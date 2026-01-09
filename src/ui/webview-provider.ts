@@ -27,7 +27,7 @@ import { CLI_CAPABILITIES } from '../cli/types';
 import { IntelligentOrchestrator } from '../orchestrator/intelligent-orchestrator';
 
 export class WebviewProvider implements vscode.WebviewViewProvider {
-  public static readonly viewType = 'cliArranger.mainView';
+  public static readonly viewType = 'multiCli.mainView';
 
   private _view?: vscode.WebviewView;
   private sessionManager: SessionManager;
@@ -78,7 +78,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     // 初始化任务分析器和 CLI 选择器（从配置读取 skills）
     this.taskAnalyzer = new TaskAnalyzer();
-    const config = vscode.workspace.getConfiguration('cliArranger');
+    const config = vscode.workspace.getConfiguration('multiCli');
     const userSkills = config.get<Record<string, string>>('skills') || {};
     this.cliSelector = new CLISelector(userSkills as Partial<import('../task/cli-selector').CLISkillsConfig>);
 
@@ -153,7 +153,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           formattedPlan: formattedPlan,
         } as any);
 
-        console.log('[CLI Arranger] Hard Stop: 等待用户确认执行计划...');
+        console.log('[MultiCLI] Hard Stop: 等待用户确认执行计划...');
       });
     });
 
@@ -172,7 +172,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           canRollback: options.rollback,
         });
 
-        console.log('[CLI Arranger] Recovery: 等待用户决策...');
+        console.log('[MultiCLI] Recovery: 等待用户决策...');
       });
     });
   }
@@ -180,7 +180,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 处理用户对执行计划的确认响应 */
   private handlePlanConfirmation(confirmed: boolean): void {
     if (this.pendingConfirmation) {
-      console.log(`[CLI Arranger] 用户确认结果: ${confirmed ? 'Y' : 'N'}`);
+      console.log(`[MultiCLI] 用户确认结果: ${confirmed ? 'Y' : 'N'}`);
       this.pendingConfirmation.resolve(confirmed);
       this.pendingConfirmation = null;
 
@@ -332,24 +332,24 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 🆕 打断当前任务 - 增强版：添加等待和超时机制 */
   private async interruptCurrentTask(): Promise<void> {
-    console.log('[CLI Arranger] 收到中断请求');
+    console.log('[MultiCLI] 收到中断请求');
 
     // 1. 首先中断 Orchestrator（这会触发 AbortController）
     if (this.intelligentOrchestrator.running) {
-      console.log('[CLI Arranger] 中断 Orchestrator');
+      console.log('[MultiCLI] 中断 Orchestrator');
       this.intelligentOrchestrator.interrupt();
     }
 
     // 2. 中断所有 CLI 并等待完成
-    console.log('[CLI Arranger] 中断所有 CLI...');
+    console.log('[MultiCLI] 中断所有 CLI...');
     try {
       await Promise.race([
         this.cliFactory.interruptAll(),
         new Promise<void>((resolve) => setTimeout(resolve, 5000)) // 5秒超时
       ]);
-      console.log('[CLI Arranger] CLI 中断完成');
+      console.log('[MultiCLI] CLI 中断完成');
     } catch (error) {
-      console.error('[CLI Arranger] CLI 中断出错:', error);
+      console.error('[MultiCLI] CLI 中断出错:', error);
     }
 
     // 3. 更新任务状态
@@ -394,7 +394,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private async checkCliAvailability(): Promise<void> {
     try {
       const availability = await this.cliFactory.checkAllAvailability();
-      console.log('[CLI Arranger] CLI 可用性检测结果:', availability);
+      console.log('[MultiCLI] CLI 可用性检测结果:', availability);
 
       // 更新 CLI 状态
       const cliTypes: CLIType[] = ['claude', 'codex', 'gemini'];
@@ -421,13 +421,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         });
       }
     } catch (error) {
-      console.error('[CLI Arranger] CLI 可用性检测失败:', error);
+      console.error('[MultiCLI] CLI 可用性检测失败:', error);
     }
   }
 
   /** 处理 Webview 消息 */
   private async handleMessage(message: WebviewToExtensionMessage): Promise<void> {
-    console.log('[CLI Arranger] 收到 Webview 消息:', message.type);
+    console.log('[MultiCLI] 收到 Webview 消息:', message.type);
 
     switch (message.type) {
       case 'getState':
@@ -435,32 +435,32 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'executeTask':
-        console.log('[CLI Arranger] 处理 executeTask, prompt:', (message as any).prompt);
+        console.log('[MultiCLI] 处理 executeTask, prompt:', (message as any).prompt);
         const images = (message as any).images || [];
         await this.executeTask((message as any).prompt, undefined, images);
         break;
 
       case 'interruptTask':
         // 🆕 使用增强版中断逻辑
-        console.log('[CLI Arranger] 收到 interruptTask 消息, taskId:', message.taskId);
+        console.log('[MultiCLI] 收到 interruptTask 消息, taskId:', message.taskId);
         await this.interruptCurrentTask();
         break;
 
       case 'pauseTask':
         // 🆕 暂停任务（目前暂不支持真正的暂停，仅记录状态）
-        console.log('[CLI Arranger] 收到 pauseTask 消息, taskId:', (message as any).taskId);
+        console.log('[MultiCLI] 收到 pauseTask 消息, taskId:', (message as any).taskId);
         this.postMessage({ type: 'toast', message: '暂停功能开发中', toastType: 'info' });
         break;
 
       case 'resumeTask':
         // 🆕 恢复任务
-        console.log('[CLI Arranger] 收到 resumeTask 消息, taskId:', (message as any).taskId);
+        console.log('[MultiCLI] 收到 resumeTask 消息, taskId:', (message as any).taskId);
         this.postMessage({ type: 'toast', message: '恢复功能开发中', toastType: 'info' });
         break;
 
       case 'appendMessage':
         // 🆕 补充内容到当前执行的任务
-        console.log('[CLI Arranger] 收到 appendMessage 消息');
+        console.log('[MultiCLI] 收到 appendMessage 消息');
         await this.handleAppendMessage((message as any).taskId, (message as any).content);
         break;
 
@@ -521,7 +521,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         const newChatSession = this.chatSessionManager.createSession();
         // 🆕 更新活跃会话ID
         this.activeSessionId = newChatSession.id;
-        console.log('[CLI Arranger] 创建新会话，已重置所有 CLI sessionId, activeSessionId:', this.activeSessionId);
+        console.log('[MultiCLI] 创建新会话，已重置所有 CLI sessionId, activeSessionId:', this.activeSessionId);
         // 通知 webview 新会话已创建
         this.postMessage({ type: 'sessionCreated', session: newChatSession as any });
         this.postMessage({ type: 'sessionsUpdated', sessions: this.chatSessionManager.getAllSessions() as any[] });
@@ -579,7 +579,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'selectCli':
         // 用户手动选择 CLI（null 表示自动选择）
         this.selectedCli = message.cli || null;
-        console.log('[CLI Arranger] 用户选择 CLI:', this.selectedCli || '自动');
+        console.log('[MultiCLI] 用户选择 CLI:', this.selectedCli || '自动');
         break;
 
       case 'confirmPlan':
@@ -617,7 +617,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private sendExecutionStats(): void {
     const executionStats = this.intelligentOrchestrator.getExecutionStats();
     if (!executionStats) {
-      console.log('[CLI Arranger] 执行统计模块未初始化');
+      console.log('[MultiCLI] 执行统计模块未初始化');
       return;
     }
 
@@ -642,7 +642,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 处理设置交互模式 */
   private handleSetInteractionMode(mode: import('../types').InteractionMode): void {
-    console.log(`[CLI Arranger] 设置交互模式: ${mode}`);
+    console.log(`[MultiCLI] 设置交互模式: ${mode}`);
     this.intelligentOrchestrator.setInteractionMode(mode);
     this.postMessage({ type: 'interactionModeChanged', mode });
     this.postMessage({
@@ -668,7 +668,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 处理恢复确认 */
   private handleRecoveryConfirmation(decision: 'retry' | 'rollback' | 'continue'): void {
-    console.log(`[CLI Arranger] 用户恢复决策: ${decision}`);
+    console.log(`[MultiCLI] 用户恢复决策: ${decision}`);
     if (this.recoveryConfirmationResolver) {
       this.recoveryConfirmationResolver(decision);
       this.recoveryConfirmationResolver = null;
@@ -677,7 +677,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 🆕 处理补充内容消息 */
   private async handleAppendMessage(taskId: string, content: string): Promise<void> {
-    console.log(`[CLI Arranger] 补充内容到任务 ${taskId}: ${content.substring(0, 50)}...`);
+    console.log(`[MultiCLI] 补充内容到任务 ${taskId}: ${content.substring(0, 50)}...`);
 
     // 检查是否有正在运行的任务
     if (!this.intelligentOrchestrator.running) {
@@ -697,16 +697,16 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       // 发送到当前活跃的 CLI
       // 注意：这是一个简化实现，真正的追加需要 CLI 支持
-      console.log('[CLI Arranger] 补充内容功能：当前为简化实现');
+      console.log('[MultiCLI] 补充内容功能：当前为简化实现');
     } catch (error) {
-      console.error('[CLI Arranger] 补充内容失败:', error);
+      console.error('[MultiCLI] 补充内容失败:', error);
       this.postMessage({ type: 'toast', message: '补充内容失败', toastType: 'error' });
     }
   }
 
   /** 处理设置更新 */
   private handleSettingUpdate(key: string, value: unknown): void {
-    const config = vscode.workspace.getConfiguration('cliArranger');
+    const config = vscode.workspace.getConfiguration('multiCli');
 
     // 处理 skills 配置
     if (key.startsWith('skill-')) {
@@ -717,7 +717,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       // 更新 CLI 选择器
       this.cliSelector.updateSkills({ [taskType]: value as CLIType });
-      console.log('[CLI Arranger] 更新技能配置:', taskType, '->', value);
+      console.log('[MultiCLI] 更新技能配置:', taskType, '->', value);
     }
     // 处理其他配置
     else if (key === 'autoSnapshot') {
@@ -732,19 +732,19 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 执行任务 */
   private async executeTask(prompt: string, forceCli?: CLIType, images?: Array<{dataUrl: string}>): Promise<void> {
-    console.log('[CLI Arranger] executeTask 开始, prompt:', prompt, '图片数量:', images?.length || 0);
+    console.log('[MultiCLI] executeTask 开始, prompt:', prompt, '图片数量:', images?.length || 0);
 
     // 🆕 确保 activeSessionId 已设置
     if (!this.activeSessionId) {
       const currentSession = this.chatSessionManager.getCurrentSession();
       this.activeSessionId = currentSession?.id || null;
-      console.log('[CLI Arranger] 设置 activeSessionId:', this.activeSessionId);
+      console.log('[MultiCLI] 设置 activeSessionId:', this.activeSessionId);
     }
 
     // 如果有图片，保存到临时文件
     const imagePaths: string[] = [];
     if (images && images.length > 0) {
-      const tmpDir = path.join(os.tmpdir(), 'cli-arranger-images');
+      const tmpDir = path.join(os.tmpdir(), 'multicli-images');
       if (!fs.existsSync(tmpDir)) {
         fs.mkdirSync(tmpDir, { recursive: true });
       }
@@ -757,7 +757,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           const filePath = path.join(tmpDir, `image_${Date.now()}_${i}.${ext}`);
           fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
           imagePaths.push(filePath);
-          console.log('[CLI Arranger] 图片已保存:', filePath);
+          console.log('[MultiCLI] 图片已保存:', filePath);
         }
       }
     }
@@ -776,7 +776,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 智能编排模式执行 */
   private async executeWithIntelligentOrchestrator(prompt: string, imagePaths: string[]): Promise<void> {
-    console.log('[CLI Arranger] 使用智能编排模式');
+    console.log('[MultiCLI] 使用智能编排模式');
 
     const task = this.taskManager.createTask(prompt);
     this.taskManager.updateTaskStatus(task.id, 'running');
@@ -809,7 +809,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
 
     } catch (error) {
-      console.error('[CLI Arranger] 智能编排执行错误:', error);
+      console.error('[MultiCLI] 智能编排执行错误:', error);
       const errorMsg = error instanceof Error ? error.message : String(error);
       this.postMessage({ type: 'cliError', cli: 'claude', error: errorMsg });
       this.postMessage({
@@ -825,7 +825,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 直接 CLI 执行模式 */
   private async executeWithDirectCli(prompt: string, targetCli: CLIType, imagePaths: string[]): Promise<void> {
-    console.log(`[CLI Arranger] 使用直接执行模式, CLI: ${targetCli}`);
+    console.log(`[MultiCLI] 使用直接执行模式, CLI: ${targetCli}`);
 
     const task = this.taskManager.createTask(prompt);
     this.taskManager.updateTaskStatus(task.id, 'running');
@@ -845,9 +845,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.postMessage({ type: 'subTaskOutput', subTaskId: targetCli, output: promptMsg + '\n', cliType: targetCli });
 
     try {
-      console.log(`[CLI Arranger] 调用 ${targetCli} CLI...`);
+      console.log(`[MultiCLI] 调用 ${targetCli} CLI...`);
       const response = await this.cliFactory.sendMessage(targetCli, prompt, imagePaths);
-      console.log(`[CLI Arranger] ${targetCli} CLI 响应:`, response.content?.substring(0, 100));
+      console.log(`[MultiCLI] ${targetCli} CLI 响应:`, response.content?.substring(0, 100));
 
       if (response.error) {
         this.taskManager.updateTaskStatus(task.id, 'failed');
@@ -866,7 +866,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
 
     } catch (error) {
-      console.error(`[CLI Arranger] ${targetCli} executeTask 错误:`, error);
+      console.error(`[MultiCLI] ${targetCli} executeTask 错误:`, error);
       this.taskManager.updateTaskStatus(task.id, 'failed');
       const errorMsg = error instanceof Error ? error.message : String(error);
       this.postMessage({ type: 'cliError', cli: targetCli, error: errorMsg });
@@ -899,11 +899,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 恢复目标会话的 CLI sessionIds
       if (session.cliSessionIds) {
         this.cliFactory.setAllSessionIds(session.cliSessionIds);
-        console.log('[CLI Arranger] 切换会话，恢复 CLI sessionIds:', session.cliSessionIds);
+        console.log('[MultiCLI] 切换会话，恢复 CLI sessionIds:', session.cliSessionIds);
       } else {
         // 如果目标会话没有 CLI sessionIds，重置所有
         this.cliFactory.resetAllSessions();
-        console.log('[CLI Arranger] 切换会话，目标会话无 CLI sessionIds，已重置');
+        console.log('[MultiCLI] 切换会话，目标会话无 CLI sessionIds，已重置');
       }
     }
   }
@@ -916,7 +916,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       currentSession.cliSessionIds = cliSessionIds;
       // 触发持久化保存
       this.sessionManager.saveCurrentSession();
-      console.log('[CLI Arranger] 保存当前会话 CLI sessionIds:', cliSessionIds);
+      console.log('[MultiCLI] 保存当前会话 CLI sessionIds:', cliSessionIds);
     }
   }
 
@@ -943,7 +943,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
       // 触发持久化保存
       this.sessionManager.saveCurrentSession();
-      console.log('[CLI Arranger] 保存消息到会话，当前消息数:', currentSession.messages.length);
+      console.log('[MultiCLI] 保存消息到会话，当前消息数:', currentSession.messages.length);
     }
   }
 
@@ -951,7 +951,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private saveCurrentSessionData(messages: any[], cliOutputs: Record<string, any[]>): void {
     const currentSession = this.chatSessionManager.getCurrentSession();
     if (!currentSession) {
-      console.log('[CLI Arranger] saveCurrentSessionData: 没有当前会话');
+      console.log('[MultiCLI] saveCurrentSessionData: 没有当前会话');
       return;
     }
 
@@ -967,7 +967,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     // 使用新的 API 保存会话数据
     this.chatSessionManager.updateSessionData(currentSession.id, sessionMessages, cliOutputs);
-    console.log('[CLI Arranger] 保存会话数据，消息数:', sessionMessages.length);
+    console.log('[MultiCLI] 保存会话数据，消息数:', sessionMessages.length);
   }
 
   /** 构建 UI 状态 */

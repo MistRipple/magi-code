@@ -232,7 +232,7 @@ export class TaskStateManager {
 
   /** 获取存储路径 */
   private getStoragePath(): string {
-    return path.join(this.workspaceRoot, '.cli-arranger', 'tasks', `${this.sessionId}.json`);
+    return path.join(this.workspaceRoot, '.multicli', 'tasks', `${this.sessionId}.json`);
   }
 
   /** 保存到文件 */

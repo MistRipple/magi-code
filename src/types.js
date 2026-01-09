@@ -1,6 +1,6 @@
 "use strict";
 /**
- * CLI Arranger 核心类型定义
+ * MultiCLI 核心类型定义
  * 版本: 0.3.0
  */
 Object.defineProperty(exports, "__esModule", { value: true });

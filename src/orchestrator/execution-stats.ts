@@ -56,7 +56,7 @@ const DEFAULT_CONFIG: StatsConfig = {
   maxRecords: 1000,
   recentWindow: 10,
   healthThreshold: 0.7,
-  persistKey: 'cliArranger.executionStats',
+  persistKey: 'multiCli.executionStats',
 };
 
 /**

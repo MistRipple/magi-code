@@ -1,5 +1,5 @@
 /**
- * CLI Arranger VSCode 扩展入口
+ * MultiCLI VSCode 扩展入口
  */
 
 import * as vscode from 'vscode';
@@ -14,12 +14,12 @@ let statusBarItem: vscode.StatusBarItem | undefined;
  * 扩展激活
  */
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  console.log('CLI Arranger 扩展已激活');
+  console.log('MultiCLI 扩展已激活');
 
   // 获取工作区根目录
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (!workspaceRoot) {
-    vscode.window.showWarningMessage('CLI Arranger: 请先打开一个工作区');
+    vscode.window.showWarningMessage('MultiCLI: 请先打开一个工作区');
     return;
   }
 
@@ -52,26 +52,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     100
   );
   updateStatusBar('idle');
-  statusBarItem.command = 'cliArranger.showPanel';
+  statusBarItem.command = 'multiCli.showPanel';
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
 
   // 监听任务状态变化，更新状态栏
   globalEventBus.on('task:started', () => {
     updateStatusBar('running');
-    vscode.commands.executeCommand('setContext', 'cliArrangerTaskRunning', true);
+    vscode.commands.executeCommand('setContext', 'multiCliTaskRunning', true);
   });
   globalEventBus.on('task:completed', () => {
     updateStatusBar('completed');
-    vscode.commands.executeCommand('setContext', 'cliArrangerTaskRunning', false);
+    vscode.commands.executeCommand('setContext', 'multiCliTaskRunning', false);
   });
   globalEventBus.on('task:failed', () => {
     updateStatusBar('failed');
-    vscode.commands.executeCommand('setContext', 'cliArrangerTaskRunning', false);
+    vscode.commands.executeCommand('setContext', 'multiCliTaskRunning', false);
   });
   globalEventBus.on('task:interrupted', () => {
     updateStatusBar('interrupted');
-    vscode.commands.executeCommand('setContext', 'cliArrangerTaskRunning', false);
+    vscode.commands.executeCommand('setContext', 'multiCliTaskRunning', false);
   });
 
   // 注册命令
@@ -83,7 +83,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     dispose: () => cliDetector.stopHealthCheck()
   });
 
-  console.log('CLI Arranger 初始化完成');
+  console.log('MultiCLI 初始化完成');
 }
 
 /**
@@ -94,31 +94,31 @@ function updateStatusBar(status: 'idle' | 'running' | 'completed' | 'failed' | '
 
   switch (status) {
     case 'idle':
-      statusBarItem.text = '$(robot) CLI Arranger';
-      statusBarItem.tooltip = '点击打开 CLI Arranger';
+      statusBarItem.text = '$(robot) MultiCLI';
+      statusBarItem.tooltip = '点击打开 MultiCLI';
       statusBarItem.backgroundColor = undefined;
       break;
     case 'running':
-      statusBarItem.text = '$(sync~spin) CLI Arranger';
+      statusBarItem.text = '$(sync~spin) MultiCLI';
       statusBarItem.tooltip = '任务执行中... 按 Escape 打断';
       statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
       break;
     case 'completed':
-      statusBarItem.text = '$(check) CLI Arranger';
+      statusBarItem.text = '$(check) MultiCLI';
       statusBarItem.tooltip = '任务已完成';
       statusBarItem.backgroundColor = undefined;
       // 3秒后恢复默认状态
       setTimeout(() => updateStatusBar('idle'), 3000);
       break;
     case 'failed':
-      statusBarItem.text = '$(error) CLI Arranger';
+      statusBarItem.text = '$(error) MultiCLI';
       statusBarItem.tooltip = '任务执行失败';
       statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
       // 5秒后恢复默认状态
       setTimeout(() => updateStatusBar('idle'), 5000);
       break;
     case 'interrupted':
-      statusBarItem.text = '$(debug-pause) CLI Arranger';
+      statusBarItem.text = '$(debug-pause) MultiCLI';
       statusBarItem.tooltip = '任务已打断';
       statusBarItem.backgroundColor = undefined;
       // 3秒后恢复默认状态
@@ -132,48 +132,48 @@ function updateStatusBar(status: 'idle' | 'running' | 'completed' | 'failed' | '
  */
 function registerCommands(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
-    vscode.commands.registerCommand('cliArranger.openPanel', () => {
-      vscode.commands.executeCommand('workbench.view.extension.cliArranger');
+    vscode.commands.registerCommand('multiCli.openPanel', () => {
+      vscode.commands.executeCommand('workbench.view.extension.multiCli');
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('cliArranger.showPanel', () => {
-      vscode.commands.executeCommand('workbench.view.extension.cliArranger');
+    vscode.commands.registerCommand('multiCli.showPanel', () => {
+      vscode.commands.executeCommand('workbench.view.extension.multiCli');
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('cliArranger.newSession', () => {
+    vscode.commands.registerCommand('multiCli.newSession', () => {
       webviewProvider?.getSessionManager().createSession();
-      vscode.window.showInformationMessage('CLI Arranger: 新会话已创建');
+      vscode.window.showInformationMessage('MultiCLI: 新会话已创建');
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('cliArranger.showStatus', async () => {
+    vscode.commands.registerCommand('multiCli.showStatus', async () => {
       const summary = await cliDetector.getStatusSummary();
       vscode.window.showInformationMessage(
-        `CLI Arranger: ${summary.available}/${summary.total} CLI 可用\n${summary.recommendation}`
+        `MultiCLI: ${summary.available}/${summary.total} CLI 可用\n${summary.recommendation}`
       );
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('cliArranger.checkCLIs', async () => {
+    vscode.commands.registerCommand('multiCli.checkCLIs', async () => {
       await detectAndNotifyCLIs();
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('cliArranger.interruptTask', () => {
+    vscode.commands.registerCommand('multiCli.interruptTask', () => {
       globalEventBus.emitEvent('task:interrupt', {});
-      vscode.window.showInformationMessage('CLI Arranger: 正在打断任务...');
+      vscode.window.showInformationMessage('MultiCLI: 正在打断任务...');
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('cliArranger.stopTask', () => {
+    vscode.commands.registerCommand('multiCli.stopTask', () => {
       globalEventBus.emitEvent('task:interrupt', {});
     })
   );
@@ -196,7 +196,7 @@ async function detectAndNotifyCLIs(): Promise<{ claudeAvailable: boolean; codexA
   // Claude CLI 是必需的
   if (!claudeAvailable) {
     const action = await vscode.window.showErrorMessage(
-      `CLI Arranger: Claude CLI 未安装或不可用。${claudeStatus?.error || ''}`,
+      `MultiCLI: Claude CLI 未安装或不可用。${claudeStatus?.error || ''}`,
       '安装指南',
       '重新检测'
     );
@@ -213,7 +213,7 @@ async function detectAndNotifyCLIs(): Promise<{ claudeAvailable: boolean; codexA
   // Codex 和 Gemini 是可选的
   if (!codexAvailable && claudeAvailable) {
     vscode.window.showInformationMessage(
-      `CLI Arranger: Codex CLI 不可用，Bug修复任务将由 Claude 处理。`,
+      `MultiCLI: Codex CLI 不可用，Bug修复任务将由 Claude 处理。`,
       '了解更多'
     ).then(action => {
       if (action === '了解更多') {
@@ -224,7 +224,7 @@ async function detectAndNotifyCLIs(): Promise<{ claudeAvailable: boolean; codexA
 
   if (!geminiAvailable && claudeAvailable) {
     vscode.window.showInformationMessage(
-      `CLI Arranger: Gemini CLI 不可用，前端任务将由 Claude 处理。`,
+      `MultiCLI: Gemini CLI 不可用，前端任务将由 Claude 处理。`,
       '了解更多'
     ).then(action => {
       if (action === '了解更多') {
@@ -240,7 +240,7 @@ async function detectAndNotifyCLIs(): Promise<{ claudeAvailable: boolean; codexA
  * 扩展停用 - 🆕 增强版：确保所有资源被正确清理
  */
 export async function deactivate(): Promise<void> {
-  console.log('CLI Arranger 扩展正在停用...');
+  console.log('MultiCLI 扩展正在停用...');
 
   try {
     // 1. 停止健康检查
@@ -261,7 +261,7 @@ export async function deactivate(): Promise<void> {
       console.log('[deactivate] 状态栏已清理');
     }
 
-    console.log('CLI Arranger 扩展已完全停用');
+    console.log('MultiCLI 扩展已完全停用');
   } catch (error) {
     console.error('[deactivate] 清理资源时出错:', error);
   }

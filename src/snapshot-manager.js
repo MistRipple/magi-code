@@ -55,7 +55,7 @@ class SnapshotManager {
     constructor(sessionManager, workspaceRoot) {
         this.sessionManager = sessionManager;
         this.workspaceRoot = workspaceRoot;
-        this.snapshotDir = path.join(workspaceRoot, '.cli-arranger', 'snapshots');
+        this.snapshotDir = path.join(workspaceRoot, '.multicli', 'snapshots');
         this.ensureSnapshotDir();
     }
     /** 确保快照目录存在 */

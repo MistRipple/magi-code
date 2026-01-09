@@ -7,8 +7,8 @@ import * as vscode from 'vscode';
 import { Session, SessionMeta } from '../cli/types';
 
 /** 存储键前缀 */
-const STORAGE_PREFIX = 'cliArranger.session.';
-const SESSION_LIST_KEY = 'cliArranger.sessionList';
+const STORAGE_PREFIX = 'multiCli.session.';
+const SESSION_LIST_KEY = 'multiCli.sessionList';
 
 /**
  * 会话存储类

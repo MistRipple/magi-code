@@ -25,7 +25,7 @@ export class SnapshotManager {
   constructor(sessionManager: SessionManager, workspaceRoot: string) {
     this.sessionManager = sessionManager;
     this.workspaceRoot = workspaceRoot;
-    this.snapshotDir = path.join(workspaceRoot, '.cli-arranger', 'snapshots');
+    this.snapshotDir = path.join(workspaceRoot, '.multicli', 'snapshots');
     this.ensureSnapshotDir();
   }
 

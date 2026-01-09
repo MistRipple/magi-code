@@ -1,5 +1,5 @@
 /**
- * CLI Arranger VSCode 扩展入口
+ * MultiCLI VSCode 扩展入口
  */
 import * as vscode from 'vscode';
 /**

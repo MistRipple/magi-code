@@ -43,7 +43,7 @@ export class CLIDetector {
   private healthCheckPeriod: number = 60 * 1000; // 1分钟健康检查
 
   constructor() {
-    this.config = vscode.workspace.getConfiguration('cliArranger');
+    this.config = vscode.workspace.getConfiguration('multiCli');
   }
 
   /**
@@ -431,7 +431,7 @@ export class CLIDetector {
    * 刷新配置
    */
   refreshConfig(): void {
-    this.config = vscode.workspace.getConfiguration('cliArranger');
+    this.config = vscode.workspace.getConfiguration('multiCli');
     this.statusCache.clear();
     this.lastCheck = 0;
   }

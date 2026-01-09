@@ -27,21 +27,6 @@ export interface WorkerInfo {
   lastActivity?: number;
 }
 
-/**
- * 执行计划中的子任务（轻量版，用于计划阶段）
- * 执行时会转换为完整的 SubTask
- */
-export interface PlanSubTask {
-  id: string;
-  description: string;
-  assignedWorker: WorkerType;
-  reason: string;
-  targetFiles?: string[];
-  dependencies: string[];
-  prompt: string;
-  priority?: number;
-}
-
 /** 执行计划 */
 export interface ExecutionPlan {
   id: string;
@@ -49,7 +34,7 @@ export interface ExecutionPlan {
   isSimpleTask?: boolean;
   skipReason?: string;
   needsCollaboration: boolean;
-  subTasks: PlanSubTask[];
+  subTasks: SubTask[];
   executionMode: 'parallel' | 'sequential';
   summary: string;
   createdAt: number;

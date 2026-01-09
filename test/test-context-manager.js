@@ -72,7 +72,7 @@ async function runTests() {
   let memoryDoc;
   
   await asyncTest('创建 MemoryDocument', async () => {
-    const storagePath = path.join(TEST_WORKSPACE, '.cli-arranger/sessions');
+    const storagePath = path.join(TEST_WORKSPACE, '.multicli/sessions');
     memoryDoc = new MemoryDocument(TEST_SESSION_ID, 'Test Session', storagePath);
     assert(memoryDoc !== null, 'MemoryDocument 应该被创建');
   });
@@ -151,7 +151,7 @@ async function runTests() {
 
   await asyncTest('保存 Memory 到文件', async () => {
     await memoryDoc.save();
-    const filePath = path.join(TEST_WORKSPACE, '.cli-arranger/sessions', TEST_SESSION_ID, 'memory.json');
+    const filePath = path.join(TEST_WORKSPACE, '.multicli/sessions', TEST_SESSION_ID, 'memory.json');
     assert(fs.existsSync(filePath), 'Memory 文件应该存在');
   });
 
@@ -213,7 +213,7 @@ async function runTests() {
 
   await asyncTest('保存 Memory', async () => {
     await contextManager.saveMemory();
-    const filePath = path.join(TEST_WORKSPACE, '.cli-arranger/sessions', 'session-002', 'memory.json');
+    const filePath = path.join(TEST_WORKSPACE, '.multicli/sessions', 'session-002', 'memory.json');
     assert(fs.existsSync(filePath), 'Memory 文件应该存在');
   });
 
@@ -231,7 +231,7 @@ async function runTests() {
 
   await asyncTest('简单压缩（不需要 LLM）', async () => {
     // 创建一个有大量数据的 Memory
-    const storagePath = path.join(TEST_WORKSPACE, '.cli-arranger/sessions');
+    const storagePath = path.join(TEST_WORKSPACE, '.multicli/sessions');
     const testMemory = new MemoryDocument('compress-test', 'Compress Test', storagePath);
     await testMemory.load();
 

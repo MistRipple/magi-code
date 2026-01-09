@@ -1,16 +1,19 @@
-# CLI Arranger 设计文档
+# MultiCLI 设计文档
 
-> 版本: 0.4.0 | 最后更新: 2025-01-08
+> 版本: 0.5.0 | 最后更新: 2025-01-09
 
 ## 1. 项目愿景
 
-**CLI Arranger** 是一个 VSCode 插件，用于**编排多个 AI CLI 工具协作完成复杂编程任务**。
+**MultiCLI** 是一个 VSCode 插件，用于**编排多个 AI CLI 工具协作完成复杂编程任务**。
 
 ### 1.1 核心价值
 
 - 🎯 **多 Agent 协作**：Claude + Codex + Gemini 等多 CLI 协作
-- 🧠 **智能编排**：根据任务类型自动选择最合适的 CLI
-- � **Token 最优**：CLI 直接修改文件，Diff 本地生成（0 Token）
+- 🧠 **智能编排**：独立编排者 Claude 专职协调，Worker CLI 专职执行
+- 🔄 **CLI 降级**：自动故障转移，根据执行统计智能选择 CLI
+- 📊 **执行统计**：实时监控各 CLI 健康状态和成功率
+- 📈 **依赖图调度**：任务依赖关系管理，最大化并行执行效率
+- 💾 **上下文管理**：三层上下文架构，智能压缩长对话
 - 📉 **优雅降级**：根据可用 CLI 自动调整执行策略
 - 🎨 **统一体验**：在 VSCode 中提供一致的交互界面
 - ⏹️ **可控执行**：流式输出 + 随时打断 + 一键还原
@@ -74,12 +77,53 @@
 |------|------|------|
 | **UI 层** | Webview（主面板）、TreeView（CLI状态/待处理）、Status Bar | 用户交互界面 |
 | **控制层** | UI Controller | 统一管理 UI 组件 |
-| **路由层** | Task Router | 任务类型识别与智能路由 |
-| **编排层** | Orchestrator | 任务分解、CLI 选择、执行调度 |
-| **执行层** | Worker Pool（CLI Workers） | 管理和执行各 CLI Worker |
+| **编排层** | OrchestratorAgent（独立编排者 Claude） | 专职编排，不执行编码任务 |
+| **执行层** | WorkerPool + WorkerAgent（多 CLI Workers） | 专职执行，向编排者汇报 |
+| **通信层** | MessageBus | 编排者与 Worker 之间的消息通信 |
 | **快照层** | Snapshot Manager | 文件快照、Diff 生成、通过/还原 |
+| **上下文层** | ContextManager + ContextCompressor | 三层上下文管理和智能压缩 |
 
 **外部依赖**：Claude CLI、Codex CLI、Gemini CLI（可扩展）
+
+### 2.2 独立编排者架构 (v0.5.0 新增)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    OrchestratorAgent                            │
+│                   (独立编排者 Claude)                            │
+│  ─────────────────────────────────────────────────────────────  │
+│  职责：                                                         │
+│  • 100% 时间用于编排和监控                                      │
+│  • 分析任务、生成执行计划                                       │
+│  • 实时监控所有 Worker 状态                                     │
+│  • 动态调度和错误处理                                           │
+│  • CLI 降级决策                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                    ┌─────────┴─────────┐
+                    │    MessageBus     │
+                    │   (消息总线)       │
+                    └─────────┬─────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+        ▼                     ▼                     ▼
+┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+│ Claude Worker │   │ Codex Worker  │   │ Gemini Worker │
+│  (执行者)     │   │  (执行者)     │   │  (执行者)     │
+│ ───────────── │   │ ───────────── │   │ ───────────── │
+│ • 接收任务    │   │ • 接收任务    │   │ • 接收任务    │
+│ • 执行编码    │   │ • 执行编码    │   │ • 执行编码    │
+│ • 汇报进度    │   │ • 汇报进度    │   │ • 汇报进度    │
+│ • 返回结果    │   │ • 返回结果    │   │ • 返回结果    │
+└───────────────┘   └───────────────┘   └───────────────┘
+```
+
+**架构优势**：
+- **职责分离**：编排者专注协调，Worker 专注执行
+- **实时响应**：编排者可立即响应任何事件
+- **灵活调度**：支持动态任务分配和 CLI 降级
+- **可扩展性**：轻松添加新的 Worker 类型
 
 ### 2.2 核心模块
 
@@ -153,7 +197,7 @@
 
 ```json
 {
-  "cliArranger.skills": {
+  "multiCli.skills": {
     "architecture": "claude",
     "bugfix": "codex",
     "frontend": "gemini",
@@ -265,7 +309,7 @@ CLI 依次执行，后一个基于前一个的结果。
 
 ### 6.1 三种交互模式
 
-CLI Arranger 支持三种交互模式，用户可根据任务风险和信任程度选择：
+MultiCLI 支持三种交互模式，用户可根据任务风险和信任程度选择：
 
 | 模式 | 说明 | 文件修改 | 命令执行 | Phase 2 确认 | 自动回滚 |
 |------|------|----------|----------|--------------|----------|
@@ -522,7 +566,7 @@ interface VerificationConfig {
 
 ### 7.6 与其他框架的对比
 
-| 维度 | oh-my-opencode | CLI Arranger |
+| 维度 | oh-my-opencode | MultiCLI |
 | ---- | -------------- | ------------ |
 | **编排器** | Sisyphus (单一 Agent) | Claude (协调多 CLI) |
 | **执行者** | 多个专门 Agent | 多个独立 CLI |
@@ -577,14 +621,14 @@ type TaskStatus =
 │                            ▼                  ▼                 │
 │                    ┌─────────────┐    ┌─────────────┐          │
 │                    │ 持久化存储  │    │ UI 订阅更新 │          │
-│                    │ .cli-arranger│    │ WebviewPanel│          │
+│                    │ .multicli│    │ WebviewPanel│          │
 │                    └─────────────┘    └─────────────┘          │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ### 8.3 持久化存储
 
-任务状态保存到 `.cli-arranger/tasks/{sessionId}.json`：
+任务状态保存到 `.multicli/tasks/{sessionId}.json`：
 
 ```json
 {
@@ -798,7 +842,7 @@ type TaskStatus =
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  标题栏: CLI Arranger + [+ 新建 Session] + [设置]              │
+│  标题栏: MultiCLI + [+ 新建 Session] + [设置]              │
 ├─────────────────────────────────────────────────────────────────┤
 │  Session 选择器: [Session 1 ×] [Session 2 ×]                   │
 ├─────────────────────────────────────────────────────────────────┤
@@ -818,7 +862,7 @@ type TaskStatus =
 
 | Tab | 内容 |
 |-----|------|
-| **对话** | 用户与 CLI Arranger 的对话流，包含任务卡片 |
+| **对话** | 用户与 MultiCLI 的对话流，包含任务卡片 |
 | **任务** | 当前 Session 的任务列表，可查看历史任务 |
 | **变更** | 待处理的文件变更列表，支持 Diff 预览、通过、还原 |
 
@@ -857,7 +901,7 @@ type TaskStatus =
 | 路径 | 说明 |
 |------|------|
 | `src/extension.ts` | 插件入口 |
-| `src/types.ts` | 类型定义（含交互模式） |
+| `src/types.ts` | 统一类型定义（SubTask、WorkerType 等） |
 | `src/cli-detector.ts` | CLI 检测器 |
 | `src/events.ts` | 事件系统 |
 | `src/diff-generator.ts` | Diff 生成器 |
@@ -869,12 +913,24 @@ type TaskStatus =
 | `src/cli/base-adapter.ts` | CLI 适配器基类 |
 | `src/cli/adapter-factory.ts` | 适配器工厂 |
 | `src/cli/adapters/` | 各 CLI 适配器实现 |
-| **src/orchestrator/** | 智能编排层 |
+| **src/orchestrator/** | 独立编排者架构 (v0.5.0) |
+| `src/orchestrator/orchestrator-agent.ts` | 独立编排者 Claude 核心实现 |
+| `src/orchestrator/worker-agent.ts` | Worker Agent 基类 |
+| `src/orchestrator/worker-pool.ts` | Worker Pool 管理器 |
+| `src/orchestrator/message-bus.ts` | 消息总线（编排者与 Worker 通信） |
+| `src/orchestrator/protocols/types.ts` | 编排者架构核心类型定义 |
+| `src/orchestrator/prompts/orchestrator-prompts.ts` | 编排者专用 Prompt 模板 |
 | `src/orchestrator/intelligent-orchestrator.ts` | 智能编排器（6 Phase 工作流） |
-| `src/orchestrator/prompts.ts` | Prompt 模板系统 |
 | `src/orchestrator/task-state-manager.ts` | 任务状态管理器 |
 | `src/orchestrator/verification-runner.ts` | 验证执行器 |
 | `src/orchestrator/recovery-handler.ts` | 失败恢复处理器 |
+| **src/orchestrator/context/** | 上下文管理层 |
+| `src/orchestrator/context/memory-document.ts` | Memory 文档读写 |
+| `src/orchestrator/context/context-manager.ts` | 三层上下文管理 |
+| `src/orchestrator/context/context-compressor.ts` | 智能压缩代理 |
+| **src/orchestrator/stats/** | 执行统计层 |
+| `src/orchestrator/stats/execution-stats.ts` | 执行统计模块 |
+| `src/orchestrator/stats/task-dependency-graph.ts` | 任务依赖图 |
 | **src/task/** | 任务处理层 |
 | `src/task/task-analyzer.ts` | 任务分析器 |
 | `src/task/task-splitter.ts` | 任务拆分器 |
@@ -933,8 +989,42 @@ type TaskStatus =
 - [x] Diff 预览面板
 - [x] 交互模式选择器（Ask/Agent/Auto）
 - [x] 恢复确认对话框
+- [x] 确认弹窗持久化（切换页面后保留）
 
-### Phase 6: 优化与发布 🚧
+### Phase 6: 独立编排者架构 ✅ (v0.5.0)
+
+- [x] 核心类型和接口定义（protocols/types.ts）
+- [x] 消息总线实现（message-bus.ts）
+- [x] Worker Agent 基类（worker-agent.ts）
+- [x] Worker Pool 管理（worker-pool.ts）
+- [x] 编排者专用 Prompts（prompts/orchestrator-prompts.ts）
+- [x] OrchestratorAgent 核心实现（orchestrator-agent.ts）
+- [x] IntelligentOrchestrator 重构集成
+
+### Phase 7: 上下文管理 ✅
+
+- [x] MemoryDocument 类（Memory 文档读写）
+- [x] ContextManager 类（三层上下文管理）
+- [x] ContextCompressor 类（智能压缩代理）
+- [x] 集成到编排器架构
+
+### Phase 8: 功能性优化 ✅
+
+- [x] 执行统计模块（ExecutionStats）
+- [x] CLI 降级策略（自动故障转移）
+- [x] 任务依赖图（TaskDependencyGraph）
+- [x] 拓扑排序和并行分组
+- [x] 执行统计 UI 面板
+- [x] 编排者/Worker UI 视觉区分
+
+### Phase 9: 系统集成 ✅
+
+- [x] SnapshotManager 集成到 OrchestratorAgent
+- [x] 统一任务类型定义（SubTask）
+- [x] ExecutionScheduler 集成到 WorkerPool
+- [x] 资源清理机制（VSCode 关闭时停止线程）
+
+### Phase 10: 优化与发布 🚧
 
 - [ ] 端到端功能测试
 - [ ] 性能优化
@@ -947,12 +1037,12 @@ type TaskStatus =
 
 | 配置项 | 默认值 | 说明 |
 |--------|-------|------|
-| `cliArranger.claude.path` | `claude` | Claude CLI 路径 |
-| `cliArranger.codex.path` | `codex` | Codex CLI 路径 |
-| `cliArranger.gemini.path` | `gemini` | Gemini CLI 路径 |
-| `cliArranger.skills` | `{}` | 任务类型到 CLI 的映射 |
-| `cliArranger.snapshotDir` | `.cli-arranger` | 快照存储目录 |
-| `cliArranger.timeout` | `300000` | 超时时间（毫秒） |
+| `multiCli.claude.path` | `claude` | Claude CLI 路径 |
+| `multiCli.codex.path` | `codex` | Codex CLI 路径 |
+| `multiCli.gemini.path` | `gemini` | Gemini CLI 路径 |
+| `multiCli.skills` | `{}` | 任务类型到 CLI 的映射 |
+| `multiCli.snapshotDir` | `.multicli` | 快照存储目录 |
+| `multiCli.timeout` | `300000` | 超时时间（毫秒） |
 
 ---
 
@@ -1009,7 +1099,7 @@ type TaskStatus =
 
 | 快捷键 | 功能 |
 |--------|------|
-| `Ctrl+Shift+A` | 打开 CLI Arranger |
+| `Ctrl+Shift+A` | 打开 MultiCLI |
 | `Ctrl+Enter` | 执行任务 |
 | `Escape` | 打断执行 |
 
@@ -1064,7 +1154,7 @@ interrupt(): void {
 
 ### B.1 存储位置
 
-`{项目根目录}/.cli-arranger/snapshots/{session_id}/`
+`{项目根目录}/.multicli/snapshots/{session_id}/`
 
 ### B.2 数据结构
 

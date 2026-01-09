@@ -107,7 +107,7 @@ export const DEFAULT_TRUNCATION_CONFIG: TruncationConfig = {
 
 // 默认配置
 export const DEFAULT_CONTEXT_CONFIG: ContextManagerConfig = {
-  storagePath: '.cli-arranger/sessions',
+  storagePath: '.multicli/sessions',
   immediateContextRounds: 5,
   compression: {
     tokenLimit: 8000,
