@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CLI Arranger UI Mockup</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1e1e1e;
+      color: #cccccc;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      font-size: 13px;
+    }
+
+    /* 顶部标题栏 */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      background: #252526;
+      border-bottom: 1px solid #3c3c3c;
+    }
+    .header-left { display: flex; align-items: center; gap: 12px; }
+    .header-title { font-size: 13px; font-weight: 600; letter-spacing: 0.3px; }
+    .header-actions { display: flex; gap: 4px; }
+    .header-actions button {
+      background: none; border: none; color: #858585;
+      cursor: pointer; padding: 6px 8px; font-size: 12px;
+      border-radius: 4px;
+    }
+    .header-actions button:hover { background: #3c3c3c; color: #cccccc; }
+    .new-session-btn {
+      background: #0e639c !important;
+      color: white !important;
+      font-size: 11px !important;
+    }
+    .new-session-btn:hover { background: #1177bb !important; }
+
+    /* Session 选择器 */
+    .session-selector {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 16px 8px;
+      background: #252526;
+      border-bottom: 1px solid #3c3c3c;
+    }
+    .session-tab {
+      padding: 6px 12px;
+      font-size: 11px;
+      color: #858585;
+      cursor: pointer;
+      border-radius: 4px;
+      background: #2d2d2d;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .session-tab:hover { background: #3c3c3c; }
+    .session-tab.active { background: #0e639c; color: white; }
+    .session-tab .close {
+      opacity: 0.6;
+      font-size: 10px;
+    }
+    .session-tab .close:hover { opacity: 1; }
+
+    /* 顶部 Tab */
+    .top-tabs {
+      display: flex;
+      padding: 0 16px;
+      background: #1e1e1e;
+      border-bottom: 1px solid #3c3c3c;
+    }
+    .top-tab {
+      padding: 10px 16px;
+      font-size: 12px;
+      color: #858585;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: all 0.15s;
+    }
+    .top-tab:hover { color: #cccccc; }
+    .top-tab.active { color: #ffffff; border-bottom-color: #0078d4; }
+    .top-tab .badge {
+      background: #0078d4;
+      color: white;
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 10px;
+      margin-left: 6px;
+    }
+
+    /* 主内容区 */
+    .main-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+    }
+
+    /* 消息样式 */
+    .message {
+      margin-bottom: 16px;
+    }
+    .message-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+      font-size: 12px;
+    }
+    .message-header .role {
+      font-weight: 600;
+      color: #e0e0e0;
+    }
+    .message-header .time {
+      margin-left: auto;
+      color: #6e6e6e;
+      font-size: 11px;
+    }
+    .message-content {
+      font-size: 13px;
+      line-height: 1.6;
+      color: #d4d4d4;
+      padding-left: 0;
+    }
+    .user-message .message-content {
+      background: #2d2d30;
+      padding: 12px 14px;
+      border-radius: 6px;
+      border-left: 3px solid #0078d4;
+    }
+
+    /* Task 卡片 */
+    .task-card {
+      background: #252526;
+      border: 1px solid #3c3c3c;
+      border-radius: 6px;
+      padding: 12px 14px;
+      margin-top: 12px;
+    }
+    .task-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 6px;
+    }
+    .task-title {
+      font-size: 12px;
+      font-weight: 500;
+      color: #e0e0e0;
+    }
+    .task-status {
+      font-size: 10px;
+      padding: 2px 8px;
+      border-radius: 3px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+    .task-status.running { background: #0e639c; color: white; }
+    .task-status.completed { background: #2ea043; color: white; }
+    .task-status.interrupted { background: #9e6a03; color: white; }
+    .task-meta { font-size: 11px; color: #858585; }
+    .task-files {
+      font-size: 11px;
+      color: #6cb6ff;
+      margin-top: 6px;
+      font-family: 'SF Mono', Consolas, monospace;
+    }
+    .interrupt-btn {
+      background: transparent;
+      color: #f85149;
+      border: 1px solid #f85149;
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      cursor: pointer;
+      margin-top: 8px;
+    }
+    .interrupt-btn:hover {
+      background: #f85149;
+      color: white;
+    }
+
+    /* 底部区域 */
+    .bottom-panel {
+      border-top: 1px solid #3c3c3c;
+      background: #252526;
+    }
+    .bottom-tabs {
+      display: flex;
+      padding: 0 16px;
+      border-bottom: 1px solid #3c3c3c;
+    }
+    .bottom-tab {
+      padding: 8px 14px;
+      font-size: 11px;
+      color: #858585;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .bottom-tab:hover { color: #cccccc; }
+    .bottom-tab.active { color: #ffffff; border-bottom-color: #0078d4; }
+    .bottom-tab .dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+    }
+    .bottom-tab .dot.available { background: #2ea043; }
+    .bottom-tab .dot.running { background: #f0883e; animation: pulse 1s infinite; }
+    .bottom-tab .dot.unavailable { background: #6e7681; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+    .bottom-content { padding: 12px 16px; min-height: 140px; }
+
+    /* 输入框 */
+    .input-area { display: flex; flex-direction: column; gap: 10px; }
+    .input-box {
+      background: #3c3c3c;
+      border: 1px solid #4c4c4c;
+      border-radius: 6px;
+      padding: 12px;
+      color: #d4d4d4;
+      font-size: 13px;
+      resize: none;
+      min-height: 70px;
+      font-family: inherit;
+    }
+    .input-box:focus { outline: none; border-color: #0078d4; }
+    .input-box::placeholder { color: #6e6e6e; }
+    .input-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .cli-indicators { display: flex; gap: 8px; }
+    .cli-indicator {
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: 4px;
+      background: #2d2d2d;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .cli-indicator .dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+    }
+    .cli-indicator .dot.ok { background: #2ea043; }
+    .cli-indicator .dot.no { background: #6e7681; }
+    .send-btn {
+      background: #0e639c;
+      color: white;
+      border: none;
+      padding: 8px 18px;
+      border-radius: 5px;
+      font-size: 12px;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    .send-btn:hover { background: #1177bb; }
+
+    /* CLI 输出区 */
+    .cli-output {
+      background: #1e1e1e;
+      border-radius: 4px;
+      padding: 12px;
+      font-family: 'SF Mono', Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #9cdcfe;
+      max-height: 120px;
+      overflow-y: auto;
+    }
+    .cli-output .line { margin-bottom: 2px; }
+    .cli-output .prefix { color: #6a9955; }
+    .cli-output .cursor {
+      display: inline-block;
+      width: 7px;
+      height: 14px;
+      background: #d4d4d4;
+      animation: blink 1s infinite;
+    }
+    @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
+  </style>
+</head>
+<body>
+  <!-- 顶部标题栏 -->
+  <div class="header">
+    <div class="header-left">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="#858585">
+        <rect x="1" y="3" width="14" height="2" rx="1"/>
+        <rect x="1" y="7" width="14" height="2" rx="1"/>
+        <rect x="1" y="11" width="14" height="2" rx="1"/>
+      </svg>
+      <span class="header-title">CLI Arranger</span>
+    </div>
+    <div class="header-actions">
+      <button class="new-session-btn">+ New Session</button>
+      <button title="Settings">⚙</button>
+    </div>
+  </div>
+
+  <!-- Session 选择器 -->
+  <div class="session-selector">
+    <div class="session-tab active">Session 1 <span class="close">×</span></div>
+    <div class="session-tab">Session 2 <span class="close">×</span></div>
+  </div>
+
+  <!-- 顶部 Tab -->
+  <div class="top-tabs">
+    <div class="top-tab active">对话</div>
+    <div class="top-tab">任务</div>
+    <div class="top-tab">变更 <span class="badge">3</span></div>
+  </div>
+
+  <!-- 主内容区 -->
+  <div class="main-content">
+    <!-- 用户消息 -->
+    <div class="message user-message">
+      <div class="message-header">
+        <span class="role">用户</span>
+        <span class="time">10:30</span>
+      </div>
+      <div class="message-content">添加用户登录功能，包括后端 API 和前端页面</div>
+    </div>
+
+    <!-- AI 回复 -->
+    <div class="message">
+      <div class="message-header">
+        <span class="role">CLI Arranger</span>
+        <span class="time">10:30</span>
+      </div>
+      <div class="message-content">
+        <p style="margin-bottom: 12px; color: #9d9d9d;">任务已分解为 2 个子任务：</p>
+
+        <div class="task-card">
+          <div class="task-header">
+            <span class="task-title">#1 后端 API</span>
+            <span class="task-status completed">已完成</span>
+          </div>
+          <div class="task-meta">Claude · 15.2s</div>
+          <div class="task-files">auth.ts (+35), user.ts (+12)</div>
+        </div>
+
+        <div class="task-card">
+          <div class="task-header">
+            <span class="task-title">#2 前端页面</span>
+            <span class="task-status running">执行中</span>
+          </div>
+          <div class="task-meta">Gemini · 执行中...</div>
+          <button class="interrupt-btn">打断</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 底部面板 -->
+  <div class="bottom-panel">
+    <div class="bottom-tabs">
+      <div class="bottom-tab active">输入</div>
+      <div class="bottom-tab"><span class="dot available"></span> Claude</div>
+      <div class="bottom-tab"><span class="dot available"></span> Codex</div>
+      <div class="bottom-tab"><span class="dot running"></span> Gemini</div>
+    </div>
+
+    <div class="bottom-content" id="bottom-content">
+      <div class="input-area" id="input-panel">
+        <textarea class="input-box" placeholder="描述你的任务..."></textarea>
+        <div class="input-footer">
+          <div class="cli-indicators">
+            <span class="cli-indicator"><span class="dot ok"></span> Claude</span>
+            <span class="cli-indicator"><span class="dot ok"></span> Codex</span>
+            <span class="cli-indicator"><span class="dot ok"></span> Gemini</span>
+          </div>
+          <button class="send-btn">执行</button>
+        </div>
+      </div>
+
+      <div class="cli-output" id="cli-output" style="display: none;">
+        <div class="line"><span class="prefix">&gt;</span> Analyzing project structure...</div>
+        <div class="line"><span class="prefix">&gt;</span> Creating src/api/auth.ts</div>
+        <div class="line"><span class="prefix">&gt;</span> Adding JWT verification logic</div>
+        <div class="line"><span class="cursor"></span></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const bottomTabs = document.querySelectorAll('.bottom-tab');
+    const inputPanel = document.getElementById('input-panel');
+    const cliOutput = document.getElementById('cli-output');
+
+    bottomTabs.forEach((tab, index) => {
+      tab.addEventListener('click', () => {
+        bottomTabs.forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        inputPanel.style.display = index === 0 ? 'flex' : 'none';
+        cliOutput.style.display = index === 0 ? 'none' : 'block';
+      });
+    });
+
+    document.querySelectorAll('.top-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.top-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+      });
+    });
+
+    document.querySelectorAll('.session-tab').forEach(tab => {
+      tab.addEventListener('click', (e) => {
+        if (!e.target.classList.contains('close')) {
+          document.querySelectorAll('.session-tab').forEach(t => t.classList.remove('active'));
+          tab.classList.add('active');
+        }
+      });
+    });
+  </script>
+</body>
+</html>
+

@@ -1,0 +1,162 @@
+{
+  "name": "cli-arranger",
+  "displayName": "CLI Arranger",
+  "description": "编排多个 AI CLI 工具 (Claude/Codex/Gemini) 协作完成复杂任务",
+  "version": "0.1.0",
+  "publisher": "xie",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "ai",
+    "claude",
+    "codex",
+    "gemini",
+    "cli",
+    "orchestration"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "cliArranger.startTask",
+        "title": "CLI Arranger: 启动任务"
+      },
+      {
+        "command": "cliArranger.checkCLIs",
+        "title": "CLI Arranger: 检测 CLI 状态"
+      },
+      {
+        "command": "cliArranger.showPanel",
+        "title": "CLI Arranger: 显示控制面板"
+      },
+      {
+        "command": "cliArranger.stopTask",
+        "title": "CLI Arranger: 停止当前任务"
+      },
+      {
+        "command": "cliArranger.interruptTask",
+        "title": "CLI Arranger: 打断当前任务"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "cliArranger.showPanel",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
+      },
+      {
+        "command": "cliArranger.interruptTask",
+        "key": "escape",
+        "when": "cliArrangerTaskRunning"
+      }
+    ],
+    "configuration": {
+      "title": "CLI Arranger",
+      "properties": {
+        "cliArranger.claude.path": {
+          "type": "string",
+          "default": "claude",
+          "description": "Claude CLI 可执行文件路径"
+        },
+        "cliArranger.codex.path": {
+          "type": "string",
+          "default": "codex",
+          "description": "Codex CLI 可执行文件路径"
+        },
+        "cliArranger.gemini.path": {
+          "type": "string",
+          "default": "gemini",
+          "description": "Gemini CLI 可执行文件路径"
+        },
+        "cliArranger.defaultMode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "parallel",
+            "sequential"
+          ],
+          "default": "auto",
+          "description": "默认执行模式"
+        },
+        "cliArranger.timeout": {
+          "type": "number",
+          "default": 300000,
+          "description": "CLI 执行超时时间（毫秒）"
+        },
+        "cliArranger.autoSnapshot": {
+          "type": "boolean",
+          "default": true,
+          "description": "执行任务前自动创建文件快照"
+        },
+        "cliArranger.skills": {
+          "type": "object",
+          "default": {
+            "architecture": "claude",
+            "bugfix": "codex",
+            "frontend": "gemini",
+            "backend": "claude",
+            "test": "codex",
+            "docs": "claude",
+            "general": "claude"
+          },
+          "description": "任务类型到 CLI 的映射配置",
+          "properties": {
+            "architecture": { "type": "string", "enum": ["claude", "codex", "gemini"] },
+            "bugfix": { "type": "string", "enum": ["claude", "codex", "gemini"] },
+            "frontend": { "type": "string", "enum": ["claude", "codex", "gemini"] },
+            "backend": { "type": "string", "enum": ["claude", "codex", "gemini"] },
+            "test": { "type": "string", "enum": ["claude", "codex", "gemini"] },
+            "docs": { "type": "string", "enum": ["claude", "codex", "gemini"] },
+            "general": { "type": "string", "enum": ["claude", "codex", "gemini"] }
+          }
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cliArranger",
+          "title": "CLI Arranger",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "cliArranger": [
+        {
+          "type": "webview",
+          "id": "cliArranger.mainView",
+          "name": "CLI Arranger"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/uuid": "^10.0.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "eslint": "^8.54.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "diff": "^5.1.0",
+    "uuid": "^13.0.0"
+  }
+}

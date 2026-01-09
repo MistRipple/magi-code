@@ -1,0 +1,26 @@
+out/
+node_modules/
+
+# VS Code extension build/test artifacts
+.vscode-test/
+*.vsix
+augment-extracted/
+
+# Editor/OS noise
+.DS_Store
+.history/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Local env files
+.env
+.env.*
+
+# Local plugin data
+.cli-arranger/
+.multicli/
+.ace-tool/
