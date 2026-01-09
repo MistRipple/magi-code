@@ -68,7 +68,7 @@ class TaskManager {
         events_1.globalEventBus.emitEvent(eventType, { sessionId: session.id, taskId });
     }
     /** 添加 SubTask */
-    addSubTask(taskId, description, category, assignedCli, targetFiles = []) {
+    addSubTask(taskId, description, assignedWorker, targetFiles = [], options) {
         const session = this.sessionManager.getCurrentSession();
         if (!session)
             throw new Error('没有活动的 Session');
@@ -79,15 +79,43 @@ class TaskManager {
             id: generateId(),
             taskId,
             description,
-            category,
-            assignedCli,
+            assignedWorker,
+            reason: options?.reason,
+            prompt: options?.prompt,
             targetFiles,
+            dependencies: options?.dependencies || [],
+            priority: options?.priority,
             status: 'pending',
             output: [],
         };
         task.subTasks.push(subTask);
         this.sessionManager.updateTask(session.id, taskId, task);
         return subTask;
+    }
+    /** 注册既有 SubTask（用于编排计划落库） */
+    addExistingSubTask(taskId, subTask) {
+        const session = this.sessionManager.getCurrentSession();
+        if (!session)
+            throw new Error('没有活动的 Session');
+        const task = session.tasks.find(t => t.id === taskId);
+        if (!task)
+            throw new Error(`Task 不存在: ${taskId}`);
+        const existing = task.subTasks.find(st => st.id === subTask.id);
+        if (existing) {
+            return existing;
+        }
+        const normalized = {
+            ...subTask,
+            taskId,
+            assignedCli: subTask.assignedCli ?? subTask.assignedWorker,
+            targetFiles: subTask.targetFiles ?? [],
+            dependencies: subTask.dependencies ?? [],
+            status: subTask.status ?? 'pending',
+            output: subTask.output ?? [],
+        };
+        task.subTasks.push(normalized);
+        this.sessionManager.updateTask(session.id, taskId, task);
+        return normalized;
     }
     /** 更新 SubTask 状态 */
     updateSubTaskStatus(taskId, subTaskId, status) {

@@ -113,13 +113,57 @@ export class ClaudeAdapter extends EventEmitter implements ICLIAdapter {
     this.setState('ready');
   }
 
-  /** 断开连接 */
+  /** 断开连接 - 等待进程退出 */
   async disconnect(): Promise<void> {
     if (this.currentProcess) {
-      this.currentProcess.kill();
+      const proc = this.currentProcess;
+      const pid = proc.pid;
+      console.log('[ClaudeAdapter] disconnect: 开始终止进程, PID:', pid);
+
+      await this.killProcessWithWait(proc);
       this.currentProcess = null;
+      console.log('[ClaudeAdapter] disconnect: 进程已终止');
     }
     this.setState('disconnected');
+  }
+
+  /** 辅助方法：终止进程并等待退出 */
+  private killProcessWithWait(proc: ChildProcess, timeoutMs: number = 5000): Promise<void> {
+    return new Promise((resolve) => {
+      let resolved = false;
+      const cleanup = () => {
+        if (resolved) return;
+        resolved = true;
+        resolve();
+      };
+
+      // 监听进程退出
+      proc.once('close', cleanup);
+      proc.once('exit', cleanup);
+
+      // 发送 SIGTERM
+      try {
+        proc.kill('SIGTERM');
+      } catch (e) {
+        // 进程可能已经退出
+        cleanup();
+        return;
+      }
+
+      // 超时后强制 SIGKILL
+      setTimeout(() => {
+        if (resolved) return;
+        console.log('[ClaudeAdapter] killProcessWithWait: SIGTERM 超时，发送 SIGKILL');
+        try { proc.kill('SIGKILL'); } catch (e) { /* ignore */ }
+      }, 1000);
+
+      // 最终超时保护
+      setTimeout(() => {
+        if (resolved) return;
+        console.log('[ClaudeAdapter] killProcessWithWait: 强制完成');
+        cleanup();
+      }, timeoutMs);
+    });
   }
 
   /** 发送消息（Claude CLI 通过 Read 工具读取图片，在 prompt 中引用路径） */
@@ -161,10 +205,16 @@ export class ClaudeAdapter extends EventEmitter implements ICLIAdapter {
 
       console.log('[ClaudeAdapter] 进程已启动, PID:', this.currentProcess.pid);
 
-      // 设置超时
-      const timeout = setTimeout(() => {
+      // 设置超时 - 修复：超时后等待进程退出
+      let timeoutTriggered = false;
+      const timeout = setTimeout(async () => {
         console.log('[ClaudeAdapter] 超时!');
-        this.currentProcess?.kill();
+        timeoutTriggered = true;
+        const proc = this.currentProcess;
+        if (proc) {
+          await this.killProcessWithWait(proc, 3000);
+          this.currentProcess = null;
+        }
         this.setState('ready');
         reject(new Error('Claude CLI timeout'));
       }, this.config.timeout);
@@ -187,6 +237,13 @@ export class ClaudeAdapter extends EventEmitter implements ICLIAdapter {
         console.log('[ClaudeAdapter] 进程关闭, code:', code, 'output length:', output.length);
         clearTimeout(timeout);
         this.currentProcess = null;
+
+        // 如果是超时触发的关闭，不再处理（已经 reject 了）
+        if (timeoutTriggered) {
+          console.log('[ClaudeAdapter] 超时触发的关闭，跳过处理');
+          return;
+        }
+
         this.setState('ready');
 
         const response = this.parseOutput(output);
@@ -211,6 +268,12 @@ export class ClaudeAdapter extends EventEmitter implements ICLIAdapter {
         console.log('[ClaudeAdapter] 进程错误:', err.message);
         clearTimeout(timeout);
         this.currentProcess = null;
+
+        // 如果是超时触发的错误，不再处理
+        if (timeoutTriggered) {
+          return;
+        }
+
         this.setState('error');
         this.emit('error', err);
         reject(err);

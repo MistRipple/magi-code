@@ -79,13 +79,45 @@ export class GeminiAdapter extends EventEmitter implements ICLIAdapter {
     this.setState('ready');
   }
 
-  /** 断开连接 */
+  /** 断开连接 - 等待进程退出 */
   async disconnect(): Promise<void> {
     if (this.currentProcess) {
-      this.currentProcess.kill();
+      const proc = this.currentProcess;
+      console.log('[GeminiAdapter] disconnect: 开始终止进程, PID:', proc.pid);
+      await this.killProcessWithWait(proc);
       this.currentProcess = null;
+      console.log('[GeminiAdapter] disconnect: 进程已终止');
     }
     this.setState('disconnected');
+  }
+
+  /** 辅助方法：终止进程并等待退出 */
+  private killProcessWithWait(proc: ChildProcess, timeoutMs: number = 5000): Promise<void> {
+    return new Promise((resolve) => {
+      let resolved = false;
+      const cleanup = () => {
+        if (resolved) return;
+        resolved = true;
+        resolve();
+      };
+
+      proc.once('close', cleanup);
+      proc.once('exit', cleanup);
+
+      try {
+        proc.kill('SIGTERM');
+      } catch (e) {
+        cleanup();
+        return;
+      }
+
+      setTimeout(() => {
+        if (resolved) return;
+        try { proc.kill('SIGKILL'); } catch (e) { /* ignore */ }
+      }, 1000);
+
+      setTimeout(cleanup, timeoutMs);
+    });
   }
 
   /** 发送消息（Gemini CLI 通过 read_file 工具读取图片，使用内置多模态能力分析） */
@@ -123,10 +155,16 @@ export class GeminiAdapter extends EventEmitter implements ICLIAdapter {
 
       console.log('[GeminiAdapter] 进程已启动, PID:', this.currentProcess.pid);
 
-      // 设置超时
-      const timeout = setTimeout(() => {
+      // 设置超时 - 修复：超时后等待进程退出
+      let timeoutTriggered = false;
+      const timeout = setTimeout(async () => {
         console.log('[GeminiAdapter] 超时!');
-        this.currentProcess?.kill();
+        timeoutTriggered = true;
+        const proc = this.currentProcess;
+        if (proc) {
+          await this.killProcessWithWait(proc, 3000);
+          this.currentProcess = null;
+        }
         this.setState('ready');
         reject(new Error('Gemini CLI timeout'));
       }, this.config.timeout);
@@ -149,6 +187,12 @@ export class GeminiAdapter extends EventEmitter implements ICLIAdapter {
         console.log('[GeminiAdapter] 进程关闭, code:', code, 'output length:', output.length);
         clearTimeout(timeout);
         this.currentProcess = null;
+
+        if (timeoutTriggered) {
+          console.log('[GeminiAdapter] 超时触发的关闭，跳过处理');
+          return;
+        }
+
         this.setState('ready');
 
         const response = this.parseOutput(output);
@@ -171,6 +215,9 @@ export class GeminiAdapter extends EventEmitter implements ICLIAdapter {
         console.log('[GeminiAdapter] 进程错误:', err.message);
         clearTimeout(timeout);
         this.currentProcess = null;
+
+        if (timeoutTriggered) return;
+
         this.setState('error');
         this.emit('error', err);
         reject(err);
@@ -178,13 +225,19 @@ export class GeminiAdapter extends EventEmitter implements ICLIAdapter {
     });
   }
 
-  /** 中断当前操作 */
+  /** 中断当前操作 - 等待进程退出 */
   async interrupt(): Promise<void> {
-    if (this.currentProcess) {
-      this.currentProcess.kill('SIGINT');
-      this.currentProcess = null;
+    if (!this.currentProcess) {
+      this.setState('ready');
+      return;
     }
+
+    const proc = this.currentProcess;
+    console.log('[GeminiAdapter] 开始中断进程, PID:', proc.pid);
+    await this.killProcessWithWait(proc, 3000);
+    this.currentProcess = null;
     this.setState('ready');
+    console.log('[GeminiAdapter] 中断完成');
   }
 
   /** 构建命令行参数（Gemini CLI 不支持图片） */

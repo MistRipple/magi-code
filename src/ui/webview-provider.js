@@ -113,7 +113,10 @@ class WebviewProvider {
     /** 设置所有 CLI 适配器事件监听 */
     setupCLIAdapters() {
         // 监听工厂的统一事件
-        this.cliFactory.on('output', ({ type, chunk }) => {
+        this.cliFactory.on('output', ({ type, chunk, source }) => {
+            if (source === 'orchestrator') {
+                return;
+            }
             const outputs = this.cliOutputs.get(type) || [];
             outputs.push(chunk);
             this.cliOutputs.set(type, outputs);
@@ -123,6 +126,7 @@ class WebviewProvider {
                 subTaskId: type,
                 output: chunk,
                 cliType: type,
+                source,
                 sessionId: this.activeSessionId
             });
         });
@@ -280,6 +284,21 @@ class WebviewProvider {
             });
             this.sendStateUpdate();
         });
+        // 🆕 Orchestrator UI 消息（主对话窗口）
+        events_1.globalEventBus.on('orchestrator:ui_message', (event) => {
+            const data = event.data;
+            if (!(data?.content))
+                return;
+            this.postMessage({
+                type: 'orchestratorMessage',
+                content: data.content,
+                phase: data.metadata?.phase || data.type || '',
+                taskId: event.taskId || data.taskId || '',
+                messageType: data.type,
+                metadata: data.metadata,
+            });
+        });
+
         // 🆕 Orchestrator Phase 状态变化事件 - 增强版
         events_1.globalEventBus.on('orchestrator:phase_changed', (event) => {
             const data = event.data;
@@ -329,28 +348,40 @@ class WebviewProvider {
         // 1. 首先中断 Orchestrator（这会触发 AbortController）
         if (this.intelligentOrchestrator.running) {
             console.log('[MultiCLI] 中断 Orchestrator');
-            this.intelligentOrchestrator.interrupt();
+            await this.intelligentOrchestrator.interrupt();
         }
         // 2. 中断所有 CLI 并等待完成
         console.log('[MultiCLI] 中断所有 CLI...');
         try {
-            await Promise.race([
-                this.cliFactory.interruptAll(),
-                new Promise((resolve) => setTimeout(resolve, 5000)) // 5秒超时
+            const interruptCompleted = await Promise.race([
+                this.cliFactory.interruptAll().then(() => true),
+                new Promise((resolve) => setTimeout(resolve, 5000, false)) // 5秒超时
             ]);
+            if (!interruptCompleted) {
+                console.warn('[MultiCLI] CLI 中断超时，尝试强制断开连接');
+                await this.cliFactory.disconnectAll();
+            }
             console.log('[MultiCLI] CLI 中断完成');
         }
         catch (error) {
             console.error('[MultiCLI] CLI 中断出错:', error);
         }
-        // 3. 更新任务状态
+        // 3. 重置会话，避免取消后的会话残留影响下次请求
+        this.cliFactory.resetAllSessions();
+        // 4. 更新任务状态
         const tasks = this.taskManager.getAllTasks();
         const runningTask = tasks.find(t => t.status === 'running');
         if (runningTask) {
-            this.taskManager.updateTaskStatus(runningTask.id, 'cancelled');
+            this.taskManager.updateTaskStatus(runningTask.id, 'interrupted');
         }
         // 4. 通知 UI
-        this.postMessage({ type: 'toast', message: '任务已取消', toastType: 'info' });
+        this.postMessage({ type: 'toast', message: '任务已打断', toastType: 'info' });
+        this.postMessage({
+            type: 'orchestratorMessage',
+            content: '任务已打断，可在变更中查看已修改的文件，或选择继续执行。',
+            phase: 'interrupted',
+            messageType: 'interrupted'
+        });
         this.sendStateUpdate();
     }
     /** 实现 WebviewViewProvider 接口 */
@@ -423,7 +454,7 @@ class WebviewProvider {
             case 'resumeTask':
                 // 🆕 恢复任务
                 console.log('[MultiCLI] 收到 resumeTask 消息, taskId:', message.taskId);
-                this.postMessage({ type: 'toast', message: '恢复功能开发中', toastType: 'info' });
+                await this.resumeInterruptedTask();
                 break;
             case 'appendMessage':
                 // 🆕 补充内容到当前执行的任务
@@ -551,7 +582,7 @@ class WebviewProvider {
                 break;
             case 'confirmRecovery':
                 // 用户确认恢复策略
-                this.handleRecoveryConfirmation(message.decision);
+                await this.handleRecoveryConfirmation(message.decision);
                 break;
             case 'getState':
                 this.sendStateUpdate();
@@ -582,13 +613,79 @@ class WebviewProvider {
     /** 恢复确认回调的 Promise resolver */
     recoveryConfirmationResolver = null;
     /** 处理恢复确认 */
-    handleRecoveryConfirmation(decision) {
+    async handleRecoveryConfirmation(decision) {
         console.log(`[MultiCLI] 用户恢复决策: ${decision}`);
         if (this.recoveryConfirmationResolver) {
             this.recoveryConfirmationResolver(decision);
             this.recoveryConfirmationResolver = null;
+            return;
         }
+        if (decision === 'rollback') {
+            const count = this.snapshotManager.revertAllChanges();
+            const message = count > 0 ? `已回滚 ${count} 个变更` : '没有可回滚的变更';
+            this.postMessage({ type: 'toast', message, toastType: 'info' });
+            this.postMessage({
+                type: 'orchestratorMessage',
+                content: `回滚完成：${message}`,
+                phase: 'recovery',
+                messageType: 'recovery_result'
+            });
+            return;
+        }
+        if (decision === 'retry') {
+            await this.resumeInterruptedTask('请继续完成之前失败的任务');
+            return;
+        }
+        this.postMessage({ type: 'toast', message: '已选择继续执行，未进行回滚', toastType: 'info' });
     }
+    /** 获取最近被打断的任务 */
+    getLastInterruptedTask() {
+        const tasks = this.taskManager.getAllTasks();
+        const interrupted = [...tasks].reverse().find(t => t.status === 'interrupted');
+        if (!interrupted)
+            return null;
+        return { id: interrupted.id, prompt: interrupted.prompt };
+    }
+
+    /** 构建恢复提示词 */
+    buildResumePrompt(originalPrompt, extraInstruction) {
+        const pendingChanges = this.snapshotManager.getPendingChanges();
+        const changeList = pendingChanges.length
+            ? pendingChanges.map(c => `- ${c.filePath} (+${c.additions}/-${c.deletions})`).join('\n')
+            : '无';
+
+        const extra = extraInstruction ? `\n\n补充指令:\n${extraInstruction}` : '';
+
+        return [
+            '请继续完成上一次被打断的任务。',
+            `原始需求:\n${originalPrompt}`,
+            `已产生的变更:\n${changeList}` + extra,
+        ].join('\n\n');
+    }
+
+    /** 恢复被打断的任务 */
+    async resumeInterruptedTask(extraInstruction) {
+        if (this.intelligentOrchestrator.running) {
+            this.postMessage({ type: 'toast', message: '当前仍有任务在执行', toastType: 'warning' });
+            return;
+        }
+
+        const lastTask = this.getLastInterruptedTask();
+        if (!lastTask) {
+            this.postMessage({ type: 'toast', message: '没有可恢复的任务', toastType: 'info' });
+            return;
+        }
+
+        const prompt = this.buildResumePrompt(lastTask.prompt, extraInstruction);
+        this.postMessage({
+            type: 'orchestratorMessage',
+            content: '正在恢复上一次任务...',
+            phase: 'resuming',
+            messageType: 'resume'
+        });
+        await this.executeTask(prompt, undefined, []);
+    }
+
     /** 🆕 处理补充内容消息 */
     async handleAppendMessage(taskId, content) {
         console.log(`[MultiCLI] 补充内容到任务 ${taskId}: ${content.substring(0, 50)}...`);
@@ -683,38 +780,23 @@ class WebviewProvider {
         const task = this.taskManager.createTask(prompt);
         this.taskManager.updateTaskStatus(task.id, 'running');
         this.sendStateUpdate();
-        // 发送用户 prompt 到 Claude 输出面板
-        const promptMsg = JSON.stringify({
-            type: 'user_prompt',
-            prompt: prompt,
-            cli: 'claude',
-            time: new Date().toLocaleTimeString(),
-            mode: 'intelligent',
-            hasImages: imagePaths.length > 0
-        });
-        this.postMessage({ type: 'subTaskOutput', subTaskId: 'claude', output: promptMsg + '\n', cliType: 'claude' });
         try {
             // 调用智能编排器
             const result = await this.intelligentOrchestrator.execute(prompt, task.id);
             // 保存消息历史
-            this.saveMessageToSession(prompt, result, 'claude');
+            this.saveMessageToSession(prompt, result, undefined, 'orchestrator');
             this.saveCurrentSessionCliIds();
-            // 发送响应到对话线程
-            this.postMessage({
-                type: 'cliResponse',
-                cli: 'claude',
-                content: result,
-            });
         }
         catch (error) {
             console.error('[MultiCLI] 智能编排执行错误:', error);
             const errorMsg = error instanceof Error ? error.message : String(error);
-            this.postMessage({ type: 'cliError', cli: 'claude', error: errorMsg });
+            this.postMessage({ type: 'cliError', cli: 'claude', error: errorMsg, source: 'orchestrator' });
             this.postMessage({
                 type: 'cliResponse',
                 cli: 'claude',
                 content: '',
                 error: errorMsg,
+                source: 'orchestrator',
             });
         }
         this.sendStateUpdate();
@@ -746,7 +828,7 @@ class WebviewProvider {
             }
             else {
                 this.taskManager.updateTaskStatus(task.id, 'completed');
-                this.saveMessageToSession(prompt, response.content || '', targetCli);
+                this.saveMessageToSession(prompt, response.content || '', targetCli, 'worker');
                 this.saveCurrentSessionCliIds();
             }
             this.postMessage({
@@ -766,6 +848,7 @@ class WebviewProvider {
                 cli: targetCli,
                 content: '',
                 error: errorMsg,
+                source: 'orchestrator',
             });
         }
         this.sendStateUpdate();
@@ -815,7 +898,7 @@ class WebviewProvider {
         }
     }
     /** 保存消息到当前会话 */
-    saveMessageToSession(userPrompt, assistantResponse, cli) {
+    saveMessageToSession(userPrompt, assistantResponse, cli, source) {
         const currentSession = this.sessionManager.getCurrentSession();
         if (currentSession) {
             if (!currentSession.messages) {
@@ -834,6 +917,7 @@ class WebviewProvider {
                 content: assistantResponse,
                 cli,
                 timestamp: Date.now(),
+                source,
             });
             // 触发持久化保存
             this.sessionManager.saveCurrentSession();
@@ -855,6 +939,7 @@ class WebviewProvider {
             cli: m.cli,
             timestamp: m.time ? new Date().getTime() : Date.now(),
             images: m.images,
+            source: m.source,
         }));
         // 使用新的 API 保存会话数据
         this.chatSessionManager.updateSessionData(currentSession.id, sessionMessages, cliOutputs);
@@ -882,6 +967,7 @@ class WebviewProvider {
             chatSessions: this.chatSessionManager.getSessionMetas(),
             currentChatSession: chatSession,
             currentTask,
+            tasks,
             cliStatuses,
             degradationStrategy: {
                 level: 3,

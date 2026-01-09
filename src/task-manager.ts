@@ -117,6 +117,34 @@ export class TaskManager {
     return subTask;
   }
 
+  /** 注册既有 SubTask（用于编排计划落库） */
+  addExistingSubTask(taskId: string, subTask: SubTask): SubTask {
+    const session = this.sessionManager.getCurrentSession();
+    if (!session) throw new Error('没有活动的 Session');
+
+    const task = session.tasks.find(t => t.id === taskId);
+    if (!task) throw new Error(`Task 不存在: ${taskId}`);
+
+    const existing = task.subTasks.find(st => st.id === subTask.id);
+    if (existing) {
+      return existing;
+    }
+
+    const normalized: SubTask = {
+      ...subTask,
+      taskId,
+      assignedCli: subTask.assignedCli ?? subTask.assignedWorker,
+      targetFiles: subTask.targetFiles ?? [],
+      dependencies: subTask.dependencies ?? [],
+      status: subTask.status ?? 'pending',
+      output: subTask.output ?? [],
+    };
+
+    task.subTasks.push(normalized);
+    this.sessionManager.updateTask(session.id, taskId, task);
+    return normalized;
+  }
+
   /** 更新 SubTask 状态 */
   updateSubTaskStatus(taskId: string, subTaskId: string, status: SubTaskStatus): void {
     const session = this.sessionManager.getCurrentSession();
@@ -185,4 +213,3 @@ export class TaskManager {
     return session?.tasks ?? [];
   }
 }
-

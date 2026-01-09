@@ -316,8 +316,9 @@ export class CLIDetector {
   /**
    * 解析版本号
    */
-  private parseVersion(output: string): string {
-    const match = output.match(/(\d+\.\d+\.\d+)/);
+  private parseVersion(output: string | undefined | null): string {
+    const safeOutput = output ?? '';
+    const match = safeOutput.match(/(\d+\.\d+\.\d+)/);
     return match ? match[1] : 'unknown';
   }
 

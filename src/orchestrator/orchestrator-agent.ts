@@ -23,6 +23,7 @@ import { ExecutionStats } from './execution-stats';
 import { VerificationRunner, VerificationResult, VerificationConfig } from './verification-runner';
 import { ContextManager, ContextCompressor } from '../context';
 import { SnapshotManager } from '../snapshot-manager';
+import { TaskManager } from '../task-manager';
 import {
   WorkerType,
   OrchestratorState,
@@ -45,10 +46,20 @@ import {
   buildProgressMessage,
 } from './prompts/orchestrator-prompts';
 
+/** 子任务自检/互检默认配置 */
+const DEFAULT_REVIEW_CONFIG = {
+  selfCheck: true,
+  peerReview: 'auto' as const,
+  maxRounds: 1,
+  highRiskExtensions: ['.ts', '.tsx', '.js', '.jsx', '.json', '.yml', '.yaml'],
+  highRiskKeywords: ['refactor', '重构', '迁移', '删除', 'remove', 'schema', '接口', 'config'],
+};
+
 /** 默认配置 */
 const DEFAULT_CONFIG: OrchestratorConfig = {
   timeout: 300000, // 5 分钟
   maxRetries: 3,
+  review: DEFAULT_REVIEW_CONFIG,
   verification: {
     compileCheck: true,
     lintCheck: true,
@@ -58,6 +69,24 @@ const DEFAULT_CONFIG: OrchestratorConfig = {
 
 /** 用户确认回调类型 */
 export type ConfirmationCallback = (plan: ExecutionPlan, formattedPlan: string) => Promise<boolean>;
+
+type ReviewDecisionStatus = 'passed' | 'rejected' | 'skipped';
+
+interface ReviewDecision {
+  status: ReviewDecisionStatus;
+  reviewer?: WorkerType;
+  issues?: string[];
+  summary?: string;
+  reason?: string;
+}
+
+interface ReviewConfigResolved {
+  selfCheck: boolean;
+  peerReview: 'auto' | 'always' | 'never';
+  maxRounds: number;
+  highRiskExtensions: string[];
+  highRiskKeywords: string[];
+}
 
 /**
  * Orchestrator Agent
@@ -82,6 +111,7 @@ export class OrchestratorAgent extends EventEmitter {
 
   // 快照管理（支持文件回滚）
   private snapshotManager: SnapshotManager | null = null;
+  private taskManager: TaskManager | null = null;
 
   // 🆕 执行统计（支持 CLI 降级决策）
   private executionStats: ExecutionStats;
@@ -95,13 +125,16 @@ export class OrchestratorAgent extends EventEmitter {
   // 任务执行状态
   private pendingTasks: Map<string, SubTask> = new Map();
   private completedResults: ExecutionResult[] = [];
-  private failedTasks: Map<string, { task: SubTask; error: string; retries: number }> = new Map();
+  private reviewAttempts: Map<string, number> = new Map();
+  private finalizationPromises: Map<string, Promise<ExecutionResult | null>> = new Map();
+  private warnedReviewSkipForDependencies = false;
 
   constructor(
     cliFactory: CLIAdapterFactory,
     config?: Partial<OrchestratorConfig>,
     workspaceRoot?: string,
-    snapshotManager?: SnapshotManager
+    snapshotManager?: SnapshotManager,
+    taskManager?: TaskManager
   ) {
     super();
     this.cliFactory = cliFactory;
@@ -109,6 +142,7 @@ export class OrchestratorAgent extends EventEmitter {
     this.messageBus = globalMessageBus;
     this.workspaceRoot = workspaceRoot || '';
     this.snapshotManager = snapshotManager || null;
+    this.taskManager = taskManager || null;
 
     // 🆕 创建执行统计实例
     this.executionStats = new ExecutionStats();
@@ -214,6 +248,21 @@ export class OrchestratorAgent extends EventEmitter {
     this.workerPool.on('workerOutput', ({ workerId, workerType, chunk }) => {
       this.emitUIMessage('worker_output', chunk, { workerId, workerType });
     });
+
+    this.workerPool.on('taskRetry', ({ subTaskId, attempt, delay }) => {
+      this.emitUIMessage(
+        'progress_update',
+        `子任务重试中 (${attempt}/${this.config.maxRetries})，等待 ${Math.round(delay)}ms`,
+        { subTaskId, retryAttempt: attempt, retryDelay: delay }
+      );
+    });
+
+    this.workerPool.on('cliFallback', ({ original, fallback, reason }) => {
+      this.emitUIMessage(
+        'progress_update',
+        `CLI 降级: ${original} -> ${fallback}，原因: ${reason}`
+      );
+    });
   }
 
   // =========================================================================
@@ -238,7 +287,9 @@ export class OrchestratorAgent extends EventEmitter {
     this.abortController = new AbortController();
     this.completedResults = [];
     this.pendingTasks.clear();
-    this.failedTasks.clear();
+    this.reviewAttempts.clear();
+    this.finalizationPromises.clear();
+    this.warnedReviewSkipForDependencies = false;
 
     // 初始化上下文管理器
     if (this.contextManager) {
@@ -372,6 +423,9 @@ export class OrchestratorAgent extends EventEmitter {
   private cleanup(): void {
     this.abortController = null;
     this.pendingTasks.clear();
+    this.reviewAttempts.clear();
+    this.finalizationPromises.clear();
+    this.warnedReviewSkipForDependencies = false;
   }
 
   // =========================================================================
@@ -389,7 +443,12 @@ export class OrchestratorAgent extends EventEmitter {
 
     try {
       // 使用 Claude 进行分析（编排者专用会话）
-      const response = await this.cliFactory.sendMessage('claude', analysisPrompt);
+      const response = await this.cliFactory.sendMessage(
+        'claude',
+        analysisPrompt,
+        undefined,
+        { source: 'orchestrator', streamToUI: false }
+      );
 
       if (response.error) {
         console.error('[OrchestratorAgent] 分析失败:', response.error);
@@ -430,12 +489,16 @@ export class OrchestratorAgent extends EventEmitter {
         needsCollaboration: parsed.needsCollaboration ?? true,
         subTasks: (parsed.subTasks || []).map((t: any, i: number) => ({
           id: t.id || String(i + 1),
+          taskId: this.currentContext?.taskId || '',
           description: t.description || '',
           assignedWorker: t.assignedWorker || t.assignedCli || 'claude',
           reason: t.reason || '',
           targetFiles: t.targetFiles || [],
           dependencies: t.dependencies || [],
           prompt: t.prompt || '',
+          priority: t.priority,
+          status: 'pending',
+          output: [],
         })),
         executionMode: parsed.executionMode || 'sequential',
         summary: parsed.summary || '',
@@ -501,12 +564,20 @@ export class OrchestratorAgent extends EventEmitter {
     if (hasDependencies) {
       // 使用依赖图调度执行
       console.log('[OrchestratorAgent] 检测到任务依赖，使用依赖图调度');
+      if (!this.warnedReviewSkipForDependencies && this.shouldEnableReviews()) {
+        this.emitUIMessage(
+          'progress_update',
+          '检测到任务依赖，子任务自检/互检在依赖图模式下暂不启用'
+        );
+        this.warnedReviewSkipForDependencies = true;
+      }
       await this.dispatchWithDependencyGraph(plan.subTasks);
     } else if (plan.executionMode === 'parallel') {
       await this.dispatchParallel(plan.subTasks);
     } else {
       await this.dispatchSequential(plan.subTasks);
     }
+
   }
 
   /** 🆕 基于依赖图分发任务 */
@@ -522,19 +593,7 @@ export class OrchestratorAgent extends EventEmitter {
 
       // 处理执行结果
       for (const result of results) {
-        this.completedResults.push(result);
-        this.pendingTasks.delete(result.subTaskId);
-
-        if (!result.success) {
-          const subTask = subTasks.find(t => t.id === result.subTaskId);
-          if (subTask) {
-            this.failedTasks.set(result.subTaskId, {
-              task: subTask,
-              error: result.error || '未知错误',
-              retries: 0,
-            });
-          }
-        }
+        await this.finalizeResult(result);
       }
 
       const successCount = results.filter(r => r.success).length;
@@ -583,19 +642,50 @@ export class OrchestratorAgent extends EventEmitter {
     }
   }
 
+  /** 将执行计划同步到 TaskManager */
+  private syncPlanToTaskManager(plan: ExecutionPlan): void {
+    if (!this.taskManager || !this.currentContext) return;
+
+    for (const subTask of plan.subTasks) {
+      try {
+        this.taskManager.addExistingSubTask(this.currentContext.taskId, subTask);
+      } catch (error) {
+        console.warn('[OrchestratorAgent] 同步子任务失败:', error);
+      }
+    }
+
+    globalEventBus.emitEvent('task:created', { taskId: this.currentContext.taskId });
+  }
+
   /** 并行分发任务 */
   private async dispatchParallel(subTasks: SubTask[]): Promise<void> {
     const taskId = this.currentContext!.taskId;
     for (const subTask of subTasks) {
-      const worker = this.workerPool.getWorker(subTask.assignedWorker);
-      if (!worker) continue;
-
       this.emitUIMessage('progress_update',
         `分发任务给 ${subTask.assignedWorker}: ${subTask.description}`,
         { subTaskId: subTask.id, workerType: subTask.assignedWorker }
       );
 
-      this.messageBus.dispatchTask(this.id, worker.id, taskId, subTask);
+      void this.workerPool.dispatchTaskWithRetry(
+        subTask.assignedWorker,
+        taskId,
+        subTask
+      ).then(result => {
+        void this.finalizeResult(result);
+      }).catch(error => {
+        console.error(`[OrchestratorAgent] 并行任务分发失败:`, error);
+        const failedResult: ExecutionResult = {
+          workerId: 'unknown',
+          workerType: subTask.assignedWorker,
+          taskId,
+          subTaskId: subTask.id,
+          result: '',
+          success: false,
+          duration: 0,
+          error: error instanceof Error ? error.message : String(error),
+        };
+        void this.finalizeResult(failedResult);
+      });
     }
   }
 
@@ -610,15 +700,256 @@ export class OrchestratorAgent extends EventEmitter {
         { subTaskId: subTask.id, workerType: subTask.assignedWorker }
       );
 
-      const result = await this.workerPool.dispatchTask(
-        subTask.assignedWorker, taskId, subTask
+      try {
+        const result = await this.workerPool.dispatchTaskWithRetry(
+          subTask.assignedWorker, taskId, subTask
+        );
+
+        const finalResult = await this.finalizeResult(result);
+
+        if (!finalResult?.success) break;
+      } catch (error) {
+        const failedResult: ExecutionResult = {
+          workerId: 'unknown',
+          workerType: subTask.assignedWorker,
+          taskId,
+          subTaskId: subTask.id,
+          result: '',
+          success: false,
+          duration: 0,
+          error: error instanceof Error ? error.message : String(error),
+        };
+
+        void this.finalizeResult(failedResult);
+        break;
+      }
+    }
+  }
+
+  /** 处理子任务执行结果 */
+  private async finalizeResult(result: ExecutionResult): Promise<ExecutionResult | null> {
+    const subTaskId = result.subTaskId;
+    if (!subTaskId) {
+      this.completedResults.push(result);
+      return result;
+    }
+
+    if (this.finalizationPromises.has(subTaskId)) {
+      return this.finalizationPromises.get(subTaskId) ?? null;
+    }
+
+    const promise = (async () => {
+      const subTask = this.pendingTasks.get(subTaskId);
+      if (!subTask) {
+        return null;
+      }
+
+      const reviewConfig = this.resolveReviewConfig();
+      if (!result.success || !reviewConfig) {
+        this.recordResult(result);
+        return result;
+      }
+
+      const decision = await this.runSubTaskReviews(subTask, result, reviewConfig);
+      if (decision.status === 'passed' || decision.status === 'skipped') {
+        this.recordResult(result);
+        return result;
+      }
+
+      const attempts = this.reviewAttempts.get(subTaskId) ?? 0;
+      if (attempts >= reviewConfig.maxRounds) {
+        const failedResult: ExecutionResult = {
+          ...result,
+          success: false,
+          error: decision.summary || decision.reason || result.error || '子任务互检失败',
+        };
+        this.recordResult(failedResult);
+        return failedResult;
+      }
+
+      this.reviewAttempts.set(subTaskId, attempts + 1);
+      this.emitUIMessage(
+        'progress_update',
+        `子任务 ${subTaskId} 互检未通过，进入第 ${attempts + 1} 轮修复`,
+        { subTaskId, review: decision } as any
       );
 
-      this.completedResults.push(result);
-      this.pendingTasks.delete(subTask.id);
+      this.pendingTasks.set(subTaskId, subTask);
+      const retryResult = await this.workerPool.dispatchTaskWithRetry(
+        subTask.assignedWorker,
+        subTask.taskId,
+        subTask
+      );
+      return this.finalizeResult(retryResult);
+    })();
 
-      if (!result.success) break;
+    this.finalizationPromises.set(subTaskId, promise);
+    try {
+      return await promise;
+    } finally {
+      this.finalizationPromises.delete(subTaskId);
     }
+  }
+
+  private resolveReviewConfig(): ReviewConfigResolved | null {
+    if (!this.config.review) {
+      return null;
+    }
+
+    return {
+      selfCheck: this.config.review.selfCheck ?? DEFAULT_REVIEW_CONFIG.selfCheck,
+      peerReview: this.config.review.peerReview ?? DEFAULT_REVIEW_CONFIG.peerReview,
+      maxRounds: this.config.review.maxRounds ?? DEFAULT_REVIEW_CONFIG.maxRounds,
+      highRiskExtensions: this.config.review.highRiskExtensions ?? DEFAULT_REVIEW_CONFIG.highRiskExtensions,
+      highRiskKeywords: this.config.review.highRiskKeywords ?? DEFAULT_REVIEW_CONFIG.highRiskKeywords,
+    };
+  }
+
+  private shouldEnableReviews(): boolean {
+    return !!this.resolveReviewConfig();
+  }
+
+  private shouldPeerReview(subTask: SubTask, config: ReviewConfigResolved): boolean {
+    if (config.peerReview === 'always') {
+      return true;
+    }
+    if (config.peerReview === 'never') {
+      return false;
+    }
+
+    const keywords = config.highRiskKeywords.map(keyword => keyword.toLowerCase());
+    const text = `${subTask.description} ${subTask.prompt || ''}`.toLowerCase();
+    const keywordHit = keywords.some(keyword => keyword && text.includes(keyword));
+    if (keywordHit) {
+      return true;
+    }
+
+    const extensions = config.highRiskExtensions.map(ext => ext.toLowerCase());
+    const fileHit = (subTask.targetFiles || []).some(file => {
+      const lower = file.toLowerCase();
+      return extensions.some(ext => lower.endsWith(ext));
+    });
+
+    return fileHit;
+  }
+
+  private selectPeerReviewer(subTask: SubTask): WorkerType {
+    const candidates: WorkerType[] = ['claude', 'codex', 'gemini'];
+    const filtered = candidates.filter(cli => cli !== subTask.assignedWorker);
+    return filtered[0] ?? subTask.assignedWorker;
+  }
+
+  private buildSelfCheckPrompt(subTask: SubTask, _result: ExecutionResult): string {
+    const files = (subTask.targetFiles || []).join(', ') || '未声明';
+    return [
+      '你刚完成一个子任务，请进行快速自检。',
+      `子任务: ${subTask.id}`,
+      `描述: ${subTask.description}`,
+      `目标文件: ${files}`,
+      '请检查是否满足任务要求、是否遗漏或引入错误。',
+      '输出 JSON: {"status":"passed|rejected","issues":[...],"summary":"..."}',
+      '只输出 JSON。',
+    ].join('\n');
+  }
+
+  private buildPeerReviewPrompt(subTask: SubTask, _result: ExecutionResult): string {
+    const files = (subTask.targetFiles || []).join(', ') || '未声明';
+    return [
+      '你是代码审查者，请对另一个 CLI 完成的子任务进行快速审查。',
+      `子任务: ${subTask.id}`,
+      `描述: ${subTask.description}`,
+      `目标文件: ${files}`,
+      '请检查是否满足要求、是否存在逻辑/质量问题。',
+      '输出 JSON: {"status":"passed|rejected","issues":[...],"summary":"..."}',
+      '只输出 JSON。',
+    ].join('\n');
+  }
+
+  private parseReviewDecision(content: string): ReviewDecision {
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    const raw = jsonMatch ? jsonMatch[0] : content;
+    try {
+      const parsed = JSON.parse(raw);
+      const status = parsed.status === 'rejected' ? 'rejected' : 'passed';
+      const issues = Array.isArray(parsed.issues) ? parsed.issues : [];
+      const summary = typeof parsed.summary === 'string' ? parsed.summary : '';
+      return { status, issues, summary };
+    } catch (error) {
+      return { status: 'skipped', reason: 'review_parse_failed' };
+    }
+  }
+
+  private async runSubTaskReviews(
+    subTask: SubTask,
+    result: ExecutionResult,
+    config: ReviewConfigResolved
+  ): Promise<ReviewDecision> {
+    if (!config.selfCheck && !this.shouldPeerReview(subTask, config)) {
+      return { status: 'skipped', reason: 'review_disabled' };
+    }
+
+    if (config.selfCheck) {
+      const prompt = this.buildSelfCheckPrompt(subTask, result);
+      const response = await this.cliFactory.sendMessage(
+        subTask.assignedWorker,
+        prompt,
+        undefined,
+        { source: 'orchestrator', streamToUI: false }
+      );
+
+      if (response.error) {
+        return { status: 'rejected', reviewer: subTask.assignedWorker, reason: response.error };
+      }
+
+      const decision = this.parseReviewDecision(response.content || '');
+      if (decision.status === 'rejected') {
+        decision.reviewer = subTask.assignedWorker;
+        this.emitUIMessage(
+          'progress_update',
+          `子任务 ${subTask.id} 自检未通过`,
+          { subTaskId: subTask.id, review: decision } as any
+        );
+        return decision;
+      }
+    }
+
+    if (!this.shouldPeerReview(subTask, config)) {
+      return { status: 'passed', reason: 'peer_review_skipped' };
+    }
+
+    const reviewer = this.selectPeerReviewer(subTask);
+    const peerPrompt = this.buildPeerReviewPrompt(subTask, result);
+    const peerResponse = await this.cliFactory.sendMessage(
+      reviewer,
+      peerPrompt,
+      undefined,
+      { source: 'orchestrator', streamToUI: false }
+    );
+
+    if (peerResponse.error) {
+      return { status: 'rejected', reviewer, reason: peerResponse.error };
+    }
+
+    const peerDecision = this.parseReviewDecision(peerResponse.content || '');
+    if (peerDecision.status === 'rejected') {
+      peerDecision.reviewer = reviewer;
+      this.emitUIMessage(
+        'progress_update',
+        `子任务 ${subTask.id} 互检未通过`,
+        { subTaskId: subTask.id, review: peerDecision } as any
+      );
+      return peerDecision;
+    }
+
+    return { status: 'passed', reviewer };
+  }
+
+  private async waitForAllFinalized(): Promise<void> {
+    const pending = Array.from(this.finalizationPromises.values());
+    if (pending.length === 0) {
+      return;
+    }
+    await Promise.allSettled(pending);
   }
 
   // =========================================================================
@@ -631,7 +962,7 @@ export class OrchestratorAgent extends EventEmitter {
 
     console.log('[OrchestratorAgent] Phase 4: 监控执行...');
 
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       const interval = setInterval(() => {
         if (this.abortController?.signal.aborted) {
           clearInterval(interval);
@@ -649,6 +980,8 @@ export class OrchestratorAgent extends EventEmitter {
         if (this.pendingTasks.size > 0) reject(new Error('任务执行超时'));
       }, this.config.timeout);
     });
+
+    await this.waitForAllFinalized();
   }
 
 
@@ -700,7 +1033,9 @@ export class OrchestratorAgent extends EventEmitter {
     console.log('[OrchestratorAgent] Phase 6: 汇总结果...');
 
     if (results.length === 0) {
-      return '没有执行任何任务。';
+      const emptySummary = '没有执行任何任务。';
+      this.emitUIMessage('summary', emptySummary);
+      return emptySummary;
     }
 
     // 构建包含验证结果的汇总 prompt
@@ -711,17 +1046,26 @@ export class OrchestratorAgent extends EventEmitter {
     }
 
     try {
-      const response = await this.cliFactory.sendMessage('claude', summaryPrompt);
+      const response = await this.cliFactory.sendMessage(
+        'claude',
+        summaryPrompt,
+        undefined,
+        { source: 'orchestrator', streamToUI: false }
+      );
 
       if (response.error) {
-        return `任务执行完成，但汇总失败: ${response.error}`;
+        const summary = `任务执行完成，但汇总失败: ${response.error}`;
+        this.emitUIMessage('summary', summary);
+        return summary;
       }
 
       this.emitUIMessage('summary', response.content);
       return response.content;
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      return `任务执行完成，但汇总失败: ${errorMsg}`;
+      const summary = `任务执行完成，但汇总失败: ${errorMsg}`;
+      this.emitUIMessage('summary', summary);
+      return summary;
     }
   }
 
@@ -729,9 +1073,10 @@ export class OrchestratorAgent extends EventEmitter {
   // 消息处理
   // =========================================================================
 
-  /** 处理任务完成消息 */
-  private handleTaskCompleted(message: TaskCompletedMessage): void {
-    const { result } = message.payload;
+  private recordResult(result: ExecutionResult): boolean {
+    if (!this.pendingTasks.has(result.subTaskId)) {
+      return false;
+    }
 
     this.completedResults.push(result);
     this.pendingTasks.delete(result.subTaskId);
@@ -739,7 +1084,6 @@ export class OrchestratorAgent extends EventEmitter {
     const total = this.currentContext?.plan?.subTasks.length || 0;
     const completed = this.completedResults.length;
 
-    // 更新 Memory 中的任务状态
     if (this.contextManager) {
       this.contextManager.updateTaskStatus(
         result.subTaskId,
@@ -748,12 +1092,39 @@ export class OrchestratorAgent extends EventEmitter {
       );
     }
 
-    this.emitUIMessage('progress_update',
+    if (this.taskManager) {
+      this.taskManager.updateSubTaskStatus(
+        result.taskId,
+        result.subTaskId,
+        result.success ? 'completed' : 'failed'
+      );
+      globalEventBus.emitEvent(result.success ? 'subtask:completed' : 'subtask:failed', {
+        taskId: result.taskId,
+        subTaskId: result.subTaskId,
+        data: result.success ? { success: true } : { error: result.error || '未知错误' },
+      });
+    }
+
+    this.emitUIMessage(
+      'progress_update',
       buildProgressMessage(completed, total, result.workerType),
       { progress: Math.round((completed / total) * 100), result }
     );
 
-    this.emit('taskCompleted', result);
+    if (!result.success) {
+      this.emitUIMessage('error', `子任务失败: ${result.error || '未知错误'}`, { subTaskId: result.subTaskId });
+    }
+
+    return true;
+  }
+
+  /** 处理任务完成消息 */
+  private handleTaskCompleted(message: TaskCompletedMessage): void {
+    const { result } = message.payload;
+
+    void this.finalizeResult(result).catch(error => {
+      console.warn('[OrchestratorAgent] 任务收尾失败:', error);
+    });
   }
 
   /** 处理任务失败消息 */
@@ -761,90 +1132,45 @@ export class OrchestratorAgent extends EventEmitter {
     const { taskId, subTaskId, error, canRetry } = message.payload;
     const subTask = this.pendingTasks.get(subTaskId);
 
-    if (subTask) {
-      const existing = this.failedTasks.get(subTaskId);
-      const retries = existing ? existing.retries + 1 : 1;
-
-      if (canRetry && retries < this.config.maxRetries) {
-        this.failedTasks.set(subTaskId, { task: subTask, error, retries });
-
-        // 实现重试逻辑
-        this.emitUIMessage('progress_update',
-          `子任务失败，正在重试 (${retries}/${this.config.maxRetries}): ${error}`,
-          { subTaskId }
-        );
-
-        // 延迟重试，避免立即重试导致相同错误
-        setTimeout(() => {
-          this.retryTask(subTask, retries);
-        }, 1000 * retries); // 递增延迟
-
-      } else {
-        // 超过最大重试次数，标记为最终失败
-        this.pendingTasks.delete(subTaskId);
-        this.failedTasks.delete(subTaskId);
-
-        // 更新 Memory 中的任务状态
-        if (this.contextManager) {
-          this.contextManager.updateTaskStatus(subTaskId, 'failed', error);
-        }
-
-        // 记录失败结果
-        const failedResult: ExecutionResult = {
-          workerId: 'unknown',
-          workerType: subTask.assignedWorker,
-          taskId,
-          subTaskId,
-          result: '',
-          success: false,
-          duration: 0,
-          error: `任务失败（已重试 ${retries} 次）: ${error}`,
-        };
-        this.completedResults.push(failedResult);
-
-        this.emitUIMessage('error', `子任务最终失败: ${error}`, { subTaskId });
-      }
-    }
-  }
-
-  /** 重试失败的任务 */
-  private async retryTask(subTask: SubTask, retryCount: number): Promise<void> {
-    if (this.abortController?.signal.aborted) {
+    if (!subTask) {
       return;
     }
 
-    console.log(`[OrchestratorAgent] 重试任务 ${subTask.id}，第 ${retryCount} 次`);
-
-    try {
-      const result = await this.workerPool.dispatchTask(
-        subTask.assignedWorker,
-        this.currentContext!.taskId,
-        subTask
+    if (canRetry) {
+      this.emitUIMessage(
+        'progress_update',
+        `子任务失败，正在重试: ${error}`,
+        { subTaskId }
       );
-
-      // 重试成功，清理失败记录
-      if (result.success) {
-        this.failedTasks.delete(subTask.id);
-        this.pendingTasks.delete(subTask.id);
-        this.completedResults.push(result);
-
-        this.emitUIMessage('progress_update',
-          `任务重试成功: ${subTask.description}`,
-          { subTaskId: subTask.id }
-        );
-      }
-      // 如果重试仍然失败，handleTaskFailed 会再次被调用
-    } catch (error) {
-      console.error(`[OrchestratorAgent] 重试任务失败:`, error);
+      return;
     }
+
+    console.warn(`[OrchestratorAgent] 子任务失败: ${error}`);
   }
 
   /** 处理进度汇报消息 */
   private handleProgressReport(message: ProgressReportMessage): void {
-    const { subTaskId, status, progress, message: msg, output } = message.payload;
+    const { taskId, subTaskId, status, progress, message: msg, output } = message.payload;
 
     if (output) {
       this.emitUIMessage('worker_output', output, { subTaskId });
+    }
+
+    if (status === 'started' || status === 'in_progress') {
+      this.taskManager?.updateSubTaskStatus(taskId, subTaskId, 'running');
+
+      if (status === 'started') {
+        const subTask = this.pendingTasks.get(subTaskId)
+          ?? this.currentContext?.plan?.subTasks.find(task => task.id === subTaskId);
+        globalEventBus.emitEvent('subtask:started', {
+          taskId,
+          subTaskId,
+          data: {
+            cli: subTask?.assignedWorker,
+            description: subTask?.description,
+          },
+        });
+      }
     }
 
     if (msg) {

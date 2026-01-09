@@ -18,6 +18,10 @@ export interface FactoryConfig {
     timeout?: number;
     env?: Record<string, string>;
 }
+export interface AdapterOutputScope {
+    source?: 'worker' | 'orchestrator' | 'system';
+    streamToUI?: boolean;
+}
 /**
  * CLI 适配器工厂
  * 提供统一的适配器创建、管理和事件转发
@@ -86,7 +90,7 @@ export declare class CLIAdapterFactory extends EventEmitter {
      * 发送消息到指定 CLI
      * 如果目标 CLI 不支持图片或处于会话恢复模式，会先用 Codex 描述图片
      */
-    sendMessage(type: CLIType, message: string, imagePaths?: string[]): Promise<CLIResponse>;
+    sendMessage(type: CLIType, message: string, imagePaths?: string[], options?: AdapterOutputScope): Promise<CLIResponse>;
     /**
      * 判断是否需要用 Codex 描述图片
      * @returns true 如果需要描述图片

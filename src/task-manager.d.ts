@@ -2,7 +2,7 @@
  * Task 管理器
  * 管理 Task 创建、状态更新、SubTask 分解
  */
-import { Task, SubTask, TaskStatus, SubTaskStatus, TaskCategory, CLIType } from './types';
+import { Task, SubTask, TaskStatus, SubTaskStatus, WorkerType } from './types';
 import { SessionManager } from './session-manager';
 /**
  * Task 管理器
@@ -16,8 +16,15 @@ export declare class TaskManager {
     getTask(taskId: string): Task | null;
     /** 更新 Task 状态 */
     updateTaskStatus(taskId: string, status: TaskStatus): void;
-    /** 添加 SubTask */
-    addSubTask(taskId: string, description: string, category: TaskCategory, assignedCli: CLIType, targetFiles?: string[]): SubTask;
+    /** 添加 SubTask（使用统一类型） */
+    addSubTask(taskId: string, description: string, assignedWorker: WorkerType, targetFiles?: string[], options?: {
+        reason?: string;
+        prompt?: string;
+        dependencies?: string[];
+        priority?: number;
+    }): SubTask;
+    /** 注册既有 SubTask（用于编排计划落库） */
+    addExistingSubTask(taskId: string, subTask: SubTask): SubTask;
     /** 更新 SubTask 状态 */
     updateSubTaskStatus(taskId: string, subTaskId: string, status: SubTaskStatus): void;
     /** 添加 SubTask 输出 */
