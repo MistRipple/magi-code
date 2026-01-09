@@ -1,5 +1,5 @@
 /**
- * CLI Arranger 主导出文件
+ * MultiCLI 主导出文件
  */
 
 // 类型导出

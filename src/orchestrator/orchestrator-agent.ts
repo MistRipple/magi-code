@@ -30,7 +30,7 @@ import {
   OrchestratorEvents,
   ExecutionPlan,
   ExecutionResult,
-  PlanSubTask,
+  SubTask,
   TaskContext,
   OrchestratorUIMessage,
   BusMessage,
@@ -585,6 +585,7 @@ export class OrchestratorAgent extends EventEmitter {
 
   /** 并行分发任务 */
   private async dispatchParallel(subTasks: SubTask[]): Promise<void> {
+    const taskId = this.currentContext!.taskId;
     for (const subTask of subTasks) {
       const worker = this.workerPool.getWorker(subTask.assignedWorker);
       if (!worker) continue;
@@ -594,12 +595,13 @@ export class OrchestratorAgent extends EventEmitter {
         { subTaskId: subTask.id, workerType: subTask.assignedWorker }
       );
 
-      this.messageBus.dispatchTask(this.id, worker.id, this.currentContext!.taskId, subTask);
+      this.messageBus.dispatchTask(this.id, worker.id, taskId, subTask);
     }
   }
 
   /** 串行分发任务 */
   private async dispatchSequential(subTasks: SubTask[]): Promise<void> {
+    const taskId = this.currentContext!.taskId;
     for (const subTask of subTasks) {
       this.checkAborted();
 
@@ -609,7 +611,7 @@ export class OrchestratorAgent extends EventEmitter {
       );
 
       const result = await this.workerPool.dispatchTask(
-        subTask.assignedWorker, this.currentContext!.taskId, subTask
+        subTask.assignedWorker, taskId, subTask
       );
 
       this.completedResults.push(result);
@@ -870,8 +872,7 @@ export class OrchestratorAgent extends EventEmitter {
 
     // 发送事件时标识来源为 'orchestrator'
     globalEventBus.emitEvent('orchestrator:ui_message', {
-      data: message,
-      source: 'orchestrator'  // 标识消息来源
+      data: { ...message, source: 'orchestrator' }  // 将 source 放入 data 中
     });
     this.emit('uiMessage', message);
   }

@@ -65,7 +65,7 @@ class CLIDetector {
     healthCheckInterval = null;
     healthCheckPeriod = 60 * 1000; // 1分钟健康检查
     constructor() {
-        this.config = vscode.workspace.getConfiguration('cliArranger');
+        this.config = vscode.workspace.getConfiguration('multiCli');
     }
     /**
      * 启动健康检查定时器
@@ -402,7 +402,7 @@ class CLIDetector {
      * 刷新配置
      */
     refreshConfig() {
-        this.config = vscode.workspace.getConfiguration('cliArranger');
+        this.config = vscode.workspace.getConfiguration('multiCli');
         this.statusCache.clear();
         this.lastCheck = 0;
     }

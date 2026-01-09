@@ -11,7 +11,7 @@ export declare class WebviewProvider implements vscode.WebviewViewProvider {
     private readonly extensionUri;
     private readonly context;
     private readonly workspaceRoot;
-    static readonly viewType = "cliArranger.mainView";
+    static readonly viewType = "multiCli.mainView";
     private _view?;
     private sessionManager;
     private chatSessionManager;

@@ -1,5 +1,5 @@
 /**
- * CLI Arranger 后端业务逻辑测试脚本
+ * MultiCLI 后端业务逻辑测试脚本
  * 运行: node -r ./test/setup-mock.js -r ts-node/register test/run-tests.ts
  * 或者: npx ts-node test/run-tests.ts
  *
@@ -159,7 +159,7 @@ async function testPrompts(): Promise<void> {
 
 // ============ 主测试入口 ============
 async function runAllTests(): Promise<void> {
-  console.log('🚀 CLI Arranger 后端业务逻辑测试\n');
+  console.log('🚀 MultiCLI 后端业务逻辑测试\n');
   console.log('=' .repeat(50));
 
   try {

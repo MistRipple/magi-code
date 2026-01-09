@@ -28,7 +28,7 @@ export class ChatSessionManager {
   private storageDir: string;
 
   constructor(workspaceRoot: string) {
-    this.storageDir = path.join(workspaceRoot, '.cli-arranger', 'chat-sessions');
+    this.storageDir = path.join(workspaceRoot, '.multicli', 'chat-sessions');
     this.ensureStorageDir();
     this.loadAllSessions();
   }

@@ -581,7 +581,7 @@ export class WorkerPool extends EventEmitter {
 
     // 添加所有任务到图中
     for (const subTask of subTasks) {
-      graph.addTask(subTask.id, subTask.title || subTask.description, subTask);
+      graph.addTask(subTask.id, subTask.description, subTask);
     }
 
     // 添加依赖关系
@@ -663,7 +663,7 @@ export class WorkerPool extends EventEmitter {
       const chunk = subTasks.slice(i, i + maxParallel);
       const chunkPromises = chunk.map(subTask =>
         this.dispatchTaskWithRetry(
-          subTask.assignedWorker || subTask.assignedCli || 'claude',
+          subTask.assignedWorker || 'claude',
           taskId,
           subTask,
           context
@@ -693,7 +693,7 @@ export class WorkerPool extends EventEmitter {
     const graph = new TaskDependencyGraph();
 
     for (const subTask of subTasks) {
-      graph.addTask(subTask.id, subTask.title || subTask.description, subTask);
+      graph.addTask(subTask.id, subTask.description, subTask);
     }
 
     for (const subTask of subTasks) {

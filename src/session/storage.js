@@ -6,8 +6,8 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.SessionStorage = void 0;
 /** 存储键前缀 */
-const STORAGE_PREFIX = 'cliArranger.session.';
-const SESSION_LIST_KEY = 'cliArranger.sessionList';
+const STORAGE_PREFIX = 'multiCli.session.';
+const SESSION_LIST_KEY = 'multiCli.sessionList';
 /**
  * 会话存储类
  */

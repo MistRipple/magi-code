@@ -22,7 +22,7 @@ export class SessionManager {
   private storageDir: string;
 
   constructor(workspaceRoot: string) {
-    this.storageDir = path.join(workspaceRoot, '.cli-arranger', 'sessions');
+    this.storageDir = path.join(workspaceRoot, '.multicli', 'sessions');
     this.ensureStorageDir();
   }
 

@@ -53,7 +53,7 @@ class SessionManager {
     currentSessionId = null;
     storageDir;
     constructor(workspaceRoot) {
-        this.storageDir = path.join(workspaceRoot, '.cli-arranger', 'sessions');
+        this.storageDir = path.join(workspaceRoot, '.multicli', 'sessions');
         this.ensureStorageDir();
     }
     /** 确保存储目录存在 */

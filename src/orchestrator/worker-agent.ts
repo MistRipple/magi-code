@@ -19,6 +19,7 @@ import {
   WorkerInfo,
   WorkerEvents,
   SubTask,
+  PlanSubTask,
   ExecutionResult,
   BusMessage,
   TaskDispatchMessage,
@@ -162,7 +163,7 @@ export class WorkerAgent extends EventEmitter {
    * 执行任务
    * 核心方法：接收子任务，调用 CLI 执行，汇报结果
    */
-  async executeTask(taskId: string, subTask: SubTask, context?: string): Promise<ExecutionResult> {
+  async executeTask(taskId: string, subTask: PlanSubTask, context?: string): Promise<ExecutionResult> {
     const startTime = Date.now();
     this.currentTaskId = taskId;
     this.currentSubTaskId = subTask.id;
@@ -248,7 +249,7 @@ export class WorkerAgent extends EventEmitter {
   /**
    * 构建执行 prompt
    */
-  protected buildExecutionPrompt(subTask: SubTask, context?: string): string {
+  protected buildExecutionPrompt(subTask: PlanSubTask, context?: string): string {
     const filesHint = subTask.targetFiles?.length
       ? `\n\n**Target Files**: ${subTask.targetFiles.join(', ')}`
       : '';
