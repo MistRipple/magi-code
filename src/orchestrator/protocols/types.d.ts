@@ -134,6 +134,19 @@ export interface OrchestratorConfig {
     timeout: number;
     /** 最大重试次数 */
     maxRetries: number;
+    /** 子任务自检/互检配置 */
+    review?: {
+        /** 子任务自检（默认 true） */
+        selfCheck?: boolean;
+        /** 互检策略（默认 auto） */
+        peerReview?: 'auto' | 'always' | 'never';
+        /** 自检/互检失败后的重做轮次（默认 1） */
+        maxRounds?: number;
+        /** 高风险文件后缀（用于 auto 互检） */
+        highRiskExtensions?: string[];
+        /** 高风险关键词（用于 auto 互检） */
+        highRiskKeywords?: string[];
+    };
     /** 验证配置 */
     verification?: {
         compileCheck?: boolean;

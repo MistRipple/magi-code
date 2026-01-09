@@ -114,13 +114,19 @@ export class ChatSessionManager {
   }
 
   /** 添加消息到当前会话 */
-  addMessage(role: 'user' | 'assistant', content: string, cli?: CLIType): SessionMessage {
+  addMessage(
+    role: 'user' | 'assistant',
+    content: string,
+    cli?: CLIType,
+    source?: 'orchestrator' | 'worker' | 'system'
+  ): SessionMessage {
     const session = this.getOrCreateCurrentSession();
     const message: SessionMessage = {
       id: generateMessageId(),
       role,
       content,
       cli,
+      source,
       timestamp: Date.now(),
     };
 
@@ -355,6 +361,26 @@ export class ChatSessionManager {
       session.updatedAt = Date.now();
       this.saveSession(session);
     }
+  }
+
+  /** 获取最近 N 条消息（用于 Prompt 增强上下文） */
+  getRecentMessages(count: number = 10): SessionMessage[] {
+    const session = this.getCurrentSession();
+    if (!session || session.messages.length === 0) {
+      return [];
+    }
+    return session.messages.slice(-count);
+  }
+
+  /** 格式化对话历史为字符串（用于 Prompt 增强） */
+  formatConversationHistory(count: number = 10): string {
+    const messages = this.getRecentMessages(count);
+    if (messages.length === 0) {
+      return '';
+    }
+    return messages
+      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
+      .join('\n\n');
   }
 }
 

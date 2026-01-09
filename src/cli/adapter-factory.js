@@ -17,6 +17,7 @@ const gemini_1 = require("./adapters/gemini");
 class CLIAdapterFactory extends events_1.EventEmitter {
     adapters = new Map();
     config;
+    outputScopes = new Map();
     constructor(config) {
         super();
         this.config = config;
@@ -58,7 +59,11 @@ class CLIAdapterFactory extends events_1.EventEmitter {
      */
     setupAdapterEvents(adapter, type) {
         adapter.on('output', (chunk) => {
-            this.emit('output', { type, chunk });
+            const scope = this.outputScopes.get(type);
+            if (scope?.streamToUI === false) {
+                return;
+            }
+            this.emit('output', { type, chunk, source: scope?.source });
         });
         adapter.on('response', (response) => {
             this.emit('response', { type, response });
@@ -170,37 +175,54 @@ class CLIAdapterFactory extends events_1.EventEmitter {
      * 发送消息到指定 CLI
      * 如果目标 CLI 不支持图片或处于会话恢复模式，会先用 Codex 描述图片
      */
-    async sendMessage(type, message, imagePaths) {
+    async sendMessage(type, message, imagePaths, options) {
         const adapter = this.getOrCreate(type);
         if (!adapter.isConnected) {
             await adapter.connect();
         }
         const hasImages = imagePaths && imagePaths.length > 0;
         console.log(`[CLIAdapterFactory] sendMessage: type=${type}, hasImages=${hasImages}, imagePaths=`, imagePaths);
-        // 判断是否需要预处理图片
-        if (hasImages) {
-            const needsImageDescription = this.shouldDescribeImages(type, adapter);
-            console.log(`[CLIAdapterFactory] needsImageDescription=${needsImageDescription}`);
-            if (needsImageDescription) {
-                console.log(`[CLIAdapterFactory] 目标 CLI ${type} 需要图片描述，使用 Codex 预处理`);
-                try {
-                    const imageDescription = await codex_1.CodexAdapter.describeImages(imagePaths, this.config.cwd);
-                    console.log(`[CLIAdapterFactory] 图片描述结果: "${imageDescription}"`);
-                    // 将图片描述附加到消息中
-                    const enhancedMessage = `${message}\n\n[图片内容描述]\n${imageDescription}`;
-                    console.log(`[CLIAdapterFactory] 图片描述完成，增强后的消息长度: ${enhancedMessage.length}`);
-                    return adapter.sendMessage(enhancedMessage);
-                }
-                catch (error) {
-                    console.error('[CLIAdapterFactory] 图片描述失败:', error);
-                    // 图片描述失败时，仍然发送原始消息，但附加提示
-                    const fallbackMessage = `${message}\n\n[注意: 图片处理失败，请用户重新描述图片内容]`;
-                    return adapter.sendMessage(fallbackMessage);
+        const scope = options ? { ...options } : null;
+        if (scope) {
+            this.outputScopes.set(type, scope);
+        }
+        try {
+            // 判断是否需要预处理图片
+            if (hasImages) {
+                const needsImageDescription = this.shouldDescribeImages(type, adapter);
+                console.log(`[CLIAdapterFactory] needsImageDescription=${needsImageDescription}`);
+                if (needsImageDescription) {
+                    console.log(`[CLIAdapterFactory] 目标 CLI ${type} 需要图片描述，使用 Codex 预处理`);
+                    try {
+                        const imageDescription = await codex_1.CodexAdapter.describeImages(imagePaths, this.config.cwd);
+                        console.log(`[CLIAdapterFactory] 图片描述结果: "${imageDescription}"`);
+                        // 将图片描述附加到消息中
+                        const enhancedMessage = `${message}
+
+[图片内容描述]
+${imageDescription}`;
+                        console.log(`[CLIAdapterFactory] 图片描述完成，增强后的消息长度: ${enhancedMessage.length}`);
+                        return adapter.sendMessage(enhancedMessage);
+                    }
+                    catch (error) {
+                        console.error('[CLIAdapterFactory] 图片描述失败:', error);
+                        // 图片描述失败时，仍然发送原始消息，但附加提示
+                        const fallbackMessage = `${message}
+
+[注意: 图片处理失败，请用户重新描述图片内容]`;
+                        return adapter.sendMessage(fallbackMessage);
+                    }
                 }
             }
+
+            // 直接发送（支持图片的 CLI 或无图片）
+            return adapter.sendMessage(message, imagePaths);
         }
-        // 直接发送（支持图片的 CLI 或无图片）
-        return adapter.sendMessage(message, imagePaths);
+        finally {
+            if (scope) {
+                this.outputScopes.delete(type);
+            }
+        }
     }
     /**
      * 判断是否需要用 Codex 描述图片

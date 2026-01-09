@@ -159,6 +159,7 @@ export interface SessionMessage {
   role: 'user' | 'assistant';
   content: string;
   cli?: CLIType;
+  source?: 'orchestrator' | 'worker' | 'system';
   timestamp: number;
   fileChanges?: FileChange[];
   /** 附件（图片等） */

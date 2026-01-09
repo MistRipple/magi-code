@@ -52,6 +52,7 @@ export interface SessionMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
   cli?: CLIType;
+  source?: MessageSource;
   timestamp: number;
 }
 
@@ -432,6 +433,7 @@ export interface UIState {
   /** 当前聊天会话 */
   currentChatSession?: ChatSession;
   currentTask?: Task;
+  tasks?: Task[];
   cliStatuses: CLIStatus[];
   degradationStrategy: DegradationStrategy;
   pendingChanges: PendingChange[];
@@ -510,7 +512,14 @@ export type WebviewToExtensionMessage =
   | { type: 'setInteractionMode'; mode: InteractionMode }
   | { type: 'confirmRecovery'; decision: 'retry' | 'rollback' | 'continue' }
   // 🆕 执行统计相关
-  | { type: 'requestExecutionStats' };
+  | { type: 'requestExecutionStats' }
+  // 🆕 CLI 连接状态检测
+  | { type: 'checkCliStatus' }
+  // 🆕 Prompt 增强配置
+  | { type: 'getPromptEnhanceConfig' }
+  | { type: 'updatePromptEnhance'; config: { baseUrl: string; apiKey: string } }
+  | { type: 'testPromptEnhance'; baseUrl: string; apiKey: string }
+  | { type: 'enhancePrompt'; prompt: string };
 
 // Extension 发送到 Webview 的消息
 // source 字段用于区分消息来源：'orchestrator' = 编排者, 'worker' = 执行代理
@@ -520,7 +529,7 @@ export type ExtensionToWebviewMessage =
   | { type: 'stateUpdate'; state: UIState }
   | { type: 'taskUpdate'; task: Task }
   | { type: 'subTaskOutput'; subTaskId: string; output: string; cliType?: CLIType; sessionId?: string | null; source?: MessageSource }
-  | { type: 'cliStatusUpdate'; statuses: CLIStatus[] }
+  | { type: 'cliStatusUpdate'; statuses: Record<string, { status: string; version?: string }> }
   | { type: 'cliStatusChanged'; cli: string; available: boolean; version?: string }
   | { type: 'cliError'; cli: string; error: string; source?: MessageSource }
   | { type: 'cliResponse'; cli: CLIType; content: string; error?: string; sessionId?: string | null; source?: MessageSource }
@@ -533,7 +542,7 @@ export type ExtensionToWebviewMessage =
   | { type: 'confirmationRequest'; plan: unknown; formattedPlan: string }
   | { type: 'error'; message: string }
   // 新增：编排者专用消息类型
-  | { type: 'orchestratorMessage'; content: string; phase: string; taskId?: string }
+  | { type: 'orchestratorMessage'; content: string; phase: string; taskId?: string; messageType?: string; metadata?: Record<string, unknown> }
   // 新增：Worker 专用消息类型
   | { type: 'workerOutput'; workerId: string; workerType: CLIType; content: string; subTaskId: string }
   // 交互模式和验证相关
@@ -546,7 +555,11 @@ export type ExtensionToWebviewMessage =
   | { type: 'taskResumed'; taskId: string }
   // 🆕 执行统计相关消息
   | { type: 'executionStatsUpdate'; stats: CLIExecutionStats[] }
-  | { type: 'cliFallbackNotice'; originalCli: CLIType; fallbackCli: CLIType; reason: string };
+  | { type: 'cliFallbackNotice'; originalCli: CLIType; fallbackCli: CLIType; reason: string }
+  // 🆕 Prompt 增强测试结果
+  | { type: 'promptEnhanceResult'; success: boolean; message: string }
+  // 🆕 Prompt 增强结果
+  | { type: 'promptEnhanced'; enhancedPrompt: string; error: string };
 
 /** 🆕 CLI 执行统计数据（用于 UI 显示） */
 export interface CLIExecutionStats {
@@ -569,4 +582,3 @@ export interface CLIExecutionStats {
   /** 最后执行时间 */
   lastExecutionTime?: number;
 }
-

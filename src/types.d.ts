@@ -28,6 +28,7 @@ export interface SessionMessage {
     role: 'user' | 'assistant' | 'system';
     content: string;
     cli?: CLIType;
+    source?: MessageSource;
     timestamp: number;
 }
 export type SessionStatus = 'active' | 'completed';
@@ -220,6 +221,7 @@ export interface UIState {
     /** 当前聊天会话 */
     currentChatSession?: ChatSession;
     currentTask?: Task;
+    tasks?: Task[];
     cliStatuses: CLIStatus[];
     degradationStrategy: DegradationStrategy;
     pendingChanges: PendingChange[];
@@ -390,6 +392,13 @@ export type ExtensionToWebviewMessage = {
 } | {
     type: 'error';
     message: string;
+} | {
+    type: 'orchestratorMessage';
+    content: string;
+    phase: string;
+    taskId?: string;
+    messageType?: string;
+    metadata?: Record<string, unknown>;
 } | {
     type: 'interactionModeChanged';
     mode: InteractionMode;

@@ -139,7 +139,7 @@
     .plan-confirm-btn.cancel { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
     .plan-confirm-btn.cancel:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
 
-    /* 🔧 固定位置模态对话框（参考 Augment Ask 模式） */
+    /* 固定位置模态对话框 */
     .plan-modal-container { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; }
     .plan-modal-overlay { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.5); }
     .plan-modal-dialog { position: relative; width: 90%; max-width: 500px; max-height: 80vh; background: var(--vscode-editor-background); border: 1px solid var(--vscode-focusBorder); border-radius: var(--radius-3); box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3); display: flex; flex-direction: column; overflow: hidden; }
@@ -161,7 +161,7 @@
     .plan-modal-btn.cancel { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
     .plan-modal-btn.cancel:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
 
-    /* 🔧 错误消息卡片（问题3修复） */
+    /* 错误消息卡片 */
     .error-message-card { background: var(--vscode-inputValidation-errorBackground, rgba(255, 0, 0, 0.1)); border: 1px solid var(--vscode-inputValidation-errorBorder, #f44336); border-radius: var(--radius-3); margin: var(--spacing-3) 0; overflow: hidden; }
     .error-message-header { display: flex; align-items: center; gap: 8px; padding: var(--spacing-3); background: rgba(244, 67, 54, 0.15); border-bottom: 1px solid var(--vscode-inputValidation-errorBorder, #f44336); }
     .error-message-header svg { width: 18px; height: 18px; fill: var(--vscode-errorForeground, #f44336); }
@@ -171,7 +171,22 @@
     .error-message-content { padding: var(--spacing-3); font-size: var(--font-size-2); line-height: 1.5; color: var(--vscode-foreground); white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow-y: auto; }
     .error-message-hint { padding: var(--spacing-2) var(--spacing-3); font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); border-top: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); }
 
-    /* 🔧 主线进度卡片（问题4修复） */
+    /* 系统提示消息（内联在对话中） */
+    .system-notice { display: flex; align-items: center; gap: 8px; padding: 6px 12px; margin: 4px 0; font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); border-radius: var(--radius-2); background: transparent; }
+    .system-notice-icon { width: 14px; height: 14px; flex-shrink: 0; opacity: 0.7; }
+    .system-notice-icon svg { width: 14px; height: 14px; }
+    .system-notice.info { color: var(--vscode-textLink-foreground); }
+    .system-notice.info .system-notice-icon svg { fill: var(--vscode-textLink-foreground); }
+    .system-notice.success { color: var(--vscode-charts-green); }
+    .system-notice.success .system-notice-icon svg { fill: var(--vscode-charts-green); }
+    .system-notice.warning { color: var(--vscode-charts-yellow); }
+    .system-notice.warning .system-notice-icon svg { fill: var(--vscode-charts-yellow); }
+    .system-notice.error { color: var(--vscode-errorForeground); }
+    .system-notice.error .system-notice-icon svg { fill: var(--vscode-errorForeground); }
+    .system-notice-text { flex: 1; }
+    .system-notice-time { font-size: 10px; opacity: 0.6; }
+
+    /* 主线进度卡片 */
     .mainline-progress-card { display: flex; align-items: center; gap: var(--spacing-2); padding: var(--spacing-2) var(--spacing-3); margin: var(--spacing-1) 0; background: var(--vscode-sideBar-background); border-left: 3px solid var(--vscode-panel-border); border-radius: 0 var(--radius-2) var(--radius-2) 0; font-size: var(--font-size-2); }
     .mainline-progress-card.started { border-left-color: var(--vscode-charts-blue); }
     .mainline-progress-card.completed { border-left-color: var(--vscode-charts-green); opacity: 0.8; }
@@ -191,7 +206,7 @@
     .mainline-progress-cli.cli-gemini { background: var(--vscode-charts-blue); }
     .mainline-progress-time { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
 
-    /* 🆕 执行计划确认卡片（内联在消息流中） */
+    /* 执行计划确认卡片（内联在消息流中） */
     .plan-confirmation-card { background: var(--vscode-editor-background); border: 2px solid var(--vscode-focusBorder); border-radius: var(--radius-3); margin: var(--spacing-3) 0; overflow: hidden; }
     .plan-confirmation-card.pending { border-color: var(--vscode-charts-yellow); }
     .plan-confirmation-card.confirmed { border-color: var(--vscode-charts-green); opacity: 0.8; }
@@ -263,7 +278,7 @@
     .cli-status-icon.claude { color: #d97706; }
     .cli-status-icon.codex { color: #22c55e; }
     .cli-status-icon.gemini { color: #3b82f6; }
-    /* 🆕 来源样式 - 编排者紫色，Worker绿色 */
+    /* 来源样式 - Orchestrator紫色，Worker绿色 */
     .cli-status-icon.source-orchestrator { color: #6366f1; }
     .cli-status-icon.source-worker { color: #10b981; }
     .cli-status-card.source-orchestrator { border-left-color: #6366f1; }
@@ -392,14 +407,26 @@
     .message-avatar.assistant.cli-claude { background: linear-gradient(135deg, #d97706, #f59e0b); }
     .message-avatar.assistant.cli-codex { background: linear-gradient(135deg, #059669, #10b981); }
     .message-avatar.assistant.cli-gemini { background: linear-gradient(135deg, #4285f4, #34a853); }
-    /* 🆕 编排者专属颜色 - 紫色/蓝色渐变 */
+    /* Orchestrator专属颜色 - 紫色/蓝色渐变 */
     .message-avatar.assistant.source-orchestrator { background: linear-gradient(135deg, #6366f1, #8b5cf6); }
-    /* 🆕 Worker 专属颜色 - 绿色渐变 */
+    /* Worker 专属颜色 - 绿色渐变 */
     .message-avatar.assistant.source-worker { background: linear-gradient(135deg, #059669, #10b981); }
     .message-avatar svg { width: 14px; height: 14px; fill: currentColor; }
 
     /* 消息主体 */
     .message-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+
+    /* 消息分组样式 - 连续同源消息只显示第一条的头像和头部 */
+    .message.grouped {
+      margin-top: 2px;
+      padding-top: 4px;
+    }
+    .message.grouped .message-avatar {
+      visibility: hidden;
+    }
+    .message.grouped .message-header {
+      display: none;
+    }
 
     /* 消息头部：角色名 + 时间 + CLI标签 */
     .message-header { display: flex; align-items: center; gap: 8px; }
@@ -410,7 +437,7 @@
       background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
       text-transform: uppercase; font-weight: 500;
     }
-    /* 🆕 消息来源标签样式 */
+    /* 消息来源标签样式 */
     .message-source-tag {
       font-size: 9px; padding: 2px 6px; border-radius: 4px;
       font-weight: 500; text-transform: uppercase;
@@ -425,6 +452,53 @@
       background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
     }
 
+    /* 编排者消息类型徽章 */
+    .orchestrator-badge {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 500;
+      padding: 2px 8px;
+      border-radius: 3px;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .orchestrator-badge.task-assign {
+      background: rgba(59, 130, 246, 0.15);
+      color: var(--vscode-textLink-foreground, #3b82f6);
+      border: 1px solid rgba(59, 130, 246, 0.3);
+    }
+    .orchestrator-badge.self-check {
+      background: rgba(168, 85, 247, 0.15);
+      color: #a855f7;
+      border: 1px solid rgba(168, 85, 247, 0.3);
+    }
+    .orchestrator-badge.peer-review {
+      background: rgba(236, 72, 153, 0.15);
+      color: #ec4899;
+      border: 1px solid rgba(236, 72, 153, 0.3);
+    }
+    .orchestrator-badge.fix-request {
+      background: rgba(245, 158, 11, 0.15);
+      color: #f59e0b;
+      border: 1px solid rgba(245, 158, 11, 0.3);
+    }
+    .orchestrator-badge.analyze {
+      background: rgba(6, 182, 212, 0.15);
+      color: #06b6d4;
+      border: 1px solid rgba(6, 182, 212, 0.3);
+    }
+    .orchestrator-badge.summary {
+      background: rgba(16, 185, 129, 0.15);
+      color: #10b981;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+    .orchestrator-badge.default {
+      background: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
+      border: 1px solid var(--vscode-panel-border);
+    }
+
     /* 消息内容 */
     .message-content {
       font-size: 13px; line-height: 1.6;
@@ -432,14 +506,10 @@
       white-space: pre-wrap; word-break: break-word;
     }
 
-    /* 流式光标 */
-    .message.streaming .message-content::after {
-      content: '▋';
-      animation: cursorBlink 1s ease-in-out infinite;
-      color: var(--vscode-textLink-foreground);
-      margin-left: 2px;
+    /* 流式消息样式（无光标） */
+    .message.streaming .message-content {
+      opacity: 0.9;
     }
-    @keyframes cursorBlink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
 
     /* 正在思考动画 */
     .thinking-indicator { display: inline-flex; align-items: center; gap: 6px; color: var(--vscode-descriptionForeground); }
@@ -585,13 +655,13 @@
     .cli-output-view { font-family: var(--vscode-editor-font-family); font-size: var(--font-size-2); line-height: 1.5; padding: var(--spacing-2); }
     /* CLI 消息气泡 - 使用与对话相同的左右对齐规则 */
     .cli-msg { margin-bottom: var(--spacing-3); display: flex; flex-direction: column; animation: fadeIn 0.2s ease; }
-    .cli-msg.streaming { animation: none; } /* 🔧 流式消息不需要入场动画 */
+    .cli-msg.streaming { animation: none; }
     .cli-msg-content { font-size: var(--font-size-3); line-height: 1.6; padding: var(--spacing-3); border-radius: var(--radius-3); max-width: 85%; word-break: break-word; white-space: pre-wrap; }
-    /* 🔧 CLI 流式消息脉冲光标效果 */
-    .cli-msg.streaming .cli-msg-content::after { content: '▋'; animation: cursor-blink 1s ease-in-out infinite; color: var(--vscode-textLink-foreground); }
+    /* 流式消息样式（无光标） */
+    .cli-msg.streaming .cli-msg-content { opacity: 0.9; }
     .cli-msg-time { font-size: 10px; color: var(--vscode-descriptionForeground); margin-bottom: 4px; }
     .cli-msg-label { font-size: var(--font-size-1); font-weight: 600; color: var(--vscode-descriptionForeground); margin-bottom: 4px; text-transform: uppercase; }
-    /* 右侧：用户/编排器发送的指令 */
+    /* 右侧：用户/Orchestrator器发送的指令 */
     .cli-msg.prompt { align-items: flex-end; }
     .cli-msg.prompt .cli-msg-time { text-align: right; padding-right: var(--spacing-1); }
     .cli-msg.prompt .cli-msg-content { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-bottom-right-radius: var(--radius-1); }
@@ -628,10 +698,14 @@
     .cli-selector { padding: var(--spacing-1) var(--spacing-2); font-size: var(--font-size-1); background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); border-radius: var(--radius-1); cursor: pointer; outline: none; }
     .cli-selector:focus { border-color: var(--vscode-focusBorder); }
 
-    .enhance-btn { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; font-size: var(--font-size-1); background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-1); cursor: pointer; transition: background 0.1s ease, border-color 0.1s ease, color 0.1s ease; }
-    .enhance-btn:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); border-color: var(--vscode-focusBorder); }
-    .enhance-btn:active { transform: scale(0.97); }
-    .enhance-btn svg { width: 12px; height: 12px; fill: currentColor; }
+    .enhance-btn { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; font-size: var(--font-size-1); background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-1); cursor: pointer; transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, opacity 0.2s ease; }
+    .enhance-btn:hover:not(.loading) { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); border-color: var(--vscode-focusBorder); }
+    .enhance-btn:active:not(.loading) { transform: scale(0.97); }
+    .enhance-btn svg { width: 14px; height: 14px; fill: currentColor; transition: transform 0.2s ease; }
+    .enhance-btn.loading { pointer-events: none; opacity: 0.7; cursor: wait; }
+    .enhance-btn.loading svg { animation: enhance-spin 1s linear infinite; }
+    .enhance-btn .enhance-text { transition: opacity 0.2s ease; }
+    @keyframes enhance-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
     .send-btn { width: 28px; height: 28px; border-radius: var(--radius-1); background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; transition: background 0.1s ease, transform 0.1s ease; }
     .send-btn:hover { background: var(--vscode-button-hoverBackground); }
@@ -678,7 +752,49 @@
     .settings-toggle.active { background: var(--vscode-button-background); border-color: var(--vscode-button-background); }
     .settings-toggle.active::after { left: 18px; background: var(--vscode-button-foreground); }
 
-    /* 🆕 CLI 统计面板样式 */
+    /* CLI 连接状态样式 */
+    .cli-connection-list { display: flex; flex-direction: column; gap: var(--spacing-2); }
+    .cli-connection-item { display: flex; align-items: center; gap: var(--spacing-3); padding: var(--spacing-2) var(--spacing-3); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); }
+    .cli-connection-item.available { border-color: #3dd68c; }
+    .cli-connection-item.unavailable { border-color: #f14c4c; opacity: 0.7; }
+    .cli-connection-icon { width: 32px; height: 32px; border-radius: var(--radius-2); display: flex; align-items: center; justify-content: center; }
+    .cli-connection-icon svg { width: 20px; height: 20px; fill: currentColor; }
+    .cli-connection-icon.claude { background: rgba(217, 119, 6, 0.15); color: #d97706; }
+    .cli-connection-icon.codex { background: rgba(34, 197, 94, 0.15); color: #22c55e; }
+    .cli-connection-icon.gemini { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+    .cli-connection-info { flex: 1; min-width: 0; }
+    .cli-connection-name { font-size: var(--font-size-2); font-weight: 600; }
+    .cli-connection-status { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-top: 2px; }
+    .cli-connection-badge { font-size: var(--font-size-1); padding: 2px 8px; border-radius: var(--radius-full); font-weight: 500; }
+    .cli-connection-badge.available { background: rgba(61, 214, 140, 0.2); color: #3dd68c; }
+    .cli-connection-badge.unavailable { background: rgba(241, 76, 76, 0.2); color: #f14c4c; }
+    .cli-connection-badge.checking { background: rgba(204, 167, 0, 0.2); color: #cca700; }
+    .cli-refresh-btn { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; margin-top: var(--spacing-2); padding: var(--spacing-2); background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: none; border-radius: var(--radius-2); cursor: pointer; font-size: var(--font-size-2); transition: background var(--transition-fast); }
+    .cli-refresh-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
+    .cli-refresh-btn svg { width: 14px; height: 14px; fill: currentColor; }
+    .cli-refresh-btn.loading svg { animation: spin 1s linear infinite; }
+
+    /* Prompt 增强配置样式 */
+    .prompt-enhance-section { margin-top: var(--spacing-2); }
+    .prompt-enhance-form { display: flex; flex-direction: column; gap: var(--spacing-2); padding: var(--spacing-2) var(--spacing-3); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); }
+    .prompt-enhance-field { display: flex; flex-direction: column; gap: 4px; }
+    .prompt-enhance-label { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .prompt-enhance-input-wrap { display: flex; align-items: center; gap: 4px; }
+    .prompt-enhance-input { flex: 1; padding: var(--spacing-1) var(--spacing-2); font-size: var(--font-size-2); background: var(--vscode-sideBar-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-1); outline: none; font-family: var(--vscode-editor-font-family), monospace; }
+    .prompt-enhance-input:focus { border-color: var(--vscode-focusBorder); }
+    .prompt-enhance-input::placeholder { color: var(--vscode-descriptionForeground); opacity: 0.6; }
+    .prompt-enhance-eye-btn { display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; background: transparent; border: 1px solid var(--vscode-input-border); border-radius: var(--radius-1); cursor: pointer; color: var(--vscode-descriptionForeground); transition: var(--transition-fast); }
+    .prompt-enhance-eye-btn:hover { background: var(--vscode-list-hoverBackground); color: var(--vscode-foreground); }
+    .prompt-enhance-eye-btn svg { width: 14px; height: 14px; fill: currentColor; }
+    .prompt-enhance-test-btn { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; margin-top: var(--spacing-1); padding: var(--spacing-2); background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: none; border-radius: var(--radius-2); cursor: pointer; font-size: var(--font-size-2); transition: background var(--transition-fast); }
+    .prompt-enhance-test-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
+    .prompt-enhance-test-btn svg { width: 14px; height: 14px; fill: currentColor; }
+    .prompt-enhance-test-btn.loading svg { animation: spin 1s linear infinite; }
+    .prompt-enhance-status { font-size: var(--font-size-1); padding: 4px 8px; border-radius: var(--radius-1); margin-top: var(--spacing-1); }
+    .prompt-enhance-status.success { background: rgba(61, 214, 140, 0.15); color: #3dd68c; }
+    .prompt-enhance-status.error { background: rgba(241, 76, 76, 0.15); color: #f14c4c; }
+
+    /* CLI 统计面板样式 */
     .cli-stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--spacing-2); }
     .cli-stat-card { background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); padding: var(--spacing-2); text-align: center; }
     .cli-stat-card.healthy { border-color: #3dd68c; }
@@ -840,12 +956,12 @@
               </select>
             </div>
             <div class="input-actions-right">
-              <button class="enhance-btn" id="enhance-btn" title="增强提示">
-                <svg viewBox="0 0 16 16"><path d="M5.933.87a2.89 2.89 0 0 1 4.134 0l.622.638.89-.011a2.89 2.89 0 0 1 2.924 2.924l-.01.89.636.622a2.89 2.89 0 0 1 0 4.134l-.637.622.011.89a2.89 2.89 0 0 1-2.924 2.924l-.89-.01-.622.636a2.89 2.89 0 0 1-4.134 0l-.622-.637-.89.011a2.89 2.89 0 0 1-2.924-2.924l.01-.89-.636-.622a2.89 2.89 0 0 1 0-4.134l.637-.622-.011-.89a2.89 2.89 0 0 1 2.924-2.924l.89.01.622-.636zM7.002 11a1 1 0 1 0 2 0 1 1 0 0 0-2 0zm1.602-2.027c.04-.534.198-.815.846-1.26.674-.475 1.05-1.09 1.05-1.986 0-1.325-.92-2.227-2.262-2.227-1.02 0-1.792.492-2.1 1.29A1.71 1.71 0 0 0 6 5.48c0 .393.203.64.545.64.272 0 .455-.147.564-.51.158-.592.525-.915 1.074-.915.61 0 .98.395.98.94 0 .476-.218.79-.645 1.07-.786.51-1.05.934-1.05 1.65v.166c0 .424.213.634.62.634.42 0 .634-.22.634-.634v-.067z"/></svg>
-                <span>增强</span>
+              <button class="enhance-btn" id="enhance-btn" title="增强提示 (AI 优化)">
+                <svg viewBox="0 0 16 16"><path d="M7.657 6.247c.11-.33.576-.33.686 0l.645 1.937a2.89 2.89 0 0 0 1.828 1.828l1.937.645c.33.11.33.576 0 .686l-1.937.645a2.89 2.89 0 0 0-1.828 1.828l-.645 1.937a.361.361 0 0 1-.686 0l-.645-1.937a2.89 2.89 0 0 0-1.828-1.828l-1.937-.645a.361.361 0 0 1 0-.686l1.937-.645a2.89 2.89 0 0 0 1.828-1.828l.645-1.937zM3.794 1.148a.217.217 0 0 1 .412 0l.387 1.162c.173.518.579.924 1.097 1.097l1.162.387a.217.217 0 0 1 0 .412l-1.162.387A1.734 1.734 0 0 0 4.593 5.69l-.387 1.162a.217.217 0 0 1-.412 0L3.407 5.69a1.734 1.734 0 0 0-1.097-1.097l-1.162-.387a.217.217 0 0 1 0-.412l1.162-.387A1.734 1.734 0 0 0 3.407 2.31l.387-1.162zM10.863.099a.145.145 0 0 1 .274 0l.258.774c.115.346.386.617.732.732l.774.258a.145.145 0 0 1 0 .274l-.774.258a1.156 1.156 0 0 0-.732.732l-.258.774a.145.145 0 0 1-.274 0l-.258-.774a1.156 1.156 0 0 0-.732-.732L9.1 2.137a.145.145 0 0 1 0-.274l.774-.258c.346-.115.617-.386.732-.732L10.863.1z"/></svg>
+                <span class="enhance-text">增强</span>
               </button>
               <button class="send-btn" id="execute-btn" title="发送 (Cmd+Enter)">
-                <svg class="icon-send" viewBox="0 0 16 16"><path d="M15.854 8.354a.5.5 0 0 0 0-.708l-3-3a.5.5 0 0 0-.708.708L14.293 7.5H1.5a.5.5 0 0 0 0 1h12.793l-2.147 2.146a.5.5 0 0 0 .708.708l3-3z"/></svg>
+                <svg class="icon-send" viewBox="0 0 16 16"><path d="M1.724 1.053a.5.5 0 0 0-.714.545l1.403 4.85a.5.5 0 0 0 .397.354l5.69.953c.268.053.268.437 0 .49l-5.69.953a.5.5 0 0 0-.397.354l-1.403 4.85a.5.5 0 0 0 .714.545l13-6.5a.5.5 0 0 0 0-.894l-13-6.5z"/></svg>
                 <svg class="icon-stop" viewBox="0 0 16 16"><path d="M5 3.5h6A1.5 1.5 0 0 1 12.5 5v6a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 11V5A1.5 1.5 0 0 1 5 3.5z"/></svg>
               </button>
             </div>
@@ -878,33 +994,72 @@
         </button>
       </div>
       <div class="settings-content">
+        <!-- CLI 连接状态 -->
         <div class="settings-section">
-          <div class="settings-section-title">CLI 配置</div>
-          <div class="settings-item">
-            <div><div class="settings-item-label">Claude 路径</div><div class="settings-item-desc">Claude CLI 可执行文件路径</div></div>
-            <input type="text" class="settings-input" id="setting-claude-path" value="claude" />
+          <div class="settings-section-title">CLI 连接状态</div>
+          <div class="cli-connection-list" id="cli-connection-list">
+            <div class="cli-connection-item" data-cli="claude">
+              <div class="cli-connection-icon claude">
+                <svg viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1z"/></svg>
+              </div>
+              <div class="cli-connection-info">
+                <div class="cli-connection-name">Claude</div>
+                <div class="cli-connection-status">检测中...</div>
+              </div>
+              <div class="cli-connection-badge checking">检测中</div>
+            </div>
+            <div class="cli-connection-item" data-cli="codex">
+              <div class="cli-connection-icon codex">
+                <svg viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1z"/></svg>
+              </div>
+              <div class="cli-connection-info">
+                <div class="cli-connection-name">Codex</div>
+                <div class="cli-connection-status">检测中...</div>
+              </div>
+              <div class="cli-connection-badge checking">检测中</div>
+            </div>
+            <div class="cli-connection-item" data-cli="gemini">
+              <div class="cli-connection-icon gemini">
+                <svg viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1z"/></svg>
+              </div>
+              <div class="cli-connection-info">
+                <div class="cli-connection-name">Gemini</div>
+                <div class="cli-connection-status">检测中...</div>
+              </div>
+              <div class="cli-connection-badge checking">检测中</div>
+            </div>
           </div>
-          <div class="settings-item">
-            <div><div class="settings-item-label">Codex 路径</div><div class="settings-item-desc">Codex CLI 可执行文件路径</div></div>
-            <input type="text" class="settings-input" id="setting-codex-path" value="codex" />
-          </div>
-          <div class="settings-item">
-            <div><div class="settings-item-label">Gemini 路径</div><div class="settings-item-desc">Gemini CLI 可执行文件路径</div></div>
-            <input type="text" class="settings-input" id="setting-gemini-path" value="gemini" />
+          <button class="cli-refresh-btn" id="cli-refresh-btn">
+            <svg viewBox="0 0 16 16"><path d="M11.534 7h3.932a.25.25 0 0 1 .192.41l-1.966 2.36a.25.25 0 0 1-.384 0l-1.966-2.36a.25.25 0 0 1 .192-.41zm-11 2h3.932a.25.25 0 0 0 .192-.41L2.692 6.23a.25.25 0 0 0-.384 0L.342 8.59A.25.25 0 0 0 .534 9z"/><path d="M8 3c-1.552 0-2.94.707-3.857 1.818a.5.5 0 1 1-.771-.636A6.002 6.002 0 0 1 13.917 7H12.9A5.002 5.002 0 0 0 8 3zM3.1 9a5.002 5.002 0 0 0 8.757 2.182.5.5 0 1 1 .771.636A6.002 6.002 0 0 1 2.083 9H3.1z"/></svg>
+            重新检测
+          </button>
+        </div>
+        <!-- Augment 配置 -->
+        <div class="settings-section prompt-enhance-section">
+          <div class="settings-section-title">Augment 配置</div>
+          <div class="prompt-enhance-form" id="prompt-enhance-form">
+            <div class="prompt-enhance-field">
+              <label class="prompt-enhance-label">API 地址</label>
+              <input type="text" class="prompt-enhance-input" id="prompt-enhance-url" placeholder="https://api.example.com/v1">
+            </div>
+            <div class="prompt-enhance-field">
+              <label class="prompt-enhance-label">API 密钥</label>
+              <div class="prompt-enhance-input-wrap">
+                <input type="password" class="prompt-enhance-input" id="prompt-enhance-key" placeholder="sk-...">
+                <button class="prompt-enhance-eye-btn" id="prompt-enhance-eye" title="显示/隐藏密钥">
+                  <svg viewBox="0 0 16 16" id="eye-icon-closed"><path d="M13.359 11.238C15.06 9.72 16 8 16 8s-3-5.5-8-5.5a7.028 7.028 0 0 0-2.79.588l.77.771A5.944 5.944 0 0 1 8 3.5c2.12 0 3.879 1.168 5.168 2.457A13.134 13.134 0 0 1 14.828 8c-.058.087-.122.183-.195.288-.335.48-.83 1.12-1.465 1.755-.165.165-.337.328-.517.486l.708.709z"/><path d="M11.297 9.176a3.5 3.5 0 0 0-4.474-4.474l.823.823a2.5 2.5 0 0 1 2.829 2.829l.822.822zm-2.943 1.299l.822.822a3.5 3.5 0 0 1-4.474-4.474l.823.823a2.5 2.5 0 0 0 2.829 2.829z"/><path d="M3.35 5.47c-.18.16-.353.322-.518.487A13.134 13.134 0 0 0 1.172 8l.195.288c.335.48.83 1.12 1.465 1.755C4.121 11.332 5.881 12.5 8 12.5c.716 0 1.39-.133 2.02-.36l.77.772A7.029 7.029 0 0 1 8 13.5C3 13.5 0 8 0 8s.939-1.721 2.641-3.238l.708.709z"/><path d="M13.646 14.354l-12-12 .708-.708 12 12-.708.708z"/></svg>
+                  <svg viewBox="0 0 16 16" id="eye-icon-open" style="display:none"><path d="M16 8s-3-5.5-8-5.5S0 8 0 8s3 5.5 8 5.5S16 8 16 8zM1.173 8a13.133 13.133 0 0 1 1.66-2.043C4.12 4.668 5.88 3.5 8 3.5c2.12 0 3.879 1.168 5.168 2.457A13.133 13.133 0 0 1 14.828 8c-.058.087-.122.183-.195.288-.335.48-.83 1.12-1.465 1.755C11.879 11.332 10.119 12.5 8 12.5c-2.12 0-3.879-1.168-5.168-2.457A13.134 13.134 0 0 1 1.172 8z"/><path d="M8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5zM4.5 8a3.5 3.5 0 1 1 7 0 3.5 3.5 0 0 1-7 0z"/></svg>
+                </button>
+              </div>
+            </div>
+            <button class="prompt-enhance-test-btn" id="prompt-enhance-test">
+              <svg viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>
+              测试连接
+            </button>
+            <div class="prompt-enhance-status" id="prompt-enhance-status" style="display:none"></div>
           </div>
         </div>
-        <div class="settings-section">
-          <div class="settings-section-title">行为设置</div>
-          <div class="settings-item">
-            <div><div class="settings-item-label">自动快照</div><div class="settings-item-desc">执行任务前自动创建快照</div></div>
-            <div class="settings-toggle active" id="setting-auto-snapshot"></div>
-          </div>
-          <div class="settings-item">
-            <div><div class="settings-item-label">自动审批</div><div class="settings-item-desc">自动审批低风险变更</div></div>
-            <div class="settings-toggle" id="setting-auto-approve"></div>
-          </div>
-        </div>
-        <!-- 🆕 CLI 执行统计区域 -->
+        <!-- CLI 执行统计 -->
         <div class="settings-section">
           <div class="settings-section-title">CLI 执行统计</div>
           <div class="cli-stats-grid" id="cli-stats-grid">
@@ -949,19 +1104,19 @@
     });
     let sessions = previousState.sessions || [];
     let currentSessionId = previousState.currentSessionId || null;
-    let pendingEdits = previousState.pendingEdits || [];
-    let isProcessing = previousState.isProcessing || false;  // 🆕 处理状态
-    // 🔧 滚动位置记忆：为每个 Tab 存储滚动位置
+    let pendingChanges = previousState.pendingChanges || [];
+    let isProcessing = previousState.isProcessing || false;  // 处理状态
+    // 滚动位置记忆：为每个 Tab 存储滚动位置
     let scrollPositions = previousState.scrollPositions || { thread: 0, claude: 0, codex: 0, gemini: 0 };
 
     function saveWebviewState() {
       vscode.setState({
         currentTopTab, currentBottomTab, threadMessages, cliOutputs,
-        sessions, currentSessionId, pendingEdits, isProcessing, scrollPositions
+        sessions, currentSessionId, pendingChanges, isProcessing, scrollPositions
       });
     }
 
-    // 🔧 保存当前 Tab 的滚动位置
+    // 保存当前 Tab 的滚动位置
     function saveScrollPosition() {
       const mainContent = document.getElementById('main-content');
       if (mainContent) {
@@ -969,7 +1124,7 @@
       }
     }
 
-    // 🔧 恢复指定 Tab 的滚动位置
+    // 恢复指定 Tab 的滚动位置
     function restoreScrollPosition(tab) {
       const mainContent = document.getElementById('main-content');
       if (mainContent && scrollPositions[tab] !== undefined) {
@@ -977,7 +1132,7 @@
       }
     }
 
-    // 🆕 更新发送按钮状态
+    // 更新发送按钮状态
     function updateSendButtonState() {
       const btn = document.getElementById('execute-btn');
       if (!btn) return;
@@ -990,7 +1145,7 @@
       }
     }
 
-    // 🆕 打断当前操作
+    // 打断当前操作
     function interruptCurrentOperation() {
       if (!isProcessing) return;
       vscode.postMessage({ type: 'interruptTask' });
@@ -1013,12 +1168,12 @@
 
       saveWebviewState();
       renderMainContent();
-      showToast('操作已中断', 'info');
+      addSystemMessage('操作已中断', 'info');
     }
 
     vscode.postMessage({ type: 'getState' });
 
-    // 🆕 防抖渲染：避免频繁重渲染导致闪动
+    // 防抖渲染：避免频繁重渲染导致闪动
     let renderDebounceTimer = null;
     let lastRenderTime = 0;
     const RENDER_DEBOUNCE_MS = 100;  // 100ms 防抖
@@ -1048,15 +1203,15 @@
         const prevSessionId = currentSessionId;
         sessions = state.sessions || [];
         currentSessionId = state.currentSessionId;
-        pendingEdits = state.pendingEdits || [];
+        pendingChanges = state.pendingChanges || [];
 
-        // 🆕 从后端状态同步 isRunning（只在变化时更新）
+        // 从后端状态同步 isRunning（只在变化时更新）
         if (state.isRunning !== undefined && state.isRunning !== isProcessing) {
           isProcessing = state.isRunning;
           updateSendButtonState();
         }
 
-        // 🆕 更新阶段指示器（不触发完整渲染）
+        // 更新阶段指示器（不触发完整渲染）
         if (state.orchestratorPhase) {
           updatePhaseIndicator(state.orchestratorPhase, state.isRunning);
         }
@@ -1065,19 +1220,19 @@
           loadSessionMessages(currentSessionId);
         }
         saveWebviewState();
-        // 🔧 使用防抖渲染
+        // 使用防抖渲染
         debouncedRender();
         renderSessionList();
       }
       else if (msg.type === 'subTaskOutput') {
-        // 🆕 会话隔离：只处理当前会话的输出
+        // 会话隔离：只处理当前会话的输出
         if (msg.sessionId && msg.sessionId !== currentSessionId) {
           console.log('[Webview] 忽略非当前会话的输出, msgSessionId:', msg.sessionId, 'currentSessionId:', currentSessionId);
           return;
         }
 
         const cli = msg.cliType || 'claude';
-        // 🆕 保存消息来源：orchestrator/worker/system
+        // 保存消息来源：orchestrator/worker/system
         const source = msg.source || 'worker';
         const messages = cliOutputs[cli] || [];
 
@@ -1108,14 +1263,14 @@
               content: parsed.prompt,
               time: parsed.time || new Date().toLocaleTimeString().slice(0,5),
               streaming: false,
-              source: source  // 🆕 保存来源
+              source: source  // 保存来源
             });
             messages.push({
               role: 'assistant',
               content: '',
               time: new Date().toLocaleTimeString().slice(0,5),
               streaming: true,
-              source: source  // 🆕 保存来源
+              source: source  // 保存来源
             });
             continue;
           }
@@ -1128,7 +1283,7 @@
               content: '',
               time: new Date().toLocaleTimeString().slice(0,5),
               streaming: true,
-              source: source  // 🆕 保存来源
+              source: source  // 保存来源
             });
             lastMsg = messages[messages.length - 1];
           }
@@ -1136,7 +1291,7 @@
           // stream-json 格式：delta 消息（Gemini/Claude）
           if (parsed.type === 'message' && parsed.role === 'assistant' && parsed.content) {
             lastMsg.content = (lastMsg.content || '') + parsed.content;
-            // 🔧 收到新内容，清除重连状态
+            // 收到新内容，清除重连状态
             if (lastMsg.reconnecting) {
               lastMsg.reconnecting = false;
               lastMsg.reconnectMessage = '';
@@ -1149,13 +1304,13 @@
             for (const block of parsed.message.content) {
               if (block.type === 'text' && block.text) {
                 lastMsg.content = (lastMsg.content || '') + block.text;
-                // 🔧 收到新内容，清除重连状态
+                // 收到新内容，清除重连状态
                 if (lastMsg.reconnecting) {
                   lastMsg.reconnecting = false;
                   lastMsg.reconnectMessage = '';
                 }
               }
-              // 🔧 Claude thinking 内容解析
+              // Claude thinking 内容解析
               if (block.type === 'thinking' && block.thinking) {
                 if (!lastMsg.thinking) lastMsg.thinking = [];
                 lastMsg.thinking.push(block.thinking);
@@ -1164,14 +1319,14 @@
             continue;
           }
 
-          // 🔧 Gemini thinking 格式（如果有）
+          // Gemini thinking 格式（如果有）
           if (parsed.type === 'thinking' && parsed.content) {
             if (!lastMsg.thinking) lastMsg.thinking = [];
             lastMsg.thinking.push(parsed.content);
             continue;
           }
 
-          // 🔧 通用 thinking 格式（兼容多种 CLI）
+          // 通用 thinking 格式（兼容多种 CLI）
           if (parsed.thinking) {
             if (!lastMsg.thinking) lastMsg.thinking = [];
             if (Array.isArray(parsed.thinking)) {
@@ -1186,20 +1341,20 @@
           if (parsed.type === 'item.completed' && parsed.item) {
             if (parsed.item.type === 'agent_message' && parsed.item.text) {
               lastMsg.content = (lastMsg.content || '') + parsed.item.text;
-              // 🔧 收到新内容，清除重连状态
+              // 收到新内容，清除重连状态
               if (lastMsg.reconnecting) {
                 lastMsg.reconnecting = false;
                 lastMsg.reconnectMessage = '';
               }
             } else if (parsed.item.type === 'reasoning' && parsed.item.text) {
-              // 🔧 将思考内容单独存储，用于折叠面板显示
+              // 将思考内容单独存储，用于折叠面板显示
               if (!lastMsg.thinking) lastMsg.thinking = [];
               lastMsg.thinking.push(parsed.item.text);
             }
             continue;
           }
 
-          // 🔧 检测断网重连状态消息 - 增强版
+          // 检测断网重连状态消息 - 增强版
           // Claude: {"type":"system","subtype":"reconnecting"} 或 error 消息
           // Codex: {"type":"error","code":"network"} 或 {"type":"status"}
           // Gemini: {"type":"connection"} 或 {"error":"..."}
@@ -1235,7 +1390,7 @@
 
         cliOutputs[cli] = messages;
 
-        // 🔧 CLI 面板增量更新
+        // CLI 面板增量更新
         const lastCliMsg = messages[messages.length - 1];
         const hasCliContent = lastCliMsg && lastCliMsg.content && lastCliMsg.content.trim().length > 0;
 
@@ -1247,9 +1402,9 @@
           }
         }
 
-        // 🆕 修复：为每个 CLI 维护独立的状态卡片消息（不再显示完整内容）
+        // 修复：为每个 CLI 维护独立的状态卡片消息（不再显示完整内容）
         if (lastCliMsg && lastCliMsg.role === 'assistant') {
-          // 🔧 关键修复：查找该 CLI 对应的状态卡片消息
+          // 关键修复：查找该 CLI 对应的状态卡片消息
           let cliCardIdx = threadMessages.findIndex(m => m.cliStatusCard && m.cli === cli);
           const loadingIdx = threadMessages.findIndex(m => m.loading);
 
@@ -1288,24 +1443,24 @@
           // 如果没有内容，保留"正在思考"动画，不做任何操作
         }
 
-        // 🔧 使用节流保存状态，避免频繁序列化
+        // 使用节流保存状态，避免频繁序列化
         throttledSaveState();
-        // 🔧 使用平滑滚动
+        // 使用平滑滚动
         smoothScrollToBottom();
         updateCliDots();
       }
       else if (msg.type === 'cliResponse') {
-        // 🆕 更新处理状态
+        // 更新处理状态
         isProcessing = false;
         updateSendButtonState();
-        // 🆕 保存消息来源
+        // 保存消息来源
         const source = msg.source || 'worker';
 
         // 移除"正在思考"占位气泡
         const loadingIdx = threadMessages.findIndex(m => m.loading);
         if (loadingIdx !== -1) threadMessages.splice(loadingIdx, 1);
 
-        // 🔧 修复问题3：如果有错误，在主对话窗口显示明显的错误消息
+        // 修复问题3：如果有错误，在主对话窗口显示明显的错误消息
         if (msg.error) {
           threadMessages.push({
             role: 'assistant',
@@ -1314,18 +1469,18 @@
             content: msg.error,
             time: new Date().toLocaleTimeString().slice(0,5),
             isError: true,
-            source: source  // 🆕 保存来源
+            source: source  // 保存来源
           });
-          showToast('任务执行失败: ' + msg.error.substring(0, 100), 'error', 5000);
+          addSystemMessage('任务执行失败: ' + msg.error.substring(0, 100), 'error');
         }
 
-        // 🔧 修复：更新对应 CLI 的状态卡片为完成状态，而非添加完整内容
+        // 修复：更新对应 CLI 的状态卡片为完成状态，而非添加完整内容
         const cliCardIdx = threadMessages.findIndex(m => m.cliStatusCard && m.cli === msg.cli);
         if (cliCardIdx !== -1) {
           // 更新状态卡片
           threadMessages[cliCardIdx].status = msg.error ? 'failed' : 'completed';
           threadMessages[cliCardIdx].streaming = false;
-          threadMessages[cliCardIdx].source = source;  // 🆕 保存来源
+          threadMessages[cliCardIdx].source = source;  // 保存来源
           threadMessages[cliCardIdx].shortDesc = msg.error
             ? '执行失败: ' + (msg.error.substring(0, 50))
             : extractCompletionSummary(msg.content);
@@ -1339,19 +1494,19 @@
             shortDesc: extractCompletionSummary(msg.content),
             time: new Date().toLocaleTimeString().slice(0,5),
             streaming: false,
-            source: source  // 🆕 保存来源
+            source: source  // 保存来源
           });
         }
 
         // 同时更新对应 CLI 的输出面板 - 标记流式消息完成
-        if (msg.cli) {
+        if (msg.cli && source !== 'orchestrator') {
           const cliMessages = cliOutputs[msg.cli] || [];
           const lastMsg = cliMessages[cliMessages.length - 1];
           if (lastMsg && lastMsg.streaming) {
             // 更新最后一条流式消息的内容并标记完成
             lastMsg.content = msg.error ? '错误: ' + msg.error : (msg.content || lastMsg.content || '(空响应)');
             lastMsg.streaming = false;
-            lastMsg.source = source;  // 🆕 保存来源
+            lastMsg.source = source;  // 保存来源
           } else if (msg.content) {
             // 如果没有流式消息，创建新的完成消息
             cliMessages.push({
@@ -1359,7 +1514,7 @@
               content: msg.content,
               time: new Date().toLocaleTimeString().slice(0,5),
               streaming: false,
-              source: source  // 🆕 保存来源
+              source: source  // 保存来源
             });
           }
           cliOutputs[msg.cli] = cliMessages;
@@ -1377,13 +1532,13 @@
         let streamingIdx = threadMessages.findIndex(m => m.streaming);
         const loadingIdx = threadMessages.findIndex(m => m.loading);
 
-        // 🔧 优化：只有有内容时才处理
+        // 优化：只有有内容时才处理
         const hasContent = msg.content && msg.content.trim().length > 0;
         if (!hasContent) return; // 无内容时保留加载动画
 
         let needFullRender = false;
 
-        // 🔧 新逻辑：不再移除 loading 消息，streaming 消息在其上方
+        // 新逻辑：不再移除 loading 消息，streaming 消息在其上方
         if (streamingIdx === -1) {
           const newStreamingMsg = {
             role: 'assistant', content: msg.content,
@@ -1398,7 +1553,7 @@
           needFullRender = true; // 新增了元素，需要完整渲染
         } else {
           threadMessages[streamingIdx].content = msg.content;
-          // 🔧 优化：尝试增量更新
+          // 优化：尝试增量更新
           if (!updateStreamingMessage(msg.content)) {
             needFullRender = true;
           }
@@ -1408,53 +1563,85 @@
           renderMainContent();
         }
 
-        // 🔧 使用节流保存和平滑滚动
+        // 使用节流保存和平滑滚动
         throttledSaveState();
         smoothScrollToBottom();
       }
-      else if (msg.type === 'cliStatusChanged') { showToast(msg.cli + ' 状态已更新', 'info'); updateCliDots(); }
-      else if (msg.type === 'cliError') { showToast(msg.cli + ': ' + msg.error, 'error', 5000); }
+      else if (msg.type === 'cliStatusChanged') { addSystemMessage(msg.cli + ' 状态已更新', 'info'); updateCliDots(); }
+      else if (msg.type === 'cliStatusUpdate') { updateCliConnectionStatus(msg.statuses); }
+      else if (msg.type === 'promptEnhanceResult') { updatePromptEnhanceStatus(msg.success, msg.message); }
+      else if (msg.type === 'promptEnhanced') { handlePromptEnhanced(msg.enhancedPrompt, msg.error); }
+      else if (msg.type === 'promptEnhanceConfig') {
+        // 从后端接收系统级配置
+        const urlInput = document.getElementById('prompt-enhance-url');
+        const keyInput = document.getElementById('prompt-enhance-key');
+        if (urlInput) urlInput.value = msg.baseUrl || '';
+        if (keyInput) keyInput.value = msg.apiKey || '';
+      }
+      else if (msg.type === 'cliError') { addSystemMessage(msg.cli + ': ' + msg.error, 'error'); }
       else if (msg.type === 'toast') { showToast(msg.message, msg.toastType || 'info', msg.duration || 3000); }
-      // 🔧 问题4修复：处理主线信息更新
+      // 问题4修复：处理主线信息更新
       else if (msg.type === 'mainlineUpdate') {
         handleMainlineUpdate(msg);
       }
-      else if (msg.type === 'sessionCreated') { sessions.push(msg.session); currentSessionId = msg.session.id; saveWebviewState(); renderSessionList(); showToast('新会话已创建', 'success'); }
+      else if (msg.type === 'sessionCreated') { sessions.push(msg.session); currentSessionId = msg.session.id; saveWebviewState(); renderSessionList(); addSystemMessage('新会话已创建', 'success'); }
       else if (msg.type === 'sessionSwitched') { currentSessionId = msg.sessionId; loadSessionMessages(msg.sessionId); saveWebviewState(); renderSessionList(); }
       else if (msg.type === 'sessionsUpdated') { sessions = msg.sessions; saveWebviewState(); renderSessionList(); }
       else if (msg.type === 'showDiff') { showDiffModal(msg.filePath, msg.diff); }
       // 新增：交互模式和验证相关消息
-      else if (msg.type === 'interactionModeChanged') { updateInteractionModeUI(msg.mode); showToast('已切换到 ' + getModeDisplayName(msg.mode) + ' 模式', 'info'); }
+      else if (msg.type === 'interactionModeChanged') { updateInteractionModeUI(msg.mode); addSystemMessage('已切换到 ' + getModeDisplayName(msg.mode) + ' 模式', 'info'); }
       else if (msg.type === 'phaseChanged') {
-        // 🆕 传递 isRunning 参数
+        // 传递 isRunning 参数
         updatePhaseIndicator(msg.phase, msg.isRunning);
       }
       else if (msg.type === 'verificationResult') {
         if (msg.success) {
-          showToast('验证通过: ' + msg.summary, 'success');
+          addSystemMessage('验证通过: ' + msg.summary, 'success');
         } else {
-          showToast('验证失败: ' + msg.summary, 'error', 5000);
+          addSystemMessage('验证失败: ' + msg.summary, 'error');
         }
       }
       else if (msg.type === 'recoveryRequest') { showRecoveryDialog(msg.taskId, msg.error, msg.canRetry, msg.canRollback); }
       else if (msg.type === 'recoveryResult') {
-        showToast(msg.message, msg.success ? 'success' : 'error');
+        addSystemMessage(msg.message, msg.success ? 'success' : 'error');
       }
-      // 🆕 执行统计数据更新
+      // 执行统计数据更新
       else if (msg.type === 'executionStatsUpdate') {
         updateExecutionStats(msg.stats);
       }
-      // 🆕 CLI 降级通知
+      // CLI 降级通知
       else if (msg.type === 'cliFallbackNotice') {
-        showToast(`${msg.originalCli} 降级到 ${msg.fallbackCli}: ${msg.reason}`, 'warning', 5000);
+        addSystemMessage(`${msg.originalCli} 降级到 ${msg.fallbackCli}: ${msg.reason}`, 'warning');
       }
       // 新增：执行计划确认请求
+      else if (msg.type === 'orchestratorMessage') {
+        const messageType = msg.messageType || '';
+        if (messageType === 'worker_output' || messageType === 'plan_ready') return;
+        if (!msg.content || !msg.content.trim()) return;
+
+        const entry = {
+          role: 'assistant',
+          content: msg.content,
+          time: new Date().toLocaleTimeString().slice(0,5),
+          source: 'orchestrator'
+        };
+
+        if (messageType === 'error') {
+          entry.type = 'error';
+          entry.isError = true;
+        }
+
+        threadMessages.push(entry);
+        saveWebviewState();
+        renderMainContent();
+        smoothScrollToBottom();
+      }
       else if (msg.type === 'confirmationRequest') {
         showPlanConfirmation(msg.plan, msg.formattedPlan);
       }
     });
 
-    // 显示执行计划确认对话框 - 🔧 改为固定位置模态对话框（参考 Augment Ask 模式）
+    // 显示执行计划确认对话框 - 改为固定位置模态对话框
     let currentPlanData = null;  // 保存当前计划数据，用于状态持久化
 
     function showPlanConfirmation(plan, formattedPlan) {
@@ -1465,7 +1652,7 @@
       const existingModal = document.getElementById('plan-modal-container');
       if (existingModal) existingModal.remove();
 
-      // 🔧 创建固定位置的模态对话框容器（不在消息流中）
+      // 创建固定位置的模态对话框容器（不在消息流中）
       const modalContainer = document.createElement('div');
       modalContainer.id = 'plan-modal-container';
       modalContainer.className = 'plan-modal-container';
@@ -1493,7 +1680,7 @@
 
       document.body.appendChild(modalContainer);
 
-      // 🆕 检查是否已存在待确认的消息（避免重复添加，用于 Webview 重新加载后恢复）
+      // 检查是否已存在待确认的消息（避免重复添加，用于 Webview 重新加载后恢复）
       const existingPendingIdx = threadMessages.findIndex(m => m.type === 'plan_confirmation' && m.isPending);
       if (existingPendingIdx === -1) {
         // 同时在消息流中添加一条记录（用于历史查看）
@@ -1518,7 +1705,7 @@
       }
     }
 
-    // 🔧 使用事件委托处理模态对话框按钮点击（避免事件丢失）
+    // 使用事件委托处理模态对话框按钮点击（避免事件丢失）
     document.body.addEventListener('click', (e) => {
       const btn = e.target.closest('.plan-modal-btn');
       if (btn) {
@@ -1529,7 +1716,7 @@
       }
     });
 
-    // 🔧 关闭确认面板
+    // 关闭确认面板
     function closePlanConfirmation(confirmed) {
       // 移除模态对话框
       const modalContainer = document.getElementById('plan-modal-container');
@@ -1547,12 +1734,12 @@
       renderMainContent();
     }
 
-    // 🔧 检查是否有待确认的面板
+    // 检查是否有待确认的面板
     function hasPendingConfirmation() {
       return currentPlanData?.isPending || threadMessages.some(m => m.type === 'plan_confirmation' && m.isPending);
     }
 
-    // 🔧 取消待确认的面板
+    // 取消待确认的面板
     function cancelPendingConfirmation() {
       if (hasPendingConfirmation()) {
         vscode.postMessage({ type: 'confirmPlan', confirmed: false });
@@ -1560,7 +1747,7 @@
       }
     }
 
-    // 🔧 恢复确认面板状态（切换插件后恢复）
+    // 恢复确认面板状态（切换插件后恢复）
     function restorePlanConfirmation() {
       if (currentPlanData?.isPending) {
         // 检查模态对话框是否存在，不存在则重新创建
@@ -1571,7 +1758,7 @@
       }
     }
 
-    // 🔧 问题4修复：处理主线信息更新
+    // 问题4修复：处理主线信息更新
     function handleMainlineUpdate(msg) {
       const time = new Date().toLocaleTimeString().slice(0, 5);
 
@@ -1614,7 +1801,7 @@
       }
     }
 
-    // 🔧 增量更新主线进度状态
+    // 增量更新主线进度状态
     function updateMainlineProgress(subTaskId, status, success) {
       const container = document.getElementById('main-content');
       if (!container) return false;
@@ -1714,7 +1901,7 @@
         .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
     }
 
-    // 🆕 提取简短描述（用于状态卡片）
+    // 提取简短描述（用于状态卡片）
     function extractShortDescription(content) {
       if (!content) return '正在处理...';
       // 移除代码块
@@ -1728,7 +1915,7 @@
       return desc;
     }
 
-    // 🆕 提取完成摘要
+    // 提取完成摘要
     function extractCompletionSummary(content) {
       if (!content) return '已完成';
       // 尝试提取文件修改信息
@@ -1747,7 +1934,7 @@
       return '已完成';
     }
 
-    // 🆕 增量更新 CLI 状态卡片
+    // 增量更新 CLI 状态卡片
     function updateCliStatusCard(cli, shortDesc) {
       const container = document.getElementById('main-content');
       if (!container || currentBottomTab !== 'thread') return false;
@@ -1778,7 +1965,7 @@
       // 阶段映射
       const phaseMap = {
         'idle': 0,
-        'started': 1,  // 🆕 新增
+        'started': 1,  // 新增
         'phase1_analysis': 1,
         'phase2_waiting_confirmation': 2,
         'phase3_execution': 3,
@@ -1787,12 +1974,12 @@
         'phase6_summary': 6,
         'completed': 7,
         'failed': -1,
-        'interrupted': -2  // 🆕 新增
+        'interrupted': -2  // 新增
       };
 
       const currentPhaseNum = phaseMap[phase] || 0;
 
-      // 🆕 根据阶段和后端状态更新 isProcessing
+      // 根据阶段和后端状态更新 isProcessing
       if (isRunningFromBackend !== undefined) {
         isProcessing = isRunningFromBackend;
       } else {
@@ -1843,7 +2030,7 @@
     // 底部 Tab 切换 - 切换消息区域内容
     document.querySelectorAll('.bottom-tab').forEach(tab => {
       tab.addEventListener('click', () => {
-        // 🔧 切换前保存当前滚动位置
+        // 切换前保存当前滚动位置
         saveScrollPosition();
 
         document.querySelectorAll('.bottom-tab').forEach(t => t.classList.remove('active'));
@@ -1852,7 +2039,7 @@
         currentBottomTab = newTab;
         renderMainContent();
 
-        // 🔧 切换后：如果有保存的位置则恢复，否则滚动到底部
+        // 切换后：如果有保存的位置则恢复，否则滚动到底部
         requestAnimationFrame(() => {
           const mainContent = document.getElementById('main-content');
           if (mainContent) {
@@ -1876,37 +2063,45 @@
       }
 
       let html = '';
+      // 用于消息分组：记录上一条消息的来源标识
+      let prevMessageKey = null;
+
       messages.forEach((m, idx) => {
         const isUser = m.role === 'user';
+        const source = m.source || 'worker';
+
+        // 计算当前消息的分组标识
+        const currentMessageKey = isUser ? 'user' : source;
+        const isGrouped = prevMessageKey === currentMessageKey;
+        prevMessageKey = currentMessageKey;
+
         const streamingClass = m.streaming ? ' streaming' : '';
         const messageTypeClass = isUser ? ' user-message' : ' assistant-message';
-        // 🆕 获取消息来源
-        const source = m.source || 'worker';
+        const groupedClass = isGrouped ? ' grouped' : '';
         const sourceClass = !isUser ? ' source-' + source : '';
-        const roleName = isUser ? '你' : (source === 'orchestrator' ? '编排者' : cli.toUpperCase());
-        // 头像类名：用户/助手 + 来源特定颜色
+        const roleName = isUser ? '你' : (source === 'orchestrator' ? 'Orchestrator' : cli.toUpperCase());
         const avatarClass = isUser ? 'user' : 'assistant' + sourceClass;
 
-        // 🆕 头像内容 - 根据来源显示不同图标
+        // 头像内容 - 根据来源显示不同图标
         let avatarContent;
         if (isUser) {
           avatarContent = '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm2-3a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm4 8c0 1-1 1-1 1H3s-1 0-1-1 1-4 6-4 6 3 6 4zm-1-.004c-.001-.246-.154-.986-.832-1.664C11.516 10.68 10.289 10 8 10c-2.29 0-3.516.68-4.168 1.332-.678.678-.83 1.418-.832 1.664h10z"/></svg>';
         } else if (source === 'orchestrator') {
-          // 编排者图标 - 指挥棒/大脑
+          // Orchestrator图标 - 指挥棒/大脑
           avatarContent = '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M9.405 1.05c-.413-1.4-2.397-1.4-2.81 0l-.1.34a1.464 1.464 0 0 1-2.105.872l-.31-.17c-1.283-.698-2.686.705-1.987 1.987l.169.311c.446.82.023 1.841-.872 2.105l-.34.1c-1.4.413-1.4 2.397 0 2.81l.34.1a1.464 1.464 0 0 1 .872 2.105l-.17.31c-.698 1.283.705 2.686 1.987 1.987l.311-.169a1.464 1.464 0 0 1 2.105.872l.1.34c.413 1.4 2.397 1.4 2.81 0l.1-.34a1.464 1.464 0 0 1 2.105-.872l.31.17c1.283.698 2.686-.705 1.987-1.987l-.169-.311a1.464 1.464 0 0 1 .872-2.105l.34-.1c1.4-.413 1.4-2.397 0-2.81l-.34-.1a1.464 1.464 0 0 1-.872-2.105l.17-.31c.698-1.283-.705-2.686-1.987-1.987l-.311.169a1.464 1.464 0 0 1-2.105-.872l-.1-.34zM8 10.93a2.929 2.929 0 1 1 0-5.86 2.929 2.929 0 0 1 0 5.858z"/></svg>';
         } else {
           // Worker 图标 - 齿轮/执行
           avatarContent = '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.5a.5.5 0 0 1 .5-.5h3a.5.5 0 0 1 0 1h-3a.5.5 0 0 1-.5-.5ZM3 8.062C3 6.76 4.235 5.765 5.53 5.886a26.58 26.58 0 0 0 4.94 0C11.765 5.765 13 6.76 13 8.062v1.157a.933.933 0 0 1-.765.935c-.845.147-2.34.346-4.235.346-1.895 0-3.39-.2-4.235-.346A.933.933 0 0 1 3 9.219V8.062Zm4.542-.827a.25.25 0 0 0-.217.068l-.92.9a24.767 24.767 0 0 1-1.871-.183.25.25 0 0 0-.068.495c.55.076 1.232.149 2.02.193a.25.25 0 0 0 .189-.071l.754-.736.847 1.71a.25.25 0 0 0 .404.062l.932-.97a25.286 25.286 0 0 0 1.922-.188.25.25 0 0 0-.068-.495c-.538.074-1.207.145-1.98.189a.25.25 0 0 0-.166.076l-.754.785-.842-1.7a.25.25 0 0 0-.182-.135Z"/><path d="M8.5 1.866a1 1 0 1 0-1 0V3h-2A4.5 4.5 0 0 0 1 7.5V8a1 1 0 0 0-1 1v2a1 1 0 0 0 1 1v1a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-1a1 1 0 0 0 1-1V9a1 1 0 0 0-1-1v-.5A4.5 4.5 0 0 0 10.5 3h-2V1.866ZM14 7.5V13a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V7.5A3.5 3.5 0 0 1 5.5 4h5A3.5 3.5 0 0 1 14 7.5Z"/></svg>';
         }
 
-        html += '<div class="message' + messageTypeClass + streamingClass + '" data-msg-idx="' + idx + '" data-cli="' + cli + '" data-source="' + source + '">';
+        html += '<div class="message' + messageTypeClass + streamingClass + groupedClass + '" data-msg-idx="' + idx + '" data-cli="' + cli + '" data-source="' + source + '">';
         html += '<div class="message-avatar ' + avatarClass + '">' + avatarContent + '</div>';
         html += '<div class="message-body">';
         html += '<div class="message-header">';
         html += '<span class="message-role">' + roleName + '</span>';
-        // 🆕 显示来源标签（仅 AI 消息）
+        // 显示来源标签（仅 AI 消息）
         if (!isUser) {
-          const sourceLabel = source === 'orchestrator' ? '编排' : 'Worker';
+          const sourceLabel = source === 'orchestrator' ? 'Orchestrator' : 'Worker';
           html += '<span class="message-source-tag ' + source + '">' + sourceLabel + '</span>';
         }
         html += '<span class="message-time">' + (m.time || '') + '</span>';
@@ -1975,7 +2170,7 @@
       });
     }
 
-    // 🆕 更新 CLI 执行统计面板
+    // 更新 CLI 执行统计面板
     function updateExecutionStats(stats) {
       if (!stats || !Array.isArray(stats)) return;
 
@@ -2026,7 +2221,7 @@
       });
     }
 
-    // 🆕 请求执行统计数据
+    // 请求执行统计数据
     function requestExecutionStats() {
       vscode.postMessage({ type: 'requestExecutionStats' });
     }
@@ -2105,7 +2300,7 @@
     }
 
     function createNewSession() {
-      // 🔧 修复：先保存当前会话的消息到后端
+      // 修复：先保存当前会话的消息到后端
       if (currentSessionId && threadMessages.length > 0) {
         vscode.postMessage({
           type: 'saveCurrentSession',
@@ -2128,7 +2323,7 @@
     }
 
     function switchSession(sessionId) {
-      // 🔧 修复：先保存当前会话的消息到后端
+      // 修复：先保存当前会话的消息到后端
       if (currentSessionId && currentSessionId !== sessionId && threadMessages.length > 0) {
         vscode.postMessage({
           type: 'saveCurrentSession',
@@ -2322,7 +2517,7 @@
 
     // 执行按钮
     document.getElementById('execute-btn').addEventListener('click', () => {
-      // 🆕 如果正在处理中，点击按钮则打断
+      // 如果正在处理中，点击按钮则打断
       if (isProcessing) {
         interruptCurrentOperation();
         return;
@@ -2330,7 +2525,7 @@
 
       const input = document.getElementById('prompt-input');
       if (input.value.trim() || attachedImages.length > 0) {
-        // 🆕 如果有待确认的面板，先取消它
+        // 如果有待确认的面板，先取消它
         if (hasPendingConfirmation()) {
           cancelPendingConfirmation();
         }
@@ -2350,7 +2545,7 @@
         threadMessages.push(msg);
         threadMessages.push({ role: 'assistant', content: '正在思考...', time: '', loading: true });
 
-        // 🆕 设置处理状态
+        // 设置处理状态
         isProcessing = true;
         updateSendButtonState();
 
@@ -2386,14 +2581,14 @@
         e.preventDefault();
         document.getElementById('execute-btn').click();
       }
-      // 🆕 Esc 键打断当前操作
+      // Esc 键打断当前操作
       if (e.key === 'Escape' && isProcessing) {
         e.preventDefault();
         interruptCurrentOperation();
       }
     });
 
-    // 🆕 全局 Esc 键监听
+    // 全局 Esc 键监听
     document.addEventListener('keydown', e => {
       if (e.key === 'Escape' && isProcessing) {
         e.preventDefault();
@@ -2409,8 +2604,19 @@
     // 增强按钮
     document.getElementById('enhance-btn').addEventListener('click', () => {
       const input = document.getElementById('prompt-input');
-      if (input.value.trim()) showToast('增强功能开发中...', 'info');
-      else showToast('请先输入任务描述', 'warning');
+      const prompt = input.value.trim();
+      if (!prompt) {
+        showToast('请先输入任务描述', 'warning');
+        return;
+      }
+      // 进入 loading 状态
+      const btn = document.getElementById('enhance-btn');
+      const textSpan = btn.querySelector('.enhance-text');
+      btn.classList.add('loading');
+      btn.disabled = true;
+      if (textSpan) textSpan.textContent = '增强中';
+      // 发送增强请求（只发送 prompt，后端从系统级存储读取配置）
+      vscode.postMessage({ type: 'enhancePrompt', prompt: prompt });
     });
 
     // 图片粘贴功能
@@ -2578,7 +2784,7 @@
     function updateEditsBadge() {
       const badge = document.getElementById('edits-badge');
       if (badge) {
-        const count = pendingEdits.length;
+        const count = pendingChanges.length;
         badge.textContent = count.toString();
         badge.style.display = count > 0 ? 'inline' : 'none';
       }
@@ -2588,7 +2794,7 @@
       const container = document.getElementById('main-content');
       if (!container) return;
 
-      // 🔧 修复：渲染前保存滚动位置
+      // 修复：渲染前保存滚动位置
       const scrollTop = container.scrollTop;
       const scrollHeight = container.scrollHeight;
       const clientHeight = container.clientHeight;
@@ -2601,7 +2807,7 @@
         renderCliOutputView(container, currentBottomTab);
       }
 
-      // 🔧 修复：渲染后恢复滚动位置
+      // 修复：渲染后恢复滚动位置
       requestAnimationFrame(() => {
         if (wasAtBottom) {
           // 如果之前在底部，保持在底部
@@ -2613,7 +2819,7 @@
       });
     }
 
-    /** 🔧 增量更新：只更新流式消息的内容，避免重建整个 DOM */
+    /** 增量更新：只更新流式消息的内容，避免重建整个 DOM */
     function updateStreamingMessage(content) {
       const container = document.getElementById('main-content');
       if (!container || currentBottomTab !== 'thread') return false;
@@ -2630,7 +2836,7 @@
       return true;
     }
 
-    /** 🔧 平滑滚动到底部（使用 requestAnimationFrame 避免跳动） */
+    /** 平滑滚动到底部（使用 requestAnimationFrame 避免跳动） */
     let scrollRAF = null;
     function smoothScrollToBottom() {
       if (scrollRAF) return; // 避免重复调度
@@ -2647,7 +2853,7 @@
       });
     }
 
-    /** 🔧 节流的状态保存（避免频繁序列化） */
+    /** 节流的状态保存（避免频繁序列化） */
     let saveStateTimeout = null;
     function throttledSaveState() {
       if (saveStateTimeout) return;
@@ -2663,37 +2869,61 @@
         return;
       }
       let html = '';
+      // 用于消息分组：记录上一条普通消息的来源标识
+      let prevMessageKey = null;
+
       threadMessages.forEach((m, idx) => {
-        // 🆕 处理 CLI 状态卡片（简洁展示）
+        // 处理 CLI 状态卡片（简洁展示）- 不参与分组
         if (m.cliStatusCard) {
           html += renderCliStatusCard(m, idx);
+          prevMessageKey = null; // 重置分组
           return;
         }
 
-        // 🆕 处理执行计划确认面板
+        // 处理执行计划确认面板 - 不参与分组
         if (m.type === 'plan_confirmation') {
           html += renderPlanConfirmationCard(m, idx);
+          prevMessageKey = null;
           return;
         }
 
-        // 🔧 处理错误消息（问题3修复）
+        // 处理错误消息 - 不参与分组
         if (m.type === 'error' || m.isError) {
           html += renderErrorMessage(m, idx);
+          prevMessageKey = null;
           return;
         }
 
-        // 🔧 处理主线进度消息（问题4修复）
+        // 处理系统提示消息 - 不参与分组
+        if (m.type === 'system_notice') {
+          html += renderSystemNotice(m, idx);
+          prevMessageKey = null;
+          return;
+        }
+
+        // 处理主线进度消息 - 不参与分组
         if (m.type === 'mainline_progress') {
           html += renderMainlineProgressCard(m, idx);
+          prevMessageKey = null;
           return;
         }
 
         const isUser = m.role === 'user';
+        const source = m.source || 'worker';
+
+        // 计算当前消息的分组标识：role + source + cli
+        const currentMessageKey = isUser ? 'user' : (source + '-' + (m.cli || 'ai'));
+
+        // 判断是否与上一条消息同源（需要分组）
+        const isGrouped = prevMessageKey === currentMessageKey;
+        prevMessageKey = currentMessageKey;
+
         const streamingClass = m.streaming ? ' streaming' : '';
         const messageTypeClass = isUser ? ' user-message' : ' assistant-message';
+        const groupedClass = isGrouped ? ' grouped' : '';
         const roleName = isUser ? '你' : (m.cli ? m.cli.toUpperCase() : 'AI');
         // 头像类名：用户/助手 + CLI 特定颜色
-        const cliClass = (!isUser && m.cli) ? ' cli-' + m.cli.toLowerCase() : '';
+        const cliClass = (!isUser && m.cli && source !== 'orchestrator') ? ' cli-' + m.cli.toLowerCase() : '';
         const avatarClass = isUser ? 'user' : 'assistant' + cliClass;
 
         // 头像内容
@@ -2704,7 +2934,7 @@
         // CLI 标签（仅 AI 消息显示）
         const cliTag = (!isUser && m.cli) ? '<span class="message-cli-tag">' + m.cli + '</span>' : '';
 
-        html += '<div class="message' + messageTypeClass + streamingClass + '" data-msg-idx="' + idx + '">';
+        html += '<div class="message' + messageTypeClass + streamingClass + groupedClass + '" data-msg-idx="' + idx + '">';
         html += '<div class="message-avatar ' + avatarClass + '">' + avatarContent + '</div>';
         html += '<div class="message-body">';
         html += '<div class="message-header">';
@@ -2773,7 +3003,24 @@
       container.innerHTML = html;
     }
 
-    // 🔧 渲染错误消息（问题3修复）
+    // 渲染系统提示消息
+    function renderSystemNotice(m, idx) {
+      const type = m.noticeType || 'info';
+      const icons = {
+        success: '<svg viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/></svg>',
+        error: '<svg viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM5.354 4.646a.5.5 0 1 0-.708.708L7.293 8l-2.647 2.646a.5.5 0 0 0 .708.708L8 8.707l2.646 2.647a.5.5 0 0 0 .708-.708L8.707 8l2.647-2.646a.5.5 0 0 0-.708-.708L8 7.293 5.354 4.646z"/></svg>',
+        warning: '<svg viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>',
+        info: '<svg viewBox="0 0 16 16"><path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16zm.93-9.412-1 4.705c-.07.34.029.533.304.533.194 0 .487-.07.686-.246l-.088.416c-.287.346-.92.598-1.465.598-.703 0-1.002-.422-.808-1.319l.738-3.468c.064-.293.006-.399-.287-.47l-.451-.081.082-.381 2.29-.287zM8 5.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2z"/></svg>'
+      };
+      let html = '<div class="system-notice ' + type + '" data-msg-idx="' + idx + '">';
+      html += '<span class="system-notice-icon">' + (icons[type] || icons.info) + '</span>';
+      html += '<span class="system-notice-text">' + escapeHtml(m.content || '') + '</span>';
+      html += '<span class="system-notice-time">' + (m.time || '') + '</span>';
+      html += '</div>';
+      return html;
+    }
+
+    // 渲染错误消息
     function renderErrorMessage(m, idx) {
       const cli = m.cli || 'system';
       let html = '<div class="error-message-card" data-msg-idx="' + idx + '">';
@@ -2789,7 +3036,7 @@
       return html;
     }
 
-    // 🔧 渲染主线进度卡片（问题4修复）
+    // 渲染主线进度卡片
     function renderMainlineProgressCard(m, idx) {
       const cli = m.cli || 'system';
       const status = m.progressType || 'started';
@@ -2818,7 +3065,7 @@
       return html;
     }
 
-    // 🆕 渲染执行计划确认卡片（内联在消息流中）
+    // 渲染执行计划确认卡片（内联在消息流中）
     function renderPlanConfirmationCard(m, idx) {
       const isPending = m.isPending;
       const statusClass = isPending ? 'pending' : (m.confirmed ? 'confirmed' : 'cancelled');
@@ -2849,16 +3096,16 @@
       return html;
     }
 
-    // 🆕 渲染 CLI 状态卡片
+    // 渲染 CLI 状态卡片
     function renderCliStatusCard(m, idx) {
       const cli = m.cli || 'claude';
       const status = m.status || 'streaming';
       const statusClass = status; // streaming, completed, failed
-      // 🆕 获取消息来源
+      // 获取消息来源
       const source = m.source || 'worker';
       const sourceClass = 'source-' + source;
 
-      // 🆕 根据来源选择图标
+      // 根据来源选择图标
       const orchestratorIcon = '<svg viewBox="0 0 16 16"><path d="M9.405 1.05c-.413-1.4-2.397-1.4-2.81 0l-.1.34a1.464 1.464 0 0 1-2.105.872l-.31-.17c-1.283-.698-2.686.705-1.987 1.987l.169.311c.446.82.023 1.841-.872 2.105l-.34.1c-1.4.413-1.4 2.397 0 2.81l.34.1a1.464 1.464 0 0 1 .872 2.105l-.17.31c-.698 1.283.705 2.686 1.987 1.987l.311-.169a1.464 1.464 0 0 1 2.105.872l.1.34c.413 1.4 2.397 1.4 2.81 0l.1-.34a1.464 1.464 0 0 1 2.105-.872l.31.17c1.283.698 2.686-.705 1.987-1.987l-.169-.311a1.464 1.464 0 0 1 .872-2.105l.34-.1c1.4-.413 1.4-2.397 0-2.81l-.34-.1a1.464 1.464 0 0 1-.872-2.105l.17-.31c.698-1.283-.705-2.686-1.987-1.987l-.311.169a1.464 1.464 0 0 1-2.105-.872l-.1-.34zM8 10.93a2.929 2.929 0 1 1 0-5.86 2.929 2.929 0 0 1 0 5.858z"/></svg>';
       const workerIcons = {
         claude: '<svg viewBox="0 0 16 16"><path d="M6 12.5a.5.5 0 0 1 .5-.5h3a.5.5 0 0 1 0 1h-3a.5.5 0 0 1-.5-.5ZM3 8.062C3 6.76 4.235 5.765 5.53 5.886a26.58 26.58 0 0 0 4.94 0C11.765 5.765 13 6.76 13 8.062v1.157a.933.933 0 0 1-.765.935c-.845.147-2.34.346-4.235.346-1.895 0-3.39-.2-4.235-.346A.933.933 0 0 1 3 9.219V8.062Z"/></svg>',
@@ -2874,9 +3121,9 @@
         failed: '执行失败'
       };
 
-      // 🆕 来源标签
-      const sourceLabel = source === 'orchestrator' ? '编排' : 'Worker';
-      const roleName = source === 'orchestrator' ? '编排者' : cli.toUpperCase();
+      // 来源标签
+      const sourceLabel = source === 'orchestrator' ? 'Orchestrator' : 'Worker';
+      const roleName = source === 'orchestrator' ? 'Orchestrator' : cli.toUpperCase();
 
       let html = '<div class="cli-status-card ' + statusClass + ' ' + sourceClass + '" data-cli="' + cli + '" data-msg-idx="' + idx + '" data-source="' + source + '" onclick="switchToCliTab(\'' + cli + '\')">';
       html += '<div class="cli-status-icon ' + sourceClass + '">' + icon + '</div>';
@@ -2890,7 +3137,7 @@
       return html;
     }
 
-    // 🆕 点击状态卡片切换到对应 CLI Tab
+    // 点击状态卡片切换到对应 CLI Tab
     function switchToCliTab(cli) {
       const tab = document.querySelector('.bottom-tab[data-bottom-tab="' + cli + '"]');
       if (tab) tab.click();
@@ -2926,7 +3173,7 @@
       if (task.subTasks && task.subTasks.length > 0) {
         html += '<div class="task-card-subtasks">';
         task.subTasks.forEach(st => {
-          html += '<div class="subtask-item"><span class="subtask-cli">' + (st.assignedCli || 'auto').toUpperCase() + '</span><span class="subtask-desc">' + escapeHtml(st.description || '') + '</span></div>';
+          html += '<div class="subtask-item"><span class="subtask-cli">' + ((st.assignedWorker || st.assignedCli || 'auto')).toUpperCase() + '</span><span class="subtask-desc">' + escapeHtml(st.description || '') + '</span></div>';
         });
         html += '</div>';
       }
@@ -2950,7 +3197,7 @@
         const statusCls = task.status === 'running' ? 'running' : task.status === 'completed' ? 'completed' : task.status === 'failed' ? 'failed' : 'pending';
         const statusIcon = task.status === 'completed' ? '<svg viewBox="0 0 16 16"><path d="M13.854 3.646a.5.5 0 0 1 0 .708l-7 7a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L6.5 10.293l6.646-6.647a.5.5 0 0 1 .708 0z"/></svg>' : task.status === 'failed' ? '<svg viewBox="0 0 16 16"><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg>' : '';
         html += '<div class="task-item" data-task-id="' + task.id + '"><div class="task-status ' + statusCls + '">' + statusIcon + '</div><div class="task-info"><div class="task-name">' + escapeHtml(task.prompt?.slice(0, 50) || '任务') + '</div><div class="task-meta">';
-        if (task.subTasks) task.subTasks.forEach(st => { html += '<span class="task-cli">' + (st.assignedCli || '').toUpperCase() + '</span>'; });
+        if (task.subTasks) task.subTasks.forEach(st => { html += '<span class="task-cli">' + ((st.assignedWorker || st.assignedCli || '')).toUpperCase() + '</span>'; });
         html += '<span class="task-time">' + (task.createdAt ? new Date(task.createdAt).toLocaleTimeString().slice(0,5) : '') + '</span></div></div>';
         if (task.status === 'running') html += '<div class="task-actions"><button class="icon-btn" onclick="interruptTask(\'' + task.id + '\')" title="中断"><svg viewBox="0 0 16 16"><path d="M5 3.5h6A1.5 1.5 0 0 1 12.5 5v6a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 11V5A1.5 1.5 0 0 1 5 3.5z"/></svg></button></div>';
         html += '</div>';
@@ -2962,22 +3209,22 @@
     function renderEditsView() {
       const container = document.getElementById('edits-content');
       if (!container) return;
-      if (pendingEdits.length === 0) {
+      if (pendingChanges.length === 0) {
         container.innerHTML = '<div class="empty-state"><div class="empty-state-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168l10-10z"/></svg></div><span class="empty-state-text">暂无待处理变更</span><span class="empty-state-hint">CLI 修改文件后将在此显示</span></div>';
         return;
       }
-      let html = '<div class="edits-header"><span class="edits-count">' + pendingEdits.length + ' 个待处理变更</span>';
+      let html = '<div class="edits-header"><span class="edits-count">' + pendingChanges.length + ' 个待处理变更</span>';
       html += '<div class="edits-batch-actions"><button class="btn-small btn-success" onclick="approveAllChanges()" title="批准全部"><svg viewBox="0 0 16 16" width="12" height="12"><path d="M13.854 3.646a.5.5 0 0 1 0 .708l-7 7a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L6.5 10.293l6.646-6.647a.5.5 0 0 1 .708 0z"/></svg> 全部批准</button>';
       html += '<button class="btn-small btn-danger" onclick="revertAllChanges()" title="还原全部"><svg viewBox="0 0 16 16" width="12" height="12"><path d="M8 3a5 5 0 1 1-4.546 2.914.5.5 0 0 0-.908-.417A6 6 0 1 0 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 0-.41-.192L5.23 2.308a.25.25 0 0 0 0 .384l2.36 1.966A.25.25 0 0 0 8 4.466z"/></svg> 全部还原</button></div></div>';
       html += '<div class="edits-list">';
-      pendingEdits.forEach(edit => {
+      pendingChanges.forEach(edit => {
         const fileName = edit.filePath.split('/').pop();
         const dirPath = edit.filePath.split('/').slice(0, -1).join('/');
         html += '<div class="edit-item" data-file="' + escapeHtml(edit.filePath) + '" onclick="viewDiff(\'' + escapeHtml(edit.filePath) + '\')">';
         html += '<svg class="edit-file-icon" viewBox="0 0 16 16"><path d="M4 0a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V4.414A2 2 0 0 0 13.414 3L11 .586A2 2 0 0 0 9.586 0H4z"/></svg>';
         html += '<div class="edit-info"><div class="edit-file-name">' + escapeHtml(fileName) + '</div><div class="edit-file-path">' + escapeHtml(dirPath) + '</div>';
         html += '<div class="edit-stats"><span class="edit-stat-add">+' + (edit.additions || 0) + '</span><span class="edit-stat-del">-' + (edit.deletions || 0) + '</span>';
-        if (edit.cli) html += '<span class="edit-cli-badge">' + edit.cli.toUpperCase() + '</span>';
+        if (edit.lastModifiedBy) html += '<span class="edit-cli-badge">' + edit.lastModifiedBy.toUpperCase() + '</span>';
         html += '</div></div>';
         html += '<div class="edit-actions" onclick="event.stopPropagation()"><button class="icon-btn" onclick="approveChange(\'' + escapeHtml(edit.filePath) + '\')" title="批准"><svg viewBox="0 0 16 16"><path d="M13.854 3.646a.5.5 0 0 1 0 .708l-7 7a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L6.5 10.293l6.646-6.647a.5.5 0 0 1 .708 0z"/></svg></button>';
         html += '<button class="icon-btn" onclick="revertChange(\'' + escapeHtml(edit.filePath) + '\')" title="还原"><svg viewBox="0 0 16 16"><path d="M8 3a5 5 0 1 1-4.546 2.914.5.5 0 0 0-.908-.417A6 6 0 1 0 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 0-.41-.192L5.23 2.308a.25.25 0 0 0 0 .384l2.36 1.966A.25.25 0 0 0 8 4.466z"/></svg></button></div>';
@@ -3034,7 +3281,7 @@
       if (modal) modal.remove();
     }
 
-    // Toast 通知系统
+    // Toast 通知系统（保留用于即时反馈，如输入验证）
     function showToast(message, type = 'info', duration = 3000) {
       const container = document.getElementById('toast-container');
       const toast = document.createElement('div');
@@ -3050,37 +3297,174 @@
       setTimeout(() => { toast.classList.add('hiding'); setTimeout(() => toast.remove(), 200); }, duration);
     }
 
+    // 系统消息（显示在对话面板中，替代大部分 Toast）
+    function addSystemMessage(message, type = 'info') {
+      const icons = {
+        success: '<svg viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/></svg>',
+        error: '<svg viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM5.354 4.646a.5.5 0 1 0-.708.708L7.293 8l-2.647 2.646a.5.5 0 0 0 .708.708L8 8.707l2.646 2.647a.5.5 0 0 0 .708-.708L8.707 8l2.647-2.646a.5.5 0 0 0-.708-.708L8 7.293 5.354 4.646z"/></svg>',
+        warning: '<svg viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>',
+        info: '<svg viewBox="0 0 16 16"><path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16zm.93-9.412-1 4.705c-.07.34.029.533.304.533.194 0 .487-.07.686-.246l-.088.416c-.287.346-.92.598-1.465.598-.703 0-1.002-.422-.808-1.319l.738-3.468c.064-.293.006-.399-.287-.47l-.451-.081.082-.381 2.29-.287zM8 5.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2z"/></svg>'
+      };
+      const now = new Date();
+      const time = now.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+
+      // 添加到当前会话的消息列表
+      const sessionMessages = messages[currentSessionId] || [];
+      sessionMessages.push({
+        type: 'system_notice',
+        noticeType: type,
+        content: message,
+        time: time,
+        timestamp: Date.now()
+      });
+      messages[currentSessionId] = sessionMessages;
+
+      // 渲染并滚动
+      renderMainContent();
+      smoothScrollToBottom();
+      throttledSaveState();
+    }
+
     // 设置面板
     const settingsOverlay = document.getElementById('settings-overlay');
     document.getElementById('settings-btn').addEventListener('click', () => {
       settingsOverlay.classList.add('visible');
-      // 🆕 打开设置面板时请求执行统计数据
+      // 打开设置面板时请求 CLI 状态和执行统计
+      requestCliStatus();
       requestExecutionStats();
     });
     document.getElementById('settings-close-btn').addEventListener('click', () => settingsOverlay.classList.remove('visible'));
     settingsOverlay.addEventListener('click', (e) => { if (e.target === settingsOverlay) settingsOverlay.classList.remove('visible'); });
 
-    // 设置开关
-    document.querySelectorAll('.settings-toggle').forEach(toggle => {
-      toggle.addEventListener('click', () => {
-        toggle.classList.toggle('active');
-        const settingId = toggle.id.replace('setting-', '');
-        vscode.postMessage({ type: 'updateSetting', key: settingId, value: toggle.classList.contains('active') });
-      });
+    // CLI 刷新按钮
+    document.getElementById('cli-refresh-btn').addEventListener('click', () => {
+      const btn = document.getElementById('cli-refresh-btn');
+      btn.classList.add('loading');
+      requestCliStatus();
+      setTimeout(() => btn.classList.remove('loading'), 1000);
     });
 
-    // 设置输入
-    document.querySelectorAll('.settings-input').forEach(input => {
-      input.addEventListener('change', () => {
-        const settingId = input.id.replace('setting-', '');
-        vscode.postMessage({ type: 'updateSetting', key: settingId, value: input.value });
+    // 请求 CLI 连接状态
+    function requestCliStatus() {
+      vscode.postMessage({ type: 'checkCliStatus' });
+    }
+
+    // 更新 CLI 连接状态 UI
+    function updateCliConnectionStatus(cliStatuses) {
+      if (!cliStatuses) return;
+      const statusTexts = {
+        'available': '可用',
+        'not_installed': '未安装',
+        'auth_failed': '认证失败',
+        'unknown': '未知'
+      };
+      ['claude', 'codex', 'gemini'].forEach(cli => {
+        const item = document.querySelector(`.cli-connection-item[data-cli="${cli}"]`);
+        if (!item) return;
+        const status = cliStatuses[cli] || { status: 'unknown' };
+        const isAvailable = status.status === 'available';
+
+        // 更新样式
+        item.classList.remove('available', 'unavailable');
+        item.classList.add(isAvailable ? 'available' : 'unavailable');
+
+        // 更新状态文本
+        const statusEl = item.querySelector('.cli-connection-status');
+        if (statusEl) {
+          statusEl.textContent = status.version ? `版本: ${status.version}` : (statusTexts[status.status] || status.status);
+        }
+
+        // 更新徽章
+        const badge = item.querySelector('.cli-connection-badge');
+        if (badge) {
+          badge.classList.remove('available', 'unavailable', 'checking');
+          badge.classList.add(isAvailable ? 'available' : 'unavailable');
+          badge.textContent = isAvailable ? '已连接' : (statusTexts[status.status] || '不可用');
+        }
       });
+    }
+
+    // Prompt 增强配置
+    const promptEnhanceUrl = document.getElementById('prompt-enhance-url');
+    const promptEnhanceKey = document.getElementById('prompt-enhance-key');
+    const promptEnhanceEye = document.getElementById('prompt-enhance-eye');
+    const promptEnhanceTest = document.getElementById('prompt-enhance-test');
+    const promptEnhanceStatus = document.getElementById('prompt-enhance-status');
+
+    // 从后端获取系统级配置（初始化时请求）
+    vscode.postMessage({ type: 'getPromptEnhanceConfig' });
+
+    // 输入变化时保存到后端（系统级存储）
+    promptEnhanceUrl.addEventListener('change', savePromptEnhanceConfig);
+    promptEnhanceKey.addEventListener('change', savePromptEnhanceConfig);
+
+    // 密钥显示/隐藏切换
+    promptEnhanceEye.addEventListener('click', () => {
+      const isPassword = promptEnhanceKey.type === 'password';
+      promptEnhanceKey.type = isPassword ? 'text' : 'password';
+      document.getElementById('eye-icon-closed').style.display = isPassword ? 'none' : 'block';
+      document.getElementById('eye-icon-open').style.display = isPassword ? 'block' : 'none';
     });
+
+    // 测试连接
+    promptEnhanceTest.addEventListener('click', () => {
+      const btn = promptEnhanceTest;
+      btn.classList.add('loading');
+      promptEnhanceStatus.style.display = 'none';
+
+      vscode.postMessage({
+        type: 'testPromptEnhance',
+        baseUrl: promptEnhanceUrl.value,
+        apiKey: promptEnhanceKey.value
+      });
+
+      setTimeout(() => btn.classList.remove('loading'), 2000);
+    });
+
+    // 保存 Prompt 增强配置到后端（系统级存储）
+    function savePromptEnhanceConfig() {
+      const config = {
+        baseUrl: promptEnhanceUrl.value,
+        apiKey: promptEnhanceKey.value
+      };
+      // 发送到后端保存（系统级存储）
+      vscode.postMessage({ type: 'updatePromptEnhance', config });
+    }
+
+    // 更新 Prompt 增强测试结果
+    function updatePromptEnhanceStatus(success, message) {
+      promptEnhanceStatus.style.display = 'block';
+      promptEnhanceStatus.className = 'prompt-enhance-status ' + (success ? 'success' : 'error');
+      promptEnhanceStatus.textContent = message;
+      promptEnhanceTest.classList.remove('loading');
+    }
+
+    // 处理增强后的 Prompt
+    function handlePromptEnhanced(enhancedPrompt, error) {
+      const btn = document.getElementById('enhance-btn');
+      const textSpan = btn.querySelector('.enhance-text');
+      // 恢复按钮状态
+      btn.classList.remove('loading');
+      btn.disabled = false;
+      if (textSpan) textSpan.textContent = '增强';
+
+      if (error) {
+        addSystemMessage('增强失败: ' + error, 'error');
+        return;
+      }
+
+      if (enhancedPrompt) {
+        const input = document.getElementById('prompt-input');
+        input.value = enhancedPrompt;
+        input.style.height = 'auto';
+        input.style.height = Math.min(input.scrollHeight, 200) + 'px';
+        addSystemMessage('Prompt 已增强', 'success');
+      }
+    }
 
     // 初始化
     render();
-    updateSendButtonState();  // 🆕 初始化按钮状态
+    updateSendButtonState();
   </script>
 </body>
 </html>
-

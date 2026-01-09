@@ -15,6 +15,7 @@ import { WorkerAgent } from './worker-agent';
 import { MessageBus, globalMessageBus } from './message-bus';
 import { ExecutionStats, FallbackSuggestion } from './execution-stats';
 import { TaskDependencyGraph, DependencyAnalysis, ExecutionBatch } from './task-dependency-graph';
+import { FileLockManager } from './file-lock-manager';
 import {
   WorkerType,
   WorkerState,
@@ -52,6 +53,11 @@ export interface SchedulingConfig {
   retryBaseDelay: number;
 }
 
+export interface DispatchOptions {
+  priority?: number;
+  abortSignal?: AbortSignal;
+}
+
 /** 默认调度配置 */
 const DEFAULT_SCHEDULING_CONFIG: SchedulingConfig = {
   maxParallel: 3,
@@ -59,6 +65,24 @@ const DEFAULT_SCHEDULING_CONFIG: SchedulingConfig = {
   maxRetries: 2,
   retryBaseDelay: 1000,
 };
+
+const DEFAULT_QUEUE_PRIORITY = 5;
+const QUEUE_STARVATION_BOOST_MS = 15000;
+
+interface QueueItem {
+  id: string;
+  taskId: string;
+  subTask: SubTask;
+  context?: string;
+  lockFiles: string[];
+  priority: number;
+  enqueuedAt: number;
+  resolve: (result: ExecutionResult) => void;
+  reject: (error: Error) => void;
+  abortSignal?: AbortSignal;
+  abortHandler?: () => void;
+  cancelGeneration: number;
+}
 
 /** 任务执行状态 */
 export interface TaskExecutionState {
@@ -96,6 +120,11 @@ export class WorkerPool extends EventEmitter {
   private schedulingConfig: SchedulingConfig;
   private executionStates: Map<string, TaskExecutionState> = new Map();
   private runningCount: number = 0;
+  private taskQueues: Map<WorkerType, QueueItem[]> = new Map();
+  private queueProcessing: Set<WorkerType> = new Set();
+  private queueCounter = 0;
+  private fileLockManager = new FileLockManager();
+  private cancelGeneration = 0;
 
   // 🆕 执行统计和降级相关
   private executionStats?: ExecutionStats;
@@ -267,15 +296,166 @@ export class WorkerPool extends EventEmitter {
     type: WorkerType,
     taskId: string,
     subTask: SubTask,
-    context?: string
+    context?: string,
+    options?: DispatchOptions
   ): Promise<ExecutionResult> {
-    const worker = await this.getOrCreateWorker(type);
+    return this.enqueueTask(type, taskId, subTask, context, options);
+  }
 
-    if (worker.state !== 'idle') {
-      throw new Error(`Worker ${type} 当前状态为 ${worker.state}，无法接受新任务`);
+  private getQueue(type: WorkerType): QueueItem[] {
+    if (!this.taskQueues.has(type)) {
+      this.taskQueues.set(type, []);
+    }
+    return this.taskQueues.get(type)!;
+  }
+
+  private async enqueueTask(
+    type: WorkerType,
+    taskId: string,
+    subTask: SubTask,
+    context?: string,
+    options?: DispatchOptions
+  ): Promise<ExecutionResult> {
+    const priority = options?.priority ?? subTask.priority ?? DEFAULT_QUEUE_PRIORITY;
+    const lockFiles = (subTask.targetFiles || []).filter(Boolean);
+    const abortSignal = options?.abortSignal;
+
+    if (abortSignal?.aborted) {
+      const reason = abortSignal.reason;
+      throw (reason instanceof Error ? reason : new Error('任务已取消'));
     }
 
-    return worker.executeTask(taskId, subTask, context);
+    const queue = this.getQueue(type);
+    const cancelGeneration = this.cancelGeneration;
+
+    return new Promise((resolve, reject) => {
+      const item: QueueItem = {
+        id: String(++this.queueCounter),
+        taskId,
+        subTask,
+        context,
+        lockFiles,
+        priority,
+        enqueuedAt: Date.now(),
+        resolve,
+        reject,
+        abortSignal,
+        cancelGeneration,
+      };
+
+      if (abortSignal) {
+        const onAbort = () => {
+          if (item.cancelGeneration !== this.cancelGeneration) {
+            return;
+          }
+          this.removeQueueItem(queue, item.id);
+          const reason = abortSignal.reason;
+          reject(reason instanceof Error ? reason : new Error('任务已取消'));
+        };
+        item.abortHandler = onAbort;
+        abortSignal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      queue.push(item);
+      void this.processQueue(type);
+    });
+  }
+
+  private async processQueue(type: WorkerType): Promise<void> {
+    if (this.queueProcessing.has(type)) {
+      return;
+    }
+
+    this.queueProcessing.add(type);
+
+    try {
+      const worker = await this.getOrCreateWorker(type);
+      const queue = this.getQueue(type);
+
+      while (queue.length > 0) {
+        if (worker.state !== 'idle') {
+          return;
+        }
+
+        const nextIndex = this.findNextQueueItemIndex(queue);
+        if (nextIndex === -1) {
+          await this.fileLockManager.waitForRelease();
+          continue;
+        }
+
+        const item = queue.splice(nextIndex, 1)[0];
+
+        if (item.abortHandler && item.abortSignal) {
+          item.abortSignal.removeEventListener('abort', item.abortHandler);
+        }
+
+        if (item.abortSignal?.aborted || item.cancelGeneration !== this.cancelGeneration) {
+          const reason = item.abortSignal?.reason;
+          item.reject(reason instanceof Error ? reason : new Error('任务已取消'));
+          continue;
+        }
+
+        let release: () => void = () => {};
+        try {
+          release = await this.fileLockManager.acquire(item.lockFiles, item.priority, item.abortSignal);
+          this.runningCount++;
+          const result = await worker.executeTask(item.taskId, item.subTask, item.context);
+          item.resolve(result);
+        } catch (error) {
+          item.reject(error instanceof Error ? error : new Error(String(error)));
+        } finally {
+          release();
+          this.runningCount = Math.max(0, this.runningCount - 1);
+        }
+      }
+    } finally {
+      this.queueProcessing.delete(type);
+      if (this.getQueue(type).length > 0) {
+        setTimeout(() => void this.processQueue(type), 0);
+      }
+    }
+  }
+
+  private findNextQueueItemIndex(queue: QueueItem[]): number {
+    if (queue.length === 0) {
+      return -1;
+    }
+
+    const now = Date.now();
+    let bestIndex = -1;
+    let bestPriority = Number.POSITIVE_INFINITY;
+    let bestEnqueuedAt = Number.POSITIVE_INFINITY;
+
+    for (let i = 0; i < queue.length; i++) {
+      const item = queue[i];
+      if (!this.fileLockManager.canAcquire(item.lockFiles)) {
+        continue;
+      }
+
+      const effectivePriority = this.computeQueuePriority(item, now);
+      if (
+        effectivePriority < bestPriority ||
+        (effectivePriority === bestPriority && item.enqueuedAt < bestEnqueuedAt)
+      ) {
+        bestPriority = effectivePriority;
+        bestEnqueuedAt = item.enqueuedAt;
+        bestIndex = i;
+      }
+    }
+
+    return bestIndex;
+  }
+
+  private computeQueuePriority(item: QueueItem, now: number): number {
+    const waitBoost = Math.floor((now - item.enqueuedAt) / QUEUE_STARVATION_BOOST_MS);
+    return item.priority - waitBoost;
+  }
+
+  private removeQueueItem(queue: QueueItem[], itemId: string): void {
+    const index = queue.findIndex(item => item.id === itemId);
+    if (index !== -1) {
+      queue.splice(index, 1);
+    }
   }
 
   /**
@@ -286,7 +466,8 @@ export class WorkerPool extends EventEmitter {
     type: WorkerType,
     taskId: string,
     subTask: SubTask,
-    context?: string
+    context?: string,
+    options?: DispatchOptions
   ): Promise<ExecutionResult> {
     const state: TaskExecutionState = {
       subTaskId: subTask.id,
@@ -308,7 +489,7 @@ export class WorkerPool extends EventEmitter {
       state.startTime = startTime;
 
       try {
-        const result = await this.executeWithTimeout(currentCli, taskId, subTask, context);
+        const result = await this.executeWithTimeout(currentCli, taskId, subTask, context, options);
         const duration = Date.now() - startTime;
 
         // 🆕 记录执行统计
@@ -318,7 +499,6 @@ export class WorkerPool extends EventEmitter {
         state.endTime = Date.now();
 
         if (result.success) {
-          this.runningCount--;
           return result;
         }
 
@@ -335,7 +515,6 @@ export class WorkerPool extends EventEmitter {
           }
 
           state.error = result.error;
-          this.runningCount--;
           return result;
         }
 
@@ -362,7 +541,6 @@ export class WorkerPool extends EventEmitter {
 
           state.status = 'failed';
           state.endTime = Date.now();
-          this.runningCount--;
           throw lastError;
         }
       }
@@ -376,7 +554,6 @@ export class WorkerPool extends EventEmitter {
 
     state.status = 'failed';
     state.endTime = Date.now();
-    this.runningCount--;
     throw lastError || new Error('任务执行失败');
   }
 
@@ -387,23 +564,50 @@ export class WorkerPool extends EventEmitter {
     type: WorkerType,
     taskId: string,
     subTask: SubTask,
-    context?: string
+    context?: string,
+    options?: DispatchOptions
   ): Promise<ExecutionResult> {
-    this.runningCount++;
+    return new Promise((resolve, reject) => {
+      const controller = new AbortController();
+      const abortSignal = options?.abortSignal;
 
-    return new Promise(async (resolve, reject) => {
+      const cleanup = (timeoutId: NodeJS.Timeout, onAbort?: () => void) => {
+        clearTimeout(timeoutId);
+        if (abortSignal && onAbort) {
+          abortSignal.removeEventListener('abort', onAbort);
+        }
+      };
+
+      const onAbort = () => {
+        const reason = abortSignal?.reason;
+        controller.abort(reason instanceof Error ? reason : new Error('任务已取消'));
+      };
+
+      if (abortSignal) {
+        if (abortSignal.aborted) {
+          const reason = abortSignal.reason;
+          reject(reason instanceof Error ? reason : new Error('任务已取消'));
+          return;
+        }
+        abortSignal.addEventListener('abort', onAbort, { once: true });
+      }
+
       const timeoutId = setTimeout(() => {
-        reject(new Error(`任务执行超时 (${this.schedulingConfig.timeout}ms)`));
+        controller.abort(new Error(`任务执行超时 (${this.schedulingConfig.timeout}ms)`));
       }, this.schedulingConfig.timeout);
 
-      try {
-        const result = await this.dispatchTask(type, taskId, subTask, context);
-        clearTimeout(timeoutId);
-        resolve(result);
-      } catch (error) {
-        clearTimeout(timeoutId);
-        reject(error);
-      }
+      this.enqueueTask(type, taskId, subTask, context, {
+        priority: options?.priority,
+        abortSignal: controller.signal,
+      })
+        .then(result => {
+          cleanup(timeoutId, onAbort);
+          resolve(result);
+        })
+        .catch(error => {
+          cleanup(timeoutId, onAbort);
+          reject(error);
+        });
     });
   }
 
@@ -556,6 +760,18 @@ export class WorkerPool extends EventEmitter {
    * 取消所有 Worker 的任务
    */
   async cancelAllTasks(): Promise<void> {
+    this.cancelGeneration++;
+
+    for (const queue of this.taskQueues.values()) {
+      for (const item of queue) {
+        if (item.abortHandler && item.abortSignal) {
+          item.abortSignal.removeEventListener('abort', item.abortHandler);
+        }
+        item.reject(new Error('任务已取消'));
+      }
+      queue.length = 0;
+    }
+
     const promises = this.getAllWorkers().map(w => w.cancel());
     await Promise.all(promises);
   }
@@ -579,6 +795,8 @@ export class WorkerPool extends EventEmitter {
     // 构建依赖图
     const graph = new TaskDependencyGraph();
 
+    const dependentsCount = new Map<string, number>();
+
     // 添加所有任务到图中
     for (const subTask of subTasks) {
       graph.addTask(subTask.id, subTask.description, subTask);
@@ -589,6 +807,11 @@ export class WorkerPool extends EventEmitter {
       if (subTask.dependencies && subTask.dependencies.length > 0) {
         graph.addDependencies(subTask.id, subTask.dependencies);
       }
+    }
+
+    for (const subTask of subTasks) {
+      const node = graph.getTask(subTask.id);
+      dependentsCount.set(subTask.id, node?.dependents.length ?? 0);
     }
 
     // 分析依赖图
@@ -624,7 +847,7 @@ export class WorkerPool extends EventEmitter {
         .filter((t): t is SubTask => t !== undefined);
 
       // 并行执行批次内的任务
-      const batchResults = await this.executeBatchParallel(taskId, batchTasks, context);
+      const batchResults = await this.executeBatchParallel(taskId, batchTasks, context, dependentsCount);
       allResults.push(...batchResults);
 
       // 更新图中的任务状态
@@ -652,7 +875,8 @@ export class WorkerPool extends EventEmitter {
   private async executeBatchParallel(
     taskId: string,
     subTasks: SubTask[],
-    context?: string
+    context?: string,
+    dependentsCount?: Map<string, number>
   ): Promise<ExecutionResult[]> {
     // 限制并行数量
     const maxParallel = this.schedulingConfig.maxParallel;
@@ -661,12 +885,17 @@ export class WorkerPool extends EventEmitter {
     // 分组执行
     for (let i = 0; i < subTasks.length; i += maxParallel) {
       const chunk = subTasks.slice(i, i + maxParallel);
-      const chunkPromises = chunk.map(subTask =>
-        this.dispatchTaskWithRetry(
+      const chunkPromises = chunk.map(subTask => {
+        const basePriority = subTask.priority ?? DEFAULT_QUEUE_PRIORITY;
+        const dependentBoost = dependentsCount?.get(subTask.id) ?? 0;
+        const priority = basePriority - dependentBoost;
+
+        return this.dispatchTaskWithRetry(
           subTask.assignedWorker || 'claude',
           taskId,
           subTask,
-          context
+          context,
+          { priority }
         ).catch(error => ({
           workerId: 'unknown',
           workerType: subTask.assignedWorker || 'claude',
@@ -676,8 +905,8 @@ export class WorkerPool extends EventEmitter {
           success: false,
           duration: 0,
           error: error instanceof Error ? error.message : String(error),
-        } as ExecutionResult))
-      );
+        } as ExecutionResult));
+      });
 
       const chunkResults = await Promise.all(chunkPromises);
       results.push(...chunkResults);
@@ -712,6 +941,16 @@ export class WorkerPool extends EventEmitter {
     // 取消所有订阅
     this.unsubscribers.forEach(unsub => unsub());
     this.unsubscribers = [];
+
+    for (const queue of this.taskQueues.values()) {
+      for (const item of queue) {
+        if (item.abortHandler && item.abortSignal) {
+          item.abortSignal.removeEventListener('abort', item.abortHandler);
+        }
+        item.reject(new Error('WorkerPool 已销毁'));
+      }
+      queue.length = 0;
+    }
 
     // 销毁所有 Worker
     this.workers.forEach(worker => worker.dispose());

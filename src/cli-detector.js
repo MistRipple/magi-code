@@ -299,7 +299,8 @@ class CLIDetector {
      * 解析版本号
      */
     parseVersion(output) {
-        const match = output.match(/(\d+\.\d+\.\d+)/);
+        const safeOutput = output ?? '';
+        const match = safeOutput.match(/(\d+\.\d+\.\d+)/);
         return match ? match[1] : 'unknown';
     }
     /**

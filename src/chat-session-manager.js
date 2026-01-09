@@ -134,13 +134,14 @@ class ChatSessionManager {
         return content.length > 50 ? content.substring(0, 50) + '...' : content;
     }
     /** 添加消息到当前会话 */
-    addMessage(role, content, cli) {
+    addMessage(role, content, cli, source) {
         const session = this.getOrCreateCurrentSession();
         const message = {
             id: generateMessageId(),
             role,
             content,
             cli,
+            source,
             timestamp: Date.now(),
         };
         session.messages.push(message);

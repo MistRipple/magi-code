@@ -4,7 +4,7 @@ node_modules/
 # VS Code extension build/test artifacts
 .vscode-test/
 *.vsix
-augment-extracted/
+augment-plugin/
 
 # Editor/OS noise
 .DS_Store

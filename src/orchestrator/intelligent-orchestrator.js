@@ -43,12 +43,12 @@ class IntelligentOrchestrator {
         this.snapshotManager = snapshotManager;
         this.workspaceRoot = workspaceRoot;
         this.config = { ...DEFAULT_CONFIG, ...config };
-        // 创建独立编排者 Agent，传递 workspaceRoot 以支持验证功能
+        // 创建独立编排者 Agent，传递 workspaceRoot 和 snapshotManager 以支持验证和回滚功能
         this.orchestratorAgent = new orchestrator_agent_1.OrchestratorAgent(cliFactory, {
             timeout: this.config.timeout,
             maxRetries: this.config.maxRetries,
             verification: this.config.verification,
-        }, workspaceRoot);
+        }, workspaceRoot, snapshotManager, taskManager);
         this.setupOrchestratorEvents();
     }
     /** 设置编排者事件监听 */
@@ -130,6 +130,11 @@ class IntelligentOrchestrator {
             }
             // agent/auto 模式：使用独立编排者执行
             const result = await this.orchestratorAgent.execute(userPrompt, taskId);
+            if (this.abortController?.signal.aborted) {
+                this.taskManager.updateTaskStatus(taskId, 'cancelled');
+                events_1.globalEventBus.emitEvent('task:interrupted', { taskId, data: { isRunning: false } });
+                return '任务已被取消。';
+            }
             this.taskManager.updateTaskStatus(taskId, 'completed');
             events_1.globalEventBus.emitEvent('task:completed', { taskId, data: { isRunning: false } });
             return result;

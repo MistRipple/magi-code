@@ -106,7 +106,8 @@ export class IntelligentOrchestrator {
         verification: this.config.verification,
       },
       workspaceRoot,
-      snapshotManager
+      snapshotManager,
+      taskManager
     );
 
     this.setupOrchestratorEvents();
@@ -211,6 +212,12 @@ export class IntelligentOrchestrator {
 
       // agent/auto 模式：使用独立编排者执行
       const result = await this.orchestratorAgent.execute(userPrompt, taskId);
+
+      if (this.abortController?.signal.aborted) {
+        this.taskManager.updateTaskStatus(taskId, 'cancelled');
+        globalEventBus.emitEvent('task:interrupted', { taskId, data: { isRunning: false } });
+        return '任务已被取消。';
+      }
 
       this.taskManager.updateTaskStatus(taskId, 'completed');
       globalEventBus.emitEvent('task:completed', { taskId, data: { isRunning: false } });

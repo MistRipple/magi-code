@@ -25,6 +25,11 @@ export interface FactoryConfig {
   env?: Record<string, string>;
 }
 
+export interface AdapterOutputScope {
+  source?: 'worker' | 'orchestrator' | 'system';
+  streamToUI?: boolean;
+}
+
 /**
  * CLI 适配器工厂
  * 提供统一的适配器创建、管理和事件转发
@@ -32,6 +37,7 @@ export interface FactoryConfig {
 export class CLIAdapterFactory extends EventEmitter {
   private adapters: Map<CLIType, ICLIAdapter> = new Map();
   private config: FactoryConfig;
+  private outputScopes: Map<CLIType, AdapterOutputScope> = new Map();
 
   constructor(config: FactoryConfig) {
     super();
@@ -79,7 +85,11 @@ export class CLIAdapterFactory extends EventEmitter {
    */
   private setupAdapterEvents(adapter: ICLIAdapter, type: CLIType): void {
     adapter.on('output', (chunk: string) => {
-      this.emit('output', { type, chunk });
+      const scope = this.outputScopes.get(type);
+      if (scope?.streamToUI === false) {
+        return;
+      }
+      this.emit('output', { type, chunk, source: scope?.source });
     });
 
     adapter.on('response', (response: CLIResponse) => {
@@ -207,7 +217,12 @@ export class CLIAdapterFactory extends EventEmitter {
    * 发送消息到指定 CLI
    * 如果目标 CLI 不支持图片或处于会话恢复模式，会先用 Codex 描述图片
    */
-  async sendMessage(type: CLIType, message: string, imagePaths?: string[]): Promise<CLIResponse> {
+  async sendMessage(
+    type: CLIType,
+    message: string,
+    imagePaths?: string[],
+    options?: AdapterOutputScope
+  ): Promise<CLIResponse> {
     const adapter = this.getOrCreate(type);
     if (!adapter.isConnected) {
       await adapter.connect();
@@ -216,31 +231,53 @@ export class CLIAdapterFactory extends EventEmitter {
     const hasImages = imagePaths && imagePaths.length > 0;
     console.log(`[CLIAdapterFactory] sendMessage: type=${type}, hasImages=${hasImages}, imagePaths=`, imagePaths);
 
-    // 判断是否需要预处理图片
-    if (hasImages) {
-      const needsImageDescription = this.shouldDescribeImages(type, adapter);
-      console.log(`[CLIAdapterFactory] needsImageDescription=${needsImageDescription}`);
-
-      if (needsImageDescription) {
-        console.log(`[CLIAdapterFactory] 目标 CLI ${type} 需要图片描述，使用 Codex 预处理`);
-        try {
-          const imageDescription = await CodexAdapter.describeImages(imagePaths, this.config.cwd);
-          console.log(`[CLIAdapterFactory] 图片描述结果: "${imageDescription}"`);
-          // 将图片描述附加到消息中
-          const enhancedMessage = `${message}\n\n[图片内容描述]\n${imageDescription}`;
-          console.log(`[CLIAdapterFactory] 图片描述完成，增强后的消息长度: ${enhancedMessage.length}`);
-          return adapter.sendMessage(enhancedMessage);
-        } catch (error) {
-          console.error('[CLIAdapterFactory] 图片描述失败:', error);
-          // 图片描述失败时，仍然发送原始消息，但附加提示
-          const fallbackMessage = `${message}\n\n[注意: 图片处理失败，请用户重新描述图片内容]`;
-          return adapter.sendMessage(fallbackMessage);
-        }
-      }
+    const scope = options ? { ...options } : null;
+    if (scope) {
+      this.outputScopes.set(type, scope);
     }
 
-    // 直接发送（支持图片的 CLI 或无图片）
-    return adapter.sendMessage(message, imagePaths);
+    // 🆕 如果是编排者发送的消息，先在 CLI 面板中展示编排者的请求
+    // 这样用户能看到完整的"对话流"：编排者请求 -> 代理回复
+    if (options?.source === 'orchestrator' && options?.streamToUI !== false) {
+      this.emitOrchestratorMessage(type, message);
+    }
+
+    try {
+      // 判断是否需要预处理图片
+      if (hasImages) {
+        const needsImageDescription = this.shouldDescribeImages(type, adapter);
+        console.log(`[CLIAdapterFactory] needsImageDescription=${needsImageDescription}`);
+
+        if (needsImageDescription) {
+          console.log(`[CLIAdapterFactory] 目标 CLI ${type} 需要图片描述，使用 Codex 预处理`);
+          try {
+            const imageDescription = await CodexAdapter.describeImages(imagePaths, this.config.cwd);
+            console.log(`[CLIAdapterFactory] 图片描述结果: "${imageDescription}"`);
+            // 将图片描述附加到消息中
+            const enhancedMessage = `${message}
+
+[图片内容描述]
+${imageDescription}`;
+            console.log(`[CLIAdapterFactory] 图片描述完成，增强后的消息长度: ${enhancedMessage.length}`);
+            return adapter.sendMessage(enhancedMessage);
+          } catch (error) {
+            console.error('[CLIAdapterFactory] 图片描述失败:', error);
+            // 图片描述失败时，仍然发送原始消息，但附加提示
+            const fallbackMessage = `${message}
+
+[注意: 图片处理失败，请用户重新描述图片内容]`;
+            return adapter.sendMessage(fallbackMessage);
+          }
+        }
+      }
+
+      // 直接发送（支持图片的 CLI 或无图片）
+      return adapter.sendMessage(message, imagePaths);
+    } finally {
+      if (scope) {
+        this.outputScopes.delete(type);
+      }
+    }
   }
 
   /**
@@ -278,6 +315,81 @@ export class CLIAdapterFactory extends EventEmitter {
     if (adapter) {
       await adapter.interrupt();
     }
+  }
+
+  /**
+   * 向 CLI 面板发送编排者的消息
+   * 让用户能看到编排者和代理之间的完整对话流
+   */
+  private emitOrchestratorMessage(type: CLIType, message: string): void {
+    // 提取消息的关键信息，生成简洁的展示内容
+    const summary = this.summarizeOrchestratorMessage(message);
+
+    // 发送到 CLI 面板，标记来源为 orchestrator
+    this.emit('output', {
+      type,
+      chunk: summary,
+      source: 'orchestrator'
+    });
+  }
+
+  /** 公开方法：向 CLI 面板发送编排者消息 */
+  emitOrchestratorMessageToUI(type: CLIType, message: string): void {
+    this.emitOrchestratorMessage(type, message);
+  }
+
+  /**
+   * 将编排者的完整 prompt 转换为简洁的展示摘要
+   * 使用 HTML 徽章标签格式，提供专业的视觉效果
+   */
+  private summarizeOrchestratorMessage(message: string): string {
+    // 检测消息类型并生成对应的摘要
+    const lines = message.split('\n').filter(l => l.trim());
+
+    // 检测任务分配
+    if (message.includes('## 任务') || message.includes('Task:') || message.includes('任务描述')) {
+      const taskMatch = message.match(/(?:任务描述|Task|描述)[：:]\s*(.+)/i);
+      const filesMatch = message.match(/(?:目标文件|Target files|文件)[：:]\s*(.+)/i);
+
+      let summary = '<span class="orchestrator-badge task-assign">Task</span>\n';
+      if (taskMatch) summary += `${taskMatch[1].trim()}\n`;
+      if (filesMatch) summary += `目标文件: ${filesMatch[1].trim()}\n`;
+
+      if (summary === '<span class="orchestrator-badge task-assign">Task</span>\n') {
+        summary += lines.slice(0, 3).join('\n');
+      }
+      return summary;
+    }
+
+    // 检测自检请求
+    if (message.includes('自检') || message.includes('self-check') || message.includes('检查是否满足')) {
+      return '<span class="orchestrator-badge self-check">Self Check</span>\n请检查刚才完成的任务是否满足要求...';
+    }
+
+    // 检测互检请求
+    if (message.includes('互检') || message.includes('peer review') || message.includes('审查')) {
+      return '<span class="orchestrator-badge peer-review">Peer Review</span>\n请审查另一个代理完成的任务...';
+    }
+
+    // 检测修复请求
+    if (message.includes('修复') || message.includes('fix') || message.includes('问题')) {
+      return '<span class="orchestrator-badge fix-request">Fix</span>\n请修复之前发现的问题...';
+    }
+
+    // 检测分析请求
+    if (message.includes('分析') || message.includes('analyze')) {
+      return '<span class="orchestrator-badge analyze">Analyze</span>\n请分析任务并生成执行计划...';
+    }
+
+    // 检测总结请求
+    if (message.includes('总结') || message.includes('summary') || message.includes('汇总')) {
+      return '<span class="orchestrator-badge summary">Summary</span>\n请汇总执行结果...';
+    }
+
+    // 默认：显示消息的前几行
+    const preview = lines.slice(0, 5).join('\n');
+    const truncated = lines.length > 5 ? '\n...' : '';
+    return `<span class="orchestrator-badge default">Message</span>\n${preview}${truncated}`;
   }
 
   /**
@@ -356,4 +468,3 @@ export class CLIAdapterFactory extends EventEmitter {
     this.removeAllListeners();
   }
 }
-

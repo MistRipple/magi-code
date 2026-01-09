@@ -32,7 +32,7 @@ export declare class ChatSessionManager {
     /** 获取会话预览（第一条用户消息的前 50 个字符） */
     private getSessionPreview;
     /** 添加消息到当前会话 */
-    addMessage(role: 'user' | 'assistant', content: string, cli?: CLIType): SessionMessage;
+    addMessage(role: 'user' | 'assistant', content: string, cli?: CLIType, source?: 'orchestrator' | 'worker' | 'system'): SessionMessage;
     /**
      * 生成会话标题 - 参考 Augment 风格的智能命名
      * 1. 移除冗余词汇（帮我、请、能不能等）
