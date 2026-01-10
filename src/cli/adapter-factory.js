@@ -16,8 +16,10 @@ const gemini_1 = require("./adapters/gemini");
  */
 class CLIAdapterFactory extends events_1.EventEmitter {
     adapters = new Map();
+    orchestratorAdapters = new Map();
     config;
     outputScopes = new Map();
+    outputMuteCounts = new Map();
     constructor(config) {
         super();
         this.config = config;
@@ -26,60 +28,44 @@ class CLIAdapterFactory extends events_1.EventEmitter {
      * 创建或获取适配器实例
      */
     create(type) {
-        const existing = this.adapters.get(type);
-        if (existing) {
-            return existing;
-        }
-        const adapterConfig = {
-            cwd: this.config.cwd,
-            timeout: this.config.timeout,
-            env: this.config.env,
-        };
-        let adapter;
-        switch (type) {
-            case 'claude':
-                adapter = new claude_1.ClaudeAdapter(adapterConfig);
-                break;
-            case 'codex':
-                adapter = new codex_1.CodexAdapter(adapterConfig);
-                break;
-            case 'gemini':
-                adapter = new gemini_1.GeminiAdapter(adapterConfig);
-                break;
-            default:
-                throw new Error(`Unknown CLI type: ${type}`);
-        }
-        // 转发适配器事件
-        this.setupAdapterEvents(adapter, type);
-        this.adapters.set(type, adapter);
-        return adapter;
+        return this.createWithRole(type, 'worker');
     }
     /**
      * 设置适配器事件转发
      */
-    setupAdapterEvents(adapter, type) {
+    setupAdapterEvents(adapter, type, role) {
+        const suppressUI = role === 'orchestrator';
         adapter.on('output', (chunk) => {
-            const scope = this.outputScopes.get(type);
+            const scopeKey = this.getScopeKey(type, role);
+            if ((this.outputMuteCounts.get(scopeKey) || 0) > 0) {
+                return;
+            }
+            const scope = this.outputScopes.get(scopeKey);
             if (scope?.streamToUI === false) {
                 return;
             }
-            this.emit('output', { type, chunk, source: scope?.source });
+            this.emit('output', { type, chunk, source: scope?.source, adapterRole: role });
         });
         adapter.on('response', (response) => {
-            this.emit('response', { type, response });
+            const scopeKey = this.getScopeKey(type, role);
+            const scope = this.outputScopes.get(scopeKey);
+            this.emit('response', { type, response, source: scope?.source, adapterRole: role });
         });
         adapter.on('error', (error) => {
             this.emit('error', { type, error });
         });
         adapter.on('stateChange', (state) => {
+            if (suppressUI) {
+                return;
+            }
             this.emit('stateChange', { type, state });
         });
     }
     /**
      * 获取已创建的适配器
      */
-    getAdapter(type) {
-        return this.adapters.get(type);
+    getAdapter(type, role = 'worker') {
+        return this.getAdapterMap(role).get(type);
     }
     /**
      * 检查 CLI 是否可用（已创建且已连接）
@@ -91,14 +77,17 @@ class CLIAdapterFactory extends events_1.EventEmitter {
     /**
      * 获取或创建适配器
      */
-    getOrCreate(type) {
-        return this.adapters.get(type) || this.create(type);
+    getOrCreate(type, role = 'worker') {
+        return this.getAdapterMap(role).get(type) || this.createWithRole(type, role);
     }
     /**
      * 获取所有已创建的适配器
      */
-    getAllAdapters() {
-        return Array.from(this.adapters.values());
+    getAllAdapters(role) {
+        if (role) {
+            return Array.from(this.getAdapterMap(role).values());
+        }
+        return [...this.adapters.values(), ...this.orchestratorAdapters.values()];
     }
     /**
      * 获取所有适配器状态
@@ -159,7 +148,7 @@ class CLIAdapterFactory extends events_1.EventEmitter {
      * 断开指定类型的适配器
      */
     async disconnect(type) {
-        const adapter = this.adapters.get(type);
+        const adapter = this.getAdapter(type);
         if (adapter) {
             await adapter.disconnect();
         }
@@ -176,15 +165,21 @@ class CLIAdapterFactory extends events_1.EventEmitter {
      * 如果目标 CLI 不支持图片或处于会话恢复模式，会先用 Codex 描述图片
      */
     async sendMessage(type, message, imagePaths, options) {
-        const adapter = this.getOrCreate(type);
+        const role = options?.adapterRole ?? (options?.source === 'orchestrator' ? 'orchestrator' : 'worker');
+        const adapter = this.getOrCreate(type, role);
         if (!adapter.isConnected) {
             await adapter.connect();
         }
         const hasImages = imagePaths && imagePaths.length > 0;
         console.log(`[CLIAdapterFactory] sendMessage: type=${type}, hasImages=${hasImages}, imagePaths=`, imagePaths);
         const scope = options ? { ...options } : null;
+        const scopeKey = this.getScopeKey(type, role);
         if (scope) {
-            this.outputScopes.set(type, scope);
+            this.outputScopes.set(scopeKey, scope);
+        }
+        if (options?.streamToUI === false) {
+            const count = this.outputMuteCounts.get(scopeKey) || 0;
+            this.outputMuteCounts.set(scopeKey, count + 1);
         }
         try {
             // 判断是否需要预处理图片
@@ -220,7 +215,16 @@ ${imageDescription}`;
         }
         finally {
             if (scope) {
-                this.outputScopes.delete(type);
+                this.outputScopes.delete(scopeKey);
+            }
+            if (options?.streamToUI === false) {
+                const count = this.outputMuteCounts.get(scopeKey) || 0;
+                if (count <= 1) {
+                    this.outputMuteCounts.delete(scopeKey);
+                }
+                else {
+                    this.outputMuteCounts.set(scopeKey, count - 1);
+                }
             }
         }
     }
@@ -257,6 +261,70 @@ ${imageDescription}`;
         }
     }
     /**
+     * 向 CLI 面板发送编排者的消息
+     * 让用户能看到编排者和代理之间的完整对话流
+     */
+    emitOrchestratorMessage(type, message) {
+        // 提取消息的关键信息，生成简洁的展示内容
+        const summary = this.summarizeOrchestratorMessage(message);
+        // 发送到 CLI 面板，标记来源为 orchestrator
+        this.emit('output', {
+            type,
+            chunk: summary,
+            source: 'orchestrator'
+        });
+    }
+    /** 公开方法：向 CLI 面板发送编排者消息 */
+    emitOrchestratorMessageToUI(type, message) {
+        this.emitOrchestratorMessage(type, message);
+    }
+    /**
+     * 将编排者的完整 prompt 转换为简洁的展示摘要
+     * 使用 HTML 徽章标签格式，提供专业的视觉效果
+     */
+    summarizeOrchestratorMessage(message) {
+        // 检测消息类型并生成对应的摘要
+        const lines = message.split('\n').filter(l => l.trim());
+        // 检测任务分配
+        if (message.includes('## 任务') || message.includes('Task:') || message.includes('任务描述')) {
+            const taskMatch = message.match(/(?:任务描述|Task|描述)[：:]\s*(.+)/i);
+            const filesMatch = message.match(/(?:目标文件|Target files|文件)[：:]\s*(.+)/i);
+            let summary = '<span class="orchestrator-badge task-assign">Task</span>\n';
+            if (taskMatch)
+                summary += `${taskMatch[1].trim()}\n`;
+            if (filesMatch)
+                summary += `目标文件: ${filesMatch[1].trim()}\n`;
+            if (summary === '<span class="orchestrator-badge task-assign">Task</span>\n') {
+                summary += lines.slice(0, 3).join('\n');
+            }
+            return summary;
+        }
+        // 检测自检请求
+        if (message.includes('自检') || message.includes('self-check') || message.includes('检查是否满足')) {
+            return '<span class="orchestrator-badge self-check">Self Check</span>\n请检查刚才完成的任务是否满足要求...';
+        }
+        // 检测互检请求
+        if (message.includes('互检') || message.includes('peer review') || message.includes('审查')) {
+            return '<span class="orchestrator-badge peer-review">Peer Review</span>\n请审查另一个代理完成的任务...';
+        }
+        // 检测修复请求
+        if (message.includes('修复') || message.includes('fix') || message.includes('问题')) {
+            return '<span class="orchestrator-badge fix-request">Fix</span>\n请修复之前发现的问题...';
+        }
+        // 检测分析请求
+        if (message.includes('分析') || message.includes('analyze')) {
+            return '<span class="orchestrator-badge analyze">Analyze</span>\n请分析任务并生成执行计划...';
+        }
+        // 检测总结请求
+        if (message.includes('总结') || message.includes('summary') || message.includes('汇总')) {
+            return '<span class="orchestrator-badge summary">Summary</span>\n请汇总执行结果...';
+        }
+        // 默认：显示消息的前几行
+        const preview = lines.slice(0, 5).join('\n');
+        const truncated = lines.length > 5 ? '\n...' : '';
+        return `<span class="orchestrator-badge default">Message</span>\n${preview}${truncated}`;
+    }
+    /**
      * 中断所有 CLI 的执行
      */
     async interruptAll() {
@@ -266,8 +334,8 @@ ${imageDescription}`;
     /**
      * 获取指定 CLI 的会话 ID
      */
-    getSessionId(type) {
-        const adapter = this.adapters.get(type);
+    getSessionId(type, role = 'worker') {
+        const adapter = this.getAdapter(type, role);
         if (adapter && 'getSessionId' in adapter && typeof adapter.getSessionId === 'function') {
             return adapter.getSessionId();
         }
@@ -276,8 +344,8 @@ ${imageDescription}`;
     /**
      * 设置指定 CLI 的会话 ID
      */
-    setSessionId(type, sessionId) {
-        const adapter = this.adapters.get(type);
+    setSessionId(type, sessionId, role = 'worker') {
+        const adapter = this.getAdapter(type, role);
         if (adapter && 'setSessionId' in adapter && typeof adapter.setSessionId === 'function') {
             adapter.setSessionId(sessionId);
         }
@@ -285,8 +353,8 @@ ${imageDescription}`;
     /**
      * 重置指定 CLI 的会话
      */
-    resetSession(type) {
-        const adapter = this.adapters.get(type);
+    resetSession(type, role = 'worker') {
+        const adapter = this.getAdapter(type, role);
         if (adapter && 'resetSession' in adapter && typeof adapter.resetSession === 'function') {
             adapter.resetSession();
         }
@@ -296,7 +364,8 @@ ${imageDescription}`;
      */
     resetAllSessions() {
         const types = ['claude', 'codex', 'gemini'];
-        types.forEach(type => this.resetSession(type));
+        types.forEach(type => this.resetSession(type, 'worker'));
+        types.forEach(type => this.resetSession(type, 'orchestrator'));
     }
     /**
      * 获取所有 CLI 的会话 ID
@@ -319,12 +388,50 @@ ${imageDescription}`;
         if (sessionIds.gemini !== undefined)
             this.setSessionId('gemini', sessionIds.gemini);
     }
+    createWithRole(type, role) {
+        const adapters = this.getAdapterMap(role);
+        const existing = adapters.get(type);
+        if (existing) {
+            return existing;
+        }
+        const adapterConfig = {
+            cwd: this.config.cwd,
+            timeout: this.config.timeout,
+            idleTimeout: this.config.idleTimeout,
+            maxTimeout: this.config.maxTimeout,
+            env: this.config.env,
+        };
+        let adapter;
+        switch (type) {
+            case 'claude':
+                adapter = new claude_1.ClaudeAdapter(adapterConfig);
+                break;
+            case 'codex':
+                adapter = new codex_1.CodexAdapter(adapterConfig);
+                break;
+            case 'gemini':
+                adapter = new gemini_1.GeminiAdapter(adapterConfig);
+                break;
+            default:
+                throw new Error(`Unknown CLI type: ${type}`);
+        }
+        this.setupAdapterEvents(adapter, type, role);
+        adapters.set(type, adapter);
+        return adapter;
+    }
+    getAdapterMap(role) {
+        return role === 'orchestrator' ? this.orchestratorAdapters : this.adapters;
+    }
+    getScopeKey(type, role) {
+        return `${role}:${type}`;
+    }
     /**
      * 销毁工厂，清理所有资源
      */
     async dispose() {
         await this.disconnectAll();
         this.adapters.clear();
+        this.orchestratorAdapters.clear();
         this.removeAllListeners();
     }
 }

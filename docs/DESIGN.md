@@ -125,7 +125,39 @@
 - **灵活调度**：支持动态任务分配和 CLI 降级
 - **可扩展性**：轻松添加新的 Worker 类型
 
-### 2.2 核心模块
+### 2.3 角色边界与阶段职责（参考 GuDaStudio/skills）
+
+> 角色边界明确化，避免“Worker 管控 Worker”的越权问题，确保流程可解释、可验证。
+
+**Orchestrator（编排者）**  
+- 负责：需求澄清、计划拆解、依赖编排、进度同步、验收标准、最终总结  
+- 不负责：具体实现、直接修改文件、替 Worker 决策实现细节
+
+**Worker Claude（架构/集成/联调）**  
+- 负责：架构与目录结构、接口契约、联调方案、跨端冲突识别  
+- 不负责：调度其他 Worker
+
+**Worker Codex（后端）**  
+- 负责：后端 API、数据层、鉴权、错误处理、测试  
+- 不负责：前端 UI 或联调决策
+
+**Worker Gemini（前端）**  
+- 负责：UI/UX、组件实现、交互逻辑、接口调用  
+- 不负责：后端接口定义或联调决策
+
+**阶段职责矩阵（简化版）**
+
+| 阶段 | 目标 | 责任角色 | 关键产物 |
+| --- | --- | --- | --- |
+| Phase 1 | 需求澄清/上下文检索 | Orchestrator | 需求边界、核心约束 |
+| Phase 2 | 计划与拆分 | Orchestrator | 执行计划、依赖关系、验收标准 |
+| Phase 3 | 架构/契约 | Worker Claude | 目录结构、接口契约、联调方案 |
+| Phase 4 | 具体实现 | Worker Codex / Worker Gemini | 代码改动与说明 |
+| Phase 5 | 自检/互检 | 原 Worker + 其他 Worker | 风险点与修复建议 |
+| Phase 6 | 联调/集成 | Worker Claude | 契约一致性确认、冲突修复任务 |
+| Phase 7 | 总结交付 | Orchestrator | 变更摘要、风险提示、后续建议 |
+
+### 2.4 核心模块
 
 #### CLI Detector (CLI 检测器)
 
@@ -421,7 +453,7 @@ const INTERACTION_MODE_CONFIGS = {
 | **智能恢复** | 失败时自动重试，支持回滚机制 |
 | **状态追踪** | 任务状态持久化，支持断点续传 |
 
-### 7.2 六阶段工作流
+### 7.2 七阶段工作流
 
 > 参考 oh-my-opencode 的 Sisyphus Orchestrator 设计，增加验证和恢复阶段
 
@@ -434,6 +466,8 @@ const INTERACTION_MODE_CONFIGS = {
 │ - 识别任务类型（architecture/bugfix/frontend/backend/...）      │
 │ - 根据 Skills 配置分配 CLI                                      │
 │ - 确定执行顺序（并行/串行）                                     │
+│ - 输出功能契约（接口/数据结构/交互约束）                        │
+│ - 输出验收清单（功能验收标准）                                  │
 │ - 创建 TaskState 列表，持久化到文件                             │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
@@ -478,7 +512,17 @@ const INTERACTION_MODE_CONFIGS = {
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│ Phase 4: 验证检查 (Verification) ← 新增                         │
+│ Phase 4: 集成联调 (Integration) ← 新增                          │
+│ ─────────────────────────────────────────────────────────────── │
+│ 编排者强制收敛：对齐前后端/架构契约，确保功能联调一致            │
+│                                                                 │
+│ - 汇总各子任务产出                                               │
+│ - 校验功能契约与验收清单                                         │
+│ - 生成修复子任务并回派（直到通过或超限）                         │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ Phase 5: 验证检查 (Verification)                                │
 │ ─────────────────────────────────────────────────────────────── │
 │ 自动验证执行结果的质量：                                        │
 │                                                                 │
@@ -497,7 +541,7 @@ const INTERACTION_MODE_CONFIGS = {
                     └────────┬────────┘
                    Yes ↓           ↓ No
                        │    ┌─────────────────────────────────────┐
-                       │    │ Phase 5: 失败恢复 (Recovery) ← 新增 │
+                       │    │ Phase 6: 失败恢复 (Recovery)        │
                        │    │ ─────────────────────────────────── │
                        │    │ 3-Strike Protocol:                  │
                        │    │                                     │
@@ -515,7 +559,7 @@ const INTERACTION_MODE_CONFIGS = {
                        └────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│ Phase 6: 汇总交付 (Summary)                                     │
+│ Phase 7: 汇总交付 (Summary)                                     │
 │ ─────────────────────────────────────────────────────────────── │
 │ Claude 汇总各 CLI 的执行结果，生成报告：                        │
 │                                                                 │
@@ -542,7 +586,7 @@ const INTERACTION_MODE_CONFIGS = {
 | 任务类型 | 判断条件 | 执行方式 |
 | -------- | -------- | -------- |
 | **简单任务** | 单一领域、单一 CLI 可完成 | 直接执行，跳过 Phase 2 |
-| **复杂任务** | 多领域、需要多 CLI 协作 | 完整 6 Phase 流程 |
+| **复杂任务** | 多领域、需要多 CLI 协作 | 完整 7 Phase 流程 |
 
 **简单任务示例**：
 - "修复 parseConfig 函数的空指针问题" → Codex 直接执行
@@ -949,7 +993,7 @@ type TaskStatus =
 | `src/orchestrator/message-bus.ts` | 消息总线（编排者与 Worker 通信） |
 | `src/orchestrator/protocols/types.ts` | 编排者架构核心类型定义 |
 | `src/orchestrator/prompts/orchestrator-prompts.ts` | 编排者专用 Prompt 模板 |
-| `src/orchestrator/intelligent-orchestrator.ts` | 智能编排器（6 Phase 工作流） |
+| `src/orchestrator/intelligent-orchestrator.ts` | 智能编排器（7 Phase 工作流） |
 | `src/orchestrator/task-state-manager.ts` | 任务状态管理器 |
 | `src/orchestrator/verification-runner.ts` | 验证执行器 |
 | `src/orchestrator/recovery-handler.ts` | 失败恢复处理器 |
@@ -1005,7 +1049,7 @@ type TaskStatus =
 
 ### Phase 4: 智能编排 ✅
 
-- [x] 6 Phase 工作流（分析→确认→执行→验证→恢复→汇总）
+- [x] 7 Phase 工作流（分析→确认→执行→联调→验证→恢复→汇总）
 - [x] 任务状态管理器（持久化 + 实时同步）
 - [x] 验证执行器（编译/IDE诊断/Lint/测试）
 - [x] 失败恢复处理器（3-Strike Protocol）

@@ -170,6 +170,13 @@ export class WorkerAgent extends EventEmitter {
 
     this.setState('executing');
 
+    const files = (subTask.targetFiles || []).filter(Boolean);
+    const summary = [
+      `任务描述: ${subTask.description}`,
+      `目标文件: ${files.length > 0 ? files.join(', ') : '无'}`
+    ].join('\n');
+    this.cliFactory.emitOrchestratorMessageToUI(this.type, summary);
+
     // 汇报任务开始
     this.messageBus.reportProgress(
       this.id,
@@ -250,17 +257,30 @@ export class WorkerAgent extends EventEmitter {
    */
   protected buildExecutionPrompt(subTask: SubTask, context?: string): string {
     const filesHint = subTask.targetFiles?.length
-      ? `\n\n**Target Files**: ${subTask.targetFiles.join(', ')}`
+      ? `\n\n**目标文件**: ${subTask.targetFiles.join(', ')}`
       : '';
 
-    const contextHint = context ? `\n\n**Context**:\n${context}` : '';
+    const contextHint = context ? `\n\n**上下文**:\n${context}` : '';
+
+    if (subTask.kind === 'integration') {
+      return `${subTask.prompt}${filesHint}${contextHint}
+
+**执行模式**: 仅联调审查
+- 只做分析与联调检查，不允许修改任何文件
+- 聚焦前后端/架构契约是否一致、验收清单是否满足
+- 必须输出 JSON 报告
+
+**重要**: 请使用中文回复。`;
+    }
 
     return `${subTask.prompt}${filesHint}${contextHint}
 
-**EXECUTION MODE**: Direct modification
-- You have FULL write permission to modify files directly
-- Make the necessary changes to complete the task
-- Provide a brief summary of what you changed after completion`;
+**执行模式**: 直接修改
+- 你拥有完整的文件写入权限，可以直接修改文件
+- 完成必要的更改以完成任务
+- 完成后提供简要的更改说明
+
+**重要**: 请使用中文回复，包括代码注释也使用中文。`;
   }
 
   /**

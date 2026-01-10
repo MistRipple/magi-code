@@ -72,6 +72,10 @@ export interface Task {
   startedAt?: number;
   completedAt?: number;
   interruptedAt?: number;
+  /** 功能契约（统一前后端约束） */
+  featureContract?: string;
+  /** 验收清单 */
+  acceptanceCriteria?: string[];
 }
 
 export type TaskStatus =
@@ -116,6 +120,10 @@ export interface SubTask {
 
   // 优先级（新架构，1 最高）
   priority?: number;
+  /** 子任务类型（实现/集成/修复/架构） */
+  kind?: 'implementation' | 'integration' | 'repair' | 'architecture';
+  /** 功能分组 ID（用于跨子任务联调） */
+  featureId?: string;
 
   // 状态管理（旧架构）
   status: SubTaskStatus;
@@ -515,6 +523,8 @@ export type WebviewToExtensionMessage =
   | { type: 'requestExecutionStats' }
   // 🆕 CLI 连接状态检测
   | { type: 'checkCliStatus' }
+  // 🆕 清理所有任务
+  | { type: 'clearAllTasks' }
   // 🆕 Prompt 增强配置
   | { type: 'getPromptEnhanceConfig' }
   | { type: 'updatePromptEnhance'; config: { baseUrl: string; apiKey: string } }
@@ -533,7 +543,8 @@ export type ExtensionToWebviewMessage =
   | { type: 'cliStatusChanged'; cli: string; available: boolean; version?: string }
   | { type: 'cliError'; cli: string; error: string; source?: MessageSource }
   | { type: 'cliResponse'; cli: CLIType; content: string; error?: string; sessionId?: string | null; source?: MessageSource }
-  | { type: 'streamingUpdate'; content: string; sessionId?: string | null; source?: MessageSource }
+  | { type: 'streamingUpdate'; content: string; sessionId?: string | null; source?: MessageSource; cli?: CLIType }
+  | { type: 'streamingComplete'; content?: string; error?: string; sessionId?: string | null; source?: MessageSource; cli?: CLIType }
   | { type: 'toast'; message: string; toastType?: 'success' | 'error' | 'warning' | 'info'; duration?: number }
   | { type: 'sessionCreated'; session: Session }
   | { type: 'sessionSwitched'; sessionId: string }

@@ -128,6 +128,12 @@ class WorkerAgent extends events_1.EventEmitter {
         this.currentSubTaskId = subTask.id;
         this.abortController = new AbortController();
         this.setState('executing');
+        const files = (subTask.targetFiles || []).filter(Boolean);
+        const summary = [
+            `任务描述: ${subTask.description}`,
+            `目标文件: ${files.length > 0 ? files.join(', ') : '无'}`
+        ].join('\n');
+        this.cliFactory.emitOrchestratorMessageToUI(this.type, summary);
         // 汇报任务开始
         this.messageBus.reportProgress(this.id, this.orchestratorId, taskId, subTask.id, 'started', { message: `开始执行: ${subTask.description}` });
         try {
@@ -186,6 +192,14 @@ class WorkerAgent extends events_1.EventEmitter {
             ? `\n\n**Target Files**: ${subTask.targetFiles.join(', ')}`
             : '';
         const contextHint = context ? `\n\n**Context**:\n${context}` : '';
+        if (subTask.kind === 'integration') {
+            return `${subTask.prompt}${filesHint}${contextHint}
+
+**EXECUTION MODE**: Integration review only
+- Analyze and validate integration only, do not modify any files
+- Focus on contract consistency and acceptance criteria
+- Must output a JSON report`;
+        }
         return `${subTask.prompt}${filesHint}${contextHint}
 
 **EXECUTION MODE**: Direct modification

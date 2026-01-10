@@ -44,6 +44,11 @@ const DEFAULT_CONFIG = {
         lintCheck: true,
         testCheck: false,
     },
+    integration: {
+        enabled: true,
+        maxRounds: 2,
+        worker: 'claude',
+    },
 };
 /**
  * Orchestrator Agent
@@ -75,6 +80,7 @@ class OrchestratorAgent extends events_1.EventEmitter {
     // 任务执行状态
     pendingTasks = new Map();
     completedResults = [];
+    lastIntegrationSummary = null;
     reviewAttempts = new Map();
     finalizationPromises = new Map();
     warnedReviewSkipForDependencies = false;
@@ -190,7 +196,12 @@ class OrchestratorAgent extends events_1.EventEmitter {
      */
     async execute(userPrompt, taskId) {
         if (this._state !== 'idle') {
-            throw new Error(`编排者当前状态为 ${this._state}，无法接受新任务`);
+            if (this._state === 'failed' || this._state === 'completed') {
+                this.setState('idle');
+            }
+            else {
+                throw new Error(`编排者当前状态为 ${this._state}，无法接受新任务`);
+            }
         }
         // 初始化任务上下文
         this.currentContext = {
@@ -205,6 +216,7 @@ class OrchestratorAgent extends events_1.EventEmitter {
         this.reviewAttempts.clear();
         this.finalizationPromises.clear();
         this.warnedReviewSkipForDependencies = false;
+        this.lastIntegrationSummary = null;
         // 初始化上下文管理器
         if (this.contextManager) {
             await this.contextManager.initialize(taskId, `task-${taskId}`);
@@ -244,6 +256,9 @@ class OrchestratorAgent extends events_1.EventEmitter {
             // Phase 4: 监控执行
             this.setState('monitoring');
             await this.monitorExecution(plan);
+            this.checkAborted();
+            // Phase 4.5: 功能集成联调
+            await this.runIntegrationStage(plan);
             this.checkAborted();
             // Phase 5: 验证阶段（如果配置了验证）
             let verificationResult = null;
@@ -307,9 +322,16 @@ class OrchestratorAgent extends events_1.EventEmitter {
     /** 取消当前任务 */
     async cancel() {
         console.log('[OrchestratorAgent] 取消任务');
+        // 1. 触发 AbortController
         this.abortController?.abort();
+        // 2. 取消 WorkerPool 中的所有任务
         await this.workerPool.cancelAllTasks();
+        this.workerPool.clearExecutionStates();
+        // 3. 清理内部状态
+        this.cleanup();
+        // 4. 设置状态为 idle
         this.setState('idle');
+        console.log('[OrchestratorAgent] 任务已取消，状态已清理');
     }
     /** 清理状态 */
     cleanup() {
@@ -331,13 +353,17 @@ class OrchestratorAgent extends events_1.EventEmitter {
         const analysisPrompt = (0, orchestrator_prompts_1.buildOrchestratorAnalysisPrompt)(userPrompt, availableWorkers);
         try {
             // 使用 Claude 进行分析（编排者专用会话）
-            const response = await this.cliFactory.sendMessage('claude', analysisPrompt, undefined, { source: 'orchestrator', streamToUI: false });
+            const response = await this.cliFactory.sendMessage('claude', analysisPrompt, undefined, { source: 'orchestrator', streamToUI: true, adapterRole: 'orchestrator' });
             if (response.error) {
                 console.error('[OrchestratorAgent] 分析失败:', response.error);
                 return null;
             }
             const plan = this.parseExecutionPlan(response.content);
             if (plan) {
+                this.ensureArchitectureTask(plan, userPrompt);
+                if (plan.analysis) {
+                    this.emitUIMessage('progress_update', `需求分析: ${plan.analysis}`);
+                }
                 this.emitUIMessage('plan_ready', (0, orchestrator_prompts_1.formatPlanForUser)(plan), { plan });
                 events_2.globalEventBus.emitEvent('orchestrator:plan_ready', {
                     taskId: this.currentContext?.taskId,
@@ -356,13 +382,45 @@ class OrchestratorAgent extends events_1.EventEmitter {
      */
     parseExecutionPlan(content) {
         try {
-            const jsonMatch = content.match(/```json\s*([\s\S]*?)\s*```/);
-            const jsonStr = jsonMatch ? jsonMatch[1] : content;
-            const parsed = JSON.parse(jsonStr);
+            const jsonCandidates = this.extractPlanJsonCandidates(content);
+            const parsed = this.parsePlanJson(jsonCandidates);
+            // 处理不需要 Worker 的情况（编排者直接回答）
+            const needsWorker = parsed.needsWorker !== false;
+            const directResponse = parsed.directResponse || '';
+            if (!needsWorker && directResponse) {
+                return {
+                    id: `plan_${Date.now()}`,
+                    analysis: parsed.analysis || '',
+                    isSimpleTask: true,
+                    needsWorker: false,
+                    directResponse,
+                    skipReason: parsed.skipReason || '编排者直接回答',
+                    needsCollaboration: false,
+                    subTasks: [],
+                    executionMode: 'sequential',
+                    summary: parsed.summary || directResponse,
+                    featureContract: '',
+                    acceptanceCriteria: [],
+                    createdAt: Date.now(),
+                };
+            }
+            const featureContract = typeof parsed.featureContract === 'string'
+                ? parsed.featureContract.trim()
+                : '';
+            const acceptanceCriteria = Array.isArray(parsed.acceptanceCriteria)
+                ? parsed.acceptanceCriteria
+                    .filter((item) => typeof item === 'string')
+                    .map((item) => item.trim())
+                    .filter(Boolean)
+                : [];
+            if (!featureContract || acceptanceCriteria.length === 0) {
+                throw new Error('执行计划缺少功能契约或验收清单');
+            }
             return {
                 id: `plan_${Date.now()}`,
                 analysis: parsed.analysis || '',
                 isSimpleTask: parsed.isSimpleTask || false,
+                needsWorker: true,
                 skipReason: parsed.skipReason,
                 needsCollaboration: parsed.needsCollaboration ?? true,
                 subTasks: (parsed.subTasks || []).map((t, i) => ({
@@ -375,11 +433,15 @@ class OrchestratorAgent extends events_1.EventEmitter {
                     dependencies: t.dependencies || [],
                     prompt: t.prompt || '',
                     priority: t.priority,
+                    kind: t.kind || 'implementation',
+                    featureId: t.featureId || `feature_${this.currentContext?.taskId || 'unknown'}`,
                     status: 'pending',
                     output: [],
                 })),
                 executionMode: parsed.executionMode || 'sequential',
                 summary: parsed.summary || '',
+                featureContract,
+                acceptanceCriteria,
                 createdAt: Date.now(),
             };
         }
@@ -387,6 +449,150 @@ class OrchestratorAgent extends events_1.EventEmitter {
             console.error('[OrchestratorAgent] 解析执行计划失败:', error);
             return null;
         }
+    }
+    /** 确保全栈任务包含架构/契约任务（Claude） */
+    ensureArchitectureTask(plan, userPrompt) {
+        if (!plan.subTasks || plan.subTasks.length === 0) {
+            return;
+        }
+        const hasClaudeTask = plan.subTasks.some(t => t.assignedWorker === 'claude' && (t.kind === 'architecture' || /架构|契约|系统|设计|框架/i.test(t.description)));
+        const hasFrontend = plan.subTasks.some(t => t.assignedWorker === 'gemini' || /前端|UI|界面|页面|组件/i.test(t.description));
+        const hasBackend = plan.subTasks.some(t => t.assignedWorker === 'codex' || /后端|API|接口|服务|鉴权|数据库/i.test(t.description));
+        if (hasClaudeTask || !hasFrontend || !hasBackend) {
+            return;
+        }
+        const taskId = this.currentContext?.taskId || '';
+        const architectureTaskId = `arch-${Date.now()}`;
+        const architecturePrompt = [
+            '请先完成系统架构与契约设计，输出明确可执行的方案：',
+            '1. 目录结构/模块边界',
+            '2. 接口契约（请求/响应字段、状态码、错误码）',
+            '3. 前后端对接约束（字段命名、校验规则、鉴权方式）',
+            '4. 若缺失框架/基础结构，请先补齐框架骨架',
+            '',
+            `原始需求：${userPrompt}`
+        ].join('\n');
+        const architectureTask = {
+            id: architectureTaskId,
+            taskId,
+            description: '架构与契约设计（前后端统一框架）',
+            assignedWorker: 'claude',
+            reason: '需要统一前后端契约与框架，避免联调偏差',
+            targetFiles: [],
+            dependencies: [],
+            prompt: architecturePrompt,
+            priority: 0,
+            kind: 'architecture',
+            featureId: plan.subTasks[0]?.featureId || `feature_${taskId || 'unknown'}`,
+            status: 'pending',
+            output: [],
+        };
+        plan.subTasks.unshift(architectureTask);
+        plan.subTasks.forEach(task => {
+            if (task.id === architectureTaskId)
+                return;
+            if (!task.dependencies) {
+                task.dependencies = [architectureTaskId];
+                return;
+            }
+            if (!task.dependencies.includes(architectureTaskId)) {
+                task.dependencies.push(architectureTaskId);
+            }
+        });
+    }
+    /**
+     * 从原始内容中提取可能的 JSON 计划文本
+     */
+    extractPlanJsonCandidates(content) {
+        const candidates = [];
+        if (!content)
+            return candidates;
+        const fenced = content.match(/```json\s*([\s\S]*?)\s*```/i);
+        if (fenced?.[1]) {
+            candidates.push(fenced[1].trim());
+        }
+        const anyFence = content.match(/```\s*([\s\S]*?)\s*```/);
+        if (anyFence?.[1]) {
+            const trimmed = anyFence[1].trim();
+            if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+                candidates.push(trimmed);
+            }
+        }
+        const objectJson = this.extractBalancedJson(content, '{', '}');
+        if (objectJson) {
+            candidates.push(objectJson);
+        }
+        const arrayJson = this.extractBalancedJson(content, '[', ']');
+        if (arrayJson) {
+            candidates.push(arrayJson);
+        }
+        if (candidates.length === 0) {
+            candidates.push(content.trim());
+        }
+        return candidates;
+    }
+    /**
+     * 从文本中提取第一个平衡的 JSON 结构（支持字符串和转义）
+     */
+    extractBalancedJson(content, openChar, closeChar) {
+        const start = content.indexOf(openChar);
+        if (start === -1)
+            return null;
+        let depth = 0;
+        let inString = false;
+        let escaping = false;
+        for (let i = start; i < content.length; i += 1) {
+            const ch = content[i];
+            if (escaping) {
+                escaping = false;
+                continue;
+            }
+            if (ch === '\\') {
+                if (inString)
+                    escaping = true;
+                continue;
+            }
+            if (ch === '"') {
+                inString = !inString;
+                continue;
+            }
+            if (inString)
+                continue;
+            if (ch === openChar)
+                depth += 1;
+            if (ch === closeChar)
+                depth -= 1;
+            if (depth === 0) {
+                return content.slice(start, i + 1).trim();
+            }
+        }
+        return null;
+    }
+    /**
+     * 解析 JSON（支持去除尾随逗号的容错）
+     */
+    parsePlanJson(candidates) {
+        const errors = [];
+        for (const raw of candidates) {
+            const trimmed = raw.trim();
+            if (!trimmed)
+                continue;
+            try {
+                return JSON.parse(trimmed);
+            }
+            catch (error) {
+                const cleaned = trimmed.replace(/,\s*([}\]])/g, '$1');
+                try {
+                    return JSON.parse(cleaned);
+                }
+                catch (retryError) {
+                    const message = error instanceof Error ? error.message : String(error);
+                    errors.push(message);
+                    continue;
+                }
+            }
+        }
+        throw new Error(`无法解析执行计划 JSON: ${errors.join(' | ')}`);
     }
     // =========================================================================
     // Phase 2: 等待用户确认
@@ -423,6 +629,7 @@ class OrchestratorAgent extends events_1.EventEmitter {
         this.syncPlanToTaskManager(plan);
         // 在执行前创建文件快照（支持回滚）
         await this.createSnapshotsForPlan(plan);
+        const sharedContext = this.buildSharedContext(plan);
         for (const subTask of plan.subTasks) {
             this.pendingTasks.set(subTask.id, subTask);
         }
@@ -435,20 +642,20 @@ class OrchestratorAgent extends events_1.EventEmitter {
                 this.emitUIMessage('progress_update', '检测到任务依赖，子任务自检/互检在依赖图模式下暂不启用');
                 this.warnedReviewSkipForDependencies = true;
             }
-            await this.dispatchWithDependencyGraph(plan.subTasks);
+            await this.dispatchWithDependencyGraph(plan.subTasks, sharedContext);
         }
         else if (plan.executionMode === 'parallel') {
-            await this.dispatchParallel(plan.subTasks);
+            await this.dispatchParallel(plan.subTasks, sharedContext);
         }
         else {
-            await this.dispatchSequential(plan.subTasks);
+            await this.dispatchSequential(plan.subTasks, sharedContext);
         }
     }
     /** 🆕 基于依赖图分发任务 */
-    async dispatchWithDependencyGraph(subTasks) {
+    async dispatchWithDependencyGraph(subTasks, context) {
         this.emitUIMessage('progress_update', '正在分析任务依赖关系...');
         try {
-            const results = await this.workerPool.executeWithDependencyGraph(this.currentContext.taskId, subTasks, this.currentContext?.userPrompt);
+            const results = await this.workerPool.executeWithDependencyGraph(this.currentContext.taskId, subTasks, context ?? this.currentContext?.userPrompt);
             // 处理执行结果
             for (const result of results) {
                 await this.finalizeResult(result);
@@ -465,12 +672,16 @@ class OrchestratorAgent extends events_1.EventEmitter {
     }
     /** 为执行计划中的目标文件创建快照 */
     async createSnapshotsForPlan(plan) {
+        await this.createSnapshotsForSubTasks(plan.subTasks);
+    }
+    /** 为子任务集合创建快照 */
+    async createSnapshotsForSubTasks(subTasks) {
         if (!this.snapshotManager) {
             console.log('[OrchestratorAgent] 未配置 SnapshotManager，跳过快照创建');
             return;
         }
         const targetFiles = new Set();
-        for (const subTask of plan.subTasks) {
+        for (const subTask of subTasks) {
             if (subTask.targetFiles) {
                 subTask.targetFiles.forEach(f => targetFiles.add(f));
             }
@@ -491,10 +702,196 @@ class OrchestratorAgent extends events_1.EventEmitter {
             }
         }
     }
+    /** 构建共享上下文（功能契约 + 验收清单） */
+    buildSharedContext(plan) {
+        const criteria = (plan.acceptanceCriteria || []).map(item => `- ${item}`).join('\n');
+        return [
+            '功能契约:',
+            plan.featureContract,
+            '',
+            '验收清单:',
+            criteria || '- 未提供',
+        ].join('\n');
+    }
+    buildIntegrationPrompt(plan) {
+        return [
+            '你是集成联调负责人，请基于功能契约与验收清单审查当前实现。',
+            '只做分析，不修改任何文件。',
+            '',
+            '输出 JSON 格式：',
+            '{"status":"passed|failed","summary":"整体结论","issues":[{"title":"问题标题","detail":"问题详情","area":"backend|frontend|architecture|api|data|other","targetFiles":["可能涉及的文件"],"suggestedWorker":"claude|codex|gemini","fixPrompt":"修复指令"}]}',
+            '只输出 JSON。',
+            '',
+            '功能契约:',
+            plan.featureContract,
+            '',
+            '验收清单:',
+            (plan.acceptanceCriteria || []).map(item => `- ${item}`).join('\n') || '- 未提供',
+        ].join('\n');
+    }
+    buildIntegrationContext(plan, results, round) {
+        const summaries = results.map(result => {
+            const files = result.modifiedFiles?.length ? result.modifiedFiles.join(', ') : '无';
+            const output = result.result ? result.result.slice(0, 1200) : '';
+            return [
+                `子任务: ${result.subTaskId} (${result.workerType})`,
+                `结果: ${result.success ? '成功' : '失败'}`,
+                `修改文件: ${files}`,
+                output ? `输出摘要:\n${output}` : ''
+            ].filter(Boolean).join('\n');
+        }).join('\n\n');
+        return [
+            `联调轮次: ${round}`,
+            this.buildSharedContext(plan),
+            '',
+            '子任务执行摘要:',
+            summaries || '暂无执行结果',
+        ].join('\n');
+    }
+    parseIntegrationReport(content) {
+        const jsonMatch = content.match(/\{[\s\S]*\}/);
+        const raw = jsonMatch ? jsonMatch[0] : content;
+        try {
+            const parsed = JSON.parse(raw);
+            const status = parsed.status === 'passed' ? 'passed' : 'failed';
+            const summary = typeof parsed.summary === 'string' ? parsed.summary : '未提供总结';
+            const issues = Array.isArray(parsed.issues)
+                ? parsed.issues.map((issue) => ({
+                    title: typeof issue.title === 'string' ? issue.title : undefined,
+                    detail: typeof issue.detail === 'string' ? issue.detail : undefined,
+                    area: typeof issue.area === 'string' ? issue.area : undefined,
+                    targetFiles: Array.isArray(issue.targetFiles) ? issue.targetFiles.filter((f) => typeof f === 'string') : undefined,
+                    suggestedWorker: ['claude', 'codex', 'gemini'].includes(issue.suggestedWorker) ? issue.suggestedWorker : undefined,
+                    fixPrompt: typeof issue.fixPrompt === 'string' ? issue.fixPrompt : undefined,
+                }))
+                : [];
+            return { status, summary, issues };
+        }
+        catch (error) {
+            return {
+                status: 'failed',
+                summary: '集成报告解析失败',
+                issues: [],
+            };
+        }
+    }
+    pickWorkerForIssue(issue) {
+        if (issue.suggestedWorker) {
+            return issue.suggestedWorker;
+        }
+        const area = (issue.area || '').toLowerCase();
+        if (area === 'frontend')
+            return 'gemini';
+        if (area === 'backend' || area === 'api' || area === 'data')
+            return 'codex';
+        if (area === 'architecture')
+            return 'claude';
+        return 'claude';
+    }
+    buildRepairPrompt(plan, issue) {
+        const detail = issue.detail || issue.title || '集成问题';
+        return [
+            '修复集成问题：',
+            detail,
+            '',
+            '请遵守功能契约与验收清单。',
+            '',
+            '功能契约:',
+            plan.featureContract,
+            '',
+            '验收清单:',
+            (plan.acceptanceCriteria || []).map(item => `- ${item}`).join('\n') || '- 未提供',
+        ].join('\n');
+    }
+    async runIntegrationStage(plan) {
+        const integrationConfig = this.resolveIntegrationConfig();
+        if (!integrationConfig.enabled || !this.currentContext) {
+            return;
+        }
+        if (plan.subTasks.length === 0) {
+            return;
+        }
+        const featureId = plan.subTasks[0]?.featureId || `feature_${this.currentContext.taskId}`;
+        const taskId = this.currentContext.taskId;
+        const maxRounds = Math.max(1, integrationConfig.maxRounds);
+        const sharedContext = this.buildSharedContext(plan);
+        let dependencyIds = plan.subTasks.map(task => task.id);
+        for (let round = 1; round <= maxRounds; round += 1) {
+            this.setState('integrating');
+            this.emitUIMessage('progress_update', `开始第 ${round} 轮联调检查...`);
+            const integrationSubTask = {
+                id: `integration_${taskId}_${round}`,
+                taskId,
+                description: `功能联调检查（第 ${round} 轮）`,
+                assignedWorker: integrationConfig.worker,
+                reason: '联调收敛与验收',
+                targetFiles: [],
+                dependencies: [...dependencyIds],
+                prompt: this.buildIntegrationPrompt(plan),
+                priority: 1,
+                status: 'pending',
+                output: [],
+                kind: 'integration',
+                featureId,
+            };
+            this.pendingTasks.set(integrationSubTask.id, integrationSubTask);
+            this.taskManager?.addExistingSubTask(taskId, integrationSubTask);
+            events_2.globalEventBus.emitEvent('task:created', { taskId });
+            const integrationContext = this.buildIntegrationContext(plan, this.completedResults, round);
+            const integrationResult = await this.workerPool.dispatchTaskWithRetry(integrationSubTask.assignedWorker, taskId, integrationSubTask, integrationContext || sharedContext);
+            const finalIntegrationResult = await this.finalizeResult(integrationResult);
+            const report = this.parseIntegrationReport(finalIntegrationResult?.result || integrationResult.result || '');
+            this.lastIntegrationSummary = report.summary;
+            if (report.status === 'passed') {
+                this.emitUIMessage('progress_update', `✅ 联调通过: ${report.summary}`);
+                return;
+            }
+            this.emitUIMessage('error', `❌ 联调未通过: ${report.summary}`);
+            const repairTasks = report.issues.map((issue, index) => {
+                const worker = this.pickWorkerForIssue(issue);
+                return {
+                    id: `repair_${taskId}_${round}_${index + 1}`,
+                    taskId,
+                    description: `修复联调问题: ${issue.title || issue.area || '问题'}`,
+                    assignedWorker: worker,
+                    reason: '联调修复',
+                    targetFiles: issue.targetFiles || [],
+                    dependencies: [...dependencyIds],
+                    prompt: issue.fixPrompt || this.buildRepairPrompt(plan, issue),
+                    priority: 2,
+                    status: 'pending',
+                    output: [],
+                    kind: 'repair',
+                    featureId,
+                };
+            });
+            if (repairTasks.length === 0) {
+                throw new Error('联调未通过但未生成修复任务');
+            }
+            await this.createSnapshotsForSubTasks(repairTasks);
+            for (const repairTask of repairTasks) {
+                this.pendingTasks.set(repairTask.id, repairTask);
+                this.taskManager?.addExistingSubTask(taskId, repairTask);
+            }
+            events_2.globalEventBus.emitEvent('task:created', { taskId });
+            await this.dispatchSequential(repairTasks, [
+                sharedContext,
+                '',
+                '联调问题摘要:',
+                report.summary,
+            ].join('\n'));
+            dependencyIds = dependencyIds.concat(repairTasks.map(task => task.id));
+        }
+        throw new Error('联调多轮未通过');
+    }
     /** 将执行计划同步到 TaskManager */
     syncPlanToTaskManager(plan) {
         if (!this.taskManager || !this.currentContext)
             return;
+        this.taskManager.updateTask(this.currentContext.taskId, {
+            featureContract: plan.featureContract,
+            acceptanceCriteria: plan.acceptanceCriteria,
+        });
         for (const subTask of plan.subTasks) {
             try {
                 this.taskManager.addExistingSubTask(this.currentContext.taskId, subTask);
@@ -506,11 +903,11 @@ class OrchestratorAgent extends events_1.EventEmitter {
         events_2.globalEventBus.emitEvent('task:created', { taskId: this.currentContext.taskId });
     }
     /** 并行分发任务 */
-    async dispatchParallel(subTasks) {
+    async dispatchParallel(subTasks, context) {
         const taskId = this.currentContext.taskId;
         for (const subTask of subTasks) {
             this.emitUIMessage('progress_update', `分发任务给 ${subTask.assignedWorker}: ${subTask.description}`, { subTaskId: subTask.id, workerType: subTask.assignedWorker });
-            void this.workerPool.dispatchTaskWithRetry(subTask.assignedWorker, taskId, subTask).then(result => {
+            void this.workerPool.dispatchTaskWithRetry(subTask.assignedWorker, taskId, subTask, context).then(result => {
                 void this.finalizeResult(result);
             }).catch(error => {
                 console.error(`[OrchestratorAgent] 并行任务分发失败:`, error);
@@ -529,13 +926,13 @@ class OrchestratorAgent extends events_1.EventEmitter {
         }
     }
     /** 串行分发任务 */
-    async dispatchSequential(subTasks) {
+    async dispatchSequential(subTasks, context) {
         const taskId = this.currentContext.taskId;
         for (const subTask of subTasks) {
             this.checkAborted();
             this.emitUIMessage('progress_update', `分发任务给 ${subTask.assignedWorker}: ${subTask.description}`, { subTaskId: subTask.id, workerType: subTask.assignedWorker });
             try {
-                const result = await this.workerPool.dispatchTaskWithRetry(subTask.assignedWorker, taskId, subTask);
+                const result = await this.workerPool.dispatchTaskWithRetry(subTask.assignedWorker, taskId, subTask, context);
                 const finalResult = await this.finalizeResult(result);
                 if (!finalResult?.success)
                     break;
@@ -572,6 +969,10 @@ class OrchestratorAgent extends events_1.EventEmitter {
             if (!subTask) {
                 return null;
             }
+            if (subTask.kind === 'integration') {
+                this.recordResult(result);
+                return result;
+            }
             const reviewConfig = this.resolveReviewConfig();
             if (!result.success || !reviewConfig) {
                 this.recordResult(result);
@@ -594,6 +995,13 @@ class OrchestratorAgent extends events_1.EventEmitter {
             }
             this.reviewAttempts.set(subTaskId, attempts + 1);
             this.emitUIMessage('progress_update', `子任务 ${subTaskId} 互检未通过，进入第 ${attempts + 1} 轮修复`, { subTaskId, review: decision });
+            const fixMessage = [
+                '修复请求:',
+                `任务描述: ${subTask.description}`,
+                decision.summary ? `问题: ${decision.summary}` : '',
+                decision.reason ? `原因: ${decision.reason}` : ''
+            ].filter(Boolean).join('\n');
+            this.cliFactory.emitOrchestratorMessageToUI(subTask.assignedWorker, fixMessage);
             this.pendingTasks.set(subTaskId, subTask);
             const retryResult = await this.workerPool.dispatchTaskWithRetry(subTask.assignedWorker, subTask.taskId, subTask);
             return this.finalizeResult(retryResult);
@@ -616,6 +1024,14 @@ class OrchestratorAgent extends events_1.EventEmitter {
             maxRounds: this.config.review.maxRounds ?? DEFAULT_REVIEW_CONFIG.maxRounds,
             highRiskExtensions: this.config.review.highRiskExtensions ?? DEFAULT_REVIEW_CONFIG.highRiskExtensions,
             highRiskKeywords: this.config.review.highRiskKeywords ?? DEFAULT_REVIEW_CONFIG.highRiskKeywords,
+        };
+    }
+    resolveIntegrationConfig() {
+        const config = this.config.integration || {};
+        return {
+            enabled: config.enabled ?? true,
+            maxRounds: config.maxRounds ?? 2,
+            worker: config.worker ?? 'claude',
         };
     }
     shouldEnableReviews() {
@@ -690,7 +1106,8 @@ class OrchestratorAgent extends events_1.EventEmitter {
         }
         if (config.selfCheck) {
             const prompt = this.buildSelfCheckPrompt(subTask, result);
-            const response = await this.cliFactory.sendMessage(subTask.assignedWorker, prompt, undefined, { source: 'orchestrator', streamToUI: false });
+            this.cliFactory.emitOrchestratorMessageToUI(subTask.assignedWorker, prompt);
+            const response = await this.cliFactory.sendMessage(subTask.assignedWorker, prompt, undefined, { source: 'worker' });
             if (response.error) {
                 return { status: 'rejected', reviewer: subTask.assignedWorker, reason: response.error };
             }
@@ -706,7 +1123,8 @@ class OrchestratorAgent extends events_1.EventEmitter {
         }
         const reviewer = this.selectPeerReviewer(subTask);
         const peerPrompt = this.buildPeerReviewPrompt(subTask, result);
-        const peerResponse = await this.cliFactory.sendMessage(reviewer, peerPrompt, undefined, { source: 'orchestrator', streamToUI: false });
+        this.cliFactory.emitOrchestratorMessageToUI(reviewer, peerPrompt);
+        const peerResponse = await this.cliFactory.sendMessage(reviewer, peerPrompt, undefined, { source: 'worker' });
         if (peerResponse.error) {
             return { status: 'rejected', reviewer, reason: peerResponse.error };
         }
@@ -798,8 +1216,11 @@ class OrchestratorAgent extends events_1.EventEmitter {
         if (verificationResult) {
             summaryPrompt += `\n\n## 验证结果\n${verificationResult.summary}`;
         }
+        if (this.lastIntegrationSummary) {
+            summaryPrompt += `\n\n## 集成联调\n${this.lastIntegrationSummary}`;
+        }
         try {
-            const response = await this.cliFactory.sendMessage('claude', summaryPrompt, undefined, { source: 'orchestrator', streamToUI: false });
+            const response = await this.cliFactory.sendMessage('claude', summaryPrompt, undefined, { source: 'orchestrator', streamToUI: false, adapterRole: 'orchestrator' });
             if (response.error) {
                 const summary = `任务执行完成，但汇总失败: ${response.error}`;
                 this.emitUIMessage('summary', summary);

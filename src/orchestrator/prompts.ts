@@ -75,15 +75,17 @@ export function buildExecutionPrompt(
   targetFiles?: string[]
 ): string {
   const filesHint = targetFiles && targetFiles.length > 0
-    ? `\n\n**Target Files**: ${targetFiles.join(', ')}`
+    ? `\n\n**目标文件**: ${targetFiles.join(', ')}`
     : '';
 
   return `${taskDescription}${filesHint}
 
-**EXECUTION MODE**: Direct modification
-- You have FULL write permission to modify files directly
-- Make the necessary changes to complete the task
-- Provide a brief summary of what you changed after completion`;
+**执行模式**: 直接修改
+- 你拥有完整的文件写入权限，可以直接修改文件
+- 完成必要的更改以完成任务
+- 完成后提供简要的更改说明
+
+**重要**: 请使用中文回复，包括代码注释也使用中文。`;
 }
 
 /**

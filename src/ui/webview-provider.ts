@@ -24,7 +24,7 @@ import { DiffGenerator } from '../diff-generator';
 import { globalEventBus } from '../events';
 import { CLIAdapterFactory } from '../cli/adapter-factory';
 import { TaskAnalyzer, CLISelector } from '../task';
-import { CLI_CAPABILITIES } from '../cli/types';
+import { CLI_CAPABILITIES, CLIResponse } from '../cli/types';
 import { IntelligentOrchestrator } from '../orchestrator/intelligent-orchestrator';
 import { AceIndexManager } from '../ace/index-manager';
 
@@ -39,6 +39,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private diffGenerator: DiffGenerator;
   private cliStatuses: Map<CLIType, CLIStatus> = new Map();
   private cliOutputs: Map<CLIType, string[]> = new Map();
+  private orchestratorStreamBuffer = '';
+  private orchestratorStreamCli: CLIType | null = null;
 
   // 多 CLI 适配器工厂
   private cliFactory: CLIAdapterFactory;
@@ -74,13 +76,19 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.snapshotManager = new SnapshotManager(this.sessionManager, workspaceRoot);
     this.diffGenerator = new DiffGenerator(this.sessionManager, workspaceRoot);
 
-    // 初始化多 CLI 适配器工厂
-    this.cliFactory = new CLIAdapterFactory({ cwd: workspaceRoot });
-    this.setupCLIAdapters();
+    // 对齐会话管理器，确保任务/快照与对话会话一致
+    this.ensureSessionAlignment();
 
     // 初始化任务分析器和 CLI 选择器（从配置读取 skills）
     this.taskAnalyzer = new TaskAnalyzer();
     const config = vscode.workspace.getConfiguration('multiCli');
+    const timeout = config.get<number>('timeout') ?? 300000;
+    const idleTimeout = config.get<number>('idleTimeout') ?? 120000;
+    const maxTimeout = config.get<number>('maxTimeout') ?? 900000;
+
+    // 初始化多 CLI 适配器工厂
+    this.cliFactory = new CLIAdapterFactory({ cwd: workspaceRoot, timeout, idleTimeout, maxTimeout });
+    this.setupCLIAdapters();
     const userSkills = config.get<Record<string, string>>('skills') || {};
     this.cliSelector = new CLISelector(userSkills as Partial<import('../task/cli-selector').CLISkillsConfig>);
 
@@ -89,7 +97,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.cliFactory,
       this.taskManager,
       this.snapshotManager,
-      this.workspaceRoot
+      this.workspaceRoot,
+      { timeout, idleTimeout, maxTimeout }
     );
 
     // 设置 Hard Stop 确认回调
@@ -107,8 +116,32 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 设置所有 CLI 适配器事件监听 */
   private setupCLIAdapters(): void {
     // 监听工厂的统一事件
-    this.cliFactory.on('output', ({ type, chunk, source }: { type: CLIType; chunk: string; source?: string }) => {
-      if (source === 'orchestrator') {
+    this.cliFactory.on('output', ({
+      type,
+      chunk,
+      source,
+      adapterRole
+    }: {
+      type: CLIType;
+      chunk: string;
+      source?: string;
+      adapterRole?: 'worker' | 'orchestrator';
+    }) => {
+      if (adapterRole === 'orchestrator') {
+        if (!chunk) {
+          return;
+        }
+        if (this.orchestratorStreamCli !== type) {
+          this.orchestratorStreamBuffer = '';
+          this.orchestratorStreamCli = type;
+        }
+        this.orchestratorStreamBuffer += chunk;
+        this.postMessage({
+          type: 'streamingUpdate',
+          content: this.orchestratorStreamBuffer,
+          source: source || 'orchestrator',
+          cli: type
+        } as any);
         return;
       }
       const outputs = this.cliOutputs.get(type) || [];
@@ -123,6 +156,35 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         source: source as MessageSource | undefined,
         sessionId: this.activeSessionId
       });
+    });
+    this.cliFactory.on('response', ({
+      type,
+      response,
+      adapterRole,
+      source
+    }: {
+      type: CLIType;
+      response: CLIResponse;
+      adapterRole?: 'worker' | 'orchestrator';
+      source?: string;
+    }) => {
+      if (adapterRole !== 'orchestrator') {
+        return;
+      }
+      const content = response.error
+        ? `错误: ${response.error}`
+        : (response.content || this.orchestratorStreamBuffer);
+      if (content) {
+        this.postMessage({
+          type: 'streamingComplete',
+          content,
+          source: source || 'orchestrator',
+          cli: type,
+          error: response.error
+        } as any);
+      }
+      this.orchestratorStreamBuffer = '';
+      this.orchestratorStreamCli = null;
     });
 
     this.cliFactory.on('stateChange', ({ type, state }: { type: CLIType; state: string }) => {
@@ -363,11 +425,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       ]);
       if (!interruptCompleted) {
         console.warn('[MultiCLI] CLI 中断超时，尝试强制断开连接');
-        await this.cliFactory.disconnectAll();
       }
-      console.log('[MultiCLI] CLI 中断完成');
+      await this.cliFactory.disconnectAll();
+      this.cliFactory.resetAllSessions();
+      console.log('[MultiCLI] CLI 已断开并重置会话');
     } catch (error) {
       console.error('[MultiCLI] CLI 中断出错:', error);
+      try {
+        await this.cliFactory.disconnectAll();
+        this.cliFactory.resetAllSessions();
+      } catch (cleanupError) {
+        console.error('[MultiCLI] CLI 清理失败:', cleanupError);
+      }
     }
 
     // 3. 重置会话，避免取消后的会话残留影响下次请求
@@ -380,8 +449,19 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.taskManager.updateTaskStatus(runningTask.id, 'interrupted');
     }
 
+    // 清理编排者流式输出缓存，避免跨任务串流
+    this.orchestratorStreamBuffer = '';
+    this.orchestratorStreamCli = null;
+
     // 4. 通知 UI
     this.postMessage({ type: 'toast', message: '任务已打断', toastType: 'info' });
+
+    // 🆕 通知 UI 更新所有运行中的状态卡片为已取消状态
+    this.postMessage({
+      type: 'taskInterrupted',
+      message: '任务已打断'
+    } as any);
+
     this.postMessage({
       type: 'orchestratorMessage',
       content: '任务已打断，可在变更中查看已修改的文件，或选择继续执行。',
@@ -530,29 +610,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'viewDiff':
-        // 查看 Diff
-        {
-          const diffResult = this.diffGenerator.generateDiff(message.filePath);
-          const diffContent = diffResult ? this.diffGenerator.formatDiff(diffResult) : '';
-          this.postMessage({ type: 'showDiff', filePath: message.filePath, diff: diffContent });
-        }
+        // 在 VS Code 原生 diff 视图中查看变更（类似 Augment）
+        await this.openVscodeDiff(message.filePath);
         break;
 
       case 'newSession':
-        // 🆕 创建新会话前，先中断当前任务
-        await this.interruptCurrentTask();
-        // 创建新会话时，重置所有 CLI 的会话 ID
-        this.cliFactory.resetAllSessions();
-        this.sessionManager.createSession();
-        // 同时创建新的聊天会话
-        const newChatSession = this.chatSessionManager.createSession();
-        // 🆕 更新活跃会话ID
-        this.activeSessionId = newChatSession.id;
-        console.log('[MultiCLI] 创建新会话，已重置所有 CLI sessionId, activeSessionId:', this.activeSessionId);
-        // 通知 webview 新会话已创建
-        this.postMessage({ type: 'sessionCreated', session: newChatSession as any });
-        this.postMessage({ type: 'sessionsUpdated', sessions: this.chatSessionManager.getAllSessions() as any[] });
-        this.sendStateUpdate();
+        await this.handleNewSession();
         break;
 
       case 'saveCurrentSession':
@@ -594,7 +657,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         if (this.chatSessionManager.deleteSession(message.sessionId)) {
           // 如果删除后没有会话，创建一个新的
           if (this.chatSessionManager.getAllSessions().length === 0) {
-            this.chatSessionManager.createSession();
+            const { chatSession } = this.createAlignedSession();
+            this.activeSessionId = chatSession.id;
+            this.postMessage({ type: 'sessionCreated', session: chatSession as any });
           }
           this.postMessage({ type: 'sessionsUpdated', sessions: this.chatSessionManager.getAllSessions() as any[] });
           this.postMessage({ type: 'toast', message: '会话已删除', toastType: 'info' });
@@ -641,6 +706,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'checkCliStatus':
         // 🆕 请求 CLI 连接状态
         this.sendCliStatus();
+        break;
+
+      case 'clearAllTasks':
+        // 🆕 清理所有任务
+        this.handleClearAllTasks();
         break;
 
       case 'getPromptEnhanceConfig':
@@ -1031,6 +1101,93 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.postMessage({ type: 'toast', message: '已选择继续执行，未进行回滚', toastType: 'info' });
   }
 
+  /** 在 VS Code 原生 diff 视图中打开文件变更（类似 Augment） */
+  private async openVscodeDiff(filePath: string): Promise<void> {
+    const session = this.sessionManager.getCurrentSession();
+    if (!session) {
+      this.postMessage({ type: 'toast', message: '没有活动会话', toastType: 'warning' });
+      return;
+    }
+
+    const relativePath = path.isAbsolute(filePath)
+      ? path.relative(this.workspaceRoot, filePath)
+      : filePath;
+
+    const snapshot = this.sessionManager.getSnapshot(session.id, relativePath);
+    if (!snapshot) {
+      this.postMessage({ type: 'toast', message: '未找到该文件的快照', toastType: 'warning' });
+      return;
+    }
+
+    try {
+      // 获取原始内容（从快照）
+      const snapshotDir = path.join(this.workspaceRoot, '.multicli', 'snapshots');
+      const snapshotFile = path.join(snapshotDir, session.id, `${snapshot.id}.snapshot`);
+      let originalContent = snapshot.originalContent;
+
+      if (fs.existsSync(snapshotFile)) {
+        originalContent = fs.readFileSync(snapshotFile, 'utf-8');
+      }
+
+      // 创建临时文件存储原始内容（用于 diff 左侧）
+      const tempDir = path.join(os.tmpdir(), 'multicli-diff');
+      if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+      }
+
+      const fileName = path.basename(relativePath);
+      const tempFile = path.join(tempDir, `original-${Date.now()}-${fileName}`);
+      fs.writeFileSync(tempFile, originalContent, 'utf-8');
+
+      // 创建 URI
+      const originalUri = vscode.Uri.file(tempFile);
+      const modifiedUri = vscode.Uri.file(path.join(this.workspaceRoot, relativePath));
+
+      // 使用 VS Code 原生 diff 命令打开
+      const title = `${fileName} (原始 ↔ 修改后)`;
+      await vscode.commands.executeCommand('vscode.diff', originalUri, modifiedUri, title);
+
+      // 清理临时文件（延迟删除，确保 diff 视图已加载）
+      setTimeout(() => {
+        try {
+          if (fs.existsSync(tempFile)) {
+            fs.unlinkSync(tempFile);
+          }
+        } catch (e) {
+          // 忽略清理错误
+        }
+      }, 5000);
+
+    } catch (error) {
+      console.error('[MultiCLI] 打开 diff 视图失败:', error);
+      this.postMessage({ type: 'toast', message: '打开 diff 视图失败', toastType: 'error' });
+    }
+  }
+
+  /** 🆕 清理所有任务 */
+  private handleClearAllTasks(): void {
+    const session = this.sessionManager.getCurrentSession();
+    if (!session) {
+      this.postMessage({ type: 'toast', message: '没有活动会话', toastType: 'warning' });
+      return;
+    }
+
+    // 检查是否有正在运行的任务
+    const runningTask = session.tasks.find(t => t.status === 'running');
+    if (runningTask) {
+      this.postMessage({ type: 'toast', message: '有任务正在执行，无法清理', toastType: 'warning' });
+      return;
+    }
+
+    // 清空任务列表
+    const taskCount = session.tasks.length;
+    session.tasks = [];
+    this.sessionManager.saveCurrentSession();
+
+    this.postMessage({ type: 'toast', message: `已清理 ${taskCount} 个任务`, toastType: 'success' });
+    this.sendStateUpdate();
+  }
+
   /** 获取最近被打断的任务 */
   private getLastInterruptedTask(): { id: string; prompt: string } | null {
     const tasks = this.taskManager.getAllTasks();
@@ -1181,28 +1338,69 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private async executeWithIntelligentOrchestrator(prompt: string, imagePaths: string[]): Promise<void> {
     console.log('[MultiCLI] 使用智能编排模式');
 
-    const task = this.taskManager.createTask(prompt);
-    this.taskManager.updateTaskStatus(task.id, 'running');
-    this.sendStateUpdate();
+    const interactionMode = this.intelligentOrchestrator.getInteractionMode();
+
+    // ask 模式不创建任务（简单对话不需要任务跟踪）
+    const isAskMode = interactionMode === 'ask';
+
+    // 🆕 修复：先创建任务，让编排器可以正确同步子任务
+    // 如果最终不需要 Worker，任务会被标记为已完成（无子任务）
+    const task = isAskMode ? null : this.taskManager.createTask(prompt);
+    const taskId = task?.id || `temp-${Date.now()}`;
+
+    if (task) {
+      this.taskManager.updateTaskStatus(task.id, 'running');
+      this.sendStateUpdate();
+    }
 
     try {
       // 调用智能编排器
-      const result = await this.intelligentOrchestrator.execute(prompt, task.id);
+      const result = await this.intelligentOrchestrator.execute(prompt, taskId);
+
+      // 获取执行计划，判断是否需要 Worker
+      const plan = this.intelligentOrchestrator.plan;
+      const needsWorker = plan?.needsWorker !== false && (plan?.subTasks?.length ?? 0) > 0;
+
+      if (task) {
+        if (needsWorker) {
+          // 🆕 子任务已经在 syncPlanToTaskManager 中添加，这里只需更新状态
+          this.taskManager.updateTaskStatus(task.id, 'completed');
+          console.log('[MultiCLI] 任务已完成:', task.id, '子任务数:', plan?.subTasks?.length || 0);
+        } else {
+          // 不需要 Worker，标记任务为已完成（无子任务）
+          this.taskManager.updateTaskStatus(task.id, 'completed');
+          console.log('[MultiCLI] 编排者直接回答，任务已完成（无子任务）');
+        }
+      }
 
       // 保存消息历史
       this.saveMessageToSession(prompt, result, undefined, 'orchestrator');
       this.saveCurrentSessionCliIds();
 
+      // 发送结果到 UI
+      if (result) {
+        this.postMessage({
+          type: 'orchestratorMessage',
+          content: result,
+          phase: 'summary',
+          messageType: 'summary',
+        } as any);
+      }
+
     } catch (error) {
       console.error('[MultiCLI] 智能编排执行错误:', error);
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.postMessage({ type: 'cliError', cli: 'claude', error: errorMsg, source: 'orchestrator' });
+
+      // 🆕 修复：错误时更新任务状态为失败
+      if (task) {
+        this.taskManager.updateTaskStatus(task.id, 'failed');
+      }
+
       this.postMessage({
-        type: 'cliResponse',
-        cli: 'claude',
-        content: '',
-        error: errorMsg,
-        source: 'orchestrator',
+        type: 'orchestratorMessage',
+        content: errorMsg,
+        phase: 'error',
+        messageType: 'error',
       });
     }
 
@@ -1274,13 +1472,34 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.postMessage({ type: 'stateUpdate', state });
   }
 
+  /** 创建并切换到新会话（对齐任务/对话会话） */
+  public async createNewSession(): Promise<void> {
+    await this.handleNewSession();
+  }
+
+  /** 处理新会话创建流程 */
+  private async handleNewSession(): Promise<void> {
+    // 创建新会话前，先中断当前任务
+    await this.interruptCurrentTask();
+    // 创建新会话时，重置所有 CLI 的会话 ID
+    this.cliFactory.resetAllSessions();
+    const { chatSession } = this.createAlignedSession();
+    // 更新活跃会话ID
+    this.activeSessionId = chatSession.id;
+    console.log('[MultiCLI] 创建新会话，已重置所有 CLI sessionId, activeSessionId:', this.activeSessionId);
+    // 通知 webview 新会话已创建
+    this.postMessage({ type: 'sessionCreated', session: chatSession as any });
+    this.postMessage({ type: 'sessionsUpdated', sessions: this.chatSessionManager.getAllSessions() as any[] });
+    this.sendStateUpdate();
+  }
+
   /** 切换到指定会话 */
   private switchToSession(sessionId: string): void {
     // 先保存当前会话的 CLI sessionIds
     this.saveCurrentSessionCliIds();
 
     // 切换会话
-    const session = this.sessionManager.switchSession(sessionId);
+    const session = this.ensureSessionExists(sessionId);
 
     if (session) {
       // 恢复目标会话的 CLI sessionIds
@@ -1293,6 +1512,43 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         console.log('[MultiCLI] 切换会话，目标会话无 CLI sessionIds，已重置');
       }
     }
+  }
+
+  /** 确保任务会话存在并已切换 */
+  private ensureSessionExists(sessionId: string) {
+    const existing = this.sessionManager.getSession(sessionId);
+    if (existing) {
+      this.sessionManager.switchSession(sessionId);
+      return existing;
+    }
+    return this.sessionManager.createSession(sessionId);
+  }
+
+  /** 创建对齐的任务会话和聊天会话 */
+  private createAlignedSession(name?: string) {
+    const session = this.sessionManager.createSession();
+    const chatSession = this.chatSessionManager.createSession(name, session.id);
+    return { session, chatSession };
+  }
+
+  /** 初始化会话对齐（用于启动时恢复） */
+  private ensureSessionAlignment(): void {
+    const chatSession = this.chatSessionManager.getCurrentSession();
+    if (chatSession) {
+      this.ensureSessionExists(chatSession.id);
+      this.activeSessionId = chatSession.id;
+      return;
+    }
+
+    const session = this.sessionManager.getCurrentSession();
+    if (session) {
+      this.chatSessionManager.createSession(undefined, session.id);
+      this.activeSessionId = session.id;
+      return;
+    }
+
+    const { chatSession: newChatSession } = this.createAlignedSession();
+    this.activeSessionId = newChatSession.id;
   }
 
   /** 保存当前会话的 CLI sessionIds */

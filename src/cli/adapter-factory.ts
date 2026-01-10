@@ -22,12 +22,17 @@ export interface AdapterStatus {
 export interface FactoryConfig {
   cwd: string;
   timeout?: number;
+  idleTimeout?: number;
+  maxTimeout?: number;
   env?: Record<string, string>;
 }
+
+export type AdapterRole = 'worker' | 'orchestrator';
 
 export interface AdapterOutputScope {
   source?: 'worker' | 'orchestrator' | 'system';
   streamToUI?: boolean;
+  adapterRole?: AdapterRole;
 }
 
 /**
@@ -36,8 +41,10 @@ export interface AdapterOutputScope {
  */
 export class CLIAdapterFactory extends EventEmitter {
   private adapters: Map<CLIType, ICLIAdapter> = new Map();
+  private orchestratorAdapters: Map<CLIType, ICLIAdapter> = new Map();
   private config: FactoryConfig;
-  private outputScopes: Map<CLIType, AdapterOutputScope> = new Map();
+  private outputScopes: Map<string, AdapterOutputScope> = new Map();
+  private outputMuteCounts: Map<string, number> = new Map();
 
   constructor(config: FactoryConfig) {
     super();
@@ -48,52 +55,30 @@ export class CLIAdapterFactory extends EventEmitter {
    * 创建或获取适配器实例
    */
   create(type: CLIType): ICLIAdapter {
-    const existing = this.adapters.get(type);
-    if (existing) {
-      return existing;
-    }
-
-    const adapterConfig: Omit<AdapterConfig, 'type'> = {
-      cwd: this.config.cwd,
-      timeout: this.config.timeout,
-      env: this.config.env,
-    };
-
-    let adapter: ICLIAdapter;
-    switch (type) {
-      case 'claude':
-        adapter = new ClaudeAdapter(adapterConfig);
-        break;
-      case 'codex':
-        adapter = new CodexAdapter(adapterConfig);
-        break;
-      case 'gemini':
-        adapter = new GeminiAdapter(adapterConfig);
-        break;
-      default:
-        throw new Error(`Unknown CLI type: ${type}`);
-    }
-
-    // 转发适配器事件
-    this.setupAdapterEvents(adapter, type);
-    this.adapters.set(type, adapter);
-    return adapter;
+    return this.createWithRole(type, 'worker');
   }
 
   /**
    * 设置适配器事件转发
    */
-  private setupAdapterEvents(adapter: ICLIAdapter, type: CLIType): void {
+  private setupAdapterEvents(adapter: ICLIAdapter, type: CLIType, role: AdapterRole): void {
+    const suppressUI = role === 'orchestrator';
     adapter.on('output', (chunk: string) => {
-      const scope = this.outputScopes.get(type);
+      const scopeKey = this.getScopeKey(type, role);
+      if ((this.outputMuteCounts.get(scopeKey) || 0) > 0) {
+        return;
+      }
+      const scope = this.outputScopes.get(scopeKey);
       if (scope?.streamToUI === false) {
         return;
       }
-      this.emit('output', { type, chunk, source: scope?.source });
+      this.emit('output', { type, chunk, source: scope?.source, adapterRole: role });
     });
 
     adapter.on('response', (response: CLIResponse) => {
-      this.emit('response', { type, response });
+      const scopeKey = this.getScopeKey(type, role);
+      const scope = this.outputScopes.get(scopeKey);
+      this.emit('response', { type, response, source: scope?.source, adapterRole: role });
     });
 
     adapter.on('error', (error: Error) => {
@@ -101,6 +86,9 @@ export class CLIAdapterFactory extends EventEmitter {
     });
 
     adapter.on('stateChange', (state: string) => {
+      if (suppressUI) {
+        return;
+      }
       this.emit('stateChange', { type, state });
     });
   }
@@ -108,8 +96,8 @@ export class CLIAdapterFactory extends EventEmitter {
   /**
    * 获取已创建的适配器
    */
-  getAdapter(type: CLIType): ICLIAdapter | undefined {
-    return this.adapters.get(type);
+  getAdapter(type: CLIType, role: AdapterRole = 'worker'): ICLIAdapter | undefined {
+    return this.getAdapterMap(role).get(type);
   }
 
   /**
@@ -123,15 +111,18 @@ export class CLIAdapterFactory extends EventEmitter {
   /**
    * 获取或创建适配器
    */
-  getOrCreate(type: CLIType): ICLIAdapter {
-    return this.adapters.get(type) || this.create(type);
+  getOrCreate(type: CLIType, role: AdapterRole = 'worker'): ICLIAdapter {
+    return this.getAdapterMap(role).get(type) || this.createWithRole(type, role);
   }
 
   /**
    * 获取所有已创建的适配器
    */
-  getAllAdapters(): ICLIAdapter[] {
-    return Array.from(this.adapters.values());
+  getAllAdapters(role?: AdapterRole): ICLIAdapter[] {
+    if (role) {
+      return Array.from(this.getAdapterMap(role).values());
+    }
+    return [...this.adapters.values(), ...this.orchestratorAdapters.values()];
   }
 
   /**
@@ -199,7 +190,7 @@ export class CLIAdapterFactory extends EventEmitter {
    * 断开指定类型的适配器
    */
   async disconnect(type: CLIType): Promise<void> {
-    const adapter = this.adapters.get(type);
+    const adapter = this.getAdapter(type);
     if (adapter) {
       await adapter.disconnect();
     }
@@ -223,7 +214,8 @@ export class CLIAdapterFactory extends EventEmitter {
     imagePaths?: string[],
     options?: AdapterOutputScope
   ): Promise<CLIResponse> {
-    const adapter = this.getOrCreate(type);
+    const role = options?.adapterRole ?? (options?.source === 'orchestrator' ? 'orchestrator' : 'worker');
+    const adapter = this.getOrCreate(type, role);
     if (!adapter.isConnected) {
       await adapter.connect();
     }
@@ -232,14 +224,13 @@ export class CLIAdapterFactory extends EventEmitter {
     console.log(`[CLIAdapterFactory] sendMessage: type=${type}, hasImages=${hasImages}, imagePaths=`, imagePaths);
 
     const scope = options ? { ...options } : null;
+    const scopeKey = this.getScopeKey(type, role);
     if (scope) {
-      this.outputScopes.set(type, scope);
+      this.outputScopes.set(scopeKey, scope);
     }
-
-    // 🆕 如果是编排者发送的消息，先在 CLI 面板中展示编排者的请求
-    // 这样用户能看到完整的"对话流"：编排者请求 -> 代理回复
-    if (options?.source === 'orchestrator' && options?.streamToUI !== false) {
-      this.emitOrchestratorMessage(type, message);
+    if (options?.streamToUI === false) {
+      const count = this.outputMuteCounts.get(scopeKey) || 0;
+      this.outputMuteCounts.set(scopeKey, count + 1);
     }
 
     try {
@@ -275,7 +266,15 @@ ${imageDescription}`;
       return adapter.sendMessage(message, imagePaths);
     } finally {
       if (scope) {
-        this.outputScopes.delete(type);
+        this.outputScopes.delete(scopeKey);
+      }
+      if (options?.streamToUI === false) {
+        const count = this.outputMuteCounts.get(scopeKey) || 0;
+        if (count <= 1) {
+          this.outputMuteCounts.delete(scopeKey);
+        } else {
+          this.outputMuteCounts.set(scopeKey, count - 1);
+        }
       }
     }
   }
@@ -403,8 +402,8 @@ ${imageDescription}`;
   /**
    * 获取指定 CLI 的会话 ID
    */
-  getSessionId(type: CLIType): string | null {
-    const adapter = this.adapters.get(type);
+  getSessionId(type: CLIType, role: AdapterRole = 'worker'): string | null {
+    const adapter = this.getAdapter(type, role);
     if (adapter && 'getSessionId' in adapter && typeof adapter.getSessionId === 'function') {
       return (adapter as { getSessionId: () => string | null }).getSessionId();
     }
@@ -414,8 +413,8 @@ ${imageDescription}`;
   /**
    * 设置指定 CLI 的会话 ID
    */
-  setSessionId(type: CLIType, sessionId: string | null): void {
-    const adapter = this.adapters.get(type);
+  setSessionId(type: CLIType, sessionId: string | null, role: AdapterRole = 'worker'): void {
+    const adapter = this.getAdapter(type, role);
     if (adapter && 'setSessionId' in adapter && typeof adapter.setSessionId === 'function') {
       (adapter as { setSessionId: (id: string | null) => void }).setSessionId(sessionId);
     }
@@ -424,8 +423,8 @@ ${imageDescription}`;
   /**
    * 重置指定 CLI 的会话
    */
-  resetSession(type: CLIType): void {
-    const adapter = this.adapters.get(type);
+  resetSession(type: CLIType, role: AdapterRole = 'worker'): void {
+    const adapter = this.getAdapter(type, role);
     if (adapter && 'resetSession' in adapter && typeof adapter.resetSession === 'function') {
       (adapter as { resetSession: () => void }).resetSession();
     }
@@ -436,7 +435,8 @@ ${imageDescription}`;
    */
   resetAllSessions(): void {
     const types: CLIType[] = ['claude', 'codex', 'gemini'];
-    types.forEach(type => this.resetSession(type));
+    types.forEach(type => this.resetSession(type, 'worker'));
+    types.forEach(type => this.resetSession(type, 'orchestrator'));
   }
 
   /**
@@ -465,6 +465,50 @@ ${imageDescription}`;
   async dispose(): Promise<void> {
     await this.disconnectAll();
     this.adapters.clear();
+    this.orchestratorAdapters.clear();
     this.removeAllListeners();
+  }
+
+  private createWithRole(type: CLIType, role: AdapterRole): ICLIAdapter {
+    const adapters = this.getAdapterMap(role);
+    const existing = adapters.get(type);
+    if (existing) {
+      return existing;
+    }
+
+    const adapterConfig: Omit<AdapterConfig, 'type'> = {
+      cwd: this.config.cwd,
+      timeout: this.config.timeout,
+      idleTimeout: this.config.idleTimeout,
+      maxTimeout: this.config.maxTimeout,
+      env: this.config.env,
+    };
+
+    let adapter: ICLIAdapter;
+    switch (type) {
+      case 'claude':
+        adapter = new ClaudeAdapter(adapterConfig);
+        break;
+      case 'codex':
+        adapter = new CodexAdapter(adapterConfig);
+        break;
+      case 'gemini':
+        adapter = new GeminiAdapter(adapterConfig);
+        break;
+      default:
+        throw new Error(`Unknown CLI type: ${type}`);
+    }
+
+    this.setupAdapterEvents(adapter, type, role);
+    adapters.set(type, adapter);
+    return adapter;
+  }
+
+  private getAdapterMap(role: AdapterRole): Map<CLIType, ICLIAdapter> {
+    return role === 'orchestrator' ? this.orchestratorAdapters : this.adapters;
+  }
+
+  private getScopeKey(type: CLIType, role: AdapterRole): string {
+    return `${role}:${type}`;
   }
 }

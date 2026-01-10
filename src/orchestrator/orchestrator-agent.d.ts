@@ -99,6 +99,16 @@ export declare class OrchestratorAgent extends EventEmitter {
     private dispatchWithDependencyGraph;
     /** 为执行计划中的目标文件创建快照 */
     private createSnapshotsForPlan;
+    /** 为子任务集合创建快照 */
+    private createSnapshotsForSubTasks;
+    /** 构建共享上下文（功能契约 + 验收清单） */
+    private buildSharedContext;
+    private buildIntegrationPrompt;
+    private buildIntegrationContext;
+    private parseIntegrationReport;
+    private pickWorkerForIssue;
+    private buildRepairPrompt;
+    private runIntegrationStage;
     /** 并行分发任务 */
     private dispatchParallel;
     /** 串行分发任务 */
@@ -106,6 +116,7 @@ export declare class OrchestratorAgent extends EventEmitter {
     /** 处理子任务执行结果 */
     private finalizeResult;
     private resolveReviewConfig;
+    private resolveIntegrationConfig;
     private shouldEnableReviews;
     private shouldPeerReview;
     private selectPeerReviewer;

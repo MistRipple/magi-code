@@ -55,6 +55,8 @@ class SessionManager {
     constructor(workspaceRoot) {
         this.storageDir = path.join(workspaceRoot, '.multicli', 'sessions');
         this.ensureStorageDir();
+        this.loadAllSessions();
+        this.ensureCurrentSession();
     }
     /** 确保存储目录存在 */
     ensureStorageDir() {
@@ -63,9 +65,13 @@ class SessionManager {
         }
     }
     /** 创建新 Session */
-    createSession() {
+    createSession(sessionId) {
+        if (sessionId && this.sessions.has(sessionId)) {
+            this.currentSessionId = sessionId;
+            return this.sessions.get(sessionId);
+        }
         const session = {
-            id: generateId(),
+            id: sessionId ?? generateId(),
             createdAt: Date.now(),
             status: 'active',
             tasks: [],
@@ -208,6 +214,15 @@ class SessionManager {
         for (const file of files) {
             const sessionId = file.replace('.json', '');
             this.loadSession(sessionId);
+        }
+    }
+    /** 选择当前 Session（按创建时间倒序） */
+    ensureCurrentSession() {
+        if (this.currentSessionId)
+            return;
+        const sessions = this.getAllSessions().sort((a, b) => b.createdAt - a.createdAt);
+        if (sessions.length > 0) {
+            this.currentSessionId = sessions[0].id;
         }
     }
     /** 删除 Session */

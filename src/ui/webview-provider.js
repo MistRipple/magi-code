@@ -66,6 +66,8 @@ class WebviewProvider {
     diffGenerator;
     cliStatuses = new Map();
     cliOutputs = new Map();
+    orchestratorStreamBuffer = '';
+    orchestratorStreamCli = null;
     // 多 CLI 适配器工厂
     cliFactory;
     // 任务分析器和 CLI 选择器
@@ -91,6 +93,8 @@ class WebviewProvider {
         this.taskManager = new task_manager_1.TaskManager(this.sessionManager);
         this.snapshotManager = new snapshot_manager_1.SnapshotManager(this.sessionManager, workspaceRoot);
         this.diffGenerator = new diff_generator_1.DiffGenerator(this.sessionManager, workspaceRoot);
+        // 对齐会话管理器，确保任务/快照与对话会话一致
+        this.ensureSessionAlignment();
         // 初始化多 CLI 适配器工厂
         this.cliFactory = new adapter_factory_1.CLIAdapterFactory({ cwd: workspaceRoot });
         this.setupCLIAdapters();
@@ -113,8 +117,22 @@ class WebviewProvider {
     /** 设置所有 CLI 适配器事件监听 */
     setupCLIAdapters() {
         // 监听工厂的统一事件
-        this.cliFactory.on('output', ({ type, chunk, source }) => {
-            if (source === 'orchestrator') {
+        this.cliFactory.on('output', ({ type, chunk, source, adapterRole }) => {
+            if (adapterRole === 'orchestrator') {
+                if (!chunk) {
+                    return;
+                }
+                if (this.orchestratorStreamCli !== type) {
+                    this.orchestratorStreamBuffer = '';
+                    this.orchestratorStreamCli = type;
+                }
+                this.orchestratorStreamBuffer += chunk;
+                this.postMessage({
+                    type: 'streamingUpdate',
+                    content: this.orchestratorStreamBuffer,
+                    source: source || 'orchestrator',
+                    cli: type
+                });
                 return;
             }
             const outputs = this.cliOutputs.get(type) || [];
@@ -129,6 +147,25 @@ class WebviewProvider {
                 source,
                 sessionId: this.activeSessionId
             });
+        });
+        this.cliFactory.on('response', ({ type, response, adapterRole, source }) => {
+            if (adapterRole !== 'orchestrator') {
+                return;
+            }
+            const content = response.error
+                ? `错误: ${response.error}`
+                : (response.content || this.orchestratorStreamBuffer);
+            if (content) {
+                this.postMessage({
+                    type: 'streamingComplete',
+                    content,
+                    source: source || 'orchestrator',
+                    cli: type,
+                    error: response.error
+                });
+            }
+            this.orchestratorStreamBuffer = '';
+            this.orchestratorStreamCli = null;
         });
         this.cliFactory.on('stateChange', ({ type, state }) => {
             const status = {
@@ -359,12 +396,20 @@ class WebviewProvider {
             ]);
             if (!interruptCompleted) {
                 console.warn('[MultiCLI] CLI 中断超时，尝试强制断开连接');
-                await this.cliFactory.disconnectAll();
             }
-            console.log('[MultiCLI] CLI 中断完成');
+            await this.cliFactory.disconnectAll();
+            this.cliFactory.resetAllSessions();
+            console.log('[MultiCLI] CLI 已断开并重置会话');
         }
         catch (error) {
             console.error('[MultiCLI] CLI 中断出错:', error);
+            try {
+                await this.cliFactory.disconnectAll();
+                this.cliFactory.resetAllSessions();
+            }
+            catch (cleanupError) {
+                console.error('[MultiCLI] CLI 清理失败:', cleanupError);
+            }
         }
         // 3. 重置会话，避免取消后的会话残留影响下次请求
         this.cliFactory.resetAllSessions();
@@ -374,6 +419,9 @@ class WebviewProvider {
         if (runningTask) {
             this.taskManager.updateTaskStatus(runningTask.id, 'interrupted');
         }
+        // 清理编排者流式输出缓存，避免跨任务串流
+        this.orchestratorStreamBuffer = '';
+        this.orchestratorStreamCli = null;
         // 4. 通知 UI
         this.postMessage({ type: 'toast', message: '任务已打断', toastType: 'info' });
         this.postMessage({
@@ -504,20 +552,7 @@ class WebviewProvider {
                 }
                 break;
             case 'newSession':
-                // 🆕 创建新会话前，先中断当前任务
-                await this.interruptCurrentTask();
-                // 创建新会话时，重置所有 CLI 的会话 ID
-                this.cliFactory.resetAllSessions();
-                this.sessionManager.createSession();
-                // 同时创建新的聊天会话
-                const newChatSession = this.chatSessionManager.createSession();
-                // 🆕 更新活跃会话ID
-                this.activeSessionId = newChatSession.id;
-                console.log('[MultiCLI] 创建新会话，已重置所有 CLI sessionId, activeSessionId:', this.activeSessionId);
-                // 通知 webview 新会话已创建
-                this.postMessage({ type: 'sessionCreated', session: newChatSession });
-                this.postMessage({ type: 'sessionsUpdated', sessions: this.chatSessionManager.getAllSessions() });
-                this.sendStateUpdate();
+                await this.handleNewSession();
                 break;
             case 'saveCurrentSession':
                 // 🔧 新增：保存当前会话的消息和 CLI 输出
@@ -555,7 +590,9 @@ class WebviewProvider {
                 if (this.chatSessionManager.deleteSession(message.sessionId)) {
                     // 如果删除后没有会话，创建一个新的
                     if (this.chatSessionManager.getAllSessions().length === 0) {
-                        this.chatSessionManager.createSession();
+                        const { chatSession } = this.createAlignedSession();
+                        this.activeSessionId = chatSession.id;
+                        this.postMessage({ type: 'sessionCreated', session: chatSession });
                     }
                     this.postMessage({ type: 'sessionsUpdated', sessions: this.chatSessionManager.getAllSessions() });
                     this.postMessage({ type: 'toast', message: '会话已删除', toastType: 'info' });
@@ -867,12 +904,31 @@ class WebviewProvider {
             });
         }
     }
+    /** 创建并切换到新会话（对齐任务/对话会话） */
+    async createNewSession() {
+        await this.handleNewSession();
+    }
+    /** 处理新会话创建流程 */
+    async handleNewSession() {
+        // 创建新会话前，先中断当前任务
+        await this.interruptCurrentTask();
+        // 创建新会话时，重置所有 CLI 的会话 ID
+        this.cliFactory.resetAllSessions();
+        const { chatSession } = this.createAlignedSession();
+        // 更新活跃会话ID
+        this.activeSessionId = chatSession.id;
+        console.log('[MultiCLI] 创建新会话，已重置所有 CLI sessionId, activeSessionId:', this.activeSessionId);
+        // 通知 webview 新会话已创建
+        this.postMessage({ type: 'sessionCreated', session: chatSession });
+        this.postMessage({ type: 'sessionsUpdated', sessions: this.chatSessionManager.getAllSessions() });
+        this.sendStateUpdate();
+    }
     /** 切换到指定会话 */
     switchToSession(sessionId) {
         // 先保存当前会话的 CLI sessionIds
         this.saveCurrentSessionCliIds();
         // 切换会话
-        const session = this.sessionManager.switchSession(sessionId);
+        const session = this.ensureSessionExists(sessionId);
         if (session) {
             // 恢复目标会话的 CLI sessionIds
             if (session.cliSessionIds) {
@@ -885,6 +941,38 @@ class WebviewProvider {
                 console.log('[MultiCLI] 切换会话，目标会话无 CLI sessionIds，已重置');
             }
         }
+    }
+    /** 确保任务会话存在并已切换 */
+    ensureSessionExists(sessionId) {
+        const existing = this.sessionManager.getSession(sessionId);
+        if (existing) {
+            this.sessionManager.switchSession(sessionId);
+            return existing;
+        }
+        return this.sessionManager.createSession(sessionId);
+    }
+    /** 创建对齐的任务会话和聊天会话 */
+    createAlignedSession(name) {
+        const session = this.sessionManager.createSession();
+        const chatSession = this.chatSessionManager.createSession(name, session.id);
+        return { session, chatSession };
+    }
+    /** 初始化会话对齐（用于启动时恢复） */
+    ensureSessionAlignment() {
+        const chatSession = this.chatSessionManager.getCurrentSession();
+        if (chatSession) {
+            this.ensureSessionExists(chatSession.id);
+            this.activeSessionId = chatSession.id;
+            return;
+        }
+        const session = this.sessionManager.getCurrentSession();
+        if (session) {
+            this.chatSessionManager.createSession(undefined, session.id);
+            this.activeSessionId = session.id;
+            return;
+        }
+        const { chatSession: newChatSession } = this.createAlignedSession();
+        this.activeSessionId = newChatSession.id;
     }
     /** 保存当前会话的 CLI sessionIds */
     saveCurrentSessionCliIds() {
@@ -1013,10 +1101,10 @@ class WebviewProvider {
                 this.intelligentOrchestrator.interrupt();
             }
             // 2. 清理 CLI 适配器（终止所有 CLI 进程）
-            if (this.cliFactory) {
-                console.log('[WebviewProvider] 清理 CLI 适配器...');
-                await this.cliFactory.dispose();
-            }
+                if (this.cliFactory) {
+                    console.log('[WebviewProvider] 清理 CLI 适配器...');
+                    await this.cliFactory.dispose();
+                }
             // 3. 移除事件监听器
             events_1.globalEventBus.clear();
             console.log('[WebviewProvider] 事件监听器已移除');
