@@ -64,6 +64,10 @@ ${projectContext ? `## 项目上下文\n${projectContext}\n` : ''}
 3. 任务之间是否有依赖关系（需要串行）还是可以并行？
 4. 是否为简单任务（单个 Worker 即可完成）？
 
+## 强制规则
+1. 若任务涉及前后端协作（或同时需要 Codex 与 Gemini），必须包含 **Claude 架构/契约任务**，并让其他子任务依赖该任务。
+2. 架构任务需明确：目录结构、接口契约、前后端对接约束。
+
 ## 输出格式
 请以 JSON 格式输出执行计划：
 \`\`\`json
@@ -72,6 +76,11 @@ ${projectContext ? `## 项目上下文\n${projectContext}\n` : ''}
   "isSimpleTask": true/false,
   "skipReason": "如果是简单任务，说明原因",
   "needsCollaboration": true/false,
+  "featureContract": "功能契约（接口、数据结构、交互约束的统一描述）",
+  "acceptanceCriteria": [
+    "验收标准 1",
+    "验收标准 2"
+  ],
   "subTasks": [
     {
       "id": "1",
@@ -163,6 +172,12 @@ function formatPlanForUser(plan) {
     return `## 📋 执行计划
 
 **分析**: ${plan.analysis}
+
+### 功能契约
+${plan.featureContract}
+
+### 验收清单
+${(plan.acceptanceCriteria || []).map(item => `- ${item}`).join('\n') || '- 未提供'}
 
 ### 子任务列表
 ${tasksText}

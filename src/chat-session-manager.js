@@ -68,10 +68,14 @@ class ChatSessionManager {
         }
     }
     /** 创建新会话 */
-    createSession(name) {
+    createSession(name, sessionId) {
+        if (sessionId && this.sessions.has(sessionId)) {
+            this.currentSessionId = sessionId;
+            return this.sessions.get(sessionId);
+        }
         const now = Date.now();
         const session = {
-            id: generateId(),
+            id: sessionId ?? generateId(),
             name: name || undefined,
             messages: [],
             createdAt: now,

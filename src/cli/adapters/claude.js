@@ -39,7 +39,15 @@ class ClaudeAdapter extends events_1.EventEmitter {
     }
     constructor(config) {
         super();
-        this.config = { ...config, type: 'claude', timeout: config.timeout || 5 * 60 * 1000 };
+        const maxTimeout = config.maxTimeout ?? config.timeout ?? 5 * 60 * 1000;
+        const idleTimeout = config.idleTimeout ?? Math.min(120000, maxTimeout);
+        this.config = {
+            ...config,
+            type: 'claude',
+            timeout: maxTimeout,
+            maxTimeout,
+            idleTimeout,
+        };
     }
     get state() {
         return this._state;
@@ -104,29 +112,64 @@ class ClaudeAdapter extends events_1.EventEmitter {
             // 立即关闭 stdin，告诉 Claude CLI 没有更多输入
             this.currentProcess.stdin?.end();
             console.log('[ClaudeAdapter] 进程已启动, PID:', this.currentProcess.pid);
-            // 设置超时
-            const timeout = setTimeout(() => {
-                console.log('[ClaudeAdapter] 超时!');
-                this.currentProcess?.kill();
+            const idleTimeoutMs = this.config.idleTimeout ?? this.config.timeout ?? 5 * 60 * 1000;
+            const maxTimeoutMs = Math.max(this.config.maxTimeout ?? this.config.timeout ?? idleTimeoutMs, idleTimeoutMs);
+            // 设置超时 - 空闲超时 + 最大超时
+            let timeoutTriggered = false;
+            let idleTimer = null;
+            const resetIdleTimer = () => {
+                if (idleTimer)
+                    clearTimeout(idleTimer);
+                idleTimer = setTimeout(async () => {
+                    console.log('[ClaudeAdapter] 空闲超时!');
+                    timeoutTriggered = true;
+                    const proc = this.currentProcess;
+                    if (proc) {
+                        await this.killProcessWithWait(proc, 3000);
+                        this.currentProcess = null;
+                    }
+                    this.setState('ready');
+                    reject(new Error('Claude CLI idle timeout'));
+                }, idleTimeoutMs);
+            };
+            const maxTimer = setTimeout(async () => {
+                console.log('[ClaudeAdapter] 最大超时!');
+                timeoutTriggered = true;
+                const proc = this.currentProcess;
+                if (proc) {
+                    await this.killProcessWithWait(proc, 3000);
+                    this.currentProcess = null;
+                }
                 this.setState('ready');
-                reject(new Error('Claude CLI timeout'));
-            }, this.config.timeout);
+                reject(new Error('Claude CLI max timeout'));
+            }, maxTimeoutMs);
+            resetIdleTimer();
             this.currentProcess.stdout?.on('data', (data) => {
                 const chunk = data.toString();
                 console.log('[ClaudeAdapter] stdout:', chunk.substring(0, 100));
                 output += chunk;
                 this.emit('output', chunk);
+                if (!timeoutTriggered)
+                    resetIdleTimer();
             });
             this.currentProcess.stderr?.on('data', (data) => {
                 const chunk = data.toString();
                 console.log('[ClaudeAdapter] stderr:', chunk.substring(0, 100));
                 output += chunk;
                 this.emit('output', chunk);
+                if (!timeoutTriggered)
+                    resetIdleTimer();
             });
             this.currentProcess.on('close', (code) => {
                 console.log('[ClaudeAdapter] 进程关闭, code:', code, 'output length:', output.length);
-                clearTimeout(timeout);
+                if (idleTimer)
+                    clearTimeout(idleTimer);
+                clearTimeout(maxTimer);
                 this.currentProcess = null;
+                if (timeoutTriggered) {
+                    console.log('[ClaudeAdapter] 超时触发的关闭，跳过处理');
+                    return;
+                }
                 this.setState('ready');
                 const response = this.parseOutput(output);
                 console.log('[ClaudeAdapter] 解析结果:', response.content?.substring(0, 100));
@@ -146,8 +189,12 @@ class ClaudeAdapter extends events_1.EventEmitter {
             });
             this.currentProcess.on('error', (err) => {
                 console.log('[ClaudeAdapter] 进程错误:', err.message);
-                clearTimeout(timeout);
+                if (idleTimer)
+                    clearTimeout(idleTimer);
+                clearTimeout(maxTimer);
                 this.currentProcess = null;
+                if (timeoutTriggered)
+                    return;
                 this.setState('error');
                 this.emit('error', err);
                 reject(err);

@@ -29,6 +29,11 @@ export interface OrchestratorConfig {
     timeout: number;
     verification?: Partial<VerificationConfig>;
     maxRetries: number;
+    integration?: {
+        enabled?: boolean;
+        maxRounds?: number;
+        worker?: WorkerType;
+    };
 }
 /** 编排器状态 */
 export type OrchestratorPhase = OrchestratorState;

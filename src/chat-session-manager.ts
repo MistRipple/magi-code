@@ -41,10 +41,15 @@ export class ChatSessionManager {
   }
 
   /** 创建新会话 */
-  createSession(name?: string): Session {
+  createSession(name?: string, sessionId?: string): Session {
+    if (sessionId && this.sessions.has(sessionId)) {
+      this.currentSessionId = sessionId;
+      return this.sessions.get(sessionId)!;
+    }
+
     const now = Date.now();
     const session: Session = {
-      id: generateId(),
+      id: sessionId ?? generateId(),
       name: name || undefined,
       messages: [],
       createdAt: now,
@@ -383,4 +388,3 @@ export class ChatSessionManager {
       .join('\n\n');
   }
 }
-

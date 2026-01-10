@@ -46,6 +46,10 @@ export interface Task {
     startedAt?: number;
     completedAt?: number;
     interruptedAt?: number;
+    /** 功能契约（统一前后端约束） */
+    featureContract?: string;
+    /** 验收清单 */
+    acceptanceCriteria?: string[];
 }
 export type TaskStatus = 'pending' | 'running' | 'interrupted' | 'completed' | 'failed' | 'cancelled';
 /**
@@ -56,9 +60,26 @@ export interface SubTask {
     id: string;
     taskId: string;
     description: string;
-    category: TaskCategory;
-    assignedCli: CLIType;
+    /** Worker 分配（新架构命名） */
+    assignedWorker: CLIType;
+    /** 向后兼容别名（旧架构命名） */
+    assignedCli?: CLIType;
+    /** 任务标题（用于依赖图显示） */
+    title?: string;
+    /** 分配原因（新架构，用于解释为什么选择该 Worker） */
+    reason?: string;
+    /** 执行提示词（新架构，Worker 执行时使用的具体指令） */
+    prompt?: string;
+    /** 目标文件列表 */
     targetFiles: string[];
+    /** 依赖关系（新架构，子任务间的依赖） */
+    dependencies: string[];
+    /** 优先级（新架构，1 最高） */
+    priority?: number;
+    /** 子任务类型（实现/集成/修复） */
+    kind?: 'implementation' | 'integration' | 'repair';
+    /** 功能分组 ID（用于跨子任务联调） */
+    featureId?: string;
     status: SubTaskStatus;
     output: string[];
     result?: WorkerResult;
@@ -367,6 +388,15 @@ export type ExtensionToWebviewMessage = {
     type: 'streamingUpdate';
     content: string;
     sessionId?: string | null;
+    source?: MessageSource;
+    cli?: CLIType;
+} | {
+    type: 'streamingComplete';
+    content?: string;
+    error?: string;
+    sessionId?: string | null;
+    source?: MessageSource;
+    cli?: CLIType;
 } | {
     type: 'toast';
     message: string;

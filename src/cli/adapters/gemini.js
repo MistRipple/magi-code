@@ -37,7 +37,15 @@ class GeminiAdapter extends events_1.EventEmitter {
     }
     constructor(config) {
         super();
-        this.config = { ...config, type: 'gemini', timeout: config.timeout || 5 * 60 * 1000 };
+        const maxTimeout = config.maxTimeout ?? config.timeout ?? 5 * 60 * 1000;
+        const idleTimeout = config.idleTimeout ?? Math.min(120000, maxTimeout);
+        this.config = {
+            ...config,
+            type: 'gemini',
+            timeout: maxTimeout,
+            maxTimeout,
+            idleTimeout,
+        };
     }
     get state() {
         return this._state;
@@ -97,29 +105,64 @@ class GeminiAdapter extends events_1.EventEmitter {
             // 关闭 stdin
             this.currentProcess.stdin?.end();
             console.log('[GeminiAdapter] 进程已启动, PID:', this.currentProcess.pid);
-            // 设置超时
-            const timeout = setTimeout(() => {
-                console.log('[GeminiAdapter] 超时!');
-                this.currentProcess?.kill();
+            const idleTimeoutMs = this.config.idleTimeout ?? this.config.timeout ?? 5 * 60 * 1000;
+            const maxTimeoutMs = Math.max(this.config.maxTimeout ?? this.config.timeout ?? idleTimeoutMs, idleTimeoutMs);
+            // 设置超时 - 空闲超时 + 最大超时
+            let timeoutTriggered = false;
+            let idleTimer = null;
+            const resetIdleTimer = () => {
+                if (idleTimer)
+                    clearTimeout(idleTimer);
+                idleTimer = setTimeout(async () => {
+                    console.log('[GeminiAdapter] 空闲超时!');
+                    timeoutTriggered = true;
+                    const proc = this.currentProcess;
+                    if (proc) {
+                        await this.killProcessWithWait(proc, 3000);
+                        this.currentProcess = null;
+                    }
+                    this.setState('ready');
+                    reject(new Error('Gemini CLI idle timeout'));
+                }, idleTimeoutMs);
+            };
+            const maxTimer = setTimeout(async () => {
+                console.log('[GeminiAdapter] 最大超时!');
+                timeoutTriggered = true;
+                const proc = this.currentProcess;
+                if (proc) {
+                    await this.killProcessWithWait(proc, 3000);
+                    this.currentProcess = null;
+                }
                 this.setState('ready');
-                reject(new Error('Gemini CLI timeout'));
-            }, this.config.timeout);
+                reject(new Error('Gemini CLI max timeout'));
+            }, maxTimeoutMs);
+            resetIdleTimer();
             this.currentProcess.stdout?.on('data', (data) => {
                 const chunk = data.toString();
                 console.log('[GeminiAdapter] stdout:', chunk.substring(0, 100));
                 output += chunk;
                 this.emit('output', chunk);
+                if (!timeoutTriggered)
+                    resetIdleTimer();
             });
             this.currentProcess.stderr?.on('data', (data) => {
                 const chunk = data.toString();
                 console.log('[GeminiAdapter] stderr:', chunk.substring(0, 100));
                 output += chunk;
                 this.emit('output', chunk);
+                if (!timeoutTriggered)
+                    resetIdleTimer();
             });
             this.currentProcess.on('close', (code) => {
                 console.log('[GeminiAdapter] 进程关闭, code:', code, 'output length:', output.length);
-                clearTimeout(timeout);
+                if (idleTimer)
+                    clearTimeout(idleTimer);
+                clearTimeout(maxTimer);
                 this.currentProcess = null;
+                if (timeoutTriggered) {
+                    console.log('[GeminiAdapter] 超时触发的关闭，跳过处理');
+                    return;
+                }
                 this.setState('ready');
                 const response = this.parseOutput(output);
                 console.log('[GeminiAdapter] 解析结果:', response.content?.substring(0, 100));
@@ -137,8 +180,12 @@ class GeminiAdapter extends events_1.EventEmitter {
             });
             this.currentProcess.on('error', (err) => {
                 console.log('[GeminiAdapter] 进程错误:', err.message);
-                clearTimeout(timeout);
+                if (idleTimer)
+                    clearTimeout(idleTimer);
+                clearTimeout(maxTimer);
                 this.currentProcess = null;
+                if (timeoutTriggered)
+                    return;
                 this.setState('error');
                 this.emit('error', err);
                 reject(err);

@@ -14,7 +14,7 @@ export declare class SessionManager {
     /** 确保存储目录存在 */
     private ensureStorageDir;
     /** 创建新 Session */
-    createSession(): Session;
+    createSession(sessionId?: string): Session;
     /** 获取当前 Session */
     getCurrentSession(): Session | null;
     /** 获取或创建当前 Session */
@@ -45,6 +45,8 @@ export declare class SessionManager {
     loadSession(sessionId: string): Session | null;
     /** 加载所有 Session */
     loadAllSessions(): void;
+    /** 选择当前 Session（按创建时间倒序） */
+    private ensureCurrentSession;
     /** 删除 Session */
     deleteSession(sessionId: string): void;
 }

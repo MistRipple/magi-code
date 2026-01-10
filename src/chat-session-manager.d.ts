@@ -16,7 +16,7 @@ export declare class ChatSessionManager {
     /** 确保存储目录存在 */
     private ensureStorageDir;
     /** 创建新会话 */
-    createSession(name?: string): Session;
+    createSession(name?: string, sessionId?: string): Session;
     /** 获取当前会话 */
     getCurrentSession(): Session | null;
     /** 获取或创建当前会话 */

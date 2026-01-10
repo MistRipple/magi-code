@@ -39,6 +39,10 @@ export interface ExecutionPlan {
     subTasks: SubTask[];
     executionMode: 'parallel' | 'sequential';
     summary: string;
+    /** 功能契约（统一前后端约束） */
+    featureContract: string;
+    /** 验收清单 */
+    acceptanceCriteria: string[];
     createdAt: number;
 }
 /** 执行结果 */
@@ -127,11 +131,15 @@ export interface OrchestratorCommandMessage extends BaseMessage {
 /** 所有消息类型联合 */
 export type BusMessage = TaskDispatchMessage | TaskCancelMessage | ProgressReportMessage | TaskCompletedMessage | TaskFailedMessage | WorkerReadyMessage | OrchestratorCommandMessage;
 /** 编排者状态 */
-export type OrchestratorState = 'idle' | 'analyzing' | 'waiting_confirmation' | 'dispatching' | 'monitoring' | 'verifying' | 'recovering' | 'summarizing' | 'completed' | 'failed';
+export type OrchestratorState = 'idle' | 'analyzing' | 'waiting_confirmation' | 'dispatching' | 'monitoring' | 'integrating' | 'verifying' | 'recovering' | 'summarizing' | 'completed' | 'failed';
 /** 编排者配置 */
 export interface OrchestratorConfig {
     /** 超时时间（毫秒） */
     timeout: number;
+    /** 空闲超时时间（毫秒） */
+    idleTimeout?: number;
+    /** 最大执行超时时间（毫秒） */
+    maxTimeout?: number;
     /** 最大重试次数 */
     maxRetries: number;
     /** 子任务自检/互检配置 */
@@ -155,9 +163,15 @@ export interface OrchestratorConfig {
         lintCheck?: boolean;
         lintCommand?: string;
         testCheck?: boolean;
-        testCommand?: string;
-        timeout?: number;
-    };
+    testCommand?: string;
+    timeout?: number;
+  };
+  /** 功能集成配置 */
+  integration?: {
+    enabled?: boolean;
+    maxRounds?: number;
+    worker?: WorkerType;
+  };
 }
 /** 任务上下文 */
 export interface TaskContext {

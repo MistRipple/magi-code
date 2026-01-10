@@ -15,6 +15,11 @@ const verification_runner_1 = require("./verification-runner");
 const DEFAULT_CONFIG = {
     timeout: 300000,
     maxRetries: 3,
+    integration: {
+        enabled: true,
+        maxRounds: 2,
+        worker: 'claude',
+    },
 };
 /**
  * 智能编排器 - 基于独立编排者架构
@@ -48,6 +53,7 @@ class IntelligentOrchestrator {
             timeout: this.config.timeout,
             maxRetries: this.config.maxRetries,
             verification: this.config.verification,
+            integration: this.config.integration,
         }, workspaceRoot, snapshotManager, taskManager);
         this.setupOrchestratorEvents();
     }
@@ -160,7 +166,7 @@ class IntelligentOrchestrator {
     /** ask 模式：仅对话 */
     async executeAskMode(userPrompt, taskId) {
         console.log('[IntelligentOrchestrator] ask 模式：仅对话');
-        const response = await this.cliFactory.sendMessage('claude', userPrompt);
+        const response = await this.cliFactory.sendMessage('claude', userPrompt, undefined, { source: 'orchestrator', streamToUI: true, adapterRole: 'orchestrator' });
         if (response.error) {
             throw new Error(response.error);
         }

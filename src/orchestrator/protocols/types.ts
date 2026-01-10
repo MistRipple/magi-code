@@ -32,11 +32,19 @@ export interface ExecutionPlan {
   id: string;
   analysis: string;
   isSimpleTask?: boolean;
+  /** 🆕 是否需要 Worker 执行（false 表示编排者直接回答） */
+  needsWorker?: boolean;
+  /** 🆕 编排者直接回答的内容（当 needsWorker=false 时使用） */
+  directResponse?: string;
   skipReason?: string;
   needsCollaboration: boolean;
   subTasks: SubTask[];
   executionMode: 'parallel' | 'sequential';
   summary: string;
+  /** 功能契约（统一前后端约束） */
+  featureContract: string;
+  /** 验收清单 */
+  acceptanceCriteria: string[];
   createdAt: number;
 }
 
@@ -165,6 +173,7 @@ export type OrchestratorState =
   | 'waiting_confirmation'
   | 'dispatching'
   | 'monitoring'
+  | 'integrating'
   | 'verifying'
   | 'recovering'
   | 'summarizing'
@@ -175,6 +184,10 @@ export type OrchestratorState =
 export interface OrchestratorConfig {
   /** 超时时间（毫秒） */
   timeout: number;
+  /** 空闲超时时间（毫秒） */
+  idleTimeout?: number;
+  /** 最大执行超时时间（毫秒） */
+  maxTimeout?: number;
   /** 最大重试次数 */
   maxRetries: number;
   /** 子任务自检/互检配置 */
@@ -201,6 +214,12 @@ export interface OrchestratorConfig {
     testCommand?: string;
     timeout?: number;
   };
+  /** 功能集成配置 */
+  integration?: {
+    enabled?: boolean;
+    maxRounds?: number;
+    worker?: WorkerType;
+  };
 }
 
 /** 任务上下文 */
@@ -220,6 +239,7 @@ export type OrchestratorMessageType =
   | 'worker_output'
   | 'verification_result'
   | 'summary'
+  | 'direct_response'  // 🆕 编排者直接回答（不需要 Worker）
   | 'error';
 
 /** 编排者消息（发送给前端） */
@@ -269,4 +289,3 @@ export interface OrchestratorEvents {
   allCompleted: (results: ExecutionResult[]) => void;
   error: (error: Error) => void;
 }
-

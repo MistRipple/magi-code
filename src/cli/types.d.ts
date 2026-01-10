@@ -80,7 +80,11 @@ export interface AdapterConfig {
     args?: string[];
     /** 环境变量 */
     env?: Record<string, string>;
-    /** 超时时间（毫秒） */
+    /** 空闲超时时间（毫秒） */
+    idleTimeout?: number;
+    /** 最大执行超时时间（毫秒） */
+    maxTimeout?: number;
+    /** 超时时间（毫秒，兼容字段，等同于最大超时） */
     timeout?: number;
 }
 /** CLI 适配器接口 */

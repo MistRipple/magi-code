@@ -47,7 +47,15 @@ export class GeminiAdapter extends EventEmitter implements ICLIAdapter {
 
   constructor(config: Omit<AdapterConfig, 'type'>) {
     super();
-    this.config = { ...config, type: 'gemini', timeout: config.timeout || 5 * 60 * 1000 };
+    const maxTimeout = config.maxTimeout ?? config.timeout ?? 5 * 60 * 1000;
+    const idleTimeout = config.idleTimeout ?? Math.min(120000, maxTimeout);
+    this.config = {
+      ...config,
+      type: 'gemini',
+      timeout: maxTimeout,
+      maxTimeout,
+      idleTimeout,
+    };
   }
 
   get state(): AdapterState {
@@ -155,10 +163,29 @@ export class GeminiAdapter extends EventEmitter implements ICLIAdapter {
 
       console.log('[GeminiAdapter] 进程已启动, PID:', this.currentProcess.pid);
 
-      // 设置超时 - 修复：超时后等待进程退出
+      const idleTimeoutMs = this.config.idleTimeout ?? this.config.timeout ?? 5 * 60 * 1000;
+      const maxTimeoutMs = Math.max(this.config.maxTimeout ?? this.config.timeout ?? idleTimeoutMs, idleTimeoutMs);
+
+      // 设置超时 - 空闲超时 + 最大超时
       let timeoutTriggered = false;
-      const timeout = setTimeout(async () => {
-        console.log('[GeminiAdapter] 超时!');
+      let idleTimer: NodeJS.Timeout | null = null;
+      const resetIdleTimer = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(async () => {
+          console.log('[GeminiAdapter] 空闲超时!');
+          timeoutTriggered = true;
+          const proc = this.currentProcess;
+          if (proc) {
+            await this.killProcessWithWait(proc, 3000);
+            this.currentProcess = null;
+          }
+          this.setState('ready');
+          reject(new Error('Gemini CLI idle timeout'));
+        }, idleTimeoutMs);
+      };
+
+      const maxTimer = setTimeout(async () => {
+        console.log('[GeminiAdapter] 最大超时!');
         timeoutTriggered = true;
         const proc = this.currentProcess;
         if (proc) {
@@ -166,14 +193,16 @@ export class GeminiAdapter extends EventEmitter implements ICLIAdapter {
           this.currentProcess = null;
         }
         this.setState('ready');
-        reject(new Error('Gemini CLI timeout'));
-      }, this.config.timeout);
+        reject(new Error('Gemini CLI max timeout'));
+      }, maxTimeoutMs);
+      resetIdleTimer();
 
       this.currentProcess.stdout?.on('data', (data: Buffer) => {
         const chunk = data.toString();
         console.log('[GeminiAdapter] stdout:', chunk.substring(0, 100));
         output += chunk;
         this.emit('output', chunk);
+        if (!timeoutTriggered) resetIdleTimer();
       });
 
       this.currentProcess.stderr?.on('data', (data: Buffer) => {
@@ -181,11 +210,13 @@ export class GeminiAdapter extends EventEmitter implements ICLIAdapter {
         console.log('[GeminiAdapter] stderr:', chunk.substring(0, 100));
         output += chunk;
         this.emit('output', chunk);
+        if (!timeoutTriggered) resetIdleTimer();
       });
 
       this.currentProcess.on('close', (code) => {
         console.log('[GeminiAdapter] 进程关闭, code:', code, 'output length:', output.length);
-        clearTimeout(timeout);
+        if (idleTimer) clearTimeout(idleTimer);
+        clearTimeout(maxTimer);
         this.currentProcess = null;
 
         if (timeoutTriggered) {
@@ -213,7 +244,8 @@ export class GeminiAdapter extends EventEmitter implements ICLIAdapter {
 
       this.currentProcess.on('error', (err) => {
         console.log('[GeminiAdapter] 进程错误:', err.message);
-        clearTimeout(timeout);
+        if (idleTimer) clearTimeout(idleTimer);
+        clearTimeout(maxTimer);
         this.currentProcess = null;
 
         if (timeoutTriggered) return;
@@ -353,4 +385,3 @@ export class GeminiAdapter extends EventEmitter implements ICLIAdapter {
     };
   }
 }
-

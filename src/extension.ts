@@ -144,8 +144,12 @@ function registerCommands(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('multiCli.newSession', () => {
-      webviewProvider?.getSessionManager().createSession();
+    vscode.commands.registerCommand('multiCli.newSession', async () => {
+      if (!webviewProvider) {
+        vscode.window.showWarningMessage('MultiCLI: 面板未初始化');
+        return;
+      }
+      await webviewProvider.createNewSession();
       vscode.window.showInformationMessage('MultiCLI: 新会话已创建');
     })
   );
@@ -266,4 +270,3 @@ export async function deactivate(): Promise<void> {
     console.error('[deactivate] 清理资源时出错:', error);
   }
 }
-

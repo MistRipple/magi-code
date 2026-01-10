@@ -39,8 +39,17 @@ export interface SubTaskPlan {
 /** 编排器配置 */
 export interface OrchestratorConfig {
   timeout: number;
+  /** 空闲超时时间（毫秒） */
+  idleTimeout?: number;
+  /** 最大执行超时时间（毫秒） */
+  maxTimeout?: number;
   verification?: Partial<VerificationConfig>;
   maxRetries: number;
+  integration?: {
+    enabled?: boolean;
+    maxRounds?: number;
+    worker?: CLIType;
+  };
 }
 
 /** 编排器状态 */
@@ -56,6 +65,11 @@ export type RecoveryConfirmationCallback = (
 const DEFAULT_CONFIG: OrchestratorConfig = {
   timeout: 300000,
   maxRetries: 3,
+  integration: {
+    enabled: true,
+    maxRounds: 2,
+    worker: 'claude',
+  },
 };
 
 /**
@@ -104,6 +118,7 @@ export class IntelligentOrchestrator {
         timeout: this.config.timeout,
         maxRetries: this.config.maxRetries,
         verification: this.config.verification,
+        integration: this.config.integration,
       },
       workspaceRoot,
       snapshotManager,
@@ -249,7 +264,12 @@ export class IntelligentOrchestrator {
   private async executeAskMode(userPrompt: string, taskId: string): Promise<string> {
     console.log('[IntelligentOrchestrator] ask 模式：仅对话');
 
-    const response = await this.cliFactory.sendMessage('claude', userPrompt);
+    const response = await this.cliFactory.sendMessage(
+      'claude',
+      userPrompt,
+      undefined,
+      { source: 'orchestrator', streamToUI: true, adapterRole: 'orchestrator' }
+    );
 
     if (response.error) {
       throw new Error(response.error);
@@ -264,8 +284,22 @@ export class IntelligentOrchestrator {
   /** 取消当前任务 */
   async cancel(): Promise<void> {
     console.log('[IntelligentOrchestrator] 取消任务');
+
+    // 1. 触发 AbortController
     this.abortController?.abort();
+
+    // 2. 取消 OrchestratorAgent 中的任务
     await this.orchestratorAgent.cancel();
+
+    // 3. 停止状态更新定时器
+    this.stopStatusUpdates();
+
+    // 4. 重置状态标志（关键！）
+    this.isRunning = false;
+    this.abortController = null;
+    this.currentTaskId = null;
+
+    console.log('[IntelligentOrchestrator] 任务已取消，状态已重置');
   }
 
   /** 开始状态更新定时器 */

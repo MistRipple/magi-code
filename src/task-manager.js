@@ -40,6 +40,17 @@ class TaskManager {
             return null;
         return session.tasks.find(t => t.id === taskId) ?? null;
     }
+    /** 更新 Task 内容（非状态字段） */
+    updateTask(taskId, updates) {
+        const session = this.sessionManager.getCurrentSession();
+        if (!session)
+            return;
+        const task = session.tasks.find(t => t.id === taskId);
+        if (!task)
+            return;
+        const next = { ...task, ...updates };
+        this.sessionManager.updateTask(session.id, taskId, next);
+    }
     /** 更新 Task 状态 */
     updateTaskStatus(taskId, status) {
         const session = this.sessionManager.getCurrentSession();
@@ -56,14 +67,14 @@ class TaskManager {
         else if (status === 'completed' || status === 'failed') {
             task.completedAt = Date.now();
         }
-        else if (status === 'interrupted') {
+        else if (status === 'interrupted' || status === 'cancelled') {
             task.interruptedAt = Date.now();
         }
         this.sessionManager.updateTask(session.id, taskId, task);
         // 发布事件
         const eventType = status === 'completed' ? 'task:completed'
             : status === 'failed' ? 'task:failed'
-                : status === 'interrupted' ? 'task:interrupted'
+                : status === 'interrupted' || status === 'cancelled' ? 'task:interrupted'
                     : 'task:started';
         events_1.globalEventBus.emitEvent(eventType, { sessionId: session.id, taskId });
     }

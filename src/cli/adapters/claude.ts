@@ -80,7 +80,15 @@ export class ClaudeAdapter extends EventEmitter implements ICLIAdapter {
 
   constructor(config: Omit<AdapterConfig, 'type'>) {
     super();
-    this.config = { ...config, type: 'claude', timeout: config.timeout || 5 * 60 * 1000 };
+    const maxTimeout = config.maxTimeout ?? config.timeout ?? 5 * 60 * 1000;
+    const idleTimeout = config.idleTimeout ?? Math.min(120000, maxTimeout);
+    this.config = {
+      ...config,
+      type: 'claude',
+      timeout: maxTimeout,
+      maxTimeout,
+      idleTimeout,
+    };
   }
 
   get state(): AdapterState {
@@ -205,10 +213,29 @@ export class ClaudeAdapter extends EventEmitter implements ICLIAdapter {
 
       console.log('[ClaudeAdapter] 进程已启动, PID:', this.currentProcess.pid);
 
-      // 设置超时 - 修复：超时后等待进程退出
+      const idleTimeoutMs = this.config.idleTimeout ?? this.config.timeout ?? 5 * 60 * 1000;
+      const maxTimeoutMs = Math.max(this.config.maxTimeout ?? this.config.timeout ?? idleTimeoutMs, idleTimeoutMs);
+
+      // 设置超时 - 空闲超时 + 最大超时
       let timeoutTriggered = false;
-      const timeout = setTimeout(async () => {
-        console.log('[ClaudeAdapter] 超时!');
+      let idleTimer: NodeJS.Timeout | null = null;
+      const resetIdleTimer = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(async () => {
+          console.log('[ClaudeAdapter] 空闲超时!');
+          timeoutTriggered = true;
+          const proc = this.currentProcess;
+          if (proc) {
+            await this.killProcessWithWait(proc, 3000);
+            this.currentProcess = null;
+          }
+          this.setState('ready');
+          reject(new Error('Claude CLI idle timeout'));
+        }, idleTimeoutMs);
+      };
+
+      const maxTimer = setTimeout(async () => {
+        console.log('[ClaudeAdapter] 最大超时!');
         timeoutTriggered = true;
         const proc = this.currentProcess;
         if (proc) {
@@ -216,14 +243,16 @@ export class ClaudeAdapter extends EventEmitter implements ICLIAdapter {
           this.currentProcess = null;
         }
         this.setState('ready');
-        reject(new Error('Claude CLI timeout'));
-      }, this.config.timeout);
+        reject(new Error('Claude CLI max timeout'));
+      }, maxTimeoutMs);
+      resetIdleTimer();
 
       this.currentProcess.stdout?.on('data', (data: Buffer) => {
         const chunk = data.toString();
         console.log('[ClaudeAdapter] stdout:', chunk.substring(0, 100));
         output += chunk;
         this.emit('output', chunk);
+        if (!timeoutTriggered) resetIdleTimer();
       });
 
       this.currentProcess.stderr?.on('data', (data: Buffer) => {
@@ -231,11 +260,13 @@ export class ClaudeAdapter extends EventEmitter implements ICLIAdapter {
         console.log('[ClaudeAdapter] stderr:', chunk.substring(0, 100));
         output += chunk;
         this.emit('output', chunk);
+        if (!timeoutTriggered) resetIdleTimer();
       });
 
       this.currentProcess.on('close', (code) => {
         console.log('[ClaudeAdapter] 进程关闭, code:', code, 'output length:', output.length);
-        clearTimeout(timeout);
+        if (idleTimer) clearTimeout(idleTimer);
+        clearTimeout(maxTimer);
         this.currentProcess = null;
 
         // 如果是超时触发的关闭，不再处理（已经 reject 了）
@@ -266,7 +297,8 @@ export class ClaudeAdapter extends EventEmitter implements ICLIAdapter {
 
       this.currentProcess.on('error', (err) => {
         console.log('[ClaudeAdapter] 进程错误:', err.message);
-        clearTimeout(timeout);
+        if (idleTimer) clearTimeout(idleTimer);
+        clearTimeout(maxTimer);
         this.currentProcess = null;
 
         // 如果是超时触发的错误，不再处理
@@ -446,4 +478,3 @@ export class ClaudeAdapter extends EventEmitter implements ICLIAdapter {
     console.log('[ClaudeAdapter] 重置会话');
   }
 }
-

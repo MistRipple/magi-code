@@ -14,6 +14,8 @@ export declare class TaskManager {
     createTask(prompt: string): Task;
     /** 获取 Task */
     getTask(taskId: string): Task | null;
+    /** 更新 Task 内容（非状态字段） */
+    updateTask(taskId: string, updates: Partial<Task>): void;
     /** 更新 Task 状态 */
     updateTaskStatus(taskId: string, status: TaskStatus): void;
     /** 添加 SubTask（使用统一类型） */

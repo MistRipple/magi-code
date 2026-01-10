@@ -16,11 +16,15 @@ export interface AdapterStatus {
 export interface FactoryConfig {
     cwd: string;
     timeout?: number;
+    idleTimeout?: number;
+    maxTimeout?: number;
     env?: Record<string, string>;
 }
+export type AdapterRole = 'worker' | 'orchestrator';
 export interface AdapterOutputScope {
     source?: 'worker' | 'orchestrator' | 'system';
     streamToUI?: boolean;
+    adapterRole?: AdapterRole;
 }
 /**
  * CLI 适配器工厂
@@ -28,7 +32,10 @@ export interface AdapterOutputScope {
  */
 export declare class CLIAdapterFactory extends EventEmitter {
     private adapters;
+    private orchestratorAdapters;
     private config;
+    private outputScopes;
+    private outputMuteCounts;
     constructor(config: FactoryConfig);
     /**
      * 创建或获取适配器实例
@@ -41,7 +48,7 @@ export declare class CLIAdapterFactory extends EventEmitter {
     /**
      * 获取已创建的适配器
      */
-    getAdapter(type: CLIType): ICLIAdapter | undefined;
+    getAdapter(type: CLIType, role?: AdapterRole): ICLIAdapter | undefined;
     /**
      * 检查 CLI 是否可用（已创建且已连接）
      */
@@ -49,11 +56,11 @@ export declare class CLIAdapterFactory extends EventEmitter {
     /**
      * 获取或创建适配器
      */
-    getOrCreate(type: CLIType): ICLIAdapter;
+    getOrCreate(type: CLIType, role?: AdapterRole): ICLIAdapter;
     /**
      * 获取所有已创建的适配器
      */
-    getAllAdapters(): ICLIAdapter[];
+    getAllAdapters(role?: AdapterRole): ICLIAdapter[];
     /**
      * 获取所有适配器状态
      */
@@ -107,15 +114,15 @@ export declare class CLIAdapterFactory extends EventEmitter {
     /**
      * 获取指定 CLI 的会话 ID
      */
-    getSessionId(type: CLIType): string | null;
+    getSessionId(type: CLIType, role?: AdapterRole): string | null;
     /**
      * 设置指定 CLI 的会话 ID
      */
-    setSessionId(type: CLIType, sessionId: string | null): void;
+    setSessionId(type: CLIType, sessionId: string | null, role?: AdapterRole): void;
     /**
      * 重置指定 CLI 的会话
      */
-    resetSession(type: CLIType): void;
+    resetSession(type: CLIType, role?: AdapterRole): void;
     /**
      * 重置所有 CLI 的会话
      */
@@ -136,9 +143,14 @@ export declare class CLIAdapterFactory extends EventEmitter {
         codex?: string;
         gemini?: string;
     }): void;
+    /** 公开方法：向 CLI 面板发送编排者消息 */
+    emitOrchestratorMessageToUI(type: CLIType, message: string): void;
     /**
      * 销毁工厂，清理所有资源
      */
     dispose(): Promise<void>;
+    private createWithRole;
+    private getAdapterMap;
+    private getScopeKey;
 }
 //# sourceMappingURL=adapter-factory.d.ts.map

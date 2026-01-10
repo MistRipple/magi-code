@@ -147,8 +147,12 @@ function registerCommands(context) {
     context.subscriptions.push(vscode.commands.registerCommand('multiCli.showPanel', () => {
         vscode.commands.executeCommand('workbench.view.extension.multiCli');
     }));
-    context.subscriptions.push(vscode.commands.registerCommand('multiCli.newSession', () => {
-        webviewProvider?.getSessionManager().createSession();
+    context.subscriptions.push(vscode.commands.registerCommand('multiCli.newSession', async () => {
+        if (!webviewProvider) {
+            vscode.window.showWarningMessage('MultiCLI: 面板未初始化');
+            return;
+        }
+        await webviewProvider.createNewSession();
         vscode.window.showInformationMessage('MultiCLI: 新会话已创建');
     }));
     context.subscriptions.push(vscode.commands.registerCommand('multiCli.showStatus', async () => {

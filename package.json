@@ -89,7 +89,17 @@
         "multiCli.timeout": {
           "type": "number",
           "default": 300000,
-          "description": "CLI 执行超时时间（毫秒）"
+          "description": "CLI 最大执行超时时间（毫秒）"
+        },
+        "multiCli.idleTimeout": {
+          "type": "number",
+          "default": 120000,
+          "description": "CLI 空闲超时时间（毫秒，持续无输出才触发）"
+        },
+        "multiCli.maxTimeout": {
+          "type": "number",
+          "default": 900000,
+          "description": "CLI 最大执行超时时间（毫秒）"
         },
         "multiCli.autoSnapshot": {
           "type": "boolean",
