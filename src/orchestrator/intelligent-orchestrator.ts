@@ -18,6 +18,7 @@ import {
   ExecutionResult,
   SubTask,
   OrchestratorState,
+  QuestionCallback,
 } from './protocols/types';
 import { formatPlanForUser } from './prompts/orchestrator-prompts';
 
@@ -87,6 +88,14 @@ export class IntelligentOrchestrator {
 
   // 交互模式
   private interactionMode: InteractionMode = 'agent';
+  private readonly directAnswerKeywords = [
+    '是什么', '为什么', '怎么', '如何', '能否', '可以吗', '建议', '解释', '了解', '对比', '优缺点',
+    '方案', '思路', '总结', '概念', '原理', '问题', '是否', '推荐'
+  ];
+  private readonly taskIntentKeywords = [
+    '实现', '添加', '新增', '修改', '修复', '重构', '迁移', '集成', '优化', '部署', '测试', '生成',
+    '创建', '删除', '更新', '写', '改', '开发', '搭建', '编排', '完善'
+  ];
   private modeConfig: InteractionModeConfig = INTERACTION_MODE_CONFIGS.agent;
 
   // 验证器
@@ -165,6 +174,11 @@ export class IntelligentOrchestrator {
     this.orchestratorAgent.setConfirmationCallback(callback);
   }
 
+  /** 设置用户补充问题回调 */
+  setQuestionCallback(callback: QuestionCallback): void {
+    this.orchestratorAgent.setQuestionCallback(callback);
+  }
+
   /** 设置恢复确认回调（向后兼容） */
   setRecoveryConfirmationCallback(_callback: RecoveryConfirmationCallback): void {
     // TODO: 实现恢复确认逻辑
@@ -206,7 +220,7 @@ export class IntelligentOrchestrator {
   /**
    * 执行任务 - 主入口
    */
-  async execute(userPrompt: string, taskId: string): Promise<string> {
+  async execute(userPrompt: string, taskId: string, sessionId?: string): Promise<string> {
     if (this.isRunning) {
       throw new Error('编排器正在运行中');
     }
@@ -220,13 +234,17 @@ export class IntelligentOrchestrator {
     this.startStatusUpdates(taskId);
 
     try {
+      if (this.shouldUseAskMode(userPrompt)) {
+        return await this.executeAskMode(userPrompt, taskId, sessionId);
+      }
+
       // ask 模式：仅对话
       if (this.interactionMode === 'ask') {
-        return await this.executeAskMode(userPrompt, taskId);
+        return await this.executeAskMode(userPrompt, taskId, sessionId);
       }
 
       // agent/auto 模式：使用独立编排者执行
-      const result = await this.orchestratorAgent.execute(userPrompt, taskId);
+      const result = await this.orchestratorAgent.execute(userPrompt, taskId, sessionId);
 
       if (this.abortController?.signal.aborted) {
         this.taskManager.updateTaskStatus(taskId, 'cancelled');
@@ -261,15 +279,33 @@ export class IntelligentOrchestrator {
   }
 
   /** ask 模式：仅对话 */
-  private async executeAskMode(userPrompt: string, taskId: string): Promise<string> {
+  private async executeAskMode(userPrompt: string, taskId: string, sessionId?: string): Promise<string> {
     console.log('[IntelligentOrchestrator] ask 模式：仅对话');
+
+    const contextSessionId = sessionId || taskId;
+    const context = await this.orchestratorAgent.prepareContext(contextSessionId, userPrompt);
+    const prompt = context
+      ? `请结合以下会话上下文回答用户问题。\n\n${context}\n\n## 用户问题\n${userPrompt}`
+      : userPrompt;
+    const snapshot = context ? this.truncateSnapshot(context) : undefined;
 
     const response = await this.cliFactory.sendMessage(
       'claude',
-      userPrompt,
+      prompt,
       undefined,
-      { source: 'orchestrator', streamToUI: true, adapterRole: 'orchestrator' }
+      {
+        source: 'orchestrator',
+        streamToUI: true,
+        adapterRole: 'orchestrator',
+        messageMeta: {
+          taskId,
+          intent: 'ask',
+          contextSnapshot: snapshot,
+        },
+      }
     );
+
+    this.orchestratorAgent.recordOrchestratorTokens(response.tokenUsage);
 
     if (response.error) {
       throw new Error(response.error);
@@ -278,7 +314,37 @@ export class IntelligentOrchestrator {
     this.taskManager.updateTaskStatus(taskId, 'completed');
     globalEventBus.emitEvent('task:completed', { taskId, data: { isRunning: false } });
 
-    return response.content || '';
+    const content = response.content || '';
+    await this.orchestratorAgent.recordAssistantMessage(content);
+    return content;
+  }
+
+  private truncateSnapshot(context: string, maxChars: number = 6000): string {
+    const trimmed = context.trim();
+    if (trimmed.length <= maxChars) return trimmed;
+    return trimmed.slice(0, maxChars) + '\n...';
+  }
+
+  private shouldUseAskMode(prompt: string): boolean {
+    const trimmed = prompt.trim();
+    if (!trimmed) return true;
+    if (this.interactionMode === 'ask') return true;
+    if (trimmed.startsWith('/agent') || trimmed.startsWith('/task')) return false;
+
+    const lower = trimmed.toLowerCase();
+    if (lower.includes('```') || /[\\/].+\.\w+/.test(lower)) return false;
+
+    const hasTaskIntent = this.taskIntentKeywords.some(k => trimmed.includes(k));
+    const hasBuildVerb = /(做|制作|搭建|实现)/.test(trimmed);
+    const hasBuildTarget = /(功能|页面|模块|接口|系统|组件|服务|项目|API|后端|前端|UI|界面)/i.test(trimmed);
+    const hasStructuredTaskIntent = hasTaskIntent || (hasBuildVerb && hasBuildTarget);
+    if (hasStructuredTaskIntent) return false;
+
+    const hasQuestion = trimmed.includes('?') || trimmed.includes('？');
+    const hasDirectAnswerIntent = this.directAnswerKeywords.some(k => trimmed.includes(k));
+    const shortPrompt = trimmed.length <= 50;
+
+    return hasQuestion || hasDirectAnswerIntent || shortPrompt;
   }
 
   /** 取消当前任务 */
@@ -331,6 +397,14 @@ export class IntelligentOrchestrator {
   /** 🆕 获取执行统计摘要 */
   getStatsSummary(): string {
     return this.orchestratorAgent.getStatsSummary();
+  }
+
+  getOrchestratorTokenUsage(): { inputTokens: number; outputTokens: number } {
+    return this.orchestratorAgent.getOrchestratorTokenUsage();
+  }
+
+  resetOrchestratorTokenUsage(): void {
+    this.orchestratorAgent.resetOrchestratorTokenUsage();
   }
 
   /** 🆕 设置扩展上下文（用于持久化统计数据） */

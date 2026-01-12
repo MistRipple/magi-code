@@ -31,6 +31,7 @@ ${projectContext ? `## 项目上下文\n${projectContext}\n` : ''}
 2. 如果需要协作，应该如何分配任务？
 3. 任务之间是否有依赖关系（需要串行）还是可以并行？
 4. 是否为简单任务（无需多模型协作）？
+5. 如果是咨询/解释/方案建议等不需要执行的内容，直接给出回答
 
 ## 输出格式
 请以 JSON 格式输出执行计划：
@@ -39,6 +40,8 @@ ${projectContext ? `## 项目上下文\n${projectContext}\n` : ''}
   "analysis": "对任务的简要分析",
   "isSimpleTask": true/false,
   "skipReason": "如果是简单任务，说明跳过协作的原因",
+  "needsWorker": true/false,
+  "directResponse": "如果不需要 Worker，直接给用户的回答",
   "needsCollaboration": true/false,
   "subTasks": [
     {
@@ -266,4 +269,3 @@ export const PromptTemplates = {
   buildCodeReviewPrompt,
   formatPlanForUser,
 };
-

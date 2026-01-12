@@ -72,7 +72,9 @@ export abstract class BaseWorker extends EventEmitter {
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       globalEventBus.emitEvent('subtask:failed', {
-        taskId: subTask.taskId, subTaskId: subTask.id, data: { error: errorMessage },
+        taskId: subTask.taskId,
+        subTaskId: subTask.id,
+        data: { error: errorMessage, cli: this.cliType },
       });
       return {
         workerId: `${this.cliType}-${subTask.id}`,
@@ -111,7 +113,7 @@ export abstract class BaseWorker extends EventEmitter {
         output += chunk;
         this.outputBuffer.push(chunk);
         onOutput?.(chunk);
-        globalEventBus.emitEvent('subtask:output', { data: { output: chunk } });
+        globalEventBus.emitEvent('subtask:output', { data: { output: chunk, cliType: this.cliType } });
       });
 
       this.process.stderr?.on('data', (data: Buffer) => {

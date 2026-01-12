@@ -36,6 +36,10 @@ export interface ExecutionPlan {
   needsWorker?: boolean;
   /** 🆕 编排者直接回答的内容（当 needsWorker=false 时使用） */
   directResponse?: string;
+  /** 🆕 是否需要用户补充信息 */
+  needsUserInput?: boolean;
+  /** 🆕 需要用户回答的问题列表 */
+  questions?: string[];
   skipReason?: string;
   needsCollaboration: boolean;
   subTasks: SubTask[];
@@ -59,6 +63,8 @@ export interface ExecutionResult {
   duration: number;
   modifiedFiles?: string[];
   error?: string;
+  inputTokens?: number;
+  outputTokens?: number;
 }
 
 // ============================================================================
@@ -170,6 +176,7 @@ export type BusMessage =
 export type OrchestratorState =
   | 'idle'
   | 'analyzing'
+  | 'waiting_questions'
   | 'waiting_confirmation'
   | 'dispatching'
   | 'monitoring'
@@ -179,6 +186,9 @@ export type OrchestratorState =
   | 'summarizing'
   | 'completed'
   | 'failed';
+
+/** 用户问题回调类型 */
+export type QuestionCallback = (questions: string[], plan: ExecutionPlan) => Promise<string | null>;
 
 /** 编排者配置 */
 export interface OrchestratorConfig {
@@ -220,11 +230,21 @@ export interface OrchestratorConfig {
     maxRounds?: number;
     worker?: WorkerType;
   };
+  /** 上下文注入配置 */
+  context?: {
+    /** Worker 使用的最大 token 数 */
+    workerMaxTokens?: number;
+    /** Memory 摘要占比（0-1） */
+    workerMemoryRatio?: number;
+    /** 高风险任务额外 token */
+    workerHighRiskExtraTokens?: number;
+  };
 }
 
 /** 任务上下文 */
 export interface TaskContext {
   taskId: string;
+  sessionId?: string;
   userPrompt: string;
   plan?: ExecutionPlan;
   results: ExecutionResult[];
@@ -240,6 +260,7 @@ export type OrchestratorMessageType =
   | 'verification_result'
   | 'summary'
   | 'direct_response'  // 🆕 编排者直接回答（不需要 Worker）
+  | 'question_request'
   | 'error';
 
 /** 编排者消息（发送给前端） */
@@ -258,6 +279,8 @@ export interface OrchestratorUIMessage {
     result?: ExecutionResult;
     retryAttempt?: number;
     retryDelay?: number;
+    canRetry?: boolean;
+    questions?: string[];
   };
 }
 

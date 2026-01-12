@@ -37,12 +37,6 @@ export interface Session {
   status: SessionStatus;
   tasks: Task[];
   snapshots: FileSnapshot[];
-  /** 各 CLI 的会话 ID，用于继续对话 */
-  cliSessionIds?: {
-    claude?: string;
-    codex?: string;
-    gemini?: string;
-  };
   /** 对话消息历史 */
   messages?: SessionMessage[];
 }
@@ -404,6 +398,7 @@ export type EventType =
   | 'cli:healthCheck'
   | 'cli:error'
   | 'cli:output'
+  | 'cli:session_event'
   | 'orchestrator:waiting_confirmation'
   | 'orchestrator:phase_changed'
   | 'orchestrator:mode_changed'
@@ -412,7 +407,8 @@ export type EventType =
   | 'verification:started'
   | 'verification:completed'
   | 'recovery:started'
-  | 'recovery:completed';
+  | 'recovery:completed'
+  | 'execution:stats_updated';
 
 // 事件数据
 export interface AppEvent {
@@ -470,7 +466,6 @@ export interface ChatSession {
   messages: ChatMessage[];
   createdAt: number;
   updatedAt: number;
-  cliSessionIds?: Partial<Record<CLIType, string>>;
 }
 
 /** 聊天消息 */
@@ -499,6 +494,9 @@ export type WebviewToExtensionMessage =
   | { type: 'executeTask'; prompt: string; cli?: CLIType }
   | { type: 'interruptTask'; taskId: string }
   | { type: 'continueTask'; taskId: string; prompt: string }
+  | { type: 'login'; apiKey: string; provider?: string; remember?: boolean }
+  | { type: 'logout' }
+  | { type: 'getStatus' }
   | { type: 'pauseTask'; taskId: string }  // 🆕 暂停任务
   | { type: 'resumeTask'; taskId: string }  // 🆕 恢复任务
   | { type: 'appendMessage'; taskId: string; content: string }  // 🆕 补充内容
@@ -515,12 +513,14 @@ export type WebviewToExtensionMessage =
   | { type: 'updateSetting'; key: string; value: unknown }
   | { type: 'viewDiff'; filePath: string }
   | { type: 'confirmPlan'; confirmed: boolean }
+  | { type: 'answerQuestions'; answer: string | null }
   | { type: 'getState' }
   // 新增：交互模式相关
   | { type: 'setInteractionMode'; mode: InteractionMode }
   | { type: 'confirmRecovery'; decision: 'retry' | 'rollback' | 'continue' }
   // 🆕 执行统计相关
   | { type: 'requestExecutionStats' }
+  | { type: 'resetExecutionStats' }
   // 🆕 CLI 连接状态检测
   | { type: 'checkCliStatus' }
   // 🆕 清理所有任务
@@ -545,6 +545,9 @@ export type ExtensionToWebviewMessage =
   | { type: 'cliResponse'; cli: CLIType; content: string; error?: string; sessionId?: string | null; source?: MessageSource }
   | { type: 'streamingUpdate'; content: string; sessionId?: string | null; source?: MessageSource; cli?: CLIType }
   | { type: 'streamingComplete'; content?: string; error?: string; sessionId?: string | null; source?: MessageSource; cli?: CLIType }
+  | { type: 'loginSuccess' }
+  | { type: 'loginError'; message: string }
+  | { type: 'authStatus'; loggedIn: boolean }
   | { type: 'toast'; message: string; toastType?: 'success' | 'error' | 'warning' | 'info'; duration?: number }
   | { type: 'sessionCreated'; session: Session }
   | { type: 'sessionSwitched'; sessionId: string }
@@ -565,7 +568,7 @@ export type ExtensionToWebviewMessage =
   | { type: 'taskPaused'; taskId: string }
   | { type: 'taskResumed'; taskId: string }
   // 🆕 执行统计相关消息
-  | { type: 'executionStatsUpdate'; stats: CLIExecutionStats[] }
+  | { type: 'executionStatsUpdate'; stats: CLIExecutionStats[]; orchestratorStats?: { totalTasks: number; totalSuccess: number; totalFailed: number; totalInputTokens: number; totalOutputTokens: number } }
   | { type: 'cliFallbackNotice'; originalCli: CLIType; fallbackCli: CLIType; reason: string }
   // 🆕 Prompt 增强测试结果
   | { type: 'promptEnhanceResult'; success: boolean; message: string }

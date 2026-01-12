@@ -4,10 +4,12 @@
  */
 
 import { EventEmitter } from 'events';
-import { ICLIAdapter, CLIType, AdapterConfig, CLIResponse, CLI_CAPABILITIES } from './types';
+import { ICLIAdapter, CLIType, AdapterConfig, CLIResponse, CLI_CAPABILITIES, AdapterMessageMeta } from './types';
 import { ClaudeAdapter } from './adapters/claude';
 import { CodexAdapter } from './adapters/codex';
 import { GeminiAdapter } from './adapters/gemini';
+import { SessionManager } from './session/session-manager';
+import { globalEventBus } from '../events';
 
 /** 适配器状态信息 */
 export interface AdapterStatus {
@@ -24,6 +26,8 @@ export interface FactoryConfig {
   timeout?: number;
   idleTimeout?: number;
   maxTimeout?: number;
+  maxOutputChars?: number;
+  cliPaths?: Partial<Record<CLIType, string>>;
   env?: Record<string, string>;
 }
 
@@ -33,6 +37,7 @@ export interface AdapterOutputScope {
   source?: 'worker' | 'orchestrator' | 'system';
   streamToUI?: boolean;
   adapterRole?: AdapterRole;
+  messageMeta?: AdapterMessageMeta;
 }
 
 /**
@@ -43,12 +48,23 @@ export class CLIAdapterFactory extends EventEmitter {
   private adapters: Map<CLIType, ICLIAdapter> = new Map();
   private orchestratorAdapters: Map<CLIType, ICLIAdapter> = new Map();
   private config: FactoryConfig;
+  private sessionManager: SessionManager;
   private outputScopes: Map<string, AdapterOutputScope> = new Map();
   private outputMuteCounts: Map<string, number> = new Map();
 
   constructor(config: FactoryConfig) {
     super();
     this.config = config;
+    this.sessionManager = new SessionManager({
+      cwd: config.cwd,
+      env: config.env,
+      idleTimeoutMs: config.idleTimeout,
+      maxOutputChars: config.maxOutputChars,
+      commandOverrides: config.cliPaths,
+    });
+    this.sessionManager.on('sessionEvent', (event) => {
+      globalEventBus.emitEvent('cli:session_event', { data: event });
+    });
   }
 
   /**
@@ -234,36 +250,7 @@ export class CLIAdapterFactory extends EventEmitter {
     }
 
     try {
-      // 判断是否需要预处理图片
-      if (hasImages) {
-        const needsImageDescription = this.shouldDescribeImages(type, adapter);
-        console.log(`[CLIAdapterFactory] needsImageDescription=${needsImageDescription}`);
-
-        if (needsImageDescription) {
-          console.log(`[CLIAdapterFactory] 目标 CLI ${type} 需要图片描述，使用 Codex 预处理`);
-          try {
-            const imageDescription = await CodexAdapter.describeImages(imagePaths, this.config.cwd);
-            console.log(`[CLIAdapterFactory] 图片描述结果: "${imageDescription}"`);
-            // 将图片描述附加到消息中
-            const enhancedMessage = `${message}
-
-[图片内容描述]
-${imageDescription}`;
-            console.log(`[CLIAdapterFactory] 图片描述完成，增强后的消息长度: ${enhancedMessage.length}`);
-            return adapter.sendMessage(enhancedMessage);
-          } catch (error) {
-            console.error('[CLIAdapterFactory] 图片描述失败:', error);
-            // 图片描述失败时，仍然发送原始消息，但附加提示
-            const fallbackMessage = `${message}
-
-[注意: 图片处理失败，请用户重新描述图片内容]`;
-            return adapter.sendMessage(fallbackMessage);
-          }
-        }
-      }
-
-      // 直接发送（支持图片的 CLI 或无图片）
-      return adapter.sendMessage(message, imagePaths);
+      return adapter.sendMessage(message, imagePaths, options?.messageMeta);
     } finally {
       if (scope) {
         this.outputScopes.delete(scopeKey);
@@ -277,33 +264,6 @@ ${imageDescription}`;
         }
       }
     }
-  }
-
-  /**
-   * 判断是否需要用 Codex 描述图片
-   * @returns true 如果需要描述图片
-   */
-  private shouldDescribeImages(type: CLIType, _adapter: ICLIAdapter): boolean {
-    const capabilities = CLI_CAPABILITIES[type];
-
-    // 1. 如果目标 CLI 不支持图片，需要描述
-    if (!capabilities.supportsImage) {
-      console.log(`[CLIAdapterFactory] ${type} 不支持图片`);
-      return true;
-    }
-
-    // 2. 如果是 Codex 且处于会话恢复模式（有 sessionId），需要描述
-    //    因为 exec resume 不支持 -i 参数
-    if (type === 'codex') {
-      const sessionId = this.getSessionId('codex');
-      if (sessionId) {
-        console.log(`[CLIAdapterFactory] Codex 处于会话恢复模式，需要描述图片`);
-        return true;
-      }
-    }
-
-    // 3. 其他情况，直接传递图片
-    return false;
   }
 
   /**
@@ -350,45 +310,45 @@ ${imageDescription}`;
       const taskMatch = message.match(/(?:任务描述|Task|描述)[：:]\s*(.+)/i);
       const filesMatch = message.match(/(?:目标文件|Target files|文件)[：:]\s*(.+)/i);
 
-      let summary = '<span class="orchestrator-badge task-assign">Task</span>\n';
+    let summary = '[TASK]\n';
       if (taskMatch) summary += `${taskMatch[1].trim()}\n`;
       if (filesMatch) summary += `目标文件: ${filesMatch[1].trim()}\n`;
 
-      if (summary === '<span class="orchestrator-badge task-assign">Task</span>\n') {
-        summary += lines.slice(0, 3).join('\n');
-      }
-      return summary;
+    if (summary === '[TASK]\n') {
+      summary += lines.slice(0, 3).join('\n');
     }
+    return summary;
+  }
 
     // 检测自检请求
     if (message.includes('自检') || message.includes('self-check') || message.includes('检查是否满足')) {
-      return '<span class="orchestrator-badge self-check">Self Check</span>\n请检查刚才完成的任务是否满足要求...';
+      return '[SELF CHECK]\n请检查刚才完成的任务是否满足要求...';
     }
 
     // 检测互检请求
     if (message.includes('互检') || message.includes('peer review') || message.includes('审查')) {
-      return '<span class="orchestrator-badge peer-review">Peer Review</span>\n请审查另一个代理完成的任务...';
+      return '[PEER REVIEW]\n请审查另一个代理完成的任务...';
     }
 
     // 检测修复请求
     if (message.includes('修复') || message.includes('fix') || message.includes('问题')) {
-      return '<span class="orchestrator-badge fix-request">Fix</span>\n请修复之前发现的问题...';
+      return '[FIX]\n请修复之前发现的问题...';
     }
 
     // 检测分析请求
     if (message.includes('分析') || message.includes('analyze')) {
-      return '<span class="orchestrator-badge analyze">Analyze</span>\n请分析任务并生成执行计划...';
+      return '[ANALYZE]\n请分析任务并生成执行计划...';
     }
 
     // 检测总结请求
     if (message.includes('总结') || message.includes('summary') || message.includes('汇总')) {
-      return '<span class="orchestrator-badge summary">Summary</span>\n请汇总执行结果...';
+      return '[SUMMARY]\n请汇总执行结果...';
     }
 
     // 默认：显示消息的前几行
     const preview = lines.slice(0, 5).join('\n');
     const truncated = lines.length > 5 ? '\n...' : '';
-    return `<span class="orchestrator-badge default">Message</span>\n${preview}${truncated}`;
+    return `[MESSAGE]\n${preview}${truncated}`;
   }
 
   /**
@@ -400,63 +360,10 @@ ${imageDescription}`;
   }
 
   /**
-   * 获取指定 CLI 的会话 ID
-   */
-  getSessionId(type: CLIType, role: AdapterRole = 'worker'): string | null {
-    const adapter = this.getAdapter(type, role);
-    if (adapter && 'getSessionId' in adapter && typeof adapter.getSessionId === 'function') {
-      return (adapter as { getSessionId: () => string | null }).getSessionId();
-    }
-    return null;
-  }
-
-  /**
-   * 设置指定 CLI 的会话 ID
-   */
-  setSessionId(type: CLIType, sessionId: string | null, role: AdapterRole = 'worker'): void {
-    const adapter = this.getAdapter(type, role);
-    if (adapter && 'setSessionId' in adapter && typeof adapter.setSessionId === 'function') {
-      (adapter as { setSessionId: (id: string | null) => void }).setSessionId(sessionId);
-    }
-  }
-
-  /**
-   * 重置指定 CLI 的会话
-   */
-  resetSession(type: CLIType, role: AdapterRole = 'worker'): void {
-    const adapter = this.getAdapter(type, role);
-    if (adapter && 'resetSession' in adapter && typeof adapter.resetSession === 'function') {
-      (adapter as { resetSession: () => void }).resetSession();
-    }
-  }
-
-  /**
    * 重置所有 CLI 的会话
    */
-  resetAllSessions(): void {
-    const types: CLIType[] = ['claude', 'codex', 'gemini'];
-    types.forEach(type => this.resetSession(type, 'worker'));
-    types.forEach(type => this.resetSession(type, 'orchestrator'));
-  }
-
-  /**
-   * 获取所有 CLI 的会话 ID
-   */
-  getAllSessionIds(): { claude?: string; codex?: string; gemini?: string } {
-    return {
-      claude: this.getSessionId('claude') ?? undefined,
-      codex: this.getSessionId('codex') ?? undefined,
-      gemini: this.getSessionId('gemini') ?? undefined,
-    };
-  }
-
-  /**
-   * 设置所有 CLI 的会话 ID
-   */
-  setAllSessionIds(sessionIds: { claude?: string; codex?: string; gemini?: string }): void {
-    if (sessionIds.claude !== undefined) this.setSessionId('claude', sessionIds.claude);
-    if (sessionIds.codex !== undefined) this.setSessionId('codex', sessionIds.codex);
-    if (sessionIds.gemini !== undefined) this.setSessionId('gemini', sessionIds.gemini);
+  async resetAllSessions(): Promise<void> {
+    await this.sessionManager.stopAll();
   }
 
   /**
@@ -464,6 +371,7 @@ ${imageDescription}`;
    */
   async dispose(): Promise<void> {
     await this.disconnectAll();
+    await this.sessionManager.stopAll();
     this.adapters.clear();
     this.orchestratorAdapters.clear();
     this.removeAllListeners();
@@ -487,13 +395,25 @@ ${imageDescription}`;
     let adapter: ICLIAdapter;
     switch (type) {
       case 'claude':
-        adapter = new ClaudeAdapter(adapterConfig);
+        adapter = new ClaudeAdapter({
+          ...adapterConfig,
+          role,
+          sessionManager: this.sessionManager,
+        });
         break;
       case 'codex':
-        adapter = new CodexAdapter(adapterConfig);
+        adapter = new CodexAdapter({
+          ...adapterConfig,
+          role,
+          sessionManager: this.sessionManager,
+        });
         break;
       case 'gemini':
-        adapter = new GeminiAdapter(adapterConfig);
+        adapter = new GeminiAdapter({
+          ...adapterConfig,
+          role,
+          sessionManager: this.sessionManager,
+        });
         break;
       default:
         throw new Error(`Unknown CLI type: ${type}`);

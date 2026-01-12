@@ -3,8 +3,9 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src {{cspSource}} 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src {{cspSource}} 'unsafe-inline'; script-src {{cspSource}} 'unsafe-inline'; img-src data: blob:;">
   <title>MultiCLI</title>
+  <link rel="stylesheet" href="styles.css">
   <style>
     /* 设计系统变量 */
     :root {
@@ -90,13 +91,10 @@
     .cli-cap-icon.inactive { opacity: 0.2; }
     .bottom-tab:hover .cli-cap-icon { opacity: 0.9; }
 
-    /* 交互模式选择器 */
-    .mode-selector { display: flex; align-items: center; gap: 2px; background: var(--vscode-input-background); border-radius: var(--radius-2); padding: 2px; margin-right: var(--spacing-2); }
-    .mode-btn { padding: 4px 8px; font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); cursor: pointer; border-radius: var(--radius-1); background: transparent; border: none; transition: all var(--transition-fast); display: flex; align-items: center; gap: 4px; }
-    .mode-btn:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
-    .mode-btn.active { color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
-    .mode-btn svg { width: 12px; height: 12px; fill: currentColor; }
-    .mode-btn .mode-label { font-weight: 500; }
+    /* 交互模式选择器（下拉框） */
+    .mode-selector { padding: 4px 8px; font-size: var(--font-size-1); background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); border-radius: var(--radius-1); cursor: pointer; outline: none; min-width: 70px; }
+    .mode-selector:hover { border-color: var(--vscode-focusBorder); }
+    .mode-selector:focus { border-color: var(--vscode-focusBorder); }
 
     /* 模式指示器 */
     .mode-indicator { display: flex; align-items: center; gap: 4px; font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); padding: 2px 6px; border-radius: var(--radius-1); background: var(--vscode-badge-background); }
@@ -124,11 +122,9 @@
     .recovery-btn.continue { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
     .recovery-btn:hover { opacity: 0.9; }
 
-    /* 执行计划确认对话框 */
-    .plan-confirmation { display: none; flex-direction: column; gap: var(--spacing-3); padding: var(--spacing-4); background: var(--vscode-editor-background); border: 1px solid var(--vscode-focusBorder); border-radius: var(--radius-3); margin: var(--spacing-3); box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15); }
-    .plan-confirmation.visible { display: flex; }
+    /* 执行计划确认对话框 - 已移除弹窗，保留内联卡片样式 */
     .plan-confirmation-header { display: flex; align-items: center; gap: 8px; font-size: var(--font-size-3); font-weight: 600; color: var(--vscode-foreground); }
-    .plan-confirmation-header svg { width: 18px; height: 18px; fill: var(--vscode-button-background); }
+    .plan-confirmation-header svg { width: 14px; height: 14px; fill: var(--vscode-button-background); }
     .plan-confirmation-content { font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); background: var(--vscode-input-background); padding: var(--spacing-3); border-radius: var(--radius-2); max-height: 300px; overflow-y: auto; white-space: pre-wrap; line-height: 1.5; }
     .plan-confirmation-content h2 { font-size: var(--font-size-3); color: var(--vscode-foreground); margin: 0 0 var(--spacing-2) 0; }
     .plan-confirmation-content strong { color: var(--vscode-foreground); }
@@ -136,30 +132,12 @@
     .plan-confirm-btn { padding: 8px 16px; font-size: var(--font-size-2); font-weight: 500; border-radius: var(--radius-2); border: none; cursor: pointer; transition: all var(--transition-fast); display: flex; align-items: center; gap: 6px; }
     .plan-confirm-btn.confirm { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
     .plan-confirm-btn.confirm:hover { background: var(--vscode-button-hoverBackground); }
+    .settings-section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--spacing-2); }
+    .settings-btn { border: none; border-radius: var(--radius-2); padding: 6px 12px; cursor: pointer; background: var(--vscode-button-background); color: var(--vscode-button-foreground); font-size: var(--font-size-2); }
+    .settings-btn.secondary { background: var(--vscode-button-secondaryBackground, var(--vscode-button-background)); }
+    .settings-btn.secondary:hover { background: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-hoverBackground)); }
     .plan-confirm-btn.cancel { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
     .plan-confirm-btn.cancel:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
-
-    /* 固定位置模态对话框 */
-    .plan-modal-container { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; }
-    .plan-modal-overlay { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.5); }
-    .plan-modal-dialog { position: relative; width: 90%; max-width: 500px; max-height: 80vh; background: var(--vscode-editor-background); border: 1px solid var(--vscode-focusBorder); border-radius: var(--radius-3); box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3); display: flex; flex-direction: column; overflow: hidden; }
-    .plan-modal-header { display: flex; align-items: center; gap: 8px; padding: var(--spacing-3); background: var(--vscode-sideBar-background); border-bottom: 1px solid var(--vscode-panel-border); }
-    .plan-modal-header svg { width: 18px; height: 18px; fill: var(--vscode-button-background); }
-    .plan-modal-title { font-weight: 600; flex: 1; }
-    .plan-modal-time { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
-    .plan-modal-content { flex: 1; padding: var(--spacing-3); overflow-y: auto; font-size: var(--font-size-2); line-height: 1.6; max-height: 400px; }
-    .plan-modal-content h2 { font-size: var(--font-size-3); margin: 0 0 var(--spacing-2) 0; color: var(--vscode-foreground); }
-    .plan-modal-content h3 { font-size: var(--font-size-2); margin: var(--spacing-2) 0 var(--spacing-1) 0; color: var(--vscode-foreground); }
-    .plan-modal-content strong { color: var(--vscode-foreground); }
-    .plan-modal-content ul { margin: var(--spacing-1) 0; padding-left: var(--spacing-4); }
-    .plan-modal-content li { margin: var(--spacing-1) 0; }
-    .plan-modal-actions { display: flex; gap: var(--spacing-2); justify-content: flex-end; padding: var(--spacing-3); border-top: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); }
-    .plan-modal-btn { padding: 8px 16px; font-size: var(--font-size-2); font-weight: 500; border-radius: var(--radius-2); border: none; cursor: pointer; transition: all var(--transition-fast); display: flex; align-items: center; gap: 6px; }
-    .plan-modal-btn svg { width: 14px; height: 14px; fill: currentColor; }
-    .plan-modal-btn.confirm { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-    .plan-modal-btn.confirm:hover { background: var(--vscode-button-hoverBackground); }
-    .plan-modal-btn.cancel { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
-    .plan-modal-btn.cancel:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
 
     /* 错误消息卡片 */
     .error-message-card { background: var(--vscode-inputValidation-errorBackground, rgba(255, 0, 0, 0.1)); border: 1px solid var(--vscode-inputValidation-errorBorder, #f44336); border-radius: var(--radius-3); margin: var(--spacing-2) 0; overflow: hidden; width: 100%; box-sizing: border-box; }
@@ -208,9 +186,10 @@
 
     /* 执行计划确认卡片（内联在消息流中） */
     .plan-confirmation-card { background: var(--vscode-editor-background); border: 2px solid var(--vscode-focusBorder); border-radius: var(--radius-3); margin: var(--spacing-2) 0; overflow: hidden; width: 100%; box-sizing: border-box; }
-    .plan-confirmation-card.pending { border-color: var(--vscode-charts-yellow); }
+    .plan-confirmation-card.pending { border-color: var(--vscode-charts-yellow); animation: plan-pulse 2s ease-in-out infinite; }
     .plan-confirmation-card.confirmed { border-color: var(--vscode-charts-green); opacity: 0.8; }
     .plan-confirmation-card.cancelled { border-color: var(--vscode-charts-red); opacity: 0.6; }
+    @keyframes plan-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(255, 193, 7, 0.4); } 50% { box-shadow: 0 0 12px 4px rgba(255, 193, 7, 0.3); } }
     .plan-confirmation-card .plan-confirmation-header { display: flex; align-items: center; gap: 8px; padding: var(--spacing-3); background: var(--vscode-sideBar-background); border-bottom: 1px solid var(--vscode-panel-border); }
     .plan-confirmation-card .plan-confirmation-title { font-weight: 600; flex: 1; }
     .plan-confirmation-card .plan-confirmation-status { font-size: var(--font-size-1); padding: 2px 8px; border-radius: var(--radius-1); }
@@ -221,6 +200,30 @@
     .plan-confirmation-card .plan-confirmation-content { padding: var(--spacing-3); max-height: 250px; overflow-y: auto; font-size: var(--font-size-2); line-height: 1.5; }
     .plan-confirmation-card .plan-confirmation-actions { display: flex; gap: var(--spacing-2); justify-content: flex-end; padding: var(--spacing-3); border-top: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); }
     .plan-confirm-btn svg { width: 14px; height: 14px; fill: currentColor; }
+
+    .question-card { background: var(--vscode-editor-background); border: 2px solid var(--vscode-focusBorder); border-radius: var(--radius-3); margin: var(--spacing-2) 0; overflow: hidden; width: 100%; box-sizing: border-box; }
+    .question-card.pending { border-color: var(--vscode-charts-yellow); animation: plan-pulse 2s ease-in-out infinite; }
+    .question-card.answered { border-color: var(--vscode-charts-green); opacity: 0.85; }
+    .question-card.cancelled { border-color: var(--vscode-charts-red); opacity: 0.6; }
+    .question-card .question-header { display: flex; align-items: center; gap: 8px; padding: var(--spacing-3); background: var(--vscode-sideBar-background); border-bottom: 1px solid var(--vscode-panel-border); }
+    .question-card .question-header svg { width: 14px; height: 14px; fill: currentColor; }
+    .question-card .question-title { font-weight: 600; flex: 1; }
+    .question-card .question-status { font-size: var(--font-size-1); padding: 2px 8px; border-radius: var(--radius-1); }
+    .question-card .question-status.pending { background: var(--vscode-charts-yellow); color: #000; }
+    .question-card .question-status.answered { background: var(--vscode-charts-green); color: #fff; }
+    .question-card .question-status.cancelled { background: var(--vscode-charts-red); color: #fff; }
+    .question-card .question-time { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .question-card .question-content { padding: var(--spacing-3); font-size: var(--font-size-2); line-height: 1.5; }
+    .question-card .question-list { margin: 0; padding-left: 16px; color: var(--vscode-foreground); }
+    .question-card .question-answer { width: 100%; box-sizing: border-box; margin-top: var(--spacing-2); padding: var(--spacing-2); border-radius: var(--radius-2); border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); min-height: 80px; resize: vertical; }
+    .question-card .question-answer-display { margin-top: var(--spacing-2); padding: var(--spacing-2); border-radius: var(--radius-2); border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); white-space: pre-wrap; }
+    .question-card .question-hint { margin-top: var(--spacing-2); font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .question-card .question-actions { display: flex; gap: var(--spacing-2); justify-content: flex-end; padding: var(--spacing-3); border-top: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); }
+    .question-card .question-btn { padding: 8px 16px; font-size: var(--font-size-2); font-weight: 500; border-radius: var(--radius-2); border: none; cursor: pointer; transition: all var(--transition-fast); display: inline-flex; align-items: center; gap: 6px; }
+    .question-card .question-btn.submit { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    .question-card .question-btn.submit:hover { background: var(--vscode-button-hoverBackground); }
+    .question-card .question-btn.cancel { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
+    .question-card .question-btn.cancel:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
 
     /* 阶段进度指示器 */
     .phase-indicator { display: none; padding: var(--spacing-3); background: var(--vscode-editor-background); border-bottom: 1px solid var(--vscode-panel-border); }
@@ -354,15 +357,16 @@
     /* 消息容器 - 基础样式 */
     .message {
       display: flex;
-      gap: 6px;
-      padding: 6px 10px;
+      gap: 4px;
+      padding: 2px 8px;
       animation: msgFadeIn 0.2s ease;
       max-width: 100%;
     }
+    .message + .message { margin-top: 0; }
     .message.streaming { animation: none; }
     @keyframes msgFadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
-    /* 用户消息 - 右对齐，带气泡 */
+    /* 用户消息 - 右对齐，带气泡，宽度自适应 */
     .message.user-message {
       flex-direction: row-reverse;
       justify-content: flex-start;
@@ -370,13 +374,14 @@
     .message.user-message .message-body {
       align-items: flex-end;
       max-width: 85%;
-      width: 100%;
+      width: auto;
     }
     .message.user-message .message-content {
       background: var(--vscode-button-background);
       color: var(--vscode-button-foreground);
       padding: 8px 12px;
       border-radius: 16px 16px 4px 16px;
+      width: fit-content;
       max-width: 100%;
     }
     .message.user-message .message-header {
@@ -403,12 +408,12 @@
     }
 
     /* 消息主体 */
-    .message-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; width: 100%; }
+    .message-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; width: 100%; }
 
     /* 消息分组样式 - 连续同源消息只显示第一条的头部 */
     .message.grouped {
       margin-top: 0;
-      padding-top: 2px;
+      padding-top: 0;
     }
     .message.grouped .message-header {
       display: none;
@@ -544,7 +549,7 @@
     .message-content.markdown-rendered > *:last-child { margin-bottom: 0; }
     .message-content.markdown-rendered p {
       white-space: pre-line;
-      margin: 4px 0;
+      margin: 0;
       line-height: 150%;
       word-break: break-word;
     }
@@ -561,7 +566,7 @@
     .task-card-body .markdown-rendered p,
     .summary-content .markdown-rendered p {
       white-space: pre-line;
-      margin: 8px 0;
+      margin: 0;
       line-height: 150%;
       word-break: break-word;
     }
@@ -575,7 +580,7 @@
     .message-content.markdown-rendered h4 {
       font-weight: 600;
       line-height: 150%;
-      margin: 12px 0 8px 0;
+      margin: 8px 0 4px 0;
     }
     .message-content.markdown-rendered h1 { font-size: 1.125em; }
     .message-content.markdown-rendered h2 { font-size: 1em; }
@@ -584,12 +589,12 @@
     .message-content.markdown-rendered strong { font-weight: 600; }
     .message-content.markdown-rendered ul,
     .message-content.markdown-rendered ol {
-      margin: 8px 0;
-      padding-left: 24px;
+      margin: 6px 0;
+      padding-left: 22px;
       line-height: 150%;
     }
     .message-content.markdown-rendered li {
-      margin: 4px 0;
+      margin: 2px 0;
       line-height: 150%;
     }
     .message-content.markdown-rendered li > ul,
@@ -598,7 +603,7 @@
       padding-bottom: 4px;
     }
     .message-content.markdown-rendered blockquote {
-      margin: 8px 0;
+      margin: 6px 0;
       padding: 8px 12px;
       border-left: 3px solid var(--vscode-textLink-foreground);
       background: var(--vscode-sideBar-background);
@@ -778,6 +783,8 @@
       border-radius: 50%;
       animation: thinkingBounce 1.4s ease-in-out infinite;
     }
+    .thinking-elapsed { margin-left: 6px; font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .message-streaming-hint { margin-top: 2px; font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
     .thinking-indicator .dot:nth-child(1) { animation-delay: 0s; }
     .thinking-indicator .dot:nth-child(2) { animation-delay: 0.2s; }
     .thinking-indicator .dot:nth-child(3) { animation-delay: 0.4s; }
@@ -850,15 +857,55 @@
       white-space: normal;
     }
     .collapsible-body.markdown-rendered p {
-      margin: 4px 0;
-      white-space: pre-wrap;
+      margin: 0;
+      white-space: pre-line;
     }
     .collapsible-body.markdown-rendered .markdown-code-block {
       margin: 8px 0;
     }
+    .collapsible-body.markdown-rendered ul,
+    .collapsible-body.markdown-rendered ol {
+      margin: 6px 0;
+      padding-left: 20px;
+      line-height: 150%;
+    }
+    .collapsible-body.markdown-rendered li {
+      margin: 2px 0;
+      line-height: 150%;
+    }
+    .collapsible-body.markdown-rendered blockquote {
+      margin: 6px 0;
+      padding: 6px 10px;
+      border-left: 3px solid var(--vscode-textLink-foreground);
+      background: var(--vscode-sideBar-background);
+      border-radius: 0 4px 4px 0;
+    }
     /* 工具调用面板特殊样式 */
     .collapsible-panel.tool-call .collapsible-title { color: var(--vscode-textLink-foreground); }
     .collapsible-panel.thinking .collapsible-title { color: var(--vscode-descriptionForeground); }
+    .tool-track { margin-top: 2px; display: flex; flex-direction: column; gap: 4px; width: 100%; }
+    .tool-item { width: 100%; box-sizing: border-box; }
+    .tool-item.collapsible-panel { margin: 0; }
+    .tool-item .collapsible-header { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; padding-left: 8px; }
+    .tool-name { font-size: var(--font-size-2); font-weight: 600; display: flex; align-items: center; gap: 6px; }
+    .tool-name svg { flex-shrink: 0; opacity: 0.7; }
+    .tool-status { font-size: 11px; padding: 2px 6px; border-radius: 999px; background: rgba(128,128,128,0.12); }
+    .tool-status.running { background: rgba(59,130,246,0.15); color: #3b82f6; }
+    .tool-status.completed { background: rgba(16,185,129,0.15); color: #10b981; }
+    .tool-status.failed { background: rgba(239,68,68,0.15); color: #ef4444; }
+    .collapsible-body.tool-body { white-space: pre-wrap; }
+    .tool-raw {
+      margin: 0;
+      padding: 10px 12px;
+      background: var(--vscode-editor-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: var(--radius-2);
+      font-family: var(--vscode-editor-font-family), monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }
+    .tool-text { font-size: 12px; line-height: 1.5; color: var(--vscode-foreground); }
 
     /* 重连状态提示 */
     .reconnect-indicator {
@@ -962,6 +1009,9 @@
     .cli-msg { margin-bottom: var(--spacing-3); display: flex; flex-direction: column; animation: fadeIn 0.2s ease; }
     .cli-msg.streaming { animation: none; }
     .cli-msg-content { font-size: var(--font-size-3); line-height: 1.6; padding: var(--spacing-3); border-radius: var(--radius-3); max-width: 85%; word-break: break-word; white-space: pre-wrap; }
+    .cli-msg-content.markdown-rendered p { margin: 0; white-space: pre-line; }
+    .cli-msg-content.markdown-rendered > *:first-child { margin-top: 0; }
+    .cli-msg-content.markdown-rendered > *:last-child { margin-bottom: 0; }
     /* 流式消息样式（无光标） */
     .cli-msg.streaming .cli-msg-content { opacity: 0.9; }
     .cli-msg-time { font-size: 10px; color: var(--vscode-descriptionForeground); margin-bottom: 4px; }
@@ -1044,9 +1094,18 @@
     .settings-panel { width: 400px; max-width: 90vw; max-height: 80vh; background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); overflow: hidden; display: flex; flex-direction: column; }
     .settings-header { display: flex; align-items: center; justify-content: space-between; padding: var(--spacing-3) var(--spacing-4); border-bottom: 1px solid var(--vscode-panel-border); }
     .settings-title { font-size: var(--font-size-3); font-weight: 600; }
+    /* 设置面板 Tab 栏 */
+    .settings-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); }
+    .settings-tab { flex: 1; padding: var(--spacing-2) var(--spacing-3); font-size: var(--font-size-2); font-weight: 500; color: var(--vscode-descriptionForeground); background: transparent; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; transition: all var(--transition-fast); position: relative; }
+    .settings-tab:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
+    .settings-tab.active { color: var(--vscode-foreground); }
+    .settings-tab.active::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: var(--vscode-focusBorder); }
+    .settings-tab svg { width: 14px; height: 14px; }
+    .settings-tab-content { display: none; flex: 1; overflow-y: auto; padding: var(--spacing-3); }
+    .settings-tab-content.active { display: block; }
     .settings-content { flex: 1; overflow-y: auto; padding: var(--spacing-3); }
     .settings-section { margin-bottom: var(--spacing-4); }
-    .settings-section-title { font-size: var(--font-size-1); font-weight: 600; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: var(--spacing-2); }
+    .settings-section-title { font-size: var(--font-size-1); font-weight: 600; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.5px; }
     .settings-item { display: flex; align-items: center; justify-content: space-between; padding: var(--spacing-2) 0; }
     .settings-item-label { font-size: var(--font-size-2); font-weight: 500; }
     .settings-item-desc { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-top: 2px; }
@@ -1100,6 +1159,14 @@
     .prompt-enhance-status.error { background: rgba(241, 76, 76, 0.15); color: #f14c4c; }
 
     /* CLI 统计面板样式 */
+    .orchestrator-stats-card { background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); padding: var(--spacing-3); margin-bottom: var(--spacing-2); }
+    .orchestrator-stats-row { display: flex; justify-content: space-between; gap: var(--spacing-2); }
+    .orchestrator-stat-item { flex: 1; text-align: center; }
+    .orchestrator-stat-label { display: block; font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-bottom: 2px; }
+    .orchestrator-stat-value { display: block; font-size: 14px; font-weight: 700; color: var(--vscode-foreground); }
+    .orchestrator-stat-value.success { color: #3dd68c; }
+    .orchestrator-stat-value.failed { color: #f14c4c; }
+    .orchestrator-stat-value.tokens { color: var(--vscode-textLink-foreground); }
     .cli-stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--spacing-2); }
     .cli-stat-card { background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); padding: var(--spacing-2); text-align: center; }
     .cli-stat-card.healthy { border-color: #3dd68c; }
@@ -1109,6 +1176,7 @@
     .cli-stat-name .health-dot.healthy { background: #3dd68c; }
     .cli-stat-name .health-dot.unhealthy { background: #f14c4c; }
     .cli-stat-rate { font-size: 18px; font-weight: 700; color: var(--vscode-foreground); }
+    .cli-stat-tokens { font-size: var(--font-size-1); color: var(--vscode-textLink-foreground); margin-top: 2px; }
     .cli-stat-rate.good { color: #3dd68c; }
     .cli-stat-rate.warning { color: #cca700; }
     .cli-stat-rate.bad { color: #f14c4c; }
@@ -1163,21 +1231,6 @@
       </div>
     </div>
     <div class="header-actions">
-      <!-- 交互模式选择器 -->
-      <div class="mode-selector" id="mode-selector">
-        <button class="mode-btn" data-mode="ask" title="对话模式：仅对话，不修改文件">
-          <svg viewBox="0 0 16 16"><path d="M14 1a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4.414A2 2 0 0 0 3 11.586l-2 2V2a1 1 0 0 1 1-1h12z"/></svg>
-          <span class="mode-label">Ask</span>
-        </button>
-        <button class="mode-btn active" data-mode="agent" title="代理模式：执行前需确认">
-          <svg viewBox="0 0 16 16"><path d="M11 6a3 3 0 1 1-6 0 3 3 0 0 1 6 0z"/><path d="M2 0a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2H2zm6.5 4.5v5.793l2.146-2.147a.5.5 0 0 1 .708.708l-3 3a.5.5 0 0 1-.708 0l-3-3a.5.5 0 1 1 .708-.708L7.5 10.293V4.5a.5.5 0 0 1 1 0z"/></svg>
-          <span class="mode-label">Agent</span>
-        </button>
-        <button class="mode-btn" data-mode="auto" title="自动模式：自动执行，失败自动回滚">
-          <svg viewBox="0 0 16 16"><path d="M11.534 7h3.932a.25.25 0 0 1 .192.41l-1.966 2.36a.25.25 0 0 1-.384 0l-1.966-2.36a.25.25 0 0 1 .192-.41zm-11 2h3.932a.25.25 0 0 0 .192-.41L2.692 6.23a.25.25 0 0 0-.384 0L.342 8.59A.25.25 0 0 0 .534 9z"/><path d="M8 3c-1.552 0-2.94.707-3.857 1.818a.5.5 0 1 1-.771-.636A6.002 6.002 0 0 1 13.917 7H12.9A5.002 5.002 0 0 0 8 3zM3.1 9a5.002 5.002 0 0 0 8.757 2.182.5.5 0 1 1 .771.636A6.002 6.002 0 0 1 2.083 9H3.1z"/></svg>
-          <span class="mode-label">Auto</span>
-        </button>
-      </div>
       <button class="icon-btn-sm" id="new-session-btn" title="新建会话">
         <svg viewBox="0 0 16 16"><path d="M8 1a.5.5 0 0 1 .5.5v6h6a.5.5 0 0 1 0 1h-6v6a.5.5 0 0 1-1 0v-6h-6a.5.5 0 0 1 0-1h6v-6A.5.5 0 0 1 8 1z"/></svg>
       </button>
@@ -1261,6 +1314,11 @@
                 <option value="codex">Codex</option>
                 <option value="gemini">Gemini</option>
               </select>
+              <select class="mode-selector" id="mode-selector" title="交互模式">
+                <option value="ask">Ask</option>
+                <option value="agent" selected>Agent</option>
+                <option value="auto">Auto</option>
+              </select>
             </div>
             <div class="input-actions-right">
               <button class="enhance-btn" id="enhance-btn" title="增强提示 (AI 优化)">
@@ -1296,11 +1354,27 @@
     <div class="settings-panel">
       <div class="settings-header">
         <span class="settings-title">设置</span>
+        <div id="logout-section" class="logout-section" style="display:none; flex-direction:row; align-items:center; gap:8px; margin-left:auto; margin-right:8px;">
+           <span id="user-info" style="font-size:12px; color:var(--vscode-descriptionForeground);"></span>
+           <button id="logout-btn" class="settings-btn secondary" style="padding:2px 8px; font-size:11px; height:24px;">退出</button>
+        </div>
         <button class="icon-btn-sm" id="settings-close-btn">
           <svg viewBox="0 0 16 16"><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg>
         </button>
       </div>
-      <div class="settings-content">
+      <!-- Tab 切换栏 -->
+      <div class="settings-tabs">
+        <button class="settings-tab active" data-tab="stats">
+          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M4 11H2v3h2v-3zm5-4H7v7h2V7zm5-5h-2v12h2V2zm-2-1a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h2a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1h-2zM6 7a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V7zm-5 4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1v-3z"/></svg>
+          统计
+        </button>
+        <button class="settings-tab" data-tab="config">
+          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 4.754a3.246 3.246 0 1 0 0 6.492 3.246 3.246 0 0 0 0-6.492zM5.754 8a2.246 2.246 0 1 1 4.492 0 2.246 2.246 0 0 1-4.492 0z"/><path d="M9.796 1.343c-.527-1.79-3.065-1.79-3.592 0l-.094.319a.873.873 0 0 1-1.255.52l-.292-.16c-1.64-.892-3.433.902-2.54 2.541l.159.292a.873.873 0 0 1-.52 1.255l-.319.094c-1.79.527-1.79 3.065 0 3.592l.319.094a.873.873 0 0 1 .52 1.255l-.16.292c-.892 1.64.901 3.434 2.541 2.54l.292-.159a.873.873 0 0 1 1.255.52l.094.319c.527 1.79 3.065 1.79 3.592 0l.094-.319a.873.873 0 0 1 1.255-.52l.292.16c1.64.893 3.434-.902 2.54-2.541l-.159-.292a.873.873 0 0 1 .52-1.255l.319-.094c1.79-.527 1.79-3.065 0-3.592l-.319-.094a.873.873 0 0 1-.52-1.255l.16-.292c.893-1.64-.902-3.433-2.541-2.54l-.292.159a.873.873 0 0 1-1.255-.52l-.094-.319zm-2.633.283c.246-.835 1.428-.835 1.674 0l.094.319a1.873 1.873 0 0 0 2.693 1.115l.291-.16c.764-.415 1.6.42 1.184 1.185l-.159.292a1.873 1.873 0 0 0 1.116 2.692l.318.094c.835.246.835 1.428 0 1.674l-.319.094a1.873 1.873 0 0 0-1.115 2.693l.16.291c.415.764-.42 1.6-1.185 1.184l-.291-.159a1.873 1.873 0 0 0-2.693 1.116l-.094.318c-.246.835-1.428.835-1.674 0l-.094-.319a1.873 1.873 0 0 0-2.692-1.115l-.292.16c-.764.415-1.6-.42-1.184-1.185l.159-.291A1.873 1.873 0 0 0 1.945 8.93l-.319-.094c-.835-.246-.835-1.428 0-1.674l.319-.094A1.873 1.873 0 0 0 3.06 4.377l-.16-.292c-.415-.764.42-1.6 1.185-1.184l.292.159a1.873 1.873 0 0 0 2.692-1.115l.094-.319z"/></svg>
+          配置
+        </button>
+      </div>
+      <!-- 统计 Tab 内容 -->
+      <div class="settings-tab-content active" id="settings-tab-stats">
         <!-- CLI 连接状态 -->
         <div class="settings-section">
           <div class="settings-section-title">CLI 连接状态</div>
@@ -1341,6 +1415,64 @@
             重新检测
           </button>
         </div>
+        <!-- CLI 执行统计 -->
+        <div class="settings-section">
+          <div class="settings-section-header">
+            <div class="settings-section-title">执行统计</div>
+            <button class="settings-btn secondary" id="stats-reset-btn">重置统计</button>
+          </div>
+          <!-- 编排者汇总统计 -->
+          <div class="orchestrator-stats-card" id="orchestrator-stats-card">
+            <div class="orchestrator-stats-row">
+              <div class="orchestrator-stat-item">
+                <span class="orchestrator-stat-label">总任务</span>
+                <span class="orchestrator-stat-value" id="orch-total-tasks">0</span>
+              </div>
+              <div class="orchestrator-stat-item">
+                <span class="orchestrator-stat-label">成功</span>
+                <span class="orchestrator-stat-value success" id="orch-success">0</span>
+              </div>
+              <div class="orchestrator-stat-item">
+                <span class="orchestrator-stat-label">失败</span>
+                <span class="orchestrator-stat-value failed" id="orch-failed">0</span>
+              </div>
+              <div class="orchestrator-stat-item">
+                <span class="orchestrator-stat-label">输入Token</span>
+                <span class="orchestrator-stat-value tokens" id="orch-input-tokens">0</span>
+              </div>
+              <div class="orchestrator-stat-item">
+                <span class="orchestrator-stat-label">输出Token</span>
+                <span class="orchestrator-stat-value tokens" id="orch-output-tokens">0</span>
+              </div>
+            </div>
+          </div>
+          <div class="cli-stats-grid" id="cli-stats-grid">
+            <div class="cli-stat-card" data-cli="claude">
+              <div class="cli-stat-name"><span class="health-dot"></span>Claude</div>
+              <div class="cli-stat-rate">--</div>
+              <div class="cli-stat-detail">0 次执行</div>
+              <div class="cli-stat-tokens">0 / 0 tokens</div>
+              <div class="cli-stat-bar"><div class="cli-stat-bar-fill" style="width: 0%"></div></div>
+            </div>
+            <div class="cli-stat-card" data-cli="codex">
+              <div class="cli-stat-name"><span class="health-dot"></span>Codex</div>
+              <div class="cli-stat-rate">--</div>
+              <div class="cli-stat-detail">0 次执行</div>
+              <div class="cli-stat-tokens">0 / 0 tokens</div>
+              <div class="cli-stat-bar"><div class="cli-stat-bar-fill" style="width: 0%"></div></div>
+            </div>
+            <div class="cli-stat-card" data-cli="gemini">
+              <div class="cli-stat-name"><span class="health-dot"></span>Gemini</div>
+              <div class="cli-stat-rate">--</div>
+              <div class="cli-stat-detail">0 次执行</div>
+              <div class="cli-stat-tokens">0 / 0 tokens</div>
+              <div class="cli-stat-bar"><div class="cli-stat-bar-fill" style="width: 0%"></div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <!-- 配置 Tab 内容 -->
+      <div class="settings-tab-content" id="settings-tab-config">
         <!-- Augment 配置 -->
         <div class="settings-section prompt-enhance-section">
           <div class="settings-section-title">Augment 配置</div>
@@ -1366,36 +1498,13 @@
             <div class="prompt-enhance-status" id="prompt-enhance-status" style="display:none"></div>
           </div>
         </div>
-        <!-- CLI 执行统计 -->
-        <div class="settings-section">
-          <div class="settings-section-title">CLI 执行统计</div>
-          <div class="cli-stats-grid" id="cli-stats-grid">
-            <div class="cli-stat-card" data-cli="claude">
-              <div class="cli-stat-name"><span class="health-dot"></span>Claude</div>
-              <div class="cli-stat-rate">--</div>
-              <div class="cli-stat-detail">0 次执行</div>
-              <div class="cli-stat-bar"><div class="cli-stat-bar-fill" style="width: 0%"></div></div>
-            </div>
-            <div class="cli-stat-card" data-cli="codex">
-              <div class="cli-stat-name"><span class="health-dot"></span>Codex</div>
-              <div class="cli-stat-rate">--</div>
-              <div class="cli-stat-detail">0 次执行</div>
-              <div class="cli-stat-bar"><div class="cli-stat-bar-fill" style="width: 0%"></div></div>
-            </div>
-            <div class="cli-stat-card" data-cli="gemini">
-              <div class="cli-stat-name"><span class="health-dot"></span>Gemini</div>
-              <div class="cli-stat-rate">--</div>
-              <div class="cli-stat-detail">0 次执行</div>
-              <div class="cli-stat-bar"><div class="cli-stat-bar-fill" style="width: 0%"></div></div>
-            </div>
-          </div>
-        </div>
       </div>
     </div>
   </div>
 
   <script>
     const vscode = acquireVsCodeApi();
+    window.vscode = vscode;
 
     // 从 VSCode 状态恢复
     const previousState = vscode.getState() || {};
@@ -1414,13 +1523,18 @@
     let currentSessionId = previousState.currentSessionId || null;
     let pendingChanges = previousState.pendingChanges || [];
     let isProcessing = previousState.isProcessing || false;  // 处理状态
+    let thinkingStartAt = previousState.thinkingStartAt || null;
+    let streamingHintTimer = null;
+    let processingActor = previousState.processingActor || { source: 'orchestrator', cli: 'claude' };
     // 滚动位置记忆：为每个 Tab 存储滚动位置
     let scrollPositions = previousState.scrollPositions || { thread: 0, claude: 0, codex: 0, gemini: 0 };
+    let autoScrollEnabled = previousState.autoScrollEnabled || { thread: true, claude: true, codex: true, gemini: true };
 
     function saveWebviewState() {
       vscode.setState({
         currentTopTab, currentBottomTab, threadMessages, cliOutputs,
-        sessions, currentSessionId, pendingChanges, isProcessing, scrollPositions
+        sessions, currentSessionId, pendingChanges, isProcessing, thinkingStartAt, processingActor, scrollPositions,
+        autoScrollEnabled
       });
     }
 
@@ -1440,6 +1554,64 @@
       }
     }
 
+    function formatElapsed(ms) {
+      const totalSec = Math.max(0, Math.floor(ms / 1000));
+      const minutes = String(Math.floor(totalSec / 60)).padStart(2, '0');
+      const seconds = String(totalSec % 60).padStart(2, '0');
+      return `${minutes}:${seconds}`;
+    }
+
+    function updateStreamingHints() {
+      const hints = document.querySelectorAll('.message-streaming-hint[data-start-at]');
+      if (!hints.length) return;
+      hints.forEach(hint => {
+        const startAt = Number(hint.dataset.startAt || '');
+        if (!startAt) return;
+        const elapsedText = formatElapsed(Date.now() - startAt);
+        const elapsedSpan = hint.querySelector('.thinking-elapsed');
+        if (elapsedSpan) {
+          elapsedSpan.textContent = `用时 ${elapsedText}`;
+        }
+      });
+    }
+
+    function startStreamingHintTimer() {
+      if (streamingHintTimer) return;
+      streamingHintTimer = setInterval(updateStreamingHints, 1000);
+      updateStreamingHints();
+    }
+
+    function stopStreamingHintTimer() {
+      if (!streamingHintTimer) return;
+      clearInterval(streamingHintTimer);
+      streamingHintTimer = null;
+    }
+
+    function setProcessingState(next) {
+      if (isProcessing === next) return;
+      isProcessing = next;
+      if (next) {
+        if (!thinkingStartAt) thinkingStartAt = Date.now();
+      } else {
+        thinkingStartAt = null;
+      }
+      updateSendButtonState();
+      saveWebviewState();
+    }
+
+    function setProcessingActor(source, cli) {
+      processingActor = {
+        source: source || 'orchestrator',
+        cli: cli || 'claude'
+      };
+      saveWebviewState();
+    }
+
+    // 恢复状态时如果正在处理，初始化计时起点
+    if (isProcessing) {
+      if (!thinkingStartAt) thinkingStartAt = Date.now();
+    }
+
     // 更新发送按钮状态
     function updateSendButtonState() {
       const btn = document.getElementById('execute-btn');
@@ -1457,20 +1629,18 @@
     function interruptCurrentOperation() {
       if (!isProcessing) return;
       vscode.postMessage({ type: 'interruptTask' });
-      isProcessing = false;
-      updateSendButtonState();
+      setProcessingState(false);
 
-      // 移除流式消息（loading 消息不再存入数组，无需移除）
-      const streamingIdx = threadMessages.findIndex(m => m.streaming);
-      if (streamingIdx !== -1) {
-        // 保留已有内容，标记为已中断
-        if (threadMessages[streamingIdx].content) {
-          threadMessages[streamingIdx].streaming = false;
-          threadMessages[streamingIdx].interrupted = true;
-        } else {
-          threadMessages.splice(streamingIdx, 1);
+      // 停止所有流式消息
+      threadMessages = threadMessages.filter(m => {
+        if (!m.streaming) return true;
+        if (m.content) {
+          m.streaming = false;
+          m.interrupted = true;
+          return true;
         }
-      }
+        return false;
+      });
 
       saveWebviewState();
       renderMainContent();
@@ -1501,6 +1671,16 @@
       }
     }
 
+    // 主对话面板渲染节流（避免高频输出造成卡顿）
+    let mainContentDebounceTimer = null;
+    function scheduleRenderMainContent() {
+      if (mainContentDebounceTimer) return;
+      mainContentDebounceTimer = setTimeout(() => {
+        mainContentDebounceTimer = null;
+        renderMainContent();
+      }, 80);
+    }
+
     // 处理来自扩展的消息
     window.addEventListener('message', event => {
       const msg = event.data;
@@ -1513,8 +1693,7 @@
 
         // 从后端状态同步 isRunning（只在变化时更新）
         if (state.isRunning !== undefined && state.isRunning !== isProcessing) {
-          isProcessing = state.isRunning;
-          updateSendButtonState();
+          setProcessingState(state.isRunning);
         }
 
         // 更新阶段指示器（不触发完整渲染）
@@ -1553,230 +1732,73 @@
               role: 'assistant',
               content: content,
               time: new Date().toLocaleTimeString().slice(0,5),
+              timestamp: Date.now(),
               streaming: false,
               source: source
             });
             cliOutputs[cli] = messages;
             saveWebviewState();
             if (currentBottomTab === cli) {
-              renderMainContent();
+              scheduleRenderMainContent();
             }
           }
           return;
         }
 
         // 处理多行输出（每行可能是一个 JSON 事件）
-        const lines = chunk.split('\n').filter(l => l.trim());
-
-        for (const line of lines) {
-          // 跳过非 JSON 行
-          if (!line.trim().startsWith('{')) {
-            if (line.includes('YOLO mode') || line.includes('Loaded cached')) continue;
-            continue;
-          }
-
-          let parsed = null;
-          try {
-            parsed = JSON.parse(line);
-          } catch { continue; }
-
-          if (!parsed) continue;
-
-          // 用户指令消息
-          if (parsed.type === 'user_prompt') {
-            messages.push({
-              role: 'user',
-              content: parsed.prompt,
-              time: parsed.time || new Date().toLocaleTimeString().slice(0,5),
-              streaming: false,
-              source: source  // 保存来源
-            });
-            messages.push({
-              role: 'assistant',
-              content: '',
-              time: new Date().toLocaleTimeString().slice(0,5),
-              streaming: true,
-              source: source  // 保存来源
-            });
-            continue;
-          }
-
-          // 获取或创建流式消息
-          let lastMsg = messages[messages.length - 1];
-          if (!lastMsg || !lastMsg.streaming) {
-            messages.push({
-              role: 'assistant',
-              content: '',
-              time: new Date().toLocaleTimeString().slice(0,5),
-              streaming: true,
-              source: source  // 保存来源
-            });
-            lastMsg = messages[messages.length - 1];
-          }
-
-          // stream-json 格式：delta 消息（Gemini/Claude）
-          if (parsed.type === 'message' && parsed.role === 'assistant' && parsed.content) {
-            lastMsg.content = (lastMsg.content || '') + parsed.content;
-            // 收到新内容，清除重连状态
-            if (lastMsg.reconnecting) {
-              lastMsg.reconnecting = false;
-              lastMsg.reconnectMessage = '';
-            }
-            continue;
-          }
-
-          // Claude stream-json 格式
-          if (parsed.type === 'assistant' && parsed.message?.content) {
-            for (const block of parsed.message.content) {
-              if (block.type === 'text' && block.text) {
-                lastMsg.content = (lastMsg.content || '') + block.text;
-                // 收到新内容，清除重连状态
-                if (lastMsg.reconnecting) {
-                  lastMsg.reconnecting = false;
-                  lastMsg.reconnectMessage = '';
-                }
-              }
-              if (block.type === 'tool_use') {
-                upsertToolCall(lastMsg, {
-                  id: block.id,
-                  name: block.name || '工具调用',
-                  input: formatToolPayload(block.input),
-                  status: 'running'
-                });
-              }
-              if (block.type === 'tool_result') {
-                upsertToolCall(lastMsg, {
-                  id: block.tool_use_id || block.id,
-                  name: block.name || '工具结果',
-                  result: formatToolPayload(block.content || block.result || block.output),
-                  status: 'completed'
-                });
-              }
-              // Claude thinking 内容解析
-              if (block.type === 'thinking' && block.thinking) {
-                if (!lastMsg.thinking) lastMsg.thinking = [];
-                lastMsg.thinking.push(block.thinking);
-              }
-            }
-            continue;
-          }
-
-          // Gemini thinking 格式（如果有）
-          if (parsed.type === 'thinking' && parsed.content) {
-            if (!lastMsg.thinking) lastMsg.thinking = [];
-            lastMsg.thinking.push(parsed.content);
-            continue;
-          }
-
-          // 通用 thinking 格式（兼容多种 CLI）
-          if (parsed.thinking) {
-            if (!lastMsg.thinking) lastMsg.thinking = [];
-            if (Array.isArray(parsed.thinking)) {
-              lastMsg.thinking.push(...parsed.thinking);
-            } else {
-              lastMsg.thinking.push(parsed.thinking);
-            }
-            continue;
-          }
-
-          // Codex JSON 格式
-          if (parsed.type === 'item.completed' && parsed.item) {
-            if (parsed.item.type === 'agent_message' && parsed.item.text) {
-              lastMsg.content = (lastMsg.content || '') + parsed.item.text;
-              // 收到新内容，清除重连状态
-              if (lastMsg.reconnecting) {
-                lastMsg.reconnecting = false;
-                lastMsg.reconnectMessage = '';
-              }
-            } else if (parsed.item.type === 'reasoning' && parsed.item.text) {
-              // 将思考内容单独存储，用于折叠面板显示
-              if (!lastMsg.thinking) lastMsg.thinking = [];
-              lastMsg.thinking.push(parsed.item.text);
-            }
-            continue;
-          }
-
-          // 通用 tool calls（OpenAI/兼容格式）
-          const toolCalls = parsed.tool_calls || parsed.toolCalls || parsed.tools;
-          if (Array.isArray(toolCalls) && toolCalls.length > 0) {
-            toolCalls.forEach(call => {
-              const fn = call.function || call.func || {};
-              upsertToolCall(lastMsg, {
-                id: call.id || call.tool_call_id,
-                name: call.name || fn.name || '工具调用',
-                input: formatToolPayload(call.input || fn.arguments || call.arguments),
-                status: call.status || 'running'
-              });
-            });
-            continue;
-          }
-
-          if (parsed.type === 'tool_call' || parsed.type === 'tool_use') {
-            upsertToolCall(lastMsg, {
-              id: parsed.id || parsed.tool_call_id,
-              name: parsed.name || parsed.tool_name || '工具调用',
-              input: formatToolPayload(parsed.input || parsed.arguments),
-              status: parsed.status || 'running'
-            });
-            continue;
-          }
-
-          if (parsed.type === 'tool_result' || parsed.type === 'tool_response') {
-            upsertToolCall(lastMsg, {
-              id: parsed.tool_call_id || parsed.id,
-              name: parsed.name || parsed.tool_name || '工具结果',
-              result: formatToolPayload(parsed.result || parsed.output || parsed.content),
-              status: 'completed'
-            });
-            continue;
-          }
-
-          // 检测断网重连状态消息 - 增强版
-          // Claude: {"type":"system","subtype":"reconnecting"} 或 error 消息
-          // Codex: {"type":"error","code":"network"} 或 {"type":"status"}
-          // Gemini: {"type":"connection"} 或 {"error":"..."}
-          const isStatusMsg = parsed.type === 'status' || parsed.type === 'connection' ||
-                              parsed.type === 'system' || parsed.type === 'error';
-          if (isStatusMsg) {
-            const statusText = parsed.status || parsed.message || parsed.text || parsed.error || '';
-            const isReconnecting = statusText.toLowerCase().includes('reconnect') ||
-                                   statusText.toLowerCase().includes('connection') ||
-                                   statusText.toLowerCase().includes('retry') ||
-                                   statusText.toLowerCase().includes('timeout') ||
-                                   statusText.toLowerCase().includes('network') ||
-                                   parsed.subtype === 'reconnecting' ||
-                                   parsed.code === 'network' ||
-                                   parsed.code === 'timeout';
-            if (isReconnecting) {
-              // 标记当前消息为重连中状态
-              lastMsg.reconnecting = true;
-              lastMsg.reconnectMessage = statusText || '正在重连...';
-              // 不结束流式状态，继续等待
-              continue;
-            }
-          }
-
-          // 最终结果
-        if (parsed.type === 'result' && (parsed.result || parsed.response)) {
-          const finalContent = parsed.result || parsed.response;
-          if (!lastMsg.content) lastMsg.content = finalContent;
-          if (lastMsg.toolCalls && lastMsg.toolCalls.length > 0) {
-            lastMsg.toolCalls.forEach(tool => {
-              if (!tool.status || tool.status === 'running') {
-                tool.status = 'completed';
-              }
-            });
-          }
-          lastMsg.streaming = false;
-          continue;
-        }
-        }
+        const parsed = appendStreamJsonChunk(cli, chunk, source);
 
         cliOutputs[cli] = messages;
 
         // CLI 面板增量更新
-        const lastCliMsg = messages[messages.length - 1];
+        let lastCliMsg = messages[messages.length - 1];
+        if (!lastCliMsg || !lastCliMsg.streaming) {
+          messages.push({
+            role: 'assistant',
+            content: '',
+            time: new Date().toLocaleTimeString().slice(0,5),
+            timestamp: Date.now(),
+            streaming: true,
+            startedAt: Date.now(),
+            source: source,
+            cli: cli
+          });
+          lastCliMsg = messages[messages.length - 1];
+        }
+        const trimmedChunk = (chunk || '').trim();
+        const likelyJson = trimmedChunk.startsWith('{') || trimmedChunk.startsWith('[');
+        if (parsed && parsed.hasJson) {
+          lastCliMsg.content = parsed.text || '';
+          if (parsed.thinking && parsed.thinking.length > 0) {
+            lastCliMsg.thinking = parsed.thinking;
+          }
+          if (parsed.toolCalls && parsed.toolCalls.length > 0) {
+            lastCliMsg.toolCalls = parsed.toolCalls;
+          }
+          if (parsed.completed) {
+            lastCliMsg.streaming = false;
+          }
+        } else if (trimmedChunk && !likelyJson) {
+          lastCliMsg.content = (lastCliMsg.content || '') + chunk;
+        }
         const hasCliContent = lastCliMsg && lastCliMsg.content && lastCliMsg.content.trim().length > 0;
+
+        // 同步到主对话窗口（Worker 输出完整展示）
+        if (source !== 'orchestrator') {
+          const threadMsg = applyThreadStreamUpdate(source, cli, parsed, trimmedChunk ? chunk : '', likelyJson);
+          const needThreadFullRender = parsed && parsed.hasJson &&
+            (threadMsg.toolCountChanged || threadMsg.thinkingCountChanged);
+          if (!needThreadFullRender && threadMsg.content) {
+            if (!updateStreamingMessage(threadMsg.streamKey, threadMsg.content)) {
+              scheduleRenderMainContent();
+            }
+          } else if (needThreadFullRender) {
+            scheduleRenderMainContent();
+            threadMsg.toolCountChanged = false;
+            threadMsg.thinkingCountChanged = false;
+          }
+          throttledSaveState();
+        }
 
         // 尝试增量更新 CLI 面板
         let cliNeedFullRender = false;
@@ -1785,41 +1807,22 @@
             cliNeedFullRender = true;
           }
         }
-
-        // 修复：为每个 CLI 维护独立的状态卡片消息（不再显示完整内容）
-        if (lastCliMsg && lastCliMsg.role === 'assistant') {
-          // 关键修复：查找该 CLI 对应的状态卡片消息
-          let cliCardIdx = threadMessages.findIndex(m => m.cliStatusCard && m.cli === cli);
-
-          const hasContent = lastCliMsg.content && lastCliMsg.content.trim().length > 0;
-
-          if (lastCliMsg.streaming && hasContent) {
-            // 提取简短描述（取内容的前 50 个字符作为描述）
-            const shortDesc = extractShortDescription(lastCliMsg.content);
-
-            if (cliCardIdx === -1) {
-              // 创建新的 CLI 状态卡片（直接添加到末尾）
-              const newCardMsg = {
-                role: 'assistant',
-                cliStatusCard: true,  // 标记为状态卡片
-                cli: cli,
-                status: 'streaming',
-                shortDesc: shortDesc,
-                time: lastCliMsg.time || new Date().toLocaleTimeString().slice(0,5),
-                streaming: true
-              };
-              threadMessages.push(newCardMsg);
-              renderMainContent();
-            } else {
-              // 更新现有状态卡片的描述
-              threadMessages[cliCardIdx].shortDesc = shortDesc;
-              // 尝试增量更新状态卡片
-              if (!updateCliStatusCard(cli, shortDesc)) {
-                renderMainContent();
-              }
-            }
+        if (lastCliMsg?.toolCallsChanged) {
+          cliNeedFullRender = true;
+        }
+        if (parsed && parsed.hasJson) {
+          const toolCount = parsed.toolCalls ? parsed.toolCalls.length : 0;
+          if (lastCliMsg.lastToolCount !== toolCount) {
+            cliNeedFullRender = true;
+            lastCliMsg.lastToolCount = toolCount;
           }
-          // 如果没有内容，保留"正在思考"动画，不做任何操作
+        }
+        if (cliNeedFullRender && currentBottomTab === cli) {
+          scheduleRenderMainContent();
+          if (lastCliMsg) {
+            lastCliMsg.renderedToolCallsVersion = lastCliMsg.toolCallsVersion || lastCliMsg.renderedToolCallsVersion;
+            lastCliMsg.toolCallsChanged = false;
+          }
         }
 
         // 使用节流保存状态，避免频繁序列化
@@ -1830,8 +1833,7 @@
       }
       else if (msg.type === 'cliResponse') {
         // 更新处理状态
-        isProcessing = false;
-        updateSendButtonState();
+        setProcessingState(false);
         // 保存消息来源
         const source = msg.source || 'worker';
 
@@ -1851,30 +1853,6 @@
           addSystemMessage('任务执行失败: ' + msg.error.substring(0, 100), 'error');
         }
 
-        // 修复：更新对应 CLI 的状态卡片为完成状态，而非添加完整内容
-        const cliCardIdx = threadMessages.findIndex(m => m.cliStatusCard && m.cli === msg.cli);
-        if (cliCardIdx !== -1) {
-          // 更新状态卡片
-          threadMessages[cliCardIdx].status = msg.error ? 'failed' : 'completed';
-          threadMessages[cliCardIdx].streaming = false;
-          threadMessages[cliCardIdx].source = source;  // 保存来源
-          threadMessages[cliCardIdx].shortDesc = msg.error
-            ? '执行失败: ' + (msg.error.substring(0, 50))
-            : extractCompletionSummary(msg.content);
-        } else if (msg.content && !msg.error) {
-          // 如果没有状态卡片且没有错误，创建一个完成状态的卡片
-          threadMessages.push({
-            role: 'assistant',
-            cliStatusCard: true,
-            cli: msg.cli,
-            status: 'completed',
-            shortDesc: extractCompletionSummary(msg.content),
-            time: new Date().toLocaleTimeString().slice(0,5),
-            streaming: false,
-            source: source  // 保存来源
-          });
-        }
-
         // 同时更新对应 CLI 的输出面板 - 标记流式消息完成
         if (msg.cli && source !== 'orchestrator') {
           const cliMessages = cliOutputs[msg.cli] || [];
@@ -1884,17 +1862,33 @@
             lastMsg.content = msg.error ? '错误: ' + msg.error : (msg.content || lastMsg.content || '(空响应)');
             lastMsg.streaming = false;
             lastMsg.source = source;  // 保存来源
+            if (lastMsg.toolCalls && lastMsg.toolCalls.length > 0) {
+              lastMsg.toolCalls.forEach(tool => {
+                if (!tool.status || tool.status === 'running') {
+                  tool.status = 'completed';
+                }
+              });
+            }
           } else if (msg.content) {
             // 如果没有流式消息，创建新的完成消息
             cliMessages.push({
               role: 'assistant',
               content: msg.content,
               time: new Date().toLocaleTimeString().slice(0,5),
+              timestamp: Date.now(),
               streaming: false,
               source: source  // 保存来源
             });
           }
           cliOutputs[msg.cli] = cliMessages;
+        }
+
+        // 同步更新主对话中的对应 Worker 流式消息
+        if (msg.cli && source !== 'orchestrator') {
+          const updated = finalizeThreadStream(source, msg.cli, msg.content, msg.error);
+          if (updated) {
+            scheduleRenderMainContent();
+          }
         }
 
         saveWebviewState();
@@ -1905,33 +1899,71 @@
           if (mainContent) mainContent.scrollTop = mainContent.scrollHeight;
         });
       }
+      else if (msg.type === 'cliSessionEvent') {
+        // 会话事件只记录日志，不展示到 CLI 面板
+      }
       else if (msg.type === 'streamingUpdate') {
-        let streamingIdx = threadMessages.findIndex(m => m.streaming);
+        // 🆕 获取消息来源信息
+        const source = msg.source || 'orchestrator';
+        const cli = msg.cli || 'claude';
+        const streamKey = getStreamKey(source, cli);
+        let streamingIdx = threadMessages.findIndex(m => m.streaming && m.streamKey === streamKey);
 
         // 优化：只有有内容时才处理
         const hasContent = msg.content && msg.content.trim().length > 0;
         if (!hasContent) return; // 无内容时保留 isProcessing 状态显示的加载动画
 
         let needFullRender = false;
-
-        // 🆕 获取消息来源信息
-        const source = msg.source || 'orchestrator';
-        const cli = msg.cli || 'claude';
+        setProcessingActor(source, cli);
+        if (source === 'orchestrator') {
+          const latency = getStreamLatency(cli);
+          if (!latency.firstSentAt && msg.sentAt) {
+            latency.firstSentAt = msg.sentAt;
+          }
+        }
+        const isOrchestratorStream = source === 'orchestrator';
+        const isAppend = Boolean(msg.append) && isOrchestratorStream;
+        const parsed = isOrchestratorStream
+          ? (isAppend ? appendStreamJsonChunk(cli, msg.content, source) : parseStreamJsonBuffer(msg.content, cli, source))
+          : { hasJson: false };
+        const nextContent = parsed && parsed.hasJson ? parsed.text : (isAppend ? null : msg.content);
 
         // loading 消息不再存入数组，直接添加或更新 streaming 消息
         if (streamingIdx === -1) {
           const newStreamingMsg = {
             role: 'assistant',
-            content: msg.content,
+            content: nextContent ?? '',
             time: new Date().toLocaleTimeString().slice(0,5),
             streaming: true,
+            startedAt: Date.now(),
             source: source,  // 🆕 保存来源
-            cli: cli         // 🆕 保存 CLI 类型
+            cli: cli,        // 🆕 保存 CLI 类型
+            streamKey: streamKey
           };
+          if (parsed && parsed.hasJson) {
+            if (parsed.thinking && parsed.thinking.length > 0) newStreamingMsg.thinking = parsed.thinking;
+            if (parsed.toolCalls && parsed.toolCalls.length > 0) newStreamingMsg.toolCalls = parsed.toolCalls;
+            const toolCount = parsed.toolCalls ? parsed.toolCalls.length : 0;
+            const thinkingCount = parsed.thinking ? parsed.thinking.length : 0;
+            newStreamingMsg.lastToolCount = toolCount;
+            newStreamingMsg.lastThinkingCount = thinkingCount;
+            needFullRender = toolCount > 0 || thinkingCount > 0;
+          }
           threadMessages.push(newStreamingMsg);
+          if (source === 'orchestrator') {
+            const latency = getStreamLatency(cli);
+            if (!latency.firstRenderAt) {
+              latency.firstRenderAt = Date.now();
+              if (latency.firstSentAt) {
+                console.log('[MultiCLI] Orchestrator stream first render latency(ms):', latency.firstRenderAt - latency.firstSentAt);
+              }
+            }
+          }
           needFullRender = true; // 新增了元素，需要完整渲染
         } else {
-          threadMessages[streamingIdx].content = msg.content;
+          if (nextContent !== null) {
+            threadMessages[streamingIdx].content = nextContent;
+          }
           // 🆕 更新来源信息（如果之前没有）
           if (!threadMessages[streamingIdx].source) {
             threadMessages[streamingIdx].source = source;
@@ -1939,72 +1971,116 @@
           if (!threadMessages[streamingIdx].cli) {
             threadMessages[streamingIdx].cli = cli;
           }
+          if (parsed && parsed.hasJson) {
+            threadMessages[streamingIdx].thinking = parsed.thinking || [];
+            threadMessages[streamingIdx].toolCalls = parsed.toolCalls || [];
+            const toolCount = parsed.toolCalls ? parsed.toolCalls.length : 0;
+            const thinkingCount = parsed.thinking ? parsed.thinking.length : 0;
+            if (threadMessages[streamingIdx].lastToolCount !== toolCount) {
+              needFullRender = true;
+              threadMessages[streamingIdx].lastToolCount = toolCount;
+            }
+            if (threadMessages[streamingIdx].lastThinkingCount !== thinkingCount) {
+              needFullRender = true;
+              threadMessages[streamingIdx].lastThinkingCount = thinkingCount;
+            }
+          }
           // 优化：尝试增量更新
-          if (!updateStreamingMessage(msg.content)) {
+          if (!needFullRender && !updateStreamingMessage(streamKey, threadMessages[streamingIdx].content || '')) {
             needFullRender = true;
           }
         }
 
         if (needFullRender) {
-          renderMainContent();
+          scheduleRenderMainContent();
         }
 
         // 使用节流保存和平滑滚动
-        throttledSaveState();
+        if (!isOrchestratorStream || !isAppend || shouldSaveStreamState()) {
+          throttledSaveState();
+        }
         smoothScrollToBottom();
       }
       else if (msg.type === 'streamingComplete') {
         const source = msg.source || 'orchestrator';
         const cli = msg.cli || 'claude';
+        if (source === 'orchestrator') {
+          const latency = getStreamLatency(cli);
+          if (!latency.firstSentAt && msg.sentAt) {
+            latency.firstSentAt = msg.sentAt;
+          }
+        }
+        const streamKey = getStreamKey(source, cli);
         const content = msg.error ? ('错误: ' + msg.error) : msg.content;
-        const streamingIdx = threadMessages.findIndex(m => m.streaming);
+        const parsed = source === 'orchestrator' && !msg.error ? parseStreamJsonBuffer(msg.content || '', cli, source) : null;
+        const streamingIdx = threadMessages.findIndex(m => m.streaming && m.streamKey === streamKey);
+        const finalContent = parsed && parsed.hasJson ? parsed.text : content;
 
         if (streamingIdx !== -1) {
-          if (content) {
-            threadMessages[streamingIdx].content = content;
+          if (finalContent) {
+            threadMessages[streamingIdx].content = finalContent;
           }
           threadMessages[streamingIdx].streaming = false;
           threadMessages[streamingIdx].source = source;
           threadMessages[streamingIdx].cli = cli;
+          threadMessages[streamingIdx].streamKey = streamKey;
+          if (parsed && parsed.hasJson) {
+            threadMessages[streamingIdx].thinking = parsed.thinking || [];
+            threadMessages[streamingIdx].toolCalls = (parsed.toolCalls || []).map(tool => {
+              if (!tool.status || tool.status === 'running') {
+                return { ...tool, status: 'completed' };
+              }
+              return tool;
+            });
+          }
           if (msg.error) {
             threadMessages[streamingIdx].type = 'error';
             threadMessages[streamingIdx].isError = true;
           }
-        } else if (content) {
+        } else if (finalContent) {
           threadMessages.push({
             role: 'assistant',
-            content: content,
+            content: finalContent,
             time: new Date().toLocaleTimeString().slice(0,5),
             streaming: false,
             source: source,
             cli: cli,
+            streamKey: streamKey,
             isError: !!msg.error,
             type: msg.error ? 'error' : undefined
           });
+          if (parsed && parsed.hasJson) {
+            const lastIdx = threadMessages.length - 1;
+            threadMessages[lastIdx].thinking = parsed.thinking || [];
+            threadMessages[lastIdx].toolCalls = (parsed.toolCalls || []).map(tool => {
+              if (!tool.status || tool.status === 'running') {
+                return { ...tool, status: 'completed' };
+              }
+              return tool;
+            });
+          }
         }
 
         saveWebviewState();
         renderMainContent();
         smoothScrollToBottom();
+        if (source === 'orchestrator') {
+          const latency = getStreamLatency(cli);
+          if (latency.firstSentAt) {
+            console.log('[MultiCLI] Orchestrator stream total latency(ms):', Date.now() - latency.firstSentAt);
+          }
+          resetStreamState(cli, source);
+        }
       }
       else if (msg.type === 'cliStatusChanged') { addSystemMessage(msg.cli + ' 状态已更新', 'info'); updateCliDots(); }
       else if (msg.type === 'cliStatusUpdate') { updateCliConnectionStatus(msg.statuses); }
       else if (msg.type === 'taskInterrupted') {
-        // 🆕 任务被中断时，更新所有运行中的状态卡片为已取消状态
-        isProcessing = false;
-        updateSendButtonState();
+        // 🆕 任务被中断时，停止所有流式消息
+        setProcessingState(false);
 
-        // 更新所有 streaming 状态的卡片为 cancelled
         let hasUpdates = false;
         threadMessages.forEach(m => {
-          if (m.cliStatusCard && m.streaming) {
-            m.status = 'cancelled';
-            m.streaming = false;
-            m.shortDesc = '已取消';
-            hasUpdates = true;
-          }
-          // 同时处理普通的 streaming 消息
-          if (m.streaming && !m.cliStatusCard) {
+          if (m.streaming) {
             m.streaming = false;
             m.interrupted = true;
             hasUpdates = true;
@@ -2066,7 +2142,7 @@
       }
       // 执行统计数据更新
       else if (msg.type === 'executionStatsUpdate') {
-        updateExecutionStats(msg.stats);
+        updateExecutionStats(msg.stats, msg.orchestratorStats);
       }
       // CLI 降级通知
       else if (msg.type === 'cliFallbackNotice') {
@@ -2075,7 +2151,7 @@
       // 新增：执行计划确认请求
       else if (msg.type === 'orchestratorMessage') {
         const messageType = msg.messageType || '';
-        if (messageType === 'worker_output' || messageType === 'plan_ready') return;
+        if (messageType === 'plan_ready' || messageType === 'question_request') return;
         if (!msg.content || !msg.content.trim()) return;
 
         const entry = {
@@ -2095,54 +2171,25 @@
         renderMainContent();
         smoothScrollToBottom();
       }
+      else if (msg.type === 'questionRequest') {
+        showQuestionRequest(msg.questions || []);
+      }
       else if (msg.type === 'confirmationRequest') {
         showPlanConfirmation(msg.plan, msg.formattedPlan);
       }
     });
 
-    // 显示执行计划确认对话框 - 改为固定位置模态对话框
-    let currentPlanData = null;  // 保存当前计划数据，用于状态持久化
-
+    // 🆕 方案A：只保留内联卡片，移除弹窗
+    // 显示执行计划确认 - 只在消息流中添加内联卡片
     function showPlanConfirmation(plan, formattedPlan) {
-      // 保存计划数据用于状态持久化
-      currentPlanData = { plan, formattedPlan, isPending: true };
-
-      // 移除已有的对话框
-      const existingModal = document.getElementById('plan-modal-container');
-      if (existingModal) existingModal.remove();
-
-      // 创建固定位置的模态对话框容器（不在消息流中）
-      const modalContainer = document.createElement('div');
-      modalContainer.id = 'plan-modal-container';
-      modalContainer.className = 'plan-modal-container';
-      modalContainer.innerHTML = `
-        <div class="plan-modal-overlay" id="plan-modal-overlay"></div>
-        <div class="plan-modal-dialog" id="plan-modal-dialog">
-          <div class="plan-modal-header">
-            <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0zM4.5 7.5a.5.5 0 0 0 0 1h5.793l-2.147 2.146a.5.5 0 0 0 .708.708l3-3a.5.5 0 0 0 0-.708l-3-3a.5.5 0 1 0-.708.708L10.293 7.5H4.5z"/></svg>
-            <span class="plan-modal-title">执行计划确认</span>
-            <span class="plan-modal-time">${new Date().toLocaleTimeString().slice(0, 5)}</span>
-          </div>
-          <div class="plan-modal-content">${formatPlanHtml(formattedPlan)}</div>
-          <div class="plan-modal-actions">
-            <button class="plan-modal-btn cancel" data-action="cancel">
-              <svg viewBox="0 0 16 16"><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg>
-              取消
-            </button>
-            <button class="plan-modal-btn confirm" data-action="confirm">
-              <svg viewBox="0 0 16 16"><path d="M13.854 3.646a.5.5 0 0 1 0 .708l-7 7a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L6.5 10.293l6.646-6.647a.5.5 0 0 1 .708 0z"/></svg>
-              确认执行
-            </button>
-          </div>
-        </div>
-      `;
-
-      document.body.appendChild(modalContainer);
-
-      // 检查是否已存在待确认的消息（避免重复添加，用于 Webview 重新加载后恢复）
+      // 检查是否已存在待确认的消息（避免重复添加）
       const existingPendingIdx = threadMessages.findIndex(m => m.type === 'plan_confirmation' && m.isPending);
-      if (existingPendingIdx === -1) {
-        // 同时在消息流中添加一条记录（用于历史查看）
+      if (existingPendingIdx !== -1) {
+        // 已有待确认消息，更新内容
+        threadMessages[existingPendingIdx].content = formattedPlan;
+        threadMessages[existingPendingIdx].plan = plan;
+      } else {
+        // 在消息流中添加确认卡片
         const confirmationMsg = {
           role: 'system',
           type: 'plan_confirmation',
@@ -2152,37 +2199,107 @@
           isPending: true
         };
         threadMessages.push(confirmationMsg);
-        renderMainContent();
       }
 
-      // 滚动到底部
-      const mainContent = document.getElementById('main-content');
-      if (mainContent) {
-        requestAnimationFrame(() => {
+      saveWebviewState();
+      renderMainContent();
+
+      // 自动滚动到确认卡片位置
+      requestAnimationFrame(() => {
+        const mainContent = document.getElementById('main-content');
+        if (mainContent) {
           mainContent.scrollTop = mainContent.scrollHeight;
-        });
-      }
+        }
+      });
     }
 
-    // 使用事件委托处理模态对话框按钮点击（避免事件丢失）
+    // 显示问题补充卡片
+    function showQuestionRequest(questions) {
+      const normalized = Array.isArray(questions) ? questions.filter(q => q && String(q).trim()) : [];
+      if (normalized.length === 0) return;
+
+      const existingIdx = threadMessages.findIndex(m => m.type === 'question_request' && m.isPending);
+      if (existingIdx !== -1) {
+        threadMessages[existingIdx].questions = normalized;
+      } else {
+        threadMessages.push({
+          role: 'system',
+          type: 'question_request',
+          questions: normalized,
+          time: new Date().toLocaleTimeString().slice(0, 5),
+          isPending: true
+        });
+      }
+
+      setProcessingState(false);
+      saveWebviewState();
+      renderMainContent();
+      const input = document.getElementById('prompt-input');
+      if (input) {
+        input.placeholder = '请回答补充问题后发送...';
+        input.focus();
+      }
+      requestAnimationFrame(() => {
+        const mainContent = document.getElementById('main-content');
+        if (mainContent) {
+          mainContent.scrollTop = mainContent.scrollHeight;
+        }
+      });
+    }
+
+    function hasPendingQuestion() {
+      return threadMessages.some(m => m.type === 'question_request' && m.isPending);
+    }
+
+    function handleQuestionAnswer(answer, cancelled) {
+      const idx = threadMessages.findIndex(m => m.type === 'question_request' && m.isPending);
+      if (idx === -1) return;
+      threadMessages[idx].isPending = false;
+      threadMessages[idx].answered = !cancelled;
+      threadMessages[idx].answer = cancelled ? '' : (answer || '');
+      threadMessages[idx].cancelled = !!cancelled;
+      vscode.postMessage({ type: 'answerQuestions', answer: cancelled ? null : (answer || '') });
+      const input = document.getElementById('prompt-input');
+      if (input) {
+        input.placeholder = '描述你的任务... (可粘贴图片)';
+      }
+      saveWebviewState();
+      renderMainContent();
+      smoothScrollToBottom();
+    }
+
+    // 处理确认卡片按钮点击（通过事件委托）
     document.body.addEventListener('click', (e) => {
-      const btn = e.target.closest('.plan-modal-btn');
+      const btn = e.target.closest('.plan-confirm-btn');
       if (btn) {
         const action = btn.dataset.action;
         const confirmed = action === 'confirm';
-        vscode.postMessage({ type: 'confirmPlan', confirmed: confirmed });
-        closePlanConfirmation(confirmed);
+        handlePlanConfirmation(confirmed);
       }
     });
 
-    // 关闭确认面板
-    function closePlanConfirmation(confirmed) {
-      // 移除模态对话框
-      const modalContainer = document.getElementById('plan-modal-container');
-      if (modalContainer) modalContainer.remove();
+    document.body.addEventListener('click', (e) => {
+      const btn = e.target.closest('.question-btn');
+      if (!btn) return;
+      const action = btn.dataset.action;
+      const card = btn.closest('.question-card');
+      const textarea = card ? card.querySelector('.question-answer') : null;
+      const answer = textarea ? textarea.value.trim() : '';
+      if (action === 'submit') {
+        if (!answer) {
+          addSystemMessage('请先回答问题后再提交', 'warning');
+          return;
+        }
+        handleQuestionAnswer(answer, false);
+      } else if (action === 'cancel') {
+        handleQuestionAnswer('', true);
+      }
+    });
 
-      // 清除计划数据
-      currentPlanData = null;
+    // 处理计划确认/取消
+    function handlePlanConfirmation(confirmed) {
+      // 发送确认消息到后端
+      vscode.postMessage({ type: 'confirmPlan', confirmed: confirmed });
 
       // 更新消息状态
       const confirmIdx = threadMessages.findIndex(m => m.type === 'plan_confirmation' && m.isPending);
@@ -2190,36 +2307,58 @@
         threadMessages[confirmIdx].isPending = false;
         threadMessages[confirmIdx].confirmed = confirmed;
       }
+
+      saveWebviewState();
       renderMainContent();
     }
 
     // 检查是否有待确认的面板
     function hasPendingConfirmation() {
-      return currentPlanData?.isPending || threadMessages.some(m => m.type === 'plan_confirmation' && m.isPending);
+      return threadMessages.some(m => m.type === 'plan_confirmation' && m.isPending);
     }
 
     // 取消待确认的面板
     function cancelPendingConfirmation() {
       if (hasPendingConfirmation()) {
-        vscode.postMessage({ type: 'confirmPlan', confirmed: false });
-        closePlanConfirmation(false);
+        handlePlanConfirmation(false);
       }
     }
 
-    // 恢复确认面板状态（切换插件后恢复）
+    // 恢复确认面板状态（切换插件后恢复）- 内联卡片无需特殊恢复，状态已在 threadMessages 中
     function restorePlanConfirmation() {
-      if (currentPlanData?.isPending) {
-        // 检查模态对话框是否存在，不存在则重新创建
-        const existingModal = document.getElementById('plan-modal-container');
-        if (!existingModal) {
-          showPlanConfirmation(currentPlanData.plan, currentPlanData.formattedPlan);
-        }
+      // 内联卡片的状态已通过 saveWebviewState/restoreWebviewState 持久化
+      // 只需确保渲染正确即可
+      if (hasPendingConfirmation()) {
+        renderMainContent();
       }
     }
 
     // 问题4修复：处理主线信息更新
     function handleMainlineUpdate(msg) {
       const time = new Date().toLocaleTimeString().slice(0, 5);
+      const finalizeCliStreaming = (cli, success) => {
+        if (!cli) return;
+        const cliMessages = cliOutputs[cli] || [];
+        let updated = false;
+        for (let i = cliMessages.length - 1; i >= 0; i--) {
+          const m = cliMessages[i];
+          if (m && m.streaming) {
+            m.streaming = false;
+            if (!m.content || !m.content.trim()) {
+              cliMessages.splice(i, 1);
+            }
+            updated = true;
+            break;
+          }
+        }
+        if (updated) {
+          cliOutputs[cli] = cliMessages;
+          saveWebviewState();
+          if (currentBottomTab === cli) {
+            scheduleRenderMainContent();
+          }
+        }
+      };
 
       if (msg.updateType === 'subtask_started') {
         // 添加主线进度消息
@@ -2247,16 +2386,28 @@
             renderMainContent();
           }
         }
+
+        finalizeCliStreaming(msg.cli, msg.success);
       } else if (msg.updateType === 'subtask_failed') {
+        // 🆕 修复：确保 error 是字符串
+        let errorMsg = msg.error || '未知错误';
+        if (typeof errorMsg === 'object') {
+          errorMsg = errorMsg.message || errorMsg.error || JSON.stringify(errorMsg);
+        }
+        const cliName = msg.cli ? msg.cli.toUpperCase() : '';
+
         // 更新对应的进度消息状态为失败
         const progressIdx = threadMessages.findIndex(
           m => m.type === 'mainline_progress' && m.subTaskId === msg.subTaskId && m.progressType === 'started'
         );
         if (progressIdx !== -1) {
           threadMessages[progressIdx].progressType = 'failed';
-          threadMessages[progressIdx].error = msg.error;
+          threadMessages[progressIdx].error = errorMsg;
+          threadMessages[progressIdx].cli = msg.cli || threadMessages[progressIdx].cli;
           renderMainContent();
         }
+
+        finalizeCliStreaming(msg.cli, false);
       }
     }
 
@@ -2309,8 +2460,38 @@
         const leadingSpaces = line.match(/^(\s*)/)[1];
         const content = line.slice(leadingSpaces.length);
 
-        // 先转义 HTML
-        let result = escapeHtml(content);
+        // 如果是空行，直接返回
+        if (!content) return leadingSpaces;
+
+        // 🆕 使用占位符保护字符串和注释，避免被后续处理破坏
+        const placeholders = [];
+        let tempContent = content;
+
+        // 提取并保护字符串（双引号和单引号）
+        tempContent = tempContent.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`/g, (match) => {
+          const idx = placeholders.length;
+          placeholders.push({ type: 'string', value: match });
+          return `__PLACEHOLDER_${idx}__`;
+        });
+
+        // 提取并保护注释
+        if (['js', 'javascript', 'ts', 'typescript', 'go', 'rust', 'java', 'kotlin', 'c', 'cpp'].includes(langLower)) {
+          tempContent = tempContent.replace(/\/\/.*$/g, (match) => {
+            const idx = placeholders.length;
+            placeholders.push({ type: 'comment', value: match });
+            return `__PLACEHOLDER_${idx}__`;
+          });
+        }
+        if (['py', 'python', 'sh', 'bash', 'shell', 'zsh', 'yaml', 'yml'].includes(langLower)) {
+          tempContent = tempContent.replace(/#.*$/g, (match) => {
+            const idx = placeholders.length;
+            placeholders.push({ type: 'comment', value: match });
+            return `__PLACEHOLDER_${idx}__`;
+          });
+        }
+
+        // 转义 HTML（在提取字符串和注释之后）
+        let result = escapeHtml(tempContent);
 
         // 根据语言定义关键字
         let keywords = [];
@@ -2318,13 +2499,13 @@
         let builtins = [];
 
         if (['js', 'javascript', 'ts', 'typescript', 'jsx', 'tsx'].includes(langLower)) {
-          keywords = ['const', 'let', 'var', 'function', 'return', 'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break', 'continue', 'try', 'catch', 'finally', 'throw', 'new', 'delete', 'typeof', 'instanceof', 'in', 'of', 'class', 'extends', 'super', 'this', 'static', 'get', 'set', 'async', 'await', 'yield', 'import', 'export', 'from', 'as', 'default', 'void'];
-          types = ['string', 'number', 'boolean', 'object', 'any', 'never', 'unknown', 'Array', 'Promise', 'Map', 'Set'];
-          builtins = ['null', 'undefined', 'true', 'false', 'NaN', 'Infinity', 'console', 'window', 'document'];
+          keywords = ['const', 'let', 'var', 'function', 'return', 'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break', 'continue', 'try', 'catch', 'finally', 'throw', 'new', 'delete', 'typeof', 'instanceof', 'in', 'of', 'class', 'extends', 'super', 'this', 'static', 'get', 'set', 'async', 'await', 'yield', 'import', 'export', 'from', 'as', 'default', 'void', 'interface', 'type', 'enum', 'implements', 'private', 'public', 'protected', 'readonly'];
+          types = ['string', 'number', 'boolean', 'object', 'any', 'never', 'unknown', 'void', 'Array', 'Promise', 'Map', 'Set', 'Record', 'Partial', 'Required', 'Readonly'];
+          builtins = ['null', 'undefined', 'true', 'false', 'NaN', 'Infinity', 'console', 'window', 'document', 'Math', 'JSON', 'Object', 'String', 'Number', 'Boolean', 'Date', 'RegExp', 'Error'];
         } else if (['py', 'python'].includes(langLower)) {
           keywords = ['def', 'class', 'return', 'if', 'elif', 'else', 'for', 'while', 'try', 'except', 'finally', 'raise', 'import', 'from', 'as', 'with', 'pass', 'break', 'continue', 'lambda', 'yield', 'global', 'nonlocal', 'assert', 'del', 'in', 'is', 'not', 'and', 'or', 'async', 'await'];
           types = ['int', 'str', 'float', 'bool', 'list', 'dict', 'tuple', 'set', 'bytes', 'type', 'object'];
-          builtins = ['True', 'False', 'None', 'self', 'print', 'len', 'range', 'open', 'input'];
+          builtins = ['True', 'False', 'None', 'self', 'print', 'len', 'range', 'open', 'input', 'super', 'isinstance', 'hasattr', 'getattr', 'setattr'];
         } else if (['java', 'kotlin'].includes(langLower)) {
           keywords = ['public', 'private', 'protected', 'static', 'final', 'abstract', 'class', 'interface', 'extends', 'implements', 'new', 'return', 'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break', 'continue', 'try', 'catch', 'finally', 'throw', 'throws', 'import', 'package', 'this', 'super', 'void', 'instanceof'];
           types = ['int', 'long', 'short', 'byte', 'float', 'double', 'boolean', 'char', 'String', 'Object', 'Integer', 'List', 'Map', 'Set'];
@@ -2332,62 +2513,57 @@
         } else if (['go', 'golang'].includes(langLower)) {
           keywords = ['func', 'return', 'if', 'else', 'for', 'range', 'switch', 'case', 'default', 'break', 'continue', 'go', 'select', 'chan', 'defer', 'panic', 'recover', 'package', 'import', 'var', 'const', 'type', 'struct', 'interface', 'map', 'make', 'new'];
           types = ['int', 'int8', 'int16', 'int32', 'int64', 'uint', 'float32', 'float64', 'string', 'bool', 'byte', 'rune', 'error'];
-          builtins = ['nil', 'true', 'false', 'iota', 'append', 'len', 'cap'];
+          builtins = ['nil', 'true', 'false', 'iota', 'append', 'len', 'cap', 'copy', 'delete', 'close'];
         } else if (['rust', 'rs'].includes(langLower)) {
-          keywords = ['fn', 'let', 'mut', 'const', 'return', 'if', 'else', 'match', 'for', 'while', 'loop', 'break', 'continue', 'struct', 'enum', 'impl', 'trait', 'pub', 'use', 'mod', 'crate', 'self', 'super', 'where', 'async', 'await', 'move', 'ref', 'static', 'unsafe'];
-          types = ['i32', 'i64', 'u32', 'u64', 'f32', 'f64', 'bool', 'char', 'str', 'String', 'Vec', 'Option', 'Result', 'Box'];
-          builtins = ['true', 'false', 'Some', 'None', 'Ok', 'Err'];
+          keywords = ['fn', 'let', 'mut', 'const', 'return', 'if', 'else', 'match', 'for', 'while', 'loop', 'break', 'continue', 'struct', 'enum', 'impl', 'trait', 'pub', 'use', 'mod', 'crate', 'self', 'super', 'where', 'async', 'await', 'move', 'ref', 'static', 'unsafe', 'dyn'];
+          types = ['i8', 'i16', 'i32', 'i64', 'i128', 'u8', 'u16', 'u32', 'u64', 'u128', 'f32', 'f64', 'bool', 'char', 'str', 'String', 'Vec', 'Option', 'Result', 'Box', 'Rc', 'Arc'];
+          builtins = ['true', 'false', 'Some', 'None', 'Ok', 'Err', 'Self'];
         } else if (['sh', 'bash', 'shell', 'zsh'].includes(langLower)) {
-          keywords = ['if', 'then', 'else', 'elif', 'fi', 'for', 'while', 'do', 'done', 'case', 'esac', 'function', 'return', 'exit', 'export', 'local', 'readonly', 'declare'];
-          builtins = ['echo', 'cd', 'pwd', 'ls', 'rm', 'cp', 'mv', 'mkdir', 'cat', 'grep', 'sed', 'awk', 'npm', 'node', 'git'];
+          keywords = ['if', 'then', 'else', 'elif', 'fi', 'for', 'while', 'do', 'done', 'case', 'esac', 'function', 'return', 'exit', 'export', 'local', 'readonly', 'declare', 'in'];
+          builtins = ['echo', 'cd', 'pwd', 'ls', 'rm', 'cp', 'mv', 'mkdir', 'cat', 'grep', 'sed', 'awk', 'npm', 'node', 'git', 'curl', 'wget', 'chmod', 'chown', 'sudo'];
         } else if (['json'].includes(langLower)) {
-          // JSON 特殊处理：高亮属性名和值
-          // 属性名（键）
-          result = result.replace(/(&quot;[^&]*?&quot;)\s*:/g, '<span class="syntax-property">$1</span>:');
-          // 字符串值
-          result = result.replace(/:\s*(&quot;[^&]*?&quot;)/g, ': <span class="syntax-string">$1</span>');
-          // 数字
-          result = result.replace(/:\s*(-?\d+\.?\d*)/g, ': <span class="syntax-number">$1</span>');
-          // 布尔值和 null
-          result = result.replace(/:\s*(true|false|null)\b/g, ': <span class="syntax-builtin">$1</span>');
+          // JSON 特殊处理：还原占位符后再处理
+          result = result.replace(/__PLACEHOLDER_(\d+)__/g, (_, idx) => {
+            const ph = placeholders[parseInt(idx)];
+            return '<span class="syntax-string">' + escapeHtml(ph.value) + '</span>';
+          });
+          // 高亮布尔值和 null
+          result = result.replace(/\b(true|false|null)\b/g, '<span class="syntax-builtin">$1</span>');
+          // 高亮数字
+          result = result.replace(/:\s*(-?\d+\.?\d*(?:[eE][+-]?\d+)?)\b/g, ': <span class="syntax-number">$1</span>');
           return leadingSpaces + result;
         }
 
-        // 检测并高亮注释（整行）
-        if (['js', 'javascript', 'ts', 'typescript', 'go', 'rust', 'java', 'kotlin'].includes(langLower)) {
-          if (/^\s*\/\//.test(result)) {
-            return leadingSpaces + '<span class="syntax-comment">' + result + '</span>';
-          }
-        }
-        if (['py', 'python', 'sh', 'bash', 'shell', 'zsh', 'yaml', 'yml'].includes(langLower)) {
-          if (/^\s*#/.test(result)) {
-            return leadingSpaces + '<span class="syntax-comment">' + result + '</span>';
-          }
-        }
-
-        // 高亮字符串（使用更宽松的匹配）
-        result = result.replace(/(&quot;.*?&quot;)/g, '<span class="syntax-string">$1</span>');
-        result = result.replace(/(&#39;.*?&#39;)/g, '<span class="syntax-string">$1</span>');
-
-        // 高亮数字
-        result = result.replace(/\b(\d+\.?\d*)\b/g, '<span class="syntax-number">$1</span>');
+        // 高亮数字（在关键字之前，避免匹配到 span 标签中的数字）
+        result = result.replace(/\b(\d+\.?\d*(?:[eE][+-]?\d+)?)\b/g, '<span class="syntax-number">$1</span>');
 
         // 高亮关键字
         keywords.forEach(kw => {
-          const regex = new RegExp('\\b(' + kw + ')\\b', 'g');
+          const regex = new RegExp('(?<![\\w-])(' + kw + ')(?![\\w-])', 'g');
           result = result.replace(regex, '<span class="syntax-keyword">$1</span>');
         });
 
         // 高亮类型
         types.forEach(t => {
-          const regex = new RegExp('\\b(' + t + ')\\b', 'g');
+          const regex = new RegExp('(?<![\\w-])(' + t + ')(?![\\w-])', 'g');
           result = result.replace(regex, '<span class="syntax-type">$1</span>');
         });
 
         // 高亮内置常量/函数
         builtins.forEach(b => {
-          const regex = new RegExp('\\b(' + b + ')\\b', 'g');
+          const regex = new RegExp('(?<![\\w-])(' + b + ')(?![\\w-])', 'g');
           result = result.replace(regex, '<span class="syntax-builtin">$1</span>');
+        });
+
+        // 🆕 还原占位符为高亮后的内容
+        result = result.replace(/__PLACEHOLDER_(\d+)__/g, (_, idx) => {
+          const ph = placeholders[parseInt(idx)];
+          if (ph.type === 'string') {
+            return '<span class="syntax-string">' + escapeHtml(ph.value) + '</span>';
+          } else if (ph.type === 'comment') {
+            return '<span class="syntax-comment">' + escapeHtml(ph.value) + '</span>';
+          }
+          return escapeHtml(ph.value);
         });
 
         return leadingSpaces + result;
@@ -2401,18 +2577,17 @@
       if (!content) return '';
       content = content.replace(/\r\n/g, '\n');
 
-      // 🆕 修复：处理代码块，支持多种格式
-      // 格式1: ```lang\ncode\n``` (标准格式)
-      // 格式2: ```lang code``` (无换行)
-      // 格式3: ```\ncode\n``` (无语言标识)
+      // 🆕 使用占位符保护代码块，避免被后续处理破坏
+      const codeBlockPlaceholders = [];
+
+      // 处理代码块，支持多种格式
       content = content.replace(/```(\w*)[ \t]*\n?([\s\S]*?)```/g, function(match, lang, code) {
         const langLabel = lang || 'text';
         const codeId = 'code-' + Math.random().toString(36).substr(2, 9);
-        // 去掉首尾换行，保留内部缩进
         const trimmedCode = code.replace(/^\n+/, '').replace(/\n+$/, '');
-        if (!trimmedCode) return ''; // 空代码块不渲染
+        if (!trimmedCode) return '';
         const highlightedCode = highlightSyntax(trimmedCode, langLabel);
-        return '<div class="markdown-code-block">' +
+        const html = '<div class="markdown-code-block">' +
           '<div class="markdown-code-header">' +
           '<span class="markdown-code-lang">' + escapeHtml(langLabel) + '</span>' +
           '<div class="markdown-code-actions">' +
@@ -2420,6 +2595,18 @@
           '</div></div>' +
           '<div class="markdown-code-content"><pre><code id="' + codeId + '">' + highlightedCode + '</code></pre></div>' +
           '</div>';
+        const idx = codeBlockPlaceholders.length;
+        codeBlockPlaceholders.push(html);
+        return `__CODEBLOCK_${idx}__`;
+      });
+
+      // 🆕 保护行内代码，避免被粗体/斜体处理破坏
+      const inlineCodePlaceholders = [];
+      content = content.replace(/`([^`]+)`/g, function(match, code) {
+        const idx = inlineCodePlaceholders.length;
+        // 行内代码需要 HTML 转义
+        inlineCodePlaceholders.push('<code>' + escapeHtml(code) + '</code>');
+        return `__INLINECODE_${idx}__`;
       });
 
       // 处理标题
@@ -2431,9 +2618,6 @@
       content = content.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
       content = content.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
       content = content.replace(/\*(.+?)\*/g, '<em>$1</em>');
-
-      // 处理行内代码
-      content = content.replace(/`([^`]+)`/g, '<code>$1</code>');
 
       // 处理链接
       content = content.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
@@ -2451,6 +2635,12 @@
 
       // 处理分隔线
       content = content.replace(/^---$/gm, '<hr>');
+
+      // 🆕 还原行内代码占位符
+      content = content.replace(/__INLINECODE_(\d+)__/g, (_, idx) => inlineCodePlaceholders[parseInt(idx)]);
+
+      // 🆕 还原代码块占位符
+      content = content.replace(/__CODEBLOCK_(\d+)__/g, (_, idx) => codeBlockPlaceholders[parseInt(idx)]);
 
       // 处理段落（连续的非空行）
       const lines = content.split('\n');
@@ -2480,10 +2670,8 @@
           if (!inParagraph) {
             result += '<p>';
             inParagraph = true;
-          } else {
-            result += '<br>';
           }
-          result += line;
+          result += line + '\n';
         }
       }
       if (inParagraph) result += '</p>';
@@ -2513,24 +2701,518 @@
       if (trimmed.startsWith('```')) return false;
       if (trimmed.startsWith('{') || trimmed.startsWith('[')) return true;
       if (!content.includes('\n')) return false;
+      if (/^\s*\d+→/m.test(content)) return true;
       return /^(\s{2,}|\t)/m.test(content);
     }
 
     function renderToolPanelContent(content) {
       if (!content) return '';
       const text = typeof content === 'string' ? content : String(content);
-      const trimmed = text.trim();
+      let trimmed = text.trim();
       if (!trimmed) return '';
-      if (trimmed.startsWith('```')) {
-        return renderMarkdown(trimmed);
+      const fenced = extractSingleCodeFence(trimmed);
+      if (fenced) {
+        trimmed = (fenced.body || '').trim();
       }
-      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-        return renderMarkdown('```json\n' + trimmed.replace(/\n$/, '') + '\n```');
+      if (!trimmed) return '';
+      const escaped = escapeHtml(trimmed);
+      if (trimmed.startsWith('{') || trimmed.startsWith('[') || shouldRenderAsCodeBlock(trimmed)) {
+        return '<pre class="tool-raw">' + escaped + '</pre>';
       }
-      if (shouldRenderAsCodeBlock(text)) {
-        return renderMarkdown('```text\n' + text.replace(/\n$/, '') + '\n```');
+      const normalized = escaped.replace(/(\r?\n){2,}/g, '\n');
+      return '<div class="tool-text">' + normalized.replace(/\n/g, '<br>') + '</div>';
+    }
+
+    function renderToolTrack(toolCalls, panelPrefix) {
+      if (!toolCalls || toolCalls.length === 0) return '';
+      const sorted = [...toolCalls].sort((a, b) => {
+        const tsA = a.timestamp || 0;
+        const tsB = b.timestamp || 0;
+        if (tsA !== tsB) return tsA - tsB;
+        return (a.seq || 0) - (b.seq || 0);
+      });
+      let html = '<div class="tool-track">';
+      sorted.forEach((tool, toolIdx) => {
+        if (tool.kind && tool.kind !== 'call') return;
+        if (tool.name === '工具结果') return;
+        const toolContent = tool.input || '';
+        if (!toolContent || !String(toolContent).trim()) return;
+        const isLatest = toolIdx === sorted.length - 1;
+        const toolPanelId = panelPrefix + '-' + toolIdx;
+        const toolStatus = tool.status || 'completed';
+        html += '<div class="tool-item collapsible-panel tool-call" data-panel-id="' + toolPanelId + '">';
+        html += '<div class="collapsible-header" onclick="togglePanel(\'' + toolPanelId + '\')">';
+        html += '<span class="tool-name">' + getToolIcon(tool.name) + escapeHtml(tool.name || '工具调用') + '</span>';
+        html += '<span class="tool-status ' + toolStatus + '">' + (toolStatus === 'running' ? '执行中' : toolStatus === 'failed' ? '失败' : '完成') + '</span>';
+        html += '<span class="collapsible-icon' + (isLatest ? ' expanded' : '') + '"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></span>';
+        html += '</div>';
+        html += '<div class="collapsible-content' + (isLatest ? ' expanded' : '') + '"><div class="collapsible-body tool-body">' + renderToolPanelContent(toolContent) + '</div></div>';
+        html += '</div>';
+      });
+      html += '</div>';
+      return html;
+    }
+
+    const streamStates = {};
+
+    function getStreamState(cli, role) {
+      const key = (role ? role + ':' : '') + (cli || 'orchestrator');
+      if (!streamStates[key]) {
+        streamStates[key] = {
+          pending: '',
+          text: '',
+          thinking: [],
+          toolMap: new Map(),
+          hasJson: false,
+          completed: false
+        };
       }
-      return renderMarkdown(text);
+      return streamStates[key];
+    }
+
+    function resetStreamState(cli, role) {
+      const key = (role ? role + ':' : '') + (cli || 'orchestrator');
+      delete streamStates[key];
+    }
+
+    function upsertTool(toolMap, tool) {
+      if (!tool) return;
+      const isResult = tool.kind === 'result' || tool.name === '工具结果';
+      const id = tool.id || tool.tool_call_id || (isResult ? '' : tool.name) || ('tool-' + toolMap.size);
+      if (id && toolMap.has(id)) {
+        const existing = toolMap.get(id);
+        const keepName = existing?.name && (isResult || tool.name === '工具调用');
+        toolMap.set(id, {
+          ...existing,
+          ...tool,
+          name: keepName ? existing.name : (tool.name || existing.name),
+          input: tool.input ?? existing.input,
+          result: tool.result ?? existing.result,
+          status: tool.status || existing.status
+        });
+        return;
+      }
+      if (isResult) {
+        let lastRunningKey = null;
+        for (const [key, value] of toolMap.entries()) {
+          if (value && (value.kind === 'call' || !value.kind) && (value.status === 'running' || !value.status)) {
+            lastRunningKey = key;
+          }
+        }
+        if (lastRunningKey) {
+          const existing = toolMap.get(lastRunningKey);
+          toolMap.set(lastRunningKey, {
+            ...existing,
+            result: tool.result ?? existing.result,
+            status: 'completed'
+          });
+          return;
+        }
+      }
+      if (id) {
+        toolMap.set(id, tool);
+      } else {
+        toolMap.set('tool-' + toolMap.size, tool);
+      }
+    }
+
+    function applyParsedChunk(parsed, state) {
+      if (parsed.type === 'assistant' && parsed.message?.content) {
+        for (const block of parsed.message.content) {
+          if (block.type === 'text' && block.text) {
+            state.text += block.text;
+          }
+          if (block.type === 'thinking' && block.thinking) {
+            state.thinking.push(block.thinking);
+          }
+          if (block.type === 'tool_use') {
+            upsertTool(state.toolMap, {
+              id: block.id,
+              name: block.name || '工具调用',
+              input: formatToolPayload(block.input),
+              status: 'running',
+              kind: 'call'
+            });
+          }
+          if (block.type === 'tool_result') {
+            upsertTool(state.toolMap, {
+              id: block.tool_use_id || block.id,
+              name: block.name || '工具结果',
+              result: formatToolPayload(block.content || block.result || block.output),
+              status: 'completed',
+              kind: 'result'
+            });
+            const toolText = formatToolPayload(block.content || block.result || block.output);
+            if (toolText) {
+              state.text += (state.text ? '\n\n' : '') + toolText;
+            }
+          }
+        }
+        return;
+      }
+
+      if (parsed.type === 'item.completed' && parsed.item) {
+        if (parsed.item.type === 'agent_message' && parsed.item.text) {
+          state.text += parsed.item.text;
+        } else if (parsed.item.type === 'reasoning' && parsed.item.text) {
+          state.thinking.push(parsed.item.text);
+        }
+        return;
+      }
+
+      if (parsed.type === 'user' && parsed.message?.content) {
+        for (const block of parsed.message.content) {
+          if (block.type === 'tool_result') {
+            upsertTool(state.toolMap, {
+              id: block.tool_use_id || block.id,
+              name: block.name || '工具结果',
+              result: formatToolPayload(block.content || block.result || block.output),
+              status: 'completed',
+              kind: 'result'
+            });
+            const toolText = formatToolPayload(block.content || block.result || block.output);
+            if (toolText) {
+              state.text += (state.text ? '\n\n' : '') + toolText;
+            }
+          }
+        }
+        return;
+      }
+
+      if (parsed.type === 'message' && parsed.role === 'user' && Array.isArray(parsed.content)) {
+        parsed.content.forEach(block => {
+          if (block?.type === 'tool_result') {
+            upsertTool(state.toolMap, {
+              id: block.tool_use_id || block.id,
+              name: block.name || '工具结果',
+              result: formatToolPayload(block.content || block.result || block.output),
+              status: 'completed',
+              kind: 'result'
+            });
+            const toolText = formatToolPayload(block.content || block.result || block.output);
+            if (toolText) {
+              state.text += (state.text ? '\n\n' : '') + toolText;
+            }
+          }
+        });
+        return;
+      }
+
+      if (parsed.type === 'message' && parsed.role === 'assistant' && parsed.content) {
+        state.text += parsed.content;
+        return;
+      }
+
+      if (parsed.type === 'thinking' && parsed.content) {
+        state.thinking.push(parsed.content);
+        return;
+      }
+
+      if (parsed.thinking) {
+        if (Array.isArray(parsed.thinking)) {
+          state.thinking.push(...parsed.thinking);
+        } else {
+          state.thinking.push(parsed.thinking);
+        }
+        return;
+      }
+
+      const toolCalls = parsed.tool_calls || parsed.toolCalls || parsed.tools;
+      if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+        toolCalls.forEach(call => {
+          const fn = call.function || call.func || {};
+          upsertTool(state.toolMap, {
+            id: call.id || call.tool_call_id,
+            name: call.name || fn.name || '工具调用',
+            input: formatToolPayload(call.input || fn.arguments || call.arguments),
+            status: call.status || 'running',
+            kind: 'call'
+          });
+        });
+        return;
+      }
+
+      if (parsed.type === 'tool_call' || parsed.type === 'tool_use') {
+        upsertTool(state.toolMap, {
+          id: parsed.id || parsed.tool_call_id,
+          name: parsed.name || parsed.tool_name || '工具调用',
+          input: formatToolPayload(parsed.input || parsed.arguments),
+          status: parsed.status || 'running',
+          kind: 'call'
+        });
+        return;
+      }
+
+      if (parsed.type === 'tool_result' || parsed.type === 'tool_response') {
+        upsertTool(state.toolMap, {
+          id: parsed.tool_call_id || parsed.id,
+          name: parsed.name || parsed.tool_name || '工具结果',
+          result: formatToolPayload(parsed.result || parsed.output || parsed.content),
+          status: 'completed',
+          kind: 'result'
+        });
+        const toolText = formatToolPayload(parsed.result || parsed.output || parsed.content);
+        if (toolText) {
+          state.text += (state.text ? '\n\n' : '') + toolText;
+        }
+        return;
+      }
+
+      if (parsed.type === 'result' && (parsed.result || parsed.response)) {
+        if (!state.text) {
+          state.text = parsed.result || parsed.response;
+        }
+        state.completed = true;
+      }
+    }
+
+    function appendStreamJsonChunk(cli, chunk, role) {
+      const state = getStreamState(cli, role);
+      const incoming = String(chunk || '');
+      const combined = state.pending + incoming;
+      const lines = combined.split('\n');
+      state.pending = combined.endsWith('\n') ? '' : (lines.pop() || '');
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        if (!trimmed.startsWith('{')) continue;
+        let parsed = null;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          state.pending = trimmed + (state.pending ? ('\n' + state.pending) : '');
+          continue;
+        }
+        if (!parsed) continue;
+        state.hasJson = true;
+        applyParsedChunk(parsed, state);
+      }
+
+      return {
+        text: state.text,
+        toolCalls: Array.from(state.toolMap.values()),
+        thinking: state.thinking,
+        hasJson: state.hasJson,
+        completed: state.completed
+      };
+    }
+
+    function parseStreamJsonBuffer(buffer, cli, role) {
+      const lines = String(buffer || '').split('\n').filter(l => l.trim());
+      const state = getStreamState(cli, role);
+      const toolMap = state.toolMap;
+      const thinking = state.thinking;
+      let text = '';
+      let hasJson = false;
+
+      const upsert = (tool) => {
+        if (!tool) return;
+        const isResult = tool.kind === 'result' || tool.name === '工具结果';
+        const id = tool.id || tool.tool_call_id || (isResult ? '' : tool.name) || ('tool-' + toolMap.size);
+        if (id && toolMap.has(id)) {
+          const existing = toolMap.get(id);
+          const keepName = existing?.name && (isResult || tool.name === '工具调用');
+          toolMap.set(id, {
+            ...existing,
+            ...tool,
+            name: keepName ? existing.name : (tool.name || existing.name),
+            input: tool.input ?? existing.input,
+            result: tool.result ?? existing.result,
+            status: tool.status || existing.status
+          });
+          return;
+        }
+        if (isResult) {
+          let lastRunningKey = null;
+          for (const [key, value] of toolMap.entries()) {
+            if (value && (value.kind === 'call' || !value.kind) && (value.status === 'running' || !value.status)) {
+              lastRunningKey = key;
+            }
+          }
+          if (lastRunningKey) {
+            const existing = toolMap.get(lastRunningKey);
+            toolMap.set(lastRunningKey, {
+              ...existing,
+              result: tool.result ?? existing.result,
+              status: 'completed'
+            });
+            return;
+          }
+        }
+        if (id) {
+          toolMap.set(id, tool);
+        } else {
+          toolMap.set('tool-' + toolMap.size, tool);
+        }
+      };
+
+      for (const line of lines) {
+        if (!line.trim().startsWith('{')) continue;
+        let parsed = null;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (!parsed) continue;
+        hasJson = true;
+
+        if (parsed.type === 'assistant' && parsed.message?.content) {
+          for (const block of parsed.message.content) {
+            if (block.type === 'text' && block.text) {
+              state.text += block.text;
+            }
+            if (block.type === 'thinking' && block.thinking) {
+              thinking.push(block.thinking);
+            }
+            if (block.type === 'tool_use') {
+              upsert({
+                id: block.id,
+                name: block.name || '工具调用',
+                input: formatToolPayload(block.input),
+                status: 'running',
+                kind: 'call'
+              });
+            }
+            if (block.type === 'tool_result') {
+              upsert({
+                id: block.tool_use_id || block.id,
+                name: block.name || '工具结果',
+                result: formatToolPayload(block.content || block.result || block.output),
+                status: 'completed',
+                kind: 'result'
+              });
+              const toolText = formatToolPayload(block.content || block.result || block.output);
+              if (toolText) {
+                state.text += (state.text ? '\n\n' : '') + toolText;
+              }
+            }
+          }
+          continue;
+        }
+
+        if (parsed.type === 'item.completed' && parsed.item) {
+          if (parsed.item.type === 'agent_message' && parsed.item.text) {
+            state.text += parsed.item.text;
+          } else if (parsed.item.type === 'reasoning' && parsed.item.text) {
+            thinking.push(parsed.item.text);
+          }
+          continue;
+        }
+
+        if (parsed.type === 'user' && parsed.message?.content) {
+          for (const block of parsed.message.content) {
+            if (block.type === 'tool_result') {
+              upsert({
+                id: block.tool_use_id || block.id,
+                name: block.name || '工具结果',
+                result: formatToolPayload(block.content || block.result || block.output),
+                status: 'completed',
+                kind: 'result'
+              });
+              const toolText = formatToolPayload(block.content || block.result || block.output);
+              if (toolText) {
+                state.text += (state.text ? '\n\n' : '') + toolText;
+              }
+            }
+          }
+          continue;
+        }
+
+        if (parsed.type === 'message' && parsed.role === 'user' && Array.isArray(parsed.content)) {
+          for (const block of parsed.content) {
+            if (block?.type === 'tool_result') {
+              upsert({
+                id: block.tool_use_id || block.id,
+                name: block.name || '工具结果',
+                result: formatToolPayload(block.content || block.result || block.output),
+                status: 'completed',
+                kind: 'result'
+              });
+              const toolText = formatToolPayload(block.content || block.result || block.output);
+              if (toolText) {
+                state.text += (state.text ? '\n\n' : '') + toolText;
+              }
+            }
+          }
+          continue;
+        }
+
+        if (parsed.type === 'message' && parsed.role === 'assistant' && parsed.content) {
+          state.text += parsed.content;
+          continue;
+        }
+
+        if (parsed.type === 'thinking' && parsed.content) {
+          thinking.push(parsed.content);
+          continue;
+        }
+
+        if (parsed.thinking) {
+          if (Array.isArray(parsed.thinking)) {
+            thinking.push(...parsed.thinking);
+          } else {
+            thinking.push(parsed.thinking);
+          }
+          continue;
+        }
+
+        const toolCalls = parsed.tool_calls || parsed.toolCalls || parsed.tools;
+        if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+          toolCalls.forEach(call => {
+            const fn = call.function || call.func || {};
+            upsert({
+              id: call.id || call.tool_call_id,
+              name: call.name || fn.name || '工具调用',
+              input: formatToolPayload(call.input || fn.arguments || call.arguments),
+              status: call.status || 'running',
+              kind: 'call'
+            });
+          });
+          continue;
+        }
+
+        if (parsed.type === 'tool_call' || parsed.type === 'tool_use') {
+          upsert({
+            id: parsed.id || parsed.tool_call_id,
+            name: parsed.name || parsed.tool_name || '工具调用',
+            input: formatToolPayload(parsed.input || parsed.arguments),
+            status: parsed.status || 'running',
+            kind: 'call'
+          });
+          continue;
+        }
+
+        if (parsed.type === 'tool_result' || parsed.type === 'tool_response') {
+          upsert({
+            id: parsed.tool_call_id || parsed.id,
+            name: parsed.name || parsed.tool_name || '工具结果',
+            result: formatToolPayload(parsed.result || parsed.output || parsed.content),
+            status: 'completed',
+            kind: 'result'
+          });
+          const toolText = formatToolPayload(parsed.result || parsed.output || parsed.content);
+          if (toolText) {
+            state.text += (state.text ? '\n\n' : '') + toolText;
+          }
+          continue;
+        }
+
+        if (parsed.type === 'result' && (parsed.result || parsed.response)) {
+          if (!state.text) {
+            state.text = parsed.result || parsed.response;
+          }
+          state.completed = true;
+        }
+      }
+
+      return {
+        text: state.text,
+        toolCalls: Array.from(toolMap.values()),
+        thinking,
+        hasJson
+      };
     }
 
     // 复制代码块
@@ -2549,28 +3231,177 @@
       });
     }
 
-    function formatMessageContent(content, cli) {
-      if (!content) return '';
+    function extractJsonInfo(content) {
+      if (!content) return { isJson: false, jsonText: '' };
+      const trimmed = content.trim();
+      if (!trimmed) return { isJson: false, jsonText: '' };
+      if (!(trimmed.startsWith('{') || trimmed.startsWith('['))) return { isJson: false, jsonText: '' };
+      try {
+        JSON.parse(trimmed);
+        return { isJson: true, jsonText: trimmed };
+      } catch {
+        return { isJson: false, jsonText: '' };
+      }
+    }
 
-      // 检测是否包含 Markdown 特征
-      const hasMarkdown = /```|^#{1,3} |^\* |\*\*|^\d+\. |^> |^---$/m.test(content);
+    function extractSingleCodeFence(content) {
+      if (!content) return null;
+      const trimmed = content.trim();
+      const match = trimmed.match(/^```(\w*)\s*\n([\s\S]*?)\n?```\s*$/);
+      if (!match) return null;
+      return { lang: match[1] || '', body: match[2] || '' };
+    }
+
+    function buildToolPayloads(toolCalls) {
+      const payloads = new Set();
+      const jsonPayloads = new Set();
+      if (!Array.isArray(toolCalls)) return { payloads, jsonPayloads };
+      toolCalls.forEach(call => {
+        const raw = call?.input;
+        if (raw === undefined || raw === null) return;
+        const text = formatToolPayload(raw).trim();
+        if (!text) return;
+        payloads.add(text);
+        if (text.startsWith('{') || text.startsWith('[')) {
+          try {
+            const parsed = JSON.parse(text);
+            jsonPayloads.add(JSON.stringify(parsed));
+          } catch {
+            // ignore parse errors
+          }
+        }
+      });
+      return { payloads, jsonPayloads };
+    }
+
+    function escapeRegExp(text) {
+      return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    function stripToolPayloadsFromContent(content, toolPayloads) {
+      if (!content || !toolPayloads) return content;
+      let result = content;
+      toolPayloads.payloads.forEach(payload => {
+        if (!payload) return;
+        const escaped = escapeRegExp(payload.trim());
+        if (!escaped) return;
+        // Remove fenced code blocks that are exactly the tool payload
+        const fenced = new RegExp('```[\\w-]*\\s*\\n' + escaped + '\\n?```', 'g');
+        result = result.replace(fenced, '');
+        // Remove standalone payload blocks
+        if (result.trim() === payload.trim()) {
+          result = '';
+        }
+      });
+      return result;
+    }
+
+    function matchesToolPayload(text, toolPayloads) {
+      if (!text) return false;
+      const trimmed = text.trim();
+      if (!trimmed) return false;
+      if (toolPayloads.payloads.has(trimmed)) return true;
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          const compact = JSON.stringify(parsed);
+          if (toolPayloads.jsonPayloads.has(compact)) return true;
+        } catch {
+          return false;
+        }
+      }
+      return false;
+    }
+
+    function collapseExtraBlankLines(text) {
+      if (!text) return '';
+      const normalized = String(text).replace(/\r\n/g, '\n');
+      const parts = normalized.split(/```/);
+      return parts.map((part, idx) => {
+        if (idx % 2 === 1) return part;
+        return part.replace(/\n{2,}/g, '\n');
+      }).join('```');
+    }
+
+    function normalizeMessageContent(content, options) {
+      const raw = collapseExtraBlankLines(content || '');
+      const trimmed = raw.trim();
+      if (!trimmed) {
+        return { type: 'empty', content: '' };
+      }
+
+      const toolCalls = options?.toolCalls || [];
+      const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
+      const toolPayloads = hasToolCalls ? buildToolPayloads(toolCalls) : { payloads: new Set(), jsonPayloads: new Set() };
+      const strippedRaw = hasToolCalls ? stripToolPayloadsFromContent(raw, toolPayloads) : raw;
+      const strippedTrimmed = strippedRaw.trim();
+      if (hasToolCalls && !strippedTrimmed) {
+        return { type: 'empty', content: '' };
+      }
+      const hasMarkdown = /```|^#{1,3} |^\* |\*\*|^\d+\. |^> |^---$/m.test(raw);
+      const isSummary = raw.includes('执行完成') || raw.includes('任务完成') || raw.includes('已完成');
+      const isTask = raw.includes('任务分析') || raw.includes('执行计划');
+      const jsonInfo = extractJsonInfo(strippedRaw);
+
+      if (hasToolCalls && jsonInfo.isJson && matchesToolPayload(jsonInfo.jsonText, toolPayloads)) {
+        return { type: 'empty', content: '' };
+      }
+      if (hasToolCalls) {
+        const codeFence = extractSingleCodeFence(strippedRaw);
+        if (codeFence && matchesToolPayload(codeFence.body, toolPayloads)) {
+          return { type: 'empty', content: '' };
+        }
+      }
 
       if (hasMarkdown) {
-        return '<div class="markdown-rendered">' + renderMarkdown(content) + '</div>';
+        return { type: 'markdown', content: strippedRaw };
       }
-
-      // 检测是否是执行摘要
-      if (content.includes('执行完成') || content.includes('任务完成') || content.includes('已完成')) {
-        return formatAsSummaryCard(content, cli);
+      if (isSummary) {
+        return { type: 'summary', content: strippedRaw };
       }
-
-      // 检测是否是任务分析
-      if (content.includes('任务分析') || content.includes('执行计划')) {
-        return formatAsTaskCard(content, cli);
+      if (isTask) {
+        return { type: 'task', content: strippedRaw };
       }
+      if (jsonInfo.isJson) {
+        return { type: 'json', content: jsonInfo.jsonText };
+      }
+      if (shouldRenderAsCodeBlock(strippedRaw)) {
+        return { type: 'code', content: strippedRaw };
+      }
+      return { type: 'text', content: strippedRaw };
+    }
 
-      // 普通消息：简单格式化
-      return formatSimpleContent(content);
+    function renderMessageContent(normalized, cli) {
+      if (!normalized || normalized.type === 'empty') return '';
+      if (normalized.type === 'summary') {
+        return formatAsSummaryCard(normalized.content, cli);
+      }
+      if (normalized.type === 'task') {
+        return formatAsTaskCard(normalized.content, cli);
+      }
+      if (normalized.type === 'markdown') {
+        return '<div class="markdown-rendered">' + renderMarkdown(normalized.content) + '</div>';
+      }
+      if (normalized.type === 'json') {
+        return '<div class="markdown-rendered">' + renderMarkdown('```json\n' + normalized.content.replace(/\n$/, '') + '\n```') + '</div>';
+      }
+      if (normalized.type === 'code') {
+        return formatSimpleContent(normalized.content);
+      }
+      return formatSimpleContent(normalized.content);
+    }
+
+    function formatMessageContent(content, cli, options) {
+      const normalized = normalizeMessageContent(content, { toolCalls: options?.toolCalls });
+      return renderMessageContent(normalized, cli);
+    }
+
+    function renderNormalizedContent(content, cli, options) {
+      const normalized = normalizeMessageContent(content, { toolCalls: options?.toolCalls });
+      return {
+        html: renderMessageContent(normalized, cli),
+        isMarkdown: ['markdown', 'json', 'code', 'summary', 'task'].includes(normalized.type)
+      };
     }
 
     // 格式化为执行摘要卡片
@@ -2619,10 +3450,29 @@
           : '```text\n' + trimmed + '\n```';
         return '<div class="markdown-rendered">' + renderMarkdown(wrapped) + '</div>';
       }
-      return escapeHtml(content)
-        .replace(/\n/g, '<br>')
-        .replace(/`([^`]+)`/g, '<code>$1</code>')
-        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+      // 🆕 修复：先处理行内代码（在 HTML 转义之前），然后再转义其他内容
+      // 保护行内代码
+      const inlineCodePlaceholders = [];
+      let processed = content.replace(/`([^`]+)`/g, function(match, code) {
+        const idx = inlineCodePlaceholders.length;
+        inlineCodePlaceholders.push('<code>' + escapeHtml(code) + '</code>');
+        return `__SIMPLECODE_${idx}__`;
+      });
+      // 保护粗体
+      const boldPlaceholders = [];
+      processed = processed.replace(/\*\*(.*?)\*\*/g, function(match, text) {
+        const idx = boldPlaceholders.length;
+        boldPlaceholders.push('<strong>' + escapeHtml(text) + '</strong>');
+        return `__SIMPLEBOLD_${idx}__`;
+      });
+      // 转义剩余内容
+      processed = escapeHtml(processed);
+      // 还原占位符
+      processed = processed.replace(/__SIMPLECODE_(\d+)__/g, (_, idx) => inlineCodePlaceholders[parseInt(idx)]);
+      processed = processed.replace(/__SIMPLEBOLD_(\d+)__/g, (_, idx) => boldPlaceholders[parseInt(idx)]);
+      // 处理换行（压缩连续空行，避免行间距过大）
+      const normalized = processed.replace(/(\r?\n){2,}/g, '\n');
+      return normalized.replace(/\n/g, '<br>');
     }
 
     // 提取简短描述（用于状态卡片）
@@ -2658,18 +3508,6 @@
       return '已完成';
     }
 
-    // 增量更新 CLI 状态卡片
-    function updateCliStatusCard(cli, shortDesc) {
-      const container = document.getElementById('main-content');
-      if (!container || currentBottomTab !== 'thread') return false;
-      const card = container.querySelector('.cli-status-card[data-cli="' + cli + '"]');
-      if (!card) return false;
-      const descEl = card.querySelector('.cli-status-desc');
-      if (!descEl) return false;
-      descEl.textContent = shortDesc;
-      return true;
-    }
-
     // 获取模式显示名称
     function getModeDisplayName(mode) {
       switch (mode) {
@@ -2694,6 +3532,7 @@
         'analyzing': 1,
         'phase2_waiting_confirmation': 2,
         'waiting_confirmation': 2,
+        'waiting_questions': 2,
         'phase3_execution': 3,
         'dispatching': 3,
         'monitoring': 3,
@@ -2712,13 +3551,17 @@
       const currentPhaseNum = phaseMap[phase] || 0;
 
       // 根据阶段和后端状态更新 isProcessing
+      let nextProcessing = false;
       if (isRunningFromBackend !== undefined) {
-        isProcessing = isRunningFromBackend;
+        nextProcessing = isRunningFromBackend;
       } else {
         // 根据阶段推断运行状态
-        isProcessing = currentPhaseNum > 0 && currentPhaseNum < 7;
+        nextProcessing = currentPhaseNum > 0 && currentPhaseNum < 7;
       }
-      updateSendButtonState();
+      if (phase === 'waiting_questions') {
+        nextProcessing = false;
+      }
+      setProcessingState(nextProcessing);
 
       // 显示/隐藏指示器
       if (currentPhaseNum > 0 && currentPhaseNum < 8) {
@@ -2794,13 +3637,25 @@
         return;
       }
 
+      // 🆕 按时间戳排序消息（如果有 timestamp 字段）
+      const sortedMessages = [...messages].sort((a, b) => {
+        const tsA = a.timestamp || 0;
+        const tsB = b.timestamp || 0;
+        return tsA - tsB;
+      });
+
       let html = '';
       // 用于消息分组：记录上一条消息的来源标识
       let prevMessageKey = null;
 
-      messages.forEach((m, idx) => {
+      sortedMessages.forEach((m, idx) => {
         const isUser = m.role === 'user';
         const source = m.source || 'worker';
+
+        if (m.type === 'system_notice') {
+          html += renderSystemNotice(m, idx);
+          return;
+        }
 
         // 计算当前消息的分组标识
         const currentMessageKey = isUser ? 'user' : source;
@@ -2811,14 +3666,17 @@
         const messageTypeClass = isUser ? ' user-message' : ' assistant-message';
         const groupedClass = isGrouped ? ' grouped' : '';
 
-        // 徽章样式类
-        const badgeClass = isUser ? 'user' : (source === 'orchestrator' ? 'orchestrator' : cli.toLowerCase());
-        const roleName = isUser ? '你' : (source === 'orchestrator' ? 'Orchestrator' : cli.toUpperCase());
+        // 徽章样式类（用户消息不显示角色徽章）
+        const badgeClass = source === 'orchestrator' ? 'orchestrator' : cli.toLowerCase();
+        const roleName = source === 'orchestrator' ? 'Orchestrator' : cli.toUpperCase();
+        const hideStreamingBadge = !isUser && m.streaming && !m.content;
 
         html += '<div class="message' + messageTypeClass + streamingClass + groupedClass + '" data-msg-idx="' + idx + '" data-cli="' + cli + '" data-source="' + source + '">';
         html += '<div class="message-body">';
         html += '<div class="message-header">';
-        html += '<span class="message-role-badge ' + badgeClass + '">' + roleName + '</span>';
+        if (!isUser && !hideStreamingBadge) {
+          html += '<span class="message-role-badge ' + badgeClass + '">' + roleName + '</span>';
+        }
         html += '<span class="message-time">' + (m.time || '') + '</span>';
         html += '</div>';
 
@@ -2837,40 +3695,31 @@
           html += '</div>';
         }
 
-        // 工具调用面板（仅 AI 消息显示）
-        if (!isUser && m.toolCalls && m.toolCalls.length > 0) {
-          m.toolCalls.forEach((tool, toolIdx) => {
-            const toolPanelId = 'tool-cli-' + cli + '-' + idx + '-' + toolIdx;
-            const toolStatus = tool.status || 'completed';
-            const toolContent = tool.result || tool.input || '';
-            if (!toolContent || !String(toolContent).trim()) {
-              if (toolStatus === 'running') return;
-            }
-            html += '<div class="collapsible-panel tool-call" data-panel-id="' + toolPanelId + '">';
-            html += '<div class="collapsible-header" onclick="togglePanel(\'' + toolPanelId + '\')">';
-            html += '<span class="collapsible-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></span>';
-            html += '<span class="collapsible-title"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M1 0L0 1l2.2 3.081a1 1 0 0 0 .815.419h.07a1 1 0 0 1 .708.293l2.675 2.675-2.617 2.654A3.003 3.003 0 0 0 0 13a3 3 0 1 0 5.878-.851l2.654-2.617.968.968-.305.914a1 1 0 0 0 .242 1.023l3.356 3.356a1 1 0 0 0 1.414 0l1.586-1.586a1 1 0 0 0 0-1.414l-3.356-3.356a1 1 0 0 0-1.023-.242l-.914.305-.968-.968 2.617-2.654A3.003 3.003 0 0 0 13 0a3 3 0 1 0-.851 5.878L9.495 8.53 6.82 5.854a1 1 0 0 1-.293-.708v-.07a1 1 0 0 0-.419-.815L1 0zm9.5 5.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm-9 8a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/></svg>' + escapeHtml(tool.name || '工具调用') + '</span>';
-            html += '<span class="collapsible-status ' + toolStatus + '">' + (toolStatus === 'running' ? '执行中' : '') + '</span>';
-            html += '</div>';
-            html += '<div class="collapsible-content"><div class="collapsible-body markdown-rendered">' + renderToolPanelContent(toolContent) + '</div></div>';
-            html += '</div>';
-          });
-        }
-
         // 消息内容
         let contentHtml = '';
+        let contentIsMarkdown = false;
         if (m.streaming && !m.content) {
-          contentHtml = '<span class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span> 正在响应...';
+          contentHtml = '<span class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span> 正在思考...';
         } else if (source === 'orchestrator') {
-          // 🆕 修复：Orchestrator 消息也需要 Markdown 渲染
-          contentHtml = formatMessageContent(m.content || '', 'orchestrator');
+          // 🆕 Orchestrator 消息统一走规范化入口
+          const rendered = renderNormalizedContent(m.content || '', 'orchestrator', { toolCalls: m.toolCalls });
+          contentHtml = rendered.html;
+          contentIsMarkdown = rendered.isMarkdown;
         } else if (!isUser && m.content) {
-          // AI 消息使用 Markdown 渲染
-          contentHtml = formatMessageContent(m.content, cli);
+          // AI 消息统一走规范化入口
+          const rendered = renderNormalizedContent(m.content, cli, { toolCalls: m.toolCalls });
+          contentHtml = rendered.html;
+          contentIsMarkdown = rendered.isMarkdown;
         } else {
           contentHtml = escapeHtml(m.content || '');
         }
-        html += '<div class="message-content' + (!isUser && m.content ? ' markdown-rendered' : '') + '">' + contentHtml + '</div>';
+        const contentClass = 'message-content' + (contentIsMarkdown ? ' markdown-rendered' : '');
+        html += '<div class="' + contentClass + '">' + contentHtml + '</div>';
+
+        // 工具调用轨道（仅 AI 消息显示）
+        if (!isUser && m.toolCalls && m.toolCalls.length > 0) {
+          html += renderToolTrack(m.toolCalls, 'tool-cli-' + cli + '-' + idx);
+        }
 
         // 重连状态（仅 AI 消息显示）
         if (!isUser && m.reconnecting) {
@@ -2895,8 +3744,19 @@
       const contentEl = streamingMessage.querySelector('.message-content');
       if (!contentEl) return false;
 
-      // 只更新文本内容，不重建 DOM
-      contentEl.textContent = content;
+      const messages = cliOutputs[cli] || [];
+      const lastMsg = messages.find(m => m.streaming);
+      if (lastMsg) {
+        const rendered = renderNormalizedContent(content || lastMsg.content || '', cli, { toolCalls: lastMsg.toolCalls });
+        contentEl.innerHTML = rendered.html;
+        if (rendered.isMarkdown) {
+          contentEl.classList.add('markdown-rendered');
+        } else {
+          contentEl.classList.remove('markdown-rendered');
+        }
+      } else {
+        contentEl.textContent = content;
+      }
       return true;
     }
 
@@ -2914,8 +3774,22 @@
     }
 
     // 更新 CLI 执行统计面板
-    function updateExecutionStats(stats) {
+    function updateExecutionStats(stats, orchestratorStats) {
       if (!stats || !Array.isArray(stats)) return;
+
+      // 🆕 更新编排者汇总统计
+      if (orchestratorStats) {
+        const totalTasksEl = document.getElementById('orch-total-tasks');
+        const successEl = document.getElementById('orch-success');
+        const failedEl = document.getElementById('orch-failed');
+        const inputTokensEl = document.getElementById('orch-input-tokens');
+        const outputTokensEl = document.getElementById('orch-output-tokens');
+        if (totalTasksEl) totalTasksEl.textContent = orchestratorStats.totalTasks || 0;
+        if (successEl) successEl.textContent = orchestratorStats.totalSuccess || 0;
+        if (failedEl) failedEl.textContent = orchestratorStats.totalFailed || 0;
+        if (inputTokensEl) inputTokensEl.textContent = formatTokenCount(orchestratorStats.totalInputTokens || 0);
+        if (outputTokensEl) outputTokensEl.textContent = formatTokenCount(orchestratorStats.totalOutputTokens || 0);
+      }
 
       stats.forEach(stat => {
         const card = document.querySelector(`.cli-stat-card[data-cli="${stat.cli}"]`);
@@ -2951,6 +3825,14 @@
           detailEl.textContent = `${stat.totalExecutions} 次执行 · 平均 ${avgTime}`;
         }
 
+        // 🆕 更新 token 统计
+        const tokensEl = card.querySelector('.cli-stat-tokens');
+        if (tokensEl) {
+          const inputTokens = formatTokenCount(stat.totalInputTokens || 0);
+          const outputTokens = formatTokenCount(stat.totalOutputTokens || 0);
+          tokensEl.textContent = `${inputTokens} / ${outputTokens}`;
+        }
+
         // 更新进度条
         const barFill = card.querySelector('.cli-stat-bar-fill');
         if (barFill) {
@@ -2962,6 +3844,14 @@
           else barFill.classList.add('bad');
         }
       });
+    }
+
+    // 🆕 格式化 token 数量（自动选择合适单位：K/M/G）
+    function formatTokenCount(count) {
+      if (count >= 1000000000) return (count / 1000000000).toFixed(2) + 'G';
+      if (count >= 1000000) return (count / 1000000).toFixed(2) + 'M';
+      if (count >= 1000) return (count / 1000).toFixed(2) + 'K';
+      return count.toString();
     }
 
     // 请求执行统计数据
@@ -3268,6 +4158,19 @@
 
       const input = document.getElementById('prompt-input');
       if (input.value.trim() || attachedImages.length > 0) {
+        if (hasPendingQuestion()) {
+          const answerText = input.value.trim();
+          if (!answerText) {
+            addSystemMessage('请先回答问题后再提交', 'warning');
+            return;
+          }
+          handleQuestionAnswer(answerText, false);
+          input.value = '';
+          attachedImages = [];
+          renderImagePreviews();
+          return;
+        }
+
         // 如果有待确认的面板，先取消它
         if (hasPendingConfirmation()) {
           cancelPendingConfirmation();
@@ -3275,6 +4178,8 @@
 
         const promptText = input.value.trim() || '请分析这张图片';
         const hasImages = attachedImages.length > 0;
+        const selectedCli = document.getElementById('cli-selector')?.value || '';
+        setProcessingActor(selectedCli ? 'worker' : 'orchestrator', selectedCli || 'claude');
 
         // 存储图片数据（不是 HTML 字符串）
         const imageDataUrls = hasImages ? attachedImages.map(img => img.dataUrl) : [];
@@ -3289,8 +4194,7 @@
         // 不再添加 loading 消息到数组，改为根据 isProcessing 状态动态显示
 
         // 设置处理状态
-        isProcessing = true;
-        updateSendButtonState();
+        setProcessingState(true);
 
         // 发送消息（包含图片数据）
         const imageData = attachedImages.map(img => ({ dataUrl: img.dataUrl }));
@@ -3455,21 +4359,24 @@
     // New Session
     document.getElementById('new-session-btn').addEventListener('click', () => createNewSession());
 
-    // 交互模式选择器
+    // 交互模式选择器（下拉框）
     let currentInteractionMode = 'agent'; // 默认 agent 模式
-    document.querySelectorAll('.mode-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const mode = btn.dataset.mode;
-        if (mode && mode !== currentInteractionMode) {
-          currentInteractionMode = mode;
-          // 更新 UI
-          document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
-          btn.classList.add('active');
-          // 发送消息到 Extension
-          vscode.postMessage({ type: 'setInteractionMode', mode: mode });
-        }
-      });
+    const modeSelector = document.getElementById('mode-selector');
+    modeSelector.addEventListener('change', (e) => {
+      const mode = e.target.value;
+      if (mode && mode !== currentInteractionMode) {
+        currentInteractionMode = mode;
+        // 发送消息到 Extension
+        vscode.postMessage({ type: 'setInteractionMode', mode: mode });
+      }
     });
+
+    // 更新模式选择器 UI
+    function updateInteractionModeUI(mode) {
+      currentInteractionMode = mode;
+      const selector = document.getElementById('mode-selector');
+      if (selector) selector.value = mode;
+    }
 
     // 处理恢复确认对话框
     function showRecoveryDialog(taskId, error, canRetry, canRollback) {
@@ -3501,14 +4408,6 @@
           vscode.postMessage({ type: 'confirmRecovery', decision: decision });
           dialog.remove();
         });
-      });
-    }
-
-    // 更新交互模式 UI
-    function updateInteractionModeUI(mode) {
-      currentInteractionMode = mode;
-      document.querySelectorAll('.mode-btn').forEach(btn => {
-        btn.classList.toggle('active', btn.dataset.mode === mode);
       });
     }
 
@@ -3561,6 +4460,14 @@
     function renderMainContent() {
       const container = document.getElementById('main-content');
       if (!container) return;
+      if (!container.dataset.scrollListener) {
+        container.dataset.scrollListener = 'true';
+        container.addEventListener('scroll', () => {
+          const atBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 20;
+          autoScrollEnabled[currentBottomTab] = atBottom;
+          saveWebviewState();
+        }, { passive: true });
+      }
 
       // 修复：渲染前保存滚动位置
       const scrollTop = container.scrollTop;
@@ -3580,27 +4487,113 @@
         if (wasAtBottom) {
           // 如果之前在底部，保持在底部
           container.scrollTop = container.scrollHeight;
+          autoScrollEnabled[currentBottomTab] = true;
         } else {
           // 否则恢复到之前的位置
           container.scrollTop = scrollTop;
+          autoScrollEnabled[currentBottomTab] = false;
         }
       });
     }
 
+    function getStreamKey(source, cli) {
+      return (source || 'orchestrator') + ':' + (cli || 'claude');
+    }
+
+    function ensureThreadStreamMessage(source, cli, initialContent) {
+      const streamKey = getStreamKey(source, cli);
+      let idx = threadMessages.findIndex(m => m.streaming && m.streamKey === streamKey);
+      if (idx === -1) {
+        const msg = {
+          role: 'assistant',
+          content: initialContent || '',
+          time: new Date().toLocaleTimeString().slice(0,5),
+          streaming: true,
+          startedAt: Date.now(),
+          source: source,
+          cli: cli,
+          streamKey: streamKey
+        };
+        threadMessages.push(msg);
+        idx = threadMessages.length - 1;
+      }
+      return { idx, msg: threadMessages[idx] };
+    }
+
+    function applyThreadStreamUpdate(source, cli, parsed, chunk, likelyJson) {
+      const initialContent = parsed && parsed.hasJson ? (parsed.text || '') : (likelyJson ? '' : (chunk || ''));
+      const { msg } = ensureThreadStreamMessage(source, cli, initialContent);
+      if (parsed && parsed.hasJson) {
+        const toolCount = parsed.toolCalls ? parsed.toolCalls.length : 0;
+        const thinkingCount = parsed.thinking ? parsed.thinking.length : 0;
+        msg.toolCountChanged = (msg.lastToolCount || 0) !== toolCount;
+        msg.thinkingCountChanged = (msg.lastThinkingCount || 0) !== thinkingCount;
+        msg.content = parsed.text || '';
+        msg.thinking = parsed.thinking || [];
+        msg.toolCalls = parsed.toolCalls || [];
+        msg.lastToolCount = toolCount;
+        msg.lastThinkingCount = thinkingCount;
+        if (parsed.completed) {
+          msg.streaming = false;
+        }
+      } else if (chunk && !likelyJson) {
+        msg.content = (msg.content || '') + chunk;
+      }
+      return msg;
+    }
+
+    function finalizeThreadStream(source, cli, content, error) {
+      const streamKey = getStreamKey(source, cli);
+      const idx = threadMessages.findIndex(m => m.streaming && m.streamKey === streamKey);
+      if (idx !== -1) {
+        const msg = threadMessages[idx];
+        if (content) {
+          msg.content = error ? ('错误: ' + error) : content;
+        }
+        msg.streaming = false;
+        if (error) {
+          msg.type = 'error';
+          msg.isError = true;
+        }
+        return msg;
+      }
+      if (content) {
+        threadMessages.push({
+          role: 'assistant',
+          content: error ? ('错误: ' + error) : content,
+          time: new Date().toLocaleTimeString().slice(0,5),
+          streaming: false,
+          source: source,
+          cli: cli,
+          streamKey: streamKey,
+          isError: !!error,
+          type: error ? 'error' : undefined
+        });
+      }
+      return null;
+    }
+
     /** 增量更新：只更新流式消息的内容，避免重建整个 DOM */
-    function updateStreamingMessage(content) {
+    function updateStreamingMessage(streamKey, content) {
       const container = document.getElementById('main-content');
       if (!container || currentBottomTab !== 'thread') return false;
 
       // 查找带有 streaming 类的消息元素
-      const streamingMessage = container.querySelector('.message.streaming');
+      const streamingMessage = container.querySelector('.message.streaming[data-stream-key="' + streamKey + '"]');
       if (!streamingMessage) return false;
 
       const contentEl = streamingMessage.querySelector('.message-content');
       if (!contentEl) return false;
 
-      // 只更新文本内容，不重建 DOM
-      contentEl.textContent = content;
+      const streamingMsg = threadMessages.find(m => m.streaming && m.streamKey === streamKey);
+      const cli = streamingMsg?.cli || 'claude';
+      const rendered = renderNormalizedContent(content || '', cli, { toolCalls: streamingMsg?.toolCalls });
+      contentEl.innerHTML = rendered.html;
+      if (rendered.isMarkdown) {
+        contentEl.classList.add('markdown-rendered');
+      } else {
+        contentEl.classList.remove('markdown-rendered');
+      }
       return true;
     }
 
@@ -3611,6 +4604,10 @@
       scrollRAF = requestAnimationFrame(() => {
         const mainContent = document.getElementById('main-content');
         if (mainContent) {
+          if (!autoScrollEnabled[currentBottomTab]) {
+            scrollRAF = null;
+            return;
+          }
           // 使用 smooth 滚动行为
           mainContent.scrollTo({
             top: mainContent.scrollHeight,
@@ -3630,6 +4627,27 @@
         saveStateTimeout = null;
       }, 500); // 500ms 节流
     }
+    let lastStreamSaveAt = 0;
+    function shouldSaveStreamState() {
+      const now = Date.now();
+      if (now - lastStreamSaveAt > 1500) {
+        lastStreamSaveAt = now;
+        return true;
+      }
+      return false;
+    }
+
+    const streamLatencyState = {};
+    function getStreamLatency(cli) {
+      const key = cli || 'orchestrator';
+      if (!streamLatencyState[key]) {
+        streamLatencyState[key] = {
+          firstSentAt: null,
+          firstRenderAt: null
+        };
+      }
+      return streamLatencyState[key];
+    }
 
     function renderThreadView(container) {
       if (threadMessages.length === 0) {
@@ -3641,16 +4659,16 @@
       let prevMessageKey = null;
 
       threadMessages.forEach((m, idx) => {
-        // 处理 CLI 状态卡片（简洁展示）- 不参与分组
-        if (m.cliStatusCard) {
-          html += renderCliStatusCard(m, idx);
-          prevMessageKey = null; // 重置分组
-          return;
-        }
-
         // 处理执行计划确认面板 - 不参与分组
         if (m.type === 'plan_confirmation') {
           html += renderPlanConfirmationCard(m, idx);
+          prevMessageKey = null;
+          return;
+        }
+
+        // 处理问题补充面板 - 不参与分组
+        if (m.type === 'question_request') {
+          html += renderQuestionCard(m, idx);
           prevMessageKey = null;
           return;
         }
@@ -3690,9 +4708,9 @@
         const messageTypeClass = isUser ? ' user-message' : ' assistant-message';
         const groupedClass = isGrouped ? ' grouped' : '';
 
-        // 🆕 根据 source 和 cli 确定显示名称
-        let roleName = '你';
-        let badgeClass = 'user';
+        // 🆕 根据 source 和 cli 确定显示名称（仅 AI 消息显示徽章）
+        let roleName = '';
+        let badgeClass = '';
         if (!isUser) {
           if (source === 'orchestrator') {
             roleName = 'Orchestrator';
@@ -3706,10 +4724,13 @@
           }
         }
 
-        html += '<div class="message' + messageTypeClass + streamingClass + groupedClass + '" data-msg-idx="' + idx + '">';
+        const streamKeyAttr = m.streamKey ? (' data-stream-key="' + m.streamKey + '"') : '';
+        html += '<div class="message' + messageTypeClass + streamingClass + groupedClass + '" data-msg-idx="' + idx + '"' + streamKeyAttr + '>';
         html += '<div class="message-body">';
         html += '<div class="message-header">';
-        html += '<span class="message-role-badge ' + badgeClass + '">' + roleName + '</span>';
+        if (!isUser && roleName) {
+          html += '<span class="message-role-badge ' + badgeClass + '">' + roleName + '</span>';
+        }
         html += '<span class="message-time">' + (m.time || '') + '</span>';
         html += '</div>';
 
@@ -3728,29 +4749,9 @@
           html += '</div>';
         }
 
-        // 工具调用面板（仅 AI 消息显示）
-        if (!isUser && m.toolCalls && m.toolCalls.length > 0) {
-          m.toolCalls.forEach((tool, toolIdx) => {
-            const toolPanelId = 'tool-thread-' + idx + '-' + toolIdx;
-            const toolStatus = tool.status || 'completed';
-            const toolContent = tool.result || tool.input || '';
-            if (!toolContent || !String(toolContent).trim()) {
-              if (toolStatus === 'running') return;
-            }
-            html += '<div class="collapsible-panel tool-call" data-panel-id="' + toolPanelId + '">';
-            html += '<div class="collapsible-header" onclick="togglePanel(\'' + toolPanelId + '\')">';
-            html += '<span class="collapsible-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></span>';
-            html += '<span class="collapsible-title"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M1 0L0 1l2.2 3.081a1 1 0 0 0 .815.419h.07a1 1 0 0 1 .708.293l2.675 2.675-2.617 2.654A3.003 3.003 0 0 0 0 13a3 3 0 1 0 5.878-.851l2.654-2.617.968.968-.305.914a1 1 0 0 0 .242 1.023l3.356 3.356a1 1 0 0 0 1.414 0l1.586-1.586a1 1 0 0 0 0-1.414l-3.356-3.356a1 1 0 0 0-1.023-.242l-.914.305-.968-.968 2.617-2.654A3.003 3.003 0 0 0 13 0a3 3 0 1 0-.851 5.878L9.495 8.53 6.82 5.854a1 1 0 0 1-.293-.708v-.07a1 1 0 0 0-.419-.815L1 0zm9.5 5.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm-9 8a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/></svg>' + escapeHtml(tool.name || '工具调用') + '</span>';
-            html += '<span class="collapsible-status ' + toolStatus + '">' + (toolStatus === 'running' ? '执行中' : '') + '</span>';
-            html += '</div>';
-            // 使用 renderMarkdown 渲染工具调用结果，支持代码块语法高亮
-            html += '<div class="collapsible-content"><div class="collapsible-body markdown-rendered">' + renderToolPanelContent(toolContent) + '</div></div>';
-            html += '</div>';
-          });
-        }
-
         // 消息内容
         let contentHtml = '';
+        let contentIsMarkdown = false;
         if (m.images && m.images.length > 0) {
           contentHtml += '<div class="message-images">';
           m.images.forEach(imgSrc => {
@@ -3758,18 +4759,30 @@
           });
           contentHtml += '</div>';
         }
-        // 使用增强的格式化函数（仅对 AI 消息）
+        // 使用统一的规范化入口（仅对 AI 消息）
         if (!isUser && m.content) {
           if (source === 'orchestrator') {
             const sanitized = sanitizeOrchestratorMessage(m.content);
-            contentHtml += sanitized ? formatSimpleContent(sanitized) : '';
+            if (sanitized) {
+              const rendered = renderNormalizedContent(sanitized, m.cli, { toolCalls: m.toolCalls });
+              contentHtml += rendered.html;
+              contentIsMarkdown = rendered.isMarkdown;
+            }
           } else {
-            contentHtml += formatMessageContent(m.content, m.cli);
+            const rendered = renderNormalizedContent(m.content, m.cli, { toolCalls: m.toolCalls });
+            contentHtml += rendered.html;
+            contentIsMarkdown = rendered.isMarkdown;
           }
         } else {
           contentHtml += escapeHtml(m.content || '');
         }
-        html += '<div class="message-content">' + contentHtml + '</div>';
+        const contentClass = 'message-content' + (contentIsMarkdown ? ' markdown-rendered' : '');
+        html += '<div class="' + contentClass + '">' + contentHtml + '</div>';
+
+        // 工具调用轨道（仅 AI 消息显示）
+        if (!isUser && m.toolCalls && m.toolCalls.length > 0) {
+          html += renderToolTrack(m.toolCalls, 'tool-thread-' + idx);
+        }
 
         // 重连状态（仅 AI 消息显示）
         if (!isUser && m.reconnecting) {
@@ -3790,15 +4803,19 @@
         if (!hasActiveStreaming || hasRunningToolCall) {
           html += '<div class="message assistant-message loading-message">';
           html += '<div class="message-body">';
-          html += '<div class="message-header">';
-          html += '<span class="message-role-badge assistant">AI</span>';
-          html += '</div>';
-          html += '<div class="message-content"><span class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span> 正在思考...</div>';
+          const startAt = thinkingStartAt || Date.now();
+          const elapsed = formatElapsed(Date.now() - startAt);
+          html += '<div class="message-content message-streaming-hint" data-start-at="' + startAt + '"><span class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span> 正在思考 <span class="thinking-elapsed">用时 ' + elapsed + '</span></div>';
           html += '</div></div>';
         }
       }
 
       container.innerHTML = html;
+      if (container.querySelector('.message-streaming-hint')) {
+        startStreamingHintTimer();
+      } else {
+        stopStreamingHintTimer();
+      }
     }
 
     // 渲染系统提示消息
@@ -3831,15 +4848,52 @@
     function upsertToolCall(message, toolCall) {
       if (!message) return;
       if (!message.toolCalls) message.toolCalls = [];
+      const isResult = toolCall.kind === 'result' || toolCall.name === '工具结果';
       const toolId = toolCall.id || toolCall.tool_call_id;
       if (toolId) {
         const existingIdx = message.toolCalls.findIndex(t => t.id === toolId || t.tool_call_id === toolId);
         if (existingIdx !== -1) {
-          message.toolCalls[existingIdx] = { ...message.toolCalls[existingIdx], ...toolCall };
+          const existing = message.toolCalls[existingIdx];
+          const seq = existing.seq ?? toolCall.seq;
+          const timestamp = existing.timestamp ?? toolCall.timestamp ?? Date.now();
+          const keepName = existing.name && (isResult || toolCall.name === '工具调用');
+          message.toolCalls[existingIdx] = {
+            ...existing,
+            ...toolCall,
+            name: keepName ? existing.name : (toolCall.name || existing.name),
+            input: toolCall.input ?? existing.input,
+            result: toolCall.result ?? existing.result,
+            status: toolCall.status || existing.status,
+            seq,
+            timestamp
+          };
+          message.toolCallsVersion = (message.toolCallsVersion || 0) + 1;
+          message.toolCallsChanged = true;
           return;
         }
       }
-      message.toolCalls.push(toolCall);
+      if (isResult) {
+        for (let i = message.toolCalls.length - 1; i >= 0; i -= 1) {
+          const existing = message.toolCalls[i];
+          if (!existing) continue;
+          if ((existing.kind === 'call' || !existing.kind) && (existing.status === 'running' || !existing.status)) {
+            message.toolCalls[i] = {
+              ...existing,
+              result: toolCall.result ?? existing.result,
+              status: 'completed'
+            };
+            message.toolCallsVersion = (message.toolCallsVersion || 0) + 1;
+            message.toolCallsChanged = true;
+            return;
+          }
+        }
+      }
+      const nextSeq = (message.toolCallSeq || 0) + 1;
+      message.toolCallSeq = nextSeq;
+      const timestamp = toolCall.timestamp ?? Date.now();
+      message.toolCalls.push({ ...toolCall, seq: toolCall.seq ?? nextSeq, timestamp });
+      message.toolCallsVersion = (message.toolCallsVersion || 0) + 1;
+      message.toolCallsChanged = true;
     }
 
     // 渲染错误消息
@@ -3914,6 +4968,42 @@
         html += '</div>';
       }
 
+      html += '</div>';
+      return html;
+    }
+
+    // 渲染问题补充卡片
+    function renderQuestionCard(m, idx) {
+      const isPending = m.isPending;
+      const answered = !!m.answered;
+      const statusClass = isPending ? 'pending' : (answered ? 'answered' : 'cancelled');
+      const statusText = isPending ? '等待回答' : (answered ? '已回答' : '已取消');
+      const questions = Array.isArray(m.questions) ? m.questions : [];
+
+      let html = '<div class="question-card ' + statusClass + '" data-msg-idx="' + idx + '">';
+      html += '<div class="question-header">';
+      html += '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 12.5A5.5 5.5 0 1 1 8 2.5a5.5 5.5 0 0 1 0 11z"/><path d="M7.75 10a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0zM8 4.75a2 2 0 0 0-1.75 2.97.75.75 0 0 0 1.3-.75.5.5 0 1 1 .9 0c0 .5-.25.75-.64 1.05-.52.4-1.11.88-1.11 2.23a.75.75 0 0 0 1.5 0c0-.7.2-.93.63-1.27.55-.43 1.37-1.07 1.37-2.26A2 2 0 0 0 8 4.75z"/></svg>';
+      html += '<span class="question-title">需要补充信息</span>';
+      html += '<span class="question-status ' + statusClass + '">' + statusText + '</span>';
+      html += '<span class="question-time">' + (m.time || '') + '</span>';
+      html += '</div>';
+      html += '<div class="question-content">';
+      html += '<ol class="question-list">';
+      questions.forEach(q => {
+        html += '<li>' + escapeHtml(String(q)) + '</li>';
+      });
+      html += '</ol>';
+      if (isPending) {
+        html += '<div class="question-hint">请在下方输入框回答问题，然后点击发送。</div>';
+      } else if (answered && m.answer) {
+        html += '<div class="question-answer-display">' + escapeHtml(m.answer) + '</div>';
+      }
+      html += '</div>';
+      if (isPending) {
+        html += '<div class="question-actions">';
+        html += '<button class="question-btn cancel" data-action="cancel">取消</button>';
+        html += '</div>';
+      }
       html += '</div>';
       return html;
     }
@@ -4142,6 +5232,45 @@
       container.innerHTML = html;
     }
 
+    // 🆕 根据工具名称返回对应的 SVG 图标
+    function getToolIcon(toolName) {
+      const name = (toolName || '').toLowerCase();
+      // 文件读取
+      if (name.includes('read') || name.includes('view') || name.includes('cat')) {
+        return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M14 4.5V14a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2a2 2 0 0 1 2-2h5.5L14 4.5zM10 4a1 1 0 0 1-1-1V1.5L13.5 6H11a1 1 0 0 1-1-1V4z"/></svg>';
+      }
+      // 文件写入/编辑
+      if (name.includes('write') || name.includes('edit') || name.includes('save') || name.includes('create') || name.includes('patch')) {
+        return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168l10-10zM11.207 2.5L13.5 4.793 14.793 3.5 12.5 1.207 11.207 2.5zm1.586 3L10.5 3.207 4 9.707V10h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.293l6.5-6.5z"/></svg>';
+      }
+      // 搜索/查找
+      if (name.includes('search') || name.includes('find') || name.includes('grep') || name.includes('glob')) {
+        return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z"/></svg>';
+      }
+      // 终端/命令执行
+      if (name.includes('bash') || name.includes('shell') || name.includes('exec') || name.includes('run') || name.includes('terminal') || name.includes('command')) {
+        return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M6 9a.5.5 0 0 1 .5-.5h3a.5.5 0 0 1 0 1h-3A.5.5 0 0 1 6 9zM3.854 4.146a.5.5 0 1 0-.708.708L4.793 6.5 3.146 8.146a.5.5 0 1 0 .708.708l2-2a.5.5 0 0 0 0-.708l-2-2z"/><path d="M2 1a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V3a2 2 0 0 0-2-2H2zm12 1a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1h12z"/></svg>';
+      }
+      // 列表/目录
+      if (name.includes('list') || name.includes('ls') || name.includes('dir')) {
+        return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M0 2a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V2zm4 0v12h10a1 1 0 0 0 1-1V3a1 1 0 0 0-1-1H4zm-1 0H2a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h1V2z"/></svg>';
+      }
+      // 网络/API
+      if (name.includes('fetch') || name.includes('http') || name.includes('api') || name.includes('web') || name.includes('url')) {
+        return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8zm7.5-6.923c-.67.204-1.335.82-1.887 1.855A7.97 7.97 0 0 0 5.145 4H7.5V1.077zM4.09 4a9.267 9.267 0 0 1 .64-1.539 6.7 6.7 0 0 1 .597-.933A7.025 7.025 0 0 0 2.255 4H4.09zm-.582 3.5c.03-.877.138-1.718.312-2.5H1.674a6.958 6.958 0 0 0-.656 2.5h2.49zM4.847 5a12.5 12.5 0 0 0-.338 2.5H7.5V5H4.847z"/></svg>';
+      }
+      // 思考/分析
+      if (name.includes('think') || name.includes('reason') || name.includes('analyze')) {
+        return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16zM7 6.5C7 7.328 6.552 8 6 8s-1-.672-1-1.5S5.448 5 6 5s1 .672 1 1.5zM4.285 9.567a.5.5 0 0 1 .683.183A3.498 3.498 0 0 0 8 11.5a3.498 3.498 0 0 0 3.032-1.75.5.5 0 1 1 .866.5A4.498 4.498 0 0 1 8 12.5a4.498 4.498 0 0 1-3.898-2.25.5.5 0 0 1 .183-.683zM10 8c-.552 0-1-.672-1-1.5S9.448 5 10 5s1 .672 1 1.5S10.552 8 10 8z"/></svg>';
+      }
+      // 删除
+      if (name.includes('delete') || name.includes('remove') || name.includes('rm')) {
+        return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/><path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1z"/></svg>';
+      }
+      // 默认：扳手工具图标
+      return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M1 0L0 1l2.2 3.081a1 1 0 0 0 .815.419h.07a1 1 0 0 1 .708.293l2.675 2.675-2.617 2.654A3.003 3.003 0 0 0 0 13a3 3 0 1 0 5.878-.851l2.654-2.617.968.968-.305.914a1 1 0 0 0 .242 1.023l3.356 3.356a1 1 0 0 0 1.414 0l1.586-1.586a1 1 0 0 0 0-1.414l-3.356-3.356a1 1 0 0 0-1.023-.242l-.914.305-.968-.968 2.617-2.654A3.003 3.003 0 0 0 13 0a3 3 0 1 0-.851 5.878L9.495 8.53 6.82 5.854a1 1 0 0 1-.293-.708v-.07a1 1 0 0 0-.419-.815L1 0zm9.5 5.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm-9 8a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/></svg>';
+    }
+
     function escapeHtml(text) {
       return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
@@ -4210,12 +5339,30 @@
     document.getElementById('settings-close-btn').addEventListener('click', () => settingsOverlay.classList.remove('visible'));
     settingsOverlay.addEventListener('click', (e) => { if (e.target === settingsOverlay) settingsOverlay.classList.remove('visible'); });
 
+    // 设置面板 Tab 切换
+    document.querySelectorAll('.settings-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        const targetTab = tab.dataset.tab;
+        // 更新 Tab 按钮状态
+        document.querySelectorAll('.settings-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        // 更新 Tab 内容显示
+        document.querySelectorAll('.settings-tab-content').forEach(content => content.classList.remove('active'));
+        document.getElementById('settings-tab-' + targetTab).classList.add('active');
+      });
+    });
+
     // CLI 刷新按钮
     document.getElementById('cli-refresh-btn').addEventListener('click', () => {
       const btn = document.getElementById('cli-refresh-btn');
       btn.classList.add('loading');
       requestCliStatus();
       setTimeout(() => btn.classList.remove('loading'), 1000);
+    });
+
+    // 统计重置按钮
+    document.getElementById('stats-reset-btn').addEventListener('click', () => {
+      vscode.postMessage({ type: 'resetExecutionStats' });
     });
 
     // 请求 CLI 连接状态

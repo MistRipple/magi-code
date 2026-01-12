@@ -73,6 +73,18 @@ export interface CLIResponse {
   error?: string;
   /** 原始输出 */
   raw?: string;
+  /** 🆕 Token 使用统计 */
+  tokenUsage?: TokenUsage;
+}
+
+/** 🆕 Token 使用统计 */
+export interface TokenUsage {
+  /** 输入 token 数 */
+  inputTokens: number;
+  /** 输出 token 数 */
+  outputTokens: number;
+  /** 缓存读取 token 数 */
+  cacheReadTokens?: number;
 }
 
 /** 文件变更 */
@@ -128,6 +140,14 @@ export interface AdapterConfig {
   timeout?: number;
 }
 
+export interface AdapterMessageMeta {
+  taskId?: string;
+  subTaskId?: string;
+  intent?: string;
+  contextSnapshot?: string;
+  data?: Record<string, unknown>;
+}
+
 /** CLI 适配器接口 */
 export interface ICLIAdapter extends EventEmitter {
   /** CLI 类型 */
@@ -146,7 +166,7 @@ export interface ICLIAdapter extends EventEmitter {
   disconnect(): Promise<void>;
 
   /** 发送消息（可选图片路径） */
-  sendMessage(message: string, imagePaths?: string[]): Promise<CLIResponse>;
+  sendMessage(message: string, imagePaths?: string[], meta?: AdapterMessageMeta): Promise<CLIResponse>;
 
   /** 中断当前操作 */
   interrupt(): Promise<void>;
@@ -185,8 +205,6 @@ export interface Session {
   messages: SessionMessage[];
   createdAt: number;
   updatedAt: number;
-  /** 各 CLI 的会话 ID */
-  cliSessionIds?: Partial<Record<CLIType, string>>;
 }
 
 /** 会话元数据（用于列表显示） */

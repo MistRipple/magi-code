@@ -26,8 +26,10 @@ export class ChatSessionManager {
   private sessions: Map<string, Session> = new Map();
   private currentSessionId: string | null = null;
   private storageDir: string;
+  private workspaceRoot: string;
 
   constructor(workspaceRoot: string) {
+    this.workspaceRoot = workspaceRoot;
     this.storageDir = path.join(workspaceRoot, '.multicli', 'chat-sessions');
     this.ensureStorageDir();
     this.loadAllSessions();
@@ -54,7 +56,6 @@ export class ChatSessionManager {
       messages: [],
       createdAt: now,
       updatedAt: now,
-      cliSessionIds: {},
     };
 
     this.sessions.set(session.id, session);
@@ -175,69 +176,12 @@ export class ChatSessionManager {
       text = text.replace(pattern, '').trim();
     }
 
-    // 提取代码相关名称（函数名、文件名、类名等）
-    const codePatterns = [
-      /`([^`]+)`/,                           // 反引号包裹的代码
-      /(\w+\.\w+)/,                          // 文件名 (xxx.ts)
-      /(\w+(?:Service|Manager|Controller|Handler|Component|Module|Utils?))/i,  // 常见类名
-      /(?:函数|方法|function|method)\s*[`'"]*(\w+)/i,  // 函数名
-    ];
-
-    let codeName = '';
-    for (const pattern of codePatterns) {
-      const match = text.match(pattern);
-      if (match && match[1]) {
-        codeName = match[1];
-        break;
-      }
-    }
-
-    // 提取动作关键词
-    const actionKeywords = [
-      { pattern: /(添加|新增|创建|实现|add|create|implement)/i, action: '添加' },
-      { pattern: /(修复|修改|fix|repair|debug)/i, action: '修复' },
-      { pattern: /(优化|改进|improve|optimize)/i, action: '优化' },
-      { pattern: /(重构|refactor)/i, action: '重构' },
-      { pattern: /(删除|移除|remove|delete)/i, action: '删除' },
-      { pattern: /(更新|update)/i, action: '更新' },
-      { pattern: /(测试|test)/i, action: '测试' },
-      { pattern: /(分析|analyze|review)/i, action: '分析' },
-      { pattern: /(解释|explain)/i, action: '解释' },
-    ];
-
-    let action = '';
-    for (const { pattern, action: act } of actionKeywords) {
-      if (pattern.test(text)) {
-        action = act;
-        break;
-      }
-    }
-
-    // 如果有动作和代码名称，生成简洁标题
-    if (action && codeName) {
-      return `${action} ${codeName}`;
-    }
-
-    // 否则智能截断原文
-    const maxLength = 25;
+    // 直接截断原文（基于第一条用户消息）
+    const maxLength = 100;
     if (text.length <= maxLength) {
       return text;
     }
-
-    // 在词边界截断（中文按字符，英文按空格）
-    const hasChinese = /[\u4e00-\u9fa5]/.test(text);
-    if (hasChinese) {
-      // 中文：直接截断
-      return text.substring(0, maxLength) + '...';
-    } else {
-      // 英文：在空格处截断
-      const truncated = text.substring(0, maxLength);
-      const lastSpace = truncated.lastIndexOf(' ');
-      if (lastSpace > maxLength * 0.6) {
-        return truncated.substring(0, lastSpace) + '...';
-      }
-      return truncated + '...';
-    }
+    return text.substring(0, maxLength) + '...';
   }
 
   /** 重命名会话 */
@@ -275,36 +219,28 @@ export class ChatSessionManager {
     }
   }
 
-  /** 更新 CLI 会话 ID */
-  updateCliSessionId(cli: CLIType, cliSessionId: string | null): void {
-    const session = this.getOrCreateCurrentSession();
-    if (!session.cliSessionIds) {
-      session.cliSessionIds = {};
-    }
-    if (cliSessionId) {
-      session.cliSessionIds[cli] = cliSessionId;
-    } else {
-      delete session.cliSessionIds[cli];
-    }
-    this.saveSession(session);
-  }
-
-  /** 获取 CLI 会话 ID */
-  getCliSessionId(cli: CLIType): string | undefined {
-    const session = this.getCurrentSession();
-    return session?.cliSessionIds?.[cli];
-  }
-
-  /** 删除会话 */
+  /** 删除会话（同时清理相关资源） */
   deleteSession(sessionId: string): boolean {
     const session = this.sessions.get(sessionId);
     if (!session) return false;
 
+    // 1. 删除会话文件
     this.sessions.delete(sessionId);
     const filePath = path.join(this.storageDir, `${sessionId}.json`);
     if (fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
     }
+
+    // 2. 清理关联的任务状态文件
+    this.cleanupTaskState(sessionId);
+
+    // 3. 清理 Memory 文档
+    this.cleanupMemoryDocument(sessionId);
+
+    // 4. 清理图片附件（如果有）
+    this.cleanupAttachments(session);
+
+    console.log(`[ChatSessionManager] 已删除会话及相关资源: ${sessionId}`);
 
     // 如果删除的是当前会话，切换到最新的会话或创建新会话
     if (this.currentSessionId === sessionId) {
@@ -313,6 +249,69 @@ export class ChatSessionManager {
     }
 
     return true;
+  }
+
+  /** 清理任务状态文件 */
+  private cleanupTaskState(sessionId: string): void {
+    const taskFilePath = path.join(this.workspaceRoot, '.multicli', 'tasks', `${sessionId}.json`);
+    if (fs.existsSync(taskFilePath)) {
+      try {
+        fs.unlinkSync(taskFilePath);
+        console.log(`[ChatSessionManager] 已清理任务状态: ${taskFilePath}`);
+      } catch (e) {
+        console.error(`[ChatSessionManager] 清理任务状态失败: ${taskFilePath}`, e);
+      }
+    }
+  }
+
+  /** 清理 Memory 文档 */
+  private cleanupMemoryDocument(sessionId: string): void {
+    const memoryDir = path.join(this.workspaceRoot, '.multicli', 'sessions', sessionId);
+    if (fs.existsSync(memoryDir)) {
+      try {
+        // 递归删除目录
+        this.removeDirectoryRecursive(memoryDir);
+        console.log(`[ChatSessionManager] 已清理 Memory 文档: ${memoryDir}`);
+      } catch (e) {
+        console.error(`[ChatSessionManager] 清理 Memory 文档失败: ${memoryDir}`, e);
+      }
+    }
+  }
+
+  /** 清理图片附件 */
+  private cleanupAttachments(session: Session): void {
+    // 遍历会话消息，查找图片附件
+    for (const message of session.messages) {
+      if (message.attachments && message.attachments.length > 0) {
+        for (const attachment of message.attachments) {
+          // 只清理工作区内的临时图片（.multicli/attachments 目录下的）
+          if (attachment.path.includes('.multicli/attachments') && fs.existsSync(attachment.path)) {
+            try {
+              fs.unlinkSync(attachment.path);
+              console.log(`[ChatSessionManager] 已清理图片附件: ${attachment.path}`);
+            } catch (e) {
+              console.error(`[ChatSessionManager] 清理图片附件失败: ${attachment.path}`, e);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /** 递归删除目录 */
+  private removeDirectoryRecursive(dirPath: string): void {
+    if (fs.existsSync(dirPath)) {
+      const files = fs.readdirSync(dirPath);
+      for (const file of files) {
+        const curPath = path.join(dirPath, file);
+        if (fs.lstatSync(curPath).isDirectory()) {
+          this.removeDirectoryRecursive(curPath);
+        } else {
+          fs.unlinkSync(curPath);
+        }
+      }
+      fs.rmdirSync(dirPath);
+    }
   }
 
   /** 保存会话到文件 */

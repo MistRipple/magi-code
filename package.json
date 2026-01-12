@@ -119,13 +119,62 @@
           },
           "description": "任务类型到 CLI 的映射配置",
           "properties": {
-            "architecture": { "type": "string", "enum": ["claude", "codex", "gemini"] },
-            "bugfix": { "type": "string", "enum": ["claude", "codex", "gemini"] },
-            "frontend": { "type": "string", "enum": ["claude", "codex", "gemini"] },
-            "backend": { "type": "string", "enum": ["claude", "codex", "gemini"] },
-            "test": { "type": "string", "enum": ["claude", "codex", "gemini"] },
-            "docs": { "type": "string", "enum": ["claude", "codex", "gemini"] },
-            "general": { "type": "string", "enum": ["claude", "codex", "gemini"] }
+            "architecture": {
+              "type": "string",
+              "enum": [
+                "claude",
+                "codex",
+                "gemini"
+              ]
+            },
+            "bugfix": {
+              "type": "string",
+              "enum": [
+                "claude",
+                "codex",
+                "gemini"
+              ]
+            },
+            "frontend": {
+              "type": "string",
+              "enum": [
+                "claude",
+                "codex",
+                "gemini"
+              ]
+            },
+            "backend": {
+              "type": "string",
+              "enum": [
+                "claude",
+                "codex",
+                "gemini"
+              ]
+            },
+            "test": {
+              "type": "string",
+              "enum": [
+                "claude",
+                "codex",
+                "gemini"
+              ]
+            },
+            "docs": {
+              "type": "string",
+              "enum": [
+                "claude",
+                "codex",
+                "gemini"
+              ]
+            },
+            "general": {
+              "type": "string",
+              "enum": [
+                "claude",
+                "codex",
+                "gemini"
+              ]
+            }
           }
         }
       }

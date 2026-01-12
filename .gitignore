@@ -24,3 +24,5 @@ pnpm-debug.log*
 .cli-arranger/
 .multicli/
 .ace-tool/
+
+.tmp/

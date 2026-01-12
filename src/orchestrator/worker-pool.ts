@@ -16,6 +16,7 @@ import { MessageBus, globalMessageBus } from './message-bus';
 import { ExecutionStats, FallbackSuggestion } from './execution-stats';
 import { TaskDependencyGraph, DependencyAnalysis, ExecutionBatch } from './task-dependency-graph';
 import { FileLockManager } from './file-lock-manager';
+import { SnapshotManager } from '../snapshot-manager';
 import {
   WorkerType,
   WorkerState,
@@ -39,6 +40,8 @@ export interface WorkerPoolConfig {
   executionStats?: ExecutionStats;
   /** 是否启用 CLI 降级 */
   enableFallback?: boolean;
+  /** 🆕 快照管理器（可选，用于跟踪文件变更） */
+  snapshotManager?: SnapshotManager;
 }
 
 /** 执行调度配置 */
@@ -129,6 +132,8 @@ export class WorkerPool extends EventEmitter {
   // 🆕 执行统计和降级相关
   private executionStats?: ExecutionStats;
   private enableFallback: boolean;
+  // 🆕 快照管理器
+  private snapshotManager?: SnapshotManager;
 
   constructor(config: WorkerPoolConfig) {
     super();
@@ -140,6 +145,7 @@ export class WorkerPool extends EventEmitter {
     // 🆕 初始化执行统计和降级配置
     this.executionStats = config.executionStats;
     this.enableFallback = config.enableFallback ?? true;
+    this.snapshotManager = config.snapshotManager;
 
     this.setupMessageHandlers();
   }
@@ -154,16 +160,25 @@ export class WorkerPool extends EventEmitter {
     return this.executionStats;
   }
 
+  /** 🆕 设置快照管理器 */
+  setSnapshotManager(manager: SnapshotManager): void {
+    this.snapshotManager = manager;
+    // 更新已有 Worker 的快照管理器
+    for (const worker of this.workers.values()) {
+      worker.setSnapshotManager(manager);
+    }
+  }
+
   /**
    * 初始化所有 Worker
    */
   async initialize(): Promise<void> {
     const workerTypes: WorkerType[] = ['claude', 'codex', 'gemini'];
-    
+
     for (const type of workerTypes) {
       await this.createWorker(type);
     }
-    
+
     console.log(`[WorkerPool] 初始化完成，共 ${this.workers.size} 个 Worker`);
   }
 
@@ -180,6 +195,7 @@ export class WorkerPool extends EventEmitter {
       cliFactory: this.cliFactory,
       messageBus: this.messageBus,
       orchestratorId: this.orchestratorId,
+      snapshotManager: this.snapshotManager,  // 🆕 传递快照管理器
     });
 
     // 监听 Worker 状态变更
@@ -317,7 +333,10 @@ export class WorkerPool extends EventEmitter {
     options?: DispatchOptions
   ): Promise<ExecutionResult> {
     const priority = options?.priority ?? subTask.priority ?? DEFAULT_QUEUE_PRIORITY;
-    const lockFiles = (subTask.targetFiles || []).filter(Boolean);
+    let lockFiles = (subTask.targetFiles || []).filter(Boolean);
+    if (lockFiles.length === 0) {
+      lockFiles = this.inferLockFiles(subTask);
+    }
     const abortSignal = options?.abortSignal;
 
     if (abortSignal?.aborted) {
@@ -493,7 +512,16 @@ export class WorkerPool extends EventEmitter {
         const duration = Date.now() - startTime;
 
         // 🆕 记录执行统计
-        this.recordExecution(currentCli, taskId, subTask.id, result.success, duration, result.error);
+        this.recordExecution(
+          currentCli,
+          taskId,
+          subTask.id,
+          result.success,
+          duration,
+          result.error,
+          result.inputTokens,
+          result.outputTokens
+        );
 
         state.status = result.success ? 'completed' : 'failed';
         state.endTime = Date.now();
@@ -652,7 +680,9 @@ export class WorkerPool extends EventEmitter {
     subTaskId: string,
     success: boolean,
     duration: number,
-    error?: string
+    error?: string,
+    inputTokens?: number,
+    outputTokens?: number
   ): void {
     if (this.executionStats) {
       this.executionStats.recordExecution({
@@ -662,6 +692,8 @@ export class WorkerPool extends EventEmitter {
         success,
         duration,
         error,
+        inputTokens,
+        outputTokens,
       });
     }
   }
@@ -790,7 +822,7 @@ export class WorkerPool extends EventEmitter {
   async executeWithDependencyGraph(
     taskId: string,
     subTasks: SubTask[],
-    context?: string
+    context?: string | ((subTask: SubTask) => string | undefined)
   ): Promise<ExecutionResult[]> {
     // 构建依赖图
     const graph = new TaskDependencyGraph();
@@ -875,7 +907,7 @@ export class WorkerPool extends EventEmitter {
   private async executeBatchParallel(
     taskId: string,
     subTasks: SubTask[],
-    context?: string,
+    context?: string | ((subTask: SubTask) => string | undefined),
     dependentsCount?: Map<string, number>
   ): Promise<ExecutionResult[]> {
     // 限制并行数量
@@ -889,12 +921,13 @@ export class WorkerPool extends EventEmitter {
         const basePriority = subTask.priority ?? DEFAULT_QUEUE_PRIORITY;
         const dependentBoost = dependentsCount?.get(subTask.id) ?? 0;
         const priority = basePriority - dependentBoost;
+        const resolvedContext = this.resolveContext(context, subTask);
 
         return this.dispatchTaskWithRetry(
           subTask.assignedWorker || 'claude',
           taskId,
           subTask,
-          context,
+          resolvedContext,
           { priority }
         ).catch(error => ({
           workerId: 'unknown',
@@ -913,6 +946,25 @@ export class WorkerPool extends EventEmitter {
     }
 
     return results;
+  }
+
+  private resolveContext(
+    context: string | ((subTask: SubTask) => string | undefined) | undefined,
+    subTask: SubTask
+  ): string | undefined {
+    if (typeof context === 'function') {
+      return context(subTask);
+    }
+    return context;
+  }
+
+  private inferLockFiles(subTask: SubTask): string[] {
+    const text = `${subTask.description || ''}\n${subTask.prompt || ''}`;
+    const matches = text.match(/[\\w./-]+\\.(ts|js|tsx|jsx|py|java|go|rs|cpp|c|css|html|json|md)/gi);
+    if (!matches) {
+      return [];
+    }
+    return [...new Set(matches)];
   }
 
   /**

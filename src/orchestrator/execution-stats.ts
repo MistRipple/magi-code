@@ -5,6 +5,7 @@
  */
 
 import * as vscode from 'vscode';
+import { globalEventBus } from '../events';
 import { CLIType } from '../types';
 
 /** 单次执行记录 */
@@ -16,6 +17,9 @@ export interface ExecutionRecord {
   duration: number;  // 毫秒
   error?: string;
   timestamp: number;
+  /** 🆕 Token 使用统计 */
+  inputTokens?: number;
+  outputTokens?: number;
 }
 
 /** CLI 统计摘要 */
@@ -34,6 +38,10 @@ export interface CLIStats {
   lastError?: string;
   /** 🆕 最后执行时间 */
   lastExecutionTime?: number;
+  /** 🆕 总输入 token */
+  totalInputTokens: number;
+  /** 🆕 总输出 token */
+  totalOutputTokens: number;
 }
 
 /** 降级建议 */
@@ -95,6 +103,7 @@ export class ExecutionStats {
     this.saveToStorage();
 
     console.log(`[ExecutionStats] 记录执行: ${record.cli} ${record.success ? '成功' : '失败'} (${record.duration}ms)`);
+    globalEventBus.emitEvent('execution:stats_updated', {});
   }
 
   /** 获取 CLI 统计摘要 */
@@ -123,6 +132,10 @@ export class ExecutionStats {
       commonErrors.set(errorType, (commonErrors.get(errorType) || 0) + 1);
     });
 
+    // 🆕 计算总 token
+    const totalInputTokens = cliRecords.reduce((sum, r) => sum + (r.inputTokens || 0), 0);
+    const totalOutputTokens = cliRecords.reduce((sum, r) => sum + (r.outputTokens || 0), 0);
+
     // 判断健康状态
     const isHealthy = successRate >= this.config.healthThreshold &&
       recentFailures < this.config.recentWindow * 0.5;
@@ -138,9 +151,10 @@ export class ExecutionStats {
       lastFailureTime: lastFailure?.timestamp,
       commonErrors,
       isHealthy,
-      // 🆕 新增属性
       lastError: lastFailure?.error,
       lastExecutionTime: lastRecord?.timestamp,
+      totalInputTokens,
+      totalOutputTokens,
     };
   }
 
@@ -272,6 +286,7 @@ export class ExecutionStats {
     this.records = [];
     await this.saveToStorage();
     console.log('[ExecutionStats] 已清除所有统计数据');
+    globalEventBus.emitEvent('execution:stats_updated', {});
   }
 
   /** 获取统计摘要（用于 UI 显示） */

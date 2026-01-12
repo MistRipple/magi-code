@@ -19,6 +19,23 @@ import {
   MemoryContent
 } from './types';
 
+type MemorySummaryOptions = {
+  includeCurrentTasks?: boolean;
+  includeKeyDecisions?: number;
+  includeImportantContext?: boolean;
+  includePendingIssues?: boolean;
+  includeCompletedTasks?: number;
+  includeCodeChanges?: number;
+};
+
+type ContextSliceOptions = {
+  maxTokens: number;
+  memoryRatio?: number;
+  includeMemory?: boolean;
+  includeRecent?: boolean;
+  memorySummary?: MemorySummaryOptions;
+};
+
 export class ContextManager {
   private config: ContextManagerConfig;
   private immediateContext: ContextMessage[] = [];
@@ -110,26 +127,44 @@ export class ContextManager {
    * 获取组装后的上下文（用于发送给 LLM）
    */
   getContext(maxTokens: number = 8000): string {
+    return this.getContextSlice({ maxTokens });
+  }
+
+  /**
+   * 获取受限上下文切片（用于 Worker 精简上下文）
+   */
+  getContextSlice(options: ContextSliceOptions): string {
+    const {
+      maxTokens,
+      memoryRatio = 0.3,
+      includeMemory = true,
+      includeRecent = true,
+      memorySummary = {},
+    } = options;
     const parts: string[] = [];
     let currentTokens = 0;
 
     // 1. 添加会话 Memory 摘要（高优先级）
-    if (this.sessionMemory) {
-      const memorySummary = this.getMemorySummary();
-      const memoryTokens = this.estimateTokens(memorySummary);
-      if (currentTokens + memoryTokens < maxTokens * 0.3) { // Memory 最多占 30%
-        parts.push('## 会话上下文\n' + memorySummary);
-        currentTokens += memoryTokens;
+    if (includeMemory && this.sessionMemory) {
+      const summary = this.buildMemorySummary(memorySummary);
+      if (summary) {
+        const memoryTokens = this.estimateTokens(summary);
+        if (currentTokens + memoryTokens < maxTokens * memoryRatio) {
+          parts.push('## 会话上下文\n' + summary);
+          currentTokens += memoryTokens;
+        }
       }
     }
 
     // 2. 添加即时上下文（最近对话）
-    const remainingTokens = maxTokens - currentTokens;
-    const recentMessages = this.getRecentMessages(remainingTokens);
-    if (recentMessages.length > 0) {
-      parts.push('## 最近对话\n' + recentMessages.map(m => 
-        `[${m.role}]: ${m.content}`
-      ).join('\n\n'));
+    if (includeRecent) {
+      const remainingTokens = maxTokens - currentTokens;
+      const recentMessages = this.getRecentMessages(remainingTokens);
+      if (recentMessages.length > 0) {
+        parts.push('## 最近对话\n' + recentMessages.map(m =>
+          `[${m.role}]: ${m.content}`
+        ).join('\n\n'));
+      }
     }
 
     return parts.join('\n\n---\n\n');
@@ -139,13 +174,29 @@ export class ContextManager {
    * 获取 Memory 摘要
    */
   private getMemorySummary(): string {
+    return this.buildMemorySummary({
+      includeCurrentTasks: true,
+      includeKeyDecisions: 3,
+      includeImportantContext: true,
+    });
+  }
+
+  private buildMemorySummary(options: MemorySummaryOptions): string {
     if (!this.sessionMemory) return '';
     
     const content = this.sessionMemory.getContent();
     const lines: string[] = [];
+    const {
+      includeCurrentTasks = false,
+      includeKeyDecisions = 0,
+      includeImportantContext = false,
+      includePendingIssues = false,
+      includeCompletedTasks = 0,
+      includeCodeChanges = 0,
+    } = options;
 
     // 当前任务
-    if (content.currentTasks.length > 0) {
+    if (includeCurrentTasks && content.currentTasks.length > 0) {
       lines.push('**当前任务:**');
       content.currentTasks.forEach(t => {
         lines.push(`- ${t.description} (${t.status})`);
@@ -153,18 +204,39 @@ export class ContextManager {
     }
 
     // 关键决策（最近3个）
-    if (content.keyDecisions.length > 0) {
+    if (includeKeyDecisions > 0 && content.keyDecisions.length > 0) {
       lines.push('**关键决策:**');
-      content.keyDecisions.slice(-3).forEach(d => {
+      content.keyDecisions.slice(-includeKeyDecisions).forEach(d => {
         lines.push(`- ${d.description}`);
       });
     }
 
     // 重要上下文
-    if (content.importantContext.length > 0) {
+    if (includeImportantContext && content.importantContext.length > 0) {
       lines.push('**重要上下文:**');
       content.importantContext.forEach(ctx => {
         lines.push(`- ${ctx}`);
+      });
+    }
+
+    if (includePendingIssues && content.pendingIssues.length > 0) {
+      lines.push('**待解决问题:**');
+      content.pendingIssues.slice(-5).forEach(issue => {
+        lines.push(`- ${issue}`);
+      });
+    }
+
+    if (includeCompletedTasks > 0 && content.completedTasks.length > 0) {
+      lines.push('**近期完成:**');
+      content.completedTasks.slice(-includeCompletedTasks).forEach(task => {
+        lines.push(`- ${task.description}`);
+      });
+    }
+
+    if (includeCodeChanges > 0 && content.codeChanges.length > 0) {
+      lines.push('**近期代码变更:**');
+      content.codeChanges.slice(-includeCodeChanges).forEach(change => {
+        lines.push(`- ${change.file}: ${change.summary}`);
       });
     }
 
@@ -313,4 +385,3 @@ export class ContextManager {
     };
   }
 }
-
