@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src {{cspSource}} 'unsafe-inline'; script-src {{cspSource}} 'unsafe-inline'; img-src data: blob:;">
   <title>MultiCLI</title>
-  <link rel="stylesheet" href="styles.css">
   <style>
     /* 设计系统变量 */
     :root {
@@ -383,6 +382,50 @@
     .question-btn.cancel { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
     .question-btn.cancel:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
 
+    /* 🆕 需求澄清卡片样式 */
+    .clarification-card { border-left: 3px solid var(--vscode-editorWarning-foreground); }
+    .clarification-card.answered { border-left-color: var(--vscode-testing-iconPassed); }
+    .clarification-card.cancelled { border-left-color: var(--vscode-descriptionForeground); }
+    .clarification-header { margin-bottom: var(--spacing-2); }
+    .ambiguity-score { display: inline-block; padding: 2px 8px; background: rgba(255, 193, 7, 0.15); color: var(--vscode-editorWarning-foreground); border-radius: var(--radius-1); font-size: var(--font-size-1); font-weight: 500; }
+    .clarification-context { margin-top: var(--spacing-2); font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); }
+    .clarification-questions { margin: var(--spacing-2) 0; }
+    .clarification-hint { font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); margin-bottom: var(--spacing-2); }
+    .clarification-question-item { margin-bottom: var(--spacing-2); padding: var(--spacing-2); background: var(--vscode-textCodeBlock-background); border-radius: var(--radius-2); }
+    .clarification-question-item .question-text { display: block; font-weight: 500; margin-bottom: var(--spacing-1); }
+    .clarification-answer-input { width: 100%; padding: 8px 10px; font-size: var(--font-size-2); border-radius: var(--radius-2); border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); margin-top: var(--spacing-1); }
+    .clarification-answer-input:focus { outline: none; border-color: var(--vscode-focusBorder); }
+    .clarification-answer-display { margin-top: var(--spacing-1); padding: var(--spacing-1) var(--spacing-2); background: var(--vscode-input-background); border-radius: var(--radius-1); font-size: var(--font-size-2); color: var(--vscode-foreground); }
+    .clarification-additional { margin-top: var(--spacing-2); }
+    .clarification-additional label { display: block; font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); margin-bottom: var(--spacing-1); }
+    .clarification-additional-input { width: 100%; min-height: 60px; padding: 8px 10px; font-size: var(--font-size-2); border-radius: var(--radius-2); border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); resize: vertical; }
+    .clarification-additional-input:focus { outline: none; border-color: var(--vscode-focusBorder); }
+    .clarification-additional-display { margin-top: var(--spacing-2); padding: var(--spacing-2); background: var(--vscode-input-background); border-radius: var(--radius-2); font-size: var(--font-size-2); }
+    .clarification-actions { display: flex; gap: var(--spacing-2); margin-top: var(--spacing-2); }
+    .clarification-btn { padding: 8px 16px; font-size: var(--font-size-2); font-weight: 500; border-radius: var(--radius-2); border: none; cursor: pointer; transition: all var(--transition-fast); }
+    .clarification-btn.submit { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    .clarification-btn.submit:hover { background: var(--vscode-button-hoverBackground); }
+    .clarification-btn.skip { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
+    .clarification-btn.skip:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+
+    /* 🆕 Worker 问题卡片样式 */
+    .worker-question-card { border-left: 3px solid var(--vscode-editorInfo-foreground); }
+    .worker-question-card.answered { border-left-color: var(--vscode-testing-iconPassed); }
+    .worker-question-card.cancelled { border-left-color: var(--vscode-descriptionForeground); }
+    .worker-question-content { margin-bottom: var(--spacing-2); }
+    .worker-info { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-bottom: var(--spacing-1); }
+    .worker-question-text { padding: var(--spacing-2); background: var(--vscode-textCodeBlock-background); border-radius: var(--radius-2); font-size: var(--font-size-2); }
+    .worker-question-context { margin-top: var(--spacing-1); font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .worker-question-answer { margin-top: var(--spacing-2); padding: var(--spacing-2); background: var(--vscode-input-background); border-radius: var(--radius-2); font-size: var(--font-size-2); }
+    .worker-question-actions { display: flex; gap: var(--spacing-2); align-items: center; }
+    .worker-answer-input { flex: 1; padding: 8px 10px; font-size: var(--font-size-2); border-radius: var(--radius-2); border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); }
+    .worker-answer-input:focus { outline: none; border-color: var(--vscode-focusBorder); }
+    .worker-answer-btn { padding: 8px 16px; font-size: var(--font-size-2); font-weight: 500; border-radius: var(--radius-2); border: none; cursor: pointer; transition: all var(--transition-fast); }
+    .worker-answer-btn.submit { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    .worker-answer-btn.submit:hover { background: var(--vscode-button-hoverBackground); }
+    .worker-answer-btn.skip { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
+    .worker-answer-btn.skip:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+
     /* Worker 状态卡片内容 */
     .worker-status-list { display: grid; gap: var(--spacing-2); }
     .worker-status-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius-2); background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.04); }
@@ -739,8 +782,9 @@
       width: 100%;
     }
 
-    /* Markdown 渲染样式 - 参考 Augment 风格 */
+    /* ========== Markdown 渲染样式 - 参考 Augment 设计系统 ========== */
     .message-content.markdown-rendered {
+      --markdown-spacing-inline: 4px;
       white-space: normal;
       max-width: 100%;
       overflow: hidden;
@@ -748,15 +792,184 @@
     }
     .message-content.markdown-rendered > *:first-child { margin-top: 0; }
     .message-content.markdown-rendered > *:last-child { margin-bottom: 0; }
-    .message-content.markdown-rendered p {
+
+    /* 段落样式 */
+    .message-content.markdown-rendered p,
+    .message-content.markdown-rendered .markdown-paragraph {
       white-space: pre-line;
-      margin: 0;
-      line-height: 150%;
+      margin: 8px 0;
+      padding-inline: var(--markdown-spacing-inline);
+      font-size: 13px;
+      line-height: 1.6;
       word-break: break-word;
     }
-    .message-content.markdown-rendered p:last-child {
+    .message-content.markdown-rendered p:first-child,
+    .message-content.markdown-rendered .markdown-paragraph:first-child {
+      margin-top: 0;
+    }
+    .message-content.markdown-rendered p:last-child,
+    .message-content.markdown-rendered .markdown-paragraph:last-child {
       margin-bottom: 0;
     }
+
+    /* 标题样式 - Augment 风格 */
+    .message-content.markdown-rendered h1,
+    .message-content.markdown-rendered h2,
+    .message-content.markdown-rendered h3,
+    .message-content.markdown-rendered h4,
+    .message-content.markdown-rendered h5,
+    .message-content.markdown-rendered h6 {
+      margin: 12px 0 6px 0;
+      font-weight: 700;
+      font-family: var(--vscode-font-family);
+      padding-inline: var(--markdown-spacing-inline);
+      color: var(--vscode-foreground);
+    }
+    .message-content.markdown-rendered h1 { font-size: 1.25em; line-height: 1.4; }
+    .message-content.markdown-rendered h2 { font-size: 1.125em; line-height: 1.4; }
+    .message-content.markdown-rendered h3 { font-size: 1em; line-height: 1.5; }
+    .message-content.markdown-rendered h4,
+    .message-content.markdown-rendered h5,
+    .message-content.markdown-rendered h6 { font-size: 0.9em; line-height: 1.5; }
+
+    /* 粗体样式 */
+    .message-content.markdown-rendered strong {
+      color: var(--vscode-foreground);
+      font-weight: 600;
+    }
+
+    /* 列表样式 - Augment 风格 */
+    .message-content.markdown-rendered ul,
+    .message-content.markdown-rendered ol,
+    .message-content.markdown-rendered .markdown-ul,
+    .message-content.markdown-rendered .markdown-ol {
+      margin: 8px 0;
+      padding-inline-start: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .message-content.markdown-rendered ul ul,
+    .message-content.markdown-rendered ul ol,
+    .message-content.markdown-rendered ol ul,
+    .message-content.markdown-rendered ol ol {
+      padding-inline-start: 16px;
+      margin-top: 4px;
+      margin-bottom: 0;
+    }
+    .message-content.markdown-rendered li {
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    /* 任务列表样式 */
+    .message-content.markdown-rendered .task-item {
+      list-style: none;
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      margin-left: -20px;
+    }
+    .message-content.markdown-rendered .task-item input[type="checkbox"] {
+      margin-top: 4px;
+      accent-color: var(--vscode-textLink-foreground);
+    }
+    .message-content.markdown-rendered .task-item.task-done span {
+      text-decoration: line-through;
+      opacity: 0.7;
+    }
+
+    /* 引用块样式 - Augment 风格 */
+    .message-content.markdown-rendered blockquote {
+      margin: 8px var(--markdown-spacing-inline);
+      background: none;
+      border-left: 3px solid var(--vscode-textLink-foreground);
+      padding: 4px 12px;
+      border-radius: 0 4px 4px 0;
+      color: var(--vscode-descriptionForeground);
+    }
+
+    /* 分隔线样式 */
+    .message-content.markdown-rendered hr {
+      border: none;
+      border-top: 1px solid var(--vscode-panel-border);
+      margin: 16px var(--markdown-spacing-inline);
+    }
+
+    /* 行内代码样式 - Augment 风格 */
+    .message-content.markdown-rendered code.markdown-codespan,
+    .message-content.markdown-rendered code:not(.markdown-code-content code) {
+      font-family: var(--vscode-editor-font-family, monospace);
+      border-radius: 2px;
+      padding: 1px 4px;
+      font-size: 0.9em;
+      background-color: var(--vscode-sideBar-background);
+      color: var(--vscode-textLink-foreground);
+      border: 1px solid var(--vscode-panel-border);
+      word-break: break-all;
+      display: inline;
+    }
+
+    /* 链接样式 - Augment 风格 */
+    .message-content.markdown-rendered a,
+    .message-content.markdown-rendered .markdown-link {
+      color: var(--vscode-textLink-foreground);
+      text-decoration: underline;
+      text-decoration-color: var(--vscode-textLink-foreground);
+      word-break: break-all;
+      cursor: pointer;
+      user-select: all;
+    }
+    .message-content.markdown-rendered a:hover,
+    .message-content.markdown-rendered .markdown-link:hover {
+      text-decoration: underline;
+      opacity: 0.9;
+    }
+
+    /* 图片样式 */
+    .message-content.markdown-rendered img,
+    .message-content.markdown-rendered .markdown-image {
+      max-width: 100%;
+      height: auto;
+      border-radius: 4px;
+      margin: 8px 0;
+    }
+
+    /* 表格样式 - Augment 风格 */
+    .message-content.markdown-rendered .table-wrapper {
+      display: block;
+      overflow-x: auto;
+      margin: 8px 0;
+    }
+    .message-content.markdown-rendered table,
+    .message-content.markdown-rendered .md-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .message-content.markdown-rendered th,
+    .message-content.markdown-rendered td,
+    .message-content.markdown-rendered .md-table th,
+    .message-content.markdown-rendered .md-table td {
+      border: 1px solid var(--vscode-panel-border);
+      padding: 6px 10px;
+      text-align: left;
+    }
+    .message-content.markdown-rendered th,
+    .message-content.markdown-rendered .md-table th {
+      background: var(--vscode-sideBar-background);
+      font-weight: 600;
+    }
+    .message-content.markdown-rendered tr:nth-child(even),
+    .message-content.markdown-rendered .md-table tr:nth-child(even) {
+      background: var(--vscode-list-hoverBackground);
+    }
+    .message-content.markdown-rendered tr:hover,
+    .message-content.markdown-rendered .md-table tr:hover {
+      background: var(--vscode-list-activeSelectionBackground);
+    }
+
     /* 卡片内 Markdown 渲染（任务分析/执行摘要） */
     .task-card-body .markdown-rendered,
     .summary-content .markdown-rendered {
@@ -767,79 +980,13 @@
     .task-card-body .markdown-rendered p,
     .summary-content .markdown-rendered p {
       white-space: pre-line;
-      margin: 0;
-      line-height: 150%;
+      margin: 4px 0;
+      line-height: 1.5;
       word-break: break-word;
     }
     .task-card-body .markdown-rendered .markdown-code-block,
     .summary-content .markdown-rendered .markdown-code-block {
       margin: 8px 0;
-    }
-    .message-content.markdown-rendered h1,
-    .message-content.markdown-rendered h2,
-    .message-content.markdown-rendered h3,
-    .message-content.markdown-rendered h4 {
-      font-weight: 600;
-      line-height: 150%;
-      margin: 8px 0 4px 0;
-    }
-    .message-content.markdown-rendered h1 { font-size: 1.125em; }
-    .message-content.markdown-rendered h2 { font-size: 1em; }
-    .message-content.markdown-rendered h3 { font-size: 0.875em; }
-    .message-content.markdown-rendered h4 { font-size: 0.75em; }
-    .message-content.markdown-rendered strong { font-weight: 600; }
-    .message-content.markdown-rendered ul,
-    .message-content.markdown-rendered ol {
-      margin: 6px 0;
-      padding-left: 22px;
-      line-height: 150%;
-    }
-    .message-content.markdown-rendered li {
-      margin: 2px 0;
-      line-height: 150%;
-    }
-    .message-content.markdown-rendered li > ul,
-    .message-content.markdown-rendered li > ol {
-      padding-top: 4px;
-      padding-bottom: 4px;
-    }
-    .message-content.markdown-rendered blockquote {
-      margin: 6px 0;
-      padding: 8px 12px;
-      border-left: 3px solid var(--vscode-textLink-foreground);
-      background: var(--vscode-sideBar-background);
-      border-radius: 0 4px 4px 0;
-    }
-    .message-content.markdown-rendered hr {
-      border: none;
-      border-top: 1px solid var(--vscode-panel-border);
-      margin: 12px 0;
-    }
-    /* Markdown 表格样式 */
-    .message-content.markdown-rendered .table-wrapper {
-      overflow-x: auto;
-      margin: 8px 0;
-    }
-    .message-content.markdown-rendered .md-table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 13px;
-      line-height: 1.4;
-    }
-    .message-content.markdown-rendered .md-table th,
-    .message-content.markdown-rendered .md-table td {
-      border: 1px solid var(--vscode-panel-border);
-      padding: 6px 10px;
-    }
-    .message-content.markdown-rendered .md-table th {
-      background: var(--vscode-sideBar-background);
-      font-weight: 600;
-    }
-    .message-content.markdown-rendered .md-table tr:nth-child(even) {
-      background: var(--vscode-list-hoverBackground);
-    }
-    .message-content.markdown-rendered .md-table tr:hover {
-      background: var(--vscode-list-activeSelectionBackground);
     }
 
     /* 代码块样式 - 增强版 */
@@ -928,7 +1075,7 @@
     .markdown-code-content {
       display: flex;
       overflow: auto;
-      max-height: 400px;
+      max-height: 600px; /* 🔧 修复：增大代码块高度限制 */
       font-family: var(--vscode-editor-font-family, monospace);
       font-size: 12px;
       line-height: 1.5;
@@ -1042,51 +1189,7 @@
     .syntax-attr-value { color: var(--vscode-symbolIcon-stringForeground, #ce9178); }
     .syntax-builtin { color: var(--vscode-symbolIcon-constantForeground, #569cd6); }
 
-    /* 行内代码样式 - Augment 风格 */
-    .message-content.markdown-rendered code:not(.markdown-code-content code) {
-      font-family: var(--vscode-editor-font-family, monospace);
-      border-radius: 2px;
-      padding: 1px 4px;
-      font-size: 0.9em;
-      background-color: var(--vscode-sideBar-background);
-      color: var(--vscode-textLink-foreground);
-      border: 1px solid var(--vscode-panel-border);
-      word-break: break-all;
-      display: inline;
-    }
-
-    /* 链接样式 */
-    .message-content.markdown-rendered a {
-      color: var(--vscode-textLink-foreground);
-      text-decoration: none;
-      word-break: break-all;
-    }
-    .message-content.markdown-rendered a:hover {
-      text-decoration: underline;
-    }
-
-    /* 表格样式 - 内部滚动 */
-    .message-content.markdown-rendered .table-wrapper {
-      overflow-x: auto;
-      max-width: 100%;
-      margin: 8px 0;
-    }
-    .message-content.markdown-rendered table {
-      border-collapse: collapse;
-      min-width: 100%;
-      font-size: 12px;
-    }
-    .message-content.markdown-rendered th,
-    .message-content.markdown-rendered td {
-      border: 1px solid var(--vscode-panel-border);
-      padding: 6px 10px;
-      text-align: left;
-      white-space: nowrap;
-    }
-    .message-content.markdown-rendered th {
-      background: var(--vscode-sideBar-background);
-      font-weight: 600;
-    }
+    /* 注：行内代码、链接、表格样式已在上方 Markdown 渲染样式块中定义 */
 
     /* 流式消息样式（无光标） */
     .message.streaming .message-content {
@@ -1094,14 +1197,19 @@
     }
 
     /* 🔧 流式输出时限制高度，防止页面被撑满 */
+    /* 🔧 修复：增大流式消息的 max-height 限制，避免内容被截断 */
     .message.streaming .message-content {
-      max-height: 300px;
+      max-height: 600px;
       overflow-y: auto;
       position: relative;
     }
     .message.streaming .message-content.has-special-content {
-      max-height: 200px;
+      max-height: 500px;
     }
+    /* 流式消息滚动条样式 */
+    .message.streaming .message-content::-webkit-scrollbar { width: 8px; }
+    .message.streaming .message-content::-webkit-scrollbar-track { background: transparent; }
+    .message.streaming .message-content::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 4px; }
     /* 流式输出时的渐变遮罩提示 */
     .message.streaming .message-content::after {
       content: '';
@@ -1118,28 +1226,116 @@
       display: none;
     }
 
-    /* 正在思考动画 */
-    .thinking-indicator { display: inline-flex; align-items: center; gap: 6px; color: var(--vscode-descriptionForeground); }
+    /* ========== 流式输出动画 - Augment 风格 ========== */
+    .thinking-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      color: var(--vscode-textLink-foreground);
+      padding: 4px 8px;
+      border-radius: 12px;
+      background: var(--vscode-textLink-foreground, #007acc);
+      background: linear-gradient(90deg,
+        rgba(0, 122, 204, 0.1) 0%,
+        rgba(0, 122, 204, 0.2) 50%,
+        rgba(0, 122, 204, 0.1) 100%);
+    }
     .thinking-indicator .dot {
-      width: 5px; height: 5px;
+      width: 6px; height: 6px;
       background: var(--vscode-textLink-foreground);
       border-radius: 50%;
-      animation: thinkingBounce 1.4s ease-in-out infinite;
-    }
-    .thinking-elapsed { margin-left: 6px; font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
-    .message-streaming-hint { margin-top: 2px; font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
-    /* 🔧 新增：流式输出时底部的"正在输出"提示 */
-    .message-streaming-footer {
-      margin-top: 8px;
-      padding-top: 8px;
-      border-top: 1px dashed var(--vscode-editorWidget-border);
-      font-size: var(--font-size-1);
-      color: var(--vscode-descriptionForeground);
+      animation: thinkingPulse 1.4s ease-in-out infinite;
     }
     .thinking-indicator .dot:nth-child(1) { animation-delay: 0s; }
     .thinking-indicator .dot:nth-child(2) { animation-delay: 0.2s; }
     .thinking-indicator .dot:nth-child(3) { animation-delay: 0.4s; }
-    @keyframes thinkingBounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.4; } 30% { transform: translateY(-4px); opacity: 1; } }
+    @keyframes thinkingPulse {
+      0%, 80%, 100% { transform: scale(0.8); opacity: 0.5; }
+      40% { transform: scale(1.2); opacity: 1; }
+    }
+    .thinking-elapsed {
+      margin-left: 8px;
+      font-size: var(--font-size-1);
+      color: var(--vscode-descriptionForeground);
+      font-variant-numeric: tabular-nums;
+    }
+    .message-streaming-hint {
+      margin-top: 4px;
+      padding: 8px 12px;
+      font-size: var(--font-size-2);
+      color: var(--vscode-descriptionForeground);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 8px;
+      background: var(--vscode-editor-inactiveSelectionBackground);
+    }
+    /* 流式输出时底部的"正在输出"提示 - Augment 风格 */
+    .message-streaming-footer {
+      margin-top: 12px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: linear-gradient(90deg,
+        rgba(0, 122, 204, 0.05) 0%,
+        rgba(0, 122, 204, 0.1) 50%,
+        rgba(0, 122, 204, 0.05) 100%);
+      font-size: var(--font-size-2);
+      color: var(--vscode-textLink-foreground);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      animation: streamingFooterPulse 2s ease-in-out infinite;
+    }
+    @keyframes streamingFooterPulse {
+      0%, 100% { opacity: 0.8; }
+      50% { opacity: 1; }
+    }
+
+    /* ========== 澄清消息样式 - 自然对话风格 ========== */
+    .message.clarification-message .message-body {
+      border-left: 3px solid var(--vscode-textLink-foreground);
+      padding-left: 12px;
+    }
+    .message.clarification-message .message-content {
+      background: linear-gradient(135deg,
+        rgba(0, 122, 204, 0.05) 0%,
+        rgba(0, 122, 204, 0.02) 100%);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .message.clarification-message .clarification-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 10px;
+      background: var(--vscode-textLink-foreground);
+      color: var(--vscode-button-foreground);
+      font-size: 10px;
+      font-weight: 500;
+      margin-bottom: 8px;
+    }
+    .message.clarification-message ol {
+      margin: 8px 0;
+      padding-left: 20px;
+    }
+    .message.clarification-message li {
+      margin: 6px 0;
+      line-height: 1.5;
+    }
+
+    /* ========== Worker 问题消息样式 ========== */
+    .message.worker-question-message .message-body {
+      border-left: 3px solid var(--vscode-charts-orange);
+      padding-left: 12px;
+    }
+    .message.worker-question-message .message-content {
+      background: linear-gradient(135deg,
+        rgba(255, 165, 0, 0.05) 0%,
+        rgba(255, 165, 0, 0.02) 100%);
+      border-radius: 8px;
+      padding: 12px;
+    }
 
     /* ========== 可折叠面板（思考/工具调用）- Augment 风格 ========== */
     .collapsible-panel {
@@ -1195,7 +1391,13 @@
       max-height: 0; overflow: hidden;
       transition: max-height 0.3s ease-out;
     }
-    .collapsible-content.expanded { max-height: 400px; overflow-y: auto; }
+    /* 🔧 修复：增大 max-height 限制，避免内容被截断 */
+    .collapsible-content.expanded { max-height: 2000px; overflow-y: auto; }
+    /* 确保滚动条明显可见 */
+    .collapsible-content::-webkit-scrollbar { width: 8px; }
+    .collapsible-content::-webkit-scrollbar-track { background: var(--vscode-editor-background); }
+    .collapsible-content::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 4px; }
+    .collapsible-content::-webkit-scrollbar-thumb:hover { background: var(--vscode-scrollbarSlider-hoverBackground); }
     .collapsible-body {
       padding: 10px 12px;
       font-size: 12px; line-height: 1.5;
@@ -1356,26 +1558,6 @@
 
     /* CLI 输出视图 */
     .cli-output-view { font-family: var(--vscode-editor-font-family); font-size: var(--font-size-2); line-height: 1.5; padding: var(--spacing-2); }
-    /* CLI 消息气泡 - 使用与对话相同的左右对齐规则 */
-    .cli-msg { margin-bottom: var(--spacing-3); display: flex; flex-direction: column; animation: fadeIn 0.2s ease; }
-    .cli-msg.streaming { animation: none; }
-    .cli-msg-content { font-size: var(--font-size-3); line-height: 1.6; padding: var(--spacing-3); border-radius: var(--radius-3); max-width: 85%; word-break: break-word; white-space: pre-wrap; }
-    .cli-msg-content.markdown-rendered p { margin: 0; white-space: pre-line; }
-    .cli-msg-content.markdown-rendered > *:first-child { margin-top: 0; }
-    .cli-msg-content.markdown-rendered > *:last-child { margin-bottom: 0; }
-    /* 流式消息样式（无光标） */
-    .cli-msg.streaming .cli-msg-content { opacity: 0.9; }
-    .cli-msg-time { font-size: 10px; color: var(--vscode-descriptionForeground); margin-bottom: 4px; }
-    .cli-msg-label { font-size: var(--font-size-1); font-weight: 600; color: var(--vscode-descriptionForeground); margin-bottom: 4px; text-transform: uppercase; }
-    /* 右侧：用户/Orchestrator器发送的指令 */
-    .cli-msg.prompt { align-items: flex-end; }
-    .cli-msg.prompt .cli-msg-time { text-align: right; padding-right: var(--spacing-1); }
-    .cli-msg.prompt .cli-msg-content { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-bottom-right-radius: var(--radius-1); }
-    /* 左侧：CLI 自身的回复 */
-    .cli-msg.response { align-items: flex-start; }
-    .cli-msg.response .cli-msg-time { padding-left: var(--spacing-1); }
-    .cli-msg.response .cli-msg-content { background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-bottom-left-radius: var(--radius-1); }
-    .cli-msg.response.error .cli-msg-content { border-left: 3px solid #e5484d; }
 
     /* 底部输入区域 - Augment 风格 */
     .bottom-area { flex-shrink: 0; display: flex; flex-direction: column; background: var(--vscode-sideBar-background); }
@@ -2101,25 +2283,6 @@
     }
     startRelativeTimeTimer();
 
-    // 🔧 问题3修复：页面不可见时暂停定时器，节省资源
-    document.addEventListener('visibilitychange', () => {
-      if (document.hidden) {
-        stopRelativeTimeTimer();
-        stopStreamingHintTimer();
-      } else {
-        startRelativeTimeTimer();
-        // 如果有活跃的流式消息，重新启动流式提示定时器
-        const hasActiveStreaming = threadMessages.some(m => m.streaming) ||
-          ['claude', 'codex', 'gemini'].some(cli => (cliOutputs[cli] || []).some(m => m.streaming));
-        if (hasActiveStreaming) {
-          startStreamingHintTimer();
-        }
-        // 立即更新一次
-        updateRelativeTimes();
-        updateStreamingHints();
-      }
-    });
-
     function startStreamingHintTimer() {
       if (streamingHintTimer) return;
       streamingHintTimer = setInterval(updateStreamingHintsWithTimeout, 1000);
@@ -2179,6 +2342,26 @@
       // 原有的提示更新逻辑
       updateStreamingHints();
     }
+
+    // 🔧 问题3修复：页面不可见时暂停定时器，节省资源
+    // 注意：必须在 stopStreamingHintTimer 和 updateStreamingHintsWithTimeout 定义之后注册
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        stopRelativeTimeTimer();
+        stopStreamingHintTimer();
+      } else {
+        startRelativeTimeTimer();
+        // 如果有活跃的流式消息，重新启动流式提示定时器
+        const hasActiveStreaming = threadMessages.some(m => m.streaming) ||
+          ['claude', 'codex', 'gemini'].some(cli => (cliOutputs[cli] || []).some(m => m.streaming));
+        if (hasActiveStreaming) {
+          startStreamingHintTimer();
+        }
+        // 立即更新一次
+        updateRelativeTimes();
+        updateStreamingHints();
+      }
+    });
 
     // 🔧 P3 修复：增强 setProcessingState，支持强制重置 thinkingStartAt
     function setProcessingState(next, forceResetTimer = false) {
@@ -2486,6 +2669,14 @@
             if (currentBottomTab === cli && lastCliMsg.content) {
               if (!updateCliStreamingMessage(cli, lastCliMsg.content)) {
                 cliNeedFullRender = true;
+              } else {
+                // 🔧 修复：即使内容更新成功，也要同步更新工具面板
+                // 否则新内容会覆盖工具面板的显示
+                const container = document.getElementById('main-content');
+                const streamingMessage = container?.querySelector('.message.streaming[data-cli="' + cli + '"]');
+                if (streamingMessage && (lastCliMsg.toolCalls?.length > 0 || lastCliMsg.thinking?.length > 0)) {
+                  updateMessagePanels(streamingMessage, lastCliMsg, 'tool-cli-' + cli + '-');
+                }
               }
             }
             if (parsed && parsed.hasJson) {
@@ -2515,6 +2706,14 @@
             if (!needThreadFullRender && threadMsg.content) {
               if (!updateStreamingMessage(threadMsg.streamKey, threadMsg.content)) {
                 scheduleRenderMainContent();
+              } else {
+                // 🔧 修复：即使内容更新成功，也要同步更新工具面板
+                // 否则新内容会覆盖工具面板的显示
+                const container = document.getElementById('main-content');
+                const streamingMessage = container?.querySelector('.message.streaming[data-stream-key="' + threadMsg.streamKey + '"]');
+                if (streamingMessage && (threadMsg.toolCalls?.length > 0 || threadMsg.thinking?.length > 0)) {
+                  updateMessagePanels(streamingMessage, threadMsg, 'tool-thread-');
+                }
               }
             } else if (needThreadFullRender) {
               const container = document.getElementById('main-content');
@@ -2861,6 +3060,22 @@
         }
         showQuestionRequest(msg.questions || []);
       }
+      // 🆕 处理需求澄清请求 - 作为普通 AI 消息显示
+      else if (msg.type === 'clarificationRequest') {
+        if (msg.sessionId && msg.sessionId !== currentSessionId) {
+          console.log('[Webview] 忽略非当前会话的 clarificationRequest');
+          return;
+        }
+        showClarificationAsMessage(msg.questions, msg.context, msg.ambiguityScore, msg.originalPrompt);
+      }
+      // 🆕 处理 Worker 问题请求
+      else if (msg.type === 'workerQuestionRequest') {
+        if (msg.sessionId && msg.sessionId !== currentSessionId) {
+          console.log('[Webview] 忽略非当前会话的 workerQuestionRequest');
+          return;
+        }
+        showWorkerQuestion(msg.workerId, msg.question, msg.context, msg.options);
+      }
       else if (msg.type === 'confirmationRequest') {
         // 🔧 P6 修复：增强会话隔离
         if (msg.sessionId && msg.sessionId !== currentSessionId) {
@@ -2898,13 +3113,28 @@
       }
     });
 
-   
+
     // 显示执行计划确认 - 只在消息流中添加内联卡片
     function showPlanConfirmation(plan, formattedPlan) {
-      // 🔧 修复：移除已有的 plan_ready 卡片，避免重复显示
+      // 🔧 修复：将已有的 plan_ready 卡片转换为 plan_confirmation，而不是创建新卡片
       const planReadyIdx = threadMessages.findIndex(m => m.type === 'plan_ready');
       if (planReadyIdx !== -1) {
-        threadMessages.splice(planReadyIdx, 1);
+        // 直接将 plan_ready 转换为 plan_confirmation
+        const existingMsg = threadMessages[planReadyIdx];
+        existingMsg.type = 'plan_confirmation';
+        existingMsg.content = formattedPlan;
+        existingMsg.plan = plan;
+        existingMsg.isPending = true;
+        // 保留原有的 review 信息（如果有）
+        saveWebviewState();
+        renderMainContent();
+        requestAnimationFrame(() => {
+          const mainContent = document.getElementById('main-content');
+          if (mainContent) {
+            mainContent.scrollTop = mainContent.scrollHeight;
+          }
+        });
+        return;
       }
 
       // 检查是否已存在待确认的消息（避免重复添加）
@@ -2976,6 +3206,171 @@
 
     function hasPendingQuestion() {
       return threadMessages.some(m => m.type === 'question_request' && m.isPending);
+    }
+
+    // 🆕 显示澄清请求作为普通 AI 消息（参考 Augment 的自然对话模式）
+    function showClarificationAsMessage(questions, context, ambiguityScore, originalPrompt) {
+      const normalized = Array.isArray(questions) ? questions.filter(q => q && String(q).trim()) : [];
+      if (normalized.length === 0) return;
+
+      // 构建澄清消息内容（Markdown 格式）
+      let content = '';
+      if (context) {
+        content += context + '\n\n';
+      }
+      content += '为了更好地理解您的需求，请帮我澄清以下问题：\n\n';
+      normalized.forEach((q, i) => {
+        content += `${i + 1}. ${q}\n`;
+      });
+      content += '\n请在下方输入框中回复您的补充信息。';
+
+      // 作为普通 assistant 消息添加
+      threadMessages.push({
+        role: 'assistant',
+        content: content,
+        time: new Date().toLocaleTimeString().slice(0, 5),
+        timestamp: Date.now(),
+        source: 'orchestrator',
+        cli: 'claude',
+        // 标记这是澄清消息，用于后续识别
+        isClarification: true,
+        clarificationData: {
+          questions: normalized,
+          context: context,
+          ambiguityScore: ambiguityScore,
+          originalPrompt: originalPrompt
+        }
+      });
+
+      // 设置等待澄清状态
+      window._pendingClarification = {
+        questions: normalized,
+        context: context,
+        ambiguityScore: ambiguityScore,
+        originalPrompt: originalPrompt,
+        timestamp: Date.now()
+      };
+
+      setProcessingState(false);
+      saveWebviewState();
+      renderMainContent();
+
+      const input = document.getElementById('prompt-input');
+      if (input) {
+        input.placeholder = '请输入补充信息...';
+        input.focus();
+      }
+      smoothScrollToBottom();
+    }
+
+    // 🆕 检查是否有待处理的澄清（使用全局状态而非消息类型）
+    function hasPendingClarification() {
+      return !!window._pendingClarification;
+    }
+
+    // 🆕 处理澄清回答（用户在输入框中自然回复）
+    function handleClarificationAnswer(answerText, cancelled) {
+      if (!window._pendingClarification) return;
+
+      const clarificationData = window._pendingClarification;
+
+      // 清除待处理状态
+      window._pendingClarification = null;
+
+      // 发送澄清回答到后端
+      vscode.postMessage({
+        type: 'answerClarification',
+        answers: cancelled ? null : { _userResponse: answerText },
+        additionalInfo: answerText
+      });
+
+      const input = document.getElementById('prompt-input');
+      if (input) {
+        input.placeholder = '描述你的任务... (可粘贴图片)';
+      }
+
+      if (!cancelled) {
+        setProcessingState(true);
+      }
+      saveWebviewState();
+      renderMainContent();
+    }
+
+    // 🆕 显示 Worker 问题作为普通 AI 消息（参考 Augment 的自然对话模式）
+    function showWorkerQuestion(workerId, question, context, options) {
+      // 构建 Worker 问题消息内容（Markdown 格式）
+      let content = `**${workerId}** 需要您的帮助：\n\n`;
+      content += question;
+      if (context) {
+        content += `\n\n> ${context}`;
+      }
+      content += '\n\n请在下方输入框中回复。';
+
+      // 作为普通 assistant 消息添加
+      threadMessages.push({
+        role: 'assistant',
+        content: content,
+        time: new Date().toLocaleTimeString().slice(0, 5),
+        timestamp: Date.now(),
+        source: 'worker',
+        cli: workerId,
+        // 标记这是 Worker 问题，用于后续识别
+        isWorkerQuestion: true,
+        workerQuestionData: {
+          workerId: workerId,
+          question: question,
+          context: context,
+          options: options
+        }
+      });
+
+      // 设置等待 Worker 问题回答状态
+      window._pendingWorkerQuestion = {
+        workerId: workerId,
+        question: question,
+        context: context,
+        options: options,
+        timestamp: Date.now()
+      };
+
+      setProcessingState(false);
+      saveWebviewState();
+      renderMainContent();
+      const input = document.getElementById('prompt-input');
+      if (input) {
+        input.placeholder = `回复 ${workerId} 的问题...`;
+        input.focus();
+      }
+      smoothScrollToBottom();
+    }
+
+    // 🆕 检查是否有待处理的 Worker 问题（使用全局状态）
+    function hasPendingWorkerQuestion() {
+      return !!window._pendingWorkerQuestion;
+    }
+
+    // 🆕 处理 Worker 问题回答（用户在输入框中自然回复）
+    function handleWorkerQuestionAnswer(answer, cancelled) {
+      if (!window._pendingWorkerQuestion) return;
+
+      // 清除待处理状态
+      window._pendingWorkerQuestion = null;
+
+      vscode.postMessage({
+        type: 'answerWorkerQuestion',
+        answer: cancelled ? null : (answer || '')
+      });
+
+      const input = document.getElementById('prompt-input');
+      if (input) {
+        input.placeholder = '描述你的任务... (可粘贴图片)';
+      }
+
+      if (!cancelled) {
+        setProcessingState(true);
+      }
+      saveWebviewState();
+      renderMainContent();
     }
 
     function handleQuestionAnswer(answer, cancelled) {
@@ -3540,44 +3935,46 @@
     }
 
     // Markdown 渲染函数
+    /**
+     * Markdown 渲染函数 - 参考 Augment 设计
+     * 支持：标题、列表、代码块、行内代码、粗体、斜体、链接、图片、表格、引用、分隔线
+     */
     function renderMarkdown(content) {
       if (!content) return '';
       content = content.replace(/\r\n/g, '\n');
 
-     
+      // 占位符数组
       const codeBlockPlaceholders = [];
+      const inlineCodePlaceholders = [];
 
-      // 处理代码块，支持多种格式（包括 language:filepath）
+      // 1. 处理代码块（最高优先级，避免内部内容被其他规则处理）
       content = content.replace(/```([^\n]*)[ \t]*\n?([\s\S]*?)```/g, function(match, langLine, code) {
         const { lang, filepath } = parseCodeBlockMeta(langLine);
         const html = renderCodeBlock(code, lang, filepath);
         if (!html) return '';
         const idx = codeBlockPlaceholders.length;
         codeBlockPlaceholders.push(html);
-        return `__CODEBLOCK_${idx}__`;
+        return `\n__CODEBLOCK_${idx}__\n`;
       });
 
-     
-      const inlineCodePlaceholders = [];
-      content = content.replace(/`([^`]+)`/g, function(match, code) {
+      // 2. 处理行内代码
+      content = content.replace(/`([^`\n]+)`/g, function(match, code) {
         const idx = inlineCodePlaceholders.length;
-        // 行内代码需要 HTML 转义
-        inlineCodePlaceholders.push('<code>' + escapeHtml(code) + '</code>');
+        inlineCodePlaceholders.push('<code class="markdown-codespan">' + escapeHtml(code) + '</code>');
         return `__INLINECODE_${idx}__`;
       });
 
-      // 处理标题 (H1-H6)
-      content = content.replace(/^###### (.+)$/gm, '<h6>$1</h6>');
-      content = content.replace(/^##### (.+)$/gm, '<h5>$1</h5>');
-      content = content.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
-      content = content.replace(/^### (.+)$/gm, '<h3>$1</h3>');
-      content = content.replace(/^## (.+)$/gm, '<h2>$1</h2>');
-      content = content.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+      // 3. 处理标题 (H1-H6)
+      content = content.replace(/^(#{1,6})\s+(.+)$/gm, function(match, hashes, text) {
+        const level = hashes.length;
+        return `<h${level}>${text.trim()}</h${level}>`;
+      });
 
-      // 处理图片 (在链接之前处理，避免冲突)
-      content = content.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" style="max-width:100%;height:auto;">');
+      // 4. 处理图片 (在链接之前处理)
+      content = content.replace(/!\[([^\]]*)\]\(([^)]+)\)/g,
+        '<img src="$2" alt="$1" class="markdown-image">');
 
-      // 处理粗体和斜体 (支持 * 和 _ 两种语法)
+      // 5. 处理粗体和斜体
       content = content.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
       content = content.replace(/___(.+?)___/g, '<strong><em>$1</em></strong>');
       content = content.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
@@ -3585,76 +3982,168 @@
       content = content.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
       content = content.replace(/_([^_\n]+)_/g, '<em>$1</em>');
 
-      // 处理删除线
+      // 6. 处理删除线和高亮
       content = content.replace(/~~(.+?)~~/g, '<del>$1</del>');
-
-      // 处理高亮 (==text==)
       content = content.replace(/==(.+?)==/g, '<mark>$1</mark>');
 
-      // 处理链接
-      content = content.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+      // 7. 处理链接
+      content = content.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" class="markdown-link">$1</a>');
 
-      // 处理任务列表 (在普通列表之前处理)
-      content = content.replace(/^[\-\*] \[x\] (.+)$/gm, '<li class="task-item"><input type="checkbox" checked disabled> $1</li>');
-      content = content.replace(/^[\-\*] \[ \] (.+)$/gm, '<li class="task-item"><input type="checkbox" disabled> $1</li>');
+      // 8. 处理任务列表 (在普通列表之前)
+      content = content.replace(/^(\s*)[\-\*]\s+\[x\]\s+(.+)$/gm,
+        '$1<li class="task-item task-done"><input type="checkbox" checked disabled><span>$2</span></li>');
+      content = content.replace(/^(\s*)[\-\*]\s+\[\s?\]\s+(.+)$/gm,
+        '$1<li class="task-item"><input type="checkbox" disabled><span>$2</span></li>');
 
-      // 处理无序列表
-      content = content.replace(/^[\-\*] (.+)$/gm, '<li>$1</li>');
-      content = content.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
+      // 9. 处理有序列表（改进版：正确处理连续列表项）
+      content = processOrderedLists(content);
 
-      // 处理有序列表
-      content = content.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+      // 10. 处理无序列表（改进版：正确处理连续列表项）
+      content = processUnorderedLists(content);
 
-      // 处理引用块
-      content = content.replace(/^> (.+)$/gm, '<blockquote>$1</blockquote>');
-      content = content.replace(/<\/blockquote>\n<blockquote>/g, '\n');
+      // 11. 处理引用块
+      content = content.replace(/^>\s*(.*)$/gm, '<blockquote-line>$1</blockquote-line>');
+      content = content.replace(/(<blockquote-line>.*<\/blockquote-line>\n?)+/g, function(match) {
+        const lines = match.replace(/<blockquote-line>/g, '').replace(/<\/blockquote-line>/g, '').trim();
+        return '<blockquote>' + lines + '</blockquote>';
+      });
 
-      // 处理分隔线 (支持 ---, ***, ___)
+      // 12. 处理分隔线
       content = content.replace(/^(---|\*\*\*|___)$/gm, '<hr>');
 
-      // 处理表格
+      // 13. 处理表格
       content = parseMarkdownTables(content);
 
-     
+      // 14. 还原占位符
       content = content.replace(/__INLINECODE_(\d+)__/g, (_, idx) => inlineCodePlaceholders[parseInt(idx)]);
-
-     
       content = content.replace(/__CODEBLOCK_(\d+)__/g, (_, idx) => codeBlockPlaceholders[parseInt(idx)]);
 
-      // 处理段落（连续的非空行）
+      // 15. 处理段落
+      content = processParagraphs(content);
+
+      return content;
+    }
+
+    /**
+     * 处理有序列表 - 改进版
+     */
+    function processOrderedLists(content) {
       const lines = content.split('\n');
-      let result = '';
-      let inParagraph = false;
+      const result = [];
+      let inList = false;
+      let listItems = [];
 
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
-        const isSpecial = line.startsWith('<h') || line.startsWith('<ul') ||
-                         line.startsWith('<ol') || line.startsWith('<blockquote') ||
-                         line.startsWith('<hr') || line.startsWith('<div') ||
-                         line.startsWith('<li') || line.startsWith('</');
+        const match = line.match(/^(\s*)(\d+)\.\s+(.+)$/);
 
-        if (line.trim() === '') {
-          if (inParagraph) {
-            result += '</p>';
-            inParagraph = false;
+        if (match) {
+          if (!inList) {
+            inList = true;
+            listItems = [];
           }
-          result += '\n';
-        } else if (isSpecial) {
-          if (inParagraph) {
-            result += '</p>';
-            inParagraph = false;
-          }
-          result += line + '\n';
+          listItems.push('<li>' + match[3] + '</li>');
         } else {
-          if (!inParagraph) {
-            result += '<p>';
-            inParagraph = true;
+          if (inList) {
+            result.push('<ol class="markdown-ol">' + listItems.join('') + '</ol>');
+            inList = false;
+            listItems = [];
           }
-          result += line + '\n';
+          result.push(line);
         }
       }
-      if (inParagraph) result += '</p>';
 
+      if (inList) {
+        result.push('<ol class="markdown-ol">' + listItems.join('') + '</ol>');
+      }
+
+      return result.join('\n');
+    }
+
+    /**
+     * 处理无序列表 - 改进版
+     */
+    function processUnorderedLists(content) {
+      const lines = content.split('\n');
+      const result = [];
+      let inList = false;
+      let listItems = [];
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        // 匹配无序列表项，但排除任务列表（已经处理过）
+        const match = line.match(/^(\s*)[\-\*]\s+(?!\[[ x]\])(.+)$/);
+
+        if (match && !line.includes('task-item')) {
+          if (!inList) {
+            inList = true;
+            listItems = [];
+          }
+          listItems.push('<li>' + match[2] + '</li>');
+        } else {
+          if (inList) {
+            result.push('<ul class="markdown-ul">' + listItems.join('') + '</ul>');
+            inList = false;
+            listItems = [];
+          }
+          result.push(line);
+        }
+      }
+
+      if (inList) {
+        result.push('<ul class="markdown-ul">' + listItems.join('') + '</ul>');
+      }
+
+      return result.join('\n');
+    }
+
+    /**
+     * 处理段落 - 改进版
+     */
+    function processParagraphs(content) {
+      const lines = content.split('\n');
+      let result = '';
+      let paragraphLines = [];
+
+      const isBlockElement = (line) => {
+        const trimmed = line.trim();
+        return trimmed.startsWith('<h') ||
+               trimmed.startsWith('<ul') ||
+               trimmed.startsWith('<ol') ||
+               trimmed.startsWith('<blockquote') ||
+               trimmed.startsWith('<hr') ||
+               trimmed.startsWith('<div') ||
+               trimmed.startsWith('<table') ||
+               trimmed.startsWith('<pre') ||
+               trimmed.startsWith('</') ||
+               trimmed.startsWith('<li') ||
+               trimmed === '';
+      };
+
+      const flushParagraph = () => {
+        if (paragraphLines.length > 0) {
+          const text = paragraphLines.join(' ').trim();
+          if (text) {
+            result += '<p class="markdown-paragraph">' + text + '</p>\n';
+          }
+          paragraphLines = [];
+        }
+      };
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+
+        if (isBlockElement(line)) {
+          flushParagraph();
+          if (line.trim()) {
+            result += line + '\n';
+          }
+        } else {
+          paragraphLines.push(line);
+        }
+      }
+
+      flushParagraph();
       return result;
     }
 
@@ -4938,6 +5427,8 @@
         if (m.type === 'cli_question') {
           return renderCliQuestionCard(m, idx);
         }
+        // 注意：clarification_request 和 worker_question 现在作为普通 assistant 消息显示
+        // 不再使用特殊卡片渲染
       }
       return null; // 普通消息，需要使用 renderMessageBlock
     }
@@ -5019,20 +5510,40 @@
       const streamingClass = message.streaming ? ' streaming' : '';
       const messageTypeClass = isUser ? ' user-message' : ' assistant-message';
       const groupedClass = grouped ? ' grouped' : '';
+      // 🆕 澄清消息和 Worker 问题消息的特殊样式类
+      const clarificationClass = message.isClarification ? ' clarification-message' : '';
+      const workerQuestionClass = message.isWorkerQuestion ? ' worker-question-message' : '';
       const streamKeyAttr = message.streamKey ? (' data-stream-key="' + message.streamKey + '"') : '';
       const cliAttr = cli ? (' data-cli="' + cli + '"') : '';
-      let html = '<div class="message' + messageTypeClass + streamingClass + groupedClass + '" data-msg-idx="' + idx + '"' + streamKeyAttr + cliAttr + '>';
+      let html = '<div class="message' + messageTypeClass + streamingClass + groupedClass + clarificationClass + workerQuestionClass + '" data-msg-idx="' + idx + '"' + streamKeyAttr + cliAttr + '>';
       html += '<div class="message-body">';
 
       // 悬停操作按钮（非用户消息）
       if (!isUser) {
         html += '<div class="message-actions">';
         html += '<button class="message-action-btn" onclick="copyMessageContent(this, ' + idx + ')" title="复制消息"><svg viewBox="0 0 16 16"><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/><path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/></svg></button>';
+        // 🆕 澄清消息添加跳过按钮
+        if (message.isClarification && window._pendingClarification) {
+          html += '<button class="message-action-btn" onclick="skipClarification()" title="跳过澄清"><svg viewBox="0 0 16 16"><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg></button>';
+        }
+        // 🆕 Worker 问题消息添加跳过按钮
+        if (message.isWorkerQuestion && window._pendingWorkerQuestion) {
+          html += '<button class="message-action-btn" onclick="skipWorkerQuestion()" title="跳过问题"><svg viewBox="0 0 16 16"><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg></button>';
+        }
         html += '</div>';
       }
 
       html += '<div class="message-header">';
-      if (!isUser && roleName) {
+      // 🆕 澄清消息显示特殊徽章
+      if (message.isClarification) {
+        html += '<span class="clarification-badge"><svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M5.255 5.786a.237.237 0 0 0 .241.247h.825c.138 0 .248-.113.266-.25.09-.656.54-1.134 1.342-1.134.686 0 1.314.343 1.314 1.168 0 .635-.374.927-.965 1.371-.673.489-1.206 1.06-1.168 1.987l.003.217a.25.25 0 0 0 .25.246h.811a.25.25 0 0 0 .25-.25v-.105c0-.718.273-.927 1.01-1.486.609-.463 1.244-.977 1.244-2.056 0-1.511-1.276-2.241-2.673-2.241-1.267 0-2.655.59-2.75 2.286zm1.557 5.763c0 .533.425.927 1.01.927.609 0 1.028-.394 1.028-.927 0-.552-.42-.94-1.029-.94-.584 0-1.009.388-1.009.94z"/></svg>需求澄清</span>';
+      }
+      // 🆕 Worker 问题消息显示特殊徽章
+      if (message.isWorkerQuestion) {
+        const workerId = message.workerQuestionData?.workerId || 'Worker';
+        html += '<span class="clarification-badge" style="background: var(--vscode-charts-orange);"><svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M11 6a3 3 0 1 1-6 0 3 3 0 0 1 6 0z"/><path fill-rule="evenodd" d="M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8zm8-7a7 7 0 0 0-5.468 11.37C3.242 11.226 4.805 10 8 10s4.757 1.225 5.468 2.37A7 7 0 0 0 8 1z"/></svg>' + escapeHtml(workerId) + ' 提问</span>';
+      }
+      if (!isUser && roleName && !message.isClarification && !message.isWorkerQuestion) {
         html += '<span class="message-role-badge ' + badgeClass + '">' + roleName + '</span>';
       }
       // 使用相对时间
@@ -5584,6 +6095,34 @@
 
       const input = document.getElementById('prompt-input');
       if (input.value.trim() || attachedImages.length > 0) {
+        // 🆕 优先处理澄清请求（使用底部输入框回答）
+        if (hasPendingClarification()) {
+          const answerText = input.value.trim();
+          if (!answerText) {
+            addSystemMessage('请输入澄清信息后再提交', 'warning');
+            return;
+          }
+          handleClarificationAnswer(answerText, false);
+          input.value = '';
+          attachedImages = [];
+          renderImagePreviews();
+          return;
+        }
+
+        // 🆕 处理 Worker 问题（使用底部输入框回答）
+        if (hasPendingWorkerQuestion()) {
+          const answerText = input.value.trim();
+          if (!answerText) {
+            addSystemMessage('请输入回答后再提交', 'warning');
+            return;
+          }
+          handleWorkerQuestionAnswer(answerText, false);
+          input.value = '';
+          attachedImages = [];
+          renderImagePreviews();
+          return;
+        }
+
         if (hasPendingQuestion()) {
           const answerText = input.value.trim();
           if (!answerText) {
@@ -5660,7 +6199,14 @@
         document.getElementById('panel-thread')?.classList.add('active');
         document.querySelectorAll('.bottom-tab').forEach(t => t.classList.remove('active'));
         document.querySelector('.bottom-tab[data-bottom-tab="thread"]')?.classList.add('active');
-        render();
+
+        // 🔧 修复：直接调用 renderMainContent 而不是 render()
+        // render() 依赖 state，但此时 state 可能还是 null
+        // 导致"正在思考"动画延迟显示
+        saveWebviewState();
+        renderMainContent();
+        startStreamingHintTimer();
+
         requestAnimationFrame(() => {
           const mainContent = document.getElementById('main-content');
           if (mainContent) mainContent.scrollTop = mainContent.scrollHeight;
@@ -6681,6 +7227,18 @@
       });
     }
 
+    // 🆕 跳过澄清（取消等待状态）
+    function skipClarification() {
+      handleClarificationAnswer('', true);
+    }
+    window.skipClarification = skipClarification;
+
+    // 🆕 跳过 Worker 问题（取消等待状态）
+    function skipWorkerQuestion() {
+      handleWorkerQuestionAnswer('', true);
+    }
+    window.skipWorkerQuestion = skipWorkerQuestion;
+
     // 通用折叠面板切换函数
     function togglePanel(panelId) {
       const panel = document.querySelector('[data-panel-id="' + panelId + '"]');
@@ -6995,16 +7553,14 @@
       const now = new Date();
       const time = now.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
 
-      // 添加到当前会话的消息列表
-      const sessionMessages = messages[currentSessionId] || [];
-      sessionMessages.push({
+      // 🔧 修复：使用 threadMessages 而不是 messages
+      threadMessages.push({
         type: 'system_notice',
         noticeType: type,
         content: message,
         time: time,
         timestamp: Date.now()
       });
-      messages[currentSessionId] = sessionMessages;
 
       // 渲染并滚动
       renderMainContent();

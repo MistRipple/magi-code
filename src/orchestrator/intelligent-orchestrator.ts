@@ -18,7 +18,7 @@ import { CLIAdapterFactory } from '../cli/adapter-factory';
 import { TaskManager } from '../task-manager';
 import { SnapshotManager } from '../snapshot-manager';
 import { globalEventBus } from '../events';
-import { OrchestratorAgent, ConfirmationCallback, RecoveryConfirmationCallback } from './orchestrator-agent';
+import { OrchestratorAgent, ConfirmationCallback, RecoveryConfirmationCallback, ClarificationCallback, WorkerQuestionCallback } from './orchestrator-agent';
 import { VerificationRunner, VerificationConfig } from './verification-runner';
 import { PlanRecord } from './plan-storage';
 import {
@@ -211,6 +211,16 @@ export class IntelligentOrchestrator {
   /** 设置用户补充问题回调 */
   setQuestionCallback(callback: QuestionCallback): void {
     this.orchestratorAgent.setQuestionCallback(callback);
+  }
+
+  /** 🆕 设置需求澄清回调 */
+  setClarificationCallback(callback: ClarificationCallback): void {
+    this.orchestratorAgent.setClarificationCallback(callback);
+  }
+
+  /** 🆕 设置 Worker 问题回调 */
+  setWorkerQuestionCallback(callback: WorkerQuestionCallback): void {
+    this.orchestratorAgent.setWorkerQuestionCallback(callback);
   }
 
   /** 更新 CLI 技能配置 */

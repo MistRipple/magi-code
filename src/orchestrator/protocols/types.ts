@@ -73,13 +73,17 @@ export interface ExecutionResult {
 
 /** 消息类型 */
 export type MessageType =
-  | 'task_dispatch'      // 编排者 -> Worker：分配任务
-  | 'task_cancel'        // 编排者 -> Worker：取消任务
-  | 'progress_report'    // Worker -> 编排者：进度汇报
-  | 'task_completed'     // Worker -> 编排者：任务完成
-  | 'task_failed'        // Worker -> 编排者：任务失败
-  | 'worker_ready'       // Worker -> 编排者：Worker 就绪
-  | 'orchestrator_command'; // 编排者广播命令
+  | 'task_dispatch'           // 编排者 -> Worker：分配任务
+  | 'task_cancel'             // 编排者 -> Worker：取消任务
+  | 'progress_report'         // Worker -> 编排者：进度汇报
+  | 'task_completed'          // Worker -> 编排者：任务完成
+  | 'task_failed'             // Worker -> 编排者：任务失败
+  | 'worker_ready'            // Worker -> 编排者：Worker 就绪
+  | 'orchestrator_command'    // 编排者广播命令
+  | 'clarification_request'   // 编排者 -> 用户：请求澄清需求
+  | 'clarification_response'  // 用户 -> 编排者：回答澄清问题
+  | 'worker_question'         // Worker -> 编排者：子代理提问
+  | 'worker_answer';          // 编排者 -> Worker：回答子代理问题
 
 /** 基础消息结构 */
 export interface BaseMessage {
@@ -158,6 +162,55 @@ export interface OrchestratorCommandMessage extends BaseMessage {
   };
 }
 
+/** 需求澄清请求消息（编排者 -> 用户） */
+export interface ClarificationRequestMessage extends BaseMessage {
+  type: 'clarification_request';
+  payload: {
+    taskId: string;
+    questions: string[];           // 需要用户回答的问题列表
+    context: string;               // 问题上下文
+    ambiguityScore: number;        // 模糊度评分 (0-100)
+    originalPrompt: string;        // 原始用户输入
+  };
+}
+
+/** 需求澄清响应消息（用户 -> 编排者） */
+export interface ClarificationResponseMessage extends BaseMessage {
+  type: 'clarification_response';
+  payload: {
+    taskId: string;
+    answers: Record<string, string>;  // 问题-答案映射
+    additionalInfo?: string;          // 用户补充的额外信息
+  };
+}
+
+/** Worker 提问消息（Worker -> 编排者） */
+export interface WorkerQuestionMessage extends BaseMessage {
+  type: 'worker_question';
+  payload: {
+    taskId: string;
+    subTaskId: string;
+    workerId: string;
+    question: string;              // 问题内容
+    context: string;               // 问题上下文
+    options?: string[];            // 可选的选项
+    timeout?: number;              // 等待超时（毫秒）
+    questionId: string;            // 问题唯一ID
+  };
+}
+
+/** Worker 回答消息（编排者 -> Worker） */
+export interface WorkerAnswerMessage extends BaseMessage {
+  type: 'worker_answer';
+  payload: {
+    taskId: string;
+    subTaskId: string;
+    questionId: string;            // 对应的问题ID
+    answer: string;                // 回答内容
+    answeredBy: 'user' | 'orchestrator';  // 回答来源
+  };
+}
+
 /** 所有消息类型联合 */
 export type BusMessage =
   | TaskDispatchMessage
@@ -166,7 +219,11 @@ export type BusMessage =
   | TaskCompletedMessage
   | TaskFailedMessage
   | WorkerReadyMessage
-  | OrchestratorCommandMessage;
+  | OrchestratorCommandMessage
+  | ClarificationRequestMessage
+  | ClarificationResponseMessage
+  | WorkerQuestionMessage
+  | WorkerAnswerMessage;
 
 // ============================================================================
 // 编排者相关类型
@@ -175,11 +232,13 @@ export type BusMessage =
 /** 编排者状态 */
 export type OrchestratorState =
   | 'idle'
+  | 'clarifying'              // 🆕 需求澄清阶段
   | 'analyzing'
   | 'waiting_questions'
   | 'waiting_confirmation'
   | 'dispatching'
   | 'monitoring'
+  | 'waiting_worker_answer'   // 🆕 等待 Worker 问题回答
   | 'integrating'
   | 'verifying'
   | 'recovering'

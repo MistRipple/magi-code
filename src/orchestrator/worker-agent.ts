@@ -26,6 +26,7 @@ import {
   TaskDispatchMessage,
   TaskCancelMessage,
   OrchestratorCommandMessage,
+  WorkerAnswerMessage,
 } from './protocols/types';
 
 /** Worker 配置 */
@@ -34,8 +35,16 @@ export interface WorkerConfig {
   cliFactory: CLIAdapterFactory;
   messageBus?: MessageBus;
   orchestratorId?: string;
-  snapshotManager?: SnapshotManager; 
+  snapshotManager?: SnapshotManager;
   permissions?: PermissionMatrix;
+}
+
+/** 🆕 待回答的问题 */
+interface PendingQuestion {
+  questionId: string;
+  resolve: (answer: string) => void;
+  reject: (error: Error) => void;
+  timeout: NodeJS.Timeout;
 }
 
 /**
@@ -58,6 +67,7 @@ export class WorkerAgent extends EventEmitter {
   private currentContextSnapshot: string | null = null;
   private abortController: AbortController | null = null;
   private unsubscribers: Array<() => void> = [];
+  private pendingQuestions: Map<string, PendingQuestion> = new Map(); // 🆕 待回答的问题
 
   constructor(config: WorkerConfig) {
     super();
@@ -120,6 +130,14 @@ export class WorkerAgent extends EventEmitter {
       this.handleMessage(msg);
     });
     this.unsubscribers.push(unsubCommand);
+
+    // 🆕 订阅 Worker 回答消息
+    const unsubAnswer = this.messageBus.subscribe('worker_answer', (msg) => {
+      if (msg.target === this.id) {
+        this.handleMessage(msg);
+      }
+    });
+    this.unsubscribers.push(unsubAnswer);
   }
 
   /** 处理消息 */
@@ -134,6 +152,24 @@ export class WorkerAgent extends EventEmitter {
       case 'orchestrator_command':
         await this.handleOrchestratorCommand(message as OrchestratorCommandMessage);
         break;
+      case 'worker_answer':
+        this.handleWorkerAnswer(message as WorkerAnswerMessage);
+        break;
+    }
+  }
+
+  /** 🆕 处理 Worker 回答消息 */
+  private handleWorkerAnswer(message: WorkerAnswerMessage): void {
+    const { questionId, answer } = message.payload;
+    const pending = this.pendingQuestions.get(questionId);
+
+    if (pending) {
+      clearTimeout(pending.timeout);
+      pending.resolve(answer);
+      this.pendingQuestions.delete(questionId);
+      console.log(`[WorkerAgent ${this.id}] 收到问题回答: ${questionId}`);
+    } else {
+      console.warn(`[WorkerAgent ${this.id}] 收到未知问题的回答: ${questionId}`);
     }
   }
 
@@ -520,6 +556,79 @@ export class WorkerAgent extends EventEmitter {
     const trimmed = context.trim();
     if (trimmed.length <= maxChars) return trimmed;
     return trimmed.slice(0, maxChars) + '\n...';
+  }
+
+  // =========================================================================
+  // 🆕 疑问上报机制
+  // =========================================================================
+
+  /**
+   * 🆕 向编排者提问
+   * 当 Worker 执行任务时遇到模糊指令，可以向编排者提问
+   * 编排者会将问题转发给用户，并将回答返回给 Worker
+   *
+   * @param question 问题内容
+   * @param context 问题上下文
+   * @param options 可选的选项
+   * @param timeoutMs 超时时间（毫秒），默认 5 分钟
+   * @returns 用户/编排者的回答
+   */
+  async askQuestion(
+    question: string,
+    context: string,
+    options?: string[],
+    timeoutMs: number = 300000
+  ): Promise<string> {
+    if (!this.currentTaskId || !this.currentSubTaskId) {
+      throw new Error('无法在任务外提问');
+    }
+
+    console.log(`[WorkerAgent ${this.id}] 向编排者提问: ${question}`);
+
+    // 发送问题消息
+    const questionId = this.messageBus.sendWorkerQuestion(
+      this.id,
+      this.orchestratorId,
+      this.currentTaskId,
+      this.currentSubTaskId,
+      question,
+      context,
+      options,
+      timeoutMs
+    );
+
+    // 等待回答
+    return new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingQuestions.delete(questionId);
+        reject(new Error(`问题超时未回答: ${question}`));
+      }, timeoutMs);
+
+      this.pendingQuestions.set(questionId, {
+        questionId,
+        resolve,
+        reject,
+        timeout
+      });
+    });
+  }
+
+  /**
+   * 🆕 检查是否有待回答的问题
+   */
+  hasPendingQuestions(): boolean {
+    return this.pendingQuestions.size > 0;
+  }
+
+  /**
+   * 🆕 取消所有待回答的问题
+   */
+  cancelPendingQuestions(): void {
+    for (const [questionId, pending] of this.pendingQuestions) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error('问题已取消'));
+    }
+    this.pendingQuestions.clear();
   }
 
   /**
