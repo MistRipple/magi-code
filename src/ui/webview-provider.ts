@@ -66,6 +66,16 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     resolve: (answer: string | null) => void;
     reject: (error: Error) => void;
   } | null = null;
+  // 🆕 需求澄清机制
+  private pendingClarification: {
+    resolve: (result: { answers: Record<string, string>; additionalInfo?: string } | null) => void;
+    reject: (error: Error) => void;
+  } | null = null;
+  // 🆕 Worker 问题机制
+  private pendingWorkerQuestion: {
+    resolve: (answer: string | null) => void;
+    reject: (error: Error) => void;
+  } | null = null;
 
   // 当前选择的 CLI（null 表示自动选择/智能编排）
   private selectedCli: CLIType | null = null;
@@ -409,6 +419,38 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         console.log('[MultiCLI] Orchestrator: 等待用户补充信息...');
       });
     });
+
+    // 🆕 设置需求澄清回调
+    this.intelligentOrchestrator.setClarificationCallback(async (questions, context, ambiguityScore, originalPrompt) => {
+      return new Promise((resolve, reject) => {
+        this.pendingClarification = { resolve, reject };
+        this.postMessage({
+          type: 'clarificationRequest',
+          questions,
+          context,
+          ambiguityScore,
+          originalPrompt,
+          sessionId: this.activeSessionId
+        } as any);
+        console.log(`[MultiCLI] Orchestrator: 需求模糊度 ${ambiguityScore}%，等待用户澄清...`);
+      });
+    });
+
+    // 🆕 设置 Worker 问题回调
+    this.intelligentOrchestrator.setWorkerQuestionCallback(async (workerId, question, context, options) => {
+      return new Promise((resolve, reject) => {
+        this.pendingWorkerQuestion = { resolve, reject };
+        this.postMessage({
+          type: 'workerQuestionRequest',
+          workerId,
+          question,
+          context,
+          options,
+          sessionId: this.activeSessionId
+        } as any);
+        console.log(`[MultiCLI] Worker ${workerId} 提问: ${question}`);
+      });
+    });
   }
 
   /** 处理用户对执行计划的确认响应 */
@@ -437,6 +479,41 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         type: 'toast',
         message: normalized ? '已提交问题回答，继续分析...' : '已取消问题补充',
         toastType: normalized ? 'success' : 'info',
+      });
+    }
+  }
+
+  /** 🆕 处理用户澄清回答 */
+  private handleClarificationAnswer(answers: Record<string, string> | null, additionalInfo?: string): void {
+    if (this.pendingClarification) {
+      if (answers && Object.keys(answers).length > 0) {
+        this.pendingClarification.resolve({ answers, additionalInfo });
+        this.postMessage({
+          type: 'toast',
+          message: '已提交澄清信息，继续分析...',
+          toastType: 'success',
+        });
+      } else {
+        this.pendingClarification.resolve(null);
+        this.postMessage({
+          type: 'toast',
+          message: '已跳过澄清，使用原始需求...',
+          toastType: 'info',
+        });
+      }
+      this.pendingClarification = null;
+    }
+  }
+
+  /** 🆕 处理 Worker 问题回答 */
+  private handleWorkerQuestionAnswer(answer: string | null): void {
+    if (this.pendingWorkerQuestion) {
+      this.pendingWorkerQuestion.resolve(answer);
+      this.pendingWorkerQuestion = null;
+      this.postMessage({
+        type: 'toast',
+        message: answer ? '已回答 Worker 问题，继续执行...' : '已跳过 Worker 问题...',
+        toastType: answer ? 'success' : 'info',
       });
     }
   }
@@ -1037,6 +1114,19 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       case 'answerQuestions':
         this.handleQuestionAnswer((message as any).answer ?? null);
+        break;
+
+      case 'answerClarification':
+        // 🆕 用户回答澄清问题
+        this.handleClarificationAnswer(
+          (message as any).answers ?? null,
+          (message as any).additionalInfo
+        );
+        break;
+
+      case 'answerWorkerQuestion':
+        // 🆕 用户回答 Worker 问题
+        this.handleWorkerQuestionAnswer((message as any).answer ?? null);
         break;
 
       case 'answerCliQuestion':

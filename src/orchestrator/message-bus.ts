@@ -19,6 +19,10 @@ import {
   TaskFailedMessage,
   WorkerReadyMessage,
   OrchestratorCommandMessage,
+  ClarificationRequestMessage,
+  ClarificationResponseMessage,
+  WorkerQuestionMessage,
+  WorkerAnswerMessage,
   SubTask,
   ExecutionResult,
   WorkerInfo,
@@ -251,6 +255,114 @@ export class MessageBus extends EventEmitter {
       timestamp: Date.now(),
       source,
       payload: { command },
+    };
+    this.publish(message);
+  }
+
+  // =========================================================================
+  // 🆕 需求澄清相关消息
+  // =========================================================================
+
+  /**
+   * 发送需求澄清请求（编排者 -> 用户）
+   */
+  requestClarification(
+    source: string,
+    taskId: string,
+    questions: string[],
+    context: string,
+    ambiguityScore: number,
+    originalPrompt: string
+  ): void {
+    const message: ClarificationRequestMessage = {
+      id: generateMessageId(),
+      type: 'clarification_request',
+      timestamp: Date.now(),
+      source,
+      payload: { taskId, questions, context, ambiguityScore, originalPrompt },
+    };
+    this.publish(message);
+  }
+
+  /**
+   * 发送需求澄清响应（用户 -> 编排者）
+   */
+  respondClarification(
+    source: string,
+    target: string,
+    taskId: string,
+    answers: Record<string, string>,
+    additionalInfo?: string
+  ): void {
+    const message: ClarificationResponseMessage = {
+      id: generateMessageId(),
+      type: 'clarification_response',
+      timestamp: Date.now(),
+      source,
+      target,
+      payload: { taskId, answers, additionalInfo },
+    };
+    this.publish(message);
+  }
+
+  // =========================================================================
+  // 🆕 Worker 疑问相关消息
+  // =========================================================================
+
+  /**
+   * 发送 Worker 提问（Worker -> 编排者）
+   */
+  sendWorkerQuestion(
+    source: string,
+    target: string,
+    taskId: string,
+    subTaskId: string,
+    question: string,
+    context: string,
+    options?: string[],
+    timeout?: number
+  ): string {
+    const questionId = `q_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const message: WorkerQuestionMessage = {
+      id: generateMessageId(),
+      type: 'worker_question',
+      timestamp: Date.now(),
+      source,
+      target,
+      payload: {
+        taskId,
+        subTaskId,
+        workerId: source,
+        question,
+        context,
+        options,
+        timeout,
+        questionId
+      },
+    };
+    this.publish(message);
+    return questionId;
+  }
+
+  /**
+   * 发送 Worker 回答（编排者 -> Worker）
+   */
+  sendWorkerAnswer(
+    source: string,
+    target: string,
+    taskId: string,
+    subTaskId: string,
+    questionId: string,
+    answer: string,
+    answeredBy: 'user' | 'orchestrator'
+  ): void {
+    const message: WorkerAnswerMessage = {
+      id: generateMessageId(),
+      type: 'worker_answer',
+      timestamp: Date.now(),
+      source,
+      target,
+      payload: { taskId, subTaskId, questionId, answer, answeredBy },
     };
     this.publish(message);
   }

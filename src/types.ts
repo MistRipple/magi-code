@@ -543,7 +543,11 @@ export type WebviewToExtensionMessage =
   | { type: 'testPromptEnhance'; baseUrl: string; apiKey: string }
   | { type: 'enhancePrompt'; prompt: string }
   // 🔧 新增：CLI 询问回答
-  | { type: 'answerCliQuestion'; cli: CLIType; questionId: string; answer: string; adapterRole?: 'worker' | 'orchestrator' };
+  | { type: 'answerCliQuestion'; cli: CLIType; questionId: string; answer: string; adapterRole?: 'worker' | 'orchestrator' }
+  // 🆕 新增：需求澄清回答
+  | { type: 'answerClarification'; answers: Record<string, string> | null; additionalInfo?: string }
+  // 🆕 新增：Worker 问题回答
+  | { type: 'answerWorkerQuestion'; answer: string | null };
 
 // Extension 发送到 Webview 的消息
 // source 字段用于区分消息来源：'orchestrator' = 编排者, 'worker' = 执行代理

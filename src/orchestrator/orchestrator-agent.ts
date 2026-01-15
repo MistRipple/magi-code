@@ -44,6 +44,7 @@ import {
   TaskCompletedMessage,
   TaskFailedMessage,
   ProgressReportMessage,
+  WorkerQuestionMessage,
 } from './protocols/types';
 import {
   buildOrchestratorAnalysisPrompt,
@@ -111,6 +112,31 @@ export type RecoveryConfirmationCallback = (
   error: string,
   options: { retry: boolean; rollback: boolean }
 ) => Promise<'retry' | 'rollback' | 'continue'>;
+
+/** 🆕 需求澄清回调类型 */
+export type ClarificationCallback = (
+  questions: string[],
+  context: string,
+  ambiguityScore: number,
+  originalPrompt: string
+) => Promise<{ answers: Record<string, string>; additionalInfo?: string } | null>;
+
+/** 🆕 Worker 疑问回调类型 */
+export type WorkerQuestionCallback = (
+  workerId: string,
+  question: string,
+  context: string,
+  options?: string[]
+) => Promise<string | null>;
+
+/** 🆕 需求模糊度评估结果 */
+export interface AmbiguityAssessment {
+  score: number;              // 0-100，越高越模糊
+  isAmbiguous: boolean;       // 是否需要澄清
+  questions: string[];        // 需要澄清的问题
+  missingDimensions: string[]; // 缺失的维度
+  context: string;            // 评估上下文
+}
 
 type ReviewDecisionStatus = 'passed' | 'rejected' | 'skipped';
 
@@ -193,6 +219,9 @@ export class OrchestratorAgent extends EventEmitter {
   private confirmationCallback: ConfirmationCallback | null = null;
   private questionCallback: QuestionCallback | null = null;
   private recoveryConfirmationCallback: RecoveryConfirmationCallback | null = null;
+  private clarificationCallback: ClarificationCallback | null = null;  // 🆕 需求澄清回调
+  private workerQuestionCallback: WorkerQuestionCallback | null = null; // 🆕 Worker 疑问回调
+  private pendingWorkerQuestions: Map<string, { resolve: (answer: string) => void; reject: (error: Error) => void }> = new Map(); // 🆕 待回答的 Worker 问题
   private planConfirmationPolicy: ((risk: TaskContext['risk'] | null) => boolean) | null = null;
   private abortController: AbortController | null = null;
   private unsubscribers: Array<() => void> = [];
@@ -312,6 +341,16 @@ export class OrchestratorAgent extends EventEmitter {
   /** 设置失败恢复确认回调 */
   setRecoveryConfirmationCallback(callback: RecoveryConfirmationCallback): void {
     this.recoveryConfirmationCallback = callback;
+  }
+
+  /** 🆕 设置需求澄清回调 */
+  setClarificationCallback(callback: ClarificationCallback): void {
+    this.clarificationCallback = callback;
+  }
+
+  /** 🆕 设置 Worker 疑问回调 */
+  setWorkerQuestionCallback(callback: WorkerQuestionCallback): void {
+    this.workerQuestionCallback = callback;
   }
 
   /** 设置执行计划确认策略 */
@@ -545,6 +584,92 @@ export class OrchestratorAgent extends EventEmitter {
       this.handleProgressReport(msg as ProgressReportMessage);
     });
     this.unsubscribers.push(unsubProgress);
+
+    // 🆕 监听 Worker 问题消息
+    const unsubWorkerQuestion = this.messageBus.subscribe('worker_question', (msg) => {
+      void this.handleWorkerQuestion(msg as WorkerQuestionMessage);
+    });
+    this.unsubscribers.push(unsubWorkerQuestion);
+  }
+
+  /**
+   * 🆕 处理 Worker 问题
+   * 将问题转发给用户，并将回答返回给 Worker
+   */
+  private async handleWorkerQuestion(message: WorkerQuestionMessage): Promise<void> {
+    const { taskId, subTaskId, workerId, question, context, options, questionId } = message.payload;
+
+    console.log(`[OrchestratorAgent] 收到 Worker 问题: ${question} (from ${workerId})`);
+
+    // 通知 UI 有 Worker 提问
+    this.emitUIMessage('progress_update', `Worker ${workerId} 提问: ${question}`, {
+      subTaskId,
+      workerQuestion: { questionId, question, context, options }
+    } as any);
+
+    // 如果设置了 Worker 问题回调，转发给用户
+    if (this.workerQuestionCallback) {
+      try {
+        const previousState = this._state;
+        this.setState('waiting_worker_answer');
+
+        const answer = await this.workerQuestionCallback(workerId, question, context, options);
+
+        if (answer) {
+          // 将回答发送给 Worker
+          this.messageBus.sendWorkerAnswer(
+            this.id,
+            workerId,
+            taskId,
+            subTaskId,
+            questionId,
+            answer,
+            'user'
+          );
+          console.log(`[OrchestratorAgent] 已回答 Worker 问题: ${questionId}`);
+        } else {
+          // 用户取消回答，使用默认回答
+          this.messageBus.sendWorkerAnswer(
+            this.id,
+            workerId,
+            taskId,
+            subTaskId,
+            questionId,
+            '请自行决定最佳方案',
+            'orchestrator'
+          );
+          console.log(`[OrchestratorAgent] 用户未回答，使用默认回答: ${questionId}`);
+        }
+
+        // 恢复之前的状态
+        this.setState(previousState);
+
+      } catch (error) {
+        console.error('[OrchestratorAgent] 处理 Worker 问题异常:', error);
+        // 发送默认回答
+        this.messageBus.sendWorkerAnswer(
+          this.id,
+          workerId,
+          taskId,
+          subTaskId,
+          questionId,
+          '请自行决定最佳方案',
+          'orchestrator'
+        );
+      }
+    } else {
+      // 没有设置回调，自动回答
+      console.log('[OrchestratorAgent] 未设置 Worker 问题回调，自动回答');
+      this.messageBus.sendWorkerAnswer(
+        this.id,
+        workerId,
+        taskId,
+        subTaskId,
+        questionId,
+        '请自行决定最佳方案',
+        'orchestrator'
+      );
+    }
   }
 
   /** 设置 Worker Pool 事件处理 */
@@ -568,6 +693,145 @@ export class OrchestratorAgent extends EventEmitter {
   // =========================================================================
   // 核心执行流程
   // =========================================================================
+
+  // =========================================================================
+  // 🆕 Phase 0: 需求澄清机制
+  // =========================================================================
+
+  /**
+   * 🆕 评估需求模糊度
+   * 通过 Claude 分析用户需求的明确程度
+   */
+  private async assessAmbiguity(userPrompt: string): Promise<AmbiguityAssessment> {
+    console.log('[OrchestratorAgent] Phase 0: 评估需求模糊度...');
+
+    const assessmentPrompt = `你是一个需求分析专家。请评估以下用户需求的模糊程度。
+
+## 用户需求
+${userPrompt}
+
+## 评估维度
+1. **目标明确性**：是否有明确的功能目标？是否有具体的输入/输出定义？
+2. **范围明确性**：是否指定了目标文件/模块？是否有边界条件说明？
+3. **技术明确性**：是否指定了技术方案？是否有接口定义？
+4. **验收标准**：是否有明确的完成标准？是否有测试用例？
+
+## 输出格式（JSON）
+\`\`\`json
+{
+  "score": 0-100,  // 模糊度评分，0=完全明确，100=完全模糊
+  "isAmbiguous": true/false,  // 是否需要澄清（score > 50 时为 true）
+  "missingDimensions": ["目标明确性", ...],  // 缺失的维度
+  "questions": ["问题1", "问题2"],  // 需要用户回答的问题（最多3个）
+  "context": "评估说明"
+}
+\`\`\`
+
+只输出 JSON，不要其他内容。`;
+
+    try {
+      const response = await this.cliFactory.sendMessage(
+        'claude',
+        assessmentPrompt,
+        undefined,
+        { source: 'orchestrator', streamToUI: false }
+      );
+
+      if (response.error) {
+        console.warn('[OrchestratorAgent] 模糊度评估失败，默认为明确需求');
+        return {
+          score: 0,
+          isAmbiguous: false,
+          questions: [],
+          missingDimensions: [],
+          context: '评估失败，默认为明确需求'
+        };
+      }
+
+      const jsonMatch = response.content.match(/```json\s*([\s\S]*?)\s*```/);
+      const jsonStr = jsonMatch ? jsonMatch[1] : response.content;
+      const parsed = JSON.parse(jsonStr);
+
+      return {
+        score: parsed.score || 0,
+        isAmbiguous: parsed.isAmbiguous || parsed.score > 50,
+        questions: parsed.questions || [],
+        missingDimensions: parsed.missingDimensions || [],
+        context: parsed.context || ''
+      };
+    } catch (error) {
+      console.warn('[OrchestratorAgent] 模糊度评估异常:', error);
+      return {
+        score: 0,
+        isAmbiguous: false,
+        questions: [],
+        missingDimensions: [],
+        context: '评估异常，默认为明确需求'
+      };
+    }
+  }
+
+  /**
+   * 🆕 执行需求澄清流程
+   * 向用户提问并等待回答
+   */
+  private async clarifyRequirements(
+    userPrompt: string,
+    assessment: AmbiguityAssessment
+  ): Promise<string> {
+    if (!this.clarificationCallback) {
+      console.log('[OrchestratorAgent] 未设置澄清回调，跳过澄清流程');
+      return userPrompt;
+    }
+
+    console.log(`[OrchestratorAgent] 需求模糊度: ${assessment.score}%，开始澄清流程`);
+    this.setState('clarifying');
+
+    // 发送澄清请求消息
+    this.messageBus.requestClarification(
+      this.id,
+      this.currentContext?.taskId || '',
+      assessment.questions,
+      assessment.context,
+      assessment.score,
+      userPrompt
+    );
+
+    // 通知 UI
+    this.emitUIMessage('progress_update', `检测到需求模糊（${assessment.score}%），正在请求澄清...`);
+
+    try {
+      const result = await this.clarificationCallback(
+        assessment.questions,
+        assessment.context,
+        assessment.score,
+        userPrompt
+      );
+
+      if (!result) {
+        console.log('[OrchestratorAgent] 用户取消澄清');
+        return userPrompt;
+      }
+
+      // 合并用户回答到原始需求
+      const answersText = Object.entries(result.answers)
+        .map(([q, a]) => `Q: ${q}\nA: ${a}`)
+        .join('\n\n');
+
+      const clarifiedPrompt = `${userPrompt}
+
+## 用户补充澄清
+${answersText}
+${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
+
+      console.log('[OrchestratorAgent] 需求澄清完成');
+      return clarifiedPrompt;
+
+    } catch (error) {
+      console.error('[OrchestratorAgent] 澄清流程异常:', error);
+      return userPrompt;
+    }
+  }
 
   /**
    * 执行任务 - 主入口
@@ -600,14 +864,26 @@ export class OrchestratorAgent extends EventEmitter {
     this.warnedReviewSkipForDependencies = false;
     this.lastIntegrationSummary = null;
     this.batchTasks.clear();
+    this.pendingWorkerQuestions.clear();
 
     // 初始化上下文管理器
     await this.ensureContext(contextSessionId, userPrompt);
 
     try {
+      // 🆕 Phase 0: 需求澄清（如果设置了澄清回调）
+      let clarifiedPrompt = userPrompt;
+      if (this.clarificationCallback) {
+        const assessment = await this.assessAmbiguity(userPrompt);
+        if (assessment.isAmbiguous && assessment.questions.length > 0) {
+          clarifiedPrompt = await this.clarifyRequirements(userPrompt, assessment);
+          this.currentContext.userPrompt = clarifiedPrompt;
+        }
+      }
+      this.checkAborted();
+
       // Phase 1: 任务分析（支持补充提问）
       let plan: ExecutionPlan | null = null;
-      let analysisPrompt = userPrompt;
+      let analysisPrompt = clarifiedPrompt;
       for (let round = 0; round < 3; round += 1) {
         this.setState('analyzing');
         this.currentContext.userPrompt = analysisPrompt;
@@ -624,7 +900,7 @@ export class OrchestratorAgent extends EventEmitter {
             this.setState('idle');
             return '任务已取消。';
           }
-          analysisPrompt = `${userPrompt}\n\n## 用户补充信息\n${answer}`;
+          analysisPrompt = `${clarifiedPrompt}\n\n## 用户补充信息\n${answer}`;
           continue;
         }
 
