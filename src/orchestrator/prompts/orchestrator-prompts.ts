@@ -100,7 +100,8 @@ ${projectContext ? `## 项目上下文\n${projectContext}\n` : ''}
       "reason": "选择该 Worker 的原因",
       "targetFiles": ["预计修改的文件列表"],
       "dependencies": [],
-      "prompt": "发送给该 Worker 的具体指令（英文，详细明确）"
+      "prompt": "发送给该 Worker 的具体指令（英文，详细明确）",
+      "background": false
     }
   ],
   "executionMode": "parallel/sequential",
@@ -144,13 +145,21 @@ export function buildOrchestratorSummaryPrompt(
   originalPrompt: string,
   executionResults: ExecutionResult[]
 ): string {
+  const sanitizeOutput = (content: string): string => {
+    const withoutFences = content.replace(/```[\s\S]*?```/g, '[代码块已省略]');
+    const trimmed = withoutFences.trim();
+    if (!trimmed) return '无';
+    if (trimmed.length <= 400) return trimmed;
+    return `${trimmed.slice(0, 400)}...(已截断)`;
+  };
+
   const resultsText = executionResults
-    .map(r => `### ${r.workerType} (${r.workerId}) 执行结果 (${r.success ? '✅ 成功' : '❌ 失败'})
+    .map(r => `### ${r.workerType} (${r.workerId}) 执行结果 (${r.success ? '[成功]' : '[失败]'})
 **子任务 ID**: ${r.subTaskId}
 **耗时**: ${r.duration}ms
 **修改文件**: ${r.modifiedFiles?.join(', ') || '无'}
 **输出**:
-${r.result}
+${sanitizeOutput(r.result || '')}
 ${r.error ? `**错误**: ${r.error}` : ''}
 `)
     .join('\n');
@@ -167,7 +176,9 @@ ${resultsText}
 1. 总结完成了哪些工作
 2. 如果有失败的任务，说明原因和建议
 3. 不要输出代码块、diff 或文件清单（这些已在 Worker 面板中展示）
-4. 给出后续建议（如需要）
+4. 避免重复叙述，同一内容只出现一次
+5. 控制在 12-15 行以内，保持简洁
+6. 给出后续建议（如需要）
 
 请用简洁清晰的中文回复，使用 Markdown 格式。`;
 }
@@ -181,11 +192,11 @@ ${resultsText}
  */
 export function formatPlanForUser(plan: ExecutionPlan): string {
   if (plan.isSimpleTask) {
-    return `## 📋 任务分析结果
+    return `## 任务分析结果
 
 **分析**: ${plan.analysis}
 
-⚠️ **这是一个简单任务，无需多 Worker 协作。**
+**注意**: 这是一个简单任务，无需多 Worker 协作。
 原因: ${plan.skipReason || '任务复杂度较低'}
 
 ---
@@ -208,10 +219,10 @@ export function formatPlanForUser(plan: ExecutionPlan): string {
 
   const hasDependencies = plan.subTasks.some(task => task.dependencies && task.dependencies.length > 0);
   const executionModeText = hasDependencies
-    ? '🔗 依赖图调度（含并行批次）'
-    : (plan.executionMode === 'parallel' ? '⚡ 并行执行' : '🔗 串行执行');
+    ? '依赖图调度（含并行批次）'
+    : (plan.executionMode === 'parallel' ? '并行执行' : '串行执行');
 
-  return `## 📋 执行计划
+  return `## 执行计划
 
 **分析**: ${plan.analysis}
 
@@ -229,7 +240,7 @@ ${tasksText}
 **总结**: ${plan.summary}
 
 ---
-⚠️ **注意**: 各 Worker 将直接修改文件。
+**注意**: 各 Worker 将直接修改文件。
 
 **确认执行此计划？**`;
 }

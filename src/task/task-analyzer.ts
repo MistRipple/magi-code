@@ -31,6 +31,7 @@ const CATEGORY_KEYWORDS: Record<TaskCategory, string[]> = {
   bugfix: ['修复', 'bug', 'fix', '错误', '问题', 'error', 'issue', '调试', 'debug'],
   debug: ['调试', 'debug', '排查', '分析', 'trace', '日志'],
   frontend: ['前端', 'frontend', 'ui', 'css', '样式', '组件', 'component', 'react', 'vue'],
+  backend: ['后端', 'backend', 'api', '服务', 'server', '数据库', 'database'],
   test: ['测试', 'test', '单元测试', 'unit', '覆盖率', 'coverage', 'jest', 'mocha'],
   document: ['文档', '注释', 'doc', 'comment', 'readme', '说明'],
   review: ['审查', 'review', '检查', 'check', '代码审查'],
@@ -169,4 +170,3 @@ export class TaskAnalyzer {
     return 'sequential';
   }
 }
-

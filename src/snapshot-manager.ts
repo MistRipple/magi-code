@@ -173,11 +173,33 @@ export class SnapshotManager {
           additions,
           deletions,
           status: 'pending',
+          subTaskId: snapshot.subTaskId,
         });
       }
     }
 
     return changes;
+  }
+
+  /** 获取指定子任务的实际变更文件 */
+  getChangedFilesForSubTask(subTaskId: string): string[] {
+    const session = this.sessionManager.getCurrentSession();
+    if (!session) return [];
+
+    const files: string[] = [];
+    for (const snapshot of session.snapshots) {
+      if (snapshot.subTaskId !== subTaskId) {
+        continue;
+      }
+      const absolutePath = path.join(this.workspaceRoot, snapshot.filePath);
+      const currentContent = fs.existsSync(absolutePath)
+        ? fs.readFileSync(absolutePath, 'utf-8')
+        : '';
+      if (currentContent !== snapshot.originalContent) {
+        files.push(snapshot.filePath);
+      }
+    }
+    return files;
   }
 
   /** 计算变更行数 */
@@ -283,4 +305,3 @@ export class SnapshotManager {
     }
   }
 }
-

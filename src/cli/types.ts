@@ -73,11 +73,11 @@ export interface CLIResponse {
   error?: string;
   /** 原始输出 */
   raw?: string;
-  /** 🆕 Token 使用统计 */
+  /** Token 使用统计 */
   tokenUsage?: TokenUsage;
 }
 
-/** 🆕 Token 使用统计 */
+/** Token 使用统计 */
 export interface TokenUsage {
   /** 输入 token 数 */
   inputTokens: number;

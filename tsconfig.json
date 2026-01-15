@@ -14,6 +14,6 @@
     "declaration": true,
     "declarationMap": true
   },
-  "exclude": ["node_modules", ".vscode-test", "out", "test", "tests", "dist"]
+  "exclude": ["node_modules", ".vscode-test", "out", "test", "tests", "dist", "scripts"]
 }
 

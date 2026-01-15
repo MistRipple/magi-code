@@ -6,7 +6,7 @@
  * - 提供 Worker 获取和分配
  * - 监控 Worker 状态
  * - CLI 降级和故障转移
- * - 🆕 任务依赖图调度
+ * - 任务依赖图调度
  */
 
 import { EventEmitter } from 'events';
@@ -17,6 +17,7 @@ import { ExecutionStats, FallbackSuggestion } from './execution-stats';
 import { TaskDependencyGraph, DependencyAnalysis, ExecutionBatch } from './task-dependency-graph';
 import { FileLockManager } from './file-lock-manager';
 import { SnapshotManager } from '../snapshot-manager';
+import { PermissionMatrix } from '../types';
 import {
   WorkerType,
   WorkerState,
@@ -40,8 +41,10 @@ export interface WorkerPoolConfig {
   executionStats?: ExecutionStats;
   /** 是否启用 CLI 降级 */
   enableFallback?: boolean;
-  /** 🆕 快照管理器（可选，用于跟踪文件变更） */
+  /** 快照管理器（可选，用于跟踪文件变更） */
   snapshotManager?: SnapshotManager;
+  /** 权限矩阵（用于 Worker Prompt 约束） */
+  permissions?: PermissionMatrix;
 }
 
 /** 执行调度配置 */
@@ -129,11 +132,12 @@ export class WorkerPool extends EventEmitter {
   private fileLockManager = new FileLockManager();
   private cancelGeneration = 0;
 
-  // 🆕 执行统计和降级相关
+ 
   private executionStats?: ExecutionStats;
   private enableFallback: boolean;
-  // 🆕 快照管理器
+ 
   private snapshotManager?: SnapshotManager;
+  private permissions: PermissionMatrix;
 
   constructor(config: WorkerPoolConfig) {
     super();
@@ -142,25 +146,26 @@ export class WorkerPool extends EventEmitter {
     this.orchestratorId = config.orchestratorId || 'orchestrator';
     this.schedulingConfig = { ...DEFAULT_SCHEDULING_CONFIG, ...config.scheduling };
 
-    // 🆕 初始化执行统计和降级配置
+   
     this.executionStats = config.executionStats;
     this.enableFallback = config.enableFallback ?? true;
     this.snapshotManager = config.snapshotManager;
+    this.permissions = config.permissions || { allowEdit: true, allowBash: true, allowWeb: true };
 
     this.setupMessageHandlers();
   }
 
-  /** 🆕 设置执行统计实例 */
+  /** 设置执行统计实例 */
   setExecutionStats(stats: ExecutionStats): void {
     this.executionStats = stats;
   }
 
-  /** 🆕 获取执行统计实例 */
+  /** 获取执行统计实例 */
   getExecutionStats(): ExecutionStats | undefined {
     return this.executionStats;
   }
 
-  /** 🆕 设置快照管理器 */
+  /** 设置快照管理器 */
   setSnapshotManager(manager: SnapshotManager): void {
     this.snapshotManager = manager;
     // 更新已有 Worker 的快照管理器
@@ -195,7 +200,8 @@ export class WorkerPool extends EventEmitter {
       cliFactory: this.cliFactory,
       messageBus: this.messageBus,
       orchestratorId: this.orchestratorId,
-      snapshotManager: this.snapshotManager,  // 🆕 传递快照管理器
+      snapshotManager: this.snapshotManager, 
+      permissions: this.permissions,
     });
 
     // 监听 Worker 状态变更
@@ -337,6 +343,10 @@ export class WorkerPool extends EventEmitter {
     if (lockFiles.length === 0) {
       lockFiles = this.inferLockFiles(subTask);
     }
+    const conflictLocks = this.resolveConflictLocks(subTask);
+    if (conflictLocks.length > 0) {
+      lockFiles = Array.from(new Set([...lockFiles, ...conflictLocks]));
+    }
     const abortSignal = options?.abortSignal;
 
     if (abortSignal?.aborted) {
@@ -378,6 +388,16 @@ export class WorkerPool extends EventEmitter {
       queue.push(item);
       void this.processQueue(type);
     });
+  }
+
+  private resolveConflictLocks(subTask: SubTask): string[] {
+    const domain = subTask.conflictDomain?.trim();
+    if (!domain) return [];
+    return domain
+      .split('|')
+      .map(part => part.trim())
+      .filter(Boolean)
+      .map(part => `__domain:${part}`);
   }
 
   private async processQueue(type: WorkerType): Promise<void> {
@@ -479,7 +499,7 @@ export class WorkerPool extends EventEmitter {
 
   /**
    * 带重试、降级和超时的任务分发（集成 ExecutionScheduler 能力）
-   * 🆕 支持 CLI 降级：当原 CLI 失败时，自动尝试其他可用 CLI
+   * 支持 CLI 降级：当原 CLI 失败时，自动尝试其他可用 CLI
    */
   async dispatchTaskWithRetry(
     type: WorkerType,
@@ -511,7 +531,7 @@ export class WorkerPool extends EventEmitter {
         const result = await this.executeWithTimeout(currentCli, taskId, subTask, context, options);
         const duration = Date.now() - startTime;
 
-        // 🆕 记录执行统计
+       
         this.recordExecution(
           currentCli,
           taskId,
@@ -532,7 +552,7 @@ export class WorkerPool extends EventEmitter {
 
         // 检查是否应该重试或降级
         if (!this.shouldRetry(result.error) || attempt >= this.schedulingConfig.maxRetries) {
-          // 🆕 尝试降级到其他 CLI
+         
           triedClis.push(currentCli);
           const fallback = this.tryFallback(currentCli, triedClis);
           if (fallback) {
@@ -542,6 +562,14 @@ export class WorkerPool extends EventEmitter {
             continue; // 使用新 CLI 重试
           }
 
+          this.messageBus.reportTaskFailed(
+            'workerpool',
+            this.orchestratorId,
+            taskId,
+            subTask.id,
+            result.error || '未知错误',
+            false
+          );
           state.error = result.error;
           return result;
         }
@@ -553,11 +581,11 @@ export class WorkerPool extends EventEmitter {
         lastError = error instanceof Error ? error : new Error(String(error));
         state.error = lastError.message;
 
-        // 🆕 记录失败统计
+       
         this.recordExecution(currentCli, taskId, subTask.id, false, duration, lastError.message);
 
         if (!this.shouldRetry(lastError.message) || attempt >= this.schedulingConfig.maxRetries) {
-          // 🆕 尝试降级到其他 CLI
+         
           triedClis.push(currentCli);
           const fallback = this.tryFallback(currentCli, triedClis);
           if (fallback) {
@@ -569,6 +597,14 @@ export class WorkerPool extends EventEmitter {
 
           state.status = 'failed';
           state.endTime = Date.now();
+          this.messageBus.reportTaskFailed(
+            'workerpool',
+            this.orchestratorId,
+            taskId,
+            subTask.id,
+            lastError.message,
+            false
+          );
           throw lastError;
         }
       }
@@ -672,7 +708,7 @@ export class WorkerPool extends EventEmitter {
   }
 
   /**
-   * 🆕 记录执行统计
+   * 记录执行统计
    */
   private recordExecution(
     cli: WorkerType,
@@ -699,7 +735,7 @@ export class WorkerPool extends EventEmitter {
   }
 
   /**
-   * 🆕 尝试 CLI 降级
+   * 尝试 CLI 降级
    * @param failedCli 失败的 CLI
    * @param triedClis 已尝试过的 CLI 列表
    * @returns 降级建议，如果没有可用的降级选项则返回 null
@@ -709,21 +745,24 @@ export class WorkerPool extends EventEmitter {
       return null;
     }
 
+    const statuses = this.cliFactory.getAllStatus();
+    const connected = statuses.filter(status => status.connected).map(status => status.type);
+    const availableClis = connected.length > 0 ? connected : (['claude', 'codex', 'gemini'] as WorkerType[]);
+
     // 如果有执行统计，使用智能降级
     if (this.executionStats) {
-      return this.executionStats.getFallbackSuggestion(failedCli, triedClis);
+      return this.executionStats.getFallbackSuggestion(failedCli, triedClis, availableClis);
     }
 
     // 没有统计数据时，使用简单的轮换策略
-    const allClis: WorkerType[] = ['claude', 'codex', 'gemini'];
-    const availableClis = allClis.filter(cli => !triedClis.includes(cli));
+    const fallbackClis = availableClis.filter(cli => !triedClis.includes(cli));
 
-    if (availableClis.length === 0) {
+    if (fallbackClis.length === 0) {
       return null;
     }
 
     // 简单选择第一个可用的 CLI
-    const suggestedCli = availableClis[0];
+    const suggestedCli = fallbackClis[0];
     return {
       originalCli: failedCli,
       suggestedCli,
@@ -816,7 +855,7 @@ export class WorkerPool extends EventEmitter {
   }
 
   /**
-   * 🆕 基于依赖图执行任务批次
+   * 基于依赖图执行任务批次
    * 按照拓扑排序的批次顺序执行任务，同一批次内的任务并行执行
    */
   async executeWithDependencyGraph(
@@ -902,7 +941,7 @@ export class WorkerPool extends EventEmitter {
   }
 
   /**
-   * 🆕 并行执行一批任务
+   * 并行执行一批任务
    */
   private async executeBatchParallel(
     taskId: string,
@@ -968,7 +1007,7 @@ export class WorkerPool extends EventEmitter {
   }
 
   /**
-   * 🆕 创建任务依赖图（供外部使用）
+   * 创建任务依赖图（供外部使用）
    */
   createDependencyGraph(subTasks: SubTask[]): TaskDependencyGraph {
     const graph = new TaskDependencyGraph();

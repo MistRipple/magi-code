@@ -36,6 +36,7 @@ export interface TaskState {
 
 /** 持久化的任务数据 */
 interface PersistedTaskData {
+  version: number;
   sessionId: string;
   createdAt: number;
   updatedAt: number;
@@ -49,16 +50,21 @@ export type StateChangeCallback = (task: TaskState, allTasks: TaskState[]) => vo
  * 任务状态管理器
  */
 export class TaskStateManager {
+  private static readonly STORAGE_VERSION = 1;
   private tasks: Map<string, TaskState> = new Map();
   private sessionId: string;
   private workspaceRoot: string;
   private callbacks: StateChangeCallback[] = [];
   private autoSave: boolean;
+  private createdAt: number;
+  private updatedAt: number;
 
   constructor(sessionId: string, workspaceRoot: string, autoSave = true) {
     this.sessionId = sessionId;
     this.workspaceRoot = workspaceRoot;
     this.autoSave = autoSave;
+    this.createdAt = Date.now();
+    this.updatedAt = this.createdAt;
   }
 
   /** 创建新任务 */
@@ -69,6 +75,11 @@ export class TaskStateManager {
     assignedCli: CLIType;
     maxAttempts?: number;
   }): TaskState {
+    if (this.tasks.has(params.id)) {
+      console.warn(`[TaskStateManager] 任务已存在: ${params.id}`);
+      return this.tasks.get(params.id)!;
+    }
+
     const task: TaskState = {
       id: params.id,
       parentTaskId: params.parentTaskId,
@@ -83,6 +94,7 @@ export class TaskStateManager {
     this.tasks.set(task.id, task);
     this.notifyChange(task);
     this.autoSaveIfEnabled();
+    this.emitStateChanged(task);
 
     return task;
   }
@@ -95,36 +107,24 @@ export class TaskStateManager {
       return;
     }
 
-    task.status = status;
-    if (error) task.error = error;
-
-    if (status === 'running' && !task.startedAt) {
-      task.startedAt = Date.now();
-    }
-    if (status === 'completed' || status === 'failed') {
-      task.completedAt = Date.now();
-    }
-    if (status === 'retrying') {
-      task.attempts += 1;
+    if (!this.applyStatus(task, status, { error })) {
+      return;
     }
 
     this.notifyChange(task);
     this.autoSaveIfEnabled();
-
-    // 发送事件
-    globalEventBus.emitEvent('task:state_changed', {
-      taskId,
-      data: { task, allTasks: this.getAllTasks() }
-    });
+    this.emitStateChanged(task);
   }
 
   /** 更新任务进度 */
   updateProgress(taskId: string, progress: number): void {
     const task = this.tasks.get(taskId);
     if (!task) return;
+    if (task.status !== 'running' && task.status !== 'retrying') return;
 
     task.progress = Math.min(100, Math.max(0, progress));
     this.notifyChange(task);
+    this.emitStateChanged(task);
   }
 
   /** 设置任务结果 */
@@ -135,6 +135,7 @@ export class TaskStateManager {
     task.result = result;
     if (modifiedFiles) task.modifiedFiles = modifiedFiles;
     this.autoSaveIfEnabled();
+    this.emitStateChanged(task);
   }
 
   /** 获取单个任务 */
@@ -190,14 +191,19 @@ export class TaskStateManager {
     const task = this.tasks.get(taskId);
     if (!task) return;
 
-    task.status = 'retrying';
-    task.attempts += 1;
-    task.error = undefined;
-    task.result = undefined;
-    task.progress = 0;
+    this.applyStatus(task, 'retrying', { force: true, reset: true, incrementAttempt: true });
 
     this.notifyChange(task);
     this.autoSaveIfEnabled();
+    this.emitStateChanged(task);
+  }
+
+  /** 发送状态变更事件 */
+  private emitStateChanged(task: TaskState): void {
+    globalEventBus.emitEvent('task:state_changed', {
+      taskId: task.id,
+      data: { task, allTasks: this.getAllTasks() }
+    });
   }
 
   /** 注册状态变更回调 */
@@ -245,10 +251,12 @@ export class TaskStateManager {
       fs.mkdirSync(dir, { recursive: true });
     }
 
+    this.updatedAt = Date.now();
     const data: PersistedTaskData = {
+      version: TaskStateManager.STORAGE_VERSION,
       sessionId: this.sessionId,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
+      createdAt: this.createdAt,
+      updatedAt: this.updatedAt,
       tasks: this.getAllTasks(),
     };
 
@@ -265,11 +273,24 @@ export class TaskStateManager {
 
     try {
       const content = fs.readFileSync(storagePath, 'utf-8');
-      const data: PersistedTaskData = JSON.parse(content);
-
+      const data = JSON.parse(content) as Partial<PersistedTaskData>;
+      const tasks = Array.isArray(data.tasks) ? data.tasks : [];
       this.tasks.clear();
-      for (const task of data.tasks) {
-        this.tasks.set(task.id, task);
+      for (const raw of tasks) {
+        const normalized = this.normalizeTaskState(raw);
+        if (normalized) {
+          this.tasks.set(normalized.id, normalized);
+        }
+      }
+      if (typeof data.createdAt === 'number') {
+        this.createdAt = data.createdAt;
+      }
+      if (typeof data.updatedAt === 'number') {
+        this.updatedAt = data.updatedAt;
+      }
+      for (const task of this.tasks.values()) {
+        this.notifyChange(task);
+        this.emitStateChanged(task);
       }
     } catch (error) {
       console.error('[TaskStateManager] 加载失败:', error);
@@ -279,6 +300,12 @@ export class TaskStateManager {
   /** 清除所有任务 */
   clear(): void {
     this.tasks.clear();
+    this.createdAt = Date.now();
+    this.updatedAt = this.createdAt;
+    const storagePath = this.getStoragePath();
+    if (fs.existsSync(storagePath)) {
+      fs.unlinkSync(storagePath);
+    }
     this.autoSaveIfEnabled();
   }
 
@@ -301,5 +328,109 @@ export class TaskStateManager {
       cancelled: tasks.filter(t => t.status === 'cancelled').length,
     };
   }
-}
 
+  private applyStatus(
+    task: TaskState,
+    status: TaskStatus,
+    options: {
+      error?: string;
+      force?: boolean;
+      reset?: boolean;
+      incrementAttempt?: boolean;
+    } = {}
+  ): boolean {
+    const prevStatus = task.status;
+    if (!options.force && !this.isTransitionAllowed(prevStatus, status)) {
+      console.warn(`[TaskStateManager] 非法状态流转: ${prevStatus} -> ${status}`);
+      return false;
+    }
+    task.status = status;
+    if (options.reset) {
+      task.error = undefined;
+      task.result = undefined;
+      task.progress = 0;
+      task.startedAt = undefined;
+      task.completedAt = undefined;
+    }
+    if (typeof options.error === 'string') {
+      task.error = options.error;
+    }
+    if (status === 'running' && !task.startedAt) {
+      task.startedAt = Date.now();
+    }
+    if (status === 'completed' || status === 'failed' || status === 'cancelled') {
+      task.completedAt = Date.now();
+    }
+    if (status === 'retrying' && options.incrementAttempt) {
+      task.attempts += 1;
+    }
+    if (status === 'completed' && task.progress < 100) {
+      task.progress = 100;
+    }
+    return true;
+  }
+
+  private isTransitionAllowed(from: TaskStatus, to: TaskStatus): boolean {
+    if (from === to) return true;
+    const allowed: Record<TaskStatus, TaskStatus[]> = {
+      pending: ['running', 'retrying', 'failed', 'cancelled', 'completed'],
+      running: ['completed', 'failed', 'retrying', 'cancelled'],
+      retrying: ['running', 'failed', 'cancelled', 'completed'],
+      failed: ['retrying', 'cancelled'],
+      completed: [],
+      cancelled: [],
+    };
+    return allowed[from].includes(to);
+  }
+
+  private normalizeTaskState(raw: Partial<TaskState>): TaskState | null {
+    if (!raw || typeof raw !== 'object') return null;
+    if (typeof raw.id !== 'string' || typeof raw.parentTaskId !== 'string' || typeof raw.description !== 'string') {
+      return null;
+    }
+    if (raw.assignedCli !== 'claude' && raw.assignedCli !== 'codex' && raw.assignedCli !== 'gemini') {
+      return null;
+    }
+    const status = this.normalizeStatus(raw.status);
+    if (!status) return null;
+    const progress = this.clampNumber(raw.progress ?? 0, 0, 100);
+    const attempts = Math.max(0, Number(raw.attempts ?? 0));
+    const maxAttempts = Math.max(1, Number(raw.maxAttempts ?? 3));
+    const startedAt = typeof raw.startedAt === 'number' ? raw.startedAt : undefined;
+    const completedAt = typeof raw.completedAt === 'number' ? raw.completedAt : undefined;
+    const result = typeof raw.result === 'string' ? raw.result : undefined;
+    const error = typeof raw.error === 'string' ? raw.error : undefined;
+    const modifiedFiles = Array.isArray(raw.modifiedFiles)
+      ? raw.modifiedFiles.filter(file => typeof file === 'string')
+      : undefined;
+
+    const normalized: TaskState = {
+      id: raw.id,
+      parentTaskId: raw.parentTaskId,
+      description: raw.description,
+      assignedCli: raw.assignedCli,
+      status,
+      progress: status === 'completed' ? 100 : progress,
+      attempts,
+      maxAttempts,
+      startedAt: status === 'pending' ? undefined : startedAt,
+      completedAt: status === 'completed' || status === 'failed' || status === 'cancelled' ? completedAt : undefined,
+      result,
+      error,
+      modifiedFiles,
+    };
+    return normalized;
+  }
+
+  private normalizeStatus(status?: TaskStatus): TaskStatus | null {
+    if (!status) return null;
+    const allowed: TaskStatus[] = ['pending', 'running', 'completed', 'failed', 'retrying', 'cancelled'];
+    return allowed.includes(status) ? status : null;
+  }
+
+  private clampNumber(value: number, min: number, max: number): number {
+    const normalized = Number(value);
+    if (Number.isNaN(normalized)) return min;
+    return Math.min(max, Math.max(min, normalized));
+  }
+}

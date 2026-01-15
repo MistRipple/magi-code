@@ -137,18 +137,20 @@ export class AITaskDecomposer {
       
       const parsed = JSON.parse(jsonStr);
       const aiSubTasks: AISubTask[] = parsed.subTasks || [];
+      const baseId = `ai-${Date.now()}`;
 
       return aiSubTasks.map((task, index) => {
         const category = this.normalizeCategory(task.category);
         const selection = this.cliSelector.selectByCategory(category);
+        const id = `${baseId}-${index}`;
         
         return {
-          id: `ai-${Date.now()}-${index}`,
+          id,
           description: task.description,
           category,
           assignedCli: selection.cli,
           targetFiles: task.targetFiles || [],
-          dependencies: (task.dependencies || []).map((d: string | number) => `ai-${Date.now()}-${d}`),
+          dependencies: (task.dependencies || []).map((d: string | number) => `${baseId}-${d}`),
           priority: task.priority || index + 1,
           cliSelection: selection,
         };
@@ -226,4 +228,3 @@ export class AITaskDecomposer {
     this.config = { ...this.config, ...config };
   }
 }
-

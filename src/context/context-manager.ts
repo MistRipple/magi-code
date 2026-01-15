@@ -149,9 +149,16 @@ export class ContextManager {
       const summary = this.buildMemorySummary(memorySummary);
       if (summary) {
         const memoryTokens = this.estimateTokens(summary);
-        if (currentTokens + memoryTokens < maxTokens * memoryRatio) {
-          parts.push('## 会话上下文\n' + summary);
-          currentTokens += memoryTokens;
+        const memoryBudget = Math.max(0, Math.floor(maxTokens * memoryRatio));
+        if (memoryBudget > 0) {
+          if (memoryTokens <= memoryBudget) {
+            parts.push('## 会话上下文\n' + summary);
+            currentTokens += memoryTokens;
+          } else {
+            const truncated = this.truncationUtils.truncateMessage(summary, memoryBudget * 4);
+            parts.push('## 会话上下文\n' + truncated.content);
+            currentTokens += this.estimateTokens(truncated.content);
+          }
         }
       }
     }
@@ -254,9 +261,19 @@ export class ContextManager {
     for (let i = this.immediateContext.length - 1; i >= 0; i--) {
       const msg = this.immediateContext[i];
       const msgTokens = msg.tokenCount || this.estimateTokens(msg.content);
-      
-      if (tokens + msgTokens > maxTokens) break;
-      
+
+      if (tokens + msgTokens > maxTokens) {
+        if (result.length === 0 && maxTokens > 0) {
+          const truncated = this.truncationUtils.truncateMessage(msg.content, maxTokens * 4);
+          result.unshift({
+            ...msg,
+            content: truncated.content,
+            tokenCount: this.estimateTokens(truncated.content),
+          });
+        }
+        break;
+      }
+
       result.unshift(msg);
       tokens += msgTokens;
     }
@@ -313,6 +330,13 @@ export class ContextManager {
    */
   addImportantContext(context: string): void {
     this.sessionMemory?.addImportantContext(context);
+  }
+
+  /**
+   * 添加待解决问题
+   */
+  addPendingIssue(issue: string): void {
+    this.sessionMemory?.addPendingIssue(issue);
   }
 
   /**

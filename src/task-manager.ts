@@ -58,6 +58,26 @@ export class TaskManager {
     this.sessionManager.updateTask(session.id, taskId, next);
   }
 
+  /** 更新 Task 关联的执行计划信息 */
+  updateTaskPlan(taskId: string, planInfo: { planId: string; planSummary?: string; status?: Task['planStatus'] }): void {
+    const updates: Partial<Task> = {
+      planId: planInfo.planId,
+      planSummary: planInfo.planSummary,
+      planStatus: planInfo.status ?? 'ready',
+      planCreatedAt: Date.now(),
+      planUpdatedAt: Date.now(),
+    };
+    this.updateTask(taskId, updates);
+  }
+
+  /** 更新 Task 的执行计划状态 */
+  updateTaskPlanStatus(taskId: string, status: Task['planStatus']): void {
+    this.updateTask(taskId, {
+      planStatus: status,
+      planUpdatedAt: Date.now(),
+    });
+  }
+
   /** 更新 Task 状态 */
   updateTaskStatus(taskId: string, status: TaskStatus): void {
     const session = this.sessionManager.getCurrentSession();
@@ -145,6 +165,7 @@ export class TaskManager {
       taskId,
       assignedCli: subTask.assignedCli ?? subTask.assignedWorker,
       targetFiles: subTask.targetFiles ?? [],
+      modifiedFiles: subTask.modifiedFiles ?? [],
       dependencies: subTask.dependencies ?? [],
       status: subTask.status ?? 'pending',
       output: subTask.output ?? [],
@@ -167,6 +188,13 @@ export class TaskManager {
     if (!subTask) return;
 
     subTask.status = status;
+
+    if (task.status === 'pending' && status !== 'pending') {
+      task.status = 'running';
+      if (!task.startedAt) {
+        task.startedAt = Date.now();
+      }
+    }
     
     if (status === 'running' && !subTask.startedAt) {
       subTask.startedAt = Date.now();
@@ -178,6 +206,25 @@ export class TaskManager {
 
     // 检查是否所有 SubTask 都完成了
     this.checkTaskCompletion(taskId);
+  }
+
+  /** 更新 SubTask 的实际修改文件 */
+  updateSubTaskFiles(taskId: string, subTaskId: string, files: string[]): void {
+    const session = this.sessionManager.getCurrentSession();
+    if (!session) return;
+
+    const task = session.tasks.find(t => t.id === taskId);
+    if (!task) return;
+
+    const subTask = task.subTasks.find(st => st.id === subTaskId);
+    if (!subTask) return;
+
+    const normalized = Array.from(
+      new Set((files || []).filter(f => typeof f === 'string' && f.trim()))
+    );
+    subTask.modifiedFiles = normalized;
+
+    this.sessionManager.updateTask(session.id, taskId, task);
   }
 
   /** 添加 SubTask 输出 */
