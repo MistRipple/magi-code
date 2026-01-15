@@ -6,7 +6,7 @@
  * - Worker Agents：专职执行，向编排者汇报进度和结果
  */
 
-import { CLIType, SubTask, WorkerType } from '../../types';
+import { CLIType, SubTask, WorkerType, PermissionMatrix, StrategyConfig } from '../../types';
 
 // 重新导出统一类型，保持向后兼容
 export { SubTask, WorkerType };
@@ -32,13 +32,13 @@ export interface ExecutionPlan {
   id: string;
   analysis: string;
   isSimpleTask?: boolean;
-  /** 🆕 是否需要 Worker 执行（false 表示编排者直接回答） */
+  /** 是否需要 Worker 执行（false 表示编排者直接回答） */
   needsWorker?: boolean;
-  /** 🆕 编排者直接回答的内容（当 needsWorker=false 时使用） */
+  /** 编排者直接回答的内容（当 needsWorker=false 时使用） */
   directResponse?: string;
-  /** 🆕 是否需要用户补充信息 */
+  /** 是否需要用户补充信息 */
   needsUserInput?: boolean;
-  /** 🆕 需要用户回答的问题列表 */
+  /** 需要用户回答的问题列表 */
   questions?: string[];
   skipReason?: string;
   needsCollaboration: boolean;
@@ -224,11 +224,25 @@ export interface OrchestratorConfig {
     testCommand?: string;
     timeout?: number;
   };
+  /** 计划评审配置 */
+  planReview?: {
+    enabled?: boolean;
+    reviewer?: WorkerType;
+  };
   /** 功能集成配置 */
   integration?: {
     enabled?: boolean;
     maxRounds?: number;
     worker?: WorkerType;
+  };
+  /** 权限矩阵 */
+  permissions?: PermissionMatrix;
+  /** 策略开关 */
+  strategy?: StrategyConfig;
+  /** CLI 选择策略 */
+  cliSelection?: {
+    enabled?: boolean;
+    healthThreshold?: number;
   };
   /** 上下文注入配置 */
   context?: {
@@ -248,6 +262,14 @@ export interface TaskContext {
   userPrompt: string;
   plan?: ExecutionPlan;
   results: ExecutionResult[];
+  risk?: {
+    level: 'low' | 'medium' | 'high';
+    path: 'light' | 'standard' | 'full';
+    hardStop: boolean;
+    verification: 'none' | 'basic' | 'full';
+    score: number;
+    signals: string[];
+  };
   startTime: number;
   endTime?: number;
 }
@@ -259,7 +281,7 @@ export type OrchestratorMessageType =
   | 'worker_output'
   | 'verification_result'
   | 'summary'
-  | 'direct_response'  // 🆕 编排者直接回答（不需要 Worker）
+  | 'direct_response' 
   | 'question_request'
   | 'error';
 
@@ -276,6 +298,9 @@ export interface OrchestratorUIMessage {
     subTaskId?: string;
     progress?: number;
     plan?: ExecutionPlan;
+    planId?: string;
+    formattedPlan?: string;
+    review?: { status: 'approved' | 'rejected' | 'skipped'; summary: string };
     result?: ExecutionResult;
     retryAttempt?: number;
     retryDelay?: number;

@@ -113,7 +113,7 @@ export abstract class BaseWorker extends EventEmitter {
         output += chunk;
         this.outputBuffer.push(chunk);
         onOutput?.(chunk);
-        globalEventBus.emitEvent('subtask:output', { data: { output: chunk, cliType: this.cliType } });
+        globalEventBus.emitEvent('cli:output', { data: { output: chunk, cliType: this.cliType } });
       });
 
       this.process.stderr?.on('data', (data: Buffer) => {

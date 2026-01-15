@@ -65,6 +65,16 @@ export class CLIAdapterFactory extends EventEmitter {
     this.sessionManager.on('sessionEvent', (event) => {
       globalEventBus.emitEvent('cli:session_event', { data: event });
     });
+
+    // 🔧 监听 CLI 询问事件
+    this.sessionManager.on('question', ({ cli, role, question }) => {
+      this.emit('question', { type: cli, question, adapterRole: role });
+    });
+
+    // 🔧 监听询问超时事件
+    this.sessionManager.on('questionTimeout', ({ cli, role, questionId }) => {
+      this.emit('questionTimeout', { type: cli, questionId, adapterRole: role });
+    });
   }
 
   /**
@@ -249,6 +259,12 @@ export class CLIAdapterFactory extends EventEmitter {
       this.outputMuteCounts.set(scopeKey, count + 1);
     }
 
+    // 🔧 发送 start 事件，通知前端开始新的消息流
+    // 这样前端可以强制结束当前流式消息，创建新消息
+    if (options?.streamToUI !== false) {
+      this.emit('streamStart', { type, source: scope?.source, adapterRole: role });
+    }
+
     try {
       return adapter.sendMessage(message, imagePaths, options?.messageMeta);
     } finally {
@@ -274,6 +290,24 @@ export class CLIAdapterFactory extends EventEmitter {
     if (adapter) {
       await adapter.interrupt();
     }
+  }
+
+  /**
+   * 向 CLI 发送用户输入（用于回答 CLI 询问）
+   * @param type CLI 类型
+   * @param text 用户输入的文本
+   * @param role 适配器角色，默认为 worker
+   * @returns 是否发送成功
+   */
+  writeInput(type: CLIType, text: string, role: 'worker' | 'orchestrator' = 'worker'): boolean {
+    return this.sessionManager.writeInput(type, role, text);
+  }
+
+  /**
+   * 检查 CLI 是否正在等待用户回答
+   */
+  isWaitingForAnswer(type: CLIType, role: 'worker' | 'orchestrator' = 'worker'): boolean {
+    return this.sessionManager.isWaitingForAnswer(type, role);
   }
 
   /**

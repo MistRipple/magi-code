@@ -193,7 +193,7 @@ export class MemoryDocument {
 
     // 当前任务
     if (c.currentTasks.length > 0) {
-      lines.push('## 🎯 当前任务');
+      lines.push('## 当前任务');
       c.currentTasks.forEach(t => {
         const status = t.status === 'in_progress' ? '[/]' : '[ ]';
         lines.push(`- ${status} ${t.description}${t.assignedWorker ? ` (${t.assignedWorker})` : ''}`);
@@ -203,7 +203,7 @@ export class MemoryDocument {
 
     // 已完成任务
     if (c.completedTasks.length > 0) {
-      lines.push('## ✅ 已完成任务');
+      lines.push('## 已完成任务');
       c.completedTasks.slice(-10).forEach(t => { // 只显示最近10个
         const status = t.status === 'completed' ? '[x]' : '[!]';
         lines.push(`- ${status} ${t.description}${t.result ? ` - ${t.result}` : ''}`);
@@ -213,7 +213,7 @@ export class MemoryDocument {
 
     // 关键决策
     if (c.keyDecisions.length > 0) {
-      lines.push('## 🔑 关键决策');
+      lines.push('## 关键决策');
       c.keyDecisions.forEach((d, i) => {
         lines.push(`${i + 1}. ${d.description}: ${d.reason}`);
       });
@@ -222,7 +222,7 @@ export class MemoryDocument {
 
     // 代码变更
     if (c.codeChanges.length > 0) {
-      lines.push('## 📝 代码变更摘要');
+      lines.push('## 代码变更摘要');
       c.codeChanges.slice(-20).forEach(ch => { // 只显示最近20个
         lines.push(`- \`${ch.file}\`: ${ch.summary}`);
       });
@@ -231,7 +231,7 @@ export class MemoryDocument {
 
     // 重要上下文
     if (c.importantContext.length > 0) {
-      lines.push('## 🧠 重要上下文');
+      lines.push('## 重要上下文');
       c.importantContext.forEach(ctx => {
         lines.push(`- ${ctx}`);
       });

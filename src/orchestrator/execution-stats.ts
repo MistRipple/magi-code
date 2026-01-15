@@ -17,7 +17,7 @@ export interface ExecutionRecord {
   duration: number;  // 毫秒
   error?: string;
   timestamp: number;
-  /** 🆕 Token 使用统计 */
+  /** Token 使用统计 */
   inputTokens?: number;
   outputTokens?: number;
 }
@@ -34,13 +34,14 @@ export interface CLIStats {
   lastFailureTime?: number;
   commonErrors: Map<string, number>;  // 错误类型 -> 出现次数
   isHealthy: boolean;  // 健康状态
-  /** 🆕 最近的错误信息 */
+  healthScore: number;  // 0-1
+  /** 最近的错误信息 */
   lastError?: string;
-  /** 🆕 最后执行时间 */
+  /** 最后执行时间 */
   lastExecutionTime?: number;
-  /** 🆕 总输入 token */
+  /** 总输入 token */
   totalInputTokens: number;
-  /** 🆕 总输出 token */
+  /** 总输出 token */
   totalOutputTokens: number;
 }
 
@@ -77,6 +78,11 @@ export class ExecutionStats {
 
   constructor(config?: Partial<StatsConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+  }
+
+  /** 更新统计配置 */
+  configure(config: Partial<StatsConfig>): void {
+    this.config = { ...this.config, ...config };
   }
 
   /** 设置扩展上下文（用于持久化） */
@@ -132,13 +138,15 @@ export class ExecutionStats {
       commonErrors.set(errorType, (commonErrors.get(errorType) || 0) + 1);
     });
 
-    // 🆕 计算总 token
+   
     const totalInputTokens = cliRecords.reduce((sum, r) => sum + (r.inputTokens || 0), 0);
     const totalOutputTokens = cliRecords.reduce((sum, r) => sum + (r.outputTokens || 0), 0);
 
+    const recentFailureRate = recentRecords.length > 0 ? recentFailures / recentRecords.length : 0;
+    const healthScore = Math.max(0, Math.min(1, successRate - recentFailureRate * 0.5));
+
     // 判断健康状态
-    const isHealthy = successRate >= this.config.healthThreshold &&
-      recentFailures < this.config.recentWindow * 0.5;
+    const isHealthy = healthScore >= this.config.healthThreshold;
 
     return {
       cli,
@@ -151,6 +159,7 @@ export class ExecutionStats {
       lastFailureTime: lastFailure?.timestamp,
       commonErrors,
       isHealthy,
+      healthScore,
       lastError: lastFailure?.error,
       lastExecutionTime: lastRecord?.timestamp,
       totalInputTokens,
@@ -172,10 +181,15 @@ export class ExecutionStats {
   }
 
   /** 获取降级建议 */
-  getFallbackSuggestion(failedCli: CLIType, excludeClis: CLIType[] = []): FallbackSuggestion | null {
+  getFallbackSuggestion(
+    failedCli: CLIType,
+    excludeClis: CLIType[] = [],
+    availableClis?: CLIType[]
+  ): FallbackSuggestion | null {
     const allStats = this.getAllStats();
     const candidates = allStats
       .filter(s => s.cli !== failedCli && !excludeClis.includes(s.cli))
+      .filter(s => !availableClis || availableClis.includes(s.cli))
       .filter(s => s.isHealthy || s.totalExecutions < 3)  // 健康或样本不足
       .sort((a, b) => {
         // 优先选择成功率高的

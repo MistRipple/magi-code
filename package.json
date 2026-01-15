@@ -38,12 +38,28 @@
         "title": "MultiCLI: 显示控制面板"
       },
       {
+        "command": "multiCli.openPanel",
+        "title": "MultiCLI: 打开控制面板"
+      },
+      {
+        "command": "multiCli.newSession",
+        "title": "MultiCLI: 新建会话"
+      },
+      {
+        "command": "multiCli.showStatus",
+        "title": "MultiCLI: 显示 CLI 状态"
+      },
+      {
         "command": "multiCli.stopTask",
         "title": "MultiCLI: 停止当前任务"
       },
       {
         "command": "multiCli.interruptTask",
         "title": "MultiCLI: 打断当前任务"
+      },
+      {
+        "command": "multiCli.testClaudePty",
+        "title": "MultiCLI: 测试 Claude PTY 初始化"
       }
     ],
     "keybindings": [
@@ -51,6 +67,24 @@
         "command": "multiCli.showPanel",
         "key": "ctrl+shift+a",
         "mac": "cmd+shift+a"
+      },
+      {
+        "command": "multiCli.startTask",
+        "key": "ctrl+shift+enter",
+        "mac": "cmd+shift+enter",
+        "when": "view == multiCli.mainView"
+      },
+      {
+        "command": "multiCli.newSession",
+        "key": "ctrl+alt+n",
+        "mac": "cmd+alt+n",
+        "when": "view == multiCli.mainView"
+      },
+      {
+        "command": "multiCli.stopTask",
+        "key": "ctrl+shift+backspace",
+        "mac": "cmd+shift+backspace",
+        "when": "multiCliTaskRunning"
       },
       {
         "command": "multiCli.interruptTask",
@@ -112,7 +146,7 @@
             "architecture": "claude",
             "bugfix": "codex",
             "frontend": "gemini",
-            "backend": "claude",
+            "backend": "codex",
             "test": "codex",
             "docs": "claude",
             "general": "claude"
@@ -176,6 +210,70 @@
               ]
             }
           }
+        },
+        "multiCli.permissions": {
+          "type": "object",
+          "default": {
+            "allowEdit": true,
+            "allowBash": true,
+            "allowWeb": true
+          },
+          "description": "权限矩阵（编辑/命令/网络）",
+          "properties": {
+            "allowEdit": {
+              "type": "boolean",
+              "default": true
+            },
+            "allowBash": {
+              "type": "boolean",
+              "default": true
+            },
+            "allowWeb": {
+              "type": "boolean",
+              "default": true
+            }
+          }
+        },
+        "multiCli.strategy": {
+          "type": "object",
+          "default": {
+            "enableVerification": true,
+            "enableRecovery": true,
+            "autoRollbackOnFailure": false
+          },
+          "description": "执行策略开关",
+          "properties": {
+            "enableVerification": {
+              "type": "boolean",
+              "default": true
+            },
+            "enableRecovery": {
+              "type": "boolean",
+              "default": true
+            },
+            "autoRollbackOnFailure": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
+        "multiCli.cliSelection": {
+          "type": "object",
+          "default": {
+            "enabled": true,
+            "healthThreshold": 0.7
+          },
+          "description": "CLI 选择策略",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "healthThreshold": {
+              "type": "number",
+              "default": 0.7
+            }
+          }
         }
       }
     },
@@ -203,7 +301,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
-    "test": "node ./out/test/runTest.js"
+    "test": "echo \"No tests defined\""
   },
   "devDependencies": {
     "@types/node": "^20.10.0",

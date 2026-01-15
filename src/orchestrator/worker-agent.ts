@@ -14,6 +14,7 @@ import { CLIAdapterFactory } from '../cli/adapter-factory';
 import { CLIResponse } from '../cli/types';
 import { MessageBus, globalMessageBus } from './message-bus';
 import { SnapshotManager } from '../snapshot-manager';
+import { PermissionMatrix } from '../types';
 import {
   WorkerType,
   WorkerState,
@@ -33,7 +34,8 @@ export interface WorkerConfig {
   cliFactory: CLIAdapterFactory;
   messageBus?: MessageBus;
   orchestratorId?: string;
-  snapshotManager?: SnapshotManager;  // 🆕 快照管理器
+  snapshotManager?: SnapshotManager; 
+  permissions?: PermissionMatrix;
 }
 
 /**
@@ -47,7 +49,8 @@ export class WorkerAgent extends EventEmitter {
   protected cliFactory: CLIAdapterFactory;
   protected messageBus: MessageBus;
   protected orchestratorId: string;
-  protected snapshotManager?: SnapshotManager;  // 🆕 快照管理器
+  protected snapshotManager?: SnapshotManager; 
+  protected permissions: PermissionMatrix;
 
   private _state: WorkerState = 'idle';
   private currentTaskId: string | null = null;
@@ -63,7 +66,8 @@ export class WorkerAgent extends EventEmitter {
     this.cliFactory = config.cliFactory;
     this.messageBus = config.messageBus || globalMessageBus;
     this.orchestratorId = config.orchestratorId || 'orchestrator';
-    this.snapshotManager = config.snapshotManager;  // 🆕 保存快照管理器
+    this.snapshotManager = config.snapshotManager; 
+    this.permissions = config.permissions || { allowEdit: true, allowBash: true, allowWeb: true };
 
     this.setupMessageHandlers();
   }
@@ -84,7 +88,7 @@ export class WorkerAgent extends EventEmitter {
     };
   }
 
-  /** 🆕 设置快照管理器 */
+  /** 设置快照管理器 */
   setSnapshotManager(manager: SnapshotManager): void {
     this.snapshotManager = manager;
   }
@@ -210,7 +214,7 @@ export class WorkerAgent extends EventEmitter {
         throw new Error('任务已被取消');
       }
 
-      // 🆕 为实际修改的文件创建快照（如果尚未创建）
+     
       if (response.fileChanges && response.fileChanges.length > 0 && this.snapshotManager) {
         for (const change of response.fileChanges) {
           try {
@@ -226,7 +230,7 @@ export class WorkerAgent extends EventEmitter {
         workerType: this.type,
         taskId,
         subTaskId: subTask.id,
-        result: response.content,
+        result: this.formatResultContent(subTask, response.content),
         success: !response.error,
         duration: Date.now() - startTime,
         modifiedFiles: response.fileChanges?.map(f => f.filePath),
@@ -285,9 +289,11 @@ export class WorkerAgent extends EventEmitter {
       : '';
 
     const contextHint = context ? `\n\n**上下文**:\n${context}` : '';
+    const permissionHint = this.buildPermissionHint();
+    const canEdit = this.permissions.allowEdit !== false;
 
     if (subTask.kind === 'architecture') {
-      return `${subTask.prompt}${contextHint}
+      return `${subTask.prompt}${contextHint}${permissionHint}
 
 **执行模式**: 架构与契约设计
 - 仅输出设计要点与契约约束，不修改任何文件
@@ -297,29 +303,123 @@ export class WorkerAgent extends EventEmitter {
 **重要**: 请使用中文回复。`;
     }
 
-    if (subTask.kind === 'integration') {
-      return `${subTask.prompt}${filesHint}${contextHint}
+    if (subTask.kind === 'background' || subTask.background) {
+      return `${subTask.prompt}${filesHint}${contextHint}${permissionHint}
 
-**执行模式**: 仅联调审查
-- 只做分析与联调检查，不允许修改任何文件
-- 聚焦前后端/架构契约是否一致、验收清单是否满足
-- 必须输出 JSON 报告
+**执行模式**: 后台探索
+- 不修改任何文件，输出简明结论与可操作建议
+- 避免长篇大论，聚焦结论与证据
+- 不调用工具
 
 **重要**: 请使用中文回复。`;
+    }
+
+    if (subTask.kind === 'integration') {
+      return `${subTask.prompt}${filesHint}${contextHint}${permissionHint}`;
     }
 
     const claudeConciseHint = this.type === 'claude'
       ? '\n\n**输出要求**:\n- 不展示分析过程，不复述用户需求或计划\n- 输出控制在 8-12 行以内\n- 仅保留必要步骤与关键结论'
       : '';
 
-    return `${subTask.prompt}${filesHint}${contextHint}${claudeConciseHint}
+    if (!canEdit) {
+      return `${subTask.prompt}${filesHint}${contextHint}${permissionHint}${claudeConciseHint}
+
+**执行模式**: 只读分析
+- 不修改任何文件，提供修改建议或差异说明
+- 不调用工具
+- 输出简要结论与可执行建议
+
+**重要**: 请使用中文回复，包括代码注释也使用中文。`;
+    }
+
+    return `${subTask.prompt}${filesHint}${contextHint}${permissionHint}${claudeConciseHint}
 
 **执行模式**: 直接修改
 - 你拥有完整的文件写入权限，可以直接修改文件
 - 完成必要的更改以完成任务
 - 完成后提供简要的更改说明
+- 严禁修改 .multicli/ 目录内的计划与状态文件
 
 **重要**: 请使用中文回复，包括代码注释也使用中文。`;
+  }
+
+  private formatResultContent(subTask: SubTask, content?: string): string {
+    const raw = (content || '').trim();
+    if (!raw) return '';
+    if (subTask.kind === 'background' || subTask.background) {
+      return this.formatBackgroundSummary(raw);
+    }
+    return this.truncateText(raw, 4000);
+  }
+
+  private formatBackgroundSummary(content: string): string {
+    const points = this.extractSummaryPoints(content, 6);
+    const summary = ['背景摘要:'].concat(points.map(point => `- ${point}`)).join('\n');
+    return this.truncateText(summary, 1200);
+  }
+
+  private extractSummaryPoints(content: string, limit: number): string[] {
+    const parsed = this.tryExtractJson(content);
+    if (parsed && typeof parsed === 'object') {
+      const points: string[] = [];
+      const fields = ['summary', 'conclusion', 'result', 'recommendation', 'suggestions', 'notes'];
+      for (const field of fields) {
+        const value = (parsed as Record<string, unknown>)[field];
+        if (typeof value === 'string' && value.trim()) {
+          points.push(value.trim());
+        } else if (Array.isArray(value)) {
+          value.forEach(item => {
+            if (typeof item === 'string' && item.trim()) {
+              points.push(item.trim());
+            }
+          });
+        }
+        if (points.length >= limit) break;
+      }
+      if (points.length > 0) {
+        return points.slice(0, limit);
+      }
+    }
+
+    const lines = content.split('\n').map(line => line.trim()).filter(Boolean);
+    if (lines.length > 0) {
+      return lines.slice(0, limit);
+    }
+    const sentences = content.split(/[。！？.!?]/).map(s => s.trim()).filter(Boolean);
+    return sentences.slice(0, limit);
+  }
+
+  private tryExtractJson(content: string): unknown | null {
+    const match = content.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    try {
+      return JSON.parse(match[0]);
+    } catch {
+      return null;
+    }
+  }
+
+  private truncateText(text: string, maxChars: number): string {
+    if (text.length <= maxChars) return text;
+    return `${text.slice(0, maxChars)}...`;
+  }
+
+  private buildPermissionHint(): string {
+    const hints: string[] = [];
+    if (!this.permissions.allowEdit) {
+      hints.push('- 不要修改文件');
+    }
+    if (!this.permissions.allowBash) {
+      hints.push('- 禁止执行命令或脚本');
+    }
+    if (!this.permissions.allowWeb) {
+      hints.push('- 禁止访问网络或外部资源');
+    }
+    if (hints.length === 0) {
+      return '';
+    }
+    return `\n\n**权限约束**:\n${hints.join('\n')}`;
   }
 
   /**

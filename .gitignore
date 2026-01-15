@@ -21,7 +21,6 @@ pnpm-debug.log*
 .env.*
 
 # Local plugin data
-.cli-arranger/
 .multicli/
 .ace-tool/
 

@@ -15,6 +15,7 @@ export interface CLISkillsConfig {
   bugfix: CLIType;
   debug: CLIType;
   frontend: CLIType;
+  backend: CLIType;
   test: CLIType;
   document: CLIType;
   review: CLIType;
@@ -29,6 +30,7 @@ const DEFAULT_SKILLS: CLISkillsConfig = {
   bugfix: 'codex',
   debug: 'claude',
   frontend: 'gemini',
+  backend: 'codex',
   test: 'codex',
   document: 'claude',
   review: 'claude',
@@ -52,21 +54,21 @@ export interface CLISelection {
   preferred: CLIType;
   /** 选择原因 */
   reason: string;
-  /** 🆕 基于统计的置信度 (0-1) */
+  /** 基于统计的置信度 (0-1) */
   confidence?: number;
 }
 
 /**
  * CLI 选择器类
- * 🆕 支持基于执行统计的智能选择
+ * 支持基于执行统计的智能选择
  */
 export class CLISelector {
   private skills: CLISkillsConfig;
   private availableCLIs: Set<CLIType> = new Set();
   private executionStats?: ExecutionStats;
-  /** 🆕 是否启用基于统计的智能选择 */
+  /** 是否启用基于统计的智能选择 */
   private useStatsBasedSelection: boolean = true;
-  /** 🆕 健康阈值：低于此成功率的 CLI 会被降级 */
+  /** 健康阈值：低于此成功率的 CLI 会被降级 */
   private healthThreshold: number = 0.6;
 
   constructor(skills?: Partial<CLISkillsConfig>) {
@@ -74,14 +76,14 @@ export class CLISelector {
   }
 
   /**
-   * 🆕 设置执行统计实例
+   * 设置执行统计实例
    */
   setExecutionStats(stats: ExecutionStats): void {
     this.executionStats = stats;
   }
 
   /**
-   * 🆕 配置智能选择参数
+   * 配置智能选择参数
    */
   configureSmartSelection(options: {
     enabled?: boolean;
@@ -111,12 +113,12 @@ export class CLISelector {
 
   /**
    * 根据任务分析选择最佳 CLI
-   * 🆕 集成基于统计的智能选择
+   * 集成基于统计的智能选择
    */
   select(analysis: TaskAnalysis): CLISelection {
     const preferred = this.skills[analysis.category] || this.skills.general;
 
-    // 🆕 如果启用统计选择，检查首选 CLI 的健康状态
+   
     if (this.useStatsBasedSelection && this.executionStats) {
       const smartSelection = this.selectWithStats(preferred, analysis.category);
       if (smartSelection) {
@@ -157,7 +159,7 @@ export class CLISelector {
   }
 
   /**
-   * 🆕 基于统计数据的智能选择
+   * 基于统计数据的智能选择
    */
   private selectWithStats(preferred: CLIType, category: TaskCategory): CLISelection | null {
     if (!this.executionStats) return null;
@@ -170,13 +172,13 @@ export class CLISelector {
         cli: preferred,
         degraded: false,
         preferred,
-        reason: `任务类型 "${category}" 的首选 CLI (成功率: ${(preferredStats.successRate * 100).toFixed(0)}%)`,
-        confidence: preferredStats.successRate,
+        reason: `任务类型 "${category}" 的首选 CLI (健康度: ${(preferredStats.healthScore * 100).toFixed(0)}%)`,
+        confidence: preferredStats.healthScore,
       };
     }
 
     // 如果首选 CLI 不健康，寻找更好的替代
-    if (!preferredStats.isHealthy || preferredStats.successRate < this.healthThreshold) {
+    if (!preferredStats.isHealthy || preferredStats.healthScore < this.healthThreshold) {
       const availableList = Array.from(this.availableCLIs);
       const betterCli = this.executionStats.recommendCLI(category, availableList);
 
@@ -186,9 +188,9 @@ export class CLISelector {
           cli: betterCli,
           degraded: true,
           preferred,
-          reason: `${preferred} 近期表现不佳 (${(preferredStats.successRate * 100).toFixed(0)}%)，` +
-                  `智能选择 ${betterCli} (${(betterStats.successRate * 100).toFixed(0)}%)`,
-          confidence: betterStats.successRate,
+          reason: `${preferred} 近期表现不佳 (${(preferredStats.healthScore * 100).toFixed(0)}%)，` +
+                  `智能选择 ${betterCli} (${(betterStats.healthScore * 100).toFixed(0)}%)`,
+          confidence: betterStats.healthScore,
         };
       }
     }
@@ -198,12 +200,12 @@ export class CLISelector {
 
   /**
    * 根据任务类型直接选择 CLI
-   * 🆕 集成基于统计的智能选择
+   * 集成基于统计的智能选择
    */
   selectByCategory(category: TaskCategory): CLISelection {
     const preferred = this.skills[category] || this.skills.general;
 
-    // 🆕 如果启用统计选择，检查首选 CLI 的健康状态
+   
     if (this.useStatsBasedSelection && this.executionStats) {
       const smartSelection = this.selectWithStats(preferred, category);
       if (smartSelection) {
@@ -254,4 +256,3 @@ export class CLISelector {
     return Array.from(this.availableCLIs);
   }
 }
-

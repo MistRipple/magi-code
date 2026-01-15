@@ -18,6 +18,7 @@ export type TaskCategory =
   | 'bugfix'        // Bug 修复
   | 'debug'         // 问题排查
   | 'frontend'      // 前端开发
+  | 'backend'       // 后端开发
   | 'test'          // 测试编写
   | 'document'      // 文档生成
   | 'review'        // 代码审查
@@ -70,6 +71,16 @@ export interface Task {
   featureContract?: string;
   /** 验收清单 */
   acceptanceCriteria?: string[];
+  /** 执行计划 ID */
+  planId?: string;
+  /** 执行计划状态 */
+  planStatus?: 'draft' | 'ready' | 'executing' | 'completed' | 'failed';
+  /** 执行计划摘要 */
+  planSummary?: string;
+  /** 执行计划创建时间 */
+  planCreatedAt?: number;
+  /** 执行计划更新时间 */
+  planUpdatedAt?: number;
 }
 
 export type TaskStatus =
@@ -108,16 +119,26 @@ export interface SubTask {
 
   // 目标文件列表
   targetFiles: string[];
+  /** 实际修改的文件列表（执行完成后写回） */
+  modifiedFiles?: string[];
+  /** 是否后台任务（不阻塞主执行流） */
+  background?: boolean;
 
   // 依赖关系（新架构，子任务间的依赖）
   dependencies: string[];
+  /** 冲突域标识（用于跨任务串行化与调度） */
+  conflictDomain?: string;
+  /** 依赖链（用于展示与调度） */
+  dependencyChain?: string[];
 
   // 优先级（新架构，1 最高）
   priority?: number;
-  /** 子任务类型（实现/集成/修复/架构） */
-  kind?: 'implementation' | 'integration' | 'repair' | 'architecture';
+  /** 子任务类型（实现/集成/修复/架构/批量） */
+  kind?: 'implementation' | 'integration' | 'repair' | 'architecture' | 'batch' | 'background';
   /** 功能分组 ID（用于跨子任务联调） */
   featureId?: string;
+  /** 批量任务包含的子任务 ID 列表 */
+  batchItems?: string[];
 
   // 状态管理（旧架构）
   status: SubTaskStatus;
@@ -165,6 +186,7 @@ export interface PendingChange {
   additions: number;
   deletions: number;
   status: 'pending' | 'approved' | 'reverted';
+  subTaskId?: string;
 }
 
 // ============================================
@@ -301,6 +323,18 @@ export type ExecutionMode = 'auto' | 'parallel' | 'sequential';
  */
 export type InteractionMode = 'ask' | 'agent' | 'auto';
 
+export interface PermissionMatrix {
+  allowEdit: boolean;
+  allowBash: boolean;
+  allowWeb: boolean;
+}
+
+export interface StrategyConfig {
+  enableVerification: boolean;
+  enableRecovery: boolean;
+  autoRollbackOnFailure: boolean;
+}
+
 /**
  * 交互模式配置
  */
@@ -368,6 +402,12 @@ export interface OrchestratorConfig {
   workers: WorkerConfig[];
   maxParallel: number;
   conflictResolution: 'ask' | 'auto-merge' | 'first-wins';
+  permissions?: PermissionMatrix;
+  strategy?: StrategyConfig;
+  cliSelection?: {
+    enabled?: boolean;
+    healthThreshold?: number;
+  };
 }
 
 // ============================================
@@ -386,7 +426,7 @@ export type EventType =
   | 'task:interrupt'
   | 'task:state_changed'
   | 'subtask:started'
-  | 'subtask:output'
+  | 'cli:output'
   | 'subtask:completed'
   | 'subtask:failed'
   | 'snapshot:created'
@@ -397,7 +437,6 @@ export type EventType =
   | 'cli:statusChanged'
   | 'cli:healthCheck'
   | 'cli:error'
-  | 'cli:output'
   | 'cli:session_event'
   | 'orchestrator:waiting_confirmation'
   | 'orchestrator:phase_changed'
@@ -428,16 +467,16 @@ export type EventListener = (event: AppEvent) => void;
 // ============================================
 
 // UI 状态
+export interface UIChatSession extends Session {
+  cliOutputs?: Record<string, any[]>;
+}
+
 export interface UIState {
-  currentSession?: Session;
   currentSessionId?: string;
-  sessions?: Session[];
-  /** 聊天会话元数据列表 */
-  chatSessions?: ChatSessionMeta[];
-  /** 当前聊天会话 */
-  currentChatSession?: ChatSession;
+  sessions?: UIChatSession[];
   currentTask?: Task;
   tasks?: Task[];
+  activePlan?: { planId: string; formattedPlan: string; updatedAt: number; review?: { status: 'approved' | 'rejected' | 'skipped'; summary: string } };
   cliStatuses: CLIStatus[];
   degradationStrategy: DegradationStrategy;
   pendingChanges: PendingChange[];
@@ -447,34 +486,6 @@ export interface UIState {
   interactionMode: InteractionMode;
   /** 当前编排器阶段 */
   orchestratorPhase?: string;
-}
-
-/** 聊天会话元数据（用于列表显示） */
-export interface ChatSessionMeta {
-  id: string;
-  name?: string;
-  messageCount: number;
-  createdAt: number;
-  updatedAt: number;
-  preview?: string;
-}
-
-/** 聊天会话 */
-export interface ChatSession {
-  id: string;
-  name?: string;
-  messages: ChatMessage[];
-  createdAt: number;
-  updatedAt: number;
-}
-
-/** 聊天消息 */
-export interface ChatMessage {
-  id: string;
-  role: 'user' | 'assistant';
-  content: string;
-  cli?: CLIType;
-  timestamp: number;
 }
 
 // 日志条目
@@ -497,9 +508,9 @@ export type WebviewToExtensionMessage =
   | { type: 'login'; apiKey: string; provider?: string; remember?: boolean }
   | { type: 'logout' }
   | { type: 'getStatus' }
-  | { type: 'pauseTask'; taskId: string }  // 🆕 暂停任务
-  | { type: 'resumeTask'; taskId: string }  // 🆕 恢复任务
-  | { type: 'appendMessage'; taskId: string; content: string }  // 🆕 补充内容
+  | { type: 'pauseTask'; taskId: string }
+  | { type: 'resumeTask'; taskId: string }
+  | { type: 'appendMessage'; taskId: string; content: string }
   | { type: 'approveChange'; filePath: string }
   | { type: 'revertChange'; filePath: string }
   | { type: 'approveAllChanges' }
@@ -512,24 +523,27 @@ export type WebviewToExtensionMessage =
   | { type: 'selectCli'; cli: CLIType | null }
   | { type: 'updateSetting'; key: string; value: unknown }
   | { type: 'viewDiff'; filePath: string }
+  | { type: 'openFile'; filepath: string }
   | { type: 'confirmPlan'; confirmed: boolean }
   | { type: 'answerQuestions'; answer: string | null }
   | { type: 'getState' }
   // 新增：交互模式相关
   | { type: 'setInteractionMode'; mode: InteractionMode }
   | { type: 'confirmRecovery'; decision: 'retry' | 'rollback' | 'continue' }
-  // 🆕 执行统计相关
+
   | { type: 'requestExecutionStats' }
   | { type: 'resetExecutionStats' }
-  // 🆕 CLI 连接状态检测
+
   | { type: 'checkCliStatus' }
-  // 🆕 清理所有任务
+
   | { type: 'clearAllTasks' }
-  // 🆕 Prompt 增强配置
+
   | { type: 'getPromptEnhanceConfig' }
   | { type: 'updatePromptEnhance'; config: { baseUrl: string; apiKey: string } }
   | { type: 'testPromptEnhance'; baseUrl: string; apiKey: string }
-  | { type: 'enhancePrompt'; prompt: string };
+  | { type: 'enhancePrompt'; prompt: string }
+  // 🔧 新增：CLI 询问回答
+  | { type: 'answerCliQuestion'; cli: CLIType; questionId: string; answer: string; adapterRole?: 'worker' | 'orchestrator' };
 
 // Extension 发送到 Webview 的消息
 // source 字段用于区分消息来源：'orchestrator' = 编排者, 'worker' = 执行代理
@@ -538,13 +552,10 @@ export type MessageSource = 'orchestrator' | 'worker' | 'system';
 export type ExtensionToWebviewMessage =
   | { type: 'stateUpdate'; state: UIState }
   | { type: 'taskUpdate'; task: Task }
-  | { type: 'subTaskOutput'; subTaskId: string; output: string; cliType?: CLIType; sessionId?: string | null; source?: MessageSource }
   | { type: 'cliStatusUpdate'; statuses: Record<string, { status: string; version?: string }> }
   | { type: 'cliStatusChanged'; cli: string; available: boolean; version?: string }
   | { type: 'cliError'; cli: string; error: string; source?: MessageSource }
-  | { type: 'cliResponse'; cli: CLIType; content: string; error?: string; sessionId?: string | null; source?: MessageSource }
-  | { type: 'streamingUpdate'; content: string; sessionId?: string | null; source?: MessageSource; cli?: CLIType }
-  | { type: 'streamingComplete'; content?: string; error?: string; sessionId?: string | null; source?: MessageSource; cli?: CLIType }
+  | { type: 'streamEvent'; phase: 'chunk' | 'complete'; content?: string; error?: string; sessionId?: string | null; source?: MessageSource; cli?: CLIType; append?: boolean; sentAt?: number; target?: 'thread' | 'cli' }
   | { type: 'loginSuccess' }
   | { type: 'loginError'; message: string }
   | { type: 'authStatus'; loggedIn: boolean }
@@ -556,7 +567,7 @@ export type ExtensionToWebviewMessage =
   | { type: 'confirmationRequest'; plan: unknown; formattedPlan: string }
   | { type: 'error'; message: string }
   // 新增：编排者专用消息类型
-  | { type: 'orchestratorMessage'; content: string; phase: string; taskId?: string; messageType?: string; metadata?: Record<string, unknown> }
+  | { type: 'orchestratorMessage'; content: string; phase: string; taskId?: string; messageType?: string; metadata?: Record<string, unknown>; sessionId?: string | null; timestamp?: number }
   // 新增：Worker 专用消息类型
   | { type: 'workerOutput'; workerId: string; workerType: CLIType; content: string; subTaskId: string }
   // 交互模式和验证相关
@@ -567,15 +578,17 @@ export type ExtensionToWebviewMessage =
   | { type: 'recoveryResult'; success: boolean; strategy: string; message: string }
   | { type: 'taskPaused'; taskId: string }
   | { type: 'taskResumed'; taskId: string }
-  // 🆕 执行统计相关消息
+ 
   | { type: 'executionStatsUpdate'; stats: CLIExecutionStats[]; orchestratorStats?: { totalTasks: number; totalSuccess: number; totalFailed: number; totalInputTokens: number; totalOutputTokens: number } }
   | { type: 'cliFallbackNotice'; originalCli: CLIType; fallbackCli: CLIType; reason: string }
-  // 🆕 Prompt 增强测试结果
+ 
+  | { type: 'cliTaskCard'; cli: CLIType; taskId: string; subTaskId: string; description: string; targetFiles?: string[]; reason?: string; status: string; sessionId?: string | null }
+ 
   | { type: 'promptEnhanceResult'; success: boolean; message: string }
-  // 🆕 Prompt 增强结果
+ 
   | { type: 'promptEnhanced'; enhancedPrompt: string; error: string };
 
-/** 🆕 CLI 执行统计数据（用于 UI 显示） */
+/** CLI 执行统计数据（用于 UI 显示） */
 export interface CLIExecutionStats {
   /** CLI 类型 */
   cli: CLIType;
@@ -595,4 +608,10 @@ export interface CLIExecutionStats {
   lastError?: string;
   /** 最后执行时间 */
   lastExecutionTime?: number;
+  /** 健康评分 (0-1) */
+  healthScore?: number;
+  /** 总输入 token */
+  totalInputTokens?: number;
+  /** 总输出 token */
+  totalOutputTokens?: number;
 }

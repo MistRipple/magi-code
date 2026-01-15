@@ -6,7 +6,7 @@
  * - 实现事件循环，实时监控所有 Worker
  * - 响应用户交互和 Worker 反馈
  * - 动态调度和错误处理
- * - 🆕 CLI 降级和执行统计
+ * - CLI 降级和执行统计
  *
  * 架构理念：
  * - 编排者是"永远在线"的协调者
@@ -24,6 +24,11 @@ import { VerificationRunner, VerificationResult, VerificationConfig } from './ve
 import { ContextManager, ContextCompressor } from '../context';
 import { SnapshotManager } from '../snapshot-manager';
 import { TaskManager } from '../task-manager';
+import { RiskPolicy, RiskAssessment } from './risk-policy';
+import { TaskStateManager, TaskState } from './task-state-manager';
+import { PlanStorage, PlanRecord, PlanReview } from './plan-storage';
+import { PlanTodoManager } from './plan-todo';
+import { ExecutionStateManager, ExecutionStateStatus } from './execution-state';
 import {
   WorkerType,
   OrchestratorState,
@@ -47,6 +52,13 @@ import {
   buildProgressMessage,
 } from './prompts/orchestrator-prompts';
 import { TokenUsage } from '../cli/types';
+import { PermissionMatrix, StrategyConfig, SubTaskStatus } from '../types';
+import { TaskAnalyzer, TaskAnalysis } from '../task/task-analyzer';
+import { TaskSplitter, SplitResult, SubTaskDef } from '../task/task-splitter';
+import { CLISelector, CLISkillsConfig } from '../task/cli-selector';
+import { AITaskDecomposer } from '../task/ai-task-decomposer';
+import { ResultAggregator } from '../task/result-aggregator';
+import { RecoveryHandler } from './recovery-handler';
 
 /** 子任务自检/互检默认配置 */
 const DEFAULT_REVIEW_CONFIG = {
@@ -62,6 +74,10 @@ const DEFAULT_CONFIG: OrchestratorConfig = {
   timeout: 300000, // 5 分钟
   maxRetries: 3,
   review: DEFAULT_REVIEW_CONFIG,
+  planReview: {
+    enabled: true,
+    reviewer: 'claude',
+  },
   verification: {
     compileCheck: true,
     lintCheck: true,
@@ -72,10 +88,29 @@ const DEFAULT_CONFIG: OrchestratorConfig = {
     maxRounds: 2,
     worker: 'claude',
   },
+  permissions: {
+    allowEdit: true,
+    allowBash: true,
+    allowWeb: true,
+  },
+  strategy: {
+    enableVerification: true,
+    enableRecovery: true,
+    autoRollbackOnFailure: false,
+  },
+  cliSelection: {
+    enabled: true,
+    healthThreshold: 0.7,
+  },
 };
 
 /** 用户确认回调类型 */
 export type ConfirmationCallback = (plan: ExecutionPlan, formattedPlan: string) => Promise<boolean>;
+export type RecoveryConfirmationCallback = (
+  failedTask: TaskState,
+  error: string,
+  options: { retry: boolean; rollback: boolean }
+) => Promise<'retry' | 'rollback' | 'continue'>;
 
 type ReviewDecisionStatus = 'passed' | 'rejected' | 'skipped';
 
@@ -115,7 +150,7 @@ interface IntegrationReport {
 /**
  * Orchestrator Agent
  * 独立编排者 Claude 的核心实现
- * 🆕 集成 CLI 降级和执行统计
+ * 集成 CLI 降级和执行统计
  */
 export class OrchestratorAgent extends EventEmitter {
   readonly id: string = 'orchestrator';
@@ -137,21 +172,38 @@ export class OrchestratorAgent extends EventEmitter {
   // 快照管理（支持文件回滚）
   private snapshotManager: SnapshotManager | null = null;
   private taskManager: TaskManager | null = null;
+  private taskStateManager: TaskStateManager | null = null;
+  private recoveryHandler: RecoveryHandler | null = null;
+  private planStorage: PlanStorage | null = null;
+  private executionStateManager: ExecutionStateManager | null = null;
+  private planTodoManager: PlanTodoManager | null = null;
 
-  // 🆕 执行统计（支持 CLI 降级决策）
+ 
   private executionStats: ExecutionStats;
+  private riskPolicy: RiskPolicy;
+  private taskAnalyzer: TaskAnalyzer;
+  private cliSelector: CLISelector;
+  private taskSplitter: TaskSplitter;
+  private aiTaskDecomposer: AITaskDecomposer;
+  private strategyConfig: StrategyConfig;
+  private permissions: PermissionMatrix;
 
   private _state: OrchestratorState = 'idle';
   private currentContext: TaskContext | null = null;
   private confirmationCallback: ConfirmationCallback | null = null;
   private questionCallback: QuestionCallback | null = null;
+  private recoveryConfirmationCallback: RecoveryConfirmationCallback | null = null;
+  private planConfirmationPolicy: ((risk: TaskContext['risk'] | null) => boolean) | null = null;
   private abortController: AbortController | null = null;
   private unsubscribers: Array<() => void> = [];
 
   // 任务执行状态
   private pendingTasks: Map<string, SubTask> = new Map();
+  private backgroundTasks: Map<string, SubTask> = new Map();
+  private backgroundFinalizations: Map<string, Promise<ExecutionResult | null>> = new Map();
   private completedResults: ExecutionResult[] = [];
   private lastIntegrationSummary: string | null = null;
+  private batchTasks: Map<string, SubTask[]> = new Map();
   private reviewAttempts: Map<string, number> = new Map();
   private finalizationPromises: Map<string, Promise<ExecutionResult | null>> = new Map();
   private warnedReviewSkipForDependencies = false;
@@ -171,9 +223,31 @@ export class OrchestratorAgent extends EventEmitter {
     this.workspaceRoot = workspaceRoot || '';
     this.snapshotManager = snapshotManager || null;
     this.taskManager = taskManager || null;
+    if (this.workspaceRoot) {
+      this.planStorage = new PlanStorage(this.workspaceRoot);
+      this.executionStateManager = new ExecutionStateManager(this.workspaceRoot);
+      this.planTodoManager = new PlanTodoManager(this.workspaceRoot);
+    }
 
-    // 🆕 创建执行统计实例
+   
     this.executionStats = new ExecutionStats();
+    if (this.config.cliSelection?.healthThreshold !== undefined) {
+      this.executionStats.configure({ healthThreshold: this.config.cliSelection.healthThreshold });
+    }
+    this.riskPolicy = new RiskPolicy();
+    this.taskAnalyzer = new TaskAnalyzer();
+    this.cliSelector = new CLISelector();
+    this.cliSelector.setExecutionStats(this.executionStats);
+    if (this.config.cliSelection) {
+      this.cliSelector.configureSmartSelection({
+        enabled: this.config.cliSelection.enabled,
+        healthThreshold: this.config.cliSelection.healthThreshold,
+      });
+    }
+    this.taskSplitter = new TaskSplitter(this.cliSelector);
+    this.aiTaskDecomposer = new AITaskDecomposer(this.cliFactory, this.cliSelector);
+    this.strategyConfig = this.resolveStrategyConfig();
+    this.permissions = this.resolvePermissions();
 
     // 创建 Worker Pool，集成执行统计和快照管理
     this.workerPool = new WorkerPool({
@@ -182,11 +256,12 @@ export class OrchestratorAgent extends EventEmitter {
       orchestratorId: this.id,
       executionStats: this.executionStats,
       enableFallback: true,
-      snapshotManager: this.snapshotManager || undefined,  // 🆕 传递快照管理器
+      snapshotManager: this.snapshotManager || undefined, 
+      permissions: this.permissions,
     });
 
     // 初始化验证组件
-    if (this.workspaceRoot && this.config.verification) {
+    if (this.workspaceRoot && this.config.verification && this.strategyConfig.enableVerification) {
       this.verificationRunner = new VerificationRunner(this.workspaceRoot, {
         compileCheck: this.config.verification.compileCheck ?? true,
         lintCheck: this.config.verification.lintCheck ?? false,
@@ -234,17 +309,32 @@ export class OrchestratorAgent extends EventEmitter {
     this.questionCallback = callback;
   }
 
-  /** 🆕 设置扩展上下文（用于持久化执行统计） */
+  /** 设置失败恢复确认回调 */
+  setRecoveryConfirmationCallback(callback: RecoveryConfirmationCallback): void {
+    this.recoveryConfirmationCallback = callback;
+  }
+
+  /** 设置执行计划确认策略 */
+  setPlanConfirmationPolicy(policy: (risk: TaskContext['risk'] | null) => boolean): void {
+    this.planConfirmationPolicy = policy;
+  }
+
+  /** 更新 CLI 技能配置 */
+  setCliSkills(skills: Partial<CLISkillsConfig>): void {
+    this.cliSelector.updateSkills(skills);
+  }
+
+  /** 设置扩展上下文（用于持久化执行统计） */
   setExtensionContext(context: import('vscode').ExtensionContext): void {
     this.executionStats.setContext(context);
   }
 
-  /** 🆕 获取执行统计实例 */
+  /** 获取执行统计实例 */
   getExecutionStats(): ExecutionStats {
     return this.executionStats;
   }
 
-  /** 🆕 获取执行统计摘要（用于 UI 显示） */
+  /** 获取执行统计摘要（用于 UI 显示） */
   getStatsSummary(): string {
     return this.executionStats.getSummary();
   }
@@ -254,6 +344,186 @@ export class OrchestratorAgent extends EventEmitter {
     await this.workerPool.initialize();
     console.log('[OrchestratorAgent] 初始化完成');
     console.log(`[OrchestratorAgent] 执行统计: ${this.getStatsSummary()}`);
+  }
+
+  /** 获取指定计划记录 */
+  getPlanById(planId: string): PlanRecord | null {
+    return this.planStorage?.getPlan(planId) ?? null;
+  }
+
+  /** 获取会话最新计划记录 */
+  getLatestPlanForSession(sessionId: string): PlanRecord | null {
+    return this.planStorage?.getLatestPlanForSession(sessionId) ?? null;
+  }
+
+  /** 获取会话当前激活计划记录 */
+  getActivePlanForSession(sessionId: string): PlanRecord | null {
+    if (!this.executionStateManager) {
+      return this.getLatestPlanForSession(sessionId);
+    }
+    const state = this.executionStateManager.loadState(sessionId);
+    if (!state) {
+      return this.getLatestPlanForSession(sessionId);
+    }
+    const record = this.planStorage?.getPlan(state.activePlanId) ?? null;
+    return record ?? this.getLatestPlanForSession(sessionId);
+  }
+
+  /** 生成执行计划但不执行 */
+  async createPlan(userPrompt: string, taskId: string, sessionId?: string): Promise<PlanRecord> {
+    if (this._state !== 'idle') {
+      if (this._state === 'failed' || this._state === 'completed') {
+        this.setState('idle');
+      } else {
+        throw new Error(`编排者当前状态为 ${this._state}，无法生成计划`);
+      }
+    }
+
+    const contextSessionId = sessionId || taskId;
+    this.currentContext = {
+      taskId,
+      sessionId: contextSessionId,
+      userPrompt,
+      results: [],
+      startTime: Date.now(),
+    };
+    this.abortController = new AbortController();
+    this.completedResults = [];
+    this.pendingTasks.clear();
+    this.backgroundTasks.clear();
+    this.backgroundFinalizations.clear();
+    this.reviewAttempts.clear();
+    this.finalizationPromises.clear();
+    this.warnedReviewSkipForDependencies = false;
+    this.lastIntegrationSummary = null;
+    this.batchTasks.clear();
+
+    await this.ensureContext(contextSessionId, userPrompt);
+
+    try {
+      let plan: ExecutionPlan | null = null;
+      let analysisPrompt = userPrompt;
+      for (let round = 0; round < 3; round += 1) {
+        this.setState('analyzing');
+        this.currentContext.userPrompt = analysisPrompt;
+        plan = await this.analyzeTask(analysisPrompt);
+
+        if (!plan) {
+          throw new Error('任务分析失败');
+        }
+
+        if (plan.needsUserInput && plan.questions && plan.questions.length > 0) {
+          this.setState('waiting_questions');
+          const answer = await this.waitForUserInput(plan);
+          if (!answer) {
+            this.setState('idle');
+            throw new Error('计划已取消');
+          }
+          analysisPrompt = `${userPrompt}\n\n## 用户补充信息\n${answer}`;
+          continue;
+        }
+
+        break;
+      }
+
+      if (!plan) {
+        throw new Error('任务分析失败');
+      }
+
+      if (plan.needsUserInput && plan.questions && plan.questions.length > 0) {
+        throw new Error('用户补充信息不足，无法生成执行计划');
+      }
+
+      this.currentContext.plan = plan;
+      this.currentContext.risk = this.riskPolicy.evaluate(userPrompt, plan);
+      this.checkAborted();
+
+      const formattedPlan = formatPlanForUser(plan);
+      const review = await this.reviewPlan(plan, formattedPlan);
+      const record = this.persistPlan(plan, formattedPlan, review);
+      if (!record) {
+        throw new Error('执行计划持久化失败');
+      }
+      if (review.status === 'rejected') {
+        this.updateTaskPlanStatus('failed');
+        this.emitUIMessage('progress_update', `计划评审未通过: ${review.summary}`);
+      }
+
+      // 🔧 修复：在 createPlan 完成后发送 plan_ready（用于 /plan 命令）
+      this.emitUIMessage('plan_ready', formattedPlan, {
+        plan,
+        planId: record.id,
+        formattedPlan,
+        review: { status: review.status, summary: review.summary }
+      });
+      globalEventBus.emitEvent('orchestrator:plan_ready', {
+        taskId: this.currentContext?.taskId,
+        data: { plan, planId: record.id, formattedPlan },
+      });
+
+      this.setState('idle');
+      this.currentContext.endTime = Date.now();
+      return record;
+    } catch (error) {
+      this.setState('failed');
+      throw error;
+    } finally {
+      this.cleanup();
+    }
+  }
+
+  /** 使用已有执行计划开始执行 */
+  async executePlan(plan: ExecutionPlan, taskId: string, sessionId?: string, userPrompt?: string): Promise<string> {
+    if (this._state !== 'idle') {
+      if (this._state === 'failed' || this._state === 'completed') {
+        this.setState('idle');
+      } else {
+        throw new Error(`编排者当前状态为 ${this._state}，无法执行计划`);
+      }
+    }
+
+    const prompt = userPrompt || plan.summary || '执行已保存计划';
+    const contextSessionId = sessionId || taskId;
+    this.currentContext = {
+      taskId,
+      sessionId: contextSessionId,
+      userPrompt: prompt,
+      results: [],
+      startTime: Date.now(),
+    };
+    this.abortController = new AbortController();
+    this.completedResults = [];
+    this.pendingTasks.clear();
+    this.backgroundTasks.clear();
+    this.backgroundFinalizations.clear();
+    this.reviewAttempts.clear();
+    this.finalizationPromises.clear();
+    this.warnedReviewSkipForDependencies = false;
+    this.lastIntegrationSummary = null;
+    this.batchTasks.clear();
+
+    await this.ensureContext(contextSessionId, prompt);
+
+    try {
+      this.normalizeExecutionPlan(plan);
+      this.currentContext.plan = plan;
+      this.currentContext.risk = this.riskPolicy.evaluate(prompt, plan);
+      this.checkAborted();
+
+      return await this.runPlanExecution(prompt, plan, taskId);
+    } catch (error) {
+      if (this.abortController?.signal.aborted) {
+        this.setState('idle');
+        return '任务已被取消。';
+      }
+      this.setState('failed');
+      this.emitUIMessage('error', `任务执行失败: ${error instanceof Error ? error.message : String(error)}`);
+      this.updateExecutionState('failed', plan.id);
+      this.updateTaskPlanStatus('failed');
+      throw error;
+    } finally {
+      this.cleanup();
+    }
   }
 
   /** 设置消息处理器 */
@@ -266,7 +536,7 @@ export class OrchestratorAgent extends EventEmitter {
 
     // 监听任务失败消息
     const unsubFailed = this.messageBus.subscribe('task_failed', (msg) => {
-      this.handleTaskFailed(msg as TaskFailedMessage);
+      void this.handleTaskFailed(msg as TaskFailedMessage);
     });
     this.unsubscribers.push(unsubFailed);
 
@@ -279,10 +549,6 @@ export class OrchestratorAgent extends EventEmitter {
 
   /** 设置 Worker Pool 事件处理 */
   private setupWorkerPoolHandlers(): void {
-    this.workerPool.on('workerOutput', ({ workerId, workerType, chunk }) => {
-      this.emitUIMessage('worker_output', chunk, { workerId, workerType });
-    });
-
     this.workerPool.on('taskRetry', ({ subTaskId, attempt, delay }) => {
       this.emitUIMessage(
         'progress_update',
@@ -327,10 +593,13 @@ export class OrchestratorAgent extends EventEmitter {
     this.abortController = new AbortController();
     this.completedResults = [];
     this.pendingTasks.clear();
+    this.backgroundTasks.clear();
+    this.backgroundFinalizations.clear();
     this.reviewAttempts.clear();
     this.finalizationPromises.clear();
     this.warnedReviewSkipForDependencies = false;
     this.lastIntegrationSummary = null;
+    this.batchTasks.clear();
 
     // 初始化上下文管理器
     await this.ensureContext(contextSessionId, userPrompt);
@@ -371,77 +640,10 @@ export class OrchestratorAgent extends EventEmitter {
       }
 
       this.currentContext.plan = plan;
+      const risk: RiskAssessment = this.riskPolicy.evaluate(userPrompt, plan);
+      this.currentContext.risk = risk;
       this.checkAborted();
-
-      // 🆕 如果不需要 Worker，直接返回编排者的回复
-      if (plan.needsWorker === false && plan.directResponse) {
-        console.log('[OrchestratorAgent] 不需要 Worker，编排者直接回答');
-        this.emitUIMessage('direct_response', plan.directResponse);
-        await this.saveAndCompressMemory(plan.directResponse);
-        this.setState('completed');
-        this.currentContext.endTime = Date.now();
-        return plan.directResponse;
-      }
-
-      // 记录任务到 Memory
-      if (this.contextManager && plan.subTasks) {
-        plan.subTasks.forEach(task => {
-          this.contextManager!.addTask({
-            id: task.id,
-            description: task.description,
-            status: 'pending',
-            assignedWorker: task.assignedWorker
-          });
-        });
-      }
-
-      // Phase 2: 等待用户确认
-      this.setState('waiting_confirmation');
-      const confirmed = await this.waitForConfirmation(plan);
-
-      if (!confirmed) {
-        this.setState('idle');
-        return '任务已取消。';
-      }
-      this.checkAborted();
-
-      // Phase 3: 分发任务给 Worker
-      this.setState('dispatching');
-      await this.dispatchTasks(plan);
-
-      // Phase 4: 监控执行
-      this.setState('monitoring');
-      await this.monitorExecution(plan);
-      this.checkAborted();
-
-      // Phase 4.5: 功能集成联调
-      await this.runIntegrationStage(plan);
-      this.checkAborted();
-
-      // Phase 5: 验证阶段（如果配置了验证）
-      let verificationResult: VerificationResult | null = null;
-      if (this.verificationRunner) {
-        this.setState('verifying');
-        verificationResult = await this.runVerification(taskId);
-
-        // 如果验证失败，记录错误但继续汇总
-        if (!verificationResult.success) {
-          this.emitUIMessage('error', `验证失败: ${verificationResult.summary}`);
-        }
-      }
-      this.checkAborted();
-
-      // Phase 6: 汇总结果
-      this.setState('summarizing');
-      const summary = await this.summarizeResults(userPrompt, this.completedResults, verificationResult);
-
-      // 保存 Memory 并检查是否需要压缩
-      await this.saveAndCompressMemory(summary);
-
-      this.setState('completed');
-      this.currentContext.endTime = Date.now();
-
-      return summary;
+      return await this.runPlanExecution(userPrompt, plan, taskId);
 
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
@@ -453,11 +655,267 @@ export class OrchestratorAgent extends EventEmitter {
 
       this.setState('failed');
       this.emitUIMessage('error', `任务执行失败: ${errorMsg}`);
+      this.updateExecutionState('failed', this.currentContext?.plan?.id);
+      this.updateTaskPlanStatus('failed');
       throw error;
 
     } finally {
       this.cleanup();
     }
+  }
+
+  private persistPlan(plan: ExecutionPlan, formattedPlan: string, review?: PlanReview): PlanRecord | null {
+    if (!this.planStorage || !this.currentContext) return null;
+    const now = Date.now();
+    const planId = plan.id || `plan_${now}`;
+    plan.id = planId;
+    const sessionId = this.currentContext.sessionId || this.currentContext.taskId;
+    const record: PlanRecord = {
+      id: planId,
+      sessionId,
+      taskId: this.currentContext.taskId,
+      prompt: this.currentContext.userPrompt,
+      createdAt: now,
+      updatedAt: now,
+      plan,
+      formattedPlan,
+      review,
+    };
+    this.planStorage.savePlan(record);
+    this.planTodoManager?.ensurePlanFile(record);
+    if (this.taskManager) {
+      const summary = plan.summary || plan.analysis || plan.featureContract || '执行计划已生成';
+      this.taskManager.updateTaskPlan(this.currentContext.taskId, {
+        planId,
+        planSummary: summary,
+        status: 'ready',
+      });
+    }
+    if (this.contextManager) {
+      const summary = plan.summary || plan.analysis || plan.featureContract;
+      if (summary) {
+        this.contextManager.addImportantContext(`计划摘要: ${summary}`);
+      }
+      if (plan.featureContract) {
+        this.contextManager.addDecision(
+          `contract-${planId}`,
+          '功能契约',
+          plan.featureContract
+        );
+      }
+      if (review?.status === 'rejected') {
+        this.contextManager.addPendingIssue(`计划评审未通过: ${review.summary}`);
+      }
+      void this.contextManager.saveMemory();
+    }
+    this.updateExecutionState('planned', planId);
+    return record;
+  }
+
+  private updateExecutionState(status: ExecutionStateStatus, planId?: string): void {
+    if (!this.executionStateManager || !this.currentContext) return;
+    const activePlanId = planId || this.currentContext.plan?.id;
+    if (!activePlanId) return;
+    const now = Date.now();
+    const sessionId = this.currentContext.sessionId || this.currentContext.taskId;
+    const existing = this.executionStateManager.loadState(sessionId);
+    const state = {
+      sessionId,
+      activePlanId,
+      taskId: this.currentContext.taskId,
+      status,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    this.executionStateManager.saveState(state);
+  }
+
+  private updateTaskPlanStatus(status: ExecutionStateStatus): void {
+    if (!this.taskManager || !this.currentContext) return;
+    const mapping: Record<ExecutionStateStatus, 'ready' | 'executing' | 'completed' | 'failed'> = {
+      planned: 'ready',
+      executing: 'executing',
+      completed: 'completed',
+      failed: 'failed',
+    };
+    this.taskManager.updateTaskPlanStatus(this.currentContext.taskId, mapping[status]);
+  }
+
+  private shouldReviewPlan(): boolean {
+    return this.config.planReview?.enabled !== false;
+  }
+
+  private buildPlanReviewPrompt(plan: ExecutionPlan, formattedPlan: string): string {
+    return [
+      '你是执行计划评审专家，请审查以下计划是否具备可执行性、边界清晰、职责拆分合理。',
+      '',
+      '## 执行计划',
+      formattedPlan,
+      '',
+      '## 评审标准',
+      '1. 目标是否明确、可验证',
+      '2. 子任务是否覆盖关键路径，是否有遗漏',
+      '3. 依赖关系是否合理',
+      '4. 是否存在高风险或歧义点',
+      '',
+      '## 输出要求（只输出 JSON）',
+      '```json',
+      '{',
+      '  "status": "approved | rejected",',
+      '  "summary": "评审结论（必要时指出需修订的点）"',
+      '}',
+      '```',
+    ].join('\n');
+  }
+
+  private parsePlanReview(content: string): { status: 'approved' | 'rejected'; summary: string } {
+    const match = content.match(/\{[\s\S]*\}/);
+    if (!match) {
+      return { status: 'approved', summary: '未提供结构化评审，默认通过' };
+    }
+    try {
+      const parsed = JSON.parse(match[0]);
+      const status = parsed.status === 'rejected' ? 'rejected' : 'approved';
+      const summary = typeof parsed.summary === 'string' ? parsed.summary : '未提供评审摘要';
+      return { status, summary };
+    } catch (error) {
+      return { status: 'approved', summary: '评审解析失败，默认通过' };
+    }
+  }
+
+  private async reviewPlan(plan: ExecutionPlan, formattedPlan: string): Promise<PlanReview> {
+    if (!this.shouldReviewPlan()) {
+      return { status: 'skipped', summary: '计划评审已关闭', reviewer: 'system', reviewedAt: Date.now() };
+    }
+    const reviewer = this.config.planReview?.reviewer ?? 'claude';
+    try {
+      const response = await this.cliFactory.sendMessage(
+        reviewer,
+        this.buildPlanReviewPrompt(plan, formattedPlan),
+        undefined,
+        {
+          source: 'orchestrator',
+          streamToUI: false,
+          adapterRole: 'orchestrator',
+          messageMeta: {
+            taskId: this.currentContext?.taskId,
+            intent: 'plan_review',
+          },
+        }
+      );
+      // 记录 token 使用
+      this.recordOrchestratorTokens(response.tokenUsage);
+      if (response.error) {
+        return { status: 'approved', summary: `评审失败(${response.error})，默认通过`, reviewer, reviewedAt: Date.now() };
+      }
+      const decision = this.parsePlanReview(response.content || '');
+      return { status: decision.status, summary: decision.summary, reviewer, reviewedAt: Date.now() };
+    } catch (error) {
+      return { status: 'approved', summary: `评审异常(${error instanceof Error ? error.message : String(error)})，默认通过`, reviewer, reviewedAt: Date.now() };
+    }
+  }
+
+  private async runPlanExecution(userPrompt: string, plan: ExecutionPlan, taskId: string): Promise<string> {
+    const formattedPlan = formatPlanForUser(plan);
+    const existingRecord = plan.id ? this.planStorage?.getPlan(plan.id) : null;
+    const review = existingRecord?.review ?? await this.reviewPlan(plan, formattedPlan);
+    const record = this.persistPlan(plan, formattedPlan, review);
+    if (!record) {
+      console.warn('[OrchestratorAgent] 计划持久化失败，继续执行');
+    }
+    if (review.status === 'rejected') {
+      this.updateTaskPlanStatus('failed');
+      this.emitUIMessage('error', `计划评审未通过: ${review.summary}`);
+      throw new Error('计划评审未通过，请修订后重试。');
+    }
+
+   
+    if (plan.needsWorker === false && plan.directResponse) {
+      console.log('[OrchestratorAgent] 不需要 Worker，编排者直接回答');
+      this.emitUIMessage('direct_response', plan.directResponse);
+      await this.saveAndCompressMemory(plan.directResponse);
+      this.setState('completed');
+      this.currentContext!.endTime = Date.now();
+      this.updateExecutionState('completed', plan.id);
+      this.updateTaskPlanStatus('completed');
+      return plan.directResponse;
+    }
+
+    // 记录任务到 Memory
+    if (this.contextManager && plan.subTasks) {
+      plan.subTasks.forEach(task => {
+        this.contextManager!.addTask({
+          id: task.id,
+          description: task.description,
+          status: 'pending',
+          assignedWorker: task.assignedWorker
+        });
+      });
+      void this.contextManager.saveMemory();
+    }
+
+    // Phase 2: 等待用户确认（按策略判定）
+    let confirmed = true;
+    const shouldConfirm = this.planConfirmationPolicy
+      ? this.planConfirmationPolicy(this.currentContext?.risk ?? null)
+      : Boolean(this.currentContext?.risk?.hardStop);
+    if (shouldConfirm) {
+      this.setState('waiting_confirmation');
+      confirmed = await this.waitForConfirmation(plan);
+    }
+
+    if (!confirmed) {
+      this.setState('idle');
+      this.updateExecutionState('planned', plan.id);
+      this.updateTaskPlanStatus('planned');
+      return '任务已取消。';
+    }
+    this.checkAborted();
+
+    this.updateExecutionState('executing', plan.id);
+    this.updateTaskPlanStatus('executing');
+
+    // Phase 3: 分发任务给 Worker
+    this.setState('dispatching');
+    await this.dispatchTasks(plan);
+
+    // Phase 4: 监控执行
+    this.setState('monitoring');
+    await this.monitorExecution(plan);
+    this.checkAborted();
+
+    // Phase 4.5: 功能集成联调
+    await this.runIntegrationStage(plan);
+    this.checkAborted();
+
+    // Phase 5: 验证阶段（如果配置了验证）
+    let verificationResult: VerificationResult | null = null;
+    if (this.verificationRunner && this.currentContext?.risk?.verification !== 'none' && this.strategyConfig.enableVerification) {
+      this.setState('verifying');
+      verificationResult = await this.runVerification(taskId);
+
+      // 如果验证失败，记录错误但继续汇总
+      if (!verificationResult.success) {
+        this.emitUIMessage('error', `验证失败: ${verificationResult.summary}`);
+      }
+    }
+    this.checkAborted();
+
+    await this.waitForBackgroundTasks();
+
+    // Phase 6: 汇总结果
+    this.setState('summarizing');
+    const summary = await this.summarizeResults(userPrompt, this.completedResults, verificationResult);
+
+    // 保存 Memory 并检查是否需要压缩
+    await this.saveAndCompressMemory(summary);
+
+    this.setState('completed');
+    this.currentContext!.endTime = Date.now();
+    this.updateExecutionState('completed', plan.id);
+    this.updateTaskPlanStatus('completed');
+
+    return summary;
   }
 
   /**
@@ -490,6 +948,21 @@ export class OrchestratorAgent extends EventEmitter {
       await this.contextManager.initialize(sessionId, `session-${sessionId}`);
       this.contextManager.clearImmediateContext();
       this.contextSessionId = sessionId;
+      if (this.workspaceRoot) {
+        this.taskStateManager = new TaskStateManager(sessionId, this.workspaceRoot, true);
+        await this.taskStateManager.load();
+        this.taskStateManager.onStateChange((taskState) => {
+          this.applyTaskStateToTaskManager(taskState);
+        });
+        this.replayTaskStatesToTaskManager();
+        if (this.snapshotManager && this.strategyConfig.enableRecovery) {
+          this.recoveryHandler = new RecoveryHandler(
+            this.cliFactory,
+            this.snapshotManager,
+            this.taskStateManager
+          );
+        }
+      }
     }
 
     if (userPrompt) {
@@ -540,6 +1013,15 @@ export class OrchestratorAgent extends EventEmitter {
     // 4. 设置状态为 idle
     this.setState('idle');
 
+    if (this.taskStateManager) {
+      for (const task of this.taskStateManager.getAllTasks()) {
+        if (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled') {
+          continue;
+        }
+        this.taskStateManager.updateStatus(task.id, 'cancelled');
+      }
+    }
+
     console.log('[OrchestratorAgent] 任务已取消，状态已清理');
   }
 
@@ -561,6 +1043,22 @@ export class OrchestratorAgent extends EventEmitter {
    */
   private async analyzeTask(userPrompt: string): Promise<ExecutionPlan | null> {
     console.log('[OrchestratorAgent] Phase 1: 任务分析...');
+
+    const ruleAnalysis = this.taskAnalyzer.analyze(userPrompt);
+    this.syncCliAvailability();
+
+    if (this.shouldUseRuleBasedPlan(ruleAnalysis)) {
+      const plan = await this.buildPlanFromAnalysis(userPrompt, ruleAnalysis, false);
+      if (plan) {
+        if (plan.analysis) {
+          this.emitUIMessage('progress_update', `需求分析: ${plan.analysis}`);
+        }
+        // 🔧 修复：不在 analyzeTask 中发送 plan_ready
+        // plan_ready 只在 createPlan() 完成后发送（用于 /plan 命令）
+        // 正常执行流程通过 confirmationRequest 请求确认
+      }
+      return plan;
+    }
 
     const availableWorkers: WorkerType[] = ['claude', 'codex', 'gemini'];
     const projectContext = this.contextManager?.getContext() || '';
@@ -591,7 +1089,20 @@ export class OrchestratorAgent extends EventEmitter {
         return null;
       }
 
-      const plan = this.parseExecutionPlan(response.content);
+      const rawContent = response.content || '';
+      const preview = rawContent.replace(/\s+/g, ' ').trim().slice(0, 200);
+      console.log('[OrchestratorAgent] 计划解析输入预览:', {
+        length: rawContent.length,
+        preview,
+      });
+
+      let plan = this.parseExecutionPlan(response.content);
+      if (plan && !this.validateExecutionPlan(plan)) {
+        plan = null;
+      }
+      if (!plan) {
+        plan = await this.buildPlanFromAnalysis(userPrompt, ruleAnalysis, true);
+      }
       if (plan) {
         this.ensureArchitectureTask(plan, userPrompt);
         this.normalizeExecutionPlan(plan);
@@ -601,13 +1112,9 @@ export class OrchestratorAgent extends EventEmitter {
         if (plan.analysis) {
           this.emitUIMessage('progress_update', `需求分析: ${plan.analysis}`);
         }
-        if (!plan.needsUserInput) {
-          this.emitUIMessage('plan_ready', formatPlanForUser(plan), { plan });
-          globalEventBus.emitEvent('orchestrator:plan_ready', {
-            taskId: this.currentContext?.taskId,
-            data: { plan },
-          });
-        }
+        // 🔧 修复：不在 analyzeTask 中发送 plan_ready
+        // plan_ready 只在 createPlan() 完成后发送（用于 /plan 命令）
+        // 正常执行流程通过 confirmationRequest 请求确认
       }
 
       return plan;
@@ -617,16 +1124,356 @@ export class OrchestratorAgent extends EventEmitter {
     }
   }
 
+  private syncCliAvailability(): void {
+    const statuses = this.cliFactory.getAllStatus();
+    const idle = statuses.filter(status => status.connected && !status.busy).map(status => status.type);
+    const connected = statuses.filter(status => status.connected).map(status => status.type);
+    this.cliSelector.setAvailableCLIs(
+      idle.length > 0 ? idle : (connected.length > 0 ? connected : ['claude', 'codex', 'gemini'])
+    );
+  }
+
+  private shouldUseRuleBasedPlan(analysis: TaskAnalysis): boolean {
+    if (analysis.splittable) return false;
+    if (analysis.complexity > 2) return false;
+    if (analysis.category === 'architecture') return false;
+    return true;
+  }
+
+  private async buildPlanFromAnalysis(
+    userPrompt: string,
+    analysis: TaskAnalysis,
+    allowAIDecompose: boolean
+  ): Promise<ExecutionPlan> {
+    const splitResult = await this.buildSplitResult(analysis, allowAIDecompose);
+    const subTasks = this.mapSplitToSubTasks(splitResult.subTasks, analysis);
+    const executionMode = splitResult.executionMode === 'sequential' ? 'sequential' : 'parallel';
+    const needsCollaboration = subTasks.length > 1;
+
+    return {
+      id: `plan_${Date.now()}`,
+      analysis: `规则分析：${analysis.category}，复杂度 ${analysis.complexity}/5`,
+      isSimpleTask: subTasks.length <= 1,
+      needsWorker: true,
+      needsUserInput: false,
+      questions: [],
+      needsCollaboration,
+      subTasks,
+      executionMode,
+      summary: `规则分析生成 ${subTasks.length} 个子任务`,
+      featureContract: userPrompt,
+      acceptanceCriteria: ['任务按要求完成'],
+      createdAt: Date.now(),
+    };
+  }
+
+  private async buildSplitResult(
+    analysis: TaskAnalysis,
+    allowAIDecompose: boolean
+  ): Promise<SplitResult> {
+    if (allowAIDecompose && this.aiTaskDecomposer.shouldUseAI(analysis)) {
+      return await this.aiTaskDecomposer.decompose(analysis);
+    }
+    return this.taskSplitter.split(analysis);
+  }
+
+  private mapSplitToSubTasks(subTasks: SubTaskDef[], analysis: TaskAnalysis): SubTask[] {
+    return subTasks.map((task, index) => ({
+      id: task.id || String(index + 1),
+      taskId: this.currentContext?.taskId || '',
+      description: task.description,
+      assignedWorker: task.assignedCli,
+      assignedCli: task.assignedCli,
+      reason: task.cliSelection?.reason || '规则分配',
+      targetFiles: task.targetFiles || [],
+      dependencies: task.dependencies || [],
+      prompt: this.buildRuleBasedPrompt(analysis, task),
+      priority: task.priority,
+      kind: this.mapCategoryToKind(task.category),
+      featureId: `feature_${this.currentContext?.taskId || 'unknown'}`,
+      status: 'pending',
+      output: [],
+    }));
+  }
+
+  private buildRuleBasedPrompt(analysis: TaskAnalysis, task: SubTaskDef): string {
+    const files = task.targetFiles || [];
+    const fileHint = files.length > 0
+      ? `目标文件: ${files.join(', ')}`
+      : '目标文件: 未指定';
+
+    return [
+      `用户需求: ${analysis.prompt}`,
+      `子任务: ${task.description}`,
+      fileHint,
+      '请直接修改文件完成该任务，并简要说明变更。',
+    ].join('\n');
+  }
+
+  private mapCategoryToKind(category: TaskAnalysis['category']): SubTask['kind'] {
+    if (category === 'architecture') return 'architecture';
+    if (category === 'bugfix' || category === 'debug' || category === 'refactor') return 'repair';
+    return 'implementation';
+  }
+
+  private buildAggregatedSummary(results: ExecutionResult[]): string {
+    const aggregator = new ResultAggregator();
+    const now = Date.now();
+    const aggregated = aggregator.aggregate(results.map(result => ({
+      subTaskId: result.subTaskId,
+      cli: result.workerType,
+      status: result.success ? 'completed' : 'failed',
+      error: result.error,
+      startTime: now - (result.duration || 0),
+      endTime: now,
+      duration: result.duration,
+    })));
+    return aggregated.summary;
+  }
+
+  private filterResultsForSummary(results: ExecutionResult[]): ExecutionResult[] {
+    const unique = new Map<string, ExecutionResult>();
+    for (const result of results) {
+      unique.set(result.subTaskId, result);
+    }
+
+    const task = this.currentContext?.taskId
+      ? this.taskManager?.getTask(this.currentContext.taskId)
+      : null;
+
+    return Array.from(unique.values()).filter(result => {
+      if (result.subTaskId.startsWith('integration_')) {
+        return false;
+      }
+      const kind = task?.subTasks.find(sub => sub.id === result.subTaskId)?.kind;
+      return kind !== 'integration';
+    });
+  }
+
+  private sanitizeSummaryText(content: string): string {
+    const withoutFences = content.replace(/```[\s\S]*?```/g, '[代码块已省略]');
+    const normalized = withoutFences.replace(/\n{3,}/g, '\n\n').trim();
+    const blocks = normalized.split(/\n{2,}/);
+    const seen = new Set<string>();
+    const deduped: string[] = [];
+
+    for (const block of blocks) {
+      const trimmed = block.trim();
+      if (!trimmed) continue;
+      const key = trimmed.replace(/\s+/g, ' ');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(trimmed);
+    }
+
+    const result = deduped.join('\n\n');
+    const lines = result.split('\n');
+    if (lines.length <= 40) {
+      return result;
+    }
+    return `${lines.slice(0, 40).join('\n')}\n...(已省略)`;
+  }
+
+  private createBatchSubTasks(
+    plan: ExecutionPlan,
+    subTasks: SubTask[] = plan.subTasks
+  ): { batchTasks: SubTask[]; batchedIds: Set<string> } {
+    const batchedIds = new Set<string>();
+    const batchTasks: SubTask[] = [];
+
+    if (plan.executionMode !== 'parallel') {
+      return { batchTasks, batchedIds };
+    }
+
+    const groups = new Map<WorkerType, SubTask[]>();
+    for (const task of subTasks) {
+      if (task.kind && task.kind !== 'implementation') continue;
+      if (task.dependencies && task.dependencies.length > 0) continue;
+      const list = groups.get(task.assignedWorker) ?? [];
+      list.push(task);
+      groups.set(task.assignedWorker, list);
+    }
+
+    for (const [worker, tasks] of groups.entries()) {
+      if (tasks.length < 2) continue;
+      const taskId = this.currentContext?.taskId || 'batch';
+      const batchId = `batch_${taskId}_${worker}_${Date.now()}`;
+      const targetFiles = Array.from(new Set(tasks.flatMap(t => t.targetFiles || [])));
+
+      const batchSubTask: SubTask = {
+        id: batchId,
+        taskId: this.currentContext?.taskId || '',
+        description: `批量执行 (${worker})`,
+        assignedWorker: worker,
+        reason: '同一 CLI 多任务批量执行',
+        targetFiles,
+        dependencies: [],
+        conflictDomain: `batch:${worker}`,
+        dependencyChain: [],
+        prompt: this.buildBatchPrompt(tasks),
+        priority: 1,
+        status: 'pending',
+        output: [],
+        kind: 'batch',
+        featureId: tasks[0]?.featureId || `feature_${taskId}`,
+        batchItems: tasks.map(t => t.id),
+      };
+
+      tasks.forEach(t => batchedIds.add(t.id));
+      batchTasks.push(batchSubTask);
+      this.batchTasks.set(batchId, tasks);
+    }
+
+    return { batchTasks, batchedIds };
+  }
+
+  private buildBatchPrompt(tasks: SubTask[]): string {
+    const lines: string[] = [
+      '你需要按顺序完成以下任务：',
+    ];
+
+    tasks.forEach((task, index) => {
+      lines.push(`${index + 1}. [ ] (${task.id}) ${task.description}`);
+      if (task.targetFiles && task.targetFiles.length > 0) {
+        lines.push(`   目标文件: ${task.targetFiles.join(', ')}`);
+      }
+      if (task.prompt) {
+        lines.push(`   要求: ${task.prompt}`);
+      }
+    });
+
+    lines.push('');
+    lines.push('每完成一个任务后将 [ ] 改为 [x]，最后输出 "ALL_TASKS_COMPLETED"。');
+    lines.push('如果无法完成某个任务，请说明原因并继续列出完成的项。');
+    return lines.join('\n');
+  }
+
+  private markBatchStarted(tasks: SubTask[]): void {
+    const taskId = this.currentContext?.taskId || '';
+    for (const task of tasks) {
+      this.taskManager?.updateSubTaskStatus(taskId, task.id, 'running');
+      this.taskStateManager?.updateStatus(task.id, 'running');
+    }
+  }
+
+  private parseBatchCompletion(content: string, taskIds: string[]): { completed: Set<string>; allCompleted: boolean } {
+    const completed = new Set<string>();
+    const regex = /\[\s*x\s*\]\s*\(([^)]+)\)/gi;
+    let match = regex.exec(content);
+    while (match) {
+      completed.add(match[1]);
+      match = regex.exec(content);
+    }
+    const allCompleted = content.includes('ALL_TASKS_COMPLETED') || completed.size === taskIds.length;
+    return { completed, allCompleted };
+  }
+
+  private async finalizeBatchResult(batchTask: SubTask, result: ExecutionResult): Promise<void> {
+    const tasks = this.batchTasks.get(batchTask.id) ?? [];
+    this.batchTasks.delete(batchTask.id);
+
+    const taskIds = tasks.map(t => t.id);
+    const completion = this.parseBatchCompletion(result.result || '', taskIds);
+    const outputSummary = (result.result || '').slice(0, 800);
+
+    for (const task of tasks) {
+      const success = result.success && (completion.allCompleted || completion.completed.has(task.id));
+      const error = success ? undefined : (result.error || '批量执行未完成');
+      const normalized: ExecutionResult = {
+        workerId: result.workerId,
+        workerType: result.workerType,
+        taskId: task.taskId,
+        subTaskId: task.id,
+        result: success ? `批量执行完成。\n${outputSummary}` : `批量执行失败。\n${outputSummary}`,
+        success,
+        duration: result.duration,
+        modifiedFiles: result.modifiedFiles,
+        error,
+      };
+      this.recordResult(normalized);
+    }
+
+    this.pendingTasks.delete(batchTask.id);
+  }
+
+  private mapTaskStateStatus(status: TaskState['status']): SubTaskStatus {
+    switch (status) {
+      case 'running':
+      case 'retrying':
+        return 'running';
+      case 'completed':
+        return 'completed';
+      case 'failed':
+        return 'failed';
+      case 'cancelled':
+        return 'skipped';
+      case 'pending':
+      default:
+        return 'pending';
+    }
+  }
+
+  private applyTaskStateToTaskManager(taskState: TaskState): void {
+    if (!this.taskManager) return;
+    const task = this.taskManager.getTask(taskState.parentTaskId);
+    if (!task) return;
+    const mappedStatus = this.mapTaskStateStatus(taskState.status);
+    const existing = task.subTasks.find(st => st.id === taskState.id);
+    if (!existing) {
+      const subTask: SubTask = {
+        id: taskState.id,
+        taskId: taskState.parentTaskId,
+        description: taskState.description,
+        assignedWorker: taskState.assignedCli,
+        assignedCli: taskState.assignedCli,
+        targetFiles: taskState.modifiedFiles ?? [],
+        modifiedFiles: taskState.modifiedFiles ?? [],
+        dependencies: [],
+        status: mappedStatus,
+        output: [],
+        kind: 'implementation',
+      };
+      this.taskManager.addExistingSubTask(taskState.parentTaskId, subTask);
+    } else if (taskState.modifiedFiles && taskState.modifiedFiles.length > 0) {
+      this.taskManager.updateSubTaskFiles(
+        taskState.parentTaskId,
+        taskState.id,
+        taskState.modifiedFiles
+      );
+    }
+    this.taskManager.updateSubTaskStatus(taskState.parentTaskId, taskState.id, mappedStatus);
+  }
+
+  private replayTaskStatesToTaskManager(): void {
+    if (!this.taskStateManager) return;
+    for (const taskState of this.taskStateManager.getAllTasks()) {
+      this.applyTaskStateToTaskManager(taskState);
+    }
+  }
+
   /**
    * 解析执行计划 JSON
    */
   private parseExecutionPlan(content: string): ExecutionPlan | null {
     try {
       const jsonCandidates = this.extractPlanJsonCandidates(content);
+      const hasCandidate = jsonCandidates.some(candidate => candidate.trim().length > 0);
+      if (!hasCandidate) {
+        const preview = (content || '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 200);
+        console.warn(`[OrchestratorAgent] 执行计划内容为空或未找到 JSON 候选${preview ? `: ${preview}` : ''}`);
+        return null;
+      }
       const parsed = this.parsePlanJson(jsonCandidates);
+      // parsePlanJson 现在返回 null 而不是抛出错误
+      if (!parsed) {
+        return null;
+      }
       const rawSubTasks = this.extractSubTasks(parsed);
 
-      // 🆕 处理不需要 Worker 的情况（编排者直接回答）
+     
       const needsWorker = parsed.needsWorker !== false; // 默认为 true
       const directResponse = parsed.directResponse || '';
       const questions = Array.isArray(parsed.questions)
@@ -665,7 +1512,7 @@ export class OrchestratorAgent extends EventEmitter {
           .filter(Boolean)
         : [];
 
-      // 🆕 修复：不再强制要求功能契约和验收清单
+     
       // 如果缺少，使用默认值，而不是抛出错误
       const finalFeatureContract = featureContract || parsed.analysis || '完成用户请求的任务';
       const finalAcceptanceCriteria = acceptanceCriteria.length > 0
@@ -685,21 +1532,35 @@ export class OrchestratorAgent extends EventEmitter {
         questions,
         skipReason: parsed.skipReason,
         needsCollaboration: parsed.needsCollaboration ?? true,
-        subTasks: rawSubTasks.map((t: any, i: number) => ({
+        subTasks: rawSubTasks.map((t: any, i: number) => {
+          const fallbackFiles = this.extractTargetFilesFromText(
+            `${t?.description || ''}\n${t?.prompt || ''}`
+          );
+          const targetFiles: string[] = Array.isArray(t?.targetFiles) && t.targetFiles.length > 0
+            ? (t.targetFiles as unknown[]).filter(
+                (f: unknown): f is string => typeof f === 'string' && f.trim().length > 0
+              )
+            : fallbackFiles;
+          const normalizedTargets = Array.from(new Set(targetFiles));
+          return ({
           id: t.id || String(i + 1),
           taskId: this.currentContext?.taskId || '',
           description: t.description || '',
           assignedWorker: t.assignedWorker || t.assignedCli || 'claude',
           reason: t.reason || '',
-          targetFiles: t.targetFiles || [],
+          targetFiles: normalizedTargets,
           dependencies: t.dependencies || [],
+          conflictDomain: typeof t.conflictDomain === 'string' ? t.conflictDomain : undefined,
+          dependencyChain: Array.isArray(t.dependencyChain) ? t.dependencyChain : undefined,
           prompt: t.prompt || '',
           priority: t.priority,
-          kind: t.kind || 'implementation',
+          kind: t.kind || (t.background ? 'background' : 'implementation'),
           featureId: t.featureId || `feature_${this.currentContext?.taskId || 'unknown'}`,
+          background: Boolean(t.background) || t.kind === 'background',
           status: 'pending',
           output: [],
-        })),
+        });
+        }),
         executionMode: parsed.executionMode || 'parallel',
         summary: parsed.summary || '',
         featureContract: finalFeatureContract,
@@ -717,6 +1578,13 @@ export class OrchestratorAgent extends EventEmitter {
     if (Array.isArray(parsed.subTasks)) return parsed.subTasks;
     if (Array.isArray(parsed)) return parsed;
     return [];
+  }
+
+  private extractTargetFilesFromText(text: string): string[] {
+    if (!text) return [];
+    const filePattern = /[\w\-./]+\.(ts|js|tsx|jsx|py|java|go|rs|cpp|c|css|scss|html|json|md|yaml|yml)/gi;
+    const matches = text.match(filePattern);
+    return matches ? Array.from(new Set(matches)) : [];
   }
 
   /** 确保全栈任务包含架构/契约任务（Claude） */
@@ -783,14 +1651,27 @@ export class OrchestratorAgent extends EventEmitter {
     });
   }
 
+  private validateExecutionPlan(plan: ExecutionPlan): boolean {
+    if (!plan) return false;
+    if (plan.needsWorker === false) {
+      return typeof plan.directResponse === 'string' && plan.directResponse.trim().length > 0;
+    }
+    if (!Array.isArray(plan.subTasks) || plan.subTasks.length === 0) return false;
+    if (!plan.executionMode) return false;
+    return plan.subTasks.every(task => task && typeof task.description === 'string' && task.description.trim().length > 0);
+  }
+
   private normalizeExecutionPlan(plan: ExecutionPlan): void {
     if (!plan.subTasks || plan.subTasks.length === 0) {
       return;
     }
 
+    this.normalizePlanMetadata(plan);
     this.normalizeArchitectureKinds(plan);
     this.pruneClaudeImplementationForFullStack(plan);
+    this.mergeLightCrossLayerTasks(plan);
     this.pruneMissingDependencies(plan);
+    this.assignConflictDomains(plan);
 
     const hasDependencies = plan.subTasks.some(task => task.dependencies && task.dependencies.length > 0);
     const hasFileConflicts = this.hasFileConflicts(plan.subTasks);
@@ -799,6 +1680,217 @@ export class OrchestratorAgent extends EventEmitter {
       plan.executionMode = 'parallel';
       this.emitUIMessage('progress_update', '执行模式已调整为并行（无依赖且无文件冲突）');
     }
+  }
+
+  private normalizePlanMetadata(plan: ExecutionPlan): void {
+    const basePrompt = plan.featureContract || this.currentContext?.userPrompt || '';
+    const analysis = basePrompt ? this.taskAnalyzer.analyze(basePrompt) : null;
+
+    if (!plan.featureContract) {
+      plan.featureContract = basePrompt;
+    }
+    if (!plan.analysis) {
+      plan.analysis = analysis
+        ? `规则分析：${analysis.category}，复杂度 ${analysis.complexity}/5`
+        : '未提供分析结果';
+    }
+    if (!Array.isArray(plan.acceptanceCriteria) || plan.acceptanceCriteria.length === 0) {
+      plan.acceptanceCriteria = this.deriveAcceptanceCriteria(plan);
+    }
+    if (!plan.summary) {
+      plan.summary = plan.analysis || '任务计划已生成';
+    }
+    if (!plan.executionMode) {
+      plan.executionMode = analysis?.suggestedMode ?? 'sequential';
+    }
+    if (plan.needsCollaboration === undefined) {
+      plan.needsCollaboration = plan.subTasks.length > 1;
+    }
+  }
+
+  private deriveAcceptanceCriteria(plan: ExecutionPlan): string[] {
+    const criteria = new Set<string>();
+    if (plan.featureContract) {
+      criteria.add('满足功能契约');
+    }
+    for (const task of plan.subTasks || []) {
+      if (task?.description) {
+        criteria.add(`完成：${task.description}`);
+      }
+      if (criteria.size >= 6) break;
+    }
+    if (criteria.size === 0) {
+      criteria.add('按要求完成任务');
+    }
+    return Array.from(criteria);
+  }
+
+  private mergeLightCrossLayerTasks(plan: ExecutionPlan): void {
+    const risk = this.currentContext?.risk;
+    if (!risk || risk.path !== 'light') return;
+    if (!plan.subTasks || plan.subTasks.length !== 2) return;
+
+    const [first, second] = plan.subTasks;
+    if (!this.isSmallSubTask(first) || !this.isSmallSubTask(second)) return;
+
+    const isFrontendPair = this.isFrontendTask(first) || this.isFrontendTask(second);
+    const isBackendPair = this.isBackendTask(first) || this.isBackendTask(second);
+    if (!isFrontendPair || !isBackendPair) return;
+
+    const targetWorker = this.pickPrimaryWorker(first, second);
+    if (first.assignedWorker === second.assignedWorker && first.assignedWorker === targetWorker) {
+      return;
+    }
+
+    const mergedTargetFiles = Array.from(new Set([
+      ...(first.targetFiles || []),
+      ...(second.targetFiles || []),
+    ]));
+    const mergedDependencies = Array.from(new Set([
+      ...(first.dependencies || []),
+      ...(second.dependencies || []),
+    ]));
+
+    const mergedTask: SubTask = {
+      id: `merge-${Date.now()}`,
+      taskId: first.taskId || second.taskId || this.currentContext?.taskId || '',
+      description: `轻量跨层合并任务：${first.description} / ${second.description}`,
+      assignedWorker: targetWorker,
+      reason: '轻量跨层改动合并执行，减少拆分成本',
+      targetFiles: mergedTargetFiles,
+      dependencies: mergedDependencies,
+      prompt: [
+        '以下为轻量跨层合并任务，请一次性完成：',
+        '',
+        `子任务1: ${first.description}`,
+        first.prompt ? `要求:\n${first.prompt}` : '',
+        '',
+        `子任务2: ${second.description}`,
+        second.prompt ? `要求:\n${second.prompt}` : '',
+      ].filter(Boolean).join('\n'),
+      priority: Math.min(first.priority ?? 0, second.priority ?? 0),
+      kind: first.kind || second.kind || 'implementation',
+      featureId: first.featureId || second.featureId || `feature_${this.currentContext?.taskId || 'unknown'}`,
+      status: 'pending',
+      output: [],
+    };
+
+    plan.subTasks = [mergedTask];
+    plan.executionMode = 'sequential';
+    this.emitUIMessage('progress_update', '已按轻量跨层规则合并前后端子任务');
+  }
+
+  private assignConflictDomains(plan: ExecutionPlan): void {
+    for (const task of plan.subTasks) {
+      task.dependencies = task.dependencies ?? [];
+      task.dependencyChain = Array.from(new Set(task.dependencies));
+
+      if (!task.conflictDomain || !task.conflictDomain.trim()) {
+        const domains = this.resolveConflictDomains(task);
+        task.conflictDomain = domains.length > 0 ? domains.join('|') : 'unknown';
+      }
+    }
+  }
+
+  private resolveConflictDomains(task: SubTask): string[] {
+    const domains = new Set<string>();
+    const files = (task.targetFiles || []).filter(Boolean);
+    const configFiles = [
+      'package.json',
+      'package-lock.json',
+      'pnpm-lock.yaml',
+      'yarn.lock',
+      'requirements.txt',
+      'pyproject.toml',
+      'Pipfile',
+      'go.mod',
+      'go.sum',
+      'Cargo.toml',
+      'Cargo.lock',
+      'pom.xml',
+      'build.gradle',
+      'build.gradle.kts',
+      'tsconfig.json',
+      'vite.config',
+      'webpack.config',
+      'next.config',
+    ];
+
+    for (const file of files) {
+      const normalized = file.replace(/\\/g, '/').replace(/^\.\//, '');
+      const base = normalized.split('/').pop() || '';
+      if (configFiles.some(cfg => base === cfg || base.startsWith(cfg))) {
+        domains.add(`config:${base}`);
+        continue;
+      }
+
+      const moduleMatch = normalized.match(/src\/modules\/([^/]+)/);
+      if (moduleMatch?.[1]) {
+        domains.add(`module:${moduleMatch[1]}`);
+        continue;
+      }
+
+      const apiMatch = normalized.match(/src\/(api|routes|controllers?)\/([^/]+)/);
+      if (apiMatch?.[2]) {
+        domains.add(`api:${apiMatch[2]}`);
+        continue;
+      }
+
+      if (normalized.startsWith('src/')) {
+        const parts = normalized.split('/');
+        const dir = parts.length >= 2 ? `${parts[0]}/${parts[1]}` : parts[0];
+        domains.add(`dir:${dir}`);
+        continue;
+      }
+
+      const top = normalized.split('/')[0];
+      if (top) {
+        domains.add(`dir:${top}`);
+      }
+    }
+
+    if (domains.size === 0) {
+      const text = `${task.description} ${task.prompt || ''}`;
+      if (/前端|UI|界面|页面|组件/i.test(text)) {
+        domains.add('frontend');
+      }
+      if (/后端|API|接口|服务|数据库|鉴权|认证/i.test(text)) {
+        domains.add('backend');
+      }
+      if (/架构|契约|系统|设计|框架/i.test(text)) {
+        domains.add('architecture');
+      }
+      if (/配置|依赖|构建|脚本/i.test(text)) {
+        domains.add('config');
+      }
+    }
+
+    return Array.from(domains.values());
+  }
+
+  private isSmallSubTask(task: SubTask): boolean {
+    const desc = task.description || '';
+    const prompt = task.prompt || '';
+    const files = task.targetFiles || [];
+    return desc.length <= 80 && prompt.length <= 400 && files.length <= 2;
+  }
+
+  private isFrontendTask(task: SubTask): boolean {
+    return task.assignedWorker === 'gemini' || /前端|UI|界面|页面|组件|样式/i.test(task.description);
+  }
+
+  private isBackendTask(task: SubTask): boolean {
+    return task.assignedWorker === 'codex' || /后端|API|接口|服务|鉴权|数据库/i.test(task.description);
+  }
+
+  private pickPrimaryWorker(a: SubTask, b: SubTask): WorkerType {
+    if (this.isBackendTask(a) || this.isBackendTask(b)) {
+      return 'codex';
+    }
+    if (this.isFrontendTask(a) || this.isFrontendTask(b)) {
+      return 'gemini';
+    }
+    return 'claude';
   }
 
   private normalizeArchitectureKinds(plan: ExecutionPlan): void {
@@ -956,6 +2048,7 @@ export class OrchestratorAgent extends EventEmitter {
 
   /**
    * 解析 JSON（支持去除尾随逗号的容错）
+   * 返回 null 而不是抛出错误，让调用方使用 fallback 逻辑
    */
   private parsePlanJson(candidates: string[]): any {
     const errors: string[] = [];
@@ -993,7 +2086,9 @@ export class OrchestratorAgent extends EventEmitter {
       }
     }
 
-    throw new Error(`无法解析执行计划 JSON: ${errors.join(' | ')}`);
+    // 返回 null 而不是抛出错误，让调用方使用 fallback 逻辑
+    console.warn('[OrchestratorAgent] 无法解析执行计划 JSON:', errors.join(' | '));
+    return null;
   }
 
   private isLikelyPlanJson(parsed: any): boolean {
@@ -1110,6 +2205,81 @@ export class OrchestratorAgent extends EventEmitter {
   // Phase 3: 分发任务
   // =========================================================================
 
+  private isBackgroundSubTask(subTask?: SubTask | null): boolean {
+    return Boolean(subTask?.background || subTask?.kind === 'background');
+  }
+
+  private getForegroundSubTasks(plan: ExecutionPlan): SubTask[] {
+    return (plan.subTasks || []).filter(task => !this.isBackgroundSubTask(task));
+  }
+
+  private getBackgroundSubTasks(plan: ExecutionPlan): SubTask[] {
+    return (plan.subTasks || []).filter(task => this.isBackgroundSubTask(task));
+  }
+
+  private dispatchBackgroundTasks(subTasks: SubTask[], plan: ExecutionPlan): void {
+    if (!this.currentContext || subTasks.length === 0) {
+      return;
+    }
+
+    const taskId = this.currentContext.taskId;
+    const backgroundPriority = 10;
+
+    for (const subTask of subTasks) {
+      this.backgroundTasks.set(subTask.id, subTask);
+      this.emitUIMessage(
+        'progress_update',
+        `后台任务排队: ${subTask.description}`,
+        { subTaskId: subTask.id, workerType: subTask.assignedWorker }
+      );
+
+      const context = this.buildWorkerContext(plan, subTask);
+      const promise = this.workerPool.dispatchTaskWithRetry(
+        subTask.assignedWorker,
+        taskId,
+        subTask,
+        context,
+        { priority: backgroundPriority }
+      ).then(result => this.finalizeResult(result)).catch(error => {
+        const failedResult: ExecutionResult = {
+          workerId: 'unknown',
+          workerType: subTask.assignedWorker,
+          taskId,
+          subTaskId: subTask.id,
+          result: '',
+          success: false,
+          duration: 0,
+          error: error instanceof Error ? error.message : String(error),
+        };
+        return this.finalizeResult(failedResult);
+      }).finally(() => {
+        this.backgroundFinalizations.delete(subTask.id);
+      });
+
+      this.backgroundFinalizations.set(subTask.id, promise);
+    }
+  }
+
+  private async waitForBackgroundTasks(timeoutMs = 15000): Promise<void> {
+    if (this.abortController?.signal.aborted) {
+      return;
+    }
+    const pending = Array.from(this.backgroundFinalizations.values());
+    if (pending.length === 0) {
+      return;
+    }
+
+    const timeout = Math.max(1000, timeoutMs);
+    await Promise.race([
+      Promise.allSettled(pending).then(() => undefined),
+      new Promise<void>(resolve => setTimeout(resolve, timeout)),
+    ]);
+
+    if (this.backgroundFinalizations.size > 0) {
+      this.emitUIMessage('progress_update', '后台任务仍在执行，先进入汇总阶段');
+    }
+  }
+
   /** 分发任务给 Worker */
   private async dispatchTasks(plan: ExecutionPlan): Promise<void> {
     console.log('[OrchestratorAgent] Phase 3: 分发任务...');
@@ -1119,14 +2289,33 @@ export class OrchestratorAgent extends EventEmitter {
     // 在执行前创建文件快照（支持回滚）
     await this.createSnapshotsForPlan(plan);
 
-    for (const subTask of plan.subTasks) {
+    const foregroundSubTasks = this.getForegroundSubTasks(plan);
+    const backgroundSubTasks = this.getBackgroundSubTasks(plan);
+
+    for (const subTask of foregroundSubTasks) {
       this.pendingTasks.set(subTask.id, subTask);
     }
 
-    // 🆕 检查是否有任务依赖关系，决定执行策略
-    const hasDependencies = plan.subTasks.some(
+   
+    const hasDependencies = foregroundSubTasks.some(
       t => t.dependencies && t.dependencies.length > 0
     );
+
+    const { batchTasks, batchedIds } = hasDependencies
+      ? { batchTasks: [], batchedIds: new Set<string>() }
+      : this.createBatchSubTasks(plan, foregroundSubTasks);
+
+    if (batchTasks.length > 0) {
+      for (const batchTask of batchTasks) {
+        this.pendingTasks.set(batchTask.id, batchTask);
+      }
+    }
+
+    const dispatchSubTasks = batchTasks.length > 0
+      ? foregroundSubTasks.filter(task => !batchedIds.has(task.id)).concat(batchTasks)
+      : foregroundSubTasks;
+
+    this.dispatchBackgroundTasks(backgroundSubTasks, plan);
 
     if (hasDependencies) {
       // 使用依赖图调度执行
@@ -1138,23 +2327,23 @@ export class OrchestratorAgent extends EventEmitter {
         );
         this.warnedReviewSkipForDependencies = true;
       }
-      await this.dispatchWithDependencyGraph(plan);
+      await this.dispatchWithDependencyGraph(plan, foregroundSubTasks);
     } else if (plan.executionMode === 'parallel') {
-      await this.dispatchParallel(plan.subTasks, plan);
+      await this.dispatchParallel(dispatchSubTasks, plan);
     } else {
-      await this.dispatchSequential(plan.subTasks, plan);
+      await this.dispatchSequential(dispatchSubTasks, plan);
     }
 
   }
 
-  /** 🆕 基于依赖图分发任务 */
-  private async dispatchWithDependencyGraph(plan: ExecutionPlan): Promise<void> {
+  /** 基于依赖图分发任务 */
+  private async dispatchWithDependencyGraph(plan: ExecutionPlan, subTasks: SubTask[]): Promise<void> {
     this.emitUIMessage('progress_update', '正在分析任务依赖关系...');
 
     try {
       const results = await this.workerPool.executeWithDependencyGraph(
         this.currentContext!.taskId,
-        plan.subTasks,
+        subTasks,
         (subTask) => this.buildWorkerContext(plan, subTask)
       );
 
@@ -1242,6 +2431,22 @@ export class OrchestratorAgent extends EventEmitter {
     };
   }
 
+  private resolvePermissions(): PermissionMatrix {
+    return {
+      allowEdit: this.config.permissions?.allowEdit ?? true,
+      allowBash: this.config.permissions?.allowBash ?? true,
+      allowWeb: this.config.permissions?.allowWeb ?? true,
+    };
+  }
+
+  private resolveStrategyConfig(): StrategyConfig {
+    return {
+      enableVerification: this.config.strategy?.enableVerification ?? true,
+      enableRecovery: this.config.strategy?.enableRecovery ?? true,
+      autoRollbackOnFailure: this.config.strategy?.autoRollbackOnFailure ?? false,
+    };
+  }
+
   private isHighRiskSubTask(subTask: SubTask): boolean {
     const reviewConfig = this.resolveReviewConfig();
     const extensions = (reviewConfig?.highRiskExtensions ?? DEFAULT_REVIEW_CONFIG.highRiskExtensions)
@@ -1264,11 +2469,15 @@ export class OrchestratorAgent extends EventEmitter {
   private buildWorkerContext(plan: ExecutionPlan, subTask: SubTask): string {
     const sharedContext = this.buildSharedContext(plan);
     const config = this.resolveContextConfig();
-    const maxTokens = config.workerMaxTokens + (this.isHighRiskSubTask(subTask) ? config.workerHighRiskExtraTokens : 0);
+    const fileCount = subTask.targetFiles?.length ?? 0;
+    const riskBoost = this.isHighRiskSubTask(subTask) ? config.workerHighRiskExtraTokens : 0;
+    const fileBoost = Math.min(600, fileCount * 200);
+    const maxTokens = config.workerMaxTokens + riskBoost + fileBoost;
+    const memoryRatio = fileCount <= 1 ? Math.max(0.2, config.workerMemoryRatio - 0.1) : config.workerMemoryRatio;
 
     const contextSlice = this.contextManager?.getContextSlice({
       maxTokens,
-      memoryRatio: config.workerMemoryRatio,
+      memoryRatio,
       memorySummary: {
         includeKeyDecisions: 2,
         includeImportantContext: true,
@@ -1285,7 +2494,8 @@ export class OrchestratorAgent extends EventEmitter {
       subTask.targetFiles?.length ? `目标文件: ${subTask.targetFiles.join(', ')}` : '',
     ].filter(Boolean).join('\n');
 
-    return [sharedContext, taskHint, contextSlice].filter(Boolean).join('\n\n');
+    const trimmedContext = contextSlice.trim();
+    return [sharedContext, taskHint, trimmedContext].filter(Boolean).join('\n\n');
   }
 
   private buildIntegrationPrompt(plan: ExecutionPlan): string {
@@ -1384,7 +2594,16 @@ export class OrchestratorAgent extends EventEmitter {
     if (!integrationConfig.enabled || !this.currentContext) {
       return;
     }
-    if (plan.subTasks.length === 0) {
+    const foregroundSubTasks = this.getForegroundSubTasks(plan);
+    if (foregroundSubTasks.length === 0) {
+      return;
+    }
+    const riskPath = this.currentContext.risk?.path;
+    const needsIntegration = riskPath === 'full'
+      || (riskPath === 'standard' && (plan.needsCollaboration || foregroundSubTasks.length > 1))
+      || (riskPath === undefined && foregroundSubTasks.length > 1);
+    if (!needsIntegration) {
+      this.emitUIMessage('progress_update', '联调阶段已跳过（风险路径较低或单任务）');
       return;
     }
 
@@ -1392,7 +2611,7 @@ export class OrchestratorAgent extends EventEmitter {
     const taskId = this.currentContext.taskId;
     const maxRounds = Math.max(1, integrationConfig.maxRounds);
     const sharedContext = this.buildSharedContext(plan);
-    let dependencyIds = plan.subTasks.map(task => task.id);
+    let dependencyIds = foregroundSubTasks.map(task => task.id);
 
     for (let round = 1; round <= maxRounds; round += 1) {
       this.setState('integrating');
@@ -1406,6 +2625,8 @@ export class OrchestratorAgent extends EventEmitter {
         reason: '联调收敛与验收',
         targetFiles: [],
         dependencies: [...dependencyIds],
+        conflictDomain: 'integration',
+        dependencyChain: [...dependencyIds],
         prompt: this.buildIntegrationPrompt(plan),
         priority: 1,
         status: 'pending',
@@ -1416,6 +2637,15 @@ export class OrchestratorAgent extends EventEmitter {
 
       this.pendingTasks.set(integrationSubTask.id, integrationSubTask);
       this.taskManager?.addExistingSubTask(taskId, integrationSubTask);
+      if (this.taskStateManager && !this.taskStateManager.getTask(integrationSubTask.id)) {
+        this.taskStateManager.createTask({
+          id: integrationSubTask.id,
+          parentTaskId: taskId,
+          description: integrationSubTask.description,
+          assignedCli: integrationSubTask.assignedWorker,
+          maxAttempts: this.config.maxRetries,
+        });
+      }
       globalEventBus.emitEvent('task:created', { taskId });
 
       const integrationContext = this.buildIntegrationContext(plan, this.completedResults, round);
@@ -1430,15 +2660,28 @@ export class OrchestratorAgent extends EventEmitter {
       this.lastIntegrationSummary = report.summary;
 
       if (report.status === 'passed') {
-        this.emitUIMessage('progress_update', `✅ 联调通过: ${report.summary}`);
+        this.emitUIMessage('progress_update', `[通过] 联调通过: ${report.summary}`);
         return;
       }
 
-      this.emitUIMessage('error', `❌ 联调未通过: ${report.summary}`);
+      this.emitUIMessage('error', `[失败] 联调未通过: ${report.summary}`);
+
+      if (report.issues.length === 0) {
+        report.issues.push({
+          title: '联调问题待修复',
+          detail: report.summary || '联调未通过，请根据联调结论修复问题',
+          area: 'other',
+          suggestedWorker: integrationConfig.worker,
+          fixPrompt: this.buildRepairPrompt(plan, {
+            detail: report.summary || '联调未通过，请根据联调结论修复问题',
+            area: 'other',
+          }),
+        });
+      }
 
       const repairTasks: SubTask[] = report.issues.map((issue, index) => {
         const worker = this.pickWorkerForIssue(issue);
-        return {
+        const task: SubTask = {
           id: `repair_${taskId}_${round}_${index + 1}`,
           taskId,
           description: `修复联调问题: ${issue.title || issue.area || '问题'}`,
@@ -1446,6 +2689,7 @@ export class OrchestratorAgent extends EventEmitter {
           reason: '联调修复',
           targetFiles: issue.targetFiles || [],
           dependencies: [...dependencyIds],
+          dependencyChain: [...dependencyIds],
           prompt: issue.fixPrompt || this.buildRepairPrompt(plan, issue),
           priority: 2,
           status: 'pending',
@@ -1453,6 +2697,11 @@ export class OrchestratorAgent extends EventEmitter {
           kind: 'repair',
           featureId,
         };
+        if (!task.conflictDomain) {
+          const domains = this.resolveConflictDomains(task);
+          task.conflictDomain = domains.length > 0 ? domains.join('|') : 'unknown';
+        }
+        return task;
       });
 
       if (repairTasks.length === 0) {
@@ -1463,6 +2712,15 @@ export class OrchestratorAgent extends EventEmitter {
       for (const repairTask of repairTasks) {
         this.pendingTasks.set(repairTask.id, repairTask);
         this.taskManager?.addExistingSubTask(taskId, repairTask);
+        if (this.taskStateManager && !this.taskStateManager.getTask(repairTask.id)) {
+          this.taskStateManager.createTask({
+            id: repairTask.id,
+            parentTaskId: taskId,
+            description: repairTask.description,
+            assignedCli: repairTask.assignedWorker,
+            maxAttempts: this.config.maxRetries,
+          });
+        }
       }
       globalEventBus.emitEvent('task:created', { taskId });
 
@@ -1491,6 +2749,15 @@ export class OrchestratorAgent extends EventEmitter {
     for (const subTask of plan.subTasks) {
       try {
         this.taskManager.addExistingSubTask(this.currentContext.taskId, subTask);
+        if (this.taskStateManager && !this.taskStateManager.getTask(subTask.id)) {
+          this.taskStateManager.createTask({
+            id: subTask.id,
+            parentTaskId: this.currentContext.taskId,
+            description: subTask.description,
+            assignedCli: subTask.assignedWorker,
+            maxAttempts: this.config.maxRetries,
+          });
+        }
       } catch (error) {
         console.warn('[OrchestratorAgent] 同步子任务失败:', error);
       }
@@ -1503,6 +2770,10 @@ export class OrchestratorAgent extends EventEmitter {
   private async dispatchParallel(subTasks: SubTask[], plan: ExecutionPlan, contextOverride?: string): Promise<void> {
     const taskId = this.currentContext!.taskId;
     for (const subTask of subTasks) {
+      if (subTask.kind === 'batch' && subTask.batchItems?.length) {
+        const tasks = this.batchTasks.get(subTask.id) ?? [];
+        this.markBatchStarted(tasks);
+      }
       this.emitUIMessage('progress_update',
         `分发任务给 ${subTask.assignedWorker}: ${subTask.description}`,
         { subTaskId: subTask.id, workerType: subTask.assignedWorker }
@@ -1539,6 +2810,10 @@ export class OrchestratorAgent extends EventEmitter {
     for (const subTask of subTasks) {
       this.checkAborted();
 
+      if (subTask.kind === 'batch' && subTask.batchItems?.length) {
+        const tasks = this.batchTasks.get(subTask.id) ?? [];
+        this.markBatchStarted(tasks);
+      }
       this.emitUIMessage('progress_update',
         `分发任务给 ${subTask.assignedWorker}: ${subTask.description}`,
         { subTaskId: subTask.id, workerType: subTask.assignedWorker }
@@ -1584,12 +2859,22 @@ export class OrchestratorAgent extends EventEmitter {
     }
 
     const promise = (async () => {
-      const subTask = this.pendingTasks.get(subTaskId);
+      const subTask = this.getTrackedSubTask(subTaskId);
       if (!subTask) {
         return null;
       }
 
+      if (subTask.kind === 'batch') {
+        await this.finalizeBatchResult(subTask, result);
+        return result;
+      }
+
       if (subTask.kind === 'integration') {
+        this.recordResult(result);
+        return result;
+      }
+
+      if (this.isBackgroundSubTask(subTask)) {
         this.recordResult(result);
         return result;
       }
@@ -1866,6 +3151,8 @@ export class OrchestratorAgent extends EventEmitter {
           },
         }
       );
+      // 记录 token 使用
+      this.recordOrchestratorTokens(response.tokenUsage);
 
       if (response.error) {
         return { status: 'rejected', reviewer: subTask.assignedWorker, reason: response.error };
@@ -1907,6 +3194,8 @@ export class OrchestratorAgent extends EventEmitter {
         },
       }
     );
+    // 记录 token 使用
+    this.recordOrchestratorTokens(peerResponse.tokenUsage);
 
     if (peerResponse.error) {
       return { status: 'rejected', reviewer, reason: peerResponse.error };
@@ -1975,8 +3264,31 @@ export class OrchestratorAgent extends EventEmitter {
   private async runVerification(taskId: string): Promise<VerificationResult> {
     console.log('[OrchestratorAgent] Phase 5: 验证阶段...');
 
+    if (!this.strategyConfig.enableVerification) {
+      return { success: true, summary: '跳过验证（策略关闭）' };
+    }
+
     if (!this.verificationRunner) {
       return { success: true, summary: '跳过验证（未配置）' };
+    }
+
+    const verificationLevel = this.currentContext?.risk?.verification ?? 'basic';
+    const baseConfig = {
+      compileCheck: this.config.verification?.compileCheck ?? true,
+      ideCheck: this.config.verification?.ideCheck ?? true,
+    };
+    if (verificationLevel === 'basic') {
+      this.verificationRunner.updateConfig({
+        ...baseConfig,
+        lintCheck: false,
+        testCheck: false,
+      });
+    } else if (verificationLevel === 'full') {
+      this.verificationRunner.updateConfig({
+        ...baseConfig,
+        lintCheck: this.config.verification?.lintCheck ?? true,
+        testCheck: this.config.verification?.testCheck ?? true,
+      });
     }
 
     this.emitUIMessage('progress_update', '正在执行验证检查...');
@@ -1990,9 +3302,9 @@ export class OrchestratorAgent extends EventEmitter {
       const result = await this.verificationRunner.runVerification(taskId, modifiedFiles);
 
       if (result.success) {
-        this.emitUIMessage('progress_update', `✅ 验证通过: ${result.summary}`);
+        this.emitUIMessage('progress_update', `[通过] 验证通过: ${result.summary}`);
       } else {
-        this.emitUIMessage('error', `❌ 验证失败: ${result.summary}`);
+        this.emitUIMessage('error', `[失败] 验证失败: ${result.summary}`);
       }
 
       return result;
@@ -2020,14 +3332,20 @@ export class OrchestratorAgent extends EventEmitter {
       return emptySummary;
     }
 
+    const summaryResults = this.filterResultsForSummary(results);
+
     // 构建包含验证结果的汇总 prompt
-    let summaryPrompt = buildOrchestratorSummaryPrompt(userPrompt, results);
+    let summaryPrompt = buildOrchestratorSummaryPrompt(userPrompt, summaryResults);
 
     if (verificationResult) {
       summaryPrompt += `\n\n## 验证结果\n${verificationResult.summary}`;
     }
     if (this.lastIntegrationSummary) {
       summaryPrompt += `\n\n## 集成联调\n${this.lastIntegrationSummary}`;
+    }
+    const aggregatedSummary = this.buildAggregatedSummary(summaryResults);
+    if (aggregatedSummary) {
+      summaryPrompt += `\n\n## 执行统计\n${aggregatedSummary}`;
     }
 
     try {
@@ -2050,16 +3368,27 @@ export class OrchestratorAgent extends EventEmitter {
       this.recordOrchestratorTokens(response.tokenUsage);
 
       if (response.error) {
-        const summary = `任务执行完成，但汇总失败: ${response.error}`;
+        const summary = this.sanitizeSummaryText([
+          aggregatedSummary ? `执行统计:\n${aggregatedSummary}` : '',
+          verificationResult?.summary ? `验证结果:\n${verificationResult.summary}` : '',
+          this.lastIntegrationSummary ? `集成联调:\n${this.lastIntegrationSummary}` : '',
+          `任务执行完成，但汇总失败: ${response.error}`,
+        ].filter(Boolean).join('\n\n'));
         this.emitUIMessage('summary', summary);
         return summary;
       }
 
-      this.emitUIMessage('summary', response.content);
-      return response.content;
+      const summary = this.sanitizeSummaryText(response.content || '');
+      this.emitUIMessage('summary', summary);
+      return summary;
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      const summary = `任务执行完成，但汇总失败: ${errorMsg}`;
+      const summary = this.sanitizeSummaryText([
+        aggregatedSummary ? `执行统计:\n${aggregatedSummary}` : '',
+        verificationResult?.summary ? `验证结果:\n${verificationResult.summary}` : '',
+        this.lastIntegrationSummary ? `集成联调:\n${this.lastIntegrationSummary}` : '',
+        `任务执行完成，但汇总失败: ${errorMsg}`,
+      ].filter(Boolean).join('\n\n'));
       this.emitUIMessage('summary', summary);
       return summary;
     }
@@ -2085,16 +3414,51 @@ export class OrchestratorAgent extends EventEmitter {
   // 消息处理
   // =========================================================================
 
+  private getTrackedSubTask(subTaskId: string): SubTask | undefined {
+    return this.pendingTasks.get(subTaskId) ?? this.backgroundTasks.get(subTaskId);
+  }
+
+  private removeTrackedSubTask(subTaskId: string): SubTask | undefined {
+    if (this.pendingTasks.has(subTaskId)) {
+      const subTask = this.pendingTasks.get(subTaskId);
+      this.pendingTasks.delete(subTaskId);
+      return subTask;
+    }
+    if (this.backgroundTasks.has(subTaskId)) {
+      const subTask = this.backgroundTasks.get(subTaskId);
+      this.backgroundTasks.delete(subTaskId);
+      return subTask;
+    }
+    return undefined;
+  }
+
   private recordResult(result: ExecutionResult): boolean {
-    if (!this.pendingTasks.has(result.subTaskId)) {
+    const subTask = this.getTrackedSubTask(result.subTaskId);
+    if (!subTask) {
       return false;
     }
 
-    this.completedResults.push(result);
-    this.pendingTasks.delete(result.subTaskId);
+    if ((!result.modifiedFiles || result.modifiedFiles.length === 0) && this.snapshotManager) {
+      const changedFiles = this.snapshotManager.getChangedFilesForSubTask(result.subTaskId);
+      if (changedFiles.length > 0) {
+        result.modifiedFiles = changedFiles;
+      }
+    }
 
-    const total = this.currentContext?.plan?.subTasks.length || 0;
-    const completed = this.completedResults.length;
+    this.completedResults.push(result);
+    this.removeTrackedSubTask(result.subTaskId);
+
+    if (subTask) {
+      this.checkDisciplineViolations(subTask, result);
+      const planId = this.currentContext?.plan?.id;
+      if (planId && (result.success === true || result.success === false)) {
+        this.planTodoManager?.updateSubTaskStatus(planId, subTask.id, result.success ? 'completed' : 'failed');
+      }
+    }
+
+    const progressCounts = this.getProgressCounts(result.taskId);
+    const total = progressCounts.total;
+    const completed = progressCounts.completed;
 
     if (this.contextManager) {
       this.contextManager.updateTaskStatus(
@@ -2102,6 +3466,14 @@ export class OrchestratorAgent extends EventEmitter {
         result.success ? 'completed' : 'failed',
         result.success ? '执行成功' : result.error
       );
+      if (result.modifiedFiles && result.modifiedFiles.length > 0) {
+        const summary = this.buildChangeSummary(result);
+        const uniqueFiles = Array.from(new Set(result.modifiedFiles));
+        uniqueFiles.forEach(file => {
+          this.contextManager!.addCodeChange(file, 'modify', summary);
+        });
+      }
+      void this.contextManager.saveMemory();
     }
 
     if (this.taskManager) {
@@ -2110,19 +3482,46 @@ export class OrchestratorAgent extends EventEmitter {
         result.subTaskId,
         result.success ? 'completed' : 'failed'
       );
+      if (result.modifiedFiles && result.modifiedFiles.length > 0) {
+        this.taskManager.updateSubTaskFiles(result.taskId, result.subTaskId, result.modifiedFiles);
+      }
       globalEventBus.emitEvent(result.success ? 'subtask:completed' : 'subtask:failed', {
         taskId: result.taskId,
         subTaskId: result.subTaskId,
         data: result.success
-          ? { success: true, cli: result.workerType }
-          : { error: result.error || '未知错误', cli: result.workerType },  // 🆕 传递 CLI 信息
+          ? {
+            success: true,
+            cli: result.workerType,
+            description: subTask?.description,
+            targetFiles: subTask?.targetFiles,
+            modifiedFiles: result.modifiedFiles || [],
+            duration: result.duration,
+          }
+          : {
+            error: result.error || '未知错误',
+            cli: result.workerType,
+            description: subTask?.description,
+            targetFiles: subTask?.targetFiles,
+            modifiedFiles: result.modifiedFiles || [],
+            duration: result.duration,
+          }, 
       });
+    }
+    if (this.taskStateManager) {
+      this.taskStateManager.updateStatus(
+        result.subTaskId,
+        result.success ? 'completed' : 'failed',
+        result.error
+      );
+      if (result.success) {
+        this.taskStateManager.setResult(result.subTaskId, result.result, result.modifiedFiles);
+      }
     }
 
     this.emitUIMessage(
       'progress_update',
       buildProgressMessage(completed, total, result.workerType),
-      { progress: Math.round((completed / total) * 100), result }
+      { progress: total > 0 ? Math.round((completed / total) * 100) : 0, result }
     );
 
     if (!result.success) {
@@ -2130,6 +3529,72 @@ export class OrchestratorAgent extends EventEmitter {
     }
 
     return true;
+  }
+
+  private checkDisciplineViolations(subTask: SubTask, result: ExecutionResult): void {
+    const modified = (result.modifiedFiles || []).map(file => file.trim()).filter(Boolean);
+    if (modified.length === 0) {
+      return;
+    }
+
+    const normalizedTargets = (subTask.targetFiles || []).map(f => f.trim()).filter(Boolean);
+    const outOfScope = normalizedTargets.length === 0
+      ? modified
+      : modified.filter(file => !normalizedTargets.includes(file));
+
+    const touchedPlan = modified.filter(file => file.includes('.multicli/plans') || file.includes('.multicli/execution-state'));
+
+    if (touchedPlan.length > 0) {
+      this.emitUIMessage(
+        'progress_update',
+        `编排纪律提示: 子任务 ${subTask.id} 修改了编排状态文件（${touchedPlan.join(', ')}），请避免直接改动计划/状态文件`,
+        { subTaskId: subTask.id }
+      );
+    }
+
+    if (outOfScope.length > 0) {
+      const targets = normalizedTargets.length > 0 ? normalizedTargets.join(', ') : '未声明目标文件';
+      this.emitUIMessage(
+        'progress_update',
+        `编排纪律提示: 子任务 ${subTask.id} 修改了计划外文件 (${outOfScope.join(', ')})；目标文件: ${targets}`,
+        { subTaskId: subTask.id }
+      );
+    }
+  }
+
+  private buildChangeSummary(result: ExecutionResult): string {
+    const raw = (result.result || '').trim();
+    if (!raw) {
+      return result.success ? '执行成功' : (result.error || '执行失败');
+    }
+    const text = raw.replace(/\s+/g, ' ').trim();
+    return text.length > 200 ? `${text.slice(0, 200)}...` : text;
+  }
+
+  private getProgressCounts(taskId: string): { total: number; completed: number } {
+    const backgroundIds = new Set(
+      (this.currentContext?.plan?.subTasks || [])
+        .filter(task => this.isBackgroundSubTask(task))
+        .map(task => task.id)
+    );
+    if (this.taskStateManager) {
+      const tasks = this.taskStateManager.getAllTasks().filter(task =>
+        task.parentTaskId === taskId && !backgroundIds.has(task.id)
+      );
+      if (tasks.length > 0) {
+        const completed = tasks.filter(task =>
+          task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'
+        ).length;
+        return { total: tasks.length, completed };
+      }
+    }
+
+    const total = (this.currentContext?.plan?.subTasks || [])
+      .filter(task => !backgroundIds.has(task.id)).length;
+    const completed = this.completedResults.filter(
+      r => r.taskId === taskId && !backgroundIds.has(r.subTaskId)
+    ).length;
+    return { total, completed };
   }
 
   /** 处理任务完成消息 */
@@ -2142,7 +3607,7 @@ export class OrchestratorAgent extends EventEmitter {
   }
 
   /** 处理任务失败消息 */
-  private handleTaskFailed(message: TaskFailedMessage): void {
+  private async handleTaskFailed(message: TaskFailedMessage): Promise<void> {
     const { taskId, subTaskId, error, canRetry } = message.payload;
     const subTask = this.pendingTasks.get(subTaskId);
 
@@ -2157,18 +3622,70 @@ export class OrchestratorAgent extends EventEmitter {
       { subTaskId, canRetry }
     );
     console.warn(`[OrchestratorAgent] 子任务尝试失败: ${error}`);
+    if (this.taskStateManager) {
+      if (canRetry) {
+        this.taskStateManager.resetForRetry(subTaskId);
+      } else {
+        this.taskStateManager.updateStatus(subTaskId, 'failed', error);
+      }
+    }
+    if (!canRetry && this.strategyConfig.enableRecovery && this.recoveryHandler && this.taskStateManager) {
+      const failedTask = this.taskStateManager.getTask(subTaskId);
+      if (failedTask) {
+        const decision = await this.resolveRecoveryDecision(failedTask, error);
+        if (decision === 'rollback') {
+          await this.performSessionRollback(failedTask);
+          this.setState('monitoring');
+          return;
+        }
+        if (decision === 'continue') {
+          this.emitUIMessage('progress_update', '已忽略失败，继续执行后续任务', { subTaskId });
+          this.setState('monitoring');
+          return;
+        }
+        this.setState('recovering');
+        this.emitUIMessage('progress_update', `进入失败恢复流程: ${failedTask.description}`, { subTaskId });
+        void this.recoveryHandler
+          .recover(taskId, failedTask, { success: false, summary: error }, error)
+          .then((result) => {
+            this.emitUIMessage('progress_update', `恢复结果: ${result.message}`, { subTaskId });
+          })
+          .finally(() => {
+            this.setState('monitoring');
+          });
+      }
+    }
+  }
+
+  private async resolveRecoveryDecision(
+    failedTask: TaskState,
+    error: string
+  ): Promise<'retry' | 'rollback' | 'continue'> {
+    const canRetry = this.recoveryHandler?.shouldContinueRecovery(failedTask) ?? false;
+    const canRollback = Boolean(this.snapshotManager);
+    if (!this.recoveryConfirmationCallback) {
+      if (canRetry) return 'retry';
+      if (canRollback) return 'rollback';
+      return 'continue';
+    }
+    return this.recoveryConfirmationCallback(failedTask, error, { retry: canRetry, rollback: canRollback });
+  }
+
+  private async performSessionRollback(failedTask: TaskState): Promise<void> {
+    await this.workerPool.cancelAllTasks();
+    this.workerPool.clearExecutionStates();
+    const count = this.snapshotManager?.revertAllChanges() ?? 0;
+    this.taskStateManager?.updateStatus(failedTask.id, 'cancelled', '已回滚');
+    this.emitUIMessage('progress_update', `已回滚 ${count} 个变更`, { subTaskId: failedTask.id });
   }
 
   /** 处理进度汇报消息 */
   private handleProgressReport(message: ProgressReportMessage): void {
     const { taskId, subTaskId, status, progress, message: msg, output } = message.payload;
 
-    if (output) {
-      this.emitUIMessage('worker_output', output, { subTaskId });
-    }
-
     if (status === 'started' || status === 'in_progress') {
       this.taskManager?.updateSubTaskStatus(taskId, subTaskId, 'running');
+      this.taskStateManager?.updateStatus(subTaskId, 'running');
 
       if (status === 'started') {
         const subTask = this.pendingTasks.get(subTaskId)
@@ -2179,13 +3696,21 @@ export class OrchestratorAgent extends EventEmitter {
           data: {
             cli: subTask?.assignedWorker,
             description: subTask?.description,
+            targetFiles: subTask?.targetFiles,
+            reason: subTask?.reason,
           },
         });
       }
     }
+    if (status === 'failed') {
+      this.taskStateManager?.updateStatus(subTaskId, 'failed', msg);
+    }
 
     if (msg) {
       this.emitUIMessage('progress_update', msg, { subTaskId, progress });
+    }
+    if (progress !== undefined) {
+      this.taskStateManager?.updateProgress(subTaskId, progress);
     }
   }
 

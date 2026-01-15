@@ -42,7 +42,10 @@ export class TaskSplitter {
     if (!analysis.splittable) return this.createSingleTask(analysis);
     switch (analysis.category) {
       case 'architecture': return this.splitArchitectureTask(analysis);
-      case 'implement': return this.splitImplementTask(analysis);
+      case 'implement':
+      case 'backend':
+      case 'frontend':
+        return this.splitImplementTask(analysis);
       default: return this.splitByFiles(analysis);
     }
   }
@@ -102,9 +105,9 @@ export class TaskSplitter {
 
   private splitFullStackTask(analysis: TaskAnalysis): SplitResult {
     const subTasks: SubTaskDef[] = [];
-    const backendSelection = this.cliSelector.selectByCategory('implement');
+    const backendSelection = this.cliSelector.selectByCategory('backend');
     subTasks.push({
-      id: generateId(), description: `实现后端 API: ${analysis.prompt}`, category: 'implement',
+      id: generateId(), description: `实现后端 API: ${analysis.prompt}`, category: 'backend',
       assignedCli: backendSelection.cli,
       targetFiles: analysis.targetFiles.filter(f => !f.includes('component') && !f.includes('.css') && !f.includes('.tsx')),
       dependencies: [], priority: 1, cliSelection: backendSelection,

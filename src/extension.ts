@@ -144,6 +144,12 @@ function registerCommands(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('multiCli.startTask', () => {
+      vscode.commands.executeCommand('workbench.view.extension.multiCli');
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand('multiCli.newSession', async () => {
       if (!webviewProvider) {
         vscode.window.showWarningMessage('MultiCLI: 面板未初始化');
@@ -241,7 +247,7 @@ async function detectAndNotifyCLIs(): Promise<{ claudeAvailable: boolean; codexA
 }
 
 /**
- * 扩展停用 - 🆕 增强版：确保所有资源被正确清理
+ * 扩展停用 - 增强版：确保所有资源被正确清理
  */
 export async function deactivate(): Promise<void> {
   console.log('MultiCLI 扩展正在停用...');

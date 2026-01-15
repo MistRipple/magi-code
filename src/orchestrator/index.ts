@@ -12,17 +12,19 @@ export {
   type OrchestratorConfig,
   type OrchestratorPhase,
   type ConfirmationCallback,
-  type RecoveryConfirmationCallback,
 } from './intelligent-orchestrator';
 
 // 独立编排者 Agent
-export { OrchestratorAgent } from './orchestrator-agent';
+export { OrchestratorAgent, type RecoveryConfirmationCallback } from './orchestrator-agent';
 
 // Worker Agent
 export { WorkerAgent, type WorkerConfig } from './worker-agent';
 
 // Worker Pool
 export { WorkerPool, type WorkerPoolConfig } from './worker-pool';
+
+// 风险策略内核
+export { RiskPolicy } from './risk-policy';
 
 // 消息总线
 export { MessageBus, globalMessageBus } from './message-bus';

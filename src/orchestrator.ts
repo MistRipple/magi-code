@@ -96,6 +96,7 @@ export class Orchestrator {
     const map: Record<TaskCategory, CLIType[]> = {
       'architecture': ['claude', 'gemini', 'codex'],
       'implement': ['claude', 'codex', 'gemini'],
+      'backend': ['codex', 'claude', 'gemini'],
       'refactor': ['claude', 'codex', 'gemini'],
       'bugfix': ['claude', 'codex', 'gemini'],
       'debug': ['claude', 'codex', 'gemini'],

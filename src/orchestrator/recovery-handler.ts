@@ -1,6 +1,6 @@
 /**
  * 失败恢复处理器
- * 实现 3-Strike Protocol，负责 Phase 5 的失败恢复
+ * 基于失败类型的恢复治理，负责 Phase 5 的失败恢复
  */
 
 import { CLIType } from '../types';
@@ -11,11 +11,20 @@ import { TaskStateManager, TaskState } from './task-state-manager';
 import { VerificationResult } from './verification-runner';
 
 /** 恢复策略 */
-export type RecoveryStrategy = 
-  | 'retry_same_cli'      // Strike 1: 原 CLI 修复
-  | 'retry_with_context'  // Strike 2: 提供更多上下文
-  | 'escalate_to_claude'  // Strike 3: 升级到 Claude
-  | 'rollback';           // 超过 3 次: 回滚
+export type RecoveryStrategy =
+  | 'retry_same_cli'      // 原 CLI 修复
+  | 'retry_with_context'  // 提供更多上下文
+  | 'escalate_to_claude'  // 升级到 Claude
+  | 'rollback';           // 回滚
+
+/** 失败类型 */
+export type FailureType =
+  | 'tool_failure'
+  | 'compile_failure'
+  | 'test_failure'
+  | 'logic_failure'
+  | 'dependency_failure'
+  | 'unknown';
 
 /** 恢复结果 */
 export interface RecoveryResult {
@@ -72,14 +81,15 @@ export class RecoveryHandler {
     const attempts = failedTask.attempts;
     console.log(`[RecoveryHandler] 开始恢复流程，当前尝试次数: ${attempts}`);
 
+    // 确定恢复策略
+    const failureType = this.classifyFailure(errorDetails, verificationResult);
+
     globalEventBus.emitEvent('recovery:started', {
       taskId,
-      data: { attempts, maxAttempts: this.config.maxAttempts }
+      data: { attempts, maxAttempts: this.config.maxAttempts, failureType }
     });
-
-    // 确定恢复策略
-    const strategy = this.determineStrategy(attempts);
-    console.log(`[RecoveryHandler] 选择策略: ${strategy}`);
+    const strategy = this.determineStrategy(attempts, failureType);
+    console.log(`[RecoveryHandler] 失败类型: ${failureType}，选择策略: ${strategy}`);
 
     let result: RecoveryResult;
 
@@ -116,24 +126,39 @@ export class RecoveryHandler {
   /**
    * 确定恢复策略
    */
-  private determineStrategy(attempts: number): RecoveryStrategy {
-    if (attempts < 1) return 'retry_same_cli';
-    if (attempts < 2) return 'retry_with_context';
-    if (attempts < this.config.maxAttempts) return 'escalate_to_claude';
-    return 'rollback';
+  private determineStrategy(attempts: number, failureType: FailureType): RecoveryStrategy {
+    if (attempts >= this.config.maxAttempts) {
+      return 'rollback';
+    }
+    const plan = this.getRecoveryPlan(failureType);
+    const index = Math.min(attempts, plan.length - 1);
+    return plan[index];
+  }
+
+  private getRecoveryPlan(failureType: FailureType): RecoveryStrategy[] {
+    const plans: Record<FailureType, RecoveryStrategy[]> = {
+      tool_failure: ['retry_same_cli', 'retry_with_context', 'rollback'],
+      compile_failure: ['retry_with_context', 'escalate_to_claude', 'rollback'],
+      test_failure: ['retry_with_context', 'escalate_to_claude', 'rollback'],
+      logic_failure: ['escalate_to_claude', 'rollback'],
+      dependency_failure: ['escalate_to_claude', 'rollback'],
+      unknown: ['retry_with_context', 'escalate_to_claude', 'rollback'],
+    };
+    return plans[failureType] ?? plans.unknown;
   }
 
   /**
-   * Strike 1: 原 CLI 尝试修复
+   * 原 CLI 尝试修复
    */
   private async retrySameCli(
     taskId: string,
     failedTask: TaskState,
     errorDetails: string
   ): Promise<RecoveryResult> {
-    console.log(`[RecoveryHandler] Strike 1: ${failedTask.assignedCli} 尝试修复`);
+    console.log(`[RecoveryHandler] 原 CLI 尝试修复: ${failedTask.assignedCli}`);
 
     this.taskStateManager.resetForRetry(failedTask.id);
+    this.taskStateManager.updateStatus(failedTask.id, 'running');
 
     const fixPrompt = this.buildFixPrompt(failedTask, errorDetails, 'simple');
 
@@ -141,6 +166,7 @@ export class RecoveryHandler {
       const response = await this.cliFactory.sendMessage(failedTask.assignedCli, fixPrompt);
 
       if (response.error) {
+        this.taskStateManager.updateStatus(failedTask.id, 'failed', response.error);
         return {
           success: false,
           strategy: 'retry_same_cli',
@@ -149,6 +175,10 @@ export class RecoveryHandler {
         };
       }
 
+      this.taskStateManager.updateStatus(failedTask.id, 'completed');
+      if (response.content) {
+        this.taskStateManager.setResult(failedTask.id, response.content);
+      }
       return {
         success: true,
         strategy: 'retry_same_cli',
@@ -156,6 +186,7 @@ export class RecoveryHandler {
         message: '原 CLI 修复成功',
       };
     } catch (error) {
+      this.taskStateManager.updateStatus(failedTask.id, 'failed', String(error));
       return {
         success: false,
         strategy: 'retry_same_cli',
@@ -166,16 +197,17 @@ export class RecoveryHandler {
   }
 
   /**
-   * Strike 2: 提供更多上下文重试
+   * 提供更多上下文重试
    */
   private async retryWithContext(
     taskId: string,
     failedTask: TaskState,
     errorDetails: string
   ): Promise<RecoveryResult> {
-    console.log(`[RecoveryHandler] Strike 2: 提供更多上下文给 ${failedTask.assignedCli}`);
+    console.log(`[RecoveryHandler] 提供更多上下文给 ${failedTask.assignedCli}`);
 
     this.taskStateManager.resetForRetry(failedTask.id);
+    this.taskStateManager.updateStatus(failedTask.id, 'running');
 
     const fixPrompt = this.buildFixPrompt(failedTask, errorDetails, 'detailed');
 
@@ -183,6 +215,7 @@ export class RecoveryHandler {
       const response = await this.cliFactory.sendMessage(failedTask.assignedCli, fixPrompt);
 
       if (response.error) {
+        this.taskStateManager.updateStatus(failedTask.id, 'failed', response.error);
         return {
           success: false,
           strategy: 'retry_with_context',
@@ -191,6 +224,10 @@ export class RecoveryHandler {
         };
       }
 
+      this.taskStateManager.updateStatus(failedTask.id, 'completed');
+      if (response.content) {
+        this.taskStateManager.setResult(failedTask.id, response.content);
+      }
       return {
         success: true,
         strategy: 'retry_with_context',
@@ -198,6 +235,7 @@ export class RecoveryHandler {
         message: '带上下文修复成功',
       };
     } catch (error) {
+      this.taskStateManager.updateStatus(failedTask.id, 'failed', String(error));
       return {
         success: false,
         strategy: 'retry_with_context',
@@ -208,16 +246,17 @@ export class RecoveryHandler {
   }
 
   /**
-   * Strike 3: 升级到 Claude 处理
+   * 升级到 Claude 处理
    */
   private async escalateToClaude(
     taskId: string,
     failedTask: TaskState,
     errorDetails: string
   ): Promise<RecoveryResult> {
-    console.log(`[RecoveryHandler] Strike 3: 升级到 ${this.config.escalateCli}`);
+    console.log(`[RecoveryHandler] 升级到 ${this.config.escalateCli}`);
 
     this.taskStateManager.resetForRetry(failedTask.id);
+    this.taskStateManager.updateStatus(failedTask.id, 'running');
 
     const escalatePrompt = this.buildEscalatePrompt(failedTask, errorDetails);
 
@@ -225,6 +264,7 @@ export class RecoveryHandler {
       const response = await this.cliFactory.sendMessage(this.config.escalateCli, escalatePrompt);
 
       if (response.error) {
+        this.taskStateManager.updateStatus(failedTask.id, 'failed', response.error);
         return {
           success: false,
           strategy: 'escalate_to_claude',
@@ -233,6 +273,10 @@ export class RecoveryHandler {
         };
       }
 
+      this.taskStateManager.updateStatus(failedTask.id, 'completed');
+      if (response.content) {
+        this.taskStateManager.setResult(failedTask.id, response.content);
+      }
       return {
         success: true,
         strategy: 'escalate_to_claude',
@@ -240,6 +284,7 @@ export class RecoveryHandler {
         message: 'Claude 修复成功',
       };
     } catch (error) {
+      this.taskStateManager.updateStatus(failedTask.id, 'failed', String(error));
       return {
         success: false,
         strategy: 'escalate_to_claude',
@@ -250,13 +295,13 @@ export class RecoveryHandler {
   }
 
   /**
-   * 超过最大重试次数：执行回滚
+   * 执行回滚
    */
   private async performRollback(
     taskId: string,
     failedTask: TaskState
   ): Promise<RecoveryResult> {
-    console.log(`[RecoveryHandler] 超过最大重试次数，执行回滚`);
+    console.log(`[RecoveryHandler] 执行回滚`);
 
     if (!this.config.enableRollback) {
       return {
@@ -286,6 +331,7 @@ export class RecoveryHandler {
         rolledBack: true,
       };
     } catch (error) {
+      this.taskStateManager.updateStatus(failedTask.id, 'failed', String(error));
       return {
         success: false,
         strategy: 'rollback',
@@ -294,6 +340,26 @@ export class RecoveryHandler {
         rolledBack: false,
       };
     }
+  }
+
+  private classifyFailure(errorDetails: string, verificationResult: VerificationResult): FailureType {
+    const text = `${errorDetails} ${verificationResult?.summary || ''}`.toLowerCase();
+    if (text.includes('timeout') || text.includes('超时') || text.includes('process')) {
+      return 'tool_failure';
+    }
+    if (text.includes('compile') || text.includes('tsc') || text.includes('build') || text.includes('编译')) {
+      return 'compile_failure';
+    }
+    if (text.includes('test') || text.includes('测试') || text.includes('jest') || text.includes('vitest')) {
+      return 'test_failure';
+    }
+    if (text.includes('dependency') || text.includes('依赖') || text.includes('module not found')) {
+      return 'dependency_failure';
+    }
+    if (text.includes('logic') || text.includes('逻辑') || text.includes('contract') || text.includes('契约')) {
+      return 'logic_failure';
+    }
+    return 'unknown';
   }
 
   /**
@@ -392,4 +458,3 @@ ${errorDetails}
     };
   }
 }
-

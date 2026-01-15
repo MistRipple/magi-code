@@ -185,11 +185,15 @@ async function testSimpleExecution(orchestrator, cliAvailable) {
   try {
     const result = await orchestrator.execute('列出当前目录下的 src 文件夹结构，只需要简单描述即可');
 
-    logResult('任务执行完成', result.success, result.success ? '成功' : result.error);
+    const isSuccess = typeof result === 'string' ? result.trim().length > 0 : result.success;
+    const errorDetail = typeof result === 'string' ? '无响应' : result.error;
+    logResult('任务执行完成', isSuccess, isSuccess ? '成功' : errorDetail);
     logResult('收到事件', events.length > 0, `${events.length} 个事件`);
     log(`  事件序列: ${events.join(' -> ')}`, 'blue');
 
-    if (result.content) {
+    if (typeof result === 'string' && result) {
+      log(`  响应内容预览: ${result.substring(0, 100)}...`, 'blue');
+    } else if (result && result.content) {
       log(`  响应内容预览: ${result.content.substring(0, 100)}...`, 'blue');
     }
   } catch (error) {
@@ -247,4 +251,3 @@ async function runAllTests() {
 
 // 运行测试
 runAllTests().catch(console.error);
-
