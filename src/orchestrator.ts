@@ -4,7 +4,7 @@
  */
 
 import { CLIType, Task, SubTask, TaskCategory, WorkerResult, ExecutionMode } from './types';
-import { SessionManager } from './session-manager';
+import { UnifiedSessionManager } from './session';
 import { TaskManager } from './task-manager';
 import { SnapshotManager } from './snapshot-manager';
 import { CLIDetector } from './cli-detector';
@@ -17,7 +17,7 @@ import { globalEventBus } from './events';
 /** Orchestrator 配置 */
 export interface OrchestratorOptions {
   workspaceRoot: string;
-  sessionManager: SessionManager;
+  sessionManager: UnifiedSessionManager;
   taskManager: TaskManager;
   snapshotManager: SnapshotManager;
   mode?: ExecutionMode;

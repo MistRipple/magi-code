@@ -9,7 +9,7 @@ export * from './types';
 export { EventEmitter, globalEventBus } from './events';
 
 // 管理器
-export { SessionManager } from './session-manager';
+export { UnifiedSessionManager, UnifiedSession, SessionMessage, FileSnapshotMeta, SessionMeta, SessionStatus } from './session';
 export { TaskManager } from './task-manager';
 export { SnapshotManager } from './snapshot-manager';
 export { DiffGenerator, DiffResult } from './diff-generator';

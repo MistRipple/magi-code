@@ -278,20 +278,16 @@
     .unified-card.card-type-warning { border-color: var(--color-warning); background: var(--color-warning-bg); }
     .unified-card.card-type-warning .card-header { background: rgba(245, 158, 11, 0.15); }
 
-    /* 系统提示消息（轻量级内联样式，不使用完整卡片） */
-    .system-notice { display: flex; align-items: center; gap: 8px; padding: 6px 12px; margin: 4px 0; font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); border-radius: var(--radius-2); background: transparent; width: 100%; box-sizing: border-box; }
-    .system-notice-icon { width: 14px; height: 14px; flex-shrink: 0; opacity: 0.7; }
-    .system-notice-icon svg { width: 14px; height: 14px; }
+    /* 系统提示消息（简洁样式，无边框，保留色彩） */
+    .system-notice { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 4px 12px; margin: 2px auto; font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); width: fit-content; max-width: 90%; }
+    .system-notice-icon { flex-shrink: 0; width: 14px; height: 14px; }
+    .system-notice-icon svg { width: 14px; height: 14px; fill: currentColor; display: block; }
     .system-notice.info { color: var(--vscode-textLink-foreground); }
-    .system-notice.info .system-notice-icon svg { fill: var(--vscode-textLink-foreground); }
     .system-notice.success { color: var(--vscode-charts-green); }
-    .system-notice.success .system-notice-icon svg { fill: var(--vscode-charts-green); }
     .system-notice.warning { color: var(--vscode-charts-yellow); }
-    .system-notice.warning .system-notice-icon svg { fill: var(--vscode-charts-yellow); }
     .system-notice.error { color: var(--vscode-errorForeground); }
-    .system-notice.error .system-notice-icon svg { fill: var(--vscode-errorForeground); }
-    .system-notice-text { flex: 1; }
-    .system-notice-time { font-size: 10px; opacity: 0.6; }
+    .system-notice-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .system-notice-time { font-size: 10px; opacity: 0.6; margin-left: 4px; }
 
     /* 统一卡片内容样式 - 用于卡片内部的特定内容区域 */
 

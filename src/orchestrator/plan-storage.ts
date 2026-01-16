@@ -21,29 +21,40 @@ export interface PlanReview {
   reviewedAt: number;
 }
 
+/**
+ * 计划存储管理器
+ *
+ * 存储位置：.multicli/sessions/{sessionId}/plans/
+ * 每个会话的计划存储在对应会话目录下
+ */
 export class PlanStorage {
-  private plansDir: string;
+  private workspaceRoot: string;
 
   constructor(workspaceRoot: string) {
-    this.plansDir = path.join(workspaceRoot, '.multicli', 'plans');
-    this.ensureDir();
+    this.workspaceRoot = workspaceRoot;
   }
 
-  private ensureDir(): void {
-    if (!fs.existsSync(this.plansDir)) {
-      fs.mkdirSync(this.plansDir, { recursive: true });
+  /** 获取会话的计划目录 */
+  private getPlansDir(sessionId: string): string {
+    return path.join(this.workspaceRoot, '.multicli', 'sessions', sessionId, 'plans');
+  }
+
+  private ensureDir(sessionId: string): void {
+    const plansDir = this.getPlansDir(sessionId);
+    if (!fs.existsSync(plansDir)) {
+      fs.mkdirSync(plansDir, { recursive: true });
     }
   }
 
   savePlan(record: PlanRecord): PlanRecord {
-    this.ensureDir();
-    const filePath = path.join(this.plansDir, `${record.id}.json`);
+    this.ensureDir(record.sessionId);
+    const filePath = path.join(this.getPlansDir(record.sessionId), `${record.id}.json`);
     fs.writeFileSync(filePath, JSON.stringify(record, null, 2), 'utf-8');
     return record;
   }
 
-  getPlan(planId: string): PlanRecord | null {
-    const filePath = path.join(this.plansDir, `${planId}.json`);
+  getPlan(planId: string, sessionId: string): PlanRecord | null {
+    const filePath = path.join(this.getPlansDir(sessionId), `${planId}.json`);
     if (!fs.existsSync(filePath)) return null;
     try {
       const content = fs.readFileSync(filePath, 'utf-8');
@@ -55,13 +66,14 @@ export class PlanStorage {
   }
 
   listPlansForSession(sessionId: string): PlanRecord[] {
-    if (!fs.existsSync(this.plansDir)) return [];
-    const files = fs.readdirSync(this.plansDir).filter(f => f.endsWith('.json'));
+    const plansDir = this.getPlansDir(sessionId);
+    if (!fs.existsSync(plansDir)) return [];
+    const files = fs.readdirSync(plansDir).filter(f => f.endsWith('.json'));
     const records: PlanRecord[] = [];
     for (const file of files) {
       const planId = file.replace(/\.json$/, '');
-      const record = this.getPlan(planId);
-      if (record && record.sessionId === sessionId) {
+      const record = this.getPlan(planId, sessionId);
+      if (record) {
         records.push(record);
       }
     }

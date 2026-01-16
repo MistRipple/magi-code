@@ -12,22 +12,33 @@ export interface ExecutionState {
   updatedAt: number;
 }
 
+/**
+ * 执行状态管理器
+ *
+ * 存储位置：.multicli/sessions/{sessionId}/execution-state.json
+ * 每个会话的执行状态存储在对应会话目录下
+ */
 export class ExecutionStateManager {
-  private stateDir: string;
+  private workspaceRoot: string;
 
   constructor(workspaceRoot: string) {
-    this.stateDir = path.join(workspaceRoot, '.multicli', 'execution-state');
-    this.ensureDir();
+    this.workspaceRoot = workspaceRoot;
   }
 
-  private ensureDir(): void {
-    if (!fs.existsSync(this.stateDir)) {
-      fs.mkdirSync(this.stateDir, { recursive: true });
+  /** 获取会话的执行状态文件路径 */
+  private getStatePath(sessionId: string): string {
+    return path.join(this.workspaceRoot, '.multicli', 'sessions', sessionId, 'execution-state.json');
+  }
+
+  private ensureDir(sessionId: string): void {
+    const sessionDir = path.join(this.workspaceRoot, '.multicli', 'sessions', sessionId);
+    if (!fs.existsSync(sessionDir)) {
+      fs.mkdirSync(sessionDir, { recursive: true });
     }
   }
 
   loadState(sessionId: string): ExecutionState | null {
-    const filePath = path.join(this.stateDir, `${sessionId}.json`);
+    const filePath = this.getStatePath(sessionId);
     if (!fs.existsSync(filePath)) return null;
     try {
       const content = fs.readFileSync(filePath, 'utf-8');
@@ -39,13 +50,13 @@ export class ExecutionStateManager {
   }
 
   saveState(state: ExecutionState): void {
-    this.ensureDir();
-    const filePath = path.join(this.stateDir, `${state.sessionId}.json`);
+    this.ensureDir(state.sessionId);
+    const filePath = this.getStatePath(state.sessionId);
     fs.writeFileSync(filePath, JSON.stringify(state, null, 2), 'utf-8');
   }
 
   clearState(sessionId: string): void {
-    const filePath = path.join(this.stateDir, `${sessionId}.json`);
+    const filePath = this.getStatePath(sessionId);
     if (fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
     }

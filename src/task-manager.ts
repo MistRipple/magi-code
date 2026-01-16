@@ -4,7 +4,7 @@
  */
 
 import { Task, SubTask, TaskStatus, SubTaskStatus, CLIType, WorkerType } from './types';
-import { SessionManager } from './session-manager';
+import { UnifiedSessionManager } from './session';
 import { globalEventBus } from './events';
 
 /** 生成唯一 ID */
@@ -16,9 +16,9 @@ function generateId(): string {
  * Task 管理器
  */
 export class TaskManager {
-  private sessionManager: SessionManager;
+  private sessionManager: UnifiedSessionManager;
 
-  constructor(sessionManager: SessionManager) {
+  constructor(sessionManager: UnifiedSessionManager) {
     this.sessionManager = sessionManager;
   }
 

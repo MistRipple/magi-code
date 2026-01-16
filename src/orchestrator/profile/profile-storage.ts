@@ -1,9 +1,14 @@
 /**
  * Worker Profile Storage - 画像配置持久化
  *
- * 配置存储位置：~/.multicli/config/
- * - 用户级别配置，一次配置，所有项目共享
- * - 项目目录 .multicli/ 只存储会话数据
+ * 配置存储位置：~/.multicli/
+ * - config.json      - 全局配置（包含 promptEnhance 等）
+ * - categories.json  - 任务分类配置
+ * - claude.json      - Claude Worker 画像
+ * - codex.json       - Codex Worker 画像
+ * - gemini.json      - Gemini Worker 画像
+ *
+ * 扁平化结构，所有配置文件直接在 ~/.multicli/ 下
  */
 
 import * as fs from 'fs';
@@ -25,8 +30,8 @@ export interface StoredProfileConfig {
 
 /** 配置存储管理器 */
 export class ProfileStorage {
-  /** 配置目录：~/.multicli/config/ */
-  private static readonly CONFIG_DIR = path.join(os.homedir(), '.multicli', 'config');
+  /** 配置目录：~/.multicli/ */
+  private static readonly CONFIG_DIR = path.join(os.homedir(), '.multicli');
 
   // ============================================================================
   // 配置读写
@@ -47,19 +52,16 @@ export class ProfileStorage {
     if (!fs.existsSync(configDir)) return undefined;
 
     const config: StoredProfileConfig = { workers: {} };
-    const workersDir = path.join(configDir, 'workers');
 
-    // 读取各 Worker 配置
-    if (fs.existsSync(workersDir)) {
-      for (const workerType of ['claude', 'codex', 'gemini'] as const) {
-        const filePath = path.join(workersDir, `${workerType}.json`);
-        if (fs.existsSync(filePath)) {
-          try {
-            const content = fs.readFileSync(filePath, 'utf-8');
-            config.workers[workerType] = JSON.parse(content);
-          } catch (e) {
-            console.warn(`[ProfileStorage] 读取 ${workerType} 配置失败:`, e);
-          }
+    // 读取各 Worker 配置（直接在 ~/.multicli/ 下）
+    for (const workerType of ['claude', 'codex', 'gemini'] as const) {
+      const filePath = path.join(configDir, `${workerType}.json`);
+      if (fs.existsSync(filePath)) {
+        try {
+          const content = fs.readFileSync(filePath, 'utf-8');
+          config.workers[workerType] = JSON.parse(content);
+        } catch (e) {
+          console.warn(`[ProfileStorage] 读取 ${workerType} 配置失败:`, e);
         }
       }
     }
@@ -88,16 +90,15 @@ export class ProfileStorage {
    */
   async saveConfig(config: StoredProfileConfig): Promise<void> {
     const configDir = ProfileStorage.CONFIG_DIR;
-    const workersDir = path.join(configDir, 'workers');
 
     // 确保目录存在
-    if (!fs.existsSync(workersDir)) {
-      fs.mkdirSync(workersDir, { recursive: true });
+    if (!fs.existsSync(configDir)) {
+      fs.mkdirSync(configDir, { recursive: true });
     }
 
-    // 保存各 Worker 配置
+    // 保存各 Worker 配置（直接在 ~/.multicli/ 下）
     for (const [workerType, workerConfig] of Object.entries(config.workers)) {
-      const filePath = path.join(workersDir, `${workerType}.json`);
+      const filePath = path.join(configDir, `${workerType}.json`);
       if (workerConfig && Object.keys(workerConfig).length > 0) {
         fs.writeFileSync(filePath, JSON.stringify(workerConfig, null, 2), 'utf-8');
       } else if (fs.existsSync(filePath)) {
@@ -115,12 +116,17 @@ export class ProfileStorage {
   }
 
   /**
-   * 清除配置
+   * 清除所有 Worker 和分类配置
    */
   async clearConfig(): Promise<void> {
     const configDir = ProfileStorage.CONFIG_DIR;
-    if (fs.existsSync(configDir)) {
-      fs.rmSync(configDir, { recursive: true });
+    // 只删除 Worker 和分类配置文件，保留 config.json 等其他配置
+    const filesToDelete = ['claude.json', 'codex.json', 'gemini.json', 'categories.json'];
+    for (const file of filesToDelete) {
+      const filePath = path.join(configDir, file);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
     }
   }
 
