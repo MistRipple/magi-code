@@ -12,6 +12,10 @@
  * - 编排者是"永远在线"的协调者
  * - 100% 时间用于监控和协调
  * - 可以立即响应任何事件
+ *
+ * Intent Gate 架构（v0.6.0）：
+ * - Phase 0: 意图门控，在任务分析前先判断用户意图
+ * - 核心原则：NEVER START IMPLEMENTING, UNLESS USER WANTS YOU TO IMPLEMENT SOMETHING EXPLICITLY
  */
 
 import { EventEmitter } from 'events';
@@ -30,6 +34,7 @@ import { TaskStateManager, TaskState } from './task-state-manager';
 import { PlanStorage, PlanRecord, PlanReview } from './plan-storage';
 import { PlanTodoManager } from './plan-todo';
 import { ExecutionStateManager, ExecutionStateStatus } from './execution-state';
+import { IntentGate, IntentHandlerMode, IntentType } from './intent-gate';
 import {
   WorkerType,
   OrchestratorState,
@@ -205,7 +210,7 @@ export class OrchestratorAgent extends EventEmitter {
   private executionStateManager: ExecutionStateManager | null = null;
   private planTodoManager: PlanTodoManager | null = null;
 
- 
+
   private executionStats: ExecutionStats;
   private riskPolicy: RiskPolicy;
   private taskAnalyzer: TaskAnalyzer;
@@ -214,6 +219,9 @@ export class OrchestratorAgent extends EventEmitter {
   private aiTaskDecomposer: AITaskDecomposer;
   private strategyConfig: StrategyConfig;
   private permissions: PermissionMatrix;
+
+  // 🆕 Intent Gate - 意图门控
+  private intentGate: IntentGate;
 
   private _state: OrchestratorState = 'idle';
   private currentContext: TaskContext | null = null;
@@ -259,7 +267,7 @@ export class OrchestratorAgent extends EventEmitter {
       this.planTodoManager = new PlanTodoManager(this.workspaceRoot);
     }
 
-   
+
     this.executionStats = new ExecutionStats();
     if (this.config.cliSelection?.healthThreshold !== undefined) {
       this.executionStats.configure({ healthThreshold: this.config.cliSelection.healthThreshold });
@@ -278,6 +286,9 @@ export class OrchestratorAgent extends EventEmitter {
     this.aiTaskDecomposer = new AITaskDecomposer(this.cliFactory, this.cliSelector);
     this.strategyConfig = this.resolveStrategyConfig();
     this.permissions = this.resolvePermissions();
+
+    // 🆕 初始化 Intent Gate - 意图门控
+    this.intentGate = new IntentGate();
 
     // 创建 Worker Pool，集成执行统计和快照管理
     this.workerPool = new WorkerPool({
@@ -871,9 +882,25 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     await this.ensureContext(contextSessionId, userPrompt);
 
     try {
-      // 🆕 Phase 0: 需求澄清（如果设置了澄清回调）
+      // 🆕 Phase 0: Intent Gate - 意图门控
+      // 核心原则：NEVER START IMPLEMENTING, UNLESS USER WANTS YOU TO IMPLEMENT SOMETHING EXPLICITLY
+      const intentResult = this.intentGate.process(userPrompt);
+      console.log(`[OrchestratorAgent] Intent Gate: ${intentResult.classification.type}, ` +
+                  `confidence: ${(intentResult.classification.confidence * 100).toFixed(0)}%, ` +
+                  `mode: ${intentResult.recommendedMode}`);
+
+      // 根据意图类型路由处理
+      if (intentResult.skipTaskAnalysis) {
+        const response = await this.handleIntentDirectly(userPrompt, intentResult, taskId);
+        if (response !== null) {
+          return response;
+        }
+        // 如果 handleIntentDirectly 返回 null，继续走任务分析流程
+      }
+
+      // Phase 0.5: 需求澄清（如果设置了澄清回调且意图门控未处理）
       let clarifiedPrompt = userPrompt;
-      if (this.clarificationCallback) {
+      if (this.clarificationCallback && !intentResult.needsClarification) {
         const assessment = await this.assessAmbiguity(userPrompt);
         if (assessment.isAmbiguous && assessment.questions.length > 0) {
           clarifiedPrompt = await this.clarifyRequirements(userPrompt, assessment);
@@ -1335,6 +1362,160 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     this.reviewAttempts.clear();
     this.finalizationPromises.clear();
     this.warnedReviewSkipForDependencies = false;
+  }
+
+  // =========================================================================
+  // Phase 0: Intent Gate - 意图门控
+  // =========================================================================
+
+  /**
+   * 直接处理不需要任务分析的意图
+   * @returns 处理结果，如果返回 null 则继续走任务分析流程
+   */
+  private async handleIntentDirectly(
+    userPrompt: string,
+    intentResult: import('./intent-gate').IntentGateResult,
+    taskId: string
+  ): Promise<string | null> {
+    const { recommendedMode, classification, needsClarification, clarificationQuestions } = intentResult;
+
+    switch (recommendedMode) {
+      case IntentHandlerMode.ASK:
+        // 问答模式：直接调用编排者 Claude 回答
+        console.log('[OrchestratorAgent] Intent Gate: ASK 模式，直接回答');
+        return await this.executeAskMode(userPrompt, taskId);
+
+      case IntentHandlerMode.CLARIFY:
+        // 澄清模式：请求用户提供更多信息
+        console.log('[OrchestratorAgent] Intent Gate: CLARIFY 模式，请求澄清');
+        if (this.clarificationCallback && clarificationQuestions && clarificationQuestions.length > 0) {
+          // 使用现有的澄清回调接口
+          const result = await this.clarificationCallback(
+            clarificationQuestions,
+            classification.reason,
+            Math.round((1 - classification.confidence) * 100), // 转换为模糊度分数
+            userPrompt
+          );
+          if (result && result.additionalInfo) {
+            // 用户提供了澄清信息，重新处理
+            const clarifiedPrompt = `${userPrompt}\n\n## 用户补充信息\n${result.additionalInfo}`;
+            this.currentContext!.userPrompt = clarifiedPrompt;
+            return null; // 继续走任务分析流程
+          }
+        }
+        // 没有澄清回调或用户未提供澄清，降级为问答
+        return await this.executeAskMode(userPrompt, taskId);
+
+      case IntentHandlerMode.EXPLORE:
+        // 探索模式：分析代码库后回答
+        console.log('[OrchestratorAgent] Intent Gate: EXPLORE 模式，探索分析');
+        return await this.executeExploreMode(userPrompt, taskId);
+
+      case IntentHandlerMode.DIRECT:
+        // 直接执行模式：简单操作，无需计划
+        console.log('[OrchestratorAgent] Intent Gate: DIRECT 模式，直接执行');
+        // 对于简单操作，仍然走任务分析但跳过确认
+        return null;
+
+      case IntentHandlerMode.TASK:
+        // 任务模式：需要完整的任务分析和执行
+        console.log('[OrchestratorAgent] Intent Gate: TASK 模式，进入任务分析');
+        return null; // 继续走任务分析流程
+
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * 问答模式：编排者 Claude 直接回答
+   */
+  private async executeAskMode(userPrompt: string, taskId: string): Promise<string> {
+    this.setState('analyzing'); // 使用 analyzing 状态表示正在处理
+    this.emitUIMessage('progress_update', '正在回答您的问题...');
+
+    const context = this.contextManager?.getContext() || '';
+    const prompt = context
+      ? `请结合以下项目上下文回答用户问题。\n\n## 项目上下文\n${this.truncateContext(context)}\n\n## 用户问题\n${userPrompt}`
+      : userPrompt;
+
+    const response = await this.cliFactory.sendMessage(
+      'claude',
+      prompt,
+      undefined,
+      {
+        source: 'orchestrator',
+        streamToUI: true,
+        adapterRole: 'orchestrator',
+        messageMeta: {
+          taskId,
+          intent: 'ask',
+          contextSnapshot: this.buildContextSnapshot(),
+        },
+      }
+    );
+
+    this.recordOrchestratorTokens(response.tokenUsage);
+    const content = response.content || '';
+
+    await this.saveAndCompressMemory(content);
+    this.setState('completed');
+    this.currentContext!.endTime = Date.now();
+
+    return content;
+  }
+
+  /**
+   * 探索模式：分析代码库后回答
+   */
+  private async executeExploreMode(userPrompt: string, taskId: string): Promise<string> {
+    this.setState('analyzing'); // 使用 analyzing 状态表示正在处理
+    this.emitUIMessage('progress_update', '正在分析代码库...');
+
+    const context = this.contextManager?.getContext() || '';
+    const prompt = `你是一个代码分析专家。请分析以下项目上下文，然后回答用户的问题。
+
+## 项目上下文
+${this.truncateContext(context)}
+
+## 用户问题
+${userPrompt}
+
+请提供详细的分析和解答。`;
+
+    const response = await this.cliFactory.sendMessage(
+      'claude',
+      prompt,
+      undefined,
+      {
+        source: 'orchestrator',
+        streamToUI: true,
+        adapterRole: 'orchestrator',
+        messageMeta: {
+          taskId,
+          intent: 'explore',
+          contextSnapshot: this.buildContextSnapshot(),
+        },
+      }
+    );
+
+    this.recordOrchestratorTokens(response.tokenUsage);
+    const content = response.content || '';
+
+    await this.saveAndCompressMemory(content);
+    this.setState('completed');
+    this.currentContext!.endTime = Date.now();
+
+    return content;
+  }
+
+  /**
+   * 截断上下文（避免过长）
+   */
+  private truncateContext(context: string, maxChars: number = 6000): string {
+    const trimmed = context.trim();
+    if (trimmed.length <= maxChars) return trimmed;
+    return trimmed.slice(0, maxChars) + '\n...（上下文已截断）';
   }
 
   // =========================================================================
