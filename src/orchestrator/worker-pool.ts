@@ -7,6 +7,7 @@
  * - 监控 Worker 状态
  * - CLI 降级和故障转移
  * - 任务依赖图调度
+ * - 🆕 Worker 画像加载和注入
  */
 
 import { EventEmitter } from 'events';
@@ -18,6 +19,7 @@ import { TaskDependencyGraph, DependencyAnalysis, ExecutionBatch } from './task-
 import { FileLockManager } from './file-lock-manager';
 import { SnapshotManager } from '../snapshot-manager';
 import { PermissionMatrix } from '../types';
+import { ProfileLoader, WorkerProfile } from './profile';
 import {
   WorkerType,
   WorkerState,
@@ -45,6 +47,8 @@ export interface WorkerPoolConfig {
   snapshotManager?: SnapshotManager;
   /** 权限矩阵（用于 Worker Prompt 约束） */
   permissions?: PermissionMatrix;
+  /** 🆕 工作区路径（用于加载项目配置） */
+  workspacePath?: string;
 }
 
 /** 执行调度配置 */
@@ -132,12 +136,16 @@ export class WorkerPool extends EventEmitter {
   private fileLockManager = new FileLockManager();
   private cancelGeneration = 0;
 
- 
+
   private executionStats?: ExecutionStats;
   private enableFallback: boolean;
- 
+
   private snapshotManager?: SnapshotManager;
   private permissions: PermissionMatrix;
+
+  // 🆕 Worker 画像系统
+  private profileLoader?: ProfileLoader;
+  private workspacePath: string;
 
   constructor(config: WorkerPoolConfig) {
     super();
@@ -146,11 +154,12 @@ export class WorkerPool extends EventEmitter {
     this.orchestratorId = config.orchestratorId || 'orchestrator';
     this.schedulingConfig = { ...DEFAULT_SCHEDULING_CONFIG, ...config.scheduling };
 
-   
+
     this.executionStats = config.executionStats;
     this.enableFallback = config.enableFallback ?? true;
     this.snapshotManager = config.snapshotManager;
     this.permissions = config.permissions || { allowEdit: true, allowBash: true, allowWeb: true };
+    this.workspacePath = config.workspacePath || '';
 
     this.setupMessageHandlers();
   }
@@ -175,9 +184,39 @@ export class WorkerPool extends EventEmitter {
   }
 
   /**
+   * 🆕 加载 Worker 画像配置
+   */
+  async loadProfiles(): Promise<void> {
+    if (!this.workspacePath) {
+      console.log('[WorkerPool] 未设置工作区路径，跳过画像加载');
+      return;
+    }
+
+    this.profileLoader = new ProfileLoader(this.workspacePath);
+    await this.profileLoader.load();
+    console.log('[WorkerPool] Worker 画像加载完成');
+
+    // 更新已有 Worker 的画像
+    for (const [type, worker] of this.workers) {
+      const profile = this.profileLoader.getProfile(type);
+      worker.setProfile(profile);
+    }
+  }
+
+  /**
+   * 🆕 获取 ProfileLoader
+   */
+  getProfileLoader(): ProfileLoader | undefined {
+    return this.profileLoader;
+  }
+
+  /**
    * 初始化所有 Worker
    */
   async initialize(): Promise<void> {
+    // 🆕 先加载画像配置
+    await this.loadProfiles();
+
     const workerTypes: WorkerType[] = ['claude', 'codex', 'gemini'];
 
     for (const type of workerTypes) {
@@ -195,13 +234,17 @@ export class WorkerPool extends EventEmitter {
       return this.workers.get(type)!;
     }
 
+    // 🆕 获取 Worker 画像
+    const profile = this.profileLoader?.getProfile(type);
+
     const worker = new WorkerAgent({
       type,
       cliFactory: this.cliFactory,
       messageBus: this.messageBus,
       orchestratorId: this.orchestratorId,
-      snapshotManager: this.snapshotManager, 
+      snapshotManager: this.snapshotManager,
       permissions: this.permissions,
+      profile, // 🆕 传递画像
     });
 
     // 监听 Worker 状态变更
@@ -225,8 +268,8 @@ export class WorkerPool extends EventEmitter {
     });
 
     this.workers.set(type, worker);
-    console.log(`[WorkerPool] 创建 Worker: ${worker.id}`);
-    
+    console.log(`[WorkerPool] 创建 Worker: ${worker.id}${profile ? ' (已加载画像)' : ''}`);
+
     return worker;
   }
 

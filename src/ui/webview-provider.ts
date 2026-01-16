@@ -38,6 +38,7 @@ import { IntelligentOrchestrator } from '../orchestrator/intelligent-orchestrato
 import { AceIndexManager } from '../ace/index-manager';
 import { normalizeOrchestratorMessage, isInternalStateMessage } from '../normalizer';
 import { parseContentToBlocks, ContentBlock, sanitizeCliOutput } from '../utils/content-parser';
+import { ProfileStorage, StoredProfileConfig } from '../orchestrator/profile';
 
 export class WebviewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'multiCli.mainView';
@@ -1415,8 +1416,20 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'checkCliStatus':
-       
+
         this.sendCliStatus();
+        break;
+
+      case 'getProfileConfig':
+        this.sendProfileConfig();
+        break;
+
+      case 'saveProfileConfig':
+        await this.handleSaveProfileConfig(message.data);
+        break;
+
+      case 'resetProfileConfig':
+        await this.handleResetProfileConfig();
         break;
 
       case 'clearAllTasks':
@@ -1875,6 +1888,149 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.intelligentOrchestrator.resetOrchestratorTokenUsage();
     this.sendExecutionStats();
     this.postMessage({ type: 'toast', message: '执行统计已重置', toastType: 'info' });
+  }
+
+  // ============================================================================
+  // 画像配置处理
+  // ============================================================================
+
+  /** 发送画像配置到 UI */
+  private sendProfileConfig(): void {
+    const storage = new ProfileStorage();
+    const storedConfig = storage.getConfig();
+
+    // 默认配置 - 与系统画像定义完全一致
+    const defaultWorkers: Record<string, any> = {
+      claude: {
+        role: '你是一个资深软件架构师，专注于系统设计、代码质量和可维护性。\n你的代码应该是清晰、可扩展、易于测试的。',
+        focus: ['优先考虑代码的可维护性和扩展性', '在修改前先分析影响范围和依赖关系', '对于跨模块修改，先确认接口契约', '保持代码风格一致性', '添加必要的类型定义和注释'],
+        constraints: ['不要进行不必要的重构', '避免引入新的依赖，除非必要', '大规模修改前先与编排者确认', '保持向后兼容性，除非明确要求破坏性变更'],
+      },
+      codex: {
+        role: '你是一个高效的代码执行者，专注于快速、准确地完成具体任务。\n你的目标是用最少的代码变更解决问题。',
+        focus: ['精准定位问题，最小化修改范围', '快速实现，不过度设计', '确保修改不引入新问题', '添加必要的错误处理'],
+        constraints: ['不要进行架构级别的修改', '保持修改范围在任务描述内', '遇到需要架构决策的问题，反馈给编排者'],
+      },
+      gemini: {
+        role: '你是一个前端专家和文档专家，专注于用户界面和开发者体验。\n你的代码应该是美观、易用、可访问的。',
+        focus: ['关注用户体验和交互细节', '保持 UI 一致性和美观性', '确保响应式设计和可访问性', '编写清晰的文档和注释'],
+        constraints: ['不要修改后端 API 逻辑', '遵循已定义的接口契约', '样式修改保持设计系统一致性'],
+      },
+    };
+
+    const defaultCategories: Record<string, string> = {
+      architecture: 'claude',
+      bugfix: 'codex',
+      frontend: 'gemini',
+      implement: 'claude',
+      refactor: 'claude',
+      test: 'codex',
+      document: 'claude',
+      general: 'claude',
+    };
+
+    // 构建 UI 需要的格式，合并存储配置和默认配置
+    const uiConfig: any = {
+      workers: { ...defaultWorkers },
+      categories: { ...defaultCategories },
+      configPath: ProfileStorage.getConfigDir(),
+    };
+
+    // 覆盖存储的 Worker 配置
+    if (storedConfig?.workers) {
+      for (const [workerType, workerConfig] of Object.entries(storedConfig.workers)) {
+        if (workerConfig) {
+          uiConfig.workers[workerType] = {
+            role: workerConfig.guidance?.role || defaultWorkers[workerType]?.role || '',
+            focus: workerConfig.guidance?.focus || defaultWorkers[workerType]?.focus || [],
+            constraints: workerConfig.guidance?.constraints || defaultWorkers[workerType]?.constraints || [],
+          };
+        }
+      }
+    }
+
+    // 覆盖存储的分类配置
+    if (storedConfig?.categories?.categories) {
+      for (const [category, categoryConfig] of Object.entries(storedConfig.categories.categories)) {
+        if (categoryConfig?.defaultWorker) {
+          uiConfig.categories[category] = categoryConfig.defaultWorker;
+        }
+      }
+    }
+
+    this.postMessage({ type: 'profileConfig', config: uiConfig } as any);
+  }
+
+  /** 保存画像配置 */
+  private async handleSaveProfileConfig(data: { workers: Record<string, any>; categories: Record<string, string> }): Promise<void> {
+    try {
+      const storage = new ProfileStorage();
+
+      // 转换 UI 格式到存储格式
+      const config: StoredProfileConfig = {
+        workers: {},
+        categories: {
+          categories: {},
+          rules: {
+            categoryPriority: ['architecture', 'bugfix', 'frontend', 'implement', 'refactor', 'test', 'document', 'general'],
+            defaultCategory: 'general',
+            riskMapping: { high: 'fullPath', medium: 'standardPath', low: 'lightPath' },
+          },
+        },
+      };
+
+      // 转换 Worker 配置
+      for (const [workerType, workerData] of Object.entries(data.workers)) {
+        if (workerData) {
+          config.workers[workerType as 'claude' | 'codex' | 'gemini'] = {
+            guidance: {
+              role: workerData.role || '',
+              focus: workerData.focus || [],
+              constraints: workerData.constraints || [],
+              outputPreferences: [],
+            },
+            profile: {
+              strengths: [],
+              weaknesses: [],
+            },
+          };
+        }
+      }
+
+      // 转换分类配置
+      for (const [category, worker] of Object.entries(data.categories)) {
+        if (config.categories?.categories) {
+          (config.categories.categories as any)[category] = {
+            defaultWorker: worker,
+            keywords: [],
+            priority: 'medium',
+            riskLevel: 'medium',
+          };
+        }
+      }
+
+      await storage.saveConfig(config);
+      this.postMessage({ type: 'toast', message: '画像配置已保存', toastType: 'success' });
+
+      // 通知 ProfileLoader 重新加载配置
+      console.log('[MultiCLI] 画像配置已保存到:', ProfileStorage.getConfigDir());
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      this.postMessage({ type: 'toast', message: `保存失败: ${errorMsg}`, toastType: 'error' });
+    }
+  }
+
+  /** 重置画像配置 */
+  private async handleResetProfileConfig(): Promise<void> {
+    try {
+      const storage = new ProfileStorage();
+      await storage.clearConfig();
+      this.postMessage({ type: 'toast', message: '画像配置已重置为默认值', toastType: 'success' });
+      this.sendProfileConfig();
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      this.postMessage({ type: 'toast', message: `重置失败: ${errorMsg}`, toastType: 'error' });
+    }
   }
 
   /** 处理设置交互模式 */

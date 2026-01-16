@@ -1,0 +1,214 @@
+/**
+ * Worker Profile System - 画像加载器
+ *
+ * 功能：
+ * - 加载默认 Worker 画像配置
+ * - 加载用户级配置（~/.multicli/config/workers/）
+ * - 合并配置（用户配置覆盖默认配置）
+ * - 加载任务分类配置
+ *
+ * 注意：
+ * - 设置页面的配置是系统级用户目录配置，与项目目录无关
+ * - 使用 JSON 格式配置文件，无需额外依赖
+ */
+
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+import { WorkerType } from '../../types';
+import {
+  WorkerProfile,
+  CategoriesConfig,
+  CategoryConfig,
+} from './types';
+import {
+  DEFAULT_CLAUDE_PROFILE,
+  DEFAULT_CODEX_PROFILE,
+  DEFAULT_GEMINI_PROFILE,
+  DEFAULT_CATEGORIES_CONFIG,
+} from './defaults';
+
+export class ProfileLoader {
+  private profiles: Map<WorkerType, WorkerProfile> = new Map();
+  private categories: Map<string, CategoryConfig> = new Map();
+  private categoriesConfig: CategoriesConfig;
+  private loaded: boolean = false;
+
+  /** 用户级配置目录：~/.multicli/config/ */
+  private static readonly USER_CONFIG_DIR = path.join(os.homedir(), '.multicli', 'config');
+
+  constructor(_workspacePath?: string) {
+    // workspacePath 参数保留用于兼容，但不再使用
+    this.categoriesConfig = DEFAULT_CATEGORIES_CONFIG;
+  }
+
+  /**
+   * 加载所有配置
+   */
+  async load(): Promise<void> {
+    if (this.loaded) return;
+
+    await this.loadWorkerProfiles();
+    await this.loadCategories();
+    this.loaded = true;
+  }
+
+  /**
+   * 强制重新加载配置（用于配置更新后）
+   */
+  async reload(): Promise<void> {
+    this.loaded = false;
+    this.profiles.clear();
+    this.categories.clear();
+    await this.load();
+  }
+
+  /**
+   * 加载 Worker 画像
+   * 从用户配置目录加载，覆盖默认配置
+   */
+  private async loadWorkerProfiles(): Promise<void> {
+    const userConfigDir = path.join(ProfileLoader.USER_CONFIG_DIR, 'workers');
+    const defaultProfiles: Record<WorkerType, WorkerProfile> = {
+      claude: DEFAULT_CLAUDE_PROFILE,
+      codex: DEFAULT_CODEX_PROFILE,
+      gemini: DEFAULT_GEMINI_PROFILE,
+    };
+
+    for (const workerType of ['claude', 'codex', 'gemini'] as WorkerType[]) {
+      const defaultProfile = defaultProfiles[workerType];
+      let finalProfile = defaultProfile;
+
+      // 尝试加载用户配置
+      const userConfigPath = path.join(userConfigDir, `${workerType}.json`);
+      if (fs.existsSync(userConfigPath)) {
+        try {
+          const content = fs.readFileSync(userConfigPath, 'utf-8');
+          const userProfile = JSON.parse(content) as Partial<WorkerProfile>;
+          finalProfile = this.mergeProfile(finalProfile, userProfile);
+          console.log(`[ProfileLoader] 已加载用户配置: ${workerType}`);
+        } catch (error) {
+          console.warn(`[ProfileLoader] 加载用户配置失败: ${userConfigPath}`, error);
+        }
+      }
+
+      this.profiles.set(workerType, finalProfile);
+    }
+  }
+
+  /**
+   * 加载任务分类配置
+   * 从用户配置目录加载，覆盖默认配置
+   */
+  private async loadCategories(): Promise<void> {
+    const userConfigPath = path.join(ProfileLoader.USER_CONFIG_DIR, 'categories.json');
+
+    // 尝试加载用户配置
+    if (fs.existsSync(userConfigPath)) {
+      try {
+        const content = fs.readFileSync(userConfigPath, 'utf-8');
+        const userConfig = JSON.parse(content) as Partial<CategoriesConfig>;
+        this.categoriesConfig = this.mergeCategoriesConfig(
+          DEFAULT_CATEGORIES_CONFIG,
+          userConfig
+        );
+        console.log('[ProfileLoader] 已加载用户分类配置');
+      } catch (error) {
+        console.warn('[ProfileLoader] 加载用户分类配置失败', error);
+      }
+    }
+
+    // 构建分类 Map
+    for (const [name, config] of Object.entries(this.categoriesConfig.categories)) {
+      this.categories.set(name, config);
+    }
+  }
+
+  /**
+   * 合并 Worker 画像配置
+   */
+  private mergeProfile(
+    base: WorkerProfile,
+    override: Partial<WorkerProfile>
+  ): WorkerProfile {
+    return {
+      name: override.name ?? base.name,
+      displayName: override.displayName ?? base.displayName,
+      version: override.version ?? base.version,
+      profile: {
+        ...base.profile,
+        ...override.profile,
+      },
+      preferences: {
+        preferredCategories: override.preferences?.preferredCategories ?? base.preferences.preferredCategories,
+        preferredKeywords: override.preferences?.preferredKeywords ?? base.preferences.preferredKeywords,
+      },
+      guidance: {
+        role: override.guidance?.role ?? base.guidance.role,
+        focus: override.guidance?.focus ?? base.guidance.focus,
+        constraints: override.guidance?.constraints ?? base.guidance.constraints,
+        outputPreferences: override.guidance?.outputPreferences ?? base.guidance.outputPreferences,
+      },
+      collaboration: {
+        asLeader: override.collaboration?.asLeader ?? base.collaboration.asLeader,
+        asCollaborator: override.collaboration?.asCollaborator ?? base.collaboration.asCollaborator,
+      },
+    };
+  }
+
+  /**
+   * 合并分类配置
+   */
+  private mergeCategoriesConfig(
+    base: CategoriesConfig,
+    override: Partial<CategoriesConfig>
+  ): CategoriesConfig {
+    return {
+      version: override.version ?? base.version,
+      categories: {
+        ...base.categories,
+        ...override.categories,
+      },
+      rules: {
+        ...base.rules,
+        ...override.rules,
+      },
+    };
+  }
+
+  /**
+   * 获取 Worker 画像
+   */
+  getProfile(workerType: WorkerType): WorkerProfile {
+    return this.profiles.get(workerType) ?? DEFAULT_CLAUDE_PROFILE;
+  }
+
+  /**
+   * 获取所有 Worker 画像
+   */
+  getAllProfiles(): Map<WorkerType, WorkerProfile> {
+    return this.profiles;
+  }
+
+  /**
+   * 获取任务分类配置
+   */
+  getCategory(categoryName: string): CategoryConfig | undefined {
+    return this.categories.get(categoryName);
+  }
+
+  /**
+   * 获取所有分类
+   */
+  getAllCategories(): Map<string, CategoryConfig> {
+    return this.categories;
+  }
+
+  /**
+   * 获取分类规则
+   */
+  getCategoryRules() {
+    return this.categoriesConfig.rules;
+  }
+}
+

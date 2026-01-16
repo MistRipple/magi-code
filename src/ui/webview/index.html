@@ -1629,7 +1629,7 @@
     /* 设置面板 */
     .settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: none; align-items: center; justify-content: center; z-index: 200; }
     .settings-overlay.visible { display: flex; animation: fadeIn 0.15s ease; }
-    .settings-panel { width: 400px; max-width: 90vw; max-height: 80vh; background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); overflow: hidden; display: flex; flex-direction: column; }
+    .settings-panel { width: 520px; max-width: 95vw; max-height: 85vh; background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); overflow: hidden; display: flex; flex-direction: column; }
     .settings-header { display: flex; align-items: center; justify-content: space-between; padding: var(--spacing-3) var(--spacing-4); border-bottom: 1px solid var(--vscode-panel-border); }
     .settings-title { font-size: var(--font-size-3); font-weight: 600; }
     /* 设置面板 Tab 栏 */
@@ -1676,6 +1676,63 @@
     .cli-refresh-btn:disabled { opacity: 0.6; cursor: not-allowed; }
     .cli-refresh-btn svg { width: 14px; height: 14px; fill: currentColor; }
     .cli-refresh-btn.loading svg { animation: spin 1s linear infinite; }
+
+    /* 画像配置样式 - 与其他 tab 保持视觉一致 */
+    /* CLI 画像配置区域（边框包裹） */
+    .profile-cli-section { border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-2); padding: var(--spacing-3); margin-bottom: var(--spacing-3); background: var(--vscode-editor-background); }
+    .profile-worker-tabs { display: flex; gap: 0; margin-bottom: var(--spacing-3); background: var(--vscode-input-background); border-radius: var(--radius-2); padding: 2px; }
+    .profile-worker-tab { flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; padding: var(--spacing-2); font-size: var(--font-size-2); font-weight: 500; color: var(--vscode-descriptionForeground); background: transparent; border: none; border-radius: var(--radius-1); cursor: pointer; transition: all var(--transition-fast); }
+    .profile-worker-tab:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
+    .profile-worker-tab.active { color: var(--vscode-foreground); background: var(--vscode-editor-background); box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .profile-worker-dot { width: 8px; height: 8px; border-radius: 50%; }
+    .profile-worker-dot.claude { background: var(--color-claude); }
+    .profile-worker-dot.codex { background: var(--color-codex); }
+    .profile-worker-dot.gemini { background: var(--color-gemini); }
+
+    .profile-section { margin-bottom: var(--spacing-4); }
+    .profile-section-title { font-size: var(--font-size-1); font-weight: 600; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: var(--spacing-2); }
+    .profile-section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--spacing-2); }
+    .profile-add-btn { font-size: var(--font-size-1); padding: 2px 8px; display: flex; align-items: center; justify-content: center; background: var(--vscode-button-secondaryBackground); border: 1px solid var(--vscode-button-border, transparent); border-radius: var(--radius-1); color: var(--vscode-button-secondaryForeground); cursor: pointer; transition: all var(--transition-fast); }
+    .profile-add-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
+
+    .profile-textarea { width: 100%; min-height: 60px; padding: var(--spacing-1) var(--spacing-2); font-size: var(--font-size-2); background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-1); resize: vertical; font-family: inherit; line-height: 1.5; }
+    .profile-textarea:focus { outline: none; border-color: var(--vscode-focusBorder); }
+
+    .profile-tags { display: flex; flex-wrap: wrap; gap: 6px; min-height: 28px; padding: var(--spacing-2); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-1); }
+    .profile-tag { display: flex; align-items: center; gap: 4px; padding: 2px 8px; font-size: var(--font-size-1); background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); border-radius: var(--radius-1); }
+    .profile-tag-remove { width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; background: transparent; border: none; color: inherit; cursor: pointer; opacity: 0.6; border-radius: 50%; font-size: 10px; }
+    .profile-tag-remove:hover { opacity: 1; background: rgba(255,255,255,0.15); }
+
+    /* 两列布局 */
+    .profile-two-columns { display: grid; grid-template-columns: 1fr 1fr; gap: var(--spacing-3); }
+    .profile-column { margin-bottom: 0; }
+
+    /* 任务分类网格（全局配置区域） */
+    .profile-global-section { margin-top: var(--spacing-2); }
+    .profile-categories-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--spacing-2); }
+    .profile-category-row { display: flex; align-items: center; justify-content: space-between; padding: var(--spacing-1) var(--spacing-2); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-1); }
+    .profile-category-label { font-size: var(--font-size-2); color: var(--vscode-foreground); }
+    .profile-category-select { padding: 2px 6px; font-size: var(--font-size-1); background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); border-radius: var(--radius-1); cursor: pointer; }
+
+    /* 底部区域 */
+    .profile-footer { display: flex; align-items: center; justify-content: space-between; margin-top: var(--spacing-3); padding-top: var(--spacing-3); border-top: 1px solid var(--vscode-panel-border); }
+    .profile-config-hint { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .profile-config-hint code { font-family: monospace; color: var(--vscode-textLink-foreground); }
+    .profile-actions { display: flex; gap: var(--spacing-2); }
+
+    /* 自定义输入对话框 */
+    .profile-input-dialog { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 300; }
+    .profile-input-dialog.visible { display: flex; }
+    .profile-input-dialog-content { width: 360px; background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); padding: var(--spacing-4); }
+    .profile-input-dialog-title { font-size: var(--font-size-3); font-weight: 600; margin-bottom: var(--spacing-3); }
+    .profile-input-dialog-input { width: 100%; padding: var(--spacing-1) var(--spacing-2); font-size: var(--font-size-2); background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-1); margin-bottom: var(--spacing-3); }
+    .profile-input-dialog-input:focus { outline: none; border-color: var(--vscode-focusBorder); }
+    .profile-input-dialog-actions { display: flex; gap: var(--spacing-2); justify-content: flex-end; }
+    .profile-input-dialog-btn { padding: var(--spacing-1) var(--spacing-3); font-size: var(--font-size-2); border-radius: var(--radius-1); cursor: pointer; border: none; }
+    .profile-input-dialog-btn.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    .profile-input-dialog-btn.primary:hover { background: var(--vscode-button-hoverBackground); }
+    .profile-input-dialog-btn.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+    .profile-input-dialog-btn.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
 
     /* Prompt 增强配置样式 */
     .prompt-enhance-section { margin-top: var(--spacing-2); }
@@ -1908,6 +1965,10 @@
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M4 11H2v3h2v-3zm5-4H7v7h2V7zm5-5h-2v12h2V2zm-2-1a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h2a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1h-2zM6 7a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V7zm-5 4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1v-3z"/></svg>
           统计
         </button>
+        <button class="settings-tab" data-tab="profile">
+          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M3 14s-1 0-1-1 1-4 6-4 6 3 6 4-1 1-1 1H3zm5-6a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"/></svg>
+          画像
+        </button>
         <button class="settings-tab" data-tab="config">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 4.754a3.246 3.246 0 1 0 0 6.492 3.246 3.246 0 0 0 0-6.492zM5.754 8a2.246 2.246 0 1 1 4.492 0 2.246 2.246 0 0 1-4.492 0z"/><path d="M9.796 1.343c-.527-1.79-3.065-1.79-3.592 0l-.094.319a.873.873 0 0 1-1.255.52l-.292-.16c-1.64-.892-3.433.902-2.54 2.541l.159.292a.873.873 0 0 1-.52 1.255l-.319.094c-1.79.527-1.79 3.065 0 3.592l.319.094a.873.873 0 0 1 .52 1.255l-.16.292c-.892 1.64.901 3.434 2.541 2.54l.292-.159a.873.873 0 0 1 1.255.52l.094.319c.527 1.79 3.065 1.79 3.592 0l.094-.319a.873.873 0 0 1 1.255-.52l.292.16c1.64.893 3.434-.902 2.54-2.541l-.159-.292a.873.873 0 0 1 .52-1.255l.319-.094c1.79-.527 1.79-3.065 0-3.592l-.319-.094a.873.873 0 0 1-.52-1.255l.16-.292c.893-1.64-.902-3.433-2.541-2.54l-.292.159a.873.873 0 0 1-1.255-.52l-.094-.319zm-2.633.283c.246-.835 1.428-.835 1.674 0l.094.319a1.873 1.873 0 0 0 2.693 1.115l.291-.16c.764-.415 1.6.42 1.184 1.185l-.159.292a1.873 1.873 0 0 0 1.116 2.692l.318.094c.835.246.835 1.428 0 1.674l-.319.094a1.873 1.873 0 0 0-1.115 2.693l.16.291c.415.764-.42 1.6-1.185 1.184l-.291-.159a1.873 1.873 0 0 0-2.693 1.116l-.094.318c-.246.835-1.428.835-1.674 0l-.094-.319a1.873 1.873 0 0 0-2.692-1.115l-.292.16c-.764.415-1.6-.42-1.184-1.185l.159-.291A1.873 1.873 0 0 0 1.945 8.93l-.319-.094c-.835-.246-.835-1.428 0-1.674l.319-.094A1.873 1.873 0 0 0 3.06 4.377l-.16-.292c-.415-.764.42-1.6 1.185-1.184l.292.159a1.873 1.873 0 0 0 2.692-1.115l.094-.319z"/></svg>
           配置
@@ -2011,6 +2072,150 @@
           </div>
         </div>
       </div>
+      <!-- 画像配置 Tab 内容 -->
+      <div class="settings-tab-content" id="settings-tab-profile">
+        <!-- CLI 画像配置区域（边框包裹） -->
+        <div class="profile-cli-section">
+          <!-- Worker 选择器 -->
+          <div class="profile-worker-tabs">
+            <button class="profile-worker-tab active" data-worker="claude">
+              <span class="profile-worker-dot claude"></span>
+              Claude
+            </button>
+            <button class="profile-worker-tab" data-worker="codex">
+              <span class="profile-worker-dot codex"></span>
+              Codex
+            </button>
+            <button class="profile-worker-tab" data-worker="gemini">
+              <span class="profile-worker-dot gemini"></span>
+              Gemini
+            </button>
+          </div>
+
+          <!-- Worker 画像编辑区 -->
+          <div class="profile-editor" id="profile-editor">
+            <!-- 角色定位 -->
+            <div class="profile-section">
+              <div class="profile-section-title">角色定位</div>
+              <textarea class="profile-textarea" id="profile-role" placeholder="描述该 Worker 的角色定位..."></textarea>
+            </div>
+
+            <!-- 两列布局：专注领域 + 行为约束 -->
+            <div class="profile-two-columns">
+              <!-- 专注领域 -->
+              <div class="profile-section profile-column">
+                <div class="profile-section-header">
+                  <span class="profile-section-title">专注领域</span>
+                  <button class="profile-add-btn" id="profile-add-focus">+</button>
+                </div>
+                <div class="profile-tags" id="profile-focus-tags"></div>
+              </div>
+
+              <!-- 行为约束 -->
+              <div class="profile-section profile-column">
+                <div class="profile-section-header">
+                  <span class="profile-section-title">行为约束</span>
+                  <button class="profile-add-btn" id="profile-add-constraint">+</button>
+                </div>
+                <div class="profile-tags" id="profile-constraint-tags"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 全局任务分类配置（不在边框内） -->
+        <div class="profile-section profile-global-section">
+          <div class="profile-section-title">任务分类默认</div>
+          <div class="profile-categories-grid" id="profile-categories">
+            <div class="profile-category-row">
+              <span class="profile-category-label">架构设计</span>
+              <select class="profile-category-select" data-category="architecture">
+                <option value="claude">Claude</option>
+                <option value="codex">Codex</option>
+                <option value="gemini">Gemini</option>
+              </select>
+            </div>
+            <div class="profile-category-row">
+              <span class="profile-category-label">缺陷修复</span>
+              <select class="profile-category-select" data-category="bugfix">
+                <option value="claude">Claude</option>
+                <option value="codex" selected>Codex</option>
+                <option value="gemini">Gemini</option>
+              </select>
+            </div>
+            <div class="profile-category-row">
+              <span class="profile-category-label">前端开发</span>
+              <select class="profile-category-select" data-category="frontend">
+                <option value="claude">Claude</option>
+                <option value="codex">Codex</option>
+                <option value="gemini" selected>Gemini</option>
+              </select>
+            </div>
+            <div class="profile-category-row">
+              <span class="profile-category-label">功能实现</span>
+              <select class="profile-category-select" data-category="implement">
+                <option value="claude" selected>Claude</option>
+                <option value="codex">Codex</option>
+                <option value="gemini">Gemini</option>
+              </select>
+            </div>
+            <div class="profile-category-row">
+              <span class="profile-category-label">代码重构</span>
+              <select class="profile-category-select" data-category="refactor">
+                <option value="claude" selected>Claude</option>
+                <option value="codex">Codex</option>
+                <option value="gemini">Gemini</option>
+              </select>
+            </div>
+            <div class="profile-category-row">
+              <span class="profile-category-label">测试编写</span>
+              <select class="profile-category-select" data-category="test">
+                <option value="claude">Claude</option>
+                <option value="codex" selected>Codex</option>
+                <option value="gemini">Gemini</option>
+              </select>
+            </div>
+            <div class="profile-category-row">
+              <span class="profile-category-label">文档编写</span>
+              <select class="profile-category-select" data-category="document">
+                <option value="claude" selected>Claude</option>
+                <option value="codex">Codex</option>
+                <option value="gemini">Gemini</option>
+              </select>
+            </div>
+            <div class="profile-category-row">
+              <span class="profile-category-label">通用任务</span>
+              <select class="profile-category-select" data-category="general">
+                <option value="claude" selected>Claude</option>
+                <option value="codex">Codex</option>
+                <option value="gemini">Gemini</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- 底部：配置路径 + 操作按钮 -->
+        <div class="profile-footer">
+          <span class="profile-config-hint">配置存储：<code>~/.multicli/config/</code></span>
+          <div class="profile-actions">
+            <button class="settings-btn secondary" id="profile-reset-btn">重置</button>
+            <button class="settings-btn" id="profile-save-btn">保存</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 自定义输入对话框 -->
+      <div class="profile-input-dialog" id="profile-input-dialog">
+        <div class="profile-input-dialog-content">
+          <div class="profile-input-dialog-title" id="profile-input-dialog-title">添加</div>
+          <input type="text" class="profile-input-dialog-input" id="profile-input-dialog-input" placeholder="请输入内容...">
+          <div class="profile-input-dialog-actions">
+            <button class="profile-input-dialog-btn secondary" id="profile-input-dialog-cancel">取消</button>
+            <button class="profile-input-dialog-btn primary" id="profile-input-dialog-confirm">确定</button>
+          </div>
+        </div>
+      </div>
+
       <!-- 配置 Tab 内容 -->
       <div class="settings-tab-content" id="settings-tab-config">
         <!-- Augment 配置 -->
@@ -6524,6 +6729,233 @@
     document.getElementById('stats-reset-btn').addEventListener('click', () => {
       vscode.postMessage({ type: 'resetExecutionStats' });
     });
+
+    // ============================================================================
+    // 画像配置功能
+    // ============================================================================
+
+    // 当前选中的 Worker
+    let currentProfileWorker = 'claude';
+
+    // 画像数据缓存 - 与系统默认画像完全一致
+    let profileData = {
+      claude: {
+        role: '你是一个资深软件架构师，专注于系统设计、代码质量和可维护性。\n你的代码应该是清晰、可扩展、易于测试的。',
+        focus: ['优先考虑代码的可维护性和扩展性', '在修改前先分析影响范围和依赖关系', '对于跨模块修改，先确认接口契约', '保持代码风格一致性', '添加必要的类型定义和注释'],
+        constraints: ['不要进行不必要的重构', '避免引入新的依赖，除非必要', '大规模修改前先与编排者确认', '保持向后兼容性，除非明确要求破坏性变更']
+      },
+      codex: {
+        role: '你是一个高效的代码执行者，专注于快速、准确地完成具体任务。\n你的目标是用最少的代码变更解决问题。',
+        focus: ['精准定位问题，最小化修改范围', '快速实现，不过度设计', '确保修改不引入新问题', '添加必要的错误处理'],
+        constraints: ['不要进行架构级别的修改', '保持修改范围在任务描述内', '遇到需要架构决策的问题，反馈给编排者']
+      },
+      gemini: {
+        role: '你是一个前端专家和文档专家，专注于用户界面和开发者体验。\n你的代码应该是美观、易用、可访问的。',
+        focus: ['关注用户体验和交互细节', '保持 UI 一致性和美观性', '确保响应式设计和可访问性', '编写清晰的文档和注释'],
+        constraints: ['不要修改后端 API 逻辑', '遵循已定义的接口契约', '样式修改保持设计系统一致性']
+      }
+    };
+
+    // 分类配置缓存 - 完整的分类映射
+    let categoryConfig = {
+      architecture: 'claude',
+      bugfix: 'codex',
+      frontend: 'gemini',
+      implement: 'claude',
+      refactor: 'claude',
+      test: 'codex',
+      document: 'claude',
+      general: 'claude'
+    };
+
+    // Worker Tab 切换
+    document.querySelectorAll('.profile-worker-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        const worker = tab.dataset.worker;
+        currentProfileWorker = worker;
+
+        // 更新 Tab 状态
+        document.querySelectorAll('.profile-worker-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+
+        // 加载该 Worker 的配置
+        loadWorkerProfile(worker);
+      });
+    });
+
+    // 加载 Worker 画像到 UI
+    function loadWorkerProfile(worker) {
+      const data = profileData[worker] || {};
+
+      // 角色定位
+      document.getElementById('profile-role').value = data.role || '';
+
+      // 专注领域
+      renderProfileTags('profile-focus-tags', data.focus || [], 'focus');
+
+      // 行为约束
+      renderProfileTags('profile-constraint-tags', data.constraints || [], 'constraint');
+    }
+
+    // 渲染标签
+    function renderProfileTags(containerId, tags, type) {
+      const container = document.getElementById(containerId);
+      container.innerHTML = tags.map((tag, idx) => `
+        <span class="profile-tag">
+          ${tag}
+          <button class="profile-tag-remove" data-type="${type}" data-index="${idx}">×</button>
+        </span>
+      `).join('');
+    }
+
+    // 标签删除
+    document.addEventListener('click', (e) => {
+      if (e.target.classList.contains('profile-tag-remove')) {
+        const type = e.target.dataset.type;
+        const index = parseInt(e.target.dataset.index);
+        const data = profileData[currentProfileWorker];
+
+        if (type === 'focus') {
+          data.focus.splice(index, 1);
+          renderProfileTags('profile-focus-tags', data.focus, 'focus');
+        } else if (type === 'constraint') {
+          data.constraints.splice(index, 1);
+          renderProfileTags('profile-constraint-tags', data.constraints, 'constraint');
+        }
+      }
+    });
+
+    // 自定义输入对话框
+    let inputDialogCallback = null;
+    const inputDialog = document.getElementById('profile-input-dialog');
+    const inputDialogTitle = document.getElementById('profile-input-dialog-title');
+    const inputDialogInput = document.getElementById('profile-input-dialog-input');
+    const inputDialogCancel = document.getElementById('profile-input-dialog-cancel');
+    const inputDialogConfirm = document.getElementById('profile-input-dialog-confirm');
+
+    function showInputDialog(title, placeholder, callback) {
+      inputDialogTitle.textContent = title;
+      inputDialogInput.placeholder = placeholder;
+      inputDialogInput.value = '';
+      inputDialogCallback = callback;
+      inputDialog.classList.add('visible');
+      setTimeout(() => inputDialogInput.focus(), 50);
+    }
+
+    function hideInputDialog() {
+      inputDialog.classList.remove('visible');
+      inputDialogCallback = null;
+    }
+
+    inputDialogCancel.addEventListener('click', hideInputDialog);
+    inputDialogConfirm.addEventListener('click', () => {
+      const value = inputDialogInput.value.trim();
+      if (value && inputDialogCallback) {
+        inputDialogCallback(value);
+      }
+      hideInputDialog();
+    });
+    inputDialogInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        inputDialogConfirm.click();
+      } else if (e.key === 'Escape') {
+        hideInputDialog();
+      }
+    });
+    inputDialog.addEventListener('click', (e) => {
+      if (e.target === inputDialog) hideInputDialog();
+    });
+
+    // 添加专注领域
+    document.getElementById('profile-add-focus').addEventListener('click', () => {
+      showInputDialog('添加专注领域', '例如：优先考虑代码的可维护性', (value) => {
+        profileData[currentProfileWorker].focus.push(value);
+        renderProfileTags('profile-focus-tags', profileData[currentProfileWorker].focus, 'focus');
+      });
+    });
+
+    // 添加行为约束
+    document.getElementById('profile-add-constraint').addEventListener('click', () => {
+      showInputDialog('添加行为约束', '例如：不要进行不必要的重构', (value) => {
+        profileData[currentProfileWorker].constraints.push(value);
+        renderProfileTags('profile-constraint-tags', profileData[currentProfileWorker].constraints, 'constraint');
+      });
+    });
+
+    // 角色定位输入
+    document.getElementById('profile-role').addEventListener('input', (e) => {
+      profileData[currentProfileWorker].role = e.target.value;
+    });
+
+    // 分类配置选择
+    document.querySelectorAll('.profile-category-select').forEach(select => {
+      select.addEventListener('change', (e) => {
+        const category = e.target.dataset.category;
+        categoryConfig[category] = e.target.value;
+      });
+    });
+
+    // 保存配置
+    document.getElementById('profile-save-btn').addEventListener('click', () => {
+      vscode.postMessage({
+        type: 'saveProfileConfig',
+        data: {
+          workers: profileData,
+          categories: categoryConfig
+        }
+      });
+    });
+
+    // 重置配置
+    document.getElementById('profile-reset-btn').addEventListener('click', () => {
+      if (confirm('确定要重置为默认配置吗？')) {
+        vscode.postMessage({ type: 'resetProfileConfig' });
+      }
+    });
+
+    // 请求画像配置
+    function requestProfileConfig() {
+      vscode.postMessage({ type: 'getProfileConfig' });
+    }
+
+    // 更新画像配置 UI
+    function updateProfileConfig(config) {
+      if (config.workers) {
+        profileData = { ...profileData, ...config.workers };
+      }
+      if (config.categories) {
+        categoryConfig = { ...categoryConfig, ...config.categories };
+        // 更新分类选择器
+        Object.entries(categoryConfig).forEach(([category, worker]) => {
+          const select = document.querySelector(`.profile-category-select[data-category="${category}"]`);
+          if (select) select.value = worker;
+        });
+      }
+      if (config.configPath) {
+        document.querySelector('.profile-config-value').textContent = config.configPath;
+      }
+      // 重新加载当前 Worker 的配置
+      loadWorkerProfile(currentProfileWorker);
+    }
+
+    // 打开画像 Tab 时请求配置
+    document.querySelector('.settings-tab[data-tab="profile"]').addEventListener('click', () => {
+      requestProfileConfig();
+    });
+
+    // 初始化画像配置 UI（使用默认数据）
+    function initProfileUI() {
+      // 加载当前 Worker 的配置
+      loadWorkerProfile(currentProfileWorker);
+      // 初始化分类选择器
+      Object.entries(categoryConfig).forEach(([category, worker]) => {
+        const select = document.querySelector(`.profile-category-select[data-category="${category}"]`);
+        if (select) select.value = worker;
+      });
+    }
+
+    // 页面加载完成后初始化画像 UI
+    initProfileUI();
 
     // 请求 CLI 连接状态
     function requestCliStatus() {

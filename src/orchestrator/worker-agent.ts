@@ -5,6 +5,7 @@
  * - 接收编排者分配的任务
  * - 执行编码任务
  * - 向编排者汇报进度和结果
+ * - 🆕 基于 Worker 画像注入行为引导
  *
  * 所有 Worker（包括 Worker Claude）都继承此基类
  */
@@ -28,6 +29,11 @@ import {
   OrchestratorCommandMessage,
   WorkerAnswerMessage,
 } from './protocols/types';
+import {
+  GuidanceInjector,
+  WorkerProfile,
+  InjectionContext,
+} from './profile';
 
 /** Worker 配置 */
 export interface WorkerConfig {
@@ -37,6 +43,8 @@ export interface WorkerConfig {
   orchestratorId?: string;
   snapshotManager?: SnapshotManager;
   permissions?: PermissionMatrix;
+  /** 🆕 Worker 画像 */
+  profile?: WorkerProfile;
 }
 
 /** 🆕 待回答的问题 */
@@ -58,8 +66,12 @@ export class WorkerAgent extends EventEmitter {
   protected cliFactory: CLIAdapterFactory;
   protected messageBus: MessageBus;
   protected orchestratorId: string;
-  protected snapshotManager?: SnapshotManager; 
+  protected snapshotManager?: SnapshotManager;
   protected permissions: PermissionMatrix;
+  /** 🆕 Worker 画像 */
+  protected profile?: WorkerProfile;
+  /** 🆕 引导注入器 */
+  protected guidanceInjector: GuidanceInjector;
 
   private _state: WorkerState = 'idle';
   private currentTaskId: string | null = null;
@@ -76,10 +88,26 @@ export class WorkerAgent extends EventEmitter {
     this.cliFactory = config.cliFactory;
     this.messageBus = config.messageBus || globalMessageBus;
     this.orchestratorId = config.orchestratorId || 'orchestrator';
-    this.snapshotManager = config.snapshotManager; 
+    this.snapshotManager = config.snapshotManager;
     this.permissions = config.permissions || { allowEdit: true, allowBash: true, allowWeb: true };
+    this.profile = config.profile;
+    this.guidanceInjector = new GuidanceInjector();
 
     this.setupMessageHandlers();
+  }
+
+  /**
+   * 🆕 设置 Worker 画像
+   */
+  setProfile(profile: WorkerProfile): void {
+    this.profile = profile;
+  }
+
+  /**
+   * 🆕 获取 Worker 画像
+   */
+  getProfile(): WorkerProfile | undefined {
+    return this.profile;
   }
 
   /** 获取当前状态 */
@@ -318,6 +346,7 @@ export class WorkerAgent extends EventEmitter {
 
   /**
    * 构建执行 prompt
+   * 🆕 集成 Worker 画像引导注入
    */
   protected buildExecutionPrompt(subTask: SubTask, context?: string): string {
     const filesHint = subTask.targetFiles?.length
@@ -328,8 +357,11 @@ export class WorkerAgent extends EventEmitter {
     const permissionHint = this.buildPermissionHint();
     const canEdit = this.permissions.allowEdit !== false;
 
+    // 🆕 构建画像引导 Prompt
+    const guidanceHint = this.buildGuidanceHint(subTask);
+
     if (subTask.kind === 'architecture') {
-      return `${subTask.prompt}${contextHint}${permissionHint}
+      return `${guidanceHint}${subTask.prompt}${contextHint}${permissionHint}
 
 **执行模式**: 架构与契约设计
 - 仅输出设计要点与契约约束，不修改任何文件
@@ -340,7 +372,7 @@ export class WorkerAgent extends EventEmitter {
     }
 
     if (subTask.kind === 'background' || subTask.background) {
-      return `${subTask.prompt}${filesHint}${contextHint}${permissionHint}
+      return `${guidanceHint}${subTask.prompt}${filesHint}${contextHint}${permissionHint}
 
 **执行模式**: 后台探索
 - 不修改任何文件，输出简明结论与可操作建议
@@ -351,7 +383,7 @@ export class WorkerAgent extends EventEmitter {
     }
 
     if (subTask.kind === 'integration') {
-      return `${subTask.prompt}${filesHint}${contextHint}${permissionHint}`;
+      return `${guidanceHint}${subTask.prompt}${filesHint}${contextHint}${permissionHint}`;
     }
 
     const claudeConciseHint = this.type === 'claude'
@@ -359,7 +391,7 @@ export class WorkerAgent extends EventEmitter {
       : '';
 
     if (!canEdit) {
-      return `${subTask.prompt}${filesHint}${contextHint}${permissionHint}${claudeConciseHint}
+      return `${guidanceHint}${subTask.prompt}${filesHint}${contextHint}${permissionHint}${claudeConciseHint}
 
 **执行模式**: 只读分析
 - 不修改任何文件，提供修改建议或差异说明
@@ -369,7 +401,7 @@ export class WorkerAgent extends EventEmitter {
 **重要**: 请使用中文回复，包括代码注释也使用中文。`;
     }
 
-    return `${subTask.prompt}${filesHint}${contextHint}${permissionHint}${claudeConciseHint}
+    return `${guidanceHint}${subTask.prompt}${filesHint}${contextHint}${permissionHint}${claudeConciseHint}
 
 **执行模式**: 直接修改
 - 你拥有完整的文件写入权限，可以直接修改文件
@@ -378,6 +410,24 @@ export class WorkerAgent extends EventEmitter {
 - 严禁修改 .multicli/ 目录内的计划与状态文件
 
 **重要**: 请使用中文回复，包括代码注释也使用中文。`;
+  }
+
+  /**
+   * 🆕 构建画像引导 Prompt
+   */
+  protected buildGuidanceHint(subTask: SubTask): string {
+    if (!this.profile) {
+      return '';
+    }
+
+    const injectionContext: InjectionContext = {
+      taskDescription: subTask.description,
+      targetFiles: subTask.targetFiles,
+      category: subTask.kind,
+    };
+
+    const guidance = this.guidanceInjector.buildWorkerPrompt(this.profile, injectionContext);
+    return guidance ? `${guidance}\n\n---\n\n` : '';
   }
 
   private formatResultContent(subTask: SubTask, content?: string): string {

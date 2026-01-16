@@ -297,8 +297,9 @@ export class OrchestratorAgent extends EventEmitter {
       orchestratorId: this.id,
       executionStats: this.executionStats,
       enableFallback: true,
-      snapshotManager: this.snapshotManager || undefined, 
+      snapshotManager: this.snapshotManager || undefined,
       permissions: this.permissions,
+      workspacePath: this.workspaceRoot, // 🆕 传递工作区路径，用于加载 Worker 画像
     });
 
     // 初始化验证组件
@@ -393,6 +394,15 @@ export class OrchestratorAgent extends EventEmitter {
   /** 初始化 */
   async initialize(): Promise<void> {
     await this.workerPool.initialize();
+
+    // 🆕 将 ProfileLoader 设置给 CLISelector 和 TaskAnalyzer，实现画像驱动的任务分配
+    const profileLoader = this.workerPool.getProfileLoader();
+    if (profileLoader) {
+      this.cliSelector.setProfileLoader(profileLoader);
+      this.taskAnalyzer.setProfileLoader(profileLoader);
+      console.log('[OrchestratorAgent] CLISelector 和 TaskAnalyzer 已集成 Worker 画像');
+    }
+
     console.log('[OrchestratorAgent] 初始化完成');
     console.log(`[OrchestratorAgent] 执行统计: ${this.getStatsSummary()}`);
   }
