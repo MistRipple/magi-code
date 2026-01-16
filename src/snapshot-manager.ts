@@ -1,12 +1,14 @@
 /**
  * 快照管理器
  * 文件快照创建、存储、还原
+ *
+ * 存储路径：.multicli/sessions/{sessionId}/snapshots/
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { FileSnapshot, CLIType, PendingChange } from './types';
-import { SessionManager } from './session-manager';
+import { UnifiedSessionManager, FileSnapshotMeta } from './session';
 import { globalEventBus } from './events';
 
 /** 生成唯一 ID */
@@ -18,21 +20,24 @@ function generateId(): string {
  * 快照管理器
  */
 export class SnapshotManager {
-  private sessionManager: SessionManager;
+  private sessionManager: UnifiedSessionManager;
   private workspaceRoot: string;
-  private snapshotDir: string;
 
-  constructor(sessionManager: SessionManager, workspaceRoot: string) {
+  constructor(sessionManager: UnifiedSessionManager, workspaceRoot: string) {
     this.sessionManager = sessionManager;
     this.workspaceRoot = workspaceRoot;
-    this.snapshotDir = path.join(workspaceRoot, '.multicli', 'snapshots');
-    this.ensureSnapshotDir();
+  }
+
+  /** 获取快照目录（基于会话） */
+  private getSnapshotDir(sessionId: string): string {
+    return this.sessionManager.getSnapshotsDir(sessionId);
   }
 
   /** 确保快照目录存在 */
-  private ensureSnapshotDir(): void {
-    if (!fs.existsSync(this.snapshotDir)) {
-      fs.mkdirSync(this.snapshotDir, { recursive: true });
+  private ensureSnapshotDir(sessionId: string): void {
+    const dir = this.getSnapshotDir(sessionId);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
     }
   }
 
@@ -45,21 +50,35 @@ export class SnapshotManager {
     const session = this.sessionManager.getCurrentSession();
     if (!session) return null;
 
-    const absolutePath = path.isAbsolute(filePath) 
-      ? filePath 
+    const absolutePath = path.isAbsolute(filePath)
+      ? filePath
       : path.join(this.workspaceRoot, filePath);
-    
+
     const relativePath = path.relative(this.workspaceRoot, absolutePath);
 
     // 检查是否已有该文件的快照
     const existingSnapshot = this.sessionManager.getSnapshot(session.id, relativePath);
     if (existingSnapshot) {
       // 更新修改信息，但保留原始内容
-      existingSnapshot.lastModifiedBy = modifiedBy;
-      existingSnapshot.lastModifiedAt = Date.now();
-      existingSnapshot.subTaskId = subTaskId;
-      this.sessionManager.addSnapshot(session.id, existingSnapshot);
-      return existingSnapshot;
+      const updatedMeta: FileSnapshotMeta = {
+        ...existingSnapshot,
+        lastModifiedBy: modifiedBy,
+        lastModifiedAt: Date.now(),
+        subTaskId,
+      };
+      this.sessionManager.addSnapshot(session.id, updatedMeta);
+
+      // 读取原始内容返回完整快照
+      const snapshotFile = path.join(this.getSnapshotDir(session.id), `${existingSnapshot.id}.snapshot`);
+      const originalContent = fs.existsSync(snapshotFile)
+        ? fs.readFileSync(snapshotFile, 'utf-8')
+        : '';
+
+      return {
+        ...updatedMeta,
+        sessionId: session.id,
+        originalContent,
+      };
     }
 
     // 读取原始文件内容
@@ -68,39 +87,33 @@ export class SnapshotManager {
       originalContent = fs.readFileSync(absolutePath, 'utf-8');
     }
 
-    const snapshot: FileSnapshot = {
-      id: generateId(),
-      sessionId: session.id,
+    const snapshotId = generateId();
+    const snapshotMeta: FileSnapshotMeta = {
+      id: snapshotId,
       filePath: relativePath,
-      originalContent,
       lastModifiedBy: modifiedBy,
       lastModifiedAt: Date.now(),
       subTaskId,
     };
 
     // 保存快照内容到文件
-    this.saveSnapshotContent(snapshot);
-    
-    // 添加到 Session
-    this.sessionManager.addSnapshot(session.id, snapshot);
-    
+    this.ensureSnapshotDir(session.id);
+    const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshotId}.snapshot`);
+    fs.writeFileSync(snapshotFile, originalContent, 'utf-8');
+
+    // 添加元数据到 Session
+    this.sessionManager.addSnapshot(session.id, snapshotMeta);
+
     globalEventBus.emitEvent('snapshot:created', {
       sessionId: session.id,
-      data: { filePath: relativePath, snapshotId: snapshot.id },
+      data: { filePath: relativePath, snapshotId },
     });
 
-    return snapshot;
-  }
-
-  /** 保存快照内容到文件 */
-  private saveSnapshotContent(snapshot: FileSnapshot): void {
-    const sessionDir = path.join(this.snapshotDir, snapshot.sessionId);
-    if (!fs.existsSync(sessionDir)) {
-      fs.mkdirSync(sessionDir, { recursive: true });
-    }
-    
-    const snapshotFile = path.join(sessionDir, `${snapshot.id}.snapshot`);
-    fs.writeFileSync(snapshotFile, snapshot.originalContent, 'utf-8');
+    return {
+      ...snapshotMeta,
+      sessionId: session.id,
+      originalContent,
+    };
   }
 
   /** 还原文件到快照状态 */
@@ -116,11 +129,11 @@ export class SnapshotManager {
     if (!snapshot) return false;
 
     const absolutePath = path.join(this.workspaceRoot, relativePath);
-    
+
     // 读取快照内容
-    const snapshotFile = path.join(this.snapshotDir, session.id, `${snapshot.id}.snapshot`);
-    let content = snapshot.originalContent;
-    
+    const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);
+    let content = '';
+
     if (fs.existsSync(snapshotFile)) {
       content = fs.readFileSync(snapshotFile, 'utf-8');
     }
@@ -159,11 +172,14 @@ export class SnapshotManager {
         ? fs.readFileSync(absolutePath, 'utf-8')
         : '';
 
+      // 读取原始内容
+      const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);
+      const originalContent = fs.existsSync(snapshotFile)
+        ? fs.readFileSync(snapshotFile, 'utf-8')
+        : '';
+
       // 计算变更行数
-      const { additions, deletions } = this.countChanges(
-        snapshot.originalContent,
-        currentContent
-      );
+      const { additions, deletions } = this.countChanges(originalContent, currentContent);
 
       if (additions > 0 || deletions > 0) {
         changes.push({
@@ -195,7 +211,14 @@ export class SnapshotManager {
       const currentContent = fs.existsSync(absolutePath)
         ? fs.readFileSync(absolutePath, 'utf-8')
         : '';
-      if (currentContent !== snapshot.originalContent) {
+
+      // 读取原始内容
+      const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);
+      const originalContent = fs.existsSync(snapshotFile)
+        ? fs.readFileSync(snapshotFile, 'utf-8')
+        : '';
+
+      if (currentContent !== originalContent) {
         files.push(snapshot.filePath);
       }
     }
@@ -235,7 +258,7 @@ export class SnapshotManager {
     if (!snapshot) return false;
 
     // 删除快照文件
-    const snapshotFile = path.join(this.snapshotDir, session.id, `${snapshot.id}.snapshot`);
+    const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);
     if (fs.existsSync(snapshotFile)) {
       fs.unlinkSync(snapshotFile);
     }
@@ -297,11 +320,11 @@ export class SnapshotManager {
     return snapshots;
   }
 
-  /** 清理会话的所有快照 */
+  /** 清理会话的所有快照（删除会话时不需要单独调用，会话目录会整体删除） */
   cleanupSession(sessionId: string): void {
-    const sessionDir = path.join(this.snapshotDir, sessionId);
-    if (fs.existsSync(sessionDir)) {
-      fs.rmSync(sessionDir, { recursive: true, force: true });
+    const snapshotDir = this.getSnapshotDir(sessionId);
+    if (fs.existsSync(snapshotDir)) {
+      fs.rmSync(snapshotDir, { recursive: true, force: true });
     }
   }
 }

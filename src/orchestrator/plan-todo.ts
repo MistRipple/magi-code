@@ -2,27 +2,38 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { PlanRecord } from './plan-storage';
 
+/**
+ * 计划 TODO 文件管理器
+ *
+ * 存储位置：.multicli/sessions/{sessionId}/plans/{planId}.md
+ * 每个会话的计划 TODO 文件存储在对应会话目录下
+ */
 export class PlanTodoManager {
-  private plansDir: string;
+  private workspaceRoot: string;
 
   constructor(workspaceRoot: string) {
-    this.plansDir = path.join(workspaceRoot, '.multicli', 'plans');
-    this.ensureDir();
+    this.workspaceRoot = workspaceRoot;
   }
 
-  private ensureDir(): void {
-    if (!fs.existsSync(this.plansDir)) {
-      fs.mkdirSync(this.plansDir, { recursive: true });
+  /** 获取会话的计划目录 */
+  private getPlansDir(sessionId: string): string {
+    return path.join(this.workspaceRoot, '.multicli', 'sessions', sessionId, 'plans');
+  }
+
+  private ensureDir(sessionId: string): void {
+    const plansDir = this.getPlansDir(sessionId);
+    if (!fs.existsSync(plansDir)) {
+      fs.mkdirSync(plansDir, { recursive: true });
     }
   }
 
-  private getTodoPath(planId: string): string {
-    return path.join(this.plansDir, `${planId}.md`);
+  private getTodoPath(sessionId: string, planId: string): string {
+    return path.join(this.getPlansDir(sessionId), `${planId}.md`);
   }
 
   ensurePlanFile(record: PlanRecord): void {
-    this.ensureDir();
-    const todoPath = this.getTodoPath(record.id);
+    this.ensureDir(record.sessionId);
+    const todoPath = this.getTodoPath(record.sessionId, record.id);
     if (fs.existsSync(todoPath)) {
       return;
     }
@@ -49,8 +60,8 @@ export class PlanTodoManager {
     fs.writeFileSync(todoPath, lines.join('\n'), 'utf-8');
   }
 
-  updateSubTaskStatus(planId: string, subTaskId: string, status: 'completed' | 'failed'): void {
-    const todoPath = this.getTodoPath(planId);
+  updateSubTaskStatus(sessionId: string, planId: string, subTaskId: string, status: 'completed' | 'failed'): void {
+    const todoPath = this.getTodoPath(sessionId, planId);
     if (!fs.existsSync(todoPath)) {
       return;
     }

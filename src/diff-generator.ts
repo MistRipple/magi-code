@@ -6,7 +6,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { DiffHunk, CLIType } from './types';
-import { SessionManager } from './session-manager';
+import { UnifiedSessionManager } from './session';
 
 /**
  * Diff 结果
@@ -23,10 +23,10 @@ export interface DiffResult {
  * Diff 生成器
  */
 export class DiffGenerator {
-  private sessionManager: SessionManager;
+  private sessionManager: UnifiedSessionManager;
   private workspaceRoot: string;
 
-  constructor(sessionManager: SessionManager, workspaceRoot: string) {
+  constructor(sessionManager: UnifiedSessionManager, workspaceRoot: string) {
     this.sessionManager = sessionManager;
     this.workspaceRoot = workspaceRoot;
   }
@@ -48,8 +48,14 @@ export class DiffGenerator {
       ? fs.readFileSync(absolutePath, 'utf-8')
       : '';
 
+    // 从快照文件读取原始内容
+    const snapshotFile = this.sessionManager.getSnapshotFilePath(session.id, snapshot.id);
+    const originalContent = fs.existsSync(snapshotFile)
+      ? fs.readFileSync(snapshotFile, 'utf-8')
+      : '';
+
     const hunks = this.computeHunks(
-      snapshot.originalContent,
+      originalContent,
       currentContent,
       relativePath,
       snapshot.lastModifiedBy

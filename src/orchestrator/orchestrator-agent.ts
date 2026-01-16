@@ -408,8 +408,8 @@ export class OrchestratorAgent extends EventEmitter {
   }
 
   /** 获取指定计划记录 */
-  getPlanById(planId: string): PlanRecord | null {
-    return this.planStorage?.getPlan(planId) ?? null;
+  getPlanById(planId: string, sessionId: string): PlanRecord | null {
+    return this.planStorage?.getPlan(planId, sessionId) ?? null;
   }
 
   /** 获取会话最新计划记录 */
@@ -426,7 +426,7 @@ export class OrchestratorAgent extends EventEmitter {
     if (!state) {
       return this.getLatestPlanForSession(sessionId);
     }
-    const record = this.planStorage?.getPlan(state.activePlanId) ?? null;
+    const record = this.planStorage?.getPlan(state.activePlanId, sessionId) ?? null;
     return record ?? this.getLatestPlanForSession(sessionId);
   }
 
@@ -1131,7 +1131,8 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
 
   private async runPlanExecution(userPrompt: string, plan: ExecutionPlan, taskId: string): Promise<string> {
     const formattedPlan = formatPlanForUser(plan);
-    const existingRecord = plan.id ? this.planStorage?.getPlan(plan.id) : null;
+    const sessionId = this.currentContext?.sessionId || this.currentContext?.taskId || taskId;
+    const existingRecord = plan.id ? this.planStorage?.getPlan(plan.id, sessionId) : null;
     const review = existingRecord?.review ?? await this.reviewPlan(plan, formattedPlan);
     const record = this.persistPlan(plan, formattedPlan, review);
     if (!record) {
@@ -4054,8 +4055,9 @@ ${userPrompt}
     if (subTask) {
       this.checkDisciplineViolations(subTask, result);
       const planId = this.currentContext?.plan?.id;
-      if (planId && (result.success === true || result.success === false)) {
-        this.planTodoManager?.updateSubTaskStatus(planId, subTask.id, result.success ? 'completed' : 'failed');
+      const sessionId = this.currentContext?.sessionId || this.currentContext?.taskId;
+      if (planId && sessionId && (result.success === true || result.success === false)) {
+        this.planTodoManager?.updateSubTaskStatus(sessionId, planId, subTask.id, result.success ? 'completed' : 'failed');
       }
     }
 

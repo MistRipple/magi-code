@@ -25,8 +25,7 @@ import {
   MessageLifecycle,
   MessageType,
 } from '../protocol/message-protocol';
-import { SessionManager } from '../session-manager';
-import { ChatSessionManager } from '../chat-session-manager';
+import { UnifiedSessionManager } from '../session';
 import { TaskManager } from '../task-manager';
 import { SnapshotManager } from '../snapshot-manager';
 import { DiffGenerator } from '../diff-generator';
@@ -44,8 +43,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'multiCli.mainView';
 
   private _view?: vscode.WebviewView;
-  private sessionManager: SessionManager;
-  private chatSessionManager: ChatSessionManager;
+  private sessionManager: UnifiedSessionManager;
   private taskManager: TaskManager;
   private snapshotManager: SnapshotManager;
   private diffGenerator: DiffGenerator;
@@ -104,14 +102,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     private readonly context: vscode.ExtensionContext,
     private readonly workspaceRoot: string
   ) {
-    // 初始化管理器
-    this.sessionManager = new SessionManager(workspaceRoot);
-    this.chatSessionManager = new ChatSessionManager(workspaceRoot);
+    // 初始化统一会话管理器
+    this.sessionManager = new UnifiedSessionManager(workspaceRoot);
     this.taskManager = new TaskManager(this.sessionManager);
     this.snapshotManager = new SnapshotManager(this.sessionManager, workspaceRoot);
     this.diffGenerator = new DiffGenerator(this.sessionManager, workspaceRoot);
 
-    // 对齐会话管理器，确保任务/快照与对话会话一致
+    // 确保有当前会话
     this.ensureSessionAlignment();
 
     // 初始化任务分析器和 CLI 选择器（从配置读取 skills）
@@ -1313,16 +1310,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'switchSession':
-       
+
         if (this.activeSessionId !== message.sessionId) {
           await this.interruptCurrentTask({ silent: true });
         }
-        // 切换会话时，同步 CLI 的会话 ID
+        // 切换会话
         await this.switchToSession(message.sessionId);
-        // 同时切换聊天会话
-        const switchedSession = this.chatSessionManager.switchSession(message.sessionId);
+        const switchedSession = this.sessionManager.switchSession(message.sessionId);
         if (switchedSession) {
-         
+
           this.activeSessionId = message.sessionId;
           // 恢复 CLI sessionIds
           this.postMessage({ type: 'sessionSwitched', sessionId: message.sessionId });
@@ -1332,25 +1328,24 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       case 'renameSession':
         // 重命名会话
-        if (this.chatSessionManager.renameSession(message.sessionId, message.name)) {
-          this.postMessage({ type: 'sessionsUpdated', sessions: this.chatSessionManager.getAllSessions() as any[] });
+        if (this.sessionManager.renameSession(message.sessionId, message.name)) {
+          this.postMessage({ type: 'sessionsUpdated', sessions: this.sessionManager.getAllSessions() as any[] });
           this.postMessage({ type: 'toast', message: '会话已重命名', toastType: 'success' });
         }
         break;
 
       case 'closeSession':
-        // 删除会话
-        if (this.chatSessionManager.deleteSession(message.sessionId)) {
+        // 删除会话（统一管理器会清理所有相关资源）
+        if (this.sessionManager.deleteSession(message.sessionId)) {
           // 如果删除后没有会话，创建一个新的
-          if (this.chatSessionManager.getAllSessions().length === 0) {
-            const { chatSession } = this.createAlignedSession();
-            this.activeSessionId = chatSession.id;
-            this.postMessage({ type: 'sessionCreated', session: chatSession as any });
+          if (this.sessionManager.getAllSessions().length === 0) {
+            const newSession = this.sessionManager.createSession();
+            this.activeSessionId = newSession.id;
+            this.postMessage({ type: 'sessionCreated', session: newSession as any });
           }
-          this.postMessage({ type: 'sessionsUpdated', sessions: this.chatSessionManager.getAllSessions() as any[] });
+          this.postMessage({ type: 'sessionsUpdated', sessions: this.sessionManager.getAllSessions() as any[] });
           this.postMessage({ type: 'toast', message: '会话已删除', toastType: 'info' });
         }
-        this.sessionManager.endSession(message.sessionId);
         this.sendStateUpdate();
         break;
 
@@ -1702,7 +1697,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
 
     // 2. 收集上下文（5-10 轮对话）
-    const conversationHistory = this.chatSessionManager.formatConversationHistory(10);
+    const conversationHistory = this.sessionManager.formatConversationHistory(10);
 
     // 3. 检测语言
     const isChinese = /[\u4e00-\u9fa5]/.test(prompt);
@@ -2107,10 +2102,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
 
     try {
-      // 获取原始内容（从快照）
-      const snapshotDir = path.join(this.workspaceRoot, '.multicli', 'snapshots');
-      const snapshotFile = path.join(snapshotDir, session.id, `${snapshot.id}.snapshot`);
-      let originalContent = snapshot.originalContent;
+      // 获取原始内容（从快照文件读取）
+      const snapshotFile = this.sessionManager.getSnapshotFilePath(session.id, snapshot.id);
+      let originalContent = '';
 
       if (fs.existsSync(snapshotFile)) {
         originalContent = fs.readFileSync(snapshotFile, 'utf-8');
@@ -2312,9 +2306,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private async executeTask(prompt: string, forceCli?: CLIType, images?: Array<{dataUrl: string}>): Promise<void> {
     console.log('[MultiCLI] executeTask 开始, prompt:', prompt, '图片数量:', images?.length || 0);
 
-   
+
     if (!this.activeSessionId) {
-      const currentSession = this.chatSessionManager.getCurrentSession();
+      const currentSession = this.sessionManager.getCurrentSession();
       this.activeSessionId = currentSession?.id || null;
       console.log('[MultiCLI] 设置 activeSessionId:', this.activeSessionId);
     }
@@ -2343,8 +2337,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 判断执行模式：智能编排 vs 直接执行
     const useIntelligentMode = !forceCli && !this.selectedCli;
 
-   
-    this.chatSessionManager.addMessage('user', prompt);
+
+    this.sessionManager.addMessage('user', prompt);
     this.sendStateUpdate();
 
     const orchestrationCommand = this.parseOrchestrationCommand(prompt);
@@ -2407,8 +2401,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   private async executeStartWork(planId?: string): Promise<void> {
     const sessionId = this.activeSessionId;
-    const record = planId
-      ? this.intelligentOrchestrator.getPlanById(planId)
+    const record = planId && sessionId
+      ? this.intelligentOrchestrator.getPlanById(planId, sessionId)
       : (sessionId ? this.intelligentOrchestrator.getActivePlanForSession(sessionId) : null);
 
     if (!record) {
@@ -2666,19 +2660,20 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     await this.interruptCurrentTask({ silent: true });
     // 创建新会话时，重置所有 CLI 进程
     await this.cliFactory.resetAllSessions();
-    const { chatSession } = this.createAlignedSession();
+    const newSession = this.sessionManager.createSession();
     // 更新活跃会话ID
-    this.activeSessionId = chatSession.id;
+    this.activeSessionId = newSession.id;
     console.log('[MultiCLI] 创建新会话，已重置所有 CLI 进程, activeSessionId:', this.activeSessionId);
     // 通知 webview 新会话已创建
-    this.postMessage({ type: 'sessionCreated', session: chatSession as any });
-    this.postMessage({ type: 'sessionsUpdated', sessions: this.chatSessionManager.getAllSessions() as any[] });
+    this.postMessage({ type: 'sessionCreated', session: newSession as any });
+    this.postMessage({ type: 'sessionsUpdated', sessions: this.sessionManager.getAllSessions() as any[] });
     this.sendStateUpdate();
   }
 
   /** 切换到指定会话 */
   private async switchToSession(sessionId: string): Promise<void> {
     await this.cliFactory.resetAllSessions();
+    this.activeSessionId = sessionId;
     this.ensureSessionExists(sessionId);
   }
 
@@ -2689,34 +2684,19 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.sessionManager.switchSession(sessionId);
       return existing;
     }
-    return this.sessionManager.createSession(sessionId);
+    return this.sessionManager.createSession(undefined, sessionId);
   }
 
-  /** 创建对齐的任务会话和聊天会话 */
-  private createAlignedSession(name?: string) {
-    const session = this.sessionManager.createSession();
-    const chatSession = this.chatSessionManager.createSession(name, session.id);
-    return { session, chatSession };
-  }
-
-  /** 初始化会话对齐（用于启动时恢复） */
+  /** 初始化会话（用于启动时恢复） */
   private ensureSessionAlignment(): void {
-    const chatSession = this.chatSessionManager.getCurrentSession();
-    if (chatSession) {
-      this.ensureSessionExists(chatSession.id);
-      this.activeSessionId = chatSession.id;
-      return;
-    }
-
     const session = this.sessionManager.getCurrentSession();
     if (session) {
-      this.chatSessionManager.createSession(undefined, session.id);
       this.activeSessionId = session.id;
       return;
     }
 
-    const { chatSession: newChatSession } = this.createAlignedSession();
-    this.activeSessionId = newChatSession.id;
+    const newSession = this.sessionManager.createSession();
+    this.activeSessionId = newSession.id;
   }
 
   /** 保存消息到当前会话 */
@@ -2726,19 +2706,19 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     cli?: CLIType,
     source?: MessageSource
   ): void {
-    const session = this.chatSessionManager.getCurrentSession();
+    const session = this.sessionManager.getCurrentSession();
     if (!session) {
       return;
     }
     if (assistantResponse) {
-      this.chatSessionManager.addMessage('assistant', assistantResponse, cli, source);
+      this.sessionManager.addMessage('assistant', assistantResponse, cli, source);
     }
     this.sendStateUpdate();
   }
 
   /** 保存当前会话的完整数据（从前端同步） */
   private saveCurrentSessionData(messages: any[], cliOutputs: Record<string, any[]>): void {
-    const currentSession = this.chatSessionManager.getCurrentSession();
+    const currentSession = this.sessionManager.getCurrentSession();
     if (!currentSession) {
       console.log('[MultiCLI] saveCurrentSessionData: 没有当前会话');
       return;
@@ -2756,20 +2736,20 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }));
 
     // 使用新的 API 保存会话数据
-    this.chatSessionManager.updateSessionData(currentSession.id, sessionMessages, cliOutputs);
+    this.sessionManager.updateSessionData(currentSession.id, sessionMessages, cliOutputs);
     console.log('[MultiCLI] 保存会话数据，消息数:', sessionMessages.length);
   }
 
   /** 构建 UI 状态 */
   private buildUIState(): UIState {
-    const chatSession = this.chatSessionManager.getCurrentSession();
+    const currentSession = this.sessionManager.getCurrentSession();
     const tasks = this.taskManager.getAllTasks();
     const currentTask = tasks.find(t => t.status === 'running') ?? tasks[tasks.length - 1];
-    const activePlanRecord = chatSession?.id
-      ? this.intelligentOrchestrator.getActivePlanForSession(chatSession.id)
+    const activePlanRecord = currentSession?.id
+      ? this.intelligentOrchestrator.getActivePlanForSession(currentSession.id)
       : null;
-    // 🔧 修复：使用 ChatSessionManager 的会话数据作为主数据源
-    const allChatSessions = this.chatSessionManager.getAllSessions();
+    // 使用统一会话管理器的会话数据
+    const allSessions = this.sessionManager.getAllSessions();
 
     // 构建 CLI 状态（包含能力信息）
     const cliStatuses: CLIStatus[] = Array.from(this.cliStatuses.values()).map(status => ({
@@ -2777,12 +2757,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       capabilities: CLI_CAPABILITIES[status.type],
     }));
 
-   
+
     const isRunning = currentTask?.status === 'running' || this.intelligentOrchestrator.running;
 
     return {
-      currentSessionId: chatSession?.id,
-      sessions: allChatSessions as any[],
+      currentSessionId: currentSession?.id,
+      sessions: allSessions as any[],
       currentTask,
       tasks,
       cliStatuses,
@@ -2861,7 +2841,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /** 获取管理器实例 */
-  getSessionManager(): SessionManager { return this.sessionManager; }
+  getSessionManager(): UnifiedSessionManager { return this.sessionManager; }
   getTaskManager(): TaskManager { return this.taskManager; }
   getSnapshotManager(): SnapshotManager { return this.snapshotManager; }
   getDiffGenerator(): DiffGenerator { return this.diffGenerator; }

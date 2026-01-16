@@ -424,8 +424,8 @@ export class IntelligentOrchestrator {
     return this.orchestratorAgent.getLatestPlanForSession(sessionId);
   }
 
-  getPlanById(planId: string): PlanRecord | null {
-    return this.orchestratorAgent.getPlanById(planId);
+  getPlanById(planId: string, sessionId: string): PlanRecord | null {
+    return this.orchestratorAgent.getPlanById(planId, sessionId);
   }
 
   /** ask 模式：仅对话 */

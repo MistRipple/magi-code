@@ -3,13 +3,17 @@
  *
  * 功能：
  * - 加载默认 Worker 画像配置
- * - 加载用户级配置（~/.multicli/config/workers/）
+ * - 加载用户级配置（~/.multicli/）
  * - 合并配置（用户配置覆盖默认配置）
  * - 加载任务分类配置
  *
- * 注意：
- * - 设置页面的配置是系统级用户目录配置，与项目目录无关
- * - 使用 JSON 格式配置文件，无需额外依赖
+ * 配置文件结构（扁平化）：
+ * ~/.multicli/
+ * ├── config.json      - 全局配置
+ * ├── categories.json  - 任务分类配置
+ * ├── claude.json      - Claude Worker 画像
+ * ├── codex.json       - Codex Worker 画像
+ * └── gemini.json      - Gemini Worker 画像
  */
 
 import * as fs from 'fs';
@@ -34,8 +38,8 @@ export class ProfileLoader {
   private categoriesConfig: CategoriesConfig;
   private loaded: boolean = false;
 
-  /** 用户级配置目录：~/.multicli/config/ */
-  private static readonly USER_CONFIG_DIR = path.join(os.homedir(), '.multicli', 'config');
+  /** 用户级配置目录：~/.multicli/ */
+  private static readonly USER_CONFIG_DIR = path.join(os.homedir(), '.multicli');
 
   constructor(_workspacePath?: string) {
     // workspacePath 参数保留用于兼容，但不再使用
@@ -68,7 +72,7 @@ export class ProfileLoader {
    * 从用户配置目录加载，覆盖默认配置
    */
   private async loadWorkerProfiles(): Promise<void> {
-    const userConfigDir = path.join(ProfileLoader.USER_CONFIG_DIR, 'workers');
+    const userConfigDir = ProfileLoader.USER_CONFIG_DIR;
     const defaultProfiles: Record<WorkerType, WorkerProfile> = {
       claude: DEFAULT_CLAUDE_PROFILE,
       codex: DEFAULT_CODEX_PROFILE,
@@ -79,7 +83,7 @@ export class ProfileLoader {
       const defaultProfile = defaultProfiles[workerType];
       let finalProfile = defaultProfile;
 
-      // 尝试加载用户配置
+      // 尝试加载用户配置（直接在 ~/.multicli/ 下）
       const userConfigPath = path.join(userConfigDir, `${workerType}.json`);
       if (fs.existsSync(userConfigPath)) {
         try {
