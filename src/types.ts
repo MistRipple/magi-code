@@ -547,7 +547,11 @@ export type WebviewToExtensionMessage =
   // 🆕 新增：需求澄清回答
   | { type: 'answerClarification'; answers: Record<string, string> | null; additionalInfo?: string }
   // 🆕 新增：Worker 问题回答
-  | { type: 'answerWorkerQuestion'; answer: string | null };
+  | { type: 'answerWorkerQuestion'; answer: string | null }
+  // 🆕 新增：画像配置
+  | { type: 'getProfileConfig' }
+  | { type: 'saveProfileConfig'; data: { workers: Record<string, any>; categories: Record<string, string> } }
+  | { type: 'resetProfileConfig' };
 
 // Extension 发送到 Webview 的消息
 // source 字段用于区分消息来源：'orchestrator' = 编排者, 'worker' = 执行代理

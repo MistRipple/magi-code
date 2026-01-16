@@ -1,9 +1,12 @@
 /**
  * 任务分析器
  * 解析用户输入，识别任务类型、复杂度和目标文件
+ *
+ * 🆕 支持画像系统的分类配置扩展
  */
 
 import { TaskCategory, CLIType } from '../types';
+import { ProfileLoader, CategoryConfig, RiskLevel } from '../orchestrator/profile';
 
 /** 任务分析结果 */
 export interface TaskAnalysis {
@@ -23,6 +26,12 @@ export interface TaskAnalysis {
   prompt: string;
   /** 是否为问答/咨询类请求（不需要执行任务） */
   isQuestion: boolean;
+  /** 🆕 风险等级（来自画像系统） */
+  riskLevel?: RiskLevel;
+  /** 🆕 推荐的 Worker（来自画像系统） */
+  recommendedWorker?: CLIType;
+  /** 🆕 匹配的关键词 */
+  matchedKeywords?: string[];
 }
 
 /** 任务类型关键词映射 */
@@ -49,8 +58,12 @@ const COMPLEXITY_INDICATORS = {
 
 /**
  * 任务分析器类
+ * 🆕 支持画像系统的分类配置扩展
  */
 export class TaskAnalyzer {
+  /** 🆕 画像加载器（可选） */
+  private profileLoader?: ProfileLoader;
+
   /** 问答/咨询类关键词 */
   private readonly questionKeywords = [
     '是什么', '什么是', '为什么', '怎么', '如何', '能否', '可以吗', '建议', '解释', '说明',
@@ -68,7 +81,15 @@ export class TaskAnalyzer {
   ];
 
   /**
+   * 🆕 设置画像加载器
+   */
+  setProfileLoader(loader: ProfileLoader): void {
+    this.profileLoader = loader;
+  }
+
+  /**
    * 分析用户输入
+   * 🆕 集成画像系统的分类配置
    */
   analyze(prompt: string): TaskAnalysis {
     const lowerPrompt = prompt.toLowerCase();
@@ -76,8 +97,8 @@ export class TaskAnalyzer {
     // 首先判断是否为问答类请求
     const isQuestion = this.detectIsQuestion(prompt);
 
-    // 识别任务类型
-    const category = this.detectCategory(lowerPrompt);
+    // 识别任务类型（优先使用画像系统）
+    const { category, matchedKeywords, categoryConfig } = this.detectCategoryWithProfile(lowerPrompt);
 
     // 识别目标文件
     const targetFiles = this.extractTargetFiles(prompt);
@@ -94,6 +115,10 @@ export class TaskAnalyzer {
     // 建议执行模式
     const suggestedMode = this.suggestMode(targetFiles, splittable);
 
+    // 🆕 从画像配置获取风险等级和推荐 Worker
+    const riskLevel = categoryConfig?.riskLevel;
+    const recommendedWorker = categoryConfig?.defaultWorker as CLIType | undefined;
+
     return {
       category,
       complexity,
@@ -103,7 +128,66 @@ export class TaskAnalyzer {
       suggestedMode,
       prompt,
       isQuestion,
+      riskLevel,
+      recommendedWorker,
+      matchedKeywords,
     };
+  }
+
+  /**
+   * 🆕 使用画像系统检测分类
+   */
+  private detectCategoryWithProfile(lowerPrompt: string): {
+    category: TaskCategory;
+    matchedKeywords: string[];
+    categoryConfig?: CategoryConfig;
+  } {
+    // 如果有画像系统，优先使用画像配置的关键词
+    if (this.profileLoader) {
+      const categories = this.profileLoader.getAllCategories();
+      const rules = this.profileLoader.getCategoryRules();
+
+      let bestMatch: { category: string; score: number; keywords: string[]; config: CategoryConfig } | null = null;
+
+      for (const categoryName of rules.categoryPriority) {
+        const config = categories.get(categoryName);
+        if (!config) continue;
+
+        let score = 0;
+        const matched: string[] = [];
+
+        for (const pattern of config.keywords) {
+          try {
+            const regex = new RegExp(pattern, 'i');
+            if (regex.test(lowerPrompt)) {
+              score += 10;
+              matched.push(pattern);
+            }
+          } catch {
+            if (lowerPrompt.includes(pattern.toLowerCase())) {
+              score += 5;
+              matched.push(pattern);
+            }
+          }
+        }
+
+        if (score > 0 && (!bestMatch || score > bestMatch.score)) {
+          bestMatch = { category: categoryName, score, keywords: matched, config };
+        }
+      }
+
+      if (bestMatch) {
+        return {
+          category: bestMatch.category as TaskCategory,
+          matchedKeywords: bestMatch.keywords,
+          categoryConfig: bestMatch.config,
+        };
+      }
+    }
+
+    // 回退到内置关键词匹配
+    const category = this.detectCategory(lowerPrompt);
+    return { category, matchedKeywords: [] };
   }
 
   /**
