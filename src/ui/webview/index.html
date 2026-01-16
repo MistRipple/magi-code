@@ -794,8 +794,7 @@
     .message-content.markdown-rendered > *:last-child { margin-bottom: 0; }
 
     /* 段落样式 */
-    .message-content.markdown-rendered p,
-    .message-content.markdown-rendered .markdown-paragraph {
+    .message-content.markdown-rendered p {
       white-space: pre-line;
       margin: 8px 0;
       padding-inline: var(--markdown-spacing-inline);
@@ -803,12 +802,10 @@
       line-height: 1.6;
       word-break: break-word;
     }
-    .message-content.markdown-rendered p:first-child,
-    .message-content.markdown-rendered .markdown-paragraph:first-child {
+    .message-content.markdown-rendered p:first-child {
       margin-top: 0;
     }
-    .message-content.markdown-rendered p:last-child,
-    .message-content.markdown-rendered .markdown-paragraph:last-child {
+    .message-content.markdown-rendered p:last-child {
       margin-bottom: 0;
     }
 
@@ -840,9 +837,7 @@
 
     /* 列表样式 - Augment 风格 */
     .message-content.markdown-rendered ul,
-    .message-content.markdown-rendered ol,
-    .message-content.markdown-rendered .markdown-ul,
-    .message-content.markdown-rendered .markdown-ol {
+    .message-content.markdown-rendered ol {
       margin: 8px 0;
       padding-inline-start: 24px;
       display: flex;
@@ -927,8 +922,7 @@
     }
 
     /* 图片样式 */
-    .message-content.markdown-rendered img,
-    .message-content.markdown-rendered .markdown-image {
+    .message-content.markdown-rendered img {
       max-width: 100%;
       height: auto;
       border-radius: 4px;
@@ -936,37 +930,29 @@
     }
 
     /* 表格样式 - Augment 风格 */
-    .message-content.markdown-rendered .table-wrapper {
-      display: block;
-      overflow-x: auto;
-      margin: 8px 0;
-    }
-    .message-content.markdown-rendered table,
-    .message-content.markdown-rendered .md-table {
+    .message-content.markdown-rendered table {
       width: 100%;
       border-collapse: collapse;
       font-size: 13px;
       line-height: 1.4;
+      display: block;
+      overflow-x: auto;
+      margin: 8px 0;
     }
     .message-content.markdown-rendered th,
-    .message-content.markdown-rendered td,
-    .message-content.markdown-rendered .md-table th,
-    .message-content.markdown-rendered .md-table td {
+    .message-content.markdown-rendered td {
       border: 1px solid var(--vscode-panel-border);
       padding: 6px 10px;
       text-align: left;
     }
-    .message-content.markdown-rendered th,
-    .message-content.markdown-rendered .md-table th {
+    .message-content.markdown-rendered th {
       background: var(--vscode-sideBar-background);
       font-weight: 600;
     }
-    .message-content.markdown-rendered tr:nth-child(even),
-    .message-content.markdown-rendered .md-table tr:nth-child(even) {
+    .message-content.markdown-rendered tr:nth-child(even) {
       background: var(--vscode-list-hoverBackground);
     }
-    .message-content.markdown-rendered tr:hover,
-    .message-content.markdown-rendered .md-table tr:hover {
+    .message-content.markdown-rendered tr:hover {
       background: var(--vscode-list-activeSelectionBackground);
     }
 
@@ -1171,23 +1157,42 @@
       padding: 0;
     }
 
-    /* 语法高亮样式 */
-    .syntax-keyword { color: var(--vscode-symbolIcon-keywordForeground, #c586c0); }
-    .syntax-string { color: var(--vscode-symbolIcon-stringForeground, #ce9178); }
-    .syntax-number { color: var(--vscode-symbolIcon-numberForeground, #b5cea8); }
-    .syntax-comment { color: var(--vscode-symbolIcon-commentForeground, #6a9955); font-style: italic; }
-    .syntax-function { color: var(--vscode-symbolIcon-functionForeground, #dcdcaa); }
-    .syntax-class { color: var(--vscode-symbolIcon-classForeground, #4ec9b0); }
-    .syntax-variable { color: var(--vscode-symbolIcon-variableForeground, #9cdcfe); }
-    .syntax-operator { color: var(--vscode-foreground, #d4d4d4); }
-    .syntax-punctuation { color: var(--vscode-foreground, #d4d4d4); }
-    .syntax-property { color: var(--vscode-symbolIcon-propertyForeground, #9cdcfe); }
-    .syntax-type { color: var(--vscode-symbolIcon-typeParameterForeground, #4ec9b0); }
-    .syntax-decorator { color: var(--vscode-symbolIcon-eventForeground, #dcdcaa); }
-    .syntax-tag { color: var(--vscode-symbolIcon-colorForeground, #569cd6); }
-    .syntax-attr-name { color: var(--vscode-symbolIcon-propertyForeground, #9cdcfe); }
-    .syntax-attr-value { color: var(--vscode-symbolIcon-stringForeground, #ce9178); }
-    .syntax-builtin { color: var(--vscode-symbolIcon-constantForeground, #569cd6); }
+    /* highlight.js 语法高亮样式 - VSCode Dark+ 主题风格 */
+    .hljs { background: transparent !important; }
+    .hljs-keyword { color: var(--vscode-symbolIcon-keywordForeground, #c586c0); }
+    .hljs-built_in { color: var(--vscode-symbolIcon-constantForeground, #569cd6); }
+    .hljs-type { color: var(--vscode-symbolIcon-typeParameterForeground, #4ec9b0); }
+    .hljs-literal { color: var(--vscode-symbolIcon-constantForeground, #569cd6); }
+    .hljs-number { color: var(--vscode-symbolIcon-numberForeground, #b5cea8); }
+    .hljs-string { color: var(--vscode-symbolIcon-stringForeground, #ce9178); }
+    .hljs-regexp { color: #d16969; }
+    .hljs-symbol { color: var(--vscode-symbolIcon-constantForeground, #569cd6); }
+    .hljs-variable { color: var(--vscode-symbolIcon-variableForeground, #9cdcfe); }
+    .hljs-template-variable { color: var(--vscode-symbolIcon-variableForeground, #9cdcfe); }
+    .hljs-link { color: var(--vscode-symbolIcon-stringForeground, #ce9178); }
+    .hljs-selector-id { color: #d7ba7d; }
+    .hljs-selector-class { color: #d7ba7d; }
+    .hljs-comment { color: var(--vscode-symbolIcon-commentForeground, #6a9955); font-style: italic; }
+    .hljs-doctag { color: var(--vscode-symbolIcon-commentForeground, #6a9955); }
+    .hljs-meta { color: #569cd6; }
+    .hljs-meta-keyword { color: #569cd6; }
+    .hljs-meta-string { color: var(--vscode-symbolIcon-stringForeground, #ce9178); }
+    .hljs-section { color: #dcdcaa; }
+    .hljs-title { color: var(--vscode-symbolIcon-functionForeground, #dcdcaa); }
+    .hljs-title.function_ { color: var(--vscode-symbolIcon-functionForeground, #dcdcaa); }
+    .hljs-title.class_ { color: var(--vscode-symbolIcon-classForeground, #4ec9b0); }
+    .hljs-name { color: var(--vscode-symbolIcon-colorForeground, #569cd6); }
+    .hljs-tag { color: var(--vscode-symbolIcon-colorForeground, #569cd6); }
+    .hljs-attr { color: var(--vscode-symbolIcon-propertyForeground, #9cdcfe); }
+    .hljs-attribute { color: var(--vscode-symbolIcon-propertyForeground, #9cdcfe); }
+    .hljs-params { color: var(--vscode-symbolIcon-variableForeground, #9cdcfe); }
+    .hljs-property { color: var(--vscode-symbolIcon-propertyForeground, #9cdcfe); }
+    .hljs-class { color: var(--vscode-symbolIcon-classForeground, #4ec9b0); }
+    .hljs-function { color: var(--vscode-symbolIcon-functionForeground, #dcdcaa); }
+    .hljs-addition { background: rgba(34, 197, 94, 0.2); color: #b5cea8; }
+    .hljs-deletion { background: rgba(239, 68, 68, 0.2); color: #ce9178; }
+    .hljs-emphasis { font-style: italic; }
+    .hljs-strong { font-weight: bold; }
 
     /* 注：行内代码、链接、表格样式已在上方 Markdown 渲染样式块中定义 */
 
@@ -2037,6 +2042,10 @@
     </div>
   </div>
 
+  <!-- 引入 Markdown 和代码高亮库 -->
+  <script src="{{libUri}}/marked.min.js"></script>
+  <script src="{{libUri}}/highlight.min.js"></script>
+
   <script>
     const vscode = typeof acquireVsCodeApi === 'function'
       ? acquireVsCodeApi()
@@ -2047,15 +2056,33 @@
         };
     window.vscode = vscode;
 
-    // 🔧 问题4修复：安全的 postMessage 包装函数
-    function safePostMessage(message) {
-      try {
-        vscode.postMessage(message);
-        return true;
-      } catch (e) {
-        console.error('[MultiCLI] postMessage failed:', e, message);
-        return false;
-      }
+    // 🆕 配置 marked 和 highlight.js
+    // 配置 marked 使用 highlight.js 进行代码高亮
+    if (typeof marked !== 'undefined' && typeof hljs !== 'undefined') {
+      marked.setOptions({
+        highlight: function(code, lang) {
+          if (lang && hljs.getLanguage(lang)) {
+            try {
+              return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
+            } catch (e) {
+              console.warn('[Marked] highlight error:', e);
+            }
+          }
+          // 自动检测语言
+          try {
+            return hljs.highlightAuto(code).value;
+          } catch (e) {
+            return code;
+          }
+        },
+        breaks: true,        // 支持 GFM 换行
+        gfm: true,           // 启用 GitHub Flavored Markdown
+        headerIds: false,    // 禁用标题 ID（避免安全问题）
+        mangle: false,       // 禁用邮箱地址混淆
+      });
+      console.log('[MultiCLI] marked + highlight.js 初始化成功');
+    } else {
+      console.warn('[MultiCLI] marked 或 highlight.js 未加载');
     }
 
     // 🔧 问题2修复：全局错误处理
@@ -2143,14 +2170,6 @@
       const mainContent = document.getElementById('main-content');
       if (mainContent) {
         scrollPositions[currentBottomTab] = mainContent.scrollTop;
-      }
-    }
-
-    // 恢复指定 Tab 的滚动位置
-    function restoreScrollPosition(tab) {
-      const mainContent = document.getElementById('main-content');
-      if (mainContent && scrollPositions[tab] !== undefined) {
-        mainContent.scrollTop = scrollPositions[tab];
       }
     }
 
@@ -2446,12 +2465,34 @@
 
     // 主对话面板渲染节流（避免高频输出造成卡顿）
     let mainContentDebounceTimer = null;
+    let pendingRenderCount = 0;
+    const RENDER_DEBOUNCE_MS = 80;
+    const RENDER_MAX_WAIT_MS = 200; // 最大等待时间，确保不会无限延迟
+    let lastRenderTime = 0;
+
     function scheduleRenderMainContent() {
+      pendingRenderCount++;
+
+      // 如果距离上次渲染超过最大等待时间，立即渲染
+      const now = Date.now();
+      if (now - lastRenderTime > RENDER_MAX_WAIT_MS && pendingRenderCount > 3) {
+        if (mainContentDebounceTimer) {
+          clearTimeout(mainContentDebounceTimer);
+          mainContentDebounceTimer = null;
+        }
+        pendingRenderCount = 0;
+        lastRenderTime = now;
+        renderMainContent();
+        return;
+      }
+
       if (mainContentDebounceTimer) return;
       mainContentDebounceTimer = setTimeout(() => {
         mainContentDebounceTimer = null;
+        pendingRenderCount = 0;
+        lastRenderTime = Date.now();
         renderMainContent();
-      }, 80);
+      }, RENDER_DEBOUNCE_MS);
     }
 
     function buildThinkingPanelHtml(panelId, thinkingItems, expanded) {
@@ -2466,44 +2507,6 @@
       html += '<div class="collapsible-content' + (expanded ? ' expanded' : '') + '"><div class="collapsible-body markdown-rendered">' + renderMarkdown(thinkingContent) + '</div></div>';
       html += '</div>';
       return html;
-    }
-
-    function updateMessagePanels(messageEl, message, panelPrefix) {
-      if (!messageEl || !message) return false;
-      const headerEl = messageEl.querySelector('.message-header');
-      if (!headerEl) return false;
-
-      const panelId = (panelPrefix || 'panel-') + 'thinking-' + (message.streamKey || messageEl.dataset.msgIdx || '0');
-      const thinkingEl = messageEl.querySelector('.collapsible-panel.thinking');
-      if (message.thinking && message.thinking.length > 0) {
-        const thinkingHtml = buildThinkingPanelHtml(panelId, message.thinking, !!message.streaming);
-        if (thinkingEl) {
-          thinkingEl.outerHTML = thinkingHtml;
-        } else {
-          headerEl.insertAdjacentHTML('afterend', thinkingHtml);
-        }
-      } else if (thinkingEl) {
-        thinkingEl.remove();
-      }
-
-      const toolTrack = messageEl.querySelector('.tool-track');
-      if (message.toolCalls && message.toolCalls.length > 0) {
-        const toolHtml = renderToolTrack(message.toolCalls, panelPrefix + (messageEl.dataset.msgIdx || '0'));
-        if (toolTrack) {
-          toolTrack.outerHTML = toolHtml;
-        } else {
-          const contentEl = messageEl.querySelector('.message-content');
-          if (contentEl) {
-            contentEl.insertAdjacentHTML('afterend', toolHtml);
-          } else {
-            messageEl.insertAdjacentHTML('beforeend', toolHtml);
-          }
-        }
-      } else if (toolTrack) {
-        toolTrack.remove();
-      }
-
-      return true;
     }
 
     // 处理来自扩展的消息
@@ -2554,312 +2557,29 @@
         saveWebviewState();
         renderStatePanels();
       }
-      else if (msg.type === 'streamEvent') {
-        // 会话隔离：只处理当前会话的输出
-        if (msg.sessionId && msg.sessionId !== currentSessionId) {
-          console.log('[Webview] 忽略非当前会话的输出, msgSessionId:', msg.sessionId, 'currentSessionId:', currentSessionId);
-          return;
-        }
-
-        const source = msg.source || 'worker';
-        const cli = msg.cli || 'claude';
-        const target = msg.target;
-        if (target === 'thread' && source !== 'orchestrator') {
-          return;
-        }
-        if (target === 'cli' && source === 'orchestrator') {
-          return;
-        }
-
-        // 🔧 处理 start 事件：强制结束当前流式消息，准备创建新消息
-        if (msg.phase === 'start') {
-          console.log('[Webview] 收到 streamStart 事件, source:', source, 'cli:', cli, 'target:', target);
-
-          // 结束当前来源的所有流式消息
-          if (source === 'orchestrator' && target === 'thread') {
-            const active = findActiveStreamMessage(source, cli);
-            if (active) {
-              // 🔧 修复：如果已有预创建的空流式消息，复用它而不是结束
-              if (!active.msg.content || !active.msg.content.trim()) {
-                console.log('[Webview] 复用预创建的流式消息, streamKey:', active.msg.streamKey);
-                // 不结束，直接复用
-                setProcessingState(true);
-                return;
-              }
-              console.log('[Webview] 强制结束当前流式消息, streamKey:', active.msg.streamKey);
-              active.msg.streaming = false;
-              active.msg.pendingComplete = false;
-            }
-            // 重置流式解析状态
-            resetStreamState(cli, source);
-          } else if (target === 'cli') {
-            const cliMessages = cliOutputs[cli] || [];
-            const lastMsg = cliMessages.length > 0 ? cliMessages[cliMessages.length - 1] : null;
-            if (lastMsg && lastMsg.streaming) {
-              console.log('[Webview] 强制结束 CLI 流式消息, cli:', cli);
-              lastMsg.streaming = false;
-              lastMsg.pendingComplete = false;
-            }
-            // 重置流式解析状态
-            resetStreamState(cli, source);
-          }
-
-          setProcessingState(true);
-          return;
-        }
-
-        if (msg.phase === 'chunk') {
-          const chunk = msg.content || '';
-          const trimmedChunk = chunk.trim();
-          if (!trimmedChunk) return;
-
-          if (source === 'orchestrator') {
-            setProcessingActor(source, cli);
-          }
-          if (source === 'orchestrator' && msg.sentAt) {
-            const latency = getStreamLatency(cli);
-            if (!latency.firstSentAt) latency.firstSentAt = msg.sentAt;
-          }
-
-          const parsed = appendStreamJsonChunk(cli, chunk, source);
-          const likelyJson = trimmedChunk.startsWith('{') || trimmedChunk.startsWith('[');
-
-          let lastCliMsg = null;
-          if (source !== 'orchestrator' && target === 'cli') {
-            // 更新 CLI 面板消息（仅 Worker）
-            const cliMessages = cliOutputs[cli] || [];
-            lastCliMsg = cliMessages[cliMessages.length - 1];
-            if (!lastCliMsg || !lastCliMsg.streaming) {
-              // CLI 面板为每个 Worker 创建新的流式消息
-              const cliStreamKey = generateStreamKey(source, cli);
-              cliMessages.push({
-                role: 'assistant',
-                content: '',
-                time: new Date().toLocaleTimeString().slice(0,5),
-                timestamp: Date.now(),
-                streaming: true,
-                startedAt: Date.now(),
-                source: source,
-                cli: cli,
-                streamKey: cliStreamKey
-              });
-              lastCliMsg = cliMessages[cliMessages.length - 1];
-            }
-
-            if (parsed && parsed.hasJson) {
-              lastCliMsg.content = parsed.text || '';
-              lastCliMsg.thinking = parsed.thinking || [];
-              lastCliMsg.toolCalls = parsed.toolCalls || [];
-              if (parsed.completed) {
-                lastCliMsg.pendingComplete = true;
-              }
-            } else if (!likelyJson) {
-              lastCliMsg.content = (lastCliMsg.content || '') + chunk;
-            }
-            cliOutputs[cli] = cliMessages;
-          }
-
-          // 同步到主对话窗口（仅编排者）
-          const threadMsg = source === 'orchestrator'
-            ? applyThreadStreamUpdate(source, cli, parsed, chunk, likelyJson)
-            : null;
-
-          if (lastCliMsg) {
-            let cliNeedFullRender = false;
-            if (currentBottomTab === cli && lastCliMsg.content) {
-              if (!updateCliStreamingMessage(cli, lastCliMsg.content)) {
-                cliNeedFullRender = true;
-              } else {
-                // 🔧 修复：即使内容更新成功，也要同步更新工具面板
-                // 否则新内容会覆盖工具面板的显示
-                const container = document.getElementById('main-content');
-                const streamingMessage = container?.querySelector('.message.streaming[data-cli="' + cli + '"]');
-                if (streamingMessage && (lastCliMsg.toolCalls?.length > 0 || lastCliMsg.thinking?.length > 0)) {
-                  updateMessagePanels(streamingMessage, lastCliMsg, 'tool-cli-' + cli + '-');
-                }
-              }
-            }
-            if (parsed && parsed.hasJson) {
-              const toolCount = parsed.toolCalls ? parsed.toolCalls.length : 0;
-              const thinkingCount = parsed.thinking ? parsed.thinking.length : 0;
-              if (lastCliMsg.lastToolCount !== toolCount) {
-                cliNeedFullRender = true;
-                lastCliMsg.lastToolCount = toolCount;
-              }
-              if (lastCliMsg.lastThinkingCount !== thinkingCount) {
-                cliNeedFullRender = true;
-                lastCliMsg.lastThinkingCount = thinkingCount;
-              }
-            }
-            if (cliNeedFullRender && currentBottomTab === cli) {
-              const container = document.getElementById('main-content');
-              const streamingMessage = container?.querySelector('.message.streaming[data-cli="' + cli + '"]');
-              if (!streamingMessage || !updateMessagePanels(streamingMessage, lastCliMsg, 'tool-cli-' + cli + '-')) {
-                scheduleRenderMainContent();
-              }
-            }
-          }
-
-          if (threadMsg) {
-            const needThreadFullRender = parsed && parsed.hasJson &&
-              (threadMsg.toolCountChanged || threadMsg.thinkingCountChanged);
-            if (!needThreadFullRender && threadMsg.content) {
-              if (!updateStreamingMessage(threadMsg.streamKey, threadMsg.content)) {
-                scheduleRenderMainContent();
-              } else {
-                // 🔧 修复：即使内容更新成功，也要同步更新工具面板
-                // 否则新内容会覆盖工具面板的显示
-                const container = document.getElementById('main-content');
-                const streamingMessage = container?.querySelector('.message.streaming[data-stream-key="' + threadMsg.streamKey + '"]');
-                if (streamingMessage && (threadMsg.toolCalls?.length > 0 || threadMsg.thinking?.length > 0)) {
-                  updateMessagePanels(streamingMessage, threadMsg, 'tool-thread-');
-                }
-              }
-            } else if (needThreadFullRender) {
-              const container = document.getElementById('main-content');
-              const streamingMessage = container?.querySelector('.message.streaming[data-stream-key="' + threadMsg.streamKey + '"]');
-              if (!streamingMessage || !updateMessagePanels(streamingMessage, threadMsg, 'tool-thread-')) {
-                scheduleRenderMainContent();
-              }
-              threadMsg.toolCountChanged = false;
-              threadMsg.thinkingCountChanged = false;
-            }
-          }
-
-          throttledSaveState();
-          smoothScrollToBottom();
-          updateCliDots();
-          return;
-        }
-
-        if (msg.phase === 'complete') {
-          const content = msg.error ? ('错误: ' + msg.error) : msg.content;
-          const streamState = getStreamState(cli, source);
-
-          // 检查是否可以复用流式解析的状态（适用于所有来源）
-          const reuseStreamState = !msg.error && streamState?.hasJson && streamState.text;
-
-          // 如果没有流式状态，尝试解析完整内容
-          const parsed = !reuseStreamState && !msg.error
-            ? parseStreamJsonBuffer(msg.content || '', cli, source)
-            : null;
-
-          const finalContent = reuseStreamState
-            ? streamState.text
-            : (parsed && parsed.hasJson ? parsed.text : content);
-
-          // 获取最终的 thinking 和 toolCalls（优先使用流式状态）
-          const finalThinking = reuseStreamState
-            ? (streamState.thinking || [])
-            : (parsed && parsed.hasJson ? (parsed.thinking || []) : []);
-
-          const rawToolCalls = reuseStreamState
-            ? Array.from(streamState.toolMap.values())
-            : (parsed && parsed.hasJson ? (parsed.toolCalls || []) : []);
-
-          // 将所有运行中的工具标记为已完成
-          const finalToolCalls = rawToolCalls.map(tool =>
-            (!tool.status || tool.status === 'running')
-              ? { ...tool, status: 'completed' }
-              : tool
-          );
-
-          // 完成线程流（仅编排者）
-          const finalizedThreadMsg = source === 'orchestrator'
-            ? finalizeThreadStream(source, cli, finalContent || '', msg.error)
-            : null;
-
-          // 完成 CLI 流（仅 Worker）
-          let lastMsg = null;
-          if (source !== 'orchestrator' && target === 'cli') {
-            const cliMessages = cliOutputs[cli] || [];
-            // 查找最后一个正在流式输出的消息
-            lastMsg = cliMessages.length > 0 ? cliMessages[cliMessages.length - 1] : null;
-            if (lastMsg && lastMsg.streaming) {
-              // 更新现有消息
-              if (finalContent) lastMsg.content = finalContent;
-              lastMsg.streaming = false;
-              lastMsg.pendingComplete = false;
-              lastMsg.thinking = finalThinking;
-              lastMsg.toolCalls = finalToolCalls;
-            } else if (finalContent) {
-              // 创建新消息（流式消息丢失的情况）
-              const newStreamKey = generateStreamKey(source, cli);
-              cliMessages.push({
-                role: 'assistant',
-                content: finalContent,
-                time: new Date().toLocaleTimeString().slice(0, 5),
-                timestamp: Date.now(),
-                streaming: false,
-                source: source,
-                cli: cli,
-                streamKey: newStreamKey,
-                thinking: finalThinking,
-                toolCalls: finalToolCalls
-              });
-              lastMsg = cliMessages[cliMessages.length - 1];
-            }
-            cliOutputs[cli] = cliMessages;
-          }
-
-          saveWebviewState();
-          if (currentBottomTab === 'thread' && finalizedThreadMsg) {
-            const container = document.getElementById('main-content');
-            // 使用 finalizedThreadMsg 的 streamKey 查找元素
-            const threadStreamKey = finalizedThreadMsg.streamKey;
-            const threadEl = threadStreamKey
-              ? container?.querySelector('.message.streaming[data-stream-key="' + threadStreamKey + '"]')
-              : null;
-            if (threadEl) {
-              threadEl.classList.remove('streaming');
-              updateStreamingMessage(threadStreamKey, finalizedThreadMsg.content || '');
-              updateMessagePanels(threadEl, finalizedThreadMsg, 'tool-thread-');
-            } else {
-              scheduleRenderMainContent();
-            }
-          }
-          if (currentBottomTab === cli && lastMsg) {
-            const container = document.getElementById('main-content');
-            const cliEl = container?.querySelector('.message.streaming[data-cli="' + cli + '"]');
-            if (cliEl) {
-              cliEl.classList.remove('streaming');
-              updateCliStreamingMessage(cli, lastMsg.content || finalContent || '');
-              updateMessagePanels(cliEl, lastMsg || { content: finalContent }, 'tool-cli-' + cli + '-');
-            } else {
-              scheduleRenderMainContent();
-            }
-          }
-          if (currentBottomTab !== 'thread' && (currentBottomTab !== cli || !lastMsg)) {
-            scheduleRenderMainContent();
-          }
-          smoothScrollToBottom();
-
-          if (source === 'orchestrator') {
-            const latency = getStreamLatency(cli);
-            if (latency.firstSentAt) {
-              console.log('[MultiCLI] Orchestrator stream total latency(ms):', Date.now() - latency.firstSentAt);
-            }
-          }
-          resetStreamState(cli, source);
-
-          // 🔧 P1+P2 修复：增强 isProcessing 状态检查
-          // 检查所有来源的活跃流式消息（Thread + CLI 面板）
-          const hasActiveThreadStreaming = threadMessages.some(m => m.streaming);
-          const hasActiveCliStreaming = ['claude', 'codex', 'gemini'].some(c => {
-            const msgs = cliOutputs[c] || [];
-            return msgs.some(m => m.streaming);
-          });
-
-          if (!hasActiveThreadStreaming && !hasActiveCliStreaming) {
-            console.log('[Webview] 所有流式消息已完成，停止处理状态');
-            // 🔧 风险2修复：显式停止定时器
-            stopStreamingHintTimer();
-            setProcessingState(false);
-          }
-        }
-      }
       else if (msg.type === 'cliSessionEvent') {
         // 会话事件只记录日志，不展示到 CLI 面板
+      }
+      // 标准消息处理 - 新的消息流开始
+      else if (msg.type === 'standardMessage') {
+        if (msg.sessionId && msg.sessionId !== currentSessionId) {
+          return;
+        }
+        handleStandardMessage(msg.message);
+      }
+      // 🆕 标准消息更新 - 流式更新
+      else if (msg.type === 'standardUpdate') {
+        if (msg.sessionId && msg.sessionId !== currentSessionId) {
+          return;
+        }
+        handleStandardUpdate(msg.update);
+      }
+      // 🆕 标准消息完成
+      else if (msg.type === 'standardComplete') {
+        if (msg.sessionId && msg.sessionId !== currentSessionId) {
+          return;
+        }
+        handleStandardComplete(msg.message);
       }
       else if (msg.type === 'cliStatusChanged') { addSystemMessage(msg.cli + ' 状态已更新', 'info'); updateCliDots(); }
       else if (msg.type === 'cliStatusUpdate') { updateCliConnectionStatus(msg.statuses); }
@@ -2970,88 +2690,7 @@
         }
         saveWebviewState();
       }
-      // 新增：执行计划确认请求
-      else if (msg.type === 'orchestratorMessage') {
-        if (msg.sessionId && msg.sessionId !== currentSessionId) {
-          console.log('[Webview] 忽略非当前会话的输出, msgSessionId:', msg.sessionId, 'currentSessionId:', currentSessionId);
-          return;
-        }
-        const messageType = msg.messageType || '';
-        if (messageType === 'question_request') return;
-        if (messageType === 'plan_ready') {
-          showPlanPreview(msg.content, msg.metadata?.planId, msg.timestamp, msg.metadata?.review);
-          return;
-        }
-        if (messageType === 'worker_output') return;
-        if (messageType === 'progress_update' && msg.metadata?.result) return;
-        if (!msg.content || !msg.content.trim()) return;
-
-        // 🔧 P4 修复：增强消息去重机制
-        // 检查最近 5 条消息中是否有相同内容（使用 content + source + type 组合判断）
-        // 🔧 风险3修复：添加时间戳检查，只过滤 5 秒内的重复消息
-        const msgHash = (msg.content || '').trim() + '|' + (messageType || 'default');
-        const msgTimestamp = msg.timestamp || Date.now();
-        const recentMessages = threadMessages.slice(-5);
-        const isDuplicate = recentMessages.some(m => {
-          if (m.source !== 'orchestrator') return false;
-          const existingHash = (m.content || '').trim() + '|' + (m.type || 'default');
-          const timeDiff = Math.abs(msgTimestamp - (m.timestamp || 0));
-          // 只过滤 5 秒内的重复消息，避免误删正常消息
-          return existingHash === msgHash && timeDiff < 5000;
-        });
-        if (isDuplicate) {
-          console.log('[Webview] 跳过重复消息:', msgHash.substring(0, 50));
-          return;
-        }
-
-        const entry = {
-          role: 'assistant',
-          content: msg.content,
-          time: new Date().toLocaleTimeString().slice(0,5),
-          timestamp: msg.timestamp || Date.now(),
-          source: 'orchestrator'
-        };
-
-        if (messageType === 'error') {
-          entry.type = 'error';
-          entry.isError = true;
-        }
-
-        if (messageType === 'progress_update') {
-          entry.type = 'progress_update';
-
-          // 🔧 P5 修复：智能合并 progress_update，保留重要消息
-          // 定义重要的里程碑关键词（这些消息不应被合并）
-          const milestoneKeywords = [
-            '开始', '完成', '成功', '失败', '通过', '未通过', '跳过',
-            '第', '轮', '阶段', '验证', '联调', '汇总', '回滚',
-            '子任务', '分发', '执行模式'
-          ];
-          const isMilestone = milestoneKeywords.some(kw => entry.content.includes(kw));
-
-          const lastProgress = threadMessages[threadMessages.length - 1];
-          const lastIsMilestone = lastProgress && lastProgress.type === 'progress_update' &&
-            milestoneKeywords.some(kw => (lastProgress.content || '').includes(kw));
-
-          // 只有当前消息和上一条消息都不是里程碑时才合并
-          if (lastProgress && lastProgress.type === 'progress_update' &&
-              lastProgress.source === 'orchestrator' &&
-              !isMilestone && !lastIsMilestone) {
-            lastProgress.content = entry.content;
-            lastProgress.timestamp = entry.timestamp;
-            lastProgress.time = entry.time;
-            saveWebviewState();
-            renderMainContent();
-            smoothScrollToBottom();
-            return;
-          }
-        }
-
-        threadMessages.push(entry);
-        saveWebviewState();
-        renderMainContent();
-        smoothScrollToBottom();
-      }
+      // [已迁移到 standardMessage] orchestratorMessage 处理已移除
       else if (msg.type === 'questionRequest') {
         // 🔧 P6 修复：增强会话隔离
         if (msg.sessionId && msg.sessionId !== currentSessionId) {
@@ -3600,16 +3239,6 @@
       }
     }
 
-    // 恢复确认面板状态（切换插件后恢复）- 内联卡片无需特殊恢复，状态已在 threadMessages 中
-    function restorePlanConfirmation() {
-      // 内联卡片的状态已通过 saveWebviewState/restoreWebviewState 持久化
-      // 只需确保渲染正确即可
-      if (hasPendingConfirmation()) {
-        renderMainContent();
-      }
-    }
-
-
     // 格式化执行计划为 HTML
     function formatPlanHtml(formattedPlan) {
       // 将 Markdown 格式转换为简单 HTML
@@ -3620,130 +3249,6 @@
         .replace(/`([^`]+)`/g, '<code>$1</code>')
         .replace(/\n/g, '<br>')
         .replace(/---/g, '<hr>');
-    }
-
-    // 格式化消息内容为更友好的展示
-    // 轻量级语法高亮函数 - 修复版
-    function highlightSyntax(code, lang) {
-      const langLower = (lang || '').toLowerCase();
-
-      // 按行处理，保留原始缩进
-      const lines = code.split('\n');
-      const highlightedLines = lines.map(line => {
-        // 保存前导空格
-        const leadingSpaces = line.match(/^(\s*)/)[1];
-        const content = line.slice(leadingSpaces.length);
-
-        // 如果是空行，直接返回
-        if (!content) return leadingSpaces;
-
-       
-        const placeholders = [];
-        let tempContent = content;
-
-        // 提取并保护字符串（双引号和单引号）
-        tempContent = tempContent.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`/g, (match) => {
-          const idx = placeholders.length;
-          placeholders.push({ type: 'string', value: match });
-          return `__PLACEHOLDER_${idx}__`;
-        });
-
-        // 提取并保护注释
-        if (['js', 'javascript', 'ts', 'typescript', 'go', 'rust', 'java', 'kotlin', 'c', 'cpp'].includes(langLower)) {
-          tempContent = tempContent.replace(/\/\/.*$/g, (match) => {
-            const idx = placeholders.length;
-            placeholders.push({ type: 'comment', value: match });
-            return `__PLACEHOLDER_${idx}__`;
-          });
-        }
-        if (['py', 'python', 'sh', 'bash', 'shell', 'zsh', 'yaml', 'yml'].includes(langLower)) {
-          tempContent = tempContent.replace(/#.*$/g, (match) => {
-            const idx = placeholders.length;
-            placeholders.push({ type: 'comment', value: match });
-            return `__PLACEHOLDER_${idx}__`;
-          });
-        }
-
-        // 转义 HTML（在提取字符串和注释之后）
-        let result = escapeHtml(tempContent);
-
-        // 根据语言定义关键字
-        let keywords = [];
-        let types = [];
-        let builtins = [];
-
-        if (['js', 'javascript', 'ts', 'typescript', 'jsx', 'tsx'].includes(langLower)) {
-          keywords = ['const', 'let', 'var', 'function', 'return', 'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break', 'continue', 'try', 'catch', 'finally', 'throw', 'new', 'delete', 'typeof', 'instanceof', 'in', 'of', 'class', 'extends', 'super', 'this', 'static', 'get', 'set', 'async', 'await', 'yield', 'import', 'export', 'from', 'as', 'default', 'void', 'interface', 'type', 'enum', 'implements', 'private', 'public', 'protected', 'readonly'];
-          types = ['string', 'number', 'boolean', 'object', 'any', 'never', 'unknown', 'void', 'Array', 'Promise', 'Map', 'Set', 'Record', 'Partial', 'Required', 'Readonly'];
-          builtins = ['null', 'undefined', 'true', 'false', 'NaN', 'Infinity', 'console', 'window', 'document', 'Math', 'JSON', 'Object', 'String', 'Number', 'Boolean', 'Date', 'RegExp', 'Error'];
-        } else if (['py', 'python'].includes(langLower)) {
-          keywords = ['def', 'class', 'return', 'if', 'elif', 'else', 'for', 'while', 'try', 'except', 'finally', 'raise', 'import', 'from', 'as', 'with', 'pass', 'break', 'continue', 'lambda', 'yield', 'global', 'nonlocal', 'assert', 'del', 'in', 'is', 'not', 'and', 'or', 'async', 'await'];
-          types = ['int', 'str', 'float', 'bool', 'list', 'dict', 'tuple', 'set', 'bytes', 'type', 'object'];
-          builtins = ['True', 'False', 'None', 'self', 'print', 'len', 'range', 'open', 'input', 'super', 'isinstance', 'hasattr', 'getattr', 'setattr'];
-        } else if (['java', 'kotlin'].includes(langLower)) {
-          keywords = ['public', 'private', 'protected', 'static', 'final', 'abstract', 'class', 'interface', 'extends', 'implements', 'new', 'return', 'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break', 'continue', 'try', 'catch', 'finally', 'throw', 'throws', 'import', 'package', 'this', 'super', 'void', 'instanceof'];
-          types = ['int', 'long', 'short', 'byte', 'float', 'double', 'boolean', 'char', 'String', 'Object', 'Integer', 'List', 'Map', 'Set'];
-          builtins = ['null', 'true', 'false'];
-        } else if (['go', 'golang'].includes(langLower)) {
-          keywords = ['func', 'return', 'if', 'else', 'for', 'range', 'switch', 'case', 'default', 'break', 'continue', 'go', 'select', 'chan', 'defer', 'panic', 'recover', 'package', 'import', 'var', 'const', 'type', 'struct', 'interface', 'map', 'make', 'new'];
-          types = ['int', 'int8', 'int16', 'int32', 'int64', 'uint', 'float32', 'float64', 'string', 'bool', 'byte', 'rune', 'error'];
-          builtins = ['nil', 'true', 'false', 'iota', 'append', 'len', 'cap', 'copy', 'delete', 'close'];
-        } else if (['rust', 'rs'].includes(langLower)) {
-          keywords = ['fn', 'let', 'mut', 'const', 'return', 'if', 'else', 'match', 'for', 'while', 'loop', 'break', 'continue', 'struct', 'enum', 'impl', 'trait', 'pub', 'use', 'mod', 'crate', 'self', 'super', 'where', 'async', 'await', 'move', 'ref', 'static', 'unsafe', 'dyn'];
-          types = ['i8', 'i16', 'i32', 'i64', 'i128', 'u8', 'u16', 'u32', 'u64', 'u128', 'f32', 'f64', 'bool', 'char', 'str', 'String', 'Vec', 'Option', 'Result', 'Box', 'Rc', 'Arc'];
-          builtins = ['true', 'false', 'Some', 'None', 'Ok', 'Err', 'Self'];
-        } else if (['sh', 'bash', 'shell', 'zsh'].includes(langLower)) {
-          keywords = ['if', 'then', 'else', 'elif', 'fi', 'for', 'while', 'do', 'done', 'case', 'esac', 'function', 'return', 'exit', 'export', 'local', 'readonly', 'declare', 'in'];
-          builtins = ['echo', 'cd', 'pwd', 'ls', 'rm', 'cp', 'mv', 'mkdir', 'cat', 'grep', 'sed', 'awk', 'npm', 'node', 'git', 'curl', 'wget', 'chmod', 'chown', 'sudo'];
-        } else if (['json'].includes(langLower)) {
-          // JSON 特殊处理：还原占位符后再处理
-          result = result.replace(/__PLACEHOLDER_(\d+)__/g, (_, idx) => {
-            const ph = placeholders[parseInt(idx)];
-            return '<span class="syntax-string">' + escapeHtml(ph.value) + '</span>';
-          });
-          // 高亮布尔值和 null
-          result = result.replace(/\b(true|false|null)\b/g, '<span class="syntax-builtin">$1</span>');
-          // 高亮数字
-          result = result.replace(/:\s*(-?\d+\.?\d*(?:[eE][+-]?\d+)?)\b/g, ': <span class="syntax-number">$1</span>');
-          return leadingSpaces + result;
-        }
-
-        // 高亮数字（在关键字之前，避免匹配到 span 标签中的数字）
-        result = result.replace(/\b(\d+\.?\d*(?:[eE][+-]?\d+)?)\b/g, '<span class="syntax-number">$1</span>');
-
-        // 高亮关键字
-        keywords.forEach(kw => {
-          const regex = new RegExp('(?<![\\w-])(' + kw + ')(?![\\w-])', 'g');
-          result = result.replace(regex, '<span class="syntax-keyword">$1</span>');
-        });
-
-        // 高亮类型
-        types.forEach(t => {
-          const regex = new RegExp('(?<![\\w-])(' + t + ')(?![\\w-])', 'g');
-          result = result.replace(regex, '<span class="syntax-type">$1</span>');
-        });
-
-        // 高亮内置常量/函数
-        builtins.forEach(b => {
-          const regex = new RegExp('(?<![\\w-])(' + b + ')(?![\\w-])', 'g');
-          result = result.replace(regex, '<span class="syntax-builtin">$1</span>');
-        });
-
-       
-        result = result.replace(/__PLACEHOLDER_(\d+)__/g, (_, idx) => {
-          const ph = placeholders[parseInt(idx)];
-          if (ph.type === 'string') {
-            return '<span class="syntax-string">' + escapeHtml(ph.value) + '</span>';
-          } else if (ph.type === 'comment') {
-            return '<span class="syntax-comment">' + escapeHtml(ph.value) + '</span>';
-          }
-          return escapeHtml(ph.value);
-        });
-
-        return leadingSpaces + result;
-      });
-
-      return highlightedLines.join('\n');
     }
 
     /**
@@ -3769,6 +3274,7 @@
 
     /**
      * 渲染代码块（带行号、文件路径、差异高亮）
+     * 使用 highlight.js 进行语法高亮
      */
     function renderCodeBlock(code, lang, filepath) {
       const codeId = 'code-' + Math.random().toString(36).substr(2, 9);
@@ -3778,30 +3284,52 @@
       const lines = trimmedCode.split('\n');
       const isDiff = lang === 'diff' || lines.some(line => /^[+-](?!\+\+|--)\s/.test(line));
 
+      // 使用 highlight.js 高亮整个代码块
+      let highlightedCode = '';
+      if (typeof hljs !== 'undefined' && lang && lang !== 'text' && lang !== 'diff') {
+        try {
+          if (hljs.getLanguage(lang)) {
+            highlightedCode = hljs.highlight(trimmedCode, { language: lang, ignoreIllegals: true }).value;
+          } else {
+            // 尝试自动检测
+            highlightedCode = hljs.highlightAuto(trimmedCode).value;
+          }
+        } catch (e) {
+          console.warn('[renderCodeBlock] highlight error:', e);
+          highlightedCode = escapeHtml(trimmedCode);
+        }
+      } else {
+        highlightedCode = escapeHtml(trimmedCode);
+      }
+
+      // 将高亮后的代码按行分割
+      const highlightedLines = highlightedCode.split('\n');
+
       // 构建行号和代码行
       let lineNumbersHtml = '';
       let codeLinesHtml = '';
 
-      lines.forEach((line, idx) => {
+      lines.forEach((originalLine, idx) => {
         const lineNum = idx + 1;
         lineNumbersHtml += '<div class="code-line-number">' + lineNum + '</div>';
 
         // 检测差异行
         let lineClass = 'code-line';
-        let displayLine = line;
+        let displayLine = highlightedLines[idx] || '';
 
         if (isDiff) {
-          if (/^[+](?!\+\+)/.test(line)) {
+          if (/^[+](?!\+\+)/.test(originalLine)) {
             lineClass += ' diff-add';
-            displayLine = line.substring(1); // 移除前导 +
-          } else if (/^[-](?!--)/.test(line)) {
+            // 移除前导 + 的高亮版本
+            displayLine = displayLine.replace(/^[+]/, '');
+          } else if (/^[-](?!--)/.test(originalLine)) {
             lineClass += ' diff-del';
-            displayLine = line.substring(1); // 移除前导 -
+            // 移除前导 - 的高亮版本
+            displayLine = displayLine.replace(/^[-]/, '');
           }
         }
 
-        const highlightedLine = highlightSyntax(displayLine, lang);
-        codeLinesHtml += '<div class="' + lineClass + '">' + highlightedLine + '</div>';
+        codeLinesHtml += '<div class="' + lineClass + '">' + displayLine + '</div>';
       });
 
       // 构建头部信息
@@ -3838,328 +3366,49 @@
       vscode.postMessage({ type: 'openFile', filepath: filepath });
     }
 
-    /**
-     * 解析 Markdown 表格
-     * 支持格式: | col1 | col2 | 和对齐语法 |:---|:---:|---:|
-     */
-    function parseMarkdownTables(content) {
-      const lines = content.split('\n');
-      const result = [];
-      let i = 0;
-
-      while (i < lines.length) {
-        const line = lines[i];
-
-        // 检测表格头行 (必须以 | 开头或包含 |)
-        if (line.includes('|') && i + 1 < lines.length) {
-          const nextLine = lines[i + 1];
-          // 检测分隔行 (包含 |---| 或 |:---| 等)
-          if (/^\|?[\s]*:?-+:?[\s]*\|/.test(nextLine) || /\|[\s]*:?-+:?[\s]*\|?$/.test(nextLine)) {
-            // 解析表格
-            const tableLines = [line, nextLine];
-            let j = i + 2;
-
-            // 收集表格数据行
-            while (j < lines.length && lines[j].includes('|')) {
-              tableLines.push(lines[j]);
-              j++;
-            }
-
-            // 转换为 HTML 表格
-            const tableHtml = convertTableToHtml(tableLines);
-            result.push(tableHtml);
-            i = j;
-            continue;
-          }
-        }
-
-        result.push(line);
-        i++;
-      }
-
-      return result.join('\n');
-    }
-
-    /**
-     * 将表格行转换为 HTML
-     */
-    function convertTableToHtml(tableLines) {
-      if (tableLines.length < 2) return tableLines.join('\n');
-
-      // 解析对齐方式
-      const alignLine = tableLines[1];
-      const alignCells = alignLine.split('|').filter(c => c.trim());
-      const alignments = alignCells.map(cell => {
-        const trimmed = cell.trim();
-        if (trimmed.startsWith(':') && trimmed.endsWith(':')) return 'center';
-        if (trimmed.endsWith(':')) return 'right';
-        return 'left';
-      });
-
-      // 解析单元格
-      const parseRow = (line) => {
-        return line.split('|')
-          .filter((_, idx, arr) => idx > 0 && idx < arr.length - 1 || (arr.length === 2 && idx === 0))
-          .map(c => c.trim());
-      };
-
-      // 构建 HTML
-      let html = '<div class="table-wrapper"><table class="md-table">';
-
-      // 表头
-      const headerCells = parseRow(tableLines[0]);
-      html += '<thead><tr>';
-      headerCells.forEach((cell, idx) => {
-        const align = alignments[idx] || 'left';
-        html += `<th style="text-align:${align}">${cell}</th>`;
-      });
-      html += '</tr></thead>';
-
-      // 表体
-      if (tableLines.length > 2) {
-        html += '<tbody>';
-        for (let i = 2; i < tableLines.length; i++) {
-          const cells = parseRow(tableLines[i]);
-          html += '<tr>';
-          cells.forEach((cell, idx) => {
-            const align = alignments[idx] || 'left';
-            html += `<td style="text-align:${align}">${cell}</td>`;
-          });
-          html += '</tr>';
-        }
-        html += '</tbody>';
-      }
-
-      html += '</table></div>';
-      return html;
-    }
-
     // Markdown 渲染函数
     /**
-     * Markdown 渲染函数 - 参考 Augment 设计
+     * Markdown 渲染函数 - 使用 marked 库
      * 支持：标题、列表、代码块、行内代码、粗体、斜体、链接、图片、表格、引用、分隔线
      */
     function renderMarkdown(content) {
       if (!content) return '';
-      content = content.replace(/\r\n/g, '\n');
 
-      // 占位符数组
-      const codeBlockPlaceholders = [];
-      const inlineCodePlaceholders = [];
-
-      // 1. 处理代码块（最高优先级，避免内部内容被其他规则处理）
-      content = content.replace(/```([^\n]*)[ \t]*\n?([\s\S]*?)```/g, function(match, langLine, code) {
-        const { lang, filepath } = parseCodeBlockMeta(langLine);
-        const html = renderCodeBlock(code, lang, filepath);
-        if (!html) return '';
-        const idx = codeBlockPlaceholders.length;
-        codeBlockPlaceholders.push(html);
-        return `\n__CODEBLOCK_${idx}__\n`;
-      });
-
-      // 2. 处理行内代码
-      content = content.replace(/`([^`\n]+)`/g, function(match, code) {
-        const idx = inlineCodePlaceholders.length;
-        inlineCodePlaceholders.push('<code class="markdown-codespan">' + escapeHtml(code) + '</code>');
-        return `__INLINECODE_${idx}__`;
-      });
-
-      // 3. 处理标题 (H1-H6)
-      content = content.replace(/^(#{1,6})\s+(.+)$/gm, function(match, hashes, text) {
-        const level = hashes.length;
-        return `<h${level}>${text.trim()}</h${level}>`;
-      });
-
-      // 4. 处理图片 (在链接之前处理)
-      content = content.replace(/!\[([^\]]*)\]\(([^)]+)\)/g,
-        '<img src="$2" alt="$1" class="markdown-image">');
-
-      // 5. 处理粗体和斜体
-      content = content.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
-      content = content.replace(/___(.+?)___/g, '<strong><em>$1</em></strong>');
-      content = content.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-      content = content.replace(/__(.+?)__/g, '<strong>$1</strong>');
-      content = content.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
-      content = content.replace(/_([^_\n]+)_/g, '<em>$1</em>');
-
-      // 6. 处理删除线和高亮
-      content = content.replace(/~~(.+?)~~/g, '<del>$1</del>');
-      content = content.replace(/==(.+?)==/g, '<mark>$1</mark>');
-
-      // 7. 处理链接
-      content = content.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" class="markdown-link">$1</a>');
-
-      // 8. 处理任务列表 (在普通列表之前)
-      content = content.replace(/^(\s*)[\-\*]\s+\[x\]\s+(.+)$/gm,
-        '$1<li class="task-item task-done"><input type="checkbox" checked disabled><span>$2</span></li>');
-      content = content.replace(/^(\s*)[\-\*]\s+\[\s?\]\s+(.+)$/gm,
-        '$1<li class="task-item"><input type="checkbox" disabled><span>$2</span></li>');
-
-      // 9. 处理有序列表（改进版：正确处理连续列表项）
-      content = processOrderedLists(content);
-
-      // 10. 处理无序列表（改进版：正确处理连续列表项）
-      content = processUnorderedLists(content);
-
-      // 11. 处理引用块
-      content = content.replace(/^>\s*(.*)$/gm, '<blockquote-line>$1</blockquote-line>');
-      content = content.replace(/(<blockquote-line>.*<\/blockquote-line>\n?)+/g, function(match) {
-        const lines = match.replace(/<blockquote-line>/g, '').replace(/<\/blockquote-line>/g, '').trim();
-        return '<blockquote>' + lines + '</blockquote>';
-      });
-
-      // 12. 处理分隔线
-      content = content.replace(/^(---|\*\*\*|___)$/gm, '<hr>');
-
-      // 13. 处理表格
-      content = parseMarkdownTables(content);
-
-      // 14. 还原占位符
-      content = content.replace(/__INLINECODE_(\d+)__/g, (_, idx) => inlineCodePlaceholders[parseInt(idx)]);
-      content = content.replace(/__CODEBLOCK_(\d+)__/g, (_, idx) => codeBlockPlaceholders[parseInt(idx)]);
-
-      // 15. 处理段落
-      content = processParagraphs(content);
-
-      return content;
-    }
-
-    /**
-     * 处理有序列表 - 改进版
-     */
-    function processOrderedLists(content) {
-      const lines = content.split('\n');
-      const result = [];
-      let inList = false;
-      let listItems = [];
-
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        const match = line.match(/^(\s*)(\d+)\.\s+(.+)$/);
-
-        if (match) {
-          if (!inList) {
-            inList = true;
-            listItems = [];
-          }
-          listItems.push('<li>' + match[3] + '</li>');
-        } else {
-          if (inList) {
-            result.push('<ol class="markdown-ol">' + listItems.join('') + '</ol>');
-            inList = false;
-            listItems = [];
-          }
-          result.push(line);
-        }
+      // 检查 marked 是否可用
+      if (typeof marked === 'undefined') {
+        console.warn('[renderMarkdown] marked 库未加载，使用简单渲染');
+        return escapeHtml(content).replace(/\n/g, '<br>');
       }
 
-      if (inList) {
-        result.push('<ol class="markdown-ol">' + listItems.join('') + '</ol>');
+      try {
+        // 使用自定义 renderer 处理代码块
+        const renderer = new marked.Renderer();
+
+        // 自定义代码块渲染（保留行号、diff 高亮、文件路径功能）
+        renderer.code = function(code, infostring) {
+          const { lang, filepath } = parseCodeBlockMeta(infostring || '');
+          return renderCodeBlock(code, lang, filepath);
+        };
+
+        // 自定义链接渲染（添加 target="_blank"）
+        renderer.link = function(href, title, text) {
+          const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+          return `<a href="${escapeHtml(href)}"${titleAttr} target="_blank" class="markdown-link">${text}</a>`;
+        };
+
+        // 自定义图片渲染
+        renderer.image = function(href, title, text) {
+          const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+          return `<img src="${escapeHtml(href)}" alt="${escapeHtml(text)}"${titleAttr}>`;
+        };
+
+        // 渲染 Markdown
+        const html = marked.parse(content, { renderer });
+        return html;
+      } catch (e) {
+        console.error('[renderMarkdown] 解析错误:', e);
+        return escapeHtml(content).replace(/\n/g, '<br>');
       }
-
-      return result.join('\n');
-    }
-
-    /**
-     * 处理无序列表 - 改进版
-     */
-    function processUnorderedLists(content) {
-      const lines = content.split('\n');
-      const result = [];
-      let inList = false;
-      let listItems = [];
-
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        // 匹配无序列表项，但排除任务列表（已经处理过）
-        const match = line.match(/^(\s*)[\-\*]\s+(?!\[[ x]\])(.+)$/);
-
-        if (match && !line.includes('task-item')) {
-          if (!inList) {
-            inList = true;
-            listItems = [];
-          }
-          listItems.push('<li>' + match[2] + '</li>');
-        } else {
-          if (inList) {
-            result.push('<ul class="markdown-ul">' + listItems.join('') + '</ul>');
-            inList = false;
-            listItems = [];
-          }
-          result.push(line);
-        }
-      }
-
-      if (inList) {
-        result.push('<ul class="markdown-ul">' + listItems.join('') + '</ul>');
-      }
-
-      return result.join('\n');
-    }
-
-    /**
-     * 处理段落 - 改进版
-     */
-    function processParagraphs(content) {
-      const lines = content.split('\n');
-      let result = '';
-      let paragraphLines = [];
-
-      const isBlockElement = (line) => {
-        const trimmed = line.trim();
-        return trimmed.startsWith('<h') ||
-               trimmed.startsWith('<ul') ||
-               trimmed.startsWith('<ol') ||
-               trimmed.startsWith('<blockquote') ||
-               trimmed.startsWith('<hr') ||
-               trimmed.startsWith('<div') ||
-               trimmed.startsWith('<table') ||
-               trimmed.startsWith('<pre') ||
-               trimmed.startsWith('</') ||
-               trimmed.startsWith('<li') ||
-               trimmed === '';
-      };
-
-      const flushParagraph = () => {
-        if (paragraphLines.length > 0) {
-          const text = paragraphLines.join(' ').trim();
-          if (text) {
-            result += '<p class="markdown-paragraph">' + text + '</p>\n';
-          }
-          paragraphLines = [];
-        }
-      };
-
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-
-        if (isBlockElement(line)) {
-          flushParagraph();
-          if (line.trim()) {
-            result += line + '\n';
-          }
-        } else {
-          paragraphLines.push(line);
-        }
-      }
-
-      flushParagraph();
-      return result;
-    }
-
-    function sanitizeOrchestratorMessage(content) {
-      if (!content) return '';
-      let text = content.replace(/```[\s\S]*?```/g, '');
-      text = text.replace(/`([^`]+)`/g, '$1');
-      const lines = text.split('\n');
-      const filtered = lines.filter(line => {
-        const trimmed = line.trim();
-        if (!trimmed) return true;
-        if (/^(diff|index |\+\+\+|---|@@)/i.test(trimmed)) return false;
-        if (/^(文件|修改文件|变更|diff|patch|文件列表)/i.test(trimmed)) return false;
-        return true;
-      });
-      return filtered.join('\n').replace(/\n{3,}/g, '\n\n').trim();
     }
 
     function shouldRenderAsCodeBlock(content) {
@@ -4264,11 +3513,6 @@
         };
       }
       return streamStates[key];
-    }
-
-    function resetStreamState(cli, role) {
-      const key = (role ? role + ':' : '') + (cli || 'orchestrator');
-      delete streamStates[key];
     }
 
     function upsertTool(toolMap, tool) {
@@ -4491,253 +3735,333 @@
       }
     }
 
-    function appendStreamJsonChunk(cli, chunk, role) {
-      const state = getStreamState(cli, role);
-      const incoming = String(chunk || '');
-      const combined = state.pending + incoming;
-      const lines = combined.split('\n');
-      state.pending = combined.endsWith('\n') ? '' : (lines.pop() || '');
+    // =========================================================================
+    // 🆕 标准消息处理函数
+    // =========================================================================
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        if (!trimmed.startsWith('{')) continue;
-        let parsed = null;
-        try {
-          parsed = JSON.parse(trimmed);
-        } catch {
-          state.pending = trimmed + (state.pending ? ('\n' + state.pending) : '');
-          continue;
-        }
-        if (!parsed) continue;
-        state.hasJson = true;
-        applyParsedChunk(parsed, state);
+    // 标准消息存储 - 按 messageId 索引
+    const standardMessages = new Map();
+
+    /**
+     * 处理新的标准消息
+     */
+    function handleStandardMessage(message) {
+      if (!message || !message.id) {
+        console.warn('[Webview] 收到无效的标准消息:', message);
+        return;
       }
 
-      return {
-        text: state.text,
-        toolCalls: Array.from(state.toolMap.values()),
-        thinking: state.thinking,
-        hasJson: state.hasJson,
-        completed: state.completed
-      };
-    }
+      console.log('[Webview] 收到标准消息:', message.id, message.type, message.lifecycle);
 
-    function parseStreamJsonBuffer(buffer, cli, role) {
-      const lines = String(buffer || '').split('\n').filter(l => l.trim());
-      const state = getStreamState(cli, role);
-      const toolMap = state.toolMap;
-      const thinking = state.thinking;
-      let text = '';
-      let hasJson = false;
+      // 存储消息
+      standardMessages.set(message.id, message);
 
-      const upsert = (tool) => {
-        if (!tool) return;
-        const isResult = tool.kind === 'result' || tool.name === '工具结果';
-        const id = tool.id || tool.tool_call_id || (isResult ? '' : tool.name) || ('tool-' + toolMap.size);
-        if (id && toolMap.has(id)) {
-          const existing = toolMap.get(id);
-          const keepName = existing?.name && (isResult || tool.name === '工具调用');
-          toolMap.set(id, {
-            ...existing,
-            ...tool,
-            name: keepName ? existing.name : (tool.name || existing.name),
-            input: tool.input ?? existing.input,
-            result: tool.result ?? existing.result,
-            status: tool.status || existing.status
-          });
-          return;
-        }
-        if (isResult) {
-          let lastRunningKey = null;
-          for (const [key, value] of toolMap.entries()) {
-            if (value && (value.kind === 'call' || !value.kind) && (value.status === 'running' || !value.status)) {
-              lastRunningKey = key;
-            }
-          }
-          if (lastRunningKey) {
-            const existing = toolMap.get(lastRunningKey);
-            toolMap.set(lastRunningKey, {
-              ...existing,
-              result: tool.result ?? existing.result,
-              status: 'completed'
-            });
+      // 获取目标信息
+      const isOrchestrator = message.source === 'orchestrator';
+      const cli = message.cli || 'claude';
+      const target = message.metadata?.extra?.target || (isOrchestrator ? 'thread' : 'cli');
+
+      // 处理特殊消息类型
+      if (message.type === 'plan') {
+        // 计划预览消息 - 调用 showPlanPreview
+        const content = extractTextFromBlocks(message.blocks || []);
+        const planId = message.metadata?.taskId || message.id;
+        showPlanPreview(content, planId, message.timestamp, message.metadata?.extra?.review);
+        return;
+      }
+
+      // 检查是否已存在该消息（避免重复添加）
+      const messages = isOrchestrator ? threadMessages : (cliOutputs[cli] || []);
+      const existingMsg = messages.find(m => m.standardMessageId === message.id);
+
+      if (existingMsg) {
+        // 更新现有消息
+        const updatedMsg = standardToWebviewMessage(message);
+        Object.assign(existingMsg, updatedMsg);
+      } else {
+        // 转换为 Webview 消息格式
+        const webviewMsg = standardToWebviewMessage(message);
+
+        // 处理进度更新消息的合并逻辑
+        if (message.type === 'progress' && isOrchestrator) {
+          const milestoneKeywords = [
+            '开始', '完成', '成功', '失败', '通过', '未通过', '跳过',
+            '第', '轮', '阶段', '验证', '联调', '汇总', '回滚',
+            '子任务', '分发', '执行模式'
+          ];
+          const isMilestone = milestoneKeywords.some(kw => (webviewMsg.content || '').includes(kw));
+          const lastProgress = threadMessages[threadMessages.length - 1];
+          const lastIsMilestone = lastProgress && lastProgress.messageType === 'progress' &&
+            milestoneKeywords.some(kw => (lastProgress.content || '').includes(kw));
+
+          // 只有当前消息和上一条消息都不是里程碑时才合并
+          if (lastProgress && lastProgress.messageType === 'progress' &&
+              lastProgress.source === 'orchestrator' &&
+              !isMilestone && !lastIsMilestone) {
+            lastProgress.content = webviewMsg.content;
+            lastProgress.timestamp = webviewMsg.timestamp;
+            lastProgress.time = webviewMsg.time;
+            saveWebviewState();
+            scheduleRenderMainContent();
+            smoothScrollToBottom();
             return;
           }
         }
-        if (id) {
-          toolMap.set(id, tool);
+
+        if (isOrchestrator) {
+          // 编排者消息 -> Thread 面板
+          threadMessages.push(webviewMsg);
         } else {
-          toolMap.set('tool-' + toolMap.size, tool);
-        }
-      };
-
-      for (const line of lines) {
-        if (!line.trim().startsWith('{')) continue;
-        let parsed = null;
-        try {
-          parsed = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (!parsed) continue;
-        hasJson = true;
-
-        if (parsed.type === 'assistant' && parsed.message?.content) {
-          for (const block of parsed.message.content) {
-            if (block.type === 'text' && block.text) {
-              state.text += block.text;
-            }
-            if (block.type === 'thinking' && block.thinking) {
-              thinking.push(block.thinking);
-            }
-            if (block.type === 'tool_use') {
-              upsert({
-                id: block.id,
-                name: block.name || '工具调用',
-                input: formatToolPayload(block.input),
-                status: 'running',
-                kind: 'call'
-              });
-            }
-            if (block.type === 'tool_result') {
-              upsert({
-                id: block.tool_use_id || block.id,
-                name: block.name || '工具结果',
-                result: formatToolPayload(block.content || block.result || block.output),
-                status: 'completed',
-                kind: 'result'
-              });
-              const toolText = formatToolPayload(block.content || block.result || block.output);
-              if (toolText) {
-                appendStreamTextWithGap(state, toolText);
-              }
-            }
+          // Worker 消息 -> CLI 面板
+          if (!cliOutputs[cli]) {
+            cliOutputs[cli] = [];
           }
-          continue;
-        }
-
-        if (parsed.type === 'item.completed' && parsed.item) {
-          if (parsed.item.type === 'agent_message' && parsed.item.text) {
-            state.text += parsed.item.text;
-          } else if (parsed.item.type === 'reasoning' && parsed.item.text) {
-            thinking.push(parsed.item.text);
-          }
-          continue;
-        }
-
-        if (parsed.type === 'user' && parsed.message?.content) {
-          for (const block of parsed.message.content) {
-            if (block.type === 'tool_result') {
-              upsert({
-                id: block.tool_use_id || block.id,
-                name: block.name || '工具结果',
-                result: formatToolPayload(block.content || block.result || block.output),
-                status: 'completed',
-                kind: 'result'
-              });
-              const toolText = formatToolPayload(block.content || block.result || block.output);
-              if (toolText) {
-                state.text += (state.text ? '\n\n' : '') + toolText;
-              }
-            }
-          }
-          continue;
-        }
-
-        if (parsed.type === 'message' && parsed.role === 'user' && Array.isArray(parsed.content)) {
-          for (const block of parsed.content) {
-            if (block?.type === 'tool_result') {
-              upsert({
-                id: block.tool_use_id || block.id,
-                name: block.name || '工具结果',
-                result: formatToolPayload(block.content || block.result || block.output),
-                status: 'completed',
-                kind: 'result'
-              });
-              const toolText = formatToolPayload(block.content || block.result || block.output);
-              if (toolText) {
-                state.text += (state.text ? '\n\n' : '') + toolText;
-              }
-            }
-          }
-          continue;
-        }
-
-        if (parsed.type === 'message' && parsed.role === 'assistant' && parsed.content) {
-          appendStreamText(state, parsed.content);
-          continue;
-        }
-
-        if (parsed.type === 'thinking' && parsed.content) {
-          thinking.push(parsed.content);
-          continue;
-        }
-
-        if (parsed.thinking) {
-          if (Array.isArray(parsed.thinking)) {
-            thinking.push(...parsed.thinking);
-          } else {
-            thinking.push(parsed.thinking);
-          }
-          continue;
-        }
-
-        const toolCalls = parsed.tool_calls || parsed.toolCalls || parsed.tools;
-        if (Array.isArray(toolCalls) && toolCalls.length > 0) {
-          toolCalls.forEach(call => {
-            const fn = call.function || call.func || {};
-            upsert({
-              id: call.id || call.tool_call_id,
-              name: call.name || fn.name || '工具调用',
-              input: formatToolPayload(call.input || fn.arguments || call.arguments),
-              status: call.status || 'running',
-              kind: 'call'
-            });
-          });
-          continue;
-        }
-
-        if (parsed.type === 'tool_call' || parsed.type === 'tool_use') {
-          upsert({
-            id: parsed.id || parsed.tool_call_id,
-            name: parsed.name || parsed.tool_name || '工具调用',
-            input: formatToolPayload(parsed.input || parsed.arguments),
-            status: parsed.status || 'running',
-            kind: 'call'
-          });
-          continue;
-        }
-
-        if (parsed.type === 'tool_result' || parsed.type === 'tool_response') {
-          upsert({
-            id: parsed.tool_call_id || parsed.id,
-            name: parsed.name || parsed.tool_name || '工具结果',
-            result: formatToolPayload(parsed.result || parsed.output || parsed.content),
-            status: 'completed',
-            kind: 'result'
-          });
-          const toolText = formatToolPayload(parsed.result || parsed.output || parsed.content);
-          if (toolText) {
-            appendStreamTextWithGap(state, toolText);
-          }
-          continue;
-        }
-
-        if (parsed.type === 'result' && (parsed.result || parsed.response)) {
-          if (!state.text) {
-            state.text = parsed.result || parsed.response;
-          }
-          state.completed = true;
+          cliOutputs[cli].push(webviewMsg);
         }
       }
 
+      // 设置处理状态
+      if (message.lifecycle === 'streaming') {
+        setProcessingState(true);
+        setProcessingActor(message.source, cli);
+      }
+
+      saveWebviewState();
+      scheduleRenderMainContent();
+      smoothScrollToBottom();
+      updateCliDots();
+    }
+
+    /**
+     * 处理标准消息更新（流式）
+     */
+    function handleStandardUpdate(update) {
+      if (!update || !update.messageId) {
+        return;
+      }
+
+      const message = standardMessages.get(update.messageId);
+      if (!message) {
+        console.warn('[Webview] 未找到消息:', update.messageId);
+        return;
+      }
+
+      // 应用更新到标准消息
+      applyUpdateToStandardMessage(message, update);
+
+      // 查找并更新对应的 Webview 消息
+      const isOrchestrator = message.source === 'orchestrator';
+      const cli = message.cli || 'claude';
+      const messages = isOrchestrator ? threadMessages : (cliOutputs[cli] || []);
+
+      const webviewMsg = messages.find(m => m.standardMessageId === update.messageId);
+      if (webviewMsg) {
+        // 应用更新
+        if (update.updateType === 'append' && update.appendText) {
+          webviewMsg.content = (webviewMsg.content || '') + update.appendText;
+
+          // 尝试增量更新 DOM
+          const updateSuccess = isOrchestrator
+            ? updateStreamingMessage(webviewMsg.streamKey, webviewMsg.content)
+            : updateCliStreamingMessage(cli, webviewMsg.content);
+
+          if (!updateSuccess) {
+            scheduleRenderMainContent();
+          }
+        } else if (update.updateType === 'replace' && update.replaceText !== undefined) {
+          webviewMsg.content = update.replaceText;
+          scheduleRenderMainContent();
+        } else if (update.updateType === 'block_update' && update.blocks) {
+          // 更新 thinking 和 toolCalls
+          const newThinking = extractThinkingFromBlocks(update.blocks);
+          const newToolCalls = extractToolCallsFromBlocks(update.blocks);
+          if (newThinking.length > 0) {
+            webviewMsg.thinking = [...(webviewMsg.thinking || []), ...newThinking];
+          }
+          if (newToolCalls.length > 0) {
+            // 合并工具调用
+            const toolMap = new Map((webviewMsg.toolCalls || []).map(t => [t.id, t]));
+            for (const tool of newToolCalls) {
+              toolMap.set(tool.id, tool);
+            }
+            webviewMsg.toolCalls = Array.from(toolMap.values());
+          }
+          scheduleRenderMainContent();
+        }
+      }
+
+      throttledSaveState();
+      smoothScrollToBottom();
+      updateCliDots();
+    }
+
+    /**
+     * 处理标准消息完成
+     */
+    function handleStandardComplete(message) {
+      if (!message || !message.id) {
+        return;
+      }
+
+      console.log('[Webview] 标准消息完成:', message.id, message.lifecycle);
+
+      // 更新存储的消息
+      standardMessages.set(message.id, message);
+
+      // 查找并更新对应的 Webview 消息
+      const isOrchestrator = message.source === 'orchestrator';
+      const cli = message.cli || 'claude';
+      const messages = isOrchestrator ? threadMessages : (cliOutputs[cli] || []);
+
+      const webviewMsg = messages.find(m => m.standardMessageId === message.id);
+      if (webviewMsg) {
+        // 更新最终状态
+        const finalMsg = standardToWebviewMessage(message);
+        Object.assign(webviewMsg, finalMsg);
+        webviewMsg.streaming = false;
+
+        if (message.lifecycle === 'interrupted') {
+          webviewMsg.interrupted = true;
+        }
+        if (message.lifecycle === 'failed') {
+          webviewMsg.error = message.metadata?.error;
+        }
+      }
+
+      // 检查是否还有活跃的流式消息
+      const hasActiveStreaming = threadMessages.some(m => m.streaming) ||
+        ['claude', 'codex', 'gemini'].some(c => (cliOutputs[c] || []).some(m => m.streaming));
+
+      if (!hasActiveStreaming) {
+        stopStreamingHintTimer();
+        setProcessingState(false);
+      }
+
+      saveWebviewState();
+      scheduleRenderMainContent();
+      smoothScrollToBottom();
+    }
+
+    /**
+     * 将标准消息转换为 Webview 消息格式
+     */
+    function standardToWebviewMessage(message) {
+      // 🆕 直接使用后端已解析的 blocks，不再重新解析
+      const blocks = message.blocks || [];
+      const textContent = extractTextFromBlocks(blocks);
+      const thinking = extractThinkingFromBlocks(blocks);
+      const toolCalls = extractToolCallsFromBlocks(blocks);
+      const codeBlocks = extractCodeBlocksFromBlocks(blocks);
+
       return {
-        text: state.text,
-        toolCalls: Array.from(toolMap.values()),
-        thinking,
-        hasJson
+        role: message.source === 'user' ? 'user' : 'assistant',
+        content: textContent,
+        time: new Date(message.timestamp).toLocaleTimeString().slice(0, 5),
+        timestamp: message.timestamp,
+        streaming: message.lifecycle === 'streaming',
+        startedAt: message.lifecycle === 'streaming' ? Date.now() : undefined,
+        source: message.source,
+        cli: message.cli,
+        streamKey: generateStreamKey(message.source, message.cli),
+        thinking: thinking,
+        toolCalls: toolCalls,
+        codeBlocks: codeBlocks,  // 🆕 新增：已解析的代码块
+        parsedBlocks: blocks,     // 🆕 新增：保留原始 blocks 供渲染使用
+        // 标准消息扩展字段
+        standardMessageId: message.id,
+        traceId: message.traceId,
+        lifecycle: message.lifecycle,
+        messageType: message.type,
       };
+    }
+
+    /**
+     * 从内容块中提取文本（包括 markdown）
+     * 🆕 后端已解析，这里只需要提取
+     */
+    function extractTextFromBlocks(blocks) {
+      return blocks
+        .filter(b => b.type === 'text')
+        .map(b => b.content)
+        .join('\n');
+    }
+
+    /**
+     * 🆕 从内容块中提取代码块
+     */
+    function extractCodeBlocksFromBlocks(blocks) {
+      return blocks
+        .filter(b => b.type === 'code')
+        .map(b => ({
+          language: b.language || 'text',
+          content: b.content,
+          filename: b.filename,
+        }));
+    }
+
+    /**
+     * 从内容块中提取思考内容
+     */
+    function extractThinkingFromBlocks(blocks) {
+      return blocks
+        .filter(b => b.type === 'thinking')
+        .map(b => ({
+          content: b.content,
+          summary: b.summary,
+        }));
+    }
+
+    /**
+     * 从内容块中提取工具调用
+     */
+    function extractToolCallsFromBlocks(blocks) {
+      return blocks
+        .filter(b => b.type === 'tool_call')
+        .map(b => ({
+          id: b.toolId,
+          name: b.toolName,
+          status: b.status,
+          input: b.input,
+          output: b.output,
+          error: b.error,
+        }));
+    }
+
+    /**
+     * 应用更新到标准消息
+     */
+    function applyUpdateToStandardMessage(message, update) {
+      if (update.updateType === 'append' && update.appendText) {
+        // 找到或创建文本块
+        let textBlock = message.blocks.find(b => b.type === 'text');
+        if (!textBlock) {
+          textBlock = { type: 'text', content: '', isMarkdown: true };
+          message.blocks.push(textBlock);
+        }
+        textBlock.content += update.appendText;
+      } else if (update.updateType === 'replace' && update.replaceText !== undefined) {
+        let textBlock = message.blocks.find(b => b.type === 'text');
+        if (!textBlock) {
+          textBlock = { type: 'text', content: '', isMarkdown: true };
+          message.blocks.push(textBlock);
+        }
+        textBlock.content = update.replaceText;
+      } else if (update.updateType === 'block_update' && update.blocks) {
+        // 合并新的块
+        for (const newBlock of update.blocks) {
+          if (newBlock.type === 'tool_call') {
+            // 工具调用按 ID 更新
+            const existing = message.blocks.find(b => b.type === 'tool_call' && b.toolId === newBlock.toolId);
+            if (existing) {
+              Object.assign(existing, newBlock);
+            } else {
+              message.blocks.push(newBlock);
+            }
+          } else {
+            message.blocks.push(newBlock);
+          }
+        }
+      }
     }
 
     // 复制代码块（适配新的行号结构）
@@ -4771,189 +4095,85 @@
       });
     }
 
-    function extractJsonInfo(content) {
-      if (!content) return { isJson: false, jsonText: '' };
-      const trimmed = content.trim();
-      if (!trimmed) return { isJson: false, jsonText: '' };
-      if (!(trimmed.startsWith('{') || trimmed.startsWith('['))) return { isJson: false, jsonText: '' };
-      try {
-        JSON.parse(trimmed);
-        return { isJson: true, jsonText: trimmed };
-      } catch {
-        return { isJson: false, jsonText: '' };
-      }
-    }
-
-    function extractSingleCodeFence(content) {
-      if (!content) return null;
-      const trimmed = content.trim();
-      const match = trimmed.match(/^```(\w*)\s*\n([\s\S]*?)\n?```\s*$/);
-      if (!match) return null;
-      return { lang: match[1] || '', body: match[2] || '' };
-    }
-
-    function buildToolPayloads(toolCalls) {
-      const payloads = new Set();
-      const jsonPayloads = new Set();
-      if (!Array.isArray(toolCalls)) return { payloads, jsonPayloads };
-      toolCalls.forEach(call => {
-        const raw = call?.input;
-        if (raw === undefined || raw === null) return;
-        const text = formatToolPayload(raw).trim();
-        if (!text) return;
-        payloads.add(text);
-        if (text.startsWith('{') || text.startsWith('[')) {
-          try {
-            const parsed = JSON.parse(text);
-            jsonPayloads.add(JSON.stringify(parsed));
-          } catch {
-            // ignore parse errors
-          }
-        }
-      });
-      return { payloads, jsonPayloads };
-    }
-
-    function escapeRegExp(text) {
-      return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    }
-
-    function stripToolPayloadsFromContent(content, toolPayloads) {
-      if (!content || !toolPayloads) return content;
-      let result = content;
-      toolPayloads.payloads.forEach(payload => {
-        if (!payload) return;
-        const escaped = escapeRegExp(payload.trim());
-        if (!escaped) return;
-        // Remove fenced code blocks that are exactly the tool payload
-        const fenced = new RegExp('```[\\w-]*\\s*\\n' + escaped + '\\n?```', 'g');
-        result = result.replace(fenced, '');
-        // Remove standalone payload blocks
-        if (result.trim() === payload.trim()) {
-          result = '';
-        }
-      });
-      return result;
-    }
-
-    function matchesToolPayload(text, toolPayloads) {
-      if (!text) return false;
-      const trimmed = text.trim();
-      if (!trimmed) return false;
-      if (toolPayloads.payloads.has(trimmed)) return true;
-      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-        try {
-          const parsed = JSON.parse(trimmed);
-          const compact = JSON.stringify(parsed);
-          if (toolPayloads.jsonPayloads.has(compact)) return true;
-        } catch {
-          return false;
-        }
-      }
-      return false;
-    }
-
-    function collapseExtraBlankLines(text) {
-      if (!text) return '';
-      const normalized = String(text).replace(/\r\n/g, '\n');
-      const parts = normalized.split(/```/);
-      return parts.map((part, idx) => {
-        if (idx % 2 === 1) return part;
-        return part.replace(/\n{2,}/g, '\n');
-      }).join('```');
-    }
-
-    function normalizePlainText(text) {
-      if (!text) return '';
-      return String(text)
-        .replace(/<br\s*\/?>/gi, '\n')
-        .replace(/\\r\\n/g, '\n')
-        .replace(/\\n/g, '\n')
-        .replace(/\\r/g, '\n')
-        .replace(/\\t/g, '\t');
-    }
-
-    function normalizeMessageContent(content, options) {
-      // 预处理：清理 ANSI 转义序列、零宽字符等
-      const sanitized = sanitizeCliOutput(content || '');
-      const raw = collapseExtraBlankLines(sanitized);
-      const trimmed = raw.trim();
-      if (!trimmed) {
-        return { type: 'empty', content: '' };
+    /**
+     * 直接渲染后端已解析的 blocks
+     * 这是唯一的渲染入口，不再需要前端解析
+     */
+    function renderParsedBlocks(blocks, cli) {
+      if (!blocks || blocks.length === 0) {
+        return { html: '', isMarkdown: false };
       }
 
-      const toolCalls = options?.toolCalls || [];
-      const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
-      const toolPayloads = hasToolCalls ? buildToolPayloads(toolCalls) : { payloads: new Set(), jsonPayloads: new Set() };
-      const strippedRaw = hasToolCalls ? stripToolPayloadsFromContent(raw, toolPayloads) : raw;
-      const strippedTrimmed = strippedRaw.trim();
-      if (hasToolCalls && !strippedTrimmed) {
-        return { type: 'empty', content: '' };
-      }
-      const hasMarkdown = /```|^#{1,3} |^\* |\*\*|^\d+\. |^> |^---$/m.test(raw);
-      const isSummary = raw.includes('执行完成') || raw.includes('任务完成') || raw.includes('已完成');
-      const isTask = raw.includes('任务分析') || raw.includes('执行计划');
-      const jsonInfo = extractJsonInfo(strippedRaw);
+      let html = '';
+      let hasMarkdown = false;
 
-      if (hasToolCalls && jsonInfo.isJson && matchesToolPayload(jsonInfo.jsonText, toolPayloads)) {
-        return { type: 'empty', content: '' };
-      }
-      if (hasToolCalls) {
-        const codeFence = extractSingleCodeFence(strippedRaw);
-        if (codeFence && matchesToolPayload(codeFence.body, toolPayloads)) {
-          return { type: 'empty', content: '' };
+      for (const block of blocks) {
+        switch (block.type) {
+          case 'text':
+            if (block.isMarkdown) {
+              html += '<div class="markdown-rendered">' + renderMarkdown(block.content) + '</div>';
+              hasMarkdown = true;
+            } else {
+              html += formatSimpleContent(block.content);
+            }
+            break;
+
+          case 'code':
+            const lang = block.language || 'text';
+            const filename = block.filename || '';
+            html += renderCodeBlock(block.content, lang, filename);
+            hasMarkdown = true;
+            break;
+
+          case 'thinking':
+            // 思考块通常在消息头部单独渲染，这里跳过
+            break;
+
+          case 'tool_call':
+            // 工具调用块通常在消息底部单独渲染，这里跳过
+            break;
+
+          default:
+            // 未知类型，作为文本处理
+            html += formatSimpleContent(block.content || '');
         }
       }
 
-      if (hasMarkdown) {
-        return { type: 'markdown', content: strippedRaw };
-      }
-      const normalizedPlain = normalizePlainText(strippedRaw);
-      if (isSummary) {
-        return { type: 'summary', content: normalizedPlain };
-      }
-      if (isTask) {
-        return { type: 'task', content: normalizedPlain };
-      }
-      if (jsonInfo.isJson) {
-        return { type: 'json', content: jsonInfo.jsonText };
-      }
-      if (shouldRenderAsCodeBlock(strippedRaw)) {
-        return { type: 'code', content: strippedRaw };
-      }
-      return { type: 'text', content: normalizedPlain };
+      return { html, isMarkdown: hasMarkdown };
     }
 
-    function renderMessageContent(normalized, cli) {
-      if (!normalized || normalized.type === 'empty') return '';
-      if (normalized.type === 'summary') {
-        return formatAsSummaryCard(normalized.content, cli);
+    /**
+     * 渲染消息内容 - 区分流式和完成状态
+     * 流式阶段：使用 content 直接渲染（简单 Markdown）
+     * 完成阶段：使用后端解析的 parsedBlocks 渲染（结构化）
+     */
+    function renderMessageContentSmart(message, cli) {
+      // 流式阶段：parsedBlocks 可能为空，使用累积的 content 直接渲染
+      if (message.streaming) {
+        const content = message.content || '';
+        if (!content) {
+          return { html: '', isMarkdown: false };
+        }
+        // 流式时使用简单 Markdown 渲染，避免不完整代码块的闪烁
+        return {
+          html: renderMarkdown(content),
+          isMarkdown: true
+        };
       }
-      if (normalized.type === 'task') {
-        return formatAsTaskCard(normalized.content, cli);
-      }
-      if (normalized.type === 'markdown') {
-        return '<div class="markdown-rendered">' + renderMarkdown(normalized.content) + '</div>';
-      }
-      if (normalized.type === 'json') {
-        return '<div class="markdown-rendered">' + renderMarkdown('```json\n' + normalized.content.replace(/\n$/, '') + '\n```') + '</div>';
-      }
-      if (normalized.type === 'code') {
-        return formatSimpleContent(normalized.content);
-      }
-      return formatSimpleContent(normalized.content);
-    }
 
-    function formatMessageContent(content, cli, options) {
-      const normalized = normalizeMessageContent(content, { toolCalls: options?.toolCalls });
-      return renderMessageContent(normalized, cli);
-    }
+      // 完成阶段：使用后端解析的 blocks 渲染（代码高亮、结构化）
+      if (message.parsedBlocks && message.parsedBlocks.length > 0) {
+        return renderParsedBlocks(message.parsedBlocks, cli);
+      }
 
-    function renderNormalizedContent(content, cli, options) {
-      const normalized = normalizeMessageContent(content, { toolCalls: options?.toolCalls });
+      // 兜底：如果没有 blocks，用 content 渲染
+      const content = message.content || '';
+      if (!content) {
+        return { html: '', isMarkdown: false };
+      }
       return {
-        html: renderMessageContent(normalized, cli),
-        isMarkdown: ['markdown', 'json', 'code', 'summary', 'task'].includes(normalized.type)
+        html: renderMarkdown(content),
+        isMarkdown: true
       };
     }
 
@@ -4991,63 +4211,10 @@
       };
     }
 
-    // 格式化为执行摘要卡片
-    // 格式化为执行摘要卡片（使用统一卡片组件）
-    function formatAsSummaryCard(content, cli) {
-      // 提取关键信息
-      const filesMatch = content.match(/修改了?\s*(\d+)\s*个?文件/);
-      const latestStats = getLatestTaskStats();
-      const filesCount = filesMatch ? filesMatch[1] : String(latestStats.filesCount || 0);
-
-      const successMatch = content.match(/成功|完成|通过/);
-      const isSuccess = !!successMatch;
-      const showSubTasks = latestStats.totalSubTasks > 0;
-
-      // 构建统计内容
-      let statsHtml = '<div class="summary-stats">' +
-        '<div class="summary-stat"><div class="summary-stat-value">' + filesCount + '</div><div class="summary-stat-label">文件修改</div></div>';
-      if (showSubTasks) {
-        statsHtml += '<div class="summary-stat"><div class="summary-stat-value">' +
-          latestStats.completedSubTasks + '/' + latestStats.totalSubTasks +
-          '</div><div class="summary-stat-label">子任务完成</div></div>';
-      }
-      statsHtml += '</div>';
-
-      const contentHtml = statsHtml + '<div class="summary-content"><div class="markdown-rendered">' + renderMarkdown(content) + '</div></div>';
-
-      return renderUnifiedCard({
-        type: 'summary',
-        variant: isSuccess ? 'success' : 'error',
-        icon: getRoleIcon(isSuccess ? 'success' : 'error'),
-        title: isSuccess ? '执行完成' : '执行失败',
-        content: contentHtml,
-        className: 'summary-card'
-      });
-    }
-
-    // 格式化为任务卡片（使用统一卡片组件）
-    function formatAsTaskCard(content, cli) {
-      return renderUnifiedCard({
-        type: 'task-analysis',
-        variant: cli ? cli.toLowerCase() : 'info',
-        icon: getRoleIcon('task'),
-        title: '任务分析',
-        badges: cli ? [{ text: cli.toUpperCase(), class: 'badge-' + cli.toLowerCase() }] : [],
-        content: '<div class="markdown-rendered">' + renderMarkdown(content) + '</div>',
-        className: 'task-card'
-      });
-    }
-
-    // 简单内容格式化
+    // 简单内容格式化（纯渲染，不做内容类型判断）
     function formatSimpleContent(content) {
-      if (shouldRenderAsCodeBlock(content)) {
-        const trimmed = content.replace(/\n$/, '');
-        const wrapped = trimmed.trim().startsWith('{') || trimmed.trim().startsWith('[')
-          ? '```json\n' + trimmed + '\n```'
-          : '```text\n' + trimmed + '\n```';
-        return '<div class="markdown-rendered">' + renderMarkdown(wrapped) + '</div>';
-      }
-     
+      if (!content) return '';
+
       // 保护行内代码
       const inlineCodePlaceholders = [];
       let processed = content.replace(/`([^`]+)`/g, function(match, code) {
@@ -5070,39 +4237,6 @@
       // 处理换行（压缩连续空行，避免行间距过大）
       const normalized = processed.replace(/(\r?\n){2,}/g, '\n');
       return normalized.replace(/\n/g, '<br>');
-    }
-
-    // 提取简短描述（用于状态卡片）
-    function extractShortDescription(content) {
-      if (!content) return '正在处理...';
-      // 移除代码块
-      let text = content.replace(/```[\s\S]*?```/g, '[代码]');
-      // 取第一行非空内容
-      const lines = text.split('\n').filter(l => l.trim());
-      if (lines.length === 0) return '正在处理...';
-      // 截取前 60 个字符
-      let desc = lines[0].trim();
-      if (desc.length > 60) desc = desc.substring(0, 57) + '...';
-      return desc;
-    }
-
-    // 提取完成摘要
-    function extractCompletionSummary(content) {
-      if (!content) return '已完成';
-      // 尝试提取文件修改信息
-      const fileMatch = content.match(/修改了?\s*(\d+)\s*个?文件/);
-      if (fileMatch) return '已完成，修改了 ' + fileMatch[1] + ' 个文件';
-      // 尝试提取行数信息
-      const lineMatch = content.match(/(\d+)\s*行/);
-      if (lineMatch) return '已完成，' + lineMatch[1] + ' 行变更';
-      // 默认摘要
-      const lines = content.split('\n').filter(l => l.trim());
-      if (lines.length > 0) {
-        let summary = lines[lines.length - 1].trim();
-        if (summary.length > 50) summary = summary.substring(0, 47) + '...';
-        return summary;
-      }
-      return '已完成';
     }
 
     // 获取模式显示名称
@@ -5579,19 +4713,10 @@
       }
       if (!isUser && message.content) {
         rawContent = message.content;
-        if (source === 'orchestrator') {
-          const sanitized = sanitizeOrchestratorMessage(message.content);
-          if (sanitized) {
-            rawContent = sanitized;
-            const rendered = renderNormalizedContent(sanitized, cli, { toolCalls: message.toolCalls });
-            contentHtml += rendered.html;
-            contentIsMarkdown = rendered.isMarkdown;
-          }
-        } else {
-          const rendered = renderNormalizedContent(message.content, cli, { toolCalls: message.toolCalls });
-          contentHtml += rendered.html;
-          contentIsMarkdown = rendered.isMarkdown;
-        }
+        // 🆕 使用智能渲染：优先使用后端已解析的 blocks
+        const rendered = renderMessageContentSmart(message, cli);
+        contentHtml += rendered.html;
+        contentIsMarkdown = rendered.isMarkdown;
       } else {
         rawContent = message.content || '';
         contentHtml += escapeHtml(rawContent);
@@ -5673,7 +4798,8 @@
       const messages = cliOutputs[cli] || [];
       const lastMsg = messages.find(m => m.streaming);
       if (lastMsg) {
-        const rendered = renderNormalizedContent(content || lastMsg.content || '', cli, { toolCalls: lastMsg.toolCalls });
+        // 🆕 使用智能渲染：优先使用后端已解析的 blocks
+        const rendered = renderMessageContentSmart(lastMsg, cli);
         contentEl.innerHTML = rendered.html;
         if (rendered.isMarkdown) {
           contentEl.classList.add('markdown-rendered');
@@ -6495,26 +5621,6 @@
       return (source || 'orchestrator') + ':' + (cli || 'claude') + ':' + Date.now() + '-' + streamKeyCounter;
     }
 
-    // 获取当前活跃的流式消息的 streamKey（用于查找）
-    function getActiveStreamKey(source, cli) {
-      const prefix = (source || 'orchestrator') + ':' + (cli || 'claude') + ':';
-      for (let i = threadMessages.length - 1; i >= 0; i -= 1) {
-        const msg = threadMessages[i];
-        if (msg.streaming && msg.streamKey && msg.streamKey.startsWith(prefix)) {
-          return msg.streamKey;
-        }
-      }
-      return null;
-    }
-
-    function findLatestMessageByStreamKey(messages, streamKey) {
-      if (!Array.isArray(messages) || !streamKey) return null;
-      for (let i = messages.length - 1; i >= 0; i -= 1) {
-        if (messages[i].streamKey === streamKey) return messages[i];
-      }
-      return null;
-    }
-
     // 查找指定来源的活跃流式消息
     function findActiveStreamMessage(source, cli) {
       const prefix = (source || 'orchestrator') + ':' + (cli || 'claude') + ':';
@@ -6549,63 +5655,6 @@
       threadMessages.push(msg);
       const idx = threadMessages.length - 1;
       return { idx, msg: threadMessages[idx] };
-    }
-
-    function applyThreadStreamUpdate(source, cli, parsed, chunk, likelyJson) {
-      const initialContent = parsed && parsed.hasJson ? (parsed.text || '') : (likelyJson ? '' : (chunk || ''));
-      const { msg } = ensureThreadStreamMessage(source, cli, initialContent);
-      if (parsed && parsed.hasJson) {
-        const toolCount = parsed.toolCalls ? parsed.toolCalls.length : 0;
-        const thinkingCount = parsed.thinking ? parsed.thinking.length : 0;
-        msg.toolCountChanged = (msg.lastToolCount || 0) !== toolCount;
-        msg.thinkingCountChanged = (msg.lastThinkingCount || 0) !== thinkingCount;
-        msg.content = parsed.text || '';
-        msg.thinking = parsed.thinking || [];
-        msg.toolCalls = parsed.toolCalls || [];
-        msg.lastToolCount = toolCount;
-        msg.lastThinkingCount = thinkingCount;
-        if (parsed.completed) {
-          msg.pendingComplete = true;
-        }
-      } else if (chunk && !likelyJson) {
-        msg.content = (msg.content || '') + chunk;
-      }
-      return msg;
-    }
-
-    function finalizeThreadStream(source, cli, content, error) {
-      // 查找当前来源的活跃流式消息
-      const active = findActiveStreamMessage(source, cli);
-      if (active) {
-        const msg = active.msg;
-        if (content) {
-          msg.content = error ? ('错误: ' + error) : content;
-        }
-        msg.streaming = false;
-        msg.pendingComplete = false;
-        if (error) {
-          msg.type = 'error';
-          msg.isError = true;
-        }
-        return msg;
-      }
-      // 没有找到活跃的流式消息，创建新消息
-      if (content) {
-        const streamKey = generateStreamKey(source, cli);
-        threadMessages.push({
-          role: 'assistant',
-          content: error ? ('错误: ' + error) : content,
-          time: new Date().toLocaleTimeString().slice(0,5),
-          timestamp: Date.now(),
-          streaming: false,
-          source: source,
-          cli: cli,
-          streamKey: streamKey,
-          isError: !!error,
-          type: error ? 'error' : undefined
-        });
-      }
-      return null;
     }
 
     /** 检测内容是否包含特殊格式（文件路径列表、带行号的代码等） */
@@ -6652,7 +5701,8 @@
 
       const streamingMsg = threadMessages.find(m => m.streaming && m.streamKey === streamKey);
       const cli = streamingMsg?.cli || 'claude';
-      const rendered = renderNormalizedContent(content || '', cli, { toolCalls: streamingMsg?.toolCalls });
+      // 🆕 使用智能渲染：优先使用后端已解析的 blocks
+      const rendered = streamingMsg ? renderMessageContentSmart(streamingMsg, cli) : { html: escapeHtml(content || ''), isMarkdown: false };
       contentEl.innerHTML = rendered.html;
       if (rendered.isMarkdown) {
         contentEl.classList.add('markdown-rendered');
@@ -6702,33 +5752,6 @@
         saveWebviewState();
         saveStateTimeout = null;
       }, 500); // 500ms 节流
-    }
-    let lastStreamSaveAt = 0;
-    function shouldSaveStreamState() {
-      const now = Date.now();
-      if (now - lastStreamSaveAt > 1500) {
-        lastStreamSaveAt = now;
-        return true;
-      }
-      return false;
-    }
-
-    const streamLatencyState = {};
-    function getStreamLatency(cli) {
-      const key = cli || 'orchestrator';
-      if (!streamLatencyState[key]) {
-        streamLatencyState[key] = {
-          firstSentAt: null,
-          firstRenderAt: null
-        };
-      }
-      return streamLatencyState[key];
-    }
-
-    function getThreadMessageTimestamp(message, fallbackIndex) {
-      if (!message) return fallbackIndex;
-      const ts = message.timestamp || message.startedAt || 0;
-      return ts || fallbackIndex;
     }
 
     function renderThreadView(container) {
@@ -6977,57 +6000,6 @@
       }
     }
 
-    function upsertToolCall(message, toolCall) {
-      if (!message) return;
-      if (!message.toolCalls) message.toolCalls = [];
-      const isResult = toolCall.kind === 'result' || toolCall.name === '工具结果';
-      const toolId = toolCall.id || toolCall.tool_call_id;
-      if (toolId) {
-        const existingIdx = message.toolCalls.findIndex(t => t.id === toolId || t.tool_call_id === toolId);
-        if (existingIdx !== -1) {
-          const existing = message.toolCalls[existingIdx];
-          const seq = existing.seq ?? toolCall.seq;
-          const timestamp = existing.timestamp ?? toolCall.timestamp ?? Date.now();
-          const keepName = existing.name && (isResult || toolCall.name === '工具调用');
-          message.toolCalls[existingIdx] = {
-            ...existing,
-            ...toolCall,
-            name: keepName ? existing.name : (toolCall.name || existing.name),
-            input: toolCall.input ?? existing.input,
-            result: toolCall.result ?? existing.result,
-            status: toolCall.status || existing.status,
-            seq,
-            timestamp
-          };
-          message.toolCallsVersion = (message.toolCallsVersion || 0) + 1;
-          message.toolCallsChanged = true;
-          return;
-        }
-      }
-      if (isResult) {
-        for (let i = message.toolCalls.length - 1; i >= 0; i -= 1) {
-          const existing = message.toolCalls[i];
-          if (!existing) continue;
-          if ((existing.kind === 'call' || !existing.kind) && (existing.status === 'running' || !existing.status)) {
-            message.toolCalls[i] = {
-              ...existing,
-              result: toolCall.result ?? existing.result,
-              status: 'completed'
-            };
-            message.toolCallsVersion = (message.toolCallsVersion || 0) + 1;
-            message.toolCallsChanged = true;
-            return;
-          }
-        }
-      }
-      const nextSeq = (message.toolCallSeq || 0) + 1;
-      message.toolCallSeq = nextSeq;
-      const timestamp = toolCall.timestamp ?? Date.now();
-      message.toolCalls.push({ ...toolCall, seq: toolCall.seq ?? nextSeq, timestamp });
-      message.toolCallsVersion = (message.toolCallsVersion || 0) + 1;
-      message.toolCallsChanged = true;
-    }
-
     // 渲染错误消息（使用统一卡片组件）
     function renderErrorMessage(m, idx) {
       const cli = m.cli || 'system';
@@ -7260,43 +6232,6 @@
     }
     window.showImageViewer = showImageViewer;
 
-    // 渲染任务面板的任务卡片（使用统一卡片组件）
-    function renderTaskPanelCard(task) {
-      const statusMap = { pending: '等待中', running: '执行中', completed: '已完成', failed: '失败', interrupted: '已中断' };
-      const statusClass = task.status || 'pending';
-      const badgeClass = statusClass === 'running' ? 'badge-running' : statusClass === 'completed' ? 'badge-completed' : statusClass === 'failed' ? 'badge-failed' : 'badge-pending';
-
-      // 构建子任务列表
-      let contentHtml = '';
-      if (task.subTasks && task.subTasks.length > 0) {
-        contentHtml += '<div class="task-card-subtasks">';
-        task.subTasks.forEach(st => {
-          const kindLabel = st.kind === 'integration' ? '[联调] ' : st.kind === 'repair' ? '[修复] ' : '';
-          const cliName = (st.assignedWorker || st.assignedCli || 'auto').toUpperCase();
-          contentHtml += '<div class="subtask-item"><span class="subtask-cli">' + cliName + '</span><span class="subtask-desc">' + escapeHtml(kindLabel + (st.description || '')) + '</span></div>';
-        });
-        contentHtml += '</div>';
-      }
-
-      // 构建底部操作
-      let footerHtml = '';
-      if (task.status === 'running') {
-        footerHtml = '<button class="icon-btn" onclick="interruptTask(\'' + task.id + '\')" title="中断">中断</button>';
-      }
-
-      return renderUnifiedCard({
-        type: 'task-panel',
-        variant: statusClass === 'running' ? 'info' : statusClass === 'completed' ? 'success' : statusClass === 'failed' ? 'error' : 'warning',
-        icon: getRoleIcon('task'),
-        title: task.prompt?.slice(0, 50) || '任务',
-        badges: [{ text: statusMap[task.status] || task.status, class: badgeClass }],
-        content: contentHtml,
-        footer: footerHtml,
-        className: 'task-card',
-        dataAttrs: { 'task-id': task.id }
-      });
-    }
-
     function renderTasksView() {
       const container = document.getElementById('tasks-content');
       if (!container) return;
@@ -7499,22 +6434,6 @@
     function stripZeroWidth(text) {
       // 零宽空格、零宽非连接符、零宽连接符等
       return String(text).replace(/[\u200B-\u200D\uFEFF]/g, '');
-    }
-
-    /**
-     * 预处理 CLI 输出内容
-     * 在渲染前清理特殊字符
-     */
-    function sanitizeCliOutput(text) {
-      if (!text) return '';
-      let result = String(text);
-      // 1. 移除 ANSI 转义序列
-      result = stripAnsi(result);
-      // 2. 移除零宽字符
-      result = stripZeroWidth(result);
-      // 3. 规范化换行符
-      result = result.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-      return result;
     }
 
     function approveChange(filePath) { vscode.postMessage({ type: 'approveChange', filePath }); }

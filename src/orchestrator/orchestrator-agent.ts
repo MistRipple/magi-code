@@ -25,6 +25,7 @@ import { ContextManager, ContextCompressor } from '../context';
 import { SnapshotManager } from '../snapshot-manager';
 import { TaskManager } from '../task-manager';
 import { RiskPolicy, RiskAssessment } from './risk-policy';
+import { PolicyEngine, policyEngine, ConflictDetectionResult } from './policy-engine';
 import { TaskStateManager, TaskState } from './task-state-manager';
 import { PlanStorage, PlanRecord, PlanReview } from './plan-storage';
 import { PlanTodoManager } from './plan-todo';
@@ -1106,15 +1107,41 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     }
 
    
-    if (plan.needsWorker === false && plan.directResponse) {
+    // 问答类请求：不需要 Worker，编排者直接回答
+    if (plan.needsWorker === false) {
       console.log('[OrchestratorAgent] 不需要 Worker，编排者直接回答');
-      this.emitUIMessage('direct_response', plan.directResponse);
-      await this.saveAndCompressMemory(plan.directResponse);
+
+      let response = plan.directResponse || '';
+
+      // 如果没有预设回答，调用 Claude 生成
+      if (!response) {
+        const askResponse = await this.cliFactory.sendMessage(
+          'claude',
+          userPrompt,
+          undefined,
+          {
+            source: 'orchestrator',
+            streamToUI: true,
+            adapterRole: 'orchestrator',
+            messageMeta: {
+              taskId: this.currentContext?.taskId,
+              intent: 'ask',
+              contextSnapshot: this.buildContextSnapshot(),
+            },
+          }
+        );
+        this.recordOrchestratorTokens(askResponse.tokenUsage);
+        response = askResponse.content || '';
+      } else {
+        this.emitUIMessage('direct_response', response);
+      }
+
+      await this.saveAndCompressMemory(response);
       this.setState('completed');
       this.currentContext!.endTime = Date.now();
       this.updateExecutionState('completed', plan.id);
       this.updateTaskPlanStatus('completed');
-      return plan.directResponse;
+      return response;
     }
 
     // 记录任务到 Memory
@@ -1410,6 +1437,8 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
   }
 
   private shouldUseRuleBasedPlan(analysis: TaskAnalysis): boolean {
+    // 问答类请求使用规则处理（直接回答）
+    if (analysis.isQuestion) return true;
     if (analysis.splittable) return false;
     if (analysis.complexity > 2) return false;
     if (analysis.category === 'architecture') return false;
@@ -1421,6 +1450,28 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     analysis: TaskAnalysis,
     allowAIDecompose: boolean
   ): Promise<ExecutionPlan> {
+    // 问答类请求：不需要 Worker，编排者直接回答
+    if (analysis.isQuestion) {
+      console.log('[OrchestratorAgent] 检测到问答类请求，编排者将直接回答');
+      return {
+        id: `plan_${Date.now()}`,
+        analysis: `问答类请求：${analysis.category}`,
+        isSimpleTask: true,
+        needsWorker: false,
+        directResponse: '', // 留空，后续由 Claude 生成回答
+        needsUserInput: false,
+        questions: [],
+        skipReason: '问答/咨询类请求，无需执行任务',
+        needsCollaboration: false,
+        subTasks: [],
+        executionMode: 'sequential',
+        summary: '问答类请求',
+        featureContract: '',
+        acceptanceCriteria: [],
+        createdAt: Date.now(),
+      };
+    }
+
     const splitResult = await this.buildSplitResult(analysis, allowAIDecompose);
     const subTasks = this.mapSplitToSubTasks(splitResult.subTasks, analysis);
     const executionMode = splitResult.executionMode === 'sequential' ? 'sequential' : 'parallel';
@@ -2568,11 +2619,23 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     const foregroundSubTasks = this.getForegroundSubTasks(plan);
     const backgroundSubTasks = this.getBackgroundSubTasks(plan);
 
+    // 🆕 为任务分配冲突域（使用 plan 而非 subTasks）
+    this.assignConflictDomains(plan);
+
+    // 🆕 检测文件冲突
+    const conflictResult = policyEngine.detectConflicts(foregroundSubTasks);
+    if (conflictResult.hasConflict) {
+      console.log('[OrchestratorAgent] 检测到文件冲突:', conflictResult.conflictingFiles);
+      this.emitUIMessage('progress_update',
+        `检测到 ${conflictResult.conflictingFiles.length} 个文件存在冲突，将串行执行相关任务`
+      );
+    }
+
     for (const subTask of foregroundSubTasks) {
       this.pendingTasks.set(subTask.id, subTask);
     }
 
-   
+
     const hasDependencies = foregroundSubTasks.some(
       t => t.dependencies && t.dependencies.length > 0
     );
@@ -2604,12 +2667,62 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
         this.warnedReviewSkipForDependencies = true;
       }
       await this.dispatchWithDependencyGraph(plan, foregroundSubTasks);
+    } else if (conflictResult.hasConflict) {
+      // 🆕 有冲突时使用智能调度策略
+      console.log('[OrchestratorAgent] 检测到文件冲突，使用智能调度策略');
+      await this.dispatchWithConflictAwareness(dispatchSubTasks, plan, conflictResult);
     } else if (plan.executionMode === 'parallel') {
       await this.dispatchParallel(dispatchSubTasks, plan);
     } else {
       await this.dispatchSequential(dispatchSubTasks, plan);
     }
 
+  }
+
+  /** 🆕 冲突感知的任务分发 */
+  private async dispatchWithConflictAwareness(
+    subTasks: SubTask[],
+    plan: ExecutionPlan,
+    conflictResult: ConflictDetectionResult
+  ): Promise<void> {
+    const taskId = this.currentContext!.taskId;
+
+    // 使用 PolicyEngine 决定执行策略
+    const strategy = policyEngine.decideExecutionStrategy(subTasks);
+
+    // 先并行执行无冲突的任务
+    if (strategy.parallel.length > 0) {
+      const parallelTaskIds = new Set(strategy.parallel.flat());
+      const parallelTasks = subTasks.filter(t => parallelTaskIds.has(t.id));
+
+      if (parallelTasks.length > 0) {
+        console.log(`[OrchestratorAgent] 并行执行 ${parallelTasks.length} 个无冲突任务`);
+        this.emitUIMessage('progress_update',
+          `并行执行 ${parallelTasks.length} 个无冲突任务`
+        );
+        await this.dispatchParallel(parallelTasks, plan);
+      }
+    }
+
+    // 然后串行执行有冲突的任务
+    if (strategy.serial.length > 0) {
+      const serialTaskIds = new Set(strategy.serial);
+      const serialTasks = subTasks.filter(t => serialTaskIds.has(t.id));
+
+      if (serialTasks.length > 0) {
+        console.log(`[OrchestratorAgent] 串行执行 ${serialTasks.length} 个冲突任务`);
+        this.emitUIMessage('progress_update',
+          `串行执行 ${serialTasks.length} 个存在文件冲突的任务`
+        );
+
+        // 按建议顺序排序
+        const orderedTasks = conflictResult.suggestedOrder
+          ? strategy.serial.map(id => serialTasks.find(t => t.id === id)).filter(Boolean) as SubTask[]
+          : serialTasks;
+
+        await this.dispatchSequential(orderedTasks, plan);
+      }
+    }
   }
 
   /** 基于依赖图分发任务 */
@@ -3548,31 +3661,54 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
       return { success: true, summary: '跳过验证（未配置）' };
     }
 
-    const verificationLevel = this.currentContext?.risk?.verification ?? 'basic';
-    const baseConfig = {
-      compileCheck: this.config.verification?.compileCheck ?? true,
-      ideCheck: this.config.verification?.ideCheck ?? true,
-    };
-    if (verificationLevel === 'basic') {
-      this.verificationRunner.updateConfig({
-        ...baseConfig,
-        lintCheck: false,
-        testCheck: false,
-      });
-    } else if (verificationLevel === 'full') {
-      this.verificationRunner.updateConfig({
-        ...baseConfig,
-        lintCheck: this.config.verification?.lintCheck ?? true,
-        testCheck: this.config.verification?.testCheck ?? true,
-      });
-    }
-
-    this.emitUIMessage('progress_update', '正在执行验证检查...');
-
     // 收集所有修改的文件
     const modifiedFiles = this.completedResults
       .flatMap(r => r.modifiedFiles || [])
       .filter((f, i, arr) => arr.indexOf(f) === i); // 去重
+
+    // 🆕 使用 PolicyEngine 决定验证策略
+    const riskAssessment = this.currentContext?.risk;
+    let verificationDecision;
+
+    if (riskAssessment) {
+      verificationDecision = policyEngine.decideVerification(riskAssessment, modifiedFiles);
+      console.log(`[OrchestratorAgent] 验证决策: ${verificationDecision.reason}`);
+    } else {
+      // 回退到基础验证
+      verificationDecision = {
+        shouldVerify: true,
+        config: {
+          compileCheck: true,
+          ideCheck: true,
+          lintCheck: false,
+          testCheck: false,
+        },
+        reason: '未找到风险评估，使用基础验证',
+      };
+    }
+
+    if (!verificationDecision.shouldVerify) {
+      return { success: true, summary: `跳过验证: ${verificationDecision.reason}` };
+    }
+
+    // 应用验证配置
+    this.verificationRunner.updateConfig({
+      compileCheck: verificationDecision.config.compileCheck ?? true,
+      ideCheck: verificationDecision.config.ideCheck ?? true,
+      lintCheck: verificationDecision.config.lintCheck ?? false,
+      testCheck: verificationDecision.config.testCheck ?? false,
+    });
+
+    // 显示验证策略信息
+    const verificationItems: string[] = [];
+    if (verificationDecision.config.compileCheck) verificationItems.push('编译');
+    if (verificationDecision.config.ideCheck) verificationItems.push('IDE诊断');
+    if (verificationDecision.config.lintCheck) verificationItems.push('Lint');
+    if (verificationDecision.config.testCheck) verificationItems.push('测试');
+
+    this.emitUIMessage('progress_update',
+      `正在执行验证检查 [${verificationItems.join(' + ')}]... (${verificationDecision.reason})`
+    );
 
     try {
       const result = await this.verificationRunner.runVerification(taskId, modifiedFiles);

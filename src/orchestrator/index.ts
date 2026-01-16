@@ -26,6 +26,16 @@ export { WorkerPool, type WorkerPoolConfig } from './worker-pool';
 // 风险策略内核
 export { RiskPolicy } from './risk-policy';
 
+// 统一策略引擎
+export {
+  PolicyEngine,
+  policyEngine,
+  type CLISelectionPolicy,
+  type ConflictDetectionResult,
+  type VerificationDecision,
+  type CLIHealthStatus,
+} from './policy-engine';
+
 // 消息总线
 export { MessageBus, globalMessageBus } from './message-bus';
 

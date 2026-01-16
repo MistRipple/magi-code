@@ -19,6 +19,12 @@ import {
   PermissionMatrix,
   StrategyConfig,
 } from '../types';
+import {
+  StandardMessage,
+  StreamUpdate,
+  MessageLifecycle,
+  MessageType,
+} from '../protocol/message-protocol';
 import { SessionManager } from '../session-manager';
 import { ChatSessionManager } from '../chat-session-manager';
 import { TaskManager } from '../task-manager';
@@ -30,6 +36,8 @@ import { TaskAnalyzer, CLISelector, CLISkillsConfig } from '../task';
 import { CLI_CAPABILITIES, CLIResponse } from '../cli/types';
 import { IntelligentOrchestrator } from '../orchestrator/intelligent-orchestrator';
 import { AceIndexManager } from '../ace/index-manager';
+import { normalizeOrchestratorMessage, isInternalStateMessage } from '../normalizer';
+import { parseContentToBlocks, ContentBlock, sanitizeCliOutput } from '../utils/content-parser';
 
 export class WebviewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'multiCli.mainView';
@@ -172,6 +180,33 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 设置所有 CLI 适配器事件监听 */
   private setupCLIAdapters(): void {
+    // 🆕 监听标准消息事件 - 新的消息流开始
+    this.cliFactory.on('standardMessage', (message: any) => {
+      this.postMessage({
+        type: 'standardMessage',
+        message,
+        sessionId: this.activeSessionId
+      } as any);
+    });
+
+    // 🆕 监听标准消息更新事件 - 流式更新
+    this.cliFactory.on('standardUpdate', (update: any) => {
+      this.postMessage({
+        type: 'standardUpdate',
+        update,
+        sessionId: this.activeSessionId
+      } as any);
+    });
+
+    // 🆕 监听标准消息完成事件
+    this.cliFactory.on('standardComplete', (message: any) => {
+      this.postMessage({
+        type: 'standardComplete',
+        message,
+        sessionId: this.activeSessionId
+      } as any);
+    });
+
     // 🔧 监听 streamStart 事件，通知前端开始新的消息流
     this.cliFactory.on('streamStart', ({
       type,
@@ -184,14 +219,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }) => {
       const target = adapterRole === 'orchestrator' ? 'thread' : 'cli';
       const resolvedSource = adapterRole === 'orchestrator' ? 'orchestrator' : (source || 'worker');
-      this.postMessage({
-        type: 'streamEvent',
+      this.sendStreamEvent({
         phase: 'start',
         source: resolvedSource,
         cli: type,
-        target: target,
-        sessionId: this.activeSessionId
-      } as any);
+        target: target as 'thread' | 'cli',
+      });
     });
 
     // 🔧 监听 CLI 询问事件
@@ -237,7 +270,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       } as any);
     });
 
-    // 监听工厂的统一事件
+    // 监听工厂的统一事件（保留向后兼容，逐步移除）
     this.cliFactory.on('output', ({
       type,
       chunk,
@@ -267,17 +300,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
             if (!pending) {
               return;
             }
-            this.postMessage({
-              type: 'streamEvent',
+            this.sendStreamEvent({
               phase: 'chunk',
               content: pending,
               append: true,
-              sentAt: Date.now(),
               source: source || 'orchestrator',
               cli: type,
               target: 'thread',
-              sessionId: this.activeSessionId
-            } as any);
+            });
           }, 50);
         }
         return;
@@ -285,15 +315,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const outputs = this.cliOutputs.get(type) || [];
       outputs.push(chunk);
       this.cliOutputs.set(type, outputs);
-      this.postMessage({
-        type: 'streamEvent',
+      this.sendStreamEvent({
         phase: 'chunk',
         content: chunk,
-        source: source as MessageSource | undefined,
+        source: source,
         cli: type,
         target: 'cli',
-        sessionId: this.activeSessionId
-      } as any);
+      });
     });
     this.cliFactory.on('response', ({
       type,
@@ -311,17 +339,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           ? `错误: ${response.error}`
           : (response.content || this.orchestratorStreamBuffer);
         if (content) {
-          this.postMessage({
-            type: 'streamEvent',
+          this.sendStreamEvent({
             phase: 'complete',
             content,
-            sentAt: Date.now(),
             source: source || 'orchestrator',
             cli: type,
             error: response.error,
             target: 'thread',
-            sessionId: this.activeSessionId
-          } as any);
+          });
         }
         this.orchestratorStreamBuffer = '';
         this.orchestratorStreamCli = null;
@@ -337,17 +362,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const content = response.error
         ? `错误: ${response.error}`
         : (response.content || buffered.join(''));
-      this.postMessage({
-        type: 'streamEvent',
+      this.sendStreamEvent({
         phase: 'complete',
         content,
-        sentAt: Date.now(),
-        source: source as MessageSource | undefined,
+        source: source,
         cli: type,
         error: response.error,
         target: 'cli',
-        sessionId: this.activeSessionId
-      } as any);
+      });
     });
 
     this.cliFactory.on('stateChange', ({ type, state }: { type: CLIType; state: string }) => {
@@ -612,21 +634,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     globalEventBus.on('subtask:started', (event) => {
       const data = event.data as { cli?: string; description?: string; targetFiles?: string[]; reason?: string };
       if (data?.description) {
-        // 发送到主对话窗口
-        this.postMessage({
-          type: 'orchestratorMessage',
+        // 发送到主对话窗口（使用标准消息）
+        this.sendOrchestratorMessage({
           content: `子任务开始: ${data.description}`,
-          phase: 'progress',
-          messageType: 'progress_update',
+          messageType: 'progress',
+          taskId: event.taskId,
           metadata: {
-            taskId: event.taskId || '',
             subTaskId: event.subTaskId || '',
             status: 'started',
             cli: data.cli || 'system',
             description: data.description,
           },
-          sessionId: this.activeSessionId,
-        } as any);
+        });
 
         // 发送任务卡片到对应的 CLI 面板
         if (data.cli) {
@@ -654,22 +673,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         modifiedFiles: data?.modifiedFiles,
         subTaskId: event.subTaskId,
       }, 'completed');
-      this.postMessage({
-        type: 'orchestratorMessage',
+      this.sendOrchestratorMessage({
         content: summary,
-        phase: 'progress',
-        messageType: 'subtask_summary',
+        messageType: 'result',
+        taskId: event.taskId,
         metadata: {
-          taskId: event.taskId || '',
           subTaskId: event.subTaskId || '',
           status: 'completed',
           success: data?.success ?? true,
           cli: data?.cli || data?.cliType || '',
           description: data?.description,
         },
-        timestamp: event.timestamp,
-        sessionId: this.activeSessionId,
-      } as any);
+      });
       this.sendStateUpdate();
     });
     globalEventBus.on('execution:stats_updated', () => {
@@ -677,7 +692,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
     globalEventBus.on('subtask:failed', (event) => {
       const data = event.data as { error?: string | object; cli?: string; cliType?: string; description?: string; modifiedFiles?: string[]; duration?: number };
-     
+
       let errorMsg = '未知错误';
       if (data?.error) {
         if (typeof data.error === 'string') {
@@ -696,38 +711,37 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         subTaskId: event.subTaskId,
         error: errorMsg,
       }, 'failed');
-      this.postMessage({
-        type: 'orchestratorMessage',
+      this.sendOrchestratorMessage({
         content: summary,
-        phase: 'progress',
-        messageType: 'subtask_summary',
+        messageType: 'error',
+        taskId: event.taskId,
         metadata: {
-          taskId: event.taskId || '',
           subTaskId: event.subTaskId || '',
           status: 'failed',
           cli: data?.cli || data?.cliType || '',
           error: errorMsg,
           description: data?.description,
         },
-        timestamp: event.timestamp,
-        sessionId: this.activeSessionId,
-      } as any);
+      });
       this.sendStateUpdate();
     });
 
-   
+
     globalEventBus.on('orchestrator:ui_message', (event) => {
       const data = event.data as any;
       if (!data?.content) return;
 
+      // 过滤内部状态消息
+      if (isInternalStateMessage(data)) {
+        return;
+      }
+
+      // 转换为标准消息格式（完整迁移，只发送标准消息）
+      const standardMessage = normalizeOrchestratorMessage(data, event.taskId);
+
       this.postMessage({
-        type: 'orchestratorMessage',
-        content: data.content,
-        phase: data.metadata?.phase || data.type || '',
-        taskId: event.taskId || data.taskId || '',
-        messageType: data.type,
-        metadata: data.metadata,
-        timestamp: data.timestamp || event.timestamp,
+        type: 'standardMessage',
+        message: standardMessage,
         sessionId: this.activeSessionId,
       } as any);
     });
@@ -766,15 +780,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     globalEventBus.on('cli:output', (event) => {
       const data = event.data as { output: string; cliType?: CLIType; source?: MessageSource };
       if (!data?.output) return;
-      this.postMessage({
-        type: 'streamEvent',
+      this.sendStreamEvent({
         phase: 'chunk',
         content: data.output,
         source: data.source,
-        cli: data.cliType,
+        cli: data.cliType || 'claude',
         target: 'cli',
-        sessionId: this.activeSessionId
-      } as any);
+      });
     });
 
     globalEventBus.on('cli:healthCheck', () => {
@@ -819,10 +831,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private async interruptCurrentTask(options?: { silent?: boolean }): Promise<void> {
     console.log('[MultiCLI] 收到中断请求');
 
-   
+
     const tasks = this.taskManager.getAllTasks();
     const runningTask = tasks.find(t => t.status === 'running');
     const hasRunningTask = runningTask || this.intelligentOrchestrator.running;
+
+    // 🆕 在中断前，先刷新并发送 pending 的流式输出内容
+    this.flushPendingStreamOutput();
 
     // 1. 首先中断 Orchestrator（这会触发 AbortController）
     if (this.intelligentOrchestrator.running) {
@@ -859,6 +874,69 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
 
     // 清理编排者流式输出缓存，避免跨任务串流
+    this.clearStreamBuffers();
+
+
+    if (hasRunningTask && !options?.silent) {
+      // 4. 通知 UI
+      this.postMessage({ type: 'toast', message: '任务已打断', toastType: 'info' });
+
+
+      this.postMessage({
+        type: 'taskInterrupted',
+        message: '任务已打断'
+      } as any);
+
+      this.sendOrchestratorMessage({
+        content: '任务已打断，可在变更中查看已修改的文件，或选择继续执行。',
+        messageType: 'text',
+        metadata: { phase: 'interrupted' },
+      });
+    }
+
+    this.sendStateUpdate();
+  }
+
+  /**
+   * 🆕 刷新并发送 pending 的流式输出内容
+   * 在中断前调用，确保不丢失已接收但未发送的内容
+   */
+  private flushPendingStreamOutput(): void {
+    // 清除定时器
+    if (this.orchestratorStreamFlushTimer) {
+      clearTimeout(this.orchestratorStreamFlushTimer);
+      this.orchestratorStreamFlushTimer = null;
+    }
+
+    // 发送 pending 内容
+    if (this.orchestratorStreamPending) {
+      console.log(`[MultiCLI] 刷新 pending 流式输出: ${this.orchestratorStreamPending.length} 字符`);
+      this.sendStreamEvent({
+        phase: 'chunk',
+        content: this.orchestratorStreamPending,
+        append: true,
+        target: 'thread',
+        cli: this.orchestratorStreamCli || 'claude',
+      });
+      this.orchestratorStreamPending = '';
+    }
+
+    // 发送完成标记（带中断标识）
+    if (this.orchestratorStreamBuffer) {
+      this.sendStreamEvent({
+        phase: 'complete',
+        content: this.orchestratorStreamBuffer,
+        target: 'thread',
+        cli: this.orchestratorStreamCli || 'claude',
+        interrupted: true,
+      });
+    }
+  }
+
+  /**
+   * 🆕 清理流式输出缓冲区
+   */
+  private clearStreamBuffers(): void {
     this.orchestratorStreamBuffer = '';
     this.orchestratorStreamCli = null;
     this.orchestratorStreamPending = '';
@@ -866,28 +944,202 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       clearTimeout(this.orchestratorStreamFlushTimer);
       this.orchestratorStreamFlushTimer = null;
     }
+  }
 
-   
-    if (hasRunningTask && !options?.silent) {
-      // 4. 通知 UI
-      this.postMessage({ type: 'toast', message: '任务已打断', toastType: 'info' });
+  // 流式消息 ID 管理
+  private streamMessageIds: Map<string, string> = new Map(); // key: `${source}-${cli}-${target}`, value: messageId
 
-     
+  /**
+   * 发送编排器标准消息（非流式）
+   * 用于发送进度更新、子任务摘要、错误等消息
+   */
+  private sendOrchestratorMessage(params: {
+    content: string;
+    messageType: 'progress' | 'error' | 'result' | 'text';
+    metadata?: Record<string, unknown>;
+    taskId?: string;
+  }): void {
+    const { content, messageType, metadata, taskId } = params;
+
+    let type: MessageType = MessageType.TEXT;
+    let lifecycle: MessageLifecycle = MessageLifecycle.COMPLETED;
+
+    if (messageType === 'progress') {
+      type = MessageType.PROGRESS;
+    } else if (messageType === 'error') {
+      type = MessageType.ERROR;
+      lifecycle = MessageLifecycle.FAILED;
+    } else if (messageType === 'result') {
+      type = MessageType.RESULT;
+    }
+
+    const standardMessage: StandardMessage = {
+      id: `msg-orch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      traceId: this.activeSessionId || 'default',
+      type,
+      source: 'orchestrator',
+      cli: 'claude',
+      timestamp: Date.now(),
+      updatedAt: Date.now(),
+      blocks: content ? [{ type: 'text', content, isMarkdown: false }] : [],
+      lifecycle,
+      metadata: {
+        taskId,
+        ...metadata,
+      },
+    };
+
+    this.postMessage({
+      type: 'standardMessage',
+      message: standardMessage,
+      sessionId: this.activeSessionId,
+    } as any);
+  }
+
+  /**
+   * 统一的流式消息发送方法
+   * 只发送 standardMessage 格式（完整迁移，无兼容性代码）
+   * 🆕 使用 parseContentToBlocks 在后端解析内容，前端只需渲染
+   */
+  private sendStreamEvent(params: {
+    phase: 'start' | 'chunk' | 'complete';
+    content?: string;
+    cli: CLIType;
+    source?: string;
+    target: 'thread' | 'cli';
+    error?: string;
+    append?: boolean;
+    interrupted?: boolean;
+  }): void {
+    const { phase, content, cli, source, target, error, interrupted } = params;
+    const resolvedSource = (source || (target === 'thread' ? 'orchestrator' : 'worker')) as 'orchestrator' | 'worker';
+    const streamKey = `${resolvedSource}-${cli}-${target}`;
+
+    if (phase === 'start') {
+      // 创建新的标准消息
+      const messageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      this.streamMessageIds.set(streamKey, messageId);
+
+      const standardMessage: StandardMessage = {
+        id: messageId,
+        traceId: this.activeSessionId || 'default',
+        type: MessageType.TEXT,
+        source: resolvedSource,
+        cli: cli,
+        timestamp: Date.now(),
+        updatedAt: Date.now(),
+        blocks: [],
+        lifecycle: MessageLifecycle.STREAMING,
+        metadata: { extra: { target } },
+      };
+
       this.postMessage({
-        type: 'taskInterrupted',
-        message: '任务已打断'
+        type: 'standardMessage',
+        message: standardMessage,
+        sessionId: this.activeSessionId,
       } as any);
+      return;
+    }
+
+    if (phase === 'chunk') {
+      const messageId = this.streamMessageIds.get(streamKey);
+
+      if (!messageId) {
+        // 如果没有 start，自动创建一个
+        const newMessageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        this.streamMessageIds.set(streamKey, newMessageId);
+
+        // 🆕 使用解析器解析内容
+        const parsedBlocks = content ? parseContentToBlocks(content) : [];
+
+        const standardMessage: StandardMessage = {
+          id: newMessageId,
+          traceId: this.activeSessionId || 'default',
+          type: MessageType.TEXT,
+          source: resolvedSource,
+          cli: cli,
+          timestamp: Date.now(),
+          updatedAt: Date.now(),
+          blocks: parsedBlocks.length > 0 ? parsedBlocks : (content ? [{ type: 'text', content, isMarkdown: true }] : []),
+          lifecycle: MessageLifecycle.STREAMING,
+          metadata: { extra: { target } },
+        };
+
+        this.postMessage({
+          type: 'standardMessage',
+          message: standardMessage,
+          sessionId: this.activeSessionId,
+        } as any);
+        return;
+      }
+
+      // 发送更新（流式追加，保持原始内容，前端累积后再解析）
+      const update: StreamUpdate = {
+        messageId,
+        updateType: 'append',
+        appendText: content || '',
+        timestamp: Date.now(),
+      };
 
       this.postMessage({
-        type: 'orchestratorMessage',
-        content: '任务已打断，可在变更中查看已修改的文件，或选择继续执行。',
-        phase: 'interrupted',
-        messageType: 'interrupted',
+        type: 'standardUpdate',
+        update,
+        sessionId: this.activeSessionId,
+      } as any);
+      return;
+    }
+
+    if (phase === 'complete') {
+      const messageId = this.streamMessageIds.get(streamKey);
+      this.streamMessageIds.delete(streamKey);
+
+      // 🆕 使用解析器解析完整内容
+      const parsedBlocks = content ? parseContentToBlocks(content) : [];
+
+      if (!messageId) {
+        // 没有流式消息，直接创建完整消息
+        const newMessageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const standardMessage: StandardMessage = {
+          id: newMessageId,
+          traceId: this.activeSessionId || 'default',
+          type: error ? MessageType.ERROR : MessageType.RESULT,
+          source: resolvedSource,
+          cli: cli,
+          timestamp: Date.now(),
+          updatedAt: Date.now(),
+          blocks: parsedBlocks.length > 0 ? parsedBlocks : (content ? [{ type: 'text', content, isMarkdown: true }] : []),
+          lifecycle: error ? MessageLifecycle.FAILED : MessageLifecycle.COMPLETED,
+          metadata: { error, extra: { target, interrupted } },
+        };
+
+        this.postMessage({
+          type: 'standardMessage',
+          message: standardMessage,
+          sessionId: this.activeSessionId,
+        } as any);
+        return;
+      }
+
+      // 发送完成消息，包含已解析的 blocks
+      const completeMessage: StandardMessage = {
+        id: messageId,
+        traceId: this.activeSessionId || 'default',
+        type: error ? MessageType.ERROR : MessageType.RESULT,
+        source: resolvedSource,
+        cli: cli,
+        timestamp: Date.now(),
+        updatedAt: Date.now(),
+        blocks: parsedBlocks.length > 0 ? parsedBlocks : (content ? [{ type: 'text', content, isMarkdown: true }] : []),
+        lifecycle: interrupted ? MessageLifecycle.INTERRUPTED : (error ? MessageLifecycle.FAILED : MessageLifecycle.COMPLETED),
+        metadata: { error, extra: { target, interrupted } },
+      };
+
+      this.postMessage({
+        type: 'standardComplete',
+        message: completeMessage,
         sessionId: this.activeSessionId,
       } as any);
     }
-
-    this.sendStateUpdate();
   }
 
   /** 实现 WebviewViewProvider 接口 */
@@ -1664,13 +1916,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const count = this.snapshotManager.revertAllChanges();
       const message = count > 0 ? `已回滚 ${count} 个变更` : '没有可回滚的变更';
       this.postMessage({ type: 'toast', message, toastType: 'info' });
-      this.postMessage({
-        type: 'orchestratorMessage',
+      this.sendOrchestratorMessage({
         content: `回滚完成：${message}`,
-        phase: 'recovery',
-        messageType: 'recovery_result',
-        sessionId: this.activeSessionId,
-      } as any);
+        messageType: 'result',
+        metadata: { phase: 'recovery' },
+      });
       return;
     }
 
@@ -1838,13 +2088,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
 
     const prompt = this.buildResumePrompt(lastTask.prompt, extraInstruction);
-    this.postMessage({
-      type: 'orchestratorMessage',
+    this.sendOrchestratorMessage({
       content: '正在恢复上一次任务...',
-      phase: 'resuming',
-      messageType: 'resume',
-      sessionId: this.activeSessionId,
-    } as any);
+      messageType: 'progress',
+      metadata: { phase: 'resuming' },
+    });
     await this.executeTask(prompt, undefined, []);
   }
 
@@ -1992,12 +2240,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.saveMessageToSession(planPrompt, record.formattedPlan, undefined, 'orchestrator');
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.postMessage({
-        type: 'orchestratorMessage',
+      this.sendOrchestratorMessage({
         content: errorMsg,
-        phase: 'error',
         messageType: 'error',
-        sessionId: this.activeSessionId,
       });
     } finally {
       this.sendStateUpdate();
@@ -2030,12 +2275,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.saveMessageToSession('/start-work', result, undefined, 'orchestrator');
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.postMessage({
-        type: 'orchestratorMessage',
+      this.sendOrchestratorMessage({
         content: errorMsg,
-        phase: 'error',
         messageType: 'error',
-        sessionId: this.activeSessionId,
       });
     } finally {
       this.sendStateUpdate();
@@ -2145,17 +2387,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       console.error('[MultiCLI] 智能编排执行错误:', error);
       const errorMsg = error instanceof Error ? error.message : String(error);
 
-     
+
       if (task) {
         this.taskManager.updateTaskStatus(task.id, 'failed');
       }
 
-      this.postMessage({
-        type: 'orchestratorMessage',
+      this.sendOrchestratorMessage({
         content: errorMsg,
-        phase: 'error',
         messageType: 'error',
-        sessionId: this.activeSessionId,
       });
     }
 
@@ -2182,15 +2421,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       time: new Date().toLocaleTimeString(),
       hasImages: imagePaths.length > 0
     });
-    this.postMessage({
-      type: 'streamEvent',
+    this.sendStreamEvent({
       phase: 'chunk',
       content: promptMsg + '\n',
       source: 'orchestrator',
       cli: targetCli,
       target: 'cli',
-      sessionId: this.activeSessionId
-    } as any);
+    });
 
     try {
       console.log(`[MultiCLI] 调用 ${targetCli} CLI...`);
@@ -2218,16 +2455,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         this.saveMessageToSession(prompt, response.content || '', targetCli, 'worker');
       }
 
-      this.postMessage({
-        type: 'streamEvent',
+      this.sendStreamEvent({
         phase: 'complete',
         content: response.content,
         error: response.error,
         source: 'worker',
         cli: targetCli,
         target: 'cli',
-        sessionId: this.activeSessionId
-      } as any);
+      });
 
     } catch (error) {
       console.error(`[MultiCLI] ${targetCli} executeTask 错误:`, error);
@@ -2245,16 +2480,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         });
       }
       this.postMessage({ type: 'cliError', cli: targetCli, error: errorMsg });
-      this.postMessage({
-        type: 'streamEvent',
+      this.sendStreamEvent({
         phase: 'complete',
         content: '',
         error: errorMsg,
         source: 'worker',
         cli: targetCli,
         target: 'cli',
-        sessionId: this.activeSessionId
-      } as any);
+      });
     }
 
     this.sendStateUpdate();
@@ -2455,9 +2688,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const loginScriptUri = webview.asWebviewUri(
       vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'login.js'))
     );
+    // lib 目录 URI（用于加载 marked 和 highlight.js）
+    const libUri = webview.asWebviewUri(
+      vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'lib'))
+    );
 
     html = html.replace('href="styles.css"', `href="${stylesUri}"`);
     html = html.replace('src="login.js"', `src="${loginScriptUri}"`);
+    // 替换 lib 目录占位符
+    html = html.replace(/\{\{libUri\}\}/g, libUri.toString());
 
     // 替换 CSP 占位符
     html = html.replace(/\{\{cspSource\}\}/g, webview.cspSource);

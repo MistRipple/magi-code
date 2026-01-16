@@ -1,6 +1,8 @@
 /**
  * CLI 适配器工厂
  * 统一管理和创建 CLI 适配器实例
+ *
+ * 🆕 集成 Normalizer 层，输出标准化消息
  */
 
 import { EventEmitter } from 'events';
@@ -10,6 +12,15 @@ import { CodexAdapter } from './adapters/codex';
 import { GeminiAdapter } from './adapters/gemini';
 import { SessionManager } from './session/session-manager';
 import { globalEventBus } from '../events';
+import {
+  createNormalizer,
+  BaseNormalizer,
+} from '../normalizer';
+import {
+  StandardMessage,
+  StreamUpdate,
+  MessageSource,
+} from '../protocol';
 
 /** 适配器状态信息 */
 export interface AdapterStatus {
@@ -43,6 +54,8 @@ export interface AdapterOutputScope {
 /**
  * CLI 适配器工厂
  * 提供统一的适配器创建、管理和事件转发
+ *
+ * 🆕 集成 Normalizer 层，输出标准化消息
  */
 export class CLIAdapterFactory extends EventEmitter {
   private adapters: Map<CLIType, ICLIAdapter> = new Map();
@@ -51,6 +64,11 @@ export class CLIAdapterFactory extends EventEmitter {
   private sessionManager: SessionManager;
   private outputScopes: Map<string, AdapterOutputScope> = new Map();
   private outputMuteCounts: Map<string, number> = new Map();
+
+  // 🆕 Normalizer 管理
+  private normalizers: Map<string, BaseNormalizer> = new Map();
+  private activeMessageIds: Map<string, string> = new Map(); // scopeKey -> messageId
+  private traceIdCounter = 0;
 
   constructor(config: FactoryConfig) {
     super();
@@ -77,6 +95,45 @@ export class CLIAdapterFactory extends EventEmitter {
     });
   }
 
+  // 🆕 获取或创建 Normalizer
+  private getOrCreateNormalizer(cli: CLIType, source: MessageSource): BaseNormalizer {
+    const key = `${cli}:${source}`;
+    let normalizer = this.normalizers.get(key);
+
+    if (!normalizer) {
+      normalizer = createNormalizer(cli, source, false);
+
+      // 设置 Normalizer 事件监听 - 转发标准消息
+      normalizer.on('message', (message: StandardMessage) => {
+        this.emit('standardMessage', message);
+      });
+
+      normalizer.on('update', (update: StreamUpdate) => {
+        this.emit('standardUpdate', update);
+      });
+
+      normalizer.on('complete', (messageId: string, message: StandardMessage) => {
+        this.emit('standardComplete', message);
+        // 清理活跃消息 ID
+        for (const [key, id] of this.activeMessageIds) {
+          if (id === messageId) {
+            this.activeMessageIds.delete(key);
+            break;
+          }
+        }
+      });
+
+      this.normalizers.set(key, normalizer);
+    }
+
+    return normalizer;
+  }
+
+  // 🆕 生成追踪 ID
+  private generateTraceId(): string {
+    return `trace-${Date.now()}-${++this.traceIdCounter}`;
+  }
+
   /**
    * 创建或获取适配器实例
    */
@@ -86,9 +143,11 @@ export class CLIAdapterFactory extends EventEmitter {
 
   /**
    * 设置适配器事件转发
+   * 🆕 集成 Normalizer，将原始输出转换为标准消息
    */
   private setupAdapterEvents(adapter: ICLIAdapter, type: CLIType, role: AdapterRole): void {
     const suppressUI = role === 'orchestrator';
+
     adapter.on('output', (chunk: string) => {
       const scopeKey = this.getScopeKey(type, role);
       if ((this.outputMuteCounts.get(scopeKey) || 0) > 0) {
@@ -98,16 +157,56 @@ export class CLIAdapterFactory extends EventEmitter {
       if (scope?.streamToUI === false) {
         return;
       }
+
+      const source: MessageSource = (scope?.source as MessageSource) || (role === 'orchestrator' ? 'orchestrator' : 'worker');
+
+      // 🆕 通过 Normalizer 处理原始输出
+      const normalizer = this.getOrCreateNormalizer(type, source);
+      let messageId = this.activeMessageIds.get(scopeKey);
+
+      if (!messageId) {
+        // 开始新的消息流
+        const traceId = this.generateTraceId();
+        messageId = normalizer.startStream(traceId, source);
+        this.activeMessageIds.set(scopeKey, messageId);
+      }
+
+      // 处理输出块
+      normalizer.processChunk(messageId, chunk);
+
+      // 🔧 同时保留旧的 output 事件（向后兼容，可逐步移除）
       this.emit('output', { type, chunk, source: scope?.source, adapterRole: role });
     });
 
     adapter.on('response', (response: CLIResponse) => {
       const scopeKey = this.getScopeKey(type, role);
       const scope = this.outputScopes.get(scopeKey);
+      const source: MessageSource = (scope?.source as MessageSource) || (role === 'orchestrator' ? 'orchestrator' : 'worker');
+
+      // 🆕 结束消息流
+      const messageId = this.activeMessageIds.get(scopeKey);
+      if (messageId) {
+        const normalizer = this.getOrCreateNormalizer(type, source);
+        normalizer.endStream(messageId, response.error);
+        this.activeMessageIds.delete(scopeKey);
+      }
+
+      // 🔧 保留旧的 response 事件
       this.emit('response', { type, response, source: scope?.source, adapterRole: role });
     });
 
     adapter.on('error', (error: Error) => {
+      const scopeKey = this.getScopeKey(type, role);
+      const source: MessageSource = role === 'orchestrator' ? 'orchestrator' : 'worker';
+
+      // 🆕 错误时结束消息流
+      const messageId = this.activeMessageIds.get(scopeKey);
+      if (messageId) {
+        const normalizer = this.getOrCreateNormalizer(type, source);
+        normalizer.endStream(messageId, error.message);
+        this.activeMessageIds.delete(scopeKey);
+      }
+
       this.emit('error', { type, error });
     });
 

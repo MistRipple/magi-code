@@ -21,6 +21,8 @@ export interface TaskAnalysis {
   suggestedMode: 'sequential' | 'parallel';
   /** 原始 prompt */
   prompt: string;
+  /** 是否为问答/咨询类请求（不需要执行任务） */
+  isQuestion: boolean;
 }
 
 /** 任务类型关键词映射 */
@@ -49,27 +51,46 @@ const COMPLEXITY_INDICATORS = {
  * 任务分析器类
  */
 export class TaskAnalyzer {
+  /** 问答/咨询类关键词 */
+  private readonly questionKeywords = [
+    '是什么', '什么是', '为什么', '怎么', '如何', '能否', '可以吗', '建议', '解释', '说明',
+    '介绍', '告诉我', '帮我理解', '对比', '优缺点', '方案', '思路', '总结', '概念', '原理',
+    '问题', '是否', '推荐', '区别', '差异', '哪个', '什么时候', '为何', '能不能',
+    'what', 'why', 'how', 'when', 'which', 'explain', 'describe', 'compare', 'difference',
+    '你可以', '你能', '你会', '你是'
+  ];
+
+  /** 任务执行类关键词 */
+  private readonly taskKeywords = [
+    '实现', '添加', '新增', '修改', '修复', '重构', '迁移', '集成', '优化', '部署', '测试',
+    '生成', '创建', '删除', '更新', '写', '改', '开发', '搭建', '编排', '完善', '构建',
+    '做一个', '帮我做', '帮我写', '帮我改', '帮我修', '帮我创建', '帮我实现', '帮我添加'
+  ];
+
   /**
    * 分析用户输入
    */
   analyze(prompt: string): TaskAnalysis {
     const lowerPrompt = prompt.toLowerCase();
-    
+
+    // 首先判断是否为问答类请求
+    const isQuestion = this.detectIsQuestion(prompt);
+
     // 识别任务类型
     const category = this.detectCategory(lowerPrompt);
-    
+
     // 识别目标文件
     const targetFiles = this.extractTargetFiles(prompt);
-    
+
     // 识别关键词
     const keywords = this.extractKeywords(lowerPrompt);
-    
+
     // 评估复杂度
     const complexity = this.assessComplexity(prompt, targetFiles, keywords);
-    
+
     // 判断是否可拆分
     const splittable = this.isSplittable(prompt, category, complexity);
-    
+
     // 建议执行模式
     const suggestedMode = this.suggestMode(targetFiles, splittable);
 
@@ -81,7 +102,40 @@ export class TaskAnalyzer {
       splittable,
       suggestedMode,
       prompt,
+      isQuestion,
     };
+  }
+
+  /**
+   * 检测是否为问答/咨询类请求
+   */
+  private detectIsQuestion(prompt: string): boolean {
+    const trimmed = prompt.trim();
+
+    // 1. 包含问号
+    if (trimmed.includes('?') || trimmed.includes('？')) {
+      // 但如果同时包含任务关键词，则不是纯问答
+      const hasTaskKeyword = this.taskKeywords.some(k => trimmed.includes(k));
+      if (!hasTaskKeyword) return true;
+    }
+
+    // 2. 包含问答关键词
+    const hasQuestionKeyword = this.questionKeywords.some(k => trimmed.includes(k));
+    const hasTaskKeyword = this.taskKeywords.some(k => trimmed.includes(k));
+
+    // 有问答关键词且没有任务关键词
+    if (hasQuestionKeyword && !hasTaskKeyword) return true;
+
+    // 3. 短文本且没有任务关键词（可能是简单问候或询问）
+    if (trimmed.length <= 30 && !hasTaskKeyword) {
+      // 检查是否包含代码块或文件路径
+      if (trimmed.includes('```') || /[\\/].+\.\w+/.test(trimmed)) {
+        return false;
+      }
+      return true;
+    }
+
+    return false;
   }
 
   /**

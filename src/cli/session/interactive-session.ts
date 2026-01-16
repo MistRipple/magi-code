@@ -22,6 +22,16 @@ export interface InteractiveSessionOptions {
   sessionId?: string;
 }
 
+/**
+ * 询问检测结果
+ */
+export interface QuestionDetectionResult {
+  isQuestion: boolean;
+  type: 'structured' | 'permission' | 'confirmation' | 'input' | 'unknown';
+  data?: Record<string, unknown>;
+  originalText?: string;
+}
+
 export class InteractiveSession extends EventEmitter implements SessionProcess {
   readonly cli: CLIType;
   private readonly cwd: string;
@@ -187,18 +197,119 @@ export class InteractiveSession extends EventEmitter implements SessionProcess {
   }
 
   /**
-   * 检测 CLI 询问
+   * 🆕 增强的 CLI 询问检测
+   * 支持结构化询问、权限请求、确认请求等多种类型
    */
-  private detectQuestion(text: string): boolean {
-    // 检测常见的询问模式
-    const questionPatterns = [
-      /\?\s*$/,
+  private detectQuestionEnhanced(text: string): QuestionDetectionResult {
+    // 1. 检查 stream-json 中的结构化询问标记
+    const structuredMatch = text.match(/\{"type"\s*:\s*"(question|input_request|permission)"[^}]*\}/);
+    if (structuredMatch) {
+      try {
+        const data = JSON.parse(structuredMatch[0]);
+        return {
+          isQuestion: true,
+          type: 'structured',
+          data,
+          originalText: text,
+        };
+      } catch {
+        // 解析失败，继续其他检测
+      }
+    }
+
+    // 2. 检查 Claude CLI 特有的权限请求格式
+    // 例如: "Allow Claude to edit file.ts? [Y/n]"
+    const permissionPatterns = [
+      /Allow\s+\w+\s+to\s+.+\?\s*\[Y\/n\]/i,
+      /Do you want to allow\s+.+\?\s*\[Y\/n\]/i,
+      /Permission\s+required.+\[Y\/n\]/i,
+      /Approve\s+.+\?\s*\[Y\/n\]/i,
+    ];
+    for (const pattern of permissionPatterns) {
+      if (pattern.test(text)) {
+        return {
+          isQuestion: true,
+          type: 'permission',
+          originalText: text,
+        };
+      }
+    }
+
+    // 3. 检查确认请求
+    const confirmationPatterns = [
       /\[y\/n\]/i,
       /\(yes\/no\)/i,
-      /press enter/i,
+      /\[Y\/n\]/,
+      /\[y\/N\]/,
+      /confirm\?/i,
+      /proceed\?/i,
       /continue\?/i,
+      /are you sure\?/i,
     ];
-    return questionPatterns.some(pattern => pattern.test(text));
+    for (const pattern of confirmationPatterns) {
+      if (pattern.test(text)) {
+        return {
+          isQuestion: true,
+          type: 'confirmation',
+          originalText: text,
+        };
+      }
+    }
+
+    // 4. 检查输入请求
+    const inputPatterns = [
+      /enter\s+.+:/i,
+      /input\s+.+:/i,
+      /provide\s+.+:/i,
+      /type\s+.+:/i,
+      /press enter/i,
+      /waiting for input/i,
+    ];
+    for (const pattern of inputPatterns) {
+      if (pattern.test(text)) {
+        return {
+          isQuestion: true,
+          type: 'input',
+          originalText: text,
+        };
+      }
+    }
+
+    // 5. 通用问号检测（最后的回退）
+    // 只有当文本以问号结尾且不是代码注释时才认为是问题
+    const trimmedText = text.trim();
+    if (trimmedText.endsWith('?') && !trimmedText.startsWith('//') && !trimmedText.startsWith('#')) {
+      // 排除代码中的三元运算符等
+      const lastLine = trimmedText.split('\n').pop() || '';
+      if (lastLine.endsWith('?') && !lastLine.includes('?') || lastLine.match(/\?\s*$/)) {
+        return {
+          isQuestion: true,
+          type: 'unknown',
+          originalText: text,
+        };
+      }
+    }
+
+    return {
+      isQuestion: false,
+      type: 'unknown',
+    };
+  }
+
+  /**
+   * 检测 CLI 询问（保持向后兼容）
+   */
+  private detectQuestion(text: string): boolean {
+    const result = this.detectQuestionEnhanced(text);
+    return result.isQuestion;
+  }
+
+  /**
+   * 获取询问类型（供外部使用）
+   */
+  getQuestionType(text: string): string {
+    const result = this.detectQuestionEnhanced(text);
+    return result.type;
   }
 
   /**

@@ -108,8 +108,8 @@ export class IntelligentOrchestrator {
   // 核心：独立编排者 Agent
   private orchestratorAgent: OrchestratorAgent;
 
-  // 交互模式
-  private interactionMode: InteractionMode = 'agent';
+  // 交互模式 - 默认 auto，根据用户输入智能判断
+  private interactionMode: InteractionMode = 'auto';
   private readonly directAnswerKeywords = [
     '是什么', '为什么', '怎么', '如何', '能否', '可以吗', '建议', '解释', '了解', '对比', '优缺点',
     '方案', '思路', '总结', '概念', '原理', '问题', '是否', '推荐'
@@ -118,7 +118,7 @@ export class IntelligentOrchestrator {
     '实现', '添加', '新增', '修改', '修复', '重构', '迁移', '集成', '优化', '部署', '测试', '生成',
     '创建', '删除', '更新', '写', '改', '开发', '搭建', '编排', '完善'
   ];
-  private modeConfig: InteractionModeConfig = INTERACTION_MODE_CONFIGS.agent;
+  private modeConfig: InteractionModeConfig = INTERACTION_MODE_CONFIGS.auto;
   private recoveryConfirmationCallback: RecoveryConfirmationCallback | null = null;
   private strategyConfig: StrategyConfig;
   private permissions: PermissionMatrix;
