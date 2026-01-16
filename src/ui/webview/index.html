@@ -2124,15 +2124,15 @@
           <div class="profile-section-title">任务分类默认</div>
           <div class="profile-categories-grid" id="profile-categories">
             <div class="profile-category-row">
-              <span class="profile-category-label">架构设计</span>
+              <span class="profile-category-label">架构设计(architecture)</span>
               <select class="profile-category-select" data-category="architecture">
-                <option value="claude">Claude</option>
+                <option value="claude" selected>Claude</option>
                 <option value="codex">Codex</option>
                 <option value="gemini">Gemini</option>
               </select>
             </div>
             <div class="profile-category-row">
-              <span class="profile-category-label">缺陷修复</span>
+              <span class="profile-category-label">缺陷修复(bugfix)</span>
               <select class="profile-category-select" data-category="bugfix">
                 <option value="claude">Claude</option>
                 <option value="codex" selected>Codex</option>
@@ -2140,7 +2140,7 @@
               </select>
             </div>
             <div class="profile-category-row">
-              <span class="profile-category-label">前端开发</span>
+              <span class="profile-category-label">前端开发(frontend)</span>
               <select class="profile-category-select" data-category="frontend">
                 <option value="claude">Claude</option>
                 <option value="codex">Codex</option>
@@ -2148,23 +2148,15 @@
               </select>
             </div>
             <div class="profile-category-row">
-              <span class="profile-category-label">功能实现</span>
-              <select class="profile-category-select" data-category="implement">
+              <span class="profile-category-label">后端开发(backend)</span>
+              <select class="profile-category-select" data-category="backend">
                 <option value="claude" selected>Claude</option>
                 <option value="codex">Codex</option>
                 <option value="gemini">Gemini</option>
               </select>
             </div>
             <div class="profile-category-row">
-              <span class="profile-category-label">代码重构</span>
-              <select class="profile-category-select" data-category="refactor">
-                <option value="claude" selected>Claude</option>
-                <option value="codex">Codex</option>
-                <option value="gemini">Gemini</option>
-              </select>
-            </div>
-            <div class="profile-category-row">
-              <span class="profile-category-label">测试编写</span>
+              <span class="profile-category-label">测试编写(test)</span>
               <select class="profile-category-select" data-category="test">
                 <option value="claude">Claude</option>
                 <option value="codex" selected>Codex</option>
@@ -2172,18 +2164,26 @@
               </select>
             </div>
             <div class="profile-category-row">
-              <span class="profile-category-label">文档编写</span>
-              <select class="profile-category-select" data-category="document">
+              <span class="profile-category-label">文档编写(docs)</span>
+              <select class="profile-category-select" data-category="docs">
+                <option value="claude">Claude</option>
+                <option value="codex">Codex</option>
+                <option value="gemini" selected>Gemini</option>
+              </select>
+            </div>
+            <div class="profile-category-row">
+              <span class="profile-category-label">集成联调(integration)</span>
+              <select class="profile-category-select" data-category="integration">
                 <option value="claude" selected>Claude</option>
                 <option value="codex">Codex</option>
                 <option value="gemini">Gemini</option>
               </select>
             </div>
             <div class="profile-category-row">
-              <span class="profile-category-label">通用任务</span>
-              <select class="profile-category-select" data-category="general">
-                <option value="claude" selected>Claude</option>
-                <option value="codex">Codex</option>
+              <span class="profile-category-label">简单任务(simple)</span>
+              <select class="profile-category-select" data-category="simple">
+                <option value="claude">Claude</option>
+                <option value="codex" selected>Codex</option>
                 <option value="gemini">Gemini</option>
               </select>
             </div>
@@ -6752,16 +6752,16 @@
       }
     };
 
-    // 分类配置缓存 - 完整的分类映射
+    // 分类配置缓存 - 与系统内置配置保持一致
     let categoryConfig = {
       architecture: 'claude',
       bugfix: 'codex',
       frontend: 'gemini',
-      implement: 'claude',
-      refactor: 'claude',
+      backend: 'claude',
       test: 'codex',
-      document: 'claude',
-      general: 'claude'
+      docs: 'gemini',
+      integration: 'claude',
+      simple: 'codex'
     };
 
     // Worker Tab 切换

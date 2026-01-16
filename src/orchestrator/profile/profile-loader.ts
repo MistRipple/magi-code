@@ -162,20 +162,48 @@ export class ProfileLoader {
 
   /**
    * 合并分类配置
+   * 注意：keywords 是系统内置配置，不允许用户覆盖
    */
   private mergeCategoriesConfig(
     base: CategoriesConfig,
     override: Partial<CategoriesConfig>
   ): CategoriesConfig {
+    // 深度合并 categories
+    const mergedCategories: Record<string, CategoryConfig> = { ...base.categories };
+
+    if (override.categories) {
+      for (const [name, userConfig] of Object.entries(override.categories)) {
+        const baseConfig = base.categories[name];
+        if (baseConfig) {
+          // 深度合并单个分类配置
+          // keywords 始终使用系统内置配置，不允许用户覆盖
+          mergedCategories[name] = {
+            displayName: userConfig.displayName || baseConfig.displayName,
+            description: userConfig.description || baseConfig.description,
+            keywords: baseConfig.keywords, // 始终使用系统内置
+            defaultWorker: userConfig.defaultWorker || baseConfig.defaultWorker,
+            priority: userConfig.priority || baseConfig.priority,
+            riskLevel: userConfig.riskLevel || baseConfig.riskLevel,
+          };
+        } else {
+          // 新分类需要有 keywords，否则跳过
+          if (userConfig.keywords && userConfig.keywords.length > 0) {
+            mergedCategories[name] = userConfig as CategoryConfig;
+          }
+        }
+      }
+    }
+
     return {
       version: override.version ?? base.version,
-      categories: {
-        ...base.categories,
-        ...override.categories,
-      },
+      categories: mergedCategories,
       rules: {
-        ...base.rules,
-        ...override.rules,
+        categoryPriority: override.rules?.categoryPriority ?? base.rules.categoryPriority,
+        defaultCategory: override.rules?.defaultCategory ?? base.rules.defaultCategory,
+        riskMapping: {
+          ...base.rules.riskMapping,
+          ...override.rules?.riskMapping,
+        },
       },
     };
   }

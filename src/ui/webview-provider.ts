@@ -1967,8 +1967,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         categories: {
           categories: {},
           rules: {
-            categoryPriority: ['architecture', 'bugfix', 'frontend', 'implement', 'refactor', 'test', 'document', 'general'],
-            defaultCategory: 'general',
+            categoryPriority: ['architecture', 'integration', 'bugfix', 'backend', 'frontend', 'test', 'docs', 'simple'],
+            defaultCategory: 'simple',
             riskMapping: { high: 'fullPath', medium: 'standardPath', low: 'lightPath' },
           },
         },
@@ -1993,11 +1993,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
 
       // 转换分类配置
+      // 注意：keywords 是系统内置配置，不保存到用户配置文件中
       for (const [category, worker] of Object.entries(data.categories)) {
         if (config.categories?.categories) {
           (config.categories.categories as any)[category] = {
             defaultWorker: worker,
-            keywords: [],
+            // keywords 不保存，由系统内置提供
             priority: 'medium',
             riskLevel: 'medium',
           };
