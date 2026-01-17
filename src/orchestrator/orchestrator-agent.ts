@@ -294,21 +294,6 @@ export class OrchestratorAgent extends EventEmitter {
     this.strategyConfig = this.resolveStrategyConfig();
     this.permissions = this.resolvePermissions();
 
-    // 初始化 Worker 画像系统
-    if (this.workspaceRoot) {
-      this.profileLoader = new ProfileLoader(this.workspaceRoot);
-      // 异步加载画像，不阻塞构造函数
-      this.profileLoader.load().catch(err => {
-        console.warn('[OrchestratorAgent] ProfileLoader 加载失败:', err);
-      });
-
-      // 创建 PolicyEngine 实例并注入 ProfileLoader
-      this.policyEngine = new PolicyEngine(this.profileLoader);
-
-      // 将 ProfileLoader 注入到 CLISelector
-      this.cliSelector.setProfileLoader(this.profileLoader);
-    }
-
     // 初始化 Intent Gate - 意图门控
     this.intentGate = new IntentGate();
 
@@ -434,8 +419,13 @@ export class OrchestratorAgent extends EventEmitter {
     // 将 ProfileLoader 设置给 CLISelector 和 TaskAnalyzer，实现画像驱动的任务分配
     const profileLoader = this.workerPool.getProfileLoader();
     if (profileLoader) {
+      this.profileLoader = profileLoader;
       this.cliSelector.setProfileLoader(profileLoader);
       this.taskAnalyzer.setProfileLoader(profileLoader);
+
+      // 创建 PolicyEngine 实例并注入 ProfileLoader
+      this.policyEngine = new PolicyEngine(profileLoader);
+
       console.log('[OrchestratorAgent] CLISelector 和 TaskAnalyzer 已集成 Worker 画像');
     }
 
@@ -976,7 +966,11 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
 
       // Phase 0.5: 需求澄清（如果设置了澄清回调且意图门控未处理）
       let clarifiedPrompt = userPrompt;
-      if (this.clarificationCallback && !intentResult.needsClarification) {
+      if (
+        this.clarificationCallback &&
+        !intentResult.needsClarification &&
+        intentResult.recommendedMode === IntentHandlerMode.TASK
+      ) {
         const assessment = await this.assessAmbiguity(userPrompt);
         if (assessment.isAmbiguous && assessment.questions.length > 0) {
           clarifiedPrompt = await this.clarifyRequirements(userPrompt, assessment);
@@ -1746,7 +1740,7 @@ ${userPrompt}
 
     return {
       id: `plan_${Date.now()}`,
-      analysis: `规则分析：${analysis.category}，复杂度 ${analysis.complexity}/5`,
+      analysis: `规则分析：${analysis.category}，复杂度 ${analysis.complexity}/5${analysis.riskLevel ? `，风险等级 ${analysis.riskLevel}` : ''}`,
       isSimpleTask: subTasks.length <= 1,
       needsWorker: true,
       needsUserInput: false,
@@ -1758,6 +1752,7 @@ ${userPrompt}
       featureContract: userPrompt,
       acceptanceCriteria: ['任务按要求完成'],
       createdAt: Date.now(),
+      riskLevel: analysis.riskLevel, // Pass riskLevel from TaskAnalyzer
     };
   }
 
@@ -4445,7 +4440,7 @@ ${userPrompt}
 
   /** 处理进度汇报消息 */
   private handleProgressReport(message: ProgressReportMessage): void {
-    const { taskId, subTaskId, status, progress, message: msg, output } = message.payload;
+    const { taskId, subTaskId, status, progress, message: msg, output, dispatchId } = message.payload;
 
     if (status === 'started' || status === 'in_progress') {
       this.taskManager?.updateSubTaskStatus(taskId, subTaskId, 'running');
@@ -4462,6 +4457,7 @@ ${userPrompt}
             description: subTask?.description,
             targetFiles: subTask?.targetFiles,
             reason: subTask?.reason,
+            dispatchId,
           },
         });
       }
@@ -4471,7 +4467,7 @@ ${userPrompt}
     }
 
     if (msg) {
-      this.emitUIMessage('progress_update', msg, { subTaskId, progress });
+      this.emitUIMessage('progress_update', msg, { subTaskId, progress, dispatchId });
     }
     if (progress !== undefined) {
       this.taskStateManager?.updateProgress(subTaskId, progress);

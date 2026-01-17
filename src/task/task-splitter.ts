@@ -51,7 +51,8 @@ export class TaskSplitter {
   }
 
   private createSingleTask(analysis: TaskAnalysis): SplitResult {
-    const selection = this.cliSelector.select(analysis);
+    // Use recommendedWorker from profile system as preference
+    const selection = this.cliSelector.select(analysis, analysis.recommendedWorker);
     return {
       subTasks: [{
         id: generateId(), description: analysis.prompt, category: analysis.category,
@@ -68,7 +69,8 @@ export class TaskSplitter {
     const files = analysis.targetFiles;
     if (files.length <= 1) return this.createSingleTask(analysis);
     const subTasks: SubTaskDef[] = files.map((file, index) => {
-      const selection = this.cliSelector.select(analysis);
+      // Use recommendedWorker from profile system as preference
+      const selection = this.cliSelector.select(analysis, analysis.recommendedWorker);
       return {
         id: generateId(), description: `处理文件: ${file}`, category: analysis.category,
         assignedCli: selection.cli, targetFiles: [file],

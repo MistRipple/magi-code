@@ -142,13 +142,14 @@ export class MessageBus extends EventEmitter {
    * 发送任务分发消息（编排者 -> Worker）
    */
   dispatchTask(source: string, target: string, taskId: string, subTask: SubTask, context?: string): void {
+    const messageId = generateMessageId();
     const message: TaskDispatchMessage = {
-      id: generateMessageId(),
+      id: messageId,
       type: 'task_dispatch',
       timestamp: Date.now(),
       source,
       target,
-      payload: { taskId, subTask, context },
+      payload: { taskId, subTask, context, dispatchId: messageId },
     };
     this.publish(message);
   }
@@ -177,7 +178,7 @@ export class MessageBus extends EventEmitter {
     taskId: string,
     subTaskId: string,
     status: 'started' | 'in_progress' | 'completed' | 'failed',
-    options?: { progress?: number; message?: string; output?: string }
+    options?: { progress?: number; message?: string; output?: string; dispatchId?: string }
   ): void {
     const message: ProgressReportMessage = {
       id: generateMessageId(),
@@ -214,7 +215,8 @@ export class MessageBus extends EventEmitter {
     taskId: string,
     subTaskId: string,
     error: string,
-    canRetry: boolean = true
+    canRetry: boolean = true,
+    dispatchId?: string
   ): void {
     const message: TaskFailedMessage = {
       id: generateMessageId(),
@@ -222,7 +224,7 @@ export class MessageBus extends EventEmitter {
       timestamp: Date.now(),
       source,
       target,
-      payload: { taskId, subTaskId, error, canRetry },
+      payload: { taskId, subTaskId, error, canRetry, dispatchId },
     };
     this.publish(message);
   }

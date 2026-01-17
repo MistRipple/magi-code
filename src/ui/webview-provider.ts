@@ -329,108 +329,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       } as any);
     });
 
-    // 监听工厂的统一事件（保留向后兼容，逐步移除）
-    this.cliFactory.on('output', ({
-      type,
-      chunk,
-      source,
-      adapterRole
-    }: {
-      type: CLIType;
-      chunk: string;
-      source?: string;
-      adapterRole?: 'worker' | 'orchestrator';
-    }) => {
-      if (adapterRole === 'orchestrator') {
-        if (!chunk) {
-          return;
-        }
-        if (this.orchestratorStreamCli !== type) {
-          this.orchestratorStreamBuffer = '';
-          this.orchestratorStreamCli = type;
-        }
-        this.orchestratorStreamBuffer += chunk;
-        this.orchestratorStreamPending += chunk;
-        if (!this.orchestratorStreamFlushTimer) {
-          this.orchestratorStreamFlushTimer = setTimeout(() => {
-            const pending = this.orchestratorStreamPending;
-            this.orchestratorStreamPending = '';
-            this.orchestratorStreamFlushTimer = null;
-            if (!pending) {
-              return;
-            }
-            this.sendStreamEvent({
-              phase: 'chunk',
-              content: pending,
-              append: true,
-              source: source || 'orchestrator',
-              cli: type,
-              target: 'thread',
-            });
-          }, 50);
-        }
-        return;
-      }
-      const outputs = this.cliOutputs.get(type) || [];
-      outputs.push(chunk);
-      this.cliOutputs.set(type, outputs);
-      this.sendStreamEvent({
-        phase: 'chunk',
-        content: chunk,
-        source: source,
-        cli: type,
-        target: 'cli',
-      });
-    });
-    this.cliFactory.on('response', ({
-      type,
-      response,
-      adapterRole,
-      source
-    }: {
-      type: CLIType;
-      response: CLIResponse;
-      adapterRole?: 'worker' | 'orchestrator';
-      source?: string;
-    }) => {
-      if (adapterRole === 'orchestrator') {
-        const content = response.error
-          ? `错误: ${response.error}`
-          : (response.content || this.orchestratorStreamBuffer);
-        if (content) {
-          this.sendStreamEvent({
-            phase: 'complete',
-            content,
-            source: source || 'orchestrator',
-            cli: type,
-            error: response.error,
-            target: 'thread',
-          });
-        }
-        this.orchestratorStreamBuffer = '';
-        this.orchestratorStreamCli = null;
-        this.orchestratorStreamPending = '';
-        if (this.orchestratorStreamFlushTimer) {
-          clearTimeout(this.orchestratorStreamFlushTimer);
-          this.orchestratorStreamFlushTimer = null;
-        }
-        return;
-      }
-
-      const buffered = this.cliOutputs.get(type) || [];
-      const content = response.error
-        ? `错误: ${response.error}`
-        : (response.content || buffered.join(''));
-      this.sendStreamEvent({
-        phase: 'complete',
-        content,
-        source: source,
-        cli: type,
-        error: response.error,
-        target: 'cli',
-      });
-      this.cliOutputs.set(type, []);
-    });
+    // ✅ P2修复: 移除旧的 output/response 事件监听器
+    // 所有消息现在通过 standardMessage API 处理
+    // 旧代码已移除，Normalizer 统一处理消息流
 
     this.cliFactory.on('stateChange', ({ type, state }: { type: CLIType; state: string }) => {
       const status: CLIStatus = {
@@ -692,7 +593,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       } as any);
     });
     globalEventBus.on('subtask:started', (event) => {
-      const data = event.data as { cli?: string; description?: string; targetFiles?: string[]; reason?: string };
+      const data = event.data as { cli?: string; description?: string; targetFiles?: string[]; reason?: string; dispatchId?: string };
       if (data?.description) {
         // 发送到主对话窗口（使用标准消息）
         this.sendOrchestratorMessage({
@@ -704,6 +605,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
             status: 'started',
             cli: data.cli || 'system',
             description: data.description,
+            dispatchId: data.dispatchId,
           },
         });
 
@@ -718,6 +620,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
             targetFiles: data.targetFiles || [],
             reason: data.reason || '',
             status: 'started',
+            dispatchId: data.dispatchId,
             sessionId: this.activeSessionId,
           });
         }
@@ -2836,9 +2739,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const currentSession = this.sessionManager.getCurrentSession();
     const tasks = this.taskManager.getAllTasks();
     const currentTask = tasks.find(t => t.status === 'running') ?? tasks[tasks.length - 1];
-    const activePlanRecord = currentSession?.id
+    const activePlanRecordRaw = currentSession?.id
       ? this.intelligentOrchestrator.getActivePlanForSession(currentSession.id)
       : null;
+    const activePlanRecord = activePlanRecordRaw?.plan?.needsWorker === false ? null : activePlanRecordRaw;
     // 使用统一会话管理器的会话数据
     const allSessions = this.sessionManager.getAllSessions();
 

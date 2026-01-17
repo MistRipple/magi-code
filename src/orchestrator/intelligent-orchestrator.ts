@@ -112,7 +112,8 @@ export class IntelligentOrchestrator {
   private interactionMode: InteractionMode = 'auto';
   private readonly directAnswerKeywords = [
     '是什么', '为什么', '怎么', '如何', '能否', '可以吗', '建议', '解释', '了解', '对比', '优缺点',
-    '方案', '思路', '总结', '概念', '原理', '问题', '是否', '推荐'
+    '方案', '思路', '总结', '概念', '原理', '问题', '是否', '推荐',
+    '你能', '你可以', '你会', '能不能', '能吗', '支持吗', '可以', '能否'
   ];
   private readonly taskIntentKeywords = [
     '实现', '添加', '新增', '修改', '修复', '重构', '迁移', '集成', '优化', '部署', '测试', '生成',
@@ -502,8 +503,16 @@ export class IntelligentOrchestrator {
     if (lower.includes('```') || /[\\/].+\.\w+/.test(lower)) return false;
 
     const hasTaskIntent = this.taskIntentKeywords.some(k => trimmed.includes(k));
-    const hasBuildVerb = /(做|制作|搭建|实现)/.test(trimmed);
+    const hasBuildVerb = /(做|制作|搭建|实现|开发|修复|重构|新增|优化|编写|添加|修改)/.test(trimmed);
     const hasBuildTarget = /(功能|页面|模块|接口|系统|组件|服务|项目|API|后端|前端|UI|界面)/i.test(trimmed);
+    const capabilityPattern = /(你能|你可以|你会|能不能|能否|是否|可以|支持)/;
+    const endsWithQuestionWord = /(吗|么|？|\?)$/.test(trimmed);
+    const hasCapabilityQuestion = capabilityPattern.test(trimmed)
+      && (endsWithQuestionWord || /(能做|能否做|可以做)/.test(trimmed))
+      && !hasBuildTarget
+      && !/(代码|文件|改动|实现|开发|修复|重构|新增|优化)/.test(trimmed);
+
+    if (hasCapabilityQuestion) return true;
     const hasStructuredTaskIntent = hasTaskIntent || (hasBuildVerb && hasBuildTarget);
     if (hasStructuredTaskIntent) return false;
 

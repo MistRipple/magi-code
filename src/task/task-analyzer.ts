@@ -195,12 +195,20 @@ export class TaskAnalyzer {
    */
   private detectIsQuestion(prompt: string): boolean {
     const trimmed = prompt.trim();
+    const hasBuildVerb = /(做|制作|搭建|实现|开发|修复|重构|新增|优化|编写|添加|修改)/.test(trimmed);
+    const hasBuildTarget = /(功能|页面|模块|接口|系统|组件|服务|项目|API|后端|前端|UI|界面)/i.test(trimmed);
+    const capabilityPattern = /(你能|你可以|你会|能不能|能否|是否|可以|支持)/;
+    const endsWithQuestionWord = /(吗|么|？|\?)$/.test(trimmed);
+    const hasCapabilityQuestion = capabilityPattern.test(trimmed)
+      && (endsWithQuestionWord || /(能做|能否做|可以做)/.test(trimmed))
+      && !hasBuildTarget
+      && !/(代码|文件|改动|实现|开发|修复|重构|新增|优化)/.test(trimmed);
 
     // 1. 包含问号
     if (trimmed.includes('?') || trimmed.includes('？')) {
       // 但如果同时包含任务关键词，则不是纯问答
       const hasTaskKeyword = this.taskKeywords.some(k => trimmed.includes(k));
-      if (!hasTaskKeyword) return true;
+      if (!hasTaskKeyword || hasCapabilityQuestion) return true;
     }
 
     // 2. 包含问答关键词
@@ -208,7 +216,7 @@ export class TaskAnalyzer {
     const hasTaskKeyword = this.taskKeywords.some(k => trimmed.includes(k));
 
     // 有问答关键词且没有任务关键词
-    if (hasQuestionKeyword && !hasTaskKeyword) return true;
+    if (hasQuestionKeyword && (!hasTaskKeyword || hasCapabilityQuestion)) return true;
 
     // 3. 短文本且没有任务关键词（可能是简单问候或询问）
     if (trimmed.length <= 30 && !hasTaskKeyword) {
@@ -216,6 +224,11 @@ export class TaskAnalyzer {
       if (trimmed.includes('```') || /[\\/].+\.\w+/.test(trimmed)) {
         return false;
       }
+      return true;
+    }
+
+    // 4. 能力/可行性询问（即便包含任务关键词）
+    if (hasCapabilityQuestion && !(hasBuildVerb && hasBuildTarget)) {
       return true;
     }
 

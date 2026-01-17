@@ -76,6 +76,7 @@ export class WorkerAgent extends EventEmitter {
   private _state: WorkerState = 'idle';
   private currentTaskId: string | null = null;
   private currentSubTaskId: string | null = null;
+  private currentDispatchId: string | null = null;
   private currentContextSnapshot: string | null = null;
   private abortController: AbortController | null = null;
   private unsubscribers: Array<() => void> = [];
@@ -203,14 +204,14 @@ export class WorkerAgent extends EventEmitter {
 
   /** 处理任务分发 */
   private async handleTaskDispatch(message: TaskDispatchMessage): Promise<void> {
-    const { taskId, subTask, context } = message.payload;
+    const { taskId, subTask, context, dispatchId } = message.payload;
     
     if (this._state !== 'idle') {
       console.warn(`[WorkerAgent ${this.id}] 收到任务但当前状态为 ${this._state}，忽略`);
       return;
     }
 
-    await this.executeTask(taskId, subTask, context);
+    await this.executeTask(taskId, subTask, context, dispatchId);
   }
 
   /** 处理任务取消 */
@@ -240,10 +241,11 @@ export class WorkerAgent extends EventEmitter {
    * 执行任务
    * 核心方法：接收子任务，调用 CLI 执行，汇报结果
    */
-  async executeTask(taskId: string, subTask: SubTask, context?: string): Promise<ExecutionResult> {
+  async executeTask(taskId: string, subTask: SubTask, context?: string, dispatchId?: string): Promise<ExecutionResult> {
     const startTime = Date.now();
     this.currentTaskId = taskId;
     this.currentSubTaskId = subTask.id;
+    this.currentDispatchId = dispatchId || null;
     this.currentContextSnapshot = context ? this.truncateSnapshot(context) : null;
     this.abortController = new AbortController();
 
@@ -263,7 +265,7 @@ export class WorkerAgent extends EventEmitter {
       taskId,
       subTask.id,
       'started',
-      { message: `开始执行: ${subTask.description}` }
+      { message: `开始执行: ${subTask.description}`, dispatchId: this.currentDispatchId || undefined }
     );
 
     try {
@@ -294,6 +296,7 @@ export class WorkerAgent extends EventEmitter {
         workerType: this.type,
         taskId,
         subTaskId: subTask.id,
+        dispatchId: this.currentDispatchId || undefined,
         // 优先使用 content，如果为空则使用 raw
         result: this.formatResultContent(subTask, response.content || response.raw),
         success: !response.error,
@@ -325,7 +328,8 @@ export class WorkerAgent extends EventEmitter {
         taskId,
         subTask.id,
         errorMsg,
-        true // canRetry
+        true,
+        this.currentDispatchId || undefined
       );
       this.emit('failed', errorMsg);
 
@@ -542,7 +546,7 @@ export class WorkerAgent extends EventEmitter {
           this.currentTaskId,
           this.currentSubTaskId,
           'in_progress',
-          { output: chunk }
+          { output: chunk, dispatchId: this.currentDispatchId || undefined }
         );
       }
     };
@@ -598,6 +602,7 @@ export class WorkerAgent extends EventEmitter {
   private cleanup(): void {
     this.currentTaskId = null;
     this.currentSubTaskId = null;
+    this.currentDispatchId = null;
     this.currentContextSnapshot = null;
     this.abortController = null;
     this.setState('idle');

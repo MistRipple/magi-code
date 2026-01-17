@@ -591,7 +591,7 @@ export type ExtensionToWebviewMessage =
   | { type: 'executionStatsUpdate'; stats: CLIExecutionStats[]; orchestratorStats?: { totalTasks: number; totalSuccess: number; totalFailed: number; totalInputTokens: number; totalOutputTokens: number } }
   | { type: 'cliFallbackNotice'; originalCli: CLIType; fallbackCli: CLIType; reason: string }
  
-  | { type: 'cliTaskCard'; cli: CLIType; taskId: string; subTaskId: string; description: string; targetFiles?: string[]; reason?: string; status: string; sessionId?: string | null }
+  | { type: 'cliTaskCard'; cli: CLIType; taskId: string; subTaskId: string; description: string; targetFiles?: string[]; reason?: string; status: string; dispatchId?: string; sessionId?: string | null }
  
   | { type: 'promptEnhanceResult'; success: boolean; message: string }
  
