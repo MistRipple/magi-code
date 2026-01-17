@@ -76,8 +76,7 @@ ${projectContext ? `## 项目上下文\n${projectContext}\n` : ''}
 2. 架构任务需明确：目录结构、接口契约、前后端对接约束。
 
 ## 输出格式
-请以 JSON 格式输出执行计划：
-\`\`\`json
+请仅输出**严格 JSON**，不要包含代码块或解释文本：
 {
   "analysis": "对任务的简要分析",
   "isSimpleTask": true/false,
@@ -107,7 +106,6 @@ ${projectContext ? `## 项目上下文\n${projectContext}\n` : ''}
   "executionMode": "parallel/sequential",
   "summary": "执行计划总结"
 }
-\`\`\`
 
 ## 重要判断
 - **不需要 Worker 的情况**（设置 needsWorker: false）：
