@@ -2922,19 +2922,32 @@
         if (!cli) return;
 
         const cliMessages = cliOutputs[cli] || [];
-        cliMessages.push({
-          type: 'task_card',
-          role: 'system',
-          taskId: msg.taskId,
-          subTaskId: msg.subTaskId,
-          description: msg.description,
-          targetFiles: msg.targetFiles || [],
-          reason: msg.reason || '',
-          status: msg.status || 'started',
-          time: new Date().toLocaleTimeString().slice(0, 5),
-          timestamp: Date.now(),
-          cli: cli
-        });
+        const existingTaskCard = cliMessages.find(m => m.type === 'task_card' && m.taskId === msg.taskId && m.subTaskId === msg.subTaskId);
+        if (existingTaskCard) {
+          Object.assign(existingTaskCard, {
+            description: msg.description,
+            targetFiles: msg.targetFiles || existingTaskCard.targetFiles || [],
+            reason: msg.reason || existingTaskCard.reason || '',
+            status: msg.status || existingTaskCard.status || 'started',
+            dispatchId: msg.dispatchId || existingTaskCard.dispatchId,
+            timestamp: Date.now()
+          });
+        } else {
+          cliMessages.push({
+            type: 'task_card',
+            role: 'system',
+            taskId: msg.taskId,
+            subTaskId: msg.subTaskId,
+            description: msg.description,
+            targetFiles: msg.targetFiles || [],
+            reason: msg.reason || '',
+            status: msg.status || 'started',
+            time: new Date().toLocaleTimeString().slice(0, 5),
+            timestamp: Date.now(),
+            dispatchId: msg.dispatchId,
+            cli: cli
+          });
+        }
         cliOutputs[cli] = cliMessages;
 
         if (currentBottomTab === cli) {
@@ -4017,6 +4030,14 @@
 
       console.log('[Webview] 收到标准消息:', message.id, message.type, message.lifecycle);
 
+      // 过滤编排者内部 JSON 分析输出（如模糊度评估、计划评审）
+      if (message.source === 'orchestrator' && message.type === 'progress') {
+        const textContent = extractTextFromBlocks(message.blocks || []);
+        if (isInternalJsonMessage(textContent)) {
+          return;
+        }
+      }
+
       // 存储消息
       standardMessages.set(message.id, message);
 
@@ -4045,6 +4066,16 @@
       } else {
         // 转换为 Webview 消息格式
         const webviewMsg = standardToWebviewMessage(message);
+
+        // 去重：连续相同内容的编排者消息只保留一条
+        const lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
+        if (lastMsg && lastMsg.source === webviewMsg.source && lastMsg.role === webviewMsg.role) {
+          const lastContent = normalizeMessageContentForDedup(lastMsg.content || '');
+          const nextContent = normalizeMessageContentForDedup(webviewMsg.content || '');
+          if (lastContent && nextContent && lastContent === nextContent) {
+            return;
+          }
+        }
 
         // 进度消息保持追加展示，避免覆盖历史消息
 
@@ -4858,11 +4889,24 @@
       let prevMessageKey = null;
 
       sortedMessages.forEach(({ m, idx }) => {
+        // 跳过空内容消息（避免只渲染徽章/时间的空行）
+        const hasRenderableContent =
+          (m.content && String(m.content).trim()) ||
+          (m.parsedBlocks && m.parsedBlocks.length > 0) ||
+          (m.codeBlocks && m.codeBlocks.length > 0) ||
+          (m.toolCalls && m.toolCalls.length > 0) ||
+          (m.thinking && m.thinking.length > 0) ||
+          (m.images && m.images.length > 0);
+
         // 尝试渲染特殊消息
         const specialHtml = renderSpecialMessage(m, idx, tabType);
         if (specialHtml !== null) {
           html += specialHtml;
           prevMessageKey = null; // 特殊消息不参与分组
+          return;
+        }
+
+        if (!hasRenderableContent) {
           return;
         }
 
@@ -4889,6 +4933,32 @@
       });
 
       return html;
+    }
+
+    function normalizeMessageContentForDedup(content) {
+      if (!content) return '';
+      return String(content)
+        .replace(/^#{1,6}\s*/gm, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+    }
+
+    function isInternalJsonMessage(content) {
+      if (!content || typeof content !== 'string') return false;
+      const trimmed = content.trim();
+      if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return false;
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (!parsed || typeof parsed !== 'object') return false;
+        const hasAmbiguity = Object.prototype.hasOwnProperty.call(parsed, 'score')
+          && Object.prototype.hasOwnProperty.call(parsed, 'isAmbiguous');
+        const hasReview = Object.prototype.hasOwnProperty.call(parsed, 'status')
+          && Object.prototype.hasOwnProperty.call(parsed, 'summary');
+        return hasAmbiguity || hasReview;
+      } catch {
+        return false;
+      }
     }
 
     // =========================================================================

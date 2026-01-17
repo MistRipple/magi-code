@@ -160,13 +160,13 @@ export class IntentClassifier {
       };
     }
 
-    // 3. 明显的问答类
-    if (this.isObviousQuestion(signals)) {
+    // 3. 明显的问答类（含能力/可行性询问）
+    if (this.isObviousQuestion(signals) || this.isCapabilityQuestion(prompt, signals)) {
       return {
         ...base,
         type: IntentType.QUESTION,
         confidence: 0.95,
-        reason: '检测到问答特征：问号或问答关键词，且无任务关键词',
+        reason: '检测到问答特征：问号/问答关键词或能力询问',
       };
     }
 
@@ -230,6 +230,20 @@ export class IntentClassifier {
       return true;
     }
     return false;
+  }
+
+  private isCapabilityQuestion(prompt: string, signals: IntentClassification['signals']): boolean {
+    const endsWithQuestionWord = /(吗|么|？|\?)$/.test(prompt);
+    if (!signals.hasQuestionMark && !signals.hasQuestionKeyword && !endsWithQuestionWord) return false;
+    const hasBuildVerb = /(做|制作|搭建|实现|开发|修复|重构|新增|优化|编写|添加|修改)/.test(prompt);
+    const hasBuildTarget = /(功能|页面|模块|接口|系统|组件|服务|项目|API|后端|前端|UI|界面)/i.test(prompt);
+    const capabilityPattern = /(你能|你可以|你会|能不能|能否|是否|可以|支持|^能|^可以|^会)/;
+    if (!capabilityPattern.test(prompt)) return false;
+    if (!endsWithQuestionWord && !/(能做|能否做|可以做)/.test(prompt)) return false;
+    if (signals.hasCodeBlock || signals.hasFilePath) return false;
+    if (/(这个|这段|此|该|上述|下面|以上|以下)/.test(prompt)) return false;
+    if (/(bug|错误|问题|报错)/i.test(prompt)) return false;
+    return !(hasBuildVerb && hasBuildTarget);
   }
 
   /**

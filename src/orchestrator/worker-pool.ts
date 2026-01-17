@@ -82,6 +82,7 @@ const QUEUE_STARVATION_BOOST_MS = 15000;
 
 interface QueueItem {
   id: string;
+  dispatchId: string;
   taskId: string;
   subTask: SubTask;
   context?: string;
@@ -405,6 +406,7 @@ export class WorkerPool extends EventEmitter {
     return new Promise((resolve, reject) => {
       const item: QueueItem = {
         id: String(++this.queueCounter),
+        dispatchId: `dispatch_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
         taskId,
         subTask,
         context,
@@ -483,7 +485,7 @@ export class WorkerPool extends EventEmitter {
         try {
           release = await this.fileLockManager.acquire(item.lockFiles, item.priority, item.abortSignal);
           this.runningCount++;
-          const result = await worker.executeTask(item.taskId, item.subTask, item.context);
+          const result = await worker.executeTask(item.taskId, item.subTask, item.context, item.dispatchId);
           item.resolve(result);
         } catch (error) {
           item.reject(error instanceof Error ? error : new Error(String(error)));
@@ -613,7 +615,8 @@ export class WorkerPool extends EventEmitter {
             taskId,
             subTask.id,
             result.error || '未知错误',
-            false
+            false,
+            result.dispatchId
           );
           state.error = result.error;
           return result;
@@ -648,7 +651,8 @@ export class WorkerPool extends EventEmitter {
             taskId,
             subTask.id,
             lastError.message,
-            false
+            false,
+            undefined
           );
           throw lastError;
         }

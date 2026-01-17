@@ -50,6 +50,8 @@ export interface ExecutionPlan {
   /** 验收清单 */
   acceptanceCriteria: string[];
   createdAt: number;
+  /** 风险等级（来自画像系统） */
+  riskLevel?: 'low' | 'medium' | 'high' | 'critical';
 }
 
 /** 执行结果 */
@@ -58,6 +60,7 @@ export interface ExecutionResult {
   workerType: WorkerType;
   taskId: string;
   subTaskId: string;
+  dispatchId?: string;
   result: string;
   success: boolean;
   duration: number;
@@ -101,6 +104,7 @@ export interface TaskDispatchMessage extends BaseMessage {
     taskId: string;
     subTask: SubTask;
     context?: string;
+    dispatchId?: string;
   };
 }
 
@@ -120,6 +124,7 @@ export interface ProgressReportMessage extends BaseMessage {
   payload: {
     taskId: string;
     subTaskId: string;
+    dispatchId?: string;
     status: 'started' | 'in_progress' | 'completed' | 'failed';
     progress?: number; // 0-100
     message?: string;
@@ -143,6 +148,7 @@ export interface TaskFailedMessage extends BaseMessage {
     subTaskId: string;
     error: string;
     canRetry: boolean;
+    dispatchId?: string;
   };
 }
 
@@ -355,6 +361,7 @@ export interface OrchestratorUIMessage {
     workerId?: string;
     workerType?: WorkerType;
     subTaskId?: string;
+    dispatchId?: string;
     progress?: number;
     plan?: ExecutionPlan;
     planId?: string;
