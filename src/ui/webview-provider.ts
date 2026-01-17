@@ -57,7 +57,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private readonly messageFlowLogEnabled = process.env.MULTICLI_MESSAGE_FLOW_LOG === '1';
   private readonly messageFlowLogPath: string;
 
-  // 🆕 消息去重器
+  // 消息去重器
   private messageDeduplicator: MessageDeduplicator;
 
   // 多 CLI 适配器工厂
@@ -79,12 +79,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     resolve: (answer: string | null) => void;
     reject: (error: Error) => void;
   } | null = null;
-  // 🆕 需求澄清机制
+  // 需求澄清机制
   private pendingClarification: {
     resolve: (result: { answers: Record<string, string>; additionalInfo?: string } | null) => void;
     reject: (error: Error) => void;
   } | null = null;
-  // 🆕 Worker 问题机制
+  // Worker 问题机制
   private pendingWorkerQuestion: {
     resolve: (answer: string | null) => void;
     reject: (error: Error) => void;
@@ -110,7 +110,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   ) {
     this.messageFlowLogPath = path.join(this.workspaceRoot, '.multicli', 'logs', 'message-flow.jsonl');
 
-    // 🆕 初始化消息去重器
+    // 初始化消息去重器
     this.messageDeduplicator = new MessageDeduplicator({
       enabled: true,
       minStreamInterval: 100, // 100ms 最小流式间隔
@@ -213,9 +213,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 设置所有 CLI 适配器事件监听 */
   private setupCLIAdapters(): void {
-    // 🆕 监听标准消息事件 - 新的消息流开始
+    // 监听标准消息事件 - 新的消息流开始
     this.cliFactory.on('standardMessage', (message: any) => {
-      // 🆕 去重检查
+      // 去重检查
       if (!this.messageDeduplicator.shouldSend(message)) {
         this.logMessageFlow('standardMessage [SKIP]', message);
         return;
@@ -229,9 +229,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.logMessageFlow('standardMessage [SENT]', message);
     });
 
-    // 🆕 监听标准消息更新事件 - 流式更新
+    // 监听标准消息更新事件 - 流式更新
     this.cliFactory.on('standardUpdate', (update: any) => {
-      // 🆕 去重检查（update 应该包含完整 message）
+      // 去重检查（update 应该包含完整 message）
       if (update.message && !this.messageDeduplicator.shouldSend(update.message)) {
         this.logMessageFlow('standardUpdate [SKIP]', update);
         return;
@@ -245,9 +245,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.logMessageFlow('standardUpdate [SENT]', update);
     });
 
-    // 🆕 监听标准消息完成事件
+    // 监听标准消息完成事件
     this.cliFactory.on('standardComplete', (message: any) => {
-      // 🆕 去重检查
+      // 去重检查
       if (!this.messageDeduplicator.shouldSend(message)) {
         this.logMessageFlow('standardComplete [SKIP]', message);
         return;
@@ -261,7 +261,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.logMessageFlow('standardComplete [SENT]', message);
     });
 
-    // 🔧 监听 streamStart 事件，通知前端开始新的消息流
+    // 监听 streamStart 事件，通知前端开始新的消息流
     this.cliFactory.on('streamStart', ({
       type,
       source,
@@ -281,7 +281,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
     });
 
-    // 🔧 监听 CLI 询问事件
+    // 监听 CLI 询问事件
     this.cliFactory.on('question', ({
       type,
       question,
@@ -304,7 +304,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       } as any);
     });
 
-    // 🔧 监听询问超时事件
+    // 监听询问超时事件
     this.cliFactory.on('questionTimeout', ({
       type,
       questionId,
@@ -496,7 +496,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
     });
 
-    // 🆕 设置需求澄清回调
+    // 设置需求澄清回调
     this.intelligentOrchestrator.setClarificationCallback(async (questions, context, ambiguityScore, originalPrompt) => {
       return new Promise((resolve, reject) => {
         this.pendingClarification = { resolve, reject };
@@ -512,7 +512,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
     });
 
-    // 🆕 设置 Worker 问题回调
+    // 设置 Worker 问题回调
     this.intelligentOrchestrator.setWorkerQuestionCallback(async (workerId, question, context, options) => {
       return new Promise((resolve, reject) => {
         this.pendingWorkerQuestion = { resolve, reject };
@@ -559,7 +559,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** 🆕 处理用户澄清回答 */
+  /** 处理用户澄清回答 */
   private handleClarificationAnswer(answers: Record<string, string> | null, additionalInfo?: string): void {
     if (this.pendingClarification) {
       if (answers && Object.keys(answers).length > 0) {
@@ -581,7 +581,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** 🆕 处理 Worker 问题回答 */
+  /** 处理 Worker 问题回答 */
   private handleWorkerQuestionAnswer(answer: string | null): void {
     if (this.pendingWorkerQuestion) {
       this.pendingWorkerQuestion.resolve(answer);
@@ -594,7 +594,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** 🔧 处理用户回答 CLI 询问 */
+  /** 处理用户回答 CLI 询问 */
   private handleCliQuestionAnswer(
     cli: CLIType,
     questionId: string,
@@ -804,7 +804,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     globalEventBus.on('orchestrator:phase_changed', (event) => {
       const data = event.data as { phase: string; isRunning?: boolean; timestamp?: number };
       if (data?.phase) {
-        // 🔧 修复页面跳动：只发送 phaseChanged 消息，不触发 sendStateUpdate
+        // 修复页面跳动：只发送 phaseChanged 消息，不触发 sendStateUpdate
         // phaseChanged 只更新阶段指示器，不会重建整个 DOM
         this.postMessage({
           type: 'phaseChanged',
@@ -812,7 +812,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           taskId: event.taskId || '',
           isRunning: data.isRunning ?? this.intelligentOrchestrator.running
         } as any);
-        // 🔧 移除 sendStateUpdate() 调用，避免频繁 DOM 重建导致页面跳动
+        // 移除 sendStateUpdate() 调用，避免频繁 DOM 重建导致页面跳动
       }
     });
 
@@ -890,7 +890,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const runningTask = tasks.find(t => t.status === 'running');
     const hasRunningTask = runningTask || this.intelligentOrchestrator.running;
 
-    // 🆕 在中断前，先刷新并发送 pending 的流式输出内容
+    // 在中断前，先刷新并发送 pending 的流式输出内容
     this.flushPendingStreamOutput();
 
     // 1. 首先中断 Orchestrator（这会触发 AbortController）
@@ -952,7 +952,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * 🆕 刷新并发送 pending 的流式输出内容
+   * 刷新并发送 pending 的流式输出内容
    * 在中断前调用，确保不丢失已接收但未发送的内容
    */
   private flushPendingStreamOutput(): void {
@@ -988,7 +988,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * 🆕 清理流式输出缓冲区
+   * 清理流式输出缓冲区
    */
   private clearStreamBuffers(): void {
     this.orchestratorStreamBuffer = '';
@@ -1054,7 +1054,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /**
    * 统一的流式消息发送方法
    * 只发送 standardMessage 格式（完整迁移，无兼容性代码）
-   * 🆕 使用 parseContentToBlocks 在后端解析内容，前端只需渲染
+   * 使用 parseContentToBlocks 在后端解析内容，前端只需渲染
    */
   private sendStreamEvent(params: {
     phase: 'start' | 'chunk' | 'complete';
@@ -1105,7 +1105,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         const newMessageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         this.streamMessageIds.set(streamKey, newMessageId);
 
-        // 🆕 使用解析器解析内容
+        // 使用解析器解析内容
         const parsedBlocks = content ? parseContentToBlocks(content) : [];
 
         const standardMessage: StandardMessage = {
@@ -1151,7 +1151,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const messageId = this.streamMessageIds.get(streamKey);
       this.streamMessageIds.delete(streamKey);
 
-      // 🆕 使用解析器解析完整内容
+      // 使用解析器解析完整内容
       const parsedBlocks = content ? parseContentToBlocks(content) : [];
 
       if (!messageId) {
@@ -1367,7 +1367,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'saveCurrentSession':
-        // 🔧 新增：保存当前会话的消息和 CLI 输出
+        // 新增：保存当前会话的消息和 CLI 输出
         this.saveCurrentSessionData(message.messages, message.cliOutputs);
         break;
 
@@ -1427,7 +1427,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'answerClarification':
-        // 🆕 用户回答澄清问题
+        // 用户回答澄清问题
         this.handleClarificationAnswer(
           (message as any).answers ?? null,
           (message as any).additionalInfo
@@ -1435,12 +1435,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'answerWorkerQuestion':
-        // 🆕 用户回答 Worker 问题
+        // 用户回答 Worker 问题
         this.handleWorkerQuestionAnswer((message as any).answer ?? null);
         break;
 
       case 'answerCliQuestion':
-        // 🔧 用户回答 CLI 询问
+        // 用户回答 CLI 询问
         this.handleCliQuestionAnswer(
           (message as any).cli,
           (message as any).questionId,

@@ -5,7 +5,7 @@
  * - 接收编排者分配的任务
  * - 执行编码任务
  * - 向编排者汇报进度和结果
- * - 🆕 基于 Worker 画像注入行为引导
+ * - 基于 Worker 画像注入行为引导
  *
  * 所有 Worker（包括 Worker Claude）都继承此基类
  */
@@ -43,11 +43,11 @@ export interface WorkerConfig {
   orchestratorId?: string;
   snapshotManager?: SnapshotManager;
   permissions?: PermissionMatrix;
-  /** 🆕 Worker 画像 */
+  /** Worker 画像 */
   profile?: WorkerProfile;
 }
 
-/** 🆕 待回答的问题 */
+/** 待回答的问题 */
 interface PendingQuestion {
   questionId: string;
   resolve: (answer: string) => void;
@@ -68,9 +68,9 @@ export class WorkerAgent extends EventEmitter {
   protected orchestratorId: string;
   protected snapshotManager?: SnapshotManager;
   protected permissions: PermissionMatrix;
-  /** 🆕 Worker 画像 */
+  /** Worker 画像 */
   protected profile?: WorkerProfile;
-  /** 🆕 引导注入器 */
+  /** 引导注入器 */
   protected guidanceInjector: GuidanceInjector;
 
   private _state: WorkerState = 'idle';
@@ -79,7 +79,7 @@ export class WorkerAgent extends EventEmitter {
   private currentContextSnapshot: string | null = null;
   private abortController: AbortController | null = null;
   private unsubscribers: Array<() => void> = [];
-  private pendingQuestions: Map<string, PendingQuestion> = new Map(); // 🆕 待回答的问题
+  private pendingQuestions: Map<string, PendingQuestion> = new Map(); // 待回答的问题
 
   constructor(config: WorkerConfig) {
     super();
@@ -97,14 +97,14 @@ export class WorkerAgent extends EventEmitter {
   }
 
   /**
-   * 🆕 设置 Worker 画像
+   * 设置 Worker 画像
    */
   setProfile(profile: WorkerProfile): void {
     this.profile = profile;
   }
 
   /**
-   * 🆕 获取 Worker 画像
+   * 获取 Worker 画像
    */
   getProfile(): WorkerProfile | undefined {
     return this.profile;
@@ -159,7 +159,7 @@ export class WorkerAgent extends EventEmitter {
     });
     this.unsubscribers.push(unsubCommand);
 
-    // 🆕 订阅 Worker 回答消息
+    // 订阅 Worker 回答消息
     const unsubAnswer = this.messageBus.subscribe('worker_answer', (msg) => {
       if (msg.target === this.id) {
         this.handleMessage(msg);
@@ -186,7 +186,7 @@ export class WorkerAgent extends EventEmitter {
     }
   }
 
-  /** 🆕 处理 Worker 回答消息 */
+  /** 处理 Worker 回答消息 */
   private handleWorkerAnswer(message: WorkerAnswerMessage): void {
     const { questionId, answer } = message.payload;
     const pending = this.pendingQuestions.get(questionId);
@@ -347,7 +347,7 @@ export class WorkerAgent extends EventEmitter {
 
   /**
    * 构建执行 prompt
-   * 🆕 集成 Worker 画像引导注入
+   * 集成 Worker 画像引导注入
    */
   protected buildExecutionPrompt(subTask: SubTask, context?: string): string {
     const filesHint = subTask.targetFiles?.length
@@ -358,7 +358,7 @@ export class WorkerAgent extends EventEmitter {
     const permissionHint = this.buildPermissionHint();
     const canEdit = this.permissions.allowEdit !== false;
 
-    // 🆕 构建画像引导 Prompt
+    // 构建画像引导 Prompt
     const guidanceHint = this.buildGuidanceHint(subTask);
 
     if (subTask.kind === 'architecture') {
@@ -414,7 +414,7 @@ export class WorkerAgent extends EventEmitter {
   }
 
   /**
-   * 🆕 构建画像引导 Prompt
+   * 构建画像引导 Prompt
    */
   protected buildGuidanceHint(subTask: SubTask): string {
     if (!this.profile) {
@@ -610,11 +610,11 @@ export class WorkerAgent extends EventEmitter {
   }
 
   // =========================================================================
-  // 🆕 疑问上报机制
+  // 疑问上报机制
   // =========================================================================
 
   /**
-   * 🆕 向编排者提问
+   * 向编排者提问
    * 当 Worker 执行任务时遇到模糊指令，可以向编排者提问
    * 编排者会将问题转发给用户，并将回答返回给 Worker
    *
@@ -665,14 +665,14 @@ export class WorkerAgent extends EventEmitter {
   }
 
   /**
-   * 🆕 检查是否有待回答的问题
+   * 检查是否有待回答的问题
    */
   hasPendingQuestions(): boolean {
     return this.pendingQuestions.size > 0;
   }
 
   /**
-   * 🆕 取消所有待回答的问题
+   * 取消所有待回答的问题
    */
   cancelPendingQuestions(): void {
     for (const [questionId, pending] of this.pendingQuestions) {

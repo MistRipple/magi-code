@@ -1,7 +1,7 @@
 /**
  * 任务依赖图
  * 管理任务之间的依赖关系，支持拓扑排序和并行分组
- * 🆕 v0.7.0: 集成文件依赖，统一调度策略
+ * v0.7.0: 集成文件依赖，统一调度策略
  */
 
 /** 任务节点 */
@@ -16,7 +16,7 @@ export interface TaskNode {
   dependents: string[];
   /** 任务状态 */
   status: 'pending' | 'ready' | 'running' | 'completed' | 'failed';
-  /** 🆕 目标文件列表 */
+  /** 目标文件列表 */
   targetFiles?: string[];
   /** 任务数据（可选） */
   data?: unknown;
@@ -42,11 +42,11 @@ export interface DependencyAnalysis {
   executionBatches: ExecutionBatch[];
   /** 关键路径（最长依赖链） */
   criticalPath: string[];
-  /** 🆕 文件冲突检测结果 */
+  /** 文件冲突检测结果 */
   fileConflicts?: FileConflictInfo[];
 }
 
-/** 🆕 文件冲突信息 */
+/** 文件冲突信息 */
 export interface FileConflictInfo {
   /** 冲突的文件路径 */
   file: string;
@@ -59,16 +59,16 @@ export interface FileConflictInfo {
 /**
  * 任务依赖图类
  * 使用邻接表实现有向无环图（DAG）
- * 🆕 集成文件依赖分析
+ * 集成文件依赖分析
  */
 export class TaskDependencyGraph {
   private nodes: Map<string, TaskNode> = new Map();
-  /** 🆕 文件到任务的映射 */
+  /** 文件到任务的映射 */
   private fileToTasks: Map<string, Set<string>> = new Map();
 
   /**
    * 添加任务节点
-   * 🆕 支持 targetFiles
+   * 支持 targetFiles
    */
   addTask(id: string, name: string, data?: unknown, targetFiles?: string[]): void {
     if (this.nodes.has(id)) {
@@ -86,7 +86,7 @@ export class TaskDependencyGraph {
       data,
     });
 
-    // 🆕 更新文件到任务的映射
+    // 更新文件到任务的映射
     if (targetFiles) {
       for (const file of targetFiles) {
         if (!this.fileToTasks.has(file)) {
@@ -234,7 +234,7 @@ export class TaskDependencyGraph {
   }
 
   /**
-   * 🆕 检测文件冲突
+   * 检测文件冲突
    * 找出修改相同文件的任务
    */
   detectFileConflicts(): FileConflictInfo[] {
@@ -255,7 +255,7 @@ export class TaskDependencyGraph {
   }
 
   /**
-   * 🆕 基于文件冲突自动添加依赖
+   * 基于文件冲突自动添加依赖
    * 将文件冲突建模为任务依赖，确保串行执行
    *
    * @param strategy 冲突解决策略
@@ -300,7 +300,7 @@ export class TaskDependencyGraph {
   }
 
   /**
-   * 🆕 获取文件的所有相关任务
+   * 获取文件的所有相关任务
    */
   getTasksByFile(file: string): string[] {
     const taskIds = this.fileToTasks.get(file);
@@ -310,7 +310,7 @@ export class TaskDependencyGraph {
   /**
    * 分析依赖图
    * 返回拓扑排序结果和并行执行批次
-   * 🆕 包含文件冲突信息
+   * 包含文件冲突信息
    */
   analyze(): DependencyAnalysis {
     // 使用 Kahn 算法进行拓扑排序
@@ -379,7 +379,7 @@ export class TaskDependencyGraph {
     // 计算关键路径
     const criticalPath = this.findCriticalPath();
 
-    // 🆕 检测文件冲突
+    // 检测文件冲突
     const fileConflicts = this.detectFileConflicts();
 
     return {

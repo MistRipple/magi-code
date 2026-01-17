@@ -213,12 +213,12 @@ export class IntelligentOrchestrator {
     this.orchestratorAgent.setQuestionCallback(callback);
   }
 
-  /** 🆕 设置需求澄清回调 */
+  /** 设置需求澄清回调 */
   setClarificationCallback(callback: ClarificationCallback): void {
     this.orchestratorAgent.setClarificationCallback(callback);
   }
 
-  /** 🆕 设置 Worker 问题回调 */
+  /** 设置 Worker 问题回调 */
   setWorkerQuestionCallback(callback: WorkerQuestionCallback): void {
     this.orchestratorAgent.setWorkerQuestionCallback(callback);
   }

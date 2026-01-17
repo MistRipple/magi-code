@@ -542,13 +542,13 @@ export type WebviewToExtensionMessage =
   | { type: 'updatePromptEnhance'; config: { baseUrl: string; apiKey: string } }
   | { type: 'testPromptEnhance'; baseUrl: string; apiKey: string }
   | { type: 'enhancePrompt'; prompt: string }
-  // 🔧 新增：CLI 询问回答
+  // 新增：CLI 询问回答
   | { type: 'answerCliQuestion'; cli: CLIType; questionId: string; answer: string; adapterRole?: 'worker' | 'orchestrator' }
-  // 🆕 新增：需求澄清回答
+  // 新增：需求澄清回答
   | { type: 'answerClarification'; answers: Record<string, string> | null; additionalInfo?: string }
-  // 🆕 新增：Worker 问题回答
+  // 新增：Worker 问题回答
   | { type: 'answerWorkerQuestion'; answer: string | null }
-  // 🆕 新增：画像配置
+  // 新增：画像配置
   | { type: 'getProfileConfig' }
   | { type: 'saveProfileConfig'; data: { workers: Record<string, any>; categories: Record<string, string> } }
   | { type: 'resetProfileConfig' };

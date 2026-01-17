@@ -232,13 +232,13 @@ export type BusMessage =
 /** 编排者状态 */
 export type OrchestratorState =
   | 'idle'
-  | 'clarifying'              // 🆕 需求澄清阶段
+  | 'clarifying'              // 需求澄清阶段
   | 'analyzing'
   | 'waiting_questions'
   | 'waiting_confirmation'
   | 'dispatching'
   | 'monitoring'
-  | 'waiting_worker_answer'   // 🆕 等待 Worker 问题回答
+  | 'waiting_worker_answer'   // 等待 Worker 问题回答
   | 'integrating'
   | 'verifying'
   | 'recovering'

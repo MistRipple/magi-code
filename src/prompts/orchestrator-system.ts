@@ -46,10 +46,10 @@ export const ORCHESTRATOR_SYSTEM_PROMPT = `# 编排者协议 (Orchestrator Proto
 - Prompt 要详细，Worker 能独立完成
 
 ## 禁止行为
-- ❌ 直接修改代码
-- ❌ 执行终端命令
-- ❌ 读写文件
-- ❌ 调用开发工具
+- 直接修改代码
+- 执行终端命令
+- 读写文件
+- 调用开发工具
 `;
 
 /**

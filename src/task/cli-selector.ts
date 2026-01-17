@@ -2,7 +2,7 @@
  * CLI 选择器
  * 根据任务类型、用户配置、CLI 可用性、执行统计和 Worker 画像选择最佳 CLI
  *
- * 🆕 集成 Worker Profile System：
+ * 集成 Worker Profile System：
  * - 基于 Worker 画像的能力匹配
  * - 基于任务分类的智能选择
  * - 支持成本/速度/质量优化目标
@@ -73,16 +73,16 @@ export interface CLISelection {
   reason: string;
   /** 基于统计的置信度 (0-1) */
   confidence?: number;
-  /** 🆕 任务分类 */
+  /** 任务分类 */
   category?: string;
-  /** 🆕 匹配分数 */
+  /** 匹配分数 */
   score?: number;
 }
 
 /**
  * CLI 选择器类
- * 🆕 支持基于 Worker 画像的智能选择
- * 🆕 集成 ConflictResolver 统一冲突解决
+ * 支持基于 Worker 画像的智能选择
+ * 集成 ConflictResolver 统一冲突解决
  */
 export class CLISelector {
   private skills: CLISkillsConfig;
@@ -92,11 +92,11 @@ export class CLISelector {
   private useStatsBasedSelection: boolean = true;
   /** 健康阈值：低于此成功率的 CLI 会被降级 */
   private healthThreshold: number = 0.6;
-  /** 🆕 画像加载器 */
+  /** 画像加载器 */
   private profileLoader?: ProfileLoader;
-  /** 🆕 是否启用画像选择 */
+  /** 是否启用画像选择 */
   private useProfileBasedSelection: boolean = true;
-  /** 🆕 冲突解决器 */
+  /** 冲突解决器 */
   private conflictResolver: ConflictResolver;
 
   constructor(skills?: Partial<CLISkillsConfig>) {
@@ -105,7 +105,7 @@ export class CLISelector {
   }
 
   /**
-   * 🆕 设置画像加载器
+   * 设置画像加载器
    */
   setProfileLoader(loader: ProfileLoader): void {
     this.profileLoader = loader;
@@ -113,7 +113,7 @@ export class CLISelector {
   }
 
   /**
-   * 🆕 配置画像选择
+   * 配置画像选择
    */
   configureProfileSelection(enabled: boolean): void {
     this.useProfileBasedSelection = enabled;
@@ -145,7 +145,7 @@ export class CLISelector {
   }
 
   /**
-   * 🆕 配置冲突解决策略
+   * 配置冲突解决策略
    */
   configureConflictResolution(config: Partial<ConflictResolutionConfig>): void {
     this.conflictResolver.updateConfig(config);
@@ -167,7 +167,7 @@ export class CLISelector {
 
   /**
    * 根据任务分析选择最佳 CLI
-   * 🆕 使用 ConflictResolver 统一冲突解决
+   * 使用 ConflictResolver 统一冲突解决
    */
   select(analysis: TaskAnalysis, userPreference?: CLIType): CLISelection {
     const category = analysis.category;
@@ -250,10 +250,10 @@ export class CLISelector {
 
   /**
    * 根据任务类型直接选择 CLI
-   * 🆕 集成画像系统和基于统计的智能选择
+   * 集成画像系统和基于统计的智能选择
    */
   selectByCategory(category: TaskCategory): CLISelection {
-    // 🆕 如果有画像系统，使用画像配置的默认 Worker
+    // 如果有画像系统，使用画像配置的默认 Worker
     let preferred = this.skills[category] || this.skills.general;
 
     if (this.useProfileBasedSelection && this.profileLoader) {
@@ -319,11 +319,11 @@ export class CLISelector {
   }
 
   // ============================================================================
-  // 🆕 基于 Worker 画像的选择方法
+  // 基于 Worker 画像的选择方法
   // ============================================================================
 
   /**
-   * 🆕 基于任务描述智能选择 Worker
+   * 基于任务描述智能选择 Worker
    * 综合考虑：画像匹配 + 执行统计 + 成本/速度/质量因子
    *
    * 注意：分类逻辑已统一到 TaskAnalyzer，此方法直接使用分类结果
@@ -372,7 +372,7 @@ export class CLISelector {
   }
 
   /**
-   * 🆕 使用画像配置分类任务
+   * 使用画像配置分类任务
    */
   private classifyWithProfile(taskDescription: string): { category: string; defaultWorker: CLIType } {
     const categories = this.profileLoader!.getAllCategories();
@@ -422,7 +422,7 @@ export class CLISelector {
   }
 
   /**
-   * 🆕 构建简化的选择原因
+   * 构建简化的选择原因
    */
   private buildSelectionReasonSimple(
     worker: CLIType,
@@ -441,7 +441,7 @@ export class CLISelector {
   }
 
   /**
-   * 🆕 计算基于画像的 Worker 匹配分数
+   * 计算基于画像的 Worker 匹配分数
    */
   private calculateProfileScores(
     taskDescription: string,
@@ -491,7 +491,7 @@ export class CLISelector {
   }
 
   /**
-   * 🆕 基于执行统计调整分数
+   * 基于执行统计调整分数
    */
   private adjustScoresWithStats(
     scores: Map<CLIType, number>,
@@ -516,7 +516,7 @@ export class CLISelector {
   }
 
   /**
-   * 🆕 回退选择（无画像时使用）
+   * 回退选择（无画像时使用）
    */
   private fallbackSelection(
     taskDescription: string,
@@ -552,7 +552,7 @@ export class CLISelector {
   }
 
   /**
-   * 🆕 获取 Worker 画像
+   * 获取 Worker 画像
    */
   getWorkerProfile(workerType: CLIType): WorkerProfile | undefined {
     return this.profileLoader?.getProfile(workerType);

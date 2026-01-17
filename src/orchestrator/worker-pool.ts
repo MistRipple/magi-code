@@ -7,7 +7,7 @@
  * - 监控 Worker 状态
  * - CLI 降级和故障转移
  * - 任务依赖图调度
- * - 🆕 Worker 画像加载和注入
+ * - Worker 画像加载和注入
  */
 
 import { EventEmitter } from 'events';
@@ -47,7 +47,7 @@ export interface WorkerPoolConfig {
   snapshotManager?: SnapshotManager;
   /** 权限矩阵（用于 Worker Prompt 约束） */
   permissions?: PermissionMatrix;
-  /** 🆕 工作区路径（用于加载项目配置） */
+  /** 工作区路径（用于加载项目配置） */
   workspacePath?: string;
 }
 
@@ -143,7 +143,7 @@ export class WorkerPool extends EventEmitter {
   private snapshotManager?: SnapshotManager;
   private permissions: PermissionMatrix;
 
-  // 🆕 Worker 画像系统
+  // Worker 画像系统
   private profileLoader?: ProfileLoader;
   private workspacePath: string;
 
@@ -184,7 +184,7 @@ export class WorkerPool extends EventEmitter {
   }
 
   /**
-   * 🆕 加载 Worker 画像配置
+   * 加载 Worker 画像配置
    */
   async loadProfiles(): Promise<void> {
     if (!this.workspacePath) {
@@ -204,7 +204,7 @@ export class WorkerPool extends EventEmitter {
   }
 
   /**
-   * 🆕 获取 ProfileLoader
+   * 获取 ProfileLoader
    */
   getProfileLoader(): ProfileLoader | undefined {
     return this.profileLoader;
@@ -214,7 +214,7 @@ export class WorkerPool extends EventEmitter {
    * 初始化所有 Worker
    */
   async initialize(): Promise<void> {
-    // 🆕 先加载画像配置
+    // 先加载画像配置
     await this.loadProfiles();
 
     const workerTypes: WorkerType[] = ['claude', 'codex', 'gemini'];
@@ -234,7 +234,7 @@ export class WorkerPool extends EventEmitter {
       return this.workers.get(type)!;
     }
 
-    // 🆕 获取 Worker 画像
+    // 获取 Worker 画像
     const profile = this.profileLoader?.getProfile(type);
 
     const worker = new WorkerAgent({
@@ -244,7 +244,7 @@ export class WorkerPool extends EventEmitter {
       orchestratorId: this.orchestratorId,
       snapshotManager: this.snapshotManager,
       permissions: this.permissions,
-      profile, // 🆕 传递画像
+      profile, // 传递画像
     });
 
     // 监听 Worker 状态变更

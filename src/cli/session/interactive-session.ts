@@ -197,7 +197,7 @@ export class InteractiveSession extends EventEmitter implements SessionProcess {
   }
 
   /**
-   * 🆕 增强的 CLI 询问检测
+   * 增强的 CLI 询问检测
    * 支持结构化询问、权限请求、确认请求等多种类型
    */
   private detectQuestionEnhanced(text: string): QuestionDetectionResult {
