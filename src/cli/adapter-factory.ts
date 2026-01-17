@@ -413,21 +413,24 @@ export class CLIAdapterFactory extends EventEmitter {
 
   /**
    * 向 CLI 面板发送编排者的消息
-   * 让用户能看到编排者和代理之间的完整对话流
-   * 修复：添加 adapterRole 标识，确保消息被正确路由到 Thread 面板
+   * 使用标准消息协议 (StandardMessage)
+   *
+   * ✅ P2修复: 统一使用 standardMessage API,移除 legacy output 事件
    */
   private emitOrchestratorMessage(type: CLIType, message: string): void {
-    // 提取消息的关键信息，生成简洁的展示内容
+    // 提取消息的关键信息,生成简洁的展示内容
     const summary = this.summarizeOrchestratorMessage(message);
 
-    // 修复：发送到 Thread 面板，而不是 CLI 面板
-    // 添加 adapterRole: 'orchestrator' 确保消息被正确路由
-    this.emit('output', {
-      type,
-      chunk: summary,
-      source: 'orchestrator',
-      adapterRole: 'orchestrator'
-    });
+    // ✅ 使用 Normalizer 发送标准消息
+    const normalizer = this.getOrCreateNormalizer(type, 'orchestrator');
+
+    // 生成唯一的traceId
+    const traceId = `orchestrator-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+
+    // 发送完整消息 (非流式)
+    const messageId = normalizer.startStream(traceId, 'orchestrator');
+    normalizer.processChunk(messageId, summary);
+    normalizer.endStream(messageId);
   }
 
   /** 公开方法：向 CLI 面板发送编排者消息 */
