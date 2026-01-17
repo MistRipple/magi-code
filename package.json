@@ -301,8 +301,11 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
-    "test": "node scripts/test-orchestrator-workers-e2e.js",
-    "test:quick": "node scripts/test-orchestrator-workers-e2e.js"
+    "test": "node scripts/run-all-tests.js quick",
+    "test:quick": "node scripts/run-all-tests.js quick",
+    "test:full": "node scripts/run-all-tests.js full",
+    "test:unit": "node scripts/run-all-tests.js unit",
+    "test:e2e": "node scripts/run-all-tests.js e2e"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
