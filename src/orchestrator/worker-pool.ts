@@ -913,14 +913,21 @@ export class WorkerPool extends EventEmitter {
 
     // 添加所有任务到图中
     for (const subTask of subTasks) {
-      graph.addTask(subTask.id, subTask.description, subTask);
+      // ✅ 传递 targetFiles 参数以启用文件冲突检测
+      graph.addTask(subTask.id, subTask.description, subTask, subTask.targetFiles || []);
     }
 
-    // 添加依赖关系
+    // 添加显式依赖关系
     for (const subTask of subTasks) {
       if (subTask.dependencies && subTask.dependencies.length > 0) {
         graph.addDependencies(subTask.id, subTask.dependencies);
       }
+    }
+
+    // ✅ 检测文件冲突并自动添加依赖关系
+    const addedDeps = graph.addFileDependencies('sequential');
+    if (addedDeps > 0) {
+      console.log(`[WorkerPool] 检测到文件冲突，自动添加 ${addedDeps} 个依赖关系`);
     }
 
     for (const subTask of subTasks) {
