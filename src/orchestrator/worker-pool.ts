@@ -207,6 +207,11 @@ export class WorkerPool extends EventEmitter {
 
   /**
    * 获取 ProfileLoader
+   *
+   * ⚠️ 重要：这是获取 ProfileLoader 的推荐方式
+   * - 其他组件应该通过此方法获取 ProfileLoader
+   * - 不要在其他地方创建新的 ProfileLoader 实例
+   * - 确保在 initialize() 完成后调用
    */
   getProfileLoader(): ProfileLoader | undefined {
     return this.profileLoader;

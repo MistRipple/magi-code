@@ -14,6 +14,11 @@
  * ├── claude.json      - Claude Worker 画像
  * ├── codex.json       - Codex Worker 画像
  * └── gemini.json      - Gemini Worker 画像
+ *
+ * ⚠️ 重要：ProfileLoader 应该只有一个实例
+ * - 推荐：由 WorkerPool 创建和管理
+ * - 其他组件：通过 WorkerPool.getProfileLoader() 获取
+ * - 避免：在多个地方创建实例
  */
 
 import * as fs from 'fs';
@@ -41,9 +46,36 @@ export class ProfileLoader {
   /** 用户级配置目录：~/.multicli/ */
   private static readonly USER_CONFIG_DIR = path.join(os.homedir(), '.multicli');
 
+  /** 实例跟踪：用于检测多实例问题 */
+  private static instanceCount = 0;
+  private static instances: WeakRef<ProfileLoader>[] = [];
+  private instanceId: number;
+
   constructor(_workspacePath?: string) {
     // workspacePath 参数保留用于兼容，但不再使用
     this.categoriesConfig = DEFAULT_CATEGORIES_CONFIG;
+
+    // 实例跟踪
+    ProfileLoader.instanceCount++;
+    this.instanceId = ProfileLoader.instanceCount;
+    ProfileLoader.instances.push(new WeakRef(this));
+
+    // 警告：检测到多个实例
+    if (ProfileLoader.instanceCount > 1) {
+      const activeInstances = ProfileLoader.instances.filter(ref => ref.deref() !== undefined).length;
+      console.warn(
+        `[ProfileLoader] ⚠️  检测到多个 ProfileLoader 实例！` +
+        `\n  当前实例 ID: ${this.instanceId}` +
+        `\n  活跃实例数: ${activeInstances}` +
+        `\n  总创建次数: ${ProfileLoader.instanceCount}` +
+        `\n  ⚠️  这可能导致配置不一致！` +
+        `\n  建议：只在 WorkerPool 中创建一个实例，其他组件通过 getProfileLoader() 获取`
+      );
+
+      // 打印堆栈跟踪以帮助定位问题
+      console.warn('[ProfileLoader] 创建位置堆栈:');
+      console.warn(new Error().stack);
+    }
   }
 
   /**

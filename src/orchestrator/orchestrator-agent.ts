@@ -1664,6 +1664,7 @@ ${userPrompt}
       if (plan && !this.validateExecutionPlan(plan)) {
         plan = null;
       }
+      // Fallback to rule-based plan if parsing failed
       if (!plan) {
         plan = await this.buildPlanFromAnalysis(userPrompt, ruleAnalysis, true);
       }
@@ -2260,6 +2261,7 @@ ${userPrompt}
 
     this.normalizePlanMetadata(plan);
     this.normalizeArchitectureKinds(plan);
+    this.enforceProfileAssignments(plan);
     this.pruneClaudeImplementationForFullStack(plan);
     this.mergeLightCrossLayerTasks(plan);
     this.pruneMissingDependencies(plan);
@@ -2493,6 +2495,25 @@ ${userPrompt}
         task.kind = 'architecture';
       }
     });
+  }
+
+  private enforceProfileAssignments(plan: ExecutionPlan): void {
+    const available = this.cliSelector.getAvailableCLIs?.() ?? ['claude', 'codex', 'gemini'];
+    for (const task of plan.subTasks) {
+      if (!task) continue;
+      const assigned = task.assignedWorker;
+      if (assigned && available.includes(assigned)) {
+        continue;
+      }
+      const description = [task.description, task.prompt].filter(Boolean).join('\n');
+      const selection = this.cliSelector.selectByDescription(description, {
+        preferredWorker: assigned,
+      });
+      task.assignedWorker = selection.worker;
+      if (!task.reason) {
+        task.reason = selection.reason || '根据画像与任务描述自动分配';
+      }
+    }
   }
 
   private pruneClaudeImplementationForFullStack(plan: ExecutionPlan): void {
