@@ -90,13 +90,27 @@ export class ContextManager {
     // 保持即时上下文在限定轮数内（每轮包含 user + assistant）
     const maxMessages = this.config.immediateContextRounds * 2;
     if (this.immediateContext.length > maxMessages) {
-      // 移除最旧的消息，但保留 system 消息
+      // ✅ P1修复: 迁移将被移除的消息到Memory
       const systemMessages = this.immediateContext.filter(m => m.role === 'system');
       const otherMessages = this.immediateContext.filter(m => m.role !== 'system');
+
+      // 提取将被移除的消息
+      const toRemove = otherMessages.slice(0, -maxMessages);
+
+      // 迁移到 Memory
+      for (const removedMsg of toRemove) {
+        this.migrateToMemory(removedMsg);
+      }
+
+      // 清理即时上下文
       this.immediateContext = [
         ...systemMessages,
         ...otherMessages.slice(-maxMessages)
       ];
+
+      console.log(
+        `[ContextManager] 即时上下文已清理,迁移 ${toRemove.length} 条消息到 Memory`
+      );
     }
   }
 
@@ -407,5 +421,136 @@ export class ContextManager {
       totalTokens: this.getTotalTokenEstimate(),
       needsCompression: this.needsCompression()
     };
+  }
+
+  // ============================================================================
+  // 私有辅助方法 - 上下文自动迁移
+  // ============================================================================
+
+  /**
+   * 将消息迁移到 SessionMemory
+   * 自动提取关键信息并结构化存储
+   */
+  private migrateToMemory(message: ContextMessage): void {
+    if (!this.sessionMemory) {
+      console.warn('[ContextManager] SessionMemory 未初始化,无法迁移消息');
+      return;
+    }
+
+    try {
+      // 用户消息 -> 提取需求和决策
+      if (message.role === 'user') {
+        const content = message.content;
+
+        // 检测是否包含技术决策
+        if (this.containsTechnicalDecision(content)) {
+          this.sessionMemory.addDecision({
+            id: `decision-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+            description: this.extractDecisionSummary(content),
+            reason: '用户需求',
+          });
+        }
+
+        // 保存重要的用户需求
+        if (content.length > 50) {
+          this.sessionMemory.addImportantContext(
+            `用户需求: ${content.substring(0, 200)}${content.length > 200 ? '...' : ''}`
+          );
+        }
+      }
+
+      // 助手消息 -> 提取任务和变更
+      if (message.role === 'assistant') {
+        const content = message.content;
+
+        // 提取已完成任务
+        const taskPattern = /(?:完成|创建|实现|修改|添加|优化)(?:了)?[:：]\s*([^\n]{10,100})/g;
+        const taskMatches = content.match(taskPattern);
+        if (taskMatches && taskMatches.length > 0) {
+          for (const match of taskMatches.slice(0, 3)) {  // 最多提取3个任务
+            const description = match.replace(/[:：]/g, ': ').substring(0, 100);
+            // 将任务添加为已完成状态
+            const taskId = `task-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+            this.sessionMemory.addCurrentTask({
+              id: taskId,
+              description,
+              status: 'completed',
+            });
+          }
+        }
+
+        // 提取文件变更
+        const filePattern = /(?:创建|修改|删除)(?:了)?\s+[`']?([a-zA-Z0-9\-_/\\.]+\.[a-z]+)[`']?/g;
+        const fileMatches = content.match(filePattern);
+        if (fileMatches && fileMatches.length > 0) {
+          for (const match of fileMatches.slice(0, 5)) {  // 最多提取5个文件
+            const actionMatch = match.match(/(创建|修改|删除)/);
+            const fileMatch = match.match(/([a-zA-Z0-9\-_/\\.]+\.[a-z]+)/);
+            if (actionMatch && fileMatch) {
+              const action = this.mapActionType(actionMatch[1]);
+              this.sessionMemory.addCodeChange({
+                file: fileMatch[1],
+                action,
+                summary: match.substring(0, 100),
+              });
+            }
+          }
+        }
+
+        // 提取关键结论
+        const conclusionPattern = /(?:因此|所以|结论|总结)[:：]\s*([^\n]{10,200})/g;
+        const conclusionMatches = content.match(conclusionPattern);
+        if (conclusionMatches && conclusionMatches.length > 0) {
+          for (const match of conclusionMatches.slice(0, 2)) {
+            this.sessionMemory.addImportantContext(
+              `关键结论: ${match.replace(/[:：]/g, ': ')}`
+            );
+          }
+        }
+      }
+    } catch (error) {
+      console.error('[ContextManager] 迁移消息到Memory失败:', error);
+    }
+  }
+
+  /**
+   * 检测内容是否包含技术决策
+   */
+  private containsTechnicalDecision(content: string): boolean {
+    const decisionKeywords = [
+      '使用', '选择', '采用', '决定',
+      'use', 'choose', 'adopt', 'decide',
+      'React', 'TypeScript', 'Vue', 'Angular', 'Node',
+      '数据库', 'PostgreSQL', 'MySQL', 'MongoDB',
+      '架构', 'MVC', 'MVVM', 'Microservices'
+    ];
+
+    const lowerContent = content.toLowerCase();
+    return decisionKeywords.some(keyword =>
+      lowerContent.includes(keyword.toLowerCase())
+    );
+  }
+
+  /**
+   * 提取决策摘要
+   */
+  private extractDecisionSummary(content: string): string {
+    // 简单实现:提取包含决策关键词的句子
+    const sentences = content.split(/[。.!！\n]/);
+    for (const sentence of sentences) {
+      if (this.containsTechnicalDecision(sentence)) {
+        return sentence.trim().substring(0, 200);
+      }
+    }
+    return content.substring(0, 200);
+  }
+
+  /**
+   * 映射操作类型
+   */
+  private mapActionType(action: string): 'add' | 'modify' | 'delete' {
+    if (action.includes('创建') || action.includes('新增')) return 'add';
+    if (action.includes('删除') || action.includes('移除')) return 'delete';
+    return 'modify';
   }
 }
