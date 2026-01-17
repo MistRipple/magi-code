@@ -50,7 +50,9 @@ export class Orchestrator {
   /** 执行任务 */
   async executeTask(taskId: string): Promise<void> {
     const task = this.options.taskManager.getTask(taskId);
-    if (!task) throw new Error(`Task 不存在: ${taskId}`);
+    if (!task) {
+      throw new Error(`Task 不存在: ${taskId}`);
+    }
 
     this.isRunning = true;
     this.options.taskManager.updateTaskStatus(taskId, 'running');
@@ -58,7 +60,10 @@ export class Orchestrator {
     try {
       const statuses = await this.cliDetector.checkAllCLIs();
       const availableCLIs = statuses.filter(s => s.available).map(s => s.type);
-      if (availableCLIs.length === 0) throw new Error('没有可用的 CLI 工具');
+
+      if (availableCLIs.length === 0) {
+        throw new Error('没有可用的 CLI 工具，请先安装至少一个 CLI (Claude/Codex/Gemini)');
+      }
 
       const category = this.categorizeTask(task.prompt);
       const cli = this.selectBestCLI(category, availableCLIs);
@@ -67,16 +72,48 @@ export class Orchestrator {
       this.options.taskManager.addSubTask(taskId, task.prompt, cli, files);
 
       const updatedTask = this.options.taskManager.getTask(taskId);
-      if (updatedTask) await this.executeSubTasks(updatedTask);
+      if (updatedTask) {
+        await this.executeSubTasks(updatedTask);
+      }
 
       this.options.taskManager.updateTaskStatus(taskId, 'completed');
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      globalEventBus.emitEvent('task:failed', { taskId, data: { error: msg } });
+      const stack = error instanceof Error ? error.stack : undefined;
+
+      console.error(`[Orchestrator] Task ${taskId} failed:`, msg);
+      if (stack) {
+        console.error('[Orchestrator] Stack trace:', stack);
+      }
+
+      globalEventBus.emitEvent('task:failed', {
+        taskId,
+        data: {
+          error: msg,
+          stack,
+          timestamp: Date.now()
+        }
+      });
+
       this.options.taskManager.updateTaskStatus(taskId, 'failed');
+
+      // 清理资源：中断所有正在运行的 Worker
+      this.cleanupWorkers();
+
       throw error;
     } finally {
       this.isRunning = false;
+    }
+  }
+
+  /** 清理 Worker 资源 */
+  private cleanupWorkers(): void {
+    try {
+      for (const worker of this.workers.values()) {
+        worker.interrupt();
+      }
+    } catch (error) {
+      console.error('[Orchestrator] Failed to cleanup workers:', error);
     }
   }
 
@@ -135,20 +172,76 @@ export class Orchestrator {
 
   private async executeSubTask(subTask: SubTask): Promise<WorkerResult> {
     const cli = subTask.assignedWorker || subTask.assignedCli;
-    const worker = this.workers.get(cli!);
-    if (!worker) {
-      return { workerId: `unknown-${subTask.id}`, cliType: cli!, success: false,
-        error: `Worker 不存在: ${cli}`, duration: 0, timestamp: new Date() };
+
+    // 类型安全检查：确保 CLI 已分配
+    if (!cli) {
+      const error = `SubTask ${subTask.id} 没有分配 Worker`;
+      console.error(`[Orchestrator] ${error}`);
+      return {
+        workerId: `unknown-${subTask.id}`,
+        cliType: 'claude', // 默认值，避免类型错误
+        success: false,
+        error,
+        duration: 0,
+        timestamp: new Date()
+      };
     }
 
+    // 类型安全检查：确保 Worker 存在
+    const worker = this.workers.get(cli);
+    if (!worker) {
+      const error = `Worker 不存在: ${cli}`;
+      console.error(`[Orchestrator] ${error}`);
+      return {
+        workerId: `unknown-${subTask.id}`,
+        cliType: cli,
+        success: false,
+        error,
+        duration: 0,
+        timestamp: new Date()
+      };
+    }
+
+    // 创建文件快照（带错误处理）
     for (const f of subTask.targetFiles) {
-      this.options.snapshotManager.createSnapshot(f, cli!, subTask.id);
+      try {
+        this.options.snapshotManager.createSnapshot(f, cli, subTask.id);
+      } catch (error) {
+        console.error(`[Orchestrator] Failed to create snapshot for ${f}:`, error);
+        // 继续执行，快照失败不应阻止任务
+      }
     }
 
     this.options.taskManager.updateSubTaskStatus(subTask.taskId, subTask.id, 'running');
-    const result = await worker.execute({ subTask, workingDirectory: this.options.workspaceRoot });
-    this.options.taskManager.updateSubTaskStatus(subTask.taskId, subTask.id, result.success ? 'completed' : 'failed');
-    return result;
+
+    try {
+      const result = await worker.execute({
+        subTask,
+        workingDirectory: this.options.workspaceRoot
+      });
+
+      this.options.taskManager.updateSubTaskStatus(
+        subTask.taskId,
+        subTask.id,
+        result.success ? 'completed' : 'failed'
+      );
+
+      return result;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error(`[Orchestrator] SubTask ${subTask.id} execution failed:`, msg);
+
+      this.options.taskManager.updateSubTaskStatus(subTask.taskId, subTask.id, 'failed');
+
+      return {
+        workerId: `${cli}-${subTask.id}`,
+        cliType: cli,
+        success: false,
+        error: msg,
+        duration: 0,
+        timestamp: new Date()
+      };
+    }
   }
 
   interrupt(): void {

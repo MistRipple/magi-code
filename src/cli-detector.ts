@@ -4,7 +4,7 @@
  * 版本: 0.3.0 - 添加健康检查和事件发射
  */
 
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import * as vscode from 'vscode';
 import {
@@ -54,10 +54,15 @@ export class CLIDetector {
       return;
     }
     this.healthCheckInterval = setInterval(async () => {
-      const statuses = await this.checkAllCLIs(true);
-      globalEventBus.emitEvent('cli:healthCheck', {
-        data: { statuses, timestamp: Date.now() }
-      });
+      try {
+        const statuses = await this.checkAllCLIs(true);
+        globalEventBus.emitEvent('cli:healthCheck', {
+          data: { statuses, timestamp: Date.now() }
+        });
+      } catch (error) {
+        console.error('[CLIDetector] Health check failed:', error);
+        // 继续运行，不中断定时器
+      }
     }, this.healthCheckPeriod);
   }
 
@@ -79,15 +84,64 @@ export class CLIDetector {
   }
 
   /**
+   * 安全地执行命令（避免命令注入）
+   */
+  private execCommand(command: string, args: string[], options: { timeout: number }): Promise<{ stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+      const proc = spawn(command, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        shell: false  // 禁用 shell 避免注入
+      });
+
+      let stdout = '';
+      let stderr = '';
+      let timeoutId: NodeJS.Timeout | undefined;
+
+      if (proc.stdout) {
+        proc.stdout.on('data', (data) => {
+          stdout += data.toString();
+        });
+      }
+
+      if (proc.stderr) {
+        proc.stderr.on('data', (data) => {
+          stderr += data.toString();
+        });
+      }
+
+      proc.on('error', (error) => {
+        if (timeoutId) clearTimeout(timeoutId);
+        reject(error);
+      });
+
+      proc.on('close', (code) => {
+        if (timeoutId) clearTimeout(timeoutId);
+        if (code === 0) {
+          resolve({ stdout, stderr });
+        } else {
+          reject(new Error(`Command failed with code ${code}: ${stderr}`));
+        }
+      });
+
+      // 超时处理
+      timeoutId = setTimeout(() => {
+        proc.kill();
+        reject(new Error(`Command timeout after ${options.timeout}ms`));
+      }, options.timeout);
+    });
+  }
+
+  /**
    * 检测单个 CLI 的可用性 (支持更细粒度状态)
    */
   async checkCLI(type: CLIType): Promise<CLIStatus> {
-    const path = this.getCLIPath(type);
-    const command = `${path} ${VERSION_COMMANDS[type]}`;
+    const cliPath = this.getCLIPath(type);
+    const versionArg = VERSION_COMMANDS[type];
     const previousStatus = this.statusCache.get(type);
 
     try {
-      const { stdout } = await execAsync(command, { timeout: 10000 });
+      // 使用 spawn 避免命令注入漏洞
+      const { stdout } = await this.execCommand(cliPath, [versionArg], { timeout: 10000 });
       const version = this.parseVersion(stdout);
 
       const status: CLIStatus = {
@@ -95,7 +149,7 @@ export class CLIDetector {
         code: CLIStatusCode.AVAILABLE,
         available: true,
         version,
-        path,
+        path: cliPath,
         lastChecked: new Date()
       };
 
@@ -116,7 +170,7 @@ export class CLIDetector {
         type,
         code,
         available: false,
-        path,
+        path: cliPath,
         error: errorMsg,
         lastChecked: new Date()
       };
