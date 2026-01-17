@@ -1,4 +1,9 @@
+# Build outputs
 out/
+dist/
+build/
+
+# Dependencies
 node_modules/
 
 # VS Code extension build/test artifacts
@@ -6,23 +11,45 @@ node_modules/
 *.vsix
 augment-plugin/
 
-# Editor/OS noise
+# Editor/OS files
 .DS_Store
+Thumbs.db
 .history/
+*.swp
+*.swo
+*~
+.idea/
 
 # Logs
 *.log
 npm-debug.log*
 yarn-debug.log*
 pnpm-debug.log*
+lerna-debug.log*
 
 # Local env files
 .env
 .env.*
+!.env.example
 
 # Local plugin data
 .multicli/
 .ace-tool/
 
+# Temporary files
 .tmp/
+*.tmp
+*.bak
+*.cache
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Demo/mockup files
+*.demo.*
+*-demo.*
+*-mockup.*
+
+# Augment artifacts
 augment*
