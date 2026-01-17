@@ -2742,9 +2742,18 @@
         }
         if (state.activePlan) {
           // 🔧 修复：如果已有 plan_confirmation 卡片，不再创建 plan_ready 卡片
+          // 🔧 修复2：当正在等待确认时，不通过 stateUpdate 创建卡片，由 confirmationRequest 处理
           const hasPlanConfirmation = threadMessages.some(m => m.type === 'plan_confirmation' && m.isPending);
           const hasPlanPreview = threadMessages.some(m => m.type === 'plan_ready' && m.planId === state.activePlan.planId);
-          if (!hasPlanPreview && !hasPlanConfirmation) {
+          const isWaitingConfirmation = state.orchestratorPhase === 'waiting_confirmation';
+          console.log('[Webview] stateUpdate activePlan 检查:', {
+            hasPlanConfirmation,
+            hasPlanPreview,
+            isWaitingConfirmation,
+            orchestratorPhase: state.orchestratorPhase
+          });
+          if (!hasPlanPreview && !hasPlanConfirmation && !isWaitingConfirmation) {
+            console.log('[Webview] stateUpdate 触发 showPlanPreview');
             showPlanPreview(state.activePlan.formattedPlan, state.activePlan.planId, state.activePlan.updatedAt, state.activePlan.review);
           }
           const relatedTask = (state.tasks || []).find(t => t.planId === state.activePlan.planId);
@@ -2956,9 +2965,12 @@
 
     // 显示执行计划确认 - 只在消息流中添加内联卡片
     function showPlanConfirmation(plan, formattedPlan) {
+      console.log('[Webview] showPlanConfirmation 被调用');
+
       // 🔧 修复：将已有的 plan_ready 卡片转换为 plan_confirmation，而不是创建新卡片
       const planReadyIdx = threadMessages.findIndex(m => m.type === 'plan_ready');
       if (planReadyIdx !== -1) {
+        console.log('[Webview] 找到 plan_ready 卡片，转换为 plan_confirmation');
         // 直接将 plan_ready 转换为 plan_confirmation
         const existingMsg = threadMessages[planReadyIdx];
         existingMsg.type = 'plan_confirmation';
@@ -2966,6 +2978,10 @@
         existingMsg.plan = plan;
         existingMsg.isPending = true;
         // 保留原有的 review 信息（如果有）
+
+        // 🔧 修复：等待确认时，AI应该停止工作，设置为对话完成状态
+        setProcessingState(false);
+
         saveWebviewState();
         renderMainContent();
         requestAnimationFrame(() => {
@@ -2980,10 +2996,12 @@
       // 检查是否已存在待确认的消息（避免重复添加）
       const existingPendingIdx = threadMessages.findIndex(m => m.type === 'plan_confirmation' && m.isPending);
       if (existingPendingIdx !== -1) {
+        console.log('[Webview] 已存在待确认的 plan_confirmation，更新内容');
         // 已有待确认消息，更新内容
         threadMessages[existingPendingIdx].content = formattedPlan;
         threadMessages[existingPendingIdx].plan = plan;
       } else {
+        console.log('[Webview] 创建新的 plan_confirmation 卡片');
         // 在消息流中添加确认卡片
         const confirmationMsg = {
           role: 'system',
@@ -2996,6 +3014,9 @@
         };
         threadMessages.push(confirmationMsg);
       }
+
+      // 🔧 修复：等待确认时，AI应该停止工作，设置为对话完成状态
+      setProcessingState(false);
 
       saveWebviewState();
       renderMainContent();
@@ -3983,31 +4004,7 @@
         // 转换为 Webview 消息格式
         const webviewMsg = standardToWebviewMessage(message);
 
-        // 处理进度更新消息的合并逻辑
-        if (message.type === 'progress' && isOrchestrator) {
-          const milestoneKeywords = [
-            '开始', '完成', '成功', '失败', '通过', '未通过', '跳过',
-            '第', '轮', '阶段', '验证', '联调', '汇总', '回滚',
-            '子任务', '分发', '执行模式'
-          ];
-          const isMilestone = milestoneKeywords.some(kw => (webviewMsg.content || '').includes(kw));
-          const lastProgress = threadMessages[threadMessages.length - 1];
-          const lastIsMilestone = lastProgress && lastProgress.messageType === 'progress' &&
-            milestoneKeywords.some(kw => (lastProgress.content || '').includes(kw));
-
-          // 只有当前消息和上一条消息都不是里程碑时才合并
-          if (lastProgress && lastProgress.messageType === 'progress' &&
-              lastProgress.source === 'orchestrator' &&
-              !isMilestone && !lastIsMilestone) {
-            lastProgress.content = webviewMsg.content;
-            lastProgress.timestamp = webviewMsg.timestamp;
-            lastProgress.time = webviewMsg.time;
-            saveWebviewState();
-            scheduleRenderMainContent();
-            smoothScrollToBottom();
-            return;
-          }
-        }
+        // 进度消息保持追加展示，避免覆盖历史消息
 
         if (isOrchestrator) {
           // 编排者消息 -> Thread 面板
@@ -4118,6 +4115,20 @@
       if (webviewMsg) {
         // 更新最终状态
         const finalMsg = standardToWebviewMessage(message);
+        const hasRenderableFinal = !!(
+          (finalMsg.content && finalMsg.content.trim()) ||
+          (finalMsg.parsedBlocks && finalMsg.parsedBlocks.length > 0) ||
+          (finalMsg.codeBlocks && finalMsg.codeBlocks.length > 0) ||
+          (finalMsg.toolCalls && finalMsg.toolCalls.length > 0) ||
+          (finalMsg.thinking && finalMsg.thinking.length > 0)
+        );
+        if (!hasRenderableFinal) {
+          finalMsg.content = webviewMsg.content;
+          finalMsg.parsedBlocks = webviewMsg.parsedBlocks;
+          finalMsg.codeBlocks = webviewMsg.codeBlocks;
+          finalMsg.toolCalls = webviewMsg.toolCalls;
+          finalMsg.thinking = webviewMsg.thinking;
+        }
         Object.assign(webviewMsg, finalMsg);
         webviewMsg.streaming = false;
 
@@ -4154,11 +4165,14 @@
       const toolCalls = extractToolCallsFromBlocks(blocks);
       const codeBlocks = extractCodeBlocksFromBlocks(blocks);
 
+      const timestamp = typeof message.timestamp === 'number' ? message.timestamp : Date.now();
+      const timeDisplay = message.timestamp ? new Date(message.timestamp).toLocaleTimeString().slice(0, 5) : '';
+
       return {
         role: message.source === 'user' ? 'user' : 'assistant',
         content: textContent,
-        time: new Date(message.timestamp).toLocaleTimeString().slice(0, 5),
-        timestamp: message.timestamp,
+        time: timeDisplay,
+        timestamp: timestamp,
         streaming: message.lifecycle === 'streaming',
         startedAt: message.lifecycle === 'streaming' ? Date.now() : undefined,
         source: message.source,
@@ -4494,13 +4508,19 @@
         nextProcessing = false;
       }
 
-      // 🔧 修复：任务完成/失败/中断时，清理所有 streaming 状态
+      // 🔧 修复：任务完成/失败/中断时，清理所有 streaming 和 isPending 状态
       if (!nextProcessing && (phase === 'completed' || phase === 'failed' || phase === 'interrupted' || phase === 'idle')) {
         let hasUpdates = false;
         threadMessages.forEach(m => {
           if (m.streaming) {
             m.streaming = false;
             hasUpdates = true;
+          }
+          // 🆕 清理待确认状态
+          if (m.isPending && (m.type === 'plan_confirmation' || m.type === 'question_request')) {
+            m.isPending = false;
+            hasUpdates = true;
+            console.log(`[Webview] 任务${phase}，清理待确认卡片: ${m.type}`);
           }
         });
         ['claude', 'codex', 'gemini'].forEach(cli => {
@@ -4724,7 +4744,8 @@
      */
     function getMessageGroupKey(message, source) {
       if (message.role === 'user') return 'user';
-      return source + '-' + (message.cli || 'ai');
+      const typeKey = message.messageType || message.type || '';
+      return source + '-' + (message.cli || 'ai') + '-' + typeKey;
     }
 
     /**
@@ -4881,11 +4902,13 @@
       if (!isUser && roleName && !message.isClarification && !message.isWorkerQuestion) {
         html += '<span class="message-role-badge ' + badgeClass + '">' + roleName + '</span>';
       }
-      // 使用相对时间
+      // 使用相对时间（无时间则不渲染，避免空占位）
       const timestamp = message.timestamp || message.startedAt;
       const timeDisplay = timestamp ? formatRelativeTime(timestamp) : (message.time || '');
-      const timestampAttr = timestamp ? (' data-timestamp="' + timestamp + '"') : '';
-      html += '<span class="message-time"' + timestampAttr + '>' + timeDisplay + '</span>';
+      if (timeDisplay) {
+        const timestampAttr = timestamp ? (' data-timestamp="' + timestamp + '"') : '';
+        html += '<span class="message-time"' + timestampAttr + '>' + timeDisplay + '</span>';
+      }
       html += '</div>';
 
       if (!isUser && message.thinking && message.thinking.length > 0) {
@@ -5242,6 +5265,7 @@
         time: m.timestamp ? new Date(m.timestamp).toLocaleTimeString().slice(0,5) : '',
         timestamp: m.timestamp,
         cli: m.cli,
+        source: m.source,
         images: m.images
       }));
 
@@ -5463,10 +5487,36 @@
           return;
         }
 
-        // 如果有待确认的面板，先取消它
+        // 🆕 处理执行计划确认（支持自然语言）
         if (hasPendingConfirmation()) {
-          cancelPendingConfirmation();
+          const userInput = input.value.trim().toLowerCase();
+
+          // 🔧 使用全量匹配，避免误判（如"我不确认"被识别为"确认"）
+          const confirmKeywords = ['确认', '好的', '好', '是的', '是', 'yes', 'y', 'ok', '执行', '开始', '继续'];
+          const cancelKeywords = ['取消', '不', '不要', '否', 'no', 'n', 'cancel', '停止'];
+
+          const isConfirm = confirmKeywords.includes(userInput);
+          const isCancel = cancelKeywords.includes(userInput);
+
+          if (isConfirm || isCancel) {
+            console.log(`[Webview] 自然语言${isConfirm ? '确认' : '取消'}执行计划: "${userInput}"`);
+            handlePlanConfirmation(isConfirm);
+            input.value = '';
+            attachedImages = [];
+            renderImagePreviews();
+            return;
+          }
+
+          // 如果输入不明确，提示用户
+          addSystemMessage('请明确回复"确认"或"取消"，或点击卡片按钮', 'warning');
+          return;
         }
+
+        // 如果有待确认的面板，先取消它
+        // 🔧 移除：这个逻辑已被上面的自然语言处理替代
+        // if (hasPendingConfirmation()) {
+        //   cancelPendingConfirmation();
+        // }
 
         const promptText = input.value.trim() || '请分析这张图片';
         const hasImages = attachedImages.length > 0;
@@ -5966,7 +6016,7 @@
         tabType: 'thread',
         defaultCli: null, // Thread 面板没有默认 CLI
         toolPanelPrefix: 'tool-thread-',
-        showStreamingHint: false
+        showStreamingHint: true
       });
 
       // Thread 面板特有：显示运行中的 Worker 状态卡片
@@ -5975,28 +6025,16 @@
         html += renderWorkerStatusCard(runningEntries);
       }
 
-      // Thread 面板特有：底部 loading 动画
-      // 🔧 修复：只在没有任何 AI 响应时显示"正在思考"动画
+      // Thread 面板特有：兜底 loading 动画
+      // 保持思考动画跟随最新消息，只有在没有流式消息时才追加底部提示
       if (isProcessing) {
-        const hasActiveStreaming = threadMessages.some(m => m.streaming && m.content && m.content.trim().length > 0);
-        const hasRunningToolCall = threadMessages.some(m =>
-          m.streaming && m.toolCalls && m.toolCalls.some(t => t.status === 'running')
-        );
-        // 🔧 新增：检查是否有来自 orchestrator 的最新消息（在用户消息之后）
-        const lastUserMsgIdx = threadMessages.map((m, i) => ({ m, i })).filter(x => x.m.role === 'user').pop()?.i ?? -1;
-        const hasOrchestratorResponse = threadMessages.slice(lastUserMsgIdx + 1).some(
-          m => m.role === 'assistant' && m.source === 'orchestrator' && m.content && m.content.trim().length > 0
-        );
-
-        // 只有在没有流式内容且没有 Orchestrator 响应时才显示"正在思考"
-        const shouldShowThinking = !hasActiveStreaming && !hasOrchestratorResponse;
-
-        if (shouldShowThinking || hasRunningToolCall) {
+        const hasStreamingMessage = threadMessages.some(m => m.streaming);
+        if (!hasStreamingMessage) {
           html += '<div class="message assistant-message loading-message">';
           html += '<div class="message-body">';
           const startAt = thinkingStartAt || Date.now();
           const elapsed = formatElapsed(Date.now() - startAt);
-          html += '<div class="message-content message-streaming-hint" data-start-at="' + startAt + '"><span class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span> 正在思考 <span class="thinking-elapsed">用时 ' + elapsed + '</span></div>';
+          html += '<div class="message-content message-streaming-hint" data-start-at="' + startAt + '\"><span class=\"thinking-indicator\"><span class=\"dot\"></span><span class=\"dot\"></span><span class=\"dot\"></span></span> 正在思考 <span class=\"thinking-elapsed\">用时 ' + elapsed + '</span></div>';
           html += '</div></div>';
         }
       }

@@ -182,21 +182,27 @@ export class IntentClassifier {
 
     // 5. 开放需求类（有任务词 + 开放词，但无具体文件）
     if (signals.hasOpenEndedKeyword && signals.hasTaskKeyword && !signals.hasFilePath) {
+      const missingInfo = this.checkMissingInfo(prompt, signals);
       return {
         ...base,
         type: IntentType.OPEN_ENDED,
-        confidence: 0.8,
+        confidence: missingInfo.length > 0 ? 0.7 : 0.8,
         reason: '检测到开放需求特征：有任务意图但范围较广',
+        needsClarification: missingInfo.length > 0,
+        clarificationQuestions: missingInfo.length > 0 ? missingInfo : undefined,
       };
     }
 
-    // 6. 有明确任务关键词 → 明确任务（不再检查缺失信息，让任务分析阶段处理）
+    // 6. 有明确任务关键词 → 明确任务（若关键信息缺失，则触发澄清）
     if (signals.hasTaskKeyword) {
+      const missingInfo = this.checkMissingInfo(prompt, signals);
       return {
         ...base,
         type: IntentType.EXPLICIT,
-        confidence: 0.85,
+        confidence: missingInfo.length > 0 ? 0.75 : 0.85,
         reason: '检测到明确的任务关键词',
+        needsClarification: missingInfo.length > 0,
+        clarificationQuestions: missingInfo.length > 0 ? missingInfo : undefined,
       };
     }
 
@@ -245,4 +251,3 @@ export class IntentClassifier {
     return questions;
   }
 }
-

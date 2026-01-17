@@ -1779,7 +1779,10 @@ ${userPrompt}
     for (const block of blocks) {
       const trimmed = block.trim();
       if (!trimmed) continue;
-      const key = trimmed.replace(/\s+/g, ' ');
+      const key = trimmed
+        .replace(/^#{1,6}\s*/gm, '')
+        .replace(/\*\*/g, '')
+        .replace(/\s+/g, ' ');
       if (seen.has(key)) continue;
       seen.add(key);
       deduped.push(trimmed);

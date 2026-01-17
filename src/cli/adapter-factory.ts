@@ -174,8 +174,9 @@ export class CLIAdapterFactory extends EventEmitter {
       // 处理输出块
       normalizer.processChunk(messageId, chunk);
 
-      // 🔧 同时保留旧的 output 事件（向后兼容，可逐步移除）
-      this.emit('output', { type, chunk, source: scope?.source, adapterRole: role });
+      // 🔧 移除旧的 output 事件：Normalizer 已完整处理消息流
+      // 保留 output 事件会导致消息重复发送，编排者消息错误地出现在 CLI 面板中
+      // this.emit('output', { type, chunk, source: scope?.source, adapterRole: role });
     });
 
     adapter.on('response', (response: CLIResponse) => {
@@ -191,8 +192,9 @@ export class CLIAdapterFactory extends EventEmitter {
         this.activeMessageIds.delete(scopeKey);
       }
 
-      // 🔧 保留旧的 response 事件
-      this.emit('response', { type, response, source: scope?.source, adapterRole: role });
+      // 🔧 移除旧的 response 事件：Normalizer 已完整处理消息流
+      // 保留 response 事件会导致消息重复发送
+      // this.emit('response', { type, response, source: scope?.source, adapterRole: role });
     });
 
     adapter.on('error', (error: Error) => {
@@ -412,16 +414,19 @@ export class CLIAdapterFactory extends EventEmitter {
   /**
    * 向 CLI 面板发送编排者的消息
    * 让用户能看到编排者和代理之间的完整对话流
+   * 🔧 修复：添加 adapterRole 标识，确保消息被正确路由到 Thread 面板
    */
   private emitOrchestratorMessage(type: CLIType, message: string): void {
     // 提取消息的关键信息，生成简洁的展示内容
     const summary = this.summarizeOrchestratorMessage(message);
 
-    // 发送到 CLI 面板，标记来源为 orchestrator
+    // 🔧 修复：发送到 Thread 面板，而不是 CLI 面板
+    // 添加 adapterRole: 'orchestrator' 确保消息被正确路由
     this.emit('output', {
       type,
       chunk: summary,
-      source: 'orchestrator'
+      source: 'orchestrator',
+      adapterRole: 'orchestrator'
     });
   }
 
