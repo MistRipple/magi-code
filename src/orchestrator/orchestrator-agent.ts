@@ -747,7 +747,7 @@ export class OrchestratorAgent extends EventEmitter {
       );
     });
 
-    this.workerPool.on('dependencyAnalysis', ({ analysis, unknownTaskIds }) => {
+    this.workerPool.on('dependencyAnalysis', ({ taskId, analysis, mermaid, unknownTaskIds }) => {
       const conflicts = (analysis?.fileConflicts || []) as Array<{ file: string; taskIds: string[] }>;
       const conflictCount = conflicts.length;
       const conflictFiles = conflicts.slice(0, 5).map(item => item.file).join(', ');
@@ -760,9 +760,16 @@ export class OrchestratorAgent extends EventEmitter {
         const suffix = conflicts.length > 5 ? ' ...' : '';
         parts.push(`冲突文件: ${conflictFiles}${suffix}`);
       }
+
+      // 发送完整依赖分析数据到UI
       globalEventBus.emitEvent('orchestrator:dependency_analysis', {
-        taskId: this.currentContext?.taskId,
-        data: { message: parts.join(' | ') },
+        taskId: this.currentContext?.taskId || taskId,
+        data: {
+          message: parts.join(' | '),
+          analysis,
+          mermaid,
+          unknownTaskIds
+        },
       });
     });
   }

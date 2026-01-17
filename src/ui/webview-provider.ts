@@ -231,8 +231,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     // 监听标准消息更新事件 - 流式更新
     this.cliFactory.on('standardUpdate', (update: any) => {
-      // 去重检查（update 应该包含完整 message）
-      if (update.message && !this.messageDeduplicator.shouldSend(update.message)) {
+      // 去重检查（可能没有完整 message）
+      if (update.message) {
+        if (!this.messageDeduplicator.shouldSend(update.message)) {
+          this.logMessageFlow('standardUpdate [SKIP]', update);
+          return;
+        }
+      } else if (!this.messageDeduplicator.shouldSendUpdate(update)) {
         this.logMessageFlow('standardUpdate [SKIP]', update);
         return;
       }
@@ -424,6 +429,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         error: response.error,
         target: 'cli',
       });
+      this.cliOutputs.set(type, []);
     });
 
     this.cliFactory.on('stateChange', ({ type, state }: { type: CLIType; state: string }) => {
@@ -813,6 +819,28 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           isRunning: data.isRunning ?? this.intelligentOrchestrator.running
         } as any);
         // 移除 sendStateUpdate() 调用，避免频繁 DOM 重建导致页面跳动
+      }
+    });
+
+    globalEventBus.on('orchestrator:dependency_analysis', (event) => {
+      const data = event.data as { message?: string };
+
+      // 记录简要信息到日志
+      if (data?.message) {
+        this.appendLog({
+          level: 'info',
+          message: data.message,
+          source: 'orchestrator',
+          timestamp: Date.now(),
+        });
+      }
+
+      // 发送完整依赖分析数据到前端进行可视化
+      if (this._view) {
+        this._view.webview.postMessage({
+          type: 'dependencyAnalysis',
+          data: event.data,
+        });
       }
     });
 
