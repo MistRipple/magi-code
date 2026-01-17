@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src {{cspSource}} 'unsafe-inline'; script-src {{cspSource}} 'unsafe-inline'; img-src data: blob:;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src {{cspSource}} 'self' 'unsafe-inline'; script-src {{cspSource}} 'self' 'unsafe-inline'; img-src data: blob:;">
   <title>MultiCLI</title>
   <style>
     /* 设计系统变量 */
@@ -2264,8 +2264,21 @@
   </div>
 
   <!-- 引入 Markdown 和代码高亮库 -->
-  <script src="{{libUri}}/marked.min.js"></script>
-  <script src="{{libUri}}/highlight.min.js"></script>
+  <script>
+    (function () {
+      var libUri = '{{libUri}}';
+      if (libUri.indexOf('{{') === 0) {
+        libUri = './lib';
+      }
+      var scripts = ['marked.min.js', 'highlight.min.js'];
+      scripts.forEach(function (file) {
+        var s = document.createElement('script');
+        s.src = libUri + '/' + file;
+        s.defer = true;
+        document.head.appendChild(s);
+      });
+    })();
+  </script>
 
   <script>
     const vscode = typeof acquireVsCodeApi === 'function'
@@ -2345,6 +2358,9 @@
     let thinkingStartAt = previousState.thinkingStartAt || null;
     let streamingHintTimer = null;
     let processingActor = previousState.processingActor || { source: 'orchestrator', cli: 'claude' };
+    // 依赖分析面板状态（需在初次渲染前初始化，避免 TDZ）
+    let currentDependencyAnalysis = null;
+    let isDependencyPanelExpanded = false;
     // 滚动位置记忆：为每个 Tab 存储滚动位置
     let scrollPositions = previousState.scrollPositions || { thread: 0, claude: 0, codex: 0, gemini: 0 };
     let autoScrollEnabled = previousState.autoScrollEnabled || { thread: true, claude: true, codex: true, gemini: true };
@@ -6030,10 +6046,6 @@
         saveStateTimeout = null;
       }, 500); // 500ms 节流
     }
-
-    // 依赖分析可视化
-    let currentDependencyAnalysis = null;
-    let isDependencyPanelExpanded = false;
 
     function showDependencyAnalysis(data) {
       currentDependencyAnalysis = data;

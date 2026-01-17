@@ -104,7 +104,7 @@ async function main() {
     taskAnalyzer.setProfileLoader(profileLoader);
 
     const tasks = [
-      ['分析 src/orchestrator 目录的代码结构', ['review', 'general']],
+      ['分析 src/orchestrator 目录的代码结构', ['architecture', 'review', 'general']],
       ['创建一个新的 TypeScript 工具函数', ['implement', 'general']],
     ];
     for (const [task, expectedCategories] of tasks) {
@@ -144,4 +144,3 @@ async function main() {
 }
 
 main().catch(console.error);
-

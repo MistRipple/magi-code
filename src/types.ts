@@ -442,6 +442,7 @@ export type EventType =
   | 'orchestrator:phase_changed'
   | 'orchestrator:mode_changed'
   | 'orchestrator:plan_ready'
+  | 'orchestrator:dependency_analysis'
   | 'orchestrator:ui_message'
   | 'verification:started'
   | 'verification:completed'

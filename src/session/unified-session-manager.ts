@@ -358,7 +358,18 @@ export class UnifiedSessionManager {
     if (session) {
       const existingIndex = session.snapshots.findIndex(s => s.filePath === snapshot.filePath);
       if (existingIndex !== -1) {
+        const previous = session.snapshots[existingIndex];
         session.snapshots[existingIndex] = snapshot;
+        if (previous.id !== snapshot.id) {
+          const oldFile = this.getSnapshotFilePath(sessionId, previous.id);
+          if (fs.existsSync(oldFile)) {
+            try {
+              fs.unlinkSync(oldFile);
+            } catch (error) {
+              console.warn('[UnifiedSessionManager] 清理旧快照失败:', oldFile, error);
+            }
+          }
+        }
       } else {
         session.snapshots.push(snapshot);
       }
@@ -561,4 +572,3 @@ export class UnifiedSessionManager {
     }
   }
 }
-

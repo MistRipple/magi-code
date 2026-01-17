@@ -96,7 +96,16 @@ export class SnapshotManager {
         `  Current: ${subTaskId}\n` +
         `  Consider using file locking to prevent conflicts.`
       );
-      // 继续创建新快照，记录当前文件状态
+      // 强制复用已有快照，避免覆盖原始快照内容
+      const snapshotFile = path.join(this.getSnapshotDir(session.id), `${otherSnapshot.id}.snapshot`);
+      const originalContent = fs.existsSync(snapshotFile)
+        ? fs.readFileSync(snapshotFile, 'utf-8')
+        : '';
+      return {
+        ...otherSnapshot,
+        sessionId: session.id,
+        originalContent,
+      };
     }
 
     // 读取原始文件内容
