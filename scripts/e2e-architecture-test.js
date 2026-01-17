@@ -73,12 +73,27 @@ function logSection(title) {
   console.log('='.repeat(80));
 }
 
+// 测试结果跟踪
+const testResults = {
+  passed: 0,
+  failed: 0,
+  tests: []
+};
+
 function logTest(name, passed, details = '') {
   const symbol = passed ? '✅' : '❌';
   const color = passed ? 'green' : 'red';
   log(`${symbol} ${name}`, color);
   if (details) {
     console.log(`   ${details}`);
+  }
+
+  // 记录测试结果
+  testResults.tests.push({ name, passed, details });
+  if (passed) {
+    testResults.passed++;
+  } else {
+    testResults.failed++;
   }
 }
 
@@ -176,57 +191,59 @@ async function testE2E_ProfileToCli() {
   }
 
   // 创建 CLI 工厂并发送简单测试消息
-  const factory = new CLIAdapterFactory({
-    cwd: workspaceRoot,
-    timeout: 30000,
-    cliPaths: { claude: 'claude', codex: 'codex', gemini: 'gemini' }
-  });
+  const factory = new CLIAdapterFactory({ cwd: workspaceRoot });
 
   try {
-    let receivedResponse = false;
-    let responseContent = '';
-    let hasError = false;
-    let errorMessage = '';
+    const standardMessages = [];
+    const standardCompletes = [];
 
-    // 监听响应
-    factory.on('response', ({ type, response }) => {
-      if (type === 'claude') {
-        receivedResponse = true;
-        responseContent = response.content || '';
-      }
-    });
+    // 监听标准事件 (参考 test-real-cli-flow.js)
+    factory.on('standardMessage', (msg) => standardMessages.push(msg));
+    factory.on('standardComplete', (msg) => standardCompletes.push(msg));
 
-    // 监听错误
-    factory.on('error', ({ type, error }) => {
-      if (type === 'claude') {
-        hasError = true;
-        errorMessage = error.message;
-      }
+    // 创建完成 Promise
+    const done = new Promise((resolve) => {
+      factory.on('standardComplete', () => resolve('complete'));
     });
 
     // 发送测试消息
     const testPrompt = 'Say hello in one word';
 
-    try {
-      await factory.sendMessage('claude', testPrompt);
-    } catch (err) {
-      hasError = true;
-      errorMessage = err.message;
+    const sendPromise = factory.sendMessage('claude', testPrompt, undefined, {
+      source: 'orchestrator',
+      streamToUI: true,
+      adapterRole: 'orchestrator',
+      messageMeta: { intent: 'ask' },
+    }).catch((error) => {
+      log(`  ⚠️  CLI 调用失败: ${error.message}`, 'yellow');
+    });
+
+    // 等待完成或超时
+    const timeoutMs = 15000;
+    const timeout = new Promise((resolve) => setTimeout(() => resolve('timeout'), timeoutMs));
+
+    const reason = await Promise.race([done, timeout]);
+
+    if (reason === 'timeout') {
+      log(`  ⚠️  等待超时(${timeoutMs}ms)`, 'yellow');
     }
 
-    // 等待响应或错误
-    const success = await waitFor(() => receivedResponse || hasError, 15000);
+    await sendPromise;
 
-    if (hasError) {
-      log(`  ⚠️  CLI 执行出错: ${errorMessage}`, 'yellow');
-      logTest('CLI 成功响应', false, `错误: ${errorMessage}`);
-    } else {
-      logTest(
-        'CLI 成功响应',
-        success && responseContent.length > 0,
-        `响应长度: ${responseContent.length} 字符`
-      );
-    }
+    // 重要: 关闭所有连接,确保消息完全接收
+    await factory.disconnectAll().catch(() => {});
+
+    // 检查结果
+    const final = standardCompletes[standardCompletes.length - 1];
+    const hasContent = final && final.blocks && final.blocks.length > 0;
+
+    logTest(
+      'CLI 成功响应',
+      hasContent,
+      hasContent
+        ? `收到 ${standardMessages.length} 个消息, 响应完成`
+        : `未收到完整响应 (messages: ${standardMessages.length}, completes: ${standardCompletes.length}, reason: ${reason})`
+    );
 
   } catch (error) {
     logTest('CLI 执行测试', false, error.message);
@@ -350,6 +367,8 @@ async function testE2E_ConflictToMessage() {
     logTest('MessageBridge 测试', false, error.message);
   } finally {
     try {
+      // 确保正确关闭所有连接
+      await factory.disconnectAll().catch(() => {});
       bridge.dispose();
       await factory.dispose();
     } catch (e) {
@@ -653,9 +672,29 @@ async function runAllE2ETests() {
 
     console.log('\n');
     log('━'.repeat(80), 'magenta');
-    log('  E2E 测试完成!', 'green');
+
+    // 输出测试统计
+    const total = testResults.passed + testResults.failed;
+    log(`  测试结果: ${testResults.passed}/${total} 通过`, testResults.failed === 0 ? 'green' : 'yellow');
+
+    if (testResults.failed > 0) {
+      log(`  失败的测试:`, 'red');
+      testResults.tests.filter(t => !t.passed).forEach(t => {
+        log(`    ❌ ${t.name}`, 'red');
+        if (t.details) {
+          console.log(`       ${t.details}`);
+        }
+      });
+    }
+
     log('━'.repeat(80), 'magenta');
     console.log('\n');
+
+    // 根据测试结果决定退出码
+    if (testResults.failed > 0) {
+      console.error(`\n${testResults.failed} 个测试失败\n`);
+      process.exit(1);
+    }
 
   } catch (error) {
     console.error('\n');
