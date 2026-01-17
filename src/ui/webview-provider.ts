@@ -36,6 +36,7 @@ import { CLI_CAPABILITIES, CLIResponse } from '../cli/types';
 import { IntelligentOrchestrator } from '../orchestrator/intelligent-orchestrator';
 import { AceIndexManager } from '../ace/index-manager';
 import { normalizeOrchestratorMessage, isInternalStateMessage } from '../normalizer';
+import { MessageDeduplicator, DeduplicationConfig } from '../normalizer/message-deduplicator';
 import { parseContentToBlocks, ContentBlock, sanitizeCliOutput } from '../utils/content-parser';
 import { ProfileStorage, StoredProfileConfig } from '../orchestrator/profile';
 
@@ -55,6 +56,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private orchestratorStreamFlushTimer: NodeJS.Timeout | null = null;
   private readonly messageFlowLogEnabled = process.env.MULTICLI_MESSAGE_FLOW_LOG === '1';
   private readonly messageFlowLogPath: string;
+
+  // 🆕 消息去重器
+  private messageDeduplicator: MessageDeduplicator;
 
   // 多 CLI 适配器工厂
   private cliFactory: CLIAdapterFactory;
@@ -105,6 +109,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     private readonly workspaceRoot: string
   ) {
     this.messageFlowLogPath = path.join(this.workspaceRoot, '.multicli', 'logs', 'message-flow.jsonl');
+
+    // 🆕 初始化消息去重器
+    this.messageDeduplicator = new MessageDeduplicator({
+      enabled: true,
+      minStreamInterval: 100, // 100ms 最小流式间隔
+      retentionTime: 5 * 60 * 1000, // 5 分钟保留时间
+      maxHistorySize: 1000,
+    });
+
     // 初始化统一会话管理器
     this.sessionManager = new UnifiedSessionManager(workspaceRoot);
     this.taskManager = new TaskManager(this.sessionManager);
@@ -202,32 +215,50 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private setupCLIAdapters(): void {
     // 🆕 监听标准消息事件 - 新的消息流开始
     this.cliFactory.on('standardMessage', (message: any) => {
+      // 🆕 去重检查
+      if (!this.messageDeduplicator.shouldSend(message)) {
+        this.logMessageFlow('standardMessage [SKIP]', message);
+        return;
+      }
+
       this.postMessage({
         type: 'standardMessage',
         message,
         sessionId: this.activeSessionId
       } as any);
-      this.logMessageFlow('standardMessage', message);
+      this.logMessageFlow('standardMessage [SENT]', message);
     });
 
     // 🆕 监听标准消息更新事件 - 流式更新
     this.cliFactory.on('standardUpdate', (update: any) => {
+      // 🆕 去重检查（update 应该包含完整 message）
+      if (update.message && !this.messageDeduplicator.shouldSend(update.message)) {
+        this.logMessageFlow('standardUpdate [SKIP]', update);
+        return;
+      }
+
       this.postMessage({
         type: 'standardUpdate',
         update,
         sessionId: this.activeSessionId
       } as any);
-      this.logMessageFlow('standardUpdate', update);
+      this.logMessageFlow('standardUpdate [SENT]', update);
     });
 
     // 🆕 监听标准消息完成事件
     this.cliFactory.on('standardComplete', (message: any) => {
+      // 🆕 去重检查
+      if (!this.messageDeduplicator.shouldSend(message)) {
+        this.logMessageFlow('standardComplete [SKIP]', message);
+        return;
+      }
+
       this.postMessage({
         type: 'standardComplete',
         message,
         sessionId: this.activeSessionId
       } as any);
-      this.logMessageFlow('standardComplete', message);
+      this.logMessageFlow('standardComplete [SENT]', message);
     });
 
     // 🔧 监听 streamStart 事件，通知前端开始新的消息流

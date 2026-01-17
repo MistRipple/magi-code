@@ -17,6 +17,12 @@ import {
   WorkerSelectionOptions,
   WorkerSelectionResult,
 } from '../orchestrator/profile';
+import {
+  ConflictResolver,
+  ConflictResolutionConfig,
+  ConflictResolutionInput,
+  ConflictResolutionResult,
+} from './conflict-resolver';
 
 /** CLI 能力配置 */
 export interface CLISkillsConfig {
@@ -76,6 +82,7 @@ export interface CLISelection {
 /**
  * CLI 选择器类
  * 🆕 支持基于 Worker 画像的智能选择
+ * 🆕 集成 ConflictResolver 统一冲突解决
  */
 export class CLISelector {
   private skills: CLISkillsConfig;
@@ -89,9 +96,12 @@ export class CLISelector {
   private profileLoader?: ProfileLoader;
   /** 🆕 是否启用画像选择 */
   private useProfileBasedSelection: boolean = true;
+  /** 🆕 冲突解决器 */
+  private conflictResolver: ConflictResolver;
 
   constructor(skills?: Partial<CLISkillsConfig>) {
     this.skills = { ...DEFAULT_SKILLS, ...skills };
+    this.conflictResolver = new ConflictResolver();
   }
 
   /**
@@ -99,6 +109,7 @@ export class CLISelector {
    */
   setProfileLoader(loader: ProfileLoader): void {
     this.profileLoader = loader;
+    this.conflictResolver.setProfileLoader(loader);
   }
 
   /**
@@ -113,6 +124,7 @@ export class CLISelector {
    */
   setExecutionStats(stats: ExecutionStats): void {
     this.executionStats = stats;
+    this.conflictResolver.setExecutionStats(stats);
   }
 
   /**
@@ -127,7 +139,16 @@ export class CLISelector {
     }
     if (options.healthThreshold !== undefined) {
       this.healthThreshold = options.healthThreshold;
+      // 同步更新 ConflictResolver 配置
+      this.conflictResolver.updateConfig({ healthThreshold: options.healthThreshold });
     }
+  }
+
+  /**
+   * 🆕 配置冲突解决策略
+   */
+  configureConflictResolution(config: Partial<ConflictResolutionConfig>): void {
+    this.conflictResolver.updateConfig(config);
   }
 
   /**
@@ -146,48 +167,44 @@ export class CLISelector {
 
   /**
    * 根据任务分析选择最佳 CLI
-   * 集成基于统计的智能选择
+   * 🆕 使用 ConflictResolver 统一冲突解决
    */
-  select(analysis: TaskAnalysis): CLISelection {
-    const preferred = this.skills[analysis.category] || this.skills.general;
+  select(analysis: TaskAnalysis, userPreference?: CLIType): CLISelection {
+    const category = analysis.category;
 
-   
+    // 获取画像推荐
+    let profileRecommendation: CLIType | undefined;
+    if (this.useProfileBasedSelection && this.profileLoader) {
+      const categoryConfig = this.profileLoader.getCategory(category);
+      profileRecommendation = categoryConfig?.defaultWorker as CLIType;
+    }
+    if (!profileRecommendation) {
+      profileRecommendation = this.skills[category] || this.skills.general;
+    }
+
+    // 获取执行统计推荐
+    let statsRecommendation: CLIType | undefined;
     if (this.useStatsBasedSelection && this.executionStats) {
-      const smartSelection = this.selectWithStats(preferred, analysis.category);
-      if (smartSelection) {
-        return smartSelection;
-      }
+      const availableList = Array.from(this.availableCLIs);
+      statsRecommendation = this.executionStats.recommendCLI(category, availableList);
     }
 
-    // 检查首选 CLI 是否可用
-    if (this.availableCLIs.has(preferred)) {
-      return {
-        cli: preferred,
-        degraded: false,
-        preferred,
-        reason: `任务类型 "${analysis.category}" 的首选 CLI`,
-      };
-    }
+    // 使用 ConflictResolver 解决冲突
+    const resolution = this.conflictResolver.resolve({
+      userPreference,
+      profileRecommendation,
+      statsRecommendation,
+      category,
+      availableClis: Array.from(this.availableCLIs),
+    });
 
-    // 降级到备选 CLI
-    const fallbacks = CLI_FALLBACK_ORDER[preferred] || [];
-    for (const fallback of fallbacks) {
-      if (this.availableCLIs.has(fallback)) {
-        return {
-          cli: fallback,
-          degraded: true,
-          preferred,
-          reason: `首选 ${preferred} 不可用，降级到 ${fallback}`,
-        };
-      }
-    }
-
-    // 如果没有可用的 CLI，返回首选（让调用者处理错误）
     return {
-      cli: preferred,
-      degraded: false,
-      preferred,
-      reason: '没有可用的 CLI，使用默认首选',
+      cli: resolution.cli,
+      degraded: resolution.degraded,
+      preferred: profileRecommendation || resolution.cli,
+      reason: resolution.reason,
+      confidence: resolution.confidence,
+      category,
     };
   }
 

@@ -22,6 +22,7 @@ export {
   getMessagePriority,
 } from './orchestrator-normalizer';
 export { MessageBatcher, type BatcherConfig, type BatchCallback } from './message-batcher';
+export { MessageDeduplicator, type DeduplicationConfig } from './message-deduplicator';
 
 import type { CLIType } from '../cli/types';
 import { BaseNormalizer } from './base-normalizer';

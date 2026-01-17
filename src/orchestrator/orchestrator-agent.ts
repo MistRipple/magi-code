@@ -66,6 +66,7 @@ import { CLISelector, CLISkillsConfig } from '../task/cli-selector';
 import { AITaskDecomposer } from '../task/ai-task-decomposer';
 import { ResultAggregator } from '../task/result-aggregator';
 import { RecoveryHandler } from './recovery-handler';
+import { ProfileLoader } from './profile/profile-loader';
 
 /** 子任务自检/互检默认配置 */
 const DEFAULT_REVIEW_CONFIG = {
@@ -220,6 +221,11 @@ export class OrchestratorAgent extends EventEmitter {
   private strategyConfig: StrategyConfig;
   private permissions: PermissionMatrix;
 
+  // 🆕 Worker 画像系统
+  private profileLoader: ProfileLoader | null = null;
+  // 🆕 统一策略引擎
+  private policyEngine: PolicyEngine | null = null;
+
   // 🆕 Intent Gate - 意图门控
   private intentGate: IntentGate;
 
@@ -286,6 +292,21 @@ export class OrchestratorAgent extends EventEmitter {
     this.aiTaskDecomposer = new AITaskDecomposer(this.cliFactory, this.cliSelector);
     this.strategyConfig = this.resolveStrategyConfig();
     this.permissions = this.resolvePermissions();
+
+    // 🆕 初始化 Worker 画像系统
+    if (this.workspaceRoot) {
+      this.profileLoader = new ProfileLoader(this.workspaceRoot);
+      // 异步加载画像，不阻塞构造函数
+      this.profileLoader.load().catch(err => {
+        console.warn('[OrchestratorAgent] ProfileLoader 加载失败:', err);
+      });
+
+      // 🆕 创建 PolicyEngine 实例并注入 ProfileLoader
+      this.policyEngine = new PolicyEngine(this.profileLoader);
+
+      // 将 ProfileLoader 注入到 CLISelector
+      this.cliSelector.setProfileLoader(this.profileLoader);
+    }
 
     // 🆕 初始化 Intent Gate - 意图门控
     this.intentGate = new IntentGate();
@@ -2818,7 +2839,9 @@ ${userPrompt}
     this.assignConflictDomains(plan);
 
     // 🆕 检测文件冲突
-    const conflictResult = policyEngine.detectConflicts(foregroundSubTasks);
+    const conflictResult = this.policyEngine
+      ? this.policyEngine.detectConflicts(foregroundSubTasks)
+      : { hasConflict: false, conflictingFiles: [], conflictingTasks: [] };
     if (conflictResult.hasConflict) {
       console.log('[OrchestratorAgent] 检测到文件冲突:', conflictResult.conflictingFiles);
       this.emitUIMessage('progress_update',
@@ -2883,7 +2906,9 @@ ${userPrompt}
     const taskId = this.currentContext!.taskId;
 
     // 使用 PolicyEngine 决定执行策略
-    const strategy = policyEngine.decideExecutionStrategy(subTasks);
+    const strategy = this.policyEngine
+      ? this.policyEngine.decideExecutionStrategy(subTasks)
+      : { parallel: [], serial: [], reason: 'PolicyEngine 未初始化' };
 
     // 先并行执行无冲突的任务
     if (strategy.parallel.length > 0) {
@@ -2912,7 +2937,7 @@ ${userPrompt}
 
         // 按建议顺序排序
         const orderedTasks = conflictResult.suggestedOrder
-          ? strategy.serial.map(id => serialTasks.find(t => t.id === id)).filter(Boolean) as SubTask[]
+          ? strategy.serial.map((id: string) => serialTasks.find(t => t.id === id)).filter(Boolean) as SubTask[]
           : serialTasks;
 
         await this.dispatchSequential(orderedTasks, plan);
@@ -3865,8 +3890,8 @@ ${userPrompt}
     const riskAssessment = this.currentContext?.risk;
     let verificationDecision;
 
-    if (riskAssessment) {
-      verificationDecision = policyEngine.decideVerification(riskAssessment, modifiedFiles);
+    if (riskAssessment && this.policyEngine) {
+      verificationDecision = this.policyEngine.decideVerification(riskAssessment, modifiedFiles);
       console.log(`[OrchestratorAgent] 验证决策: ${verificationDecision.reason}`);
     } else {
       // 回退到基础验证

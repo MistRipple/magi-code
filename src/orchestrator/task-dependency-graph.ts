@@ -1,6 +1,7 @@
 /**
  * 任务依赖图
  * 管理任务之间的依赖关系，支持拓扑排序和并行分组
+ * 🆕 v0.7.0: 集成文件依赖，统一调度策略
  */
 
 /** 任务节点 */
@@ -15,6 +16,8 @@ export interface TaskNode {
   dependents: string[];
   /** 任务状态 */
   status: 'pending' | 'ready' | 'running' | 'completed' | 'failed';
+  /** 🆕 目标文件列表 */
+  targetFiles?: string[];
   /** 任务数据（可选） */
   data?: unknown;
 }
@@ -39,19 +42,35 @@ export interface DependencyAnalysis {
   executionBatches: ExecutionBatch[];
   /** 关键路径（最长依赖链） */
   criticalPath: string[];
+  /** 🆕 文件冲突检测结果 */
+  fileConflicts?: FileConflictInfo[];
+}
+
+/** 🆕 文件冲突信息 */
+export interface FileConflictInfo {
+  /** 冲突的文件路径 */
+  file: string;
+  /** 涉及此文件的任务 ID 列表 */
+  taskIds: string[];
+  /** 冲突类型: 'read-write' | 'write-write' */
+  conflictType: 'read-write' | 'write-write';
 }
 
 /**
  * 任务依赖图类
  * 使用邻接表实现有向无环图（DAG）
+ * 🆕 集成文件依赖分析
  */
 export class TaskDependencyGraph {
   private nodes: Map<string, TaskNode> = new Map();
+  /** 🆕 文件到任务的映射 */
+  private fileToTasks: Map<string, Set<string>> = new Map();
 
   /**
    * 添加任务节点
+   * 🆕 支持 targetFiles
    */
-  addTask(id: string, name: string, data?: unknown): void {
+  addTask(id: string, name: string, data?: unknown, targetFiles?: string[]): void {
     if (this.nodes.has(id)) {
       console.warn(`[TaskDependencyGraph] 任务 ${id} 已存在，跳过添加`);
       return;
@@ -63,8 +82,19 @@ export class TaskDependencyGraph {
       dependencies: [],
       dependents: [],
       status: 'pending',
+      targetFiles,
       data,
     });
+
+    // 🆕 更新文件到任务的映射
+    if (targetFiles) {
+      for (const file of targetFiles) {
+        if (!this.fileToTasks.has(file)) {
+          this.fileToTasks.set(file, new Set());
+        }
+        this.fileToTasks.get(file)!.add(id);
+      }
+    }
   }
 
   /**
@@ -204,8 +234,83 @@ export class TaskDependencyGraph {
   }
 
   /**
+   * 🆕 检测文件冲突
+   * 找出修改相同文件的任务
+   */
+  detectFileConflicts(): FileConflictInfo[] {
+    const conflicts: FileConflictInfo[] = [];
+
+    for (const [file, taskIds] of this.fileToTasks) {
+      if (taskIds.size > 1) {
+        // 多个任务修改同一文件，产生冲突
+        conflicts.push({
+          file,
+          taskIds: Array.from(taskIds),
+          conflictType: 'write-write', // 简化处理，假设都是写冲突
+        });
+      }
+    }
+
+    return conflicts;
+  }
+
+  /**
+   * 🆕 基于文件冲突自动添加依赖
+   * 将文件冲突建模为任务依赖，确保串行执行
+   *
+   * @param strategy 冲突解决策略
+   *   - 'first-wins': 先添加的任务优先
+   *   - 'sequential': 按任务 ID 顺序串行
+   * @returns 添加的依赖数量
+   */
+  addFileDependencies(strategy: 'first-wins' | 'sequential' = 'sequential'): number {
+    const conflicts = this.detectFileConflicts();
+    let addedCount = 0;
+
+    for (const conflict of conflicts) {
+      const taskIds = conflict.taskIds;
+
+      if (strategy === 'sequential') {
+        // 按任务 ID 排序，确保稳定的执行顺序
+        taskIds.sort();
+
+        // 添加链式依赖: task[0] -> task[1] -> task[2] -> ...
+        for (let i = 1; i < taskIds.length; i++) {
+          const success = this.addDependency(taskIds[i], taskIds[i - 1]);
+          if (success) {
+            addedCount++;
+            console.log(
+              `[TaskDependencyGraph] 文件冲突自动添加依赖: ${taskIds[i]} 依赖 ${taskIds[i - 1]} (文件: ${conflict.file})`
+            );
+          }
+        }
+      } else if (strategy === 'first-wins') {
+        // 第一个任务无依赖，其他任务都依赖第一个
+        const firstTask = taskIds[0];
+        for (let i = 1; i < taskIds.length; i++) {
+          const success = this.addDependency(taskIds[i], firstTask);
+          if (success) {
+            addedCount++;
+          }
+        }
+      }
+    }
+
+    return addedCount;
+  }
+
+  /**
+   * 🆕 获取文件的所有相关任务
+   */
+  getTasksByFile(file: string): string[] {
+    const taskIds = this.fileToTasks.get(file);
+    return taskIds ? Array.from(taskIds) : [];
+  }
+
+  /**
    * 分析依赖图
    * 返回拓扑排序结果和并行执行批次
+   * 🆕 包含文件冲突信息
    */
   analyze(): DependencyAnalysis {
     // 使用 Kahn 算法进行拓扑排序
@@ -274,12 +379,16 @@ export class TaskDependencyGraph {
     // 计算关键路径
     const criticalPath = this.findCriticalPath();
 
+    // 🆕 检测文件冲突
+    const fileConflicts = this.detectFileConflicts();
+
     return {
       hasCycle,
       cycleNodes,
       topologicalOrder,
       executionBatches,
       criticalPath,
+      fileConflicts,
     };
   }
 

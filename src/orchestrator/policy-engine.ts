@@ -1,6 +1,8 @@
 /**
  * PolicyEngine - 统一策略引擎
  * 集中管理所有策略决策：CLI选择、风险评估、验证策略、冲突检测等
+ *
+ * 🆕 v0.7.0: 集成 ProfileLoader，移除硬编码的任务映射
  */
 
 import { EventEmitter } from 'events';
@@ -8,6 +10,8 @@ import { CLIType, SubTask } from '../types';
 import { RiskPolicy, RiskAssessment, RiskLevel, VerificationLevel } from './risk-policy';
 import { ExecutionPlan } from './protocols/types';
 import { VerificationConfig } from './verification-runner';
+import { ProfileLoader } from './profile/profile-loader';
+import { CategoryConfig } from './profile/types';
 
 /** CLI 选择策略 */
 export interface CLISelectionPolicy {
@@ -53,30 +57,12 @@ export interface CLIHealthStatus {
   lastSuccessAt?: number;
 }
 
-/** CLI 任务类型映射 */
-const CLI_TASK_MAPPING: Record<string, CLIType[]> = {
-  // 架构设计、复杂重构
-  architecture: ['claude'],
-  refactoring: ['claude', 'codex'],
-  // 后端开发、API、数据库
-  backend: ['codex', 'claude'],
-  api: ['codex', 'claude'],
-  database: ['codex'],
-  // 前端开发、UI/UX
-  frontend: ['gemini', 'claude'],
-  ui: ['gemini'],
-  styling: ['gemini'],
-  // Bug 修复、调试
-  bugfix: ['codex', 'claude'],
-  debug: ['codex', 'claude'],
-  // 测试、文档
-  testing: ['codex', 'claude'],
-  documentation: ['claude', 'gemini'],
-  // 默认
-  general: ['claude', 'codex', 'gemini'],
-};
+/**
+ * 🗑️ 已废弃: 硬编码的任务映射
+ * 现在从 ProfileLoader 读取分类配置
+ */
 
-/** 文件类型到任务类型的映射 */
+/** 文件类型到任务类型的映射（保留用于文件扩展名推断） */
 const FILE_TYPE_MAPPING: Record<string, string> = {
   '.tsx': 'frontend',
   '.jsx': 'frontend',
@@ -93,25 +79,37 @@ const FILE_TYPE_MAPPING: Record<string, string> = {
   '.java': 'backend',
   '.sql': 'database',
   '.prisma': 'database',
-  '.md': 'documentation',
-  '.test.ts': 'testing',
-  '.spec.ts': 'testing',
-  '.test.js': 'testing',
-  '.spec.js': 'testing',
+  '.md': 'docs',
+  '.test.ts': 'test',
+  '.spec.ts': 'test',
+  '.test.js': 'test',
+  '.spec.js': 'test',
 };
 
 /**
  * 统一策略引擎
+ * 🆕 集成 ProfileLoader，从配置读取任务分类和 CLI 映射
  */
 export class PolicyEngine extends EventEmitter {
   private riskPolicy: RiskPolicy;
   private cliHealthStatus: Map<CLIType, CLIHealthStatus> = new Map();
   private executionHistory: Array<{ cli: CLIType; success: boolean; duration: number }> = [];
 
-  constructor() {
+  /** 🆕 画像加载器 */
+  private profileLoader?: ProfileLoader;
+
+  constructor(profileLoader?: ProfileLoader) {
     super();
     this.riskPolicy = new RiskPolicy();
+    this.profileLoader = profileLoader;
     this.initializeCLIHealth();
+  }
+
+  /**
+   * 🆕 设置画像加载器（支持延迟注入）
+   */
+  setProfileLoader(loader: ProfileLoader): void {
+    this.profileLoader = loader;
   }
 
   /** 初始化 CLI 健康状态 */
@@ -131,11 +129,14 @@ export class PolicyEngine extends EventEmitter {
 
   /**
    * 根据任务特征选择最佳 CLI
+   * 🆕 从 ProfileLoader 读取任务分类配置
    */
   selectCLI(task: SubTask, availableClis?: CLIType[]): CLISelectionPolicy {
     const available = availableClis || this.getAvailableCLIs();
     const taskType = this.inferTaskType(task);
-    const preferredClis = CLI_TASK_MAPPING[taskType] || CLI_TASK_MAPPING.general;
+
+    // 🆕 从 ProfileLoader 获取该分类的推荐 CLI
+    const preferredClis = this.getPreferredCLIsForCategory(taskType);
 
     // 过滤出可用的 CLI
     const candidates = preferredClis.filter(cli => available.includes(cli));
@@ -162,26 +163,68 @@ export class PolicyEngine extends EventEmitter {
     };
   }
 
-  /** 推断任务类型 */
+  /**
+   * 🆕 从 ProfileLoader 获取分类的推荐 CLI 列表
+   */
+  private getPreferredCLIsForCategory(category: string): CLIType[] {
+    if (!this.profileLoader) {
+      // 降级到默认值
+      return ['claude', 'codex', 'gemini'];
+    }
+
+    const categoryConfig = this.profileLoader.getCategory(category);
+    if (categoryConfig?.defaultWorker) {
+      const defaultWorker = categoryConfig.defaultWorker as CLIType;
+      // 返回默认 Worker 加上其他可选 Worker
+      const allClis: CLIType[] = ['claude', 'codex', 'gemini'];
+      const others = allClis.filter(cli => cli !== defaultWorker);
+      return [defaultWorker, ...others];
+    }
+
+    // 如果没有配置，使用默认规则
+    const rules = this.profileLoader.getCategoryRules();
+    const defaultCategory = rules.defaultCategory;
+    const defaultConfig = this.profileLoader.getCategory(defaultCategory);
+    if (defaultConfig?.defaultWorker) {
+      return [defaultConfig.defaultWorker as CLIType, 'claude', 'codex', 'gemini'];
+    }
+
+    return ['claude', 'codex', 'gemini'];
+  }
+
+  /** 推断任务类型
+   * 🆕 使用 ProfileLoader 的分类配置进行关键词匹配
+   */
   private inferTaskType(task: SubTask): string {
     const description = (task.description || '').toLowerCase();
     const title = (task.title || '').toLowerCase();
     const files = task.targetFiles || [];
+    const combinedText = `${description} ${title}`;
 
-    // 1. 从描述关键词推断
-    const keywords: Record<string, string[]> = {
-      architecture: ['架构', 'architecture', '重构', 'refactor', '设计'],
-      frontend: ['前端', 'frontend', 'ui', '界面', '组件', 'component'],
-      backend: ['后端', 'backend', 'api', '服务', 'service'],
-      database: ['数据库', 'database', 'sql', 'migration', '迁移'],
-      bugfix: ['修复', 'fix', 'bug', '问题', 'issue', '错误'],
-      testing: ['测试', 'test', 'spec', '单元测试'],
-      documentation: ['文档', 'doc', 'readme', '注释'],
-    };
+    // 🆕 使用 ProfileLoader 的分类配置
+    if (this.profileLoader) {
+      const categories = this.profileLoader.getAllCategories();
+      const rules = this.profileLoader.getCategoryRules();
 
-    for (const [type, words] of Object.entries(keywords)) {
-      if (words.some(w => description.includes(w) || title.includes(w))) {
-        return type;
+      // 按优先级顺序匹配
+      for (const categoryName of rules.categoryPriority) {
+        const config = categories.get(categoryName);
+        if (!config) continue;
+
+        // 检查关键词匹配
+        for (const pattern of config.keywords) {
+          try {
+            const regex = new RegExp(pattern, 'i');
+            if (regex.test(combinedText)) {
+              return categoryName;
+            }
+          } catch {
+            // 如果正则表达式无效，使用简单字符串匹配
+            if (combinedText.includes(pattern.toLowerCase())) {
+              return categoryName;
+            }
+          }
+        }
       }
     }
 
@@ -193,7 +236,13 @@ export class PolicyEngine extends EventEmitter {
       }
     }
 
-    return 'general';
+    // 3. 回退到默认分类
+    if (this.profileLoader) {
+      const rules = this.profileLoader.getCategoryRules();
+      return rules.defaultCategory;
+    }
+
+    return 'simple';
   }
 
   /** 获取文件扩展名 */
@@ -223,11 +272,21 @@ export class PolicyEngine extends EventEmitter {
     });
   }
 
-  /** 计算置信度 */
+  /** 计算置信度
+   * 🆕 基于 ProfileLoader 配置和健康状态
+   */
   private calculateConfidence(cli: CLIType, taskType: string): number {
     const health = this.cliHealthStatus.get(cli);
-    const baseConfidence = CLI_TASK_MAPPING[taskType]?.[0] === cli ? 0.9 : 0.7;
     const healthFactor = health?.successRate || 0.5;
+
+    // 检查是否是该分类的首选 Worker
+    let isPreferred = false;
+    if (this.profileLoader) {
+      const categoryConfig = this.profileLoader.getCategory(taskType);
+      isPreferred = categoryConfig?.defaultWorker === cli;
+    }
+
+    const baseConfidence = isPreferred ? 0.9 : 0.7;
     return Math.min(1, baseConfidence * healthFactor);
   }
 
@@ -593,5 +652,10 @@ export class PolicyEngine extends EventEmitter {
   }
 }
 
-// 导出单例
+/**
+ * 🗑️ 已废弃: 全局单例
+ * 现在推荐在各个使用处创建实例并注入 ProfileLoader
+ *
+ * @deprecated 使用 `new PolicyEngine(profileLoader)` 替代
+ */
 export const policyEngine = new PolicyEngine();
