@@ -53,6 +53,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private orchestratorStreamCli: CLIType | null = null;
   private orchestratorStreamPending = '';
   private orchestratorStreamFlushTimer: NodeJS.Timeout | null = null;
+  private readonly messageFlowLogEnabled = process.env.MULTICLI_MESSAGE_FLOW_LOG === '1';
+  private readonly messageFlowLogPath: string;
 
   // 多 CLI 适配器工厂
   private cliFactory: CLIAdapterFactory;
@@ -102,6 +104,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     private readonly context: vscode.ExtensionContext,
     private readonly workspaceRoot: string
   ) {
+    this.messageFlowLogPath = path.join(this.workspaceRoot, '.multicli', 'logs', 'message-flow.jsonl');
     // 初始化统一会话管理器
     this.sessionManager = new UnifiedSessionManager(workspaceRoot);
     this.taskManager = new TaskManager(this.sessionManager);
@@ -160,6 +163,25 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.bindEvents();
   }
 
+  private logMessageFlow(eventType: string, payload: unknown): void {
+    if (!this.messageFlowLogEnabled) return;
+    try {
+      const dir = path.dirname(this.messageFlowLogPath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      const record = {
+        timestamp: Date.now(),
+        sessionId: this.activeSessionId,
+        eventType,
+        payload,
+      };
+      fs.appendFileSync(this.messageFlowLogPath, JSON.stringify(record) + '\n', 'utf-8');
+    } catch (error) {
+      console.warn('[MultiCLI] 写入消息流日志失败:', error);
+    }
+  }
+
   private normalizePermissions(input?: Partial<PermissionMatrix>): PermissionMatrix {
     return {
       allowEdit: input?.allowEdit ?? true,
@@ -185,6 +207,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         message,
         sessionId: this.activeSessionId
       } as any);
+      this.logMessageFlow('standardMessage', message);
     });
 
     // 🆕 监听标准消息更新事件 - 流式更新
@@ -194,6 +217,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         update,
         sessionId: this.activeSessionId
       } as any);
+      this.logMessageFlow('standardUpdate', update);
     });
 
     // 🆕 监听标准消息完成事件
@@ -203,6 +227,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         message,
         sessionId: this.activeSessionId
       } as any);
+      this.logMessageFlow('standardComplete', message);
     });
 
     // 🔧 监听 streamStart 事件，通知前端开始新的消息流
@@ -992,6 +1017,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       message: standardMessage,
       sessionId: this.activeSessionId,
     } as any);
+    this.logMessageFlow('standardMessage', standardMessage);
   }
 
   /**
@@ -1036,6 +1062,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         message: standardMessage,
         sessionId: this.activeSessionId,
       } as any);
+      this.logMessageFlow('standardMessage', standardMessage);
       return;
     }
 
@@ -1068,6 +1095,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           message: standardMessage,
           sessionId: this.activeSessionId,
         } as any);
+        this.logMessageFlow('standardMessage', standardMessage);
         return;
       }
 
@@ -1084,6 +1112,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         update,
         sessionId: this.activeSessionId,
       } as any);
+      this.logMessageFlow('standardUpdate', update);
       return;
     }
 
@@ -1115,6 +1144,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           message: standardMessage,
           sessionId: this.activeSessionId,
         } as any);
+        this.logMessageFlow('standardMessage', standardMessage);
         return;
       }
 
@@ -1137,6 +1167,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         message: completeMessage,
         sessionId: this.activeSessionId,
       } as any);
+      this.logMessageFlow('standardComplete', completeMessage);
     }
   }
 
@@ -2731,7 +2762,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       role: m.role as 'user' | 'assistant',
       content: m.content,
       cli: m.cli,
-      timestamp: m.time ? new Date().getTime() : Date.now(),
+      timestamp: typeof m.timestamp === 'number' ? m.timestamp : Date.now(),
       images: m.images,
       source: m.source,
     }));

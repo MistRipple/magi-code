@@ -51,6 +51,7 @@ export interface ParseContext {
   rawBuffer: string;
   blocks: ContentBlock[];
   pendingText: string;
+  hasAssistantText: boolean;
   pendingThinking: string | null;
   activeToolCalls: Map<string, ToolCallBlock>;
   interaction: InteractionRequest | null;
@@ -81,6 +82,7 @@ export abstract class BaseNormalizer extends EventEmitter {
       rawBuffer: '',
       blocks: [],
       pendingText: '',
+      hasAssistantText: false,
       pendingThinking: null,
       activeToolCalls: new Map(),
       interaction: null,

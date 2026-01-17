@@ -48,12 +48,14 @@ interface ClaudeStreamEvent {
     partial_json?: string;
     thinking?: string;
   };
-  result?: {
-    type: string;
-    content?: string;
-    output?: string;
-    is_error?: boolean;
-  };
+  result?:
+    | {
+        type: string;
+        content?: string;
+        output?: string;
+        is_error?: boolean;
+      }
+    | string;
 }
 
 /**
@@ -94,6 +96,7 @@ export class ClaudeNormalizer extends BaseNormalizer {
         // 非 JSON 行，作为纯文本处理
         if (trimmed) {
           context.pendingText += trimmed + '\n';
+          context.hasAssistantText = true;
           updates.push(this.createUpdate(context.messageId, 'append', { appendText: trimmed + '\n' }));
         }
       }
@@ -104,7 +107,42 @@ export class ClaudeNormalizer extends BaseNormalizer {
 
   private processEvent(context: ParseContext, event: ClaudeStreamEvent): StreamUpdate[] {
     const updates: StreamUpdate[] = [];
-    
+
+    if (event.type === 'assistant' && event.message?.content?.length) {
+      for (const block of event.message.content) {
+        if (block.type === 'text' && block.text) {
+          context.pendingText += block.text;
+          context.hasAssistantText = true;
+          updates.push(this.createUpdate(context.messageId, 'append', { appendText: block.text }));
+        }
+      }
+      return updates;
+    }
+
+    if (event.type === 'result') {
+      const resultText = typeof event.result === 'string'
+        ? event.result
+        : (event.result?.content || event.result?.output || '');
+      if (resultText) {
+        if (!context.hasAssistantText) {
+          context.pendingText += resultText;
+          updates.push(this.createUpdate(context.messageId, 'append', { appendText: resultText }));
+          context.hasAssistantText = true;
+        } else if (context.pendingText && resultText.startsWith(context.pendingText)) {
+          const tail = resultText.slice(context.pendingText.length);
+          if (tail) {
+            context.pendingText += tail;
+            updates.push(this.createUpdate(context.messageId, 'append', { appendText: tail }));
+          }
+        } else if (!context.pendingText || !context.pendingText.includes(resultText)) {
+          // 回退: 只在未包含时追加，避免重复
+          context.pendingText += resultText;
+          updates.push(this.createUpdate(context.messageId, 'append', { appendText: resultText }));
+        }
+      }
+      return updates;
+    }
+
     switch (event.type) {
       case 'message_start':
         // 消息开始，可以获取消息 ID
@@ -133,6 +171,7 @@ export class ClaudeNormalizer extends BaseNormalizer {
         if (event.delta) {
           if (event.delta.type === 'text_delta' && event.delta.text) {
             context.pendingText += event.delta.text;
+            context.hasAssistantText = true;
             updates.push(this.createUpdate(context.messageId, 'append', { appendText: event.delta.text }));
           } else if (event.delta.type === 'thinking_delta' && event.delta.thinking) {
             if (context.pendingThinking === null) {
@@ -161,9 +200,13 @@ export class ClaudeNormalizer extends BaseNormalizer {
         if (event.result) {
           const toolId = this.findActiveToolId(context);
           if (toolId) {
-            const output = event.result.content || event.result.output || '';
-            const error = event.result.is_error ? output : undefined;
-            this.completeToolCall(context, toolId, event.result.is_error ? undefined : output, error);
+            if (typeof event.result === 'string') {
+              this.completeToolCall(context, toolId, event.result, undefined);
+            } else {
+              const output = event.result.content || event.result.output || '';
+              const error = event.result.is_error ? output : undefined;
+              this.completeToolCall(context, toolId, event.result.is_error ? undefined : output, error);
+            }
           }
         }
         break;

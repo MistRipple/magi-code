@@ -47,7 +47,7 @@ export interface IntentGateConfig {
 
 const DEFAULT_CONFIG: IntentGateConfig = {
   enableClarification: true,
-  lowConfidenceThreshold: 0.6,
+  lowConfidenceThreshold: 0.7,
 };
 
 /**
@@ -187,4 +187,3 @@ export class IntentGate {
 }
 
 export { IntentClassifier, IntentType, IntentClassification };
-
