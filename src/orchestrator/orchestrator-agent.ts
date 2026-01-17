@@ -19,6 +19,7 @@
  */
 
 import { EventEmitter } from 'events';
+import * as path from 'path';
 import { CLIAdapterFactory } from '../cli/adapter-factory';
 import { globalEventBus } from '../events';
 import { MessageBus, globalMessageBus } from './message-bus';
@@ -909,12 +910,10 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     this.batchTasks.clear();
     this.pendingWorkerQuestions.clear();
 
-    // 初始化上下文管理器
-    await this.ensureContext(contextSessionId, userPrompt);
-
     try {
-      // Phase 0: Intent Gate - 意图门控
-      // 核心原则：NEVER START IMPLEMENTING, UNLESS USER WANTS YOU TO IMPLEMENT SOMETHING EXPLICITLY
+      // ✅ P2优化: Phase 0: Intent Gate - 意图门控 (前置优化)
+      // 核心原则: NEVER START IMPLEMENTING, UNLESS USER WANTS YOU TO IMPLEMENT SOMETHING EXPLICITLY
+      // 优化: 在初始化上下文之前先进行意图分类,轻量请求可跳过完整上下文初始化
       const intentResult = this.intentGate.process(userPrompt);
       console.log(`[OrchestratorAgent] Intent Gate: ${intentResult.classification.type}, ` +
                   `confidence: ${(intentResult.classification.confidence * 100).toFixed(0)}%, ` +
@@ -922,12 +921,18 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
 
       // 根据意图类型路由处理
       if (intentResult.skipTaskAnalysis) {
-        const response = await this.handleIntentDirectly(userPrompt, intentResult, taskId);
+        // ✅ P2优化: 轻量请求按需初始化context
+        // ASK/EXPLORE模式可能需要轻量context,但不需要完整Memory加载
+        const response = await this.handleIntentDirectly(userPrompt, intentResult, taskId, contextSessionId);
         if (response !== null) {
           return response;
         }
         // 如果 handleIntentDirectly 返回 null，继续走任务分析流程
       }
+
+      // ✅ P2优化: 仅在需要任务分析时才初始化完整上下文
+      // 这避免了轻量请求(QUESTION/EXPLORE)的不必要开销
+      await this.ensureContext(contextSessionId, userPrompt);
 
       // Phase 0.5: 需求澄清（如果设置了澄清回调且意图门控未处理）
       let clarifiedPrompt = userPrompt;
@@ -1407,9 +1412,18 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
   private async handleIntentDirectly(
     userPrompt: string,
     intentResult: import('./intent-gate').IntentGateResult,
-    taskId: string
+    taskId: string,
+    contextSessionId: string
   ): Promise<string | null> {
     const { recommendedMode, classification, needsClarification, clarificationQuestions } = intentResult;
+
+    // ✅ P2优化: ASK/EXPLORE模式按需初始化轻量context
+    // 仅加载immediateContext,不加载完整Memory(节省时间和资源)
+    if (recommendedMode === IntentHandlerMode.ASK || recommendedMode === IntentHandlerMode.EXPLORE) {
+      if (!this.contextManager) {
+        await this.ensureContext(contextSessionId, userPrompt);
+      }
+    }
 
     switch (recommendedMode) {
       case IntentHandlerMode.ASK:
@@ -2984,39 +2998,116 @@ ${userPrompt}
       return;
     }
 
-    // 构建文件到 Worker 的映射，记录每个文件由哪个 Worker 负责
-    const fileToWorker = new Map<string, WorkerType>();
+    const subTaskMap = new Map<string, SubTask>();
+    subTasks.forEach(task => subTaskMap.set(task.id, task));
+
+    const fileToTasks = new Map<string, string[]>();
+    // 构建文件到 Worker/SubTask 的映射，记录每个文件由哪个子任务负责
+    const fileToInfo = new Map<string, { worker: WorkerType; subTaskId: string }>();
     for (const subTask of subTasks) {
       if (subTask.targetFiles) {
         const worker = subTask.assignedWorker || 'claude';
         subTask.targetFiles.forEach(f => {
+          const normalized = this.normalizeSnapshotPath(f);
+          if (!normalized) {
+            return;
+          }
+          if (!fileToTasks.has(normalized)) {
+            fileToTasks.set(normalized, []);
+          }
+          fileToTasks.get(normalized)!.push(subTask.id);
           // 如果文件已被其他 Worker 关联，保留第一个（或可以选择覆盖）
-          if (!fileToWorker.has(f)) {
-            fileToWorker.set(f, worker);
+          if (!fileToInfo.has(normalized)) {
+            fileToInfo.set(normalized, { worker, subTaskId: subTask.id });
+          } else if (fileToInfo.get(normalized)?.subTaskId !== subTask.id) {
+            console.warn(`[OrchestratorAgent] 多个子任务引用同一文件快照: ${normalized}`);
           }
         });
       }
     }
 
-    if (fileToWorker.size === 0) {
+    // 对同文件多子任务强制串行（按 ID 稳定排序）
+    for (const [filePath, taskIds] of fileToTasks) {
+      if (taskIds.length <= 1) continue;
+      const sorted = Array.from(new Set(taskIds)).sort();
+      for (let i = 1; i < sorted.length; i += 1) {
+        const currentId = sorted[i];
+        const dependsOn = sorted[i - 1];
+        if (this.wouldCreateDependencyCycle(currentId, dependsOn, subTaskMap)) {
+          console.warn(`[OrchestratorAgent] 跳过可能导致循环依赖的文件串行化: ${currentId} -> ${dependsOn} (${filePath})`);
+          continue;
+        }
+        const task = subTaskMap.get(currentId);
+        if (!task) continue;
+        task.dependencies = task.dependencies ?? [];
+        if (!task.dependencies.includes(dependsOn)) {
+          task.dependencies.push(dependsOn);
+          console.log(`[OrchestratorAgent] 文件冲突串行化: ${currentId} 依赖 ${dependsOn} (${filePath})`);
+        }
+      }
+    }
+
+    if (fileToInfo.size === 0) {
       console.log('[OrchestratorAgent] 没有目标文件，跳过快照创建');
       return;
     }
 
-    console.log(`[OrchestratorAgent] 为 ${fileToWorker.size} 个文件创建快照...`);
-    this.emitUIMessage('progress_update', `正在为 ${fileToWorker.size} 个文件创建快照...`);
+    console.log(`[OrchestratorAgent] 为 ${fileToInfo.size} 个文件创建快照...`);
+    this.emitUIMessage('progress_update', `正在为 ${fileToInfo.size} 个文件创建快照...`);
 
-    for (const [filePath, worker] of fileToWorker) {
+    for (const [filePath, info] of fileToInfo) {
       try {
         this.snapshotManager.createSnapshot(
           filePath,
-          worker, // 使用实际分配的 Worker
-          this.currentContext?.taskId || 'unknown'
+          info.worker, // 使用实际分配的 Worker
+          info.subTaskId
         );
       } catch (error) {
         console.warn(`[OrchestratorAgent] 创建快照失败: ${filePath}`, error);
       }
     }
+  }
+
+  private normalizeSnapshotPath(filePath: string): string {
+    const trimmed = filePath.trim();
+    if (!trimmed) return '';
+    if (!this.workspaceRoot) {
+      return path.normalize(trimmed);
+    }
+    const absolutePath = path.isAbsolute(trimmed)
+      ? trimmed
+      : path.join(this.workspaceRoot, trimmed);
+    const normalizedPath = path.normalize(absolutePath);
+    const normalizedRoot = path.normalize(this.workspaceRoot);
+    if (!normalizedPath.startsWith(normalizedRoot)) {
+      return trimmed;
+    }
+    const relative = path.relative(this.workspaceRoot, normalizedPath);
+    return relative || trimmed;
+  }
+
+  private wouldCreateDependencyCycle(
+    taskId: string,
+    dependsOnId: string,
+    tasks: Map<string, SubTask>
+  ): boolean {
+    const visited = new Set<string>();
+    const stack: string[] = [dependsOnId];
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      if (current === taskId) return true;
+      if (visited.has(current)) continue;
+      visited.add(current);
+      const task = tasks.get(current);
+      if (task?.dependencies) {
+        for (const dep of task.dependencies) {
+          if (!visited.has(dep)) {
+            stack.push(dep);
+          }
+        }
+      }
+    }
+    return false;
   }
 
   /** 构建共享上下文（功能契约 + 验收清单） */
