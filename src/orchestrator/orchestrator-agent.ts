@@ -1664,9 +1664,25 @@ ${userPrompt}
       if (plan && !this.validateExecutionPlan(plan)) {
         plan = null;
       }
+      if (!plan) {
+        const repaired = await this.repairAnalysisToPlan(
+          rawContent,
+          userPrompt,
+          availableWorkers,
+          projectContext || undefined
+        );
+        if (repaired && this.validateExecutionPlan(repaired)) {
+          plan = repaired;
+        }
+      }
       // Fallback to rule-based plan if parsing failed
       if (!plan) {
-        plan = await this.buildPlanFromAnalysis(userPrompt, ruleAnalysis, true);
+        const fallbackClarify = this.buildFallbackClarificationPlan(userPrompt, ruleAnalysis);
+        if (fallbackClarify) {
+          plan = fallbackClarify;
+        } else {
+          plan = await this.buildPlanFromAnalysis(userPrompt, ruleAnalysis, true);
+        }
       }
       if (plan) {
         this.ensureArchitectureTask(plan, userPrompt);
@@ -1689,6 +1705,97 @@ ${userPrompt}
     }
   }
 
+  private async repairAnalysisToPlan(
+    rawContent: string,
+    userPrompt: string,
+    availableWorkers: WorkerType[],
+    projectContext?: string
+  ): Promise<ExecutionPlan | null> {
+    const preview = rawContent.trim().slice(0, 4000);
+    if (!preview) {
+      return null;
+    }
+    const workersDesc = availableWorkers.map(w => `- ${w}`).join('\n');
+    console.log('[OrchestratorAgent] 计划解析失败，尝试修复 JSON 输出');
+    const repairPrompt = [
+      '你刚才的输出不是合法 JSON。',
+      '请将以下内容修复为**严格 JSON**，仅输出 JSON，不要代码块或解释文本。',
+      '',
+      '## 用户需求',
+      userPrompt,
+      '',
+      projectContext ? `## 项目上下文\n${projectContext}\n` : '',
+      '## 可用 Worker',
+      workersDesc,
+      '',
+      '## 原始输出',
+      preview,
+      '',
+      '## 输出格式（严格遵守字段名）',
+      '{',
+      '  "analysis": "对任务的简要分析",',
+      '  "isSimpleTask": true/false,',
+      '  "needsWorker": true/false,',
+      '  "directResponse": "如果不需要 Worker，直接在此回答用户问题（可选）",',
+      '  "needsUserInput": true/false,',
+      '  "questions": ["需要用户补充的关键问题 1", "问题 2"],',
+      '  "skipReason": "如果不需要 Worker，说明原因",',
+      '  "needsCollaboration": true/false,',
+      '  "featureContract": "功能契约（接口、数据结构、交互约束的统一描述）",',
+      '  "acceptanceCriteria": ["验收标准 1", "验收标准 2"],',
+      '  "subTasks": [',
+      '    {',
+      '      "id": "1",',
+      '      "description": "子任务描述",',
+      '      "assignedWorker": "claude/codex/gemini",',
+      '      "reason": "选择该 Worker 的原因",',
+      '      "targetFiles": ["预计修改的文件列表"],',
+      '      "dependencies": [],',
+      '      "prompt": "发送给该 Worker 的具体指令（英文，详细明确）",',
+      '      "background": false',
+      '    }',
+      '  ],',
+      '  "executionMode": "parallel/sequential",',
+      '  "summary": "执行计划总结"',
+      '}',
+      '',
+      '如果信息不足以生成计划，请设置 needsUserInput=true，并给出 questions；其余字段按默认值填充。',
+    ].filter(Boolean).join('\n');
+
+    try {
+      const response = await this.cliFactory.sendMessage(
+        'claude',
+        repairPrompt,
+        undefined,
+        {
+          source: 'orchestrator',
+          streamToUI: false,
+          adapterRole: 'orchestrator',
+          messageMeta: {
+            taskId: this.currentContext?.taskId,
+            intent: 'orchestrator_plan_repair',
+          },
+        }
+      );
+
+      this.recordOrchestratorTokens(response.tokenUsage);
+
+      if (response.error) {
+        console.error('[OrchestratorAgent] 计划修复失败:', response.error);
+        return null;
+      }
+
+      const repaired = this.parseExecutionPlan(response.content || '');
+      if (!repaired) {
+        console.warn('[OrchestratorAgent] 计划修复仍未得到有效 JSON');
+      }
+      return repaired;
+    } catch (error) {
+      console.error('[OrchestratorAgent] 计划修复异常:', error);
+      return null;
+    }
+  }
+
   private syncCliAvailability(): void {
     const statuses = this.cliFactory.getAllStatus();
     const idle = statuses.filter(status => status.connected && !status.busy).map(status => status.type);
@@ -1705,6 +1812,62 @@ ${userPrompt}
     if (analysis.complexity > 2) return false;
     if (analysis.category === 'architecture') return false;
     return true;
+  }
+
+  private buildFallbackClarificationPlan(
+    userPrompt: string,
+    analysis: TaskAnalysis
+  ): ExecutionPlan | null {
+    const questions = this.deriveClarificationQuestions(userPrompt, analysis);
+    if (questions.length === 0) return null;
+    return {
+      id: `plan_${Date.now()}`,
+      analysis: `需要澄清：${analysis.category}`,
+      isSimpleTask: true,
+      needsWorker: false,
+      directResponse: '',
+      needsUserInput: true,
+      questions,
+      skipReason: '缺少关键信息，先澄清需求范围',
+      needsCollaboration: false,
+      subTasks: [],
+      executionMode: 'sequential',
+      summary: '等待用户补充信息',
+      featureContract: userPrompt,
+      acceptanceCriteria: [],
+      createdAt: Date.now(),
+      riskLevel: analysis.riskLevel,
+    };
+  }
+
+  private deriveClarificationQuestions(userPrompt: string, analysis: TaskAnalysis): string[] {
+    const questions: string[] = [];
+    const prompt = userPrompt.trim();
+    const lower = prompt.toLowerCase();
+
+    if (/优化|提升|性能|performance|perf/i.test(prompt)) {
+      questions.push('需要优化哪个模块/功能/流程？');
+      questions.push('希望达到的性能目标或指标是什么？');
+    }
+
+    if (/修复|bug|报错|错误|error|fix/i.test(prompt)) {
+      questions.push('请提供具体的错误信息或复现步骤');
+      questions.push('相关的文件/模块/日志在哪里？');
+    }
+
+    if (/生成.*计划|执行计划|计划/i.test(prompt) && !/为.+计划/.test(prompt)) {
+      questions.push('需要为哪一项具体任务生成执行计划？');
+    }
+
+    if (analysis.targetFiles.length === 0 && questions.length < 2) {
+      questions.push('涉及哪些具体文件或模块？');
+    }
+
+    if (questions.length === 0 && lower.length < 50) {
+      questions.push('请补充具体需求目标和范围');
+    }
+
+    return Array.from(new Set(questions)).slice(0, 4);
   }
 
   private async buildPlanFromAnalysis(
@@ -2246,6 +2409,9 @@ ${userPrompt}
 
   private validateExecutionPlan(plan: ExecutionPlan): boolean {
     if (!plan) return false;
+    if (plan.needsUserInput && Array.isArray(plan.questions) && plan.questions.length > 0) {
+      return true;
+    }
     if (plan.needsWorker === false) {
       return typeof plan.directResponse === 'string' && plan.directResponse.trim().length > 0;
     }

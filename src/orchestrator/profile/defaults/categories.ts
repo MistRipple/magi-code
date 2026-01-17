@@ -50,6 +50,34 @@ export const DEFAULT_CATEGORIES_CONFIG: CategoriesConfig = {
       riskLevel: 'low',
     },
 
+    // 功能实现类
+    implement: {
+      displayName: '功能实现',
+      description: '实现新功能、编写业务逻辑',
+      keywords: [
+        '实现|开发|编写',
+        '功能|特性|feature',
+        '业务逻辑|逻辑实现',
+      ],
+      defaultWorker: 'codex',
+      priority: 'medium',
+      riskLevel: 'medium',
+    },
+
+    // 代码重构类
+    refactor: {
+      displayName: '代码重构',
+      description: '优化代码结构、提升可维护性',
+      keywords: [
+        '重构|优化|改进',
+        '提取|抽象|简化',
+        '可维护性|可读性',
+      ],
+      defaultWorker: 'claude',
+      priority: 'medium',
+      riskLevel: 'medium',
+    },
+
     // Bug 修复类
     bugfix: {
       displayName: 'Bug 修复',
@@ -57,11 +85,24 @@ export const DEFAULT_CATEGORIES_CONFIG: CategoriesConfig = {
       keywords: [
         '修复|bug|fix|错误',
         '问题|异常|崩溃',
-        '调试|排查',
       ],
       defaultWorker: 'codex',
       priority: 'high',
       riskLevel: 'medium',
+    },
+
+    // 问题排查类
+    debug: {
+      displayName: '问题排查',
+      description: '调试、问题定位、日志分析',
+      keywords: [
+        '调试|debug|排查',
+        '定位|分析|追踪',
+        '日志|堆栈|错误信息',
+      ],
+      defaultWorker: 'claude',
+      priority: 'high',
+      riskLevel: 'low',
     },
 
     // 测试类
@@ -77,8 +118,8 @@ export const DEFAULT_CATEGORIES_CONFIG: CategoriesConfig = {
       riskLevel: 'low',
     },
 
-    // 文档类
-    docs: {
+    // 文档类 (注意：类型定义使用 'document'，但这里保持 'docs' 作为内部标识)
+    document: {
       displayName: '文档编写',
       description: 'README、注释、API 文档',
       keywords: [
@@ -86,6 +127,31 @@ export const DEFAULT_CATEGORIES_CONFIG: CategoriesConfig = {
         '说明|指南|教程',
       ],
       defaultWorker: 'gemini',
+      priority: 'low',
+      riskLevel: 'low',
+    },
+
+    // 代码审查类
+    review: {
+      displayName: '代码审查',
+      description: '代码审查、质量检查',
+      keywords: [
+        '审查|review|检查',
+        '质量|规范|最佳实践',
+      ],
+      defaultWorker: 'claude',
+      priority: 'medium',
+      riskLevel: 'low',
+    },
+
+    // 通用任务类
+    general: {
+      displayName: '通用任务',
+      description: '其他未分类任务',
+      keywords: [
+        '通用|其他|杂项',
+      ],
+      defaultWorker: 'claude',
       priority: 'low',
       riskLevel: 'low',
     },
@@ -120,15 +186,18 @@ export const DEFAULT_CATEGORIES_CONFIG: CategoriesConfig = {
   rules: {
     categoryPriority: [
       'architecture',
-      'integration',
+      'debug',
       'bugfix',
+      'refactor',
       'backend',
       'frontend',
+      'implement',
       'test',
-      'docs',
-      'simple',
+      'review',
+      'document',
+      'general',
     ],
-    defaultCategory: 'simple',
+    defaultCategory: 'general',
     riskMapping: {
       high: 'fullPath',
       medium: 'standardPath',
