@@ -431,6 +431,26 @@
     .worker-status-item .task-cli.gemini { background: rgba(66, 133, 244, 0.15); color: var(--color-gemini); }
     .worker-status-item .task-desc { flex: 1; font-size: var(--font-size-2); color: var(--vscode-foreground); }
 
+    /* 依赖分析面板 */
+    .dependency-panel { margin: var(--spacing-3); margin-top: var(--spacing-2); background: var(--vscode-editor-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); overflow: hidden; }
+    .dependency-panel-header { display: flex; align-items: center; gap: var(--spacing-2); padding: var(--spacing-3); background: rgba(59, 130, 246, 0.05); cursor: pointer; transition: background var(--transition-fast); user-select: none; }
+    .dependency-panel-header:hover { background: rgba(59, 130, 246, 0.08); }
+    .dependency-chevron { width: 12px; color: var(--vscode-descriptionForeground); transition: transform var(--transition-fast); }
+    .dependency-title { font-size: var(--font-size-2); font-weight: 600; color: var(--vscode-foreground); }
+    .dependency-summary { flex: 1; font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); text-align: right; }
+    .dependency-panel-content { padding: var(--spacing-3); padding-top: var(--spacing-2); display: flex; flex-direction: column; gap: var(--spacing-3); }
+    .dependency-section { display: flex; flex-direction: column; gap: var(--spacing-2); }
+    .dependency-section-title { font-size: var(--font-size-1); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--vscode-descriptionForeground); }
+    .dependency-batches { display: flex; flex-wrap: wrap; gap: var(--spacing-2); }
+    .dependency-batch { display: inline-flex; align-items: center; gap: var(--spacing-2); padding: var(--spacing-1) var(--spacing-2); background: var(--color-info-bg); border: 1px solid rgba(59, 130, 246, 0.2); border-radius: var(--radius-2); }
+    .batch-label { font-size: var(--font-size-1); font-weight: 600; color: var(--color-info); }
+    .batch-tasks { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .dependency-path { font-size: var(--font-size-2); color: var(--vscode-foreground); padding: var(--spacing-2); background: rgba(255, 255, 255, 0.02); border-radius: var(--radius-2); font-family: var(--vscode-editor-font-family); }
+    .dependency-conflicts { display: flex; flex-direction: column; gap: var(--spacing-1); }
+    .dependency-conflict { display: flex; align-items: center; justify-content: space-between; padding: var(--spacing-1) var(--spacing-2); background: var(--color-warning-bg); border: 1px solid rgba(245, 158, 11, 0.2); border-radius: var(--radius-2); }
+    .conflict-file { font-size: var(--font-size-2); color: var(--color-warning); font-family: var(--vscode-editor-font-family); }
+    .conflict-tasks { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+
     /* 摘要卡片内容 */
     .summary-stats { display: flex; gap: var(--spacing-4); margin-bottom: var(--spacing-3); }
     .summary-stat { text-align: center; }
@@ -2872,6 +2892,12 @@
       // CLI 降级通知
       else if (msg.type === 'cliFallbackNotice') {
         addSystemMessage(`${msg.originalCli} 降级到 ${msg.fallbackCli}: ${msg.reason}`, 'warning');
+      }
+      // 依赖分析可视化
+      else if (msg.type === 'dependencyAnalysis') {
+        if (msg.data) {
+          showDependencyAnalysis(msg.data);
+        }
       }
       // CLI 任务卡片（子代理面板显示任务信息）
       else if (msg.type === 'cliTaskCard') {
@@ -6005,14 +6031,98 @@
       }, 500); // 500ms 节流
     }
 
+    // 依赖分析可视化
+    let currentDependencyAnalysis = null;
+    let isDependencyPanelExpanded = false;
+
+    function showDependencyAnalysis(data) {
+      currentDependencyAnalysis = data;
+      isDependencyPanelExpanded = true; // 新数据默认展开
+      renderMainContent();
+    }
+
+    function toggleDependencyPanel() {
+      isDependencyPanelExpanded = !isDependencyPanelExpanded;
+      renderMainContent();
+    }
+
+    function renderDependencyPanel() {
+      if (!currentDependencyAnalysis) return '';
+
+      const { message, analysis, mermaid } = currentDependencyAnalysis;
+      const conflicts = analysis?.fileConflicts || [];
+      const batches = analysis?.executionBatches || [];
+      const criticalPath = analysis?.criticalPath || [];
+
+      const isExpanded = isDependencyPanelExpanded;
+      const chevron = isExpanded ? '▼' : '▶';
+
+      let html = '<div class="dependency-panel">';
+      html += `<div class="dependency-panel-header" onclick="toggleDependencyPanel()">`;
+      html += `<span class="dependency-chevron">${chevron}</span>`;
+      html += `<span class="dependency-title">任务依赖分析</span>`;
+      html += `<span class="dependency-summary">${message || ''}</span>`;
+      html += '</div>';
+
+      if (isExpanded) {
+        html += '<div class="dependency-panel-content">';
+
+        // 执行批次信息
+        if (batches.length > 0) {
+          html += '<div class="dependency-section">';
+          html += '<h4 class="dependency-section-title">执行批次</h4>';
+          html += '<div class="dependency-batches">';
+          batches.forEach(batch => {
+            html += `<div class="dependency-batch">`;
+            html += `<span class="batch-label">批次 ${batch.batchIndex + 1}</span>`;
+            html += `<span class="batch-tasks">${batch.taskIds.length} 个任务并行</span>`;
+            html += '</div>';
+          });
+          html += '</div>';
+          html += '</div>';
+        }
+
+        // 关键路径
+        if (criticalPath.length > 0) {
+          html += '<div class="dependency-section">';
+          html += '<h4 class="dependency-section-title">关键路径</h4>';
+          html += `<div class="dependency-path">${criticalPath.join(' → ')}</div>`;
+          html += '</div>';
+        }
+
+        // 文件冲突
+        if (conflicts.length > 0) {
+          html += '<div class="dependency-section">';
+          html += '<h4 class="dependency-section-title">文件冲突</h4>';
+          html += '<div class="dependency-conflicts">';
+          conflicts.forEach(conflict => {
+            html += `<div class="dependency-conflict">`;
+            html += `<span class="conflict-file">${conflict.file}</span>`;
+            html += `<span class="conflict-tasks">${conflict.taskIds.length} 个任务冲突</span>`;
+            html += '</div>';
+          });
+          html += '</div>';
+          html += '</div>';
+        }
+      }
+
+      html += '</div>';
+      html += '</div>';
+
+      return html;
+    }
+
     function renderThreadView(container) {
       if (threadMessages.length === 0) {
         container.innerHTML = '<div class="empty-state"><div class="empty-state-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M14 1a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4.414A2 2 0 0 0 3 11.586l-2 2V2a1 1 0 0 1 1-1h12zM2 0a2 2 0 0 0-2 2v12.793a.5.5 0 0 0 .854.353l2.853-2.853A1 1 0 0 1 4.414 12H14a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2H2z"/></svg></div><span class="empty-state-text">开始新对话</span><span class="empty-state-hint">输入任务描述，按 ⌘↵ 发送</span></div>';
         return;
       }
 
+      // 依赖分析面板（Thread面板特有）
+      let html = renderDependencyPanel();
+
       // 使用统一的消息列表渲染函数
-      let html = renderMessageList(threadMessages, {
+      html += renderMessageList(threadMessages, {
         tabType: 'thread',
         defaultCli: null, // Thread 面板没有默认 CLI
         toolPanelPrefix: 'tool-thread-',
