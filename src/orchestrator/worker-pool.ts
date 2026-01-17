@@ -11,6 +11,7 @@
  */
 
 import { EventEmitter } from 'events';
+import * as path from 'path';
 import { CLIAdapterFactory } from '../cli/adapter-factory';
 import { WorkerAgent } from './worker-agent';
 import { MessageBus, globalMessageBus } from './message-bus';
@@ -390,6 +391,7 @@ export class WorkerPool extends EventEmitter {
     if (conflictLocks.length > 0) {
       lockFiles = Array.from(new Set([...lockFiles, ...conflictLocks]));
     }
+    lockFiles = this.normalizeLockFiles(lockFiles);
     const abortSignal = options?.abortSignal;
 
     if (abortSignal?.aborted) {
@@ -913,8 +915,9 @@ export class WorkerPool extends EventEmitter {
 
     // 添加所有任务到图中
     for (const subTask of subTasks) {
+      const targetFiles = this.resolveTargetFilesForGraph(subTask);
       // ✅ 传递 targetFiles 参数以启用文件冲突检测
-      graph.addTask(subTask.id, subTask.description, subTask, subTask.targetFiles || []);
+      graph.addTask(subTask.id, subTask.description, subTask, targetFiles);
     }
 
     // 添加显式依赖关系
@@ -928,6 +931,11 @@ export class WorkerPool extends EventEmitter {
     const addedDeps = graph.addFileDependencies('sequential');
     if (addedDeps > 0) {
       console.log(`[WorkerPool] 检测到文件冲突，自动添加 ${addedDeps} 个依赖关系`);
+    }
+
+    const unknownTaskIds = this.addUnknownTargetDependencies(graph, subTasks);
+    if (unknownTaskIds.length > 1) {
+      console.log(`[WorkerPool] 目标文件未知的子任务已强制串行: ${unknownTaskIds.join(', ')}`);
     }
 
     for (const subTask of subTasks) {
@@ -953,6 +961,7 @@ export class WorkerPool extends EventEmitter {
       taskId,
       analysis,
       mermaid: graph.toMermaid(),
+      unknownTaskIds,
     });
 
     // 按批次执行任务
@@ -1056,6 +1065,69 @@ export class WorkerPool extends EventEmitter {
     return [...new Set(matches)];
   }
 
+  private normalizeLockFiles(files: string[]): string[] {
+    const normalized: string[] = [];
+    for (const file of files) {
+      if (!file) continue;
+      if (file.startsWith('__domain:')) {
+        normalized.push(file);
+        continue;
+      }
+      const trimmed = file.trim();
+      if (!trimmed) continue;
+      const resolved = this.workspacePath
+        ? path.normalize(path.isAbsolute(trimmed) ? trimmed : path.join(this.workspacePath, trimmed))
+        : path.normalize(trimmed);
+      normalized.push(resolved);
+    }
+    return Array.from(new Set(normalized)).sort();
+  }
+
+  private normalizeTargetFilesForGraph(files?: string[]): string[] | undefined {
+    if (!files || files.length === 0) return undefined;
+    const normalized = files
+      .map(file => file.trim())
+      .filter(Boolean)
+      .map(file => {
+        if (!this.workspacePath) {
+          return path.normalize(file);
+        }
+        const absolute = path.isAbsolute(file) ? file : path.join(this.workspacePath, file);
+        const normalizedPath = path.normalize(absolute);
+        return path.relative(this.workspacePath, normalizedPath) || file;
+      });
+    return Array.from(new Set(normalized)).sort();
+  }
+
+  private resolveTargetFilesForGraph(subTask: SubTask): string[] | undefined {
+    const declared = (subTask.targetFiles || []).filter(Boolean);
+    const inferred = declared.length > 0 ? [] : this.inferLockFiles(subTask);
+    const combined = declared.length > 0 ? declared : inferred;
+    return this.normalizeTargetFilesForGraph(combined);
+  }
+
+  private addUnknownTargetDependencies(graph: TaskDependencyGraph, subTasks: SubTask[]): string[] {
+    const unknownTaskIds = subTasks
+      .filter(subTask => {
+        const declared = (subTask.targetFiles || []).filter(Boolean);
+        if (declared.length > 0) return false;
+        const inferred = this.inferLockFiles(subTask);
+        return inferred.length === 0;
+      })
+      .map(subTask => subTask.id)
+      .sort();
+
+    if (unknownTaskIds.length <= 1) {
+      return unknownTaskIds;
+    }
+
+    for (let i = 1; i < unknownTaskIds.length; i += 1) {
+      graph.addDependency(unknownTaskIds[i], unknownTaskIds[i - 1]);
+    }
+
+    return unknownTaskIds;
+  }
+
   /**
    * 创建任务依赖图（供外部使用）
    */
@@ -1063,7 +1135,8 @@ export class WorkerPool extends EventEmitter {
     const graph = new TaskDependencyGraph();
 
     for (const subTask of subTasks) {
-      graph.addTask(subTask.id, subTask.description, subTask);
+      const targetFiles = this.resolveTargetFilesForGraph(subTask);
+      graph.addTask(subTask.id, subTask.description, subTask, targetFiles);
     }
 
     for (const subTask of subTasks) {
@@ -1072,6 +1145,8 @@ export class WorkerPool extends EventEmitter {
       }
     }
 
+    graph.addFileDependencies('sequential');
+    this.addUnknownTargetDependencies(graph, subTasks);
     return graph;
   }
 

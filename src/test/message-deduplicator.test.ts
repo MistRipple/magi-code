@@ -5,6 +5,12 @@
 import { MessageDeduplicator } from '../normalizer/message-deduplicator';
 import { StandardMessage, MessageLifecycle, MessageType, MessageSource } from '../protocol';
 
+declare const describe: (name: string, fn: () => void) => void;
+declare const test: (name: string, fn: () => void | Promise<void>) => void;
+declare const beforeEach: (fn: () => void) => void;
+declare const afterEach: (fn: () => void) => void;
+declare const expect: any;
+
 function createTestMessage(
   id: string,
   lifecycle: MessageLifecycle,
@@ -18,7 +24,7 @@ function createTestMessage(
     cli: 'claude',
     lifecycle,
     blocks: [],
-    metadata: { priority: 0, tags: [] },
+    metadata: { extra: { priority: 0, tags: [] } },
     timestamp: Date.now(),
     updatedAt: Date.now(),
   };

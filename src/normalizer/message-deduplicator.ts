@@ -14,7 +14,7 @@
  * - 不同 source 的消息严格隔离
  */
 
-import { StandardMessage, MessageLifecycle, MessageSource } from '../protocol';
+import { StandardMessage, MessageLifecycle, MessageSource, StreamUpdate } from '../protocol';
 
 /** 消息状态 */
 interface MessageState {
@@ -59,6 +59,8 @@ export class MessageDeduplicator {
   private messageStates: Map<string, MessageState> = new Map();
   /** 按 source 分组的消息 ID 列表 */
   private messagesBySource: Map<MessageSource, string[]> = new Map();
+  /** 仅更新时的时间戳缓存（用于缺少完整 message 的 StreamUpdate） */
+  private streamUpdateTimes: Map<string, number> = new Map();
 
   constructor(config?: Partial<DeduplicationConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -120,6 +122,31 @@ export class MessageDeduplicator {
     }
 
     // 默认：发送
+    return true;
+  }
+
+  /**
+   * 处理流式更新（缺少完整 message 的场景）
+   */
+  shouldSendUpdate(update: StreamUpdate): boolean {
+    if (!this.config.enabled) {
+      return true;
+    }
+
+    const now = Date.now();
+    const state = this.messageStates.get(update.messageId);
+    const lastStreamAt = state?.lastStreamAt ?? this.streamUpdateTimes.get(update.messageId) ?? 0;
+
+    if (now - lastStreamAt < this.config.minStreamInterval) {
+      return false;
+    }
+
+    if (state) {
+      state.lastStreamAt = now;
+    } else {
+      this.streamUpdateTimes.set(update.messageId, now);
+    }
+
     return true;
   }
 
@@ -202,6 +229,7 @@ export class MessageDeduplicator {
     // 删除过期消息
     for (const id of toDelete) {
       this.messageStates.delete(id);
+      this.streamUpdateTimes.delete(id);
       // 从 source 分组中删除
       for (const ids of this.messagesBySource.values()) {
         const index = ids.indexOf(id);
@@ -222,6 +250,7 @@ export class MessageDeduplicator {
 
       for (const id of oldestIds) {
         this.messageStates.delete(id);
+        this.streamUpdateTimes.delete(id);
       }
     }
   }
@@ -249,6 +278,7 @@ export class MessageDeduplicator {
   reset(): void {
     this.messageStates.clear();
     this.messagesBySource.clear();
+    this.streamUpdateTimes.clear();
   }
 
   /**
