@@ -2152,10 +2152,34 @@
               </select>
             </div>
             <div class="profile-category-row">
+              <span class="profile-category-label">功能实现(implement)</span>
+              <select class="profile-category-select" data-category="implement">
+                <option value="claude">Claude</option>
+                <option value="codex" selected>Codex</option>
+                <option value="gemini">Gemini</option>
+              </select>
+            </div>
+            <div class="profile-category-row">
+              <span class="profile-category-label">代码重构(refactor)</span>
+              <select class="profile-category-select" data-category="refactor">
+                <option value="claude" selected>Claude</option>
+                <option value="codex">Codex</option>
+                <option value="gemini">Gemini</option>
+              </select>
+            </div>
+            <div class="profile-category-row">
               <span class="profile-category-label">缺陷修复(bugfix)</span>
               <select class="profile-category-select" data-category="bugfix">
                 <option value="claude">Claude</option>
                 <option value="codex" selected>Codex</option>
+                <option value="gemini">Gemini</option>
+              </select>
+            </div>
+            <div class="profile-category-row">
+              <span class="profile-category-label">问题排查(debug)</span>
+              <select class="profile-category-select" data-category="debug">
+                <option value="claude" selected>Claude</option>
+                <option value="codex">Codex</option>
                 <option value="gemini">Gemini</option>
               </select>
             </div>
@@ -2184,26 +2208,26 @@
               </select>
             </div>
             <div class="profile-category-row">
-              <span class="profile-category-label">文档编写(docs)</span>
-              <select class="profile-category-select" data-category="docs">
+              <span class="profile-category-label">文档编写(document)</span>
+              <select class="profile-category-select" data-category="document">
                 <option value="claude">Claude</option>
                 <option value="codex">Codex</option>
                 <option value="gemini" selected>Gemini</option>
               </select>
             </div>
             <div class="profile-category-row">
-              <span class="profile-category-label">集成联调(integration)</span>
-              <select class="profile-category-select" data-category="integration">
+              <span class="profile-category-label">代码审查(review)</span>
+              <select class="profile-category-select" data-category="review">
                 <option value="claude" selected>Claude</option>
                 <option value="codex">Codex</option>
                 <option value="gemini">Gemini</option>
               </select>
             </div>
             <div class="profile-category-row">
-              <span class="profile-category-label">简单任务(simple)</span>
-              <select class="profile-category-select" data-category="simple">
-                <option value="claude">Claude</option>
-                <option value="codex" selected>Codex</option>
+              <span class="profile-category-label">通用任务(general)</span>
+              <select class="profile-category-select" data-category="general">
+                <option value="claude" selected>Claude</option>
+                <option value="codex">Codex</option>
                 <option value="gemini">Gemini</option>
               </select>
             </div>
@@ -6985,13 +7009,16 @@
     // 分类配置缓存 - 与系统内置配置保持一致
     let categoryConfig = {
       architecture: 'claude',
+      implement: 'codex',
+      refactor: 'claude',
       bugfix: 'codex',
+      debug: 'claude',
       frontend: 'gemini',
       backend: 'claude',
       test: 'codex',
-      docs: 'gemini',
-      integration: 'claude',
-      simple: 'codex'
+      document: 'gemini',
+      review: 'claude',
+      general: 'claude'
     };
 
     // Worker Tab 切换
