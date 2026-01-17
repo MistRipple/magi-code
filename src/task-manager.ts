@@ -24,12 +24,26 @@ export class TaskManager {
 
   /** 创建新 Task */
   createTask(prompt: string): Task {
+    // 输入验证：确保 prompt 有效
+    if (!prompt || typeof prompt !== 'string') {
+      throw new Error('Prompt must be a non-empty string');
+    }
+
+    const trimmedPrompt = prompt.trim();
+    if (trimmedPrompt.length === 0) {
+      throw new Error('Prompt cannot be empty');
+    }
+
+    if (trimmedPrompt.length > 50000) {
+      throw new Error('Prompt too long (maximum 50000 characters)');
+    }
+
     const session = this.sessionManager.getOrCreateCurrentSession();
-    
+
     const task: Task = {
       id: generateId(),
       sessionId: session.id,
-      prompt,
+      prompt: trimmedPrompt,
       status: 'pending',
       subTasks: [],
       createdAt: Date.now(),
@@ -37,7 +51,7 @@ export class TaskManager {
 
     this.sessionManager.addTask(session.id, task);
     globalEventBus.emitEvent('task:created', { sessionId: session.id, taskId: task.id });
-    
+
     return task;
   }
 

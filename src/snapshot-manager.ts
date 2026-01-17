@@ -54,31 +54,49 @@ export class SnapshotManager {
       ? filePath
       : path.join(this.workspaceRoot, filePath);
 
+    // 安全检查：防止路径遍历攻击
+    const normalizedPath = path.normalize(absolutePath);
+    const normalizedRoot = path.normalize(this.workspaceRoot);
+    if (!normalizedPath.startsWith(normalizedRoot)) {
+      console.error(`[SnapshotManager] Path traversal detected: ${filePath}`);
+      throw new Error(`Path traversal detected: file must be within workspace`);
+    }
+
     const relativePath = path.relative(this.workspaceRoot, absolutePath);
 
-    // 检查是否已有该文件的快照
-    const existingSnapshot = this.sessionManager.getSnapshot(session.id, relativePath);
-    if (existingSnapshot) {
-      // 更新修改信息，但保留原始内容
-      const updatedMeta: FileSnapshotMeta = {
-        ...existingSnapshot,
-        lastModifiedBy: modifiedBy,
-        lastModifiedAt: Date.now(),
-        subTaskId,
-      };
-      this.sessionManager.addSnapshot(session.id, updatedMeta);
+    // 检查是否已有该文件的快照（同一 SubTask）
+    const existingSnapshot = session.snapshots.find(
+      s => s.filePath === relativePath && s.subTaskId === subTaskId
+    );
 
-      // 读取原始内容返回完整快照
+    if (existingSnapshot) {
+      // 同一 SubTask 重复创建快照，直接返回现有快照
       const snapshotFile = path.join(this.getSnapshotDir(session.id), `${existingSnapshot.id}.snapshot`);
       const originalContent = fs.existsSync(snapshotFile)
         ? fs.readFileSync(snapshotFile, 'utf-8')
         : '';
 
       return {
-        ...updatedMeta,
+        ...existingSnapshot,
         sessionId: session.id,
         originalContent,
       };
+    }
+
+    // 检查是否有其他 SubTask 已经创建了该文件的快照
+    const otherSnapshot = session.snapshots.find(
+      s => s.filePath === relativePath && s.subTaskId !== subTaskId
+    );
+
+    if (otherSnapshot) {
+      // 警告：多个 SubTask 修改同一文件，可能导致冲突
+      console.warn(
+        `[SnapshotManager] Multiple SubTasks modifying same file: ${relativePath}\n` +
+        `  Previous: ${otherSnapshot.subTaskId}\n` +
+        `  Current: ${subTaskId}\n` +
+        `  Consider using file locking to prevent conflicts.`
+      );
+      // 继续创建新快照，记录当前文件状态
     }
 
     // 读取原始文件内容
@@ -129,6 +147,14 @@ export class SnapshotManager {
     if (!snapshot) return false;
 
     const absolutePath = path.join(this.workspaceRoot, relativePath);
+
+    // 安全检查：防止路径遍历攻击
+    const normalizedPath = path.normalize(absolutePath);
+    const normalizedRoot = path.normalize(this.workspaceRoot);
+    if (!normalizedPath.startsWith(normalizedRoot)) {
+      console.error(`[SnapshotManager] Path traversal detected: ${filePath}`);
+      return false;
+    }
 
     // 读取快照内容
     const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);

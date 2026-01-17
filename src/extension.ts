@@ -77,11 +77,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // 注册命令
   registerCommands(context);
 
-  // 启动健康检查
-  cliDetector.startHealthCheck();
-  context.subscriptions.push({
-    dispose: () => cliDetector.stopHealthCheck()
-  });
+  // 启动健康检查（带错误处理）
+  try {
+    cliDetector.startHealthCheck();
+    context.subscriptions.push({
+      dispose: () => cliDetector.stopHealthCheck()
+    });
+  } catch (error) {
+    console.error('[Extension] Failed to start health check:', error);
+    vscode.window.showWarningMessage('MultiCLI: 健康检查启动失败，部分功能可能受限');
+  }
 
   console.log('MultiCLI 初始化完成');
 }
@@ -155,23 +160,38 @@ function registerCommands(context: vscode.ExtensionContext): void {
         vscode.window.showWarningMessage('MultiCLI: 面板未初始化');
         return;
       }
-      await webviewProvider.createNewSession();
-      vscode.window.showInformationMessage('MultiCLI: 新会话已创建');
+      try {
+        await webviewProvider.createNewSession();
+        vscode.window.showInformationMessage('MultiCLI: 新会话已创建');
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(`MultiCLI: 创建会话失败 - ${msg}`);
+      }
     })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('multiCli.showStatus', async () => {
-      const summary = await cliDetector.getStatusSummary();
-      vscode.window.showInformationMessage(
-        `MultiCLI: ${summary.available}/${summary.total} CLI 可用\n${summary.recommendation}`
-      );
+      try {
+        const summary = await cliDetector.getStatusSummary();
+        vscode.window.showInformationMessage(
+          `MultiCLI: ${summary.available}/${summary.total} CLI 可用\n${summary.recommendation}`
+        );
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(`MultiCLI: 获取状态失败 - ${msg}`);
+      }
     })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('multiCli.checkCLIs', async () => {
-      await detectAndNotifyCLIs();
+      try {
+        await detectAndNotifyCLIs();
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(`MultiCLI: CLI 检测失败 - ${msg}`);
+      }
     })
   );
 
