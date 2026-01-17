@@ -134,10 +134,7 @@ export class SessionManager extends EventEmitter {
       } else {
         args.push('--full-auto');
       }
-      // Codex 通过 --instructions 注入系统指令
-      if (systemPrompt) {
-        args.push('--instructions', systemPrompt);
-      }
+      // 注意：Codex 不支持 --instructions 参数，系统指令通过消息前缀注入
     }
     if (cli === 'gemini') {
       args.push('--output-format', 'stream-json');

@@ -294,7 +294,8 @@ export class WorkerAgent extends EventEmitter {
         workerType: this.type,
         taskId,
         subTaskId: subTask.id,
-        result: this.formatResultContent(subTask, response.content),
+        // 优先使用 content，如果为空则使用 raw
+        result: this.formatResultContent(subTask, response.content || response.raw),
         success: !response.error,
         duration: Date.now() - startTime,
         modifiedFiles: response.fileChanges?.map(f => f.filePath),

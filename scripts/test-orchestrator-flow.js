@@ -45,6 +45,9 @@ const { SessionManager } = require('../out/session-manager');
 const { SnapshotManager } = require('../out/snapshot-manager');
 const { IntelligentOrchestrator } = require('../out/orchestrator/intelligent-orchestrator');
 const { globalEventBus } = require('../out/events');
+const { ProfileLoader, GuidanceInjector } = require('../out/orchestrator/profile');
+const { CLISelector } = require('../out/task/cli-selector');
+const { TaskAnalyzer } = require('../out/task/task-analyzer');
 
 const workspaceRoot = process.cwd();
 
@@ -156,7 +159,7 @@ async function testEventBus() {
 async function testConfirmationCallback(orchestrator) {
   logSection('5. 确认回调机制测试');
 
-  orchestrator.setConfirmationCallback(async (plan, formattedPlan) => {
+  orchestrator.setConfirmationCallback(async (plan) => {
     log(`  收到计划确认请求: ${plan.summary?.substring(0, 50)}...`, 'yellow');
     return true; // 自动确认
   });
@@ -164,8 +167,119 @@ async function testConfirmationCallback(orchestrator) {
   logResult('确认回调设置', true);
 }
 
+// ============================================================================
+// 画像系统测试
+// ============================================================================
+
+async function testProfileSystem() {
+  logSection('6. 画像系统测试');
+
+  // 6.1 加载画像配置
+  const profileLoader = new ProfileLoader();
+  await profileLoader.load();
+
+  const profiles = profileLoader.getAllProfiles();
+  logResult('画像加载', profiles.size === 3, `加载了 ${profiles.size} 个 Worker 画像`);
+
+  // 显示各 Worker 画像信息
+  for (const [type, profile] of profiles) {
+    log(`  - ${type}: ${profile.displayName} (优先分类: ${profile.preferences.preferredCategories.slice(0, 3).join(', ')})`, 'blue');
+  }
+
+  // 6.2 加载分类配置
+  const categories = profileLoader.getAllCategories();
+  logResult('分类加载', categories.size >= 8, `加载了 ${categories.size} 个任务分类`);
+
+  // 显示分类信息
+  for (const [name, config] of categories) {
+    log(`  - ${name}: ${config.displayName || name} -> ${config.defaultWorker}`, 'blue');
+  }
+
+  // 6.3 测试任务分析器
+  const taskAnalyzer = new TaskAnalyzer();
+  taskAnalyzer.setProfileLoader(profileLoader);
+  logResult('TaskAnalyzer 集成', true, '已设置 ProfileLoader');
+
+  // 6.4 测试 CLI 选择器
+  const cliSelector = new CLISelector();
+  cliSelector.setProfileLoader(profileLoader);
+  logResult('CLISelector 集成', true, '已设置 ProfileLoader');
+
+  // 6.5 测试引导注入器
+  const guidanceInjector = new GuidanceInjector();
+  logResult('GuidanceInjector 创建', true);
+
+  return { profileLoader, taskAnalyzer, cliSelector, guidanceInjector };
+}
+
+async function testProfileBasedWorkerSelection(profileSystem) {
+  logSection('7. 画像驱动的 Worker 选择测试');
+
+  const { profileLoader, cliSelector } = profileSystem;
+
+  // 测试用例：不同类型任务应该分配给不同的 Worker
+  const testCases = [
+    { desc: '重构 UserService 类，提取公共方法', expectedWorker: 'claude', expectedCategory: 'architecture' },
+    { desc: '修复登录页面的表单验证错误', expectedWorker: 'codex', expectedCategory: 'bugfix' },
+    { desc: '实现用户认证 API 服务和数据库操作', expectedWorker: 'claude', expectedCategory: 'backend' },
+    { desc: '编写项目 README 文档说明', expectedWorker: 'gemini', expectedCategory: 'docs' },
+    { desc: '为 PaymentService 编写单元测试', expectedWorker: 'codex', expectedCategory: 'test' },
+    { desc: '实现用户界面 UI 组件和页面样式', expectedWorker: 'gemini', expectedCategory: 'frontend' },
+  ];
+
+  let passed = 0;
+  let failed = 0;
+
+  for (const tc of testCases) {
+    const selection = cliSelector.selectByDescription(tc.desc);
+    const workerMatch = selection.worker === tc.expectedWorker;
+    const categoryMatch = selection.category === tc.expectedCategory;
+    const success = workerMatch && categoryMatch;
+
+    if (success) {
+      passed++;
+      log(`  ✅ "${tc.desc.substring(0, 30)}..." -> ${selection.worker} (${selection.category})`, 'green');
+    } else {
+      failed++;
+      log(`  ❌ "${tc.desc.substring(0, 30)}..."`, 'red');
+      log(`     期望: ${tc.expectedWorker}/${tc.expectedCategory}, 实际: ${selection.worker}/${selection.category}`, 'red');
+    }
+  }
+
+  logResult('Worker 选择测试', failed === 0, `${passed}/${testCases.length} 通过`);
+  return { passed, failed, total: testCases.length };
+}
+
+async function testGuidancePromptGeneration(profileSystem) {
+  logSection('8. 画像引导 Prompt 生成测试');
+
+  const { profileLoader, guidanceInjector } = profileSystem;
+
+  // 测试为不同 Worker 生成引导 Prompt
+  const workers = ['claude', 'codex', 'gemini'];
+
+  for (const workerType of workers) {
+    const profile = profileLoader.getProfile(workerType);
+    const context = {
+      taskDescription: '实现用户登录功能',
+      targetFiles: ['src/auth/login.ts'],
+      category: 'backend',
+    };
+
+    const prompt = guidanceInjector.buildWorkerPrompt(profile, context);
+    const hasRole = prompt.includes('角色定位');
+    const hasFocus = prompt.includes('专注领域');
+
+    logResult(`${workerType} 引导 Prompt`, hasRole && hasFocus, `${prompt.length} 字符`);
+
+    // 显示 Prompt 预览
+    const preview = prompt.split('\n').slice(0, 3).join(' ').substring(0, 80);
+    log(`  预览: ${preview}...`, 'blue');
+  }
+}
+
 async function testSimpleExecution(orchestrator, cliAvailable) {
-  logSection('6. 简单任务执行测试');
+  logSection('9. 简单任务执行测试');
 
   if (!cliAvailable.claude) {
     log('⚠️  跳过执行测试：Claude CLI 未安装', 'yellow');
@@ -202,7 +316,7 @@ async function testSimpleExecution(orchestrator, cliAvailable) {
 }
 
 async function runAllTests() {
-  log('\n🚀 开始测试主 Claude + 多端 CLI 代理流程\n', 'cyan');
+  log('\n🚀 开始测试主 Claude + 多端 CLI 代理流程（含画像系统）\n', 'cyan');
 
   const startTime = Date.now();
   let passed = 0;
@@ -229,7 +343,23 @@ async function runAllTests() {
     await testConfirmationCallback(orchestrator);
     passed++;
 
-    // 6. 简单执行测试（可选，需要 Claude CLI）
+    // 6. 画像系统测试
+    const profileSystem = await testProfileSystem();
+    passed++;
+
+    // 7. 画像驱动的 Worker 选择测试
+    const selectionResult = await testProfileBasedWorkerSelection(profileSystem);
+    if (selectionResult.failed === 0) {
+      passed++;
+    } else {
+      failed++;
+    }
+
+    // 8. 画像引导 Prompt 生成测试
+    await testGuidancePromptGeneration(profileSystem);
+    passed++;
+
+    // 9. 简单执行测试（可选，需要 Claude CLI）
     await testSimpleExecution(orchestrator, cliAvailable);
     passed++;
 
