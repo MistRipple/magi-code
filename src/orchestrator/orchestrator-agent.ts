@@ -120,7 +120,7 @@ export type RecoveryConfirmationCallback = (
   options: { retry: boolean; rollback: boolean }
 ) => Promise<'retry' | 'rollback' | 'continue'>;
 
-/** 🆕 需求澄清回调类型 */
+/** 需求澄清回调类型 */
 export type ClarificationCallback = (
   questions: string[],
   context: string,
@@ -128,7 +128,7 @@ export type ClarificationCallback = (
   originalPrompt: string
 ) => Promise<{ answers: Record<string, string>; additionalInfo?: string } | null>;
 
-/** 🆕 Worker 疑问回调类型 */
+/** Worker 疑问回调类型 */
 export type WorkerQuestionCallback = (
   workerId: string,
   question: string,
@@ -136,7 +136,7 @@ export type WorkerQuestionCallback = (
   options?: string[]
 ) => Promise<string | null>;
 
-/** 🆕 需求模糊度评估结果 */
+/** 需求模糊度评估结果 */
 export interface AmbiguityAssessment {
   score: number;              // 0-100，越高越模糊
   isAmbiguous: boolean;       // 是否需要澄清
@@ -221,12 +221,12 @@ export class OrchestratorAgent extends EventEmitter {
   private strategyConfig: StrategyConfig;
   private permissions: PermissionMatrix;
 
-  // 🆕 Worker 画像系统
+  // Worker 画像系统
   private profileLoader: ProfileLoader | null = null;
-  // 🆕 统一策略引擎
+  // 统一策略引擎
   private policyEngine: PolicyEngine | null = null;
 
-  // 🆕 Intent Gate - 意图门控
+  // Intent Gate - 意图门控
   private intentGate: IntentGate;
 
   private _state: OrchestratorState = 'idle';
@@ -234,9 +234,9 @@ export class OrchestratorAgent extends EventEmitter {
   private confirmationCallback: ConfirmationCallback | null = null;
   private questionCallback: QuestionCallback | null = null;
   private recoveryConfirmationCallback: RecoveryConfirmationCallback | null = null;
-  private clarificationCallback: ClarificationCallback | null = null;  // 🆕 需求澄清回调
-  private workerQuestionCallback: WorkerQuestionCallback | null = null; // 🆕 Worker 疑问回调
-  private pendingWorkerQuestions: Map<string, { resolve: (answer: string) => void; reject: (error: Error) => void }> = new Map(); // 🆕 待回答的 Worker 问题
+  private clarificationCallback: ClarificationCallback | null = null;  // 需求澄清回调
+  private workerQuestionCallback: WorkerQuestionCallback | null = null; // Worker 疑问回调
+  private pendingWorkerQuestions: Map<string, { resolve: (answer: string) => void; reject: (error: Error) => void }> = new Map(); // 待回答的 Worker 问题
   private planConfirmationPolicy: ((risk: TaskContext['risk'] | null) => boolean) | null = null;
   private abortController: AbortController | null = null;
   private unsubscribers: Array<() => void> = [];
@@ -293,7 +293,7 @@ export class OrchestratorAgent extends EventEmitter {
     this.strategyConfig = this.resolveStrategyConfig();
     this.permissions = this.resolvePermissions();
 
-    // 🆕 初始化 Worker 画像系统
+    // 初始化 Worker 画像系统
     if (this.workspaceRoot) {
       this.profileLoader = new ProfileLoader(this.workspaceRoot);
       // 异步加载画像，不阻塞构造函数
@@ -301,14 +301,14 @@ export class OrchestratorAgent extends EventEmitter {
         console.warn('[OrchestratorAgent] ProfileLoader 加载失败:', err);
       });
 
-      // 🆕 创建 PolicyEngine 实例并注入 ProfileLoader
+      // 创建 PolicyEngine 实例并注入 ProfileLoader
       this.policyEngine = new PolicyEngine(this.profileLoader);
 
       // 将 ProfileLoader 注入到 CLISelector
       this.cliSelector.setProfileLoader(this.profileLoader);
     }
 
-    // 🆕 初始化 Intent Gate - 意图门控
+    // 初始化 Intent Gate - 意图门控
     this.intentGate = new IntentGate();
 
     // 创建 Worker Pool，集成执行统计和快照管理
@@ -320,7 +320,7 @@ export class OrchestratorAgent extends EventEmitter {
       enableFallback: true,
       snapshotManager: this.snapshotManager || undefined,
       permissions: this.permissions,
-      workspacePath: this.workspaceRoot, // 🆕 传递工作区路径，用于加载 Worker 画像
+      workspacePath: this.workspaceRoot, // 传递工作区路径，用于加载 Worker 画像
     });
 
     // 初始化验证组件
@@ -377,12 +377,12 @@ export class OrchestratorAgent extends EventEmitter {
     this.recoveryConfirmationCallback = callback;
   }
 
-  /** 🆕 设置需求澄清回调 */
+  /** 设置需求澄清回调 */
   setClarificationCallback(callback: ClarificationCallback): void {
     this.clarificationCallback = callback;
   }
 
-  /** 🆕 设置 Worker 疑问回调 */
+  /** 设置 Worker 疑问回调 */
   setWorkerQuestionCallback(callback: WorkerQuestionCallback): void {
     this.workerQuestionCallback = callback;
   }
@@ -416,7 +416,7 @@ export class OrchestratorAgent extends EventEmitter {
   async initialize(): Promise<void> {
     await this.workerPool.initialize();
 
-    // 🆕 将 ProfileLoader 设置给 CLISelector 和 TaskAnalyzer，实现画像驱动的任务分配
+    // 将 ProfileLoader 设置给 CLISelector 和 TaskAnalyzer，实现画像驱动的任务分配
     const profileLoader = this.workerPool.getProfileLoader();
     if (profileLoader) {
       this.cliSelector.setProfileLoader(profileLoader);
@@ -531,7 +531,7 @@ export class OrchestratorAgent extends EventEmitter {
         this.emitUIMessage('progress_update', `计划评审未通过: ${review.summary}`);
       }
 
-      // 🔧 修复：在 createPlan 完成后发送 plan_ready（用于 /plan 命令）
+      // 修复：在 createPlan 完成后发送 plan_ready（用于 /plan 命令）
       this.emitUIMessage('plan_ready', formattedPlan, {
         plan,
         planId: record.id,
@@ -628,7 +628,7 @@ export class OrchestratorAgent extends EventEmitter {
     });
     this.unsubscribers.push(unsubProgress);
 
-    // 🆕 监听 Worker 问题消息
+    // 监听 Worker 问题消息
     const unsubWorkerQuestion = this.messageBus.subscribe('worker_question', (msg) => {
       void this.handleWorkerQuestion(msg as WorkerQuestionMessage);
     });
@@ -636,7 +636,7 @@ export class OrchestratorAgent extends EventEmitter {
   }
 
   /**
-   * 🆕 处理 Worker 问题
+   * 处理 Worker 问题
    * 将问题转发给用户，并将回答返回给 Worker
    */
   private async handleWorkerQuestion(message: WorkerQuestionMessage): Promise<void> {
@@ -738,11 +738,11 @@ export class OrchestratorAgent extends EventEmitter {
   // =========================================================================
 
   // =========================================================================
-  // 🆕 Phase 0: 需求澄清机制
+  // Phase 0: 需求澄清机制
   // =========================================================================
 
   /**
-   * 🆕 评估需求模糊度
+   * 评估需求模糊度
    * 通过 Claude 分析用户需求的明确程度
    */
   private async assessAmbiguity(userPrompt: string): Promise<AmbiguityAssessment> {
@@ -815,7 +815,7 @@ ${userPrompt}
   }
 
   /**
-   * 🆕 执行需求澄清流程
+   * 执行需求澄清流程
    * 向用户提问并等待回答
    */
   private async clarifyRequirements(
@@ -913,7 +913,7 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     await this.ensureContext(contextSessionId, userPrompt);
 
     try {
-      // 🆕 Phase 0: Intent Gate - 意图门控
+      // Phase 0: Intent Gate - 意图门控
       // 核心原则：NEVER START IMPLEMENTING, UNLESS USER WANTS YOU TO IMPLEMENT SOMETHING EXPLICITLY
       const intentResult = this.intentGate.process(userPrompt);
       console.log(`[OrchestratorAgent] Intent Gate: ${intentResult.classification.type}, ` +
@@ -1569,7 +1569,7 @@ ${userPrompt}
         if (plan.analysis) {
           this.emitUIMessage('progress_update', `需求分析: ${plan.analysis}`);
         }
-        // 🔧 修复：不在 analyzeTask 中发送 plan_ready
+        // 修复：不在 analyzeTask 中发送 plan_ready
         // plan_ready 只在 createPlan() 完成后发送（用于 /plan 命令）
         // 正常执行流程通过 confirmationRequest 请求确认
       }
@@ -1628,7 +1628,7 @@ ${userPrompt}
         if (plan.analysis) {
           this.emitUIMessage('progress_update', `需求分析: ${plan.analysis}`);
         }
-        // 🔧 修复：不在 analyzeTask 中发送 plan_ready
+        // 修复：不在 analyzeTask 中发送 plan_ready
         // plan_ready 只在 createPlan() 完成后发送（用于 /plan 命令）
         // 正常执行流程通过 confirmationRequest 请求确认
       }
@@ -2835,10 +2835,10 @@ ${userPrompt}
     const foregroundSubTasks = this.getForegroundSubTasks(plan);
     const backgroundSubTasks = this.getBackgroundSubTasks(plan);
 
-    // 🆕 为任务分配冲突域（使用 plan 而非 subTasks）
+    // 为任务分配冲突域（使用 plan 而非 subTasks）
     this.assignConflictDomains(plan);
 
-    // 🆕 检测文件冲突
+    // 检测文件冲突
     const conflictResult = this.policyEngine
       ? this.policyEngine.detectConflicts(foregroundSubTasks)
       : { hasConflict: false, conflictingFiles: [], conflictingTasks: [] };
@@ -2886,7 +2886,7 @@ ${userPrompt}
       }
       await this.dispatchWithDependencyGraph(plan, foregroundSubTasks);
     } else if (conflictResult.hasConflict) {
-      // 🆕 有冲突时使用智能调度策略
+      // 有冲突时使用智能调度策略
       console.log('[OrchestratorAgent] 检测到文件冲突，使用智能调度策略');
       await this.dispatchWithConflictAwareness(dispatchSubTasks, plan, conflictResult);
     } else if (plan.executionMode === 'parallel') {
@@ -2897,7 +2897,7 @@ ${userPrompt}
 
   }
 
-  /** 🆕 冲突感知的任务分发 */
+  /** 冲突感知的任务分发 */
   private async dispatchWithConflictAwareness(
     subTasks: SubTask[],
     plan: ExecutionPlan,
@@ -3886,7 +3886,7 @@ ${userPrompt}
       .flatMap(r => r.modifiedFiles || [])
       .filter((f, i, arr) => arr.indexOf(f) === i); // 去重
 
-    // 🆕 使用 PolicyEngine 决定验证策略
+    // 使用 PolicyEngine 决定验证策略
     const riskAssessment = this.currentContext?.risk;
     let verificationDecision;
 

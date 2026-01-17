@@ -249,7 +249,7 @@ export class CLIDetector {
         availableCLIs: available,
         missingCLIs: missing,
         hasOrchestrator: true,
-        recommendation: '✅ 全功能模式：Claude(编排) + Codex(Bug修复) + Gemini(前端)',
+        recommendation: '全功能模式：Claude(编排) + Codex(Bug修复) + Gemini(前端)',
         canProceed: true,
         fallbackMap: {}
       };
@@ -262,7 +262,7 @@ export class CLIDetector {
         availableCLIs: available,
         missingCLIs: missing,
         hasOrchestrator: true,
-        recommendation: '⚡ Claude + Codex 模式：前端任务由 Claude 降级处理',
+        recommendation: 'Claude + Codex 模式：前端任务由 Claude 降级处理',
         canProceed: true,
         fallbackMap: { gemini: 'claude' }
       };
@@ -275,7 +275,7 @@ export class CLIDetector {
         availableCLIs: available,
         missingCLIs: missing,
         hasOrchestrator: true,
-        recommendation: '⚡ Claude + Gemini 模式：Bug修复由 Claude 降级处理',
+        recommendation: 'Claude + Gemini 模式：Bug修复由 Claude 降级处理',
         canProceed: true,
         fallbackMap: { codex: 'claude' }
       };
@@ -288,7 +288,7 @@ export class CLIDetector {
         availableCLIs: available,
         missingCLIs: missing,
         hasOrchestrator: true,
-        recommendation: '⚠️ 仅 Claude 模式：所有任务由 Claude 独立完成',
+        recommendation: '仅 Claude 模式：所有任务由 Claude 独立完成',
         canProceed: true,
         fallbackMap: { codex: 'claude', gemini: 'claude' }
       };
@@ -301,7 +301,7 @@ export class CLIDetector {
         availableCLIs: available,
         missingCLIs: missing,
         hasOrchestrator: false,
-        recommendation: '⚠️ 简单模式：无智能编排，仅基于关键词分配任务',
+        recommendation: '简单模式：无智能编排，仅基于关键词分配任务',
         canProceed: true,
         fallbackMap: { claude: 'codex' }  // 架构任务勉强由 Codex 处理
       };
@@ -314,7 +314,7 @@ export class CLIDetector {
         availableCLIs: available,
         missingCLIs: missing,
         hasOrchestrator: false,
-        recommendation: '⚠️ 仅 Codex 模式：仅适合 Bug 修复类任务',
+        recommendation: '仅 Codex 模式：仅适合 Bug 修复类任务',
         canProceed: true,
         fallbackMap: { claude: 'codex', gemini: 'codex' }
       };
@@ -327,7 +327,7 @@ export class CLIDetector {
         availableCLIs: available,
         missingCLIs: missing,
         hasOrchestrator: false,
-        recommendation: '⚠️ 仅 Gemini 模式：仅适合前端类任务',
+        recommendation: '仅 Gemini 模式：仅适合前端类任务',
         canProceed: true,
         fallbackMap: { claude: 'gemini', codex: 'gemini' }
       };
@@ -339,7 +339,7 @@ export class CLIDetector {
       availableCLIs: available,
       missingCLIs: missing,
       hasOrchestrator: false,
-      recommendation: '❌ 无可用 CLI，请至少安装一个 CLI 工具',
+      recommendation: '无可用 CLI，请至少安装一个 CLI 工具',
       canProceed: false,
       fallbackMap: {}
     };

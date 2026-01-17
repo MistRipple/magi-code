@@ -2,7 +2,7 @@
  * PolicyEngine - 统一策略引擎
  * 集中管理所有策略决策：CLI选择、风险评估、验证策略、冲突检测等
  *
- * 🆕 v0.7.0: 集成 ProfileLoader，移除硬编码的任务映射
+ * v0.7.0: 集成 ProfileLoader，移除硬编码的任务映射
  */
 
 import { EventEmitter } from 'events';
@@ -88,14 +88,14 @@ const FILE_TYPE_MAPPING: Record<string, string> = {
 
 /**
  * 统一策略引擎
- * 🆕 集成 ProfileLoader，从配置读取任务分类和 CLI 映射
+ * 集成 ProfileLoader，从配置读取任务分类和 CLI 映射
  */
 export class PolicyEngine extends EventEmitter {
   private riskPolicy: RiskPolicy;
   private cliHealthStatus: Map<CLIType, CLIHealthStatus> = new Map();
   private executionHistory: Array<{ cli: CLIType; success: boolean; duration: number }> = [];
 
-  /** 🆕 画像加载器 */
+  /** 画像加载器 */
   private profileLoader?: ProfileLoader;
 
   constructor(profileLoader?: ProfileLoader) {
@@ -106,7 +106,7 @@ export class PolicyEngine extends EventEmitter {
   }
 
   /**
-   * 🆕 设置画像加载器（支持延迟注入）
+   * 设置画像加载器（支持延迟注入）
    */
   setProfileLoader(loader: ProfileLoader): void {
     this.profileLoader = loader;
@@ -129,13 +129,13 @@ export class PolicyEngine extends EventEmitter {
 
   /**
    * 根据任务特征选择最佳 CLI
-   * 🆕 从 ProfileLoader 读取任务分类配置
+   * 从 ProfileLoader 读取任务分类配置
    */
   selectCLI(task: SubTask, availableClis?: CLIType[]): CLISelectionPolicy {
     const available = availableClis || this.getAvailableCLIs();
     const taskType = this.inferTaskType(task);
 
-    // 🆕 从 ProfileLoader 获取该分类的推荐 CLI
+    // 从 ProfileLoader 获取该分类的推荐 CLI
     const preferredClis = this.getPreferredCLIsForCategory(taskType);
 
     // 过滤出可用的 CLI
@@ -164,7 +164,7 @@ export class PolicyEngine extends EventEmitter {
   }
 
   /**
-   * 🆕 从 ProfileLoader 获取分类的推荐 CLI 列表
+   * 从 ProfileLoader 获取分类的推荐 CLI 列表
    */
   private getPreferredCLIsForCategory(category: string): CLIType[] {
     if (!this.profileLoader) {
@@ -193,7 +193,7 @@ export class PolicyEngine extends EventEmitter {
   }
 
   /** 推断任务类型
-   * 🆕 使用 ProfileLoader 的分类配置进行关键词匹配
+   * 使用 ProfileLoader 的分类配置进行关键词匹配
    */
   private inferTaskType(task: SubTask): string {
     const description = (task.description || '').toLowerCase();
@@ -201,7 +201,7 @@ export class PolicyEngine extends EventEmitter {
     const files = task.targetFiles || [];
     const combinedText = `${description} ${title}`;
 
-    // 🆕 使用 ProfileLoader 的分类配置
+    // 使用 ProfileLoader 的分类配置
     if (this.profileLoader) {
       const categories = this.profileLoader.getAllCategories();
       const rules = this.profileLoader.getCategoryRules();
@@ -273,7 +273,7 @@ export class PolicyEngine extends EventEmitter {
   }
 
   /** 计算置信度
-   * 🆕 基于 ProfileLoader 配置和健康状态
+   * 基于 ProfileLoader 配置和健康状态
    */
   private calculateConfidence(cli: CLIType, taskType: string): number {
     const health = this.cliHealthStatus.get(cli);

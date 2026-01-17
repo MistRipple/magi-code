@@ -106,9 +106,9 @@ export class VerificationRunner {
       result.compileResult = await this.runCommand(this.config.compileCommand, '编译');
       if (!result.compileResult.success) {
         result.success = false;
-        summaryParts.push(`❌ 编译失败: ${result.compileResult.error || '未知错误'}`);
+        summaryParts.push(`编译失败: ${result.compileResult.error || '未知错误'}`);
       } else {
-        summaryParts.push('✅ 编译通过');
+        summaryParts.push('编译通过');
       }
     }
 
@@ -118,12 +118,12 @@ export class VerificationRunner {
       result.ideResult = await this.runIDEDiagnostics(modifiedFiles);
       if (!result.ideResult.success) {
         result.success = false;
-        summaryParts.push(`❌ IDE 诊断: ${result.ideResult.errors} 个错误`);
+        summaryParts.push(`IDE 诊断: ${result.ideResult.errors} 个错误`);
       } else {
         const warningText = result.ideResult.warnings > 0 
           ? ` (${result.ideResult.warnings} 个警告)` 
           : '';
-        summaryParts.push(`✅ IDE 诊断通过${warningText}`);
+        summaryParts.push(`IDE 诊断通过${warningText}`);
       }
     }
 
@@ -133,9 +133,9 @@ export class VerificationRunner {
       result.lintResult = await this.runCommand(this.config.lintCommand, 'Lint');
       if (!result.lintResult.success) {
         result.success = false;
-        summaryParts.push(`❌ Lint 失败: ${result.lintResult.error || '未知错误'}`);
+        summaryParts.push(`Lint 失败: ${result.lintResult.error || '未知错误'}`);
       } else {
-        summaryParts.push('✅ Lint 通过');
+        summaryParts.push('Lint 通过');
       }
     }
 
@@ -145,9 +145,9 @@ export class VerificationRunner {
       result.testResult = await this.runCommand(this.config.testCommand, '测试');
       if (!result.testResult.success) {
         result.success = false;
-        summaryParts.push(`❌ 测试失败: ${result.testResult.error || '未知错误'}`);
+        summaryParts.push(`测试失败: ${result.testResult.error || '未知错误'}`);
       } else {
-        summaryParts.push('✅ 测试通过');
+        summaryParts.push('测试通过');
       }
     }
 

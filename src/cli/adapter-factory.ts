@@ -2,7 +2,7 @@
  * CLI 适配器工厂
  * 统一管理和创建 CLI 适配器实例
  *
- * 🆕 集成 Normalizer 层，输出标准化消息
+ * 集成 Normalizer 层，输出标准化消息
  */
 
 import { EventEmitter } from 'events';
@@ -55,7 +55,7 @@ export interface AdapterOutputScope {
  * CLI 适配器工厂
  * 提供统一的适配器创建、管理和事件转发
  *
- * 🆕 集成 Normalizer 层，输出标准化消息
+ * 集成 Normalizer 层，输出标准化消息
  */
 export class CLIAdapterFactory extends EventEmitter {
   private adapters: Map<CLIType, ICLIAdapter> = new Map();
@@ -65,7 +65,7 @@ export class CLIAdapterFactory extends EventEmitter {
   private outputScopes: Map<string, AdapterOutputScope> = new Map();
   private outputMuteCounts: Map<string, number> = new Map();
 
-  // 🆕 Normalizer 管理
+  // Normalizer 管理
   private normalizers: Map<string, BaseNormalizer> = new Map();
   private activeMessageIds: Map<string, string> = new Map(); // scopeKey -> messageId
   private traceIdCounter = 0;
@@ -84,18 +84,18 @@ export class CLIAdapterFactory extends EventEmitter {
       globalEventBus.emitEvent('cli:session_event', { data: event });
     });
 
-    // 🔧 监听 CLI 询问事件
+    // 监听 CLI 询问事件
     this.sessionManager.on('question', ({ cli, role, question }) => {
       this.emit('question', { type: cli, question, adapterRole: role });
     });
 
-    // 🔧 监听询问超时事件
+    // 监听询问超时事件
     this.sessionManager.on('questionTimeout', ({ cli, role, questionId }) => {
       this.emit('questionTimeout', { type: cli, questionId, adapterRole: role });
     });
   }
 
-  // 🆕 获取或创建 Normalizer
+  // 获取或创建 Normalizer
   private getOrCreateNormalizer(cli: CLIType, source: MessageSource): BaseNormalizer {
     const key = `${cli}:${source}`;
     let normalizer = this.normalizers.get(key);
@@ -129,7 +129,7 @@ export class CLIAdapterFactory extends EventEmitter {
     return normalizer;
   }
 
-  // 🆕 生成追踪 ID
+  // 生成追踪 ID
   private generateTraceId(): string {
     return `trace-${Date.now()}-${++this.traceIdCounter}`;
   }
@@ -143,7 +143,7 @@ export class CLIAdapterFactory extends EventEmitter {
 
   /**
    * 设置适配器事件转发
-   * 🆕 集成 Normalizer，将原始输出转换为标准消息
+   * 集成 Normalizer，将原始输出转换为标准消息
    */
   private setupAdapterEvents(adapter: ICLIAdapter, type: CLIType, role: AdapterRole): void {
     const suppressUI = role === 'orchestrator';
@@ -160,7 +160,7 @@ export class CLIAdapterFactory extends EventEmitter {
 
       const source: MessageSource = (scope?.source as MessageSource) || (role === 'orchestrator' ? 'orchestrator' : 'worker');
 
-      // 🆕 通过 Normalizer 处理原始输出
+      // 通过 Normalizer 处理原始输出
       const normalizer = this.getOrCreateNormalizer(type, source);
       let messageId = this.activeMessageIds.get(scopeKey);
 
@@ -174,7 +174,7 @@ export class CLIAdapterFactory extends EventEmitter {
       // 处理输出块
       normalizer.processChunk(messageId, chunk);
 
-      // 🔧 移除旧的 output 事件：Normalizer 已完整处理消息流
+      // 移除旧的 output 事件：Normalizer 已完整处理消息流
       // 保留 output 事件会导致消息重复发送，编排者消息错误地出现在 CLI 面板中
       // this.emit('output', { type, chunk, source: scope?.source, adapterRole: role });
     });
@@ -184,7 +184,7 @@ export class CLIAdapterFactory extends EventEmitter {
       const scope = this.outputScopes.get(scopeKey);
       const source: MessageSource = (scope?.source as MessageSource) || (role === 'orchestrator' ? 'orchestrator' : 'worker');
 
-      // 🆕 结束消息流
+      // 结束消息流
       const messageId = this.activeMessageIds.get(scopeKey);
       if (messageId) {
         const normalizer = this.getOrCreateNormalizer(type, source);
@@ -192,7 +192,7 @@ export class CLIAdapterFactory extends EventEmitter {
         this.activeMessageIds.delete(scopeKey);
       }
 
-      // 🔧 移除旧的 response 事件：Normalizer 已完整处理消息流
+      // 移除旧的 response 事件：Normalizer 已完整处理消息流
       // 保留 response 事件会导致消息重复发送
       // this.emit('response', { type, response, source: scope?.source, adapterRole: role });
     });
@@ -201,7 +201,7 @@ export class CLIAdapterFactory extends EventEmitter {
       const scopeKey = this.getScopeKey(type, role);
       const source: MessageSource = role === 'orchestrator' ? 'orchestrator' : 'worker';
 
-      // 🆕 错误时结束消息流
+      // 错误时结束消息流
       const messageId = this.activeMessageIds.get(scopeKey);
       if (messageId) {
         const normalizer = this.getOrCreateNormalizer(type, source);
@@ -360,7 +360,7 @@ export class CLIAdapterFactory extends EventEmitter {
       this.outputMuteCounts.set(scopeKey, count + 1);
     }
 
-    // 🔧 发送 start 事件，通知前端开始新的消息流
+    // 发送 start 事件，通知前端开始新的消息流
     // 这样前端可以强制结束当前流式消息，创建新消息
     if (options?.streamToUI !== false) {
       this.emit('streamStart', { type, source: scope?.source, adapterRole: role });
@@ -414,13 +414,13 @@ export class CLIAdapterFactory extends EventEmitter {
   /**
    * 向 CLI 面板发送编排者的消息
    * 让用户能看到编排者和代理之间的完整对话流
-   * 🔧 修复：添加 adapterRole 标识，确保消息被正确路由到 Thread 面板
+   * 修复：添加 adapterRole 标识，确保消息被正确路由到 Thread 面板
    */
   private emitOrchestratorMessage(type: CLIType, message: string): void {
     // 提取消息的关键信息，生成简洁的展示内容
     const summary = this.summarizeOrchestratorMessage(message);
 
-    // 🔧 修复：发送到 Thread 面板，而不是 CLI 面板
+    // 修复：发送到 Thread 面板，而不是 CLI 面板
     // 添加 adapterRole: 'orchestrator' 确保消息被正确路由
     this.emit('output', {
       type,

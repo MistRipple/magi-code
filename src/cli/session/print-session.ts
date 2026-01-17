@@ -154,7 +154,7 @@ export class PrintSession extends EventEmitter implements SessionProcess {
       });
       this.current = child;
 
-      // 🔧 不再立即关闭 stdin，保持打开以支持交互式询问
+      // 不再立即关闭 stdin，保持打开以支持交互式询问
       // if (child.stdin) {
       //   child.stdin.end();
       // }

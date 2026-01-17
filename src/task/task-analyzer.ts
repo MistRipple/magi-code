@@ -2,7 +2,7 @@
  * 任务分析器
  * 解析用户输入，识别任务类型、复杂度和目标文件
  *
- * 🆕 支持画像系统的分类配置扩展
+ * 支持画像系统的分类配置扩展
  */
 
 import { TaskCategory, CLIType } from '../types';
@@ -26,11 +26,11 @@ export interface TaskAnalysis {
   prompt: string;
   /** 是否为问答/咨询类请求（不需要执行任务） */
   isQuestion: boolean;
-  /** 🆕 风险等级（来自画像系统） */
+  /** 风险等级（来自画像系统） */
   riskLevel?: RiskLevel;
-  /** 🆕 推荐的 Worker（来自画像系统） */
+  /** 推荐的 Worker（来自画像系统） */
   recommendedWorker?: CLIType;
-  /** 🆕 匹配的关键词 */
+  /** 匹配的关键词 */
   matchedKeywords?: string[];
 }
 
@@ -58,10 +58,10 @@ const COMPLEXITY_INDICATORS = {
 
 /**
  * 任务分析器类
- * 🆕 支持画像系统的分类配置扩展
+ * 支持画像系统的分类配置扩展
  */
 export class TaskAnalyzer {
-  /** 🆕 画像加载器（可选） */
+  /** 画像加载器（可选） */
   private profileLoader?: ProfileLoader;
 
   /** 问答/咨询类关键词 */
@@ -81,7 +81,7 @@ export class TaskAnalyzer {
   ];
 
   /**
-   * 🆕 设置画像加载器
+   * 设置画像加载器
    */
   setProfileLoader(loader: ProfileLoader): void {
     this.profileLoader = loader;
@@ -89,7 +89,7 @@ export class TaskAnalyzer {
 
   /**
    * 分析用户输入
-   * 🆕 集成画像系统的分类配置
+   * 集成画像系统的分类配置
    */
   analyze(prompt: string): TaskAnalysis {
     const lowerPrompt = prompt.toLowerCase();
@@ -115,7 +115,7 @@ export class TaskAnalyzer {
     // 建议执行模式
     const suggestedMode = this.suggestMode(targetFiles, splittable);
 
-    // 🆕 从画像配置获取风险等级和推荐 Worker
+    // 从画像配置获取风险等级和推荐 Worker
     const riskLevel = categoryConfig?.riskLevel;
     const recommendedWorker = categoryConfig?.defaultWorker as CLIType | undefined;
 
@@ -135,7 +135,7 @@ export class TaskAnalyzer {
   }
 
   /**
-   * 🆕 使用画像系统检测分类
+   * 使用画像系统检测分类
    */
   private detectCategoryWithProfile(lowerPrompt: string): {
     category: TaskCategory;

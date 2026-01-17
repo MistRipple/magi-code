@@ -105,7 +105,7 @@ export function buildSummaryPrompt(
   }>
 ): string {
   const resultsText = executionResults
-    .map(r => `### ${r.cli} 执行结果 (${r.success ? '✅ 成功' : '❌ 失败'})
+    .map(r => `### ${r.cli} 执行结果 (${r.success ? '成功' : '失败'})
 **任务**: ${r.task}
 **输出**:
 ${r.result}
@@ -225,7 +225,7 @@ export function formatPlanForUser(plan: {
 
 **分析**: ${plan.analysis}
 
-⚠️ **这是一个简单任务，无需多模型协作。**
+**注意**: **这是一个简单任务，无需多模型协作。**
 原因: ${plan.skipReason || '任务复杂度较低'}
 
 ---
@@ -251,12 +251,12 @@ export function formatPlanForUser(plan: {
 ### 子任务列表
 ${tasksText}
 
-**执行模式**: ${plan.executionMode === 'parallel' ? '⚡ 并行执行（各 CLI 同时工作）' : '🔗 串行执行（按顺序依次执行）'}
+**执行模式**: ${plan.executionMode === 'parallel' ? '并行执行（各 CLI 同时工作）' : '串行执行（按顺序依次执行）'}
 
 **总结**: ${plan.summary}
 
 ---
-⚠️ **注意**: 各 CLI 将直接修改文件，拥有完整写入权限。
+**注意**: 各 CLI 将直接修改文件，拥有完整写入权限。
 
 **Shall I proceed with this plan? (Y/N)**
 请回复 **Y** 确认执行，或 **N** 取消/修改计划。`;
