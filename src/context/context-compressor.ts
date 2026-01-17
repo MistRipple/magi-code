@@ -380,8 +380,7 @@ export class ContextCompressor {
       const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/);
       if (!jsonMatch) {
         console.error('[ContextCompressor] 无法解析 LLM 响应');
-        this.aggressiveSimpleCompression(memory);
-        return true;
+        return false;
       }
 
       const compressed = JSON.parse(jsonMatch[1]);
@@ -391,9 +390,7 @@ export class ContextCompressor {
       return true;
     } catch (error) {
       console.error('[ContextCompressor] LLM 压缩失败:', error);
-      // 回退到激进简单压缩
-      this.aggressiveSimpleCompression(memory);
-      return true;
+      return false;
     }
   }
 

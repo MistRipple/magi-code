@@ -336,7 +336,21 @@ export class OrchestratorAgent extends EventEmitter {
     // 初始化上下文管理
     if (this.workspaceRoot) {
       this.contextManager = new ContextManager(this.workspaceRoot);
-      this.contextCompressor = new ContextCompressor();
+
+      // 创建 LLM 适配器用于智能压缩
+      const compressorAdapter = {
+        sendMessage: async (message: string): Promise<string> => {
+          const response = await this.cliFactory.sendMessage(
+            'claude',
+            message,
+            undefined,
+            { streamToUI: false, source: 'system', adapterRole: 'orchestrator' }
+          );
+          return response.content;
+        }
+      };
+
+      this.contextCompressor = new ContextCompressor(compressorAdapter);
     }
 
     this.setupMessageHandlers();
@@ -731,6 +745,25 @@ export class OrchestratorAgent extends EventEmitter {
         'progress_update',
         `CLI 降级: ${original} -> ${fallback}，原因: ${reason}`
       );
+    });
+
+    this.workerPool.on('dependencyAnalysis', ({ analysis, unknownTaskIds }) => {
+      const conflicts = (analysis?.fileConflicts || []) as Array<{ file: string; taskIds: string[] }>;
+      const conflictCount = conflicts.length;
+      const conflictFiles = conflicts.slice(0, 5).map(item => item.file).join(', ');
+      const unknownCount = Array.isArray(unknownTaskIds) ? unknownTaskIds.length : 0;
+      const parts: string[] = [`依赖分析: 文件冲突 ${conflictCount}`];
+      if (unknownCount > 1) {
+        parts.push(`目标文件未知任务串行 ${unknownCount}`);
+      }
+      if (conflictCount > 0 && conflictFiles) {
+        const suffix = conflicts.length > 5 ? ' ...' : '';
+        parts.push(`冲突文件: ${conflictFiles}${suffix}`);
+      }
+      globalEventBus.emitEvent('orchestrator:dependency_analysis', {
+        taskId: this.currentContext?.taskId,
+        data: { message: parts.join(' | ') },
+      });
     });
   }
 
