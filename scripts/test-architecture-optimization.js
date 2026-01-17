@@ -42,45 +42,16 @@ const { ConflictResolver } = require('../out/task/conflict-resolver');
 const { TaskDependencyGraph } = require('../out/orchestrator/task-dependency-graph');
 const { MessageDeduplicator } = require('../out/normalizer/message-deduplicator');
 const { MessageLifecycle, MessageType } = require('../out/protocol/message-protocol');
+const { TestRunner } = require('./test-utils');
 
 const workspaceRoot = process.cwd();
-
-// 颜色输出
-const colors = {
-  reset: '\x1b[0m',
-  green: '\x1b[32m',
-  red: '\x1b[31m',
-  yellow: '\x1b[33m',
-  blue: '\x1b[34m',
-  cyan: '\x1b[36m',
-  magenta: '\x1b[35m',
-};
-
-function log(msg, color = 'reset') {
-  console.log(`${colors[color]}${msg}${colors.reset}`);
-}
-
-function logSection(title) {
-  console.log('\n' + '='.repeat(80));
-  log(`  ${title}`, 'cyan');
-  console.log('='.repeat(80));
-}
-
-function logTest(name, passed, details = '') {
-  const symbol = passed ? '✅' : '❌';
-  const color = passed ? 'green' : 'red';
-  log(`${symbol} ${name}`, color);
-  if (details) {
-    console.log(`   ${details}`);
-  }
-}
 
 // ============================================================================
 // 阶段 1 测试: PolicyEngine 与 ProfileLoader 集成
 // ============================================================================
 
-async function testPhase1_PolicyEngineIntegration() {
-  logSection('阶段 1: PolicyEngine 与 ProfileLoader 集成测试');
+async function testPhase1_PolicyEngineIntegration(runner) {
+  runner.logSection('阶段 1: PolicyEngine 与 ProfileLoader 集成测试');
 
   const profileLoader = new ProfileLoader(workspaceRoot);
   await profileLoader.load();
@@ -97,13 +68,13 @@ async function testPhase1_PolicyEngineIntegration() {
 
     const strategy = policyEngine.decideExecutionStrategy(subTasks);
 
-    logTest(
+    runner.logTest(
       'PolicyEngine 使用 ProfileLoader 获取分类配置',
       strategy.parallel.length > 0 || strategy.serial.length > 0,
       `并行任务: ${strategy.parallel.length}, 串行任务: ${strategy.serial.length}`
     );
   } catch (error) {
-    logTest('PolicyEngine 集成 ProfileLoader', false, error.message);
+    runner.logTest('PolicyEngine 集成 ProfileLoader', false, error.message);
   }
 
   // 测试 1.2: PolicyEngine 实例化而非全局单例
@@ -111,26 +82,26 @@ async function testPhase1_PolicyEngineIntegration() {
     const engine1 = new PolicyEngine(profileLoader);
     const engine2 = new PolicyEngine(profileLoader);
 
-    logTest(
+    runner.logTest(
       'PolicyEngine 支持多实例',
       engine1 !== engine2,
       '两个实例应该独立存在'
     );
   } catch (error) {
-    logTest('PolicyEngine 多实例', false, error.message);
+    runner.logTest('PolicyEngine 多实例', false, error.message);
   }
 
   // 测试 1.3: 从 ProfileLoader 读取分类关键词
   try {
     const categoryConfig = profileLoader.getCategory('architecture');
 
-    logTest(
+    runner.logTest(
       'ProfileLoader 提供分类配置',
       categoryConfig && categoryConfig.keywords && categoryConfig.keywords.length > 0,
       `architecture 分类有 ${categoryConfig?.keywords?.length || 0} 个关键词`
     );
   } catch (error) {
-    logTest('ProfileLoader 分类配置', false, error.message);
+    runner.logTest('ProfileLoader 分类配置', false, error.message);
   }
 }
 
@@ -138,8 +109,8 @@ async function testPhase1_PolicyEngineIntegration() {
 // 阶段 2 测试: ConflictResolver 冲突解决机制
 // ============================================================================
 
-function testPhase2_ConflictResolution() {
-  logSection('阶段 2: ConflictResolver 冲突解决机制测试');
+function testPhase2_ConflictResolution(runner) {
+  runner.logSection('阶段 2: ConflictResolver 冲突解决机制测试');
 
   // 测试 2.1: 用户偏好优先级
   try {
@@ -152,13 +123,13 @@ function testPhase2_ConflictResolution() {
       availableClis: ['claude', 'codex', 'gemini'],
     });
 
-    logTest(
+    runner.logTest(
       'ConflictResolver 用户偏好优先 (Level 1)',
       result.cli === 'gemini' && result.level === 'user',
       `选择结果: ${result.cli}, 决策层级: ${result.level}, 原因: ${result.reason}`
     );
   } catch (error) {
-    logTest('用户偏好优先级', false, error.message);
+    runner.logTest('用户偏好优先级', false, error.message);
   }
 
   // 测试 2.2: 统计推荐优先级 (无用户偏好时)
@@ -186,13 +157,13 @@ function testPhase2_ConflictResolution() {
       availableClis: ['claude', 'codex', 'gemini'],
     });
 
-    logTest(
+    runner.logTest(
       'ConflictResolver 统计推荐优先 (Level 2)',
       result.cli === 'codex' && result.level === 'stats',
       `选择结果: ${result.cli}, 决策层级: ${result.level}`
     );
   } catch (error) {
-    logTest('统计推荐优先级', false, error.message);
+    runner.logTest('统计推荐优先级', false, error.message);
   }
 
   // 测试 2.3: 画像推荐优先级 (无用户偏好和统计时)
@@ -204,13 +175,13 @@ function testPhase2_ConflictResolution() {
       availableClis: ['claude', 'codex', 'gemini'],
     });
 
-    logTest(
+    runner.logTest(
       'ConflictResolver 画像推荐优先 (Level 3)',
       result.cli === 'claude' && result.level === 'profile',
       `选择结果: ${result.cli}, 决策层级: ${result.level}`
     );
   } catch (error) {
-    logTest('画像推荐优先级', false, error.message);
+    runner.logTest('画像推荐优先级', false, error.message);
   }
 
   // 测试 2.4: 默认值回退 (Level 4)
@@ -221,13 +192,13 @@ function testPhase2_ConflictResolution() {
       availableClis: ['claude'],
     });
 
-    logTest(
+    runner.logTest(
       'ConflictResolver 默认值回退 (Level 4)',
       result.cli === 'claude' && result.level === 'default',
       `选择结果: ${result.cli}, 决策层级: ${result.level}`
     );
   } catch (error) {
-    logTest('默认值回退', false, error.message);
+    runner.logTest('默认值回退', false, error.message);
   }
 
   // 测试 2.5: CLISelector 集成 ConflictResolver
@@ -240,13 +211,13 @@ function testPhase2_ConflictResolution() {
       'gemini' // 用户偏好
     );
 
-    logTest(
+    runner.logTest(
       'CLISelector 集成 ConflictResolver',
       selection.cli === 'gemini',
       `用户指定 gemini, 实际选择: ${selection.cli}, 原因: ${selection.reason}`
     );
   } catch (error) {
-    logTest('CLISelector 集成', false, error.message);
+    runner.logTest('CLISelector 集成', false, error.message);
   }
 }
 
@@ -254,8 +225,8 @@ function testPhase2_ConflictResolution() {
 // 阶段 3 测试: TaskDependencyGraph 文件依赖调度
 // ============================================================================
 
-function testPhase3_FileDependencyScheduling() {
-  logSection('阶段 3: TaskDependencyGraph 文件依赖调度测试');
+function testPhase3_FileDependencyScheduling(runner) {
+  runner.logSection('阶段 3: TaskDependencyGraph 文件依赖调度测试');
 
   // 测试 3.1: 添加带文件的任务节点
   try {
@@ -267,13 +238,13 @@ function testPhase3_FileDependencyScheduling() {
 
     const task1 = graph.getTask('task-1');
 
-    logTest(
+    runner.logTest(
       'TaskDependencyGraph 支持 targetFiles',
       task1 && task1.targetFiles && task1.targetFiles.length === 1,
       `task-1 目标文件: ${task1?.targetFiles?.join(', ')}`
     );
   } catch (error) {
-    logTest('支持 targetFiles', false, error.message);
+    runner.logTest('支持 targetFiles', false, error.message);
   }
 
   // 测试 3.2: 检测文件冲突
@@ -286,13 +257,13 @@ function testPhase3_FileDependencyScheduling() {
 
     const conflicts = graph.detectFileConflicts();
 
-    logTest(
+    runner.logTest(
       'TaskDependencyGraph 检测文件冲突',
       conflicts.length === 1 && conflicts[0].file === 'src/file.ts',
       `检测到 ${conflicts.length} 个冲突: ${conflicts.map(c => c.file).join(', ')}`
     );
   } catch (error) {
-    logTest('检测文件冲突', false, error.message);
+    runner.logTest('检测文件冲突', false, error.message);
   }
 
   // 测试 3.3: 自动添加文件依赖 (sequential 策略)
@@ -306,13 +277,13 @@ function testPhase3_FileDependencyScheduling() {
     const addedCount = graph.addFileDependencies('sequential');
 
     // 应该添加 2 个依赖: task-2 -> task-1, task-3 -> task-2 (按 ID 排序)
-    logTest(
+    runner.logTest(
       'TaskDependencyGraph 自动添加文件依赖',
       addedCount === 2,
       `添加了 ${addedCount} 个依赖关系`
     );
   } catch (error) {
-    logTest('自动添加文件依赖', false, error.message);
+    runner.logTest('自动添加文件依赖', false, error.message);
   }
 
   // 测试 3.4: 分析包含文件冲突信息
@@ -325,13 +296,13 @@ function testPhase3_FileDependencyScheduling() {
 
     const analysis = graph.analyze();
 
-    logTest(
+    runner.logTest(
       'DependencyAnalysis 包含文件冲突信息',
       analysis.fileConflicts && analysis.fileConflicts.length > 0,
       `文件冲突: ${analysis.fileConflicts?.length || 0} 个`
     );
   } catch (error) {
-    logTest('分析包含文件冲突', false, error.message);
+    runner.logTest('分析包含文件冲突', false, error.message);
   }
 
   // 测试 3.5: 获取文件的所有相关任务
@@ -344,13 +315,13 @@ function testPhase3_FileDependencyScheduling() {
 
     const tasks = graph.getTasksByFile('src/shared.ts');
 
-    logTest(
+    runner.logTest(
       'TaskDependencyGraph 获取文件相关任务',
       tasks.length === 2 && tasks.includes('task-1') && tasks.includes('task-2'),
       `src/shared.ts 相关任务: ${tasks.join(', ')}`
     );
   } catch (error) {
-    logTest('获取文件相关任务', false, error.message);
+    runner.logTest('获取文件相关任务', false, error.message);
   }
 }
 
@@ -358,8 +329,8 @@ function testPhase3_FileDependencyScheduling() {
 // 阶段 4 测试: MessageDeduplicator 消息去重
 // ============================================================================
 
-async function testPhase4_MessageDeduplication() {
-  logSection('阶段 4: MessageDeduplicator 消息去重测试');
+async function testPhase4_MessageDeduplication(runner) {
+  runner.logSection('阶段 4: MessageDeduplicator 消息去重测试');
 
   // 辅助函数: 创建测试消息
   function createMessage(id, lifecycle, source = 'worker') {
@@ -387,13 +358,13 @@ async function testPhase4_MessageDeduplication() {
     const shouldSend1 = deduplicator.shouldSend(msg1);
     const shouldSend2 = deduplicator.shouldSend(msg2);
 
-    logTest(
+    runner.logTest(
       'MessageDeduplicator STARTED 消息总是发送',
       shouldSend1 === true && shouldSend2 === true,
       `第一次: ${shouldSend1}, 第二次: ${shouldSend2}`
     );
   } catch (error) {
-    logTest('STARTED 消息总是发送', false, error.message);
+    runner.logTest('STARTED 消息总是发送', false, error.message);
   }
 
   // 测试 4.2: 已完成消息不再发送
@@ -408,13 +379,13 @@ async function testPhase4_MessageDeduplication() {
     deduplicator.shouldSend(msg2); // COMPLETED
     const shouldSend3 = deduplicator.shouldSend(msg3); // 尝试在完成后发送
 
-    logTest(
+    runner.logTest(
       'MessageDeduplicator 完成后消息不再发送',
       shouldSend3 === false,
       '完成后的 STREAMING 消息应该被跳过'
     );
   } catch (error) {
-    logTest('完成后消息不再发送', false, error.message);
+    runner.logTest('完成后消息不再发送', false, error.message);
   }
 
   // 测试 4.3: STREAMING 消息限制发送间隔
@@ -432,7 +403,7 @@ async function testPhase4_MessageDeduplication() {
     const shouldSend2 = deduplicator.shouldSend(msg2); // 第一次 STREAMING - 应该发送
     const shouldSend3 = deduplicator.shouldSend(msg3); // 立即发送第二次 - 应该被拒绝
 
-    logTest(
+    runner.logTest(
       'MessageDeduplicator STREAMING 消息限制间隔',
       shouldSend1 === true && shouldSend2 === true && shouldSend3 === false,
       `STARTED: ${shouldSend1}, 第一次 STREAMING: ${shouldSend2}, 立即第二次: ${shouldSend3}`
@@ -443,13 +414,13 @@ async function testPhase4_MessageDeduplication() {
     const msg4 = createMessage('msg-3', MessageLifecycle.STREAMING);
     const shouldSend4 = deduplicator.shouldSend(msg4);
 
-    logTest(
+    runner.logTest(
       'MessageDeduplicator 等待后可发送 STREAMING',
       shouldSend4 === true,
       '等待 100ms 后应该允许发送'
     );
   } catch (error) {
-    logTest('STREAMING 消息限制间隔', false, error.message);
+    runner.logTest('STREAMING 消息限制间隔', false, error.message);
   }
 
   // 测试 4.4: 不同 source 消息隔离
@@ -462,13 +433,13 @@ async function testPhase4_MessageDeduplication() {
     const shouldSend1 = deduplicator.shouldSend(msg1);
     const shouldSend2 = deduplicator.shouldSend(msg2);
 
-    logTest(
+    runner.logTest(
       'MessageDeduplicator 不同 source 消息隔离',
       shouldSend1 === true && shouldSend2 === true,
       'orchestrator 和 worker 的相同 ID 消息应该独立'
     );
   } catch (error) {
-    logTest('不同 source 消息隔离', false, error.message);
+    runner.logTest('不同 source 消息隔离', false, error.message);
   }
 
   // 测试 4.5: 按 source 获取消息
@@ -482,13 +453,13 @@ async function testPhase4_MessageDeduplication() {
     const orchestratorMessages = deduplicator.getMessagesBySource('orchestrator');
     const workerMessages = deduplicator.getMessagesBySource('worker');
 
-    logTest(
+    runner.logTest(
       'MessageDeduplicator 按 source 获取消息',
       orchestratorMessages.length === 2 && workerMessages.length === 1,
       `orchestrator: ${orchestratorMessages.length}, worker: ${workerMessages.length}`
     );
   } catch (error) {
-    logTest('按 source 获取消息', false, error.message);
+    runner.logTest('按 source 获取消息', false, error.message);
   }
 
   // 测试 4.6: 统计信息
@@ -501,13 +472,13 @@ async function testPhase4_MessageDeduplication() {
 
     const stats = deduplicator.getStats();
 
-    logTest(
+    runner.logTest(
       'MessageDeduplicator 统计信息',
       stats.totalMessages === 2 && stats.completedMessages === 1,
       `总消息: ${stats.totalMessages}, 已完成: ${stats.completedMessages}`
     );
   } catch (error) {
-    logTest('统计信息', false, error.message);
+    runner.logTest('统计信息', false, error.message);
   }
 
   // 测试 4.7: 禁用去重
@@ -522,13 +493,13 @@ async function testPhase4_MessageDeduplication() {
     const shouldSend2 = deduplicator.shouldSend(msg2);
     const shouldSend3 = deduplicator.shouldSend(msg3);
 
-    logTest(
+    runner.logTest(
       'MessageDeduplicator 禁用时总是发送',
       shouldSend1 && shouldSend2 && shouldSend3,
       '禁用去重后所有消息都应该发送'
     );
   } catch (error) {
-    logTest('禁用去重', false, error.message);
+    runner.logTest('禁用去重', false, error.message);
   }
 }
 
@@ -537,25 +508,19 @@ async function testPhase4_MessageDeduplication() {
 // ============================================================================
 
 async function runAllTests() {
-  console.log('\n');
-  log('━'.repeat(80), 'magenta');
-  log('  MultiCLI 架构优化综合测试', 'magenta');
-  log('━'.repeat(80), 'magenta');
+  const runner = new TestRunner('架构优化综合测试');
 
   try {
-    await testPhase1_PolicyEngineIntegration();
-    testPhase2_ConflictResolution();
-    testPhase3_FileDependencyScheduling();
-    await testPhase4_MessageDeduplication();
+    await testPhase1_PolicyEngineIntegration(runner);
+    testPhase2_ConflictResolution(runner);
+    testPhase3_FileDependencyScheduling(runner);
+    await testPhase4_MessageDeduplication(runner);
 
-    console.log('\n');
-    log('━'.repeat(80), 'magenta');
-    log('  测试完成!', 'green');
-    log('━'.repeat(80), 'magenta');
-    console.log('\n');
+    // 使用 TestRunner 的统一输出
+    process.exit(runner.finish());
+
   } catch (error) {
-    console.error('\n');
-    log('测试过程出错:', 'red');
+    runner.log(`\n❌ 测试失败: ${error.message}`, 'red');
     console.error(error);
     process.exit(1);
   }
