@@ -12,6 +12,7 @@ import { ClaudeAdapter } from './adapters/claude';
 import { CodexAdapter } from './adapters/codex';
 import { GeminiAdapter } from './adapters/gemini';
 import { SessionManager } from './session/session-manager';
+import type { CLIQuestion } from './session/print-session';
 import { globalEventBus } from '../events';
 import {
   createNormalizer,
@@ -21,6 +22,11 @@ import {
   StandardMessage,
   StreamUpdate,
   MessageSource,
+  MessageType,
+  MessageLifecycle,
+  InteractionType,
+  createInteractionMessage,
+  createStandardMessage,
 } from '../protocol';
 
 /** 适配器状态信息 */
@@ -35,7 +41,6 @@ export interface AdapterStatus {
 /** 工厂配置 */
 export interface FactoryConfig {
   cwd: string;
-  timeout?: number;
   idleTimeout?: number;
   maxTimeout?: number;
   maxOutputChars?: number;
@@ -85,14 +90,53 @@ export class CLIAdapterFactory extends EventEmitter {
       globalEventBus.emitEvent('cli:session_event', { data: event });
     });
 
-    // 监听 CLI 询问事件
-    this.sessionManager.on('question', ({ cli, role, question }) => {
-      this.emit('question', { type: cli, question, adapterRole: role });
+    // 监听 CLI 询问事件（标准消息）
+    this.sessionManager.on('question', ({
+      cli,
+      role,
+      question
+    }: {
+      cli: CLIType;
+      role: 'worker' | 'orchestrator';
+      question: CLIQuestion;
+    }) => {
+      const message = createInteractionMessage(
+        {
+          type: InteractionType.QUESTION,
+          requestId: question.questionId,
+          prompt: question.content,
+          required: true,
+          options: [{ value: 'answer', label: '请回答', isDefault: true }],
+        },
+        role === 'orchestrator' ? 'orchestrator' : 'worker',
+        cli,
+        this.generateTraceId(),
+        {
+          metadata: {
+            questionId: question.questionId,
+            questionPattern: question.pattern,
+            questionTimestamp: question.timestamp,
+            adapterRole: role,
+          }
+        }
+      );
+      this.emit('standardMessage', message);
+      this.emit('standardComplete', message);
     });
 
-    // 监听询问超时事件
+    // 监听询问超时事件（标准消息）
     this.sessionManager.on('questionTimeout', ({ cli, role, questionId }) => {
-      this.emit('questionTimeout', { type: cli, questionId, adapterRole: role });
+      const timeoutMessage = createStandardMessage({
+        type: MessageType.ERROR,
+        source: role === 'orchestrator' ? 'orchestrator' : 'worker',
+        cli,
+        traceId: this.generateTraceId(),
+        lifecycle: MessageLifecycle.FAILED,
+        blocks: [{ type: 'text', content: `CLI 询问超时: ${questionId}` }],
+        metadata: { questionId, adapterRole: role },
+      });
+      this.emit('standardMessage', timeoutMessage);
+      this.emit('standardComplete', timeoutMessage);
     });
   }
 
@@ -175,8 +219,7 @@ export class CLIAdapterFactory extends EventEmitter {
       // 处理输出块
       normalizer.processChunk(messageId, chunk);
 
-      // 移除旧的 output 事件：Normalizer 已完整处理消息流
-      // 保留 output 事件会导致消息重复发送，编排者消息错误地出现在 CLI 面板中
+      // Normalizer 统一处理消息流，避免重复发送
       // this.emit('output', { type, chunk, source: scope?.source, adapterRole: role });
     });
 
@@ -193,8 +236,7 @@ export class CLIAdapterFactory extends EventEmitter {
         this.activeMessageIds.delete(scopeKey);
       }
 
-      // 移除旧的 response 事件：Normalizer 已完整处理消息流
-      // 保留 response 事件会导致消息重复发送
+      // Normalizer 统一处理消息流，避免重复发送
       // this.emit('response', { type, response, source: scope?.source, adapterRole: role });
     });
 
@@ -361,11 +403,6 @@ export class CLIAdapterFactory extends EventEmitter {
       this.outputMuteCounts.set(scopeKey, count + 1);
     }
 
-    // 发送 start 事件，通知前端开始新的消息流
-    // 这样前端可以强制结束当前流式消息，创建新消息
-    if (options?.streamToUI !== false) {
-      this.emit('streamStart', { type, source: scope?.source, adapterRole: role });
-    }
 
     try {
       return adapter.sendMessage(message, imagePaths, options?.messageMeta);
@@ -416,7 +453,7 @@ export class CLIAdapterFactory extends EventEmitter {
    * 向 CLI 面板发送编排者的消息
    * 使用标准消息协议 (StandardMessage)
    *
-   * ✅ P2修复: 统一使用 standardMessage API,移除 legacy output 事件
+   * 统一使用 standardMessage API
    */
   private emitOrchestratorMessage(type: CLIType, message: string): void {
     // 提取消息的关键信息,生成简洁的展示内容
@@ -528,7 +565,6 @@ export class CLIAdapterFactory extends EventEmitter {
 
     const adapterConfig: Omit<AdapterConfig, 'type'> = {
       cwd: this.config.cwd,
-      timeout: this.config.timeout,
       idleTimeout: this.config.idleTimeout,
       maxTimeout: this.config.maxTimeout,
       env: this.config.env,

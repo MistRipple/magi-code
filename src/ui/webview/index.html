@@ -2320,8 +2320,7 @@
         };
     window.vscode = vscode;
 
-    // 🔧 marked v12 兼容性修复：配置 marked 基础选项
-    // 注意：highlight 选项在 marked v5+ 中已废弃，代码高亮通过自定义 renderer.code 处理
+    // marked 基础选项
     if (typeof marked !== 'undefined') {
       marked.setOptions({
         breaks: true,        // 支持 GFM 换行
@@ -2362,15 +2361,12 @@
     let threadMessages = previousState.threadMessages || [];
     // cliOutputs 改为结构化消息数组: { claude: [{role, content, time, streaming}], ... }
     let cliOutputs = previousState.cliOutputs || { claude: [], codex: [], gemini: [] };
-    // 兼容旧格式：如果是字符串则转换为空数组
-    ['claude', 'codex', 'gemini'].forEach(cli => {
-      if (typeof cliOutputs[cli] === 'string') cliOutputs[cli] = [];
-    });
     let sessions = previousState.sessions || [];
     let currentSessionId = previousState.currentSessionId || null;
     let pendingChanges = previousState.pendingChanges || [];
     let isProcessing = previousState.isProcessing || false;  // 处理状态
     let thinkingStartAt = previousState.thinkingStartAt || null;
+    let localProcessingUntil = 0;
     let streamingHintTimer = null;
     let processingActor = previousState.processingActor || { source: 'orchestrator', cli: 'claude' };
     // 依赖分析面板状态（需在初次渲染前初始化，避免 TDZ）
@@ -2406,6 +2402,14 @@
         sessions, currentSessionId, pendingChanges, isProcessing, thinkingStartAt, processingActor, scrollPositions,
         autoScrollEnabled
       });
+    }
+
+    function setLocalProcessingGrace(ms) {
+      localProcessingUntil = Date.now() + ms;
+    }
+
+    function hasLocalProcessingGrace() {
+      return localProcessingUntil > 0 && Date.now() < localProcessingUntil;
     }
 
     function renderInitialView() {
@@ -2773,7 +2777,12 @@
 
         // 从后端状态同步 isRunning（只在变化时更新）
         if (state.isRunning !== undefined && state.isRunning !== isProcessing) {
-          setProcessingState(state.isRunning);
+          if (state.isRunning || !hasLocalProcessingGrace()) {
+            setProcessingState(state.isRunning);
+            if (state.isRunning) {
+              localProcessingUntil = 0;
+            }
+          }
         }
 
         // 更新阶段指示器（不触发完整渲染）
@@ -2826,6 +2835,7 @@
         if (msg.sessionId && msg.sessionId !== currentSessionId) {
           return;
         }
+        localProcessingUntil = 0;
         handleStandardMessage(msg.message);
       }
       // 🆕 标准消息更新 - 流式更新
@@ -2833,6 +2843,7 @@
         if (msg.sessionId && msg.sessionId !== currentSessionId) {
           return;
         }
+        localProcessingUntil = 0;
         handleStandardUpdate(msg.update);
       }
       // 🆕 标准消息完成
@@ -2840,6 +2851,7 @@
         if (msg.sessionId && msg.sessionId !== currentSessionId) {
           return;
         }
+        localProcessingUntil = 0;
         handleStandardComplete(msg.message);
       }
       else if (msg.type === 'cliStatusChanged') { addSystemMessage(msg.cli + ' 状态已更新', 'info'); updateCliDots(); }
@@ -2970,7 +2982,7 @@
         }
         saveWebviewState();
       }
-      // [已迁移到 standardMessage] orchestratorMessage 处理已移除
+      // orchestratorMessage 处理已移除
       else if (msg.type === 'questionRequest') {
         // 🔧 P6 修复：增强会话隔离
         if (msg.sessionId && msg.sessionId !== currentSessionId) {
@@ -3006,33 +3018,6 @@
           return;
         }
         showPlanConfirmation(msg.plan, msg.formattedPlan);
-      }
-      // 🔧 处理 CLI 询问事件
-      else if (msg.type === 'cliQuestion') {
-        // 🔧 P6 修复：增强会话隔离
-        if (msg.sessionId && msg.sessionId !== currentSessionId) {
-          console.log('[Webview] 忽略非当前会话的 cliQuestion');
-          return;
-        }
-        showCliQuestion(msg);
-      }
-      // 🔧 处理 CLI 询问超时事件
-      else if (msg.type === 'cliQuestionTimeout') {
-        // 🔧 P6 修复：增强会话隔离
-        if (msg.sessionId && msg.sessionId !== currentSessionId) {
-          console.log('[Webview] 忽略非当前会话的 cliQuestionTimeout');
-          return;
-        }
-        handleCliQuestionTimeout(msg);
-      }
-      // 🔧 处理 CLI 询问回答结果
-      else if (msg.type === 'cliQuestionAnswered') {
-        // 🔧 P6 修复：增强会话隔离
-        if (msg.sessionId && msg.sessionId !== currentSessionId) {
-          console.log('[Webview] 忽略非当前会话的 cliQuestionAnswered');
-          return;
-        }
-        handleCliQuestionAnswered(msg);
       }
     });
 
@@ -3225,6 +3210,7 @@
       }
 
       if (!cancelled) {
+        setLocalProcessingGrace(15000);
         setProcessingState(true);
       }
       saveWebviewState();
@@ -3343,174 +3329,6 @@
       saveWebviewState();
       renderMainContent();
       smoothScrollToBottom();
-    }
-
-    function findCliQuestionIndex(list, cli, questionId) {
-      if (!Array.isArray(list) || !questionId) return -1;
-      return list.findIndex(m => m.type === 'cli_question' && m.questionId === questionId && m.cli === cli);
-    }
-
-    // 🔧 显示 CLI 询问卡片
-    function showCliQuestion(msg) {
-      console.log('[Webview] 收到 CLI 询问:', msg);
-
-      // 在 CLI 输出中添加询问卡片
-      const cli = msg.cli || 'claude';
-      if (!cliOutputs[cli]) {
-        cliOutputs[cli] = [];
-      }
-
-      // 添加/更新询问消息
-      const questionMsg = {
-        role: 'cli_question',
-        type: 'cli_question',
-        cli: cli,
-        questionId: msg.questionId,
-        content: msg.content,
-        pattern: msg.pattern,
-        time: new Date().toLocaleTimeString().slice(0, 5),
-        timestamp: msg.timestamp || Date.now(),
-        isPending: true,
-        adapterRole: msg.adapterRole
-      };
-
-      const existingCliIdx = findCliQuestionIndex(cliOutputs[cli], cli, msg.questionId);
-      if (existingCliIdx !== -1) {
-        cliOutputs[cli][existingCliIdx] = { ...cliOutputs[cli][existingCliIdx], ...questionMsg };
-      } else {
-        cliOutputs[cli].push(questionMsg);
-      }
-
-      // 同时在 Thread 面板显示（如果是 orchestrator 模式）
-      if (msg.adapterRole === 'orchestrator') {
-        const existingThreadIdx = findCliQuestionIndex(threadMessages, cli, msg.questionId);
-        if (existingThreadIdx !== -1) {
-          threadMessages[existingThreadIdx] = {
-            ...threadMessages[existingThreadIdx],
-            ...questionMsg,
-            role: 'system'
-          };
-        } else {
-          threadMessages.push({
-            ...questionMsg,
-            role: 'system'
-          });
-        }
-      }
-
-      if (!window._pendingCliQuestion ||
-        window._pendingCliQuestion.questionId !== msg.questionId ||
-        window._pendingCliQuestion.cli !== cli) {
-        window._pendingCliQuestion = {
-          cli: cli,
-          questionId: msg.questionId,
-          adapterRole: msg.adapterRole || 'worker',
-          timestamp: Date.now()
-        };
-      }
-
-      setProcessingState(false);
-      saveWebviewState();
-      renderMainContent();
-
-      // 滚动到询问卡片
-      requestAnimationFrame(() => {
-        const mainContent = document.getElementById('main-content');
-        if (mainContent) {
-          mainContent.scrollTop = mainContent.scrollHeight;
-        }
-      });
-
-      const input = document.getElementById('prompt-input');
-      if (input) {
-        input.placeholder = `回复 ${cli} 的问题...`;
-        input.focus();
-      }
-    }
-
-    // 🔧 处理 CLI 询问超时
-    function handleCliQuestionTimeout(msg) {
-      console.log('[Webview] CLI 询问超时:', msg);
-
-      const cli = msg.cli || 'claude';
-      const questionId = msg.questionId;
-
-      // 更新 CLI 输出中的询问状态
-      if (cliOutputs[cli]) {
-        cliOutputs[cli].forEach(m => {
-          if (m.type === 'cli_question' && m.questionId === questionId) {
-            m.isPending = false;
-            m.timedOut = true;
-            m.answer = 'n (超时自动回答)';
-          }
-        });
-      }
-
-      // 更新 Thread 面板中的询问状态
-      threadMessages.forEach(m => {
-        if (m.type === 'cli_question' && m.questionId === questionId) {
-          m.isPending = false;
-          m.timedOut = true;
-          m.answer = 'n (超时自动回答)';
-        }
-      });
-
-      if (window._pendingCliQuestion &&
-        window._pendingCliQuestion.questionId === questionId &&
-        window._pendingCliQuestion.cli === cli) {
-        window._pendingCliQuestion = null;
-        const input = document.getElementById('prompt-input');
-        if (input) {
-          input.placeholder = '描述你的任务... (可粘贴图片)';
-        }
-      }
-
-      saveWebviewState();
-      renderMainContent();
-    }
-
-    // 🔧 处理 CLI 询问回答结果
-    function handleCliQuestionAnswered(msg) {
-      console.log('[Webview] CLI 询问已回答:', msg);
-
-      const cli = msg.cli || 'claude';
-      const questionId = msg.questionId;
-
-      // 更新 CLI 输出中的询问状态
-      if (cliOutputs[cli]) {
-        cliOutputs[cli].forEach(m => {
-          if (m.type === 'cli_question' && m.questionId === questionId) {
-            m.isPending = false;
-            m.answered = msg.success;
-            m.answer = msg.answer;
-            m.error = msg.error;
-          }
-        });
-      }
-
-      // 更新 Thread 面板中的询问状态
-      threadMessages.forEach(m => {
-        if (m.type === 'cli_question' && m.questionId === questionId) {
-          m.isPending = false;
-          m.answered = msg.success;
-          m.answer = msg.answer;
-          m.error = msg.error;
-        }
-      });
-
-      if (window._pendingCliQuestion &&
-        window._pendingCliQuestion.questionId === questionId &&
-        window._pendingCliQuestion.cli === cli) {
-        window._pendingCliQuestion = null;
-        const input = document.getElementById('prompt-input');
-        if (input) {
-          input.placeholder = '描述你的任务... (可粘贴图片)';
-        }
-      }
-
-      setProcessingState(true);
-      saveWebviewState();
-      renderMainContent();
     }
 
     // 🔧 发送 CLI 询问回答
@@ -3768,18 +3586,17 @@
       }
 
       try {
-        // 🔧 marked v12 兼容性修复：使用 marked.use() 配置自定义 renderer
-        // marked v5+ 废弃了 setOptions 的 highlight 选项，需要通过自定义 renderer 处理
+        // 使用 marked.use() 配置自定义 renderer
         const renderer = {
           // 自定义代码块渲染（保留行号、diff 高亮、文件路径功能）
-          // 🔧 marked v12 使用对象参数 { text, lang, escaped }
+          // marked v12 使用对象参数 { text, lang, escaped }
           code({ text, lang, escaped }) {
             const { lang: parsedLang, filepath } = parseCodeBlockMeta(lang || '');
             return renderCodeBlock(text || '', parsedLang, filepath);
           },
 
           // 自定义链接渲染（添加 target="_blank"）
-          // 🔧 marked v12 使用对象参数 { href, title, tokens }
+          // marked v12 使用对象参数 { href, title, tokens }
           link({ href, title, tokens }) {
             const text = this.parser.parseInline(tokens);
             const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
@@ -3787,7 +3604,7 @@
           },
 
           // 自定义图片渲染
-          // 🔧 marked v12 使用对象参数 { href, title, text }
+          // marked v12 使用对象参数 { href, title, text }
           image({ href, title, text }) {
             const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
             return `<img src="${escapeHtml(href || '')}" alt="${escapeHtml(text || '')}"${titleAttr}>`;
@@ -4209,6 +4026,94 @@
     const standardMessages = new Map();
 
     /**
+     * 处理交互消息（CLI 询问）
+     */
+    function handleInteractionMessage(message) {
+      const interaction = message.interaction;
+      const cli = message.cli || 'claude';
+
+      console.log('[Webview] 收到交互消息:', interaction.type, interaction.requestId);
+
+      // 只处理 QUESTION 类型的交互
+      if (interaction.type !== 'question') {
+        console.warn('[Webview] 不支持的交互类型:', interaction.type);
+        return;
+      }
+
+      // 确保 CLI 输出数组存在
+      if (!cliOutputs[cli]) {
+        cliOutputs[cli] = [];
+      }
+
+      // 创建询问消息
+      const questionMsg = {
+        role: 'cli_question',
+        type: 'cli_question',
+        cli: cli,
+        questionId: interaction.requestId,
+        content: interaction.prompt,
+        pattern: message.metadata?.questionPattern || 'interaction',
+        time: new Date(message.timestamp).toLocaleTimeString().slice(0, 5),
+        timestamp: message.timestamp,
+        isPending: true,
+        adapterRole: message.metadata?.adapterRole,
+        standardMessageId: message.id,
+        traceId: message.traceId
+      };
+
+      // 检查是否已存在（去重）
+      const existingIdx = cliOutputs[cli].findIndex(m =>
+        m.type === 'cli_question' && m.questionId === interaction.requestId
+      );
+
+      if (existingIdx !== -1) {
+        // 更新现有消息
+        cliOutputs[cli][existingIdx] = { ...cliOutputs[cli][existingIdx], ...questionMsg };
+      } else {
+        // 添加新消息
+        cliOutputs[cli].push(questionMsg);
+      }
+
+      // 如果是 orchestrator 角色，也在 Thread 面板显示
+      if (message.metadata?.adapterRole === 'orchestrator') {
+        const threadQuestionMsg = {
+          ...questionMsg,
+          source: 'orchestrator'
+        };
+
+        const existingThreadIdx = threadMessages.findIndex(m =>
+          m.type === 'cli_question' && m.questionId === interaction.requestId
+        );
+
+        if (existingThreadIdx !== -1) {
+          threadMessages[existingThreadIdx] = { ...threadMessages[existingThreadIdx], ...threadQuestionMsg };
+        } else {
+          threadMessages.push(threadQuestionMsg);
+        }
+      }
+
+      // 设置全局变量（用于输入框占位符）
+      window._pendingCliQuestion = {
+        cli: cli,
+        questionId: interaction.requestId,
+        content: interaction.prompt
+      };
+
+      // 更新输入框占位符
+      const inputBox = document.getElementById('user-input');
+      if (inputBox) {
+        inputBox.placeholder = `回答 ${cli} 的询问...`;
+      }
+
+      // 停止处理状态（等待用户回答）
+      setProcessingState(false);
+
+      saveWebviewState();
+      renderMainContent();
+      smoothScrollToBottom();
+    }
+
+    /**
      * 处理新的标准消息
      */
     function handleStandardMessage(message) {
@@ -4218,6 +4123,13 @@
       }
 
       console.log('[Webview] 收到标准消息:', message.id, message.type, message.lifecycle);
+
+      // 🆕 处理交互消息（CLI 询问）
+      if (message.type === 'interaction' && message.interaction) {
+        handleInteractionMessage(message);
+        return;
+      }
+
       if ((!message.blocks || message.blocks.length === 0) &&
           message.lifecycle !== 'streaming' &&
           message.lifecycle !== 'started') {
@@ -4573,8 +4485,7 @@
           return lineText;
         }).join('\n');
       } else {
-        // 兼容旧结构
-        text = codeEl.textContent;
+        return;
       }
 
       navigator.clipboard.writeText(text).then(() => {
@@ -4602,7 +4513,10 @@
       for (const block of blocks) {
         switch (block.type) {
           case 'text':
-            if (block.isMarkdown) {
+            if (isJsonText(block.content)) {
+              html += renderCodeBlock(block.content, 'json', '');
+              hasMarkdown = true;
+            } else if (block.isMarkdown) {
               html += '<div class="markdown-rendered">' + renderMarkdown(block.content) + '</div>';
               hasMarkdown = true;
             } else {
@@ -4765,6 +4679,9 @@
       }
       if (phase === 'waiting_questions') {
         nextProcessing = false;
+      }
+      if (!nextProcessing && hasLocalProcessingGrace()) {
+        nextProcessing = true;
       }
 
       // 🔧 修复：任务完成/失败/中断时，清理所有 streaming 和 isPending 状态
@@ -5082,14 +4999,25 @@
 
       sortedMessages.forEach(({ m, idx }) => {
         // 跳过空内容消息（避免只渲染徽章/时间的空行）
-      const hasRenderableContent =
-        (m.content && String(m.content).trim()) ||
-        (m.parsedBlocks && m.parsedBlocks.length > 0) ||
-        (m.codeBlocks && m.codeBlocks.length > 0) ||
-        (m.toolCalls && m.toolCalls.length > 0) ||
-        (m.thinking && m.thinking.length > 0) ||
-        (m.images && m.images.length > 0) ||
-        (m.metadata && (m.metadata.subTaskCard || m.metadata.summaryCard));
+        const hasRenderableContent =
+          m.streaming ||
+          (m.content && String(m.content).trim()) ||
+          (m.codeBlocks && m.codeBlocks.length > 0) ||
+          (m.thinking && m.thinking.length > 0) ||
+          (m.images && m.images.length > 0) ||
+          (m.metadata && (m.metadata.subTaskCard || m.metadata.summaryCard)) ||
+          (m.parsedBlocks && m.parsedBlocks.some(b =>
+            (b.type === 'text' && b.content && String(b.content).trim()) ||
+            (b.type === 'code' && b.content && String(b.content).trim()) ||
+            (b.type === 'thinking' && b.content && String(b.content).trim()) ||
+            (b.type === 'tool_call' && (b.input || b.output || b.error))
+          )) ||
+          (m.toolCalls && m.toolCalls.some(t =>
+            (t.input && String(t.input).trim()) ||
+            (t.output && String(t.output).trim()) ||
+            (t.result && String(t.result).trim()) ||
+            (t.error && String(t.error).trim())
+          ));
 
         // 尝试渲染特殊消息
         const specialHtml = renderSpecialMessage(m, idx, tabType);
@@ -5172,7 +5100,29 @@
           && Object.prototype.hasOwnProperty.call(parsed, 'isAmbiguous');
         const hasReview = Object.prototype.hasOwnProperty.call(parsed, 'status')
           && Object.prototype.hasOwnProperty.call(parsed, 'summary');
-        return hasAmbiguity || hasReview;
+        const hasMessageEnvelope = typeof parsed.type === 'string'
+          && parsed.message && (parsed.message.role || parsed.message.content);
+        const hasToolTrace = Array.isArray(parsed.message?.content)
+          && parsed.message.content.some(item =>
+            item && typeof item === 'object' &&
+            (item.type === 'tool_result' || item.type === 'tool_use' || item.tool_use_id)
+          );
+        const hasToolUseRefs = Object.prototype.hasOwnProperty.call(parsed, 'tool_use_id')
+          || Object.prototype.hasOwnProperty.call(parsed, 'parent_tool_use_id');
+        return hasAmbiguity || hasReview || hasMessageEnvelope || hasToolTrace || hasToolUseRefs;
+      } catch {
+        return false;
+      }
+    }
+
+    function isJsonText(content) {
+      if (!content || typeof content !== 'string') return false;
+      const trimmed = content.trim();
+      if (!trimmed) return false;
+      if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return false;
+      try {
+        JSON.parse(trimmed);
+        return true;
       } catch {
         return false;
       }
@@ -5899,6 +5849,7 @@
         }
 
         // 设置处理状态（会自动设置 thinkingStartAt）
+        setLocalProcessingGrace(15000);
         setProcessingState(true);
 
         // 发送消息（包含图片数据）
@@ -7208,7 +7159,7 @@
       claude: {
         role: '你是一个资深软件架构师，专注于系统设计、代码质量和可维护性。\n你的代码应该是清晰、可扩展、易于测试的。',
         focus: ['优先考虑代码的可维护性和扩展性', '在修改前先分析影响范围和依赖关系', '对于跨模块修改，先确认接口契约', '保持代码风格一致性', '添加必要的类型定义和注释'],
-        constraints: ['不要进行不必要的重构', '避免引入新的依赖，除非必要', '大规模修改前先与编排者确认', '保持向后兼容性，除非明确要求破坏性变更']
+        constraints: ['不要进行不必要的重构', '避免引入新的依赖，除非必要', '大规模修改前先与编排者确认']
       },
       codex: {
         role: '你是一个高效的代码执行者，专注于快速、准确地完成具体任务。\n你的目标是用最少的代码变更解决问题。',
