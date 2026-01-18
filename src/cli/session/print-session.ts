@@ -1,6 +1,7 @@
 import { logger, LogCategory } from '../../logging';
 import { EventEmitter } from 'events';
 import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
+import * as crypto from 'crypto';
 import type { SessionMessage, SessionProcess, SessionProcessOptions, SessionResponse } from './types';
 import type { CLIType } from '../types';
 
@@ -61,6 +62,8 @@ export class PrintSession extends EventEmitter implements SessionProcess {
   private waitingForAnswer = false;
   /** 当前询问 ID */
   private currentQuestionId?: string;
+  /** 上一次询问 ID（用于去重） */
+  private lastQuestionId?: string;
   /** 询问超时定时器 */
   private questionTimeoutId?: NodeJS.Timeout;
   /** 询问超时时间（毫秒） */
@@ -236,17 +239,36 @@ export class PrintSession extends EventEmitter implements SessionProcess {
 
     // 获取最后几行进行检测
     const lines = buffer.split('\n');
-    const lastLines = lines.slice(-5).join('\n');
+    const lastLines = lines.slice(-5).join('\n').trim();
+
+    // 🔧 修复：如果内容为空，不触发询问
+    if (!lastLines) {
+      return;
+    }
 
     for (const pattern of QUESTION_PATTERNS) {
       if (pattern.test(lastLines)) {
+        // 🔧 修复：基于内容生成稳定的 questionId
+        const contentHash = crypto.createHash('md5')
+          .update(lastLines)
+          .digest('hex')
+          .slice(0, 8);
+
+        this.currentQuestionId = `${requestId}-${contentHash}`;
+
+        // 🔧 修复：检查是否已经发送过相同的询问
+        if (this.lastQuestionId === this.currentQuestionId) {
+          logger.debug(`[PrintSession] 跳过重复询问: ${this.currentQuestionId}`, undefined, LogCategory.CLI);
+          return;
+        }
+
+        this.lastQuestionId = this.currentQuestionId;
         this.waitingForAnswer = true;
-        this.currentQuestionId = `${requestId}-${Date.now()}`;
 
         const question: CLIQuestion = {
           questionId: this.currentQuestionId,
           cli: this.cli,
-          content: lastLines.trim(),
+          content: lastLines,
           pattern: pattern.source,
           timestamp: Date.now(),
         };
