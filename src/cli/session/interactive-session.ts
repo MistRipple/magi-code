@@ -8,8 +8,10 @@
 
 import { EventEmitter } from 'events';
 import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
+import * as crypto from 'crypto';
 import type { SessionMessage, SessionProcess, SessionResponse } from './types';
 import type { CLIType } from '../types';
+import type { CLIQuestion } from './print-session';
 
 export interface InteractiveSessionOptions {
   cli: CLIType;
@@ -45,6 +47,10 @@ export class InteractiveSession extends EventEmitter implements SessionProcess {
   private alive = false;
   private waitingForAnswer = false;
   private isFirstMessage = true;
+  /** 当前询问 ID */
+  private currentQuestionId?: string;
+  /** 上一次询问 ID（用于去重） */
+  private lastQuestionId?: string;
 
   constructor(options: InteractiveSessionOptions) {
     super();
@@ -131,10 +137,39 @@ export class InteractiveSession extends EventEmitter implements SessionProcess {
         jsonBuffer += text;
         this.emit('output', text);
 
-        // 检测 CLI 询问
+        // 🔧 修复：检测 CLI 询问并发送正确格式的事件
         if (this.detectQuestion(text)) {
+          // 如果已经在等待回答，不重复触发
+          if (this.waitingForAnswer) {
+            return;
+          }
+
+          // 基于内容生成稳定的 questionId
+          const contentHash = crypto.createHash('md5')
+            .update(text.trim())
+            .digest('hex')
+            .slice(0, 8);
+
+          this.currentQuestionId = `${message.requestId || 'interactive'}-${contentHash}`;
+
+          // 检查是否已经发送过相同的询问
+          if (this.lastQuestionId === this.currentQuestionId) {
+            return;
+          }
+
+          this.lastQuestionId = this.currentQuestionId;
           this.waitingForAnswer = true;
-          this.emit('question', { text, process: proc });
+
+          // 🔧 修复：发送正确格式的 CLIQuestion 对象
+          const question: CLIQuestion = {
+            questionId: this.currentQuestionId,
+            cli: this.cli,
+            content: text.trim(),
+            pattern: 'interactive-detection',
+            timestamp: Date.now(),
+          };
+
+          this.emit('question', question);
         }
       });
 
