@@ -3,6 +3,7 @@
  * 提供事件发布/订阅机制，用于组件间通信
  */
 
+import { logger, LogCategory } from './logging';
 import { EventType, AppEvent, EventListener } from './types';
 
 /**
@@ -63,7 +64,7 @@ export class EventEmitter {
         try {
           listener(event);
         } catch (error) {
-          console.error(`事件监听器错误 [${event.type}]:`, error);
+          logger.error(`事件监听器错误 [${event.type}]:`, error);
         }
       }
     }
@@ -73,7 +74,7 @@ export class EventEmitter {
       try {
         listener(event);
       } catch (error) {
-        console.error(`全局事件监听器错误:`, error);
+        logger.error(`全局事件监听器错误:`, error);
       }
     }
   }

@@ -9,6 +9,7 @@
  * 这是消息标准化架构的核心组件
  */
 
+import { logger, LogCategory } from '../logging';
 import { EventEmitter } from 'events';
 import type { CLIType } from '../cli/types';
 import type { CLIAdapterFactory } from '../cli/adapter-factory';
@@ -108,7 +109,7 @@ export class MessageBridge extends EventEmitter {
    */
   private debug(message: string, ...args: unknown[]): void {
     if (this.config.debug) {
-      console.log(message, ...args);
+      logger.info(message, ...args);
     }
   }
 

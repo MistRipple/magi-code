@@ -56,7 +56,6 @@ export abstract class BaseWorker extends EventEmitter {
       const parsed = this.parseOutput(output);
 
       const result: WorkerResult = {
-        workerId: `${this.cliType}-${subTask.id}`,
         cliType: this.cliType,
         success: true,
         output,
@@ -77,7 +76,6 @@ export abstract class BaseWorker extends EventEmitter {
         data: { error: errorMessage, cli: this.cliType },
       });
       return {
-        workerId: `${this.cliType}-${subTask.id}`,
         cliType: this.cliType,
         success: false,
         error: errorMessage,

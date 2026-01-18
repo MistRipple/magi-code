@@ -12,7 +12,7 @@ export interface SubTaskDef {
   id: string;
   description: string;
   category: TaskCategory;
-  assignedCli: CLIType;
+  assignedWorker: CLIType;
   targetFiles: string[];
   dependencies: string[];
   priority: number;
@@ -56,7 +56,7 @@ export class TaskSplitter {
     return {
       subTasks: [{
         id: generateId(), description: analysis.prompt, category: analysis.category,
-        assignedCli: selection.cli, targetFiles: analysis.targetFiles,
+        assignedWorker: selection.cli, targetFiles: analysis.targetFiles,
         dependencies: [], priority: 1, cliSelection: selection,
       }],
       executionMode: 'sequential',
@@ -73,7 +73,7 @@ export class TaskSplitter {
       const selection = this.cliSelector.select(analysis, analysis.recommendedWorker);
       return {
         id: generateId(), description: `处理文件: ${file}`, category: analysis.category,
-        assignedCli: selection.cli, targetFiles: [file],
+        assignedWorker: selection.cli, targetFiles: [file],
         dependencies: [], priority: index + 1, cliSelection: selection,
       };
     });
@@ -85,14 +85,14 @@ export class TaskSplitter {
     const designSelection = this.cliSelector.selectByCategory('architecture');
     const designTask: SubTaskDef = {
       id: generateId(), description: `分析需求并设计架构: ${analysis.prompt}`,
-      category: 'architecture', assignedCli: designSelection.cli, targetFiles: [],
+      category: 'architecture', assignedWorker: designSelection.cli, targetFiles: [],
       dependencies: [], priority: 1, cliSelection: designSelection,
     };
     subTasks.push(designTask);
     const implSelection = this.cliSelector.selectByCategory('implement');
     subTasks.push({
       id: generateId(), description: `实现架构设计`, category: 'implement',
-      assignedCli: implSelection.cli, targetFiles: analysis.targetFiles,
+      assignedWorker: implSelection.cli, targetFiles: analysis.targetFiles,
       dependencies: [designTask.id], priority: 2, cliSelection: implSelection,
     });
     return { subTasks, executionMode: 'sequential', estimatedTime: this.estimateTime(analysis.complexity) * 1.5, hasDependencies: true };
@@ -110,14 +110,14 @@ export class TaskSplitter {
     const backendSelection = this.cliSelector.selectByCategory('backend');
     subTasks.push({
       id: generateId(), description: `实现后端 API: ${analysis.prompt}`, category: 'backend',
-      assignedCli: backendSelection.cli,
+      assignedWorker: backendSelection.cli,
       targetFiles: analysis.targetFiles.filter(f => !f.includes('component') && !f.includes('.css') && !f.includes('.tsx')),
       dependencies: [], priority: 1, cliSelection: backendSelection,
     });
     const frontendSelection = this.cliSelector.selectByCategory('frontend');
     subTasks.push({
       id: generateId(), description: `实现前端界面: ${analysis.prompt}`, category: 'frontend',
-      assignedCli: frontendSelection.cli,
+      assignedWorker: frontendSelection.cli,
       targetFiles: analysis.targetFiles.filter(f => f.includes('component') || f.includes('.css') || f.includes('.tsx')),
       dependencies: [], priority: 1, cliSelection: frontendSelection,
     });

@@ -3,6 +3,7 @@
  * 负责任务分解、Worker 调度、结果收集
  */
 
+import { logger, LogCategory } from './logging';
 import { CLIType, Task, SubTask, TaskCategory, WorkerResult, ExecutionMode } from './types';
 import { UnifiedSessionManager } from './session';
 import { TaskManager } from './task-manager';
@@ -81,9 +82,9 @@ export class Orchestrator {
       const msg = error instanceof Error ? error.message : String(error);
       const stack = error instanceof Error ? error.stack : undefined;
 
-      console.error(`[Orchestrator] Task ${taskId} failed:`, msg);
+      logger.error(`[Orchestrator] Task ${taskId} failed:`, msg, LogCategory.ORCHESTRATOR);
       if (stack) {
-        console.error('[Orchestrator] Stack trace:', stack);
+        logger.error('[Orchestrator] Stack trace:', stack, LogCategory.ORCHESTRATOR);
       }
 
       globalEventBus.emitEvent('task:failed', {
@@ -113,7 +114,7 @@ export class Orchestrator {
         worker.interrupt();
       }
     } catch (error) {
-      console.error('[Orchestrator] Failed to cleanup workers:', error);
+      logger.error('[Orchestrator] Failed to cleanup workers:', error, LogCategory.ORCHESTRATOR);
     }
   }
 
@@ -141,6 +142,7 @@ export class Orchestrator {
       'test': ['codex', 'claude', 'gemini'],
       'document': ['claude', 'gemini', 'codex'],
       'review': ['claude', 'gemini', 'codex'],
+      'simple': ['claude', 'codex', 'gemini'],
       'general': ['claude', 'codex', 'gemini'],
     };
     for (const cli of map[category] || []) {
@@ -171,14 +173,13 @@ export class Orchestrator {
   }
 
   private async executeSubTask(subTask: SubTask): Promise<WorkerResult> {
-    const cli = subTask.assignedWorker || subTask.assignedCli;
+    const cli = subTask.assignedWorker;
 
     // 类型安全检查：确保 CLI 已分配
     if (!cli) {
       const error = `SubTask ${subTask.id} 没有分配 Worker`;
-      console.error(`[Orchestrator] ${error}`);
+      logger.error(`[Orchestrator] ${error}`, undefined, LogCategory.ORCHESTRATOR);
       return {
-        workerId: `unknown-${subTask.id}`,
         cliType: 'claude', // 默认值，避免类型错误
         success: false,
         error,
@@ -191,9 +192,8 @@ export class Orchestrator {
     const worker = this.workers.get(cli);
     if (!worker) {
       const error = `Worker 不存在: ${cli}`;
-      console.error(`[Orchestrator] ${error}`);
+      logger.error(`[Orchestrator] ${error}`, undefined, LogCategory.ORCHESTRATOR);
       return {
-        workerId: `unknown-${subTask.id}`,
         cliType: cli,
         success: false,
         error,
@@ -203,11 +203,12 @@ export class Orchestrator {
     }
 
     // 创建文件快照（带错误处理）
+    const priority = subTask.priority ?? 5; // 默认优先级 5
     for (const f of subTask.targetFiles) {
       try {
-        this.options.snapshotManager.createSnapshot(f, cli, subTask.id);
+        this.options.snapshotManager.createSnapshot(f, cli, subTask.id, priority);
       } catch (error) {
-        console.error(`[Orchestrator] Failed to create snapshot for ${f}:`, error);
+        logger.error(`[Orchestrator] Failed to create snapshot for ${f}:`, error, LogCategory.ORCHESTRATOR);
         // 继续执行，快照失败不应阻止任务
       }
     }
@@ -229,12 +230,11 @@ export class Orchestrator {
       return result;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      console.error(`[Orchestrator] SubTask ${subTask.id} execution failed:`, msg);
+      logger.error(`[Orchestrator] SubTask ${subTask.id} execution failed:`, msg, LogCategory.ORCHESTRATOR);
 
       this.options.taskManager.updateSubTaskStatus(subTask.taskId, subTask.id, 'failed');
 
       return {
-        workerId: `${cli}-${subTask.id}`,
         cliType: cli,
         success: false,
         error: msg,

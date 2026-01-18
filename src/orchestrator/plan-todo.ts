@@ -50,7 +50,7 @@ export class PlanTodoManager {
     lines.push('## Tasks');
 
     for (const task of record.plan.subTasks || []) {
-      const worker = task.assignedWorker || task.assignedCli || 'unknown';
+      const worker = task.assignedWorker || 'unknown';
       const files = task.targetFiles && task.targetFiles.length > 0
         ? ` | files: ${task.targetFiles.join(', ')}`
         : '';

@@ -10,11 +10,15 @@
  * 所有 Worker（包括 Worker Claude）都继承此基类
  */
 
+import { logger, LogCategory } from '../logging';
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
+import * as path from 'path';
 import { CLIAdapterFactory } from '../cli/adapter-factory';
 import { CLIResponse } from '../cli/types';
 import { MessageBus, globalMessageBus } from './message-bus';
 import { SnapshotManager } from '../snapshot-manager';
+import { FileWatcher } from '../utils/file-watcher';
 import { PermissionMatrix } from '../types';
 import {
   WorkerType,
@@ -43,6 +47,8 @@ export interface WorkerConfig {
   orchestratorId?: string;
   snapshotManager?: SnapshotManager;
   permissions?: PermissionMatrix;
+  /** 工作区根目录（用于文件监控） */
+  workspaceRoot?: string;
   /** Worker 画像 */
   profile?: WorkerProfile;
 }
@@ -70,8 +76,13 @@ export class WorkerAgent extends EventEmitter {
   protected permissions: PermissionMatrix;
   /** Worker 画像 */
   protected profile?: WorkerProfile;
+  /** 工作区根目录（用于文件监控） */
+  protected workspaceRoot: string = '';
+
   /** 引导注入器 */
   protected guidanceInjector: GuidanceInjector;
+  /** 文件监控器（用于捕获真实文件变更） */
+  private fileWatcher: FileWatcher | null = null;
 
   private _state: WorkerState = 'idle';
   private currentTaskId: string | null = null;
@@ -92,6 +103,7 @@ export class WorkerAgent extends EventEmitter {
     this.snapshotManager = config.snapshotManager;
     this.permissions = config.permissions || { allowEdit: true, allowBash: true, allowWeb: true };
     this.profile = config.profile;
+    this.workspaceRoot = config.workspaceRoot || '';
     this.guidanceInjector = new GuidanceInjector();
 
     this.setupMessageHandlers();
@@ -196,18 +208,18 @@ export class WorkerAgent extends EventEmitter {
       clearTimeout(pending.timeout);
       pending.resolve(answer);
       this.pendingQuestions.delete(questionId);
-      console.log(`[WorkerAgent ${this.id}] 收到问题回答: ${questionId}`);
+      logger.info(`[WorkerAgent ${this.id}] 收到问题回答: ${questionId}`, undefined, LogCategory.WORKER);
     } else {
-      console.warn(`[WorkerAgent ${this.id}] 收到未知问题的回答: ${questionId}`);
+      logger.warn(`[WorkerAgent ${this.id}] 收到未知问题的回答: ${questionId}`, undefined, LogCategory.WORKER);
     }
   }
 
   /** 处理任务分发 */
   private async handleTaskDispatch(message: TaskDispatchMessage): Promise<void> {
     const { taskId, subTask, context, dispatchId } = message.payload;
-    
+
     if (this._state !== 'idle') {
-      console.warn(`[WorkerAgent ${this.id}] 收到任务但当前状态为 ${this._state}，忽略`);
+      logger.warn(`[WorkerAgent ${this.id}] 收到任务但当前状态为 ${this._state}，忽略`, undefined, LogCategory.WORKER);
       return;
     }
 
@@ -217,7 +229,7 @@ export class WorkerAgent extends EventEmitter {
   /** 处理任务取消 */
   private async handleTaskCancel(message: TaskCancelMessage): Promise<void> {
     const { taskId, subTaskId } = message.payload;
-    
+
     if (this.currentTaskId === taskId && (!subTaskId || this.currentSubTaskId === subTaskId)) {
       await this.cancel();
     }
@@ -268,27 +280,83 @@ export class WorkerAgent extends EventEmitter {
       { message: `开始执行: ${subTask.description}`, dispatchId: this.currentDispatchId || undefined }
     );
 
+    let watcher: FileWatcher | null = null;
+    let watcherFinalized = false;
+
+    const finalizeWatcher = (): string[] => {
+      if (watcherFinalized) return [];
+      watcherFinalized = true;
+
+      const actualChanges = watcher ? watcher.getChangedFiles() : [];
+      if (watcher) {
+        watcher.stop();
+        this.fileWatcher = null;
+      }
+
+      if (actualChanges.length > 0 && this.snapshotManager) {
+        const priority = subTask.priority ?? 5;
+        for (const absolutePath of actualChanges) {
+          try {
+            const stat = fs.existsSync(absolutePath) ? fs.statSync(absolutePath) : null;
+            if (stat && stat.isDirectory()) {
+              continue;
+            }
+            const baseline = watcher?.getBaselineContent(absolutePath) ?? '';
+            this.snapshotManager.createSnapshotFromBaseline(
+              absolutePath,
+              this.type,
+              subTask.id,
+              priority,
+              baseline
+            );
+          } catch (err) {
+            logger.warn(`[WorkerAgent ${this.id}] 补快照失败: ${absolutePath}`, err, LogCategory.WORKER);
+          }
+        }
+      }
+
+      return actualChanges;
+    };
+
     try {
+      if (this.snapshotManager && this.workspaceRoot) {
+        watcher = new FileWatcher({
+          root: this.workspaceRoot,
+          ignore: ['/node_modules/', '/.git/', '/.multicli/', '/out/', '/dist/']
+        });
+        watcher.start();
+        this.fileWatcher = watcher;
+      }
+
+      // ========================================
+      // 事前创建快照 (保存初始状态)
+      // ========================================
+      if (files.length > 0 && this.snapshotManager) {
+        logger.info(`[WorkerAgent ${this.id}] 为任务 ${subTask.id} 创建快照`, undefined, LogCategory.WORKER);
+        const priority = subTask.priority ?? 5; // 默认优先级 5
+        for (const file of files) {
+          try {
+            this.snapshotManager.createSnapshot(file, this.type, subTask.id, priority);
+          } catch (err) {
+            logger.warn(`[WorkerAgent ${this.id}] 创建快照失败: ${file}`, err, LogCategory.WORKER);
+          }
+        }
+      }
+
       // 构建执行 prompt
       const prompt = this.buildExecutionPrompt(subTask, context);
 
       // 调用 CLI 执行
       const response = await this.executeCLI(prompt);
 
+      const actualChanges = finalizeWatcher();
+      const resolvedModifiedFiles = actualChanges.map(file => this.workspaceRoot
+        ? path.relative(this.workspaceRoot, file) || file
+        : file);
+
       // 检查是否被取消
       if (this.abortController.signal.aborted) {
         throw new Error('任务已被取消');
-      }
-
-     
-      if (response.fileChanges && response.fileChanges.length > 0 && this.snapshotManager) {
-        for (const change of response.fileChanges) {
-          try {
-            this.snapshotManager.createSnapshot(change.filePath, this.type, subTask.id);
-          } catch (err) {
-            console.warn(`[WorkerAgent ${this.id}] 创建快照失败: ${change.filePath}`, err);
-          }
-        }
       }
 
       const result: ExecutionResult = {
@@ -301,7 +369,7 @@ export class WorkerAgent extends EventEmitter {
         result: this.formatResultContent(subTask, response.content || response.raw),
         success: !response.error,
         duration: Date.now() - startTime,
-        modifiedFiles: response.fileChanges?.map(f => f.filePath),
+        modifiedFiles: response.fileChanges?.map(f => f.filePath) || resolvedModifiedFiles,
         error: response.error,
         inputTokens: response.tokenUsage?.inputTokens,
         outputTokens: response.tokenUsage?.outputTokens,
@@ -318,6 +386,8 @@ export class WorkerAgent extends EventEmitter {
 
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
+
+      finalizeWatcher();
 
       this.setState('failed');
 
@@ -574,7 +644,7 @@ export class WorkerAgent extends EventEmitter {
       return;
     }
 
-    console.log(`[WorkerAgent ${this.id}] 取消任务`);
+    logger.info(`[WorkerAgent ${this.id}] 取消任务`, undefined, LogCategory.WORKER);
 
     // 触发中断信号
     this.abortController?.abort();
@@ -600,6 +670,14 @@ export class WorkerAgent extends EventEmitter {
    * 清理任务状态
    */
   private cleanup(): void {
+    if (this.fileWatcher) {
+      try {
+        this.fileWatcher.stop();
+      } catch (error) {
+        logger.warn(`[WorkerAgent ${this.id}] 停止文件监控失败`, error, LogCategory.WORKER);
+      }
+      this.fileWatcher = null;
+    }
     this.currentTaskId = null;
     this.currentSubTaskId = null;
     this.currentDispatchId = null;
@@ -639,7 +717,7 @@ export class WorkerAgent extends EventEmitter {
       throw new Error('无法在任务外提问');
     }
 
-    console.log(`[WorkerAgent ${this.id}] 向编排者提问: ${question}`);
+    logger.info(`[WorkerAgent ${this.id}] 向编排者提问: ${question}`, undefined, LogCategory.WORKER);
 
     // 发送问题消息
     const questionId = this.messageBus.sendWorkerQuestion(

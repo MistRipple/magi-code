@@ -5,6 +5,7 @@
  * 每个 CLI 实现自己的 Normalizer，在适配层完成标准化
  */
 
+import { logger, LogCategory } from '../logging';
 import { EventEmitter } from 'events';
 import type { CLIType } from '../cli/types';
 import {
@@ -144,7 +145,7 @@ export abstract class BaseNormalizer extends EventEmitter {
 
     this.finalizeContext(context);
     const message = this.buildFinalMessage(context);
-    message.lifecycle = MessageLifecycle.INTERRUPTED;
+    message.lifecycle = MessageLifecycle.CANCELLED;
     this.activeContexts.delete(messageId);
 
     this.emit('complete', messageId, message);
@@ -237,7 +238,7 @@ export abstract class BaseNormalizer extends EventEmitter {
 
   protected debug(message: string, ...args: unknown[]): void {
     if (this.config.debug) {
-      console.log(message, ...args);
+      logger.info(message, ...args);
     }
   }
 

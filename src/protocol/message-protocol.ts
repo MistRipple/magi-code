@@ -52,8 +52,8 @@ export enum MessageLifecycle {
   COMPLETED = 'completed',
   /** 消息失败 */
   FAILED = 'failed',
-  /** 消息被中断 */
-  INTERRUPTED = 'interrupted',
+  /** 消息被取消 */
+  CANCELLED = 'cancelled',
 }
 
 /**

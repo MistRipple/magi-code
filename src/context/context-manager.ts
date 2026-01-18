@@ -9,6 +9,7 @@
  * - LLM 智能压缩（Memory 文档）
  */
 
+import { logger, LogCategory } from '../logging';
 import * as path from 'path';
 import { MemoryDocument } from './memory-document';
 import { TruncationUtils } from './truncation-utils';
@@ -59,7 +60,7 @@ export class ContextManager {
     this.sessionMemory = new MemoryDocument(sessionId, sessionName, storagePath);
     await this.sessionMemory.load();
     this.initialized = true;
-    console.log(`[ContextManager] 已初始化，会话: ${sessionId}`);
+    logger.info(`[ContextManager] 已初始化，会话: ${sessionId}`);
   }
 
   /**
@@ -73,7 +74,7 @@ export class ContextManager {
     if (applyTruncation && this.config.compression.truncation.enabled) {
       const truncated = this.truncationUtils.truncateMessage(content);
       if (truncated.wasTruncated) {
-        console.log(`[ContextManager] 消息已截断: ${truncated.originalLength} -> ${truncated.truncatedLength} 字符`);
+        logger.info(`[ContextManager] 消息已截断: ${truncated.originalLength} -> ${truncated.truncatedLength} 字符`);
         content = truncated.content;
       }
     }
@@ -108,7 +109,7 @@ export class ContextManager {
         ...otherMessages.slice(-maxMessages)
       ];
 
-      console.log(
+      logger.info(
         `[ContextManager] 即时上下文已清理,迁移 ${toRemove.length} 条消息到 Memory`
       );
     }
@@ -433,7 +434,7 @@ export class ContextManager {
    */
   private migrateToMemory(message: ContextMessage): void {
     if (!this.sessionMemory) {
-      console.warn('[ContextManager] SessionMemory 未初始化,无法迁移消息');
+      logger.warn('[ContextManager] SessionMemory 未初始化,无法迁移消息', LogCategory.SESSION);
       return;
     }
 
@@ -509,7 +510,7 @@ export class ContextManager {
         }
       }
     } catch (error) {
-      console.error('[ContextManager] 迁移消息到Memory失败:', error);
+      logger.error('[ContextManager] 迁移消息到Memory失败:', error);
     }
   }
 

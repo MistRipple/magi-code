@@ -1,3 +1,4 @@
+import { logger, LogCategory } from '../../logging';
 import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
 import * as crypto from 'crypto';
@@ -447,7 +448,7 @@ export class SessionManager extends EventEmitter {
     const key = this.getKey(cli, role);
     const entry = this.sessions.get(key);
     if (!entry) {
-      console.log(`[SessionManager] writeInput failed: session not found for ${cli}/${role}`);
+      logger.info(`[SessionManager] writeInput failed: session not found for ${cli}/${role}`, undefined, LogCategory.CLI);
       return false;
     }
     return entry.process.writeInput(text);

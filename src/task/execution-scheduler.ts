@@ -163,7 +163,7 @@ export class ExecutionScheduler extends EventEmitter {
   private async executeSubTask(task: SubTaskDef, retryCount = 0): Promise<SubTaskResult> {
     const result: SubTaskResult = {
       subTaskId: task.id,
-      cli: task.assignedCli,
+      cli: task.assignedWorker,
       status: 'running',
       startTime: Date.now(),
     };
@@ -208,7 +208,7 @@ export class ExecutionScheduler extends EventEmitter {
         reject(new Error(`任务执行超时 (${this.config.timeout}ms)`));
       }, this.config.timeout);
 
-      this.factory.sendMessage(task.assignedCli, task.description)
+      this.factory.sendMessage(task.assignedWorker, task.description)
         .then(response => {
           clearTimeout(timeoutId);
           resolve(response);
@@ -333,4 +333,3 @@ export class ExecutionScheduler extends EventEmitter {
     };
   }
 }
-

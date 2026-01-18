@@ -5,6 +5,7 @@
  * 通过批量处理和节流来降低渲染压力
  */
 
+import { logger, LogCategory } from '../logging';
 import { StandardMessage, StreamUpdate } from '../protocol';
 
 /** 批处理配置 */
@@ -134,7 +135,7 @@ export class MessageBatcher {
     try {
       callback(batch);
     } catch (error) {
-      console.error('[MessageBatcher] Callback error:', error);
+      logger.error('[MessageBatcher] Callback error:', error);
     }
   }
 

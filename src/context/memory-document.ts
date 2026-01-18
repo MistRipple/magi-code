@@ -3,6 +3,7 @@
  * 负责 Memory 文档的读写、更新和序列化
  */
 
+import { logger, LogCategory } from '../logging';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
@@ -35,13 +36,13 @@ export class MemoryDocument {
       if (fs.existsSync(this.filePath)) {
         const data = fs.readFileSync(this.filePath, 'utf-8');
         this.content = JSON.parse(data);
-        console.log(`[MemoryDocument] 已加载会话 Memory: ${this.sessionId}`);
+        logger.info(`[MemoryDocument] 已加载会话 Memory: ${this.sessionId}`);
       } else {
-        console.log(`[MemoryDocument] 创建新的会话 Memory: ${this.sessionId}`);
+        logger.info(`[MemoryDocument] 创建新的会话 Memory: ${this.sessionId}`);
         await this.save();
       }
     } catch (error) {
-      console.error(`[MemoryDocument] 加载失败:`, error);
+      logger.error(`[MemoryDocument] 加载失败:`, error);
       this.content = createEmptyMemoryContent(this.sessionId, this.sessionName);
     }
   }
@@ -61,9 +62,9 @@ export class MemoryDocument {
       
       fs.writeFileSync(this.filePath, JSON.stringify(this.content, null, 2));
       this.dirty = false;
-      console.log(`[MemoryDocument] 已保存会话 Memory: ${this.sessionId}`);
+      logger.info(`[MemoryDocument] 已保存会话 Memory: ${this.sessionId}`);
     } catch (error) {
-      console.error(`[MemoryDocument] 保存失败:`, error);
+      logger.error(`[MemoryDocument] 保存失败:`, error);
       throw error;
     }
   }

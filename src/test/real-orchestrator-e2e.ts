@@ -51,7 +51,14 @@ async function run() {
     cliFactory,
     taskManager,
     snapshotManager,
-    workspaceRoot
+    workspaceRoot,
+    {
+      review: { selfCheck: false, peerReview: 'never', maxRounds: 0 },
+      planReview: { enabled: false },
+      verification: { compileCheck: false, lintCheck: false, testCheck: false },
+      integration: { enabled: false },
+      strategy: { enableVerification: false, enableRecovery: false, autoRollbackOnFailure: false },
+    }
   );
 
   // 自动确认/澄清/提问回调（避免卡住）

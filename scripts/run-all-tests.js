@@ -24,6 +24,8 @@ const TEST_SUITES = {
   quick: [
     'test-orchestrator-workers-e2e.js',      // 画像系统单元测试
     'test-architecture-optimization.js',     // 架构优化综合测试
+    'test-ui-dedupe-started.js',             // UI 去重/streaming 指示器验证
+    'test-explicit-worker-assignments.js',   // 显式 Worker 指派保留
   ],
 
   // 完整测试 (包括 E2E, < 30秒)
@@ -38,6 +40,8 @@ const TEST_SUITES = {
   unit: [
     'test-orchestrator-workers-e2e.js',
     'test-architecture-optimization.js',
+    'test-ui-dedupe-started.js',
+    'test-explicit-worker-assignments.js',
   ],
 
   // 仅 E2E 测试

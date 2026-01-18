@@ -3,6 +3,7 @@
  * 用于调试和监控消息在各层之间的流转
  */
 
+import { logger, LogCategory } from '../logging';
 import { v4 as uuidv4 } from 'uuid';
 import { EventEmitter } from 'events';
 
@@ -159,14 +160,14 @@ export class MessageTracer extends EventEmitter {
 
     switch (this.config.consoleLevel) {
       case 'verbose':
-        console.log(`${prefix} ${flow}: ${record.summary}`, record.payload || '');
+        logger.info(`${prefix} ${flow}: ${record.summary}`, record.payload || '');
         break;
       case 'normal':
-        console.log(`${prefix} ${flow}: ${record.summary}`);
+        logger.info(`${prefix} ${flow}: ${record.summary}`);
         break;
       case 'minimal':
         if (record.messageType === 'error') {
-          console.log(`${prefix} ${flow}: ${record.summary}`);
+          logger.info(`${prefix} ${flow}: ${record.summary}`);
         }
         break;
     }

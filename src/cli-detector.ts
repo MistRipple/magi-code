@@ -4,6 +4,7 @@
  * 版本: 0.3.0 - 添加健康检查和事件发射
  */
 
+import { logger, LogCategory } from './logging';
 import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import * as vscode from 'vscode';
@@ -60,7 +61,7 @@ export class CLIDetector {
           data: { statuses, timestamp: Date.now() }
         });
       } catch (error) {
-        console.error('[CLIDetector] Health check failed:', error);
+        logger.error('[CLIDetector] Health check failed:', error, LogCategory.CLI);
         // 继续运行，不中断定时器
       }
     }, this.healthCheckPeriod);

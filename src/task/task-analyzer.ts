@@ -1,3 +1,4 @@
+// TASK ANALYZER TEST
 /**
  * 任务分析器
  * 解析用户输入，识别任务类型、复杂度和目标文件
@@ -7,6 +8,7 @@
 
 import { TaskCategory, CLIType } from '../types';
 import { ProfileLoader, CategoryConfig, RiskLevel } from '../orchestrator/profile';
+import { DEFAULT_CATEGORIES_CONFIG } from '../orchestrator/profile/defaults';
 
 /** 任务分析结果 */
 export interface TaskAnalysis {
@@ -46,6 +48,7 @@ const CATEGORY_KEYWORDS: Record<TaskCategory, string[]> = {
   test: ['测试', 'test', '单元测试', 'unit', '覆盖率', 'coverage', 'jest', 'mocha'],
   document: ['文档', '注释', 'doc', 'comment', 'readme', '说明'],
   review: ['审查', 'review', '检查', 'check', '代码审查'],
+  simple: ['简单', '小', '快速', 'simple', 'small', 'quick', '单个'],
   general: [],
 };
 
@@ -142,52 +145,49 @@ export class TaskAnalyzer {
     matchedKeywords: string[];
     categoryConfig?: CategoryConfig;
   } {
-    // 如果有画像系统，优先使用画像配置的关键词
-    if (this.profileLoader) {
-      const categories = this.profileLoader.getAllCategories();
-      const rules = this.profileLoader.getCategoryRules();
+    const categories = this.profileLoader?.getAllCategories();
+    const rules = this.profileLoader?.getCategoryRules() ?? DEFAULT_CATEGORIES_CONFIG.rules;
 
-      let bestMatch: { category: string; score: number; keywords: string[]; config: CategoryConfig } | null = null;
+    let bestMatch: { category: string; score: number; keywords: string[]; config: CategoryConfig } | null = null;
 
-      for (const categoryName of rules.categoryPriority) {
-        const config = categories.get(categoryName);
-        if (!config) continue;
+    for (const categoryName of rules.categoryPriority) {
+      const config = categories?.get(categoryName) || DEFAULT_CATEGORIES_CONFIG.categories[categoryName];
+      if (!config) continue;
 
-        let score = 0;
-        const matched: string[] = [];
+      let score = 0;
+      const matched: string[] = [];
 
-        for (const pattern of config.keywords) {
-          try {
-            const regex = new RegExp(pattern, 'i');
-            if (regex.test(lowerPrompt)) {
-              score += 10;
-              matched.push(pattern);
-            }
-          } catch {
-            if (lowerPrompt.includes(pattern.toLowerCase())) {
-              score += 5;
-              matched.push(pattern);
-            }
+      for (const pattern of config.keywords) {
+        try {
+          const regex = new RegExp(pattern, 'i');
+          if (regex.test(lowerPrompt)) {
+            score += 10;
+            matched.push(pattern);
           }
-        }
-
-        if (score > 0 && (!bestMatch || score > bestMatch.score)) {
-          bestMatch = { category: categoryName, score, keywords: matched, config };
+        } catch {
+          if (lowerPrompt.includes(pattern.toLowerCase())) {
+            score += 5;
+            matched.push(pattern);
+          }
         }
       }
 
-      if (bestMatch) {
-        return {
-          category: bestMatch.category as TaskCategory,
-          matchedKeywords: bestMatch.keywords,
-          categoryConfig: bestMatch.config,
-        };
+      if (score > 0 && (!bestMatch || score > bestMatch.score)) {
+        bestMatch = { category: categoryName, score, keywords: matched, config };
       }
     }
 
-    // 回退到内置关键词匹配
-    const category = this.detectCategory(lowerPrompt);
-    return { category, matchedKeywords: [] };
+    if (bestMatch) {
+      return {
+        category: bestMatch.category as TaskCategory,
+        matchedKeywords: bestMatch.keywords,
+        categoryConfig: bestMatch.config,
+      };
+    }
+
+    const defaultCategory = rules.defaultCategory as TaskCategory;
+    const defaultConfig = categories?.get(defaultCategory) || DEFAULT_CATEGORIES_CONFIG.categories[defaultCategory];
+    return { category: defaultCategory, matchedKeywords: [], categoryConfig: defaultConfig };
   }
 
   /**

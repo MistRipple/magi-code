@@ -3,11 +3,13 @@
  * 基于失败类型的恢复治理，负责 Phase 5 的失败恢复
  */
 
+import { logger, LogCategory } from '../logging';
 import { CLIType } from '../types';
 import { CLIAdapterFactory } from '../cli/adapter-factory';
 import { SnapshotManager } from '../snapshot-manager';
 import { globalEventBus } from '../events';
-import { TaskStateManager, TaskState } from './task-state-manager';
+import { UnifiedTaskManager } from '../task/unified-task-manager';
+import { SubTask } from '../task/types';
 import { VerificationResult } from './verification-runner';
 
 /** 恢复策略 */
@@ -54,18 +56,18 @@ const DEFAULT_CONFIG: RecoveryConfig = {
 export class RecoveryHandler {
   private cliFactory: CLIAdapterFactory;
   private snapshotManager: SnapshotManager;
-  private taskStateManager: TaskStateManager;
+  private unifiedTaskManager: UnifiedTaskManager;
   private config: RecoveryConfig;
 
   constructor(
     cliFactory: CLIAdapterFactory,
     snapshotManager: SnapshotManager,
-    taskStateManager: TaskStateManager,
+    unifiedTaskManager: UnifiedTaskManager,
     config?: Partial<RecoveryConfig>
   ) {
     this.cliFactory = cliFactory;
     this.snapshotManager = snapshotManager;
-    this.taskStateManager = taskStateManager;
+    this.unifiedTaskManager = unifiedTaskManager;
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
 
@@ -74,12 +76,12 @@ export class RecoveryHandler {
    */
   async recover(
     taskId: string,
-    failedTask: TaskState,
+    failedTask: SubTask,
     verificationResult: VerificationResult,
     errorDetails: string
   ): Promise<RecoveryResult> {
-    const attempts = failedTask.attempts;
-    console.log(`[RecoveryHandler] 开始恢复流程，当前尝试次数: ${attempts}`);
+    const attempts = failedTask.retryCount;
+    logger.info(`[RecoveryHandler] 开始恢复流程，当前尝试次数: ${attempts}`, undefined, LogCategory.ORCHESTRATOR);
 
     // 确定恢复策略
     const failureType = this.classifyFailure(errorDetails, verificationResult);
@@ -89,7 +91,7 @@ export class RecoveryHandler {
       data: { attempts, maxAttempts: this.config.maxAttempts, failureType }
     });
     const strategy = this.determineStrategy(attempts, failureType);
-    console.log(`[RecoveryHandler] 失败类型: ${failureType}，选择策略: ${strategy}`);
+    logger.info(`[RecoveryHandler] 失败类型: ${failureType}，选择策略: ${strategy}`, undefined, LogCategory.ORCHESTRATOR);
 
     let result: RecoveryResult;
 
@@ -152,45 +154,51 @@ export class RecoveryHandler {
    */
   private async retrySameCli(
     taskId: string,
-    failedTask: TaskState,
+    failedTask: SubTask,
     errorDetails: string
   ): Promise<RecoveryResult> {
-    console.log(`[RecoveryHandler] 原 CLI 尝试修复: ${failedTask.assignedCli}`);
+    logger.info(`[RecoveryHandler] 原 CLI 尝试修复: ${failedTask.assignedWorker}`, undefined, LogCategory.ORCHESTRATOR);
 
-    this.taskStateManager.resetForRetry(failedTask.id);
-    this.taskStateManager.updateStatus(failedTask.id, 'running');
+    await this.unifiedTaskManager.resetSubTaskForRetry(taskId, failedTask.id);
+    await this.unifiedTaskManager.startSubTask(taskId, failedTask.id);
 
     const fixPrompt = this.buildFixPrompt(failedTask, errorDetails, 'simple');
 
     try {
-      const response = await this.cliFactory.sendMessage(failedTask.assignedCli, fixPrompt);
+      const response = await this.cliFactory.sendMessage(failedTask.assignedWorker, fixPrompt);
 
       if (response.error) {
-        this.taskStateManager.updateStatus(failedTask.id, 'failed', response.error);
+        await this.unifiedTaskManager.failSubTask(taskId, failedTask.id, response.error);
         return {
           success: false,
           strategy: 'retry_same_cli',
-          attempts: failedTask.attempts,
+          attempts: failedTask.retryCount,
           message: `修复失败: ${response.error}`,
         };
       }
 
-      this.taskStateManager.updateStatus(failedTask.id, 'completed');
       if (response.content) {
-        this.taskStateManager.setResult(failedTask.id, response.content);
+        await this.unifiedTaskManager.completeSubTask(taskId, failedTask.id, {
+          cliType: failedTask.assignedWorker,
+          success: true,
+          output: response.content || '',
+          modifiedFiles: failedTask.modifiedFiles || [],
+          duration: 0,
+          timestamp: new Date(),
+        });
       }
       return {
         success: true,
         strategy: 'retry_same_cli',
-        attempts: failedTask.attempts,
+        attempts: failedTask.retryCount,
         message: '原 CLI 修复成功',
       };
     } catch (error) {
-      this.taskStateManager.updateStatus(failedTask.id, 'failed', String(error));
+      await this.unifiedTaskManager.failSubTask(taskId, failedTask.id, String(error));
       return {
         success: false,
         strategy: 'retry_same_cli',
-        attempts: failedTask.attempts,
+        attempts: failedTask.retryCount,
         message: `修复异常: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
@@ -201,45 +209,51 @@ export class RecoveryHandler {
    */
   private async retryWithContext(
     taskId: string,
-    failedTask: TaskState,
+    failedTask: SubTask,
     errorDetails: string
   ): Promise<RecoveryResult> {
-    console.log(`[RecoveryHandler] 提供更多上下文给 ${failedTask.assignedCli}`);
+    logger.info(`[RecoveryHandler] 提供更多上下文给 ${failedTask.assignedWorker}`, undefined, LogCategory.ORCHESTRATOR);
 
-    this.taskStateManager.resetForRetry(failedTask.id);
-    this.taskStateManager.updateStatus(failedTask.id, 'running');
+    await this.unifiedTaskManager.resetSubTaskForRetry(taskId, failedTask.id);
+    await this.unifiedTaskManager.startSubTask(taskId, failedTask.id);
 
     const fixPrompt = this.buildFixPrompt(failedTask, errorDetails, 'detailed');
 
     try {
-      const response = await this.cliFactory.sendMessage(failedTask.assignedCli, fixPrompt);
+      const response = await this.cliFactory.sendMessage(failedTask.assignedWorker, fixPrompt);
 
       if (response.error) {
-        this.taskStateManager.updateStatus(failedTask.id, 'failed', response.error);
+        await this.unifiedTaskManager.failSubTask(taskId, failedTask.id, response.error);
         return {
           success: false,
           strategy: 'retry_with_context',
-          attempts: failedTask.attempts,
+          attempts: failedTask.retryCount,
           message: `带上下文修复失败: ${response.error}`,
         };
       }
 
-      this.taskStateManager.updateStatus(failedTask.id, 'completed');
       if (response.content) {
-        this.taskStateManager.setResult(failedTask.id, response.content);
+        await this.unifiedTaskManager.completeSubTask(taskId, failedTask.id, {
+          cliType: failedTask.assignedWorker,
+          success: true,
+          output: response.content || '',
+          modifiedFiles: failedTask.modifiedFiles || [],
+          duration: 0,
+          timestamp: new Date(),
+        });
       }
       return {
         success: true,
         strategy: 'retry_with_context',
-        attempts: failedTask.attempts,
+        attempts: failedTask.retryCount,
         message: '带上下文修复成功',
       };
     } catch (error) {
-      this.taskStateManager.updateStatus(failedTask.id, 'failed', String(error));
+      await this.unifiedTaskManager.failSubTask(taskId, failedTask.id, String(error));
       return {
         success: false,
         strategy: 'retry_with_context',
-        attempts: failedTask.attempts,
+        attempts: failedTask.retryCount,
         message: `修复异常: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
@@ -250,13 +264,13 @@ export class RecoveryHandler {
    */
   private async escalateToClaude(
     taskId: string,
-    failedTask: TaskState,
+    failedTask: SubTask,
     errorDetails: string
   ): Promise<RecoveryResult> {
-    console.log(`[RecoveryHandler] 升级到 ${this.config.escalateCli}`);
+    logger.info(`[RecoveryHandler] 升级到 ${this.config.escalateCli}`, undefined, LogCategory.ORCHESTRATOR);
 
-    this.taskStateManager.resetForRetry(failedTask.id);
-    this.taskStateManager.updateStatus(failedTask.id, 'running');
+    await this.unifiedTaskManager.resetSubTaskForRetry(taskId, failedTask.id);
+    await this.unifiedTaskManager.startSubTask(taskId, failedTask.id);
 
     const escalatePrompt = this.buildEscalatePrompt(failedTask, errorDetails);
 
@@ -264,31 +278,37 @@ export class RecoveryHandler {
       const response = await this.cliFactory.sendMessage(this.config.escalateCli, escalatePrompt);
 
       if (response.error) {
-        this.taskStateManager.updateStatus(failedTask.id, 'failed', response.error);
+        await this.unifiedTaskManager.failSubTask(taskId, failedTask.id, response.error);
         return {
           success: false,
           strategy: 'escalate_to_claude',
-          attempts: failedTask.attempts,
+          attempts: failedTask.retryCount,
           message: `Claude 修复失败: ${response.error}`,
         };
       }
 
-      this.taskStateManager.updateStatus(failedTask.id, 'completed');
       if (response.content) {
-        this.taskStateManager.setResult(failedTask.id, response.content);
+        await this.unifiedTaskManager.completeSubTask(taskId, failedTask.id, {
+          cliType: failedTask.assignedWorker,
+          success: true,
+          output: response.content || '',
+          modifiedFiles: failedTask.modifiedFiles || [],
+          duration: 0,
+          timestamp: new Date(),
+        });
       }
       return {
         success: true,
         strategy: 'escalate_to_claude',
-        attempts: failedTask.attempts,
+        attempts: failedTask.retryCount,
         message: 'Claude 修复成功',
       };
     } catch (error) {
-      this.taskStateManager.updateStatus(failedTask.id, 'failed', String(error));
+      await this.unifiedTaskManager.failSubTask(taskId, failedTask.id, String(error));
       return {
         success: false,
         strategy: 'escalate_to_claude',
-        attempts: failedTask.attempts,
+        attempts: failedTask.retryCount,
         message: `Claude 修复异常: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
@@ -299,15 +319,15 @@ export class RecoveryHandler {
    */
   private async performRollback(
     taskId: string,
-    failedTask: TaskState
+    failedTask: SubTask
   ): Promise<RecoveryResult> {
-    console.log(`[RecoveryHandler] 执行回滚`);
+    logger.info(`[RecoveryHandler] 执行回滚`, undefined, LogCategory.ORCHESTRATOR);
 
     if (!this.config.enableRollback) {
       return {
         success: false,
         strategy: 'rollback',
-        attempts: failedTask.attempts,
+        attempts: failedTask.retryCount,
         message: '回滚已禁用，任务失败',
         rolledBack: false,
       };
@@ -321,21 +341,21 @@ export class RecoveryHandler {
         this.snapshotManager.revertToSnapshot(file);
       }
 
-      this.taskStateManager.updateStatus(failedTask.id, 'cancelled', '已回滚');
+      await this.unifiedTaskManager.skipSubTask(taskId, failedTask.id);
 
       return {
         success: false,
         strategy: 'rollback',
-        attempts: failedTask.attempts,
+        attempts: failedTask.retryCount,
         message: `任务失败，已回滚 ${modifiedFiles.length} 个文件`,
         rolledBack: true,
       };
     } catch (error) {
-      this.taskStateManager.updateStatus(failedTask.id, 'failed', String(error));
+      await this.unifiedTaskManager.failSubTask(taskId, failedTask.id, String(error));
       return {
         success: false,
         strategy: 'rollback',
-        attempts: failedTask.attempts,
+        attempts: failedTask.retryCount,
         message: `回滚失败: ${error instanceof Error ? error.message : String(error)}`,
         rolledBack: false,
       };
@@ -366,7 +386,7 @@ export class RecoveryHandler {
    * 构建修复 Prompt
    */
   private buildFixPrompt(
-    task: TaskState,
+    task: SubTask,
     errorDetails: string,
     level: 'simple' | 'detailed'
   ): string {
@@ -386,7 +406,7 @@ ${errorDetails}
 
     // detailed level - 提供更多上下文
     return `
-之前的任务执行失败，这是第 ${task.attempts + 1} 次尝试修复。
+之前的任务执行失败，这是第 ${task.retryCount + 1} 次尝试修复。
 
 ## 原始任务
 ${task.description}
@@ -410,14 +430,14 @@ ${errorDetails}
   /**
    * 构建升级到 Claude 的 Prompt
    */
-  private buildEscalatePrompt(task: TaskState, errorDetails: string): string {
+  private buildEscalatePrompt(task: SubTask, errorDetails: string): string {
     return `
 一个任务在多次尝试后仍然失败，需要你的帮助来分析和修复。
 
 ## 任务信息
 - 描述: ${task.description}
-- 原执行者: ${task.assignedCli}
-- 尝试次数: ${task.attempts}
+- 原执行者: ${task.assignedWorker}
+- 尝试次数: ${task.retryCount}
 - 修改的文件: ${task.modifiedFiles?.join(', ') || '未知'}
 
 ## 错误信息
@@ -436,25 +456,25 @@ ${errorDetails}
   /**
    * 检查是否应该继续恢复
    */
-  shouldContinueRecovery(task: TaskState): boolean {
-    return task.attempts < this.config.maxAttempts;
+  shouldContinueRecovery(task: SubTask): boolean {
+    return task.retryCount < this.config.maxAttempts;
   }
 
   /**
    * 获取恢复统计
    */
-  getRecoveryStats(tasks: TaskState[]): {
+  getRecoveryStats(tasks: SubTask[]): {
     totalRecoveries: number;
     successfulRecoveries: number;
     failedRecoveries: number;
     rollbacks: number;
   } {
-    const recoveredTasks = tasks.filter(t => t.attempts > 0);
+    const recoveredTasks = tasks.filter(t => t.retryCount > 0);
     return {
       totalRecoveries: recoveredTasks.length,
       successfulRecoveries: recoveredTasks.filter(t => t.status === 'completed').length,
       failedRecoveries: recoveredTasks.filter(t => t.status === 'failed').length,
-      rollbacks: recoveredTasks.filter(t => t.status === 'cancelled').length,
+      rollbacks: recoveredTasks.filter(t => t.status === 'skipped').length,
     };
   }
 }

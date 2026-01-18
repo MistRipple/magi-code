@@ -1,3 +1,4 @@
+// UI ADAPTER SMOKE TEST
 /**
  * StandardMessageAdapter - Webview 端标准消息适配器
  *
@@ -15,6 +16,7 @@ import {
   type ThinkingBlock,
   type ToolCallBlock,
   type MessageType,
+  type MessageMetadata,
 } from '../../protocol';
 
 /**
@@ -39,6 +41,7 @@ export interface WebviewMessage {
     output?: string;
     error?: string;
   }>;
+  metadata?: MessageMetadata;
   interrupted?: boolean;
   timeout?: boolean;
   error?: string;
@@ -63,6 +66,7 @@ export function standardToWebview(message: StandardMessage): WebviewMessage {
     cli: message.cli,
     thinking: extractThinking(message.blocks),
     toolCalls: extractToolCalls(message.blocks),
+    metadata: message.metadata,
     // 标准消息扩展字段
     standardMessageId: message.id,
     traceId: message.traceId,
@@ -71,7 +75,7 @@ export function standardToWebview(message: StandardMessage): WebviewMessage {
   };
 
   // 处理特殊状态
-  if (message.lifecycle === 'interrupted') {
+  if (message.lifecycle === 'cancelled') {
     webviewMsg.interrupted = true;
     webviewMsg.streaming = false;
   }
@@ -125,7 +129,7 @@ export function applyStreamUpdate(
     case 'lifecycle_change':
       if (update.lifecycle === MessageLifecycle.COMPLETED ||
           update.lifecycle === MessageLifecycle.FAILED ||
-          update.lifecycle === MessageLifecycle.INTERRUPTED) {
+          update.lifecycle === MessageLifecycle.CANCELLED) {
         updated.streaming = false;
       }
       break;

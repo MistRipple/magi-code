@@ -13,6 +13,7 @@
  * Level 4: 硬编码默认值
  */
 
+import { logger, LogCategory } from '../logging';
 import { CLIType } from '../types';
 import { ExecutionStats } from '../orchestrator/execution-stats';
 import { ProfileLoader } from '../orchestrator/profile/profile-loader';
@@ -156,7 +157,7 @@ export class ConflictResolver {
       }
 
       // 用户选择的 CLI 不健康，提示降级
-      console.warn(
+      logger.warn(
         `[ConflictResolver] 用户指定的 ${userPreference} 健康度不足 ` +
         `(${(stats.successRate * 100).toFixed(0)}% < ${this.config.healthThreshold * 100}%), 考虑降级`
       );

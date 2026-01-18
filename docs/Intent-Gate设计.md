@@ -1,135 +1,72 @@
-# Intent Gate 设计文档
+# Intent Gate 设计文档（AI 决策版）
 
-> 版本: 1.0 | 日期: 2025-01-16
+> 版本: 2.0 | 日期: 2026-01-18
 
 ## 1. 设计背景
 
-### 1.1 当前问题
+我们是“智能编排工具”。核心价值是让系统像“智能项目经理”：理解用户意图并选择最合适的流程路径，尽可能减少不必要的澄清与阻塞。
 
-用户输入直接进入任务分析流程，缺少意图判断：
-- 用户问"你可以做什么" → 系统生成执行计划 → 弹出确认卡片 ❌
-- 正确行为：识别为问答 → 直接回答 ✅
+本版本不使用规则分类作为主流程，仅保留执行控制与安全约束；意图判断由 AI 决策完成。
 
-### 1.2 参考：Oh-My-OpenCode 的 Intent Gate
+## 2. 设计原则
 
-```
-Phase 0 - Intent Gate (EVERY message)
-├── Step 1: Classify Request Type
-├── Step 2: Check for Ambiguity  
-└── Step 3: Validate Before Acting
-```
+1. **AI 主导意图选择**：ASK / DIRECT / EXPLORE / TASK / CLARIFY 由 AI 决策。
+2. **少打断，多推进**：能分析就进入 TASK；只有无法推进时才 CLARIFY。
+3. **澄清必须具体问题**：没有问题就不允许进入 CLARIFY。
+4. **能力咨询直答**：能力/可行性类问题直接 ASK。
+5. **置信度可观测**：记录置信度与决策理由，便于追踪体验问题。
 
-**核心原则**：NEVER START IMPLEMENTING, UNLESS USER WANTS YOU TO IMPLEMENT SOMETHING EXPLICITLY
+## 3. 决策输出规范（JSON）
 
-## 2. 意图类型定义
-
-| 类型 | 英文 | 信号特征 | 处理方式 |
-|------|------|----------|----------|
-| 问答咨询 | QUESTION | 问号、"是什么"、"为什么"、短文本 | 直接回答 |
-| 简单操作 | TRIVIAL | 单文件、已知位置、简单修改 | 直接执行 |
-| 明确任务 | EXPLICIT | 具体文件、明确命令、代码块 | 任务分析→执行 |
-| 探索分析 | EXPLORATORY | "怎么工作"、"找到X"、"分析" | 探索→回答 |
-| 开放需求 | OPEN_ENDED | "改进"、"重构"、"添加功能" | 评估→计划→执行 |
-| 模糊请求 | AMBIGUOUS | 范围不清、多种解释 | **询问澄清** |
-
-## 3. 分类规则
-
-### 3.1 快速路径（规则匹配）
-
-```typescript
-// 明显问答
-if (hasQuestionMark || hasQuestionKeyword && !hasTaskKeyword) {
-  return IntentType.QUESTION;
-}
-
-// 明显任务
-if (hasCodeBlock || hasFilePath || hasExplicitTaskKeyword) {
-  return IntentType.EXPLICIT;
-}
-
-// 短文本无任务词
-if (length <= 30 && !hasTaskKeyword) {
-  return IntentType.QUESTION;
+```json
+{
+  "intent": "question|trivial|exploratory|task|ambiguous|open_ended",
+  "recommendedMode": "ask|direct|explore|task|clarify",
+  "confidence": 0-1,
+  "needsClarification": true/false,
+  "clarificationQuestions": ["问题1","问题2"],
+  "reason": "一句话原因"
 }
 ```
 
-### 3.2 LLM 辅助分类（复杂情况）
+约束：
+- 能力/可行性询问 → 推荐 `ask`
+- 有明确执行意图但信息不全 → 推荐 `task`，可将 `needsClarification=true`
+- 只有在确实无法推进时才推荐 `clarify`
+- `clarificationQuestions` 最多 3 个；不澄清则为空数组
 
-当规则无法确定时，使用轻量级 LLM 调用进行意图分类。
-
-## 4. 歧义检查规则
-
-| 情况 | 行动 |
-|------|------|
-| 单一有效解释 | 继续执行 |
-| 多种解释，工作量相似 | 继续，注明假设 |
-| 多种解释，工作量差2倍+ | **必须询问** |
-| 缺少关键信息（文件、错误、上下文） | **必须询问** |
-| 用户设计有明显问题 | **提出关注** |
-
-## 5. 处理路由
-
-```
-IntentType.QUESTION     → executeAskMode()      // 直接回答
-IntentType.TRIVIAL      → executeDirectMode()   // 直接执行
-IntentType.EXPLICIT     → executeTaskMode()     // 任务分析→执行
-IntentType.EXPLORATORY  → executeExploreMode()  // 探索→回答
-IntentType.OPEN_ENDED   → executeTaskMode()     // 评估→计划→执行
-IntentType.AMBIGUOUS    → executeClarifyMode()  // 询问澄清
-```
-
-## 6. 架构集成
-
-### 6.1 新增组件
-
-```
-src/orchestrator/
-├── intent-gate.ts           # 🆕 意图门控
-├── intent-classifier.ts     # 🆕 意图分类器
-├── clarification-handler.ts # 🆕 澄清处理器
-└── orchestrator-agent.ts    # 修改：集成 Intent Gate
-```
-
-### 6.2 执行流程
+## 4. 流程路由
 
 ```
 用户输入
-    ↓
-IntentGate.classify(prompt)
-    ↓
+  ↓
+AI Intent Decision (JSON)
+  ↓
 ┌─────────────────────────────────────┐
-│ QUESTION → Ask Mode (直接回答)       │
-│ TRIVIAL  → Direct Mode (直接执行)    │
-│ EXPLICIT → Task Mode (任务分析)      │
-│ EXPLORATORY → Explore Mode (探索)   │
-│ OPEN_ENDED → Task Mode (计划执行)   │
-│ AMBIGUOUS → Clarify Mode (询问澄清) │
+│ ask      → executeAskMode()         │
+│ direct   → 直接执行(轻量)           │
+│ explore  → executeExploreMode()     │
+│ task     → 任务分析 → 执行           │
+│ clarify  → clarifying questions     │
 └─────────────────────────────────────┘
-    ↓
-执行对应处理器
 ```
 
-## 7. 与现有架构的关系
+## 5. 澄清策略
 
-### 7.1 保留的组件
-- OrchestratorAgent：编排者核心逻辑
-- WorkerAgent：执行者
-- TaskAnalyzer：任务分析（用于 EXPLICIT/OPEN_ENDED）
-- RiskPolicy：风险评估
+- **轻度澄清**：1 个问题，目标/范围/模块
+- **重度澄清**：2–3 个问题，仅在 AI 明确无法推进时
+- **不允许空澄清**：问题为空直接回退为 task
 
-### 7.2 修改的组件
-- IntelligentOrchestrator.execute()：入口处集成 Intent Gate
-- TaskAnalyzer：增强 isQuestion 为完整的意图分类
+## 6. 组件关系
 
-### 7.3 新增的组件
-- IntentGate：意图门控入口
-- IntentClassifier：意图分类器
-- ClarificationHandler：澄清对话处理
+```
+OrchestratorAgent
+ ├─ IntentGate (AI Decision)
+ ├─ TaskAnalyzer (仅用于 task 细分/分析)
+ └─ ClarificationCallback (UI)
+```
 
-## 8. 实现优先级
+## 7. 兼容性策略
 
-1. **P0**：IntentClassifier 基础实现（规则分类）
-2. **P1**：IntentGate 集成到 execute() 入口
-3. **P2**：ClarificationHandler 澄清机制
-4. **P3**：LLM 辅助分类（复杂情况）
+本版本为 **AI 决策主路径**，不保留规则分类的兼容入口。
 

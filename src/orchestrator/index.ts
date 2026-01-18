@@ -49,7 +49,6 @@ export * from './prompts/orchestrator-prompts';
 export {
   TaskStateManager,
   type TaskState,
-  type TaskStatus,
   type StateChangeCallback,
 } from './task-state-manager';
 

@@ -1,3 +1,4 @@
+import { logger, LogCategory } from '../logging';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -44,7 +45,7 @@ export class ExecutionStateManager {
       const content = fs.readFileSync(filePath, 'utf-8');
       return JSON.parse(content) as ExecutionState;
     } catch (error) {
-      console.warn('[ExecutionState] 读取状态失败:', sessionId, error);
+      logger.warn('[ExecutionState] 读取状态失败:', { sessionId, error }, LogCategory.ORCHESTRATOR);
       return null;
     }
   }
