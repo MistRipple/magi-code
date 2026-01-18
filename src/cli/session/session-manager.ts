@@ -3,6 +3,7 @@ import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
 import * as crypto from 'crypto';
 import { PrintSession } from './print-session';
+import type { CLIQuestion } from './print-session';
 import { InteractiveSession } from './interactive-session';
 import type { CLIType } from '../types';
 import type { SessionMessage, SessionProcess, SessionProcessOptions, SessionResponse } from './types';
@@ -266,9 +267,8 @@ export class SessionManager extends EventEmitter {
     });
 
     // 监听 CLI 询问事件
-    sessionProcess.on('question', (...args: unknown[]) => {
-      const question = args[0];
-      this.emit('question', { cli, role, question });
+    sessionProcess.on('question', (question) => {
+      this.emit('question', { cli, role, question: question as CLIQuestion });
     });
 
     // 监听询问超时事件
