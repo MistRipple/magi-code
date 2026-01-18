@@ -2,6 +2,7 @@
  * MultiCLI VSCode 扩展入口
  */
 
+import { logger, LogCategory } from './logging';
 import * as vscode from 'vscode';
 import { WebviewProvider } from './ui/webview-provider';
 import { cliDetector } from './cli-detector';
@@ -14,7 +15,7 @@ let statusBarItem: vscode.StatusBarItem | undefined;
  * 扩展激活
  */
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  console.log('MultiCLI 扩展已激活');
+  logger.info('MultiCLI 扩展已激活', undefined, LogCategory.CLI);
 
   // 获取工作区根目录
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -69,8 +70,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     updateStatusBar('failed');
     vscode.commands.executeCommand('setContext', 'multiCliTaskRunning', false);
   });
-  globalEventBus.on('task:interrupted', () => {
-    updateStatusBar('interrupted');
+  globalEventBus.on('task:cancelled', () => {
+    updateStatusBar('cancelled');
     vscode.commands.executeCommand('setContext', 'multiCliTaskRunning', false);
   });
 
@@ -84,17 +85,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       dispose: () => cliDetector.stopHealthCheck()
     });
   } catch (error) {
-    console.error('[Extension] Failed to start health check:', error);
+    logger.error('[Extension] Failed to start health check:', error);
     vscode.window.showWarningMessage('MultiCLI: 健康检查启动失败，部分功能可能受限');
   }
 
-  console.log('MultiCLI 初始化完成');
+  logger.info('MultiCLI 初始化完成', undefined, LogCategory.CLI);
 }
 
 /**
  * 更新状态栏显示
  */
-function updateStatusBar(status: 'idle' | 'running' | 'completed' | 'failed' | 'interrupted'): void {
+function updateStatusBar(status: 'idle' | 'running' | 'completed' | 'failed' | 'cancelled'): void {
   if (!statusBarItem) return;
 
   switch (status) {
@@ -122,9 +123,9 @@ function updateStatusBar(status: 'idle' | 'running' | 'completed' | 'failed' | '
       // 5秒后恢复默认状态
       setTimeout(() => updateStatusBar('idle'), 5000);
       break;
-    case 'interrupted':
+    case 'cancelled':
       statusBarItem.text = '$(debug-pause) MultiCLI';
-      statusBarItem.tooltip = '任务已打断';
+      statusBarItem.tooltip = '任务已取消';
       statusBarItem.backgroundColor = undefined;
       // 3秒后恢复默认状态
       setTimeout(() => updateStatusBar('idle'), 3000);
@@ -197,14 +198,14 @@ function registerCommands(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('multiCli.interruptTask', () => {
-      globalEventBus.emitEvent('task:interrupt', {});
-      vscode.window.showInformationMessage('MultiCLI: 正在打断任务...');
+      globalEventBus.emitEvent('task:cancelled', {});
+      vscode.window.showInformationMessage('MultiCLI: 正在取消任务...');
     })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('multiCli.stopTask', () => {
-      globalEventBus.emitEvent('task:interrupt', {});
+      globalEventBus.emitEvent('task:cancelled', {});
     })
   );
 }
@@ -237,7 +238,7 @@ async function detectAndNotifyCLIs(): Promise<{ claudeAvailable: boolean; codexA
     }
   } else {
     // Claude 可用，显示版本信息
-    console.log(`Claude CLI 已就绪: v${claudeStatus?.version}`);
+    logger.info(`Claude CLI 已就绪: v${claudeStatus?.version}`, undefined, LogCategory.CLI);
   }
 
   // Codex 和 Gemini 是可选的
@@ -270,29 +271,29 @@ async function detectAndNotifyCLIs(): Promise<{ claudeAvailable: boolean; codexA
  * 扩展停用 - 增强版：确保所有资源被正确清理
  */
 export async function deactivate(): Promise<void> {
-  console.log('MultiCLI 扩展正在停用...');
+  logger.info('MultiCLI 扩展正在停用...', undefined, LogCategory.CLI);
 
   try {
     // 1. 停止健康检查
     cliDetector.stopHealthCheck();
-    console.log('[deactivate] 健康检查已停止');
+    logger.info('[deactivate] 健康检查已停止');
 
     // 2. 清理 WebviewProvider（包括 CLI 进程、编排器、事件监听器）
     if (webviewProvider) {
       await webviewProvider.dispose();
       webviewProvider = undefined;
-      console.log('[deactivate] WebviewProvider 已清理');
+      logger.info('[deactivate] WebviewProvider 已清理', undefined, LogCategory.UI);
     }
 
     // 3. 清理状态栏
     if (statusBarItem) {
       statusBarItem.dispose();
       statusBarItem = undefined;
-      console.log('[deactivate] 状态栏已清理');
+      logger.info('[deactivate] 状态栏已清理');
     }
 
-    console.log('MultiCLI 扩展已完全停用');
+    logger.info('MultiCLI 扩展已完全停用', undefined, LogCategory.CLI);
   } catch (error) {
-    console.error('[deactivate] 清理资源时出错:', error);
+    logger.error('[deactivate] 清理资源时出错:', error);
   }
 }

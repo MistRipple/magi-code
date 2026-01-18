@@ -1,3 +1,5 @@
+<!-- UI MULTI TEST -->
+<!-- UI MULTI SMOKE TEST -->
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -324,14 +326,21 @@
     .subtask-status-item { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: var(--radius-2); background: rgba(255, 255, 255, 0.02); border: 1px solid transparent; transition: all 0.15s; }
     .subtask-status-item:hover { background: rgba(255, 255, 255, 0.04); }
     .subtask-status-item.running { border-color: rgba(59, 130, 246, 0.3); background: rgba(59, 130, 246, 0.05); }
+    .subtask-status-item.paused { border-color: rgba(245, 158, 11, 0.3); background: rgba(245, 158, 11, 0.05); }
+    .subtask-status-item.retrying { border-color: rgba(255, 197, 61, 0.3); background: rgba(255, 197, 61, 0.05); }
     .subtask-status-item.completed { border-color: rgba(34, 197, 94, 0.3); }
     .subtask-status-item.failed { border-color: rgba(239, 68, 68, 0.3); }
+    .subtask-status-item.cancelled { border-color: rgba(136, 136, 136, 0.3); }
     .subtask-status-icon { width: 16px; height: 16px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
     .subtask-status-icon svg { width: 14px; height: 14px; fill: currentColor; }
     .subtask-status-icon.pending { color: var(--vscode-descriptionForeground); }
     .subtask-status-icon.running { color: #3b82f6; animation: pulse 1.5s infinite; }
+    .subtask-status-icon.paused { color: #f59e0b; }
+    .subtask-status-icon.retrying { color: #ffc53d; animation: pulse 1.5s infinite; }
     .subtask-status-icon.completed { color: #22c55e; }
     .subtask-status-icon.failed { color: #ef4444; }
+    .subtask-status-icon.cancelled { color: #888; }
+    .subtask-status-icon.skipped { color: #888; opacity: 0.6; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
     .subtask-status-cli { font-size: 10px; padding: 2px 6px; border-radius: var(--radius-1); text-transform: uppercase; font-weight: 500; }
     .subtask-status-cli.claude { background: rgba(139, 92, 246, 0.15); color: #a78bfa; }
@@ -1116,7 +1125,7 @@
       white-space: pre;
       min-height: 1.5em;
     }
-    /* 差异高亮 */
+    /* 差异高亮 - 🔧 修复：保留原始 +/- 字符支持复制 */
     .code-line.diff-add {
       background: rgba(34, 197, 94, 0.15);
       border-left: 3px solid var(--color-success, #22c55e);
@@ -1131,18 +1140,8 @@
       text-decoration: line-through;
       opacity: 0.7;
     }
-    .code-line.diff-add::before {
-      content: '+';
-      color: var(--color-success, #22c55e);
-      font-weight: bold;
-      margin-right: 4px;
-    }
-    .code-line.diff-del::before {
-      content: '-';
-      color: var(--color-error, #ef4444);
-      font-weight: bold;
-      margin-right: 4px;
-    }
+    /* 🔧 移除 ::before 伪元素，因为现在 +/- 保留在原始文本中 */
+    /* 通过颜色区分即可，不再重复添加前缀 */
     /* Webkit 滚动条样式 */
     .markdown-code-content::-webkit-scrollbar {
       width: 6px;
@@ -1480,6 +1479,10 @@
       white-space: pre-wrap;
     }
     .tool-text { font-size: 12px; line-height: 1.5; color: var(--vscode-foreground); }
+    .tool-section { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+    .tool-section:last-child { margin-bottom: 0; }
+    .tool-section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--vscode-descriptionForeground); }
+    .summary-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
 
     /* 重连状态提示 */
     .reconnect-indicator {
@@ -1527,8 +1530,11 @@
     .task-status { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: var(--vscode-descriptionForeground); }
     .task-status.pending { background: var(--vscode-descriptionForeground); opacity: 0.5; }
     .task-status.running { background: #ffc53d; animation: statusPulse 1.5s ease-in-out infinite; }
+    .task-status.paused { background: #f59e0b; opacity: 0.7; }
+    .task-status.retrying { background: #ffc53d; animation: statusPulse 1.5s ease-in-out infinite; }
     .task-status.completed { background: #3dd68c; }
     .task-status.failed { background: #e5484d; }
+    .task-status.cancelled { background: #888; opacity: 0.6; }
     .task-status.skipped { background: #888; opacity: 0.5; }
     @keyframes statusPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
     .task-info { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
@@ -2236,7 +2242,7 @@
 
         <!-- 底部：配置路径 + 操作按钮 -->
         <div class="profile-footer">
-          <span class="profile-config-hint">配置存储：<code>~/.multicli/config/</code></span>
+          <span class="profile-config-hint">配置存储：<code>~/.multicli/</code></span>
           <div class="profile-actions">
             <button class="settings-btn secondary" id="profile-reset-btn">重置</button>
             <button class="settings-btn" id="profile-save-btn">保存</button>
@@ -2314,33 +2320,18 @@
         };
     window.vscode = vscode;
 
-    // 🆕 配置 marked 和 highlight.js
-    // 配置 marked 使用 highlight.js 进行代码高亮
-    if (typeof marked !== 'undefined' && typeof hljs !== 'undefined') {
+    // 🔧 marked v12 兼容性修复：配置 marked 基础选项
+    // 注意：highlight 选项在 marked v5+ 中已废弃，代码高亮通过自定义 renderer.code 处理
+    if (typeof marked !== 'undefined') {
       marked.setOptions({
-        highlight: function(code, lang) {
-          if (lang && hljs.getLanguage(lang)) {
-            try {
-              return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
-            } catch (e) {
-              console.warn('[Marked] highlight error:', e);
-            }
-          }
-          // 自动检测语言
-          try {
-            return hljs.highlightAuto(code).value;
-          } catch (e) {
-            return code;
-          }
-        },
         breaks: true,        // 支持 GFM 换行
         gfm: true,           // 启用 GitHub Flavored Markdown
         headerIds: false,    // 禁用标题 ID（避免安全问题）
         mangle: false,       // 禁用邮箱地址混淆
       });
-      console.log('[MultiCLI] marked + highlight.js 初始化成功');
+      console.log('[MultiCLI] marked 初始化成功' + (typeof hljs !== 'undefined' ? '，highlight.js 已加载' : ''));
     } else {
-      console.warn('[MultiCLI] marked 或 highlight.js 未加载');
+      console.warn('[MultiCLI] marked 库未加载');
     }
 
     // 🔧 问题2修复：全局错误处理
@@ -3010,6 +3001,10 @@
           console.log('[Webview] 忽略非当前会话的 confirmationRequest');
           return;
         }
+        if (typeof currentInteractionMode !== 'undefined' && currentInteractionMode === 'ask') {
+          console.log('[Webview] Ask 模式忽略 confirmationRequest');
+          return;
+        }
         showPlanConfirmation(msg.plan, msg.formattedPlan);
       }
       // 🔧 处理 CLI 询问事件
@@ -3313,6 +3308,26 @@
       renderMainContent();
     }
 
+    function hasPendingCliQuestion() {
+      return !!window._pendingCliQuestion;
+    }
+
+    function handleCliQuestionAnswer(answer, cancelled) {
+      if (!window._pendingCliQuestion) return;
+      const pending = window._pendingCliQuestion;
+      window._pendingCliQuestion = null;
+      answerCliQuestion(pending.cli || 'claude', pending.questionId || '', cancelled ? '' : (answer || ''), pending.adapterRole || 'worker');
+      const input = document.getElementById('prompt-input');
+      if (input) {
+        input.placeholder = '描述你的任务... (可粘贴图片)';
+      }
+      if (!cancelled) {
+        setProcessingState(true);
+      }
+      saveWebviewState();
+      renderMainContent();
+    }
+
     function handleQuestionAnswer(answer, cancelled) {
       const idx = threadMessages.findIndex(m => m.type === 'question_request' && m.isPending);
       if (idx === -1) return;
@@ -3330,6 +3345,11 @@
       smoothScrollToBottom();
     }
 
+    function findCliQuestionIndex(list, cli, questionId) {
+      if (!Array.isArray(list) || !questionId) return -1;
+      return list.findIndex(m => m.type === 'cli_question' && m.questionId === questionId && m.cli === cli);
+    }
+
     // 🔧 显示 CLI 询问卡片
     function showCliQuestion(msg) {
       console.log('[Webview] 收到 CLI 询问:', msg);
@@ -3340,7 +3360,7 @@
         cliOutputs[cli] = [];
       }
 
-      // 添加询问消息
+      // 添加/更新询问消息
       const questionMsg = {
         role: 'cli_question',
         type: 'cli_question',
@@ -3354,14 +3374,39 @@
         adapterRole: msg.adapterRole
       };
 
-      cliOutputs[cli].push(questionMsg);
+      const existingCliIdx = findCliQuestionIndex(cliOutputs[cli], cli, msg.questionId);
+      if (existingCliIdx !== -1) {
+        cliOutputs[cli][existingCliIdx] = { ...cliOutputs[cli][existingCliIdx], ...questionMsg };
+      } else {
+        cliOutputs[cli].push(questionMsg);
+      }
 
       // 同时在 Thread 面板显示（如果是 orchestrator 模式）
       if (msg.adapterRole === 'orchestrator') {
-        threadMessages.push({
-          ...questionMsg,
-          role: 'system'
-        });
+        const existingThreadIdx = findCliQuestionIndex(threadMessages, cli, msg.questionId);
+        if (existingThreadIdx !== -1) {
+          threadMessages[existingThreadIdx] = {
+            ...threadMessages[existingThreadIdx],
+            ...questionMsg,
+            role: 'system'
+          };
+        } else {
+          threadMessages.push({
+            ...questionMsg,
+            role: 'system'
+          });
+        }
+      }
+
+      if (!window._pendingCliQuestion ||
+        window._pendingCliQuestion.questionId !== msg.questionId ||
+        window._pendingCliQuestion.cli !== cli) {
+        window._pendingCliQuestion = {
+          cli: cli,
+          questionId: msg.questionId,
+          adapterRole: msg.adapterRole || 'worker',
+          timestamp: Date.now()
+        };
       }
 
       setProcessingState(false);
@@ -3375,6 +3420,12 @@
           mainContent.scrollTop = mainContent.scrollHeight;
         }
       });
+
+      const input = document.getElementById('prompt-input');
+      if (input) {
+        input.placeholder = `回复 ${cli} 的问题...`;
+        input.focus();
+      }
     }
 
     // 🔧 处理 CLI 询问超时
@@ -3386,20 +3437,32 @@
 
       // 更新 CLI 输出中的询问状态
       if (cliOutputs[cli]) {
-        const idx = cliOutputs[cli].findIndex(m => m.type === 'cli_question' && m.questionId === questionId);
-        if (idx !== -1) {
-          cliOutputs[cli][idx].isPending = false;
-          cliOutputs[cli][idx].timedOut = true;
-          cliOutputs[cli][idx].answer = 'n (超时自动回答)';
-        }
+        cliOutputs[cli].forEach(m => {
+          if (m.type === 'cli_question' && m.questionId === questionId) {
+            m.isPending = false;
+            m.timedOut = true;
+            m.answer = 'n (超时自动回答)';
+          }
+        });
       }
 
       // 更新 Thread 面板中的询问状态
-      const threadIdx = threadMessages.findIndex(m => m.type === 'cli_question' && m.questionId === questionId);
-      if (threadIdx !== -1) {
-        threadMessages[threadIdx].isPending = false;
-        threadMessages[threadIdx].timedOut = true;
-        threadMessages[threadIdx].answer = 'n (超时自动回答)';
+      threadMessages.forEach(m => {
+        if (m.type === 'cli_question' && m.questionId === questionId) {
+          m.isPending = false;
+          m.timedOut = true;
+          m.answer = 'n (超时自动回答)';
+        }
+      });
+
+      if (window._pendingCliQuestion &&
+        window._pendingCliQuestion.questionId === questionId &&
+        window._pendingCliQuestion.cli === cli) {
+        window._pendingCliQuestion = null;
+        const input = document.getElementById('prompt-input');
+        if (input) {
+          input.placeholder = '描述你的任务... (可粘贴图片)';
+        }
       }
 
       saveWebviewState();
@@ -3415,22 +3478,34 @@
 
       // 更新 CLI 输出中的询问状态
       if (cliOutputs[cli]) {
-        const idx = cliOutputs[cli].findIndex(m => m.type === 'cli_question' && m.questionId === questionId);
-        if (idx !== -1) {
-          cliOutputs[cli][idx].isPending = false;
-          cliOutputs[cli][idx].answered = msg.success;
-          cliOutputs[cli][idx].answer = msg.answer;
-          cliOutputs[cli][idx].error = msg.error;
-        }
+        cliOutputs[cli].forEach(m => {
+          if (m.type === 'cli_question' && m.questionId === questionId) {
+            m.isPending = false;
+            m.answered = msg.success;
+            m.answer = msg.answer;
+            m.error = msg.error;
+          }
+        });
       }
 
       // 更新 Thread 面板中的询问状态
-      const threadIdx = threadMessages.findIndex(m => m.type === 'cli_question' && m.questionId === questionId);
-      if (threadIdx !== -1) {
-        threadMessages[threadIdx].isPending = false;
-        threadMessages[threadIdx].answered = msg.success;
-        threadMessages[threadIdx].answer = msg.answer;
-        threadMessages[threadIdx].error = msg.error;
+      threadMessages.forEach(m => {
+        if (m.type === 'cli_question' && m.questionId === questionId) {
+          m.isPending = false;
+          m.answered = msg.success;
+          m.answer = msg.answer;
+          m.error = msg.error;
+        }
+      });
+
+      if (window._pendingCliQuestion &&
+        window._pendingCliQuestion.questionId === questionId &&
+        window._pendingCliQuestion.cli === cli) {
+        window._pendingCliQuestion = null;
+        const input = document.getElementById('prompt-input');
+        if (input) {
+          input.placeholder = '描述你的任务... (可粘贴图片)';
+        }
       }
 
       setProcessingState(true);
@@ -3453,6 +3528,18 @@
 
     // 显示执行计划预览（计划已生成，但未执行）
     function showPlanPreview(formattedPlan, planId, timestamp, review) {
+      const existingIdx = threadMessages.findIndex(m =>
+        m.type === 'plan_ready' && m.planId === planId
+      );
+      if (existingIdx !== -1) {
+        threadMessages[existingIdx].content = formattedPlan;
+        threadMessages[existingIdx].timestamp = timestamp || Date.now();
+        threadMessages[existingIdx].review = review;
+        saveWebviewState();
+        renderMainContent();
+        smoothScrollToBottom();
+        return;
+      }
       const previewMsg = {
         role: 'system',
         type: 'plan_ready',
@@ -3621,12 +3708,11 @@
         if (isDiff) {
           if (/^[+](?!\+\+)/.test(originalLine)) {
             lineClass += ' diff-add';
-            // 移除前导 + 的高亮版本
-            displayLine = displayLine.replace(/^[+]/, '');
+            // 🔧 修复：保留前导 + 在文本中（用于复制），通过 CSS 隐藏并用伪元素显示
+            // 不再移除前导字符，而是使用 data 属性存储原始前缀
           } else if (/^[-](?!--)/.test(originalLine)) {
             lineClass += ' diff-del';
-            // 移除前导 - 的高亮版本
-            displayLine = displayLine.replace(/^[-]/, '');
+            // 🔧 修复：保留前导 - 在文本中（用于复制），通过 CSS 隐藏并用伪元素显示
           }
         }
 
@@ -3682,29 +3768,37 @@
       }
 
       try {
-        // 使用自定义 renderer 处理代码块
-        const renderer = new marked.Renderer();
+        // 🔧 marked v12 兼容性修复：使用 marked.use() 配置自定义 renderer
+        // marked v5+ 废弃了 setOptions 的 highlight 选项，需要通过自定义 renderer 处理
+        const renderer = {
+          // 自定义代码块渲染（保留行号、diff 高亮、文件路径功能）
+          // 🔧 marked v12 使用对象参数 { text, lang, escaped }
+          code({ text, lang, escaped }) {
+            const { lang: parsedLang, filepath } = parseCodeBlockMeta(lang || '');
+            return renderCodeBlock(text || '', parsedLang, filepath);
+          },
 
-        // 自定义代码块渲染（保留行号、diff 高亮、文件路径功能）
-        renderer.code = function(code, infostring) {
-          const { lang, filepath } = parseCodeBlockMeta(infostring || '');
-          return renderCodeBlock(code, lang, filepath);
+          // 自定义链接渲染（添加 target="_blank"）
+          // 🔧 marked v12 使用对象参数 { href, title, tokens }
+          link({ href, title, tokens }) {
+            const text = this.parser.parseInline(tokens);
+            const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+            return `<a href="${escapeHtml(href || '')}"${titleAttr} target="_blank" class="markdown-link">${text}</a>`;
+          },
+
+          // 自定义图片渲染
+          // 🔧 marked v12 使用对象参数 { href, title, text }
+          image({ href, title, text }) {
+            const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+            return `<img src="${escapeHtml(href || '')}" alt="${escapeHtml(text || '')}"${titleAttr}>`;
+          }
         };
 
-        // 自定义链接渲染（添加 target="_blank"）
-        renderer.link = function(href, title, text) {
-          const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
-          return `<a href="${escapeHtml(href)}"${titleAttr} target="_blank" class="markdown-link">${text}</a>`;
-        };
-
-        // 自定义图片渲染
-        renderer.image = function(href, title, text) {
-          const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
-          return `<img src="${escapeHtml(href)}" alt="${escapeHtml(text)}"${titleAttr}>`;
-        };
+        // 🔧 使用 marked.use() 而非传递给 parse()
+        marked.use({ renderer });
 
         // 渲染 Markdown
-        const html = marked.parse(content, { renderer });
+        const html = marked.parse(content);
         return html;
       } catch (e) {
         console.error('[renderMarkdown] 解析错误:', e);
@@ -3716,15 +3810,31 @@
       if (!content) return false;
       const trimmed = content.trim();
       if (!trimmed) return false;
+      // 已经是代码块围栏格式
       if (trimmed.startsWith('```')) return false;
+      // JSON 格式
       if (trimmed.startsWith('{') || trimmed.startsWith('[')) return true;
+      // 单行内容不作为代码块
       if (!content.includes('\n')) return false;
+
+      // 🔧 修复：检测带行号的特殊输出格式（CLI 工具输出）
+      // 注意：避免误判 Markdown 有序列表（如 "1. 项目"）
+
+      // 特殊行号格式：数字→（如 "1→ code"）
       if (/^\s*\d+→/m.test(content)) return true;
-      if (/^\s*\d+\s*[:|>]/m.test(content)) return true;
-      if (/^\s*\d+\s*-\s+/m.test(content)) return true;
-      if (/^\s*\d+\)\s+/m.test(content)) return true;
-      if (/^\s*\d+\.\s+/m.test(content)) return true;
-      return /^(\s{2,}|\t)/m.test(content);
+      // 行号格式：数字: 或 数字> （如 "1: code" 或 "1> code"）
+      if (/^\s*\d+\s*[:>]/m.test(content)) return true;
+      // 🔧 移除误判有序列表的检测
+      // 之前的规则 /^\s*\d+\.\s+/m 会错误匹配 "1. 列表项"
+      // 之前的规则 /^\s*\d+\)\s+/m 也会错误匹配括号式列表
+      // 之前的规则 /^\s*\d+\s*-\s+/m 也可能误判
+
+      // 只检测明确的缩进代码（2+ 空格或制表符开头）
+      // 且要求多行都有缩进，避免单行缩进误判
+      const lines = content.split('\n');
+      const indentedLines = lines.filter(l => /^\s{2,}|^\t/.test(l) && l.trim());
+      // 至少 3 行有缩进才认为是代码块
+      return indentedLines.length >= 3;
     }
 
     function renderToolPanelContent(content) {
@@ -3745,15 +3855,85 @@
       return '<div class="tool-text">' + normalized.replace(/\n/g, '<br>') + '</div>';
     }
 
+    function renderSummarySections(sections) {
+      if (!sections || sections.length === 0) return '';
+      return sections.map(section => {
+        const title = section.title ? `<div class="tool-section-title">${escapeHtml(section.title)}</div>` : '';
+        const items = Array.isArray(section.items) ? section.items : [];
+        const list = items.length > 0
+          ? '<ul class="summary-list">' + items.map(item => `<li>${escapeHtml(item)}</li>`).join('') + '</ul>'
+          : '';
+        return `<div class="tool-section">${title}${list}</div>`;
+      }).join('');
+    }
+
+    function renderSubTaskSummaryCard(message) {
+      const card = message.metadata?.subTaskCard;
+      if (!card) return null;
+      const statusText = card.status === 'failed' ? '失败' : '完成';
+      const badgeClass = card.status === 'failed' ? 'badge-failed' : 'badge-completed';
+      const changes = card.changes && card.changes.length > 0 ? card.changes : ['暂无文件变更记录'];
+      const verification = card.verification && card.verification.length > 0 ? card.verification : [];
+      const sections = [
+        { title: '概览', items: [
+          `描述: ${card.description || ''}`,
+          `执行者: ${card.executor || ''}`,
+          `耗时: ${card.duration || ''}`,
+        ].filter(Boolean) },
+        card.error ? { title: '错误', items: [card.error] } : null,
+        { title: '文件变更', items: changes },
+        verification.length > 0 ? { title: '验证提醒', items: verification } : null,
+      ].filter(Boolean);
+
+      return renderUnifiedCard({
+        type: 'summary',
+        variant: card.status === 'failed' ? 'error' : 'success',
+        title: card.title || '子任务结果',
+        badges: [{ text: statusText, class: badgeClass }],
+        content: renderSummarySections(sections),
+        collapsed: false,
+      });
+    }
+
+    function renderSummaryCard(message) {
+      const card = message.metadata?.summaryCard;
+      if (!card) return null;
+      return renderUnifiedCard({
+        type: 'summary',
+        variant: 'success',
+        title: card.title || '执行总结',
+        badges: [{ text: '总结', class: 'badge-completed' }],
+        content: renderSummarySections(card.sections || []),
+        collapsed: false,
+      });
+    }
+
     // 渲染单个工具调用项（使用统一卡片组件风格）
     function renderToolCallItem(tool, toolIdx, panelPrefix, isLatest) {
-      const toolContent = tool.input || '';
-      if (!toolContent || !String(toolContent).trim()) return '';
+      const inputContent = tool.input || '';
+      const outputContent = tool.output || tool.result || '';
+      const errorContent = tool.error || '';
+      const hasInput = inputContent && String(inputContent).trim();
+      const hasOutput = outputContent && String(outputContent).trim();
+      const hasError = errorContent && String(errorContent).trim();
+      if (!hasInput && !hasOutput && !hasError) return '';
 
       const toolPanelId = panelPrefix + '-' + toolIdx;
       const toolStatus = tool.status || 'completed';
       const statusText = toolStatus === 'running' ? '执行中' : toolStatus === 'failed' ? '失败' : '完成';
       const badgeClass = toolStatus === 'running' ? 'badge-running' : toolStatus === 'failed' ? 'badge-failed' : 'badge-completed';
+
+      const sections = [];
+      if (hasInput) {
+        sections.push('<div class="tool-section"><div class="tool-section-title">输入</div>' + renderToolPanelContent(inputContent) + '</div>');
+      }
+      if (hasOutput) {
+        sections.push('<div class="tool-section"><div class="tool-section-title">输出</div>' + renderToolPanelContent(outputContent) + '</div>');
+      }
+      if (hasError) {
+        sections.push('<div class="tool-section"><div class="tool-section-title">错误</div>' + renderToolPanelContent(errorContent) + '</div>');
+      }
+      const toolContent = sections.join('');
 
       // 使用统一卡片组件渲染工具调用
       return renderUnifiedCard({
@@ -3762,7 +3942,7 @@
         icon: getToolIcon(tool.name),
         title: tool.name || '工具调用',
         badges: [{ text: statusText, class: badgeClass }],
-        content: renderToolPanelContent(toolContent),
+        content: toolContent,
         collapsed: true,           // 启用折叠功能
         expanded: isLatest,        // 最新的工具调用默认展开
         panelId: toolPanelId,      // 折叠面板 ID
@@ -3782,10 +3962,9 @@
 
       // 过滤有效的工具调用
       const validTools = sorted.filter(tool => {
-        if (tool.kind && tool.kind !== 'call') return false;
-        if (tool.name === '工具结果') return false;
-        const toolContent = tool.input || '';
-        return toolContent && String(toolContent).trim();
+        const inputContent = tool.input || '';
+        const outputContent = tool.output || tool.result || tool.error || '';
+        return (inputContent && String(inputContent).trim()) || (outputContent && String(outputContent).trim());
       });
 
       if (validTools.length === 0) return '';
@@ -3818,7 +3997,7 @@
 
     function upsertTool(toolMap, tool) {
       if (!tool) return;
-      const isResult = tool.kind === 'result' || tool.name === '工具结果';
+      const isResult = tool.kind === 'result' || tool.name === '工具结果' || tool.output || tool.result;
       const id = tool.id || tool.tool_call_id || (isResult ? '' : tool.name) || ('tool-' + toolMap.size);
       if (id && toolMap.has(id)) {
         const existing = toolMap.get(id);
@@ -3828,7 +4007,8 @@
           ...tool,
           name: keepName ? existing.name : (tool.name || existing.name),
           input: tool.input ?? existing.input,
-          result: tool.result ?? existing.result,
+          output: tool.output ?? existing.output ?? tool.result ?? existing.result,
+          error: tool.error ?? existing.error,
           status: tool.status || existing.status
         });
         return;
@@ -3844,7 +4024,8 @@
           const existing = toolMap.get(lastRunningKey);
           toolMap.set(lastRunningKey, {
             ...existing,
-            result: tool.result ?? existing.result,
+            output: tool.output ?? existing.output ?? tool.result ?? existing.result,
+            error: tool.error ?? existing.error,
             status: 'completed'
           });
           return;
@@ -3907,15 +4088,11 @@
           if (block.type === 'tool_result') {
             upsertTool(state.toolMap, {
               id: block.tool_use_id || block.id,
-              name: block.name || '工具结果',
-              result: formatToolPayload(block.content || block.result || block.output),
+              name: block.name || '工具调用',
+              output: formatToolPayload(block.content || block.result || block.output),
               status: 'completed',
               kind: 'result'
             });
-            const toolText = formatToolPayload(block.content || block.result || block.output);
-            if (toolText) {
-              appendStreamTextWithGap(state, toolText);
-            }
           }
         }
         return;
@@ -3935,15 +4112,11 @@
           if (block.type === 'tool_result') {
             upsertTool(state.toolMap, {
               id: block.tool_use_id || block.id,
-              name: block.name || '工具结果',
-              result: formatToolPayload(block.content || block.result || block.output),
+              name: block.name || '工具调用',
+              output: formatToolPayload(block.content || block.result || block.output),
               status: 'completed',
               kind: 'result'
             });
-            const toolText = formatToolPayload(block.content || block.result || block.output);
-            if (toolText) {
-              appendStreamTextWithGap(state, toolText);
-            }
           }
         }
         return;
@@ -3954,15 +4127,11 @@
           if (block?.type === 'tool_result') {
             upsertTool(state.toolMap, {
               id: block.tool_use_id || block.id,
-              name: block.name || '工具结果',
-              result: formatToolPayload(block.content || block.result || block.output),
+              name: block.name || '工具调用',
+              output: formatToolPayload(block.content || block.result || block.output),
               status: 'completed',
               kind: 'result'
             });
-            const toolText = formatToolPayload(block.content || block.result || block.output);
-            if (toolText) {
-              appendStreamTextWithGap(state, toolText);
-            }
           }
         });
         return;
@@ -4016,15 +4185,11 @@
       if (parsed.type === 'tool_result' || parsed.type === 'tool_response') {
         upsertTool(state.toolMap, {
           id: parsed.tool_call_id || parsed.id,
-          name: parsed.name || parsed.tool_name || '工具结果',
-          result: formatToolPayload(parsed.result || parsed.output || parsed.content),
+          name: parsed.name || parsed.tool_name || '工具调用',
+          output: formatToolPayload(parsed.result || parsed.output || parsed.content),
           status: 'completed',
           kind: 'result'
         });
-        const toolText = formatToolPayload(parsed.result || parsed.output || parsed.content);
-        if (toolText) {
-          state.text += (state.text ? '\n\n' : '') + toolText;
-        }
         return;
       }
 
@@ -4053,11 +4218,16 @@
       }
 
       console.log('[Webview] 收到标准消息:', message.id, message.type, message.lifecycle);
+      if ((!message.blocks || message.blocks.length === 0) &&
+          message.lifecycle !== 'streaming' &&
+          message.lifecycle !== 'started') {
+        console.warn('[Webview] 标准消息 blocks 为空:', message.id, message.type);
+      }
 
       // 过滤编排者内部 JSON 分析输出（如模糊度评估、计划评审）
-      if (message.source === 'orchestrator' && message.type === 'progress') {
+      if (message.source === 'orchestrator') {
         const textContent = extractTextFromBlocks(message.blocks || []);
-        if (isInternalJsonMessage(textContent)) {
+        if (isInternalJsonMessage(textContent) && message.type !== 'plan') {
           return;
         }
       }
@@ -4091,6 +4261,14 @@
         // 转换为 Webview 消息格式
         const webviewMsg = standardToWebviewMessage(message);
 
+        // 跨 messageId 去重：同来源/角色、时间相近且内容相同则复用
+        const equivalentMsg = findEquivalentMessage(messages, webviewMsg, 6000);
+        if (equivalentMsg) {
+          Object.assign(equivalentMsg, webviewMsg);
+          equivalentMsg.standardMessageId = message.id;
+          return;
+        }
+
         // 去重：连续相同内容的编排者消息只保留一条
         const lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
         if (lastMsg && lastMsg.source === webviewMsg.source && lastMsg.role === webviewMsg.role) {
@@ -4116,7 +4294,7 @@
       }
 
       // 设置处理状态
-      if (message.lifecycle === 'streaming') {
+      if (message.lifecycle === 'streaming' || message.lifecycle === 'started') {
         setProcessingState(true);
         setProcessingActor(message.source, cli);
       }
@@ -4151,11 +4329,14 @@
 
       const webviewMsg = messages.find(m => m.standardMessageId === update.messageId);
       if (webviewMsg) {
-        // 应用更新
-        if (update.updateType === 'append' && update.appendText) {
-          webviewMsg.content = (webviewMsg.content || '') + update.appendText;
+        const updatedMsg = standardToWebviewMessage(message);
+        if (webviewMsg.startedAt && !updatedMsg.startedAt) {
+          updatedMsg.startedAt = webviewMsg.startedAt;
+        }
+        Object.assign(webviewMsg, updatedMsg);
 
-          // 尝试增量更新 DOM
+        // 尝试增量更新 DOM（基于 blocks 渲染）
+        if (update.updateType === 'append' || update.updateType === 'replace') {
           const updateSuccess = isOrchestrator
             ? updateStreamingMessage(webviewMsg.streamKey, webviewMsg.content)
             : updateCliStreamingMessage(cli, webviewMsg.content);
@@ -4163,24 +4344,7 @@
           if (!updateSuccess) {
             scheduleRenderMainContent();
           }
-        } else if (update.updateType === 'replace' && update.replaceText !== undefined) {
-          webviewMsg.content = update.replaceText;
-          scheduleRenderMainContent();
-        } else if (update.updateType === 'block_update' && update.blocks) {
-          // 更新 thinking 和 toolCalls
-          const newThinking = extractThinkingFromBlocks(update.blocks);
-          const newToolCalls = extractToolCallsFromBlocks(update.blocks);
-          if (newThinking.length > 0) {
-            webviewMsg.thinking = [...(webviewMsg.thinking || []), ...newThinking];
-          }
-          if (newToolCalls.length > 0) {
-            // 合并工具调用
-            const toolMap = new Map((webviewMsg.toolCalls || []).map(t => [t.id, t]));
-            for (const tool of newToolCalls) {
-              toolMap.set(tool.id, tool);
-            }
-            webviewMsg.toolCalls = Array.from(toolMap.values());
-          }
+        } else {
           scheduleRenderMainContent();
         }
       }
@@ -4235,6 +4399,20 @@
         if (message.lifecycle === 'failed') {
           webviewMsg.error = message.metadata?.error;
         }
+      } else {
+        // 补偿：尝试将完成消息合并到最近的流式或相同内容消息
+        const finalMsg = standardToWebviewMessage(message);
+        const candidate = messages.find(m =>
+          m.streaming &&
+          m.source === finalMsg.source &&
+          m.role === finalMsg.role &&
+          (m.cli || '') === (finalMsg.cli || '')
+        ) || findEquivalentMessage(messages, finalMsg, 10000);
+        if (candidate) {
+          Object.assign(candidate, finalMsg);
+          candidate.streaming = false;
+          candidate.standardMessageId = message.id;
+        }
       }
 
       // 检查是否还有活跃的流式消息
@@ -4265,27 +4443,29 @@
       const timestamp = typeof message.timestamp === 'number' ? message.timestamp : Date.now();
       const timeDisplay = message.timestamp ? new Date(message.timestamp).toLocaleTimeString().slice(0, 5) : '';
 
-      return {
-        role: message.source === 'user' ? 'user' : 'assistant',
-        content: textContent,
-        time: timeDisplay,
-        timestamp: timestamp,
-        streaming: message.lifecycle === 'streaming',
-        startedAt: message.lifecycle === 'streaming' ? Date.now() : undefined,
-        source: message.source,
-        cli: message.cli,
-        streamKey: generateStreamKey(message.source, message.cli),
-        thinking: thinking,
-        toolCalls: toolCalls,
-        codeBlocks: codeBlocks,  // 🆕 新增：已解析的代码块
-        parsedBlocks: blocks,     // 🆕 新增：保留原始 blocks 供渲染使用
-        // 标准消息扩展字段
-        standardMessageId: message.id,
-        traceId: message.traceId,
-        lifecycle: message.lifecycle,
-        messageType: message.type,
-      };
-    }
+        const isStreaming = message.lifecycle === 'streaming' || message.lifecycle === 'started';
+        return {
+          role: message.source === 'user' ? 'user' : 'assistant',
+          content: textContent,
+          time: timeDisplay,
+          timestamp: timestamp,
+          streaming: isStreaming,
+          startedAt: isStreaming ? Date.now() : undefined,
+          source: message.source,
+          cli: message.cli,
+          streamKey: generateStreamKey(message.source, message.cli),
+          thinking: thinking,
+          toolCalls: toolCalls,
+          codeBlocks: codeBlocks,  // 🆕 新增：已解析的代码块
+          parsedBlocks: blocks,     // 🆕 新增：保留原始 blocks 供渲染使用
+          metadata: message.metadata || {},
+          // 标准消息扩展字段
+          standardMessageId: message.id,
+          traceId: message.traceId,
+          lifecycle: message.lifecycle,
+          messageType: message.type,
+        };
+      }
 
     /**
      * 从内容块中提取文本（包括 markdown）
@@ -4460,33 +4640,15 @@
      * 完成阶段：使用后端解析的 parsedBlocks 渲染（结构化）
      */
     function renderMessageContentSmart(message, cli) {
-      // 流式阶段：parsedBlocks 可能为空，使用累积的 content 直接渲染
-      if (message.streaming) {
-        const content = message.content || '';
-        if (!content) {
-          return { html: '', isMarkdown: false };
-        }
-        // 流式时使用简单 Markdown 渲染，避免不完整代码块的闪烁
-        return {
-          html: renderMarkdown(content),
-          isMarkdown: true
-        };
-      }
+      const blocks = (message.parsedBlocks && message.parsedBlocks.length > 0)
+        ? message.parsedBlocks
+        : (message.content ? [{ type: 'text', content: message.content, isMarkdown: true }] : []);
 
-      // 完成阶段：使用后端解析的 blocks 渲染（代码高亮、结构化）
-      if (message.parsedBlocks && message.parsedBlocks.length > 0) {
-        return renderParsedBlocks(message.parsedBlocks, cli);
-      }
-
-      // 兜底：如果没有 blocks，用 content 渲染
-      const content = message.content || '';
-      if (!content) {
+      if (!blocks.length) {
         return { html: '', isMarkdown: false };
       }
-      return {
-        html: renderMarkdown(content),
-        isMarkdown: true
-      };
+
+      return renderParsedBlocks(blocks, cli);
     }
 
     function getLatestTaskStats() {
@@ -4853,6 +5015,12 @@
      * @returns {string|null} - 返回 HTML 字符串，或 null 表示普通消息
      */
     function renderSpecialMessage(m, idx, tabType) {
+      if (m.metadata?.subTaskCard) {
+        return renderSubTaskSummaryCard(m);
+      }
+      if (m.metadata?.summaryCard) {
+        return renderSummaryCard(m);
+      }
       // 任务卡片（CLI 面板专用）
       if (m.type === 'task_card') {
         return renderTaskCard(m, idx);
@@ -4914,13 +5082,14 @@
 
       sortedMessages.forEach(({ m, idx }) => {
         // 跳过空内容消息（避免只渲染徽章/时间的空行）
-        const hasRenderableContent =
-          (m.content && String(m.content).trim()) ||
-          (m.parsedBlocks && m.parsedBlocks.length > 0) ||
-          (m.codeBlocks && m.codeBlocks.length > 0) ||
-          (m.toolCalls && m.toolCalls.length > 0) ||
-          (m.thinking && m.thinking.length > 0) ||
-          (m.images && m.images.length > 0);
+      const hasRenderableContent =
+        (m.content && String(m.content).trim()) ||
+        (m.parsedBlocks && m.parsedBlocks.length > 0) ||
+        (m.codeBlocks && m.codeBlocks.length > 0) ||
+        (m.toolCalls && m.toolCalls.length > 0) ||
+        (m.thinking && m.thinking.length > 0) ||
+        (m.images && m.images.length > 0) ||
+        (m.metadata && (m.metadata.subTaskCard || m.metadata.summaryCard));
 
         // 尝试渲染特殊消息
         const specialHtml = renderSpecialMessage(m, idx, tabType);
@@ -4966,6 +5135,30 @@
         .replace(/\s+/g, ' ')
         .trim()
         .toLowerCase();
+    }
+
+    function findEquivalentMessage(messages, webviewMsg, windowMs) {
+      const normalized = normalizeMessageContentForDedup(webviewMsg.content || '');
+      if (!normalized) return null;
+      const ts = webviewMsg.timestamp || Date.now();
+      const targetType = webviewMsg.messageType || '';
+      const maxWindow = typeof windowMs === 'number' ? windowMs : 5000;
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const m = messages[i];
+        if (!m) continue;
+        if (m.source !== webviewMsg.source || m.role !== webviewMsg.role) continue;
+        const existingType = m.messageType || '';
+        if (targetType && existingType && targetType !== existingType) continue;
+        const delta = Math.abs((m.timestamp || 0) - ts);
+        if (delta > maxWindow && i < messages.length - 5) {
+          break;
+        }
+        const existingNormalized = normalizeMessageContentForDedup(m.content || '');
+        if (existingNormalized && existingNormalized === normalized) {
+          return m;
+        }
+      }
+      return null;
     }
 
     function isInternalJsonMessage(content) {
@@ -5604,6 +5797,20 @@
             return;
           }
           handleWorkerQuestionAnswer(answerText, false);
+          input.value = '';
+          attachedImages = [];
+          renderImagePreviews();
+          return;
+        }
+
+        // 🆕 处理 CLI 询问（使用底部输入框回答）
+        if (hasPendingCliQuestion()) {
+          const answerText = input.value.trim();
+          if (!answerText) {
+            addSystemMessage('请输入回答后再提交', 'warning');
+            return;
+          }
+          handleCliQuestionAnswer(answerText, false);
           input.value = '';
           attachedImages = [];
           renderImagePreviews();
@@ -6399,8 +6606,12 @@
       const statusIcons = {
         pending: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>',
         running: '<svg viewBox="0 0 16 16"><path d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/></svg>',
+        paused: '<svg viewBox="0 0 16 16"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M5 6.25a1.25 1.25 0 0 1 2.5 0v3.5a1.25 1.25 0 0 1-2.5 0v-3.5zm3.5 0a1.25 1.25 0 0 1 2.5 0v3.5a1.25 1.25 0 0 1-2.5 0v-3.5z"/></svg>',
+        retrying: '<svg viewBox="0 0 16 16"><path d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/></svg>',
         completed: '<svg viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/></svg>',
-        failed: '<svg viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM5.354 4.646a.5.5 0 1 0-.708.708L7.293 8l-2.647 2.646a.5.5 0 0 0 .708.708L8 8.707l2.646 2.647a.5.5 0 0 0 .708-.708L8.707 8l2.647-2.646a.5.5 0 0 0-.708-.708L8 7.293 5.354 4.646z"/></svg>'
+        failed: '<svg viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM5.354 4.646a.5.5 0 1 0-.708.708L7.293 8l-2.647 2.646a.5.5 0 0 0 .708.708L8 8.707l2.646 2.647a.5.5 0 0 0 .708-.708L8.707 8l2.647-2.646a.5.5 0 0 0-.708-.708L8 7.293 5.354 4.646z"/></svg>',
+        cancelled: '<svg viewBox="0 0 16 16"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg>',
+        skipped: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="2,2"/></svg>'
       };
 
       let html = '<div class="subtask-status-list">';
@@ -6624,20 +6835,7 @@
       // 构建底部（快捷回答按钮）
       let footerHtml = '';
       if (isPending) {
-        const cli = m.cli || 'claude';
-        const questionId = m.questionId || '';
-        const adapterRole = m.adapterRole || 'worker';
-
-        footerHtml = '<div class="cli-question-actions">' +
-          '<button class="cli-answer-btn yes" onclick="answerCliQuestion(\'' + cli + '\', \'' + questionId + '\', \'y\', \'' + adapterRole + '\')">' +
-          '<svg viewBox="0 0 16 16"><path d="M13.854 3.646a.5.5 0 0 1 0 .708l-7 7a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L6.5 10.293l6.646-6.647a.5.5 0 0 1 .708 0z"/></svg>' +
-          'Yes (y)</button>' +
-          '<button class="cli-answer-btn no" onclick="answerCliQuestion(\'' + cli + '\', \'' + questionId + '\', \'n\', \'' + adapterRole + '\')">' +
-          '<svg viewBox="0 0 16 16"><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg>' +
-          'No (n)</button>' +
-          '<input type="text" class="cli-answer-input" placeholder="或输入自定义回答..." ' +
-          'onkeydown="if(event.key===\'Enter\'){answerCliQuestion(\'' + cli + '\', \'' + questionId + '\', this.value, \'' + adapterRole + '\');this.value=\'\';}">' +
-          '</div>';
+        footerHtml = '<div class="question-hint">请在底部输入框中回复该问题后发送。</div>';
       }
 
       return renderUnifiedCard({
@@ -6715,7 +6913,7 @@
       tasks.forEach((task, taskIndex) => {
         const isRunning = task.status === 'running';
         const isExpanded = isRunning || taskIndex === 0; // 运行中或最新的任务默认展开
-        const statusMap = { pending: '等待中', running: '执行中', completed: '已完成', failed: '失败', interrupted: '已中断', cancelled: '已取消' };
+        const statusMap = { pending: '等待中', running: '执行中', paused: '已暂停', retrying: '重试中', completed: '已完成', failed: '失败', cancelled: '已取消' };
         const statusClass = task.status || 'pending';
         const subTasks = task.subTasks || [];
         const completedCount = subTasks.filter(st => st.status === 'completed').length;
@@ -6742,7 +6940,7 @@
         if (subTasks.length > 0) {
           html += '<div class="task-group-content">';
           subTasks.forEach((st, index) => {
-            const stStatusCls = st.status === 'running' ? 'running' : st.status === 'completed' ? 'completed' : st.status === 'failed' ? 'failed' : st.status === 'skipped' ? 'skipped' : 'pending';
+            const stStatusCls = st.status === 'running' ? 'running' : st.status === 'completed' ? 'completed' : st.status === 'failed' ? 'failed' : st.status === 'skipped' ? 'skipped' : st.status === 'paused' ? 'paused' : st.status === 'retrying' ? 'retrying' : 'pending';
             const workerName = (st.assignedWorker || st.assignedCli || 'auto').toLowerCase();
             const description = st.description || st.title || '子任务 ' + (index + 1);
             const cliClass = workerName.includes('claude') ? 'claude' : workerName.includes('codex') ? 'codex' : workerName.includes('gemini') ? 'gemini' : '';
@@ -6877,18 +7075,31 @@
 
     /**
      * 移除 ANSI 转义序列（CLI 输出的颜色代码）
+     * 🔧 增强：支持更多类型的 ANSI 序列
      */
     function stripAnsi(text) {
-      // 匹配 ANSI 转义序列: ESC[ ... m 和其他控制序列
-      return String(text).replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+      return String(text)
+        // CSI 序列 (Control Sequence Introducer): ESC [ ... 字母
+        .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+        // OSC 序列 (Operating System Command): ESC ] ... BEL 或 ESC \
+        .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+        // 单字符转义序列: ESC 后跟单个字符
+        .replace(/\x1b[NOPXZn\\^_@]/g, '')
+        // DCS/PM/APC 序列: ESC P/^/_ ... ST
+        .replace(/\x1b[P^_][^\x1b]*\x1b\\/g, '')
+        // 简单的 ESC 后跟一个字符
+        .replace(/\x1b./g, '');
     }
 
     /**
      * 移除零宽字符（可能导致复制粘贴问题）
+     * 🔧 增强：扩展处理范围
      */
     function stripZeroWidth(text) {
-      // 零宽空格、零宽非连接符、零宽连接符等
-      return String(text).replace(/[\u200B-\u200D\uFEFF]/g, '');
+      return String(text).replace(
+        /[\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\u00AD\u180E]/g,
+        ''
+      );
     }
 
     function approveChange(filePath) { vscode.postMessage({ type: 'approveChange', filePath }); }
@@ -6926,6 +7137,11 @@
       };
       const now = new Date();
       const time = now.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+
+      const last = threadMessages.length > 0 ? threadMessages[threadMessages.length - 1] : null;
+      if (last && last.type === 'system_notice' && String(last.content || '') === String(message || '')) {
+        return;
+      }
 
       // 🔧 修复：使用 threadMessages 而不是 messages
       threadMessages.push({

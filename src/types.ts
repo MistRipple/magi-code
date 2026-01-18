@@ -22,7 +22,42 @@ export type TaskCategory =
   | 'test'          // 测试编写
   | 'document'      // 文档生成
   | 'review'        // 代码审查
+  | 'simple'        // 简单任务
   | 'general';      // 通用任务
+
+// ============================================
+// 统一任务类型（从新架构导出）
+// ============================================
+
+/**
+ * 导入并重新导出统一的 Task 和 SubTask 类型
+ * 这些类型来自新的任务系统架构
+ */
+import type {
+  Task,
+  SubTask,
+  TaskStatus,
+  SubTaskStatus,
+  CreateTaskParams,
+  CreateSubTaskParams,
+  WorkerResult,
+} from './task/types';
+
+export type {
+  Task,
+  SubTask,
+  TaskStatus,
+  SubTaskStatus,
+  CreateTaskParams,
+  CreateSubTaskParams,
+  WorkerResult,
+};
+
+/**
+ * @deprecated 使用 assignedWorker 替代
+ * 为了向后兼容，保留 WorkerType 的类型别名
+ */
+export type WorkerType = CLIType;
 
 // ============================================
 // Session 和 Task 管理
@@ -52,114 +87,6 @@ export interface SessionMessage {
 }
 
 export type SessionStatus = 'active' | 'completed';
-
-/**
- * Task - 用户任务
- * 用户每次输入 Prompt 时由 Orchestrator 创建
- */
-export interface Task {
-  id: string;
-  sessionId: string;
-  prompt: string;
-  status: TaskStatus;
-  subTasks: SubTask[];
-  createdAt: number;
-  startedAt?: number;
-  completedAt?: number;
-  interruptedAt?: number;
-  /** 功能契约（统一前后端约束） */
-  featureContract?: string;
-  /** 验收清单 */
-  acceptanceCriteria?: string[];
-  /** 执行计划 ID */
-  planId?: string;
-  /** 执行计划状态 */
-  planStatus?: 'draft' | 'ready' | 'executing' | 'completed' | 'failed';
-  /** 执行计划摘要 */
-  planSummary?: string;
-  /** 执行计划创建时间 */
-  planCreatedAt?: number;
-  /** 执行计划更新时间 */
-  planUpdatedAt?: number;
-}
-
-export type TaskStatus =
-  | 'pending'      // 等待执行
-  | 'running'      // 执行中
-  | 'interrupted'  // 已打断
-  | 'completed'    // 已完成
-  | 'failed'       // 失败
-  | 'cancelled';   // 已取消
-
-/**
- * SubTask - 子任务（统一类型定义）
- * Task 分解后的执行单元，每个 SubTask 由一个 Worker 执行
- *
- * 合并了旧架构（状态管理）和新架构（编排功能）的优点
- */
-export interface SubTask {
-  id: string;
-  taskId: string;
-  description: string;
-
-  // Worker 分配（新架构命名）
-  assignedWorker: CLIType;
-
-  // 向后兼容别名（旧架构命名）
-  assignedCli?: CLIType;
-
-  // 任务标题（用于依赖图显示）
-  title?: string;
-
-  // 分配原因（新架构，用于解释为什么选择该 Worker）
-  reason?: string;
-
-  // 执行提示词（新架构，Worker 执行时使用的具体指令）
-  prompt?: string;
-
-  // 目标文件列表
-  targetFiles: string[];
-  /** 实际修改的文件列表（执行完成后写回） */
-  modifiedFiles?: string[];
-  /** 是否后台任务（不阻塞主执行流） */
-  background?: boolean;
-
-  // 依赖关系（新架构，子任务间的依赖）
-  dependencies: string[];
-  /** 冲突域标识（用于跨任务串行化与调度） */
-  conflictDomain?: string;
-  /** 依赖链（用于展示与调度） */
-  dependencyChain?: string[];
-
-  // 优先级（新架构，1 最高）
-  priority?: number;
-  /** 子任务类型（实现/集成/修复/架构/批量） */
-  kind?: 'implementation' | 'integration' | 'repair' | 'architecture' | 'batch' | 'background';
-  /** 功能分组 ID（用于跨子任务联调） */
-  featureId?: string;
-  /** 批量任务包含的子任务 ID 列表 */
-  batchItems?: string[];
-
-  // 状态管理（旧架构）
-  status: SubTaskStatus;
-  output: string[];
-  result?: WorkerResult;
-  startedAt?: number;
-  completedAt?: number;
-}
-
-export type SubTaskStatus =
-  | 'pending'    // 等待执行
-  | 'running'    // 执行中
-  | 'completed'  // 已完成
-  | 'failed'     // 失败
-  | 'skipped';   // 跳过
-
-/**
- * @deprecated 使用 assignedWorker 替代
- * 为了向后兼容，保留 assignedCli 的类型别名
- */
-export type WorkerType = CLIType;
 
 /**
  * FileSnapshot - 文件快照
@@ -275,18 +202,6 @@ export interface DegradationStrategy {
   recommendation: string;
   canProceed: boolean;
   fallbackMap: Partial<Record<CLIType, CLIType>>;  // 降级映射
-}
-
-// Worker 执行结果
-export interface WorkerResult {
-  workerId: string;
-  cliType: CLIType;
-  success: boolean;
-  output?: string;
-  diff?: string;
-  error?: string;
-  duration: number;
-  timestamp: Date;
 }
 
 // Diff 块
@@ -422,8 +337,7 @@ export type EventType =
   | 'task:started'
   | 'task:completed'
   | 'task:failed'
-  | 'task:interrupted'
-  | 'task:interrupt'
+  | 'task:cancelled'
   | 'task:state_changed'
   | 'subtask:started'
   | 'cli:output'

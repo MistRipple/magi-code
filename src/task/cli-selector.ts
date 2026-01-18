@@ -18,48 +18,17 @@ import {
   WorkerSelectionResult,
 } from '../orchestrator/profile';
 import {
+  DEFAULT_CLAUDE_PROFILE,
+  DEFAULT_CODEX_PROFILE,
+  DEFAULT_GEMINI_PROFILE,
+  DEFAULT_CATEGORIES_CONFIG,
+} from '../orchestrator/profile/defaults';
+import {
   ConflictResolver,
   ConflictResolutionConfig,
   ConflictResolutionInput,
   ConflictResolutionResult,
 } from './conflict-resolver';
-
-/** CLI 能力配置 */
-export interface CLISkillsConfig {
-  architecture: CLIType;
-  implement: CLIType;
-  refactor: CLIType;
-  bugfix: CLIType;
-  debug: CLIType;
-  frontend: CLIType;
-  backend: CLIType;
-  test: CLIType;
-  document: CLIType;
-  review: CLIType;
-  general: CLIType;
-}
-
-/** 默认 CLI 技能配置 */
-const DEFAULT_SKILLS: CLISkillsConfig = {
-  architecture: 'claude',
-  implement: 'claude',
-  refactor: 'claude',
-  bugfix: 'codex',
-  debug: 'claude',
-  frontend: 'gemini',
-  backend: 'codex',
-  test: 'codex',
-  document: 'claude',
-  review: 'claude',
-  general: 'claude',
-};
-
-/** CLI 优先级降级顺序 */
-const CLI_FALLBACK_ORDER: Record<CLIType, CLIType[]> = {
-  claude: ['codex', 'gemini'],
-  codex: ['claude', 'gemini'],
-  gemini: ['claude', 'codex'],
-};
 
 /** CLI 选择结果 */
 export interface CLISelection {
@@ -85,7 +54,6 @@ export interface CLISelection {
  * 集成 ConflictResolver 统一冲突解决
  */
 export class CLISelector {
-  private skills: CLISkillsConfig;
   private availableCLIs: Set<CLIType> = new Set();
   private executionStats?: ExecutionStats;
   /** 是否启用基于统计的智能选择 */
@@ -99,8 +67,7 @@ export class CLISelector {
   /** 冲突解决器 */
   private conflictResolver: ConflictResolver;
 
-  constructor(skills?: Partial<CLISkillsConfig>) {
-    this.skills = { ...DEFAULT_SKILLS, ...skills };
+  constructor() {
     this.conflictResolver = new ConflictResolver();
   }
 
@@ -158,11 +125,34 @@ export class CLISelector {
     this.availableCLIs = new Set(clis);
   }
 
-  /**
-   * 更新技能配置
-   */
-  updateSkills(skills: Partial<CLISkillsConfig>): void {
-    this.skills = { ...this.skills, ...skills };
+
+  private getCategoryConfig(category: TaskCategory) {
+    if (this.useProfileBasedSelection && this.profileLoader) {
+      const config = this.profileLoader.getCategory(category);
+      if (config) return config;
+    }
+    return DEFAULT_CATEGORIES_CONFIG.categories[category];
+  }
+
+  private getCategoryRules() {
+    if (this.useProfileBasedSelection && this.profileLoader) {
+      return this.profileLoader.getCategoryRules();
+    }
+    return DEFAULT_CATEGORIES_CONFIG.rules;
+  }
+
+  private getProfile(worker: CLIType): WorkerProfile {
+    if (this.useProfileBasedSelection && this.profileLoader) {
+      return this.profileLoader.getProfile(worker);
+    }
+    switch (worker) {
+      case 'codex':
+        return DEFAULT_CODEX_PROFILE;
+      case 'gemini':
+        return DEFAULT_GEMINI_PROFILE;
+      default:
+        return DEFAULT_CLAUDE_PROFILE;
+    }
   }
 
   /**
@@ -173,20 +163,18 @@ export class CLISelector {
     const category = analysis.category;
 
     // 获取画像推荐
-    let profileRecommendation: CLIType | undefined;
-    if (this.useProfileBasedSelection && this.profileLoader) {
-      const categoryConfig = this.profileLoader.getCategory(category);
-      profileRecommendation = categoryConfig?.defaultWorker as CLIType;
-    }
-    if (!profileRecommendation) {
-      profileRecommendation = this.skills[category] || this.skills.general;
-    }
+    const categoryConfig = this.getCategoryConfig(category);
+    const defaultGeneral = DEFAULT_CATEGORIES_CONFIG.categories.general?.defaultWorker || 'claude';
+    const profileRecommendation = (categoryConfig?.defaultWorker || defaultGeneral) as CLIType;
+
+    const availableClis = this.availableCLIs.size > 0
+      ? Array.from(this.availableCLIs)
+      : (['claude', 'codex', 'gemini'] as CLIType[]);
 
     // 获取执行统计推荐
     let statsRecommendation: CLIType | undefined;
     if (this.useStatsBasedSelection && this.executionStats) {
-      const availableList = Array.from(this.availableCLIs);
-      statsRecommendation = this.executionStats.recommendCLI(category, availableList);
+      statsRecommendation = this.executionStats.recommendCLI(category, availableClis);
     }
 
     // 使用 ConflictResolver 解决冲突
@@ -195,7 +183,7 @@ export class CLISelector {
       profileRecommendation,
       statsRecommendation,
       category,
-      availableClis: Array.from(this.availableCLIs),
+      availableClis,
     });
 
     return {
@@ -254,14 +242,9 @@ export class CLISelector {
    */
   selectByCategory(category: TaskCategory): CLISelection {
     // 如果有画像系统，使用画像配置的默认 Worker
-    let preferred = this.skills[category] || this.skills.general;
-
-    if (this.useProfileBasedSelection && this.profileLoader) {
-      const categoryConfig = this.profileLoader.getCategory(category);
-      if (categoryConfig?.defaultWorker) {
-        preferred = categoryConfig.defaultWorker as CLIType;
-      }
-    }
+    const categoryConfig = this.getCategoryConfig(category);
+    const defaultGeneral = DEFAULT_CATEGORIES_CONFIG.categories.general?.defaultWorker || 'claude';
+    let preferred = (categoryConfig?.defaultWorker || defaultGeneral) as CLIType;
 
     // 基于统计的智能选择
     if (this.useStatsBasedSelection && this.executionStats) {
@@ -272,7 +255,11 @@ export class CLISelector {
       }
     }
 
-    if (this.availableCLIs.has(preferred)) {
+    const availableList = this.availableCLIs.size > 0
+      ? Array.from(this.availableCLIs)
+      : (['claude', 'codex', 'gemini'] as CLIType[]);
+
+    if (availableList.includes(preferred)) {
       return {
         cli: preferred,
         degraded: false,
@@ -282,33 +269,47 @@ export class CLISelector {
       };
     }
 
-    const fallbacks = CLI_FALLBACK_ORDER[preferred] || [];
-    for (const fallback of fallbacks) {
-      if (this.availableCLIs.has(fallback)) {
-        return {
-          cli: fallback,
-          degraded: true,
-          preferred,
-          reason: `首选 ${preferred} 不可用，降级到 ${fallback}`,
-          category,
-        };
+    const description = [
+      categoryConfig?.displayName,
+      categoryConfig?.description,
+      category,
+    ].filter(Boolean).join(' ');
+    const scores = this.calculateProfileScores(description, category, {
+      preferredWorker: preferred,
+    });
+    if (this.executionStats) {
+      this.adjustScoresWithStats(scores, category);
+    }
+    if (availableList.length === 0) {
+      return {
+        cli: preferred,
+        degraded: false,
+        preferred,
+        reason: '没有可用的 CLI，保持首选',
+        category,
+      };
+    }
+
+    let bestWorker = availableList[0] as CLIType;
+    let bestScore = scores.get(bestWorker) || 0;
+    for (const worker of availableList) {
+      const score = scores.get(worker as CLIType);
+      if (score !== undefined && score > bestScore) {
+        bestScore = score;
+        bestWorker = worker as CLIType;
       }
     }
 
+    const degraded = bestWorker !== preferred;
     return {
-      cli: preferred,
-      degraded: false,
+      cli: bestWorker,
+      degraded,
       preferred,
-      reason: '没有可用的 CLI，使用默认首选',
+      reason: degraded
+        ? `首选 ${preferred} 不可用，基于画像选择 ${bestWorker}`
+        : '没有可用的 CLI，保持首选',
       category,
     };
-  }
-
-  /**
-   * 获取当前技能配置
-   */
-  getSkills(): CLISkillsConfig {
-    return { ...this.skills };
   }
 
   /**
@@ -332,11 +333,6 @@ export class CLISelector {
     taskDescription: string,
     options: WorkerSelectionOptions = {}
   ): WorkerSelectionResult {
-    // 如果没有画像加载器，回退到传统选择
-    if (!this.profileLoader || !this.useProfileBasedSelection) {
-      return this.fallbackSelection(taskDescription, options);
-    }
-
     // 1. 使用画像配置识别任务分类
     const { category, defaultWorker } = this.classifyWithProfile(taskDescription);
 
@@ -349,18 +345,26 @@ export class CLISelector {
     }
 
     // 4. 选择最高分的 Worker
+    const availableList = this.availableCLIs.size > 0
+      ? Array.from(this.availableCLIs)
+      : (['claude', 'codex', 'gemini'] as CLIType[]);
     let bestWorker = defaultWorker;
     let bestScore = scores.get(defaultWorker) || 0;
 
+    if (availableList.length > 0 && !this.availableCLIs.has(defaultWorker)) {
+      bestWorker = availableList[0] as CLIType;
+      bestScore = scores.get(bestWorker) || 0;
+    }
+
     for (const [workerType, score] of scores) {
-      if (score > bestScore && this.availableCLIs.has(workerType)) {
+      if (score > bestScore && (availableList.length === 0 || this.availableCLIs.has(workerType))) {
         bestScore = score;
         bestWorker = workerType;
       }
     }
 
     // 构建选择原因
-    const profile = this.profileLoader.getProfile(bestWorker);
+    const profile = this.getProfile(bestWorker);
     const reason = this.buildSelectionReasonSimple(bestWorker, category, profile);
 
     return {
@@ -375,14 +379,14 @@ export class CLISelector {
    * 使用画像配置分类任务
    */
   private classifyWithProfile(taskDescription: string): { category: string; defaultWorker: CLIType } {
-    const categories = this.profileLoader!.getAllCategories();
-    const rules = this.profileLoader!.getCategoryRules();
+    const rules = this.getCategoryRules();
+    const categories = this.profileLoader?.getAllCategories();
     const lowerDesc = taskDescription.toLowerCase();
 
     let bestMatch: { category: string; score: number; defaultWorker: CLIType } | null = null;
 
     for (const categoryName of rules.categoryPriority) {
-      const config = categories.get(categoryName);
+      const config = categories?.get(categoryName) || DEFAULT_CATEGORIES_CONFIG.categories[categoryName];
       if (!config) continue;
 
       let score = 0;
@@ -414,7 +418,7 @@ export class CLISelector {
 
     // 回退到默认分类
     const defaultCategory = rules.defaultCategory;
-    const defaultConfig = categories.get(defaultCategory);
+    const defaultConfig = categories?.get(defaultCategory) || DEFAULT_CATEGORIES_CONFIG.categories[defaultCategory];
     return {
       category: defaultCategory,
       defaultWorker: (defaultConfig?.defaultWorker || 'claude') as CLIType,
@@ -457,7 +461,7 @@ export class CLISelector {
         continue;
       }
 
-      const profile = this.profileLoader!.getProfile(workerType);
+      const profile = this.getProfile(workerType);
       let score = 50; // 基础分
 
       // 1. 分类匹配 (+30)
@@ -555,6 +559,6 @@ export class CLISelector {
    * 获取 Worker 画像
    */
   getWorkerProfile(workerType: CLIType): WorkerProfile | undefined {
-    return this.profileLoader?.getProfile(workerType);
+    return this.getProfile(workerType);
   }
 }

@@ -1,6 +1,23 @@
 /**
  * Task 管理器
  * 管理 Task 创建、状态更新、SubTask 分解
+ *
+ * @deprecated 自 v0.8.0 起废弃，请使用 UnifiedTaskManager
+ * @deprecated-since v0.8.0
+ * @deprecated-reason 功能已完全迁移到 UnifiedTaskManager，该类将在下一个大版本中删除
+ *
+ * 迁移指南:
+ * - 使用 UnifiedTaskManager 替代 TaskManager
+ * - createTask() → unifiedTaskManager.createTask()
+ * - updateTaskStatus() → unifiedTaskManager.startTask() / completeTask() / failTask()
+ * - addSubTask() → unifiedTaskManager.createSubTask()
+ * - updateSubTaskStatus() → unifiedTaskManager.startSubTask() / completeSubTask() / failSubTask()
+ * - updateTaskPlan() → unifiedTaskManager.updateTaskPlan()
+ * - updateTaskPlanStatus() → unifiedTaskManager.updateTaskPlanStatus()
+ * - addExistingSubTask() → unifiedTaskManager.addExistingSubTask()
+ * - updateSubTaskFiles() → unifiedTaskManager.updateSubTaskFiles()
+ *
+ * @see UnifiedTaskManager
  */
 
 import { Task, SubTask, TaskStatus, SubTaskStatus, CLIType, WorkerType } from './types';
@@ -14,6 +31,8 @@ function generateId(): string {
 
 /**
  * Task 管理器
+ *
+ * @deprecated 自 v0.8.0 起废弃，请使用 UnifiedTaskManager
  */
 export class TaskManager {
   private sessionManager: UnifiedSessionManager;
@@ -45,8 +64,11 @@ export class TaskManager {
       sessionId: session.id,
       prompt: trimmedPrompt,
       status: 'pending',
+      priority: 5,
       subTasks: [],
       createdAt: Date.now(),
+      retryCount: 0,
+      maxRetries: 3,
     };
 
     this.sessionManager.addTask(session.id, task);
@@ -101,24 +123,24 @@ export class TaskManager {
     if (!task) return;
 
     task.status = status;
-    
+
     // 更新时间戳
     if (status === 'running' && !task.startedAt) {
       task.startedAt = Date.now();
     } else if (status === 'completed' || status === 'failed') {
       task.completedAt = Date.now();
-    } else if (status === 'interrupted' || status === 'cancelled') {
-      task.interruptedAt = Date.now();
+    } else if (status === 'cancelled') {
+      task.cancelledAt = Date.now();
     }
 
     this.sessionManager.updateTask(session.id, taskId, task);
 
     // 发布事件
-    const eventType = status === 'completed' ? 'task:completed' 
-      : status === 'failed' ? 'task:failed' 
-      : status === 'interrupted' || status === 'cancelled' ? 'task:interrupted'
+    const eventType = status === 'completed' ? 'task:completed'
+      : status === 'failed' ? 'task:failed'
+      : status === 'cancelled' ? 'task:cancelled'
       : 'task:started';
-    
+
     globalEventBus.emitEvent(eventType, { sessionId: session.id, taskId });
   }
 
@@ -150,8 +172,11 @@ export class TaskManager {
       prompt: options?.prompt,
       targetFiles,
       dependencies: options?.dependencies || [],
-      priority: options?.priority,
+      priority: options?.priority ?? 5,
       status: 'pending',
+      progress: 0,
+      retryCount: 0,
+      maxRetries: 3,
       output: [],
     };
 
@@ -177,12 +202,15 @@ export class TaskManager {
     const normalized: SubTask = {
       ...subTask,
       taskId,
-      assignedCli: subTask.assignedCli ?? subTask.assignedWorker,
       targetFiles: subTask.targetFiles ?? [],
       modifiedFiles: subTask.modifiedFiles ?? [],
       dependencies: subTask.dependencies ?? [],
       status: subTask.status ?? 'pending',
       output: subTask.output ?? [],
+      progress: subTask.progress ?? 0,
+      retryCount: subTask.retryCount ?? 0,
+      maxRetries: subTask.maxRetries ?? 3,
+      priority: subTask.priority ?? 5,
     };
 
     task.subTasks.push(normalized);
@@ -273,9 +301,9 @@ export class TaskManager {
     }
   }
 
-  /** 打断 Task */
-  interruptTask(taskId: string): void {
-    this.updateTaskStatus(taskId, 'interrupted');
+  /** 取消 Task */
+  cancelTask(taskId: string): void {
+    this.updateTaskStatus(taskId, 'cancelled');
   }
 
   /** 获取当前 Session 的所有 Task */

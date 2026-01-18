@@ -14,8 +14,10 @@ import {
   PermissionMatrix,
   StrategyConfig,
 } from '../types';
+import { logger, LogCategory } from '../logging';
 import { CLIAdapterFactory } from '../cli/adapter-factory';
 import { TaskManager } from '../task-manager';
+import { UnifiedSessionManager } from '../session';
 import { SnapshotManager } from '../snapshot-manager';
 import { globalEventBus } from '../events';
 import { OrchestratorAgent, ConfirmationCallback, RecoveryConfirmationCallback, ClarificationCallback, WorkerQuestionCallback } from './orchestrator-agent';
@@ -29,7 +31,6 @@ import {
   QuestionCallback,
 } from './protocols/types';
 import { formatPlanForUser } from './prompts/orchestrator-prompts';
-import { CLISkillsConfig } from '../task/cli-selector';
 
 // 重新导出类型以保持向后兼容
 export type { ExecutionPlan, ExecutionResult, SubTask };
@@ -59,6 +60,17 @@ export interface OrchestratorConfig {
     enabled?: boolean;
     maxRounds?: number;
     worker?: CLIType;
+  };
+  review?: {
+    selfCheck?: boolean;
+    peerReview?: 'auto' | 'always' | 'never';
+    maxRounds?: number;
+    highRiskExtensions?: string[];
+    highRiskKeywords?: string[];
+  };
+  planReview?: {
+    enabled?: boolean;
+    reviewer?: CLIType;
   };
   permissions?: PermissionMatrix;
   strategy?: StrategyConfig;
@@ -101,6 +113,7 @@ const DEFAULT_CONFIG: OrchestratorConfig = {
 export class IntelligentOrchestrator {
   private cliFactory: CLIAdapterFactory;
   private taskManager: TaskManager;
+  private sessionManager: UnifiedSessionManager;
   private snapshotManager: SnapshotManager;
   private config: OrchestratorConfig;
   private workspaceRoot: string;
@@ -148,12 +161,17 @@ export class IntelligentOrchestrator {
     this.strategyConfig = this.resolveStrategyConfig();
     this.permissions = this.resolvePermissions();
 
+    // 从 TaskManager 获取 SessionManager
+    this.sessionManager = (taskManager as any).sessionManager;
+
     // 创建独立编排者 Agent，传递 workspaceRoot 和 snapshotManager 以支持验证和回滚功能
     this.orchestratorAgent = new OrchestratorAgent(
       cliFactory,
       {
         timeout: this.config.timeout,
         maxRetries: this.config.maxRetries,
+        review: this.config.review,
+        planReview: this.config.planReview,
         verification: this.config.verification,
         integration: this.config.integration,
         permissions: this.permissions,
@@ -162,7 +180,7 @@ export class IntelligentOrchestrator {
       },
       workspaceRoot,
       snapshotManager,
-      taskManager
+      this.sessionManager
     );
 
     this.setupOrchestratorEvents();
@@ -193,7 +211,7 @@ export class IntelligentOrchestrator {
   setInteractionMode(mode: InteractionMode): void {
     this.interactionMode = mode;
     this.modeConfig = INTERACTION_MODE_CONFIGS[mode];
-    console.log(`[IntelligentOrchestrator] 交互模式设置为: ${mode}`);
+    logger.info(`[IntelligentOrchestrator] 交互模式设置为: ${mode}`, undefined, LogCategory.ORCHESTRATOR);
     globalEventBus.emitEvent('orchestrator:mode_changed', { data: { mode } });
     this.syncPlanConfirmationPolicy();
     this.syncRecoveryConfirmationCallback();
@@ -225,10 +243,6 @@ export class IntelligentOrchestrator {
   }
 
   /** 更新 CLI 技能配置 */
-  setCliSkills(skills: Partial<CLISkillsConfig>): void {
-    this.orchestratorAgent.setCliSkills(skills);
-  }
-
   /** 设置恢复确认回调（向后兼容） */
   setRecoveryConfirmationCallback(_callback: RecoveryConfirmationCallback): void {
     this.recoveryConfirmationCallback = _callback;
@@ -269,6 +283,13 @@ export class IntelligentOrchestrator {
   }
 
   /**
+   * 重新加载画像配置
+   */
+  async reloadProfiles(): Promise<void> {
+    await this.orchestratorAgent.reloadProfiles();
+  }
+
+  /**
    * 执行任务 - 主入口
    */
   async execute(userPrompt: string, taskId: string, sessionId?: string): Promise<string> {
@@ -302,8 +323,8 @@ export class IntelligentOrchestrator {
       const result = await this.orchestratorAgent.execute(userPrompt, taskId, sessionId);
 
       if (this.abortController?.signal.aborted) {
-        this.taskManager.updateTaskStatus(taskId, 'interrupted');
-        globalEventBus.emitEvent('task:interrupted', { taskId, data: { isRunning: false } });
+        this.taskManager.updateTaskStatus(taskId, 'cancelled');
+        globalEventBus.emitEvent('task:cancelled', { taskId, data: { isRunning: false } });
         return '任务已被取消。';
       }
 
@@ -316,14 +337,14 @@ export class IntelligentOrchestrator {
       const errorMsg = error instanceof Error ? error.message : String(error);
 
       if (this.abortController?.signal.aborted) {
-        this.taskManager.updateTaskStatus(taskId, 'interrupted');
-        globalEventBus.emitEvent('task:interrupted', { taskId, data: { isRunning: false } });
+        this.taskManager.updateTaskStatus(taskId, 'cancelled');
+        globalEventBus.emitEvent('task:cancelled', { taskId, data: { isRunning: false } });
         return '任务已被取消。';
       }
 
       if (this.modeConfig.autoRollbackOnFailure && this.strategyConfig.autoRollbackOnFailure) {
         const count = this.snapshotManager.revertAllChanges();
-        console.log(`[IntelligentOrchestrator] 自动回滚 ${count} 个变更`);
+        logger.info(`[IntelligentOrchestrator] 自动回滚 ${count} 个变更`, undefined, LogCategory.ORCHESTRATOR);
       }
 
       this.taskManager.updateTaskStatus(taskId, 'failed');
@@ -396,8 +417,8 @@ export class IntelligentOrchestrator {
         record.prompt
       );
       if (this.abortController?.signal.aborted) {
-        this.taskManager.updateTaskStatus(finalTaskId, 'interrupted');
-        globalEventBus.emitEvent('task:interrupted', { taskId: finalTaskId, data: { isRunning: false } });
+        this.taskManager.updateTaskStatus(finalTaskId, 'cancelled');
+        globalEventBus.emitEvent('task:cancelled', { taskId: finalTaskId, data: { isRunning: false } });
         return '任务已被取消。';
       }
 
@@ -431,7 +452,7 @@ export class IntelligentOrchestrator {
 
   /** ask 模式：仅对话 */
   private async executeAskMode(userPrompt: string, taskId: string, sessionId?: string): Promise<string> {
-    console.log('[IntelligentOrchestrator] ask 模式：仅对话');
+    logger.info('[IntelligentOrchestrator] ask 模式：仅对话', undefined, LogCategory.ORCHESTRATOR);
 
     const contextSessionId = sessionId || taskId;
     const context = await this.orchestratorAgent.prepareContext(contextSessionId, userPrompt);
@@ -525,7 +546,7 @@ export class IntelligentOrchestrator {
 
   /** 取消当前任务 */
   async cancel(): Promise<void> {
-    console.log('[IntelligentOrchestrator] 取消任务');
+    logger.info('[IntelligentOrchestrator] 取消任务', undefined, LogCategory.ORCHESTRATOR);
 
     // 1. 触发 AbortController
     this.abortController?.abort();
@@ -537,8 +558,8 @@ export class IntelligentOrchestrator {
     this.stopStatusUpdates();
 
     if (this.currentTaskId) {
-      this.taskManager.updateTaskStatus(this.currentTaskId, 'interrupted');
-      globalEventBus.emitEvent('task:interrupted', { taskId: this.currentTaskId, data: { isRunning: false } });
+      this.taskManager.updateTaskStatus(this.currentTaskId, 'cancelled');
+      globalEventBus.emitEvent('task:cancelled', { taskId: this.currentTaskId, data: { isRunning: false } });
     }
 
     // 4. 重置状态标志（关键！）
@@ -546,7 +567,7 @@ export class IntelligentOrchestrator {
     this.abortController = null;
     this.currentTaskId = null;
 
-    console.log('[IntelligentOrchestrator] 任务已取消，状态已重置');
+    logger.info('[IntelligentOrchestrator] 任务已取消，状态已重置', undefined, LogCategory.ORCHESTRATOR);
   }
 
   /** 开始状态更新定时器 */
@@ -631,6 +652,6 @@ export class IntelligentOrchestrator {
   dispose(): void {
     this.stopStatusUpdates();
     this.orchestratorAgent.dispose();
-    console.log('[IntelligentOrchestrator] 已销毁');
+    logger.info('[IntelligentOrchestrator] 已销毁', undefined, LogCategory.ORCHESTRATOR);
   }
 }

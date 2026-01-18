@@ -1,3 +1,5 @@
+import { logger, LogCategory } from '../logging';
+
 /**
  * 任务依赖图
  * 管理任务之间的依赖关系，支持拓扑排序和并行分组
@@ -72,7 +74,7 @@ export class TaskDependencyGraph {
    */
   addTask(id: string, name: string, data?: unknown, targetFiles?: string[]): void {
     if (this.nodes.has(id)) {
-      console.warn(`[TaskDependencyGraph] 任务 ${id} 已存在，跳过添加`);
+      logger.warn(`[TaskDependencyGraph] 任务 ${id} 已存在，跳过添加`, undefined, LogCategory.ORCHESTRATOR);
       return;
     }
 
@@ -107,18 +109,18 @@ export class TaskDependencyGraph {
     const dependency = this.nodes.get(dependsOn);
 
     if (!task) {
-      console.warn(`[TaskDependencyGraph] 任务 ${taskId} 不存在`);
+      logger.warn(`[TaskDependencyGraph] 任务 ${taskId} 不存在`, undefined, LogCategory.ORCHESTRATOR);
       return false;
     }
 
     if (!dependency) {
-      console.warn(`[TaskDependencyGraph] 依赖任务 ${dependsOn} 不存在`);
+      logger.warn(`[TaskDependencyGraph] 依赖任务 ${dependsOn} 不存在`, undefined, LogCategory.ORCHESTRATOR);
       return false;
     }
 
     // 检查是否会形成循环
     if (this.wouldCreateCycle(taskId, dependsOn)) {
-      console.warn(`[TaskDependencyGraph] 添加依赖会形成循环: ${taskId} -> ${dependsOn}`);
+      logger.warn(`[TaskDependencyGraph] 添加依赖会形成循环: ${taskId} -> ${dependsOn}`, undefined, LogCategory.ORCHESTRATOR);
       return false;
     }
 
@@ -279,7 +281,7 @@ export class TaskDependencyGraph {
           const success = this.addDependency(taskIds[i], taskIds[i - 1]);
           if (success) {
             addedCount++;
-            console.log(
+            logger.info(
               `[TaskDependencyGraph] 文件冲突自动添加依赖: ${taskIds[i]} 依赖 ${taskIds[i - 1]} (文件: ${conflict.file})`
             );
           }

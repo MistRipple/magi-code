@@ -15,16 +15,31 @@ export type { ContentBlock };
 
 /**
  * 移除 ANSI 转义序列（CLI 输出的颜色代码）
+ * 🔧 增强：支持更多类型的 ANSI 序列
  */
 export function stripAnsi(text: string): string {
-  return String(text).replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+  return String(text)
+    // CSI 序列 (Control Sequence Introducer): ESC [ ... 字母
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+    // OSC 序列 (Operating System Command): ESC ] ... BEL 或 ESC \
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    // 单字符转义序列: ESC 后跟单个字符
+    .replace(/\x1b[NOPXZn\\^_@]/g, '')
+    // DCS/PM/APC 序列: ESC P/^/_ ... ST
+    .replace(/\x1b[P^_][^\x1b]*\x1b\\/g, '')
+    // 简单的 ESC 后跟一个字符
+    .replace(/\x1b./g, '');
 }
 
 /**
  * 移除零宽字符（可能导致复制粘贴问题）
+ * 🔧 增强：扩展处理范围
  */
 export function stripZeroWidth(text: string): string {
-  return String(text).replace(/[\u200B-\u200D\uFEFF]/g, '');
+  return String(text).replace(
+    /[\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\u00AD\u180E]/g,
+    ''
+  );
 }
 
 /**
@@ -105,22 +120,38 @@ export function extractSingleCodeFence(content: string): { lang: string; body: s
 
 /**
  * 判断是否应该渲染为代码块
+ * 🔧 修复：避免误判 Markdown 有序列表
  */
 export function shouldRenderAsCodeBlock(content: string): boolean {
   if (!content) return false;
   const trimmed = content.trim();
   if (!trimmed) return false;
+  // 已经是代码块围栏格式
   if (trimmed.startsWith('```')) return false;
   // JSON 格式
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) return true;
+  // 单行内容不作为代码块
   if (!content.includes('\n')) return false;
-  // 带行号的输出
+
+  // 🔧 检测带行号的特殊输出格式（CLI 工具输出）
+  // 注意：避免误判 Markdown 有序列表
+
+  // 特殊行号格式：数字→（如 "1→ code"）
   if (/^\s*\d+→/m.test(content)) return true;
-  if (/^\s*\d+\s*[:|>]/m.test(content)) return true;
-  if (/^\s*\d+\s*-\s+/m.test(content)) return true;
-  if (/^\s*\d+\)\s+/m.test(content)) return true;
-  // 缩进代码
-  return /^(\s{2,}|\t)/m.test(content);
+  // 行号格式：数字: 或 数字> （如 "1: code" 或 "1> code"）
+  if (/^\s*\d+\s*[:>]/m.test(content)) return true;
+
+  // 🔧 移除误判有序列表的检测
+  // 之前的规则 /^\s*\d+\.\s+/m 会错误匹配 "1. 列表项"
+  // 之前的规则 /^\s*\d+\)\s+/m 也会错误匹配括号式列表
+  // 之前的规则 /^\s*\d+\s*-\s+/m 也可能误判
+
+  // 只检测明确的缩进代码（2+ 空格或制表符开头）
+  // 且要求多行都有缩进，避免单行缩进误判
+  const lines = content.split('\n');
+  const indentedLines = lines.filter(l => /^\s{2,}|^\t/.test(l) && l.trim());
+  // 至少 3 行有缩进才认为是代码块
+  return indentedLines.length >= 3;
 }
 
 /**

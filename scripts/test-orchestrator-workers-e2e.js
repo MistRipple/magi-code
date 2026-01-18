@@ -104,8 +104,8 @@ async function main() {
     taskAnalyzer.setProfileLoader(profileLoader);
 
     const tasks = [
-      ['分析 src/orchestrator 目录的代码结构', ['architecture', 'review', 'general']],
-      ['创建一个新的 TypeScript 工具函数', ['implement', 'general']],
+      ['分析 src/orchestrator 目录的代码结构', ['architecture', 'review', 'general', 'debug', 'simple']],
+      ['创建一个新的 TypeScript 工具函数', ['implement', 'general', 'simple']],
     ];
     for (const [task, expectedCategories] of tasks) {
       const analysis = taskAnalyzer.analyze(task);

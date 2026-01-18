@@ -1,3 +1,5 @@
+// ORCH MULTI TEST
+// ORCH SMOKE TEST
 /**
  * Orchestrator Agent - 独立编排者 Claude
  *
@@ -18,6 +20,7 @@
  * - 核心原则：NEVER START IMPLEMENTING, UNLESS USER WANTS YOU TO IMPLEMENT SOMETHING EXPLICITLY
  */
 
+import { logger, LogCategory } from '../logging';
 import { EventEmitter } from 'events';
 import * as path from 'path';
 import { CLIAdapterFactory } from '../cli/adapter-factory';
@@ -28,14 +31,15 @@ import { ExecutionStats } from './execution-stats';
 import { VerificationRunner, VerificationResult, VerificationConfig } from './verification-runner';
 import { ContextManager, ContextCompressor } from '../context';
 import { SnapshotManager } from '../snapshot-manager';
-import { TaskManager } from '../task-manager';
 import { RiskPolicy, RiskAssessment } from './risk-policy';
 import { PolicyEngine, policyEngine, ConflictDetectionResult } from './policy-engine';
-import { TaskStateManager, TaskState } from './task-state-manager';
+import { UnifiedTaskManager } from '../task/unified-task-manager';
+import { SessionManagerTaskRepository } from '../task/session-manager-task-repository';
+import { UnifiedSessionManager } from '../session';
 import { PlanStorage, PlanRecord, PlanReview } from './plan-storage';
 import { PlanTodoManager } from './plan-todo';
 import { ExecutionStateManager, ExecutionStateStatus } from './execution-state';
-import { IntentGate, IntentHandlerMode, IntentType } from './intent-gate';
+import { IntentGate, IntentHandlerMode, IntentDecision } from './intent-gate';
 import {
   WorkerType,
   OrchestratorState,
@@ -63,7 +67,7 @@ import { TokenUsage } from '../cli/types';
 import { PermissionMatrix, StrategyConfig, SubTaskStatus } from '../types';
 import { TaskAnalyzer, TaskAnalysis } from '../task/task-analyzer';
 import { TaskSplitter, SplitResult, SubTaskDef } from '../task/task-splitter';
-import { CLISelector, CLISkillsConfig } from '../task/cli-selector';
+import { CLISelector } from '../task/cli-selector';
 import { AITaskDecomposer } from '../task/ai-task-decomposer';
 import { ResultAggregator } from '../task/result-aggregator';
 import { RecoveryHandler } from './recovery-handler';
@@ -116,7 +120,7 @@ const DEFAULT_CONFIG: OrchestratorConfig = {
 /** 用户确认回调类型 */
 export type ConfirmationCallback = (plan: ExecutionPlan, formattedPlan: string) => Promise<boolean>;
 export type RecoveryConfirmationCallback = (
-  failedTask: TaskState,
+  failedTask: SubTask,
   error: string,
   options: { retry: boolean; rollback: boolean }
 ) => Promise<'retry' | 'rollback' | 'continue'>;
@@ -205,8 +209,9 @@ export class OrchestratorAgent extends EventEmitter {
 
   // 快照管理（支持文件回滚）
   private snapshotManager: SnapshotManager | null = null;
-  private taskManager: TaskManager | null = null;
-  private taskStateManager: TaskStateManager | null = null;
+  private sessionManager: UnifiedSessionManager | null = null;
+  private unifiedTaskManager: UnifiedTaskManager | null = null;
+  private subTaskIdToTaskIdMap: Map<string, string> = new Map();
   private recoveryHandler: RecoveryHandler | null = null;
   private planStorage: PlanStorage | null = null;
   private executionStateManager: ExecutionStateManager | null = null;
@@ -259,7 +264,7 @@ export class OrchestratorAgent extends EventEmitter {
     config?: Partial<OrchestratorConfig>,
     workspaceRoot?: string,
     snapshotManager?: SnapshotManager,
-    taskManager?: TaskManager
+    sessionManager?: UnifiedSessionManager
   ) {
     super();
     this.cliFactory = cliFactory;
@@ -267,7 +272,7 @@ export class OrchestratorAgent extends EventEmitter {
     this.messageBus = globalMessageBus;
     this.workspaceRoot = workspaceRoot || '';
     this.snapshotManager = snapshotManager || null;
-    this.taskManager = taskManager || null;
+    this.sessionManager = sessionManager || null;
     if (this.workspaceRoot) {
       this.planStorage = new PlanStorage(this.workspaceRoot);
       this.executionStateManager = new ExecutionStateManager(this.workspaceRoot);
@@ -294,8 +299,10 @@ export class OrchestratorAgent extends EventEmitter {
     this.strategyConfig = this.resolveStrategyConfig();
     this.permissions = this.resolvePermissions();
 
-    // 初始化 Intent Gate - 意图门控
-    this.intentGate = new IntentGate();
+    // 初始化 Intent Gate - 意图门控（AI 决策）
+    this.intentGate = new IntentGate(async (prompt: string) => {
+      return await this.decideIntentWithAI(prompt);
+    });
 
     // 创建 Worker Pool，集成执行统计和快照管理
     this.workerPool = new WorkerPool({
@@ -358,7 +365,7 @@ export class OrchestratorAgent extends EventEmitter {
       const oldState = this._state;
       this._state = state;
       this.emit('stateChange', state);
-      console.log(`[OrchestratorAgent] 状态变更: ${oldState} -> ${state}`);
+      logger.info(`[OrchestratorAgent] 状态变更: ${oldState} -> ${state}`, undefined, LogCategory.ORCHESTRATOR);
     }
   }
 
@@ -393,10 +400,6 @@ export class OrchestratorAgent extends EventEmitter {
   }
 
   /** 更新 CLI 技能配置 */
-  setCliSkills(skills: Partial<CLISkillsConfig>): void {
-    this.cliSelector.updateSkills(skills);
-  }
-
   /** 设置扩展上下文（用于持久化执行统计） */
   setExtensionContext(context: import('vscode').ExtensionContext): void {
     this.executionStats.setContext(context);
@@ -426,11 +429,27 @@ export class OrchestratorAgent extends EventEmitter {
       // 创建 PolicyEngine 实例并注入 ProfileLoader
       this.policyEngine = new PolicyEngine(profileLoader);
 
-      console.log('[OrchestratorAgent] CLISelector 和 TaskAnalyzer 已集成 Worker 画像');
+      logger.info('[OrchestratorAgent] CLISelector 和 TaskAnalyzer 已集成 Worker 画像', undefined, LogCategory.ORCHESTRATOR);
     }
 
-    console.log('[OrchestratorAgent] 初始化完成');
-    console.log(`[OrchestratorAgent] 执行统计: ${this.getStatsSummary()}`);
+    logger.info('[OrchestratorAgent] 初始化完成', undefined, LogCategory.ORCHESTRATOR);
+    logger.info(`[OrchestratorAgent] 执行统计: ${this.getStatsSummary()}`, undefined, LogCategory.ORCHESTRATOR);
+  }
+
+  /**
+   * 重新加载画像配置并同步到分析/选择器
+   */
+  async reloadProfiles(): Promise<void> {
+    await this.workerPool.loadProfiles();
+
+    const profileLoader = this.workerPool.getProfileLoader();
+    if (profileLoader) {
+      this.profileLoader = profileLoader;
+      this.cliSelector.setProfileLoader(profileLoader);
+      this.taskAnalyzer.setProfileLoader(profileLoader);
+      this.policyEngine = new PolicyEngine(profileLoader);
+      logger.info('[OrchestratorAgent] 画像配置已重新加载', undefined, LogCategory.ORCHESTRATOR);
+    }
   }
 
   /** 获取指定计划记录 */
@@ -504,6 +523,7 @@ export class OrchestratorAgent extends EventEmitter {
           const answer = await this.waitForUserInput(plan);
           if (!answer) {
             this.setState('idle');
+            this.emitUIMessage('progress_update', '用户取消补充信息，任务已取消。');
             throw new Error('计划已取消');
           }
           analysisPrompt = `${userPrompt}\n\n## 用户补充信息\n${answer}`;
@@ -518,6 +538,8 @@ export class OrchestratorAgent extends EventEmitter {
       }
 
       if (plan.needsUserInput && plan.questions && plan.questions.length > 0) {
+        this.setState('idle');
+        this.emitUIMessage('progress_update', '用户补充信息不足，无法生成执行计划。');
         throw new Error('用户补充信息不足，无法生成执行计划');
       }
 
@@ -527,12 +549,12 @@ export class OrchestratorAgent extends EventEmitter {
 
       const formattedPlan = formatPlanForUser(plan);
       const review = await this.reviewPlan(plan, formattedPlan);
-      const record = this.persistPlan(plan, formattedPlan, review);
+      const record = await this.persistPlan(plan, formattedPlan, review);
       if (!record) {
         throw new Error('执行计划持久化失败');
       }
       if (review.status === 'rejected') {
-        this.updateTaskPlanStatus('failed');
+        await this.updateTaskPlanStatus('failed');
         this.emitUIMessage('progress_update', `计划评审未通过: ${review.summary}`);
       }
 
@@ -606,7 +628,7 @@ export class OrchestratorAgent extends EventEmitter {
       this.setState('failed');
       this.emitUIMessage('error', `任务执行失败: ${error instanceof Error ? error.message : String(error)}`);
       this.updateExecutionState('failed', plan.id);
-      this.updateTaskPlanStatus('failed');
+      await this.updateTaskPlanStatus('failed');
       throw error;
     } finally {
       this.cleanup();
@@ -647,7 +669,7 @@ export class OrchestratorAgent extends EventEmitter {
   private async handleWorkerQuestion(message: WorkerQuestionMessage): Promise<void> {
     const { taskId, subTaskId, workerId, question, context, options, questionId } = message.payload;
 
-    console.log(`[OrchestratorAgent] 收到 Worker 问题: ${question} (from ${workerId})`);
+    logger.info(`[OrchestratorAgent] 收到 Worker 问题: ${question} (from ${workerId}, undefined, LogCategory.ORCHESTRATOR)`);
 
     // 通知 UI 有 Worker 提问
     this.emitUIMessage('progress_update', `Worker ${workerId} 提问: ${question}`, {
@@ -674,7 +696,7 @@ export class OrchestratorAgent extends EventEmitter {
             answer,
             'user'
           );
-          console.log(`[OrchestratorAgent] 已回答 Worker 问题: ${questionId}`);
+          logger.info(`[OrchestratorAgent] 已回答 Worker 问题: ${questionId}`, undefined, LogCategory.ORCHESTRATOR);
         } else {
           // 用户取消回答，使用默认回答
           this.messageBus.sendWorkerAnswer(
@@ -686,14 +708,14 @@ export class OrchestratorAgent extends EventEmitter {
             '请自行决定最佳方案',
             'orchestrator'
           );
-          console.log(`[OrchestratorAgent] 用户未回答，使用默认回答: ${questionId}`);
+          logger.info(`[OrchestratorAgent] 用户未回答，使用默认回答: ${questionId}`, undefined, LogCategory.ORCHESTRATOR);
         }
 
         // 恢复之前的状态
         this.setState(previousState);
 
       } catch (error) {
-        console.error('[OrchestratorAgent] 处理 Worker 问题异常:', error);
+        logger.error('[OrchestratorAgent] 处理 Worker 问题异常:', error, LogCategory.ORCHESTRATOR);
         // 发送默认回答
         this.messageBus.sendWorkerAnswer(
           this.id,
@@ -707,7 +729,7 @@ export class OrchestratorAgent extends EventEmitter {
       }
     } else {
       // 没有设置回调，自动回答
-      console.log('[OrchestratorAgent] 未设置 Worker 问题回调，自动回答');
+      logger.info('[OrchestratorAgent] 未设置 Worker 问题回调，自动回答', undefined, LogCategory.ORCHESTRATOR);
       this.messageBus.sendWorkerAnswer(
         this.id,
         workerId,
@@ -773,79 +795,6 @@ export class OrchestratorAgent extends EventEmitter {
   // =========================================================================
 
   /**
-   * 评估需求模糊度
-   * 通过 Claude 分析用户需求的明确程度
-   */
-  private async assessAmbiguity(userPrompt: string): Promise<AmbiguityAssessment> {
-    console.log('[OrchestratorAgent] Phase 0: 评估需求模糊度...');
-
-    const assessmentPrompt = `你是一个需求分析专家。请评估以下用户需求的模糊程度。
-
-## 用户需求
-${userPrompt}
-
-## 评估维度
-1. **目标明确性**：是否有明确的功能目标？是否有具体的输入/输出定义？
-2. **范围明确性**：是否指定了目标文件/模块？是否有边界条件说明？
-3. **技术明确性**：是否指定了技术方案？是否有接口定义？
-4. **验收标准**：是否有明确的完成标准？是否有测试用例？
-
-## 输出格式（JSON）
-\`\`\`json
-{
-  "score": 0-100,  // 模糊度评分，0=完全明确，100=完全模糊
-  "isAmbiguous": true/false,  // 是否需要澄清（score > 50 时为 true）
-  "missingDimensions": ["目标明确性", ...],  // 缺失的维度
-  "questions": ["问题1", "问题2"],  // 需要用户回答的问题（最多3个）
-  "context": "评估说明"
-}
-\`\`\`
-
-只输出 JSON，不要其他内容。`;
-
-    try {
-      const response = await this.cliFactory.sendMessage(
-        'claude',
-        assessmentPrompt,
-        undefined,
-        { source: 'orchestrator', streamToUI: false }
-      );
-
-      if (response.error) {
-        console.warn('[OrchestratorAgent] 模糊度评估失败，默认为明确需求');
-        return {
-          score: 0,
-          isAmbiguous: false,
-          questions: [],
-          missingDimensions: [],
-          context: '评估失败，默认为明确需求'
-        };
-      }
-
-      const jsonMatch = response.content.match(/```json\s*([\s\S]*?)\s*```/);
-      const jsonStr = jsonMatch ? jsonMatch[1] : response.content;
-      const parsed = JSON.parse(jsonStr);
-
-      return {
-        score: parsed.score || 0,
-        isAmbiguous: parsed.isAmbiguous || parsed.score > 50,
-        questions: parsed.questions || [],
-        missingDimensions: parsed.missingDimensions || [],
-        context: parsed.context || ''
-      };
-    } catch (error) {
-      console.warn('[OrchestratorAgent] 模糊度评估异常:', error);
-      return {
-        score: 0,
-        isAmbiguous: false,
-        questions: [],
-        missingDimensions: [],
-        context: '评估异常，默认为明确需求'
-      };
-    }
-  }
-
-  /**
    * 执行需求澄清流程
    * 向用户提问并等待回答
    */
@@ -854,11 +803,11 @@ ${userPrompt}
     assessment: AmbiguityAssessment
   ): Promise<string> {
     if (!this.clarificationCallback) {
-      console.log('[OrchestratorAgent] 未设置澄清回调，跳过澄清流程');
+      logger.info('[OrchestratorAgent] 未设置澄清回调，跳过澄清流程', undefined, LogCategory.ORCHESTRATOR);
       return userPrompt;
     }
 
-    console.log(`[OrchestratorAgent] 需求模糊度: ${assessment.score}%，开始澄清流程`);
+    logger.info(`[OrchestratorAgent] 需求模糊度: ${assessment.score}%，开始澄清流程`, undefined, LogCategory.ORCHESTRATOR);
     this.setState('clarifying');
 
     // 发送澄清请求消息
@@ -883,7 +832,7 @@ ${userPrompt}
       );
 
       if (!result) {
-        console.log('[OrchestratorAgent] 用户取消澄清');
+        logger.info('[OrchestratorAgent] 用户取消澄清', undefined, LogCategory.ORCHESTRATOR);
         return userPrompt;
       }
 
@@ -898,11 +847,11 @@ ${userPrompt}
 ${answersText}
 ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
 
-      console.log('[OrchestratorAgent] 需求澄清完成');
+      logger.info('[OrchestratorAgent] 需求澄清完成', undefined, LogCategory.ORCHESTRATOR);
       return clarifiedPrompt;
 
     } catch (error) {
-      console.error('[OrchestratorAgent] 澄清流程异常:', error);
+      logger.error('[OrchestratorAgent] 澄清流程异常:', error, LogCategory.ORCHESTRATOR);
       return userPrompt;
     }
   }
@@ -944,12 +893,14 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
       // ✅ P2优化: Phase 0: Intent Gate - 意图门控 (前置优化)
       // 核心原则: NEVER START IMPLEMENTING, UNLESS USER WANTS YOU TO IMPLEMENT SOMETHING EXPLICITLY
       // 优化: 在初始化上下文之前先进行意图分类,轻量请求可跳过完整上下文初始化
-      const intentResult = this.intentGate.process(userPrompt);
-      console.log(`[OrchestratorAgent] Intent Gate: ${intentResult.classification.type}, ` +
+      const intentResult = await this.intentGate.process(userPrompt);
+      logger.info(`[OrchestratorAgent] Intent Gate: ${intentResult.classification.intent}, ` +
                   `confidence: ${(intentResult.classification.confidence * 100).toFixed(0)}%, ` +
                   `mode: ${intentResult.recommendedMode}`);
 
       // 根据意图类型路由处理
+      let clarifiedPrompt = userPrompt;
+      let clarifiedByIntentGate = false;
       if (intentResult.skipTaskAnalysis) {
         // ✅ P2优化: 轻量请求按需初始化context
         // ASK/EXPLORE模式可能需要轻量context,但不需要完整Memory加载
@@ -958,25 +909,15 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
           return response;
         }
         // 如果 handleIntentDirectly 返回 null，继续走任务分析流程
+        clarifiedByIntentGate = true;
+        clarifiedPrompt = this.currentContext?.userPrompt || userPrompt;
       }
 
       // ✅ P2优化: 仅在需要任务分析时才初始化完整上下文
       // 这避免了轻量请求(QUESTION/EXPLORE)的不必要开销
-      await this.ensureContext(contextSessionId, userPrompt);
+      await this.ensureContext(contextSessionId, clarifiedPrompt);
 
-      // Phase 0.5: 需求澄清（如果设置了澄清回调且意图门控未处理）
-      let clarifiedPrompt = userPrompt;
-      if (
-        this.clarificationCallback &&
-        !intentResult.needsClarification &&
-        intentResult.recommendedMode === IntentHandlerMode.TASK
-      ) {
-        const assessment = await this.assessAmbiguity(userPrompt);
-        if (assessment.isAmbiguous && assessment.questions.length > 0) {
-          clarifiedPrompt = await this.clarifyRequirements(userPrompt, assessment);
-          this.currentContext.userPrompt = clarifiedPrompt;
-        }
-      }
+      // AI 决策已完成意图选择，后续不再进行规则澄清
       this.checkAborted();
 
       // Phase 1: 任务分析（支持补充提问）
@@ -996,6 +937,7 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
           const answer = await this.waitForUserInput(plan);
           if (!answer) {
             this.setState('idle');
+            this.emitUIMessage('progress_update', '用户取消补充信息，任务已取消。');
             return '任务已取消。';
           }
           analysisPrompt = `${clarifiedPrompt}\n\n## 用户补充信息\n${answer}`;
@@ -1010,7 +952,9 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
       }
 
       if (plan.needsUserInput && plan.questions && plan.questions.length > 0) {
-        throw new Error('用户补充信息不足，无法生成执行计划');
+        this.setState('idle');
+        this.emitUIMessage('progress_update', '用户补充信息不足，无法生成执行计划。');
+        return '需要补充信息后才能继续。';
       }
 
       this.currentContext.plan = plan;
@@ -1030,7 +974,7 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
       this.setState('failed');
       this.emitUIMessage('error', `任务执行失败: ${errorMsg}`);
       this.updateExecutionState('failed', this.currentContext?.plan?.id);
-      this.updateTaskPlanStatus('failed');
+      await this.updateTaskPlanStatus('failed');
       throw error;
 
     } finally {
@@ -1038,7 +982,7 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     }
   }
 
-  private persistPlan(plan: ExecutionPlan, formattedPlan: string, review?: PlanReview): PlanRecord | null {
+  private async persistPlan(plan: ExecutionPlan, formattedPlan: string, review?: PlanReview): Promise<PlanRecord | null> {
     if (!this.planStorage || !this.currentContext) return null;
     const now = Date.now();
     const planId = plan.id || `plan_${now}`;
@@ -1057,9 +1001,9 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     };
     this.planStorage.savePlan(record);
     this.planTodoManager?.ensurePlanFile(record);
-    if (this.taskManager) {
+    if (this.unifiedTaskManager) {
       const summary = plan.summary || plan.analysis || plan.featureContract || '执行计划已生成';
-      this.taskManager.updateTaskPlan(this.currentContext.taskId, {
+      await this.unifiedTaskManager.updateTaskPlan(this.currentContext.taskId, {
         planId,
         planSummary: summary,
         status: 'ready',
@@ -1104,15 +1048,15 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     this.executionStateManager.saveState(state);
   }
 
-  private updateTaskPlanStatus(status: ExecutionStateStatus): void {
-    if (!this.taskManager || !this.currentContext) return;
+  private async updateTaskPlanStatus(status: ExecutionStateStatus): Promise<void> {
+    if (!this.unifiedTaskManager || !this.currentContext) return;
     const mapping: Record<ExecutionStateStatus, 'ready' | 'executing' | 'completed' | 'failed'> = {
       planned: 'ready',
       executing: 'executing',
       completed: 'completed',
       failed: 'failed',
     };
-    this.taskManager.updateTaskPlanStatus(this.currentContext.taskId, mapping[status]);
+    await this.unifiedTaskManager.updateTaskPlanStatus(this.currentContext.taskId, mapping[status]);
   }
 
   private shouldReviewPlan(): boolean {
@@ -1132,13 +1076,11 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
       '3. 依赖关系是否合理',
       '4. 是否存在高风险或歧义点',
       '',
-      '## 输出要求（只输出 JSON）',
-      '```json',
+      '## 输出要求（只输出严格 JSON）',
       '{',
       '  "status": "approved | rejected",',
       '  "summary": "评审结论（必要时指出需修订的点）"',
       '}',
-      '```',
     ].join('\n');
   }
 
@@ -1193,13 +1135,17 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     const formattedPlan = formatPlanForUser(plan);
     const sessionId = this.currentContext?.sessionId || this.currentContext?.taskId || taskId;
     const existingRecord = plan.id ? this.planStorage?.getPlan(plan.id, sessionId) : null;
-    const review = existingRecord?.review ?? await this.reviewPlan(plan, formattedPlan);
-    const record = this.persistPlan(plan, formattedPlan, review);
+    const review = existingRecord?.review ?? (
+      (plan.needsWorker === false || plan.needsUserInput || plan.isSimpleTask || (plan.subTasks?.length ?? 0) <= 1)
+        ? { status: 'skipped', summary: '无需评审（问答/澄清/简单任务）', reviewer: 'system', reviewedAt: Date.now() }
+        : await this.reviewPlan(plan, formattedPlan)
+    );
+    const record = await this.persistPlan(plan, formattedPlan, review);
     if (!record) {
-      console.warn('[OrchestratorAgent] 计划持久化失败，继续执行');
+      logger.warn('[OrchestratorAgent] 计划持久化失败，继续执行', undefined, LogCategory.ORCHESTRATOR);
     }
     if (review.status === 'rejected') {
-      this.updateTaskPlanStatus('failed');
+      await this.updateTaskPlanStatus('failed');
       this.emitUIMessage('error', `计划评审未通过: ${review.summary}`);
       throw new Error('计划评审未通过，请修订后重试。');
     }
@@ -1207,7 +1153,7 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
    
     // 问答类请求：不需要 Worker，编排者直接回答
     if (plan.needsWorker === false) {
-      console.log('[OrchestratorAgent] 不需要 Worker，编排者直接回答');
+      logger.info('[OrchestratorAgent] 不需要 Worker，编排者直接回答', undefined, LogCategory.ORCHESTRATOR);
 
       let response = plan.directResponse || '';
 
@@ -1238,7 +1184,7 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
       this.setState('completed');
       this.currentContext!.endTime = Date.now();
       this.updateExecutionState('completed', plan.id);
-      this.updateTaskPlanStatus('completed');
+      await this.updateTaskPlanStatus('completed');
       return response;
     }
 
@@ -1268,13 +1214,13 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     if (!confirmed) {
       this.setState('idle');
       this.updateExecutionState('planned', plan.id);
-      this.updateTaskPlanStatus('planned');
+      await this.updateTaskPlanStatus('planned');
       return '任务已取消。';
     }
     this.checkAborted();
 
     this.updateExecutionState('executing', plan.id);
-    this.updateTaskPlanStatus('executing');
+    await this.updateTaskPlanStatus('executing');
 
     // Phase 3: 分发任务给 Worker
     this.setState('dispatching');
@@ -1314,7 +1260,7 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     this.setState('completed');
     this.currentContext!.endTime = Date.now();
     this.updateExecutionState('completed', plan.id);
-    this.updateTaskPlanStatus('completed');
+    await this.updateTaskPlanStatus('completed');
 
     return summary;
   }
@@ -1332,7 +1278,7 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     if (this.contextManager.needsCompression() && this.contextCompressor) {
       const memory = this.contextManager.getMemoryDocument();
       if (memory) {
-        console.log('[OrchestratorAgent] Memory 需要压缩，开始压缩...');
+        logger.info('[OrchestratorAgent] Memory 需要压缩，开始压缩...', undefined, LogCategory.ORCHESTRATOR);
         await this.contextCompressor.compress(memory);
       }
     }
@@ -1349,18 +1295,19 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
       await this.contextManager.initialize(sessionId, `session-${sessionId}`);
       this.contextManager.clearImmediateContext();
       this.contextSessionId = sessionId;
-      if (this.workspaceRoot) {
-        this.taskStateManager = new TaskStateManager(sessionId, this.workspaceRoot, true);
-        await this.taskStateManager.load();
-        this.taskStateManager.onStateChange((taskState) => {
-          this.applyTaskStateToTaskManager(taskState);
-        });
-        this.replayTaskStatesToTaskManager();
+
+      // 初始化 UnifiedTaskManager（替代 TaskStateManager）
+      if (this.workspaceRoot && this.sessionManager) {
+        const taskRepository = new SessionManagerTaskRepository(this.sessionManager, sessionId);
+        this.unifiedTaskManager = new UnifiedTaskManager(sessionId, taskRepository);
+        await this.unifiedTaskManager.initialize();
+
+        // 初始化 RecoveryHandler（使用 UnifiedTaskManager）
         if (this.snapshotManager && this.strategyConfig.enableRecovery) {
           this.recoveryHandler = new RecoveryHandler(
             this.cliFactory,
             this.snapshotManager,
-            this.taskStateManager
+            this.unifiedTaskManager
           );
         }
       }
@@ -1399,7 +1346,7 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
 
   /** 取消当前任务 */
   async cancel(): Promise<void> {
-    console.log('[OrchestratorAgent] 取消任务');
+    logger.info('[OrchestratorAgent] 取消任务', undefined, LogCategory.ORCHESTRATOR);
 
     // 1. 触发 AbortController
     this.abortController?.abort();
@@ -1414,16 +1361,25 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     // 4. 设置状态为 idle
     this.setState('idle');
 
-    if (this.taskStateManager) {
-      for (const task of this.taskStateManager.getAllTasks()) {
-        if (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled') {
-          continue;
+    // 使用 UnifiedTaskManager 取消所有任务
+    if (this.unifiedTaskManager) {
+      const tasks = await this.unifiedTaskManager.getAllTasks();
+      for (const task of tasks) {
+        for (const subTask of task.subTasks) {
+          if (subTask.status === 'completed' || subTask.status === 'failed' || subTask.status === 'skipped') {
+            continue;
+          }
+          try {
+            await this.unifiedTaskManager.skipSubTask(task.id, subTask.id);
+          } catch (error) {
+            logger.warn(`[OrchestratorAgent] Failed to skip subtask ${subTask.id}:`, error, LogCategory.ORCHESTRATOR);
+          }
         }
-        this.taskStateManager.updateStatus(task.id, 'cancelled');
       }
     }
 
-    console.log('[OrchestratorAgent] 任务已取消，状态已清理');
+
+    logger.info('[OrchestratorAgent] 任务已取消，状态已清理', undefined, LogCategory.ORCHESTRATOR);
   }
 
   /** 清理状态 */
@@ -1449,7 +1405,7 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     taskId: string,
     contextSessionId: string
   ): Promise<string | null> {
-    const { recommendedMode, classification, needsClarification, clarificationQuestions } = intentResult;
+    const { recommendedMode, classification, clarificationQuestions } = intentResult;
 
     // ✅ P2优化: ASK/EXPLORE模式按需初始化轻量context
     // 仅加载immediateContext,不加载完整Memory(节省时间和资源)
@@ -1462,44 +1418,52 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     switch (recommendedMode) {
       case IntentHandlerMode.ASK:
         // 问答模式：直接调用编排者 Claude 回答
-        console.log('[OrchestratorAgent] Intent Gate: ASK 模式，直接回答');
+        logger.info('[OrchestratorAgent] Intent Gate: ASK 模式，直接回答', undefined, LogCategory.ORCHESTRATOR);
         return await this.executeAskMode(userPrompt, taskId);
 
       case IntentHandlerMode.CLARIFY:
         // 澄清模式：请求用户提供更多信息
-        console.log('[OrchestratorAgent] Intent Gate: CLARIFY 模式，请求澄清');
-        if (this.clarificationCallback && clarificationQuestions && clarificationQuestions.length > 0) {
-          // 使用现有的澄清回调接口
-          const result = await this.clarificationCallback(
-            clarificationQuestions,
-            classification.reason,
-            Math.round((1 - classification.confidence) * 100), // 转换为模糊度分数
-            userPrompt
-          );
-          if (result && result.additionalInfo) {
-            // 用户提供了澄清信息，重新处理
-            const clarifiedPrompt = `${userPrompt}\n\n## 用户补充信息\n${result.additionalInfo}`;
-            this.currentContext!.userPrompt = clarifiedPrompt;
-            return null; // 继续走任务分析流程
+        logger.info('[OrchestratorAgent] Intent Gate: CLARIFY 模式，请求澄清', undefined, LogCategory.ORCHESTRATOR);
+        if (this.clarificationCallback) {
+          let questions = Array.isArray(clarificationQuestions) && clarificationQuestions.length > 0
+            ? clarificationQuestions
+            : [];
+          if (questions.length === 0) {
+            questions = await this.requestClarificationQuestionsWithAI(userPrompt, classification);
+          }
+          if (questions.length > 0) {
+            const score = Math.round((1 - Math.max(0, Math.min(1, classification.confidence))) * 100);
+            const assessment = {
+              score,
+              isAmbiguous: true,
+              questions,
+              missingDimensions: [],
+              context: classification.reason || '需要澄清后再继续',
+            };
+            const clarifiedPrompt = await this.clarifyRequirements(userPrompt, assessment);
+            if (clarifiedPrompt !== userPrompt) {
+              this.currentContext!.userPrompt = clarifiedPrompt;
+              return null; // 继续走任务分析流程
+            }
           }
         }
-        // 没有澄清回调或用户未提供澄清，降级为问答
-        return await this.executeAskMode(userPrompt, taskId);
+        // 没有澄清回调或用户未提供澄清，返回提示而非直接回答
+        return '需要补充信息后才能继续。';
 
       case IntentHandlerMode.EXPLORE:
         // 探索模式：分析代码库后回答
-        console.log('[OrchestratorAgent] Intent Gate: EXPLORE 模式，探索分析');
+        logger.info('[OrchestratorAgent] Intent Gate: EXPLORE 模式，探索分析', undefined, LogCategory.ORCHESTRATOR);
         return await this.executeExploreMode(userPrompt, taskId);
 
       case IntentHandlerMode.DIRECT:
         // 直接执行模式：简单操作，无需计划
-        console.log('[OrchestratorAgent] Intent Gate: DIRECT 模式，直接执行');
+        logger.info('[OrchestratorAgent] Intent Gate: DIRECT 模式，直接执行', undefined, LogCategory.ORCHESTRATOR);
         // 对于简单操作，仍然走任务分析但跳过确认
         return null;
 
       case IntentHandlerMode.TASK:
         // 任务模式：需要完整的任务分析和执行
-        console.log('[OrchestratorAgent] Intent Gate: TASK 模式，进入任务分析');
+        logger.info('[OrchestratorAgent] Intent Gate: TASK 模式，进入任务分析', undefined, LogCategory.ORCHESTRATOR);
         return null; // 继续走任务分析流程
 
       default:
@@ -1543,6 +1507,165 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
     this.currentContext!.endTime = Date.now();
 
     return content;
+  }
+
+  /**
+   * AI 意图决策（不走规则兜底）
+   */
+  private async decideIntentWithAI(prompt: string): Promise<IntentDecision> {
+    const decisionPrompt = `你是一个智能编排系统的意图决策器。请根据用户输入，严格输出 JSON。
+
+可选模式:
+- ask: 问答咨询/能力介绍/解释说明（不执行任务）
+- direct: 简单执行（无需计划）
+- explore: 需要探索代码库再回答
+- task: 进入任务分析与执行
+- clarify: 需要用户澄清后再继续
+
+输出格式（严格 JSON）:
+{
+  "intent": "question|trivial|exploratory|task|ambiguous|open_ended",
+  "recommendedMode": "ask|direct|explore|task|clarify",
+  "confidence": 0-1,
+  "needsClarification": true/false,
+  "clarificationQuestions": ["问题1","问题2"],
+  "reason": "一句话原因"
+}
+
+约束:
+1) 能力/可行性询问 → 推荐 ask
+2) 有明确执行意图但信息不全 → 推荐 task，needsClarification 可为 true
+3) 只有在确实无法推进时才推荐 clarify
+4) clarificationQuestions 最多 3 个；如果不需要澄清则为空数组
+
+用户输入:
+${prompt}
+只输出 JSON，不要其他内容，不要代码块。`;
+
+    try {
+      const response = await this.cliFactory.sendMessage(
+        'claude',
+        decisionPrompt,
+        undefined,
+        { source: 'orchestrator', streamToUI: false }
+      );
+
+      if (response.error) {
+        throw response.error;
+      }
+
+      const parsed = this.parseIntentDecisionJson(response.content || '');
+      if (!parsed) {
+        throw new Error('意图决策 JSON 解析失败');
+      }
+
+      return this.normalizeIntentDecision(parsed);
+    } catch (error) {
+      logger.error('[OrchestratorAgent] AI 意图决策失败:', error, LogCategory.ORCHESTRATOR);
+      throw error;
+    }
+  }
+
+  private async requestClarificationQuestionsWithAI(
+    prompt: string,
+    decision: IntentDecision
+  ): Promise<string[]> {
+    const questionPrompt = `你是需求澄清助手。请基于用户输入给出 1-3 个澄清问题。
+只输出 JSON:
+{ "questions": ["问题1","问题2"] }
+用户输入:
+${prompt}`;
+
+    try {
+      const response = await this.cliFactory.sendMessage(
+        'claude',
+        questionPrompt,
+        undefined,
+        { source: 'orchestrator', streamToUI: false }
+      );
+      if (response.error) {
+        throw response.error;
+      }
+      const parsed = this.parseQuestionsJson(response.content || '');
+      const questions = Array.isArray(parsed?.questions) ? parsed.questions : [];
+      return questions
+        .filter((q: unknown) => typeof q === 'string' && q.trim())
+        .slice(0, 3);
+    } catch (error) {
+      logger.warn('[OrchestratorAgent] 澄清问题生成失败，返回空问题', undefined, LogCategory.ORCHESTRATOR);
+      return [];
+    }
+  }
+
+  private normalizeIntentDecision(raw: Partial<IntentDecision>): IntentDecision {
+    const intent = typeof raw.intent === 'string' ? raw.intent : 'ambiguous';
+    const recommendedMode = typeof raw.recommendedMode === 'string' ? raw.recommendedMode : 'clarify';
+    const confidence = typeof raw.confidence === 'number' ? raw.confidence : 0.5;
+    const needsClarification = typeof raw.needsClarification === 'boolean' ? raw.needsClarification : false;
+    const questions = Array.isArray(raw.clarificationQuestions) ? raw.clarificationQuestions : [];
+    const reason = typeof raw.reason === 'string' ? raw.reason : '';
+    return {
+      intent: intent as IntentDecision['intent'],
+      recommendedMode: recommendedMode as IntentDecision['recommendedMode'],
+      confidence: Math.max(0, Math.min(1, confidence)),
+      needsClarification,
+      clarificationQuestions: questions.slice(0, 3),
+      reason,
+    };
+  }
+
+  private parseIntentDecisionJson(content: string): Partial<IntentDecision> | null {
+    const candidates = this.extractPlanJsonCandidates(content);
+    for (const raw of candidates) {
+      const trimmed = raw.trim();
+      if (!trimmed) continue;
+      try {
+        return JSON.parse(trimmed);
+      } catch {
+        const cleaned = trimmed.replace(/,\s*([}\]])/g, '$1');
+        try {
+          return JSON.parse(cleaned);
+        } catch {
+          continue;
+        }
+      }
+    }
+    const match = content.match(/\{[\s\S]*\}/);
+    if (match) {
+      try {
+        return JSON.parse(match[0]);
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  private parseQuestionsJson(content: string): { questions?: string[] } | null {
+    const candidates = this.extractPlanJsonCandidates(content);
+    for (const raw of candidates) {
+      const trimmed = raw.trim();
+      if (!trimmed) continue;
+      try {
+        return JSON.parse(trimmed);
+      } catch {
+        const cleaned = trimmed.replace(/,\s*([}\]])/g, '$1');
+        try {
+          return JSON.parse(cleaned);
+        } catch {
+          continue;
+        }
+      }
+    }
+    const match = content.match(/\{[\s\S]*\}/);
+    if (match) {
+      try {
+        return JSON.parse(match[0]);
+      } catch {
+        return null;
+      }
+    }
+    return null;
   }
 
   /**
@@ -1606,10 +1729,31 @@ ${userPrompt}
    * 分析任务，生成执行计划
    */
   private async analyzeTask(userPrompt: string): Promise<ExecutionPlan | null> {
-    console.log('[OrchestratorAgent] Phase 1: 任务分析...');
+    logger.info('[OrchestratorAgent] Phase 1: 任务分析...', undefined, LogCategory.ORCHESTRATOR);
 
     const ruleAnalysis = this.taskAnalyzer.analyze(userPrompt);
     this.syncCliAvailability();
+
+    if (this.detectEmptyClarification(userPrompt)) {
+      return {
+        id: `plan_${Date.now()}`,
+        analysis: `澄清信息不足：${ruleAnalysis.category}`,
+        isSimpleTask: true,
+        needsWorker: false,
+        directResponse: '目前关键信息不足，无法制定执行计划。请提供具体的目标模块/范围或性能指标后再继续。',
+        needsUserInput: false,
+        questions: [],
+        skipReason: '用户未提供有效补充信息',
+        needsCollaboration: false,
+        subTasks: [],
+        executionMode: 'sequential',
+        summary: '信息不足，暂停执行',
+        featureContract: userPrompt,
+        acceptanceCriteria: [],
+        createdAt: Date.now(),
+        riskLevel: ruleAnalysis.riskLevel,
+      };
+    }
 
     if (this.shouldUseRuleBasedPlan(ruleAnalysis)) {
       const plan = await this.buildPlanFromAnalysis(userPrompt, ruleAnalysis, false);
@@ -1649,13 +1793,13 @@ ${userPrompt}
       this.recordOrchestratorTokens(response.tokenUsage);
 
       if (response.error) {
-        console.error('[OrchestratorAgent] 分析失败:', response.error);
+        logger.error('[OrchestratorAgent] 分析失败:', response.error, LogCategory.ORCHESTRATOR);
         return null;
       }
 
       const rawContent = response.content || '';
       const preview = rawContent.replace(/\s+/g, ' ').trim().slice(0, 200);
-      console.log('[OrchestratorAgent] 计划解析输入预览:', {
+      logger.info('[OrchestratorAgent] 计划解析输入预览:', {
         length: rawContent.length,
         preview,
       });
@@ -1677,12 +1821,7 @@ ${userPrompt}
       }
       // Fallback to rule-based plan if parsing failed
       if (!plan) {
-        const fallbackClarify = this.buildFallbackClarificationPlan(userPrompt, ruleAnalysis);
-        if (fallbackClarify) {
-          plan = fallbackClarify;
-        } else {
-          plan = await this.buildPlanFromAnalysis(userPrompt, ruleAnalysis, true);
-        }
+        plan = await this.buildPlanFromAnalysis(userPrompt, ruleAnalysis, true);
       }
       if (plan) {
         this.ensureArchitectureTask(plan, userPrompt);
@@ -1700,7 +1839,7 @@ ${userPrompt}
 
       return plan;
     } catch (error) {
-      console.error('[OrchestratorAgent] 分析异常:', error);
+      logger.error('[OrchestratorAgent] 分析异常:', error, LogCategory.ORCHESTRATOR);
       return null;
     }
   }
@@ -1716,7 +1855,7 @@ ${userPrompt}
       return null;
     }
     const workersDesc = availableWorkers.map(w => `- ${w}`).join('\n');
-    console.log('[OrchestratorAgent] 计划解析失败，尝试修复 JSON 输出');
+    logger.info('[OrchestratorAgent] 计划解析失败，尝试修复 JSON 输出', undefined, LogCategory.ORCHESTRATOR);
     const repairPrompt = [
       '你刚才的输出不是合法 JSON。',
       '请将以下内容修复为**严格 JSON**，仅输出 JSON，不要代码块或解释文本。',
@@ -1781,17 +1920,17 @@ ${userPrompt}
       this.recordOrchestratorTokens(response.tokenUsage);
 
       if (response.error) {
-        console.error('[OrchestratorAgent] 计划修复失败:', response.error);
+        logger.error('[OrchestratorAgent] 计划修复失败:', response.error, LogCategory.ORCHESTRATOR);
         return null;
       }
 
       const repaired = this.parseExecutionPlan(response.content || '');
       if (!repaired) {
-        console.warn('[OrchestratorAgent] 计划修复仍未得到有效 JSON');
+        logger.warn('[OrchestratorAgent] 计划修复仍未得到有效 JSON', undefined, LogCategory.ORCHESTRATOR);
       }
       return repaired;
     } catch (error) {
-      console.error('[OrchestratorAgent] 计划修复异常:', error);
+      logger.error('[OrchestratorAgent] 计划修复异常:', error, LogCategory.ORCHESTRATOR);
       return null;
     }
   }
@@ -1814,60 +1953,17 @@ ${userPrompt}
     return true;
   }
 
-  private buildFallbackClarificationPlan(
-    userPrompt: string,
-    analysis: TaskAnalysis
-  ): ExecutionPlan | null {
-    const questions = this.deriveClarificationQuestions(userPrompt, analysis);
-    if (questions.length === 0) return null;
-    return {
-      id: `plan_${Date.now()}`,
-      analysis: `需要澄清：${analysis.category}`,
-      isSimpleTask: true,
-      needsWorker: false,
-      directResponse: '',
-      needsUserInput: true,
-      questions,
-      skipReason: '缺少关键信息，先澄清需求范围',
-      needsCollaboration: false,
-      subTasks: [],
-      executionMode: 'sequential',
-      summary: '等待用户补充信息',
-      featureContract: userPrompt,
-      acceptanceCriteria: [],
-      createdAt: Date.now(),
-      riskLevel: analysis.riskLevel,
-    };
-  }
-
-  private deriveClarificationQuestions(userPrompt: string, analysis: TaskAnalysis): string[] {
-    const questions: string[] = [];
-    const prompt = userPrompt.trim();
-    const lower = prompt.toLowerCase();
-
-    if (/优化|提升|性能|performance|perf/i.test(prompt)) {
-      questions.push('需要优化哪个模块/功能/流程？');
-      questions.push('希望达到的性能目标或指标是什么？');
-    }
-
-    if (/修复|bug|报错|错误|error|fix/i.test(prompt)) {
-      questions.push('请提供具体的错误信息或复现步骤');
-      questions.push('相关的文件/模块/日志在哪里？');
-    }
-
-    if (/生成.*计划|执行计划|计划/i.test(prompt) && !/为.+计划/.test(prompt)) {
-      questions.push('需要为哪一项具体任务生成执行计划？');
-    }
-
-    if (analysis.targetFiles.length === 0 && questions.length < 2) {
-      questions.push('涉及哪些具体文件或模块？');
-    }
-
-    if (questions.length === 0 && lower.length < 50) {
-      questions.push('请补充具体需求目标和范围');
-    }
-
-    return Array.from(new Set(questions)).slice(0, 4);
+  private detectEmptyClarification(prompt: string): boolean {
+    if (!prompt.includes('## 用户补充澄清')) return false;
+    const answerLines = prompt
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.startsWith('A:'));
+    if (answerLines.length === 0) return false;
+    return answerLines.every(line => {
+      const value = line.replace(/^A:\s*/i, '').trim().toLowerCase();
+      return value === '' || value === '无' || value === 'none' || value === 'n/a' || value === 'null';
+    });
   }
 
   private async buildPlanFromAnalysis(
@@ -1877,7 +1973,7 @@ ${userPrompt}
   ): Promise<ExecutionPlan> {
     // 问答类请求：不需要 Worker，编排者直接回答
     if (analysis.isQuestion) {
-      console.log('[OrchestratorAgent] 检测到问答类请求，编排者将直接回答');
+      logger.info('[OrchestratorAgent] 检测到问答类请求，编排者将直接回答', undefined, LogCategory.ORCHESTRATOR);
       return {
         id: `plan_${Date.now()}`,
         analysis: `问答类请求：${analysis.category}`,
@@ -1935,8 +2031,7 @@ ${userPrompt}
       id: task.id || String(index + 1),
       taskId: this.currentContext?.taskId || '',
       description: task.description,
-      assignedWorker: task.assignedCli,
-      assignedCli: task.assignedCli,
+      assignedWorker: task.assignedWorker,
       reason: task.cliSelection?.reason || '规则分配',
       targetFiles: task.targetFiles || [],
       dependencies: task.dependencies || [],
@@ -1945,6 +2040,9 @@ ${userPrompt}
       kind: this.mapCategoryToKind(task.category),
       featureId: `feature_${this.currentContext?.taskId || 'unknown'}`,
       status: 'pending',
+      progress: 0,
+      retryCount: 0,
+      maxRetries: 3,
       output: [],
     }));
   }
@@ -1984,21 +2082,21 @@ ${userPrompt}
     return aggregated.summary;
   }
 
-  private filterResultsForSummary(results: ExecutionResult[]): ExecutionResult[] {
+  private async filterResultsForSummary(results: ExecutionResult[]): Promise<ExecutionResult[]> {
     const unique = new Map<string, ExecutionResult>();
     for (const result of results) {
       unique.set(result.subTaskId, result);
     }
 
-    const task = this.currentContext?.taskId
-      ? this.taskManager?.getTask(this.currentContext.taskId)
+    const task = this.currentContext?.taskId && this.unifiedTaskManager
+      ? await this.unifiedTaskManager.getTask(this.currentContext.taskId)
       : null;
 
     return Array.from(unique.values()).filter(result => {
       if (result.subTaskId.startsWith('integration_')) {
         return false;
       }
-      const kind = task?.subTasks.find(sub => sub.id === result.subTaskId)?.kind;
+      const kind = task?.subTasks.find((sub: any) => sub.id === result.subTaskId)?.kind;
       return kind !== 'integration';
     });
   }
@@ -2069,6 +2167,9 @@ ${userPrompt}
         prompt: this.buildBatchPrompt(tasks),
         priority: 1,
         status: 'pending',
+        progress: 0,
+        retryCount: 0,
+        maxRetries: 3,
         output: [],
         kind: 'batch',
         featureId: tasks[0]?.featureId || `feature_${taskId}`,
@@ -2107,8 +2208,14 @@ ${userPrompt}
   private markBatchStarted(tasks: SubTask[]): void {
     const taskId = this.currentContext?.taskId || '';
     for (const task of tasks) {
-      this.taskManager?.updateSubTaskStatus(taskId, task.id, 'running');
-      this.taskStateManager?.updateStatus(task.id, 'running');
+      // 使用 UnifiedTaskManager 更新状态
+      if (this.unifiedTaskManager && taskId) {
+        const mappedTaskId = this.subTaskIdToTaskIdMap.get(task.id) || taskId;
+        this.unifiedTaskManager.startSubTask(mappedTaskId, task.id).catch(error => {
+          logger.warn(`[OrchestratorAgent] Failed to start subtask ${task.id}:`, error, LogCategory.ORCHESTRATOR);
+        });
+      }
+
     }
   }
 
@@ -2152,60 +2259,6 @@ ${userPrompt}
     this.pendingTasks.delete(batchTask.id);
   }
 
-  private mapTaskStateStatus(status: TaskState['status']): SubTaskStatus {
-    switch (status) {
-      case 'running':
-      case 'retrying':
-        return 'running';
-      case 'completed':
-        return 'completed';
-      case 'failed':
-        return 'failed';
-      case 'cancelled':
-        return 'skipped';
-      case 'pending':
-      default:
-        return 'pending';
-    }
-  }
-
-  private applyTaskStateToTaskManager(taskState: TaskState): void {
-    if (!this.taskManager) return;
-    const task = this.taskManager.getTask(taskState.parentTaskId);
-    if (!task) return;
-    const mappedStatus = this.mapTaskStateStatus(taskState.status);
-    const existing = task.subTasks.find(st => st.id === taskState.id);
-    if (!existing) {
-      const subTask: SubTask = {
-        id: taskState.id,
-        taskId: taskState.parentTaskId,
-        description: taskState.description,
-        assignedWorker: taskState.assignedCli,
-        assignedCli: taskState.assignedCli,
-        targetFiles: taskState.modifiedFiles ?? [],
-        modifiedFiles: taskState.modifiedFiles ?? [],
-        dependencies: [],
-        status: mappedStatus,
-        output: [],
-        kind: 'implementation',
-      };
-      this.taskManager.addExistingSubTask(taskState.parentTaskId, subTask);
-    } else if (taskState.modifiedFiles && taskState.modifiedFiles.length > 0) {
-      this.taskManager.updateSubTaskFiles(
-        taskState.parentTaskId,
-        taskState.id,
-        taskState.modifiedFiles
-      );
-    }
-    this.taskManager.updateSubTaskStatus(taskState.parentTaskId, taskState.id, mappedStatus);
-  }
-
-  private replayTaskStatesToTaskManager(): void {
-    if (!this.taskStateManager) return;
-    for (const taskState of this.taskStateManager.getAllTasks()) {
-      this.applyTaskStateToTaskManager(taskState);
-    }
-  }
 
   /**
    * 解析执行计划 JSON
@@ -2219,7 +2272,7 @@ ${userPrompt}
           .replace(/\s+/g, ' ')
           .trim()
           .slice(0, 200);
-        console.warn(`[OrchestratorAgent] 执行计划内容为空或未找到 JSON 候选${preview ? `: ${preview}` : ''}`);
+        logger.warn(`[OrchestratorAgent] 执行计划内容为空或未找到 JSON 候选${preview ? `: ${preview}` : ''}`, undefined, LogCategory.ORCHESTRATOR);
         return null;
       }
       const parsed = this.parsePlanJson(jsonCandidates);
@@ -2276,7 +2329,7 @@ ${userPrompt}
         : ['任务按要求完成'];
 
       if (!featureContract && acceptanceCriteria.length === 0) {
-        console.warn('[OrchestratorAgent] 执行计划缺少功能契约或验收清单，使用默认值');
+        logger.warn('[OrchestratorAgent] 执行计划缺少功能契约或验收清单，使用默认值', undefined, LogCategory.ORCHESTRATOR);
       }
 
       return {
@@ -2314,6 +2367,9 @@ ${userPrompt}
           featureId: t.featureId || `feature_${this.currentContext?.taskId || 'unknown'}`,
           background: Boolean(t.background) || t.kind === 'background',
           status: 'pending',
+          progress: 0,
+          retryCount: 0,
+          maxRetries: 3,
           output: [],
         });
         }),
@@ -2324,7 +2380,7 @@ ${userPrompt}
         createdAt: Date.now(),
       };
     } catch (error) {
-      console.error('[OrchestratorAgent] 解析执行计划失败:', error);
+      logger.error('[OrchestratorAgent] 解析执行计划失败:', error, LogCategory.ORCHESTRATOR);
       return null;
     }
   }
@@ -2343,9 +2399,33 @@ ${userPrompt}
     return matches ? Array.from(new Set(matches)) : [];
   }
 
+  private hasExplicitWorkerAssignments(prompt?: string): boolean {
+    if (!prompt || !prompt.trim()) return false;
+    const text = prompt.trim();
+    const workerNames = /(claude|codex|gemini)/i;
+    if (!workerNames.test(text)) return false;
+
+    // 排除仅列出可用 CLI 的情况
+    if (/(?:可用|available)\s*(?:cli|worker)/i.test(text)) {
+      return false;
+    }
+
+    const patterns = [
+      /(?:由|给|分配给|安排给|交给)\s*(claude|codex|gemini)/i,
+      /(claude|codex|gemini)\s*(负责|处理|执行|完成|实现|修复|开发|设计|分析|编排)/i,
+      /(?:worker|cli)\s*[:：]\s*(claude|codex|gemini)/i,  // 必须有冒号
+      /(?:负责|分配|安排).{0,8}(claude|codex|gemini)/i,
+    ];
+    return patterns.some(pattern => pattern.test(text));
+  }
+
   /** 确保全栈任务包含架构/契约任务（Claude） */
   private ensureArchitectureTask(plan: ExecutionPlan, userPrompt: string): void {
     if (!plan.subTasks || plan.subTasks.length === 0) {
+      return;
+    }
+
+    if (this.hasExplicitWorkerAssignments(userPrompt)) {
       return;
     }
 
@@ -2353,13 +2433,8 @@ ${userPrompt}
       t.assignedWorker === 'claude' && (t.kind === 'architecture' || /架构|契约|系统|设计|框架/i.test(t.description))
     );
 
-    const hasFrontend = plan.subTasks.some(t =>
-      t.assignedWorker === 'gemini' || /前端|UI|界面|页面|组件/i.test(t.description)
-    );
-
-    const hasBackend = plan.subTasks.some(t =>
-      t.assignedWorker === 'codex' || /后端|API|接口|服务|鉴权|数据库/i.test(t.description)
-    );
+    const hasFrontend = plan.subTasks.some(t => this.isFrontendTask(t));
+    const hasBackend = plan.subTasks.some(t => this.isBackendTask(t));
 
     if (hasClaudeTask || !hasFrontend || !hasBackend) {
       return;
@@ -2377,12 +2452,13 @@ ${userPrompt}
       `原始需求：${userPrompt}`
     ].join('\n');
 
+    const architectureSelection = this.cliSelector.selectByCategory('architecture');
     const architectureTask: SubTask = {
       id: architectureTaskId,
       taskId,
       description: '架构与契约设计（前后端统一框架）',
-      assignedWorker: 'claude',
-      reason: '需要统一前后端契约与框架，避免联调偏差',
+      assignedWorker: architectureSelection.cli,
+      reason: architectureSelection.reason || '需要统一前后端契约与框架，避免联调偏差',
       targetFiles: [],
       dependencies: [],
       prompt: architecturePrompt,
@@ -2390,6 +2466,9 @@ ${userPrompt}
       kind: 'architecture',
       featureId: plan.subTasks[0]?.featureId || `feature_${taskId || 'unknown'}`,
       status: 'pending',
+      progress: 0,
+      retryCount: 0,
+      maxRetries: 3,
       output: [],
     };
 
@@ -2425,11 +2504,13 @@ ${userPrompt}
       return;
     }
 
+    const preserveUserAssignments = this.hasExplicitWorkerAssignments(this.currentContext?.userPrompt);
+
     this.normalizePlanMetadata(plan);
     this.normalizeArchitectureKinds(plan);
-    this.enforceProfileAssignments(plan);
-    this.pruneClaudeImplementationForFullStack(plan);
-    this.mergeLightCrossLayerTasks(plan);
+    this.enforceProfileAssignments(plan, preserveUserAssignments);
+    this.pruneClaudeImplementationForFullStack(plan, preserveUserAssignments);
+    this.mergeLightCrossLayerTasks(plan, preserveUserAssignments);
     this.pruneMissingDependencies(plan);
     this.assignConflictDomains(plan);
 
@@ -2485,7 +2566,8 @@ ${userPrompt}
     return Array.from(criteria);
   }
 
-  private mergeLightCrossLayerTasks(plan: ExecutionPlan): void {
+  private mergeLightCrossLayerTasks(plan: ExecutionPlan, preserveAssignments: boolean): void {
+    if (preserveAssignments) return;
     const risk = this.currentContext?.risk;
     if (!risk || risk.path !== 'light') return;
     if (!plan.subTasks || plan.subTasks.length !== 2) return;
@@ -2532,6 +2614,9 @@ ${userPrompt}
       kind: first.kind || second.kind || 'implementation',
       featureId: first.featureId || second.featureId || `feature_${this.currentContext?.taskId || 'unknown'}`,
       status: 'pending',
+      progress: 0,
+      retryCount: 0,
+      maxRetries: 3,
       output: [],
     };
 
@@ -2636,14 +2721,28 @@ ${userPrompt}
   }
 
   private isFrontendTask(task: SubTask): boolean {
-    return task.assignedWorker === 'gemini' || /前端|UI|界面|页面|组件|样式/i.test(task.description);
+    if (task.assignedWorker === 'gemini') return true;
+    const text = [task.title, task.description, task.prompt].filter(Boolean).join('\n');
+    if (!text.trim()) return false;
+    const analysis = this.taskAnalyzer.analyze(text);
+    return analysis.category === 'frontend';
   }
 
   private isBackendTask(task: SubTask): boolean {
-    return task.assignedWorker === 'codex' || /后端|API|接口|服务|鉴权|数据库/i.test(task.description);
+    if (task.assignedWorker === 'codex') return true;
+    const text = [task.title, task.description, task.prompt].filter(Boolean).join('\n');
+    if (!text.trim()) return false;
+    const analysis = this.taskAnalyzer.analyze(text);
+    return analysis.category === 'backend';
   }
 
   private pickPrimaryWorker(a: SubTask, b: SubTask): WorkerType {
+    const selection = this.cliSelector.selectByDescription(
+      [a.description, a.prompt, b.description, b.prompt].filter(Boolean).join('\n')
+    );
+    if (selection?.worker) {
+      return selection.worker;
+    }
     if (this.isBackendTask(a) || this.isBackendTask(b)) {
       return 'codex';
     }
@@ -2657,41 +2756,50 @@ ${userPrompt}
     plan.subTasks.forEach(task => {
       if (task.assignedWorker !== 'claude') return;
       if (task.kind === 'architecture') return;
-      if (/^arch-/i.test(task.id) || /架构|契约|系统|设计|框架/i.test(task.description)) {
+      const text = [task.title, task.description, task.prompt].filter(Boolean).join('\n');
+      const analysis = text.trim() ? this.taskAnalyzer.analyze(text) : null;
+      if (/^arch-/i.test(task.id) || analysis?.category === 'architecture') {
         task.kind = 'architecture';
       }
     });
   }
 
-  private enforceProfileAssignments(plan: ExecutionPlan): void {
+  private enforceProfileAssignments(plan: ExecutionPlan, preserveAssignments: boolean): void {
     const available = this.cliSelector.getAvailableCLIs?.() ?? ['claude', 'codex', 'gemini'];
     for (const task of plan.subTasks) {
       if (!task) continue;
       const assigned = task.assignedWorker;
-      if (assigned && available.includes(assigned)) {
+      if (
+        preserveAssignments
+        && assigned
+        && available.includes(assigned)
+      ) {
+        continue;
+      }
+      if (task.kind === 'architecture' || /架构|契约|系统|设计|框架/i.test(task.description || '')) {
+        const selection = this.cliSelector.selectByCategory('architecture');
+        task.assignedWorker = assigned && available.includes(assigned) ? assigned : selection.cli;
+        task.reason = selection.reason || task.reason;
         continue;
       }
       const description = [task.description, task.prompt].filter(Boolean).join('\n');
       const selection = this.cliSelector.selectByDescription(description, {
         preferredWorker: assigned,
       });
-      task.assignedWorker = selection.worker;
-      if (!task.reason) {
-        task.reason = selection.reason || '根据画像与任务描述自动分配';
+      if (!assigned || !available.includes(assigned) || selection.worker !== assigned) {
+        task.assignedWorker = selection.worker;
+        task.reason = selection.reason || task.reason || '根据画像与任务描述自动分配';
       }
     }
   }
 
-  private pruneClaudeImplementationForFullStack(plan: ExecutionPlan): void {
+  private pruneClaudeImplementationForFullStack(plan: ExecutionPlan, preserveAssignments: boolean): void {
+    if (preserveAssignments) return;
     const hasArchitecture = plan.subTasks.some(t =>
       t.assignedWorker === 'claude' && t.kind === 'architecture'
     );
-    const hasFrontend = plan.subTasks.some(t =>
-      t.assignedWorker === 'gemini' || /前端|UI|界面|页面|组件/i.test(t.description)
-    );
-    const hasBackend = plan.subTasks.some(t =>
-      t.assignedWorker === 'codex' || /后端|API|接口|服务|鉴权|数据库/i.test(t.description)
-    );
+    const hasFrontend = plan.subTasks.some(t => this.isFrontendTask(t));
+    const hasBackend = plan.subTasks.some(t => this.isBackendTask(t));
 
     if (!hasArchitecture || !hasFrontend || !hasBackend) return;
 
@@ -2866,7 +2974,7 @@ ${userPrompt}
     }
 
     // 返回 null 而不是抛出错误，让调用方使用 fallback 逻辑
-    console.warn('[OrchestratorAgent] 无法解析执行计划 JSON:', errors.join(' | '));
+    logger.warn('[OrchestratorAgent] 无法解析执行计划 JSON:', errors.join(' | '), LogCategory.ORCHESTRATOR);
     return null;
   }
 
@@ -2934,7 +3042,7 @@ ${userPrompt}
     const questions = (plan.questions || []).map(q => String(q || '').trim()).filter(Boolean);
     if (questions.length === 0) return null;
     if (!this.questionCallback) {
-      console.log('[OrchestratorAgent] 未设置问题回调，无法等待用户补充');
+      logger.info('[OrchestratorAgent] 未设置问题回调，无法等待用户补充', undefined, LogCategory.ORCHESTRATOR);
       return null;
     }
 
@@ -2944,7 +3052,7 @@ ${userPrompt}
       const normalized = typeof answer === 'string' ? answer.trim() : '';
       return normalized || null;
     } catch (error) {
-      console.error('[OrchestratorAgent] 等待用户补充异常:', error);
+      logger.error('[OrchestratorAgent] 等待用户补充异常:', error, LogCategory.ORCHESTRATOR);
       return null;
     }
   }
@@ -2958,7 +3066,7 @@ ${userPrompt}
    */
   private async waitForConfirmation(plan: ExecutionPlan): Promise<boolean> {
     if (!this.confirmationCallback) {
-      console.log('[OrchestratorAgent] 未设置确认回调，自动确认');
+      logger.info('[OrchestratorAgent] 未设置确认回调，自动确认', undefined, LogCategory.ORCHESTRATOR);
       return true;
     }
 
@@ -2971,10 +3079,10 @@ ${userPrompt}
 
     try {
       const confirmed = await this.confirmationCallback(plan, formattedPlan);
-      console.log(`[OrchestratorAgent] 用户确认结果: ${confirmed ? 'Y' : 'N'}`);
+      logger.info(`[OrchestratorAgent] 用户确认结果: ${confirmed ? 'Y' : 'N'}`, undefined, LogCategory.ORCHESTRATOR);
       return confirmed;
     } catch (error) {
-      console.error('[OrchestratorAgent] 等待确认异常:', error);
+      logger.error('[OrchestratorAgent] 等待确认异常:', error, LogCategory.ORCHESTRATOR);
       return false;
     }
   }
@@ -3061,9 +3169,9 @@ ${userPrompt}
 
   /** 分发任务给 Worker */
   private async dispatchTasks(plan: ExecutionPlan): Promise<void> {
-    console.log('[OrchestratorAgent] Phase 3: 分发任务...');
+    logger.info('[OrchestratorAgent] Phase 3: 分发任务...', undefined, LogCategory.ORCHESTRATOR);
 
-    this.syncPlanToTaskManager(plan);
+    await this.syncPlanToTaskManager(plan);
 
     // 在执行前创建文件快照（支持回滚）
     await this.createSnapshotsForPlan(plan);
@@ -3079,7 +3187,7 @@ ${userPrompt}
       ? this.policyEngine.detectConflicts(foregroundSubTasks)
       : { hasConflict: false, conflictingFiles: [], conflictingTasks: [] };
     if (conflictResult.hasConflict) {
-      console.log('[OrchestratorAgent] 检测到文件冲突:', conflictResult.conflictingFiles);
+      logger.info('[OrchestratorAgent] 检测到文件冲突:', conflictResult.conflictingFiles, LogCategory.ORCHESTRATOR);
       this.emitUIMessage('progress_update',
         `检测到 ${conflictResult.conflictingFiles.length} 个文件存在冲突，将串行执行相关任务`
       );
@@ -3112,7 +3220,7 @@ ${userPrompt}
 
     if (hasDependencies) {
       // 使用依赖图调度执行
-      console.log('[OrchestratorAgent] 检测到任务依赖，使用依赖图调度');
+      logger.info('[OrchestratorAgent] 检测到任务依赖，使用依赖图调度', undefined, LogCategory.ORCHESTRATOR);
       if (!this.warnedReviewSkipForDependencies && this.shouldEnableReviews()) {
         this.emitUIMessage(
           'progress_update',
@@ -3123,7 +3231,7 @@ ${userPrompt}
       await this.dispatchWithDependencyGraph(plan, foregroundSubTasks);
     } else if (conflictResult.hasConflict) {
       // 有冲突时使用智能调度策略
-      console.log('[OrchestratorAgent] 检测到文件冲突，使用智能调度策略');
+      logger.info('[OrchestratorAgent] 检测到文件冲突，使用智能调度策略', undefined, LogCategory.ORCHESTRATOR);
       await this.dispatchWithConflictAwareness(dispatchSubTasks, plan, conflictResult);
     } else if (plan.executionMode === 'parallel') {
       await this.dispatchParallel(dispatchSubTasks, plan);
@@ -3152,7 +3260,7 @@ ${userPrompt}
       const parallelTasks = subTasks.filter(t => parallelTaskIds.has(t.id));
 
       if (parallelTasks.length > 0) {
-        console.log(`[OrchestratorAgent] 并行执行 ${parallelTasks.length} 个无冲突任务`);
+        logger.info(`[OrchestratorAgent] 并行执行 ${parallelTasks.length} 个无冲突任务`, undefined, LogCategory.ORCHESTRATOR);
         this.emitUIMessage('progress_update',
           `并行执行 ${parallelTasks.length} 个无冲突任务`
         );
@@ -3166,7 +3274,7 @@ ${userPrompt}
       const serialTasks = subTasks.filter(t => serialTaskIds.has(t.id));
 
       if (serialTasks.length > 0) {
-        console.log(`[OrchestratorAgent] 串行执行 ${serialTasks.length} 个冲突任务`);
+        logger.info(`[OrchestratorAgent] 串行执行 ${serialTasks.length} 个冲突任务`, undefined, LogCategory.ORCHESTRATOR);
         this.emitUIMessage('progress_update',
           `串行执行 ${serialTasks.length} 个存在文件冲突的任务`
         );
@@ -3199,10 +3307,10 @@ ${userPrompt}
 
       const successCount = results.filter(r => r.success).length;
       const failCount = results.filter(r => !r.success).length;
-      console.log(`[OrchestratorAgent] 依赖图执行完成: ${successCount} 成功, ${failCount} 失败`);
+      logger.info(`[OrchestratorAgent] 依赖图执行完成: ${successCount} 成功, ${failCount} 失败`, LogCategory.ORCHESTRATOR);
 
     } catch (error) {
-      console.error('[OrchestratorAgent] 依赖图执行失败:', error);
+      logger.error('[OrchestratorAgent] 依赖图执行失败:', error, LogCategory.ORCHESTRATOR);
       this.emitUIMessage('error', `任务执行失败: ${error instanceof Error ? error.message : String(error)}`);
       throw error;
     }
@@ -3216,7 +3324,7 @@ ${userPrompt}
   /** 为子任务集合创建快照 */
   private async createSnapshotsForSubTasks(subTasks: SubTask[]): Promise<void> {
     if (!this.snapshotManager) {
-      console.log('[OrchestratorAgent] 未配置 SnapshotManager，跳过快照创建');
+      logger.info('[OrchestratorAgent] 未配置 SnapshotManager，跳过快照创建', undefined, LogCategory.ORCHESTRATOR);
       return;
     }
 
@@ -3242,7 +3350,7 @@ ${userPrompt}
           if (!fileToInfo.has(normalized)) {
             fileToInfo.set(normalized, { worker, subTaskId: subTask.id });
           } else if (fileToInfo.get(normalized)?.subTaskId !== subTask.id) {
-            console.warn(`[OrchestratorAgent] 多个子任务引用同一文件快照: ${normalized}`);
+            logger.warn(`[OrchestratorAgent] 多个子任务引用同一文件快照: ${normalized}`, undefined, LogCategory.ORCHESTRATOR);
           }
         });
       }
@@ -3256,7 +3364,7 @@ ${userPrompt}
         const currentId = sorted[i];
         const dependsOn = sorted[i - 1];
         if (this.wouldCreateDependencyCycle(currentId, dependsOn, subTaskMap)) {
-          console.warn(`[OrchestratorAgent] 跳过可能导致循环依赖的文件串行化: ${currentId} -> ${dependsOn} (${filePath})`);
+          logger.warn(`[OrchestratorAgent] 跳过可能导致循环依赖的文件串行化: ${currentId} -> ${dependsOn} (${filePath}, undefined, LogCategory.ORCHESTRATOR)`);
           continue;
         }
         const task = subTaskMap.get(currentId);
@@ -3264,28 +3372,31 @@ ${userPrompt}
         task.dependencies = task.dependencies ?? [];
         if (!task.dependencies.includes(dependsOn)) {
           task.dependencies.push(dependsOn);
-          console.log(`[OrchestratorAgent] 文件冲突串行化: ${currentId} 依赖 ${dependsOn} (${filePath})`);
+          logger.info(`[OrchestratorAgent] 文件冲突串行化: ${currentId} 依赖 ${dependsOn} (${filePath}, undefined, LogCategory.ORCHESTRATOR)`);
         }
       }
     }
 
     if (fileToInfo.size === 0) {
-      console.log('[OrchestratorAgent] 没有目标文件，跳过快照创建');
+      logger.info('[OrchestratorAgent] 没有目标文件，跳过快照创建', undefined, LogCategory.ORCHESTRATOR);
       return;
     }
 
-    console.log(`[OrchestratorAgent] 为 ${fileToInfo.size} 个文件创建快照...`);
+    logger.info(`[OrchestratorAgent] 为 ${fileToInfo.size} 个文件创建快照...`, undefined, LogCategory.ORCHESTRATOR);
     this.emitUIMessage('progress_update', `正在为 ${fileToInfo.size} 个文件创建快照...`);
 
     for (const [filePath, info] of fileToInfo) {
       try {
+        const subTask = subTaskMap.get(info.subTaskId);
+        const priority = subTask?.priority ?? 5; // 默认优先级 5
         this.snapshotManager.createSnapshot(
           filePath,
           info.worker, // 使用实际分配的 Worker
-          info.subTaskId
+          info.subTaskId,
+          priority
         );
       } catch (error) {
-        console.warn(`[OrchestratorAgent] 创建快照失败: ${filePath}`, error);
+        logger.warn(`[OrchestratorAgent] 创建快照失败: ${filePath}`, error, LogCategory.ORCHESTRATOR);
       }
     }
   }
@@ -3552,22 +3663,22 @@ ${userPrompt}
         prompt: this.buildIntegrationPrompt(plan),
         priority: 1,
         status: 'pending',
+        progress: 0,
+        retryCount: 0,
+        maxRetries: 3,
         output: [],
         kind: 'integration',
         featureId,
       };
 
       this.pendingTasks.set(integrationSubTask.id, integrationSubTask);
-      this.taskManager?.addExistingSubTask(taskId, integrationSubTask);
-      if (this.taskStateManager && !this.taskStateManager.getTask(integrationSubTask.id)) {
-        this.taskStateManager.createTask({
-          id: integrationSubTask.id,
-          parentTaskId: taskId,
-          description: integrationSubTask.description,
-          assignedCli: integrationSubTask.assignedWorker,
-          maxAttempts: this.config.maxRetries,
-        });
+      if (this.unifiedTaskManager) {
+        await this.unifiedTaskManager.addExistingSubTask(taskId, integrationSubTask);
       }
+
+      // 记录 subTaskId -> taskId 映射
+      this.subTaskIdToTaskIdMap.set(integrationSubTask.id, taskId);
+
       globalEventBus.emitEvent('task:created', { taskId });
 
       const integrationContext = this.buildIntegrationContext(plan, this.completedResults, round);
@@ -3615,6 +3726,9 @@ ${userPrompt}
           prompt: issue.fixPrompt || this.buildRepairPrompt(plan, issue),
           priority: 2,
           status: 'pending',
+          progress: 0,
+          retryCount: 0,
+          maxRetries: 3,
           output: [],
           kind: 'repair',
           featureId,
@@ -3633,16 +3747,13 @@ ${userPrompt}
       await this.createSnapshotsForSubTasks(repairTasks);
       for (const repairTask of repairTasks) {
         this.pendingTasks.set(repairTask.id, repairTask);
-        this.taskManager?.addExistingSubTask(taskId, repairTask);
-        if (this.taskStateManager && !this.taskStateManager.getTask(repairTask.id)) {
-          this.taskStateManager.createTask({
-            id: repairTask.id,
-            parentTaskId: taskId,
-            description: repairTask.description,
-            assignedCli: repairTask.assignedWorker,
-            maxAttempts: this.config.maxRetries,
-          });
+        if (this.unifiedTaskManager) {
+          await this.unifiedTaskManager.addExistingSubTask(taskId, repairTask);
         }
+
+        // 记录 subTaskId -> taskId 映射
+        this.subTaskIdToTaskIdMap.set(repairTask.id, taskId);
+
       }
       globalEventBus.emitEvent('task:created', { taskId });
 
@@ -3659,29 +3770,24 @@ ${userPrompt}
     throw new Error('联调多轮未通过');
   }
 
-  /** 将执行计划同步到 TaskManager */
-  private syncPlanToTaskManager(plan: ExecutionPlan): void {
-    if (!this.taskManager || !this.currentContext) return;
+  /** 将执行计划保存到 UnifiedTaskManager */
+  private async syncPlanToTaskManager(plan: ExecutionPlan): Promise<void> {
+    if (!this.unifiedTaskManager || !this.currentContext) return;
 
-    this.taskManager.updateTask(this.currentContext.taskId, {
+    await this.unifiedTaskManager.updateTask(this.currentContext.taskId, {
       featureContract: plan.featureContract,
       acceptanceCriteria: plan.acceptanceCriteria,
     });
 
     for (const subTask of plan.subTasks) {
       try {
-        this.taskManager.addExistingSubTask(this.currentContext.taskId, subTask);
-        if (this.taskStateManager && !this.taskStateManager.getTask(subTask.id)) {
-          this.taskStateManager.createTask({
-            id: subTask.id,
-            parentTaskId: this.currentContext.taskId,
-            description: subTask.description,
-            assignedCli: subTask.assignedWorker,
-            maxAttempts: this.config.maxRetries,
-          });
-        }
+        await this.unifiedTaskManager.addExistingSubTask(this.currentContext.taskId, subTask);
+
+        // 记录 subTaskId -> taskId 映射
+        this.subTaskIdToTaskIdMap.set(subTask.id, this.currentContext.taskId);
+
       } catch (error) {
-        console.warn('[OrchestratorAgent] 同步子任务失败:', error);
+        logger.warn('[OrchestratorAgent] 同步子任务失败:', error, LogCategory.ORCHESTRATOR);
       }
     }
 
@@ -3710,7 +3816,7 @@ ${userPrompt}
       ).then(result => {
         void this.finalizeResult(result);
       }).catch(error => {
-        console.error(`[OrchestratorAgent] 并行任务分发失败:`, error);
+        logger.error(`[OrchestratorAgent] 并行任务分发失败:`, error, LogCategory.ORCHESTRATOR);
         const failedResult: ExecutionResult = {
           workerId: 'unknown',
           workerType: subTask.assignedWorker,
@@ -4153,7 +4259,7 @@ ${userPrompt}
   private async monitorExecution(plan: ExecutionPlan): Promise<void> {
     if (plan.executionMode !== 'parallel') return;
 
-    console.log('[OrchestratorAgent] Phase 4: 监控执行...');
+    logger.info('[OrchestratorAgent] Phase 4: 监控执行...', undefined, LogCategory.ORCHESTRATOR);
 
     await new Promise<void>((resolve, reject) => {
       const interval = setInterval(() => {
@@ -4184,7 +4290,7 @@ ${userPrompt}
 
   /** 执行验证 */
   private async runVerification(taskId: string): Promise<VerificationResult> {
-    console.log('[OrchestratorAgent] Phase 5: 验证阶段...');
+    logger.info('[OrchestratorAgent] Phase 5: 验证阶段...', undefined, LogCategory.ORCHESTRATOR);
 
     if (!this.strategyConfig.enableVerification) {
       return { success: true, summary: '跳过验证（策略关闭）' };
@@ -4205,7 +4311,7 @@ ${userPrompt}
 
     if (riskAssessment && this.policyEngine) {
       verificationDecision = this.policyEngine.decideVerification(riskAssessment, modifiedFiles);
-      console.log(`[OrchestratorAgent] 验证决策: ${verificationDecision.reason}`);
+      logger.info(`[OrchestratorAgent] 验证决策: ${verificationDecision.reason}`, undefined, LogCategory.ORCHESTRATOR);
     } else {
       // 回退到基础验证
       verificationDecision = {
@@ -4269,7 +4375,7 @@ ${userPrompt}
     results: ExecutionResult[],
     verificationResult?: VerificationResult | null
   ): Promise<string> {
-    console.log('[OrchestratorAgent] Phase 6: 汇总结果...');
+    logger.info('[OrchestratorAgent] Phase 6: 汇总结果...', undefined, LogCategory.ORCHESTRATOR);
 
     if (results.length === 0) {
       const emptySummary = '没有执行任何任务。';
@@ -4277,7 +4383,7 @@ ${userPrompt}
       return emptySummary;
     }
 
-    const summaryResults = this.filterResultsForSummary(results);
+    const summaryResults = await this.filterResultsForSummary(results);
 
     // 构建包含验证结果的汇总 prompt
     let summaryPrompt = buildOrchestratorSummaryPrompt(userPrompt, summaryResults);
@@ -4422,47 +4528,52 @@ ${userPrompt}
       void this.contextManager.saveMemory();
     }
 
-    if (this.taskManager) {
-      this.taskManager.updateSubTaskStatus(
-        result.taskId,
-        result.subTaskId,
-        result.success ? 'completed' : 'failed'
-      );
-      if (result.modifiedFiles && result.modifiedFiles.length > 0) {
-        this.taskManager.updateSubTaskFiles(result.taskId, result.subTaskId, result.modifiedFiles);
-      }
-      globalEventBus.emitEvent(result.success ? 'subtask:completed' : 'subtask:failed', {
-        taskId: result.taskId,
-        subTaskId: result.subTaskId,
-        data: result.success
-          ? {
+    // 发送全局事件（保留用于其他监听器）
+    globalEventBus.emitEvent(result.success ? 'subtask:completed' : 'subtask:failed', {
+      taskId: result.taskId,
+      subTaskId: result.subTaskId,
+      data: result.success
+        ? {
+          success: true,
+          cli: result.workerType,
+          description: subTask?.description,
+          targetFiles: subTask?.targetFiles,
+          modifiedFiles: result.modifiedFiles || [],
+          duration: result.duration,
+        }
+        : {
+          error: result.error || '未知错误',
+          cli: result.workerType,
+          description: subTask?.description,
+          targetFiles: subTask?.targetFiles,
+          modifiedFiles: result.modifiedFiles || [],
+          duration: result.duration,
+        },
+    });
+
+    // 使用 UnifiedTaskManager 更新状态
+    if (this.unifiedTaskManager) {
+      const taskId = this.subTaskIdToTaskIdMap.get(result.subTaskId);
+      if (taskId) {
+        if (result.success) {
+          this.unifiedTaskManager.completeSubTask(taskId, result.subTaskId, {
+            cliType: result.workerType,
             success: true,
-            cli: result.workerType,
-            description: subTask?.description,
-            targetFiles: subTask?.targetFiles,
-            modifiedFiles: result.modifiedFiles || [],
+            output: result.result,
+            modifiedFiles: result.modifiedFiles,
             duration: result.duration,
-          }
-          : {
-            error: result.error || '未知错误',
-            cli: result.workerType,
-            description: subTask?.description,
-            targetFiles: subTask?.targetFiles,
-            modifiedFiles: result.modifiedFiles || [],
-            duration: result.duration,
-          }, 
-      });
-    }
-    if (this.taskStateManager) {
-      this.taskStateManager.updateStatus(
-        result.subTaskId,
-        result.success ? 'completed' : 'failed',
-        result.error
-      );
-      if (result.success) {
-        this.taskStateManager.setResult(result.subTaskId, result.result, result.modifiedFiles);
+            timestamp: new Date(),
+          }).catch(error => {
+            logger.warn(`[OrchestratorAgent] Failed to complete subtask ${result.subTaskId}:`, error, LogCategory.ORCHESTRATOR);
+          });
+        } else {
+          this.unifiedTaskManager.failSubTask(taskId, result.subTaskId, result.error || 'Unknown error').catch(error => {
+            logger.warn(`[OrchestratorAgent] Failed to fail subtask ${result.subTaskId}:`, error, LogCategory.ORCHESTRATOR);
+          });
+        }
       }
     }
+
 
     this.emitUIMessage(
       'progress_update',
@@ -4523,18 +4634,6 @@ ${userPrompt}
         .filter(task => this.isBackgroundSubTask(task))
         .map(task => task.id)
     );
-    if (this.taskStateManager) {
-      const tasks = this.taskStateManager.getAllTasks().filter(task =>
-        task.parentTaskId === taskId && !backgroundIds.has(task.id)
-      );
-      if (tasks.length > 0) {
-        const completed = tasks.filter(task =>
-          task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'
-        ).length;
-        return { total: tasks.length, completed };
-      }
-    }
-
     const total = (this.currentContext?.plan?.subTasks || [])
       .filter(task => !backgroundIds.has(task.id)).length;
     const completed = this.completedResults.filter(
@@ -4548,7 +4647,7 @@ ${userPrompt}
     const { result } = message.payload;
 
     void this.finalizeResult(result).catch(error => {
-      console.warn('[OrchestratorAgent] 任务收尾失败:', error);
+      logger.warn('[OrchestratorAgent] 任务收尾失败:', error, LogCategory.ORCHESTRATOR);
     });
   }
 
@@ -4567,44 +4666,26 @@ ${userPrompt}
       `子任务尝试失败: ${error}`,
       { subTaskId, canRetry }
     );
-    console.warn(`[OrchestratorAgent] 子任务尝试失败: ${error}`);
-    if (this.taskStateManager) {
+    logger.warn(`[OrchestratorAgent] 子任务尝试失败: ${error}`, undefined, LogCategory.ORCHESTRATOR);
+
+    // 使用 UnifiedTaskManager 处理重试
+    const mappedTaskId = this.subTaskIdToTaskIdMap.get(subTaskId);
+    if (this.unifiedTaskManager && mappedTaskId) {
       if (canRetry) {
-        this.taskStateManager.resetForRetry(subTaskId);
+        this.unifiedTaskManager.resetSubTaskForRetry(mappedTaskId, subTaskId).catch(err => {
+          logger.warn(`[OrchestratorAgent] Failed to reset subtask for retry ${subTaskId}:`, err, LogCategory.ORCHESTRATOR);
+        });
       } else {
-        this.taskStateManager.updateStatus(subTaskId, 'failed', error);
+        this.unifiedTaskManager.failSubTask(mappedTaskId, subTaskId, error).catch(err => {
+          logger.warn(`[OrchestratorAgent] Failed to fail subtask ${subTaskId}:`, err, LogCategory.ORCHESTRATOR);
+        });
       }
     }
-    if (!canRetry && this.strategyConfig.enableRecovery && this.recoveryHandler && this.taskStateManager) {
-      const failedTask = this.taskStateManager.getTask(subTaskId);
-      if (failedTask) {
-        const decision = await this.resolveRecoveryDecision(failedTask, error);
-        if (decision === 'rollback') {
-          await this.performSessionRollback(failedTask);
-          this.setState('monitoring');
-          return;
-        }
-        if (decision === 'continue') {
-          this.emitUIMessage('progress_update', '已忽略失败，继续执行后续任务', { subTaskId });
-          this.setState('monitoring');
-          return;
-        }
-        this.setState('recovering');
-        this.emitUIMessage('progress_update', `进入失败恢复流程: ${failedTask.description}`, { subTaskId });
-        void this.recoveryHandler
-          .recover(taskId, failedTask, { success: false, summary: error }, error)
-          .then((result) => {
-            this.emitUIMessage('progress_update', `恢复结果: ${result.message}`, { subTaskId });
-          })
-          .finally(() => {
-            this.setState('monitoring');
-          });
-      }
-    }
+
   }
 
   private async resolveRecoveryDecision(
-    failedTask: TaskState,
+    failedTask: SubTask,
     error: string
   ): Promise<'retry' | 'rollback' | 'continue'> {
     const canRetry = this.recoveryHandler?.shouldContinueRecovery(failedTask) ?? false;
@@ -4617,11 +4698,20 @@ ${userPrompt}
     return this.recoveryConfirmationCallback(failedTask, error, { retry: canRetry, rollback: canRollback });
   }
 
-  private async performSessionRollback(failedTask: TaskState): Promise<void> {
+  private async performSessionRollback(failedTask: SubTask): Promise<void> {
     await this.workerPool.cancelAllTasks();
     this.workerPool.clearExecutionStates();
     const count = this.snapshotManager?.revertAllChanges() ?? 0;
-    this.taskStateManager?.updateStatus(failedTask.id, 'cancelled', '已回滚');
+
+    // 使用 UnifiedTaskManager 更新状态
+    const mappedTaskId = this.subTaskIdToTaskIdMap.get(failedTask.id);
+    if (this.unifiedTaskManager && mappedTaskId) {
+      this.unifiedTaskManager.skipSubTask(mappedTaskId, failedTask.id).catch(error => {
+        logger.warn(`[OrchestratorAgent] Failed to skip subtask ${failedTask.id}:`, error, LogCategory.ORCHESTRATOR);
+      });
+    }
+
+
     this.emitUIMessage('progress_update', `已回滚 ${count} 个变更`, { subTaskId: failedTask.id });
   }
 
@@ -4630,8 +4720,14 @@ ${userPrompt}
     const { taskId, subTaskId, status, progress, message: msg, output, dispatchId } = message.payload;
 
     if (status === 'started' || status === 'in_progress') {
-      this.taskManager?.updateSubTaskStatus(taskId, subTaskId, 'running');
-      this.taskStateManager?.updateStatus(subTaskId, 'running');
+      // 使用 UnifiedTaskManager 更新状态
+      const mappedTaskId = this.subTaskIdToTaskIdMap.get(subTaskId) || taskId;
+      if (this.unifiedTaskManager && mappedTaskId) {
+        this.unifiedTaskManager.startSubTask(mappedTaskId, subTaskId).catch(error => {
+          logger.warn(`[OrchestratorAgent] Failed to start subtask ${subTaskId}:`, error, LogCategory.ORCHESTRATOR);
+        });
+      }
+
 
       if (status === 'started') {
         const subTask = this.pendingTasks.get(subTaskId)
@@ -4650,14 +4746,28 @@ ${userPrompt}
       }
     }
     if (status === 'failed') {
-      this.taskStateManager?.updateStatus(subTaskId, 'failed', msg);
+      // 使用 UnifiedTaskManager 更新状态
+      const mappedTaskId = this.subTaskIdToTaskIdMap.get(subTaskId) || taskId;
+      if (this.unifiedTaskManager && mappedTaskId) {
+        this.unifiedTaskManager.failSubTask(mappedTaskId, subTaskId, msg || 'Unknown error').catch(error => {
+          logger.warn(`[OrchestratorAgent] Failed to fail subtask ${subTaskId}:`, error, LogCategory.ORCHESTRATOR);
+        });
+      }
+
     }
 
     if (msg) {
       this.emitUIMessage('progress_update', msg, { subTaskId, progress, dispatchId });
     }
     if (progress !== undefined) {
-      this.taskStateManager?.updateProgress(subTaskId, progress);
+      // 使用 UnifiedTaskManager 更新进度
+      const mappedTaskId = this.subTaskIdToTaskIdMap.get(subTaskId) || taskId;
+      if (this.unifiedTaskManager && mappedTaskId) {
+        this.unifiedTaskManager.updateSubTaskProgress(mappedTaskId, subTaskId, progress).catch(error => {
+          logger.warn(`[OrchestratorAgent] Failed to update subtask progress ${subTaskId}:`, error, LogCategory.ORCHESTRATOR);
+        });
+      }
+
     }
   }
 
@@ -4697,6 +4807,6 @@ ${userPrompt}
     this.workerPool.dispose();
     this.cleanup();
     this.removeAllListeners();
-    console.log('[OrchestratorAgent] 已销毁');
+    logger.info('[OrchestratorAgent] 已销毁', undefined, LogCategory.ORCHESTRATOR);
   }
 }

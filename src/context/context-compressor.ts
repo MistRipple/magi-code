@@ -8,6 +8,7 @@
  * 3. 简单压缩（降级方案）- 基于重要性评分
  */
 
+import { logger, LogCategory } from '../logging';
 import { MemoryDocument } from './memory-document';
 import { CompressionConfig, MemoryContent, DEFAULT_TRUNCATION_CONFIG } from './types';
 import { TruncationUtils, TruncationResult } from './truncation-utils';
@@ -121,7 +122,7 @@ export class ContextCompressor {
     if (truncatedContent !== content) {
       memory.replaceContent(truncatedContent);
       truncationApplied = true;
-      console.log('[ContextCompressor] 已应用预防性截断');
+      logger.info('[ContextCompressor] 已应用预防性截断');
 
       // 检查截断后是否还需要进一步压缩
       if (!memory.needsCompression(this.config.tokenLimit, this.config.lineLimit)) {
@@ -132,27 +133,27 @@ export class ContextCompressor {
 
     // 第二步：LLM 智能压缩（保留语义）
     if (this.adapter) {
-      console.log('[ContextCompressor] 使用 LLM 智能压缩...');
+      logger.info('[ContextCompressor] 使用 LLM 智能压缩...');
       const success = await this.llmCompress(memory);
       if (success) {
         this.updateStats(originalTokens, memory.estimateTokens(), 'llm', truncationApplied);
         return true;
       }
-      console.log('[ContextCompressor] LLM 压缩失败，降级到简单压缩');
+      logger.info('[ContextCompressor] LLM 压缩失败，降级到简单压缩');
     }
 
     // 第三步：简单压缩（降级方案）
-    console.log('[ContextCompressor] 使用简单压缩（降级方案）');
+    logger.info('[ContextCompressor] 使用简单压缩（降级方案）');
     if (this.trySimpleCompression(memory)) {
       this.updateStats(originalTokens, memory.estimateTokens(), 'simple', truncationApplied);
-      console.log('[ContextCompressor] 简单压缩成功');
+      logger.info('[ContextCompressor] 简单压缩成功');
       return true;
     }
 
     // 第四步：激进压缩（最后手段）
     this.aggressiveSimpleCompression(memory);
     this.updateStats(originalTokens, memory.estimateTokens(), 'aggressive', truncationApplied);
-    console.log('[ContextCompressor] 激进简单压缩完成（可能丢失部分信息）');
+    logger.info('[ContextCompressor] 激进简单压缩完成（可能丢失部分信息）');
     return true;
   }
 
@@ -373,23 +374,23 @@ export class ContextCompressor {
       const markdown = memory.toMarkdown();
       const prompt = COMPRESSION_PROMPT.replace('{MEMORY_CONTENT}', markdown);
 
-      console.log('[ContextCompressor] 开始 LLM 压缩...');
+      logger.info('[ContextCompressor] 开始 LLM 压缩...');
       const response = await this.adapter.sendMessage(prompt);
 
       // 解析 JSON 响应
       const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/);
       if (!jsonMatch) {
-        console.error('[ContextCompressor] 无法解析 LLM 响应');
+        logger.error('[ContextCompressor] 无法解析 LLM 响应');
         return false;
       }
 
       const compressed = JSON.parse(jsonMatch[1]);
       memory.replaceContent(compressed);
 
-      console.log('[ContextCompressor] LLM 压缩成功');
+      logger.info('[ContextCompressor] LLM 压缩成功');
       return true;
     } catch (error) {
-      console.error('[ContextCompressor] LLM 压缩失败:', error);
+      logger.error('[ContextCompressor] LLM 压缩失败:', error);
       return false;
     }
   }

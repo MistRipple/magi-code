@@ -3,6 +3,7 @@
  * 调用 AI CLI 分析复杂任务并自动分解为子任务
  */
 
+import { logger, LogCategory } from '../logging';
 import { CLIType, TaskCategory } from '../types';
 import { CLIAdapterFactory } from '../cli/adapter-factory';
 import { TaskAnalysis } from './task-analyzer';
@@ -72,7 +73,7 @@ export class AITaskDecomposer {
       );
 
       if (response.error) {
-        console.error('[AITaskDecomposer] AI 分解失败:', response.error);
+        logger.error('[AITaskDecomposer] AI 分解失败:', response.error, LogCategory.TASK);
         return this.fallbackSplit(analysis);
       }
 
@@ -88,7 +89,7 @@ export class AITaskDecomposer {
         hasDependencies: subTasks.some(t => t.dependencies.length > 0),
       };
     } catch (error) {
-      console.error('[AITaskDecomposer] AI 分解异常:', error);
+      logger.error('[AITaskDecomposer] AI 分解异常:', error, LogCategory.TASK);
       return this.fallbackSplit(analysis);
     }
   }
@@ -148,7 +149,7 @@ export class AITaskDecomposer {
           id,
           description: task.description,
           category,
-          assignedCli: selection.cli,
+          assignedWorker: selection.cli,
           targetFiles: task.targetFiles || [],
           dependencies: (task.dependencies || []).map((d: string | number) => `${baseId}-${d}`),
           priority: task.priority || index + 1,
@@ -156,7 +157,7 @@ export class AITaskDecomposer {
         };
       });
     } catch (error) {
-      console.error('[AITaskDecomposer] 解析 AI 响应失败:', error);
+      logger.error('[AITaskDecomposer] 解析 AI 响应失败:', error, LogCategory.TASK);
       return [];
     }
   }
@@ -209,7 +210,7 @@ export class AITaskDecomposer {
         id: `fallback-${Date.now()}`,
         description: analysis.prompt,
         category: analysis.category,
-        assignedCli: selection.cli,
+        assignedWorker: selection.cli,
         targetFiles: analysis.targetFiles,
         dependencies: [],
         priority: 1,

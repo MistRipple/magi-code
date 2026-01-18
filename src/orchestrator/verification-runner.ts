@@ -3,6 +3,7 @@
  * 负责执行 Phase 4 的验证检查：编译、Lint、测试、IDE 诊断
  */
 
+import { logger, LogCategory } from '../logging';
 import { spawn } from 'child_process';
 import * as vscode from 'vscode';
 import { globalEventBus } from '../events';
@@ -90,7 +91,7 @@ export class VerificationRunner {
    * 执行完整验证流程
    */
   async runVerification(taskId: string, modifiedFiles?: string[]): Promise<VerificationResult> {
-    console.log('[VerificationRunner] 开始验证检查...');
+    logger.info('[VerificationRunner] 开始验证检查...', undefined, LogCategory.ORCHESTRATOR);
     globalEventBus.emitEvent('verification:started', { taskId });
 
     const result: VerificationResult = {
@@ -102,7 +103,7 @@ export class VerificationRunner {
 
     // 1. 编译检查
     if (this.config.compileCheck) {
-      console.log('[VerificationRunner] 执行编译检查...');
+      logger.info('[VerificationRunner] 执行编译检查...', undefined, LogCategory.ORCHESTRATOR);
       result.compileResult = await this.runCommand(this.config.compileCommand, '编译');
       if (!result.compileResult.success) {
         result.success = false;
@@ -114,7 +115,7 @@ export class VerificationRunner {
 
     // 2. IDE 诊断检查
     if (this.config.ideCheck) {
-      console.log('[VerificationRunner] 执行 IDE 诊断检查...');
+      logger.info('[VerificationRunner] 执行 IDE 诊断检查...', undefined, LogCategory.ORCHESTRATOR);
       result.ideResult = await this.runIDEDiagnostics(modifiedFiles);
       if (!result.ideResult.success) {
         result.success = false;
@@ -129,7 +130,7 @@ export class VerificationRunner {
 
     // 3. Lint 检查
     if (this.config.lintCheck) {
-      console.log('[VerificationRunner] 执行 Lint 检查...');
+      logger.info('[VerificationRunner] 执行 Lint 检查...', undefined, LogCategory.ORCHESTRATOR);
       result.lintResult = await this.runCommand(this.config.lintCommand, 'Lint');
       if (!result.lintResult.success) {
         result.success = false;
@@ -141,7 +142,7 @@ export class VerificationRunner {
 
     // 4. 测试检查
     if (this.config.testCheck) {
-      console.log('[VerificationRunner] 执行测试检查...');
+      logger.info('[VerificationRunner] 执行测试检查...', undefined, LogCategory.ORCHESTRATOR);
       result.testResult = await this.runCommand(this.config.testCommand, '测试');
       if (!result.testResult.success) {
         result.success = false;
@@ -158,7 +159,7 @@ export class VerificationRunner {
       data: { success: result.success, summary: result.summary } 
     });
 
-    console.log(`[VerificationRunner] 验证完成: ${result.success ? '通过' : '失败'}`);
+    logger.info(`[VerificationRunner] 验证完成: ${result.success ? '通过' : '失败'}`, undefined, LogCategory.ORCHESTRATOR);
     return result;
   }
 
@@ -257,7 +258,7 @@ export class VerificationRunner {
 
       result.success = result.errors === 0;
     } catch (error) {
-      console.error('[VerificationRunner] IDE 诊断检查失败:', error);
+      logger.error('[VerificationRunner] IDE 诊断检查失败:', error, LogCategory.ORCHESTRATOR);
       result.success = false;
     }
 

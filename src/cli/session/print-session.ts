@@ -1,3 +1,4 @@
+import { logger, LogCategory } from '../../logging';
 import { EventEmitter } from 'events';
 import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
 import type { SessionMessage, SessionProcess, SessionProcessOptions, SessionResponse } from './types';
@@ -121,7 +122,7 @@ export class PrintSession extends EventEmitter implements SessionProcess {
    */
   writeInput(text: string): boolean {
     if (!this.current || !this.current.stdin || !this.waitingForAnswer) {
-      console.log(`[PrintSession] writeInput failed: no current process or not waiting for answer`);
+      logger.info(`[PrintSession] writeInput failed: no current process or not waiting for answer`, undefined, LogCategory.CLI);
       return false;
     }
 
@@ -133,10 +134,10 @@ export class PrintSession extends EventEmitter implements SessionProcess {
       // 发送用户输入，添加换行符
       const input = text.endsWith('\n') ? text : text + '\n';
       this.current.stdin.write(input);
-      console.log(`[PrintSession] writeInput success: ${text}`);
+      logger.info(`[PrintSession] writeInput success: ${text}`, undefined, LogCategory.CLI);
       return true;
     } catch (error) {
-      console.error(`[PrintSession] writeInput error:`, error);
+      logger.error(`[PrintSession] writeInput error:`, error, LogCategory.CLI);
       return false;
     }
   }
@@ -250,7 +251,7 @@ export class PrintSession extends EventEmitter implements SessionProcess {
           timestamp: Date.now(),
         };
 
-        console.log(`[PrintSession] 检测到 CLI 询问:`, question);
+        logger.info(`[PrintSession] 检测到 CLI 询问:`, question, LogCategory.CLI);
         this.emit('question', question);
 
         // 设置询问超时
@@ -267,7 +268,7 @@ export class PrintSession extends EventEmitter implements SessionProcess {
     this.clearQuestionTimeout();
     this.questionTimeoutId = setTimeout(() => {
       if (this.waitingForAnswer) {
-        console.log(`[PrintSession] 询问超时，自动发送默认回答`);
+        logger.info(`[PrintSession] 询问超时，自动发送默认回答`, undefined, LogCategory.CLI);
         // 超时后发送默认回答（通常是 'n' 或空行）
         this.writeInput('n');
         this.emit('questionTimeout', {

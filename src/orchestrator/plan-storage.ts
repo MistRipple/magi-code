@@ -1,3 +1,4 @@
+import { logger, LogCategory } from '../logging';
 import * as fs from 'fs';
 import * as path from 'path';
 import { ExecutionPlan } from './protocols/types';
@@ -60,7 +61,7 @@ export class PlanStorage {
       const content = fs.readFileSync(filePath, 'utf-8');
       return JSON.parse(content) as PlanRecord;
     } catch (error) {
-      console.warn('[PlanStorage] 读取计划失败:', planId, error);
+      logger.warn('[PlanStorage] 读取计划失败:', { planId, error }, LogCategory.ORCHESTRATOR);
       return null;
     }
   }

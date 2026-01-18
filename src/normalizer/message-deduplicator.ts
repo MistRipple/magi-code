@@ -14,6 +14,7 @@
  * - 不同 source 的消息严格隔离
  */
 
+import { logger, LogCategory } from '../logging';
 import { StandardMessage, MessageLifecycle, MessageSource, StreamUpdate } from '../protocol';
 
 /** 消息状态 */
@@ -94,7 +95,7 @@ export class MessageDeduplicator {
 
     // 3. 已完成的消息：不再发送
     if (existingState.completed) {
-      console.warn(`[MessageDeduplicator] 消息已完成，跳过: ${id}`);
+      logger.warn(`[MessageDeduplicator] 消息已完成，跳过: ${id}`);
       return false;
     }
 
@@ -115,7 +116,7 @@ export class MessageDeduplicator {
     if (
       lifecycle === MessageLifecycle.COMPLETED ||
       lifecycle === MessageLifecycle.FAILED ||
-      lifecycle === MessageLifecycle.INTERRUPTED
+      lifecycle === MessageLifecycle.CANCELLED
     ) {
       this.completeMessage(message, now);
       return true;

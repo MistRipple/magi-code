@@ -11,6 +11,7 @@
  * └── execution-state.json  # 执行状态
  */
 
+import { logger, LogCategory } from '../logging';
 import * as fs from 'fs';
 import * as path from 'path';
 import { CLIType, Task, FileSnapshot } from '../types';
@@ -34,6 +35,7 @@ export interface FileSnapshotMeta {
   lastModifiedBy: CLIType;
   lastModifiedAt: number;
   subTaskId: string;
+  priority: number;  // SubTask 优先级 (1-10, 1 最高)
 }
 
 /** 任务状态 */
@@ -86,6 +88,11 @@ export class UnifiedSessionManager {
   private currentSessionId: string | null = null;
   private workspaceRoot: string;
   private baseDir: string;
+
+  // 内存管理配置
+  private readonly MAX_SESSIONS_IN_MEMORY = 50;  // 最大内存中会话数
+  private readonly MAX_MESSAGES_PER_SESSION = 1000;  // 每个会话最大消息数
+  private readonly MESSAGE_CLEANUP_THRESHOLD = 800;  // 消息清理阈值
 
   constructor(workspaceRoot: string) {
     this.workspaceRoot = workspaceRoot;
@@ -148,6 +155,10 @@ export class UnifiedSessionManager {
     };
 
     this.ensureSessionDir(id);
+
+    // 内存管理：如果会话数超过限制，驱逐最旧的非当前会话
+    this.evictOldSessionsIfNeeded();
+
     this.sessions.set(id, session);
     this.currentSessionId = id;
     this.saveSession(session);
@@ -244,6 +255,9 @@ export class UnifiedSessionManager {
       session.name = this.generateSessionTitle(content);
     }
 
+    // 消息数量管理：如果超过阈值，清理旧消息
+    this.cleanupOldMessagesIfNeeded(session);
+
     this.saveSession(session);
     return message;
   }
@@ -303,6 +317,80 @@ export class UnifiedSessionManager {
     const session = this.getCurrentSession();
     if (!session) return [];
     return session.messages.slice(-count);
+  }
+
+  /** 估算消息的 token 数量（粗略估算：1 token ≈ 4 字符） */
+  private estimateTokenCount(text: string): number {
+    // 简单估算：英文约 4 字符/token，中文约 1.5 字符/token
+    // 使用保守估算：平均 3 字符/token
+    return Math.ceil(text.length / 3);
+  }
+
+  /** 获取消息的总 token 数 */
+  private getMessageTokenCount(message: SessionMessage): number {
+    let total = this.estimateTokenCount(message.content);
+
+    // 添加元数据的 token 开销（role, timestamp 等）
+    total += 20; // 固定开销
+
+    return total;
+  }
+
+  /** 获取在 token 预算内的最近消息 */
+  getRecentMessagesWithinTokenBudget(maxTokens: number = 8000): SessionMessage[] {
+    const session = this.getCurrentSession();
+    if (!session || session.messages.length === 0) return [];
+
+    const messages: SessionMessage[] = [];
+    let totalTokens = 0;
+
+    // 从最新消息开始，向前累加
+    for (let i = session.messages.length - 1; i >= 0; i--) {
+      const message = session.messages[i];
+      const messageTokens = this.getMessageTokenCount(message);
+
+      if (totalTokens + messageTokens > maxTokens) {
+        // 超出预算，停止添加
+        break;
+      }
+
+      messages.unshift(message); // 添加到开头以保持顺序
+      totalTokens += messageTokens;
+    }
+
+    return messages;
+  }
+
+  /** 获取上下文窗口统计信息 */
+  getContextWindowStats(): {
+    totalMessages: number;
+    estimatedTokens: number;
+    oldestMessageAge: number;
+    newestMessageAge: number;
+  } {
+    const session = this.getCurrentSession();
+    if (!session || session.messages.length === 0) {
+      return {
+        totalMessages: 0,
+        estimatedTokens: 0,
+        oldestMessageAge: 0,
+        newestMessageAge: 0,
+      };
+    }
+
+    const now = Date.now();
+    let totalTokens = 0;
+
+    for (const message of session.messages) {
+      totalTokens += this.getMessageTokenCount(message);
+    }
+
+    return {
+      totalMessages: session.messages.length,
+      estimatedTokens: totalTokens,
+      oldestMessageAge: now - session.messages[0].timestamp,
+      newestMessageAge: now - session.messages[session.messages.length - 1].timestamp,
+    };
   }
 
   // ============================================================================
@@ -366,14 +454,21 @@ export class UnifiedSessionManager {
             try {
               fs.unlinkSync(oldFile);
             } catch (error) {
-              console.warn('[UnifiedSessionManager] 清理旧快照失败:', oldFile, error);
+              logger.warn('[UnifiedSessionManager] 清理旧快照失败:', { oldFile, error }, LogCategory.SESSION);
+              // 不抛出错误，继续执行
             }
           }
         }
       } else {
         session.snapshots.push(snapshot);
       }
-      this.saveSession(session);
+
+      try {
+        this.saveSession(session);
+      } catch (error) {
+        logger.error('[UnifiedSessionManager] 保存快照元数据失败:', error, LogCategory.SESSION);
+        throw error;
+      }
     }
   }
 
@@ -420,10 +515,15 @@ export class UnifiedSessionManager {
     // 删除整个会话目录
     const sessionDir = this.getSessionDir(sessionId);
     if (fs.existsSync(sessionDir)) {
-      fs.rmSync(sessionDir, { recursive: true, force: true });
+      try {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+        logger.info(`[UnifiedSessionManager] 已删除会话: ${sessionId}`, undefined, LogCategory.SESSION);
+      } catch (error) {
+        logger.error(`[UnifiedSessionManager] 删除会话目录失败: ${sessionId}`, error, LogCategory.SESSION);
+        // 即使删除失败，也从内存中移除了，返回 true
+        // 用户可以手动清理文件系统
+      }
     }
-
-    console.log(`[UnifiedSessionManager] 已删除会话: ${sessionId}`);
 
     // 如果删除的是当前会话，切换到最新的会话
     if (this.currentSessionId === sessionId) {
@@ -448,6 +548,125 @@ export class UnifiedSessionManager {
   }
 
   // ============================================================================
+  // 数据完整性验证
+  // ============================================================================
+
+  /** 验证会话数据完整性 */
+  private validateSessionData(session: any): boolean {
+    // 基础字段验证
+    if (!session || typeof session !== 'object') {
+      return false;
+    }
+
+    // 必需字段验证
+    if (!session.id || typeof session.id !== 'string') {
+      logger.error('[UnifiedSessionManager] 会话缺少有效的 id 字段', undefined, LogCategory.SESSION);
+      return false;
+    }
+
+    if (!session.status || !['active', 'completed'].includes(session.status)) {
+      logger.error('[UnifiedSessionManager] 会话状态无效:', session.status, LogCategory.SESSION);
+      return false;
+    }
+
+    if (typeof session.createdAt !== 'number' || typeof session.updatedAt !== 'number') {
+      logger.error('[UnifiedSessionManager] 会话时间戳无效', undefined, LogCategory.SESSION);
+      return false;
+    }
+
+    // 数组字段验证
+    if (!Array.isArray(session.messages)) {
+      logger.error('[UnifiedSessionManager] messages 字段不是数组', undefined, LogCategory.SESSION);
+      return false;
+    }
+
+    if (!Array.isArray(session.tasks)) {
+      logger.error('[UnifiedSessionManager] tasks 字段不是数组', undefined, LogCategory.SESSION);
+      return false;
+    }
+
+    if (!Array.isArray(session.snapshots)) {
+      logger.error('[UnifiedSessionManager] snapshots 字段不是数组', undefined, LogCategory.SESSION);
+      return false;
+    }
+
+    // 消息数据验证
+    for (const msg of session.messages) {
+      if (!msg.id || !msg.role || !['user', 'assistant'].includes(msg.role)) {
+        logger.error('[UnifiedSessionManager] 消息数据无效:', msg, LogCategory.SESSION);
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  /** 备份损坏的会话文件 */
+  private backupCorruptedSession(sessionId: string, filePath: string): void {
+    try {
+      const backupPath = `${filePath}.corrupted.${Date.now()}.bak`;
+      if (fs.existsSync(filePath)) {
+        fs.copyFileSync(filePath, backupPath);
+        logger.info(`[UnifiedSessionManager] 已备份损坏的会话文件: ${backupPath}`, undefined, LogCategory.SESSION);
+      }
+    } catch (error) {
+      logger.error(`[UnifiedSessionManager] 备份损坏会话失败: ${sessionId}`, error, LogCategory.SESSION);
+    }
+  }
+
+  // ============================================================================
+  // 内存管理
+  // ============================================================================
+
+  /** 驱逐旧会话（如果超过内存限制） */
+  private evictOldSessionsIfNeeded(): void {
+    if (this.sessions.size <= this.MAX_SESSIONS_IN_MEMORY) {
+      return;
+    }
+
+    // 获取所有会话，按更新时间排序（最旧的在前）
+    const allSessions = Array.from(this.sessions.values())
+      .sort((a, b) => a.updatedAt - b.updatedAt);
+
+    // 计算需要驱逐的会话数
+    const toEvict = this.sessions.size - this.MAX_SESSIONS_IN_MEMORY;
+
+    // 驱逐最旧的非当前会话
+    let evicted = 0;
+    for (const session of allSessions) {
+      if (evicted >= toEvict) break;
+      if (session.id === this.currentSessionId) continue; // 不驱逐当前会话
+
+      // 保存到磁盘后从内存中移除
+      this.saveSession(session);
+      this.sessions.delete(session.id);
+      evicted++;
+    }
+
+    if (evicted > 0) {
+      logger.info(`[UnifiedSessionManager] 驱逐了 ${evicted} 个旧会话以释放内存`, undefined, LogCategory.SESSION);
+    }
+  }
+
+  /** 清理旧消息（如果超过阈值） */
+  private cleanupOldMessagesIfNeeded(session: UnifiedSession): void {
+    if (session.messages.length <= this.MESSAGE_CLEANUP_THRESHOLD) {
+      return;
+    }
+
+    // 保留最近的消息，删除最旧的消息
+    const toKeep = Math.floor(this.MAX_MESSAGES_PER_SESSION * 0.8); // 保留 80%
+    const removed = session.messages.length - toKeep;
+
+    logger.info(
+      `[UnifiedSessionManager] 会话 ${session.id} 消息数超过阈值 (${session.messages.length}/${this.MESSAGE_CLEANUP_THRESHOLD})，` +
+      `清理最旧的 ${removed} 条消息`
+    );
+
+    session.messages = session.messages.slice(-toKeep);
+  }
+
+  // ============================================================================
   // 持久化
   // ============================================================================
 
@@ -455,7 +674,12 @@ export class UnifiedSessionManager {
   saveSession(session: UnifiedSession): void {
     this.ensureSessionDir(session.id);
     const filePath = this.getSessionFilePath(session.id);
-    fs.writeFileSync(filePath, JSON.stringify(session, null, 2), 'utf-8');
+    try {
+      fs.writeFileSync(filePath, JSON.stringify(session, null, 2), 'utf-8');
+    } catch (error) {
+      logger.error(`[UnifiedSessionManager] 保存会话失败: ${session.id}`, error, LogCategory.SESSION);
+      throw new Error(`Failed to save session: ${error}`);
+    }
   }
 
   /** 保存当前会话 */
@@ -473,10 +697,19 @@ export class UnifiedSessionManager {
       try {
         const data = fs.readFileSync(filePath, 'utf-8');
         const session = JSON.parse(data) as UnifiedSession;
+
+        // 数据完整性验证
+        if (!this.validateSessionData(session)) {
+          logger.error(`[UnifiedSessionManager] 会话数据验证失败: ${sessionId}`, undefined, LogCategory.SESSION);
+          return null;
+        }
+
         this.sessions.set(session.id, session);
         return session;
       } catch (e) {
-        console.error(`[UnifiedSessionManager] 加载会话失败: ${sessionId}`, e);
+        logger.error(`[UnifiedSessionManager] 加载会话失败: ${sessionId}`, e, LogCategory.SESSION);
+        // 尝试备份损坏的会话文件
+        this.backupCorruptedSession(sessionId, filePath);
       }
     }
     return null;
@@ -547,9 +780,9 @@ export class UnifiedSessionManager {
     if (fs.existsSync(taskFilePath)) {
       try {
         fs.unlinkSync(taskFilePath);
-        console.log(`[UnifiedSessionManager] 已清理任务状态: ${taskFilePath}`);
+        logger.info(`[UnifiedSessionManager] 已清理任务状态: ${taskFilePath}`, undefined, LogCategory.SESSION);
       } catch (e) {
-        console.error(`[UnifiedSessionManager] 清理任务状态失败: ${taskFilePath}`, e);
+        logger.error(`[UnifiedSessionManager] 清理任务状态失败: ${taskFilePath}`, e, LogCategory.SESSION);
       }
     }
   }
@@ -562,9 +795,9 @@ export class UnifiedSessionManager {
           if (attachment.path.includes('.multicli/attachments') && fs.existsSync(attachment.path)) {
             try {
               fs.unlinkSync(attachment.path);
-              console.log(`[UnifiedSessionManager] 已清理图片附件: ${attachment.path}`);
+              logger.info(`[UnifiedSessionManager] 已清理图片附件: ${attachment.path}`, undefined, LogCategory.SESSION);
             } catch (e) {
-              console.error(`[UnifiedSessionManager] 清理图片附件失败: ${attachment.path}`, e);
+              logger.error(`[UnifiedSessionManager] 清理图片附件失败: ${attachment.path}`, e, LogCategory.SESSION);
             }
           }
         }

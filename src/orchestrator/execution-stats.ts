@@ -4,6 +4,7 @@
  * 用于智能 CLI 选择和降级决策
  */
 
+import { logger, LogCategory } from '../logging';
 import * as vscode from 'vscode';
 import { globalEventBus } from '../events';
 import { CLIType } from '../types';
@@ -108,7 +109,7 @@ export class ExecutionStats {
     // 异步保存
     this.saveToStorage();
 
-    console.log(`[ExecutionStats] 记录执行: ${record.cli} ${record.success ? '成功' : '失败'} (${record.duration}ms)`);
+    logger.info(`[ExecutionStats] 记录执行: ${record.cli} ${record.success ? '成功' : '失败'} (${record.duration}ms, undefined, LogCategory.ORCHESTRATOR)`);
     globalEventBus.emitEvent('execution:stats_updated', {});
   }
 
@@ -277,10 +278,10 @@ export class ExecutionStats {
       const data = this.context.globalState.get<ExecutionRecord[]>(this.config.persistKey);
       if (data && Array.isArray(data)) {
         this.records = data;
-        console.log(`[ExecutionStats] 从存储加载 ${this.records.length} 条记录`);
+        logger.info(`[ExecutionStats] 从存储加载 ${this.records.length} 条记录`, undefined, LogCategory.ORCHESTRATOR);
       }
     } catch (error) {
-      console.warn('[ExecutionStats] 加载存储数据失败:', error);
+      logger.warn('[ExecutionStats] 加载存储数据失败:', error, LogCategory.ORCHESTRATOR);
     }
   }
 
@@ -291,7 +292,7 @@ export class ExecutionStats {
     try {
       await this.context.globalState.update(this.config.persistKey, this.records);
     } catch (error) {
-      console.warn('[ExecutionStats] 保存存储数据失败:', error);
+      logger.warn('[ExecutionStats] 保存存储数据失败:', error, LogCategory.ORCHESTRATOR);
     }
   }
 
@@ -299,7 +300,7 @@ export class ExecutionStats {
   async clearStats(): Promise<void> {
     this.records = [];
     await this.saveToStorage();
-    console.log('[ExecutionStats] 已清除所有统计数据');
+    logger.info('[ExecutionStats] 已清除所有统计数据', undefined, LogCategory.ORCHESTRATOR);
     globalEventBus.emitEvent('execution:stats_updated', {});
   }
 

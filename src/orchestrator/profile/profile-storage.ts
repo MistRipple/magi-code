@@ -11,6 +11,7 @@
  * 扁平化结构，所有配置文件直接在 ~/.multicli/ 下
  */
 
+import { logger, LogCategory } from '../../logging';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -61,7 +62,7 @@ export class ProfileStorage {
           const content = fs.readFileSync(filePath, 'utf-8');
           config.workers[workerType] = JSON.parse(content);
         } catch (e) {
-          console.warn(`[ProfileStorage] 读取 ${workerType} 配置失败:`, e);
+          logger.warn(`[ProfileStorage] 读取 ${workerType} 配置失败:`, e, LogCategory.ORCHESTRATOR);
         }
       }
     }
@@ -73,7 +74,7 @@ export class ProfileStorage {
         const content = fs.readFileSync(categoriesPath, 'utf-8');
         config.categories = JSON.parse(content);
       } catch (e) {
-        console.warn('[ProfileStorage] 读取分类配置失败:', e);
+        logger.warn('[ProfileStorage] 读取分类配置失败:', e, LogCategory.ORCHESTRATOR);
       }
     }
 
@@ -135,5 +136,42 @@ export class ProfileStorage {
    */
   hasConfig(): boolean {
     return this.getConfig() !== undefined;
+  }
+
+  /**
+   * 确保默认画像与分类配置存在（仅在缺失时写入）
+   */
+  static ensureDefaults(defaults: {
+    workers: {
+      claude: WorkerProfile;
+      codex: WorkerProfile;
+      gemini: WorkerProfile;
+    };
+    categories: CategoriesConfig;
+  }): void {
+    const configDir = ProfileStorage.CONFIG_DIR;
+    if (!fs.existsSync(configDir)) {
+      fs.mkdirSync(configDir, { recursive: true });
+    }
+
+    const created: string[] = [];
+    const workerDefaults: Record<string, WorkerProfile> = defaults.workers;
+    for (const [workerType, workerProfile] of Object.entries(workerDefaults)) {
+      const filePath = path.join(configDir, `${workerType}.json`);
+      if (!fs.existsSync(filePath)) {
+        fs.writeFileSync(filePath, JSON.stringify(workerProfile, null, 2), 'utf-8');
+        created.push(`${workerType}.json`);
+      }
+    }
+
+    const categoriesPath = path.join(configDir, 'categories.json');
+    if (!fs.existsSync(categoriesPath)) {
+      fs.writeFileSync(categoriesPath, JSON.stringify(defaults.categories, null, 2), 'utf-8');
+      created.push('categories.json');
+    }
+
+    if (created.length > 0) {
+      logger.info(`[ProfileStorage] 已重建默认画像配置: ${created.join(', ')}`, undefined, LogCategory.ORCHESTRATOR);
+    }
   }
 }

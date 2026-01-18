@@ -37,9 +37,10 @@ export function normalizeOrchestratorMessage(
 
   // 构建内容块
   const blocks: ContentBlock[] = [];
+  const summaryCard = uiMessage.type === 'summary' ? parseSummaryCard(uiMessage.content) : null;
 
   // 主文本内容
-  if (uiMessage.content) {
+  if (uiMessage.content && !summaryCard) {
     const textBlock: TextBlock = {
       type: 'text',
       content: uiMessage.content,
@@ -48,8 +49,8 @@ export function normalizeOrchestratorMessage(
     blocks.push(textBlock);
   }
 
-  // 如果有计划信息，添加为额外块
-  if (uiMessage.metadata?.formattedPlan) {
+  // 如果有计划信息，且与主内容不同，添加为额外块
+  if (uiMessage.metadata?.formattedPlan && uiMessage.metadata.formattedPlan !== uiMessage.content) {
     const planBlock: TextBlock = {
       type: 'text',
       content: uiMessage.metadata.formattedPlan,
@@ -92,8 +93,66 @@ export function normalizeOrchestratorMessage(
       taskId: uiMessage.taskId,
       phase: uiMessage.metadata?.phase,
       subTaskId: uiMessage.metadata?.subTaskId,
+      ...(summaryCard ? { summaryCard } : {}),
     },
   };
+}
+
+function parseSummaryCard(content: string): { title: string; sections: Array<{ title: string; items: string[] }> } | null {
+  if (!content) return null;
+  const lines = content.split('\n').map(line => line.trim()).filter(Boolean);
+  if (lines.length === 0) return null;
+
+  let title = '';
+  const sections: Array<{ title: string; items: string[] }> = [];
+  let current: { title: string; items: string[] } | null = null;
+
+  const pushCurrent = () => {
+    if (current && current.items.length > 0) {
+      sections.push(current);
+    }
+    current = null;
+  };
+
+  for (const line of lines) {
+    if (line.startsWith('## ')) {
+      pushCurrent();
+      current = { title: line.replace(/^##\s+/, '').trim(), items: [] };
+      continue;
+    }
+
+    if (/:$/.test(line) || /：$/.test(line)) {
+      pushCurrent();
+      current = { title: line.replace(/[:：]\s*$/, '').trim(), items: [] };
+      continue;
+    }
+
+    if (!title) {
+      title = line;
+      continue;
+    }
+
+    if (!current) {
+      current = { title: '内容', items: [] };
+    }
+
+    const cleaned = line.replace(/^[-*•]\s+/, '').replace(/^\d+\.\s+/, '');
+    if (cleaned) {
+      current.items.push(cleaned);
+    }
+  }
+
+  pushCurrent();
+
+  if (!title) {
+    title = '执行总结';
+  }
+
+  if (sections.length === 0) {
+    return null;
+  }
+
+  return { title, sections };
 }
 
 /**
@@ -142,4 +201,3 @@ export function getMessagePriority(uiMessage: OrchestratorUIMessage): number {
 
   return priorities[uiMessage.type] || 0;
 }
-

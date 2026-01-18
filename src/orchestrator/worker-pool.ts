@@ -10,6 +10,7 @@
  * - Worker 画像加载和注入
  */
 
+import { logger, LogCategory } from '../logging';
 import { EventEmitter } from 'events';
 import * as path from 'path';
 import { CLIAdapterFactory } from '../cli/adapter-factory';
@@ -50,6 +51,8 @@ export interface WorkerPoolConfig {
   permissions?: PermissionMatrix;
   /** 工作区路径（用于加载项目配置） */
   workspacePath?: string;
+  /** 统一任务管理器（可选，用于委托任务状态管理） */
+  taskManager?: any; // UnifiedTaskManager - using any to avoid circular dependency
 }
 
 /** 执行调度配置 */
@@ -149,6 +152,9 @@ export class WorkerPool extends EventEmitter {
   private profileLoader?: ProfileLoader;
   private workspacePath: string;
 
+  // 统一任务管理器（可选，用于委托任务状态管理）
+  private taskManager?: any; // UnifiedTaskManager
+
   constructor(config: WorkerPoolConfig) {
     super();
     this.cliFactory = config.cliFactory;
@@ -162,6 +168,7 @@ export class WorkerPool extends EventEmitter {
     this.snapshotManager = config.snapshotManager;
     this.permissions = config.permissions || { allowEdit: true, allowBash: true, allowWeb: true };
     this.workspacePath = config.workspacePath || '';
+    this.taskManager = config.taskManager;
 
     this.setupMessageHandlers();
   }
@@ -190,13 +197,13 @@ export class WorkerPool extends EventEmitter {
    */
   async loadProfiles(): Promise<void> {
     if (!this.workspacePath) {
-      console.log('[WorkerPool] 未设置工作区路径，跳过画像加载');
+      logger.info('[WorkerPool] 未设置工作区路径，跳过画像加载', undefined, LogCategory.WORKER);
       return;
     }
 
     this.profileLoader = new ProfileLoader(this.workspacePath);
     await this.profileLoader.load();
-    console.log('[WorkerPool] Worker 画像加载完成');
+    logger.info('[WorkerPool] Worker 画像加载完成', undefined, LogCategory.WORKER);
 
     // 更新已有 Worker 的画像
     for (const [type, worker] of this.workers) {
@@ -230,7 +237,7 @@ export class WorkerPool extends EventEmitter {
       await this.createWorker(type);
     }
 
-    console.log(`[WorkerPool] 初始化完成，共 ${this.workers.size} 个 Worker`);
+    logger.info(`[WorkerPool] 初始化完成，共 ${this.workers.size} 个 Worker`, undefined, LogCategory.WORKER);
   }
 
   /**
@@ -251,6 +258,7 @@ export class WorkerPool extends EventEmitter {
       orchestratorId: this.orchestratorId,
       snapshotManager: this.snapshotManager,
       permissions: this.permissions,
+      workspaceRoot: this.workspacePath,
       profile, // 传递画像
     });
 
@@ -275,7 +283,7 @@ export class WorkerPool extends EventEmitter {
     });
 
     this.workers.set(type, worker);
-    console.log(`[WorkerPool] 创建 Worker: ${worker.id}${profile ? ' (已加载画像)' : ''}`);
+    logger.info(`[WorkerPool] 创建 Worker: ${worker.id}${profile ? ' (已加载画像, undefined, LogCategory.WORKER)' : ''}`);
 
     return worker;
   }
@@ -560,6 +568,7 @@ export class WorkerPool extends EventEmitter {
     context?: string,
     options?: DispatchOptions
   ): Promise<ExecutionResult> {
+    // Initialize local state (fallback when taskManager is not available)
     const state: TaskExecutionState = {
       subTaskId: subTask.id,
       workerType: type,
@@ -567,6 +576,11 @@ export class WorkerPool extends EventEmitter {
       retries: 0,
     };
     this.executionStates.set(subTask.id, state);
+
+    // Delegate to UnifiedTaskManager if available
+    if (this.taskManager) {
+      await this.taskManager.updateSubTaskStatus(taskId, subTask.id, 'running');
+    }
 
     let lastError: Error | null = null;
     let currentCli: WorkerType = type;
@@ -578,6 +592,18 @@ export class WorkerPool extends EventEmitter {
       state.workerType = currentCli;
       const startTime = Date.now();
       state.startTime = startTime;
+
+      // Update retry count in UnifiedTaskManager
+      if (this.taskManager) {
+        const subTaskData = await this.taskManager.getSubTask(taskId, subTask.id);
+        if (subTaskData) {
+          await this.taskManager.updateSubTask(taskId, {
+            ...subTaskData,
+            retryCount: attempt,
+            assignedWorker: currentCli,
+          });
+        }
+      }
 
       try {
         const result = await this.executeWithTimeout(currentCli, taskId, subTask, context, options);
@@ -598,6 +624,15 @@ export class WorkerPool extends EventEmitter {
         state.status = result.success ? 'completed' : 'failed';
         state.endTime = Date.now();
 
+        // Delegate to UnifiedTaskManager
+        if (this.taskManager) {
+          if (result.success) {
+            await this.taskManager.completeSubTask(taskId, subTask.id, result);
+          } else {
+            await this.taskManager.failSubTask(taskId, subTask.id, result.error || '未知错误');
+          }
+        }
+
         if (result.success) {
           return result;
         }
@@ -609,7 +644,7 @@ export class WorkerPool extends EventEmitter {
           const fallback = this.tryFallback(currentCli, triedClis);
           if (fallback) {
             currentCli = fallback.suggestedCli;
-            console.log(`[WorkerPool] CLI 降级: ${type} -> ${currentCli}，原因: ${fallback.reason}`);
+            logger.info(`[WorkerPool] CLI 降级: ${type} -> ${currentCli}，原因: ${fallback.reason}`, undefined, LogCategory.WORKER);
             this.emit('cliFallback', { original: type, fallback: currentCli, reason: fallback.reason });
             continue; // 使用新 CLI 重试
           }
@@ -634,8 +669,13 @@ export class WorkerPool extends EventEmitter {
         lastError = error instanceof Error ? error : new Error(String(error));
         state.error = lastError.message;
 
-       
+
         this.recordExecution(currentCli, taskId, subTask.id, false, duration, lastError.message);
+
+        // Delegate failure to UnifiedTaskManager
+        if (this.taskManager) {
+          await this.taskManager.failSubTask(taskId, subTask.id, lastError.message);
+        }
 
         if (!this.shouldRetry(lastError.message) || attempt >= this.schedulingConfig.maxRetries) {
          
@@ -643,7 +683,7 @@ export class WorkerPool extends EventEmitter {
           const fallback = this.tryFallback(currentCli, triedClis);
           if (fallback) {
             currentCli = fallback.suggestedCli;
-            console.log(`[WorkerPool] CLI 降级: ${type} -> ${currentCli}，原因: ${fallback.reason}`);
+            logger.info(`[WorkerPool] CLI 降级: ${type} -> ${currentCli}，原因: ${fallback.reason}`, undefined, LogCategory.WORKER);
             this.emit('cliFallback', { original: type, fallback: currentCli, reason: fallback.reason });
             continue; // 使用新 CLI 重试
           }
@@ -665,13 +705,19 @@ export class WorkerPool extends EventEmitter {
 
       // 重试延迟（指数退避）
       const delay = this.getRetryDelay(attempt);
-      console.log(`[WorkerPool] 任务 ${subTask.id} 重试 ${attempt + 1}/${this.schedulingConfig.maxRetries}，延迟 ${delay}ms`);
+      logger.info(`[WorkerPool] 任务 ${subTask.id} 重试 ${attempt + 1}/${this.schedulingConfig.maxRetries}，延迟 ${delay}ms`, undefined, LogCategory.WORKER);
       this.emit('taskRetry', { subTaskId: subTask.id, attempt: attempt + 1, delay });
       await this.delay(delay);
     }
 
     state.status = 'failed';
     state.endTime = Date.now();
+
+    // Final failure - delegate to UnifiedTaskManager
+    if (this.taskManager) {
+      await this.taskManager.failSubTask(taskId, subTask.id, lastError?.message || '任务执行失败');
+    }
+
     throw lastError || new Error('任务执行失败');
   }
 
@@ -826,10 +872,31 @@ export class WorkerPool extends EventEmitter {
   }
 
   /**
-   * 获取任务执行状态
+   * 获取任务执行状态（旧 API，保留用于向后兼容）
+   * 注意：此方法仅返回本地状态，不查询 UnifiedTaskManager
    */
   getExecutionState(subTaskId: string): TaskExecutionState | undefined {
     return this.executionStates.get(subTaskId);
+  }
+
+  /**
+   * 获取子任务状态（新 API，支持 UnifiedTaskManager）
+   * @param taskId 任务 ID
+   * @param subTaskId 子任务 ID
+   * @returns SubTask 对象或 null
+   */
+  async getSubTaskState(taskId: string, subTaskId: string): Promise<any | null> {
+    if (this.taskManager) {
+      return await this.taskManager.getSubTask(taskId, subTaskId);
+    }
+    return null;
+  }
+
+  /**
+   * 设置统一任务管理器
+   */
+  setTaskManager(taskManager: any): void {
+    this.taskManager = taskManager;
   }
 
   /**
@@ -858,7 +925,7 @@ export class WorkerPool extends EventEmitter {
   ): void {
     const worker = this.workers.get(type);
     if (!worker) {
-      console.error(`[WorkerPool] Worker ${type} 不存在`);
+      logger.error(`[WorkerPool] Worker ${type} 不存在`, undefined, LogCategory.WORKER);
       return;
     }
 
@@ -939,12 +1006,12 @@ export class WorkerPool extends EventEmitter {
     // ✅ 检测文件冲突并自动添加依赖关系
     const addedDeps = graph.addFileDependencies('sequential');
     if (addedDeps > 0) {
-      console.log(`[WorkerPool] 检测到文件冲突，自动添加 ${addedDeps} 个依赖关系`);
+      logger.info(`[WorkerPool] 检测到文件冲突，自动添加 ${addedDeps} 个依赖关系`, undefined, LogCategory.WORKER);
     }
 
     const unknownTaskIds = this.addUnknownTargetDependencies(graph, subTasks);
     if (unknownTaskIds.length > 1) {
-      console.log(`[WorkerPool] 目标文件未知的子任务已强制串行: ${unknownTaskIds.join(', ')}`);
+      logger.info(`[WorkerPool] 目标文件未知的子任务已强制串行: ${unknownTaskIds.join(', ')}`);
     }
 
     for (const subTask of subTasks) {
@@ -956,14 +1023,14 @@ export class WorkerPool extends EventEmitter {
     const analysis = graph.analyze();
 
     if (analysis.hasCycle) {
-      console.error('[WorkerPool] 检测到循环依赖:', analysis.cycleNodes);
+      logger.error('[WorkerPool] 检测到循环依赖:', analysis.cycleNodes, LogCategory.WORKER);
       throw new Error(`任务存在循环依赖: ${analysis.cycleNodes?.join(', ')}`);
     }
 
-    console.log(`[WorkerPool] 依赖图分析完成:`);
-    console.log(`  - 任务总数: ${subTasks.length}`);
-    console.log(`  - 执行批次: ${analysis.executionBatches.length}`);
-    console.log(`  - 关键路径: ${analysis.criticalPath.join(' -> ')}`);
+    logger.info(`[WorkerPool] 依赖图分析完成:`, undefined, LogCategory.WORKER);
+    logger.info(`  - 任务总数: ${subTasks.length}`, undefined, LogCategory.WORKER);
+    logger.info(`  - 执行批次: ${analysis.executionBatches.length}`, undefined, LogCategory.WORKER);
+    logger.info(`  - 关键路径: ${analysis.criticalPath.join(' -> ')}`, undefined, LogCategory.WORKER);
 
     // 发出依赖图分析事件
     this.emit('dependencyAnalysis', {
@@ -977,7 +1044,7 @@ export class WorkerPool extends EventEmitter {
     const allResults: ExecutionResult[] = [];
 
     for (const batch of analysis.executionBatches) {
-      console.log(`[WorkerPool] 执行批次 ${batch.batchIndex + 1}/${analysis.executionBatches.length}:`,
+      logger.info(`[WorkerPool] 执行批次 ${batch.batchIndex + 1}/${analysis.executionBatches.length}:`,
         batch.taskIds.join(', '));
 
       // 获取批次中的任务
@@ -1000,7 +1067,7 @@ export class WorkerPool extends EventEmitter {
       // 如果有任务失败，检查是否影响后续任务
       const failedTasks = batchResults.filter(r => !r.success);
       if (failedTasks.length > 0) {
-        console.warn(`[WorkerPool] 批次 ${batch.batchIndex + 1} 有 ${failedTasks.length} 个任务失败`);
+        logger.warn(`[WorkerPool] 批次 ${batch.batchIndex + 1} 有 ${failedTasks.length} 个任务失败`, undefined, LogCategory.WORKER);
         // 继续执行，让后续批次中不依赖失败任务的任务继续执行
       }
     }
@@ -1182,6 +1249,6 @@ export class WorkerPool extends EventEmitter {
     this.workers.clear();
 
     this.removeAllListeners();
-    console.log('[WorkerPool] 已销毁');
+    logger.info('[WorkerPool] 已销毁', undefined, LogCategory.WORKER);
   }
 }

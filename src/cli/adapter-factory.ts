@@ -5,6 +5,7 @@
  * 集成 Normalizer 层，输出标准化消息
  */
 
+import { logger, LogCategory } from '../logging';
 import { EventEmitter } from 'events';
 import { ICLIAdapter, CLIType, AdapterConfig, CLIResponse, CLI_CAPABILITIES, AdapterMessageMeta } from './types';
 import { ClaudeAdapter } from './adapters/claude';
@@ -348,7 +349,7 @@ export class CLIAdapterFactory extends EventEmitter {
     }
 
     const hasImages = imagePaths && imagePaths.length > 0;
-    console.log(`[CLIAdapterFactory] sendMessage: type=${type}, hasImages=${hasImages}, imagePaths=`, imagePaths);
+    logger.info(`[CLIAdapterFactory] sendMessage: type=${type}, hasImages=${hasImages}, imagePaths=`, imagePaths, LogCategory.CLI);
 
     const scope = options ? { ...options } : null;
     const scopeKey = this.getScopeKey(type, role);

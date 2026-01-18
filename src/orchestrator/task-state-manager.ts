@@ -1,28 +1,30 @@
 /**
  * 任务状态管理器
  * 负责追踪所有子任务的执行状态，支持持久化和实时同步
+ * 
+ * @deprecated 此类已被 UnifiedTaskManager 替代，将在未来版本中移除
+ * @see UnifiedTaskManager - 使用统一的任务管理器
+ * @since v0.1.0
+ * @deprecated-since v0.7.0
+ * 
+ * 迁移指南：
+ * - 使用 UnifiedTaskManager 替代 TaskStateManager
+ * - 使用 SubTask 类型替代 TaskState 类型
+ * - 参考 docs/Stage3-完成总结.md 了解迁移详情
  */
 
+import { logger, LogCategory } from '../logging';
 import * as fs from 'fs';
 import * as path from 'path';
-import { CLIType } from '../types';
+import { CLIType, TaskStatus } from '../types';
 import { globalEventBus } from '../events';
-
-/** 任务状态类型 */
-export type TaskStatus =
-  | 'pending'    // 等待执行
-  | 'running'    // 执行中
-  | 'completed'  // 已完成
-  | 'failed'     // 失败
-  | 'retrying'   // 重试中
-  | 'cancelled'; // 已取消
 
 /** 任务状态 */
 export interface TaskState {
   id: string;
   parentTaskId: string;
   description: string;
-  assignedCli: CLIType;
+  assignedWorker: CLIType;
   status: TaskStatus;
   progress: number;        // 0-100
   attempts: number;        // 重试次数
@@ -49,6 +51,9 @@ export type StateChangeCallback = (task: TaskState, allTasks: TaskState[]) => vo
 /**
  * 任务状态管理器
  */
+/**
+ * @deprecated 使用 UnifiedTaskManager 替代
+ */
 export class TaskStateManager {
   private static readonly STORAGE_VERSION = 1;
   private tasks: Map<string, TaskState> = new Map();
@@ -72,11 +77,11 @@ export class TaskStateManager {
     id: string;
     parentTaskId: string;
     description: string;
-    assignedCli: CLIType;
+    assignedWorker: CLIType;
     maxAttempts?: number;
   }): TaskState {
     if (this.tasks.has(params.id)) {
-      console.warn(`[TaskStateManager] 任务已存在: ${params.id}`);
+      logger.warn(`[TaskStateManager] 任务已存在: ${params.id}`, undefined, LogCategory.ORCHESTRATOR);
       return this.tasks.get(params.id)!;
     }
 
@@ -84,7 +89,7 @@ export class TaskStateManager {
       id: params.id,
       parentTaskId: params.parentTaskId,
       description: params.description,
-      assignedCli: params.assignedCli,
+      assignedWorker: params.assignedWorker,
       status: 'pending',
       progress: 0,
       attempts: 0,
@@ -103,7 +108,7 @@ export class TaskStateManager {
   updateStatus(taskId: string, status: TaskStatus, error?: string): void {
     const task = this.tasks.get(taskId);
     if (!task) {
-      console.warn(`[TaskStateManager] 任务不存在: ${taskId}`);
+      logger.warn(`[TaskStateManager] 任务不存在: ${taskId}`, undefined, LogCategory.ORCHESTRATOR);
       return;
     }
 
@@ -152,14 +157,14 @@ export class TaskStateManager {
   getPendingTasks(cli?: CLIType): TaskState[] {
     return this.getAllTasks().filter(t => {
       if (t.status !== 'pending') return false;
-      if (cli && t.assignedCli !== cli) return false;
+      if (cli && t.assignedWorker !== cli) return false;
       return true;
     });
   }
 
   /** 获取指定 CLI 的任务 */
   getTasksByCli(cli: CLIType): TaskState[] {
-    return this.getAllTasks().filter(t => t.assignedCli === cli);
+    return this.getAllTasks().filter(t => t.assignedWorker === cli);
   }
 
   /** 检查是否所有任务都已完成 */
@@ -222,7 +227,7 @@ export class TaskStateManager {
       try {
         callback(task, allTasks);
       } catch (error) {
-        console.error('[TaskStateManager] 回调执行失败:', error);
+        logger.error('[TaskStateManager] 回调执行失败:', error, LogCategory.ORCHESTRATOR);
       }
     }
   }
@@ -231,7 +236,7 @@ export class TaskStateManager {
   private autoSaveIfEnabled(): void {
     if (this.autoSave) {
       this.save().catch(err => {
-        console.error('[TaskStateManager] 自动保存失败:', err);
+        logger.error('[TaskStateManager] 自动保存失败:', err, LogCategory.ORCHESTRATOR);
       });
     }
   }
@@ -293,7 +298,7 @@ export class TaskStateManager {
         this.emitStateChanged(task);
       }
     } catch (error) {
-      console.error('[TaskStateManager] 加载失败:', error);
+      logger.error('[TaskStateManager] 加载失败:', error, LogCategory.ORCHESTRATOR);
     }
   }
 
@@ -341,7 +346,7 @@ export class TaskStateManager {
   ): boolean {
     const prevStatus = task.status;
     if (!options.force && !this.isTransitionAllowed(prevStatus, status)) {
-      console.warn(`[TaskStateManager] 非法状态流转: ${prevStatus} -> ${status}`);
+      logger.warn(`[TaskStateManager] 非法状态流转: ${prevStatus} -> ${status}`, undefined, LogCategory.ORCHESTRATOR);
       return false;
     }
     task.status = status;
@@ -373,8 +378,9 @@ export class TaskStateManager {
   private isTransitionAllowed(from: TaskStatus, to: TaskStatus): boolean {
     if (from === to) return true;
     const allowed: Record<TaskStatus, TaskStatus[]> = {
-      pending: ['running', 'retrying', 'failed', 'cancelled', 'completed'],
-      running: ['completed', 'failed', 'retrying', 'cancelled'],
+      pending: ['running', 'retrying', 'paused', 'failed', 'cancelled', 'completed'],
+      running: ['completed', 'failed', 'retrying', 'paused', 'cancelled'],
+      paused: ['running', 'cancelled'],
       retrying: ['running', 'failed', 'cancelled', 'completed'],
       failed: ['retrying', 'cancelled'],
       completed: [],
@@ -388,7 +394,7 @@ export class TaskStateManager {
     if (typeof raw.id !== 'string' || typeof raw.parentTaskId !== 'string' || typeof raw.description !== 'string') {
       return null;
     }
-    if (raw.assignedCli !== 'claude' && raw.assignedCli !== 'codex' && raw.assignedCli !== 'gemini') {
+    if (raw.assignedWorker !== 'claude' && raw.assignedWorker !== 'codex' && raw.assignedWorker !== 'gemini') {
       return null;
     }
     const status = this.normalizeStatus(raw.status);
@@ -408,7 +414,7 @@ export class TaskStateManager {
       id: raw.id,
       parentTaskId: raw.parentTaskId,
       description: raw.description,
-      assignedCli: raw.assignedCli,
+      assignedWorker: raw.assignedWorker,
       status,
       progress: status === 'completed' ? 100 : progress,
       attempts,

@@ -21,6 +21,7 @@
  * - 避免：在多个地方创建实例
  */
 
+import { logger, LogCategory } from '../../logging';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -36,6 +37,7 @@ import {
   DEFAULT_GEMINI_PROFILE,
   DEFAULT_CATEGORIES_CONFIG,
 } from './defaults';
+import { ProfileStorage } from './profile-storage';
 
 export class ProfileLoader {
   private profiles: Map<WorkerType, WorkerProfile> = new Map();
@@ -63,7 +65,7 @@ export class ProfileLoader {
     // 警告：检测到多个实例
     if (ProfileLoader.instanceCount > 1) {
       const activeInstances = ProfileLoader.instances.filter(ref => ref.deref() !== undefined).length;
-      console.warn(
+      logger.warn(
         `[ProfileLoader] ⚠️  检测到多个 ProfileLoader 实例！` +
         `\n  当前实例 ID: ${this.instanceId}` +
         `\n  活跃实例数: ${activeInstances}` +
@@ -73,8 +75,8 @@ export class ProfileLoader {
       );
 
       // 打印堆栈跟踪以帮助定位问题
-      console.warn('[ProfileLoader] 创建位置堆栈:');
-      console.warn(new Error().stack);
+      logger.warn('[ProfileLoader] 创建位置堆栈:', undefined, LogCategory.ORCHESTRATOR);
+      logger.warn(new Error().stack || '', undefined, LogCategory.ORCHESTRATOR);
     }
   }
 
@@ -83,6 +85,15 @@ export class ProfileLoader {
    */
   async load(): Promise<void> {
     if (this.loaded) return;
+
+    ProfileStorage.ensureDefaults({
+      workers: {
+        claude: DEFAULT_CLAUDE_PROFILE,
+        codex: DEFAULT_CODEX_PROFILE,
+        gemini: DEFAULT_GEMINI_PROFILE,
+      },
+      categories: DEFAULT_CATEGORIES_CONFIG,
+    });
 
     await this.loadWorkerProfiles();
     await this.loadCategories();
@@ -122,9 +133,9 @@ export class ProfileLoader {
           const content = fs.readFileSync(userConfigPath, 'utf-8');
           const userProfile = JSON.parse(content) as Partial<WorkerProfile>;
           finalProfile = this.mergeProfile(finalProfile, userProfile);
-          console.log(`[ProfileLoader] 已加载用户配置: ${workerType}`);
+          logger.info(`[ProfileLoader] 已加载用户配置: ${workerType}`, undefined, LogCategory.ORCHESTRATOR);
         } catch (error) {
-          console.warn(`[ProfileLoader] 加载用户配置失败: ${userConfigPath}`, error);
+          logger.warn(`[ProfileLoader] 加载用户配置失败: ${userConfigPath}`, error, LogCategory.ORCHESTRATOR);
         }
       }
 
@@ -148,9 +159,9 @@ export class ProfileLoader {
           DEFAULT_CATEGORIES_CONFIG,
           userConfig
         );
-        console.log('[ProfileLoader] 已加载用户分类配置');
+        logger.info('[ProfileLoader] 已加载用户分类配置', undefined, LogCategory.ORCHESTRATOR);
       } catch (error) {
-        console.warn('[ProfileLoader] 加载用户分类配置失败', error);
+        logger.warn('[ProfileLoader] 加载用户分类配置失败', error, LogCategory.ORCHESTRATOR);
       }
     }
 
@@ -275,4 +286,3 @@ export class ProfileLoader {
     return this.categoriesConfig.rules;
   }
 }
-
