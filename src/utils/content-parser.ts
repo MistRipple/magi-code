@@ -318,7 +318,7 @@ export function parseContentToBlocks(
 
 /**
  * 解析纯文本内容（不含代码块）
- * 返回与 message-protocol.ts 兼容的 ContentBlock 类型
+ * 返回 message-protocol.ts 定义的 ContentBlock 类型
  */
 function parseTextContent(text: string): ContentBlock[] {
   if (!text) return [];

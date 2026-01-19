@@ -41,7 +41,7 @@ class DeepCodeChecker {
     // 3. 检查 webview-provider.ts 中的事件监听
     await this.checkWebviewProviderEvents();
     
-    // 4. 检查是否有未使用的旧代码
+    // 4. 检查是否有未使用的遗留代码
     await this.checkDeadCode();
     
     // 5. 检查状态一致性
@@ -104,7 +104,7 @@ class DeepCodeChecker {
     
     // 检查1: output 事件是否被注释掉
     if (content.includes("// this.emit('output'")) {
-      console.log('  ✓ 旧的 output 事件已被注释');
+      console.log('  ✓ 遗留 output 事件已被注释');
     } else if (content.includes("this.emit('output'") && !content.includes('emitOrchestratorMessage')) {
       this.issues.push({
         file: 'src/cli/adapter-factory.ts',
@@ -116,7 +116,7 @@ class DeepCodeChecker {
     
     // 检查2: response 事件是否被注释掉
     if (content.includes("// this.emit('response'")) {
-      console.log('  ✓ 旧的 response 事件已被注释');
+      console.log('  ✓ 遗留 response 事件已被注释');
     }
     
     // 检查3: emitOrchestratorMessage 是否正确设置 adapterRole
@@ -131,10 +131,10 @@ class DeepCodeChecker {
     const filePath = path.join(this.workspaceRoot, 'src/ui/webview-provider.ts');
     const content = fs.readFileSync(filePath, 'utf-8');
     
-    // 检查1: 是否还在监听旧的 output/response 事件
+    // 检查1: 是否还在监听遗留的 output/response 事件
     if (content.includes("cliFactory.on('output'")) {
-      console.log('  ⚠ 仍在监听 output 事件（可能是兼容代码）');
-      // 这可能是故意保留的兼容代码，需要进一步检查
+      console.log('  ⚠ 仍在监听 output 事件（可能是遗留代码）');
+      // 这可能是故意保留的遗留代码，需要进一步检查
     }
     
     // 检查2: 是否正确处理 standardMessage
@@ -144,7 +144,7 @@ class DeepCodeChecker {
   }
   
   private async checkDeadCode(): Promise<void> {
-    console.log('[检查] 是否有未使用的旧代码...');
+    console.log('[检查] 是否有未使用的遗留代码...');
     
     // 检查 webview-provider.ts 中是否有永远不会触发的事件监听
     const providerPath = path.join(this.workspaceRoot, 'src/ui/webview-provider.ts');

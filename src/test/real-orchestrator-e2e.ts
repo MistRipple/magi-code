@@ -6,9 +6,10 @@
 
 import { CLIAdapterFactory } from '../cli/adapter-factory';
 import { IntelligentOrchestrator } from '../orchestrator/intelligent-orchestrator';
-import { TaskManager } from '../task-manager';
 import { SnapshotManager } from '../snapshot-manager';
 import { UnifiedSessionManager } from '../session';
+import { UnifiedTaskManager } from '../task/unified-task-manager';
+import { SessionManagerTaskRepository } from '../task/session-manager-task-repository';
 import { globalEventBus } from '../events';
 
 type StandardMsg = {
@@ -43,13 +44,16 @@ async function run() {
   const workspaceRoot = process.cwd();
 
   const sessionManager = new UnifiedSessionManager(workspaceRoot);
-  const taskManager = new TaskManager(sessionManager);
   const snapshotManager = new SnapshotManager(sessionManager, workspaceRoot);
   const cliFactory = new CLIAdapterFactory({ cwd: workspaceRoot });
+  const session = sessionManager.getOrCreateCurrentSession();
+  const repository = new SessionManagerTaskRepository(sessionManager, session.id);
+  const taskManager = new UnifiedTaskManager(session.id, repository);
+  await taskManager.initialize();
 
   const orchestrator = new IntelligentOrchestrator(
     cliFactory,
-    taskManager,
+    sessionManager,
     snapshotManager,
     workspaceRoot,
     {
@@ -60,6 +64,7 @@ async function run() {
       strategy: { enableVerification: false, enableRecovery: false, autoRollbackOnFailure: false },
     }
   );
+  orchestrator.setTaskManager(taskManager, session.id);
 
   // 自动确认/澄清/提问回调（避免卡住）
   orchestrator.setConfirmationCallback(async () => true);

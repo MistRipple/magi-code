@@ -91,14 +91,14 @@ export class ContextManager {
     // 保持即时上下文在限定轮数内（每轮包含 user + assistant）
     const maxMessages = this.config.immediateContextRounds * 2;
     if (this.immediateContext.length > maxMessages) {
-      // ✅ P1修复: 迁移将被移除的消息到Memory
+      // ✅ P1修复: 将被移除的消息转存到 Memory
       const systemMessages = this.immediateContext.filter(m => m.role === 'system');
       const otherMessages = this.immediateContext.filter(m => m.role !== 'system');
 
       // 提取将被移除的消息
       const toRemove = otherMessages.slice(0, -maxMessages);
 
-      // 迁移到 Memory
+      // 转存到 Memory
       for (const removedMsg of toRemove) {
         this.migrateToMemory(removedMsg);
       }
@@ -110,7 +110,7 @@ export class ContextManager {
       ];
 
       logger.info(
-        `[ContextManager] 即时上下文已清理,迁移 ${toRemove.length} 条消息到 Memory`
+        `[ContextManager] 即时上下文已清理,转存 ${toRemove.length} 条消息到 Memory`
       );
     }
   }
@@ -425,16 +425,16 @@ export class ContextManager {
   }
 
   // ============================================================================
-  // 私有辅助方法 - 上下文自动迁移
+  // 私有辅助方法 - 上下文自动转存
   // ============================================================================
 
   /**
-   * 将消息迁移到 SessionMemory
+   * 将消息转存到 SessionMemory
    * 自动提取关键信息并结构化存储
    */
   private migrateToMemory(message: ContextMessage): void {
     if (!this.sessionMemory) {
-      logger.warn('[ContextManager] SessionMemory 未初始化,无法迁移消息', LogCategory.SESSION);
+      logger.warn('[ContextManager] SessionMemory 未初始化,无法转存消息', LogCategory.SESSION);
       return;
     }
 
@@ -510,7 +510,7 @@ export class ContextManager {
         }
       }
     } catch (error) {
-      logger.error('[ContextManager] 迁移消息到Memory失败:', error);
+      logger.error('[ContextManager] 转存消息到Memory失败:', error);
     }
   }
 

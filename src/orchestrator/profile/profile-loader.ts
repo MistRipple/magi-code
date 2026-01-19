@@ -25,7 +25,7 @@ import { logger, LogCategory } from '../../logging';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { WorkerType } from '../../types';
+import { CLIType } from '../../types';
 import {
   WorkerProfile,
   CategoriesConfig,
@@ -40,7 +40,7 @@ import {
 import { ProfileStorage } from './profile-storage';
 
 export class ProfileLoader {
-  private profiles: Map<WorkerType, WorkerProfile> = new Map();
+  private profiles: Map<CLIType, WorkerProfile> = new Map();
   private categories: Map<string, CategoryConfig> = new Map();
   private categoriesConfig: CategoriesConfig;
   private loaded: boolean = false;
@@ -54,7 +54,6 @@ export class ProfileLoader {
   private instanceId: number;
 
   constructor(_workspacePath?: string) {
-    // workspacePath 参数保留用于兼容，但不再使用
     this.categoriesConfig = DEFAULT_CATEGORIES_CONFIG;
 
     // 实例跟踪
@@ -116,13 +115,13 @@ export class ProfileLoader {
    */
   private async loadWorkerProfiles(): Promise<void> {
     const userConfigDir = ProfileLoader.USER_CONFIG_DIR;
-    const defaultProfiles: Record<WorkerType, WorkerProfile> = {
+    const defaultProfiles: Record<CLIType, WorkerProfile> = {
       claude: DEFAULT_CLAUDE_PROFILE,
       codex: DEFAULT_CODEX_PROFILE,
       gemini: DEFAULT_GEMINI_PROFILE,
     };
 
-    for (const workerType of ['claude', 'codex', 'gemini'] as WorkerType[]) {
+    for (const workerType of ['claude', 'codex', 'gemini'] as CLIType[]) {
       const defaultProfile = defaultProfiles[workerType];
       let finalProfile = defaultProfile;
 
@@ -254,14 +253,14 @@ export class ProfileLoader {
   /**
    * 获取 Worker 画像
    */
-  getProfile(workerType: WorkerType): WorkerProfile {
+  getProfile(workerType: CLIType): WorkerProfile {
     return this.profiles.get(workerType) ?? DEFAULT_CLAUDE_PROFILE;
   }
 
   /**
    * 获取所有 Worker 画像
    */
-  getAllProfiles(): Map<WorkerType, WorkerProfile> {
+  getAllProfiles(): Map<CLIType, WorkerProfile> {
     return this.profiles;
   }
 

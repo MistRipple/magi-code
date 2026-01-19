@@ -21,7 +21,7 @@ import { SnapshotManager } from '../snapshot-manager';
 import { FileWatcher } from '../utils/file-watcher';
 import { PermissionMatrix } from '../types';
 import {
-  WorkerType,
+  CLIType,
   WorkerState,
   WorkerInfo,
   WorkerEvents,
@@ -41,7 +41,7 @@ import {
 
 /** Worker 配置 */
 export interface WorkerConfig {
-  type: WorkerType;
+  type: CLIType;
   cliFactory: CLIAdapterFactory;
   messageBus?: MessageBus;
   orchestratorId?: string;
@@ -67,7 +67,7 @@ interface PendingQuestion {
  */
 export class WorkerAgent extends EventEmitter {
   readonly id: string;
-  readonly type: WorkerType;
+  readonly type: CLIType;
 
   protected cliFactory: CLIAdapterFactory;
   protected messageBus: MessageBus;

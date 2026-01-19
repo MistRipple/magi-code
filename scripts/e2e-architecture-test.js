@@ -293,7 +293,6 @@ async function testE2E_ConflictToMessage() {
   // 创建 MessageBridge 测试消息流
   const factory = new CLIAdapterFactory({
     cwd: workspaceRoot,
-    timeout: 30000,
     cliPaths: { claude: 'claude', codex: 'codex', gemini: 'gemini' }
   });
 
@@ -563,7 +562,6 @@ async function testE2E_FullIntegration() {
     // 4. 创建 MessageBridge + MessageDeduplicator
     const factory = new CLIAdapterFactory({
       cwd: workspaceRoot,
-      timeout: 30000,
       cliPaths: { claude: 'claude', codex: 'codex', gemini: 'gemini' }
     });
 

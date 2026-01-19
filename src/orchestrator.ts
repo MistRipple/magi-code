@@ -6,7 +6,7 @@
 import { logger, LogCategory } from './logging';
 import { CLIType, Task, SubTask, TaskCategory, WorkerResult, ExecutionMode } from './types';
 import { UnifiedSessionManager } from './session';
-import { TaskManager } from './task-manager';
+import { UnifiedTaskManager } from './task/unified-task-manager';
 import { SnapshotManager } from './snapshot-manager';
 import { CLIDetector } from './cli-detector';
 import { BaseWorker } from './workers/base-worker';
@@ -19,7 +19,7 @@ import { globalEventBus } from './events';
 export interface OrchestratorOptions {
   workspaceRoot: string;
   sessionManager: UnifiedSessionManager;
-  taskManager: TaskManager;
+  taskManager: UnifiedTaskManager;
   snapshotManager: SnapshotManager;
   mode?: ExecutionMode;
   timeout?: number;
@@ -50,13 +50,13 @@ export class Orchestrator {
 
   /** 执行任务 */
   async executeTask(taskId: string): Promise<void> {
-    const task = this.options.taskManager.getTask(taskId);
+    const task = await this.options.taskManager.getTask(taskId);
     if (!task) {
       throw new Error(`Task 不存在: ${taskId}`);
     }
 
     this.isRunning = true;
-    this.options.taskManager.updateTaskStatus(taskId, 'running');
+    await this.options.taskManager.startTask(taskId);
 
     try {
       const statuses = await this.cliDetector.checkAllCLIs();
@@ -70,14 +70,19 @@ export class Orchestrator {
       const cli = this.selectBestCLI(category, availableCLIs);
       const files = this.extractTargetFiles(task.prompt);
 
-      this.options.taskManager.addSubTask(taskId, task.prompt, cli, files);
+      await this.options.taskManager.createSubTask(taskId, {
+        description: task.prompt,
+        assignedWorker: cli,
+        targetFiles: files,
+        prompt: task.prompt,
+      });
 
-      const updatedTask = this.options.taskManager.getTask(taskId);
+      const updatedTask = await this.options.taskManager.getTask(taskId);
       if (updatedTask) {
         await this.executeSubTasks(updatedTask);
       }
 
-      this.options.taskManager.updateTaskStatus(taskId, 'completed');
+      await this.options.taskManager.completeTask(taskId);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       const stack = error instanceof Error ? error.stack : undefined;
@@ -96,7 +101,7 @@ export class Orchestrator {
         }
       });
 
-      this.options.taskManager.updateTaskStatus(taskId, 'failed');
+      await this.options.taskManager.failTask(taskId, msg);
 
       // 清理资源：中断所有正在运行的 Worker
       this.cleanupWorkers();
@@ -213,7 +218,7 @@ export class Orchestrator {
       }
     }
 
-    this.options.taskManager.updateSubTaskStatus(subTask.taskId, subTask.id, 'running');
+    await this.options.taskManager.startSubTask(subTask.taskId, subTask.id);
 
     try {
       const result = await worker.execute({
@@ -221,18 +226,18 @@ export class Orchestrator {
         workingDirectory: this.options.workspaceRoot
       });
 
-      this.options.taskManager.updateSubTaskStatus(
-        subTask.taskId,
-        subTask.id,
-        result.success ? 'completed' : 'failed'
-      );
+      if (result.success) {
+        await this.options.taskManager.completeSubTask(subTask.taskId, subTask.id, result);
+      } else {
+        await this.options.taskManager.failSubTask(subTask.taskId, subTask.id, result.error || 'Unknown error');
+      }
 
       return result;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       logger.error(`[Orchestrator] SubTask ${subTask.id} execution failed:`, msg, LogCategory.ORCHESTRATOR);
 
-      this.options.taskManager.updateSubTaskStatus(subTask.taskId, subTask.id, 'failed');
+      await this.options.taskManager.failSubTask(subTask.taskId, subTask.id, msg);
 
       return {
         cliType: cli,

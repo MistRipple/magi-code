@@ -32,7 +32,7 @@ import { VerificationRunner, VerificationResult, VerificationConfig } from './ve
 import { ContextManager, ContextCompressor } from '../context';
 import { SnapshotManager } from '../snapshot-manager';
 import { RiskPolicy, RiskAssessment } from './risk-policy';
-import { PolicyEngine, policyEngine, ConflictDetectionResult } from './policy-engine';
+import { PolicyEngine, ConflictDetectionResult } from './policy-engine';
 import { UnifiedTaskManager } from '../task/unified-task-manager';
 import { SessionManagerTaskRepository } from '../task/session-manager-task-repository';
 import { UnifiedSessionManager } from '../session';
@@ -41,7 +41,7 @@ import { PlanTodoManager } from './plan-todo';
 import { ExecutionStateManager, ExecutionStateStatus } from './execution-state';
 import { IntentGate, IntentHandlerMode, IntentDecision } from './intent-gate';
 import {
-  WorkerType,
+  CLIType,
   OrchestratorState,
   OrchestratorConfig,
   OrchestratorEvents,
@@ -154,7 +154,7 @@ type ReviewDecisionStatus = 'passed' | 'rejected' | 'skipped';
 
 interface ReviewDecision {
   status: ReviewDecisionStatus;
-  reviewer?: WorkerType;
+  reviewer?: CLIType;
   issues?: string[];
   summary?: string;
   reason?: string;
@@ -175,7 +175,7 @@ interface IntegrationIssue {
   detail?: string;
   area?: string;
   targetFiles?: string[];
-  suggestedWorker?: WorkerType;
+  suggestedWorker?: CLIType;
   fixPrompt?: string;
 }
 
@@ -211,6 +211,7 @@ export class OrchestratorAgent extends EventEmitter {
   private snapshotManager: SnapshotManager | null = null;
   private sessionManager: UnifiedSessionManager | null = null;
   private unifiedTaskManager: UnifiedTaskManager | null = null;
+  private unifiedTaskManagerSessionId: string | null = null;
   private subTaskIdToTaskIdMap: Map<string, string> = new Map();
   private recoveryHandler: RecoveryHandler | null = null;
   private planStorage: PlanStorage | null = null;
@@ -392,6 +393,20 @@ export class OrchestratorAgent extends EventEmitter {
   /** 设置 Worker 疑问回调 */
   setWorkerQuestionCallback(callback: WorkerQuestionCallback): void {
     this.workerQuestionCallback = callback;
+  }
+
+  /** 注入统一任务管理器（按会话） */
+  setTaskManager(taskManager: UnifiedTaskManager, sessionId: string): void {
+    this.unifiedTaskManager = taskManager;
+    this.unifiedTaskManagerSessionId = sessionId;
+    this.workerPool.setTaskManager(taskManager);
+    if (this.snapshotManager && this.strategyConfig.enableRecovery) {
+      this.recoveryHandler = new RecoveryHandler(
+        this.cliFactory,
+        this.snapshotManager,
+        taskManager
+      );
+    }
   }
 
   /** 设置执行计划确认策略 */
@@ -1297,10 +1312,14 @@ ${result.additionalInfo ? `\n## 额外信息\n${result.additionalInfo}` : ''}`;
       this.contextSessionId = sessionId;
 
       // 初始化 UnifiedTaskManager（替代 TaskStateManager）
-      if (this.workspaceRoot && this.sessionManager) {
+      if (this.unifiedTaskManager && this.unifiedTaskManagerSessionId === sessionId) {
+        this.workerPool.setTaskManager(this.unifiedTaskManager);
+      } else if (this.workspaceRoot && this.sessionManager) {
         const taskRepository = new SessionManagerTaskRepository(this.sessionManager, sessionId);
         this.unifiedTaskManager = new UnifiedTaskManager(sessionId, taskRepository);
+        this.unifiedTaskManagerSessionId = sessionId;
         await this.unifiedTaskManager.initialize();
+        this.workerPool.setTaskManager(this.unifiedTaskManager);
 
         // 初始化 RecoveryHandler（使用 UnifiedTaskManager）
         if (this.snapshotManager && this.strategyConfig.enableRecovery) {
@@ -1768,7 +1787,7 @@ ${userPrompt}
       return plan;
     }
 
-    const availableWorkers: WorkerType[] = ['claude', 'codex', 'gemini'];
+    const availableWorkers: CLIType[] = ['claude', 'codex', 'gemini'];
     const projectContext = this.contextManager?.getContext() || '';
     const analysisPrompt = buildOrchestratorAnalysisPrompt(userPrompt, availableWorkers, projectContext || undefined);
 
@@ -1847,7 +1866,7 @@ ${userPrompt}
   private async repairAnalysisToPlan(
     rawContent: string,
     userPrompt: string,
-    availableWorkers: WorkerType[],
+    availableWorkers: CLIType[],
     projectContext?: string
   ): Promise<ExecutionPlan | null> {
     const preview = rawContent.trim().slice(0, 4000);
@@ -1859,6 +1878,8 @@ ${userPrompt}
     const repairPrompt = [
       '你刚才的输出不是合法 JSON。',
       '请将以下内容修复为**严格 JSON**，仅输出 JSON，不要代码块或解释文本。',
+      '禁止输出任何额外文字（包括说明、致歉、引导语、计划模式提示）。',
+      '禁止输出 tool_use/tool_call 或任何工具调用格式。',
       '',
       '## 用户需求',
       userPrompt,
@@ -2139,7 +2160,7 @@ ${userPrompt}
       return { batchTasks, batchedIds };
     }
 
-    const groups = new Map<WorkerType, SubTask[]>();
+    const groups = new Map<CLIType, SubTask[]>();
     for (const task of subTasks) {
       if (task.kind && task.kind !== 'implementation') continue;
       if (task.dependencies && task.dependencies.length > 0) continue;
@@ -2736,7 +2757,7 @@ ${userPrompt}
     return analysis.category === 'backend';
   }
 
-  private pickPrimaryWorker(a: SubTask, b: SubTask): WorkerType {
+  private pickPrimaryWorker(a: SubTask, b: SubTask): CLIType {
     const selection = this.cliSelector.selectByDescription(
       [a.description, a.prompt, b.description, b.prompt].filter(Boolean).join('\n')
     );
@@ -2861,27 +2882,30 @@ ${userPrompt}
     const candidates: string[] = [];
     if (!content) return candidates;
 
-    const fenced = content.match(/```json\s*([\s\S]*?)\s*```/i);
-    if (fenced?.[1]) {
-      candidates.push(fenced[1].trim());
+    const jsonFenceRegex = /```json\s*([\s\S]*?)\s*```/gi;
+    let match: RegExpExecArray | null;
+    while ((match = jsonFenceRegex.exec(content)) !== null) {
+      if (match[1]) {
+        candidates.push(match[1].trim());
+      }
     }
 
-    const anyFence = content.match(/```\s*([\s\S]*?)\s*```/);
-    if (anyFence?.[1]) {
-      const trimmed = anyFence[1].trim();
+    const anyFenceRegex = /```\s*([\s\S]*?)\s*```/g;
+    while ((match = anyFenceRegex.exec(content)) !== null) {
+      const trimmed = (match[1] || '').trim();
       if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
         candidates.push(trimmed);
       }
     }
 
-    const objectJson = this.extractBalancedJson(content, '{', '}');
-    if (objectJson) {
-      candidates.push(objectJson);
+    const objectJsons = this.extractAllBalancedJson(content, '{', '}');
+    if (objectJsons.length > 0) {
+      candidates.push(...objectJsons);
     }
 
-    const arrayJson = this.extractBalancedJson(content, '[', ']');
-    if (arrayJson) {
-      candidates.push(arrayJson);
+    const arrayJsons = this.extractAllBalancedJson(content, '[', ']');
+    if (arrayJsons.length > 0) {
+      candidates.push(...arrayJsons);
     }
 
     if (candidates.length === 0) {
@@ -2898,6 +2922,32 @@ ${userPrompt}
     const start = content.indexOf(openChar);
     if (start === -1) return null;
 
+    const found = this.extractBalancedJsonFromIndex(content, start, openChar, closeChar);
+    return found ? found.json : null;
+
+    return null;
+  }
+
+  private extractAllBalancedJson(content: string, openChar: '{' | '[', closeChar: '}' | ']'): string[] {
+    const results: string[] = [];
+    let index = content.indexOf(openChar);
+    while (index !== -1) {
+      const found = this.extractBalancedJsonFromIndex(content, index, openChar, closeChar);
+      if (!found) {
+        break;
+      }
+      results.push(found.json);
+      index = content.indexOf(openChar, found.end + 1);
+    }
+    return results;
+  }
+
+  private extractBalancedJsonFromIndex(
+    content: string,
+    start: number,
+    openChar: '{' | '[',
+    closeChar: '}' | ']'
+  ): { json: string; end: number } | null {
     let depth = 0;
     let inString = false;
     let escaping = false;
@@ -2926,7 +2976,7 @@ ${userPrompt}
       if (ch === closeChar) depth -= 1;
 
       if (depth === 0) {
-        return content.slice(start, i + 1).trim();
+        return { json: content.slice(start, i + 1).trim(), end: i };
       }
     }
 
@@ -3333,7 +3383,7 @@ ${userPrompt}
 
     const fileToTasks = new Map<string, string[]>();
     // 构建文件到 Worker/SubTask 的映射，记录每个文件由哪个子任务负责
-    const fileToInfo = new Map<string, { worker: WorkerType; subTaskId: string }>();
+    const fileToInfo = new Map<string, { worker: CLIType; subTaskId: string }>();
     for (const subTask of subTasks) {
       if (subTask.targetFiles) {
         const worker = subTask.assignedWorker || 'claude';
@@ -3595,7 +3645,7 @@ ${userPrompt}
     }
   }
 
-  private pickWorkerForIssue(issue: IntegrationIssue): WorkerType {
+  private pickWorkerForIssue(issue: IntegrationIssue): CLIType {
     if (issue.suggestedWorker) {
       return issue.suggestedWorker;
     }
@@ -4013,7 +4063,7 @@ ${userPrompt}
     return fileHit;
   }
 
-  private async waitForCliReady(worker: WorkerType, timeoutMs: number = 60000): Promise<boolean> {
+  private async waitForCliReady(worker: CLIType, timeoutMs: number = 60000): Promise<boolean> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       const adapter = this.cliFactory.getAdapter(worker);
@@ -4025,8 +4075,8 @@ ${userPrompt}
     return false;
   }
 
-  private selectPeerReviewer(subTask: SubTask): WorkerType {
-    const candidates: WorkerType[] = ['claude', 'codex', 'gemini'];
+  private selectPeerReviewer(subTask: SubTask): CLIType {
+    const candidates: CLIType[] = ['claude', 'codex', 'gemini'];
     const filtered = candidates.filter(cli => cli !== subTask.assignedWorker);
     return filtered[0] ?? subTask.assignedWorker;
   }

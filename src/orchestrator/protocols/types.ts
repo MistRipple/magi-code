@@ -6,10 +6,10 @@
  * - Worker Agents：专职执行，向编排者汇报进度和结果
  */
 
-import { CLIType, SubTask, WorkerType, PermissionMatrix, StrategyConfig } from '../../types';
+import { CLIType, SubTask, PermissionMatrix, StrategyConfig } from '../../types';
 
-// 重新导出统一类型，保持向后兼容
-export { SubTask, WorkerType };
+// 重新导出统一类型
+export { SubTask, CLIType };
 
 // ============================================================================
 // Worker 相关类型
@@ -21,7 +21,7 @@ export type WorkerState = 'idle' | 'executing' | 'completed' | 'failed' | 'cance
 /** Worker 信息 */
 export interface WorkerInfo {
   id: string;
-  type: WorkerType;
+  type: CLIType;
   state: WorkerState;
   currentTaskId?: string;
   lastActivity?: number;
@@ -57,7 +57,7 @@ export interface ExecutionPlan {
 /** 执行结果 */
 export interface ExecutionResult {
   workerId: string;
-  workerType: WorkerType;
+  workerType: CLIType;
   taskId: string;
   subTaskId: string;
   dispatchId?: string;
@@ -292,13 +292,13 @@ export interface OrchestratorConfig {
   /** 计划评审配置 */
   planReview?: {
     enabled?: boolean;
-    reviewer?: WorkerType;
+    reviewer?: CLIType;
   };
   /** 功能集成配置 */
   integration?: {
     enabled?: boolean;
     maxRounds?: number;
-    worker?: WorkerType;
+    worker?: CLIType;
   };
   /** 权限矩阵 */
   permissions?: PermissionMatrix;
@@ -359,7 +359,7 @@ export interface OrchestratorUIMessage {
   metadata?: {
     phase?: OrchestratorState;
     workerId?: string;
-    workerType?: WorkerType;
+    workerType?: CLIType;
     subTaskId?: string;
     dispatchId?: string;
     progress?: number;

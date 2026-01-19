@@ -651,11 +651,3 @@ export class PolicyEngine extends EventEmitter {
     this.executionHistory = [];
   }
 }
-
-/**
- * 🗑️ 已废弃: 全局单例
- * 现在推荐在各个使用处创建实例并注入 ProfileLoader
- *
- * @deprecated 使用 `new PolicyEngine(profileLoader)` 替代
- */
-export const policyEngine = new PolicyEngine();

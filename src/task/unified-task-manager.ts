@@ -545,6 +545,22 @@ export class UnifiedTaskManager extends EventEmitter {
   }
 
   /**
+   * 更新 SubTask（通用更新方法）
+   */
+  async updateSubTask(taskId: string, updates: Partial<SubTask> & { id: string }): Promise<void> {
+    const task = await this.getTask(taskId);
+    if (!task) throw new Error(`Task not found: ${taskId}`);
+
+    const subTask = task.subTasks.find(st => st.id === updates.id);
+    if (!subTask) throw new Error(`SubTask not found: ${updates.id}`);
+
+    Object.assign(subTask, updates);
+
+    // 持久化
+    await this.repository.saveTask(task);
+  }
+
+  /**
    * 获取下一个待执行的 SubTask
    */
   getNextPendingSubTask(): { task: Task; subTask: SubTask } | null {

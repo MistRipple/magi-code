@@ -40,8 +40,9 @@ const { CLIAdapterFactory } = require('../out/cli/adapter-factory');
 const { ClaudeAdapter } = require('../out/cli/adapters/claude');
 const { CodexAdapter } = require('../out/cli/adapters/codex');
 const { GeminiAdapter } = require('../out/cli/adapters/gemini');
-const { TaskManager } = require('../out/task-manager');
-const { SessionManager } = require('../out/session-manager');
+const { UnifiedTaskManager } = require('../out/task/unified-task-manager');
+const { SessionManagerTaskRepository } = require('../out/task/session-manager-task-repository');
+const { UnifiedSessionManager } = require('../out/session');
 const { SnapshotManager } = require('../out/snapshot-manager');
 const { IntelligentOrchestrator } = require('../out/orchestrator/intelligent-orchestrator');
 const { globalEventBus } = require('../out/events');
@@ -117,16 +118,20 @@ async function testAdapterFactory() {
 async function testOrchestratorInit(factory) {
   logSection('3. 智能编排器初始化');
   
-  const sessionManager = new SessionManager(workspaceRoot);
-  const taskManager = new TaskManager(sessionManager);
+  const sessionManager = new UnifiedSessionManager(workspaceRoot);
+  const sessionId = sessionManager.getOrCreateCurrentSession().id;
+  const repository = new SessionManagerTaskRepository(sessionManager, sessionId);
+  const taskManager = new UnifiedTaskManager(sessionId, repository);
+  await taskManager.initialize();
   const snapshotManager = new SnapshotManager(sessionManager, workspaceRoot);
   
   const orchestrator = new IntelligentOrchestrator(
     factory,
-    taskManager,
+    sessionManager,
     snapshotManager,
     workspaceRoot
   );
+  orchestrator.setTaskManager(taskManager, sessionId);
   
   logResult('编排器创建', !!orchestrator);
   logResult('初始状态', orchestrator.phase === 'idle', `phase=${orchestrator.phase}`);

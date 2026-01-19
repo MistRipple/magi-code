@@ -136,8 +136,6 @@ export interface AdapterConfig {
   idleTimeout?: number;
   /** 最大执行超时时间（毫秒） */
   maxTimeout?: number;
-  /** 超时时间（毫秒，兼容字段，等同于最大超时） */
-  timeout?: number;
 }
 
 export interface AdapterMessageMeta {

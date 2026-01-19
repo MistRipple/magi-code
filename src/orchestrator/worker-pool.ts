@@ -23,7 +23,7 @@ import { SnapshotManager } from '../snapshot-manager';
 import { PermissionMatrix } from '../types';
 import { ProfileLoader, WorkerProfile } from './profile';
 import {
-  WorkerType,
+  CLIType,
   WorkerState,
   WorkerInfo,
   SubTask,
@@ -102,7 +102,7 @@ interface QueueItem {
 /** 任务执行状态 */
 export interface TaskExecutionState {
   subTaskId: string;
-  workerType: WorkerType;
+  workerType: CLIType;
   status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
   retries: number;
   startTime?: number;
@@ -113,7 +113,7 @@ export interface TaskExecutionState {
 /** Worker 状态变更事件 */
 export interface WorkerStateChangeEvent {
   workerId: string;
-  workerType: WorkerType;
+  workerType: CLIType;
   oldState: WorkerState;
   newState: WorkerState;
 }
@@ -125,7 +125,7 @@ export interface WorkerStateChangeEvent {
  * 支持 CLI 降级和故障转移
  */
 export class WorkerPool extends EventEmitter {
-  private workers: Map<WorkerType, WorkerAgent> = new Map();
+  private workers: Map<CLIType, WorkerAgent> = new Map();
   private cliFactory: CLIAdapterFactory;
   private messageBus: MessageBus;
   private orchestratorId: string;
@@ -135,8 +135,8 @@ export class WorkerPool extends EventEmitter {
   private schedulingConfig: SchedulingConfig;
   private executionStates: Map<string, TaskExecutionState> = new Map();
   private runningCount: number = 0;
-  private taskQueues: Map<WorkerType, QueueItem[]> = new Map();
-  private queueProcessing: Set<WorkerType> = new Set();
+  private taskQueues: Map<CLIType, QueueItem[]> = new Map();
+  private queueProcessing: Set<CLIType> = new Set();
   private queueCounter = 0;
   private fileLockManager = new FileLockManager();
   private cancelGeneration = 0;
@@ -231,7 +231,7 @@ export class WorkerPool extends EventEmitter {
     // 先加载画像配置
     await this.loadProfiles();
 
-    const workerTypes: WorkerType[] = ['claude', 'codex', 'gemini'];
+    const workerTypes: CLIType[] = ['claude', 'codex', 'gemini'];
 
     for (const type of workerTypes) {
       await this.createWorker(type);
@@ -243,7 +243,7 @@ export class WorkerPool extends EventEmitter {
   /**
    * 创建单个 Worker
    */
-  private async createWorker(type: WorkerType): Promise<WorkerAgent> {
+  private async createWorker(type: CLIType): Promise<WorkerAgent> {
     if (this.workers.has(type)) {
       return this.workers.get(type)!;
     }
@@ -317,14 +317,14 @@ export class WorkerPool extends EventEmitter {
   /**
    * 获取指定类型的 Worker
    */
-  getWorker(type: WorkerType): WorkerAgent | undefined {
+  getWorker(type: CLIType): WorkerAgent | undefined {
     return this.workers.get(type);
   }
 
   /**
    * 获取或创建 Worker
    */
-  async getOrCreateWorker(type: WorkerType): Promise<WorkerAgent> {
+  async getOrCreateWorker(type: CLIType): Promise<WorkerAgent> {
     const existing = this.workers.get(type);
     if (existing) {
       return existing;
@@ -356,7 +356,7 @@ export class WorkerPool extends EventEmitter {
   /**
    * 获取指定类型的空闲 Worker
    */
-  getIdleWorker(type: WorkerType): WorkerAgent | undefined {
+  getIdleWorker(type: CLIType): WorkerAgent | undefined {
     const worker = this.workers.get(type);
     return worker?.state === 'idle' ? worker : undefined;
   }
@@ -364,7 +364,7 @@ export class WorkerPool extends EventEmitter {
   /**
    * 检查指定类型的 Worker 是否空闲
    */
-  isWorkerIdle(type: WorkerType): boolean {
+  isWorkerIdle(type: CLIType): boolean {
     const worker = this.workers.get(type);
     return (worker?.state === 'idle') || false;
   }
@@ -373,7 +373,7 @@ export class WorkerPool extends EventEmitter {
    * 分发任务给指定 Worker
    */
   async dispatchTask(
-    type: WorkerType,
+    type: CLIType,
     taskId: string,
     subTask: SubTask,
     context?: string,
@@ -382,7 +382,7 @@ export class WorkerPool extends EventEmitter {
     return this.enqueueTask(type, taskId, subTask, context, options);
   }
 
-  private getQueue(type: WorkerType): QueueItem[] {
+  private getQueue(type: CLIType): QueueItem[] {
     if (!this.taskQueues.has(type)) {
       this.taskQueues.set(type, []);
     }
@@ -390,7 +390,7 @@ export class WorkerPool extends EventEmitter {
   }
 
   private async enqueueTask(
-    type: WorkerType,
+    type: CLIType,
     taskId: string,
     subTask: SubTask,
     context?: string,
@@ -460,7 +460,7 @@ export class WorkerPool extends EventEmitter {
       .map(part => `__domain:${part}`);
   }
 
-  private async processQueue(type: WorkerType): Promise<void> {
+  private async processQueue(type: CLIType): Promise<void> {
     if (this.queueProcessing.has(type)) {
       return;
     }
@@ -562,7 +562,7 @@ export class WorkerPool extends EventEmitter {
    * 支持 CLI 降级：当原 CLI 失败时，自动尝试其他可用 CLI
    */
   async dispatchTaskWithRetry(
-    type: WorkerType,
+    type: CLIType,
     taskId: string,
     subTask: SubTask,
     context?: string,
@@ -579,12 +579,12 @@ export class WorkerPool extends EventEmitter {
 
     // Delegate to UnifiedTaskManager if available
     if (this.taskManager) {
-      await this.taskManager.updateSubTaskStatus(taskId, subTask.id, 'running');
+      await this.taskManager.startSubTask(taskId, subTask.id);
     }
 
     let lastError: Error | null = null;
-    let currentCli: WorkerType = type;
-    const triedClis: WorkerType[] = [];
+    let currentCli: CLIType = type;
+    const triedClis: CLIType[] = [];
 
     for (let attempt = 0; attempt <= this.schedulingConfig.maxRetries; attempt++) {
       state.retries = attempt;
@@ -725,7 +725,7 @@ export class WorkerPool extends EventEmitter {
    * 带超时的任务执行
    */
   private async executeWithTimeout(
-    type: WorkerType,
+    type: CLIType,
     taskId: string,
     subTask: SubTask,
     context?: string,
@@ -811,7 +811,7 @@ export class WorkerPool extends EventEmitter {
    * 记录执行统计
    */
   private recordExecution(
-    cli: WorkerType,
+    cli: CLIType,
     taskId: string,
     subTaskId: string,
     success: boolean,
@@ -840,14 +840,14 @@ export class WorkerPool extends EventEmitter {
    * @param triedClis 已尝试过的 CLI 列表
    * @returns 降级建议，如果没有可用的降级选项则返回 null
    */
-  private tryFallback(failedCli: WorkerType, triedClis: WorkerType[]): FallbackSuggestion | null {
+  private tryFallback(failedCli: CLIType, triedClis: CLIType[]): FallbackSuggestion | null {
     if (!this.enableFallback) {
       return null;
     }
 
     const statuses = this.cliFactory.getAllStatus();
     const connected = statuses.filter(status => status.connected).map(status => status.type);
-    const availableClis = connected.length > 0 ? connected : (['claude', 'codex', 'gemini'] as WorkerType[]);
+    const availableClis = connected.length > 0 ? connected : (['claude', 'codex', 'gemini'] as CLIType[]);
 
     // 如果有执行统计，使用智能降级
     if (this.executionStats) {
@@ -869,14 +869,6 @@ export class WorkerPool extends EventEmitter {
       reason: `${failedCli} 执行失败，尝试使用 ${suggestedCli}`,
       confidence: 0.5,
     };
-  }
-
-  /**
-   * 获取任务执行状态（旧 API，保留用于向后兼容）
-   * 注意：此方法仅返回本地状态，不查询 UnifiedTaskManager
-   */
-  getExecutionState(subTaskId: string): TaskExecutionState | undefined {
-    return this.executionStates.get(subTaskId);
   }
 
   /**
@@ -918,7 +910,7 @@ export class WorkerPool extends EventEmitter {
    * 通过消息总线分发任务（异步）
    */
   dispatchTaskAsync(
-    type: WorkerType,
+    type: CLIType,
     taskId: string,
     subTask: SubTask,
     context?: string
@@ -941,7 +933,7 @@ export class WorkerPool extends EventEmitter {
   /**
    * 取消指定 Worker 的任务
    */
-  async cancelWorkerTask(type: WorkerType): Promise<void> {
+  async cancelWorkerTask(type: CLIType): Promise<void> {
     const worker = this.workers.get(type);
     if (worker) {
       await worker.cancel();

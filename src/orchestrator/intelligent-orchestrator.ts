@@ -13,10 +13,12 @@ import {
   InteractionModeConfig,
   PermissionMatrix,
   StrategyConfig,
+  TaskStatus,
 } from '../types';
 import { logger, LogCategory } from '../logging';
 import { CLIAdapterFactory } from '../cli/adapter-factory';
-import { TaskManager } from '../task-manager';
+import { UnifiedTaskManager } from '../task/unified-task-manager';
+import { SessionManagerTaskRepository } from '../task/session-manager-task-repository';
 import { UnifiedSessionManager } from '../session';
 import { SnapshotManager } from '../snapshot-manager';
 import { globalEventBus } from '../events';
@@ -32,11 +34,11 @@ import {
 } from './protocols/types';
 import { formatPlanForUser } from './prompts/orchestrator-prompts';
 
-// 重新导出类型以保持向后兼容
+// 重新导出类型，供外部引用
 export type { ExecutionPlan, ExecutionResult, SubTask };
 export { ConfirmationCallback };
 
-/** 子任务计划（向后兼容） */
+/** 子任务计划 */
 export interface SubTaskPlan {
   id: string;
   description: string;
@@ -112,7 +114,8 @@ const DEFAULT_CONFIG: OrchestratorConfig = {
  */
 export class IntelligentOrchestrator {
   private cliFactory: CLIAdapterFactory;
-  private taskManager: TaskManager;
+  private taskManager: UnifiedTaskManager | null = null;
+  private taskManagerSessionId: string | null = null;
   private sessionManager: UnifiedSessionManager;
   private snapshotManager: SnapshotManager;
   private config: OrchestratorConfig;
@@ -148,21 +151,18 @@ export class IntelligentOrchestrator {
 
   constructor(
     cliFactory: CLIAdapterFactory,
-    taskManager: TaskManager,
+    sessionManager: UnifiedSessionManager,
     snapshotManager: SnapshotManager,
     workspaceRoot: string,
     config?: Partial<OrchestratorConfig>
   ) {
     this.cliFactory = cliFactory;
-    this.taskManager = taskManager;
+    this.sessionManager = sessionManager;
     this.snapshotManager = snapshotManager;
     this.workspaceRoot = workspaceRoot;
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.strategyConfig = this.resolveStrategyConfig();
     this.permissions = this.resolvePermissions();
-
-    // 从 TaskManager 获取 SessionManager
-    this.sessionManager = (taskManager as any).sessionManager;
 
     // 创建独立编排者 Agent，传递 workspaceRoot 和 snapshotManager 以支持验证和回滚功能
     this.orchestratorAgent = new OrchestratorAgent(
@@ -197,14 +197,6 @@ export class IntelligentOrchestrator {
       });
     });
 
-    this.orchestratorAgent.on('uiMessage', (message) => {
-      if (message.type === 'worker_output') {
-        globalEventBus.emitEvent('cli:output', {
-          taskId: this.currentTaskId || undefined,
-          data: { output: message.content, cliType: message.metadata?.workerType, source: 'worker' },
-        });
-      }
-    });
   }
 
   /** 设置交互模式 */
@@ -243,7 +235,7 @@ export class IntelligentOrchestrator {
   }
 
   /** 更新 CLI 技能配置 */
-  /** 设置恢复确认回调（向后兼容） */
+  /** 设置恢复确认回调 */
   setRecoveryConfirmationCallback(_callback: RecoveryConfirmationCallback): void {
     this.recoveryConfirmationCallback = _callback;
     this.syncRecoveryConfirmationCallback();
@@ -259,12 +251,83 @@ export class IntelligentOrchestrator {
     return this.orchestratorAgent.context?.plan || null;
   }
 
-  /** 是否正在运行（向后兼容） */
+  /** 注入统一任务管理器（按会话） */
+  setTaskManager(taskManager: UnifiedTaskManager, sessionId: string): void {
+    this.taskManager = taskManager;
+    this.taskManagerSessionId = sessionId;
+    this.orchestratorAgent.setTaskManager(taskManager, sessionId);
+  }
+
+  private resolveSessionId(sessionId?: string): string {
+    const resolved = sessionId || this.sessionManager.getCurrentSession()?.id || '';
+    if (!resolved) {
+      throw new Error('未找到有效的会话 ID');
+    }
+    return resolved;
+  }
+
+  private async getTaskManager(sessionId?: string): Promise<UnifiedTaskManager> {
+    const resolvedSessionId = this.resolveSessionId(sessionId);
+    if (this.taskManager && this.taskManagerSessionId === resolvedSessionId) {
+      return this.taskManager;
+    }
+    const repository = new SessionManagerTaskRepository(this.sessionManager, resolvedSessionId);
+    const manager = new UnifiedTaskManager(resolvedSessionId, repository);
+    await manager.initialize();
+    this.setTaskManager(manager, resolvedSessionId);
+    return manager;
+  }
+
+  private async updateTaskStatus(
+    taskId: string,
+    status: TaskStatus,
+    sessionId?: string,
+    error?: string
+  ): Promise<void> {
+    const taskManager = await this.getTaskManager(sessionId);
+    const task = await taskManager.getTask(taskId);
+    if (!task) {
+      return;
+    }
+
+    if (status === 'running') {
+      if (task.status !== 'running') {
+        await taskManager.startTask(taskId);
+      }
+      return;
+    }
+
+    if (status === 'completed') {
+      await taskManager.completeTask(taskId);
+      return;
+    }
+
+    if (status === 'failed') {
+      await taskManager.failTask(taskId, error);
+      return;
+    }
+
+    if (status === 'cancelled') {
+      await taskManager.cancelTask(taskId);
+      return;
+    }
+
+    if (status === 'pending') {
+      if (task.status !== 'pending') {
+        await taskManager.updateTask(taskId, { status: 'pending' });
+      }
+      return;
+    }
+
+    await taskManager.updateTask(taskId, { status });
+  }
+
+  /** 是否正在运行 */
   get running(): boolean {
     return this.isRunning;
   }
 
-  /** 中断当前任务（向后兼容） */
+  /** 中断当前任务 */
   async interrupt(): Promise<void> {
     await this.cancel();
   }
@@ -299,13 +362,14 @@ export class IntelligentOrchestrator {
 
     this.isRunning = true;
     if (!taskId) {
-      const task = this.taskManager.createTask(userPrompt);
+      const taskManager = await this.getTaskManager(sessionId);
+      const task = await taskManager.createTask({ prompt: userPrompt });
       taskId = task.id;
     }
     this.currentTaskId = taskId;
     this.abortController = new AbortController();
 
-    this.taskManager.updateTaskStatus(taskId, 'running');
+    await this.updateTaskStatus(taskId, 'running', sessionId);
     globalEventBus.emitEvent('task:started', { taskId, data: { isRunning: true } });
     this.startStatusUpdates(taskId);
 
@@ -323,12 +387,12 @@ export class IntelligentOrchestrator {
       const result = await this.orchestratorAgent.execute(userPrompt, taskId, sessionId);
 
       if (this.abortController?.signal.aborted) {
-        this.taskManager.updateTaskStatus(taskId, 'cancelled');
+        await this.updateTaskStatus(taskId, 'cancelled', sessionId);
         globalEventBus.emitEvent('task:cancelled', { taskId, data: { isRunning: false } });
         return '任务已被取消。';
       }
 
-      this.taskManager.updateTaskStatus(taskId, 'completed');
+      await this.updateTaskStatus(taskId, 'completed', sessionId);
       globalEventBus.emitEvent('task:completed', { taskId, data: { isRunning: false } });
 
       return result;
@@ -337,7 +401,7 @@ export class IntelligentOrchestrator {
       const errorMsg = error instanceof Error ? error.message : String(error);
 
       if (this.abortController?.signal.aborted) {
-        this.taskManager.updateTaskStatus(taskId, 'cancelled');
+        await this.updateTaskStatus(taskId, 'cancelled', sessionId);
         globalEventBus.emitEvent('task:cancelled', { taskId, data: { isRunning: false } });
         return '任务已被取消。';
       }
@@ -347,7 +411,7 @@ export class IntelligentOrchestrator {
         logger.info(`[IntelligentOrchestrator] 自动回滚 ${count} 个变更`, undefined, LogCategory.ORCHESTRATOR);
       }
 
-      this.taskManager.updateTaskStatus(taskId, 'failed');
+      await this.updateTaskStatus(taskId, 'failed', sessionId, errorMsg);
       globalEventBus.emitEvent('task:failed', { taskId, data: { error: errorMsg, isRunning: false } });
       throw error;
 
@@ -367,23 +431,24 @@ export class IntelligentOrchestrator {
 
     this.isRunning = true;
     if (!taskId) {
-      const task = this.taskManager.createTask(userPrompt);
+      const taskManager = await this.getTaskManager(sessionId);
+      const task = await taskManager.createTask({ prompt: userPrompt });
       taskId = task.id;
     }
     this.currentTaskId = taskId;
     this.abortController = new AbortController();
 
-    this.taskManager.updateTaskStatus(taskId, 'running');
+    await this.updateTaskStatus(taskId, 'running', sessionId);
     globalEventBus.emitEvent('task:started', { taskId, data: { isRunning: true } });
     this.startStatusUpdates(taskId);
 
     try {
       const record = await this.orchestratorAgent.createPlan(userPrompt, taskId, sessionId);
-      this.taskManager.updateTaskStatus(taskId, 'pending');
+      await this.updateTaskStatus(taskId, 'pending', sessionId);
       return record;
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.taskManager.updateTaskStatus(taskId, 'failed');
+      await this.updateTaskStatus(taskId, 'failed', sessionId, errorMsg);
       globalEventBus.emitEvent('task:failed', { taskId, data: { error: errorMsg, isRunning: false } });
       throw error;
     } finally {
@@ -405,7 +470,7 @@ export class IntelligentOrchestrator {
     this.currentTaskId = finalTaskId;
     this.abortController = new AbortController();
 
-    this.taskManager.updateTaskStatus(finalTaskId, 'running');
+    await this.updateTaskStatus(finalTaskId, 'running', sessionId || record.sessionId);
     globalEventBus.emitEvent('task:started', { taskId: finalTaskId, data: { isRunning: true } });
     this.startStatusUpdates(finalTaskId);
 
@@ -417,17 +482,17 @@ export class IntelligentOrchestrator {
         record.prompt
       );
       if (this.abortController?.signal.aborted) {
-        this.taskManager.updateTaskStatus(finalTaskId, 'cancelled');
+        await this.updateTaskStatus(finalTaskId, 'cancelled', sessionId || record.sessionId);
         globalEventBus.emitEvent('task:cancelled', { taskId: finalTaskId, data: { isRunning: false } });
         return '任务已被取消。';
       }
 
-      this.taskManager.updateTaskStatus(finalTaskId, 'completed');
+      await this.updateTaskStatus(finalTaskId, 'completed', sessionId || record.sessionId);
       globalEventBus.emitEvent('task:completed', { taskId: finalTaskId, data: { isRunning: false } });
       return result;
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.taskManager.updateTaskStatus(finalTaskId, 'failed');
+      await this.updateTaskStatus(finalTaskId, 'failed', sessionId || record.sessionId, errorMsg);
       globalEventBus.emitEvent('task:failed', { taskId: finalTaskId, data: { error: errorMsg, isRunning: false } });
       throw error;
     } finally {
@@ -483,7 +548,7 @@ export class IntelligentOrchestrator {
       throw new Error(response.error);
     }
 
-    this.taskManager.updateTaskStatus(taskId, 'completed');
+    await this.updateTaskStatus(taskId, 'completed', sessionId);
     globalEventBus.emitEvent('task:completed', { taskId, data: { isRunning: false } });
 
     const content = response.content || '';
@@ -558,7 +623,7 @@ export class IntelligentOrchestrator {
     this.stopStatusUpdates();
 
     if (this.currentTaskId) {
-      this.taskManager.updateTaskStatus(this.currentTaskId, 'cancelled');
+      await this.updateTaskStatus(this.currentTaskId, 'cancelled');
       globalEventBus.emitEvent('task:cancelled', { taskId: this.currentTaskId, data: { isRunning: false } });
     }
 

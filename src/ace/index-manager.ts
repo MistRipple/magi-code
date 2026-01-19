@@ -1,6 +1,6 @@
 /**
  * ACE 索引管理器 - 管理文件收集、索引和搜索操作
- * 基于 ace-tool 的实现，与其索引格式完全兼容
+ * 基于 ace-tool 的实现，遵循其索引格式
  */
 
 import { logger, LogCategory } from '../logging';
@@ -80,7 +80,7 @@ function isBinaryContent(content: string): boolean {
   return nonPrintable.length > content.length * 0.1;
 }
 
-/** 获取索引文件路径（与 ace-tool 兼容） */
+/** 获取索引文件路径（遵循 ace-tool 目录结构） */
 function getIndexFilePath(projectRoot: string): string {
   return path.join(projectRoot, '.ace-tool', 'index.json');
 }

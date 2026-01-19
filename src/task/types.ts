@@ -3,7 +3,7 @@
  *
  * 重构说明：
  * - 统一 TaskStatus 和 SubTaskStatus 定义
- * - 删除所有向后兼容字段（assignedCli, WorkerType）
+ * - 移除历史字段（assignedCli）
  * - 添加新功能字段（priority, retry, timeout, pause）
  */
 

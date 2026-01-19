@@ -77,7 +77,7 @@ export class SnapshotManager {
 
   /** 添加到缓存（带大小限制，LRU策略） */
   private addToCache(cache: Map<string, string>, key: string, value: string): void {
-    // 如果缓存已满，删除最旧的条目（Map 保持插入顺序）
+    // 如果缓存已满，删除最早的条目（Map 保持插入顺序）
     if (cache.size >= this.MAX_CACHE_SIZE) {
       const firstKey = cache.keys().next().value;
       if (firstKey) {
@@ -271,28 +271,28 @@ export class SnapshotManager {
       // 冲突检测：多个 SubTask 修改同一文件
       // 使用优先级解决冲突：数字越小优先级越高
       if (priority < otherSnapshot.priority) {
-        // 新 SubTask 优先级更高，允许覆盖旧快照
+        // 新 SubTask 优先级更高，允许覆盖历史快照
         logger.info(
           `[SnapshotManager] 🔄 高优先级任务覆盖: ${relativePath}\n` +
           `  新任务: ${subTaskId} (优先级 ${priority})\n` +
-          `  旧任务: ${otherSnapshot.subTaskId} (优先级 ${otherSnapshot.priority})\n` +
-          `  决策: 允许创建新快照，删除旧快照`
+          `  历史任务: ${otherSnapshot.subTaskId} (优先级 ${otherSnapshot.priority})\n` +
+          `  决策: 允许创建新快照，删除历史快照`
         );
 
-        // 删除旧快照文件
+        // 删除历史快照文件
         const oldSnapshotFile = path.join(this.getSnapshotDir(session.id), `${otherSnapshot.id}.snapshot`);
         if (fs.existsSync(oldSnapshotFile)) {
           try {
             fs.unlinkSync(oldSnapshotFile);
-            // 清除旧快照的缓存
+            // 清除历史快照的缓存
             this.invalidateSnapshotCache(oldSnapshotFile);
           } catch (error) {
-            logger.error(`[SnapshotManager] 删除旧快照文件失败: ${oldSnapshotFile}`, error);
-            throw new Error(`Failed to delete old snapshot: ${error}`);
+            logger.error(`[SnapshotManager] 删除历史快照文件失败: ${oldSnapshotFile}`, error);
+            throw new Error(`Failed to delete previous snapshot: ${error}`);
           }
         }
 
-        // 从 session 中移除旧快照元数据
+        // 从 session 中移除历史快照元数据
         this.sessionManager.removeSnapshot(session.id, relativePath);
 
         // 继续创建新快照（下面的代码会处理）
@@ -409,7 +409,7 @@ export class SnapshotManager {
         logger.info(
           `[SnapshotManager] [1m[35m高优先级任务覆盖快照[0m: ${relativePath}\n` +
           `  新任务: ${subTaskId} (优先级 ${priority})\n` +
-          `  旧任务: ${otherSnapshot.subTaskId} (优先级 ${otherSnapshot.priority})`
+          `  历史任务: ${otherSnapshot.subTaskId} (优先级 ${otherSnapshot.priority})`
         );
 
         const oldSnapshotFile = path.join(this.getSnapshotDir(session.id), `${otherSnapshot.id}.snapshot`);
@@ -418,8 +418,8 @@ export class SnapshotManager {
             fs.unlinkSync(oldSnapshotFile);
             this.invalidateSnapshotCache(oldSnapshotFile);
           } catch (error) {
-            logger.error(`[SnapshotManager] 删除旧快照文件失败: ${oldSnapshotFile}`, error);
-            throw new Error(`Failed to delete old snapshot: ${error}`);
+            logger.error(`[SnapshotManager] 删除历史快照文件失败: ${oldSnapshotFile}`, error);
+            throw new Error(`Failed to delete previous snapshot: ${error}`);
           }
         }
 
@@ -627,7 +627,7 @@ export class SnapshotManager {
     return { additions, deletions };
   }
 
-  /** 接受变更（删除旧快照，创建新基准快照） */
+  /** 接受变更（删除历史快照，创建新基准快照） */
   acceptChange(filePath: string): boolean {
     const session = this.sessionManager.getCurrentSession();
     if (!session) return false;
@@ -639,13 +639,13 @@ export class SnapshotManager {
     const snapshot = this.sessionManager.getSnapshot(session.id, relativePath);
     if (!snapshot) return false;
 
-    // 1. 删除旧快照文件
+    // 1. 删除历史快照文件
     const oldSnapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);
     if (fs.existsSync(oldSnapshotFile)) {
       fs.unlinkSync(oldSnapshotFile);
     }
 
-    // 2. 从 session 中移除旧快照元数据
+    // 2. 从 session 中移除历史快照元数据
     this.sessionManager.removeSnapshot(session.id, relativePath);
 
     // ========================================
@@ -680,7 +680,7 @@ export class SnapshotManager {
     const newSnapshotFile = path.join(this.getSnapshotDir(session.id), `${newSnapshotId}.snapshot`);
     fs.writeFileSync(newSnapshotFile, currentContent, 'utf-8');
 
-    // 清除旧快照缓存，添加新快照到缓存
+    // 清除历史快照缓存，添加新快照到缓存
     this.invalidateSnapshotCache(oldSnapshotFile);
     this.snapshotContentCache.set(newSnapshotFile, currentContent);
 

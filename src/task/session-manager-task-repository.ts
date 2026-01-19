@@ -2,7 +2,7 @@
  * SessionManagerTaskRepository - 适配器
  *
  * 将 UnifiedSessionManager 适配为 TaskRepository 接口
- * 用于渐进式迁移，允许 UnifiedTaskManager 使用现有的 Session 管理系统
+ * 供 UnifiedTaskManager 通过 Session 层持久化任务数据
  */
 
 import {

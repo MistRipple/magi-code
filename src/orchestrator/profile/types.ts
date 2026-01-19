@@ -7,7 +7,7 @@
  * - 执行统计驱动：基于历史数据动态调整 Worker 选择
  */
 
-import { WorkerType } from '../../types';
+import { CLIType } from '../../types';
 
 // ============================================================================
 // Worker 画像类型
@@ -86,7 +86,7 @@ export interface CategoryConfig {
   /** 匹配关键词（正则模式） */
   keywords: string[];
   /** 默认 Worker */
-  defaultWorker: WorkerType;
+  defaultWorker: CLIType;
   /** 优先级 */
   priority: TaskPriority;
   /** 风险等级 */
@@ -128,7 +128,7 @@ export interface InjectionContext {
   /** 功能契约 */
   featureContract?: string;
   /** 协作者列表 */
-  collaborators?: WorkerType[];
+  collaborators?: CLIType[];
   /** 任务分类 */
   category?: string;
 }
@@ -140,15 +140,15 @@ export interface InjectionContext {
 /** Worker 选择选项 */
 export interface WorkerSelectionOptions {
   /** 排除的 Worker */
-  excludeWorkers?: WorkerType[];
+  excludeWorkers?: CLIType[];
   /** 偏好的 Worker */
-  preferredWorker?: WorkerType;
+  preferredWorker?: CLIType;
 }
 
 /** Worker 选择结果 */
 export interface WorkerSelectionResult {
   /** 选中的 Worker */
-  worker: WorkerType;
+  worker: CLIType;
   /** 任务分类 */
   category: string;
   /** 匹配分数 */

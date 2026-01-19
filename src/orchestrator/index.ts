@@ -29,7 +29,6 @@ export { RiskPolicy } from './risk-policy';
 // 统一策略引擎
 export {
   PolicyEngine,
-  policyEngine,
   type CLISelectionPolicy,
   type ConflictDetectionResult,
   type VerificationDecision,
@@ -44,13 +43,6 @@ export * from './protocols';
 
 // 编排者专用 Prompts
 export * from './prompts/orchestrator-prompts';
-
-// 任务状态管理
-export {
-  TaskStateManager,
-  type TaskState,
-  type StateChangeCallback,
-} from './task-state-manager';
 
 // 验证执行器
 export {
@@ -68,11 +60,3 @@ export {
   type RecoveryResult,
   type RecoveryConfig,
 } from './recovery-handler';
-
-// 旧版 Prompt 构建器（向后兼容）
-export {
-  buildTaskAnalysisPrompt,
-  buildExecutionPrompt,
-  buildSummaryPrompt,
-  formatPlanForUser,
-} from './prompts';

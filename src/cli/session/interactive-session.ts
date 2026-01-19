@@ -137,8 +137,8 @@ export class InteractiveSession extends EventEmitter implements SessionProcess {
         jsonBuffer += text;
         this.emit('output', text);
 
-        // 🔧 修复：检测 CLI 询问并发送正确格式的事件
-        if (this.detectQuestion(text)) {
+        const questionResult = this.detectQuestionEnhanced(text);
+        if (questionResult.isQuestion) {
           // 如果已经在等待回答，不重复触发
           if (this.waitingForAnswer) {
             return;
@@ -165,7 +165,7 @@ export class InteractiveSession extends EventEmitter implements SessionProcess {
             questionId: this.currentQuestionId,
             cli: this.cli,
             content: text.trim(),
-            pattern: 'interactive-detection',
+            pattern: questionResult.type || 'interactive-detection',
             timestamp: Date.now(),
           };
 
@@ -329,14 +329,6 @@ export class InteractiveSession extends EventEmitter implements SessionProcess {
       isQuestion: false,
       type: 'unknown',
     };
-  }
-
-  /**
-   * 检测 CLI 询问（保持向后兼容）
-   */
-  private detectQuestion(text: string): boolean {
-    const result = this.detectQuestionEnhanced(text);
-    return result.isQuestion;
   }
 
   /**

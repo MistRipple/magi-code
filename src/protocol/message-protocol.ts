@@ -237,6 +237,14 @@ export interface MessageMetadata {
   duration?: number;
   /** 错误信息 */
   error?: string;
+  /** CLI 询问唯一 ID */
+  questionId?: string;
+  /** CLI 询问匹配模式 */
+  questionPattern?: string;
+  /** CLI 询问时间戳 */
+  questionTimestamp?: number;
+  /** 适配器角色 */
+  adapterRole?: 'worker' | 'orchestrator';
   /** 扩展数据 */
   extra?: Record<string, unknown>;
 }
