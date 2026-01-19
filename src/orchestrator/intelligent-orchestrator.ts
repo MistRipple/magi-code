@@ -22,7 +22,13 @@ import { SessionManagerTaskRepository } from '../task/session-manager-task-repos
 import { UnifiedSessionManager } from '../session';
 import { SnapshotManager } from '../snapshot-manager';
 import { globalEventBus } from '../events';
-import { OrchestratorAgent, ConfirmationCallback, RecoveryConfirmationCallback, ClarificationCallback, WorkerQuestionCallback } from './orchestrator-agent';
+import {
+  MissionDrivenEngine,
+  MissionConfirmationCallback,
+  MissionRecoveryConfirmationCallback,
+  MissionClarificationCallback,
+  MissionWorkerQuestionCallback,
+} from './core';
 import { VerificationRunner, VerificationConfig } from './verification-runner';
 import { PlanRecord } from './plan-storage';
 import {
@@ -32,11 +38,13 @@ import {
   OrchestratorState,
   QuestionCallback,
 } from './protocols/types';
-import { formatPlanForUser } from './prompts/orchestrator-prompts';
 
 // 重新导出类型，供外部引用
 export type { ExecutionPlan, ExecutionResult, SubTask };
-export { ConfirmationCallback };
+export type ConfirmationCallback = MissionConfirmationCallback;
+export type RecoveryConfirmationCallback = MissionRecoveryConfirmationCallback;
+export type ClarificationCallback = MissionClarificationCallback;
+export type WorkerQuestionCallback = MissionWorkerQuestionCallback;
 
 /** 子任务计划 */
 export interface SubTaskPlan {
@@ -121,8 +129,8 @@ export class IntelligentOrchestrator {
   private config: OrchestratorConfig;
   private workspaceRoot: string;
 
-  // 核心：独立编排者 Agent
-  private orchestratorAgent: OrchestratorAgent;
+  // 核心：MissionDrivenEngine
+  private missionDrivenEngine: MissionDrivenEngine;
 
   // 交互模式 - 默认 auto，根据用户输入智能判断
   private interactionMode: InteractionMode = 'auto';
@@ -164,8 +172,8 @@ export class IntelligentOrchestrator {
     this.strategyConfig = this.resolveStrategyConfig();
     this.permissions = this.resolvePermissions();
 
-    // 创建独立编排者 Agent，传递 workspaceRoot 和 snapshotManager 以支持验证和回滚功能
-    this.orchestratorAgent = new OrchestratorAgent(
+    // 创建 MissionDrivenEngine
+    this.missionDrivenEngine = new MissionDrivenEngine(
       cliFactory,
       {
         timeout: this.config.timeout,
@@ -190,20 +198,19 @@ export class IntelligentOrchestrator {
 
   /** 设置编排者事件监听 */
   private setupOrchestratorEvents(): void {
-    this.orchestratorAgent.on('stateChange', (state: OrchestratorState) => {
+    this.missionDrivenEngine.on('stateChange', (state: OrchestratorState) => {
       globalEventBus.emitEvent('orchestrator:phase_changed', {
         taskId: this.currentTaskId || undefined,
         data: { phase: state, isRunning: this.isRunning },
       });
     });
-
   }
 
   /** 设置交互模式 */
   setInteractionMode(mode: InteractionMode): void {
     this.interactionMode = mode;
     this.modeConfig = INTERACTION_MODE_CONFIGS[mode];
-    logger.info(`[IntelligentOrchestrator] 交互模式设置为: ${mode}`, undefined, LogCategory.ORCHESTRATOR);
+    logger.info('编排器.交互_模式.变更', { mode }, LogCategory.ORCHESTRATOR);
     globalEventBus.emitEvent('orchestrator:mode_changed', { data: { mode } });
     this.syncPlanConfirmationPolicy();
     this.syncRecoveryConfirmationCallback();
@@ -216,46 +223,46 @@ export class IntelligentOrchestrator {
 
   /** 设置用户确认回调 */
   setConfirmationCallback(callback: ConfirmationCallback): void {
-    this.orchestratorAgent.setConfirmationCallback(callback);
+    this.missionDrivenEngine.setConfirmationCallback(callback);
   }
 
   /** 设置用户补充问题回调 */
   setQuestionCallback(callback: QuestionCallback): void {
-    this.orchestratorAgent.setQuestionCallback(callback);
+    this.missionDrivenEngine.setQuestionCallback(callback);
   }
 
   /** 设置需求澄清回调 */
   setClarificationCallback(callback: ClarificationCallback): void {
-    this.orchestratorAgent.setClarificationCallback(callback);
+    this.missionDrivenEngine.setClarificationCallback(callback);
   }
 
   /** 设置 Worker 问题回调 */
   setWorkerQuestionCallback(callback: WorkerQuestionCallback): void {
-    this.orchestratorAgent.setWorkerQuestionCallback(callback);
+    this.missionDrivenEngine.setWorkerQuestionCallback(callback);
   }
 
-  /** 更新 CLI 技能配置 */
   /** 设置恢复确认回调 */
   setRecoveryConfirmationCallback(_callback: RecoveryConfirmationCallback): void {
     this.recoveryConfirmationCallback = _callback;
     this.syncRecoveryConfirmationCallback();
+    this.missionDrivenEngine.setRecoveryConfirmationCallback(_callback);
   }
 
   /** 获取当前阶段 */
   get phase(): OrchestratorPhase {
-    return this.orchestratorAgent.state;
+    return this.missionDrivenEngine.state;
   }
 
   /** 获取当前执行计划 */
   get plan(): ExecutionPlan | null {
-    return this.orchestratorAgent.context?.plan || null;
+    return this.missionDrivenEngine.context?.plan || null;
   }
 
   /** 注入统一任务管理器（按会话） */
   setTaskManager(taskManager: UnifiedTaskManager, sessionId: string): void {
     this.taskManager = taskManager;
     this.taskManagerSessionId = sessionId;
-    this.orchestratorAgent.setTaskManager(taskManager, sessionId);
+    this.missionDrivenEngine.setTaskManager(taskManager, sessionId);
   }
 
   private resolveSessionId(sessionId?: string): string {
@@ -335,7 +342,7 @@ export class IntelligentOrchestrator {
 
   /** 初始化编排者 */
   async initialize(): Promise<void> {
-    await this.orchestratorAgent.initialize();
+    await this.missionDrivenEngine.initialize();
 
     if (this.config.verification && this.strategyConfig.enableVerification) {
       this.verificationRunner = new VerificationRunner(
@@ -349,7 +356,7 @@ export class IntelligentOrchestrator {
    * 重新加载画像配置
    */
   async reloadProfiles(): Promise<void> {
-    await this.orchestratorAgent.reloadProfiles();
+    await this.missionDrivenEngine.reloadProfiles();
   }
 
   /**
@@ -383,8 +390,8 @@ export class IntelligentOrchestrator {
         return await this.executeAskMode(userPrompt, taskId, sessionId);
       }
 
-      // agent/auto 模式：使用独立编排者执行
-      const result = await this.orchestratorAgent.execute(userPrompt, taskId, sessionId);
+      // agent/auto 模式：使用 MissionDrivenEngine 执行
+      const result = await this.missionDrivenEngine.execute(userPrompt, taskId, sessionId);
 
       if (this.abortController?.signal.aborted) {
         await this.updateTaskStatus(taskId, 'cancelled', sessionId);
@@ -408,7 +415,7 @@ export class IntelligentOrchestrator {
 
       if (this.modeConfig.autoRollbackOnFailure && this.strategyConfig.autoRollbackOnFailure) {
         const count = this.snapshotManager.revertAllChanges();
-        logger.info(`[IntelligentOrchestrator] 自动回滚 ${count} 个变更`, undefined, LogCategory.ORCHESTRATOR);
+        logger.info('编排器.回滚.自动.完成', { count }, LogCategory.ORCHESTRATOR);
       }
 
       await this.updateTaskStatus(taskId, 'failed', sessionId, errorMsg);
@@ -443,7 +450,7 @@ export class IntelligentOrchestrator {
     this.startStatusUpdates(taskId);
 
     try {
-      const record = await this.orchestratorAgent.createPlan(userPrompt, taskId, sessionId);
+      const record = await this.missionDrivenEngine.createPlan(userPrompt, taskId, sessionId);
       await this.updateTaskStatus(taskId, 'pending', sessionId);
       return record;
     } catch (error) {
@@ -475,7 +482,7 @@ export class IntelligentOrchestrator {
     this.startStatusUpdates(finalTaskId);
 
     try {
-      const result = await this.orchestratorAgent.executePlan(
+      const result = await this.missionDrivenEngine.executePlan(
         record.plan,
         finalTaskId,
         sessionId || record.sessionId,
@@ -504,23 +511,23 @@ export class IntelligentOrchestrator {
   }
 
   getActivePlanForSession(sessionId: string): PlanRecord | null {
-    return this.orchestratorAgent.getActivePlanForSession(sessionId);
+    return this.missionDrivenEngine.getActivePlanForSession(sessionId);
   }
 
   getLatestPlanForSession(sessionId: string): PlanRecord | null {
-    return this.orchestratorAgent.getLatestPlanForSession(sessionId);
+    return this.missionDrivenEngine.getLatestPlanForSession(sessionId);
   }
 
   getPlanById(planId: string, sessionId: string): PlanRecord | null {
-    return this.orchestratorAgent.getPlanById(planId, sessionId);
+    return this.missionDrivenEngine.getPlanById(planId, sessionId);
   }
 
   /** ask 模式：仅对话 */
   private async executeAskMode(userPrompt: string, taskId: string, sessionId?: string): Promise<string> {
-    logger.info('[IntelligentOrchestrator] ask 模式：仅对话', undefined, LogCategory.ORCHESTRATOR);
+    logger.info('编排器.执行.对话_模式', undefined, LogCategory.ORCHESTRATOR);
 
     const contextSessionId = sessionId || taskId;
-    const context = await this.orchestratorAgent.prepareContext(contextSessionId, userPrompt);
+    const context = await this.missionDrivenEngine.prepareContext(contextSessionId, userPrompt);
     const prompt = context
       ? `请结合以下会话上下文回答用户问题。\n\n${context}\n\n## 用户问题\n${userPrompt}`
       : userPrompt;
@@ -542,7 +549,7 @@ export class IntelligentOrchestrator {
       }
     );
 
-    this.orchestratorAgent.recordOrchestratorTokens(response.tokenUsage);
+    this.missionDrivenEngine.recordOrchestratorTokens(response.tokenUsage);
 
     if (response.error) {
       throw new Error(response.error);
@@ -552,7 +559,7 @@ export class IntelligentOrchestrator {
     globalEventBus.emitEvent('task:completed', { taskId, data: { isRunning: false } });
 
     const content = response.content || '';
-    await this.orchestratorAgent.recordAssistantMessage(content);
+    await this.missionDrivenEngine.recordAssistantMessage(content);
     return content;
   }
 
@@ -611,13 +618,13 @@ export class IntelligentOrchestrator {
 
   /** 取消当前任务 */
   async cancel(): Promise<void> {
-    logger.info('[IntelligentOrchestrator] 取消任务', undefined, LogCategory.ORCHESTRATOR);
+    logger.info('编排器.任务.取消.请求', undefined, LogCategory.ORCHESTRATOR);
 
     // 1. 触发 AbortController
     this.abortController?.abort();
 
-    // 2. 取消 OrchestratorAgent 中的任务
-    await this.orchestratorAgent.cancel();
+    // 2. 取消 MissionDrivenEngine 中的任务
+    await this.missionDrivenEngine.cancel();
 
     // 3. 停止状态更新定时器
     this.stopStatusUpdates();
@@ -627,12 +634,12 @@ export class IntelligentOrchestrator {
       globalEventBus.emitEvent('task:cancelled', { taskId: this.currentTaskId, data: { isRunning: false } });
     }
 
-    // 4. 重置状态标志（关键！）
+    // 4. 重置状态标志
     this.isRunning = false;
     this.abortController = null;
     this.currentTaskId = null;
 
-    logger.info('[IntelligentOrchestrator] 任务已取消，状态已重置', undefined, LogCategory.ORCHESTRATOR);
+    logger.info('编排器.任务.取消.完成', undefined, LogCategory.ORCHESTRATOR);
   }
 
   /** 开始状态更新定时器 */
@@ -642,7 +649,7 @@ export class IntelligentOrchestrator {
       if (this.isRunning) {
         globalEventBus.emitEvent('orchestrator:phase_changed', {
           taskId,
-          data: { phase: this.orchestratorAgent.state, isRunning: true },
+          data: { phase: this.missionDrivenEngine.state, isRunning: true },
         });
       }
     }, 2000);
@@ -657,17 +664,15 @@ export class IntelligentOrchestrator {
   }
 
   private syncPlanConfirmationPolicy(): void {
-    this.orchestratorAgent.setPlanConfirmationPolicy((_risk) => {
-      // 如果模式配置不需要确认，直接返回 false
+    this.missionDrivenEngine.setPlanConfirmationPolicy((_risk) => {
       if (!this.modeConfig.requirePlanConfirmation) return false;
-      // 否则始终需要确认（不管 risk 是什么）
       return true;
     });
   }
 
   private syncRecoveryConfirmationCallback(): void {
     const userCallback = this.recoveryConfirmationCallback;
-    this.orchestratorAgent.setRecoveryConfirmationCallback(async (failedTask, error, options) => {
+    this.missionDrivenEngine.setRecoveryConfirmationCallback(async (failedTask, error, options) => {
       if (!this.strategyConfig.enableRecovery) {
         return 'continue';
       }
@@ -692,31 +697,31 @@ export class IntelligentOrchestrator {
 
   /** 获取执行统计摘要 */
   getStatsSummary(): string {
-    return this.orchestratorAgent.getStatsSummary();
+    return this.missionDrivenEngine.getStatsSummary();
   }
 
   getOrchestratorTokenUsage(): { inputTokens: number; outputTokens: number } {
-    return this.orchestratorAgent.getOrchestratorTokenUsage();
+    return this.missionDrivenEngine.getOrchestratorTokenUsage();
   }
 
   resetOrchestratorTokenUsage(): void {
-    this.orchestratorAgent.resetOrchestratorTokenUsage();
+    this.missionDrivenEngine.resetOrchestratorTokenUsage();
   }
 
   /** 设置扩展上下文（用于持久化统计数据） */
   setExtensionContext(context: import('vscode').ExtensionContext): void {
-    this.orchestratorAgent.setExtensionContext(context);
+    this.missionDrivenEngine.setExtensionContext(context);
   }
 
   /** 获取执行统计实例（用于 UI 显示） */
   getExecutionStats(): import('./execution-stats').ExecutionStats | null {
-    return this.orchestratorAgent.getExecutionStats();
+    return this.missionDrivenEngine.getExecutionStats();
   }
 
   /** 销毁编排器 */
   dispose(): void {
     this.stopStatusUpdates();
-    this.orchestratorAgent.dispose();
-    logger.info('[IntelligentOrchestrator] 已销毁', undefined, LogCategory.ORCHESTRATOR);
+    this.missionDrivenEngine.dispose();
+    logger.info('编排器.销毁.完成', undefined, LogCategory.ORCHESTRATOR);
   }
 }

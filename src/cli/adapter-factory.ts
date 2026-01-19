@@ -391,7 +391,7 @@ export class CLIAdapterFactory extends EventEmitter {
     }
 
     const hasImages = imagePaths && imagePaths.length > 0;
-    logger.info(`[CLIAdapterFactory] sendMessage: type=${type}, hasImages=${hasImages}, imagePaths=`, imagePaths, LogCategory.CLI);
+    logger.info('CLI.发送消息.请求', { cli: type, hasImages, imageCount: imagePaths?.length || 0, imagePaths }, LogCategory.CLI);
 
     const scope = options ? { ...options } : null;
     const scopeKey = this.getScopeKey(type, role);

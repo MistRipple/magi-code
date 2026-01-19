@@ -49,6 +49,16 @@ export interface WorkerCollaboration {
   asCollaborator: string[];
 }
 
+/** Worker 评审配置 */
+export interface WorkerReviewConfig {
+  /** 被评审时需要重点关注的领域 */
+  focusAreasWhenReviewed: string[];
+  /** 作为评审者时的优势领域 */
+  reviewStrengths: string[];
+  /** 需要严格评审的任务分类 */
+  strictReviewCategories: string[];
+}
+
 /** 完整的 Worker 画像 */
 export interface WorkerProfile {
   /** Worker 名称 */
@@ -65,6 +75,8 @@ export interface WorkerProfile {
   guidance: WorkerGuidance;
   /** 协作规则 */
   collaboration: WorkerCollaboration;
+  /** 评审配置（可选，向后兼容） */
+  review?: WorkerReviewConfig;
 }
 
 // ============================================================================
@@ -76,6 +88,16 @@ export type TaskPriority = 'high' | 'medium' | 'low';
 
 /** 风险等级 */
 export type RiskLevel = 'high' | 'medium' | 'low';
+
+/** 评审策略配置 */
+export interface CategoryReviewPolicy {
+  /** 是否需要互检评审 */
+  requirePeerReview: boolean;
+  /** 偏好的评审者 */
+  preferredReviewer?: CLIType;
+  /** 评审重点 */
+  reviewFocus: string[];
+}
 
 /** 任务分类配置 */
 export interface CategoryConfig {
@@ -91,6 +113,8 @@ export interface CategoryConfig {
   priority: TaskPriority;
   /** 风险等级 */
   riskLevel: RiskLevel;
+  /** 评审策略（可选，向后兼容） */
+  reviewPolicy?: CategoryReviewPolicy;
 }
 
 /** 分类规则配置 */

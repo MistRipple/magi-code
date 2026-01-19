@@ -224,7 +224,7 @@ export class FileTaskRepository implements TaskRepository {
           this.cache.set(task.id, task);
         }
       } catch (error) {
-        logger.error('[FileTaskRepository] Failed to load cache:', error, LogCategory.TASK);
+        logger.error('任务.仓库.缓存_加载_失败', error, LogCategory.TASK);
       }
     }
   }

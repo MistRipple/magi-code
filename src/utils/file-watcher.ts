@@ -41,14 +41,14 @@ export class FileWatcher {
       this.changedFiles.add(absolute);
     });
 
-    logger.info(`[FileWatcher] 开始监控: ${this.root}`, undefined, LogCategory.WORKER);
+    logger.info('子代理.文件_监听.开始', { root: this.root }, LogCategory.WORKER);
   }
 
   stop(): void {
     if (this.watcher) {
       this.watcher.close();
       this.watcher = null;
-      logger.info('[FileWatcher] 已停止监控', undefined, LogCategory.WORKER);
+      logger.info('子代理.文件_监听.停止', undefined, LogCategory.WORKER);
     }
   }
 
@@ -71,7 +71,7 @@ export class FileWatcher {
     try {
       entries = fs.readdirSync(dirPath, { withFileTypes: true });
     } catch (error) {
-      logger.warn(`[FileWatcher] 读取目录失败: ${dirPath}`, error, LogCategory.WORKER);
+      logger.warn('子代理.文件_监听.读取_目录_失败', { path: dirPath, error }, LogCategory.WORKER);
       return;
     }
 
@@ -84,13 +84,13 @@ export class FileWatcher {
         try {
           const buffer = fs.readFileSync(absolute);
           if (!this.isTextBuffer(buffer)) {
-            logger.warn(`[FileWatcher] 跳过二进制文件基线: ${absolute}`, undefined, LogCategory.WORKER);
+            logger.warn('子代理.文件_监听.基线.跳过_二进制', { path: absolute }, LogCategory.WORKER);
             continue;
           }
           const content = buffer.toString('utf-8');
           this.baselineContent.set(absolute, content);
         } catch (error) {
-          logger.warn(`[FileWatcher] 读取基线文件失败: ${absolute}`, error, LogCategory.WORKER);
+          logger.warn('子代理.文件_监听.基线.读取_失败', { path: absolute, error }, LogCategory.WORKER);
         }
       }
     }
@@ -120,5 +120,3 @@ export class FileWatcher {
     return controlChars / sampleSize < 0.05;
   }
 }
-
-

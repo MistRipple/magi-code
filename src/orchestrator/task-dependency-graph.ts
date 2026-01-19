@@ -74,7 +74,7 @@ export class TaskDependencyGraph {
    */
   addTask(id: string, name: string, data?: unknown, targetFiles?: string[]): void {
     if (this.nodes.has(id)) {
-      logger.warn(`[TaskDependencyGraph] 任务 ${id} 已存在，跳过添加`, undefined, LogCategory.ORCHESTRATOR);
+      logger.warn('编排器.依赖_图.任务_已存在', { taskId: id }, LogCategory.ORCHESTRATOR);
       return;
     }
 
@@ -109,18 +109,18 @@ export class TaskDependencyGraph {
     const dependency = this.nodes.get(dependsOn);
 
     if (!task) {
-      logger.warn(`[TaskDependencyGraph] 任务 ${taskId} 不存在`, undefined, LogCategory.ORCHESTRATOR);
+      logger.warn('编排器.依赖_图.任务_缺失', { taskId }, LogCategory.ORCHESTRATOR);
       return false;
     }
 
     if (!dependency) {
-      logger.warn(`[TaskDependencyGraph] 依赖任务 ${dependsOn} 不存在`, undefined, LogCategory.ORCHESTRATOR);
+      logger.warn('编排器.依赖_图.依赖_缺失', { dependsOn }, LogCategory.ORCHESTRATOR);
       return false;
     }
 
     // 检查是否会形成循环
     if (this.wouldCreateCycle(taskId, dependsOn)) {
-      logger.warn(`[TaskDependencyGraph] 添加依赖会形成循环: ${taskId} -> ${dependsOn}`, undefined, LogCategory.ORCHESTRATOR);
+      logger.warn('编排器.依赖_图.循环_检测到', { taskId, dependsOn }, LogCategory.ORCHESTRATOR);
       return false;
     }
 
@@ -282,7 +282,9 @@ export class TaskDependencyGraph {
           if (success) {
             addedCount++;
             logger.info(
-              `[TaskDependencyGraph] 文件冲突自动添加依赖: ${taskIds[i]} 依赖 ${taskIds[i - 1]} (文件: ${conflict.file})`
+              '编排器.依赖_图.文件_冲突.依赖_新增',
+              { taskId: taskIds[i], dependsOn: taskIds[i - 1], file: conflict.file },
+              LogCategory.ORCHESTRATOR
             );
           }
         }

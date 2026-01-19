@@ -158,8 +158,13 @@ export class ConflictResolver {
 
       // 用户选择的 CLI 不健康，提示降级
       logger.warn(
-        `[ConflictResolver] 用户指定的 ${userPreference} 健康度不足 ` +
-        `(${(stats.successRate * 100).toFixed(0)}% < ${this.config.healthThreshold * 100}%), 考虑降级`
+        '任务.冲突.用户_偏好.不健康',
+        {
+          cli: userPreference,
+          successRate: stats.successRate,
+          threshold: this.config.healthThreshold,
+        },
+        LogCategory.TASK
       );
 
       // 如果有更健康的备选，建议降级

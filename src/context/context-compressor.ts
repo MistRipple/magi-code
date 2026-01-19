@@ -122,7 +122,7 @@ export class ContextCompressor {
     if (truncatedContent !== content) {
       memory.replaceContent(truncatedContent);
       truncationApplied = true;
-      logger.info('[ContextCompressor] 已应用预防性截断');
+      logger.info('上下文压缩.预防_截断.已应用', undefined, LogCategory.SESSION);
 
       // 检查截断后是否还需要进一步压缩
       if (!memory.needsCompression(this.config.tokenLimit, this.config.lineLimit)) {
@@ -133,27 +133,27 @@ export class ContextCompressor {
 
     // 第二步：LLM 智能压缩（保留语义）
     if (this.adapter) {
-      logger.info('[ContextCompressor] 使用 LLM 智能压缩...');
+      logger.info('上下文压缩.LLM.开始', undefined, LogCategory.SESSION);
       const success = await this.llmCompress(memory);
       if (success) {
         this.updateStats(originalTokens, memory.estimateTokens(), 'llm', truncationApplied);
         return true;
       }
-      logger.info('[ContextCompressor] LLM 压缩失败，降级到简单压缩');
+      logger.info('上下文压缩.LLM.降级_为_简单', undefined, LogCategory.SESSION);
     }
 
     // 第三步：简单压缩（降级方案）
-    logger.info('[ContextCompressor] 使用简单压缩（降级方案）');
+    logger.info('上下文压缩.简单.开始', undefined, LogCategory.SESSION);
     if (this.trySimpleCompression(memory)) {
       this.updateStats(originalTokens, memory.estimateTokens(), 'simple', truncationApplied);
-      logger.info('[ContextCompressor] 简单压缩成功');
+      logger.info('上下文压缩.简单.完成', undefined, LogCategory.SESSION);
       return true;
     }
 
     // 第四步：激进压缩（最后手段）
     this.aggressiveSimpleCompression(memory);
     this.updateStats(originalTokens, memory.estimateTokens(), 'aggressive', truncationApplied);
-    logger.info('[ContextCompressor] 激进简单压缩完成（可能丢失部分信息）');
+    logger.info('上下文压缩.简单.激进.完成', undefined, LogCategory.SESSION);
     return true;
   }
 
@@ -374,23 +374,23 @@ export class ContextCompressor {
       const markdown = memory.toMarkdown();
       const prompt = COMPRESSION_PROMPT.replace('{MEMORY_CONTENT}', markdown);
 
-      logger.info('[ContextCompressor] 开始 LLM 压缩...');
+      logger.info('上下文压缩.LLM.开始', undefined, LogCategory.SESSION);
       const response = await this.adapter.sendMessage(prompt);
 
       // 解析 JSON 响应
       const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/);
       if (!jsonMatch) {
-        logger.error('[ContextCompressor] 无法解析 LLM 响应');
+        logger.error('上下文压缩.LLM.解析_失败', undefined, LogCategory.SESSION);
         return false;
       }
 
       const compressed = JSON.parse(jsonMatch[1]);
       memory.replaceContent(compressed);
 
-      logger.info('[ContextCompressor] LLM 压缩成功');
+      logger.info('上下文压缩.LLM.完成', undefined, LogCategory.SESSION);
       return true;
     } catch (error) {
-      logger.error('[ContextCompressor] LLM 压缩失败:', error);
+      logger.error('上下文压缩.LLM.失败', error, LogCategory.SESSION);
       return false;
     }
   }
@@ -421,4 +421,3 @@ ${messages.map(m => `[${m.role}]: ${m.content}`).join('\n\n')}
     }
   }
 }
-

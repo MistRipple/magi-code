@@ -60,7 +60,7 @@ export class ContextManager {
     this.sessionMemory = new MemoryDocument(sessionId, sessionName, storagePath);
     await this.sessionMemory.load();
     this.initialized = true;
-    logger.info(`[ContextManager] 已初始化，会话: ${sessionId}`);
+    logger.info('上下文.初始化.完成', { sessionId }, LogCategory.SESSION);
   }
 
   /**
@@ -74,7 +74,11 @@ export class ContextManager {
     if (applyTruncation && this.config.compression.truncation.enabled) {
       const truncated = this.truncationUtils.truncateMessage(content);
       if (truncated.wasTruncated) {
-        logger.info(`[ContextManager] 消息已截断: ${truncated.originalLength} -> ${truncated.truncatedLength} 字符`);
+        logger.info(
+          '上下文.截断.已应用',
+          { originalLength: truncated.originalLength, truncatedLength: truncated.truncatedLength },
+          LogCategory.SESSION
+        );
         content = truncated.content;
       }
     }
@@ -109,9 +113,7 @@ export class ContextManager {
         ...otherMessages.slice(-maxMessages)
       ];
 
-      logger.info(
-        `[ContextManager] 即时上下文已清理,转存 ${toRemove.length} 条消息到 Memory`
-      );
+      logger.info('上下文.即时上下文.已裁剪', { removedCount: toRemove.length }, LogCategory.SESSION);
     }
   }
 
@@ -434,7 +436,7 @@ export class ContextManager {
    */
   private migrateToMemory(message: ContextMessage): void {
     if (!this.sessionMemory) {
-      logger.warn('[ContextManager] SessionMemory 未初始化,无法转存消息', LogCategory.SESSION);
+      logger.warn('上下文.记忆.未_初始化', undefined, LogCategory.SESSION);
       return;
     }
 
@@ -510,7 +512,7 @@ export class ContextManager {
         }
       }
     } catch (error) {
-      logger.error('[ContextManager] 转存消息到Memory失败:', error);
+      logger.error('上下文.记忆.转存.失败', error, LogCategory.SESSION);
     }
   }
 

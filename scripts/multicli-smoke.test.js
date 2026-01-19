@@ -27,7 +27,7 @@ Module._load = function load(request, parent, isMain) {
   return originalModuleLoad(request, parent, isMain);
 };
 
-const ROOT = '/Users/xie/code/cli-arranger';
+const ROOT = '/Users/xie/code/MultiCLI';
 const TEST_ROOT = path.join(ROOT, 'TEST');
 
 const { CLISelector } = require(path.join(ROOT, 'out/task/cli-selector.js'));
@@ -44,7 +44,6 @@ const { RiskPolicy } = require(path.join(ROOT, 'out/orchestrator/risk-policy.js'
 const { AITaskDecomposer } = require(path.join(ROOT, 'out/task/ai-task-decomposer.js'));
 const { SessionManager } = require(path.join(ROOT, 'out/session-manager.js'));
 const { SnapshotManager } = require(path.join(ROOT, 'out/snapshot-manager.js'));
-const { OrchestratorAgent } = require(path.join(ROOT, 'out/orchestrator/orchestrator-agent.js'));
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
@@ -465,62 +464,7 @@ test('SnapshotManager returns changed files by subTaskId', () => {
   assert(changed.includes(relative), 'changed files should include modified file');
 });
 
-// 31) 联调失败自动生成修复任务
-test('Integration failure auto-creates repair tasks when issues missing', async () => {
-  const fakeFactory = {
-    sendMessage: async () => ({ content: '', error: undefined }),
-    emitOrchestratorMessageToUI: () => {}
-  };
-  const agent = new OrchestratorAgent(fakeFactory, {
-    integration: { enabled: true, maxRounds: 1, worker: 'claude' }
-  }, TEST_ROOT);
-
-  agent.workerPool = {
-    dispatchTaskWithRetry: async (worker, taskId, subTask) => ({
-      workerId: 'worker',
-      workerType: worker,
-      taskId,
-      subTaskId: subTask.id,
-      result: JSON.stringify({ status: 'failed', summary: '联调失败', issues: [] }),
-      success: true,
-      duration: 1
-    })
-  };
-  agent.createSnapshotsForSubTasks = async () => {};
-
-  let captured = null;
-  agent.dispatchSequential = async (tasks) => {
-    captured = tasks;
-  };
-
-  const plan = {
-    id: 'plan-int',
-    analysis: 'integration test',
-    needsCollaboration: true,
-    subTasks: [
-      { id: 's1', taskId: 't-int', description: 'A', assignedWorker: 'codex', targetFiles: [], dependencies: [], status: 'pending', output: [] },
-      { id: 's2', taskId: 't-int', description: 'B', assignedWorker: 'gemini', targetFiles: [], dependencies: [], status: 'pending', output: [] }
-    ],
-    executionMode: 'parallel',
-    summary: 'summary',
-    featureContract: 'contract',
-    acceptanceCriteria: ['ok'],
-    createdAt: Date.now()
-  };
-
-  agent.currentContext = { taskId: 't-int', plan, risk: { path: 'full' } };
-  try {
-    await agent.runIntegrationStage(plan);
-  } catch (error) {
-    assert(
-      error && error.message === '联调多轮未通过',
-      `unexpected error: ${error && error.message}`
-    );
-  }
-
-  assert(captured && captured.length > 0, 'repair tasks should be generated');
-  assert(captured[0].kind === 'repair', 'repair task kind should be set');
-});
+// 31) 测试已移除 - OrchestratorAgent 已被 MissionDrivenEngine 替代
 
 // 33) 并行 -> 串行锁冲突（域锁）
 test('FileLockManager blocks conflicting domain locks', async () => {

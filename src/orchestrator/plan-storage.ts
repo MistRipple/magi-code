@@ -61,7 +61,7 @@ export class PlanStorage {
       const content = fs.readFileSync(filePath, 'utf-8');
       return JSON.parse(content) as PlanRecord;
     } catch (error) {
-      logger.warn('[PlanStorage] 读取计划失败:', { planId, error }, LogCategory.ORCHESTRATOR);
+      logger.warn('编排器.计划.加载_失败', { planId, error }, LogCategory.ORCHESTRATOR);
       return null;
     }
   }

@@ -39,9 +39,23 @@ import { CLI_CAPABILITIES, CLIResponse } from '../cli/types';
 import { IntelligentOrchestrator } from '../orchestrator/intelligent-orchestrator';
 import { AceIndexManager } from '../ace/index-manager';
 import { normalizeOrchestratorMessage, isInternalStateMessage } from '../normalizer';
-import { MessageDeduplicator, DeduplicationConfig } from '../normalizer/message-deduplicator';
+import { UnifiedMessageBus, type ProcessingState } from '../normalizer/unified-message-bus';
 import { ProfileStorage, StoredProfileConfig } from '../orchestrator/profile';
 import { parseContentToBlocks } from '../utils/content-parser';
+// Mission-Driven Architecture 类型 - 直接从子模块导入
+import {
+  MissionOrchestrator,
+  MissionExecutor,
+  ExecutionProgress,
+  BlockedItem,
+  MissionSummary,
+  MissionVerificationResult,
+} from '../orchestrator/core';
+import {
+  Mission,
+  Assignment,
+  WorkerTodo,
+} from '../orchestrator/mission';
 
 export class WebviewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'multiCli.mainView';
@@ -58,8 +72,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private readonly messageFlowLogEnabled = process.env.MULTICLI_MESSAGE_FLOW_LOG === '1';
   private readonly messageFlowLogPath: string;
 
-  // 消息去重器
-  private messageDeduplicator: MessageDeduplicator;
+  // 统一消息总线（替代原有的 MessageDeduplicator）
+  private messageBus: UnifiedMessageBus;
 
   // 多 CLI 适配器工厂
   private cliFactory: CLIAdapterFactory;
@@ -70,6 +84,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   // 智能编排器
   private intelligentOrchestrator: IntelligentOrchestrator;
+
+  // Mission-Driven 编排器（新架构）
+  private missionOrchestrator?: MissionOrchestrator;
+  private missionExecutor?: MissionExecutor;
 
   // Hard Stop 确认机制
   private pendingConfirmation: {
@@ -111,13 +129,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   ) {
     this.messageFlowLogPath = path.join(this.workspaceRoot, '.multicli', 'logs', 'message-flow.jsonl');
 
-    // 初始化消息去重器
-    this.messageDeduplicator = new MessageDeduplicator({
+    // 初始化统一消息总线（替代原有的 MessageDeduplicator）
+    this.messageBus = new UnifiedMessageBus({
       enabled: true,
-      minStreamInterval: 100, // 100ms 最小流式间隔
-      retentionTime: 5 * 60 * 1000, // 5 分钟保留时间
-      maxHistorySize: 1000,
+      minStreamInterval: 100,
+      batchInterval: 50,
+      retentionTime: 5 * 60 * 1000,
+      debug: false,
     });
+    this.setupMessageBusListeners();
 
     // 初始化统一会话管理器
     this.sessionManager = new UnifiedSessionManager(workspaceRoot);
@@ -191,7 +211,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       };
       fs.appendFileSync(this.messageFlowLogPath, JSON.stringify(record) + '\n', 'utf-8');
     } catch (error) {
-      logger.warn('[MultiCLI] 写入消息流日志失败:', error, LogCategory.UI);
+      logger.warn('界面.消息流.写入_失败', error, LogCategory.UI);
     }
   }
 
@@ -238,60 +258,19 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 设置所有 CLI 适配器事件监听 */
   private setupCLIAdapters(): void {
-    // 监听标准消息事件 - 新的消息流开始
+    // 🔧 重构：所有消息通过 UnifiedMessageBus 发送
+    // CLI Adapter 的事件直接接入 MessageBus
     this.cliFactory.on('standardMessage', (message: any) => {
-      // 去重检查
-      if (!this.messageDeduplicator.shouldSend(message)) {
-        this.logMessageFlow('standardMessage [SKIP]', message);
-        return;
-      }
-
-      this.postMessage({
-        type: 'standardMessage',
-        message,
-        sessionId: this.activeSessionId
-      } as any);
-      this.logMessageFlow('standardMessage [SENT]', message);
+      this.messageBus.sendMessage(message);
     });
 
-    // 监听标准消息更新事件 - 流式更新
     this.cliFactory.on('standardUpdate', (update: any) => {
-      // 去重检查（可能没有完整 message）
-      if (update.message) {
-        if (!this.messageDeduplicator.shouldSend(update.message)) {
-          this.logMessageFlow('standardUpdate [SKIP]', update);
-          return;
-        }
-      } else if (!this.messageDeduplicator.shouldSendUpdate(update)) {
-        this.logMessageFlow('standardUpdate [SKIP]', update);
-        return;
-      }
-
-      this.postMessage({
-        type: 'standardUpdate',
-        update,
-        sessionId: this.activeSessionId
-      } as any);
-      this.logMessageFlow('standardUpdate [SENT]', update);
+      this.messageBus.sendUpdate(update);
     });
 
-    // 监听标准消息完成事件
     this.cliFactory.on('standardComplete', (message: any) => {
-      // 去重检查
-      if (!this.messageDeduplicator.shouldSend(message)) {
-        this.logMessageFlow('standardComplete [SKIP]', message);
-        return;
-      }
-
-      this.postMessage({
-        type: 'standardComplete',
-        message,
-        sessionId: this.activeSessionId
-      } as any);
-      this.logMessageFlow('standardComplete [SENT]', message);
+      this.messageBus.sendMessage(message);
     });
-
-    // standardMessage 统一处理消息流
 
     this.cliFactory.on('stateChange', ({ type, state }: { type: CLIType; state: string }) => {
       const status: CLIStatus = {
@@ -305,13 +284,53 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /** 设置 MessageBus 事件监听，转发消息到前端 */
+  private setupMessageBusListeners(): void {
+    // MessageBus 事件转发到前端
+    this.messageBus.on('message', (message) => {
+      this.postMessage({
+        type: 'standardMessage',
+        message,
+        sessionId: this.activeSessionId
+      } as any);
+      this.logMessageFlow('standardMessage [SENT]', message);
+    });
+
+    this.messageBus.on('update', (update) => {
+      this.postMessage({
+        type: 'standardUpdate',
+        update,
+        sessionId: this.activeSessionId
+      } as any);
+      this.logMessageFlow('standardUpdate [SENT]', update);
+    });
+
+    this.messageBus.on('complete', (message) => {
+      this.postMessage({
+        type: 'standardComplete',
+        message,
+        sessionId: this.activeSessionId
+      } as any);
+      this.logMessageFlow('standardComplete [SENT]', message);
+    });
+
+    // 处理状态变化 - 推送到前端
+    this.messageBus.on('processingStateChanged', (state) => {
+      this.postMessage({
+        type: 'processingStateChanged',
+        state,
+        sessionId: this.activeSessionId
+      } as any);
+    });
+  }
+
   /** 设置智能编排器的 Hard Stop 确认回调 */
   private setupOrchestratorConfirmation(): void {
     // 设置 Hard Stop 确认回调
     this.intelligentOrchestrator.setConfirmationCallback(async (plan, formattedPlan) => {
       const mode = this.intelligentOrchestrator.getInteractionMode();
       if (mode === 'auto') {
-        logger.info('[MultiCLI] Auto 模式跳过确认，自动执行', undefined, LogCategory.UI);
+        logger.info('界面.编排器.确认.自动_跳过', { mode }, LogCategory.UI);
         return true;
       }
       return new Promise<boolean>((resolve, reject) => {
@@ -325,7 +344,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           formattedPlan: formattedPlan,
         } as any);
 
-        logger.info('[MultiCLI] Hard Stop: 等待用户确认执行计划...', undefined, LogCategory.UI);
+        logger.info('界面.编排器.确认.等待', { mode }, LogCategory.UI);
       });
     });
 
@@ -344,7 +363,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           canRollback: options.rollback,
         });
 
-        logger.info('[MultiCLI] Recovery: 等待用户决策...', undefined, LogCategory.UI);
+        logger.info('界面.编排器.恢复.等待', { taskId: failedTask.id }, LogCategory.UI);
       });
     });
   }
@@ -359,7 +378,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           questions,
           plan
         } as any);
-        logger.info('[MultiCLI] Orchestrator: 等待用户补充信息...', undefined, LogCategory.UI);
+        logger.info('界面.编排器.提问.等待', undefined, LogCategory.UI);
       });
     });
 
@@ -375,7 +394,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           originalPrompt,
           sessionId: this.activeSessionId
         } as any);
-        logger.info(`[MultiCLI] Orchestrator: 需求模糊度 ${ambiguityScore}%，等待用户澄清...`, undefined, LogCategory.UI);
+        logger.info('界面.编排器.澄清.等待', { ambiguityScore }, LogCategory.UI);
       });
     });
 
@@ -391,7 +410,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           options,
           sessionId: this.activeSessionId
         } as any);
-        logger.info(`[MultiCLI] Worker ${workerId} 提问: ${question}`, undefined, LogCategory.UI);
+        logger.info('界面.子代理.提问.等待', { workerId }, LogCategory.UI);
       });
     });
   }
@@ -399,7 +418,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 处理用户对执行计划的确认响应 */
   private handlePlanConfirmation(confirmed: boolean): void {
     if (this.pendingConfirmation) {
-      logger.info(`[MultiCLI] 用户确认结果: ${confirmed ? 'Y' : 'N'}`, undefined, LogCategory.UI);
+      logger.info('界面.编排器.确认.结果', { confirmed }, LogCategory.UI);
       this.pendingConfirmation.resolve(confirmed);
       this.pendingConfirmation = null;
 
@@ -468,7 +487,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     answer: string,
     adapterRole?: 'worker' | 'orchestrator'
   ): void {
-    logger.info(`[WebviewProvider] 处理 CLI 询问回答: cli=${cli}, questionId=${questionId}, answer=${answer}`, undefined, LogCategory.UI);
+    logger.info('界面.CLI.提问.回答', { cli, questionId, answer, role: adapterRole || 'worker' }, LogCategory.UI);
 
     const role = adapterRole || 'worker';
     const success = this.cliFactory.writeInput(cli, answer, role);
@@ -656,6 +675,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const data = event.data as any;
       if (!data?.content) return;
 
+      // 🔍 检查点 1：记录原始 CLI 数据
+      console.log('[DEBUG-LAYER-1] 原始 Orchestrator 消息:', {
+        type: data.type,
+        contentLength: data.content.length,
+        contentPreview: data.content.substring(0, 200),
+        hasJson: /\{[\s\S]*"[^"]+"\s*:/.test(data.content),
+      });
+
       // 过滤内部状态消息
       if (isInternalStateMessage(data)) {
         return;
@@ -761,11 +788,305 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
       // session_event 仅写入日志，不推送到 CLI 面板，避免干扰用户对话
     });
+
+    // ============= Mission-Driven 架构事件 =============
+    // 这些事件来自 MissionOrchestrator 和 MissionExecutor
+    this.bindMissionEvents();
+  }
+
+  /**
+   * 绑定 Mission-Driven 架构事件
+   * 将 MissionOrchestrator 和 MissionExecutor 的事件转发到 Webview
+   */
+  private bindMissionEvents(): void {
+    // 如果 MissionOrchestrator 未初始化，跳过
+    if (!this.missionOrchestrator) return;
+
+    // Mission 生命周期事件
+    this.missionOrchestrator.on('missionCreated', (data: { mission: Mission }) => {
+      this.postMessage({
+        type: 'missionCreated',
+        mission: data.mission,
+        sessionId: this.activeSessionId,
+      } as any);
+      this.sendStateUpdate();
+    });
+
+    this.missionOrchestrator.on('missionPlanned', (data: { mission: Mission; contracts: any[]; assignments: Assignment[] }) => {
+      this.postMessage({
+        type: 'missionPlanned',
+        missionId: data.mission.id,
+        contracts: data.contracts,
+        assignments: data.assignments,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    this.missionOrchestrator.on('missionApproved', (data: { mission: Mission }) => {
+      this.postMessage({
+        type: 'missionApproved',
+        missionId: data.mission.id,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    this.missionOrchestrator.on('missionCompleted', (data: { mission: Mission }) => {
+      this.postMessage({
+        type: 'missionCompleted',
+        missionId: data.mission.id,
+        sessionId: this.activeSessionId,
+      } as any);
+      this.sendStateUpdate();
+    });
+
+    this.missionOrchestrator.on('missionFailed', (data: { mission: Mission; error: string }) => {
+      this.postMessage({
+        type: 'missionFailed',
+        missionId: data.mission.id,
+        error: data.error,
+        sessionId: this.activeSessionId,
+      } as any);
+      this.sendStateUpdate();
+    });
+
+    this.missionOrchestrator.on('missionPaused', (data: { mission: Mission; reason: string }) => {
+      this.postMessage({
+        type: 'missionPaused',
+        missionId: data.mission.id,
+        reason: data.reason,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    this.missionOrchestrator.on('missionResumed', (data: { mission: Mission }) => {
+      this.postMessage({
+        type: 'missionResumed',
+        missionId: data.mission.id,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    this.missionOrchestrator.on('missionCancelled', (data: { mission: Mission; reason: string }) => {
+      this.postMessage({
+        type: 'missionCancelled',
+        missionId: data.mission.id,
+        reason: data.reason,
+        sessionId: this.activeSessionId,
+      } as any);
+      this.sendStateUpdate();
+    });
+
+    // 验证事件
+    this.missionOrchestrator.on('verificationStarted', (data: { missionId: string }) => {
+      this.postMessage({
+        type: 'missionVerificationStarted',
+        missionId: data.missionId,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    this.missionOrchestrator.on('verificationCompleted', (data: { missionId: string; result: MissionVerificationResult }) => {
+      this.postMessage({
+        type: 'missionVerificationCompleted',
+        missionId: data.missionId,
+        result: data.result,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    // 总结事件
+    this.missionOrchestrator.on('summarizationCompleted', (data: { missionId: string; summary: MissionSummary }) => {
+      this.postMessage({
+        type: 'missionSummary',
+        missionId: data.missionId,
+        summary: data.summary,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    // 如果 MissionExecutor 未初始化，跳过执行事件
+    if (!this.missionExecutor) return;
+
+    // 执行事件
+    this.missionExecutor.on('executionStarted', (data: { missionId: string }) => {
+      this.postMessage({
+        type: 'missionExecutionStarted',
+        missionId: data.missionId,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    this.missionExecutor.on('executionCompleted', (data: any) => {
+      this.postMessage({
+        type: 'missionExecutionCompleted',
+        missionId: data.mission.id,
+        success: data.success,
+        duration: data.duration,
+        sessionId: this.activeSessionId,
+      } as any);
+      this.sendStateUpdate();
+    });
+
+    this.missionExecutor.on('executionFailed', (data: { missionId: string; error: string }) => {
+      this.postMessage({
+        type: 'missionExecutionFailed',
+        missionId: data.missionId,
+        error: data.error,
+        sessionId: this.activeSessionId,
+      } as any);
+      this.sendStateUpdate();
+    });
+
+    // Assignment 事件
+    this.missionExecutor.on('assignmentStarted', (data: { missionId: string; assignmentId: string; workerId: CLIType }) => {
+      this.postMessage({
+        type: 'assignmentStarted',
+        missionId: data.missionId,
+        assignmentId: data.assignmentId,
+        workerId: data.workerId,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    this.missionExecutor.on('assignmentCompleted', (data: { missionId: string; assignmentId: string; success: boolean }) => {
+      this.postMessage({
+        type: 'assignmentCompleted',
+        missionId: data.missionId,
+        assignmentId: data.assignmentId,
+        success: data.success,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    // Todo 事件
+    this.missionExecutor.on('todoStarted', (data: { missionId: string; assignmentId: string; todoId: string }) => {
+      this.postMessage({
+        type: 'todoStarted',
+        missionId: data.missionId,
+        assignmentId: data.assignmentId,
+        todoId: data.todoId,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    this.missionExecutor.on('todoCompleted', (data: { missionId: string; assignmentId: string; todoId: string; output: any }) => {
+      this.postMessage({
+        type: 'todoCompleted',
+        missionId: data.missionId,
+        assignmentId: data.assignmentId,
+        todoId: data.todoId,
+        output: data.output,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    this.missionExecutor.on('todoFailed', (data: { missionId: string; assignmentId: string; todoId: string; error: string }) => {
+      this.postMessage({
+        type: 'todoFailed',
+        missionId: data.missionId,
+        assignmentId: data.assignmentId,
+        todoId: data.todoId,
+        error: data.error,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    // 动态 Todo 事件
+    this.missionExecutor.on('dynamicTodoAdded', (data: { missionId: string; assignmentId: string; todo: WorkerTodo }) => {
+      this.postMessage({
+        type: 'dynamicTodoAdded',
+        missionId: data.missionId,
+        assignmentId: data.assignmentId,
+        todo: data.todo,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    // 审批请求事件
+    this.missionExecutor.on('approvalRequested', (data: { missionId: string; assignmentId: string; todoId: string; reason: string }) => {
+      this.postMessage({
+        type: 'todoApprovalRequested',
+        missionId: data.missionId,
+        assignmentId: data.assignmentId,
+        todoId: data.todoId,
+        reason: data.reason,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    // 阻塞事件
+    this.missionExecutor.on('blocked', (blockedItem: BlockedItem) => {
+      this.postMessage({
+        type: 'missionBlocked',
+        blockedItem,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    this.missionExecutor.on('unblocked', (blockedItem: BlockedItem) => {
+      this.postMessage({
+        type: 'missionUnblocked',
+        blockedItem,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    // 进度更新事件
+    this.missionExecutor.on('progressUpdated', (progress: ExecutionProgress) => {
+      this.postMessage({
+        type: 'missionProgress',
+        progress,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    // 契约验证事件
+    this.missionExecutor.on('contractVerified', (data: { missionId: string; contractId: string; success: boolean }) => {
+      this.postMessage({
+        type: 'contractVerified',
+        missionId: data.missionId,
+        contractId: data.contractId,
+        success: data.success,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+  }
+
+  /**
+   * 设置 MissionOrchestrator
+   * 用于 Mission-Driven 架构
+   */
+  setMissionOrchestrator(orchestrator: MissionOrchestrator): void {
+    this.missionOrchestrator = orchestrator;
+    this.bindMissionEvents();
+  }
+
+  /**
+   * 设置 MissionExecutor
+   * 用于 Mission-Driven 架构
+   */
+  setMissionExecutor(executor: MissionExecutor): void {
+    this.missionExecutor = executor;
+    this.bindMissionEvents();
+  }
+
+  /**
+   * 获取 MissionOrchestrator
+   */
+  getMissionOrchestrator(): MissionOrchestrator | undefined {
+    return this.missionOrchestrator;
+  }
+
+  /**
+   * 获取 MissionExecutor
+   */
+  getMissionExecutor(): MissionExecutor | undefined {
+    return this.missionExecutor;
   }
 
   /** 打断当前任务 - 增强版：添加等待和超时机制 */
   private async interruptCurrentTask(options?: { silent?: boolean }): Promise<void> {
-    logger.info('[MultiCLI] 收到中断请求', undefined, LogCategory.UI);
+    logger.info('界面.任务.中断.请求', undefined, LogCategory.UI);
 
 
     const taskManager = await this.getTaskManager();
@@ -776,30 +1097,30 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     // 1. 首先中断 Orchestrator（这会触发 AbortController）
     if (this.intelligentOrchestrator.running) {
-      logger.info('[MultiCLI] 中断 Orchestrator', undefined, LogCategory.UI);
+      logger.info('界面.任务.中断.编排器', undefined, LogCategory.UI);
       await this.intelligentOrchestrator.interrupt();
     }
 
     // 2. 中断所有 CLI 并等待完成
-    logger.info('[MultiCLI] 中断所有 CLI...', undefined, LogCategory.UI);
+    logger.info('界面.任务.中断.CLI.开始', undefined, LogCategory.UI);
     try {
       const interruptCompleted = await Promise.race([
         this.cliFactory.interruptAll().then(() => true),
         new Promise<boolean>((resolve) => setTimeout(resolve, 5000, false)) // 5秒超时
       ]);
       if (!interruptCompleted) {
-        logger.warn('[MultiCLI] CLI 中断超时，尝试强制断开连接', undefined, LogCategory.UI);
+        logger.warn('界面.任务.中断.CLI.超时', undefined, LogCategory.UI);
       }
       await this.cliFactory.disconnectAll();
       await this.cliFactory.resetAllSessions();
-      logger.info('[MultiCLI] CLI 已断开并重置会话', undefined, LogCategory.UI);
+      logger.info('界面.任务.中断.CLI.重置', undefined, LogCategory.UI);
     } catch (error) {
-      logger.error('[MultiCLI] CLI 中断出错:', error, LogCategory.UI);
+      logger.error('界面.任务.中断.CLI.错误', error, LogCategory.UI);
       try {
         await this.cliFactory.disconnectAll();
         await this.cliFactory.resetAllSessions();
       } catch (cleanupError) {
-        logger.error('[MultiCLI] CLI 清理失败:', cleanupError, LogCategory.UI);
+        logger.error('界面.任务.中断.CLI.清理_失败', cleanupError, LogCategory.UI);
       }
     }
 
@@ -897,6 +1218,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [this.extensionUri],
     };
 
+    // HTML 中已注入 initialSessionId，webview 加载时即有正确的 sessionId
     webviewView.webview.html = this.getHtmlContent(webviewView.webview);
 
     // 处理来自 Webview 的消息
@@ -914,7 +1236,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private async checkCliAvailability(): Promise<void> {
     try {
       const availability = await this.cliFactory.checkAllAvailability();
-      logger.info('[MultiCLI] CLI 可用性检测结果:', availability, LogCategory.UI);
+      logger.info('界面.CLI.可用性', availability, LogCategory.UI);
 
       // 更新 CLI 状态
       const cliTypes: CLIType[] = ['claude', 'codex', 'gemini'];
@@ -941,13 +1263,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         });
       }
     } catch (error) {
-      logger.error('[MultiCLI] CLI 可用性检测失败:', error, LogCategory.UI);
+      logger.error('界面.CLI.可用性_失败', error, LogCategory.UI);
     }
   }
 
   /** 处理 Webview 消息 */
   private async handleMessage(message: WebviewToExtensionMessage): Promise<void> {
-    logger.info('[MultiCLI] 收到 Webview 消息:', message.type, LogCategory.UI);
+    logger.info('界面.Webview.消息.收到', { type: message.type }, LogCategory.UI);
 
     switch (message.type) {
       case 'getState':
@@ -967,32 +1289,32 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'executeTask':
-        logger.info('[MultiCLI] 处理 executeTask, prompt:', (message as any).prompt, LogCategory.UI);
+        logger.info('界面.任务.执行.请求', { promptLength: String((message as any).prompt || '').length, imageCount: (message as any).images?.length || 0 }, LogCategory.UI);
         const images = (message as any).images || [];
         await this.executeTask((message as any).prompt, undefined, images);
         break;
 
       case 'interruptTask':
        
-        logger.info('[MultiCLI] 收到 interruptTask 消息, taskId:', message.taskId, LogCategory.UI);
+        logger.info('界面.任务.中断.消息', { taskId: message.taskId }, LogCategory.UI);
         await this.interruptCurrentTask();
         break;
 
       case 'pauseTask':
        
-        logger.info('[MultiCLI] 收到 pauseTask 消息, taskId:', (message as any).taskId);
+        logger.info('界面.任务.暂停.消息', { taskId: (message as any).taskId }, LogCategory.UI);
         this.postMessage({ type: 'toast', message: '暂停功能开发中', toastType: 'info' });
         break;
 
       case 'resumeTask':
        
-        logger.info('[MultiCLI] 收到 resumeTask 消息, taskId:', (message as any).taskId);
+        logger.info('界面.任务.恢复.消息', { taskId: (message as any).taskId }, LogCategory.UI);
         await this.resumeInterruptedTask();
         break;
 
       case 'appendMessage':
        
-        logger.info('[MultiCLI] 收到 appendMessage 消息', undefined, LogCategory.UI);
+        logger.info('界面.消息.补充.请求', undefined, LogCategory.UI);
         await this.handleAppendMessage((message as any).taskId, (message as any).content);
         break;
 
@@ -1096,7 +1418,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'selectCli':
         // 用户手动选择 CLI（null 表示自动选择）
         this.selectedCli = message.cli || null;
-        logger.info('[MultiCLI] 用户选择 CLI:', this.selectedCli || '自动', LogCategory.UI);
+        logger.info('界面.CLI.选择.变更', { cli: this.selectedCli || 'auto' }, LogCategory.UI);
         break;
 
       case 'confirmPlan':
@@ -1321,9 +1643,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       // 写入配置文件
       fs.writeFileSync(configPath, JSON.stringify(existingConfig, null, 2), 'utf-8');
-      logger.info('[MultiCLI] Prompt 增强配置已保存到:', configPath, LogCategory.UI);
+      logger.info('界面.提示词_增强.配置.已保存', { path: configPath }, LogCategory.UI);
     } catch (error) {
-      logger.error('[MultiCLI] 保存配置失败:', error, LogCategory.UI);
+      logger.error('界面.提示词_增强.配置.保存_失败', error, LogCategory.UI);
     }
   }
 
@@ -1346,7 +1668,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         }
       }
     } catch (error) {
-      logger.error('[MultiCLI] 读取配置失败:', error, LogCategory.UI);
+      logger.error('界面.提示词_增强.配置.读取_失败', error, LogCategory.UI);
     }
     return { baseUrl: '', apiKey: '' };
   }
@@ -1427,15 +1749,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     let blobNames: string[] = [];
     if (projectRoot) {
       try {
-        logger.info('[MultiCLI] 开始 ACE 索引...', undefined, LogCategory.UI);
+        logger.info('界面.ACE.索引.开始', { projectRoot }, LogCategory.UI);
         const aceManager = new AceIndexManager(projectRoot, baseUrl, apiKey);
         const indexResult = await aceManager.indexProject();
         if (indexResult.status !== 'error') {
           blobNames = aceManager.loadIndex();
-          logger.info(`[MultiCLI] ACE 索引完成，共 ${blobNames.length} 个文件块`, undefined, LogCategory.UI);
+          logger.info('界面.ACE.索引.完成', { blobCount: blobNames.length }, LogCategory.UI);
         }
       } catch (error) {
-        logger.error('[MultiCLI] ACE 索引失败:', error, LogCategory.UI);
+        logger.error('界面.ACE.索引.失败', error, LogCategory.UI);
         // 索引失败不阻止增强，继续使用空 blobs
       }
     }
@@ -1571,7 +1893,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         statuses
       } as ExtensionToWebviewMessage);
     } catch (error) {
-      logger.error('[MultiCLI] CLI 状态检测失败:', error, LogCategory.UI);
+      logger.error('界面.CLI.状态.检查_失败', error, LogCategory.UI);
     }
   }
 
@@ -1579,7 +1901,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private sendExecutionStats(): void {
     const executionStats = this.intelligentOrchestrator.getExecutionStats();
     if (!executionStats) {
-      logger.info('[MultiCLI] 执行统计模块未初始化', undefined, LogCategory.UI);
+      logger.info('界面.执行统计.未初始化', undefined, LogCategory.UI);
       return;
     }
 
@@ -1759,7 +2081,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         this.postMessage({ type: 'toast', message: `画像重载失败: ${reloadMsg}`, toastType: 'warning' });
       }
       this.sendProfileConfig();
-      logger.info(`[MultiCLI] 画像配置已保存到: ${ProfileStorage.getConfigDir()}`, undefined, LogCategory.UI);
+      logger.info('界面.画像.配置.已保存', { path: ProfileStorage.getConfigDir() }, LogCategory.UI);
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       this.postMessage({ type: 'toast', message: `保存失败: ${errorMsg}`, toastType: 'error' });
@@ -1787,7 +2109,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 处理设置交互模式 */
   private handleSetInteractionMode(mode: import('../types').InteractionMode): void {
-    logger.info(`[MultiCLI] 设置交互模式: ${mode}`, undefined, LogCategory.UI);
+    logger.info('界面.交互_模式.变更', { mode }, LogCategory.UI);
     this.intelligentOrchestrator.setInteractionMode(mode);
     this.postMessage({ type: 'interactionModeChanged', mode });
     this.postMessage({
@@ -1813,7 +2135,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 处理恢复确认 */
   private async handleRecoveryConfirmation(decision: 'retry' | 'rollback' | 'continue'): Promise<void> {
-    logger.info(`[MultiCLI] 用户恢复决策: ${decision}`, undefined, LogCategory.UI);
+    logger.info('界面.编排器.恢复.决策', { decision }, LogCategory.UI);
     if (this.recoveryConfirmationResolver) {
       this.recoveryConfirmationResolver(decision);
       this.recoveryConfirmationResolver = null;
@@ -1897,7 +2219,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }, 5000);
 
     } catch (error) {
-      logger.error('[MultiCLI] 打开 diff 视图失败:', error, LogCategory.UI);
+      logger.error('界面.差异.打开_失败', error, LogCategory.UI);
       this.postMessage({ type: 'toast', message: '打开 diff 视图失败', toastType: 'error' });
     }
   }
@@ -1928,7 +2250,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         preserveFocus: false
       });
     } catch (error) {
-      logger.error('[MultiCLI] 打开文件失败:', error, LogCategory.UI);
+      logger.error('界面.文件.打开_失败', error, LogCategory.UI);
       this.postMessage({ type: 'toast', message: `打开文件失败: ${filepath}`, toastType: 'error' });
     }
   }
@@ -2006,7 +2328,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 处理补充内容消息 */
   private async handleAppendMessage(taskId: string, content: string): Promise<void> {
-    logger.info(`[MultiCLI] 补充内容到任务 ${taskId}: ${content.substring(0, 50)}...`);
+    logger.info('界面.消息.补充.请求', { taskId, preview: content.substring(0, 50) }, LogCategory.UI);
 
     // 检查是否有正在运行的任务
     if (!this.intelligentOrchestrator.running) {
@@ -2026,9 +2348,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       // 发送到当前活跃的 CLI
       // 注意：这是一个简化实现，真正的追加需要 CLI 支持
-      logger.info('[MultiCLI] 补充内容功能：当前为简化实现', undefined, LogCategory.UI);
+      logger.info('界面.消息.补充.降级', { reason: 'simplified_implementation' }, LogCategory.UI);
     } catch (error) {
-      logger.error('[MultiCLI] 补充内容失败:', error, LogCategory.UI);
+      logger.error('界面.消息.补充.失败', error, LogCategory.UI);
       this.postMessage({ type: 'toast', message: '补充内容失败', toastType: 'error' });
     }
   }
@@ -2050,13 +2372,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 执行任务 */
   private async executeTask(prompt: string, forceCli?: CLIType, images?: Array<{dataUrl: string}>): Promise<void> {
-    logger.info('[MultiCLI] executeTask 开始', { prompt, imageCount: images?.length || 0 }, LogCategory.UI);
+    logger.info('界面.任务.执行.开始', { promptLength: prompt.length, imageCount: images?.length || 0, forceCli: forceCli || undefined }, LogCategory.UI);
 
 
     if (!this.activeSessionId) {
       const currentSession = this.sessionManager.getCurrentSession();
       this.activeSessionId = currentSession?.id || null;
-      logger.info('[MultiCLI] 设置 activeSessionId:', this.activeSessionId, LogCategory.UI);
+      logger.info('界面.会话.当前.设置', { sessionId: this.activeSessionId }, LogCategory.UI);
     }
 
     // 如果有图片，保存到临时文件
@@ -2075,7 +2397,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           const filePath = path.join(tmpDir, `image_${Date.now()}_${i}.${ext}`);
           fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
           imagePaths.push(filePath);
-          logger.info('[MultiCLI] 图片已保存:', filePath, LogCategory.UI);
+          logger.info('界面.图片.已保存', { path: filePath }, LogCategory.UI);
         }
       }
     }
@@ -2233,7 +2555,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 智能编排模式执行 */
   private async executeWithIntelligentOrchestrator(prompt: string, imagePaths: string[]): Promise<void> {
-    logger.info('[MultiCLI] 使用智能编排模式', undefined, LogCategory.UI);
+    logger.info('界面.执行.模式.智能', undefined, LogCategory.UI);
 
     const interactionMode = this.intelligentOrchestrator.getInteractionMode();
 
@@ -2267,11 +2589,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         if (needsWorker) {
          
           await taskManager!.completeTask(task.id);
-          logger.info('[MultiCLI] 任务已完成', { taskId: task.id, subTaskCount: plan?.subTasks?.length || 0 }, LogCategory.UI);
+          logger.info('界面.任务.完成', { taskId: task.id, subTaskCount: plan?.subTasks?.length || 0 }, LogCategory.UI);
         } else {
           // 不需要 Worker，标记任务为已完成（无子任务）
           await taskManager!.completeTask(task.id);
-          logger.info('[MultiCLI] 编排者直接回答，任务已完成（无子任务）', undefined, LogCategory.UI);
+          logger.info('界面.任务.完成.无_子任务', { taskId: task.id }, LogCategory.UI);
         }
       }
 
@@ -2279,7 +2601,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.saveMessageToSession(prompt, result, undefined, 'orchestrator');
 
     } catch (error) {
-      logger.error('[MultiCLI] 智能编排执行错误:', error, LogCategory.UI);
+      logger.error('界面.执行.智能.失败', error, LogCategory.UI);
       const errorMsg = error instanceof Error ? error.message : String(error);
 
 
@@ -2298,7 +2620,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 直接 CLI 执行模式 */
   private async executeWithDirectCli(prompt: string, targetCli: CLIType, imagePaths: string[]): Promise<void> {
-    logger.info(`[MultiCLI] 使用直接执行模式, CLI: ${targetCli}`, undefined, LogCategory.UI);
+    logger.info('界面.执行.模式.直接', { cli: targetCli }, LogCategory.UI);
 
     const startTime = Date.now();
     const taskManager = await this.getTaskManager();
@@ -2310,9 +2632,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.cliOutputs.set(targetCli, []);
 
     try {
-      logger.info(`[MultiCLI] 调用 ${targetCli} CLI...`, undefined, LogCategory.UI);
+      logger.info('界面.执行.直接.请求', { cli: targetCli }, LogCategory.UI);
       const response = await this.cliFactory.sendMessage(targetCli, prompt, imagePaths);
-      logger.info(`[MultiCLI] ${targetCli} CLI 响应:`, response.content?.substring(0, 100), LogCategory.UI);
+      logger.info('界面.执行.直接.响应', { cli: targetCli, preview: response.content?.substring(0, 100) }, LogCategory.UI);
       const executionStats = this.intelligentOrchestrator.getExecutionStats();
       if (executionStats) {
         executionStats.recordExecution({
@@ -2336,7 +2658,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
 
     } catch (error) {
-      logger.error(`[MultiCLI] ${targetCli} executeTask 错误:`, error, LogCategory.UI);
+      logger.error('界面.执行.直接.失败', error, LogCategory.UI);
       const errorMsg = error instanceof Error ? error.message : String(error);
       await taskManager.failTask(task.id, errorMsg);
       const executionStats = this.intelligentOrchestrator.getExecutionStats();
@@ -2376,7 +2698,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const newSession = this.sessionManager.createSession();
     // 更新活跃会话ID
     this.activeSessionId = newSession.id;
-    logger.info('[MultiCLI] 创建新会话，已重置所有 CLI 进程, activeSessionId:', this.activeSessionId, LogCategory.UI);
+    logger.info('界面.会话.已创建', { sessionId: this.activeSessionId }, LogCategory.UI);
     // 通知 webview 新会话已创建
     this.postMessage({ type: 'sessionCreated', session: newSession as any });
     this.postMessage({ type: 'sessionsUpdated', sessions: this.sessionManager.getAllSessions() as any[] });
@@ -2433,7 +2755,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private saveCurrentSessionData(messages: any[], cliOutputs: Record<string, any[]>): void {
     const currentSession = this.sessionManager.getCurrentSession();
     if (!currentSession) {
-      logger.info('[MultiCLI] saveCurrentSessionData: 没有当前会话', undefined, LogCategory.UI);
+      logger.info('界面.会话.保存.跳过', { reason: 'no_current_session' }, LogCategory.UI);
       return;
     }
 
@@ -2450,7 +2772,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     // 使用新的 API 保存会话数据
     this.sessionManager.updateSessionData(currentSession.id, sessionMessages, cliOutputs);
-    logger.info('[MultiCLI] 保存会话数据，消息数:', sessionMessages.length, LogCategory.UI);
+    logger.info('界面.会话.保存.完成', { messageCount: sessionMessages.length }, LogCategory.UI);
   }
 
   /** 构建 UI 状态 */
@@ -2475,7 +2797,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const isRunning = currentTask?.status === 'running' || this.intelligentOrchestrator.running;
 
     return {
-      currentSessionId: currentSession?.id,
+      // 使用 activeSessionId 作为单一真相来源，确保与消息发送时的 sessionId 一致
+      currentSessionId: this.activeSessionId ?? currentSession?.id,
       sessions: allSessions as any[],
       currentTask,
       tasks,
@@ -2551,6 +2874,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 替换 CSP 占位符
     html = html.replace(/\{\{cspSource\}\}/g, webview.cspSource);
 
+    // 注入初始 sessionId，确保 webview 加载时就有正确的值（避免时序问题）
+    const initialSessionId = this.activeSessionId || '';
+    html = html.replace(/\{\{initialSessionId\}\}/g, initialSessionId);
+
     return html;
   }
 
@@ -2561,24 +2888,24 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 清理所有资源 - VSCode 关闭时调用 */
   async dispose(): Promise<void> {
-    logger.info('[WebviewProvider] 开始清理资源...', undefined, LogCategory.UI);
+    logger.info('界面.销毁.开始', undefined, LogCategory.UI);
 
     try {
       // 1. 中断当前任务
       if (this.intelligentOrchestrator) {
-        logger.info('[WebviewProvider] 中断编排器...', undefined, LogCategory.UI);
+        logger.info('界面.销毁.编排器.中断', undefined, LogCategory.UI);
         this.intelligentOrchestrator.interrupt();
       }
 
       // 2. 清理 CLI 适配器（终止所有 CLI 进程）
       if (this.cliFactory) {
-        logger.info('[WebviewProvider] 清理 CLI 适配器...', undefined, LogCategory.UI);
+        logger.info('界面.销毁.CLI.清理', undefined, LogCategory.UI);
         await this.cliFactory.dispose();
       }
 
       // 3. 移除事件监听器
       globalEventBus.clear();
-      logger.info('[WebviewProvider] 事件监听器已移除', undefined, LogCategory.UI);
+      logger.info('界面.销毁.事件.已清理', undefined, LogCategory.UI);
 
       // 4. 清理待确认的 Promise
       if (this.pendingConfirmation) {
@@ -2593,9 +2920,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 5. 清理 Webview
       this._view = undefined;
 
-      logger.info('[WebviewProvider] 资源清理完成', undefined, LogCategory.UI);
+      logger.info('界面.销毁.完成', undefined, LogCategory.UI);
     } catch (error) {
-      logger.error('[WebviewProvider] 清理资源时出错:', error, LogCategory.UI);
+      logger.error('界面.销毁.失败', error, LogCategory.UI);
     }
   }
 }

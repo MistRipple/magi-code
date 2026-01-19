@@ -45,7 +45,7 @@ export class ExecutionStateManager {
       const content = fs.readFileSync(filePath, 'utf-8');
       return JSON.parse(content) as ExecutionState;
     } catch (error) {
-      logger.warn('[ExecutionState] 读取状态失败:', { sessionId, error }, LogCategory.ORCHESTRATOR);
+      logger.warn('编排器.执行_状态.加载_失败', { sessionId, error }, LogCategory.ORCHESTRATOR);
       return null;
     }
   }

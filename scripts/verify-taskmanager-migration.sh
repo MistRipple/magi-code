@@ -26,28 +26,29 @@ fi
 total_passed=$(echo "$test_output" | grep -o "✅ 通过: [0-9]*/[0-9]*" | awk -F'[/: ]' '{sum+=$4} END {print sum}')
 echo "✅ 测试通过 ($total_passed 个测试)"
 
-# 3. TaskManager 使用检查
+# 3. 日志 key 规范检查
 echo ""
-echo "3. TaskManager 使用检查..."
-tm_count=$(grep "this\.taskManager" src/orchestrator/orchestrator-agent.ts 2>/dev/null | wc -l | tr -d ' ')
-if [ "$tm_count" = "0" ]; then
-  echo "✅ OrchestratorAgent 中无 TaskManager 引用"
+echo "3. 日志 key 规范检查..."
+if node scripts/check-log-keys.js >/dev/null 2>&1; then
+  echo "✅ 日志 key 规范通过"
 else
-  echo "❌ 发现 $tm_count 个 TaskManager 引用"
-  grep -n "this\.taskManager" src/orchestrator/orchestrator-agent.ts
+  echo "❌ 日志 key 规范未通过"
+  node scripts/check-log-keys.js
   exit 1
 fi
 
-# 4. 状态同步代码检查
+# 4. 旧架构文件检查
 echo ""
-echo "4. 状态同步代码检查..."
-sync_count=$(grep "同步到 TaskManager" src/orchestrator/orchestrator-agent.ts 2>/dev/null | wc -l | tr -d ' ')
-if [ "$sync_count" = "0" ]; then
-  echo "✅ 无状态同步代码"
-else
-  echo "❌ 发现 $sync_count 个状态同步注释"
-  grep -n "同步到 TaskManager" src/orchestrator/orchestrator-agent.ts
-  exit 1
+echo "4. 旧架构文件检查..."
+old_files_exist=0
+for file in "src/orchestrator/orchestrator-agent.ts" "src/orchestrator/worker-agent.ts" "src/orchestrator/worker-pool.ts"; do
+  if [ -f "$file" ]; then
+    echo "❌ 旧架构文件仍存在: $file"
+    old_files_exist=1
+  fi
+done
+if [ "$old_files_exist" = "0" ]; then
+  echo "✅ 旧架构文件已全部删除"
 fi
 
 # 5. TaskManager 文件清理检查
@@ -60,29 +61,19 @@ else
   exit 1
 fi
 
-# 6. UnifiedTaskManager 使用检查
+# 6. MissionDrivenEngine 使用检查
 echo ""
-echo "6. UnifiedTaskManager 使用检查..."
-utm_count=$(grep "this\.unifiedTaskManager\." src/orchestrator/orchestrator-agent.ts 2>/dev/null | wc -l | tr -d ' ')
-if [ "$utm_count" -gt 15 ]; then
-  echo "✅ UnifiedTaskManager 正常使用 ($utm_count 处)"
+echo "6. MissionDrivenEngine 使用检查..."
+mde_count=$(grep "missionDrivenEngine" src/orchestrator/intelligent-orchestrator.ts 2>/dev/null | wc -l | tr -d ' ')
+if [ "$mde_count" -gt 5 ]; then
+  echo "✅ MissionDrivenEngine 正常使用 ($mde_count 处)"
 else
-  echo "⚠️  UnifiedTaskManager 使用较少 ($utm_count 处)"
+  echo "⚠️  MissionDrivenEngine 使用较少 ($mde_count 处)"
 fi
 
-# 7. SessionManager 传递检查
+# 7. IntelligentOrchestrator 检查
 echo ""
-echo "7. SessionManager 传递检查..."
-if grep -q "sessionManager?: UnifiedSessionManager" src/orchestrator/orchestrator-agent.ts; then
-  echo "✅ OrchestratorAgent 接受 SessionManager"
-else
-  echo "❌ OrchestratorAgent 未接受 SessionManager"
-  exit 1
-fi
-
-# 8. IntelligentOrchestrator 检查
-echo ""
-echo "8. IntelligentOrchestrator 检查..."
+echo "7. IntelligentOrchestrator 检查..."
 if grep -q "sessionManager: UnifiedSessionManager" src/orchestrator/intelligent-orchestrator.ts; then
   echo "✅ IntelligentOrchestrator 直接接收 SessionManager"
 elif grep -q "this.sessionManager = sessionManager" src/orchestrator/intelligent-orchestrator.ts; then
@@ -97,11 +88,11 @@ echo "=== ✅ 所有检查通过 ==="
 echo ""
 echo "验证摘要:"
 echo "  - 编译: ✅ 通过"
-echo "  - 测试: ✅ $total_passed/$total_passed 通过"
-echo "  - TaskManager 清理: ✅ 完成"
-echo "  - 状态同步清理: ✅ 完成"
+echo "  - 测试: ✅ $total_passed 通过"
+echo "  - 日志 key 规范: ✅ 通过"
+echo "  - 旧架构清理: ✅ 完成"
 echo "  - TaskManager 删除: ✅ 完成"
-echo "  - UnifiedTaskManager 使用: ✅ 正常"
+echo "  - MissionDrivenEngine 使用: ✅ 正常"
 echo "  - SessionManager 传递: ✅ 正常"
 echo ""
-echo "项目状态: 生产就绪 \(Production Ready\)"
+echo "项目状态: 生产就绪 (Production Ready)"

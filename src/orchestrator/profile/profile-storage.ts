@@ -62,7 +62,7 @@ export class ProfileStorage {
           const content = fs.readFileSync(filePath, 'utf-8');
           config.workers[workerType] = JSON.parse(content);
         } catch (e) {
-          logger.warn(`[ProfileStorage] 读取 ${workerType} 配置失败:`, e, LogCategory.ORCHESTRATOR);
+          logger.warn('编排器.画像_存储.子代理_配置.读取_失败', { workerType, error: e }, LogCategory.ORCHESTRATOR);
         }
       }
     }
@@ -74,7 +74,7 @@ export class ProfileStorage {
         const content = fs.readFileSync(categoriesPath, 'utf-8');
         config.categories = JSON.parse(content);
       } catch (e) {
-        logger.warn('[ProfileStorage] 读取分类配置失败:', e, LogCategory.ORCHESTRATOR);
+        logger.warn('编排器.画像_存储.分类_配置.读取_失败', { error: e }, LogCategory.ORCHESTRATOR);
       }
     }
 
@@ -171,7 +171,7 @@ export class ProfileStorage {
     }
 
     if (created.length > 0) {
-      logger.info(`[ProfileStorage] 已重建默认画像配置: ${created.join(', ')}`, undefined, LogCategory.ORCHESTRATOR);
+      logger.info('编排器.画像_存储.默认.已重建', { created }, LogCategory.ORCHESTRATOR);
     }
   }
 }

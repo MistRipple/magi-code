@@ -1,0 +1,895 @@
+/**
+ * Mission Executor - 任务执行器
+ *
+ * 核心职责：
+ * - 执行 Mission 中的所有 Assignment
+ * - 协调 Worker 之间的执行顺序
+ * - 管理契约验证
+ * - 处理执行过程中的错误
+ */
+
+import { EventEmitter } from 'events';
+import { CLIType } from '../../types';
+import { ProfileLoader } from '../profile/profile-loader';
+import { GuidanceInjector } from '../profile/guidance-injector';
+import { ProfileAwareReviewer } from '../review/profile-aware-reviewer';
+import { AutonomousWorker, AutonomousExecutionResult } from '../worker';
+import { BaseWorker } from '../../workers/base-worker';
+import {
+  Mission,
+  Assignment,
+  WorkerTodo,
+} from '../mission';
+import { MissionOrchestrator } from './mission-orchestrator';
+
+/**
+ * 阻塞项类型
+ */
+export type BlockedItemType = 'assignment' | 'todo';
+
+/**
+ * 阻塞原因
+ */
+export interface BlockingReason {
+  /** 阻塞类型 */
+  type: 'contract_pending' | 'dependency_incomplete' | 'resource_conflict' | 'approval_required';
+  /** 依赖的契约 ID */
+  contractId?: string;
+  /** 依赖的 Todo ID */
+  dependencyId?: string;
+  /** 描述 */
+  description: string;
+}
+
+/**
+ * 阻塞项
+ */
+export interface BlockedItem {
+  /** 唯一 ID */
+  id: string;
+  /** 阻塞项类型 */
+  type: BlockedItemType;
+  /** Mission ID */
+  missionId: string;
+  /** Assignment ID */
+  assignmentId: string;
+  /** Todo ID（如果是 Todo 级别阻塞） */
+  todoId?: string;
+  /** 阻塞原因 */
+  reason: BlockingReason;
+  /** 阻塞开始时间 */
+  blockedAt: number;
+  /** 解除时间 */
+  unblockedAt?: number;
+  /** 是否已解除 */
+  resolved: boolean;
+}
+
+/**
+ * 执行选项
+ */
+export interface ExecutionOptions {
+  /** 工作目录 */
+  workingDirectory: string;
+  /** 超时时间（毫秒） */
+  timeout?: number;
+  /** 项目上下文 */
+  projectContext?: string;
+  /** 并行执行 */
+  parallel?: boolean;
+  /** 并行规划（默认 true） */
+  parallelPlanning?: boolean;
+  /** 阻塞超时时间（毫秒），超时后跳过阻塞项 */
+  blockingTimeout?: number;
+  /** 阻塞检查间隔（毫秒） */
+  blockingCheckInterval?: number;
+  /** 输出回调 */
+  onOutput?: (workerId: CLIType, output: string) => void;
+  /** 进度回调 */
+  onProgress?: (progress: ExecutionProgress) => void;
+  /** 阻塞回调 */
+  onBlocked?: (blockedItem: BlockedItem) => void;
+  /** 解除阻塞回调 */
+  onUnblocked?: (blockedItem: BlockedItem) => void;
+}
+
+/**
+ * 执行进度
+ */
+export interface ExecutionProgress {
+  missionId: string;
+  phase: 'planning' | 'executing' | 'reviewing' | 'completed';
+  totalAssignments: number;
+  completedAssignments: number;
+  blockedAssignments: number;
+  currentAssignment?: {
+    id: string;
+    workerId: CLIType;
+    progress: number;
+  };
+  blockedItems: BlockedItem[];
+  overallProgress: number;
+}
+
+/**
+ * 执行结果
+ */
+export interface ExecutionResult {
+  mission: Mission;
+  success: boolean;
+  assignmentResults: Map<string, AutonomousExecutionResult>;
+  contractVerifications: Map<string, boolean>;
+  blockedItems: BlockedItem[];
+  resolvedBlockings: BlockedItem[];
+  errors: string[];
+  duration: number;
+}
+
+/**
+ * MissionExecutor - 任务执行器
+ */
+export class MissionExecutor extends EventEmitter {
+  private workers: Map<CLIType, AutonomousWorker> = new Map();
+  private reviewer: ProfileAwareReviewer;
+  private blockedItems: Map<string, BlockedItem> = new Map();
+  private resolvedBlockings: BlockedItem[] = [];
+  private blockingIdCounter = 0;
+
+  constructor(
+    private orchestrator: MissionOrchestrator,
+    private profileLoader: ProfileLoader,
+    private guidanceInjector: GuidanceInjector
+  ) {
+    super();
+    this.reviewer = new ProfileAwareReviewer(profileLoader);
+  }
+
+  /**
+   * 注册 Worker
+   */
+  registerWorker(cliType: CLIType, baseWorker: BaseWorker): void {
+    const autonomousWorker = new AutonomousWorker(
+      cliType,
+      baseWorker,
+      this.profileLoader,
+      this.guidanceInjector
+    );
+
+    this.setupWorkerListeners(autonomousWorker);
+    this.workers.set(cliType, autonomousWorker);
+  }
+
+  /**
+   * 设置 Worker 事件监听
+   */
+  private setupWorkerListeners(worker: AutonomousWorker): void {
+    worker.on('todoStarted', (data) => {
+      this.emit('todoStarted', data);
+    });
+
+    worker.on('todoCompleted', (data) => {
+      this.emit('todoCompleted', data);
+    });
+
+    worker.on('todoFailed', (data) => {
+      this.emit('todoFailed', data);
+    });
+
+    worker.on('dynamicTodoAdded', (data) => {
+      this.emit('dynamicTodoAdded', data);
+    });
+
+    worker.on('approvalRequested', (data) => {
+      this.emit('approvalRequested', data);
+    });
+  }
+
+  /**
+   * 执行 Mission
+   */
+  async execute(
+    mission: Mission,
+    options: ExecutionOptions
+  ): Promise<ExecutionResult> {
+    const startTime = Date.now();
+    const assignmentResults = new Map<string, AutonomousExecutionResult>();
+    const contractVerifications = new Map<string, boolean>();
+    const errors: string[] = [];
+
+    // 清除上一次执行的阻塞状态
+    this.clearBlockingState();
+
+    this.emit('executionStarted', { missionId: mission.id });
+
+    // 报告初始进度
+    this.reportProgress(mission, 'planning', assignmentResults, options.onProgress);
+
+    try {
+      // 1. Worker 规划阶段
+      await this.planningPhase(mission, options);
+
+      // 2. 执行阶段
+      this.reportProgress(mission, 'executing', assignmentResults, options.onProgress);
+
+      if (options.parallel) {
+        await this.executeParallel(mission, options, assignmentResults, errors);
+      } else {
+        await this.executeSequential(mission, options, assignmentResults, errors);
+      }
+
+      // 3. 评审阶段
+      this.reportProgress(mission, 'reviewing', assignmentResults, options.onProgress);
+      await this.reviewPhase(mission, assignmentResults);
+
+      // 4. 契约验证
+      await this.verifyContracts(mission, contractVerifications, errors);
+
+      // 5. 完成
+      const success = errors.length === 0 &&
+        Array.from(assignmentResults.values()).every(r => r.success);
+
+      if (success) {
+        await this.orchestrator.completeMission(mission.id);
+      } else {
+        await this.orchestrator.failMission(mission.id, errors.join('; '));
+      }
+
+      this.reportProgress(mission, 'completed', assignmentResults, options.onProgress);
+
+      const result: ExecutionResult = {
+        mission,
+        success,
+        assignmentResults,
+        contractVerifications,
+        blockedItems: this.getBlockedItems(),
+        resolvedBlockings: this.getResolvedBlockings(),
+        errors,
+        duration: Date.now() - startTime,
+      };
+
+      this.emit('executionCompleted', result);
+
+      return result;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      errors.push(errorMessage);
+
+      await this.orchestrator.failMission(mission.id, errorMessage);
+
+      this.emit('executionFailed', { missionId: mission.id, error: errorMessage });
+
+      return {
+        mission,
+        success: false,
+        assignmentResults,
+        contractVerifications,
+        blockedItems: this.getBlockedItems(),
+        resolvedBlockings: this.getResolvedBlockings(),
+        errors,
+        duration: Date.now() - startTime,
+      };
+    }
+  }
+
+  /**
+   * Worker 规划阶段（支持并行规划）
+   */
+  private async planningPhase(
+    mission: Mission,
+    options: ExecutionOptions
+  ): Promise<void> {
+    // 默认启用并行规划
+    const parallelPlanning = options.parallelPlanning !== false;
+
+    if (parallelPlanning && mission.assignments.length > 1) {
+      // 并行规划：所有 Worker 同时规划
+      await this.planningPhaseParallel(mission, options);
+    } else {
+      // 顺序规划
+      await this.planningPhaseSequential(mission, options);
+    }
+  }
+
+  /**
+   * 并行规划阶段
+   */
+  private async planningPhaseParallel(
+    mission: Mission,
+    options: ExecutionOptions
+  ): Promise<void> {
+    const planningPromises = mission.assignments.map(async (assignment) => {
+      const worker = this.workers.get(assignment.workerId);
+      if (!worker) {
+        throw new Error(`Worker not found: ${assignment.workerId}`);
+      }
+
+      // Worker 自主规划
+      const planResult = await worker.planAssignment(assignment, options.projectContext);
+
+      // 更新 Assignment 的 todos
+      assignment.todos = planResult.todos;
+      assignment.planningStatus = 'planned';
+
+      await this.orchestrator.updateAssignment(mission.id, assignment);
+
+      this.emit('assignmentPlanned', {
+        missionId: mission.id,
+        assignmentId: assignment.id,
+        todos: planResult.todos,
+        warnings: planResult.warnings,
+      });
+
+      return { assignmentId: assignment.id, planResult };
+    });
+
+    await Promise.all(planningPromises);
+  }
+
+  /**
+   * 顺序规划阶段
+   */
+  private async planningPhaseSequential(
+    mission: Mission,
+    options: ExecutionOptions
+  ): Promise<void> {
+    for (const assignment of mission.assignments) {
+      const worker = this.workers.get(assignment.workerId);
+      if (!worker) {
+        throw new Error(`Worker not found: ${assignment.workerId}`);
+      }
+
+      // Worker 自主规划
+      const planResult = await worker.planAssignment(assignment, options.projectContext);
+
+      // 更新 Assignment 的 todos
+      assignment.todos = planResult.todos;
+      assignment.planningStatus = 'planned';
+
+      await this.orchestrator.updateAssignment(mission.id, assignment);
+
+      this.emit('assignmentPlanned', {
+        missionId: mission.id,
+        assignmentId: assignment.id,
+        todos: planResult.todos,
+        warnings: planResult.warnings,
+      });
+    }
+  }
+
+  /**
+   * 顺序执行
+   */
+  private async executeSequential(
+    mission: Mission,
+    options: ExecutionOptions,
+    results: Map<string, AutonomousExecutionResult>,
+    errors: string[]
+  ): Promise<void> {
+    for (const assignment of mission.assignments) {
+      const result = await this.executeAssignment(assignment, mission, options);
+      results.set(assignment.id, result);
+
+      if (!result.success) {
+        errors.push(...result.errors);
+      }
+
+      await this.orchestrator.updateAssignment(mission.id, assignment);
+    }
+  }
+
+  /**
+   * 并行执行
+   */
+  private async executeParallel(
+    mission: Mission,
+    options: ExecutionOptions,
+    results: Map<string, AutonomousExecutionResult>,
+    errors: string[]
+  ): Promise<void> {
+    // 分析依赖关系，确定可并行执行的 Assignment
+    const executionGroups = this.groupByDependencies(mission);
+
+    for (const group of executionGroups) {
+      const groupPromises = group.map(async (assignment) => {
+        const result = await this.executeAssignment(assignment, mission, options);
+        results.set(assignment.id, result);
+
+        if (!result.success) {
+          errors.push(...result.errors);
+        }
+
+        await this.orchestrator.updateAssignment(mission.id, assignment);
+        return result;
+      });
+
+      await Promise.all(groupPromises);
+    }
+  }
+
+  /**
+   * 执行单个 Assignment
+   */
+  private async executeAssignment(
+    assignment: Assignment,
+    mission: Mission,
+    options: ExecutionOptions
+  ): Promise<AutonomousExecutionResult> {
+    const worker = this.workers.get(assignment.workerId);
+    if (!worker) {
+      throw new Error(`Worker not found: ${assignment.workerId}`);
+    }
+
+    // 检查阻塞
+    const blockingReason = this.checkAssignmentBlocking(assignment, mission);
+    if (blockingReason) {
+      const blockedItem = this.recordBlocking(
+        'assignment',
+        mission.id,
+        assignment.id,
+        blockingReason
+      );
+
+      // 等待阻塞解除
+      const unblocked = await this.waitForUnblocking(blockedItem, mission, options);
+      if (!unblocked) {
+        // 超时未解除，返回失败结果
+        assignment.status = 'blocked';
+        return {
+          assignment,
+          success: false,
+          completedTodos: [],
+          failedTodos: [],
+          skippedTodos: assignment.todos,
+          dynamicTodos: [],
+          recoveredTodos: [],
+          totalDuration: 0,
+          errors: [`Assignment blocked: ${blockingReason.description}`],
+          recoveryAttempts: 0,
+        };
+      }
+    }
+
+    assignment.status = 'executing';
+    assignment.startedAt = Date.now();
+
+    this.emit('assignmentStarted', {
+      missionId: mission.id,
+      assignmentId: assignment.id,
+      workerId: assignment.workerId,
+    });
+
+    const result = await worker.executeAssignment(assignment, {
+      workingDirectory: options.workingDirectory,
+      timeout: options.timeout,
+      projectContext: options.projectContext,
+      onOutput: (output) => {
+        options.onOutput?.(assignment.workerId, output);
+      },
+    });
+
+    // 执行完成后，检查并解除可能因此满足的阻塞
+    this.checkAndResolveBlockings(mission);
+
+    assignment.status = result.success ? 'completed' : 'failed';
+    assignment.completedAt = Date.now();
+    assignment.progress = 100;
+
+    this.emit('assignmentCompleted', {
+      missionId: mission.id,
+      assignmentId: assignment.id,
+      success: result.success,
+    });
+
+    return result;
+  }
+
+  /**
+   * 评审阶段
+   */
+  private async reviewPhase(
+    mission: Mission,
+    results: Map<string, AutonomousExecutionResult>
+  ): Promise<void> {
+    for (const assignment of mission.assignments) {
+      const result = results.get(assignment.id);
+      if (!result) continue;
+
+      // 对每个完成的 Todo 进行评审
+      for (const todo of result.completedTodos) {
+        const reviewResult = await this.reviewer.reviewTodoOutput(todo, assignment);
+
+        if (reviewResult.status !== 'approved') {
+          this.emit('todoReviewFailed', {
+            missionId: mission.id,
+            assignmentId: assignment.id,
+            todoId: todo.id,
+            feedback: reviewResult.feedback,
+            issues: reviewResult.issues,
+          });
+        }
+      }
+
+      // 互检评审
+      if (mission.assignments.length > 1) {
+        const reviewer = this.reviewer.selectPeerReviewer(assignment, assignment.workerId);
+        const reviewerProfile = this.profileLoader.getProfile(reviewer);
+        const executorProfile = this.profileLoader.getProfile(assignment.workerId);
+
+        const peerReviewGuidance = this.guidanceInjector.buildPeerReviewGuidance(
+          reviewerProfile,
+          executorProfile,
+          assignment.responsibility
+        );
+
+        this.emit('peerReviewScheduled', {
+          missionId: mission.id,
+          assignmentId: assignment.id,
+          executor: assignment.workerId,
+          reviewer,
+          guidance: peerReviewGuidance,
+        });
+      }
+    }
+  }
+
+  /**
+   * 契约验证
+   */
+  private async verifyContracts(
+    mission: Mission,
+    verifications: Map<string, boolean>,
+    errors: string[]
+  ): Promise<void> {
+    for (const contract of mission.contracts) {
+      // 检查契约是否被实现
+      const producerAssignment = mission.assignments.find(
+        a => a.workerId === contract.producer
+      );
+
+      if (!producerAssignment || producerAssignment.status !== 'completed') {
+        verifications.set(contract.id, false);
+        errors.push(`契约 "${contract.name}" 未被提供方 ${contract.producer} 实现`);
+        continue;
+      }
+
+      // 基于提供方完成状态验证契约（更复杂的验证可以扩展 ContractManager）
+      verifications.set(contract.id, true);
+
+      this.emit('contractVerified', {
+        missionId: mission.id,
+        contractId: contract.id,
+        passed: true,
+      });
+    }
+  }
+
+  /**
+   * 按依赖关系分组
+   */
+  private groupByDependencies(mission: Mission): Assignment[][] {
+    // 简单实现：检查契约依赖
+    const groups: Assignment[][] = [];
+    const remaining = [...mission.assignments];
+    const completed = new Set<string>();
+
+    while (remaining.length > 0) {
+      const currentGroup: Assignment[] = [];
+
+      for (let i = remaining.length - 1; i >= 0; i--) {
+        const assignment = remaining[i];
+
+        // 检查是否所有依赖的契约都已完成
+        const consumerContracts = assignment.consumerContracts;
+        const dependenciesMet = consumerContracts.every(contractId => {
+          const contract = mission.contracts.find(c => c.id === contractId);
+          if (!contract) return true;
+
+          // 检查提供方是否已完成
+          return completed.has(contract.producer);
+        });
+
+        if (dependenciesMet) {
+          currentGroup.push(assignment);
+          remaining.splice(i, 1);
+        }
+      }
+
+      if (currentGroup.length === 0 && remaining.length > 0) {
+        // 有循环依赖，强制执行剩余的
+        currentGroup.push(...remaining);
+        remaining.length = 0;
+      }
+
+      if (currentGroup.length > 0) {
+        groups.push(currentGroup);
+        for (const assignment of currentGroup) {
+          completed.add(assignment.workerId);
+        }
+      }
+    }
+
+    return groups;
+  }
+
+  /**
+   * 报告进度
+   */
+  private reportProgress(
+    mission: Mission,
+    phase: ExecutionProgress['phase'],
+    results: Map<string, AutonomousExecutionResult>,
+    onProgress?: (progress: ExecutionProgress) => void
+  ): void {
+    const completedCount = Array.from(results.values()).filter(r => r.success).length;
+    const totalCount = mission.assignments.length;
+    const activeBlockedItems = Array.from(this.blockedItems.values());
+    const blockedAssignmentIds = new Set(
+      activeBlockedItems
+        .filter(b => b.type === 'assignment')
+        .map(b => b.assignmentId)
+    );
+
+    const progress: ExecutionProgress = {
+      missionId: mission.id,
+      phase,
+      totalAssignments: totalCount,
+      completedAssignments: completedCount,
+      blockedAssignments: blockedAssignmentIds.size,
+      blockedItems: activeBlockedItems,
+      overallProgress: totalCount > 0 ? Math.round((completedCount / totalCount) * 100) : 0,
+    };
+
+    onProgress?.(progress);
+    this.emit('progressUpdated', progress);
+  }
+
+  /**
+   * 获取 Worker
+   */
+  getWorker(cliType: CLIType): AutonomousWorker | undefined {
+    return this.workers.get(cliType);
+  }
+
+  /**
+   * 获取所有 Worker
+   */
+  getAllWorkers(): Map<CLIType, AutonomousWorker> {
+    return new Map(this.workers);
+  }
+
+  // ============= 阻塞处理方法 =============
+
+  /**
+   * 检查 Assignment 是否被阻塞
+   */
+  checkAssignmentBlocking(
+    assignment: Assignment,
+    mission: Mission
+  ): BlockingReason | null {
+    // 检查契约依赖
+    for (const contractId of assignment.consumerContracts) {
+      const contract = mission.contracts.find(c => c.id === contractId);
+      if (!contract) continue;
+
+      // 检查契约是否已实现
+      if (contract.status !== 'implemented' && contract.status !== 'verified') {
+        return {
+          type: 'contract_pending',
+          contractId: contract.id,
+          description: `等待契约 "${contract.name}" 由 ${contract.producer} 实现`,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * 检查 Todo 是否被阻塞
+   */
+  checkTodoBlocking(
+    todo: WorkerTodo,
+    assignment: Assignment,
+    mission: Mission
+  ): BlockingReason | null {
+    // 检查 Todo 依赖
+    for (const depId of todo.dependsOn) {
+      const depTodo = assignment.todos.find(t => t.id === depId);
+      if (!depTodo) continue;
+
+      if (depTodo.status !== 'completed') {
+        return {
+          type: 'dependency_incomplete',
+          dependencyId: depId,
+          description: `等待 Todo "${depTodo.content}" 完成`,
+        };
+      }
+    }
+
+    // 检查契约依赖
+    for (const contractId of todo.requiredContracts) {
+      const contract = mission.contracts.find(c => c.id === contractId);
+      if (!contract) continue;
+
+      if (contract.status !== 'implemented' && contract.status !== 'verified') {
+        return {
+          type: 'contract_pending',
+          contractId: contract.id,
+          description: `等待契约 "${contract.name}" 实现`,
+        };
+      }
+    }
+
+    // 检查审批状态
+    if (todo.outOfScope && todo.approvalStatus !== 'approved') {
+      return {
+        type: 'approval_required',
+        description: `超范围 Todo 需要审批`,
+      };
+    }
+
+    return null;
+  }
+
+  /**
+   * 记录阻塞
+   */
+  private recordBlocking(
+    type: BlockedItemType,
+    missionId: string,
+    assignmentId: string,
+    reason: BlockingReason,
+    todoId?: string
+  ): BlockedItem {
+    const id = `blocking-${++this.blockingIdCounter}`;
+    const blockedItem: BlockedItem = {
+      id,
+      type,
+      missionId,
+      assignmentId,
+      todoId,
+      reason,
+      blockedAt: Date.now(),
+      resolved: false,
+    };
+
+    this.blockedItems.set(id, blockedItem);
+    this.emit('blocked', blockedItem);
+
+    return blockedItem;
+  }
+
+  /**
+   * 解除阻塞
+   */
+  private resolveBlocking(blockingId: string): void {
+    const blockedItem = this.blockedItems.get(blockingId);
+    if (!blockedItem) return;
+
+    blockedItem.resolved = true;
+    blockedItem.unblockedAt = Date.now();
+
+    this.blockedItems.delete(blockingId);
+    this.resolvedBlockings.push(blockedItem);
+
+    this.emit('unblocked', blockedItem);
+  }
+
+  /**
+   * 等待阻塞解除
+   */
+  async waitForUnblocking(
+    blockedItem: BlockedItem,
+    mission: Mission,
+    options: ExecutionOptions
+  ): Promise<boolean> {
+    const timeout = options.blockingTimeout || 300000; // 默认 5 分钟
+    const checkInterval = options.blockingCheckInterval || 1000; // 默认 1 秒
+    const startTime = Date.now();
+
+    options.onBlocked?.(blockedItem);
+
+    while (Date.now() - startTime < timeout) {
+      // 检查是否已解除
+      const stillBlocked = this.isStillBlocked(blockedItem, mission);
+      if (!stillBlocked) {
+        this.resolveBlocking(blockedItem.id);
+        options.onUnblocked?.(blockedItem);
+        return true;
+      }
+
+      // 等待一段时间后重新检查
+      await this.sleep(checkInterval);
+    }
+
+    // 超时，标记为解除但失败
+    this.resolveBlocking(blockedItem.id);
+    return false;
+  }
+
+  /**
+   * 检查阻塞是否仍然存在
+   */
+  private isStillBlocked(blockedItem: BlockedItem, mission: Mission): boolean {
+    const { reason } = blockedItem;
+
+    switch (reason.type) {
+      case 'contract_pending': {
+        if (!reason.contractId) return false;
+        const contract = mission.contracts.find(c => c.id === reason.contractId);
+        if (!contract) return false;
+        return contract.status !== 'implemented' && contract.status !== 'verified';
+      }
+
+      case 'dependency_incomplete': {
+        if (!reason.dependencyId) return false;
+        const assignment = mission.assignments.find(a => a.id === blockedItem.assignmentId);
+        if (!assignment) return false;
+        const depTodo = assignment.todos.find(t => t.id === reason.dependencyId);
+        if (!depTodo) return false;
+        return depTodo.status !== 'completed';
+      }
+
+      case 'approval_required': {
+        const assignment = mission.assignments.find(a => a.id === blockedItem.assignmentId);
+        if (!assignment || !blockedItem.todoId) return false;
+        const todo = assignment.todos.find(t => t.id === blockedItem.todoId);
+        if (!todo) return false;
+        return todo.approvalStatus !== 'approved';
+      }
+
+      case 'resource_conflict':
+        // 资源冲突需要外部解决
+        return true;
+
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * 批量检查并解除已满足条件的阻塞
+   */
+  checkAndResolveBlockings(mission: Mission): BlockedItem[] {
+    const resolved: BlockedItem[] = [];
+
+    for (const [id, blockedItem] of this.blockedItems) {
+      if (!this.isStillBlocked(blockedItem, mission)) {
+        this.resolveBlocking(id);
+        resolved.push(blockedItem);
+      }
+    }
+
+    return resolved;
+  }
+
+  /**
+   * 获取当前所有阻塞项
+   */
+  getBlockedItems(): BlockedItem[] {
+    return Array.from(this.blockedItems.values());
+  }
+
+  /**
+   * 获取已解除的阻塞项
+   */
+  getResolvedBlockings(): BlockedItem[] {
+    return [...this.resolvedBlockings];
+  }
+
+  /**
+   * 清除阻塞状态
+   */
+  clearBlockingState(): void {
+    this.blockedItems.clear();
+    this.resolvedBlockings = [];
+    this.blockingIdCounter = 0;
+  }
+
+  /**
+   * 辅助方法：等待
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+}

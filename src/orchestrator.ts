@@ -87,9 +87,9 @@ export class Orchestrator {
       const msg = error instanceof Error ? error.message : String(error);
       const stack = error instanceof Error ? error.stack : undefined;
 
-      logger.error(`[Orchestrator] Task ${taskId} failed:`, msg, LogCategory.ORCHESTRATOR);
+      logger.error('编排器.任务.失败', { taskId, error: msg }, LogCategory.ORCHESTRATOR);
       if (stack) {
-        logger.error('[Orchestrator] Stack trace:', stack, LogCategory.ORCHESTRATOR);
+        logger.error('编排器.任务.失败.堆栈', { taskId, stack }, LogCategory.ORCHESTRATOR);
       }
 
       globalEventBus.emitEvent('task:failed', {
@@ -119,7 +119,7 @@ export class Orchestrator {
         worker.interrupt();
       }
     } catch (error) {
-      logger.error('[Orchestrator] Failed to cleanup workers:', error, LogCategory.ORCHESTRATOR);
+      logger.error('编排器.清理.失败', error, LogCategory.ORCHESTRATOR);
     }
   }
 
@@ -183,7 +183,7 @@ export class Orchestrator {
     // 类型安全检查：确保 CLI 已分配
     if (!cli) {
       const error = `SubTask ${subTask.id} 没有分配 Worker`;
-      logger.error(`[Orchestrator] ${error}`, undefined, LogCategory.ORCHESTRATOR);
+      logger.error('编排器.子任务.未分配', { subTaskId: subTask.id }, LogCategory.ORCHESTRATOR);
       return {
         cliType: 'claude', // 默认值，避免类型错误
         success: false,
@@ -197,7 +197,7 @@ export class Orchestrator {
     const worker = this.workers.get(cli);
     if (!worker) {
       const error = `Worker 不存在: ${cli}`;
-      logger.error(`[Orchestrator] ${error}`, undefined, LogCategory.ORCHESTRATOR);
+      logger.error('编排器.子代理.缺失', { cli }, LogCategory.ORCHESTRATOR);
       return {
         cliType: cli,
         success: false,
@@ -213,7 +213,7 @@ export class Orchestrator {
       try {
         this.options.snapshotManager.createSnapshot(f, cli, subTask.id, priority);
       } catch (error) {
-        logger.error(`[Orchestrator] Failed to create snapshot for ${f}:`, error, LogCategory.ORCHESTRATOR);
+        logger.error('编排器.快照.创建_失败', { filePath: f, cli, subTaskId: subTask.id, error }, LogCategory.ORCHESTRATOR);
         // 继续执行，快照失败不应阻止任务
       }
     }
@@ -235,7 +235,7 @@ export class Orchestrator {
       return result;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      logger.error(`[Orchestrator] SubTask ${subTask.id} execution failed:`, msg, LogCategory.ORCHESTRATOR);
+      logger.error('编排器.子任务.执行_失败', { subTaskId: subTask.id, error: msg }, LogCategory.ORCHESTRATOR);
 
       await this.options.taskManager.failSubTask(subTask.taskId, subTask.id, msg);
 

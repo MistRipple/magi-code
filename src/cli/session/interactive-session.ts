@@ -202,8 +202,17 @@ export class InteractiveSession extends EventEmitter implements SessionProcess {
           return;
         }
 
-        // 解析 stream-json 响应
-        const response = this.parseStreamJsonResponse(message.requestId, stdout, jsonBuffer);
+        // 解析 stream-json 响应（传递 Mission 上下文）
+        const response = this.parseStreamJsonResponse(
+          message.requestId,
+          stdout,
+          jsonBuffer,
+          {
+            missionId: message.missionId,
+            assignmentId: message.assignmentId,
+            todoId: message.todoId,
+          }
+        );
         resolve(response);
       });
 
@@ -340,9 +349,23 @@ export class InteractiveSession extends EventEmitter implements SessionProcess {
   }
 
   /**
+   * Mission 上下文（用于响应中传递）
+   */
+  missionContext?: {
+    missionId?: string;
+    assignmentId?: string;
+    todoId?: string;
+  };
+
+  /**
    * 解析 stream-json 响应
    */
-  private parseStreamJsonResponse(requestId: string, stdout: string, jsonBuffer: string): SessionResponse {
+  private parseStreamJsonResponse(
+    requestId: string,
+    stdout: string,
+    jsonBuffer: string,
+    missionContext?: { missionId?: string; assignmentId?: string; todoId?: string }
+  ): SessionResponse {
     const lines = jsonBuffer.split('\n');
     let resultJson: Record<string, unknown> = {};
     const contents: string[] = [];
@@ -377,6 +400,10 @@ export class InteractiveSession extends EventEmitter implements SessionProcess {
       content: contents.join('\n') || (resultJson.result as string) || '',
       raw: stdout,
       metadata: resultJson,
+      // Mission 上下文传递
+      missionId: missionContext?.missionId,
+      assignmentId: missionContext?.assignmentId,
+      todoId: missionContext?.todoId,
     };
 
     // 提取 token 使用信息

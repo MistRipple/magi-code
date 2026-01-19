@@ -243,13 +243,13 @@ export class AceIndexManager {
 
   /** 对项目进行索引（支持增量索引） */
   async indexProject(): Promise<IndexResult> {
-    logger.info(`[ACE] 开始索引项目: ${this.projectRoot}`);
+    logger.info('ACE.索引.开始', { projectRoot: this.projectRoot }, LogCategory.SYSTEM);
     try {
       const blobs = await this.collectFiles();
       if (blobs.length === 0) {
         return { status: 'error', message: '未找到可索引的文本文件' };
       }
-      logger.info(`[ACE] 扫描完成，共发现 ${blobs.length} 个文件块`);
+      logger.info('ACE.索引.扫描.完成', { blobCount: blobs.length }, LogCategory.SYSTEM);
 
       // 计算当前所有 blob 的哈希
       const currentBlobHashes: string[] = [];
@@ -267,12 +267,16 @@ export class AceIndexManager {
       const newHashes = currentBlobHashes.filter(h => !existingBlobNames.has(h));
       const blobsToUpload = newHashes.map(h => blobHashMap.get(h)!);
 
-      logger.info(`[ACE] 增量索引: 当前 ${currentBlobHashes.length} 个, 已有 ${existingBlobNames.size} 个, 新增 ${newHashes.length} 个`);
+      logger.info(
+        'ACE.索引.增量.摘要',
+        { total: currentBlobHashes.length, existing: existingBlobNames.size, new: newHashes.length },
+        LogCategory.SYSTEM
+      );
 
       if (blobsToUpload.length === 0) {
         // 无需上传，但仍需更新索引（可能有文件被删除）
         this.saveIndex(currentBlobHashes);
-        logger.info('[ACE] 无需上传新文件，索引已更新');
+        logger.info('ACE.索引.上传.跳过', { total: currentBlobHashes.length }, LogCategory.SYSTEM);
         return {
           status: 'success',
           message: `索引完成，共 ${currentBlobHashes.length} 个文件块`,
@@ -288,9 +292,9 @@ export class AceIndexManager {
         try {
           await this.uploadBatch(batch, strategy.timeout);
           uploadedCount += batch.length;
-          logger.info(`[ACE] 上传进度: ${uploadedCount}/${blobsToUpload.length}`);
+          logger.info('ACE.索引.上传.进度', { uploaded: uploadedCount, total: blobsToUpload.length }, LogCategory.SYSTEM);
         } catch (error) {
-          logger.error(`[ACE] 批次上传失败:`, error);
+          logger.error('ACE.索引.上传.批次_失败', error, LogCategory.SYSTEM);
         }
       }
 
@@ -303,9 +307,9 @@ export class AceIndexManager {
         stats: { total_blobs: currentBlobHashes.length, existing_blobs: existingBlobNames.size, new_blobs: uploadedCount }
       };
     } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      logger.error(`[ACE] 索引失败:`, msg);
-      return { status: 'error', message: msg };
+      logger.error('ACE.索引.失败', error, LogCategory.SYSTEM);
+      const message = error instanceof Error ? error.message : String(error);
+      return { status: 'error', message };
     }
   }
 }

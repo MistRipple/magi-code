@@ -16,7 +16,7 @@ logger.error('这是一条错误信息', new Error('测试错误'));
 console.log('\n2. 分类日志测试:');
 logger.info('系统启动', undefined, LogCategory.SYSTEM);
 logger.info('任务创建', { taskId: 'task-123' }, LogCategory.TASK);
-logger.debug('Worker 执行', { workerId: 'worker-1' }, LogCategory.WORKER);
+logger.debug('子代理.执行', { workerId: 'worker-1' }, LogCategory.WORKER);
 logger.info('编排器分析', { planId: 'plan-456' }, LogCategory.ORCHESTRATOR);
 
 console.log('\n3. CLI 消息日志测试:');

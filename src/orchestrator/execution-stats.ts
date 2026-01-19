@@ -109,7 +109,11 @@ export class ExecutionStats {
     // 异步保存
     this.saveToStorage();
 
-    logger.info(`[ExecutionStats] 记录执行: ${record.cli} ${record.success ? '成功' : '失败'} (${record.duration}ms, undefined, LogCategory.ORCHESTRATOR)`);
+    logger.info(
+      '编排器.执行.已记录',
+      { cli: record.cli, success: record.success, duration: record.duration, taskId: record.taskId, subTaskId: record.subTaskId },
+      LogCategory.ORCHESTRATOR
+    );
     globalEventBus.emitEvent('execution:stats_updated', {});
   }
 
@@ -278,10 +282,10 @@ export class ExecutionStats {
       const data = this.context.globalState.get<ExecutionRecord[]>(this.config.persistKey);
       if (data && Array.isArray(data)) {
         this.records = data;
-        logger.info(`[ExecutionStats] 从存储加载 ${this.records.length} 条记录`, undefined, LogCategory.ORCHESTRATOR);
+        logger.info('编排器.执行_统计.加载.完成', { count: this.records.length }, LogCategory.ORCHESTRATOR);
       }
     } catch (error) {
-      logger.warn('[ExecutionStats] 加载存储数据失败:', error, LogCategory.ORCHESTRATOR);
+      logger.warn('编排器.执行_统计.加载.失败', error, LogCategory.ORCHESTRATOR);
     }
   }
 
@@ -292,7 +296,7 @@ export class ExecutionStats {
     try {
       await this.context.globalState.update(this.config.persistKey, this.records);
     } catch (error) {
-      logger.warn('[ExecutionStats] 保存存储数据失败:', error, LogCategory.ORCHESTRATOR);
+      logger.warn('编排器.执行_统计.保存.失败', error, LogCategory.ORCHESTRATOR);
     }
   }
 
@@ -300,7 +304,7 @@ export class ExecutionStats {
   async clearStats(): Promise<void> {
     this.records = [];
     await this.saveToStorage();
-    logger.info('[ExecutionStats] 已清除所有统计数据', undefined, LogCategory.ORCHESTRATOR);
+    logger.info('编排器.执行_统计.已清理', undefined, LogCategory.ORCHESTRATOR);
     globalEventBus.emitEvent('execution:stats_updated', {});
   }
 

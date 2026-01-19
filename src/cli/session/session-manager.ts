@@ -448,7 +448,7 @@ export class SessionManager extends EventEmitter {
     const key = this.getKey(cli, role);
     const entry = this.sessions.get(key);
     if (!entry) {
-      logger.info(`[SessionManager] writeInput failed: session not found for ${cli}/${role}`, undefined, LogCategory.CLI);
+      logger.info('CLI.会话.写入_输入.失败', { cli, role, reason: 'session_not_found' }, LogCategory.CLI);
       return false;
     }
     return entry.process.writeInput(text);

@@ -109,7 +109,7 @@ export class MessageBridge extends EventEmitter {
    */
   private debug(message: string, ...args: unknown[]): void {
     if (this.config.debug) {
-      logger.info(message, ...args);
+      logger.debug('规范化.消息桥.调试', { message, args }, LogCategory.SYSTEM);
     }
   }
 

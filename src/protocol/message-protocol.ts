@@ -85,6 +85,8 @@ export interface CodeBlock {
   filename?: string;
   /** 高亮行号 */
   highlightLines?: number[];
+  /** 是否为嵌入式代码块（在文本中间的代码块，通常是内部数据，不需要显示给用户） */
+  isEmbedded?: boolean;
 }
 
 /**

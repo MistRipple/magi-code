@@ -23,6 +23,12 @@ export {
 } from './orchestrator-normalizer';
 export { MessageBatcher, type BatcherConfig, type BatchCallback } from './message-batcher';
 export { MessageDeduplicator, type DeduplicationConfig } from './message-deduplicator';
+export {
+  UnifiedMessageBus,
+  type MessageBusConfig,
+  type MessageBusEvents,
+  type ProcessingState,
+} from './unified-message-bus';
 
 import type { CLIType } from '../cli/types';
 import { BaseNormalizer } from './base-normalizer';

@@ -95,7 +95,7 @@ export class MessageDeduplicator {
 
     // 3. 已完成的消息：不再发送
     if (existingState.completed) {
-      logger.warn(`[MessageDeduplicator] 消息已完成，跳过: ${id}`);
+      logger.warn('规范化.消息去重.跳过_完成', { id }, LogCategory.SYSTEM);
       return false;
     }
 

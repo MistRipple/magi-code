@@ -135,7 +135,7 @@ export class MessageBatcher {
     try {
       callback(batch);
     } catch (error) {
-      logger.error('[MessageBatcher] Callback error:', error);
+      logger.error('规范化.消息批处理.回调_失败', error, LogCategory.SYSTEM);
     }
   }
 
@@ -176,4 +176,3 @@ export class MessageBatcher {
     this.lastFlushTime.clear();
   }
 }
-

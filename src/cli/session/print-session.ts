@@ -125,7 +125,7 @@ export class PrintSession extends EventEmitter implements SessionProcess {
    */
   writeInput(text: string): boolean {
     if (!this.current || !this.current.stdin || !this.waitingForAnswer) {
-      logger.info(`[PrintSession] writeInput failed: no current process or not waiting for answer`, undefined, LogCategory.CLI);
+      logger.info('CLI.打印_会话.写入_输入.失败', { reason: 'not_waiting_or_no_process' }, LogCategory.CLI);
       return false;
     }
 
@@ -137,10 +137,10 @@ export class PrintSession extends EventEmitter implements SessionProcess {
       // 发送用户输入，添加换行符
       const input = text.endsWith('\n') ? text : text + '\n';
       this.current.stdin.write(input);
-      logger.info(`[PrintSession] writeInput success: ${text}`, undefined, LogCategory.CLI);
+      logger.info('CLI.打印_会话.写入_输入.成功', { length: text.length }, LogCategory.CLI);
       return true;
     } catch (error) {
-      logger.error(`[PrintSession] writeInput error:`, error, LogCategory.CLI);
+      logger.error('CLI.打印_会话.写入_输入.错误', error, LogCategory.CLI);
       return false;
     }
   }
@@ -258,7 +258,7 @@ export class PrintSession extends EventEmitter implements SessionProcess {
 
         // 🔧 修复：检查是否已经发送过相同的询问
         if (this.lastQuestionId === this.currentQuestionId) {
-          logger.debug(`[PrintSession] 跳过重复询问: ${this.currentQuestionId}`, undefined, LogCategory.CLI);
+          logger.debug('CLI.打印_会话.提问.重复', { questionId: this.currentQuestionId }, LogCategory.CLI);
           return;
         }
 
@@ -273,7 +273,7 @@ export class PrintSession extends EventEmitter implements SessionProcess {
           timestamp: Date.now(),
         };
 
-        logger.info(`[PrintSession] 检测到 CLI 询问:`, question, LogCategory.CLI);
+        logger.info('CLI.打印_会话.提问.检测到', { question }, LogCategory.CLI);
         this.emit('question', question);
 
         // 设置询问超时
@@ -290,7 +290,7 @@ export class PrintSession extends EventEmitter implements SessionProcess {
     this.clearQuestionTimeout();
     this.questionTimeoutId = setTimeout(() => {
       if (this.waitingForAnswer) {
-        logger.info(`[PrintSession] 询问超时，自动发送默认回答`, undefined, LogCategory.CLI);
+        logger.info('CLI.打印_会话.提问.超时', { questionId: this.currentQuestionId, cli: this.cli }, LogCategory.CLI);
         // 超时后发送默认回答（通常是 'n' 或空行）
         this.writeInput('n');
         this.emit('questionTimeout', {

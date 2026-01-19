@@ -628,7 +628,6 @@
       background: var(--vscode-toolbar-hoverBackground);
       color: var(--vscode-foreground);
     }
-    .message-action-btn.copied { color: var(--color-success, #22c55e); }
     .message-action-btn svg { width: 14px; height: 14px; fill: currentColor; }
 
     /* 长消息折叠 - 带边框容器 */
@@ -1060,28 +1059,6 @@
       fill: currentColor;
       flex-shrink: 0;
     }
-    .markdown-code-actions {
-      display: flex;
-      gap: 4px;
-      flex-shrink: 0;
-    }
-    .markdown-code-btn {
-      padding: 2px 8px;
-      font-size: 11px;
-      background: transparent;
-      border: 1px solid var(--vscode-button-border, transparent);
-      color: var(--vscode-descriptionForeground);
-      border-radius: 3px;
-      cursor: pointer;
-      transition: all 0.15s;
-    }
-    .markdown-code-btn:hover {
-      background: var(--vscode-toolbar-hoverBackground);
-      color: var(--vscode-foreground);
-    }
-    .markdown-code-btn.copied {
-      color: var(--vscode-testing-iconPassed, #10b981);
-    }
     /* 代码内容区域 - 带行号 */
     .markdown-code-content {
       display: flex;
@@ -1456,6 +1433,12 @@
     /* 工具调用面板特殊样式 */
     .collapsible-panel.tool-call .collapsible-title { color: var(--vscode-textLink-foreground); }
     .collapsible-panel.thinking .collapsible-title { color: var(--vscode-descriptionForeground); }
+    /* 代码折叠面板样式 */
+    .collapsible-panel.code-panel { margin: 8px 0; }
+    .collapsible-panel.code-panel .collapsible-title { color: var(--vscode-symbolIcon-fileForeground, #cccccc); }
+    .collapsible-panel.code-panel .collapsible-title svg { fill: var(--vscode-symbolIcon-classForeground, #ee9d28); }
+    .collapsible-panel.code-panel .collapsible-body { padding: 0; }
+    .collapsible-panel.code-panel .collapsible-body .markdown-code-block { margin: 0; border: none; border-radius: 0; }
     .tool-track { margin-top: 2px; display: flex; flex-direction: column; gap: 4px; width: 100%; }
     .tool-item { width: 100%; box-sizing: border-box; }
     .tool-item.collapsible-panel { margin: 0; }
@@ -1714,6 +1697,7 @@
     .profile-section { margin-bottom: var(--spacing-4); }
     .profile-section-title { font-size: var(--font-size-1); font-weight: 600; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: var(--spacing-2); }
     .profile-section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--spacing-2); }
+    .profile-section-header .profile-section-title { margin-bottom: 0; line-height: 1; }
     .profile-add-btn { font-size: var(--font-size-1); padding: 2px 8px; display: flex; align-items: center; justify-content: center; background: var(--vscode-button-secondaryBackground); border: 1px solid var(--vscode-button-border, transparent); border-radius: var(--radius-1); color: var(--vscode-button-secondaryForeground); cursor: pointer; transition: all var(--transition-fast); }
     .profile-add-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
 
@@ -2355,14 +2339,17 @@
     // 从 VSCode 状态恢复
     const previousState = vscode.getState() || {};
     let state = null;
-   
+
     let currentTopTab = 'thread';
     let currentBottomTab = 'thread';
     let threadMessages = previousState.threadMessages || [];
     // cliOutputs 改为结构化消息数组: { claude: [{role, content, time, streaming}], ... }
     let cliOutputs = previousState.cliOutputs || { claude: [], codex: [], gemini: [] };
     let sessions = previousState.sessions || [];
-    let currentSessionId = previousState.currentSessionId || null;
+    // 优先使用注入的初始 sessionId，确保 webview 加载时就有正确的值
+    // {{initialSessionId}} 由 WebviewProvider 在 getHtmlContent 中替换
+    const injectedSessionId = '{{initialSessionId}}';
+    let currentSessionId = previousState.currentSessionId || (injectedSessionId || null);
     let pendingChanges = previousState.pendingChanges || [];
     let isProcessing = previousState.isProcessing || false;  // 处理状态
     let thinkingStartAt = previousState.thinkingStartAt || null;
@@ -2459,27 +2446,6 @@
       }
       // 超过一周显示具体日期
       return new Date(timestamp).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' });
-    }
-
-    /**
-     * 复制消息内容到剪贴板
-     */
-    function copyMessageContent(btn, msgIdx) {
-      const msgEl = btn.closest('.message');
-      if (!msgEl) return;
-
-      const contentEl = msgEl.querySelector('.message-content');
-      if (!contentEl) return;
-
-      const text = contentEl.textContent || '';
-      navigator.clipboard.writeText(text).then(() => {
-        btn.classList.add('copied');
-        btn.title = '已复制';
-        setTimeout(() => {
-          btn.classList.remove('copied');
-          btn.title = '复制消息';
-        }, 2000);
-      });
     }
 
     /**
@@ -2832,7 +2798,21 @@
       }
       // 标准消息处理 - 新的消息流开始
       else if (msg.type === 'standardMessage') {
-        if (msg.sessionId && msg.sessionId !== currentSessionId) {
+        // 🔍 检查点 3.1：记录前端接收到的消息
+        console.log('[DEBUG-LAYER-3] 前端接收 standardMessage:', {
+          messageId: msg.message?.id,
+          source: msg.message?.source,
+          blocksCount: msg.message?.blocks?.length || 0,
+          blockTypes: msg.message?.blocks?.map(b => b.type) || [],
+          firstBlockPreview: msg.message?.blocks?.[0] ? {
+            type: msg.message.blocks[0].type,
+            contentLength: msg.message.blocks[0].content?.length || 0,
+            contentPreview: msg.message.blocks[0].content?.substring(0, 100),
+          } : null,
+        });
+
+        // 只有当前端已有明确的 sessionId 且与消息不匹配时才过滤
+        if (currentSessionId && msg.sessionId && msg.sessionId !== currentSessionId) {
           return;
         }
         localProcessingUntil = 0;
@@ -2840,7 +2820,8 @@
       }
       // 🆕 标准消息更新 - 流式更新
       else if (msg.type === 'standardUpdate') {
-        if (msg.sessionId && msg.sessionId !== currentSessionId) {
+        // 只有当前端已有明确的 sessionId 且与消息不匹配时才过滤
+        if (currentSessionId && msg.sessionId && msg.sessionId !== currentSessionId) {
           return;
         }
         localProcessingUntil = 0;
@@ -2848,7 +2829,8 @@
       }
       // 🆕 标准消息完成
       else if (msg.type === 'standardComplete') {
-        if (msg.sessionId && msg.sessionId !== currentSessionId) {
+        // 只有当前端已有明确的 sessionId 且与消息不匹配时才过滤
+        if (currentSessionId && msg.sessionId && msg.sessionId !== currentSessionId) {
           return;
         }
         localProcessingUntil = 0;
@@ -2856,6 +2838,22 @@
       }
       else if (msg.type === 'cliStatusChanged') { addSystemMessage(msg.cli + ' 状态已更新', 'info'); updateCliDots(); }
       else if (msg.type === 'cliStatusUpdate') { updateCliConnectionStatus(msg.statuses); }
+      // 🔧 重构：后端推送处理状态变化
+      else if (msg.type === 'processingStateChanged') {
+        const state = msg.state;
+        if (state) {
+          setProcessingState(state.isProcessing);
+          if (state.isProcessing && state.source && state.cli) {
+            setProcessingActor(state.source, state.cli);
+          }
+          if (state.startedAt && !thinkingStartAt) {
+            thinkingStartAt = state.startedAt;
+          }
+          if (!state.isProcessing) {
+            stopStreamingHintTimer();
+          }
+        }
+      }
       else if (msg.type === 'taskInterrupted') {
         // 🔧 风险2修复：任务中断时停止定时器
         stopStreamingHintTimer();
@@ -2944,7 +2942,8 @@
       }
       // CLI 任务卡片（子代理面板显示任务信息）
       else if (msg.type === 'cliTaskCard') {
-        if (msg.sessionId && msg.sessionId !== currentSessionId) return;
+        // 只有当前端已有明确的 sessionId 且与消息不匹配时才过滤
+        if (currentSessionId && msg.sessionId && msg.sessionId !== currentSessionId) return;
         const cli = msg.cli;
         if (!cli) return;
 
@@ -2984,8 +2983,8 @@
       }
       // orchestratorMessage 处理已移除
       else if (msg.type === 'questionRequest') {
-        // 🔧 P6 修复：增强会话隔离
-        if (msg.sessionId && msg.sessionId !== currentSessionId) {
+        // 只有当前端已有明确的 sessionId 且与消息不匹配时才过滤
+        if (currentSessionId && msg.sessionId && msg.sessionId !== currentSessionId) {
           console.log('[Webview] 忽略非当前会话的 questionRequest');
           return;
         }
@@ -2993,7 +2992,8 @@
       }
       // 🆕 处理需求澄清请求 - 作为普通 AI 消息显示
       else if (msg.type === 'clarificationRequest') {
-        if (msg.sessionId && msg.sessionId !== currentSessionId) {
+        // 只有当前端已有明确的 sessionId 且与消息不匹配时才过滤
+        if (currentSessionId && msg.sessionId && msg.sessionId !== currentSessionId) {
           console.log('[Webview] 忽略非当前会话的 clarificationRequest');
           return;
         }
@@ -3001,15 +3001,16 @@
       }
       // 🆕 处理 Worker 问题请求
       else if (msg.type === 'workerQuestionRequest') {
-        if (msg.sessionId && msg.sessionId !== currentSessionId) {
+        // 只有当前端已有明确的 sessionId 且与消息不匹配时才过滤
+        if (currentSessionId && msg.sessionId && msg.sessionId !== currentSessionId) {
           console.log('[Webview] 忽略非当前会话的 workerQuestionRequest');
           return;
         }
         showWorkerQuestion(msg.workerId, msg.question, msg.context, msg.options);
       }
       else if (msg.type === 'confirmationRequest') {
-        // 🔧 P6 修复：增强会话隔离
-        if (msg.sessionId && msg.sessionId !== currentSessionId) {
+        // 只有当前端已有明确的 sessionId 且与消息不匹配时才过滤
+        if (currentSessionId && msg.sessionId && msg.sessionId !== currentSessionId) {
           console.log('[Webview] 忽略非当前会话的 confirmationRequest');
           return;
         }
@@ -3552,9 +3553,7 @@
       const html = '<div class="markdown-code-block' + (isDiff ? ' diff-block' : '') + '">' +
         '<div class="markdown-code-header">' +
         headerInfoHtml +
-        '<div class="markdown-code-actions">' +
-        '<button class="markdown-code-btn" onclick="copyCodeBlock(\'' + codeId + '\', this)">复制</button>' +
-        '</div></div>' +
+        '</div>' +
         '<div class="markdown-code-content">' +
         '<div class="code-line-numbers">' + lineNumbersHtml + '</div>' +
         '<div class="code-lines" id="' + codeId + '">' + codeLinesHtml + '</div>' +
@@ -3742,13 +3741,13 @@
 
       const sections = [];
       if (hasInput) {
-        sections.push('<div class="tool-section"><div class="tool-section-title">输入</div>' + renderToolPanelContent(inputContent) + '</div>');
+        sections.push('<div class="tool-section"><div class="tool-section-title">IN</div>' + renderToolPanelContent(inputContent) + '</div>');
       }
       if (hasOutput) {
-        sections.push('<div class="tool-section"><div class="tool-section-title">输出</div>' + renderToolPanelContent(outputContent) + '</div>');
+        sections.push('<div class="tool-section"><div class="tool-section-title">OUT</div>' + renderToolPanelContent(outputContent) + '</div>');
       }
       if (hasError) {
-        sections.push('<div class="tool-section"><div class="tool-section-title">错误</div>' + renderToolPanelContent(errorContent) + '</div>');
+        sections.push('<div class="tool-section"><div class="tool-section-title">ERROR</div>' + renderToolPanelContent(errorContent) + '</div>');
       }
       const toolContent = sections.join('');
 
@@ -4099,14 +4098,17 @@
         content: interaction.prompt
       };
 
-      // 更新输入框占位符
-      const inputBox = document.getElementById('user-input');
+      // 🔧 修复：使用正确的输入框 ID，并更新占位符
+      const inputBox = document.getElementById('prompt-input');
       if (inputBox) {
-        inputBox.placeholder = `回答 ${cli} 的询问...`;
+        inputBox.placeholder = `回答 ${cli} 的询问... (输入 y/n 或其他回复)`;
+        inputBox.focus();
       }
 
-      // 停止处理状态（等待用户回答）
+      // 🔧 修复：确保停止处理状态，让用户可以输入回答
       setProcessingState(false);
+      // 清除本地处理宽限期，避免状态被覆盖
+      localProcessingUntil = 0;
 
       saveWebviewState();
       renderMainContent();
@@ -4115,6 +4117,7 @@
 
     /**
      * 处理新的标准消息
+     * 🔧 重构：移除前端去重逻辑，后端 UnifiedMessageBus 已统一处理
      */
     function handleStandardMessage(message) {
       if (!message || !message.id) {
@@ -4124,16 +4127,10 @@
 
       console.log('[Webview] 收到标准消息:', message.id, message.type, message.lifecycle);
 
-      // 🆕 处理交互消息（CLI 询问）
+      // 处理交互消息（CLI 询问）
       if (message.type === 'interaction' && message.interaction) {
         handleInteractionMessage(message);
         return;
-      }
-
-      if ((!message.blocks || message.blocks.length === 0) &&
-          message.lifecycle !== 'streaming' &&
-          message.lifecycle !== 'started') {
-        console.warn('[Webview] 标准消息 blocks 为空:', message.id, message.type);
       }
 
       // 过滤编排者内部 JSON 分析输出（如模糊度评估、计划评审）
@@ -4150,18 +4147,16 @@
       // 获取目标信息
       const isOrchestrator = message.source === 'orchestrator';
       const cli = message.cli || 'claude';
-      const target = message.metadata?.extra?.target || (isOrchestrator ? 'thread' : 'cli');
 
       // 处理特殊消息类型
       if (message.type === 'plan') {
-        // 计划预览消息 - 调用 showPlanPreview
         const content = extractTextFromBlocks(message.blocks || []);
         const planId = message.metadata?.taskId || message.id;
         showPlanPreview(content, planId, message.timestamp, message.metadata?.extra?.review);
         return;
       }
 
-      // 检查是否已存在该消息（避免重复添加）
+      // 检查是否已存在该消息
       const messages = isOrchestrator ? threadMessages : (cliOutputs[cli] || []);
       const existingMsg = messages.find(m => m.standardMessageId === message.id);
 
@@ -4170,34 +4165,11 @@
         const updatedMsg = standardToWebviewMessage(message);
         Object.assign(existingMsg, updatedMsg);
       } else {
-        // 转换为 Webview 消息格式
+        // 🔧 简化：直接添加消息，后端已去重
         const webviewMsg = standardToWebviewMessage(message);
-
-        // 跨 messageId 去重：同来源/角色、时间相近且内容相同则复用
-        const equivalentMsg = findEquivalentMessage(messages, webviewMsg, 6000);
-        if (equivalentMsg) {
-          Object.assign(equivalentMsg, webviewMsg);
-          equivalentMsg.standardMessageId = message.id;
-          return;
-        }
-
-        // 去重：连续相同内容的编排者消息只保留一条
-        const lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
-        if (lastMsg && lastMsg.source === webviewMsg.source && lastMsg.role === webviewMsg.role) {
-          const lastContent = normalizeMessageContentForDedup(lastMsg.content || '');
-          const nextContent = normalizeMessageContentForDedup(webviewMsg.content || '');
-          if (lastContent && nextContent && lastContent === nextContent) {
-            return;
-          }
-        }
-
-        // 进度消息保持追加展示，避免覆盖历史消息
-
         if (isOrchestrator) {
-          // 编排者消息 -> Thread 面板
           threadMessages.push(webviewMsg);
         } else {
-          // Worker 消息 -> CLI 面板
           if (!cliOutputs[cli]) {
             cliOutputs[cli] = [];
           }
@@ -4268,6 +4240,7 @@
 
     /**
      * 处理标准消息完成
+     * 🔧 重构：简化补偿逻辑，后端已保证消息顺序
      */
     function handleStandardComplete(message) {
       if (!message || !message.id) {
@@ -4288,42 +4261,19 @@
       if (webviewMsg) {
         // 更新最终状态
         const finalMsg = standardToWebviewMessage(message);
-        const hasRenderableFinal = !!(
-          (finalMsg.content && finalMsg.content.trim()) ||
-          (finalMsg.parsedBlocks && finalMsg.parsedBlocks.length > 0) ||
-          (finalMsg.codeBlocks && finalMsg.codeBlocks.length > 0) ||
-          (finalMsg.toolCalls && finalMsg.toolCalls.length > 0) ||
-          (finalMsg.thinking && finalMsg.thinking.length > 0)
-        );
-        if (!hasRenderableFinal) {
+        // 保留已有内容（如果完成消息内容为空）
+        if (!finalMsg.content && webviewMsg.content) {
           finalMsg.content = webviewMsg.content;
           finalMsg.parsedBlocks = webviewMsg.parsedBlocks;
-          finalMsg.codeBlocks = webviewMsg.codeBlocks;
-          finalMsg.toolCalls = webviewMsg.toolCalls;
-          finalMsg.thinking = webviewMsg.thinking;
         }
         Object.assign(webviewMsg, finalMsg);
         webviewMsg.streaming = false;
 
-        if (message.lifecycle === 'interrupted') {
+        if (message.lifecycle === 'interrupted' || message.lifecycle === 'cancelled') {
           webviewMsg.interrupted = true;
         }
         if (message.lifecycle === 'failed') {
           webviewMsg.error = message.metadata?.error;
-        }
-      } else {
-        // 补偿：尝试将完成消息合并到最近的流式或相同内容消息
-        const finalMsg = standardToWebviewMessage(message);
-        const candidate = messages.find(m =>
-          m.streaming &&
-          m.source === finalMsg.source &&
-          m.role === finalMsg.role &&
-          (m.cli || '') === (finalMsg.cli || '')
-        ) || findEquivalentMessage(messages, finalMsg, 10000);
-        if (candidate) {
-          Object.assign(candidate, finalMsg);
-          candidate.streaming = false;
-          candidate.standardMessageId = message.id;
         }
       }
 
@@ -4468,41 +4418,17 @@
       }
     }
 
-    // 复制代码块（适配新的行号结构）
-    function copyCodeBlock(codeId, btn) {
-      const codeEl = document.getElementById(codeId);
-      if (!codeEl) return;
-
-      // 新结构：代码在 .code-lines 中，每行是一个 .code-line div
-      // 需要提取纯文本，忽略差异标记
-      let text = '';
-      const lines = codeEl.querySelectorAll('.code-line');
-      if (lines.length > 0) {
-        text = Array.from(lines).map(line => {
-          // 获取行文本，移除差异前缀（如果有）
-          let lineText = line.textContent;
-          // 差异行的 ::before 伪元素不会被 textContent 获取，所以直接返回
-          return lineText;
-        }).join('\n');
-      } else {
-        return;
-      }
-
-      navigator.clipboard.writeText(text).then(() => {
-        btn.textContent = '已复制';
-        btn.classList.add('copied');
-        setTimeout(() => {
-          btn.textContent = '复制';
-          btn.classList.remove('copied');
-        }, 2000);
-      });
-    }
-
     /**
      * 直接渲染后端已解析的 blocks
      * 这是唯一的渲染入口，不再需要前端解析
      */
     function renderParsedBlocks(blocks, cli) {
+      // 🔍 检查点 3.2：记录渲染的 blocks
+      console.log('[DEBUG-LAYER-3] renderParsedBlocks 开始渲染:', {
+        blocksCount: blocks?.length || 0,
+        blockTypes: blocks?.map(b => b.type) || [],
+      });
+
       if (!blocks || blocks.length === 0) {
         return { html: '', isMarkdown: false };
       }
@@ -4511,12 +4437,19 @@
       let hasMarkdown = false;
 
       for (const block of blocks) {
+        // 🔍 检查点 3.3：记录每个 block 的渲染
+        console.log('[DEBUG-LAYER-3] 渲染 block:', {
+          type: block.type,
+          contentLength: block.content?.length || 0,
+          isMarkdown: block.isMarkdown,
+          language: block.language,
+        });
+
         switch (block.type) {
           case 'text':
-            if (isJsonText(block.content)) {
-              html += renderCodeBlock(block.content, 'json', '');
-              hasMarkdown = true;
-            } else if (block.isMarkdown) {
+            // 🔧 移除前端 JSON 检测 - 后端已经处理，避免显示意外的 JSON 代码块
+            // 如果后端认为是 JSON，会发送 type: 'code' 块
+            if (block.isMarkdown) {
               html += '<div class="markdown-rendered">' + renderMarkdown(block.content) + '</div>';
               hasMarkdown = true;
             } else {
@@ -4525,9 +4458,36 @@
             break;
 
           case 'code':
+            // 🔧 新增：跳过嵌入式代码块（通常是内部 JSON 数据）
+            if (block.isEmbedded) {
+              console.log('[DEBUG-LAYER-3] 跳过嵌入式代码块:', {
+                language: block.language,
+                contentLength: block.content?.length || 0,
+              });
+              break;
+            }
+
             const lang = block.language || 'text';
             const filename = block.filename || '';
-            html += renderCodeBlock(block.content, lang, filename);
+            const codeContent = block.content || '';
+            const lineCount = (codeContent.match(/\n/g) || []).length + 1;
+
+            // 🔧 新增：超长代码块（超过20行）使用可折叠面板
+            if (lineCount > 20) {
+              const panelId = 'code-panel-' + Math.random().toString(36).substr(2, 9);
+              // 🔧 修复：面板标题只显示语言类型，不显示文件名或其他内容
+              const displayName = lang.toUpperCase();
+              html += '<div class="collapsible-panel code-panel" data-panel-id="' + panelId + '">';
+              html += '<div class="collapsible-header" onclick="togglePanel(\'' + panelId + '\')">';
+              html += '<span class="collapsible-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></span>';
+              html += '<span class="collapsible-title"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M5.854 4.854a.5.5 0 1 0-.708-.708l-3.5 3.5a.5.5 0 0 0 0 .708l3.5 3.5a.5.5 0 0 0 .708-.708L2.707 8l3.147-3.146zm4.292 0a.5.5 0 0 1 .708-.708l3.5 3.5a.5.5 0 0 1 0 .708l-3.5 3.5a.5.5 0 0 1-.708-.708L13.293 8l-3.147-3.146z"/></svg>' + escapeHtml(displayName) + '</span>';
+              html += '<span class="collapsible-badge">' + lineCount + ' 行</span>';
+              html += '</div>';
+              html += '<div class="collapsible-content"><div class="collapsible-body code-body">' + renderCodeBlock(codeContent, lang, filename) + '</div></div>';
+              html += '</div>';
+            } else {
+              html += renderCodeBlock(codeContent, lang, filename);
+            }
             hasMarkdown = true;
             break;
 
@@ -4999,6 +4959,8 @@
 
       sortedMessages.forEach(({ m, idx }) => {
         // 跳过空内容消息（避免只渲染徽章/时间的空行）
+        // 🔧 修复：对于 orchestrator 消息，即使内容为空也应该渲染（可能是工具调用或状态消息）
+        const isOrchestrator = m.source === 'orchestrator';
         const hasRenderableContent =
           m.streaming ||
           (m.content && String(m.content).trim()) ||
@@ -5017,7 +4979,8 @@
             (t.output && String(t.output).trim()) ||
             (t.result && String(t.result).trim()) ||
             (t.error && String(t.error).trim())
-          ));
+          )) ||
+          (isOrchestrator && m.standardMessageId);  // 🔧 orchestrator 消息总是渲染
 
         // 尝试渲染特殊消息
         const specialHtml = renderSpecialMessage(m, idx, tabType);
@@ -5153,10 +5116,9 @@
       let html = '<div class="message' + messageTypeClass + streamingClass + groupedClass + clarificationClass + workerQuestionClass + '" data-msg-idx="' + idx + '"' + streamKeyAttr + cliAttr + '>';
       html += '<div class="message-body">';
 
-      // 悬停操作按钮（非用户消息）
-      if (!isUser) {
+      // 悬停操作按钮（非用户消息，且存在可操作项）
+      if (!isUser && ((message.isClarification && window._pendingClarification) || (message.isWorkerQuestion && window._pendingWorkerQuestion))) {
         html += '<div class="message-actions">';
-        html += '<button class="message-action-btn" onclick="copyMessageContent(this, ' + idx + ')" title="复制消息"><svg viewBox="0 0 16 16"><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/><path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/></svg></button>';
         // 🆕 澄清消息添加跳过按钮
         if (message.isClarification && window._pendingClarification) {
           html += '<button class="message-action-btn" onclick="skipClarification()" title="跳过澄清"><svg viewBox="0 0 16 16"><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg></button>';
@@ -5220,25 +5182,32 @@
         const rendered = renderMessageContentSmart(message, cli);
         contentHtml += rendered.html;
         contentIsMarkdown = rendered.isMarkdown;
+      } else if (!isUser && !message.content && !message.streaming) {
+        // 🔧 修复：空内容的非流式消息显示占位符（可能是工具调用消息）
+        if (message.toolCalls && message.toolCalls.length > 0) {
+          // 有工具调用，不需要占位符
+          rawContent = '';
+        } else if (source === 'orchestrator') {
+          // Orchestrator 空消息显示占位符
+          contentHtml += '<div class="empty-message-placeholder" style="color: var(--vscode-descriptionForeground); font-style: italic; padding: 8px 0;">（处理中...）</div>';
+          rawContent = '';
+        } else {
+          rawContent = message.content || '';
+          contentHtml += escapeHtml(rawContent);
+        }
       } else {
         rawContent = message.content || '';
         contentHtml += escapeHtml(rawContent);
       }
 
-      // 检查是否需要折叠长消息
-      const needsCollapse = !isUser && !message.streaming && shouldCollapseMessage(rawContent);
-      const collapsedClass = needsCollapse ? ' collapsed' : '';
-      const contentClass = 'message-content' + (contentIsMarkdown ? ' markdown-rendered' : '') + collapsedClass;
-
-      // 如果需要折叠，用容器包裹内容和按钮
-      if (needsCollapse) {
-        html += '<div class="message-collapsible-wrapper">';
-        html += '<div class="' + contentClass + '">' + contentHtml + '</div>';
-        html += '<button class="message-expand-btn" onclick="toggleMessageExpand(this)">展开更多</button>';
-        html += '</div>';
-      } else {
-        html += '<div class="' + contentClass + '">' + contentHtml + '</div>';
-      }
+      // 🔧 修复：移除对普通消息的折叠
+      // 根据设计原则，只有特殊内容面板才需要折叠：
+      // - 思考过程 (thinking) - 已在上面通过 collapsible-panel 处理
+      // - 工具调用 (toolCalls) - 在下面通过 renderToolTrack 处理
+      // - 代码块 - 在 renderParsedBlocks 中通过 collapsible-panel 处理
+      // 普通AI回复（包括统计、解释等）不应该被折叠
+      const contentClass = 'message-content' + (contentIsMarkdown ? ' markdown-rendered' : '');
+      html += '<div class="' + contentClass + '">' + contentHtml + '</div>';
 
       if (!isUser && message.toolCalls && message.toolCalls.length > 0) {
         html += renderToolTrack(message.toolCalls, toolPanelPrefix + idx);
@@ -5829,24 +5798,11 @@
         };
         threadMessages.push(userMsg);
 
-        // 🔧 修复：立即创建流式消息，避免出现两个消息卡片
-        // 在编排者模式下，预先创建带 Orchestrator 徽章的流式消息
-        if (isOrchestratorMode) {
-          const streamKey = generateStreamKey('orchestrator', 'claude');
-          const assistantMsg = {
-            role: 'assistant',
-            content: '',
-            time: new Date().toLocaleTimeString().slice(0,5),
-            timestamp: Date.now(),
-            streaming: true,
-            startedAt: Date.now(),
-            source: 'orchestrator',
-            cli: 'claude',
-            streamKey: streamKey
-          };
-          threadMessages.push(assistantMsg);
-          // 🔧 P3 修复：移除直接设置 thinkingStartAt，由 setProcessingState 统一管理
-        }
+        // 🔧 修复：移除预创建空流式消息的逻辑
+        // 之前这里会预创建一个空的 assistant 消息作为占位符，但这会导致：
+        // 1. 后端返回真正消息时无法正确匹配，出现两个消息
+        // 2. 消息 ID 不一致，状态同步混乱
+        // 现在完全依赖后端 standardMessage 系统创建消息
 
         // 设置处理状态（会自动设置 thinkingStartAt）
         setLocalProcessingGrace(15000);
@@ -6654,11 +6610,12 @@
         type: 'plan',
         variant: 'info',
         icon: getRoleIcon('plan'),
-        title: '执行计划已生成',
+        title: '执行计划',  // 恢复标题，但不设置 collapsed，所以标题无点击事件
         badges: [{ text: statusText, class: badgeClass }],
         time: m.time || '',
         content: '<div class="plan-content">' + formatPlanHtml(m.content || '') + '</div>' + reviewHtml,
         footer: footerHtml,
+        collapsed: false,  // 🔧 不可折叠，标题无点击事件
         className: 'plan-confirmation-card ' + (reviewStatus === 'rejected' ? 'cancelled' : 'ready'),
         dataAttrs: { 'msg-idx': idx }
       });
@@ -6685,11 +6642,12 @@
         type: 'plan',
         variant: isPending ? 'warning' : (m.confirmed ? 'success' : 'error'),
         icon: getRoleIcon('plan'),
-        title: '执行计划确认',
+        title: '执行计划确认',  // 恢复标题，但不设置 collapsed，所以标题无点击事件
         badges: [{ text: statusText, class: badgeClass }],
         time: m.time || '',
         content: '<div class="plan-content">' + formatPlanHtml(m.content || '') + '</div>',
         footer: footerHtml,
+        collapsed: false,  // 🔧 不可折叠，标题无点击事件
         className: 'plan-confirmation-card ' + statusClass,
         dataAttrs: { 'msg-idx': idx }
       });
@@ -6726,14 +6684,66 @@
         type: 'question',
         variant: isPending ? 'warning' : (answered ? 'success' : 'error'),
         icon: getRoleIcon('question'),
-        title: '需要补充信息',
+        title: '需要补充信息',  // 恢复标题，但不设置 collapsed，所以标题无点击事件
         badges: [{ text: statusText, class: badgeClass }],
         time: m.time || '',
         content: contentHtml,
         footer: footerHtml,
+        collapsed: false,  // 🔧 不可折叠，标题无点击事件
         className: 'question-card ' + statusClass,
         dataAttrs: { 'msg-idx': idx }
       });
+    }
+
+    // 🔧 解析 CLI 询问内容，提取有意义的信息
+    function parseCliQuestionContent(content) {
+      if (!content || typeof content !== 'string') {
+        return { type: 'text', display: content || '' };
+      }
+
+      const trimmed = content.trim();
+
+      // 检测是否是 JSON 格式的工具调用
+      if (trimmed.startsWith('{') && trimmed.includes('"type"')) {
+        try {
+          const parsed = JSON.parse(trimmed);
+
+          // Claude 工具调用格式: {"type":"assistant","message":{"content":[...]}}
+          if (parsed.type === 'assistant' && parsed.message?.content) {
+            const toolCalls = parsed.message.content.filter(c => c.type === 'tool_use');
+            if (toolCalls.length > 0) {
+              return {
+                type: 'tool_calls',
+                tools: toolCalls.map(t => ({
+                  name: t.name || '未知工具',
+                  description: t.input?.description || t.input?.prompt || '',
+                  model: t.input?.model,
+                  input: t.input
+                }))
+              };
+            }
+          }
+
+          // 其他 JSON 格式，尝试提取关键信息
+          if (parsed.description || parsed.prompt) {
+            return {
+              type: 'structured',
+              description: parsed.description || parsed.prompt,
+              data: parsed
+            };
+          }
+        } catch {
+          // JSON 解析失败，作为普通文本处理
+        }
+      }
+
+      // 检测常见的权限请求模式
+      if (/\[Y\/n\]/i.test(trimmed) || /\[yes\/no\]/i.test(trimmed)) {
+        return { type: 'permission', display: trimmed };
+      }
+
+      // 普通文本
+      return { type: 'text', display: trimmed };
     }
 
     // 🔧 渲染 CLI 询问卡片
@@ -6766,9 +6776,38 @@
         badgeClass = 'badge-error';
       }
 
-      // 构建内容
+      // 🔧 智能解析内容
+      const parsed = parseCliQuestionContent(m.content);
       let contentHtml = '<div class="cli-question-content">';
-      contentHtml += '<pre class="cli-question-text">' + escapeHtml(m.content || '') + '</pre>';
+
+      if (parsed.type === 'tool_calls') {
+        // 工具调用：显示友好的工具信息
+        parsed.tools.forEach((tool, i) => {
+          contentHtml += '<div class="cli-tool-call" style="margin-bottom: 8px;">';
+          contentHtml += '<div style="font-weight: 500; color: var(--vscode-textLink-foreground);">';
+          contentHtml += '<span style="opacity: 0.7;">🔧 </span>' + escapeHtml(tool.name);
+          if (tool.model) {
+            contentHtml += ' <span style="opacity: 0.6; font-size: 0.9em;">(' + escapeHtml(tool.model) + ')</span>';
+          }
+          contentHtml += '</div>';
+          if (tool.description) {
+            contentHtml += '<div style="margin-top: 4px; color: var(--vscode-foreground); opacity: 0.9;">';
+            contentHtml += escapeHtml(tool.description.slice(0, 300));
+            if (tool.description.length > 300) contentHtml += '...';
+            contentHtml += '</div>';
+          }
+          contentHtml += '</div>';
+        });
+      } else if (parsed.type === 'structured') {
+        // 结构化数据：显示描述
+        contentHtml += '<div class="cli-question-text" style="white-space: pre-wrap;">';
+        contentHtml += escapeHtml(parsed.description || '');
+        contentHtml += '</div>';
+      } else {
+        // 普通文本或权限请求
+        contentHtml += '<pre class="cli-question-text">' + escapeHtml(parsed.display || '') + '</pre>';
+      }
+
       contentHtml += '</div>';
 
       if (!isPending && m.answer) {
@@ -6793,11 +6832,12 @@
         type: 'cli_question',
         variant: isPending ? 'warning' : (answered ? 'success' : 'error'),
         icon: '<svg viewBox="0 0 16 16"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M5.255 5.786a.237.237 0 0 0 .241.247h.825c.138 0 .248-.113.266-.25.09-.656.54-1.134 1.342-1.134.686 0 1.314.343 1.314 1.168 0 .635-.374.927-.965 1.371-.673.489-1.206 1.06-1.168 1.987l.003.217a.25.25 0 0 0 .25.246h.811a.25.25 0 0 0 .25-.25v-.105c0-.718.273-.927 1.01-1.486.609-.463 1.244-.977 1.244-2.056 0-1.511-1.276-2.241-2.673-2.241-1.267 0-2.655.59-2.75 2.286zm1.557 5.763c0 .533.425.927 1.01.927.609 0 1.028-.394 1.028-.927 0-.552-.42-.94-1.029-.94-.584 0-1.009.388-1.009.94z"/></svg>',
-        title: 'CLI 询问 (' + (m.cli || 'CLI') + ')',
+        title: 'CLI 询问',  // 恢复标题，但不设置 collapsed，所以标题无点击事件
         badges: [{ text: statusText, class: badgeClass }],
         time: m.time || '',
         content: contentHtml,
         footer: footerHtml,
+        collapsed: false,  // 🔧 不可折叠，标题无点击事件
         className: 'cli-question-card ' + statusClass,
         dataAttrs: { 'msg-idx': idx, 'question-id': m.questionId || '' }
       });

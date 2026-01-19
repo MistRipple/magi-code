@@ -15,6 +15,7 @@ import {
   TextBlock,
 } from '../protocol';
 import { OrchestratorUIMessage, OrchestratorState } from '../orchestrator/protocols/types';
+import { parseContentToBlocks } from '../utils/content-parser';
 
 /** 编排器消息类型到内容块类型的映射 */
 const MESSAGE_TYPE_MAP: Record<string, ContentBlock['type']> = {
@@ -35,28 +36,55 @@ export function normalizeOrchestratorMessage(
 ): StandardMessage {
   const messageId = `msg-orch-${uuidv4().substring(0, 8)}`;
 
-  // 构建内容块
-  const blocks: ContentBlock[] = [];
-  const summaryCard = uiMessage.type === 'summary' ? parseSummaryCard(uiMessage.content) : null;
+  // 🔍 检查点 2.1：记录进入 normalizer
+  console.log('[DEBUG-LAYER-2] normalizeOrchestratorMessage 入口:', {
+    messageId,
+    type: uiMessage.type,
+    contentLength: uiMessage.content?.length || 0,
+    contentPreview: uiMessage.content?.substring(0, 100),
+  });
 
-  // 主文本内容
-  if (uiMessage.content && !summaryCard) {
-    const textBlock: TextBlock = {
-      type: 'text',
-      content: uiMessage.content,
-      isMarkdown: uiMessage.type === 'plan_ready',
-    };
-    blocks.push(textBlock);
+  // 构建内容块
+  let blocks: ContentBlock[] = [];
+
+  // 🔧 移除 summaryCard 特殊处理 - 总结内容应该作为普通消息显示
+  // const summaryCard = uiMessage.type === 'summary' ? parseSummaryCard(uiMessage.content) : null;
+
+  // 🔧 使用 parseContentToBlocks 处理内容（会自动移除裸露的 JSON）
+  if (uiMessage.content) {
+    blocks = parseContentToBlocks(uiMessage.content, { source: 'orchestrator' });
+
+    // 🔍 检查点 2.2：记录解析后的 blocks
+    console.log('[DEBUG-LAYER-2] parseContentToBlocks 返回:', {
+      messageId,
+      blocksCount: blocks.length,
+      blockTypes: blocks.map(b => b.type),
+      firstBlockPreview: blocks[0] ? {
+        type: blocks[0].type,
+        contentLength: (blocks[0].type === 'text' || blocks[0].type === 'code') ? (blocks[0] as any).content?.length || 0 : 0,
+        contentPreview: (blocks[0].type === 'text' || blocks[0].type === 'code') ? (blocks[0] as any).content?.substring(0, 100) : '',
+      } : null,
+    });
+
+    // 如果解析后是文本块，根据消息类型设置 isMarkdown
+    if (blocks.length > 0 && blocks[0].type === 'text') {
+      const textBlock = blocks[0] as TextBlock;
+      if (uiMessage.type === 'plan_ready' || uiMessage.type === 'summary') {
+        textBlock.isMarkdown = true;
+      }
+    }
   }
 
   // 如果有计划信息，且与主内容不同，添加为额外块
   if (uiMessage.metadata?.formattedPlan && uiMessage.metadata.formattedPlan !== uiMessage.content) {
-    const planBlock: TextBlock = {
-      type: 'text',
-      content: uiMessage.metadata.formattedPlan,
-      isMarkdown: true,
-    };
-    blocks.push(planBlock);
+    const planBlocks = parseContentToBlocks(uiMessage.metadata.formattedPlan, { source: 'orchestrator' });
+    // 设置为 Markdown
+    planBlocks.forEach(block => {
+      if (block.type === 'text') {
+        (block as TextBlock).isMarkdown = true;
+      }
+    });
+    blocks.push(...planBlocks);
   }
 
   // 确定消息类型
@@ -93,7 +121,7 @@ export function normalizeOrchestratorMessage(
       taskId: uiMessage.taskId,
       phase: uiMessage.metadata?.phase,
       subTaskId: uiMessage.metadata?.subTaskId,
-      ...(summaryCard ? { summaryCard } : {}),
+      // 🔧 移除 summaryCard - 总结内容作为普通消息显示
     },
   };
 }

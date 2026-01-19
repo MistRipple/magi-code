@@ -12,7 +12,7 @@ export type TraceLayer =
   | 'webview'
   | 'webview-provider'
   | 'orchestrator'
-  | 'worker-pool'
+  | 'mission-executor'
   | 'cli-adapter'
   | 'session-manager'
   | 'cli-process';
@@ -153,21 +153,50 @@ export class MessageTracer extends EventEmitter {
   private logToConsole(record: TraceRecord): void {
     if (!this.config.consoleOutput) return;
 
-    const timestamp = new Date(record.timestamp).toISOString().substring(11, 23);
-    const arrow = record.messageType === 'response' ? '<-' : '->';
-    const prefix = `[${timestamp}] [${record.traceId.substring(0, 12)}]`;
-    const flow = `${record.source} ${arrow} ${record.target}`;
-
     switch (this.config.consoleLevel) {
       case 'verbose':
-        logger.info(`${prefix} ${flow}: ${record.summary}`, record.payload || '');
+        logger.info(
+          '追踪.控制台',
+          {
+            level: this.config.consoleLevel,
+            traceId: record.traceId,
+            source: record.source,
+            target: record.target,
+            messageType: record.messageType,
+            summary: record.summary,
+            payload: record.payload,
+          },
+          LogCategory.SYSTEM
+        );
         break;
       case 'normal':
-        logger.info(`${prefix} ${flow}: ${record.summary}`);
+        logger.info(
+          '追踪.控制台',
+          {
+            level: this.config.consoleLevel,
+            traceId: record.traceId,
+            source: record.source,
+            target: record.target,
+            messageType: record.messageType,
+            summary: record.summary,
+          },
+          LogCategory.SYSTEM
+        );
         break;
       case 'minimal':
         if (record.messageType === 'error') {
-          logger.info(`${prefix} ${flow}: ${record.summary}`);
+          logger.info(
+            '追踪.控制台',
+            {
+              level: this.config.consoleLevel,
+              traceId: record.traceId,
+              source: record.source,
+              target: record.target,
+              messageType: record.messageType,
+              summary: record.summary,
+            },
+            LogCategory.SYSTEM
+          );
         }
         break;
     }

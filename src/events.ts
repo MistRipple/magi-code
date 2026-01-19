@@ -64,7 +64,7 @@ export class EventEmitter {
         try {
           listener(event);
         } catch (error) {
-          logger.error(`事件监听器错误 [${event.type}]:`, error);
+          logger.error('事件.监听.失败', { eventType: event.type, error }, LogCategory.SYSTEM);
         }
       }
     }
@@ -74,7 +74,7 @@ export class EventEmitter {
       try {
         listener(event);
       } catch (error) {
-        logger.error(`全局事件监听器错误:`, error);
+        logger.error('事件.监听.全局_失败', error, LogCategory.SYSTEM);
       }
     }
   }
@@ -131,4 +131,3 @@ export function emitEvent(
 export function onEvent(type: EventType, listener: EventListener): () => void {
   return globalEventBus.on(type, listener);
 }
-

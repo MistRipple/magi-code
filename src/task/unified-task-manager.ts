@@ -826,7 +826,11 @@ export class UnifiedTaskManager extends EventEmitter {
     // 发送事件
     this.emit('subtask:retrying', task, subTask);
 
-    logger.info(`[UnifiedTaskManager] SubTask ${subTaskId} reset for retry (${subTask.retryCount}/${subTask.maxRetries}, undefined, LogCategory.TASK)`);
+    logger.info(
+      '任务.子任务.重试_重置',
+      { subTaskId, retryCount: subTask.retryCount, maxRetries: subTask.maxRetries },
+      LogCategory.TASK
+    );
   }
 
   /**

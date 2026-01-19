@@ -16,8 +16,8 @@
  * └── gemini.json      - Gemini Worker 画像
  *
  * ⚠️ 重要：ProfileLoader 应该只有一个实例
- * - 推荐：由 WorkerPool 创建和管理
- * - 其他组件：通过 WorkerPool.getProfileLoader() 获取
+ * - 推荐：由 MissionOrchestrator 或 MissionDrivenEngine 创建和管理
+ * - 其他组件：通过依赖注入获取
  * - 避免：在多个地方创建实例
  */
 
@@ -65,17 +65,17 @@ export class ProfileLoader {
     if (ProfileLoader.instanceCount > 1) {
       const activeInstances = ProfileLoader.instances.filter(ref => ref.deref() !== undefined).length;
       logger.warn(
-        `[ProfileLoader] ⚠️  检测到多个 ProfileLoader 实例！` +
-        `\n  当前实例 ID: ${this.instanceId}` +
-        `\n  活跃实例数: ${activeInstances}` +
-        `\n  总创建次数: ${ProfileLoader.instanceCount}` +
-        `\n  ⚠️  这可能导致配置不一致！` +
-        `\n  建议：只在 WorkerPool 中创建一个实例，其他组件通过 getProfileLoader() 获取`
+        '编排器.画像_加载器.多个_实例',
+        {
+          instanceId: this.instanceId,
+          activeInstances,
+          totalInstances: ProfileLoader.instanceCount,
+        },
+        LogCategory.ORCHESTRATOR
       );
 
       // 打印堆栈跟踪以帮助定位问题
-      logger.warn('[ProfileLoader] 创建位置堆栈:', undefined, LogCategory.ORCHESTRATOR);
-      logger.warn(new Error().stack || '', undefined, LogCategory.ORCHESTRATOR);
+      logger.warn('编排器.画像_加载器.多个_实例.堆栈', { stack: new Error().stack || '' }, LogCategory.ORCHESTRATOR);
     }
   }
 
@@ -132,9 +132,9 @@ export class ProfileLoader {
           const content = fs.readFileSync(userConfigPath, 'utf-8');
           const userProfile = JSON.parse(content) as Partial<WorkerProfile>;
           finalProfile = this.mergeProfile(finalProfile, userProfile);
-          logger.info(`[ProfileLoader] 已加载用户配置: ${workerType}`, undefined, LogCategory.ORCHESTRATOR);
+          logger.info('编排器.画像_加载器.子代理_配置.已加载', { workerType }, LogCategory.ORCHESTRATOR);
         } catch (error) {
-          logger.warn(`[ProfileLoader] 加载用户配置失败: ${userConfigPath}`, error, LogCategory.ORCHESTRATOR);
+          logger.warn('编排器.画像_加载器.子代理_配置.失败', { path: userConfigPath, error }, LogCategory.ORCHESTRATOR);
         }
       }
 
@@ -158,9 +158,9 @@ export class ProfileLoader {
           DEFAULT_CATEGORIES_CONFIG,
           userConfig
         );
-        logger.info('[ProfileLoader] 已加载用户分类配置', undefined, LogCategory.ORCHESTRATOR);
+        logger.info('编排器.画像_加载器.分类_配置.已加载', undefined, LogCategory.ORCHESTRATOR);
       } catch (error) {
-        logger.warn('[ProfileLoader] 加载用户分类配置失败', error, LogCategory.ORCHESTRATOR);
+        logger.warn('编排器.画像_加载器.分类_配置.失败', error, LogCategory.ORCHESTRATOR);
       }
     }
 

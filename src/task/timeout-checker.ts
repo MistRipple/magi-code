@@ -119,7 +119,7 @@ export class TimeoutChecker {
         try {
           item.callback();
         } catch (error) {
-          logger.error(`[TimeoutChecker] Callback error for ${id}:`, error, LogCategory.TASK);
+          logger.error('任务.超时.回调_失败', { id, error }, LogCategory.TASK);
         }
       }
     }

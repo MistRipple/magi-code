@@ -88,7 +88,7 @@ ${specialization}`;
 
 /**
  * 构建 Worker 任务执行 Prompt
- * 用于替代 worker-agent.ts 中的 buildExecutionPrompt
+ * 提供任务执行的系统级引导
  */
 export function buildWorkerTaskPrompt(options: {
   taskDescription: string;

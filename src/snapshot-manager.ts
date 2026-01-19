@@ -169,7 +169,7 @@ export class SnapshotManager {
     }
 
     if (cleaned > 0) {
-      logger.info(`[SnapshotManager] 清理了 ${cleaned} 个孤立的快照元数据`);
+      logger.info('快照.清理.孤立元数据', { count: cleaned }, LogCategory.RECOVERY);
     }
 
     return cleaned;
@@ -197,14 +197,14 @@ export class SnapshotManager {
             this.invalidateSnapshotCache(filePath);
             cleaned++;
           } catch (error) {
-            logger.error(`[SnapshotManager] 清理未记录快照文件失败: ${file}`, error);
+            logger.error('快照.清理.未记录.失败', { filePath: file, error }, LogCategory.RECOVERY);
           }
         }
       }
     }
 
     if (cleaned > 0) {
-      logger.info(`[SnapshotManager] 清理了 ${cleaned} 个未记录的快照文件`);
+      logger.info('快照.清理.未记录.完成', { count: cleaned }, LogCategory.RECOVERY);
     }
 
     return cleaned;
@@ -239,7 +239,7 @@ export class SnapshotManager {
     const normalizedPath = path.normalize(absolutePath);
     const normalizedRoot = path.normalize(this.workspaceRoot);
     if (!normalizedPath.startsWith(normalizedRoot)) {
-      logger.error(`[SnapshotManager] Path traversal detected: ${filePath}`);
+      logger.error('快照.安全.路径穿越', { filePath }, LogCategory.RECOVERY);
       throw new Error(`Path traversal detected: file must be within workspace`);
     }
 
@@ -273,10 +273,15 @@ export class SnapshotManager {
       if (priority < otherSnapshot.priority) {
         // 新 SubTask 优先级更高，允许覆盖历史快照
         logger.info(
-          `[SnapshotManager] 🔄 高优先级任务覆盖: ${relativePath}\n` +
-          `  新任务: ${subTaskId} (优先级 ${priority})\n` +
-          `  历史任务: ${otherSnapshot.subTaskId} (优先级 ${otherSnapshot.priority})\n` +
-          `  决策: 允许创建新快照，删除历史快照`
+          '快照.冲突.覆盖',
+          {
+            filePath: relativePath,
+            subTaskId,
+            priority,
+            previousSubTaskId: otherSnapshot.subTaskId,
+            previousPriority: otherSnapshot.priority,
+          },
+          LogCategory.RECOVERY
         );
 
         // 删除历史快照文件
@@ -287,7 +292,7 @@ export class SnapshotManager {
             // 清除历史快照的缓存
             this.invalidateSnapshotCache(oldSnapshotFile);
           } catch (error) {
-            logger.error(`[SnapshotManager] 删除历史快照文件失败: ${oldSnapshotFile}`, error);
+            logger.error('快照.清理.旧快照.失败', { path: oldSnapshotFile, error }, LogCategory.RECOVERY);
             throw new Error(`Failed to delete previous snapshot: ${error}`);
           }
         }
@@ -299,10 +304,15 @@ export class SnapshotManager {
       } else {
         // 新 SubTask 优先级更低或相等，拒绝创建新快照
         logger.warn(
-          `[SnapshotManager] ⛔ 低优先级任务被阻止: ${relativePath}\n` +
-          `  新任务: ${subTaskId} (优先级 ${priority})\n` +
-          `  现有任务: ${otherSnapshot.subTaskId} (优先级 ${otherSnapshot.priority})\n` +
-          `  决策: 拒绝创建新快照，复用现有快照`
+          '快照.冲突.阻塞',
+          {
+            filePath: relativePath,
+            subTaskId,
+            priority,
+            existingSubTaskId: otherSnapshot.subTaskId,
+            existingPriority: otherSnapshot.priority,
+          },
+          LogCategory.RECOVERY
         );
 
         // 返回现有快照
@@ -337,7 +347,7 @@ export class SnapshotManager {
       // 写入成功后，将内容添加到缓存
       this.addToCache(this.snapshotContentCache, snapshotFile, originalContent);
     } catch (error) {
-      logger.error(`[SnapshotManager] 写入快照文件失败: ${snapshotFile}`, error);
+      logger.error('快照.写入.失败', { path: snapshotFile, error }, LogCategory.RECOVERY);
       throw new Error(`Failed to write snapshot: ${error}`);
     }
 
@@ -377,7 +387,7 @@ export class SnapshotManager {
     const normalizedPath = path.normalize(absolutePath);
     const normalizedRoot = path.normalize(this.workspaceRoot);
     if (!normalizedPath.startsWith(normalizedRoot)) {
-      logger.error(`[SnapshotManager] Path traversal detected: ${filePath}`);
+      logger.error('快照.安全.路径穿越', { filePath }, LogCategory.RECOVERY);
       throw new Error(`Path traversal detected: file must be within workspace`);
     }
 
@@ -407,9 +417,15 @@ export class SnapshotManager {
     if (otherSnapshot) {
       if (priority < otherSnapshot.priority) {
         logger.info(
-          `[SnapshotManager] [1m[35m高优先级任务覆盖快照[0m: ${relativePath}\n` +
-          `  新任务: ${subTaskId} (优先级 ${priority})\n` +
-          `  历史任务: ${otherSnapshot.subTaskId} (优先级 ${otherSnapshot.priority})`
+          '快照.冲突.覆盖',
+          {
+            filePath: relativePath,
+            subTaskId,
+            priority,
+            previousSubTaskId: otherSnapshot.subTaskId,
+            previousPriority: otherSnapshot.priority,
+          },
+          LogCategory.RECOVERY
         );
 
         const oldSnapshotFile = path.join(this.getSnapshotDir(session.id), `${otherSnapshot.id}.snapshot`);
@@ -418,7 +434,7 @@ export class SnapshotManager {
             fs.unlinkSync(oldSnapshotFile);
             this.invalidateSnapshotCache(oldSnapshotFile);
           } catch (error) {
-            logger.error(`[SnapshotManager] 删除历史快照文件失败: ${oldSnapshotFile}`, error);
+            logger.error('快照.清理.旧快照.失败', { path: oldSnapshotFile, error }, LogCategory.RECOVERY);
             throw new Error(`Failed to delete previous snapshot: ${error}`);
           }
         }
@@ -426,9 +442,15 @@ export class SnapshotManager {
         this.sessionManager.removeSnapshot(session.id, relativePath);
       } else {
         logger.warn(
-          `[SnapshotManager] [1m[33m低优先级任务复用快照[0m: ${relativePath}\n` +
-          `  新任务: ${subTaskId} (优先级 ${priority})\n` +
-          `  现有任务: ${otherSnapshot.subTaskId} (优先级 ${otherSnapshot.priority})`
+          '快照.冲突.复用',
+          {
+            filePath: relativePath,
+            subTaskId,
+            priority,
+            existingSubTaskId: otherSnapshot.subTaskId,
+            existingPriority: otherSnapshot.priority,
+          },
+          LogCategory.RECOVERY
         );
 
         const snapshotFile = path.join(this.getSnapshotDir(session.id), `${otherSnapshot.id}.snapshot`);
@@ -458,7 +480,7 @@ export class SnapshotManager {
       fs.writeFileSync(snapshotFile, originalContent, 'utf-8');
       this.addToCache(this.snapshotContentCache, snapshotFile, originalContent);
     } catch (error) {
-      logger.error(`[SnapshotManager] 写入快照文件失败: ${snapshotFile}`, error);
+      logger.error('快照.写入.失败', { path: snapshotFile, error }, LogCategory.RECOVERY);
       throw new Error(`Failed to write snapshot: ${error}`);
     }
 
@@ -495,7 +517,7 @@ export class SnapshotManager {
     const normalizedPath = path.normalize(absolutePath);
     const normalizedRoot = path.normalize(this.workspaceRoot);
     if (!normalizedPath.startsWith(normalizedRoot)) {
-      logger.error(`[SnapshotManager] Path traversal detected: ${filePath}`);
+      logger.error('快照.安全.路径穿越', { filePath }, LogCategory.RECOVERY);
       return false;
     }
 
@@ -657,7 +679,7 @@ export class SnapshotManager {
     const normalizedPath = path.normalize(absolutePath);
     const normalizedRoot = path.normalize(this.workspaceRoot);
     if (!normalizedPath.startsWith(normalizedRoot)) {
-      logger.error(`[SnapshotManager] Path traversal detected: ${filePath}`);
+      logger.error('快照.安全.路径穿越', { filePath }, LogCategory.RECOVERY);
       return false;
     }
 
@@ -687,7 +709,7 @@ export class SnapshotManager {
     // 添加新快照元数据到 Session
     this.sessionManager.addSnapshot(session.id, newSnapshotMeta);
 
-    logger.info(`[SnapshotManager] 确认变更并创建新基准快照: ${relativePath}`);
+    logger.info('快照.接受.完成', { filePath: relativePath, oldSnapshotId: snapshot.id, newSnapshotId }, LogCategory.RECOVERY);
 
     globalEventBus.emitEvent('snapshot:accepted', {
       sessionId: session.id,

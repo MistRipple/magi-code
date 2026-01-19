@@ -15,7 +15,7 @@ let statusBarItem: vscode.StatusBarItem | undefined;
  * 扩展激活
  */
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  logger.info('MultiCLI 扩展已激活', undefined, LogCategory.CLI);
+  logger.info('扩展.激活.开始', undefined, LogCategory.SYSTEM);
 
   // 获取工作区根目录
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -85,11 +85,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       dispose: () => cliDetector.stopHealthCheck()
     });
   } catch (error) {
-    logger.error('[Extension] Failed to start health check:', error);
+    logger.error('扩展.健康_检查.开始_失败', error, LogCategory.SYSTEM);
     vscode.window.showWarningMessage('MultiCLI: 健康检查启动失败，部分功能可能受限');
   }
 
-  logger.info('MultiCLI 初始化完成', undefined, LogCategory.CLI);
+  logger.info('扩展.初始化.完成', undefined, LogCategory.SYSTEM);
 }
 
 /**
@@ -238,7 +238,7 @@ async function detectAndNotifyCLIs(): Promise<{ claudeAvailable: boolean; codexA
     }
   } else {
     // Claude 可用，显示版本信息
-    logger.info(`Claude CLI 已就绪: v${claudeStatus?.version}`, undefined, LogCategory.CLI);
+    logger.info('CLI.检测.claude.就绪', { version: claudeStatus?.version }, LogCategory.CLI);
   }
 
   // Codex 和 Gemini 是可选的
@@ -271,29 +271,29 @@ async function detectAndNotifyCLIs(): Promise<{ claudeAvailable: boolean; codexA
  * 扩展停用 - 增强版：确保所有资源被正确清理
  */
 export async function deactivate(): Promise<void> {
-  logger.info('MultiCLI 扩展正在停用...', undefined, LogCategory.CLI);
+  logger.info('扩展.停用.开始', undefined, LogCategory.SYSTEM);
 
   try {
     // 1. 停止健康检查
     cliDetector.stopHealthCheck();
-    logger.info('[deactivate] 健康检查已停止');
+    logger.info('扩展.健康_检查.已停止', undefined, LogCategory.SYSTEM);
 
     // 2. 清理 WebviewProvider（包括 CLI 进程、编排器、事件监听器）
     if (webviewProvider) {
       await webviewProvider.dispose();
       webviewProvider = undefined;
-      logger.info('[deactivate] WebviewProvider 已清理', undefined, LogCategory.UI);
+      logger.info('扩展.停用.Webview.已清理', undefined, LogCategory.UI);
     }
 
     // 3. 清理状态栏
     if (statusBarItem) {
       statusBarItem.dispose();
       statusBarItem = undefined;
-      logger.info('[deactivate] 状态栏已清理');
+    logger.info('扩展.停用.状态栏.已清理', undefined, LogCategory.SYSTEM);
     }
 
-    logger.info('MultiCLI 扩展已完全停用', undefined, LogCategory.CLI);
+    logger.info('扩展.停用.完成', undefined, LogCategory.SYSTEM);
   } catch (error) {
-    logger.error('[deactivate] 清理资源时出错:', error);
+    logger.error('扩展.停用.失败', error, LogCategory.SYSTEM);
   }
 }

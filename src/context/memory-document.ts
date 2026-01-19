@@ -36,13 +36,13 @@ export class MemoryDocument {
       if (fs.existsSync(this.filePath)) {
         const data = fs.readFileSync(this.filePath, 'utf-8');
         this.content = JSON.parse(data);
-        logger.info(`[MemoryDocument] 已加载会话 Memory: ${this.sessionId}`);
+        logger.info('上下文记忆.加载.完成', { sessionId: this.sessionId }, LogCategory.SESSION);
       } else {
-        logger.info(`[MemoryDocument] 创建新的会话 Memory: ${this.sessionId}`);
+        logger.info('上下文记忆.加载.新建', { sessionId: this.sessionId }, LogCategory.SESSION);
         await this.save();
       }
     } catch (error) {
-      logger.error(`[MemoryDocument] 加载失败:`, error);
+      logger.error('上下文记忆.加载.失败', error, LogCategory.SESSION);
       this.content = createEmptyMemoryContent(this.sessionId, this.sessionName);
     }
   }
@@ -62,9 +62,9 @@ export class MemoryDocument {
       
       fs.writeFileSync(this.filePath, JSON.stringify(this.content, null, 2));
       this.dirty = false;
-      logger.info(`[MemoryDocument] 已保存会话 Memory: ${this.sessionId}`);
+      logger.info('上下文记忆.保存.完成', { sessionId: this.sessionId }, LogCategory.SESSION);
     } catch (error) {
-      logger.error(`[MemoryDocument] 保存失败:`, error);
+      logger.error('上下文记忆.保存.失败', error, LogCategory.SESSION);
       throw error;
     }
   }
@@ -277,4 +277,3 @@ export class MemoryDocument {
     this.dirty = true;
   }
 }
-

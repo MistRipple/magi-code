@@ -274,6 +274,92 @@ export function buildProgressMessage(
 }
 
 // ============================================================================
+// Prompt 优化工具
+// ============================================================================
+
+/**
+ * Prompt 压缩选项
+ */
+export interface PromptCompressionOptions {
+  /** 移除多余空白行 */
+  removeExtraWhitespace?: boolean;
+  /** 移除注释块 */
+  removeComments?: boolean;
+  /** 截断上下文长度 */
+  maxContextLength?: number;
+  /** 使用紧凑格式 */
+  compact?: boolean;
+}
+
+/**
+ * 压缩 Prompt 以减少 Token 使用
+ */
+export function compressPrompt(prompt: string, options: PromptCompressionOptions = {}): string {
+  let result = prompt;
+
+  // 移除多余空白行
+  if (options.removeExtraWhitespace !== false) {
+    result = result.replace(/\n{3,}/g, '\n\n');
+    result = result.replace(/[ \t]+$/gm, '');
+  }
+
+  // 移除注释块（可选）
+  if (options.removeComments) {
+    result = result.replace(/\/\*[\s\S]*?\*\//g, '');
+    result = result.replace(/\/\/.*$/gm, '');
+  }
+
+  // 截断上下文
+  if (options.maxContextLength && result.length > options.maxContextLength) {
+    result = result.slice(0, options.maxContextLength) + '\n...[已截断]';
+  }
+
+  return result.trim();
+}
+
+/**
+ * 估算 Token 数量（粗略估计：中文约 1.5 token/字，英文约 0.25 token/字）
+ */
+export function estimateTokenCount(text: string): number {
+  const chineseChars = (text.match(/[\u4e00-\u9fff]/g) || []).length;
+  const otherChars = text.length - chineseChars;
+  return Math.ceil(chineseChars * 1.5 + otherChars * 0.25);
+}
+
+/**
+ * 构建紧凑版任务分析 Prompt（减少约 30% Token）
+ */
+export function buildCompactAnalysisPrompt(
+  userPrompt: string,
+  availableWorkers: CLIType[],
+  projectContext?: string
+): string {
+  const workers = availableWorkers.map(w => {
+    const short: Record<CLIType, string> = {
+      claude: 'Claude: 架构/重构/复杂任务',
+      codex: 'Codex: 后端/算法/Bug修复',
+      gemini: 'Gemini: 前端/UI/样式',
+    };
+    return short[w];
+  }).join(' | ');
+
+  const context = projectContext
+    ? compressPrompt(projectContext, { maxContextLength: 2000 })
+    : '';
+
+  return `任务编排器。分析需求，制定计划。禁止执行代码。
+
+需求: ${userPrompt}
+
+Workers: ${workers}
+${context ? `上下文: ${context}\n` : ''}
+输出纯JSON:
+{"analysis":"分析","isSimpleTask":bool,"needsWorker":bool,"directResponse":"直接回答(可选)","needsUserInput":bool,"questions":[],"needsCollaboration":bool,"subTasks":[{"id":"1","description":"描述","assignedWorker":"worker","targetFiles":[],"dependencies":[],"prompt":"Worker指令"}],"executionMode":"parallel/sequential","summary":"总结"}
+
+规则: 前端→Gemini, 后端→Codex, 复杂→Claude. 禁止tool_use.`;
+}
+
+// ============================================================================
 // 导出
 // ============================================================================
 
@@ -283,4 +369,8 @@ export const OrchestratorPrompts = {
   buildOrchestratorSummaryPrompt,
   formatPlanForUser,
   buildProgressMessage,
+  // 新增优化工具
+  compressPrompt,
+  estimateTokenCount,
+  buildCompactAnalysisPrompt,
 };

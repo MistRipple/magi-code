@@ -104,6 +104,101 @@ export function extractJsonInfo(content: string): { isJson: boolean; jsonText: s
 }
 
 /**
+ * 提取内容中的裸露 JSON 对象（不在代码块中的 JSON）
+ * 🔧 新增：处理 AI 响应中混合的 JSON 对象
+ */
+export function extractEmbeddedJson(content: string): Array<{
+  jsonText: string;
+  startIndex: number;
+  endIndex: number;
+}> {
+  const results: Array<{ jsonText: string; startIndex: number; endIndex: number }> = [];
+
+  // 匹配 JSON 对象或数组的正则（简化版，匹配大括号或方括号）
+  // 从 { 或 [ 开始，找到匹配的结束符
+  let i = 0;
+  while (i < content.length) {
+    const char = content[i];
+
+    // 跳过代码块中的内容
+    if (content.substring(i, i + 3) === '```') {
+      const endIndex = content.indexOf('```', i + 3);
+      if (endIndex !== -1) {
+        i = endIndex + 3;
+        continue;
+      }
+    }
+
+    if (char === '{' || char === '[') {
+      // 尝试提取 JSON
+      const extracted = tryExtractJsonAt(content, i);
+      if (extracted) {
+        results.push(extracted);
+        i = extracted.endIndex;
+        continue;
+      }
+    }
+    i++;
+  }
+
+  return results;
+}
+
+/**
+ * 尝试从指定位置提取 JSON
+ */
+function tryExtractJsonAt(content: string, startIndex: number): { jsonText: string; startIndex: number; endIndex: number } | null {
+  const startChar = content[startIndex];
+  const endChar = startChar === '{' ? '}' : ']';
+  let depth = 0;
+  let inString = false;
+  let escapeNext = false;
+
+  for (let i = startIndex; i < content.length; i++) {
+    const char = content[i];
+
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+
+    if (char === '\\') {
+      escapeNext = true;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (char === startChar) {
+      depth++;
+    } else if (char === endChar) {
+      depth--;
+      if (depth === 0) {
+        // 找到匹配的结束符
+        const jsonText = content.substring(startIndex, i + 1);
+        try {
+          JSON.parse(jsonText);
+          return {
+            jsonText,
+            startIndex,
+            endIndex: i + 1,
+          };
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
  * 提取单个代码块
  */
 export function extractSingleCodeFence(content: string): { lang: string; body: string; filepath?: string } | null {
@@ -253,15 +348,49 @@ export function parseContentToBlocks(
 
   // 1. 预处理：清理 ANSI、零宽字符等
   const sanitized = sanitizeCliOutput(rawContent);
-  const content = collapseExtraBlankLines(sanitized);
+  let content = collapseExtraBlankLines(sanitized);
   const trimmed = content.trim();
 
   if (!trimmed) return [];
 
   const blocks: ContentBlock[] = [];
 
-  // 2. 提取代码块
+  // 2. 🔧 移除裸露的 JSON 对象（用户不需要看到原始 JSON）
+  const embeddedJsons = extractEmbeddedJson(content);
+  if (embeddedJsons.length > 0) {
+    console.log('[content-parser] 发现裸露 JSON:', embeddedJsons.length, '个');
+    embeddedJsons.forEach((json, idx) => {
+      console.log(`[content-parser] JSON ${idx + 1}:`, {
+        startIndex: json.startIndex,
+        endIndex: json.endIndex,
+        length: json.jsonText.length,
+        preview: json.jsonText.substring(0, 100) + '...'
+      });
+    });
+
+    // 从后往前移除，避免索引变化
+    for (let i = embeddedJsons.length - 1; i >= 0; i--) {
+      const json = embeddedJsons[i];
+      // 移除 JSON 及其前后的空行
+      const before = content.substring(0, json.startIndex).trimEnd();
+      const after = content.substring(json.endIndex).trimStart();
+      content = before + (before && after ? '\n\n' : '') + after;
+    }
+
+    console.log('[content-parser] 移除 JSON 后的内容长度:', content.length);
+  }
+
+  // 3. 提取代码块
   const codeBlocks = extractCodeBlocks(content);
+
+  // 🔧 新增：检查内容是否以代码块开头
+  const startsWithCodeBlock = codeBlocks.length > 0 && codeBlocks[0].startIndex === 0;
+
+  console.log('[content-parser] 代码块检查:', {
+    codeBlocksCount: codeBlocks.length,
+    startsWithCodeBlock,
+    firstCodeBlockLang: codeBlocks[0]?.lang,
+  });
 
   if (codeBlocks.length > 0) {
     // 有代码块，需要分段处理
@@ -274,6 +403,24 @@ export function parseContentToBlocks(
         if (textBefore) {
           blocks.push(...parseTextContent(textBefore));
         }
+      }
+
+      // 🔧 新增：如果不是以代码块开头，且当前代码块是 JSON，则标记为嵌入式
+      if (!startsWithCodeBlock && codeBlock.lang === 'json') {
+        console.log('[content-parser] 标记嵌入式 JSON 代码块:', {
+          startIndex: codeBlock.startIndex,
+          length: codeBlock.code.length,
+        });
+        // 添加 isEmbedded 标记，前端会隐藏这个代码块
+        blocks.push({
+          type: 'code',
+          content: codeBlock.code,
+          language: codeBlock.lang,
+          filename: codeBlock.filepath,
+          isEmbedded: true,  // 标记为嵌入式，前端不渲染
+        } as ContentBlock);
+        lastIndex = codeBlock.endIndex;
+        continue;
       }
 
       // 代码块本身
@@ -297,10 +444,13 @@ export function parseContentToBlocks(
     }
   } else {
     // 没有代码块，直接解析文本
-    blocks.push(...parseTextContent(trimmed));
+    const finalContent = content.trim();
+    if (finalContent) {
+      blocks.push(...parseTextContent(finalContent));
+    }
   }
 
-  // 3. 添加工具调用块
+  // 4. 添加工具调用块
   if (options?.toolCalls && options.toolCalls.length > 0) {
     for (const tool of options.toolCalls) {
       blocks.push({
@@ -328,8 +478,9 @@ function parseTextContent(text: string): ContentBlock[] {
   // 检测内容类型
   const jsonInfo = extractJsonInfo(trimmed);
 
-  // JSON 内容 -> 作为代码块
-  if (jsonInfo.isJson) {
+  // 🔧 只有在纯 JSON 时才作为代码块（整个内容都是 JSON，没有其他文本）
+  // 如果 JSON 混合在其他文本中，说明是 AI 的解释，应该保持原样
+  if (jsonInfo.isJson && trimmed === jsonInfo.jsonText) {
     return [{
       type: 'code',
       content: jsonInfo.jsonText,

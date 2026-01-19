@@ -9,6 +9,10 @@ export interface SessionMessage {
   content: string;
   metadata?: Record<string, unknown>;
   silent?: boolean;
+  // Mission-Driven Architecture 扩展
+  missionId?: string;
+  assignmentId?: string;
+  todoId?: string;
 }
 
 export interface SessionResponse {
@@ -22,6 +26,10 @@ export interface SessionResponse {
     outputTokens: number;
     cacheReadTokens?: number;
   };
+  // Mission-Driven Architecture 扩展
+  missionId?: string;
+  assignmentId?: string;
+  todoId?: string;
 }
 
 export interface SessionProcessOptions {

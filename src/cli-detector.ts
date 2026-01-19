@@ -61,7 +61,7 @@ export class CLIDetector {
           data: { statuses, timestamp: Date.now() }
         });
       } catch (error) {
-        logger.error('[CLIDetector] Health check failed:', error, LogCategory.CLI);
+        logger.error('CLI.健康_检查.失败', error, LogCategory.CLI);
         // 继续运行，不中断定时器
       }
     }, this.healthCheckPeriod);
@@ -494,4 +494,3 @@ export class CLIDetector {
 }
 
 export const cliDetector = new CLIDetector();
-

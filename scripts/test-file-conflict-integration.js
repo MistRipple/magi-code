@@ -1,7 +1,7 @@
 /**
  * 文件冲突检测集成测试
  *
- * 验证 WorkerPool 层面的文件冲突检测是否正确启用
+ * 验证 TaskDependencyGraph 层面的文件冲突检测是否正确启用
  *
  * 测试场景:
  * 1. 并行任务修改同一文件应自动串行化
@@ -48,7 +48,7 @@ const runner = new TestRunner('文件冲突检测集成测试');
 async function testFileConflictDetection() {
   runner.logSection('文件冲突检测机制测试');
 
-  // 测试 1: 模拟 WorkerPool 的调用模式
+  // 测试 1: 模拟 MissionExecutor 的调用模式
   try {
     const graph = new TaskDependencyGraph();
 
@@ -73,7 +73,7 @@ async function testFileConflictDetection() {
       }
     ];
 
-    // 模拟 WorkerPool 的调用方式 (修复后的版本)
+    // 模拟 MissionExecutor 的调用方式 (修复后的版本)
     for (const subTask of subTasks) {
       graph.addTask(subTask.id, subTask.description, subTask, subTask.targetFiles || []);
     }

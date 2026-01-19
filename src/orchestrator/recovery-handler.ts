@@ -81,7 +81,7 @@ export class RecoveryHandler {
     errorDetails: string
   ): Promise<RecoveryResult> {
     const attempts = failedTask.retryCount;
-    logger.info(`[RecoveryHandler] 开始恢复流程，当前尝试次数: ${attempts}`, undefined, LogCategory.ORCHESTRATOR);
+    logger.info('编排器.恢复.开始', { attempts }, LogCategory.ORCHESTRATOR);
 
     // 确定恢复策略
     const failureType = this.classifyFailure(errorDetails, verificationResult);
@@ -91,7 +91,7 @@ export class RecoveryHandler {
       data: { attempts, maxAttempts: this.config.maxAttempts, failureType }
     });
     const strategy = this.determineStrategy(attempts, failureType);
-    logger.info(`[RecoveryHandler] 失败类型: ${failureType}，选择策略: ${strategy}`, undefined, LogCategory.ORCHESTRATOR);
+    logger.info('编排器.恢复.策略_选择', { failureType, strategy }, LogCategory.ORCHESTRATOR);
 
     let result: RecoveryResult;
 
@@ -157,7 +157,7 @@ export class RecoveryHandler {
     failedTask: SubTask,
     errorDetails: string
   ): Promise<RecoveryResult> {
-    logger.info(`[RecoveryHandler] 原 CLI 尝试修复: ${failedTask.assignedWorker}`, undefined, LogCategory.ORCHESTRATOR);
+    logger.info('编排器.恢复.重试.原始_CLI', { cli: failedTask.assignedWorker }, LogCategory.ORCHESTRATOR);
 
     await this.unifiedTaskManager.resetSubTaskForRetry(taskId, failedTask.id);
     await this.unifiedTaskManager.startSubTask(taskId, failedTask.id);
@@ -212,7 +212,7 @@ export class RecoveryHandler {
     failedTask: SubTask,
     errorDetails: string
   ): Promise<RecoveryResult> {
-    logger.info(`[RecoveryHandler] 提供更多上下文给 ${failedTask.assignedWorker}`, undefined, LogCategory.ORCHESTRATOR);
+    logger.info('编排器.恢复.提供_上下文', { cli: failedTask.assignedWorker }, LogCategory.ORCHESTRATOR);
 
     await this.unifiedTaskManager.resetSubTaskForRetry(taskId, failedTask.id);
     await this.unifiedTaskManager.startSubTask(taskId, failedTask.id);
@@ -267,7 +267,7 @@ export class RecoveryHandler {
     failedTask: SubTask,
     errorDetails: string
   ): Promise<RecoveryResult> {
-    logger.info(`[RecoveryHandler] 升级到 ${this.config.escalateCli}`, undefined, LogCategory.ORCHESTRATOR);
+    logger.info('编排器.恢复.升级', { cli: this.config.escalateCli }, LogCategory.ORCHESTRATOR);
 
     await this.unifiedTaskManager.resetSubTaskForRetry(taskId, failedTask.id);
     await this.unifiedTaskManager.startSubTask(taskId, failedTask.id);
@@ -321,7 +321,7 @@ export class RecoveryHandler {
     taskId: string,
     failedTask: SubTask
   ): Promise<RecoveryResult> {
-    logger.info(`[RecoveryHandler] 执行回滚`, undefined, LogCategory.ORCHESTRATOR);
+    logger.info('编排器.恢复.回滚', undefined, LogCategory.ORCHESTRATOR);
 
     if (!this.config.enableRollback) {
       return {

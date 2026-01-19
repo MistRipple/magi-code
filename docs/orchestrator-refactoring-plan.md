@@ -1,8 +1,65 @@
 # OrchestratorAgent 重构方案：Mission-Driven Architecture
 
-> **版本**: v1.0
+> **版本**: v1.1
 > **日期**: 2026-01-19
 > **状态**: 待审核
+
+---
+
+## 零、重构原则（强制）
+
+### 0.1 零兼容原则
+
+> **核心立场**：这是一次**完整的架构重构**，不允许任何兼容性妥协。
+
+**禁止事项**：
+- ❌ 禁止保留兼容层（LegacyAdapter、CompatibilityWrapper 等）
+- ❌ 禁止使用废弃标记（@deprecated）代替删除
+- ❌ 禁止保留旧接口"以防万一"
+- ❌ 禁止为旧代码做特殊处理
+- ❌ 禁止在新架构中引用旧类型或旧逻辑
+
+**强制事项**：
+- ✅ 所有调用方必须同步升级到新架构
+- ✅ 不兼容新架构的模块必须**同步重构**，而非架构妥协
+- ✅ UI 层、存储层、测试代码必须同步适配
+- ✅ 配置文件、数据格式必须同步迁移
+
+### 0.2 零残留原则
+
+> **核心立场**：重构完成且测试通过后，必须**完全清理**所有残留内容。
+
+**必须删除**：
+- 🗑️ 旧的 `orchestrator-agent.ts` 文件
+- 🗑️ 旧的 `worker-agent.ts` 文件
+- 🗑️ 旧的 `worker-pool.ts` 文件
+- 🗑️ 旧的类型定义（ExecutionPlan、SubTask 旧版）
+- 🗑️ 旧的 Prompt 模板
+- 🗑️ 所有 `.backup`、`.old`、`.deprecated` 文件
+- 🗑️ 注释掉的旧代码
+- 🗑️ 无用的 import 语句
+- 🗑️ 孤立的工具函数
+
+**代码质量要求**：
+- 📖 保持高度可读性，新开发者能快速理解
+- 📖 文件职责单一，每个文件 < 500 行
+- 📖 类型定义完整，无 `any` 类型逃逸
+- 📖 注释只保留"为什么"，删除"是什么"
+
+### 0.3 同步升级清单
+
+以下模块必须在本次重构中**同步升级**：
+
+| 模块 | 升级内容 | 优先级 |
+|------|----------|--------|
+| **WebviewProvider** | 适配 Mission/Assignment/Todo 事件 | P0 |
+| **UnifiedSessionManager** | 适配 MissionStorage | P0 |
+| **InteractiveSession** | 适配新消息协议 | P0 |
+| **CLI 适配器** | 适配 AutonomousWorker 调用 | P0 |
+| **测试文件** | 全部重写，匹配新架构 | P1 |
+| **Prompt 模板** | 迁移到新目录结构 | P1 |
+| **配置文件** | WorkerProfile 新增评审字段 | P1 |
+| **文档** | 更新 API 文档 | P2 |
 
 ---
 
@@ -1197,7 +1254,270 @@ export class OrchestratorFactory {
 
 ---
 
-## 八、附录
+## 八、画像驱动评审系统（增强）
+
+> **来源**：结合 orchestrator-refactoring-analysis.md 分析补充
+
+### 8.1 核心问题
+
+当前评审机制与画像系统**脱节**：
+
+```typescript
+// 问题1: Plan Review 未利用画像信息
+private async reviewPlan(plan): Promise<PlanReview> {
+  // ❌ 未检查子任务分配是否符合 Worker 的 strengths
+  // ❌ 未利用 CategoryConfig.riskLevel 调整评审严格度
+}
+
+// 问题2: 评审者选择太简单
+private selectPeerReviewer(subTask: SubTask): CLIType {
+  // ❌ 仅排除执行者后取第一个
+  // ❌ 应该选择 strengths 匹配当前任务分类的 Worker
+}
+```
+
+### 8.2 ProfileAwareReviewer（画像感知评审器）
+
+```typescript
+/**
+ * 画像感知评审器
+ * 让评审决策基于 Worker 画像
+ */
+export class ProfileAwareReviewer {
+  constructor(
+    private profileLoader: ProfileLoader,
+    private policyEngine: PolicyEngine
+  ) {}
+
+  /**
+   * 计划评审：检查任务分配是否符合 Worker 能力
+   */
+  async reviewPlan(plan: ExecutionPlan): Promise<PlanReviewResult> {
+    const issues: PlanIssue[] = [];
+
+    for (const task of plan.subTasks) {
+      const profile = this.profileLoader.getProfile(task.assignedWorker);
+      const category = this.inferCategory(task);
+
+      // 1. 检查是否分配给了擅长该分类的 Worker
+      if (!profile.preferences.preferredCategories.includes(category)) {
+        issues.push({
+          type: 'suboptimal_assignment',
+          taskId: task.id,
+          message: `任务分类 "${category}" 不在 ${task.assignedWorker} 的擅长领域`,
+          suggestion: this.findBetterWorker(category),
+        });
+      }
+
+      // 2. 检查任务是否涉及 Worker 的弱项
+      const weaknessHit = profile.profile.weaknesses.find(w =>
+        task.description.toLowerCase().includes(w.toLowerCase())
+      );
+      if (weaknessHit) {
+        issues.push({
+          type: 'weakness_match',
+          taskId: task.id,
+          message: `任务涉及 ${task.assignedWorker} 的弱项: "${weaknessHit}"`,
+          reviewLevel: 'strict', // 需要更严格的评审
+        });
+      }
+    }
+
+    return { issues, approved: issues.filter(i => i.type === 'critical').length === 0 };
+  }
+
+  /**
+   * 互检评审者选择：基于能力画像匹配
+   */
+  selectPeerReviewer(task: SubTask, executor: CLIType): CLIType {
+    const category = this.inferCategory(task);
+    const allProfiles = this.profileLoader.getAllProfiles();
+
+    // 选择擅长该分类且不是执行者的 Worker
+    const candidates = [...allProfiles.entries()]
+      .filter(([cli]) => cli !== executor)
+      .filter(([_, profile]) =>
+        profile.preferences.preferredCategories.includes(category)
+      )
+      .sort((a, b) => {
+        // 优先选择该分类是第一优先的 Worker
+        const aIndex = a[1].preferences.preferredCategories.indexOf(category);
+        const bIndex = b[1].preferences.preferredCategories.indexOf(category);
+        return aIndex - bIndex;
+      });
+
+    return candidates[0]?.[0] || (executor === 'claude' ? 'codex' : 'claude');
+  }
+
+  /**
+   * 评审严格度：基于分类风险 + Worker 弱项
+   */
+  determineReviewLevel(task: SubTask, executor: CLIType): ReviewLevel {
+    const category = this.profileLoader.getCategory(this.inferCategory(task));
+    const profile = this.profileLoader.getProfile(executor);
+
+    // 基础严格度来自分类风险
+    let level: ReviewLevel = category?.riskLevel === 'high' ? 'strict'
+                           : category?.riskLevel === 'medium' ? 'standard'
+                           : 'light';
+
+    // 如果任务涉及 Worker 弱项，提升严格度
+    const involvesWeakness = profile.profile.weaknesses.some(w =>
+      task.description.toLowerCase().includes(w.toLowerCase())
+    );
+    if (involvesWeakness && level !== 'strict') {
+      level = level === 'light' ? 'standard' : 'strict';
+    }
+
+    return level;
+  }
+}
+```
+
+### 8.3 GuidanceInjector 扩展
+
+```typescript
+/**
+ * 扩展 GuidanceInjector，支持评审上下文
+ */
+export class EnhancedGuidanceInjector extends GuidanceInjector {
+  /**
+   * 构建自检引导 Prompt
+   * 基于 Worker 弱项定制检查清单
+   */
+  buildSelfCheckGuidance(profile: WorkerProfile, task: SubTask): string {
+    const sections: string[] = [];
+
+    // 1. 基于 Worker 弱项的重点检查
+    if (profile.profile.weaknesses.length > 0) {
+      sections.push(`## 重点自检（你的相对弱项）`);
+      sections.push(`请特别检查以下方面：`);
+      profile.profile.weaknesses.forEach(w => {
+        sections.push(`- ${w}`);
+      });
+    }
+
+    // 2. 基于协作规则的输出检查
+    sections.push(`## 协作规范检查`);
+    profile.collaboration.asCollaborator.forEach(rule => {
+      sections.push(`- [ ] ${rule}`);
+    });
+
+    return sections.join('\n');
+  }
+
+  /**
+   * 构建互检引导 Prompt
+   * 利用评审者专长视角
+   */
+  buildPeerReviewGuidance(
+    reviewerProfile: WorkerProfile,
+    executorProfile: WorkerProfile,
+    task: SubTask
+  ): string {
+    const sections: string[] = [];
+
+    // 1. 利用评审者的专长
+    sections.push(`## 你的专长检查视角`);
+    sections.push(`作为 ${reviewerProfile.name}，请重点从以下专长领域审查：`);
+    reviewerProfile.profile.strengths.forEach(s => {
+      sections.push(`- ${s}`);
+    });
+
+    // 2. 针对执行者弱项的检查
+    sections.push(`\n## 执行者弱项重点审查`);
+    sections.push(`执行者 ${executorProfile.name} 在以下方面相对较弱，请重点检查：`);
+    executorProfile.profile.weaknesses.forEach(w => {
+      sections.push(`- ${w}`);
+    });
+
+    return sections.join('\n');
+  }
+}
+```
+
+### 8.4 类型扩展
+
+**WorkerProfile 评审扩展**：
+
+```typescript
+// src/orchestrator/profile/types.ts 扩展
+interface WorkerProfile {
+  // ... 现有字段 ...
+
+  // 🆕 评审相关配置
+  review?: {
+    /** 作为被评审者时需要重点检查的方面 */
+    focusAreasWhenReviewed: string[];
+    /** 作为评审者时的专长视角 */
+    reviewStrengths: string[];
+    /** 需要更严格评审的任务类型 */
+    strictReviewCategories: string[];
+  };
+}
+```
+
+**CategoryConfig 评审扩展**：
+
+```typescript
+// src/orchestrator/profile/types.ts 扩展
+interface CategoryConfig {
+  // ... 现有字段 ...
+
+  // 🆕 评审策略
+  reviewPolicy?: {
+    /** 是否强制互检 */
+    requirePeerReview: boolean;
+    /** 推荐的评审 Worker */
+    preferredReviewer?: CLIType;
+    /** 评审重点 */
+    reviewFocus: string[];
+  };
+}
+```
+
+### 8.5 画像感知失败恢复
+
+```typescript
+/**
+ * 画像感知的失败恢复
+ * 失败与 Worker 弱项相关时，考虑换 Worker 重试
+ */
+class ProfileAwareRecoveryHandler {
+  async handleReviewFailure(
+    task: SubTask,
+    failure: ReviewFailure,
+    executor: CLIType
+  ): Promise<RecoveryAction> {
+    const profile = this.profileLoader.getProfile(executor);
+
+    // 检查失败是否与 Worker 弱项相关
+    const isWeaknessRelated = profile.profile.weaknesses.some(w =>
+      failure.message.toLowerCase().includes(w.toLowerCase()) ||
+      task.description.toLowerCase().includes(w.toLowerCase())
+    );
+
+    if (isWeaknessRelated) {
+      // 弱项相关失败：换 Worker 重试
+      const betterWorker = this.findWorkerWithStrength(category);
+      if (betterWorker && betterWorker !== executor) {
+        return {
+          action: 'reassign',
+          newWorker: betterWorker,
+          reason: `任务涉及 ${executor} 的弱项，转交给更擅长的 ${betterWorker}`,
+        };
+      }
+    }
+
+    // 非弱项相关失败：使用原有恢复逻辑
+    return this.recoveryHandler.handleFailure(task, failure);
+  }
+}
+```
+
+---
+
+## 九、附录
 
 ### A. 术语表
 

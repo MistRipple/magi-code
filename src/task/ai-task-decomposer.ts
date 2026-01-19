@@ -73,7 +73,7 @@ export class AITaskDecomposer {
       );
 
       if (response.error) {
-        logger.error('[AITaskDecomposer] AI 分解失败:', response.error, LogCategory.TASK);
+        logger.error('任务.分解器.AI_失败', { error: response.error }, LogCategory.TASK);
         return this.fallbackSplit(analysis);
       }
 
@@ -89,7 +89,7 @@ export class AITaskDecomposer {
         hasDependencies: subTasks.some(t => t.dependencies.length > 0),
       };
     } catch (error) {
-      logger.error('[AITaskDecomposer] AI 分解异常:', error, LogCategory.TASK);
+      logger.error('任务.分解器.异常', error, LogCategory.TASK);
       return this.fallbackSplit(analysis);
     }
   }
@@ -157,7 +157,7 @@ export class AITaskDecomposer {
         };
       });
     } catch (error) {
-      logger.error('[AITaskDecomposer] 解析 AI 响应失败:', error, LogCategory.TASK);
+      logger.error('任务.分解器.解析_失败', error, LogCategory.TASK);
       return [];
     }
   }

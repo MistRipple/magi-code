@@ -454,7 +454,7 @@ export class UnifiedSessionManager {
             try {
               fs.unlinkSync(oldFile);
             } catch (error) {
-              logger.warn('[UnifiedSessionManager] 清理历史快照失败:', { oldFile, error }, LogCategory.SESSION);
+              logger.warn('会话.快照.清理_失败', { oldFile, error }, LogCategory.SESSION);
               // 不抛出错误，继续执行
             }
           }
@@ -466,7 +466,7 @@ export class UnifiedSessionManager {
       try {
         this.saveSession(session);
       } catch (error) {
-        logger.error('[UnifiedSessionManager] 保存快照元数据失败:', error, LogCategory.SESSION);
+        logger.error('会话.快照.保存_失败', error, LogCategory.SESSION);
         throw error;
       }
     }
@@ -517,9 +517,9 @@ export class UnifiedSessionManager {
     if (fs.existsSync(sessionDir)) {
       try {
         fs.rmSync(sessionDir, { recursive: true, force: true });
-        logger.info(`[UnifiedSessionManager] 已删除会话: ${sessionId}`, undefined, LogCategory.SESSION);
+        logger.info('会话.删除.成功', { sessionId }, LogCategory.SESSION);
       } catch (error) {
-        logger.error(`[UnifiedSessionManager] 删除会话目录失败: ${sessionId}`, error, LogCategory.SESSION);
+        logger.error('会话.删除.失败', { sessionId, error }, LogCategory.SESSION);
         // 即使删除失败，也从内存中移除了，返回 true
         // 用户可以手动清理文件系统
       }
@@ -560,40 +560,40 @@ export class UnifiedSessionManager {
 
     // 必需字段验证
     if (!session.id || typeof session.id !== 'string') {
-      logger.error('[UnifiedSessionManager] 会话缺少有效的 id 字段', undefined, LogCategory.SESSION);
+      logger.error('会话.验证.缺失标识', undefined, LogCategory.SESSION);
       return false;
     }
 
     if (!session.status || !['active', 'completed'].includes(session.status)) {
-      logger.error('[UnifiedSessionManager] 会话状态无效:', session.status, LogCategory.SESSION);
+      logger.error('会话.验证.非法_状态', { status: session.status }, LogCategory.SESSION);
       return false;
     }
 
     if (typeof session.createdAt !== 'number' || typeof session.updatedAt !== 'number') {
-      logger.error('[UnifiedSessionManager] 会话时间戳无效', undefined, LogCategory.SESSION);
+      logger.error('会话.验证.非法_时间戳', undefined, LogCategory.SESSION);
       return false;
     }
 
     // 数组字段验证
     if (!Array.isArray(session.messages)) {
-      logger.error('[UnifiedSessionManager] messages 字段不是数组', undefined, LogCategory.SESSION);
+      logger.error('会话.验证.消息_非数组', undefined, LogCategory.SESSION);
       return false;
     }
 
     if (!Array.isArray(session.tasks)) {
-      logger.error('[UnifiedSessionManager] tasks 字段不是数组', undefined, LogCategory.SESSION);
+      logger.error('会话.验证.任务_非数组', undefined, LogCategory.SESSION);
       return false;
     }
 
     if (!Array.isArray(session.snapshots)) {
-      logger.error('[UnifiedSessionManager] snapshots 字段不是数组', undefined, LogCategory.SESSION);
+      logger.error('会话.验证.快照_非数组', undefined, LogCategory.SESSION);
       return false;
     }
 
     // 消息数据验证
     for (const msg of session.messages) {
       if (!msg.id || !msg.role || !['user', 'assistant'].includes(msg.role)) {
-        logger.error('[UnifiedSessionManager] 消息数据无效:', msg, LogCategory.SESSION);
+        logger.error('会话.验证.消息_非法', { message: msg }, LogCategory.SESSION);
         return false;
       }
     }
@@ -607,10 +607,10 @@ export class UnifiedSessionManager {
       const backupPath = `${filePath}.corrupted.${Date.now()}.bak`;
       if (fs.existsSync(filePath)) {
         fs.copyFileSync(filePath, backupPath);
-        logger.info(`[UnifiedSessionManager] 已备份损坏的会话文件: ${backupPath}`, undefined, LogCategory.SESSION);
+        logger.info('会话.备份.损坏.成功', { backupPath }, LogCategory.SESSION);
       }
     } catch (error) {
-      logger.error(`[UnifiedSessionManager] 备份损坏会话失败: ${sessionId}`, error, LogCategory.SESSION);
+      logger.error('会话.备份.损坏.失败', { sessionId, error }, LogCategory.SESSION);
     }
   }
 
@@ -644,7 +644,7 @@ export class UnifiedSessionManager {
     }
 
     if (evicted > 0) {
-      logger.info(`[UnifiedSessionManager] 驱逐了 ${evicted} 个历史会话以释放内存`, undefined, LogCategory.SESSION);
+      logger.info('会话.清理.完成', { count: evicted }, LogCategory.SESSION);
     }
   }
 
@@ -659,8 +659,9 @@ export class UnifiedSessionManager {
     const removed = session.messages.length - toKeep;
 
     logger.info(
-      `[UnifiedSessionManager] 会话 ${session.id} 消息数超过阈值 (${session.messages.length}/${this.MESSAGE_CLEANUP_THRESHOLD})，` +
-      `清理最早的 ${removed} 条消息`
+      '会话.消息.清理',
+      { sessionId: session.id, total: session.messages.length, threshold: this.MESSAGE_CLEANUP_THRESHOLD, removed },
+      LogCategory.SESSION
     );
 
     session.messages = session.messages.slice(-toKeep);
@@ -677,7 +678,7 @@ export class UnifiedSessionManager {
     try {
       fs.writeFileSync(filePath, JSON.stringify(session, null, 2), 'utf-8');
     } catch (error) {
-      logger.error(`[UnifiedSessionManager] 保存会话失败: ${session.id}`, error, LogCategory.SESSION);
+      logger.error('会话.保存.失败', { sessionId: session.id, error }, LogCategory.SESSION);
       throw new Error(`Failed to save session: ${error}`);
     }
   }
@@ -700,14 +701,14 @@ export class UnifiedSessionManager {
 
         // 数据完整性验证
         if (!this.validateSessionData(session)) {
-          logger.error(`[UnifiedSessionManager] 会话数据验证失败: ${sessionId}`, undefined, LogCategory.SESSION);
+          logger.error('会话.加载.校验_失败', { sessionId }, LogCategory.SESSION);
           return null;
         }
 
         this.sessions.set(session.id, session);
         return session;
       } catch (e) {
-        logger.error(`[UnifiedSessionManager] 加载会话失败: ${sessionId}`, e, LogCategory.SESSION);
+        logger.error('会话.加载.失败', { sessionId, error: e }, LogCategory.SESSION);
         // 尝试备份损坏的会话文件
         this.backupCorruptedSession(sessionId, filePath);
       }
@@ -780,9 +781,9 @@ export class UnifiedSessionManager {
     if (fs.existsSync(taskFilePath)) {
       try {
         fs.unlinkSync(taskFilePath);
-        logger.info(`[UnifiedSessionManager] 已清理任务状态: ${taskFilePath}`, undefined, LogCategory.SESSION);
+        logger.info('会话.清理.任务_状态.成功', { path: taskFilePath }, LogCategory.SESSION);
       } catch (e) {
-        logger.error(`[UnifiedSessionManager] 清理任务状态失败: ${taskFilePath}`, e, LogCategory.SESSION);
+        logger.error('会话.清理.任务_状态.失败', { path: taskFilePath, error: e }, LogCategory.SESSION);
       }
     }
   }
@@ -795,13 +796,30 @@ export class UnifiedSessionManager {
           if (attachment.path.includes('.multicli/attachments') && fs.existsSync(attachment.path)) {
             try {
               fs.unlinkSync(attachment.path);
-              logger.info(`[UnifiedSessionManager] 已清理图片附件: ${attachment.path}`, undefined, LogCategory.SESSION);
+              logger.info('会话.清理.附件.成功', { path: attachment.path }, LogCategory.SESSION);
             } catch (e) {
-              logger.error(`[UnifiedSessionManager] 清理图片附件失败: ${attachment.path}`, e, LogCategory.SESSION);
+              logger.error('会话.清理.附件.失败', { path: attachment.path, error: e }, LogCategory.SESSION);
             }
           }
         }
       }
+    }
+  }
+
+  // ============================================================================
+  // Mission Storage 支持（新架构）
+  // ============================================================================
+
+  /** 获取会话的 missions 目录路径 */
+  getMissionsDir(sessionId: string): string {
+    return path.join(this.getSessionDir(sessionId), 'missions');
+  }
+
+  /** 确保 missions 目录存在 */
+  ensureMissionsDir(sessionId: string): void {
+    const missionsDir = this.getMissionsDir(sessionId);
+    if (!fs.existsSync(missionsDir)) {
+      fs.mkdirSync(missionsDir, { recursive: true });
     }
   }
 }
