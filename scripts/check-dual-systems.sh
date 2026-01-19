@@ -6,8 +6,8 @@ echo ""
 # 1. TaskManager vs UnifiedTaskManager
 echo "## 1. TaskManager 双重使用检查"
 echo ""
-tm_count=$(grep -c "this.taskManager\." src/orchestrator/orchestrator-agent.ts 2>/dev/null || echo "0")
-utm_count=$(grep -c "this.unifiedTaskManager\." src/orchestrator/orchestrator-agent.ts 2>/dev/null || echo "0")
+tm_count=$(grep -c "this.taskManager\." src/orchestrator/orchestrator-agent.ts 2>/dev/null || true)
+utm_count=$(grep -c "this.unifiedTaskManager\." src/orchestrator/orchestrator-agent.ts 2>/dev/null || true)
 
 echo "  TaskManager 使用: $tm_count 处"
 echo "  UnifiedTaskManager 使用: $utm_count 处"
@@ -36,7 +36,7 @@ fi
 echo ""
 echo "## 3. 事件监听中的双重调用检查"
 echo ""
-event_sync=$(grep -A5 "unifiedTaskManager.on" src/orchestrator/orchestrator-agent.ts 2>/dev/null | grep -c "taskManager\." || echo "0")
+event_sync=$(grep -A5 "unifiedTaskManager.on" src/orchestrator/orchestrator-agent.ts 2>/dev/null | grep -c "taskManager\." || true)
 echo "  事件监听中调用 TaskManager: $event_sync 处"
 
 if [ "$event_sync" -gt 0 ]; then

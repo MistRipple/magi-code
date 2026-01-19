@@ -37,7 +37,6 @@ const { ExecutionStats } = require(path.join(ROOT, 'out/orchestrator/execution-s
 const { ContextManager } = require(path.join(ROOT, 'out/context/context-manager.js'));
 const { TaskDependencyGraph } = require(path.join(ROOT, 'out/orchestrator/task-dependency-graph.js'));
 const { FileLockManager } = require(path.join(ROOT, 'out/orchestrator/file-lock-manager.js'));
-const { TaskStateManager } = require(path.join(ROOT, 'out/orchestrator/task-state-manager.js'));
 const { INTERACTION_MODE_CONFIGS } = require(path.join(ROOT, 'out/types.js'));
 const { EventEmitter, globalEventBus } = require(path.join(ROOT, 'out/events.js'));
 const { MessageBus } = require(path.join(ROOT, 'out/orchestrator/message-bus.js'));
@@ -255,31 +254,6 @@ test('FileLockManager enforces exclusive locks', async () => {
   assert(secondResolved === true, 'second lock should resolve after release');
 });
 
-// 17) 任务状态流转与重试
-test('TaskStateManager supports transitions and retry', async () => {
-  const manager = new TaskStateManager('test-state', TEST_ROOT, false);
-  manager.createTask({
-    id: 't1',
-    parentTaskId: 'p1',
-    description: 'Test task',
-    assignedCli: 'claude',
-    maxAttempts: 2,
-  });
-
-  manager.updateStatus('t1', 'running');
-  manager.updateProgress('t1', 50);
-  manager.updateStatus('t1', 'failed', 'boom');
-
-  assert(manager.canRetry('t1') === true, 'task should be retryable');
-  manager.resetForRetry('t1');
-  const task = manager.getTask('t1');
-  assert(task && task.status === 'retrying', 'task should be retrying after reset');
-
-  manager.updateStatus('t1', 'completed');
-  const completed = manager.getTask('t1');
-  assert(completed && completed.progress === 100, 'completed task should be 100%');
-});
-
 // 18) 智能选择：统计驱动降级
 test('CLISelector uses stats-based selection when preferred unhealthy', () => {
   const stats = new ExecutionStats();
@@ -348,22 +322,6 @@ test('ContextManager truncates oversized memory summary', async () => {
     memorySummary: { includeKeyDecisions: 10 }
   });
   assert(context.includes('<response clipped>'), 'memory summary should be truncated');
-});
-
-// 22) 非法状态流转阻止
-test('TaskStateManager blocks invalid transitions', () => {
-  const manager = new TaskStateManager('test-state-2', TEST_ROOT, false);
-  manager.createTask({
-    id: 't2',
-    parentTaskId: 'p2',
-    description: 'Test task 2',
-    assignedCli: 'codex',
-  });
-  manager.updateStatus('t2', 'completed');
-  const before = manager.getTask('t2');
-  manager.updateStatus('t2', 'running');
-  const after = manager.getTask('t2');
-  assert(before && after && after.status === 'completed', 'completed task should not transition to running');
 });
 
 // 23) 并行批次可视化
@@ -562,23 +520,6 @@ test('Integration failure auto-creates repair tasks when issues missing', async 
 
   assert(captured && captured.length > 0, 'repair tasks should be generated');
   assert(captured[0].kind === 'repair', 'repair task kind should be set');
-});
-
-// 32) 取消流程：取消后不可再进入运行状态
-test('TaskStateManager prevents transitions after cancel', () => {
-  const manager = new TaskStateManager('cancel-test', TEST_ROOT, false);
-  manager.createTask({
-    id: 'cancel-1',
-    parentTaskId: 'p-cancel',
-    description: 'Cancelable task',
-    assignedCli: 'claude',
-    maxAttempts: 2,
-  });
-  manager.updateStatus('cancel-1', 'running');
-  manager.updateStatus('cancel-1', 'cancelled');
-  manager.updateStatus('cancel-1', 'running');
-  const task = manager.getTask('cancel-1');
-  assert(task && task.status === 'cancelled', 'cancelled task should not resume running');
 });
 
 // 33) 并行 -> 串行锁冲突（域锁）

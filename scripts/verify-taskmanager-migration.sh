@@ -50,13 +50,13 @@ else
   exit 1
 fi
 
-# 5. @deprecated 标记检查
+# 5. TaskManager 文件清理检查
 echo ""
-echo "5. @deprecated 标记检查..."
-if grep -q "@deprecated" src/task-manager.ts; then
-  echo "✅ TaskManager 已标记为 @deprecated"
+echo "5. TaskManager 文件清理检查..."
+if [ ! -f src/task-manager.ts ]; then
+  echo "✅ TaskManager 已删除"
 else
-  echo "❌ TaskManager 未标记为 @deprecated"
+  echo "❌ TaskManager 文件仍存在"
   exit 1
 fi
 
@@ -83,10 +83,12 @@ fi
 # 8. IntelligentOrchestrator 检查
 echo ""
 echo "8. IntelligentOrchestrator 检查..."
-if grep -q "this.sessionManager = (taskManager as any).sessionManager" src/orchestrator/intelligent-orchestrator.ts; then
-  echo "✅ IntelligentOrchestrator 提取 SessionManager"
+if grep -q "sessionManager: UnifiedSessionManager" src/orchestrator/intelligent-orchestrator.ts; then
+  echo "✅ IntelligentOrchestrator 直接接收 SessionManager"
+elif grep -q "this.sessionManager = sessionManager" src/orchestrator/intelligent-orchestrator.ts; then
+  echo "✅ IntelligentOrchestrator 使用 SessionManager"
 else
-  echo "❌ IntelligentOrchestrator 未提取 SessionManager"
+  echo "❌ IntelligentOrchestrator 未正确使用 SessionManager"
   exit 1
 fi
 
@@ -98,7 +100,7 @@ echo "  - 编译: ✅ 通过"
 echo "  - 测试: ✅ $total_passed/$total_passed 通过"
 echo "  - TaskManager 清理: ✅ 完成"
 echo "  - 状态同步清理: ✅ 完成"
-echo "  - @deprecated 标记: ✅ 完成"
+echo "  - TaskManager 删除: ✅ 完成"
 echo "  - UnifiedTaskManager 使用: ✅ 正常"
 echo "  - SessionManager 传递: ✅ 正常"
 echo ""

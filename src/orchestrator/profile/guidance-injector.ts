@@ -7,7 +7,7 @@
  * - 支持协作上下文注入
  */
 
-import { WorkerType } from '../../types';
+import { CLIType } from '../../types';
 import { WorkerProfile, InjectionContext } from './types';
 
 export class GuidanceInjector {

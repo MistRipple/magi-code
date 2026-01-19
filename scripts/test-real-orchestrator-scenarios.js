@@ -10,7 +10,8 @@ const fs = require('fs');
 const path = require('path');
 const { CLIAdapterFactory } = require('../out/cli/adapter-factory');
 const { IntelligentOrchestrator } = require('../out/orchestrator/intelligent-orchestrator');
-const { TaskManager } = require('../out/task-manager');
+const { UnifiedTaskManager } = require('../out/task/unified-task-manager');
+const { SessionManagerTaskRepository } = require('../out/task/session-manager-task-repository');
 const { SnapshotManager } = require('../out/snapshot-manager');
 const { UnifiedSessionManager } = require('../out/session');
 const { globalEventBus } = require('../out/events');
@@ -96,13 +97,16 @@ async function run() {
     console.warn('创建临时目录失败:', tempRoot, err.message);
   }
   const sessionManager = new UnifiedSessionManager(cwd);
-  const taskManager = new TaskManager(sessionManager);
+  const sessionId = sessionManager.getOrCreateCurrentSession().id;
+  const repository = new SessionManagerTaskRepository(sessionManager, sessionId);
+  const taskManager = new UnifiedTaskManager(sessionId, repository);
+  await taskManager.initialize();
   const snapshotManager = new SnapshotManager(sessionManager, cwd);
   const cliFactory = new CLIAdapterFactory({ cwd });
 
   const orchestrator = new IntelligentOrchestrator(
     cliFactory,
-    taskManager,
+    sessionManager,
     snapshotManager,
     cwd,
     {
@@ -113,6 +117,7 @@ async function run() {
       strategy: { enableVerification: false, enableRecovery: false, autoRollbackOnFailure: false },
     }
   );
+  orchestrator.setTaskManager(taskManager, sessionId);
 
   orchestrator.setConfirmationCallback(async () => true);
   orchestrator.setQuestionCallback(async (questions) => {

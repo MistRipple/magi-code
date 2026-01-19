@@ -53,12 +53,6 @@ export type {
   WorkerResult,
 };
 
-/**
- * @deprecated 使用 assignedWorker 替代
- * 为了向后兼容，保留 WorkerType 的类型别名
- */
-export type WorkerType = CLIType;
-
 // ============================================
 // Session 和 Task 管理
 // ============================================
@@ -340,7 +334,6 @@ export type EventType =
   | 'task:cancelled'
   | 'task:state_changed'
   | 'subtask:started'
-  | 'cli:output'
   | 'subtask:completed'
   | 'subtask:failed'
   | 'snapshot:created'

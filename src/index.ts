@@ -10,7 +10,6 @@ export { EventEmitter, globalEventBus } from './events';
 
 // 管理器
 export { UnifiedSessionManager, UnifiedSession, SessionMessage, FileSnapshotMeta, SessionMeta, SessionStatus } from './session';
-export { TaskManager } from './task-manager';
 export { SnapshotManager } from './snapshot-manager';
 export { DiffGenerator, DiffResult } from './diff-generator';
 
@@ -40,4 +39,3 @@ export { WebviewProvider } from './ui/webview-provider';
 
 // 扩展入口
 export { activate, deactivate } from './extension';
-

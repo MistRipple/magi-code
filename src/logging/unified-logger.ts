@@ -3,7 +3,7 @@
  *
  * 设计原则：
  * 1. 完全统一 - 所有日志使用相同格式和接口
- * 2. 零兼容 - 不保留旧的 console.log 方式
+ * 2. 不保留 console.log 方式
  * 3. 配置驱动 - 通过配置控制所有行为
  * 4. 性能优先 - 延迟初始化、异步写入
  */
@@ -717,7 +717,7 @@ export class UnifiedLogger extends EventEmitter {
       this.fileStream.end();
     }
 
-    // 清理旧文件
+    // 清理历史文件
     this.cleanOldLogFiles();
 
     // 创建新文件

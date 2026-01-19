@@ -156,7 +156,7 @@ export class UnifiedSessionManager {
 
     this.ensureSessionDir(id);
 
-    // 内存管理：如果会话数超过限制，驱逐最旧的非当前会话
+    // 内存管理：如果会话数超过限制，驱逐最早的非当前会话
     this.evictOldSessionsIfNeeded();
 
     this.sessions.set(id, session);
@@ -255,7 +255,7 @@ export class UnifiedSessionManager {
       session.name = this.generateSessionTitle(content);
     }
 
-    // 消息数量管理：如果超过阈值，清理旧消息
+    // 消息数量管理：如果超过阈值，清理历史消息
     this.cleanupOldMessagesIfNeeded(session);
 
     this.saveSession(session);
@@ -454,7 +454,7 @@ export class UnifiedSessionManager {
             try {
               fs.unlinkSync(oldFile);
             } catch (error) {
-              logger.warn('[UnifiedSessionManager] 清理旧快照失败:', { oldFile, error }, LogCategory.SESSION);
+              logger.warn('[UnifiedSessionManager] 清理历史快照失败:', { oldFile, error }, LogCategory.SESSION);
               // 不抛出错误，继续执行
             }
           }
@@ -618,20 +618,20 @@ export class UnifiedSessionManager {
   // 内存管理
   // ============================================================================
 
-  /** 驱逐旧会话（如果超过内存限制） */
+  /** 驱逐历史会话（如果超过内存限制） */
   private evictOldSessionsIfNeeded(): void {
     if (this.sessions.size <= this.MAX_SESSIONS_IN_MEMORY) {
       return;
     }
 
-    // 获取所有会话，按更新时间排序（最旧的在前）
+    // 获取所有会话，按更新时间排序（最早的在前）
     const allSessions = Array.from(this.sessions.values())
       .sort((a, b) => a.updatedAt - b.updatedAt);
 
     // 计算需要驱逐的会话数
     const toEvict = this.sessions.size - this.MAX_SESSIONS_IN_MEMORY;
 
-    // 驱逐最旧的非当前会话
+    // 驱逐最早的非当前会话
     let evicted = 0;
     for (const session of allSessions) {
       if (evicted >= toEvict) break;
@@ -644,23 +644,23 @@ export class UnifiedSessionManager {
     }
 
     if (evicted > 0) {
-      logger.info(`[UnifiedSessionManager] 驱逐了 ${evicted} 个旧会话以释放内存`, undefined, LogCategory.SESSION);
+      logger.info(`[UnifiedSessionManager] 驱逐了 ${evicted} 个历史会话以释放内存`, undefined, LogCategory.SESSION);
     }
   }
 
-  /** 清理旧消息（如果超过阈值） */
+  /** 清理历史消息（如果超过阈值） */
   private cleanupOldMessagesIfNeeded(session: UnifiedSession): void {
     if (session.messages.length <= this.MESSAGE_CLEANUP_THRESHOLD) {
       return;
     }
 
-    // 保留最近的消息，删除最旧的消息
+    // 保留最近的消息，删除最早的消息
     const toKeep = Math.floor(this.MAX_MESSAGES_PER_SESSION * 0.8); // 保留 80%
     const removed = session.messages.length - toKeep;
 
     logger.info(
       `[UnifiedSessionManager] 会话 ${session.id} 消息数超过阈值 (${session.messages.length}/${this.MESSAGE_CLEANUP_THRESHOLD})，` +
-      `清理最旧的 ${removed} 条消息`
+      `清理最早的 ${removed} 条消息`
     );
 
     session.messages = session.messages.slice(-toKeep);

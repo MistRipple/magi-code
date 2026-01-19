@@ -6,15 +6,15 @@
  * - 所有 Prompt 都围绕"分析、规划、监控、汇总"设计
  */
 
-import { WorkerType, ExecutionResult, SubTask, ExecutionPlan } from '../protocols/types';
+import { CLIType, ExecutionResult, SubTask, ExecutionPlan } from '../protocols/types';
 
 // ============================================================================
 // CLI 能力描述
 // ============================================================================
 
 /** 获取 Worker 能力描述 */
-export function getWorkerDescription(worker: WorkerType): string {
-  const descriptions: Record<WorkerType, string> = {
+export function getWorkerDescription(worker: CLIType): string {
+  const descriptions: Record<CLIType, string> = {
     claude: `Worker Claude (代码执行者)
       - 擅长: 复杂代码实现、架构重构、多文件修改、代码审查
       - 最适合: 需要深度理解的编码任务、复杂重构、架构调整
@@ -41,7 +41,7 @@ export function getWorkerDescription(worker: WorkerType): string {
  */
 export function buildOrchestratorAnalysisPrompt(
   userPrompt: string,
-  availableWorkers: WorkerType[],
+  availableWorkers: CLIType[],
   projectContext?: string
 ): string {
   const workersDesc = availableWorkers
@@ -51,6 +51,7 @@ export function buildOrchestratorAnalysisPrompt(
   return `你是一个智能任务编排器（Orchestrator）。你的职责是分析用户需求并制定执行计划。
 
 **重要**：你只负责分析和规划，不执行任何编码任务。所有编码工作将由 Worker 执行。
+**严禁输出计划之外的说明性文本**（例如“我将先探索项目”、“我处于计划模式”等），这些都会导致计划被丢弃。
 
 ## 用户需求
 ${userPrompt}
@@ -70,6 +71,7 @@ ${projectContext ? `## 项目上下文\n${projectContext}\n` : ''}
 
 ## 工具限制
 本阶段禁止调用任何工具（包括文件读取、命令执行等）。只根据当前提示生成计划。
+**禁止产生 tool_use/tool_call 相关内容或任何结构化工具调用。**
 
 ## 强制规则
 1. 若任务涉及前后端协作（或同时需要 Codex 与 Gemini），必须包含 **Claude 架构/契约任务**，并让其他子任务依赖该任务。
@@ -79,6 +81,7 @@ ${projectContext ? `## 项目上下文\n${projectContext}\n` : ''}
 ## 输出格式 - 严格要求
 **关键：你的回复必须是纯 JSON，第一个字符是 {，最后一个字符是 }**
 **不要输出任何解释、前缀、后缀或代码块标记（如 \`\`\`json）**
+**不要输出除 JSON 之外的任何字符**
 **直接输出以下 JSON 对象：**
 {
   "analysis": "对任务的简要分析",
@@ -252,7 +255,7 @@ ${tasksText}
 export function buildProgressMessage(
   completedTasks: number,
   totalTasks: number,
-  currentWorker?: WorkerType,
+  currentWorker?: CLIType,
   currentTask?: string
 ): string {
   const safeTotal = totalTasks > 0 ? totalTasks : 0;

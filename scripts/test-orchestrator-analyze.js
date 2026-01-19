@@ -44,7 +44,6 @@ async function main() {
 
   const cliFactory = new CLIAdapterFactory({
     cwd: process.cwd(),
-    timeout: 300000,
     idleTimeout: 120000,
     maxTimeout: 900000,
     cliPaths: {

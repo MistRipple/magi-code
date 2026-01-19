@@ -56,7 +56,6 @@ export const DEFAULT_CLAUDE_PROFILE: WorkerProfile = {
       '不要进行不必要的重构',
       '避免引入新的依赖，除非必要',
       '大规模修改前先与编排者确认',
-      '保持向后兼容性，除非明确要求破坏性变更',
     ],
 
     outputPreferences: [
@@ -79,4 +78,3 @@ export const DEFAULT_CLAUDE_PROFILE: WorkerProfile = {
     ],
   },
 };
-

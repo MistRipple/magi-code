@@ -23,6 +23,7 @@ import {
   createStreamingMessage,
   generateMessageId,
 } from '../protocol';
+import { parseContentToBlocks } from '../utils/content-parser';
 
 /**
  * Normalizer 配置
@@ -172,7 +173,10 @@ export abstract class BaseNormalizer extends EventEmitter {
     const blocks = [...context.blocks];
 
     if (context.pendingText.trim()) {
-      blocks.push({ type: 'text', content: context.pendingText.trim(), isMarkdown: true } as TextBlock);
+      const parsedBlocks = parseContentToBlocks(context.pendingText.trim());
+      if (parsedBlocks.length > 0) {
+        blocks.push(...parsedBlocks);
+      }
     }
 
     if (context.pendingThinking) {
