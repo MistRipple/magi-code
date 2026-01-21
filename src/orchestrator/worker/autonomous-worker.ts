@@ -6,13 +6,15 @@
  * - 执行 Assignment 而非 SubTask
  * - 支持动态 Todo 添加
  * - 自动生成自检和互检引导
- * - 通过 CLIAdapterFactory 执行实际命令
+ * - 通过 IAdapterFactory 执行实际命令
  */
 
 import { EventEmitter } from 'events';
-import { CLIType } from '../../types';
+import { CLIType, SubTask } from '../../types';
 import { BaseWorker } from '../../workers/base-worker';
-import { CLIAdapterFactory, AdapterOutputScope } from '../../cli/adapter-factory';
+import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
+import { AdapterOutputScope } from '../../adapters/adapter-factory-interface';
+import { TokenUsage } from '../../types/agent-types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
 import { TodoPlanner, PlanningContext, PlanningResult } from './todo-planner';
@@ -40,8 +42,8 @@ export interface TodoExecuteOptions {
   onOutput?: (output: string) => void;
   /** 项目上下文 */
   projectContext?: string;
-  /** CLI 适配器工厂（可选，用于实际执行） */
-  adapterFactory?: CLIAdapterFactory;
+  /** 适配器工厂（可选，用于实际执行） */
+  adapterFactory?: IAdapterFactory;
   /** 适配器输出范围选项 */
   adapterScope?: AdapterOutputScope;
 }
@@ -60,6 +62,8 @@ export interface AutonomousExecutionResult {
   totalDuration: number;
   errors: string[];
   recoveryAttempts: number;
+  /** Token 使用统计 */
+  tokenUsage?: TokenUsage;
 }
 
 /**
@@ -93,7 +97,10 @@ export class AutonomousWorker extends EventEmitter {
    */
   async planAssignment(
     assignment: Assignment,
-    projectContext?: string
+    options?: {
+      projectContext?: string;
+      contextSnapshot?: string;
+    }
   ): Promise<PlanningResult> {
     const context: PlanningContext = {
       responsibility: assignment.responsibility,
@@ -102,7 +109,8 @@ export class AutonomousWorker extends EventEmitter {
         ...assignment.producerContracts,
         ...assignment.consumerContracts,
       ],
-      projectContext,
+      projectContext: options?.projectContext,
+      contextSnapshot: options?.contextSnapshot,
     };
 
     const result = await this.todoPlanner.planTodos(assignment, context);
@@ -130,6 +138,8 @@ export class AutonomousWorker extends EventEmitter {
     const skippedTodos: WorkerTodo[] = [];
     const dynamicTodos: WorkerTodo[] = [];
     const errors: string[] = [];
+    // 聚合 Token 使用统计
+    let totalTokenUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
 
     this.emit('assignmentStarted', { assignmentId: assignment.id });
 
@@ -139,6 +149,18 @@ export class AutonomousWorker extends EventEmitter {
     while (currentTodo) {
       try {
         const result = await this.executeTodo(currentTodo, assignment, options);
+
+        // 聚合 Token 统计
+        if (result.tokenUsage) {
+          totalTokenUsage.inputTokens += result.tokenUsage.inputTokens || 0;
+          totalTokenUsage.outputTokens += result.tokenUsage.outputTokens || 0;
+          if (result.tokenUsage.cacheReadTokens) {
+            totalTokenUsage.cacheReadTokens = (totalTokenUsage.cacheReadTokens || 0) + result.tokenUsage.cacheReadTokens;
+          }
+          if (result.tokenUsage.cacheWriteTokens) {
+            totalTokenUsage.cacheWriteTokens = (totalTokenUsage.cacheWriteTokens || 0) + result.tokenUsage.cacheWriteTokens;
+          }
+        }
 
         if (result.success) {
           completedTodos.push(result.todo);
@@ -199,6 +221,7 @@ export class AutonomousWorker extends EventEmitter {
       totalDuration: Date.now() - startTime,
       errors,
       recoveryAttempts: 0,
+      tokenUsage: totalTokenUsage,
     };
 
     this.emit('assignmentCompleted', result);
@@ -218,6 +241,7 @@ export class AutonomousWorker extends EventEmitter {
     todo: WorkerTodo;
     error?: string;
     dynamicTodos?: WorkerTodo[];
+    tokenUsage?: TokenUsage;
   }> {
     const startTime = Date.now();
 
@@ -253,6 +277,8 @@ export class AutonomousWorker extends EventEmitter {
 
       // 执行（通过 executeWithWorker 调用 CLI 适配器）
       const output = await this.executeWithWorker(
+        todo,
+        assignment,
         executionPrompt,
         selfCheckGuidance,
         options
@@ -278,6 +304,7 @@ export class AutonomousWorker extends EventEmitter {
         success: true,
         todo,
         dynamicTodos: output.dynamicTodos,
+        tokenUsage: output.tokenUsage,
       };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -355,6 +382,8 @@ export class AutonomousWorker extends EventEmitter {
    * 2. 通过 BaseWorker（传统）：使用底层 Worker 执行
    */
   private async executeWithWorker(
+    todo: WorkerTodo,
+    assignment: Assignment,
     executionPrompt: string,
     selfCheckGuidance: string,
     options: TodoExecuteOptions
@@ -362,6 +391,7 @@ export class AutonomousWorker extends EventEmitter {
     summary: string;
     modifiedFiles?: string[];
     dynamicTodos?: WorkerTodo[];
+    tokenUsage?: TokenUsage;
   }> {
     // 组合执行 prompt 和自检引导
     const fullPrompt = `${executionPrompt}\n\n## 自检要点\n${selfCheckGuidance}`;
@@ -381,6 +411,10 @@ export class AutonomousWorker extends EventEmitter {
           }
         );
 
+        if (response.error) {
+          throw new Error(response.error);
+        }
+
         // 解析响应
         const summary = response.content || response.error || '执行完成';
         const modifiedFiles = this.extractModifiedFiles(response.content || '');
@@ -395,6 +429,7 @@ export class AutonomousWorker extends EventEmitter {
           summary,
           modifiedFiles,
           dynamicTodos,
+          tokenUsage: response.tokenUsage,
         };
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -402,16 +437,47 @@ export class AutonomousWorker extends EventEmitter {
       }
     }
 
-    // 模式 2: 模拟执行（无适配器时的回退）
-    this.emit('executionSkipped', {
-      reason: '未提供 CLIAdapterFactory，使用模拟执行',
-      prompt: fullPrompt.substring(0, 200) + '...',
+    // 模式 2: 使用 BaseWorker 执行（真实 CLI）
+    const inferredTargets = this.extractTargetFiles(fullPrompt);
+    const targetFiles = [...new Set([...(assignment.scope?.targetPaths || []), ...inferredTargets])];
+    const subTask: SubTask = {
+      id: todo.id,
+      taskId: assignment.missionId,
+      description: fullPrompt,
+      assignmentId: assignment.id,
+      assignedWorker: this.cliType,
+      reason: todo.reasoning,
+      prompt: fullPrompt,
+      targetFiles,
+      dependencies: todo.dependsOn || [],
+      priority: todo.priority || 5,
+      kind: this.mapTodoKind(todo.type),
+      status: 'pending',
+      progress: 0,
+      retryCount: 0,
+      maxRetries: 3,
+      output: [],
+    };
+
+    const result = await this.baseWorker.execute({
+      subTask,
+      workingDirectory: options.workingDirectory,
+      timeout: options.timeout,
+      onOutput: options.onOutput,
     });
 
+    if (!result.success) {
+      throw new Error(result.error || 'CLI 执行失败');
+    }
+
+    const outputText = result.output || '';
+    const modifiedFiles = result.modifiedFiles || this.extractModifiedFiles(outputText);
+    const dynamicTodos = this.extractDynamicTodos(outputText);
+
     return {
-      summary: '模拟执行完成（未提供 CLIAdapterFactory）',
-      modifiedFiles: [],
-      dynamicTodos: [],
+      summary: outputText || result.error || '执行完成',
+      modifiedFiles,
+      dynamicTodos,
     };
   }
 
@@ -439,6 +505,12 @@ export class AutonomousWorker extends EventEmitter {
     }
 
     return files;
+  }
+
+  private extractTargetFiles(text: string): string[] {
+    const filePattern = /[\w\-./]+\.(ts|js|tsx|jsx|py|java|go|rs|cpp|c|css|scss|html|json|md|yaml|yml|txt)/gi;
+    const matches = text.match(filePattern);
+    return matches ? [...new Set(matches)] : [];
   }
 
   /**
@@ -477,6 +549,23 @@ export class AutonomousWorker extends EventEmitter {
     }
 
     return todos;
+  }
+
+  private mapTodoKind(todoType: string): SubTask['kind'] {
+    switch (todoType) {
+      case 'integration':
+        return 'integration';
+      case 'repair':
+        return 'repair';
+      case 'architecture':
+        return 'architecture';
+      case 'batch':
+        return 'batch';
+      case 'background':
+        return 'background';
+      default:
+        return 'implementation';
+    }
   }
 
   /**

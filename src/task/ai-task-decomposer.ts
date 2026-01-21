@@ -5,7 +5,7 @@
 
 import { logger, LogCategory } from '../logging';
 import { CLIType, TaskCategory } from '../types';
-import { CLIAdapterFactory } from '../cli/adapter-factory';
+import { IAdapterFactory } from '../adapters/adapter-factory-interface';
 import { TaskAnalysis } from './task-analyzer';
 import { SubTaskDef, SplitResult } from './task-splitter';
 import { CLISelector } from './cli-selector';
@@ -39,12 +39,12 @@ interface AISubTask {
  * AI 任务分解器
  */
 export class AITaskDecomposer {
-  private cliFactory: CLIAdapterFactory;
+  private cliFactory: IAdapterFactory;
   private cliSelector: CLISelector;
   private config: AIDecomposeConfig;
 
   constructor(
-    cliFactory: CLIAdapterFactory,
+    cliFactory: IAdapterFactory,
     cliSelector: CLISelector,
     config?: Partial<AIDecomposeConfig>
   ) {

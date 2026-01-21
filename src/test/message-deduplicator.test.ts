@@ -21,7 +21,7 @@ function createTestMessage(
     traceId: 'test-trace',
     type: 'text' as MessageType,
     source,
-    cli: 'claude',
+    agent: 'claude',  // ✅ 使用 agent
     lifecycle,
     blocks: [],
     metadata: { extra: { priority: 0, tags: [] } },

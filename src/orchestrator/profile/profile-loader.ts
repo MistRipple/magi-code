@@ -25,7 +25,7 @@ import { logger, LogCategory } from '../../logging';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { CLIType } from '../../types';
+import { WorkerSlot } from '../../types/agent-types';
 import {
   WorkerProfile,
   CategoriesConfig,
@@ -39,8 +39,25 @@ import {
 } from './defaults';
 import { ProfileStorage } from './profile-storage';
 
+/**
+ * 配置验证错误
+ */
+export interface ConfigValidationError {
+  field: string;
+  message: string;
+  value?: unknown;
+}
+
+/**
+ * 配置验证结果
+ */
+export interface ConfigValidationResult {
+  valid: boolean;
+  errors: ConfigValidationError[];
+}
+
 export class ProfileLoader {
-  private profiles: Map<CLIType, WorkerProfile> = new Map();
+  private profiles: Map<WorkerSlot, WorkerProfile> = new Map();
   private categories: Map<string, CategoryConfig> = new Map();
   private categoriesConfig: CategoriesConfig;
   private loaded: boolean = false;
@@ -48,35 +65,145 @@ export class ProfileLoader {
   /** 用户级配置目录：~/.multicli/ */
   private static readonly USER_CONFIG_DIR = path.join(os.homedir(), '.multicli');
 
-  /** 实例跟踪：用于检测多实例问题 */
-  private static instanceCount = 0;
-  private static instances: WeakRef<ProfileLoader>[] = [];
-  private instanceId: number;
+  /** 单例实例 */
+  private static instance: ProfileLoader | null = null;
 
-  constructor(_workspacePath?: string) {
-    this.categoriesConfig = DEFAULT_CATEGORIES_CONFIG;
-
-    // 实例跟踪
-    ProfileLoader.instanceCount++;
-    this.instanceId = ProfileLoader.instanceCount;
-    ProfileLoader.instances.push(new WeakRef(this));
-
-    // 警告：检测到多个实例
-    if (ProfileLoader.instanceCount > 1) {
-      const activeInstances = ProfileLoader.instances.filter(ref => ref.deref() !== undefined).length;
-      logger.warn(
-        '编排器.画像_加载器.多个_实例',
-        {
-          instanceId: this.instanceId,
-          activeInstances,
-          totalInstances: ProfileLoader.instanceCount,
-        },
-        LogCategory.ORCHESTRATOR
-      );
-
-      // 打印堆栈跟踪以帮助定位问题
-      logger.warn('编排器.画像_加载器.多个_实例.堆栈', { stack: new Error().stack || '' }, LogCategory.ORCHESTRATOR);
+  /**
+   * 获取 ProfileLoader 单例实例
+   * 这是获取 ProfileLoader 的唯一推荐方式
+   */
+  static getInstance(): ProfileLoader {
+    if (!ProfileLoader.instance) {
+      ProfileLoader.instance = new ProfileLoader();
     }
+    return ProfileLoader.instance;
+  }
+
+  /**
+   * 重置单例（仅用于测试）
+   * @internal
+   */
+  static resetInstance(): void {
+    ProfileLoader.instance = null;
+  }
+
+  /**
+   * 私有构造函数，强制使用 getInstance()
+   */
+  private constructor() {
+    this.categoriesConfig = DEFAULT_CATEGORIES_CONFIG;
+  }
+
+  /**
+   * 验证 WorkerProfile 配置
+   */
+  private validateWorkerProfile(profile: Partial<WorkerProfile>, workerType: string): ConfigValidationResult {
+    const errors: ConfigValidationError[] = [];
+
+    // 必填字段验证
+    if (!profile.name || typeof profile.name !== 'string') {
+      errors.push({ field: `${workerType}.name`, message: 'name is required and must be a string', value: profile.name });
+    }
+
+    if (!profile.displayName || typeof profile.displayName !== 'string') {
+      errors.push({ field: `${workerType}.displayName`, message: 'displayName is required and must be a string', value: profile.displayName });
+    }
+
+    // guidance 验证
+    if (profile.guidance) {
+      if (!profile.guidance.role || typeof profile.guidance.role !== 'string') {
+        errors.push({ field: `${workerType}.guidance.role`, message: 'guidance.role is required and must be a string', value: profile.guidance.role });
+      }
+
+      if (!Array.isArray(profile.guidance.focus)) {
+        errors.push({ field: `${workerType}.guidance.focus`, message: 'guidance.focus must be an array', value: profile.guidance.focus });
+      }
+    }
+
+    // preferences 验证
+    if (profile.preferences) {
+      if (!Array.isArray(profile.preferences.preferredCategories)) {
+        errors.push({ field: `${workerType}.preferences.preferredCategories`, message: 'must be an array', value: profile.preferences.preferredCategories });
+      }
+    }
+
+    // collaboration 验证
+    if (profile.collaboration) {
+      if (!Array.isArray(profile.collaboration.asLeader)) {
+        errors.push({ field: `${workerType}.collaboration.asLeader`, message: 'must be an array', value: profile.collaboration.asLeader });
+      }
+      if (!Array.isArray(profile.collaboration.asCollaborator)) {
+        errors.push({ field: `${workerType}.collaboration.asCollaborator`, message: 'must be an array', value: profile.collaboration.asCollaborator });
+      }
+    }
+
+    return { valid: errors.length === 0, errors };
+  }
+
+  /**
+   * 验证 CategoryConfig 配置
+   */
+  private validateCategoryConfig(config: Partial<CategoryConfig>, categoryName: string): ConfigValidationResult {
+    const errors: ConfigValidationError[] = [];
+
+    if (!config.displayName || typeof config.displayName !== 'string') {
+      errors.push({ field: `${categoryName}.displayName`, message: 'displayName is required', value: config.displayName });
+    }
+
+    if (!config.keywords || !Array.isArray(config.keywords) || config.keywords.length === 0) {
+      errors.push({ field: `${categoryName}.keywords`, message: 'keywords must be a non-empty array', value: config.keywords });
+    }
+
+    if (!config.defaultWorker) {
+      errors.push({ field: `${categoryName}.defaultWorker`, message: 'defaultWorker is required', value: config.defaultWorker });
+    } else if (!['claude', 'codex', 'gemini'].includes(config.defaultWorker)) {
+      errors.push({ field: `${categoryName}.defaultWorker`, message: 'defaultWorker must be one of: claude, codex, gemini', value: config.defaultWorker });
+    }
+
+    if (config.priority && !['high', 'medium', 'low'].includes(config.priority)) {
+      errors.push({ field: `${categoryName}.priority`, message: 'priority must be one of: high, medium, low', value: config.priority });
+    }
+
+    if (config.riskLevel && !['high', 'medium', 'low'].includes(config.riskLevel)) {
+      errors.push({ field: `${categoryName}.riskLevel`, message: 'riskLevel must be one of: high, medium, low', value: config.riskLevel });
+    }
+
+    return { valid: errors.length === 0, errors };
+  }
+
+  /**
+   * 验证所有已加载的配置
+   */
+  validateAllConfigs(): ConfigValidationResult {
+    const errors: ConfigValidationError[] = [];
+
+    // 验证 Worker 画像
+    for (const [workerType, profile] of this.profiles) {
+      const result = this.validateWorkerProfile(profile, workerType);
+      errors.push(...result.errors);
+    }
+
+    // 验证分类配置
+    for (const [categoryName, config] of this.categories) {
+      const result = this.validateCategoryConfig(config, categoryName);
+      errors.push(...result.errors);
+    }
+
+    // 验证分类规则
+    const rules = this.categoriesConfig.rules;
+    if (!rules.defaultCategory || !this.categories.has(rules.defaultCategory)) {
+      errors.push({
+        field: 'rules.defaultCategory',
+        message: 'defaultCategory must reference an existing category',
+        value: rules.defaultCategory,
+      });
+    }
+
+    if (errors.length > 0) {
+      logger.warn('编排器.画像_加载器.配置_验证.警告', { errorCount: errors.length, errors: errors.slice(0, 5) }, LogCategory.ORCHESTRATOR);
+    }
+
+    return { valid: errors.length === 0, errors };
   }
 
   /**
@@ -97,6 +224,9 @@ export class ProfileLoader {
     await this.loadWorkerProfiles();
     await this.loadCategories();
     this.loaded = true;
+
+    // 加载完成后验证配置
+    this.validateAllConfigs();
   }
 
   /**
@@ -115,13 +245,13 @@ export class ProfileLoader {
    */
   private async loadWorkerProfiles(): Promise<void> {
     const userConfigDir = ProfileLoader.USER_CONFIG_DIR;
-    const defaultProfiles: Record<CLIType, WorkerProfile> = {
+    const defaultProfiles: Record<WorkerSlot, WorkerProfile> = {
       claude: DEFAULT_CLAUDE_PROFILE,
       codex: DEFAULT_CODEX_PROFILE,
       gemini: DEFAULT_GEMINI_PROFILE,
     };
 
-    for (const workerType of ['claude', 'codex', 'gemini'] as CLIType[]) {
+    for (const workerType of ['claude', 'codex', 'gemini'] as WorkerSlot[]) {
       const defaultProfile = defaultProfiles[workerType];
       let finalProfile = defaultProfile;
 
@@ -253,14 +383,14 @@ export class ProfileLoader {
   /**
    * 获取 Worker 画像
    */
-  getProfile(workerType: CLIType): WorkerProfile {
+  getProfile(workerType: WorkerSlot): WorkerProfile {
     return this.profiles.get(workerType) ?? DEFAULT_CLAUDE_PROFILE;
   }
 
   /**
    * 获取所有 Worker 画像
    */
-  getAllProfiles(): Map<CLIType, WorkerProfile> {
+  getAllProfiles(): Map<WorkerSlot, WorkerProfile> {
     return this.profiles;
   }
 

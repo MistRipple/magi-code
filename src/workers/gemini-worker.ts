@@ -3,7 +3,7 @@
  * Gemini CLI 执行器
  */
 
-import { CLIType, SubTask, WorkerResult, WorkerConfig } from '../types';
+import { AgentType, SubTask, WorkerResult, WorkerConfig } from '../types';  // ✅ 使用 AgentType
 import { BaseWorker } from './base-worker';
 
 /**
@@ -27,7 +27,7 @@ export class GeminiWorker extends BaseWorker {
     this.geminiConfig = config;
   }
 
-  get cliType(): CLIType {
+  get agentType(): AgentType {  // ✅ 使用 agentType
     return 'gemini';
   }
 

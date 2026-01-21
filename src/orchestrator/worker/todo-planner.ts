@@ -32,8 +32,10 @@ export interface PlanningContext {
   };
   /** 可用契约 */
   availableContracts: string[];
-  /** 项目上下文 */
+  /** 项目上下文（静态） */
   projectContext?: string;
+  /** 会话上下文快照（动态，来自 ContextManager） */
+  contextSnapshot?: string;
 }
 
 /**
@@ -197,8 +199,9 @@ export class TodoPlanner {
     todos.push(
       this.createTodo({
         assignmentId: assignment.id,
-        content: '实现核心功能',
+        content: `执行职责任务：${assignment.responsibility}`,
         reasoning: '完成职责的主要工作',
+        expectedOutput: assignment.responsibility,
         type: 'implementation',
         priority: 3,
       })
@@ -208,7 +211,7 @@ export class TodoPlanner {
     todos.push(
       this.createTodo({
         assignmentId: assignment.id,
-        content: '验证实现结果',
+        content: `验证任务结果是否满足目标：${assignment.responsibility}`,
         reasoning: '确保实现正确',
         type: 'verification',
         priority: 4,

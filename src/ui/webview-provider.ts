@@ -11,14 +11,14 @@ import * as os from 'os';
 import {
   CLIType,
   UIState,
-  CLIStatus,
-  CLIStatusCode,
   WebviewToExtensionMessage,
   ExtensionToWebviewMessage,
   MessageSource,
   LogEntry,
   PermissionMatrix,
   StrategyConfig,
+  WorkerStatus,
+  WorkerSlot,  // ✅ 新增
 } from '../types';
 import {
   StandardMessage,
@@ -33,9 +33,9 @@ import { SessionManagerTaskRepository } from '../task/session-manager-task-repos
 import { SnapshotManager } from '../snapshot-manager';
 import { DiffGenerator } from '../diff-generator';
 import { globalEventBus } from '../events';
-import { CLIAdapterFactory } from '../cli/adapter-factory';
+import { IAdapterFactory } from '../adapters/adapter-factory-interface';
+import { LLMAdapterFactory } from '../llm/adapter-factory';
 import { TaskAnalyzer, CLISelector } from '../task';
-import { CLI_CAPABILITIES, CLIResponse } from '../cli/types';
 import { IntelligentOrchestrator } from '../orchestrator/intelligent-orchestrator';
 import { AceIndexManager } from '../ace/index-manager';
 import { normalizeOrchestratorMessage, isInternalStateMessage } from '../normalizer';
@@ -67,16 +67,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private taskManagerReady: Promise<void> | null = null;
   private snapshotManager: SnapshotManager;
   private diffGenerator: DiffGenerator;
-  private cliStatuses: Map<CLIType, CLIStatus> = new Map();
-  private cliOutputs: Map<CLIType, string[]> = new Map();
   private readonly messageFlowLogEnabled = process.env.MULTICLI_MESSAGE_FLOW_LOG === '1';
   private readonly messageFlowLogPath: string;
 
   // 统一消息总线（替代原有的 MessageDeduplicator）
   private messageBus: UnifiedMessageBus;
 
-  // 多 CLI 适配器工厂
-  private cliFactory: CLIAdapterFactory;
+  // 适配器工厂（LLM 模式）
+  private adapterFactory: IAdapterFactory;
 
   // 任务分析器和 CLI 选择器
   private taskAnalyzer: TaskAnalyzer;
@@ -157,18 +155,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const timeout = config.get<number>('timeout') ?? 300000;
     const idleTimeout = config.get<number>('idleTimeout') ?? 120000;
     const maxTimeout = config.get<number>('maxTimeout') ?? 900000;
-    const cliPaths = {
-      claude: config.get<string>('claude.path') ?? 'claude',
-      codex: config.get<string>('codex.path') ?? 'codex',
-      gemini: config.get<string>('gemini.path') ?? 'gemini',
-    };
     const permissions = this.normalizePermissions(config.get<Partial<PermissionMatrix>>('permissions'));
     const strategy = this.normalizeStrategy(config.get<Partial<StrategyConfig>>('strategy'));
     const cliSelection = config.get<{ enabled?: boolean; healthThreshold?: number }>('cliSelection') || {};
 
-    // 初始化多 CLI 适配器工厂
-    this.cliFactory = new CLIAdapterFactory({ cwd: workspaceRoot, idleTimeout, maxTimeout, cliPaths });
-    this.setupCLIAdapters();
+    // 初始化 LLM 适配器工厂（替代 CLI 适配器工厂）
+    this.adapterFactory = new LLMAdapterFactory({ cwd: workspaceRoot });
+    // 异步初始化 profile loader
+    void (this.adapterFactory as LLMAdapterFactory).initialize().catch(err => {
+      logger.error('Failed to initialize LLM adapter factory', { error: err.message }, LogCategory.LLM);
+    });
+    this.setupAdapterEvents();
     this.cliSelector = new CLISelector();
     this.cliSelector.configureSmartSelection({
       enabled: cliSelection.enabled,
@@ -177,7 +174,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     // 初始化智能编排器
     this.intelligentOrchestrator = new IntelligentOrchestrator(
-      this.cliFactory,
+      this.adapterFactory,
       this.sessionManager,
       this.snapshotManager,
       this.workspaceRoot,
@@ -186,11 +183,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 设置 Hard Stop 确认回调
     this.setupOrchestratorConfirmation();
     this.setupOrchestratorQuestions();
-
-    // 初始化 CLI 输出缓冲
-    this.cliOutputs.set('claude', []);
-    this.cliOutputs.set('codex', []);
-    this.cliOutputs.set('gemini', []);
 
     // 绑定事件
     this.bindEvents();
@@ -257,30 +249,23 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /** 设置所有 CLI 适配器事件监听 */
-  private setupCLIAdapters(): void {
+  private setupAdapterEvents(): void {
     // 🔧 重构：所有消息通过 UnifiedMessageBus 发送
-    // CLI Adapter 的事件直接接入 MessageBus
-    this.cliFactory.on('standardMessage', (message: any) => {
+    // Adapter Factory 的事件直接接入 MessageBus
+    this.adapterFactory.on('standardMessage', (message: any) => {
       this.messageBus.sendMessage(message);
     });
 
-    this.cliFactory.on('standardUpdate', (update: any) => {
+    this.adapterFactory.on('stream', (update: any) => {
       this.messageBus.sendUpdate(update);
     });
 
-    this.cliFactory.on('standardComplete', (message: any) => {
+    this.adapterFactory.on('standardComplete', (message: any) => {
       this.messageBus.sendMessage(message);
     });
 
-    this.cliFactory.on('stateChange', ({ type, state }: { type: CLIType; state: string }) => {
-      const status: CLIStatus = {
-        type: type,
-        code: state === 'error' ? CLIStatusCode.RUNTIME_ERROR : CLIStatusCode.AVAILABLE,
-        available: state !== 'error',
-        path: type,
-      };
-      this.cliStatuses.set(type, status);
-      this.sendStateUpdate();
+    this.adapterFactory.on('error', (error: Error) => {
+      logger.error('适配器错误', { error: error.message }, LogCategory.LLM);
     });
   }
 
@@ -490,7 +475,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     logger.info('界面.CLI.提问.回答', { cli, questionId, answer, role: adapterRole || 'worker' }, LogCategory.UI);
 
     const role = adapterRole || 'worker';
-    const success = this.cliFactory.writeInput(cli, answer, role);
+    // TODO: LLM mode doesn't support writeInput - this needs to be refactored
+    const success = false; // this.adapterFactory.writeInput(cli, answer, role);
 
     if (success) {
       this.postMessage({
@@ -553,6 +539,26 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
     globalEventBus.on('task:failed', (event) => {
       this.sendStateUpdate();
+      const data = event.data as { error?: string | object; stack?: string };
+      let errorMsg = '任务执行失败';
+      if (data?.error) {
+        if (typeof data.error === 'string') {
+          errorMsg = data.error;
+        } else if (typeof data.error === 'object') {
+          const errObj = data.error as { message?: string; error?: string };
+          errorMsg = errObj.message || errObj.error || JSON.stringify(data.error);
+        }
+      }
+
+      this.sendOrchestratorMessage({
+        content: errorMsg,
+        messageType: 'error',
+        taskId: event.taskId,
+        metadata: {
+          error: errorMsg,
+          stack: data?.stack,
+        },
+      });
      
       this.postMessage({
         type: 'phaseChanged',
@@ -691,11 +697,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 转换为标准消息格式（只发送标准消息）
       const standardMessage = normalizeOrchestratorMessage(data, event.taskId);
 
-      this.postMessage({
-        type: 'standardMessage',
-        message: standardMessage,
-        sessionId: this.activeSessionId,
-      } as any);
+      // 通过统一消息总线发送，确保 processingState 正确更新
+      this.messageBus.sendMessage(standardMessage);
     });
 
    
@@ -748,8 +751,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     globalEventBus.on('cli:statusChanged', (event) => {
       const data = event.data as { cli: string; available: boolean; version?: string };
       this.sendStateUpdate();
-      // 通知 UI CLI 状态变化
-      this.postMessage({ type: 'cliStatusChanged', cli: data.cli, available: data.available, version: data.version });
+      // 通知 UI Worker 状态变化
+      this.postMessage({ type: 'workerStatusChanged', worker: data.cli as WorkerSlot, available: data.available, version: data.version });
     });
 
     globalEventBus.on('cli:healthCheck', () => {
@@ -1101,24 +1104,21 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       await this.intelligentOrchestrator.interrupt();
     }
 
-    // 2. 中断所有 CLI 并等待完成
-    logger.info('界面.任务.中断.CLI.开始', undefined, LogCategory.UI);
+    // 2. 中断所有适配器并等待完成
+    logger.info('界面.任务.中断.适配器.开始', undefined, LogCategory.UI);
     try {
       const interruptCompleted = await Promise.race([
-        this.cliFactory.interruptAll().then(() => true),
+        this.adapterFactory.shutdown().then(() => true),
         new Promise<boolean>((resolve) => setTimeout(resolve, 5000, false)) // 5秒超时
       ]);
       if (!interruptCompleted) {
-        logger.warn('界面.任务.中断.CLI.超时', undefined, LogCategory.UI);
+        logger.warn('界面.任务.中断.适配器.超时', undefined, LogCategory.UI);
       }
-      await this.cliFactory.disconnectAll();
-      await this.cliFactory.resetAllSessions();
-      logger.info('界面.任务.中断.CLI.重置', undefined, LogCategory.UI);
+      logger.info('界面.任务.中断.适配器.完成', undefined, LogCategory.UI);
     } catch (error) {
-      logger.error('界面.任务.中断.CLI.错误', error, LogCategory.UI);
+      logger.error('界面.任务.中断.适配器.错误', error, LogCategory.UI);
       try {
-        await this.cliFactory.disconnectAll();
-        await this.cliFactory.resetAllSessions();
+        await this.adapterFactory.shutdown();
       } catch (cleanupError) {
         logger.error('界面.任务.中断.CLI.清理_失败', cleanupError, LogCategory.UI);
       }
@@ -1186,7 +1186,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       traceId: this.activeSessionId || 'default',
       type,
       source: 'orchestrator',
-      cli: 'claude',
+      agent: 'orchestrator',  // ✅ 使用 agent
       timestamp: Date.now(),
       updatedAt: Date.now(),
       blocks: Array.isArray(blocks) ? blocks : (content ? [{ type: 'text', content, isMarkdown: false }] : []),
@@ -1235,31 +1235,24 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 检测所有 CLI 的可用性并更新状态 */
   private async checkCliAvailability(): Promise<void> {
     try {
-      const availability = await this.cliFactory.checkAllAvailability();
-      logger.info('界面.CLI.可用性', availability, LogCategory.UI);
-
-      // 更新 CLI 状态
-      const cliTypes: CLIType[] = ['claude', 'codex', 'gemini'];
-      for (const cli of cliTypes) {
-        const status: CLIStatus = {
-          type: cli,
-          code: availability[cli] ? CLIStatusCode.AVAILABLE : CLIStatusCode.NOT_INSTALLED,
-          available: availability[cli],
-          path: cli,
-          lastChecked: new Date(),
-        };
-        this.cliStatuses.set(cli, status);
-      }
+      // TODO: LLM mode - check adapter connectivity instead of CLI availability
+      const availability = {
+        claude: this.adapterFactory.isConnected('claude'),
+        codex: this.adapterFactory.isConnected('codex'),
+        gemini: this.adapterFactory.isConnected('gemini'),
+      };
+      logger.info('界面.适配器.可用性', availability, LogCategory.UI);
 
       // 通知 UI 更新状态
       this.sendStateUpdate();
 
       // 发送单独的状态变更通知
-      for (const cli of cliTypes) {
+      const workerSlots: WorkerSlot[] = ['claude', 'codex', 'gemini'];
+      for (const worker of workerSlots) {
         this.postMessage({
-          type: 'cliStatusChanged',
-          cli,
-          available: availability[cli],
+          type: 'workerStatusChanged',
+          worker,
+          available: availability[worker],
         });
       }
     } catch (error) {
@@ -1371,8 +1364,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'saveCurrentSession':
-        // 新增：保存当前会话的消息和 CLI 输出
-        this.saveCurrentSessionData(message.messages, message.cliOutputs);
+        // 保存当前会话的消息
+        this.saveCurrentSessionData(message.messages);
         break;
 
       case 'switchSession':
@@ -1516,6 +1509,126 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'enhancePrompt':
         // 执行 Prompt 增强（从系统级存储读取配置）
         this.handleEnhancePrompt((message as any).prompt);
+        break;
+
+      // LLM 配置相关
+      case 'loadAllWorkerConfigs':
+        await this.handleLoadAllWorkerConfigs();
+        break;
+
+      case 'saveWorkerConfig':
+        await this.handleSaveWorkerConfig(message.worker, message.config);
+        break;
+
+      case 'testWorkerConnection':
+        await this.handleTestWorkerConnection(message.worker, message.config);
+        break;
+
+      case 'loadOrchestratorConfig':
+        await this.handleLoadOrchestratorConfig();
+        break;
+
+      case 'saveOrchestratorConfig':
+        await this.handleSaveOrchestratorConfig(message.config);
+        break;
+
+      case 'testOrchestratorConnection':
+        await this.handleTestOrchestratorConnection(message.config);
+        break;
+
+      case 'loadCompressorConfig':
+        await this.handleLoadCompressorConfig();
+        break;
+
+      case 'saveCompressorConfig':
+        await this.handleSaveCompressorConfig(message.config);
+        break;
+
+      case 'testCompressorConnection':
+        await this.handleTestCompressorConnection(message.config);
+        break;
+
+      // MCP 配置相关
+      case 'loadMCPServers':
+        await this.handleLoadMCPServers();
+        break;
+
+      case 'addMCPServer':
+        await this.handleAddMCPServer(message.server);
+        break;
+
+      case 'updateMCPServer':
+        await this.handleUpdateMCPServer(message.serverId, message.updates);
+        break;
+
+      case 'deleteMCPServer':
+        await this.handleDeleteMCPServer(message.serverId);
+        break;
+
+      case 'connectMCPServer':
+        await this.handleConnectMCPServer(message.serverId);
+        break;
+
+      case 'disconnectMCPServer':
+        await this.handleDisconnectMCPServer(message.serverId);
+        break;
+
+      case 'refreshMCPTools':
+        await this.handleRefreshMCPTools(message.serverId);
+        break;
+
+      case 'getMCPServerTools':
+        await this.handleGetMCPServerTools(message.serverId);
+        break;
+
+      // Skills 配置相关
+      case 'loadSkillsConfig':
+        await this.handleLoadSkillsConfig();
+        break;
+
+      case 'saveSkillsConfig':
+        await this.handleSaveSkillsConfig(message.config);
+        break;
+
+      case 'toggleBuiltInTool':
+        await this.handleToggleBuiltInTool(message.tool, message.enabled);
+        break;
+
+      case 'addCustomTool':
+        await this.handleAddCustomTool(message.tool);
+        break;
+
+      case 'removeCustomTool':
+        await this.handleRemoveCustomTool(message.toolName);
+        break;
+
+      case 'installSkill':
+        await this.handleInstallSkill(message.skillId);
+        break;
+
+      // Skills 仓库管理
+      case 'loadRepositories':
+        await this.handleLoadRepositories();
+        break;
+
+      case 'addRepository':
+        await this.handleAddRepository(message.url);
+        break;
+
+      case 'updateRepository':
+        await this.handleUpdateRepository(message.repositoryId, message.updates);
+        break;
+
+      case 'deleteRepository':
+        await this.handleDeleteRepository(message.repositoryId);
+        break;
+
+      case 'refreshRepository':
+        await this.handleRefreshRepository(message.repositoryId);
+        break;
+
+      case 'loadSkillLibrary':
+        await this.handleLoadSkillLibrary();
         break;
     }
   }
@@ -1874,26 +1987,1207 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     return chatHistory;
   }
 
-  /** 发送 CLI 连接状态到前端 */
+  // ============================================
+  // LLM 配置管理方法
+  // ============================================
+
+  /** 加载所有 Worker 配置 */
+  private async handleLoadAllWorkerConfigs(): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      const fullConfig = LLMConfigLoader.loadFullConfig();
+
+      this.postMessage({
+        type: 'allWorkerConfigsLoaded',
+        configs: fullConfig.workers
+      });
+    } catch (error: any) {
+      logger.error('加载 Worker 配置失败', { error: error.message }, LogCategory.LLM);
+      this.postMessage({
+        type: 'toast',
+        message: '加载配置失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /** 保存 Worker 配置 */
+  private async handleSaveWorkerConfig(worker: WorkerSlot, config: any): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+
+      // 保存配置
+      LLMConfigLoader.updateWorkerConfig(worker, config);
+
+      // 清除适配器缓存
+      if (this.adapterFactory && 'clearAdapter' in this.adapterFactory) {
+        await (this.adapterFactory as any).clearAdapter(worker);
+      }
+
+      this.postMessage({
+        type: 'workerConfigSaved',
+        worker: worker
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: `${worker} 配置已保存`,
+        toastType: 'success'
+      });
+
+      logger.info('Worker 配置已保存', { worker }, LogCategory.LLM);
+    } catch (error: any) {
+      logger.error('保存 Worker 配置失败', { worker, error: error.message }, LogCategory.LLM);
+      this.postMessage({
+        type: 'toast',
+        message: '保存配置失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /** 测试 Worker 连接 */
+  private async handleTestWorkerConnection(worker: WorkerSlot, config: any): Promise<void> {
+    try {
+      const { createLLMClient } = await import('../llm/clients/client-factory');
+      const client = createLLMClient(config);
+
+      // 发送测试请求
+      const response = await client.sendMessage({
+        messages: [{ role: 'user', content: 'Hello' }],
+        maxTokens: 10,
+        temperature: 0.7
+      });
+
+      if (response && response.content) {
+        this.postMessage({
+          type: 'workerConnectionTestResult',
+          worker: worker,
+          success: true
+        });
+
+        this.postMessage({
+          type: 'toast',
+          message: `${worker} 连接成功`,
+          toastType: 'success'
+        });
+      } else {
+        throw new Error('No response from LLM');
+      }
+    } catch (error: any) {
+      logger.error('Worker 连接测试失败', { worker, error: error.message }, LogCategory.LLM);
+
+      this.postMessage({
+        type: 'workerConnectionTestResult',
+        worker: worker,
+        success: false,
+        error: error.message
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: `${worker} 连接失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /** 加载编排者配置 */
+  private async handleLoadOrchestratorConfig(): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      const config = LLMConfigLoader.loadOrchestratorConfig();
+
+      this.postMessage({
+        type: 'orchestratorConfigLoaded',
+        config: config
+      });
+    } catch (error: any) {
+      logger.error('加载编排者配置失败', { error: error.message }, LogCategory.LLM);
+      this.postMessage({
+        type: 'toast',
+        message: '加载配置失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /** 保存编排者配置 */
+  private async handleSaveOrchestratorConfig(config: any): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+
+      // 保存配置
+      LLMConfigLoader.updateOrchestratorConfig(config);
+
+      // 清除适配器缓存
+      if (this.adapterFactory && 'clearAdapter' in this.adapterFactory) {
+        await (this.adapterFactory as any).clearAdapter('orchestrator');
+      }
+
+      this.postMessage({
+        type: 'orchestratorConfigSaved'
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: '编排者配置已保存',
+        toastType: 'success'
+      });
+
+      logger.info('编排者配置已保存', undefined, LogCategory.LLM);
+    } catch (error: any) {
+      logger.error('保存编排者配置失败', { error: error.message }, LogCategory.LLM);
+      this.postMessage({
+        type: 'toast',
+        message: '保存配置失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /** 测试编排者连接 */
+  private async handleTestOrchestratorConnection(config: any): Promise<void> {
+    try {
+      const { createLLMClient } = await import('../llm/clients/client-factory');
+      const client = createLLMClient(config);
+
+      // 发送测试请求
+      const response = await client.sendMessage({
+        messages: [{ role: 'user', content: 'Hello' }],
+        maxTokens: 10,
+        temperature: 0.7
+      });
+
+      if (response && response.content) {
+        this.postMessage({
+          type: 'orchestratorConnectionTestResult',
+          success: true
+        });
+
+        this.postMessage({
+          type: 'toast',
+          message: '编排者连接成功',
+          toastType: 'success'
+        });
+      } else {
+        throw new Error('No response from LLM');
+      }
+    } catch (error: any) {
+      logger.error('编排者连接测试失败', { error: error.message }, LogCategory.LLM);
+
+      this.postMessage({
+        type: 'orchestratorConnectionTestResult',
+        success: false,
+        error: error.message
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: `编排者连接失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /** 加载压缩器配置 */
+  private async handleLoadCompressorConfig(): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      const config = LLMConfigLoader.loadCompressorConfig();
+
+      this.postMessage({
+        type: 'compressorConfigLoaded',
+        config: config
+      });
+    } catch (error: any) {
+      logger.error('加载压缩器配置失败', { error: error.message }, LogCategory.LLM);
+      this.postMessage({
+        type: 'toast',
+        message: '加载配置失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /** 保存压缩器配置 */
+  private async handleSaveCompressorConfig(config: any): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+
+      // 保存配置
+      LLMConfigLoader.updateCompressorConfig(config);
+
+      this.postMessage({
+        type: 'compressorConfigSaved'
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: '压缩器配置已保存',
+        toastType: 'success'
+      });
+
+      logger.info('压缩器配置已保存', undefined, LogCategory.LLM);
+    } catch (error: any) {
+      logger.error('保存压缩器配置失败', { error: error.message }, LogCategory.LLM);
+      this.postMessage({
+        type: 'toast',
+        message: '保存配置失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /** 测试压缩器连接 */
+  private async handleTestCompressorConnection(config: any): Promise<void> {
+    try {
+      const { createLLMClient } = await import('../llm/clients/client-factory');
+      const client = createLLMClient(config);
+
+      // 发送测试请求
+      const response = await client.sendMessage({
+        messages: [{ role: 'user', content: 'Hello' }],
+        maxTokens: 10,
+        temperature: 0.7
+      });
+
+      if (response && response.content) {
+        this.postMessage({
+          type: 'compressorConnectionTestResult',
+          success: true
+        });
+
+        this.postMessage({
+          type: 'toast',
+          message: '压缩器连接成功',
+          toastType: 'success'
+        });
+      } else {
+        throw new Error('No response from LLM');
+      }
+    } catch (error: any) {
+      logger.error('压缩器连接测试失败', { error: error.message }, LogCategory.LLM);
+
+      this.postMessage({
+        type: 'compressorConnectionTestResult',
+        success: false,
+        error: error.message
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: `压缩器连接失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  // ============================================================================
+  // MCP 配置处理方法
+  // ============================================================================
+
+  private mcpManager: any = null;
+
+  /**
+   * 获取或创建 MCP 管理器
+   */
+  private async getMCPManager(): Promise<any> {
+    if (!this.mcpManager) {
+      const { MCPManager } = await import('../tools/mcp-manager');
+      this.mcpManager = new MCPManager();
+    }
+    return this.mcpManager;
+  }
+
+  /**
+   * 加载 MCP 服务器列表
+   */
+  private async handleLoadMCPServers(): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      const servers = LLMConfigLoader.loadMCPConfig();
+
+      this.postMessage({
+        type: 'mcpServersLoaded',
+        servers
+      });
+    } catch (error: any) {
+      logger.error('加载 MCP 服务器列表失败', { error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: `加载 MCP 服务器失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 添加 MCP 服务器
+   */
+  private async handleAddMCPServer(server: any): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+
+      // 生成 ID
+      if (!server.id) {
+        server.id = `mcp-${Date.now()}`;
+      }
+
+      LLMConfigLoader.addMCPServer(server);
+
+      this.postMessage({
+        type: 'mcpServerAdded',
+        server
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: `MCP 服务器 "${server.name}" 已添加`,
+        toastType: 'success'
+      });
+
+      logger.info('MCP 服务器已添加', { id: server.id, name: server.name }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('添加 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: `添加 MCP 服务器失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 更新 MCP 服务器
+   */
+  private async handleUpdateMCPServer(serverId: string, updates: any): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      LLMConfigLoader.updateMCPServer(serverId, updates);
+
+      this.postMessage({
+        type: 'mcpServerUpdated',
+        serverId
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: 'MCP 服务器已更新',
+        toastType: 'success'
+      });
+
+      logger.info('MCP 服务器已更新', { id: serverId }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('更新 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: `更新 MCP 服务器失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 删除 MCP 服务器
+   */
+  private async handleDeleteMCPServer(serverId: string): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+
+      // 先断开连接
+      const manager = await this.getMCPManager();
+      await manager.disconnectServer(serverId);
+
+      // 删除配置
+      LLMConfigLoader.deleteMCPServer(serverId);
+
+      this.postMessage({
+        type: 'mcpServerDeleted',
+        serverId
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: 'MCP 服务器已删除',
+        toastType: 'success'
+      });
+
+      logger.info('MCP 服务器已删除', { id: serverId }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('删除 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: `删除 MCP 服务器失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 连接 MCP 服务器
+   */
+  private async handleConnectMCPServer(serverId: string): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      const servers = LLMConfigLoader.loadMCPConfig();
+      const server = servers.find((s: any) => s.id === serverId);
+
+      if (!server) {
+        throw new Error(`MCP 服务器不存在: ${serverId}`);
+      }
+
+      if (!server.enabled) {
+        throw new Error('MCP 服务器未启用');
+      }
+
+      const manager = await this.getMCPManager();
+      await manager.connectServer(server);
+
+      const tools = manager.getServerTools(serverId);
+
+      this.postMessage({
+        type: 'mcpServerConnected',
+        serverId,
+        toolCount: tools.length
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: `MCP 服务器 "${server.name}" 已连接，发现 ${tools.length} 个工具`,
+        toastType: 'success'
+      });
+
+      logger.info('MCP 服务器已连接', { id: serverId, toolCount: tools.length }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('连接 MCP 服务器失败', { serverId, error: error.message }, LogCategory.TOOLS);
+
+      this.postMessage({
+        type: 'mcpServerConnectionFailed',
+        serverId,
+        error: error.message
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: `连接 MCP 服务器失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 断开 MCP 服务器连接
+   */
+  private async handleDisconnectMCPServer(serverId: string): Promise<void> {
+    try {
+      const manager = await this.getMCPManager();
+      await manager.disconnectServer(serverId);
+
+      this.postMessage({
+        type: 'mcpServerDisconnected',
+        serverId
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: 'MCP 服务器已断开连接',
+        toastType: 'success'
+      });
+
+      logger.info('MCP 服务器已断开', { id: serverId }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('断开 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: `断开 MCP 服务器失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 刷新 MCP 服务器工具列表
+   */
+  private async handleRefreshMCPTools(serverId: string): Promise<void> {
+    try {
+      const manager = await this.getMCPManager();
+      let tools: any[] = [];
+
+      if (!manager.getServerStatus(serverId)) {
+        const { LLMConfigLoader } = await import('../llm/config');
+        const servers = LLMConfigLoader.loadMCPConfig();
+        const server = servers.find((s: any) => s.id === serverId);
+
+        if (!server) {
+          throw new Error(`MCP 服务器不存在: ${serverId}`);
+        }
+
+        if (!server.enabled) {
+          throw new Error('MCP 服务器未启用');
+        }
+
+        await manager.connectServer(server);
+      }
+
+      tools = await manager.refreshServerTools(serverId);
+
+      this.postMessage({
+        type: 'mcpToolsRefreshed',
+        serverId,
+        tools
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: `工具列表已刷新，发现 ${tools.length} 个工具`,
+        toastType: 'success'
+      });
+
+      logger.info('MCP 工具列表已刷新', { serverId, toolCount: tools.length }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('刷新 MCP 工具列表失败', { error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: `刷新工具列表失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 获取 MCP 服务器工具列表
+   */
+  private async handleGetMCPServerTools(serverId: string): Promise<void> {
+    try {
+      const manager = await this.getMCPManager();
+      const tools = manager.getServerTools(serverId);
+
+      this.postMessage({
+        type: 'mcpServerTools',
+        serverId,
+        tools
+      });
+    } catch (error: any) {
+      logger.error('获取 MCP 工具列表失败', { error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: `获取工具列表失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  // ============================================================================
+  // Skills 配置处理
+  // ============================================================================
+
+  /**
+   * 加载 Skills 配置
+   */
+  private async handleLoadSkillsConfig(): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      const config = LLMConfigLoader.loadSkillsConfig();
+
+      this.postMessage({
+        type: 'skillsConfigLoaded',
+        config: config || {
+          builtInTools: {
+            web_search_20250305: { enabled: true, description: '搜索网络以获取最新信息' },
+            web_fetch_20250305: { enabled: true, description: '获取网页内容' },
+            text_editor_20250124: { enabled: false, description: '编辑文本文件（需要客户端实现）' },
+            computer_use_20241022: { enabled: false, description: '控制计算机（需要客户端实现）' }
+          },
+          customTools: []
+        }
+      });
+
+      logger.info('Skills 配置已加载', {}, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('加载 Skills 配置失败', { error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: `加载 Skills 配置失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 保存 Skills 配置
+   */
+  private async handleSaveSkillsConfig(config: any): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      LLMConfigLoader.saveSkillsConfig(config);
+
+      this.postMessage({
+        type: 'skillsConfigSaved'
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: 'Skills 配置已保存',
+        toastType: 'success'
+      });
+
+      logger.info('Skills 配置已保存', {}, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('保存 Skills 配置失败', { error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: `保存 Skills 配置失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 切换内置工具启用状态
+   */
+  private async handleToggleBuiltInTool(tool: string, enabled: boolean): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      const config = LLMConfigLoader.loadSkillsConfig() || {
+        builtInTools: {},
+        customTools: []
+      };
+
+      if (!config.builtInTools[tool]) {
+        config.builtInTools[tool] = { enabled: false };
+      }
+
+      config.builtInTools[tool].enabled = enabled;
+      LLMConfigLoader.saveSkillsConfig(config);
+
+      this.postMessage({
+        type: 'builtInToolToggled',
+        tool,
+        enabled
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: `工具 "${tool}" 已${enabled ? '启用' : '禁用'}`,
+        toastType: 'success'
+      });
+
+      logger.info('内置工具状态已切换', { tool, enabled }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('切换工具状态失败', { tool, error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: `切换工具状态失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 添加自定义工具
+   */
+  private async handleAddCustomTool(tool: any): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      const config = LLMConfigLoader.loadSkillsConfig() || {
+        builtInTools: {},
+        customTools: []
+      };
+
+      // 检查是否已存在
+      const existingIndex = config.customTools.findIndex((t: any) => t.name === tool.name);
+      if (existingIndex >= 0) {
+        config.customTools[existingIndex] = tool;
+      } else {
+        config.customTools.push(tool);
+      }
+
+      LLMConfigLoader.saveSkillsConfig(config);
+
+      this.postMessage({
+        type: 'customToolAdded',
+        tool
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: `自定义工具 "${tool.name}" 已添加`,
+        toastType: 'success'
+      });
+
+      logger.info('自定义工具已添加', { name: tool.name }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('添加自定义工具失败', { error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: `添加自定义工具失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 删除自定义工具
+   */
+  private async handleRemoveCustomTool(toolName: string): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      const config = LLMConfigLoader.loadSkillsConfig() || {
+        builtInTools: {},
+        customTools: []
+      };
+
+      config.customTools = config.customTools.filter((t: any) => t.name !== toolName);
+      LLMConfigLoader.saveSkillsConfig(config);
+
+      this.postMessage({
+        type: 'customToolRemoved',
+        toolName
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: `自定义工具 "${toolName}" 已删除`,
+        toastType: 'success'
+      });
+
+      logger.info('自定义工具已删除', { name: toolName }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('删除自定义工具失败', { toolName, error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: `删除自定义工具失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 安装 Skill
+   */
+  private async handleInstallSkill(skillId: string): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+
+      // 定义可安装的 Skill 库
+      const skillLibrary: Record<string, any> = {
+        web_search: {
+          name: 'web_search_20250305',
+          description: '搜索网络以获取最新信息',
+          enabled: true
+        },
+        web_fetch: {
+          name: 'web_fetch_20250305',
+          description: '获取网页内容',
+          enabled: true
+        },
+        text_editor: {
+          name: 'text_editor_20250124',
+          description: '编辑文本文件',
+          enabled: true
+        },
+        computer_use: {
+          name: 'computer_use_20241022',
+          description: '控制计算机',
+          enabled: true
+        }
+      };
+
+      const skill = skillLibrary[skillId];
+      if (!skill) {
+        throw new Error(`未找到 Skill: ${skillId}`);
+      }
+
+      // 加载当前配置
+      const config = LLMConfigLoader.loadSkillsConfig() || {
+        builtInTools: {},
+        customTools: []
+      };
+
+      // 添加或更新内置工具
+      config.builtInTools[skill.name] = {
+        enabled: skill.enabled,
+        description: skill.description
+      };
+
+      // 保存配置
+      LLMConfigLoader.saveSkillsConfig(config);
+
+      // 发送成功消息
+      this.postMessage({
+        type: 'skillInstalled',
+        skillId,
+        skill
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: `Skill "${skill.description}" 已安装`,
+        toastType: 'success'
+      });
+
+      // 重新加载配置以更新前端
+      await this.handleLoadSkillsConfig();
+
+      // 重新加载 Skills 到 ToolManager（让工具真正可用）
+      if (this.adapterFactory && 'reloadSkills' in this.adapterFactory) {
+        await (this.adapterFactory as any).reloadSkills();
+        logger.info('Skills reloaded in adapter factory', { skillId }, LogCategory.TOOLS);
+      }
+
+      logger.info('Skill 已安装', { skillId, name: skill.name }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('安装 Skill 失败', { skillId, error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: `安装 Skill 失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  // ============================================================================
+  // Skills 仓库管理
+  // ============================================================================
+
+  /**
+   * 加载仓库配置
+   */
+  private async handleLoadRepositories(): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      const repositories = LLMConfigLoader.loadRepositories();
+
+      this.postMessage({
+        type: 'repositoriesLoaded',
+        repositories
+      });
+
+      logger.info('Repositories loaded', { count: repositories.length }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('Failed to load repositories', { error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: '加载仓库失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 添加仓库（简化版：只需要 URL）
+   */
+  private async handleAddRepository(url: string): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      const { SkillRepositoryManager } = await import('../tools/skill-repository-manager');
+
+      // 先验证仓库
+      const manager = new SkillRepositoryManager();
+      const repoInfo = await manager.validateRepository(url);
+
+      // 添加仓库
+      const result = await LLMConfigLoader.addRepository(url);
+
+      // 更新仓库名称
+      LLMConfigLoader.updateRepositoryName(result.id, repoInfo.name);
+
+      this.postMessage({
+        type: 'repositoryAdded',
+        repository: {
+          id: result.id,
+          url,
+          name: repoInfo.name,
+          enabled: true
+        }
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: `仓库 "${repoInfo.name}" 已添加（${repoInfo.skillCount} 个技能）`,
+        toastType: 'success'
+      });
+
+      logger.info('Repository added', { url, name: repoInfo.name }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('Failed to add repository', { url, error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: '添加仓库失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 更新仓库
+   */
+  private async handleUpdateRepository(repositoryId: string, updates: any): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      LLMConfigLoader.updateRepository(repositoryId, updates);
+
+      this.postMessage({
+        type: 'repositoryUpdated',
+        repositoryId
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: '仓库已更新',
+        toastType: 'success'
+      });
+
+      // 重新加载仓库列表
+      await this.handleLoadRepositories();
+
+      logger.info('Repository updated', { id: repositoryId }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('Failed to update repository', { repositoryId, error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: '更新仓库失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 删除仓库
+   */
+  private async handleDeleteRepository(repositoryId: string): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      LLMConfigLoader.deleteRepository(repositoryId);
+
+      this.postMessage({
+        type: 'repositoryDeleted',
+        repositoryId
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: '仓库已删除',
+        toastType: 'success'
+      });
+
+      // 重新加载仓库列表
+      await this.handleLoadRepositories();
+
+      logger.info('Repository deleted', { id: repositoryId }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('Failed to delete repository', { repositoryId, error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: '删除仓库失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 刷新仓库缓存
+   */
+  private async handleRefreshRepository(repositoryId: string): Promise<void> {
+    try {
+      const { SkillRepositoryManager } = await import('../tools/skill-repository-manager');
+      const manager = new SkillRepositoryManager();
+      manager.clearCache(repositoryId);
+
+      this.postMessage({
+        type: 'repositoryRefreshed',
+        repositoryId
+      });
+
+      this.postMessage({
+        type: 'toast',
+        message: '仓库缓存已清除',
+        toastType: 'success'
+      });
+
+      logger.info('Repository cache cleared', { id: repositoryId }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('Failed to refresh repository', { repositoryId, error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: '刷新仓库失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 加载 Skill 库（从所有启用的仓库）
+   */
+  private async handleLoadSkillLibrary(): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      const { SkillRepositoryManager } = await import('../tools/skill-repository-manager');
+
+      // 加载仓库配置
+      const repositories = LLMConfigLoader.loadRepositories();
+
+      // 获取所有 Skills
+      const manager = new SkillRepositoryManager();
+      const skills = await manager.getAllSkills(repositories);
+
+      // 检查哪些已安装
+      const skillsConfig = LLMConfigLoader.loadSkillsConfig();
+      const installedSkills = new Set<string>();
+      if (skillsConfig && skillsConfig.builtInTools) {
+        Object.keys(skillsConfig.builtInTools).forEach(name => {
+          if (skillsConfig.builtInTools[name].enabled) {
+            installedSkills.add(name);
+          }
+        });
+      }
+
+      // 添加安装状态
+      const skillsWithStatus = skills.map(skill => ({
+        ...skill,
+        installed: installedSkills.has(skill.fullName)
+      }));
+
+      this.postMessage({
+        type: 'skillLibraryLoaded',
+        skills: skillsWithStatus
+      });
+
+      logger.info('Skill library loaded', {
+        totalSkills: skillsWithStatus.length,
+        installedCount: skillsWithStatus.filter(s => s.installed).length
+      }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('Failed to load skill library', { error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: '加载 Skill 库失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /** 发送适配器连接状态到前端 */
   private async sendCliStatus(): Promise<void> {
     try {
-      const availability = await this.cliFactory.checkAllAvailability();
-      const statuses: Record<string, { status: string; version?: string }> = {};
+      const { LLMConfigLoader } = await import('../llm/config');
+      const { createLLMClient } = await import('../llm/clients/client-factory');
 
-      for (const cli of ['claude', 'codex', 'gemini'] as CLIType[]) {
-        const isAvailable = availability[cli];
-        statuses[cli] = {
-          status: isAvailable ? 'available' : 'not_installed',
-          version: isAvailable ? '已安装' : undefined
-        };
-      }
+      const config = LLMConfigLoader.loadFullConfig();
+      const statuses: Record<string, { status: string; version?: string; error?: string }> = {};
+
+      // 测试模型的通用函数
+      const testModel = async (name: string, modelConfig: any, isRequired: boolean = false) => {
+        // 1. 检查是否启用
+        if (!modelConfig.enabled) {
+          statuses[name] = {
+            status: 'disabled',
+            version: '已禁用'
+          };
+          return;
+        }
+
+        // 2. 检查配置完整性
+        if (!modelConfig.apiKey || !modelConfig.model) {
+          statuses[name] = {
+            status: 'not_configured',
+            version: isRequired ? '未配置（必需）' : '未配置'
+          };
+          return;
+        }
+
+        try {
+          // 3. 创建临时客户端并发送真实测试请求
+          const client = createLLMClient(modelConfig);
+
+          // 发送最小测试请求（10 tokens）
+          await Promise.race([
+            client.sendMessage({
+              messages: [{ role: 'user', content: 'Hello' }],
+              maxTokens: 10,
+              temperature: 0.7
+            }),
+            // 10 秒超时
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('Connection timeout')), 10000)
+            )
+          ]);
+
+          // 4. 连接成功
+          statuses[name] = {
+            status: 'available',
+            version: `${modelConfig.provider} - ${modelConfig.model}`
+          };
+
+          logger.info(`Model connection test succeeded: ${name}`, {
+            provider: modelConfig.provider,
+            model: modelConfig.model
+          }, LogCategory.LLM);
+        } catch (error: any) {
+          // 5. 连接失败，分类错误
+          let status = 'unknown';
+          let errorMsg = error.message;
+
+          if (error.message.includes('401') || error.message.includes('authentication') || error.message.includes('Unauthorized')) {
+            status = 'auth_failed';
+            errorMsg = 'API Key 无效';
+          } else if (error.message.includes('network') || error.message.includes('ECONNREFUSED') || error.message.includes('ENOTFOUND')) {
+            status = 'network_error';
+            errorMsg = '网络连接失败';
+          } else if (error.message.includes('timeout') || error.message === 'Connection timeout') {
+            status = 'timeout';
+            errorMsg = '连接超时';
+          } else if (error.message.includes('disabled')) {
+            status = 'disabled';
+            errorMsg = '已禁用';
+          } else if (error.message.includes('empty choices') || error.message.includes('model name is invalid')) {
+            status = 'invalid_model';
+            errorMsg = `模型名称无效: ${modelConfig.model}`;
+          } else if (error.message.includes('404') || error.message.includes('not found')) {
+            status = 'invalid_model';
+            errorMsg = `模型不存在: ${modelConfig.model}`;
+          }
+
+          statuses[name] = {
+            status,
+            version: undefined,
+            error: errorMsg
+          };
+
+          logger.warn(`Model connection test failed: ${name}`, {
+            status,
+            error: errorMsg,
+            originalError: error.message
+          }, LogCategory.LLM);
+        }
+      };
+
+      // 并行测试所有模型
+      const testPromises = [
+        // 测试 3 个 Worker
+        ...(['claude', 'codex', 'gemini'] as WorkerSlot[]).map(worker =>
+          testModel(worker, config.workers[worker])
+        ),
+        // 测试编排者（必需）
+        testModel('orchestrator', config.orchestrator, true),
+        // 测试压缩模型（必需）
+        testModel('compressor', config.compressor, true)
+      ];
+
+      // 等待所有测试完成
+      await Promise.all(testPromises);
 
       this.postMessage({
         type: 'cliStatusUpdate',
         statuses
       } as ExtensionToWebviewMessage);
-    } catch (error) {
-      logger.error('界面.CLI.状态.检查_失败', error, LogCategory.UI);
+
+      logger.info('Model connection status check completed', {
+        results: Object.entries(statuses).map(([name, s]) => `${name}: ${s.status}`)
+      }, LogCategory.LLM);
+    } catch (error: any) {
+      logger.error('界面.模型状态.检查_失败', { error: error.message }, LogCategory.UI);
     }
   }
 
@@ -2479,17 +3773,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const taskManager = await this.getTaskManager();
-    let task = await taskManager.getTask(record.taskId);
-    if (!task) {
-      task = await taskManager.createTask({ prompt: record.prompt });
-      await taskManager.updateTaskPlan(task.id, { planId: record.id, planSummary: record.plan.summary || record.plan.analysis || '执行计划' });
-    }
-
     try {
       const result = await this.intelligentOrchestrator.executePlan(
         record,
-        task.id,
+        record.taskId,
         sessionId || record.sessionId
       );
       this.saveMessageToSession('/start-work', result, undefined, 'orchestrator');
@@ -2557,45 +3844,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private async executeWithIntelligentOrchestrator(prompt: string, imagePaths: string[]): Promise<void> {
     logger.info('界面.执行.模式.智能', undefined, LogCategory.UI);
 
-    const interactionMode = this.intelligentOrchestrator.getInteractionMode();
-
-    // ask 模式不创建任务（简单对话不需要任务跟踪）
-    const isAskMode = interactionMode === 'ask';
-
-   
-    // 如果最终不需要 Worker，任务会被标记为已完成（无子任务）
-    const taskManager = isAskMode ? null : await this.getTaskManager();
-    const task = taskManager ? await taskManager.createTask({ prompt }) : null;
-    const taskId = task?.id || `temp-${Date.now()}`;
-
-    if (task) {
-      await taskManager!.startTask(task.id);
-      await this.sendStateUpdate();
-    }
-
     try {
       // 调用智能编排器
-      const result = await this.intelligentOrchestrator.execute(
-        prompt,
-        taskId,
-        this.activeSessionId || taskId
-      );
+      const taskContext = await this.intelligentOrchestrator.executeWithTaskContext(prompt, this.activeSessionId || undefined);
+      const result = taskContext.result;
 
       // 获取执行计划，判断是否需要 Worker
       const plan = this.intelligentOrchestrator.plan;
       const needsWorker = plan?.needsWorker !== false && (plan?.subTasks?.length ?? 0) > 0;
-
-      if (task) {
-        if (needsWorker) {
-         
-          await taskManager!.completeTask(task.id);
-          logger.info('界面.任务.完成', { taskId: task.id, subTaskCount: plan?.subTasks?.length || 0 }, LogCategory.UI);
-        } else {
-          // 不需要 Worker，标记任务为已完成（无子任务）
-          await taskManager!.completeTask(task.id);
-          logger.info('界面.任务.完成.无_子任务', { taskId: task.id }, LogCategory.UI);
-        }
-      }
+      logger.info('界面.任务.完成', { needsWorker, subTaskCount: plan?.subTasks?.length || 0 }, LogCategory.UI);
 
       // 保存消息历史
       this.saveMessageToSession(prompt, result, undefined, 'orchestrator');
@@ -2603,11 +3860,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     } catch (error) {
       logger.error('界面.执行.智能.失败', error, LogCategory.UI);
       const errorMsg = error instanceof Error ? error.message : String(error);
-
-
-      if (task) {
-        await taskManager!.failTask(task.id, errorMsg);
-      }
 
       this.sendOrchestratorMessage({
         content: errorMsg,
@@ -2628,12 +3880,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     await taskManager.startTask(task.id);
     this.sendStateUpdate();
 
-    // 清空目标 CLI 的输出
-    this.cliOutputs.set(targetCli, []);
-
     try {
       logger.info('界面.执行.直接.请求', { cli: targetCli }, LogCategory.UI);
-      const response = await this.cliFactory.sendMessage(targetCli, prompt, imagePaths);
+      const response = await this.adapterFactory.sendMessage(targetCli, prompt, imagePaths);
       logger.info('界面.执行.直接.响应', { cli: targetCli, preview: response.content?.substring(0, 100) }, LogCategory.UI);
       const executionStats = this.intelligentOrchestrator.getExecutionStats();
       if (executionStats) {
@@ -2693,8 +3942,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private async handleNewSession(): Promise<void> {
     // 创建新会话前，先中断当前任务
     await this.interruptCurrentTask({ silent: true });
-    // 创建新会话时，重置所有 CLI 进程
-    await this.cliFactory.resetAllSessions();
+    // 创建新会话时，重置所有适配器
+    await this.adapterFactory.shutdown();
     const newSession = this.sessionManager.createSession();
     // 更新活跃会话ID
     this.activeSessionId = newSession.id;
@@ -2707,7 +3956,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 切换到指定会话 */
   private async switchToSession(sessionId: string): Promise<void> {
-    await this.cliFactory.resetAllSessions();
+    await this.adapterFactory.shutdown();
     this.activeSessionId = sessionId;
     this.ensureSessionExists(sessionId);
   }
@@ -2752,7 +4001,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /** 保存当前会话的完整数据（从前端同步） */
-  private saveCurrentSessionData(messages: any[], cliOutputs: Record<string, any[]>): void {
+  private saveCurrentSessionData(messages: any[]): void {
     const currentSession = this.sessionManager.getCurrentSession();
     if (!currentSession) {
       logger.info('界面.会话.保存.跳过', { reason: 'no_current_session' }, LogCategory.UI);
@@ -2771,7 +4020,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }));
 
     // 使用新的 API 保存会话数据
-    this.sessionManager.updateSessionData(currentSession.id, sessionMessages, cliOutputs);
+    this.sessionManager.updateSessionData(currentSession.id, sessionMessages);  // ✅ 移除 cliOutputs 参数
     logger.info('界面.会话.保存.完成', { messageCount: sessionMessages.length }, LogCategory.UI);
   }
 
@@ -2787,10 +4036,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 使用统一会话管理器的会话数据
     const allSessions = this.sessionManager.getAllSessions();
 
-    // 构建 CLI 状态（包含能力信息）
-    const cliStatuses: CLIStatus[] = Array.from(this.cliStatuses.values()).map(status => ({
-      ...status,
-      capabilities: CLI_CAPABILITIES[status.type],
+    // 构建 Worker 状态（基于 LLM 适配器）
+    const workerSlots: WorkerSlot[] = ['claude', 'codex', 'gemini'];
+    const workerStatuses: WorkerStatus[] = workerSlots.map(worker => ({
+      worker,
+      available: this.adapterFactory.isConnected(worker),
+      enabled: true,  // TODO: 从配置读取
     }));
 
 
@@ -2802,18 +4053,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       sessions: allSessions as any[],
       currentTask,
       tasks,
-      cliStatuses,
-      degradationStrategy: {
-        level: 3,
-        availableCLIs: ['claude', 'codex', 'gemini'],
-        missingCLIs: [],
-        hasOrchestrator: true,
-        recommendation: '',
-        canProceed: true,
-        fallbackMap: {},
-      },
+      workerStatuses,  // ✅ 使用 workerStatuses
       pendingChanges: this.snapshotManager.getPendingChanges(),
-      isRunning, 
+      isRunning,
       logs: this.logs,
       interactionMode: this.intelligentOrchestrator.getInteractionMode(),
       orchestratorPhase: this.intelligentOrchestrator.phase,
@@ -2897,10 +4139,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         this.intelligentOrchestrator.interrupt();
       }
 
-      // 2. 清理 CLI 适配器（终止所有 CLI 进程）
-      if (this.cliFactory) {
-        logger.info('界面.销毁.CLI.清理', undefined, LogCategory.UI);
-        await this.cliFactory.dispose();
+      // 2. 清理适配器（关闭所有连接）
+      if (this.adapterFactory) {
+        logger.info('界面.销毁.适配器.清理', undefined, LogCategory.UI);
+        await this.adapterFactory.shutdown();
       }
 
       // 3. 移除事件监听器

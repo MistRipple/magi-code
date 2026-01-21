@@ -138,11 +138,19 @@ export class AssignmentManager {
       excludes.push(`涉及 ${weakness} 的任务（如必须，需额外审查）`);
     }
 
+    const targetPaths = this.extractTargetPaths(mission.userPrompt);
+
     return {
       includes,
       excludes,
-      targetPaths: [],
+      targetPaths,
     };
+  }
+
+  private extractTargetPaths(prompt: string): string[] {
+    const filePattern = /[\w\-./]+\.(ts|js|tsx|jsx|py|java|go|rs|cpp|c|css|scss|html|json|md|yaml|yml|txt)/gi;
+    const matches = prompt.match(filePattern);
+    return matches ? [...new Set(matches)] : [];
   }
 
   /**
@@ -255,8 +263,28 @@ export class AssignmentManager {
   ): string {
     const profile = this.profileLoader.getProfile(workerId);
     const primaryCategory = profile.preferences.preferredCategories[0] || 'general';
+    const parts: string[] = [
+      `作为 ${profile.displayName}，负责 ${primaryCategory} 相关工作。`,
+    ];
 
-    return `作为 ${profile.displayName}，负责 ${primaryCategory} 相关工作：${scope.includes.slice(0, 3).join('、')}`;
+    const goal = mission.goal || mission.userPrompt;
+    if (goal) {
+      parts.push(`目标: ${goal}`);
+    }
+
+    if (mission.userPrompt && mission.userPrompt !== goal) {
+      parts.push(`原始需求: ${mission.userPrompt}`);
+    }
+
+    if (scope.targetPaths && scope.targetPaths.length > 0) {
+      parts.push(`目标路径: ${scope.targetPaths.join(', ')}`);
+    }
+
+    if (scope.includes.length > 0) {
+      parts.push(`职责范围: ${scope.includes.slice(0, 5).join('、')}`);
+    }
+
+    return parts.join('\n');
   }
 
   /**

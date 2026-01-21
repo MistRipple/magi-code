@@ -1,10 +1,10 @@
 /**
- * 真实 CLI 编排端到端测试
- * - 使用真实 CLI + IntelligentOrchestrator
+ * 真实 LLM 编排端到端测试
+ * - 使用真实 LLM + IntelligentOrchestrator
  * - 记录消息流、重复内容、dispatchId
  */
 
-import { CLIAdapterFactory } from '../cli/adapter-factory';
+import { LLMAdapterFactory } from '../llm/adapter-factory';
 import { IntelligentOrchestrator } from '../orchestrator/intelligent-orchestrator';
 import { SnapshotManager } from '../snapshot-manager';
 import { UnifiedSessionManager } from '../session';
@@ -45,14 +45,18 @@ async function run() {
 
   const sessionManager = new UnifiedSessionManager(workspaceRoot);
   const snapshotManager = new SnapshotManager(sessionManager, workspaceRoot);
-  const cliFactory = new CLIAdapterFactory({ cwd: workspaceRoot });
+  const adapterFactory = new LLMAdapterFactory({ cwd: workspaceRoot });
+
+  // 初始化 adapter factory（加载 profile）
+  await adapterFactory.initialize();
+
   const session = sessionManager.getOrCreateCurrentSession();
   const repository = new SessionManagerTaskRepository(sessionManager, session.id);
   const taskManager = new UnifiedTaskManager(session.id, repository);
   await taskManager.initialize();
 
   const orchestrator = new IntelligentOrchestrator(
-    cliFactory,
+    adapterFactory,
     sessionManager,
     snapshotManager,
     workspaceRoot,
@@ -79,16 +83,20 @@ async function run() {
 
   await orchestrator.initialize();
 
-  const availability = await cliFactory.checkAllAvailability();
+  // TODO: LLM mode - check adapter connectivity instead of CLI availability
+  const availability = {
+    claude: adapterFactory.isConnected('claude'),
+    codex: adapterFactory.isConnected('codex'),
+    gemini: adapterFactory.isConnected('gemini'),
+  };
   const available = Object.entries(availability).filter(([, ok]) => ok).map(([k]) => k);
   if (available.length === 0) {
-    console.error('没有可用的 CLI，无法进行真实编排测试。');
-    process.exit(1);
+    console.log('适配器未连接，将在首次使用时连接。');
   }
 
-  console.log('=== 真实 CLI 编排 E2E ===');
+  console.log('=== 真实 LLM 编排 E2E ===');
   console.log(`用户输入: ${prompt}`);
-  console.log(`可用 CLI: ${available.join(', ')}`);
+  console.log(`可用适配器: ${available.length > 0 ? available.join(', ') : '将自动连接'}`);
   console.log('');
 
   const standardMessages: StandardMsg[] = [];
@@ -98,10 +106,10 @@ async function run() {
   const duplicates: Array<{ id?: string; content: string }> = [];
   const seenContent = new Set<string>();
 
-  cliFactory.on('standardMessage', (msg: StandardMsg) => {
+  adapterFactory.on('standardMessage', (msg: StandardMsg) => {
     standardMessages.push(msg);
   });
-  cliFactory.on('standardComplete', (msg: StandardMsg) => {
+  adapterFactory.on('standardComplete', (msg: StandardMsg) => {
     standardCompletes.push(msg);
     const content = extractTextFromBlocks(msg.blocks);
     const key = normalizeText(content);
@@ -141,7 +149,7 @@ async function run() {
   } finally {
     unsubUi();
     unsubStart();
-    await cliFactory.disconnectAll().catch(() => {});
+    await adapterFactory.shutdown().catch(() => {});
   }
 
   const duration = Date.now() - start;

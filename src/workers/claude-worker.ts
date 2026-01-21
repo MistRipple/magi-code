@@ -3,7 +3,7 @@
  * Claude CLI 执行器
  */
 
-import { CLIType, SubTask, WorkerResult, WorkerConfig } from '../types';
+import { AgentType, SubTask, WorkerResult, WorkerConfig } from '../types';  // ✅ 使用 AgentType
 import { BaseWorker } from './base-worker';
 
 /**
@@ -25,7 +25,7 @@ export class ClaudeWorker extends BaseWorker {
     this.claudeConfig = config;
   }
 
-  get cliType(): CLIType {
+  get agentType(): AgentType {  // ✅ 使用 agentType
     return 'claude';
   }
 
@@ -40,6 +40,7 @@ export class ClaudeWorker extends BaseWorker {
     if (subTask.targetFiles.length > 0) {
       for (const file of subTask.targetFiles) {
         args.push('--allowedTools', `Edit:${file}`);
+        args.push('--allowedTools', `Write:${file}`);
       }
     }
 
@@ -104,4 +105,3 @@ export function createClaudeWorker(
     workingDirectory,
   });
 }
-

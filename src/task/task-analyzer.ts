@@ -32,6 +32,10 @@ export interface TaskAnalysis {
   riskLevel?: RiskLevel;
   /** 推荐的 Worker（来自画像系统） */
   recommendedWorker?: CLIType;
+  /** 用户显式指定的 Worker */
+  explicitWorkers?: CLIType[];
+  /** 用户是否明确要求并行 */
+  wantsParallel?: boolean;
   /** 匹配的关键词 */
   matchedKeywords?: string[];
 }
@@ -118,6 +122,10 @@ export class TaskAnalyzer {
     // 建议执行模式
     const suggestedMode = this.suggestMode(targetFiles, splittable);
 
+    // 显式指定 Worker 与并行意图
+    const explicitWorkers = this.detectExplicitWorkers(lowerPrompt);
+    const wantsParallel = this.detectWantsParallel(lowerPrompt);
+
     // 从画像配置获取风险等级和推荐 Worker
     const riskLevel = categoryConfig?.riskLevel;
     const recommendedWorker = categoryConfig?.defaultWorker as CLIType | undefined;
@@ -134,6 +142,8 @@ export class TaskAnalyzer {
       riskLevel,
       recommendedWorker,
       matchedKeywords,
+      explicitWorkers,
+      wantsParallel,
     };
   }
 
@@ -319,5 +329,24 @@ export class TaskAnalyzer {
       return 'parallel';
     }
     return 'sequential';
+  }
+
+  private detectExplicitWorkers(promptLower: string): CLIType[] {
+    const workers: CLIType[] = [];
+    if (promptLower.includes('claude')) workers.push('claude');
+    if (promptLower.includes('codex')) workers.push('codex');
+    if (promptLower.includes('gemini')) workers.push('gemini');
+    return workers;
+  }
+
+  private detectWantsParallel(promptLower: string): boolean {
+    const parallelKeywords = [
+      '并行',
+      '并发',
+      '同时',
+      'parallel',
+      'concurrent',
+    ];
+    return parallelKeywords.some(k => promptLower.includes(k));
   }
 }

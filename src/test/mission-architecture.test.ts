@@ -35,7 +35,7 @@ async function runTests(): Promise<void> {
   const results: TestResult[] = [];
 
   // 初始化依赖
-  const profileLoader = new ProfileLoader();
+  const profileLoader = ProfileLoader.getInstance();
   const guidanceInjector = new GuidanceInjector();
   const storage = new MissionStorageManager();
   const orchestrator = new MissionOrchestrator(profileLoader, guidanceInjector, storage);

@@ -10,6 +10,8 @@
 
 import { EventEmitter } from 'events';
 import { CLIType } from '../../types';
+import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
+import { TokenUsage } from '../../types/agent-types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
 import { ProfileAwareReviewer } from '../review/profile-aware-reviewer';
@@ -21,6 +23,9 @@ import {
   WorkerTodo,
 } from '../mission';
 import { MissionOrchestrator } from './mission-orchestrator';
+import { SnapshotManager } from '../../snapshot-manager';
+import { UnifiedTaskManager } from '../../task/unified-task-manager';
+import { logger, LogCategory } from '../../logging';
 
 /**
  * 阻塞项类型
@@ -83,6 +88,8 @@ export interface ExecutionOptions {
   blockingTimeout?: number;
   /** 阻塞检查间隔（毫秒） */
   blockingCheckInterval?: number;
+  /** 外部 Task ID（用于同步 SubTask） */
+  taskId?: string;
   /** 输出回调 */
   onOutput?: (workerId: CLIType, output: string) => void;
   /** 进度回调 */
@@ -91,6 +98,8 @@ export interface ExecutionOptions {
   onBlocked?: (blockedItem: BlockedItem) => void;
   /** 解除阻塞回调 */
   onUnblocked?: (blockedItem: BlockedItem) => void;
+  /** 执行后端选择 */
+  executionMode?: 'base' | 'adapter';
 }
 
 /**
@@ -123,6 +132,8 @@ export interface ExecutionResult {
   resolvedBlockings: BlockedItem[];
   errors: string[];
   duration: number;
+  /** 聚合的 Token 使用统计 */
+  tokenUsage?: TokenUsage;
 }
 
 /**
@@ -134,6 +145,11 @@ export class MissionExecutor extends EventEmitter {
   private blockedItems: Map<string, BlockedItem> = new Map();
   private resolvedBlockings: BlockedItem[] = [];
   private blockingIdCounter = 0;
+  private snapshotManager: SnapshotManager | null = null;
+  private taskManager: UnifiedTaskManager | null = null;
+  private workspaceRoot: string = '';
+  private adapterFactory: IAdapterFactory | null = null;
+  private contextManager: import('../../context/context-manager').ContextManager | null = null;
 
   constructor(
     private orchestrator: MissionOrchestrator,
@@ -142,6 +158,41 @@ export class MissionExecutor extends EventEmitter {
   ) {
     super();
     this.reviewer = new ProfileAwareReviewer(profileLoader);
+  }
+
+  /**
+   * 设置快照管理器
+   */
+  setSnapshotManager(snapshotManager: SnapshotManager): void {
+    this.snapshotManager = snapshotManager;
+  }
+
+  /**
+   * 设置任务管理器
+   */
+  setTaskManager(taskManager: UnifiedTaskManager): void {
+    this.taskManager = taskManager;
+  }
+
+  /**
+   * 设置工作目录
+   */
+  setWorkspaceRoot(workspaceRoot: string): void {
+    this.workspaceRoot = workspaceRoot;
+  }
+
+  /**
+   * 设置适配器工厂（用于真实执行）
+   */
+  setAdapterFactory(adapterFactory: IAdapterFactory): void {
+    this.adapterFactory = adapterFactory;
+  }
+
+  /**
+   * 设置上下文管理器
+   */
+  setContextManager(contextManager: import('../../context/context-manager').ContextManager): void {
+    this.contextManager = contextManager;
   }
 
   /**
@@ -191,6 +242,12 @@ export class MissionExecutor extends EventEmitter {
     mission: Mission,
     options: ExecutionOptions
   ): Promise<ExecutionResult> {
+    const executionMode = options.executionMode
+      ?? (this.adapterFactory ? 'adapter' : 'base');
+    const effectiveOptions: ExecutionOptions = { ...options, executionMode };
+    if (executionMode === 'adapter' && !this.adapterFactory) {
+      throw new Error('未配置 CLIAdapterFactory，无法使用流式执行模式');
+    }
     const startTime = Date.now();
     const assignmentResults = new Map<string, AutonomousExecutionResult>();
     const contractVerifications = new Map<string, boolean>();
@@ -202,23 +259,39 @@ export class MissionExecutor extends EventEmitter {
     this.emit('executionStarted', { missionId: mission.id });
 
     // 报告初始进度
-    this.reportProgress(mission, 'planning', assignmentResults, options.onProgress);
+    this.reportProgress(mission, 'planning', assignmentResults, effectiveOptions.onProgress);
+
+    // ✅ 将 Assignments 添加到 ContextManager
+    if (this.contextManager) {
+      for (const assignment of mission.assignments) {
+        this.contextManager.addTask({
+          id: assignment.id,
+          description: assignment.responsibility,
+          status: 'pending',
+          assignedWorker: assignment.workerId,
+        });
+      }
+      await this.contextManager.saveMemory();
+    }
+
+    // 同步 Assignment 到 TaskManager 作为 SubTask
+    await this.syncAssignmentsToSubTasks(mission, effectiveOptions.taskId);
 
     try {
       // 1. Worker 规划阶段
-      await this.planningPhase(mission, options);
+      await this.planningPhase(mission, effectiveOptions);
 
       // 2. 执行阶段
-      this.reportProgress(mission, 'executing', assignmentResults, options.onProgress);
+      this.reportProgress(mission, 'executing', assignmentResults, effectiveOptions.onProgress);
 
-      if (options.parallel) {
-        await this.executeParallel(mission, options, assignmentResults, errors);
+      if (effectiveOptions.parallel) {
+        await this.executeParallel(mission, effectiveOptions, assignmentResults, errors);
       } else {
-        await this.executeSequential(mission, options, assignmentResults, errors);
+        await this.executeSequential(mission, effectiveOptions, assignmentResults, errors);
       }
 
       // 3. 评审阶段
-      this.reportProgress(mission, 'reviewing', assignmentResults, options.onProgress);
+      this.reportProgress(mission, 'reviewing', assignmentResults, effectiveOptions.onProgress);
       await this.reviewPhase(mission, assignmentResults);
 
       // 4. 契约验证
@@ -236,6 +309,19 @@ export class MissionExecutor extends EventEmitter {
 
       this.reportProgress(mission, 'completed', assignmentResults, options.onProgress);
 
+      // 聚合所有 Assignment 的 Token 统计
+      const totalTokenUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
+      for (const assignmentResult of assignmentResults.values()) {
+        if (assignmentResult.tokenUsage) {
+          totalTokenUsage.inputTokens += assignmentResult.tokenUsage.inputTokens || 0;
+          totalTokenUsage.outputTokens += assignmentResult.tokenUsage.outputTokens || 0;
+          if (assignmentResult.tokenUsage.cacheReadTokens) {
+            totalTokenUsage.cacheReadTokens = (totalTokenUsage.cacheReadTokens || 0) +
+              assignmentResult.tokenUsage.cacheReadTokens;
+          }
+        }
+      }
+
       const result: ExecutionResult = {
         mission,
         success,
@@ -245,6 +331,7 @@ export class MissionExecutor extends EventEmitter {
         resolvedBlockings: this.getResolvedBlockings(),
         errors,
         duration: Date.now() - startTime,
+        tokenUsage: totalTokenUsage,
       };
 
       this.emit('executionCompleted', result);
@@ -297,14 +384,28 @@ export class MissionExecutor extends EventEmitter {
     mission: Mission,
     options: ExecutionOptions
   ): Promise<void> {
+    // 生成 contextSnapshot（如果有 ContextManager）
+    const contextSnapshot = this.contextManager?.getContextSlice({
+      maxTokens: 4000,
+      memoryRatio: 0.4,
+      memorySummary: {
+        includeCurrentTasks: true,
+        includeKeyDecisions: 3,
+        includeCodeChanges: 5,
+      },
+    });
+
     const planningPromises = mission.assignments.map(async (assignment) => {
       const worker = this.workers.get(assignment.workerId);
       if (!worker) {
         throw new Error(`Worker not found: ${assignment.workerId}`);
       }
 
-      // Worker 自主规划
-      const planResult = await worker.planAssignment(assignment, options.projectContext);
+      // Worker 自主规划（传递动态上下文）
+      const planResult = await worker.planAssignment(assignment, {
+        projectContext: options.projectContext,
+        contextSnapshot,
+      });
 
       // 更新 Assignment 的 todos
       assignment.todos = planResult.todos;
@@ -332,14 +433,28 @@ export class MissionExecutor extends EventEmitter {
     mission: Mission,
     options: ExecutionOptions
   ): Promise<void> {
+    // 生成 contextSnapshot（如果有 ContextManager）
+    const contextSnapshot = this.contextManager?.getContextSlice({
+      maxTokens: 4000,
+      memoryRatio: 0.4,
+      memorySummary: {
+        includeCurrentTasks: true,
+        includeKeyDecisions: 3,
+        includeCodeChanges: 5,
+      },
+    });
+
     for (const assignment of mission.assignments) {
       const worker = this.workers.get(assignment.workerId);
       if (!worker) {
         throw new Error(`Worker not found: ${assignment.workerId}`);
       }
 
-      // Worker 自主规划
-      const planResult = await worker.planAssignment(assignment, options.projectContext);
+      // Worker 自主规划（传递动态上下文）
+      const planResult = await worker.planAssignment(assignment, {
+        projectContext: options.projectContext,
+        contextSnapshot,
+      });
 
       // 更新 Assignment 的 todos
       assignment.todos = planResult.todos;
@@ -452,20 +567,51 @@ export class MissionExecutor extends EventEmitter {
     assignment.status = 'executing';
     assignment.startedAt = Date.now();
 
+    // 创建快照 - 在执行前为目标文件创建快照
+    await this.createSnapshotsForAssignment(assignment, mission);
+
+    // 同步 SubTask 状态为 running
+    await this.updateSubTaskStatus(mission, assignment, 'running');
+
     this.emit('assignmentStarted', {
       missionId: mission.id,
       assignmentId: assignment.id,
       workerId: assignment.workerId,
     });
 
+    // 生成 contextSnapshot（如果有 ContextManager）
+    const contextSnapshot = this.contextManager
+      ? this.contextManager.getContext(6000)
+      : undefined;
+
     const result = await worker.executeAssignment(assignment, {
       workingDirectory: options.workingDirectory,
       timeout: options.timeout,
       projectContext: options.projectContext,
+      adapterFactory: options.executionMode === 'adapter' ? this.adapterFactory || undefined : undefined,
+      adapterScope: options.executionMode === 'adapter' ? {
+        source: 'worker',
+        streamToUI: true,
+        adapterRole: 'worker',
+        messageMeta: {
+          taskId: mission.id,
+          subTaskId: assignment.id,
+          contextSnapshot,
+          taskContext: {
+            goal: assignment.responsibility,
+            targetFiles: assignment.scope?.targetPaths,
+            dependencies: assignment.consumerContracts, // 使用 consumerContracts 作为依赖
+            constraints: assignment.scope?.excludes, // 使用 excludes 作为约束
+          },
+        },
+      } : undefined,
       onOutput: (output) => {
         options.onOutput?.(assignment.workerId, output);
       },
     });
+
+    // 更新契约状态（执行期解锁消费者任务）
+    this.updateContractsFromAssignment(mission, assignment);
 
     // 执行完成后，检查并解除可能因此满足的阻塞
     this.checkAndResolveBlockings(mission);
@@ -474,6 +620,69 @@ export class MissionExecutor extends EventEmitter {
     assignment.completedAt = Date.now();
     assignment.progress = 100;
 
+    // ✅ 自动更新到 ContextManager
+    if (this.contextManager) {
+      if (result.success) {
+        // 更新任务状态为完成
+        this.contextManager.updateTaskStatus(
+          assignment.id,
+          'completed',
+          `完成 ${result.completedTodos.length} 个 Todo`
+        );
+
+        // 添加代码变更记录
+        const modifiedFiles = new Set<string>();
+        for (const todo of result.completedTodos) {
+          if (todo.output?.modifiedFiles) {
+            for (const file of todo.output.modifiedFiles) {
+              modifiedFiles.add(file);
+            }
+          }
+        }
+
+        // 为每个修改的文件添加变更记录
+        for (const file of modifiedFiles) {
+          this.contextManager.addCodeChange(
+            file,
+            'modify',
+            `${assignment.workerId} 完成: ${assignment.responsibility}`
+          );
+        }
+
+        // 如果有动态添加的 Todo，记录为重要上下文
+        if (result.dynamicTodos.length > 0) {
+          this.contextManager.addImportantContext(
+            `${assignment.workerId} 动态添加了 ${result.dynamicTodos.length} 个 Todo`
+          );
+        }
+      } else {
+        // 更新任务状态为失败
+        this.contextManager.updateTaskStatus(
+          assignment.id,
+          'failed',
+          result.errors.join('; ')
+        );
+
+        // 添加待解决问题
+        if (result.errors.length > 0) {
+          this.contextManager.addPendingIssue(
+            `${assignment.workerId} 执行失败: ${result.errors[0]}`
+          );
+        }
+      }
+
+      // 保存 Memory
+      await this.contextManager.saveMemory();
+    }
+
+    // 同步 SubTask 状态
+    await this.updateSubTaskStatus(
+      mission,
+      assignment,
+      result.success ? 'completed' : 'failed',
+      result.success ? undefined : result.errors.join('; ')
+    );
+
     this.emit('assignmentCompleted', {
       missionId: mission.id,
       assignmentId: assignment.id,
@@ -481,6 +690,191 @@ export class MissionExecutor extends EventEmitter {
     });
 
     return result;
+  }
+
+  private updateContractsFromAssignment(mission: Mission, assignment: Assignment): void {
+    const producedContracts = new Set<string>();
+    for (const todo of assignment.todos) {
+      if (todo.status !== 'completed') continue;
+      for (const contractId of todo.producesContracts || []) {
+        producedContracts.add(contractId);
+      }
+    }
+
+    if (producedContracts.size === 0) return;
+
+    for (const contractId of producedContracts) {
+      const contract = mission.contracts.find(c => c.id === contractId);
+      if (!contract) continue;
+      if (contract.status === 'implemented' || contract.status === 'verified') {
+        continue;
+      }
+      contract.status = 'implemented';
+    }
+  }
+
+  /**
+   * 为 Assignment 创建快照
+   * 注意：此方法在执行前调用，只能使用 scope.includes 作为目标文件来源
+   */
+  private async createSnapshotsForAssignment(
+    assignment: Assignment,
+    mission: Mission
+  ): Promise<void> {
+    if (!this.snapshotManager) {
+      logger.warn('执行器.快照.未配置', { assignmentId: assignment.id }, LogCategory.ORCHESTRATOR);
+      return;
+    }
+
+    // 收集所有目标文件
+    const targetFiles = new Set(this.collectTargetFiles(assignment));
+    if (targetFiles.size > 0) {
+      this.snapshotManager.clearSnapshotsForFiles([...targetFiles], assignment.id);
+    }
+
+    if (targetFiles.size === 0) {
+      logger.debug('执行器.快照.无目标文件', { assignmentId: assignment.id }, LogCategory.ORCHESTRATOR);
+      return;
+    }
+
+    // 为每个目标文件创建快照
+    const priority = 5; // 默认优先级
+    for (const filePath of targetFiles) {
+      try {
+        this.snapshotManager.createSnapshot(
+          filePath,
+          assignment.workerId,
+          assignment.id,
+          priority
+        );
+        logger.debug('执行器.快照.创建', {
+          filePath,
+          assignmentId: assignment.id,
+          workerId: assignment.workerId,
+        }, LogCategory.ORCHESTRATOR);
+      } catch (error) {
+        // 快照创建失败不阻止执行，但记录警告
+        logger.warn('执行器.快照.创建_失败', {
+          filePath,
+          assignmentId: assignment.id,
+          error: error instanceof Error ? error.message : String(error),
+        }, LogCategory.ORCHESTRATOR);
+      }
+    }
+  }
+
+  /**
+   * 同步 Assignment 到 TaskManager 作为 SubTask
+   */
+  private async syncAssignmentsToSubTasks(mission: Mission, externalTaskId?: string): Promise<void> {
+    if (!this.taskManager) {
+      logger.debug('执行器.任务管理器.未配置', { missionId: mission.id }, LogCategory.ORCHESTRATOR);
+      return;
+    }
+
+    // 优先使用外部传入的 taskId，否则使用 missionId
+    const taskId = externalTaskId || mission.id;
+
+    // 保存 taskId 到 mission 以供后续使用
+    mission.externalTaskId = taskId;
+
+    for (const assignment of mission.assignments) {
+      try {
+        // 收集目标文件（从 scope 中获取）
+        const targetFiles = this.collectTargetFiles(assignment);
+
+        // 创建 SubTask（包含 assignmentId 用于稳定匹配）
+        await this.taskManager.createSubTask(taskId, {
+          description: assignment.responsibility,
+          assignedWorker: assignment.workerId,
+          assignmentId: assignment.id,
+          targetFiles,
+          priority: 5,
+          reason: assignment.assignmentReason?.explanation,
+          prompt: assignment.guidancePrompt,
+        });
+
+        logger.debug('执行器.子任务.创建', {
+          taskId,
+          missionId: mission.id,
+          assignmentId: assignment.id,
+          workerId: assignment.workerId,
+        }, LogCategory.ORCHESTRATOR);
+      } catch (error) {
+        // 创建 SubTask 失败不阻止执行，但记录警告
+        logger.warn('执行器.子任务.创建_失败', {
+          taskId,
+          missionId: mission.id,
+          assignmentId: assignment.id,
+          error: error instanceof Error ? error.message : String(error),
+        }, LogCategory.ORCHESTRATOR);
+      }
+    }
+  }
+
+  private collectTargetFiles(assignment: Assignment): string[] {
+    const filePattern = /[\w\-./]+\.(ts|js|tsx|jsx|py|java|go|rs|cpp|c|css|scss|html|json|md|yaml|yml|txt)/i;
+    const candidates = [
+      ...(assignment.scope?.targetPaths || []),
+      ...(assignment.scope?.includes || []),
+    ];
+    const filtered = candidates.filter((item) => filePattern.test(item));
+    return [...new Set(filtered)];
+  }
+
+  /**
+   * 更新 SubTask 状态
+   * 使用 assignmentId 进行稳定匹配（替代不稳定的 description 匹配）
+   */
+  private async updateSubTaskStatus(
+    mission: Mission,
+    assignment: Assignment,
+    status: 'running' | 'completed' | 'failed',
+    error?: string
+  ): Promise<void> {
+    if (!this.taskManager) return;
+
+    // 使用 Mission 的 externalTaskId
+    const taskId = mission.externalTaskId || mission.id;
+
+    try {
+      // 使用 assignmentId 进行稳定匹配（替代不稳定的 description 匹配）
+      const subTask = await this.taskManager.getSubTaskByAssignmentId(taskId, assignment.id);
+      if (!subTask) {
+        logger.warn('执行器.子任务状态.未找到', {
+          taskId,
+          assignmentId: assignment.id,
+          status,
+        }, LogCategory.ORCHESTRATOR);
+        return;
+      }
+
+      switch (status) {
+        case 'running':
+          await this.taskManager.startSubTask(taskId, subTask.id);
+          break;
+        case 'completed':
+          await this.taskManager.completeSubTask(taskId, subTask.id, {
+            agentType: assignment.workerId,  // ✅ 使用 agentType
+            success: true,
+            output: 'Assignment completed',
+            duration: assignment.completedAt && assignment.startedAt
+              ? assignment.completedAt - assignment.startedAt
+              : 0,
+            timestamp: new Date(),
+          });
+          break;
+        case 'failed':
+          await this.taskManager.failSubTask(taskId, subTask.id, error || 'Unknown error');
+          break;
+      }
+    } catch (err) {
+      logger.warn('执行器.子任务状态.更新_失败', {
+        assignmentId: assignment.id,
+        status,
+        error: err instanceof Error ? err.message : String(err),
+      }, LogCategory.ORCHESTRATOR);
+    }
   }
 
   /**

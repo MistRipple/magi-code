@@ -4,9 +4,9 @@
  */
 
 import { EventEmitter } from 'events';
-import { CLIType } from '../types';
-import { CLIAdapterFactory } from '../cli/adapter-factory';
-import { CLIResponse } from '../cli/types';
+import { CLIType, WorkerSlot } from '../types';
+import { IAdapterFactory } from '../adapters/adapter-factory-interface';
+import { AdapterResponse } from '../adapters/adapter-factory-interface';
 import { SubTaskDef, SplitResult } from './task-splitter';
 
 /** 执行状态 */
@@ -17,7 +17,7 @@ export interface SubTaskResult {
   subTaskId: string;
   cli: CLIType;
   status: ExecutionStatus;
-  response?: CLIResponse;
+  response?: AdapterResponse;
   error?: string;
   startTime: number;
   endTime?: number;
@@ -50,7 +50,7 @@ const DEFAULT_CONFIG: SchedulerConfig = {
  * 执行调度器类
  */
 export class ExecutionScheduler extends EventEmitter {
-  private factory: CLIAdapterFactory;
+  private factory: IAdapterFactory;
   private config: SchedulerConfig;
   private queue: SubTaskDef[] = [];
   private running: Map<string, SubTaskDef> = new Map();
@@ -58,7 +58,7 @@ export class ExecutionScheduler extends EventEmitter {
   private isRunning = false;
   private isCancelled = false;
 
-  constructor(factory: CLIAdapterFactory, config?: Partial<SchedulerConfig>) {
+  constructor(factory: IAdapterFactory, config?: Partial<SchedulerConfig>) {
     super();
     this.factory = factory;
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -202,7 +202,7 @@ export class ExecutionScheduler extends EventEmitter {
   /**
    * 带超时的执行
    */
-  private async executeWithTimeout(task: SubTaskDef): Promise<CLIResponse> {
+  private async executeWithTimeout(task: SubTaskDef): Promise<AdapterResponse> {
     return new Promise((resolve, reject) => {
       const timeoutId = setTimeout(() => {
         reject(new Error(`任务执行超时 (${this.config.timeout}ms)`));
@@ -256,7 +256,11 @@ export class ExecutionScheduler extends EventEmitter {
   /** 取消执行 */
   cancel(): void {
     this.isCancelled = true;
-    this.factory.interruptAll();
+    // 中断所有 worker
+    const workers: WorkerSlot[] = ["claude", "codex", "gemini"];
+    for (const worker of workers) {
+      this.factory.interrupt(worker).catch(() => {});
+    }
     // 标记所有运行中的任务为取消状态
     for (const [id, task] of this.running) {
       const result = this.results.get(id);

@@ -15,11 +15,11 @@
       --font-size-1: 11px; --font-size-2: 12px; --font-size-3: 13px;
       --transition-fast: 0.1s ease; --transition-normal: 0.15s ease;
 
-      /* 统一颜色系统 - 角色颜色 */
-      --color-orchestrator: #8b5cf6;
-      --color-orchestrator-bg: rgba(139, 92, 246, 0.1);
-      --color-claude: #c96442;
-      --color-claude-bg: rgba(201, 100, 66, 0.1);
+      /* 统一颜色系统 - 角色颜色 (按设计规范) */
+      --color-orchestrator: #d97706;
+      --color-orchestrator-bg: rgba(217, 119, 6, 0.1);
+      --color-claude: #d97706;
+      --color-claude-bg: rgba(217, 119, 6, 0.1);
       --color-codex: #10a37f;
       --color-codex-bg: rgba(16, 163, 127, 0.1);
       --color-gemini: #4285f4;
@@ -311,13 +311,27 @@
     .subtask-cli { font-size: var(--font-size-1); padding: 2px 6px; border-radius: var(--radius-1); background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); text-transform: uppercase; }
     .subtask-desc { flex: 1; font-size: var(--font-size-2); }
 
+    /* 任务分配卡片 - Worker 面板专用（来自编排者的任务） */
+    .task-assignment-card { margin-bottom: var(--spacing-3); }
+    .task-assignment-card .card-header { background: var(--color-orchestrator-bg); }
+    .task-assignment-content { display: flex; flex-direction: column; gap: var(--spacing-2); }
+    .task-field { display: flex; flex-direction: column; gap: var(--spacing-1); }
+    .task-field-label { font-size: var(--font-size-1); font-weight: 500; color: var(--vscode-descriptionForeground); }
+    .task-field-value { font-size: var(--font-size-2); color: var(--vscode-foreground); line-height: 1.5; }
+    .task-file-list { margin: 0; padding-left: var(--spacing-4); list-style: none; }
+    .task-file-list li { margin: var(--spacing-1) 0; font-size: var(--font-size-2); }
+    .task-file-list li::before { content: "•"; margin-right: var(--spacing-2); color: var(--vscode-descriptionForeground); }
+    .task-file-list code { font-family: var(--vscode-editor-font-family); font-size: 11px; padding: 1px 4px; background: var(--vscode-textCodeBlock-background); border-radius: 3px; }
+    .task-field.task-reason { padding-top: var(--spacing-2); border-top: 1px solid var(--vscode-panel-border); }
+    .task-field.task-reason .task-field-value { font-style: italic; color: var(--vscode-descriptionForeground); }
+
     /* 任务进度条 */
     .task-progress-container { margin: 8px 0; }
     .task-progress-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
     .task-progress-label { font-size: 11px; color: var(--vscode-descriptionForeground); }
     .task-progress-percent { font-size: 11px; font-weight: 500; color: var(--vscode-foreground); }
     .task-progress-bar { height: 6px; background: var(--vscode-progressBar-background, rgba(255,255,255,0.1)); border-radius: 3px; overflow: hidden; }
-    .task-progress-fill { height: 100%; border-radius: 3px; transition: width 0.3s ease; background: linear-gradient(90deg, #3b82f6, #8b5cf6); }
+    .task-progress-fill { height: 100%; border-radius: 3px; transition: width 0.3s ease; background: linear-gradient(90deg, #3b82f6, #d97706); }
     .task-progress-fill.completed { background: linear-gradient(90deg, #22c55e, #10b981); }
     .task-progress-fill.failed { background: linear-gradient(90deg, #ef4444, #dc2626); }
 
@@ -343,9 +357,9 @@
     .subtask-status-icon.skipped { color: #888; opacity: 0.6; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
     .subtask-status-cli { font-size: 10px; padding: 2px 6px; border-radius: var(--radius-1); text-transform: uppercase; font-weight: 500; }
-    .subtask-status-cli.claude { background: rgba(139, 92, 246, 0.15); color: #a78bfa; }
-    .subtask-status-cli.codex { background: rgba(34, 197, 94, 0.15); color: #4ade80; }
-    .subtask-status-cli.gemini { background: rgba(59, 130, 246, 0.15); color: #60a5fa; }
+    .subtask-status-cli.claude { background: rgba(217, 119, 6, 0.15); color: var(--color-claude); }
+    .subtask-status-cli.codex { background: rgba(16, 163, 127, 0.15); color: var(--color-codex); }
+    .subtask-status-cli.gemini { background: rgba(66, 133, 244, 0.15); color: var(--color-gemini); }
     .subtask-status-desc { flex: 1; font-size: 12px; color: var(--vscode-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .subtask-status-time { font-size: 10px; color: var(--vscode-descriptionForeground); flex-shrink: 0; }
 
@@ -357,6 +371,16 @@
     .plan-confirm-btn.confirm:hover { background: var(--vscode-button-hoverBackground); }
     .plan-confirm-btn.cancel { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
     .plan-confirm-btn.cancel:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+
+    /* 🔧 结构化规划内容样式 */
+    .structured-plan-content { padding: var(--spacing-2) 0; }
+    .structured-plan-content .plan-section { margin-bottom: var(--spacing-3); }
+    .structured-plan-content .plan-section:last-child { margin-bottom: 0; }
+    .structured-plan-content .plan-section-title { font-weight: 600; font-size: var(--font-size-2); color: var(--vscode-foreground); margin-bottom: var(--spacing-1); display: flex; align-items: center; gap: 6px; }
+    .structured-plan-content .plan-section-content { font-size: var(--font-size-2); color: var(--vscode-foreground); opacity: 0.9; line-height: 1.5; padding-left: 24px; }
+    .structured-plan-content .plan-list { margin: 0; padding-left: 40px; list-style-type: disc; }
+    .structured-plan-content .plan-list li { font-size: var(--font-size-2); color: var(--vscode-foreground); opacity: 0.9; line-height: 1.6; margin-bottom: 4px; }
+    .structured-plan-content .plan-list.risk-list li { color: var(--vscode-editorWarning-foreground); }
 
     /* 问题卡片内容 */
     .question-list { margin: 0; padding-left: 16px; color: var(--vscode-foreground); }
@@ -433,12 +457,21 @@
 
     /* Worker 状态卡片内容 */
     .worker-status-list { display: grid; gap: var(--spacing-2); }
-    .worker-status-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius-2); background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.04); }
-    .worker-status-item .task-cli { font-size: var(--font-size-1); padding: 2px 6px; border-radius: var(--radius-1); text-transform: uppercase; }
-    .worker-status-item .task-cli.claude { background: rgba(201, 100, 66, 0.15); color: var(--color-claude); }
+    .worker-status-item { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: var(--radius-2); background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.04); }
+    .worker-status-row { display: flex; align-items: center; gap: 8px; }
+    .worker-status-item .task-cli { font-size: var(--font-size-1); padding: 2px 6px; border-radius: var(--radius-1); text-transform: uppercase; flex-shrink: 0; }
+    .worker-status-item .task-cli.claude { background: rgba(217, 119, 6, 0.15); color: var(--color-claude); }
     .worker-status-item .task-cli.codex { background: rgba(16, 163, 127, 0.15); color: var(--color-codex); }
     .worker-status-item .task-cli.gemini { background: rgba(66, 133, 244, 0.15); color: var(--color-gemini); }
-    .worker-status-item .task-desc { flex: 1; font-size: var(--font-size-2); color: var(--vscode-foreground); }
+    .worker-status-item .task-desc { flex: 1; font-size: var(--font-size-2); color: var(--vscode-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .worker-status-item .task-current { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); font-style: italic; }
+    .worker-status-progress { display: flex; align-items: center; gap: 8px; }
+    .worker-status-progress-bar { flex: 1; height: 4px; background: var(--vscode-panel-border); border-radius: 2px; overflow: hidden; }
+    .worker-status-progress-fill { height: 100%; background: var(--color-info); border-radius: 2px; transition: width 0.3s ease; }
+    .worker-status-progress-fill.completed { background: var(--color-success); }
+    .worker-status-progress-fill.failed { background: var(--color-error); }
+    .worker-status-progress-text { font-size: 10px; color: var(--vscode-descriptionForeground); min-width: 40px; text-align: right; }
+    .worker-status-time { font-size: 10px; color: var(--vscode-descriptionForeground); }
 
     /* 依赖分析面板 */
     .dependency-panel { margin: var(--spacing-3); margin-top: var(--spacing-2); background: var(--vscode-editor-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); overflow: hidden; }
@@ -706,11 +739,11 @@
       color: var(--vscode-button-foreground);
     }
     .message-role-badge.assistant {
-      background: var(--color-orchestrator, #6366f1);
+      background: var(--color-orchestrator, #d97706);
       color: white;
     }
     .message-role-badge.orchestrator {
-      background: var(--color-orchestrator, #6366f1);
+      background: var(--color-orchestrator, #d97706);
       color: white;
     }
     .message-role-badge.worker {
@@ -742,10 +775,10 @@
       font-weight: 500; text-transform: uppercase;
     }
     .message-source-tag.orchestrator {
-      background: rgba(99, 102, 241, 0.2); color: #6366f1;
+      background: rgba(217, 119, 6, 0.2); color: var(--color-orchestrator);
     }
     .message-source-tag.worker {
-      background: rgba(16, 185, 129, 0.2); color: #10b981;
+      background: rgba(16, 163, 127, 0.2); color: var(--color-codex);
     }
     .message-source-tag.system {
       background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
@@ -1149,6 +1182,90 @@
       padding: 0;
     }
 
+    /* 代码块头部操作区 */
+    .code-header-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .code-line-count {
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+    }
+    .code-copy-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      border: none;
+      background: transparent;
+      color: var(--vscode-descriptionForeground);
+      cursor: pointer;
+      border-radius: 4px;
+      transition: all 0.15s ease;
+    }
+    .code-copy-btn:hover {
+      background: var(--vscode-toolbar-hoverBackground);
+      color: var(--vscode-foreground);
+    }
+    .code-copy-btn.copied {
+      color: var(--color-success);
+    }
+    .code-copy-btn svg {
+      width: 14px;
+      height: 14px;
+      fill: currentColor;
+    }
+
+    /* 代码块折叠模式 */
+    .collapsible-code .markdown-code-preview {
+      display: flex;
+      overflow: hidden;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 12px;
+      line-height: 1.5;
+      background: var(--vscode-editor-background);
+    }
+    .collapsible-code .markdown-code-full {
+      display: flex;
+      overflow: auto;
+      max-height: 600px;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 12px;
+      line-height: 1.5;
+      background: var(--vscode-editor-background);
+    }
+    .code-expand-bar {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 6px 12px;
+      background: var(--vscode-sideBar-background);
+      border-top: 1px solid var(--vscode-panel-border);
+      color: var(--vscode-textLink-foreground);
+      cursor: pointer;
+      font-size: 11px;
+      transition: background 0.15s ease;
+    }
+    .code-expand-bar:hover {
+      background: var(--vscode-list-hoverBackground);
+    }
+    .code-expand-bar svg {
+      width: 12px;
+      height: 12px;
+      fill: currentColor;
+    }
+    .code-expand-hint {
+      font-size: 11px;
+    }
+    .collapsible-code.expanded .code-expand-bar {
+      display: none;
+    }
+
     /* highlight.js 语法高亮样式 - VSCode Dark+ 主题风格 */
     .hljs { background: transparent !important; }
     .hljs-keyword { color: var(--vscode-symbolIcon-keywordForeground, #c586c0); }
@@ -1361,14 +1478,27 @@
       transition: transform 0.2s ease;
       color: var(--vscode-descriptionForeground);
       flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
     }
-    .collapsible-icon svg { width: 12px; height: 12px; fill: currentColor; }
+    .collapsible-icon svg { width: 12px; height: 12px; fill: currentColor; display: block; }
     .collapsible-icon.expanded { transform: rotate(90deg); }
     .collapsible-title {
       font-size: 11px; font-weight: 500;
       color: var(--vscode-descriptionForeground);
       flex: 1;
       display: flex; align-items: center; gap: 6px;
+    }
+    /* 思考过程折叠时的摘要显示 */
+    .collapsible-summary {
+      flex: 1;
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-style: italic;
+      opacity: 0.8;
+      margin-left: 8px;
     }
     .collapsible-title svg { width: 12px; height: 12px; opacity: 0.7; fill: currentColor; }
     .collapsible-badge {
@@ -1439,6 +1569,8 @@
     .collapsible-panel.code-panel .collapsible-title svg { fill: var(--vscode-symbolIcon-classForeground, #ee9d28); }
     .collapsible-panel.code-panel .collapsible-body { padding: 0; }
     .collapsible-panel.code-panel .collapsible-body .markdown-code-block { margin: 0; border: none; border-radius: 0; }
+    /* 🔧 修复：隐藏折叠面板内的代码块内部标题（避免双重标题） */
+    .collapsible-panel.code-panel .collapsible-body .markdown-code-header { display: none; }
     .tool-track { margin-top: 2px; display: flex; flex-direction: column; gap: 4px; width: 100%; }
     .tool-item { width: 100%; box-sizing: border-box; }
     .tool-item.collapsible-panel { margin: 0; }
@@ -1450,22 +1582,103 @@
     .tool-status.completed { background: rgba(16,185,129,0.15); color: #10b981; }
     .tool-status.failed { background: rgba(239,68,68,0.15); color: #ef4444; }
     .collapsible-body.tool-body { white-space: pre-wrap; }
-    .tool-raw {
-      margin: 0;
-      padding: 10px 12px;
-      background: var(--vscode-editor-background);
+    /* 工具调用截图风格面板 - 类似终端输出 */
+    .tool-snapshot {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
       border: 1px solid var(--vscode-panel-border);
       border-radius: var(--radius-2);
+      overflow: hidden;
+      background: var(--vscode-editor-background);
+    }
+    .tool-snapshot-section {
+      display: flex;
+      flex-direction: column;
+    }
+    .tool-snapshot-section + .tool-snapshot-section {
+      border-top: 1px solid var(--vscode-panel-border);
+    }
+    .tool-snapshot-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      background: var(--vscode-sideBar-background);
+      border-bottom: 1px solid var(--vscode-panel-border);
+    }
+    .tool-snapshot-label {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      padding: 2px 6px;
+      border-radius: 3px;
+    }
+    .tool-snapshot-label.in {
+      background: rgba(59, 130, 246, 0.15);
+      color: var(--color-info);
+    }
+    .tool-snapshot-label.out {
+      background: rgba(34, 197, 94, 0.15);
+      color: var(--color-success);
+    }
+    .tool-snapshot-label.error {
+      background: rgba(239, 68, 68, 0.15);
+      color: var(--color-error);
+    }
+    .tool-snapshot-meta {
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+      margin-left: auto;
+    }
+    .tool-snapshot-body {
+      padding: 10px 12px;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    .tool-snapshot-body::-webkit-scrollbar { width: 6px; }
+    .tool-snapshot-body::-webkit-scrollbar-track { background: transparent; }
+    .tool-snapshot-body::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 3px; }
+
+    .tool-raw {
+      margin: 0;
+      padding: 0;
+      background: transparent;
+      border: none;
+      border-radius: 0;
       font-family: var(--vscode-editor-font-family), monospace;
       font-size: 12px;
       line-height: 1.5;
       white-space: pre-wrap;
+      word-break: break-word;
     }
     .tool-text { font-size: 12px; line-height: 1.5; color: var(--vscode-foreground); }
+
+    /* 旧版 tool-section 保留兼容 */
     .tool-section { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
     .tool-section:last-child { margin-bottom: 0; }
     .tool-section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--vscode-descriptionForeground); }
     .summary-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
+
+    /* Worker 完成摘要卡片增强样式 */
+    .worker-summary-card { margin: var(--spacing-2) 0; }
+    .worker-summary-card .card-header { cursor: pointer; }
+    .worker-summary-overview { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: var(--spacing-2); padding: var(--spacing-2) 0; }
+    .worker-summary-stat { display: flex; flex-direction: column; gap: 2px; padding: 8px 12px; background: rgba(255, 255, 255, 0.02); border-radius: var(--radius-2); border: 1px solid rgba(255, 255, 255, 0.04); }
+    .worker-summary-stat-label { font-size: 10px; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.5px; }
+    .worker-summary-stat-value { font-size: 13px; font-weight: 500; color: var(--vscode-foreground); }
+    .worker-summary-stat-value.success { color: var(--color-success); }
+    .worker-summary-stat-value.error { color: var(--color-error); }
+    .worker-summary-changes { display: flex; flex-direction: column; gap: var(--spacing-2); margin-top: var(--spacing-2); }
+    .worker-summary-changes-title { font-size: 11px; font-weight: 500; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.5px; }
+    .worker-summary-file-list { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 0; list-style: none; }
+    .worker-summary-file-item { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 4px 8px; background: rgba(255, 255, 255, 0.02); border-radius: var(--radius-1); }
+    .worker-summary-file-icon { width: 14px; height: 14px; flex-shrink: 0; }
+    .worker-summary-file-icon.created { color: var(--color-success); }
+    .worker-summary-file-icon.modified { color: var(--color-info); }
+    .worker-summary-file-icon.deleted { color: var(--color-error); }
+    .worker-summary-file-path { flex: 1; font-family: var(--vscode-editor-font-family), monospace; color: var(--vscode-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
     /* 重连状态提示 */
     .reconnect-indicator {
@@ -1524,9 +1737,9 @@
     .task-name { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
     .task-meta { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
     .task-cli { font-size: 10px; padding: 1px 5px; border-radius: 3px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); font-weight: 500; text-transform: uppercase; }
-    .task-cli.claude { background: rgba(217, 119, 6, 0.15); color: #f59e0b; }
-    .task-cli.codex { background: rgba(16, 185, 129, 0.15); color: #10b981; }
-    .task-cli.gemini { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+    .task-cli.claude { background: rgba(217, 119, 6, 0.15); color: var(--color-claude); }
+    .task-cli.codex { background: rgba(16, 163, 127, 0.15); color: var(--color-codex); }
+    .task-cli.gemini { background: rgba(66, 133, 244, 0.15); color: var(--color-gemini); }
     .task-files { font-size: 10px; color: var(--vscode-descriptionForeground); }
     .task-time { font-size: 10px; color: var(--vscode-descriptionForeground); min-width: 32px; text-align: right; }
     .task-actions { display: flex; gap: 2px; opacity: 0; transition: opacity 0.15s; }
@@ -1632,28 +1845,34 @@
     .toast-close:hover { background: var(--vscode-toolbar-hoverBackground); }
 
     /* 设置面板 */
-    .settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: none; align-items: center; justify-content: center; z-index: 200; }
-    .settings-overlay.visible { display: flex; animation: fadeIn 0.15s ease; }
-    .settings-panel { width: 520px; max-width: 95vw; max-height: 85vh; background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); overflow: hidden; display: flex; flex-direction: column; }
-    .settings-header { display: flex; align-items: center; justify-content: space-between; padding: var(--spacing-3) var(--spacing-4); border-bottom: 1px solid var(--vscode-panel-border); }
-    .settings-title { font-size: var(--font-size-3); font-weight: 600; }
+    .settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 200; backdrop-filter: blur(2px); }
+    .settings-overlay.visible { display: flex; animation: fadeIn 0.2s ease; }
+    .settings-panel { width: 560px; max-width: 95vw; max-height: 88vh; background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); overflow: hidden; display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+    .settings-header { display: flex; align-items: center; gap: var(--spacing-3); padding: var(--spacing-4); border-bottom: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); }
+    .settings-title { font-size: 14px; font-weight: 600; color: var(--vscode-foreground); }
+    .logout-section { display: none; flex-direction: row; align-items: center; gap: var(--spacing-2); margin-left: auto; }
+    .logout-section.visible { display: flex; }
+    .user-info-text { font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); }
+    .logout-btn { padding: 4px var(--spacing-2); font-size: var(--font-size-1); height: 24px; }
     /* 设置面板 Tab 栏 */
     .settings-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); }
-    .settings-tab { flex: 1; padding: var(--spacing-2) var(--spacing-3); font-size: var(--font-size-2); font-weight: 500; color: var(--vscode-descriptionForeground); background: transparent; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; transition: all var(--transition-fast); position: relative; }
+    .settings-tab { flex: 1; padding: 10px var(--spacing-3); font-size: var(--font-size-2); font-weight: 500; color: var(--vscode-descriptionForeground); background: transparent; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: var(--spacing-2); transition: all var(--transition-normal); position: relative; }
     .settings-tab:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
-    .settings-tab.active { color: var(--vscode-foreground); }
-    .settings-tab.active::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: var(--vscode-focusBorder); }
-    .settings-tab svg { width: 14px; height: 14px; }
-    .settings-tab-content { display: none; flex: 1; overflow-y: auto; padding: var(--spacing-3); }
+    .settings-tab.active { color: var(--vscode-foreground); font-weight: 600; }
+    .settings-tab.active::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 3px; background: var(--vscode-focusBorder); }
+    .settings-tab svg { width: 15px; height: 15px; }
+    .settings-tab-content { display: none; flex: 1; overflow-y: auto; padding: var(--spacing-4); }
     .settings-tab-content.active { display: block; }
-    .settings-content { flex: 1; overflow-y: auto; padding: var(--spacing-3); }
-    .settings-section { margin-bottom: var(--spacing-4); }
-    .settings-section-title { font-size: var(--font-size-1); font-weight: 600; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.5px; }
+    .settings-content { flex: 1; overflow-y: auto; padding: var(--spacing-4); }
+    .settings-section { margin-bottom: var(--spacing-5); }
+    .settings-section:last-child { margin-bottom: 0; }
+    .settings-section-title { font-size: var(--font-size-1); font-weight: 700; color: var(--vscode-foreground); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: var(--spacing-3); }
+    .settings-section-desc { font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); line-height: 1.5; margin-bottom: var(--spacing-3); }
     .settings-item { display: flex; align-items: center; justify-content: space-between; padding: var(--spacing-2) 0; }
     .settings-item-label { font-size: var(--font-size-2); font-weight: 500; }
     .settings-item-desc { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-top: 2px; }
-    .settings-input { width: 180px; padding: var(--spacing-1) var(--spacing-2); font-size: var(--font-size-2); background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-1); outline: none; }
-    .settings-input:focus { border-color: var(--vscode-focusBorder); }
+    .settings-input { width: 180px; padding: var(--spacing-2); font-size: var(--font-size-2); background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); outline: none; transition: border-color var(--transition-fast); }
+    .settings-input:focus { border-color: var(--vscode-focusBorder); box-shadow: 0 0 0 1px var(--vscode-focusBorder); }
     .settings-toggle { width: 36px; height: 20px; background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-full); cursor: pointer; position: relative; transition: all var(--transition-fast); }
     .settings-toggle::after { content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; background: var(--vscode-descriptionForeground); border-radius: var(--radius-full); transition: all var(--transition-fast); }
     .settings-toggle.active { background: var(--vscode-button-background); border-color: var(--vscode-button-background); }
@@ -1664,23 +1883,83 @@
     .cli-connection-item { display: flex; align-items: center; gap: var(--spacing-3); padding: var(--spacing-2) var(--spacing-3); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); }
     .cli-connection-item.available { border-color: #3dd68c; }
     .cli-connection-item.unavailable { border-color: #f14c4c; opacity: 0.7; }
+    .cli-connection-item.disabled { border-color: var(--vscode-descriptionForeground); opacity: 0.5; }
     .cli-connection-icon { width: 32px; height: 32px; border-radius: var(--radius-2); display: flex; align-items: center; justify-content: center; }
     .cli-connection-icon svg { width: 20px; height: 20px; fill: currentColor; }
     .cli-connection-icon.claude { background: rgba(217, 119, 6, 0.15); color: #d97706; }
     .cli-connection-icon.codex { background: rgba(34, 197, 94, 0.15); color: #22c55e; }
     .cli-connection-icon.gemini { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+    .cli-connection-icon.orchestrator { background: rgba(168, 85, 247, 0.15); color: #a855f7; }
+    .cli-connection-icon.compressor { background: rgba(236, 72, 153, 0.15); color: #ec4899; }
     .cli-connection-info { flex: 1; min-width: 0; }
     .cli-connection-name { font-size: var(--font-size-2); font-weight: 600; }
-    .cli-connection-status { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-top: 2px; }
+    .cli-connection-status { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .cli-connection-badge { font-size: var(--font-size-1); padding: 2px 8px; border-radius: var(--radius-full); font-weight: 500; }
     .cli-connection-badge.available { background: rgba(61, 214, 140, 0.2); color: #3dd68c; }
     .cli-connection-badge.unavailable { background: rgba(241, 76, 76, 0.2); color: #f14c4c; }
     .cli-connection-badge.checking { background: rgba(204, 167, 0, 0.2); color: #cca700; }
+    .cli-connection-badge.disabled { background: rgba(128, 128, 128, 0.2); color: var(--vscode-descriptionForeground); }
+    .cli-connection-badge.error { background: rgba(241, 76, 76, 0.2); color: #f14c4c; }
     .cli-refresh-btn { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; margin-top: var(--spacing-2); padding: var(--spacing-2); background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: 1px solid var(--vscode-button-border, var(--vscode-contrastBorder, rgba(255,255,255,0.1))); border-radius: var(--radius-2); cursor: pointer; font-size: var(--font-size-2); transition: background var(--transition-fast), border-color var(--transition-fast); }
     .cli-refresh-btn:hover { background: var(--vscode-button-secondaryHoverBackground); border-color: var(--vscode-focusBorder); }
     .cli-refresh-btn:disabled { opacity: 0.6; cursor: not-allowed; }
     .cli-refresh-btn svg { width: 14px; height: 14px; fill: currentColor; }
     .cli-refresh-btn.loading svg { animation: spin 1s linear infinite; }
+
+    /* MCP 服务器列表样式 */
+    .mcp-server-list { display: flex; flex-direction: column; gap: var(--spacing-2); }
+    .mcp-server-item { background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); overflow: hidden; transition: border-color var(--transition-fast); }
+    .mcp-server-item:hover { border-color: var(--vscode-focusBorder); }
+    .mcp-server-header { display: flex; align-items: center; justify-content: space-between; padding: var(--spacing-2) var(--spacing-3); cursor: pointer; }
+    .mcp-server-info { flex: 1; min-width: 0; }
+    .mcp-server-name { font-size: var(--font-size-2); font-weight: 600; color: var(--vscode-foreground); }
+    .mcp-server-command { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-top: 2px; font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .mcp-server-actions { display: flex; align-items: center; gap: 4px; }
+    .mcp-action-btn { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: transparent; border: 1px solid transparent; border-radius: var(--radius-1); cursor: pointer; color: var(--vscode-descriptionForeground); transition: all var(--transition-fast); }
+    .mcp-action-btn:hover { background: var(--vscode-toolbar-hoverBackground); border-color: var(--vscode-focusBorder); color: var(--vscode-foreground); }
+    .mcp-action-btn.danger:hover { background: rgba(241, 76, 76, 0.15); border-color: #f14c4c; color: #f14c4c; }
+    .mcp-action-btn svg { width: 16px; height: 16px; fill: currentColor; }
+    .mcp-server-tools { padding: var(--spacing-2) var(--spacing-3); border-top: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); max-height: 240px; overflow-y: auto; }
+    .mcp-tools-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--spacing-2); }
+    .mcp-tools-title { font-size: var(--font-size-1); font-weight: 600; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.5px; }
+    .mcp-tools-count { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .mcp-tools-list { display: flex; flex-direction: column; gap: var(--spacing-1); }
+    .mcp-tool-item { padding: var(--spacing-2); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-1); }
+    .mcp-tool-row { display: flex; align-items: center; gap: var(--spacing-2); }
+    .mcp-tool-name { flex: 1; min-width: 0; font-size: var(--font-size-2); font-weight: 600; color: var(--vscode-foreground); font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .mcp-tool-desc-btn { width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid transparent; border-radius: var(--radius-1); cursor: pointer; color: var(--vscode-descriptionForeground); }
+    .mcp-tool-desc-btn:hover { background: var(--vscode-toolbar-hoverBackground); border-color: var(--vscode-focusBorder); color: var(--vscode-foreground); }
+    .mcp-tool-desc-btn svg { width: 14px; height: 14px; fill: currentColor; }
+    .mcp-tool-desc-pop { position: absolute; right: 12px; top: calc(100% + 6px); width: min(360px, 80vw); max-height: 160px; overflow-y: auto; background: var(--vscode-editor-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-2); padding: var(--spacing-2); box-shadow: 0 6px 18px rgba(0,0,0,0.25); font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); line-height: 1.4; z-index: 2; }
+    .mcp-tool-item { position: relative; }
+    .mcp-tool-item.show-desc .mcp-tool-desc-pop { display: block; }
+    .mcp-tool-desc-pop { display: none; }
+    .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: var(--spacing-5) var(--spacing-3); text-align: center; color: var(--vscode-descriptionForeground); }
+    .empty-state svg { margin-bottom: var(--spacing-2); }
+    .empty-state p { margin: 4px 0; }
+
+    /* Modal 对话框样式 */
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6); display: flex; align-items: center; justify-content: center; z-index: 1000; animation: fadeIn 0.15s ease; }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    .modal-dialog { width: 480px; max-width: 90vw; max-height: 80vh; background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); overflow: hidden; display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4); animation: slideUp 0.2s ease; }
+    @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+    .modal-header { display: flex; align-items: center; justify-content: space-between; padding: var(--spacing-3) var(--spacing-4); border-bottom: 1px solid var(--vscode-panel-border); }
+    .modal-header h3 { font-size: var(--font-size-3); font-weight: 600; margin: 0; }
+    .modal-close { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: transparent; border: none; color: var(--vscode-descriptionForeground); cursor: pointer; border-radius: var(--radius-1); font-size: 20px; line-height: 1; transition: all var(--transition-fast); }
+    .modal-close:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+    .modal-body { flex: 1; overflow-y: auto; padding: var(--spacing-4); }
+    .modal-footer { display: flex; align-items: center; justify-content: flex-end; gap: var(--spacing-2); padding: var(--spacing-3) var(--spacing-4); border-top: 1px solid var(--vscode-panel-border); }
+    .form-field { margin-bottom: var(--spacing-3); }
+    .form-field:last-child { margin-bottom: 0; }
+    .form-field label { display: block; font-size: var(--font-size-2); font-weight: 500; color: var(--vscode-foreground); margin-bottom: var(--spacing-1); }
+    .form-field input[type="text"],
+    .form-field input[type="password"],
+    .form-field textarea { width: 100%; padding: var(--spacing-2); font-size: var(--font-size-2); background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-1); font-family: inherit; outline: none; transition: border-color var(--transition-fast); }
+    .form-field input[type="text"]:focus,
+    .form-field input[type="password"]:focus,
+    .form-field textarea:focus { border-color: var(--vscode-focusBorder); }
+    .form-field textarea { resize: vertical; font-family: monospace; line-height: 1.5; }
+    .form-field input[type="checkbox"] { margin-right: var(--spacing-1); }
 
     /* 画像配置样式 - 与其他 tab 保持视觉一致 */
     /* CLI 画像配置区域（边框包裹） */
@@ -1790,6 +2069,110 @@
     .cli-stat-bar-fill.warning { background: #cca700; }
     .cli-stat-bar-fill.bad { background: #f14c4c; }
 
+    /* LLM 配置表单样式 */
+    .llm-config-form { display: flex; flex-direction: column; gap: var(--spacing-2); padding: var(--spacing-2) var(--spacing-3); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); }
+    .llm-config-field { display: flex; flex-direction: column; gap: 4px; }
+    .llm-config-label { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); font-weight: 500; }
+    .llm-config-input-wrap { display: flex; align-items: center; gap: 4px; }
+    .llm-config-input { flex: 1; padding: var(--spacing-1) var(--spacing-2); font-size: var(--font-size-2); background: var(--vscode-sideBar-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-1); outline: none; font-family: var(--vscode-editor-font-family), monospace; }
+    .llm-config-input:focus { border-color: var(--vscode-focusBorder); }
+    .llm-config-input::placeholder { color: var(--vscode-descriptionForeground); opacity: 0.6; }
+    .llm-config-select { padding: var(--spacing-1) var(--spacing-2); font-size: var(--font-size-2); background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); border-radius: var(--radius-1); cursor: pointer; outline: none; }
+    .llm-config-select:focus { border-color: var(--vscode-focusBorder); }
+    .llm-config-eye-btn { display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; background: transparent; border: 1px solid var(--vscode-input-border); border-radius: var(--radius-1); cursor: pointer; color: var(--vscode-descriptionForeground); transition: var(--transition-fast); }
+    .llm-config-eye-btn:hover { background: var(--vscode-list-hoverBackground); color: var(--vscode-foreground); }
+    .llm-config-eye-btn svg { width: 14px; height: 14px; fill: currentColor; }
+    .llm-config-toggle { margin-bottom: var(--spacing-2); }
+    .llm-config-toggle-label { display: flex; align-items: center; gap: var(--spacing-2); cursor: pointer; }
+    .llm-config-toggle-label input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
+    .llm-config-toggle-label span { font-size: var(--font-size-2); color: var(--vscode-foreground); }
+
+    /* 技能列表样式 */
+    .skill-list { display: flex; flex-direction: column; gap: var(--spacing-2); }
+    .skill-item { display: flex; align-items: center; gap: var(--spacing-2); padding: var(--spacing-2) var(--spacing-3); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); }
+    .skill-icon { width: 32px; height: 32px; border-radius: var(--radius-2); display: flex; align-items: center; justify-content: center; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+    .skill-icon svg { width: 18px; height: 18px; fill: currentColor; }
+    .skill-info { flex: 1; min-width: 0; }
+    .skill-name { font-size: var(--font-size-2); font-weight: 600; }
+    .skill-desc { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-top: 2px; }
+    .skill-actions { display: flex; gap: var(--spacing-1); }
+    .skill-toggle { width: 36px; height: 20px; background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-full); cursor: pointer; position: relative; transition: all var(--transition-fast); }
+    .skill-toggle::after { content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; background: var(--vscode-descriptionForeground); border-radius: var(--radius-full); transition: all var(--transition-fast); }
+    .skill-toggle.active { background: var(--vscode-button-background); border-color: var(--vscode-button-background); }
+    .skill-toggle.active::after { left: 18px; background: var(--vscode-button-foreground); }
+
+    /* 内置工具列表样式 */
+    .builtin-tool-list { display: flex; flex-direction: column; gap: var(--spacing-2); }
+    .builtin-tool-item { display: flex; align-items: center; gap: var(--spacing-2); padding: var(--spacing-2) var(--spacing-3); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); }
+    .builtin-tool-icon { width: 32px; height: 32px; border-radius: var(--radius-2); display: flex; align-items: center; justify-content: center; background: rgba(61, 214, 140, 0.15); color: #3dd68c; }
+    .builtin-tool-info { flex: 1; min-width: 0; }
+    .builtin-tool-name { font-size: var(--font-size-2); font-weight: 600; }
+    .builtin-tool-desc { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-top: 2px; }
+    .builtin-tool-badge { font-size: var(--font-size-1); padding: 2px 8px; border-radius: var(--radius-full); font-weight: 500; }
+    .builtin-tool-badge.enabled { background: rgba(61, 214, 140, 0.2); color: #3dd68c; }
+
+    /* Skills 工具列表样式 */
+    .skills-tool-list { display: flex; flex-direction: column; gap: var(--spacing-2); }
+    .skills-tool-item { display: flex; align-items: center; gap: var(--spacing-2); padding: var(--spacing-2) var(--spacing-3); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); transition: border-color var(--transition-fast); }
+    .skills-tool-item:hover { border-color: var(--vscode-focusBorder); }
+    .skills-tool-icon { width: 32px; height: 32px; border-radius: var(--radius-2); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+    .skills-tool-icon.web-search { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+    .skills-tool-icon.web-fetch { background: rgba(168, 85, 247, 0.15); color: #a855f7; }
+    .skills-tool-icon.text-editor { background: rgba(236, 72, 153, 0.15); color: #ec4899; }
+    .skills-tool-icon.computer-use { background: rgba(251, 146, 60, 0.15); color: #fb923c; }
+    .skills-tool-icon svg { width: 20px; height: 20px; fill: currentColor; }
+    .skills-tool-info { flex: 1; min-width: 0; }
+    .skills-tool-name { font-size: var(--font-size-2); font-weight: 600; display: flex; align-items: center; gap: 6px; }
+    .skills-tool-type { font-size: var(--font-size-1); padding: 1px 6px; border-radius: var(--radius-1); background: rgba(59, 130, 246, 0.15); color: #3b82f6; font-weight: 500; }
+    .skills-tool-type.client { background: rgba(236, 72, 153, 0.15); color: #ec4899; }
+    .skills-tool-desc { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-top: 2px; line-height: 1.4; }
+    .skills-tool-toggle { width: 36px; height: 20px; background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-full); cursor: pointer; position: relative; transition: all var(--transition-fast); flex-shrink: 0; }
+    .skills-tool-toggle::after { content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; background: var(--vscode-descriptionForeground); border-radius: var(--radius-full); transition: all var(--transition-fast); }
+    .skills-tool-toggle.active { background: var(--vscode-button-background); border-color: var(--vscode-button-background); }
+    .skills-tool-toggle.active::after { left: 18px; background: var(--vscode-button-foreground); }
+
+    /* 自定义工具列表样式 */
+    .custom-tool-list { display: flex; flex-direction: column; gap: var(--spacing-2); }
+    .custom-tool-item { display: flex; align-items: center; gap: var(--spacing-2); padding: var(--spacing-2) var(--spacing-3); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); }
+    .custom-tool-icon { width: 32px; height: 32px; border-radius: var(--radius-2); display: flex; align-items: center; justify-content: center; background: rgba(251, 146, 60, 0.15); color: #fb923c; }
+    .custom-tool-icon svg { width: 20px; height: 20px; fill: currentColor; }
+    .custom-tool-info { flex: 1; min-width: 0; }
+    .custom-tool-name { font-size: var(--font-size-2); font-weight: 600; font-family: monospace; }
+    .custom-tool-desc { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-top: 2px; }
+    .custom-tool-actions { display: flex; gap: 4px; }
+    .custom-tool-btn { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: transparent; border: 1px solid transparent; border-radius: var(--radius-1); cursor: pointer; color: var(--vscode-descriptionForeground); transition: all var(--transition-fast); }
+    .custom-tool-btn:hover { background: var(--vscode-toolbar-hoverBackground); border-color: var(--vscode-focusBorder); color: var(--vscode-foreground); }
+    .custom-tool-btn.danger:hover { background: rgba(241, 76, 76, 0.15); border-color: #f14c4c; color: #f14c4c; }
+    .custom-tool-btn svg { width: 16px; height: 16px; fill: currentColor; }
+
+    /* 仓库列表样式 */
+    .repo-list { display: flex; flex-direction: column; gap: var(--spacing-2); }
+    .repo-item { display: flex; align-items: center; gap: var(--spacing-2); padding: var(--spacing-2) var(--spacing-3); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); transition: border-color var(--transition-fast); }
+    .repo-item:hover { border-color: var(--vscode-focusBorder); }
+    .repo-info { flex: 1; min-width: 0; }
+    .repo-name { font-size: var(--font-size-2); font-weight: 600; }
+    .repo-url { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-top: 2px; font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .repo-actions { display: flex; align-items: center; gap: 8px; }
+    .repo-toggle { display: flex; align-items: center; gap: 6px; font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .repo-toggle input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
+    .repo-action-btn { padding: 4px 12px; font-size: var(--font-size-1); background: transparent; border: 1px solid var(--vscode-input-border); border-radius: var(--radius-1); cursor: pointer; color: var(--vscode-foreground); transition: all var(--transition-fast); }
+    .repo-action-btn:hover { background: var(--vscode-toolbar-hoverBackground); border-color: var(--vscode-focusBorder); }
+    .repo-action-btn.danger:hover { background: rgba(241, 76, 76, 0.15); border-color: #f14c4c; color: #f14c4c; }
+    .repo-badge { font-size: var(--font-size-1); padding: 2px 8px; border-radius: var(--radius-full); font-weight: 500; background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+    .repo-badge.builtin { background: rgba(61, 214, 140, 0.2); color: #3dd68c; }
+
+    /* 空状态样式 */
+    .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: var(--spacing-5) var(--spacing-3); color: var(--vscode-descriptionForeground); text-align: center; }
+    .empty-state p { margin: var(--spacing-1) 0; }
+
+    /* 设置按钮样式 */
+    .settings-btn { padding: var(--spacing-1) var(--spacing-3); font-size: var(--font-size-2); border-radius: var(--radius-2); cursor: pointer; border: 1px solid transparent; transition: var(--transition-fast); }
+    .settings-btn.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    .settings-btn.primary:hover { background: var(--vscode-button-hoverBackground); }
+    .settings-btn.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border-color: var(--vscode-button-border, transparent); }
+    .settings-btn.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
+    .settings-section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--spacing-2); }
+
     /* Diff 模态框 */
     .diff-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 300; }
     .diff-modal { width: 600px; max-width: 90vw; max-height: 80vh; background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); overflow: hidden; display: flex; flex-direction: column; }
@@ -1808,6 +2191,145 @@
     .icon-btn:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
     .icon-btn:active { background: var(--vscode-toolbar-activeBackground, var(--vscode-list-activeSelectionBackground)); transform: scale(0.96); }
     .icon-btn svg { width: 14px; height: 14px; fill: currentColor; }
+
+    /* Worker 模型选择器样式 */
+    .worker-model-tabs {
+      display: flex;
+      gap: var(--spacing-2);
+      margin-bottom: var(--spacing-4);
+      padding: var(--spacing-2);
+      background: var(--vscode-editor-background);
+      border-radius: var(--radius-2);
+    }
+
+    .worker-model-tab {
+      flex: 1;
+      padding: var(--spacing-2) var(--spacing-3);
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: var(--radius-1);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      font-size: var(--font-size-2);
+      color: var(--vscode-descriptionForeground);
+      transition: all var(--transition-normal);
+    }
+
+    .worker-model-tab:hover {
+      background: var(--vscode-list-hoverBackground);
+      color: var(--vscode-foreground);
+    }
+
+    .worker-model-tab.active {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border-color: var(--vscode-focusBorder);
+    }
+
+    .worker-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+
+    .worker-dot.claude { background: var(--color-claude); }
+    .worker-dot.codex { background: var(--color-codex); }
+    .worker-dot.gemini { background: var(--color-gemini); }
+
+    /* LLM 配置按钮组容器 */
+    .llm-config-actions {
+      display: flex;
+      gap: var(--spacing-2);
+      margin-top: var(--spacing-3);
+    }
+
+    /* LLM 配置测试按钮 */
+    .llm-config-test-btn {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: var(--spacing-2);
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      border: 1px solid var(--vscode-button-border, transparent);
+      border-radius: var(--radius-1);
+      cursor: pointer;
+      font-size: var(--font-size-2);
+      transition: var(--transition-fast);
+    }
+
+    .llm-config-test-btn:hover {
+      background: var(--vscode-button-secondaryHoverBackground);
+    }
+
+    .llm-config-test-btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    .llm-config-test-btn svg {
+      width: 14px;
+      height: 14px;
+      fill: currentColor;
+    }
+
+    /* LLM 配置保存按钮 */
+    .llm-config-save-btn {
+      flex: 1;
+      padding: var(--spacing-2) var(--spacing-4);
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: none;
+      border-radius: var(--radius-1);
+      cursor: pointer;
+      font-size: var(--font-size-2);
+      transition: background var(--transition-normal);
+    }
+
+    .llm-config-save-btn:hover {
+      background: var(--vscode-button-hoverBackground);
+    }
+
+    .llm-config-save-btn:active {
+      transform: scale(0.98);
+    }
+
+    /* LLM 配置测试按钮加载状态 */
+    .llm-config-test-btn.loading {
+      pointer-events: none;
+      opacity: 0.7;
+      cursor: wait;
+    }
+
+    .llm-config-test-btn.loading svg {
+      animation: spin 1s linear infinite;
+    }
+
+    /* LLM 配置测试按钮成功状态 */
+    .llm-config-test-btn.success {
+      background: rgba(61, 214, 140, 0.2);
+      color: #3dd68c;
+      border-color: #3dd68c;
+      pointer-events: none;
+    }
+
+    /* LLM 配置测试按钮失败状态 */
+    .llm-config-test-btn.error {
+      background: rgba(241, 76, 76, 0.2);
+      color: #f14c4c;
+      border-color: #f14c4c;
+      pointer-events: none;
+    }
+
+    @keyframes test-btn-spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
   </style>
 </head>
 <body>
@@ -1971,21 +2493,26 @@
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M4 11H2v3h2v-3zm5-4H7v7h2V7zm5-5h-2v12h2V2zm-2-1a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h2a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1h-2zM6 7a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V7zm-5 4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1v-3z"/></svg>
           统计
         </button>
+        <button class="settings-tab" data-tab="model">
+          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0zM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0z"/></svg>
+          模型
+        </button>
         <button class="settings-tab" data-tab="profile">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M3 14s-1 0-1-1 1-4 6-4 6 3 6 4-1 1-1 1H3zm5-6a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"/></svg>
           画像
         </button>
-        <button class="settings-tab" data-tab="config">
-          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 4.754a3.246 3.246 0 1 0 0 6.492 3.246 3.246 0 0 0 0-6.492zM5.754 8a2.246 2.246 0 1 1 4.492 0 2.246 2.246 0 0 1-4.492 0z"/><path d="M9.796 1.343c-.527-1.79-3.065-1.79-3.592 0l-.094.319a.873.873 0 0 1-1.255.52l-.292-.16c-1.64-.892-3.433.902-2.54 2.541l.159.292a.873.873 0 0 1-.52 1.255l-.319.094c-1.79.527-1.79 3.065 0 3.592l.319.094a.873.873 0 0 1 .52 1.255l-.16.292c-.892 1.64.901 3.434 2.541 2.54l.292-.159a.873.873 0 0 1 1.255.52l.094.319c.527 1.79 3.065 1.79 3.592 0l.094-.319a.873.873 0 0 1 1.255-.52l.292.16c1.64.893 3.434-.902 2.54-2.541l-.159-.292a.873.873 0 0 1 .52-1.255l.319-.094c1.79-.527 1.79-3.065 0-3.592l-.319-.094a.873.873 0 0 1-.52-1.255l.16-.292c.893-1.64-.902-3.433-2.541-2.54l-.292.159a.873.873 0 0 1-1.255-.52l-.094-.319zm-2.633.283c.246-.835 1.428-.835 1.674 0l.094.319a1.873 1.873 0 0 0 2.693 1.115l.291-.16c.764-.415 1.6.42 1.184 1.185l-.159.292a1.873 1.873 0 0 0 1.116 2.692l.318.094c.835.246.835 1.428 0 1.674l-.319.094a1.873 1.873 0 0 0-1.115 2.693l.16.291c.415.764-.42 1.6-1.185 1.184l-.291-.159a1.873 1.873 0 0 0-2.693 1.116l-.094.318c-.246.835-1.428.835-1.674 0l-.094-.319a1.873 1.873 0 0 0-2.692-1.115l-.292.16c-.764.415-1.6-.42-1.184-1.185l.159-.291A1.873 1.873 0 0 0 1.945 8.93l-.319-.094c-.835-.246-.835-1.428 0-1.674l.319-.094A1.873 1.873 0 0 0 3.06 4.377l-.16-.292c-.415-.764.42-1.6 1.185-1.184l.292.159a1.873 1.873 0 0 0 2.692-1.115l.094-.319z"/></svg>
-          配置
+        <button class="settings-tab" data-tab="tools">
+          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M5 2V0H0v5h2v6H0v5h5v-2h6v2h5v-5h-2V5h2V0h-5v2H5zm6 1v2h2v6h-2v2H5v-2H3V5h2V3h6z"/></svg>
+          工具
         </button>
       </div>
       <!-- 统计 Tab 内容 -->
       <div class="settings-tab-content active" id="settings-tab-stats">
-        <!-- CLI 连接状态 -->
+        <!-- 模型连接状态 -->
         <div class="settings-section">
-          <div class="settings-section-title">CLI 连接状态</div>
+          <div class="settings-section-title">模型连接状态</div>
           <div class="cli-connection-list" id="cli-connection-list">
+            <!-- Worker 模型 -->
             <div class="cli-connection-item" data-cli="claude">
               <div class="cli-connection-icon claude">
                 <svg viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1z"/></svg>
@@ -2012,6 +2539,28 @@
               </div>
               <div class="cli-connection-info">
                 <div class="cli-connection-name">Gemini</div>
+                <div class="cli-connection-status">检测中...</div>
+              </div>
+              <div class="cli-connection-badge checking">检测中</div>
+            </div>
+            <!-- 编排者模型 -->
+            <div class="cli-connection-item" data-cli="orchestrator">
+              <div class="cli-connection-icon orchestrator">
+                <svg viewBox="0 0 16 16"><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0zM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0z"/><path d="M8 4a.5.5 0 0 1 .5.5v3h3a.5.5 0 0 1 0 1h-3v3a.5.5 0 0 1-1 0v-3h-3a.5.5 0 0 1 0-1h3v-3A.5.5 0 0 1 8 4z"/></svg>
+              </div>
+              <div class="cli-connection-info">
+                <div class="cli-connection-name">编排者 <span style="color: var(--vscode-errorForeground); font-size: 10px;">(必需)</span></div>
+                <div class="cli-connection-status">检测中...</div>
+              </div>
+              <div class="cli-connection-badge checking">检测中</div>
+            </div>
+            <!-- 压缩模型 -->
+            <div class="cli-connection-item" data-cli="compressor">
+              <div class="cli-connection-icon compressor">
+                <svg viewBox="0 0 16 16"><path d="M4 0a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2H4zm0 1h8a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1z"/><path d="M5 4h6v1H5V4zm0 3h6v1H5V7zm0 3h6v1H5v-1z"/></svg>
+              </div>
+              <div class="cli-connection-info">
+                <div class="cli-connection-name">压缩模型 <span style="color: var(--vscode-errorForeground); font-size: 10px;">(必需)</span></div>
                 <div class="cli-connection-status">检测中...</div>
               </div>
               <div class="cli-connection-badge checking">检测中</div>
@@ -2246,8 +2795,234 @@
         </div>
       </div>
 
-      <!-- 配置 Tab 内容 -->
-      <div class="settings-tab-content" id="settings-tab-config">
+      <!-- 模型 Tab 内容 -->
+      <div class="settings-tab-content" id="settings-tab-model">
+        <!-- 编排者模型配置 -->
+        <div class="settings-section">
+          <div class="settings-section-title">编排者模型配置</div>
+          <div class="llm-config-form">
+            <div class="llm-config-field">
+              <label class="llm-config-label">Base URL</label>
+              <input type="text" class="llm-config-input" id="orch-base-url" placeholder="https://api.anthropic.com">
+            </div>
+            <div class="llm-config-field">
+              <label class="llm-config-label">API Key</label>
+              <div class="llm-config-input-wrap">
+                <input type="password" class="llm-config-input" id="orch-api-key" placeholder="sk-ant-...">
+                <button class="llm-config-eye-btn" data-target="orch-api-key">
+                  <svg viewBox="0 0 16 16" class="eye-closed"><path d="M13.359 11.238C15.06 9.72 16 8 16 8s-3-5.5-8-5.5a7.028 7.028 0 0 0-2.79.588l.77.771A5.944 5.944 0 0 1 8 3.5c2.12 0 3.879 1.168 5.168 2.457A13.134 13.134 0 0 1 14.828 8c-.058.087-.122.183-.195.288-.335.48-.83 1.12-1.465 1.755-.165.165-.337.328-.517.486l.708.709z"/><path d="M11.297 9.176a3.5 3.5 0 0 0-4.474-4.474l.823.823a2.5 2.5 0 0 1 2.829 2.829l.822.822zm-2.943 1.299l.822.822a3.5 3.5 0 0 1-4.474-4.474l.823.823a2.5 2.5 0 0 0 2.829 2.829z"/><path d="M3.35 5.47c-.18.16-.353.322-.518.487A13.134 13.134 0 0 0 1.172 8l.195.288c.335.48.83 1.12 1.465 1.755C4.121 11.332 5.881 12.5 8 12.5c.716 0 1.39-.133 2.02-.36l.77.772A7.029 7.029 0 0 1 8 13.5C3 13.5 0 8 0 8s.939-1.721 2.641-3.238l.708.709z"/><path d="M13.646 14.354l-12-12 .708-.708 12 12-.708.708z"/></svg>
+                  <svg viewBox="0 0 16 16" class="eye-open" style="display:none"><path d="M16 8s-3-5.5-8-5.5S0 8 0 8s3 5.5 8 5.5S16 8 16 8zM1.173 8a13.133 13.133 0 0 1 1.66-2.043C4.12 4.668 5.88 3.5 8 3.5c2.12 0 3.879 1.168 5.168 2.457A13.133 13.133 0 0 1 14.828 8c-.058.087-.122.183-.195.288-.335.48-.83 1.12-1.465 1.755C11.879 11.332 10.119 12.5 8 12.5c-2.12 0-3.879-1.168-5.168-2.457A13.134 13.134 0 0 1 1.172 8z"/><path d="M8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5zM4.5 8a3.5 3.5 0 1 1 7 0 3.5 3.5 0 0 1-7 0z"/></svg>
+                </button>
+              </div>
+            </div>
+            <div class="llm-config-field">
+              <label class="llm-config-label">Model</label>
+              <input type="text" class="llm-config-input" id="orch-model" placeholder="claude-3-5-sonnet-20241022">
+            </div>
+            <div class="llm-config-field">
+              <label class="llm-config-label">Provider</label>
+              <select class="llm-config-select" id="orch-provider">
+                <option value="openai">OpenAI</option>
+                <option value="anthropic">Anthropic</option>
+              </select>
+            </div>
+            <div class="llm-config-actions">
+              <button class="llm-config-test-btn" id="orch-test-btn">
+                <svg viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>
+                测试连接
+              </button>
+              <button class="llm-config-save-btn" id="orch-save-btn">
+                保存配置
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Worker 模型配置 -->
+        <div class="settings-section">
+          <div class="settings-section-title">Worker 模型配置</div>
+
+          <!-- Worker 选择器 -->
+          <div class="worker-model-tabs">
+            <button class="worker-model-tab active" data-worker="claude">
+              <span class="worker-dot claude"></span>
+              Claude
+            </button>
+            <button class="worker-model-tab" data-worker="codex">
+              <span class="worker-dot codex"></span>
+              Codex
+            </button>
+            <button class="worker-model-tab" data-worker="gemini">
+              <span class="worker-dot gemini"></span>
+              Gemini
+            </button>
+          </div>
+
+          <!-- Worker 配置表单 -->
+          <div class="llm-config-form" id="worker-model-config">
+            <div class="llm-config-field">
+              <label class="llm-config-label">Base URL</label>
+              <input type="text" class="llm-config-input" id="worker-base-url" placeholder="https://api.anthropic.com">
+            </div>
+            <div class="llm-config-field">
+              <label class="llm-config-label">API Key</label>
+              <div class="llm-config-input-wrap">
+                <input type="password" class="llm-config-input" id="worker-api-key" placeholder="sk-ant-...">
+                <button class="llm-config-eye-btn" data-target="worker-api-key">
+                  <svg viewBox="0 0 16 16" class="eye-closed"><path d="M13.359 11.238C15.06 9.72 16 8 16 8s-3-5.5-8-5.5a7.028 7.028 0 0 0-2.79.588l.77.771A5.944 5.944 0 0 1 8 3.5c2.12 0 3.879 1.168 5.168 2.457A13.134 13.134 0 0 1 14.828 8c-.058.087-.122.183-.195.288-.335.48-.83 1.12-1.465 1.755-.165.165-.337.328-.517.486l.708.709z"/><path d="M11.297 9.176a3.5 3.5 0 0 0-4.474-4.474l.823.823a2.5 2.5 0 0 1 2.829 2.829l.822.822zm-2.943 1.299l.822.822a3.5 3.5 0 0 1-4.474-4.474l.823.823a2.5 2.5 0 0 0 2.829 2.829z"/><path d="M3.35 5.47c-.18.16-.353.322-.518.487A13.134 13.134 0 0 0 1.172 8l.195.288c.335.48.83 1.12 1.465 1.755C4.121 11.332 5.881 12.5 8 12.5c.716 0 1.39-.133 2.02-.36l.77.772A7.029 7.029 0 0 1 8 13.5C3 13.5 0 8 0 8s.939-1.721 2.641-3.238l.708.709z"/><path d="M13.646 14.354l-12-12 .708-.708 12 12-.708.708z"/></svg>
+                  <svg viewBox="0 0 16 16" class="eye-open" style="display:none"><path d="M16 8s-3-5.5-8-5.5S0 8 0 8s3 5.5 8 5.5S16 8 16 8zM1.173 8a13.133 13.133 0 0 1 1.66-2.043C4.12 4.668 5.88 3.5 8 3.5c2.12 0 3.879 1.168 5.168 2.457A13.133 13.133 0 0 1 14.828 8c-.058.087-.122.183-.195.288-.335.48-.83 1.12-1.465 1.755C11.879 11.332 10.119 12.5 8 12.5c-2.12 0-3.879-1.168-5.168-2.457A13.134 13.134 0 0 1 1.172 8z"/><path d="M8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5zM4.5 8a3.5 3.5 0 1 1 7 0 3.5 3.5 0 0 1-7 0z"/></svg>
+                </button>
+              </div>
+            </div>
+            <div class="llm-config-field">
+              <label class="llm-config-label">Model</label>
+              <input type="text" class="llm-config-input" id="worker-model" placeholder="claude-3-5-sonnet-20241022">
+            </div>
+            <div class="llm-config-field">
+              <label class="llm-config-label">Provider</label>
+              <select class="llm-config-select" id="worker-provider">
+                <option value="openai">OpenAI</option>
+                <option value="anthropic">Anthropic</option>
+              </select>
+            </div>
+            <div class="llm-config-field">
+              <label class="llm-config-toggle-label">
+                <input type="checkbox" id="worker-enabled" checked>
+                <span>启用此 Worker</span>
+              </label>
+            </div>
+            <div class="llm-config-actions">
+              <button class="llm-config-test-btn" id="worker-test-btn">
+                <svg viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>
+                测试连接
+              </button>
+              <button class="llm-config-save-btn" id="worker-save-btn">
+                保存配置
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 压缩模型配置 -->
+        <div class="settings-section">
+          <div class="settings-section-title">压缩模型配置</div>
+          <div class="llm-config-form">
+            <div class="llm-config-field">
+              <label class="llm-config-label">Base URL</label>
+              <input type="text" class="llm-config-input" id="comp-base-url" placeholder="https://api.anthropic.com">
+            </div>
+            <div class="llm-config-field">
+              <label class="llm-config-label">API Key</label>
+              <div class="llm-config-input-wrap">
+                <input type="password" class="llm-config-input" id="comp-api-key" placeholder="sk-ant-...">
+                <button class="llm-config-eye-btn" data-target="comp-api-key">
+                  <svg viewBox="0 0 16 16" class="eye-closed"><path d="M13.359 11.238C15.06 9.72 16 8 16 8s-3-5.5-8-5.5a7.028 7.028 0 0 0-2.79.588l.77.771A5.944 5.944 0 0 1 8 3.5c2.12 0 3.879 1.168 5.168 2.457A13.134 13.134 0 0 1 14.828 8c-.058.087-.122.183-.195.288-.335.48-.83 1.12-1.465 1.755-.165.165-.337.328-.517.486l.708.709z"/><path d="M11.297 9.176a3.5 3.5 0 0 0-4.474-4.474l.823.823a2.5 2.5 0 0 1 2.829 2.829l.822.822zm-2.943 1.299l.822.822a3.5 3.5 0 0 1-4.474-4.474l.823.823a2.5 2.5 0 0 0 2.829 2.829z"/><path d="M3.35 5.47c-.18.16-.353.322-.518.487A13.134 13.134 0 0 0 1.172 8l.195.288c.335.48.83 1.12 1.465 1.755C4.121 11.332 5.881 12.5 8 12.5c.716 0 1.39-.133 2.02-.36l.77.772A7.029 7.029 0 0 1 8 13.5C3 13.5 0 8 0 8s.939-1.721 2.641-3.238l.708.709z"/><path d="M13.646 14.354l-12-12 .708-.708 12 12-.708.708z"/></svg>
+                  <svg viewBox="0 0 16 16" class="eye-open" style="display:none"><path d="M16 8s-3-5.5-8-5.5S0 8 0 8s3 5.5 8 5.5S16 8 16 8zM1.173 8a13.133 13.133 0 0 1 1.66-2.043C4.12 4.668 5.88 3.5 8 3.5c2.12 0 3.879 1.168 5.168 2.457A13.133 13.133 0 0 1 14.828 8c-.058.087-.122.183-.195.288-.335.48-.83 1.12-1.465 1.755C11.879 11.332 10.119 12.5 8 12.5c-2.12 0-3.879-1.168-5.168-2.457A13.134 13.134 0 0 1 1.172 8z"/><path d="M8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5zM4.5 8a3.5 3.5 0 1 1 7 0 3.5 3.5 0 0 1-7 0z"/></svg>
+                </button>
+              </div>
+            </div>
+            <div class="llm-config-field">
+              <label class="llm-config-label">Model</label>
+              <input type="text" class="llm-config-input" id="comp-model" placeholder="claude-3-haiku-20240307">
+            </div>
+            <div class="llm-config-field">
+              <label class="llm-config-label">Provider</label>
+              <select class="llm-config-select" id="comp-provider">
+                <option value="openai">OpenAI</option>
+                <option value="anthropic">Anthropic</option>
+              </select>
+            </div>
+            <div class="llm-config-actions">
+              <button class="llm-config-test-btn" id="comp-test-btn">
+                <svg viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>
+                测试连接
+              </button>
+              <button class="llm-config-save-btn" id="comp-save-btn">
+                保存配置
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 工具 Tab 内容 (合并 MCP + 技能 + 配置) -->
+      <div class="settings-tab-content" id="settings-tab-tools">
+        <!-- MCP 工具 -->
+        <div class="settings-section">
+          <div class="settings-section-header">
+            <div class="settings-section-title">MCP 工具</div>
+            <button class="settings-btn primary" id="mcp-add-btn">+ 添加服务器</button>
+          </div>
+          <div class="settings-section-desc" style="margin-bottom: 12px; font-size: 12px; color: var(--vscode-descriptionForeground);">
+            通过 JSON 配置 MCP 服务器，自动解析和使用工具
+          </div>
+          <div class="mcp-server-list" id="mcp-server-list">
+            <div class="empty-state">
+              <svg viewBox="0 0 16 16" width="48" height="48" fill="currentColor" opacity="0.3">
+                <path d="M2 2.5a.5.5 0 0 1 .5-.5h3a.5.5 0 0 1 0 1H3v2.5a.5.5 0 0 1-1 0v-3zm12 0a.5.5 0 0 0-.5-.5h-3a.5.5 0 0 0 0 1H13v2.5a.5.5 0 0 0 1 0v-3zm-12 9a.5.5 0 0 0 .5.5h3a.5.5 0 0 0 0-1H3v-2.5a.5.5 0 0 0-1 0v3zm12 0a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1 0-1H13v-2.5a.5.5 0 0 1 1 0v3z"/>
+                <path d="M8 3a5 5 0 1 0 0 10A5 5 0 0 0 8 3zM4 8a4 4 0 1 1 8 0 4 4 0 0 1-8 0z"/>
+              </svg>
+              <p>暂无 MCP 服务器</p>
+              <p style="font-size: 11px; opacity: 0.6;">点击"添加服务器"开始配置</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Claude Skills 工具 -->
+        <div class="settings-section">
+          <div class="settings-section-header">
+            <div class="settings-section-title">Claude Skills 工具</div>
+            <div style="display: flex; gap: 8px;">
+              <button class="settings-btn primary" id="skill-add-btn" style="display: inline-flex; align-items: center; gap: 6px;">
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
+                  <path d="M8 2a.5.5 0 0 1 .5.5v5h5a.5.5 0 0 1 0 1h-5v5a.5.5 0 0 1-1 0v-5h-5a.5.5 0 0 1 0-1h5v-5A.5.5 0 0 1 8 2z"/>
+                </svg>
+                <span>安装 Skill</span>
+              </button>
+              <button class="settings-btn" id="repo-manage-btn" style="display: inline-flex; align-items: center; gap: 6px;">
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
+                  <path d="M2.5 3.5a.5.5 0 0 1 0-1h11a.5.5 0 0 1 0 1h-11zm0 3a.5.5 0 0 1 0-1h11a.5.5 0 0 1 0 1h-11zm0 3a.5.5 0 0 1 0-1h11a.5.5 0 0 1 0 1h-11zm0 3a.5.5 0 0 1 0-1h11a.5.5 0 0 1 0 1h-11z"/>
+                </svg>
+                <span>管理技能仓库</span>
+              </button>
+            </div>
+          </div>
+          <div class="settings-section-desc" style="margin-bottom: 12px; font-size: 12px; color: var(--vscode-descriptionForeground);">
+            通过 Skill 库安装的技能工具，由 Anthropic 提供
+          </div>
+          <div class="skills-tool-list" id="skills-tool-list">
+            <div class="empty-state">
+              <svg viewBox="0 0 16 16" width="48" height="48" fill="currentColor" opacity="0.3">
+                <path d="M5 2V0H0v5h2v6H0v5h5v-2h6v2h5v-5h-2V5h2V0h-5v2H5zm6 1v2h2v6h-2v2H5v-2H3V5h2V3h6z"/>
+              </svg>
+              <p>暂无已安装的 Skill</p>
+              <p style="font-size: 11px; opacity: 0.6;">点击"安装 Skill"从库中安装</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Shell 工具 -->
+        <div class="settings-section">
+          <div class="settings-section-title">Shell 工具</div>
+          <div class="settings-section-desc" style="margin-bottom: 12px; font-size: 12px; color: var(--vscode-descriptionForeground);">
+            默认内置的 Shell 执行器，在 VS Code 终端中执行命令
+          </div>
+          <div class="builtin-tool-list">
+            <div class="builtin-tool-item">
+              <div class="builtin-tool-icon">
+                <svg viewBox="0 0 16 16" width="20" height="20" fill="currentColor">
+                  <path d="M0 3a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V3zm9.5 5.5h-3a.5.5 0 0 0 0 1h3a.5.5 0 0 0 0-1z"/>
+                </svg>
+              </div>
+              <div class="builtin-tool-info">
+                <div class="builtin-tool-name">Shell 执行器</div>
+                <div class="builtin-tool-desc">在 VS Code 终端中执行命令（可视化）</div>
+              </div>
+              <div class="builtin-tool-badge enabled">内置</div>
+            </div>
+          </div>
+        </div>
+
         <!-- Augment 配置 -->
         <div class="settings-section prompt-enhance-section">
           <div class="settings-section-title">Augment 配置</div>
@@ -2536,6 +3311,40 @@
       streamingHintTimer = null;
     }
 
+    /**
+     * 🔧 清除所有消息的 streaming 状态
+     * 用于错误发生、会话中断等情况
+     */
+    function clearAllStreamingStates() {
+      // 清除 Thread 消息的 streaming 状态
+      threadMessages.forEach(m => {
+        if (m.streaming) {
+          m.streaming = false;
+        }
+      });
+
+      // 清除所有 CLI 消息的 streaming 状态
+      ['claude', 'codex', 'gemini'].forEach(cli => {
+        const msgs = cliOutputs[cli] || [];
+        msgs.forEach(m => {
+          if (m.streaming) {
+            m.streaming = false;
+          }
+        });
+      });
+
+      // 移除 DOM 中的 streaming 类和动画元素
+      document.querySelectorAll('.message.streaming').forEach(el => {
+        el.classList.remove('streaming');
+      });
+      document.querySelectorAll('.message-streaming-hint, .message-streaming-footer').forEach(el => {
+        el.remove();
+      });
+
+      // 更新处理状态
+      setProcessingState(false);
+    }
+
     // 🔧 风险1修复：带超时检测的流式提示更新
     const STREAM_TIMEOUT = 5 * 60 * 1000; // 5 分钟超时
     function updateStreamingHintsWithTimeout() {
@@ -2604,8 +3413,20 @@
       }
     });
 
+    // ========== 交互状态管理 ==========
+    // 交互状态：Idle / Processing / Awaiting
+    let interactionState = 'idle'; // 'idle' | 'processing' | 'awaiting'
+    let awaitingContext = null; // 等待输入时的上下文信息
+
     // 🔧 P3 修复：增强 setProcessingState，支持强制重置 thinkingStartAt
     function setProcessingState(next, forceResetTimer = false) {
+      // 🔧 关键修复：等待状态是受保护的，后续消息不应覆盖
+      // 根据 UI_UX_DESIGN_SPECIFICATION.md 第 449 行：防止后续消息覆盖状态
+      if (interactionState === 'awaiting' && next === true) {
+        console.log('[Webview] 忽略处理状态变更，当前正在等待用户输入');
+        return;  // 不要覆盖等待状态
+      }
+
       const changed = isProcessing !== next;
       isProcessing = next;
       if (next) {
@@ -2613,13 +3434,57 @@
         if (!thinkingStartAt || forceResetTimer) {
           thinkingStartAt = Date.now();
         }
+        interactionState = 'processing';
       } else {
         thinkingStartAt = null;
+        // 只有不是等待状态时才设为空闲
+        if (interactionState !== 'awaiting') {
+          interactionState = 'idle';
+        }
       }
       if (changed) {
         updateSendButtonState();
         saveWebviewState();
       }
+    }
+
+    // 进入等待用户输入状态
+    function enterAwaitingState(context) {
+      interactionState = 'awaiting';
+      awaitingContext = context || {};
+      isProcessing = false;
+      thinkingStartAt = null;
+
+      const inputBox = document.getElementById('prompt-input');
+      if (inputBox) {
+        inputBox.disabled = false;
+        if (context && context.prompt) {
+          const promptPreview = context.prompt.length > 40
+            ? context.prompt.substring(0, 40) + '...'
+            : context.prompt;
+          inputBox.placeholder = '回复: ' + promptPreview;
+        } else {
+          inputBox.placeholder = '输入您的回复...';
+        }
+        inputBox.focus();
+      }
+      updateSendButtonState();
+      saveWebviewState();
+    }
+
+    // 退出等待用户输入状态
+    function exitAwaitingState() {
+      interactionState = 'idle';
+      awaitingContext = null;
+      window._pendingCliQuestion = null;
+      window._pendingClarification = null;
+      window._pendingWorkerQuestion = null;
+
+      const inputBox = document.getElementById('prompt-input');
+      if (inputBox) {
+        inputBox.placeholder = '输入消息或 / 查看命令...';
+      }
+      updateSendButtonState();
     }
 
     function setProcessingActor(source, cli) {
@@ -2635,16 +3500,28 @@
       if (!thinkingStartAt) thinkingStartAt = Date.now();
     }
 
-    // 更新发送按钮状态
+    // 更新发送按钮状态（三态：idle / processing / awaiting）
     function updateSendButtonState() {
       const btn = document.getElementById('execute-btn');
+      const inputBox = document.getElementById('prompt-input');
       if (!btn) return;
-      if (isProcessing) {
+
+      if (interactionState === 'processing') {
         btn.classList.add('processing');
+        btn.disabled = false;
         btn.title = '停止 (Esc)';
-      } else {
+        if (inputBox) inputBox.disabled = true;
+      } else if (interactionState === 'awaiting') {
         btn.classList.remove('processing');
+        btn.disabled = false;
+        btn.title = '发送回复 (Cmd+Enter)';
+        if (inputBox) inputBox.disabled = false;
+      } else {
+        // idle 状态
+        btn.classList.remove('processing');
+        btn.disabled = false;
         btn.title = '发送 (Cmd+Enter)';
+        if (inputBox) inputBox.disabled = false;
       }
     }
 
@@ -2894,8 +3771,210 @@
         if (urlInput) urlInput.value = msg.baseUrl || '';
         if (keyInput) keyInput.value = msg.apiKey || '';
       }
-      else if (msg.type === 'cliError') { addSystemMessage(msg.cli + ': ' + msg.error, 'error'); }
+      else if (msg.type === 'cliError') {
+        // 🔧 修复：CLI 错误时清除所有 streaming 状态
+        stopStreamingHintTimer();
+        clearAllStreamingStates();
+        addSystemMessage(msg.cli + ': ' + msg.error, 'error');
+      }
       else if (msg.type === 'toast') { addSystemMessage(msg.message, msg.toastType || 'info'); }
+      // Worker 配置消息处理
+      else if (msg.type === 'allWorkerConfigsLoaded') {
+        // 加载所有 Worker 配置
+        workerConfigs = msg.configs || { claude: null, codex: null, gemini: null };
+        displayWorkerConfig(currentWorker);
+      }
+      else if (msg.type === 'workerConfigSaved') {
+        // 配置保存成功（toast 已由后端发送）
+        // 无需额外操作
+      }
+      else if (msg.type === 'workerConnectionTestResult') {
+        // 连接测试结果
+        const workerTestBtn = document.getElementById('worker-test-btn');
+        if (workerTestBtn) {
+          workerTestBtn.classList.remove('loading');
+          workerTestBtn.disabled = false;
+
+          // 根据测试结果显示状态
+          if (msg.success) {
+            workerTestBtn.classList.add('success');
+            workerTestBtn.innerHTML = '<svg viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>连接成功';
+          } else {
+            workerTestBtn.classList.add('error');
+            workerTestBtn.innerHTML = '<svg viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 13A6 6 0 1 1 8 2a6 6 0 0 1 0 12zm.75-8.25a.75.75 0 0 0-1.5 0v3.5a.75.75 0 0 0 1.5 0v-3.5zM8 11a1 1 0 1 0 0-2 1 1 0 0 0 0 2z"/></svg>连接失败';
+          }
+
+          // 2秒后恢复初始状态
+          setTimeout(() => {
+            workerTestBtn.classList.remove('success', 'error');
+            workerTestBtn.innerHTML = '<svg viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>测试连接';
+          }, 2000);
+        }
+      }
+      else if (msg.type === 'orchestratorConfigLoaded') {
+        // 加载编排者配置
+        const config = msg.config || {};
+        const baseUrlInput = document.getElementById('orch-base-url');
+        const apiKeyInput = document.getElementById('orch-api-key');
+        const modelInput = document.getElementById('orch-model');
+        const providerSelect = document.getElementById('orch-provider');
+        const enabledCheckbox = document.getElementById('orch-enabled');
+
+        if (baseUrlInput) baseUrlInput.value = config.baseUrl || '';
+        if (apiKeyInput) apiKeyInput.value = config.apiKey || '';
+        if (modelInput) modelInput.value = config.model || '';
+        if (providerSelect) providerSelect.value = config.provider || 'anthropic';
+        if (enabledCheckbox) enabledCheckbox.checked = config.enabled !== false;
+      }
+      else if (msg.type === 'orchestratorConfigSaved') {
+        // 编排者配置保存成功（toast 已由后端发送）
+        // 无需额外操作
+      }
+      else if (msg.type === 'orchestratorConnectionTestResult') {
+        // 编排者连接测试结果
+        const orchTestBtn = document.getElementById('orch-test-btn');
+        if (orchTestBtn) {
+          orchTestBtn.classList.remove('loading');
+          orchTestBtn.disabled = false;
+
+          // 根据测试结果显示状态
+          if (msg.success) {
+            orchTestBtn.classList.add('success');
+            orchTestBtn.innerHTML = '<svg viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>连接成功';
+          } else {
+            orchTestBtn.classList.add('error');
+            orchTestBtn.innerHTML = '<svg viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 13A6 6 0 1 1 8 2a6 6 0 0 1 0 12zm.75-8.25a.75.75 0 0 0-1.5 0v3.5a.75.75 0 0 0 1.5 0v-3.5zM8 11a1 1 0 1 0 0-2 1 1 0 0 0 0 2z"/></svg>连接失败';
+          }
+
+          // 2秒后恢复初始状态
+          setTimeout(() => {
+            orchTestBtn.classList.remove('success', 'error');
+            orchTestBtn.innerHTML = '<svg viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>测试连接';
+          }, 2000);
+        }
+      }
+      else if (msg.type === 'compressorConnectionTestResult') {
+        // 压缩器连接测试结果
+        const compTestBtn = document.getElementById('comp-test-btn');
+        if (compTestBtn) {
+          compTestBtn.classList.remove('loading');
+          compTestBtn.disabled = false;
+
+          // 根据测试结果显示状态
+          if (msg.success) {
+            compTestBtn.classList.add('success');
+            compTestBtn.innerHTML = '<svg viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>连接成功';
+          } else {
+            compTestBtn.classList.add('error');
+            compTestBtn.innerHTML = '<svg viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 13A6 6 0 1 1 8 2a6 6 0 0 1 0 12zm.75-8.25a.75.75 0 0 0-1.5 0v3.5a.75.75 0 0 0 1.5 0v-3.5zM8 11a1 1 0 1 0 0-2 1 1 0 0 0 0 2z"/></svg>连接失败';
+          }
+
+          // 2秒后恢复初始状态
+          setTimeout(() => {
+            compTestBtn.classList.remove('success', 'error');
+            compTestBtn.innerHTML = '<svg viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>测试连接';
+          }, 2000);
+        }
+      }
+      else if (msg.type === 'compressorConfigLoaded') {
+        // 加载压缩器配置
+        const config = msg.config || {};
+        const enabledCheckbox = document.getElementById('compressor-enabled');
+        const baseUrlInput = document.getElementById('comp-base-url');  // ✅ FIX: 使用正确的 ID
+        const apiKeyInput = document.getElementById('comp-api-key');    // ✅ FIX: 使用正确的 ID
+        const modelInput = document.getElementById('comp-model');        // ✅ FIX: 使用正确的 ID
+        const providerSelect = document.getElementById('comp-provider'); // ✅ FIX: 使用正确的 ID
+
+        if (enabledCheckbox) enabledCheckbox.checked = config.enabled === true;
+        if (baseUrlInput) baseUrlInput.value = config.baseUrl || '';
+        if (apiKeyInput) apiKeyInput.value = config.apiKey || '';
+        if (modelInput) modelInput.value = config.model || '';
+        if (providerSelect) providerSelect.value = config.provider || 'anthropic';
+
+        // 根据启用状态显示/隐藏配置表单
+        const configForm = document.getElementById('compressor-config');
+        if (configForm) {
+          configForm.style.display = config.enabled ? 'block' : 'none';
+        }
+      }
+      else if (msg.type === 'compressorConfigSaved') {
+        // 压缩器配置保存成功（toast 已由后端发送）
+        // 无需额外操作
+      }
+      // MCP 配置消息处理
+      else if (msg.type === 'mcpServersLoaded') {
+        mcpServers = msg.servers || [];
+        renderMCPServerList();
+      }
+      else if (msg.type === 'mcpServerAdded') {
+        mcpServers.push(msg.server);
+        renderMCPServerList();
+      }
+      else if (msg.type === 'mcpServerUpdated') {
+        // 重新加载服务器列表
+        vscode.postMessage({ type: 'loadMCPServers' });
+      }
+      else if (msg.type === 'mcpServerDeleted') {
+        mcpServers = mcpServers.filter(s => s.id !== msg.serverId);
+        renderMCPServerList();
+      }
+      else if (msg.type === 'mcpServerConnected') {
+        // 服务器连接成功（toast 已由后端发送）
+        // 可以更新 UI 显示连接状态
+      }
+      else if (msg.type === 'mcpServerDisconnected') {
+        // 服务器断开连接（toast 已由后端发送）
+      }
+      else if (msg.type === 'mcpServerConnectionFailed') {
+        // 连接失败（toast 已由后端发送）
+      }
+      else if (msg.type === 'mcpToolsRefreshed') {
+        renderMCPTools(msg.serverId, msg.tools);
+      }
+      else if (msg.type === 'mcpServerTools') {
+        renderMCPTools(msg.serverId, msg.tools);
+      }
+      // Skills 配置消息处理
+      else if (msg.type === 'skillsConfigLoaded') {
+        skillsConfig = msg.config;
+        renderSkillsToolList();
+      }
+      else if (msg.type === 'skillInstalled') {
+        // Skill 安装成功，配置会自动重新加载
+        // 不需要额外处理，因为 handleInstallSkill 会调用 handleLoadSkillsConfig
+      }
+      // Skill 仓库消息处理
+      else if (msg.type === 'repositoriesLoaded') {
+        repositories = msg.repositories || [];
+        // 如果仓库管理对话框打开，更新它
+        if (document.getElementById('repo-manage-overlay')) {
+          renderRepositoryManagementList();
+        }
+      }
+      else if (msg.type === 'repositoryAdded') {
+        repositories.push(msg.repository);
+        // 如果仓库管理对话框打开，更新它
+        if (document.getElementById('repo-manage-overlay')) {
+          renderRepositoryManagementList();
+        }
+      }
+      else if (msg.type === 'repositoryUpdated') {
+        // 重新加载仓库列表
+        vscode.postMessage({ type: 'loadRepositories' });
+      }
+      else if (msg.type === 'repositoryDeleted') {
+        repositories = repositories.filter(r => r.id !== msg.repositoryId);
+        // 如果仓库管理对话框打开，更新它
+        if (document.getElementById('repo-manage-overlay')) {
+          renderRepositoryManagementList();
+        }
+      }
+      else if (msg.type === 'repositoryRefreshed') {
+        // 缓存已刷新（toast 已由后端发送）
+      }
+      else if (msg.type === 'skillLibraryLoaded') {
+        showSkillLibraryDialog(msg.skills);
+      }
       else if (msg.type === 'sessionCreated') {
         sessions.push(msg.session);
         currentSessionId = msg.session.id;
@@ -3039,17 +4118,16 @@
         existingMsg.isPending = true;
         // 保留原有的 review 信息（如果有）
 
-        // 🔧 修复：等待确认时，AI应该停止工作，设置为对话完成状态
-        setProcessingState(false);
+        // 🔧 修复：清除处理宽限期并进入等待状态（等待用户确认计划）
+        localProcessingUntil = 0;
+        enterAwaitingState({
+          type: 'plan_confirmation',
+          prompt: '请确认或拒绝执行计划...'
+        });
 
         saveWebviewState();
         renderMainContent();
-        requestAnimationFrame(() => {
-          const mainContent = document.getElementById('main-content');
-          if (mainContent) {
-            mainContent.scrollTop = mainContent.scrollHeight;
-          }
-        });
+        smoothScrollToBottom();
         return;
       }
 
@@ -3075,19 +4153,16 @@
         threadMessages.push(confirmationMsg);
       }
 
-      // 🔧 修复：等待确认时，AI应该停止工作，设置为对话完成状态
-      setProcessingState(false);
+      // 🔧 修复：清除处理宽限期并进入等待状态（等待用户确认计划）
+      localProcessingUntil = 0;
+      enterAwaitingState({
+        type: 'plan_confirmation',
+        prompt: '请确认或拒绝执行计划...'
+      });
 
       saveWebviewState();
       renderMainContent();
-
-      // 自动滚动到确认卡片位置
-      requestAnimationFrame(() => {
-        const mainContent = document.getElementById('main-content');
-        if (mainContent) {
-          mainContent.scrollTop = mainContent.scrollHeight;
-        }
-      });
+      smoothScrollToBottom();
     }
 
     // 显示问题补充卡片
@@ -3109,20 +4184,16 @@
         });
       }
 
-      setProcessingState(false);
+      // 🔧 修复：清除处理宽限期并进入等待状态
+      localProcessingUntil = 0;
+      enterAwaitingState({
+        type: 'question_request',
+        prompt: '请回答补充问题后发送...'
+      });
+
       saveWebviewState();
       renderMainContent();
-      const input = document.getElementById('prompt-input');
-      if (input) {
-        input.placeholder = '请回答补充问题后发送...';
-        input.focus();
-      }
-      requestAnimationFrame(() => {
-        const mainContent = document.getElementById('main-content');
-        if (mainContent) {
-          mainContent.scrollTop = mainContent.scrollHeight;
-        }
-      });
+      smoothScrollToBottom();
     }
 
     function hasPendingQuestion() {
@@ -3172,15 +4243,15 @@
         timestamp: Date.now()
       };
 
-      setProcessingState(false);
+      // 🔧 修复：清除处理宽限期并进入等待状态
+      localProcessingUntil = 0;
+      enterAwaitingState({
+        type: 'clarification',
+        prompt: '请输入补充信息...'
+      });
+
       saveWebviewState();
       renderMainContent();
-
-      const input = document.getElementById('prompt-input');
-      if (input) {
-        input.placeholder = '请输入补充信息...';
-        input.focus();
-      }
       smoothScrollToBottom();
     }
 
@@ -3255,14 +4326,16 @@
         timestamp: Date.now()
       };
 
-      setProcessingState(false);
+      // 🔧 修复：清除处理宽限期并进入等待状态
+      localProcessingUntil = 0;
+      enterAwaitingState({
+        type: 'worker_question',
+        cli: workerId,
+        prompt: `回复 ${workerId} 的问题...`
+      });
+
       saveWebviewState();
       renderMainContent();
-      const input = document.getElementById('prompt-input');
-      if (input) {
-        input.placeholder = `回复 ${workerId} 的问题...`;
-        input.focus();
-      }
       smoothScrollToBottom();
     }
 
@@ -3459,6 +4532,91 @@
     }
 
     /**
+     * 🔧 渲染结构化规划内容
+     * 将规划 JSON 转换为用户友好的结构化展示
+     */
+    function renderStructuredPlanContent(plan) {
+      let html = '<div class="structured-plan-content">';
+
+      // 目标
+      if (plan.goal) {
+        html += '<div class="plan-section">';
+        html += '<div class="plan-section-title">🎯 目标</div>';
+        html += '<div class="plan-section-content">' + escapeHtml(plan.goal) + '</div>';
+        html += '</div>';
+      }
+
+      // 分析
+      if (plan.analysis) {
+        html += '<div class="plan-section">';
+        html += '<div class="plan-section-title">📋 分析</div>';
+        html += '<div class="plan-section-content">' + escapeHtml(plan.analysis) + '</div>';
+        html += '</div>';
+      }
+
+      // 约束条件
+      if (plan.constraints && Array.isArray(plan.constraints) && plan.constraints.length > 0) {
+        html += '<div class="plan-section">';
+        html += '<div class="plan-section-title">⚠️ 约束条件</div>';
+        html += '<ul class="plan-list">';
+        for (const constraint of plan.constraints) {
+          html += '<li>' + escapeHtml(String(constraint)) + '</li>';
+        }
+        html += '</ul>';
+        html += '</div>';
+      }
+
+      // 验收标准
+      if (plan.acceptanceCriteria && Array.isArray(plan.acceptanceCriteria) && plan.acceptanceCriteria.length > 0) {
+        html += '<div class="plan-section">';
+        html += '<div class="plan-section-title">✅ 验收标准</div>';
+        html += '<ul class="plan-list">';
+        for (const criteria of plan.acceptanceCriteria) {
+          html += '<li>' + escapeHtml(String(criteria)) + '</li>';
+        }
+        html += '</ul>';
+        html += '</div>';
+      }
+
+      // 风险等级
+      if (plan.riskLevel) {
+        const riskColors = {
+          'low': 'var(--vscode-testing-iconPassed)',
+          'medium': 'var(--vscode-editorWarning-foreground)',
+          'high': 'var(--vscode-errorForeground)'
+        };
+        const riskLabels = {
+          'low': '低',
+          'medium': '中',
+          'high': '高'
+        };
+        const riskColor = riskColors[plan.riskLevel] || 'var(--vscode-foreground)';
+        const riskLabel = riskLabels[plan.riskLevel] || plan.riskLevel;
+        html += '<div class="plan-section">';
+        html += '<div class="plan-section-title">⚡ 风险等级</div>';
+        html += '<div class="plan-section-content">';
+        html += '<span class="risk-badge" style="background: ' + riskColor + '; color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 0.9em;">' + escapeHtml(riskLabel) + '</span>';
+        html += '</div>';
+        html += '</div>';
+      }
+
+      // 风险因素
+      if (plan.riskFactors && Array.isArray(plan.riskFactors) && plan.riskFactors.length > 0) {
+        html += '<div class="plan-section">';
+        html += '<div class="plan-section-title">🚨 风险因素</div>';
+        html += '<ul class="plan-list risk-list">';
+        for (const factor of plan.riskFactors) {
+          html += '<li>' + escapeHtml(String(factor)) + '</li>';
+        }
+        html += '</ul>';
+        html += '</div>';
+      }
+
+      html += '</div>';
+      return html;
+    }
+
+    /**
      * 解析代码块语言标签，提取语言和文件路径
      * 支持格式: ```python:path/to/file.py 或 ```python path/to/file.py
      */
@@ -3549,17 +4707,63 @@
       }
       headerInfoHtml += '</div>';
 
-      // 构建完整 HTML
-      const html = '<div class="markdown-code-block' + (isDiff ? ' diff-block' : '') + '">' +
-        '<div class="markdown-code-header">' +
-        headerInfoHtml +
-        '</div>' +
-        '<div class="markdown-code-content">' +
-        '<div class="code-line-numbers">' + lineNumbersHtml + '</div>' +
-        '<div class="code-lines" id="' + codeId + '">' + codeLinesHtml + '</div>' +
-        '</div></div>';
+      // 复制按钮
+      const copyBtnHtml = '<button class="code-copy-btn" onclick="copyCodeBlock(\'' + codeId + '\')" title="复制代码">' +
+        '<svg viewBox="0 0 16 16"><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/><path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/></svg>' +
+        '</button>';
 
-      return html;
+      // 检查是否需要折叠（超过 20 行）
+      const shouldCollapse = lines.length > 20;
+      const previewLines = 5;
+
+      // 构建完整 HTML
+      if (shouldCollapse) {
+        // 折叠模式：只显示前 5 行，可展开查看全部
+        let previewLineNumbersHtml = '';
+        let previewCodeLinesHtml = '';
+        for (let i = 0; i < Math.min(previewLines, lines.length); i++) {
+          previewLineNumbersHtml += '<div class="code-line-number">' + (i + 1) + '</div>';
+          const lineClass = isDiff ? (lines[i].match(/^[+](?!\+\+)/) ? 'code-line diff-add' : (lines[i].match(/^[-](?!--)/) ? 'code-line diff-del' : 'code-line')) : 'code-line';
+          previewCodeLinesHtml += '<div class="' + lineClass + '">' + (highlightedLines[i] || '') + '</div>';
+        }
+
+        const html = '<div class="markdown-code-block collapsible-code' + (isDiff ? ' diff-block' : '') + '" data-code-id="' + codeId + '">' +
+          '<div class="markdown-code-header">' +
+          headerInfoHtml +
+          '<div class="code-header-actions">' +
+          '<span class="code-line-count">' + lines.length + ' 行</span>' +
+          copyBtnHtml +
+          '</div>' +
+          '</div>' +
+          '<div class="markdown-code-preview">' +
+          '<div class="code-line-numbers">' + previewLineNumbersHtml + '</div>' +
+          '<div class="code-lines">' + previewCodeLinesHtml + '</div>' +
+          '</div>' +
+          '<div class="code-expand-bar" onclick="expandCodeBlock(\'' + codeId + '\')">' +
+          '<span class="code-expand-hint">显示全部 ' + lines.length + ' 行</span>' +
+          '<svg viewBox="0 0 16 16"><path d="M1.646 4.646a.5.5 0 0 1 .708 0L8 10.293l5.646-5.647a.5.5 0 0 1 .708.708l-6 6a.5.5 0 0 1-.708 0l-6-6a.5.5 0 0 1 0-.708z"/></svg>' +
+          '</div>' +
+          '<div class="markdown-code-full" style="display: none;">' +
+          '<div class="code-line-numbers">' + lineNumbersHtml + '</div>' +
+          '<div class="code-lines" id="' + codeId + '">' + codeLinesHtml + '</div>' +
+          '</div>' +
+          '</div>';
+        return html;
+      } else {
+        // 不折叠模式
+        const html = '<div class="markdown-code-block' + (isDiff ? ' diff-block' : '') + '">' +
+          '<div class="markdown-code-header">' +
+          headerInfoHtml +
+          '<div class="code-header-actions">' +
+          copyBtnHtml +
+          '</div>' +
+          '</div>' +
+          '<div class="markdown-code-content">' +
+          '<div class="code-line-numbers">' + lineNumbersHtml + '</div>' +
+          '<div class="code-lines" id="' + codeId + '">' + codeLinesHtml + '</div>' +
+          '</div></div>';
+        return html;
+      }
     }
 
     /**
@@ -3568,6 +4772,49 @@
     function openFileInEditor(filepath) {
       if (!filepath) return;
       vscode.postMessage({ type: 'openFile', filepath: filepath });
+    }
+
+    /**
+     * 复制代码块内容
+     */
+    function copyCodeBlock(codeId) {
+      const codeElement = document.getElementById(codeId);
+      if (!codeElement) return;
+
+      // 获取纯文本内容
+      const text = codeElement.innerText || codeElement.textContent;
+
+      navigator.clipboard.writeText(text).then(() => {
+        // 显示复制成功提示
+        const btn = event.currentTarget;
+        const originalHtml = btn.innerHTML;
+        btn.innerHTML = '<svg viewBox="0 0 16 16"><path d="M13.854 3.646a.5.5 0 0 1 0 .708l-7 7a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L6.5 10.293l6.646-6.647a.5.5 0 0 1 .708 0z"/></svg>';
+        btn.classList.add('copied');
+        setTimeout(() => {
+          btn.innerHTML = originalHtml;
+          btn.classList.remove('copied');
+        }, 1500);
+      }).catch(err => {
+        console.error('[copyCodeBlock] 复制失败:', err);
+      });
+    }
+
+    /**
+     * 展开折叠的代码块
+     */
+    function expandCodeBlock(codeId) {
+      const block = document.querySelector('[data-code-id="' + codeId + '"]');
+      if (!block) return;
+
+      const preview = block.querySelector('.markdown-code-preview');
+      const expandBar = block.querySelector('.code-expand-bar');
+      const full = block.querySelector('.markdown-code-full');
+
+      if (preview) preview.style.display = 'none';
+      if (expandBar) expandBar.style.display = 'none';
+      if (full) full.style.display = 'flex';
+
+      block.classList.add('expanded');
     }
 
     // Markdown 渲染函数
@@ -3653,8 +4900,25 @@
       return indentedLines.length >= 3;
     }
 
+    /**
+     * 提取单个代码块
+     * 匹配 ```lang:filepath 或 ```lang filepath 或 ```lang
+     */
+    function extractSingleCodeFence(content) {
+      if (!content) return null;
+      const trimmed = content.trim();
+      // 匹配 ```lang:filepath 或 ```lang filepath 或 ```lang
+      const match = trimmed.match(/^```(\w*)(?::([^\s\n]+)|\s+([^\n]+))?\s*\n([\s\S]*?)\n?```\s*$/);
+      if (!match) return null;
+      const lang = match[1] || '';
+      const filepath = match[2] || match[3] || undefined;
+      const body = match[4] || '';
+      return { lang: lang, body: body, filepath: filepath };
+    }
+
     function renderToolPanelContent(content) {
       if (!content) return '';
+      // 后端已统一序列化，这里直接处理字符串
       const text = typeof content === 'string' ? content : String(content);
       let trimmed = text.trim();
       if (!trimmed) return '';
@@ -3683,31 +4947,106 @@
       }).join('');
     }
 
+    // 渲染 Worker 完成摘要卡片（增强版：可折叠，含统计信息）
     function renderSubTaskSummaryCard(message) {
       const card = message.metadata?.subTaskCard;
       if (!card) return null;
       const statusText = card.status === 'failed' ? '失败' : '完成';
       const badgeClass = card.status === 'failed' ? 'badge-failed' : 'badge-completed';
-      const changes = card.changes && card.changes.length > 0 ? card.changes : ['暂无文件变更记录'];
+      const cli = card.executor || card.cli || '';
+      const cliClass = cli.toLowerCase().includes('claude') ? 'claude' : cli.toLowerCase().includes('codex') ? 'codex' : cli.toLowerCase().includes('gemini') ? 'gemini' : '';
+
+      // 构建概览统计
+      let contentHtml = '<div class="worker-summary-overview">';
+      contentHtml += '<div class="worker-summary-stat">';
+      contentHtml += '<span class="worker-summary-stat-label">执行者</span>';
+      contentHtml += '<span class="worker-summary-stat-value">' + escapeHtml(cli || '未知') + '</span>';
+      contentHtml += '</div>';
+      contentHtml += '<div class="worker-summary-stat">';
+      contentHtml += '<span class="worker-summary-stat-label">耗时</span>';
+      contentHtml += '<span class="worker-summary-stat-value">' + escapeHtml(card.duration || '-') + '</span>';
+      contentHtml += '</div>';
+      contentHtml += '<div class="worker-summary-stat">';
+      contentHtml += '<span class="worker-summary-stat-label">状态</span>';
+      contentHtml += '<span class="worker-summary-stat-value ' + (card.status === 'failed' ? 'error' : 'success') + '">' + statusText + '</span>';
+      contentHtml += '</div>';
+      if (card.toolCount !== undefined) {
+        contentHtml += '<div class="worker-summary-stat">';
+        contentHtml += '<span class="worker-summary-stat-label">工具调用</span>';
+        contentHtml += '<span class="worker-summary-stat-value">' + card.toolCount + ' 次</span>';
+        contentHtml += '</div>';
+      }
+      contentHtml += '</div>';
+
+      // 任务描述
+      if (card.description) {
+        contentHtml += '<div class="tool-section">';
+        contentHtml += '<div class="tool-section-title">任务描述</div>';
+        contentHtml += '<div class="tool-text">' + escapeHtml(card.description) + '</div>';
+        contentHtml += '</div>';
+      }
+
+      // 错误信息（如果有）
+      if (card.error) {
+        contentHtml += '<div class="tool-section">';
+        contentHtml += '<div class="tool-section-title" style="color: var(--color-error)">错误信息</div>';
+        contentHtml += '<div class="tool-text" style="color: var(--color-error)">' + escapeHtml(card.error) + '</div>';
+        contentHtml += '</div>';
+      }
+
+      // 文件变更列表
+      const changes = card.changes && card.changes.length > 0 ? card.changes : [];
+      if (changes.length > 0) {
+        contentHtml += '<div class="worker-summary-changes">';
+        contentHtml += '<div class="worker-summary-changes-title">文件变更 (' + changes.length + ')</div>';
+        contentHtml += '<ul class="worker-summary-file-list">';
+        changes.forEach(file => {
+          const fileStr = String(file);
+          // 检测变更类型
+          let iconClass = 'modified';
+          let iconSvg = '<svg viewBox="0 0 16 16"><path d="M5.5 7.5a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1-.5-.5z"/><path d="M8 2a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11zM1.5 7.5a6.5 6.5 0 1 1 13 0 6.5 6.5 0 0 1-13 0z"/></svg>';
+          if (fileStr.includes('新增') || fileStr.includes('create') || fileStr.includes('+')) {
+            iconClass = 'created';
+            iconSvg = '<svg viewBox="0 0 16 16"><path d="M8 4a.5.5 0 0 1 .5.5v3h3a.5.5 0 0 1 0 1h-3v3a.5.5 0 0 1-1 0v-3h-3a.5.5 0 0 1 0-1h3v-3A.5.5 0 0 1 8 4z"/></svg>';
+          } else if (fileStr.includes('删除') || fileStr.includes('delete') || fileStr.includes('-')) {
+            iconClass = 'deleted';
+            iconSvg = '<svg viewBox="0 0 16 16"><path d="M5.5 7.5a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1-.5-.5z"/></svg>';
+          }
+          contentHtml += '<li class="worker-summary-file-item">';
+          contentHtml += '<span class="worker-summary-file-icon ' + iconClass + '">' + iconSvg + '</span>';
+          contentHtml += '<span class="worker-summary-file-path">' + escapeHtml(fileStr) + '</span>';
+          contentHtml += '</li>';
+        });
+        contentHtml += '</ul>';
+        contentHtml += '</div>';
+      }
+
+      // 验证提醒
       const verification = card.verification && card.verification.length > 0 ? card.verification : [];
-      const sections = [
-        { title: '概览', items: [
-          `描述: ${card.description || ''}`,
-          `执行者: ${card.executor || ''}`,
-          `耗时: ${card.duration || ''}`,
-        ].filter(Boolean) },
-        card.error ? { title: '错误', items: [card.error] } : null,
-        { title: '文件变更', items: changes },
-        verification.length > 0 ? { title: '验证提醒', items: verification } : null,
-      ].filter(Boolean);
+      if (verification.length > 0) {
+        contentHtml += '<div class="tool-section">';
+        contentHtml += '<div class="tool-section-title" style="color: var(--color-warning)">验证提醒</div>';
+        contentHtml += '<ul class="summary-list">';
+        verification.forEach(item => {
+          contentHtml += '<li>' + escapeHtml(item) + '</li>';
+        });
+        contentHtml += '</ul>';
+        contentHtml += '</div>';
+      }
 
       return renderUnifiedCard({
         type: 'summary',
         variant: card.status === 'failed' ? 'error' : 'success',
-        title: card.title || '子任务结果',
-        badges: [{ text: statusText, class: badgeClass }],
-        content: renderSummarySections(sections),
-        collapsed: false,
+        icon: getRoleIcon(cliClass || 'success'),
+        title: card.title || 'Worker 执行摘要',
+        badges: [
+          { text: cli ? cli.toUpperCase() : 'WORKER', class: 'badge-' + (cliClass || 'info') },
+          { text: statusText, class: badgeClass }
+        ],
+        content: contentHtml,
+        collapsed: true,       // 默认折叠
+        expanded: false,
+        className: 'worker-summary-card',
       });
     }
 
@@ -3724,7 +5063,7 @@
       });
     }
 
-    // 渲染单个工具调用项（使用统一卡片组件风格）
+    // 渲染单个工具调用项（截图风格：IN/OUT 分区）
     function renderToolCallItem(tool, toolIdx, panelPrefix, isLatest) {
       const inputContent = tool.input || '';
       const outputContent = tool.output || tool.result || '';
@@ -3738,18 +5077,30 @@
       const toolStatus = tool.status || 'completed';
       const statusText = toolStatus === 'running' ? '执行中' : toolStatus === 'failed' ? '失败' : '完成';
       const badgeClass = toolStatus === 'running' ? 'badge-running' : toolStatus === 'failed' ? 'badge-failed' : 'badge-completed';
+      const durationText = tool.duration ? (tool.duration / 1000).toFixed(1) + 's' : '';
 
-      const sections = [];
+      // 构建截图风格的 IN/OUT 面板
+      const buildSnapshotSection = (label, labelClass, content, meta) => {
+        return '<div class="tool-snapshot-section">' +
+          '<div class="tool-snapshot-header">' +
+            '<span class="tool-snapshot-label ' + labelClass + '">' + label + '</span>' +
+            (meta ? '<span class="tool-snapshot-meta">' + escapeHtml(meta) + '</span>' : '') +
+          '</div>' +
+          '<div class="tool-snapshot-body">' + renderToolPanelContent(content) + '</div>' +
+        '</div>';
+      };
+
+      let snapshotHtml = '<div class="tool-snapshot">';
       if (hasInput) {
-        sections.push('<div class="tool-section"><div class="tool-section-title">IN</div>' + renderToolPanelContent(inputContent) + '</div>');
+        snapshotHtml += buildSnapshotSection('IN', 'in', inputContent, '');
       }
       if (hasOutput) {
-        sections.push('<div class="tool-section"><div class="tool-section-title">OUT</div>' + renderToolPanelContent(outputContent) + '</div>');
+        snapshotHtml += buildSnapshotSection('OUT', 'out', outputContent, durationText);
       }
       if (hasError) {
-        sections.push('<div class="tool-section"><div class="tool-section-title">ERROR</div>' + renderToolPanelContent(errorContent) + '</div>');
+        snapshotHtml += buildSnapshotSection('ERROR', 'error', errorContent, '');
       }
-      const toolContent = sections.join('');
+      snapshotHtml += '</div>';
 
       // 使用统一卡片组件渲染工具调用
       return renderUnifiedCard({
@@ -3758,7 +5109,7 @@
         icon: getToolIcon(tool.name),
         title: tool.name || '工具调用',
         badges: [{ text: statusText, class: badgeClass }],
-        content: toolContent,
+        content: snapshotHtml,
         collapsed: true,           // 启用折叠功能
         expanded: isLatest,        // 最新的工具调用默认展开
         panelId: toolPanelId,      // 折叠面板 ID
@@ -4023,6 +5374,50 @@
 
     // 标准消息存储 - 按 messageId 索引
     const standardMessages = new Map();
+    // 早到的流式更新（避免 update 先于 message 抵达被丢弃）
+    const pendingStandardUpdates = new Map();
+
+    function bufferStandardUpdate(update) {
+      if (!update || !update.messageId) return;
+      const list = pendingStandardUpdates.get(update.messageId) || [];
+      list.push(update);
+      pendingStandardUpdates.set(update.messageId, list);
+    }
+
+    function applyPendingUpdates(message) {
+      const pending = pendingStandardUpdates.get(message.id);
+      if (!pending || pending.length === 0) return;
+      pending.forEach(update => applyUpdateToStandardMessage(message, update));
+      pendingStandardUpdates.delete(message.id);
+    }
+
+    function upsertThreadMirrorFromWorker(message) {
+      if (!message || message.source === 'orchestrator') return null;
+      const existingIdx = threadMessages.findIndex(m => m.standardMessageId === message.id && m.source === 'worker');
+      const mirrorMsg = standardToWebviewMessage(message);
+      mirrorMsg.mirroredFromCli = true;
+      if (existingIdx !== -1) {
+        const existing = threadMessages[existingIdx];
+        if (existing.startedAt && !mirrorMsg.startedAt) {
+          mirrorMsg.startedAt = existing.startedAt;
+        }
+        if (existing.streamKey) {
+          mirrorMsg.streamKey = existing.streamKey;
+        }
+        Object.assign(existing, mirrorMsg);
+        return existing;
+      }
+
+      // 🔧 新增：内容去重 - 检查是否存在内容完全相同的消息
+      const duplicateByContent = findEquivalentMessage(threadMessages, mirrorMsg, 30000);
+      if (duplicateByContent) {
+        console.log('[Webview] Worker 镜像跳过内容重复的消息:', message.id);
+        return duplicateByContent;
+      }
+
+      threadMessages.push(mirrorMsg);
+      return mirrorMsg;
+    }
 
     /**
      * 处理交互消息（CLI 询问）
@@ -4098,17 +5493,14 @@
         content: interaction.prompt
       };
 
-      // 🔧 修复：使用正确的输入框 ID，并更新占位符
-      const inputBox = document.getElementById('prompt-input');
-      if (inputBox) {
-        inputBox.placeholder = `回答 ${cli} 的询问... (输入 y/n 或其他回复)`;
-        inputBox.focus();
-      }
-
-      // 🔧 修复：确保停止处理状态，让用户可以输入回答
-      setProcessingState(false);
-      // 清除本地处理宽限期，避免状态被覆盖
+      // 🔧 修复：清除处理宽限期并进入等待状态
       localProcessingUntil = 0;
+      enterAwaitingState({
+        type: 'cli_question',
+        cli: cli,
+        requestId: interaction.requestId,
+        prompt: interaction.prompt
+      });
 
       saveWebviewState();
       renderMainContent();
@@ -4143,6 +5535,8 @@
 
       // 存储消息
       standardMessages.set(message.id, message);
+      // 应用可能早到的流式更新
+      applyPendingUpdates(message);
 
       // 获取目标信息
       const isOrchestrator = message.source === 'orchestrator';
@@ -4163,10 +5557,29 @@
       if (existingMsg) {
         // 更新现有消息
         const updatedMsg = standardToWebviewMessage(message);
+        if (existingMsg.startedAt && !updatedMsg.startedAt) {
+          updatedMsg.startedAt = existingMsg.startedAt;
+        }
+        if (existingMsg.streamKey) {
+          updatedMsg.streamKey = existingMsg.streamKey;
+        }
         Object.assign(existingMsg, updatedMsg);
       } else {
         // 🔧 简化：直接添加消息，后端已去重
         const webviewMsg = standardToWebviewMessage(message);
+
+        // 🔧 新增：内容去重 - 检查是否存在内容完全相同的消息
+        const targetMessages = isOrchestrator ? threadMessages : (cliOutputs[cli] || []);
+        const duplicateByContent = findEquivalentMessage(targetMessages, webviewMsg, 30000);
+        if (duplicateByContent) {
+          console.log('[Webview] 跳过内容重复的消息:', message.id, 'duplicate of:', duplicateByContent.standardMessageId);
+          // 更新已存在消息的元数据而不是添加新消息
+          if (webviewMsg.standardMessageId) {
+            duplicateByContent.standardMessageId = webviewMsg.standardMessageId;
+          }
+          return;
+        }
+
         if (isOrchestrator) {
           threadMessages.push(webviewMsg);
         } else {
@@ -4175,6 +5588,11 @@
           }
           cliOutputs[cli].push(webviewMsg);
         }
+      }
+
+      // Worker 输出镜像到 Thread 面板，确保主对话可见流式输出
+      if (!isOrchestrator) {
+        upsertThreadMirrorFromWorker(message);
       }
 
       // 设置处理状态
@@ -4199,7 +5617,8 @@
 
       const message = standardMessages.get(update.messageId);
       if (!message) {
-        console.warn('[Webview] 未找到消息:', update.messageId);
+        console.warn('[Webview] 未找到消息，暂存更新:', update.messageId);
+        bufferStandardUpdate(update);
         return;
       }
 
@@ -4217,6 +5636,9 @@
         if (webviewMsg.startedAt && !updatedMsg.startedAt) {
           updatedMsg.startedAt = webviewMsg.startedAt;
         }
+        if (webviewMsg.streamKey) {
+          updatedMsg.streamKey = webviewMsg.streamKey;
+        }
         Object.assign(webviewMsg, updatedMsg);
 
         // 尝试增量更新 DOM（基于 blocks 渲染）
@@ -4230,6 +5652,14 @@
           }
         } else {
           scheduleRenderMainContent();
+        }
+      }
+
+      // 同步更新 Thread 面板中的 Worker 镜像
+      if (message.source !== 'orchestrator') {
+        const mirrorMsg = upsertThreadMirrorFromWorker(message);
+        if (mirrorMsg && (update.updateType === 'append' || update.updateType === 'replace')) {
+          updateStreamingMessage(mirrorMsg.streamKey, mirrorMsg.content);
         }
       }
 
@@ -4251,6 +5681,8 @@
 
       // 更新存储的消息
       standardMessages.set(message.id, message);
+      // 应用可能早到的流式更新
+      applyPendingUpdates(message);
 
       // 查找并更新对应的 Webview 消息
       const isOrchestrator = message.source === 'orchestrator';
@@ -4266,6 +5698,12 @@
           finalMsg.content = webviewMsg.content;
           finalMsg.parsedBlocks = webviewMsg.parsedBlocks;
         }
+        if (webviewMsg.startedAt && !finalMsg.startedAt) {
+          finalMsg.startedAt = webviewMsg.startedAt;
+        }
+        if (webviewMsg.streamKey) {
+          finalMsg.streamKey = webviewMsg.streamKey;
+        }
         Object.assign(webviewMsg, finalMsg);
         webviewMsg.streaming = false;
 
@@ -4275,6 +5713,11 @@
         if (message.lifecycle === 'failed') {
           webviewMsg.error = message.metadata?.error;
         }
+      }
+
+      // 同步更新 Thread 面板中的 Worker 镜像
+      if (message.source !== 'orchestrator') {
+        upsertThreadMirrorFromWorker(message);
       }
 
       // 检查是否还有活跃的流式消息
@@ -4341,7 +5784,7 @@
     }
 
     /**
-     * 🆕 从内容块中提取代码块
+     * 从内容块中提取代码块
      */
     function extractCodeBlocksFromBlocks(blocks) {
       return blocks
@@ -4350,6 +5793,8 @@
           language: b.language || 'text',
           content: b.content,
           filename: b.filename,
+          isEmbedded: b.isEmbedded,  // 嵌入式代码块标记
+          highlightLines: b.highlightLines,  // 高亮行
         }));
     }
 
@@ -4378,6 +5823,7 @@
           input: b.input,
           output: b.output,
           error: b.error,
+          duration: b.duration,  // 持续时间（毫秒）
         }));
     }
 
@@ -4406,6 +5852,13 @@
           if (newBlock.type === 'tool_call') {
             // 工具调用按 ID 更新
             const existing = message.blocks.find(b => b.type === 'tool_call' && b.toolId === newBlock.toolId);
+            if (existing) {
+              Object.assign(existing, newBlock);
+            } else {
+              message.blocks.push(newBlock);
+            }
+          } else if (newBlock.type === 'thinking' && newBlock.blockId) {
+            const existing = message.blocks.find(b => b.type === 'thinking' && b.blockId === newBlock.blockId);
             if (existing) {
               Object.assign(existing, newBlock);
             } else {
@@ -4472,7 +5925,16 @@
             const codeContent = block.content || '';
             const lineCount = (codeContent.match(/\n/g) || []).length + 1;
 
-            // 🔧 新增：超长代码块（超过20行）使用可折叠面板
+            // 🔍 增强调试：记录代码块首行内容，帮助诊断首行丢失问题
+            console.log('[DEBUG-LAYER-3] 渲染代码块:', {
+              language: lang,
+              lineCount: lineCount,
+              contentLength: codeContent.length,
+              firstLine: codeContent.split('\n')[0],
+              startsWithBrace: codeContent.trim().startsWith('{'),
+            });
+
+            // 🔧 超长代码块（超过20行）使用可折叠面板
             if (lineCount > 20) {
               const panelId = 'code-panel-' + Math.random().toString(36).substr(2, 9);
               // 🔧 修复：面板标题只显示语言类型，不显示文件名或其他内容
@@ -4488,6 +5950,17 @@
             } else {
               html += renderCodeBlock(codeContent, lang, filename);
             }
+            hasMarkdown = true;
+            break;
+
+          case 'plan':
+            // 🔧 新增：渲染后端发送的 PlanBlock
+            console.log('[DEBUG-LAYER-3] 渲染规划块:', {
+              goal: block.goal?.substring(0, 50),
+              hasAnalysis: !!block.analysis,
+              constraintsCount: block.constraints?.length || 0,
+            });
+            html += renderStructuredPlanContent(block);
             hasMarkdown = true;
             break;
 
@@ -4514,9 +5987,30 @@
      * 完成阶段：使用后端解析的 parsedBlocks 渲染（结构化）
      */
     function renderMessageContentSmart(message, cli) {
-      const blocks = (message.parsedBlocks && message.parsedBlocks.length > 0)
+      let blocks = (message.parsedBlocks && message.parsedBlocks.length > 0)
         ? message.parsedBlocks
         : (message.content ? [{ type: 'text', content: message.content, isMarkdown: true }] : []);
+
+      if (!blocks.length) {
+        return { html: '', isMarkdown: false };
+      }
+
+      // 🔧 新增：过滤内部协议数据
+      blocks = blocks.map(block => {
+        if (block.type === 'text' && block.content) {
+          const cleaned = cleanInternalProtocolData(block.content);
+          if (cleaned !== block.content) {
+            return { ...block, content: cleaned };
+          }
+        }
+        return block;
+      }).filter(block => {
+        // 过滤掉清理后为空的文本块
+        if (block.type === 'text') {
+          return block.content && block.content.trim();
+        }
+        return true;
+      });
 
       if (!blocks.length) {
         return { html: '', isMarkdown: false };
@@ -4938,7 +6432,7 @@
      * @returns {string} - HTML 字符串
      */
     function renderMessageList(messages, options) {
-      const { tabType, defaultCli, toolPanelPrefix, showStreamingHint } = options;
+      const { tabType, defaultCli, toolPanelPrefix } = options;
 
       if (!messages || messages.length === 0) {
         return '';
@@ -4953,6 +6447,9 @@
           if (tsA !== tsB) return tsA - tsB;
           return a.idx - b.idx;
         });
+
+      // 🔧 重构：动画逻辑已移至 renderStreamingAnimation 函数
+      // renderMessageList 只负责渲染消息，不处理动画
 
       let html = '';
       let prevMessageKey = null;
@@ -5011,8 +6508,7 @@
           grouped: isGrouped,
           roleName,
           badgeClass,
-          toolPanelPrefix: toolPanelPrefix + idx,
-          showStreamingHint: showStreamingHint !== false
+          toolPanelPrefix: toolPanelPrefix + idx
         });
       });
 
@@ -5103,7 +6599,7 @@
       const roleName = options.roleName || '';
       const badgeClass = options.badgeClass || '';
       const toolPanelPrefix = options.toolPanelPrefix || 'tool-thread-';
-      const showStreamingHint = options.showStreamingHint !== false;
+      // 🔧 重构：移除 showStreamingHint，动画统一由 renderStreamingAnimation 处理
 
       const streamingClass = message.streaming ? ' streaming' : '';
       const messageTypeClass = isUser ? ' user-message' : ' assistant-message';
@@ -5155,13 +6651,22 @@
       if (!isUser && message.thinking && message.thinking.length > 0) {
         const panelId = (toolPanelPrefix || 'panel-') + 'thinking-' + idx;
         const thinkingExpanded = !!message.streaming;
+        // 从对象数组中提取内容（支持旧格式字符串数组和新格式对象数组）
+        const thinkingContent = message.thinking.map(t => typeof t === 'string' ? t : t.content).join('\n\n');
+        // 生成摘要（前 50 字符）
+        const thinkingSummary = thinkingContent.replace(/\s+/g, ' ').trim().substring(0, 50);
+        const summaryDisplay = thinkingSummary + (thinkingContent.length > 50 ? '...' : '');
+
         html += '<div class="collapsible-panel thinking" data-panel-id="' + panelId + '">';
         html += '<div class="collapsible-header" onclick="togglePanel(\'' + panelId + '\')">';
         html += '<span class="collapsible-icon' + (thinkingExpanded ? ' expanded' : '') + '"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></span>';
         html += '<span class="collapsible-title"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M9.405 1.05c-.413-1.4-2.397-1.4-2.81 0l-.1.34a1.464 1.464 0 0 1-2.105.872l-.31-.17c-1.283-.698-2.686.705-1.987 1.987l.169.311c.446.82.023 1.841-.872 2.105l-.34.1c-1.4.413-1.4 2.397 0 2.81l.34.1a1.464 1.464 0 0 1 .872 2.105l-.17.31c-.698 1.283.705 2.686 1.987 1.987l.311-.169a1.464 1.464 0 0 1 2.105.872l.1.34c.413 1.4 2.397 1.4 2.81 0l.1-.34a1.464 1.464 0 0 1 2.105-.872l.31.17c1.283.698 2.686-.705 1.987-1.987l-.169-.311a1.464 1.464 0 0 1 .872-2.105l.34-.1c1.4-.413 1.4-2.397 0-2.81l-.34-.1a1.464 1.464 0 0 1-.872-2.105l.17-.31c.698-1.283-.705-2.686-1.987-1.987l-.311.169a1.464 1.464 0 0 1-2.105-.872l-.1-.34zM8 10.93a2.929 2.929 0 1 1 0-5.86 2.929 2.929 0 0 1 0 5.858z"/></svg>思考过程</span>';
+        // 折叠时显示摘要
+        if (!thinkingExpanded && summaryDisplay) {
+          html += '<span class="collapsible-summary">' + escapeHtml(summaryDisplay) + '</span>';
+        }
         html += '<span class="collapsible-badge">' + message.thinking.length + ' 步</span>';
         html += '</div>';
-        const thinkingContent = message.thinking.join('\n\n');
         html += '<div class="collapsible-content' + (thinkingExpanded ? ' expanded' : '') + '"><div class="collapsible-body markdown-rendered">' + renderMarkdown(thinkingContent) + '</div></div>';
         html += '</div>';
       }
@@ -5217,20 +6722,8 @@
         html += '<div class="reconnect-indicator"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.534 7h3.932a.25.25 0 0 1 .192.41l-1.966 2.36a.25.25 0 0 1-.384 0l-1.966-2.36a.25.25 0 0 1 .192-.41zm-11 2h3.932a.25.25 0 0 0 .192-.41L2.692 6.23a.25.25 0 0 0-.384 0L.342 8.59A.25.25 0 0 0 .534 9z"/><path d="M8 3c-1.552 0-2.94.707-3.857 1.818a.5.5 0 1 1-.771-.636A6.002 6.002 0 0 1 13.917 7H12.9A5.002 5.002 0 0 0 8 3zM3.1 9a5.002 5.002 0 0 0 8.757 2.182.5.5 0 1 1 .771.636A6.002 6.002 0 0 1 2.083 9H3.1z"/></svg>' + escapeHtml(message.reconnectMessage || '正在重连...') + '</div>';
       }
 
-      // 🔧 修复：流式输出时的动画显示逻辑
-      if (showStreamingHint && !isUser && message.streaming) {
-        const startAt = message.startedAt || thinkingStartAt || Date.now();
-        const elapsed = formatElapsed(Date.now() - startAt);
-        const hasContent = message.content && message.content.trim();
-
-        if (!hasContent) {
-          // 没有内容时显示"正在思考"
-          html += '<div class="message-content message-streaming-hint" data-start-at="' + startAt + '"><span class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span> 正在思考 <span class="thinking-elapsed">用时 ' + elapsed + '</span></div>';
-        } else {
-          // 有内容但仍在流式输出时，在底部显示"正在输出"提示
-          html += '<div class="message-streaming-footer" data-start-at="' + startAt + '"><span class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span> 正在输出 <span class="thinking-elapsed">用时 ' + elapsed + '</span></div>';
-        }
-      }
+      // 🔧 重构：动画逻辑已移至 renderStreamingAnimation 函数
+      // renderMessageBlock 不再负责渲染动画，确保单一入口
 
       html += '</div></div>';
       return html;
@@ -5244,14 +6737,22 @@
       }
 
       // 使用统一的消息列表渲染函数
-      const html = renderMessageList(messages, {
+      let html = renderMessageList(messages, {
         tabType: 'cli',
         defaultCli: cli,
-        toolPanelPrefix: 'tool-cli-' + cli + '-',
-        showStreamingHint: true
+        toolPanelPrefix: 'tool-cli-' + cli + '-'
       });
 
+      // 🔧 重构：CLI 面板也使用统一的动画渲染入口
+      // 只为当前 CLI 的消息添加动画
+      html += renderStreamingAnimationForCli(messages, cli);
+
       container.innerHTML = html;
+
+      // 🔧 修复：CLI 面板也需要启动/停止动画计时器
+      if (container.querySelector('.message-streaming-hint, .message-streaming-footer')) {
+        startStreamingHintTimer();
+      }
     }
 
 
@@ -5999,6 +7500,10 @@
 
     // 处理恢复确认对话框
     function showRecoveryDialog(taskId, error, canRetry, canRollback) {
+      // 🔧 修复：显示错误对话框时，立即停止所有 streaming 状态和动画
+      stopStreamingHintTimer();
+      clearAllStreamingStates();
+
       // 创建恢复对话框
       const dialog = document.createElement('div');
       dialog.className = 'recovery-dialog visible';
@@ -6345,8 +7850,7 @@
       html += renderMessageList(threadMessages, {
         tabType: 'thread',
         defaultCli: null, // Thread 面板没有默认 CLI
-        toolPanelPrefix: 'tool-thread-',
-        showStreamingHint: true
+        toolPanelPrefix: 'tool-thread-'
       });
 
       // Thread 面板特有：显示运行中的 Worker 状态卡片
@@ -6355,19 +7859,8 @@
         html += renderWorkerStatusCard(runningEntries);
       }
 
-      // Thread 面板特有：兜底 loading 动画
-      // 保持思考动画跟随最新消息，只有在没有流式消息时才追加底部提示
-      if (isProcessing) {
-        const hasStreamingMessage = threadMessages.some(m => m.streaming);
-        if (!hasStreamingMessage) {
-          html += '<div class="message assistant-message loading-message">';
-          html += '<div class="message-body">';
-          const startAt = thinkingStartAt || Date.now();
-          const elapsed = formatElapsed(Date.now() - startAt);
-          html += '<div class="message-content message-streaming-hint" data-start-at="' + startAt + '\"><span class=\"thinking-indicator\"><span class=\"dot\"></span><span class=\"dot\"></span><span class=\"dot\"></span></span> 正在思考 <span class=\"thinking-elapsed\">用时 ' + elapsed + '</span></div>';
-          html += '</div></div>';
-        }
-      }
+      // 🔧 重构：统一的动画渲染入口（唯一添加动画的地方）
+      html += renderStreamingAnimation(threadMessages);
 
       container.innerHTML = html;
       // 🔧 修复：同时检测 streaming-hint 和 streaming-footer
@@ -6376,6 +7869,97 @@
       } else {
         stopStreamingHintTimer();
       }
+    }
+
+    /**
+     * 🔧 统一的动画渲染函数 - 整个页面唯一添加"正在思考"动画的入口
+     * 确保任何时刻最多只有一个动画
+     * @param {Array} messages - 消息数组
+     * @returns {string} - 动画 HTML 或空字符串
+     */
+    function renderStreamingAnimation(messages) {
+      // 找到最后一条 streaming 消息
+      const lastStreamingMsg = [...(messages || [])].reverse().find(m => m.streaming);
+
+      if (lastStreamingMsg) {
+        // 有 streaming 消息时，追加动画
+        const startAt = lastStreamingMsg.startedAt || thinkingStartAt || Date.now();
+        const elapsed = formatElapsed(Date.now() - startAt);
+        const hasContent = lastStreamingMsg.content && lastStreamingMsg.content.trim();
+
+        if (!hasContent) {
+          // 没有内容时显示"正在思考"
+          return '<div class="message assistant-message streaming-animation-message">' +
+                 '<div class="message-body">' +
+                 '<div class="message-content message-streaming-hint" data-start-at="' + startAt + '">' +
+                 '<span class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span> ' +
+                 '正在思考 <span class="thinking-elapsed">用时 ' + elapsed + '</span></div>' +
+                 '</div></div>';
+        } else {
+          // 有内容时显示"正在输出"
+          return '<div class="message assistant-message streaming-animation-message">' +
+                 '<div class="message-body">' +
+                 '<div class="message-streaming-footer" data-start-at="' + startAt + '">' +
+                 '<span class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span> ' +
+                 '正在输出 <span class="thinking-elapsed">用时 ' + elapsed + '</span></div>' +
+                 '</div></div>';
+        }
+      }
+
+      // 没有 streaming 消息但正在处理时，显示兜底动画
+      if (isProcessing) {
+        const startAt = thinkingStartAt || Date.now();
+        const elapsed = formatElapsed(Date.now() - startAt);
+        return '<div class="message assistant-message loading-message">' +
+               '<div class="message-body">' +
+               '<div class="message-content message-streaming-hint" data-start-at="' + startAt + '">' +
+               '<span class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span> ' +
+               '正在思考 <span class="thinking-elapsed">用时 ' + elapsed + '</span></div>' +
+               '</div></div>';
+      }
+
+      return '';
+    }
+
+    /**
+     * 🔧 CLI 面板专用的动画渲染函数
+     * 与 renderStreamingAnimation 类似，但不检查 isProcessing
+     * 因为 CLI 面板只关心自己的消息状态
+     * @param {Array} messages - CLI 消息数组
+     * @param {string} cli - CLI 类型 (claude/codex/gemini)
+     * @returns {string} - 动画 HTML 或空字符串
+     */
+    function renderStreamingAnimationForCli(messages, cli) {
+      // 找到最后一条 streaming 消息
+      const lastStreamingMsg = [...(messages || [])].reverse().find(m => m.streaming);
+
+      if (lastStreamingMsg) {
+        // 有 streaming 消息时，追加动画
+        const startAt = lastStreamingMsg.startedAt || thinkingStartAt || Date.now();
+        const elapsed = formatElapsed(Date.now() - startAt);
+        const hasContent = lastStreamingMsg.content && lastStreamingMsg.content.trim();
+        const cliName = cli ? cli.toUpperCase() : 'Worker';
+
+        if (!hasContent) {
+          // 没有内容时显示"正在思考"
+          return '<div class="message assistant-message streaming-animation-message" data-cli="' + cli + '">' +
+                 '<div class="message-body">' +
+                 '<div class="message-content message-streaming-hint" data-start-at="' + startAt + '">' +
+                 '<span class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span> ' +
+                 cliName + ' 正在思考 <span class="thinking-elapsed">用时 ' + elapsed + '</span></div>' +
+                 '</div></div>';
+        } else {
+          // 有内容时显示"正在输出"
+          return '<div class="message assistant-message streaming-animation-message" data-cli="' + cli + '">' +
+                 '<div class="message-body">' +
+                 '<div class="message-streaming-footer" data-start-at="' + startAt + '">' +
+                 '<span class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span> ' +
+                 cliName + ' 正在输出 <span class="thinking-elapsed">用时 ' + elapsed + '</span></div>' +
+                 '</div></div>';
+        }
+      }
+
+      return '';
     }
 
     function collectWorkerStatusEntries() {
@@ -6399,59 +7983,107 @@
       return entries;
     }
 
-    // 渲染子代理运行状态卡片（使用统一卡片组件）
+    // 渲染子代理运行状态卡片（增强版：含进度条和当前操作）
     function renderWorkerStatusCard(entries) {
-      const statusMap = { running: '执行中', pending: '等待中' };
+      const statusMap = { running: '执行中', pending: '等待中', completed: '已完成', failed: '失败' };
 
       // 构建列表内容
       let listHtml = '<div class="worker-status-list">';
       entries.forEach(item => {
         const cliClass = item.worker.includes('claude') ? 'claude' : item.worker.includes('codex') ? 'codex' : item.worker.includes('gemini') ? 'gemini' : '';
-        const statusClass = item.status === 'running' ? 'badge-running' : 'badge-pending';
+        const statusClass = item.status === 'running' ? 'badge-running' : item.status === 'completed' ? 'badge-completed' : item.status === 'failed' ? 'badge-failed' : 'badge-pending';
+        const progressClass = item.status === 'completed' ? 'completed' : item.status === 'failed' ? 'failed' : '';
+        const progress = item.progress !== undefined ? Math.min(100, Math.max(0, item.progress)) : (item.status === 'running' ? 50 : 0);
+        const duration = item.duration || item.time || '';
+
         listHtml += '<div class="worker-status-item">';
+
+        // 第一行：Worker 名称、描述、状态
+        listHtml += '<div class="worker-status-row">';
         listHtml += '<span class="task-cli ' + cliClass + '">' + escapeHtml(item.worker) + '</span>';
-        listHtml += '<span class="task-desc">' + escapeHtml(item.description) + '</span>';
+        listHtml += '<span class="task-desc" title="' + escapeHtml(item.description) + '">' + escapeHtml(item.description) + '</span>';
         listHtml += '<span class="card-badge ' + statusClass + '">' + (statusMap[item.status] || item.status) + '</span>';
+        listHtml += '</div>';
+
+        // 第二行：当前操作（如果有）
+        if (item.currentAction && item.status === 'running') {
+          listHtml += '<div class="task-current">' + escapeHtml(item.currentAction) + '</div>';
+        }
+
+        // 第三行：进度条（如果是 running 状态或有进度信息）
+        if (item.status === 'running' || item.progress !== undefined) {
+          listHtml += '<div class="worker-status-progress">';
+          listHtml += '<div class="worker-status-progress-bar">';
+          listHtml += '<div class="worker-status-progress-fill ' + progressClass + '" style="width: ' + progress + '%"></div>';
+          listHtml += '</div>';
+          listHtml += '<span class="worker-status-progress-text">' + progress + '%</span>';
+          if (duration) {
+            listHtml += '<span class="worker-status-time">' + escapeHtml(duration) + '</span>';
+          }
+          listHtml += '</div>';
+        }
+
         listHtml += '</div>';
       });
       listHtml += '</div>';
+
+      // 统计完成数量
+      const runningCount = entries.filter(e => e.status === 'running').length;
+      const completedCount = entries.filter(e => e.status === 'completed').length;
+      const badgeText = runningCount > 0 ? runningCount + ' 执行中' : completedCount + '/' + entries.length + ' 完成';
 
       return renderUnifiedCard({
         type: 'worker-status',
         variant: 'info',
         icon: getRoleIcon('orchestrator'),
         title: '子代理运行状态',
-        badges: [{ text: entries.length + ' 项', class: 'badge-info' }],
+        badges: [{ text: badgeText, class: runningCount > 0 ? 'badge-running' : 'badge-info' }],
         content: listHtml,
         className: 'worker-status-card'
       });
     }
 
     // 渲染任务卡片（子代理面板显示编排者分配的任务，使用统一卡片组件）
+    // 使用 orchestrator 变体（紫色边框）明确标识来自编排者
     function renderTaskCard(m, idx) {
       const cli = m.cli || '';
       const statusClass = m.status || 'started';
       const statusText = statusClass === 'started' ? '执行中' : statusClass === 'completed' ? '已完成' : statusClass === 'failed' ? '失败' : statusClass;
       const badgeStatusClass = statusClass === 'started' ? 'badge-running' : statusClass === 'completed' ? 'badge-completed' : statusClass === 'failed' ? 'badge-failed' : '';
 
-      // 构建内容
-      let contentHtml = '<div class="task-card-description">' + escapeHtml(m.description || '') + '</div>';
+      // 构建任务分配卡片内容
+      let contentHtml = '<div class="task-assignment-content">';
 
-      // 添加进度条（如果有进度信息）
-      if (m.progress !== undefined || m.subtasks) {
-        contentHtml += renderTaskProgress(m);
+      // 任务描述
+      if (m.description) {
+        contentHtml += '<div class="task-field">';
+        contentHtml += '<span class="task-field-label">任务描述</span>';
+        contentHtml += '<span class="task-field-value">' + escapeHtml(m.description) + '</span>';
+        contentHtml += '</div>';
       }
 
-      if (m.reason) {
-        contentHtml += '<div class="task-card-reason"><span class="task-card-label">分配原因:</span> ' + escapeHtml(m.reason) + '</div>';
-      }
+      // 目标文件
       if (m.targetFiles && m.targetFiles.length > 0) {
-        contentHtml += '<div class="task-card-files"><span class="task-card-label">目标文件:</span>';
-        contentHtml += '<ul class="task-card-file-list">';
+        contentHtml += '<div class="task-field">';
+        contentHtml += '<span class="task-field-label">目标文件</span>';
+        contentHtml += '<ul class="task-file-list">';
         m.targetFiles.forEach(file => {
           contentHtml += '<li><code>' + escapeHtml(file) + '</code></li>';
         });
         contentHtml += '</ul></div>';
+      }
+
+      // 分配原因
+      if (m.reason) {
+        contentHtml += '<div class="task-field task-reason">';
+        contentHtml += '<span class="task-field-label">分配原因</span>';
+        contentHtml += '<span class="task-field-value">' + escapeHtml(m.reason) + '</span>';
+        contentHtml += '</div>';
+      }
+
+      // 添加进度条（如果有进度信息）
+      if (m.progress !== undefined || m.subtasks) {
+        contentHtml += renderTaskProgress(m);
       }
 
       // 添加子任务状态列表
@@ -6459,15 +8091,21 @@
         contentHtml += renderSubtaskStatusList(m.subtasks);
       }
 
+      contentHtml += '</div>';
+
       return renderUnifiedCard({
-        type: 'task',
-        variant: cli.toLowerCase() || 'info',
-        icon: getRoleIcon('task'),
-        title: '任务分配',
-        badges: [{ text: statusText, class: badgeStatusClass }],
+        type: 'task-assignment',
+        variant: 'orchestrator',  // 使用紫色边框标识来自编排者
+        icon: getRoleIcon('orchestrator'),
+        title: '来自编排者的任务',
+        badges: [
+          { text: cli ? cli.toUpperCase() + ' 执行' : '执行中', class: 'badge-' + (cli.toLowerCase() || 'info') },
+          { text: statusText, class: badgeStatusClass }
+        ],
         time: m.time || '',
         content: contentHtml,
-        dataAttrs: { 'msg-idx': idx, 'subtask-id': m.subTaskId || '' }
+        dataAttrs: { 'msg-idx': idx, 'subtask-id': m.subTaskId || '' },
+        className: 'task-assignment-card'
       });
     }
 
@@ -6695,18 +8333,277 @@
       });
     }
 
+    /**
+     * 🔧 清理内部协议元数据
+     *
+     * CLI 输出可能包含 stream-json 格式的内部协议数据，如：
+     * - stream_event: {"type":"stream_event","event":{...}}
+     * - content_block_delta: {"type":"content_block_delta",...}
+     *
+     * 这些元数据不应该展示给用户，应该被过滤掉
+     *
+     * 🔧 增强：支持多行 JSON 对象的处理
+     */
+    function cleanInternalProtocolData(rawText) {
+      if (!rawText || typeof rawText !== 'string') return '';
+
+      // 内部协议事件类型
+      const internalEventTypes = [
+        'stream_event', 'content_block_start', 'content_block_delta',
+        'content_block_stop', 'message_start', 'message_delta',
+        'message_stop', 'input_json_delta', 'ping'
+      ];
+
+      // 🔧 新增：尝试提取多行 JSON 对象
+      function tryExtractMultilineJson(text, startIndex) {
+        let depth = 0;
+        let inString = false;
+        let escapeNext = false;
+
+        for (let i = startIndex; i < text.length; i++) {
+          const char = text[i];
+          if (escapeNext) { escapeNext = false; continue; }
+          if (char === '\\') { escapeNext = true; continue; }
+          if (char === '"') { inString = !inString; continue; }
+          if (inString) continue;
+          if (char === '{') depth++;
+          else if (char === '}') {
+            depth--;
+            if (depth === 0) {
+              const jsonText = text.substring(startIndex, i + 1);
+              try {
+                const parsed = JSON.parse(jsonText);
+                return { parsed, endIndex: i + 1 };
+              } catch {
+                return null;
+              }
+            }
+          }
+        }
+        return null;
+      }
+
+      // 🔧 新增：检查是否是内部协议事件
+      function isInternalProtocolEvent(obj) {
+        if (!obj || typeof obj !== 'object') return false;
+
+        // 直接类型检查
+        if (internalEventTypes.includes(obj.type)) return true;
+
+        // stream_event 包裹检查
+        if (obj.type === 'stream_event' && obj.event) {
+          if (internalEventTypes.includes(obj.event.type)) return true;
+        }
+
+        return false;
+      }
+
+      // 🔧 新增：从 JSON 对象中提取可读内容
+      // 重要：不是过滤数据，而是正确解析并提取有意义的内容
+      function extractReadableContent(obj) {
+        if (!obj || typeof obj !== 'object') return null;
+
+        // 从 stream_event 中提取（递归处理 event）
+        if (obj.type === 'stream_event' && obj.event) {
+          return extractReadableContent(obj.event);
+        }
+
+        // 从 content_block_delta 中提取实际内容
+        if (obj.type === 'content_block_delta' && obj.delta) {
+          const delta = obj.delta;
+
+          // 文本增量
+          if (delta.type === 'text_delta' && delta.text) {
+            return delta.text;
+          }
+
+          // 工具输入 JSON 增量 - 尝试解析并格式化显示
+          if (delta.type === 'input_json_delta' && delta.partial_json) {
+            try {
+              // 尝试解析 partial_json
+              const toolInput = JSON.parse(delta.partial_json);
+              // 如果是工具调用输入，格式化显示
+              if (toolInput.description || toolInput.command || toolInput.content) {
+                let display = '';
+                if (toolInput.description) {
+                  display += '📝 ' + toolInput.description + '\n';
+                }
+                if (toolInput.command) {
+                  display += '$ ' + toolInput.command;
+                }
+                if (toolInput.content && !toolInput.command) {
+                  // 如果是文件内容，截取显示
+                  const content = toolInput.content;
+                  if (content.length > 500) {
+                    display += content.substring(0, 500) + '\n... (内容已截断)';
+                  } else {
+                    display += content;
+                  }
+                }
+                if (toolInput.file_path) {
+                  display += '\n📁 ' + toolInput.file_path;
+                }
+                return display.trim() || null;
+              }
+              // 其他 JSON 对象，返回格式化的摘要
+              return JSON.stringify(toolInput, null, 2);
+            } catch {
+              // 解析失败，可能是不完整的 JSON，返回原始内容
+              return delta.partial_json;
+            }
+          }
+
+          // 思考增量
+          if (delta.type === 'thinking_delta' && delta.thinking) {
+            return '💭 ' + delta.thinking;
+          }
+        }
+
+        // 从 result 类型提取
+        if (obj.type === 'result' && obj.result) {
+          return typeof obj.result === 'string'
+            ? obj.result
+            : (obj.result.content || obj.result.output || null);
+        }
+
+        // 从 assistant 消息提取
+        if (obj.type === 'assistant' && obj.message?.content) {
+          const texts = [];
+          for (const block of obj.message.content) {
+            if (block.type === 'text' && block.text) {
+              texts.push(block.text);
+            }
+            // 处理工具调用
+            if (block.type === 'tool_use') {
+              let toolDisplay = '🔧 工具: ' + (block.name || '未知');
+              if (block.input?.description) {
+                toolDisplay += '\n   ' + block.input.description;
+              }
+              texts.push(toolDisplay);
+            }
+          }
+          return texts.length > 0 ? texts.join('\n') : null;
+        }
+
+        // 从 user 消息提取 (tool_result)
+        if (obj.type === 'user' && obj.message?.content) {
+          const texts = [];
+          for (const block of obj.message.content) {
+            if (block.type === 'tool_result' && block.content) {
+              // 工具结果可能很长，截取显示
+              const content = typeof block.content === 'string'
+                ? block.content
+                : JSON.stringify(block.content);
+              if (content.length > 1000) {
+                texts.push(content.substring(0, 1000) + '\n... (结果已截断)');
+              } else {
+                texts.push(content);
+              }
+            }
+          }
+          return texts.length > 0 ? texts.join('\n\n') : null;
+        }
+
+        // 直接的工具调用对象
+        if (obj.description || obj.command || obj.prompt) {
+          let display = '';
+          if (obj.description) display += obj.description + '\n';
+          if (obj.command) display += '$ ' + obj.command;
+          if (obj.prompt && !obj.description) display += obj.prompt;
+          return display.trim() || null;
+        }
+
+        return null;
+      }
+
+      const cleanedParts = [];
+      let i = 0;
+      let textBuffer = '';
+
+      while (i < rawText.length) {
+        const char = rawText[i];
+
+        // 检测 JSON 对象开始
+        if (char === '{') {
+          // 先保存之前的文本缓冲
+          if (textBuffer.trim()) {
+            cleanedParts.push(textBuffer.trim());
+            textBuffer = '';
+          }
+
+          const result = tryExtractMultilineJson(rawText, i);
+          if (result) {
+            const { parsed, endIndex } = result;
+
+            // 检查是否是内部协议事件
+            if (isInternalProtocolEvent(parsed)) {
+              // 尝试提取可读内容
+              const readable = extractReadableContent(parsed);
+              if (readable) {
+                cleanedParts.push(readable);
+              }
+              // 否则跳过这个 JSON
+              i = endIndex;
+              continue;
+            }
+
+            // 不是内部协议，保留这个 JSON（但不作为原始文本，避免显示）
+            // 🔧 如果是有意义的数据（如工具调用），可以保留
+            const readable = extractReadableContent(parsed);
+            if (readable) {
+              cleanedParts.push(readable);
+              i = endIndex;
+              continue;
+            }
+
+            // 其他 JSON 对象，跳过（通常是内部数据结构）
+            i = endIndex;
+            continue;
+          }
+        }
+
+        // 普通字符，添加到缓冲区
+        textBuffer += char;
+        i++;
+      }
+
+      // 处理剩余的文本缓冲
+      if (textBuffer.trim()) {
+        cleanedParts.push(textBuffer.trim());
+      }
+
+      return cleanedParts.join('\n').trim();
+    }
+
     // 🔧 解析 CLI 询问内容，提取有意义的信息
     function parseCliQuestionContent(content) {
       if (!content || typeof content !== 'string') {
         return { type: 'text', display: content || '' };
       }
 
-      const trimmed = content.trim();
+      // 🔧 修复：先清理内部协议元数据
+      const cleanedContent = cleanInternalProtocolData(content);
+      const trimmed = cleanedContent.trim();
+
+      // 如果清理后为空，说明全是内部协议数据，显示默认提示
+      if (!trimmed) {
+        return { type: 'text', display: '等待输入...' };
+      }
 
       // 检测是否是 JSON 格式的工具调用
       if (trimmed.startsWith('{') && trimmed.includes('"type"')) {
         try {
           const parsed = JSON.parse(trimmed);
+
+          // 🔧 新增：检查是否是内部协议事件（兜底检查）
+          const internalEventTypes = [
+            'stream_event', 'content_block_start', 'content_block_delta',
+            'content_block_stop', 'message_start', 'message_delta',
+            'message_stop', 'input_json_delta', 'ping'
+          ];
+          if (internalEventTypes.includes(parsed.type)) {
+            return { type: 'text', display: '等待输入...' };
+          }
 
           // Claude 工具调用格式: {"type":"assistant","message":{"content":[...]}}
           if (parsed.type === 'assistant' && parsed.message?.content) {
@@ -6724,6 +8621,23 @@
             }
           }
 
+          // 🔧 新增：处理 tool_result 格式 {"type":"user","message":{"content":[{"type":"tool_result","content":"..."}]}}
+          if (parsed.type === 'user' && parsed.message?.content) {
+            const toolResults = parsed.message.content.filter(c => c.type === 'tool_result');
+            if (toolResults.length > 0) {
+              // 提取 tool_result 的内容并格式化显示
+              const resultContent = toolResults.map(r => r.content).join('\n\n');
+              // 如果内容太长，只显示前几行
+              const lines = resultContent.split('\n');
+              const preview = lines.slice(0, 10).join('\n');
+              const truncated = lines.length > 10 ? '\n... (更多内容)' : '';
+              return {
+                type: 'text',
+                display: preview + truncated
+              };
+            }
+          }
+
           // 其他 JSON 格式，尝试提取关键信息
           if (parsed.description || parsed.prompt) {
             return {
@@ -6732,6 +8646,33 @@
               data: parsed
             };
           }
+
+          // 🔧 新增：如果 JSON 解析成功但没有匹配到已知格式，尝试提取可读内容
+          if (parsed.message?.content) {
+            if (typeof parsed.message.content === 'string') {
+              return { type: 'text', display: parsed.message.content };
+            }
+            if (Array.isArray(parsed.message.content)) {
+              const textContent = parsed.message.content
+                .map(item => {
+                  if (typeof item === 'string') return item;
+                  if (item.text) return item.text;
+                  if (item.content) return typeof item.content === 'string' ? item.content : JSON.stringify(item.content, null, 2);
+                  return '';
+                })
+                .filter(Boolean)
+                .join('\n\n');
+              if (textContent) {
+                return { type: 'text', display: textContent };
+              }
+            }
+          }
+
+          // 如果还是无法提取，显示格式化的 JSON
+          return {
+            type: 'text',
+            display: JSON.stringify(parsed, null, 2)
+          };
         } catch {
           // JSON 解析失败，作为普通文本处理
         }
@@ -7432,34 +9373,68 @@
       }
 
       if (!cliStatuses) return;
+
+      // 扩展状态文本映射
       const statusTexts = {
-        'available': '可用',
-        'not_installed': '未安装',
+        'available': '已连接',
+        'disabled': '已禁用',
+        'not_configured': '未配置',
         'auth_failed': '认证失败',
-        'unknown': '未知'
+        'network_error': '网络错误',
+        'timeout': '连接超时',
+        'invalid_model': '模型无效',
+        'not_installed': '未安装',
+        'unknown': '未知错误'
       };
-      ['claude', 'codex', 'gemini'].forEach(cli => {
+
+      // 更新所有模型状态（Worker + 编排者 + 压缩模型）
+      ['claude', 'codex', 'gemini', 'orchestrator', 'compressor'].forEach(cli => {
         const item = document.querySelector(`.cli-connection-item[data-cli="${cli}"]`);
         if (!item) return;
         const status = cliStatuses[cli] || { status: 'unknown' };
         const isAvailable = status.status === 'available';
 
         // 更新样式
-        item.classList.remove('available', 'unavailable');
-        item.classList.add(isAvailable ? 'available' : 'unavailable');
+        item.classList.remove('available', 'unavailable', 'disabled', 'error');
+        if (isAvailable) {
+          item.classList.add('available');
+        } else if (status.status === 'disabled') {
+          item.classList.add('disabled');
+        } else {
+          item.classList.add('unavailable');
+        }
 
-        // 更新状态文本
+        // 更新状态文本（显示版本信息或错误信息）
         const statusEl = item.querySelector('.cli-connection-status');
         if (statusEl) {
-          statusEl.textContent = status.version ? `版本: ${status.version}` : (statusTexts[status.status] || status.status);
+          if (status.version) {
+            statusEl.textContent = status.version;
+          } else if (status.error) {
+            statusEl.textContent = status.error;
+            statusEl.title = status.error; // 添加 tooltip
+          } else {
+            statusEl.textContent = statusTexts[status.status] || status.status;
+          }
         }
 
         // 更新徽章
         const badge = item.querySelector('.cli-connection-badge');
         if (badge) {
-          badge.classList.remove('available', 'unavailable', 'checking');
-          badge.classList.add(isAvailable ? 'available' : 'unavailable');
-          badge.textContent = isAvailable ? '已连接' : (statusTexts[status.status] || '不可用');
+          badge.classList.remove('available', 'unavailable', 'checking', 'disabled', 'error');
+
+          if (isAvailable) {
+            badge.classList.add('available');
+            badge.textContent = '已连接';
+          } else if (status.status === 'disabled') {
+            badge.classList.add('disabled');
+            badge.textContent = '已禁用';
+          } else {
+            badge.classList.add('error');
+            badge.textContent = statusTexts[status.status] || '不可用';
+            if (status.error) {
+              badge.title = status.error; // 添加 tooltip
+            }
+          }
         }
       });
     }
@@ -7542,6 +9517,1123 @@
         addSystemMessage('Prompt 已增强', 'success');
       }
     }
+
+    // ============================================================================
+    // 编排者配置功能
+    // ============================================================================
+
+    // 压缩模型启用/禁用切换
+    const compressorEnabled = document.getElementById('compressor-enabled');
+    const compressorConfig = document.getElementById('compressor-config');
+
+    if (compressorEnabled && compressorConfig) {
+      compressorEnabled.addEventListener('change', () => {
+        compressorConfig.style.display = compressorEnabled.checked ? 'flex' : 'none';
+      });
+    }
+
+    // LLM 配置密钥显示/隐藏切换
+    document.querySelectorAll('.llm-config-eye-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const targetId = btn.dataset.target;
+        const input = document.getElementById(targetId);
+        if (input) {
+          const isPassword = input.type === 'password';
+          input.type = isPassword ? 'text' : 'password';
+          const eyeClosed = btn.querySelector('.eye-closed');
+          const eyeOpen = btn.querySelector('.eye-open');
+          if (eyeClosed && eyeOpen) {
+            eyeClosed.style.display = isPassword ? 'none' : 'block';
+            eyeOpen.style.display = isPassword ? 'block' : 'none';
+          }
+        }
+      });
+    });
+
+    // ============================================================================
+    // 编排者模型配置功能
+    // ============================================================================
+
+    // 初始化：加载编排者配置
+    function initOrchestratorConfig() {
+      vscode.postMessage({
+        type: 'loadOrchestratorConfig'
+      });
+    }
+
+    // 保存编排者配置
+    const orchSaveBtn = document.getElementById('orch-save-btn');
+    if (orchSaveBtn) {
+      orchSaveBtn.addEventListener('click', () => {
+        const baseUrlInput = document.getElementById('orch-base-url');
+        const apiKeyInput = document.getElementById('orch-api-key');
+        const modelInput = document.getElementById('orch-model');
+        const providerSelect = document.getElementById('orch-provider');
+
+        const config = {
+          baseUrl: baseUrlInput ? baseUrlInput.value : '',
+          apiKey: apiKeyInput ? apiKeyInput.value : '',
+          model: modelInput ? modelInput.value : '',
+          provider: providerSelect ? providerSelect.value : 'anthropic',
+          enabled: true  // 编排者始终启用
+        };
+
+        vscode.postMessage({
+          type: 'saveOrchestratorConfig',
+          config: config
+        });
+      });
+    }
+
+    // 测试编排者连接
+    const orchTestBtn = document.getElementById('orch-test-btn');
+    if (orchTestBtn) {
+      orchTestBtn.addEventListener('click', () => {
+        const baseUrlInput = document.getElementById('orch-base-url');
+        const apiKeyInput = document.getElementById('orch-api-key');
+        const modelInput = document.getElementById('orch-model');
+        const providerSelect = document.getElementById('orch-provider');
+
+        const config = {
+          baseUrl: baseUrlInput ? baseUrlInput.value : '',
+          apiKey: apiKeyInput ? apiKeyInput.value : '',
+          model: modelInput ? modelInput.value : '',
+          provider: providerSelect ? providerSelect.value : 'anthropic',
+          enabled: true
+        };
+
+        // 添加加载状态
+        orchTestBtn.classList.add('loading');
+        orchTestBtn.disabled = true;
+
+        vscode.postMessage({
+          type: 'testOrchestratorConnection',
+          config: config
+        });
+      });
+    }
+
+    // ============================================================================
+    // 压缩模型配置功能
+    // ============================================================================
+
+    // 初始化：加载压缩器配置
+    function initCompressorConfig() {
+      vscode.postMessage({
+        type: 'loadCompressorConfig'
+      });
+    }
+
+    // 保存压缩器配置
+    const compSaveBtn = document.getElementById('comp-save-btn');
+    if (compSaveBtn) {
+      compSaveBtn.addEventListener('click', () => {
+        const baseUrlInput = document.getElementById('comp-base-url');
+        const apiKeyInput = document.getElementById('comp-api-key');
+        const modelInput = document.getElementById('comp-model');
+        const providerSelect = document.getElementById('comp-provider');
+
+        const config = {
+          enabled: true,  // 压缩模型始终启用
+          baseUrl: baseUrlInput ? baseUrlInput.value : '',
+          apiKey: apiKeyInput ? apiKeyInput.value : '',
+          model: modelInput ? modelInput.value : '',
+          provider: providerSelect ? providerSelect.value : 'anthropic'
+        };
+
+        vscode.postMessage({
+          type: 'saveCompressorConfig',
+          config: config
+        });
+      });
+    }
+
+    // 测试压缩器连接
+    const compTestBtn = document.getElementById('comp-test-btn');
+    if (compTestBtn) {
+      compTestBtn.addEventListener('click', () => {
+        const baseUrlInput = document.getElementById('comp-base-url');
+        const apiKeyInput = document.getElementById('comp-api-key');
+        const modelInput = document.getElementById('comp-model');
+        const providerSelect = document.getElementById('comp-provider');
+
+        const config = {
+          baseUrl: baseUrlInput ? baseUrlInput.value : '',
+          apiKey: apiKeyInput ? apiKeyInput.value : '',
+          model: modelInput ? modelInput.value : '',
+          provider: providerSelect ? providerSelect.value : 'anthropic',
+          enabled: true
+        };
+
+        // 添加加载状态
+        compTestBtn.classList.add('loading');
+        compTestBtn.disabled = true;
+
+        vscode.postMessage({
+          type: 'testCompressorConnection',
+          config: config
+        });
+      });
+    }
+
+    // ============================================================================
+    // MCP 配置功能
+    // ============================================================================
+
+    const mcpAddBtn = document.getElementById('mcp-add-btn');
+    if (mcpAddBtn) {
+      mcpAddBtn.addEventListener('click', () => {
+        showMCPDialog();
+      });
+    }
+
+    // Skill 仓库管理按钮
+    const repoManageBtn = document.getElementById('repo-manage-btn');
+    if (repoManageBtn) {
+      repoManageBtn.addEventListener('click', () => {
+        showRepositoryManagementDialog();
+      });
+    }
+
+    // ============================================================================
+    // Worker 模型配置功能
+    // ============================================================================
+
+    // Worker 配置管理
+    let currentWorker = 'claude';
+    let workerConfigs = {
+      claude: null,
+      codex: null,
+      gemini: null
+    };
+
+    // 初始化：加载所有 Worker 配置
+    function initWorkerModelConfig() {
+      vscode.postMessage({
+        type: 'loadAllWorkerConfigs'
+      });
+    }
+
+    // 显示 Worker 配置
+    function displayWorkerConfig(worker) {
+      const config = workerConfigs[worker];
+      if (!config) return;
+
+      const baseUrlInput = document.getElementById('worker-base-url');
+      const apiKeyInput = document.getElementById('worker-api-key');
+      const modelInput = document.getElementById('worker-model');
+      const providerSelect = document.getElementById('worker-provider');
+      const enabledCheckbox = document.getElementById('worker-enabled');
+
+      if (baseUrlInput) baseUrlInput.value = config.baseUrl || '';
+      if (apiKeyInput) apiKeyInput.value = config.apiKey || '';
+      if (modelInput) modelInput.value = config.model || '';
+      if (providerSelect) providerSelect.value = config.provider || 'anthropic';
+      if (enabledCheckbox) enabledCheckbox.checked = config.enabled !== false;
+    }
+
+    // Worker 选择器切换
+    document.querySelectorAll('.worker-model-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        const worker = tab.dataset.worker;
+        if (worker === currentWorker) return;
+
+        // 更新选中状态
+        document.querySelectorAll('.worker-model-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+
+        // 显示 Worker 配置
+        displayWorkerConfig(worker);
+        currentWorker = worker;
+      });
+    });
+
+    // 保存 Worker 配置
+    const workerSaveBtn = document.getElementById('worker-save-btn');
+    if (workerSaveBtn) {
+      workerSaveBtn.addEventListener('click', () => {
+        const baseUrlInput = document.getElementById('worker-base-url');
+        const apiKeyInput = document.getElementById('worker-api-key');
+        const modelInput = document.getElementById('worker-model');
+        const providerSelect = document.getElementById('worker-provider');
+        const enabledCheckbox = document.getElementById('worker-enabled');
+
+        const config = {
+          baseUrl: baseUrlInput ? baseUrlInput.value : '',
+          apiKey: apiKeyInput ? apiKeyInput.value : '',
+          model: modelInput ? modelInput.value : '',
+          provider: providerSelect ? providerSelect.value : 'anthropic',
+          enabled: enabledCheckbox ? enabledCheckbox.checked : true
+        };
+
+        // 保存到本地缓存
+        workerConfigs[currentWorker] = config;
+
+        // 发送到后端保存
+        vscode.postMessage({
+          type: 'saveWorkerConfig',
+          worker: currentWorker,
+          config: config
+        });
+      });
+    }
+
+    // 测试 Worker 连接
+    const workerTestBtn = document.getElementById('worker-test-btn');
+    if (workerTestBtn) {
+      workerTestBtn.addEventListener('click', () => {
+        const baseUrlInput = document.getElementById('worker-base-url');
+        const apiKeyInput = document.getElementById('worker-api-key');
+        const modelInput = document.getElementById('worker-model');
+        const providerSelect = document.getElementById('worker-provider');
+
+        const config = {
+          baseUrl: baseUrlInput ? baseUrlInput.value : '',
+          apiKey: apiKeyInput ? apiKeyInput.value : '',
+          model: modelInput ? modelInput.value : '',
+          provider: providerSelect ? providerSelect.value : 'anthropic',
+          enabled: true  // 测试连接时强制启用
+        };
+
+        // 添加加载状态
+        workerTestBtn.classList.add('loading');
+        workerTestBtn.disabled = true;
+
+        vscode.postMessage({
+          type: 'testWorkerConnection',
+          worker: currentWorker,
+          config: config
+        });
+      });
+    }
+
+    // 页面加载时初始化配置
+    initWorkerModelConfig();
+    initOrchestratorConfig();
+    initCompressorConfig();
+
+    // ============================================================================
+    // MCP 配置功能
+    // ============================================================================
+
+    let mcpServers = [];
+    let currentEditingMCPServer = null;
+
+    /**
+     * 初始化 MCP 配置
+     */
+    function initMCPConfig() {
+      vscode.postMessage({ type: 'loadMCPServers' });
+    }
+
+    /**
+     * 渲染 MCP 服务器列表
+     */
+    function renderMCPServerList() {
+      const listEl = document.getElementById('mcp-server-list');
+      if (!listEl) return;
+
+      if (mcpServers.length === 0) {
+        listEl.innerHTML = `
+          <div class="empty-state">
+            <svg viewBox="0 0 16 16" width="48" height="48" fill="currentColor" opacity="0.3">
+              <path d="M2 2.5a.5.5 0 0 1 .5-.5h3a.5.5 0 0 1 0 1H3v2.5a.5.5 0 0 1-1 0v-3zm12 0a.5.5 0 0 0-.5-.5h-3a.5.5 0 0 0 0 1H13v2.5a.5.5 0 0 0 1 0v-3zm-12 9a.5.5 0 0 0 .5.5h3a.5.5 0 0 0 0-1H3v-2.5a.5.5 0 0 0-1 0v3zm12 0a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1 0-1H13v-2.5a.5.5 0 0 1 1 0v3z"/>
+              <path d="M8 3a5 5 0 1 0 0 10A5 5 0 0 0 8 3zM4 8a4 4 0 1 1 8 0 4 4 0 0 1-8 0z"/>
+            </svg>
+            <p>暂无 MCP 服务器</p>
+            <p style="font-size: 11px; opacity: 0.6;">点击"添加服务器"开始配置</p>
+          </div>
+        `;
+        return;
+      }
+
+      listEl.innerHTML = mcpServers.map(server => `
+        <div class="mcp-server-item" data-server-id="${server.id}">
+          <div class="mcp-server-header" data-server-id="${server.id}">
+            <div class="mcp-server-info">
+              <div class="mcp-server-name">${server.name}</div>
+              <div class="mcp-server-command">${server.command || ''}</div>
+            </div>
+            <div class="mcp-server-actions">
+              <button class="mcp-action-btn" data-action="refresh" data-server-id="${server.id}" title="刷新工具列表">
+                <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor">
+                  <path d="M11.534 7h3.932a.25.25 0 0 1 .192.41l-1.966 2.36a.25.25 0 0 1-.384 0l-1.966-2.36a.25.25 0 0 1 .192-.41zm-11 2h3.932a.25.25 0 0 0 .192-.41L2.692 6.23a.25.25 0 0 0-.384 0L.342 8.59A.25.25 0 0 0 .534 9z"/>
+                  <path d="M8 3c-1.552 0-2.94.707-3.857 1.818a.5.5 0 1 1-.771-.636A6.002 6.002 0 0 1 13.917 7H12.9A5.002 5.002 0 0 0 8 3zM3.1 9a5.002 5.002 0 0 0 8.757 2.182.5.5 0 1 1 .771.636A6.002 6.002 0 0 1 2.083 9H3.1z"/>
+                </svg>
+              </button>
+              <button class="mcp-action-btn" data-action="edit" data-server-id="${server.id}" title="编辑">
+                <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor">
+                  <path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168l10-10zM11.207 2.5 13.5 4.793 14.793 3.5 12.5 1.207 11.207 2.5zm1.586 3L10.5 3.207 4 9.707V10h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.293l6.5-6.5zm-9.761 5.175-.106.106-1.528 3.821 3.821-1.528.106-.106A.5.5 0 0 1 5 12.5V12h-.5a.5.5 0 0 1-.5-.5V11h-.5a.5.5 0 0 1-.468-.325z"/>
+                </svg>
+              </button>
+              <button class="mcp-action-btn danger" data-action="delete" data-server-id="${server.id}" title="删除">
+                <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor">
+                  <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
+                  <path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div class="mcp-server-tools" id="mcp-tools-${server.id}" style="display:none;"></div>
+        </div>
+      `).join('');
+
+      // 绑定事件
+      document.querySelectorAll('.mcp-server-header').forEach(header => {
+        header.addEventListener('click', () => {
+          const serverId = header.dataset.serverId;
+          toggleMCPTools(serverId);
+        });
+      });
+
+      document.querySelectorAll('.mcp-action-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const action = btn.dataset.action;
+          const serverId = btn.dataset.serverId;
+          handleMCPAction(action, serverId);
+        });
+      });
+    }
+
+    /**
+     * 处理 MCP 操作
+     */
+    function handleMCPAction(action, serverId) {
+      switch (action) {
+        case 'refresh':
+          expandMCPTools(serverId, true);
+          break;
+        case 'edit':
+          editMCPServer(serverId);
+          break;
+        case 'delete':
+          if (confirm('确定要删除此 MCP 服务器吗？')) {
+            vscode.postMessage({ type: 'deleteMCPServer', serverId });
+          }
+          break;
+      }
+    }
+
+    /**
+     * 切换工具列表显示
+     */
+    function toggleMCPTools(serverId) {
+      const toolsEl = document.getElementById(`mcp-tools-${serverId}`);
+      if (!toolsEl) return;
+
+      if (toolsEl.style.display === 'none') {
+        // 显示工具列表并自动刷新
+        expandMCPTools(serverId, true);
+      } else {
+        // 隐藏工具列表
+        toolsEl.style.display = 'none';
+      }
+    }
+
+    /**
+     * 展开工具列表并加载数据
+     */
+    function expandMCPTools(serverId, forceRefresh) {
+      const toolsEl = document.getElementById(`mcp-tools-${serverId}`);
+      if (!toolsEl) return;
+
+      toolsEl.style.display = 'block';
+      toolsEl.innerHTML = '<div class="mcp-tools-empty">加载中...</div>';
+
+      if (forceRefresh) {
+        vscode.postMessage({ type: 'refreshMCPTools', serverId });
+      } else {
+        vscode.postMessage({ type: 'getMCPServerTools', serverId });
+      }
+    }
+
+    /**
+     * 渲染工具列表
+     */
+    function renderMCPTools(serverId, tools) {
+      const toolsEl = document.getElementById(`mcp-tools-${serverId}`);
+      if (!toolsEl) return;
+
+      if (tools.length === 0) {
+        toolsEl.innerHTML = '<div class="mcp-tools-empty">暂无工具</div>';
+        return;
+      }
+
+      toolsEl.innerHTML = `
+        <div class="mcp-tools-header">
+          <span>工具列表 (${tools.length})</span>
+        </div>
+        <div class="mcp-tools-list">
+          ${tools.map(tool => `
+            <div class="mcp-tool-item">
+              <div class="mcp-tool-row">
+                <div class="mcp-tool-name" title="${tool.name}">${tool.name}</div>
+                <button class="mcp-tool-desc-btn" type="button" title="查看描述" data-tool-desc="${(tool.description || '无描述').replace(/"/g, '&quot;')}">
+                  <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor">
+                    <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 13A6 6 0 1 1 8 2a6 6 0 0 1 0 12zm-.5-6.5h1v4h-1v-4zm0-3h1v1h-1v-1z"/>
+                  </svg>
+                </button>
+              </div>
+              <div class="mcp-tool-desc-pop">${tool.description || '无描述'}</div>
+            </div>
+          `).join('')}
+        </div>
+      `;
+
+      toolsEl.querySelectorAll('.mcp-tool-desc-btn').forEach((btn) => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const item = btn.closest('.mcp-tool-item');
+          if (!item) return;
+          toolsEl.querySelectorAll('.mcp-tool-item.show-desc').forEach((openItem) => {
+            if (openItem !== item) openItem.classList.remove('show-desc');
+          });
+          item.classList.toggle('show-desc');
+        });
+      });
+
+      toolsEl.addEventListener('click', (e) => {
+        const target = e.target;
+        if (target && target.closest && target.closest('.mcp-tool-desc-pop')) {
+          return;
+        }
+        toolsEl.querySelectorAll('.mcp-tool-item.show-desc').forEach((openItem) => {
+          openItem.classList.remove('show-desc');
+        });
+      });
+    }
+
+    /**
+     * 编辑 MCP 服务器
+     */
+    function editMCPServer(serverId) {
+      const server = mcpServers.find(s => s.id === serverId);
+      if (!server) return;
+
+      currentEditingMCPServer = server;
+      showMCPDialog(server);
+    }
+
+    /**
+     * 显示 MCP 对话框
+     */
+    function showMCPDialog(server = null) {
+      const isEdit = server !== null;
+      const title = isEdit ? '编辑 MCP 服务器' : '添加 MCP 服务器';
+      const defaultJSON = `{
+  "mcpServers": {
+    "${server?.name || "mcp-server"}": {
+      "command": "${server?.command || "npx"}",
+      "args": ${server?.args ? JSON.stringify(server.args, null, 2) : `[
+        "@modelcontextprotocol/server-filesystem",
+        "/path/to/allowed/files"
+      ]`},
+      "env": ${server?.env ? JSON.stringify(server.env, null, 2) : `{}`}
+    }
+  }
+}`;
+
+      const dialogHTML = `
+        <div class="modal-overlay" id="mcp-dialog-overlay">
+          <div class="modal-dialog">
+            <div class="modal-header">
+              <h3>${title}</h3>
+              <button class="modal-close" id="mcp-dialog-close">×</button>
+            </div>
+            <div class="modal-body">
+              <div class="form-field">
+                <label>MCP 服务器 JSON</label>
+                <textarea id="mcp-json" rows="12" placeholder="粘贴 MCP JSON 配置">${defaultJSON}</textarea>
+                <div class="form-help" style="font-size: 11px; opacity: 0.7; margin-top: 6px;">
+                  支持格式：{ "mcpServers": { "name": { "command": "...", "args": [...], "env": {...} } } }
+                </div>
+              </div>
+            </div>
+            <div class="modal-footer">
+              <button class="settings-btn" id="mcp-dialog-cancel">取消</button>
+              <button class="settings-btn primary" id="mcp-dialog-save">保存</button>
+            </div>
+          </div>
+        </div>
+      `;
+
+      // 移除旧对话框
+      const oldDialog = document.getElementById('mcp-dialog-overlay');
+      if (oldDialog) oldDialog.remove();
+
+      // 添加新对话框
+      document.body.insertAdjacentHTML('beforeend', dialogHTML);
+
+      // 绑定事件
+      document.getElementById('mcp-dialog-close').addEventListener('click', closeMCPDialog);
+      document.getElementById('mcp-dialog-cancel').addEventListener('click', closeMCPDialog);
+      document.getElementById('mcp-dialog-save').addEventListener('click', () => saveMCPServer(isEdit));
+      document.getElementById('mcp-dialog-overlay').addEventListener('click', (e) => {
+        if (e.target.id === 'mcp-dialog-overlay') closeMCPDialog();
+      });
+    }
+
+    /**
+     * 关闭 MCP 对话框
+     */
+    function closeMCPDialog() {
+      const dialog = document.getElementById('mcp-dialog-overlay');
+      if (dialog) dialog.remove();
+      currentEditingMCPServer = null;
+    }
+
+    /**
+     * 保存 MCP 服务器
+     */
+    function saveMCPServer(isEdit) {
+      const jsonText = document.getElementById('mcp-json').value.trim();
+      if (!jsonText) {
+        alert('请输入 MCP JSON 配置');
+        return;
+      }
+
+      let parsed;
+      try {
+        parsed = JSON.parse(jsonText);
+      } catch (error) {
+        alert('JSON 格式错误：' + error.message);
+        return;
+      }
+
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        alert('JSON 必须是对象');
+        return;
+      }
+
+      const servers = parsed.mcpServers;
+      if (!servers || typeof servers !== 'object' || Array.isArray(servers)) {
+        alert('缺少 mcpServers 对象');
+        return;
+      }
+
+      const serverNames = Object.keys(servers);
+      if (serverNames.length === 0) {
+        alert('mcpServers 不能为空');
+        return;
+      }
+
+      if (serverNames.length > 1 && isEdit) {
+        alert('编辑模式仅支持一个服务器');
+        return;
+      }
+
+      const saveServer = (name, cfg, isUpdate) => {
+        if (!cfg || typeof cfg !== 'object') {
+          alert(`服务器 ${name} 配置无效`);
+          return false;
+        }
+        const command = String(cfg.command || '').trim();
+        if (!command) {
+          alert(`服务器 ${name} 缺少 command`);
+          return false;
+        }
+
+        const args = cfg.args ?? [];
+        if (!Array.isArray(args)) {
+          alert(`服务器 ${name} 的 args 必须是数组`);
+          return false;
+        }
+
+        const env = cfg.env ?? {};
+        if (typeof env !== 'object' || Array.isArray(env)) {
+          alert(`服务器 ${name} 的 env 必须是对象`);
+          return false;
+        }
+
+        const serverData = {
+          name,
+          command,
+          args,
+          env,
+          enabled: cfg.enabled !== false,
+          type: 'stdio'
+        };
+
+        if (isUpdate && currentEditingMCPServer) {
+          serverData.id = currentEditingMCPServer.id;
+          vscode.postMessage({
+            type: 'updateMCPServer',
+            serverId: currentEditingMCPServer.id,
+            updates: serverData
+          });
+        } else {
+          vscode.postMessage({
+            type: 'addMCPServer',
+            server: serverData
+          });
+        }
+
+        return true;
+      };
+
+      let savedCount = 0;
+      if (isEdit && currentEditingMCPServer) {
+        const name = serverNames[0];
+        if (saveServer(name, servers[name], true)) savedCount += 1;
+      } else {
+        serverNames.forEach((name) => {
+          if (saveServer(name, servers[name], false)) savedCount += 1;
+        });
+      }
+
+      if (savedCount > 0) {
+        vscode.postMessage({ type: 'loadMCPServers' });
+        closeMCPDialog();
+      }
+    }
+
+    // 初始化 MCP 配置
+    initMCPConfig();
+
+    // 初始化 Skill 仓库配置
+    initRepositories();
+
+    // ============================================================================
+    // Claude Skills 配置功能
+    // ============================================================================
+
+    let skillsConfig = null;
+
+    /**
+     * ============================================================================
+     * Skill 仓库管理
+     * ============================================================================
+     */
+
+    let repositories = [];
+
+    /**
+     * 初始化仓库配置
+     */
+    function initRepositories() {
+      vscode.postMessage({ type: 'loadRepositories' });
+    }
+
+    /**
+     * 显示仓库管理对话框
+     */
+    function showRepositoryManagementDialog() {
+      const dialogHTML = `
+        <div class="modal-overlay" id="repo-manage-overlay" onclick="if(event.target===this) closeRepositoryManagementDialog()">
+          <div class="modal-dialog" style="width: 600px; max-height: 80vh;">
+            <div class="modal-header">
+              <h3>管理技能仓库</h3>
+              <button class="modal-close" onclick="closeRepositoryManagementDialog()">×</button>
+            </div>
+            <div class="modal-body" style="padding: 20px;">
+              <!-- 添加仓库区域 -->
+              <div style="margin-bottom: 24px; padding: 16px; background: var(--vscode-editor-background); border-radius: 6px; border: 1px solid var(--vscode-panel-border);">
+                <div style="display: flex; gap: 12px; align-items: flex-end;">
+                  <div style="flex: 1;">
+                    <label style="display: block; margin-bottom: 8px; font-size: 13px; font-weight: 500; color: var(--vscode-foreground);">仓库 URL</label>
+                    <input type="text" id="repo-url-input" placeholder="https://example.com/skills.json"
+                      style="width: 100%; padding: 8px 12px; background: var(--vscode-input-background);
+                      border: 1px solid var(--vscode-input-border); border-radius: 4px;
+                      color: var(--vscode-input-foreground); font-size: 13px; line-height: 20px;">
+                  </div>
+                  <button class="settings-btn primary" onclick="addRepositoryFromDialog()"
+                    style="height: 36px; padding: 0 16px; display: flex; align-items: center; gap: 6px; white-space: nowrap;">
+                    <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
+                      <path d="M8 2a.5.5 0 0 1 .5.5v5h5a.5.5 0 0 1 0 1h-5v5a.5.5 0 0 1-1 0v-5h-5a.5.5 0 0 1 0-1h5v-5A.5.5 0 0 1 8 2z"/>
+                    </svg>
+                    <span>添加</span>
+                  </button>
+                </div>
+                <div style="margin-top: 8px; font-size: 12px; color: var(--vscode-descriptionForeground); line-height: 18px;">
+                  仓库名称将自动从 URL 获取
+                </div>
+              </div>
+
+              <!-- 仓库列表 -->
+              <div style="margin-bottom: 12px; font-size: 13px; font-weight: 500; color: var(--vscode-foreground);">
+                已添加的仓库
+              </div>
+              <div id="repo-manage-list" style="max-height: 400px; overflow-y: auto;">
+                <!-- 仓库列表将在这里渲染 -->
+              </div>
+            </div>
+            <div class="modal-footer" style="display: flex; justify-content: flex-end; padding: 16px 20px;">
+              <button class="settings-btn" onclick="closeRepositoryManagementDialog()"
+                style="padding: 8px 20px;">关闭</button>
+            </div>
+          </div>
+        </div>
+      `;
+
+      document.body.insertAdjacentHTML('beforeend', dialogHTML);
+      renderRepositoryManagementList();
+    }
+
+    /**
+     * 渲染仓库管理列表
+     */
+    function renderRepositoryManagementList() {
+      const listEl = document.getElementById('repo-manage-list');
+      if (!listEl) return;
+
+      if (!repositories || repositories.length === 0) {
+        listEl.innerHTML = `
+          <div class="empty-state" style="padding: 60px 20px; text-align: center;">
+            <svg viewBox="0 0 16 16" width="48" height="48" fill="currentColor" opacity="0.3" style="display: block; margin: 0 auto 12px;">
+              <path d="M2.5 3.5a.5.5 0 0 1 0-1h11a.5.5 0 0 1 0 1h-11zm0 3a.5.5 0 0 1 0-1h11a.5.5 0 0 1 0 1h-11zm0 3a.5.5 0 0 1 0-1h11a.5.5 0 0 1 0 1h-11zm0 3a.5.5 0 0 1 0-1h11a.5.5 0 0 1 0 1h-11z"/>
+            </svg>
+            <p style="margin: 0; font-size: 13px; color: var(--vscode-descriptionForeground);">暂无仓库</p>
+          </div>
+        `;
+        return;
+      }
+
+      listEl.innerHTML = repositories.map(repo => `
+        <div style="margin-bottom: 8px; padding: 14px 16px; background: var(--vscode-editor-background);
+          border-radius: 6px; border: 1px solid var(--vscode-panel-border);">
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 16px;">
+            <!-- 仓库信息 -->
+            <div style="flex: 1; min-width: 0;">
+              <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
+                <span style="font-size: 13px; font-weight: 500; color: var(--vscode-foreground);">
+                  ${repo.name || (repo.id === 'builtin' ? 'Claude 官方技能' : repo.url)}
+                </span>
+                ${repo.id === 'builtin' ? `
+                  <span style="display: inline-flex; align-items: center; padding: 2px 8px;
+                    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
+                    border-radius: 3px; font-size: 11px; line-height: 16px; font-weight: 500;">内置</span>
+                ` : ''}
+              </div>
+              <div style="font-size: 12px; color: var(--vscode-descriptionForeground);
+                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 18px;">
+                ${repo.url}
+              </div>
+            </div>
+
+            <!-- 操作按钮 -->
+            <div style="display: flex; align-items: center; gap: 8px; flex-shrink: 0;">
+              <button class="settings-btn" onclick="refreshRepositoryInDialog('${repo.id}')"
+                title="刷新仓库" style="height: 32px; padding: 0 12px; display: flex; align-items: center; gap: 6px;">
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
+                  <path d="M11.534 7h3.932a.25.25 0 0 1 .192.41l-1.966 2.36a.25.25 0 0 1-.384 0l-1.966-2.36a.25.25 0 0 1 .192-.41zm-11 2h3.932a.25.25 0 0 0 .192-.41L2.692 6.23a.25.25 0 0 0-.384 0L.342 8.59A.25.25 0 0 0 .534 9z"/>
+                  <path fill-rule="evenodd" d="M8 3c-1.552 0-2.94.707-3.857 1.818a.5.5 0 1 1-.771-.636A6.002 6.002 0 0 1 13.917 7H12.9A5.002 5.002 0 0 0 8 3zM3.1 9a5.002 5.002 0 0 0 8.757 2.182.5.5 0 1 1 .771.636A6.002 6.002 0 0 1 2.083 9H3.1z"/>
+                </svg>
+                <span style="font-size: 12px;">刷新</span>
+              </button>
+              ${repo.id !== 'builtin' ? `
+                <button class="settings-btn danger" onclick="deleteRepositoryFromDialog('${repo.id}')"
+                  title="删除仓库" style="height: 32px; padding: 0 12px; display: flex; align-items: center; gap: 6px;">
+                  <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
+                    <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
+                    <path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
+                  </svg>
+                  <span style="font-size: 12px;">删除</span>
+                </button>
+              ` : ''}
+            </div>
+          </div>
+        </div>
+      `).join('');
+    }
+
+    /**
+     * 从对话框添加仓库
+     */
+    function addRepositoryFromDialog() {
+      const input = document.getElementById('repo-url-input');
+      const url = input.value.trim();
+
+      if (!url) {
+        alert('请输入仓库 URL');
+        return;
+      }
+
+      vscode.postMessage({
+        type: 'addRepository',
+        url
+      });
+
+      input.value = '';
+    }
+
+    /**
+     * 从对话框刷新仓库
+     */
+    function refreshRepositoryInDialog(id) {
+      vscode.postMessage({
+        type: 'refreshRepository',
+        repositoryId: id
+      });
+    }
+
+    /**
+     * 从对话框删除仓库
+     */
+    function deleteRepositoryFromDialog(id) {
+      if (confirm('确定要删除此仓库吗？')) {
+        vscode.postMessage({
+          type: 'deleteRepository',
+          repositoryId: id
+        });
+      }
+    }
+
+    /**
+     * 关闭仓库管理对话框
+     */
+    function closeRepositoryManagementDialog() {
+      const dialog = document.getElementById('repo-manage-overlay');
+      if (dialog) dialog.remove();
+    }
+
+    /**
+     * ============================================================================
+     * Skills 配置管理
+     * ============================================================================
+     */
+
+    /**
+     * 初始化 Skills 配置
+     */
+    function initSkillsConfig() {
+      vscode.postMessage({ type: 'loadSkillsConfig' });
+    }
+
+    /**
+     * 渲染 Skills 工具列表
+     */
+    function renderSkillsToolList() {
+      const listEl = document.getElementById('skills-tool-list');
+      if (!listEl) return;
+
+      // 检查是否有已安装的 Skills
+      if (!skillsConfig || !skillsConfig.builtInTools) {
+        listEl.innerHTML = `
+          <div class="empty-state">
+            <svg viewBox="0 0 16 16" width="48" height="48" fill="currentColor" opacity="0.3">
+              <path d="M5 2V0H0v5h2v6H0v5h5v-2h6v2h5v-5h-2V5h2V0h-5v2H5zm6 1v2h2v6h-2v2H5v-2H3V5h2V3h6z"/>
+            </svg>
+            <p>暂无已安装的 Skill</p>
+            <p style="font-size: 11px; opacity: 0.6;">点击"安装 Skill"从库中安装</p>
+          </div>
+        `;
+        return;
+      }
+
+      // 获取已启用的 Skills
+      const enabledSkills = [];
+      for (const [toolName, toolConfig] of Object.entries(skillsConfig.builtInTools)) {
+        if (toolConfig.enabled) {
+          enabledSkills.push({
+            name: toolName,
+            description: toolConfig.description || '',
+            enabled: true
+          });
+        }
+      }
+
+      // 如果没有启用的 Skills，显示空状态
+      if (enabledSkills.length === 0) {
+        listEl.innerHTML = `
+          <div class="empty-state">
+            <svg viewBox="0 0 16 16" width="48" height="48" fill="currentColor" opacity="0.3">
+              <path d="M5 2V0H0v5h2v6H0v5h5v-2h6v2h5v-5h-2V5h2V0h-5v2H5zm6 1v2h2v6h-2v2H5v-2H3V5h2V3h6z"/>
+            </svg>
+            <p>暂无已安装的 Skill</p>
+            <p style="font-size: 11px; opacity: 0.6;">点击"安装 Skill"从库中安装</p>
+          </div>
+        `;
+        return;
+      }
+
+      // 渲染已安装的 Skills
+      let html = '<div class="skills-tool-list">';
+
+      for (const skill of enabledSkills) {
+        // 判断是服务器端还是客户端工具
+        const isServerSide = skill.name.includes('web_search') || skill.name.includes('web_fetch');
+        const typeLabel = isServerSide ? 'Server' : 'Client';
+        const typeColor = isServerSide ? '#0078d4' : '#e91e63';
+
+        html += `
+          <div class="skills-tool-item">
+            <div class="skills-tool-icon" style="background: ${typeColor}20; color: ${typeColor};">
+              <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor">
+                <path d="M5 2V0H0v5h2v6H0v5h5v-2h6v2h5v-5h-2V5h2V0h-5v2H5zm6 1v2h2v6h-2v2H5v-2H3V5h2V3h6z"/>
+              </svg>
+            </div>
+            <div class="skills-tool-info">
+              <div class="skills-tool-header">
+                <span class="skills-tool-name">${skill.name}</span>
+                <span class="skills-tool-type" style="background: ${typeColor}20; color: ${typeColor};">${typeLabel}</span>
+              </div>
+              <div class="skills-tool-description">${skill.description}</div>
+            </div>
+            <label class="skills-tool-toggle">
+              <input type="checkbox" checked disabled>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        `;
+      }
+
+      html += '</div>';
+      listEl.innerHTML = html;
+    }
+
+    // 绑定安装 Skill 按钮
+    const skillAddBtn = document.getElementById('skill-add-btn');
+    if (skillAddBtn) {
+      skillAddBtn.addEventListener('click', () => {
+        showSkillLibraryDialog();
+      });
+    }
+
+    /**
+     * 显示 Skill 库对话框
+     */
+    function showSkillLibraryDialog(skills) {
+      const dialogHTML = `
+        <div class="modal-overlay" id="skill-library-overlay">
+          <div class="modal-dialog" style="width: 600px;">
+            <div class="modal-header">
+              <h3>Skill 库</h3>
+              <button class="modal-close" id="skill-library-close">×</button>
+            </div>
+            <div class="modal-body">
+              <div class="skill-library-search" style="margin-bottom: 16px;">
+                <input type="text" id="skill-search" placeholder="搜索 Skill..."
+                  style="width: 100%; padding: 8px; border: 1px solid var(--vscode-input-border);
+                  background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+                  border-radius: 4px;">
+              </div>
+              <div class="skill-library-list" id="skill-library-list">
+                <!-- Skill 列表将动态生成 -->
+              </div>
+            </div>
+            <div class="modal-footer">
+              <button class="settings-btn" id="skill-library-cancel">关闭</button>
+            </div>
+          </div>
+        </div>
+      `;
+
+      // 移除旧对话框
+      const oldDialog = document.getElementById('skill-library-overlay');
+      if (oldDialog) oldDialog.remove();
+
+      // 添加新对话框
+      document.body.insertAdjacentHTML('beforeend', dialogHTML);
+
+      // 绑定事件
+      document.getElementById('skill-library-close').addEventListener('click', closeSkillLibraryDialog);
+      document.getElementById('skill-library-cancel').addEventListener('click', closeSkillLibraryDialog);
+      document.getElementById('skill-library-overlay').addEventListener('click', (e) => {
+        if (e.target.id === 'skill-library-overlay') closeSkillLibraryDialog();
+      });
+
+      // 如果传入了 skills，直接渲染；否则从后端加载
+      if (skills) {
+        renderSkillLibrary(skills);
+      } else {
+        vscode.postMessage({ type: 'loadSkillLibrary' });
+      }
+    }
+
+    /**
+     * 关闭 Skill 库对话框
+     */
+    function closeSkillLibraryDialog() {
+      const dialog = document.getElementById('skill-library-overlay');
+      if (dialog) dialog.remove();
+    }
+
+    /**
+     * 渲染 Skill 库（按仓库分组）
+     */
+    function renderSkillLibrary(skills) {
+      const listEl = document.getElementById('skill-library-list');
+      if (!listEl) return;
+
+      if (!skills || skills.length === 0) {
+        listEl.innerHTML = `
+          <div class="empty-state">
+            <p>暂无可用的 Skill</p>
+          </div>
+        `;
+        return;
+      }
+
+      // 按仓库分组
+      const skillsByRepo = {};
+      for (const skill of skills) {
+        const repoId = skill.repositoryId || 'unknown';
+        if (!skillsByRepo[repoId]) {
+          skillsByRepo[repoId] = {
+            name: skill.repositoryName || '未知仓库',
+            skills: []
+          };
+        }
+        skillsByRepo[repoId].skills.push(skill);
+      }
+
+      // 渲染分组后的 Skills
+      let html = '';
+      for (const [repoId, repoData] of Object.entries(skillsByRepo)) {
+        html += `
+          <div class="skill-repo-group" style="margin-bottom: 24px;">
+            <div style="font-size: 13px; font-weight: 600; margin-bottom: 12px; color: var(--vscode-descriptionForeground);">
+              ${repoData.name}
+            </div>
+            ${repoData.skills.map(skill => `
+              <div class="skill-library-item" style="padding: 12px; border: 1px solid var(--vscode-input-border);
+                border-radius: 4px; margin-bottom: 8px; display: flex; align-items: center; gap: 12px;">
+                <div class="skill-library-icon" style="width: 40px; height: 40px; border-radius: 8px;
+                  display: flex; align-items: center; justify-content: center;
+                  background: rgba(59, 130, 246, 0.15); color: #3b82f6; flex-shrink: 0;">
+                  ${skill.icon || '<svg viewBox="0 0 16 16" width="24" height="24" fill="currentColor"><path d="M5 2V0H0v5h2v6H0v5h5v-2h6v2h5v-5h-2V5h2V0h-5v2H5zm6 1v2h2v6h-2v2H5v-2H3V5h2V3h6z"/></svg>'}
+                </div>
+                <div class="skill-library-info" style="flex: 1; min-width: 0;">
+                  <div style="font-size: 14px; font-weight: 600; margin-bottom: 4px;">${skill.name}</div>
+                  <div style="font-size: 12px; color: var(--vscode-descriptionForeground); margin-bottom: 4px;">
+                    ${skill.description}
+                  </div>
+                  <div style="font-size: 11px; color: var(--vscode-descriptionForeground);">
+                    ${skill.author ? `作者: ${skill.author}` : ''}
+                    ${skill.version ? `| 版本: ${skill.version}` : ''}
+                    ${skill.category ? `| 分类: ${skill.category}` : ''}
+                  </div>
+                </div>
+                <button class="settings-btn ${skill.installed ? '' : 'primary'}"
+                  onclick="installSkill('${skill.fullName}')" style="flex-shrink: 0;" ${skill.installed ? 'disabled' : ''}>
+                  ${skill.installed ? '已安装' : '安装'}
+                </button>
+              </div>
+            `).join('')}
+          </div>
+        `;
+      }
+
+      listEl.innerHTML = html;
+    }
+
+    /**
+     * 安装 Skill
+     */
+    function installSkill(skillFullName) {
+      // 发送安装请求到后端
+      vscode.postMessage({
+        type: 'installSkill',
+        skillId: skillFullName
+      });
+
+      // 关闭对话框
+      closeSkillLibraryDialog();
+    }
+
+    // 初始化 Skills 配置
+    initSkillsConfig();
 
     // 初始化
     render();

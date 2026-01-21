@@ -9,6 +9,9 @@ import * as vscode from 'vscode';
 import { globalEventBus } from '../events';
 import { CLIType } from '../types';
 
+/** 执行阶段类型 */
+export type ExecutionPhase = 'planning' | 'execution' | 'verification' | 'integration';
+
 /** 单次执行记录 */
 export interface ExecutionRecord {
   cli: CLIType;
@@ -21,6 +24,8 @@ export interface ExecutionRecord {
   /** Token 使用统计 */
   inputTokens?: number;
   outputTokens?: number;
+  /** 执行阶段 */
+  phase?: ExecutionPhase;
 }
 
 /** CLI 统计摘要 */
@@ -176,6 +181,33 @@ export class ExecutionStats {
   getAllStats(): CLIStats[] {
     const cliTypes: CLIType[] = ['claude', 'codex', 'gemini'];
     return cliTypes.map(cli => this.getStats(cli));
+  }
+
+  /** 获取按阶段分离的 Token 统计 */
+  getPhaseStats(): Record<ExecutionPhase | 'unknown', { inputTokens: number; outputTokens: number }> {
+    const phases: (ExecutionPhase | 'unknown')[] = ['planning', 'execution', 'verification', 'integration', 'unknown'];
+    const result: Record<string, { inputTokens: number; outputTokens: number }> = {};
+
+    for (const phase of phases) {
+      const phaseRecords = phase === 'unknown'
+        ? this.records.filter(r => !r.phase)
+        : this.records.filter(r => r.phase === phase);
+
+      result[phase] = {
+        inputTokens: phaseRecords.reduce((sum, r) => sum + (r.inputTokens || 0), 0),
+        outputTokens: phaseRecords.reduce((sum, r) => sum + (r.outputTokens || 0), 0),
+      };
+    }
+
+    return result as Record<ExecutionPhase | 'unknown', { inputTokens: number; outputTokens: number }>;
+  }
+
+  /** 获取总 Token 统计 */
+  getTotalTokens(): { inputTokens: number; outputTokens: number } {
+    return {
+      inputTokens: this.records.reduce((sum, r) => sum + (r.inputTokens || 0), 0),
+      outputTokens: this.records.reduce((sum, r) => sum + (r.outputTokens || 0), 0),
+    };
   }
 
   /** 获取健康的 CLI 列表 */

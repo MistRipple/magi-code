@@ -8,10 +8,10 @@
  * 3. 前端负责渲染（使用 marked + highlight.js）
  */
 
-import { ContentBlock } from '../protocol/message-protocol';
+import { ContentBlock, PlanBlock } from '../protocol/message-protocol';
 
 // 重新导出类型，方便其他模块使用
-export type { ContentBlock };
+export type { ContentBlock, PlanBlock };
 
 /**
  * 移除 ANSI 转义序列（CLI 输出的颜色代码）
@@ -299,6 +299,65 @@ export function isErrorContent(content: string): boolean {
 }
 
 /**
+ * 检测并解析规划 JSON
+ * 返回 PlanBlock 如果内容是有效的规划 JSON，否则返回 null
+ */
+export function tryParsePlanJson(jsonContent: string): PlanBlock | null {
+  if (!jsonContent) return null;
+
+  try {
+    const parsed = JSON.parse(jsonContent.trim());
+
+    // 规划 JSON 必须包含 goal 字段
+    if (!parsed.goal || typeof parsed.goal !== 'string') {
+      return null;
+    }
+
+    // 需要至少有 constraints 或 analysis 之一才算规划
+    if (!parsed.constraints && !parsed.analysis) {
+      return null;
+    }
+
+    // 构建 PlanBlock
+    const planBlock: PlanBlock = {
+      type: 'plan',
+      goal: parsed.goal,
+      rawJson: jsonContent.trim(),
+    };
+
+    if (parsed.analysis && typeof parsed.analysis === 'string') {
+      planBlock.analysis = parsed.analysis;
+    }
+
+    if (Array.isArray(parsed.constraints)) {
+      planBlock.constraints = parsed.constraints.filter((c: unknown) => typeof c === 'string');
+    }
+
+    if (Array.isArray(parsed.acceptanceCriteria)) {
+      planBlock.acceptanceCriteria = parsed.acceptanceCriteria.filter((c: unknown) => typeof c === 'string');
+    }
+
+    if (parsed.riskLevel && ['low', 'medium', 'high'].includes(parsed.riskLevel)) {
+      planBlock.riskLevel = parsed.riskLevel;
+    }
+
+    if (Array.isArray(parsed.riskFactors)) {
+      planBlock.riskFactors = parsed.riskFactors.filter((c: unknown) => typeof c === 'string');
+    }
+
+    console.log('[content-parser] 成功解析规划 JSON:', {
+      goal: planBlock.goal.substring(0, 50) + '...',
+      hasAnalysis: !!planBlock.analysis,
+      constraintsCount: planBlock.constraints?.length || 0,
+    });
+
+    return planBlock;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 提取代码块（支持多个）
  */
 export function extractCodeBlocks(content: string): Array<{
@@ -317,20 +376,52 @@ export function extractCodeBlocks(content: string): Array<{
   }> = [];
 
   // 匹配 ```lang:filepath 或 ```lang filepath 或 ```lang
-  const regex = /```(\w*)(?::([^\s\n]+)|\s+([^\n]*))?\n([\s\S]*?)```/g;
+  // 🔧 修复：使用 [^\S\n]+ 替代 \s+，避免匹配换行符
+  const regex = /```(\w*)(?::([^\s\n]+)|[^\S\n]+([^\n]*))?\n([\s\S]*?)```/g;
   let match;
 
   while ((match = regex.exec(content)) !== null) {
+    // 🔧 修复：只有看起来像文件路径的才当作 filepath
+    // 路径应该包含 / 或 \ 或文件扩展名（.xxx）
+    let candidateFilepath = match[2] || match[3]?.trim() || undefined;
+    let codeContent = match[4] || '';
+
+    // 🔧 关键修复：如果捕获的内容不是有效路径，需要将其添加回代码内容
+    // 例如：```json {\n"goal":... 中的 { 被捕获为 match[3]，但不是路径
+    if (candidateFilepath && !isValidFilepath(candidateFilepath)) {
+      // 将被错误捕获的内容添加回代码开头
+      // match[3] 是空格后的内容，需要加换行符连接代码
+      if (match[3]?.trim()) {
+        codeContent = match[3].trim() + '\n' + codeContent;
+      }
+      candidateFilepath = undefined;
+    }
+
     blocks.push({
       lang: match[1] || 'text',
-      filepath: match[2] || match[3]?.trim() || undefined,
-      code: match[4] || '',
+      filepath: candidateFilepath,
+      code: codeContent,
       startIndex: match.index,
       endIndex: match.index + match[0].length,
     });
   }
 
   return blocks;
+}
+
+/**
+ * 判断字符串是否看起来像有效的文件路径
+ * 有效路径应该包含: / 或 \ 或 .扩展名
+ */
+function isValidFilepath(candidate: string): boolean {
+  if (!candidate || candidate.length > 200) return false;
+  // 包含路径分隔符
+  if (candidate.includes('/') || candidate.includes('\\')) return true;
+  // 包含常见文件扩展名
+  if (/\.\w{1,10}$/.test(candidate)) return true;
+  // 排除看起来像代码的内容（包含空格、括号、花括号等）
+  if (/[\s(){}[\]<>=;,]/.test(candidate)) return false;
+  return false;
 }
 
 /**
@@ -390,6 +481,9 @@ export function parseContentToBlocks(
     codeBlocksCount: codeBlocks.length,
     startsWithCodeBlock,
     firstCodeBlockLang: codeBlocks[0]?.lang,
+    // 🔍 增强调试：记录首个代码块的首行内容
+    firstCodeBlockFirstLine: codeBlocks[0]?.code?.split('\n')[0] || 'N/A',
+    firstCodeBlockContentLength: codeBlocks[0]?.code?.length || 0,
   });
 
   if (codeBlocks.length > 0) {
@@ -425,6 +519,19 @@ export function parseContentToBlocks(
 
       // 代码块本身
       const lang = codeBlock.lang || 'text';
+
+      // 🔧 新增：尝试解析规划 JSON，返回 PlanBlock 而不是 CodeBlock
+      if (lang === 'json') {
+        const planBlock = tryParsePlanJson(codeBlock.code);
+        if (planBlock) {
+          // 成功解析为规划块
+          blocks.push(planBlock);
+          lastIndex = codeBlock.endIndex;
+          continue;
+        }
+      }
+
+      // 普通代码块
       blocks.push({
         type: 'code',
         content: codeBlock.code,
@@ -453,12 +560,17 @@ export function parseContentToBlocks(
   // 4. 添加工具调用块
   if (options?.toolCalls && options.toolCalls.length > 0) {
     for (const tool of options.toolCalls) {
+      // 后端统一序列化 input 为 JSON 字符串
+      let inputStr: string | undefined;
+      if (tool.input !== undefined && tool.input !== null) {
+        inputStr = typeof tool.input === 'string' ? tool.input : JSON.stringify(tool.input, null, 2);
+      }
       blocks.push({
         type: 'tool_call',
         toolName: tool.name,
         toolId: `tool-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         status: (tool.status as 'pending' | 'running' | 'completed' | 'failed') || 'completed',
-        input: typeof tool.input === 'object' ? tool.input as Record<string, unknown> : { value: tool.input },
+        input: inputStr,
       } as ContentBlock);
     }
   }

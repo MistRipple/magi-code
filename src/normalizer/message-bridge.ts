@@ -1,8 +1,8 @@
 /**
  * MessageBridge - 消息桥接层
  *
- * 连接 CLIAdapterFactory 和 Webview，负责：
- * 1. 接收 CLIAdapterFactory 的标准消息事件
+ * 连接 IAdapterFactory 和 Webview，负责：
+ * 1. 接收 IAdapterFactory 的标准消息事件
  * 2. 转发标准消息到 Webview
  * 3. 管理消息生命周期
  *
@@ -11,8 +11,8 @@
 
 import { logger, LogCategory } from '../logging';
 import { EventEmitter } from 'events';
-import type { CLIType } from '../cli/types';
-import type { CLIAdapterFactory } from '../cli/adapter-factory';
+import type { CLIType } from '../types';
+import type { IAdapterFactory } from '../adapters/adapter-factory-interface';
 import {
   StandardMessage,
   StreamUpdate,
@@ -47,10 +47,10 @@ export interface MessageBridgeConfig {
  * 将 CLI 原始输出转换为标准消息格式
  */
 export class MessageBridge extends EventEmitter {
-  private factory: CLIAdapterFactory;
+  private factory: IAdapterFactory;
   private config: MessageBridgeConfig;
 
-  constructor(factory: CLIAdapterFactory, config?: MessageBridgeConfig) {
+  constructor(factory: IAdapterFactory, config?: MessageBridgeConfig) {
     super();
     this.factory = factory;
     this.config = {

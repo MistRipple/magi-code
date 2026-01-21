@@ -30,7 +30,7 @@ export class GeminiNormalizer extends BaseNormalizer {
 
   constructor(config?: Partial<NormalizerConfig>) {
     super({
-      cli: 'gemini',
+      agent: 'gemini',  // ✅ 使用 agent
       defaultSource: 'worker',
       ...config,
     });
@@ -79,12 +79,14 @@ export class GeminiNormalizer extends BaseNormalizer {
       context.pendingText += data.content;
       updates.push(this.createUpdate(context.messageId, 'append', { appendText: data.content }));
     } else if (data.type === 'tool_call' || data.type === 'function_call') {
+      // 后端统一序列化 input 为 JSON 字符串
+      const rawInput = data.args || data.input;
       const toolCall: ToolCallBlock = {
         type: 'tool_call',
         toolName: (data.name as string) || 'unknown',
         toolId: (data.id as string) || generateMessageId(),
         status: 'running',
-        input: data.args as Record<string, unknown> || data.input as Record<string, unknown>,
+        input: rawInput ? JSON.stringify(rawInput, null, 2) : undefined,
       };
       this.upsertToolCall(context, toolCall);
       updates.push(this.createUpdate(context.messageId, 'block_update', { blocks: [toolCall] }));

@@ -3,7 +3,7 @@
  * Codex CLI 执行器
  */
 
-import { CLIType, SubTask, WorkerResult, WorkerConfig } from '../types';
+import { AgentType, SubTask, WorkerResult, WorkerConfig } from '../types';  // ✅ 使用 AgentType
 import { BaseWorker } from './base-worker';
 
 /**
@@ -25,7 +25,7 @@ export class CodexWorker extends BaseWorker {
     this.codexConfig = config;
   }
 
-  get cliType(): CLIType {
+  get agentType(): AgentType {  // ✅ 使用 agentType
     return 'codex';
   }
 
@@ -39,12 +39,8 @@ export class CodexWorker extends BaseWorker {
     // 添加提示内容
     args.push(this.buildPrompt(subTask));
 
-    // 自动批准模式
-    const approval = this.codexConfig.approval ?? 'full-auto';
-    args.push('--approval', approval);
-
-    // 静默模式
-    args.push('--quiet');
+    // 允许在工作区写入并自动执行
+    args.push('--full-auto');
 
     return args;
   }
@@ -83,4 +79,3 @@ export function createCodexWorker(
     approval: 'full-auto',
   });
 }
-

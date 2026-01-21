@@ -52,7 +52,7 @@ interface MessageState {
 export interface ProcessingState {
   isProcessing: boolean;
   source: MessageSource | null;
-  cli: string | null;
+  agent: string | null;  // ✅ 使用 agent 替代 cli
   startedAt: number | null;
 }
 
@@ -90,7 +90,7 @@ export class UnifiedMessageBus extends EventEmitter {
   private processingState: ProcessingState = {
     isProcessing: false,
     source: null,
-    cli: null,
+    agent: null,  // ✅ 使用 agent
     startedAt: null,
   };
   private activeMessageIds: Set<string> = new Set();
@@ -122,7 +122,7 @@ export class UnifiedMessageBus extends EventEmitter {
     // 1. STARTED 消息：总是发送
     if (lifecycle === MessageLifecycle.STARTED) {
       this.recordMessage(message, now);
-      this.updateProcessingState(true, message.source, message.cli);
+      this.updateProcessingState(true, message.source, message.agent);  // ✅ 使用 agent
       this.emit('message', message);
       this.debug('发送消息 [STARTED]', id);
       return true;
@@ -132,7 +132,7 @@ export class UnifiedMessageBus extends EventEmitter {
     if (!existingState) {
       this.recordMessage(message, now);
       if (lifecycle === MessageLifecycle.STREAMING) {
-        this.updateProcessingState(true, message.source, message.cli);
+        this.updateProcessingState(true, message.source, message.agent);  // ✅ 使用 agent
       }
       this.emit('message', message);
       this.debug('发送消息 [NEW]', id);
@@ -267,12 +267,12 @@ export class UnifiedMessageBus extends EventEmitter {
     );
   }
 
-  private updateProcessingState(isProcessing: boolean, source: MessageSource | null, cli: string | null): void {
+  private updateProcessingState(isProcessing: boolean, source: MessageSource | null, agent: string | null): void {  // ✅ 使用 agent
     const prev = this.processingState.isProcessing;
     this.processingState = {
       isProcessing,
       source: isProcessing ? source : null,
-      cli: isProcessing ? cli : null,
+      agent: isProcessing ? agent : null,  // ✅ 使用 agent
       startedAt: isProcessing ? (this.processingState.startedAt || Date.now()) : null,
     };
     if (prev !== isProcessing) {

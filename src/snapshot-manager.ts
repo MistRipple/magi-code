@@ -8,13 +8,23 @@
 import { logger, LogCategory } from './logging';
 import * as fs from 'fs';
 import * as path from 'path';
-import { FileSnapshot, CLIType, PendingChange } from './types';
+import { FileSnapshot, PendingChange } from './types';
+import { AgentType } from './types/agent-types';
 import { UnifiedSessionManager, FileSnapshotMeta } from './session';
 import { globalEventBus } from './events';
 
 /** 生成唯一 ID */
 function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+}
+
+/**
+ * 快照操作结果
+ */
+interface SnapshotOperationResult {
+  success: boolean;
+  snapshotId?: string;
+  error?: string;
 }
 
 /**
@@ -29,9 +39,150 @@ export class SnapshotManager {
   private snapshotContentCache: Map<string, string> = new Map();
   private readonly MAX_CACHE_SIZE = 100; // 最大缓存条目数
 
+  // 操作锁（防止并发写入冲突）
+  private operationLocks: Set<string> = new Set();
+
   constructor(sessionManager: UnifiedSessionManager, workspaceRoot: string) {
     this.sessionManager = sessionManager;
     this.workspaceRoot = workspaceRoot;
+  }
+
+  /**
+   * 获取操作锁
+   * @returns 是否成功获取锁
+   */
+  private acquireLock(key: string): boolean {
+    if (this.operationLocks.has(key)) {
+      return false;
+    }
+    this.operationLocks.add(key);
+    return true;
+  }
+
+  /**
+   * 释放操作锁
+   */
+  private releaseLock(key: string): void {
+    this.operationLocks.delete(key);
+  }
+
+  /**
+   * 原子性写入快照（写文件 + 更新元数据）
+   * 如果任何步骤失败，回滚所有更改
+   */
+  private atomicWriteSnapshot(
+    sessionId: string,
+    snapshotId: string,
+    snapshotFile: string,
+    content: string,
+    meta: FileSnapshotMeta
+  ): SnapshotOperationResult {
+    const lockKey = `snapshot:${sessionId}:${meta.filePath}`;
+
+    // 尝试获取锁
+    if (!this.acquireLock(lockKey)) {
+      return {
+        success: false,
+        error: `Operation in progress for file: ${meta.filePath}`,
+      };
+    }
+
+    try {
+      // 步骤 1: 写入快照文件
+      this.ensureSnapshotDir(sessionId);
+      fs.writeFileSync(snapshotFile, content, 'utf-8');
+
+      // 步骤 2: 更新元数据
+      try {
+        this.sessionManager.addSnapshot(sessionId, meta);
+      } catch (metaError) {
+        // 元数据更新失败，回滚文件写入
+        try {
+          fs.unlinkSync(snapshotFile);
+        } catch {
+          // 回滚失败也记录日志
+          logger.error('快照.原子操作.回滚失败', { snapshotFile }, LogCategory.RECOVERY);
+        }
+        throw metaError;
+      }
+
+      // 步骤 3: 更新缓存
+      this.addToCache(this.snapshotContentCache, snapshotFile, content);
+
+      return { success: true, snapshotId };
+    } catch (error) {
+      logger.error('快照.原子操作.失败', { snapshotId, error }, LogCategory.RECOVERY);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    } finally {
+      this.releaseLock(lockKey);
+    }
+  }
+
+  /**
+   * 原子性删除快照（删除文件 + 更新元数据）
+   */
+  private atomicDeleteSnapshot(
+    sessionId: string,
+    snapshotId: string,
+    snapshotFile: string,
+    filePath: string
+  ): SnapshotOperationResult {
+    const lockKey = `snapshot:${sessionId}:${filePath}`;
+
+    if (!this.acquireLock(lockKey)) {
+      return {
+        success: false,
+        error: `Operation in progress for file: ${filePath}`,
+      };
+    }
+
+    // 备份内容以便回滚
+    let backupContent: string | null = null;
+    if (fs.existsSync(snapshotFile)) {
+      try {
+        backupContent = fs.readFileSync(snapshotFile, 'utf-8');
+      } catch {
+        // 读取失败继续，不阻塞删除
+      }
+    }
+
+    try {
+      // 步骤 1: 删除快照文件
+      if (fs.existsSync(snapshotFile)) {
+        fs.unlinkSync(snapshotFile);
+      }
+
+      // 步骤 2: 移除元数据
+      try {
+        this.sessionManager.removeSnapshot(sessionId, filePath);
+      } catch (metaError) {
+        // 元数据删除失败，尝试恢复文件
+        if (backupContent !== null) {
+          try {
+            fs.writeFileSync(snapshotFile, backupContent, 'utf-8');
+          } catch {
+            logger.error('快照.原子删除.回滚失败', { snapshotFile }, LogCategory.RECOVERY);
+          }
+        }
+        throw metaError;
+      }
+
+      // 步骤 3: 清除缓存
+      this.invalidateSnapshotCache(snapshotFile);
+
+      return { success: true, snapshotId };
+    } catch (error) {
+      logger.error('快照.原子删除.失败', { snapshotId, error }, LogCategory.RECOVERY);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    } finally {
+      this.releaseLock(lockKey);
+    }
   }
 
   /** 获取快照目录（基于会话） */
@@ -101,6 +252,44 @@ export class SnapshotManager {
   clearCache(): void {
     this.fileContentCache.clear();
     this.snapshotContentCache.clear();
+  }
+
+  /** 清理指定文件的历史快照（避免旧任务阻塞新任务） */
+  clearSnapshotsForFiles(filePaths: string[], keepSubTaskId?: string): number {
+    const session = this.sessionManager.getCurrentSession();
+    if (!session || filePaths.length === 0) return 0;
+
+    const normalizedRoot = path.normalize(this.workspaceRoot);
+    const targets = new Set<string>();
+    for (const filePath of filePaths) {
+      const absolutePath = path.resolve(this.workspaceRoot, filePath);
+      if (!absolutePath.startsWith(normalizedRoot)) continue;
+      targets.add(path.relative(this.workspaceRoot, absolutePath));
+    }
+    if (targets.size === 0) return 0;
+
+    let removed = 0;
+    for (const snapshot of [...session.snapshots]) {
+      if (!targets.has(snapshot.filePath)) continue;
+      if (keepSubTaskId && snapshot.subTaskId === keepSubTaskId) continue;
+
+      const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);
+      if (fs.existsSync(snapshotFile)) {
+        try {
+          fs.unlinkSync(snapshotFile);
+          this.invalidateSnapshotCache(snapshotFile);
+        } catch (error) {
+          logger.error('快照.清理.文件.失败', { filePath: snapshot.filePath, error }, LogCategory.RECOVERY);
+        }
+      }
+      this.sessionManager.removeSnapshot(session.id, snapshot.filePath);
+      removed++;
+    }
+
+    if (removed > 0) {
+      logger.info('快照.清理.目标文件', { count: removed }, LogCategory.RECOVERY);
+    }
+    return removed;
   }
 
   /** 验证快照完整性（检查元数据与文件是否一致） */
@@ -224,7 +413,7 @@ export class SnapshotManager {
   /** 创建文件快照 */
   createSnapshot(
     filePath: string,
-    modifiedBy: CLIType,
+    modifiedBy: AgentType,  // ✅ 使用 AgentType
     subTaskId: string,
     priority: number = 5  // SubTask 优先级 (1-10, 1 最高)，默认 5
   ): FileSnapshot | null {
@@ -339,20 +528,20 @@ export class SnapshotManager {
       priority,  // 添加优先级字段
     };
 
-    // 保存快照内容到文件
-    this.ensureSnapshotDir(session.id);
+    // 使用原子操作保存快照
     const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshotId}.snapshot`);
-    try {
-      fs.writeFileSync(snapshotFile, originalContent, 'utf-8');
-      // 写入成功后，将内容添加到缓存
-      this.addToCache(this.snapshotContentCache, snapshotFile, originalContent);
-    } catch (error) {
-      logger.error('快照.写入.失败', { path: snapshotFile, error }, LogCategory.RECOVERY);
-      throw new Error(`Failed to write snapshot: ${error}`);
-    }
+    const result = this.atomicWriteSnapshot(
+      session.id,
+      snapshotId,
+      snapshotFile,
+      originalContent,
+      snapshotMeta
+    );
 
-    // 添加元数据到 Session
-    this.sessionManager.addSnapshot(session.id, snapshotMeta);
+    if (!result.success) {
+      logger.error('快照.创建.失败', { path: snapshotFile, error: result.error }, LogCategory.RECOVERY);
+      throw new Error(`Failed to create snapshot: ${result.error}`);
+    }
 
     globalEventBus.emitEvent('snapshot:created', {
       sessionId: session.id,
@@ -371,7 +560,7 @@ export class SnapshotManager {
    */
   createSnapshotFromBaseline(
     filePath: string,
-    modifiedBy: CLIType,
+    modifiedBy: AgentType,  // ✅ 使用 AgentType
     subTaskId: string,
     priority: number = 5,
     baselineContent: string = ''
@@ -474,17 +663,20 @@ export class SnapshotManager {
       priority,
     };
 
-    this.ensureSnapshotDir(session.id);
+    // 使用原子操作保存快照
     const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshotId}.snapshot`);
-    try {
-      fs.writeFileSync(snapshotFile, originalContent, 'utf-8');
-      this.addToCache(this.snapshotContentCache, snapshotFile, originalContent);
-    } catch (error) {
-      logger.error('快照.写入.失败', { path: snapshotFile, error }, LogCategory.RECOVERY);
-      throw new Error(`Failed to write snapshot: ${error}`);
-    }
+    const result = this.atomicWriteSnapshot(
+      session.id,
+      snapshotId,
+      snapshotFile,
+      originalContent,
+      snapshotMeta
+    );
 
-    this.sessionManager.addSnapshot(session.id, snapshotMeta);
+    if (!result.success) {
+      logger.error('快照.创建.失败', { path: snapshotFile, error: result.error }, LogCategory.RECOVERY);
+      throw new Error(`Failed to create snapshot: ${result.error}`);
+    }
 
     globalEventBus.emitEvent('snapshot:created', {
       sessionId: session.id,
@@ -757,8 +949,14 @@ export class SnapshotManager {
     return count;
   }
 
+  /** 检查当前会话是否有快照 */
+  hasSnapshots(): boolean {
+    const session = this.sessionManager.getCurrentSession();
+    return session ? session.snapshots.length > 0 : false;
+  }
+
   /** 为多个文件创建快照 */
-  createSnapshots(filePaths: string[], modifiedBy: CLIType, subTaskId: string, priority: number = 5): FileSnapshot[] {
+  createSnapshots(filePaths: string[], modifiedBy: AgentType, subTaskId: string, priority: number = 5): FileSnapshot[] {  // ✅ 使用 AgentType
     const snapshots: FileSnapshot[] = [];
     for (const filePath of filePaths) {
       const snapshot = this.createSnapshot(filePath, modifiedBy, subTaskId, priority);

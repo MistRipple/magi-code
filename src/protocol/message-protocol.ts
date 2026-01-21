@@ -8,7 +8,7 @@
  * 4. 可扩展的内容结构，支持各种富文本元素
  */
 
-import type { CLIType } from '../cli/types';
+import type { AgentType } from '../types/agent-types';
 
 // ============================================================================
 // 消息类型枚举
@@ -97,6 +97,8 @@ export interface ThinkingBlock {
   content: string;
   /** 思考摘要（用于折叠显示） */
   summary?: string;
+  /** 用于增量更新的块 ID */
+  blockId?: string;
 }
 
 /**
@@ -108,8 +110,8 @@ export interface ToolCallBlock {
   toolId: string;
   /** 工具调用状态 */
   status: 'pending' | 'running' | 'completed' | 'failed';
-  /** 输入参数 */
-  input?: Record<string, unknown>;
+  /** 输入参数（JSON 字符串格式，后端统一序列化） */
+  input?: string;
   /** 输出结果 */
   output?: string;
   /** 错误信息 */
@@ -132,6 +134,28 @@ export interface FileChangeBlock {
 }
 
 /**
+ * 规划块 - 结构化的任务规划数据
+ * 用于展示 AI 生成的任务分析和执行计划
+ */
+export interface PlanBlock {
+  type: 'plan';
+  /** 目标描述 */
+  goal: string;
+  /** 任务分析 */
+  analysis?: string;
+  /** 约束条件 */
+  constraints?: string[];
+  /** 验收标准 */
+  acceptanceCriteria?: string[];
+  /** 风险等级 */
+  riskLevel?: 'low' | 'medium' | 'high';
+  /** 风险因素 */
+  riskFactors?: string[];
+  /** 原始 JSON 内容（用于调试或详细查看） */
+  rawJson?: string;
+}
+
+/**
  * 内容块联合类型
  */
 export type ContentBlock =
@@ -139,7 +163,8 @@ export type ContentBlock =
   | CodeBlock
   | ThinkingBlock
   | ToolCallBlock
-  | FileChangeBlock;
+  | FileChangeBlock
+  | PlanBlock;
 
 // ============================================================================
 // 交互请求类型
@@ -203,8 +228,8 @@ export interface StandardMessage {
   /** 消息来源 */
   source: MessageSource;
 
-  /** CLI 类型 */
-  cli: CLIType;
+  /** Agent 类型 */
+  agent: AgentType;
 
   /** 生命周期状态 */
   lifecycle: MessageLifecycle;
@@ -313,14 +338,14 @@ export function createStandardMessage(
 export function createTextMessage(
   text: string,
   source: MessageSource,
-  cli: CLIType,
+  agent: AgentType,
   traceId: string,
   options?: Partial<StandardMessage>
 ): StandardMessage {
   return createStandardMessage({
     type: MessageType.TEXT,
     source,
-    cli,
+    agent,
     traceId,
     lifecycle: MessageLifecycle.COMPLETED,
     blocks: [{ type: 'text', content: text, isMarkdown: true }],
@@ -334,14 +359,14 @@ export function createTextMessage(
  */
 export function createStreamingMessage(
   source: MessageSource,
-  cli: CLIType,
+  agent: AgentType,
   traceId: string,
   options?: Partial<StandardMessage>
 ): StandardMessage {
   return createStandardMessage({
     type: MessageType.TEXT,
     source,
-    cli,
+    agent,
     traceId,
     lifecycle: MessageLifecycle.STARTED,
     blocks: [],
@@ -356,14 +381,14 @@ export function createStreamingMessage(
 export function createErrorMessage(
   error: string,
   source: MessageSource,
-  cli: CLIType,
+  agent: AgentType,
   traceId: string,
   options?: Partial<StandardMessage>
 ): StandardMessage {
   return createStandardMessage({
     type: MessageType.ERROR,
     source,
-    cli,
+    agent,
     traceId,
     lifecycle: MessageLifecycle.FAILED,
     blocks: [{ type: 'text', content: error }],
@@ -378,14 +403,14 @@ export function createErrorMessage(
 export function createInteractionMessage(
   interaction: InteractionRequest,
   source: MessageSource,
-  cli: CLIType,
+  agent: AgentType,
   traceId: string,
   options?: Partial<StandardMessage>
 ): StandardMessage {
   return createStandardMessage({
     type: MessageType.INTERACTION,
     source,
-    cli,
+    agent,
     traceId,
     lifecycle: MessageLifecycle.STREAMING, // 等待用户响应
     blocks: [{ type: 'text', content: interaction.prompt }],

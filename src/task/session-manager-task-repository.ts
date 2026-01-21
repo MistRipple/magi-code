@@ -270,6 +270,7 @@ export class SessionManagerTaskRepository implements TaskRepository {
       completed: 0,
       failed: 0,
       skipped: 0,
+      cancelled: 0,
     };
 
     let totalSubTasks = 0;

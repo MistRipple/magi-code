@@ -14,7 +14,8 @@
 import { logger, LogCategory } from '../logging';
 import * as fs from 'fs';
 import * as path from 'path';
-import { CLIType, Task, FileSnapshot } from '../types';
+import { Task, FileSnapshot } from '../types';
+import { AgentType } from '../types/agent-types';
 import { globalEventBus } from '../events';
 
 /** 会话消息 */
@@ -22,7 +23,7 @@ export interface SessionMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
-  cli?: CLIType;
+  agent?: AgentType;
   source?: 'orchestrator' | 'worker' | 'system';
   timestamp: number;
   attachments?: { name: string; path: string; mimeType?: string }[];
@@ -32,7 +33,7 @@ export interface SessionMessage {
 export interface FileSnapshotMeta {
   id: string;
   filePath: string;
-  lastModifiedBy: CLIType;
+  lastModifiedBy: AgentType;
   lastModifiedAt: number;
   subTaskId: string;
   priority: number;  // SubTask 优先级 (1-10, 1 最高)
@@ -54,10 +55,6 @@ export interface UnifiedSession {
   tasks: Task[];
   /** 快照元数据 */
   snapshots: FileSnapshotMeta[];
-  /** CLI 会话 ID 映射 */
-  cliSessionIds?: Record<string, string>;
-  /** CLI 输出缓存 */
-  cliOutputs?: Record<string, any[]>;
 }
 
 /** 会话元数据（用于列表显示） */
@@ -234,7 +231,7 @@ export class UnifiedSessionManager {
   addMessage(
     role: 'user' | 'assistant',
     content: string,
-    cli?: CLIType,
+    agent?: AgentType,  // ✅ 使用 AgentType
     source?: 'orchestrator' | 'worker' | 'system'
   ): SessionMessage {
     const session = this.getOrCreateCurrentSession();
@@ -242,7 +239,7 @@ export class UnifiedSessionManager {
       id: generateMessageId(),
       role,
       content,
-      cli,
+      agent,  // ✅ 使用 agent
       source,
       timestamp: Date.now(),
     };
@@ -278,11 +275,11 @@ export class UnifiedSessionManager {
   }
 
   /** 更新会话数据 */
-  updateSessionData(sessionId: string, messages: SessionMessage[], cliOutputs?: Record<string, any[]>): boolean {
+  updateSessionData(sessionId: string, messages: SessionMessage[]): boolean {  // ✅ 移除 cliOutputs 参数
     const session = this.sessions.get(sessionId);
     if (session) {
       session.messages = messages;
-      if (cliOutputs) session.cliOutputs = cliOutputs;
+      // ✅ 移除 cliOutputs 更新逻辑
       session.updatedAt = Date.now();
       this.saveSession(session);
       return true;

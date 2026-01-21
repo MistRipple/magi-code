@@ -7,7 +7,7 @@
  * - 执行统计驱动：基于历史数据动态调整 Worker 选择
  */
 
-import { CLIType } from '../../types';
+import { WorkerSlot } from '../../types/agent-types';
 
 // ============================================================================
 // Worker 画像类型
@@ -94,7 +94,7 @@ export interface CategoryReviewPolicy {
   /** 是否需要互检评审 */
   requirePeerReview: boolean;
   /** 偏好的评审者 */
-  preferredReviewer?: CLIType;
+  preferredReviewer?: WorkerSlot;
   /** 评审重点 */
   reviewFocus: string[];
 }
@@ -108,7 +108,7 @@ export interface CategoryConfig {
   /** 匹配关键词（正则模式） */
   keywords: string[];
   /** 默认 Worker */
-  defaultWorker: CLIType;
+  defaultWorker: WorkerSlot;
   /** 优先级 */
   priority: TaskPriority;
   /** 风险等级 */
@@ -152,7 +152,7 @@ export interface InjectionContext {
   /** 功能契约 */
   featureContract?: string;
   /** 协作者列表 */
-  collaborators?: CLIType[];
+  collaborators?: WorkerSlot[];
   /** 任务分类 */
   category?: string;
 }
@@ -164,15 +164,15 @@ export interface InjectionContext {
 /** Worker 选择选项 */
 export interface WorkerSelectionOptions {
   /** 排除的 Worker */
-  excludeWorkers?: CLIType[];
+  excludeWorkers?: WorkerSlot[];
   /** 偏好的 Worker */
-  preferredWorker?: CLIType;
+  preferredWorker?: WorkerSlot;
 }
 
 /** Worker 选择结果 */
 export interface WorkerSelectionResult {
   /** 选中的 Worker */
-  worker: CLIType;
+  worker: WorkerSlot;
   /** 任务分类 */
   category: string;
   /** 匹配分数 */

@@ -16,7 +16,7 @@ import {
   TaskStatus,
 } from '../types';
 import { logger, LogCategory } from '../logging';
-import { CLIAdapterFactory } from '../cli/adapter-factory';
+import { IAdapterFactory } from '../adapters/adapter-factory-interface';
 import { UnifiedTaskManager } from '../task/unified-task-manager';
 import { SessionManagerTaskRepository } from '../task/session-manager-task-repository';
 import { UnifiedSessionManager } from '../session';
@@ -121,7 +121,7 @@ const DEFAULT_CONFIG: OrchestratorConfig = {
  * 智能编排器 - 基于独立编排者架构
  */
 export class IntelligentOrchestrator {
-  private cliFactory: CLIAdapterFactory;
+  private adapterFactory: IAdapterFactory;
   private taskManager: UnifiedTaskManager | null = null;
   private taskManagerSessionId: string | null = null;
   private sessionManager: UnifiedSessionManager;
@@ -158,13 +158,13 @@ export class IntelligentOrchestrator {
   private statusUpdateInterval: NodeJS.Timeout | null = null;
 
   constructor(
-    cliFactory: CLIAdapterFactory,
+    adapterFactory: IAdapterFactory,
     sessionManager: UnifiedSessionManager,
     snapshotManager: SnapshotManager,
     workspaceRoot: string,
     config?: Partial<OrchestratorConfig>
   ) {
-    this.cliFactory = cliFactory;
+    this.adapterFactory = adapterFactory;
     this.sessionManager = sessionManager;
     this.snapshotManager = snapshotManager;
     this.workspaceRoot = workspaceRoot;
@@ -174,7 +174,7 @@ export class IntelligentOrchestrator {
 
     // 创建 MissionDrivenEngine
     this.missionDrivenEngine = new MissionDrivenEngine(
-      cliFactory,
+      adapterFactory,
       {
         timeout: this.config.timeout,
         maxRetries: this.config.maxRetries,
@@ -285,6 +285,15 @@ export class IntelligentOrchestrator {
     return manager;
   }
 
+  private async ensureTaskExists(taskId: string, prompt: string, sessionId?: string): Promise<void> {
+    const taskManager = await this.getTaskManager(sessionId);
+    const existing = await taskManager.getTask(taskId);
+    if (existing) {
+      return;
+    }
+    await taskManager.createTask({ id: taskId, prompt });
+  }
+
   private async updateTaskStatus(
     taskId: string,
     status: TaskStatus,
@@ -329,6 +338,19 @@ export class IntelligentOrchestrator {
     await taskManager.updateTask(taskId, { status });
   }
 
+  async executeWithTaskContext(userPrompt: string, sessionId?: string): Promise<{ taskId: string; result: string }> {
+    const shouldAsk = this.shouldUseAskMode(userPrompt) || this.interactionMode === 'ask';
+    if (shouldAsk) {
+      const result = await this.execute(userPrompt, undefined, sessionId);
+      return { taskId: '', result };
+    }
+    const taskManager = await this.getTaskManager(sessionId);
+    const task = await taskManager.createTask({ prompt: userPrompt });
+    const taskId = task.id;
+    const result = await this.execute(userPrompt, taskId, sessionId);
+    return { taskId, result };
+  }
+
   /** 是否正在运行 */
   get running(): boolean {
     return this.isRunning;
@@ -362,16 +384,29 @@ export class IntelligentOrchestrator {
   /**
    * 执行任务 - 主入口
    */
-  async execute(userPrompt: string, taskId: string, sessionId?: string): Promise<string> {
+  async execute(userPrompt: string, taskId?: string, sessionId?: string): Promise<string> {
     if (this.isRunning) {
       throw new Error('编排器正在运行中');
     }
 
     this.isRunning = true;
+    const shouldAsk = this.shouldUseAskMode(userPrompt) || this.interactionMode === 'ask';
+    if (shouldAsk) {
+      try {
+        return await this.executeAskMode(userPrompt, taskId, sessionId);
+      } finally {
+        this.isRunning = false;
+        this.stopStatusUpdates();
+        this.abortController = null;
+        this.currentTaskId = null;
+      }
+    }
     if (!taskId) {
       const taskManager = await this.getTaskManager(sessionId);
       const task = await taskManager.createTask({ prompt: userPrompt });
       taskId = task.id;
+    } else {
+      await this.ensureTaskExists(taskId, userPrompt, sessionId);
     }
     this.currentTaskId = taskId;
     this.abortController = new AbortController();
@@ -381,17 +416,9 @@ export class IntelligentOrchestrator {
     this.startStatusUpdates(taskId);
 
     try {
-      if (this.shouldUseAskMode(userPrompt)) {
-        return await this.executeAskMode(userPrompt, taskId, sessionId);
-      }
-
-      // ask 模式：仅对话
-      if (this.interactionMode === 'ask') {
-        return await this.executeAskMode(userPrompt, taskId, sessionId);
-      }
-
       // agent/auto 模式：使用 MissionDrivenEngine 执行
       const result = await this.missionDrivenEngine.execute(userPrompt, taskId, sessionId);
+      const execStatus = this.missionDrivenEngine.getLastExecutionStatus();
 
       if (this.abortController?.signal.aborted) {
         await this.updateTaskStatus(taskId, 'cancelled', sessionId);
@@ -399,8 +426,14 @@ export class IntelligentOrchestrator {
         return '任务已被取消。';
       }
 
-      await this.updateTaskStatus(taskId, 'completed', sessionId);
-      globalEventBus.emitEvent('task:completed', { taskId, data: { isRunning: false } });
+      if (execStatus.success) {
+        await this.updateTaskStatus(taskId, 'completed', sessionId);
+        globalEventBus.emitEvent('task:completed', { taskId, data: { isRunning: false } });
+      } else {
+        const errorMsg = execStatus.errors.join('; ') || '任务执行失败';
+        await this.updateTaskStatus(taskId, 'failed', sessionId, errorMsg);
+        globalEventBus.emitEvent('task:failed', { taskId, data: { error: errorMsg, isRunning: false } });
+      }
 
       return result;
 
@@ -441,6 +474,8 @@ export class IntelligentOrchestrator {
       const taskManager = await this.getTaskManager(sessionId);
       const task = await taskManager.createTask({ prompt: userPrompt });
       taskId = task.id;
+    } else {
+      await this.ensureTaskExists(taskId, userPrompt, sessionId);
     }
     this.currentTaskId = taskId;
     this.abortController = new AbortController();
@@ -451,6 +486,12 @@ export class IntelligentOrchestrator {
 
     try {
       const record = await this.missionDrivenEngine.createPlan(userPrompt, taskId, sessionId);
+      const taskManager = await this.getTaskManager(sessionId);
+      await taskManager.updateTaskPlan(taskId, {
+        planId: record.id,
+        planSummary: record.plan.summary || record.plan.analysis || '执行计划',
+        status: 'ready',
+      });
       await this.updateTaskStatus(taskId, 'pending', sessionId);
       return record;
     } catch (error) {
@@ -474,6 +515,7 @@ export class IntelligentOrchestrator {
 
     this.isRunning = true;
     const finalTaskId = taskId || record.taskId;
+    await this.ensureTaskExists(finalTaskId, record.prompt || '', sessionId || record.sessionId);
     this.currentTaskId = finalTaskId;
     this.abortController = new AbortController();
 
@@ -482,23 +524,41 @@ export class IntelligentOrchestrator {
     this.startStatusUpdates(finalTaskId);
 
     try {
+      const taskManager = await this.getTaskManager(sessionId || record.sessionId);
+      await taskManager.updateTaskPlan(finalTaskId, {
+        planId: record.id,
+        planSummary: record.plan.summary || record.plan.analysis || '执行计划',
+        status: 'executing',
+      });
+
       const result = await this.missionDrivenEngine.executePlan(
         record.plan,
         finalTaskId,
         sessionId || record.sessionId,
         record.prompt
       );
+      const execStatus = this.missionDrivenEngine.getLastExecutionStatus();
       if (this.abortController?.signal.aborted) {
         await this.updateTaskStatus(finalTaskId, 'cancelled', sessionId || record.sessionId);
         globalEventBus.emitEvent('task:cancelled', { taskId: finalTaskId, data: { isRunning: false } });
         return '任务已被取消。';
       }
 
-      await this.updateTaskStatus(finalTaskId, 'completed', sessionId || record.sessionId);
-      globalEventBus.emitEvent('task:completed', { taskId: finalTaskId, data: { isRunning: false } });
+      if (execStatus.success) {
+        await taskManager.updateTaskPlanStatus(finalTaskId, 'completed');
+        await this.updateTaskStatus(finalTaskId, 'completed', sessionId || record.sessionId);
+        globalEventBus.emitEvent('task:completed', { taskId: finalTaskId, data: { isRunning: false } });
+      } else {
+        const errorMsg = execStatus.errors.join('; ') || '任务执行失败';
+        await taskManager.updateTaskPlanStatus(finalTaskId, 'failed');
+        await this.updateTaskStatus(finalTaskId, 'failed', sessionId || record.sessionId, errorMsg);
+        globalEventBus.emitEvent('task:failed', { taskId: finalTaskId, data: { error: errorMsg, isRunning: false } });
+      }
       return result;
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
+      const taskManager = await this.getTaskManager(sessionId || record.sessionId);
+      await taskManager.updateTaskPlanStatus(finalTaskId, 'failed');
       await this.updateTaskStatus(finalTaskId, 'failed', sessionId || record.sessionId, errorMsg);
       globalEventBus.emitEvent('task:failed', { taskId: finalTaskId, data: { error: errorMsg, isRunning: false } });
       throw error;
@@ -523,17 +583,26 @@ export class IntelligentOrchestrator {
   }
 
   /** ask 模式：仅对话 */
-  private async executeAskMode(userPrompt: string, taskId: string, sessionId?: string): Promise<string> {
+  private async executeAskMode(userPrompt: string, taskId?: string, sessionId?: string): Promise<string> {
     logger.info('编排器.执行.对话_模式', undefined, LogCategory.ORCHESTRATOR);
 
-    const contextSessionId = sessionId || taskId;
+    const contextSessionId = sessionId || taskId || this.sessionManager.getCurrentSession()?.id || '';
+    const taskManager = contextSessionId ? await this.getTaskManager(contextSessionId) : null;
+    const task = taskManager && taskId ? await taskManager.getTask(taskId) : null;
+    if (taskId) {
+      if (task) {
+        await this.updateTaskStatus(taskId, 'running', sessionId);
+      }
+      globalEventBus.emitEvent('task:started', { taskId, data: { isRunning: true } });
+      this.startStatusUpdates(taskId);
+    }
     const context = await this.missionDrivenEngine.prepareContext(contextSessionId, userPrompt);
     const prompt = context
       ? `请结合以下会话上下文回答用户问题。\n\n${context}\n\n## 用户问题\n${userPrompt}`
       : userPrompt;
     const snapshot = context ? this.truncateSnapshot(context) : undefined;
 
-    const response = await this.cliFactory.sendMessage(
+    const response = await this.adapterFactory.sendMessage(
       'claude',
       prompt,
       undefined,
@@ -542,7 +611,7 @@ export class IntelligentOrchestrator {
         streamToUI: true,
         adapterRole: 'orchestrator',
         messageMeta: {
-          taskId,
+          taskId: taskId || '',
           intent: 'ask',
           contextSnapshot: snapshot,
         },
@@ -552,11 +621,21 @@ export class IntelligentOrchestrator {
     this.missionDrivenEngine.recordOrchestratorTokens(response.tokenUsage);
 
     if (response.error) {
+      if (taskId) {
+        if (task) {
+          await this.updateTaskStatus(taskId, 'failed', sessionId, response.error);
+        }
+        globalEventBus.emitEvent('task:failed', { taskId, data: { error: response.error, isRunning: false } });
+      }
       throw new Error(response.error);
     }
 
-    await this.updateTaskStatus(taskId, 'completed', sessionId);
-    globalEventBus.emitEvent('task:completed', { taskId, data: { isRunning: false } });
+    if (taskId) {
+      if (task) {
+        await this.updateTaskStatus(taskId, 'completed', sessionId);
+      }
+      globalEventBus.emitEvent('task:completed', { taskId, data: { isRunning: false } });
+    }
 
     const content = response.content || '';
     await this.missionDrivenEngine.recordAssistantMessage(content);

@@ -7,8 +7,13 @@
 // CLI 类型与角色系统
 // ============================================
 
-// CLI 类型枚举
-export type CLIType = 'claude' | 'codex' | 'gemini';
+// ✅ 导入并重新导出新的 AgentType 系统
+import type { AgentType, WorkerSlot, AgentRole } from './types/agent-types';
+export type { AgentType, WorkerSlot, AgentRole };
+
+// ❌ 已废弃：使用 AgentType 替代
+// export type CLIType = 'claude' | 'codex' | 'gemini';
+export type CLIType = WorkerSlot;  // 向后兼容别名
 
 // 任务类型（用于任务分类和 CLI 分配）
 export type TaskCategory =
@@ -75,7 +80,7 @@ export interface Session {
 export interface SessionMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
-  cli?: CLIType;
+  agent?: AgentType;  // ✅ 使用 AgentType
   source?: MessageSource;
   timestamp: number;
 }
@@ -91,7 +96,7 @@ export interface FileSnapshot {
   sessionId: string;
   filePath: string;
   originalContent: string;
-  lastModifiedBy: CLIType;
+  lastModifiedBy: AgentType;  // ✅ 使用 AgentType
   lastModifiedAt: number;
   subTaskId: string;
 }
@@ -103,7 +108,7 @@ export interface FileSnapshot {
 export interface PendingChange {
   filePath: string;
   snapshotId: string;
-  lastModifiedBy: CLIType;
+  lastModifiedBy: AgentType;  // ✅ 使用 AgentType
   additions: number;
   deletions: number;
   status: 'pending' | 'approved' | 'reverted';
@@ -206,14 +211,14 @@ export interface DiffHunk {
   newStart: number;
   newLines: number;
   content: string;
-  source: CLIType;
+  source: AgentType;  // ✅ 使用 AgentType
 }
 
 // 冲突信息
 export interface ConflictInfo {
   filePath: string;
   hunks: DiffHunk[];
-  sources: CLIType[];
+  sources: AgentType[];  // ✅ 使用 AgentType
   description: string;
 }
 
@@ -385,8 +390,7 @@ export interface UIState {
   currentTask?: Task;
   tasks?: Task[];
   activePlan?: { planId: string; formattedPlan: string; updatedAt: number; review?: { status: 'approved' | 'rejected' | 'skipped'; summary: string } };
-  cliStatuses: CLIStatus[];
-  degradationStrategy: DegradationStrategy;
+  workerStatuses: WorkerStatus[];  // ✅ 使用 WorkerStatus 替代 cliStatuses
   pendingChanges: PendingChange[];
   isRunning: boolean;
   logs: LogEntry[];
@@ -396,11 +400,20 @@ export interface UIState {
   orchestratorPhase?: string;
 }
 
+/** Worker 状态（基于 LLM 适配器） */
+export interface WorkerStatus {
+  worker: WorkerSlot;
+  available: boolean;
+  enabled: boolean;
+  model?: string;      // 配置的模型名称
+  provider?: string;   // openai 或 anthropic
+}
+
 // 日志条目
 export interface LogEntry {
   level: 'info' | 'warn' | 'error' | 'debug';
   message: string;
-  source?: CLIType | 'orchestrator' | 'system';
+  source?: AgentType | 'orchestrator' | 'system';  // ✅ 使用 AgentType
   timestamp: number;
 }
 
@@ -424,7 +437,7 @@ export type WebviewToExtensionMessage =
   | { type: 'approveAllChanges' }
   | { type: 'revertAllChanges' }
   | { type: 'newSession' }
-  | { type: 'saveCurrentSession'; messages: any[]; cliOutputs: Record<string, any[]> }
+  | { type: 'saveCurrentSession'; messages: any[] }  // ✅ 移除 cliOutputs 参数
   | { type: 'switchSession'; sessionId: string }
   | { type: 'renameSession'; sessionId: string; name: string }
   | { type: 'closeSession'; sessionId: string }
@@ -459,7 +472,40 @@ export type WebviewToExtensionMessage =
   // 新增：画像配置
   | { type: 'getProfileConfig' }
   | { type: 'saveProfileConfig'; data: { workers: Record<string, any>; categories: Record<string, string> } }
-  | { type: 'resetProfileConfig' };
+  | { type: 'resetProfileConfig' }
+  // 新增：LLM 配置相关
+  | { type: 'loadAllWorkerConfigs' }
+  | { type: 'saveWorkerConfig'; worker: WorkerSlot; config: any }
+  | { type: 'testWorkerConnection'; worker: WorkerSlot; config: any }
+  | { type: 'loadOrchestratorConfig' }
+  | { type: 'saveOrchestratorConfig'; config: any }
+  | { type: 'testOrchestratorConnection'; config: any }
+  | { type: 'loadCompressorConfig' }
+  | { type: 'saveCompressorConfig'; config: any }
+  | { type: 'testCompressorConnection'; config: any }
+  // 新增：MCP 配置相关
+  | { type: 'loadMCPServers' }
+  | { type: 'addMCPServer'; server: any }
+  | { type: 'updateMCPServer'; serverId: string; updates: any }
+  | { type: 'deleteMCPServer'; serverId: string }
+  | { type: 'connectMCPServer'; serverId: string }
+  | { type: 'disconnectMCPServer'; serverId: string }
+  | { type: 'refreshMCPTools'; serverId: string }
+  | { type: 'getMCPServerTools'; serverId: string }
+  // 新增：Skills 配置相关
+  | { type: 'loadSkillsConfig' }
+  | { type: 'saveSkillsConfig'; config: any }
+  | { type: 'toggleBuiltInTool'; tool: string; enabled: boolean }
+  | { type: 'addCustomTool'; tool: any }
+  | { type: 'removeCustomTool'; toolName: string }
+  | { type: 'installSkill'; skillId: string }
+  // 新增：Skills 仓库相关
+  | { type: 'loadRepositories' }
+  | { type: 'addRepository'; url: string }
+  | { type: 'updateRepository'; repositoryId: string; updates: any }
+  | { type: 'deleteRepository'; repositoryId: string }
+  | { type: 'refreshRepository'; repositoryId: string }
+  | { type: 'loadSkillLibrary' };
 
 // Extension 发送到 Webview 的消息
 // source 字段用于区分消息来源：'orchestrator' = 编排者, 'worker' = 执行代理
@@ -469,7 +515,7 @@ export type ExtensionToWebviewMessage =
   | { type: 'stateUpdate'; state: UIState }
   | { type: 'taskUpdate'; task: Task }
   | { type: 'cliStatusUpdate'; statuses: Record<string, { status: string; version?: string }> }
-  | { type: 'cliStatusChanged'; cli: string; available: boolean; version?: string }
+  | { type: 'workerStatusChanged'; worker: WorkerSlot; available: boolean; version?: string }  // ✅ 改为 workerStatusChanged
   | { type: 'cliError'; cli: string; error: string; source?: MessageSource }
   | { type: 'streamEvent'; phase: 'chunk' | 'complete'; content?: string; error?: string; sessionId?: string | null; source?: MessageSource; cli?: CLIType; append?: boolean; sentAt?: number; target?: 'thread' | 'cli' }
   | { type: 'loginSuccess' }
@@ -501,8 +547,42 @@ export type ExtensionToWebviewMessage =
   | { type: 'cliTaskCard'; cli: CLIType; taskId: string; subTaskId: string; description: string; targetFiles?: string[]; reason?: string; status: string; dispatchId?: string; sessionId?: string | null }
  
   | { type: 'promptEnhanceResult'; success: boolean; message: string }
- 
-  | { type: 'promptEnhanced'; enhancedPrompt: string; error: string };
+
+  | { type: 'promptEnhanced'; enhancedPrompt: string; error: string }
+  // 新增：LLM 配置响应
+  | { type: 'allWorkerConfigsLoaded'; configs: any }
+  | { type: 'workerConfigSaved'; worker: WorkerSlot }
+  | { type: 'workerConnectionTestResult'; worker: WorkerSlot; success: boolean; error?: string }
+  | { type: 'orchestratorConfigLoaded'; config: any }
+  | { type: 'orchestratorConfigSaved' }
+  | { type: 'orchestratorConnectionTestResult'; success: boolean; error?: string }
+  | { type: 'compressorConfigLoaded'; config: any }
+  | { type: 'compressorConfigSaved' }
+  | { type: 'compressorConnectionTestResult'; success: boolean; error?: string }
+  // 新增：MCP 配置响应
+  | { type: 'mcpServersLoaded'; servers: any[] }
+  | { type: 'mcpServerAdded'; server: any }
+  | { type: 'mcpServerUpdated'; serverId: string }
+  | { type: 'mcpServerDeleted'; serverId: string }
+  | { type: 'mcpServerConnected'; serverId: string; toolCount: number }
+  | { type: 'mcpServerDisconnected'; serverId: string }
+  | { type: 'mcpServerConnectionFailed'; serverId: string; error: string }
+  | { type: 'mcpToolsRefreshed'; serverId: string; tools: any[] }
+  | { type: 'mcpServerTools'; serverId: string; tools: any[] }
+  // 新增：Skills 配置响应
+  | { type: 'skillsConfigLoaded'; config: any }
+  | { type: 'skillsConfigSaved' }
+  | { type: 'builtInToolToggled'; tool: string; enabled: boolean }
+  | { type: 'customToolAdded'; tool: any }
+  | { type: 'customToolRemoved'; toolName: string }
+  | { type: 'skillInstalled'; skillId: string; skill: any }
+  // 新增：Skills 仓库响应
+  | { type: 'repositoriesLoaded'; repositories: any[] }
+  | { type: 'repositoryAdded'; repository: any }
+  | { type: 'repositoryUpdated'; repositoryId: string }
+  | { type: 'repositoryDeleted'; repositoryId: string }
+  | { type: 'repositoryRefreshed'; repositoryId: string }
+  | { type: 'skillLibraryLoaded'; skills: any[] };
 
 /** CLI 执行统计数据（用于 UI 显示） */
 export interface CLIExecutionStats {

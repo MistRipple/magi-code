@@ -6,6 +6,33 @@
  *   node scripts/test-real-orchestrator-scenarios.js
  */
 
+// Mock vscode module for non-VSCode runtime
+const Module = require('module');
+const originalModuleLoad = Module._load;
+Module._load = function load(request, parent, isMain) {
+  if (request === 'vscode') {
+    return {
+      languages: { getDiagnostics: () => [] },
+      DiagnosticSeverity: { Error: 0, Warning: 1, Information: 2, Hint: 3 },
+      window: {
+        showInformationMessage: () => Promise.resolve(),
+        showWarningMessage: () => Promise.resolve(),
+        showErrorMessage: () => Promise.resolve(),
+        createOutputChannel: () => ({ appendLine: () => {}, show: () => {}, dispose: () => {} }),
+      },
+      workspace: {
+        workspaceFolders: [],
+        getConfiguration: () => ({ get: () => undefined, update: () => Promise.resolve() }),
+        onDidChangeConfiguration: () => ({ dispose: () => {} }),
+      },
+      commands: { registerCommand: () => ({ dispose: () => {} }), executeCommand: () => Promise.resolve() },
+      EventEmitter: class { event = () => {}; fire() {} dispose() {} },
+      Uri: { file: (p) => ({ fsPath: p, path: p }), parse: (s) => ({ fsPath: s, path: s }) },
+    };
+  }
+  return originalModuleLoad(request, parent, isMain);
+};
+
 const fs = require('fs');
 const path = require('path');
 const { CLIAdapterFactory } = require('../out/cli/adapter-factory');

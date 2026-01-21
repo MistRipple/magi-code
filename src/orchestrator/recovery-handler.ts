@@ -5,7 +5,7 @@
 
 import { logger, LogCategory } from '../logging';
 import { CLIType } from '../types';
-import { CLIAdapterFactory } from '../cli/adapter-factory';
+import { IAdapterFactory } from '../adapters/adapter-factory-interface';
 import { SnapshotManager } from '../snapshot-manager';
 import { globalEventBus } from '../events';
 import { UnifiedTaskManager } from '../task/unified-task-manager';
@@ -54,13 +54,13 @@ const DEFAULT_CONFIG: RecoveryConfig = {
  * 失败恢复处理器
  */
 export class RecoveryHandler {
-  private cliFactory: CLIAdapterFactory;
+  private cliFactory: IAdapterFactory;
   private snapshotManager: SnapshotManager;
   private unifiedTaskManager: UnifiedTaskManager;
   private config: RecoveryConfig;
 
   constructor(
-    cliFactory: CLIAdapterFactory,
+    cliFactory: IAdapterFactory,
     snapshotManager: SnapshotManager,
     unifiedTaskManager: UnifiedTaskManager,
     config?: Partial<RecoveryConfig>
@@ -165,7 +165,7 @@ export class RecoveryHandler {
     const fixPrompt = this.buildFixPrompt(failedTask, errorDetails, 'simple');
 
     try {
-      const response = await this.cliFactory.sendMessage(failedTask.assignedWorker, fixPrompt);
+      const response = await this.cliFactory.sendMessage(failedTask.assignedWorker as any, fixPrompt);  // ✅ 临时类型断言
 
       if (response.error) {
         await this.unifiedTaskManager.failSubTask(taskId, failedTask.id, response.error);
@@ -179,7 +179,7 @@ export class RecoveryHandler {
 
       if (response.content) {
         await this.unifiedTaskManager.completeSubTask(taskId, failedTask.id, {
-          cliType: failedTask.assignedWorker,
+          agentType: failedTask.assignedWorker,  // ✅ 使用 agentType
           success: true,
           output: response.content || '',
           modifiedFiles: failedTask.modifiedFiles || [],
@@ -220,7 +220,7 @@ export class RecoveryHandler {
     const fixPrompt = this.buildFixPrompt(failedTask, errorDetails, 'detailed');
 
     try {
-      const response = await this.cliFactory.sendMessage(failedTask.assignedWorker, fixPrompt);
+      const response = await this.cliFactory.sendMessage(failedTask.assignedWorker as any, fixPrompt);  // ✅ 临时类型断言
 
       if (response.error) {
         await this.unifiedTaskManager.failSubTask(taskId, failedTask.id, response.error);
@@ -234,7 +234,7 @@ export class RecoveryHandler {
 
       if (response.content) {
         await this.unifiedTaskManager.completeSubTask(taskId, failedTask.id, {
-          cliType: failedTask.assignedWorker,
+          agentType: failedTask.assignedWorker,  // ✅ 使用 agentType
           success: true,
           output: response.content || '',
           modifiedFiles: failedTask.modifiedFiles || [],
@@ -289,7 +289,7 @@ export class RecoveryHandler {
 
       if (response.content) {
         await this.unifiedTaskManager.completeSubTask(taskId, failedTask.id, {
-          cliType: failedTask.assignedWorker,
+          agentType: failedTask.assignedWorker,  // ✅ 使用 agentType
           success: true,
           output: response.content || '',
           modifiedFiles: failedTask.modifiedFiles || [],

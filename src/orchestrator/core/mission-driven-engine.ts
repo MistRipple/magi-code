@@ -14,14 +14,18 @@
 
 import { EventEmitter } from 'events';
 import path from 'path';
-import { CLIAdapterFactory } from '../../cli/adapter-factory';
+import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
+import { createClaudeWorker } from '../../workers/claude-worker';
+import { createCodexWorker } from '../../workers/codex-worker';
+import { createGeminiWorker } from '../../workers/gemini-worker';
 import { UnifiedSessionManager } from '../../session/unified-session-manager';
 import { SnapshotManager } from '../../snapshot-manager';
 import { ContextManager } from '../../context/context-manager';
 import { UnifiedTaskManager } from '../../task/unified-task-manager';
+import { TaskAnalyzer } from '../../task/task-analyzer';
 import { logger, LogCategory } from '../../logging';
-import { CLIType, PermissionMatrix, StrategyConfig, SubTask } from '../../types';
-import { TokenUsage } from '../../cli/types';
+import { CLIType, PermissionMatrix, StrategyConfig, SubTask, WorkerSlot } from '../../types';
+import { TokenUsage } from '../../types/agent-types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
 import { PlanRecord, PlanStorage } from '../plan-storage';
@@ -36,6 +40,8 @@ import {
   MissionStorageManager,
   FileBasedMissionStorage,
 } from '../mission';
+import { ExecutionStats } from '../execution-stats';
+import { globalEventBus } from '../../events';
 
 /**
  * 用户确认回调类型（与 OrchestratorAgent 兼容）
@@ -102,7 +108,7 @@ export interface MissionDrivenContext {
  * MissionDrivenEngine - 基于 Mission-Driven Architecture 的编排引擎
  */
 export class MissionDrivenEngine extends EventEmitter {
-  private cliFactory: CLIAdapterFactory;
+  private adapterFactory: IAdapterFactory;
   private sessionManager: UnifiedSessionManager;
   private snapshotManager: SnapshotManager;
   private contextManager: ContextManager;
@@ -115,6 +121,7 @@ export class MissionDrivenEngine extends EventEmitter {
   private missionStorage: MissionStorageManager;
   private profileLoader: ProfileLoader;
   private guidanceInjector: GuidanceInjector;
+  private taskAnalyzer: TaskAnalyzer;
 
   // 兼容性组件（用于 PlanRecord 转换）
   private planStorage: PlanStorage;
@@ -126,6 +133,14 @@ export class MissionDrivenEngine extends EventEmitter {
   private _context: MissionDrivenContext = { plan: null, mission: null };
   private taskManager: UnifiedTaskManager | null = null;
   private taskManagerSessionId: string | null = null;
+  private lastTaskAnalysis: {
+    suggestedMode?: 'sequential' | 'parallel';
+    explicitWorkers?: CLIType[];
+    wantsParallel?: boolean;
+  } | null = null;
+  private currentTaskId: string | null = null;
+  private taskManagerEventsBound = false;
+  private boundTaskManager: UnifiedTaskManager | null = null;
 
   // 回调
   private confirmationCallback?: ConfirmationCallback;
@@ -138,25 +153,34 @@ export class MissionDrivenEngine extends EventEmitter {
   // Token 统计
   private orchestratorTokens = { inputTokens: 0, outputTokens: 0 };
 
+  private lastExecutionErrors: string[] = [];
+  private lastExecutionSuccess = true;
+
+  // 执行统计
+  private executionStats: ExecutionStats;
+
   constructor(
-    cliFactory: CLIAdapterFactory,
+    adapterFactory: IAdapterFactory,
     config: MissionDrivenEngineConfig,
     workspaceRoot: string,
     snapshotManager: SnapshotManager,
     sessionManager: UnifiedSessionManager
   ) {
     super();
-    this.cliFactory = cliFactory;
+    this.adapterFactory = adapterFactory;
     this.config = config;
     this.workspaceRoot = workspaceRoot;
     this.snapshotManager = snapshotManager;
     this.sessionManager = sessionManager;
 
     // 初始化基础组件
-    this.profileLoader = new ProfileLoader();
+    this.profileLoader = ProfileLoader.getInstance();
     this.guidanceInjector = new GuidanceInjector();
+    this.taskAnalyzer = new TaskAnalyzer();
+    this.taskAnalyzer.setProfileLoader(this.profileLoader);
     this.contextManager = new ContextManager(workspaceRoot);
     this.planStorage = new PlanStorage(workspaceRoot);
+    this.executionStats = new ExecutionStats();
 
     // 初始化 Mission 存储（使用 .multicli/sessions 目录，按 session 分组存储）
     const sessionsDir = path.join(workspaceRoot, '.multicli', 'sessions');
@@ -178,6 +202,26 @@ export class MissionDrivenEngine extends EventEmitter {
       this.missionOrchestrator,
       this.profileLoader,
       this.guidanceInjector
+    );
+    // 传递快照管理器、工作目录和适配器工厂给执行器
+    this.missionExecutor.setSnapshotManager(snapshotManager);
+    this.missionExecutor.setWorkspaceRoot(workspaceRoot);
+    this.missionExecutor.setAdapterFactory(adapterFactory);
+    const timeout = this.config.timeout ?? 300000;
+
+    // ✅ Note: Worker creation still uses CLI paths for now
+    // This will be refactored in later phases when workers are updated to use LLM adapters
+    this.missionExecutor.registerWorker(
+      'claude',
+      createClaudeWorker((adapterFactory as any).getCliPath?.('claude') || 'claude', workspaceRoot, timeout)
+    );
+    this.missionExecutor.registerWorker(
+      'codex',
+      createCodexWorker((adapterFactory as any).getCliPath?.('codex') || 'codex', workspaceRoot, timeout)
+    );
+    this.missionExecutor.registerWorker(
+      'gemini',
+      createGeminiWorker((adapterFactory as any).getCliPath?.('gemini') || 'gemini', workspaceRoot, timeout)
     );
 
     this.setupEventForwarding();
@@ -220,6 +264,11 @@ export class MissionDrivenEngine extends EventEmitter {
     return this._state;
   }
 
+  private setState(next: OrchestratorState): void {
+    this._state = next;
+    this.emit('stateChange', this._state);
+  }
+
   /**
    * 获取当前上下文
    */
@@ -231,11 +280,12 @@ export class MissionDrivenEngine extends EventEmitter {
    * 初始化引擎
    */
   async initialize(): Promise<void> {
-    // ProfileLoader 不需要显式加载
+    // 加载画像配置
+    await this.profileLoader.load();
 
-    // 初始化 IntentGate（使用 CLI 进行意图决策）
+    // 初始化 IntentGate（使用适配器进行意图决策）
     const decider = async (prompt: string) => {
-      const response = await this.cliFactory.sendMessage(
+      const response = await this.adapterFactory.sendMessage(
         'claude',
         `分析以下用户输入的意图，返回 JSON：
 {
@@ -278,6 +328,7 @@ export class MissionDrivenEngine extends EventEmitter {
       };
     };
     this.intentGate = new IntentGate(decider);
+    this.missionOrchestrator.setIntentGate(decider);
 
     // 初始化 VerificationRunner
     if (this.config.verification && this.config.strategy?.enableVerification) {
@@ -317,6 +368,62 @@ export class MissionDrivenEngine extends EventEmitter {
   setTaskManager(taskManager: UnifiedTaskManager, sessionId: string): void {
     this.taskManager = taskManager;
     this.taskManagerSessionId = sessionId;
+    // 同步传递给 MissionExecutor
+    this.missionExecutor.setTaskManager(taskManager);
+    // 绑定任务事件到全局事件总线（避免 UI/测试漏掉 UnifiedTaskManager 事件）
+    if (!this.taskManagerEventsBound || this.boundTaskManager !== taskManager) {
+      this.taskManagerEventsBound = true;
+      this.boundTaskManager = taskManager;
+      this.bindTaskManagerEvents(taskManager);
+    }
+  }
+
+  private bindTaskManagerEvents(taskManager: UnifiedTaskManager): void {
+    taskManager.on('subtask:started', (task, subTask) => {
+      globalEventBus.emitEvent('subtask:started', {
+        taskId: task.id,
+        subTaskId: subTask.id,
+        data: {
+          cli: subTask.assignedWorker,
+          description: subTask.description,
+          targetFiles: subTask.targetFiles,
+          reason: subTask.reason,
+        },
+      });
+    });
+
+    taskManager.on('subtask:completed', (task, subTask) => {
+      const duration = subTask.result?.duration
+        ?? (subTask.startedAt && subTask.completedAt ? subTask.completedAt - subTask.startedAt : undefined);
+      globalEventBus.emitEvent('subtask:completed', {
+        taskId: task.id,
+        subTaskId: subTask.id,
+        data: {
+          success: true,
+          cliType: subTask.assignedWorker,
+          description: subTask.description,
+          modifiedFiles: subTask.modifiedFiles,
+          duration,
+        },
+      });
+    });
+
+    taskManager.on('subtask:failed', (task, subTask) => {
+      const duration = subTask.startedAt && subTask.completedAt
+        ? subTask.completedAt - subTask.startedAt
+        : undefined;
+      globalEventBus.emitEvent('subtask:failed', {
+        taskId: task.id,
+        subTaskId: subTask.id,
+        data: {
+          cliType: subTask.assignedWorker,
+          description: subTask.description,
+          error: subTask.error,
+          modifiedFiles: subTask.modifiedFiles,
+          duration,
+        },
+      });
+    });
   }
 
   /**
@@ -365,14 +472,15 @@ export class MissionDrivenEngine extends EventEmitter {
    * 执行任务 - 主入口
    */
   async execute(userPrompt: string, taskId: string, sessionId?: string): Promise<string> {
-    this._state = 'analyzing';
-    this.emit('stateChange', this._state);
+    this.currentTaskId = taskId || null;
+    this.setState('analyzing');
+    this.lastTaskAnalysis = null;
 
     try {
       const resolvedSessionId = sessionId || this.sessionManager.getCurrentSession()?.id || taskId;
 
       // 1. 意图分析
-      const intentResult = await this.missionOrchestrator.processRequest(
+      let intentResult = await this.missionOrchestrator.processRequest(
         userPrompt,
         resolvedSessionId
       );
@@ -380,29 +488,55 @@ export class MissionDrivenEngine extends EventEmitter {
       // 2. 处理非任务模式
       if (intentResult.skipMission) {
         if (intentResult.mode === IntentHandlerMode.CLARIFY && intentResult.clarificationQuestions) {
-          // 需要澄清
-          if (this.clarificationCallback) {
-            const answers = await this.clarificationCallback(
-              intentResult.clarificationQuestions,
-              '',
-              0.5,
-              userPrompt
-            );
-            if (answers) {
-              // 重新执行带答案的请求
-              const clarifiedPrompt = `${userPrompt}\n\n补充信息：${JSON.stringify(answers)}`;
-              return this.execute(clarifiedPrompt, taskId, sessionId);
+            // 需要澄清
+            if (this.clarificationCallback) {
+              const answers = await this.clarificationCallback(
+                intentResult.clarificationQuestions,
+                '',
+                0.5,
+                userPrompt
+              );
+              if (answers) {
+                // 重新执行带答案的请求
+                const clarifiedPrompt = `${userPrompt}\n\n补充信息：${JSON.stringify(answers)}`;
+                return this.execute(clarifiedPrompt, taskId, sessionId);
+              }
+            }
+          // 用户取消澄清，标记任务取消
+          if (this.taskManager && taskId) {
+            try {
+              await this.taskManager.cancelTask(taskId);
+            } catch (error) {
+              logger.warn('编排器.任务引擎.澄清_取消.任务更新_失败', { error }, LogCategory.ORCHESTRATOR);
             }
           }
-          return intentResult.suggestion;
+          globalEventBus.emitEvent('task:cancelled', { taskId, data: { isRunning: false } });
+          this.currentTaskId = null;
+          return '任务已取消。';
         }
 
         if (intentResult.mode === IntentHandlerMode.ASK) {
           // 直接对话模式
-          return this.executeAskMode(userPrompt, taskId, resolvedSessionId);
+          const result = await this.executeAskMode(userPrompt, taskId, resolvedSessionId);
+          this.currentTaskId = null;
+          return result;
         }
 
-        return intentResult.suggestion;
+        if (intentResult.mode === IntentHandlerMode.DIRECT) {
+          // 直接模式在编排引擎内仍按任务流程执行
+          intentResult = await this.missionOrchestrator.processRequest(
+            userPrompt,
+            resolvedSessionId,
+            { forceMode: IntentHandlerMode.TASK }
+          );
+          if (intentResult.skipMission || !intentResult.mission) {
+            this.currentTaskId = null;
+            return intentResult.suggestion;
+          }
+        } else {
+          this.currentTaskId = null;
+          return intentResult.suggestion;
+        }
       }
 
       // 3. 创建并执行 Mission
@@ -424,6 +558,7 @@ export class MissionDrivenEngine extends EventEmitter {
           const confirmed = await this.confirmationCallback(plan, formatted);
           if (!confirmed) {
             await this.missionOrchestrator.cancelMission(mission.id, '用户取消');
+            this.currentTaskId = null;
             return '任务已取消。';
           }
         }
@@ -433,12 +568,25 @@ export class MissionDrivenEngine extends EventEmitter {
       await this.missionOrchestrator.approveMission(mission.id);
 
       // 8. 执行 Mission
-      this._state = 'dispatching';
-      this.emit('stateChange', this._state);
+      this.setState('dispatching');
 
-      await this.missionExecutor.execute(mission, {
+      const analysis = this.lastTaskAnalysis as unknown as {
+        wantsParallel?: boolean;
+        explicitWorkers?: CLIType[];
+        suggestedMode?: 'sequential' | 'parallel';
+      } | null;
+      const wantsParallel = Boolean(
+        analysis?.wantsParallel
+        || (analysis?.explicitWorkers?.length || 0) > 1
+        || analysis?.suggestedMode === 'parallel'
+      );
+
+      const executionResult = await this.missionExecutor.execute(mission, {
         workingDirectory: this.workspaceRoot,
         timeout: this.config.timeout,
+        taskId, // 传递外部 taskId 用于同步 SubTask
+        parallel: wantsParallel,
+        executionMode: 'adapter',
         onProgress: (progress) => {
           this.emit('progress', progress);
         },
@@ -447,28 +595,139 @@ export class MissionDrivenEngine extends EventEmitter {
         },
       });
 
+      // 记录执行统计（按 Assignment 记录）
+      for (const [assignmentId, assignmentResult] of executionResult.assignmentResults) {
+        const assignment = mission.assignments.find(a => a.id === assignmentId);
+        if (assignment) {
+          this.executionStats.recordExecution({
+            cli: assignment.workerId,
+            taskId,
+            subTaskId: assignmentId,
+            success: assignmentResult.success,
+            duration: assignmentResult.totalDuration,
+            error: assignmentResult.errors?.join('; '),
+            inputTokens: assignmentResult.tokenUsage?.inputTokens,
+            outputTokens: assignmentResult.tokenUsage?.outputTokens,
+            phase: 'execution',
+          });
+        }
+      }
+
       // 9. 验证结果
-      this._state = 'verifying';
-      this.emit('stateChange', this._state);
+      this.setState('verifying');
 
       const verificationResult = await this.missionOrchestrator.verifyMission(mission.id);
+      this.lastExecutionSuccess = executionResult.success && verificationResult.passed;
+      this.lastExecutionErrors = [
+        ...(executionResult.errors || []),
+        ...(verificationResult.passed ? [] : [verificationResult.summary || '验证未通过']),
+      ];
 
-      // 10. 生成总结
-      this._state = 'summarizing';
-      this.emit('stateChange', this._state);
+      // 10. 验证失败时的恢复流程
+      if (!verificationResult.passed && this.recoveryConfirmationCallback) {
+        const failedSubTask: SubTask = {
+          id: mission.id,
+          taskId,
+          description: mission.goal,
+          assignedWorker: 'claude',
+          status: 'failed',
+          priority: 5,
+          retryCount: 0,
+          maxRetries: 3,
+          output: [],
+          targetFiles: [],
+          dependencies: [],
+          progress: 0,
+        };
+        const errorMsg = `验证失败: ${verificationResult.summary || '未通过验收标准'}`;
+        const hasSnapshots = this.snapshotManager.hasSnapshots();
+
+        const decision = await this.recoveryConfirmationCallback(
+          failedSubTask,
+          errorMsg,
+          { retry: true, rollback: hasSnapshots }
+        );
+
+        if (decision === 'rollback' && hasSnapshots) {
+          const rollbackCount = this.snapshotManager.revertAllChanges();
+          logger.info('引擎.恢复.回滚', { rollbackCount }, LogCategory.ORCHESTRATOR);
+          return `验证失败，已回滚 ${rollbackCount} 个文件的更改。`;
+        } else if (decision === 'retry') {
+          // 重新执行 Mission
+          return this.execute(userPrompt, taskId, sessionId);
+        }
+        // decision === 'continue': 继续生成总结
+      }
+
+      // 11. 生成总结
+      this.setState('summarizing');
 
       const summary = await this.missionOrchestrator.summarizeMission(mission.id);
 
-      this._state = 'idle';
-      this.emit('stateChange', this._state);
+      this.setState('idle');
 
-      return this.formatSummary(summary, verificationResult.passed);
+      const formatted = this.formatSummary(summary, this.lastExecutionSuccess, this.lastExecutionErrors);
+      this.currentTaskId = null;
+      return formatted;
 
     } catch (error) {
-      this._state = 'idle';
-      this.emit('stateChange', this._state);
+      // 执行过程中发生错误时的恢复流程
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.lastExecutionSuccess = false;
+      this.lastExecutionErrors = [errorMessage];
+
+      if (this.recoveryConfirmationCallback) {
+        const failedSubTask: SubTask = {
+          id: taskId,
+          taskId,
+          description: userPrompt.substring(0, 100),
+          assignedWorker: 'claude',
+          status: 'failed',
+          priority: 5,
+          retryCount: 0,
+          maxRetries: 3,
+          output: [],
+          targetFiles: [],
+          dependencies: [],
+          progress: 0,
+        };
+        const hasSnapshots = this.snapshotManager.hasSnapshots();
+
+        try {
+          const decision = await this.recoveryConfirmationCallback(
+            failedSubTask,
+            errorMessage,
+            { retry: true, rollback: hasSnapshots }
+          );
+
+          if (decision === 'rollback' && hasSnapshots) {
+            const rollbackCount = this.snapshotManager.revertAllChanges();
+            logger.info('引擎.恢复.错误_回滚', { rollbackCount, error: errorMessage }, LogCategory.ORCHESTRATOR);
+            this.setState('idle');
+            this.currentTaskId = null;
+            return `执行出错，已回滚 ${rollbackCount} 个文件的更改。\n\n错误: ${errorMessage}`;
+          } else if (decision === 'retry') {
+            // 重试执行
+            return this.execute(userPrompt, taskId, sessionId);
+          }
+          // decision === 'continue': 继续抛出错误
+        } catch (callbackError) {
+          // 回调本身出错，继续原来的错误处理
+          logger.warn('引擎.恢复.回调_失败', { error: String(callbackError) }, LogCategory.ORCHESTRATOR);
+        }
+      }
+
+      this.setState('idle');
+      this.currentTaskId = null;
       throw error;
     }
+  }
+
+  getLastExecutionStatus(): { success: boolean; errors: string[] } {
+    return {
+      success: this.lastExecutionSuccess,
+      errors: [...this.lastExecutionErrors],
+    };
   }
 
   /**
@@ -533,16 +792,23 @@ export class MissionDrivenEngine extends EventEmitter {
     }
 
     // 执行 Mission
-    await this.missionExecutor.execute(mission, {
+    const executionResult = await this.missionExecutor.execute(mission, {
       workingDirectory: this.workspaceRoot,
       timeout: this.config.timeout,
+      taskId, // 传递外部 taskId 用于同步 SubTask
+      executionMode: 'adapter',
     });
 
     // 验证和总结
     const verification = await this.missionOrchestrator.verifyMission(mission.id);
+    this.lastExecutionSuccess = executionResult.success && verification.passed;
+    this.lastExecutionErrors = [
+      ...(executionResult.errors || []),
+      ...(verification.passed ? [] : [verification.summary || '验证未通过']),
+    ];
     const summary = await this.missionOrchestrator.summarizeMission(mission.id);
 
-    return this.formatSummary(summary, verification.passed);
+    return this.formatSummary(summary, this.lastExecutionSuccess, this.lastExecutionErrors);
   }
 
   /**
@@ -577,10 +843,22 @@ export class MissionDrivenEngine extends EventEmitter {
   /**
    * 记录编排器 Token 使用
    */
-  recordOrchestratorTokens(usage?: TokenUsage): void {
+  recordOrchestratorTokens(usage?: TokenUsage, phase: 'planning' | 'verification' = 'planning'): void {
     if (usage) {
       this.orchestratorTokens.inputTokens += usage.inputTokens || 0;
       this.orchestratorTokens.outputTokens += usage.outputTokens || 0;
+
+      // 同时记录到 ExecutionStats（编排器使用 claude）
+      this.executionStats.recordExecution({
+        cli: 'claude',
+        taskId: 'orchestrator',
+        subTaskId: phase,
+        success: true,
+        duration: 0,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        phase,
+      });
     }
   }
 
@@ -599,8 +877,8 @@ export class MissionDrivenEngine extends EventEmitter {
     if (this._context.mission) {
       await this.missionOrchestrator.cancelMission(this._context.mission.id, '用户取消');
     }
-    this._state = 'idle';
-    this.emit('stateChange', this._state);
+    this.setState('idle');
+    this.currentTaskId = null;
   }
 
   /**
@@ -635,9 +913,8 @@ export class MissionDrivenEngine extends EventEmitter {
   /**
    * 获取执行统计
    */
-  getExecutionStats(): null {
-    // 执行统计功能将在 Phase 6 性能优化中实现
-    return null;
+  getExecutionStats(): ExecutionStats {
+    return this.executionStats;
   }
 
   /**
@@ -661,7 +938,7 @@ export class MissionDrivenEngine extends EventEmitter {
     _sessionId: string
   ): Promise<void> {
     // 使用 Claude 分析用户请求
-    const response = await this.cliFactory.sendMessage(
+    const response = await this.adapterFactory.sendMessage(
       'claude',
       `分析以下用户请求，提取：
 1. 目标（goal）：用户想要达成什么
@@ -710,8 +987,23 @@ export class MissionDrivenEngine extends EventEmitter {
    * 使用 LLM 规划协作
    */
   private async planCollaborationWithLLM(mission: Mission, _sessionId: string): Promise<void> {
+    const analysis = this.taskAnalyzer.analyze(mission.userPrompt || mission.goal || '');
+    this.lastTaskAnalysis = {
+      suggestedMode: analysis.suggestedMode,
+      explicitWorkers: analysis.explicitWorkers,
+      wantsParallel: analysis.wantsParallel,
+    };
+    const explicitWorkers = Array.from(new Set((analysis.explicitWorkers || []).filter(Boolean)));
+    const preferredWorker = analysis.recommendedWorker
+      || (analysis.targetFiles.length > 0 ? 'codex' : undefined);
+    const preferredWorkers = explicitWorkers.length > 0
+      ? explicitWorkers
+      : (preferredWorker ? [preferredWorker] : undefined);
+
     // 选择参与者
-    const participants = await this.missionOrchestrator.selectParticipants(mission);
+    const participants = await this.missionOrchestrator.selectParticipants(mission, {
+      preferredWorkers,
+    });
 
     // 定义契约
     await this.missionOrchestrator.defineContracts(mission, participants);
@@ -733,7 +1025,7 @@ export class MissionDrivenEngine extends EventEmitter {
       ? `请结合以下会话上下文回答用户问题。\n\n${context}\n\n## 用户问题\n${userPrompt}`
       : userPrompt;
 
-    const response = await this.cliFactory.sendMessage(
+    const response = await this.adapterFactory.sendMessage(
       'claude',
       prompt,
       undefined,
@@ -812,7 +1104,7 @@ export class MissionDrivenEngine extends EventEmitter {
       assignments: plan.subTasks.map((subTask) => ({
         id: subTask.id,
         missionId: plan.id || taskId,
-        workerId: subTask.assignedWorker,
+        workerId: subTask.assignedWorker as WorkerSlot,  // ✅ Type assertion: assignments are only for workers
         assignmentReason: {
           profileMatch: { category: 'general', score: 0.8, matchedKeywords: [] },
           contractRole: 'none' as const,
@@ -869,7 +1161,11 @@ export class MissionDrivenEngine extends EventEmitter {
   /**
    * 格式化总结
    */
-  private formatSummary(summary: import('./mission-orchestrator').MissionSummary, passed: boolean): string {
+  private formatSummary(
+    summary: import('./mission-orchestrator').MissionSummary,
+    passed: boolean,
+    errors: string[] = []
+  ): string {
     const totalTodos = summary.completedTodos + summary.failedTodos + summary.skippedTodos;
     let output = `## 任务完成\n\n`;
     output += `**状态**: ${passed ? '✅ 验证通过' : '⚠️ 需要检查'}\n\n`;
@@ -880,6 +1176,13 @@ export class MissionDrivenEngine extends EventEmitter {
       output += `### 修改的文件\n\n`;
       summary.modifiedFiles.forEach((file) => {
         output += `- ${file}\n`;
+      });
+    }
+
+    if (!passed && errors.length > 0) {
+      output += `\n### 失败原因\n\n`;
+      errors.forEach((err) => {
+        output += `- ${err}\n`;
       });
     }
 

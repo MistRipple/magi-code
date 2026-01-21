@@ -4,7 +4,7 @@
  */
 
 import { logger, LogCategory } from './logging';
-import { CLIType, Task, SubTask, TaskCategory, WorkerResult, ExecutionMode } from './types';
+import { CLIType, Task, SubTask, TaskCategory, WorkerResult, ExecutionMode, WorkerSlot } from './types';  // ✅ 导入 WorkerSlot
 import { UnifiedSessionManager } from './session';
 import { UnifiedTaskManager } from './task/unified-task-manager';
 import { SnapshotManager } from './snapshot-manager';
@@ -178,14 +178,14 @@ export class Orchestrator {
   }
 
   private async executeSubTask(subTask: SubTask): Promise<WorkerResult> {
-    const cli = subTask.assignedWorker;
+    const agent = subTask.assignedWorker;  // ✅ 使用 agent
 
-    // 类型安全检查：确保 CLI 已分配
-    if (!cli) {
+    // 类型安全检查：确保 Agent 已分配
+    if (!agent) {
       const error = `SubTask ${subTask.id} 没有分配 Worker`;
       logger.error('编排器.子任务.未分配', { subTaskId: subTask.id }, LogCategory.ORCHESTRATOR);
       return {
-        cliType: 'claude', // 默认值，避免类型错误
+        agentType: 'claude', // ✅ 使用 agentType，默认值，避免类型错误
         success: false,
         error,
         duration: 0,
@@ -194,12 +194,13 @@ export class Orchestrator {
     }
 
     // 类型安全检查：确保 Worker 存在
-    const worker = this.workers.get(cli);
+    // SubTask 的 assignedWorker 应该总是 WorkerSlot，不会是 'orchestrator'
+    const worker = this.workers.get(agent as WorkerSlot);  // ✅ 类型断言
     if (!worker) {
-      const error = `Worker 不存在: ${cli}`;
-      logger.error('编排器.子代理.缺失', { cli }, LogCategory.ORCHESTRATOR);
+      const error = `Worker 不存在: ${agent}`;
+      logger.error('编排器.子代理.缺失', { agent }, LogCategory.ORCHESTRATOR);
       return {
-        cliType: cli,
+        agentType: agent,  // ✅ 使用 agentType
         success: false,
         error,
         duration: 0,
@@ -211,9 +212,9 @@ export class Orchestrator {
     const priority = subTask.priority ?? 5; // 默认优先级 5
     for (const f of subTask.targetFiles) {
       try {
-        this.options.snapshotManager.createSnapshot(f, cli, subTask.id, priority);
+        this.options.snapshotManager.createSnapshot(f, agent, subTask.id, priority);
       } catch (error) {
-        logger.error('编排器.快照.创建_失败', { filePath: f, cli, subTaskId: subTask.id, error }, LogCategory.ORCHESTRATOR);
+        logger.error('编排器.快照.创建_失败', { filePath: f, agent, subTaskId: subTask.id, error }, LogCategory.ORCHESTRATOR);
         // 继续执行，快照失败不应阻止任务
       }
     }
@@ -240,7 +241,7 @@ export class Orchestrator {
       await this.options.taskManager.failSubTask(subTask.taskId, subTask.id, msg);
 
       return {
-        cliType: cli,
+        agentType: agent,  // ✅ 使用 agentType
         success: false,
         error: msg,
         duration: 0,

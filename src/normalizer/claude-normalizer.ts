@@ -65,10 +65,11 @@ export class ClaudeNormalizer extends BaseNormalizer {
   private jsonBuffer: string = '';
   private currentBlockType: string | null = null;
   private currentBlockIndex: number = -1;
+  private pendingToolInputJson: string = '';  // 累积工具输入的增量 JSON
 
   constructor(config?: Partial<NormalizerConfig>) {
     super({
-      cli: 'claude',
+      agent: 'claude',  // ✅ 使用 agent
       defaultSource: 'worker',
       ...config,
     });
@@ -89,9 +90,15 @@ export class ClaudeNormalizer extends BaseNormalizer {
       if (!trimmed) continue;
       
       try {
-        const event = JSON.parse(trimmed) as ClaudeStreamEvent;
-        const eventUpdates = this.processEvent(context, event);
-        updates.push(...eventUpdates);
+        const event = JSON.parse(trimmed) as any;
+        // Claude stream-json 可能包裹在 stream_event 中
+        if (event?.type === 'stream_event' && event.event) {
+          const eventUpdates = this.processEvent(context, event.event as ClaudeStreamEvent);
+          updates.push(...eventUpdates);
+        } else {
+          const eventUpdates = this.processEvent(context, event as ClaudeStreamEvent);
+          updates.push(...eventUpdates);
+        }
       } catch {
         // 非 JSON 行，作为纯文本处理
         if (trimmed) {
@@ -152,21 +159,22 @@ export class ClaudeNormalizer extends BaseNormalizer {
       case 'content_block_start':
         this.currentBlockIndex = event.index ?? -1;
         this.currentBlockType = event.content_block?.type || null;
-        
+
         if (this.currentBlockType === 'tool_use' && event.content_block) {
-          // 工具调用开始
+          // 工具调用开始 - 清空累积的 JSON，准备接收增量数据
+          this.pendingToolInputJson = '';
           const toolCall: ToolCallBlock = {
             type: 'tool_call',
             toolName: event.content_block.name || 'unknown',
             toolId: event.content_block.id || generateMessageId(),
             status: 'running',
-            input: event.content_block.input,
+            input: undefined,  // 初始时 input 为空，等待增量数据
           };
           this.upsertToolCall(context, toolCall);
           updates.push(this.createUpdate(context.messageId, 'block_update', { blocks: [toolCall] }));
         }
         break;
-        
+
       case 'content_block_delta':
         if (event.delta) {
           if (event.delta.type === 'text_delta' && event.delta.text) {
@@ -178,18 +186,49 @@ export class ClaudeNormalizer extends BaseNormalizer {
               context.pendingThinking = '';
             }
             context.pendingThinking += event.delta.thinking;
+            if (!context.thinkingBlockId) {
+              context.thinkingBlockId = `${context.messageId}-thinking`;
+            }
+            updates.push(this.createUpdate(context.messageId, 'block_update', {
+              blocks: [{
+                type: 'thinking',
+                content: context.pendingThinking,
+                blockId: context.thinkingBlockId,
+              }],
+            }));
           } else if (event.delta.type === 'input_json_delta' && event.delta.partial_json) {
-            // 工具输入的增量 JSON
+            // 累积工具输入的增量 JSON
+            this.pendingToolInputJson += event.delta.partial_json;
             this.debug('[Claude] tool input delta:', event.delta.partial_json);
           }
         }
         break;
-        
+
       case 'content_block_stop':
         // 内容块结束
         if (this.currentBlockType === 'thinking' && context.pendingThinking) {
-          this.addThinkingBlock(context, context.pendingThinking);
+          this.addThinkingBlock(context, context.pendingThinking, undefined, context.thinkingBlockId);
           context.pendingThinking = null;
+        }
+        // 工具调用结束 - 使用累积的 JSON 更新工具输入
+        if (this.currentBlockType === 'tool_use' && this.pendingToolInputJson) {
+          const toolId = this.findActiveToolId(context);
+          if (toolId) {
+            const toolCall = context.activeToolCalls.get(toolId);
+            if (toolCall) {
+              try {
+                // 解析累积的 JSON 并格式化
+                const parsedInput = JSON.parse(this.pendingToolInputJson);
+                toolCall.input = JSON.stringify(parsedInput, null, 2);
+              } catch {
+                // 解析失败，直接使用原始字符串
+                toolCall.input = this.pendingToolInputJson;
+              }
+              // 发送更新
+              updates.push(this.createUpdate(context.messageId, 'block_update', { blocks: [toolCall] }));
+            }
+          }
+          this.pendingToolInputJson = '';
         }
         this.currentBlockType = null;
         this.currentBlockIndex = -1;

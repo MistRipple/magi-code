@@ -5,7 +5,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { DiffHunk, CLIType } from './types';
+import { DiffHunk, AgentType } from './types';  // ✅ 使用 AgentType
 import { UnifiedSessionManager } from './session';
 
 /**
@@ -16,7 +16,7 @@ export interface DiffResult {
   hunks: DiffHunk[];
   additions: number;
   deletions: number;
-  source: CLIType;
+  source: AgentType;  // ✅ 使用 AgentType
 }
 
 /**
@@ -85,7 +85,7 @@ export class DiffGenerator {
     original: string,
     current: string,
     filePath: string,
-    source: CLIType
+    source: AgentType  // ✅ 使用 AgentType
   ): DiffHunk[] {
     const originalLines = original.split('\n');
     const currentLines = current.split('\n');
@@ -141,7 +141,7 @@ export class DiffGenerator {
   private createHunk(
     data: { oldStart: number; oldLines: string[]; newStart: number; newLines: string[] },
     filePath: string,
-    source: CLIType
+    source: AgentType  // ✅ 使用 AgentType
   ): DiffHunk {
     const content = [
       ...data.oldLines.map(l => `-${l}`),

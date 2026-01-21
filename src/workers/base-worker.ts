@@ -4,7 +4,7 @@
  */
 
 import { ChildProcess, spawn } from 'child_process';
-import { CLIType, SubTask, WorkerResult, WorkerConfig } from '../types';
+import { AgentType, SubTask, WorkerResult, WorkerConfig } from '../types';  // ✅ 使用 AgentType
 import { EventEmitter, globalEventBus } from '../events';
 
 /** Worker 执行选项 */
@@ -30,8 +30,8 @@ export abstract class BaseWorker extends EventEmitter {
     this.config = config;
   }
 
-  /** CLI 类型 */
-  abstract get cliType(): CLIType;
+  /** Agent 类型 */
+  abstract get agentType(): AgentType;  // ✅ 使用 agentType
 
   /** 构建 CLI 命令参数 */
   protected abstract buildArgs(subTask: SubTask): string[];
@@ -56,7 +56,7 @@ export abstract class BaseWorker extends EventEmitter {
       const parsed = this.parseOutput(output);
 
       const result: WorkerResult = {
-        cliType: this.cliType,
+        agentType: this.agentType,  // ✅ 使用 agentType
         success: true,
         output,
         duration: Date.now() - startTime,
@@ -73,10 +73,10 @@ export abstract class BaseWorker extends EventEmitter {
       globalEventBus.emitEvent('subtask:failed', {
         taskId: subTask.taskId,
         subTaskId: subTask.id,
-        data: { error: errorMessage, cli: this.cliType },
+        data: { error: errorMessage, agent: this.agentType },  // ✅ 使用 agent
       });
       return {
-        cliType: this.cliType,
+        agentType: this.agentType,  // ✅ 使用 agentType
         success: false,
         error: errorMessage,
         duration: Date.now() - startTime,
@@ -97,7 +97,7 @@ export abstract class BaseWorker extends EventEmitter {
       let output = '';
       let timeoutId: NodeJS.Timeout | undefined;
 
-      this.process = spawn(this.config.cliPath, args, { cwd, shell: true, env: { ...process.env } });
+      this.process = spawn(this.config.cliPath, args, { cwd, shell: false, env: { ...process.env } });
 
       if (effectiveTimeout > 0) {
         timeoutId = setTimeout(() => {

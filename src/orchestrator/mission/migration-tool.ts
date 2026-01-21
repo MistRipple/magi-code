@@ -13,7 +13,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { logger, LogCategory } from '../../logging';
-import { CLIType, SubTask, SubTaskStatus } from '../../types';
+import { SubTask, SubTaskStatus, WorkerSlot } from '../../types';
 import { PlanRecord, PlanStorage } from '../plan-storage';
 import { ExecutionPlan } from '../protocols/types';
 import {
@@ -30,6 +30,7 @@ import {
   AcceptanceCriterion,
   AssignmentScope,
   AssignmentReason,
+  VerificationSpec,
 } from './types';
 import { MissionStorageManager, createFileBasedMissionStorage } from './mission-storage';
 
@@ -208,14 +209,17 @@ export class MissionMigrationTool {
     };
 
     // 创建 Todo（每个 SubTask 对应一个 Todo）
-    const todo = this.convertSubTaskToTodo(subTask, `${missionId}-${subTask.id}`);
+    // 优先使用 SubTask 的 assignmentId（如果存在），否则生成
+    const assignmentIdForTodo = subTask.assignmentId || `${missionId}-${subTask.id}`;
+    const todo = this.convertSubTaskToTodo(subTask, assignmentIdForTodo);
 
     const assignment: Assignment = {
-      id: subTask.id,
+      // 优先使用 SubTask 的 assignmentId（如果存在）
+      id: subTask.assignmentId || subTask.id,
       missionId,
 
       // Worker 分配（SubTask 使用 assignedWorker）
-      workerId: subTask.assignedWorker,
+      workerId: subTask.assignedWorker as WorkerSlot,  // ✅ Type assertion: assignments are only for workers
       assignmentReason,
 
       // 职责定义
@@ -341,19 +345,73 @@ export class MissionMigrationTool {
 
   /**
    * 转换验收标准
+   * 尝试从描述中解析出结构化验证规格
    */
   private convertAcceptanceCriteria(criteria?: string[]): AcceptanceCriterion[] {
     if (!criteria || criteria.length === 0) {
       return [];
     }
 
-    return criteria.map((criterion, index) => ({
-      id: `criterion-${index}`,
-      description: criterion,
-      verifiable: true,
-      verificationMethod: 'manual' as const,
-      status: 'pending' as const,
-    }));
+    return criteria.map((criterion, index) => {
+      const spec = this.parseVerificationSpec(criterion);
+      return {
+        id: `criterion-${index}`,
+        description: criterion,
+        verifiable: true,
+        verificationMethod: spec ? 'auto' as const : 'manual' as const,
+        status: 'pending' as const,
+        verificationSpec: spec,
+      };
+    });
+  }
+
+  /**
+   * 从描述文本解析验证规格
+   * 支持常见的验收标准模式
+   */
+  private parseVerificationSpec(description: string): VerificationSpec | undefined {
+    // 模式1: 文件存在 - "文件 xxx 存在" 或 "xxx file exists"
+    const fileExistsMatch = description.match(
+      /(?:文件\s+([^\s]+)\s+存在|([^\s]+)\s+(?:file\s+)?exists)/i
+    );
+    if (fileExistsMatch) {
+      const targetPath = fileExistsMatch[1] || fileExistsMatch[2];
+      return {
+        type: 'file_exists',
+        targetPath: targetPath.replace(/^["'`]|["'`]$/g, ''),
+      };
+    }
+
+    // 模式2: 文件内容 - "文件内容等于/为 xxx" 或 "content equals xxx"
+    const contentMatch = description.match(
+      /(?:文件\s*)?内容\s*(?:等于|为|匹配|is|equals)\s*["'`]?([^"'`]+)["'`]?/i
+    );
+    if (contentMatch) {
+      return {
+        type: 'file_content',
+        expectedContent: contentMatch[1].trim(),
+        contentMatchMode: description.includes('匹配') || description.includes('match')
+          ? 'contains'
+          : 'exact',
+      };
+    }
+
+    // 模式3: 测试通过 - "测试通过" 或 "tests pass"
+    if (/(?:测试通过|tests?\s+pass)/i.test(description)) {
+      return {
+        type: 'test_pass',
+      };
+    }
+
+    // 模式4: 任务完成 - "任务完成" 或 "task completed"
+    if (/(?:任务完成|task\s+complet)/i.test(description)) {
+      return {
+        type: 'task_completed',
+      };
+    }
+
+    // 无法解析，返回 undefined（将使用任务完成检查作为回退）
+    return undefined;
   }
 
   /**

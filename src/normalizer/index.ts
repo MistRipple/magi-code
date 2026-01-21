@@ -30,7 +30,7 @@ export {
   type ProcessingState,
 } from './unified-message-bus';
 
-import type { CLIType } from '../cli/types';
+import type { AgentType, WorkerSlot } from '../types/agent-types';  // ✅ 使用 AgentType
 import { BaseNormalizer } from './base-normalizer';
 import { ClaudeNormalizer } from './claude-normalizer';
 import { CodexNormalizer } from './codex-normalizer';
@@ -41,19 +41,19 @@ import type { MessageSource } from '../protocol';
  * 创建 CLI 对应的 Normalizer
  */
 export function createNormalizer(
-  cli: CLIType,
+  agent: WorkerSlot,  // ✅ 使用 WorkerSlot (不包含 orchestrator)
   source: MessageSource = 'worker',
   debug = false
 ): BaseNormalizer {
-  switch (cli) {
+  switch (agent) {
     case 'claude':
-      return new ClaudeNormalizer({ cli, defaultSource: source, debug });
+      return new ClaudeNormalizer({ agent, defaultSource: source, debug });
     case 'codex':
-      return new CodexNormalizer({ cli, defaultSource: source, debug });
+      return new CodexNormalizer({ agent, defaultSource: source, debug });
     case 'gemini':
-      return new GeminiNormalizer({ cli, defaultSource: source, debug });
+      return new GeminiNormalizer({ agent, defaultSource: source, debug });
     default:
-      throw new Error(`Unknown CLI type: ${cli}`);
+      throw new Error(`Unknown agent type: ${agent}`);
   }
 }
 

@@ -111,7 +111,7 @@ export function normalizeOrchestratorMessage(
     id: messageId,
     traceId: traceId || `trace-${uuidv4().substring(0, 8)}`,
     type: messageType,
-    cli: 'claude', // 编排器使用 claude
+    agent: 'orchestrator',  // ✅ 使用 agent 替代 cli
     source: 'orchestrator',
     lifecycle,
     timestamp: uiMessage.timestamp || Date.now(),

@@ -3,7 +3,7 @@
  * 合并多个 CLI 的输出，生成统一报告
  */
 
-import { CLIType } from '../types';
+import { CLIType, AgentType } from '../types';  // ✅ 导入 AgentType
 import { SubTaskResult } from './execution-scheduler';
 import { DiffResult } from '../diff-generator';
 
@@ -49,7 +49,7 @@ export interface CLIStats {
 /** 文件变更摘要 */
 export interface FileChangeSummary {
   filePath: string;
-  cli: CLIType;
+  cli: AgentType;  // ✅ 使用 AgentType
   additions: number;
   deletions: number;
 }

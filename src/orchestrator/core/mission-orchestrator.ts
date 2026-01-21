@@ -9,6 +9,8 @@
  */
 
 import { EventEmitter } from 'events';
+import fs from 'fs';
+import path from 'path';
 import { CLIType } from '../../types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
@@ -26,7 +28,8 @@ import {
 } from '../intent-gate';
 import { SnapshotManager } from '../../snapshot-manager';
 import { ContextManager } from '../../context/context-manager';
-import { UnifiedSessionManager } from '../../session/unified-session-manager';
+import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
+import { logger, LogCategory } from '../../logging';
 import {
   MissionStorageManager,
   ContractManager,
@@ -35,6 +38,8 @@ import {
   Contract,
   Assignment,
   CreateMissionParams,
+  VerificationSpec,
+  AcceptanceCriterion,
 } from '../mission';
 
 /**
@@ -129,6 +134,7 @@ export class MissionOrchestrator extends EventEmitter {
   private intentGate?: IntentGate;
   private snapshotManager?: SnapshotManager;
   private contextManager?: ContextManager;
+  private adapterFactory?: IAdapterFactory;
 
   // 规划结果缓存（基于 prompt hash）
   private planningCache: Map<string, { mission: Mission; timestamp: number }> = new Map();
@@ -182,6 +188,13 @@ export class MissionOrchestrator extends EventEmitter {
    */
   getContextManager(): ContextManager | undefined {
     return this.contextManager;
+  }
+
+  /**
+   * 设置 AdapterFactory
+   */
+  setAdapterFactory(adapterFactory: IAdapterFactory): void {
+    this.adapterFactory = adapterFactory;
   }
 
   /**
@@ -265,6 +278,17 @@ export class MissionOrchestrator extends EventEmitter {
           };
         }
 
+        // 兜底启发式：模糊请求需要澄清（避免直接执行）
+        const heuristicQuestions = this.getHeuristicClarificationQuestions(userPrompt);
+        if (heuristicQuestions.length > 0) {
+          return {
+            mode: IntentHandlerMode.CLARIFY,
+            skipMission: true,
+            clarificationQuestions: heuristicQuestions,
+            suggestion: '需要用户补充信息以继续执行',
+          };
+        }
+
         // 对于简单模式，跳过 Mission 创建
         if (mode === IntentHandlerMode.ASK || mode === IntentHandlerMode.DIRECT) {
           return {
@@ -289,6 +313,28 @@ export class MissionOrchestrator extends EventEmitter {
       skipMission: false,
       suggestion,
     };
+  }
+
+  private getHeuristicClarificationQuestions(userPrompt: string): string[] {
+    const prompt = (userPrompt || '').trim();
+    if (!prompt) return [];
+    const hasFileHint = /[\\w./-]+\\.(ts|js|tsx|jsx|py|java|go|rs|cpp|c|css|scss|html|json|md|yaml|yml|txt)/i.test(prompt);
+    const hasPathHint = /[\\\\/]/.test(prompt);
+    const hasSpecificTarget = /(接口|页面|模块|组件|数据库|查询|渲染|路由|加载|启动|api|sql|缓存|ui|后端|前端|服务|日志|profil|profile|指标|延迟|latency|throughput|qps|fps|cpu|内存)/i.test(prompt);
+
+    const isPerformanceVague = /(优化|性能|改进|提升)/i.test(prompt)
+      && !hasFileHint
+      && !hasPathHint
+      && !hasSpecificTarget
+      && prompt.length <= 40;
+
+    if (!isPerformanceVague) return [];
+
+    return [
+      '需要优化的具体功能/页面/接口是什么？',
+      '是否有复现步骤或性能指标（响应时间/吞吐/CPU/内存）？',
+      '是否有相关日志或 Profiling 结果？',
+    ];
   }
 
   /**
@@ -344,12 +390,28 @@ export class MissionOrchestrator extends EventEmitter {
     }
 
     if (analysis.acceptanceCriteria) {
-      mission.acceptanceCriteria = analysis.acceptanceCriteria.map((desc, i) => ({
-        id: `criterion_${i}`,
-        description: desc,
-        verifiable: true,
-        status: 'pending' as const,
-      }));
+      mission.acceptanceCriteria = analysis.acceptanceCriteria.map((desc, i) => {
+        const spec = this.parseVerificationSpec(desc);
+        return {
+          id: `criterion_${i}`,
+          description: desc,
+          verifiable: true,
+          verificationMethod: spec ? 'auto' : 'manual',
+          status: 'pending' as const,
+          verificationSpec: spec,
+        };
+      });
+    } else {
+      mission.acceptanceCriteria = [
+        {
+          id: 'criterion_0',
+          description: '任务完成',
+          verifiable: true,
+          verificationMethod: 'auto',
+          status: 'pending' as const,
+          verificationSpec: { type: 'task_completed' },
+        },
+      ];
     }
 
     mission.riskLevel = analysis.riskLevel || 'medium';
@@ -697,28 +759,13 @@ export class MissionOrchestrator extends EventEmitter {
 
     // 1. 验证验收标准
     for (const criterion of mission.acceptanceCriteria) {
-      // 检查相关的 Assignment 和 Todo 是否完成
-      const relatedAssignments = mission.assignments.filter(a =>
-        a.todos.some(t =>
-          t.content.toLowerCase().includes(criterion.description.toLowerCase().slice(0, 20))
-        )
-      );
-
-      const allCompleted = relatedAssignments.every(a =>
-        a.todos.every(t => t.status === 'completed' || t.status === 'skipped')
-      );
-
-      const passed = allCompleted && relatedAssignments.length > 0;
+      const { passed, reason } = this.verifyCriterion(criterion, mission);
 
       result.criteriaStatus.push({
         criterionId: criterion.id,
         description: criterion.description,
         passed,
-        reason: passed
-          ? undefined
-          : relatedAssignments.length === 0
-            ? '未找到相关任务'
-            : '相关任务未全部完成',
+        reason,
       });
 
       // 更新 Mission 中的验收标准状态
@@ -805,6 +852,361 @@ export class MissionOrchestrator extends EventEmitter {
   }
 
   /**
+   * 验证单个验收标准
+   * 优先使用结构化 verificationSpec，否则回退到任务完成检查
+   */
+  private verifyCriterion(
+    criterion: AcceptanceCriterion,
+    mission: Mission
+  ): { passed: boolean; reason?: string } {
+    // 如果不可验证，直接通过
+    if (!criterion.verifiable) {
+      return { passed: true };
+    }
+
+    const spec = criterion.verificationSpec;
+
+    // 有结构化规格时，使用结构化验证
+    if (spec) {
+      if (spec.type === 'task_completed') {
+        return this.verifyByTaskCompletion(criterion.description, mission);
+      }
+      return this.verifyWithSpec(spec);
+    }
+
+    // 没有结构化规格时，回退到任务完成检查
+    return this.verifyByTaskCompletion(criterion.description, mission);
+  }
+
+  /**
+   * 使用结构化规格验证
+   */
+  private verifyWithSpec(spec: VerificationSpec): { passed: boolean; reason?: string } {
+    switch (spec.type) {
+      case 'file_exists': {
+        if (!spec.targetPath) {
+          return { passed: false, reason: '验证规格缺少 targetPath' };
+        }
+        const resolvedPath = this.resolvePath(spec.targetPath);
+        const exists = fs.existsSync(resolvedPath);
+        return exists
+          ? { passed: true }
+          : { passed: false, reason: `文件不存在: ${resolvedPath}` };
+      }
+
+      case 'file_content': {
+        if (!spec.targetPath) {
+          return { passed: false, reason: '验证规格缺少 targetPath' };
+        }
+        if (spec.expectedContent === undefined) {
+          return { passed: false, reason: '验证规格缺少 expectedContent' };
+        }
+        const resolvedPath = this.resolvePath(spec.targetPath);
+        if (!fs.existsSync(resolvedPath)) {
+          return { passed: false, reason: `文件不存在: ${resolvedPath}` };
+        }
+        const actual = fs.readFileSync(resolvedPath, 'utf8');
+        const matchMode = spec.contentMatchMode || 'exact';
+        let matched = false;
+        switch (matchMode) {
+          case 'exact':
+            matched = actual === spec.expectedContent;
+            break;
+          case 'contains':
+            matched = actual.includes(spec.expectedContent);
+            break;
+          case 'regex':
+            try {
+              matched = new RegExp(spec.expectedContent).test(actual);
+            } catch {
+              return { passed: false, reason: `无效的正则表达式: ${spec.expectedContent}` };
+            }
+            break;
+        }
+        return matched
+          ? { passed: true }
+          : { passed: false, reason: `文件内容不匹配: ${resolvedPath}` };
+      }
+
+      case 'task_completed': {
+        // 由于没有 mission 上下文，task_completed 需要外部处理
+        // 这里返回待定状态
+        return { passed: false, reason: '任务完成验证需要 mission 上下文' };
+      }
+
+      case 'test_pass': {
+        // 测试验证需要执行命令，暂不支持自动化
+        return { passed: false, reason: '测试验证需要手动执行' };
+      }
+
+      case 'custom': {
+        // 自定义验证需要外部实现
+        return { passed: false, reason: '自定义验证需要外部实现' };
+      }
+
+      default:
+        return { passed: false, reason: `未知的验证类型: ${(spec as VerificationSpec).type}` };
+    }
+  }
+
+  private parseVerificationSpec(description: string): VerificationSpec | undefined {
+    const text = (description || '').trim();
+    if (!text) return undefined;
+
+    const strip = (value: string) => value.replace(/^["'`]|["'`]$/g, '');
+
+    // 模式1: 文件存在
+    const fileExistsMatch = text.match(
+      /(?:文件|file)\s+([^\s]+)\s*(?:存在|已创建|exists)/i
+    ) || text.match(/创建文件\s*([^\s]+)/i);
+    if (fileExistsMatch) {
+      const targetPath = strip(fileExistsMatch[1]);
+      return {
+        type: 'file_exists',
+        targetPath,
+      };
+    }
+
+    // 模式2: 文件内容为/等于
+    const contentWithPathMatch = text.match(
+      /(?:文件|file)\s+([^\s]+)\s*(?:内容|content)\s*(?:等于|为|匹配|is|equals)\s*["'`]?([^"'`]+)["'`]?/i
+    );
+    if (contentWithPathMatch) {
+      return {
+        type: 'file_content',
+        targetPath: strip(contentWithPathMatch[1]),
+        expectedContent: strip(contentWithPathMatch[2].trim()),
+        contentMatchMode: /匹配|match/i.test(text) ? 'contains' : 'exact',
+      };
+    }
+
+    // 模式3: 写入 内容 到 路径
+    const writeToMatch = text.match(/写入\s*["'`]?([^"'`]+)["'`]?\s*(?:到|至)\s*([^\s]+)/i);
+    if (writeToMatch) {
+      return {
+        type: 'file_content',
+        targetPath: strip(writeToMatch[2]),
+        expectedContent: strip(writeToMatch[1].trim()),
+        contentMatchMode: 'exact',
+      };
+    }
+    const writeAtMatch = text.match(/在\s*([^\s]+)\s*(?:写入|写|write)\s*["'`]?([^"'`]+)["'`]?/i);
+    if (writeAtMatch) {
+      return {
+        type: 'file_content',
+        targetPath: strip(writeAtMatch[1]),
+        expectedContent: strip(writeAtMatch[2].trim()),
+        contentMatchMode: 'exact',
+      };
+    }
+
+    // 模式4: 测试通过
+    if (/(?:测试通过|tests?\s+pass)/i.test(text)) {
+      return { type: 'test_pass' };
+    }
+
+    // 模式5: 任务完成
+    if (/(?:任务完成|task\s+complet)/i.test(text)) {
+      return { type: 'task_completed' };
+    }
+
+    return undefined;
+  }
+
+  /**
+   * 通过任务完成状态验证
+   */
+  private verifyByTaskCompletion(
+    description: string,
+    mission: Mission
+  ): { passed: boolean; reason?: string } {
+    // 检查相关的 Assignment 和 Todo 是否完成
+    const relatedAssignments = mission.assignments.filter(a =>
+      a.todos.some(t =>
+        t.content.toLowerCase().includes(description.toLowerCase().slice(0, 20))
+      )
+    );
+
+    if (relatedAssignments.length === 0) {
+      const allAssignmentsCompleted = mission.assignments.length > 0
+        && mission.assignments.every(a => a.status === 'completed');
+      return allAssignmentsCompleted
+        ? { passed: true }
+        : { passed: false, reason: '任务未全部完成' };
+    }
+
+    const allCompleted = relatedAssignments.every(a =>
+      a.todos.every(t => t.status === 'completed' || t.status === 'skipped')
+    );
+
+    const passed = allCompleted;
+    const reason = passed ? undefined : '相关任务未全部完成';
+
+    return { passed, reason };
+  }
+
+  /**
+   * 解析路径（相对路径转绝对路径）
+   */
+  private resolvePath(targetPath: string): string {
+    if (path.isAbsolute(targetPath)) {
+      return targetPath;
+    }
+    return this.workspaceRoot
+      ? path.join(this.workspaceRoot, targetPath)
+      : targetPath;
+  }
+
+  /**
+   * 将任务执行结果写入 Memory
+   * 记录：任务状态、关键决策、代码变更、失败原因
+   */
+  private async writeExecutionToMemory(mission: Mission): Promise<void> {
+    if (!this.contextManager) {
+      return;
+    }
+
+    const memory = this.contextManager.getMemoryDocument();
+    if (!memory) {
+      return;
+    }
+
+    for (const assignment of mission.assignments) {
+      // 1. 添加/更新任务状态
+      const taskExists = memory.getContent().currentTasks.some(t => t.id === assignment.id);
+
+      if (!taskExists && assignment.status !== 'completed' && assignment.status !== 'failed') {
+        // 添加进行中的任务
+        memory.addCurrentTask({
+          id: assignment.id,
+          description: assignment.responsibility,
+          status: assignment.status === 'executing' ? 'in_progress' : 'pending',
+          assignedWorker: assignment.workerId,
+        });
+      }
+
+      // 2. 更新已完成或失败的任务
+      if (assignment.status === 'completed') {
+        const completedTodos = assignment.todos.filter(t => t.status === 'completed');
+        const summary = completedTodos.length > 0
+          ? `完成 ${completedTodos.length} 个子任务`
+          : '任务完成';
+        memory.updateTaskStatus(assignment.id, 'completed', summary);
+      } else if (assignment.status === 'failed') {
+        const failedTodos = assignment.todos.filter(t => t.status === 'failed');
+        const errors = failedTodos
+          .map(t => t.output?.error)
+          .filter(Boolean)
+          .join('; ');
+        memory.updateTaskStatus(assignment.id, 'failed', errors || '执行失败');
+
+        // 3. 记录失败原因到 pendingIssues
+        if (errors) {
+          memory.addPendingIssue(`[${assignment.workerId}] ${assignment.responsibility}: ${errors}`);
+        }
+      }
+
+      // 4. 记录代码变更
+      for (const todo of assignment.todos) {
+        if (todo.status === 'completed' && todo.output?.modifiedFiles) {
+          for (const file of todo.output.modifiedFiles) {
+            memory.addCodeChange({
+              file,
+              summary: `${todo.type || 'task'} (${assignment.workerId})`,
+              action: 'modify',
+            });
+          }
+        }
+      }
+
+      // 5. 记录关键决策（如果有）
+      if (assignment.status === 'completed' && assignment.responsibility) {
+        const hasDecisionKeywords = /决策|选择|方案|架构|设计/.test(assignment.responsibility);
+        if (hasDecisionKeywords) {
+          memory.addDecision({
+            id: `decision-${assignment.id}`,
+            description: `${assignment.workerId}: ${assignment.responsibility}`,
+            reason: `完成 ${assignment.todos.filter(t => t.status === 'completed').length} 个子任务`,
+          });
+        }
+      }
+    }
+
+    // 6. 保存 Memory
+    if (memory.isDirty()) {
+      await memory.save();
+      logger.info('编排器.Memory.写回完成', { missionId: mission.id }, LogCategory.ORCHESTRATOR);
+    }
+  }
+
+  /**
+   * 检查并压缩 Memory（如果需要）
+   * 在任务完成后自动触发
+   */
+  private async compressMemoryIfNeeded(): Promise<void> {
+    if (!this.contextManager) {
+      return;
+    }
+
+    const memory = this.contextManager.getMemoryDocument();
+    if (!memory) {
+      return;
+    }
+
+    // 检查是否需要压缩
+    if (!memory.needsCompression(8000, 200)) {
+      return;
+    }
+
+    logger.info('编排器.Memory.开始压缩', undefined, LogCategory.ORCHESTRATOR);
+
+    // 导入 ContextCompressor
+    const { ContextCompressor } = await import('../../context/context-compressor');
+
+    const compressor = new ContextCompressor(
+      this.adapterFactory ? {
+        sendMessage: async (message: string) => {
+          // 使用 Claude 进行智能压缩
+          const response = await this.adapterFactory!.sendMessage(
+            'claude',
+            message,
+            undefined,
+            {
+              source: 'orchestrator',
+              streamToUI: false,
+              adapterRole: 'orchestrator',
+            }
+          );
+          return response.content || '';
+        },
+      } : null,
+      {
+        tokenLimit: 8000,
+        lineLimit: 200,
+        compressionRatio: 0.5,
+        retentionPriority: ['currentTasks', 'keyDecisions', 'importantContext', 'codeChanges', 'completedTasks', 'pendingIssues'],
+        truncation: {
+          enabled: true,
+          maxMessageChars: 4000,
+          maxToolOutputChars: 8000,
+          truncationNotice: '[内容已截断]',
+        },
+      }
+    );
+
+    try {
+      const success = await compressor.compress(memory);
+      if (success) {
+        await memory.save();
+        const stats = compressor.getLastStats();
+        logger.info('编排器.Memory.压缩完成', stats, LogCategory.ORCHESTRATOR);
+      }
+    } catch (error) {
+      logger.error('编排器.Memory.压缩失败', error, LogCategory.ORCHESTRATOR);
+    }
+  }
+
+  /**
    * 生成 Mission 总结
    * Phase 9: 汇总执行情况，生成报告
    */
@@ -813,6 +1215,9 @@ export class MissionOrchestrator extends EventEmitter {
     if (!mission) {
       throw new Error(`Mission not found: ${missionId}`);
     }
+
+    // 在生成总结前，先将执行结果写入 Memory
+    await this.writeExecutionToMemory(mission);
 
     this.emit('summarizationStarted', { missionId });
 
@@ -912,6 +1317,9 @@ export class MissionOrchestrator extends EventEmitter {
       remainingIssues,
       suggestedNextSteps,
     };
+
+    // 在 Mission 完成后，检查并压缩 Memory（如果需要）
+    await this.compressMemoryIfNeeded();
 
     this.emit('summarizationCompleted', { missionId, summary });
 

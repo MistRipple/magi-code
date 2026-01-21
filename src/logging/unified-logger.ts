@@ -35,6 +35,9 @@ export enum LogCategory {
   SESSION = 'session',
   RECOVERY = 'recovery',
   UI = 'ui',
+  LLM = 'llm',
+  TOOLS = 'tools',
+  SHELL = 'shell',
 }
 
 /** 日志记录 */

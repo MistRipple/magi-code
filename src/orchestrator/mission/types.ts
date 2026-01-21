@@ -8,7 +8,7 @@
  * - WorkerTodo: Worker 自主规划的工作项
  */
 
-import { CLIType } from '../../types';
+import { WorkerSlot } from '../../types';
 
 // ============================================================================
 // 状态枚举
@@ -172,6 +172,10 @@ export interface Mission {
   /** 当前阶段 */
   phase: MissionPhase;
 
+  // ===== 外部关联 =====
+  /** 关联的外部 Task ID（用于与 UnifiedTaskManager 同步） */
+  externalTaskId?: string;
+
   // ===== 时间戳 =====
   createdAt: number;
   updatedAt: number;
@@ -190,6 +194,37 @@ export interface Constraint {
 }
 
 /**
+ * 验证规格类型
+ */
+export type VerificationSpecType =
+  | 'file_exists'     // 文件存在验证
+  | 'file_content'    // 文件内容验证
+  | 'task_completed'  // 任务完成验证
+  | 'test_pass'       // 测试通过验证
+  | 'custom';         // 自定义验证
+
+/**
+ * 结构化验证规格
+ * 替代正则解析 description 的脆弱方式
+ */
+export interface VerificationSpec {
+  /** 验证类型 */
+  type: VerificationSpecType;
+  /** 目标文件路径（file_exists, file_content） */
+  targetPath?: string;
+  /** 期望内容（file_content） */
+  expectedContent?: string;
+  /** 内容匹配模式：exact=精确匹配, contains=包含, regex=正则 */
+  contentMatchMode?: 'exact' | 'contains' | 'regex';
+  /** 任务匹配模式（task_completed） */
+  taskPattern?: string;
+  /** 测试命令（test_pass） */
+  testCommand?: string;
+  /** 自定义验证函数名（custom） */
+  customValidator?: string;
+}
+
+/**
  * 验收标准
  */
 export interface AcceptanceCriterion {
@@ -198,6 +233,8 @@ export interface AcceptanceCriterion {
   verifiable: boolean;
   verificationMethod?: 'auto' | 'manual' | 'test';
   status: 'pending' | 'passed' | 'failed';
+  /** 结构化验证规格（优先于 description 解析） */
+  verificationSpec?: VerificationSpec;
 }
 
 // ============================================================================
@@ -224,9 +261,9 @@ export interface Contract {
 
   // ===== 参与方 =====
   /** 提供方（谁定义/实现这个契约） */
-  producer: CLIType;
+  producer: WorkerSlot;
   /** 消费方（谁使用这个契约） */
-  consumers: CLIType[];
+  consumers: WorkerSlot[];
 
   // ===== 状态 =====
   status: ContractStatus;
@@ -315,7 +352,7 @@ export interface Assignment {
   missionId: string;
 
   // ===== Worker 分配 =====
-  workerId: CLIType;
+  workerId: WorkerSlot;
   /** 分配原因（基于画像的决策记录） */
   assignmentReason: AssignmentReason;
 
@@ -380,7 +417,7 @@ export interface AssignmentReason {
   explanation: string;
   /** 备选方案 */
   alternatives: Array<{
-    workerId: CLIType;
+    workerId: WorkerSlot;
     score: number;
     reason: string;
   }>;
@@ -513,8 +550,8 @@ export interface CreateContractParams {
   type: ContractType;
   name: string;
   description: string;
-  producer: CLIType;
-  consumers: CLIType[];
+  producer: WorkerSlot;
+  consumers: WorkerSlot[];
   specification?: ContractSpecification;
 }
 
@@ -523,7 +560,7 @@ export interface CreateContractParams {
  */
 export interface CreateAssignmentParams {
   missionId: string;
-  workerId: CLIType;
+  workerId: WorkerSlot;
   responsibility: string;
   scope: AssignmentScope;
   assignmentReason: AssignmentReason;

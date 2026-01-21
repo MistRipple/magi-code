@@ -7,7 +7,7 @@
 
 import { logger, LogCategory } from '../logging';
 import { EventEmitter } from 'events';
-import type { CLIType } from '../cli/types';
+import type { AgentType } from '../types/agent-types';  // ✅ 使用 AgentType
 import {
   StandardMessage,
   StreamUpdate,
@@ -29,7 +29,7 @@ import { parseContentToBlocks } from '../utils/content-parser';
  * Normalizer 配置
  */
 export interface NormalizerConfig {
-  cli: CLIType;
+  agent: AgentType;  // ✅ 使用 agent 替代 cli
   defaultSource: MessageSource;
   debug?: boolean;
 }
@@ -55,6 +55,7 @@ export interface ParseContext {
   pendingText: string;
   hasAssistantText: boolean;
   pendingThinking: string | null;
+  thinkingBlockId?: string;
   activeToolCalls: Map<string, ToolCallBlock>;
   interaction: InteractionRequest | null;
   startTime: number;
@@ -72,8 +73,8 @@ export abstract class BaseNormalizer extends EventEmitter {
     this.config = config;
   }
 
-  get cli(): CLIType {
-    return this.config.cli;
+  get agent(): AgentType {  // ✅ 使用 agent 替代 cli
+    return this.config.agent;
   }
 
   startStream(traceId: string, source?: MessageSource): string {
@@ -86,6 +87,7 @@ export abstract class BaseNormalizer extends EventEmitter {
       pendingText: '',
       hasAssistantText: false,
       pendingThinking: null,
+      thinkingBlockId: undefined,
       activeToolCalls: new Map(),
       interaction: null,
       startTime: Date.now(),
@@ -95,13 +97,13 @@ export abstract class BaseNormalizer extends EventEmitter {
 
     const message = createStreamingMessage(
       source || this.config.defaultSource,
-      this.config.cli,
+      this.config.agent,  // ✅ 使用 agent
       traceId,
       { id: messageId }
     );
 
     this.emit('message', message);
-    this.debug(`[${this.cli}] 开始流式消息: ${messageId}`);
+    this.debug(`[${this.agent}] 开始流式消息: ${messageId}`);  // ✅ 使用 agent
 
     return messageId;
   }
@@ -109,7 +111,7 @@ export abstract class BaseNormalizer extends EventEmitter {
   processChunk(messageId: string, chunk: string): void {
     const context = this.activeContexts.get(messageId);
     if (!context) {
-      this.debug(`[${this.cli}] 未找到消息上下文: ${messageId}`);
+      this.debug(`[${this.agent}] 未找到消息上下文: ${messageId}`);  // ✅ 使用 agent
       return;
     }
 
@@ -124,7 +126,7 @@ export abstract class BaseNormalizer extends EventEmitter {
   endStream(messageId: string, error?: string): StandardMessage | null {
     const context = this.activeContexts.get(messageId);
     if (!context) {
-      this.debug(`[${this.cli}] 未找到消息上下文: ${messageId}`);
+      this.debug(`[${this.agent}] 未找到消息上下文: ${messageId}`);  // ✅ 使用 agent
       return null;
     }
 
@@ -133,7 +135,7 @@ export abstract class BaseNormalizer extends EventEmitter {
     this.activeContexts.delete(messageId);
 
     this.emit('complete', messageId, message);
-    this.debug(`[${this.cli}] 消息完成: ${messageId}, blocks: ${message.blocks.length}`);
+    this.debug(`[${this.agent}] 消息完成: ${messageId}, blocks: ${message.blocks.length}`);  // ✅ 使用 agent
 
     return message;
   }
@@ -150,7 +152,7 @@ export abstract class BaseNormalizer extends EventEmitter {
     this.activeContexts.delete(messageId);
 
     this.emit('complete', messageId, message);
-    this.debug(`[${this.cli}] 消息中断: ${messageId}`);
+    this.debug(`[${this.agent}] 消息中断: ${messageId}`);  // ✅ 使用 agent
 
     return message;
   }
@@ -207,6 +209,9 @@ export abstract class BaseNormalizer extends EventEmitter {
       messageType = MessageType.ERROR;
     } else if (context.interaction) {
       messageType = MessageType.INTERACTION;
+    } else if (blocks.some(b => b.type === 'plan')) {
+      // 🔧 新增：如果包含规划块，设置消息类型为 PLAN
+      messageType = MessageType.PLAN;
     } else if (blocks.some(b => b.type === 'tool_call')) {
       messageType = MessageType.TOOL_CALL;
     }
@@ -216,7 +221,7 @@ export abstract class BaseNormalizer extends EventEmitter {
       traceId: context.traceId,
       type: messageType,
       source: this.config.defaultSource,
-      cli: this.config.cli,
+      agent: this.config.agent,  // ✅ 使用 agent
       lifecycle: error ? MessageLifecycle.FAILED : MessageLifecycle.COMPLETED,
       blocks,
       interaction: context.interaction || undefined,
@@ -234,9 +239,9 @@ export abstract class BaseNormalizer extends EventEmitter {
     }
   }
 
-  protected addThinkingBlock(context: ParseContext, content: string, summary?: string): void {
+  protected addThinkingBlock(context: ParseContext, content: string, summary?: string, blockId?: string): void {
     if (content.trim()) {
-      context.blocks.push({ type: 'thinking', content: content.trim(), summary } as ThinkingBlock);
+      context.blocks.push({ type: 'thinking', content: content.trim(), summary, blockId } as ThinkingBlock);
     }
   }
 

@@ -7,7 +7,7 @@
  * - 添加新功能字段（priority, retry, timeout, pause）
  */
 
-import { CLIType } from '../types';
+import { AgentType } from '../types/agent-types';
 
 // ============================================================================
 // 状态定义
@@ -44,7 +44,8 @@ export type SubTaskStatus =
   | 'retrying'     // 重试中
   | 'completed'    // 已完成
   | 'failed'       // 失败
-  | 'skipped';     // 跳过
+  | 'skipped'      // 跳过
+  | 'cancelled';   // 已取消
 
 // ============================================================================
 // Task 接口
@@ -59,6 +60,9 @@ export interface Task {
   id: string;
   sessionId: string;
   prompt: string;
+
+  /** 关联的 Mission ID（用于 Task-Mission 统一） */
+  missionId?: string;
 
   // 状态管理
   status: TaskStatus;
@@ -109,8 +113,17 @@ export interface SubTask {
   description: string;
   title?: string;
 
+  /**
+   * 关联的 Assignment ID（用于与 Mission 系统的稳定匹配）
+   *
+   * 当 SubTask 由 MissionExecutor 创建时，此字段必须提供，
+   * 用于在状态更新时通过 getSubTaskByAssignmentId() 进行稳定匹配。
+   * 对于非 Mission 路径创建的 SubTask（如简单任务模式），此字段可省略。
+   */
+  assignmentId?: string;
+
   // Worker 分配（统一命名，删除 assignedCli）
-  assignedWorker: CLIType;
+  assignedWorker: AgentType;
   reason?: string;
   prompt?: string;
 
@@ -158,7 +171,7 @@ export interface SubTask {
 // ============================================================================
 
 export interface WorkerResult {
-  cliType: CLIType;
+  agentType: AgentType;
   success: boolean;
   output?: string;
   modifiedFiles?: string[];
@@ -177,7 +190,10 @@ export interface WorkerResult {
  * Task 创建参数
  */
 export interface CreateTaskParams {
+  id?: string;
   prompt: string;
+  /** 关联的 Mission ID */
+  missionId?: string;
   priority?: number;
   maxRetries?: number;
   timeout?: number;
@@ -188,7 +204,9 @@ export interface CreateTaskParams {
  */
 export interface CreateSubTaskParams {
   description: string;
-  assignedWorker: CLIType;
+  assignedWorker: AgentType;  // ✅ 使用 AgentType
+  /** 关联的 Assignment ID（用于稳定匹配） */
+  assignmentId?: string;
   targetFiles?: string[];
   dependencies?: string[];
   priority?: number;

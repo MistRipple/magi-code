@@ -155,7 +155,7 @@ async function runTests(): Promise<void> {
   console.log('='.repeat(60));
 
   const results: TestResult[] = [];
-  const profileLoader = new ProfileLoader();
+  const profileLoader = ProfileLoader.getInstance();
   const guidanceInjector = new GuidanceInjector();
 
   // =========== 契约测试 ===========

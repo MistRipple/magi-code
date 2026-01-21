@@ -73,6 +73,7 @@ export interface TaskManagerEvents {
   'subtask:completed': (task: Task, subTask: SubTask) => void;
   'subtask:failed': (task: Task, subTask: SubTask) => void;
   'subtask:skipped': (task: Task, subTask: SubTask) => void;
+  'subtask:cancelled': (task: Task, subTask: SubTask) => void;
   'subtask:timeout': (task: Task, subTask: SubTask) => void;
 }
 
@@ -87,7 +88,15 @@ export class UnifiedTaskManager extends EventEmitter {
   private timeoutChecker: TimeoutChecker;
   private sessionId: string;
 
-  // 内存缓存（用于快速访问）
+  /** 缓存大小上限 */
+  private static readonly MAX_CACHE_SIZE = 1000;
+
+  /**
+   * 内存缓存（用于快速访问，带 LRU 淘汰）
+   * 利用 ES6 Map 的插入顺序特性实现 O(1) LRU：
+   * - 最早插入的在前面（迭代时第一个）
+   * - delete + set 会把元素移到最后（最新访问）
+   */
   private taskCache: Map<string, Task> = new Map();
 
   constructor(
@@ -95,6 +104,7 @@ export class UnifiedTaskManager extends EventEmitter {
     repository: TaskRepository,
     options?: {
       timeoutCheckInterval?: number;
+      maxCacheSize?: number;
     }
   ) {
     super();
@@ -106,12 +116,52 @@ export class UnifiedTaskManager extends EventEmitter {
   }
 
   /**
+   * 缓存任务（带 LRU 淘汰）
+   * 利用 ES6 Map 插入顺序特性实现 O(1) 操作
+   */
+  private cacheTask(task: Task): void {
+    const taskId = task.id;
+
+    // 如果已存在，先删除（delete + set 会移到末尾）
+    if (this.taskCache.has(taskId)) {
+      this.taskCache.delete(taskId);
+    }
+
+    // 添加到缓存（插入到末尾 = 最新访问）
+    this.taskCache.set(taskId, task);
+
+    // LRU 淘汰：超过上限时移除最久未访问的任务（Map 迭代顺序 = 插入顺序）
+    while (this.taskCache.size > UnifiedTaskManager.MAX_CACHE_SIZE) {
+      const oldestId = this.taskCache.keys().next().value;
+      if (oldestId) {
+        this.taskCache.delete(oldestId);
+      } else {
+        break;
+      }
+    }
+  }
+
+  /**
+   * 从缓存获取任务（更新访问顺序）
+   * 利用 ES6 Map delete + set 实现 O(1) 访问顺序更新
+   */
+  private getCachedTask(taskId: string): Task | undefined {
+    const task = this.taskCache.get(taskId);
+    if (task) {
+      // 更新访问顺序：delete + set 移到末尾
+      this.taskCache.delete(taskId);
+      this.taskCache.set(taskId, task);
+    }
+    return task;
+  }
+
+  /**
    * 初始化（从持久化层恢复状态）
    */
   async initialize(): Promise<void> {
     const tasks = await this.repository.getTasksBySession(this.sessionId);
     for (const task of tasks) {
-      this.taskCache.set(task.id, task);
+      this.cacheTask(task);
 
       // 恢复到优先级队列
       if (task.status === 'pending') {
@@ -171,9 +221,10 @@ export class UnifiedTaskManager extends EventEmitter {
    */
   async createTask(params: CreateTaskParams): Promise<Task> {
     const task: Task = {
-      id: this.generateId(),
+      id: params.id || this.generateId(),
       sessionId: this.sessionId,
       prompt: params.prompt,
+      missionId: params.missionId,
       status: 'pending',
       priority: params.priority ?? 5,
       subTasks: [],
@@ -188,7 +239,7 @@ export class UnifiedTaskManager extends EventEmitter {
     await this.repository.saveTask(task);
 
     // 缓存
-    this.taskCache.set(task.id, task);
+    this.cacheTask(task);
 
     // 加入优先级队列
     this.taskQueue.enqueue({
@@ -214,14 +265,14 @@ export class UnifiedTaskManager extends EventEmitter {
    * 获取 Task
    */
   async getTask(taskId: string): Promise<Task | null> {
-    // 先从缓存获取
-    const cachedTask = this.taskCache.get(taskId);
+    // 先从缓存获取（使用 LRU 访问）
+    const cachedTask = this.getCachedTask(taskId);
     if (cachedTask) return cachedTask;
 
     // 从持久化层获取
     const task = await this.repository.getTask(taskId);
     if (task) {
-      this.taskCache.set(taskId, task);
+      this.cacheTask(task);
     }
     return task;
   }
@@ -234,10 +285,20 @@ export class UnifiedTaskManager extends EventEmitter {
   }
 
   /**
-   * 获取下一个待执行的 Task
+   * 获取下一个待执行的 Task（不移除）
    */
   getNextPendingTask(): Task | null {
     const item = this.taskQueue.peek();
+    if (!item) return null;
+    return this.taskCache.get(item.taskId) || null;
+  }
+
+  /**
+   * 出队并返回优先级最高的待执行 Task
+   * 使用 dequeue() 原子操作，避免 peek + remove 的竞态条件
+   */
+  dequeueTask(): Task | null {
+    const item = this.taskQueue.dequeue();
     if (!item) return null;
     return this.taskCache.get(item.taskId) || null;
   }
@@ -491,6 +552,7 @@ export class UnifiedTaskManager extends EventEmitter {
       taskId,
       description: params.description,
       title: params.description.substring(0, 50),
+      assignmentId: params.assignmentId,
       assignedWorker: params.assignedWorker,
       reason: params.reason,
       prompt: params.prompt,
@@ -545,6 +607,16 @@ export class UnifiedTaskManager extends EventEmitter {
   }
 
   /**
+   * 根据 Assignment ID 获取 SubTask
+   * 用于 Mission 执行时的稳定匹配
+   */
+  async getSubTaskByAssignmentId(taskId: string, assignmentId: string): Promise<SubTask | null> {
+    const task = await this.getTask(taskId);
+    if (!task) return null;
+    return task.subTasks.find(st => st.assignmentId === assignmentId) || null;
+  }
+
+  /**
    * 更新 SubTask（通用更新方法）
    */
   async updateSubTask(taskId: string, updates: Partial<SubTask> & { id: string }): Promise<void> {
@@ -561,7 +633,7 @@ export class UnifiedTaskManager extends EventEmitter {
   }
 
   /**
-   * 获取下一个待执行的 SubTask
+   * 获取下一个待执行的 SubTask（不移除）
    */
   getNextPendingSubTask(): { task: Task; subTask: SubTask } | null {
     const item = this.subTaskQueue.peek();
@@ -574,6 +646,39 @@ export class UnifiedTaskManager extends EventEmitter {
     if (!subTask) return null;
 
     return { task, subTask };
+  }
+
+  /**
+   * 出队并返回优先级最高的待执行 SubTask
+   * 使用 dequeue() 原子操作，避免 peek + remove 的竞态条件
+   */
+  dequeueSubTask(): { task: Task; subTask: SubTask } | null {
+    const item = this.subTaskQueue.dequeue();
+    if (!item) return null;
+
+    const task = this.taskCache.get(item.taskId);
+    if (!task) return null;
+
+    const subTask = task.subTasks.find(st => st.id === item.subTaskId);
+    if (!subTask) return null;
+
+    return { task, subTask };
+  }
+
+  /**
+   * 批量出队多个 SubTask（按优先级顺序）
+   * 用于并行执行多个高优先级任务
+   */
+  dequeueBatchSubTasks(count: number): Array<{ task: Task; subTask: SubTask }> {
+    const results: Array<{ task: Task; subTask: SubTask }> = [];
+
+    for (let i = 0; i < count; i++) {
+      const result = this.dequeueSubTask();
+      if (!result) break;
+      results.push(result);
+    }
+
+    return results;
   }
 
   /**
@@ -766,6 +871,40 @@ export class UnifiedTaskManager extends EventEmitter {
       // 已达到最大重试次数，标记 Task 为失败
       await this.failTask(taskId);
     }
+  }
+
+  /**
+   * 取消 SubTask
+   */
+  async cancelSubTask(taskId: string, subTaskId: string, reason?: string): Promise<void> {
+    const task = await this.getTask(taskId);
+    if (!task) throw new Error(`Task not found: ${taskId}`);
+
+    const subTask = task.subTasks.find(st => st.id === subTaskId);
+    if (!subTask) throw new Error(`SubTask not found: ${subTaskId}`);
+
+    // 只有 pending 或 running 状态的 SubTask 可以被取消
+    if (subTask.status !== 'pending' && subTask.status !== 'running' && subTask.status !== 'paused') {
+      return; // 已经是终态，不需要取消
+    }
+
+    subTask.status = 'cancelled';
+    subTask.completedAt = Date.now();
+    if (reason) {
+      subTask.error = reason;
+    }
+
+    // 移除超时监控
+    this.timeoutChecker.remove(subTaskId);
+
+    // 从队列中移除
+    this.subTaskQueue.remove(subTaskId);
+
+    // 持久化
+    await this.repository.saveTask(task);
+
+    // 发送事件
+    this.emit('subtask:cancelled', task, subTask);
   }
 
   /**
