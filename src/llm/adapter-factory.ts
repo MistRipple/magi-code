@@ -13,6 +13,7 @@ import { createLLMClient } from './clients/client-factory';
 import { createNormalizer } from '../normalizer';
 import { ToolManager } from '../tools/tool-manager';
 import { SkillsManager } from '../tools/skills-manager';
+import { MCPToolExecutor } from '../tools/mcp-executor';
 import { logger, LogCategory } from '../logging';
 import { IAdapterFactory, AdapterOutputScope, AdapterResponse } from '../adapters/adapter-factory-interface';
 import { AgentProfileLoader } from '../orchestrator/profile/agent-profile-loader';
@@ -24,6 +25,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   private adapters = new Map<AgentType, BaseLLMAdapter>();
   private toolManager: ToolManager;
   private skillsManager: SkillsManager | null = null;
+  private mcpExecutor: MCPToolExecutor | null = null;
   private workspaceRoot: string;
   private profileLoader: AgentProfileLoader;
 
@@ -44,6 +46,9 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
 
     // 加载并注册 Skills
     await this.loadSkills();
+
+    // 加载并注册 MCP
+    await this.loadMCP();
 
     logger.info('LLM Adapter Factory initialized', { configDir: LLMConfigLoader.getConfigDir() }, LogCategory.LLM);
   }
@@ -86,6 +91,55 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     this.adapters.clear();
 
     logger.info('Skills reloaded', {}, LogCategory.TOOLS);
+  }
+
+  /**
+   * 加载并注册 MCP 执行器
+   */
+  private async loadMCP(): Promise<void> {
+    try {
+      // 创建 MCP 执行器
+      this.mcpExecutor = new MCPToolExecutor();
+
+      // 初始化（连接所有配置的 MCP 服务器）
+      await this.mcpExecutor.initialize();
+
+      // 注册到 ToolManager
+      this.toolManager.registerMCPExecutor('mcp-servers', this.mcpExecutor);
+
+      const tools = await this.mcpExecutor.getTools();
+      logger.info('MCP loaded and registered', {
+        toolCount: tools.length
+      }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('Failed to load MCP', { error: error.message }, LogCategory.TOOLS);
+    }
+  }
+
+  /**
+   * 重新加载 MCP（用于添加/删除 MCP 服务器后）
+   */
+  async reloadMCP(): Promise<void> {
+    // 注销旧的 MCP 执行器
+    if (this.mcpExecutor) {
+      await this.mcpExecutor.shutdown();
+      this.toolManager.unregisterMCPExecutor('mcp-servers');
+    }
+
+    // 重新加载
+    await this.loadMCP();
+
+    // 清除适配器缓存，强制重新创建（以获取新的工具列表）
+    this.adapters.clear();
+
+    logger.info('MCP reloaded', {}, LogCategory.TOOLS);
+  }
+
+  /**
+   * 获取 MCP 执行器（用于 UI 交互）
+   */
+  getMCPExecutor(): MCPToolExecutor | null {
+    return this.mcpExecutor;
   }
 
   /**
@@ -284,6 +338,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
    * 关闭所有适配器（实现 IAdapterFactory 接口）
    */
   async shutdown(): Promise<void> {
+    // 关闭 LLM 适配器
     for (const [agent, adapter] of this.adapters) {
       try {
         await adapter.disconnect();
@@ -295,6 +350,19 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       }
     }
     this.adapters.clear();
+
+    // 关闭 MCP 连接
+    if (this.mcpExecutor) {
+      try {
+        await this.mcpExecutor.shutdown();
+        logger.info('MCP executor shut down', undefined, LogCategory.TOOLS);
+      } catch (error: any) {
+        logger.error('Failed to shut down MCP executor', {
+          error: error.message,
+        }, LogCategory.TOOLS);
+      }
+    }
+
     logger.info('All adapters shut down', undefined, LogCategory.LLM);
   }
 
@@ -361,5 +429,65 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   async reloadOrchestratorConfig(): Promise<void> {
     await this.clearAdapter('orchestrator');
     logger.info('Orchestrator config reloaded', undefined, LogCategory.LLM);
+  }
+
+  /**
+   * 清除特定适配器的对话历史（不断开连接）
+   */
+  clearAdapterHistory(agent: AgentType): void {
+    const adapter = this.adapters.get(agent);
+    if (adapter) {
+      if ('clearHistory' in adapter && typeof adapter.clearHistory === 'function') {
+        adapter.clearHistory();
+        logger.info(`Cleared adapter history: ${agent}`, undefined, LogCategory.LLM);
+      }
+    }
+  }
+
+  /**
+   * 清除所有适配器的对话历史（不断开连接）
+   */
+  clearAllAdapterHistories(): void {
+    for (const [agent, adapter] of this.adapters) {
+      if ('clearHistory' in adapter && typeof adapter.clearHistory === 'function') {
+        adapter.clearHistory();
+      }
+    }
+    logger.info('Cleared all adapter histories', undefined, LogCategory.LLM);
+  }
+
+  /**
+   * 获取适配器历史信息（用于监控 token 消耗）
+   */
+  getAdapterHistoryInfo(agent: AgentType): { messages: number; chars: number } | null {
+    const adapter = this.adapters.get(agent);
+    if (!adapter) {
+      return null;
+    }
+
+    if ('getHistoryLength' in adapter && 'getHistoryChars' in adapter) {
+      return {
+        messages: (adapter as any).getHistoryLength(),
+        chars: (adapter as any).getHistoryChars(),
+      };
+    }
+
+    return null;
+  }
+
+  /**
+   * 获取所有适配器的历史信息
+   */
+  getAllAdapterHistoryInfo(): Map<AgentType, { messages: number; chars: number }> {
+    const result = new Map<AgentType, { messages: number; chars: number }>();
+
+    for (const [agent] of this.adapters) {
+      const info = this.getAdapterHistoryInfo(agent);
+      if (info) {
+        result.set(agent, info);
+      }
+    }
+
+    return result;
   }
 }

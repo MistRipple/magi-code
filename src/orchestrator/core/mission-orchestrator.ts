@@ -11,7 +11,7 @@
 import { EventEmitter } from 'events';
 import fs from 'fs';
 import path from 'path';
-import { CLIType } from '../../types';
+import { WorkerSlot } from '../../types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
 import { ProfileAwareReviewer } from '../review/profile-aware-reviewer';
@@ -56,7 +56,7 @@ export interface MissionCreationResult {
  */
 export interface PlanningOptions {
   /** 参与者列表（如果不指定，自动选择） */
-  participants?: CLIType[];
+  participants?: WorkerSlot[];
   /** 项目上下文 */
   projectContext?: string;
   /** 是否需要用户确认 */
@@ -109,7 +109,7 @@ export interface MissionSummary {
   /** 恢复尝试次数 */
   recoveryAttempts: number;
   /** Worker 贡献 */
-  workerContributions: Record<CLIType, {
+  workerContributions: Record<WorkerSlot, {
     assignmentCount: number;
     completedTodos: number;
     failedTodos: number;
@@ -431,10 +431,10 @@ export class MissionOrchestrator extends EventEmitter {
    */
   async selectParticipants(
     mission: Mission,
-    options?: { preferredWorkers?: CLIType[] }
-  ): Promise<CLIType[]> {
+    options?: { preferredWorkers?: WorkerSlot[] }
+  ): Promise<WorkerSlot[]> {
     const allProfiles = this.profileLoader.getAllProfiles();
-    const participants: CLIType[] = [];
+    const participants: WorkerSlot[] = [];
 
     // 如果指定了首选 Worker
     if (options?.preferredWorkers && options.preferredWorkers.length > 0) {
@@ -455,7 +455,7 @@ export class MissionOrchestrator extends EventEmitter {
         );
 
         if (hasMatch || hasStrength) {
-          participants.push(cli as CLIType);
+          participants.push(cli as WorkerSlot);
         }
       }
 
@@ -463,7 +463,7 @@ export class MissionOrchestrator extends EventEmitter {
       if (participants.length === 0) {
         const firstCli = allProfiles.keys().next().value;
         if (firstCli) {
-          participants.push(firstCli as CLIType);
+          participants.push(firstCli as WorkerSlot);
         }
       }
     }
@@ -481,7 +481,7 @@ export class MissionOrchestrator extends EventEmitter {
    */
   async defineContracts(
     mission: Mission,
-    participants: CLIType[]
+    participants: WorkerSlot[]
   ): Promise<Contract[]> {
     const contracts = await this.contractManager.defineContracts(mission, participants);
 
@@ -499,7 +499,7 @@ export class MissionOrchestrator extends EventEmitter {
    */
   async assignResponsibilities(
     mission: Mission,
-    participants: CLIType[]
+    participants: WorkerSlot[]
   ): Promise<Assignment[]> {
     const assignments = await this.assignmentManager.createAssignments(
       mission,

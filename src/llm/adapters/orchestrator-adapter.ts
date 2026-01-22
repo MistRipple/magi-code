@@ -11,6 +11,18 @@ import { BaseLLMAdapter, AdapterState } from './base-adapter';
 import { logger, LogCategory } from '../../logging';
 
 /**
+ * 历史管理配置
+ */
+export interface OrchestratorHistoryConfig {
+  /** 最大历史消息数量（默认 30） */
+  maxMessages?: number;
+  /** 最大历史字符数（默认 80000） */
+  maxChars?: number;
+  /** 保留最近 N 轮对话（默认 3） */
+  preserveRecentRounds?: number;
+}
+
+/**
  * Orchestrator 适配器配置
  */
 export interface OrchestratorAdapterConfig {
@@ -19,6 +31,7 @@ export interface OrchestratorAdapterConfig {
   toolManager: ToolManager;
   config: LLMConfig;
   systemPrompt?: string;
+  historyConfig?: OrchestratorHistoryConfig;
 }
 
 /**
@@ -28,6 +41,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   private systemPrompt: string;
   private conversationHistory: LLMMessage[] = [];
   private abortController?: AbortController;
+  private historyConfig: Required<OrchestratorHistoryConfig>;
 
   constructor(adapterConfig: OrchestratorAdapterConfig) {
     super(
@@ -37,6 +51,11 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       adapterConfig.config
     );
     this.systemPrompt = adapterConfig.systemPrompt || this.getDefaultSystemPrompt();
+    this.historyConfig = {
+      maxMessages: adapterConfig.historyConfig?.maxMessages ?? 30,
+      maxChars: adapterConfig.historyConfig?.maxChars ?? 80000,
+      preserveRecentRounds: adapterConfig.historyConfig?.preserveRecentRounds ?? 3,
+    };
   }
 
   /**
@@ -65,6 +84,9 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     this.currentTraceId = this.generateTraceId();
 
     try {
+      // 自动截断历史以控制 token 消耗
+      this.truncateHistoryIfNeeded();
+
       // 添加用户消息到历史
       this.conversationHistory.push({
         role: 'user',
@@ -176,6 +198,51 @@ Guidelines:
    */
   getHistoryLength(): number {
     return this.conversationHistory.length;
+  }
+
+  /**
+   * 获取历史总字符数
+   */
+  getHistoryChars(): number {
+    return this.conversationHistory.reduce((total, msg) => {
+      if (typeof msg.content === 'string') {
+        return total + msg.content.length;
+      } else if (Array.isArray(msg.content)) {
+        return total + JSON.stringify(msg.content).length;
+      }
+      return total;
+    }, 0);
+  }
+
+  /**
+   * 截断历史（如果超过限制）
+   * 保留最近的 N 轮对话
+   */
+  private truncateHistoryIfNeeded(): void {
+    const { maxMessages, maxChars, preserveRecentRounds } = this.historyConfig;
+
+    // 检查是否需要截断
+    const currentLength = this.conversationHistory.length;
+    const currentChars = this.getHistoryChars();
+
+    if (currentLength <= maxMessages && currentChars <= maxChars) {
+      return; // 无需截断
+    }
+
+    // 计算需要保留的消息数量（每轮对话约 2 条消息：user + assistant）
+    const preserveCount = Math.min(preserveRecentRounds * 2, currentLength);
+
+    // 截断旧消息，保留最近的
+    const truncatedCount = currentLength - preserveCount;
+    if (truncatedCount > 0) {
+      this.conversationHistory = this.conversationHistory.slice(-preserveCount);
+      logger.debug('Orchestrator history truncated', {
+        removedMessages: truncatedCount,
+        remainingMessages: this.conversationHistory.length,
+        previousChars: currentChars,
+        currentChars: this.getHistoryChars(),
+      }, LogCategory.LLM);
+    }
   }
 
   /**

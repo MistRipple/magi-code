@@ -33,7 +33,7 @@ Module.prototype.require = function(id) {
 const path = require('path');
 const { ProfileLoader, GuidanceInjector } = require('../out/orchestrator/profile');
 const { TaskAnalyzer } = require('../out/task/task-analyzer');
-const { CLISelector } = require('../out/task/cli-selector');
+const { WorkerSelector } = require('../out/task/worker-selector');
 const { TestRunner } = require('./test-utils');
 
 const workspaceRoot = path.resolve(__dirname, '..');
@@ -117,20 +117,20 @@ async function main() {
       );
     }
 
-    // 4. 测试 CLISelector
-    runner.logSection('4. CLISelector 测试');
-    const cliSelector = new CLISelector();
-    cliSelector.setProfileLoader(profileLoader);
-    cliSelector.setAvailableCLIs(['claude', 'codex', 'gemini']);
+    // 4. 测试 WorkerSelector
+    runner.logSection('4. WorkerSelector 测试');
+    const workerSelector = new WorkerSelector();
+    workerSelector.setProfileLoader(profileLoader);
+    workerSelector.setAvailableWorkers(['claude', 'codex', 'gemini']);
 
     // 测试选择
     const testAnalysis = { category: 'implement', complexity: 2 };
-    const selection = cliSelector.select(testAnalysis);
-    const ok = !!selection?.cli;
+    const selection = workerSelector.select(testAnalysis);
+    const ok = !!selection?.worker;
     runner.logTest(
-      'CLI 选择 (implement 任务)',
+      'Worker 选择 (implement 任务)',
       ok,
-      `选择: ${selection?.cli || '无'}, 原因: ${selection?.reason || '无'}`
+      `选择: ${selection?.worker || '无'}, 原因: ${selection?.reason || '无'}`
     );
 
     // 使用 TestRunner 的统一输出

@@ -4,18 +4,15 @@
  */
 
 // ============================================
-// CLI 类型与角色系统
+// Agent 类型与角色系统
 // ============================================
 
 // ✅ 导入并重新导出新的 AgentType 系统
 import type { AgentType, WorkerSlot, AgentRole } from './types/agent-types';
 export type { AgentType, WorkerSlot, AgentRole };
 
-// ❌ 已废弃：使用 AgentType 替代
-// export type CLIType = 'claude' | 'codex' | 'gemini';
-export type CLIType = WorkerSlot;  // 向后兼容别名
 
-// 任务类型（用于任务分类和 CLI 分配）
+// 任务类型（用于任务分类和 Worker 分配）
 export type TaskCategory =
   | 'architecture'  // 架构设计
   | 'implement'     // 功能实现
@@ -116,12 +113,12 @@ export interface PendingChange {
 }
 
 // ============================================
-// CLI 角色系统
+// Worker 角色系统
 // ============================================
 
-// CLI 角色定义
-export interface CLIRole {
-  type: CLIType;
+// Worker 角色定义
+export interface WorkerRole {
+  type: WorkerSlot;
   name: string;
   strengths: string[];
   taskAffinity: TaskCategory[];
@@ -129,8 +126,9 @@ export interface CLIRole {
   priority: number;  // 1 最高，用于降级时选择
 }
 
+
 // 预设角色配置
-export const CLI_ROLES: Record<CLIType, CLIRole> = {
+export const WORKER_ROLES: Record<WorkerSlot, WorkerRole> = {
   claude: {
     type: 'claude',
     name: '架构师/编排者',
@@ -157,14 +155,15 @@ export const CLI_ROLES: Record<CLIType, CLIRole> = {
   }
 };
 
+
 // ============================================
-// CLI 状态系统 (更细粒度)
+// Worker 状态系统 (更细粒度)
 // ============================================
 
-// CLI 详细状态枚举
-export enum CLIStatusCode {
+// Worker 详细状态枚举
+export enum WorkerStatusCode {
   AVAILABLE = 'AVAILABLE',           // 可用
-  NOT_INSTALLED = 'NOT_INSTALLED',   // 未安装
+  NOT_CONFIGURED = 'NOT_CONFIGURED', // 未配置
   AUTH_FAILED = 'AUTH_FAILED',       // 认证失败
   QUOTA_EXCEEDED = 'QUOTA_EXCEEDED', // 配额耗尽
   TIMEOUT = 'TIMEOUT',               // 响应超时
@@ -172,16 +171,18 @@ export enum CLIStatusCode {
   NETWORK_ERROR = 'NETWORK_ERROR'    // 网络问题
 }
 
-// CLI 状态
-export interface CLIStatus {
-  type: CLIType;
-  code: CLIStatusCode;
+
+// Worker 详细状态
+export interface WorkerDetailedStatus {
+  type: WorkerSlot;
+  code: WorkerStatusCode;
   available: boolean;
-  version?: string;
-  path: string;
+  model?: string;
+  provider?: string;
   error?: string;
   lastChecked?: Date;
 }
+
 
 // 降级等级
 export enum DegradationLevel {
@@ -195,12 +196,12 @@ export enum DegradationLevel {
 // 降级策略结果
 export interface DegradationStrategy {
   level: DegradationLevel;
-  availableCLIs: CLIType[];
-  missingCLIs: CLIType[];
+  availableWorkers: WorkerSlot[];
+  missingWorkers: WorkerSlot[];
   hasOrchestrator: boolean;  // Claude 是否可用作编排者
   recommendation: string;
   canProceed: boolean;
-  fallbackMap: Partial<Record<CLIType, CLIType>>;  // 降级映射
+  fallbackMap: Partial<Record<WorkerSlot, WorkerSlot>>;  // 降级映射
 }
 
 // Diff 块
@@ -303,8 +304,7 @@ export const INTERACTION_MODE_CONFIGS: Record<InteractionMode, InteractionModeCo
 
 // Worker 配置
 export interface WorkerConfig {
-  cliType: CLIType;
-  cliPath: string;
+  workerSlot: WorkerSlot;
   timeout: number;
   workingDirectory: string;
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
@@ -318,7 +318,7 @@ export interface OrchestratorConfig {
   conflictResolution: 'ask' | 'auto-merge' | 'first-wins';
   permissions?: PermissionMatrix;
   strategy?: StrategyConfig;
-  cliSelection?: {
+  workerSelection?: {
     enabled?: boolean;
     healthThreshold?: number;
   };
@@ -346,10 +346,10 @@ export type EventType =
   | 'snapshot:accepted'
   | 'change:approved'
   | 'change:reverted'
-  | 'cli:statusChanged'
-  | 'cli:healthCheck'
-  | 'cli:error'
-  | 'cli:session_event'
+  | 'worker:statusChanged'
+  | 'worker:healthCheck'
+  | 'worker:error'
+  | 'worker:session_event'
   | 'orchestrator:waiting_confirmation'
   | 'orchestrator:phase_changed'
   | 'orchestrator:mode_changed'
@@ -381,7 +381,7 @@ export type EventListener = (event: AppEvent) => void;
 
 // UI 状态
 export interface UIChatSession extends Session {
-  cliOutputs?: Record<string, any[]>;
+  workerOutputs?: Record<string, any[]>;
 }
 
 export interface UIState {
@@ -423,7 +423,7 @@ export interface LogEntry {
 
 // Webview 发送到 Extension 的消息
 export type WebviewToExtensionMessage =
-  | { type: 'executeTask'; prompt: string; cli?: CLIType }
+  | { type: 'executeTask'; prompt: string; worker?: WorkerSlot }
   | { type: 'interruptTask'; taskId: string }
   | { type: 'continueTask'; taskId: string; prompt: string }
   | { type: 'login'; apiKey: string; provider?: string; remember?: boolean }
@@ -437,11 +437,11 @@ export type WebviewToExtensionMessage =
   | { type: 'approveAllChanges' }
   | { type: 'revertAllChanges' }
   | { type: 'newSession' }
-  | { type: 'saveCurrentSession'; messages: any[] }  // ✅ 移除 cliOutputs 参数
+  | { type: 'saveCurrentSession'; messages: any[] }
   | { type: 'switchSession'; sessionId: string }
   | { type: 'renameSession'; sessionId: string; name: string }
   | { type: 'closeSession'; sessionId: string }
-  | { type: 'selectCli'; cli: CLIType | null }
+  | { type: 'selectWorker'; worker: WorkerSlot | null }
   | { type: 'updateSetting'; key: string; value: unknown }
   | { type: 'viewDiff'; filePath: string }
   | { type: 'openFile'; filepath: string }
@@ -455,7 +455,7 @@ export type WebviewToExtensionMessage =
   | { type: 'requestExecutionStats' }
   | { type: 'resetExecutionStats' }
 
-  | { type: 'checkCliStatus' }
+  | { type: 'checkWorkerStatus' }
 
   | { type: 'clearAllTasks' }
 
@@ -463,8 +463,6 @@ export type WebviewToExtensionMessage =
   | { type: 'updatePromptEnhance'; config: { baseUrl: string; apiKey: string } }
   | { type: 'testPromptEnhance'; baseUrl: string; apiKey: string }
   | { type: 'enhancePrompt'; prompt: string }
-  // 新增：CLI 询问回答
-  | { type: 'answerCliQuestion'; cli: CLIType; questionId: string; answer: string; adapterRole?: 'worker' | 'orchestrator' }
   // 新增：需求澄清回答
   | { type: 'answerClarification'; answers: Record<string, string> | null; additionalInfo?: string }
   // 新增：Worker 问题回答
@@ -514,16 +512,17 @@ export type MessageSource = 'orchestrator' | 'worker' | 'system';
 export type ExtensionToWebviewMessage =
   | { type: 'stateUpdate'; state: UIState }
   | { type: 'taskUpdate'; task: Task }
-  | { type: 'cliStatusUpdate'; statuses: Record<string, { status: string; version?: string }> }
-  | { type: 'workerStatusChanged'; worker: WorkerSlot; available: boolean; version?: string }  // ✅ 改为 workerStatusChanged
-  | { type: 'cliError'; cli: string; error: string; source?: MessageSource }
-  | { type: 'streamEvent'; phase: 'chunk' | 'complete'; content?: string; error?: string; sessionId?: string | null; source?: MessageSource; cli?: CLIType; append?: boolean; sentAt?: number; target?: 'thread' | 'cli' }
+  | { type: 'workerStatusUpdate'; statuses: Record<string, { status: string; model?: string }> }
+  | { type: 'workerStatusChanged'; worker: WorkerSlot; available: boolean; model?: string }
+  | { type: 'workerError'; worker: string; error: string; source?: MessageSource }
+  | { type: 'streamEvent'; phase: 'chunk' | 'complete'; content?: string; error?: string; sessionId?: string | null; source?: MessageSource; worker?: WorkerSlot; append?: boolean; sentAt?: number; target?: 'thread' | 'worker' }
   | { type: 'loginSuccess' }
   | { type: 'loginError'; message: string }
   | { type: 'authStatus'; loggedIn: boolean }
   | { type: 'toast'; message: string; toastType?: 'success' | 'error' | 'warning' | 'info'; duration?: number }
   | { type: 'sessionCreated'; session: Session }
   | { type: 'sessionSwitched'; sessionId: string }
+  | { type: 'sessionSummaryLoaded'; sessionId: string; summary: any }
   | { type: 'sessionsUpdated'; sessions: Session[] }
   | { type: 'showDiff'; filePath: string; diff: string }
   | { type: 'confirmationRequest'; plan: unknown; formattedPlan: string }
@@ -531,7 +530,7 @@ export type ExtensionToWebviewMessage =
   // 新增：编排者专用消息类型
   | { type: 'orchestratorMessage'; content: string; phase: string; taskId?: string; messageType?: string; metadata?: Record<string, unknown>; sessionId?: string | null; timestamp?: number }
   // 新增：Worker 专用消息类型
-  | { type: 'workerOutput'; workerId: string; workerType: CLIType; content: string; subTaskId: string }
+  | { type: 'workerOutput'; workerId: string; workerType: WorkerSlot; content: string; subTaskId: string }
   // 交互模式和验证相关
   | { type: 'interactionModeChanged'; mode: InteractionMode }
   | { type: 'phaseChanged'; phase: string; taskId: string; isRunning?: boolean }
@@ -540,12 +539,12 @@ export type ExtensionToWebviewMessage =
   | { type: 'recoveryResult'; success: boolean; strategy: string; message: string }
   | { type: 'taskPaused'; taskId: string }
   | { type: 'taskResumed'; taskId: string }
- 
-  | { type: 'executionStatsUpdate'; stats: CLIExecutionStats[]; orchestratorStats?: { totalTasks: number; totalSuccess: number; totalFailed: number; totalInputTokens: number; totalOutputTokens: number } }
-  | { type: 'cliFallbackNotice'; originalCli: CLIType; fallbackCli: CLIType; reason: string }
- 
-  | { type: 'cliTaskCard'; cli: CLIType; taskId: string; subTaskId: string; description: string; targetFiles?: string[]; reason?: string; status: string; dispatchId?: string; sessionId?: string | null }
- 
+
+  | { type: 'executionStatsUpdate'; stats: WorkerExecutionStats[]; orchestratorStats?: { totalTasks: number; totalSuccess: number; totalFailed: number; totalInputTokens: number; totalOutputTokens: number } }
+  | { type: 'workerFallbackNotice'; originalWorker: WorkerSlot; fallbackWorker: WorkerSlot; reason: string }
+
+  | { type: 'workerTaskCard'; worker: WorkerSlot; taskId: string; subTaskId: string; description: string; targetFiles?: string[]; reason?: string; status: string; dispatchId?: string; sessionId?: string | null }
+
   | { type: 'promptEnhanceResult'; success: boolean; message: string }
 
   | { type: 'promptEnhanced'; enhancedPrompt: string; error: string }
@@ -584,10 +583,10 @@ export type ExtensionToWebviewMessage =
   | { type: 'repositoryRefreshed'; repositoryId: string }
   | { type: 'skillLibraryLoaded'; skills: any[] };
 
-/** CLI 执行统计数据（用于 UI 显示） */
-export interface CLIExecutionStats {
-  /** CLI 类型 */
-  cli: CLIType;
+/** Worker 执行统计数据（用于 UI 显示） */
+export interface WorkerExecutionStats {
+  /** Worker 类型 */
+  worker: WorkerSlot;
   /** 总执行次数 */
   totalExecutions: number;
   /** 成功次数 */
@@ -611,3 +610,4 @@ export interface CLIExecutionStats {
   /** 总输出 token */
   totalOutputTokens?: number;
 }
+

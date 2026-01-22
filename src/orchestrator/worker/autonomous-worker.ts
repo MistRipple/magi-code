@@ -2,7 +2,6 @@
  * Autonomous Worker - 自主 Worker
  *
  * 核心功能：
- * - 包装 BaseWorker，增加自主规划能力
  * - 执行 Assignment 而非 SubTask
  * - 支持动态 Todo 添加
  * - 自动生成自检和互检引导
@@ -10,8 +9,7 @@
  */
 
 import { EventEmitter } from 'events';
-import { CLIType, SubTask } from '../../types';
-import { BaseWorker } from '../../workers/base-worker';
+import { WorkerSlot, SubTask } from '../../types';
 import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import { AdapterOutputScope } from '../../adapters/adapter-factory-interface';
 import { TokenUsage } from '../../types/agent-types';
@@ -75,8 +73,7 @@ export class AutonomousWorker extends EventEmitter {
   private retryCountMap: Map<string, number> = new Map();
 
   constructor(
-    private cliType: CLIType,
-    private baseWorker: BaseWorker,
+    private workerType: WorkerSlot,
     private profileLoader: ProfileLoader,
     private guidanceInjector: GuidanceInjector
   ) {
@@ -86,10 +83,10 @@ export class AutonomousWorker extends EventEmitter {
   }
 
   /**
-   * 获取 CLI 类型
+   * 获取 Worker 类型
    */
-  getCliType(): CLIType {
-    return this.cliType;
+  getWorkerType(): WorkerSlot {
+    return this.workerType;
   }
 
   /**
@@ -266,7 +263,7 @@ export class AutonomousWorker extends EventEmitter {
 
     try {
       // 构建执行 prompt
-      const profile = this.profileLoader.getProfile(this.cliType);
+      const profile = this.profileLoader.getProfile(this.workerType);
       const executionPrompt = this.buildExecutionPrompt(todo, assignment, options.projectContext);
 
       // 生成自检引导
@@ -375,11 +372,9 @@ export class AutonomousWorker extends EventEmitter {
   }
 
   /**
-   * 使用底层 Worker 执行
+   * 使用 LLM 适配器执行任务
    *
-   * 支持两种执行模式：
-   * 1. 通过 CLIAdapterFactory（推荐）：使用适配器工厂发送消息
-   * 2. 通过 BaseWorker（传统）：使用底层 Worker 执行
+   * 通过 AdapterFactory 发送消息到 LLM API
    */
   private async executeWithWorker(
     todo: WorkerTodo,
@@ -393,92 +388,51 @@ export class AutonomousWorker extends EventEmitter {
     dynamicTodos?: WorkerTodo[];
     tokenUsage?: TokenUsage;
   }> {
+    // 必须提供 adapterFactory
+    if (!options.adapterFactory) {
+      throw new Error('adapterFactory 是必需的，当前项目仅支持 LLM API 模式');
+    }
+
     // 组合执行 prompt 和自检引导
     const fullPrompt = `${executionPrompt}\n\n## 自检要点\n${selfCheckGuidance}`;
 
-    // 模式 1: 通过 CLIAdapterFactory 执行
-    if (options.adapterFactory) {
-      try {
-        const response = await options.adapterFactory.sendMessage(
-          this.cliType,
-          fullPrompt,
-          undefined, // 无图片
-          {
-            source: 'worker',
-            streamToUI: true,
-            adapterRole: 'worker',
-            ...options.adapterScope,
-          }
-        );
-
-        if (response.error) {
-          throw new Error(response.error);
+    try {
+      const response = await options.adapterFactory.sendMessage(
+        this.workerType,
+        fullPrompt,
+        undefined, // 无图片
+        {
+          source: 'worker',
+          streamToUI: true,
+          adapterRole: 'worker',
+          ...options.adapterScope,
         }
+      );
 
-        // 解析响应
-        const summary = response.content || response.error || '执行完成';
-        const modifiedFiles = this.extractModifiedFiles(response.content || '');
-        const dynamicTodos = this.extractDynamicTodos(response.content || '');
-
-        // 调用输出回调
-        if (options.onOutput && response.content) {
-          options.onOutput(response.content);
-        }
-
-        return {
-          summary,
-          modifiedFiles,
-          dynamicTodos,
-          tokenUsage: response.tokenUsage,
-        };
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        throw new Error(`CLI 执行失败: ${errorMessage}`);
+      if (response.error) {
+        throw new Error(response.error);
       }
+
+      // 解析响应
+      const summary = response.content || response.error || '执行完成';
+      const modifiedFiles = this.extractModifiedFiles(response.content || '');
+      const dynamicTodos = this.extractDynamicTodos(response.content || '');
+
+      // 调用输出回调
+      if (options.onOutput && response.content) {
+        options.onOutput(response.content);
+      }
+
+      return {
+        summary,
+        modifiedFiles,
+        dynamicTodos,
+        tokenUsage: response.tokenUsage,
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      throw new Error(`LLM 执行失败: ${errorMessage}`);
     }
-
-    // 模式 2: 使用 BaseWorker 执行（真实 CLI）
-    const inferredTargets = this.extractTargetFiles(fullPrompt);
-    const targetFiles = [...new Set([...(assignment.scope?.targetPaths || []), ...inferredTargets])];
-    const subTask: SubTask = {
-      id: todo.id,
-      taskId: assignment.missionId,
-      description: fullPrompt,
-      assignmentId: assignment.id,
-      assignedWorker: this.cliType,
-      reason: todo.reasoning,
-      prompt: fullPrompt,
-      targetFiles,
-      dependencies: todo.dependsOn || [],
-      priority: todo.priority || 5,
-      kind: this.mapTodoKind(todo.type),
-      status: 'pending',
-      progress: 0,
-      retryCount: 0,
-      maxRetries: 3,
-      output: [],
-    };
-
-    const result = await this.baseWorker.execute({
-      subTask,
-      workingDirectory: options.workingDirectory,
-      timeout: options.timeout,
-      onOutput: options.onOutput,
-    });
-
-    if (!result.success) {
-      throw new Error(result.error || 'CLI 执行失败');
-    }
-
-    const outputText = result.output || '';
-    const modifiedFiles = result.modifiedFiles || this.extractModifiedFiles(outputText);
-    const dynamicTodos = this.extractDynamicTodos(outputText);
-
-    return {
-      summary: outputText || result.error || '执行完成',
-      modifiedFiles,
-      dynamicTodos,
-    };
   }
 
   /**

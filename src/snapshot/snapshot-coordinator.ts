@@ -11,7 +11,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { logger, LogCategory } from '../logging';
-import { FileSnapshot, CLIType, PendingChange } from '../types';
+import { FileSnapshot, WorkerSlot, PendingChange } from '../types';
 import { UnifiedSessionManager, FileSnapshotMeta } from '../session';
 import { globalEventBus } from '../events';
 import { IDGenerator } from '../utils/id-generator';
@@ -42,7 +42,7 @@ export class SnapshotCoordinator {
    */
   createSnapshot(
     filePath: string,
-    modifiedBy: CLIType,
+    modifiedBy: WorkerSlot,
     subTaskId: string,
     priority: number = 5
   ): FileSnapshot | null {
@@ -143,7 +143,7 @@ export class SnapshotCoordinator {
    */
   createSnapshots(
     filePaths: string[],
-    modifiedBy: CLIType,
+    modifiedBy: WorkerSlot,
     subTaskId: string,
     priority: number = 5
   ): FileSnapshot[] {

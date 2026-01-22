@@ -8,7 +8,7 @@
  * - 汇总结果，向用户报告
  */
 
-import { CLIType } from '../orchestrator/protocols/types';
+import { WorkerSlot } from '../orchestrator/protocols/types';
 
 /**
  * 编排者 System Prompt - 精简版
@@ -57,7 +57,7 @@ export const ORCHESTRATOR_SYSTEM_PROMPT = `# 编排者协议 (Orchestrator Proto
  */
 export function buildOrchestratorSystemPrompt(options: {
   workspace: string;
-  availableWorkers: CLIType[];
+  availableWorkers: WorkerSlot[];
 }): string {
   const { workspace, availableWorkers } = options;
   

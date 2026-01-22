@@ -18,7 +18,7 @@ import type {
   WorkerTodo,
   ContractViolation,
 } from '../orchestrator/mission/types';
-import type { CLIType } from '../types';
+import type { WorkerSlot } from '../types';
 
 /**
  * 测试结果
@@ -58,7 +58,7 @@ function createTestMission(id: string): Mission {
 /**
  * 创建测试契约
  */
-function createTestContract(id: string, missionId: string, producer: CLIType, consumers: CLIType[]): Contract {
+function createTestContract(id: string, missionId: string, producer: WorkerSlot, consumers: WorkerSlot[]): Contract {
   return {
     id,
     missionId,
@@ -82,7 +82,7 @@ function createTestContract(id: string, missionId: string, producer: CLIType, co
 /**
  * 创建测试 Assignment
  */
-function createTestAssignment(id: string, missionId: string, workerId: CLIType): Assignment {
+function createTestAssignment(id: string, missionId: string, workerId: WorkerSlot): Assignment {
   return {
     id,
     missionId,

@@ -12,6 +12,7 @@ import {
   LLMResponse,
   LLMStreamChunk,
   ToolCall,
+  ToolDefinition,
   ContentBlock,
 } from '../types';
 import { logger, LogCategory } from '../../logging';
@@ -104,12 +105,117 @@ export class UniversalLLMClient extends BaseLLMClient {
   // Anthropic 实现
   // ============================================================================
 
+  /**
+   * 清理工具定义，确保符合 Anthropic API 要求
+   */
+  private sanitizeToolsForAnthropic(tools?: ToolDefinition[]): any[] | undefined {
+    if (!tools || tools.length === 0) {
+      return undefined;
+    }
+
+    return tools.map(tool => {
+      const sanitized: any = {
+        name: tool.name,
+        description: tool.description || 'No description available',
+        input_schema: this.sanitizeSchema(tool.input_schema)
+      };
+      return sanitized;
+    });
+  }
+
+  /**
+   * 清理 JSON Schema，移除不兼容的属性
+   */
+  private sanitizeSchema(schema: any): any {
+    if (!schema || typeof schema !== 'object') {
+      return { type: 'object', properties: {} };
+    }
+
+    const sanitized: any = {
+      type: schema.type || 'object'
+    };
+
+    // 处理 properties
+    if (schema.properties && typeof schema.properties === 'object') {
+      sanitized.properties = {};
+      for (const [key, value] of Object.entries(schema.properties)) {
+        sanitized.properties[key] = this.sanitizeProperty(value);
+      }
+    } else {
+      sanitized.properties = {};
+    }
+
+    // 处理 required - 只在有值时添加
+    if (Array.isArray(schema.required) && schema.required.length > 0) {
+      // 过滤出实际存在于 properties 中的 required 字段
+      const validRequired = schema.required.filter(
+        (r: string) => sanitized.properties[r] !== undefined
+      );
+      if (validRequired.length > 0) {
+        sanitized.required = validRequired;
+      }
+    }
+
+    return sanitized;
+  }
+
+  /**
+   * 清理属性定义
+   */
+  private sanitizeProperty(prop: any): any {
+    if (!prop || typeof prop !== 'object') {
+      return { type: 'string' };
+    }
+
+    const sanitized: any = {};
+
+    // 复制基本字段
+    if (prop.type) {
+      sanitized.type = prop.type;
+    } else {
+      sanitized.type = 'string';
+    }
+
+    if (prop.description) {
+      sanitized.description = String(prop.description);
+    }
+
+    // 处理枚举
+    if (Array.isArray(prop.enum) && prop.enum.length > 0) {
+      sanitized.enum = prop.enum;
+    }
+
+    // 处理默认值
+    if (prop.default !== undefined) {
+      sanitized.default = prop.default;
+    }
+
+    // 处理数组类型
+    if (prop.type === 'array' && prop.items) {
+      sanitized.items = this.sanitizeProperty(prop.items);
+    }
+
+    // 处理对象类型
+    if (prop.type === 'object' && prop.properties) {
+      sanitized.properties = {};
+      for (const [key, value] of Object.entries(prop.properties)) {
+        sanitized.properties[key] = this.sanitizeProperty(value);
+      }
+      if (Array.isArray(prop.required) && prop.required.length > 0) {
+        sanitized.required = prop.required;
+      }
+    }
+
+    return sanitized;
+  }
+
   private async sendAnthropicMessage(params: LLMMessageParams): Promise<LLMResponse> {
     if (!this.anthropicClient) {
       throw new Error('Anthropic client not initialized');
     }
 
     const { messages, systemPrompt } = this.convertToAnthropicFormat(params);
+    const sanitizedTools = this.sanitizeToolsForAnthropic(params.tools);
 
     const response = await this.anthropicClient.messages.create({
       model: this.config.model,
@@ -117,7 +223,7 @@ export class UniversalLLMClient extends BaseLLMClient {
       temperature: params.temperature,
       system: systemPrompt,
       messages,
-      tools: params.tools as any,
+      tools: sanitizedTools as any,
     });
 
     const result = this.parseAnthropicResponse(response);
@@ -134,6 +240,7 @@ export class UniversalLLMClient extends BaseLLMClient {
     }
 
     const { messages, systemPrompt } = this.convertToAnthropicFormat(params);
+    const sanitizedTools = this.sanitizeToolsForAnthropic(params.tools);
 
     const stream = await this.anthropicClient.messages.create({
       model: this.config.model,
@@ -141,7 +248,7 @@ export class UniversalLLMClient extends BaseLLMClient {
       temperature: params.temperature,
       system: systemPrompt,
       messages,
-      tools: params.tools as any,
+      tools: sanitizedTools as any,
       stream: true,
     });
 

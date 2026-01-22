@@ -13,7 +13,7 @@
  * - 专注：每个 Worker 专注于自己的专业领域
  */
 
-import { CLIType } from '../orchestrator/protocols/types';
+import { WorkerSlot } from '../orchestrator/protocols/types';
 
 /**
  * Worker 通用 System Prompt - 极简版
@@ -40,7 +40,7 @@ export const WORKER_SYSTEM_PROMPT_BASE = `# Worker 执行协议
 /**
  * Worker 专业领域描述
  */
-const WORKER_SPECIALIZATIONS: Record<CLIType, string> = {
+const WORKER_SPECIALIZATIONS: Record<WorkerSlot, string> = {
   claude: `## 专业领域：复杂架构
 - 多文件重构、架构设计
 - 代码审查、技术方案
@@ -61,7 +61,7 @@ const WORKER_SPECIALIZATIONS: Record<CLIType, string> = {
  * 构建 Worker System Prompt
  */
 export function buildWorkerSystemPrompt(
-  workerType: CLIType,
+  workerType: WorkerSlot,
   options?: {
     workspace?: string;
     additionalContext?: string;

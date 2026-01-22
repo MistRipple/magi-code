@@ -3,7 +3,7 @@
  * 合并多个 CLI 的输出，生成统一报告
  */
 
-import { CLIType, AgentType } from '../types';  // ✅ 导入 AgentType
+import { WorkerSlot, AgentType } from '../types';  // ✅ 导入 AgentType
 import { SubTaskResult } from './execution-scheduler';
 import { DiffResult } from '../diff-generator';
 
@@ -20,8 +20,8 @@ export interface AggregatedReport {
     failed: number;
     cancelled: number;
   };
-  /** CLI 统计 */
-  cliStats: Record<CLIType, CLIStats>;
+  /** Worker 统计 */
+  workerStats: Record<WorkerSlot, WorkerStats>;
   /** 文件变更统计 */
   fileStats: {
     total: number;
@@ -38,8 +38,8 @@ export interface AggregatedReport {
   summary: string;
 }
 
-/** CLI 统计 */
-export interface CLIStats {
+/** Worker 统计 */
+export interface WorkerStats {
   taskCount: number;
   successCount: number;
   failedCount: number;
@@ -63,19 +63,19 @@ export class ResultAggregator {
    */
   aggregate(results: SubTaskResult[], diffs?: DiffResult[]): AggregatedReport {
     const taskStats = this.computeTaskStats(results);
-    const cliStats = this.computeCLIStats(results);
+    const workerStats = this.computeWorkerStats(results);
     const fileStats = this.computeFileStats(diffs || []);
     const fileChanges = this.extractFileChanges(diffs || []);
     const totalDuration = results.reduce((sum, r) => sum + (r.duration || 0), 0);
 
     const status = this.determineStatus(taskStats);
-    const summary = this.generateSummary(taskStats, cliStats, fileStats, totalDuration);
+    const summary = this.generateSummary(taskStats, workerStats, fileStats, totalDuration);
 
     return {
       status,
       totalDuration,
       taskStats,
-      cliStats,
+      workerStats,
       fileStats,
       results,
       fileChanges,
@@ -97,21 +97,21 @@ export class ResultAggregator {
   }
 
   /**
-   * 计算 CLI 统计
+   * 计算 Worker 统计
    */
-  private computeCLIStats(results: SubTaskResult[]): Record<CLIType, CLIStats> {
-    const stats: Record<CLIType, CLIStats> = {
+  private computeWorkerStats(results: SubTaskResult[]): Record<WorkerSlot, WorkerStats> {
+    const stats: Record<WorkerSlot, WorkerStats> = {
       claude: { taskCount: 0, successCount: 0, failedCount: 0, totalDuration: 0 },
       codex: { taskCount: 0, successCount: 0, failedCount: 0, totalDuration: 0 },
       gemini: { taskCount: 0, successCount: 0, failedCount: 0, totalDuration: 0 },
     };
 
     for (const result of results) {
-      const cli = result.cli;
-      stats[cli].taskCount++;
-      if (result.status === 'completed') stats[cli].successCount++;
-      if (result.status === 'failed') stats[cli].failedCount++;
-      stats[cli].totalDuration += result.duration || 0;
+      const worker = result.worker;
+      stats[worker].taskCount++;
+      if (result.status === 'completed') stats[worker].successCount++;
+      if (result.status === 'failed') stats[worker].failedCount++;
+      stats[worker].totalDuration += result.duration || 0;
     }
 
     return stats;
@@ -154,7 +154,7 @@ export class ResultAggregator {
    */
   private generateSummary(
     taskStats: AggregatedReport['taskStats'],
-    cliStats: Record<CLIType, CLIStats>,
+    workerStats: Record<WorkerSlot, WorkerStats>,
     fileStats: AggregatedReport['fileStats'],
     totalDuration: number
   ): string {
@@ -168,12 +168,12 @@ export class ResultAggregator {
       lines.push(`失败: ${taskStats.failed} 个任务`);
     }
 
-    const usedCLIs = Object.entries(cliStats)
+    const usedWorkers = Object.entries(workerStats)
       .filter(([, s]) => s.taskCount > 0)
-      .map(([cli, s]) => `${cli}(${s.successCount}/${s.taskCount})`);
-    
-    if (usedCLIs.length > 0) {
-      lines.push(`CLI: ${usedCLIs.join(', ')}`);
+      .map(([worker, s]) => `${worker}(${s.successCount}/${s.taskCount})`);
+
+    if (usedWorkers.length > 0) {
+      lines.push(`Worker: ${usedWorkers.join(', ')}`);
     }
 
     if (fileStats.total > 0) {

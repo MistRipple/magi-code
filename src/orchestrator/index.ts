@@ -46,10 +46,10 @@ export { RiskPolicy } from './risk-policy';
 // 统一策略引擎
 export {
   PolicyEngine,
-  type CLISelectionPolicy,
+  type WorkerSelectionPolicy,
   type ConflictDetectionResult,
   type VerificationDecision,
-  type CLIHealthStatus,
+  type WorkerHealthStatus,
 } from './policy-engine';
 
 // 消息总线

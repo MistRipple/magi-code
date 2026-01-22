@@ -4,7 +4,7 @@
  * 负责职责分配的创建、更新和管理
  */
 
-import { CLIType } from '../../types';
+import { WorkerSlot } from '../../types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
 import {
@@ -33,7 +33,7 @@ export class AssignmentManager {
    */
   async createAssignments(
     mission: Mission,
-    participants: CLIType[],
+    participants: WorkerSlot[],
     contracts: Contract[]
   ): Promise<Assignment[]> {
     const assignments: Assignment[] = [];
@@ -55,7 +55,7 @@ export class AssignmentManager {
    */
   private async createAssignmentForWorker(
     mission: Mission,
-    workerId: CLIType,
+    workerId: WorkerSlot,
     contracts: Contract[]
   ): Promise<Assignment> {
     const profile = this.profileLoader.getProfile(workerId);
@@ -110,7 +110,7 @@ export class AssignmentManager {
    */
   private determineScope(
     mission: Mission,
-    workerId: CLIType,
+    workerId: WorkerSlot,
     contracts: Contract[]
   ): AssignmentScope {
     const profile = this.profileLoader.getProfile(workerId);
@@ -158,7 +158,7 @@ export class AssignmentManager {
    */
   private generateAssignmentReason(
     mission: Mission,
-    workerId: CLIType,
+    workerId: WorkerSlot,
     profile: ReturnType<ProfileLoader['getProfile']>
   ): AssignmentReason {
     const category = this.inferCategory(mission, profile);
@@ -258,7 +258,7 @@ export class AssignmentManager {
    */
   private generateResponsibility(
     mission: Mission,
-    workerId: CLIType,
+    workerId: WorkerSlot,
     scope: AssignmentScope
   ): string {
     const profile = this.profileLoader.getProfile(workerId);
@@ -290,8 +290,8 @@ export class AssignmentManager {
   /**
    * 获取协作者列表
    */
-  private getCollaborators(contracts: Contract[], workerId: CLIType): CLIType[] {
-    const collaborators = new Set<CLIType>();
+  private getCollaborators(contracts: Contract[], workerId: WorkerSlot): WorkerSlot[] {
+    const collaborators = new Set<WorkerSlot>();
 
     for (const contract of contracts) {
       if (contract.producer === workerId) {
@@ -309,7 +309,7 @@ export class AssignmentManager {
   /**
    * 格式化契约信息
    */
-  private formatContracts(contracts: Contract[], workerId: CLIType): string {
+  private formatContracts(contracts: Contract[], workerId: WorkerSlot): string {
     const relevant = contracts.filter(
       c => c.producer === workerId || c.consumers.includes(workerId)
     );

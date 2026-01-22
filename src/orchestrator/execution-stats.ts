@@ -7,14 +7,14 @@
 import { logger, LogCategory } from '../logging';
 import * as vscode from 'vscode';
 import { globalEventBus } from '../events';
-import { CLIType } from '../types';
+import { WorkerSlot } from '../types';
 
 /** 执行阶段类型 */
 export type ExecutionPhase = 'planning' | 'execution' | 'verification' | 'integration';
 
 /** 单次执行记录 */
 export interface ExecutionRecord {
-  cli: CLIType;
+  worker: WorkerSlot;
   taskId: string;
   subTaskId: string;
   success: boolean;
@@ -28,9 +28,9 @@ export interface ExecutionRecord {
   phase?: ExecutionPhase;
 }
 
-/** CLI 统计摘要 */
-export interface CLIStats {
-  cli: CLIType;
+/** Worker 统计摘要 */
+export interface WorkerStats {
+  worker: WorkerSlot;
   totalExecutions: number;
   successCount: number;
   failureCount: number;
@@ -51,10 +51,11 @@ export interface CLIStats {
   totalOutputTokens: number;
 }
 
+
 /** 降级建议 */
 export interface FallbackSuggestion {
-  originalCli: CLIType;
-  suggestedCli: CLIType;
+  originalWorker: WorkerSlot;
+  suggestedWorker: WorkerSlot;
   reason: string;
   confidence: number;  // 0-1
 }
@@ -116,41 +117,41 @@ export class ExecutionStats {
 
     logger.info(
       '编排器.执行.已记录',
-      { cli: record.cli, success: record.success, duration: record.duration, taskId: record.taskId, subTaskId: record.subTaskId },
+      { worker: record.worker, success: record.success, duration: record.duration, taskId: record.taskId, subTaskId: record.subTaskId },
       LogCategory.ORCHESTRATOR
     );
     globalEventBus.emitEvent('execution:stats_updated', {});
   }
 
-  /** 获取 CLI 统计摘要 */
-  getStats(cli: CLIType): CLIStats {
-    const cliRecords = this.records.filter(r => r.cli === cli);
-    const recentRecords = cliRecords.slice(-this.config.recentWindow);
+  /** 获取 Worker 统计摘要 */
+  getStats(worker: WorkerSlot): WorkerStats {
+    const workerRecords = this.records.filter(r => r.worker === worker);
+    const recentRecords = workerRecords.slice(-this.config.recentWindow);
 
-    const totalExecutions = cliRecords.length;
-    const successCount = cliRecords.filter(r => r.success).length;
+    const totalExecutions = workerRecords.length;
+    const successCount = workerRecords.filter(r => r.success).length;
     const failureCount = totalExecutions - successCount;
     const successRate = totalExecutions > 0 ? successCount / totalExecutions : 1;
 
-    const successfulDurations = cliRecords.filter(r => r.success).map(r => r.duration);
+    const successfulDurations = workerRecords.filter(r => r.success).map(r => r.duration);
     const avgDuration = successfulDurations.length > 0
       ? successfulDurations.reduce((a, b) => a + b, 0) / successfulDurations.length
       : 0;
 
     const recentFailures = recentRecords.filter(r => !r.success).length;
-    const lastFailure = cliRecords.filter(r => !r.success).pop();
-    const lastRecord = cliRecords[cliRecords.length - 1];
+    const lastFailure = workerRecords.filter(r => !r.success).pop();
+    const lastRecord = workerRecords[workerRecords.length - 1];
 
     // 统计常见错误
     const commonErrors = new Map<string, number>();
-    cliRecords.filter(r => r.error).forEach(r => {
+    workerRecords.filter(r => r.error).forEach(r => {
       const errorType = this.categorizeError(r.error!);
       commonErrors.set(errorType, (commonErrors.get(errorType) || 0) + 1);
     });
 
-   
-    const totalInputTokens = cliRecords.reduce((sum, r) => sum + (r.inputTokens || 0), 0);
-    const totalOutputTokens = cliRecords.reduce((sum, r) => sum + (r.outputTokens || 0), 0);
+
+    const totalInputTokens = workerRecords.reduce((sum, r) => sum + (r.inputTokens || 0), 0);
+    const totalOutputTokens = workerRecords.reduce((sum, r) => sum + (r.outputTokens || 0), 0);
 
     const recentFailureRate = recentRecords.length > 0 ? recentFailures / recentRecords.length : 0;
     const healthScore = Math.max(0, Math.min(1, successRate - recentFailureRate * 0.5));
@@ -159,7 +160,7 @@ export class ExecutionStats {
     const isHealthy = healthScore >= this.config.healthThreshold;
 
     return {
-      cli,
+      worker,
       totalExecutions,
       successCount,
       failureCount,
@@ -177,10 +178,10 @@ export class ExecutionStats {
     };
   }
 
-  /** 获取所有 CLI 的统计 */
-  getAllStats(): CLIStats[] {
-    const cliTypes: CLIType[] = ['claude', 'codex', 'gemini'];
-    return cliTypes.map(cli => this.getStats(cli));
+  /** 获取所有 Worker 的统计 */
+  getAllStats(): WorkerStats[] {
+    const workerTypes: WorkerSlot[] = ['claude', 'codex', 'gemini'];
+    return workerTypes.map(worker => this.getStats(worker));
   }
 
   /** 获取按阶段分离的 Token 统计 */
@@ -210,23 +211,23 @@ export class ExecutionStats {
     };
   }
 
-  /** 获取健康的 CLI 列表 */
-  getHealthyCLIs(): CLIType[] {
+  /** 获取健康的 Worker 列表 */
+  getHealthyWorkers(): WorkerSlot[] {
     return this.getAllStats()
       .filter(s => s.isHealthy)
-      .map(s => s.cli);
+      .map(s => s.worker);
   }
 
   /** 获取降级建议 */
   getFallbackSuggestion(
-    failedCli: CLIType,
-    excludeClis: CLIType[] = [],
-    availableClis?: CLIType[]
+    failedWorker: WorkerSlot,
+    excludeWorkers: WorkerSlot[] = [],
+    availableWorkers?: WorkerSlot[]
   ): FallbackSuggestion | null {
     const allStats = this.getAllStats();
     const candidates = allStats
-      .filter(s => s.cli !== failedCli && !excludeClis.includes(s.cli))
-      .filter(s => !availableClis || availableClis.includes(s.cli))
+      .filter(s => s.worker !== failedWorker && !excludeWorkers.includes(s.worker))
+      .filter(s => !availableWorkers || availableWorkers.includes(s.worker))
       .filter(s => s.isHealthy || s.totalExecutions < 3)  // 健康或样本不足
       .sort((a, b) => {
         // 优先选择成功率高的
@@ -242,21 +243,21 @@ export class ExecutionStats {
     }
 
     const best = candidates[0];
-    const failedStats = this.getStats(failedCli);
+    const failedStats = this.getStats(failedWorker);
 
     return {
-      originalCli: failedCli,
-      suggestedCli: best.cli,
+      originalWorker: failedWorker,
+      suggestedWorker: best.worker,
       reason: this.buildFallbackReason(failedStats, best),
       confidence: this.calculateConfidence(best),
     };
   }
 
-  /** 根据任务类型推荐最佳 CLI */
-  recommendCLI(taskCategory: string, availableCLIs: CLIType[]): CLIType {
-    const stats = availableCLIs.map(cli => this.getStats(cli));
+  /** 根据任务类型推荐最佳 Worker */
+  recommendWorker(taskCategory: string, availableWorkers: WorkerSlot[]): WorkerSlot {
+    const stats = availableWorkers.map(worker => this.getStats(worker));
 
-    // 过滤掉不健康的 CLI（除非全部不健康）
+    // 过滤掉不健康的 Worker（除非全部不健康）
     const healthyStats = stats.filter(s => s.isHealthy);
     const candidates = healthyStats.length > 0 ? healthyStats : stats;
 
@@ -267,7 +268,7 @@ export class ExecutionStats {
       return scoreB - scoreA;
     });
 
-    return candidates[0]?.cli || availableCLIs[0];
+    return candidates[0]?.worker || availableWorkers[0];
   }
 
   /** 分类错误类型 */
@@ -282,24 +283,24 @@ export class ExecutionStats {
   }
 
   /** 构建降级原因说明 */
-  private buildFallbackReason(failed: CLIStats, suggested: CLIStats): string {
+  private buildFallbackReason(failed: WorkerStats, suggested: WorkerStats): string {
     const reasons: string[] = [];
 
     if (failed.recentFailures > 3) {
-      reasons.push(`${failed.cli} 最近失败率较高 (${failed.recentFailures}/${this.config.recentWindow})`);
+      reasons.push(`${failed.worker} 最近失败率较高 (${failed.recentFailures}/${this.config.recentWindow})`);
     }
     if (suggested.successRate > failed.successRate) {
-      reasons.push(`${suggested.cli} 成功率更高 (${(suggested.successRate * 100).toFixed(0)}%)`);
+      reasons.push(`${suggested.worker} 成功率更高 (${(suggested.successRate * 100).toFixed(0)}%)`);
     }
     if (suggested.avgDuration < failed.avgDuration && failed.avgDuration > 0) {
-      reasons.push(`${suggested.cli} 平均响应更快`);
+      reasons.push(`${suggested.worker} 平均响应更快`);
     }
 
-    return reasons.join('；') || `${suggested.cli} 当前状态更稳定`;
+    return reasons.join('；') || `${suggested.worker} 当前状态更稳定`;
   }
 
   /** 计算降级建议的置信度 */
-  private calculateConfidence(stats: CLIStats): number {
+  private calculateConfidence(stats: WorkerStats): number {
     const sampleFactor = Math.min(stats.totalExecutions / 10, 1);
     const successFactor = stats.successRate;
     const recentFactor = 1 - (stats.recentFailures / this.config.recentWindow);
@@ -344,7 +345,7 @@ export class ExecutionStats {
   getSummary(): string {
     const allStats = this.getAllStats();
     return allStats.map(s =>
-      `${s.cli}: ${(s.successRate * 100).toFixed(0)}% (${s.totalExecutions}次)`
+      `${s.worker}: ${(s.successRate * 100).toFixed(0)}% (${s.totalExecutions}次)`
     ).join(' | ');
   }
 }

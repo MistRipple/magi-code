@@ -4,7 +4,7 @@
  */
 
 import { EventEmitter } from 'events';
-import { CLIType, WorkerSlot } from '../types';
+import { WorkerSlot } from '../types';
 import { IAdapterFactory } from '../adapters/adapter-factory-interface';
 import { AdapterResponse } from '../adapters/adapter-factory-interface';
 import { SubTaskDef, SplitResult } from './task-splitter';
@@ -15,7 +15,7 @@ export type ExecutionStatus = 'pending' | 'running' | 'completed' | 'failed' | '
 /** 子任务执行结果 */
 export interface SubTaskResult {
   subTaskId: string;
-  cli: CLIType;
+  worker: WorkerSlot;
   status: ExecutionStatus;
   response?: AdapterResponse;
   error?: string;
@@ -163,7 +163,7 @@ export class ExecutionScheduler extends EventEmitter {
   private async executeSubTask(task: SubTaskDef, retryCount = 0): Promise<SubTaskResult> {
     const result: SubTaskResult = {
       subTaskId: task.id,
-      cli: task.assignedWorker,
+      worker: task.assignedWorker,
       status: 'running',
       startTime: Date.now(),
     };

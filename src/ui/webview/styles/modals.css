@@ -1,0 +1,114 @@
+    /* 删除确认对话框 */
+    .confirm-dialog { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 400; }
+    .confirm-dialog-content { background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); padding: var(--spacing-4); max-width: 300px; }
+    .confirm-dialog-title { font-size: var(--font-size-3); font-weight: 600; margin-bottom: var(--spacing-2); }
+    .confirm-dialog-message { font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); margin-bottom: var(--spacing-4); }
+    .confirm-dialog-actions { display: flex; justify-content: flex-end; gap: var(--spacing-2); }
+    .confirm-dialog-actions button { padding: var(--spacing-1) var(--spacing-3); border-radius: var(--radius-2); border: none; cursor: pointer; font-size: var(--font-size-2); }
+    .confirm-dialog-actions .confirm-btn { background: #e5484d; color: white; }
+    .confirm-dialog-actions .cancel-btn { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+
+    /* 图片粘贴预览 - Augment 风格内联设计 */
+    .image-preview-container { display: none; padding: var(--spacing-2) var(--spacing-3) 0; background: transparent; align-items: center; }
+    .image-preview-container.has-images { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .image-preview-item { position: relative; width: 44px; height: 44px; border-radius: var(--radius-1); overflow: hidden; border: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); flex-shrink: 0; transition: border-color var(--transition-fast), transform var(--transition-fast); }
+    .image-preview-item:hover { border-color: var(--vscode-focusBorder); transform: scale(1.02); }
+    .image-preview-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .image-preview-item .remove-btn { position: absolute; top: -1px; right: -1px; width: 16px; height: 16px; border-radius: 50%; background: var(--vscode-badge-background); border: none; color: var(--vscode-badge-foreground); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 600; line-height: 1; opacity: 0; transition: opacity var(--transition-fast), background var(--transition-fast); box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
+    .image-preview-item:hover .remove-btn { opacity: 1; }
+    .image-preview-item .remove-btn:hover { background: var(--vscode-errorForeground, #e5484d); color: white; }
+    .image-preview-hint { display: none; }
+
+    /* 拖拽上传提示 */
+    .drop-overlay { position: absolute; inset: 0; background: rgba(var(--vscode-button-background), 0.1); border: 2px dashed var(--vscode-focusBorder); border-radius: var(--radius-2); display: none; align-items: center; justify-content: center; z-index: 10; pointer-events: none; }
+    .drop-overlay.active { display: flex; }
+    .drop-overlay-text { font-size: var(--font-size-2); color: var(--vscode-focusBorder); font-weight: 500; }
+
+    /* 重连状态提示 */
+    .reconnect-indicator {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 8px 12px; margin: 8px 0; border-radius: 6px;
+      background: rgba(234, 179, 8, 0.1);
+      border: 1px solid rgba(234, 179, 8, 0.3);
+      color: #eab308; font-size: 12px;
+    }
+    .reconnect-indicator svg { width: 14px; height: 14px; animation: spin 1s linear infinite; }
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+    /* 空状态 */
+    .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--vscode-descriptionForeground); gap: var(--spacing-3); padding: var(--spacing-5); }
+    .empty-state-icon { width: 64px; height: 64px; border-radius: var(--radius-3); background: var(--vscode-input-background); display: flex; align-items: center; justify-content: center; }
+    .empty-state-icon svg { width: 32px; height: 32px; fill: currentColor; opacity: 0.5; }
+    .empty-state-text { font-size: var(--font-size-3); text-align: center; max-width: 240px; line-height: 1.5; }
+    .empty-state-hint { font-size: var(--font-size-1); opacity: 0.7; }
+
+    /* Modal 对话框样式 */
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6); display: flex; align-items: center; justify-content: center; z-index: 1000; animation: fadeIn 0.15s ease; }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    .modal-dialog { width: 480px; max-width: 90vw; max-height: 80vh; background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); overflow: hidden; display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4); animation: slideUp 0.2s ease; }
+    @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+    .modal-header { display: flex; align-items: center; justify-content: space-between; padding: var(--spacing-3) var(--spacing-4); border-bottom: 1px solid var(--vscode-panel-border); }
+    .modal-header h3 { font-size: var(--font-size-3); font-weight: 600; margin: 0; }
+    .modal-close { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: transparent; border: none; color: var(--vscode-descriptionForeground); cursor: pointer; border-radius: var(--radius-1); font-size: 20px; line-height: 1; transition: all var(--transition-fast); }
+    .modal-close:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+    .modal-body { flex: 1; overflow-y: auto; padding: var(--spacing-4); }
+    .modal-footer { display: flex; align-items: center; justify-content: flex-end; gap: var(--spacing-2); padding: var(--spacing-3) var(--spacing-4); border-top: 1px solid var(--vscode-panel-border); }
+    .form-field { margin-bottom: var(--spacing-3); }
+    .form-field:last-child { margin-bottom: 0; }
+    .form-field label { display: block; font-size: var(--font-size-2); font-weight: 500; color: var(--vscode-foreground); margin-bottom: var(--spacing-1); }
+    .form-field input[type="text"],
+    .form-field input[type="password"],
+    .form-field textarea { width: 100%; padding: var(--spacing-2); font-size: var(--font-size-2); background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-1); font-family: inherit; outline: none; transition: border-color var(--transition-fast); }
+    .form-field input[type="text"]:focus,
+    .form-field input[type="password"]:focus,
+    .form-field textarea:focus { border-color: var(--vscode-focusBorder); }
+    .form-field textarea { resize: vertical; font-family: monospace; line-height: 1.5; }
+    .form-field input[type="checkbox"] { margin-right: var(--spacing-1); }
+
+    /* 自定义输入对话框 */
+    .profile-input-dialog { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 300; }
+    .profile-input-dialog.visible { display: flex; }
+    .profile-input-dialog-content { width: 360px; background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); padding: var(--spacing-4); }
+    .profile-input-dialog-title { font-size: var(--font-size-3); font-weight: 600; margin-bottom: var(--spacing-3); }
+    .profile-input-dialog-input { width: 100%; padding: var(--spacing-1) var(--spacing-2); font-size: var(--font-size-2); background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-1); margin-bottom: var(--spacing-3); }
+    .profile-input-dialog-input:focus { outline: none; border-color: var(--vscode-focusBorder); }
+    .profile-input-dialog-actions { display: flex; gap: var(--spacing-2); justify-content: flex-end; }
+    .profile-input-dialog-btn { padding: var(--spacing-1) var(--spacing-3); font-size: var(--font-size-2); border-radius: var(--radius-1); cursor: pointer; border: none; }
+    .profile-input-dialog-btn.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    .profile-input-dialog-btn.primary:hover { background: var(--vscode-button-hoverBackground); }
+    .profile-input-dialog-btn.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+    .profile-input-dialog-btn.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
+
+    /* 空状态样式 - 统一所有空状态提示 */
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: var(--spacing-5) var(--spacing-3);
+      color: var(--vscode-descriptionForeground);
+      text-align: center;
+      background: var(--vscode-input-background);
+      border: 1px dashed var(--vscode-input-border);
+      border-radius: var(--radius-2);
+      min-height: 160px;
+    }
+    .empty-state svg {
+      margin-bottom: var(--spacing-3);
+      opacity: 0.3;
+    }
+    .empty-state p {
+      margin: var(--spacing-1) 0;
+      font-size: var(--font-size-2);
+      font-weight: 500;
+    }
+    .empty-state p:first-of-type {
+      font-size: var(--font-size-3);
+      font-weight: 600;
+      color: var(--vscode-foreground);
+    }
+    .empty-state-hint {
+      font-size: var(--font-size-1);
+      opacity: 0.7;
+      margin-top: var(--spacing-1);
+    }

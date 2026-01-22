@@ -19,6 +19,7 @@ import {
   DEFAULT_CONTEXT_CONFIG,
   MemoryContent
 } from './types';
+import { UnifiedSessionManager, SessionSummary } from '../session/unified-session-manager';
 
 type MemorySummaryOptions = {
   includeCurrentTasks?: boolean;
@@ -43,13 +44,31 @@ export class ContextManager {
   private sessionMemory: MemoryDocument | null = null;
   private initialized: boolean = false;
   private truncationUtils: TruncationUtils;
+  private sessionManager: UnifiedSessionManager | null = null;
+  private currentSessionId: string | null = null;
 
   constructor(
     private workspacePath: string,
-    config: Partial<ContextManagerConfig> = {}
+    config: Partial<ContextManagerConfig> = {},
+    sessionManager?: UnifiedSessionManager
   ) {
     this.config = { ...DEFAULT_CONTEXT_CONFIG, ...config };
     this.truncationUtils = new TruncationUtils(this.config.compression.truncation);
+    this.sessionManager = sessionManager || null;
+  }
+
+  /**
+   * 设置 SessionManager（用于获取会话总结）
+   */
+  setSessionManager(sessionManager: UnifiedSessionManager): void {
+    this.sessionManager = sessionManager;
+  }
+
+  /**
+   * 设置当前会话 ID（用于获取会话总结）
+   */
+  setCurrentSessionId(sessionId: string): void {
+    this.currentSessionId = sessionId;
   }
 
   /**
@@ -161,12 +180,41 @@ export class ContextManager {
     const parts: string[] = [];
     let currentTokens = 0;
 
+    // 0. 添加会话总结（如果有 SessionManager 和当前会话 ID）
+    if (this.sessionManager && this.currentSessionId) {
+      const sessionSummary = this.sessionManager.getSessionSummary(this.currentSessionId);
+      if (sessionSummary) {
+        const summaryText = this.formatSessionSummaryForContext(sessionSummary);
+        const summaryTokens = this.estimateTokens(summaryText);
+        const summaryBudget = Math.floor(maxTokens * 0.2); // 最多占用 20% 的 token 预算
+
+        if (summaryTokens <= summaryBudget) {
+          parts.push(summaryText);
+          currentTokens += summaryTokens;
+          logger.info('上下文.会话总结.已注入', {
+            sessionId: this.currentSessionId,
+            tokens: summaryTokens
+          }, LogCategory.SESSION);
+        } else {
+          // 如果总结太长，进行截断
+          const truncated = this.truncationUtils.truncateMessage(summaryText, summaryBudget * 4);
+          parts.push(truncated.content);
+          currentTokens += this.estimateTokens(truncated.content);
+          logger.info('上下文.会话总结.已截断', {
+            sessionId: this.currentSessionId,
+            originalTokens: summaryTokens,
+            truncatedTokens: this.estimateTokens(truncated.content)
+          }, LogCategory.SESSION);
+        }
+      }
+    }
+
     // 1. 添加会话 Memory 摘要（高优先级）
     if (includeMemory && this.sessionMemory) {
       const summary = this.buildMemorySummary(memorySummary);
       if (summary) {
         const memoryTokens = this.estimateTokens(summary);
-        const memoryBudget = Math.max(0, Math.floor(maxTokens * memoryRatio));
+        const memoryBudget = Math.max(0, Math.floor((maxTokens - currentTokens) * memoryRatio));
         if (memoryBudget > 0) {
           if (memoryTokens <= memoryBudget) {
             parts.push('## 会话上下文\n' + summary);
@@ -192,6 +240,65 @@ export class ContextManager {
     }
 
     return parts.join('\n\n---\n\n');
+  }
+
+  /**
+   * 格式化会话总结为上下文文本
+   */
+  private formatSessionSummaryForContext(summary: SessionSummary): string {
+    const lines: string[] = [];
+
+    lines.push('## 会话总结');
+    lines.push('');
+    lines.push(`**会话**: ${summary.title}`);
+    lines.push(`**目标**: ${summary.objective}`);
+    lines.push(`**消息数**: ${summary.messageCount} 条`);
+    lines.push('');
+
+    if (summary.completedTasks.length > 0) {
+      lines.push('**已完成任务**:');
+      summary.completedTasks.forEach((task, i) => {
+        lines.push(`${i + 1}. ${task}`);
+      });
+      lines.push('');
+    }
+
+    if (summary.inProgressTasks.length > 0) {
+      lines.push('**进行中任务**:');
+      summary.inProgressTasks.forEach((task, i) => {
+        lines.push(`${i + 1}. ${task}`);
+      });
+      lines.push('');
+    }
+
+    if (summary.keyDecisions.length > 0) {
+      lines.push('**关键决策**:');
+      summary.keyDecisions.forEach((decision, i) => {
+        lines.push(`${i + 1}. ${decision}`);
+      });
+      lines.push('');
+    }
+
+    if (summary.codeChanges.length > 0) {
+      lines.push('**代码变更**:');
+      summary.codeChanges.slice(0, 10).forEach((change, i) => {
+        lines.push(`${i + 1}. ${change}`);
+      });
+      if (summary.codeChanges.length > 10) {
+        lines.push(`... 还有 ${summary.codeChanges.length - 10} 个文件`);
+      }
+      lines.push('');
+    }
+
+    if (summary.pendingIssues.length > 0) {
+      lines.push('**待解决问题**:');
+      summary.pendingIssues.forEach((issue, i) => {
+        lines.push(`${i + 1}. ${issue}`);
+      });
+      lines.push('');
+    }
+
+    return lines.join('\n');
   }
 
   /**

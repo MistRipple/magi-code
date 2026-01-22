@@ -7,7 +7,7 @@
  * - 基于风险 + 弱项决定评审严格度
  */
 
-import { CLIType } from '../../types';
+import { WorkerSlot } from '../../types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { WorkerProfile } from '../profile/types';
 import {
@@ -137,7 +137,7 @@ export class ProfileAwareReviewer {
   /**
    * 互检评审者选择：基于能力画像匹配
    */
-  selectPeerReviewer(assignment: Assignment, executor: CLIType): CLIType {
+  selectPeerReviewer(assignment: Assignment, executor: WorkerSlot): WorkerSlot {
     const category = this.inferCategory(assignment);
     const allProfiles = this.profileLoader.getAllProfiles();
 
@@ -155,7 +155,7 @@ export class ProfileAwareReviewer {
       });
 
     if (candidates.length > 0) {
-      return candidates[0][0] as CLIType;
+      return candidates[0][0] as WorkerSlot;
     }
 
     // 没有找到合适的评审者，返回默认
@@ -165,7 +165,7 @@ export class ProfileAwareReviewer {
   /**
    * 评审严格度：基于分类风险 + Worker 弱项
    */
-  determineReviewLevel(assignment: Assignment, executor: CLIType): ReviewLevel {
+  determineReviewLevel(assignment: Assignment, executor: WorkerSlot): ReviewLevel {
     const category = this.inferCategory(assignment);
     const categoryConfig = this.profileLoader.getCategory(category);
     const profile = this.profileLoader.getProfile(executor);
@@ -291,14 +291,14 @@ export class ProfileAwareReviewer {
    */
   private findBetterWorker(
     category: string,
-    currentWorker: CLIType
-  ): CLIType | null {
+    currentWorker: WorkerSlot
+  ): WorkerSlot | null {
     const allProfiles = this.profileLoader.getAllProfiles();
 
     for (const [cli, profile] of allProfiles.entries()) {
       if (cli === currentWorker) continue;
       if (profile.preferences.preferredCategories.includes(category)) {
-        return cli as CLIType;
+        return cli as WorkerSlot;
       }
     }
 

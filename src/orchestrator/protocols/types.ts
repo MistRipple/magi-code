@@ -6,10 +6,10 @@
  * - Worker Agents：专职执行，向编排者汇报进度和结果
  */
 
-import { CLIType, SubTask, PermissionMatrix, StrategyConfig } from '../../types';
+import { WorkerSlot, SubTask, PermissionMatrix, StrategyConfig } from '../../types';
 
 // 重新导出统一类型
-export { SubTask, CLIType };
+export { SubTask, WorkerSlot };
 
 // ============================================================================
 // Worker 相关类型
@@ -21,7 +21,7 @@ export type WorkerState = 'idle' | 'executing' | 'completed' | 'failed' | 'cance
 /** Worker 信息 */
 export interface WorkerInfo {
   id: string;
-  type: CLIType;
+  type: WorkerSlot;
   state: WorkerState;
   currentTaskId?: string;
   lastActivity?: number;
@@ -57,7 +57,7 @@ export interface ExecutionPlan {
 /** 执行结果 */
 export interface ExecutionResult {
   workerId: string;
-  workerType: CLIType;
+  workerType: WorkerSlot;
   taskId: string;
   subTaskId: string;
   dispatchId?: string;
@@ -292,23 +292,18 @@ export interface OrchestratorConfig {
   /** 计划评审配置 */
   planReview?: {
     enabled?: boolean;
-    reviewer?: CLIType;
+    reviewer?: WorkerSlot;
   };
   /** 功能集成配置 */
   integration?: {
     enabled?: boolean;
     maxRounds?: number;
-    worker?: CLIType;
+    worker?: WorkerSlot;
   };
   /** 权限矩阵 */
   permissions?: PermissionMatrix;
   /** 策略开关 */
   strategy?: StrategyConfig;
-  /** CLI 选择策略 */
-  cliSelection?: {
-    enabled?: boolean;
-    healthThreshold?: number;
-  };
   /** 上下文注入配置 */
   context?: {
     /** Worker 使用的最大 token 数 */
@@ -359,7 +354,7 @@ export interface OrchestratorUIMessage {
   metadata?: {
     phase?: OrchestratorState;
     workerId?: string;
-    workerType?: CLIType;
+    workerType?: WorkerSlot;
     subTaskId?: string;
     dispatchId?: string;
     progress?: number;

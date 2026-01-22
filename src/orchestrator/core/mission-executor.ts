@@ -9,14 +9,13 @@
  */
 
 import { EventEmitter } from 'events';
-import { CLIType } from '../../types';
+import { WorkerSlot } from '../../types';
 import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import { TokenUsage } from '../../types/agent-types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
 import { ProfileAwareReviewer } from '../review/profile-aware-reviewer';
 import { AutonomousWorker, AutonomousExecutionResult } from '../worker';
-import { BaseWorker } from '../../workers/base-worker';
 import {
   Mission,
   Assignment,
@@ -91,15 +90,15 @@ export interface ExecutionOptions {
   /** 外部 Task ID（用于同步 SubTask） */
   taskId?: string;
   /** 输出回调 */
-  onOutput?: (workerId: CLIType, output: string) => void;
+  onOutput?: (workerId: WorkerSlot, output: string) => void;
   /** 进度回调 */
   onProgress?: (progress: ExecutionProgress) => void;
   /** 阻塞回调 */
   onBlocked?: (blockedItem: BlockedItem) => void;
   /** 解除阻塞回调 */
   onUnblocked?: (blockedItem: BlockedItem) => void;
-  /** 执行后端选择 */
-  executionMode?: 'base' | 'adapter';
+  /** 执行后端选择（已弃用，仅支持 adapter 模式） */
+  executionMode?: 'adapter';
 }
 
 /**
@@ -113,7 +112,7 @@ export interface ExecutionProgress {
   blockedAssignments: number;
   currentAssignment?: {
     id: string;
-    workerId: CLIType;
+    workerId: WorkerSlot;
     progress: number;
   };
   blockedItems: BlockedItem[];
@@ -140,7 +139,7 @@ export interface ExecutionResult {
  * MissionExecutor - 任务执行器
  */
 export class MissionExecutor extends EventEmitter {
-  private workers: Map<CLIType, AutonomousWorker> = new Map();
+  private workers: Map<WorkerSlot, AutonomousWorker> = new Map();
   private reviewer: ProfileAwareReviewer;
   private blockedItems: Map<string, BlockedItem> = new Map();
   private resolvedBlockings: BlockedItem[] = [];
@@ -196,18 +195,20 @@ export class MissionExecutor extends EventEmitter {
   }
 
   /**
-   * 注册 Worker
+   * 确保 Worker 存在（懒加载创建）
    */
-  registerWorker(cliType: CLIType, baseWorker: BaseWorker): void {
-    const autonomousWorker = new AutonomousWorker(
-      cliType,
-      baseWorker,
-      this.profileLoader,
-      this.guidanceInjector
-    );
-
-    this.setupWorkerListeners(autonomousWorker);
-    this.workers.set(cliType, autonomousWorker);
+  private ensureWorker(workerSlot: WorkerSlot): AutonomousWorker {
+    let worker = this.workers.get(workerSlot);
+    if (!worker) {
+      worker = new AutonomousWorker(
+        workerSlot,
+        this.profileLoader,
+        this.guidanceInjector
+      );
+      this.setupWorkerListeners(worker);
+      this.workers.set(workerSlot, worker);
+    }
+    return worker;
   }
 
   /**
@@ -242,12 +243,11 @@ export class MissionExecutor extends EventEmitter {
     mission: Mission,
     options: ExecutionOptions
   ): Promise<ExecutionResult> {
-    const executionMode = options.executionMode
-      ?? (this.adapterFactory ? 'adapter' : 'base');
-    const effectiveOptions: ExecutionOptions = { ...options, executionMode };
-    if (executionMode === 'adapter' && !this.adapterFactory) {
-      throw new Error('未配置 CLIAdapterFactory，无法使用流式执行模式');
+    // 仅支持 adapter 模式
+    if (!this.adapterFactory) {
+      throw new Error('未配置 AdapterFactory，无法执行任务');
     }
+    const effectiveOptions: ExecutionOptions = { ...options, executionMode: 'adapter' };
     const startTime = Date.now();
     const assignmentResults = new Map<string, AutonomousExecutionResult>();
     const contractVerifications = new Map<string, boolean>();
@@ -396,10 +396,7 @@ export class MissionExecutor extends EventEmitter {
     });
 
     const planningPromises = mission.assignments.map(async (assignment) => {
-      const worker = this.workers.get(assignment.workerId);
-      if (!worker) {
-        throw new Error(`Worker not found: ${assignment.workerId}`);
-      }
+      const worker = this.ensureWorker(assignment.workerId);
 
       // Worker 自主规划（传递动态上下文）
       const planResult = await worker.planAssignment(assignment, {
@@ -445,10 +442,7 @@ export class MissionExecutor extends EventEmitter {
     });
 
     for (const assignment of mission.assignments) {
-      const worker = this.workers.get(assignment.workerId);
-      if (!worker) {
-        throw new Error(`Worker not found: ${assignment.workerId}`);
-      }
+      const worker = this.ensureWorker(assignment.workerId);
 
       // Worker 自主规划（传递动态上下文）
       const planResult = await worker.planAssignment(assignment, {
@@ -529,10 +523,7 @@ export class MissionExecutor extends EventEmitter {
     mission: Mission,
     options: ExecutionOptions
   ): Promise<AutonomousExecutionResult> {
-    const worker = this.workers.get(assignment.workerId);
-    if (!worker) {
-      throw new Error(`Worker not found: ${assignment.workerId}`);
-    }
+    const worker = this.ensureWorker(assignment.workerId);
 
     // 检查阻塞
     const blockingReason = this.checkAssignmentBlocking(assignment, mission);
@@ -1040,14 +1031,14 @@ export class MissionExecutor extends EventEmitter {
   /**
    * 获取 Worker
    */
-  getWorker(cliType: CLIType): AutonomousWorker | undefined {
+  getWorker(cliType: WorkerSlot): AutonomousWorker | undefined {
     return this.workers.get(cliType);
   }
 
   /**
    * 获取所有 Worker
    */
-  getAllWorkers(): Map<CLIType, AutonomousWorker> {
+  getAllWorkers(): Map<WorkerSlot, AutonomousWorker> {
     return new Map(this.workers);
   }
 

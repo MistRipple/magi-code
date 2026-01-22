@@ -15,16 +15,13 @@
 import { EventEmitter } from 'events';
 import path from 'path';
 import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
-import { createClaudeWorker } from '../../workers/claude-worker';
-import { createCodexWorker } from '../../workers/codex-worker';
-import { createGeminiWorker } from '../../workers/gemini-worker';
 import { UnifiedSessionManager } from '../../session/unified-session-manager';
 import { SnapshotManager } from '../../snapshot-manager';
 import { ContextManager } from '../../context/context-manager';
 import { UnifiedTaskManager } from '../../task/unified-task-manager';
 import { TaskAnalyzer } from '../../task/task-analyzer';
 import { logger, LogCategory } from '../../logging';
-import { CLIType, PermissionMatrix, StrategyConfig, SubTask, WorkerSlot } from '../../types';
+import { PermissionMatrix, StrategyConfig, SubTask, WorkerSlot } from '../../types';
 import { TokenUsage } from '../../types/agent-types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
@@ -80,20 +77,16 @@ export interface MissionDrivenEngineConfig {
   };
   planReview?: {
     enabled?: boolean;
-    reviewer?: CLIType;
+    reviewer?: WorkerSlot;
   };
   verification?: Partial<VerificationConfig>;
   integration?: {
     enabled?: boolean;
     maxRounds?: number;
-    worker?: CLIType;
+    worker?: WorkerSlot;
   };
   permissions?: PermissionMatrix;
   strategy?: StrategyConfig;
-  cliSelection?: {
-    enabled?: boolean;
-    healthThreshold?: number;
-  };
 }
 
 /**
@@ -135,7 +128,7 @@ export class MissionDrivenEngine extends EventEmitter {
   private taskManagerSessionId: string | null = null;
   private lastTaskAnalysis: {
     suggestedMode?: 'sequential' | 'parallel';
-    explicitWorkers?: CLIType[];
+    explicitWorkers?: WorkerSlot[];
     wantsParallel?: boolean;
   } | null = null;
   private currentTaskId: string | null = null;
@@ -207,22 +200,6 @@ export class MissionDrivenEngine extends EventEmitter {
     this.missionExecutor.setSnapshotManager(snapshotManager);
     this.missionExecutor.setWorkspaceRoot(workspaceRoot);
     this.missionExecutor.setAdapterFactory(adapterFactory);
-    const timeout = this.config.timeout ?? 300000;
-
-    // ✅ Note: Worker creation still uses CLI paths for now
-    // This will be refactored in later phases when workers are updated to use LLM adapters
-    this.missionExecutor.registerWorker(
-      'claude',
-      createClaudeWorker((adapterFactory as any).getCliPath?.('claude') || 'claude', workspaceRoot, timeout)
-    );
-    this.missionExecutor.registerWorker(
-      'codex',
-      createCodexWorker((adapterFactory as any).getCliPath?.('codex') || 'codex', workspaceRoot, timeout)
-    );
-    this.missionExecutor.registerWorker(
-      'gemini',
-      createGeminiWorker((adapterFactory as any).getCliPath?.('gemini') || 'gemini', workspaceRoot, timeout)
-    );
 
     this.setupEventForwarding();
   }
@@ -572,7 +549,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
       const analysis = this.lastTaskAnalysis as unknown as {
         wantsParallel?: boolean;
-        explicitWorkers?: CLIType[];
+        explicitWorkers?: WorkerSlot[];
         suggestedMode?: 'sequential' | 'parallel';
       } | null;
       const wantsParallel = Boolean(
@@ -600,7 +577,7 @@ export class MissionDrivenEngine extends EventEmitter {
         const assignment = mission.assignments.find(a => a.id === assignmentId);
         if (assignment) {
           this.executionStats.recordExecution({
-            cli: assignment.workerId,
+            worker: assignment.workerId,
             taskId,
             subTaskId: assignmentId,
             success: assignmentResult.success,
@@ -663,6 +640,9 @@ export class MissionDrivenEngine extends EventEmitter {
       this.setState('summarizing');
 
       const summary = await this.missionOrchestrator.summarizeMission(mission.id);
+
+      // 12. 清理 Worker 适配器历史以控制 token 消耗
+      this.clearWorkerHistoriesAfterMission();
 
       this.setState('idle');
 
@@ -850,7 +830,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
       // 同时记录到 ExecutionStats（编排器使用 claude）
       this.executionStats.recordExecution({
-        cli: 'claude',
+        worker: 'claude',
         taskId: 'orchestrator',
         subTaskId: phase,
         success: true,
@@ -1187,5 +1167,16 @@ export class MissionDrivenEngine extends EventEmitter {
     }
 
     return output;
+  }
+
+  /**
+   * 任务完成后清理 Worker 适配器历史
+   * 以控制 token 消耗，避免历史无限增长
+   */
+  private clearWorkerHistoriesAfterMission(): void {
+    if (this.adapterFactory.clearAllAdapterHistories) {
+      this.adapterFactory.clearAllAdapterHistories();
+      logger.debug('引擎.历史清理.完成', undefined, LogCategory.ORCHESTRATOR);
+    }
   }
 }

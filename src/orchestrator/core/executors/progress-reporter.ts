@@ -8,7 +8,7 @@
  */
 
 import { EventEmitter } from 'events';
-import { CLIType } from '../../../types';
+import { WorkerSlot } from '../../../types';
 import { TokenUsage } from '../../../types/agent-types';
 import { Mission, Assignment, WorkerTodo } from '../../mission';
 
@@ -27,7 +27,7 @@ export interface ExecutionProgress {
   /** 已完成 Todo 数 */
   completedTodos: number;
   /** 当前执行的 Worker */
-  currentWorker?: CLIType;
+  currentWorker?: WorkerSlot;
   /** 当前执行的 Assignment */
   currentAssignment?: string;
   /** Token 使用统计 */

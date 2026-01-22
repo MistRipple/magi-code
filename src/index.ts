@@ -13,27 +13,6 @@ export { UnifiedSessionManager, UnifiedSession, SessionMessage, FileSnapshotMeta
 export { SnapshotManager } from './snapshot-manager';
 export { DiffGenerator, DiffResult } from './diff-generator';
 
-// CLI 检测器
-export { CLIDetector, cliDetector } from './cli-detector';
-
-// Orchestrator
-export { Orchestrator, OrchestratorOptions } from './orchestrator';
-
-// Workers
-export {
-  BaseWorker,
-  WorkerExecuteOptions,
-  ClaudeWorker,
-  ClaudeWorkerConfig,
-  createClaudeWorker,
-  CodexWorker,
-  CodexWorkerConfig,
-  createCodexWorker,
-  GeminiWorker,
-  GeminiWorkerConfig,
-  createGeminiWorker,
-} from './workers';
-
 // UI
 export { WebviewProvider } from './ui/webview-provider';
 

@@ -1,0 +1,1427 @@
+    /* 恢复确认对话框 */
+    .recovery-dialog { display: none; flex-direction: column; gap: var(--spacing-3); padding: var(--spacing-4); background: var(--vscode-editor-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); margin: var(--spacing-3); }
+    .recovery-dialog.visible { display: flex; }
+    .recovery-dialog-title { font-size: var(--font-size-3); font-weight: 600; color: var(--vscode-errorForeground); display: flex; align-items: center; gap: 8px; }
+    .recovery-dialog-title svg { width: 16px; height: 16px; fill: currentColor; }
+    .recovery-dialog-error { font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); background: var(--vscode-input-background); padding: var(--spacing-2); border-radius: var(--radius-2); max-height: 100px; overflow-y: auto; white-space: pre-wrap; font-family: monospace; }
+    .recovery-dialog-actions { display: flex; gap: var(--spacing-2); justify-content: flex-end; }
+    .recovery-btn { padding: 6px 12px; font-size: var(--font-size-2); border-radius: var(--radius-2); border: none; cursor: pointer; transition: all var(--transition-fast); }
+    .recovery-btn.retry { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    .recovery-btn.rollback { background: var(--vscode-errorForeground); color: white; }
+    .recovery-btn.continue { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
+    .recovery-btn:hover { opacity: 0.9; }
+
+    /* 执行计划确认对话框 - 已移除弹窗，保留内联卡片样式 */
+    .plan-confirmation-header { display: flex; align-items: center; gap: 8px; font-size: var(--font-size-3); font-weight: 600; color: var(--vscode-foreground); }
+    .plan-confirmation-header svg { width: 14px; height: 14px; fill: var(--vscode-button-background); }
+    .plan-confirmation-content { font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); background: var(--vscode-input-background); padding: var(--spacing-3); border-radius: var(--radius-2); max-height: 300px; overflow-y: auto; white-space: pre-wrap; line-height: 1.5; }
+    .plan-confirmation-content h2 { font-size: var(--font-size-3); color: var(--vscode-foreground); margin: 0 0 var(--spacing-2) 0; }
+    .plan-confirmation-content strong { color: var(--vscode-foreground); }
+    .plan-confirmation-actions { display: flex; gap: var(--spacing-2); justify-content: flex-end; padding-top: var(--spacing-2); border-top: 1px solid var(--vscode-panel-border); }
+    .plan-confirm-btn { padding: 8px 16px; font-size: var(--font-size-2); font-weight: 500; border-radius: var(--radius-2); border: none; cursor: pointer; transition: all var(--transition-fast); display: flex; align-items: center; gap: 6px; }
+    .plan-confirm-btn.confirm { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    .plan-confirm-btn.confirm:hover { background: var(--vscode-button-hoverBackground); }
+    .settings-section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--spacing-2); }
+    .settings-btn { border: 1px solid var(--vscode-button-border, var(--vscode-contrastBorder, rgba(255,255,255,0.1))); border-radius: var(--radius-2); padding: 6px 12px; cursor: pointer; background: var(--vscode-button-background); color: var(--vscode-button-foreground); font-size: var(--font-size-2); min-width: 80px; transition: background var(--transition-fast), border-color var(--transition-fast); }
+    .settings-btn:hover { border-color: var(--vscode-focusBorder); }
+    .settings-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .settings-btn.secondary { background: var(--vscode-button-secondaryBackground, var(--vscode-button-background)); color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground)); }
+    .settings-btn.secondary:hover { background: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-hoverBackground)); }
+    .plan-confirm-btn.cancel { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
+    .plan-confirm-btn.cancel:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+    /* =========================================================================
+       统一卡片组件系统 (Unified Card Component System)
+       所有卡片类型统一使用此系统，不再使用独立的卡片样式
+       ========================================================================= */
+    .unified-card {
+      background: var(--vscode-editor-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: var(--card-border-radius);
+      margin: var(--spacing-2) 0;
+      overflow: hidden;
+      width: 100%;
+      box-sizing: border-box;
+    }
+
+    /* 卡片变体 - 左边框颜色 */
+    .unified-card.card-orchestrator { border-left: 3px solid var(--color-orchestrator); }
+    .unified-card.card-claude { border-left: 3px solid var(--color-claude); }
+    .unified-card.card-codex { border-left: 3px solid var(--color-codex); }
+    .unified-card.card-gemini { border-left: 3px solid var(--color-gemini); }
+    .unified-card.card-success { border-left: 3px solid var(--color-success); }
+    .unified-card.card-error { border-left: 3px solid var(--color-error); }
+    .unified-card.card-warning { border-left: 3px solid var(--color-warning); }
+    .unified-card.card-info { border-left: 3px solid var(--color-info); }
+
+    /* 卡片头部 */
+    .unified-card .card-header {
+      display: flex;
+      align-items: center;
+      gap: var(--card-header-gap);
+      padding: var(--spacing-2) var(--card-padding);
+      background: var(--vscode-sideBar-background);
+      border-bottom: 1px solid var(--vscode-panel-border);
+      cursor: default;
+    }
+    .unified-card.collapsible-panel .card-header { cursor: pointer; }
+    .unified-card.collapsible-panel .card-header:hover { background: var(--vscode-list-hoverBackground); }
+
+    .unified-card .card-icon {
+      width: 14px;
+      height: 14px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .unified-card .card-icon svg { width: 14px; height: 14px; fill: currentColor; opacity: 0.8; }
+    .unified-card.card-orchestrator .card-icon svg { fill: var(--color-orchestrator); }
+    .unified-card.card-claude .card-icon svg { fill: var(--color-claude); }
+    .unified-card.card-codex .card-icon svg { fill: var(--color-codex); }
+    .unified-card.card-gemini .card-icon svg { fill: var(--color-gemini); }
+    .unified-card.card-success .card-icon svg { fill: var(--color-success); }
+    .unified-card.card-error .card-icon svg { fill: var(--color-error); }
+    .unified-card.card-warning .card-icon svg { fill: var(--color-warning); }
+    .unified-card.card-info .card-icon svg { fill: var(--color-info); }
+
+    .unified-card .card-title {
+      font-weight: 600;
+      font-size: var(--font-size-2);
+      flex: 1;
+      color: var(--vscode-foreground);
+    }
+
+    .unified-card .card-badges { display: flex; gap: 4px; }
+    .unified-card .card-badge {
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: var(--radius-1);
+      font-weight: 500;
+      background: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
+    }
+    .unified-card .card-badge.badge-orchestrator { background: var(--color-orchestrator); color: #fff; }
+    .unified-card .card-badge.badge-claude { background: var(--color-claude); color: #fff; }
+    .unified-card .card-badge.badge-codex { background: var(--color-codex); color: #fff; }
+    .unified-card .card-badge.badge-gemini { background: var(--color-gemini); color: #fff; }
+    .unified-card .card-badge.badge-success { background: var(--color-success); color: #fff; }
+    .unified-card .card-badge.badge-error { background: var(--color-error); color: #fff; }
+    .unified-card .card-badge.badge-warning { background: var(--color-warning); color: #000; }
+    .unified-card .card-badge.badge-info { background: var(--color-info); color: #fff; }
+    .unified-card .card-badge.badge-pending { background: var(--vscode-charts-yellow); color: #000; }
+    .unified-card .card-badge.badge-running { background: var(--vscode-charts-blue); color: #fff; }
+    .unified-card .card-badge.badge-completed { background: var(--vscode-charts-green); color: #fff; }
+    .unified-card .card-badge.badge-failed { background: var(--vscode-charts-red); color: #fff; }
+
+    .unified-card .card-time {
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+    }
+
+    /* 卡片内容 */
+    .unified-card .card-body {
+      padding: var(--card-padding);
+      font-size: var(--font-size-2);
+      line-height: 1.5;
+      color: var(--vscode-foreground);
+    }
+    .unified-card .card-body .markdown-rendered { margin: 0; }
+
+    /* 卡片底部 */
+    .unified-card .card-footer {
+      display: flex;
+      gap: var(--spacing-2);
+      justify-content: flex-end;
+      padding: var(--spacing-2) var(--card-padding);
+      border-top: 1px solid var(--vscode-panel-border);
+      background: var(--vscode-sideBar-background);
+    }
+
+    /* 卡片类型特定样式 */
+    .unified-card.card-type-error { border-color: var(--color-error); background: var(--color-error-bg); }
+    .unified-card.card-type-error .card-header { background: rgba(239, 68, 68, 0.15); }
+    .unified-card.card-type-warning { border-color: var(--color-warning); background: var(--color-warning-bg); }
+    .unified-card.card-type-warning .card-header { background: rgba(245, 158, 11, 0.15); }
+
+    /* 系统提示消息（简洁样式，无边框，保留色彩） */
+    .system-notice { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 4px 12px; margin: 2px auto; font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); width: fit-content; max-width: 90%; }
+    .system-notice-icon { flex-shrink: 0; width: 14px; height: 14px; }
+    .system-notice-icon svg { width: 14px; height: 14px; fill: currentColor; display: block; }
+    .system-notice.info { color: var(--vscode-textLink-foreground); }
+    .system-notice.success { color: var(--vscode-charts-green); }
+    .system-notice.warning { color: var(--vscode-charts-yellow); }
+    .system-notice.error { color: var(--vscode-errorForeground); }
+    .system-notice-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .system-notice-time { font-size: 10px; opacity: 0.6; margin-left: 4px; }
+
+    /* 统一卡片内容样式 - 用于卡片内部的特定内容区域 */
+
+    /* 错误卡片内容 */
+    .error-content { white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow-y: auto; }
+    .error-hint { margin-top: var(--spacing-2); font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); padding-top: var(--spacing-2); border-top: 1px solid var(--vscode-panel-border); }
+
+    /* 任务卡片内容 */
+    .task-card-description { font-size: var(--font-size-2); line-height: 1.5; color: var(--vscode-foreground); margin-bottom: 8px; }
+    .task-card-reason { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-bottom: 6px; }
+    .task-card-label { font-weight: 500; color: var(--vscode-foreground); opacity: 0.8; }
+    .task-card-files { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .task-card-file-list { margin: 4px 0 0 0; padding-left: 16px; list-style: none; }
+    .task-card-file-list li { margin: 2px 0; }
+    .task-card-file-list li::before { content: "•"; margin-right: 6px; opacity: 0.5; }
+    .task-card-file-list code { font-family: var(--vscode-editor-font-family); font-size: 11px; background: var(--vscode-textCodeBlock-background); padding: 1px 4px; border-radius: 3px; }
+    .task-card-subtasks { display: flex; flex-direction: column; gap: 4px; }
+    .subtask-item { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: var(--radius-2); background: rgba(255, 255, 255, 0.02); }
+    .subtask-cli { font-size: var(--font-size-1); padding: 2px 6px; border-radius: var(--radius-1); background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); text-transform: uppercase; }
+    .subtask-desc { flex: 1; font-size: var(--font-size-2); }
+
+    /* 任务分配卡片 - Worker 面板专用（来自编排者的任务） */
+    .task-assignment-card { margin-bottom: var(--spacing-3); }
+    .task-assignment-card .card-header { background: var(--color-orchestrator-bg); }
+    .task-assignment-content { display: flex; flex-direction: column; gap: var(--spacing-2); }
+    .task-field { display: flex; flex-direction: column; gap: var(--spacing-1); }
+    .task-field-label { font-size: var(--font-size-1); font-weight: 500; color: var(--vscode-descriptionForeground); }
+    .task-field-value { font-size: var(--font-size-2); color: var(--vscode-foreground); line-height: 1.5; }
+    .task-file-list { margin: 0; padding-left: var(--spacing-4); list-style: none; }
+    .task-file-list li { margin: var(--spacing-1) 0; font-size: var(--font-size-2); }
+    .task-file-list li::before { content: "•"; margin-right: var(--spacing-2); color: var(--vscode-descriptionForeground); }
+    .task-file-list code { font-family: var(--vscode-editor-font-family); font-size: 11px; padding: 1px 4px; background: var(--vscode-textCodeBlock-background); border-radius: 3px; }
+    .task-field.task-reason { padding-top: var(--spacing-2); border-top: 1px solid var(--vscode-panel-border); }
+    .task-field.task-reason .task-field-value { font-style: italic; color: var(--vscode-descriptionForeground); }
+
+    /* 任务进度条 */
+    .task-progress-container { margin: 8px 0; }
+    .task-progress-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+    .task-progress-label { font-size: 11px; color: var(--vscode-descriptionForeground); }
+    .task-progress-percent { font-size: 11px; font-weight: 500; color: var(--vscode-foreground); }
+    .task-progress-bar { height: 6px; background: var(--vscode-progressBar-background, rgba(255,255,255,0.1)); border-radius: 3px; overflow: hidden; }
+    .task-progress-fill { height: 100%; border-radius: 3px; transition: width 0.3s ease; background: linear-gradient(90deg, #3b82f6, #d97706); }
+    .task-progress-fill.completed { background: linear-gradient(90deg, #22c55e, #10b981); }
+    .task-progress-fill.failed { background: linear-gradient(90deg, #ef4444, #dc2626); }
+
+    /* 子任务状态列表 */
+    .subtask-status-list { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+    .subtask-status-item { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: var(--radius-2); background: rgba(255, 255, 255, 0.02); border: 1px solid transparent; transition: all 0.15s; }
+    .subtask-status-item:hover { background: rgba(255, 255, 255, 0.04); }
+    .subtask-status-item.running { border-color: rgba(59, 130, 246, 0.3); background: rgba(59, 130, 246, 0.05); }
+    .subtask-status-item.paused { border-color: rgba(245, 158, 11, 0.3); background: rgba(245, 158, 11, 0.05); }
+    .subtask-status-item.retrying { border-color: rgba(255, 197, 61, 0.3); background: rgba(255, 197, 61, 0.05); }
+    .subtask-status-item.completed { border-color: rgba(34, 197, 94, 0.3); }
+    .subtask-status-item.failed { border-color: rgba(239, 68, 68, 0.3); }
+    .subtask-status-item.cancelled { border-color: rgba(136, 136, 136, 0.3); }
+    .subtask-status-icon { width: 16px; height: 16px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+    .subtask-status-icon svg { width: 14px; height: 14px; fill: currentColor; }
+    .subtask-status-icon.pending { color: var(--vscode-descriptionForeground); }
+    .subtask-status-icon.running { color: #3b82f6; animation: pulse 1.5s infinite; }
+    .subtask-status-icon.paused { color: #f59e0b; }
+    .subtask-status-icon.retrying { color: #ffc53d; animation: pulse 1.5s infinite; }
+    .subtask-status-icon.completed { color: #22c55e; }
+    .subtask-status-icon.failed { color: #ef4444; }
+    .subtask-status-icon.cancelled { color: #888; }
+    .subtask-status-icon.skipped { color: #888; opacity: 0.6; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    .subtask-status-cli { font-size: 10px; padding: 2px 6px; border-radius: var(--radius-1); text-transform: uppercase; font-weight: 500; }
+    .subtask-status-cli.claude { background: rgba(217, 119, 6, 0.15); color: var(--color-claude); }
+    .subtask-status-cli.codex { background: rgba(16, 163, 127, 0.15); color: var(--color-codex); }
+    .subtask-status-cli.gemini { background: rgba(66, 133, 244, 0.15); color: var(--color-gemini); }
+    .subtask-status-desc { flex: 1; font-size: 12px; color: var(--vscode-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .subtask-status-time { font-size: 10px; color: var(--vscode-descriptionForeground); flex-shrink: 0; }
+
+    /* 计划卡片内容 */
+    .plan-content { max-height: 250px; overflow-y: auto; }
+    .plan-confirm-btn { padding: 8px 16px; font-size: var(--font-size-2); font-weight: 500; border-radius: var(--radius-2); border: none; cursor: pointer; transition: all var(--transition-fast); display: inline-flex; align-items: center; gap: 6px; }
+    .plan-confirm-btn svg { width: 14px; height: 14px; fill: currentColor; }
+    .plan-confirm-btn.confirm { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    .plan-confirm-btn.confirm:hover { background: var(--vscode-button-hoverBackground); }
+    .plan-confirm-btn.cancel { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
+    .plan-confirm-btn.cancel:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+
+    /* 🔧 结构化规划内容样式 */
+    .structured-plan-content { padding: var(--spacing-2) 0; }
+    .structured-plan-content .plan-section { margin-bottom: var(--spacing-3); }
+    .structured-plan-content .plan-section:last-child { margin-bottom: 0; }
+    .structured-plan-content .plan-section-title { font-weight: 600; font-size: var(--font-size-2); color: var(--vscode-foreground); margin-bottom: var(--spacing-1); display: flex; align-items: center; gap: 6px; }
+    .structured-plan-content .plan-section-content { font-size: var(--font-size-2); color: var(--vscode-foreground); opacity: 0.9; line-height: 1.5; padding-left: 24px; }
+    .structured-plan-content .plan-list { margin: 0; padding-left: 40px; list-style-type: disc; }
+    .structured-plan-content .plan-list li { font-size: var(--font-size-2); color: var(--vscode-foreground); opacity: 0.9; line-height: 1.6; margin-bottom: 4px; }
+    .structured-plan-content .plan-list.risk-list li { color: var(--vscode-editorWarning-foreground); }
+
+    /* 问题卡片内容 */
+    .question-list { margin: 0; padding-left: 16px; color: var(--vscode-foreground); }
+    .question-answer { width: 100%; box-sizing: border-box; margin-top: var(--spacing-2); padding: var(--spacing-2); border-radius: var(--radius-2); border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); min-height: 80px; resize: vertical; }
+    .question-answer-display { margin-top: var(--spacing-2); padding: var(--spacing-2); border-radius: var(--radius-2); border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); white-space: pre-wrap; }
+    .question-hint { margin-top: var(--spacing-2); font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .question-btn { padding: 8px 16px; font-size: var(--font-size-2); font-weight: 500; border-radius: var(--radius-2); border: none; cursor: pointer; transition: all var(--transition-fast); display: inline-flex; align-items: center; gap: 6px; }
+    .question-btn.submit { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+
+    /* 🔧 CLI 询问卡片样式 */
+    .cli-question-card { border-left: 3px solid var(--vscode-editorWarning-foreground); }
+    .cli-question-card.answered { border-left-color: var(--vscode-testing-iconPassed); }
+    .cli-question-card.timeout, .cli-question-card.error { border-left-color: var(--vscode-errorForeground); }
+    .cli-question-content { margin-bottom: var(--spacing-2); }
+    .cli-question-text { margin: 0; padding: var(--spacing-2); background: var(--vscode-textCodeBlock-background); border-radius: var(--radius-2); font-family: var(--vscode-editor-font-family); font-size: var(--font-size-2); white-space: pre-wrap; word-break: break-word; max-height: 150px; overflow-y: auto; }
+    .cli-question-answer { margin-top: var(--spacing-2); padding: var(--spacing-2); background: var(--vscode-input-background); border-radius: var(--radius-2); font-size: var(--font-size-2); }
+    .cli-question-error { margin-top: var(--spacing-2); padding: var(--spacing-2); background: rgba(255, 0, 0, 0.1); border-radius: var(--radius-2); font-size: var(--font-size-2); color: var(--vscode-errorForeground); }
+    .cli-question-actions { display: flex; gap: var(--spacing-2); align-items: center; flex-wrap: wrap; }
+    .cli-answer-btn { padding: 6px 12px; font-size: var(--font-size-2); font-weight: 500; border-radius: var(--radius-2); border: none; cursor: pointer; transition: all var(--transition-fast); display: inline-flex; align-items: center; gap: 4px; }
+    .cli-answer-btn svg { width: 14px; height: 14px; fill: currentColor; }
+    .cli-answer-btn.yes { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    .cli-answer-btn.yes:hover { background: var(--vscode-button-hoverBackground); }
+    .cli-answer-btn.no { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
+    .cli-answer-btn.no:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+    .cli-answer-input { flex: 1; min-width: 150px; padding: 6px 10px; font-size: var(--font-size-2); border-radius: var(--radius-2); border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); }
+    .cli-answer-input:focus { outline: none; border-color: var(--vscode-focusBorder); }
+    .question-btn.submit:hover { background: var(--vscode-button-hoverBackground); }
+    .question-btn.cancel { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
+    .question-btn.cancel:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+
+    /* 🆕 需求澄清卡片样式 */
+    .clarification-card { border-left: 3px solid var(--vscode-editorWarning-foreground); }
+    .clarification-card.answered { border-left-color: var(--vscode-testing-iconPassed); }
+    .clarification-card.cancelled { border-left-color: var(--vscode-descriptionForeground); }
+    .clarification-header { margin-bottom: var(--spacing-2); }
+    .ambiguity-score { display: inline-block; padding: 2px 8px; background: rgba(255, 193, 7, 0.15); color: var(--vscode-editorWarning-foreground); border-radius: var(--radius-1); font-size: var(--font-size-1); font-weight: 500; }
+    .clarification-context { margin-top: var(--spacing-2); font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); }
+    .clarification-questions { margin: var(--spacing-2) 0; }
+    .clarification-hint { font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); margin-bottom: var(--spacing-2); }
+    .clarification-question-item { margin-bottom: var(--spacing-2); padding: var(--spacing-2); background: var(--vscode-textCodeBlock-background); border-radius: var(--radius-2); }
+    .clarification-question-item .question-text { display: block; font-weight: 500; margin-bottom: var(--spacing-1); }
+    .clarification-answer-input { width: 100%; padding: 8px 10px; font-size: var(--font-size-2); border-radius: var(--radius-2); border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); margin-top: var(--spacing-1); }
+    .clarification-answer-input:focus { outline: none; border-color: var(--vscode-focusBorder); }
+    .clarification-answer-display { margin-top: var(--spacing-1); padding: var(--spacing-1) var(--spacing-2); background: var(--vscode-input-background); border-radius: var(--radius-1); font-size: var(--font-size-2); color: var(--vscode-foreground); }
+    .clarification-additional { margin-top: var(--spacing-2); }
+    .clarification-additional label { display: block; font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); margin-bottom: var(--spacing-1); }
+    .clarification-additional-input { width: 100%; min-height: 60px; padding: 8px 10px; font-size: var(--font-size-2); border-radius: var(--radius-2); border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); resize: vertical; }
+    .clarification-additional-input:focus { outline: none; border-color: var(--vscode-focusBorder); }
+    .clarification-additional-display { margin-top: var(--spacing-2); padding: var(--spacing-2); background: var(--vscode-input-background); border-radius: var(--radius-2); font-size: var(--font-size-2); }
+    .clarification-actions { display: flex; gap: var(--spacing-2); margin-top: var(--spacing-2); }
+    .clarification-btn { padding: 8px 16px; font-size: var(--font-size-2); font-weight: 500; border-radius: var(--radius-2); border: none; cursor: pointer; transition: all var(--transition-fast); }
+    .clarification-btn.submit { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    .clarification-btn.submit:hover { background: var(--vscode-button-hoverBackground); }
+    .clarification-btn.skip { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
+    .clarification-btn.skip:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+
+    /* 🆕 Worker 问题卡片样式 */
+    .worker-question-card { border-left: 3px solid var(--vscode-editorInfo-foreground); }
+    .worker-question-card.answered { border-left-color: var(--vscode-testing-iconPassed); }
+    .worker-question-card.cancelled { border-left-color: var(--vscode-descriptionForeground); }
+    .worker-question-content { margin-bottom: var(--spacing-2); }
+    .worker-info { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-bottom: var(--spacing-1); }
+    .worker-question-text { padding: var(--spacing-2); background: var(--vscode-textCodeBlock-background); border-radius: var(--radius-2); font-size: var(--font-size-2); }
+    .worker-question-context { margin-top: var(--spacing-1); font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .worker-question-answer { margin-top: var(--spacing-2); padding: var(--spacing-2); background: var(--vscode-input-background); border-radius: var(--radius-2); font-size: var(--font-size-2); }
+    .worker-question-actions { display: flex; gap: var(--spacing-2); align-items: center; }
+    .worker-answer-input { flex: 1; padding: 8px 10px; font-size: var(--font-size-2); border-radius: var(--radius-2); border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); }
+    .worker-answer-input:focus { outline: none; border-color: var(--vscode-focusBorder); }
+    .worker-answer-btn { padding: 8px 16px; font-size: var(--font-size-2); font-weight: 500; border-radius: var(--radius-2); border: none; cursor: pointer; transition: all var(--transition-fast); }
+    .worker-answer-btn.submit { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    .worker-answer-btn.submit:hover { background: var(--vscode-button-hoverBackground); }
+    .worker-answer-btn.skip { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
+    .worker-answer-btn.skip:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+
+    /* Worker 状态卡片内容 */
+    .worker-status-list { display: grid; gap: var(--spacing-2); }
+    .worker-status-item { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: var(--radius-2); background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.04); }
+    .worker-status-row { display: flex; align-items: center; gap: 8px; }
+    .worker-status-item .task-cli { font-size: var(--font-size-1); padding: 2px 6px; border-radius: var(--radius-1); text-transform: uppercase; flex-shrink: 0; }
+    .worker-status-item .task-cli.claude { background: rgba(217, 119, 6, 0.15); color: var(--color-claude); }
+    .worker-status-item .task-cli.codex { background: rgba(16, 163, 127, 0.15); color: var(--color-codex); }
+    .worker-status-item .task-cli.gemini { background: rgba(66, 133, 244, 0.15); color: var(--color-gemini); }
+    .worker-status-item .task-desc { flex: 1; font-size: var(--font-size-2); color: var(--vscode-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .worker-status-item .task-current { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); font-style: italic; }
+    .worker-status-progress { display: flex; align-items: center; gap: 8px; }
+    .worker-status-progress-bar { flex: 1; height: 4px; background: var(--vscode-panel-border); border-radius: 2px; overflow: hidden; }
+    .worker-status-progress-fill { height: 100%; background: var(--color-info); border-radius: 2px; transition: width 0.3s ease; }
+    .worker-status-progress-fill.completed { background: var(--color-success); }
+    .worker-status-progress-fill.failed { background: var(--color-error); }
+    .worker-status-progress-text { font-size: 10px; color: var(--vscode-descriptionForeground); min-width: 40px; text-align: right; }
+    .worker-status-time { font-size: 10px; color: var(--vscode-descriptionForeground); }
+
+    /* 依赖分析面板 */
+    .dependency-panel { margin: var(--spacing-3); margin-top: var(--spacing-2); background: var(--vscode-editor-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); overflow: hidden; }
+    .dependency-panel-header { display: flex; align-items: center; gap: var(--spacing-2); padding: var(--spacing-3); background: rgba(59, 130, 246, 0.05); cursor: pointer; transition: background var(--transition-fast); user-select: none; }
+    .dependency-panel-header:hover { background: rgba(59, 130, 246, 0.08); }
+    .dependency-chevron { width: 12px; color: var(--vscode-descriptionForeground); transition: transform var(--transition-fast); }
+    .dependency-title { font-size: var(--font-size-2); font-weight: 600; color: var(--vscode-foreground); }
+    .dependency-summary { flex: 1; font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); text-align: right; }
+    .dependency-panel-content { padding: var(--spacing-3); padding-top: var(--spacing-2); display: flex; flex-direction: column; gap: var(--spacing-3); }
+    .dependency-section { display: flex; flex-direction: column; gap: var(--spacing-2); }
+    .dependency-section-title { font-size: var(--font-size-1); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--vscode-descriptionForeground); }
+    .dependency-batches { display: flex; flex-wrap: wrap; gap: var(--spacing-2); }
+    .dependency-batch { display: inline-flex; align-items: center; gap: var(--spacing-2); padding: var(--spacing-1) var(--spacing-2); background: var(--color-info-bg); border: 1px solid rgba(59, 130, 246, 0.2); border-radius: var(--radius-2); }
+    .batch-label { font-size: var(--font-size-1); font-weight: 600; color: var(--color-info); }
+    .batch-tasks { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .dependency-path { font-size: var(--font-size-2); color: var(--vscode-foreground); padding: var(--spacing-2); background: rgba(255, 255, 255, 0.02); border-radius: var(--radius-2); font-family: var(--vscode-editor-font-family); }
+    .dependency-conflicts { display: flex; flex-direction: column; gap: var(--spacing-1); }
+    .dependency-conflict { display: flex; align-items: center; justify-content: space-between; padding: var(--spacing-1) var(--spacing-2); background: var(--color-warning-bg); border: 1px solid rgba(245, 158, 11, 0.2); border-radius: var(--radius-2); }
+    .conflict-file { font-size: var(--font-size-2); color: var(--color-warning); font-family: var(--vscode-editor-font-family); }
+    .conflict-tasks { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+
+    /* 摘要卡片内容 */
+    .summary-stats { display: flex; gap: var(--spacing-4); margin-bottom: var(--spacing-3); }
+    .summary-stat { text-align: center; }
+    .summary-stat-value { font-size: var(--font-size-4); font-weight: 600; color: var(--vscode-foreground); }
+    .summary-stat-label { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .summary-content { margin-top: var(--spacing-2); }
+
+    /* 消息中的图片 */
+    .message-images { display: flex; flex-wrap: wrap; gap: var(--spacing-2); margin-bottom: var(--spacing-1); }
+    .message-image-thumb { width: 60px; height: 60px; object-fit: cover; border-radius: var(--radius-2); border: 1px solid var(--vscode-panel-border); cursor: pointer; transition: transform var(--transition-fast); }
+    .message-image-thumb:hover { transform: scale(1.05); }
+
+    /* 图片查看器 */
+    .image-viewer { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; z-index: 500; cursor: zoom-out; }
+    .image-viewer img { max-width: 90vw; max-height: 90vh; object-fit: contain; border-radius: var(--radius-2); }
+
+    /* 主内容区 */
+    .main-content { flex: 1; overflow-y: auto; padding: var(--spacing-2); min-height: 0; scroll-behavior: smooth; }
+    .main-content::-webkit-scrollbar { width: 8px; }
+    .main-content::-webkit-scrollbar-track { background: transparent; }
+    .main-content::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: var(--radius-full); }
+
+    /* 任务/变更内容区 */
+    .tasks-content, .edits-content { flex: 1; overflow-y: auto; padding: var(--spacing-2); }
+    .tasks-content::-webkit-scrollbar, .edits-content::-webkit-scrollbar { width: 8px; }
+    .tasks-content::-webkit-scrollbar-track, .edits-content::-webkit-scrollbar-track { background: transparent; }
+    .tasks-content::-webkit-scrollbar-thumb, .edits-content::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: var(--radius-full); }
+
+    /* ========== Augment 风格消息样式 ========== */
+
+    /* 消息容器 - 基础样式 */
+    .message {
+      display: flex;
+      gap: 4px;
+      padding: 2px 8px;
+      animation: msgFadeIn 0.2s ease;
+      max-width: 100%;
+    }
+    .message + .message { margin-top: 0; }
+    .message.streaming { animation: none; }
+    @keyframes msgFadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+    /* 用户消息 - 右对齐，带气泡，宽度自适应 */
+    .message.user-message {
+      flex-direction: row-reverse;
+      justify-content: flex-start;
+    }
+    .message.user-message .message-body {
+      align-items: flex-end;
+      max-width: 85%;
+      width: auto;
+    }
+    .message.user-message .message-content {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      padding: 8px 12px;
+      border-radius: 16px 16px 4px 16px;
+      width: fit-content;
+      max-width: 100%;
+    }
+    .message.user-message .message-header {
+      flex-direction: row-reverse;
+    }
+
+    /* AI 消息 - 左对齐，无气泡 */
+    .message.assistant-message {
+      flex-direction: row;
+    }
+    .message.assistant-message .message-body {
+      align-items: flex-start;
+      max-width: 100%;
+      min-width: 0;
+      overflow: hidden;
+      width: 100%;
+    }
+    .message.assistant-message .message-content {
+      background: transparent;
+      padding: 0;
+      max-width: 100%;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    /* 消息主体 */
+    .message-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; width: 100%; position: relative; }
+
+    /* 长消息折叠 - 带边框容器 */
+    .message-collapsible-wrapper {
+      position: relative;
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: var(--radius-2);
+      padding: var(--spacing-2);
+      padding-bottom: 32px; /* 为按钮留出空间 */
+      margin-top: 4px;
+    }
+    .message-content.collapsed {
+      max-height: 200px;
+      overflow: hidden;
+      position: relative;
+      width: 100%;
+    }
+    .message-content.collapsed::after {
+      content: '';
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 60px;
+      background: linear-gradient(transparent, var(--vscode-editor-background));
+      pointer-events: none;
+    }
+    .message-expand-btn {
+      display: none;
+      position: absolute;
+      bottom: 6px;
+      right: 6px;
+      padding: 4px 12px;
+      font-size: 11px;
+      color: var(--vscode-textLink-foreground);
+      background: var(--vscode-editor-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: var(--radius-2);
+      cursor: pointer;
+      transition: all 0.15s;
+      z-index: 1;
+    }
+    .message-expand-btn:hover {
+      background: var(--vscode-toolbar-hoverBackground);
+      border-color: var(--vscode-focusBorder);
+    }
+    .message-collapsible-wrapper .message-expand-btn { display: inline-flex; }
+
+    /* 消息分组样式 - 连续同源消息只显示第一条的头部 */
+    .message.grouped {
+      margin-top: 0;
+      padding-top: 0;
+    }
+    .message.grouped .message-header {
+      display: none;
+    }
+
+    /* 消息来源标签样式 */
+    .message-source-tag {
+      font-size: 9px; padding: 2px 6px; border-radius: 4px;
+      font-weight: 500; text-transform: uppercase;
+    }
+    .message-source-tag.orchestrator {
+      background: rgba(217, 119, 6, 0.2); color: var(--color-orchestrator);
+    }
+    .message-source-tag.worker {
+      background: rgba(16, 163, 127, 0.2); color: var(--color-codex);
+    }
+    .message-source-tag.system {
+      background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
+    }
+
+    /* 消息内容 */
+    .message-content {
+      font-size: 13px; line-height: 1.6;
+      color: var(--vscode-foreground);
+      white-space: pre-wrap; word-break: break-word;
+      width: 100%;
+    }
+
+    /* ========== Markdown 渲染样式 - 参考 Augment 设计系统 ========== */
+    .message-content.markdown-rendered {
+      --markdown-spacing-inline: 4px;
+      white-space: normal;
+      max-width: 100%;
+      overflow: hidden;
+      width: 100%;
+    }
+    .message-content.markdown-rendered > *:first-child { margin-top: 0; }
+    .message-content.markdown-rendered > *:last-child { margin-bottom: 0; }
+
+    /* 段落样式 */
+    .message-content.markdown-rendered p {
+      white-space: pre-line;
+      margin: 8px 0;
+      padding-inline: var(--markdown-spacing-inline);
+      font-size: 13px;
+      line-height: 1.6;
+      word-break: break-word;
+    }
+    .message-content.markdown-rendered p:first-child {
+      margin-top: 0;
+    }
+    .message-content.markdown-rendered p:last-child {
+      margin-bottom: 0;
+    }
+
+    /* 标题样式 - Augment 风格 */
+    .message-content.markdown-rendered h1,
+    .message-content.markdown-rendered h2,
+    .message-content.markdown-rendered h3,
+    .message-content.markdown-rendered h4,
+    .message-content.markdown-rendered h5,
+    .message-content.markdown-rendered h6 {
+      margin: 12px 0 6px 0;
+      font-weight: 700;
+      font-family: var(--vscode-font-family);
+      padding-inline: var(--markdown-spacing-inline);
+      color: var(--vscode-foreground);
+    }
+    .message-content.markdown-rendered h1 { font-size: 1.25em; line-height: 1.4; }
+    .message-content.markdown-rendered h2 { font-size: 1.125em; line-height: 1.4; }
+    .message-content.markdown-rendered h3 { font-size: 1em; line-height: 1.5; }
+    .message-content.markdown-rendered h4,
+    .message-content.markdown-rendered h5,
+    .message-content.markdown-rendered h6 { font-size: 0.9em; line-height: 1.5; }
+
+    /* 粗体样式 */
+    .message-content.markdown-rendered strong {
+      color: var(--vscode-foreground);
+      font-weight: 600;
+    }
+
+    /* 列表样式 - Augment 风格 */
+    .message-content.markdown-rendered ul,
+    .message-content.markdown-rendered ol {
+      margin: 8px 0;
+      padding-inline-start: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .message-content.markdown-rendered ul ul,
+    .message-content.markdown-rendered ul ol,
+    .message-content.markdown-rendered ol ul,
+    .message-content.markdown-rendered ol ol {
+      padding-inline-start: 16px;
+      margin-top: 4px;
+      margin-bottom: 0;
+    }
+    .message-content.markdown-rendered li {
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    /* 任务列表样式 */
+    .message-content.markdown-rendered .task-item {
+      list-style: none;
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      margin-left: -20px;
+    }
+    .message-content.markdown-rendered .task-item input[type="checkbox"] {
+      margin-top: 4px;
+      accent-color: var(--vscode-textLink-foreground);
+    }
+    .message-content.markdown-rendered .task-item.task-done span {
+      text-decoration: line-through;
+      opacity: 0.7;
+    }
+
+    /* 引用块样式 - Augment 风格 */
+    .message-content.markdown-rendered blockquote {
+      margin: 8px var(--markdown-spacing-inline);
+      background: none;
+      border-left: 3px solid var(--vscode-textLink-foreground);
+      padding: 4px 12px;
+      border-radius: 0 4px 4px 0;
+      color: var(--vscode-descriptionForeground);
+    }
+
+    /* 分隔线样式 */
+    .message-content.markdown-rendered hr {
+      border: none;
+      border-top: 1px solid var(--vscode-panel-border);
+      margin: 16px var(--markdown-spacing-inline);
+    }
+
+    /* 行内代码样式 - Augment 风格 */
+    .message-content.markdown-rendered code.markdown-codespan,
+    .message-content.markdown-rendered code:not(.markdown-code-content code) {
+      font-family: var(--vscode-editor-font-family, monospace);
+      border-radius: 2px;
+      padding: 1px 4px;
+      font-size: 0.9em;
+      background-color: var(--vscode-sideBar-background);
+      color: var(--vscode-textLink-foreground);
+      border: 1px solid var(--vscode-panel-border);
+      word-break: break-all;
+      display: inline;
+    }
+
+    /* 链接样式 - Augment 风格 */
+    .message-content.markdown-rendered a,
+    .message-content.markdown-rendered .markdown-link {
+      color: var(--vscode-textLink-foreground);
+      text-decoration: underline;
+      text-decoration-color: var(--vscode-textLink-foreground);
+      word-break: break-all;
+      cursor: pointer;
+      user-select: all;
+    }
+    .message-content.markdown-rendered a:hover,
+    .message-content.markdown-rendered .markdown-link:hover {
+      text-decoration: underline;
+      opacity: 0.9;
+    }
+
+    /* 图片样式 */
+    .message-content.markdown-rendered img {
+      max-width: 100%;
+      height: auto;
+      border-radius: 4px;
+      margin: 8px 0;
+    }
+
+    /* 表格样式 - Augment 风格 */
+    .message-content.markdown-rendered table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      line-height: 1.4;
+      display: block;
+      overflow-x: auto;
+      margin: 8px 0;
+    }
+    .message-content.markdown-rendered th,
+    .message-content.markdown-rendered td {
+      border: 1px solid var(--vscode-panel-border);
+      padding: 6px 10px;
+      text-align: left;
+    }
+    .message-content.markdown-rendered th {
+      background: var(--vscode-sideBar-background);
+      font-weight: 600;
+    }
+    .message-content.markdown-rendered tr:nth-child(even) {
+      background: var(--vscode-list-hoverBackground);
+    }
+    .message-content.markdown-rendered tr:hover {
+      background: var(--vscode-list-activeSelectionBackground);
+    }
+
+    /* 卡片内 Markdown 渲染（任务分析/执行摘要） */
+    .task-card-body .markdown-rendered,
+    .summary-content .markdown-rendered {
+      white-space: normal;
+      max-width: 100%;
+      width: 100%;
+    }
+    .task-card-body .markdown-rendered p,
+    .summary-content .markdown-rendered p {
+      white-space: pre-line;
+      margin: 4px 0;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+    .task-card-body .markdown-rendered .markdown-code-block,
+    .summary-content .markdown-rendered .markdown-code-block {
+      margin: 8px 0;
+    }
+
+    /* 代码块样式 - 增强版 */
+    .markdown-code-block {
+      position: relative;
+      margin: 8px 0;
+      border-radius: var(--augment-border-radius, 6px);
+      border: 1px solid var(--vscode-panel-border);
+      max-width: 100%;
+      width: 100%;
+      box-sizing: border-box;
+      overflow: hidden;
+    }
+    .markdown-code-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 12px;
+      background: var(--vscode-sideBar-background);
+      border-bottom: 1px solid var(--vscode-panel-border);
+      font-size: 11px;
+      flex-shrink: 0;
+      gap: 8px;
+    }
+    .markdown-code-info {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .markdown-code-lang {
+      color: var(--vscode-descriptionForeground);
+      font-family: var(--vscode-editor-font-family, monospace);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      flex-shrink: 0;
+    }
+    /* 文件路径 - 可点击 */
+    .markdown-code-filepath {
+      color: var(--vscode-textLink-foreground);
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 11px;
+      cursor: pointer;
+      text-decoration: none;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .markdown-code-filepath:hover {
+      text-decoration: underline;
+    }
+    .markdown-code-filepath svg {
+      width: 12px;
+      height: 12px;
+      fill: currentColor;
+      flex-shrink: 0;
+    }
+    /* 代码内容区域 - 带行号 */
+    .markdown-code-content {
+      display: flex;
+      overflow: auto;
+      max-height: 600px; /* 🔧 修复：增大代码块高度限制 */
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 12px;
+      line-height: 1.5;
+      box-sizing: border-box;
+      scrollbar-width: thin;
+      scrollbar-color: var(--vscode-scrollbarSlider-background) transparent;
+      background: var(--vscode-editor-background);
+    }
+    /* 行号列 */
+    .code-line-numbers {
+      display: flex;
+      flex-direction: column;
+      padding: 12px 0;
+      background: var(--vscode-editorLineNumber-background, var(--vscode-sideBar-background));
+      border-right: 1px solid var(--vscode-panel-border);
+      user-select: none;
+      flex-shrink: 0;
+      text-align: right;
+    }
+    .code-line-number {
+      padding: 0 8px 0 12px;
+      color: var(--vscode-editorLineNumber-foreground, var(--vscode-descriptionForeground));
+      font-size: 11px;
+      line-height: 1.5;
+      min-width: 2em;
+    }
+    /* 代码区域 */
+    .code-lines {
+      flex: 1;
+      padding: 12px;
+      min-width: 0;
+      overflow-x: auto;
+    }
+    .code-line {
+      line-height: 1.5;
+      white-space: pre;
+      min-height: 1.5em;
+    }
+    /* 差异高亮 - 🔧 修复：保留原始 +/- 字符支持复制 */
+    .code-line.diff-add {
+      background: rgba(34, 197, 94, 0.15);
+      border-left: 3px solid var(--color-success, #22c55e);
+      margin-left: -3px;
+      padding-left: 3px;
+    }
+    .code-line.diff-del {
+      background: rgba(239, 68, 68, 0.15);
+      border-left: 3px solid var(--color-error, #ef4444);
+      margin-left: -3px;
+      padding-left: 3px;
+      text-decoration: line-through;
+      opacity: 0.7;
+    }
+    /* 🔧 移除 ::before 伪元素，因为现在 +/- 保留在原始文本中 */
+    /* 通过颜色区分即可，不再重复添加前缀 */
+    /* Webkit 滚动条样式 */
+    .markdown-code-content::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    .markdown-code-content::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    .markdown-code-content::-webkit-scrollbar-thumb {
+      background: var(--vscode-scrollbarSlider-background);
+      border-radius: 3px;
+    }
+    .markdown-code-content::-webkit-scrollbar-thumb:hover {
+      background: var(--vscode-scrollbarSlider-hoverBackground);
+    }
+    .markdown-code-content::-webkit-scrollbar-corner {
+      background: transparent;
+    }
+    .markdown-code-content pre {
+      margin: 0;
+      white-space: pre;
+      min-width: min-content;
+    }
+    .markdown-code-content code {
+      font-family: inherit;
+      background: transparent;
+      border: none;
+      padding: 0;
+    }
+
+    /* 代码块头部操作区 */
+    .code-header-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .code-line-count {
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+    }
+    .code-copy-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      border: none;
+      background: transparent;
+      color: var(--vscode-descriptionForeground);
+      cursor: pointer;
+      border-radius: 4px;
+      transition: all 0.15s ease;
+    }
+    .code-copy-btn:hover {
+      background: var(--vscode-toolbar-hoverBackground);
+      color: var(--vscode-foreground);
+    }
+    .code-copy-btn.copied {
+      color: var(--color-success);
+    }
+    .code-copy-btn svg {
+      width: 14px;
+      height: 14px;
+      fill: currentColor;
+    }
+
+    /* 代码块折叠模式 */
+    .collapsible-code .markdown-code-preview {
+      display: flex;
+      overflow: hidden;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 12px;
+      line-height: 1.5;
+      background: var(--vscode-editor-background);
+    }
+    .collapsible-code .markdown-code-full {
+      display: flex;
+      overflow: auto;
+      max-height: 600px;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 12px;
+      line-height: 1.5;
+      background: var(--vscode-editor-background);
+    }
+    .code-expand-bar {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 6px 12px;
+      background: var(--vscode-sideBar-background);
+      border-top: 1px solid var(--vscode-panel-border);
+      color: var(--vscode-textLink-foreground);
+      cursor: pointer;
+      font-size: 11px;
+      transition: background 0.15s ease;
+    }
+    .code-expand-bar:hover {
+      background: var(--vscode-list-hoverBackground);
+    }
+    .code-expand-bar svg {
+      width: 12px;
+      height: 12px;
+      fill: currentColor;
+    }
+    .code-expand-hint {
+      font-size: 11px;
+    }
+    .collapsible-code.expanded .code-expand-bar {
+      display: none;
+    }
+
+    /* highlight.js 语法高亮样式 - VSCode Dark+ 主题风格 */
+    .hljs { background: transparent !important; }
+    .hljs-keyword { color: var(--vscode-symbolIcon-keywordForeground, #c586c0); }
+    .hljs-built_in { color: var(--vscode-symbolIcon-constantForeground, #569cd6); }
+    .hljs-type { color: var(--vscode-symbolIcon-typeParameterForeground, #4ec9b0); }
+    .hljs-literal { color: var(--vscode-symbolIcon-constantForeground, #569cd6); }
+    .hljs-number { color: var(--vscode-symbolIcon-numberForeground, #b5cea8); }
+    .hljs-string { color: var(--vscode-symbolIcon-stringForeground, #ce9178); }
+    .hljs-regexp { color: #d16969; }
+    .hljs-symbol { color: var(--vscode-symbolIcon-constantForeground, #569cd6); }
+    .hljs-variable { color: var(--vscode-symbolIcon-variableForeground, #9cdcfe); }
+    .hljs-template-variable { color: var(--vscode-symbolIcon-variableForeground, #9cdcfe); }
+    .hljs-link { color: var(--vscode-symbolIcon-stringForeground, #ce9178); }
+    .hljs-selector-id { color: #d7ba7d; }
+    .hljs-selector-class { color: #d7ba7d; }
+    .hljs-comment { color: var(--vscode-symbolIcon-commentForeground, #6a9955); font-style: italic; }
+    .hljs-doctag { color: var(--vscode-symbolIcon-commentForeground, #6a9955); }
+    .hljs-meta { color: #569cd6; }
+    .hljs-meta-keyword { color: #569cd6; }
+    .hljs-meta-string { color: var(--vscode-symbolIcon-stringForeground, #ce9178); }
+    .hljs-section { color: #dcdcaa; }
+    .hljs-title { color: var(--vscode-symbolIcon-functionForeground, #dcdcaa); }
+    .hljs-title.function_ { color: var(--vscode-symbolIcon-functionForeground, #dcdcaa); }
+    .hljs-title.class_ { color: var(--vscode-symbolIcon-classForeground, #4ec9b0); }
+    .hljs-name { color: var(--vscode-symbolIcon-colorForeground, #569cd6); }
+    .hljs-tag { color: var(--vscode-symbolIcon-colorForeground, #569cd6); }
+    .hljs-attr { color: var(--vscode-symbolIcon-propertyForeground, #9cdcfe); }
+    .hljs-attribute { color: var(--vscode-symbolIcon-propertyForeground, #9cdcfe); }
+    .hljs-params { color: var(--vscode-symbolIcon-variableForeground, #9cdcfe); }
+    .hljs-property { color: var(--vscode-symbolIcon-propertyForeground, #9cdcfe); }
+    .hljs-class { color: var(--vscode-symbolIcon-classForeground, #4ec9b0); }
+    .hljs-function { color: var(--vscode-symbolIcon-functionForeground, #dcdcaa); }
+    .hljs-addition { background: rgba(34, 197, 94, 0.2); color: #b5cea8; }
+    .hljs-deletion { background: rgba(239, 68, 68, 0.2); color: #ce9178; }
+    .hljs-emphasis { font-style: italic; }
+    .hljs-strong { font-weight: bold; }
+
+    /* 注：行内代码、链接、表格样式已在上方 Markdown 渲染样式块中定义 */
+
+    /* 流式消息样式（无光标） */
+    .message.streaming .message-content {
+      opacity: 0.9;
+    }
+
+    /* 🔧 流式输出时限制高度，防止页面被撑满 */
+    /* 🔧 修复：增大流式消息的 max-height 限制，避免内容被截断 */
+    .message.streaming .message-content {
+      max-height: 600px;
+      overflow-y: auto;
+      position: relative;
+    }
+    .message.streaming .message-content.has-special-content {
+      max-height: 500px;
+    }
+    /* 流式消息滚动条样式 */
+    .message.streaming .message-content::-webkit-scrollbar { width: 8px; }
+    .message.streaming .message-content::-webkit-scrollbar-track { background: transparent; }
+    .message.streaming .message-content::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 4px; }
+    /* 流式输出时的渐变遮罩提示 */
+    .message.streaming .message-content::after {
+      content: '';
+      position: sticky;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 40px;
+      background: linear-gradient(transparent, var(--vscode-editor-background));
+      pointer-events: none;
+      display: block;
+    }
+    .message.streaming .message-content:not(.content-overflow)::after {
+      display: none;
+    }
+
+    /* 流式输出时底部的"正在输出"提示 - Augment 风格 */
+    .message-streaming-footer {
+      margin-top: 12px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: linear-gradient(90deg,
+        rgba(0, 122, 204, 0.05) 0%,
+        rgba(0, 122, 204, 0.1) 50%,
+        rgba(0, 122, 204, 0.05) 100%);
+      font-size: var(--font-size-2);
+      color: var(--vscode-textLink-foreground);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      animation: streamingFooterPulse 2s ease-in-out infinite;
+    }
+    @keyframes streamingFooterPulse {
+      0%, 100% { opacity: 0.8; }
+      50% { opacity: 1; }
+    }
+
+    /* ========== 澄清消息样式 - 自然对话风格 ========== */
+    .message.clarification-message .message-body {
+      border-left: 3px solid var(--vscode-textLink-foreground);
+      padding-left: 12px;
+    }
+    .message.clarification-message .message-content {
+      background: linear-gradient(135deg,
+        rgba(0, 122, 204, 0.05) 0%,
+        rgba(0, 122, 204, 0.02) 100%);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .message.clarification-message .clarification-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 10px;
+      background: var(--vscode-textLink-foreground);
+      color: var(--vscode-button-foreground);
+      font-size: 10px;
+      font-weight: 500;
+      margin-bottom: 8px;
+    }
+    .message.clarification-message ol {
+      margin: 8px 0;
+      padding-left: 20px;
+    }
+    .message.clarification-message li {
+      margin: 6px 0;
+      line-height: 1.5;
+    }
+
+    /* ========== Worker 问题消息样式 ========== */
+    .message.worker-question-message .message-body {
+      border-left: 3px solid var(--vscode-charts-orange);
+      padding-left: 12px;
+    }
+    .message.worker-question-message .message-content {
+      background: linear-gradient(135deg,
+        rgba(255, 165, 0, 0.05) 0%,
+        rgba(255, 165, 0, 0.02) 100%);
+      border-radius: 8px;
+      padding: 12px;
+    }
+
+    /* ========== 可折叠面板（思考/工具调用）- Augment 风格 ========== */
+    .collapsible-panel {
+      border-radius: 8px;
+      border: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.15));
+      background: var(--vscode-editor-background);
+      overflow: hidden;
+      margin: 6px 0;
+      transition: border-color 0.15s ease;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .collapsible-panel:hover {
+      border-color: var(--vscode-focusBorder, rgba(128,128,128,0.3));
+    }
+    .collapsible-header {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 12px;
+      cursor: pointer; user-select: none;
+      background: var(--vscode-sideBar-background);
+      transition: background 0.15s;
+    }
+    .collapsible-header:hover { background: var(--vscode-list-hoverBackground); }
+    .collapsible-icon {
+      width: 12px; height: 12px;
+      transition: transform 0.2s ease;
+      color: var(--vscode-descriptionForeground);
+      flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .collapsible-icon svg { width: 12px; height: 12px; fill: currentColor; display: block; }
+    .collapsible-icon.expanded { transform: rotate(90deg); }
+    .collapsible-title {
+      font-size: 11px; font-weight: 500;
+      color: var(--vscode-descriptionForeground);
+      flex: 1;
+      display: flex; align-items: center; gap: 6px;
+    }
+    /* 思考过程折叠时的摘要显示 */
+    .collapsible-summary {
+      flex: 1;
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-style: italic;
+      opacity: 0.8;
+      margin-left: 8px;
+    }
+    .collapsible-title svg { width: 12px; height: 12px; opacity: 0.7; fill: currentColor; }
+    .collapsible-badge {
+      font-size: 9px; padding: 2px 6px; border-radius: 10px;
+      background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
+    }
+    .collapsible-status {
+      font-size: 10px; color: var(--vscode-descriptionForeground);
+      display: flex; align-items: center; gap: 4px;
+    }
+    .collapsible-status.running { color: var(--vscode-textLink-foreground); }
+    .collapsible-status.running::before {
+      content: ''; width: 6px; height: 6px; border-radius: 50%;
+      background: currentColor; animation: pulse 1.5s ease-in-out infinite;
+    }
+    .collapsible-content {
+      max-height: 0; overflow: hidden;
+      transition: max-height 0.3s ease-out;
+    }
+    /* 🔧 修复：增大 max-height 限制，避免内容被截断 */
+    .collapsible-content.expanded { max-height: 2000px; overflow-y: auto; }
+    /* 确保滚动条明显可见 */
+    .collapsible-content::-webkit-scrollbar { width: 8px; }
+    .collapsible-content::-webkit-scrollbar-track { background: var(--vscode-editor-background); }
+    .collapsible-content::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 4px; }
+    .collapsible-content::-webkit-scrollbar-thumb:hover { background: var(--vscode-scrollbarSlider-hoverBackground); }
+    .collapsible-body {
+      padding: 10px 12px;
+      font-size: 12px; line-height: 1.5;
+      color: var(--vscode-foreground);
+      border-top: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.15));
+      background: var(--vscode-editor-background);
+    }
+    /* collapsible-body 内的 Markdown 渲染样式 */
+    .collapsible-body.markdown-rendered {
+      white-space: normal;
+    }
+    .collapsible-body.markdown-rendered p {
+      margin: 0;
+      white-space: pre-line;
+    }
+    .collapsible-body.markdown-rendered .markdown-code-block {
+      margin: 8px 0;
+    }
+    .collapsible-body.markdown-rendered ul,
+    .collapsible-body.markdown-rendered ol {
+      margin: 6px 0;
+      padding-left: 20px;
+      line-height: 150%;
+    }
+    .collapsible-body.markdown-rendered li {
+      margin: 2px 0;
+      line-height: 150%;
+    }
+    .collapsible-body.markdown-rendered blockquote {
+      margin: 6px 0;
+      padding: 6px 10px;
+      border-left: 3px solid var(--vscode-textLink-foreground);
+      background: var(--vscode-sideBar-background);
+      border-radius: 0 4px 4px 0;
+    }
+    /* 工具调用面板特殊样式 */
+    .collapsible-panel.tool-call .collapsible-title { color: var(--vscode-textLink-foreground); }
+    .collapsible-panel.thinking .collapsible-title { color: var(--vscode-descriptionForeground); }
+    /* 代码折叠面板样式 */
+    .collapsible-panel.code-panel { margin: 8px 0; }
+    .collapsible-panel.code-panel .collapsible-title { color: var(--vscode-symbolIcon-fileForeground, #cccccc); }
+    .collapsible-panel.code-panel .collapsible-title svg { fill: var(--vscode-symbolIcon-classForeground, #ee9d28); }
+    .collapsible-panel.code-panel .collapsible-body { padding: 0; }
+    .collapsible-panel.code-panel .collapsible-body .markdown-code-block { margin: 0; border: none; border-radius: 0; }
+    /* 🔧 修复：隐藏折叠面板内的代码块内部标题（避免双重标题） */
+    .collapsible-panel.code-panel .collapsible-body .markdown-code-header { display: none; }
+    .tool-track { margin-top: 2px; display: flex; flex-direction: column; gap: 4px; width: 100%; }
+    .tool-item { width: 100%; box-sizing: border-box; }
+    .tool-item.collapsible-panel { margin: 0; }
+    .tool-item .collapsible-header { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; padding-left: 8px; }
+    .tool-name { font-size: var(--font-size-2); font-weight: 600; display: flex; align-items: center; gap: 6px; }
+    .tool-name svg { flex-shrink: 0; opacity: 0.7; }
+    .tool-status { font-size: 11px; padding: 2px 6px; border-radius: 999px; background: rgba(128,128,128,0.12); }
+    .tool-status.running { background: rgba(59,130,246,0.15); color: #3b82f6; }
+    .tool-status.completed { background: rgba(16,185,129,0.15); color: #10b981; }
+    .tool-status.failed { background: rgba(239,68,68,0.15); color: #ef4444; }
+    .collapsible-body.tool-body { white-space: pre-wrap; }
+    /* 工具调用截图风格面板 - 类似终端输出 */
+    .tool-snapshot {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: var(--radius-2);
+      overflow: hidden;
+      background: var(--vscode-editor-background);
+    }
+    .tool-snapshot-section {
+      display: flex;
+      flex-direction: column;
+    }
+    .tool-snapshot-section + .tool-snapshot-section {
+      border-top: 1px solid var(--vscode-panel-border);
+    }
+    .tool-snapshot-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      background: var(--vscode-sideBar-background);
+      border-bottom: 1px solid var(--vscode-panel-border);
+    }
+    .tool-snapshot-label {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      padding: 2px 6px;
+      border-radius: 3px;
+    }
+    .tool-snapshot-label.in {
+      background: rgba(59, 130, 246, 0.15);
+      color: var(--color-info);
+    }
+    .tool-snapshot-label.out {
+      background: rgba(34, 197, 94, 0.15);
+      color: var(--color-success);
+    }
+    .tool-snapshot-label.error {
+      background: rgba(239, 68, 68, 0.15);
+      color: var(--color-error);
+    }
+    .tool-snapshot-meta {
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+      margin-left: auto;
+    }
+    .tool-snapshot-body {
+      padding: 10px 12px;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    .tool-snapshot-body::-webkit-scrollbar { width: 6px; }
+    .tool-snapshot-body::-webkit-scrollbar-track { background: transparent; }
+    .tool-snapshot-body::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 3px; }
+
+    .tool-raw {
+      margin: 0;
+      padding: 0;
+      background: transparent;
+      border: none;
+      border-radius: 0;
+      font-family: var(--vscode-editor-font-family), monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .tool-text { font-size: 12px; line-height: 1.5; color: var(--vscode-foreground); }
+
+    /* 旧版 tool-section 保留兼容 */
+    .tool-section { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+    .tool-section:last-child { margin-bottom: 0; }
+    .tool-section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--vscode-descriptionForeground); }
+    .summary-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
+
+    /* Worker 完成摘要卡片增强样式 */
+    .worker-summary-card { margin: var(--spacing-2) 0; }
+    .worker-summary-card .card-header { cursor: pointer; }
+    .worker-summary-overview { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: var(--spacing-2); padding: var(--spacing-2) 0; }
+    .worker-summary-stat { display: flex; flex-direction: column; gap: 2px; padding: 8px 12px; background: rgba(255, 255, 255, 0.02); border-radius: var(--radius-2); border: 1px solid rgba(255, 255, 255, 0.04); }
+    .worker-summary-stat-label { font-size: 10px; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.5px; }
+    .worker-summary-stat-value { font-size: 13px; font-weight: 500; color: var(--vscode-foreground); }
+    .worker-summary-stat-value.success { color: var(--color-success); }
+    .worker-summary-stat-value.error { color: var(--color-error); }
+    .worker-summary-changes { display: flex; flex-direction: column; gap: var(--spacing-2); margin-top: var(--spacing-2); }
+    .worker-summary-changes-title { font-size: 11px; font-weight: 500; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.5px; }
+    .worker-summary-file-list { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 0; list-style: none; }
+    .worker-summary-file-item { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 4px 8px; background: rgba(255, 255, 255, 0.02); border-radius: var(--radius-1); }
+    .worker-summary-file-icon { width: 14px; height: 14px; flex-shrink: 0; }
+    .worker-summary-file-icon.created { color: var(--color-success); }
+    .worker-summary-file-icon.modified { color: var(--color-info); }
+    .worker-summary-file-icon.deleted { color: var(--color-error); }
+    .worker-summary-file-path { flex: 1; font-family: var(--vscode-editor-font-family), monospace; color: var(--vscode-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    /* 任务列表 - Augment 风格 */
+    .task-list { display: flex; flex-direction: column; gap: 2px; }
+    .tasks-header { display: flex; align-items: center; justify-content: space-between; padding: 4px 0 8px 0; border-bottom: 1px solid var(--vscode-panel-border); margin-bottom: 8px; }
+    .tasks-count { font-size: 11px; color: var(--vscode-descriptionForeground); }
+    .task-header { padding: 8px 12px; margin-bottom: 4px; }
+    .task-header-label { font-size: 10px; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+    .task-header-title { font-size: 13px; font-weight: 500; color: var(--vscode-foreground); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+    /* 任务组（可折叠） */
+    .task-group { border: 1px solid var(--vscode-panel-border); border-radius: 6px; margin-bottom: 6px; overflow: hidden; }
+    .task-group-header { display: flex; align-items: center; gap: 8px; padding: 8px 10px; cursor: pointer; background: var(--vscode-sideBar-background); transition: background 0.1s; }
+    .task-group-header:hover { background: var(--vscode-list-hoverBackground); }
+    .task-group-toggle { width: 16px; height: 16px; display: flex; align-items: center; justify-content: center; transition: transform 0.2s; }
+    .task-group-toggle svg { width: 10px; height: 10px; fill: var(--vscode-descriptionForeground); }
+    .task-group.expanded .task-group-toggle { transform: rotate(90deg); }
+    .task-group-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+    .task-group-title { font-size: 12px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .task-group-meta { font-size: 10px; color: var(--vscode-descriptionForeground); }
+    .task-group-content { display: none; padding: 4px 0; border-top: 1px solid var(--vscode-panel-border); }
+    .task-group.expanded .task-group-content { display: block; }
+    .task-group.collapsed .task-group-content { display: none; }
+
+    .task-item { display: flex; align-items: center; gap: 8px; padding: 4px 12px; height: 28px; border-radius: 4px; cursor: pointer; transition: background 0.1s; }
+    .task-item:hover { background: var(--vscode-list-hoverBackground); }
+    .task-item:hover .task-actions { opacity: 1; }
+    .task-status { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: var(--vscode-descriptionForeground); }
+    .task-status.pending { background: var(--vscode-descriptionForeground); opacity: 0.5; }
+    .task-status.running { background: #ffc53d; animation: statusPulse 1.5s ease-in-out infinite; }
+    .task-status.paused { background: #f59e0b; opacity: 0.7; }
+    .task-status.retrying { background: #ffc53d; animation: statusPulse 1.5s ease-in-out infinite; }
+    .task-status.completed { background: #3dd68c; }
+    .task-status.failed { background: #e5484d; }
+    .task-status.cancelled { background: #888; opacity: 0.6; }
+    .task-status.skipped { background: #888; opacity: 0.5; }
+    @keyframes statusPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .task-info { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
+    .task-name { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+    .task-meta { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    .task-cli { font-size: 10px; padding: 1px 5px; border-radius: 3px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); font-weight: 500; text-transform: uppercase; }
+    .task-cli.claude { background: rgba(217, 119, 6, 0.15); color: var(--color-claude); }
+    .task-cli.codex { background: rgba(16, 163, 127, 0.15); color: var(--color-codex); }
+    .task-cli.gemini { background: rgba(66, 133, 244, 0.15); color: var(--color-gemini); }
+    .task-files { font-size: 10px; color: var(--vscode-descriptionForeground); }
+    .task-time { font-size: 10px; color: var(--vscode-descriptionForeground); min-width: 32px; text-align: right; }
+    .task-actions { display: flex; gap: 2px; opacity: 0; transition: opacity 0.15s; }
+
+    /* 变更列表 - Augment 风格 */
+    .edits-header { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; margin-bottom: 4px; }
+    .edits-count { font-size: 11px; color: var(--vscode-descriptionForeground); }
+    .edits-batch-actions { display: flex; gap: 4px; }
+    .edits-list { display: flex; flex-direction: column; gap: 2px; }
+    .edit-item { display: flex; align-items: center; gap: 8px; padding: 4px 8px; height: 28px; border-radius: 4px; cursor: pointer; transition: background 0.1s; }
+    .edit-item:hover { background: var(--vscode-list-hoverBackground); }
+    .edit-item:hover .edit-actions { opacity: 1; }
+    .edit-item:focus, .edit-item:focus-within { background: var(--vscode-list-hoverBackground); outline: none; }
+    .edit-file-icon { width: 14px; height: 14px; flex-shrink: 0; opacity: 0.7; }
+    .edit-info { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; }
+    .edit-file-path { display: flex; align-items: center; gap: 2px; flex: 1; min-width: 0; overflow: hidden; }
+    .edit-file-name { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .edit-file-dir { font-size: 11px; color: var(--vscode-descriptionForeground); opacity: 0.6; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
+    .edit-stats { display: flex; align-items: center; gap: 4px; flex-shrink: 0; font-size: 10px; }
+    .edit-stat-add { color: #3dd68c; }
+    .edit-stat-del { color: #e5484d; }
+    .edit-cli-badge { font-size: 9px; padding: 1px 4px; border-radius: 3px; font-weight: 500; text-transform: uppercase; }
+    .edit-cli-badge.claude { background: rgba(217, 119, 6, 0.15); color: #f59e0b; }
+    .edit-cli-badge.codex { background: rgba(16, 185, 129, 0.15); color: #10b981; }
+    .edit-cli-badge.gemini { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+    .edit-actions { display: flex; gap: 2px; opacity: 0; transition: opacity 0.15s; }
+
+    .btn-small { padding: 3px 8px; font-size: 11px; border-radius: 3px; border: none; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; transition: all 0.1s; font-weight: 500; }
+    .btn-small:active { transform: scale(0.97); }
+    .btn-small:hover { opacity: 0.9; }
+    .btn-success { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    .btn-danger { background: transparent; color: var(--vscode-errorForeground, #e5484d); border: 1px solid currentColor; }
+    .btn-danger:hover { background: rgba(229, 72, 77, 0.1); }
+    .btn-ghost { background: transparent; color: var(--vscode-foreground); }
+    .btn-ghost:hover { background: var(--vscode-list-hoverBackground); }
+    .btn-icon { width: 22px; height: 22px; padding: 0; display: flex; align-items: center; justify-content: center; border-radius: 4px; background: transparent; border: none; cursor: pointer; color: var(--vscode-foreground); opacity: 0.7; }
+    .btn-icon:hover { background: var(--vscode-list-hoverBackground); opacity: 1; }
+    .btn-icon svg { width: 14px; height: 14px; }
+
+    /* CLI 输出视图 */
+    .cli-output-view { font-family: var(--vscode-editor-font-family); font-size: var(--font-size-2); line-height: 1.5; padding: var(--spacing-2); }
+
+    /* 底部输入区域 - Augment 风格 */
+    .bottom-area { flex-shrink: 0; display: flex; flex-direction: column; background: var(--vscode-sideBar-background); }
+    .bottom-tabs { display: flex; align-items: center; padding: 0 var(--spacing-2); background: var(--vscode-sideBar-background); border-top: 1px solid var(--vscode-panel-border); height: 32px; flex-shrink: 0; gap: var(--spacing-1); }
+    .bottom-content { display: flex; flex-direction: column; padding: var(--spacing-2) var(--spacing-3) var(--spacing-3); }
+
+    /* 输入区域 */
+    .input-container { display: flex; flex-direction: column; }
+    .input-wrapper { display: flex; flex-direction: column; background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); overflow: hidden; transition: border-color 0.15s ease; }
+    .input-wrapper:focus-within { border-color: var(--vscode-focusBorder); }
+
+    /* 任务分类网格（全局配置区域） */
+    .profile-global-section { margin-top: var(--spacing-2); }
+    .profile-categories-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--spacing-2); }
+    .profile-category-row { display: flex; align-items: center; justify-content: space-between; padding: var(--spacing-1) var(--spacing-2); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-1); }
+    .profile-category-label { font-size: var(--font-size-2); color: var(--vscode-foreground); }
+    .profile-category-select { padding: 2px 6px; font-size: var(--font-size-1); background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); border-radius: var(--radius-1); cursor: pointer; }
+
+    /* 底部区域 */
+    .profile-footer { display: flex; align-items: center; justify-content: space-between; margin-top: var(--spacing-3); padding-top: var(--spacing-3); border-top: 1px solid var(--vscode-panel-border); }
+    .profile-config-hint { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .profile-config-hint code { font-family: monospace; color: var(--vscode-textLink-foreground); }
+    .profile-actions { display: flex; gap: var(--spacing-2); }

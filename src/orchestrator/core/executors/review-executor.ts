@@ -7,7 +7,7 @@
  * - 处理评审结果
  */
 
-import { CLIType } from '../../../types';
+import { WorkerSlot } from '../../../types';
 import { ProfileLoader } from '../../profile/profile-loader';
 import { ProfileAwareReviewer } from '../../review/profile-aware-reviewer';
 import { AutonomousWorker } from '../../worker';
@@ -26,7 +26,7 @@ export interface ReviewResult {
 
 export class ReviewExecutor {
   constructor(
-    private workers: Map<CLIType, AutonomousWorker>,
+    private workers: Map<WorkerSlot, AutonomousWorker>,
     private profileLoader: ProfileLoader,
     private reviewer: ProfileAwareReviewer
   ) {}
@@ -115,7 +115,7 @@ export class ReviewExecutor {
   /**
    * 选择评审者
    */
-  private selectReviewer(executorId: CLIType): CLIType | null {
+  private selectReviewer(executorId: WorkerSlot): WorkerSlot | null {
     // 简单策略：选择第一个不是执行者的 Worker
     for (const workerId of this.workers.keys()) {
       if (workerId !== executorId) {

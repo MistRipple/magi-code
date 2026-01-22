@@ -13,6 +13,18 @@ import { AgentProfileLoader } from '../../orchestrator/profile/agent-profile-loa
 import { GuidanceInjector } from '../../orchestrator/profile/guidance-injector';
 
 /**
+ * 历史管理配置
+ */
+export interface HistoryManagementConfig {
+  /** 最大历史消息数量（默认 50） */
+  maxMessages?: number;
+  /** 最大历史字符数（默认 100000） */
+  maxChars?: number;
+  /** 保留最近 N 轮对话（默认 5） */
+  preserveRecentRounds?: number;
+}
+
+/**
  * Worker 适配器配置
  */
 export interface WorkerAdapterConfig {
@@ -23,6 +35,7 @@ export interface WorkerAdapterConfig {
   workerSlot: WorkerSlot;
   systemPrompt?: string;
   profileLoader?: AgentProfileLoader;  // ✅ 新增：用于加载 Agent 画像
+  historyConfig?: HistoryManagementConfig;
 }
 
 /**
@@ -35,6 +48,11 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   private abortController?: AbortController;
   private profileLoader?: AgentProfileLoader;
   private guidanceInjector: GuidanceInjector;
+  private historyConfig: Required<HistoryManagementConfig>;
+
+  // Token 使用统计
+  private lastTokenUsage: { inputTokens: number; outputTokens: number } = { inputTokens: 0, outputTokens: 0 };
+  private totalTokenUsage: { inputTokens: number; outputTokens: number } = { inputTokens: 0, outputTokens: 0 };
 
   constructor(adapterConfig: WorkerAdapterConfig) {
     super(
@@ -47,6 +65,11 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     this.profileLoader = adapterConfig.profileLoader;
     this.guidanceInjector = new GuidanceInjector();
     this.systemPrompt = adapterConfig.systemPrompt || this.buildSystemPrompt();
+    this.historyConfig = {
+      maxMessages: adapterConfig.historyConfig?.maxMessages ?? 50,
+      maxChars: adapterConfig.historyConfig?.maxChars ?? 100000,
+      preserveRecentRounds: adapterConfig.historyConfig?.preserveRecentRounds ?? 5,
+    };
   }
 
   /**
@@ -75,6 +98,9 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     this.currentTraceId = this.generateTraceId();
 
     try {
+      // 自动截断历史以控制 token 消耗
+      this.truncateHistoryIfNeeded();
+
       // 添加用户消息到历史
       this.conversationHistory.push({
         role: 'user',
@@ -297,5 +323,50 @@ Always think step by step and use tools when appropriate.`;
    */
   getHistoryLength(): number {
     return this.conversationHistory.length;
+  }
+
+  /**
+   * 获取历史总字符数
+   */
+  getHistoryChars(): number {
+    return this.conversationHistory.reduce((total, msg) => {
+      if (typeof msg.content === 'string') {
+        return total + msg.content.length;
+      } else if (Array.isArray(msg.content)) {
+        return total + JSON.stringify(msg.content).length;
+      }
+      return total;
+    }, 0);
+  }
+
+  /**
+   * 截断历史（如果超过限制）
+   * 保留最近的 N 轮对话
+   */
+  private truncateHistoryIfNeeded(): void {
+    const { maxMessages, maxChars, preserveRecentRounds } = this.historyConfig;
+
+    // 检查是否需要截断
+    const currentLength = this.conversationHistory.length;
+    const currentChars = this.getHistoryChars();
+
+    if (currentLength <= maxMessages && currentChars <= maxChars) {
+      return; // 无需截断
+    }
+
+    // 计算需要保留的消息数量（每轮对话约 2 条消息：user + assistant）
+    const preserveCount = Math.min(preserveRecentRounds * 2, currentLength);
+
+    // 截断旧消息，保留最近的
+    const truncatedCount = currentLength - preserveCount;
+    if (truncatedCount > 0) {
+      this.conversationHistory = this.conversationHistory.slice(-preserveCount);
+      logger.debug(`${this.agent} history truncated`, {
+        removedMessages: truncatedCount,
+        remainingMessages: this.conversationHistory.length,
+        previousChars: currentChars,
+        currentChars: this.getHistoryChars(),
+      }, LogCategory.LLM);
+    }
   }
 }

@@ -11,7 +11,7 @@
 
 import { logger, LogCategory } from '../logging';
 import { EventEmitter } from 'events';
-import type { CLIType } from '../types';
+import type { WorkerSlot } from '../types';
 import type { IAdapterFactory } from '../adapters/adapter-factory-interface';
 import {
   StandardMessage,
@@ -29,7 +29,7 @@ export interface MessageBridgeEvents {
   /** 消息完成 */
   complete: (message: StandardMessage) => void;
   /** 错误 */
-  error: (error: Error, cli?: CLIType) => void;
+  error: (error: Error, worker?: WorkerSlot) => void;
 }
 
 /**
@@ -93,8 +93,8 @@ export class MessageBridge extends EventEmitter {
   /**
    * 处理错误
    */
-  private handleError(cli: CLIType, error: Error): void {
-    this.emit('error', error, cli);
+  private handleError(worker: WorkerSlot, error: Error): void {
+    this.emit('error', error, worker);
   }
 
   /**

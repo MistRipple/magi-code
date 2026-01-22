@@ -64,4 +64,19 @@ export interface IAdapterFactory extends EventEmitter {
    * 检查代理是否忙碌
    */
   isBusy(agent: AgentType): boolean;
+
+  /**
+   * 清除特定适配器的对话历史（可选）
+   */
+  clearAdapterHistory?(agent: AgentType): void;
+
+  /**
+   * 清除所有适配器的对话历史（可选）
+   */
+  clearAllAdapterHistories?(): void;
+
+  /**
+   * 获取适配器历史信息（可选）
+   */
+  getAdapterHistoryInfo?(agent: AgentType): { messages: number; chars: number } | null;
 }

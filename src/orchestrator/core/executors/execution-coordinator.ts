@@ -8,7 +8,7 @@
  */
 
 import { EventEmitter } from 'events';
-import { CLIType } from '../../../types';
+import { WorkerSlot } from '../../../types';
 import { IAdapterFactory } from '../../../adapters/adapter-factory-interface';
 import { TokenUsage } from '../../../types/agent-types';
 import { ProfileLoader } from '../../profile/profile-loader';
@@ -47,7 +47,7 @@ export interface ExecutionOptions {
   /** 外部 Task ID（用于同步 SubTask） */
   taskId?: string;
   /** 输出回调 */
-  onOutput?: (workerId: CLIType, output: string) => void;
+  onOutput?: (workerId: WorkerSlot, output: string) => void;
   /** 进度回调 */
   onProgress?: (progress: ExecutionProgress) => void;
   /** 阻塞回调 */
@@ -78,7 +78,7 @@ export class ExecutionCoordinator extends EventEmitter {
   private contextManager: import('../../../context/context-manager').ContextManager | null = null;
 
   constructor(
-    private workers: Map<CLIType, AutonomousWorker>,
+    private workers: Map<WorkerSlot, AutonomousWorker>,
     private adapterFactory: IAdapterFactory,
     private profileLoader: ProfileLoader,
     private reviewer: ProfileAwareReviewer,

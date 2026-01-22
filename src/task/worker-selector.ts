@@ -1,6 +1,6 @@
 /**
- * CLI 选择器
- * 根据任务类型、用户配置、CLI 可用性、执行统计和 Worker 画像选择最佳 CLI
+ * Worker 选择器
+ * 根据任务类型、用户配置、Worker 可用性、执行统计和 Worker 画像选择最佳 Worker
  *
  * 集成 Worker Profile System：
  * - 基于 Worker 画像的能力匹配
@@ -8,7 +8,7 @@
  * - 支持成本/速度/质量优化目标
  */
 
-import { CLIType, TaskCategory } from '../types';
+import { WorkerSlot, TaskCategory } from '../types';
 import { TaskAnalysis } from './task-analyzer';
 import { ExecutionStats } from '../orchestrator/execution-stats';
 import {
@@ -30,14 +30,14 @@ import {
   ConflictResolutionResult,
 } from './conflict-resolver';
 
-/** CLI 选择结果 */
-export interface CLISelection {
-  /** 选中的 CLI */
-  cli: CLIType;
+/** Worker 选择结果 */
+export interface WorkerSelection {
+  /** 选中的 Worker */
+  worker: WorkerSlot;
   /** 是否为降级选择 */
   degraded: boolean;
-  /** 原始首选 CLI */
-  preferred: CLIType;
+  /** 原始首选 Worker */
+  preferred: WorkerSlot;
   /** 选择原因 */
   reason: string;
   /** 基于统计的置信度 (0-1) */
@@ -48,17 +48,18 @@ export interface CLISelection {
   score?: number;
 }
 
+
 /**
- * CLI 选择器类
+ * Worker 选择器类
  * 支持基于 Worker 画像的智能选择
  * 集成 ConflictResolver 统一冲突解决
  */
-export class CLISelector {
-  private availableCLIs: Set<CLIType> = new Set();
+export class WorkerSelector {
+  private availableWorkers: Set<WorkerSlot> = new Set();
   private executionStats?: ExecutionStats;
   /** 是否启用基于统计的智能选择 */
   private useStatsBasedSelection: boolean = true;
-  /** 健康阈值：低于此成功率的 CLI 会被降级 */
+  /** 健康阈值：低于此成功率的 Worker 会被降级 */
   private healthThreshold: number = 0.6;
   /** 画像加载器 */
   private profileLoader?: ProfileLoader;
@@ -119,10 +120,10 @@ export class CLISelector {
   }
 
   /**
-   * 更新可用 CLI 列表
+   * 更新可用 Worker 列表
    */
-  setAvailableCLIs(clis: CLIType[]): void {
-    this.availableCLIs = new Set(clis);
+  setAvailableWorkers(workers: WorkerSlot[]): void {
+    this.availableWorkers = new Set(workers);
   }
 
 
@@ -141,7 +142,7 @@ export class CLISelector {
     return DEFAULT_CATEGORIES_CONFIG.rules;
   }
 
-  private getProfile(worker: CLIType): WorkerProfile {
+  private getProfile(worker: WorkerSlot): WorkerProfile {
     if (this.useProfileBasedSelection && this.profileLoader) {
       return this.profileLoader.getProfile(worker);
     }
@@ -156,25 +157,25 @@ export class CLISelector {
   }
 
   /**
-   * 根据任务分析选择最佳 CLI
+   * 根据任务分析选择最佳 Worker
    * 使用 ConflictResolver 统一冲突解决
    */
-  select(analysis: TaskAnalysis, userPreference?: CLIType): CLISelection {
+  select(analysis: TaskAnalysis, userPreference?: WorkerSlot): WorkerSelection {
     const category = analysis.category;
 
     // 获取画像推荐
     const categoryConfig = this.getCategoryConfig(category);
     const defaultGeneral = DEFAULT_CATEGORIES_CONFIG.categories.general?.defaultWorker || 'claude';
-    const profileRecommendation = (categoryConfig?.defaultWorker || defaultGeneral) as CLIType;
+    const profileRecommendation = (categoryConfig?.defaultWorker || defaultGeneral) as WorkerSlot;
 
-    const availableClis = this.availableCLIs.size > 0
-      ? Array.from(this.availableCLIs)
-      : (['claude', 'codex', 'gemini'] as CLIType[]);
+    const availableWorkers = this.availableWorkers.size > 0
+      ? Array.from(this.availableWorkers)
+      : (['claude', 'codex', 'gemini'] as WorkerSlot[]);
 
     // 获取执行统计推荐
-    let statsRecommendation: CLIType | undefined;
+    let statsRecommendation: WorkerSlot | undefined;
     if (this.useStatsBasedSelection && this.executionStats) {
-      statsRecommendation = this.executionStats.recommendCLI(category, availableClis);
+      statsRecommendation = this.executionStats.recommendWorker(category, availableWorkers);
     }
 
     // 使用 ConflictResolver 解决冲突
@@ -183,13 +184,13 @@ export class CLISelector {
       profileRecommendation,
       statsRecommendation,
       category,
-      availableClis,
+      availableWorkers,
     });
 
     return {
-      cli: resolution.cli,
+      worker: resolution.worker,
       degraded: resolution.degraded,
-      preferred: profileRecommendation || resolution.cli,
+      preferred: profileRecommendation || resolution.worker,
       reason: resolution.reason,
       confidence: resolution.confidence,
       category,
@@ -199,35 +200,35 @@ export class CLISelector {
   /**
    * 基于统计数据的智能选择
    */
-  private selectWithStats(preferred: CLIType, category: TaskCategory): CLISelection | null {
+  private selectWithStats(preferred: WorkerSlot, category: TaskCategory): WorkerSelection | null {
     if (!this.executionStats) return null;
 
     const preferredStats = this.executionStats.getStats(preferred);
 
-    // 如果首选 CLI 健康且可用，直接使用
-    if (preferredStats.isHealthy && this.availableCLIs.has(preferred)) {
+    // 如果首选 Worker 健康且可用，直接使用
+    if (preferredStats.isHealthy && this.availableWorkers.has(preferred)) {
       return {
-        cli: preferred,
+        worker: preferred,
         degraded: false,
         preferred,
-        reason: `任务类型 "${category}" 的首选 CLI (健康度: ${(preferredStats.healthScore * 100).toFixed(0)}%)`,
+        reason: `任务类型 "${category}" 的首选 Worker (健康度: ${(preferredStats.healthScore * 100).toFixed(0)}%)`,
         confidence: preferredStats.healthScore,
       };
     }
 
-    // 如果首选 CLI 不健康，寻找更好的替代
+    // 如果首选 Worker 不健康，寻找更好的替代
     if (!preferredStats.isHealthy || preferredStats.healthScore < this.healthThreshold) {
-      const availableList = Array.from(this.availableCLIs);
-      const betterCli = this.executionStats.recommendCLI(category, availableList);
+      const availableList = Array.from(this.availableWorkers);
+      const betterWorker = this.executionStats.recommendWorker(category, availableList);
 
-      if (betterCli !== preferred && this.availableCLIs.has(betterCli)) {
-        const betterStats = this.executionStats.getStats(betterCli);
+      if (betterWorker !== preferred && this.availableWorkers.has(betterWorker)) {
+        const betterStats = this.executionStats.getStats(betterWorker);
         return {
-          cli: betterCli,
+          worker: betterWorker,
           degraded: true,
           preferred,
           reason: `${preferred} 近期表现不佳 (${(preferredStats.healthScore * 100).toFixed(0)}%)，` +
-                  `智能选择 ${betterCli} (${(betterStats.healthScore * 100).toFixed(0)}%)`,
+                  `智能选择 ${betterWorker} (${(betterStats.healthScore * 100).toFixed(0)}%)`,
           confidence: betterStats.healthScore,
         };
       }
@@ -237,14 +238,14 @@ export class CLISelector {
   }
 
   /**
-   * 根据任务类型直接选择 CLI
+   * 根据任务类型直接选择 Worker
    * 集成画像系统和基于统计的智能选择
    */
-  selectByCategory(category: TaskCategory): CLISelection {
+  selectByCategory(category: TaskCategory): WorkerSelection {
     // 如果有画像系统，使用画像配置的默认 Worker
     const categoryConfig = this.getCategoryConfig(category);
     const defaultGeneral = DEFAULT_CATEGORIES_CONFIG.categories.general?.defaultWorker || 'claude';
-    let preferred = (categoryConfig?.defaultWorker || defaultGeneral) as CLIType;
+    let preferred = (categoryConfig?.defaultWorker || defaultGeneral) as WorkerSlot;
 
     // 基于统计的智能选择
     if (this.useStatsBasedSelection && this.executionStats) {
@@ -255,16 +256,16 @@ export class CLISelector {
       }
     }
 
-    const availableList = this.availableCLIs.size > 0
-      ? Array.from(this.availableCLIs)
-      : (['claude', 'codex', 'gemini'] as CLIType[]);
+    const availableList = this.availableWorkers.size > 0
+      ? Array.from(this.availableWorkers)
+      : (['claude', 'codex', 'gemini'] as WorkerSlot[]);
 
     if (availableList.includes(preferred)) {
       return {
-        cli: preferred,
+        worker: preferred,
         degraded: false,
         preferred,
-        reason: `任务类型 "${category}" 的首选 CLI`,
+        reason: `任务类型 "${category}" 的首选 Worker`,
         category,
       };
     }
@@ -282,41 +283,41 @@ export class CLISelector {
     }
     if (availableList.length === 0) {
       return {
-        cli: preferred,
+        worker: preferred,
         degraded: false,
         preferred,
-        reason: '没有可用的 CLI，保持首选',
+        reason: '没有可用的 Worker，保持首选',
         category,
       };
     }
 
-    let bestWorker = availableList[0] as CLIType;
+    let bestWorker = availableList[0] as WorkerSlot;
     let bestScore = scores.get(bestWorker) || 0;
     for (const worker of availableList) {
-      const score = scores.get(worker as CLIType);
+      const score = scores.get(worker as WorkerSlot);
       if (score !== undefined && score > bestScore) {
         bestScore = score;
-        bestWorker = worker as CLIType;
+        bestWorker = worker as WorkerSlot;
       }
     }
 
     const degraded = bestWorker !== preferred;
     return {
-      cli: bestWorker,
+      worker: bestWorker,
       degraded,
       preferred,
       reason: degraded
         ? `首选 ${preferred} 不可用，基于画像选择 ${bestWorker}`
-        : '没有可用的 CLI，保持首选',
+        : '没有可用的 Worker，保持首选',
       category,
     };
   }
 
   /**
-   * 获取可用 CLI 列表
+   * 获取可用 Worker 列表
    */
-  getAvailableCLIs(): CLIType[] {
-    return Array.from(this.availableCLIs);
+  getAvailableWorkers(): WorkerSlot[] {
+    return Array.from(this.availableWorkers);
   }
 
   // ============================================================================
@@ -345,19 +346,19 @@ export class CLISelector {
     }
 
     // 4. 选择最高分的 Worker
-    const availableList = this.availableCLIs.size > 0
-      ? Array.from(this.availableCLIs)
-      : (['claude', 'codex', 'gemini'] as CLIType[]);
+    const availableList = this.availableWorkers.size > 0
+      ? Array.from(this.availableWorkers)
+      : (['claude', 'codex', 'gemini'] as WorkerSlot[]);
     let bestWorker = defaultWorker;
     let bestScore = scores.get(defaultWorker) || 0;
 
-    if (availableList.length > 0 && !this.availableCLIs.has(defaultWorker)) {
-      bestWorker = availableList[0] as CLIType;
+    if (availableList.length > 0 && !this.availableWorkers.has(defaultWorker)) {
+      bestWorker = availableList[0] as WorkerSlot;
       bestScore = scores.get(bestWorker) || 0;
     }
 
     for (const [workerType, score] of scores) {
-      if (score > bestScore && (availableList.length === 0 || this.availableCLIs.has(workerType))) {
+      if (score > bestScore && (availableList.length === 0 || this.availableWorkers.has(workerType))) {
         bestScore = score;
         bestWorker = workerType;
       }
@@ -378,12 +379,12 @@ export class CLISelector {
   /**
    * 使用画像配置分类任务
    */
-  private classifyWithProfile(taskDescription: string): { category: string; defaultWorker: CLIType } {
+  private classifyWithProfile(taskDescription: string): { category: string; defaultWorker: WorkerSlot } {
     const rules = this.getCategoryRules();
     const categories = this.profileLoader?.getAllCategories();
     const lowerDesc = taskDescription.toLowerCase();
 
-    let bestMatch: { category: string; score: number; defaultWorker: CLIType } | null = null;
+    let bestMatch: { category: string; score: number; defaultWorker: WorkerSlot } | null = null;
 
     for (const categoryName of rules.categoryPriority) {
       const config = categories?.get(categoryName) || DEFAULT_CATEGORIES_CONFIG.categories[categoryName];
@@ -407,7 +408,7 @@ export class CLISelector {
         bestMatch = {
           category: categoryName,
           score,
-          defaultWorker: config.defaultWorker as CLIType,
+          defaultWorker: config.defaultWorker as WorkerSlot,
         };
       }
     }
@@ -421,7 +422,7 @@ export class CLISelector {
     const defaultConfig = categories?.get(defaultCategory) || DEFAULT_CATEGORIES_CONFIG.categories[defaultCategory];
     return {
       category: defaultCategory,
-      defaultWorker: (defaultConfig?.defaultWorker || 'claude') as CLIType,
+      defaultWorker: (defaultConfig?.defaultWorker || 'claude') as WorkerSlot,
     };
   }
 
@@ -429,7 +430,7 @@ export class CLISelector {
    * 构建简化的选择原因
    */
   private buildSelectionReasonSimple(
-    worker: CLIType,
+    worker: WorkerSlot,
     category: string,
     profile: WorkerProfile
   ): string {
@@ -451,10 +452,10 @@ export class CLISelector {
     taskDescription: string,
     category: string,
     options: WorkerSelectionOptions
-  ): Map<CLIType, number> {
-    const scores = new Map<CLIType, number>();
+  ): Map<WorkerSlot, number> {
+    const scores = new Map<WorkerSlot, number>();
 
-    for (const workerType of ['claude', 'codex', 'gemini'] as CLIType[]) {
+    for (const workerType of ['claude', 'codex', 'gemini'] as WorkerSlot[]) {
       // 排除指定的 Worker
       if (options.excludeWorkers?.includes(workerType)) {
         scores.set(workerType, -Infinity);
@@ -498,7 +499,7 @@ export class CLISelector {
    * 基于执行统计调整分数
    */
   private adjustScoresWithStats(
-    scores: Map<CLIType, number>,
+    scores: Map<WorkerSlot, number>,
     category: string
   ): void {
     if (!this.executionStats) return;
@@ -528,7 +529,7 @@ export class CLISelector {
   ): WorkerSelectionResult {
     // 简单关键词匹配
     const desc = taskDescription.toLowerCase();
-    let worker: CLIType = 'claude';
+    let worker: WorkerSlot = 'claude';
     let category = 'general';
 
     if (desc.includes('bug') || desc.includes('fix') || desc.includes('修复')) {
@@ -558,7 +559,7 @@ export class CLISelector {
   /**
    * 获取 Worker 画像
    */
-  getWorkerProfile(workerType: CLIType): WorkerProfile | undefined {
+  getWorkerProfile(workerType: WorkerSlot): WorkerProfile | undefined {
     return this.getProfile(workerType);
   }
 }
