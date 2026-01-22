@@ -6,7 +6,7 @@
  * 支持画像系统的分类配置扩展
  */
 
-import { TaskCategory, CLIType } from '../types';
+import { TaskCategory, WorkerSlot } from '../types';
 import { ProfileLoader, CategoryConfig, RiskLevel } from '../orchestrator/profile';
 import { DEFAULT_CATEGORIES_CONFIG } from '../orchestrator/profile/defaults';
 
@@ -31,9 +31,9 @@ export interface TaskAnalysis {
   /** 风险等级（来自画像系统） */
   riskLevel?: RiskLevel;
   /** 推荐的 Worker（来自画像系统） */
-  recommendedWorker?: CLIType;
+  recommendedWorker?: WorkerSlot;
   /** 用户显式指定的 Worker */
-  explicitWorkers?: CLIType[];
+  explicitWorkers?: WorkerSlot[];
   /** 用户是否明确要求并行 */
   wantsParallel?: boolean;
   /** 匹配的关键词 */
@@ -128,7 +128,7 @@ export class TaskAnalyzer {
 
     // 从画像配置获取风险等级和推荐 Worker
     const riskLevel = categoryConfig?.riskLevel;
-    const recommendedWorker = categoryConfig?.defaultWorker as CLIType | undefined;
+    const recommendedWorker = categoryConfig?.defaultWorker as WorkerSlot | undefined;
 
     return {
       category,
@@ -331,8 +331,8 @@ export class TaskAnalyzer {
     return 'sequential';
   }
 
-  private detectExplicitWorkers(promptLower: string): CLIType[] {
-    const workers: CLIType[] = [];
+  private detectExplicitWorkers(promptLower: string): WorkerSlot[] {
+    const workers: WorkerSlot[] = [];
     if (promptLower.includes('claude')) workers.push('claude');
     if (promptLower.includes('codex')) workers.push('codex');
     if (promptLower.includes('gemini')) workers.push('gemini');

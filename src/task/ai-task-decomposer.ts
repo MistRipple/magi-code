@@ -1,19 +1,19 @@
 /**
  * AI 任务分解器
- * 调用 AI CLI 分析复杂任务并自动分解为子任务
+ * 调用 AI Worker 分析复杂任务并自动分解为子任务
  */
 
 import { logger, LogCategory } from '../logging';
-import { CLIType, TaskCategory } from '../types';
+import { WorkerSlot, TaskCategory } from '../types';
 import { IAdapterFactory } from '../adapters/adapter-factory-interface';
 import { TaskAnalysis } from './task-analyzer';
 import { SubTaskDef, SplitResult } from './task-splitter';
-import { CLISelector } from './cli-selector';
+import { WorkerSelector } from './worker-selector';
 
 /** AI 分解配置 */
 export interface AIDecomposeConfig {
-  /** 用于分解任务的 CLI（默认 claude） */
-  decomposeCli: CLIType;
+  /** 用于分解任务的 Worker（默认 claude） */
+  decomposeWorker: WorkerSlot;
   /** 复杂度阈值，超过此值才使用 AI 分解 */
   complexityThreshold: number;
   /** 超时时间（毫秒） */
@@ -21,7 +21,7 @@ export interface AIDecomposeConfig {
 }
 
 const DEFAULT_CONFIG: AIDecomposeConfig = {
-  decomposeCli: 'claude',
+  decomposeWorker: 'claude',
   complexityThreshold: 3,
   timeout: 60000,
 };
@@ -39,17 +39,17 @@ interface AISubTask {
  * AI 任务分解器
  */
 export class AITaskDecomposer {
-  private cliFactory: IAdapterFactory;
-  private cliSelector: CLISelector;
+  private adapterFactory: IAdapterFactory;
+  private workerSelector: WorkerSelector;
   private config: AIDecomposeConfig;
 
   constructor(
-    cliFactory: IAdapterFactory,
-    cliSelector: CLISelector,
+    adapterFactory: IAdapterFactory,
+    workerSelector: WorkerSelector,
     config?: Partial<AIDecomposeConfig>
   ) {
-    this.cliFactory = cliFactory;
-    this.cliSelector = cliSelector;
+    this.adapterFactory = adapterFactory;
+    this.workerSelector = workerSelector;
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
 
@@ -65,10 +65,10 @@ export class AITaskDecomposer {
    */
   async decompose(analysis: TaskAnalysis): Promise<SplitResult> {
     const prompt = this.buildDecomposePrompt(analysis);
-    
+
     try {
-      const response = await this.cliFactory.sendMessage(
-        this.config.decomposeCli,
+      const response = await this.adapterFactory.sendMessage(
+        this.config.decomposeWorker,
         prompt
       );
 
@@ -135,25 +135,25 @@ export class AITaskDecomposer {
       // 提取 JSON 块
       const jsonMatch = content.match(/```json\s*([\s\S]*?)\s*```/);
       const jsonStr = jsonMatch ? jsonMatch[1] : content;
-      
+
       const parsed = JSON.parse(jsonStr);
       const aiSubTasks: AISubTask[] = parsed.subTasks || [];
       const baseId = `ai-${Date.now()}`;
 
       return aiSubTasks.map((task, index) => {
         const category = this.normalizeCategory(task.category);
-        const selection = this.cliSelector.selectByCategory(category);
+        const selection = this.workerSelector.selectByCategory(category);
         const id = `${baseId}-${index}`;
-        
+
         return {
           id,
           description: task.description,
           category,
-          assignedWorker: selection.cli,
+          assignedWorker: selection.worker,
           targetFiles: task.targetFiles || [],
           dependencies: (task.dependencies || []).map((d: string | number) => `${baseId}-${d}`),
           priority: task.priority || index + 1,
-          cliSelection: selection,
+          workerSelection: selection,
         };
       });
     } catch (error) {
@@ -204,17 +204,17 @@ export class AITaskDecomposer {
    * 降级到规则分解
    */
   private fallbackSplit(analysis: TaskAnalysis): SplitResult {
-    const selection = this.cliSelector.select(analysis);
+    const selection = this.workerSelector.select(analysis);
     return {
       subTasks: [{
         id: `fallback-${Date.now()}`,
         description: analysis.prompt,
         category: analysis.category,
-        assignedWorker: selection.cli,
+        assignedWorker: selection.worker,
         targetFiles: analysis.targetFiles,
         dependencies: [],
         priority: 1,
-        cliSelection: selection,
+        workerSelection: selection,
       }],
       executionMode: 'sequential',
       estimatedTime: analysis.complexity * 30,

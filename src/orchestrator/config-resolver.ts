@@ -9,7 +9,7 @@
  */
 
 import {
-  CLIType,
+  WorkerSlot,
   PermissionMatrix,
   StrategyConfig,
 } from '../types';
@@ -19,7 +19,7 @@ import { VerificationConfig } from './verification-runner';
 export interface SubTaskPlan {
   id: string;
   description: string;
-  assignedCli: CLIType;
+  assignedWorker: WorkerSlot;
   reason: string;
   targetFiles?: string[];
   dependencies: string[];
@@ -38,7 +38,7 @@ export interface OrchestratorConfig {
   integration?: {
     enabled?: boolean;
     maxRounds?: number;
-    worker?: CLIType;
+    worker?: WorkerSlot;
   };
   review?: {
     selfCheck?: boolean;
@@ -49,14 +49,10 @@ export interface OrchestratorConfig {
   };
   planReview?: {
     enabled?: boolean;
-    reviewer?: CLIType;
+    reviewer?: WorkerSlot;
   };
   permissions?: PermissionMatrix;
   strategy?: StrategyConfig;
-  cliSelection?: {
-    enabled?: boolean;
-    healthThreshold?: number;
-  };
 }
 
 const DEFAULT_CONFIG: OrchestratorConfig = {
@@ -76,10 +72,6 @@ const DEFAULT_CONFIG: OrchestratorConfig = {
     enableVerification: true,
     enableRecovery: true,
     autoRollbackOnFailure: false,
-  },
-  cliSelection: {
-    enabled: true,
-    healthThreshold: 0.7,
   },
 };
 

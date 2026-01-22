@@ -8,7 +8,7 @@
  * - 同步 SubTask 状态
  */
 
-import { CLIType } from '../../../types';
+import { WorkerSlot } from '../../../types';
 import { IAdapterFactory } from '../../../adapters/adapter-factory-interface';
 import { TokenUsage } from '../../../types/agent-types';
 import { AutonomousWorker, AutonomousExecutionResult } from '../../worker';
@@ -23,7 +23,7 @@ export interface AssignmentExecutionOptions {
   timeout?: number;
   taskId?: string;
   contextManager?: import('../../../context/context-manager').ContextManager | null;
-  onOutput?: (workerId: CLIType, output: string) => void;
+  onOutput?: (workerId: WorkerSlot, output: string) => void;
 }
 
 export interface AssignmentExecutionResult {
@@ -36,7 +36,7 @@ export interface AssignmentExecutionResult {
 
 export class AssignmentExecutor {
   constructor(
-    private workers: Map<CLIType, AutonomousWorker>,
+    private workers: Map<WorkerSlot, AutonomousWorker>,
     private adapterFactory: IAdapterFactory,
     private snapshotManager: SnapshotManager | null,
     private taskManager: UnifiedTaskManager | null

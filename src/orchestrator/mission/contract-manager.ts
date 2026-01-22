@@ -4,7 +4,7 @@
  * 负责契约的定义、验证、冲突检测
  */
 
-import { CLIType } from '../../types';
+import { WorkerSlot } from '../../types';
 import {
   Mission,
   Contract,
@@ -26,7 +26,7 @@ export class ContractManager {
    */
   async defineContracts(
     mission: Mission,
-    participants: CLIType[]
+    participants: WorkerSlot[]
   ): Promise<Contract[]> {
     // 如果只有一个参与者，不需要契约
     if (participants.length <= 1) {
@@ -76,18 +76,18 @@ export class ContractManager {
    */
   private async identifyContractTypes(
     mission: Mission,
-    participants: CLIType[]
+    participants: WorkerSlot[]
   ): Promise<Array<{
     type: ContractType;
-    producer: CLIType;
-    consumers: CLIType[];
+    producer: WorkerSlot;
+    consumers: WorkerSlot[];
     name: string;
     description: string;
   }>> {
     const contracts: Array<{
       type: ContractType;
-      producer: CLIType;
-      consumers: CLIType[];
+      producer: WorkerSlot;
+      consumers: WorkerSlot[];
       name: string;
       description: string;
     }> = [];
@@ -159,9 +159,9 @@ export class ContractManager {
   /**
    * 选择契约提供方
    */
-  private selectProducer(participants: CLIType[], contractType: ContractType): CLIType {
+  private selectProducer(participants: WorkerSlot[], contractType: ContractType): WorkerSlot {
     // 基于契约类型选择最合适的提供方
-    const preferences: Record<ContractType, CLIType[]> = {
+    const preferences: Record<ContractType, WorkerSlot[]> = {
       api: ['claude', 'codex', 'gemini'],
       data: ['claude', 'codex', 'gemini'],
       event: ['claude', 'codex', 'gemini'],

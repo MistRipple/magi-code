@@ -3,20 +3,20 @@
  * 将复杂任务拆分为子任务，标注依赖关系
  */
 
-import { CLIType, TaskCategory } from '../types';
+import { WorkerSlot, TaskCategory } from '../types';
 import { TaskAnalysis } from './task-analyzer';
-import { CLISelector, CLISelection } from './cli-selector';
+import { WorkerSelector, WorkerSelection } from './worker-selector';
 
 /** 子任务定义 */
 export interface SubTaskDef {
   id: string;
   description: string;
   category: TaskCategory;
-  assignedWorker: CLIType;
+  assignedWorker: WorkerSlot;
   targetFiles: string[];
   dependencies: string[];
   priority: number;
-  cliSelection: CLISelection;
+  workerSelection: WorkerSelection;
 }
 
 /** 拆分结果 */
@@ -32,10 +32,10 @@ function generateId(): string {
 }
 
 export class TaskSplitter {
-  private cliSelector: CLISelector;
+  private workerSelector: WorkerSelector;
 
-  constructor(cliSelector: CLISelector) {
-    this.cliSelector = cliSelector;
+  constructor(workerSelector: WorkerSelector) {
+    this.workerSelector = workerSelector;
   }
 
   split(analysis: TaskAnalysis): SplitResult {
@@ -52,12 +52,12 @@ export class TaskSplitter {
 
   private createSingleTask(analysis: TaskAnalysis): SplitResult {
     // Use recommendedWorker from profile system as preference
-    const selection = this.cliSelector.select(analysis, analysis.recommendedWorker);
+    const selection = this.workerSelector.select(analysis, analysis.recommendedWorker);
     return {
       subTasks: [{
         id: generateId(), description: analysis.prompt, category: analysis.category,
-        assignedWorker: selection.cli, targetFiles: analysis.targetFiles,
-        dependencies: [], priority: 1, cliSelection: selection,
+        assignedWorker: selection.worker, targetFiles: analysis.targetFiles,
+        dependencies: [], priority: 1, workerSelection: selection,
       }],
       executionMode: 'sequential',
       estimatedTime: this.estimateTime(analysis.complexity),
@@ -70,11 +70,11 @@ export class TaskSplitter {
     if (files.length <= 1) return this.createSingleTask(analysis);
     const subTasks: SubTaskDef[] = files.map((file, index) => {
       // Use recommendedWorker from profile system as preference
-      const selection = this.cliSelector.select(analysis, analysis.recommendedWorker);
+      const selection = this.workerSelector.select(analysis, analysis.recommendedWorker);
       return {
         id: generateId(), description: `处理文件: ${file}`, category: analysis.category,
-        assignedWorker: selection.cli, targetFiles: [file],
-        dependencies: [], priority: index + 1, cliSelection: selection,
+        assignedWorker: selection.worker, targetFiles: [file],
+        dependencies: [], priority: index + 1, workerSelection: selection,
       };
     });
     return { subTasks, executionMode: 'parallel', estimatedTime: this.estimateTime(analysis.complexity), hasDependencies: false };
@@ -82,18 +82,18 @@ export class TaskSplitter {
 
   private splitArchitectureTask(analysis: TaskAnalysis): SplitResult {
     const subTasks: SubTaskDef[] = [];
-    const designSelection = this.cliSelector.selectByCategory('architecture');
+    const designSelection = this.workerSelector.selectByCategory('architecture');
     const designTask: SubTaskDef = {
       id: generateId(), description: `分析需求并设计架构: ${analysis.prompt}`,
-      category: 'architecture', assignedWorker: designSelection.cli, targetFiles: [],
-      dependencies: [], priority: 1, cliSelection: designSelection,
+      category: 'architecture', assignedWorker: designSelection.worker, targetFiles: [],
+      dependencies: [], priority: 1, workerSelection: designSelection,
     };
     subTasks.push(designTask);
-    const implSelection = this.cliSelector.selectByCategory('implement');
+    const implSelection = this.workerSelector.selectByCategory('implement');
     subTasks.push({
       id: generateId(), description: `实现架构设计`, category: 'implement',
-      assignedWorker: implSelection.cli, targetFiles: analysis.targetFiles,
-      dependencies: [designTask.id], priority: 2, cliSelection: implSelection,
+      assignedWorker: implSelection.worker, targetFiles: analysis.targetFiles,
+      dependencies: [designTask.id], priority: 2, workerSelection: implSelection,
     });
     return { subTasks, executionMode: 'sequential', estimatedTime: this.estimateTime(analysis.complexity) * 1.5, hasDependencies: true };
   }
@@ -107,19 +107,19 @@ export class TaskSplitter {
 
   private splitFullStackTask(analysis: TaskAnalysis): SplitResult {
     const subTasks: SubTaskDef[] = [];
-    const backendSelection = this.cliSelector.selectByCategory('backend');
+    const backendSelection = this.workerSelector.selectByCategory('backend');
     subTasks.push({
       id: generateId(), description: `实现后端 API: ${analysis.prompt}`, category: 'backend',
-      assignedWorker: backendSelection.cli,
+      assignedWorker: backendSelection.worker,
       targetFiles: analysis.targetFiles.filter(f => !f.includes('component') && !f.includes('.css') && !f.includes('.tsx')),
-      dependencies: [], priority: 1, cliSelection: backendSelection,
+      dependencies: [], priority: 1, workerSelection: backendSelection,
     });
-    const frontendSelection = this.cliSelector.selectByCategory('frontend');
+    const frontendSelection = this.workerSelector.selectByCategory('frontend');
     subTasks.push({
       id: generateId(), description: `实现前端界面: ${analysis.prompt}`, category: 'frontend',
-      assignedWorker: frontendSelection.cli,
+      assignedWorker: frontendSelection.worker,
       targetFiles: analysis.targetFiles.filter(f => f.includes('component') || f.includes('.css') || f.includes('.tsx')),
-      dependencies: [], priority: 1, cliSelection: frontendSelection,
+      dependencies: [], priority: 1, workerSelection: frontendSelection,
     });
     return { subTasks, executionMode: 'parallel', estimatedTime: this.estimateTime(analysis.complexity), hasDependencies: false };
   }

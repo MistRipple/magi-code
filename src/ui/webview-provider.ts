@@ -9,7 +9,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import {
-  CLIType,
   UIState,
   WebviewToExtensionMessage,
   ExtensionToWebviewMessage,
@@ -18,7 +17,7 @@ import {
   PermissionMatrix,
   StrategyConfig,
   WorkerStatus,
-  WorkerSlot,  // ✅ 新增
+  WorkerSlot,
 } from '../types';
 import {
   StandardMessage,
@@ -35,7 +34,7 @@ import { DiffGenerator } from '../diff-generator';
 import { globalEventBus } from '../events';
 import { IAdapterFactory } from '../adapters/adapter-factory-interface';
 import { LLMAdapterFactory } from '../llm/adapter-factory';
-import { TaskAnalyzer, CLISelector } from '../task';
+import { TaskAnalyzer, WorkerSelector } from '../task';
 import { IntelligentOrchestrator } from '../orchestrator/intelligent-orchestrator';
 import { AceIndexManager } from '../ace/index-manager';
 import { normalizeOrchestratorMessage, isInternalStateMessage } from '../normalizer';
@@ -76,9 +75,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   // 适配器工厂（LLM 模式）
   private adapterFactory: IAdapterFactory;
 
-  // 任务分析器和 CLI 选择器
+  // 任务分析器和 Worker 选择器
   private taskAnalyzer: TaskAnalyzer;
-  private cliSelector: CLISelector;
+  private workerSelector: WorkerSelector;
 
   // 智能编排器
   private intelligentOrchestrator: IntelligentOrchestrator;
@@ -108,7 +107,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   } | null = null;
 
   // 当前选择的 CLI（null 表示自动选择/智能编排）
-  private selectedCli: CLIType | null = null;
+  private selectedCli: WorkerSlot | null = null;
 
 
   private activeSessionId: string | null = null;
@@ -149,7 +148,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       void this.initTaskManagerForSession(this.activeSessionId);
     }
 
-    // 初始化任务分析器和 CLI 选择器（画像系统驱动）
+    // 初始化任务分析器（画像系统驱动）
     this.taskAnalyzer = new TaskAnalyzer();
     const config = vscode.workspace.getConfiguration('multiCli');
     const timeout = config.get<number>('timeout') ?? 300000;
@@ -157,7 +156,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const maxTimeout = config.get<number>('maxTimeout') ?? 900000;
     const permissions = this.normalizePermissions(config.get<Partial<PermissionMatrix>>('permissions'));
     const strategy = this.normalizeStrategy(config.get<Partial<StrategyConfig>>('strategy'));
-    const cliSelection = config.get<{ enabled?: boolean; healthThreshold?: number }>('cliSelection') || {};
 
     // 初始化 LLM 适配器工厂（替代 CLI 适配器工厂）
     this.adapterFactory = new LLMAdapterFactory({ cwd: workspaceRoot });
@@ -166,11 +164,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.error('Failed to initialize LLM adapter factory', { error: err.message }, LogCategory.LLM);
     });
     this.setupAdapterEvents();
-    this.cliSelector = new CLISelector();
-    this.cliSelector.configureSmartSelection({
-      enabled: cliSelection.enabled,
-      healthThreshold: cliSelection.healthThreshold,
-    });
+    this.workerSelector = new WorkerSelector();
 
     // 初始化智能编排器
     this.intelligentOrchestrator = new IntelligentOrchestrator(
@@ -178,7 +172,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.sessionManager,
       this.snapshotManager,
       this.workspaceRoot,
-      { timeout, idleTimeout, maxTimeout, permissions, strategy, cliSelection }
+      { timeout, idleTimeout, maxTimeout, permissions, strategy }
     );
     // 设置 Hard Stop 确认回调
     this.setupOrchestratorConfirmation();
@@ -465,53 +459,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** 处理用户回答 CLI 询问 */
-  private handleCliQuestionAnswer(
-    cli: CLIType,
-    questionId: string,
-    answer: string,
-    adapterRole?: 'worker' | 'orchestrator'
-  ): void {
-    logger.info('界面.CLI.提问.回答', { cli, questionId, answer, role: adapterRole || 'worker' }, LogCategory.UI);
-
-    const role = adapterRole || 'worker';
-    // TODO: LLM mode doesn't support writeInput - this needs to be refactored
-    const success = false; // this.adapterFactory.writeInput(cli, answer, role);
-
-    if (success) {
-      this.postMessage({
-        type: 'cliQuestionAnswered',
-        cli: cli,
-        questionId: questionId,
-        answer: answer,
-        success: true,
-        sessionId: this.activeSessionId
-      } as any);
-
-      this.postMessage({
-        type: 'toast',
-        message: `已发送回答: ${answer}`,
-        toastType: 'success',
-      });
-    } else {
-      this.postMessage({
-        type: 'cliQuestionAnswered',
-        cli: cli,
-        questionId: questionId,
-        answer: answer,
-        success: false,
-        error: 'CLI 未在等待输入或会话已关闭',
-        sessionId: this.activeSessionId
-      } as any);
-
-      this.postMessage({
-        type: 'toast',
-        message: '发送回答失败：CLI 未在等待输入',
-        toastType: 'error',
-      });
-    }
-  }
-
   /** 绑定全局事件 */
   private bindEvents(): void {
     // 任务相关事件
@@ -597,8 +544,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         // 发送任务卡片到对应的 CLI 面板
         if (data.cli) {
           this.postMessage({
-            type: 'cliTaskCard',
-            cli: data.cli as CLIType,
+            type: 'workerTaskCard',
+            worker: data.cli as WorkerSlot,
             taskId: event.taskId || '',
             subTaskId: event.subTaskId || '',
             description: data.description,
@@ -748,27 +695,27 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     globalEventBus.on('snapshot:reverted', () => this.sendStateUpdate());
 
     // CLI 状态相关事件
-    globalEventBus.on('cli:statusChanged', (event) => {
-      const data = event.data as { cli: string; available: boolean; version?: string };
+    globalEventBus.on('worker:statusChanged', (event) => {
+      const data = event.data as { worker: string; available: boolean; model?: string };
       this.sendStateUpdate();
       // 通知 UI Worker 状态变化
-      this.postMessage({ type: 'workerStatusChanged', worker: data.cli as WorkerSlot, available: data.available, version: data.version });
+      this.postMessage({ type: 'workerStatusChanged', worker: data.worker as WorkerSlot, available: data.available, model: data.model });
     });
 
-    globalEventBus.on('cli:healthCheck', () => {
+    globalEventBus.on('worker:healthCheck', () => {
       this.sendStateUpdate();
     });
 
-    globalEventBus.on('cli:error', (event) => {
-      const data = event.data as { cli: string; error: string };
+    globalEventBus.on('worker:error', (event) => {
+      const data = event.data as { worker: string; error: string };
       // 通知 UI 显示错误
-      this.postMessage({ type: 'cliError', cli: data.cli, error: data.error });
+      this.postMessage({ type: 'workerError', worker: data.worker, error: data.error });
     });
 
-    globalEventBus.on('cli:session_event', (event) => {
+    globalEventBus.on('worker:session_event', (event) => {
       const data = event.data as {
         type?: string;
-        cli?: CLIType;
+        worker?: WorkerSlot;
         role?: string;
         requestId?: string;
         reason?: string;
@@ -776,7 +723,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       };
       const pieces = [
         data?.type || 'session',
-        data?.cli ? `cli=${data.cli}` : '',
+        data?.worker ? `worker=${data.worker}` : '',
         data?.role ? `role=${data.role}` : '',
         data?.requestId ? `req=${data.requestId}` : '',
         data?.reason ? `reason=${data.reason}` : '',
@@ -786,7 +733,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.appendLog({
         level,
         message: pieces.join(' '),
-        source: data?.cli ?? 'system',
+        source: data?.worker ?? 'system',
         timestamp: Date.now(),
       });
       // session_event 仅写入日志，不推送到 CLI 面板，避免干扰用户对话
@@ -941,7 +888,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     // Assignment 事件
-    this.missionExecutor.on('assignmentStarted', (data: { missionId: string; assignmentId: string; workerId: CLIType }) => {
+    this.missionExecutor.on('assignmentStarted', (data: { missionId: string; assignmentId: string; workerId: WorkerSlot }) => {
       this.postMessage({
         type: 'assignmentStarted',
         missionId: data.missionId,
@@ -1408,10 +1355,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         this.sendStateUpdate();
         break;
 
-      case 'selectCli':
-        // 用户手动选择 CLI（null 表示自动选择）
-        this.selectedCli = message.cli || null;
-        logger.info('界面.CLI.选择.变更', { cli: this.selectedCli || 'auto' }, LogCategory.UI);
+      case 'selectWorker':
+        // 用户手动选择 Worker（null 表示自动选择）
+        this.selectedCli = (message as any).worker || null;
+        logger.info('界面.Worker.选择.变更', { worker: this.selectedCli || 'auto' }, LogCategory.UI);
         break;
 
       case 'confirmPlan':
@@ -1434,16 +1381,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'answerWorkerQuestion':
         // 用户回答 Worker 问题
         this.handleWorkerQuestionAnswer((message as any).answer ?? null);
-        break;
-
-      case 'answerCliQuestion':
-        // 用户回答 CLI 询问
-        this.handleCliQuestionAnswer(
-          (message as any).cli,
-          (message as any).questionId,
-          (message as any).answer,
-          (message as any).adapterRole
-        );
         break;
 
       case 'updateSetting':
@@ -1469,9 +1406,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         await this.handleResetExecutionStats();
         break;
 
-      case 'checkCliStatus':
+      case 'checkWorkerStatus':
 
-        this.sendCliStatus();
+        this.sendWorkerStatus();
         break;
 
       case 'getProfileConfig':
@@ -2890,8 +2827,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 添加仓库
       const result = await LLMConfigLoader.addRepository(url);
 
-      // 更新仓库名称
+      // 更新仓库名称和类型
       LLMConfigLoader.updateRepositoryName(result.id, repoInfo.name);
+      LLMConfigLoader.updateRepository(result.id, { type: repoInfo.type });
 
       this.postMessage({
         type: 'repositoryAdded',
@@ -2899,6 +2837,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           id: result.id,
           url,
           name: repoInfo.name,
+          type: repoInfo.type,
           enabled: true
         }
       });
@@ -2909,7 +2848,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         toastType: 'success'
       });
 
-      logger.info('Repository added', { url, name: repoInfo.name }, LogCategory.TOOLS);
+      logger.info('Repository added', { url, name: repoInfo.name, type: repoInfo.type }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to add repository', { url, error: error.message }, LogCategory.TOOLS);
       this.postMessage({
@@ -3027,10 +2966,21 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       // 加载仓库配置
       const repositories = LLMConfigLoader.loadRepositories();
+      logger.info('Loaded repositories for skill library', {
+        count: repositories.length,
+        repositories: repositories.map((r: any) => ({ id: r.id, url: r.url }))
+      }, LogCategory.TOOLS);
 
       // 获取所有 Skills
       const manager = new SkillRepositoryManager();
       const skills = await manager.getAllSkills(repositories);
+      logger.info('Fetched skills from all repositories', {
+        totalSkills: skills.length,
+        byRepository: skills.reduce((acc: any, skill) => {
+          acc[skill.repositoryId] = (acc[skill.repositoryId] || 0) + 1;
+          return acc;
+        }, {})
+      }, LogCategory.TOOLS);
 
       // 检查哪些已安装
       const skillsConfig = LLMConfigLoader.loadSkillsConfig();
@@ -3059,7 +3009,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         installedCount: skillsWithStatus.filter(s => s.installed).length
       }, LogCategory.TOOLS);
     } catch (error: any) {
-      logger.error('Failed to load skill library', { error: error.message }, LogCategory.TOOLS);
+      logger.error('Failed to load skill library', { error: error.message, stack: error.stack }, LogCategory.TOOLS);
       this.postMessage({
         type: 'toast',
         message: '加载 Skill 库失败: ' + error.message,
@@ -3069,13 +3019,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /** 发送适配器连接状态到前端 */
-  private async sendCliStatus(): Promise<void> {
+  private async sendWorkerStatus(): Promise<void> {
     try {
       const { LLMConfigLoader } = await import('../llm/config');
       const { createLLMClient } = await import('../llm/clients/client-factory');
 
       const config = LLMConfigLoader.loadFullConfig();
-      const statuses: Record<string, { status: string; version?: string; error?: string }> = {};
+      const statuses: Record<string, { status: string; model?: string; error?: string }> = {};
 
       // 测试模型的通用函数
       const testModel = async (name: string, modelConfig: any, isRequired: boolean = false) => {
@@ -3083,7 +3033,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         if (!modelConfig.enabled) {
           statuses[name] = {
             status: 'disabled',
-            version: '已禁用'
+            model: '已禁用'
           };
           return;
         }
@@ -3092,7 +3042,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         if (!modelConfig.apiKey || !modelConfig.model) {
           statuses[name] = {
             status: 'not_configured',
-            version: isRequired ? '未配置（必需）' : '未配置'
+            model: isRequired ? '未配置（必需）' : '未配置'
           };
           return;
         }
@@ -3117,7 +3067,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           // 4. 连接成功
           statuses[name] = {
             status: 'available',
-            version: `${modelConfig.provider} - ${modelConfig.model}`
+            model: `${modelConfig.provider} - ${modelConfig.model}`
           };
 
           logger.info(`Model connection test succeeded: ${name}`, {
@@ -3151,7 +3101,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
           statuses[name] = {
             status,
-            version: undefined,
+            model: undefined,
             error: errorMsg
           };
 
@@ -3179,7 +3129,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       await Promise.all(testPromises);
 
       this.postMessage({
-        type: 'cliStatusUpdate',
+        type: 'workerStatusUpdate',
         statuses
       } as ExtensionToWebviewMessage);
 
@@ -3199,21 +3149,21 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const stats = (['claude', 'codex', 'gemini'] as CLIType[]).map(cli => {
-      const cliStats = executionStats.getStats(cli);
+    const stats = (['claude', 'codex', 'gemini'] as WorkerSlot[]).map(worker => {
+      const workerStats = executionStats.getStats(worker);
       return {
-        cli,
-        totalExecutions: cliStats.totalExecutions,
-        successCount: cliStats.successCount,
-        failureCount: cliStats.failureCount,
-        successRate: cliStats.successRate,
-        avgDuration: cliStats.avgDuration,
-        isHealthy: cliStats.isHealthy,
-        healthScore: cliStats.healthScore,
-        lastError: cliStats.lastError,
-        lastExecutionTime: cliStats.lastExecutionTime,
-        totalInputTokens: cliStats.totalInputTokens,
-        totalOutputTokens: cliStats.totalOutputTokens,
+        worker,
+        totalExecutions: workerStats.totalExecutions,
+        successCount: workerStats.successCount,
+        failureCount: workerStats.failureCount,
+        successRate: workerStats.successRate,
+        avgDuration: workerStats.avgDuration,
+        isHealthy: workerStats.isHealthy,
+        healthScore: workerStats.healthScore,
+        lastError: workerStats.lastError,
+        lastExecutionTime: workerStats.lastExecutionTime,
+        totalInputTokens: workerStats.totalInputTokens,
+        totalOutputTokens: workerStats.totalOutputTokens,
       };
     });
 
@@ -3665,7 +3615,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /** 执行任务 */
-  private async executeTask(prompt: string, forceCli?: CLIType, images?: Array<{dataUrl: string}>): Promise<void> {
+  private async executeTask(prompt: string, forceCli?: WorkerSlot, images?: Array<{dataUrl: string}>): Promise<void> {
     logger.info('界面.任务.执行.开始', { promptLength: prompt.length, imageCount: images?.length || 0, forceCli: forceCli || undefined }, LogCategory.UI);
 
 
@@ -3871,7 +3821,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /** 直接 CLI 执行模式 */
-  private async executeWithDirectCli(prompt: string, targetCli: CLIType, imagePaths: string[]): Promise<void> {
+  private async executeWithDirectCli(prompt: string, targetCli: WorkerSlot, imagePaths: string[]): Promise<void> {
     logger.info('界面.执行.模式.直接', { cli: targetCli }, LogCategory.UI);
 
     const startTime = Date.now();
@@ -3881,13 +3831,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.sendStateUpdate();
 
     try {
-      logger.info('界面.执行.直接.请求', { cli: targetCli }, LogCategory.UI);
+      logger.info('界面.执行.直接.请求', { worker: targetCli }, LogCategory.UI);
       const response = await this.adapterFactory.sendMessage(targetCli, prompt, imagePaths);
-      logger.info('界面.执行.直接.响应', { cli: targetCli, preview: response.content?.substring(0, 100) }, LogCategory.UI);
+      logger.info('界面.执行.直接.响应', { worker: targetCli, preview: response.content?.substring(0, 100) }, LogCategory.UI);
       const executionStats = this.intelligentOrchestrator.getExecutionStats();
       if (executionStats) {
         executionStats.recordExecution({
-          cli: targetCli,
+          worker: targetCli,
           taskId: task.id,
           subTaskId: `direct-${task.id}`,
           success: !response.error,
@@ -3900,7 +3850,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       if (response.error) {
         await taskManager.failTask(task.id, response.error);
-        this.postMessage({ type: 'cliError', cli: targetCli, error: response.error });
+        this.postMessage({ type: 'workerError', worker: targetCli, error: response.error });
       } else {
         await taskManager.completeTask(task.id);
         this.saveMessageToSession(prompt, response.content || '', targetCli, 'worker');
@@ -3913,7 +3863,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const executionStats = this.intelligentOrchestrator.getExecutionStats();
       if (executionStats) {
         executionStats.recordExecution({
-          cli: targetCli,
+          worker: targetCli,
           taskId: task.id,
           subTaskId: `direct-${task.id}`,
           success: false,
@@ -3921,7 +3871,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           error: errorMsg,
         });
       }
-      this.postMessage({ type: 'cliError', cli: targetCli, error: errorMsg });
+      this.postMessage({ type: 'workerError', worker: targetCli, error: errorMsg });
     }
 
     this.sendStateUpdate();
@@ -3959,6 +3909,34 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     await this.adapterFactory.shutdown();
     this.activeSessionId = sessionId;
     this.ensureSessionExists(sessionId);
+
+    // 生成会话总结（而不是加载完整历史）
+    const summary = this.sessionManager.getSessionSummary(sessionId);
+    if (summary) {
+      // 发送会话总结给前端
+      this.postMessage({
+        type: 'sessionSummaryLoaded',
+        sessionId,
+        summary: {
+          title: summary.title,
+          objective: summary.objective,
+          completedTasks: summary.completedTasks,
+          inProgressTasks: summary.inProgressTasks,
+          keyDecisions: summary.keyDecisions,
+          codeChanges: summary.codeChanges,
+          pendingIssues: summary.pendingIssues,
+          messageCount: summary.messageCount,
+          lastUpdated: summary.lastUpdated,
+        }
+      });
+
+      logger.info('界面.会话.总结.已加载', {
+        sessionId,
+        messageCount: summary.messageCount,
+        completedTasks: summary.completedTasks.length,
+        codeChanges: summary.codeChanges.length
+      }, LogCategory.UI);
+    }
   }
 
   /** 确保任务会话存在并已切换 */
@@ -3987,7 +3965,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private saveMessageToSession(
     userPrompt: string,
     assistantResponse: string,
-    cli?: CLIType,
+    cli?: WorkerSlot,
     source?: MessageSource
   ): void {
     const session = this.sessionManager.getCurrentSession();
@@ -4033,8 +4011,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       ? this.intelligentOrchestrator.getActivePlanForSession(currentSession.id)
       : null;
     const activePlanRecord = activePlanRecordRaw?.plan?.needsWorker === false ? null : activePlanRecordRaw;
-    // 使用统一会话管理器的会话数据
-    const allSessions = this.sessionManager.getAllSessions();
+
+    // 使用轻量级的会话元数据（而不是完整会话数据）
+    const sessionMetas = this.sessionManager.getSessionMetas();
 
     // 构建 Worker 状态（基于 LLM 适配器）
     const workerSlots: WorkerSlot[] = ['claude', 'codex', 'gemini'];
@@ -4050,7 +4029,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     return {
       // 使用 activeSessionId 作为单一真相来源，确保与消息发送时的 sessionId 一致
       currentSessionId: this.activeSessionId ?? currentSession?.id,
-      sessions: allSessions as any[],
+      sessions: sessionMetas as any[],  // 使用轻量级元数据
       currentTask,
       tasks,
       workerStatuses,  // ✅ 使用 workerStatuses
@@ -4097,20 +4076,57 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const templatePath = path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'index.html');
     let html = fs.readFileSync(templatePath, 'utf-8');
 
-    const stylesUri = webview.asWebviewUri(
-      vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'styles.css'))
+    // 获取 webview 根目录 URI
+    const webviewRoot = webview.asWebviewUri(
+      vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview'))
     );
-    const loginScriptUri = webview.asWebviewUri(
-      vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'login.js'))
+
+    // 替换 CSS 文件路径（6 个模块化 CSS 文件）
+    const cssFiles = ['base.css', 'layout.css', 'components.css', 'messages.css', 'settings.css', 'modals.css'];
+    cssFiles.forEach(cssFile => {
+      const cssUri = webview.asWebviewUri(
+        vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'styles', cssFile))
+      );
+      html = html.replace(`href="styles/${cssFile}"`, `href="${cssUri}"`);
+    });
+
+    // 替换 JavaScript 主入口路径
+    const mainJsUri = webview.asWebviewUri(
+      vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'js', 'main.js'))
     );
+    html = html.replace('src="js/main.js"', `src="${mainJsUri}"`);
+
+    // 创建 import map 来处理 ES6 模块的相对导入
+    const jsModules = [
+      'core/state.js',
+      'core/utils.js',
+      'core/vscode-api.js',
+      'ui/message-renderer.js',
+      'ui/message-handler.js',
+      'ui/event-handlers.js'
+    ];
+
+    const imports: Record<string, string> = {};
+    jsModules.forEach(modulePath => {
+      const moduleUri = webview.asWebviewUri(
+        vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'js', modulePath))
+      );
+      imports[`./${modulePath}`] = moduleUri.toString();
+    });
+
+    const importMap = `<script type="importmap">
+{
+  "imports": ${JSON.stringify(imports, null, 2)}
+}
+</script>`;
+
+    // 在 </head> 之前插入 import map
+    html = html.replace('</head>', `${importMap}\n</head>`);
+
     // lib 目录 URI（用于加载 marked 和 highlight.js）
     const libUri = webview.asWebviewUri(
       vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'lib'))
     );
-
-    html = html.replace('href="styles.css"', `href="${stylesUri}"`);
-    html = html.replace('src="login.js"', `src="${loginScriptUri}"`);
-    // 替换 lib 目录占位符
     html = html.replace(/\{\{libUri\}\}/g, libUri.toString());
 
     // 替换 CSP 占位符

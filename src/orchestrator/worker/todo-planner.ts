@@ -8,7 +8,7 @@
  * - 支持规划修订和批准流程
  */
 
-import { CLIType } from '../../types';
+import { WorkerSlot } from '../../types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
 import {

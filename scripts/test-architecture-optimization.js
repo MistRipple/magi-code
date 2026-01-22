@@ -37,7 +37,7 @@ Module.prototype.require = function(id) {
 
 const { PolicyEngine } = require('../out/orchestrator/policy-engine');
 const { ProfileLoader } = require('../out/orchestrator/profile');
-const { CLISelector } = require('../out/task/cli-selector');
+const { WorkerSelector } = require('../out/task/worker-selector');
 const { ConflictResolver } = require('../out/task/conflict-resolver');
 const { TaskDependencyGraph } = require('../out/orchestrator/task-dependency-graph');
 const { MessageDeduplicator } = require('../out/normalizer/message-deduplicator');
@@ -120,13 +120,13 @@ function testPhase2_ConflictResolution(runner) {
       userPreference: 'gemini',
       profileRecommendation: 'claude',
       statsRecommendation: 'codex',
-      availableClis: ['claude', 'codex', 'gemini'],
+      availableWorkers: ['claude', 'codex', 'gemini'],
     });
 
     runner.logTest(
       'ConflictResolver 用户偏好优先 (Level 1)',
-      result.cli === 'gemini' && result.level === 'user',
-      `选择结果: ${result.cli}, 决策层级: ${result.level}, 原因: ${result.reason}`
+      result.worker === 'gemini' && result.level === 'user',
+      `选择结果: ${result.worker}, 决策层级: ${result.level}, 原因: ${result.reason}`
     );
   } catch (error) {
     runner.logTest('用户偏好优先级', false, error.message);
@@ -154,13 +154,13 @@ function testPhase2_ConflictResolution(runner) {
     const result = resolver.resolve({
       profileRecommendation: 'claude',
       statsRecommendation: 'codex',
-      availableClis: ['claude', 'codex', 'gemini'],
+      availableWorkers: ['claude', 'codex', 'gemini'],
     });
 
     runner.logTest(
       'ConflictResolver 统计推荐优先 (Level 2)',
-      result.cli === 'codex' && result.level === 'stats',
-      `选择结果: ${result.cli}, 决策层级: ${result.level}`
+      result.worker === 'codex' && result.level === 'stats',
+      `选择结果: ${result.worker}, 决策层级: ${result.level}`
     );
   } catch (error) {
     runner.logTest('统计推荐优先级', false, error.message);
@@ -172,13 +172,13 @@ function testPhase2_ConflictResolution(runner) {
 
     const result = resolver.resolve({
       profileRecommendation: 'claude',
-      availableClis: ['claude', 'codex', 'gemini'],
+      availableWorkers: ['claude', 'codex', 'gemini'],
     });
 
     runner.logTest(
       'ConflictResolver 画像推荐优先 (Level 3)',
-      result.cli === 'claude' && result.level === 'profile',
-      `选择结果: ${result.cli}, 决策层级: ${result.level}`
+      result.worker === 'claude' && result.level === 'profile',
+      `选择结果: ${result.worker}, 决策层级: ${result.level}`
     );
   } catch (error) {
     runner.logTest('画像推荐优先级', false, error.message);
@@ -189,35 +189,35 @@ function testPhase2_ConflictResolution(runner) {
     const resolver = new ConflictResolver();
 
     const result = resolver.resolve({
-      availableClis: ['claude'],
+      availableWorkers: ['claude'],
     });
 
     runner.logTest(
       'ConflictResolver 默认值回退 (Level 4)',
-      result.cli === 'claude' && result.level === 'default',
-      `选择结果: ${result.cli}, 决策层级: ${result.level}`
+      result.worker === 'claude' && result.level === 'default',
+      `选择结果: ${result.worker}, 决策层级: ${result.level}`
     );
   } catch (error) {
     runner.logTest('默认值回退', false, error.message);
   }
 
-  // 测试 2.5: CLISelector 集成 ConflictResolver
+  // 测试 2.5: WorkerSelector 集成 ConflictResolver
   try {
-    const cliSelector = new CLISelector();
-    cliSelector.setAvailableCLIs(['claude', 'codex', 'gemini']);
+    const workerSelector = new WorkerSelector();
+    workerSelector.setAvailableWorkers(['claude', 'codex', 'gemini']);
 
-    const selection = cliSelector.select(
+    const selection = workerSelector.select(
       { category: 'architecture', complexity: 'high' },
       'gemini' // 用户偏好
     );
 
     runner.logTest(
-      'CLISelector 集成 ConflictResolver',
-      selection.cli === 'gemini',
-      `用户指定 gemini, 实际选择: ${selection.cli}, 原因: ${selection.reason}`
+      'WorkerSelector 集成 ConflictResolver',
+      selection.worker === 'gemini',
+      `用户指定 gemini, 实际选择: ${selection.worker}, 原因: ${selection.reason}`
     );
   } catch (error) {
-    runner.logTest('CLISelector 集成', false, error.message);
+    runner.logTest('WorkerSelector 集成', false, error.message);
   }
 }
 

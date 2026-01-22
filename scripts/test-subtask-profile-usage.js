@@ -10,7 +10,7 @@
 
 const { TaskAnalyzer } = require('../out/task/task-analyzer');
 const { TaskSplitter } = require('../out/task/task-splitter');
-const { CLISelector } = require('../out/task/cli-selector');
+const { WorkerSelector } = require('../out/task/worker-selector');
 const { ProfileLoader } = require('../out/orchestrator/profile/profile-loader');
 
 console.log('\n🧪 子任务拆分画像使用测试\n');
@@ -23,14 +23,14 @@ async function runTests() {
   const profileLoader = new ProfileLoader();
   await profileLoader.load();
 
-  const cliSelector = new CLISelector();
-  cliSelector.setProfileLoader(profileLoader);
-  cliSelector.setAvailableCLIs(['claude', 'codex', 'gemini']);
+  const workerSelector = new WorkerSelector();
+  workerSelector.setProfileLoader(profileLoader);
+  workerSelector.setAvailableWorkers(['claude', 'codex', 'gemini']);
 
   const taskAnalyzer = new TaskAnalyzer();
   taskAnalyzer.setProfileLoader(profileLoader);
 
-  const taskSplitter = new TaskSplitter(cliSelector);
+  const taskSplitter = new TaskSplitter(workerSelector);
 
   console.log('======================================================================');
   console.log('  测试 1: 架构任务拆分');

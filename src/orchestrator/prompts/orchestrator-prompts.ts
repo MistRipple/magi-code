@@ -6,15 +6,15 @@
  * - 所有 Prompt 都围绕"分析、规划、监控、汇总"设计
  */
 
-import { CLIType, ExecutionResult, SubTask, ExecutionPlan } from '../protocols/types';
+import { WorkerSlot, ExecutionResult, SubTask, ExecutionPlan } from '../protocols/types';
 
 // ============================================================================
 // CLI 能力描述
 // ============================================================================
 
 /** 获取 Worker 能力描述 */
-export function getWorkerDescription(worker: CLIType): string {
-  const descriptions: Record<CLIType, string> = {
+export function getWorkerDescription(worker: WorkerSlot): string {
+  const descriptions: Record<WorkerSlot, string> = {
     claude: `Worker Claude (代码执行者)
       - 擅长: 复杂代码实现、架构重构、多文件修改、代码审查
       - 最适合: 需要深度理解的编码任务、复杂重构、架构调整
@@ -41,7 +41,7 @@ export function getWorkerDescription(worker: CLIType): string {
  */
 export function buildOrchestratorAnalysisPrompt(
   userPrompt: string,
-  availableWorkers: CLIType[],
+  availableWorkers: WorkerSlot[],
   projectContext?: string
 ): string {
   const workersDesc = availableWorkers
@@ -255,7 +255,7 @@ ${tasksText}
 export function buildProgressMessage(
   completedTasks: number,
   totalTasks: number,
-  currentWorker?: CLIType,
+  currentWorker?: WorkerSlot,
   currentTask?: string
 ): string {
   const safeTotal = totalTasks > 0 ? totalTasks : 0;
@@ -331,11 +331,11 @@ export function estimateTokenCount(text: string): number {
  */
 export function buildCompactAnalysisPrompt(
   userPrompt: string,
-  availableWorkers: CLIType[],
+  availableWorkers: WorkerSlot[],
   projectContext?: string
 ): string {
   const workers = availableWorkers.map(w => {
-    const short: Record<CLIType, string> = {
+    const short: Record<WorkerSlot, string> = {
       claude: 'Claude: 架构/重构/复杂任务',
       codex: 'Codex: 后端/算法/Bug修复',
       gemini: 'Gemini: 前端/UI/样式',

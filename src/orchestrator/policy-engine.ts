@@ -1,29 +1,30 @@
 /**
  * PolicyEngine - 统一策略引擎
- * 集中管理所有策略决策：CLI选择、风险评估、验证策略、冲突检测等
+ * 集中管理所有策略决策：Worker选择、风险评估、验证策略、冲突检测等
  *
  * v0.7.0: 集成 ProfileLoader，移除硬编码的任务映射
  */
 
 import { EventEmitter } from 'events';
-import { CLIType, SubTask } from '../types';
+import { WorkerSlot, SubTask } from '../types';
 import { RiskPolicy, RiskAssessment, RiskLevel, VerificationLevel } from './risk-policy';
 import { ExecutionPlan } from './protocols/types';
 import { VerificationConfig } from './verification-runner';
 import { ProfileLoader } from './profile/profile-loader';
 import { CategoryConfig } from './profile/types';
 
-/** CLI 选择策略 */
-export interface CLISelectionPolicy {
-  /** 推荐的 CLI */
-  recommendedCli: CLIType;
-  /** 备选 CLI 列表 */
-  fallbackClis: CLIType[];
+/** Worker 选择策略 */
+export interface WorkerSelectionPolicy {
+  /** 推荐的 Worker */
+  recommendedWorker: WorkerSlot;
+  /** 备选 Worker 列表 */
+  fallbackWorkers: WorkerSlot[];
   /** 选择原因 */
   reason: string;
   /** 置信度 (0-1) */
   confidence: number;
 }
+
 
 /** 冲突检测结果 */
 export interface ConflictDetectionResult {
@@ -47,15 +48,16 @@ export interface VerificationDecision {
   reason: string;
 }
 
-/** CLI 健康状态 */
-export interface CLIHealthStatus {
-  cli: CLIType;
+/** Worker 健康状态 */
+export interface WorkerHealthStatus {
+  worker: WorkerSlot;
   available: boolean;
   successRate: number;
   avgResponseTime: number;
   lastError?: string;
   lastSuccessAt?: number;
 }
+
 
 /**
  * 🗑️ 已废弃: 硬编码的任务映射
@@ -88,12 +90,12 @@ const FILE_TYPE_MAPPING: Record<string, string> = {
 
 /**
  * 统一策略引擎
- * 集成 ProfileLoader，从配置读取任务分类和 CLI 映射
+ * 集成 ProfileLoader，从配置读取任务分类和 Worker 映射
  */
 export class PolicyEngine extends EventEmitter {
   private riskPolicy: RiskPolicy;
-  private cliHealthStatus: Map<CLIType, CLIHealthStatus> = new Map();
-  private executionHistory: Array<{ cli: CLIType; success: boolean; duration: number }> = [];
+  private workerHealthStatus: Map<WorkerSlot, WorkerHealthStatus> = new Map();
+  private executionHistory: Array<{ worker: WorkerSlot; success: boolean; duration: number }> = [];
 
   /** 画像加载器 */
   private profileLoader?: ProfileLoader;
@@ -102,7 +104,7 @@ export class PolicyEngine extends EventEmitter {
     super();
     this.riskPolicy = new RiskPolicy();
     this.profileLoader = profileLoader;
-    this.initializeCLIHealth();
+    this.initializeWorkerHealth();
   }
 
   /**
@@ -112,12 +114,12 @@ export class PolicyEngine extends EventEmitter {
     this.profileLoader = loader;
   }
 
-  /** 初始化 CLI 健康状态 */
-  private initializeCLIHealth(): void {
-    const clis: CLIType[] = ['claude', 'codex', 'gemini'];
-    for (const cli of clis) {
-      this.cliHealthStatus.set(cli, {
-        cli,
+  /** 初始化 Worker 健康状态 */
+  private initializeWorkerHealth(): void {
+    const workers: WorkerSlot[] = ['claude', 'codex', 'gemini'];
+    for (const worker of workers) {
+      this.workerHealthStatus.set(worker, {
+        worker,
         available: true,
         successRate: 1.0,
         avgResponseTime: 0,
@@ -125,27 +127,27 @@ export class PolicyEngine extends EventEmitter {
     }
   }
 
-  // ========== CLI 选择策略 ==========
+  // ========== Worker 选择策略 ==========
 
   /**
-   * 根据任务特征选择最佳 CLI
+   * 根据任务特征选择最佳 Worker
    * 从 ProfileLoader 读取任务分类配置
    */
-  selectCLI(task: SubTask, availableClis?: CLIType[]): CLISelectionPolicy {
-    const available = availableClis || this.getAvailableCLIs();
+  selectWorker(task: SubTask, availableWorkers?: WorkerSlot[]): WorkerSelectionPolicy {
+    const available = availableWorkers || this.getAvailableWorkers();
     const taskType = this.inferTaskType(task);
 
-    // 从 ProfileLoader 获取该分类的推荐 CLI
-    const preferredClis = this.getPreferredCLIsForCategory(taskType);
+    // 从 ProfileLoader 获取该分类的推荐 Worker
+    const preferredWorkers = this.getPreferredWorkersForCategory(taskType);
 
-    // 过滤出可用的 CLI
-    const candidates = preferredClis.filter(cli => available.includes(cli));
+    // 过滤出可用的 Worker
+    const candidates = preferredWorkers.filter(w => available.includes(w));
     if (candidates.length === 0) {
-      // 回退到任何可用的 CLI
+      // 回退到任何可用的 Worker
       return {
-        recommendedCli: available[0] || 'claude',
-        fallbackClis: available.slice(1),
-        reason: `无首选 CLI 可用，回退到 ${available[0] || 'claude'}`,
+        recommendedWorker: available[0] || 'claude',
+        fallbackWorkers: available.slice(1),
+        reason: `无首选 Worker 可用，回退到 ${available[0] || 'claude'}`,
         confidence: 0.5,
       };
     }
@@ -156,17 +158,17 @@ export class PolicyEngine extends EventEmitter {
     const fallbacks = sorted.slice(1);
 
     return {
-      recommendedCli: recommended,
-      fallbackClis: fallbacks,
+      recommendedWorker: recommended,
+      fallbackWorkers: fallbacks,
       reason: `任务类型 "${taskType}" 推荐使用 ${recommended}`,
       confidence: this.calculateConfidence(recommended, taskType),
     };
   }
 
   /**
-   * 从 ProfileLoader 获取分类的推荐 CLI 列表
+   * 从 ProfileLoader 获取分类的推荐 Worker 列表
    */
-  private getPreferredCLIsForCategory(category: string): CLIType[] {
+  private getPreferredWorkersForCategory(category: string): WorkerSlot[] {
     if (!this.profileLoader) {
       // 降级到默认值
       return ['claude', 'codex', 'gemini'];
@@ -174,10 +176,10 @@ export class PolicyEngine extends EventEmitter {
 
     const categoryConfig = this.profileLoader.getCategory(category);
     if (categoryConfig?.defaultWorker) {
-      const defaultWorker = categoryConfig.defaultWorker as CLIType;
+      const defaultWorker = categoryConfig.defaultWorker as WorkerSlot;
       // 返回默认 Worker 加上其他可选 Worker
-      const allClis: CLIType[] = ['claude', 'codex', 'gemini'];
-      const others = allClis.filter(cli => cli !== defaultWorker);
+      const allWorkers: WorkerSlot[] = ['claude', 'codex', 'gemini'];
+      const others = allWorkers.filter(w => w !== defaultWorker);
       return [defaultWorker, ...others];
     }
 
@@ -186,7 +188,7 @@ export class PolicyEngine extends EventEmitter {
     const defaultCategory = rules.defaultCategory;
     const defaultConfig = this.profileLoader.getCategory(defaultCategory);
     if (defaultConfig?.defaultWorker) {
-      return [defaultConfig.defaultWorker as CLIType, 'claude', 'codex', 'gemini'];
+      return [defaultConfig.defaultWorker as WorkerSlot, 'claude', 'codex', 'gemini'];
     }
 
     return ['claude', 'codex', 'gemini'];
@@ -255,11 +257,11 @@ export class PolicyEngine extends EventEmitter {
     return match ? match[0] : '';
   }
 
-  /** 根据健康状态排序 CLI */
-  private sortByHealth(clis: CLIType[]): CLIType[] {
-    return [...clis].sort((a, b) => {
-      const healthA = this.cliHealthStatus.get(a);
-      const healthB = this.cliHealthStatus.get(b);
+  /** 根据健康状态排序 Worker */
+  private sortByHealth(workers: WorkerSlot[]): WorkerSlot[] {
+    return [...workers].sort((a, b) => {
+      const healthA = this.workerHealthStatus.get(a);
+      const healthB = this.workerHealthStatus.get(b);
       if (!healthA || !healthB) return 0;
 
       // 优先考虑可用性
@@ -275,45 +277,45 @@ export class PolicyEngine extends EventEmitter {
   /** 计算置信度
    * 基于 ProfileLoader 配置和健康状态
    */
-  private calculateConfidence(cli: CLIType, taskType: string): number {
-    const health = this.cliHealthStatus.get(cli);
+  private calculateConfidence(worker: WorkerSlot, taskType: string): number {
+    const health = this.workerHealthStatus.get(worker);
     const healthFactor = health?.successRate || 0.5;
 
     // 检查是否是该分类的首选 Worker
     let isPreferred = false;
     if (this.profileLoader) {
       const categoryConfig = this.profileLoader.getCategory(taskType);
-      isPreferred = categoryConfig?.defaultWorker === cli;
+      isPreferred = categoryConfig?.defaultWorker === worker;
     }
 
     const baseConfidence = isPreferred ? 0.9 : 0.7;
     return Math.min(1, baseConfidence * healthFactor);
   }
 
-  /** 获取可用的 CLI 列表 */
-  getAvailableCLIs(): CLIType[] {
-    const available: CLIType[] = [];
-    for (const [cli, status] of this.cliHealthStatus) {
+  /** 获取可用的 Worker 列表 */
+  getAvailableWorkers(): WorkerSlot[] {
+    const available: WorkerSlot[] = [];
+    for (const [worker, status] of this.workerHealthStatus) {
       if (status.available && status.successRate > 0.3) {
-        available.push(cli);
+        available.push(worker);
       }
     }
     return available.length > 0 ? available : ['claude'];
   }
 
-  /** 更新 CLI 健康状态 */
-  updateCLIHealth(cli: CLIType, success: boolean, responseTime: number, error?: string): void {
-    const status = this.cliHealthStatus.get(cli);
+  /** 更新 Worker 健康状态 */
+  updateWorkerHealth(worker: WorkerSlot, success: boolean, responseTime: number, error?: string): void {
+    const status = this.workerHealthStatus.get(worker);
     if (!status) return;
 
     // 记录执行历史
-    this.executionHistory.push({ cli, success, duration: responseTime });
+    this.executionHistory.push({ worker, success, duration: responseTime });
     if (this.executionHistory.length > 100) {
       this.executionHistory.shift();
     }
 
     // 计算最近的成功率
-    const recentHistory = this.executionHistory.filter(h => h.cli === cli).slice(-20);
+    const recentHistory = this.executionHistory.filter(h => h.worker === worker).slice(-20);
     const successCount = recentHistory.filter(h => h.success).length;
     status.successRate = recentHistory.length > 0 ? successCount / recentHistory.length : 1;
 
@@ -333,7 +335,7 @@ export class PolicyEngine extends EventEmitter {
     const recentFailures = recentHistory.slice(-5).filter(h => !h.success).length;
     status.available = recentFailures < 5;
 
-    this.emit('cliHealthUpdated', { cli, status });
+    this.emit('workerHealthUpdated', { worker, status });
   }
 
 
@@ -554,28 +556,28 @@ export class PolicyEngine extends EventEmitter {
   // ========== 降级策略 ==========
 
   /**
-   * 获取 CLI 降级顺序
+   * 获取 Worker 降级顺序
    */
-  getFallbackOrder(primaryCli: CLIType): CLIType[] {
-    const allClis: CLIType[] = ['claude', 'codex', 'gemini'];
-    const available = this.getAvailableCLIs();
+  getFallbackOrder(primaryWorker: WorkerSlot): WorkerSlot[] {
+    const allWorkers: WorkerSlot[] = ['claude', 'codex', 'gemini'];
+    const available = this.getAvailableWorkers();
 
-    // 移除主 CLI，按健康状态排序剩余的
-    const fallbacks = allClis
-      .filter(cli => cli !== primaryCli && available.includes(cli));
+    // 移除主 Worker，按健康状态排序剩余的
+    const fallbacks = allWorkers
+      .filter(w => w !== primaryWorker && available.includes(w));
 
     return this.sortByHealth(fallbacks);
   }
 
   /**
-   * 处理 CLI 失败，返回下一个可用的 CLI
+   * 处理 Worker 失败，返回下一个可用的 Worker
    */
-  handleCLIFailure(failedCli: CLIType, error: string): CLIType | null {
+  handleWorkerFailure(failedWorker: WorkerSlot, error: string): WorkerSlot | null {
     // 更新健康状态
-    this.updateCLIHealth(failedCli, false, 0, error);
+    this.updateWorkerHealth(failedWorker, false, 0, error);
 
     // 获取降级选项
-    const fallbacks = this.getFallbackOrder(failedCli);
+    const fallbacks = this.getFallbackOrder(failedWorker);
     return fallbacks.length > 0 ? fallbacks[0] : null;
   }
 
@@ -627,17 +629,17 @@ export class PolicyEngine extends EventEmitter {
    * 获取策略引擎状态报告
    */
   getStatusReport(): {
-    cliHealth: CLIHealthStatus[];
+    workerHealth: WorkerHealthStatus[];
     recentExecutions: number;
     overallSuccessRate: number;
   } {
-    const cliHealth = Array.from(this.cliHealthStatus.values());
+    const workerHealth = Array.from(this.workerHealthStatus.values());
     const recentExecutions = this.executionHistory.length;
     const successCount = this.executionHistory.filter(h => h.success).length;
     const overallSuccessRate = recentExecutions > 0 ? successCount / recentExecutions : 1;
 
     return {
-      cliHealth,
+      workerHealth,
       recentExecutions,
       overallSuccessRate,
     };
@@ -647,7 +649,7 @@ export class PolicyEngine extends EventEmitter {
    * 重置策略引擎状态
    */
   reset(): void {
-    this.initializeCLIHealth();
+    this.initializeWorkerHealth();
     this.executionHistory = [];
   }
 }

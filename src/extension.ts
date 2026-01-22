@@ -5,7 +5,6 @@
 import { logger, LogCategory } from './logging';
 import * as vscode from 'vscode';
 import { WebviewProvider } from './ui/webview-provider';
-import { cliDetector } from './cli-detector';
 import { globalEventBus } from './events';
 
 let webviewProvider: WebviewProvider | undefined;
@@ -22,14 +21,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   if (!workspaceRoot) {
     vscode.window.showWarningMessage('MultiCLI: 请先打开一个工作区');
     return;
-  }
-
-  // 检测 CLI 可用性
-  const cliStatus = await detectAndNotifyCLIs();
-
-  // 如果 Claude CLI 不可用，显示警告但仍然启动插件
-  if (!cliStatus.claudeAvailable) {
-    // 不阻止插件启动，但会在 UI 中显示状态
   }
 
   // 创建 Webview Provider
@@ -77,17 +68,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // 注册命令
   registerCommands(context);
-
-  // 启动健康检查（带错误处理）
-  try {
-    cliDetector.startHealthCheck();
-    context.subscriptions.push({
-      dispose: () => cliDetector.stopHealthCheck()
-    });
-  } catch (error) {
-    logger.error('扩展.健康_检查.开始_失败', error, LogCategory.SYSTEM);
-    vscode.window.showWarningMessage('MultiCLI: 健康检查启动失败，部分功能可能受限');
-  }
 
   logger.info('扩展.初始化.完成', undefined, LogCategory.SYSTEM);
 }
@@ -173,26 +153,7 @@ function registerCommands(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('multiCli.showStatus', async () => {
-      try {
-        const summary = await cliDetector.getStatusSummary();
-        vscode.window.showInformationMessage(
-          `MultiCLI: ${summary.available}/${summary.total} CLI 可用\n${summary.recommendation}`
-        );
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        vscode.window.showErrorMessage(`MultiCLI: 获取状态失败 - ${msg}`);
-      }
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('multiCli.checkCLIs', async () => {
-      try {
-        await detectAndNotifyCLIs();
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        vscode.window.showErrorMessage(`MultiCLI: CLI 检测失败 - ${msg}`);
-      }
+      vscode.window.showInformationMessage('MultiCLI: 使用 LLM API 模式运行');
     })
   );
 
@@ -211,85 +172,24 @@ function registerCommands(context: vscode.ExtensionContext): void {
 }
 
 /**
- * 检测 CLI 并显示通知
- */
-async function detectAndNotifyCLIs(): Promise<{ claudeAvailable: boolean; codexAvailable: boolean; geminiAvailable: boolean }> {
-  const statuses = await cliDetector.checkAllCLIs(true);
-
-  const claudeStatus = statuses.find(s => s.type === 'claude');
-  const codexStatus = statuses.find(s => s.type === 'codex');
-  const geminiStatus = statuses.find(s => s.type === 'gemini');
-
-  const claudeAvailable = claudeStatus?.available ?? false;
-  const codexAvailable = codexStatus?.available ?? false;
-  const geminiAvailable = geminiStatus?.available ?? false;
-
-  // Claude CLI 是必需的
-  if (!claudeAvailable) {
-    const action = await vscode.window.showErrorMessage(
-      `MultiCLI: Claude CLI 未安装或不可用。${claudeStatus?.error || ''}`,
-      '安装指南',
-      '重新检测'
-    );
-    if (action === '安装指南') {
-      vscode.env.openExternal(vscode.Uri.parse('https://docs.anthropic.com/claude-code/getting-started'));
-    } else if (action === '重新检测') {
-      return detectAndNotifyCLIs();
-    }
-  } else {
-    // Claude 可用，显示版本信息
-    logger.info('CLI.检测.claude.就绪', { version: claudeStatus?.version }, LogCategory.CLI);
-  }
-
-  // Codex 和 Gemini 是可选的
-  if (!codexAvailable && claudeAvailable) {
-    vscode.window.showInformationMessage(
-      `MultiCLI: Codex CLI 不可用，Bug修复任务将由 Claude 处理。`,
-      '了解更多'
-    ).then(action => {
-      if (action === '了解更多') {
-        vscode.env.openExternal(vscode.Uri.parse('https://github.com/openai/codex'));
-      }
-    });
-  }
-
-  if (!geminiAvailable && claudeAvailable) {
-    vscode.window.showInformationMessage(
-      `MultiCLI: Gemini CLI 不可用，前端任务将由 Claude 处理。`,
-      '了解更多'
-    ).then(action => {
-      if (action === '了解更多') {
-        vscode.env.openExternal(vscode.Uri.parse('https://github.com/google/gemini-cli'));
-      }
-    });
-  }
-
-  return { claudeAvailable, codexAvailable, geminiAvailable };
-}
-
-/**
- * 扩展停用 - 增强版：确保所有资源被正确清理
+ * 扩展停用 - 确保所有资源被正确清理
  */
 export async function deactivate(): Promise<void> {
   logger.info('扩展.停用.开始', undefined, LogCategory.SYSTEM);
 
   try {
-    // 1. 停止健康检查
-    cliDetector.stopHealthCheck();
-    logger.info('扩展.健康_检查.已停止', undefined, LogCategory.SYSTEM);
-
-    // 2. 清理 WebviewProvider（包括 CLI 进程、编排器、事件监听器）
+    // 清理 WebviewProvider（包括编排器、事件监听器）
     if (webviewProvider) {
       await webviewProvider.dispose();
       webviewProvider = undefined;
       logger.info('扩展.停用.Webview.已清理', undefined, LogCategory.UI);
     }
 
-    // 3. 清理状态栏
+    // 清理状态栏
     if (statusBarItem) {
       statusBarItem.dispose();
       statusBarItem = undefined;
-    logger.info('扩展.停用.状态栏.已清理', undefined, LogCategory.SYSTEM);
+      logger.info('扩展.停用.状态栏.已清理', undefined, LogCategory.SYSTEM);
     }
 
     logger.info('扩展.停用.完成', undefined, LogCategory.SYSTEM);

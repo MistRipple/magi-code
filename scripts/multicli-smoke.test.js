@@ -30,7 +30,7 @@ Module._load = function load(request, parent, isMain) {
 const ROOT = '/Users/xie/code/MultiCLI';
 const TEST_ROOT = path.join(ROOT, 'TEST');
 
-const { CLISelector } = require(path.join(ROOT, 'out/task/cli-selector.js'));
+const { WorkerSelector } = require(path.join(ROOT, 'out/task/worker-selector.js'));
 const { TaskAnalyzer } = require(path.join(ROOT, 'out/task/task-analyzer.js'));
 const { TaskSplitter } = require(path.join(ROOT, 'out/task/task-splitter.js'));
 const { ExecutionStats } = require(path.join(ROOT, 'out/orchestrator/execution-stats.js'));
@@ -71,9 +71,9 @@ test('TaskAnalyzer detects backend category', () => {
 });
 
 // 2) backend 默认映射为 codex
-test('CLISelector picks codex for backend by default', () => {
-  const selector = new CLISelector();
-  selector.setAvailableCLIs(['claude', 'codex', 'gemini']);
+test('WorkerSelector picks codex for backend by default', () => {
+  const selector = new WorkerSelector();
+  selector.setAvailableWorkers(['claude', 'codex', 'gemini']);
   const selection = selector.selectByCategory('backend');
   assert(selection.cli === 'codex', `expected codex, got ${selection.cli}`);
 });
@@ -82,8 +82,8 @@ test('CLISelector picks codex for backend by default', () => {
 test('TaskSplitter splits fullstack tasks into frontend + backend', () => {
   const analyzer = new TaskAnalyzer();
   const analysis = analyzer.analyze('同时实现前端页面和后端 API 登录功能');
-  const selector = new CLISelector();
-  selector.setAvailableCLIs(['claude', 'codex', 'gemini']);
+  const selector = new WorkerSelector();
+  selector.setAvailableWorkers(['claude', 'codex', 'gemini']);
   const splitter = new TaskSplitter(selector);
   const result = splitter.split(analysis);
   assert(result.subTasks.length === 2, `expected 2 subTasks, got ${result.subTasks.length}`);
@@ -112,8 +112,8 @@ test('TaskAnalyzer marks refactor task as splittable', () => {
 test('TaskSplitter splits architecture task into design + implement', () => {
   const analyzer = new TaskAnalyzer();
   const analysis = analyzer.analyze('进行系统架构设计并实现基础结构');
-  const selector = new CLISelector();
-  selector.setAvailableCLIs(['claude', 'codex', 'gemini']);
+  const selector = new WorkerSelector();
+  selector.setAvailableWorkers(['claude', 'codex', 'gemini']);
   const splitter = new TaskSplitter(selector);
   const result = splitter.split(analysis);
   assert(result.subTasks.length === 2, `expected 2 subTasks, got ${result.subTasks.length}`);
@@ -129,10 +129,10 @@ test('TaskAnalyzer suggests parallel mode for multi-file tasks', () => {
   assert(analysis.suggestedMode === 'parallel', 'multi-file splittable tasks should be parallel');
 });
 
-// 8) CLI 降级选择
-test('CLISelector degrades when preferred CLI unavailable', () => {
-  const selector = new CLISelector();
-  selector.setAvailableCLIs(['gemini']);
+// 8) Worker 降级选择
+test('WorkerSelector degrades when preferred Worker unavailable', () => {
+  const selector = new WorkerSelector();
+  selector.setAvailableWorkers(['gemini']);
   const selection = selector.selectByCategory('backend');
   assert(selection.cli === 'gemini', `expected gemini fallback, got ${selection.cli}`);
   assert(selection.degraded === true, 'selection should be marked degraded');
@@ -254,15 +254,15 @@ test('FileLockManager enforces exclusive locks', async () => {
 });
 
 // 18) 智能选择：统计驱动降级
-test('CLISelector uses stats-based selection when preferred unhealthy', () => {
+test('WorkerSelector uses stats-based selection when preferred unhealthy', () => {
   const stats = new ExecutionStats();
   stats.configure({ healthThreshold: 0.8 });
 
   recordExecutions(stats, 'claude', 2, false);
   recordExecutions(stats, 'codex', 5, true);
 
-  const selector = new CLISelector();
-  selector.setAvailableCLIs(['claude', 'codex']);
+  const selector = new WorkerSelector();
+  selector.setAvailableWorkers(['claude', 'codex']);
   selector.setExecutionStats(stats);
   selector.configureSmartSelection({ enabled: true, healthThreshold: 0.8 });
 
@@ -432,7 +432,7 @@ test('RiskPolicy flags high risk for interface + config change', () => {
 // 29) AI 分解启用条件
 test('AITaskDecomposer shouldUseAI respects complexity threshold', () => {
   const fakeFactory = { sendMessage: async () => ({ error: 'skip', content: '' }) };
-  const selector = new CLISelector();
+  const selector = new WorkerSelector();
   const decomposer = new AITaskDecomposer(fakeFactory, selector, { complexityThreshold: 3 });
 
   const analyzer = new TaskAnalyzer();

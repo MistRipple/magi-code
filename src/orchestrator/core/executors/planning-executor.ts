@@ -7,7 +7,7 @@
  * - 生成和传递上下文快照
  */
 
-import { CLIType } from '../../../types';
+import { WorkerSlot } from '../../../types';
 import { AutonomousWorker } from '../../worker';
 import { Mission, Assignment } from '../../mission';
 import { logger, LogCategory } from '../../../logging';
@@ -25,7 +25,7 @@ export interface PlanningResult {
 
 export class PlanningExecutor {
   constructor(
-    private workers: Map<CLIType, AutonomousWorker>
+    private workers: Map<WorkerSlot, AutonomousWorker>
   ) {}
 
   /**

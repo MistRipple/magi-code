@@ -47,7 +47,7 @@ const { SnapshotManager } = require('../out/snapshot-manager');
 const { IntelligentOrchestrator } = require('../out/orchestrator/intelligent-orchestrator');
 const { globalEventBus } = require('../out/events');
 const { ProfileLoader, GuidanceInjector } = require('../out/orchestrator/profile');
-const { CLISelector } = require('../out/task/cli-selector');
+const { WorkerSelector } = require('../out/task/worker-selector');
 const { TaskAnalyzer } = require('../out/task/task-analyzer');
 
 const workspaceRoot = process.cwd();
@@ -205,22 +205,22 @@ async function testProfileSystem() {
   taskAnalyzer.setProfileLoader(profileLoader);
   logResult('TaskAnalyzer 集成', true, '已设置 ProfileLoader');
 
-  // 6.4 测试 CLI 选择器
-  const cliSelector = new CLISelector();
-  cliSelector.setProfileLoader(profileLoader);
-  logResult('CLISelector 集成', true, '已设置 ProfileLoader');
+  // 6.4 测试 Worker 选择器
+  const workerSelector = new WorkerSelector();
+  workerSelector.setProfileLoader(profileLoader);
+  logResult('WorkerSelector 集成', true, '已设置 ProfileLoader');
 
   // 6.5 测试引导注入器
   const guidanceInjector = new GuidanceInjector();
   logResult('GuidanceInjector 创建', true);
 
-  return { profileLoader, taskAnalyzer, cliSelector, guidanceInjector };
+  return { profileLoader, taskAnalyzer, workerSelector, guidanceInjector };
 }
 
 async function testProfileBasedWorkerSelection(profileSystem) {
   logSection('7. 画像驱动的 Worker 选择测试');
 
-  const { profileLoader, cliSelector } = profileSystem;
+  const { profileLoader, workerSelector } = profileSystem;
 
   // 测试用例：不同类型任务应该分配给不同的 Worker
   const testCases = [
@@ -236,7 +236,7 @@ async function testProfileBasedWorkerSelection(profileSystem) {
   let failed = 0;
 
   for (const tc of testCases) {
-    const selection = cliSelector.selectByDescription(tc.desc);
+    const selection = workerSelector.selectByDescription(tc.desc);
     const workerMatch = selection.worker === tc.expectedWorker;
     const categoryMatch = selection.category === tc.expectedCategory;
     const success = workerMatch && categoryMatch;

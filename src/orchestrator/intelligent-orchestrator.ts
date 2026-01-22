@@ -7,7 +7,7 @@
  */
 
 import {
-  CLIType,
+  WorkerSlot,
   InteractionMode,
   INTERACTION_MODE_CONFIGS,
   InteractionModeConfig,
@@ -50,7 +50,7 @@ export type WorkerQuestionCallback = MissionWorkerQuestionCallback;
 export interface SubTaskPlan {
   id: string;
   description: string;
-  assignedCli: CLIType;
+  assignedWorker: WorkerSlot;
   reason: string;
   targetFiles?: string[];
   dependencies: string[];
@@ -69,7 +69,7 @@ export interface OrchestratorConfig {
   integration?: {
     enabled?: boolean;
     maxRounds?: number;
-    worker?: CLIType;
+    worker?: WorkerSlot;
   };
   review?: {
     selfCheck?: boolean;
@@ -80,14 +80,10 @@ export interface OrchestratorConfig {
   };
   planReview?: {
     enabled?: boolean;
-    reviewer?: CLIType;
+    reviewer?: WorkerSlot;
   };
   permissions?: PermissionMatrix;
   strategy?: StrategyConfig;
-  cliSelection?: {
-    enabled?: boolean;
-    healthThreshold?: number;
-  };
 }
 
 /** 编排器状态 */
@@ -110,10 +106,6 @@ const DEFAULT_CONFIG: OrchestratorConfig = {
     enableVerification: true,
     enableRecovery: true,
     autoRollbackOnFailure: false,
-  },
-  cliSelection: {
-    enabled: true,
-    healthThreshold: 0.7,
   },
 };
 
@@ -184,7 +176,6 @@ export class IntelligentOrchestrator {
         integration: this.config.integration,
         permissions: this.permissions,
         strategy: this.strategyConfig,
-        cliSelection: this.config.cliSelection,
       },
       workspaceRoot,
       snapshotManager,
@@ -769,8 +760,8 @@ export class IntelligentOrchestrator {
     });
   }
 
-  /** 获取可用的 CLI 列表 */
-  getAvailableCLIs(): CLIType[] {
+  /** 获取可用的 Worker 列表 */
+  getAvailableWorkers(): WorkerSlot[] {
     return ['claude', 'codex', 'gemini'];
   }
 

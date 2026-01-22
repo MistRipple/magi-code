@@ -42,6 +42,20 @@ export interface FileSnapshotMeta {
 /** 任务状态 */
 export type SessionStatus = 'active' | 'completed';
 
+/** 会话总结（用于会话恢复） */
+export interface SessionSummary {
+  sessionId: string;
+  title: string;
+  objective: string;              // 会话目标/主题
+  completedTasks: string[];       // 已完成任务摘要
+  inProgressTasks: string[];      // 进行中任务摘要
+  keyDecisions: string[];         // 关键决策
+  codeChanges: string[];          // 代码变更摘要
+  pendingIssues: string[];        // 待解决问题
+  messageCount: number;           // 消息数量
+  lastUpdated: number;            // 最后更新时间
+}
+
 /** 统一会话数据结构 */
 export interface UnifiedSession {
   id: string;
@@ -755,6 +769,163 @@ export class UnifiedSessionManager {
   /** 获取快照目录 */
   getSnapshotsDir(sessionId: string): string {
     return path.join(this.getSessionDir(sessionId), 'snapshots');
+  }
+
+  // ============================================================================
+  // 会话总结生成（用于会话恢复）
+  // ============================================================================
+
+  /** 生成会话总结（用于会话切换时的上下文注入） */
+  getSessionSummary(sessionId?: string): SessionSummary | null {
+    const session = sessionId ? this.sessions.get(sessionId) : this.getCurrentSession();
+    if (!session) return null;
+
+    // 提取已完成任务
+    const completedTasks = session.tasks
+      .filter(t => t.status === 'completed')
+      .map(t => t.prompt || '未命名任务')
+      .slice(0, 10); // 最多 10 个
+
+    // 提取进行中任务
+    const inProgressTasks = session.tasks
+      .filter(t => t.status === 'running' || t.status === 'pending')
+      .map(t => t.prompt || '未命名任务')
+      .slice(0, 5); // 最多 5 个
+
+    // 提取代码变更摘要
+    const codeChanges = session.snapshots
+      .map(s => `${s.filePath} (${s.lastModifiedBy})`)
+      .slice(0, 20); // 最多 20 个文件
+
+    // 提取关键决策（从消息中提取）
+    const keyDecisions = this.extractKeyDecisions(session.messages);
+
+    // 提取待解决问题（从任务中提取）
+    const pendingIssues = session.tasks
+      .filter(t => t.status === 'failed')
+      .map(t => t.prompt || '未命名问题')
+      .slice(0, 5); // 最多 5 个
+
+    // 生成会话目标（从第一条用户消息或会话名称）
+    const objective = this.extractObjective(session);
+
+    return {
+      sessionId: session.id,
+      title: session.name || '未命名会话',
+      objective,
+      completedTasks,
+      inProgressTasks,
+      keyDecisions,
+      codeChanges,
+      pendingIssues,
+      messageCount: session.messages.length,
+      lastUpdated: session.updatedAt,
+    };
+  }
+
+  /** 提取会话目标 */
+  private extractObjective(session: UnifiedSession): string {
+    // 优先使用会话名称
+    if (session.name) {
+      return session.name;
+    }
+
+    // 否则使用第一条用户消息
+    const firstUserMsg = session.messages.find(m => m.role === 'user');
+    if (firstUserMsg) {
+      const content = firstUserMsg.content.trim();
+      return content.length > 100 ? content.substring(0, 100) + '...' : content;
+    }
+
+    return '新对话';
+  }
+
+  /** 提取关键决策（简单规则：包含关键词的消息） */
+  private extractKeyDecisions(messages: SessionMessage[]): string[] {
+    const decisionKeywords = [
+      '决定', '选择', '采用', '使用', '方案', '架构',
+      'decide', 'choose', 'use', 'adopt', 'approach', 'architecture'
+    ];
+
+    const decisions: string[] = [];
+
+    for (const msg of messages) {
+      if (msg.role !== 'assistant') continue;
+
+      const content = msg.content.toLowerCase();
+      const hasKeyword = decisionKeywords.some(kw => content.includes(kw.toLowerCase()));
+
+      if (hasKeyword) {
+        // 提取包含关键词的句子
+        const sentences = msg.content.split(/[。！？.!?]/);
+        for (const sentence of sentences) {
+          const sentenceLower = sentence.toLowerCase();
+          if (decisionKeywords.some(kw => sentenceLower.includes(kw.toLowerCase()))) {
+            const trimmed = sentence.trim();
+            if (trimmed.length > 10 && trimmed.length < 200) {
+              decisions.push(trimmed);
+              if (decisions.length >= 5) break; // 最多 5 个决策
+            }
+          }
+        }
+      }
+
+      if (decisions.length >= 5) break;
+    }
+
+    return decisions;
+  }
+
+  /** 格式化会话总结为文本（用于注入到上下文） */
+  formatSessionSummary(summary: SessionSummary): string {
+    const parts: string[] = [];
+
+    parts.push(`# 会话总结: ${summary.title}`);
+    parts.push(`会话目标: ${summary.objective}`);
+    parts.push(`消息数量: ${summary.messageCount} 条`);
+    parts.push('');
+
+    if (summary.completedTasks.length > 0) {
+      parts.push('## 已完成任务:');
+      summary.completedTasks.forEach((task, i) => {
+        parts.push(`${i + 1}. ${task}`);
+      });
+      parts.push('');
+    }
+
+    if (summary.inProgressTasks.length > 0) {
+      parts.push('## 进行中任务:');
+      summary.inProgressTasks.forEach((task, i) => {
+        parts.push(`${i + 1}. ${task}`);
+      });
+      parts.push('');
+    }
+
+    if (summary.keyDecisions.length > 0) {
+      parts.push('## 关键决策:');
+      summary.keyDecisions.forEach((decision, i) => {
+        parts.push(`${i + 1}. ${decision}`);
+      });
+      parts.push('');
+    }
+
+    if (summary.codeChanges.length > 0) {
+      parts.push('## 代码变更:');
+      summary.codeChanges.forEach((change, i) => {
+        parts.push(`${i + 1}. ${change}`);
+      });
+      parts.push('');
+    }
+
+    if (summary.pendingIssues.length > 0) {
+      parts.push('## 待解决问题:');
+      summary.pendingIssues.forEach((issue, i) => {
+        parts.push(`${i + 1}. ${issue}`);
+      });
+      parts.push('');
+    }
+
+    return parts.join('\n');
   }
 
   // ============================================================================

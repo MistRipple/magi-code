@@ -8,7 +8,7 @@
  * - 事件管理和状态更新
  */
 
-import { CLIType, InteractionMode, PermissionMatrix, StrategyConfig } from '../types';
+import { WorkerSlot, InteractionMode, PermissionMatrix, StrategyConfig } from '../types';
 import { logger, LogCategory } from '../logging';
 import { IAdapterFactory } from '../adapters/adapter-factory-interface';
 import { UnifiedSessionManager } from '../session';
@@ -100,7 +100,6 @@ export class IntelligentOrchestrator {
         integration: this.config.integration,
         permissions: this.permissions,
         strategy: this.strategyConfig,
-        cliSelection: this.config.cliSelection,
       },
       workspaceRoot,
       snapshotManager,
@@ -261,8 +260,8 @@ export class IntelligentOrchestrator {
     await this.executionCoordinator.cancel();
   }
 
-  /** 获取可用的 CLI 列表 */
-  getAvailableCLIs(): CLIType[] {
+  /** 获取可用的 Worker 列表 */
+  getAvailableWorkers(): WorkerSlot[] {
     return ['claude', 'codex', 'gemini'];
   }
 

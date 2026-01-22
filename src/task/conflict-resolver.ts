@@ -1,5 +1,5 @@
 /**
- * ConflictResolver - CLI 选择冲突解决器
+ * ConflictResolver - Worker 选择冲突解决器
  *
  * 职责：
  * - 解决用户偏好 vs 画像推荐 vs 执行统计之间的冲突
@@ -14,7 +14,7 @@
  */
 
 import { logger, LogCategory } from '../logging';
-import { CLIType } from '../types';
+import { WorkerSlot } from '../types';
 import { ExecutionStats } from '../orchestrator/execution-stats';
 import { ProfileLoader } from '../orchestrator/profile/profile-loader';
 
@@ -30,22 +30,22 @@ export interface ConflictResolutionConfig {
 
 /** 冲突解决输入 */
 export interface ConflictResolutionInput {
-  /** 用户手动选择的 CLI */
-  userPreference?: CLIType;
-  /** 画像推荐的 CLI */
-  profileRecommendation?: CLIType;
-  /** 执行统计推荐的 CLI */
-  statsRecommendation?: CLIType;
+  /** 用户手动选择的 Worker */
+  userPreference?: WorkerSlot;
+  /** 画像推荐的 Worker */
+  profileRecommendation?: WorkerSlot;
+  /** 执行统计推荐的 Worker */
+  statsRecommendation?: WorkerSlot;
   /** 任务分类 */
   category?: string;
-  /** 可用的 CLI 列表 */
-  availableClis: CLIType[];
+  /** 可用的 Worker 列表 */
+  availableWorkers: WorkerSlot[];
 }
 
 /** 冲突解决结果 */
 export interface ConflictResolutionResult {
-  /** 最终选择的 CLI */
-  cli: CLIType;
+  /** 最终选择的 Worker */
+  worker: WorkerSlot;
   /** 选择原因 */
   reason: string;
   /** 使用的决策层级 */
@@ -64,7 +64,7 @@ const DEFAULT_CONFIG: ConflictResolutionConfig = {
 };
 
 /**
- * CLI 选择冲突解决器
+ * Worker 选择冲突解决器
  */
 export class ConflictResolver {
   private config: ConflictResolutionConfig;
@@ -82,13 +82,13 @@ export class ConflictResolver {
   }
 
   /**
-   * 解决 CLI 选择冲突
+   * 解决 Worker 选择冲突
    */
   resolve(input: ConflictResolutionInput): ConflictResolutionResult {
-    const { userPreference, profileRecommendation, statsRecommendation, availableClis } = input;
+    const { userPreference, profileRecommendation, statsRecommendation, availableWorkers } = input;
 
     // Level 1: 用户手动选择
-    if (userPreference && availableClis.includes(userPreference)) {
+    if (userPreference && availableWorkers.includes(userPreference)) {
       const userResult = this.handleUserPreference(userPreference, input);
       if (userResult) {
         return userResult;
@@ -96,7 +96,7 @@ export class ConflictResolver {
     }
 
     // Level 2: 执行统计推荐（健康度降级）
-    if (statsRecommendation && availableClis.includes(statsRecommendation)) {
+    if (statsRecommendation && availableWorkers.includes(statsRecommendation)) {
       const statsResult = this.handleStatsRecommendation(statsRecommendation, profileRecommendation, input);
       if (statsResult) {
         return statsResult;
@@ -104,9 +104,9 @@ export class ConflictResolver {
     }
 
     // Level 3: 画像配置推荐
-    if (profileRecommendation && availableClis.includes(profileRecommendation)) {
+    if (profileRecommendation && availableWorkers.includes(profileRecommendation)) {
       return {
-        cli: profileRecommendation,
+        worker: profileRecommendation,
         reason: `画像推荐: ${profileRecommendation}`,
         level: 'profile',
         degraded: false,
@@ -115,10 +115,10 @@ export class ConflictResolver {
     }
 
     // Level 4: 硬编码默认值
-    const defaultCli = availableClis[0] || 'claude';
+    const defaultWorker = availableWorkers[0] || 'claude';
     return {
-      cli: defaultCli,
-      reason: `回退到默认值: ${defaultCli}`,
+      worker: defaultWorker,
+      reason: `回退到默认值: ${defaultWorker}`,
       level: 'default',
       degraded: true,
       confidence: 0.5,
@@ -129,13 +129,13 @@ export class ConflictResolver {
    * 处理用户偏好
    */
   private handleUserPreference(
-    userPreference: CLIType,
+    userPreference: WorkerSlot,
     input: ConflictResolutionInput
   ): ConflictResolutionResult | null {
     // always-respect: 直接使用用户选择
     if (this.config.userPreference === 'always-respect') {
       return {
-        cli: userPreference,
+        worker: userPreference,
         reason: `用户指定: ${userPreference}`,
         level: 'user',
         degraded: false,
@@ -148,7 +148,7 @@ export class ConflictResolver {
       const stats = this.executionStats.getStats(userPreference);
       if (stats.isHealthy && stats.successRate >= this.config.healthThreshold) {
         return {
-          cli: userPreference,
+          worker: userPreference,
           reason: `用户指定: ${userPreference} (健康度: ${(stats.successRate * 100).toFixed(0)}%)`,
           level: 'user',
           degraded: false,
@@ -156,11 +156,11 @@ export class ConflictResolver {
         };
       }
 
-      // 用户选择的 CLI 不健康，提示降级
+      // 用户选择的 Worker 不健康，提示降级
       logger.warn(
         '任务.冲突.用户_偏好.不健康',
         {
-          cli: userPreference,
+          worker: userPreference,
           successRate: stats.successRate,
           threshold: this.config.healthThreshold,
         },
@@ -172,7 +172,7 @@ export class ConflictResolver {
         const altStats = this.executionStats.getStats(input.statsRecommendation);
         if (altStats.successRate > stats.successRate) {
           return {
-            cli: input.statsRecommendation,
+            worker: input.statsRecommendation,
             reason: `用户指定的 ${userPreference} 不健康，降级到 ${input.statsRecommendation}`,
             level: 'stats',
             degraded: true,
@@ -183,7 +183,7 @@ export class ConflictResolver {
 
       // 没有更好的备选，仍使用用户选择（带警告）
       return {
-        cli: userPreference,
+        worker: userPreference,
         reason: `用户指定: ${userPreference} (健康度低，但无更好备选)`,
         level: 'user',
         degraded: false,
@@ -193,7 +193,7 @@ export class ConflictResolver {
 
     // 默认使用用户偏好
     return {
-      cli: userPreference,
+      worker: userPreference,
       reason: `用户指定: ${userPreference}`,
       level: 'user',
       degraded: false,
@@ -205,8 +205,8 @@ export class ConflictResolver {
    * 处理执行统计推荐
    */
   private handleStatsRecommendation(
-    statsRecommendation: CLIType,
-    profileRecommendation: CLIType | undefined,
+    statsRecommendation: WorkerSlot,
+    profileRecommendation: WorkerSlot | undefined,
     input: ConflictResolutionInput
   ): ConflictResolutionResult | null {
     if (!this.executionStats) {
@@ -219,7 +219,7 @@ export class ConflictResolver {
     if (this.config.statsVsProfile === 'prefer-stats-if-healthy') {
       if (statsData.isHealthy && statsData.successRate >= this.config.healthThreshold) {
         return {
-          cli: statsRecommendation,
+          worker: statsRecommendation,
           reason: `执行统计推荐: ${statsRecommendation} (成功率: ${(statsData.successRate * 100).toFixed(0)}%)`,
           level: 'stats',
           degraded: false,
@@ -235,7 +235,7 @@ export class ConflictResolver {
       }
       // 没有画像推荐时才使用统计
       return {
-        cli: statsRecommendation,
+        worker: statsRecommendation,
         reason: `执行统计推荐: ${statsRecommendation} (无画像推荐)`,
         level: 'stats',
         degraded: false,
@@ -250,7 +250,7 @@ export class ConflictResolver {
       // 统计数据明显更好时才覆盖画像
       if (statsData.successRate > profileData.successRate + 0.2) {
         return {
-          cli: statsRecommendation,
+          worker: statsRecommendation,
           reason: `执行统计显著优于画像推荐 (${(statsData.successRate * 100).toFixed(0)}% vs ${(profileData.successRate * 100).toFixed(0)}%)`,
           level: 'stats',
           degraded: false,
@@ -264,7 +264,7 @@ export class ConflictResolver {
 
     // 默认使用统计推荐
     return {
-      cli: statsRecommendation,
+      worker: statsRecommendation,
       reason: `执行统计推荐: ${statsRecommendation}`,
       level: 'stats',
       degraded: false,

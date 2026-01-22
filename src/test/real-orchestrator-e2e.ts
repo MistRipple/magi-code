@@ -17,7 +17,7 @@ type StandardMsg = {
   source?: string;
   type?: string;
   lifecycle?: string;
-  cli?: string;
+  worker?: string;
   blocks?: Array<{ type: string; content?: string }>;
   metadata?: any;
 };
@@ -102,7 +102,7 @@ async function run() {
   const standardMessages: StandardMsg[] = [];
   const standardCompletes: StandardMsg[] = [];
   const progressEvents: Array<{ subTaskId?: string; dispatchId?: string; msg?: string }> = [];
-  const subtaskStarts: Array<{ subTaskId?: string; dispatchId?: string; cli?: string }> = [];
+  const subtaskStarts: Array<{ subTaskId?: string; dispatchId?: string; worker?: string }> = [];
   const duplicates: Array<{ id?: string; content: string }> = [];
   const seenContent = new Set<string>();
 
@@ -136,7 +136,7 @@ async function run() {
     subtaskStarts.push({
       subTaskId: event.subTaskId,
       dispatchId: data?.dispatchId,
-      cli: data?.cli,
+      worker: data?.worker,
     });
   });
 

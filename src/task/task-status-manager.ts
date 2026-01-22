@@ -4,7 +4,7 @@
  */
 
 import { EventEmitter } from 'events';
-import { CLIType, TaskStatus, SubTaskStatus } from '../types';
+import { WorkerSlot, TaskStatus, SubTaskStatus } from '../types';
 
 /** 任务进度信息 */
 export interface TaskProgress {
@@ -24,7 +24,7 @@ export interface SubTaskProgress {
   subTaskId: string;
   taskId: string;
   status: SubTaskStatus;
-  cli: CLIType;
+  worker: WorkerSlot;
   description: string;
   startTime?: number;
   endTime?: number;
@@ -71,12 +71,12 @@ export class TaskStatusManager extends EventEmitter {
   }
 
   /** 开始跟踪子任务 */
-  startSubTask(taskId: string, subTaskId: string, cli: CLIType, description: string): void {
+  startSubTask(taskId: string, subTaskId: string, worker: WorkerSlot, description: string): void {
     const progress: SubTaskProgress = {
       subTaskId,
       taskId,
       status: 'running',
-      cli,
+      worker,
       description,
       startTime: Date.now(),
       output: [],

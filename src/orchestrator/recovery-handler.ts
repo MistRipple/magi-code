@@ -4,7 +4,7 @@
  */
 
 import { logger, LogCategory } from '../logging';
-import { CLIType } from '../types';
+import { WorkerSlot } from '../types';
 import { IAdapterFactory } from '../adapters/adapter-factory-interface';
 import { SnapshotManager } from '../snapshot-manager';
 import { globalEventBus } from '../events';
@@ -41,13 +41,13 @@ export interface RecoveryResult {
 export interface RecoveryConfig {
   maxAttempts: number;
   enableRollback: boolean;
-  escalateCli: CLIType;
+  escalateWorker: WorkerSlot;
 }
 
 const DEFAULT_CONFIG: RecoveryConfig = {
   maxAttempts: 3,
   enableRollback: true,
-  escalateCli: 'claude',
+  escalateWorker: 'claude',
 };
 
 /**
@@ -267,7 +267,7 @@ export class RecoveryHandler {
     failedTask: SubTask,
     errorDetails: string
   ): Promise<RecoveryResult> {
-    logger.info('编排器.恢复.升级', { cli: this.config.escalateCli }, LogCategory.ORCHESTRATOR);
+    logger.info('编排器.恢复.升级', { worker: this.config.escalateWorker }, LogCategory.ORCHESTRATOR);
 
     await this.unifiedTaskManager.resetSubTaskForRetry(taskId, failedTask.id);
     await this.unifiedTaskManager.startSubTask(taskId, failedTask.id);
@@ -275,7 +275,7 @@ export class RecoveryHandler {
     const escalatePrompt = this.buildEscalatePrompt(failedTask, errorDetails);
 
     try {
-      const response = await this.cliFactory.sendMessage(this.config.escalateCli, escalatePrompt);
+      const response = await this.cliFactory.sendMessage(this.config.escalateWorker, escalatePrompt);
 
       if (response.error) {
         await this.unifiedTaskManager.failSubTask(taskId, failedTask.id, response.error);

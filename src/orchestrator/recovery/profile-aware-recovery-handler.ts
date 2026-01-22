@@ -7,7 +7,7 @@
  * - 非弱项失败 → 原有恢复逻辑
  */
 
-import { CLIType } from '../../types';
+import { WorkerSlot } from '../../types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { WorkerProfile } from '../profile/types';
 import {
@@ -32,7 +32,7 @@ export type RecoveryStrategyType =
 export interface RecoveryDecision {
   strategy: RecoveryStrategyType;
   reason: string;
-  alternativeWorker?: CLIType;
+  alternativeWorker?: WorkerSlot;
   simplifiedTask?: string;
   confidence: number;
 }
@@ -234,7 +234,7 @@ export class ProfileAwareRecoveryHandler {
   private findAlternativeWorker(
     assignment: Assignment,
     weaknesses: string[]
-  ): CLIType | undefined {
+  ): WorkerSlot | undefined {
     const allProfiles = this.profileLoader.getAllProfiles();
     const currentWorker = assignment.workerId;
 
@@ -250,14 +250,14 @@ export class ProfileAwareRecoveryHandler {
       );
 
       if (hasStrengthForWeakness) {
-        return cli as CLIType;
+        return cli as WorkerSlot;
       }
     }
 
     // 没有特别匹配的，返回第一个不同的 Worker
     for (const [cli] of allProfiles.entries()) {
       if (cli !== currentWorker) {
-        return cli as CLIType;
+        return cli as WorkerSlot;
       }
     }
 
