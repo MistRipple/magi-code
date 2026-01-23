@@ -117,7 +117,8 @@ export class AssignmentExecutor {
    */
   private async createSnapshots(
     assignment: Assignment,
-    workingDirectory: string
+    workingDirectory: string,
+    mission?: Mission
   ): Promise<void> {
     if (!this.snapshotManager) {
       return;
@@ -129,15 +130,28 @@ export class AssignmentExecutor {
     }
 
     try {
-      // SnapshotManager.createSnapshot expects (filePath, modifiedBy, subTaskId, priority)
-      // Create snapshots for each target file
-      for (const filePath of targetFiles) {
-        this.snapshotManager.createSnapshot(
-          filePath,
-          assignment.workerId,
-          assignment.id,
-          5 // default priority
-        );
+      // 如果有 Mission 信息，使用新的 createSnapshotForMission 方法
+      if (mission) {
+        for (const filePath of targetFiles) {
+          this.snapshotManager.createSnapshotForMission(
+            filePath,
+            mission.id,
+            assignment.id,
+            'assignment-init',
+            assignment.workerId,
+            `Assignment 执行前快照: ${assignment.responsibility}`
+          );
+        }
+      } else {
+        // 兼容旧代码：使用旧方法
+        for (const filePath of targetFiles) {
+          this.snapshotManager.createSnapshot(
+            filePath,
+            assignment.workerId,
+            assignment.id,
+            5 // default priority
+          );
+        }
       }
 
       logger.info(

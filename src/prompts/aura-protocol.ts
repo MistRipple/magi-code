@@ -7,7 +7,7 @@
  * - 节省: ~60%
  *
  * 移除内容：
- * - 可用工具列表（CLI 已内置，约 350 tokens）
+ * - 可用工具列表（模型已内置，约 350 tokens）
  * - 执行模式详情（合并到任务级别）
  * - 冗余描述
  *
@@ -194,4 +194,3 @@ IDE State:
 - Terminal CWD: ${terminalCwd || workspace}
 `;
 }
-

@@ -175,6 +175,8 @@ export interface Mission {
   // ===== 外部关联 =====
   /** 关联的外部 Task ID（用于与 UnifiedTaskManager 同步） */
   externalTaskId?: string;
+  /** 快照追踪（记录此 Mission 创建的所有快照 ID） */
+  snapshots?: string[];
 
   // ===== 时间戳 =====
   createdAt: number;

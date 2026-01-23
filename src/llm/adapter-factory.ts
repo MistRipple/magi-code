@@ -293,7 +293,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
    * 发送消息（实现 IAdapterFactory 接口）
    */
   async sendMessage(
-    agent: WorkerSlot,
+    agent: AgentType,
     message: string,
     images?: string[],
     options?: AdapterOutputScope

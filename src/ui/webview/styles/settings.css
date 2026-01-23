@@ -206,8 +206,8 @@
     .empty-state p { margin: 4px 0; }
 
     /* 画像配置样式 - 与其他 tab 保持视觉一致 */
-    /* CLI 画像配置区域（边框包裹） */
-    .profile-cli-section { border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-2); padding: var(--spacing-3); margin-bottom: var(--spacing-3); background: var(--vscode-editor-background); }
+    /* 模型画像配置区域（边框包裹） */
+    .profile-model-section { border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-2); padding: var(--spacing-3); margin-bottom: var(--spacing-3); background: var(--vscode-editor-background); }
     .profile-worker-tabs { display: flex; gap: 0; margin-bottom: var(--spacing-3); background: var(--vscode-input-background); border-radius: var(--radius-2); padding: 2px; }
     .profile-worker-tab { flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; padding: var(--spacing-2); font-size: var(--font-size-2); font-weight: 500; color: var(--vscode-descriptionForeground); background: transparent; border: none; border-radius: var(--radius-1); cursor: pointer; transition: all var(--transition-fast); }
     .profile-worker-tab:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
@@ -253,7 +253,7 @@
     .prompt-enhance-status.success { background: rgba(61, 214, 140, 0.15); color: #3dd68c; }
     .prompt-enhance-status.error { background: rgba(241, 76, 76, 0.15); color: #f14c4c; }
 
-    /* CLI 统计面板样式 */
+    /* 模型统计面板样式 */
     .orchestrator-stats-card { background: var(--vscode-editor-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-2); padding: var(--spacing-4); margin-bottom: var(--spacing-3); }
     .orchestrator-stats-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: var(--spacing-3); }
     .orchestrator-stat-item { text-align: center; padding: var(--spacing-2); background: var(--vscode-input-background); border-radius: var(--radius-1); }
@@ -262,26 +262,26 @@
     .orchestrator-stat-value.success { color: #3dd68c; }
     .orchestrator-stat-value.failed { color: #f14c4c; }
     .orchestrator-stat-value.tokens { color: var(--vscode-textLink-foreground); }
-    .cli-stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--spacing-3); }
-    .cli-stat-card { background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); padding: var(--spacing-3); text-align: center; transition: all var(--transition-fast); }
-    .cli-stat-card:hover { border-color: var(--vscode-focusBorder); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
-    .cli-stat-card.healthy { border-color: rgba(61, 214, 140, 0.5); }
-    .cli-stat-card.unhealthy { border-color: rgba(241, 76, 76, 0.5); }
-    .cli-stat-name { font-size: var(--font-size-2); font-weight: 600; margin-bottom: var(--spacing-2); display: flex; align-items: center; justify-content: center; gap: 6px; }
-    .cli-stat-name .health-dot { width: 10px; height: 10px; border-radius: var(--radius-full); }
-    .cli-stat-name .health-dot.healthy { background: #3dd68c; box-shadow: 0 0 8px rgba(61, 214, 140, 0.5); }
-    .cli-stat-name .health-dot.unhealthy { background: #f14c4c; box-shadow: 0 0 8px rgba(241, 76, 76, 0.5); }
-    .cli-stat-rate { font-size: 20px; font-weight: 700; color: var(--vscode-foreground); margin: var(--spacing-1) 0; }
-    .cli-stat-tokens { font-size: var(--font-size-1); color: var(--vscode-textLink-foreground); margin-top: 4px; }
-    .cli-stat-rate.good { color: #3dd68c; }
-    .cli-stat-rate.warning { color: #cca700; }
-    .cli-stat-rate.bad { color: #f14c4c; }
-    .cli-stat-detail { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-top: var(--spacing-1); }
-    .cli-stat-bar { height: 5px; background: var(--vscode-input-border); border-radius: var(--radius-full); margin-top: var(--spacing-2); overflow: hidden; }
-    .cli-stat-bar-fill { height: 100%; border-radius: var(--radius-full); transition: width 0.4s ease; }
-    .cli-stat-bar-fill.good { background: linear-gradient(90deg, #3dd68c, #22c55e); }
-    .cli-stat-bar-fill.warning { background: linear-gradient(90deg, #cca700, #f59e0b); }
-    .cli-stat-bar-fill.bad { background: linear-gradient(90deg, #f14c4c, #dc2626); }
+    .model-stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--spacing-3); }
+    .model-stat-card { background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); padding: var(--spacing-3); text-align: center; transition: all var(--transition-fast); }
+.model-stat-card:hover { border-color: var(--vscode-focusBorder); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+    .model-stat-card.healthy { border-color: rgba(61, 214, 140, 0.5); }
+    .model-stat-card.unhealthy { border-color: rgba(241, 76, 76, 0.5); }
+    .model-stat-name { font-size: var(--font-size-2); font-weight: 600; margin-bottom: var(--spacing-2); display: flex; align-items: center; justify-content: center; gap: 6px; }
+    .model-stat-name .health-dot { width: 10px; height: 10px; border-radius: var(--radius-full); }
+    .model-stat-name .health-dot.healthy { background: #3dd68c; box-shadow: 0 0 8px rgba(61, 214, 140, 0.5); }
+    .model-stat-name .health-dot.unhealthy { background: #f14c4c; box-shadow: 0 0 8px rgba(241, 76, 76, 0.5); }
+    .model-stat-rate { font-size: 20px; font-weight: 700; color: var(--vscode-foreground); margin: var(--spacing-1) 0; }
+    .model-stat-tokens { font-size: var(--font-size-1); color: var(--vscode-textLink-foreground); margin-top: 4px; }
+    .model-stat-rate.good { color: #3dd68c; }
+    .model-stat-rate.warning { color: #cca700; }
+    .model-stat-rate.bad { color: #f14c4c; }
+    .model-stat-detail { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-top: var(--spacing-1); }
+    .model-stat-bar { height: 5px; background: var(--vscode-input-border); border-radius: var(--radius-full); margin-top: var(--spacing-2); overflow: hidden; }
+    .model-stat-bar-fill { height: 100%; border-radius: var(--radius-full); transition: width 0.4s ease; }
+    .model-stat-bar-fill.good { background: linear-gradient(90deg, #3dd68c, #22c55e); }
+    .model-stat-bar-fill.warning { background: linear-gradient(90deg, #cca700, #f59e0b); }
+    .model-stat-bar-fill.bad { background: linear-gradient(90deg, #f14c4c, #dc2626); }
 
     /* LLM 配置表单样式 */
     .llm-config-form {

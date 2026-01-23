@@ -1,8 +1,8 @@
 /**
- * CLI Normalizer 基类
+ * LLM Normalizer 基类
  * 
- * 职责：将各 CLI 的原始输出转换为标准消息格式
- * 每个 CLI 实现自己的 Normalizer，在适配层完成标准化
+ * 职责：将各模型的原始输出转换为标准消息格式
+ * 每个模型实现自己的 Normalizer，在适配层完成标准化
  */
 
 import { logger, LogCategory } from '../logging';
@@ -29,7 +29,7 @@ import { parseContentToBlocks } from '../utils/content-parser';
  * Normalizer 配置
  */
 export interface NormalizerConfig {
-  agent: AgentType;  // ✅ 使用 agent 替代 cli
+  agent: AgentType;  // ✅ 使用 agent 替代旧字段
   defaultSource: MessageSource;
   debug?: boolean;
 }
@@ -62,7 +62,7 @@ export interface ParseContext {
 }
 
 /**
- * CLI Normalizer 抽象基类
+ * LLM Normalizer 抽象基类
  */
 export abstract class BaseNormalizer extends EventEmitter {
   protected config: NormalizerConfig;
@@ -73,7 +73,7 @@ export abstract class BaseNormalizer extends EventEmitter {
     this.config = config;
   }
 
-  get agent(): AgentType {  // ✅ 使用 agent 替代 cli
+  get agent(): AgentType {  // ✅ 使用 agent 替代旧字段
     return this.config.agent;
   }
 

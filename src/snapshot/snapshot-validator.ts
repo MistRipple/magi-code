@@ -46,12 +46,12 @@ export class SnapshotValidator {
       warnings.push('快照内容为空');
     }
 
-    if (!snapshot.lastModifiedAt) {
+    if (!snapshot.timestamp) {
       errors.push('时间戳缺失');
     }
 
-    if (!snapshot.lastModifiedBy) {
-      warnings.push('修改者信息缺失');
+    if (!snapshot.workerId) {
+      warnings.push('Worker 信息缺失');
     }
 
     // 检查文件路径有效性

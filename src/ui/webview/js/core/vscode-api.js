@@ -13,13 +13,13 @@ export function postMessage(message) {
 /**
  * 执行任务
  */
-export function executeTask(prompt, images = null, mode = 'agent', cli = null) {
+export function executeTask(prompt, images = null, mode = 'auto', agent = null) {
   postMessage({
     type: 'executeTask',
     prompt,
     images,
     mode,
-    cli
+    agent
   });
 }
 
@@ -136,10 +136,10 @@ export function enhancePrompt(prompt) {
 }
 
 /**
- * 刷新 CLI 连接状态
+ * 刷新 Agent 连接状态
  */
-export function refreshCliConnections() {
-  postMessage({ type: 'refreshCliConnections' });
+export function refreshAgentConnections() {
+  postMessage({ type: 'checkWorkerStatus' });
 }
 
 /**

@@ -52,7 +52,7 @@ interface MessageState {
 export interface ProcessingState {
   isProcessing: boolean;
   source: MessageSource | null;
-  agent: string | null;  // ✅ 使用 agent 替代 cli
+  agent: string | null;  // ✅ 使用 agent 替代旧字段
   startedAt: number | null;
 }
 
@@ -317,4 +317,3 @@ export class UnifiedMessageBus extends EventEmitter {
     return super.emit(event, ...args);
   }
 }
-

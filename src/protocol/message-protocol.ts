@@ -2,7 +2,7 @@
  * 统一消息协议 (Unified Message Protocol)
  *
  * 核心设计理念：
- * 1. 所有 CLI 输出在适配层完成标准化，Webview 只负责渲染
+ * 1. 所有 Agent 输出在适配层完成标准化，Webview 只负责渲染
  * 2. 明确的消息类型枚举，消除格式猜测
  * 3. 统一的生命周期状态机，消除状态混乱
  * 4. 可扩展的内容结构，支持各种富文本元素
@@ -212,7 +212,7 @@ export interface InteractionRequest {
 /**
  * 标准消息 - 统一消息协议的核心
  *
- * 所有 CLI 输出经过 Normalizer 转换后都变成这个格式
+ * 所有 Agent 输出经过 Normalizer 转换后都变成这个格式
  * Webview 只需要根据这个接口渲染，无需任何解析逻辑
  */
 export interface StandardMessage {
@@ -264,11 +264,11 @@ export interface MessageMetadata {
   duration?: number;
   /** 错误信息 */
   error?: string;
-  /** CLI 询问唯一 ID */
+  /** Worker 询问唯一 ID */
   questionId?: string;
-  /** CLI 询问匹配模式 */
+  /** Worker 询问匹配模式 */
   questionPattern?: string;
-  /** CLI 询问时间戳 */
+  /** Worker 询问时间戳 */
   questionTimestamp?: number;
   /** 适配器角色 */
   adapterRole?: 'worker' | 'orchestrator';

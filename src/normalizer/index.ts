@@ -1,7 +1,7 @@
 /**
  * Normalizer 模块导出
  *
- * 提供各 CLI 的消息标准化器
+ * 提供各模型的消息标准化器
  */
 
 export {
@@ -38,7 +38,7 @@ import { GeminiNormalizer } from './gemini-normalizer';
 import type { MessageSource } from '../protocol';
 
 /**
- * 创建 CLI 对应的 Normalizer
+ * 创建模型对应的 Normalizer
  */
 export function createNormalizer(
   agent: WorkerSlot,  // ✅ 使用 WorkerSlot (不包含 orchestrator)
@@ -56,4 +56,3 @@ export function createNormalizer(
       throw new Error(`Unknown agent type: ${agent}`);
   }
 }
-

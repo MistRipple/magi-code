@@ -1,0 +1,46 @@
+{
+  "说明": "Codex 配置修复建议",
+  "问题": "模型名称 'gpt-5.2-codex' 可能不存在或不可用",
+  
+  "建议配置_方案1_使用GPT4": {
+    "codex": {
+      "baseUrl": "https://newapi.stonefancyx.com",
+      "apiKey": "sk-cl2qvOyDvuUFhmaiKgQ07Ha9nsyzFqWJkV99v9IkJRXEyuGG",
+      "model": "gpt-4-turbo-preview",
+      "provider": "openai",
+      "enabled": true
+    }
+  },
+  
+  "建议配置_方案2_使用GPT35": {
+    "codex": {
+      "baseUrl": "https://newapi.stonefancyx.com",
+      "apiKey": "sk-cl2qvOyDvuUFhmaiKgQ07Ha9nsyzFqWJkV99v9IkJRXEyuGG",
+      "model": "gpt-3.5-turbo",
+      "provider": "openai",
+      "enabled": true
+    }
+  },
+  
+  "标准OpenAI模型列表": [
+    "gpt-4-turbo-preview",
+    "gpt-4-turbo",
+    "gpt-4",
+    "gpt-4-0125-preview",
+    "gpt-4-1106-preview",
+    "gpt-3.5-turbo",
+    "gpt-3.5-turbo-16k"
+  ],
+  
+  "Gemini配置也需要修复": {
+    "当前问题": "provider 是 'anthropic' 但模型名是 'gemini-3-pro-preview'",
+    "建议": "如果该 API 代理支持 Gemini 模型，provider 应该改为 'openai'"
+  },
+  
+  "修改方法": [
+    "方法1: 直接编辑 ~/.multicli/llm.json 文件",
+    "方法2: 在 MultiCLI UI 的「画像」标签页中修改",
+    "方法3: 使用下面提供的修复脚本"
+  ]
+}
+

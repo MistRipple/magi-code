@@ -143,7 +143,7 @@ export class ProfileAwareReviewer {
 
     // 选择擅长该分类且不是执行者的 Worker
     const candidates = Array.from(allProfiles.entries())
-      .filter(([cli]) => cli !== executor)
+      .filter(([worker]) => worker !== executor)
       .filter(([_, profile]) =>
         profile.preferences.preferredCategories.includes(category)
       )
@@ -295,10 +295,10 @@ export class ProfileAwareReviewer {
   ): WorkerSlot | null {
     const allProfiles = this.profileLoader.getAllProfiles();
 
-    for (const [cli, profile] of allProfiles.entries()) {
-      if (cli === currentWorker) continue;
+    for (const [worker, profile] of allProfiles.entries()) {
+      if (worker === currentWorker) continue;
       if (profile.preferences.preferredCategories.includes(category)) {
-        return cli as WorkerSlot;
+        return worker as WorkerSlot;
       }
     }
 

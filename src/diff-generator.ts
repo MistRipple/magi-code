@@ -58,7 +58,7 @@ export class DiffGenerator {
       originalContent,
       currentContent,
       relativePath,
-      snapshot.lastModifiedBy
+      snapshot.workerId as AgentType
     );
 
     let additions = 0;
@@ -76,7 +76,7 @@ export class DiffGenerator {
       hunks,
       additions,
       deletions,
-      source: snapshot.lastModifiedBy,
+      source: snapshot.workerId as AgentType,
     };
   }
 

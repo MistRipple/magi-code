@@ -99,7 +99,7 @@ class DeepCodeChecker {
   private async checkAdapterFactoryFixes(): Promise<void> {
     console.log('[检查] adapter-factory.ts 修复完整性...');
     
-    const filePath = path.join(this.workspaceRoot, 'src/cli/adapter-factory.ts');
+    const filePath = path.join(this.workspaceRoot, 'src/llm/adapter-factory.ts');
     const content = fs.readFileSync(filePath, 'utf-8');
     
     // 检查1: output 事件是否被注释掉
@@ -107,7 +107,7 @@ class DeepCodeChecker {
       console.log('  ✓ 遗留 output 事件已被注释');
     } else if (content.includes("this.emit('output'") && !content.includes('emitOrchestratorMessage')) {
       this.issues.push({
-        file: 'src/cli/adapter-factory.ts',
+        file: 'src/llm/adapter-factory.ts',
         severity: 'high',
         category: '消息重复',
         description: '可能仍有重复的 output 事件发送'
@@ -151,7 +151,7 @@ class DeepCodeChecker {
     const providerContent = fs.readFileSync(providerPath, 'utf-8');
     
     // 如果 adapter-factory 不再发送 output 事件，那么 webview-provider 中的监听器就是死代码
-    const factoryPath = path.join(this.workspaceRoot, 'src/cli/adapter-factory.ts');
+    const factoryPath = path.join(this.workspaceRoot, 'src/llm/adapter-factory.ts');
     const factoryContent = fs.readFileSync(factoryPath, 'utf-8');
     
     const factoryEmitsOutput = factoryContent.includes("this.emit('output'") && 

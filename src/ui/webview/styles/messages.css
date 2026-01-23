@@ -171,7 +171,7 @@
     .task-card-file-list code { font-family: var(--vscode-editor-font-family); font-size: 11px; background: var(--vscode-textCodeBlock-background); padding: 1px 4px; border-radius: 3px; }
     .task-card-subtasks { display: flex; flex-direction: column; gap: 4px; }
     .subtask-item { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: var(--radius-2); background: rgba(255, 255, 255, 0.02); }
-    .subtask-cli { font-size: var(--font-size-1); padding: 2px 6px; border-radius: var(--radius-1); background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); text-transform: uppercase; }
+    .subtask-worker { font-size: var(--font-size-1); padding: 2px 6px; border-radius: var(--radius-1); background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); text-transform: uppercase; }
     .subtask-desc { flex: 1; font-size: var(--font-size-2); }
 
     /* 任务分配卡片 - Worker 面板专用（来自编排者的任务） */
@@ -219,10 +219,10 @@
     .subtask-status-icon.cancelled { color: #888; }
     .subtask-status-icon.skipped { color: #888; opacity: 0.6; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-    .subtask-status-cli { font-size: 10px; padding: 2px 6px; border-radius: var(--radius-1); text-transform: uppercase; font-weight: 500; }
-    .subtask-status-cli.claude { background: rgba(217, 119, 6, 0.15); color: var(--color-claude); }
-    .subtask-status-cli.codex { background: rgba(16, 163, 127, 0.15); color: var(--color-codex); }
-    .subtask-status-cli.gemini { background: rgba(66, 133, 244, 0.15); color: var(--color-gemini); }
+    .subtask-status-agent { font-size: 10px; padding: 2px 6px; border-radius: var(--radius-1); text-transform: uppercase; font-weight: 500; }
+    .subtask-status-agent.claude { background: rgba(217, 119, 6, 0.15); color: var(--color-claude); }
+    .subtask-status-agent.codex { background: rgba(16, 163, 127, 0.15); color: var(--color-codex); }
+    .subtask-status-agent.gemini { background: rgba(66, 133, 244, 0.15); color: var(--color-gemini); }
     .subtask-status-desc { flex: 1; font-size: 12px; color: var(--vscode-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .subtask-status-time { font-size: 10px; color: var(--vscode-descriptionForeground); flex-shrink: 0; }
 
@@ -253,23 +253,23 @@
     .question-btn { padding: 8px 16px; font-size: var(--font-size-2); font-weight: 500; border-radius: var(--radius-2); border: none; cursor: pointer; transition: all var(--transition-fast); display: inline-flex; align-items: center; gap: 6px; }
     .question-btn.submit { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
 
-    /* 🔧 CLI 询问卡片样式 */
-    .cli-question-card { border-left: 3px solid var(--vscode-editorWarning-foreground); }
-    .cli-question-card.answered { border-left-color: var(--vscode-testing-iconPassed); }
-    .cli-question-card.timeout, .cli-question-card.error { border-left-color: var(--vscode-errorForeground); }
-    .cli-question-content { margin-bottom: var(--spacing-2); }
-    .cli-question-text { margin: 0; padding: var(--spacing-2); background: var(--vscode-textCodeBlock-background); border-radius: var(--radius-2); font-family: var(--vscode-editor-font-family); font-size: var(--font-size-2); white-space: pre-wrap; word-break: break-word; max-height: 150px; overflow-y: auto; }
-    .cli-question-answer { margin-top: var(--spacing-2); padding: var(--spacing-2); background: var(--vscode-input-background); border-radius: var(--radius-2); font-size: var(--font-size-2); }
-    .cli-question-error { margin-top: var(--spacing-2); padding: var(--spacing-2); background: rgba(255, 0, 0, 0.1); border-radius: var(--radius-2); font-size: var(--font-size-2); color: var(--vscode-errorForeground); }
-    .cli-question-actions { display: flex; gap: var(--spacing-2); align-items: center; flex-wrap: wrap; }
-    .cli-answer-btn { padding: 6px 12px; font-size: var(--font-size-2); font-weight: 500; border-radius: var(--radius-2); border: none; cursor: pointer; transition: all var(--transition-fast); display: inline-flex; align-items: center; gap: 4px; }
-    .cli-answer-btn svg { width: 14px; height: 14px; fill: currentColor; }
-    .cli-answer-btn.yes { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-    .cli-answer-btn.yes:hover { background: var(--vscode-button-hoverBackground); }
-    .cli-answer-btn.no { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
-    .cli-answer-btn.no:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
-    .cli-answer-input { flex: 1; min-width: 150px; padding: 6px 10px; font-size: var(--font-size-2); border-radius: var(--radius-2); border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); }
-    .cli-answer-input:focus { outline: none; border-color: var(--vscode-focusBorder); }
+    /* 🔧 Worker 询问卡片样式 */
+    .agent-question-card { border-left: 3px solid var(--vscode-editorWarning-foreground); }
+    .agent-question-card.answered { border-left-color: var(--vscode-testing-iconPassed); }
+    .agent-question-card.timeout, .agent-question-card.error { border-left-color: var(--vscode-errorForeground); }
+    .agent-question-content { margin-bottom: var(--spacing-2); }
+    .agent-question-text { margin: 0; padding: var(--spacing-2); background: var(--vscode-textCodeBlock-background); border-radius: var(--radius-2); font-family: var(--vscode-editor-font-family); font-size: var(--font-size-2); white-space: pre-wrap; word-break: break-word; max-height: 150px; overflow-y: auto; }
+    .agent-question-answer { margin-top: var(--spacing-2); padding: var(--spacing-2); background: var(--vscode-input-background); border-radius: var(--radius-2); font-size: var(--font-size-2); }
+    .agent-question-error { margin-top: var(--spacing-2); padding: var(--spacing-2); background: rgba(255, 0, 0, 0.1); border-radius: var(--radius-2); font-size: var(--font-size-2); color: var(--vscode-errorForeground); }
+    .agent-question-actions { display: flex; gap: var(--spacing-2); align-items: center; flex-wrap: wrap; }
+    .agent-answer-btn { padding: 6px 12px; font-size: var(--font-size-2); font-weight: 500; border-radius: var(--radius-2); border: none; cursor: pointer; transition: all var(--transition-fast); display: inline-flex; align-items: center; gap: 4px; }
+    .agent-answer-btn svg { width: 14px; height: 14px; fill: currentColor; }
+    .agent-answer-btn.yes { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    .agent-answer-btn.yes:hover { background: var(--vscode-button-hoverBackground); }
+    .agent-answer-btn.no { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
+    .agent-answer-btn.no:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+    .agent-answer-input { flex: 1; min-width: 150px; padding: 6px 10px; font-size: var(--font-size-2); border-radius: var(--radius-2); border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); }
+    .agent-answer-input:focus { outline: none; border-color: var(--vscode-focusBorder); }
     .question-btn.submit:hover { background: var(--vscode-button-hoverBackground); }
     .question-btn.cancel { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
     .question-btn.cancel:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
@@ -322,10 +322,10 @@
     .worker-status-list { display: grid; gap: var(--spacing-2); }
     .worker-status-item { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: var(--radius-2); background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.04); }
     .worker-status-row { display: flex; align-items: center; gap: 8px; }
-    .worker-status-item .task-cli { font-size: var(--font-size-1); padding: 2px 6px; border-radius: var(--radius-1); text-transform: uppercase; flex-shrink: 0; }
-    .worker-status-item .task-cli.claude { background: rgba(217, 119, 6, 0.15); color: var(--color-claude); }
-    .worker-status-item .task-cli.codex { background: rgba(16, 163, 127, 0.15); color: var(--color-codex); }
-    .worker-status-item .task-cli.gemini { background: rgba(66, 133, 244, 0.15); color: var(--color-gemini); }
+    .worker-status-item .task-worker { font-size: var(--font-size-1); padding: 2px 6px; border-radius: var(--radius-1); text-transform: uppercase; flex-shrink: 0; }
+    .worker-status-item .task-worker.claude { background: rgba(217, 119, 6, 0.15); color: var(--color-claude); }
+    .worker-status-item .task-worker.codex { background: rgba(16, 163, 127, 0.15); color: var(--color-codex); }
+    .worker-status-item .task-worker.gemini { background: rgba(66, 133, 244, 0.15); color: var(--color-gemini); }
     .worker-status-item .task-desc { flex: 1; font-size: var(--font-size-2); color: var(--vscode-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .worker-status-item .task-current { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); font-style: italic; }
     .worker-status-progress { display: flex; align-items: center; gap: 8px; }
@@ -366,7 +366,7 @@
     /* 消息中的图片 */
     .message-images { display: flex; flex-wrap: wrap; gap: var(--spacing-2); margin-bottom: var(--spacing-1); }
     .message-image-thumb { width: 60px; height: 60px; object-fit: cover; border-radius: var(--radius-2); border: 1px solid var(--vscode-panel-border); cursor: pointer; transition: transform var(--transition-fast); }
-    .message-image-thumb:hover { transform: scale(1.05); }
+.message-image-thumb:hover { transform: none; }
 
     /* 图片查看器 */
     .image-viewer { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; z-index: 500; cursor: zoom-out; }
@@ -1357,10 +1357,10 @@
     .task-info { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
     .task-name { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
     .task-meta { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
-    .task-cli { font-size: 10px; padding: 1px 5px; border-radius: 3px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); font-weight: 500; text-transform: uppercase; }
-    .task-cli.claude { background: rgba(217, 119, 6, 0.15); color: var(--color-claude); }
-    .task-cli.codex { background: rgba(16, 163, 127, 0.15); color: var(--color-codex); }
-    .task-cli.gemini { background: rgba(66, 133, 244, 0.15); color: var(--color-gemini); }
+    .task-worker { font-size: 10px; padding: 1px 5px; border-radius: 3px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); font-weight: 500; text-transform: uppercase; }
+    .task-worker.claude { background: rgba(217, 119, 6, 0.15); color: var(--color-claude); }
+    .task-worker.codex { background: rgba(16, 163, 127, 0.15); color: var(--color-codex); }
+    .task-worker.gemini { background: rgba(66, 133, 244, 0.15); color: var(--color-gemini); }
     .task-files { font-size: 10px; color: var(--vscode-descriptionForeground); }
     .task-time { font-size: 10px; color: var(--vscode-descriptionForeground); min-width: 32px; text-align: right; }
     .task-actions { display: flex; gap: 2px; opacity: 0; transition: opacity 0.15s; }
@@ -1382,10 +1382,10 @@
     .edit-stats { display: flex; align-items: center; gap: 4px; flex-shrink: 0; font-size: 10px; }
     .edit-stat-add { color: #3dd68c; }
     .edit-stat-del { color: #e5484d; }
-    .edit-cli-badge { font-size: 9px; padding: 1px 4px; border-radius: 3px; font-weight: 500; text-transform: uppercase; }
-    .edit-cli-badge.claude { background: rgba(217, 119, 6, 0.15); color: #f59e0b; }
-    .edit-cli-badge.codex { background: rgba(16, 185, 129, 0.15); color: #10b981; }
-    .edit-cli-badge.gemini { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+    .edit-worker-badge { font-size: 9px; padding: 1px 4px; border-radius: 3px; font-weight: 500; text-transform: uppercase; }
+    .edit-worker-badge.claude { background: rgba(217, 119, 6, 0.15); color: #f59e0b; }
+    .edit-worker-badge.codex { background: rgba(16, 185, 129, 0.15); color: #10b981; }
+    .edit-worker-badge.gemini { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
     .edit-actions { display: flex; gap: 2px; opacity: 0; transition: opacity 0.15s; }
 
     .btn-small { padding: 3px 8px; font-size: 11px; border-radius: 3px; border: none; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; transition: all 0.1s; font-weight: 500; }
@@ -1400,8 +1400,8 @@
     .btn-icon:hover { background: var(--vscode-list-hoverBackground); opacity: 1; }
     .btn-icon svg { width: 14px; height: 14px; }
 
-    /* CLI 输出视图 */
-    .cli-output-view { font-family: var(--vscode-editor-font-family); font-size: var(--font-size-2); line-height: 1.5; padding: var(--spacing-2); }
+    /* 模型输出视图 */
+    .model-output-view { font-family: var(--vscode-editor-font-family); font-size: var(--font-size-2); line-height: 1.5; padding: var(--spacing-2); }
 
     /* 底部输入区域 - Augment 风格 */
     .bottom-area { flex-shrink: 0; display: flex; flex-direction: column; background: var(--vscode-sideBar-background); }

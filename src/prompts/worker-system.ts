@@ -1,5 +1,5 @@
 /**
- * Worker (CLI 子代理) System Prompt
+ * Worker 子代理 System Prompt
  * 
  * 角色定义：
  * - 接收编排者分配的任务
@@ -121,4 +121,3 @@ export function buildWorkerTaskPrompt(options: {
 - 直接修改文件完成任务
 - 完成后简要说明变更`;
 }
-

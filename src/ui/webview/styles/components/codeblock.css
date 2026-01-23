@@ -1,0 +1,257 @@
+/**
+ * 代码块组件样式 (Code Block Components)
+ * 参考 Augment 的 c-codeblock 组件设计
+ */
+
+/* ========== 代码块容器 ========== */
+.c-codeblock {
+  --augment-file-icon-font-size: 20px;
+  --codeblock-line-height: 1.5;
+  --codeblock-truncate-lines: 10;
+  
+  margin: var(--ds-spacing-1) 0;
+  border-radius: var(--ds-radius-3);
+  border: 1px solid var(--ds-color-neutral-a5);
+  overflow: hidden;
+  background: var(--ds-color-neutral-2);
+}
+
+.c-codeblock:hover {
+  border-color: var(--ds-color-neutral-a7);
+}
+
+/* ========== 代码块头部 ========== */
+.c-codeblock__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--ds-spacing-1) var(--ds-spacing-2);
+  background: var(--ds-color-neutral-3);
+  border-bottom: 1px solid var(--ds-color-neutral-a5);
+  min-height: 28px;
+}
+
+.c-codeblock__header-content {
+  display: flex;
+  align-items: center;
+  gap: var(--ds-spacing-1);
+  width: 100%;
+  cursor: pointer;
+  min-height: 20px;
+}
+
+.c-codeblock__collapse-btn {
+  margin-right: var(--ds-spacing-1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--ds-icon-size-2);
+  height: var(--ds-icon-size-2);
+  color: var(--ds-color-neutral-a11);
+  transition: transform var(--ds-transition-fast);
+}
+
+.c-codeblock__collapse-btn svg {
+  width: 100%;
+  height: 100%;
+  fill: currentColor;
+}
+
+.c-codeblock__collapse-btn.expanded {
+  transform: rotate(90deg);
+}
+
+/* 文件路径显示 */
+.c-codeblock__relpath {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  min-width: 0;
+  width: 100%;
+  flex: 1;
+}
+
+.c-codeblock__filename {
+  width: 100%;
+  color: var(--ds-color-neutral-12);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--ds-font-size-2);
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+
+/* 语言标签 */
+.c-codeblock__language {
+  font-size: var(--ds-font-size-0);
+  color: var(--ds-color-neutral-a11);
+  padding: var(--ds-spacing-0_5) var(--ds-spacing-1);
+  background: var(--ds-color-neutral-a3);
+  border-radius: var(--ds-radius-1);
+  text-transform: uppercase;
+  font-weight: var(--ds-font-weight-medium);
+}
+
+/* 操作按钮区域 */
+.c-codeblock__action-bar-right {
+  padding-right: var(--ds-spacing-1);
+  display: flex;
+  text-wrap: nowrap;
+  justify-content: end;
+  align-items: center;
+  gap: var(--ds-spacing-0_5);
+}
+
+/* ========== 代码块内容 ========== */
+.c-codeblock__container {
+  position: relative;
+}
+
+.c-codeblock__container-inner {
+  position: relative;
+}
+
+/* 截断模式 */
+.c-codeblock__truncated {
+  max-height: calc(var(--codeblock-line-height) * var(--codeblock-truncate-lines) * 1em);
+  overflow: hidden;
+  border-bottom-left-radius: var(--ds-radius-2);
+  border-bottom-right-radius: var(--ds-radius-2);
+}
+
+/* 截断渐变遮罩 */
+.c-codeblock__truncated-surface {
+  --dark-gradient: linear-gradient(
+    180deg,
+    transparent 0%,
+    var(--ds-panel-background) 100%
+  );
+  --light-gradient: linear-gradient(
+    180deg,
+    transparent 0%,
+    var(--ds-panel-translucent) 100%
+  );
+  
+  position: absolute;
+  bottom: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  padding: var(--ds-spacing-2);
+  background: var(--dark-gradient);
+}
+
+[data-vscode-theme-kind="vscode-light"] .c-codeblock__truncated-surface {
+  background: var(--light-gradient);
+}
+
+/* 代码内容区域 */
+.c-codeblock__code {
+  padding: var(--ds-spacing-2) var(--ds-spacing-3);
+  overflow-x: auto;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: var(--ds-font-size-2);
+  line-height: var(--codeblock-line-height);
+  background: var(--ds-color-neutral-1);
+}
+
+.c-codeblock__code pre {
+  margin: 0;
+  white-space: pre;
+}
+
+.c-codeblock__code code {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+/* ========== 展开按钮 ========== */
+.c-codeblock__expand-btn {
+  width: 100%;
+  flex: 1;
+  position: relative;
+  transition: background-color var(--ds-transition-normal);
+  backdrop-filter: blur(8px);
+  background: var(--ds-color-neutral-a2);
+  border: none;
+  padding: var(--ds-spacing-2);
+  color: var(--ds-color-accent-a11);
+  cursor: pointer;
+  font-size: var(--ds-font-size-1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--ds-spacing-1);
+}
+
+.c-codeblock__expand-btn:hover {
+  background: var(--ds-color-neutral-a3);
+}
+
+.c-codeblock__expand-btn svg {
+  width: var(--ds-icon-size-1);
+  height: var(--ds-icon-size-1);
+  fill: currentColor;
+}
+
+/* 展开状态 */
+.c-codeblock__truncated.expanded {
+  max-height: none;
+  overflow: visible;
+}
+
+/* 行数显示 */
+.c-codeblock__line-count {
+  font-size: var(--ds-font-size-0);
+  color: var(--ds-color-neutral-a11);
+  padding: var(--ds-spacing-0_5) var(--ds-spacing-1);
+}
+
+/* 代码行样式 */
+.c-codeblock .code-line {
+  min-height: 1.5em;
+  padding: 0 var(--ds-spacing-1);
+}
+
+/* Diff 样式 */
+.c-codeblock--diff .code-line.diff-add {
+  background: var(--ds-color-success-a2);
+  border-left: 3px solid var(--ds-color-success-9);
+}
+
+.c-codeblock--diff .code-line.diff-del {
+  background: var(--ds-color-error-a2);
+  border-left: 3px solid var(--ds-color-error-9);
+}
+
+/* 复制按钮样式 */
+.c-codeblock .code-copy-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--ds-color-neutral-a11);
+  cursor: pointer;
+  border-radius: var(--ds-radius-1);
+  transition: all var(--ds-transition-fast);
+}
+
+.c-codeblock .code-copy-btn:hover {
+  background: var(--ds-color-neutral-a3);
+  color: var(--ds-color-neutral-12);
+}
+
+.c-codeblock .code-copy-btn.copied {
+  color: var(--ds-color-success-9);
+}
+
+.c-codeblock .code-copy-btn svg {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+}

@@ -19,9 +19,9 @@ logger.info('任务创建', { taskId: 'task-123' }, LogCategory.TASK);
 logger.debug('子代理.执行', { workerId: 'worker-1' }, LogCategory.WORKER);
 logger.info('编排器分析', { planId: 'plan-456' }, LogCategory.ORCHESTRATOR);
 
-console.log('\n3. CLI 消息日志测试:');
-logger.logCLIMessage({
-  cli: 'claude',
+console.log('\n3. Agent 消息日志测试:');
+logger.logAgentMessage({
+  agent: 'claude',
   role: 'worker',
   requestId: 'req-123',
   message: 'Please implement the following feature:\n\n1. Add a new function\n2. Write tests\n3. Update documentation',
@@ -35,8 +35,8 @@ logger.logCLIMessage({
 });
 
 setTimeout(() => {
-  logger.logCLIResponse({
-    cli: 'claude',
+  logger.logAgentResponse({
+    agent: 'claude',
     role: 'worker',
     requestId: 'req-123',
     response: 'I have implemented the feature:\n\n[Modified Files]\n- src/feature.ts\n- src/feature.test.ts\n- README.md\n\nAll tests are passing.',
@@ -52,8 +52,8 @@ setTimeout(() => {
 
   console.log('\n4. 长消息截断测试:');
   const longMessage = 'A'.repeat(1000);
-  logger.logCLIMessage({
-    cli: 'codex',
+  logger.logAgentMessage({
+    agent: 'codex',
     role: 'worker',
     requestId: 'req-456',
     message: longMessage,
@@ -67,8 +67,8 @@ setTimeout(() => {
   console.log('当前配置:', logger.getConfig());
 
   console.log('\n6. 条件日志测试:');
-  if (logger.isDebugEnabled(LogCategory.CLI)) {
-    logger.debug('CLI 调试已启用', undefined, LogCategory.CLI);
+  if (logger.isDebugEnabled(LogCategory.AGENT)) {
+    logger.debug('Agent 调试已启用', undefined, LogCategory.AGENT);
   }
 
   console.log('\n=== 测试完成 ===');

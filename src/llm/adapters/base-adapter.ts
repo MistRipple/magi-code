@@ -1,6 +1,6 @@
 /**
  * LLM 适配器抽象基类
- * 替代 CLI 适配器，使用 LLM API 直接通信
+ * 替代 LLM 适配器，使用 LLM API 直接通信
  */
 
 import { EventEmitter } from 'events';

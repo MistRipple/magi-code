@@ -44,7 +44,7 @@ const messageHandlerFunctions = [
   // 流式消息管理
   'findActiveStreamMessage',
   'ensureThreadStreamMessage',
-  'updateCliStreamingMessage',
+  'updateAgentStreamingMessage',
 
   // 消息转换和规范化
   'upsertThreadMirrorFromWorker',
@@ -139,7 +139,7 @@ let handlerCode = `// 消息处理模块
 
 import {
   threadMessages,
-  cliOutputs,
+  agentOutputs,
   currentSessionId,
   isProcessing,
   thinkingStartAt,
@@ -190,7 +190,7 @@ const groups = {
     'updateStreamingMessage',
     'findActiveStreamMessage',
     'ensureThreadStreamMessage',
-    'updateCliStreamingMessage'
+    'updateAgentStreamingMessage'
   ],
   '消息转换和规范化': [
     'upsertThreadMirrorFromWorker',

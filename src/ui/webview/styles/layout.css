@@ -65,12 +65,12 @@
     .bottom-tab .dot.unavailable { background: var(--vscode-descriptionForeground); opacity: 0.5; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
-    /* CLI 能力标识 */
-    .cli-capabilities { display: flex; gap: 2px; margin-left: 4px; }
-    .cli-cap-icon { width: 12px; height: 12px; fill: currentColor; opacity: 0.5; }
-    .cli-cap-icon.active { opacity: 0.8; }
-    .cli-cap-icon.inactive { opacity: 0.2; }
-    .bottom-tab:hover .cli-cap-icon { opacity: 0.9; }
+    /* 模型能力标识 */
+    .model-capabilities { display: flex; gap: 2px; margin-left: 4px; }
+    .model-cap-icon { width: 12px; height: 12px; fill: currentColor; opacity: 0.5; }
+    .model-cap-icon.active { opacity: 0.8; }
+    .model-cap-icon.inactive { opacity: 0.2; }
+    .bottom-tab:hover .model-cap-icon { opacity: 0.9; }
 
     /* 交互模式选择器（下拉框） */
     .mode-selector { padding: 4px 8px; font-size: var(--font-size-1); background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); border-radius: var(--radius-1); cursor: pointer; outline: none; min-width: 70px; }

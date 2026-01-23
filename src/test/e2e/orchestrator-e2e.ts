@@ -2,7 +2,7 @@
  * 编排流程端到端测试框架
  *
  * 核心功能：
- * - 模拟用户输入和 CLI 响应
+ * - 模拟用户输入和模型响应
  * - 记录消息传递流程
  * - 验证流程正确性
  * - 检测流程卡死
@@ -64,7 +64,7 @@ export interface TestCaseConfig {
 /** 模拟响应配置 */
 export interface MockResponse {
   trigger: string;           // 触发条件
-  cli: string;               // 目标 CLI
+  agent: string;             // 目标 Agent
   response: string;          // 响应内容
   delay?: number;            // 延迟时间
   shouldAskQuestion?: boolean; // 是否触发提问
@@ -141,36 +141,36 @@ export class MessageRecorder {
 }
 
 // ============================================================================
-// 模拟 CLI 适配器
+// 模拟 LLM 适配器
 // ============================================================================
 
-export class MockCLIAdapter {
+export class MockWorkerAdapter {
   private responses: Map<string, MockResponse[]> = new Map();
-  private questionCallback?: (cli: string, question: string) => Promise<string>;
+  private questionCallback?: (agent: string, question: string) => Promise<string>;
 
   /** 注册模拟响应 */
-  registerResponse(cli: string, trigger: string, response: string, options?: Partial<MockResponse>): void {
-    if (!this.responses.has(cli)) {
-      this.responses.set(cli, []);
+  registerResponse(agent: string, trigger: string, response: string, options?: Partial<MockResponse>): void {
+    if (!this.responses.has(agent)) {
+      this.responses.set(agent, []);
     }
-    this.responses.get(cli)!.push({
+    this.responses.get(agent)!.push({
       trigger,
-      cli,
+      agent,
       response,
       ...options
     });
   }
 
   /** 设置提问回调 */
-  onQuestion(callback: (cli: string, question: string) => Promise<string>): void {
+  onQuestion(callback: (agent: string, question: string) => Promise<string>): void {
     this.questionCallback = callback;
   }
 
   /** 模拟发送消息 */
-  async sendMessage(cli: string, prompt: string): Promise<{ content: string; error?: string }> {
-    const cliResponses = this.responses.get(cli) || [];
+  async sendMessage(agent: string, prompt: string): Promise<{ content: string; error?: string }> {
+    const agentResponses = this.responses.get(agent) || [];
 
-    for (const resp of cliResponses) {
+    for (const resp of agentResponses) {
       if (prompt.includes(resp.trigger)) {
         // 模拟延迟
         if (resp.delay) {
@@ -179,7 +179,7 @@ export class MockCLIAdapter {
 
         // 检查是否需要提问
         if (resp.shouldAskQuestion && resp.question && this.questionCallback) {
-          const answer = await this.questionCallback(cli, resp.question);
+          const answer = await this.questionCallback(agent, resp.question);
           return { content: resp.response.replace('{{ANSWER}}', answer) };
         }
 
@@ -386,14 +386,14 @@ export class TestRunner {
   private recorder: MessageRecorder;
   private validator: FlowValidator;
   private timeoutDetector: TimeoutDetector;
-  private mockCLI: MockCLIAdapter;
+  private mockWorker: MockWorkerAdapter;
   private mockUI: MockUserInterface;
 
   constructor(timeoutMs: number = 30000) {
     this.recorder = new MessageRecorder();
     this.validator = new FlowValidator(this.recorder);
     this.timeoutDetector = new TimeoutDetector(timeoutMs);
-    this.mockCLI = new MockCLIAdapter();
+    this.mockWorker = new MockWorkerAdapter();
     this.mockUI = new MockUserInterface();
   }
 
@@ -405,7 +405,7 @@ export class TestRunner {
 
     // 注册模拟响应
     for (const resp of config.mockResponses) {
-      this.mockCLI.registerResponse(resp.cli, resp.trigger, resp.response, resp);
+      this.mockWorker.registerResponse(resp.agent, resp.trigger, resp.response, resp);
     }
 
     // 设置超时检测
@@ -486,7 +486,7 @@ export class TestRunner {
   private async simulateClearRequirementFlow(config: TestCaseConfig): Promise<void> {
     // Phase 1: 分析
     this.recorder.recordStateTransition('idle', 'analyzing', 'user_input');
-    const analysisResponse = await this.mockCLI.sendMessage('claude', config.userInput);
+    const analysisResponse = await this.mockWorker.sendMessage('claude', config.userInput);
 
     // Phase 2: 确认
     this.recorder.recordStateTransition('analyzing', 'waiting_confirmation', 'plan_ready');
@@ -528,7 +528,7 @@ export class TestRunner {
     // 🔧 修复：从 clarifying 状态转换到 analyzing，而不是重新从 idle 开始
     // Phase 1: 分析
     this.recorder.recordStateTransition('clarifying', 'analyzing', 'clarification_complete');
-    const analysisResponse = await this.mockCLI.sendMessage('claude', config.userInput);
+    const analysisResponse = await this.mockWorker.sendMessage('claude', config.userInput);
 
     // Phase 2: 确认
     this.recorder.recordStateTransition('analyzing', 'waiting_confirmation', 'plan_ready');
@@ -719,7 +719,7 @@ export const TEST_CASES: TestCaseConfig[] = [
     mockResponses: [
       {
         trigger: 'formatDate',
-        cli: 'claude',
+        agent: 'claude',
         response: JSON.stringify({
           featureContract: '添加日期格式化函数',
           acceptanceCriteria: ['函数接收Date对象', '返回YYYY-MM-DD格式'],
@@ -747,7 +747,7 @@ export const TEST_CASES: TestCaseConfig[] = [
     mockResponses: [
       {
         trigger: '数据库',
-        cli: 'claude',
+        agent: 'claude',
         response: '需要确认数据库连接方式',
         shouldAskQuestion: true,
         question: '请确认数据库连接方式'

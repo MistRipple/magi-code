@@ -1,7 +1,7 @@
 /**
- * Claude CLI Normalizer
+ * Claude LLM Normalizer
  * 
- * 解析 Claude CLI 的 stream-json 格式输出
+ * 解析 Claude LLM 的 stream-json 格式输出
  * 将其转换为标准消息格式
  */
 
@@ -59,7 +59,7 @@ interface ClaudeStreamEvent {
 }
 
 /**
- * Claude CLI Normalizer
+ * Claude LLM Normalizer
  */
 export class ClaudeNormalizer extends BaseNormalizer {
   private jsonBuffer: string = '';

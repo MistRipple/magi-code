@@ -136,6 +136,9 @@ export class MissionOrchestrator extends EventEmitter {
   private contextManager?: ContextManager;
   private adapterFactory?: IAdapterFactory;
 
+  // 项目知识库
+  private projectKnowledgeBase?: import('../../knowledge/project-knowledge-base').ProjectKnowledgeBase;
+
   // 规划结果缓存（基于 prompt hash）
   private planningCache: Map<string, { mission: Mission; timestamp: number }> = new Map();
   private readonly CACHE_TTL_MS = 5 * 60 * 1000; // 5 分钟缓存过期
@@ -195,6 +198,60 @@ export class MissionOrchestrator extends EventEmitter {
    */
   setAdapterFactory(adapterFactory: IAdapterFactory): void {
     this.adapterFactory = adapterFactory;
+  }
+
+  /**
+   * 设置项目知识库
+   */
+  setKnowledgeBase(knowledgeBase: import('../../knowledge/project-knowledge-base').ProjectKnowledgeBase): void {
+    this.projectKnowledgeBase = knowledgeBase;
+    logger.info('任务编排器.知识库.已设置', undefined, LogCategory.ORCHESTRATOR);
+  }
+
+  /**
+   * 获取项目知识库上下文
+   */
+  private getProjectContext(maxTokens: number = 600): string {
+    if (!this.projectKnowledgeBase) {
+      return '';
+    }
+    return this.projectKnowledgeBase.getProjectContext(maxTokens);
+  }
+
+  /**
+   * 获取相关的 ADRs
+   */
+  private getRelevantADRs(userPrompt: string): string {
+    if (!this.projectKnowledgeBase) {
+      return '';
+    }
+
+    const adrs = this.projectKnowledgeBase.getADRs({ status: 'accepted' });
+    if (adrs.length === 0) {
+      return '';
+    }
+
+    // 简单的关键词匹配
+    const keywords = userPrompt.toLowerCase().split(/\s+/);
+    const relevantADRs = adrs.filter(adr => {
+      const adrText = `${adr.title} ${adr.context} ${adr.decision}`.toLowerCase();
+      return keywords.some(keyword => keyword.length > 2 && adrText.includes(keyword));
+    }).slice(0, 2); // 最多2个，避免上下文过长
+
+    if (relevantADRs.length === 0) {
+      return '';
+    }
+
+    const parts: string[] = [];
+    relevantADRs.forEach(adr => {
+      parts.push(`[ADR-${adr.id}] ${adr.title}`);
+      parts.push(`决策: ${adr.decision}`);
+      if (adr.consequences) {
+        parts.push(`影响: ${adr.consequences}`);
+      }
+    });
+
+    return parts.join('\n');
   }
 
   /**
@@ -358,7 +415,36 @@ export class MissionOrchestrator extends EventEmitter {
    * 创建新 Mission
    */
   async createMission(params: CreateMissionParams): Promise<Mission> {
-    const mission = await this.storage.createMission(params);
+    // 增强用户提示，注入项目知识库上下文
+    let enhancedContext = params.context || '';
+
+    if (this.projectKnowledgeBase) {
+      const projectContext = this.getProjectContext(600);
+      const relevantADRs = this.getRelevantADRs(params.userPrompt);
+
+      const knowledgeParts: string[] = [];
+      if (projectContext) {
+        knowledgeParts.push('## 项目信息');
+        knowledgeParts.push(projectContext);
+      }
+      if (relevantADRs) {
+        knowledgeParts.push('\n## 相关架构决策');
+        knowledgeParts.push(relevantADRs);
+      }
+
+      if (knowledgeParts.length > 0) {
+        enhancedContext = knowledgeParts.join('\n') + (enhancedContext ? '\n\n' + enhancedContext : '');
+        logger.info('任务编排器.知识库.上下文已注入', {
+          hasProjectContext: !!projectContext,
+          hasADRs: !!relevantADRs
+        }, LogCategory.ORCHESTRATOR);
+      }
+    }
+
+    const mission = await this.storage.createMission({
+      ...params,
+      context: enhancedContext
+    });
     return mission;
   }
 
@@ -443,7 +529,7 @@ export class MissionOrchestrator extends EventEmitter {
       // 基于任务分析自动选择
       const goalText = `${mission.goal} ${mission.analysis}`.toLowerCase();
 
-      for (const [cli, profile] of allProfiles.entries()) {
+      for (const [worker, profile] of allProfiles.entries()) {
         // 检查是否有匹配的分类偏好
         const hasMatch = profile.preferences.preferredCategories.some(cat =>
           goalText.includes(cat)
@@ -455,15 +541,15 @@ export class MissionOrchestrator extends EventEmitter {
         );
 
         if (hasMatch || hasStrength) {
-          participants.push(cli as WorkerSlot);
+          participants.push(worker as WorkerSlot);
         }
       }
 
       // 如果没有匹配，默认选择第一个
       if (participants.length === 0) {
-        const firstCli = allProfiles.keys().next().value;
-        if (firstCli) {
-          participants.push(firstCli as WorkerSlot);
+        const firstWorker = allProfiles.keys().next().value;
+        if (firstWorker) {
+          participants.push(firstWorker as WorkerSlot);
         }
       }
     }

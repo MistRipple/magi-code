@@ -12,7 +12,7 @@
     .image-preview-container { display: none; padding: var(--spacing-2) var(--spacing-3) 0; background: transparent; align-items: center; }
     .image-preview-container.has-images { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
     .image-preview-item { position: relative; width: 44px; height: 44px; border-radius: var(--radius-1); overflow: hidden; border: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); flex-shrink: 0; transition: border-color var(--transition-fast), transform var(--transition-fast); }
-    .image-preview-item:hover { border-color: var(--vscode-focusBorder); transform: scale(1.02); }
+.image-preview-item:hover { border-color: var(--vscode-focusBorder); transform: none; }
     .image-preview-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
     .image-preview-item .remove-btn { position: absolute; top: -1px; right: -1px; width: 16px; height: 16px; border-radius: 50%; background: var(--vscode-badge-background); border: none; color: var(--vscode-badge-foreground); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 600; line-height: 1; opacity: 0; transition: opacity var(--transition-fast), background var(--transition-fast); box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
     .image-preview-item:hover .remove-btn { opacity: 1; }
@@ -111,4 +111,100 @@
       font-size: var(--font-size-1);
       opacity: 0.7;
       margin-top: var(--spacing-1);
+    }
+
+    /* 工具授权对话框 */
+    .tool-auth-dialog {
+      display: none;
+      flex-direction: column;
+      gap: var(--spacing-3);
+      padding: var(--spacing-4);
+      background: var(--vscode-editor-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: var(--radius-3);
+      margin: var(--spacing-3);
+      max-width: 600px;
+    }
+    .tool-auth-dialog.visible { display: flex; }
+    .tool-auth-dialog-title {
+      font-size: var(--font-size-3);
+      font-weight: 600;
+      color: var(--vscode-foreground);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .tool-auth-dialog-title svg {
+      width: 16px;
+      height: 16px;
+      fill: var(--vscode-button-background);
+    }
+    .tool-auth-dialog-content {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-2);
+    }
+    .tool-auth-tool-name,
+    .tool-auth-tool-args {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-1);
+    }
+    .tool-auth-label {
+      font-size: var(--font-size-2);
+      font-weight: 500;
+      color: var(--vscode-foreground);
+    }
+    .tool-auth-value {
+      font-size: var(--font-size-2);
+      color: var(--vscode-descriptionForeground);
+      font-family: monospace;
+      background: var(--vscode-input-background);
+      padding: var(--spacing-1) var(--spacing-2);
+      border-radius: var(--radius-1);
+    }
+    .tool-auth-args-pre {
+      font-size: var(--font-size-2);
+      color: var(--vscode-descriptionForeground);
+      background: var(--vscode-input-background);
+      padding: var(--spacing-2);
+      border-radius: var(--radius-2);
+      max-height: 200px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      font-family: monospace;
+      margin: 0;
+      line-height: 1.5;
+    }
+    .tool-auth-dialog-actions {
+      display: flex;
+      gap: var(--spacing-2);
+      justify-content: flex-end;
+      padding-top: var(--spacing-2);
+      border-top: 1px solid var(--vscode-panel-border);
+    }
+    .tool-auth-btn {
+      padding: 6px 12px;
+      font-size: var(--font-size-2);
+      border-radius: var(--radius-2);
+      border: none;
+      cursor: pointer;
+      transition: all var(--transition-fast);
+      font-weight: 500;
+    }
+    .tool-auth-btn.deny {
+      background: transparent;
+      color: var(--vscode-descriptionForeground);
+      border: 1px solid var(--vscode-panel-border);
+    }
+    .tool-auth-btn.deny:hover {
+      background: var(--vscode-toolbar-hoverBackground);
+      color: var(--vscode-foreground);
+    }
+    .tool-auth-btn.allow {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+    }
+    .tool-auth-btn.allow:hover {
+      background: var(--vscode-button-hoverBackground);
     }

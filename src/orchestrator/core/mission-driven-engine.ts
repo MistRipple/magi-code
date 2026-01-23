@@ -121,6 +121,9 @@ export class MissionDrivenEngine extends EventEmitter {
   private intentGate?: IntentGate;
   private verificationRunner?: VerificationRunner;
 
+  // 项目知识库
+  private projectKnowledgeBase?: import('../../knowledge/project-knowledge-base').ProjectKnowledgeBase;
+
   // 状态
   private _state: OrchestratorState = 'idle';
   private _context: MissionDrivenContext = { plan: null, mission: null };
@@ -355,13 +358,23 @@ export class MissionDrivenEngine extends EventEmitter {
     }
   }
 
+  /**
+   * 设置项目知识库
+   */
+  setKnowledgeBase(knowledgeBase: import('../../knowledge/project-knowledge-base').ProjectKnowledgeBase): void {
+    this.projectKnowledgeBase = knowledgeBase;
+    // 同时注入到 MissionOrchestrator
+    this.missionOrchestrator.setKnowledgeBase(knowledgeBase);
+    logger.info('任务引擎.知识库.已设置', undefined, LogCategory.ORCHESTRATOR);
+  }
+
   private bindTaskManagerEvents(taskManager: UnifiedTaskManager): void {
     taskManager.on('subtask:started', (task, subTask) => {
       globalEventBus.emitEvent('subtask:started', {
         taskId: task.id,
         subTaskId: subTask.id,
         data: {
-          cli: subTask.assignedWorker,
+          agent: subTask.assignedWorker,
           description: subTask.description,
           targetFiles: subTask.targetFiles,
           reason: subTask.reason,
@@ -377,7 +390,7 @@ export class MissionDrivenEngine extends EventEmitter {
         subTaskId: subTask.id,
         data: {
           success: true,
-          cliType: subTask.assignedWorker,
+          agent: subTask.assignedWorker,
           description: subTask.description,
           modifiedFiles: subTask.modifiedFiles,
           duration,
@@ -393,7 +406,7 @@ export class MissionDrivenEngine extends EventEmitter {
         taskId: task.id,
         subTaskId: subTask.id,
         data: {
-          cliType: subTask.assignedWorker,
+          agent: subTask.assignedWorker,
           description: subTask.description,
           error: subTask.error,
           modifiedFiles: subTask.modifiedFiles,

@@ -44,7 +44,7 @@ export interface MessageBridgeConfig {
 
 /**
  * 消息桥接层
- * 将 CLI 原始输出转换为标准消息格式
+ * 将模型原始输出转换为标准消息格式
  */
 export class MessageBridge extends EventEmitter {
   private factory: IAdapterFactory;

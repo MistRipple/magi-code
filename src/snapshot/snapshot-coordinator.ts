@@ -76,9 +76,11 @@ export class SnapshotCoordinator {
       sessionId,
       filePath,
       originalContent: content,
-      lastModifiedAt: Date.now(),
-      lastModifiedBy: modifiedBy,
-      subTaskId,
+      timestamp: Date.now(),
+      missionId: 'legacy-mission',
+      assignmentId: 'legacy-assignment',
+      todoId: subTaskId,
+      workerId: modifiedBy,
     };
 
     // 验证快照
@@ -95,10 +97,11 @@ export class SnapshotCoordinator {
     const meta: FileSnapshotMeta = {
       id: snapshotId,
       filePath,
-      lastModifiedAt: snapshot.lastModifiedAt,
-      lastModifiedBy: modifiedBy,
-      subTaskId,
-      priority,
+      timestamp: snapshot.timestamp,
+      missionId: 'legacy-mission',
+      assignmentId: 'legacy-assignment',
+      todoId: subTaskId,
+      workerId: modifiedBy,
     };
 
     // 原子性写入快照
@@ -310,11 +313,13 @@ export class SnapshotCoordinator {
     return {
       filePath: meta.filePath,
       snapshotId,
-      lastModifiedBy: meta.lastModifiedBy,
+      missionId: meta.missionId,
+      assignmentId: meta.assignmentId,
+      todoId: meta.todoId,
+      workerId: meta.workerId,
       additions: changes.additions,
       deletions: changes.deletions,
       status: 'pending' as const,
-      subTaskId: meta.subTaskId,
     };
   }
 

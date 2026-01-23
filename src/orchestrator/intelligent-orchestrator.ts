@@ -124,6 +124,9 @@ export class IntelligentOrchestrator {
   // 核心：MissionDrivenEngine
   private missionDrivenEngine: MissionDrivenEngine;
 
+  // 项目知识库
+  private projectKnowledgeBase?: import('../knowledge/project-knowledge-base').ProjectKnowledgeBase;
+
   // 交互模式 - 默认 auto，根据用户输入智能判断
   private interactionMode: InteractionMode = 'auto';
   private readonly directAnswerKeywords = [
@@ -201,6 +204,21 @@ export class IntelligentOrchestrator {
   setInteractionMode(mode: InteractionMode): void {
     this.interactionMode = mode;
     this.modeConfig = INTERACTION_MODE_CONFIGS[mode];
+
+    // 根据模式设置工具授权回调
+    const toolManager = (this.adapterFactory as any).getToolManager?.();
+    if (toolManager) {
+      if (mode === 'ask') {
+        // Ask 模式：设置授权回调
+        toolManager.setAuthorizationCallback(async (toolName: string, toolArgs: any) => {
+          return await this.requestToolAuthorization(toolName, toolArgs);
+        });
+      } else {
+        // Auto 模式：移除授权回调
+        toolManager.setAuthorizationCallback(undefined);
+      }
+    }
+
     logger.info('编排器.交互_模式.变更', { mode }, LogCategory.ORCHESTRATOR);
     globalEventBus.emitEvent('orchestrator:mode_changed', { data: { mode } });
     this.syncPlanConfirmationPolicy();
@@ -254,6 +272,79 @@ export class IntelligentOrchestrator {
     this.taskManager = taskManager;
     this.taskManagerSessionId = sessionId;
     this.missionDrivenEngine.setTaskManager(taskManager, sessionId);
+  }
+
+  /** 设置项目知识库 */
+  setKnowledgeBase(knowledgeBase: import('../knowledge/project-knowledge-base').ProjectKnowledgeBase): void {
+    this.projectKnowledgeBase = knowledgeBase;
+    // 同时注入到 MissionDrivenEngine
+    this.missionDrivenEngine.setKnowledgeBase(knowledgeBase);
+    logger.info('编排器.知识库.已设置', undefined, LogCategory.ORCHESTRATOR);
+  }
+
+  /** 获取项目知识库上下文 */
+  private getProjectContext(maxTokens: number = 800): string {
+    if (!this.projectKnowledgeBase) {
+      return '';
+    }
+    return this.projectKnowledgeBase.getProjectContext(maxTokens);
+  }
+
+  /** 获取相关的 ADRs */
+  private getRelevantADRs(userPrompt: string): string {
+    if (!this.projectKnowledgeBase) {
+      return '';
+    }
+
+    const adrs = this.projectKnowledgeBase.getADRs({ status: 'accepted' });
+    if (adrs.length === 0) {
+      return '';
+    }
+
+    // 简单的关键词匹配（未来可以使用更智能的相似度算法）
+    const keywords = userPrompt.toLowerCase().split(/\s+/);
+    const relevantADRs = adrs.filter(adr => {
+      const adrText = `${adr.title} ${adr.context} ${adr.decision}`.toLowerCase();
+      return keywords.some(keyword => adrText.includes(keyword));
+    }).slice(0, 3); // 最多3个
+
+    if (relevantADRs.length === 0) {
+      return '';
+    }
+
+    const parts: string[] = ['## 相关架构决策 (ADR)'];
+    relevantADRs.forEach(adr => {
+      parts.push(`\n### [${adr.id}] ${adr.title}`);
+      parts.push(`**背景**: ${adr.context}`);
+      parts.push(`**决策**: ${adr.decision}`);
+      parts.push(`**影响**: ${adr.consequences}`);
+    });
+
+    return parts.join('\n');
+  }
+
+  /** 获取相关的 FAQs */
+  private getRelevantFAQs(userPrompt: string): string {
+    if (!this.projectKnowledgeBase) {
+      return '';
+    }
+
+    const faqs = this.projectKnowledgeBase.searchFAQs(userPrompt);
+    if (faqs.length === 0) {
+      return '';
+    }
+
+    const topFAQs = faqs.slice(0, 2); // 最多2个
+    const parts: string[] = ['## 相关常见问题 (FAQ)'];
+
+    topFAQs.forEach(faq => {
+      parts.push(`\n**Q**: ${faq.question}`);
+      parts.push(`**A**: ${faq.answer}`);
+      // 增加使用次数
+      this.projectKnowledgeBase?.incrementFAQUseCount(faq.id);
+    });
+
+    return parts.join('\n');
   }
 
   private resolveSessionId(sessionId?: string): string {
@@ -588,13 +679,34 @@ export class IntelligentOrchestrator {
       this.startStatusUpdates(taskId);
     }
     const context = await this.missionDrivenEngine.prepareContext(contextSessionId, userPrompt);
-    const prompt = context
-      ? `请结合以下会话上下文回答用户问题。\n\n${context}\n\n## 用户问题\n${userPrompt}`
+
+    // 获取项目知识库上下文
+    const projectContext = this.getProjectContext(500);
+    const relevantADRs = this.getRelevantADRs(userPrompt);
+    const relevantFAQs = this.getRelevantFAQs(userPrompt);
+
+    // 构建增强的提示词
+    const knowledgeParts: string[] = [];
+    if (context) {
+      knowledgeParts.push(`## 会话上下文\n${context}`);
+    }
+    if (projectContext) {
+      knowledgeParts.push(`\n## 项目信息\n${projectContext}`);
+    }
+    if (relevantADRs) {
+      knowledgeParts.push(`\n${relevantADRs}`);
+    }
+    if (relevantFAQs) {
+      knowledgeParts.push(`\n${relevantFAQs}`);
+    }
+
+    const prompt = knowledgeParts.length > 0
+      ? `请结合以下信息回答用户问题。\n\n${knowledgeParts.join('\n')}\n\n## 用户问题\n${userPrompt}`
       : userPrompt;
     const snapshot = context ? this.truncateSnapshot(context) : undefined;
 
     const response = await this.adapterFactory.sendMessage(
-      'claude',
+      'orchestrator',
       prompt,
       undefined,
       {
@@ -658,7 +770,6 @@ export class IntelligentOrchestrator {
   private shouldUseAskMode(prompt: string): boolean {
     const trimmed = prompt.trim();
     if (!trimmed) return true;
-    if (this.interactionMode === 'agent') return false;
     if (this.interactionMode === 'ask') return true;
     if (trimmed.startsWith('/agent') || trimmed.startsWith('/task')) return false;
 
@@ -786,6 +897,24 @@ export class IntelligentOrchestrator {
   /** 获取执行统计实例（用于 UI 显示） */
   getExecutionStats(): import('./execution-stats').ExecutionStats | null {
     return this.missionDrivenEngine.getExecutionStats();
+  }
+
+  /**
+   * 请求工具授权（Ask 模式）
+   */
+  private async requestToolAuthorization(toolName: string, toolArgs: any): Promise<boolean> {
+    // 发送授权请求到前端
+    return new Promise((resolve) => {
+      globalEventBus.emitEvent('tool:authorization_request', {
+        data: {
+          toolName,
+          toolArgs,
+          callback: (allowed: boolean) => {
+            resolve(allowed);
+          },
+        },
+      });
+    });
   }
 
   /** 销毁编排器 */

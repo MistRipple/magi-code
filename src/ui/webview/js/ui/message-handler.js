@@ -3,7 +3,7 @@
 
 import {
   threadMessages,
-  cliOutputs,
+  agentOutputs,
   currentSessionId,
   isProcessing,
   thinkingStartAt,
@@ -49,6 +49,8 @@ import {
   extractToolCallsFromBlocks
 } from './message-renderer.js';
 
+import { resetIncrementalState } from '../core/incremental-update.js';
+
 // 标准消息存储 - 按 messageId 索引
 const standardMessages = new Map();
 // 早到的流式更新（避免 update 先于 message 抵达被丢弃）
@@ -56,7 +58,7 @@ const pendingStandardUpdates = new Map();
 
 // 消息列表限制
 const MAX_THREAD_MESSAGES = 500;
-const MAX_CLI_MESSAGES = 200;
+const MAX_AGENT_MESSAGES = 200;
 
 // 交互状态
 let interactionState = 'idle'; // 'idle' | 'processing' | 'awaiting'
@@ -82,7 +84,7 @@ export function handleStandardMessage(message) {
 
       console.log('[Webview] 收到标准消息:', message.id, message.type, message.lifecycle);
 
-      // 处理交互消息（CLI 询问）
+      // 处理交互消息（Worker 询问）
       if (message.type === 'interaction' && message.interaction) {
         handleInteractionMessage(message);
         return;
@@ -103,7 +105,7 @@ export function handleStandardMessage(message) {
 
       // 获取目标信息
       const isOrchestrator = message.source === 'orchestrator';
-      const cli = message.cli || 'claude';
+      const agent = message.agent || 'claude';
 
       // 处理特殊消息类型
       if (message.type === 'plan') {
@@ -114,7 +116,7 @@ export function handleStandardMessage(message) {
       }
 
       // 检查是否已存在该消息
-      const messages = isOrchestrator ? threadMessages : (cliOutputs[cli] || []);
+      const messages = isOrchestrator ? threadMessages : (agentOutputs[agent] || []);
       const existingMsg = messages.find(m => m.standardMessageId === message.id);
 
       if (existingMsg) {
@@ -132,7 +134,7 @@ export function handleStandardMessage(message) {
         const webviewMsg = standardToWebviewMessage(message);
 
         // 🔧 新增：内容去重 - 检查是否存在内容完全相同的消息
-        const targetMessages = isOrchestrator ? threadMessages : (cliOutputs[cli] || []);
+        const targetMessages = isOrchestrator ? threadMessages : (agentOutputs[agent] || []);
         const duplicateByContent = findEquivalentMessage(targetMessages, webviewMsg, 30000);
         if (duplicateByContent) {
           console.log('[Webview] 跳过内容重复的消息:', message.id, 'duplicate of:', duplicateByContent.standardMessageId);
@@ -146,10 +148,10 @@ export function handleStandardMessage(message) {
         if (isOrchestrator) {
           threadMessages.push(webviewMsg);
         } else {
-          if (!cliOutputs[cli]) {
-            cliOutputs[cli] = [];
+          if (!agentOutputs[agent]) {
+            agentOutputs[agent] = [];
           }
-          cliOutputs[cli].push(webviewMsg);
+          agentOutputs[agent].push(webviewMsg);
         }
       }
 
@@ -161,13 +163,13 @@ export function handleStandardMessage(message) {
       // 设置处理状态
       if (message.lifecycle === 'streaming' || message.lifecycle === 'started') {
         setProcessingState(true);
-        setProcessingActor(message.source, cli);
+        setProcessingActor(message.source, agent);
       }
 
       saveWebviewState();
       scheduleRenderMainContent();
       smoothScrollToBottom();
-      updateCliDots();
+      updateWorkerDots();
     }
 
 export function bufferStandardUpdate(update) {
@@ -194,8 +196,8 @@ export function handleStandardUpdate(update) {
 
       // 查找并更新对应的 Webview 消息
       const isOrchestrator = message.source === 'orchestrator';
-      const cli = message.cli || 'claude';
-      const messages = isOrchestrator ? threadMessages : (cliOutputs[cli] || []);
+      const agent = message.agent || 'claude';
+      const messages = isOrchestrator ? threadMessages : (agentOutputs[agent] || []);
 
       const webviewMsg = messages.find(m => m.standardMessageId === update.messageId);
       if (webviewMsg) {
@@ -212,7 +214,7 @@ export function handleStandardUpdate(update) {
         if (update.updateType === 'append' || update.updateType === 'replace') {
           const updateSuccess = isOrchestrator
             ? updateStreamingMessage(webviewMsg.streamKey, webviewMsg.content)
-            : updateCliStreamingMessage(cli, webviewMsg.content);
+            : updateAgentStreamingMessage(agent, webviewMsg.content);
 
           if (!updateSuccess) {
             scheduleRenderMainContent();
@@ -232,7 +234,7 @@ export function handleStandardUpdate(update) {
 
       throttledSaveState();
       smoothScrollToBottom();
-      updateCliDots();
+      updateWorkerDots();
     }
 
 export function handleStandardComplete(message) {
@@ -249,8 +251,8 @@ export function handleStandardComplete(message) {
 
       // 查找并更新对应的 Webview 消息
       const isOrchestrator = message.source === 'orchestrator';
-      const cli = message.cli || 'claude';
-      const messages = isOrchestrator ? threadMessages : (cliOutputs[cli] || []);
+      const agent = message.agent || 'claude';
+      const messages = isOrchestrator ? threadMessages : (agentOutputs[agent] || []);
 
       const webviewMsg = messages.find(m => m.standardMessageId === message.id);
       if (webviewMsg) {
@@ -283,13 +285,15 @@ export function handleStandardComplete(message) {
         upsertThreadMirrorFromWorker(message);
       }
 
-      // 检查是否还有活跃的流式消息
+      // 检查是否还有活跃的流式消息，用于停止提示计时器
+      // 注意：处理状态由后端 processingStateChanged 事件控制，前端不再自行判断
       const hasActiveStreaming = threadMessages.some(m => m.streaming) ||
-        ['claude', 'codex', 'gemini'].some(c => (cliOutputs[c] || []).some(m => m.streaming));
+        ['claude', 'codex', 'gemini'].some(c => (agentOutputs[c] || []).some(m => m.streaming));
 
       if (!hasActiveStreaming) {
         stopStreamingHintTimer();
-        setProcessingState(false);
+        // 不再在此处调用 setProcessingState(false)
+        // 处理状态完全由后端 UnifiedMessageBus 的 processingStateChanged 事件控制
       }
 
       saveWebviewState();
@@ -390,9 +394,9 @@ export function updateSendButtonState() {
 // 辅助函数
 // ============================================
 
-export function generateStreamKey(source, cli) {
+export function generateStreamKey(source, agent) {
       streamKeyCounter += 1;
-      return (source || 'orchestrator') + ':' + (cli || 'claude') + ':' + Date.now() + '-' + streamKeyCounter;
+      return (source || 'orchestrator') + ':' + (agent || 'claude') + ':' + Date.now() + '-' + streamKeyCounter;
     }
 
 export function detectSpecialContent(content) {
@@ -422,15 +426,17 @@ export function detectSpecialContent(content) {
       return { hasSpecial: false };
     }
 
-export function updateCliDots() {
-      const statuses = appState?.cliStatuses || [];
-      ['claude', 'codex', 'gemini'].forEach(cli => {
-        const s = statuses.find(x => x.type === cli);
-        const dotEl = document.getElementById('dot-' + cli);
-        if (dotEl) {
-          const isRunning = appState?.tasks?.some(t => t.status === 'running' && t.cli === cli);
-          dotEl.className = 'dot ' + (isRunning ? 'running' : s?.available ? 'available' : 'unavailable');
-        }
+export function updateWorkerDots() {
+      const statuses = appState?.workerStatuses || [];
+      const tasks = appState?.tasks || [];
+      ['claude', 'codex', 'gemini'].forEach(worker => {
+        const s = statuses.find(x => x.worker === worker);
+        const dotEl = document.getElementById('dot-' + worker);
+        if (!dotEl) return;
+        const isRunning = tasks.some(t =>
+          Array.isArray(t.subTasks) && t.subTasks.some(st => st.status === 'running' && st.assignedWorker === worker)
+        );
+        dotEl.className = 'dot ' + (isRunning ? 'running' : s?.available ? 'available' : 'unavailable');
       });
     }
 
@@ -442,9 +448,9 @@ export function clearAllStreamingStates() {
         }
       });
 
-      // 清除所有 CLI 消息的 streaming 状态
-      ['claude', 'codex', 'gemini'].forEach(cli => {
-        const msgs = cliOutputs[cli] || [];
+      // 清除所有 Worker 消息的 streaming 状态
+      ['claude', 'codex', 'gemini'].forEach(agent => {
+        const msgs = agentOutputs[agent] || [];
         msgs.forEach(m => {
           if (m.streaming) {
             m.streaming = false;
@@ -460,8 +466,9 @@ export function clearAllStreamingStates() {
         el.remove();
       });
 
-      // 更新处理状态
-      setProcessingState(false);
+      // 注意：不再在此处调用 setProcessingState(false)
+      // 处理状态完全由后端 processingStateChanged 事件控制
+      // 此函数仅负责清理流式消息的 UI 状态
     }
 
 let saveStateTimeout = null;
@@ -547,7 +554,7 @@ export function showWorkerQuestion(workerId, question, context, options) {
         time: new Date().toLocaleTimeString().slice(0, 5),
         timestamp: Date.now(),
         source: 'worker',
-        cli: workerId,
+        agent: workerId,
         isWorkerQuestion: true,
         workerQuestionData: {
           workerId,
@@ -568,7 +575,7 @@ export function showWorkerQuestion(workerId, question, context, options) {
       clearLocalProcessingGrace();
       enterAwaitingState({
         type: 'worker_question',
-        cli: workerId,
+        agent: workerId,
         prompt: `回复 ${workerId} 的问题...`
       });
 
@@ -662,8 +669,8 @@ export function updatePhaseIndicator(phase, isRunningFromBackend) {
             hasUpdates = true;
           }
         });
-        ['claude', 'codex', 'gemini'].forEach(cli => {
-          const msgs = cliOutputs[cli] || [];
+        ['claude', 'codex', 'gemini'].forEach(agent => {
+          const msgs = agentOutputs[agent] || [];
           msgs.forEach(m => {
             if (m.streaming) {
               m.streaming = false;
@@ -737,9 +744,63 @@ export function showRecoveryDialog(taskId, error, canRetry, canRollback) {
       });
     }
 
+export function showToolAuthorizationDialog(toolName, toolArgs) {
+      // 移除已存在的授权对话框
+      const existingDialog = document.getElementById('tool-auth-dialog');
+      if (existingDialog) {
+        existingDialog.remove();
+      }
+
+      const dialog = document.createElement('div');
+      dialog.className = 'tool-auth-dialog visible';
+      dialog.id = 'tool-auth-dialog';
+
+      // 格式化工具参数
+      let argsDisplay = '';
+      try {
+        argsDisplay = JSON.stringify(toolArgs, null, 2);
+      } catch (e) {
+        argsDisplay = String(toolArgs || '');
+      }
+
+      dialog.innerHTML = `
+        <div class="tool-auth-dialog-title">
+          <svg viewBox="0 0 16 16"><path d="M8 1a2 2 0 0 1 2 2v4H6V3a2 2 0 0 1 2-2zm3 6V3a3 3 0 0 0-6 0v4a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"/></svg>
+          工具授权请求
+        </div>
+        <div class="tool-auth-dialog-content">
+          <div class="tool-auth-tool-name">
+            <span class="tool-auth-label">工具:</span>
+            <span class="tool-auth-value">${escapeHtml(toolName)}</span>
+          </div>
+          <div class="tool-auth-tool-args">
+            <span class="tool-auth-label">参数:</span>
+            <pre class="tool-auth-args-pre">${escapeHtml(argsDisplay)}</pre>
+          </div>
+        </div>
+        <div class="tool-auth-dialog-actions">
+          <button class="tool-auth-btn deny" data-allowed="false">拒绝</button>
+          <button class="tool-auth-btn allow" data-allowed="true">允许</button>
+        </div>
+      `;
+
+      const mainContent = document.getElementById('main-content');
+      if (mainContent) {
+        mainContent.appendChild(dialog);
+      }
+
+      dialog.querySelectorAll('.tool-auth-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const allowed = btn.dataset.allowed === 'true';
+          postMessage({ type: 'toolAuthorizationResponse', allowed: allowed });
+          dialog.remove();
+        });
+      });
+    }
+
 export function handleInteractionMessage(message) {
       const interaction = message.interaction;
-      const worker = message.cli || 'claude';
+      const worker = message.agent || 'claude';
 
       console.log('[Webview] 收到交互消息:', interaction.type, interaction.requestId);
 
@@ -859,8 +920,8 @@ export function standardToWebviewMessage(message) {
           streaming: isStreaming,
           startedAt: isStreaming ? Date.now() : undefined,
           source: message.source,
-          cli: message.cli,
-          streamKey: generateStreamKey(message.source, message.cli),
+          agent: message.agent,
+          streamKey: generateStreamKey(message.source, message.agent),
           thinking: thinking,
           toolCalls: toolCalls,
           codeBlocks: codeBlocks,  // 🆕 新增：已解析的代码块
@@ -891,9 +952,9 @@ export function updateStreamingMessage(streamKey, content) {
       if (!contentEl) return false;
 
       const streamingMsg = threadMessages.find(m => m.streaming && m.streamKey === streamKey);
-      const cli = streamingMsg?.cli || 'claude';
+      const agent = streamingMsg?.agent || 'claude';
       // 🆕 使用智能渲染：优先使用后端已解析的 blocks
-      const rendered = streamingMsg ? renderMessageContentSmart(streamingMsg, cli) : { html: escapeHtml(content || ''), isMarkdown: false };
+      const rendered = streamingMsg ? renderMessageContentSmart(streamingMsg, agent) : { html: escapeHtml(content || ''), isMarkdown: false };
       contentEl.innerHTML = rendered.html;
       if (rendered.isMarkdown) {
         contentEl.classList.add('markdown-rendered');
@@ -914,8 +975,8 @@ export function updateStreamingMessage(streamKey, content) {
       return true;
     }
 
-export function findActiveStreamMessage(source, cli) {
-      const prefix = (source || 'orchestrator') + ':' + (cli || 'claude') + ':';
+export function findActiveStreamMessage(source, agent) {
+      const prefix = (source || 'orchestrator') + ':' + (agent || 'claude') + ':';
       for (let i = threadMessages.length - 1; i >= 0; i -= 1) {
         const msg = threadMessages[i];
         if (msg.streaming && msg.streamKey && msg.streamKey.startsWith(prefix)) {
@@ -925,14 +986,14 @@ export function findActiveStreamMessage(source, cli) {
       return null;
     }
 
-export function ensureThreadStreamMessage(source, cli, initialContent) {
+export function ensureThreadStreamMessage(source, agent, initialContent) {
       // 查找当前来源的活跃流式消息
-      const active = findActiveStreamMessage(source, cli);
+      const active = findActiveStreamMessage(source, agent);
       if (active) {
         return active;
       }
       // 创建新的流式消息，使用唯一的 streamKey
-      const streamKey = generateStreamKey(source, cli);
+      const streamKey = generateStreamKey(source, agent);
       const msg = {
         role: 'assistant',
         content: initialContent || '',
@@ -941,7 +1002,7 @@ export function ensureThreadStreamMessage(source, cli, initialContent) {
         streaming: true,
         startedAt: Date.now(),
         source: source,
-        cli: cli,
+        agent: agent,
         streamKey: streamKey
       };
       threadMessages.push(msg);
@@ -949,22 +1010,22 @@ export function ensureThreadStreamMessage(source, cli, initialContent) {
       return { idx, msg: threadMessages[idx] };
     }
 
-export function updateCliStreamingMessage(cli, content) {
+export function updateAgentStreamingMessage(agent, content) {
       const container = document.getElementById('main-content');
-      if (!container || currentBottomTab !== cli) return false;
+      if (!container || currentBottomTab !== agent) return false;
 
       // 查找带有 streaming 类的消息元素
-      const streamingMessage = container.querySelector('.message.streaming[data-cli="' + cli + '"]');
+      const streamingMessage = container.querySelector('.message.streaming[data-agent="' + agent + '"]');
       if (!streamingMessage) return false;
 
       const contentEl = streamingMessage.querySelector('.message-content');
       if (!contentEl) return false;
 
-      const messages = cliOutputs[cli] || [];
+      const messages = agentOutputs[agent] || [];
       const lastMsg = messages.find(m => m.streaming);
       if (lastMsg) {
         // 🆕 使用智能渲染：优先使用后端已解析的 blocks
-        const rendered = renderMessageContentSmart(lastMsg, cli);
+        const rendered = renderMessageContentSmart(lastMsg, agent);
         contentEl.innerHTML = rendered.html;
         if (rendered.isMarkdown) {
           contentEl.classList.add('markdown-rendered');
@@ -1100,7 +1161,7 @@ export function handleClarificationAnswer(answerText, cancelled) {
       window._pendingClarification = null;
 
       // 发送澄清回答到后端
-      vscode.postMessage({
+      postMessage({
         type: 'answerClarification',
         answers: cancelled ? null : { _userResponse: answerText },
         additionalInfo: answerText
@@ -1125,7 +1186,7 @@ export function handleWorkerQuestionAnswer(answer, cancelled) {
       // 清除待处理状态
       window._pendingWorkerQuestion = null;
 
-      vscode.postMessage({
+      postMessage({
         type: 'answerWorkerQuestion',
         answer: cancelled ? null : (answer || '')
       });
@@ -1149,7 +1210,7 @@ export function handleQuestionAnswer(answer, cancelled) {
       threadMessages[idx].answered = !cancelled;
       threadMessages[idx].answer = cancelled ? '' : (answer || '');
       threadMessages[idx].cancelled = !!cancelled;
-      vscode.postMessage({ type: 'answerQuestions', answer: cancelled ? null : (answer || '') });
+      postMessage({ type: 'answerQuestions', answer: cancelled ? null : (answer || '') });
       const input = document.getElementById('prompt-input');
       if (input) {
         input.placeholder = '描述你的任务... (可粘贴图片)';
@@ -1161,7 +1222,7 @@ export function handleQuestionAnswer(answer, cancelled) {
 
 export function handlePlanConfirmation(confirmed) {
       // 发送确认消息到后端
-      vscode.postMessage({ type: 'confirmPlan', confirmed: confirmed });
+      postMessage({ type: 'confirmPlan', confirmed: confirmed });
 
       // 🔧 风险1修复：确认后立即设置处理状态
       if (confirmed) {
@@ -1201,7 +1262,7 @@ export function showClarificationAsMessage(questions, context, ambiguityScore, o
         time: new Date().toLocaleTimeString().slice(0, 5),
         timestamp: Date.now(),
         source: 'orchestrator',
-        cli: 'claude',
+        agent: 'claude',
         // 标记这是澄清消息，用于后续识别
         isClarification: true,
         clarificationData: {
@@ -1243,31 +1304,40 @@ export function loadSessionMessages(sessionId) {
       if (!session) return;
       const sessionMessages = Array.isArray(session.messages) ? session.messages : [];
 
+      // 🔧 重要：切换会话时必须重置增量更新状态，否则 UI 不会刷新
+      resetIncrementalState();
+
       // 转换消息格式：后端存储的是 SessionMessage，前端需要简化格式
+      // 注意：必须保留所有特殊字段（toolCalls、parsedBlocks 等）以正确渲染
       const convertedMessages = sessionMessages.map(m => ({
         role: m.role,
         content: m.content,
         time: m.timestamp ? new Date(m.timestamp).toLocaleTimeString().slice(0,5) : '',
         timestamp: m.timestamp,
-        cli: m.cli,
+        agent: m.agent,
         source: m.source,
-        images: m.images
+        images: m.images,
+        // 保留特殊内容字段
+        toolCalls: m.toolCalls,
+        parsedBlocks: m.parsedBlocks,
+        thinking: m.thinking,
+        thinkingContent: m.thinkingContent
       }));
 
       // 清空并重新填充 threadMessages
       threadMessages.length = 0;
       threadMessages.push(...convertedMessages);
 
-      // 清空 cliOutputs
-      cliOutputs.claude = [];
-      cliOutputs.codex = [];
-      cliOutputs.gemini = [];
+      // 清空 agentOutputs
+      agentOutputs.claude = [];
+      agentOutputs.codex = [];
+      agentOutputs.gemini = [];
 
-      // 恢复 cliOutputs
-      if (session.cliOutputs) {
-        ['claude', 'codex', 'gemini'].forEach(cli => {
-          if (Array.isArray(session.cliOutputs[cli])) {
-            cliOutputs[cli] = session.cliOutputs[cli];
+      // 恢复 agentOutputs
+      if (session.agentOutputs) {
+        ['claude', 'codex', 'gemini'].forEach(agent => {
+          if (Array.isArray(session.agentOutputs[agent])) {
+            agentOutputs[agent] = session.agentOutputs[agent];
           }
         });
       }
@@ -1286,10 +1356,10 @@ export function trimMessageLists() {
         threadMessages.length = 0;
         threadMessages.push(...trimmed);
       }
-      // 裁剪 cliOutputs
-      ['claude', 'codex', 'gemini'].forEach(cli => {
-        if (cliOutputs[cli] && cliOutputs[cli].length > MAX_CLI_MESSAGES) {
-          cliOutputs[cli] = cliOutputs[cli].slice(-MAX_CLI_MESSAGES);
+      // 裁剪 agentOutputs
+      ['claude', 'codex', 'gemini'].forEach(agent => {
+        if (agentOutputs[agent] && agentOutputs[agent].length > MAX_AGENT_MESSAGES) {
+          agentOutputs[agent] = agentOutputs[agent].slice(-MAX_AGENT_MESSAGES);
         }
       });
     }
@@ -1374,13 +1444,35 @@ export function handlePromptEnhanced(enhancedPrompt, error) {
 export function updatePromptEnhanceStatus(success, message) {
       const promptEnhanceStatus = document.getElementById('prompt-enhance-status');
       const promptEnhanceTest = document.getElementById('prompt-enhance-test');
-      if (promptEnhanceStatus) {
-        promptEnhanceStatus.style.display = 'block';
-        promptEnhanceStatus.className = 'prompt-enhance-status ' + (success ? 'success' : 'error');
-        promptEnhanceStatus.textContent = message;
-      }
+
       if (promptEnhanceTest) {
         promptEnhanceTest.classList.remove('loading');
         promptEnhanceTest.disabled = false;
+
+        if (success) {
+          promptEnhanceTest.classList.add('success');
+          promptEnhanceTest.innerHTML = '<svg viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>连接成功';
+        } else {
+          promptEnhanceTest.classList.add('error');
+          promptEnhanceTest.innerHTML = '<svg viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 13A6 6 0 1 1 8 2a6 6 0 0 1 0 12zm.75-8.25a.75.75 0 0 0-1.5 0v3.5a.75.75 0 0 0 1.5 0v-3.5zM8 11a1 1 0 1 0 0-2 1 1 0 0 0 0 2z"/></svg>连接失败';
+        }
+
+        setTimeout(() => {
+          promptEnhanceTest.classList.remove('success', 'error');
+          promptEnhanceTest.innerHTML = '<svg viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>测试连接';
+        }, 2000);
+      }
+
+      if (promptEnhanceStatus) {
+        const hasMessage = !!message && message.trim().length > 0;
+        const normalized = hasMessage ? message.trim() : '';
+        const showDetail = hasMessage && normalized !== '连接成功' && normalized !== '连接失败';
+        promptEnhanceStatus.style.display = showDetail ? 'block' : 'none';
+        if (showDetail) {
+          promptEnhanceStatus.className = 'prompt-enhance-status ' + (success ? 'success' : 'error');
+          promptEnhanceStatus.textContent = normalized;
+        } else {
+          promptEnhanceStatus.textContent = '';
+        }
       }
     }

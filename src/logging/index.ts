@@ -9,5 +9,5 @@ export {
   LogCategory,
   type LogConfig,
   type LogRecord,
-  type CLIMessageLog,
+  type AgentMessageLog,
 } from './unified-logger';

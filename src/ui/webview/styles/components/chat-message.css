@@ -1,0 +1,169 @@
+/**
+ * 消息组件样式 (Chat Message Components)
+ * 参考 Augment 的 c-chat-message 组件设计
+ */
+
+/* ========== 消息容器 ========== */
+.c-chat-message {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  width: 100%;
+  align-items: end;
+}
+
+.c-chat-message:not(.c-chat-message--augment) {
+  margin-block: var(--ds-spacing-1) var(--ds-spacing-3);
+}
+
+/* AI 消息 - 左对齐 */
+.c-chat-message--augment {
+  align-items: start;
+}
+
+.c-chat-message--augment .c-chat-message__content {
+  width: 100%;
+}
+
+.c-chat-message--augment .c-timestamp-display {
+  padding-left: 0;
+}
+
+/* ========== 消息内容区域 ========== */
+.c-chat-message__content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ds-spacing-2);
+  max-width: 100%;
+}
+
+.c-chat-message__content--editing {
+  width: 100%;
+}
+
+/* ========== 用户消息 ========== */
+.c-chat-message__user {
+  display: flex;
+  flex-direction: row;
+  gap: 0;
+  align-items: flex-start;
+  justify-content: flex-end;
+  width: 100%;
+  margin-top: var(--ds-spacing-1);
+}
+
+.c-chat-message__user-actions {
+  display: flex;
+  gap: var(--ds-spacing-1);
+  padding-right: var(--ds-spacing-1);
+  padding-top: var(--ds-spacing-1);
+}
+
+/* 用户消息气泡 */
+.c-chat-message__user-bubble {
+  background: var(--ds-color-primary);
+  color: var(--ds-color-primary-fg);
+  padding: var(--ds-spacing-2) var(--ds-spacing-3);
+  border-radius: var(--ds-radius-4) var(--ds-radius-4) var(--ds-radius-1) var(--ds-radius-4);
+  max-width: 85%;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+/* ========== AI 消息操作区 ========== */
+.c-aug-msg__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  opacity: 0;
+  transition: opacity var(--ds-transition-normal);
+}
+
+.c-aug-msg__actions.c-aug-msg__actions-visible,
+.c-chat-message:hover .c-aug-msg__actions {
+  opacity: 1;
+}
+
+/* ========== 消息底部区域 ========== */
+.c-aug-msg__footer {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.c-aug-msg__actions-row {
+  width: 100%;
+  display: flex;
+  justify-content: flex-start;
+}
+
+.c-aug-msg__suggestions,
+.c-aug-msg__feedback {
+  width: 100%;
+}
+
+.c-aug-msg__suggestions {
+  padding-block: var(--ds-spacing-1);
+}
+
+.c-aug-msg__feedback {
+  display: flex;
+  transition: opacity var(--ds-transition-normal);
+}
+
+/* ========== 时间戳显示 ========== */
+.c-timestamp-display {
+  white-space: nowrap;
+  padding-inline: var(--ds-spacing-2);
+  font-size: var(--ds-font-size-0);
+  color: var(--ds-color-neutral-a11);
+}
+
+/* ========== 消息操作按钮 ========== */
+.c-message-actions {
+  display: flex;
+  gap: var(--ds-spacing-1);
+  align-items: center;
+}
+
+.c-message-actions svg {
+  width: var(--ds-icon-size-2);
+  height: var(--ds-icon-size-2);
+}
+
+/* ========== 反馈面板 ========== */
+.c-feedback-panel {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  margin-bottom: var(--ds-spacing-4);
+  --icon-size: var(--ds-icon-size-0);
+}
+
+.c-feedback__buttons {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: var(--ds-spacing-1);
+  margin-left: auto;
+}
+
+.c-feedback__ratings {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--ds-spacing-3);
+}
+
+/* 正面反馈按钮 */
+.c-feedback__positive:not([disabled]):hover,
+.c-feedback__positive.c-feedback--selected {
+  color: var(--ds-color-success-9);
+}
+
+/* 负面反馈按钮 */
+.c-feedback__negative:not([disabled]):hover,
+.c-feedback__negative.c-feedback--selected {
+  color: var(--ds-color-error-9);
+}
+

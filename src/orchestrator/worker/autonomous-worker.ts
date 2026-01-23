@@ -272,7 +272,7 @@ export class AutonomousWorker extends EventEmitter {
         todo.content
       );
 
-      // 执行（通过 executeWithWorker 调用 CLI 适配器）
+      // 执行（通过 executeWithWorker 调用 LLM 适配器）
       const output = await this.executeWithWorker(
         todo,
         assignment,

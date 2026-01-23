@@ -10,20 +10,20 @@ console.log('=== 调试测试 ===\n');
 const config = logger.getConfig();
 console.log('配置:', {
   enabled: config.enabled,
-  cliLogMessages: config.cli.logMessages,
-  cliLogResponses: config.cli.logResponses,
-  cliCategory: config.categories[LogCategory.CLI],
+  agentLogMessages: config.agent.logMessages,
+  agentLogResponses: config.agent.logResponses,
+  agentCategory: config.categories[LogCategory.AGENT],
 });
 
 // 检查 shouldLog
 console.log('\nshouldLog 检查:');
-console.log('- DEBUG + CLI:', logger.isDebugEnabled(LogCategory.CLI));
-console.log('- INFO + CLI:', logger.isInfoEnabled(LogCategory.CLI));
+console.log('- DEBUG + AGENT:', logger.isDebugEnabled(LogCategory.AGENT));
+console.log('- INFO + AGENT:', logger.isInfoEnabled(LogCategory.AGENT));
 
-// 尝试记录 CLI 消息
-console.log('\n尝试记录 CLI 消息...');
-logger.logCLIMessage({
-  cli: 'claude',
+// 尝试记录 Agent 消息
+console.log('\n尝试记录 Agent 消息...');
+logger.logAgentMessage({
+  agent: 'claude',
   role: 'worker',
   requestId: 'req-test',
   message: 'Test message',

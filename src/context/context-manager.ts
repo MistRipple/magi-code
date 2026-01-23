@@ -20,6 +20,7 @@ import {
   MemoryContent
 } from './types';
 import { UnifiedSessionManager, SessionSummary } from '../session/unified-session-manager';
+import { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
 
 type MemorySummaryOptions = {
   includeCurrentTasks?: boolean;
@@ -46,6 +47,7 @@ export class ContextManager {
   private truncationUtils: TruncationUtils;
   private sessionManager: UnifiedSessionManager | null = null;
   private currentSessionId: string | null = null;
+  private projectKnowledgeBase: ProjectKnowledgeBase | null = null;
 
   constructor(
     private workspacePath: string,
@@ -69,6 +71,14 @@ export class ContextManager {
    */
   setCurrentSessionId(sessionId: string): void {
     this.currentSessionId = sessionId;
+  }
+
+  /**
+   * 设置 ProjectKnowledgeBase（用于获取项目知识）
+   */
+  setProjectKnowledgeBase(knowledgeBase: ProjectKnowledgeBase): void {
+    this.projectKnowledgeBase = knowledgeBase;
+    logger.info('上下文.项目知识库.已设置', undefined, LogCategory.SESSION);
   }
 
   /**
@@ -180,7 +190,23 @@ export class ContextManager {
     const parts: string[] = [];
     let currentTokens = 0;
 
-    // 0. 添加会话总结（如果有 SessionManager 和当前会话 ID）
+    // 0. 添加项目知识（如果有 ProjectKnowledgeBase）- 最高优先级
+    if (this.projectKnowledgeBase) {
+      const projectBudget = Math.floor(maxTokens * 0.1); // 最多占用 10% 的 token 预算
+      const projectContext = this.projectKnowledgeBase.getProjectContext(projectBudget);
+
+      if (projectContext) {
+        const projectTokens = this.estimateTokens(projectContext);
+        parts.push('## 项目知识\n' + projectContext);
+        currentTokens += projectTokens;
+        logger.info('上下文.项目知识.已注入', {
+          tokens: projectTokens,
+          budget: projectBudget
+        }, LogCategory.SESSION);
+      }
+    }
+
+    // 1. 添加会话总结（如果有 SessionManager 和当前会话 ID）
     if (this.sessionManager && this.currentSessionId) {
       const sessionSummary = this.sessionManager.getSessionSummary(this.currentSessionId);
       if (sessionSummary) {
@@ -209,7 +235,7 @@ export class ContextManager {
       }
     }
 
-    // 1. 添加会话 Memory 摘要（高优先级）
+    // 2. 添加会话 Memory 摘要（高优先级）
     if (includeMemory && this.sessionMemory) {
       const summary = this.buildMemorySummary(memorySummary);
       if (summary) {
@@ -228,7 +254,7 @@ export class ContextManager {
       }
     }
 
-    // 2. 添加即时上下文（最近对话）
+    // 3. 添加即时上下文（最近对话）
     if (includeRecent) {
       const remainingTokens = maxTokens - currentTokens;
       const recentMessages = this.getRecentMessages(remainingTokens);

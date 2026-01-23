@@ -252,7 +252,7 @@ async function runTests() {
     // 第三次尝试：成功
     await taskManager.startSubTask(task.id, subTask.id);
     await taskManager.completeSubTask(task.id, subTask.id, {
-      cliType: 'claude',
+      agentType: 'claude',
       success: true,
       duration: 1000,
       timestamp: new Date(),

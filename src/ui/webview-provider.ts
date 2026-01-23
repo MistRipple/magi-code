@@ -1,6 +1,6 @@
 /**
  * WebviewProvider - Webview 面板提供者
- * 负责：对话面板、任务视图、变更视图、CLI 输出
+ * 负责：对话面板、任务视图、变更视图、Agent 输出
  */
 
 import { logger, LogCategory } from '../logging';
@@ -41,6 +41,7 @@ import { normalizeOrchestratorMessage, isInternalStateMessage } from '../normali
 import { UnifiedMessageBus, type ProcessingState } from '../normalizer/unified-message-bus';
 import { ProfileStorage, StoredProfileConfig } from '../orchestrator/profile';
 import { parseContentToBlocks } from '../utils/content-parser';
+import { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
 // Mission-Driven Architecture 类型 - 直接从子模块导入
 import {
   MissionOrchestrator,
@@ -86,6 +87,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private missionOrchestrator?: MissionOrchestrator;
   private missionExecutor?: MissionExecutor;
 
+  // 项目知识库
+  private projectKnowledgeBase?: ProjectKnowledgeBase;
+
   // Hard Stop 确认机制
   private pendingConfirmation: {
     resolve: (confirmed: boolean) => void;
@@ -105,9 +109,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     resolve: (answer: string | null) => void;
     reject: (error: Error) => void;
   } | null = null;
+  // 工具授权回调
+  private toolAuthorizationCallback: ((allowed: boolean) => void) | null = null;
 
-  // 当前选择的 CLI（null 表示自动选择/智能编排）
-  private selectedCli: WorkerSlot | null = null;
+  // 当前选择的 Worker（null 表示自动选择/智能编排）
+  private selectedWorker: WorkerSlot | null = null;
 
 
   private activeSessionId: string | null = null;
@@ -157,7 +163,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const permissions = this.normalizePermissions(config.get<Partial<PermissionMatrix>>('permissions'));
     const strategy = this.normalizeStrategy(config.get<Partial<StrategyConfig>>('strategy'));
 
-    // 初始化 LLM 适配器工厂（替代 CLI 适配器工厂）
+    // 初始化 LLM 适配器工厂（替代 LLM 适配器工厂）
     this.adapterFactory = new LLMAdapterFactory({ cwd: workspaceRoot });
     // 异步初始化 profile loader
     void (this.adapterFactory as LLMAdapterFactory).initialize().catch(err => {
@@ -177,6 +183,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 设置 Hard Stop 确认回调
     this.setupOrchestratorConfirmation();
     this.setupOrchestratorQuestions();
+
+    // 初始化项目知识库
+    this.initializeProjectKnowledgeBase();
 
     // 绑定事件
     this.bindEvents();
@@ -242,7 +251,200 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     };
   }
 
-  /** 设置所有 CLI 适配器事件监听 */
+  /**
+   * 初始化项目知识库
+   */
+  private async initializeProjectKnowledgeBase(): Promise<void> {
+    try {
+      this.projectKnowledgeBase = new ProjectKnowledgeBase({
+        projectRoot: this.workspaceRoot
+      });
+      await this.projectKnowledgeBase.initialize();
+
+      // 设置压缩模型客户端（用于自动知识提取）
+      await this.setupKnowledgeExtractionClient();
+
+      // 注入知识库到编排器
+      this.intelligentOrchestrator.setKnowledgeBase(this.projectKnowledgeBase);
+
+      // 监听任务完成事件，自动提取知识
+      this.setupAutoKnowledgeExtraction();
+
+      const codeIndex = this.projectKnowledgeBase.getCodeIndex();
+      logger.info('项目知识库.已初始化', {
+        files: codeIndex ? codeIndex.files.length : 0
+      }, LogCategory.SESSION);
+    } catch (error: any) {
+      logger.error('项目知识库.初始化失败', { error: error.message }, LogCategory.SESSION);
+    }
+  }
+
+  /**
+   * 设置知识提取客户端（使用压缩模型）
+   */
+  private async setupKnowledgeExtractionClient(): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      const { UniversalLLMClient } = await import('../llm/clients/universal-client');
+
+      // 加载压缩模型配置
+      const compressorConfig = LLMConfigLoader.loadCompressorConfig();
+
+      if (!compressorConfig.enabled) {
+        logger.warn('项目知识库.压缩模型未启用', undefined, LogCategory.SESSION);
+        return;
+      }
+
+      // 创建压缩模型客户端
+      const client = new UniversalLLMClient({
+        baseUrl: compressorConfig.baseUrl,
+        apiKey: compressorConfig.apiKey,
+        model: compressorConfig.model,
+        provider: compressorConfig.provider,
+        enabled: true,
+      });
+
+      const knowledgeBase = this.projectKnowledgeBase;
+      if (!knowledgeBase) {
+        logger.warn('项目知识库.压缩模型客户端.未设置_知识库未初始化', undefined, LogCategory.SESSION);
+        return;
+      }
+
+      // 设置到知识库
+      knowledgeBase.setLLMClient(client);
+
+      logger.info('项目知识库.压缩模型客户端.已设置', {
+        model: compressorConfig.model,
+        provider: compressorConfig.provider
+      }, LogCategory.SESSION);
+    } catch (error: any) {
+      logger.error('项目知识库.压缩模型客户端.设置失败', { error: error.message }, LogCategory.SESSION);
+    }
+  }
+
+  /**
+   * 设置自动知识提取
+   * 监听任务完成事件，自动从会话中提取 ADR 和 FAQ
+   */
+  private setupAutoKnowledgeExtraction(): void {
+    // 任务完成计数器
+    let completedTaskCount = 0;
+    const EXTRACTION_THRESHOLD = 3; // 每完成 3 个任务提取一次
+
+    // 监听任务完成事件
+    globalEventBus.on('task:completed', async (event: any) => {
+      completedTaskCount++;
+
+      // 达到阈值时提取知识
+      if (completedTaskCount >= EXTRACTION_THRESHOLD) {
+        completedTaskCount = 0; // 重置计数器
+        await this.extractKnowledgeFromCurrentSession();
+      }
+    });
+
+    // 监听会话结束事件
+    globalEventBus.on('session:ended', async (event: any) => {
+      const sessionId = event.sessionId;
+      if (sessionId) {
+        await this.extractKnowledgeFromSession(sessionId);
+      }
+    });
+
+    logger.info('项目知识库.自动提取.已启用', {
+      threshold: EXTRACTION_THRESHOLD
+    }, LogCategory.SESSION);
+  }
+
+  /**
+   * 从当前会话提取知识
+   */
+  private async extractKnowledgeFromCurrentSession(): Promise<void> {
+    const session = this.sessionManager.getCurrentSession();
+    if (!session) {
+      return;
+    }
+
+    await this.extractKnowledgeFromSession(session.id);
+  }
+
+  /**
+   * 从指定会话提取知识
+   */
+  private async extractKnowledgeFromSession(sessionId: string): Promise<void> {
+    try {
+      const session = this.sessionManager.getSession(sessionId);
+      if (!session || session.messages.length < 5) {
+        // 消息太少，不值得提取
+        return;
+      }
+
+      logger.info('项目知识库.开始提取知识', {
+        sessionId,
+        messageCount: session.messages.length
+      }, LogCategory.SESSION);
+
+      // 转换消息格式
+      const messages = session.messages.map(m => ({
+        role: m.role,
+        content: m.content
+      }));
+
+      const knowledgeBase = this.projectKnowledgeBase;
+      if (!knowledgeBase) {
+        logger.warn('项目知识库.知识提取跳过_知识库未初始化', { sessionId }, LogCategory.SESSION);
+        return;
+      }
+
+      // 提取 ADR
+      const adrs = await knowledgeBase.extractADRFromSession(messages);
+      if (adrs.length > 0) {
+        logger.info('项目知识库.ADR提取成功', {
+          count: adrs.length,
+          titles: adrs.map(a => a.title)
+        }, LogCategory.SESSION);
+
+        // 通知前端
+        this.postMessage({
+          type: 'toast',
+          message: `自动提取了 ${adrs.length} 条架构决策记录`,
+          toastType: 'success'
+        });
+
+        // 刷新知识库显示
+        await this.handleGetProjectKnowledge();
+      }
+
+      // 提取 FAQ
+      const faqs = await knowledgeBase.extractFAQFromSession(messages);
+      if (faqs.length > 0) {
+        logger.info('项目知识库.FAQ提取成功', {
+          count: faqs.length,
+          questions: faqs.map(f => f.question)
+        }, LogCategory.SESSION);
+
+        // 通知前端
+        this.postMessage({
+          type: 'toast',
+          message: `自动提取了 ${faqs.length} 条常见问题`,
+          toastType: 'success'
+        });
+
+        // 刷新知识库显示
+        await this.handleGetProjectKnowledge();
+      }
+
+      if (adrs.length === 0 && faqs.length === 0) {
+        logger.info('项目知识库.未提取到新知识', { sessionId }, LogCategory.SESSION);
+      }
+    } catch (error: any) {
+      logger.error('项目知识库.知识提取失败', {
+        sessionId,
+        error: error.message
+      }, LogCategory.SESSION);
+    }
+  }
+
+  /** 设置所有 LLM 适配器事件监听 */
   private setupAdapterEvents(): void {
     // 🔧 重构：所有消息通过 UnifiedMessageBus 发送
     // Adapter Factory 的事件直接接入 MessageBus
@@ -459,6 +661,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** 处理工具授权响应 */
+  private handleToolAuthorizationResponse(allowed: boolean): void {
+    if (this.toolAuthorizationCallback) {
+      this.toolAuthorizationCallback(allowed);
+      this.toolAuthorizationCallback = null;
+    }
+  }
+
   /** 绑定全局事件 */
   private bindEvents(): void {
     // 任务相关事件
@@ -525,7 +735,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       } as any);
     });
     globalEventBus.on('subtask:started', (event) => {
-      const data = event.data as { cli?: string; description?: string; targetFiles?: string[]; reason?: string; dispatchId?: string };
+      const data = event.data as { agent?: string; description?: string; targetFiles?: string[]; reason?: string; dispatchId?: string };
       if (data?.description) {
         // 发送到主对话窗口（使用标准消息）
         this.sendOrchestratorMessage({
@@ -535,17 +745,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           metadata: {
             subTaskId: event.subTaskId || '',
             status: 'started',
-            cli: data.cli || 'system',
+            agent: data.agent || 'system',
             description: data.description,
             dispatchId: data.dispatchId,
           },
         });
 
-        // 发送任务卡片到对应的 CLI 面板
-        if (data.cli) {
+        // 发送任务卡片到对应的 Agent 面板
+        if (data.agent) {
           this.postMessage({
             type: 'workerTaskCard',
-            worker: data.cli as WorkerSlot,
+            worker: data.agent as WorkerSlot,
             taskId: event.taskId || '',
             subTaskId: event.subTaskId || '',
             description: data.description,
@@ -560,10 +770,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.sendStateUpdate();
     });
     globalEventBus.on('subtask:completed', (event) => {
-      const data = event.data as { success?: boolean; cli?: string; cliType?: string; description?: string; modifiedFiles?: string[]; duration?: number };
+      const data = event.data as { success?: boolean; agent?: string; description?: string; modifiedFiles?: string[]; duration?: number };
       const summaryCard = this.buildSubTaskSummaryCard({
         description: data?.description,
-        cli: data?.cli || data?.cliType,
+        agent: data?.agent,
         duration: data?.duration,
         modifiedFiles: data?.modifiedFiles,
         subTaskId: event.subTaskId,
@@ -576,7 +786,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           subTaskId: event.subTaskId || '',
           status: 'completed',
           success: data?.success ?? true,
-          cli: data?.cli || data?.cliType || '',
+          agent: data?.agent || '',
           description: data?.description,
           subTaskCard: summaryCard,
         },
@@ -587,7 +797,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.sendExecutionStats();
     });
     globalEventBus.on('subtask:failed', (event) => {
-      const data = event.data as { error?: string | object; cli?: string; cliType?: string; description?: string; modifiedFiles?: string[]; duration?: number };
+      const data = event.data as { error?: string | object; agent?: string; description?: string; modifiedFiles?: string[]; duration?: number };
 
       let errorMsg = '未知错误';
       if (data?.error) {
@@ -601,7 +811,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
       const summaryCard = this.buildSubTaskSummaryCard({
         description: data?.description,
-        cli: data?.cli || data?.cliType,
+        agent: data?.agent,
         duration: data?.duration,
         modifiedFiles: data?.modifiedFiles,
         subTaskId: event.subTaskId,
@@ -614,7 +824,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         metadata: {
           subTaskId: event.subTaskId || '',
           status: 'failed',
-          cli: data?.cli || data?.cliType || '',
+          agent: data?.agent || '',
           error: errorMsg,
           description: data?.description,
           subTaskCard: summaryCard,
@@ -628,7 +838,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const data = event.data as any;
       if (!data?.content) return;
 
-      // 🔍 检查点 1：记录原始 CLI 数据
+      // 🔍 检查点 1：记录原始 Worker 数据
       console.log('[DEBUG-LAYER-1] 原始 Orchestrator 消息:', {
         type: data.type,
         contentLength: data.content.length,
@@ -694,7 +904,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     globalEventBus.on('snapshot:created', () => this.sendStateUpdate());
     globalEventBus.on('snapshot:reverted', () => this.sendStateUpdate());
 
-    // CLI 状态相关事件
+    // Worker 状态相关事件
     globalEventBus.on('worker:statusChanged', (event) => {
       const data = event.data as { worker: string; available: boolean; model?: string };
       this.sendStateUpdate();
@@ -736,7 +946,26 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         source: data?.worker ?? 'system',
         timestamp: Date.now(),
       });
-      // session_event 仅写入日志，不推送到 CLI 面板，避免干扰用户对话
+      // session_event 仅写入日志，不推送到 Worker 面板，避免干扰用户对话
+    });
+
+    // 工具授权请求事件
+    globalEventBus.on('tool:authorization_request', (event) => {
+      const data = event.data as {
+        toolName: string;
+        toolArgs: any;
+        callback: (allowed: boolean) => void;
+      };
+
+      // 发送授权请求到前端
+      this.postMessage({
+        type: 'toolAuthorizationRequest',
+        toolName: data.toolName,
+        toolArgs: data.toolArgs,
+      });
+
+      // 存储回调以便后续响应
+      this.toolAuthorizationCallback = data.callback;
     });
 
     // ============= Mission-Driven 架构事件 =============
@@ -1067,7 +1296,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       try {
         await this.adapterFactory.shutdown();
       } catch (cleanupError) {
-        logger.error('界面.任务.中断.CLI.清理_失败', cleanupError, LogCategory.UI);
+        logger.error('界面.任务.中断.Worker.清理_失败', cleanupError, LogCategory.UI);
       }
     }
 
@@ -1101,7 +1330,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   // 流式消息 ID 管理
-  private streamMessageIds: Map<string, string> = new Map(); // key: `${source}-${cli}-${target}`, value: messageId
+  private streamMessageIds: Map<string, string> = new Map(); // key: `${source}-${worker}-${target}`, value: messageId
 
   /**
    * 发送编排器标准消息（非流式）
@@ -1175,14 +1404,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.context.subscriptions
     );
 
-    // 启动时检测所有 CLI 的可用性
-    this.checkCliAvailability();
+    // 启动时检测所有 Agent 的可用性
+    this.checkWorkerAvailability();
   }
 
-  /** 检测所有 CLI 的可用性并更新状态 */
-  private async checkCliAvailability(): Promise<void> {
+  /** 检测所有 Agent 的可用性并更新状态 */
+  private async checkWorkerAvailability(): Promise<void> {
     try {
-      // TODO: LLM mode - check adapter connectivity instead of CLI availability
+      // TODO: LLM mode - check adapter connectivity instead of worker availability
       const availability = {
         claude: this.adapterFactory.isConnected('claude'),
         codex: this.adapterFactory.isConnected('codex'),
@@ -1203,7 +1432,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         });
       }
     } catch (error) {
-      logger.error('界面.CLI.可用性_失败', error, LogCategory.UI);
+      logger.error('界面.Worker.可用性_失败', error, LogCategory.UI);
     }
   }
 
@@ -1229,9 +1458,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'executeTask':
-        logger.info('界面.任务.执行.请求', { promptLength: String((message as any).prompt || '').length, imageCount: (message as any).images?.length || 0 }, LogCategory.UI);
-        const images = (message as any).images || [];
-        await this.executeTask((message as any).prompt, undefined, images);
+        logger.info('界面.任务.执行.请求', { promptLength: String((message as any).prompt || '').length, imageCount: (message as any).images?.length || 0, agent: (message as any).agent || 'orchestrator' }, LogCategory.UI);
+        const execImages = (message as any).images || [];
+        const execAgent = (message as any).agent as WorkerSlot | undefined;
+        await this.executeTask((message as any).prompt, execAgent || undefined, execImages);
         break;
 
       case 'interruptTask':
@@ -1326,7 +1556,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         if (switchedSession) {
 
           this.activeSessionId = message.sessionId;
-          // 恢复 CLI sessionIds
+          // 恢复 Worker sessionIds
           this.postMessage({ type: 'sessionSwitched', sessionId: message.sessionId });
         }
         this.sendStateUpdate();
@@ -1357,8 +1587,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       case 'selectWorker':
         // 用户手动选择 Worker（null 表示自动选择）
-        this.selectedCli = (message as any).worker || null;
-        logger.info('界面.Worker.选择.变更', { worker: this.selectedCli || 'auto' }, LogCategory.UI);
+        this.selectedWorker = (message as any).worker || null;
+        logger.info('界面.Worker.选择.变更', { worker: this.selectedWorker || 'auto' }, LogCategory.UI);
         break;
 
       case 'confirmPlan':
@@ -1381,6 +1611,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'answerWorkerQuestion':
         // 用户回答 Worker 问题
         this.handleWorkerQuestionAnswer((message as any).answer ?? null);
+        break;
+
+      case 'toolAuthorizationResponse':
+        // 用户响应工具授权请求
+        this.handleToolAuthorizationResponse((message as any).allowed ?? false);
         break;
 
       case 'updateSetting':
@@ -1410,6 +1645,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
         this.sendWorkerStatus();
         break;
+
 
       case 'getProfileConfig':
         this.sendProfileConfig();
@@ -1566,6 +1802,59 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       case 'loadSkillLibrary':
         await this.handleLoadSkillLibrary();
+        break;
+
+      // 项目知识相关
+      case 'getProjectKnowledge':
+        await this.handleGetProjectKnowledge();
+        break;
+
+      case 'getADRs':
+        await this.handleGetADRs(message.filter);
+        break;
+
+      case 'getFAQs':
+        await this.handleGetFAQs(message.filter);
+        break;
+
+      case 'searchFAQs':
+        await this.handleSearchFAQs(message.keyword);
+        break;
+
+      case 'deleteADR':
+        await this.handleDeleteADR(message.id);
+        break;
+
+      case 'deleteFAQ':
+        await this.handleDeleteFAQ(message.id);
+        break;
+
+      case 'openFile':
+        await this.handleOpenFile(message.filepath);
+        break;
+
+      case 'addADR':
+        await this.handleAddADR(message.adr);
+        break;
+
+      case 'updateADR':
+        await this.handleUpdateADR(message.id, message.updates);
+        break;
+
+      case 'deleteADR':
+        await this.handleDeleteADR(message.id);
+        break;
+
+      case 'addFAQ':
+        await this.handleAddFAQ(message.faq);
+        break;
+
+      case 'updateFAQ':
+        await this.handleUpdateFAQ(message.id, message.updates);
+        break;
+
+      case 'deleteFAQ':
+        await this.handleDeleteFAQ(message.id);
         break;
     }
   }
@@ -3018,6 +3307,370 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /**
+   * 获取项目知识（代码索引、ADR、FAQ）
+   */
+  private async handleGetProjectKnowledge(): Promise<void> {
+    try {
+      const kb = this.projectKnowledgeBase;
+      if (!kb) {
+        this.postMessage({
+          type: 'toast',
+          message: '项目知识库未初始化',
+          toastType: 'warning'
+        });
+        return;
+      }
+
+      const codeIndex = kb.getCodeIndex();
+      const adrs = kb.getADRs();
+      const faqs = kb.getFAQs();
+
+      this.postMessage({
+        type: 'projectKnowledgeLoaded',
+        codeIndex,
+        adrs,
+        faqs
+      });
+
+      logger.info('项目知识.已加载', {
+        files: codeIndex ? codeIndex.files.length : 0,
+        adrs: adrs.length,
+        faqs: faqs.length
+      }, LogCategory.SESSION);
+    } catch (error: any) {
+      logger.error('项目知识.加载失败', { error: error.message }, LogCategory.SESSION);
+      this.postMessage({
+        type: 'toast',
+        message: '加载项目知识失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 获取 ADR 列表
+   */
+  private async handleGetADRs(filter?: { status?: string }): Promise<void> {
+    try {
+      const kb = this.projectKnowledgeBase;
+      if (!kb) {
+        this.postMessage({ type: 'adrsLoaded', adrs: [] });
+        return;
+      }
+
+      const adrs = kb.getADRs(filter as any);
+      this.postMessage({ type: 'adrsLoaded', adrs });
+      logger.info('ADR.已加载', { count: adrs.length, filter }, LogCategory.SESSION);
+    } catch (error: any) {
+      logger.error('ADR.加载失败', { error: error.message }, LogCategory.SESSION);
+      this.postMessage({ type: 'adrsLoaded', adrs: [] });
+    }
+  }
+
+  /**
+   * 获取 FAQ 列表
+   */
+  private async handleGetFAQs(filter?: { category?: string }): Promise<void> {
+    try {
+      const kb = this.projectKnowledgeBase;
+      if (!kb) {
+        this.postMessage({ type: 'faqsLoaded', faqs: [] });
+        return;
+      }
+
+      const faqs = kb.getFAQs(filter);
+      this.postMessage({ type: 'faqsLoaded', faqs });
+      logger.info('FAQ.已加载', { count: faqs.length, filter }, LogCategory.SESSION);
+    } catch (error: any) {
+      logger.error('FAQ.加载失败', { error: error.message }, LogCategory.SESSION);
+      this.postMessage({ type: 'faqsLoaded', faqs: [] });
+    }
+  }
+
+  /**
+   * 搜索 FAQ
+   */
+  private async handleSearchFAQs(keyword: string): Promise<void> {
+    try {
+      const kb = this.projectKnowledgeBase;
+      if (!kb) {
+        this.postMessage({ type: 'faqSearchResults', results: [] });
+        return;
+      }
+
+      const results = kb.searchFAQs(keyword);
+      this.postMessage({ type: 'faqSearchResults', results });
+      logger.info('FAQ.搜索完成', { keyword, count: results.length }, LogCategory.SESSION);
+    } catch (error: any) {
+      logger.error('FAQ.搜索失败', { error: error.message }, LogCategory.SESSION);
+      this.postMessage({ type: 'faqSearchResults', results: [] });
+    }
+  }
+
+  /**
+   * 删除 ADR
+   */
+  private async handleDeleteADR(id: string): Promise<void> {
+    try {
+      const kb = this.projectKnowledgeBase;
+      if (!kb) {
+        this.postMessage({
+          type: 'toast',
+          message: '项目知识库未初始化',
+          toastType: 'warning'
+        });
+        return;
+      }
+
+      const success = kb.deleteADR(id);
+      if (success) {
+        this.postMessage({ type: 'adrDeleted', id });
+        logger.info('ADR.删除成功', { id }, LogCategory.SESSION);
+      } else {
+        this.postMessage({
+          type: 'toast',
+          message: 'ADR 删除失败',
+          toastType: 'error'
+        });
+      }
+    } catch (error: any) {
+      logger.error('ADR.删除失败', { error: error.message }, LogCategory.SESSION);
+      this.postMessage({
+        type: 'toast',
+        message: `删除失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 删除 FAQ
+   */
+  private async handleDeleteFAQ(id: string): Promise<void> {
+    try {
+      const kb = this.projectKnowledgeBase;
+      if (!kb) {
+        this.postMessage({
+          type: 'toast',
+          message: '项目知识库未初始化',
+          toastType: 'warning'
+        });
+        return;
+      }
+
+      const success = kb.deleteFAQ(id);
+      if (success) {
+        this.postMessage({ type: 'faqDeleted', id });
+        logger.info('FAQ.删除成功', { id }, LogCategory.SESSION);
+      } else {
+        this.postMessage({
+          type: 'toast',
+          message: 'FAQ 删除失败',
+          toastType: 'error'
+        });
+      }
+    } catch (error: any) {
+      logger.error('FAQ.删除失败', { error: error.message }, LogCategory.SESSION);
+      this.postMessage({
+        type: 'toast',
+        message: `删除失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 在编辑器中打开文件
+   */
+  private async handleOpenFile(filePath: string): Promise<void> {
+    try {
+      const kb = this.projectKnowledgeBase;
+      if (!kb) {
+        this.postMessage({
+          type: 'toast',
+          message: '项目知识库未初始化',
+          toastType: 'warning'
+        });
+        return;
+      }
+
+      // 构建完整路径
+      const fullPath = path.join(kb['projectRoot'], filePath);
+
+      // 检查文件是否存在
+      if (!fs.existsSync(fullPath)) {
+        this.postMessage({
+          type: 'toast',
+          message: '文件不存在',
+          toastType: 'error'
+        });
+        return;
+      }
+
+      // 在编辑器中打开文件
+      const document = await vscode.workspace.openTextDocument(fullPath);
+      await vscode.window.showTextDocument(document);
+
+      logger.info('文件.已打开', { path: filePath }, LogCategory.SESSION);
+    } catch (error: any) {
+      logger.error('文件.打开失败', { error: error.message }, LogCategory.SESSION);
+      this.postMessage({
+        type: 'toast',
+        message: `打开文件失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 添加 ADR
+   */
+  private async handleAddADR(adr: any): Promise<void> {
+    try {
+      const kb = this.projectKnowledgeBase;
+      if (!kb) {
+        this.postMessage({
+          type: 'toast',
+          message: '项目知识库未初始化',
+          toastType: 'warning'
+        });
+        return;
+      }
+
+      kb.addADR(adr);
+      this.postMessage({ type: 'adrAdded', adr });
+      this.postMessage({
+        type: 'toast',
+        message: 'ADR 已添加',
+        toastType: 'success'
+      });
+      logger.info('ADR.已添加', { id: adr.id, title: adr.title }, LogCategory.SESSION);
+    } catch (error: any) {
+      logger.error('ADR.添加失败', { error: error.message }, LogCategory.SESSION);
+      this.postMessage({
+        type: 'toast',
+        message: '添加 ADR 失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 更新 ADR
+   */
+  private async handleUpdateADR(id: string, updates: any): Promise<void> {
+    try {
+      const kb = this.projectKnowledgeBase;
+      if (!kb) {
+        this.postMessage({
+          type: 'toast',
+          message: '项目知识库未初始化',
+          toastType: 'warning'
+        });
+        return;
+      }
+
+      const success = kb.updateADR(id, updates);
+      if (success) {
+        this.postMessage({ type: 'adrUpdated', id });
+        this.postMessage({
+          type: 'toast',
+          message: 'ADR 已更新',
+          toastType: 'success'
+        });
+        logger.info('ADR.已更新', { id }, LogCategory.SESSION);
+      } else {
+        this.postMessage({
+          type: 'toast',
+          message: 'ADR 不存在',
+          toastType: 'warning'
+        });
+      }
+    } catch (error: any) {
+      logger.error('ADR.更新失败', { error: error.message }, LogCategory.SESSION);
+      this.postMessage({
+        type: 'toast',
+        message: '更新 ADR 失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 添加 FAQ
+   */
+  private async handleAddFAQ(faq: any): Promise<void> {
+    try {
+      const kb = this.projectKnowledgeBase;
+      if (!kb) {
+        this.postMessage({
+          type: 'toast',
+          message: '项目知识库未初始化',
+          toastType: 'warning'
+        });
+        return;
+      }
+
+      kb.addFAQ(faq);
+      this.postMessage({ type: 'faqAdded', faq });
+      this.postMessage({
+        type: 'toast',
+        message: 'FAQ 已添加',
+        toastType: 'success'
+      });
+      logger.info('FAQ.已添加', { id: faq.id, question: faq.question }, LogCategory.SESSION);
+    } catch (error: any) {
+      logger.error('FAQ.添加失败', { error: error.message }, LogCategory.SESSION);
+      this.postMessage({
+        type: 'toast',
+        message: '添加 FAQ 失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 更新 FAQ
+   */
+  private async handleUpdateFAQ(id: string, updates: any): Promise<void> {
+    try {
+      const kb = this.projectKnowledgeBase;
+      if (!kb) {
+        this.postMessage({
+          type: 'toast',
+          message: '项目知识库未初始化',
+          toastType: 'warning'
+        });
+        return;
+      }
+
+      const success = kb.updateFAQ(id, updates);
+      if (success) {
+        this.postMessage({ type: 'faqUpdated', id });
+        this.postMessage({
+          type: 'toast',
+          message: 'FAQ 已更新',
+          toastType: 'success'
+        });
+        logger.info('FAQ.已更新', { id }, LogCategory.SESSION);
+      } else {
+        this.postMessage({
+          type: 'toast',
+          message: 'FAQ 不存在',
+          toastType: 'warning'
+        });
+      }
+    } catch (error: any) {
+      logger.error('FAQ.更新失败', { error: error.message }, LogCategory.SESSION);
+      this.postMessage({
+        type: 'toast',
+        message: '更新 FAQ 失败: ' + error.message,
+        toastType: 'error'
+      });
+    }
+  }
+
   /** 发送适配器连接状态到前端 */
   private async sendWorkerStatus(): Promise<void> {
     try {
@@ -3368,7 +4021,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private getModeDisplayName(mode: import('../types').InteractionMode): string {
     switch (mode) {
       case 'ask': return '对话';
-      case 'agent': return '代理';
       case 'auto': return '自动';
       default: return mode;
     }
@@ -3580,7 +4232,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    // 目前的实现：将补充内容作为新消息发送到当前 CLI
+    // 目前的实现：将补充内容作为新消息发送到当前 Worker
     // 未来可以扩展为真正的追加到当前执行上下文
     try {
       // 添加用户消息到对话
@@ -3590,8 +4242,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         toastType: 'info'
       });
 
-      // 发送到当前活跃的 CLI
-      // 注意：这是一个简化实现，真正的追加需要 CLI 支持
+      // 发送到当前活跃的 Worker
+      // 注意：这是一个简化实现，真正的追加需要 Worker 支持
       logger.info('界面.消息.补充.降级', { reason: 'simplified_implementation' }, LogCategory.UI);
     } catch (error) {
       logger.error('界面.消息.补充.失败', error, LogCategory.UI);
@@ -3615,8 +4267,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /** 执行任务 */
-  private async executeTask(prompt: string, forceCli?: WorkerSlot, images?: Array<{dataUrl: string}>): Promise<void> {
-    logger.info('界面.任务.执行.开始', { promptLength: prompt.length, imageCount: images?.length || 0, forceCli: forceCli || undefined }, LogCategory.UI);
+  private async executeTask(prompt: string, forceWorker?: WorkerSlot, images?: Array<{dataUrl: string}>): Promise<void> {
+    logger.info('界面.任务.执行.开始', { promptLength: prompt.length, imageCount: images?.length || 0, forceWorker: forceWorker || undefined }, LogCategory.UI);
 
 
     if (!this.activeSessionId) {
@@ -3647,7 +4299,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
 
     // 判断执行模式：智能编排 vs 直接执行
-    const useIntelligentMode = !forceCli && !this.selectedCli;
+    const useIntelligentMode = !forceWorker && !this.selectedWorker;
 
 
     this.sessionManager.addMessage('user', prompt);
@@ -3664,11 +4316,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
 
     if (useIntelligentMode) {
-      // 智能编排模式：Claude 分析 → 分配 CLI → 执行 → 总结
+      // 智能编排模式：Claude 分析 → 分配 Worker → 执行 → 总结
       await this.executeWithIntelligentOrchestrator(prompt, imagePaths);
     } else {
-      // 直接执行模式：指定 CLI 直接执行
-      await this.executeWithDirectCli(prompt, forceCli || this.selectedCli!, imagePaths);
+      // 直接执行模式：指定 Worker 直接执行
+      await this.executeWithDirectWorker(prompt, forceWorker || this.selectedWorker!, imagePaths);
     }
   }
 
@@ -3752,7 +4404,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   private buildSubTaskChangeList(subTaskId: string, modifiedFiles?: string[]): string[] {
     if (subTaskId) {
-      const changes = this.snapshotManager.getPendingChanges().filter(c => c.subTaskId === subTaskId);
+      const changes = this.snapshotManager.getPendingChanges().filter(c => c.todoId === subTaskId);
       if (changes.length > 0) {
         return changes.map(change => `${change.filePath} (+${change.additions}, -${change.deletions})`);
       }
@@ -3771,10 +4423,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     ];
   }
 
-  private buildSubTaskSummaryCard(data: { description?: string; cli?: string; duration?: number; modifiedFiles?: string[]; subTaskId?: string; error?: string }, status: 'completed' | 'failed') {
+  private buildSubTaskSummaryCard(data: { description?: string; agent?: string; duration?: number; modifiedFiles?: string[]; subTaskId?: string; error?: string }, status: 'completed' | 'failed') {
     const title = status === 'completed' ? '子任务完成' : '子任务失败';
     const description = data.description || data.subTaskId || '未知子任务';
-    const executor = data.cli || 'unknown';
+    const executor = data.agent || 'unknown';
     const duration = this.formatDuration(data.duration);
     const changes = this.buildSubTaskChangeList(data.subTaskId || '', data.modifiedFiles);
     const verification = this.buildVerificationReminderList();
@@ -3820,9 +4472,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.sendStateUpdate();
   }
 
-  /** 直接 CLI 执行模式 */
-  private async executeWithDirectCli(prompt: string, targetCli: WorkerSlot, imagePaths: string[]): Promise<void> {
-    logger.info('界面.执行.模式.直接', { cli: targetCli }, LogCategory.UI);
+  /** 直接 Worker 执行模式 */
+  private async executeWithDirectWorker(prompt: string, targetWorker: WorkerSlot, imagePaths: string[]): Promise<void> {
+    logger.info('界面.执行.模式.直接', { agent: targetWorker }, LogCategory.UI);
 
     const startTime = Date.now();
     const taskManager = await this.getTaskManager();
@@ -3831,13 +4483,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.sendStateUpdate();
 
     try {
-      logger.info('界面.执行.直接.请求', { worker: targetCli }, LogCategory.UI);
-      const response = await this.adapterFactory.sendMessage(targetCli, prompt, imagePaths);
-      logger.info('界面.执行.直接.响应', { worker: targetCli, preview: response.content?.substring(0, 100) }, LogCategory.UI);
+      logger.info('界面.执行.直接.请求', { worker: targetWorker }, LogCategory.UI);
+      const response = await this.adapterFactory.sendMessage(targetWorker, prompt, imagePaths);
+      logger.info('界面.执行.直接.响应', { worker: targetWorker, preview: response.content?.substring(0, 100) }, LogCategory.UI);
       const executionStats = this.intelligentOrchestrator.getExecutionStats();
       if (executionStats) {
         executionStats.recordExecution({
-          worker: targetCli,
+          worker: targetWorker,
           taskId: task.id,
           subTaskId: `direct-${task.id}`,
           success: !response.error,
@@ -3850,10 +4502,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       if (response.error) {
         await taskManager.failTask(task.id, response.error);
-        this.postMessage({ type: 'workerError', worker: targetCli, error: response.error });
+        this.postMessage({ type: 'workerError', worker: targetWorker, error: response.error });
       } else {
         await taskManager.completeTask(task.id);
-        this.saveMessageToSession(prompt, response.content || '', targetCli, 'worker');
+        this.saveMessageToSession(prompt, response.content || '', targetWorker, 'worker');
       }
 
     } catch (error) {
@@ -3863,7 +4515,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const executionStats = this.intelligentOrchestrator.getExecutionStats();
       if (executionStats) {
         executionStats.recordExecution({
-          worker: targetCli,
+          worker: targetWorker,
           taskId: task.id,
           subTaskId: `direct-${task.id}`,
           success: false,
@@ -3871,7 +4523,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           error: errorMsg,
         });
       }
-      this.postMessage({ type: 'workerError', worker: targetCli, error: errorMsg });
+      this.postMessage({ type: 'workerError', worker: targetWorker, error: errorMsg });
     }
 
     this.sendStateUpdate();
@@ -3965,7 +4617,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private saveMessageToSession(
     userPrompt: string,
     assistantResponse: string,
-    cli?: WorkerSlot,
+    agent?: WorkerSlot,
     source?: MessageSource
   ): void {
     const session = this.sessionManager.getCurrentSession();
@@ -3973,7 +4625,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
     if (assistantResponse) {
-      this.sessionManager.addMessage('assistant', assistantResponse, cli, source);
+      this.sessionManager.addMessage('assistant', assistantResponse, agent, source);
     }
     this.sendStateUpdate();
   }
@@ -3987,11 +4639,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
 
     // 转换前端消息格式为后端格式
+    const normalizeRole = (role: any): 'user' | 'assistant' | 'system' => {
+      if (role === 'user') return 'user';
+      if (role === 'assistant' || role === 'system') return role;
+      return 'assistant';
+    };
+
     const sessionMessages = messages.map(m => ({
       id: m.id || `msg-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-      role: m.role as 'user' | 'assistant',
+      role: normalizeRole(m.role),
       content: m.content,
-      cli: m.cli,
+      agent: m.agent,
       timestamp: typeof m.timestamp === 'number' ? m.timestamp : Date.now(),
       images: m.images,
       source: m.source,
@@ -4081,20 +4739,40 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview'))
     );
 
-    // 替换 CSS 文件路径（6 个模块化 CSS 文件）
+    const cacheBuster = Date.now().toString();
+
+    // 替换 CSS 文件路径（设计系统 + 组件 + 模块化 CSS 文件）
+    // 1. 设计系统 CSS
+    const designSystemUri = webview.asWebviewUri(
+      vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'styles', 'design-system.css'))
+    );
+    html = html.replace('href="styles/design-system.css"', `href="${designSystemUri}?v=${cacheBuster}"`);
+
+    // 2. Augment 风格组件 CSS 文件
+    const componentCssFiles = ['tool-use.css', 'codeblock.css', 'thinking.css', 'chat-message.css'];
+    componentCssFiles.forEach(cssFile => {
+      const cssUri = webview.asWebviewUri(
+        vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'styles', 'components', cssFile))
+      );
+      html = html.replace(`href="styles/components/${cssFile}"`, `href="${cssUri}?v=${cacheBuster}"`);
+    });
+
+    // 3. 原有的模块化 CSS 文件
     const cssFiles = ['base.css', 'layout.css', 'components.css', 'messages.css', 'settings.css', 'modals.css'];
     cssFiles.forEach(cssFile => {
       const cssUri = webview.asWebviewUri(
         vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'styles', cssFile))
       );
-      html = html.replace(`href="styles/${cssFile}"`, `href="${cssUri}"`);
+      html = html.replace(`href="styles/${cssFile}"`, `href="${cssUri}?v=${cacheBuster}"`);
     });
 
     // 替换 JavaScript 主入口路径
     const mainJsUri = webview.asWebviewUri(
       vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'js', 'main.js'))
     );
-    html = html.replace('src="js/main.js"', `src="${mainJsUri}"`);
+    const mainJsUriWithVersion = `${mainJsUri.toString()}?v=${cacheBuster}`;
+    html = html.replace('src="js/main.js"', `src="${mainJsUriWithVersion}"`);
+    html = html.replace(/\{\{mainJsUri\}\}/g, mainJsUriWithVersion);
 
     // 创建 import map 来处理 ES6 模块的相对导入
     const jsModules = [
@@ -4111,7 +4789,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const moduleUri = webview.asWebviewUri(
         vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'js', modulePath))
       );
-      imports[`./${modulePath}`] = moduleUri.toString();
+      imports[`./${modulePath}`] = `${moduleUri.toString()}?v=${cacheBuster}`;
     });
 
     const importMap = `<script type="importmap">

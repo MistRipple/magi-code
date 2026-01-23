@@ -3,7 +3,7 @@
  *
  * 设计理念：
  * - 引导而非限制：通过 Prompt 注入引导 Worker 行为，不限制工具权限
- * - CLI 进程复用：利用成熟 CLI 的完整能力
+ * - LLM 客户端复用：利用成熟模型的完整能力
  * - 执行统计驱动：基于历史数据动态调整 Worker 选择
  */
 
@@ -180,4 +180,3 @@ export interface WorkerSelectionResult {
   /** 选择原因 */
   reason: string;
 }
-

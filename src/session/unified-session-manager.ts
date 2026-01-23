@@ -21,7 +21,7 @@ import { globalEventBus } from '../events';
 /** 会话消息 */
 export interface SessionMessage {
   id: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   content: string;
   agent?: AgentType;
   source?: 'orchestrator' | 'worker' | 'system';
@@ -33,10 +33,16 @@ export interface SessionMessage {
 export interface FileSnapshotMeta {
   id: string;
   filePath: string;
-  lastModifiedBy: AgentType;
-  lastModifiedAt: number;
-  subTaskId: string;
-  priority: number;  // SubTask 优先级 (1-10, 1 最高)
+  timestamp: number;
+
+  // Mission 架构字段
+  missionId: string;
+  assignmentId: string;
+  todoId: string;
+  workerId: string;  // Worker 标识（claude/codex/gemini）
+
+  agentType?: AgentType;
+  reason?: string;
 }
 
 /** 任务状态 */
@@ -603,13 +609,41 @@ export class UnifiedSessionManager {
 
     // 消息数据验证
     for (const msg of session.messages) {
-      if (!msg.id || !msg.role || !['user', 'assistant'].includes(msg.role)) {
+      if (!msg.id || !msg.role || !['user', 'assistant', 'system'].includes(msg.role)) {
         logger.error('会话.验证.消息_非法', { message: msg }, LogCategory.SESSION);
         return false;
       }
     }
 
     return true;
+  }
+
+  /** 规范化会话数据（修复旧格式/非法字段） */
+  private normalizeSessionData(session: UnifiedSession): UnifiedSession {
+    if (!session || typeof session !== 'object') return session;
+    if (!Array.isArray(session.messages)) return session;
+
+    const now = Date.now();
+    session.messages = session.messages.map((msg: any) => {
+      const role = msg?.role;
+      const normalizedRole = role === 'user'
+        ? 'user'
+        : role === 'assistant' || role === 'system'
+          ? role
+          : 'assistant';
+
+      return {
+        ...msg,
+        id: msg?.id || `msg-${now}-${Math.random().toString(36).substring(2, 6)}`,
+        role: normalizedRole,
+        content: typeof msg?.content === 'string'
+          ? msg.content
+          : (msg?.content ? JSON.stringify(msg.content) : ''),
+        timestamp: typeof msg?.timestamp === 'number' ? msg.timestamp : now,
+      } as SessionMessage;
+    });
+
+    return session;
   }
 
   /** 备份损坏的会话文件 */
@@ -708,7 +742,10 @@ export class UnifiedSessionManager {
     if (fs.existsSync(filePath)) {
       try {
         const data = fs.readFileSync(filePath, 'utf-8');
-        const session = JSON.parse(data) as UnifiedSession;
+        let session = JSON.parse(data) as UnifiedSession;
+
+        // 兼容旧数据：规范化消息结构
+        session = this.normalizeSessionData(session);
 
         // 数据完整性验证
         if (!this.validateSessionData(session)) {
@@ -794,7 +831,7 @@ export class UnifiedSessionManager {
 
     // 提取代码变更摘要
     const codeChanges = session.snapshots
-      .map(s => `${s.filePath} (${s.lastModifiedBy})`)
+      .map(s => `${s.filePath} (${s.workerId})`)
       .slice(0, 20); // 最多 20 个文件
 
     // 提取关键决策（从消息中提取）

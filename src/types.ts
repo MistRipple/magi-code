@@ -93,9 +93,15 @@ export interface FileSnapshot {
   sessionId: string;
   filePath: string;
   originalContent: string;
-  lastModifiedBy: AgentType;  // ✅ 使用 AgentType
-  lastModifiedAt: number;
-  subTaskId: string;
+  timestamp: number;
+
+  // Mission 架构字段
+  missionId: string;
+  assignmentId: string;
+  todoId: string;
+  workerId: string;
+  agentType?: AgentType;
+  reason?: string;
 }
 
 /**
@@ -105,11 +111,15 @@ export interface FileSnapshot {
 export interface PendingChange {
   filePath: string;
   snapshotId: string;
-  lastModifiedBy: AgentType;  // ✅ 使用 AgentType
   additions: number;
   deletions: number;
   status: 'pending' | 'approved' | 'reverted';
-  subTaskId?: string;
+
+  // Mission 架构字段
+  missionId: string;
+  assignmentId: string;
+  todoId: string;
+  workerId: string;
 }
 
 // ============================================
@@ -190,7 +200,7 @@ export enum DegradationLevel {
   DUAL = 2,           // 双 Agent：Claude + 任一
   SINGLE_CLAUDE = 1,  // 单 Agent：仅 Claude (智能模式)
   SINGLE_OTHER = 0.5, // 单 Agent：仅 Codex 或 Gemini (简单模式)
-  NONE = 0            // 无可用 CLI
+  NONE = 0            // 无可用模型
 }
 
 // 降级策略结果
@@ -232,11 +242,10 @@ export type ExecutionMode = 'auto' | 'parallel' | 'sequential';
 
 /**
  * 用户交互模式
- * - ask: 对话模式，仅对话交流，不执行代码编辑
- * - agent: 代理模式，关键节点需要用户确认（Hard Stop）
- * - auto: 自动模式，无需确认，自动执行并回滚保护
+ * - ask: 对话模式，可以调用工具，但每次都需要用户授权
+ * - auto: 自动模式，完全自动执行，不需要确认
  */
-export type InteractionMode = 'ask' | 'agent' | 'auto';
+export type InteractionMode = 'ask' | 'auto';
 
 export interface PermissionMatrix {
   allowEdit: boolean;
@@ -259,6 +268,8 @@ export interface InteractionModeConfig {
   allowFileModification: boolean;
   /** 是否允许命令执行 */
   allowCommandExecution: boolean;
+  /** 是否需要工具授权 */
+  requireToolAuthorization: boolean;
   /** 是否需要 Phase 2 确认 */
   requirePlanConfirmation: boolean;
   /** 是否需要 Phase 5 恢复确认 */
@@ -275,26 +286,19 @@ export interface InteractionModeConfig {
 export const INTERACTION_MODE_CONFIGS: Record<InteractionMode, InteractionModeConfig> = {
   ask: {
     mode: 'ask',
-    allowFileModification: false,
-    allowCommandExecution: false,
-    requirePlanConfirmation: false,
-    requireRecoveryConfirmation: false,
-    autoRollbackOnFailure: false,
-    maxFilesToModify: 0,
-  },
-  agent: {
-    mode: 'agent',
     allowFileModification: true,
     allowCommandExecution: true,
-    requirePlanConfirmation: true,
-    requireRecoveryConfirmation: true,
-    autoRollbackOnFailure: false,
+    requireToolAuthorization: true,   // ✅ 需要工具授权
+    requirePlanConfirmation: false,
+    requireRecoveryConfirmation: false,
+    autoRollbackOnFailure: true,
     maxFilesToModify: 0,
   },
   auto: {
     mode: 'auto',
     allowFileModification: true,
     allowCommandExecution: true,
+    requireToolAuthorization: false,  // ❌ 不需要工具授权
     requirePlanConfirmation: false,
     requireRecoveryConfirmation: false,
     autoRollbackOnFailure: true,
@@ -356,6 +360,7 @@ export type EventType =
   | 'orchestrator:plan_ready'
   | 'orchestrator:dependency_analysis'
   | 'orchestrator:ui_message'
+  | 'tool:authorization_request'
   | 'verification:started'
   | 'verification:completed'
   | 'recovery:started'
@@ -503,7 +508,20 @@ export type WebviewToExtensionMessage =
   | { type: 'updateRepository'; repositoryId: string; updates: any }
   | { type: 'deleteRepository'; repositoryId: string }
   | { type: 'refreshRepository'; repositoryId: string }
-  | { type: 'loadSkillLibrary' };
+  | { type: 'loadSkillLibrary' }
+  // 新增：项目知识相关
+  | { type: 'getProjectKnowledge' }
+  | { type: 'getADRs'; filter?: { status?: string } }
+  | { type: 'getFAQs'; filter?: { category?: string } }
+  | { type: 'searchFAQs'; keyword: string }
+  | { type: 'addADR'; adr: any }
+  | { type: 'updateADR'; id: string; updates: any }
+  | { type: 'deleteADR'; id: string }
+  | { type: 'addFAQ'; faq: any }
+  | { type: 'updateFAQ'; id: string; updates: any }
+  | { type: 'deleteFAQ'; id: string }
+  // 新增：工具授权相关
+  | { type: 'toolAuthorizationResponse'; allowed: boolean };
 
 // Extension 发送到 Webview 的消息
 // source 字段用于区分消息来源：'orchestrator' = 编排者, 'worker' = 执行代理
@@ -581,7 +599,20 @@ export type ExtensionToWebviewMessage =
   | { type: 'repositoryUpdated'; repositoryId: string }
   | { type: 'repositoryDeleted'; repositoryId: string }
   | { type: 'repositoryRefreshed'; repositoryId: string }
-  | { type: 'skillLibraryLoaded'; skills: any[] };
+  | { type: 'skillLibraryLoaded'; skills: any[] }
+  // 新增：项目知识响应
+  | { type: 'projectKnowledgeLoaded'; codeIndex: any; adrs: any[]; faqs: any[] }
+  | { type: 'adrsLoaded'; adrs: any[] }
+  | { type: 'faqsLoaded'; faqs: any[] }
+  | { type: 'faqSearchResults'; results: any[] }
+  | { type: 'adrAdded'; adr: any }
+  | { type: 'adrUpdated'; id: string }
+  | { type: 'adrDeleted'; id: string }
+  | { type: 'faqAdded'; faq: any }
+  | { type: 'faqUpdated'; id: string }
+  | { type: 'faqDeleted'; id: string }
+  // 新增：工具授权相关
+  | { type: 'toolAuthorizationRequest'; toolName: string; toolArgs: any };
 
 /** Worker 执行统计数据（用于 UI 显示） */
 export interface WorkerExecutionStats {
@@ -610,4 +641,3 @@ export interface WorkerExecutionStats {
   /** 总输出 token */
   totalOutputTokens?: number;
 }
-

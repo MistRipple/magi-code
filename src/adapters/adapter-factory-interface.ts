@@ -1,6 +1,6 @@
 /**
  * 适配器工厂接口
- * 统一 CLI 和 LLM 适配器工厂的接口
+ * 统一 Worker 和 LLM 适配器工厂的接口
  */
 
 import { EventEmitter } from 'events';
@@ -37,9 +37,10 @@ export interface AdapterResponse {
 export interface IAdapterFactory extends EventEmitter {
   /**
    * 发送消息到指定代理
+   * @param agent - 代理类型，包括 'orchestrator' 和 Worker 槽位
    */
   sendMessage(
-    agent: WorkerSlot,
+    agent: AgentType,
     message: string,
     images?: string[],
     options?: AdapterOutputScope

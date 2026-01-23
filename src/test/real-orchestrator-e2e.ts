@@ -83,7 +83,7 @@ async function run() {
 
   await orchestrator.initialize();
 
-  // TODO: LLM mode - check adapter connectivity instead of CLI availability
+  // TODO: LLM mode - check adapter connectivity instead of worker availability
   const availability = {
     claude: adapterFactory.isConnected('claude'),
     codex: adapterFactory.isConnected('codex'),

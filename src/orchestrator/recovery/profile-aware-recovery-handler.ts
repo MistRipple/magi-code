@@ -239,8 +239,8 @@ export class ProfileAwareRecoveryHandler {
     const currentWorker = assignment.workerId;
 
     // 查找擅长当前任务且不在弱项的 Worker
-    for (const [cli, profile] of allProfiles.entries()) {
-      if (cli === currentWorker) continue;
+    for (const [worker, profile] of allProfiles.entries()) {
+      if (worker === currentWorker) continue;
 
       // 检查这个 Worker 是否擅长处理当前弱项相关的任务
       const hasStrengthForWeakness = weaknesses.some(weakness =>
@@ -250,14 +250,14 @@ export class ProfileAwareRecoveryHandler {
       );
 
       if (hasStrengthForWeakness) {
-        return cli as WorkerSlot;
+        return worker as WorkerSlot;
       }
     }
 
     // 没有特别匹配的，返回第一个不同的 Worker
-    for (const [cli] of allProfiles.entries()) {
-      if (cli !== currentWorker) {
-        return cli as WorkerSlot;
+    for (const [worker] of allProfiles.entries()) {
+      if (worker !== currentWorker) {
+        return worker as WorkerSlot;
       }
     }
 

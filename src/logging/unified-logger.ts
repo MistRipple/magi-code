@@ -28,7 +28,7 @@ export enum LogLevel {
 /** 日志分类 */
 export enum LogCategory {
   SYSTEM = 'system',
-  CLI = 'cli',
+  AGENT = 'agent',
   TASK = 'task',
   WORKER = 'worker',
   ORCHESTRATOR = 'orchestrator',
@@ -56,11 +56,11 @@ export interface LogRecord {
   };
 }
 
-/** CLI 消息日志 */
-export interface CLIMessageLog {
+/** Agent 消息日志 */
+export interface AgentMessageLog {
   timestamp: number;
   direction: 'send' | 'receive';
-  cli: string;
+  agent: string;
   role: 'worker' | 'orchestrator';
   requestId: string;
   content: string;
@@ -96,7 +96,7 @@ export interface LogConfig {
     maxSize: number;
     maxFiles: number;
   };
-  cli: {
+  agent: {
     logMessages: boolean;
     logResponses: boolean;
     maxLength: number;  // 控制台显示的最大长度
@@ -113,7 +113,7 @@ const DEFAULT_CONFIG: LogConfig = {
   level: LogLevel.INFO,
   categories: {
     [LogCategory.SYSTEM]: LogLevel.INFO,
-    [LogCategory.CLI]: LogLevel.INFO,
+    [LogCategory.AGENT]: LogLevel.INFO,
     [LogCategory.TASK]: LogLevel.INFO,
     [LogCategory.WORKER]: LogLevel.INFO,
     [LogCategory.ORCHESTRATOR]: LogLevel.INFO,
@@ -132,7 +132,7 @@ const DEFAULT_CONFIG: LogConfig = {
     maxSize: 10 * 1024 * 1024, // 10MB
     maxFiles: 5,
   },
-  cli: {
+  agent: {
     logMessages: true,
     logResponses: true,
     maxLength: 500,  // 控制台显示截断
@@ -208,9 +208,9 @@ export class UnifiedLogger extends EventEmitter {
         ...DEFAULT_CONFIG.file,
         ...config?.file,
       },
-      cli: {
-        ...DEFAULT_CONFIG.cli,
-        ...config?.cli,
+      agent: {
+        ...DEFAULT_CONFIG.agent,
+        ...config?.agent,
       },
     };
   }
@@ -240,12 +240,12 @@ export class UnifiedLogger extends EventEmitter {
       }
     });
 
-    // CLI 消息日志
-    if (process.env.MULTICLI_LOG_CLI_MESSAGES !== undefined) {
-      this.config.cli.logMessages = process.env.MULTICLI_LOG_CLI_MESSAGES === 'true';
+    // Agent 消息日志
+    if (process.env.MULTICLI_LOG_AGENT_MESSAGES !== undefined) {
+      this.config.agent.logMessages = process.env.MULTICLI_LOG_AGENT_MESSAGES === 'true';
     }
-    if (process.env.MULTICLI_LOG_CLI_RESPONSES !== undefined) {
-      this.config.cli.logResponses = process.env.MULTICLI_LOG_CLI_RESPONSES === 'true';
+    if (process.env.MULTICLI_LOG_AGENT_RESPONSES !== undefined) {
+      this.config.agent.logResponses = process.env.MULTICLI_LOG_AGENT_RESPONSES === 'true';
     }
   }
 
@@ -262,26 +262,26 @@ export class UnifiedLogger extends EventEmitter {
   // 便捷配置方法
   // --------------------------------------------------------------------------
 
-  /** 配置 CLI 消息日志 */
-  configureCLILogging(options: {
+  /** 配置 Agent 消息日志 */
+  configureAgentLogging(options: {
     enabled?: boolean;
     logMessages?: boolean;
     logResponses?: boolean;
     maxLength?: number;
     maxLengthFile?: number;
   }): void {
-    this.config.cli = {
-      ...this.config.cli,
-      logMessages: options.logMessages ?? this.config.cli.logMessages,
-      logResponses: options.logResponses ?? this.config.cli.logResponses,
-      maxLength: options.maxLength ?? this.config.cli.maxLength,
-      maxLengthFile: options.maxLengthFile ?? this.config.cli.maxLengthFile,
+    this.config.agent = {
+      ...this.config.agent,
+      logMessages: options.logMessages ?? this.config.agent.logMessages,
+      logResponses: options.logResponses ?? this.config.agent.logResponses,
+      maxLength: options.maxLength ?? this.config.agent.maxLength,
+      maxLengthFile: options.maxLengthFile ?? this.config.agent.maxLengthFile,
     };
 
-    // 如果启用 CLI 日志，确保 CLI 分类级别至少是 DEBUG
+    // 如果启用 Agent 日志，确保 AGENT 分类级别至少是 DEBUG
     if (options.enabled !== false && (options.logMessages || options.logResponses)) {
-      if (!this.config.categories[LogCategory.CLI] || this.config.categories[LogCategory.CLI] > LogLevel.DEBUG) {
-        this.config.categories[LogCategory.CLI] = LogLevel.DEBUG;
+      if (!this.config.categories[LogCategory.AGENT] || this.config.categories[LogCategory.AGENT] > LogLevel.DEBUG) {
+        this.config.categories[LogCategory.AGENT] = LogLevel.DEBUG;
       }
     }
   }
@@ -401,11 +401,11 @@ export class UnifiedLogger extends EventEmitter {
   }
 
   // --------------------------------------------------------------------------
-  // CLI 消息日志
+  // Agent 消息日志
   // --------------------------------------------------------------------------
 
-  logCLIMessage(params: {
-    cli: string;
+  logAgentMessage(params: {
+    agent: string;
     role: 'worker' | 'orchestrator';
     requestId: string;
     message: string;
@@ -419,18 +419,18 @@ export class UnifiedLogger extends EventEmitter {
     };
   }): void {
     if (!this.config.enabled) return;
-    if (!this.config.cli.logMessages) return;
-    if (!this.shouldLog(LogLevel.DEBUG, LogCategory.CLI)) return;
+    if (!this.config.agent.logMessages) return;
+    if (!this.shouldLog(LogLevel.DEBUG, LogCategory.AGENT)) return;
 
     const { message, processedMessage, conversationContext, ...rest } = params;
 
     // 控制台显示用的截断内容
-    const truncated = message.length > this.config.cli.maxLength;
+    const truncated = message.length > this.config.agent.maxLength;
     const content = truncated
-      ? message.substring(0, this.config.cli.maxLength) + '...'
+      ? message.substring(0, this.config.agent.maxLength) + '...'
       : message;
 
-    const log: CLIMessageLog = {
+    const log: AgentMessageLog = {
       timestamp: Date.now(),
       direction: 'send',
       content,  // 控制台显示的截断内容
@@ -442,13 +442,13 @@ export class UnifiedLogger extends EventEmitter {
       ...rest,
     };
 
-    this.emit('cli-message', log);
-    this.writeCLIMessageToConsole(log);
-    this.writeCLIMessageToFile(log);
+    this.emit('agent-message', log);
+    this.writeAgentMessageToConsole(log);
+    this.writeAgentMessageToFile(log);
   }
 
-  logCLIResponse(params: {
-    cli: string;
+  logAgentResponse(params: {
+    agent: string;
     role: 'worker' | 'orchestrator';
     requestId: string;
     response: string;
@@ -463,18 +463,18 @@ export class UnifiedLogger extends EventEmitter {
     };
   }): void {
     if (!this.config.enabled) return;
-    if (!this.config.cli.logResponses) return;
-    if (!this.shouldLog(LogLevel.DEBUG, LogCategory.CLI)) return;
+    if (!this.config.agent.logResponses) return;
+    if (!this.shouldLog(LogLevel.DEBUG, LogCategory.AGENT)) return;
 
     const { response, processedResponse, conversationContext, ...rest } = params;
 
     // 控制台显示用的截断内容
-    const truncated = response.length > this.config.cli.maxLength;
+    const truncated = response.length > this.config.agent.maxLength;
     const content = truncated
-      ? response.substring(0, this.config.cli.maxLength) + '...'
+      ? response.substring(0, this.config.agent.maxLength) + '...'
       : response;
 
-    const log: CLIMessageLog = {
+    const log: AgentMessageLog = {
       timestamp: Date.now(),
       direction: 'receive',
       content,  // 控制台显示的截断内容
@@ -486,9 +486,9 @@ export class UnifiedLogger extends EventEmitter {
       ...rest,
     };
 
-    this.emit('cli-response', log);
-    this.writeCLIMessageToConsole(log);
-    this.writeCLIMessageToFile(log);
+    this.emit('agent-response', log);
+    this.writeAgentMessageToConsole(log);
+    this.writeAgentMessageToFile(log);
   }
 
   // --------------------------------------------------------------------------
@@ -534,7 +534,7 @@ export class UnifiedLogger extends EventEmitter {
     }
   }
 
-  private writeCLIMessageToConsole(log: CLIMessageLog): void {
+  private writeAgentMessageToConsole(log: AgentMessageLog): void {
     if (!this.config.console.enabled) return;
 
     const time = new Date(log.timestamp).toISOString().substring(11, 23);
@@ -542,9 +542,9 @@ export class UnifiedLogger extends EventEmitter {
     const color = log.direction === 'send' ? COLORS.blue : COLORS.green;
 
     console.log('');
-    console.log(this.colorize(`━━━ CLI ${log.direction === 'send' ? '发送' : '接收'} ━━━`, color));
+    console.log(this.colorize(`━━━ Agent ${log.direction === 'send' ? '发送' : '接收'} ━━━`, color));
     console.log(this.colorize(`  时间: ${time}`, COLORS.gray));
-    console.log(`  CLI: ${log.cli} (${log.role})`);
+    console.log(`  Agent: ${log.agent} (${log.role})`);
     console.log(`  Request ID: ${log.requestId}`);
 
     // 显示对话上下文（必需）
@@ -670,19 +670,19 @@ export class UnifiedLogger extends EventEmitter {
     }
   }
 
-  private writeCLIMessageToFile(log: CLIMessageLog): void {
+  private writeAgentMessageToFile(log: AgentMessageLog): void {
     if (!this.config.file.enabled || !this.fileStream) return;
 
     // 文件日志保存完整内容
-    const fileContent = this.config.cli.maxLengthFile > 0 && log.fullContent
-      ? log.fullContent.substring(0, this.config.cli.maxLengthFile)
+    const fileContent = this.config.agent.maxLengthFile > 0 && log.fullContent
+      ? log.fullContent.substring(0, this.config.agent.maxLengthFile)
       : log.fullContent || log.content;
 
     const line = JSON.stringify({
       timestamp: new Date(log.timestamp).toISOString(),
-      type: 'cli-message',
+      type: 'agent-message',
       direction: log.direction,
-      cli: log.cli,
+      agent: log.agent,
       role: log.role,
       requestId: log.requestId,
       // 保存完整内容和处理后的内容
@@ -694,7 +694,7 @@ export class UnifiedLogger extends EventEmitter {
       // 执行时长
       duration: log.duration,
       // 标记是否被截断
-      truncatedInFile: this.config.cli.maxLengthFile > 0 && log.fullContent && log.fullContent.length > this.config.cli.maxLengthFile,
+      truncatedInFile: this.config.agent.maxLengthFile > 0 && log.fullContent && log.fullContent.length > this.config.agent.maxLengthFile,
     }) + '\n';
 
     this.logBuffer.push(line);

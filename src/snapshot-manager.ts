@@ -254,8 +254,8 @@ export class SnapshotManager {
     this.snapshotContentCache.clear();
   }
 
-  /** 清理指定文件的历史快照（避免旧任务阻塞新任务） */
-  clearSnapshotsForFiles(filePaths: string[], keepSubTaskId?: string): number {
+  /** 清理指定文件的历史快照（Mission 版本） */
+  clearSnapshotsForFiles(filePaths: string[], keepTodoId?: string): number {
     const session = this.sessionManager.getCurrentSession();
     if (!session || filePaths.length === 0) return 0;
 
@@ -271,7 +271,7 @@ export class SnapshotManager {
     let removed = 0;
     for (const snapshot of [...session.snapshots]) {
       if (!targets.has(snapshot.filePath)) continue;
-      if (keepSubTaskId && snapshot.subTaskId === keepSubTaskId) continue;
+      if (keepTodoId && snapshot.todoId === keepTodoId) continue;
 
       const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);
       if (fs.existsSync(snapshotFile)) {
@@ -288,6 +288,68 @@ export class SnapshotManager {
 
     if (removed > 0) {
       logger.info('快照.清理.目标文件', { count: removed }, LogCategory.RECOVERY);
+    }
+    return removed;
+  }
+
+  /** 按 Mission 清理快照 */
+  clearSnapshotsForMission(missionId: string): number {
+    const session = this.sessionManager.getCurrentSession();
+    if (!session) return 0;
+
+    let removed = 0;
+    for (const snapshot of [...session.snapshots]) {
+      if (snapshot.missionId !== missionId) continue;
+
+      const snapshotFile = path.join(
+        this.getSnapshotDir(session.id),
+        `${snapshot.id}.snapshot`
+      );
+      if (fs.existsSync(snapshotFile)) {
+        try {
+          fs.unlinkSync(snapshotFile);
+          this.invalidateSnapshotCache(snapshotFile);
+        } catch (error) {
+          logger.error('快照.清理.失败', { snapshotId: snapshot.id, error }, LogCategory.RECOVERY);
+        }
+      }
+      this.sessionManager.removeSnapshot(session.id, snapshot.filePath);
+      removed++;
+    }
+
+    if (removed > 0) {
+      logger.info('快照.清理.Mission', { missionId, count: removed }, LogCategory.RECOVERY);
+    }
+    return removed;
+  }
+
+  /** 按 Assignment 清理快照 */
+  clearSnapshotsForAssignment(assignmentId: string): number {
+    const session = this.sessionManager.getCurrentSession();
+    if (!session) return 0;
+
+    let removed = 0;
+    for (const snapshot of [...session.snapshots]) {
+      if (snapshot.assignmentId !== assignmentId) continue;
+
+      const snapshotFile = path.join(
+        this.getSnapshotDir(session.id),
+        `${snapshot.id}.snapshot`
+      );
+      if (fs.existsSync(snapshotFile)) {
+        try {
+          fs.unlinkSync(snapshotFile);
+          this.invalidateSnapshotCache(snapshotFile);
+        } catch (error) {
+          logger.error('快照.清理.失败', { snapshotId: snapshot.id, error }, LogCategory.RECOVERY);
+        }
+      }
+      this.sessionManager.removeSnapshot(session.id, snapshot.filePath);
+      removed++;
+    }
+
+    if (removed > 0) {
+      logger.info('快照.清理.Assignment', { assignmentId, count: removed }, LogCategory.RECOVERY);
     }
     return removed;
   }
@@ -410,12 +472,14 @@ export class SnapshotManager {
     return { orphanedCleaned, unrecordedCleaned };
   }
 
-  /** 创建文件快照 */
-  createSnapshot(
+  /** 创建文件快照（Mission 版本） */
+  createSnapshotForMission(
     filePath: string,
-    modifiedBy: AgentType,  // ✅ 使用 AgentType
-    subTaskId: string,
-    priority: number = 5  // SubTask 优先级 (1-10, 1 最高)，默认 5
+    missionId: string,
+    assignmentId: string,
+    todoId: string,
+    workerId: string,
+    reason?: string
   ): FileSnapshot | null {
     const session = this.sessionManager.getCurrentSession();
     if (!session) return null;
@@ -434,85 +498,29 @@ export class SnapshotManager {
 
     const relativePath = path.relative(this.workspaceRoot, absolutePath);
 
-    // 检查是否已有该文件的快照（同一 SubTask）
+    // 检查是否已有该文件的快照（同一 Todo）
     const existingSnapshot = session.snapshots.find(
-      s => s.filePath === relativePath && s.subTaskId === subTaskId
+      s => s.filePath === relativePath && s.todoId === todoId
     );
 
     if (existingSnapshot) {
-      // 同一 SubTask 重复创建快照，直接返回现有快照
+      // 同一 Todo 重复创建快照，直接返回现有快照
       const snapshotFile = path.join(this.getSnapshotDir(session.id), `${existingSnapshot.id}.snapshot`);
       const originalContent = this.readSnapshotWithCache(snapshotFile);
 
       return {
-        ...existingSnapshot,
+        id: existingSnapshot.id,
         sessionId: session.id,
+        filePath: relativePath,
+        timestamp: existingSnapshot.timestamp,
+        missionId: existingSnapshot.missionId,
+        assignmentId: existingSnapshot.assignmentId,
+        todoId: existingSnapshot.todoId,
+        workerId: existingSnapshot.workerId,
+        agentType: existingSnapshot.agentType,
+        reason: existingSnapshot.reason,
         originalContent,
       };
-    }
-
-    // 检查是否有其他 SubTask 已经创建了该文件的快照
-    const otherSnapshot = session.snapshots.find(
-      s => s.filePath === relativePath && s.subTaskId !== subTaskId
-    );
-
-    if (otherSnapshot) {
-      // 冲突检测：多个 SubTask 修改同一文件
-      // 使用优先级解决冲突：数字越小优先级越高
-      if (priority < otherSnapshot.priority) {
-        // 新 SubTask 优先级更高，允许覆盖历史快照
-        logger.info(
-          '快照.冲突.覆盖',
-          {
-            filePath: relativePath,
-            subTaskId,
-            priority,
-            previousSubTaskId: otherSnapshot.subTaskId,
-            previousPriority: otherSnapshot.priority,
-          },
-          LogCategory.RECOVERY
-        );
-
-        // 删除历史快照文件
-        const oldSnapshotFile = path.join(this.getSnapshotDir(session.id), `${otherSnapshot.id}.snapshot`);
-        if (fs.existsSync(oldSnapshotFile)) {
-          try {
-            fs.unlinkSync(oldSnapshotFile);
-            // 清除历史快照的缓存
-            this.invalidateSnapshotCache(oldSnapshotFile);
-          } catch (error) {
-            logger.error('快照.清理.旧快照.失败', { path: oldSnapshotFile, error }, LogCategory.RECOVERY);
-            throw new Error(`Failed to delete previous snapshot: ${error}`);
-          }
-        }
-
-        // 从 session 中移除历史快照元数据
-        this.sessionManager.removeSnapshot(session.id, relativePath);
-
-        // 继续创建新快照（下面的代码会处理）
-      } else {
-        // 新 SubTask 优先级更低或相等，拒绝创建新快照
-        logger.warn(
-          '快照.冲突.阻塞',
-          {
-            filePath: relativePath,
-            subTaskId,
-            priority,
-            existingSubTaskId: otherSnapshot.subTaskId,
-            existingPriority: otherSnapshot.priority,
-          },
-          LogCategory.RECOVERY
-        );
-
-        // 返回现有快照
-        const snapshotFile = path.join(this.getSnapshotDir(session.id), `${otherSnapshot.id}.snapshot`);
-        const originalContent = this.readSnapshotWithCache(snapshotFile);
-        return {
-          ...otherSnapshot,
-          sessionId: session.id,
-          originalContent,
-        };
-      }
     }
 
     // 读取原始文件内容（使用缓存）
@@ -522,10 +530,12 @@ export class SnapshotManager {
     const snapshotMeta: FileSnapshotMeta = {
       id: snapshotId,
       filePath: relativePath,
-      lastModifiedBy: modifiedBy,
-      lastModifiedAt: Date.now(),
-      subTaskId,
-      priority,  // 添加优先级字段
+      timestamp: Date.now(),
+      missionId,
+      assignmentId,
+      todoId,
+      workerId,
+      reason,
     };
 
     // 使用原子操作保存快照
@@ -545,149 +555,63 @@ export class SnapshotManager {
 
     globalEventBus.emitEvent('snapshot:created', {
       sessionId: session.id,
-      data: { filePath: relativePath, snapshotId },
+      data: { filePath: relativePath, snapshotId, missionId, assignmentId, todoId },
     });
 
     return {
-      ...snapshotMeta,
+      id: snapshotId,
       sessionId: session.id,
+      filePath: relativePath,
+      timestamp: snapshotMeta.timestamp,
+      missionId,
+      assignmentId,
+      todoId,
+      workerId,
+      reason,
       originalContent,
     };
   }
 
+  /** 创建文件快照（旧版本 - 兼容性保留，将被移除） */
+  createSnapshot(
+    filePath: string,
+    modifiedBy: AgentType,
+    subTaskId: string,
+    priority: number = 5
+  ): FileSnapshot | null {
+    // 临时映射到新架构
+    // TODO: 移除此方法，所有调用点应使用 createSnapshotForMission
+    return this.createSnapshotForMission(
+      filePath,
+      'legacy-mission',
+      'legacy-assignment',
+      subTaskId,
+      modifiedBy,
+      'Legacy snapshot creation'
+    );
+  }
+
   /**
    * 创建文件快照（使用基线内容，适用于任务后补快照）
+   * 旧版本 - 兼容性保留，将被移除
    */
   createSnapshotFromBaseline(
     filePath: string,
-    modifiedBy: AgentType,  // ✅ 使用 AgentType
+    modifiedBy: AgentType,
     subTaskId: string,
     priority: number = 5,
     baselineContent: string = ''
   ): FileSnapshot | null {
-    const session = this.sessionManager.getCurrentSession();
-    if (!session) return null;
-
-    const absolutePath = path.isAbsolute(filePath)
-      ? filePath
-      : path.join(this.workspaceRoot, filePath);
-
-    // 安全检查：防止路径遍历攻击
-    const normalizedPath = path.normalize(absolutePath);
-    const normalizedRoot = path.normalize(this.workspaceRoot);
-    if (!normalizedPath.startsWith(normalizedRoot)) {
-      logger.error('快照.安全.路径穿越', { filePath }, LogCategory.RECOVERY);
-      throw new Error(`Path traversal detected: file must be within workspace`);
-    }
-
-    const relativePath = path.relative(this.workspaceRoot, absolutePath);
-
-    // 检查是否已有该文件的快照（同一 SubTask）
-    const existingSnapshot = session.snapshots.find(
-      s => s.filePath === relativePath && s.subTaskId === subTaskId
-    );
-
-    if (existingSnapshot) {
-      const snapshotFile = path.join(this.getSnapshotDir(session.id), `${existingSnapshot.id}.snapshot`);
-      const originalContent = this.readSnapshotWithCache(snapshotFile);
-
-      return {
-        ...existingSnapshot,
-        sessionId: session.id,
-        originalContent,
-      };
-    }
-
-    // 检查是否有其他 SubTask 已经创建了该文件的快照
-    const otherSnapshot = session.snapshots.find(
-      s => s.filePath === relativePath && s.subTaskId !== subTaskId
-    );
-
-    if (otherSnapshot) {
-      if (priority < otherSnapshot.priority) {
-        logger.info(
-          '快照.冲突.覆盖',
-          {
-            filePath: relativePath,
-            subTaskId,
-            priority,
-            previousSubTaskId: otherSnapshot.subTaskId,
-            previousPriority: otherSnapshot.priority,
-          },
-          LogCategory.RECOVERY
-        );
-
-        const oldSnapshotFile = path.join(this.getSnapshotDir(session.id), `${otherSnapshot.id}.snapshot`);
-        if (fs.existsSync(oldSnapshotFile)) {
-          try {
-            fs.unlinkSync(oldSnapshotFile);
-            this.invalidateSnapshotCache(oldSnapshotFile);
-          } catch (error) {
-            logger.error('快照.清理.旧快照.失败', { path: oldSnapshotFile, error }, LogCategory.RECOVERY);
-            throw new Error(`Failed to delete previous snapshot: ${error}`);
-          }
-        }
-
-        this.sessionManager.removeSnapshot(session.id, relativePath);
-      } else {
-        logger.warn(
-          '快照.冲突.复用',
-          {
-            filePath: relativePath,
-            subTaskId,
-            priority,
-            existingSubTaskId: otherSnapshot.subTaskId,
-            existingPriority: otherSnapshot.priority,
-          },
-          LogCategory.RECOVERY
-        );
-
-        const snapshotFile = path.join(this.getSnapshotDir(session.id), `${otherSnapshot.id}.snapshot`);
-        const originalContent = this.readSnapshotWithCache(snapshotFile);
-        return {
-          ...otherSnapshot,
-          sessionId: session.id,
-          originalContent,
-        };
-      }
-    }
-
-    const originalContent = baselineContent ?? '';
-    const snapshotId = generateId();
-    const snapshotMeta: FileSnapshotMeta = {
-      id: snapshotId,
-      filePath: relativePath,
-      lastModifiedBy: modifiedBy,
-      lastModifiedAt: Date.now(),
+    // 临时映射到新架构
+    // TODO: 移除此方法，所有调用点应使用 createSnapshotForMission
+    return this.createSnapshotForMission(
+      filePath,
+      'legacy-mission',
+      'legacy-assignment',
       subTaskId,
-      priority,
-    };
-
-    // 使用原子操作保存快照
-    const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshotId}.snapshot`);
-    const result = this.atomicWriteSnapshot(
-      session.id,
-      snapshotId,
-      snapshotFile,
-      originalContent,
-      snapshotMeta
+      modifiedBy,
+      'Legacy baseline snapshot'
     );
-
-    if (!result.success) {
-      logger.error('快照.创建.失败', { path: snapshotFile, error: result.error }, LogCategory.RECOVERY);
-      throw new Error(`Failed to create snapshot: ${result.error}`);
-    }
-
-    globalEventBus.emitEvent('snapshot:created', {
-      sessionId: session.id,
-      data: { filePath: relativePath, snapshotId },
-    });
-
-    return {
-      ...snapshotMeta,
-      sessionId: session.id,
-      originalContent,
-    };
   }
 
 
@@ -745,7 +669,7 @@ export class SnapshotManager {
     const session = this.sessionManager.getCurrentSession();
     if (!session) return [];
 
-    const changesMap = new Map<string, PendingChange & { lastModifiedAt?: number }>();
+    const changesMap = new Map<string, PendingChange & { timestamp?: number }>();
 
     for (const snapshot of session.snapshots) {
       const absolutePath = path.join(this.workspaceRoot, snapshot.filePath);
@@ -760,17 +684,19 @@ export class SnapshotManager {
 
       if (additions > 0 || deletions > 0) {
         const existing = changesMap.get(snapshot.filePath);
-        const currentModifiedAt = snapshot.lastModifiedAt ?? 0;
+        const currentTimestamp = snapshot.timestamp ?? 0;
         if (!existing) {
           changesMap.set(snapshot.filePath, {
             filePath: snapshot.filePath,
             snapshotId: snapshot.id,
-            lastModifiedBy: snapshot.lastModifiedBy,
+            missionId: snapshot.missionId,
+            assignmentId: snapshot.assignmentId,
+            todoId: snapshot.todoId,
+            workerId: snapshot.workerId,
             additions,
             deletions,
             status: 'pending',
-            subTaskId: snapshot.subTaskId,
-            lastModifiedAt: currentModifiedAt,
+            timestamp: currentTimestamp,
           });
           continue;
         }
@@ -781,11 +707,13 @@ export class SnapshotManager {
           deletions: Math.max(existing.deletions, deletions),
         };
 
-        if (currentModifiedAt >= (existing.lastModifiedAt ?? 0)) {
+        if (currentTimestamp >= (existing.timestamp ?? 0)) {
           merged.snapshotId = snapshot.id;
-          merged.lastModifiedBy = snapshot.lastModifiedBy;
-          merged.subTaskId = snapshot.subTaskId;
-          merged.lastModifiedAt = currentModifiedAt;
+          merged.missionId = snapshot.missionId;
+          merged.assignmentId = snapshot.assignmentId;
+          merged.todoId = snapshot.todoId;
+          merged.workerId = snapshot.workerId;
+          merged.timestamp = currentTimestamp;
         }
 
         changesMap.set(snapshot.filePath, merged);
@@ -793,18 +721,18 @@ export class SnapshotManager {
     }
 
     return Array.from(changesMap.values())
-      .map(({ lastModifiedAt, ...change }) => change)
+      .map(({ timestamp, ...change }) => change)
       .sort((a, b) => a.filePath.localeCompare(b.filePath));
   }
 
-  /** 获取指定子任务的实际变更文件 */
-  getChangedFilesForSubTask(subTaskId: string): string[] {
+  /** 获取指定 Todo 的实际变更文件 */
+  getChangedFilesForTodo(todoId: string): string[] {
     const session = this.sessionManager.getCurrentSession();
     if (!session) return [];
 
     const files: string[] = [];
     for (const snapshot of session.snapshots) {
-      if (snapshot.subTaskId !== subTaskId) {
+      if (snapshot.todoId !== todoId) {
         continue;
       }
       const absolutePath = path.join(this.workspaceRoot, snapshot.filePath);
@@ -819,6 +747,12 @@ export class SnapshotManager {
       }
     }
     return files;
+  }
+
+  /** 获取指定子任务的实际变更文件（旧版本 - 兼容性保留） */
+  getChangedFilesForSubTask(subTaskId: string): string[] {
+    // 临时映射到新方法
+    return this.getChangedFilesForTodo(subTaskId);
   }
 
   /** 计算变更行数 */
@@ -883,10 +817,13 @@ export class SnapshotManager {
     const newSnapshotMeta: FileSnapshotMeta = {
       id: newSnapshotId,
       filePath: relativePath,
-      lastModifiedBy: snapshot.lastModifiedBy,
-      lastModifiedAt: Date.now(),
-      subTaskId: snapshot.subTaskId, // 继承原 subTaskId
-      priority: snapshot.priority, // 继承原优先级
+      timestamp: Date.now(),
+      missionId: snapshot.missionId,
+      assignmentId: snapshot.assignmentId,
+      todoId: snapshot.todoId,
+      workerId: snapshot.workerId,
+      agentType: snapshot.agentType,
+      reason: 'Accepted change',
     };
 
     // 保存新快照内容到文件

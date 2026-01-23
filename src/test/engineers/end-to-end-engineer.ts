@@ -131,7 +131,7 @@ class EndToEndEngineer implements TestEngineer {
     const issues: TestIssue[] = [];
     
     // 测试各种错误情况的恢复
-    // 例如：网络错误、CLI崩溃、超时等
+    // 例如：网络错误、模型崩溃、超时等
     
     issues.push({
       severity: 'medium',

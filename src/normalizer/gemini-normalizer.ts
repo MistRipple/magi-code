@@ -1,7 +1,7 @@
 /**
- * Gemini CLI Normalizer
+ * Gemini LLM Normalizer
  * 
- * 解析 Gemini CLI 的混合格式输出
+ * 解析 Gemini LLM 的混合格式输出
  * Gemini 支持流式输出，格式介于 Claude 和 Codex 之间
  */
 
@@ -20,7 +20,7 @@ import {
 } from '../protocol';
 
 /**
- * Gemini CLI Normalizer
+ * Gemini LLM Normalizer
  */
 export class GeminiNormalizer extends BaseNormalizer {
   private codeBlockBuffer: string = '';

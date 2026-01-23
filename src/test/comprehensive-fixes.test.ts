@@ -136,25 +136,25 @@ class ComprehensiveFixesTestSuite {
       // 模拟编排者发送消息
       router.sendMessage('standardMessage', 'thread', 'orchestrator');
       router.sendMessage('standardMessage', 'thread', 'orchestrator');
-      router.sendMessage('standardMessage', 'cli', 'worker');
+      router.sendMessage('standardMessage', 'worker', 'worker');
       
       const threadMessages = router.getMessagesByTarget('thread');
-      const cliMessages = router.getMessagesByTarget('cli');
+      const workerMessages = router.getMessagesByTarget('worker');
       
       console.log(`✓ Thread 消息数: ${threadMessages.length}`);
-      console.log(`✓ CLI 消息数: ${cliMessages.length}`);
+      console.log(`✓ Worker 消息数: ${workerMessages.length}`);
       
       if (threadMessages.length !== 2) {
         errors.push(`Thread 应该有2条消息，实际: ${threadMessages.length}`);
       }
       
-      if (cliMessages.length !== 1) {
-        errors.push(`CLI 应该有1条消息，实际: ${cliMessages.length}`);
+      if (workerMessages.length !== 1) {
+        errors.push(`Worker 应该有1条消息，实际: ${workerMessages.length}`);
       }
       
-      const orchestratorInCli = cliMessages.some(m => m.source === 'orchestrator');
-      if (orchestratorInCli) {
-        errors.push('编排者消息不应该出现在 CLI 面板');
+      const orchestratorInWorker = workerMessages.some(m => m.source === 'orchestrator');
+      if (orchestratorInWorker) {
+        errors.push('编排者消息不应该出现在 Worker 面板');
       }
       
     } catch (error) {

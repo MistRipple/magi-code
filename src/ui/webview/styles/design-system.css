@@ -1,0 +1,159 @@
+/**
+ * MultiCLI 设计系统 (Design System)
+ * 参考 Augment 的设计令牌系统
+ * 
+ * 命名规范：
+ * - --ds-spacing-*: 间距
+ * - --ds-color-*: 颜色
+ * - --ds-radius-*: 圆角
+ * - --ds-font-*: 字体
+ * - --ds-shadow-*: 阴影
+ * - --ds-transition-*: 过渡动画
+ */
+
+:root {
+  /* ========== 间距系统 (Spacing) ========== */
+  --ds-spacing-0: 0;
+  --ds-spacing-0_5: 2px;
+  --ds-spacing-1: 4px;
+  --ds-spacing-1_5: 6px;
+  --ds-spacing-2: 8px;
+  --ds-spacing-2_5: 10px;
+  --ds-spacing-3: 12px;
+  --ds-spacing-3_5: 14px;
+  --ds-spacing-4: 16px;
+  --ds-spacing-4_5: 18px;
+  --ds-spacing-5: 20px;
+  --ds-spacing-6: 24px;
+  --ds-spacing-7: 28px;
+  --ds-spacing-8: 32px;
+
+  /* ========== 圆角系统 (Border Radius) ========== */
+  --ds-radius-0: 0;
+  --ds-radius-1: 2px;
+  --ds-radius-2: 4px;
+  --ds-radius-3: 6px;
+  --ds-radius-4: 8px;
+  --ds-radius-5: 10px;
+  --ds-radius-6: 12px;
+  --ds-radius-full: 9999px;
+
+  /* ========== 字体系统 (Typography) ========== */
+  --ds-font-size-0: 10px;
+  --ds-font-size-1: 11px;
+  --ds-font-size-2: 12px;
+  --ds-font-size-3: 13px;
+  --ds-font-size-4: 14px;
+  --ds-font-size-5: 16px;
+  --ds-font-size-6: 18px;
+  --ds-font-size-7: 20px;
+  
+  --ds-font-weight-normal: 400;
+  --ds-font-weight-medium: 500;
+  --ds-font-weight-semibold: 600;
+  --ds-font-weight-bold: 700;
+  
+  --ds-line-height-tight: 1.25;
+  --ds-line-height-normal: 1.5;
+  --ds-line-height-relaxed: 1.75;
+
+  /* ========== 图标尺寸 (Icon Sizes) ========== */
+  --ds-icon-size-0: 12px;
+  --ds-icon-size-1: 14px;
+  --ds-icon-size-2: 16px;
+  --ds-icon-size-3: 18px;
+  --ds-icon-size-4: 20px;
+  --ds-icon-size-5: 24px;
+
+  /* ========== 过渡动画 (Transitions) ========== */
+  --ds-transition-fast: 0.1s ease;
+  --ds-transition-normal: 0.2s ease;
+  --ds-transition-slow: 0.3s ease;
+  --ds-transition-expand: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* ========== 阴影系统 (Shadows) ========== */
+  --ds-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --ds-shadow-md: 0 2px 4px rgba(0, 0, 0, 0.1);
+  --ds-shadow-lg: 0 4px 8px rgba(0, 0, 0, 0.15);
+  --ds-shadow-xl: 0 8px 16px rgba(0, 0, 0, 0.2);
+
+  /* ========== 语义颜色 (Semantic Colors) ========== */
+  /* 主色调 - 使用 VSCode 变量作为基础 */
+  --ds-color-primary: var(--vscode-button-background);
+  --ds-color-primary-hover: var(--vscode-button-hoverBackground);
+  --ds-color-primary-fg: var(--vscode-button-foreground);
+
+  /* 中性色 */
+  --ds-color-neutral-1: rgba(255, 255, 255, 0.02);
+  --ds-color-neutral-2: rgba(255, 255, 255, 0.04);
+  --ds-color-neutral-3: rgba(255, 255, 255, 0.06);
+  --ds-color-neutral-4: rgba(255, 255, 255, 0.08);
+  --ds-color-neutral-5: rgba(255, 255, 255, 0.1);
+  --ds-color-neutral-a3: rgba(255, 255, 255, 0.06);
+  --ds-color-neutral-a5: rgba(255, 255, 255, 0.1);
+  --ds-color-neutral-a7: rgba(255, 255, 255, 0.14);
+  --ds-color-neutral-a11: var(--vscode-descriptionForeground);
+  --ds-color-neutral-12: var(--vscode-foreground);
+
+  /* 状态颜色 */
+  --ds-color-success-2: rgba(34, 197, 94, 0.08);
+  --ds-color-success-a2: rgba(34, 197, 94, 0.12);
+  --ds-color-success-9: #22c55e;
+  --ds-color-success-11: #16a34a;
+
+  --ds-color-error-2: rgba(239, 68, 68, 0.08);
+  --ds-color-error-a2: rgba(239, 68, 68, 0.12);
+  --ds-color-error-8: #dc2626;
+  --ds-color-error-9: #ef4444;
+
+  --ds-color-warning-2: rgba(245, 158, 11, 0.08);
+  --ds-color-warning-9: #f59e0b;
+
+  --ds-color-info-2: rgba(59, 130, 246, 0.08);
+  --ds-color-info-9: #3b82f6;
+
+  /* 强调色 */
+  --ds-color-accent-a11: var(--vscode-textLink-foreground);
+  --ds-color-accent-a12: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground));
+
+  /* 次要色 */
+  --ds-color-secondary-11: var(--vscode-descriptionForeground);
+  --ds-color-secondary-12: var(--vscode-foreground);
+
+  /* ========== 面板颜色 (Panel Colors) ========== */
+  --ds-panel-background: var(--vscode-editor-background);
+  --ds-panel-translucent: var(--vscode-sideBar-background);
+  --ds-panel-border: var(--vscode-panel-border);
+
+  /* ========== Agent 颜色 (Agent Colors) ========== */
+  --ds-color-orchestrator: #d97706;
+  --ds-color-orchestrator-bg: rgba(217, 119, 6, 0.1);
+  --ds-color-claude: #d97706;
+  --ds-color-claude-bg: rgba(217, 119, 6, 0.1);
+  --ds-color-codex: #10a37f;
+  --ds-color-codex-bg: rgba(16, 163, 127, 0.1);
+  --ds-color-gemini: #4285f4;
+  --ds-color-gemini-bg: rgba(66, 133, 244, 0.1);
+
+  /* ========== 强调色补充 (Accent Colors) ========== */
+  --ds-color-accent-9: var(--vscode-textLink-foreground, #3b82f6);
+
+  /* ========== 工具状态颜色 (Tool Status Colors) ========== */
+  --ds-tool-running: var(--ds-color-info-9);
+  --ds-tool-success: var(--ds-color-success-9);
+  --ds-tool-error: var(--ds-color-error-9);
+  --ds-tool-pending: var(--ds-color-neutral-a11);
+}
+
+/* 亮色主题覆盖 */
+[data-vscode-theme-kind="vscode-light"] {
+  --ds-color-neutral-1: rgba(0, 0, 0, 0.02);
+  --ds-color-neutral-2: rgba(0, 0, 0, 0.04);
+  --ds-color-neutral-3: rgba(0, 0, 0, 0.06);
+  --ds-color-neutral-4: rgba(0, 0, 0, 0.08);
+  --ds-color-neutral-5: rgba(0, 0, 0, 0.1);
+  --ds-color-neutral-a3: rgba(0, 0, 0, 0.06);
+  --ds-color-neutral-a5: rgba(0, 0, 0, 0.1);
+  --ds-color-neutral-a7: rgba(0, 0, 0, 0.14);
+}
+

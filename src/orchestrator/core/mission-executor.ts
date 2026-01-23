@@ -24,6 +24,7 @@ import {
 import { MissionOrchestrator } from './mission-orchestrator';
 import { SnapshotManager } from '../../snapshot-manager';
 import { UnifiedTaskManager } from '../../task/unified-task-manager';
+import { PlanTodoManager } from '../plan-todo';
 import { logger, LogCategory } from '../../logging';
 
 /**
@@ -146,9 +147,11 @@ export class MissionExecutor extends EventEmitter {
   private blockingIdCounter = 0;
   private snapshotManager: SnapshotManager | null = null;
   private taskManager: UnifiedTaskManager | null = null;
+  private todoManager: PlanTodoManager | null = null;
   private workspaceRoot: string = '';
   private adapterFactory: IAdapterFactory | null = null;
   private contextManager: import('../../context/context-manager').ContextManager | null = null;
+  private currentMissionId: string | null = null;
 
   constructor(
     private orchestrator: MissionOrchestrator,
@@ -171,6 +174,13 @@ export class MissionExecutor extends EventEmitter {
    */
   setTaskManager(taskManager: UnifiedTaskManager): void {
     this.taskManager = taskManager;
+  }
+
+  /**
+   * 设置 TODO 管理器
+   */
+  setTodoManager(todoManager: PlanTodoManager): void {
+    this.todoManager = todoManager;
   }
 
   /**
@@ -221,10 +231,16 @@ export class MissionExecutor extends EventEmitter {
 
     worker.on('todoCompleted', (data) => {
       this.emit('todoCompleted', data);
+
+      // 更新 TODO 文件状态
+      this.updateTodoFileStatus(data.todoId, 'completed');
     });
 
     worker.on('todoFailed', (data) => {
       this.emit('todoFailed', data);
+
+      // 更新 TODO 文件状态
+      this.updateTodoFileStatus(data.todoId, 'failed');
     });
 
     worker.on('dynamicTodoAdded', (data) => {
@@ -234,6 +250,31 @@ export class MissionExecutor extends EventEmitter {
     worker.on('approvalRequested', (data) => {
       this.emit('approvalRequested', data);
     });
+  }
+
+  /**
+   * 更新 TODO 文件中的状态
+   */
+  private updateTodoFileStatus(todoId: string, status: 'completed' | 'failed'): void {
+    if (!this.todoManager || !this.snapshotManager) {
+      return;
+    }
+
+    const session = (this.snapshotManager as any).sessionManager?.getCurrentSession();
+    if (!session) {
+      return;
+    }
+
+    // 从当前执行的 mission 中获取 missionId
+    // 注意：这里需要在 execute() 方法中存储当前 missionId
+    if (this.currentMissionId) {
+      this.todoManager.updateMissionTodoStatus(
+        session.id,
+        this.currentMissionId,
+        todoId,
+        status
+      );
+    }
   }
 
   /**
@@ -253,6 +294,9 @@ export class MissionExecutor extends EventEmitter {
     const contractVerifications = new Map<string, boolean>();
     const errors: string[] = [];
 
+    // 设置当前 missionId（用于 TODO 状态更新）
+    this.currentMissionId = mission.id;
+
     // 清除上一次执行的阻塞状态
     this.clearBlockingState();
 
@@ -260,6 +304,14 @@ export class MissionExecutor extends EventEmitter {
 
     // 报告初始进度
     this.reportProgress(mission, 'planning', assignmentResults, effectiveOptions.onProgress);
+
+    // 生成 TODO 文件
+    if (this.todoManager && this.snapshotManager) {
+      const session = (this.snapshotManager as any).sessionManager?.getCurrentSession();
+      if (session) {
+        this.todoManager.ensureMissionTodoFile(mission, session.id);
+      }
+    }
 
     // ✅ 将 Assignments 添加到 ContextManager
     if (this.contextManager) {
@@ -336,6 +388,9 @@ export class MissionExecutor extends EventEmitter {
 
       this.emit('executionCompleted', result);
 
+      // 清除当前 missionId
+      this.currentMissionId = null;
+
       return result;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -344,6 +399,9 @@ export class MissionExecutor extends EventEmitter {
       await this.orchestrator.failMission(mission.id, errorMessage);
 
       this.emit('executionFailed', { missionId: mission.id, error: errorMessage });
+
+      // 清除当前 missionId
+      this.currentMissionId = null;
 
       return {
         mission,
@@ -720,7 +778,8 @@ export class MissionExecutor extends EventEmitter {
     // 收集所有目标文件
     const targetFiles = new Set(this.collectTargetFiles(assignment));
     if (targetFiles.size > 0) {
-      this.snapshotManager.clearSnapshotsForFiles([...targetFiles], assignment.id);
+      // 使用新的清理方法：按 Assignment 清理
+      this.snapshotManager.clearSnapshotsForAssignment(assignment.id);
     }
 
     if (targetFiles.size === 0) {
@@ -729,20 +788,33 @@ export class MissionExecutor extends EventEmitter {
     }
 
     // 为每个目标文件创建快照
-    const priority = 5; // 默认优先级
+    // 注意：这里为整个 Assignment 创建快照，todoId 使用 'assignment-init'
     for (const filePath of targetFiles) {
       try {
-        this.snapshotManager.createSnapshot(
+        const snapshot = this.snapshotManager.createSnapshotForMission(
           filePath,
-          assignment.workerId,
+          mission.id,
           assignment.id,
-          priority
+          'assignment-init', // 初始快照，不属于特定 todo
+          assignment.workerId,
+          `Assignment 执行前快照: ${assignment.responsibility}`
         );
-        logger.debug('执行器.快照.创建', {
-          filePath,
-          assignmentId: assignment.id,
-          workerId: assignment.workerId,
-        }, LogCategory.ORCHESTRATOR);
+
+        if (snapshot) {
+          // 将快照 ID 添加到 Mission 的快照列表
+          if (!mission.snapshots) {
+            mission.snapshots = [];
+          }
+          mission.snapshots.push(snapshot.id);
+
+          logger.debug('执行器.快照.创建', {
+            filePath,
+            missionId: mission.id,
+            assignmentId: assignment.id,
+            workerId: assignment.workerId,
+            snapshotId: snapshot.id,
+          }, LogCategory.ORCHESTRATOR);
+        }
       } catch (error) {
         // 快照创建失败不阻止执行，但记录警告
         logger.warn('执行器.快照.创建_失败', {
@@ -1031,8 +1103,8 @@ export class MissionExecutor extends EventEmitter {
   /**
    * 获取 Worker
    */
-  getWorker(cliType: WorkerSlot): AutonomousWorker | undefined {
-    return this.workers.get(cliType);
+  getWorker(workerType: WorkerSlot): AutonomousWorker | undefined {
+    return this.workers.get(workerType);
   }
 
   /**

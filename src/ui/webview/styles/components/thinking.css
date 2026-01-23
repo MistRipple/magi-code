@@ -1,0 +1,184 @@
+/**
+ * 思考过程组件样式 (Thinking Components)
+ * 参考 Augment 的 c-thinking 组件设计
+ * 支持两种结构：
+ * 1. details.c-thinking > summary.c-thinking__header (markdown-renderer)
+ * 2. div.c-thinking > details.c-thinking__details > summary (message-renderer)
+ */
+
+/* ========== 思考过程容器 ========== */
+.c-thinking {
+  margin: var(--ds-spacing-2) 0;
+  border-radius: var(--ds-radius-2);
+  background: var(--ds-color-neutral-a2);
+  border: 1px solid var(--ds-color-neutral-a4);
+  overflow: hidden;
+}
+
+/* 当 c-thinking 本身是 details 元素时 */
+details.c-thinking {
+  padding: 0;
+}
+
+details.c-thinking > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: var(--ds-spacing-2) var(--ds-spacing-3);
+}
+
+details.c-thinking > summary::-webkit-details-marker {
+  display: none;
+}
+
+/* 使用 details/summary 实现折叠（嵌套结构） */
+.c-thinking__details {
+  width: 100%;
+}
+
+.c-thinking__details > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: var(--ds-spacing-2) var(--ds-spacing-3);
+}
+
+.c-thinking__details > summary::-webkit-details-marker {
+  display: none;
+}
+
+/* ========== 头部区域 ========== */
+.c-thinking__header {
+  display: flex;
+  align-items: center;
+  gap: var(--ds-spacing-2);
+  font-size: var(--ds-font-size-1);
+  color: var(--ds-color-secondary-11);
+}
+
+/* 摘要行（兼容旧结构） */
+.c-thinking__summary {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ds-spacing-2);
+  padding: var(--ds-spacing-2) var(--ds-spacing-3);
+}
+
+/* 图标 */
+.c-thinking__icon {
+  width: var(--ds-icon-size-2);
+  height: var(--ds-icon-size-2);
+  color: var(--ds-color-info-9);
+  flex-shrink: 0;
+}
+
+.c-thinking__icon svg {
+  width: 100%;
+  height: 100%;
+  fill: currentColor;
+}
+
+/* 折叠箭头 */
+.c-thinking__chevron {
+  width: var(--ds-icon-size-1);
+  height: var(--ds-icon-size-1);
+  transition: transform var(--ds-transition-fast);
+  color: var(--ds-color-neutral-a11);
+  flex-shrink: 0;
+}
+
+.c-thinking__chevron svg {
+  width: 100%;
+  height: 100%;
+  fill: currentColor;
+}
+
+/* 展开时旋转箭头 */
+details.c-thinking[open] .c-thinking__chevron,
+.c-thinking__details[open] .c-thinking__chevron {
+  transform: rotate(90deg);
+}
+
+/* 标题 */
+.c-thinking__title {
+  font-weight: var(--ds-font-weight-semibold);
+  color: var(--ds-color-secondary-12);
+  flex-shrink: 0;
+}
+
+/* 摘要文本（折叠时显示） */
+.c-thinking__summary-text,
+.c-thinking__summary {
+  font-size: var(--ds-font-size-1);
+  color: var(--ds-color-neutral-a11);
+  font-weight: var(--ds-font-weight-normal);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 300px;
+  flex: 1;
+}
+
+/* ========== 内容区域 ========== */
+.c-thinking__content {
+  padding: var(--ds-spacing-2) var(--ds-spacing-3);
+  padding-top: 0;
+  font-size: var(--ds-font-size-2);
+  line-height: var(--ds-line-height-normal);
+  color: var(--ds-color-neutral-12);
+  border-top: 1px solid var(--ds-color-neutral-a4);
+  margin-top: var(--ds-spacing-2);
+}
+
+.c-thinking__text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ========== 思考过程徽章 ========== */
+.c-thinking__badge {
+  font-size: var(--ds-font-size-0);
+  padding: var(--ds-spacing-0_5) var(--ds-spacing-1_5);
+  border-radius: var(--ds-radius-full);
+  background: var(--ds-color-neutral-a3);
+  color: var(--ds-color-neutral-a11);
+  font-weight: var(--ds-font-weight-medium);
+  flex-shrink: 0;
+}
+
+.c-thinking__badge--active {
+  background: var(--ds-color-info-2);
+  color: var(--ds-color-info-9);
+}
+
+/* ========== 流式输出动画 ========== */
+.c-thinking__cursor {
+  display: inline-block;
+  width: 6px;
+  height: 14px;
+  background: var(--ds-color-accent-9);
+  margin-left: var(--ds-spacing-1);
+  animation: thinking-cursor 1s ease-in-out infinite;
+  border-radius: 1px;
+  vertical-align: middle;
+}
+
+.c-thinking__streaming-cursor {
+  display: inline-block;
+  width: 6px;
+  height: 14px;
+  background: var(--ds-color-accent-9);
+  margin-left: var(--ds-spacing-1);
+  animation: thinking-cursor 1s ease-in-out infinite;
+  border-radius: 1px;
+}
+
+.c-thinking--streaming .c-thinking__content::after {
+  content: '▋';
+  animation: thinking-cursor 1s ease-in-out infinite;
+  color: var(--ds-color-accent-a11);
+}
+
+@keyframes thinking-cursor {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+

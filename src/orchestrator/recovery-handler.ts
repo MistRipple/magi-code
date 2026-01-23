@@ -14,7 +14,7 @@ import { VerificationResult } from './verification-runner';
 
 /** 恢复策略 */
 export type RecoveryStrategy =
-  | 'retry_same_cli'      // 原 CLI 修复
+  | 'retry_same_worker'   // 原 Worker 修复
   | 'retry_with_context'  // 提供更多上下文
   | 'escalate_to_claude'  // 升级到 Claude
   | 'rollback';           // 回滚
@@ -54,18 +54,18 @@ const DEFAULT_CONFIG: RecoveryConfig = {
  * 失败恢复处理器
  */
 export class RecoveryHandler {
-  private cliFactory: IAdapterFactory;
+  private adapterFactory: IAdapterFactory;
   private snapshotManager: SnapshotManager;
   private unifiedTaskManager: UnifiedTaskManager;
   private config: RecoveryConfig;
 
   constructor(
-    cliFactory: IAdapterFactory,
+    adapterFactory: IAdapterFactory,
     snapshotManager: SnapshotManager,
     unifiedTaskManager: UnifiedTaskManager,
     config?: Partial<RecoveryConfig>
   ) {
-    this.cliFactory = cliFactory;
+    this.adapterFactory = adapterFactory;
     this.snapshotManager = snapshotManager;
     this.unifiedTaskManager = unifiedTaskManager;
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -96,8 +96,8 @@ export class RecoveryHandler {
     let result: RecoveryResult;
 
     switch (strategy) {
-      case 'retry_same_cli':
-        result = await this.retrySameCli(taskId, failedTask, errorDetails);
+      case 'retry_same_worker':
+        result = await this.retrySameWorker(taskId, failedTask, errorDetails);
         break;
       case 'retry_with_context':
         result = await this.retryWithContext(taskId, failedTask, errorDetails);
@@ -139,7 +139,7 @@ export class RecoveryHandler {
 
   private getRecoveryPlan(failureType: FailureType): RecoveryStrategy[] {
     const plans: Record<FailureType, RecoveryStrategy[]> = {
-      tool_failure: ['retry_same_cli', 'retry_with_context', 'rollback'],
+      tool_failure: ['retry_same_worker', 'retry_with_context', 'rollback'],
       compile_failure: ['retry_with_context', 'escalate_to_claude', 'rollback'],
       test_failure: ['retry_with_context', 'escalate_to_claude', 'rollback'],
       logic_failure: ['escalate_to_claude', 'rollback'],
@@ -150,14 +150,14 @@ export class RecoveryHandler {
   }
 
   /**
-   * 原 CLI 尝试修复
+   * 原 Worker 尝试修复
    */
-  private async retrySameCli(
+  private async retrySameWorker(
     taskId: string,
     failedTask: SubTask,
     errorDetails: string
   ): Promise<RecoveryResult> {
-    logger.info('编排器.恢复.重试.原始_CLI', { cli: failedTask.assignedWorker }, LogCategory.ORCHESTRATOR);
+    logger.info('编排器.恢复.重试.原始_Worker', { agent: failedTask.assignedWorker }, LogCategory.ORCHESTRATOR);
 
     await this.unifiedTaskManager.resetSubTaskForRetry(taskId, failedTask.id);
     await this.unifiedTaskManager.startSubTask(taskId, failedTask.id);
@@ -165,13 +165,13 @@ export class RecoveryHandler {
     const fixPrompt = this.buildFixPrompt(failedTask, errorDetails, 'simple');
 
     try {
-      const response = await this.cliFactory.sendMessage(failedTask.assignedWorker as any, fixPrompt);  // ✅ 临时类型断言
+      const response = await this.adapterFactory.sendMessage(failedTask.assignedWorker as any, fixPrompt);  // ✅ 临时类型断言
 
       if (response.error) {
         await this.unifiedTaskManager.failSubTask(taskId, failedTask.id, response.error);
         return {
           success: false,
-          strategy: 'retry_same_cli',
+          strategy: 'retry_same_worker',
           attempts: failedTask.retryCount,
           message: `修复失败: ${response.error}`,
         };
@@ -189,15 +189,15 @@ export class RecoveryHandler {
       }
       return {
         success: true,
-        strategy: 'retry_same_cli',
+        strategy: 'retry_same_worker',
         attempts: failedTask.retryCount,
-        message: '原 CLI 修复成功',
+        message: '原 Worker 修复成功',
       };
     } catch (error) {
       await this.unifiedTaskManager.failSubTask(taskId, failedTask.id, String(error));
       return {
         success: false,
-        strategy: 'retry_same_cli',
+        strategy: 'retry_same_worker',
         attempts: failedTask.retryCount,
         message: `修复异常: ${error instanceof Error ? error.message : String(error)}`,
       };
@@ -212,7 +212,7 @@ export class RecoveryHandler {
     failedTask: SubTask,
     errorDetails: string
   ): Promise<RecoveryResult> {
-    logger.info('编排器.恢复.提供_上下文', { cli: failedTask.assignedWorker }, LogCategory.ORCHESTRATOR);
+    logger.info('编排器.恢复.提供_上下文', { agent: failedTask.assignedWorker }, LogCategory.ORCHESTRATOR);
 
     await this.unifiedTaskManager.resetSubTaskForRetry(taskId, failedTask.id);
     await this.unifiedTaskManager.startSubTask(taskId, failedTask.id);
@@ -220,7 +220,7 @@ export class RecoveryHandler {
     const fixPrompt = this.buildFixPrompt(failedTask, errorDetails, 'detailed');
 
     try {
-      const response = await this.cliFactory.sendMessage(failedTask.assignedWorker as any, fixPrompt);  // ✅ 临时类型断言
+      const response = await this.adapterFactory.sendMessage(failedTask.assignedWorker as any, fixPrompt);  // ✅ 临时类型断言
 
       if (response.error) {
         await this.unifiedTaskManager.failSubTask(taskId, failedTask.id, response.error);
@@ -275,7 +275,7 @@ export class RecoveryHandler {
     const escalatePrompt = this.buildEscalatePrompt(failedTask, errorDetails);
 
     try {
-      const response = await this.cliFactory.sendMessage(this.config.escalateWorker, escalatePrompt);
+      const response = await this.adapterFactory.sendMessage(this.config.escalateWorker, escalatePrompt);
 
       if (response.error) {
         await this.unifiedTaskManager.failSubTask(taskId, failedTask.id, response.error);

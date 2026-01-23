@@ -19,11 +19,14 @@ export let currentBottomTab = 'thread';
 
 // 消息状态
 export let threadMessages = previousState.threadMessages || [];
-export let cliOutputs = previousState.cliOutputs || { claude: [], codex: [], gemini: [] };
+export let agentOutputs = previousState.agentOutputs || { claude: [], codex: [], gemini: [] };
 
 // 会话状态
 export let sessions = previousState.sessions || [];
-const injectedSessionId = '{{initialSessionId}}';
+const rawInjectedSessionId = (typeof window !== 'undefined' && window.__INITIAL_SESSION_ID__) || '';
+const injectedSessionId = rawInjectedSessionId && !String(rawInjectedSessionId).startsWith('{{')
+  ? rawInjectedSessionId
+  : '';
 export let currentSessionId = previousState.currentSessionId || (injectedSessionId || null);
 
 // 变更和任务状态
@@ -35,7 +38,7 @@ export let isProcessing = previousState.isProcessing || false;
 export let thinkingStartAt = previousState.thinkingStartAt || null;
 export let localProcessingUntil = 0;
 export let streamingHintTimer = null;
-export let processingActor = previousState.processingActor || { source: 'orchestrator', cli: 'claude' };
+export let processingActor = previousState.processingActor || { source: 'orchestrator', agent: 'claude' };
 
 // 后端下发的完整状态（用于 UI 渲染）
 export let appState = null;
@@ -51,16 +54,16 @@ export let hasInitialRender = false;
 
 // 消息列表限制
 const MAX_THREAD_MESSAGES = 500;
-const MAX_CLI_MESSAGES = 200;
+const MAX_AGENT_MESSAGES = 200;
 
 // 裁剪消息列表
 export function trimMessageLists() {
   if (threadMessages.length > MAX_THREAD_MESSAGES) {
     threadMessages = threadMessages.slice(-MAX_THREAD_MESSAGES);
   }
-  ['claude', 'codex', 'gemini'].forEach(cli => {
-    if (cliOutputs[cli] && cliOutputs[cli].length > MAX_CLI_MESSAGES) {
-      cliOutputs[cli] = cliOutputs[cli].slice(-MAX_CLI_MESSAGES);
+  ['claude', 'codex', 'gemini'].forEach(agent => {
+    if (agentOutputs[agent] && agentOutputs[agent].length > MAX_AGENT_MESSAGES) {
+      agentOutputs[agent] = agentOutputs[agent].slice(-MAX_AGENT_MESSAGES);
     }
   });
 }
@@ -72,7 +75,7 @@ export function saveWebviewState() {
     currentTopTab,
     currentBottomTab,
     threadMessages,
-    cliOutputs,
+    agentOutputs,
     sessions,
     currentSessionId,
     pendingChanges,
@@ -111,13 +114,13 @@ export function setThinkingStartAt(value) {
   saveWebviewState();
 }
 
-export function setProcessingActor(source, cli) {
+export function setProcessingActor(source, agent) {
   if (source && typeof source === 'object') {
     processingActor = source;
   } else {
     processingActor = {
       source: source || 'orchestrator',
-      cli: cli || 'claude'
+      agent: agent || 'claude'
     };
   }
   saveWebviewState();
@@ -132,11 +135,11 @@ export function addThreadMessage(message) {
   saveWebviewState();
 }
 
-export function addCliOutput(cli, message) {
-  if (!cliOutputs[cli]) {
-    cliOutputs[cli] = [];
+export function addAgentOutput(agent, message) {
+  if (!agentOutputs[agent]) {
+    agentOutputs[agent] = [];
   }
-  cliOutputs[cli].push(message);
+  agentOutputs[agent].push(message);
   saveWebviewState();
 }
 
@@ -145,8 +148,8 @@ export function clearThreadMessages() {
   saveWebviewState();
 }
 
-export function clearCliOutputs() {
-  cliOutputs = { claude: [], codex: [], gemini: [] };
+export function clearAgentOutputs() {
+  agentOutputs = { claude: [], codex: [], gemini: [] };
   saveWebviewState();
 }
 
@@ -236,7 +239,7 @@ export const state = {
   get currentTopTab() { return currentTopTab; },
   get currentBottomTab() { return currentBottomTab; },
   get threadMessages() { return threadMessages; },
-  get cliOutputs() { return cliOutputs; },
+  get agentOutputs() { return agentOutputs; },
   get sessions() { return sessions; },
   get currentSessionId() { return currentSessionId; },
   get pendingChanges() { return pendingChanges; },

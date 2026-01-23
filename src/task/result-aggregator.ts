@@ -1,6 +1,6 @@
 /**
  * 结果聚合器
- * 合并多个 CLI 的输出，生成统一报告
+ * 合并多个模型的输出，生成统一报告
  */
 
 import { WorkerSlot, AgentType } from '../types';  // ✅ 导入 AgentType
@@ -49,7 +49,7 @@ export interface WorkerStats {
 /** 文件变更摘要 */
 export interface FileChangeSummary {
   filePath: string;
-  cli: AgentType;  // ✅ 使用 AgentType
+  agent: AgentType;  // ✅ 使用 AgentType
   additions: number;
   deletions: number;
 }
@@ -134,7 +134,7 @@ export class ResultAggregator {
   private extractFileChanges(diffs: DiffResult[]): FileChangeSummary[] {
     return diffs.map(d => ({
       filePath: d.filePath,
-      cli: d.source,
+      agent: d.source,
       additions: d.additions,
       deletions: d.deletions,
     }));
@@ -183,4 +183,3 @@ export class ResultAggregator {
     return lines.join('\n');
   }
 }
-

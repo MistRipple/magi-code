@@ -1,7 +1,7 @@
 /**
- * Codex CLI Normalizer
+ * Codex LLM Normalizer
  * 
- * 解析 Codex CLI 输出
+ * 解析 Codex Agent 输出
  * 支持 --json 事件流与纯文本降级
  */
 
@@ -19,7 +19,7 @@ import {
 } from '../protocol';
 
 /**
- * Codex CLI Normalizer
+ * Codex LLM Normalizer
  */
 export class CodexNormalizer extends BaseNormalizer {
   private codeBlockBuffer: string = '';

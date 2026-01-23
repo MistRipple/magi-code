@@ -105,7 +105,7 @@ class MessageRoutingEngineer implements TestEngineer {
   private async testWorkerRouting(): Promise<{ passed: boolean; issues: TestIssue[] }> {
     const issues: TestIssue[] = [];
     
-    // 检查 Worker 消息是否正确路由到 CLI 面板
+    // 检查 Worker 消息是否正确路由到 Worker 面板
     
     return { passed: true, issues };
   }

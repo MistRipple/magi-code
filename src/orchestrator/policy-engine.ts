@@ -542,15 +542,15 @@ export class PolicyEngine extends EventEmitter {
   /**
    * 决定是否需要 Hard Stop（用户确认）
    */
-  shouldHardStop(riskAssessment: RiskAssessment, mode: 'ask' | 'agent' | 'auto'): boolean {
+  shouldHardStop(riskAssessment: RiskAssessment, mode: 'ask' | 'auto'): boolean {
     // Auto 模式跳过 Hard Stop
     if (mode === 'auto') return false;
 
     // Ask 模式不执行任务，无需 Hard Stop
     if (mode === 'ask') return false;
 
-    // Agent 模式根据风险等级决定
-    return riskAssessment.hardStop;
+    // 默认不需要 Hard Stop
+    return false;
   }
 
   // ========== 降级策略 ==========

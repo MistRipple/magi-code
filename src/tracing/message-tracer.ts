@@ -13,9 +13,9 @@ export type TraceLayer =
   | 'webview-provider'
   | 'orchestrator'
   | 'mission-executor'
-  | 'cli-adapter'
+  | 'llm-adapter'
   | 'session-manager'
-  | 'cli-process';
+  | 'llm-client';
 
 /** 追踪消息类型 */
 export type TraceMessageType = 'request' | 'response' | 'event' | 'stream' | 'error';

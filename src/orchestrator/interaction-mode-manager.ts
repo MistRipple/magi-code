@@ -89,7 +89,6 @@ export class InteractionModeManager {
     if (!trimmed) return true;
 
     // 强制模式
-    if (this.interactionMode === 'agent') return false;
     if (this.interactionMode === 'ask') return true;
 
     // 命令前缀

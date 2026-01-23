@@ -3,7 +3,7 @@
 
 import {
   threadMessages,
-  cliOutputs,
+  agentOutputs,
   currentSessionId,
   currentTopTab,
   currentBottomTab,
@@ -57,12 +57,12 @@ import {
   showQuestionRequest,
   showWorkerQuestion,
   showPlanConfirmation,
-  updateCliDots,
   updatePromptEnhanceStatus,
   handlePromptEnhanced,
   loadSessionMessages,
   showToast,
-  addSystemMessage
+  addSystemMessage,
+  setProcessingState
 } from './message-handler.js';
 
 import { showDependencyAnalysis } from './message-renderer.js';
@@ -71,7 +71,11 @@ import {
   initializeSettingsPanel
 } from './settings-handler.js';
 
-let currentInteractionMode = 'agent';
+import {
+  loadProjectKnowledge
+} from './knowledge-handler.js';
+
+let currentInteractionMode = 'auto';
 let currentWorkerModel = 'claude';
 let workerConfigs = {
   claude: null,
@@ -111,18 +115,17 @@ function interruptCurrentOperation() {
 }
 
 export function updateInteractionModeUI(mode) {
-  currentInteractionMode = mode || 'agent';
+  currentInteractionMode = mode || 'auto';
   const selector = document.getElementById('mode-selector');
   if (selector) selector.value = currentInteractionMode;
 }
 
 export function getModeDisplayName(mode) {
   const map = {
-    agent: 'Agent',
     ask: 'Ask',
     auto: 'Auto'
   };
-  return map[mode] || mode || 'Agent';
+  return map[mode] || mode || 'Auto';
 }
 
 function savePromptEnhanceConfig() {
@@ -362,6 +365,9 @@ export function handleTopTabClick(tabName) {
     renderTasksView();
   } else if (tabName === 'edits') {
     renderEditsView();
+  } else if (tabName === 'knowledge') {
+    // 加载项目知识
+    loadProjectKnowledge();
   }
 
   saveWebviewState();
@@ -388,7 +394,7 @@ export function handleSettingsTabClick(tabName) {
 
   // 显示对应内容
   document.querySelectorAll('.settings-tab-content').forEach(content => {
-    content.style.display = content.id === `settings-tab-${tabName}` ? 'block' : 'none';
+    content.classList.toggle('active', content.id === `settings-tab-${tabName}`);
   });
 }
 
@@ -474,10 +480,12 @@ export function handleExecuteButtonClick() {
   // 正常执行任务
   const promptText = input.value.trim() || '请分析这张图片';
   const hasImages = attachedImages.length > 0;
-  const selectedCli = document.getElementById('cli-selector')?.value || '';
-  const isOrchestratorMode = !selectedCli;
+  const selectedAgent = document.getElementById('agent-selector')?.value || '';
+  const isOrchestratorMode = !selectedAgent;
 
-  setProcessingActor(isOrchestratorMode ? 'orchestrator' : 'worker', selectedCli || 'claude');
+  // 立即设置处理状态，显示思考动画
+  setProcessingActor(isOrchestratorMode ? 'orchestrator' : 'worker', selectedAgent || 'claude');
+  setProcessingState(true, true);  // 立即开始计时
 
   const imageDataUrls = hasImages ? attachedImages.map(img => img.dataUrl) : [];
 
@@ -493,8 +501,8 @@ export function handleExecuteButtonClick() {
   renderMainContent();
   saveWebviewState();
 
-  const mode = isOrchestratorMode ? 'agent' : 'ask';
-  executeTask(promptText, hasImages ? imageDataUrls : null, mode, selectedCli || null);
+  const mode = isOrchestratorMode ? currentInteractionMode : 'auto';
+  executeTask(promptText, hasImages ? imageDataUrls : null, mode, selectedAgent || null);
 
   input.value = '';
   attachedImages.length = 0;
@@ -773,11 +781,11 @@ export function initializeEventListeners() {
     promptInput.addEventListener('paste', handlePromptInputPaste);
   }
 
-  // CLI 选择器
-  const cliSelector = document.getElementById('cli-selector');
-  if (cliSelector) {
-    cliSelector.addEventListener('change', (e) => {
-      postMessage({ type: 'selectCli', cli: e.target.value || null });
+  // 模型选择器
+  const modelSelector = document.getElementById('model-selector');
+  if (modelSelector) {
+    modelSelector.addEventListener('change', (e) => {
+      postMessage({ type: 'selectWorker', worker: e.target.value || null });
     });
   }
 
@@ -946,13 +954,11 @@ export function initializeEventListeners() {
   }
 
   if (promptEnhanceEye && promptEnhanceKey) {
-    promptEnhanceEye.addEventListener('click', () => {
+    promptEnhanceEye.addEventListener('click', (event) => {
+      event.preventDefault();
       const isPassword = promptEnhanceKey.type === 'password';
       promptEnhanceKey.type = isPassword ? 'text' : 'password';
-      const closed = promptEnhanceEye.querySelector('.eye-closed');
-      const open = promptEnhanceEye.querySelector('.eye-open');
-      if (closed) closed.style.display = isPassword ? 'none' : 'block';
-      if (open) open.style.display = isPassword ? 'block' : 'none';
+      promptEnhanceEye.classList.toggle('visible', isPassword);
     });
   }
 
@@ -961,6 +967,8 @@ export function initializeEventListeners() {
       const btn = promptEnhanceTest;
       btn.classList.add('loading');
       btn.disabled = true;
+      const promptEnhanceStatus = document.getElementById('prompt-enhance-status');
+      if (promptEnhanceStatus) promptEnhanceStatus.style.display = 'none';
       postMessage({
         type: 'testPromptEnhance',
         baseUrl: promptEnhanceUrl ? promptEnhanceUrl.value : '',
@@ -968,6 +976,171 @@ export function initializeEventListeners() {
       });
     });
   }
+
+  // LLM API Key 显示/隐藏
+  document.body.addEventListener('click', (event) => {
+    const btn = event.target.closest('.llm-config-eye-btn');
+    if (!btn) return;
+    event.preventDefault();
+    const targetId = btn.getAttribute('data-target');
+    if (!targetId) return;
+    const input = document.getElementById(targetId);
+    if (!input) return;
+
+    const isPassword = input.type === 'password';
+    input.type = isPassword ? 'text' : 'password';
+    btn.classList.toggle('visible', isPassword);
+  });
+
+  // Worker 模型选择器切换
+  document.querySelectorAll('.worker-model-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      const worker = tab.dataset.worker;
+      if (worker === currentWorkerModel) return;
+      document.querySelectorAll('.worker-model-tab').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      currentWorkerModel = worker;
+      displayWorkerConfig(worker);
+    });
+  });
+
+  // 保存 Worker 配置
+  const workerSaveBtn = document.getElementById('worker-save-btn');
+  if (workerSaveBtn) {
+    workerSaveBtn.addEventListener('click', () => {
+      const baseUrlInput = document.getElementById('worker-base-url');
+      const apiKeyInput = document.getElementById('worker-api-key');
+      const modelInput = document.getElementById('worker-model');
+      const providerSelect = document.getElementById('worker-provider');
+      const enabledCheckbox = document.getElementById('worker-enabled');
+
+      const config = {
+        baseUrl: baseUrlInput ? baseUrlInput.value : '',
+        apiKey: apiKeyInput ? apiKeyInput.value : '',
+        model: modelInput ? modelInput.value : '',
+        provider: providerSelect ? providerSelect.value : 'anthropic',
+        enabled: enabledCheckbox ? enabledCheckbox.checked : true
+      };
+
+      workerConfigs[currentWorkerModel] = config;
+      postMessage({ type: 'saveWorkerConfig', worker: currentWorkerModel, config: config });
+    });
+  }
+
+  // 测试 Worker 连接
+  const workerTestBtn = document.getElementById('worker-test-btn');
+  if (workerTestBtn) {
+    workerTestBtn.addEventListener('click', () => {
+      const baseUrlInput = document.getElementById('worker-base-url');
+      const apiKeyInput = document.getElementById('worker-api-key');
+      const modelInput = document.getElementById('worker-model');
+      const providerSelect = document.getElementById('worker-provider');
+
+      const config = {
+        baseUrl: baseUrlInput ? baseUrlInput.value : '',
+        apiKey: apiKeyInput ? apiKeyInput.value : '',
+        model: modelInput ? modelInput.value : '',
+        provider: providerSelect ? providerSelect.value : 'anthropic',
+        enabled: true
+      };
+
+      workerTestBtn.classList.add('loading');
+      workerTestBtn.disabled = true;
+      postMessage({ type: 'testWorkerConnection', worker: currentWorkerModel, config: config });
+    });
+  }
+
+  // 保存编排者配置
+  const orchSaveBtn = document.getElementById('orch-save-btn');
+  if (orchSaveBtn) {
+    orchSaveBtn.addEventListener('click', () => {
+      const baseUrlInput = document.getElementById('orch-base-url');
+      const apiKeyInput = document.getElementById('orch-api-key');
+      const modelInput = document.getElementById('orch-model');
+      const providerSelect = document.getElementById('orch-provider');
+
+      const config = {
+        baseUrl: baseUrlInput ? baseUrlInput.value : '',
+        apiKey: apiKeyInput ? apiKeyInput.value : '',
+        model: modelInput ? modelInput.value : '',
+        provider: providerSelect ? providerSelect.value : 'anthropic',
+        enabled: true
+      };
+
+      postMessage({ type: 'saveOrchestratorConfig', config: config });
+    });
+  }
+
+  // 测试编排者连接
+  const orchTestBtn = document.getElementById('orch-test-btn');
+  if (orchTestBtn) {
+    orchTestBtn.addEventListener('click', () => {
+      const baseUrlInput = document.getElementById('orch-base-url');
+      const apiKeyInput = document.getElementById('orch-api-key');
+      const modelInput = document.getElementById('orch-model');
+      const providerSelect = document.getElementById('orch-provider');
+
+      const config = {
+        baseUrl: baseUrlInput ? baseUrlInput.value : '',
+        apiKey: apiKeyInput ? apiKeyInput.value : '',
+        model: modelInput ? modelInput.value : '',
+        provider: providerSelect ? providerSelect.value : 'anthropic',
+        enabled: true
+      };
+
+      orchTestBtn.classList.add('loading');
+      orchTestBtn.disabled = true;
+      postMessage({ type: 'testOrchestratorConnection', config: config });
+    });
+  }
+
+  // 保存压缩器配置
+  const compSaveBtn = document.getElementById('comp-save-btn');
+  if (compSaveBtn) {
+    compSaveBtn.addEventListener('click', () => {
+      const baseUrlInput = document.getElementById('comp-base-url');
+      const apiKeyInput = document.getElementById('comp-api-key');
+      const modelInput = document.getElementById('comp-model');
+      const providerSelect = document.getElementById('comp-provider');
+
+      const config = {
+        enabled: true,
+        baseUrl: baseUrlInput ? baseUrlInput.value : '',
+        apiKey: apiKeyInput ? apiKeyInput.value : '',
+        model: modelInput ? modelInput.value : '',
+        provider: providerSelect ? providerSelect.value : 'anthropic'
+      };
+
+      postMessage({ type: 'saveCompressorConfig', config: config });
+    });
+  }
+
+  // 测试压缩器连接
+  const compTestBtn = document.getElementById('comp-test-btn');
+  if (compTestBtn) {
+    compTestBtn.addEventListener('click', () => {
+      const baseUrlInput = document.getElementById('comp-base-url');
+      const apiKeyInput = document.getElementById('comp-api-key');
+      const modelInput = document.getElementById('comp-model');
+      const providerSelect = document.getElementById('comp-provider');
+
+      const config = {
+        baseUrl: baseUrlInput ? baseUrlInput.value : '',
+        apiKey: apiKeyInput ? apiKeyInput.value : '',
+        model: modelInput ? modelInput.value : '',
+        provider: providerSelect ? providerSelect.value : 'anthropic',
+        enabled: true
+      };
+
+      compTestBtn.classList.add('loading');
+      compTestBtn.disabled = true;
+      postMessage({ type: 'testCompressorConnection', config: config });
+    });
+  }
+
+  initWorkerModelConfig();
+  initOrchestratorConfig();
+  initCompressorConfig();
 
   // 系统事件
   document.addEventListener('visibilitychange', handleVisibilityChange);

@@ -51,7 +51,7 @@ export class SnapshotCleaner {
       const snapshotDir = this.sessionManager.getSnapshotsDir(sessionId);
 
       // 按时间排序（最新的在前）
-      const sortedSnapshots = [...snapshots].sort((a, b) => b.lastModifiedAt - a.lastModifiedAt);
+      const sortedSnapshots = [...snapshots].sort((a, b) => b.timestamp - a.timestamp);
 
       for (let i = 0; i < sortedSnapshots.length; i++) {
         const snapshot = sortedSnapshots[i];
@@ -63,7 +63,7 @@ export class SnapshotCleaner {
 
         // 检查是否过期
         if (options.olderThanDays) {
-          const age = Date.now() - snapshot.lastModifiedAt;
+          const age = Date.now() - snapshot.timestamp;
           const days = age / (1000 * 60 * 60 * 24);
           if (days < options.olderThanDays) {
             continue;

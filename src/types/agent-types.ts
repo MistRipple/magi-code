@@ -1,7 +1,7 @@
 /**
  * Agent 类型系统
  *
- * 用于替代原有的 CLIType，支持 LLM 模式
+ * 已完全替代原有的 CLIType，现在使用 LLM 模式
  */
 
 /**

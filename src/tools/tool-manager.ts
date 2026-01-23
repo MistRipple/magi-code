@@ -12,6 +12,7 @@ import {
 import { ToolCall, ToolResult, ToolDefinition } from '../llm/types';
 import { ShellExecutor } from './shell-executor';
 import { logger, LogCategory } from '../logging';
+import { PermissionMatrix } from '../types';
 
 /**
  * 工具管理器
@@ -21,10 +22,42 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   private mcpExecutors: Map<string, ToolExecutor> = new Map();
   private skillExecutors: Map<string, ToolExecutor> = new Map();
   private toolCache: Map<string, ExtendedToolDefinition> = new Map();
+  private permissions: PermissionMatrix;
+  private authorizationCallback?: (toolName: string, toolArgs: any) => Promise<boolean>;
 
-  constructor() {
+  constructor(permissions?: PermissionMatrix) {
     super();
     this.shellExecutor = new ShellExecutor();
+    this.permissions = permissions || {
+      allowEdit: true,
+      allowBash: true,
+      allowWeb: true,
+    };
+  }
+
+  /**
+   * 设置工具授权回调
+   */
+  setAuthorizationCallback(callback?: (toolName: string, toolArgs: any) => Promise<boolean>): void {
+    this.authorizationCallback = callback;
+    logger.info('Tool authorization callback updated', {
+      hasCallback: !!callback
+    }, LogCategory.TOOLS);
+  }
+
+  /**
+   * 设置权限矩阵
+   */
+  setPermissions(permissions: PermissionMatrix): void {
+    this.permissions = permissions;
+    logger.info('Tool permissions updated', permissions, LogCategory.TOOLS);
+  }
+
+  /**
+   * 获取当前权限
+   */
+  getPermissions(): PermissionMatrix {
+    return { ...this.permissions };
   }
 
   /**
@@ -73,8 +106,22 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     }, LogCategory.TOOLS);
 
     try {
+      // 检查授权（包括权限和用户授权）
+      const authCheck = await this.checkAuthorization(toolCall);
+      if (!authCheck.allowed) {
+        logger.warn('Tool execution blocked', {
+          toolName: toolCall.name,
+          reason: authCheck.reason,
+        }, LogCategory.TOOLS);
+        return {
+          toolCallId: toolCall.id,
+          content: `Tool blocked: ${authCheck.reason}`,
+          isError: true,
+        };
+      }
+
       // 检查是否是内置 Shell 工具
-      if (toolCall.name === 'execute_shell') {
+      if (toolCall.name === 'execute_shell' || toolCall.name === 'Bash') {
         return await this.executeShellTool(toolCall);
       }
 
@@ -112,6 +159,65 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         isError: true,
       };
     }
+  }
+
+  /**
+   * 检查工具授权（包括权限和用户授权）
+   */
+  private async checkAuthorization(toolCall: ToolCall): Promise<{ allowed: boolean; reason?: string }> {
+    // 1. 先检查基础权限
+    const permissionCheck = this.checkPermission(toolCall.name);
+    if (!permissionCheck.allowed) {
+      return permissionCheck;
+    }
+
+    // 2. 如果没有授权回调，默认允许（Auto 模式）
+    if (!this.authorizationCallback) {
+      return { allowed: true };
+    }
+
+    // 3. 请求用户授权（Ask 模式）
+    try {
+      const allowed = await this.authorizationCallback(toolCall.name, toolCall.arguments);
+      if (!allowed) {
+        return { allowed: false, reason: 'User denied tool authorization' };
+      }
+      return { allowed: true };
+    } catch (error) {
+      return { allowed: false, reason: 'Authorization request failed' };
+    }
+  }
+
+  /**
+   * 检查工具权限
+   */
+  private checkPermission(toolName: string): { allowed: boolean; reason?: string } {
+    // Bash/Shell 工具需要 allowBash 权限
+    if (toolName === 'Bash' || toolName === 'execute_shell') {
+      if (!this.permissions.allowBash) {
+        return { allowed: false, reason: 'Bash execution is disabled' };
+      }
+      return { allowed: true };
+    }
+
+    // Edit/Write 工具需要 allowEdit 权限
+    if (toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit') {
+      if (!this.permissions.allowEdit) {
+        return { allowed: false, reason: 'File editing is disabled' };
+      }
+      return { allowed: true };
+    }
+
+    // Web 相关工具需要 allowWeb 权限
+    if (toolName === 'WebFetch' || toolName === 'WebSearch' || toolName.toLowerCase().includes('web')) {
+      if (!this.permissions.allowWeb) {
+        return { allowed: false, reason: 'Web access is disabled' };
+      }
+      return { allowed: true };
+    }
+
+    // 其他工具默认允许（Read, Grep, Glob 等只读工具）
+    return { allowed: true };
   }
 
   /**

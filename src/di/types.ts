@@ -32,6 +32,6 @@ export const TYPES = {
   ProfileLoader: Symbol.for('ProfileLoader'),
   GuidanceInjector: Symbol.for('GuidanceInjector'),
 
-  // CLI 适配器
-  CLIAdapterFactory: Symbol.for('CLIAdapterFactory'),
+  // 适配器（已迁移到 LLMAdapterFactory）
+  // CLIAdapterFactory: Symbol.for('CLIAdapterFactory'), // ⚠️ 已废弃，使用 LLMAdapterFactory
 };

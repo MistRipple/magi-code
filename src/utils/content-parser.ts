@@ -1,9 +1,9 @@
 /**
  * 内容解析器模块
- * 将 CLI 原始输出解析为统一的 ContentBlock 格式
+ * 将模型原始输出解析为统一的 ContentBlock 格式
  *
  * 设计目标：
- * 1. 后端统一处理所有 CLI 输出格式
+ * 1. 后端统一处理所有 Agent 输出格式
  * 2. 解析为结构化的 ContentBlock
  * 3. 前端负责渲染（使用 marked + highlight.js）
  */
@@ -14,7 +14,7 @@ import { ContentBlock, PlanBlock } from '../protocol/message-protocol';
 export type { ContentBlock, PlanBlock };
 
 /**
- * 移除 ANSI 转义序列（CLI 输出的颜色代码）
+ * 移除 ANSI 转义序列（Agent 输出的颜色代码）
  * 🔧 增强：支持更多类型的 ANSI 序列
  */
 export function stripAnsi(text: string): string {
@@ -43,7 +43,7 @@ export function stripZeroWidth(text: string): string {
 }
 
 /**
- * 预处理 CLI 输出内容
+ * 预处理 Agent 输出内容
  * 清理 ANSI 转义序列、零宽字符等
  */
 export function sanitizeCliOutput(text: string): string {
@@ -228,7 +228,7 @@ export function shouldRenderAsCodeBlock(content: string): boolean {
   // 单行内容不作为代码块
   if (!content.includes('\n')) return false;
 
-  // 🔧 检测带行号的特殊输出格式（CLI 工具输出）
+  // 🔧 检测带行号的特殊输出格式（Agent 工具输出）
   // 注意：避免误判 Markdown 有序列表
 
   // 特殊行号格式：数字→（如 "1→ code"）
@@ -426,7 +426,7 @@ function isValidFilepath(candidate: string): boolean {
 
 /**
  * 核心函数：将原始内容解析为 ContentBlock 数组
- * 这是后端统一处理 CLI 输出的入口
+ * 这是后端统一处理 Agent 输出的入口
  */
 export function parseContentToBlocks(
   rawContent: string,

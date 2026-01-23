@@ -9,7 +9,7 @@
  * │  ├── System Prompt: orchestrator-system.ts (~300 tokens)   │
  * │  └── Task Prompts: orchestrator-prompts.ts (动态生成)        │
  * ├─────────────────────────────────────────────────────────────┤
- * │  Worker (CLI 子代理)                                         │
+ * │  Worker (子代理)                                             │
  * │  ├── System Prompt: worker-system.ts (~150 tokens)          │
  * │  └── Task Prompts: 动态生成 (buildWorkerTaskPrompt)          │
  * ├─────────────────────────────────────────────────────────────┤
@@ -77,4 +77,3 @@ export function getSystemPrompt(
 
   throw new Error(`Invalid role or missing workerType: ${role}`);
 }
-

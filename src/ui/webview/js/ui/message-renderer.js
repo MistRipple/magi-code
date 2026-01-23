@@ -3,7 +3,7 @@
 
 import {
   threadMessages,
-  cliOutputs,
+  agentOutputs,
   currentBottomTab,
   currentSessionId,
   isProcessing,
@@ -17,14 +17,77 @@ import {
   attachedImages,
   currentDependencyAnalysis,
   isDependencyPanelExpanded,
+  streamingHintTimer,
   setDependencyAnalysis,
   setDependencyPanelExpanded,
   saveScrollPosition,
   saveWebviewState,
+  setStreamingHintTimer,
   stopStreamingHintTimer
 } from '../core/state.js';
 
 import { postMessage } from '../core/vscode-api.js';
+
+// 渲染器模块
+import { renderParsedBlocks } from './renderers/markdown-renderer.js';
+
+// 增量更新引擎
+import {
+  getMessageKey,
+  computeMessageUpdates,
+  applyIncrementalUpdates,
+  resetIncrementalState,
+  scheduleUpdate,
+  registerMessageDOM
+} from '../core/incremental-update.js';
+
+// 增量更新开关（可通过控制台切换）
+let incrementalUpdateEnabled = true;
+window.__toggleIncrementalUpdate = () => {
+  incrementalUpdateEnabled = !incrementalUpdateEnabled;
+  console.log('[MessageRenderer] 增量更新:', incrementalUpdateEnabled ? '已启用' : '已禁用');
+  return incrementalUpdateEnabled;
+};
+
+const STREAM_TIMEOUT = 5 * 60 * 1000;
+
+function updateStreamingHintsWithTimeout() {
+  const now = Date.now();
+  let hasTimeout = false;
+
+  threadMessages.forEach(m => {
+    if (m.streaming && m.startedAt && (now - m.startedAt > STREAM_TIMEOUT)) {
+      m.streaming = false;
+      m.timeout = true;
+      m.content = (m.content || '') + '\n\n[超时] 响应超时，已自动结束';
+      hasTimeout = true;
+    }
+  });
+
+  ['claude', 'codex', 'gemini'].forEach(agent => {
+    const msgs = agentOutputs[agent] || [];
+    msgs.forEach(m => {
+      if (m.streaming && m.startedAt && (now - m.startedAt > STREAM_TIMEOUT)) {
+        m.streaming = false;
+        m.timeout = true;
+        m.content = (m.content || '') + '\n\n[超时] 响应超时，已自动结束';
+        hasTimeout = true;
+      }
+    });
+  });
+
+  if (hasTimeout) {
+    saveWebviewState();
+    renderMainContent();
+  }
+}
+
+function startStreamingHintTimer() {
+  if (streamingHintTimer) return;
+  const timer = setInterval(updateStreamingHintsWithTimeout, 1000);
+  setStreamingHintTimer(timer);
+  updateStreamingHintsWithTimeout();
+}
 
 // 创建 state 对象供向后兼容
 const state = {
@@ -111,30 +174,43 @@ export function renderMainContent() {
 
 export function renderThreadView(container) {
       if (threadMessages.length === 0) {
+        resetIncrementalState(); // 清空增量更新状态
         container.innerHTML = '<div class="empty-state"><div class="empty-state-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M14 1a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4.414A2 2 0 0 0 3 11.586l-2 2V2a1 1 0 0 1 1-1h12zM2 0a2 2 0 0 0-2 2v12.793a.5.5 0 0 0 .854.353l2.853-2.853A1 1 0 0 1 4.414 12H14a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2H2z"/></svg></div><span class="empty-state-text">开始新对话</span><span class="empty-state-hint">输入任务描述，按 ⌘↵ 发送</span></div>';
         return;
       }
 
       // 依赖分析面板（Thread面板特有）
-      let html = renderDependencyPanel();
+      const dependencyHtml = renderDependencyPanel();
 
       // 使用统一的消息列表渲染函数
-      html += renderMessageList(threadMessages, {
+      const messagesHtml = renderMessageList(threadMessages, {
         tabType: 'thread',
-        defaultCli: null, // Thread 面板没有默认 CLI
+        defaultAgent: null, // Thread 面板没有默认 Worker
         toolPanelPrefix: 'tool-thread-'
       });
 
       // Thread 面板特有：显示运行中的 Worker 状态卡片
       const runningEntries = collectWorkerStatusEntries();
-      if (runningEntries.length > 0) {
-        html += renderWorkerStatusCard(runningEntries);
-      }
+      const workerStatusHtml = runningEntries.length > 0 ? renderWorkerStatusCard(runningEntries) : '';
 
       // 🔧 重构：统一的动画渲染入口（唯一添加动画的地方）
-      html += renderStreamingAnimation(threadMessages);
+      const animationHtml = renderStreamingAnimation(threadMessages);
+
+      // 组合完整 HTML
+      const html = dependencyHtml + messagesHtml + workerStatusHtml + animationHtml;
 
       container.innerHTML = html;
+
+      // 注册消息 DOM 元素用于增量更新追踪
+      if (incrementalUpdateEnabled) {
+        container.querySelectorAll('[data-message-key]').forEach(el => {
+          const key = el.dataset.messageKey;
+          if (key) {
+            registerMessageDOM(key, el);
+          }
+        });
+      }
+
       // 🔧 修复：同时检测 streaming-hint 和 streaming-footer
       if (container.querySelector('.message-streaming-hint, .message-streaming-footer')) {
         startStreamingHintTimer();
@@ -143,27 +219,27 @@ export function renderThreadView(container) {
       }
     }
 
-export function renderCliOutputView(container, cli) {
-      const messages = cliOutputs[cli] || [];
+export function renderAgentOutputView(container, agent) {
+      const messages = agentOutputs[agent] || [];
       if (!messages.length) {
-        container.innerHTML = '<div class="empty-state"><div class="empty-state-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 9a.5.5 0 0 1 .5-.5h3a.5.5 0 0 1 0 1h-3A.5.5 0 0 1 6 9zM3.854 4.146a.5.5 0 1 0-.708.708L4.793 6.5 3.146 8.146a.5.5 0 1 0 .708.708l2-2a.5.5 0 0 0 0-.708l-2-2z"/><path d="M2 1a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V3a2 2 0 0 0-2-2H2zm12 1a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1h12z"/></svg></div><span class="empty-state-text">' + cli.toUpperCase() + ' 输出</span><span class="empty-state-hint">暂无输出内容</span></div>';
+        container.innerHTML = '<div class="empty-state"><div class="empty-state-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 9a.5.5 0 0 1 .5-.5h3a.5.5 0 0 1 0 1h-3A.5.5 0 0 1 6 9zM3.854 4.146a.5.5 0 1 0-.708.708L4.793 6.5 3.146 8.146a.5.5 0 1 0 .708.708l2-2a.5.5 0 0 0 0-.708l-2-2z"/><path d="M2 1a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V3a2 2 0 0 0-2-2H2zm12 1a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1h12z"/></svg></div><span class="empty-state-text">' + agent.toUpperCase() + ' 输出</span><span class="empty-state-hint">暂无输出内容</span></div>';
         return;
       }
 
       // 使用统一的消息列表渲染函数
       let html = renderMessageList(messages, {
-        tabType: 'cli',
-        defaultCli: cli,
-        toolPanelPrefix: 'tool-cli-' + cli + '-'
+        tabType: 'agent',
+        defaultAgent: agent,
+        toolPanelPrefix: 'tool-agent-' + agent + '-'
       });
 
-      // 🔧 重构：CLI 面板也使用统一的动画渲染入口
-      // 只为当前 CLI 的消息添加动画
-      html += renderStreamingAnimationForCli(messages, cli);
+      // 🔧 重构：Worker 面板也使用统一的动画渲染入口
+      // 只为当前 Worker 的消息添加动画
+      html += renderStreamingAnimationForAgent(messages, agent);
 
       container.innerHTML = html;
 
-      // 🔧 修复：CLI 面板也需要启动/停止动画计时器
+      // 🔧 修复：Worker 面板也需要启动/停止动画计时器
       if (container.querySelector('.message-streaming-hint, .message-streaming-footer')) {
         startStreamingHintTimer();
       }
@@ -175,7 +251,7 @@ export function renderCliOutputView(container, cli) {
 // ============================================
 
 export function renderMessageList(messages, options) {
-      const { tabType, defaultCli, toolPanelPrefix } = options;
+      const { tabType, defaultAgent, toolPanelPrefix } = options;
 
       if (!messages || messages.length === 0) {
         return '';
@@ -241,13 +317,13 @@ export function renderMessageList(messages, options) {
         const isGrouped = prevMessageKey === currentMessageKey;
         prevMessageKey = currentMessageKey;
 
-        const { roleName, badgeClass } = getRoleInfo(m, source, defaultCli);
-        const cli = m.cli || defaultCli || 'claude';
+        const { roleName, badgeClass } = getRoleInfo(m, source, defaultAgent);
+        const agent = m.agent || defaultAgent || 'claude';
 
         html += renderMessageBlock(m, idx, {
           isUser,
           source,
-          cli,
+          agent,
           grouped: isGrouped,
           roleName,
           badgeClass,
@@ -261,7 +337,7 @@ export function renderMessageList(messages, options) {
 export function renderMessageBlock(message, idx, options) {
       const isUser = !!options.isUser;
       const source = options.source || 'worker';
-      const cli = options.cli || message.cli || 'claude';
+      const agent = options.agent || message.agent || 'claude';
       const grouped = !!options.grouped;
       const roleName = options.roleName || '';
       const badgeClass = options.badgeClass || '';
@@ -275,8 +351,11 @@ export function renderMessageBlock(message, idx, options) {
       const clarificationClass = message.isClarification ? ' clarification-message' : '';
       const workerQuestionClass = message.isWorkerQuestion ? ' worker-question-message' : '';
       const streamKeyAttr = message.streamKey ? (' data-stream-key="' + message.streamKey + '"') : '';
-      const cliAttr = cli ? (' data-cli="' + cli + '"') : '';
-      let html = '<div class="message' + messageTypeClass + streamingClass + groupedClass + clarificationClass + workerQuestionClass + '" data-msg-idx="' + idx + '"' + streamKeyAttr + cliAttr + '>';
+      const agentAttr = agent ? (' data-agent="' + agent + '"') : '';
+      // 🔧 增量更新：添加消息唯一标识用于 DOM 追踪
+      const messageKey = getMessageKey(message);
+      const messageKeyAttr = messageKey ? (' data-message-key="' + messageKey + '"') : '';
+      let html = '<div class="message' + messageTypeClass + streamingClass + groupedClass + clarificationClass + workerQuestionClass + '" data-msg-idx="' + idx + '"' + streamKeyAttr + agentAttr + messageKeyAttr + '>';
       html += '<div class="message-body">';
 
       // 悬停操作按钮（非用户消息，且存在可操作项）
@@ -324,17 +403,23 @@ export function renderMessageBlock(message, idx, options) {
         const thinkingSummary = thinkingContent.replace(/\s+/g, ' ').trim().substring(0, 50);
         const summaryDisplay = thinkingSummary + (thinkingContent.length > 50 ? '...' : '');
 
-        html += '<div class="collapsible-panel thinking" data-panel-id="' + panelId + '">';
-        html += '<div class="collapsible-header" onclick="togglePanel(\'' + panelId + '\')">';
-        html += '<span class="collapsible-icon' + (thinkingExpanded ? ' expanded' : '') + '"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></span>';
-        html += '<span class="collapsible-title"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M9.405 1.05c-.413-1.4-2.397-1.4-2.81 0l-.1.34a1.464 1.464 0 0 1-2.105.872l-.31-.17c-1.283-.698-2.686.705-1.987 1.987l.169.311c.446.82.023 1.841-.872 2.105l-.34.1c-1.4.413-1.4 2.397 0 2.81l.34.1a1.464 1.464 0 0 1 .872 2.105l-.17.31c-.698 1.283.705 2.686 1.987 1.987l.311-.169a1.464 1.464 0 0 1 2.105.872l.1.34c.413 1.4 2.397 1.4 2.81 0l.1-.34a1.464 1.464 0 0 1 2.105-.872l.31.17c1.283.698 2.686-.705 1.987-1.987l-.169-.311a1.464 1.464 0 0 1 .872-2.105l.34-.1c1.4-.413 1.4-2.397 0-2.81l-.34-.1a1.464 1.464 0 0 1-.872-2.105l.17-.31c.698-1.283-.705-2.686-1.987-1.987l-.311.169a1.464 1.464 0 0 1-2.105-.872l-.1-.34zM8 10.93a2.929 2.929 0 1 1 0-5.86 2.929 2.929 0 0 1 0 5.858z"/></svg>思考过程</span>';
+        // 使用 Augment 风格的 c-thinking 组件
+        html += '<div class="c-thinking" data-panel-id="' + panelId + '">';
+        html += '<details class="c-thinking__details"' + (thinkingExpanded ? ' open' : '') + '>';
+        html += '<summary class="c-thinking__summary">';
+        html += '<span class="c-thinking__chevron"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></span>';
+        html += '<span class="c-thinking__title">思考过程</span>';
         // 折叠时显示摘要
         if (!thinkingExpanded && summaryDisplay) {
-          html += '<span class="collapsible-summary">' + escapeHtml(summaryDisplay) + '</span>';
+          html += '<span class="c-thinking__summary-text">' + escapeHtml(summaryDisplay) + '</span>';
         }
-        html += '<span class="collapsible-badge">' + message.thinking.length + ' 步</span>';
-        html += '</div>';
-        html += '<div class="collapsible-content' + (thinkingExpanded ? ' expanded' : '') + '"><div class="collapsible-body markdown-rendered">' + renderMarkdown(thinkingContent) + '</div></div>';
+        html += '<span class="c-thinking__badge">' + message.thinking.length + ' 步</span>';
+        if (message.streaming) {
+          html += '<span class="c-thinking__streaming-cursor"></span>';
+        }
+        html += '</summary>';
+        html += '<div class="c-thinking__content markdown-rendered">' + renderMarkdown(thinkingContent) + '</div>';
+        html += '</details>';
         html += '</div>';
       }
 
@@ -351,7 +436,7 @@ export function renderMessageBlock(message, idx, options) {
       if (!isUser && message.content) {
         rawContent = message.content;
         // 🆕 使用智能渲染：优先使用后端已解析的 blocks
-        const rendered = renderMessageContentSmart(message, cli);
+        const rendered = renderMessageContentSmart(message, agent);
         contentHtml += rendered.html;
         contentIsMarkdown = rendered.isMarkdown;
       } else if (!isUser && !message.content && !message.streaming) {
@@ -480,7 +565,7 @@ export function renderSpecialMessage(m, idx, tabType) {
       if (m.metadata?.summaryCard) {
         return renderSummaryCard(m);
       }
-      // 任务卡片（CLI 面板专用）
+      // 任务卡片（Worker 面板专用）
       if (m.type === 'task_card') {
         return renderTaskCard(m, idx);
       }
@@ -503,9 +588,9 @@ export function renderSpecialMessage(m, idx, tabType) {
         if (m.type === 'question_request') {
           return renderQuestionCard(m, idx);
         }
-        // 🔧 CLI 询问卡片
-        if (m.type === 'cli_question') {
-          return renderCliQuestionCard(m, idx);
+        // 🔧 Worker 询问卡片
+        if (m.type === 'worker_question') {
+          return renderWorkerQuestionCard(m, idx);
         }
         // 注意：clarification_request 和 worker_question 现在作为普通 assistant 消息显示
         // 不再使用特殊卡片渲染
@@ -513,7 +598,7 @@ export function renderSpecialMessage(m, idx, tabType) {
       return null; // 普通消息，需要使用 renderMessageBlock
     }
 
-export function renderMessageContentSmart(message, cli) {
+export function renderMessageContentSmart(message, agent) {
       let blocks = (message.parsedBlocks && message.parsedBlocks.length > 0)
         ? message.parsedBlocks
         : (message.content ? [{ type: 'text', content: message.content, isMarkdown: true }] : []);
@@ -543,7 +628,7 @@ export function renderMessageContentSmart(message, cli) {
         return { html: '', isMarkdown: false };
       }
 
-      return renderParsedBlocks(blocks, cli);
+      return renderParsedBlocks(blocks, agent);
     }
 
 
@@ -613,7 +698,6 @@ export function renderCodeBlock(code, lang, filepath) {
           if (hljs.getLanguage(lang)) {
             highlightedCode = hljs.highlight(trimmedCode, { language: lang, ignoreIllegals: true }).value;
           } else {
-            // 尝试自动检测
             highlightedCode = hljs.highlightAuto(trimmedCode).value;
           }
         } catch (e) {
@@ -627,101 +711,87 @@ export function renderCodeBlock(code, lang, filepath) {
       // 将高亮后的代码按行分割
       const highlightedLines = highlightedCode.split('\n');
 
-      // 构建行号和代码行
-      let lineNumbersHtml = '';
+      // 构建代码行 HTML
       let codeLinesHtml = '';
 
       lines.forEach((originalLine, idx) => {
-        const lineNum = idx + 1;
-        lineNumbersHtml += '<div class="code-line-number">' + lineNum + '</div>';
-
-        // 检测差异行
         let lineClass = 'code-line';
         let displayLine = highlightedLines[idx] || '';
 
         if (isDiff) {
           if (/^[+](?!\+\+)/.test(originalLine)) {
             lineClass += ' diff-add';
-            // 🔧 修复：保留前导 + 在文本中（用于复制），通过 CSS 隐藏并用伪元素显示
-            // 不再移除前导字符，而是使用 data 属性存储原始前缀
           } else if (/^[-](?!--)/.test(originalLine)) {
             lineClass += ' diff-del';
-            // 🔧 修复：保留前导 - 在文本中（用于复制），通过 CSS 隐藏并用伪元素显示
           }
         }
-
         codeLinesHtml += '<div class="' + lineClass + '">' + displayLine + '</div>';
       });
 
-      // 构建头部信息
-      let headerInfoHtml = '<div class="markdown-code-info">';
-      headerInfoHtml += '<span class="markdown-code-lang">' + escapeHtml(lang) + '</span>';
+      // 检查是否需要折叠（超过 15 行）
+      const shouldCollapse = lines.length > 15;
+      const expandedClass = shouldCollapse ? '' : ' expanded';
 
-      if (filepath) {
-        // 文件路径可点击，跳转到 VSCode
-        const fileIcon = '<svg viewBox="0 0 16 16"><path d="M13.5 1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h9.5a.5.5 0 0 0 .5-.5v-12a.5.5 0 0 0-.5-.5zM4 0a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h9.5a1.5 1.5 0 0 0 1.5-1.5V1.5A1.5 1.5 0 0 0 13.5 0H4z"/></svg>';
-        headerInfoHtml += '<span class="markdown-code-filepath" onclick="openFileInEditor(\'' + escapeHtml(filepath) + '\')" title="点击在编辑器中打开">' + fileIcon + escapeHtml(filepath) + '</span>';
-      }
-      headerInfoHtml += '</div>';
-
-      // 复制按钮
-      const copyBtnHtml = '<button class="code-copy-btn" onclick="copyCodeBlock(\'' + codeId + '\')" title="复制代码">' +
-        '<svg viewBox="0 0 16 16"><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/><path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/></svg>' +
-        '</button>';
-
-      // 检查是否需要折叠（超过 20 行）
-      const shouldCollapse = lines.length > 20;
-      const previewLines = 5;
-
-      // 构建完整 HTML
+      // 使用 Augment 风格的 c-codeblock 组件
+      let html = '<div class="c-codeblock' + (isDiff ? ' c-codeblock--diff' : '') + '" data-code-id="' + codeId + '">';
+      
+      // 头部区域
+      html += '<div class="c-codeblock__header">';
+      html += '<div class="c-codeblock__header-content" onclick="toggleCodeBlock(\'' + codeId + '\')">';
+      
+      // 折叠按钮
       if (shouldCollapse) {
-        // 折叠模式：只显示前 5 行，可展开查看全部
-        let previewLineNumbersHtml = '';
-        let previewCodeLinesHtml = '';
-        for (let i = 0; i < Math.min(previewLines, lines.length); i++) {
-          previewLineNumbersHtml += '<div class="code-line-number">' + (i + 1) + '</div>';
-          const lineClass = isDiff ? (lines[i].match(/^[+](?!\+\+)/) ? 'code-line diff-add' : (lines[i].match(/^[-](?!--)/) ? 'code-line diff-del' : 'code-line')) : 'code-line';
-          previewCodeLinesHtml += '<div class="' + lineClass + '">' + (highlightedLines[i] || '') + '</div>';
-        }
-
-        const html = '<div class="markdown-code-block collapsible-code' + (isDiff ? ' diff-block' : '') + '" data-code-id="' + codeId + '">' +
-          '<div class="markdown-code-header">' +
-          headerInfoHtml +
-          '<div class="code-header-actions">' +
-          '<span class="code-line-count">' + lines.length + ' 行</span>' +
-          copyBtnHtml +
-          '</div>' +
-          '</div>' +
-          '<div class="markdown-code-preview">' +
-          '<div class="code-line-numbers">' + previewLineNumbersHtml + '</div>' +
-          '<div class="code-lines">' + previewCodeLinesHtml + '</div>' +
-          '</div>' +
-          '<div class="code-expand-bar" onclick="expandCodeBlock(\'' + codeId + '\')">' +
-          '<span class="code-expand-hint">显示全部 ' + lines.length + ' 行</span>' +
-          '<svg viewBox="0 0 16 16"><path d="M1.646 4.646a.5.5 0 0 1 .708 0L8 10.293l5.646-5.647a.5.5 0 0 1 .708.708l-6 6a.5.5 0 0 1-.708 0l-6-6a.5.5 0 0 1 0-.708z"/></svg>' +
-          '</div>' +
-          '<div class="markdown-code-full" style="display: none;">' +
-          '<div class="code-line-numbers">' + lineNumbersHtml + '</div>' +
-          '<div class="code-lines" id="' + codeId + '">' + codeLinesHtml + '</div>' +
-          '</div>' +
-          '</div>';
-        return html;
+        html += '<div class="c-codeblock__collapse-btn' + expandedClass + '"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></div>';
+      }
+      
+      // 文件路径或语言标签
+      html += '<div class="c-codeblock__relpath">';
+      if (filepath) {
+        html += '<span class="c-codeblock__filename" onclick="event.stopPropagation(); openFileInEditor(\'' + escapeHtml(filepath) + '\')" title="点击在编辑器中打开">' + escapeHtml(filepath) + '</span>';
+      } else if (lang) {
+        html += '<span class="c-codeblock__language">' + escapeHtml(lang) + '</span>';
+      }
+      html += '</div>';
+      html += '</div>'; // c-codeblock__header-content
+      
+      // 操作按钮
+      html += '<div class="c-codeblock__action-bar-right">';
+      html += '<span class="c-codeblock__line-count">' + lines.length + ' 行</span>';
+      html += '<button class="code-copy-btn" onclick="copyCodeBlock(\'' + codeId + '\')" title="复制代码">';
+      html += '<svg viewBox="0 0 16 16"><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/><path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/></svg>';
+      html += '</button>';
+      html += '</div>';
+      html += '</div>'; // c-codeblock__header
+      
+      // 代码内容区域
+      html += '<div class="c-codeblock__container">';
+      html += '<div class="c-codeblock__container-inner">';
+      
+      if (shouldCollapse) {
+        // 折叠模式：截断显示
+        html += '<div class="c-codeblock__truncated collapsible-content' + expandedClass + '">';
+        html += '<div class="c-codeblock__code" id="' + codeId + '"><pre><code>' + codeLinesHtml + '</code></pre></div>';
+        html += '</div>';
+        
+        // 展开按钮
+        html += '<div class="c-codeblock__truncated-surface collapsible-expand-btn" onclick="toggleCodeBlock(\'' + codeId + '\')" style="' + (expandedClass ? 'display:none;' : '') + '">';
+        html += '<button class="c-codeblock__expand-btn">';
+        html += '<svg viewBox="0 0 16 16"><path d="M1.646 4.646a.5.5 0 0 1 .708 0L8 10.293l5.646-5.647a.5.5 0 0 1 .708.708l-6 6a.5.5 0 0 1-.708 0l-6-6a.5.5 0 0 1 0-.708z"/></svg>';
+        html += '<span>显示全部 ' + lines.length + ' 行</span>';
+        html += '</button>';
+        html += '</div>';
       } else {
         // 不折叠模式
-        const html = '<div class="markdown-code-block' + (isDiff ? ' diff-block' : '') + '">' +
-          '<div class="markdown-code-header">' +
-          headerInfoHtml +
-          '<div class="code-header-actions">' +
-          copyBtnHtml +
-          '</div>' +
-          '</div>' +
-          '<div class="markdown-code-content">' +
-          '<div class="code-line-numbers">' + lineNumbersHtml + '</div>' +
-          '<div class="code-lines" id="' + codeId + '">' + codeLinesHtml + '</div>' +
-          '</div></div>';
-        return html;
+        html += '<div class="c-codeblock__code" id="' + codeId + '"><pre><code>' + codeLinesHtml + '</code></pre></div>';
       }
+      
+      html += '</div>'; // c-codeblock__container-inner
+      html += '</div>'; // c-codeblock__container
+      html += '</div>'; // c-codeblock
+      
+      return html;
     }
+
 
 
 
@@ -735,14 +805,14 @@ export function renderSubTaskSummaryCard(message) {
       if (!card) return null;
       const statusText = card.status === 'failed' ? '失败' : '完成';
       const badgeClass = card.status === 'failed' ? 'badge-failed' : 'badge-completed';
-      const cli = card.executor || card.cli || '';
-      const cliClass = cli.toLowerCase().includes('claude') ? 'claude' : cli.toLowerCase().includes('codex') ? 'codex' : cli.toLowerCase().includes('gemini') ? 'gemini' : '';
+      const agent = card.executor || card.agent || '';
+      const agentClass = agent.toLowerCase().includes('claude') ? 'claude' : agent.toLowerCase().includes('codex') ? 'codex' : agent.toLowerCase().includes('gemini') ? 'gemini' : '';
 
       // 构建概览统计
       let contentHtml = '<div class="worker-summary-overview">';
       contentHtml += '<div class="worker-summary-stat">';
       contentHtml += '<span class="worker-summary-stat-label">执行者</span>';
-      contentHtml += '<span class="worker-summary-stat-value">' + escapeHtml(cli || '未知') + '</span>';
+      contentHtml += '<span class="worker-summary-stat-value">' + escapeHtml(agent || '未知') + '</span>';
       contentHtml += '</div>';
       contentHtml += '<div class="worker-summary-stat">';
       contentHtml += '<span class="worker-summary-stat-label">耗时</span>';
@@ -819,10 +889,10 @@ export function renderSubTaskSummaryCard(message) {
       return renderUnifiedCard({
         type: 'summary',
         variant: card.status === 'failed' ? 'error' : 'success',
-        icon: getRoleIcon(cliClass || 'success'),
+        icon: getRoleIcon(agentClass || 'success'),
         title: card.title || 'Worker 执行摘要',
         badges: [
-          { text: cli ? cli.toUpperCase() : 'WORKER', class: 'badge-' + (cliClass || 'info') },
+          { text: agent ? agent.toUpperCase() : 'WORKER', class: 'badge-' + (agentClass || 'info') },
           { text: statusText, class: badgeClass }
         ],
         content: contentHtml,
@@ -857,46 +927,93 @@ export function renderToolCallItem(tool, toolIdx, panelPrefix, isLatest) {
       const toolPanelId = panelPrefix + '-' + toolIdx;
       const toolStatus = tool.status || 'completed';
       const statusText = toolStatus === 'running' ? '执行中' : toolStatus === 'failed' ? '失败' : '完成';
-      const badgeClass = toolStatus === 'running' ? 'badge-running' : toolStatus === 'failed' ? 'badge-failed' : 'badge-completed';
+      const statusClass = toolStatus === 'running' ? 'c-tooluse-status--running' :
+                          toolStatus === 'failed' ? 'c-tooluse-status--error' : 'c-tooluse-status--success';
       const durationText = tool.duration ? (tool.duration / 1000).toFixed(1) + 's' : '';
+      const expandedClass = isLatest ? ' expanded' : '';
 
-      // 构建截图风格的 IN/OUT 面板
-      const buildSnapshotSection = (label, labelClass, content, meta) => {
-        return '<div class="tool-snapshot-section">' +
-          '<div class="tool-snapshot-header">' +
-            '<span class="tool-snapshot-label ' + labelClass + '">' + label + '</span>' +
-            (meta ? '<span class="tool-snapshot-meta">' + escapeHtml(meta) + '</span>' : '') +
-          '</div>' +
-          '<div class="tool-snapshot-body">' + renderToolPanelContent(content) + '</div>' +
-        '</div>';
-      };
+      // 使用 Augment 风格的 c-tool-use 组件
+      let html = '<div class="c-tool-use' + (isLatest ? ' is-expandable' : '') + '" data-panel-id="' + toolPanelId + '">';
+      html += '<div class="c-tool-use__container">';
 
-      let snapshotHtml = '<div class="tool-snapshot">';
+      // 头部区域
+      html += '<div class="c-tool-use__header-container" onclick="togglePanel(\'' + toolPanelId + '\')">';
+      html += '<div class="c-tool-use__header">';
+      html += '<div class="c-tool-use__content">';
+
+      // 工具图标
+      html += '<div class="c-tool-use__icon-wrapper">' + getToolIcon(tool.name) + '</div>';
+
+      // 工具名称和参数摘要
+      html += '<div class="c-tool-use__main-bar">';
+      html += '<div class="c-tool-use__tool-name">';
+      html += '<span class="c-tool-use__tool-name-text">' + escapeHtml(tool.name || '工具调用') + '</span>';
+      html += '</div>';
+
+      // 参数摘要（折叠时显示）
+      if (hasInput && !isLatest) {
+        const inputSummary = String(inputContent).substring(0, 60).replace(/\s+/g, ' ');
+        html += '<div class="c-tool-use__content-secondary">' + escapeHtml(inputSummary) + (inputContent.length > 60 ? '...' : '') + '</div>';
+      }
+      html += '</div>'; // c-tool-use__main-bar
+      html += '</div>'; // c-tool-use__content
+
+      // 状态指示器
+      html += '<div class="c-tooluse-status ' + statusClass + '">';
+      if (toolStatus === 'running') {
+        html += '<svg class="c-tooluse-status__icon" viewBox="0 0 16 16" fill="currentColor"><path d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/></svg>';
+      } else if (toolStatus === 'failed') {
+        html += '<svg class="c-tooluse-status__icon" viewBox="0 0 16 16" fill="currentColor"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg>';
+      } else {
+        html += '<svg class="c-tooluse-status__icon" viewBox="0 0 16 16" fill="currentColor"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M10.97 4.97a.235.235 0 0 0-.02.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-1.071-1.05z"/></svg>';
+      }
+      html += '<span class="c-tooluse-status__text">' + statusText + '</span>';
+      if (durationText) {
+        html += '<span class="c-tooluse-status__text">' + durationText + '</span>';
+      }
+      html += '</div>'; // c-tooluse-status
+
+      // 折叠图标
+      html += '<div class="c-collapsible-icon' + expandedClass + '"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></div>';
+
+      html += '</div>'; // c-tool-use__header
+      html += '</div>'; // c-tool-use__header-container
+
+      // 详情面板（可折叠）
+      html += '<div class="collapsible-content' + expandedClass + '">';
+      html += '<div class="c-tooluse__details">';
+
+      // 输入区域
       if (hasInput) {
-        snapshotHtml += buildSnapshotSection('IN', 'in', inputContent, '');
+        html += '<div class="c-tooluse__structured-content">';
+        html += '<div class="c-tooluse__details__heading">输入</div>';
+        html += '<div class="c-tooluse__value">' + renderToolPanelContent(inputContent) + '</div>';
+        html += '</div>';
       }
-      if (hasOutput) {
-        snapshotHtml += buildSnapshotSection('OUT', 'out', outputContent, durationText);
-      }
-      if (hasError) {
-        snapshotHtml += buildSnapshotSection('ERROR', 'error', errorContent, '');
-      }
-      snapshotHtml += '</div>';
 
-      // 使用统一卡片组件渲染工具调用
-      return renderUnifiedCard({
-        type: 'tool',
-        variant: toolStatus === 'failed' ? 'error' : toolStatus === 'running' ? 'info' : 'success',
-        icon: getToolIcon(tool.name),
-        title: tool.name || '工具调用',
-        badges: [{ text: statusText, class: badgeClass }],
-        content: snapshotHtml,
-        collapsed: true,           // 启用折叠功能
-        expanded: isLatest,        // 最新的工具调用默认展开
-        panelId: toolPanelId,      // 折叠面板 ID
-        className: 'tool-item tool-call',
-        dataAttrs: { 'panel-id': toolPanelId }
-      });
+      // 输出区域
+      if (hasOutput) {
+        html += '<div class="c-tooluse__structured-content">';
+        html += '<div class="c-tooluse__details__heading">输出</div>';
+        html += '<div class="c-tooluse__value">' + renderToolPanelContent(outputContent) + '</div>';
+        html += '</div>';
+      }
+
+      // 错误区域
+      if (hasError) {
+        html += '<div class="c-shell-error">';
+        html += '<div class="c-shell-error__code"><span>错误</span></div>';
+        html += '<div class="c-shell-error__message"><pre>' + escapeHtml(String(errorContent)) + '</pre></div>';
+        html += '</div>';
+      }
+
+      html += '</div>'; // c-tooluse__details
+      html += '</div>'; // collapsible-content
+
+      html += '</div>'; // c-tool-use__container
+      html += '</div>'; // c-tool-use
+
+      return html;
     }
 
 export function renderToolTrack(toolCalls, panelPrefix) {
@@ -1007,51 +1124,6 @@ export function renderStructuredPlanContent(plan) {
       return html;
     }
 
-
-// ============================================
-// 特殊视图
-// ============================================
-
-export function renderSessionList() {
-      const listEl = document.getElementById('session-list');
-      const emptyEl = document.getElementById('session-empty');
-      const nameEl = document.getElementById('current-session-name');
-      const currentSession = sessions.find(s => s.id === currentSessionId);
-      nameEl.textContent = currentSession ? (currentSession.name || '会话 ' + currentSession.id.slice(0,6)) : '新会话';
-
-      if (sessions.length === 0) {
-        listEl.innerHTML = '';
-        emptyEl.classList.add('visible');
-        return;
-      }
-
-      emptyEl.classList.remove('visible');
-      let html = '';
-      sessions.slice().reverse().forEach(session => {
-        const isActive = session.id === currentSessionId;
-        const name = session.name || '会话 ' + session.id.slice(0,6);
-        const time = session.updatedAt ? formatTime(new Date(session.updatedAt)) : '';
-        const msgCount = (session.messages || []).length;
-        html += '<div class="session-item' + (isActive ? ' active' : '') + '" data-session-id="' + session.id + '">';
-        html += '<svg class="session-item-icon" viewBox="0 0 16 16"><path d="M14 1a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4.414A2 2 0 0 0 3 11.586l-2 2V2a1 1 0 0 1 1-1h12z"/></svg>';
-        html += '<div class="session-item-content"><div class="session-item-name">' + escapeHtml(name) + '</div>';
-        html += '<div class="session-item-meta"><span>' + msgCount + ' 条消息</span><span>' + time + '</span></div></div>';
-        html += '<div class="session-item-actions">';
-        html += '<button class="icon-btn-sm" onclick="event.stopPropagation();renameSession(\'' + session.id + '\')" title="重命名"><svg viewBox="0 0 16 16"><path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168l10-10z"/></svg></button>';
-        html += '<button class="icon-btn-sm" onclick="event.stopPropagation();deleteSession(\'' + session.id + '\')" title="删除"><svg viewBox="0 0 16 16"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/><path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1z"/></svg></button>';
-        html += '</div></div>';
-      });
-      listEl.innerHTML = html;
-
-      listEl.querySelectorAll('.session-item').forEach(item => {
-        item.addEventListener('click', () => {
-          const sessionId = item.dataset.sessionId;
-          if (sessionId !== currentSessionId) switchSession(sessionId);
-          sessionDropdown.classList.remove('visible');
-          sessionSelectorBtn.classList.remove('open');
-        });
-      });
-    }
 
 export function renderImagePreviews() {
       const container = document.getElementById('image-preview-container');
@@ -1209,18 +1281,22 @@ export function renderStreamingAnimation(messages) {
       if (isProcessing) {
         const startAt = thinkingStartAt || Date.now();
         const elapsed = formatElapsed(Date.now() - startAt);
+        // 根据 processingActor 显示不同的角色
+        const actorName = processingActor?.source === 'orchestrator' ? '编排者' :
+                          (processingActor?.agent ? processingActor.agent.toUpperCase() : '');
+        const displayText = actorName ? actorName + ' 正在思考' : '正在思考';
         return '<div class="message assistant-message loading-message">' +
                '<div class="message-body">' +
                '<div class="message-content message-streaming-hint" data-start-at="' + startAt + '">' +
                '<span class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span> ' +
-               '正在思考 <span class="thinking-elapsed">用时 ' + elapsed + '</span></div>' +
+               displayText + ' <span class="thinking-elapsed">用时 ' + elapsed + '</span></div>' +
                '</div></div>';
       }
 
       return '';
     }
 
-export function renderStreamingAnimationForCli(messages, cli) {
+export function renderStreamingAnimationForAgent(messages, agent) {
       // 找到最后一条 streaming 消息
       const lastStreamingMsg = [...(messages || [])].reverse().find(m => m.streaming);
 
@@ -1229,23 +1305,23 @@ export function renderStreamingAnimationForCli(messages, cli) {
         const startAt = lastStreamingMsg.startedAt || thinkingStartAt || Date.now();
         const elapsed = formatElapsed(Date.now() - startAt);
         const hasContent = lastStreamingMsg.content && lastStreamingMsg.content.trim();
-        const cliName = cli ? cli.toUpperCase() : 'Worker';
+        const agentName = agent ? agent.toUpperCase() : 'Worker';
 
         if (!hasContent) {
           // 没有内容时显示"正在思考"
-          return '<div class="message assistant-message streaming-animation-message" data-cli="' + cli + '">' +
+          return '<div class="message assistant-message streaming-animation-message" data-agent="' + agent + '">' +
                  '<div class="message-body">' +
                  '<div class="message-content message-streaming-hint" data-start-at="' + startAt + '">' +
                  '<span class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span> ' +
-                 cliName + ' 正在思考 <span class="thinking-elapsed">用时 ' + elapsed + '</span></div>' +
+                 agentName + ' 正在思考 <span class="thinking-elapsed">用时 ' + elapsed + '</span></div>' +
                  '</div></div>';
         } else {
           // 有内容时显示"正在输出"
-          return '<div class="message assistant-message streaming-animation-message" data-cli="' + cli + '">' +
+          return '<div class="message assistant-message streaming-animation-message" data-agent="' + agent + '">' +
                  '<div class="message-body">' +
                  '<div class="message-streaming-footer" data-start-at="' + startAt + '">' +
                  '<span class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span> ' +
-                 cliName + ' 正在输出 <span class="thinking-elapsed">用时 ' + elapsed + '</span></div>' +
+                 agentName + ' 正在输出 <span class="thinking-elapsed">用时 ' + elapsed + '</span></div>' +
                  '</div></div>';
         }
       }
@@ -1264,7 +1340,7 @@ export function renderWorkerStatusCard(entries) {
       // 构建列表内容
       let listHtml = '<div class="worker-status-list">';
       entries.forEach(item => {
-        const cliClass = item.worker.includes('claude') ? 'claude' : item.worker.includes('codex') ? 'codex' : item.worker.includes('gemini') ? 'gemini' : '';
+        const agentClass = item.worker.includes('claude') ? 'claude' : item.worker.includes('codex') ? 'codex' : item.worker.includes('gemini') ? 'gemini' : '';
         const statusClass = item.status === 'running' ? 'badge-running' : item.status === 'completed' ? 'badge-completed' : item.status === 'failed' ? 'badge-failed' : 'badge-pending';
         const progressClass = item.status === 'completed' ? 'completed' : item.status === 'failed' ? 'failed' : '';
         const progress = item.progress !== undefined ? Math.min(100, Math.max(0, item.progress)) : (item.status === 'running' ? 50 : 0);
@@ -1274,7 +1350,7 @@ export function renderWorkerStatusCard(entries) {
 
         // 第一行：Worker 名称、描述、状态
         listHtml += '<div class="worker-status-row">';
-        listHtml += '<span class="task-cli ' + cliClass + '">' + escapeHtml(item.worker) + '</span>';
+        listHtml += '<span class="task-agent ' + agentClass + '">' + escapeHtml(item.worker) + '</span>';
         listHtml += '<span class="task-desc" title="' + escapeHtml(item.description) + '">' + escapeHtml(item.description) + '</span>';
         listHtml += '<span class="card-badge ' + statusClass + '">' + (statusMap[item.status] || item.status) + '</span>';
         listHtml += '</div>';
@@ -1318,7 +1394,7 @@ export function renderWorkerStatusCard(entries) {
     }
 
 export function renderTaskCard(m, idx) {
-      const cli = m.cli || '';
+      const agent = m.agent || '';
       const statusClass = m.status || 'started';
       const statusText = statusClass === 'started' ? '执行中' : statusClass === 'completed' ? '已完成' : statusClass === 'failed' ? '失败' : statusClass;
       const badgeStatusClass = statusClass === 'started' ? 'badge-running' : statusClass === 'completed' ? 'badge-completed' : statusClass === 'failed' ? 'badge-failed' : '';
@@ -1371,7 +1447,7 @@ export function renderTaskCard(m, idx) {
         icon: getRoleIcon('orchestrator'),
         title: '来自编排者的任务',
         badges: [
-          { text: cli ? cli.toUpperCase() + ' 执行' : '执行中', class: 'badge-' + (cli.toLowerCase() || 'info') },
+          { text: agent ? agent.toUpperCase() + ' 执行' : '执行中', class: 'badge-' + (agent.toLowerCase() || 'info') },
           { text: statusText, class: badgeStatusClass }
         ],
         time: m.time || '',
@@ -1429,14 +1505,14 @@ export function renderSubtaskStatusList(subtasks) {
 
       subtasks.forEach(subtask => {
         const status = subtask.status || 'pending';
-        const cli = subtask.cli || '';
+        const agent = subtask.agent || '';
         const desc = subtask.description || subtask.prompt || '';
         const time = subtask.time || '';
 
         html += '<div class="subtask-status-item ' + status + '">';
         html += '<span class="subtask-status-icon ' + status + '">' + (statusIcons[status] || statusIcons.pending) + '</span>';
-        if (cli) {
-          html += '<span class="subtask-status-cli ' + cli.toLowerCase() + '">' + cli + '</span>';
+        if (agent) {
+          html += '<span class="subtask-status-agent ' + agent.toLowerCase() + '">' + agent + '</span>';
         }
         html += '<span class="subtask-status-desc" title="' + escapeHtml(desc) + '">' + escapeHtml(desc.substring(0, 50) + (desc.length > 50 ? '...' : '')) + '</span>';
         if (time) {
@@ -1467,16 +1543,16 @@ export function renderSystemNotice(m, idx) {
     }
 
 export function renderErrorMessage(m, idx) {
-      const cli = m.cli || 'system';
+      const agent = m.agent || 'system';
       const contentHtml = '<div class="error-content">' + escapeHtml(m.content || '未知错误') + '</div>' +
-        '<div class="error-hint">查看 CLI 输出 Tab 获取详细信息</div>';
+        '<div class="error-hint">查看模型输出 Tab 获取详细信息</div>';
 
       return renderUnifiedCard({
         type: 'error',
         variant: 'error',
         icon: getRoleIcon('error'),
         title: '执行失败',
-        badges: [{ text: cli.toUpperCase(), class: 'badge-' + cli.toLowerCase() }],
+        badges: [{ text: agent.toUpperCase(), class: 'badge-' + agent.toLowerCase() }],
         time: m.time || '',
         content: contentHtml,
         dataAttrs: { 'msg-idx': idx }
@@ -1589,7 +1665,7 @@ export function renderQuestionCard(m, idx) {
       });
     }
 
-export function renderCliQuestionCard(m, idx) {
+export function renderWorkerQuestionCard(m, idx) {
       const isPending = m.isPending;
       const answered = !!m.answered;
       const timedOut = !!m.timedOut;
@@ -1619,13 +1695,13 @@ export function renderCliQuestionCard(m, idx) {
       }
 
       // 🔧 智能解析内容
-      const parsed = parseCliQuestionContent(m.content);
-      let contentHtml = '<div class="cli-question-content">';
+      const parsed = parseWorkerQuestionContent(m.content);
+      let contentHtml = '<div class="agent-question-content">';
 
       if (parsed.type === 'tool_calls') {
         // 工具调用：显示友好的工具信息
         parsed.tools.forEach((tool, i) => {
-          contentHtml += '<div class="cli-tool-call" style="margin-bottom: 8px;">';
+          contentHtml += '<div class="agent-tool-call" style="margin-bottom: 8px;">';
           contentHtml += '<div style="font-weight: 500; color: var(--vscode-textLink-foreground);">';
           contentHtml += '<span style="opacity: 0.7;">工具: </span>' + escapeHtml(tool.name);
           if (tool.model) {
@@ -1642,24 +1718,24 @@ export function renderCliQuestionCard(m, idx) {
         });
       } else if (parsed.type === 'structured') {
         // 结构化数据：显示描述
-        contentHtml += '<div class="cli-question-text" style="white-space: pre-wrap;">';
+        contentHtml += '<div class="agent-question-text" style="white-space: pre-wrap;">';
         contentHtml += escapeHtml(parsed.description || '');
         contentHtml += '</div>';
       } else {
         // 普通文本或权限请求
-        contentHtml += '<pre class="cli-question-text">' + escapeHtml(parsed.display || '') + '</pre>';
+        contentHtml += '<pre class="agent-question-text">' + escapeHtml(parsed.display || '') + '</pre>';
       }
 
       contentHtml += '</div>';
 
       if (!isPending && m.answer) {
-        contentHtml += '<div class="cli-question-answer">';
+        contentHtml += '<div class="agent-question-answer">';
         contentHtml += '<strong>回答:</strong> ' + escapeHtml(m.answer);
         contentHtml += '</div>';
       }
 
       if (hasError) {
-        contentHtml += '<div class="cli-question-error">';
+        contentHtml += '<div class="agent-question-error">';
         contentHtml += '<strong>错误:</strong> ' + escapeHtml(m.error);
         contentHtml += '</div>';
       }
@@ -1671,16 +1747,16 @@ export function renderCliQuestionCard(m, idx) {
       }
 
       return renderUnifiedCard({
-        type: 'cli_question',
+        type: 'worker_question',
         variant: isPending ? 'warning' : (answered ? 'success' : 'error'),
         icon: '<svg viewBox="0 0 16 16"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M5.255 5.786a.237.237 0 0 0 .241.247h.825c.138 0 .248-.113.266-.25.09-.656.54-1.134 1.342-1.134.686 0 1.314.343 1.314 1.168 0 .635-.374.927-.965 1.371-.673.489-1.206 1.06-1.168 1.987l.003.217a.25.25 0 0 0 .25.246h.811a.25.25 0 0 0 .25-.25v-.105c0-.718.273-.927 1.01-1.486.609-.463 1.244-.977 1.244-2.056 0-1.511-1.276-2.241-2.673-2.241-1.267 0-2.655.59-2.75 2.286zm1.557 5.763c0 .533.425.927 1.01.927.609 0 1.028-.394 1.028-.927 0-.552-.42-.94-1.029-.94-.584 0-1.009.388-1.009.94z"/></svg>',
-        title: 'CLI 询问',  // 恢复标题，但不设置 collapsed，所以标题无点击事件
+        title: 'Worker 询问',  // 恢复标题，但不设置 collapsed，所以标题无点击事件
         badges: [{ text: statusText, class: badgeClass }],
         time: m.time || '',
         content: contentHtml,
         footer: footerHtml,
         collapsed: false,  // 🔧 不可折叠，标题无点击事件
-        className: 'cli-question-card ' + statusClass,
+        className: 'agent-question-card ' + statusClass,
         dataAttrs: { 'msg-idx': idx, 'question-id': m.questionId || '' }
       });
     }
@@ -1748,14 +1824,14 @@ export function renderTasksView() {
             const stStatusCls = st.status === 'running' ? 'running' : st.status === 'completed' ? 'completed' : st.status === 'failed' ? 'failed' : st.status === 'skipped' ? 'skipped' : st.status === 'paused' ? 'paused' : st.status === 'retrying' ? 'retrying' : 'pending';
             const workerName = (st.assignedWorker || st.assignedCli || 'auto').toLowerCase();
             const description = st.description || st.title || '子任务 ' + (index + 1);
-            const cliClass = workerName.includes('claude') ? 'claude' : workerName.includes('codex') ? 'codex' : workerName.includes('gemini') ? 'gemini' : '';
+            const agentClass = workerName.includes('claude') ? 'claude' : workerName.includes('codex') ? 'codex' : workerName.includes('gemini') ? 'gemini' : '';
 
             html += '<div class="task-item" data-subtask-id="' + st.id + '">';
             html += '<div class="task-status ' + stStatusCls + '"></div>';
             html += '<div class="task-info">';
             html += '<span class="task-name">' + escapeHtml(description.slice(0, 50)) + (description.length > 50 ? '...' : '') + '</span>';
             html += '<div class="task-meta">';
-            html += '<span class="task-cli ' + cliClass + '">' + workerName + '</span>';
+            html += '<span class="task-worker ' + agentClass + '">' + workerName + '</span>';
             const fileCount = (st.modifiedFiles && st.modifiedFiles.length > 0)
               ? st.modifiedFiles.length
               : (st.targetFiles ? st.targetFiles.length : 0);
@@ -1778,7 +1854,7 @@ export function renderEditsView() {
       const container = document.getElementById('edits-content');
       if (!container) return;
       if (pendingChanges.length === 0) {
-        container.innerHTML = '<div class="empty-state"><div class="empty-state-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168l10-10z"/></svg></div><span class="empty-state-text">暂无待处理变更</span><span class="empty-state-hint">CLI 修改文件后将在此显示</span></div>';
+        container.innerHTML = '<div class="empty-state"><div class="empty-state-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168l10-10z"/></svg></div><span class="empty-state-text">暂无待处理变更</span><span class="empty-state-hint">模型修改文件后将在此显示</span></div>';
         return;
       }
       let html = '<div class="edits-header"><span class="edits-count">' + pendingChanges.length + ' 个变更</span>';
@@ -1788,8 +1864,8 @@ export function renderEditsView() {
       pendingChanges.forEach(edit => {
         const fileName = edit.filePath.split('/').pop();
         const dirPath = edit.filePath.split('/').slice(0, -1).join('/');
-        const cliName = (edit.lastModifiedBy || '').toLowerCase();
-        const cliClass = cliName.includes('claude') ? 'claude' : cliName.includes('codex') ? 'codex' : cliName.includes('gemini') ? 'gemini' : '';
+        const agentName = (edit.lastModifiedBy || '').toLowerCase();
+        const agentClass = agentName.includes('claude') ? 'claude' : agentName.includes('codex') ? 'codex' : agentName.includes('gemini') ? 'gemini' : '';
 
         html += '<div class="edit-item" data-file="' + escapeHtml(edit.filePath) + '" onclick="viewDiff(\'' + escapeHtml(edit.filePath) + '\')">';
         html += '<svg class="edit-file-icon" viewBox="0 0 16 16" fill="currentColor"><path d="M4 0a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V4.414A2 2 0 0 0 13.414 3L11 .586A2 2 0 0 0 9.586 0H4z"/></svg>';
@@ -1800,7 +1876,7 @@ export function renderEditsView() {
         html += '<div class="edit-stats">';
         html += '<span class="edit-stat-add">+' + (edit.additions || 0) + '</span>';
         html += '<span class="edit-stat-del">-' + (edit.deletions || 0) + '</span>';
-        if (cliName) html += '<span class="edit-cli-badge ' + cliClass + '">' + cliName + '</span>';
+        if (agentName) html += '<span class="edit-worker-badge ' + agentClass + '">' + agentName + '</span>';
         html += '</div>';
         html += '<div class="edit-actions" onclick="event.stopPropagation()">';
         html += '<button class="btn-icon" onclick="approveChange(\'' + escapeHtml(edit.filePath) + '\')" title="批准"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M13.854 3.646a.5.5 0 0 1 0 .708l-7 7a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L6.5 10.293l6.646-6.647a.5.5 0 0 1 .708 0z"/></svg></button>';
@@ -2414,7 +2490,7 @@ export function collectWorkerStatusEntries() {
 export function getMessageGroupKey(message, source) {
   if (message.role === 'user') return 'user';
   const typeKey = message.messageType || message.type || '';
-  return source + '-' + (message.cli || 'ai') + '-' + typeKey;
+  return source + '-' + (message.agent || 'ai') + '-' + typeKey;
 }
 
 // 获取角色图标
@@ -2436,18 +2512,18 @@ export function getRoleIcon(role) {
 }
 
 // 获取角色信息
-export function getRoleInfo(message, source, defaultCli) {
+export function getRoleInfo(message, source, defaultAgent) {
   if (message.role === 'user') {
     return { roleName: '', badgeClass: '' };
   }
   if (source === 'orchestrator') {
     return { roleName: 'Orchestrator', badgeClass: 'orchestrator' };
   }
-  if (message.cli) {
-    return { roleName: message.cli.toUpperCase(), badgeClass: message.cli.toLowerCase() };
+  if (message.agent) {
+    return { roleName: message.agent.toUpperCase(), badgeClass: message.agent.toLowerCase() };
   }
-  if (defaultCli) {
-    return { roleName: defaultCli.toUpperCase(), badgeClass: defaultCli.toLowerCase() };
+  if (defaultAgent) {
+    return { roleName: defaultAgent.toUpperCase(), badgeClass: defaultAgent.toLowerCase() };
   }
   return { roleName: 'AI', badgeClass: 'assistant' };
 }
@@ -2496,7 +2572,146 @@ export function cleanInternalProtocolData(content) {
   return content.replace(/\[INTERNAL:.*?\]/g, '').trim();
 }
 
+// 解析 Worker 询问内容，提取有意义的信息
+export function parseWorkerQuestionContent(content) {
+  if (!content || typeof content !== 'string') {
+    return { type: 'text', display: content || '' };
+  }
+
+  // 先清理内部协议元数据
+  const cleanedContent = cleanInternalProtocolData(content);
+  const trimmed = cleanedContent.trim();
+
+  // 清理后为空，说明全是内部协议数据
+  if (!trimmed) {
+    return { type: 'text', display: '等待输入...' };
+  }
+
+  // 检测是否是 JSON 格式的工具调用
+  if (trimmed.startsWith('{') && trimmed.includes('\"type\"')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+
+      const internalEventTypes = [
+        'stream_event', 'content_block_start', 'content_block_delta',
+        'content_block_stop', 'message_start', 'message_delta',
+        'message_stop', 'input_json_delta', 'ping'
+      ];
+      if (internalEventTypes.includes(parsed.type)) {
+        return { type: 'text', display: '等待输入...' };
+      }
+
+      // Claude 工具调用格式: {"type":"assistant","message":{"content":[...]}}
+      if (parsed.type === 'assistant' && parsed.message?.content) {
+        const toolCalls = parsed.message.content.filter(c => c.type === 'tool_use');
+        if (toolCalls.length > 0) {
+          return {
+            type: 'tool_calls',
+            tools: toolCalls.map(t => ({
+              name: t.name || '未知工具',
+              description: t.input?.description || t.input?.prompt || '',
+              model: t.input?.model,
+              input: t.input
+            }))
+          };
+        }
+      }
+
+      // tool_result 格式: {"type":"user","message":{"content":[{"type":"tool_result","content":"..."}]}}
+      if (parsed.type === 'user' && parsed.message?.content) {
+        const toolResults = parsed.message.content.filter(c => c.type === 'tool_result');
+        if (toolResults.length > 0) {
+          const resultContent = toolResults.map(r => r.content).join('\n\n');
+          const lines = resultContent.split('\n');
+          const preview = lines.slice(0, 10).join('\n');
+          const truncated = lines.length > 10 ? '\n... (更多内容)' : '';
+          return { type: 'text', display: preview + truncated };
+        }
+      }
+
+      // 结构化内容
+      if (parsed.description || parsed.prompt) {
+        return {
+          type: 'structured',
+          description: parsed.description || parsed.prompt,
+          data: parsed
+        };
+      }
+
+      // 尝试提取可读内容
+      if (parsed.message?.content) {
+        if (typeof parsed.message.content === 'string') {
+          return { type: 'text', display: parsed.message.content };
+        }
+        if (Array.isArray(parsed.message.content)) {
+          const textContent = parsed.message.content
+            .map(item => {
+              if (typeof item === 'string') return item;
+              if (item.text) return item.text;
+              if (item.content) return typeof item.content === 'string' ? item.content : JSON.stringify(item.content, null, 2);
+              return '';
+            })
+            .filter(Boolean)
+            .join('\n\n');
+          if (textContent) {
+            return { type: 'text', display: textContent };
+          }
+        }
+      }
+
+      // 兜底展示格式化 JSON
+      return { type: 'text', display: JSON.stringify(parsed, null, 2) };
+    } catch {
+      // JSON 解析失败，作为普通文本处理
+    }
+  }
+
+  // 检测常见权限请求模式
+  if (/\[Y\/n\]/i.test(trimmed) || /\[yes\/no\]/i.test(trimmed)) {
+    return { type: 'permission', display: trimmed };
+  }
+
+  return { type: 'text', display: trimmed };
+}
+
 // 全局函数（供 onclick 使用）
+window.togglePanel = function(panelId) {
+  // 查找包含该 panelId 的元素
+  const panel = document.querySelector('[data-panel-id="' + panelId + '"]');
+  if (!panel) return;
+
+  // 查找折叠内容和图标
+  const collapsibleContent = panel.querySelector('.collapsible-content');
+  const collapsibleIcon = panel.querySelector('.c-collapsible-icon, .collapsible-icon');
+
+  if (collapsibleContent) {
+    collapsibleContent.classList.toggle('expanded');
+  }
+  if (collapsibleIcon) {
+    collapsibleIcon.classList.toggle('expanded');
+  }
+};
+
+window.toggleCodeBlock = function(codeId) {
+  const block = document.querySelector('[data-code-id="' + codeId + '"]');
+  if (!block) return;
+
+  // 新版 c-codeblock 组件
+  const truncated = block.querySelector('.c-codeblock__truncated');
+  const expandSurface = block.querySelector('.c-codeblock__truncated-surface');
+  const collapseBtn = block.querySelector('.c-codeblock__collapse-btn');
+
+  if (truncated) {
+    const isExpanded = truncated.classList.toggle('expanded');
+    if (expandSurface) {
+      expandSurface.style.display = isExpanded ? 'none' : '';
+    }
+    if (collapseBtn) {
+      collapseBtn.classList.toggle('expanded', isExpanded);
+    }
+  }
+};
+
 window.copyCodeBlock = function(codeId) {
   const codeElement = document.getElementById(codeId);
   if (!codeElement) return;
@@ -2640,27 +2855,28 @@ export function renderSessionList() {
   sessionList.innerHTML = sessions.map(session => {
     const isActive = session.id === currentSessionId;
     const timeStr = formatRelativeTime(session.updatedAt);
+    const msgCount = session.messageCount || 0;
 
     return `
       <div class="session-item ${isActive ? 'active' : ''}"
            onclick="handleSessionSelect('${session.id}')">
-        <div class="session-item-header">
-          <span class="session-item-name">${escapeHtml(session.name || '未命名会话')}</span>
-          <span class="session-item-time">${timeStr}</span>
-        </div>
-        <div class="session-item-preview">${escapeHtml(session.preview || '')}</div>
-        <div class="session-item-meta">
-          <span>💬 ${session.messageCount || 0} 条消息</span>
+        <svg class="session-item-icon" viewBox="0 0 16 16"><path d="M14 1a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4.414A2 2 0 0 0 3 11.586l-2 2V2a1 1 0 0 1 1-1h12z"/></svg>
+        <div class="session-item-content">
+          <div class="session-item-name">${escapeHtml(session.name || '未命名会话')}</div>
+          <div class="session-item-meta">
+            <span>💬 ${msgCount} 条消息</span>
+            <span>${timeStr}</span>
+          </div>
         </div>
         <div class="session-item-actions" onclick="event.stopPropagation()">
-          <button class="session-action-btn"
+          <button class="icon-btn-sm"
                   onclick="handleRenameSession('${session.id}')"
                   title="重命名">
             <svg viewBox="0 0 16 16" width="14" height="14">
               <path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168l10-10zM11.207 2.5 13.5 4.793 14.793 3.5 12.5 1.207 11.207 2.5zm1.586 3L10.5 3.207 4 9.707V10h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.293l6.5-6.5zm-9.761 5.175-.106.106-1.528 3.821 3.821-1.528.106-.106A.5.5 0 0 1 5 12.5V12h-.5a.5.5 0 0 1-.5-.5V11h-.5a.5.5 0 0 1-.468-.325z"/>
             </svg>
           </button>
-          <button class="session-action-btn session-delete-btn"
+          <button class="icon-btn-sm"
                   onclick="handleDeleteSession('${session.id}')"
                   title="删除">
             <svg viewBox="0 0 16 16" width="14" height="14">
