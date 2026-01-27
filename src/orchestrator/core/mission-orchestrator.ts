@@ -30,6 +30,7 @@ import { SnapshotManager } from '../../snapshot-manager';
 import { ContextManager } from '../../context/context-manager';
 import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import { logger, LogCategory } from '../../logging';
+import { ExecutionStats } from '../execution-stats';
 import {
   MissionStorageManager,
   ContractManager,
@@ -135,6 +136,7 @@ export class MissionOrchestrator extends EventEmitter {
   private snapshotManager?: SnapshotManager;
   private contextManager?: ContextManager;
   private adapterFactory?: IAdapterFactory;
+  private executionStats?: ExecutionStats;
 
   // 项目知识库
   private projectKnowledgeBase?: import('../../knowledge/project-knowledge-base').ProjectKnowledgeBase;
@@ -198,6 +200,13 @@ export class MissionOrchestrator extends EventEmitter {
    */
   setAdapterFactory(adapterFactory: IAdapterFactory): void {
     this.adapterFactory = adapterFactory;
+  }
+
+  /**
+   * 设置 ExecutionStats（用于记录压缩模型 token 使用）
+   */
+  setExecutionStats(executionStats: ExecutionStats): void {
+    this.executionStats = executionStats;
   }
 
   /**
@@ -1252,7 +1261,50 @@ export class MissionOrchestrator extends EventEmitter {
     const compressor = new ContextCompressor(
       this.adapterFactory ? {
         sendMessage: async (message: string) => {
-          // 使用 Claude 进行智能压缩
+          const startAt = Date.now();
+          const { LLMConfigLoader } = await import('../../llm/config');
+          const { createLLMClient } = await import('../../llm/clients/client-factory');
+          const compressorConfig = LLMConfigLoader.loadCompressorConfig();
+
+          if (compressorConfig.enabled) {
+            try {
+              const client = createLLMClient(compressorConfig);
+              const response = await client.sendMessage({
+                messages: [{ role: 'user', content: message }],
+                maxTokens: 2000,
+                temperature: 0.3,
+              });
+              const duration = Date.now() - startAt;
+              if (this.executionStats) {
+                this.executionStats.recordExecution({
+                  worker: 'compressor',
+                  taskId: 'memory',
+                  subTaskId: 'compress',
+                  success: true,
+                  duration,
+                  inputTokens: response.usage?.inputTokens,
+                  outputTokens: response.usage?.outputTokens,
+                  phase: 'integration',
+                });
+              }
+              return response.content || '';
+            } catch (error: any) {
+              const duration = Date.now() - startAt;
+              if (this.executionStats) {
+                this.executionStats.recordExecution({
+                  worker: 'compressor',
+                  taskId: 'memory',
+                  subTaskId: 'compress',
+                  success: false,
+                  duration,
+                  error: error?.message,
+                  phase: 'integration',
+                });
+              }
+              throw error;
+            }
+          }
+
           const response = await this.adapterFactory!.sendMessage(
             'claude',
             message,
@@ -1263,6 +1315,20 @@ export class MissionOrchestrator extends EventEmitter {
               adapterRole: 'orchestrator',
             }
           );
+          const duration = Date.now() - startAt;
+          if (this.executionStats) {
+            this.executionStats.recordExecution({
+              worker: 'claude',
+              taskId: 'memory',
+              subTaskId: 'compress',
+              success: !response.error,
+              duration,
+              error: response.error,
+              inputTokens: response.tokenUsage?.inputTokens,
+              outputTokens: response.tokenUsage?.outputTokens,
+              phase: 'integration',
+            });
+          }
           return response.content || '';
         },
       } : null,

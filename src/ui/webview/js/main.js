@@ -14,6 +14,7 @@ import {
   currentBottomTab,
   isProcessing,
   thinkingStartAt,
+  appState,
   sessions,
   pendingChanges,
   tasks,
@@ -87,6 +88,7 @@ import {
   showRecoveryDialog,
   showToolAuthorizationDialog,
   loadSessionMessages,
+  loadSessionFromData,
   showToast,
   addSystemMessage,
   handlePromptEnhanced,
@@ -98,7 +100,8 @@ import {
   updateInteractionModeUI,
   getModeDisplayName,
   showSkillLibraryDialog,
-  setWorkerConfigs
+  setWorkerConfigs,
+  setRepoAddLoading
 } from './ui/event-handlers.js';
 
 import {
@@ -127,6 +130,57 @@ let workerConfigs = {
   codex: null,
   gemini: null
 };
+const CONNECTION_STATUS_POLL_MS = 60000;
+let connectionStatusTimer = null;
+
+function applyWorkerStatusSnapshot(statuses) {
+  if (!statuses) return;
+  const nextState = appState ? { ...appState } : {};
+  const workers = ['claude', 'codex', 'gemini'];
+  const workerStatuses = workers.map(worker => {
+    const status = statuses[worker] || { status: 'unknown' };
+    return {
+      worker,
+      available: status.status === 'available',
+      enabled: status.status !== 'disabled'
+    };
+  });
+  nextState.workerStatuses = workerStatuses;
+  setAppState(nextState);
+  updateWorkerDots();
+}
+
+function applyWorkerStatusChange(worker, available) {
+  if (!worker) return;
+  const nextState = appState ? { ...appState } : {};
+  const workerStatuses = Array.isArray(nextState.workerStatuses) ? [...nextState.workerStatuses] : [];
+  const index = workerStatuses.findIndex(item => item.worker === worker);
+  const entry = {
+    worker,
+    available: Boolean(available),
+    enabled: true
+  };
+  if (index >= 0) {
+    workerStatuses[index] = { ...workerStatuses[index], ...entry };
+  } else {
+    workerStatuses.push(entry);
+  }
+  nextState.workerStatuses = workerStatuses;
+  setAppState(nextState);
+  updateWorkerDots();
+}
+
+function startConnectionStatusPolling() {
+  if (connectionStatusTimer) return;
+  connectionStatusTimer = setInterval(() => {
+    if (document.hidden) return;
+    postMessage({ type: 'checkWorkerStatus' });
+  }, CONNECTION_STATUS_POLL_MS);
+}
+
+function triggerConnectionStatusRefresh() {
+  postMessage({ type: 'checkWorkerStatus' });
+}
 
 // ============================================
 // 应用初始化
@@ -143,6 +197,17 @@ function initializeApp() {
 
   // 2.1 初始化知识 Tab 事件监听器
   initializeKnowledgeEventListeners();
+
+  // 2.2 初始化连接状态与统计（无需等待设置面板打开）
+  triggerConnectionStatusRefresh();
+  postMessage({ type: 'requestExecutionStats' });
+  startConnectionStatusPolling();
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      triggerConnectionStatusRefresh();
+    }
+  });
 
   // 3. 设置 window.addEventListener('message') 处理
   window.addEventListener('message', (event) => {
@@ -178,11 +243,17 @@ function initializeApp() {
         // 会话加载完成
         if (message.session) {
           const session = message.session;
+          const hasLocalMessages = threadMessages.length > 0;
+          const sameSession = currentSessionId && currentSessionId === session.id;
+
           setCurrentSessionId(session.id);
-          threadMessages.length = 0;
-          threadMessages.push(...(session.messages || []));
-          renderMainContent();
-          saveWebviewState();
+          if (!hasLocalMessages || !sameSession) {
+            loadSessionFromData(session);
+            saveWebviewState();
+          } else {
+            renderMainContent();
+            renderSessionList();
+          }
         }
         break;
 
@@ -215,7 +286,7 @@ function initializeApp() {
 
       case 'executionStats':
         // 执行统计更新
-        updateExecutionStats(message.stats, message.orchestratorStats);
+        updateExecutionStats(message.stats, message.orchestratorStats, message.modelCatalog);
         break;
 
       case 'profileConfig':
@@ -269,11 +340,29 @@ function initializeApp() {
           const needsSessionLoad = currentSessionId
             && (currentSessionId !== prevSessionId || threadMessages.length === 0);
           if (needsSessionLoad) {
-            loadSessionMessages(currentSessionId);
-            renderMainContent();
+            const sessionEntry = sessions.find(s => s.id === currentSessionId);
+            const hasFullMessages = sessionEntry && Array.isArray(sessionEntry.messages);
+            if (hasFullMessages) {
+              loadSessionMessages(currentSessionId);
+              renderMainContent();
+              // 🔧 初始加载后滚动到底部
+              requestAnimationFrame(() => {
+                const mainContent = document.getElementById('main-content');
+                if (mainContent) {
+                  mainContent.scrollTop = mainContent.scrollHeight;
+                }
+              });
+            }
             hasInitialRender = true;
           } else if (!hasInitialRender) {
             renderMainContent();
+            // 🔧 首次渲染后滚动到底部
+            requestAnimationFrame(() => {
+              const mainContent = document.getElementById('main-content');
+              if (mainContent) {
+                mainContent.scrollTop = mainContent.scrollHeight;
+              }
+            });
             hasInitialRender = true;
           } else {
             renderMainContent();
@@ -337,7 +426,11 @@ function initializeApp() {
         if (message.sessionId) {
           setCurrentSessionId(message.sessionId);
           resetIncrementalState(); // 切换会话时重置增量更新状态
-          loadSessionMessages(message.sessionId);
+          if (message.session) {
+            loadSessionFromData(message.session);
+          } else {
+            loadSessionMessages(message.sessionId);
+          }
           renderSessionList();
         }
         break;
@@ -346,15 +439,15 @@ function initializeApp() {
         // 会话总结加载（切换会话时）
         if (message.summary) {
           console.log('[Main] 会话总结已加载:', message.summary);
-          // 显示会话总结提示
+          // 显示会话总结提示（使用纯文本，不使用 emoji）
           const summaryText = `
-📋 会话总结: ${message.summary.title}
-🎯 目标: ${message.summary.objective}
-💬 消息数: ${message.summary.messageCount} 条
+[会话总结] ${message.summary.title}
+[目标] ${message.summary.objective}
+[消息数] ${message.summary.messageCount} 条
 
-${message.summary.completedTasks.length > 0 ? `✅ 已完成任务:\n${message.summary.completedTasks.map((t, i) => `  ${i + 1}. ${t}`).join('\n')}` : ''}
-${message.summary.inProgressTasks.length > 0 ? `\n⏳ 进行中任务:\n${message.summary.inProgressTasks.map((t, i) => `  ${i + 1}. ${t}`).join('\n')}` : ''}
-${message.summary.codeChanges.length > 0 ? `\n📝 代码变更: ${message.summary.codeChanges.length} 个文件` : ''}
+${message.summary.completedTasks.length > 0 ? `[已完成任务]\n${message.summary.completedTasks.map((t, i) => `  ${i + 1}. ${t}`).join('\n')}` : ''}
+${message.summary.inProgressTasks.length > 0 ? `\n[进行中任务]\n${message.summary.inProgressTasks.map((t, i) => `  ${i + 1}. ${t}`).join('\n')}` : ''}
+${message.summary.codeChanges.length > 0 ? `\n[代码变更] ${message.summary.codeChanges.length} 个文件` : ''}
           `.trim();
 
           addSystemMessage(summaryText, 'info');
@@ -364,16 +457,17 @@ ${message.summary.codeChanges.length > 0 ? `\n📝 代码变更: ${message.summa
 
       case 'executionStatsUpdate':
         // 执行统计更新（注意是 executionStatsUpdate 不是 executionStats）
-        updateExecutionStats(message.stats, message.orchestratorStats);
+        updateExecutionStats(message.stats, message.orchestratorStats, message.modelCatalog);
         break;
 
       case 'workerStatusUpdate':
         updateModelConnectionStatus(message.statuses);
+        applyWorkerStatusSnapshot(message.statuses);
         break;
 
       case 'workerStatusChanged':
         addSystemMessage(message.worker + ' 状态已更新', 'info');
-        updateWorkerDots();
+        applyWorkerStatusChange(message.worker, message.available);
         break;
 
       case 'processingStateChanged': {
@@ -598,6 +692,7 @@ ${message.summary.codeChanges.length > 0 ? `\n📝 代码变更: ${message.summa
         setRepositories(repositories);
         if (document.getElementById('repo-manage-overlay')) {
           renderRepositoryManagementList();
+          setRepoAddLoading(false);
         }
         break;
 
@@ -606,11 +701,13 @@ ${message.summary.codeChanges.length > 0 ? `\n📝 代码变更: ${message.summa
         setRepositories(repositories);
         if (document.getElementById('repo-manage-overlay')) {
           renderRepositoryManagementList();
+          setRepoAddLoading(false);
         }
         break;
 
       case 'repositoryUpdated':
         postMessage({ type: 'loadRepositories' });
+        setRepoAddLoading(false);
         break;
 
       case 'repositoryDeleted':
@@ -618,6 +715,7 @@ ${message.summary.codeChanges.length > 0 ? `\n📝 代码变更: ${message.summa
         setRepositories(repositories);
         if (document.getElementById('repo-manage-overlay')) {
           renderRepositoryManagementList();
+          setRepoAddLoading(false);
         }
         break;
 

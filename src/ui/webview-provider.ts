@@ -42,6 +42,8 @@ import { UnifiedMessageBus, type ProcessingState } from '../normalizer/unified-m
 import { ProfileStorage, StoredProfileConfig } from '../orchestrator/profile';
 import { parseContentToBlocks } from '../utils/content-parser';
 import { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
+import { InstructionSkillDefinition } from '../tools/skills-manager';
+import { applySkillInstall, buildInstructionSkillPrompt } from '../tools/skill-installation';
 // Mission-Driven Architecture 类型 - 直接从子模块导入
 import {
   MissionOrchestrator,
@@ -296,13 +298,86 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
 
       // 创建压缩模型客户端
-      const client = new UniversalLLMClient({
+      const baseClient = new UniversalLLMClient({
         baseUrl: compressorConfig.baseUrl,
         apiKey: compressorConfig.apiKey,
         model: compressorConfig.model,
         provider: compressorConfig.provider,
         enabled: true,
       });
+      const executionStats = this.intelligentOrchestrator.getExecutionStats();
+      const client = {
+        config: baseClient.config,
+        sendMessage: async (params: any) => {
+          const startedAt = Date.now();
+          try {
+            const response = await baseClient.sendMessage(params);
+            const duration = Date.now() - startedAt;
+            if (executionStats) {
+              executionStats.recordExecution({
+                worker: 'compressor',
+                taskId: 'knowledge',
+                subTaskId: 'extract',
+                success: true,
+                duration,
+                inputTokens: response.usage?.inputTokens,
+                outputTokens: response.usage?.outputTokens,
+                phase: 'integration',
+              });
+            }
+            return response;
+          } catch (error: any) {
+            const duration = Date.now() - startedAt;
+            if (executionStats) {
+              executionStats.recordExecution({
+                worker: 'compressor',
+                taskId: 'knowledge',
+                subTaskId: 'extract',
+                success: false,
+                duration,
+                error: error?.message,
+                phase: 'integration',
+              });
+            }
+            throw error;
+          }
+        },
+        streamMessage: async (params: any, onChunk: any) => {
+          const startedAt = Date.now();
+          try {
+            const response = await baseClient.streamMessage(params, onChunk);
+            const duration = Date.now() - startedAt;
+            if (executionStats) {
+              executionStats.recordExecution({
+                worker: 'compressor',
+                taskId: 'knowledge',
+                subTaskId: 'extract',
+                success: true,
+                duration,
+                inputTokens: response.usage?.inputTokens,
+                outputTokens: response.usage?.outputTokens,
+                phase: 'integration',
+              });
+            }
+            return response;
+          } catch (error: any) {
+            const duration = Date.now() - startedAt;
+            if (executionStats) {
+              executionStats.recordExecution({
+                worker: 'compressor',
+                taskId: 'knowledge',
+                subTaskId: 'extract',
+                success: false,
+                duration,
+                error: error?.message,
+                phase: 'integration',
+              });
+            }
+            throw error;
+          }
+        },
+        testConnection: baseClient.testConnection.bind(baseClient),
+      } as import('../llm/types').LLMClient;
 
       const knowledgeBase = this.projectKnowledgeBase;
       if (!knowledgeBase) {
@@ -1431,6 +1506,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           available: availability[worker],
         });
       }
+
+      // 发送执行统计数据
+      this.sendExecutionStats();
     } catch (error) {
       logger.error('界面.Worker.可用性_失败', error, LogCategory.UI);
     }
@@ -1443,6 +1521,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     switch (message.type) {
       case 'getState':
         this.sendStateUpdate();
+        this.sendCurrentSessionToWebview();
+        break;
+
+      case 'requestState':
+        this.sendStateUpdate();
+        this.sendCurrentSessionToWebview();
         break;
 
       case 'login':
@@ -1557,7 +1641,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
           this.activeSessionId = message.sessionId;
           // 恢复 Worker sessionIds
-          this.postMessage({ type: 'sessionSwitched', sessionId: message.sessionId });
+          this.postMessage({
+            type: 'sessionSwitched',
+            sessionId: message.sessionId,
+            session: switchedSession as any,
+          });
         }
         this.sendStateUpdate();
         break;
@@ -1777,6 +1865,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       case 'installSkill':
         await this.handleInstallSkill(message.skillId);
+        break;
+      case 'applyInstructionSkill':
+        await this.handleApplyInstructionSkill(
+          (message as any).skillName,
+          (message as any).args,
+          (message as any).images || [],
+          (message as any).agent || undefined
+        );
         break;
 
       // Skills 仓库管理
@@ -2519,6 +2615,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
    * 获取或创建 MCP 管理器
    */
   private async getMCPManager(): Promise<any> {
+    if (this.adapterFactory && 'getMCPExecutor' in this.adapterFactory) {
+      const executor = (this.adapterFactory as any).getMCPExecutor?.();
+      if (executor?.getMCPManager) {
+        return executor.getMCPManager();
+      }
+    }
+
     if (!this.mcpManager) {
       const { MCPManager } = await import('../tools/mcp-manager');
       this.mcpManager = new MCPManager();
@@ -2573,6 +2676,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         toastType: 'success'
       });
 
+      if (this.adapterFactory && 'reloadMCP' in this.adapterFactory) {
+        await (this.adapterFactory as any).reloadMCP();
+        logger.info('MCP reloaded in adapter factory', { id: server.id }, LogCategory.TOOLS);
+      }
+
       logger.info('MCP 服务器已添加', { id: server.id, name: server.name }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('添加 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
@@ -2602,6 +2710,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         message: 'MCP 服务器已更新',
         toastType: 'success'
       });
+
+      if (this.adapterFactory && 'reloadMCP' in this.adapterFactory) {
+        await (this.adapterFactory as any).reloadMCP();
+        logger.info('MCP reloaded in adapter factory', { id: serverId }, LogCategory.TOOLS);
+      }
 
       logger.info('MCP 服务器已更新', { id: serverId }, LogCategory.TOOLS);
     } catch (error: any) {
@@ -2638,6 +2751,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         message: 'MCP 服务器已删除',
         toastType: 'success'
       });
+
+      if (this.adapterFactory && 'reloadMCP' in this.adapterFactory) {
+        await (this.adapterFactory as any).reloadMCP();
+        logger.info('MCP reloaded in adapter factory', { id: serverId }, LogCategory.TOOLS);
+      }
 
       logger.info('MCP 服务器已删除', { id: serverId }, LogCategory.TOOLS);
     } catch (error: any) {
@@ -2808,6 +2926,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   // Skills 配置处理
   // ============================================================================
 
+  private async reloadSkillsIfPossible(reason: string): Promise<void> {
+    if (this.adapterFactory && 'reloadSkills' in this.adapterFactory) {
+      await (this.adapterFactory as any).reloadSkills();
+      logger.info('Skills reloaded in adapter factory', { reason }, LogCategory.TOOLS);
+    }
+  }
+
   /**
    * 加载 Skills 配置
    */
@@ -2825,7 +2950,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
             text_editor_20250124: { enabled: false, description: '编辑文本文件（需要客户端实现）' },
             computer_use_20241022: { enabled: false, description: '控制计算机（需要客户端实现）' }
           },
-          customTools: []
+          customTools: [],
+          instructionSkills: []
         }
       });
 
@@ -2858,6 +2984,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         toastType: 'success'
       });
 
+      await this.reloadSkillsIfPossible('saveSkillsConfig');
+
       logger.info('Skills 配置已保存', {}, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('保存 Skills 配置失败', { error: error.message }, LogCategory.TOOLS);
@@ -2877,7 +3005,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const { LLMConfigLoader } = await import('../llm/config');
       const config = LLMConfigLoader.loadSkillsConfig() || {
         builtInTools: {},
-        customTools: []
+        customTools: [],
+        instructionSkills: []
       };
 
       if (!config.builtInTools[tool]) {
@@ -2899,6 +3028,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         toastType: 'success'
       });
 
+      await this.reloadSkillsIfPossible('toggleBuiltInTool');
+
       logger.info('内置工具状态已切换', { tool, enabled }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('切换工具状态失败', { tool, error: error.message }, LogCategory.TOOLS);
@@ -2918,7 +3049,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const { LLMConfigLoader } = await import('../llm/config');
       const config = LLMConfigLoader.loadSkillsConfig() || {
         builtInTools: {},
-        customTools: []
+        customTools: [],
+        instructionSkills: []
       };
 
       // 检查是否已存在
@@ -2942,6 +3074,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         toastType: 'success'
       });
 
+      await this.reloadSkillsIfPossible('addCustomTool');
+
       logger.info('自定义工具已添加', { name: tool.name }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('添加自定义工具失败', { error: error.message }, LogCategory.TOOLS);
@@ -2961,7 +3095,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const { LLMConfigLoader } = await import('../llm/config');
       const config = LLMConfigLoader.loadSkillsConfig() || {
         builtInTools: {},
-        customTools: []
+        customTools: [],
+        instructionSkills: []
       };
 
       config.customTools = config.customTools.filter((t: any) => t.name !== toolName);
@@ -2977,6 +3112,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         message: `自定义工具 "${toolName}" 已删除`,
         toastType: 'success'
       });
+
+      await this.reloadSkillsIfPossible('removeCustomTool');
 
       logger.info('自定义工具已删除', { name: toolName }, LogCategory.TOOLS);
     } catch (error: any) {
@@ -2995,32 +3132,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private async handleInstallSkill(skillId: string): Promise<void> {
     try {
       const { LLMConfigLoader } = await import('../llm/config');
+      const { SkillRepositoryManager } = await import('../tools/skill-repository-manager');
 
-      // 定义可安装的 Skill 库
-      const skillLibrary: Record<string, any> = {
-        web_search: {
-          name: 'web_search_20250305',
-          description: '搜索网络以获取最新信息',
-          enabled: true
-        },
-        web_fetch: {
-          name: 'web_fetch_20250305',
-          description: '获取网页内容',
-          enabled: true
-        },
-        text_editor: {
-          name: 'text_editor_20250124',
-          description: '编辑文本文件',
-          enabled: true
-        },
-        computer_use: {
-          name: 'computer_use_20241022',
-          description: '控制计算机',
-          enabled: true
-        }
-      };
-
-      const skill = skillLibrary[skillId];
+      const repositories = LLMConfigLoader.loadRepositories();
+      const manager = new SkillRepositoryManager();
+      const skills = await manager.getAllSkills(repositories);
+      const skill = skills.find((item: any) => item.fullName === skillId || item.id === skillId);
       if (!skill) {
         throw new Error(`未找到 Skill: ${skillId}`);
       }
@@ -3028,14 +3145,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 加载当前配置
       const config = LLMConfigLoader.loadSkillsConfig() || {
         builtInTools: {},
-        customTools: []
+        customTools: [],
+        instructionSkills: [],
+        repositories
       };
 
-      // 添加或更新内置工具
-      config.builtInTools[skill.name] = {
-        enabled: skill.enabled,
-        description: skill.description
-      };
+      const updatedConfig = applySkillInstall(config, skill);
+      Object.assign(config, updatedConfig);
 
       // 保存配置
       LLMConfigLoader.saveSkillsConfig(config);
@@ -3057,10 +3173,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       await this.handleLoadSkillsConfig();
 
       // 重新加载 Skills 到 ToolManager（让工具真正可用）
-      if (this.adapterFactory && 'reloadSkills' in this.adapterFactory) {
-        await (this.adapterFactory as any).reloadSkills();
-        logger.info('Skills reloaded in adapter factory', { skillId }, LogCategory.TOOLS);
-      }
+      await this.reloadSkillsIfPossible('installSkill');
 
       logger.info('Skill 已安装', { skillId, name: skill.name }, LogCategory.TOOLS);
     } catch (error: any) {
@@ -3278,6 +3391,20 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         Object.keys(skillsConfig.builtInTools).forEach(name => {
           if (skillsConfig.builtInTools[name].enabled) {
             installedSkills.add(name);
+          }
+        });
+      }
+      if (skillsConfig && Array.isArray(skillsConfig.customTools)) {
+        skillsConfig.customTools.forEach((tool: any) => {
+          if (tool?.name) {
+            installedSkills.add(tool.name);
+          }
+        });
+      }
+      if (skillsConfig && Array.isArray(skillsConfig.instructionSkills)) {
+        skillsConfig.instructionSkills.forEach((skill: any) => {
+          if (skill?.name) {
+            installedSkills.add(skill.name);
           }
         });
       }
@@ -3802,39 +3929,76 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const stats = (['claude', 'codex', 'gemini'] as WorkerSlot[]).map(worker => {
-      const workerStats = executionStats.getStats(worker);
-      return {
-        worker,
-        totalExecutions: workerStats.totalExecutions,
-        successCount: workerStats.successCount,
-        failureCount: workerStats.failureCount,
-        successRate: workerStats.successRate,
-        avgDuration: workerStats.avgDuration,
-        isHealthy: workerStats.isHealthy,
-        healthScore: workerStats.healthScore,
-        lastError: workerStats.lastError,
-        lastExecutionTime: workerStats.lastExecutionTime,
-        totalInputTokens: workerStats.totalInputTokens,
-        totalOutputTokens: workerStats.totalOutputTokens,
-      };
-    });
+    const modelCatalog = this.buildModelCatalog();
+    const modelIds = modelCatalog.map(entry => entry.id);
+    const stats = executionStats.getAllStats(modelIds).map(workerStats => ({
+      worker: workerStats.worker,
+      totalExecutions: workerStats.totalExecutions,
+      successCount: workerStats.successCount,
+      failureCount: workerStats.failureCount,
+      successRate: workerStats.successRate,
+      avgDuration: workerStats.avgDuration,
+      isHealthy: workerStats.isHealthy,
+      healthScore: workerStats.healthScore,
+      lastError: workerStats.lastError,
+      lastExecutionTime: workerStats.lastExecutionTime,
+      totalInputTokens: workerStats.totalInputTokens,
+      totalOutputTokens: workerStats.totalOutputTokens,
+    }));
 
-   
-    const orchestratorTokens = this.intelligentOrchestrator.getOrchestratorTokenUsage();
     const orchestratorStats = {
       totalTasks: stats.reduce((sum, s) => sum + s.totalExecutions, 0),
       totalSuccess: stats.reduce((sum, s) => sum + s.successCount, 0),
       totalFailed: stats.reduce((sum, s) => sum + s.failureCount, 0),
-      totalInputTokens: stats.reduce((sum, s) => sum + s.totalInputTokens, 0) + (orchestratorTokens?.inputTokens || 0),
-      totalOutputTokens: stats.reduce((sum, s) => sum + s.totalOutputTokens, 0) + (orchestratorTokens?.outputTokens || 0),
+      totalInputTokens: stats.reduce((sum, s) => sum + (s.totalInputTokens || 0), 0),
+      totalOutputTokens: stats.reduce((sum, s) => sum + (s.totalOutputTokens || 0), 0),
     };
 
     this.postMessage({
       type: 'executionStatsUpdate',
       stats,
       orchestratorStats,
+      modelCatalog,
     } as ExtensionToWebviewMessage);
+  }
+
+  private buildModelCatalog(): { id: string; label: string; model?: string; provider?: string; enabled?: boolean; role?: 'worker' | 'orchestrator' | 'compressor' | 'unknown' }[] {
+    try {
+      const { LLMConfigLoader } = require('../llm/config');
+      const fullConfig = LLMConfigLoader.loadFullConfig();
+      const entries: { id: string; label: string; model?: string; provider?: string; enabled?: boolean; role?: 'worker' | 'orchestrator' | 'compressor' | 'unknown' }[] = [];
+
+      const toLabel = (id: string) => id.charAt(0).toUpperCase() + id.slice(1);
+      const addEntry = (id: string, label: string, config: any, role: 'worker' | 'orchestrator' | 'compressor') => {
+        entries.push({
+          id,
+          label,
+          model: config?.model,
+          provider: config?.provider,
+          enabled: config?.enabled !== false,
+          role,
+        });
+      };
+
+      if (fullConfig?.workers) {
+        for (const [workerId, workerConfig] of Object.entries(fullConfig.workers)) {
+          addEntry(workerId, toLabel(workerId), workerConfig, 'worker');
+        }
+      }
+
+      if (fullConfig?.orchestrator) {
+        addEntry('orchestrator', 'Orchestrator', fullConfig.orchestrator, 'orchestrator');
+      }
+
+      if (fullConfig?.compressor) {
+        addEntry('compressor', 'Compressor', fullConfig.compressor, 'compressor');
+      }
+
+      return entries;
+    } catch (error) {
+      logger.warn('界面.模型目录.加载失败', { error: (error as Error).message }, LogCategory.UI);
+      return [];
+    }
   }
 
   private async handleResetExecutionStats(): Promise<void> {
@@ -4301,6 +4465,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 判断执行模式：智能编排 vs 直接执行
     const useIntelligentMode = !forceWorker && !this.selectedWorker;
 
+    const resolvedSkill = this.resolveInstructionSkillPrompt(prompt);
+    const effectivePrompt = resolvedSkill.prompt;
 
     this.sessionManager.addMessage('user', prompt);
     this.sendStateUpdate();
@@ -4317,10 +4483,75 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     if (useIntelligentMode) {
       // 智能编排模式：Claude 分析 → 分配 Worker → 执行 → 总结
-      await this.executeWithIntelligentOrchestrator(prompt, imagePaths);
+      await this.executeWithIntelligentOrchestrator(effectivePrompt, imagePaths);
     } else {
       // 直接执行模式：指定 Worker 直接执行
-      await this.executeWithDirectWorker(prompt, forceWorker || this.selectedWorker!, imagePaths);
+      await this.executeWithDirectWorker(effectivePrompt, forceWorker || this.selectedWorker!, imagePaths);
+    }
+  }
+
+  private resolveInstructionSkillPrompt(prompt: string): { prompt: string; skillName?: string } {
+    const trimmed = prompt.trim();
+    if (!trimmed) {
+      return { prompt };
+    }
+    if (trimmed.startsWith('/plan') || trimmed.startsWith('@plan') || trimmed.startsWith('/start-work') || trimmed.startsWith('/start')) {
+      return { prompt };
+    }
+
+    const match = trimmed.match(/^\/([^\s]+)(\s+([\s\S]*))?$/);
+    if (!match) {
+      return { prompt };
+    }
+
+    const skillName = match[1];
+    const args = (match[3] || '').trim();
+
+    try {
+      const { LLMConfigLoader } = require('../llm/config');
+      const config = LLMConfigLoader.loadSkillsConfig();
+      const skills: InstructionSkillDefinition[] = Array.isArray(config?.instructionSkills) ? config.instructionSkills : [];
+      const skill = skills.find((item) => item.name === skillName);
+      if (!skill) {
+        return { prompt };
+      }
+      const mergedPrompt = buildInstructionSkillPrompt(skill, args);
+      return { prompt: mergedPrompt, skillName: skill.name };
+    } catch (error: any) {
+      logger.warn('Failed to resolve instruction skill', { error: error.message }, LogCategory.TOOLS);
+      return { prompt };
+    }
+  }
+
+  private async handleApplyInstructionSkill(
+    skillName: string,
+    args?: string,
+    images?: Array<{ dataUrl: string }>,
+    agent?: WorkerSlot
+  ): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      const config = LLMConfigLoader.loadSkillsConfig();
+      const skills: InstructionSkillDefinition[] = Array.isArray(config?.instructionSkills) ? config.instructionSkills : [];
+      const skill = skills.find((item) => item.name === skillName);
+      if (!skill) {
+        this.postMessage({
+          type: 'toast',
+          message: `未找到 Skill: ${skillName}`,
+          toastType: 'error'
+        });
+        return;
+      }
+
+      const prompt = buildInstructionSkillPrompt(skill, args || '');
+      await this.executeTask(prompt, agent || undefined, images || []);
+    } catch (error: any) {
+      logger.error('应用 Skill 失败', { skillName, error: error.message }, LogCategory.TOOLS);
+      this.postMessage({
+        type: 'toast',
+        message: `应用 Skill 失败: ${error.message}`,
+        toastType: 'error'
+      });
     }
   }
 
@@ -4533,6 +4764,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private sendStateUpdate(): void {
     const state = this.buildUIState();
     this.postMessage({ type: 'stateUpdate', state });
+  }
+
+  private sendCurrentSessionToWebview(): void {
+    const session = this.sessionManager.getCurrentSession();
+    if (!session) {
+      return;
+    }
+    this.postMessage({ type: 'sessionLoaded', session: session as any });
   }
 
   /** 创建并切换到新会话（对齐任务/对话会话） */

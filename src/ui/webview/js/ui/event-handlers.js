@@ -43,6 +43,7 @@ import {
   renderSkillLibrary,
   renderRepositoryManagementList,
   renderSkillsToolList,
+  getSkillsConfig,
   showMCPDialog,
   toggleDependencyPanel,
   updateEditsBadge,
@@ -153,7 +154,7 @@ export function showRepositoryManagementDialog() {
                 <label>仓库 URL</label>
                 <input type="text" id="repo-url-input" placeholder="https://example.com/skills.json">
               </div>
-              <button class="settings-btn primary" onclick="addRepositoryFromDialog()">
+              <button class="settings-btn primary" id="repo-add-btn" onclick="addRepositoryFromDialog()">
                 <svg viewBox="0 0 16 16" fill="currentColor">
                   <path d="M8 2a.5.5 0 0 1 .5.5v5h5a.5.5 0 0 1 0 1h-5v5a.5.5 0 0 1-1 0v-5h-5a.5.5 0 0 1 0-1h5v-5A.5.5 0 0 1 8 2z"/>
                 </svg>
@@ -189,8 +190,20 @@ export function addRepositoryFromDialog() {
     alert('请输入仓库 URL');
     return;
   }
+  setRepoAddLoading(true);
   postMessage({ type: 'addRepository', url });
   if (input) input.value = '';
+}
+
+export function setRepoAddLoading(isLoading) {
+  const btn = document.getElementById('repo-add-btn');
+  if (!btn) return;
+  btn.classList.toggle('loading', isLoading);
+  btn.disabled = isLoading;
+  const label = btn.querySelector('span');
+  if (label) {
+    label.textContent = isLoading ? '添加中' : '添加';
+  }
 }
 
 export function refreshRepositoryInDialog(id) {
@@ -305,6 +318,248 @@ export function closeSkillLibraryDialog() {
 export function installSkill(skillFullName) {
   postMessage({ type: 'installSkill', skillId: skillFullName });
   closeSkillLibraryDialog();
+}
+
+export function showSkillUseDialog() {
+  const config = getSkillsConfig();
+  if (!config) {
+    postMessage({ type: 'loadSkillsConfig' });
+    showToast('技能配置加载中，请稍后再试', 'info');
+    return;
+  }
+  const instructionSkills = Array.isArray(config?.instructionSkills) ? config.instructionSkills : [];
+
+  const dialogHTML = `
+    <div class="modal-overlay" id="skill-use-overlay">
+      <div class="modal-dialog skill-use-dialog">
+        <div class="modal-header">
+          <h3>使用 Skill</h3>
+          <button class="modal-close" id="skill-use-close">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="skill-use-layout">
+            <div class="skill-use-list">
+              <div class="skill-use-search">
+                <input type="text" id="skill-use-search" placeholder="搜索 Skill...">
+              </div>
+              <div class="skill-use-items" id="skill-use-items"></div>
+            </div>
+            <div class="skill-use-detail" id="skill-use-detail">
+              <div class="skill-use-empty">选择一个 Skill 查看详情</div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="settings-btn" id="skill-use-cancel">取消</button>
+          <button class="settings-btn primary" id="skill-use-apply" disabled>应用并发送</button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const oldDialog = document.getElementById('skill-use-overlay');
+  if (oldDialog) oldDialog.remove();
+  document.body.insertAdjacentHTML('beforeend', dialogHTML);
+
+  const closeDialog = () => {
+    const dialog = document.getElementById('skill-use-overlay');
+    if (dialog) dialog.remove();
+  };
+
+  document.getElementById('skill-use-close').addEventListener('click', closeDialog);
+  document.getElementById('skill-use-cancel').addEventListener('click', closeDialog);
+  document.getElementById('skill-use-overlay').addEventListener('click', (e) => {
+    if (e.target.id === 'skill-use-overlay') closeDialog();
+  });
+
+  const listEl = document.getElementById('skill-use-items');
+  const detailEl = document.getElementById('skill-use-detail');
+  const applyBtn = document.getElementById('skill-use-apply');
+  const searchInput = document.getElementById('skill-use-search');
+
+  if (!listEl || !detailEl || !applyBtn) {
+    return;
+  }
+
+  if (instructionSkills.length === 0) {
+    listEl.innerHTML = `
+      <div class="empty-state">
+        <p>暂无可用的 Skill</p>
+        <p class="empty-state-hint">请先安装 Skill</p>
+        <button class="settings-btn primary" id="skill-use-install-btn">打开 Skill 库</button>
+      </div>
+    `;
+    const installBtn = document.getElementById('skill-use-install-btn');
+    if (installBtn) {
+      installBtn.addEventListener('click', () => {
+        closeDialog();
+        showSkillLibraryDialog();
+      });
+    }
+    return;
+  }
+
+  let currentSkill = null;
+
+  const renderList = (filter = '') => {
+    const lower = filter.toLowerCase();
+    const items = instructionSkills.filter(skill => {
+      const name = (skill.name || '').toLowerCase();
+      const desc = (skill.description || '').toLowerCase();
+      return name.includes(lower) || desc.includes(lower);
+    });
+
+    listEl.innerHTML = items.map(skill => {
+      const safeName = escapeHtml(skill.name);
+      const safeDesc = escapeHtml(skill.description || '');
+      const descAttr = safeDesc.replace(/\"/g, '&quot;');
+      const hasDesc = Boolean(safeDesc);
+      return `
+        <div class="skill-use-item" data-skill-name="${safeName}">
+          <div class="skill-use-name">${safeName}</div>
+          <div class="skill-use-desc-row">
+            <div class="skill-use-desc" title="${descAttr}">${safeDesc || '-'}</div>
+            ${hasDesc ? `
+              <button class="skill-use-desc-btn" type="button" title="查看描述">
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
+                  <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 13A6 6 0 1 1 8 2a6 6 0 0 1 0 12zm-.5-6.5h1v4h-1v-4zm0-3h1v1h-1v-1z"/>
+                </svg>
+              </button>
+            ` : ''}
+          </div>
+          ${hasDesc ? `<div class="skill-use-desc-pop">${safeDesc}</div>` : ''}
+        </div>
+      `;
+    }).join('');
+
+    listEl.querySelectorAll('.skill-use-item').forEach(item => {
+      item.addEventListener('click', (event) => {
+        const target = event.target;
+        if (target && target.closest && (target.closest('.skill-use-desc-btn') || target.closest('.skill-use-desc-pop'))) {
+          return;
+        }
+        const name = item.getAttribute('data-skill-name');
+        currentSkill = instructionSkills.find(s => s.name === name);
+        listEl.querySelectorAll('.skill-use-item').forEach(node => node.classList.remove('active'));
+        item.classList.add('active');
+        renderDetail();
+      });
+    });
+
+    listEl.querySelectorAll('.skill-use-desc-btn').forEach((btn) => {
+      btn.addEventListener('click', (event) => {
+        event.stopPropagation();
+        const item = btn.closest('.skill-use-item');
+        if (!item) return;
+        listEl.querySelectorAll('.skill-use-item.show-desc').forEach((openItem) => {
+          if (openItem !== item) openItem.classList.remove('show-desc');
+        });
+        item.classList.toggle('show-desc');
+      });
+    });
+  };
+
+  const renderDetail = () => {
+    if (!currentSkill) {
+      detailEl.innerHTML = '<div class="skill-use-detail-scroll"><div class="skill-use-empty">选择一个 Skill 查看详情</div></div>';
+      applyBtn.disabled = true;
+      return;
+    }
+
+    const inputValue = document.getElementById('prompt-input')?.value || '';
+    const allowedTools = Array.isArray(currentSkill.allowedTools) ? currentSkill.allowedTools : [];
+    const repoName = currentSkill.repositoryName || '';
+    const invocable = currentSkill.userInvocable !== false;
+    const instructionPreview = escapeHtml((currentSkill.content || '').trim());
+    detailEl.innerHTML = `
+      <div class="skill-use-detail-scroll">
+        <div class="skill-use-detail-header">
+          <div class="skill-use-title">${escapeHtml(currentSkill.name)}</div>
+          <div class="skill-use-meta">${escapeHtml(currentSkill.description || '')}</div>
+          <div class="skill-use-chips">
+            ${repoName ? `<span class="skill-use-chip">来源: ${escapeHtml(repoName)}</span>` : ''}
+            ${allowedTools.length > 0 ? `<span class="skill-use-chip">工具: ${escapeHtml(allowedTools.join(', '))}</span>` : ''}
+            ${currentSkill.disableModelInvocation ? `<span class="skill-use-chip">需手动触发</span>` : ''}
+          </div>
+        </div>
+        ${invocable ? '' : '<div class="skill-use-warning">该 Skill 禁止手动调用</div>'}
+        <div class="skill-use-field">
+          <label>参数（可选）</label>
+          <textarea id="skill-use-args" placeholder="${escapeHtml(currentSkill.argumentHint || '输入参数')}">${escapeHtml(inputValue)}</textarea>
+        </div>
+        <div class="skill-use-field">
+          <label>指令预览</label>
+          <div class="skill-use-preview">${instructionPreview || '无指令内容'}</div>
+        </div>
+      </div>
+    `;
+    applyBtn.disabled = !invocable;
+  };
+
+  renderList();
+  renderDetail();
+
+  if (searchInput) {
+    searchInput.addEventListener('input', (e) => {
+      renderList(e.target.value || '');
+    });
+  }
+
+  listEl.addEventListener('click', (event) => {
+    const target = event.target;
+    if (target && target.closest && target.closest('.skill-use-desc-pop')) {
+      return;
+    }
+    listEl.querySelectorAll('.skill-use-item.show-desc').forEach((openItem) => {
+      openItem.classList.remove('show-desc');
+    });
+  });
+
+  applyBtn.addEventListener('click', () => {
+    if (!currentSkill) return;
+
+    const args = document.getElementById('skill-use-args')?.value || '';
+    const imageDataUrls = attachedImages.length > 0 ? attachedImages.map(img => img.dataUrl) : [];
+    const selectedAgent = document.getElementById('agent-selector')?.value || '';
+    const isOrchestratorMode = !selectedAgent;
+
+    if (isProcessing) {
+      showToast('任务执行中，请稍后再试', 'warning');
+      return;
+    }
+    if (hasPendingClarification() || hasPendingWorkerQuestion() || hasPendingQuestion() || hasPendingConfirmation()) {
+      showToast('请先完成当前的交互流程后再使用 Skill', 'warning');
+      return;
+    }
+
+    setProcessingActor(isOrchestratorMode ? 'orchestrator' : 'worker', selectedAgent || 'claude');
+    setProcessingState(true, true);
+
+    const userMsg = {
+      role: 'user',
+      content: args ? `使用 Skill: ${currentSkill.name}\n${args}` : `使用 Skill: ${currentSkill.name}`,
+      time: new Date().toLocaleTimeString().slice(0, 5),
+      timestamp: Date.now(),
+      images: imageDataUrls
+    };
+    threadMessages.push(userMsg);
+    renderMainContent();
+    saveWebviewState();
+
+    postMessage({
+      type: 'applyInstructionSkill',
+      skillName: currentSkill.name,
+      args,
+      images: imageDataUrls,
+      agent: selectedAgent || null
+    });
+
+    const input = document.getElementById('prompt-input');
+    if (input) input.value = '';
+    attachedImages.length = 0;
+    renderImagePreviews();
+    closeDialog();
+  });
 }
 
 function displayWorkerConfig(worker) {
@@ -810,6 +1065,13 @@ export function initializeEventListeners() {
   const imageFileInput = document.getElementById('image-file-input');
   if (imageFileInput) {
     imageFileInput.addEventListener('change', handleImageFileInputChange);
+  }
+
+  const useSkillBtn = document.getElementById('use-skill-btn');
+  if (useSkillBtn) {
+    useSkillBtn.addEventListener('click', () => {
+      showSkillUseDialog();
+    });
   }
 
   // Prompt 增强按钮

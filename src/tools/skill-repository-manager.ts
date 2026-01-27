@@ -8,6 +8,7 @@
  */
 
 import axios from 'axios';
+import type { CustomToolExecutorConfig, ToolDefinition } from './skills-manager';
 import { logger, LogCategory } from '../logging';
 
 /**
@@ -34,6 +35,14 @@ export interface SkillInfo {
   icon?: string;
   repositoryId: string;
   repositoryName?: string;
+  toolDefinition?: ToolDefinition;
+  executor?: CustomToolExecutorConfig;
+  skillType?: 'tool' | 'instruction';
+  instruction?: string;
+  allowedTools?: string[];
+  disableModelInvocation?: boolean;
+  userInvocable?: boolean;
+  argumentHint?: string;
 }
 
 /**
@@ -60,7 +69,8 @@ export class SkillRepositoryManager {
         type: 'server-side',
         icon: '🔍',
         repositoryId: 'builtin',
-        repositoryName: 'Claude 官方技能'
+        repositoryName: 'Claude 官方技能',
+        skillType: 'tool'
       },
       {
         id: 'web_fetch',
@@ -73,7 +83,8 @@ export class SkillRepositoryManager {
         type: 'server-side',
         icon: '🌐',
         repositoryId: 'builtin',
-        repositoryName: 'Claude 官方技能'
+        repositoryName: 'Claude 官方技能',
+        skillType: 'tool'
       },
       {
         id: 'text_editor',
@@ -86,7 +97,8 @@ export class SkillRepositoryManager {
         type: 'client-side',
         icon: '📝',
         repositoryId: 'builtin',
-        repositoryName: 'Claude 官方技能'
+        repositoryName: 'Claude 官方技能',
+        skillType: 'tool'
       },
       {
         id: 'computer_use',
@@ -99,7 +111,8 @@ export class SkillRepositoryManager {
         type: 'client-side',
         icon: '💻',
         repositoryId: 'builtin',
-        repositoryName: 'Claude 官方技能'
+        repositoryName: 'Claude 官方技能',
+        skillType: 'tool'
       }
     ];
   }
@@ -142,6 +155,9 @@ export class SkillRepositoryManager {
           continue;
         }
 
+        const { toolDefinition, executor } = this.normalizeToolDefinition(skill);
+        const skillType = this.detectSkillType(skill, toolDefinition);
+
         skills.push({
           id: skill.id,
           name: skill.name,
@@ -153,7 +169,15 @@ export class SkillRepositoryManager {
           type: skill.type,
           icon: skill.icon,
           repositoryId,
-          repositoryName: data.name
+          repositoryName: data.name,
+          toolDefinition,
+          executor,
+          skillType,
+          instruction: skill.instruction,
+          allowedTools: skill.allowedTools || skill['allowed-tools'],
+          disableModelInvocation: skill.disableModelInvocation ?? skill['disable-model-invocation'],
+          userInvocable: skill.userInvocable ?? skill['user-invocable'],
+          argumentHint: skill.argumentHint ?? skill['argument-hint']
         });
       }
 
@@ -231,7 +255,9 @@ export class SkillRepositoryManager {
             type: 'client-side',
             icon: '🔌',
             repositoryId,
-            repositoryName: `${repo} (Claude Code Plugins)`
+            repositoryName: `${repo} (Claude Code Plugins)`,
+            skillType: 'instruction',
+            instruction: readme
           });
 
           logger.debug('Converted Claude Code plugin', { pluginName, title }, LogCategory.TOOLS);
@@ -248,7 +274,9 @@ export class SkillRepositoryManager {
             type: 'client-side',
             icon: '🔌',
             repositoryId,
-            repositoryName: `${repo} (Claude Code Plugins)`
+            repositoryName: `${repo} (Claude Code Plugins)`,
+            skillType: 'instruction',
+            instruction: `Claude Code plugin: ${pluginName}`
           });
 
           logger.debug('Converted Claude Code plugin (no README)', { pluginName }, LogCategory.TOOLS);
@@ -271,6 +299,290 @@ export class SkillRepositoryManager {
     }
   }
 
+  private async fetchRawFile(owner: string, repo: string, branch: string, filePath: string): Promise<string | null> {
+    const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${filePath}`;
+    try {
+      const response = await axios.get(rawUrl, {
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'MultiCLI-SkillManager/1.0'
+        }
+      });
+      if (typeof response.data === 'string') {
+        return response.data;
+      }
+      return JSON.stringify(response.data);
+    } catch (error: any) {
+      if (error.response?.status === 404 || error.response?.status === 403 || error.response?.status === 429) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  private async listRepoDir(owner: string, repo: string, dirPath: string): Promise<any[] | null> {
+    const url = `https://api.github.com/repos/${owner}/${repo}/contents/${dirPath}`;
+    try {
+      const response = await axios.get(url, {
+        timeout: 10000,
+        headers: {
+          'Accept': 'application/vnd.github.v3+json',
+          'User-Agent': 'MultiCLI-SkillManager/1.0'
+        }
+      });
+      return Array.isArray(response.data) ? response.data : null;
+    } catch (error: any) {
+      if (error.response?.status === 404 || error.response?.status === 403 || error.response?.status === 429) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  private parseSkillMarkdown(content: string): {
+    meta: Record<string, any>;
+    body: string;
+  } {
+    const trimmed = content.trim();
+    if (!trimmed.startsWith('---')) {
+      return { meta: {}, body: content.trim() };
+    }
+
+    const lines = trimmed.split('\n');
+    const metaLines: string[] = [];
+    let i = 1;
+    for (; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (line === '---') {
+        i++;
+        break;
+      }
+      metaLines.push(lines[i]);
+    }
+
+    const meta: Record<string, any> = {};
+    let currentKey: string | null = null;
+
+    for (const line of metaLines) {
+      const trimmedLine = line.trim();
+      if (!trimmedLine) continue;
+
+      if (trimmedLine.startsWith('- ') && currentKey) {
+        if (!Array.isArray(meta[currentKey])) {
+          meta[currentKey] = [];
+        }
+        meta[currentKey].push(trimmedLine.slice(2).trim());
+        continue;
+      }
+
+      const match = trimmedLine.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
+      if (match) {
+        const key = match[1];
+        let value: any = match[2].trim();
+        if (value === '') {
+          meta[key] = [];
+        } else if (value === 'true' || value === 'false') {
+          meta[key] = value === 'true';
+        } else {
+          value = value.replace(/^['"]|['"]$/g, '');
+          meta[key] = value;
+        }
+        currentKey = key;
+        continue;
+      }
+    }
+
+    const body = lines.slice(i).join('\n').trim();
+    return { meta, body };
+  }
+
+  private normalizeSkillName(name: string): string {
+    return name.trim();
+  }
+
+  private slugify(name: string): string {
+    return name
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '');
+  }
+
+  private extractAllowedTools(meta: Record<string, any>): string[] | undefined {
+    const raw = meta['allowed-tools'] ?? meta['allowed_tools'];
+    if (!raw) return undefined;
+    if (Array.isArray(raw)) {
+      return raw.map((item) => String(item).trim()).filter(Boolean);
+    }
+    if (typeof raw === 'string') {
+      return raw.split(',').map((item) => item.trim()).filter(Boolean);
+    }
+    return undefined;
+  }
+
+  private async fetchSkillFromDirectory(
+    owner: string,
+    repo: string,
+    branch: string,
+    repositoryId: string,
+    repositoryName: string,
+    skillDirPath: string
+  ): Promise<SkillInfo | null> {
+    const skillMd = await this.fetchRawFile(owner, repo, branch, `${skillDirPath}/SKILL.md`);
+    const fallbackMd = skillMd ?? await this.fetchRawFile(owner, repo, branch, `${skillDirPath}/skill.md`);
+    if (!fallbackMd) {
+      return null;
+    }
+
+    const { meta, body } = this.parseSkillMarkdown(fallbackMd);
+    const dirName = skillDirPath.split('/').filter(Boolean).pop() || 'skill';
+    const name = this.normalizeSkillName(meta.name || dirName);
+    const description = meta.description || body.split('\n').find(line => line.trim()) || '';
+
+    return {
+      id: this.slugify(name),
+      name,
+      fullName: name,
+      description: description || '',
+      author: meta.author || owner,
+      version: meta.version,
+      category: meta.category,
+      repositoryId,
+      repositoryName,
+      skillType: 'instruction',
+      instruction: body,
+      allowedTools: this.extractAllowedTools(meta),
+      disableModelInvocation: meta['disable-model-invocation'] ?? meta.disable_model_invocation ?? false,
+      userInvocable: meta['user-invocable'] ?? meta.user_invocable ?? true,
+      argumentHint: meta['argument-hint'] ?? meta.argument_hint
+    };
+  }
+
+  private normalizeSkillPaths(raw: any): string[] {
+    if (!raw) {
+      return ['skills'];
+    }
+    if (Array.isArray(raw)) {
+      return raw.map((item) => String(item)).filter(Boolean);
+    }
+    if (typeof raw === 'string') {
+      return [raw];
+    }
+    return ['skills'];
+  }
+
+  private normalizeSkillPath(pathInput: string): string {
+    return pathInput
+      .trim()
+      .replace(/\\/g, '/')
+      .replace(/^\.\/+/, '')
+      .replace(/^\/+/, '')
+      .replace(/\/+/g, '/');
+  }
+
+  private async fetchClaudeCodePluginSkills(
+    owner: string,
+    repo: string,
+    repositoryId: string,
+    branch: string,
+    basePath: string,
+    pluginJson: any
+  ): Promise<SkillInfo[]> {
+    const skillPaths = this.normalizeSkillPaths(pluginJson.skills);
+    const skills: SkillInfo[] = [];
+
+    for (const skillPath of skillPaths) {
+      const normalized = this.normalizeSkillPath([basePath, skillPath].filter(Boolean).join('/'));
+
+      const directSkill = await this.fetchSkillFromDirectory(
+        owner,
+        repo,
+        branch,
+        repositoryId,
+        pluginJson.name || repo,
+        normalized
+      );
+      if (directSkill) {
+        skills.push(directSkill);
+        continue;
+      }
+
+      const entries = await this.listRepoDir(owner, repo, normalized);
+      if (!entries) continue;
+
+      const dirs = entries.filter((item: any) => item.type === 'dir');
+      for (const dir of dirs) {
+        const skillDirPath = dir.path;
+        const skill = await this.fetchSkillFromDirectory(owner, repo, branch, repositoryId, pluginJson.name || repo, skillDirPath);
+        if (skill) {
+          skills.push(skill);
+        }
+      }
+    }
+
+    return skills;
+  }
+
+  private async tryFetchClaudeCodePluginRepository(
+    owner: string,
+    repo: string,
+    repositoryId: string,
+    branch: string
+  ): Promise<{ name: string; skills: SkillInfo[] } | null> {
+    const pluginJsonPaths = ['.claude-plugin/plugin.json', 'plugin.json'];
+    const candidateBranches = [branch, 'main', 'master'].filter((value, index, arr) => value && arr.indexOf(value) === index);
+
+    for (const pluginJsonPath of pluginJsonPaths) {
+      for (const candidateBranch of candidateBranches) {
+        const raw = await this.fetchRawFile(owner, repo, candidateBranch, pluginJsonPath);
+        if (!raw) continue;
+        try {
+          const pluginJson = JSON.parse(raw);
+          const skills = await this.fetchClaudeCodePluginSkills(owner, repo, repositoryId, candidateBranch, '', pluginJson);
+          if (skills.length > 0) {
+            return { name: pluginJson.name || repo, skills };
+          }
+        } catch (error: any) {
+          logger.warn('Failed to parse plugin.json', { error: error.message }, LogCategory.TOOLS);
+        }
+      }
+    }
+
+    // 支持 monorepo plugins/ 目录
+    const pluginsDir = await this.listRepoDir(owner, repo, 'plugins');
+    if (!pluginsDir) {
+      return null;
+    }
+
+    const skills: SkillInfo[] = [];
+    for (const pluginDir of pluginsDir.filter((item: any) => item.type === 'dir')) {
+      const basePath = `plugins/${pluginDir.name}`;
+      for (const pluginJsonPath of ['.claude-plugin/plugin.json', 'plugin.json']) {
+        const raw = await this.fetchRawFile(owner, repo, branch, `${basePath}/${pluginJsonPath}`);
+        if (!raw) continue;
+        try {
+          const pluginJson = JSON.parse(raw);
+          const pluginSkills = await this.fetchClaudeCodePluginSkills(owner, repo, repositoryId, branch, basePath, pluginJson);
+          if (pluginSkills.length > 0) {
+            pluginSkills.forEach((skill) => {
+              skill.repositoryName = pluginJson.name || pluginDir.name || repo;
+            });
+            skills.push(...pluginSkills);
+          }
+          break;
+        } catch (error: any) {
+          logger.warn('Failed to parse plugin.json', { error: error.message }, LogCategory.TOOLS);
+        }
+      }
+    }
+
+    if (skills.length === 0) {
+      return null;
+    }
+
+    return { name: repo, skills };
+  }
+
   /**
    * 从 GitHub 仓库获取 Skills
    * 支持格式：https://github.com/owner/repo
@@ -288,22 +600,33 @@ export class SkillRepositoryManager {
       const owner = match[1];
       const repo = match[2].replace(/\.git$/, '');
 
-      // 获取仓库信息
-      const repoInfoUrl = `https://api.github.com/repos/${owner}/${repo}`;
-      const repoInfoResponse = await axios.get(repoInfoUrl, {
-        timeout: 10000,
-        headers: {
-          'Accept': 'application/vnd.github.v3+json',
-          'User-Agent': 'MultiCLI-SkillManager/1.0'
-        }
-      });
+      // 获取仓库信息（可能被 GitHub API 速率限制阻断）
+      let repoName = repo;
+      let repoDescription = '';
+      let defaultBranch = 'main';
+      try {
+        const repoInfoUrl = `https://api.github.com/repos/${owner}/${repo}`;
+        const repoInfoResponse = await axios.get(repoInfoUrl, {
+          timeout: 10000,
+          headers: {
+            'Accept': 'application/vnd.github.v3+json',
+            'User-Agent': 'MultiCLI-SkillManager/1.0'
+          }
+        });
 
-      const repoInfo = repoInfoResponse.data;
-      const repoName = repoInfo.name || repo;
-      const repoDescription = repoInfo.description || '';
+        const repoInfo = repoInfoResponse.data;
+        repoName = repoInfo.name || repo;
+        repoDescription = repoInfo.description || '';
+        defaultBranch = repoInfo.default_branch || 'main';
+      } catch (error: any) {
+        logger.warn('Failed to fetch GitHub repo info, falling back to branch guesses', {
+          url,
+          error: error.message
+        }, LogCategory.TOOLS);
+      }
 
       // 尝试获取 skills.json 文件
-      const skillsJsonUrl = `https://raw.githubusercontent.com/${owner}/${repo}/main/skills.json`;
+      const skillsJsonUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/skills.json`;
       let skillsData: any;
 
       try {
@@ -315,21 +638,39 @@ export class SkillRepositoryManager {
           }
         });
         skillsData = skillsResponse.data;
-      } catch (mainError: any) {
-        // 如果 main 分支没有，尝试 master 分支
-        const skillsJsonUrlMaster = `https://raw.githubusercontent.com/${owner}/${repo}/master/skills.json`;
-        try {
-          const skillsResponse = await axios.get(skillsJsonUrlMaster, {
-            timeout: 10000,
-            headers: {
-              'Accept': 'application/json',
-              'User-Agent': 'MultiCLI-SkillManager/1.0'
-            }
-          });
-          skillsData = skillsResponse.data;
-        } catch (masterError: any) {
+      } catch (defaultBranchError: any) {
+        const fallbackBranches = ['main', 'master'].filter(branch => branch !== defaultBranch);
+        let fetched = false;
+        for (const branch of fallbackBranches) {
+          const fallbackUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/skills.json`;
+          try {
+            const skillsResponse = await axios.get(fallbackUrl, {
+              timeout: 10000,
+              headers: {
+                'Accept': 'application/json',
+                'User-Agent': 'MultiCLI-SkillManager/1.0'
+              }
+            });
+            skillsData = skillsResponse.data;
+            fetched = true;
+            break;
+          } catch {
+            // continue
+          }
+        }
+
+        if (!fetched) {
           // 两个分支都没有 skills.json，尝试检测 Claude Code 插件格式
           logger.info('No skills.json found, trying Claude Code plugins format', { owner, repo }, LogCategory.TOOLS);
+
+          try {
+            const pluginSkills = await this.tryFetchClaudeCodePluginRepository(owner, repo, repositoryId, defaultBranch);
+            if (pluginSkills) {
+              return pluginSkills;
+            }
+          } catch (pluginError: any) {
+            logger.warn('Failed to fetch Claude Code plugins', { error: pluginError.message }, LogCategory.TOOLS);
+          }
 
           try {
             const pluginsData = await this.fetchClaudeCodePlugins(owner, repo, repositoryId);
@@ -342,8 +683,8 @@ export class SkillRepositoryManager {
 
           // 如果也不是 Claude Code 格式，抛出错误
           throw new Error(
-            `GitHub 仓库 ${owner}/${repo} 中没有找到 skills.json 文件。\n` +
-            `请确保仓库根目录包含 skills.json 文件（main 或 master 分支）。\n` +
+            `GitHub 仓库 ${owner}/${repo} 中没有找到 skills.json 或 Claude Code 插件技能。\n` +
+            `请确保仓库根目录包含 skills.json 文件（${defaultBranch} 分支优先），或符合 Claude Code 插件格式。\n` +
             `参考格式请查看 example-skills-repository.json 文件。`
           );
         }
@@ -366,6 +707,9 @@ export class SkillRepositoryManager {
           continue;
         }
 
+        const { toolDefinition, executor } = this.normalizeToolDefinition(skill);
+        const skillType = this.detectSkillType(skill, toolDefinition);
+
         skills.push({
           id: skill.id,
           name: skill.name,
@@ -377,7 +721,15 @@ export class SkillRepositoryManager {
           type: skill.type,
           icon: skill.icon,
           repositoryId,
-          repositoryName: skillsData.name || repoName
+          repositoryName: skillsData.name || repoName,
+          toolDefinition,
+          executor,
+          skillType,
+          instruction: skill.instruction,
+          allowedTools: skill.allowedTools || skill['allowed-tools'],
+          disableModelInvocation: skill.disableModelInvocation ?? skill['disable-model-invocation'],
+          userInvocable: skill.userInvocable ?? skill['user-invocable'],
+          argumentHint: skill.argumentHint ?? skill['argument-hint']
         });
       }
 
@@ -516,5 +868,48 @@ export class SkillRepositoryManager {
       this.cacheExpiry.clear();
       logger.info('All repository caches cleared', {}, LogCategory.TOOLS);
     }
+  }
+
+  private normalizeToolDefinition(skill: any): {
+    toolDefinition?: ToolDefinition;
+    executor?: CustomToolExecutorConfig;
+  } {
+    const candidate = skill.toolDefinition || skill.tool;
+    const inputSchema =
+      candidate?.input_schema ||
+      candidate?.inputSchema ||
+      skill.input_schema ||
+      skill.inputSchema;
+
+    const executor: CustomToolExecutorConfig | undefined =
+      candidate?.executor || skill.executor;
+
+    if (!inputSchema) {
+      return { executor };
+    }
+
+    return {
+      toolDefinition: {
+        name: candidate?.name || skill.fullName || skill.name,
+        description: candidate?.description || skill.description || '',
+        input_schema: inputSchema
+      },
+      executor
+    };
+  }
+
+  private detectSkillType(skill: any, toolDefinition?: ToolDefinition): 'tool' | 'instruction' | undefined {
+    if (skill.skillType) {
+      if (skill.skillType === 'instruction' || skill.skillType === 'tool') {
+        return skill.skillType;
+      }
+    }
+    if (skill.instruction || skill['instruction']) {
+      return 'instruction';
+    }
+    if (toolDefinition || skill.executor || skill.toolDefinition || skill.tool) {
+      return 'tool';
+    }
+    return undefined;
   }
 }

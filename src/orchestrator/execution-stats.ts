@@ -14,7 +14,7 @@ export type ExecutionPhase = 'planning' | 'execution' | 'verification' | 'integr
 
 /** 单次执行记录 */
 export interface ExecutionRecord {
-  worker: WorkerSlot;
+  worker: string;
   taskId: string;
   subTaskId: string;
   success: boolean;
@@ -30,7 +30,7 @@ export interface ExecutionRecord {
 
 /** Worker 统计摘要 */
 export interface WorkerStats {
-  worker: WorkerSlot;
+  worker: string;
   totalExecutions: number;
   successCount: number;
   failureCount: number;
@@ -124,7 +124,7 @@ export class ExecutionStats {
   }
 
   /** 获取 Worker 统计摘要 */
-  getStats(worker: WorkerSlot): WorkerStats {
+  getStats(worker: string): WorkerStats {
     const workerRecords = this.records.filter(r => r.worker === worker);
     const recentRecords = workerRecords.slice(-this.config.recentWindow);
 
@@ -179,9 +179,19 @@ export class ExecutionStats {
   }
 
   /** 获取所有 Worker 的统计 */
-  getAllStats(): WorkerStats[] {
-    const workerTypes: WorkerSlot[] = ['claude', 'codex', 'gemini'];
-    return workerTypes.map(worker => this.getStats(worker));
+  getAllStats(modelIds?: string[]): WorkerStats[] {
+    const defaultWorkers: WorkerSlot[] = ['claude', 'codex', 'gemini'];
+    const ids = modelIds && modelIds.length > 0 ? new Set(modelIds) : new Set(defaultWorkers);
+
+    if (modelIds && modelIds.length > 0) {
+      for (const record of this.records) {
+        if (record.worker) {
+          ids.add(record.worker);
+        }
+      }
+    }
+
+    return Array.from(ids).map(id => this.getStats(id));
   }
 
   /** 获取按阶段分离的 Token 统计 */
@@ -214,8 +224,8 @@ export class ExecutionStats {
   /** 获取健康的 Worker 列表 */
   getHealthyWorkers(): WorkerSlot[] {
     return this.getAllStats()
-      .filter(s => s.isHealthy)
-      .map(s => s.worker);
+      .filter(s => s.isHealthy && this.isWorkerSlot(s.worker))
+      .map(s => s.worker as WorkerSlot);
   }
 
   /** 获取降级建议 */
@@ -226,8 +236,9 @@ export class ExecutionStats {
   ): FallbackSuggestion | null {
     const allStats = this.getAllStats();
     const candidates = allStats
-      .filter(s => s.worker !== failedWorker && !excludeWorkers.includes(s.worker))
-      .filter(s => !availableWorkers || availableWorkers.includes(s.worker))
+      .filter(s => this.isWorkerSlot(s.worker))
+      .filter(s => s.worker !== failedWorker && !excludeWorkers.includes(s.worker as WorkerSlot))
+      .filter(s => !availableWorkers || availableWorkers.includes(s.worker as WorkerSlot))
       .filter(s => s.isHealthy || s.totalExecutions < 3)  // 健康或样本不足
       .sort((a, b) => {
         // 优先选择成功率高的
@@ -247,7 +258,7 @@ export class ExecutionStats {
 
     return {
       originalWorker: failedWorker,
-      suggestedWorker: best.worker,
+      suggestedWorker: best.worker as WorkerSlot,
       reason: this.buildFallbackReason(failedStats, best),
       confidence: this.calculateConfidence(best),
     };
@@ -268,7 +279,11 @@ export class ExecutionStats {
       return scoreB - scoreA;
     });
 
-    return candidates[0]?.worker || availableWorkers[0];
+    return (candidates[0]?.worker as WorkerSlot) || availableWorkers[0];
+  }
+
+  private isWorkerSlot(value: string): value is WorkerSlot {
+    return value === 'claude' || value === 'codex' || value === 'gemini';
   }
 
   /** 分类错误类型 */

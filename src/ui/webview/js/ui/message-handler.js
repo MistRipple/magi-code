@@ -1301,27 +1301,27 @@ export function showClarificationAsMessage(questions, context, ambiguityScore, o
 
 export function loadSessionMessages(sessionId) {
       const session = sessions.find(s => s.id === sessionId);
-      if (!session) return;
+      if (!session) {
+        return;
+      }
       const sessionMessages = Array.isArray(session.messages) ? session.messages : [];
 
       // 🔧 重要：切换会话时必须重置增量更新状态，否则 UI 不会刷新
       resetIncrementalState();
 
-      // 转换消息格式：后端存储的是 SessionMessage，前端需要简化格式
-      // 注意：必须保留所有特殊字段（toolCalls、parsedBlocks 等）以正确渲染
+      // 转换消息格式：后端存储的是 SessionMessage（只有基本字段），前端需要完整格式
       const convertedMessages = sessionMessages.map(m => ({
         role: m.role,
-        content: m.content,
+        content: m.content || '',
         time: m.timestamp ? new Date(m.timestamp).toLocaleTimeString().slice(0,5) : '',
         timestamp: m.timestamp,
         agent: m.agent,
         source: m.source,
-        images: m.images,
-        // 保留特殊内容字段
-        toolCalls: m.toolCalls,
-        parsedBlocks: m.parsedBlocks,
-        thinking: m.thinking,
-        thinkingContent: m.thinkingContent
+        images: m.images || [],
+        toolCalls: m.toolCalls || [],
+        parsedBlocks: m.parsedBlocks || null,
+        thinking: m.thinking || null,
+        thinkingContent: m.thinkingContent || ''
       }));
 
       // 清空并重新填充 threadMessages
@@ -1343,10 +1343,79 @@ export function loadSessionMessages(sessionId) {
       }
 
       saveWebviewState();
+
+      // 🔧 强制刷新：直接操作 DOM 确保渲染
+      const container = document.getElementById('main-content');
+      if (container) {
+        // 先清空容器，强制重新渲染
+        container.innerHTML = '';
+      }
+
       renderMainContent();
+
+      // 🔧 切换会话后滚动到底部
+      autoScrollEnabled.thread = true;
+      requestAnimationFrame(() => {
+        const mainContent = document.getElementById('main-content');
+        if (mainContent) {
+          mainContent.scrollTop = mainContent.scrollHeight;
+        }
+      });
 
       // 更新会话选择器显示
       renderSessionList();
+    }
+
+export function loadSessionFromData(session) {
+      if (!session) {
+        return;
+      }
+
+      const sessionMessages = Array.isArray(session.messages) ? session.messages : [];
+
+      // 🔧 重要：切换会话时必须重置增量更新状态，否则 UI 不会刷新
+      resetIncrementalState();
+
+      const convertedMessages = sessionMessages.map(m => ({
+        role: m.role,
+        content: m.content,
+        time: m.timestamp ? new Date(m.timestamp).toLocaleTimeString().slice(0,5) : '',
+        timestamp: m.timestamp,
+        agent: m.agent,
+        source: m.source,
+        images: m.images,
+        toolCalls: m.toolCalls,
+        parsedBlocks: m.parsedBlocks,
+        thinking: m.thinking,
+        thinkingContent: m.thinkingContent
+      }));
+
+      threadMessages.length = 0;
+      threadMessages.push(...convertedMessages);
+
+      agentOutputs.claude = [];
+      agentOutputs.codex = [];
+      agentOutputs.gemini = [];
+
+      if (session.agentOutputs) {
+        ['claude', 'codex', 'gemini'].forEach(agent => {
+          if (Array.isArray(session.agentOutputs[agent])) {
+            agentOutputs[agent] = session.agentOutputs[agent];
+          }
+        });
+      }
+
+      saveWebviewState();
+      renderMainContent();
+
+      renderSessionList();
+      autoScrollEnabled.thread = true;
+      requestAnimationFrame(() => {
+        const mainContent = document.getElementById('main-content');
+        if (mainContent) {
+          mainContent.scrollTop = mainContent.scrollHeight;
+        }
+      });
     }
 
 export function trimMessageLists() {

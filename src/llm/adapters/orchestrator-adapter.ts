@@ -107,13 +107,14 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       let fullResponse = '';
 
       // 流式调用 LLM
-      await this.client.streamMessage(params, (chunk) => {
+      const response = await this.client.streamMessage(params, (chunk) => {
         if (chunk.type === 'content_delta' && chunk.content) {
           fullResponse += chunk.content;
           this.normalizer.processChunk(messageId, chunk.content);
           this.emit('message', chunk.content);
         }
       });
+      this.recordTokenUsage(response.usage);
 
       // 添加助手响应到历史
       this.conversationHistory.push({

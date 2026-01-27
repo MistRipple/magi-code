@@ -453,6 +453,7 @@ export type WebviewToExtensionMessage =
   | { type: 'confirmPlan'; confirmed: boolean }
   | { type: 'answerQuestions'; answer: string | null }
   | { type: 'getState' }
+  | { type: 'requestState' }
   // 新增：交互模式相关
   | { type: 'setInteractionMode'; mode: InteractionMode }
   | { type: 'confirmRecovery'; decision: 'retry' | 'rollback' | 'continue' }
@@ -502,6 +503,7 @@ export type WebviewToExtensionMessage =
   | { type: 'addCustomTool'; tool: any }
   | { type: 'removeCustomTool'; toolName: string }
   | { type: 'installSkill'; skillId: string }
+  | { type: 'applyInstructionSkill'; skillName: string; args?: string; images?: Array<{ dataUrl: string }>; agent?: WorkerSlot | null }
   // 新增：Skills 仓库相关
   | { type: 'loadRepositories' }
   | { type: 'addRepository'; url: string }
@@ -538,8 +540,9 @@ export type ExtensionToWebviewMessage =
   | { type: 'loginError'; message: string }
   | { type: 'authStatus'; loggedIn: boolean }
   | { type: 'toast'; message: string; toastType?: 'success' | 'error' | 'warning' | 'info'; duration?: number }
+  | { type: 'sessionLoaded'; session: Session }
   | { type: 'sessionCreated'; session: Session }
-  | { type: 'sessionSwitched'; sessionId: string }
+  | { type: 'sessionSwitched'; sessionId: string; session?: Session }
   | { type: 'sessionSummaryLoaded'; sessionId: string; summary: any }
   | { type: 'sessionsUpdated'; sessions: Session[] }
   | { type: 'showDiff'; filePath: string; diff: string }
@@ -558,7 +561,7 @@ export type ExtensionToWebviewMessage =
   | { type: 'taskPaused'; taskId: string }
   | { type: 'taskResumed'; taskId: string }
 
-  | { type: 'executionStatsUpdate'; stats: WorkerExecutionStats[]; orchestratorStats?: { totalTasks: number; totalSuccess: number; totalFailed: number; totalInputTokens: number; totalOutputTokens: number } }
+  | { type: 'executionStatsUpdate'; stats: WorkerExecutionStats[]; orchestratorStats?: { totalTasks: number; totalSuccess: number; totalFailed: number; totalInputTokens: number; totalOutputTokens: number }; modelCatalog?: ModelCatalogEntry[] }
   | { type: 'workerFallbackNotice'; originalWorker: WorkerSlot; fallbackWorker: WorkerSlot; reason: string }
 
   | { type: 'workerTaskCard'; worker: WorkerSlot; taskId: string; subTaskId: string; description: string; targetFiles?: string[]; reason?: string; status: string; dispatchId?: string; sessionId?: string | null }
@@ -616,8 +619,8 @@ export type ExtensionToWebviewMessage =
 
 /** Worker 执行统计数据（用于 UI 显示） */
 export interface WorkerExecutionStats {
-  /** Worker 类型 */
-  worker: WorkerSlot;
+  /** 模型标识 */
+  worker: string;
   /** 总执行次数 */
   totalExecutions: number;
   /** 成功次数 */
@@ -640,4 +643,14 @@ export interface WorkerExecutionStats {
   totalInputTokens?: number;
   /** 总输出 token */
   totalOutputTokens?: number;
+}
+
+/** 模型目录（用于动态渲染统计卡片） */
+export interface ModelCatalogEntry {
+  id: string;
+  label: string;
+  model?: string;
+  provider?: string;
+  enabled?: boolean;
+  role?: 'worker' | 'orchestrator' | 'compressor' | 'unknown';
 }
