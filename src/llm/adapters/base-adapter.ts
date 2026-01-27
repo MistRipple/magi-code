@@ -4,7 +4,7 @@
  */
 
 import { EventEmitter } from 'events';
-import { AgentType, AgentRole, LLMConfig } from '../../types/agent-types';
+import { AgentType, AgentRole, LLMConfig, TokenUsage } from '../../types/agent-types';
 import { LLMClient } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager } from '../../tools/tool-manager';
@@ -42,6 +42,8 @@ export abstract class BaseLLMAdapter extends EventEmitter {
   protected toolManager: ToolManager;
   protected config: LLMConfig;
   protected currentTraceId?: string;
+  protected lastTokenUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
+  protected totalTokenUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
 
   constructor(
     client: LLMClient,
@@ -150,6 +152,49 @@ export abstract class BaseLLMAdapter extends EventEmitter {
    */
   get isBusy(): boolean {
     return this.state === AdapterState.BUSY;
+  }
+
+  /**
+   * 获取最近一次请求的 Token 使用
+   */
+  getLastTokenUsage(): TokenUsage {
+    return { ...this.lastTokenUsage };
+  }
+
+  /**
+   * 获取累计 Token 使用
+   */
+  getTotalTokenUsage(): TokenUsage {
+    return { ...this.totalTokenUsage };
+  }
+
+  /**
+   * 记录 Token 使用
+   */
+  protected recordTokenUsage(usage?: Partial<TokenUsage>): void {
+    if (!usage) return;
+    const inputTokens = usage.inputTokens || 0;
+    const outputTokens = usage.outputTokens || 0;
+    const cacheReadTokens = usage.cacheReadTokens || 0;
+    const cacheWriteTokens = usage.cacheWriteTokens || 0;
+
+    this.lastTokenUsage = {
+      inputTokens,
+      outputTokens,
+      cacheReadTokens: cacheReadTokens || undefined,
+      cacheWriteTokens: cacheWriteTokens || undefined,
+    };
+
+    this.totalTokenUsage.inputTokens += inputTokens;
+    this.totalTokenUsage.outputTokens += outputTokens;
+    if (cacheReadTokens) {
+      this.totalTokenUsage.cacheReadTokens =
+        (this.totalTokenUsage.cacheReadTokens || 0) + cacheReadTokens;
+    }
+    if (cacheWriteTokens) {
+      this.totalTokenUsage.cacheWriteTokens =
+        (this.totalTokenUsage.cacheWriteTokens || 0) + cacheWriteTokens;
+    }
   }
 
   /**

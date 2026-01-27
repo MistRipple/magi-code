@@ -359,13 +359,20 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       };
     }
 
-    const executor = this.mcpExecutors.get(serverId);
+    let executor = this.mcpExecutors.get(serverId);
     if (!executor) {
-      return {
-        toolCallId: toolCall.id,
-        content: `MCP server '${serverId}' not found`,
-        isError: true,
-      };
+      if (this.mcpExecutors.size === 1) {
+        executor = Array.from(this.mcpExecutors.values())[0];
+        logger.warn('MCP executor not found by serverId, falling back to sole executor', {
+          serverId,
+        }, LogCategory.TOOLS);
+      } else {
+        return {
+          toolCallId: toolCall.id,
+          content: `MCP server '${serverId}' not found`,
+          isError: true,
+        };
+      }
     }
 
     return await executor.execute(toolCall);
@@ -387,13 +394,20 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       };
     }
 
-    const executor = this.skillExecutors.get(skillId);
+    let executor = this.skillExecutors.get(skillId);
     if (!executor) {
-      return {
-        toolCallId: toolCall.id,
-        content: `Skill '${skillId}' not found`,
-        isError: true,
-      };
+      if (this.skillExecutors.size === 1) {
+        executor = Array.from(this.skillExecutors.values())[0];
+        logger.warn('Skill executor not found by skillId, falling back to sole executor', {
+          skillId,
+        }, LogCategory.TOOLS);
+      } else {
+        return {
+          toolCallId: toolCall.id,
+          content: `Skill '${skillId}' not found`,
+          isError: true,
+        };
+      }
     }
 
     return await executor.execute(toolCall);

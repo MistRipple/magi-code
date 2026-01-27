@@ -150,12 +150,13 @@ export function renderMainContent() {
       const scrollHeight = container.scrollHeight;
       const clientHeight = container.clientHeight;
       // 判断是否在底部附近（允许 50px 误差）
-      const wasAtBottom = scrollTop + clientHeight >= scrollHeight - 50;
+      const wasAtBottom = autoScrollEnabled[currentBottomTab]
+        || scrollTop + clientHeight >= scrollHeight - 50;
 
       if (currentBottomTab === 'thread') {
         renderThreadView(container);
       } else if (['claude', 'codex', 'gemini'].includes(currentBottomTab)) {
-        renderCliOutputView(container, currentBottomTab);
+        renderAgentOutputView(container, currentBottomTab);
       }
 
       // 修复：渲染后恢复滚动位置
@@ -628,6 +629,11 @@ export function renderMessageContentSmart(message, agent) {
         return { html: '', isMarkdown: false };
       }
 
+      // 如果已经有 toolCalls 渲染通道，避免 tool_call 块重复渲染
+      if (message.toolCalls && message.toolCalls.length > 0) {
+        blocks = blocks.filter(block => block.type !== 'tool_call');
+      }
+
       return renderParsedBlocks(blocks, agent);
     }
 
@@ -688,7 +694,15 @@ export function renderCodeBlock(code, lang, filepath) {
       const trimmedCode = code.replace(/^\n+/, '').replace(/\n+$/, '');
       if (!trimmedCode) return '';
 
-      const lines = trimmedCode.split('\n');
+      const isBlankLine = (line) => line.replace(/[\s\uFEFF\u200B\u200C\u200D]/g, '') === '';
+
+      const rawLines = trimmedCode.split('\n');
+      while (rawLines.length > 0 && isBlankLine(rawLines[0])) rawLines.shift();
+      while (rawLines.length > 0 && isBlankLine(rawLines[rawLines.length - 1])) rawLines.pop();
+      if (rawLines.length === 0) return '';
+      const normalizedCode = rawLines.join('\n');
+
+      const lines = normalizedCode.split('\n');
       const isDiff = lang === 'diff' || lines.some(line => /^[+-](?!\+\+|--)\s/.test(line));
 
       // 使用 highlight.js 高亮整个代码块
@@ -696,16 +710,16 @@ export function renderCodeBlock(code, lang, filepath) {
       if (typeof hljs !== 'undefined' && lang && lang !== 'text' && lang !== 'diff') {
         try {
           if (hljs.getLanguage(lang)) {
-            highlightedCode = hljs.highlight(trimmedCode, { language: lang, ignoreIllegals: true }).value;
+            highlightedCode = hljs.highlight(normalizedCode, { language: lang, ignoreIllegals: true }).value;
           } else {
-            highlightedCode = hljs.highlightAuto(trimmedCode).value;
+            highlightedCode = hljs.highlightAuto(normalizedCode).value;
           }
         } catch (e) {
           console.warn('[renderCodeBlock] highlight error:', e);
-          highlightedCode = escapeHtml(trimmedCode);
+          highlightedCode = escapeHtml(normalizedCode);
         }
       } else {
-        highlightedCode = escapeHtml(trimmedCode);
+        highlightedCode = escapeHtml(normalizedCode);
       }
 
       // 将高亮后的代码按行分割
@@ -1077,7 +1091,7 @@ export function renderStructuredPlanContent(plan) {
       // 验收标准
       if (plan.acceptanceCriteria && Array.isArray(plan.acceptanceCriteria) && plan.acceptanceCriteria.length > 0) {
         html += '<div class="plan-section">';
-        html += '<div class="plan-section-title">✅ 验收标准</div>';
+        html += '<div class="plan-section-title"><svg class="icon-inline" viewBox="0 0 16 16" width="14" height="14"><path fill="currentColor" d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/></svg> 验收标准</div>';
         html += '<ul class="plan-list">';
         for (const criteria of plan.acceptanceCriteria) {
           html += '<li>' + escapeHtml(String(criteria)) + '</li>';
@@ -2282,6 +2296,10 @@ export function renderRepositoryManagementList() {
       }).join('');
     }
 
+export function getSkillsConfig() {
+      return skillsConfig;
+    }
+
 export function renderSkillsToolList() {
       const listEl = document.getElementById('skills-tool-list');
       if (!listEl) return;
@@ -2307,9 +2325,30 @@ export function renderSkillsToolList() {
           enabledSkills.push({
             name: toolName,
             description: toolConfig.description || '',
-            enabled: true
+            enabled: true,
+            source: 'builtin'
           });
         }
+      }
+      if (Array.isArray(skillsConfig.customTools)) {
+        skillsConfig.customTools.forEach(tool => {
+          enabledSkills.push({
+            name: tool.name,
+            description: tool.description || '',
+            enabled: true,
+            source: 'custom'
+          });
+        });
+      }
+      if (Array.isArray(skillsConfig.instructionSkills)) {
+        skillsConfig.instructionSkills.forEach(skill => {
+          enabledSkills.push({
+            name: skill.name,
+            description: skill.description || '',
+            enabled: true,
+            source: 'instruction'
+          });
+        });
       }
 
       // 如果没有启用的 Skills，显示空状态
@@ -2332,12 +2371,18 @@ export function renderSkillsToolList() {
       for (const skill of enabledSkills) {
         // 判断是服务器端还是客户端工具
         const isServerSide = skill.name.includes('web_search') || skill.name.includes('web_fetch');
-        const typeLabel = isServerSide ? 'Server' : 'Client';
-        const typeClass = isServerSide ? '' : 'client';
+        const isCustom = skill.source === 'custom';
+        const isInstruction = skill.source === 'instruction';
+        const typeLabel = isInstruction ? 'Instruction' : (isCustom ? 'Custom' : (isServerSide ? 'Server' : 'Client'));
+        const typeClass = isInstruction ? 'instruction' : (isCustom ? 'custom' : (isServerSide ? '' : 'client'));
         const iconClass = skill.name.includes('web_search') ? 'web-search' :
                          skill.name.includes('web_fetch') ? 'web-fetch' :
-                         skill.name.includes('text_editor') ? 'text-editor' : 'computer-use';
+                         skill.name.includes('text_editor') ? 'text-editor' :
+                         skill.name.includes('computer_use') ? 'computer-use' :
+                         isInstruction ? 'instruction-skill' : 'custom-skill';
 
+        const safeDesc = escapeHtml(skill.description || '');
+        const descAttr = safeDesc.replace(/"/g, '&quot;');
         html += `
           <div class="skills-tool-item">
             <div class="skills-tool-icon ${iconClass}">
@@ -2350,15 +2395,45 @@ export function renderSkillsToolList() {
                 <span class="skills-tool-name">${escapeHtml(skill.name)}</span>
                 <span class="skills-tool-type ${typeClass}">${typeLabel}</span>
               </div>
-              <div class="skills-tool-desc">${escapeHtml(skill.description || '')}</div>
+              <div class="skills-tool-row">
+                <div class="skills-tool-desc" title="${descAttr}">${safeDesc || '-'}</div>
+                <button class="skills-tool-desc-btn" type="button" title="查看描述" data-skill-desc="${descAttr}">
+                  <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor">
+                    <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 13A6 6 0 1 1 8 2a6 6 0 0 1 0 12zm-.5-6.5h1v4h-1v-4zm0-3h1v1h-1v-1z"/>
+                  </svg>
+                </button>
+              </div>
             </div>
             <div class="skills-tool-toggle active" title="已启用"></div>
+            <div class="skills-tool-desc-pop">${safeDesc || '无描述'}</div>
           </div>
         `;
       }
 
       html += '</div>';
       listEl.innerHTML = html;
+
+      listEl.querySelectorAll('.skills-tool-desc-btn').forEach((btn) => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const item = btn.closest('.skills-tool-item');
+          if (!item) return;
+          listEl.querySelectorAll('.skills-tool-item.show-desc').forEach((openItem) => {
+            if (openItem !== item) openItem.classList.remove('show-desc');
+          });
+          item.classList.toggle('show-desc');
+        });
+      });
+
+      listEl.addEventListener('click', (e) => {
+        const target = e.target;
+        if (target && target.closest && target.closest('.skills-tool-desc-pop')) {
+          return;
+        }
+        listEl.querySelectorAll('.skills-tool-item.show-desc').forEach((openItem) => {
+          openItem.classList.remove('show-desc');
+        });
+      });
     }
 
 export function renderSkillLibrary(skills) {
@@ -2414,6 +2489,10 @@ export function renderSkillLibrary(skills) {
               if (skill.author) metaParts.push(`<span class="skill-library-meta-item">作者: ${escapeHtml(skill.author)}</span>`);
               if (skill.version) metaParts.push(`<span class="skill-library-meta-item">版本: ${escapeHtml(skill.version)}</span>`);
               if (skill.category) metaParts.push(`<span class="skill-library-meta-item">分类: ${escapeHtml(skill.category)}</span>`);
+              if (skill.skillType) {
+                const typeLabel = skill.skillType === 'instruction' ? 'Instruction' : 'Tool';
+                metaParts.push(`<span class="skill-library-meta-item">类型: ${escapeHtml(typeLabel)}</span>`);
+              }
               const metaHtml = metaParts.length > 0 ? metaParts.join('<span class="skill-library-meta-separator">|</span>') : '';
 
               return `
@@ -2857,31 +2936,33 @@ export function renderSessionList() {
     const timeStr = formatRelativeTime(session.updatedAt);
     const msgCount = session.messageCount || 0;
 
+    // 生成会话名称首字母作为头像
+    const sessionName = session.name || '未命名会话';
+    const initial = sessionName.charAt(0).toUpperCase();
+
     return `
       <div class="session-item ${isActive ? 'active' : ''}"
            onclick="handleSessionSelect('${session.id}')">
-        <svg class="session-item-icon" viewBox="0 0 16 16"><path d="M14 1a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4.414A2 2 0 0 0 3 11.586l-2 2V2a1 1 0 0 1 1-1h12z"/></svg>
+        <div class="session-item-avatar">${initial}</div>
         <div class="session-item-content">
-          <div class="session-item-name">${escapeHtml(session.name || '未命名会话')}</div>
-          <div class="session-item-meta">
-            <span>💬 ${msgCount} 条消息</span>
-            <span>${timeStr}</span>
+          <div class="session-item-header">
+            <span class="session-item-name">${escapeHtml(sessionName)}</span>
+            <span class="session-item-time">${timeStr}</span>
+          </div>
+          <div class="session-item-preview">
+            <span class="session-item-count">${msgCount} 条消息</span>
           </div>
         </div>
         <div class="session-item-actions" onclick="event.stopPropagation()">
-          <button class="icon-btn-sm"
-                  onclick="handleRenameSession('${session.id}')"
-                  title="重命名">
+          <button class="session-action-btn" onclick="handleRenameSession('${session.id}')" title="重命名">
             <svg viewBox="0 0 16 16" width="14" height="14">
-              <path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168l10-10zM11.207 2.5 13.5 4.793 14.793 3.5 12.5 1.207 11.207 2.5zm1.586 3L10.5 3.207 4 9.707V10h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.293l6.5-6.5zm-9.761 5.175-.106.106-1.528 3.821 3.821-1.528.106-.106A.5.5 0 0 1 5 12.5V12h-.5a.5.5 0 0 1-.5-.5V11h-.5a.5.5 0 0 1-.468-.325z"/>
+              <path fill="currentColor" d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168l10-10zM11.207 2.5 13.5 4.793 14.793 3.5 12.5 1.207 11.207 2.5zm1.586 3L10.5 3.207 4 9.707V10h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.293l6.5-6.5zm-9.761 5.175-.106.106-1.528 3.821 3.821-1.528.106-.106A.5.5 0 0 1 5 12.5V12h-.5a.5.5 0 0 1-.5-.5V11h-.5a.5.5 0 0 1-.468-.325z"/>
             </svg>
           </button>
-          <button class="icon-btn-sm"
-                  onclick="handleDeleteSession('${session.id}')"
-                  title="删除">
+          <button class="session-action-btn session-action-btn--danger" onclick="handleDeleteSession('${session.id}')" title="删除">
             <svg viewBox="0 0 16 16" width="14" height="14">
-              <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
-              <path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
+              <path fill="currentColor" d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
+              <path fill="currentColor" fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
             </svg>
           </button>
         </div>

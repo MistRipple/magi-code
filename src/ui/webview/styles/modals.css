@@ -46,6 +46,38 @@
     .modal-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6); display: flex; align-items: center; justify-content: center; z-index: 1000; animation: fadeIn 0.15s ease; }
     @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
     .modal-dialog { width: 480px; max-width: 90vw; max-height: 80vh; background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); overflow: hidden; display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4); animation: slideUp 0.2s ease; }
+    .skill-use-dialog { width: 720px; max-width: 92vw; }
+    .skill-use-dialog .modal-body { overflow: hidden; }
+    .skill-use-layout { display: grid; grid-template-columns: 240px 1fr; gap: var(--spacing-4); align-items: stretch; }
+    .skill-use-list { border-right: 1px solid var(--vscode-panel-border); padding-right: var(--spacing-3); display: flex; flex-direction: column; height: 360px; }
+    .skill-use-search input { width: 100%; height: 34px; padding: var(--spacing-2) var(--spacing-3); border: 1px solid var(--vscode-input-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); border-radius: var(--radius-2); font-size: var(--font-size-2); outline: none; }
+    .skill-use-items { margin-top: var(--spacing-3); display: flex; flex-direction: column; gap: var(--spacing-2); overflow-y: auto; flex: 1; }
+    .skill-use-item { padding: var(--spacing-2) var(--spacing-3); border-radius: var(--radius-2); background: rgba(255, 255, 255, 0.02); cursor: pointer; border: 1px solid transparent; position: relative; }
+    .skill-use-item:hover { border-color: var(--vscode-focusBorder); }
+    .skill-use-item.active { border-color: var(--vscode-focusBorder); background: rgba(59, 130, 246, 0.12); }
+    .skill-use-name { font-size: var(--font-size-2); font-weight: 600; color: var(--vscode-foreground); }
+    .skill-use-desc-row { display: flex; align-items: center; gap: var(--spacing-2); margin-top: 2px; }
+    .skill-use-desc { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; text-overflow: ellipsis; }
+    .skill-use-desc-btn { width: 22px; height: 22px; border: none; border-radius: var(--radius-full); background: transparent; color: var(--vscode-descriptionForeground); display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; }
+    .skill-use-desc-btn:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+    .skill-use-desc-pop { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); background: var(--vscode-editor-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-2); padding: var(--spacing-2) var(--spacing-3); font-size: var(--font-size-1); color: var(--vscode-foreground); box-shadow: 0 8px 16px rgba(0,0,0,0.2); max-width: 320px; width: max-content; display: none; z-index: 5; line-height: 1.4; }
+    .skill-use-item.show-desc .skill-use-desc-pop { display: block; }
+    .skill-use-detail { display: flex; flex-direction: column; height: 360px; overflow: hidden; }
+    .skill-use-detail-scroll { display: flex; flex-direction: column; gap: var(--spacing-3); height: 100%; overflow-y: auto; padding-right: 2px; }
+    .skill-use-empty { color: var(--vscode-descriptionForeground); font-size: var(--font-size-2); padding: var(--spacing-4) 0; }
+    .skill-use-detail-header { display: flex; flex-direction: column; gap: var(--spacing-1); }
+    .skill-use-title { font-size: var(--font-size-3); font-weight: 700; color: var(--vscode-foreground); }
+    .skill-use-meta { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .skill-use-chips { display: flex; flex-wrap: wrap; gap: var(--spacing-2); margin-top: var(--spacing-2); }
+    .skill-use-chip { font-size: var(--font-size-1); padding: 2px 8px; border-radius: var(--radius-full); background: rgba(59, 130, 246, 0.12); color: #60a5fa; }
+    .skill-use-warning { padding: var(--spacing-2) var(--spacing-3); border-radius: var(--radius-2); background: rgba(248, 113, 113, 0.12); color: #f87171; font-size: var(--font-size-1); }
+    .skill-use-field label { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-bottom: var(--spacing-2); display: block; }
+    .skill-use-field textarea { width: 100%; min-height: 120px; resize: vertical; padding: var(--spacing-3); border-radius: var(--radius-2); border: 1px solid var(--vscode-input-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); font-size: var(--font-size-2); outline: none; }
+    .skill-use-preview { padding: var(--spacing-3); border-radius: var(--radius-2); border: 1px solid var(--vscode-input-border); background: rgba(15, 23, 42, 0.25); color: var(--vscode-foreground); font-size: var(--font-size-1); white-space: pre-wrap; line-height: 1.5; max-height: 160px; overflow: auto; }
+    @media (max-width: 720px) {
+      .skill-use-layout { grid-template-columns: 1fr; }
+      .skill-use-list { border-right: none; padding-right: 0; border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: var(--spacing-3); }
+    }
     @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
     .modal-header { display: flex; align-items: center; justify-content: space-between; padding: var(--spacing-3) var(--spacing-4); border-bottom: 1px solid var(--vscode-panel-border); }
     .modal-header h3 { font-size: var(--font-size-3); font-weight: 600; margin: 0; }

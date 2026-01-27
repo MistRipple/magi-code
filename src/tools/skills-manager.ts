@@ -7,6 +7,8 @@
 import { logger, LogCategory } from '../logging/unified-logger';
 import { ToolExecutor, ExtendedToolDefinition } from './types';
 import { ToolCall, ToolResult as LLMToolResult } from '../llm/types';
+import * as fs from 'fs/promises';
+import * as path from 'path';
 
 /**
  * 工具定义接口
@@ -19,6 +21,44 @@ export interface ToolDefinition {
     properties: Record<string, any>;
     required?: string[];
   };
+}
+
+/**
+ * 自定义工具执行器配置
+ */
+export interface CustomToolExecutorConfig {
+  type: 'static' | 'template' | 'http';
+  response?: string;
+  template?: string;
+  url?: string;
+  method?: string;
+  headers?: Record<string, string>;
+  bodyTemplate?: string;
+  timeoutMs?: number;
+}
+
+/**
+ * 自定义工具定义
+ */
+export interface CustomToolDefinition extends ToolDefinition {
+  executor?: CustomToolExecutorConfig;
+  repositoryId?: string;
+  repositoryName?: string;
+}
+
+/**
+ * 指令型 Skill（来自 SKILL.md）
+ */
+export interface InstructionSkillDefinition {
+  name: string;
+  description: string;
+  content: string;
+  allowedTools?: string[];
+  disableModelInvocation?: boolean;
+  userInvocable?: boolean;
+  argumentHint?: string;
+  repositoryId?: string;
+  repositoryName?: string;
 }
 
 /**
@@ -69,7 +109,8 @@ export interface SkillsConfig {
     [BuiltInTool.TEXT_EDITOR]: ToolConfig;
     [BuiltInTool.COMPUTER_USE]: ToolConfig;
   };
-  customTools: ToolDefinition[];
+  customTools: CustomToolDefinition[];
+  instructionSkills?: InstructionSkillDefinition[];
 }
 
 /**
@@ -205,8 +246,10 @@ const BUILT_IN_TOOL_DEFINITIONS: Record<BuiltInTool, ToolDefinition> = {
  */
 export class SkillsManager implements ToolExecutor {
   private config: SkillsConfig;
+  private workspaceRoot: string;
+  private undoStack: Map<string, string> = new Map();
 
-  constructor(config?: Partial<SkillsConfig>) {
+  constructor(config?: Partial<SkillsConfig>, options?: { workspaceRoot?: string }) {
     this.config = {
       ...DEFAULT_SKILLS_CONFIG,
       ...config,
@@ -215,10 +258,12 @@ export class SkillsManager implements ToolExecutor {
         ...config?.builtInTools
       }
     };
+    this.workspaceRoot = options?.workspaceRoot || process.cwd();
 
     logger.info('SkillsManager initialized', {
       enabledBuiltInTools: this.getEnabledBuiltInTools().length,
-      customTools: this.config.customTools.length
+      customTools: this.config.customTools.length,
+      workspaceRoot: this.workspaceRoot
     }, LogCategory.TOOLS);
   }
 
@@ -293,8 +338,9 @@ export class SkillsManager implements ToolExecutor {
 
     // 添加自定义工具
     for (const customTool of this.config.customTools) {
+      const definition = this.stripCustomTool(customTool);
       tools.push({
-        ...customTool,
+        ...definition,
         metadata: {
           source: 'skill',
           sourceId: customTool.name,
@@ -339,7 +385,7 @@ export class SkillsManager implements ToolExecutor {
     }
 
     // 添加自定义工具
-    tools.push(...this.config.customTools);
+    tools.push(...this.config.customTools.map(tool => this.stripCustomTool(tool)));
 
     return tools;
   }
@@ -396,10 +442,10 @@ export class SkillsManager implements ToolExecutor {
     // 检查是否已存在
     const existingIndex = this.config.customTools.findIndex(t => t.name === tool.name);
     if (existingIndex >= 0) {
-      this.config.customTools[existingIndex] = tool;
+      this.config.customTools[existingIndex] = tool as CustomToolDefinition;
       logger.info('Custom tool updated', { name: tool.name }, LogCategory.TOOLS);
     } else {
-      this.config.customTools.push(tool);
+      this.config.customTools.push(tool as CustomToolDefinition);
       logger.info('Custom tool added', { name: tool.name }, LogCategory.TOOLS);
     }
   }
@@ -426,7 +472,8 @@ export class SkillsManager implements ToolExecutor {
     }
 
     // 检查自定义工具
-    return this.config.customTools.find(t => t.name === toolName);
+    const customTool = this.config.customTools.find(t => t.name === toolName);
+    return customTool ? this.stripCustomTool(customTool) : undefined;
   }
 
   /**
@@ -447,8 +494,7 @@ export class SkillsManager implements ToolExecutor {
           return await this.executeComputerUse(id, input);
 
         default:
-          // 自定义工具需要外部实现
-          throw new Error(`Custom tool execution not implemented: ${name}`);
+          return await this.executeCustomTool(id, name, input);
       }
     } catch (error: any) {
       logger.error('Client tool execution failed', {
@@ -466,17 +512,346 @@ export class SkillsManager implements ToolExecutor {
   }
 
   /**
+   * 执行自定义工具
+   */
+  private async executeCustomTool(toolUseId: string, name: string, input: any): Promise<SkillToolResult> {
+    const customTool = this.config.customTools.find(tool => tool.name === name);
+    if (!customTool) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Error: custom tool not found: ${name}`,
+        is_error: true
+      };
+    }
+
+    if (!customTool.executor) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Error: custom tool '${name}' has no executor configured`,
+        is_error: true
+      };
+    }
+
+    switch (customTool.executor.type) {
+      case 'static':
+        return {
+          type: 'tool_result',
+          tool_use_id: toolUseId,
+          content: customTool.executor.response ?? ''
+        };
+
+      case 'template': {
+        const template = customTool.executor.template ?? '';
+        const rendered = this.renderTemplate(template, input);
+        return {
+          type: 'tool_result',
+          tool_use_id: toolUseId,
+          content: rendered
+        };
+      }
+
+      case 'http':
+        return await this.executeHttpTool(toolUseId, customTool.executor, input);
+
+      default:
+        return {
+          type: 'tool_result',
+          tool_use_id: toolUseId,
+          content: `Error: unsupported executor type ${(customTool.executor as any).type}`,
+          is_error: true
+        };
+    }
+  }
+
+  private renderTemplate(template: string, input: Record<string, any>): string {
+    return template.replace(/{{\s*([\w.-]+)\s*}}/g, (_match, pathKey) => {
+      const value = this.getValueByPath(input, pathKey);
+      if (value === undefined || value === null) {
+        return '';
+      }
+      if (typeof value === 'string') {
+        return value;
+      }
+      return JSON.stringify(value);
+    });
+  }
+
+  private getValueByPath(source: Record<string, any>, pathKey: string): any {
+    return pathKey.split('.').reduce((acc: any, key: string) => {
+      if (acc && typeof acc === 'object' && key in acc) {
+        return acc[key];
+      }
+      return undefined;
+    }, source);
+  }
+
+  private async executeHttpTool(
+    toolUseId: string,
+    executor: CustomToolExecutorConfig,
+    input: Record<string, any>
+  ): Promise<SkillToolResult> {
+    if (!executor.url) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: 'Error: http executor requires url',
+        is_error: true
+      };
+    }
+
+    const method = (executor.method || 'POST').toUpperCase();
+    const headers = executor.headers ? { ...executor.headers } : {};
+    const timeoutMs = executor.timeoutMs ?? 15000;
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      let url = executor.url;
+      let body: string | undefined;
+
+      if (method === 'GET') {
+        const query = new URLSearchParams();
+        Object.entries(input || {}).forEach(([key, value]) => {
+          if (value === undefined) return;
+          query.append(key, typeof value === 'string' ? value : JSON.stringify(value));
+        });
+        if (query.toString()) {
+          url += (url.includes('?') ? '&' : '?') + query.toString();
+        }
+      } else {
+        if (executor.bodyTemplate) {
+          body = this.renderTemplate(executor.bodyTemplate, input || {});
+        } else {
+          body = JSON.stringify(input || {});
+          if (!headers['Content-Type']) {
+            headers['Content-Type'] = 'application/json';
+          }
+        }
+      }
+
+      const response = await fetch(url, {
+        method,
+        headers,
+        body,
+        signal: controller.signal
+      });
+
+      const contentType = response.headers.get('content-type') || '';
+      let content: string;
+
+      if (contentType.includes('application/json')) {
+        const data = await response.json();
+        content = JSON.stringify(data, null, 2);
+      } else {
+        content = await response.text();
+      }
+
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content,
+        is_error: !response.ok
+      };
+    } catch (error: any) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Error: ${error.message}`,
+        is_error: true
+      };
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
+  }
+
+  private stripCustomTool(customTool: CustomToolDefinition): ToolDefinition {
+    return {
+      name: customTool.name,
+      description: customTool.description,
+      input_schema: customTool.input_schema
+    };
+  }
+
+  /**
    * 执行文本编辑器工具
    */
   private async executeTextEditor(toolUseId: string, input: any): Promise<SkillToolResult> {
-    // TODO: 实现文本编辑器功能
-    // 这需要与 VS Code 的文件系统 API 集成
-    return {
-      type: 'tool_result',
-      tool_use_id: toolUseId,
-      content: 'Text editor tool not yet implemented',
-      is_error: true
-    };
+    const command = input?.command;
+    const targetPath = input?.path;
+
+    if (!command || !targetPath) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: 'Error: command and path are required',
+        is_error: true
+      };
+    }
+
+    const resolved = this.resolveWorkspacePath(targetPath);
+    if (!resolved) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Error: path is outside workspace: ${targetPath}`,
+        is_error: true
+      };
+    }
+
+    try {
+      switch (command) {
+        case 'view': {
+          const content = await fs.readFile(resolved, 'utf-8');
+          return {
+            type: 'tool_result',
+            tool_use_id: toolUseId,
+            content
+          };
+        }
+
+        case 'create': {
+          const fileText = input?.file_text ?? '';
+          await fs.mkdir(path.dirname(resolved), { recursive: true });
+          try {
+            await fs.access(resolved);
+            return {
+              type: 'tool_result',
+              tool_use_id: toolUseId,
+              content: 'Error: file already exists',
+              is_error: true
+            };
+          } catch {
+            await fs.writeFile(resolved, fileText, 'utf-8');
+          }
+          return {
+            type: 'tool_result',
+            tool_use_id: toolUseId,
+            content: 'OK: file created'
+          };
+        }
+
+        case 'str_replace': {
+          const oldStr = input?.old_str;
+          const newStr = input?.new_str ?? '';
+          if (typeof oldStr !== 'string') {
+            return {
+              type: 'tool_result',
+              tool_use_id: toolUseId,
+              content: 'Error: old_str is required',
+              is_error: true
+            };
+          }
+          let content = '';
+          try {
+            content = await fs.readFile(resolved, 'utf-8');
+          } catch (error: any) {
+            return {
+              type: 'tool_result',
+              tool_use_id: toolUseId,
+              content: `Error: ${error.message}`,
+              is_error: true
+            };
+          }
+          const index = content.indexOf(oldStr);
+          if (index === -1) {
+            return {
+              type: 'tool_result',
+              tool_use_id: toolUseId,
+              content: 'Error: old_str not found',
+              is_error: true
+            };
+          }
+          this.undoStack.set(resolved, content);
+          const updated = content.replace(oldStr, newStr);
+          await fs.writeFile(resolved, updated, 'utf-8');
+          return {
+            type: 'tool_result',
+            tool_use_id: toolUseId,
+            content: 'OK: str_replace applied'
+          };
+        }
+
+        case 'insert': {
+          const insertLine = Number(input?.insert_line);
+          const insertText = input?.insert_text ?? '';
+          if (!Number.isFinite(insertLine) || insertLine < 1) {
+            return {
+              type: 'tool_result',
+              tool_use_id: toolUseId,
+              content: 'Error: insert_line must be a positive number',
+              is_error: true
+            };
+          }
+          let content = '';
+          try {
+            content = await fs.readFile(resolved, 'utf-8');
+          } catch (error: any) {
+            if (error?.code !== 'ENOENT') {
+              return {
+                type: 'tool_result',
+                tool_use_id: toolUseId,
+                content: `Error: ${error.message}`,
+                is_error: true
+              };
+            }
+          }
+          const lines = content.split('\n');
+          if (insertLine > lines.length + 1) {
+            return {
+              type: 'tool_result',
+              tool_use_id: toolUseId,
+              content: 'Error: insert_line out of range',
+              is_error: true
+            };
+          }
+          this.undoStack.set(resolved, content);
+          lines.splice(insertLine - 1, 0, insertText);
+          await fs.mkdir(path.dirname(resolved), { recursive: true });
+          await fs.writeFile(resolved, lines.join('\n'), 'utf-8');
+          return {
+            type: 'tool_result',
+            tool_use_id: toolUseId,
+            content: 'OK: text inserted'
+          };
+        }
+
+        case 'undo_edit': {
+          if (!this.undoStack.has(resolved)) {
+            return {
+              type: 'tool_result',
+              tool_use_id: toolUseId,
+              content: 'Error: no undo history for this file',
+              is_error: true
+            };
+          }
+          const previous = this.undoStack.get(resolved) ?? '';
+          await fs.writeFile(resolved, previous, 'utf-8');
+          this.undoStack.delete(resolved);
+          return {
+            type: 'tool_result',
+            tool_use_id: toolUseId,
+            content: 'OK: undo applied'
+          };
+        }
+
+        default:
+          return {
+            type: 'tool_result',
+            tool_use_id: toolUseId,
+            content: `Error: unsupported command ${command}`,
+            is_error: true
+          };
+      }
+    } catch (error: any) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Error: ${error.message}`,
+        is_error: true
+      };
+    }
   }
 
   /**
@@ -491,6 +866,15 @@ export class SkillsManager implements ToolExecutor {
       content: 'Computer use tool not yet implemented',
       is_error: true
     };
+  }
+
+  private resolveWorkspacePath(inputPath: string): string | null {
+    const resolved = path.resolve(this.workspaceRoot, inputPath);
+    const normalizedRoot = path.resolve(this.workspaceRoot) + path.sep;
+    if (!resolved.startsWith(normalizedRoot)) {
+      return null;
+    }
+    return resolved;
   }
 
   /**

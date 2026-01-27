@@ -61,25 +61,33 @@ export function renderCodeBlock(code, lang, filepath) {
   const trimmedCode = code.replace(/^\n+/, '').replace(/\n+$/, '');
   if (!trimmedCode) return '';
 
-  const lines = trimmedCode.split('\n');
+  const isBlankLine = (line) => line.replace(/[\s\uFEFF\u200B\u200C\u200D]/g, '') === '';
+
+  const rawLines = trimmedCode.split('\n');
+  while (rawLines.length > 0 && isBlankLine(rawLines[0])) rawLines.shift();
+  while (rawLines.length > 0 && isBlankLine(rawLines[rawLines.length - 1])) rawLines.pop();
+  if (rawLines.length === 0) return '';
+  const normalizedCode = rawLines.join('\n');
+
+  const lines = normalizedCode.split('\n');
   const lineCount = lines.length;
   const language = lang || 'text';
   const isDiff = language === 'diff' || lines.some(line => /^[+-](?!\+\+|--)\s/.test(line));
 
   // 语法高亮
-  let highlightedCode = trimmedCode;
+  let highlightedCode = normalizedCode;
   if (typeof hljs !== 'undefined' && language !== 'text' && language !== 'diff') {
     try {
       if (hljs.getLanguage(language)) {
-        highlightedCode = hljs.highlight(trimmedCode, { language }).value;
+        highlightedCode = hljs.highlight(normalizedCode, { language }).value;
       } else {
-        highlightedCode = hljs.highlightAuto(trimmedCode).value;
+        highlightedCode = hljs.highlightAuto(normalizedCode).value;
       }
     } catch (e) {
-      highlightedCode = escapeHtml(trimmedCode);
+      highlightedCode = escapeHtml(normalizedCode);
     }
   } else {
-    highlightedCode = escapeHtml(trimmedCode);
+    highlightedCode = escapeHtml(normalizedCode);
   }
 
   // 将高亮后的代码按行分割
@@ -199,9 +207,21 @@ export function renderParsedBlocks(blocks, agent) {
         break;
 
       case 'tool_call':
-        if (block.tool) {
-          html += renderToolUseBlock(block.tool);
-        }
+        html += renderToolUseBlock({
+          name: block.toolName,
+          input: block.input,
+          output: block.output,
+          error: block.error
+        });
+        break;
+
+      case 'plan':
+        html += renderPlanBlock(block);
+        hasMarkdown = true;
+        break;
+
+      case 'file_change':
+        html += renderFileChangeBlock(block);
         break;
 
       default:
@@ -212,6 +232,103 @@ export function renderParsedBlocks(blocks, agent) {
   });
 
   return { html, isMarkdown: hasMarkdown };
+}
+
+function renderPlanBlock(plan) {
+  const content = renderStructuredPlanContent(plan);
+  if (!content) return '';
+  return '<div class="plan-content">' + content + '</div>';
+}
+
+function renderFileChangeBlock(change) {
+  const diff = change.diff && String(change.diff).trim() ? change.diff : '';
+  if (diff) {
+    return renderCodeBlock(diff, 'diff', change.filePath);
+  }
+
+  const labelMap = {
+    create: '新增文件',
+    modify: '修改文件',
+    delete: '删除文件'
+  };
+  const label = labelMap[change.changeType] || '文件变更';
+  const title = change.filePath ? label + ': ' + change.filePath : label;
+  return '<div class="unknown-block">' + escapeHtml(title) + '</div>';
+}
+
+function renderStructuredPlanContent(plan) {
+  let html = '<div class="structured-plan-content">';
+
+  if (plan.goal) {
+    html += '<div class="plan-section">';
+    html += '<div class="plan-section-title">目标</div>';
+    html += '<div class="plan-section-content">' + escapeHtml(plan.goal) + '</div>';
+    html += '</div>';
+  }
+
+  if (plan.analysis) {
+    html += '<div class="plan-section">';
+    html += '<div class="plan-section-title">分析</div>';
+    html += '<div class="plan-section-content">' + escapeHtml(plan.analysis) + '</div>';
+    html += '</div>';
+  }
+
+  if (plan.constraints && Array.isArray(plan.constraints) && plan.constraints.length > 0) {
+    html += '<div class="plan-section">';
+    html += '<div class="plan-section-title">约束条件</div>';
+    html += '<ul class="plan-list">';
+    for (const constraint of plan.constraints) {
+      html += '<li>' + escapeHtml(String(constraint)) + '</li>';
+    }
+    html += '</ul>';
+    html += '</div>';
+  }
+
+  if (plan.acceptanceCriteria && Array.isArray(plan.acceptanceCriteria) && plan.acceptanceCriteria.length > 0) {
+    html += '<div class="plan-section">';
+    html += '<div class="plan-section-title"><svg class="icon-inline" viewBox="0 0 16 16" width="14" height="14"><path fill="currentColor" d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/></svg> 验收标准</div>';
+    html += '<ul class="plan-list">';
+    for (const criteria of plan.acceptanceCriteria) {
+      html += '<li>' + escapeHtml(String(criteria)) + '</li>';
+    }
+    html += '</ul>';
+    html += '</div>';
+  }
+
+  if (plan.riskLevel) {
+    const riskColors = {
+      'low': 'var(--vscode-testing-iconPassed)',
+      'medium': 'var(--vscode-editorWarning-foreground)',
+      'high': 'var(--vscode-errorForeground)'
+    };
+    const riskLabels = {
+      'low': '低',
+      'medium': '中',
+      'high': '高'
+    };
+    const riskColor = riskColors[plan.riskLevel] || 'var(--vscode-foreground)';
+    const riskLabel = riskLabels[plan.riskLevel] || plan.riskLevel;
+    html += '<div class="plan-section">';
+    html += '<div class="plan-section-title">风险等级</div>';
+    html += '<div class="plan-section-content">';
+    html += '<span class="risk-badge" style="background: ' + riskColor + '; color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 0.9em;">' + escapeHtml(riskLabel) + '</span>';
+    html += '</div>';
+    html += '</div>';
+  }
+
+  if (plan.riskFactors && Array.isArray(plan.riskFactors) && plan.riskFactors.length > 0) {
+    html += '<div class="plan-section">';
+    html += '<div class="plan-section-title">风险因素</div>';
+    html += '<ul class="plan-list risk-list">';
+    for (const factor of plan.riskFactors) {
+      html += '<li>' + escapeHtml(String(factor)) + '</li>';
+    }
+    html += '</ul>';
+    html += '</div>';
+  }
+
+  html += '</div>';
+  return html;
 }
 
 // ============================================
@@ -257,6 +374,9 @@ export function renderToolUseBlock(tool) {
   const hasInput = inputContent && String(inputContent).trim();
   const hasOutput = outputContent && String(outputContent).trim();
   const hasError = errorContent && String(errorContent).trim();
+  if (!hasInput && !hasOutput && !hasError) {
+    return '';
+  }
 
   // 状态判断
   let statusClass = 'running';
@@ -347,4 +467,3 @@ function getToolIconSvg(toolName) {
   // 默认工具图标
   return '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1 0 0 1l2.2 3.081a1 1 0 0 0 .815.419h.07a1 1 0 0 1 .708.293l2.675 2.675-2.617 2.654A3.003 3.003 0 0 0 0 13a3 3 0 1 0 5.878-.851l2.654-2.617.968.968-.305.914a1 1 0 0 0 .242 1.023l3.27 3.27a.997.997 0 0 0 1.414 0l1.586-1.586a.997.997 0 0 0 0-1.414l-3.27-3.27a1 1 0 0 0-1.023-.242L10.5 9.5l-.96-.96 2.68-2.643A3.005 3.005 0 0 0 16 3c0-.269-.035-.53-.102-.777l-2.14 2.141L12 4l-.364-1.757L13.777.102a3 3 0 0 0-3.675 3.68L7.462 6.46 4.793 3.793a1 1 0 0 1-.293-.707v-.071a1 1 0 0 0-.419-.814L1 0Zm9.646 10.646a.5.5 0 0 1 .708 0l2.914 2.915a.5.5 0 0 1-.707.707l-2.915-2.914a.5.5 0 0 1 0-.708ZM3 11l.471.242.529.026.287.445.445.287.026.529L5 13l-.242.471-.026.529-.445.287-.287.445-.529.026L3 15l-.471-.242L2 14.732l-.287-.445L1.268 14l-.026-.529L1 13l.242-.471.026-.529.445-.287.287-.445.529-.026L3 11Z"/></svg>';
 }
-

@@ -192,6 +192,7 @@ export class MissionDrivenEngine extends EventEmitter {
     );
     this.missionOrchestrator.setSnapshotManager(snapshotManager);
     this.missionOrchestrator.setContextManager(this.contextManager);
+    this.missionOrchestrator.setExecutionStats(this.executionStats);
 
     // 初始化 Mission 执行器
     this.missionExecutor = new MissionExecutor(
@@ -843,7 +844,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
       // 同时记录到 ExecutionStats（编排器使用 claude）
       this.executionStats.recordExecution({
-        worker: 'claude',
+        worker: 'orchestrator',
         taskId: 'orchestrator',
         subTaskId: phase,
         success: true,

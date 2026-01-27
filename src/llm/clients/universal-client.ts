@@ -427,6 +427,7 @@ export class UniversalLLMClient extends BaseLLMClient {
       temperature: params.temperature,
       tools: params.tools as any,
       stream: true,
+      stream_options: { include_usage: true },
     });
 
     let fullContent = '';
@@ -459,6 +460,11 @@ export class UniversalLLMClient extends BaseLLMClient {
 
       if (chunk.choices[0]?.finish_reason) {
         stopReason = this.mapOpenAIStopReason(chunk.choices[0].finish_reason);
+      }
+
+      if (chunk.usage) {
+        usage.inputTokens = chunk.usage.prompt_tokens || 0;
+        usage.outputTokens = chunk.usage.completion_tokens || 0;
       }
     }
 

@@ -94,7 +94,7 @@ function formatTokenCount(count) {
   return count.toString();
 }
 
-export function updateExecutionStats(stats, orchestratorStats) {
+export function updateExecutionStats(stats, orchestratorStats, modelCatalog) {
   if (!stats || !Array.isArray(stats)) return;
 
   // 更新编排者统计
@@ -111,60 +111,60 @@ export function updateExecutionStats(stats, orchestratorStats) {
     if (outputTokensEl) outputTokensEl.textContent = formatTokenCount(orchestratorStats.totalOutputTokens || 0);
   }
 
-  // 更新各模型统计
+  renderModelStatsGrid(stats, modelCatalog);
+}
+
+function renderModelStatsGrid(stats, modelCatalog) {
+  const grid = document.getElementById('model-stats-grid');
+  if (!grid) return;
+
+  const statsMap = new Map();
   stats.forEach(stat => {
-    const card = document.querySelector(`.model-stat-card[data-worker="${stat.worker}"]`);
-    if (!card) return;
-
-    // 更新健康状态
-    card.classList.toggle('healthy', stat.isHealthy);
-    card.classList.toggle('unhealthy', !stat.isHealthy);
-
-    const healthDot = card.querySelector('.health-dot');
-    if (healthDot) {
-      healthDot.classList.toggle('healthy', stat.isHealthy);
-      healthDot.classList.toggle('unhealthy', !stat.isHealthy);
-    }
-
-    // 更新成功率
-    const rateEl = card.querySelector('.model-stat-rate');
-    if (rateEl) {
-      const rate = stat.totalExecutions > 0 ? Math.round(stat.successRate * 100) : '--';
-      rateEl.textContent = rate === '--' ? '--' : rate + '%';
-      rateEl.className = 'model-stat-rate';
-      if (rate !== '--') {
-        if (rate >= 80) rateEl.classList.add('good');
-        else if (rate >= 60) rateEl.classList.add('warning');
-        else rateEl.classList.add('bad');
-      }
-    }
-
-    // 更新详情
-    const detailEl = card.querySelector('.model-stat-detail');
-    if (detailEl) {
-      const avgTime = stat.avgDuration > 0 ? Math.round(stat.avgDuration / 1000) + 's' : '-';
-      detailEl.textContent = `${stat.totalExecutions} 次执行 · 平均 ${avgTime}`;
-    }
-
-    // 更新 Token 统计
-    const tokensEl = card.querySelector('.model-stat-tokens');
-    if (tokensEl) {
-      const inputTokens = formatTokenCount(stat.totalInputTokens || 0);
-      const outputTokens = formatTokenCount(stat.totalOutputTokens || 0);
-      tokensEl.textContent = `${inputTokens} / ${outputTokens}`;
-    }
-
-    // 更新进度条
-    const barFill = card.querySelector('.model-stat-bar-fill');
-    if (barFill) {
-      const rate = stat.totalExecutions > 0 ? stat.successRate * 100 : 0;
-      barFill.style.width = rate + '%';
-      barFill.className = 'model-stat-bar-fill';
-      if (rate >= 80) barFill.classList.add('good');
-      else if (rate >= 60) barFill.classList.add('warning');
-      else barFill.classList.add('bad');
-    }
+    statsMap.set(stat.worker, stat);
   });
+
+  const entries = Array.isArray(modelCatalog) && modelCatalog.length > 0
+    ? modelCatalog
+    : stats.map(stat => ({ id: stat.worker, label: String(stat.worker) }));
+
+  const html = entries.map(entry => {
+    const stat = statsMap.get(entry.id) || {
+      totalExecutions: 0,
+      successCount: 0,
+      failureCount: 0,
+      successRate: 0,
+      avgDuration: 0,
+      isHealthy: true,
+      totalInputTokens: 0,
+      totalOutputTokens: 0
+    };
+
+    const rateValue = stat.totalExecutions > 0 ? Math.round(stat.successRate * 100) : null;
+    const rateText = rateValue === null ? '--' : `${rateValue}%`;
+    const rateClass = rateValue === null
+      ? ''
+      : rateValue >= 80 ? ' good' : rateValue >= 60 ? ' warning' : ' bad';
+    const avgTime = stat.avgDuration > 0 ? Math.round(stat.avgDuration / 1000) + 's' : '-';
+    const inputTokens = formatTokenCount(stat.totalInputTokens || 0);
+    const outputTokens = formatTokenCount(stat.totalOutputTokens || 0);
+    const barRate = stat.totalExecutions > 0 ? stat.successRate * 100 : 0;
+    const barClass = barRate >= 80 ? ' good' : barRate >= 60 ? ' warning' : ' bad';
+    const healthClass = stat.isHealthy ? ' healthy' : ' unhealthy';
+    const disabledClass = entry.enabled === false ? ' disabled' : '';
+    const title = entry.model ? ` title="${entry.model}"` : '';
+
+    return `
+      <div class="model-stat-card${healthClass}${disabledClass}" data-worker="${entry.id}">
+        <div class="model-stat-name"${title}><span class="health-dot${healthClass}"></span>${entry.label}</div>
+        <div class="model-stat-rate${rateClass}">成功率 ${rateText}</div>
+        <div class="model-stat-detail">${stat.totalExecutions}次 · 平均${avgTime}</div>
+        <div class="model-stat-tokens">In ${inputTokens} · Out ${outputTokens}</div>
+        <div class="model-stat-bar"><div class="model-stat-bar-fill${barClass}" style="width: ${barRate}%"></div></div>
+      </div>
+    `;
+  }).join('');
+
+  grid.innerHTML = html;
 }
 
 // ============================================

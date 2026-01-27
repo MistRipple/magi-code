@@ -12,7 +12,7 @@ import { LLMConfigLoader } from './config';
 import { createLLMClient } from './clients/client-factory';
 import { createNormalizer } from '../normalizer';
 import { ToolManager } from '../tools/tool-manager';
-import { SkillsManager } from '../tools/skills-manager';
+import { SkillsManager, InstructionSkillDefinition } from '../tools/skills-manager';
 import { MCPToolExecutor } from '../tools/mcp-executor';
 import { logger, LogCategory } from '../logging';
 import { IAdapterFactory, AdapterOutputScope, AdapterResponse } from '../adapters/adapter-factory-interface';
@@ -62,7 +62,9 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       const skillsConfig = LLMConfigLoader.loadSkillsConfig();
 
       // 创建 SkillsManager
-      this.skillsManager = new SkillsManager(skillsConfig);
+      this.skillsManager = new SkillsManager(skillsConfig, {
+        workspaceRoot: this.workspaceRoot,
+      });
 
       // 注册到 ToolManager
       this.toolManager.registerSkillExecutor('claude-skills', this.skillsManager);
@@ -185,6 +187,11 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
 
     const adapter = new WorkerLLMAdapter(adapterConfig);
 
+    const skillPrompt = this.buildSkillPromptAppendix();
+    if (skillPrompt) {
+      adapter.setSystemPrompt(`${adapter.getSystemPrompt()}\n\n${skillPrompt}`);
+    }
+
     // 转发适配器事件
     this.setupAdapterEvents(adapter, workerSlot);
 
@@ -196,6 +203,74 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     }, LogCategory.LLM);
 
     return adapter;
+  }
+
+  private buildSkillPromptAppendix(): string {
+    const skillsConfig = LLMConfigLoader.loadSkillsConfig();
+    const instructionSkills: InstructionSkillDefinition[] = Array.isArray(skillsConfig?.instructionSkills)
+      ? skillsConfig.instructionSkills
+      : [];
+
+    if (instructionSkills.length === 0) {
+      return '';
+    }
+
+    const autoSkills = instructionSkills.filter(skill => !skill.disableModelInvocation);
+    const manualSkills = instructionSkills.filter(skill => skill.disableModelInvocation);
+    const maxChars = 6000;
+    let usedChars = 0;
+    const blocks: string[] = [];
+
+    const header = [
+      '## 可用 Skills（兼容 Claude Code）',
+      '- 你可以在合适的任务中主动使用 Skill。',
+      '- 当用户输入 /skill-name 时，必须应用对应 Skill 指令。',
+    ].join('\n');
+
+    blocks.push(header);
+
+    if (instructionSkills.length > 0) {
+      blocks.push('\n### Skill 列表');
+      instructionSkills.forEach((skill) => {
+        const flag = skill.disableModelInvocation ? '（仅手动 /skill）' : '';
+        blocks.push(`- ${skill.name}${flag}: ${skill.description || ''}`);
+      });
+    }
+
+    blocks.push('\n### Skill 指令（可自动调用）');
+    for (const skill of autoSkills) {
+      const contentBlock = this.formatSkillInstruction(skill);
+      if (usedChars + contentBlock.length > maxChars) {
+        blocks.push(`- ${skill.name}: 指令内容过长，需在 /${skill.name} 调用时加载`);
+        continue;
+      }
+      blocks.push(contentBlock);
+      usedChars += contentBlock.length;
+    }
+
+    if (manualSkills.length > 0) {
+      blocks.push('\n### 仅在 /skill 调用时启用的 Skills');
+      manualSkills.forEach((skill) => {
+        blocks.push(`- ${skill.name}: ${skill.description || ''}`);
+      });
+    }
+
+    return blocks.join('\n');
+  }
+
+  private formatSkillInstruction(skill: InstructionSkillDefinition): string {
+    const toolHint = Array.isArray(skill.allowedTools) && skill.allowedTools.length > 0
+      ? `允许使用的工具: ${skill.allowedTools.join(', ')}`
+      : '';
+    const argHint = skill.argumentHint ? `参数提示: ${skill.argumentHint}` : '';
+    const hints = [toolHint, argHint].filter(Boolean).join(' | ');
+
+    return [
+      `\n[Skill: ${skill.name}]`,
+      skill.description ? `描述: ${skill.description}` : '',
+      hints ? `提示: ${hints}` : '',
+      skill.content ? `指令:\n${skill.content}` : '',
+    ].filter(Boolean).join('\n');
   }
 
   /**
@@ -305,15 +380,25 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     }
 
     try {
+      const beforeTotals = 'getTotalTokenUsage' in adapter && typeof (adapter as any).getTotalTokenUsage === 'function'
+        ? (adapter as any).getTotalTokenUsage()
+        : { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
       const content = await adapter.sendMessage(message, images);
+      const afterTotals = 'getTotalTokenUsage' in adapter && typeof (adapter as any).getTotalTokenUsage === 'function'
+        ? (adapter as any).getTotalTokenUsage()
+        : { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+
+      const tokenUsage = {
+        inputTokens: Math.max(0, (afterTotals.inputTokens || 0) - (beforeTotals.inputTokens || 0)),
+        outputTokens: Math.max(0, (afterTotals.outputTokens || 0) - (beforeTotals.outputTokens || 0)),
+        cacheReadTokens: (afterTotals.cacheReadTokens || 0) - (beforeTotals.cacheReadTokens || 0) || undefined,
+        cacheWriteTokens: (afterTotals.cacheWriteTokens || 0) - (beforeTotals.cacheWriteTokens || 0) || undefined,
+      };
 
       return {
         content,
         done: true,
-        tokenUsage: {
-          inputTokens: 0, // TODO: Get from adapter
-          outputTokens: 0, // TODO: Get from adapter
-        },
+        tokenUsage,
       };
     } catch (error: any) {
       return {

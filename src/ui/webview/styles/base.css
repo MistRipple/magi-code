@@ -8,12 +8,16 @@
       --transition-fast: 0.1s ease; --transition-normal: 0.15s ease;
 
       /* 统一颜色系统 - 角色颜色 (按设计规范) */
-      --color-orchestrator: #d97706;
-      --color-orchestrator-bg: rgba(217, 119, 6, 0.1);
+      /* Orchestrator: 紫色 - 代表协调/指挥 */
+      --color-orchestrator: #8b5cf6;
+      --color-orchestrator-bg: rgba(139, 92, 246, 0.1);
+      /* Claude: 橙色 - Anthropic 品牌色 */
       --color-claude: #d97706;
       --color-claude-bg: rgba(217, 119, 6, 0.1);
+      /* Codex: 绿色 - OpenAI 品牌色 */
       --color-codex: #10a37f;
       --color-codex-bg: rgba(16, 163, 127, 0.1);
+      /* Gemini: 蓝色 - Google 品牌色 */
       --color-gemini: #4285f4;
       --color-gemini-bg: rgba(66, 133, 244, 0.1);
 

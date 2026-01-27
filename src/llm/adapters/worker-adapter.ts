@@ -50,10 +50,6 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   private guidanceInjector: GuidanceInjector;
   private historyConfig: Required<HistoryManagementConfig>;
 
-  // Token 使用统计
-  private lastTokenUsage: { inputTokens: number; outputTokens: number } = { inputTokens: 0, outputTokens: 0 };
-  private totalTokenUsage: { inputTokens: number; outputTokens: number } = { inputTokens: 0, outputTokens: 0 };
-
   constructor(adapterConfig: WorkerAdapterConfig) {
     super(
       adapterConfig.client,
@@ -140,6 +136,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           this.emit('toolCall', chunk.toolCall.name || '', chunk.toolCall.arguments || {});
         }
       });
+      this.recordTokenUsage(response.usage);
 
       // 处理工具调用
       if (response.toolCalls && response.toolCalls.length > 0) {
@@ -235,6 +232,10 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   setSystemPrompt(prompt: string): void {
     this.systemPrompt = prompt;
     logger.debug(`${this.agent} system prompt updated`, undefined, LogCategory.LLM);
+  }
+
+  getSystemPrompt(): string {
+    return this.systemPrompt;
   }
 
   /**

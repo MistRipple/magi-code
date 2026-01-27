@@ -516,6 +516,7 @@ export class LLMConfigLoader {
     const config = this.loadSkillsConfig() || {
       builtInTools: {},
       customTools: [],
+      instructionSkills: [],
       repositories: []
     };
     config.repositories = repositories;
