@@ -2,11 +2,11 @@
     .settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 200; backdrop-filter: blur(2px); }
     .settings-overlay.visible { display: flex; animation: fadeIn 0.2s ease; }
     .settings-panel { width: 560px; max-width: 95vw; max-height: 88vh; background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); overflow: hidden; display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
-    .settings-header { display: flex; align-items: center; gap: var(--spacing-3); padding: var(--spacing-4); border-bottom: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); }
+    .settings-header { display: flex; align-items: center; gap: var(--spacing-3); padding: var(--spacing-4); border-bottom: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); justify-content: space-between; }
     .settings-title { font-size: 14px; font-weight: 600; color: var(--vscode-foreground); flex: 0 0 auto; }
     .logout-section { display: none; flex-direction: row; align-items: center; gap: var(--spacing-2); flex: 1 1 auto; justify-content: flex-end; }
     .logout-section.visible { display: flex; }
-    .settings-header .icon-btn-sm { flex: 0 0 auto; margin-left: auto; }
+    .settings-header .icon-btn-sm { flex: 0 0 auto; }
     .user-info-text { font-size: var(--font-size-2); color: var(--vscode-descriptionForeground); }
     .logout-btn { padding: 4px var(--spacing-2); font-size: var(--font-size-1); height: 24px; }
     /* 设置面板 Tab 栏 */
@@ -244,7 +244,10 @@
     .prompt-enhance-eye-btn { display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; background: transparent; border: 1px solid var(--vscode-input-border); border-radius: var(--radius-1); cursor: pointer; color: var(--vscode-descriptionForeground); transition: var(--transition-fast); }
     .prompt-enhance-eye-btn:hover { background: var(--vscode-list-hoverBackground); color: var(--vscode-foreground); }
     .prompt-enhance-eye-btn svg { width: 14px; height: 14px; fill: currentColor; }
-    .prompt-enhance-test-btn { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; margin-top: var(--spacing-1); padding: var(--spacing-2); background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: 1px solid var(--vscode-button-border, var(--vscode-contrastBorder, rgba(255,255,255,0.1))); border-radius: var(--radius-2); cursor: pointer; font-size: var(--font-size-2); transition: background var(--transition-fast), border-color var(--transition-fast); }
+    .prompt-enhance-actions { display: flex; align-items: center; justify-content: flex-end; gap: var(--spacing-2); margin-top: var(--spacing-1); }
+    .prompt-enhance-test-btn { display: flex; align-items: center; justify-content: center; gap: 6px; padding: var(--spacing-2) var(--spacing-3); background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: 1px solid var(--vscode-button-border, var(--vscode-contrastBorder, rgba(255,255,255,0.1))); border-radius: var(--radius-2); cursor: pointer; font-size: var(--font-size-2); transition: background var(--transition-fast), border-color var(--transition-fast); }
+    .prompt-enhance-save-btn { display: inline-flex; align-items: center; justify-content: center; padding: var(--spacing-2) var(--spacing-3); background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; border-radius: var(--radius-2); cursor: pointer; font-size: var(--font-size-2); transition: background var(--transition-fast); }
+    .prompt-enhance-save-btn:hover { background: var(--vscode-button-hoverBackground); }
     .prompt-enhance-test-btn:hover { background: var(--vscode-button-secondaryHoverBackground); border-color: var(--vscode-focusBorder); }
     .prompt-enhance-test-btn:disabled { opacity: 0.6; cursor: not-allowed; }
     .prompt-enhance-test-btn svg { width: 14px; height: 14px; fill: currentColor; }
@@ -254,36 +257,6 @@
     .prompt-enhance-status.error { background: rgba(241, 76, 76, 0.15); color: #f14c4c; }
     .settings-btn.loading { opacity: 0.7; cursor: wait; pointer-events: none; }
     .settings-btn.loading svg { animation: spin 1s linear infinite; }
-
-    /* 模型统计面板样式 */
-    .orchestrator-stats-card { background: var(--vscode-editor-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-2); padding: var(--spacing-4); margin-bottom: var(--spacing-3); }
-    .orchestrator-stats-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: var(--spacing-3); }
-    .orchestrator-stat-item { text-align: center; padding: var(--spacing-2); background: var(--vscode-input-background); border-radius: var(--radius-1); }
-    .orchestrator-stat-label { display: block; font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-bottom: 6px; font-weight: 500; }
-    .orchestrator-stat-value { display: block; font-size: 16px; font-weight: 700; color: var(--vscode-foreground); }
-    .orchestrator-stat-value.success { color: #3dd68c; }
-    .orchestrator-stat-value.failed { color: #f14c4c; }
-    .orchestrator-stat-value.tokens { color: var(--vscode-textLink-foreground); }
-    .model-stats-grid { display: flex; flex-wrap: nowrap; gap: var(--spacing-2); overflow: hidden; }
-    .model-stat-card { background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); padding: var(--spacing-2); text-align: center; transition: all var(--transition-fast); flex: 1 1 0; min-width: 0; }
-.model-stat-card:hover { border-color: var(--vscode-focusBorder); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
-    .model-stat-card.healthy { border-color: rgba(61, 214, 140, 0.5); }
-    .model-stat-card.unhealthy { border-color: rgba(241, 76, 76, 0.5); }
-    .model-stat-name { font-size: var(--font-size-1); font-weight: 600; margin-bottom: var(--spacing-1); display: flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .model-stat-name .health-dot { width: 10px; height: 10px; border-radius: var(--radius-full); }
-    .model-stat-name .health-dot.healthy { background: #3dd68c; box-shadow: 0 0 8px rgba(61, 214, 140, 0.5); }
-    .model-stat-name .health-dot.unhealthy { background: #f14c4c; box-shadow: 0 0 8px rgba(241, 76, 76, 0.5); }
-    .model-stat-rate { font-size: 14px; font-weight: 700; color: var(--vscode-foreground); margin: 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .model-stat-tokens { font-size: var(--font-size-0); color: var(--vscode-textLink-foreground); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .model-stat-rate.good { color: #3dd68c; }
-    .model-stat-rate.warning { color: #cca700; }
-    .model-stat-rate.bad { color: #f14c4c; }
-    .model-stat-detail { font-size: var(--font-size-0); color: var(--vscode-descriptionForeground); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .model-stat-bar { height: 5px; background: var(--vscode-input-border); border-radius: var(--radius-full); margin-top: var(--spacing-2); overflow: hidden; }
-    .model-stat-bar-fill { height: 100%; border-radius: var(--radius-full); transition: width 0.4s ease; }
-    .model-stat-bar-fill.good { background: linear-gradient(90deg, #3dd68c, #22c55e); }
-    .model-stat-bar-fill.warning { background: linear-gradient(90deg, #cca700, #f59e0b); }
-    .model-stat-bar-fill.bad { background: linear-gradient(90deg, #f14c4c, #dc2626); }
 
     /* LLM 配置表单样式 */
     .llm-config-form {
@@ -295,6 +268,7 @@
       border: 1px solid var(--vscode-panel-border);
       border-radius: var(--radius-2);
     }
+    .llm-config-form.compact { padding: var(--spacing-3); }
     .llm-config-field {
       display: flex;
       flex-direction: column;
@@ -406,6 +380,129 @@
       font-size: var(--font-size-2);
       font-weight: 500;
       color: var(--vscode-foreground);
+    }
+    .llm-config-field-row.inline-toggle-row {
+      grid-template-columns: minmax(0, 1fr) 160px 120px;
+      align-items: end;
+    }
+    .llm-config-field.provider-compact .llm-config-select {
+      width: 100%;
+      min-width: 0;
+    }
+    .llm-config-field.inline-toggle {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .llm-config-field.inline-toggle .llm-config-toggle-label {
+      margin-top: auto;
+    }
+    .llm-config-toggle-label.compact {
+      padding: 6px 8px;
+      gap: 8px;
+    }
+    .llm-config-toggle-label.compact span {
+      font-size: var(--font-size-1);
+      font-weight: 600;
+    }
+
+    /* 模型 Tab 布局优化 */
+    .model-config-grid {
+      display: grid;
+      grid-template-columns: 1.1fr 1.4fr;
+      gap: var(--spacing-4);
+      align-items: start;
+    }
+    .model-config-stack {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-4);
+    }
+    .model-config-tabs {
+      display: flex;
+      gap: var(--spacing-2);
+      background: var(--vscode-input-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: var(--radius-2);
+      padding: 4px;
+    }
+    .model-config-tab {
+      flex: 1;
+      border: none;
+      background: transparent;
+      color: var(--vscode-descriptionForeground);
+      padding: 8px 10px;
+      border-radius: var(--radius-2);
+      font-size: var(--font-size-2);
+      font-weight: 600;
+      cursor: pointer;
+      transition: background var(--transition-fast), color var(--transition-fast);
+    }
+    .model-config-tab:hover {
+      background: var(--vscode-list-hoverBackground);
+      color: var(--vscode-foreground);
+    }
+    .model-config-tab.active {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+    }
+    .model-config-panel {
+      display: none;
+    }
+    .model-config-panel.active {
+      display: block;
+    }
+    .model-config-card {
+      background: var(--vscode-sideBar-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: var(--radius-2);
+      padding: var(--spacing-3);
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-3);
+      box-shadow: 0 8px 18px rgba(0,0,0,0.12);
+    }
+    .model-config-header {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .model-config-title {
+      font-size: var(--font-size-3);
+      font-weight: 700;
+      color: var(--vscode-foreground);
+    }
+    .model-config-desc {
+      font-size: var(--font-size-1);
+      color: var(--vscode-descriptionForeground);
+    }
+    .model-config-card .llm-config-form {
+      background: transparent;
+      border: none;
+      padding: 0;
+    }
+    .worker-model-tabs {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: var(--radius-2);
+      padding: 4px;
+    }
+    .worker-model-tab {
+      border-radius: var(--radius-2);
+      padding: 8px 12px;
+      font-weight: 600;
+    }
+    .llm-config-actions {
+      justify-content: flex-end;
+    }
+    .llm-config-actions .llm-config-test-btn {
+      flex: 0 0 auto;
+    }
+    .llm-config-actions .llm-config-save-btn {
+      flex: 0 0 auto;
+    }
+    @media (max-width: 900px) {
+      .model-config-grid { grid-template-columns: 1fr; }
     }
 
     /* 内置工具列表样式 */

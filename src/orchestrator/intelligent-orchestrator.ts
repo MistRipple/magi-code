@@ -22,6 +22,7 @@ import { SessionManagerTaskRepository } from '../task/session-manager-task-repos
 import { UnifiedSessionManager } from '../session';
 import { SnapshotManager } from '../snapshot-manager';
 import { globalEventBus } from '../events';
+import { LLMConfigLoader } from '../llm/config';
 import {
   MissionDrivenEngine,
   MissionConfirmationCallback,
@@ -680,6 +681,18 @@ export class IntelligentOrchestrator {
     }
     const context = await this.missionDrivenEngine.prepareContext(contextSessionId, userPrompt);
 
+    const toolInventory = await this.tryBuildToolInventoryResponse(userPrompt);
+    if (toolInventory) {
+      if (taskId) {
+        if (task) {
+          await this.updateTaskStatus(taskId, 'completed', sessionId);
+        }
+        globalEventBus.emitEvent('task:completed', { taskId, data: { isRunning: false } });
+      }
+      await this.missionDrivenEngine.recordAssistantMessage(toolInventory);
+      return toolInventory;
+    }
+
     // 获取项目知识库上下文
     const projectContext = this.getProjectContext(500);
     const relevantADRs = this.getRelevantADRs(userPrompt);
@@ -743,6 +756,93 @@ export class IntelligentOrchestrator {
     const content = response.content || '';
     await this.missionDrivenEngine.recordAssistantMessage(content);
     return content;
+  }
+
+  private isToolInventoryRequest(prompt: string): boolean {
+    const trimmed = prompt.trim();
+    if (!trimmed) return false;
+    const lower = trimmed.toLowerCase();
+    const hasToolKeyword = /mcp|skill|技能|工具|能力/.test(lower) || /mcp|skill|技能|工具|能力/.test(trimmed);
+    const hasListKeyword = /(有哪些|列表|清单|汇总|有什么|能看到|能否看到|支持|能用|能不能|能否)/.test(trimmed);
+    return hasToolKeyword && hasListKeyword;
+  }
+
+  private async tryBuildToolInventoryResponse(prompt: string): Promise<string | null> {
+    if (!this.isToolInventoryRequest(prompt)) return null;
+
+    const toolManager = this.adapterFactory.getToolManager?.();
+    if (!toolManager) {
+      return '暂时无法读取工具清单（ToolManager 未初始化）。';
+    }
+
+    const tools = await toolManager.getTools();
+    const mcpTools = tools.filter(t => t.metadata?.source === 'mcp');
+    const skillTools = tools.filter(t => t.metadata?.source === 'skill');
+    const builtinTools = tools.filter(t => t.metadata?.source === 'builtin');
+
+    const mcpByServer = new Map<string, typeof mcpTools>();
+    for (const tool of mcpTools) {
+      const serverId = tool.metadata?.sourceId || 'unknown';
+      if (!mcpByServer.has(serverId)) {
+        mcpByServer.set(serverId, []);
+      }
+      mcpByServer.get(serverId)!.push(tool);
+    }
+
+    const skillsConfig = LLMConfigLoader.loadSkillsConfig() || {};
+    const instructionSkills: Array<{ name: string; description?: string; disableModelInvocation?: boolean }> =
+      Array.isArray(skillsConfig.instructionSkills) ? skillsConfig.instructionSkills : [];
+
+    const lines: string[] = [];
+    lines.push('🔎 **当前可用 MCP 工具与 Skill 清单**');
+    lines.push('');
+
+    lines.push('## MCP 工具');
+    if (mcpTools.length === 0) {
+      lines.push('- 当前没有已连接的 MCP 工具。');
+    } else {
+      for (const [serverId, serverTools] of mcpByServer.entries()) {
+        lines.push(`### ${serverId} (${serverTools.length} 个)`);
+        serverTools.forEach((tool, idx) => {
+          const desc = tool.description ? ` - ${tool.description}` : '';
+          lines.push(`${idx + 1}. \`${tool.name}\`${desc}`);
+        });
+        lines.push('');
+      }
+    }
+
+    lines.push('## Skills（工具）');
+    if (skillTools.length === 0) {
+      lines.push('- 当前没有启用的 Skill 工具。');
+    } else {
+      skillTools.forEach((tool, idx) => {
+        const desc = tool.description ? ` - ${tool.description}` : '';
+        lines.push(`${idx + 1}. \`${tool.name}\`${desc}`);
+      });
+    }
+    lines.push('');
+
+    lines.push('## Skills（指令）');
+    if (instructionSkills.length === 0) {
+      lines.push('- 当前没有配置指令类 Skills。');
+    } else {
+      instructionSkills.forEach((skill, idx) => {
+        const flag = skill.disableModelInvocation ? '（仅 /skill 调用）' : '';
+        lines.push(`${idx + 1}. \`${skill.name}\`${flag} - ${skill.description || ''}`);
+      });
+    }
+    lines.push('');
+
+    if (builtinTools.length > 0) {
+      lines.push('## 内置工具');
+      builtinTools.forEach((tool, idx) => {
+        const desc = tool.description ? ` - ${tool.description}` : '';
+        lines.push(`${idx + 1}. \`${tool.name}\`${desc}`);
+      });
+      lines.push('');
+    }
+
+    return lines.join('\n');
   }
 
   private truncateSnapshot(context: string, maxChars: number = 6000): string {

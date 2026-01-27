@@ -466,7 +466,7 @@ export type WebviewToExtensionMessage =
   | { type: 'clearAllTasks' }
 
   | { type: 'getPromptEnhanceConfig' }
-  | { type: 'updatePromptEnhance'; config: { baseUrl: string; apiKey: string } }
+  | { type: 'updatePromptEnhance'; config: { baseUrl: string; apiKey: string }; source?: 'auto' | 'manual' }
   | { type: 'testPromptEnhance'; baseUrl: string; apiKey: string }
   | { type: 'enhancePrompt'; prompt: string }
   // 新增：需求澄清回答
@@ -567,17 +567,18 @@ export type ExtensionToWebviewMessage =
   | { type: 'workerTaskCard'; worker: WorkerSlot; taskId: string; subTaskId: string; description: string; targetFiles?: string[]; reason?: string; status: string; dispatchId?: string; sessionId?: string | null }
 
   | { type: 'promptEnhanceResult'; success: boolean; message: string }
+  | { type: 'promptEnhanceSaved'; success: boolean; error?: string }
 
   | { type: 'promptEnhanced'; enhancedPrompt: string; error: string }
   // 新增：LLM 配置响应
   | { type: 'allWorkerConfigsLoaded'; configs: any }
-  | { type: 'workerConfigSaved'; worker: WorkerSlot }
+  | { type: 'workerConfigSaved'; worker: WorkerSlot; success?: boolean; error?: string }
   | { type: 'workerConnectionTestResult'; worker: WorkerSlot; success: boolean; error?: string }
   | { type: 'orchestratorConfigLoaded'; config: any }
-  | { type: 'orchestratorConfigSaved' }
+  | { type: 'orchestratorConfigSaved'; success?: boolean; error?: string }
   | { type: 'orchestratorConnectionTestResult'; success: boolean; error?: string }
   | { type: 'compressorConfigLoaded'; config: any }
-  | { type: 'compressorConfigSaved' }
+  | { type: 'compressorConfigSaved'; success?: boolean; error?: string }
   | { type: 'compressorConnectionTestResult'; success: boolean; error?: string }
   // 新增：MCP 配置响应
   | { type: 'mcpServersLoaded'; servers: any[] }
@@ -592,6 +593,7 @@ export type ExtensionToWebviewMessage =
   // 新增：Skills 配置响应
   | { type: 'skillsConfigLoaded'; config: any }
   | { type: 'skillsConfigSaved' }
+  | { type: 'profileConfigSaved'; success: boolean; error?: string }
   | { type: 'builtInToolToggled'; tool: string; enabled: boolean }
   | { type: 'customToolAdded'; tool: any }
   | { type: 'customToolRemoved'; toolName: string }

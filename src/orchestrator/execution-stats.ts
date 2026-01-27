@@ -327,9 +327,16 @@ export class ExecutionStats {
     if (!this.context) return;
 
     try {
-      const data = this.context.globalState.get<ExecutionRecord[]>(this.config.persistKey);
-      if (data && Array.isArray(data)) {
-        this.records = data;
+      const raw = this.context.globalState.get<any>(this.config.persistKey);
+      if (Array.isArray(raw)) {
+        // Legacy format: ExecutionRecord[]
+        this.records = raw;
+        this.saveToStorage();
+        logger.info('编排器.执行_统计.迁移.完成', { count: this.records.length }, LogCategory.ORCHESTRATOR);
+        return;
+      }
+      if (raw && typeof raw === 'object' && Array.isArray(raw.records)) {
+        this.records = raw.records;
         logger.info('编排器.执行_统计.加载.完成', { count: this.records.length }, LogCategory.ORCHESTRATOR);
       }
     } catch (error) {
@@ -342,7 +349,10 @@ export class ExecutionStats {
     if (!this.context) return;
 
     try {
-      await this.context.globalState.update(this.config.persistKey, this.records);
+      await this.context.globalState.update(this.config.persistKey, {
+        version: 1,
+        records: this.records,
+      });
     } catch (error) {
       logger.warn('编排器.执行_统计.保存.失败', error, LogCategory.ORCHESTRATOR);
     }

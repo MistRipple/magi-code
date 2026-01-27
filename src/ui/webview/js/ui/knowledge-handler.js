@@ -288,7 +288,7 @@ function renderOverview() {
         <div class="knowledge-overview-section-title">技术栈</div>
         <div class="knowledge-tech-stack">
           ${techStack.map(tech => `
-            <span class="knowledge-tech-badge">${escapeHtml(tech)}</span>
+            <span class="badge badge--sm badge--pill">${escapeHtml(tech)}</span>
           `).join('')}
         </div>
       </div>
@@ -371,11 +371,11 @@ function renderKeyFile(file) {
 
   let typeLabel = '';
   if (file.type === 'entry') {
-    typeLabel = '<span class="knowledge-file-type-badge entry">入口</span>';
+    typeLabel = '<span class="badge badge--xs badge--pill badge--success">入口</span>';
   } else if (file.type === 'config') {
-    typeLabel = '<span class="knowledge-file-type-badge config">配置</span>';
+    typeLabel = '<span class="badge badge--xs badge--pill badge--warning">配置</span>';
   } else if (file.type === 'doc') {
-    typeLabel = '<span class="knowledge-file-type-badge doc">文档</span>';
+    typeLabel = '<span class="badge badge--xs badge--pill">文档</span>';
   }
 
   // SVG 图标
@@ -451,7 +451,7 @@ function renderADRList(filteredADRs) {
         <div class="knowledge-list-item-content">
           <div class="knowledge-list-item-header">
             <h4 class="knowledge-list-item-title">${escapeHtml(adr.title)}</h4>
-            <span class="knowledge-list-item-badge ${statusClass}">${statusText}</span>
+            <span class="badge badge--sm badge--${statusClass}">${statusText}</span>
           </div>
           ${description ? `<div class="knowledge-list-item-desc">${escapeHtml(description)}</div>` : ''}
           <div class="knowledge-list-item-meta">
@@ -460,7 +460,7 @@ function renderADRList(filteredADRs) {
           </div>
         </div>
         <div class="knowledge-list-item-actions">
-          <button class="knowledge-item-delete-btn" data-id="${escapeHtml(adr.id)}" data-type="adr" title="删除">
+          <button class="btn-icon btn-icon--sm btn-icon--danger" data-id="${escapeHtml(adr.id)}" data-type="adr" title="删除">
             <svg viewBox="0 0 16 16">
               <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
               <path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
@@ -552,7 +552,7 @@ function renderFAQList(filteredFAQs) {
           </div>
         </div>
         <div class="knowledge-list-item-actions">
-          <button class="knowledge-item-delete-btn" data-id="${escapeHtml(faq.id)}" data-type="faq" title="删除">
+          <button class="btn-icon btn-icon--sm btn-icon--danger" data-id="${escapeHtml(faq.id)}" data-type="faq" title="删除">
             <svg viewBox="0 0 16 16">
               <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
               <path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
@@ -668,7 +668,7 @@ function renderADRDetail(adr) {
     <div class="knowledge-detail-meta">
       <div class="knowledge-detail-meta-item">
         <span class="knowledge-detail-meta-label">状态:</span>
-        <span class="knowledge-list-item-badge ${statusClass}">${statusText}</span>
+        <span class="badge badge--sm badge--${statusClass}">${statusText}</span>
       </div>
       ${date ? `
         <div class="knowledge-detail-meta-item">

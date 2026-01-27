@@ -109,7 +109,7 @@ export class ShellExecutor {
   getToolDefinition() {
     return {
       name: 'execute_shell',
-      description: 'Execute a shell command and return the output. Use this for running terminal commands, scripts, or system operations.',
+      description: 'Execute a shell command and return the output. Use this for running terminal commands, scripts, or system operations. Can optionally display the command in a VSCode terminal window for interactive use.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -126,6 +126,21 @@ export class ShellExecutor {
           timeout: {
             type: 'number' as const,
             description: 'Timeout in milliseconds (default: 30000, max: 300000)',
+            required: false,
+          },
+          showTerminal: {
+            type: 'boolean' as const,
+            description: 'Whether to show the command in a VSCode terminal window (default: false). Use this for interactive commands or when you want the user to see the terminal output.',
+            required: false,
+          },
+          keepTerminalOpen: {
+            type: 'boolean' as const,
+            description: 'Whether to keep the terminal window open after the command completes (default: false). Only applies when showTerminal is true.',
+            required: false,
+          },
+          name: {
+            type: 'string' as const,
+            description: 'Name for the terminal window (default: "MultiCLI"). Only applies when showTerminal is true.',
             required: false,
           },
         },

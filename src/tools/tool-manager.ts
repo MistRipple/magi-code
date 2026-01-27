@@ -11,6 +11,7 @@ import {
 } from './types';
 import { ToolCall, ToolResult, ToolDefinition } from '../llm/types';
 import { ShellExecutor } from './shell-executor';
+import { VSCodeTerminalExecutor } from './vscode-terminal-executor';
 import { logger, LogCategory } from '../logging';
 import { PermissionMatrix } from '../types';
 
@@ -19,6 +20,7 @@ import { PermissionMatrix } from '../types';
  */
 export class ToolManager extends EventEmitter implements ToolExecutor {
   private shellExecutor: ShellExecutor;
+  private terminalExecutor: VSCodeTerminalExecutor;
   private mcpExecutors: Map<string, ToolExecutor> = new Map();
   private skillExecutors: Map<string, ToolExecutor> = new Map();
   private toolCache: Map<string, ExtendedToolDefinition> = new Map();
@@ -28,6 +30,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   constructor(permissions?: PermissionMatrix) {
     super();
     this.shellExecutor = new ShellExecutor();
+    this.terminalExecutor = new VSCodeTerminalExecutor();
     this.permissions = permissions || {
       allowEdit: true,
       allowBash: true,
@@ -310,7 +313,16 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    * 执行 Shell 工具
    */
   private async executeShellTool(toolCall: ToolCall): Promise<ToolResult> {
-    const { command, cwd, timeout } = toolCall.arguments;
+    const args = toolCall.arguments as any;
+    const {
+      command,
+      cwd,
+      timeout,
+      showTerminal,
+      keepTerminalOpen,
+      useVSCodeTerminal,
+      name
+    } = args;
 
     // 验证命令安全性
     const validation = this.shellExecutor.validateCommand(command);
@@ -322,10 +334,25 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       };
     }
 
-    const result = await this.shellExecutor.execute({
+    // 选择执行器：如果指定使用VSCode终端或需要显示终端，则使用终端执行器
+    const shouldUseTerminal = useVSCodeTerminal || showTerminal;
+    const executor = shouldUseTerminal ? this.terminalExecutor : this.shellExecutor;
+
+    logger.debug('Executing shell command', {
+      command,
+      executor: shouldUseTerminal ? 'VSCodeTerminal' : 'ChildProcess',
+      showTerminal,
+      keepTerminalOpen,
+    }, LogCategory.TOOLS);
+
+    const result = await executor.execute({
       command,
       cwd,
       timeout,
+      name,
+      showTerminal,
+      keepTerminalOpen,
+      useVSCodeTerminal,
     });
 
     if (result.exitCode !== 0) {

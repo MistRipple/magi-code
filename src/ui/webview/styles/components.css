@@ -37,120 +37,11 @@
       box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
     }
     .message:hover .message-actions { opacity: 1; }
-    .message-action-btn {
-      width: 24px;
-      height: 24px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: transparent;
-      border: none;
-      border-radius: var(--radius-1);
-      cursor: pointer;
-      color: var(--vscode-descriptionForeground);
-      transition: all 0.15s;
-    }
-    .message-action-btn:hover {
-      background: var(--vscode-toolbar-hoverBackground);
-      color: var(--vscode-foreground);
-    }
-    .message-action-btn svg { width: 14px; height: 14px; fill: currentColor; }
-
     /* 消息头部：角色徽章 + 时间 */
     .message-header { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
     .message-time { font-size: 10px; color: var(--vscode-descriptionForeground); }
 
-    /* 角色名徽章样式 */
-    .message-role-badge {
-      font-size: 11px;
-      padding: 2px 8px;
-      border-radius: 4px;
-      font-weight: 500;
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-    }
-    .message-role-badge.user {
-      background: var(--vscode-button-background);
-      color: var(--vscode-button-foreground);
-    }
-    .message-role-badge.assistant {
-      background: var(--color-orchestrator, #d97706);
-      color: white;
-    }
-    .message-role-badge.orchestrator {
-      background: var(--color-orchestrator, #d97706);
-      color: white;
-    }
-    .message-role-badge.worker {
-      background: var(--color-codex, #10b981);
-      color: white;
-    }
-    .message-role-badge.claude {
-      background: var(--color-claude, #d97706);
-      color: white;
-    }
-    .message-role-badge.codex {
-      background: var(--color-codex, #10b981);
-      color: white;
-    }
-    .message-role-badge.gemini {
-      background: var(--color-gemini, #4285f4);
-      color: white;
-    }
 
-    /* 模型标签 */
-    .message-model-tag {
-      font-size: 9px; padding: 2px 6px; border-radius: 4px;
-      background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
-      text-transform: uppercase; font-weight: 500;
-    }
-    /* 编排者消息类型徽章 */
-    .orchestrator-badge {
-      display: inline-block;
-      font-size: 11px;
-      font-weight: 500;
-      padding: 2px 8px;
-      border-radius: 3px;
-      margin-bottom: 6px;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-    .orchestrator-badge.task-assign {
-      background: rgba(59, 130, 246, 0.15);
-      color: var(--vscode-textLink-foreground, #3b82f6);
-      border: 1px solid rgba(59, 130, 246, 0.3);
-    }
-    .orchestrator-badge.self-check {
-      background: rgba(168, 85, 247, 0.15);
-      color: #a855f7;
-      border: 1px solid rgba(168, 85, 247, 0.3);
-    }
-    .orchestrator-badge.peer-review {
-      background: rgba(236, 72, 153, 0.15);
-      color: #ec4899;
-      border: 1px solid rgba(236, 72, 153, 0.3);
-    }
-    .orchestrator-badge.fix-request {
-      background: rgba(245, 158, 11, 0.15);
-      color: #f59e0b;
-      border: 1px solid rgba(245, 158, 11, 0.3);
-    }
-    .orchestrator-badge.analyze {
-      background: rgba(6, 182, 212, 0.15);
-      color: #06b6d4;
-      border: 1px solid rgba(6, 182, 212, 0.3);
-    }
-    .orchestrator-badge.summary {
-      background: rgba(16, 185, 129, 0.15);
-      color: #10b981;
-      border: 1px solid rgba(16, 185, 129, 0.3);
-    }
-    .orchestrator-badge.default {
-      background: var(--vscode-badge-background);
-      color: var(--vscode-badge-foreground);
-      border: 1px solid var(--vscode-panel-border);
-    }
 
     /* ========== 流式输出动画 - Augment 风格 ========== */
     .thinking-indicator {
@@ -222,7 +113,21 @@
     .enhance-btn .enhance-text { transition: opacity 0.2s ease; }
     @keyframes enhance-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
-    .send-btn { width: 28px; height: 28px; border-radius: var(--radius-1); background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; transition: background 0.1s ease, transform 0.1s ease; }
+    /* 发送按钮（特殊样式，使用 btn-icon--lg + btn-icon--primary 基础） */
+    .send-btn {
+      width: 28px;
+      height: 28px;
+      border-radius: var(--radius-1);
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: none;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      transition: background var(--transition-fast), transform var(--transition-fast);
+    }
     .send-btn:hover { background: var(--vscode-button-hoverBackground); }
     .send-btn:active { transform: scale(0.95); }
     .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -245,8 +150,6 @@
     .toast-icon.warning { fill: #ffc53d; }
     .toast-icon.info { fill: var(--vscode-button-background); }
     .toast-message { flex: 1; font-size: var(--font-size-2); color: var(--vscode-notifications-foreground); }
-    .toast-close { width: 20px; height: 20px; background: transparent; border: none; color: var(--vscode-descriptionForeground); cursor: pointer; display: flex; align-items: center; justify-content: center; border-radius: var(--radius-1); }
-    .toast-close:hover { background: var(--vscode-toolbar-hoverBackground); }
 
     /* 统一的 Toggle Switch 开关样式 */
     .toggle-switch {
@@ -308,13 +211,13 @@
     }
 
     /* 模型连接状态样式 */
-    .model-connection-list { display: flex; flex-direction: column; gap: var(--spacing-2); margin-top: var(--spacing-3); }
-    .model-connection-item { display: flex; align-items: center; gap: var(--spacing-3); padding: var(--spacing-3); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); transition: all var(--transition-fast); }
+    .model-connection-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--spacing-2); margin-top: var(--spacing-3); }
+    .model-connection-item { display: flex; align-items: center; gap: var(--spacing-3); padding: var(--spacing-2) var(--spacing-3); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: var(--radius-2); transition: all var(--transition-fast); min-width: 0; }
     .model-connection-item:hover { border-color: var(--vscode-focusBorder); }
     .model-connection-item.available { border-color: rgba(61, 214, 140, 0.5); background: rgba(61, 214, 140, 0.05); }
     .model-connection-item.unavailable { border-color: rgba(241, 76, 76, 0.5); background: rgba(241, 76, 76, 0.05); opacity: 0.8; }
     .model-connection-item.disabled { border-color: var(--vscode-descriptionForeground); opacity: 0.5; }
-    .model-connection-icon { width: 36px; height: 36px; border-radius: var(--radius-2); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+    .model-connection-icon { width: 32px; height: 32px; border-radius: var(--radius-2); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
     .model-connection-icon svg { width: 22px; height: 22px; fill: currentColor; }
     .model-connection-icon.claude { background: rgba(217, 119, 6, 0.2); color: #d97706; }
     .model-connection-icon.codex { background: rgba(34, 197, 94, 0.2); color: #22c55e; }
@@ -323,19 +226,56 @@
     .model-connection-icon.compressor { background: rgba(236, 72, 153, 0.2); color: #ec4899; }
     .model-connection-info { flex: 1; min-width: 0; }
     .model-connection-name { font-size: var(--font-size-2); font-weight: 600; color: var(--vscode-foreground); }
-    .model-connection-status { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .model-connection-badge { font-size: var(--font-size-1); padding: 4px 10px; border-radius: var(--radius-full); font-weight: 600; flex-shrink: 0; }
-    .model-connection-badge.available { background: rgba(61, 214, 140, 0.25); color: #3dd68c; }
-    .model-connection-badge.unavailable { background: rgba(241, 76, 76, 0.25); color: #f14c4c; }
-    .model-connection-badge.checking { background: rgba(204, 167, 0, 0.25); color: #cca700; }
-    .model-connection-badge.disabled { background: rgba(128, 128, 128, 0.25); color: var(--vscode-descriptionForeground); }
-    .model-connection-badge.error { background: rgba(241, 76, 76, 0.25); color: #f14c4c; }
+    .model-connection-meta { display: flex; align-items: center; gap: 6px; margin-top: 2px; font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); }
+    .model-connection-meta-label { opacity: 0.7; }
+    .model-connection-model { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .model-connection-status { font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .model-connection-badge {
+      padding: 4px 8px;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.4px;
+      text-transform: uppercase;
+      border-radius: var(--radius-1);
+      border: 1px solid transparent;
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--vscode-foreground);
+      flex-shrink: 0;
+    }
+    .model-connection-badge.available { background: rgba(61, 214, 140, 0.15); color: #3dd68c; border-color: rgba(61, 214, 140, 0.35); }
+    .model-connection-badge.error { background: rgba(241, 76, 76, 0.15); color: #f14c4c; border-color: rgba(241, 76, 76, 0.35); }
+    .model-connection-badge.disabled { background: rgba(148, 163, 184, 0.15); color: #94a3b8; border-color: rgba(148, 163, 184, 0.35); }
+    .model-connection-badge.checking { background: rgba(59, 130, 246, 0.15); color: #3b82f6; border-color: rgba(59, 130, 246, 0.35); }
+    .model-connection-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-top: var(--spacing-2); }
+    .model-connection-stat { display: flex; flex-direction: column; gap: 2px; padding: 4px 6px; background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.06); border-radius: var(--radius-1); min-width: 0; }
+    .model-connection-stat-label { font-size: 10px; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.3px; }
+    .model-connection-stat-value { font-size: 12px; font-weight: 600; color: var(--vscode-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .model-refresh-btn { display: flex; align-items: center; justify-content: center; gap: var(--spacing-2); width: 100%; margin-top: var(--spacing-3); padding: var(--spacing-2); background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: 1px solid var(--vscode-button-border, var(--vscode-contrastBorder, rgba(255,255,255,0.1))); border-radius: var(--radius-2); cursor: pointer; font-size: var(--font-size-2); font-weight: 500; transition: all var(--transition-fast); }
+
+    @media (max-width: 900px) {
+      .model-connection-list { grid-template-columns: 1fr; }
+    }
 .model-refresh-btn:hover { background: var(--vscode-button-secondaryHoverBackground); border-color: var(--vscode-focusBorder); }
     .model-refresh-btn:active { transform: translateY(0); }
     .model-refresh-btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
     .model-refresh-btn svg { width: 15px; height: 15px; fill: currentColor; }
     .model-refresh-btn.loading svg { animation: spin 1s linear infinite; }
+    .settings-section-actions { display: flex; align-items: center; gap: var(--spacing-2); }
+    .settings-section-actions .model-refresh-btn { width: auto; margin-top: 0; padding: var(--spacing-2) var(--spacing-3); }
+    .settings-summary-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.3px;
+      text-transform: uppercase;
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--vscode-foreground);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+    }
 
     /* 统一所有按钮内SVG图标尺寸 */
     .settings-btn svg,
@@ -417,40 +357,6 @@
       display: flex;
       gap: var(--spacing-2);
     }
-    .skill-toggle {
-      width: 44px;
-      height: 24px;
-      background: var(--vscode-input-background);
-      border: 1px solid var(--vscode-input-border);
-      border-radius: var(--radius-full);
-      cursor: pointer;
-      position: relative;
-      transition: all var(--transition-fast);
-      flex-shrink: 0;
-    }
-    .skill-toggle::after {
-      content: '';
-      position: absolute;
-      top: 2px;
-      left: 2px;
-      width: 18px;
-      height: 18px;
-      background: var(--vscode-descriptionForeground);
-      border-radius: var(--radius-full);
-      transition: all var(--transition-fast);
-      box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-    }
-    .skill-toggle:hover {
-      border-color: var(--vscode-focusBorder);
-    }
-    .skill-toggle.active {
-      background: var(--vscode-button-background);
-      border-color: var(--vscode-button-background);
-    }
-    .skill-toggle.active::after {
-      left: 22px;
-      background: var(--vscode-button-foreground);
-    }
 
     /* 设置按钮样式 - 统一所有按钮风格 */
     .settings-btn {
@@ -510,6 +416,9 @@
       justify-content: space-between;
       margin-bottom: var(--spacing-3);
     }
+    .settings-section-header .settings-section-title {
+      margin-bottom: 0;
+    }
     .settings-section-header .settings-btn-group {
       display: flex;
       gap: var(--spacing-2);
@@ -520,8 +429,6 @@
     .diff-modal { width: 600px; max-width: 90vw; max-height: 80vh; background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-3); overflow: hidden; display: flex; flex-direction: column; }
     .diff-modal-header { display: flex; align-items: center; justify-content: space-between; padding: var(--spacing-3) var(--spacing-4); border-bottom: 1px solid var(--vscode-panel-border); }
     .diff-modal-title { font-size: var(--font-size-3); font-weight: 600; }
-    .diff-modal-close { width: 28px; height: 28px; background: transparent; border: none; color: var(--vscode-foreground); cursor: pointer; font-size: 18px; border-radius: var(--radius-1); }
-    .diff-modal-close:hover { background: var(--vscode-toolbar-hoverBackground); }
     .diff-modal-content { flex: 1; overflow: auto; padding: var(--spacing-3); }
     .diff-content { font-family: var(--vscode-editor-font-family); font-size: var(--font-size-2); line-height: 1.5; white-space: pre; }
     .diff-add { color: #3dd68c; background: rgba(61, 214, 140, 0.1); display: block; }
@@ -529,10 +436,231 @@
     .diff-hunk { color: var(--vscode-descriptionForeground); display: block; }
     .diff-modal-actions { display: flex; justify-content: flex-end; gap: var(--spacing-2); padding: var(--spacing-3) var(--spacing-4); border-top: 1px solid var(--vscode-panel-border); }
 
-    .icon-btn { width: 26px; height: 26px; border-radius: var(--radius-1); border: none; background: transparent; color: var(--vscode-descriptionForeground); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; transition: background 0.1s ease, color 0.1s ease; }
-    .icon-btn:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
-    .icon-btn:active { background: var(--vscode-toolbar-activeBackground, var(--vscode-list-activeSelectionBackground)); transform: scale(0.96); }
-    .icon-btn svg { width: 14px; height: 14px; fill: currentColor; }
+    /* ========================================
+       统一组件基类系统
+       ======================================== */
+
+    /* ========== 按钮系统 ========== */
+
+    /* 基础图标按钮 */
+    .btn-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      background: transparent;
+      border: none;
+      border-radius: var(--radius-1);
+      cursor: pointer;
+      color: var(--vscode-descriptionForeground);
+      transition: background var(--transition-fast), color var(--transition-fast), transform var(--transition-fast);
+    }
+
+    .btn-icon:hover {
+      background: var(--vscode-toolbar-hoverBackground);
+      color: var(--vscode-foreground);
+    }
+
+    .btn-icon:active {
+      background: var(--vscode-toolbar-activeBackground, var(--vscode-list-activeSelectionBackground));
+      transform: scale(0.96);
+    }
+
+    .btn-icon svg {
+      width: 14px;
+      height: 14px;
+      fill: currentColor;
+    }
+
+    /* 尺寸修饰符 */
+    .btn-icon--xs { width: 20px; height: 20px; }
+    .btn-icon--sm { width: 24px; height: 24px; }
+    .btn-icon--md { width: 26px; height: 26px; }
+    .btn-icon--lg { width: 28px; height: 28px; }
+
+    /* 颜色修饰符 */
+    .btn-icon--danger:hover {
+      background: var(--ds-color-error-2);
+      color: var(--ds-color-error-9);
+    }
+
+    .btn-icon--primary {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+    }
+
+    .btn-icon--primary:hover {
+      background: var(--vscode-button-hoverBackground);
+    }
+
+    /* ========== Badge 徽章系统 ========== */
+
+    /* 基础徽章 */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px var(--spacing-2);
+      border-radius: var(--radius-1);
+      font-size: var(--font-size-1);
+      font-weight: 500;
+      background: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
+      flex-shrink: 0;
+    }
+
+    /* 尺寸修饰符 */
+    .badge--xs {
+      padding: 1px var(--spacing-1);
+      font-size: 9px;
+    }
+    .badge--sm {
+      padding: 2px var(--spacing-2);
+      font-size: 10px;
+    }
+    .badge--md {
+      padding: 2px var(--spacing-2);
+      font-size: 11px;
+    }
+    .badge--lg {
+      padding: 4px var(--spacing-3);
+      font-size: var(--font-size-2);
+    }
+
+    /* 形状修饰符 */
+    .badge--pill {
+      border-radius: var(--radius-full);
+    }
+
+    /* 颜色修饰符 */
+    .badge--success {
+      background: var(--ds-color-success-2);
+      color: var(--ds-color-success-9);
+    }
+    .badge--warning {
+      background: var(--ds-color-warning-2);
+      color: var(--ds-color-warning-9);
+    }
+    .badge--error {
+      background: var(--ds-color-error-2);
+      color: var(--ds-color-error-9);
+    }
+    .badge--neutral {
+      background: var(--ds-color-neutral-2);
+      color: var(--vscode-descriptionForeground);
+    }
+    .badge--primary {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+    }
+    .badge--orchestrator {
+      background: var(--color-orchestrator, #d97706);
+      color: white;
+    }
+    .badge--claude {
+      background: var(--color-claude, #d97706);
+      color: white;
+    }
+    .badge--codex {
+      background: var(--color-codex, #10b981);
+      color: white;
+    }
+    .badge--gemini {
+      background: var(--color-gemini, #4285f4);
+      color: white;
+    }
+
+    /* 特殊徽章样式 */
+    .badge--task-assign {
+      background: rgba(59, 130, 246, 0.15);
+      color: var(--vscode-textLink-foreground, #3b82f6);
+      border: 1px solid rgba(59, 130, 246, 0.3);
+    }
+    .badge--self-check {
+      background: rgba(168, 85, 247, 0.15);
+      color: #a855f7;
+      border: 1px solid rgba(168, 85, 247, 0.3);
+    }
+    .badge--peer-review {
+      background: rgba(236, 72, 153, 0.15);
+      color: #ec4899;
+      border: 1px solid rgba(236, 72, 153, 0.3);
+    }
+    .badge--fix-request {
+      background: rgba(245, 158, 11, 0.15);
+      color: #f59e0b;
+      border: 1px solid rgba(245, 158, 11, 0.3);
+    }
+    .badge--analyze {
+      background: rgba(6, 182, 212, 0.15);
+      color: #06b6d4;
+      border: 1px solid rgba(6, 182, 212, 0.3);
+    }
+    .badge--summary {
+      background: rgba(16, 185, 129, 0.15);
+      color: #10b981;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+
+    /* 连接状态徽章 */
+    .badge--available {
+      background: rgba(61, 214, 140, 0.25);
+      color: #3dd68c;
+    }
+    .badge--unavailable {
+      background: rgba(241, 76, 76, 0.25);
+      color: #f14c4c;
+    }
+    .badge--checking {
+      background: rgba(204, 167, 0, 0.25);
+      color: #cca700;
+    }
+    .badge--disabled {
+      background: rgba(128, 128, 128, 0.25);
+      color: var(--vscode-descriptionForeground);
+    }
+
+    /* ========== Card 卡片系统 ========== */
+
+    /* 基础卡片 */
+    .card {
+      background: var(--vscode-input-background);
+      border: 1px solid var(--vscode-input-border);
+      border-radius: var(--radius-2);
+      transition: all var(--transition-fast);
+    }
+
+    .card:hover {
+      border-color: var(--vscode-focusBorder);
+    }
+
+    /* 尺寸修饰符 */
+    .card--xs { padding: var(--spacing-1) var(--spacing-2); }
+    .card--sm { padding: var(--spacing-2); }
+    .card--md { padding: var(--spacing-2) var(--spacing-3); }
+    .card--lg { padding: var(--spacing-3) var(--spacing-4); }
+
+    /* 交互修饰符 */
+    .card--clickable {
+      cursor: pointer;
+    }
+    .card--clickable:active {
+      transform: scale(0.99);
+    }
+
+    /* 状态修饰符 */
+    .card--success {
+      border-color: rgba(61, 214, 140, 0.5);
+      background: rgba(61, 214, 140, 0.05);
+    }
+    .card--error {
+      border-color: rgba(241, 76, 76, 0.5);
+      background: rgba(241, 76, 76, 0.05);
+    }
+    .card--disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
 
     /* Worker 模型选择器样式 */
     .worker-model-tabs {
@@ -639,6 +767,45 @@
 
     .llm-config-save-btn:active {
       transform: scale(0.98);
+    }
+
+    /* 通用保存按钮状态 */
+    .save-btn {
+      position: relative;
+      transition: background var(--transition-normal), color var(--transition-normal), border-color var(--transition-normal);
+    }
+
+    .save-btn.loading {
+      pointer-events: none;
+      cursor: wait;
+      opacity: 0.8;
+      padding-right: calc(var(--spacing-4) + 16px);
+    }
+
+    .save-btn.loading::after {
+      content: '';
+      position: absolute;
+      right: var(--spacing-3);
+      top: 50%;
+      width: 12px;
+      height: 12px;
+      margin-top: -6px;
+      border: 2px solid currentColor;
+      border-right-color: transparent;
+      border-radius: 999px;
+      animation: spin 0.8s linear infinite;
+    }
+
+    .save-btn.success {
+      background: rgba(61, 214, 140, 0.2);
+      color: #3dd68c;
+      border-color: rgba(61, 214, 140, 0.6);
+    }
+
+    .save-btn.error {
+      background: rgba(241, 76, 76, 0.2);
+      color: #f14c4c;
+      border-color: rgba(241, 76, 76, 0.6);
     }
 
     /* LLM 配置测试按钮加载状态 */
@@ -880,37 +1047,6 @@
   opacity: 1;
 }
 
-/* 会话操作按钮样式 */
-.session-action-btn {
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  border: none;
-  background: transparent;
-  color: var(--vscode-descriptionForeground);
-  border-radius: var(--radius-1);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all var(--transition-fast);
-}
-
-.session-action-btn:hover {
-  background: var(--vscode-toolbar-hoverBackground);
-  color: var(--vscode-foreground);
-}
-
-.session-action-btn--danger:hover {
-  background: rgba(239, 68, 68, 0.15);
-  color: var(--color-error, #ef4444);
-}
-
-.session-action-btn svg {
-  width: 14px;
-  height: 14px;
-}
-
 /* 空状态 */
 .session-dropdown-empty {
   display: none;
@@ -996,16 +1132,6 @@
   flex-shrink: 0;
 }
 
-.knowledge-tab-badge {
-  background: var(--vscode-badge-background);
-  color: var(--vscode-badge-foreground);
-  font-size: 10px;
-  padding: 1px 5px;
-  border-radius: var(--radius-full);
-  min-width: 16px;
-  text-align: center;
-}
-
 .knowledge-tab.active .knowledge-tab-badge {
   background: var(--ds-color-neutral-a7);
 }
@@ -1054,41 +1180,10 @@
   color: var(--vscode-input-placeholderForeground);
 }
 
-.knowledge-action-btn {
-  color: var(--vscode-descriptionForeground);
-  width: 26px;
-  height: 26px;
-  padding: 0;
-  border: none;
-  background: transparent;
-  border-radius: var(--radius-1);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  transition: background var(--transition-fast), color var(--transition-fast), transform var(--transition-fast);
-}
-
 .knowledge-action-btn.loading {
   pointer-events: none;
   opacity: 0.7;
   cursor: wait;
-}
-
-.knowledge-action-btn svg {
-  width: 14px;
-  height: 14px;
-  fill: currentColor;
-}
-
-.knowledge-action-btn:hover {
-  background: var(--vscode-toolbar-hoverBackground);
-  color: var(--vscode-foreground);
-}
-
-.knowledge-action-btn:active {
-  background: var(--vscode-toolbar-activeBackground, var(--vscode-list-activeSelectionBackground));
-  transform: scale(0.96);
 }
 
 .knowledge-action-btn.loading svg {
@@ -1256,15 +1351,6 @@
   gap: var(--spacing-2);
 }
 
-.knowledge-tech-badge {
-  padding: var(--spacing-1) var(--spacing-3);
-  background: var(--vscode-badge-background);
-  color: var(--vscode-badge-foreground);
-  border-radius: var(--radius-full);
-  font-size: var(--font-size-1);
-  font-weight: 500;
-}
-
 /* 关键文件列表 */
 .knowledge-key-files {
   display: flex;
@@ -1341,30 +1427,6 @@
   white-space: nowrap;
 }
 
-.knowledge-file-type-badge {
-  display: inline-block;
-  padding: 2px var(--spacing-2);
-  border-radius: var(--radius-full);
-  font-size: var(--font-size-1);
-  font-weight: 500;
-  line-height: 1;
-}
-
-.knowledge-file-type-badge.entry {
-  background: var(--ds-color-success-2);
-  color: var(--ds-color-success-9);
-}
-
-.knowledge-file-type-badge.config {
-  background: var(--ds-color-warning-2);
-  color: var(--ds-color-warning-9);
-}
-
-.knowledge-file-type-badge.doc {
-  background: var(--vscode-badge-background);
-  color: var(--vscode-badge-foreground);
-}
-
 /* ============================================
    列表区域
    ============================================ */
@@ -1426,34 +1488,6 @@
   white-space: nowrap;
 }
 
-.knowledge-list-item-badge {
-  padding: 2px var(--spacing-2);
-  border-radius: var(--radius-1);
-  font-size: var(--font-size-1);
-  font-weight: 500;
-  flex-shrink: 0;
-}
-
-.knowledge-list-item-badge.proposed {
-  background: var(--ds-color-warning-2);
-  color: var(--ds-color-warning-9);
-}
-
-.knowledge-list-item-badge.accepted {
-  background: var(--ds-color-success-2);
-  color: var(--ds-color-success-9);
-}
-
-.knowledge-list-item-badge.deprecated {
-  background: var(--ds-color-error-2);
-  color: var(--ds-color-error-9);
-}
-
-.knowledge-list-item-badge.superseded {
-  background: var(--ds-color-neutral-2);
-  color: var(--vscode-descriptionForeground);
-}
-
 /* 删除按钮 */
 .knowledge-list-item-actions {
   display: flex;
@@ -1464,33 +1498,6 @@
 
 .knowledge-list-item:hover .knowledge-list-item-actions {
   opacity: 1;
-}
-
-.knowledge-item-delete-btn {
-  color: var(--vscode-descriptionForeground);
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  border: none;
-  background: transparent;
-  border-radius: var(--radius-1);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  transition: background var(--transition-fast), color var(--transition-fast), transform var(--transition-fast);
-}
-
-.knowledge-item-delete-btn:hover {
-  background: var(--ds-color-error-2);
-  color: var(--ds-color-error-9);
-  transform: scale(0.96);
-}
-
-.knowledge-item-delete-btn svg {
-  width: 14px;
-  height: 14px;
-  fill: currentColor;
 }
 
 .knowledge-list-item-desc {
@@ -1508,20 +1515,6 @@
   gap: var(--spacing-3);
   font-size: var(--font-size-1);
   color: var(--vscode-descriptionForeground);
-}
-
-.knowledge-list-item-tags {
-  display: flex;
-  gap: var(--spacing-1);
-  flex-wrap: wrap;
-}
-
-.knowledge-list-item-tag {
-  padding: 2px var(--spacing-1);
-  background: var(--vscode-badge-background);
-  color: var(--vscode-badge-foreground);
-  border-radius: var(--radius-1);
-  font-size: var(--font-size-1);
 }
 
 /* ============================================
@@ -1550,37 +1543,6 @@
   border-bottom: 1px solid var(--vscode-panel-border);
   flex-shrink: 0;
   height: 36px;
-}
-
-.knowledge-detail-close {
-  color: var(--vscode-descriptionForeground);
-  width: 26px;
-  height: 26px;
-  padding: 0;
-  border: none;
-  background: transparent;
-  border-radius: var(--radius-1);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  transition: background var(--transition-fast), color var(--transition-fast), transform var(--transition-fast);
-}
-
-.knowledge-detail-close svg {
-  width: 14px;
-  height: 14px;
-  fill: currentColor;
-}
-
-.knowledge-detail-close:hover {
-  background: var(--vscode-toolbar-hoverBackground);
-  color: var(--vscode-foreground);
-}
-
-.knowledge-detail-close:active {
-  background: var(--vscode-toolbar-activeBackground, var(--vscode-list-activeSelectionBackground));
-  transform: scale(0.96);
 }
 
 .knowledge-detail-content {
@@ -1657,22 +1619,6 @@
   line-height: 1.5;
 }
 
-.knowledge-detail-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--spacing-1);
-  margin-top: var(--spacing-2);
-}
-
-.knowledge-detail-tag {
-  padding: 2px var(--spacing-2);
-  background: var(--vscode-badge-background);
-  color: var(--vscode-badge-foreground);
-  border-radius: var(--radius-1);
-  font-size: var(--font-size-1);
-  font-weight: 500;
-}
-
 /* ============================================
    代码索引特殊样式
    ============================================ */
@@ -1725,15 +1671,6 @@
   display: flex;
   flex-wrap: wrap;
   gap: var(--spacing-1);
-}
-
-.knowledge-index-tech-item {
-  padding: 2px var(--spacing-2);
-  background: var(--vscode-badge-background);
-  color: var(--vscode-badge-foreground);
-  border-radius: var(--radius-1);
-  font-size: var(--font-size-1);
-  font-weight: 500;
 }
 
 .knowledge-index-tree {

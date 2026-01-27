@@ -376,15 +376,15 @@ export function renderMessageBlock(message, idx, options) {
       html += '<div class="message-header">';
       // 🆕 澄清消息显示特殊徽章
       if (message.isClarification) {
-        html += '<span class="clarification-badge"><svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M5.255 5.786a.237.237 0 0 0 .241.247h.825c.138 0 .248-.113.266-.25.09-.656.54-1.134 1.342-1.134.686 0 1.314.343 1.314 1.168 0 .635-.374.927-.965 1.371-.673.489-1.206 1.06-1.168 1.987l.003.217a.25.25 0 0 0 .25.246h.811a.25.25 0 0 0 .25-.25v-.105c0-.718.273-.927 1.01-1.486.609-.463 1.244-.977 1.244-2.056 0-1.511-1.276-2.241-2.673-2.241-1.267 0-2.655.59-2.75 2.286zm1.557 5.763c0 .533.425.927 1.01.927.609 0 1.028-.394 1.028-.927 0-.552-.42-.94-1.029-.94-.584 0-1.009.388-1.009.94z"/></svg>需求澄清</span>';
+        html += '<span class="badge badge--sm badge--warning"><svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M5.255 5.786a.237.237 0 0 0 .241.247h.825c.138 0 .248-.113.266-.25.09-.656.54-1.134 1.342-1.134.686 0 1.314.343 1.314 1.168 0 .635-.374.927-.965 1.371-.673.489-1.206 1.06-1.168 1.987l.003.217a.25.25 0 0 0 .25.246h.811a.25.25 0 0 0 .25-.25v-.105c0-.718.273-.927 1.01-1.486.609-.463 1.244-.977 1.244-2.056 0-1.511-1.276-2.241-2.673-2.241-1.267 0-2.655.59-2.75 2.286zm1.557 5.763c0 .533.425.927 1.01.927.609 0 1.028-.394 1.028-.927 0-.552-.42-.94-1.029-.94-.584 0-1.009.388-1.009.94z"/></svg>需求澄清</span>';
       }
       // 🆕 Worker 问题消息显示特殊徽章
       if (message.isWorkerQuestion) {
         const workerId = message.workerQuestionData?.workerId || 'Worker';
-        html += '<span class="clarification-badge" style="background: var(--vscode-charts-orange);"><svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M11 6a3 3 0 1 1-6 0 3 3 0 0 1 6 0z"/><path fill-rule="evenodd" d="M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8zm8-7a7 7 0 0 0-5.468 11.37C3.242 11.226 4.805 10 8 10s4.757 1.225 5.468 2.37A7 7 0 0 0 8 1z"/></svg>' + escapeHtml(workerId) + ' 提问</span>';
+        html += '<span class="badge badge--sm badge--warning"><svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M11 6a3 3 0 1 1-6 0 3 3 0 0 1 6 0z"/><path fill-rule="evenodd" d="M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8zm8-7a7 7 0 0 0-5.468 11.37C3.242 11.226 4.805 10 8 10s4.757 1.225 5.468 2.37A7 7 0 0 0 8 1z"/></svg>' + escapeHtml(workerId) + ' 提问</span>';
       }
       if (!isUser && roleName && !message.isClarification && !message.isWorkerQuestion) {
-        html += '<span class="message-role-badge ' + badgeClass + '">' + roleName + '</span>';
+        html += '<span class="badge badge--md badge--' + badgeClass + '">' + roleName + '</span>';
       }
       // 使用相对时间（无时间则不渲染，避免空占位）
       const timestamp = message.timestamp || message.startedAt;
@@ -906,8 +906,8 @@ export function renderSubTaskSummaryCard(message) {
         icon: getRoleIcon(agentClass || 'success'),
         title: card.title || 'Worker 执行摘要',
         badges: [
-          { text: agent ? agent.toUpperCase() : 'WORKER', class: 'badge-' + (agentClass || 'info') },
-          { text: statusText, class: badgeClass }
+          { text: agent ? agent.toUpperCase() : 'WORKER', class: 'badge--' + (agentClass || 'primary') },
+          { text: statusText, class: 'badge--' + (card.status === 'failed' ? 'error' : 'success') }
         ],
         content: contentHtml,
         collapsed: true,       // 默认折叠
@@ -923,7 +923,7 @@ export function renderSummaryCard(message) {
         type: 'summary',
         variant: 'success',
         title: card.title || '执行总结',
-        badges: [{ text: '总结', class: 'badge-completed' }],
+        badges: [{ text: '总结', class: 'badge--success' }],
         content: renderSummarySections(card.sections || []),
         collapsed: false,
       });
@@ -1355,7 +1355,7 @@ export function renderWorkerStatusCard(entries) {
       let listHtml = '<div class="worker-status-list">';
       entries.forEach(item => {
         const agentClass = item.worker.includes('claude') ? 'claude' : item.worker.includes('codex') ? 'codex' : item.worker.includes('gemini') ? 'gemini' : '';
-        const statusClass = item.status === 'running' ? 'badge-running' : item.status === 'completed' ? 'badge-completed' : item.status === 'failed' ? 'badge-failed' : 'badge-pending';
+        const statusClass = item.status === 'running' ? 'warning' : item.status === 'completed' ? 'success' : item.status === 'failed' ? 'error' : 'neutral';
         const progressClass = item.status === 'completed' ? 'completed' : item.status === 'failed' ? 'failed' : '';
         const progress = item.progress !== undefined ? Math.min(100, Math.max(0, item.progress)) : (item.status === 'running' ? 50 : 0);
         const duration = item.duration || item.time || '';
@@ -1366,7 +1366,7 @@ export function renderWorkerStatusCard(entries) {
         listHtml += '<div class="worker-status-row">';
         listHtml += '<span class="task-agent ' + agentClass + '">' + escapeHtml(item.worker) + '</span>';
         listHtml += '<span class="task-desc" title="' + escapeHtml(item.description) + '">' + escapeHtml(item.description) + '</span>';
-        listHtml += '<span class="card-badge ' + statusClass + '">' + (statusMap[item.status] || item.status) + '</span>';
+        listHtml += '<span class="badge badge--sm badge--' + statusClass + '">' + (statusMap[item.status] || item.status) + '</span>';
         listHtml += '</div>';
 
         // 第二行：当前操作（如果有）
@@ -1401,7 +1401,7 @@ export function renderWorkerStatusCard(entries) {
         variant: 'info',
         icon: getRoleIcon('orchestrator'),
         title: '子代理运行状态',
-        badges: [{ text: badgeText, class: runningCount > 0 ? 'badge-running' : 'badge-info' }],
+        badges: [{ text: badgeText, class: runningCount > 0 ? 'badge--warning' : 'badge--primary' }],
         content: listHtml,
         className: 'worker-status-card'
       });
@@ -1890,7 +1890,7 @@ export function renderEditsView() {
         html += '<div class="edit-stats">';
         html += '<span class="edit-stat-add">+' + (edit.additions || 0) + '</span>';
         html += '<span class="edit-stat-del">-' + (edit.deletions || 0) + '</span>';
-        if (agentName) html += '<span class="edit-worker-badge ' + agentClass + '">' + agentName + '</span>';
+        if (agentName) html += '<span class="badge badge--xs badge--' + agentClass + '">' + agentName + '</span>';
         html += '</div>';
         html += '<div class="edit-actions" onclick="event.stopPropagation()">';
         html += '<button class="btn-icon" onclick="approveChange(\'' + escapeHtml(edit.filePath) + '\')" title="批准"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M13.854 3.646a.5.5 0 0 1 0 .708l-7 7a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L6.5 10.293l6.646-6.647a.5.5 0 0 1 .708 0z"/></svg></button>';
@@ -2271,19 +2271,19 @@ export function renderRepositoryManagementList() {
             <div class="repo-manage-info">
               <div class="repo-manage-header">
                 <span class="repo-manage-name">${escapeHtml(repoName)}</span>
-                ${isBuiltin ? '<span class="repo-badge builtin">内置</span>' : ''}
+                ${isBuiltin ? '<span class="badge badge--xs badge--pill badge--primary">内置</span>' : ''}
               </div>
               <div class="repo-manage-url">${escapeHtml(repo.url)}</div>
             </div>
             <div class="repo-manage-actions">
-              <button class="icon-btn-sm" id="refresh-btn-${repo.id}" onclick="refreshRepositoryInDialog('${repo.id}')" title="刷新仓库">
+              <button class="btn-icon btn-icon--sm" id="refresh-btn-${repo.id}" onclick="refreshRepositoryInDialog('${repo.id}')" title="刷新仓库">
                 <svg viewBox="0 0 16 16" fill="currentColor">
                   <path d="M11.534 7h3.932a.25.25 0 0 1 .192.41l-1.966 2.36a.25.25 0 0 1-.384 0l-1.966-2.36a.25.25 0 0 1 .192-.41zm-11 2h3.932a.25.25 0 0 0 .192-.41L2.692 6.23a.25.25 0 0 0-.384 0L.342 8.59A.25.25 0 0 0 .534 9z"/>
                   <path fill-rule="evenodd" d="M8 3c-1.552 0-2.94.707-3.857 1.818a.5.5 0 1 1-.771-.636A6.002 6.002 0 0 1 13.917 7H12.9A5.002 5.002 0 0 0 8 3zM3.1 9a5.002 5.002 0 0 0 8.757 2.182.5.5 0 1 1 .771.636A6.002 6.002 0 0 1 2.083 9H3.1z"/>
                 </svg>
               </button>
               ${!isBuiltin ? `
-                <button class="icon-btn-sm danger" onclick="deleteRepositoryFromDialog('${repo.id}')" title="删除仓库">
+                <button class="btn-icon btn-icon--sm btn-icon--danger" onclick="deleteRepositoryFromDialog('${repo.id}')" title="删除仓库">
                   <svg viewBox="0 0 16 16" fill="currentColor">
                     <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
                     <path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>

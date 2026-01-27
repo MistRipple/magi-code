@@ -106,6 +106,7 @@ import {
 
 import {
   updateModelConnectionStatus,
+  updateModelConnectionModels,
   updateExecutionStats,
   updateProfileConfig,
   initializeSettingsPanel
@@ -132,6 +133,7 @@ let workerConfigs = {
 };
 const CONNECTION_STATUS_POLL_MS = 60000;
 let connectionStatusTimer = null;
+const saveButtonTimers = new Map();
 
 function applyWorkerStatusSnapshot(statuses) {
   if (!statuses) return;
@@ -180,6 +182,49 @@ function startConnectionStatusPolling() {
 
 function triggerConnectionStatusRefresh() {
   postMessage({ type: 'checkWorkerStatus' });
+}
+
+function setSaveButtonState(buttonId, state, message) {
+  const btn = document.getElementById(buttonId);
+  if (!btn) return;
+
+  const originalLabel = btn.dataset.originalLabel || btn.textContent || '';
+  if (!btn.dataset.originalLabel) {
+    btn.dataset.originalLabel = originalLabel;
+  }
+
+  if (saveButtonTimers.has(buttonId)) {
+    clearTimeout(saveButtonTimers.get(buttonId));
+    saveButtonTimers.delete(buttonId);
+  }
+
+  btn.classList.remove('loading', 'success', 'error');
+
+  if (state === 'loading') {
+    btn.disabled = true;
+    btn.classList.add('loading');
+    btn.textContent = message || '保存中';
+    return;
+  }
+
+  btn.disabled = false;
+  if (state === 'success') {
+    btn.classList.add('success');
+    btn.textContent = message || '已保存';
+  } else if (state === 'error') {
+    btn.classList.add('error');
+    btn.textContent = message || '保存失败';
+  } else {
+    btn.textContent = originalLabel;
+    return;
+  }
+
+  const resetTimer = setTimeout(() => {
+    btn.classList.remove('success', 'error');
+    btn.textContent = btn.dataset.originalLabel || originalLabel;
+    saveButtonTimers.delete(buttonId);
+  }, 1400);
+  saveButtonTimers.set(buttonId, resetTimer);
 }
 
 // ============================================
@@ -542,9 +587,15 @@ ${message.summary.codeChanges.length > 0 ? `\n[代码变更] ${message.summary.c
 
       case 'allWorkerConfigsLoaded':
         setWorkerConfigs(message.configs || { claude: null, codex: null, gemini: null });
+        updateModelConnectionModels();
         break;
 
       case 'workerConfigSaved':
+        if (message.success === false) {
+          setSaveButtonState('worker-save-btn', 'error');
+        } else {
+          setSaveButtonState('worker-save-btn', 'success');
+        }
         break;
 
       case 'workerConnectionTestResult': {
@@ -580,10 +631,16 @@ ${message.summary.codeChanges.length > 0 ? `\n[代码变更] ${message.summary.c
         if (apiKeyInput) apiKeyInput.value = config.apiKey || '';
         if (modelInput) modelInput.value = config.model || '';
         if (providerSelect) providerSelect.value = config.provider || 'anthropic';
+        updateModelConnectionModels();
         break;
       }
 
       case 'orchestratorConfigSaved':
+        if (message.success === false) {
+          setSaveButtonState('orch-save-btn', 'error');
+        } else {
+          setSaveButtonState('orch-save-btn', 'success');
+        }
         break;
 
       case 'orchestratorConnectionTestResult': {
@@ -641,10 +698,32 @@ ${message.summary.codeChanges.length > 0 ? `\n[代码变更] ${message.summary.c
         if (apiKeyInput) apiKeyInput.value = config.apiKey || '';
         if (modelInput) modelInput.value = config.model || '';
         if (providerSelect) providerSelect.value = config.provider || 'anthropic';
+        updateModelConnectionModels();
         break;
       }
 
       case 'compressorConfigSaved':
+        if (message.success === false) {
+          setSaveButtonState('comp-save-btn', 'error');
+        } else {
+          setSaveButtonState('comp-save-btn', 'success');
+        }
+        break;
+
+      case 'promptEnhanceSaved':
+        if (message.success) {
+          setSaveButtonState('prompt-enhance-save', 'success');
+        } else {
+          setSaveButtonState('prompt-enhance-save', 'error');
+        }
+        break;
+
+      case 'profileConfigSaved':
+        if (message.success) {
+          setSaveButtonState('profile-save-btn', 'success');
+        } else {
+          setSaveButtonState('profile-save-btn', 'error');
+        }
         break;
 
       case 'mcpServersLoaded':
@@ -935,5 +1014,7 @@ window.__DEBUG__ = {
   showToast,
   postMessage
 };
+
+window.__setSaveButtonState = setSaveButtonState;
 
 console.log('[Main] 主模块加载完成');

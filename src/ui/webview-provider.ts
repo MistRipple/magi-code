@@ -182,6 +182,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.workspaceRoot,
       { timeout, idleTimeout, maxTimeout, permissions, strategy }
     );
+    this.intelligentOrchestrator.setExtensionContext(this.context);
     // 设置 Hard Stop 确认回调
     this.setupOrchestratorConfirmation();
     this.setupOrchestratorQuestions();
@@ -1759,7 +1760,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       case 'updatePromptEnhance':
         // 更新 Prompt 增强配置
-        this.handleUpdatePromptEnhance((message as any).config);
+        this.handleUpdatePromptEnhance((message as any).config, (message as any).source);
         break;
 
       case 'testPromptEnhance':
@@ -2050,7 +2051,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /** 处理 Prompt 增强配置更新 - 存储到 ~/.multicli/config.json */
-  private async handleUpdatePromptEnhance(config: { enabled: boolean; baseUrl: string; apiKey: string }): Promise<void> {
+  private async handleUpdatePromptEnhance(
+    config: { enabled: boolean; baseUrl: string; apiKey: string },
+    source: 'auto' | 'manual' = 'auto'
+  ): Promise<void> {
     try {
       const configPath = this.getMultiCliConfigPath();
       const configDir = path.dirname(configPath);
@@ -2079,8 +2083,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 写入配置文件
       fs.writeFileSync(configPath, JSON.stringify(existingConfig, null, 2), 'utf-8');
       logger.info('界面.提示词_增强.配置.已保存', { path: configPath }, LogCategory.UI);
+      if (source === 'manual') {
+        this.postMessage({ type: 'promptEnhanceSaved', success: true });
+        this.postMessage({ type: 'toast', message: 'ACE 配置已保存', toastType: 'success' });
+      }
     } catch (error) {
       logger.error('界面.提示词_增强.配置.保存_失败', error, LogCategory.UI);
+      if (source === 'manual') {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        this.postMessage({ type: 'promptEnhanceSaved', success: false, error: errorMsg });
+        this.postMessage({ type: 'toast', message: `ACE 配置保存失败: ${errorMsg}`, toastType: 'error' });
+      }
     }
   }
 
@@ -2348,7 +2361,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       this.postMessage({
         type: 'workerConfigSaved',
-        worker: worker
+        worker: worker,
+        success: true
       });
 
       this.postMessage({
@@ -2360,6 +2374,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.info('Worker 配置已保存', { worker }, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存 Worker 配置失败', { worker, error: error.message }, LogCategory.LLM);
+      this.postMessage({
+        type: 'workerConfigSaved',
+        worker: worker,
+        success: false,
+        error: error.message
+      });
       this.postMessage({
         type: 'toast',
         message: '保存配置失败: ' + error.message,
@@ -2448,7 +2468,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
 
       this.postMessage({
-        type: 'orchestratorConfigSaved'
+        type: 'orchestratorConfigSaved',
+        success: true
       });
 
       this.postMessage({
@@ -2460,6 +2481,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.info('编排者配置已保存', undefined, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存编排者配置失败', { error: error.message }, LogCategory.LLM);
+      this.postMessage({
+        type: 'orchestratorConfigSaved',
+        success: false,
+        error: error.message
+      });
       this.postMessage({
         type: 'toast',
         message: '保存配置失败: ' + error.message,
@@ -2541,7 +2567,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       LLMConfigLoader.updateCompressorConfig(config);
 
       this.postMessage({
-        type: 'compressorConfigSaved'
+        type: 'compressorConfigSaved',
+        success: true
       });
 
       this.postMessage({
@@ -2553,6 +2580,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.info('压缩器配置已保存', undefined, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存压缩器配置失败', { error: error.message }, LogCategory.LLM);
+      this.postMessage({
+        type: 'compressorConfigSaved',
+        success: false,
+        error: error.message
+      });
       this.postMessage({
         type: 'toast',
         message: '保存配置失败: ' + error.message,
@@ -4133,6 +4165,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
 
       await storage.saveConfig(config);
+      this.postMessage({ type: 'profileConfigSaved', success: true });
       this.postMessage({ type: 'toast', message: '画像配置已保存', toastType: 'success' });
 
       try {
@@ -4145,6 +4178,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.info('界面.画像.配置.已保存', { path: ProfileStorage.getConfigDir() }, LogCategory.UI);
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
+      this.postMessage({ type: 'profileConfigSaved', success: false, error: errorMsg });
       this.postMessage({ type: 'toast', message: `保存失败: ${errorMsg}`, toastType: 'error' });
     }
   }

@@ -901,7 +901,7 @@ export class MissionDrivenEngine extends EventEmitter {
    * 设置扩展上下文
    */
   setExtensionContext(_context: import('vscode').ExtensionContext): void {
-    // 可以用于持久化统计数据
+    this.executionStats.setContext(_context);
   }
 
   /**

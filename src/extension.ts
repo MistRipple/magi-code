@@ -6,6 +6,7 @@ import { logger, LogCategory } from './logging';
 import * as vscode from 'vscode';
 import { WebviewProvider } from './ui/webview-provider';
 import { globalEventBus } from './events';
+import { registerTerminalTest } from './test/terminal-test';
 
 let webviewProvider: WebviewProvider | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
@@ -68,6 +69,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // 注册命令
   registerCommands(context);
+
+  // 注册终端测试命令
+  registerTerminalTest(context);
 
   logger.info('扩展.初始化.完成', undefined, LogCategory.SYSTEM);
 }

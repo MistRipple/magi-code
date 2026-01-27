@@ -234,7 +234,8 @@
     "test:quick": "node scripts/run-all-tests.js quick",
     "test:full": "node scripts/run-all-tests.js full",
     "test:unit": "node scripts/run-all-tests.js unit",
-    "test:e2e": "node scripts/run-all-tests.js e2e"
+    "test:e2e": "node scripts/run-all-tests.js e2e",
+    "check-ui": "bash scripts/check-ui-duplicates.sh"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",

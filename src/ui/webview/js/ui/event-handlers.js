@@ -129,14 +129,14 @@ export function getModeDisplayName(mode) {
   return map[mode] || mode || 'Auto';
 }
 
-function savePromptEnhanceConfig() {
+function savePromptEnhanceConfig(source = 'auto') {
   const urlInput = document.getElementById('prompt-enhance-url');
   const keyInput = document.getElementById('prompt-enhance-key');
   const config = {
     baseUrl: urlInput ? urlInput.value : '',
     apiKey: keyInput ? keyInput.value : ''
   };
-  postMessage({ type: 'updatePromptEnhance', config });
+  postMessage({ type: 'updatePromptEnhance', config, source });
 }
 
 export function showRepositoryManagementDialog() {
@@ -584,6 +584,11 @@ export function setWorkerConfigs(configs) {
   displayWorkerConfig(currentWorkerModel);
 }
 
+export function getWorkerConfig(worker) {
+  if (!workerConfigs) return null;
+  return workerConfigs[worker] || null;
+}
+
 function initWorkerModelConfig() {
   postMessage({ type: 'loadAllWorkerConfigs' });
 }
@@ -769,7 +774,9 @@ export function handleExecuteButtonClick() {
 // ============================================
 
 export function handlePromptInputKeydown(e) {
-  if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+  if (e.key !== 'Enter') return;
+  if (e.isComposing) return;
+  if (e.ctrlKey || e.metaKey) {
     e.preventDefault();
     handleExecuteButtonClick();
   }
@@ -1208,6 +1215,7 @@ export function initializeEventListeners() {
   const promptEnhanceKey = document.getElementById('prompt-enhance-key');
   const promptEnhanceEye = document.getElementById('prompt-enhance-eye');
   const promptEnhanceTest = document.getElementById('prompt-enhance-test');
+  const promptEnhanceSave = document.getElementById('prompt-enhance-save');
 
   if (promptEnhanceUrl && promptEnhanceKey) {
     postMessage({ type: 'getPromptEnhanceConfig' });
@@ -1236,6 +1244,15 @@ export function initializeEventListeners() {
         baseUrl: promptEnhanceUrl ? promptEnhanceUrl.value : '',
         apiKey: promptEnhanceKey ? promptEnhanceKey.value : ''
       });
+    });
+  }
+
+  if (promptEnhanceSave) {
+    promptEnhanceSave.addEventListener('click', () => {
+      if (window.__setSaveButtonState) {
+        window.__setSaveButtonState('prompt-enhance-save', 'loading');
+      }
+      savePromptEnhanceConfig('manual');
     });
   }
 
@@ -1270,6 +1287,9 @@ export function initializeEventListeners() {
   const workerSaveBtn = document.getElementById('worker-save-btn');
   if (workerSaveBtn) {
     workerSaveBtn.addEventListener('click', () => {
+      if (window.__setSaveButtonState) {
+        window.__setSaveButtonState('worker-save-btn', 'loading');
+      }
       const baseUrlInput = document.getElementById('worker-base-url');
       const apiKeyInput = document.getElementById('worker-api-key');
       const modelInput = document.getElementById('worker-model');
@@ -1316,6 +1336,9 @@ export function initializeEventListeners() {
   const orchSaveBtn = document.getElementById('orch-save-btn');
   if (orchSaveBtn) {
     orchSaveBtn.addEventListener('click', () => {
+      if (window.__setSaveButtonState) {
+        window.__setSaveButtonState('orch-save-btn', 'loading');
+      }
       const baseUrlInput = document.getElementById('orch-base-url');
       const apiKeyInput = document.getElementById('orch-api-key');
       const modelInput = document.getElementById('orch-model');
@@ -1360,6 +1383,9 @@ export function initializeEventListeners() {
   const compSaveBtn = document.getElementById('comp-save-btn');
   if (compSaveBtn) {
     compSaveBtn.addEventListener('click', () => {
+      if (window.__setSaveButtonState) {
+        window.__setSaveButtonState('comp-save-btn', 'loading');
+      }
       const baseUrlInput = document.getElementById('comp-base-url');
       const apiKeyInput = document.getElementById('comp-api-key');
       const modelInput = document.getElementById('comp-model');

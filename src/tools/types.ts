@@ -116,6 +116,10 @@ export interface ShellExecuteOptions {
   cwd?: string;
   timeout?: number;
   env?: Record<string, string>;
+  name?: string; // 终端名称（用于VSCode终端）
+  showTerminal?: boolean; // 是否显示终端窗口
+  keepTerminalOpen?: boolean; // 是否保持终端打开
+  useVSCodeTerminal?: boolean; // 是否使用VSCode终端（默认false，使用child_process）
 }
 
 /**

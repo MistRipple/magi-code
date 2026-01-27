@@ -367,6 +367,14 @@ export function exitAwaitingState() {
       updateSendButtonState();
     }
 
+export function resetInteractionState() {
+      exitAwaitingState();
+      clearLocalProcessingGrace();
+      setProcessingState(false);
+      stopStreamingHintTimer();
+      saveWebviewState();
+    }
+
 export function updateSendButtonState() {
       const btn = document.getElementById('execute-btn');
       const inputBox = document.getElementById('prompt-input');
@@ -1172,6 +1180,7 @@ export function handleClarificationAnswer(answerText, cancelled) {
         input.placeholder = '描述你的任务... (可粘贴图片)';
       }
 
+      exitAwaitingState();
       if (!cancelled) {
         setLocalProcessingGrace(15000);
         setProcessingState(true);
@@ -1196,6 +1205,7 @@ export function handleWorkerQuestionAnswer(answer, cancelled) {
         input.placeholder = '描述你的任务... (可粘贴图片)';
       }
 
+      exitAwaitingState();
       if (!cancelled) {
         setProcessingState(true);
       }
@@ -1215,6 +1225,7 @@ export function handleQuestionAnswer(answer, cancelled) {
       if (input) {
         input.placeholder = '描述你的任务... (可粘贴图片)';
       }
+      exitAwaitingState();
       saveWebviewState();
       renderMainContent();
       smoothScrollToBottom();
@@ -1225,6 +1236,7 @@ export function handlePlanConfirmation(confirmed) {
       postMessage({ type: 'confirmPlan', confirmed: confirmed });
 
       // 🔧 风险1修复：确认后立即设置处理状态
+      exitAwaitingState();
       if (confirmed) {
         setProcessingState(true);
       }
@@ -1304,6 +1316,7 @@ export function loadSessionMessages(sessionId) {
       if (!session) {
         return;
       }
+      resetInteractionState();
       const sessionMessages = Array.isArray(session.messages) ? session.messages : [];
 
       // 🔧 重要：切换会话时必须重置增量更新状态，否则 UI 不会刷新
@@ -1371,6 +1384,7 @@ export function loadSessionFromData(session) {
         return;
       }
 
+      resetInteractionState();
       const sessionMessages = Array.isArray(session.messages) ? session.messages : [];
 
       // 🔧 重要：切换会话时必须重置增量更新状态，否则 UI 不会刷新

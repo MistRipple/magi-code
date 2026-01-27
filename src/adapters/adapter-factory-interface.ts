@@ -80,4 +80,9 @@ export interface IAdapterFactory extends EventEmitter {
    * 获取适配器历史信息（可选）
    */
   getAdapterHistoryInfo?(agent: AgentType): { messages: number; chars: number } | null;
+
+  /**
+   * 获取 ToolManager（可选）
+   */
+  getToolManager?(): import('../tools/tool-manager').ToolManager;
 }

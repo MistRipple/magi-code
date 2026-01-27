@@ -3,6 +3,7 @@
 
 import { saveWebviewState } from '../core/state.js';
 import { postMessage, getProfileConfig, refreshAgentConnections, resetExecutionStats } from '../core/vscode-api.js';
+import { getWorkerConfig } from './event-handlers.js';
 
 // ============================================
 // 模型连接状态更新
@@ -48,6 +49,8 @@ export function updateModelConnectionStatus(modelStatuses) {
       item.classList.add('unavailable');
     }
 
+    updateModelConnectionModel(worker, item);
+
     // 更新状态文本（显示版本信息或错误信息）
     const statusEl = item.querySelector('.model-connection-status');
     if (statusEl) {
@@ -83,6 +86,38 @@ export function updateModelConnectionStatus(modelStatuses) {
   });
 }
 
+export function updateModelConnectionModels() {
+  ['claude', 'codex', 'gemini', 'orchestrator', 'compressor'].forEach(worker => {
+    const item = document.querySelector(`.model-connection-item[data-worker="${worker}"]`);
+    if (!item) return;
+    updateModelConnectionModel(worker, item);
+  });
+}
+
+function updateModelConnectionModel(worker, item) {
+  const modelEl = item.querySelector('.model-connection-model');
+  if (!modelEl) return;
+
+  let modelName = '';
+  if (worker === 'orchestrator') {
+    const input = document.getElementById('orch-model');
+    modelName = input ? input.value.trim() : '';
+  } else if (worker === 'compressor') {
+    const input = document.getElementById('comp-model');
+    modelName = input ? input.value.trim() : '';
+  } else {
+    const config = getWorkerConfig(worker);
+    modelName = config && config.model ? String(config.model).trim() : '';
+  }
+
+  modelEl.textContent = modelName || '未配置';
+  if (modelName) {
+    modelEl.title = modelName;
+  } else {
+    modelEl.removeAttribute('title');
+  }
+}
+
 // ============================================
 // 执行统计更新
 // ============================================
@@ -96,75 +131,81 @@ function formatTokenCount(count) {
 
 export function updateExecutionStats(stats, orchestratorStats, modelCatalog) {
   if (!stats || !Array.isArray(stats)) return;
-
-  // 更新编排者统计
-  if (orchestratorStats) {
-    const totalTasksEl = document.getElementById('orch-total-tasks');
-    const successEl = document.getElementById('orch-success');
-    const failedEl = document.getElementById('orch-failed');
-    const inputTokensEl = document.getElementById('orch-input-tokens');
-    const outputTokensEl = document.getElementById('orch-output-tokens');
-    if (totalTasksEl) totalTasksEl.textContent = orchestratorStats.totalTasks || 0;
-    if (successEl) successEl.textContent = orchestratorStats.totalSuccess || 0;
-    if (failedEl) failedEl.textContent = orchestratorStats.totalFailed || 0;
-    if (inputTokensEl) inputTokensEl.textContent = formatTokenCount(orchestratorStats.totalInputTokens || 0);
-    if (outputTokensEl) outputTokensEl.textContent = formatTokenCount(orchestratorStats.totalOutputTokens || 0);
-  }
-
-  renderModelStatsGrid(stats, modelCatalog);
+  renderModelConnectionStats(stats);
+  updateTotalTokensSummary(stats);
 }
 
-function renderModelStatsGrid(stats, modelCatalog) {
-  const grid = document.getElementById('model-stats-grid');
-  if (!grid) return;
-
+function renderModelConnectionStats(stats) {
   const statsMap = new Map();
   stats.forEach(stat => {
     statsMap.set(stat.worker, stat);
   });
 
-  const entries = Array.isArray(modelCatalog) && modelCatalog.length > 0
-    ? modelCatalog
-    : stats.map(stat => ({ id: stat.worker, label: String(stat.worker) }));
+  ['claude', 'codex', 'gemini', 'orchestrator', 'compressor'].forEach(worker => {
+    const item = document.querySelector(`.model-connection-item[data-worker="${worker}"]`);
+    if (!item) return;
 
-  const html = entries.map(entry => {
-    const stat = statsMap.get(entry.id) || {
-      totalExecutions: 0,
-      successCount: 0,
-      failureCount: 0,
-      successRate: 0,
-      avgDuration: 0,
-      isHealthy: true,
-      totalInputTokens: 0,
-      totalOutputTokens: 0
-    };
+    const stat = statsMap.get(worker);
+    const totalExecutions = stat?.totalExecutions || 0;
+    const successRate = stat?.successRate || 0;
+    const totalInputTokens = stat?.totalInputTokens || 0;
+    const totalOutputTokens = stat?.totalOutputTokens || 0;
 
-    const rateValue = stat.totalExecutions > 0 ? Math.round(stat.successRate * 100) : null;
-    const rateText = rateValue === null ? '--' : `${rateValue}%`;
-    const rateClass = rateValue === null
-      ? ''
-      : rateValue >= 80 ? ' good' : rateValue >= 60 ? ' warning' : ' bad';
-    const avgTime = stat.avgDuration > 0 ? Math.round(stat.avgDuration / 1000) + 's' : '-';
-    const inputTokens = formatTokenCount(stat.totalInputTokens || 0);
-    const outputTokens = formatTokenCount(stat.totalOutputTokens || 0);
-    const barRate = stat.totalExecutions > 0 ? stat.successRate * 100 : 0;
-    const barClass = barRate >= 80 ? ' good' : barRate >= 60 ? ' warning' : ' bad';
-    const healthClass = stat.isHealthy ? ' healthy' : ' unhealthy';
-    const disabledClass = entry.enabled === false ? ' disabled' : '';
-    const title = entry.model ? ` title="${entry.model}"` : '';
+    const executionsEl = item.querySelector('[data-stat="executions"]');
+    if (executionsEl) {
+      executionsEl.textContent = `${totalExecutions}次`;
+    }
 
-    return `
-      <div class="model-stat-card${healthClass}${disabledClass}" data-worker="${entry.id}">
-        <div class="model-stat-name"${title}><span class="health-dot${healthClass}"></span>${entry.label}</div>
-        <div class="model-stat-rate${rateClass}">成功率 ${rateText}</div>
-        <div class="model-stat-detail">${stat.totalExecutions}次 · 平均${avgTime}</div>
-        <div class="model-stat-tokens">In ${inputTokens} · Out ${outputTokens}</div>
-        <div class="model-stat-bar"><div class="model-stat-bar-fill${barClass}" style="width: ${barRate}%"></div></div>
-      </div>
-    `;
-  }).join('');
+    const successRateEl = item.querySelector('[data-stat="success-rate"]');
+    if (successRateEl) {
+      successRateEl.textContent = `${Math.round(successRate * 100)}%`;
+    }
 
-  grid.innerHTML = html;
+    const tokensEl = item.querySelector('[data-stat="tokens"]');
+    if (tokensEl) {
+      tokensEl.textContent = `In ${formatTokenCount(totalInputTokens)} · Out ${formatTokenCount(totalOutputTokens)}`;
+    }
+  });
+}
+
+function updateTotalTokensSummary(stats) {
+  const totalEl = document.getElementById('stats-total-tokens');
+  if (!totalEl) return;
+
+  let totalInput = 0;
+  let totalOutput = 0;
+  stats.forEach(stat => {
+    totalInput += stat.totalInputTokens || 0;
+    totalOutput += stat.totalOutputTokens || 0;
+  });
+
+  totalEl.textContent = `总 Token In ${formatTokenCount(totalInput)} · Out ${formatTokenCount(totalOutput)}`;
+}
+
+// ============================================
+// 模型配置 Tab
+// ============================================
+
+let modelConfigTabsInitialized = false;
+
+function initModelConfigTabs() {
+  if (modelConfigTabsInitialized) return;
+  modelConfigTabsInitialized = true;
+
+  const tabs = document.querySelectorAll('.model-config-tab');
+  const panels = document.querySelectorAll('.model-config-panel');
+  if (!tabs.length || !panels.length) return;
+
+  tabs.forEach((tab) => {
+    tab.addEventListener('click', () => {
+      const target = tab.dataset.modelTab;
+      if (!target) return;
+      tabs.forEach((t) => t.classList.toggle('active', t === tab));
+      panels.forEach((panel) => {
+        panel.classList.toggle('active', panel.dataset.modelPanel === target);
+      });
+    });
+  });
 }
 
 // ============================================
@@ -336,6 +377,9 @@ function initProfileUI() {
   const saveBtn = document.getElementById('profile-save-btn');
   if (saveBtn) {
     saveBtn.addEventListener('click', () => {
+      if (window.__setSaveButtonState) {
+        window.__setSaveButtonState('profile-save-btn', 'loading');
+      }
       postMessage({
         type: 'saveProfileConfig',
         data: {
@@ -391,6 +435,7 @@ export function updateProfileConfig(config) {
 // ============================================
 
 export function initializeSettingsPanel() {
+  initModelConfigTabs();
   initProfileUI();
 
   // 请求模型连接状态
