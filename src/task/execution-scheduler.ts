@@ -230,6 +230,7 @@ export class ExecutionScheduler extends EventEmitter {
       'timeout', '超时', 'ETIMEDOUT', 'ECONNRESET',
       'rate limit', '限流', 'overloaded', '过载',
       'temporary', '临时', 'retry', '重试',
+      'connect', 'connection', 'not connected', 'not initialized', 'network'
     ];
     const lowerError = error.toLowerCase();
     return retryableErrors.some(e => lowerError.includes(e.toLowerCase()));

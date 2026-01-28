@@ -48,6 +48,13 @@ interface MessageState {
   completed: boolean;
 }
 
+/** 内容去重记录 */
+interface ContentDedupeRecord {
+  messageId: string;
+  contentHash: string;
+  timestamp: number;
+}
+
 /** 处理状态 */
 export interface ProcessingState {
   isProcessing: boolean;
@@ -90,11 +97,15 @@ export class UnifiedMessageBus extends EventEmitter {
   private processingState: ProcessingState = {
     isProcessing: false,
     source: null,
-    agent: null,  // ✅ 使用 agent
+    agent: null,
     startedAt: null,
   };
   private activeMessageIds: Set<string> = new Set();
   private cleanupTimer: NodeJS.Timeout | null = null;
+
+  // 🔧 新增：基于内容的去重记录（用于检测不同ID但内容相同的消息）
+  private contentDedupeRecords: ContentDedupeRecord[] = [];
+  private readonly CONTENT_DEDUPE_WINDOW_MS = 30000; // 30秒窗口
 
   constructor(config?: Partial<MessageBusConfig>) {
     super();
@@ -108,6 +119,7 @@ export class UnifiedMessageBus extends EventEmitter {
 
   /**
    * 发送标准消息（唯一入口）
+   * 🔧 增强：支持基于内容的去重，防止不同ID但内容相同的消息重复发送
    */
   sendMessage(message: StandardMessage): boolean {
     if (!this.config.enabled) {
@@ -119,10 +131,27 @@ export class UnifiedMessageBus extends EventEmitter {
     const now = Date.now();
     const existingState = this.messageStates.get(id);
 
+    // 🔧 新增：对于非流式消息，检查内容重复
+    // 状态消息(isStatusMessage)和进度消息(PROGRESS)不参与内容去重
+    const isStatusMessage = message.metadata?.isStatusMessage === true;
+    const isProgressMessage = message.type === 'progress';
+
+    if (!isStatusMessage && !isProgressMessage && lifecycle !== MessageLifecycle.STARTED && lifecycle !== MessageLifecycle.STREAMING) {
+      const contentHash = this.computeContentHash(message);
+      if (contentHash && this.isDuplicateContent(contentHash, message.source, now)) {
+        this.debug('跳过消息 [CONTENT_DUPLICATE]', id);
+        return false;
+      }
+      // 记录内容哈希
+      if (contentHash) {
+        this.recordContentHash(id, contentHash, now);
+      }
+    }
+
     // 1. STARTED 消息：总是发送
     if (lifecycle === MessageLifecycle.STARTED) {
       this.recordMessage(message, now);
-      this.updateProcessingState(true, message.source, message.agent);  // ✅ 使用 agent
+      this.updateProcessingState(true, message.source, message.agent);
       this.emit('message', message);
       this.debug('发送消息 [STARTED]', id);
       return true;
@@ -132,7 +161,7 @@ export class UnifiedMessageBus extends EventEmitter {
     if (!existingState) {
       this.recordMessage(message, now);
       if (lifecycle === MessageLifecycle.STREAMING) {
-        this.updateProcessingState(true, message.source, message.agent);  // ✅ 使用 agent
+        this.updateProcessingState(true, message.source, message.agent);
       }
       this.emit('message', message);
       this.debug('发送消息 [NEW]', id);
@@ -295,6 +324,8 @@ export class UnifiedMessageBus extends EventEmitter {
           this.messageStates.delete(id);
         }
       }
+      // 🔧 清理过期的内容去重记录
+      this.cleanupContentDedupeRecords(now);
     }, 60 * 1000);
   }
 
@@ -302,6 +333,84 @@ export class UnifiedMessageBus extends EventEmitter {
     if (this.config.debug) {
       logger.debug('消息总线.' + action, { messageId }, LogCategory.SYSTEM);
     }
+  }
+
+  // ==========================================================================
+  // 🔧 内容去重辅助方法
+  // ==========================================================================
+
+  /**
+   * 计算消息内容的哈希值
+   * 用于检测不同ID但内容相同的消息
+   */
+  private computeContentHash(message: StandardMessage): string | null {
+    // 提取所有文本内容
+    const textParts: string[] = [];
+    for (const block of message.blocks || []) {
+      if (block.type === 'text' && block.content) {
+        textParts.push(block.content);
+      }
+    }
+
+    if (textParts.length === 0) {
+      return null; // 无文本内容，不参与去重
+    }
+
+    // 规范化内容：去除空白、转小写
+    const normalized = textParts
+      .join(' ')
+      .replace(/#{1,6}\s*/g, '') // 移除 markdown 标题符号
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+
+    if (normalized.length < 10) {
+      return null; // 内容太短，不参与去重
+    }
+
+    // 简单哈希：取前100字符 + 长度 + 来源
+    return `${message.source}:${normalized.slice(0, 100)}:${normalized.length}`;
+  }
+
+  /**
+   * 检查是否存在重复内容
+   */
+  private isDuplicateContent(contentHash: string, source: MessageSource, now: number): boolean {
+    const windowStart = now - this.CONTENT_DEDUPE_WINDOW_MS;
+
+    for (const record of this.contentDedupeRecords) {
+      if (record.timestamp >= windowStart && record.contentHash === contentHash) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * 记录内容哈希
+   */
+  private recordContentHash(messageId: string, contentHash: string, timestamp: number): void {
+    this.contentDedupeRecords.push({
+      messageId,
+      contentHash,
+      timestamp,
+    });
+
+    // 限制记录数量
+    if (this.contentDedupeRecords.length > 100) {
+      this.contentDedupeRecords = this.contentDedupeRecords.slice(-50);
+    }
+  }
+
+  /**
+   * 清理过期的内容去重记录
+   */
+  private cleanupContentDedupeRecords(now: number): void {
+    const windowStart = now - this.CONTENT_DEDUPE_WINDOW_MS;
+    this.contentDedupeRecords = this.contentDedupeRecords.filter(
+      record => record.timestamp >= windowStart
+    );
   }
 
   // 类型安全的事件方法

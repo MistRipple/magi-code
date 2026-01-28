@@ -1,0 +1,752 @@
+/**
+ * 特殊内容面板样式
+ * 参考 Claude Code VSCode 插件的设计和现代AI插件
+ *
+ * 设计原则：
+ * - 明显的卡片形式，清晰的边界和层次
+ * - 丰富的背景和阴影效果，增强立体感
+ * - 清晰的状态指示和视觉反馈
+ * - 优雅的动画过渡
+ */
+
+/* ========================================
+   通用面板基础样式 - 现代卡片设计
+   ======================================== */
+
+.panel {
+  margin: 16px 0;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3),
+              0 2px 6px rgba(0, 0, 0, 0.2);
+  overflow: hidden;
+  transition: all 0.2s ease;
+  position: relative;
+  /* 🔧 修复：确保面板占满父容器宽度，防止 flexbox shrink 导致宽度过小 */
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.panel::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.15),
+    transparent
+  );
+  pointer-events: none;
+}
+
+.panel:hover {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4),
+              0 4px 12px rgba(0, 0, 0, 0.25);
+  border-color: rgba(255, 255, 255, 0.25);
+  transform: translateY(-2px);
+}
+
+/* 面板头部 */
+.panel__header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0.10),
+    rgba(255, 255, 255, 0.05)
+  );
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.15s ease;
+  min-width: 0;  /* 🔧 修复：防止 flexbox 子元素溢出 */
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.panel__header:hover {
+  background: rgba(255, 255, 255, 0.10);
+}
+
+/* 面板图标 */
+.panel__icon {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--ds-radius-2);
+  padding: 3px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+}
+
+.panel__icon svg {
+  width: 100%;
+  height: 100%;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.2));
+}
+
+/* 面板标题 */
+.panel__title {
+  flex: 1;
+  min-width: 0;  /* 🔧 修复：防止文本溢出导致布局问题 */
+  font-size: var(--ds-font-size-2);
+  font-weight: 600;
+  color: var(--ds-color-text-primary);
+  display: flex;
+  align-items: center;
+  gap: var(--ds-spacing-2);
+  overflow: hidden;  /* 🔧 修复：溢出时隐藏 */
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 面板徽章 */
+.panel__badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: var(--ds-radius-2);
+  font-size: var(--ds-font-size-0);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+}
+
+/* 面板内容 */
+.panel__content {
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.15);
+  animation: panelContentSlideIn 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@keyframes panelContentSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* 面板折叠指示器 */
+.panel__chevron {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  color: var(--ds-color-text-tertiary);
+}
+
+/* 注意：折叠箭头的旋转由 panel--collapsed 类控制，见文件底部的统一规则 */
+
+/* ========================================
+   思考面板 (Thinking Panel)
+   ======================================== */
+
+.panel--thinking {
+  border: 1px solid rgba(139, 92, 246, 0.3);
+  border-left: 3px solid var(--ds-color-purple-9);
+  background: linear-gradient(
+    135deg,
+    rgba(139, 92, 246, 0.05) 0%,
+    transparent 100%
+  );
+  box-shadow: 0 1px 3px rgba(139, 92, 246, 0.1);
+}
+
+.panel--thinking .panel__icon {
+  background: linear-gradient(135deg, #8b5cf6, #a78bfa);
+  color: white;
+  box-shadow: 0 2px 4px rgba(139, 92, 246, 0.3);
+}
+
+.panel--thinking .panel__badge {
+  background: rgba(139, 92, 246, 0.15);
+  color: #8b5cf6;
+  border: 1px solid rgba(139, 92, 246, 0.3);
+}
+
+.panel--thinking.panel--streaming {
+  border-left-color: #a78bfa;
+  animation: thinkingPulse 2s ease-in-out infinite;
+}
+
+@keyframes thinkingPulse {
+  0%, 100% {
+    border-left-color: #8b5cf6;
+    box-shadow: 0 2px 8px rgba(139, 92, 246, 0.15),
+                0 1px 4px rgba(139, 92, 246, 0.1);
+  }
+  50% {
+    border-left-color: #a78bfa;
+    box-shadow: 0 4px 16px rgba(139, 92, 246, 0.25),
+                0 2px 8px rgba(139, 92, 246, 0.15);
+  }
+}
+
+/* 思考内容样式 */
+.panel--thinking .panel__content {
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: var(--ds-font-size-1);
+  line-height: 1.6;
+  color: var(--ds-color-text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ========================================
+   工具调用面板 (Tool Call Panel)
+   ======================================== */
+
+.panel--tool {
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  border-left: 3px solid var(--ds-color-blue-9);
+  background: linear-gradient(
+    135deg,
+    rgba(59, 130, 246, 0.03) 0%,
+    transparent 100%
+  );
+  box-shadow: 0 1px 3px rgba(59, 130, 246, 0.1);
+}
+
+.panel--tool .panel__icon {
+  background: linear-gradient(135deg, #3b82f6, #60a5fa);
+  color: white;
+  box-shadow: 0 2px 4px rgba(59, 130, 246, 0.3);
+}
+
+/* 工具调用状态 */
+.panel--tool.panel--running {
+  border-left-color: #60a5fa;
+  animation: toolPulse 1.5s ease-in-out infinite;
+}
+
+.panel--tool.panel--success {
+  border-left-color: #10b981;
+  border-color: rgba(16, 185, 129, 0.3);
+}
+
+.panel--tool.panel--error {
+  border-left-color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.3);
+  background: linear-gradient(
+    135deg,
+    rgba(239, 68, 68, 0.05) 0%,
+    transparent 100%
+  );
+}
+
+@keyframes toolPulse {
+  0%, 100% {
+    box-shadow: 0 2px 8px rgba(59, 130, 246, 0.15),
+                0 1px 4px rgba(59, 130, 246, 0.1);
+  }
+  50% {
+    box-shadow: 0 4px 16px rgba(59, 130, 246, 0.25),
+                0 2px 8px rgba(59, 130, 246, 0.15);
+  }
+}
+
+/* 工具调用状态指示器 */
+.panel--tool .panel__status {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-right: 4px;
+}
+
+.panel--tool.panel--running .panel__status {
+  background: #60a5fa;
+  box-shadow: 0 0 8px rgba(96, 165, 250, 0.6);
+  animation: statusPulse 1.5s ease-in-out infinite;
+}
+
+.panel--tool.panel--success .panel__status {
+  background: #10b981;
+}
+
+.panel--tool.panel--error .panel__status {
+  background: #ef4444;
+}
+
+@keyframes statusPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(1.2); }
+}
+
+/* 工具调用内容区域 */
+.tool-section {
+  margin-top: var(--ds-spacing-3);
+}
+
+.tool-section:first-child {
+  margin-top: 0;
+}
+
+.tool-section__label {
+  font-size: var(--ds-font-size-0);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--ds-color-text-tertiary);
+  margin-bottom: var(--ds-spacing-1_5);
+  display: flex;
+  align-items: center;
+  gap: var(--ds-spacing-1);
+}
+
+.tool-section__content {
+  padding: var(--ds-spacing-2_5);
+  background: var(--ds-color-neutral-2);
+  border: 1px solid var(--ds-color-neutral-4);
+  border-radius: var(--ds-radius-2);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: var(--ds-font-size-1);
+  line-height: 1.5;
+  color: var(--ds-color-text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.tool-section__content::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.tool-section__content::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.tool-section__content::-webkit-scrollbar-thumb {
+  background: var(--ds-color-neutral-6);
+  border-radius: 3px;
+}
+
+.tool-section__content::-webkit-scrollbar-thumb:hover {
+  background: var(--ds-color-neutral-7);
+}
+
+/* 工具调用错误样式 */
+.tool-section--error {
+  border-left: 2px solid #ef4444;
+  padding-left: var(--ds-spacing-2);
+}
+
+.tool-section--error .tool-section__label {
+  color: #ef4444;
+}
+
+.tool-section--error .tool-section__content {
+  background: rgba(239, 68, 68, 0.05);
+  border-color: rgba(239, 68, 68, 0.3);
+}
+
+/* 工具调用元信息 */
+.tool-meta {
+  margin-top: var(--ds-spacing-3);
+  padding-top: var(--ds-spacing-3);
+  border-top: 1px solid var(--ds-color-neutral-4);
+  display: flex;
+  gap: var(--ds-spacing-4);
+  font-size: var(--ds-font-size-1);
+  color: var(--ds-color-text-tertiary);
+}
+
+/* ========================================
+   错误/警告/信息面板
+   ======================================== */
+
+.panel--error {
+  border-left: 3px solid #ef4444;
+  background: linear-gradient(
+    135deg,
+    rgba(239, 68, 68, 0.05) 0%,
+    transparent 100%
+  );
+}
+
+.panel--error .panel__icon {
+  background: linear-gradient(135deg, #ef4444, #f87171);
+  color: white;
+}
+
+.panel--warning {
+  border-left: 3px solid #f59e0b;
+  background: linear-gradient(
+    135deg,
+    rgba(245, 158, 11, 0.05) 0%,
+    transparent 100%
+  );
+}
+
+.panel--warning .panel__icon {
+  background: linear-gradient(135deg, #f59e0b, #fbbf24);
+  color: white;
+}
+
+.panel--info {
+  border-left: 3px solid #06b6d4;
+  background: linear-gradient(
+    135deg,
+    rgba(6, 182, 212, 0.05) 0%,
+    transparent 100%
+  );
+}
+
+.panel--info .panel__icon {
+  background: linear-gradient(135deg, #06b6d4, #22d3ee);
+  color: white;
+}
+
+.panel--success {
+  border-left: 3px solid #10b981;
+  background: linear-gradient(
+    135deg,
+    rgba(16, 185, 129, 0.05) 0%,
+    transparent 100%
+  );
+}
+
+.panel--success .panel__icon {
+  background: linear-gradient(135deg, #10b981, #34d399);
+  color: white;
+}
+
+/* ========================================
+   代码块面板增强
+   ======================================== */
+
+.panel--code {
+  border: 1px solid rgba(107, 114, 128, 0.4);
+  border-left: 4px solid #6b7280;
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.panel--code .panel__header {
+  background: linear-gradient(
+    to bottom,
+    rgba(107, 114, 128, 0.15),
+    rgba(107, 114, 128, 0.08)
+  );
+  border-bottom: 1px solid rgba(107, 114, 128, 0.3);
+  padding: 10px 16px;
+}
+
+.panel--code .panel__icon {
+  background: linear-gradient(135deg, #6b7280, #9ca3af);
+  color: white;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+/* 代码块操作按钮增强 */
+.code-actions {
+  display: flex;
+  gap: var(--ds-spacing-1_5);
+  margin-left: auto;
+}
+
+.code-action {
+  display: flex;
+  align-items: center;
+  gap: var(--ds-spacing-1);
+  padding: 4px 10px;
+  border-radius: var(--ds-radius-2);
+  font-size: var(--ds-font-size-1);
+  font-weight: 500;
+  color: var(--ds-color-text-secondary);
+  background: transparent;
+  border: 1px solid var(--ds-color-neutral-5);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.code-action:hover {
+  background: var(--ds-color-neutral-4);
+  border-color: var(--ds-color-neutral-7);
+  color: var(--ds-color-text-primary);
+  transform: translateY(-1px);
+}
+
+.code-action:active {
+  transform: translateY(0);
+}
+
+.code-action--success {
+  color: #10b981;
+  border-color: #10b981;
+  background: rgba(16, 185, 129, 0.1);
+}
+
+.code-action__icon {
+  width: 14px;
+  height: 14px;
+}
+
+/* 代码内容样式 */
+.code-pre {
+  margin: 0;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  border-radius: 0;
+  overflow-x: auto;
+  font-family: var(--vscode-editor-font-family, 'Courier New', monospace);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.code-content {
+  display: block;
+  color: var(--vscode-editor-foreground, #d4d4d4);
+  white-space: pre;
+  word-wrap: normal;
+}
+
+/* 行号支持 */
+.code-with-line-numbers {
+  display: flex;
+  width: 100%;
+}
+
+.code-line-numbers {
+  padding: var(--ds-spacing-3) var(--ds-spacing-2);
+  background: rgba(0, 0, 0, 0.2);
+  border-right: 1px solid var(--ds-color-neutral-4);
+  user-select: none;
+  text-align: right;
+  font-family: var(--vscode-editor-font-family, 'Courier New', monospace);
+  font-size: var(--ds-font-size-2);
+  line-height: 1.6;
+  color: var(--ds-color-text-tertiary);
+}
+
+.code-line-number {
+  display: block;
+}
+
+.code-with-line-numbers .code-pre {
+  flex: 1;
+  padding-left: var(--ds-spacing-3);
+}
+
+/* 展开折叠按钮 */
+.code-expand-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--ds-spacing-1);
+  padding: var(--ds-spacing-2);
+  background: var(--ds-color-neutral-2);
+  border-top: 1px solid var(--ds-color-neutral-4);
+  cursor: pointer;
+  font-size: var(--ds-font-size-1);
+  color: var(--ds-color-text-secondary);
+  transition: all 0.15s ease;
+}
+
+.code-expand-btn:hover {
+  background: var(--ds-color-neutral-3);
+  color: var(--ds-color-text-primary);
+}
+
+.code-expand-btn svg {
+  transition: transform 0.2s ease;
+}
+
+.panel--collapsed .code-expand-btn svg {
+  transform: rotate(0deg);
+}
+
+/* 折叠状态下隐藏内容和摘要显示 */
+.panel--collapsed .panel__content {
+  display: none;
+}
+
+.panel--collapsed .panel__summary {
+  display: inline;
+}
+
+/* 展开状态下隐藏摘要 */
+.panel:not(.panel--collapsed) .panel__summary {
+  display: none;
+}
+
+/* 折叠箭头旋转 */
+.panel--collapsed .panel__chevron {
+  transform: rotate(0deg);
+}
+
+.panel:not(.panel--collapsed) .panel__chevron {
+  transform: rotate(90deg);
+}
+
+/* 内联代码 */
+.c-code-inline {
+  padding: 2px 6px;
+  background: var(--ds-color-neutral-3);
+  border-radius: var(--ds-radius-1);
+  font-family: var(--vscode-editor-font-family, 'Courier New', monospace);
+  font-size: 0.9em;
+  color: var(--ds-color-accent-9);
+}
+
+/* ========================================
+   Plan面板
+   ======================================== */
+
+.panel--plan {
+  border-left: 3px solid #8b5cf6;
+}
+
+.panel--plan .panel__icon {
+  background: linear-gradient(135deg, #8b5cf6, #a78bfa);
+  color: white;
+}
+
+.plan-section {
+  margin-top: var(--ds-spacing-3);
+  padding: var(--ds-spacing-3);
+  background: var(--ds-color-neutral-2);
+  border-radius: var(--ds-radius-2);
+  border-left: 2px solid var(--ds-color-neutral-6);
+}
+
+.plan-section__title {
+  font-size: var(--ds-font-size-2);
+  font-weight: 600;
+  color: var(--ds-color-text-primary);
+  margin-bottom: var(--ds-spacing-2);
+  display: flex;
+  align-items: center;
+  gap: var(--ds-spacing-1_5);
+}
+
+.plan-section__title svg {
+  width: 16px;
+  height: 16px;
+  color: #8b5cf6;
+}
+
+.plan-section__content {
+  font-size: var(--ds-font-size-1);
+  line-height: 1.6;
+  color: var(--ds-color-text-secondary);
+}
+
+.plan-list {
+  list-style: none;
+  padding: 0;
+  margin: var(--ds-spacing-2) 0 0 0;
+}
+
+.plan-list li {
+  padding: var(--ds-spacing-1_5) 0;
+  padding-left: var(--ds-spacing-3);
+  position: relative;
+}
+
+.plan-list li::before {
+  content: '•';
+  position: absolute;
+  left: 0;
+  color: #8b5cf6;
+  font-weight: bold;
+  font-size: 1.2em;
+}
+
+/* ========================================
+   响应式适配
+   ======================================== */
+
+@media (max-width: 768px) {
+  .panel {
+    margin: var(--ds-spacing-2) 0;
+    border-radius: var(--ds-radius-2);
+  }
+
+  .panel__header,
+  .panel__content {
+    padding: var(--ds-spacing-2);
+  }
+
+  .tool-section__content {
+    max-height: 300px;
+  }
+
+  .code-actions {
+    flex-direction: column;
+    width: 100%;
+  }
+
+  .code-action {
+    width: 100%;
+    justify-content: center;
+  }
+}
+
+/* ========================================
+   暗色主题优化
+   ======================================== */
+
+@media (prefers-color-scheme: dark) {
+  .panel {
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3),
+                0 1px 6px rgba(0, 0, 0, 0.2);
+  }
+
+  .panel:hover {
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4),
+                0 2px 10px rgba(0, 0, 0, 0.3);
+  }
+
+  .panel--thinking {
+    background: linear-gradient(
+      135deg,
+      rgba(139, 92, 246, 0.08) 0%,
+      transparent 100%
+    );
+  }
+
+  .panel--tool.panel--error {
+    background: linear-gradient(
+      135deg,
+      rgba(239, 68, 68, 0.08) 0%,
+      transparent 100%
+    );
+  }
+}
+
+/* ========================================
+   打印样式
+   ======================================== */
+
+@media print {
+  .panel {
+    box-shadow: none;
+    border: 1px solid #000;
+    page-break-inside: avoid;
+  }
+
+  .panel__chevron,
+  .code-actions {
+    display: none !important;
+  }
+}

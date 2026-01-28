@@ -19,6 +19,7 @@ import {
   WorkerStatus,
   WorkerSlot,
 } from '../types';
+import { AgentType } from '../types/agent-types';
 import {
   StandardMessage,
   StreamUpdate,
@@ -116,6 +117,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   // 当前选择的 Worker（null 表示自动选择/智能编排）
   private selectedWorker: WorkerSlot | null = null;
+  private pendingRequestId: string | null = null;
+  private recentRequestIds: Map<string, number> = new Map();
+
+  // 模型连接状态缓存（避免频繁真实请求）
+  private workerStatusCache: Record<string, { status: string; model?: string; error?: string }> | null = null;
+  private workerStatusCacheAt = 0;
+  private workerStatusInFlight: Promise<void> | null = null;
+  private readonly workerStatusCacheTtlMs = 30000;
+  private readonly workerStatusSoftTtlMs = 120000;
+  private readonly workerStatusTimeoutMs = 4000;
+  private readonly workerStatusHardTimeoutMs = 10000;
 
 
   private activeSessionId: string | null = null;
@@ -752,7 +764,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     globalEventBus.on('task:state_changed', () => this.sendStateUpdate());
     globalEventBus.on('task:started', (event) => {
       this.sendStateUpdate();
-     
+
       this.postMessage({
         type: 'phaseChanged',
         phase: 'started',
@@ -1047,6 +1059,24 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // ============= Mission-Driven 架构事件 =============
     // 这些事件来自 MissionOrchestrator 和 MissionExecutor
     this.bindMissionEvents();
+  }
+
+  private shouldProcessRequest(requestId?: string | null): boolean {
+    if (!requestId) return true;
+    const now = Date.now();
+    const lastSeen = this.recentRequestIds.get(requestId);
+    if (lastSeen && now - lastSeen < 30000) {
+      return false;
+    }
+    this.recentRequestIds.set(requestId, now);
+    if (this.recentRequestIds.size > 200) {
+      for (const [key, ts] of this.recentRequestIds) {
+        if (now - ts > 60000) {
+          this.recentRequestIds.delete(key);
+        }
+      }
+    }
+    return true;
   }
 
   /**
@@ -1346,8 +1376,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     const taskManager = await this.getTaskManager();
     const tasks = await taskManager.getAllTasks();
-    const runningTask = tasks.find(t => t.status === 'running');
-    const hasRunningTask = runningTask || this.intelligentOrchestrator.running;
+    const runningTasks = tasks.filter(t => t.status === 'running');
+    const hasRunningTask = runningTasks.length > 0 || this.intelligentOrchestrator.running;
 
 
     // 1. 首先中断 Orchestrator（这会触发 AbortController）
@@ -1377,12 +1407,16 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
 
     // 3. 更新任务状态
-    if (runningTask) {
-      await taskManager.cancelTask(runningTask.id);
+    if (runningTasks.length > 0) {
+      for (const task of runningTasks) {
+        await taskManager.cancelTask(task.id);
+      }
     }
 
     // 清理编排者流式输出缓存，避免跨任务串流
     this.streamMessageIds.clear();
+    // 强制清理消息总线处理状态，避免前端残留“处理中”
+    this.messageBus.forceProcessingState(false);
 
 
     if (hasRunningTask && !options?.silent) {
@@ -1412,6 +1446,16 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
    * 发送编排器标准消息（非流式）
    * 用于发送进度更新、子任务摘要、错误等消息
    */
+  /**
+   * 发送编排器标准消息
+   * 🔧 重构：所有消息通过 MessageBus 发送，确保统一的去重和状态管理
+   *
+   * 消息类型说明：
+   * - progress: 进度提示（如"正在分析..."），使用 PROGRESS 类型
+   * - error: 错误消息，使用 ERROR 类型
+   * - result: 结果消息（通常不应手动发送，LLM响应已通过流式传输）
+   * - text: 普通文本消息
+   */
   private sendOrchestratorMessage(params: {
     content?: string;
     messageType: 'progress' | 'error' | 'result' | 'text';
@@ -1426,6 +1470,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     if (messageType === 'progress') {
       type = MessageType.PROGRESS;
+      lifecycle = MessageLifecycle.STREAMING; // 进度消息标记为流式状态
     } else if (messageType === 'error') {
       type = MessageType.ERROR;
       lifecycle = MessageLifecycle.FAILED;
@@ -1438,23 +1483,21 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       traceId: this.activeSessionId || 'default',
       type,
       source: 'orchestrator',
-      agent: 'orchestrator',  // ✅ 使用 agent
+      agent: 'orchestrator',
       timestamp: Date.now(),
       updatedAt: Date.now(),
       blocks: Array.isArray(blocks) ? blocks : (content ? [{ type: 'text', content, isMarkdown: false }] : []),
       lifecycle,
       metadata: {
         taskId,
+        isStatusMessage: true, // 标记为状态消息，区别于 LLM 对话响应
         ...metadata,
       },
     };
 
-    this.postMessage({
-      type: 'standardMessage',
-      message: standardMessage,
-      sessionId: this.activeSessionId,
-    } as any);
-    this.logMessageFlow('standardMessage', standardMessage);
+    // 🔧 通过 MessageBus 发送，统一消息流
+    this.messageBus.sendMessage(standardMessage);
+    this.logMessageFlow('orchestratorMessage via MessageBus', standardMessage);
   }
 
   /** 实现 WebviewViewProvider 接口 */
@@ -1479,6 +1522,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       undefined,
       this.context.subscriptions
     );
+
+    // Webview 初始化时强制中断可能残留的任务，避免重启后状态错乱
+    void this.interruptCurrentTask({ silent: true });
 
     // 启动时检测所有 Agent 的可用性
     this.checkWorkerAvailability();
@@ -1546,13 +1592,34 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         logger.info('界面.任务.执行.请求', { promptLength: String((message as any).prompt || '').length, imageCount: (message as any).images?.length || 0, agent: (message as any).agent || 'orchestrator' }, LogCategory.UI);
         const execImages = (message as any).images || [];
         const execAgent = (message as any).agent as WorkerSlot | undefined;
-        await this.executeTask((message as any).prompt, execAgent || undefined, execImages);
+        this.postMessage({
+          type: 'messageReceived',
+          requestId: (message as any).requestId,
+          sessionId: this.activeSessionId
+        } as any);
+        if (!this.shouldProcessRequest((message as any).requestId)) {
+          break;
+        }
+        this.pendingRequestId = (message as any).requestId || null;
+        try {
+          await this.executeTask((message as any).prompt, execAgent || undefined, execImages);
+        } catch (error: any) {
+          const errorMsg = error instanceof Error ? error.message : String(error);
+          this.postMessage({
+            type: 'taskRejected',
+            requestId: this.pendingRequestId || (message as any).requestId,
+            message: errorMsg,
+            sessionId: this.activeSessionId
+          } as any);
+          this.pendingRequestId = null;
+          throw error;
+        }
         break;
 
       case 'interruptTask':
        
         logger.info('界面.任务.中断.消息', { taskId: message.taskId }, LogCategory.UI);
-        await this.interruptCurrentTask();
+        await this.interruptCurrentTask({ silent: Boolean((message as any).silent) });
         break;
 
       case 'pauseTask':
@@ -1731,8 +1798,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'checkWorkerStatus':
-
-        this.sendWorkerStatus();
+        this.sendWorkerStatus(Boolean((message as any).force));
         break;
 
 
@@ -1868,12 +1934,33 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         await this.handleInstallSkill(message.skillId);
         break;
       case 'applyInstructionSkill':
-        await this.handleApplyInstructionSkill(
-          (message as any).skillName,
-          (message as any).args,
-          (message as any).images || [],
-          (message as any).agent || undefined
-        );
+        this.postMessage({
+          type: 'messageReceived',
+          requestId: (message as any).requestId,
+          sessionId: this.activeSessionId
+        } as any);
+        if (!this.shouldProcessRequest((message as any).requestId)) {
+          break;
+        }
+        this.pendingRequestId = (message as any).requestId || null;
+        try {
+          await this.handleApplyInstructionSkill(
+            (message as any).skillName,
+            (message as any).args,
+            (message as any).images || [],
+            (message as any).agent || undefined
+          );
+        } catch (error: any) {
+          const errorMsg = error instanceof Error ? error.message : String(error);
+          this.postMessage({
+            type: 'taskRejected',
+            requestId: this.pendingRequestId || (message as any).requestId,
+            message: errorMsg,
+            sessionId: this.activeSessionId
+          } as any);
+          this.pendingRequestId = null;
+          throw error;
+        }
         break;
 
       // Skills 仓库管理
@@ -3831,126 +3918,250 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /** 发送适配器连接状态到前端 */
-  private async sendWorkerStatus(): Promise<void> {
+  private async sendWorkerStatus(force: boolean = false): Promise<void> {
     try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const { createLLMClient } = await import('../llm/clients/client-factory');
+      const now = Date.now();
+      if (!force && this.workerStatusCache && (now - this.workerStatusCacheAt) < this.workerStatusCacheTtlMs) {
+        this.postMessage({
+          type: 'workerStatusUpdate',
+          statuses: this.workerStatusCache
+        } as ExtensionToWebviewMessage);
+        return;
+      }
 
-      const config = LLMConfigLoader.loadFullConfig();
-      const statuses: Record<string, { status: string; model?: string; error?: string }> = {};
-
-      // 测试模型的通用函数
-      const testModel = async (name: string, modelConfig: any, isRequired: boolean = false) => {
-        // 1. 检查是否启用
-        if (!modelConfig.enabled) {
-          statuses[name] = {
-            status: 'disabled',
-            model: '已禁用'
-          };
+      if (this.workerStatusInFlight) {
+        if (!force) {
           return;
         }
+        await this.workerStatusInFlight;
+      }
 
-        // 2. 检查配置完整性
-        if (!modelConfig.apiKey || !modelConfig.model) {
-          statuses[name] = {
-            status: 'not_configured',
-            model: isRequired ? '未配置（必需）' : '未配置'
-          };
-          return;
-        }
-
-        try {
-          // 3. 创建临时客户端并发送真实测试请求
-          const client = createLLMClient(modelConfig);
-
-          // 发送最小测试请求（10 tokens）
-          await Promise.race([
-            client.sendMessage({
-              messages: [{ role: 'user', content: 'Hello' }],
-              maxTokens: 10,
-              temperature: 0.7
-            }),
-            // 10 秒超时
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('Connection timeout')), 10000)
-            )
-          ]);
-
-          // 4. 连接成功
-          statuses[name] = {
-            status: 'available',
-            model: `${modelConfig.provider} - ${modelConfig.model}`
-          };
-
-          logger.info(`Model connection test succeeded: ${name}`, {
-            provider: modelConfig.provider,
-            model: modelConfig.model
-          }, LogCategory.LLM);
-        } catch (error: any) {
-          // 5. 连接失败，分类错误
-          let status = 'unknown';
-          let errorMsg = error.message;
-
-          if (error.message.includes('401') || error.message.includes('authentication') || error.message.includes('Unauthorized')) {
-            status = 'auth_failed';
-            errorMsg = 'API Key 无效';
-          } else if (error.message.includes('network') || error.message.includes('ECONNREFUSED') || error.message.includes('ENOTFOUND')) {
-            status = 'network_error';
-            errorMsg = '网络连接失败';
-          } else if (error.message.includes('timeout') || error.message === 'Connection timeout') {
-            status = 'timeout';
-            errorMsg = '连接超时';
-          } else if (error.message.includes('disabled')) {
-            status = 'disabled';
-            errorMsg = '已禁用';
-          } else if (error.message.includes('empty choices') || error.message.includes('model name is invalid')) {
-            status = 'invalid_model';
-            errorMsg = `模型名称无效: ${modelConfig.model}`;
-          } else if (error.message.includes('404') || error.message.includes('not found')) {
-            status = 'invalid_model';
-            errorMsg = `模型不存在: ${modelConfig.model}`;
-          }
-
-          statuses[name] = {
-            status,
-            model: undefined,
-            error: errorMsg
-          };
-
-          logger.warn(`Model connection test failed: ${name}`, {
-            status,
-            error: errorMsg,
-            originalError: error.message
-          }, LogCategory.LLM);
-        }
-      };
-
-      // 并行测试所有模型
-      const testPromises = [
-        // 测试 3 个 Worker
-        ...(['claude', 'codex', 'gemini'] as WorkerSlot[]).map(worker =>
-          testModel(worker, config.workers[worker])
-        ),
-        // 测试编排者（必需）
-        testModel('orchestrator', config.orchestrator, true),
-        // 测试压缩模型（必需）
-        testModel('compressor', config.compressor, true)
-      ];
-
-      // 等待所有测试完成
-      await Promise.all(testPromises);
-
-      this.postMessage({
-        type: 'workerStatusUpdate',
-        statuses
-      } as ExtensionToWebviewMessage);
-
-      logger.info('Model connection status check completed', {
-        results: Object.entries(statuses).map(([name, s]) => `${name}: ${s.status}`)
-      }, LogCategory.LLM);
+      const runCheck = this.performWorkerStatusCheck(force);
+      this.workerStatusInFlight = runCheck;
+      await runCheck;
     } catch (error: any) {
       logger.error('界面.模型状态.检查_失败', { error: error.message }, LogCategory.UI);
+    } finally {
+      this.workerStatusInFlight = null;
     }
+  }
+
+  private async performWorkerStatusCheck(force: boolean): Promise<void> {
+    const { LLMConfigLoader } = await import('../llm/config');
+    const { createLLMClient } = await import('../llm/clients/client-factory');
+
+    const config = LLMConfigLoader.loadFullConfig();
+    const statuses: Record<string, { status: string; model?: string; error?: string }> = {};
+    const now = Date.now();
+    const statusTimeout = force ? this.workerStatusHardTimeoutMs : this.workerStatusTimeoutMs;
+    const priorityModels: Array<'orchestrator' | 'compressor'> = ['orchestrator', 'compressor'];
+    const workerModels: WorkerSlot[] = ['claude', 'codex', 'gemini'];
+    const modelIds = [...priorityModels, ...workerModels];
+
+    const getCachedStatus = (name: string) => {
+      if (!this.workerStatusCache) return null;
+      if ((now - this.workerStatusCacheAt) > this.workerStatusSoftTtlMs) return null;
+      return this.workerStatusCache[name] || null;
+    };
+
+    const applyQuickStatus = (name: string, modelLabel?: string) => {
+      const cached = getCachedStatus(name);
+      if (cached) {
+        statuses[name] = {
+          status: cached.status,
+          model: cached.model || modelLabel,
+          error: cached.error
+        };
+        return true;
+      }
+      return false;
+    };
+
+    // 测试模型的通用函数
+    const testModel = async (name: string, modelConfig: any, isRequired: boolean = false) => {
+      if (!modelConfig.enabled) {
+        statuses[name] = {
+          status: 'disabled',
+          model: '已禁用'
+        };
+        this.postMessage({
+          type: 'workerStatusUpdate',
+          statuses
+        } as ExtensionToWebviewMessage);
+        return;
+      }
+
+      if (!modelConfig.apiKey || !modelConfig.model) {
+        statuses[name] = {
+          status: 'not_configured',
+          model: isRequired ? '未配置（必需）' : '未配置'
+        };
+        this.postMessage({
+          type: 'workerStatusUpdate',
+          statuses
+        } as ExtensionToWebviewMessage);
+        return;
+      }
+
+      const modelLabel = `${modelConfig.provider} - ${modelConfig.model}`;
+      if (!force) {
+        const isConnected = name !== 'compressor'
+          && this.adapterFactory.isConnected(name as AgentType);
+        if (isConnected) {
+          statuses[name] = { status: 'available', model: modelLabel };
+          this.postMessage({
+            type: 'workerStatusUpdate',
+            statuses
+          } as ExtensionToWebviewMessage);
+          return;
+        }
+        if (applyQuickStatus(name, modelLabel)) {
+          this.postMessage({
+            type: 'workerStatusUpdate',
+            statuses
+          } as ExtensionToWebviewMessage);
+          return;
+        }
+        // 软检测也需要继续执行真实检测，避免长期停留在“检测中”
+      }
+
+      try {
+        statuses[name] = {
+          status: 'checking',
+          model: modelLabel
+        };
+        this.postMessage({
+          type: 'workerStatusUpdate',
+          statuses
+        } as ExtensionToWebviewMessage);
+
+        const client = createLLMClient(modelConfig);
+
+        await Promise.race([
+          client.sendMessage({
+            messages: [{ role: 'user', content: 'Hello' }],
+            maxTokens: 10,
+            temperature: 0.7
+          }),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Connection timeout')), statusTimeout)
+          )
+        ]);
+
+        statuses[name] = {
+          status: 'available',
+          model: modelLabel
+        };
+        this.postMessage({
+          type: 'workerStatusUpdate',
+          statuses
+        } as ExtensionToWebviewMessage);
+
+        logger.info(`Model connection test succeeded: ${name}`, {
+          provider: modelConfig.provider,
+          model: modelConfig.model
+        }, LogCategory.LLM);
+      } catch (error: any) {
+        let status = 'unknown';
+        let errorMsg = error.message;
+
+        if (error.message.includes('401') || error.message.includes('authentication') || error.message.includes('Unauthorized')) {
+          status = 'auth_failed';
+          errorMsg = 'API Key 无效';
+        } else if (error.message.includes('network') || error.message.includes('ECONNREFUSED') || error.message.includes('ENOTFOUND')) {
+          status = 'network_error';
+          errorMsg = '网络连接失败';
+        } else if (error.message.includes('timeout') || error.message === 'Connection timeout') {
+          status = 'timeout';
+          errorMsg = '连接超时';
+        } else if (error.message.includes('disabled')) {
+          status = 'disabled';
+          errorMsg = '已禁用';
+        } else if (error.message.includes('empty choices') || error.message.includes('model name is invalid')) {
+          status = 'invalid_model';
+          errorMsg = `模型名称无效: ${modelConfig.model}`;
+        } else if (error.message.includes('404') || error.message.includes('not found')) {
+          status = 'invalid_model';
+          errorMsg = `模型不存在: ${modelConfig.model}`;
+        }
+
+        statuses[name] = {
+          status,
+          model: undefined,
+          error: errorMsg
+        };
+        this.postMessage({
+          type: 'workerStatusUpdate',
+          statuses
+        } as ExtensionToWebviewMessage);
+
+        logger.warn(`Model connection test failed: ${name}`, {
+          status,
+          error: errorMsg,
+          originalError: error.message
+        }, LogCategory.LLM);
+      }
+    };
+
+    // 初始化占位状态，确保 UI 先显示检测中/缓存结果
+    modelIds.forEach(name => {
+      const modelConfig = name === 'orchestrator'
+        ? config.orchestrator
+        : name === 'compressor'
+          ? config.compressor
+          : config.workers[name as WorkerSlot];
+
+      if (!modelConfig?.enabled) {
+        statuses[name] = { status: 'disabled', model: '已禁用' };
+        return;
+      }
+      if (!modelConfig?.apiKey || !modelConfig?.model) {
+        statuses[name] = {
+          status: 'not_configured',
+          model: name === 'orchestrator' || name === 'compressor' ? '未配置（必需）' : '未配置'
+        };
+        return;
+      }
+
+      const modelLabel = `${modelConfig.provider} - ${modelConfig.model}`;
+      if (!force) {
+        const isConnected = name !== 'compressor'
+          && this.adapterFactory.isConnected(name as AgentType);
+        if (isConnected) {
+          statuses[name] = { status: 'available', model: modelLabel };
+          return;
+        }
+        if (applyQuickStatus(name, modelLabel)) {
+          return;
+        }
+      }
+      statuses[name] = { status: 'checking', model: modelLabel };
+    });
+
+    this.postMessage({
+      type: 'workerStatusUpdate',
+      statuses
+    } as ExtensionToWebviewMessage);
+
+    // 优先检测编排模型，再检测压缩模型，最后并行检测 Worker
+    await testModel('orchestrator', config.orchestrator, true);
+    await testModel('compressor', config.compressor, true);
+    await Promise.all(
+      workerModels.map(worker => testModel(worker, config.workers[worker]))
+    );
+
+    this.workerStatusCache = statuses;
+    this.workerStatusCacheAt = Date.now();
+
+    this.postMessage({
+      type: 'workerStatusUpdate',
+      statuses
+    } as ExtensionToWebviewMessage);
+
+    logger.info('Model connection status check completed', {
+      results: Object.entries(statuses).map(([name, s]) => `${name}: ${s.status}`),
+      mode: force ? 'hard' : 'soft'
+    }, LogCategory.LLM);
   }
 
   /** 发送执行统计数据到前端 */
@@ -4468,6 +4679,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private async executeTask(prompt: string, forceWorker?: WorkerSlot, images?: Array<{dataUrl: string}>): Promise<void> {
     logger.info('界面.任务.执行.开始', { promptLength: prompt.length, imageCount: images?.length || 0, forceWorker: forceWorker || undefined }, LogCategory.UI);
 
+    // 立即发送 taskAccepted 确认，避免前端超时
+    if (this.pendingRequestId) {
+      this.postMessage({
+        type: 'taskAccepted',
+        requestId: this.pendingRequestId,
+        sessionId: this.activeSessionId
+      } as any);
+      this.pendingRequestId = null;
+    }
 
     if (!this.activeSessionId) {
       const currentSession = this.sessionManager.getCurrentSession();
@@ -4711,8 +4931,16 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private async executeWithIntelligentOrchestrator(prompt: string, imagePaths: string[]): Promise<void> {
     logger.info('界面.执行.模式.智能', undefined, LogCategory.UI);
 
+    // 立即发送"正在思考"消息，避免前端显示兜底动画
+    this.sendOrchestratorMessage({
+      content: '正在分析您的需求...',
+      messageType: 'progress'
+    });
+
     try {
       // 调用智能编排器
+      // 注意：executeWithTaskContext 内部通过 streamToUI: true 已经将 LLM 响应流式发送到前端
+      // 因此不需要再手动调用 sendOrchestratorMessage 发送结果，否则会导致重复消息
       const taskContext = await this.intelligentOrchestrator.executeWithTaskContext(prompt, this.activeSessionId || undefined);
       const result = taskContext.result;
 
@@ -4723,6 +4951,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       // 保存消息历史
       this.saveMessageToSession(prompt, result, undefined, 'orchestrator');
+
+      // 🔧 移除重复的 sendOrchestratorMessage 调用
+      // LLM 响应已通过流式传输发送到前端，无需再次发送
 
     } catch (error) {
       logger.error('界面.执行.智能.失败', error, LogCategory.UI);
@@ -4740,6 +4971,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 直接 Worker 执行模式 */
   private async executeWithDirectWorker(prompt: string, targetWorker: WorkerSlot, imagePaths: string[]): Promise<void> {
     logger.info('界面.执行.模式.直接', { agent: targetWorker }, LogCategory.UI);
+
+    // 立即发送"正在处理"消息
+    this.sendOrchestratorMessage({
+      content: `${targetWorker.toUpperCase()} 正在处理您的请求...`,
+      messageType: 'progress'
+    });
 
     const startTime = Date.now();
     const taskManager = await this.getTaskManager();
@@ -5021,8 +5258,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     );
     html = html.replace('href="styles/design-system.css"', `href="${designSystemUri}?v=${cacheBuster}"`);
 
-    // 2. Augment 风格组件 CSS 文件
-    const componentCssFiles = ['tool-use.css', 'codeblock.css', 'thinking.css', 'chat-message.css'];
+    // 1.5 tokens.css（设计令牌）
+    const tokensUri = webview.asWebviewUri(
+      vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'styles', 'tokens.css'))
+    );
+    html = html.replace('href="styles/tokens.css"', `href="${tokensUri}?v=${cacheBuster}"`);
+
+    // 2. 组件 CSS 文件（包含 panels.css 用于代码块、思考过程、工具调用面板样式）
+    const componentCssFiles = ['panels.css', 'collapsible.css', 'chat-message.css'];
     componentCssFiles.forEach(cssFile => {
       const cssUri = webview.asWebviewUri(
         vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'styles', 'components', cssFile))

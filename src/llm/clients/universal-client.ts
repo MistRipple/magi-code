@@ -253,7 +253,7 @@ export class UniversalLLMClient extends BaseLLMClient {
     });
 
     let fullContent = '';
-    let toolCalls: ToolCall[] = [];
+    const toolCallBuffers = new Map<string, { id: string; name?: string; argumentsText: string }>();
     let usage = { inputTokens: 0, outputTokens: 0 };
     let stopReason: LLMResponse['stopReason'] = 'end_turn';
 
@@ -262,6 +262,14 @@ export class UniversalLLMClient extends BaseLLMClient {
         if (event.content_block.type === 'text') {
           onChunk({ type: 'content_start' });
         } else if (event.content_block.type === 'tool_use') {
+          const toolId = event.content_block.id || '';
+          if (toolId) {
+            toolCallBuffers.set(toolId, {
+              id: toolId,
+              name: event.content_block.name,
+              argumentsText: '',
+            });
+          }
           onChunk({
             type: 'tool_call_start',
             toolCall: {
@@ -276,9 +284,21 @@ export class UniversalLLMClient extends BaseLLMClient {
           fullContent += event.delta.text;
           onChunk({ type: 'content_delta', content: event.delta.text });
         } else if (event.delta.type === 'input_json_delta') {
+          const lastTool = [...toolCallBuffers.values()].slice(-1)[0];
+          if (lastTool) {
+            lastTool.argumentsText += event.delta.partial_json || '';
+          }
+          let safeArgs: Record<string, any> = {};
+          if (event.delta.partial_json) {
+            try {
+              safeArgs = JSON.parse(event.delta.partial_json);
+            } catch {
+              safeArgs = {};
+            }
+          }
           onChunk({
             type: 'tool_call_delta',
-            toolCall: { arguments: JSON.parse(event.delta.partial_json) },
+            toolCall: { arguments: safeArgs },
           });
         }
       } else if (event.type === 'content_block_stop') {
@@ -295,6 +315,24 @@ export class UniversalLLMClient extends BaseLLMClient {
           usage.inputTokens = event.message.usage.input_tokens;
         }
       }
+    }
+
+    const toolCalls: ToolCall[] = [];
+    for (const tool of toolCallBuffers.values()) {
+      if (!tool.id) continue;
+      let parsedArgs: Record<string, any> = {};
+      if (tool.argumentsText) {
+        try {
+          parsedArgs = JSON.parse(tool.argumentsText);
+        } catch {
+          parsedArgs = {};
+        }
+      }
+      toolCalls.push({
+        id: tool.id,
+        name: tool.name || '',
+        arguments: parsedArgs,
+      });
     }
 
     const result: LLMResponse = {
@@ -431,7 +469,7 @@ export class UniversalLLMClient extends BaseLLMClient {
     });
 
     let fullContent = '';
-    let toolCalls: ToolCall[] = [];
+    const toolCallBuffers = new Map<string, { id: string; name?: string; argumentsText: string }>();
     let usage = { inputTokens: 0, outputTokens: 0 };
     let stopReason: LLMResponse['stopReason'] = 'end_turn';
 
@@ -445,13 +483,25 @@ export class UniversalLLMClient extends BaseLLMClient {
 
       if (delta?.tool_calls) {
         for (const toolCall of delta.tool_calls) {
-          if (toolCall.function?.name && toolCall.function?.arguments) {
+          const toolId = toolCall.id || toolCall.index?.toString() || '';
+          if (!toolCallBuffers.has(toolId)) {
+            toolCallBuffers.set(toolId, {
+              id: toolId,
+              name: toolCall.function?.name,
+              argumentsText: '',
+            });
+          }
+          const buffer = toolCallBuffers.get(toolId);
+          if (buffer && toolCall.function?.arguments) {
+            buffer.argumentsText += toolCall.function.arguments;
+          }
+          if (toolCall.function?.name) {
             onChunk({
               type: 'tool_call_delta',
               toolCall: {
-                id: toolCall.id,
+                id: toolId,
                 name: toolCall.function.name,
-                arguments: JSON.parse(toolCall.function.arguments || '{}'),
+                arguments: {},
               },
             });
           }
@@ -466,6 +516,24 @@ export class UniversalLLMClient extends BaseLLMClient {
         usage.inputTokens = chunk.usage.prompt_tokens || 0;
         usage.outputTokens = chunk.usage.completion_tokens || 0;
       }
+    }
+
+    const toolCalls: ToolCall[] = [];
+    for (const tool of toolCallBuffers.values()) {
+      if (!tool.id) continue;
+      let parsedArgs: Record<string, any> = {};
+      if (tool.argumentsText) {
+        try {
+          parsedArgs = JSON.parse(tool.argumentsText);
+        } catch {
+          parsedArgs = {};
+        }
+      }
+      toolCalls.push({
+        id: tool.id,
+        name: tool.name || '',
+        arguments: parsedArgs,
+      });
     }
 
     const result: LLMResponse = {

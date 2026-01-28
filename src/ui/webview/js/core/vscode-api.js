@@ -13,21 +13,30 @@ export function postMessage(message) {
 /**
  * 执行任务
  */
-export function executeTask(prompt, images = null, mode = 'auto', agent = null) {
+export function executeTask(prompt, images = null, mode = 'auto', agent = null, requestId = null) {
   postMessage({
     type: 'executeTask',
     prompt,
     images,
     mode,
-    agent
+    agent,
+    requestId: requestId || undefined
   });
 }
 
 /**
  * 中断任务
  */
-export function interruptTask() {
-  postMessage({ type: 'interrupt' });
+export function interruptTask(taskIdOrOptions) {
+  const payload = { type: 'interruptTask' };
+  if (typeof taskIdOrOptions === 'string') {
+    payload.taskId = taskIdOrOptions;
+  } else if (taskIdOrOptions && typeof taskIdOrOptions === 'object') {
+    if (taskIdOrOptions.taskId) payload.taskId = taskIdOrOptions.taskId;
+    if (taskIdOrOptions.silent) payload.silent = true;
+    if (taskIdOrOptions.reason) payload.reason = taskIdOrOptions.reason;
+  }
+  postMessage(payload);
 }
 
 /**
@@ -138,8 +147,8 @@ export function enhancePrompt(prompt) {
 /**
  * 刷新 Agent 连接状态
  */
-export function refreshAgentConnections() {
-  postMessage({ type: 'checkWorkerStatus' });
+export function refreshAgentConnections(force = false) {
+  postMessage({ type: 'checkWorkerStatus', force: !!force });
 }
 
 /**

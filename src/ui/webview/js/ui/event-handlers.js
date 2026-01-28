@@ -10,9 +10,11 @@ import {
   isProcessing,
   sessions,
   pendingChanges,
-  attachedImages,
+  appState,
   setAppState,
   setIsProcessing,
+  clearLocalProcessingGrace,
+  setLocalProcessingGrace,
   setCurrentTopTab,
   setCurrentBottomTab,
   setProcessingActor,
@@ -37,7 +39,6 @@ import {
 import {
   renderMainContent,
   scheduleRenderMainContent,
-  renderImagePreviews,
   renderTasksView,
   renderEditsView,
   renderSkillLibrary,
@@ -84,6 +85,100 @@ let workerConfigs = {
   gemini: null
 };
 
+const pendingTaskAcks = new Map();
+const pendingReceipts = new Map();
+let backendStartTimer = null;
+
+function startTaskAckTimer(requestId, actor, timeoutMs = 8000) {
+  if (!requestId) return;
+  const existing = pendingTaskAcks.get(requestId);
+  if (existing?.timer) {
+    clearTimeout(existing.timer);
+  }
+  const timer = setTimeout(() => {
+    pendingTaskAcks.delete(requestId);
+    clearLocalProcessingGrace();
+    setProcessingState(false, true);
+    showToast('请求未被后端确认，请稍后重试', 'warning');
+    addSystemMessage('未收到后端确认，已停止等待。请重试。', 'warning');
+  }, timeoutMs);
+  pendingTaskAcks.set(requestId, { timer, actor });
+}
+
+function startBackendStartTimer(timeoutMs = 12000) {
+  if (backendStartTimer) {
+    clearTimeout(backendStartTimer);
+  }
+  backendStartTimer = setTimeout(() => {
+    backendStartTimer = null;
+    clearLocalProcessingGrace();
+    setProcessingState(false, true);
+    showToast('后端未开始处理，请稍后重试', 'warning');
+    addSystemMessage('后端未开始处理，已停止等待。请重试。', 'warning');
+  }, timeoutMs);
+}
+
+function startMessageReceiptTimer(requestId, resend, timeoutMs = 1500) {
+  if (!requestId) return;
+  const existing = pendingReceipts.get(requestId);
+  if (existing?.timer) {
+    clearTimeout(existing.timer);
+  }
+  const timer = setTimeout(() => {
+    const entry = pendingReceipts.get(requestId);
+    if (!entry || entry.retries >= 1) {
+      pendingReceipts.delete(requestId);
+      return;
+    }
+    entry.retries += 1;
+    pendingReceipts.set(requestId, entry);
+    if (typeof entry.resend === 'function') {
+      entry.resend();
+    }
+    startMessageReceiptTimer(requestId, entry.resend, timeoutMs);
+  }, timeoutMs);
+  pendingReceipts.set(requestId, { timer, resend, retries: existing?.retries || 0 });
+}
+
+export function resolveMessageReceipt(requestId) {
+  if (!requestId) return;
+  const entry = pendingReceipts.get(requestId);
+  if (entry?.timer) {
+    clearTimeout(entry.timer);
+  }
+  pendingReceipts.delete(requestId);
+}
+
+export function markBackendActivity() {
+  if (!backendStartTimer) return;
+  clearTimeout(backendStartTimer);
+  backendStartTimer = null;
+}
+
+export function resolveTaskAck(requestId) {
+  if (!requestId) return;
+  const entry = pendingTaskAcks.get(requestId);
+  if (entry?.timer) {
+    clearTimeout(entry.timer);
+  }
+  if (entry?.actor) {
+    setProcessingActor(entry.actor.source, entry.actor.agent);
+    setLocalProcessingGrace(12000);
+    setProcessingState(true, true);
+  }
+  pendingTaskAcks.delete(requestId);
+  startBackendStartTimer(15000);
+}
+
+export function rejectTaskAck(requestId, message) {
+  resolveTaskAck(requestId);
+  markBackendActivity();
+  clearLocalProcessingGrace();
+  setProcessingState(false, true);
+  showToast(message || '任务未被接受', 'error');
+  addSystemMessage(message || '任务未被接受', 'error');
+}
+
 // ============================================
 // 辅助函数
 // ============================================
@@ -111,14 +206,18 @@ function hasPendingConfirmation() {
 }
 
 function interruptCurrentOperation() {
-  postMessage({ type: 'interrupt' });
+  postMessage({ type: 'interruptTask' });
   showToast('正在中断任务...', 'info');
 }
 
 export function updateInteractionModeUI(mode) {
   currentInteractionMode = mode || 'auto';
-  const selector = document.getElementById('mode-selector');
-  if (selector) selector.value = currentInteractionMode;
+  const toggle = document.getElementById('mode-toggle');
+  if (toggle) {
+    toggle.querySelectorAll('.mode-toggle-option').forEach(opt => {
+      opt.classList.toggle('active', opt.dataset.mode === currentInteractionMode);
+    });
+  }
 }
 
 export function getModeDisplayName(mode) {
@@ -155,7 +254,7 @@ export function showRepositoryManagementDialog() {
                 <input type="text" id="repo-url-input" placeholder="https://example.com/skills.json">
               </div>
               <button class="settings-btn primary" id="repo-add-btn" onclick="addRepositoryFromDialog()">
-                <svg viewBox="0 0 16 16" fill="currentColor">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
                   <path d="M8 2a.5.5 0 0 1 .5.5v5h5a.5.5 0 0 1 0 1h-5v5a.5.5 0 0 1-1 0v-5h-5a.5.5 0 0 1 0-1h5v-5A.5.5 0 0 1 8 2z"/>
                 </svg>
                 <span>添加</span>
@@ -519,21 +618,32 @@ export function showSkillUseDialog() {
     if (!currentSkill) return;
 
     const args = document.getElementById('skill-use-args')?.value || '';
-    const imageDataUrls = attachedImages.length > 0 ? attachedImages.map(img => img.dataUrl) : [];
     const selectedAgent = document.getElementById('agent-selector')?.value || '';
     const isOrchestratorMode = !selectedAgent;
 
     if (isProcessing) {
-      showToast('任务执行中，请稍后再试', 'warning');
-      return;
+      const hasBackendRunning = appState && appState.isRunning === true;
+      if (hasBackendRunning) {
+        showToast('任务执行中，请稍后再试', 'warning');
+        return;
+      }
+      clearLocalProcessingGrace();
+      setProcessingState(false, true);
     }
     if (hasPendingClarification() || hasPendingWorkerQuestion() || hasPendingQuestion() || hasPendingConfirmation()) {
       showToast('请先完成当前的交互流程后再使用 Skill', 'warning');
       return;
     }
 
-    setProcessingActor(isOrchestratorMode ? 'orchestrator' : 'worker', selectedAgent || 'claude');
-    setProcessingState(true, true);
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    startTaskAckTimer(requestId, {
+      source: isOrchestratorMode ? 'orchestrator' : 'worker',
+      agent: selectedAgent || 'claude'
+    });
+
+    // 获取粘贴的图片
+    const pastedImages = window._pastedImages || [];
+    const imageDataUrls = pastedImages.map(img => img.dataUrl);
 
     const userMsg = {
       role: 'user',
@@ -546,18 +656,20 @@ export function showSkillUseDialog() {
     renderMainContent();
     saveWebviewState();
 
-    postMessage({
+    const payload = {
       type: 'applyInstructionSkill',
       skillName: currentSkill.name,
       args,
       images: imageDataUrls,
-      agent: selectedAgent || null
-    });
+      agent: selectedAgent || null,
+      requestId
+    };
+    startMessageReceiptTimer(requestId, () => postMessage(payload));
+    postMessage(payload);
 
     const input = document.getElementById('prompt-input');
     if (input) input.value = '';
-    attachedImages.length = 0;
-    renderImagePreviews();
+    window._pastedImages = [];
     closeDialog();
   });
 }
@@ -665,12 +777,17 @@ export function handleSettingsTabClick(tabName) {
 export function handleExecuteButtonClick() {
   // 如果正在处理中，点击按钮则打断
   if (isProcessing) {
-    interruptCurrentOperation();
-    return;
+    const hasBackendRunning = appState && appState.isRunning === true;
+    if (hasBackendRunning) {
+      interruptCurrentOperation();
+      return;
+    }
+    clearLocalProcessingGrace();
+    setProcessingState(false, true);
   }
 
   const input = document.getElementById('prompt-input');
-  if (!input.value.trim() && attachedImages.length === 0) {
+  if (!input.value.trim()) {
     return;
   }
 
@@ -683,8 +800,6 @@ export function handleExecuteButtonClick() {
     }
     handleClarificationAnswer(answerText, false);
     input.value = '';
-    attachedImages.length = 0;
-    renderImagePreviews();
     return;
   }
 
@@ -697,8 +812,6 @@ export function handleExecuteButtonClick() {
     }
     handleWorkerQuestionAnswer(answerText, false);
     input.value = '';
-    attachedImages.length = 0;
-    renderImagePreviews();
     return;
   }
 
@@ -711,8 +824,6 @@ export function handleExecuteButtonClick() {
     }
     handleQuestionAnswer(answerText, false);
     input.value = '';
-    attachedImages.length = 0;
-    renderImagePreviews();
     return;
   }
 
@@ -728,8 +839,6 @@ export function handleExecuteButtonClick() {
     if (isConfirm || isCancel) {
       handlePlanConfirmation(isConfirm);
       input.value = '';
-      attachedImages.length = 0;
-      renderImagePreviews();
       return;
     }
 
@@ -738,16 +847,20 @@ export function handleExecuteButtonClick() {
   }
 
   // 正常执行任务
-  const promptText = input.value.trim() || '请分析这张图片';
-  const hasImages = attachedImages.length > 0;
+  const promptText = input.value.trim();
   const selectedAgent = document.getElementById('agent-selector')?.value || '';
   const isOrchestratorMode = !selectedAgent;
 
   // 立即设置处理状态，显示思考动画
-  setProcessingActor(isOrchestratorMode ? 'orchestrator' : 'worker', selectedAgent || 'claude');
-  setProcessingState(true, true);  // 立即开始计时
+  const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  startTaskAckTimer(requestId, {
+    source: isOrchestratorMode ? 'orchestrator' : 'worker',
+    agent: selectedAgent || 'claude'
+  });
 
-  const imageDataUrls = hasImages ? attachedImages.map(img => img.dataUrl) : [];
+  // 获取粘贴的图片
+  const pastedImages = window._pastedImages || [];
+  const imageDataUrls = pastedImages.map(img => img.dataUrl);
 
   const userMsg = {
     role: 'user',
@@ -762,11 +875,13 @@ export function handleExecuteButtonClick() {
   saveWebviewState();
 
   const mode = isOrchestratorMode ? currentInteractionMode : 'auto';
-  executeTask(promptText, hasImages ? imageDataUrls : null, mode, selectedAgent || null);
+  startMessageReceiptTimer(requestId, () => {
+    executeTask(promptText, imageDataUrls.length > 0 ? imageDataUrls : null, mode, selectedAgent || null, requestId);
+  });
+  executeTask(promptText, imageDataUrls.length > 0 ? imageDataUrls : null, mode, selectedAgent || null, requestId);
 
   input.value = '';
-  attachedImages.length = 0;
-  renderImagePreviews();
+  window._pastedImages = [];
 }
 
 // ============================================
@@ -797,10 +912,6 @@ export function handlePromptInputPaste(e) {
   }
 }
 
-// ============================================
-// 图片处理
-// ============================================
-
 export function handleImageFile(file) {
   if (!file.type.startsWith('image/')) {
     showToast('只支持图片文件', 'error');
@@ -810,63 +921,15 @@ export function handleImageFile(file) {
   const reader = new FileReader();
   reader.onload = (e) => {
     const dataUrl = e.target.result;
-    attachedImages.push({
+    // Store image in a temporary location for sending
+    window._pastedImages = window._pastedImages || [];
+    window._pastedImages.push({
       name: file.name,
       dataUrl: dataUrl
     });
-    renderImagePreviews();
+    showToast('图片已添加，可直接发送', 'info');
   };
   reader.readAsDataURL(file);
-}
-
-export function handleAttachImageClick() {
-  document.getElementById('image-file-input')?.click();
-}
-
-export function handleImageFileInputChange(e) {
-  const files = e.target.files;
-  if (files && files.length > 0) {
-    for (const file of files) {
-      handleImageFile(file);
-    }
-  }
-  e.target.value = '';
-}
-
-export function handleRemoveImage(index) {
-  attachedImages.splice(index, 1);
-  renderImagePreviews();
-}
-
-// ============================================
-// 拖拽处理
-// ============================================
-
-export function handleDragOver(e) {
-  e.preventDefault();
-  e.stopPropagation();
-  e.currentTarget.classList.add('drag-over');
-}
-
-export function handleDragLeave(e) {
-  e.preventDefault();
-  e.stopPropagation();
-  e.currentTarget.classList.remove('drag-over');
-}
-
-export function handleDrop(e) {
-  e.preventDefault();
-  e.stopPropagation();
-  e.currentTarget.classList.remove('drag-over');
-
-  const files = e.dataTransfer?.files;
-  if (files && files.length > 0) {
-    for (const file of files) {
-      if (file.type.startsWith('image/')) {
-        handleImageFile(file);
-      }
-    }
-  }
 }
 
 // ============================================
@@ -1051,27 +1114,21 @@ export function initializeEventListeners() {
     });
   }
 
-  // 交互模式选择器
-  const modeSelector = document.getElementById('mode-selector');
-  if (modeSelector) {
-    modeSelector.addEventListener('change', (e) => {
-      const mode = e.target.value;
+  // 交互模式切换
+  const modeToggle = document.getElementById('mode-toggle');
+  if (modeToggle) {
+    modeToggle.addEventListener('click', (e) => {
+      const btn = e.target.closest('.mode-toggle-option');
+      if (!btn) return;
+      const mode = btn.dataset.mode;
       if (mode && mode !== currentInteractionMode) {
         currentInteractionMode = mode;
+        modeToggle.querySelectorAll('.mode-toggle-option').forEach(opt => {
+          opt.classList.toggle('active', opt.dataset.mode === mode);
+        });
         postMessage({ type: 'setInteractionMode', mode: mode });
       }
     });
-  }
-
-  // 图片上传
-  const attachImageBtn = document.getElementById('attach-image-btn');
-  if (attachImageBtn) {
-    attachImageBtn.addEventListener('click', handleAttachImageClick);
-  }
-
-  const imageFileInput = document.getElementById('image-file-input');
-  if (imageFileInput) {
-    imageFileInput.addEventListener('change', handleImageFileInputChange);
   }
 
   const useSkillBtn = document.getElementById('use-skill-btn');
@@ -1099,15 +1156,8 @@ export function initializeEventListeners() {
     });
   }
 
-  // 拖拽
-  const inputWrapper = document.querySelector('.input-wrapper');
-  if (inputWrapper) {
-    inputWrapper.addEventListener('dragover', handleDragOver);
-    inputWrapper.addEventListener('dragleave', handleDragLeave);
-    inputWrapper.addEventListener('drop', handleDrop);
-  }
-
   // 拖动调整输入框高度
+  const inputWrapper = document.querySelector('.input-wrapper');
   const resizeBar = document.getElementById('input-resize-bar');
   const inputBox = document.getElementById('prompt-input');
   if (resizeBar && inputWrapper && inputBox) {
@@ -1430,6 +1480,69 @@ export function initializeEventListeners() {
   initOrchestratorConfig();
   initCompressorConfig();
 
+  // 可折叠面板事件委托 (c-collapsible)
+  // 注意：components.js 中的 setupPanelEventDelegation 也会注册类似事件
+  // 这里作为备份处理，确保复制/应用按钮正常工作
+  document.body.addEventListener('click', (e) => {
+    // 处理 toggle-collapsible 动作
+    const toggleTarget = e.target.closest('[data-action="toggle-collapsible"]');
+    if (toggleTarget) {
+      // 检查是否点击了按钮（复制/应用），如果是则不切换折叠状态
+      if (e.target.closest('[data-action="copy-code"]') || e.target.closest('[data-action="apply-code"]')) {
+        return; // 让后面的代码处理按钮点击
+      }
+      const collapsible = toggleTarget.closest('.c-collapsible');
+      if (collapsible) {
+        console.log('[EventHandlers] 切换面板折叠状态', collapsible.className);
+        collapsible.classList.toggle('is-collapsed');
+        e.preventDefault();
+        e.stopPropagation();
+      }
+      return;
+    }
+
+    // 处理复制代码动作
+    const copyBtn = e.target.closest('[data-action="copy-code"]');
+    if (copyBtn) {
+      e.stopPropagation();
+      e.preventDefault();
+      const codeId = copyBtn.getAttribute('data-code-id');
+      console.log('[EventHandlers] 复制代码', codeId);
+      if (codeId && window.copyCodeBlock) {
+        window.copyCodeBlock(codeId);
+      }
+      return;
+    }
+
+    // 处理应用代码动作
+    const applyBtn = e.target.closest('[data-action="apply-code"]');
+    if (applyBtn) {
+      e.stopPropagation();
+      e.preventDefault();
+      const codeId = applyBtn.getAttribute('data-code-id');
+      console.log('[EventHandlers] 应用代码', codeId);
+      if (codeId && window.applyCodeBlock) {
+        window.applyCodeBlock(codeId);
+      }
+      return;
+    }
+
+    // 兼容旧的 toggle-panel 动作（如果有的话）
+    const oldToggle = e.target.closest('[data-action="toggle-panel"]');
+    if (oldToggle) {
+      const panel = oldToggle.closest('.panel, .c-collapsible');
+      if (panel) {
+        if (panel.classList.contains('c-collapsible')) {
+          panel.classList.toggle('is-collapsed');
+        } else {
+          panel.classList.toggle('panel--collapsed');
+        }
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    }
+  });
+
   // 系统事件
   document.addEventListener('visibilitychange', handleVisibilityChange);
   window.addEventListener('unhandledrejection', handleUnhandledRejection);
@@ -1459,7 +1572,6 @@ window.revertChange = handleRevertChange;
 window.approveAllChanges = handleApproveAllChanges;
 window.revertAllChanges = handleRevertAllChanges;
 window.viewDiff = handleViewDiff;
-window.removeImage = handleRemoveImage;
 window.toggleDependencyPanel = toggleDependencyPanel;
 window.showRepositoryManagementDialog = showRepositoryManagementDialog;
 window.closeRepositoryManagementDialog = closeRepositoryManagementDialog;

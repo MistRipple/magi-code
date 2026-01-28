@@ -48,10 +48,7 @@ const store = {
   tasks: [],
   
   // 待处理变更
-  pendingChanges: [],
-  
-  // 附件
-  attachedImages: []
+  pendingChanges: []
 };
 
 // ============================================
@@ -188,8 +185,7 @@ export function resetState(path) {
     'messages.agentOutputs': { claude: [], codex: [], gemini: [] },
     'processing': { isProcessing: false, actor: null, agent: null, startedAt: null },
     'tasks': [],
-    'pendingChanges': [],
-    'attachedImages': []
+    'pendingChanges': []
   };
 
   if (initialValues[path] !== undefined) {

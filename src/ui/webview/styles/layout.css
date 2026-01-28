@@ -72,10 +72,42 @@
     .model-cap-icon.inactive { opacity: 0.2; }
     .bottom-tab:hover .model-cap-icon { opacity: 0.9; }
 
-    /* 交互模式选择器（下拉框） */
-    .mode-selector { padding: 4px 8px; font-size: var(--font-size-1); background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); border-radius: var(--radius-1); cursor: pointer; outline: none; min-width: 70px; }
-    .mode-selector:hover { border-color: var(--vscode-focusBorder); }
-    .mode-selector:focus { border-color: var(--vscode-focusBorder); }
+    /* 交互模式切换 - 两侧按钮设计 */
+    .mode-toggle {
+      display: flex;
+      align-items: center;
+      background: var(--vscode-input-background);
+      border: 1px solid var(--vscode-input-border);
+      border-radius: var(--radius-1);
+      padding: 2px;
+      gap: 2px;
+      flex-shrink: 0;
+    }
+
+    .mode-toggle-option {
+      padding: 4px 12px;
+      font-size: var(--font-size-1);
+      background: transparent;
+      color: var(--vscode-descriptionForeground);
+      border: none;
+      border-radius: var(--radius-1);
+      cursor: pointer;
+      transition: all var(--transition-fast);
+      font-weight: 500;
+      min-width: 50px;
+      text-align: center;
+    }
+
+    .mode-toggle-option:hover {
+      background: var(--vscode-list-hoverBackground);
+      color: var(--vscode-foreground);
+    }
+
+    .mode-toggle-option.active {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+    }
 
     /* 模式指示器 */
     .mode-indicator { display: flex; align-items: center; gap: 4px; font-size: var(--font-size-1); color: var(--vscode-descriptionForeground); padding: 2px 6px; border-radius: var(--radius-1); background: var(--vscode-badge-background); }
@@ -84,7 +116,7 @@
     .mode-indicator.auto { background: rgba(245, 158, 11, 0.2); color: #f59e0b; }
 
     /* 阶段指示器 */
-    .phase-indicator { display: none; align-items: center; gap: 6px; padding: 6px 12px; background: var(--vscode-editor-background); border-bottom: 1px solid var(--vscode-panel-border); font-size: var(--font-size-2); }
+    .phase-indicator { display: none; align-items: center; gap: 6px; padding: 6px 12px; background: var(--vscode-editor-background); border-bottom: 1px solid var(--vscode-panel-border); font-size: var(--font-size-2); flex-shrink: 0; }
     .phase-indicator.visible { display: flex; }
     .phase-indicator .phase-icon { width: 14px; height: 14px; fill: currentColor; animation: spin 1s linear infinite; }
     .phase-indicator .phase-text { color: var(--vscode-foreground); }

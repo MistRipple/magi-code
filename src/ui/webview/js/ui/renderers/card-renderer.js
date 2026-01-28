@@ -60,7 +60,7 @@ export function renderUnifiedCard(options) {
       html += '<span class="card-time">' + escapeHtml(time) + '</span>';
     }
     if (collapsed) {
-      html += '<span class="collapsible-icon' + (expanded ? ' expanded' : '') + '"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></span>';
+      html += '<span class="collapsible-icon' + (expanded ? ' expanded' : '') + '"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></span>';
     }
     html += '</div>';
   }
@@ -114,7 +114,7 @@ export function renderToolCallItem(tool, toolIdx, panelPrefix, isLatest) {
   html += '<div class="c-tool-use__content">';
 
   // 折叠图标
-  html += '<div class="c-tool-use__collapse-btn' + expandedClass + '"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></div>';
+  html += '<div class="c-tool-use__collapse-btn' + expandedClass + '"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></div>';
 
   // 工具图标
   html += '<div class="c-tool-use__icon">' + getToolIcon(tool.name) + '</div>';
@@ -135,7 +135,7 @@ export function renderToolCallItem(tool, toolIdx, panelPrefix, isLatest) {
   html += '<span class="c-tool-use__status c-tool-use__status--' + statusClass + '">' + statusText + '</span>';
 
   // 折叠图标
-  html += '<div class="c-collapsible-icon' + expandedClass + '"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></div>';
+  html += '<div class="c-collapsible-icon' + expandedClass + '"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></div>';
 
   html += '</div>'; // c-tool-use__header
   html += '</div>'; // c-tool-use__header-container
@@ -226,7 +226,7 @@ export function renderTaskCard(m, idx) {
   return renderUnifiedCard({
     type: 'task',
     variant: agent.toLowerCase() || 'default',
-    icon: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M2.5 0a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2h-11zm5.5 3a.5.5 0 0 1 .5.5v5.793l1.146-1.147a.5.5 0 0 1 .708.708l-2 2a.5.5 0 0 1-.708 0l-2-2a.5.5 0 1 1 .708-.708L7.5 9.293V3.5a.5.5 0 0 1 .5-.5z"/></svg>',
+    icon: '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M2.5 0a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2h-11zm5.5 3a.5.5 0 0 1 .5.5v5.793l1.146-1.147a.5.5 0 0 1 .708.708l-2 2a.5.5 0 0 1-.708 0l-2-2a.5.5 0 1 1 .708-.708L7.5 9.293V3.5a.5.5 0 0 1 .5-.5z"/></svg>',
     title: m.taskTitle || '子任务',
     badges: badges,
     time: m.time || '',

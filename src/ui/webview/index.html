@@ -9,10 +9,10 @@
   <title>MultiCLI</title>
   <!-- 引入模块化 CSS -->
   <link rel="stylesheet" href="styles/design-system.css">
-  <!-- Augment 风格组件样式 -->
-  <link rel="stylesheet" href="styles/components/tool-use.css">
-  <link rel="stylesheet" href="styles/components/codeblock.css">
-  <link rel="stylesheet" href="styles/components/thinking.css">
+  <link rel="stylesheet" href="styles/tokens.css">
+  <!-- 新设计系统组件样式 -->
+  <link rel="stylesheet" href="styles/components/panels.css">
+  <link rel="stylesheet" href="styles/components/collapsible.css">
   <link rel="stylesheet" href="styles/components/chat-message.css">
   <link rel="stylesheet" href="styles/base.css">
   <link rel="stylesheet" href="styles/layout.css">
@@ -103,19 +103,11 @@
       <div class="input-container">
         <div class="input-wrapper" id="input-wrapper">
           <div class="input-resize-bar" id="input-resize-bar"></div>
-          <!-- 图片预览区域 -->
-          <div class="image-preview-container" id="image-preview-container"></div>
-          <textarea class="input-box" id="prompt-input" placeholder="描述你的任务... (可粘贴图片)"></textarea>
-          <!-- 拖拽提示 -->
-          <div class="drop-overlay" id="drop-overlay"><span class="drop-overlay-text">释放以添加图片</span></div>
+          <textarea class="input-box" id="prompt-input" placeholder="描述你的任务..."></textarea>
           <div class="input-actions">
             <div class="input-actions-left">
-              <button class="icon-btn" id="attach-image-btn" title="添加图片 (Ctrl+V 粘贴)">
-                <svg viewBox="0 0 16 16"><path d="M6.002 5.5a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0z"/><path d="M2.002 1a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V3a2 2 0 0 0-2-2h-12zm12 1a1 1 0 0 1 1 1v6.5l-3.777-1.947a.5.5 0 0 0-.577.093l-3.71 3.71-2.66-1.772a.5.5 0 0 0-.63.062L1.002 12V3a1 1 0 0 1 1-1h12z"/></svg>
-              </button>
-              <input type="file" id="image-file-input" accept="image/*" multiple style="display:none" />
               <button class="icon-btn" id="use-skill-btn" title="使用 Skill">
-                <svg viewBox="0 0 16 16"><path d="M8 1.5a3.5 3.5 0 0 1 3.5 3.5c0 1.302-.73 2.43-1.8 3.012L9 10H7l-.7-1.988A3.5 3.5 0 0 1 8 1.5zm-2 12.5h4a.5.5 0 0 0 .5-.5V12H5.5v1.5a.5.5 0 0 0 .5.5z"/></svg>
+                <svg viewBox="0 0 16 16"><path d="M2 14l12-12M14 2l-2-2M4 12l2 2M12 4l2-2" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" fill="none"/><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="0.8" fill="none"/></svg>
               </button>
               <select class="model-selector" id="model-selector" title="选择模型">
                 <option value="">自动</option>
@@ -123,10 +115,10 @@
                 <option value="codex">Codex</option>
                 <option value="gemini">Gemini</option>
               </select>
-              <select class="mode-selector" id="mode-selector" title="交互模式">
-                <option value="ask">Ask</option>
-                <option value="auto" selected>Auto</option>
-              </select>
+              <div class="mode-toggle" id="mode-toggle" title="交互模式">
+                <button class="mode-toggle-option" data-mode="ask">Ask</button>
+                <button class="mode-toggle-option active" data-mode="auto">Auto</button>
+              </div>
             </div>
             <div class="input-actions-right">
               <button class="enhance-btn" id="enhance-btn" title="增强提示 (AI 优化)">
@@ -966,19 +958,25 @@
   </div>
 
   <!-- 引入 Markdown 和代码高亮库 -->
+  <!-- 注意：这些库必须在 ES Module 之前同步加载，否则会导致竞态条件 -->
+  <!-- 使用标准 script 标签同步加载，确保在模块代码执行前可用 -->
+  <script src="{{libUri}}/marked.min.js"></script>
+  <script src="{{libUri}}/highlight.min.js"></script>
+  <script src="{{libUri}}/morphdom-umd.min.js"></script>
+  <!-- 本地开发回退 -->
   <script>
-    (function () {
-      var libUri = '{{libUri}}';
-      if (libUri.indexOf('{{') === 0) {
-        libUri = './lib';
+    (function() {
+      // 检查库是否加载成功，如果失败则尝试本地路径
+      if (typeof marked === 'undefined') {
+        console.warn('[Webview] 库从 {{libUri}} 加载失败，尝试本地路径');
+        var libUri = './lib';
+        var scripts = ['marked.min.js', 'highlight.min.js', 'morphdom-umd.min.js'];
+        scripts.forEach(function (file) {
+          var s = document.createElement('script');
+          s.src = libUri + '/' + file;
+          document.head.appendChild(s);
+        });
       }
-      var scripts = ['marked.min.js', 'highlight.min.js'];
-      scripts.forEach(function (file) {
-        var s = document.createElement('script');
-        s.src = libUri + '/' + file;
-        s.defer = true;
-        document.head.appendChild(s);
-      });
     })();
   </script>
 

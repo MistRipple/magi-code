@@ -682,16 +682,6 @@ export class IntelligentOrchestrator {
     const context = await this.missionDrivenEngine.prepareContext(contextSessionId, userPrompt);
 
     const toolInventory = await this.tryBuildToolInventoryResponse(userPrompt);
-    if (toolInventory) {
-      if (taskId) {
-        if (task) {
-          await this.updateTaskStatus(taskId, 'completed', sessionId);
-        }
-        globalEventBus.emitEvent('task:completed', { taskId, data: { isRunning: false } });
-      }
-      await this.missionDrivenEngine.recordAssistantMessage(toolInventory);
-      return toolInventory;
-    }
 
     // 获取项目知识库上下文
     const projectContext = this.getProjectContext(500);
@@ -700,17 +690,22 @@ export class IntelligentOrchestrator {
 
     // 构建增强的提示词
     const knowledgeParts: string[] = [];
-    if (context) {
-      knowledgeParts.push(`## 会话上下文\n${context}`);
-    }
-    if (projectContext) {
-      knowledgeParts.push(`\n## 项目信息\n${projectContext}`);
-    }
-    if (relevantADRs) {
-      knowledgeParts.push(`\n${relevantADRs}`);
-    }
-    if (relevantFAQs) {
-      knowledgeParts.push(`\n${relevantFAQs}`);
+    if (toolInventory) {
+      knowledgeParts.push(`## 工具清单\n${toolInventory}`);
+      knowledgeParts.push(`\n## 输出要求\n- 用中文归纳汇总\n- 按类别列出（MCP / Skills / 内置 / 其他）\n- 描述尽量简短清晰\n- 不要输出清单之外的工具`);
+    } else {
+      if (context) {
+        knowledgeParts.push(`## 会话上下文\n${context}`);
+      }
+      if (projectContext) {
+        knowledgeParts.push(`\n## 项目信息\n${projectContext}`);
+      }
+      if (relevantADRs) {
+        knowledgeParts.push(`\n${relevantADRs}`);
+      }
+      if (relevantFAQs) {
+        knowledgeParts.push(`\n${relevantFAQs}`);
+      }
     }
 
     const prompt = knowledgeParts.length > 0
@@ -775,10 +770,17 @@ export class IntelligentOrchestrator {
       return '暂时无法读取工具清单（ToolManager 未初始化）。';
     }
 
+    const skillsConfig = LLMConfigLoader.loadSkillsConfig() || {};
+    const instructionSkills: Array<{ name: string; description?: string; disableModelInvocation?: boolean }> =
+      Array.isArray(skillsConfig.instructionSkills) ? skillsConfig.instructionSkills : [];
+    const skillTools = Array.isArray(skillsConfig.customTools) ? skillsConfig.customTools : [];
+    const builtInTools = skillsConfig.builtInTools || {};
+
     const tools = await toolManager.getTools();
     const mcpTools = tools.filter(t => t.metadata?.source === 'mcp');
-    const skillTools = tools.filter(t => t.metadata?.source === 'skill');
-    const builtinTools = tools.filter(t => t.metadata?.source === 'builtin');
+    const skillToolDefs = tools.filter(t => t.metadata?.source === 'skill');
+    const builtinToolDefs = tools.filter(t => t.metadata?.source === 'builtin');
+    const otherTools = tools.filter(t => !['mcp', 'skill', 'builtin'].includes(t.metadata?.source || ''));
 
     const mcpByServer = new Map<string, typeof mcpTools>();
     for (const tool of mcpTools) {
@@ -789,22 +791,40 @@ export class IntelligentOrchestrator {
       mcpByServer.get(serverId)!.push(tool);
     }
 
-    const skillsConfig = LLMConfigLoader.loadSkillsConfig() || {};
-    const instructionSkills: Array<{ name: string; description?: string; disableModelInvocation?: boolean }> =
-      Array.isArray(skillsConfig.instructionSkills) ? skillsConfig.instructionSkills : [];
+    const mcpExecutor = (this.adapterFactory as any).getMCPExecutor?.();
+    const mcpManager = mcpExecutor?.getMCPManager?.();
+    const mcpServers = LLMConfigLoader.loadMCPConfig() || [];
+
+    const hasChinese = (text: string) => /[\u4e00-\u9fff]/.test(text);
+    const formatDesc = (desc?: string) => {
+      if (!desc) return '';
+      const trimmed = desc.trim();
+      if (!trimmed) return '';
+      if (!hasChinese(trimmed)) return '';
+      if (trimmed.length > 80) return '';
+      return ` - ${trimmed}`;
+    };
 
     const lines: string[] = [];
     lines.push('🔎 **当前可用 MCP 工具与 Skill 清单**');
     lines.push('');
 
     lines.push('## MCP 工具');
-    if (mcpTools.length === 0) {
-      lines.push('- 当前没有已连接的 MCP 工具。');
+    const enabledServers = mcpServers.filter((s: any) => s && s.enabled !== false);
+    if (enabledServers.length === 0) {
+      lines.push('- 当前没有启用的 MCP 服务器。');
     } else {
-      for (const [serverId, serverTools] of mcpByServer.entries()) {
-        lines.push(`### ${serverId} (${serverTools.length} 个)`);
+      for (const server of enabledServers) {
+        const serverId = server.id || 'unknown';
+        const serverName = server.name || serverId;
+        const serverTools = mcpByServer.get(serverId) || [];
+        if (serverTools.length === 0) {
+          lines.push(`### ${serverName}（未连接或无工具）`);
+          continue;
+        }
+        lines.push(`### ${serverName} (${serverTools.length} 个)`);
         serverTools.forEach((tool, idx) => {
-          const desc = tool.description ? ` - ${tool.description}` : '';
+          const desc = formatDesc(tool.description);
           lines.push(`${idx + 1}. \`${tool.name}\`${desc}`);
         });
         lines.push('');
@@ -812,11 +832,11 @@ export class IntelligentOrchestrator {
     }
 
     lines.push('## Skills（工具）');
-    if (skillTools.length === 0) {
+    if (skillToolDefs.length === 0) {
       lines.push('- 当前没有启用的 Skill 工具。');
     } else {
-      skillTools.forEach((tool, idx) => {
-        const desc = tool.description ? ` - ${tool.description}` : '';
+      skillToolDefs.forEach((tool, idx) => {
+        const desc = formatDesc(tool.description);
         lines.push(`${idx + 1}. \`${tool.name}\`${desc}`);
       });
     }
@@ -828,15 +848,25 @@ export class IntelligentOrchestrator {
     } else {
       instructionSkills.forEach((skill, idx) => {
         const flag = skill.disableModelInvocation ? '（仅 /skill 调用）' : '';
-        lines.push(`${idx + 1}. \`${skill.name}\`${flag} - ${skill.description || ''}`);
+        const desc = formatDesc(skill.description || '');
+        lines.push(`${idx + 1}. \`${skill.name}\`${flag}${desc}`);
       });
     }
     lines.push('');
 
-    if (builtinTools.length > 0) {
+    if (builtinToolDefs.length > 0) {
       lines.push('## 内置工具');
-      builtinTools.forEach((tool, idx) => {
-        const desc = tool.description ? ` - ${tool.description}` : '';
+      builtinToolDefs.forEach((tool, idx) => {
+        const desc = formatDesc(tool.description);
+        lines.push(`${idx + 1}. \`${tool.name}\`${desc}`);
+      });
+      lines.push('');
+    }
+
+    if (otherTools.length > 0) {
+      lines.push('## 其他可用工具');
+      otherTools.forEach((tool, idx) => {
+        const desc = formatDesc(tool.description);
         lines.push(`${idx + 1}. \`${tool.name}\`${desc}`);
       });
       lines.push('');
