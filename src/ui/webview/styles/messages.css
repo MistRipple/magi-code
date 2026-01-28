@@ -373,7 +373,9 @@
     .image-viewer img { max-width: 90vw; max-height: 90vh; object-fit: contain; border-radius: var(--radius-2); }
 
     /* 主内容区 */
-    .main-content { flex: 1; overflow-y: auto; padding: 0 var(--spacing-2); min-height: 0; scroll-behavior: smooth; }
+    /* 🔧 修复：移除 scroll-behavior: smooth，避免流式输出时页面抖动和切换时可见滚动动画 */
+    /* 使用 overflow-anchor: auto 让浏览器自动维护滚动位置 */
+    .main-content { flex: 1; overflow-y: auto; padding: 0 var(--spacing-2); min-height: 0; overflow-anchor: auto; }
     .main-content::-webkit-scrollbar { width: 8px; }
     .main-content::-webkit-scrollbar-track { background: transparent; }
     .main-content::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: var(--radius-full); }
@@ -410,13 +412,10 @@
     .message.grouped + .message.grouped { margin-top: 4px; }
     .message.streaming { animation: none; }
 
-    /* 流式内容淡入动画 */
-    .message.streaming .message-content {
-      animation: content-fade-in 0.3s ease-out;
-    }
+    /* 🔧 优化：移除流式内容的重复淡入动画，避免每次渲染时闪烁 */
+    /* 仅在消息首次出现时使用淡入效果 */
 
     @keyframes msgFadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
-    @keyframes content-fade-in { from { opacity: 0.7; } to { opacity: 1; } }
 
     /* 用户消息 - 右对齐，带气泡，宽度自适应 */
     .message.user-message {
@@ -1012,27 +1011,36 @@
 
     /* 注：行内代码、链接、表格样式已在上方 Markdown 渲染样式块中定义 */
 
+    /* 🔧 优化：为消息内容添加平滑过渡，消除流式完成时的跳动 */
+    .message-content {
+      transition: max-height 0.3s ease-out, opacity 0.2s ease-out;
+    }
+
     /* 流式消息样式（无光标） */
     .message.streaming .message-content {
-      opacity: 0.9;
+      opacity: 0.95;
     }
 
     /* 🔧 流式输出时限制高度，防止页面被撑满 */
-    /* 🔧 修复：增大流式消息的 max-height 限制，避免内容被截断 */
+    /* 🔧 优化：使用更大的 max-height 并添加过渡动画 */
     .message.streaming .message-content {
-      max-height: 600px;
+      max-height: 800px;
       overflow-y: auto;
       position: relative;
     }
     .message.streaming .message-content.has-special-content {
-      max-height: 500px;
+      max-height: 600px;
+    }
+    /* 🔧 完成后移除高度限制，添加过渡动画 */
+    .message:not(.streaming) .message-content {
+      max-height: none;
     }
     /* 流式消息滚动条样式 */
     .message.streaming .message-content::-webkit-scrollbar { width: 8px; }
     .message.streaming .message-content::-webkit-scrollbar-track { background: transparent; }
     .message.streaming .message-content::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 4px; }
-    /* 流式输出时的渐变遮罩提示 */
-    .message.streaming .message-content::after {
+    /* 🔧 优化：渐变遮罩添加淡出动画 */
+    .message .message-content::after {
       content: '';
       position: sticky;
       bottom: 0;
@@ -1042,9 +1050,16 @@
       background: linear-gradient(transparent, var(--vscode-editor-background));
       pointer-events: none;
       display: block;
+      opacity: 0;
+      transition: opacity 0.3s ease-out;
     }
-    .message.streaming .message-content:not(.content-overflow)::after {
-      display: none;
+    .message.streaming .message-content::after {
+      opacity: 1;
+    }
+    .message.streaming .message-content:not(.content-overflow)::after,
+    .message:not(.streaming) .message-content::after {
+      opacity: 0;
+      height: 0;
     }
 
     /* 流式输出时底部的"正在输出"提示 - Augment 风格 */

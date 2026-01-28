@@ -14,6 +14,12 @@
  * 10. Skill 技能 - 内置工具调用
  *
  * 注意：此文件需要通过 run-e2e.ts 启动，以注入 vscode mock
+ *
+ * 消息流架构（4层）：
+ * Layer 1: Normalizer.emit('message')
+ * Layer 2: Adapter → messageBus.sendMessage() [直接调用]
+ * Layer 3: MessageBus → emit('message')
+ * Layer 4: 测试捕获 / WebviewProvider → postMessage()
  */
 
 import { LLMAdapterFactory } from '../../llm/adapter-factory';
@@ -27,6 +33,8 @@ import { ContextManager } from '../../context/context-manager';
 import { ProjectKnowledgeBase } from '../../knowledge/project-knowledge-base';
 import { SnapshotCoordinator } from '../../snapshot/snapshot-coordinator';
 import { ToolManager } from '../../tools/tool-manager';
+import { UnifiedMessageBus } from '../../normalizer/unified-message-bus';
+import { MESSAGE_EVENTS, PROCESSING_EVENTS } from '../../protocol/event-names';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -60,6 +68,7 @@ class E2ETestHarness {
   private adapterFactory: LLMAdapterFactory;
   private sessionManager: UnifiedSessionManager;
   private snapshotManager: SnapshotManager;
+  private messageBus: UnifiedMessageBus;
   private orchestrator: IntelligentOrchestrator | null = null;
   private taskManager: UnifiedTaskManager | null = null;
   private contextManager: ContextManager | null = null;
@@ -73,7 +82,19 @@ class E2ETestHarness {
   constructor(private workspaceRoot: string) {
     this.sessionManager = new UnifiedSessionManager(workspaceRoot);
     this.snapshotManager = new SnapshotManager(this.sessionManager, workspaceRoot);
+
+    // 创建 MessageBus（消息总线）
+    this.messageBus = new UnifiedMessageBus({
+      enabled: true,
+      minStreamInterval: 50,
+      batchInterval: 100,
+      retentionTime: 60000,
+      debug: true,
+    });
+
+    // 创建 AdapterFactory 并注入 MessageBus
     this.adapterFactory = new LLMAdapterFactory({ cwd: workspaceRoot });
+    this.adapterFactory.setMessageBus(this.messageBus);
   }
 
   async initialize(): Promise<void> {
@@ -148,9 +169,18 @@ class E2ETestHarness {
     this.setupMessageCapture();
   }
 
+  /**
+   * 设置消息捕获
+   *
+   * 消息流架构（4层）：
+   * Layer 1: Normalizer.emit('message')
+   * Layer 2: Adapter → messageBus.sendMessage() [直接调用]
+   * Layer 3: MessageBus → emit('message') ← 测试在此捕获
+   * Layer 4: WebviewProvider → postMessage()
+   */
   private setupMessageCapture(): void {
-    // 捕获标准消息
-    this.adapterFactory.on('standardMessage', (msg: any) => {
+    // 监听 MessageBus 的消息事件（Layer 3）
+    this.messageBus.on(MESSAGE_EVENTS.MESSAGE, (msg: any) => {
       this.capturedMessages.push({
         id: msg.id || '',
         source: msg.source || 'unknown',
@@ -162,7 +192,7 @@ class E2ETestHarness {
       });
     });
 
-    this.adapterFactory.on('standardComplete', (msg: any) => {
+    this.messageBus.on(MESSAGE_EVENTS.COMPLETE, (msg: any) => {
       this.capturedMessages.push({
         id: msg.id || '',
         source: msg.source || 'unknown',
@@ -175,10 +205,18 @@ class E2ETestHarness {
     });
 
     // 捕获流式更新
-    this.adapterFactory.on('stream', (update: any) => {
+    this.messageBus.on(MESSAGE_EVENTS.UPDATE, (update: any) => {
       this.streamUpdates.push({
         messageId: update.messageId || '',
         content: update.appendText || update.content || '',
+        timestamp: Date.now()
+      });
+    });
+
+    // 捕获处理状态变化
+    this.messageBus.on(PROCESSING_EVENTS.STATE_CHANGED, (state: any) => {
+      this.processingStateChanges.push({
+        isProcessing: state.isProcessing,
         timestamp: Date.now()
       });
     });

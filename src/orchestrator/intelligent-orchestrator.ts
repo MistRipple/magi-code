@@ -275,6 +275,11 @@ export class IntelligentOrchestrator {
     this.missionDrivenEngine.setTaskManager(taskManager, sessionId);
   }
 
+  /** 设置消息总线（用于发送阶段消息到主对话区） */
+  setMessageBus(messageBus: import('../normalizer/unified-message-bus').UnifiedMessageBus): void {
+    this.missionDrivenEngine.setMessageBus(messageBus);
+  }
+
   /** 设置项目知识库 */
   setKnowledgeBase(knowledgeBase: import('../knowledge/project-knowledge-base').ProjectKnowledgeBase): void {
     this.projectKnowledgeBase = knowledgeBase;

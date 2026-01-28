@@ -21,6 +21,7 @@ import {
   MessageLifecycle,
   MessageSource,
 } from '../protocol';
+import { MESSAGE_EVENTS, PROCESSING_EVENTS } from '../protocol/event-names';
 
 // ============================================================================
 // 类型定义
@@ -123,7 +124,7 @@ export class UnifiedMessageBus extends EventEmitter {
    */
   sendMessage(message: StandardMessage): boolean {
     if (!this.config.enabled) {
-      this.emit('message', message);
+      this.emit(MESSAGE_EVENTS.MESSAGE, message);
       return true;
     }
 
@@ -152,7 +153,7 @@ export class UnifiedMessageBus extends EventEmitter {
     if (lifecycle === MessageLifecycle.STARTED) {
       this.recordMessage(message, now);
       this.updateProcessingState(true, message.source, message.agent);
-      this.emit('message', message);
+      this.emit(MESSAGE_EVENTS.MESSAGE, message);
       this.debug('发送消息 [STARTED]', id);
       return true;
     }
@@ -163,7 +164,7 @@ export class UnifiedMessageBus extends EventEmitter {
       if (lifecycle === MessageLifecycle.STREAMING) {
         this.updateProcessingState(true, message.source, message.agent);
       }
-      this.emit('message', message);
+      this.emit(MESSAGE_EVENTS.MESSAGE, message);
       this.debug('发送消息 [NEW]', id);
       return true;
     }
@@ -183,7 +184,7 @@ export class UnifiedMessageBus extends EventEmitter {
       }
       existingState.lastStreamAt = now;
       existingState.message = message;
-      this.emit('message', message);
+      this.emit(MESSAGE_EVENTS.MESSAGE, message);
       this.debug('发送消息 [STREAMING]', id);
       return true;
     }
@@ -191,7 +192,7 @@ export class UnifiedMessageBus extends EventEmitter {
     // 5. COMPLETED/FAILED/CANCELLED：标记完成，发送
     if (this.isTerminalLifecycle(lifecycle)) {
       this.completeMessage(id, message, now);
-      this.emit('complete', message);
+      this.emit(MESSAGE_EVENTS.COMPLETE, message);
       this.checkAndUpdateProcessingState();
       this.debug('发送消息 [COMPLETE]', id);
       return true;
@@ -205,7 +206,7 @@ export class UnifiedMessageBus extends EventEmitter {
    */
   sendUpdate(update: StreamUpdate): boolean {
     if (!this.config.enabled) {
-      this.emit('update', update);
+      this.emit(MESSAGE_EVENTS.UPDATE, update);
       return true;
     }
 
@@ -229,7 +230,7 @@ export class UnifiedMessageBus extends EventEmitter {
     }
 
     state.lastStreamAt = now;
-    this.emit('update', update);
+    this.emit(MESSAGE_EVENTS.UPDATE, update);
     this.debug('发送更新', update.messageId);
     return true;
   }
@@ -305,7 +306,7 @@ export class UnifiedMessageBus extends EventEmitter {
       startedAt: isProcessing ? (this.processingState.startedAt || Date.now()) : null,
     };
     if (prev !== isProcessing) {
-      this.emit('processingStateChanged', this.getProcessingState());
+      this.emit(PROCESSING_EVENTS.STATE_CHANGED, this.getProcessingState());
     }
   }
 

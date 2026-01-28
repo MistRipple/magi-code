@@ -27,6 +27,7 @@ import {
   MessageType,
   ContentBlock,
 } from '../protocol/message-protocol';
+import { ADAPTER_EVENTS, MESSAGE_EVENTS, PROCESSING_EVENTS, WEBVIEW_MESSAGE_TYPES } from '../protocol/event-names';
 import { UnifiedSessionManager } from '../session';
 import { UnifiedTaskManager } from '../task/unified-task-manager';
 import { SessionManagerTaskRepository } from '../task/session-manager-task-repository';
@@ -177,12 +178,19 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const permissions = this.normalizePermissions(config.get<Partial<PermissionMatrix>>('permissions'));
     const strategy = this.normalizeStrategy(config.get<Partial<StrategyConfig>>('strategy'));
 
-    // 初始化 LLM 适配器工厂（替代 LLM 适配器工厂）
+    // 初始化 LLM 适配器工厂
     this.adapterFactory = new LLMAdapterFactory({ cwd: workspaceRoot });
+
+    // 注入 MessageBus 到 AdapterFactory（必须在创建 Adapter 之前）
+    // 这样 Adapter 可以直接通过 MessageBus 发送消息
+    (this.adapterFactory as LLMAdapterFactory).setMessageBus(this.messageBus);
+
     // 异步初始化 profile loader
     void (this.adapterFactory as LLMAdapterFactory).initialize().catch(err => {
       logger.error('Failed to initialize LLM adapter factory', { error: err.message }, LogCategory.LLM);
     });
+
+    // 设置错误事件处理（消息由 Adapter 直接发送到 MessageBus，不再通过事件转发）
     this.setupAdapterEvents();
     this.workerSelector = new WorkerSelector();
 
@@ -195,6 +203,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       { timeout, idleTimeout, maxTimeout, permissions, strategy }
     );
     this.intelligentOrchestrator.setExtensionContext(this.context);
+    // 注入 MessageBus 到编排器（用于发送阶段消息到主对话区）
+    this.intelligentOrchestrator.setMessageBus(this.messageBus);
     // 设置 Hard Stop 确认回调
     this.setupOrchestratorConfirmation();
     this.setupOrchestratorQuestions();
@@ -532,23 +542,20 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** 设置所有 LLM 适配器事件监听 */
+  /**
+   * 设置 LLM 适配器错误事件监听
+   *
+   * 消息流已简化为 4 层架构：
+   * Layer 1: Normalizer.emit('message')
+   * Layer 2: Adapter → messageBus.sendMessage() [直接调用]
+   * Layer 3: MessageBus → emit('message')
+   * Layer 4: WebviewProvider.setupMessageBusListeners() → postMessage()
+   *
+   * 此方法只处理错误事件，消息由 Adapter 直接发送到 MessageBus
+   */
   private setupAdapterEvents(): void {
-    // 🔧 重构：所有消息通过 UnifiedMessageBus 发送
-    // Adapter Factory 的事件直接接入 MessageBus
-    this.adapterFactory.on('standardMessage', (message: any) => {
-      this.messageBus.sendMessage(message);
-    });
-
-    this.adapterFactory.on('stream', (update: any) => {
-      this.messageBus.sendUpdate(update);
-    });
-
-    this.adapterFactory.on('standardComplete', (message: any) => {
-      this.messageBus.sendMessage(message);
-    });
-
-    this.adapterFactory.on('error', (error: Error) => {
+    // 只监听错误事件
+    this.adapterFactory.on(ADAPTER_EVENTS.ERROR, (error: Error) => {
       logger.error('适配器错误', { error: error.message }, LogCategory.LLM);
     });
   }
@@ -556,27 +563,27 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 设置 MessageBus 事件监听，转发消息到前端 */
   private setupMessageBusListeners(): void {
     // MessageBus 事件转发到前端
-    this.messageBus.on('message', (message) => {
+    this.messageBus.on(MESSAGE_EVENTS.MESSAGE, (message) => {
       this.postMessage({
-        type: 'standardMessage',
+        type: WEBVIEW_MESSAGE_TYPES.STANDARD_MESSAGE,
         message,
         sessionId: this.activeSessionId
       } as any);
       this.logMessageFlow('standardMessage [SENT]', message);
     });
 
-    this.messageBus.on('update', (update) => {
+    this.messageBus.on(MESSAGE_EVENTS.UPDATE, (update) => {
       this.postMessage({
-        type: 'standardUpdate',
+        type: WEBVIEW_MESSAGE_TYPES.STANDARD_UPDATE,
         update,
         sessionId: this.activeSessionId
       } as any);
       this.logMessageFlow('standardUpdate [SENT]', update);
     });
 
-    this.messageBus.on('complete', (message) => {
+    this.messageBus.on(MESSAGE_EVENTS.COMPLETE, (message) => {
       this.postMessage({
-        type: 'standardComplete',
+        type: WEBVIEW_MESSAGE_TYPES.STANDARD_COMPLETE,
         message,
         sessionId: this.activeSessionId
       } as any);
@@ -584,9 +591,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     // 处理状态变化 - 推送到前端
-    this.messageBus.on('processingStateChanged', (state) => {
+    this.messageBus.on(PROCESSING_EVENTS.STATE_CHANGED, (state) => {
       this.postMessage({
-        type: 'processingStateChanged',
+        type: WEBVIEW_MESSAGE_TYPES.PROCESSING_STATE_CHANGED,
         state,
         sessionId: this.activeSessionId
       } as any);
@@ -4931,11 +4938,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private async executeWithIntelligentOrchestrator(prompt: string, imagePaths: string[]): Promise<void> {
     logger.info('界面.执行.模式.智能', undefined, LogCategory.UI);
 
-    // 立即发送"正在思考"消息，避免前端显示兜底动画
-    this.sendOrchestratorMessage({
-      content: '正在分析您的需求...',
-      messageType: 'progress'
-    });
+    // 🔧 初始分析消息已由 MissionDrivenEngine.sendPhaseMessage 统一发送
+    // 不再在这里重复发送，避免用户看到两条类似的"正在分析"消息
 
     try {
       // 调用智能编排器

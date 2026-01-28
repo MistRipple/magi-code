@@ -1,6 +1,12 @@
 /**
  * LLM 适配器抽象基类
  * 替代 LLM 适配器，使用 LLM API 直接通信
+ *
+ * 消息流架构（4层）：
+ * Layer 1: Normalizer.emit('message')
+ * Layer 2: Adapter.setupNormalizerEvents() → messageBus.sendMessage() [直接调用]
+ * Layer 3: MessageBus → emit('message')
+ * Layer 4: WebviewProvider.setupMessageBusListeners() → postMessage()
  */
 
 import { EventEmitter } from 'events';
@@ -8,7 +14,9 @@ import { AgentType, AgentRole, LLMConfig, TokenUsage } from '../../types/agent-t
 import { LLMClient } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager } from '../../tools/tool-manager';
+import { UnifiedMessageBus } from '../../normalizer/unified-message-bus';
 import { logger, LogCategory } from '../../logging';
+import { MESSAGE_EVENTS, ADAPTER_EVENTS } from '../../protocol/event-names';
 
 /**
  * 适配器状态
@@ -34,6 +42,9 @@ export interface AdapterEvents {
 
 /**
  * LLM 适配器基类
+ *
+ * 直接持有 MessageBus 引用，消息通过 MessageBus 发送到前端。
+ * 不再通过事件转发链，减少层级，提高效率。
  */
 export abstract class BaseLLMAdapter extends EventEmitter {
   protected state: AdapterState = AdapterState.DISCONNECTED;
@@ -45,40 +56,84 @@ export abstract class BaseLLMAdapter extends EventEmitter {
   protected lastTokenUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
   protected totalTokenUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
 
+  /**
+   * 消息总线 - 直接发送消息到前端
+   * 这是消息的唯一出口，不再通过事件转发
+   */
+  protected messageBus: UnifiedMessageBus;
+
+  /**
+   * 控制是否将消息流式传输到 UI
+   * - true: 消息会发送到前端（默认）
+   * - false: 静默模式，用于内部后台操作（如内存压缩）
+   */
+  protected _streamToUI: boolean = true;
+
   constructor(
     client: LLMClient,
     normalizer: BaseNormalizer,
     toolManager: ToolManager,
-    config: LLMConfig
+    config: LLMConfig,
+    messageBus: UnifiedMessageBus
   ) {
     super();
     this.client = client;
     this.normalizer = normalizer;
     this.toolManager = toolManager;
     this.config = config;
+    this.messageBus = messageBus;
 
-    // 转发 normalizer 事件
+    // 设置 Normalizer 事件处理，直接发送到 MessageBus
     this.setupNormalizerEvents();
   }
 
   /**
-   * 设置 normalizer 事件转发
+   * 设置是否流式传输到 UI
+   */
+  setStreamToUI(enabled: boolean): void {
+    this._streamToUI = enabled;
+  }
+
+  /**
+   * 获取当前 streamToUI 状态
+   */
+  get streamToUI(): boolean {
+    return this._streamToUI;
+  }
+
+  /**
+   * 设置 Normalizer 事件处理
+   *
+   * 消息直接发送到 MessageBus（Layer 2 → Layer 3）：
+   * - 根据 streamToUI 控制是否发送
+   * - 跳过 AdapterFactory 和 WebviewProvider 的中间转发层
+   * - 错误事件仍通过 EventEmitter 传递（需要特殊处理）
    */
   private setupNormalizerEvents(): void {
-    this.normalizer.on('message', (message) => {
-      this.emit('standardMessage', message);
+    // 消息开始/流式：直接发送到 MessageBus
+    this.normalizer.on(MESSAGE_EVENTS.MESSAGE, (message) => {
+      if (this._streamToUI) {
+        this.messageBus.sendMessage(message);
+      }
     });
 
-    this.normalizer.on('complete', (messageId, message) => {
-      this.emit('standardComplete', message);
+    // 消息完成：直接发送到 MessageBus
+    this.normalizer.on(MESSAGE_EVENTS.COMPLETE, (_messageId, message) => {
+      if (this._streamToUI) {
+        this.messageBus.sendMessage(message);
+      }
     });
 
-    this.normalizer.on('update', (update) => {
-      this.emit('stream', update);
+    // 流式更新：直接发送到 MessageBus
+    this.normalizer.on(MESSAGE_EVENTS.UPDATE, (update) => {
+      if (this._streamToUI) {
+        this.messageBus.sendUpdate(update);
+      }
     });
 
-    this.normalizer.on('error', (error) => {
-      this.emit('normalizerError', error);
+    // 错误事件：通过 EventEmitter 传递（需要特殊处理）
+    this.normalizer.on(MESSAGE_EVENTS.ERROR, (error) => {
+      this.emit(ADAPTER_EVENTS.NORMALIZER_ERROR, error);
     });
   }
 
@@ -94,28 +149,21 @@ export abstract class BaseLLMAdapter extends EventEmitter {
 
   /**
    * 连接到 LLM
+   *
+   * 直接标记为已连接状态，不再发送测试请求。
+   * 如果配置有误（API key 错误等），sendMessage 时会抛出错误并返回给用户。
+   * 这样避免了第一条消息发送两次 LLM 请求的性能问题。
    */
   async connect(): Promise<void> {
     if (this.state === AdapterState.CONNECTED) {
       return;
     }
 
-    this.setState(AdapterState.CONNECTING);
-
-    try {
-      // 测试连接
-      const connected = await this.client.testConnection();
-      if (!connected) {
-        throw new Error('Failed to connect to LLM');
-      }
-
-      this.setState(AdapterState.CONNECTED);
-      logger.info(`${this.agent} adapter connected`, undefined, LogCategory.LLM);
-    } catch (error: any) {
-      this.setState(AdapterState.ERROR);
-      logger.error(`${this.agent} adapter connection failed`, { error: error.message }, LogCategory.LLM);
-      throw error;
-    }
+    // 直接标记为已连接，跳过 testConnection 调用
+    // 原因：testConnection 会发送一个 "test" 消息到 LLM API，
+    // 这导致第一条用户消息需要等待两次 LLM 往返，延迟翻倍
+    this.setState(AdapterState.CONNECTED);
+    logger.info(`${this.agent} adapter connected`, undefined, LogCategory.LLM);
   }
 
   /**

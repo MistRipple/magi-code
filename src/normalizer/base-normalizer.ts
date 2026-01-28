@@ -24,6 +24,7 @@ import {
   generateMessageId,
 } from '../protocol';
 import { parseContentToBlocks } from '../utils/content-parser';
+import { MESSAGE_EVENTS } from '../protocol/event-names';
 
 /**
  * Normalizer 配置
@@ -102,7 +103,7 @@ export abstract class BaseNormalizer extends EventEmitter {
       { id: messageId }
     );
 
-    this.emit('message', message);
+    this.emit(MESSAGE_EVENTS.MESSAGE, message);
     this.debug(`[${this.agent}] 开始流式消息: ${messageId}`);  // ✅ 使用 agent
 
     return messageId;
@@ -119,7 +120,7 @@ export abstract class BaseNormalizer extends EventEmitter {
     const updates = this.parseChunk(context, chunk);
 
     for (const update of updates) {
-      this.emit('update', update);
+      this.emit(MESSAGE_EVENTS.UPDATE, update);
     }
   }
 
@@ -134,7 +135,7 @@ export abstract class BaseNormalizer extends EventEmitter {
     const message = this.buildFinalMessage(context, error);
     this.activeContexts.delete(messageId);
 
-    this.emit('complete', messageId, message);
+    this.emit(MESSAGE_EVENTS.COMPLETE, messageId, message);
     this.debug(`[${this.agent}] 消息完成: ${messageId}, blocks: ${message.blocks.length}`);  // ✅ 使用 agent
 
     return message;
@@ -151,7 +152,7 @@ export abstract class BaseNormalizer extends EventEmitter {
     message.lifecycle = MessageLifecycle.CANCELLED;
     this.activeContexts.delete(messageId);
 
-    this.emit('complete', messageId, message);
+    this.emit(MESSAGE_EVENTS.COMPLETE, messageId, message);
     this.debug(`[${this.agent}] 消息中断: ${messageId}`);  // ✅ 使用 agent
 
     return message;
@@ -175,21 +176,7 @@ export abstract class BaseNormalizer extends EventEmitter {
     const blocks = [...context.blocks];
 
     if (context.pendingText.trim()) {
-      // 🔍 检查点：记录 Worker 消息解析
-      console.log('[DEBUG-WORKER] buildFinalMessage 解析 pendingText:', {
-        messageId: context.messageId,
-        pendingTextLength: context.pendingText.trim().length,
-        pendingTextPreview: context.pendingText.trim().substring(0, 200),
-      });
-
       const parsedBlocks = parseContentToBlocks(context.pendingText.trim());
-
-      // 🔍 检查点：记录解析结果
-      console.log('[DEBUG-WORKER] parseContentToBlocks 返回:', {
-        messageId: context.messageId,
-        blocksCount: parsedBlocks.length,
-        blockTypes: parsedBlocks.map(b => b.type),
-      });
 
       if (parsedBlocks.length > 0) {
         blocks.push(...parsedBlocks);

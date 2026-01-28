@@ -38,6 +38,10 @@ export abstract class BaseLLMClient extends EventEmitter implements LLMClient {
 
   /**
    * 测试连接
+   *
+   * 注意：此方法会发送一个实际的 LLM 请求来测试连接，可能产生延迟和费用。
+   * 不建议在连接阶段调用，Adapter.connect() 已不再使用此方法。
+   * 保留此方法仅供需要显式验证 API 配置的场景使用（如设置界面测试）。
    */
   async testConnection(): Promise<boolean> {
     try {

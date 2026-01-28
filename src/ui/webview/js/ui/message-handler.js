@@ -133,20 +133,8 @@ export function handleStandardMessage(message) {
         }
         Object.assign(existingMsg, updatedMsg);
       } else {
-        // 🔧 简化：直接添加消息，后端已去重
+        // 🔧 简化：直接添加消息，后端已完成去重
         const webviewMsg = standardToWebviewMessage(message);
-
-        // 🔧 新增：内容去重 - 检查是否存在内容完全相同的消息
-        const targetMessages = isOrchestrator ? threadMessages : (agentOutputs[agent] || []);
-        const duplicateByContent = findEquivalentMessage(targetMessages, webviewMsg, 30000);
-        if (duplicateByContent) {
-          console.log('[Webview] 跳过内容重复的消息:', message.id, 'duplicate of:', duplicateByContent.standardMessageId);
-          // 更新已存在消息的元数据而不是添加新消息
-          if (webviewMsg.standardMessageId) {
-            duplicateByContent.standardMessageId = webviewMsg.standardMessageId;
-          }
-          return;
-        }
 
         if (isOrchestrator) {
           threadMessages.push(webviewMsg);
@@ -158,10 +146,9 @@ export function handleStandardMessage(message) {
         }
       }
 
-      // Worker 输出镜像到 Thread 面板，确保主对话可见流式输出
-      if (!isOrchestrator) {
-        upsertThreadMirrorFromWorker(message);
-      }
+      // 🔧 架构重构：Worker 完整输出只显示在 Agent Tab，不再镜像到主对话
+      // 主对话区只显示：用户消息、编排者消息、Worker 执行摘要（由编排者发送）
+      // Worker 的详细执行过程（思考、工具调用、代码）保留在各自的 Agent Tab 中
 
       // 设置处理状态
       if (message.lifecycle === 'streaming' || message.lifecycle === 'started') {
@@ -231,6 +218,9 @@ export function handleStandardUpdate(update) {
         Object.assign(webviewMsg, updatedMsg);
 
         // 🔧 使用 StreamingManager 进行增量更新
+        // 🔧 修复：webviewMsg.content 已经是累积后的完整内容
+        // 所以应该使用 'replace' 模式同步到 StreamingManager
+        // 而不是 'append' 模式（否则会导致内容重复追加）
         if (update.updateType === 'append' || update.updateType === 'replace') {
           // 准备增量数据
           const delta = {
@@ -238,7 +228,9 @@ export function handleStandardUpdate(update) {
             thinking: updatedMsg.thinking,
             toolCalls: updatedMsg.toolCalls,
             parsedBlocks: updatedMsg.parsedBlocks,
-            updateType: update.updateType
+            // 🔧 关键修复：始终使用 replace 模式
+            // 因为 updatedMsg.content 已经是完整的累积内容
+            updateType: 'replace'
           };
 
           // 尝试通过 StreamingManager 更新
@@ -254,21 +246,8 @@ export function handleStandardUpdate(update) {
         }
       }
 
-      // 同步更新 Thread 面板中的 Worker 镜像
-      if (message.source !== 'orchestrator') {
-        const mirrorMsg = upsertThreadMirrorFromWorker(message);
-        if (mirrorMsg && (update.updateType === 'append' || update.updateType === 'replace')) {
-          // Worker 镜像也通过 StreamingManager 更新
-          const delta = {
-            content: mirrorMsg.content,
-            thinking: mirrorMsg.thinking,
-            toolCalls: mirrorMsg.toolCalls,
-            parsedBlocks: mirrorMsg.parsedBlocks,
-            updateType: update.updateType
-          };
-          streamingManager.updateStream(mirrorMsg.standardMessageId || mirrorMsg.streamKey, delta);
-        }
-      }
+      // 🔧 架构重构：不再镜像 Worker 消息到主对话
+      // Worker 消息只在 Agent Tab 中更新
 
       throttledSaveState();
       smoothScrollToBottom();
@@ -323,10 +302,8 @@ export function handleStandardComplete(message) {
         }
       }
 
-      // 同步更新 Thread 面板中的 Worker 镜像
-      if (message.source !== 'orchestrator') {
-        upsertThreadMirrorFromWorker(message);
-      }
+      // 🔧 架构重构：不再镜像 Worker 消息到主对话
+      // Worker 消息完成时只更新 Agent Tab 中的状态
 
       // 检查是否还有活跃的流式消息，用于停止提示计时器
       // 注意：处理状态由后端 processingStateChanged 事件控制，前端不再自行判断
@@ -1034,33 +1011,9 @@ export function ensureThreadStreamMessage(source, agent, initialContent) {
 // 消息转换和规范化
 // ============================================
 
-export function upsertThreadMirrorFromWorker(message) {
-      if (!message || message.source === 'orchestrator') return null;
-      const existingIdx = threadMessages.findIndex(m => m.standardMessageId === message.id && m.source === 'worker');
-      const mirrorMsg = standardToWebviewMessage(message);
-      mirrorMsg.mirroredFromCli = true;
-      if (existingIdx !== -1) {
-        const existing = threadMessages[existingIdx];
-        if (existing.startedAt && !mirrorMsg.startedAt) {
-          mirrorMsg.startedAt = existing.startedAt;
-        }
-        if (existing.streamKey) {
-          mirrorMsg.streamKey = existing.streamKey;
-        }
-        Object.assign(existing, mirrorMsg);
-        return existing;
-      }
-
-      // 🔧 新增：内容去重 - 检查是否存在内容完全相同的消息
-      const duplicateByContent = findEquivalentMessage(threadMessages, mirrorMsg, 30000);
-      if (duplicateByContent) {
-        console.log('[Webview] Worker 镜像跳过内容重复的消息:', message.id);
-        return duplicateByContent;
-      }
-
-      threadMessages.push(mirrorMsg);
-      return mirrorMsg;
-    }
+// 🔧 架构重构：已移除 upsertThreadMirrorFromWorker 函数
+// Worker 完整输出不再镜像到主对话区，只显示在各自的 Agent Tab
+// 主对话区只显示：用户消息、编排者消息、Worker 执行摘要
 
 export function applyPendingUpdates(message) {
       const pending = pendingStandardUpdates.get(message.id);
@@ -1069,38 +1022,8 @@ export function applyPendingUpdates(message) {
       pendingStandardUpdates.delete(message.id);
     }
 
-export function normalizeMessageContentForDedup(content) {
-      if (!content) return '';
-      return String(content)
-        .replace(/^#{1,6}\s*/gm, '')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .toLowerCase();
-    }
-
-export function findEquivalentMessage(messages, webviewMsg, windowMs) {
-      const normalized = normalizeMessageContentForDedup(webviewMsg.content || '');
-      if (!normalized) return null;
-      const ts = webviewMsg.timestamp || Date.now();
-      const targetType = webviewMsg.messageType || '';
-      const maxWindow = typeof windowMs === 'number' ? windowMs : 5000;
-      for (let i = messages.length - 1; i >= 0; i -= 1) {
-        const m = messages[i];
-        if (!m) continue;
-        if (m.source !== webviewMsg.source || m.role !== webviewMsg.role) continue;
-        const existingType = m.messageType || '';
-        if (targetType && existingType && targetType !== existingType) continue;
-        const delta = Math.abs((m.timestamp || 0) - ts);
-        if (delta > maxWindow && i < messages.length - 5) {
-          break;
-        }
-        const existingNormalized = normalizeMessageContentForDedup(m.content || '');
-        if (existingNormalized && existingNormalized === normalized) {
-          return m;
-        }
-      }
-      return null;
-    }
+// 🔧 已移除：normalizeMessageContentForDedup 和 findEquivalentMessage
+// 前端去重逻辑已迁移到后端 MessageBus，不再需要前端去重
 
 export function isInternalJsonMessage(content) {
       if (!content || typeof content !== 'string') return false;

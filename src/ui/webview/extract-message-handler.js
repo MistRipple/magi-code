@@ -47,10 +47,9 @@ const messageHandlerFunctions = [
   'updateAgentStreamingMessage',
 
   // 消息转换和规范化
-  'upsertThreadMirrorFromWorker',
+  // 🔧 已移除：upsertThreadMirrorFromWorker - Worker 输出不再镜像到主对话
   'applyPendingUpdates',
-  'normalizeMessageContentForDedup',
-  'findEquivalentMessage',
+  // 🔧 已移除：normalizeMessageContentForDedup, findEquivalentMessage - 前端去重已迁移到后端
   'isInternalJsonMessage',
 
   // 交互处理
@@ -193,10 +192,9 @@ const groups = {
     'updateAgentStreamingMessage'
   ],
   '消息转换和规范化': [
-    'upsertThreadMirrorFromWorker',
+    // 🔧 已移除：upsertThreadMirrorFromWorker - Worker 输出不再镜像到主对话
     'applyPendingUpdates',
-    'normalizeMessageContentForDedup',
-    'findEquivalentMessage',
+    // 🔧 已移除：normalizeMessageContentForDedup, findEquivalentMessage
     'isInternalJsonMessage'
   ],
   '交互处理': [

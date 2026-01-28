@@ -66,15 +66,21 @@ export function generateId() {
 }
 
 /**
- * 平滑滚动到底部
+ * 滚动到底部
+ * @param {boolean} smooth - 是否使用平滑滚动（默认 false，避免流式输出时抖动）
  */
-export function smoothScrollToBottom() {
+export function smoothScrollToBottom(smooth = false) {
   const mainContent = document.getElementById('main-content');
   if (mainContent) {
-    mainContent.scrollTo({
-      top: mainContent.scrollHeight,
-      behavior: 'smooth'
-    });
+    if (smooth) {
+      mainContent.scrollTo({
+        top: mainContent.scrollHeight,
+        behavior: 'smooth'
+      });
+    } else {
+      // 🔧 优化：直接设置 scrollTop，避免抖动
+      mainContent.scrollTop = mainContent.scrollHeight;
+    }
   }
 }
 

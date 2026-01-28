@@ -10,7 +10,7 @@ import {
   ToolMetadata,
 } from './types';
 import { ToolCall, ToolResult, ToolDefinition } from '../llm/types';
-import { ShellExecutor } from './shell-executor';
+// ShellExecutor 已废弃，统一使用 VSCodeTerminalExecutor 实现终端可视化
 import { VSCodeTerminalExecutor } from './vscode-terminal-executor';
 import { logger, LogCategory } from '../logging';
 import { PermissionMatrix } from '../types';
@@ -19,7 +19,7 @@ import { PermissionMatrix } from '../types';
  * 工具管理器
  */
 export class ToolManager extends EventEmitter implements ToolExecutor {
-  private shellExecutor: ShellExecutor;
+  // 统一使用 VSCode Terminal 执行器，实现终端可视化
   private terminalExecutor: VSCodeTerminalExecutor;
   private mcpExecutors: Map<string, ToolExecutor> = new Map();
   private skillExecutors: Map<string, ToolExecutor> = new Map();
@@ -29,7 +29,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
   constructor(permissions?: PermissionMatrix) {
     super();
-    this.shellExecutor = new ShellExecutor();
     this.terminalExecutor = new VSCodeTerminalExecutor();
     this.permissions = permissions || {
       allowEdit: true,
@@ -195,10 +194,10 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    * 检查工具权限
    */
   private checkPermission(toolName: string): { allowed: boolean; reason?: string } {
-    // Bash/Shell 工具需要 allowBash 权限
+    // 终端命令工具需要 allowBash 权限（通过 VSCode Terminal 执行）
     if (toolName === 'Bash' || toolName === 'execute_shell') {
       if (!this.permissions.allowBash) {
-        return { allowed: false, reason: 'Bash execution is disabled' };
+        return { allowed: false, reason: 'Terminal command execution is disabled' };
       }
       return { allowed: true };
     }
@@ -234,14 +233,14 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
     const tools: ExtendedToolDefinition[] = [];
 
-    // 添加内置 Shell 工具
-    const shellTool = this.shellExecutor.getToolDefinition();
+    // 添加内置 Shell 工具（使用 VSCode Terminal 实现可视化）
+    const shellTool = this.terminalExecutor.getToolDefinition();
     tools.push({
       ...shellTool,
       metadata: {
         source: 'builtin',
         category: 'system',
-        tags: ['shell', 'command', 'execution'],
+        tags: ['shell', 'command', 'execution', 'terminal'],
       },
     });
 
@@ -310,7 +309,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   }
 
   /**
-   * 执行 Shell 工具
+   * 执行 Shell 工具（统一使用 VSCode Terminal 实现可视化）
    */
   private async executeShellTool(toolCall: ToolCall): Promise<ToolResult> {
     const args = toolCall.arguments as any;
@@ -318,14 +317,13 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       command,
       cwd,
       timeout,
-      showTerminal,
-      keepTerminalOpen,
-      useVSCodeTerminal,
+      showTerminal = true,  // 默认显示终端
+      keepTerminalOpen = false,
       name
     } = args;
 
     // 验证命令安全性
-    const validation = this.shellExecutor.validateCommand(command);
+    const validation = this.terminalExecutor.validateCommand(command);
     if (!validation.valid) {
       return {
         toolCallId: toolCall.id,
@@ -334,25 +332,21 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       };
     }
 
-    // 选择执行器：如果指定使用VSCode终端或需要显示终端，则使用终端执行器
-    const shouldUseTerminal = useVSCodeTerminal || showTerminal;
-    const executor = shouldUseTerminal ? this.terminalExecutor : this.shellExecutor;
-
-    logger.debug('Executing shell command', {
+    logger.debug('Executing shell command in VSCode Terminal', {
       command,
-      executor: shouldUseTerminal ? 'VSCodeTerminal' : 'ChildProcess',
       showTerminal,
       keepTerminalOpen,
     }, LogCategory.TOOLS);
 
-    const result = await executor.execute({
+    // 统一使用 VSCode Terminal 执行器
+    const result = await this.terminalExecutor.execute({
       command,
       cwd,
       timeout,
       name,
       showTerminal,
       keepTerminalOpen,
-      useVSCodeTerminal,
+      useVSCodeTerminal: true,
     });
 
     if (result.exitCode !== 0) {
