@@ -7,6 +7,7 @@ import { AgentType, AgentRole, LLMConfig } from '../../types/agent-types';
 import { LLMClient, LLMMessageParams, LLMMessage } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager } from '../../tools/tool-manager';
+import { UnifiedMessageBus } from '../../normalizer/unified-message-bus';
 import { BaseLLMAdapter, AdapterState } from './base-adapter';
 import { logger, LogCategory } from '../../logging';
 
@@ -30,6 +31,7 @@ export interface OrchestratorAdapterConfig {
   normalizer: BaseNormalizer;
   toolManager: ToolManager;
   config: LLMConfig;
+  messageBus: UnifiedMessageBus;  // 必选：消息总线
   systemPrompt?: string;
   historyConfig?: OrchestratorHistoryConfig;
 }
@@ -48,7 +50,8 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       adapterConfig.client,
       adapterConfig.normalizer,
       adapterConfig.toolManager,
-      adapterConfig.config
+      adapterConfig.config,
+      adapterConfig.messageBus
     );
     this.systemPrompt = adapterConfig.systemPrompt || this.getDefaultSystemPrompt();
     this.historyConfig = {

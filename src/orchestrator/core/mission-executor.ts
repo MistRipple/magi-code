@@ -26,6 +26,8 @@ import { SnapshotManager } from '../../snapshot-manager';
 import { UnifiedTaskManager } from '../../task/unified-task-manager';
 import { PlanTodoManager } from '../plan-todo';
 import { logger, LogCategory } from '../../logging';
+// 🔧 已移除 UnifiedMessageBus、MessageType、MessageLifecycle、StandardMessage 导入
+// Worker 执行摘要现在通过 subtask:completed 事件 + subTaskCard 机制发送
 
 /**
  * 阻塞项类型
@@ -153,6 +155,9 @@ export class MissionExecutor extends EventEmitter {
   private contextManager: import('../../context/context-manager').ContextManager | null = null;
   private currentMissionId: string | null = null;
 
+  // 🔧 已移除 messageBus 和 currentSessionId 属性
+  // Worker 执行摘要现在通过 subtask:completed 事件 + subTaskCard 机制发送
+
   constructor(
     private orchestrator: MissionOrchestrator,
     private profileLoader: ProfileLoader,
@@ -161,6 +166,9 @@ export class MissionExecutor extends EventEmitter {
     super();
     this.reviewer = new ProfileAwareReviewer(profileLoader);
   }
+
+  // 🔧 已移除 setMessageBus 和 setSessionId 方法
+  // Worker 执行摘要现在通过 subtask:completed 事件 + subTaskCard 机制发送
 
   /**
    * 设置快照管理器
@@ -725,6 +733,8 @@ export class MissionExecutor extends EventEmitter {
     }
 
     // 同步 SubTask 状态
+    // 🔧 这会触发 subtask:completed/failed 事件，webview-provider 会发送带有 subTaskCard 的消息
+    // 因此不需要再调用 sendWorkerSummary，避免重复消息
     await this.updateSubTaskStatus(
       mission,
       assignment,
@@ -740,6 +750,10 @@ export class MissionExecutor extends EventEmitter {
 
     return result;
   }
+
+  // 🔧 已移除 sendWorkerSummary 方法
+  // Worker 执行摘要现在通过 subtask:completed 事件 + subTaskCard 机制发送
+  // 这提供了更好的视觉呈现（卡片样式而非纯文本）
 
   private updateContractsFromAssignment(mission: Mission, assignment: Assignment): void {
     const producedContracts = new Set<string>();

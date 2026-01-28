@@ -7,14 +7,30 @@ import { EventEmitter } from 'events';
 import { AgentType, WorkerSlot } from '../types/agent-types';
 
 /**
- * 适配器输出范围
+ * 适配器输出范围配置
+ * 控制 LLM 响应的输出行为
  */
 export interface AdapterOutputScope {
+  /** 是否包含思考内容（thinking blocks） */
   includeThinking?: boolean;
+
+  /** 是否包含工具调用信息 */
   includeToolCalls?: boolean;
+
+  /** 消息来源标识 */
   source?: 'orchestrator' | 'worker' | 'user';
+
+  /**
+   * 是否将响应流式传输到 UI
+   * - true（默认）: 消息会实时显示给用户
+   * - false: 静默模式，用于内部后台操作（如内存压缩、内部分析）
+   */
   streamToUI?: boolean;
+
+  /** 适配器角色 */
   adapterRole?: 'orchestrator' | 'worker';
+
+  /** 附加元数据，会传递到消息中 */
   messageMeta?: Record<string, any>;
 }
 

@@ -7,6 +7,7 @@ import { AgentType, AgentRole, LLMConfig, WorkerSlot } from '../../types/agent-t
 import { LLMClient, LLMMessageParams, LLMMessage, ToolCall } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager } from '../../tools/tool-manager';
+import { UnifiedMessageBus } from '../../normalizer/unified-message-bus';
 import { BaseLLMAdapter, AdapterState } from './base-adapter';
 import { logger, LogCategory } from '../../logging';
 import { AgentProfileLoader } from '../../orchestrator/profile/agent-profile-loader';
@@ -32,9 +33,10 @@ export interface WorkerAdapterConfig {
   normalizer: BaseNormalizer;
   toolManager: ToolManager;
   config: LLMConfig;
+  messageBus: UnifiedMessageBus;  // 必选：消息总线
   workerSlot: WorkerSlot;
   systemPrompt?: string;
-  profileLoader?: AgentProfileLoader;  // ✅ 新增：用于加载 Agent 画像
+  profileLoader?: AgentProfileLoader;
   historyConfig?: HistoryManagementConfig;
 }
 
@@ -55,7 +57,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       adapterConfig.client,
       adapterConfig.normalizer,
       adapterConfig.toolManager,
-      adapterConfig.config
+      adapterConfig.config,
+      adapterConfig.messageBus
     );
     this.workerSlot = adapterConfig.workerSlot;
     this.profileLoader = adapterConfig.profileLoader;

@@ -36,35 +36,12 @@ export function normalizeOrchestratorMessage(
 ): StandardMessage {
   const messageId = `msg-orch-${uuidv4().substring(0, 8)}`;
 
-  // 🔍 检查点 2.1：记录进入 normalizer
-  console.log('[DEBUG-LAYER-2] normalizeOrchestratorMessage 入口:', {
-    messageId,
-    type: uiMessage.type,
-    contentLength: uiMessage.content?.length || 0,
-    contentPreview: uiMessage.content?.substring(0, 100),
-  });
-
   // 构建内容块
   let blocks: ContentBlock[] = [];
 
-  // 🔧 移除 summaryCard 特殊处理 - 总结内容应该作为普通消息显示
-  // const summaryCard = uiMessage.type === 'summary' ? parseSummaryCard(uiMessage.content) : null;
-
-  // 🔧 使用 parseContentToBlocks 处理内容（会自动移除裸露的 JSON）
+  // 使用 parseContentToBlocks 处理内容（会自动移除裸露的 JSON）
   if (uiMessage.content) {
     blocks = parseContentToBlocks(uiMessage.content, { source: 'orchestrator' });
-
-    // 🔍 检查点 2.2：记录解析后的 blocks
-    console.log('[DEBUG-LAYER-2] parseContentToBlocks 返回:', {
-      messageId,
-      blocksCount: blocks.length,
-      blockTypes: blocks.map(b => b.type),
-      firstBlockPreview: blocks[0] ? {
-        type: blocks[0].type,
-        contentLength: (blocks[0].type === 'text' || blocks[0].type === 'code') ? (blocks[0] as any).content?.length || 0 : 0,
-        contentPreview: (blocks[0].type === 'text' || blocks[0].type === 'code') ? (blocks[0] as any).content?.substring(0, 100) : '',
-      } : null,
-    });
 
     // 如果解析后是文本块，根据消息类型设置 isMarkdown
     if (blocks.length > 0 && blocks[0].type === 'text') {

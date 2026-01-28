@@ -189,14 +189,18 @@ export function renderMainContent() {
         renderAgentOutputView(container, currentBottomTab);
       }
 
-      // 如果之前在底部，渲染后保持在底部（用于流式输出）
+      // 🔧 优化：如果之前在底部，渲染后保持在底部（用于流式输出）
+      // 使用 requestAnimationFrame 确保在 DOM 更新后执行
+      // 但不使用 smooth 滚动，避免抖动
       if (wasAtBottom) {
         requestAnimationFrame(() => {
+          // 直接设置 scrollTop，不使用 smooth 动画
           container.scrollTop = container.scrollHeight;
           autoScrollEnabled[currentBottomTab] = true;
         });
       }
       // morphdom 会自动保留其他情况下的滚动位置
+      // overflow-anchor: auto 会帮助维持滚动锚点
     }
 
 export function renderThreadView(container) {

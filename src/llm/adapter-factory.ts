@@ -1,6 +1,11 @@
 /**
  * LLM 适配器工厂
  * 创建和管理 LLM 适配器实例
+ *
+ * 消息流职责：
+ * - 创建 Adapter 并注入 MessageBus
+ * - Adapter 直接通过 MessageBus 发送消息
+ * - 只转发错误事件
  */
 
 import { EventEmitter } from 'events';
@@ -14,9 +19,11 @@ import { createNormalizer } from '../normalizer';
 import { ToolManager } from '../tools/tool-manager';
 import { SkillsManager, InstructionSkillDefinition } from '../tools/skills-manager';
 import { MCPToolExecutor } from '../tools/mcp-executor';
+import { UnifiedMessageBus } from '../normalizer/unified-message-bus';
 import { logger, LogCategory } from '../logging';
 import { IAdapterFactory, AdapterOutputScope, AdapterResponse } from '../adapters/adapter-factory-interface';
 import { AgentProfileLoader } from '../orchestrator/profile/agent-profile-loader';
+import { ADAPTER_EVENTS } from '../protocol/event-names';
 
 /**
  * LLM 适配器工厂
@@ -29,12 +36,12 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   private workspaceRoot: string;
   private profileLoader: AgentProfileLoader;
   private connectionPromises = new Map<AgentType, Promise<void>>();
-  private readonly connectionRetryConfig = {
-    maxAttempts: 12,
-    baseDelayMs: 1000,
-    maxDelayMs: 15000,
-    maxTotalWaitMs: 120000,
-  };
+
+  /**
+   * 消息总线 - 注入给 Adapter，用于直接发送消息
+   * 必须在创建 Adapter 之前通过 setMessageBus() 设置
+   */
+  private messageBus: UnifiedMessageBus | null = null;
 
   constructor(options: { cwd: string }) {
     super();
@@ -42,6 +49,26 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     this.toolManager = new ToolManager();
     this.profileLoader = new AgentProfileLoader();
     logger.info('LLM Adapter Factory initialized', { cwd: options.cwd }, LogCategory.LLM);
+  }
+
+  /**
+   * 设置 MessageBus（由 WebviewProvider 在初始化时调用）
+   * 必须在创建任何 Adapter 之前调用
+   */
+  setMessageBus(messageBus: UnifiedMessageBus): void {
+    this.messageBus = messageBus;
+    logger.info('MessageBus 已注入到 AdapterFactory', undefined, LogCategory.LLM);
+  }
+
+  /**
+   * 获取 MessageBus（内部使用）
+   * @throws 如果 MessageBus 未设置
+   */
+  private getMessageBus(): UnifiedMessageBus {
+    if (!this.messageBus) {
+      throw new Error('MessageBus 未设置，请先调用 setMessageBus()');
+    }
+    return this.messageBus;
   }
 
   /**
@@ -182,14 +209,15 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     // 创建 normalizer
     const normalizer = createNormalizer(workerSlot, 'worker', false);
 
-    // 创建适配器
+    // 创建适配器（注入 MessageBus）
     const adapterConfig: WorkerAdapterConfig = {
       client,
       normalizer,
       toolManager: this.toolManager,
       config: workerConfig,
+      messageBus: this.getMessageBus(),
       workerSlot,
-      profileLoader: this.profileLoader,  // ✅ 传递 profileLoader
+      profileLoader: this.profileLoader,
     };
 
     const adapter = new WorkerLLMAdapter(adapterConfig);
@@ -199,7 +227,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       adapter.setSystemPrompt(`${adapter.getSystemPrompt()}\n\n${skillPrompt}`);
     }
 
-    // 转发适配器事件
+    // 只设置错误事件处理（消息由 Adapter 直接发送到 MessageBus）
     this.setupAdapterEvents(adapter, workerSlot);
 
     this.adapters.set(workerSlot, adapter);
@@ -311,17 +339,18 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     // 创建 normalizer
     const normalizer = createNormalizer('claude', 'orchestrator', false);
 
-    // 创建适配器
+    // 创建适配器（注入 MessageBus）
     const adapterConfig: OrchestratorAdapterConfig = {
       client,
       normalizer,
       toolManager: this.toolManager,
       config: orchestratorConfig,
+      messageBus: this.getMessageBus(),
     };
 
     const adapter = new OrchestratorLLMAdapter(adapterConfig);
 
-    // 转发适配器事件
+    // 只设置错误事件处理（消息由 Adapter 直接发送到 MessageBus）
     this.setupAdapterEvents(adapter, 'orchestrator');
 
     this.adapters.set('orchestrator', adapter);
@@ -335,28 +364,19 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   }
 
   /**
-   * 设置适配器事件转发
+   * 设置适配器错误事件处理
+   *
+   * 消息事件不再转发：Adapter 直接通过 MessageBus 发送消息
+   * 只转发错误事件，供上层统一处理
    */
-  private setupAdapterEvents(adapter: BaseLLMAdapter, agent: AgentType): void {
-    // 转发标准消息事件
-    adapter.on('standardMessage', (message) => {
-      this.emit('standardMessage', message);
+  private setupAdapterEvents(adapter: BaseLLMAdapter, _agent: AgentType): void {
+    // 只转发错误事件
+    adapter.on(ADAPTER_EVENTS.NORMALIZER_ERROR, (error) => {
+      this.emit(ADAPTER_EVENTS.ERROR, error);
     });
 
-    adapter.on('standardComplete', (message) => {
-      this.emit('standardComplete', message);
-    });
-
-    adapter.on('stream', (update) => {
-      this.emit('stream', update);
-    });
-
-    adapter.on('normalizerError', (error) => {
-      this.emit('error', error);
-    });
-
-    adapter.on('error', (error) => {
-      this.emit('error', error);
+    adapter.on(ADAPTER_EVENTS.ERROR, (error) => {
+      this.emit(ADAPTER_EVENTS.ERROR, error);
     });
   }
 
@@ -373,6 +393,13 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
 
   /**
    * 发送消息（实现 IAdapterFactory 接口）
+   * @param agent - 代理类型
+   * @param message - 消息内容
+   * @param images - 图片（可选）
+   * @param options - 输出范围配置
+   *   - streamToUI: 是否将响应流式传输到 UI（默认 true）
+   *   - source: 消息来源
+   *   - adapterRole: 适配器角色
    */
   async sendMessage(
     agent: AgentType,
@@ -382,9 +409,15 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   ): Promise<AdapterResponse> {
     const adapter = this.getOrCreateAdapter(agent);
 
+    // 应用 streamToUI 配置（默认为 true）
+    const streamToUI = options?.streamToUI !== false;
+    adapter.setStreamToUI(streamToUI);
+
     try {
       await this.ensureConnected(agent, adapter);
     } catch (error: any) {
+      // 重置 streamToUI 为默认值
+      adapter.setStreamToUI(true);
       return {
         content: '',
         done: false,
@@ -419,84 +452,36 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
         done: false,
         error: error.message,
       };
+    } finally {
+      // 重置 streamToUI 为默认值，避免影响后续请求
+      adapter.setStreamToUI(true);
     }
   }
 
+  /**
+   * 确保适配器已连接
+   *
+   * 由于 connect() 现在是同步标记状态（不再发送测试请求），
+   * 此方法已简化，移除了重试逻辑。
+   */
   private async ensureConnected(agent: AgentType, adapter: BaseLLMAdapter): Promise<void> {
     if (adapter.isConnected) {
       return;
     }
 
+    // 防止并发连接同一个适配器
     const existing = this.connectionPromises.get(agent);
     if (existing) {
       return existing;
     }
 
-    const connectPromise = this.connectWithRetry(agent, adapter);
+    const connectPromise = adapter.connect();
     this.connectionPromises.set(agent, connectPromise);
     try {
       await connectPromise;
     } finally {
       this.connectionPromises.delete(agent);
     }
-  }
-
-  private async connectWithRetry(agent: AgentType, adapter: BaseLLMAdapter): Promise<void> {
-    const startTime = Date.now();
-    let attempt = 0;
-    let lastError: unknown = null;
-
-    while (attempt < this.connectionRetryConfig.maxAttempts) {
-      attempt += 1;
-      try {
-        await adapter.connect();
-        return;
-      } catch (error) {
-        lastError = error;
-        const message = error instanceof Error ? error.message : String(error);
-        if (!this.isRetryableConnectionError(message)) {
-          throw error;
-        }
-        const elapsed = Date.now() - startTime;
-        if (elapsed >= this.connectionRetryConfig.maxTotalWaitMs) {
-          break;
-        }
-        const delay = this.getConnectionRetryDelay(attempt);
-        logger.warn('适配器连接失败，准备重试', {
-          agent,
-          attempt,
-          delayMs: delay,
-          error: message,
-        }, LogCategory.LLM);
-        await this.sleep(delay);
-      }
-    }
-
-    const finalMessage = lastError instanceof Error ? lastError.message : String(lastError || '连接失败');
-    throw new Error(`连接 ${agent} 失败：${finalMessage}`);
-  }
-
-  private getConnectionRetryDelay(attempt: number): number {
-    const raw = Math.min(
-      this.connectionRetryConfig.baseDelayMs * Math.pow(2, attempt - 1),
-      this.connectionRetryConfig.maxDelayMs
-    );
-    return raw + Math.random() * 500;
-  }
-
-  private isRetryableConnectionError(message: string): boolean {
-    if (!message) return false;
-    const lower = message.toLowerCase();
-    const nonRetryable = ['api key', 'apikey', 'model', 'not configured', 'not initialized', 'invalid'];
-    if (nonRetryable.some(token => lower.includes(token))) {
-      return false;
-    }
-    const retryable = ['connect', 'connection', 'timeout', 'timed out', 'econn', 'network', 'rate limit', 'overloaded'];
-    return retryable.some(token => lower.includes(token));
-  }
-
-  private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   /**

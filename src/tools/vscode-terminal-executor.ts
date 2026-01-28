@@ -343,12 +343,35 @@ export class VSCodeTerminalExecutor {
   }
 
   /**
+   * 验证命令是否安全
+   */
+  validateCommand(command: string): { valid: boolean; reason?: string } {
+    // 基本的安全检查
+    const dangerousPatterns = [
+      /rm\s+-rf\s+\//, // 删除根目录
+      /:\(\)\{.*\}/, // Fork bomb
+      />\s*\/dev\/sda/, // 写入磁盘设备
+    ];
+
+    for (const pattern of dangerousPatterns) {
+      if (pattern.test(command)) {
+        return {
+          valid: false,
+          reason: `Command contains dangerous pattern: ${pattern}`,
+        };
+      }
+    }
+
+    return { valid: true };
+  }
+
+  /**
    * 获取工具定义（用于 LLM）
    */
   getToolDefinition() {
     return {
-      name: 'execute_terminal',
-      description: 'Execute a shell command in a VSCode terminal window. The terminal can be shown to the user for interactive commands.',
+      name: 'execute_shell',  // 统一使用 execute_shell 作为工具名
+      description: 'Execute a shell command in a VSCode terminal window. The terminal is shown to the user for visibility and interactive commands.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -369,12 +392,17 @@ export class VSCodeTerminalExecutor {
           },
           showTerminal: {
             type: 'boolean' as const,
-            description: 'Whether to show the terminal window to the user (default: false)',
+            description: 'Whether to show the terminal window to the user (default: true)',
             required: false,
           },
           keepTerminalOpen: {
             type: 'boolean' as const,
             description: 'Whether to keep the terminal open after command completes (default: false)',
+            required: false,
+          },
+          name: {
+            type: 'string' as const,
+            description: 'Name for the terminal window (default: "MultiCLI")',
             required: false,
           },
         },

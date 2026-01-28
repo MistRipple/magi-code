@@ -39,6 +39,8 @@ import {
 } from '../mission';
 import { ExecutionStats } from '../execution-stats';
 import { globalEventBus } from '../../events';
+import { UnifiedMessageBus } from '../../normalizer/unified-message-bus';
+import { MessageType, MessageLifecycle, StandardMessage } from '../../protocol';
 
 /**
  * 用户确认回调类型（与 OrchestratorAgent 兼容）
@@ -155,6 +157,10 @@ export class MissionDrivenEngine extends EventEmitter {
   // 执行统计
   private executionStats: ExecutionStats;
 
+  // 消息总线（用于发送阶段状态消息到主对话区）
+  private messageBus?: UnifiedMessageBus;
+  private currentSessionId?: string;
+
   constructor(
     adapterFactory: IAdapterFactory,
     config: MissionDrivenEngineConfig,
@@ -255,6 +261,82 @@ export class MissionDrivenEngine extends EventEmitter {
    */
   get context(): MissionDrivenContext {
     return this._context;
+  }
+
+  /**
+   * 设置消息总线（用于发送阶段状态消息到主对话区）
+   */
+  setMessageBus(messageBus: UnifiedMessageBus): void {
+    this.messageBus = messageBus;
+    // 🔧 不再需要传递给 MissionExecutor
+    // Worker 执行摘要现在通过 subtask:completed 事件 + subTaskCard 机制发送
+  }
+
+  /**
+   * 发送编排者阶段消息到主对话区
+   * @param content 消息内容
+   * @param phase 阶段标识（用于日志和调试）
+   * @param metadata 额外元数据
+   */
+  private sendPhaseMessage(
+    content: string,
+    phase: string,
+    metadata?: Record<string, unknown>
+  ): void {
+    if (!this.messageBus) {
+      logger.debug('引擎.阶段消息.跳过', { phase, reason: '未设置 MessageBus' }, LogCategory.ORCHESTRATOR);
+      return;
+    }
+
+    const message: StandardMessage = {
+      id: `phase-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      traceId: this.currentSessionId || 'default',
+      type: MessageType.PROGRESS,
+      source: 'orchestrator',
+      agent: 'orchestrator',
+      timestamp: Date.now(),
+      updatedAt: Date.now(),
+      blocks: [{ type: 'text', content, isMarkdown: true }],
+      lifecycle: MessageLifecycle.COMPLETED,
+      metadata: {
+        phase,
+        isStatusMessage: true,
+        ...metadata,
+      },
+    };
+
+    this.messageBus.sendMessage(message);
+    logger.debug('引擎.阶段消息.发送', { phase, content: content.substring(0, 50) }, LogCategory.ORCHESTRATOR);
+  }
+
+  /**
+   * 发送最终总结消息到主对话区
+   */
+  private sendSummaryMessage(content: string, metadata?: Record<string, unknown>): void {
+    if (!this.messageBus) {
+      return;
+    }
+
+    const message: StandardMessage = {
+      id: `summary-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      traceId: this.currentSessionId || 'default',
+      type: MessageType.RESULT,
+      source: 'orchestrator',
+      agent: 'orchestrator',
+      timestamp: Date.now(),
+      updatedAt: Date.now(),
+      blocks: [{ type: 'text', content, isMarkdown: true }],
+      lifecycle: MessageLifecycle.COMPLETED,
+      metadata: {
+        phase: 'summary',
+        extra: {
+          isSummary: true,
+          ...metadata,
+        },
+      },
+    };
+
+    this.messageBus.sendMessage(message);
   }
 
   /**
@@ -467,8 +549,15 @@ export class MissionDrivenEngine extends EventEmitter {
     this.setState('analyzing');
     this.lastTaskAnalysis = null;
 
+    // 保存 sessionId 用于消息发送
+    this.currentSessionId = sessionId;
+
     try {
       const resolvedSessionId = sessionId || this.sessionManager.getCurrentSession()?.id || taskId;
+      this.currentSessionId = resolvedSessionId;
+
+      // 发送分析阶段消息
+      this.sendPhaseMessage('🔍 正在分析任务...', 'analyzing');
 
       // 1. 意图分析
       let intentResult = await this.missionOrchestrator.processRequest(
@@ -538,7 +627,18 @@ export class MissionDrivenEngine extends EventEmitter {
       await this.understandGoalWithLLM(mission, userPrompt, resolvedSessionId);
 
       // 5. 规划协作
+      this.sendPhaseMessage('📋 正在规划任务分解...', 'planning');
       await this.planCollaborationWithLLM(mission, resolvedSessionId);
+
+      // 发送规划完成消息，包含任务分解信息
+      const assignmentCount = mission.assignments.length;
+      const todoCount = mission.assignments.reduce((sum, a) => sum + a.todos.length, 0);
+      const workerList = [...new Set(mission.assignments.map(a => a.workerId.toUpperCase()))].join(', ');
+      this.sendPhaseMessage(
+        `📋 任务分解完成\n- 分配数：${assignmentCount}\n- 子任务数：${todoCount}\n- 执行者：${workerList}`,
+        'planned',
+        { assignmentCount, todoCount, workers: workerList }
+      );
 
       // 6. 用户确认（如果需要）
       if (this.planConfirmationPolicy?.('medium')) {
@@ -560,6 +660,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
       // 8. 执行 Mission
       this.setState('dispatching');
+      this.sendPhaseMessage('🚀 开始执行任务...', 'executing');
 
       const analysis = this.lastTaskAnalysis as unknown as {
         wantsParallel?: boolean;
@@ -606,6 +707,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
       // 9. 验证结果
       this.setState('verifying');
+      this.sendPhaseMessage('🔬 正在验证执行结果...', 'verifying');
 
       const verificationResult = await this.missionOrchestrator.verifyMission(mission.id);
       this.lastExecutionSuccess = executionResult.success && verificationResult.passed;
@@ -652,6 +754,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
       // 11. 生成总结
       this.setState('summarizing');
+      this.sendPhaseMessage('📊 正在生成执行总结...', 'summarizing');
 
       const summary = await this.missionOrchestrator.summarizeMission(mission.id);
 
@@ -661,6 +764,15 @@ export class MissionDrivenEngine extends EventEmitter {
       this.setState('idle');
 
       const formatted = this.formatSummary(summary, this.lastExecutionSuccess, this.lastExecutionErrors);
+
+      // 发送最终总结消息到主对话区
+      this.sendSummaryMessage(formatted, {
+        success: this.lastExecutionSuccess,
+        completedTodos: summary.completedTodos,
+        failedTodos: summary.failedTodos,
+        modifiedFiles: summary.modifiedFiles?.length || 0,
+      });
+
       this.currentTaskId = null;
       return formatted;
 

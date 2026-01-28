@@ -1,7 +1,6 @@
 // 流式更新管理器
 // 统一管理所有流式输出，确保一致的更新路径
-
-import { morphElement } from './dom-diff.js';
+// 🔧 重构：不再使用增量 DOM 更新，统一使用全量渲染 + morphdom Diff
 
 // 避免循环依赖：通过回调函数注入
 let scheduleRenderCallback = null;
@@ -35,7 +34,9 @@ class StreamingManager {
     this.activeStreams = new Map();
 
     // 流式更新节流配置
-    this.minUpdateInterval = 50; // 最小更新间隔（毫秒）
+    // 🔧 优化：从 50ms 减少到 16ms（一帧时间），让更新更平滑
+    // 配合 requestAnimationFrame 可实现 60fps 平滑渲染
+    this.minUpdateInterval = 16; // 最小更新间隔（毫秒）
     this.lastUpdateTime = new Map(); // messageId -> timestamp
   }
 
@@ -177,147 +178,53 @@ class StreamingManager {
 
   /**
    * 应用增量数据到流式状态
+   * 🔧 重构：由于前端已使用 replace 模式传递完整累积内容
+   * 这里主要使用替换逻辑，避免重复追加
    * @private
    */
   _applyDelta(stream, delta) {
-    // 文本内容：追加
+    // 文本内容：替换（前端已累积完整内容）
     if (delta.content !== undefined) {
-      if (delta.updateType === 'replace') {
-        stream.content = delta.content;
-      } else {
-        stream.content += delta.content;
-      }
+      // 始终使用替换模式，因为 delta.content 已经是完整的累积内容
+      stream.content = delta.content;
     }
 
-    // Thinking：追加
+    // Thinking：替换完整数组（前端已累积）
     if (delta.thinking) {
       if (Array.isArray(delta.thinking)) {
-        stream.thinking.push(...delta.thinking);
+        stream.thinking = delta.thinking;
       } else {
-        stream.thinking.push(delta.thinking);
+        stream.thinking = [delta.thinking];
       }
     }
 
-    // 工具调用：追加或更新
+    // 工具调用：替换完整数组（前端已累积）
     if (delta.toolCalls) {
       if (Array.isArray(delta.toolCalls)) {
-        delta.toolCalls.forEach(newTool => {
-          const existingIndex = stream.toolCalls.findIndex(t => t.toolId === newTool.toolId);
-          if (existingIndex >= 0) {
-            // 更新现有工具调用
-            stream.toolCalls[existingIndex] = { ...stream.toolCalls[existingIndex], ...newTool };
-          } else {
-            // 添加新工具调用
-            stream.toolCalls.push(newTool);
-          }
-        });
+        stream.toolCalls = delta.toolCalls;
       }
     }
 
-    // Parsed Blocks：替换或追加
+    // Parsed Blocks：替换完整数组（前端已累积）
     if (delta.parsedBlocks) {
-      if (delta.updateType === 'replace') {
-        stream.parsedBlocks = delta.parsedBlocks;
-      } else {
-        stream.parsedBlocks = delta.parsedBlocks;
-      }
+      stream.parsedBlocks = delta.parsedBlocks;
     }
   }
 
   /**
    * 渲染单个流式消息
+   * 🔧 优化：使用全量渲染 + morphdom Diff，确保流式输出使用 Markdown 格式
+   * 性能由双重节流保证：
+   * - StreamingManager: minUpdateInterval = 16ms（一帧时间）
+   * - requestAnimationFrame: ~16.7ms（浏览器刷新率）
+   * - morphdom DOM Diff: 只更新变化的部分
    * @private
    */
   _renderStream(messageId) {
-    const stream = this.activeStreams.get(messageId);
-    if (!stream) return;
-
-    // 查找对应的 DOM 元素
-    const messageEl = document.querySelector(`[data-message-key="${messageId}"]`);
-    if (!messageEl) {
-      // DOM 元素不存在，触发全量渲染
-      console.log('[StreamingManager] DOM 元素不存在，触发全量渲染:', messageId);
-      scheduleRender();
-      return;
-    }
-
-    // 只更新消息内容部分（不更新整个消息块）
-    const contentEl = messageEl.querySelector('.message-content');
-    if (contentEl && stream.content) {
-      // 使用 morphdom 更新内容
-      const newContentHTML = this._renderMessageContent(stream);
-      try {
-        morphElement(contentEl, `<div class="message-content markdown-rendered">${newContentHTML}</div>`);
-      } catch (error) {
-        console.error('[StreamingManager] morphElement 失败:', error);
-        scheduleRender();
-      }
-    }
-
-    // 更新 Thinking 面板
-    if (stream.thinking && stream.thinking.length > 0) {
-      this._updateThinkingPanel(messageEl, stream);
-    }
-
-    // 更新工具调用
-    if (stream.toolCalls && stream.toolCalls.length > 0) {
-      this._updateToolCalls(messageEl, stream);
-    }
-  }
-
-  /**
-   * 渲染消息内容
-   * @private
-   */
-  _renderMessageContent(stream) {
-    // 这里需要导入 renderMarkdown 函数
-    // 为了避免循环依赖，我们直接使用简单的文本渲染
-    // 实际项目中应该使用完整的 Markdown 渲染
-    const content = stream.content || '';
-
-    // 简单的换行处理
-    return content
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/\n/g, '<br>');
-  }
-
-  /**
-   * 更新 Thinking 面板
-   * @private
-   */
-  _updateThinkingPanel(messageEl, stream) {
-    const thinkingEl = messageEl.querySelector('.panel__content');
-    if (!thinkingEl) return;
-
-    const thinkingContent = stream.thinking
-      .map(t => typeof t === 'string' ? t : t.content)
-      .join('\n\n');
-
-    // 使用 morphdom 更新
-    try {
-      const newHTML = `<div class="panel__content markdown-rendered">${this._renderMessageContent({ content: thinkingContent })}</div>`;
-      morphElement(thinkingEl, newHTML);
-
-      // 流式时自动展开
-      const panelEl = messageEl.querySelector('.panel--thinking');
-      if (panelEl && stream.streaming) {
-        panelEl.classList.add('panel--expanded');
-      }
-    } catch (error) {
-      console.error('[StreamingManager] 更新 Thinking 面板失败:', error);
-    }
-  }
-
-  /**
-   * 更新工具调用
-   * @private
-   */
-  _updateToolCalls(messageEl, stream) {
-    // 工具调用的更新比较复杂，暂时触发全量渲染
-    // 后续可以优化为增量更新
-    scheduleRenderMainContent();
+    // 直接调用全量渲染，统一渲染路径
+    // 这样可以确保流式输出也使用完整的 Markdown 渲染
+    // 而不是简单的文本渲染
+    scheduleRender();
   }
 }
 

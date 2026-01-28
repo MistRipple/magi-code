@@ -1,6 +1,11 @@
 /**
- * Shell 执行器
- * 提供安全的 Shell 命令执行能力
+ * Shell 执行器（已废弃）
+ *
+ * @deprecated 已被 VSCodeTerminalExecutor 替代
+ * 统一使用 VSCode Terminal 实现终端可视化，提供更好的用户体验。
+ * 保留此文件仅供参考，如需后台静默执行可考虑恢复。
+ *
+ * 提供安全的 Shell 命令执行能力（基于 child_process）
  */
 
 import { exec } from 'child_process';
