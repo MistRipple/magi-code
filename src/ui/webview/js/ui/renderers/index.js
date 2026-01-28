@@ -20,11 +20,17 @@ export {
 // Markdown 渲染
 export {
   renderMarkdown,
-  renderCodeBlock,
-  renderParsedBlocks,
-  renderThinkingBlock,
-  renderToolUseBlock
+  renderParsedBlocks
 } from './markdown-renderer.js';
+
+// 组件渲染器（新）
+export {
+  renderCodeBlock,
+  renderInlineCode,
+  renderThinking,
+  renderToolCall,
+  renderToolCallList
+} from './components.js';
 
 // 卡片渲染
 export {

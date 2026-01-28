@@ -28,6 +28,13 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   private mcpExecutor: MCPToolExecutor | null = null;
   private workspaceRoot: string;
   private profileLoader: AgentProfileLoader;
+  private connectionPromises = new Map<AgentType, Promise<void>>();
+  private readonly connectionRetryConfig = {
+    maxAttempts: 12,
+    baseDelayMs: 1000,
+    maxDelayMs: 15000,
+    maxTotalWaitMs: 120000,
+  };
 
   constructor(options: { cwd: string }) {
     super();
@@ -375,8 +382,14 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   ): Promise<AdapterResponse> {
     const adapter = this.getOrCreateAdapter(agent);
 
-    if (!adapter.isConnected) {
-      await adapter.connect();
+    try {
+      await this.ensureConnected(agent, adapter);
+    } catch (error: any) {
+      return {
+        content: '',
+        done: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
 
     try {
@@ -407,6 +420,83 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
         error: error.message,
       };
     }
+  }
+
+  private async ensureConnected(agent: AgentType, adapter: BaseLLMAdapter): Promise<void> {
+    if (adapter.isConnected) {
+      return;
+    }
+
+    const existing = this.connectionPromises.get(agent);
+    if (existing) {
+      return existing;
+    }
+
+    const connectPromise = this.connectWithRetry(agent, adapter);
+    this.connectionPromises.set(agent, connectPromise);
+    try {
+      await connectPromise;
+    } finally {
+      this.connectionPromises.delete(agent);
+    }
+  }
+
+  private async connectWithRetry(agent: AgentType, adapter: BaseLLMAdapter): Promise<void> {
+    const startTime = Date.now();
+    let attempt = 0;
+    let lastError: unknown = null;
+
+    while (attempt < this.connectionRetryConfig.maxAttempts) {
+      attempt += 1;
+      try {
+        await adapter.connect();
+        return;
+      } catch (error) {
+        lastError = error;
+        const message = error instanceof Error ? error.message : String(error);
+        if (!this.isRetryableConnectionError(message)) {
+          throw error;
+        }
+        const elapsed = Date.now() - startTime;
+        if (elapsed >= this.connectionRetryConfig.maxTotalWaitMs) {
+          break;
+        }
+        const delay = this.getConnectionRetryDelay(attempt);
+        logger.warn('适配器连接失败，准备重试', {
+          agent,
+          attempt,
+          delayMs: delay,
+          error: message,
+        }, LogCategory.LLM);
+        await this.sleep(delay);
+      }
+    }
+
+    const finalMessage = lastError instanceof Error ? lastError.message : String(lastError || '连接失败');
+    throw new Error(`连接 ${agent} 失败：${finalMessage}`);
+  }
+
+  private getConnectionRetryDelay(attempt: number): number {
+    const raw = Math.min(
+      this.connectionRetryConfig.baseDelayMs * Math.pow(2, attempt - 1),
+      this.connectionRetryConfig.maxDelayMs
+    );
+    return raw + Math.random() * 500;
+  }
+
+  private isRetryableConnectionError(message: string): boolean {
+    if (!message) return false;
+    const lower = message.toLowerCase();
+    const nonRetryable = ['api key', 'apikey', 'model', 'not configured', 'not initialized', 'invalid'];
+    if (nonRetryable.some(token => lower.includes(token))) {
+      return false;
+    }
+    const retryable = ['connect', 'connection', 'timeout', 'timed out', 'econn', 'network', 'rate limit', 'overloaded'];
+    return retryable.some(token => lower.includes(token));
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   /**

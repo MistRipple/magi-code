@@ -428,8 +428,8 @@ export interface LogEntry {
 
 // Webview 发送到 Extension 的消息
 export type WebviewToExtensionMessage =
-  | { type: 'executeTask'; prompt: string; worker?: WorkerSlot }
-  | { type: 'interruptTask'; taskId: string }
+  | { type: 'executeTask'; prompt: string; images?: Array<{ dataUrl: string }>; mode?: string; agent?: WorkerSlot | null; worker?: WorkerSlot; requestId?: string }
+  | { type: 'interruptTask'; taskId?: string; silent?: boolean; reason?: string }
   | { type: 'continueTask'; taskId: string; prompt: string }
   | { type: 'login'; apiKey: string; provider?: string; remember?: boolean }
   | { type: 'logout' }
@@ -461,7 +461,7 @@ export type WebviewToExtensionMessage =
   | { type: 'requestExecutionStats' }
   | { type: 'resetExecutionStats' }
 
-  | { type: 'checkWorkerStatus' }
+  | { type: 'checkWorkerStatus'; force?: boolean }
 
   | { type: 'clearAllTasks' }
 
@@ -503,7 +503,7 @@ export type WebviewToExtensionMessage =
   | { type: 'addCustomTool'; tool: any }
   | { type: 'removeCustomTool'; toolName: string }
   | { type: 'installSkill'; skillId: string }
-  | { type: 'applyInstructionSkill'; skillName: string; args?: string; images?: Array<{ dataUrl: string }>; agent?: WorkerSlot | null }
+  | { type: 'applyInstructionSkill'; skillName: string; args?: string; images?: Array<{ dataUrl: string }>; agent?: WorkerSlot | null; requestId?: string }
   // 新增：Skills 仓库相关
   | { type: 'loadRepositories' }
   | { type: 'addRepository'; url: string }
@@ -531,6 +531,9 @@ export type MessageSource = 'orchestrator' | 'worker' | 'system';
 
 export type ExtensionToWebviewMessage =
   | { type: 'stateUpdate'; state: UIState }
+  | { type: 'messageReceived'; requestId?: string; sessionId?: string | null }
+  | { type: 'taskAccepted'; requestId?: string; sessionId?: string | null }
+  | { type: 'taskRejected'; requestId?: string; message: string; sessionId?: string | null }
   | { type: 'taskUpdate'; task: Task }
   | { type: 'workerStatusUpdate'; statuses: Record<string, { status: string; model?: string }> }
   | { type: 'workerStatusChanged'; worker: WorkerSlot; available: boolean; model?: string }

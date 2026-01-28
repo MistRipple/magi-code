@@ -33,12 +33,12 @@ export let currentSessionId = previousState.currentSessionId || (injectedSession
 export let pendingChanges = previousState.pendingChanges || [];
 export let tasks = previousState.tasks || [];
 
-// 处理状态
-export let isProcessing = previousState.isProcessing || false;
-export let thinkingStartAt = previousState.thinkingStartAt || null;
+// 处理状态（不从持久化恢复，避免重启后残留“处理中”）
+export let isProcessing = false;
+export let thinkingStartAt = null;
 export let localProcessingUntil = 0;
 export let streamingHintTimer = null;
-export let processingActor = previousState.processingActor || { source: 'orchestrator', agent: 'claude' };
+export let processingActor = { source: 'orchestrator', agent: 'claude' };
 
 // 后端下发的完整状态（用于 UI 渲染）
 export let appState = null;
@@ -80,9 +80,6 @@ export function saveWebviewState() {
     currentSessionId,
     pendingChanges,
     tasks,
-    isProcessing,
-    thinkingStartAt,
-    processingActor,
     scrollPositions,
     autoScrollEnabled
   });
@@ -231,9 +228,6 @@ export function restoreWebviewState() {
   console.log('[State] 状态已从持久化存储恢复');
 }
 
-// 附加的图片（用于输入框）
-export let attachedImages = [];
-
 // 导出完整的 state 对象供调试使用
 export const state = {
   get currentTopTab() { return currentTopTab; },
@@ -244,6 +238,5 @@ export const state = {
   get currentSessionId() { return currentSessionId; },
   get pendingChanges() { return pendingChanges; },
   get isProcessing() { return isProcessing; },
-  get attachedImages() { return attachedImages; },
   get appState() { return appState; }
 };

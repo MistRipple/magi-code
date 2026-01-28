@@ -98,10 +98,16 @@
 
     /* 输入框底部操作栏 - 与输入框背景一致 */
     .input-actions { display: flex; align-items: center; justify-content: space-between; padding: var(--spacing-2) var(--spacing-3); background: transparent; }
-    .input-actions-left { display: flex; align-items: center; gap: var(--spacing-2); }
+    .input-actions-left { display: flex; align-items: center; gap: var(--spacing-2); flex-wrap: nowrap; }
     .input-actions-right { display: flex; align-items: center; gap: var(--spacing-2); }
 
-    .model-selector { padding: var(--spacing-1) var(--spacing-2); font-size: var(--font-size-1); background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); border-radius: var(--radius-1); cursor: pointer; outline: none; }
+    /* 图标按钮 - 用于技能按钮等 */
+    .icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; background: transparent; border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-1); cursor: pointer; color: var(--vscode-descriptionForeground); transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast); flex-shrink: 0; }
+    .icon-btn:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); border-color: var(--vscode-focusBorder); }
+    .icon-btn:active { background: var(--vscode-toolbar-activeBackground, var(--vscode-list-activeSelectionBackground)); transform: scale(0.96); }
+    .icon-btn svg { width: 16px; height: 16px; fill: currentColor; }
+
+    .model-selector { padding: var(--spacing-1) var(--spacing-2); font-size: var(--font-size-1); background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); border-radius: var(--radius-1); cursor: pointer; outline: none; flex-shrink: 0; }
     .model-selector:focus { border-color: var(--vscode-focusBorder); }
 
     .enhance-btn { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; font-size: var(--font-size-1); background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-1); cursor: pointer; transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, opacity 0.2s ease; }

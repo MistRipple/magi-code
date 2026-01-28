@@ -115,6 +115,7 @@
   /* 强调色 */
   --ds-color-accent-a11: var(--vscode-textLink-foreground);
   --ds-color-accent-a12: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground));
+  --ds-color-accent-7: rgba(59, 130, 246, 0.5);
 
   /* 次要色 */
   --ds-color-secondary-11: var(--vscode-descriptionForeground);
@@ -124,6 +125,20 @@
   --ds-panel-background: var(--vscode-editor-background);
   --ds-panel-translucent: var(--vscode-sideBar-background);
   --ds-panel-border: var(--vscode-panel-border);
+  --ds-color-panel-1: var(--vscode-editor-background);
+  --ds-color-panel-2: rgba(255, 255, 255, 0.03);
+  --ds-color-panel-border: var(--vscode-panel-border, rgba(255, 255, 255, 0.1));
+
+  /* ========== 文本颜色 (Text Colors) ========== */
+  --ds-color-text-primary: var(--vscode-foreground);
+  --ds-color-text-secondary: var(--vscode-descriptionForeground);
+  --ds-color-text-tertiary: rgba(255, 255, 255, 0.5);
+
+  /* ========== 色彩数字变量 (Color Number Variants) ========== */
+  --ds-color-purple-9: #8b5cf6;
+  --ds-color-blue-9: #3b82f6;
+  --ds-color-neutral-6: rgba(255, 255, 255, 0.12);
+  --ds-color-neutral-7: rgba(255, 255, 255, 0.14);
 
   /* ========== Agent 颜色 (Agent Colors) ========== */
   /* Orchestrator: 紫色 - 代表协调/指挥 */
@@ -147,6 +162,43 @@
   --ds-tool-success: var(--ds-color-success-9);
   --ds-tool-error: var(--ds-color-error-9);
   --ds-tool-pending: var(--ds-color-neutral-a11);
+
+  /* ========== Z-index 系统 (Z-index Layers) ========== */
+  --ds-z-base: 0;
+  --ds-z-dropdown: 10;
+  --ds-z-sticky: 50;
+  --ds-z-header: 100;
+  --ds-z-modal-backdrop: 200;
+  --ds-z-modal: 300;
+  --ds-z-tooltip: 400;
+  --ds-z-notification: 500;
+
+  /* ========== 特殊内容背景色 (Special Content Backgrounds) ========== */
+  --ds-color-thinking-bg: rgba(139, 92, 246, 0.08);
+  --ds-color-thinking-border: rgba(139, 92, 246, 0.3);
+  --ds-color-tool-bg: rgba(16, 185, 129, 0.08);
+  --ds-color-tool-border: rgba(16, 185, 129, 0.3);
+  --ds-color-code-bg: rgba(100, 116, 139, 0.08);
+  --ds-color-code-border: rgba(100, 116, 139, 0.2);
+
+  /* ========== 动画缓动函数 (Easing Functions) ========== */
+  --ds-easing-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --ds-easing-decelerate: cubic-bezier(0, 0, 0.2, 1);
+  --ds-easing-accelerate: cubic-bezier(0.4, 0, 1, 1);
+  --ds-easing-sharp: cubic-bezier(0.4, 0, 0.6, 1);
+
+  /* ========== 组件高度 (Component Heights) ========== */
+  --ds-height-btn-sm: 24px;
+  --ds-height-btn-md: 28px;
+  --ds-height-btn-lg: 32px;
+  --ds-height-input-sm: 28px;
+  --ds-height-input-md: 32px;
+  --ds-height-input-lg: 40px;
+
+  /* ========== 边框宽度 (Border Widths) ========== */
+  --ds-border-width-thin: 1px;
+  --ds-border-width-medium: 2px;
+  --ds-border-width-thick: 3px;
 }
 
 /* 亮色主题覆盖 */
@@ -156,8 +208,12 @@
   --ds-color-neutral-3: rgba(0, 0, 0, 0.06);
   --ds-color-neutral-4: rgba(0, 0, 0, 0.08);
   --ds-color-neutral-5: rgba(0, 0, 0, 0.1);
+  --ds-color-neutral-6: rgba(0, 0, 0, 0.12);
+  --ds-color-neutral-7: rgba(0, 0, 0, 0.14);
   --ds-color-neutral-a3: rgba(0, 0, 0, 0.06);
   --ds-color-neutral-a5: rgba(0, 0, 0, 0.1);
   --ds-color-neutral-a7: rgba(0, 0, 0, 0.14);
+  --ds-color-panel-2: rgba(0, 0, 0, 0.03);
+  --ds-color-text-tertiary: rgba(0, 0, 0, 0.5);
 }
 

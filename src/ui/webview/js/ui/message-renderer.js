@@ -14,7 +14,6 @@ import {
   pendingChanges,
   tasks,
   sessions,
-  attachedImages,
   currentDependencyAnalysis,
   isDependencyPanelExpanded,
   streamingHintTimer,
@@ -29,25 +28,34 @@ import {
 import { postMessage } from '../core/vscode-api.js';
 
 // 渲染器模块
-import { renderParsedBlocks } from './renderers/markdown-renderer.js';
+import { renderParsedBlocks, renderMarkdown } from './renderers/markdown-renderer.js';
 
-// 增量更新引擎
+// 渲染辅助函数（统一从 render-utils.js 导入）
 import {
-  getMessageKey,
-  computeMessageUpdates,
-  applyIncrementalUpdates,
-  resetIncrementalState,
-  scheduleUpdate,
-  registerMessageDOM
-} from '../core/incremental-update.js';
+  getRoleIcon,
+  getRoleInfo,
+  getMessageGroupKey,
+  cleanInternalProtocolData,
+  formatTime
+} from './renderers/render-utils.js';
 
-// 增量更新开关（可通过控制台切换）
-let incrementalUpdateEnabled = true;
-window.__toggleIncrementalUpdate = () => {
-  incrementalUpdateEnabled = !incrementalUpdateEnabled;
-  console.log('[MessageRenderer] 增量更新:', incrementalUpdateEnabled ? '已启用' : '已禁用');
-  return incrementalUpdateEnabled;
-};
+// 新设计系统组件渲染器
+import {
+  renderThinking,
+  renderToolCallList,
+  renderCodeBlock,
+  renderInlineCode,
+  registerGlobalFunctions
+} from './renderers/components.js';
+
+// DOM Diff 引擎
+import { morphContainer, isMorphdomAvailable } from '../core/dom-diff.js';
+
+// 流式更新管理器
+import { streamingManager, setRenderCallback } from '../core/streaming-manager.js';
+
+// 配置管理
+import { getConfig } from '../core/config.js';
 
 const STREAM_TIMEOUT = 5 * 60 * 1000;
 
@@ -109,6 +117,26 @@ import {
 } from '../core/utils.js';
 
 // ============================================
+// 辅助函数
+// ============================================
+
+/**
+ * 获取消息的唯一标识（用于 DOM diff）
+ */
+export function getMessageKey(message) {
+  return message.standardMessageId || message.streamKey || message.id || null;
+}
+
+/**
+ * 生成 Thinking 内容的智能摘要
+ * @param {string} content - Thinking 内容
+ * @returns {string} 摘要文本
+ */
+
+// 旧的 generateThinkingSummary 函数已删除
+// 现在使用新的组件渲染器中的实现
+
+// ============================================
 // 渲染函数
 // ============================================
 
@@ -136,6 +164,8 @@ export function setSkillsConfig(config) {
 export function renderMainContent() {
       const container = document.getElementById('main-content');
       if (!container) return;
+
+      // 添加滚动监听器（只添加一次）
       if (!container.dataset.scrollListener) {
         container.dataset.scrollListener = 'true';
         container.addEventListener('scroll', () => {
@@ -145,74 +175,61 @@ export function renderMainContent() {
         }, { passive: true });
       }
 
-      // 修复：渲染前保存滚动位置
-      const scrollTop = container.scrollTop;
+      // 判断是否在底部（用于流式输出时自动滚动）
       const scrollHeight = container.scrollHeight;
       const clientHeight = container.clientHeight;
-      // 判断是否在底部附近（允许 50px 误差）
+      const scrollTop = container.scrollTop;
       const wasAtBottom = autoScrollEnabled[currentBottomTab]
         || scrollTop + clientHeight >= scrollHeight - 50;
 
+      // 渲染对应的视图
       if (currentBottomTab === 'thread') {
         renderThreadView(container);
       } else if (['claude', 'codex', 'gemini'].includes(currentBottomTab)) {
         renderAgentOutputView(container, currentBottomTab);
       }
 
-      // 修复：渲染后恢复滚动位置
-      requestAnimationFrame(() => {
-        if (wasAtBottom) {
-          // 如果之前在底部，保持在底部
+      // 如果之前在底部，渲染后保持在底部（用于流式输出）
+      if (wasAtBottom) {
+        requestAnimationFrame(() => {
           container.scrollTop = container.scrollHeight;
           autoScrollEnabled[currentBottomTab] = true;
-        } else {
-          // 否则恢复到之前的位置
-          container.scrollTop = scrollTop;
-          autoScrollEnabled[currentBottomTab] = false;
-        }
-      });
+        });
+      }
+      // morphdom 会自动保留其他情况下的滚动位置
     }
 
 export function renderThreadView(container) {
       if (threadMessages.length === 0) {
-        resetIncrementalState(); // 清空增量更新状态
-        container.innerHTML = '<div class="empty-state"><div class="empty-state-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M14 1a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4.414A2 2 0 0 0 3 11.586l-2 2V2a1 1 0 0 1 1-1h12zM2 0a2 2 0 0 0-2 2v12.793a.5.5 0 0 0 .854.353l2.853-2.853A1 1 0 0 1 4.414 12H14a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2H2z"/></svg></div><span class="empty-state-text">开始新对话</span><span class="empty-state-hint">输入任务描述，按 ⌘↵ 发送</span></div>';
+        const emptyHTML = '<div class="empty-state"><div class="empty-state-icon"><svg width="24" height="24" viewBox="0 0 16 16" fill="currentColor"><path d="M14 1a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4.414A2 2 0 0 0 3 11.586l-2 2V2a1 1 0 0 1 1-1h12zM2 0a2 2 0 0 0-2 2v12.793a.5.5 0 0 0 .854.353l2.853-2.853A1 1 0 0 1 4.414 12H14a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2H2z"/></svg></div><span class="empty-state-text">开始新对话</span><span class="empty-state-hint">输入任务描述，按 ⌘↵ 发送</span></div>';
+        morphContainer(container, emptyHTML);
         return;
       }
 
       // 依赖分析面板（Thread面板特有）
-      const dependencyHtml = renderDependencyPanel();
+      const dependencyHtml = renderDependencyPanel() || '';
 
       // 使用统一的消息列表渲染函数
       const messagesHtml = renderMessageList(threadMessages, {
         tabType: 'thread',
         defaultAgent: null, // Thread 面板没有默认 Worker
         toolPanelPrefix: 'tool-thread-'
-      });
+      }) || '';
 
       // Thread 面板特有：显示运行中的 Worker 状态卡片
       const runningEntries = collectWorkerStatusEntries();
-      const workerStatusHtml = runningEntries.length > 0 ? renderWorkerStatusCard(runningEntries) : '';
+      const workerStatusHtml = runningEntries.length > 0 ? (renderWorkerStatusCard(runningEntries) || '') : '';
 
-      // 🔧 重构：统一的动画渲染入口（唯一添加动画的地方）
-      const animationHtml = renderStreamingAnimation(threadMessages);
+      // 统一的动画渲染入口
+      const animationHtml = renderStreamingAnimation(threadMessages) || '';
 
       // 组合完整 HTML
       const html = dependencyHtml + messagesHtml + workerStatusHtml + animationHtml;
 
-      container.innerHTML = html;
+      // 使用 morphdom 更新 DOM（保留未变化的节点）
+      morphContainer(container, html);
 
-      // 注册消息 DOM 元素用于增量更新追踪
-      if (incrementalUpdateEnabled) {
-        container.querySelectorAll('[data-message-key]').forEach(el => {
-          const key = el.dataset.messageKey;
-          if (key) {
-            registerMessageDOM(key, el);
-          }
-        });
-      }
-
-      // 🔧 修复：同时检测 streaming-hint 和 streaming-footer
+      // 启动/停止流式动画计时器
       if (container.querySelector('.message-streaming-hint, .message-streaming-footer')) {
         startStreamingHintTimer();
       } else {
@@ -223,7 +240,8 @@ export function renderThreadView(container) {
 export function renderAgentOutputView(container, agent) {
       const messages = agentOutputs[agent] || [];
       if (!messages.length) {
-        container.innerHTML = '<div class="empty-state"><div class="empty-state-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 9a.5.5 0 0 1 .5-.5h3a.5.5 0 0 1 0 1h-3A.5.5 0 0 1 6 9zM3.854 4.146a.5.5 0 1 0-.708.708L4.793 6.5 3.146 8.146a.5.5 0 1 0 .708.708l2-2a.5.5 0 0 0 0-.708l-2-2z"/><path d="M2 1a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V3a2 2 0 0 0-2-2H2zm12 1a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1h12z"/></svg></div><span class="empty-state-text">' + agent.toUpperCase() + ' 输出</span><span class="empty-state-hint">暂无输出内容</span></div>';
+        const emptyHTML = '<div class="empty-state"><div class="empty-state-icon"><svg width="24" height="24" viewBox="0 0 16 16" fill="currentColor"><path d="M6 9a.5.5 0 0 1 .5-.5h3a.5.5 0 0 1 0 1h-3A.5.5 0 0 1 6 9zM3.854 4.146a.5.5 0 1 0-.708.708L4.793 6.5 3.146 8.146a.5.5 0 1 0 .708.708l2-2a.5.5 0 0 0 0-.708l-2-2z"/><path d="M2 1a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V3a2 2 0 0 0-2-2H2zm12 1a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1h12z"/></svg></div><span class="empty-state-text">' + agent.toUpperCase() + ' 输出</span><span class="empty-state-hint">暂无输出内容</span></div>';
+        morphContainer(container, emptyHTML);
         return;
       }
 
@@ -232,15 +250,15 @@ export function renderAgentOutputView(container, agent) {
         tabType: 'agent',
         defaultAgent: agent,
         toolPanelPrefix: 'tool-agent-' + agent + '-'
-      });
+      }) || '';
 
-      // 🔧 重构：Worker 面板也使用统一的动画渲染入口
-      // 只为当前 Worker 的消息添加动画
-      html += renderStreamingAnimationForAgent(messages, agent);
+      // Worker 面板也使用统一的动画渲染入口
+      html += renderStreamingAnimationForAgent(messages, agent) || '';
 
-      container.innerHTML = html;
+      // 使用 morphdom 更新 DOM
+      morphContainer(container, html);
 
-      // 🔧 修复：Worker 面板也需要启动/停止动画计时器
+      // Worker 面板也需要启动/停止动画计时器
       if (container.querySelector('.message-streaming-hint, .message-streaming-footer')) {
         startStreamingHintTimer();
       }
@@ -364,11 +382,11 @@ export function renderMessageBlock(message, idx, options) {
         html += '<div class="message-actions">';
         // 🆕 澄清消息添加跳过按钮
         if (message.isClarification && window._pendingClarification) {
-          html += '<button class="message-action-btn" onclick="skipClarification()" title="跳过澄清"><svg viewBox="0 0 16 16"><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg></button>';
+          html += '<button class="message-action-btn" onclick="skipClarification()" title="跳过澄清"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg></button>';
         }
         // 🆕 Worker 问题消息添加跳过按钮
         if (message.isWorkerQuestion && window._pendingWorkerQuestion) {
-          html += '<button class="message-action-btn" onclick="skipWorkerQuestion()" title="跳过问题"><svg viewBox="0 0 16 16"><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg></button>';
+          html += '<button class="message-action-btn" onclick="skipWorkerQuestion()" title="跳过问题"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg></button>';
         }
         html += '</div>';
       }
@@ -397,31 +415,14 @@ export function renderMessageBlock(message, idx, options) {
 
       if (!isUser && message.thinking && message.thinking.length > 0) {
         const panelId = (toolPanelPrefix || 'panel-') + 'thinking-' + idx;
-        const thinkingExpanded = !!message.streaming;
-        // 从对象数组中提取内容（支持旧格式字符串数组和新格式对象数组）
-        const thinkingContent = message.thinking.map(t => typeof t === 'string' ? t : t.content).join('\n\n');
-        // 生成摘要（前 50 字符）
-        const thinkingSummary = thinkingContent.replace(/\s+/g, ' ').trim().substring(0, 50);
-        const summaryDisplay = thinkingSummary + (thinkingContent.length > 50 ? '...' : '');
 
-        // 使用 Augment 风格的 c-thinking 组件
-        html += '<div class="c-thinking" data-panel-id="' + panelId + '">';
-        html += '<details class="c-thinking__details"' + (thinkingExpanded ? ' open' : '') + '>';
-        html += '<summary class="c-thinking__summary">';
-        html += '<span class="c-thinking__chevron"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></span>';
-        html += '<span class="c-thinking__title">思考过程</span>';
-        // 折叠时显示摘要
-        if (!thinkingExpanded && summaryDisplay) {
-          html += '<span class="c-thinking__summary-text">' + escapeHtml(summaryDisplay) + '</span>';
-        }
-        html += '<span class="c-thinking__badge">' + message.thinking.length + ' 步</span>';
-        if (message.streaming) {
-          html += '<span class="c-thinking__streaming-cursor"></span>';
-        }
-        html += '</summary>';
-        html += '<div class="c-thinking__content markdown-rendered">' + renderMarkdown(thinkingContent) + '</div>';
-        html += '</details>';
-        html += '</div>';
+        // 使用新的 thinking 组件渲染器
+        html += renderThinking({
+          thinking: message.thinking,
+          isStreaming: !!message.streaming,
+          panelId: panelId,
+          autoExpand: message.streaming
+        });
       }
 
       let contentHtml = '';
@@ -468,11 +469,12 @@ export function renderMessageBlock(message, idx, options) {
       html += '<div class="' + contentClass + '">' + contentHtml + '</div>';
 
       if (!isUser && message.toolCalls && message.toolCalls.length > 0) {
-        html += renderToolTrack(message.toolCalls, toolPanelPrefix + idx);
+        // 使用新的工具调用组件渲染器
+        html += renderToolCallList(message.toolCalls, toolPanelPrefix + idx);
       }
 
       if (!isUser && message.reconnecting) {
-        html += '<div class="reconnect-indicator"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.534 7h3.932a.25.25 0 0 1 .192.41l-1.966 2.36a.25.25 0 0 1-.384 0l-1.966-2.36a.25.25 0 0 1 .192-.41zm-11 2h3.932a.25.25 0 0 0 .192-.41L2.692 6.23a.25.25 0 0 0-.384 0L.342 8.59A.25.25 0 0 0 .534 9z"/><path d="M8 3c-1.552 0-2.94.707-3.857 1.818a.5.5 0 1 1-.771-.636A6.002 6.002 0 0 1 13.917 7H12.9A5.002 5.002 0 0 0 8 3zM3.1 9a5.002 5.002 0 0 0 8.757 2.182.5.5 0 1 1 .771.636A6.002 6.002 0 0 1 2.083 9H3.1z"/></svg>' + escapeHtml(message.reconnectMessage || '正在重连...') + '</div>';
+        html += '<div class="reconnect-indicator"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M11.534 7h3.932a.25.25 0 0 1 .192.41l-1.966 2.36a.25.25 0 0 1-.384 0l-1.966-2.36a.25.25 0 0 1 .192-.41zm-11 2h3.932a.25.25 0 0 0 .192-.41L2.692 6.23a.25.25 0 0 0-.384 0L.342 8.59A.25.25 0 0 0 .534 9z"/><path d="M8 3c-1.552 0-2.94.707-3.857 1.818a.5.5 0 1 1-.771-.636A6.002 6.002 0 0 1 13.917 7H12.9A5.002 5.002 0 0 0 8 3zM3.1 9a5.002 5.002 0 0 0 8.757 2.182.5.5 0 1 1 .771.636A6.002 6.002 0 0 1 2.083 9H3.1z"/></svg>' + escapeHtml(message.reconnectMessage || '正在重连...') + '</div>';
       }
 
       // 🔧 重构：动画逻辑已移至 renderStreamingAnimation 函数
@@ -535,7 +537,7 @@ export function renderUnifiedCard(options) {
           html += '<span class="card-time">' + escapeHtml(time) + '</span>';
         }
         if (collapsed) {
-          html += '<span class="collapsible-icon' + (expanded ? ' expanded' : '') + '"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></span>';
+          html += '<span class="collapsible-icon' + (expanded ? ' expanded' : '') + '"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></span>';
         }
         html += '</div>';
       }
@@ -638,177 +640,6 @@ export function renderMessageContentSmart(message, agent) {
     }
 
 
-// ============================================
-// Markdown和代码
-// ============================================
-
-export function renderMarkdown(content) {
-      if (!content) return '';
-
-      // 检查 marked 是否可用
-      if (typeof marked === 'undefined') {
-        console.warn('[renderMarkdown] marked 库未加载，使用简单渲染');
-        return escapeHtml(content).replace(/\n/g, '<br>');
-      }
-
-      try {
-        // 使用 marked.use() 配置自定义 renderer
-        const renderer = {
-          // 自定义代码块渲染（保留行号、diff 高亮、文件路径功能）
-          // marked v12 使用对象参数 { text, lang, escaped }
-          code({ text, lang, escaped }) {
-            const { lang: parsedLang, filepath } = parseCodeBlockMeta(lang || '');
-            return renderCodeBlock(text || '', parsedLang, filepath);
-          },
-
-          // 自定义链接渲染（添加 target="_blank"）
-          // marked v12 使用对象参数 { href, title, tokens }
-          link({ href, title, tokens }) {
-            const text = this.parser.parseInline(tokens);
-            const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
-            return `<a href="${escapeHtml(href || '')}"${titleAttr} target="_blank" class="markdown-link">${text}</a>`;
-          },
-
-          // 自定义图片渲染
-          // marked v12 使用对象参数 { href, title, text }
-          image({ href, title, text }) {
-            const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
-            return `<img src="${escapeHtml(href || '')}" alt="${escapeHtml(text || '')}"${titleAttr}>`;
-          }
-        };
-
-        // 🔧 使用 marked.use() 而非传递给 parse()
-        marked.use({ renderer });
-
-        // 渲染 Markdown
-        const html = marked.parse(content);
-        return html;
-      } catch (e) {
-        console.error('[renderMarkdown] 解析错误:', e);
-        return escapeHtml(content).replace(/\n/g, '<br>');
-      }
-    }
-
-export function renderCodeBlock(code, lang, filepath) {
-      const codeId = 'code-' + Math.random().toString(36).substr(2, 9);
-      const trimmedCode = code.replace(/^\n+/, '').replace(/\n+$/, '');
-      if (!trimmedCode) return '';
-
-      const isBlankLine = (line) => line.replace(/[\s\uFEFF\u200B\u200C\u200D]/g, '') === '';
-
-      const rawLines = trimmedCode.split('\n');
-      while (rawLines.length > 0 && isBlankLine(rawLines[0])) rawLines.shift();
-      while (rawLines.length > 0 && isBlankLine(rawLines[rawLines.length - 1])) rawLines.pop();
-      if (rawLines.length === 0) return '';
-      const normalizedCode = rawLines.join('\n');
-
-      const lines = normalizedCode.split('\n');
-      const isDiff = lang === 'diff' || lines.some(line => /^[+-](?!\+\+|--)\s/.test(line));
-
-      // 使用 highlight.js 高亮整个代码块
-      let highlightedCode = '';
-      if (typeof hljs !== 'undefined' && lang && lang !== 'text' && lang !== 'diff') {
-        try {
-          if (hljs.getLanguage(lang)) {
-            highlightedCode = hljs.highlight(normalizedCode, { language: lang, ignoreIllegals: true }).value;
-          } else {
-            highlightedCode = hljs.highlightAuto(normalizedCode).value;
-          }
-        } catch (e) {
-          console.warn('[renderCodeBlock] highlight error:', e);
-          highlightedCode = escapeHtml(normalizedCode);
-        }
-      } else {
-        highlightedCode = escapeHtml(normalizedCode);
-      }
-
-      // 将高亮后的代码按行分割
-      const highlightedLines = highlightedCode.split('\n');
-
-      // 构建代码行 HTML
-      let codeLinesHtml = '';
-
-      lines.forEach((originalLine, idx) => {
-        let lineClass = 'code-line';
-        let displayLine = highlightedLines[idx] || '';
-
-        if (isDiff) {
-          if (/^[+](?!\+\+)/.test(originalLine)) {
-            lineClass += ' diff-add';
-          } else if (/^[-](?!--)/.test(originalLine)) {
-            lineClass += ' diff-del';
-          }
-        }
-        codeLinesHtml += '<div class="' + lineClass + '">' + displayLine + '</div>';
-      });
-
-      // 检查是否需要折叠（超过 15 行）
-      const shouldCollapse = lines.length > 15;
-      const expandedClass = shouldCollapse ? '' : ' expanded';
-
-      // 使用 Augment 风格的 c-codeblock 组件
-      let html = '<div class="c-codeblock' + (isDiff ? ' c-codeblock--diff' : '') + '" data-code-id="' + codeId + '">';
-      
-      // 头部区域
-      html += '<div class="c-codeblock__header">';
-      html += '<div class="c-codeblock__header-content" onclick="toggleCodeBlock(\'' + codeId + '\')">';
-      
-      // 折叠按钮
-      if (shouldCollapse) {
-        html += '<div class="c-codeblock__collapse-btn' + expandedClass + '"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></div>';
-      }
-      
-      // 文件路径或语言标签
-      html += '<div class="c-codeblock__relpath">';
-      if (filepath) {
-        html += '<span class="c-codeblock__filename" onclick="event.stopPropagation(); openFileInEditor(\'' + escapeHtml(filepath) + '\')" title="点击在编辑器中打开">' + escapeHtml(filepath) + '</span>';
-      } else if (lang) {
-        html += '<span class="c-codeblock__language">' + escapeHtml(lang) + '</span>';
-      }
-      html += '</div>';
-      html += '</div>'; // c-codeblock__header-content
-      
-      // 操作按钮
-      html += '<div class="c-codeblock__action-bar-right">';
-      html += '<span class="c-codeblock__line-count">' + lines.length + ' 行</span>';
-      html += '<button class="code-copy-btn" onclick="copyCodeBlock(\'' + codeId + '\')" title="复制代码">';
-      html += '<svg viewBox="0 0 16 16"><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/><path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/></svg>';
-      html += '</button>';
-      html += '</div>';
-      html += '</div>'; // c-codeblock__header
-      
-      // 代码内容区域
-      html += '<div class="c-codeblock__container">';
-      html += '<div class="c-codeblock__container-inner">';
-      
-      if (shouldCollapse) {
-        // 折叠模式：截断显示
-        html += '<div class="c-codeblock__truncated collapsible-content' + expandedClass + '">';
-        html += '<div class="c-codeblock__code" id="' + codeId + '"><pre><code>' + codeLinesHtml + '</code></pre></div>';
-        html += '</div>';
-        
-        // 展开按钮
-        html += '<div class="c-codeblock__truncated-surface collapsible-expand-btn" onclick="toggleCodeBlock(\'' + codeId + '\')" style="' + (expandedClass ? 'display:none;' : '') + '">';
-        html += '<button class="c-codeblock__expand-btn">';
-        html += '<svg viewBox="0 0 16 16"><path d="M1.646 4.646a.5.5 0 0 1 .708 0L8 10.293l5.646-5.647a.5.5 0 0 1 .708.708l-6 6a.5.5 0 0 1-.708 0l-6-6a.5.5 0 0 1 0-.708z"/></svg>';
-        html += '<span>显示全部 ' + lines.length + ' 行</span>';
-        html += '</button>';
-        html += '</div>';
-      } else {
-        // 不折叠模式
-        html += '<div class="c-codeblock__code" id="' + codeId + '"><pre><code>' + codeLinesHtml + '</code></pre></div>';
-      }
-      
-      html += '</div>'; // c-codeblock__container-inner
-      html += '</div>'; // c-codeblock__container
-      html += '</div>'; // c-codeblock
-      
-      return html;
-    }
-
-
-
-
 
 // ============================================
 // 卡片渲染
@@ -870,13 +701,13 @@ export function renderSubTaskSummaryCard(message) {
           const fileStr = String(file);
           // 检测变更类型
           let iconClass = 'modified';
-          let iconSvg = '<svg viewBox="0 0 16 16"><path d="M5.5 7.5a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1-.5-.5z"/><path d="M8 2a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11zM1.5 7.5a6.5 6.5 0 1 1 13 0 6.5 6.5 0 0 1-13 0z"/></svg>';
+          let iconSvg = '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M5.5 7.5a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1-.5-.5z"/><path d="M8 2a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11zM1.5 7.5a6.5 6.5 0 1 1 13 0 6.5 6.5 0 0 1-13 0z"/></svg>';
           if (fileStr.includes('新增') || fileStr.includes('create') || fileStr.includes('+')) {
             iconClass = 'created';
-            iconSvg = '<svg viewBox="0 0 16 16"><path d="M8 4a.5.5 0 0 1 .5.5v3h3a.5.5 0 0 1 0 1h-3v3a.5.5 0 0 1-1 0v-3h-3a.5.5 0 0 1 0-1h3v-3A.5.5 0 0 1 8 4z"/></svg>';
+            iconSvg = '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M8 4a.5.5 0 0 1 .5.5v3h3a.5.5 0 0 1 0 1h-3v3a.5.5 0 0 1-1 0v-3h-3a.5.5 0 0 1 0-1h3v-3A.5.5 0 0 1 8 4z"/></svg>';
           } else if (fileStr.includes('删除') || fileStr.includes('delete') || fileStr.includes('-')) {
             iconClass = 'deleted';
-            iconSvg = '<svg viewBox="0 0 16 16"><path d="M5.5 7.5a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1-.5-.5z"/></svg>';
+            iconSvg = '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M5.5 7.5a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1-.5-.5z"/></svg>';
           }
           contentHtml += '<li class="worker-summary-file-item">';
           contentHtml += '<span class="worker-summary-file-icon ' + iconClass + '">' + iconSvg + '</span>';
@@ -929,133 +760,8 @@ export function renderSummaryCard(message) {
       });
     }
 
-export function renderToolCallItem(tool, toolIdx, panelPrefix, isLatest) {
-      const inputContent = tool.input || '';
-      const outputContent = tool.output || tool.result || '';
-      const errorContent = tool.error || '';
-      const hasInput = inputContent && String(inputContent).trim();
-      const hasOutput = outputContent && String(outputContent).trim();
-      const hasError = errorContent && String(errorContent).trim();
-      if (!hasInput && !hasOutput && !hasError) return '';
-
-      const toolPanelId = panelPrefix + '-' + toolIdx;
-      const toolStatus = tool.status || 'completed';
-      const statusText = toolStatus === 'running' ? '执行中' : toolStatus === 'failed' ? '失败' : '完成';
-      const statusClass = toolStatus === 'running' ? 'c-tooluse-status--running' :
-                          toolStatus === 'failed' ? 'c-tooluse-status--error' : 'c-tooluse-status--success';
-      const durationText = tool.duration ? (tool.duration / 1000).toFixed(1) + 's' : '';
-      const expandedClass = isLatest ? ' expanded' : '';
-
-      // 使用 Augment 风格的 c-tool-use 组件
-      let html = '<div class="c-tool-use' + (isLatest ? ' is-expandable' : '') + '" data-panel-id="' + toolPanelId + '">';
-      html += '<div class="c-tool-use__container">';
-
-      // 头部区域
-      html += '<div class="c-tool-use__header-container" onclick="togglePanel(\'' + toolPanelId + '\')">';
-      html += '<div class="c-tool-use__header">';
-      html += '<div class="c-tool-use__content">';
-
-      // 工具图标
-      html += '<div class="c-tool-use__icon-wrapper">' + getToolIcon(tool.name) + '</div>';
-
-      // 工具名称和参数摘要
-      html += '<div class="c-tool-use__main-bar">';
-      html += '<div class="c-tool-use__tool-name">';
-      html += '<span class="c-tool-use__tool-name-text">' + escapeHtml(tool.name || '工具调用') + '</span>';
-      html += '</div>';
-
-      // 参数摘要（折叠时显示）
-      if (hasInput && !isLatest) {
-        const inputSummary = String(inputContent).substring(0, 60).replace(/\s+/g, ' ');
-        html += '<div class="c-tool-use__content-secondary">' + escapeHtml(inputSummary) + (inputContent.length > 60 ? '...' : '') + '</div>';
-      }
-      html += '</div>'; // c-tool-use__main-bar
-      html += '</div>'; // c-tool-use__content
-
-      // 状态指示器
-      html += '<div class="c-tooluse-status ' + statusClass + '">';
-      if (toolStatus === 'running') {
-        html += '<svg class="c-tooluse-status__icon" viewBox="0 0 16 16" fill="currentColor"><path d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/></svg>';
-      } else if (toolStatus === 'failed') {
-        html += '<svg class="c-tooluse-status__icon" viewBox="0 0 16 16" fill="currentColor"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg>';
-      } else {
-        html += '<svg class="c-tooluse-status__icon" viewBox="0 0 16 16" fill="currentColor"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M10.97 4.97a.235.235 0 0 0-.02.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-1.071-1.05z"/></svg>';
-      }
-      html += '<span class="c-tooluse-status__text">' + statusText + '</span>';
-      if (durationText) {
-        html += '<span class="c-tooluse-status__text">' + durationText + '</span>';
-      }
-      html += '</div>'; // c-tooluse-status
-
-      // 折叠图标
-      html += '<div class="c-collapsible-icon' + expandedClass + '"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 12.796V3.204L11.481 8 6 12.796z"/></svg></div>';
-
-      html += '</div>'; // c-tool-use__header
-      html += '</div>'; // c-tool-use__header-container
-
-      // 详情面板（可折叠）
-      html += '<div class="collapsible-content' + expandedClass + '">';
-      html += '<div class="c-tooluse__details">';
-
-      // 输入区域
-      if (hasInput) {
-        html += '<div class="c-tooluse__structured-content">';
-        html += '<div class="c-tooluse__details__heading">输入</div>';
-        html += '<div class="c-tooluse__value">' + renderToolPanelContent(inputContent) + '</div>';
-        html += '</div>';
-      }
-
-      // 输出区域
-      if (hasOutput) {
-        html += '<div class="c-tooluse__structured-content">';
-        html += '<div class="c-tooluse__details__heading">输出</div>';
-        html += '<div class="c-tooluse__value">' + renderToolPanelContent(outputContent) + '</div>';
-        html += '</div>';
-      }
-
-      // 错误区域
-      if (hasError) {
-        html += '<div class="c-shell-error">';
-        html += '<div class="c-shell-error__code"><span>错误</span></div>';
-        html += '<div class="c-shell-error__message"><pre>' + escapeHtml(String(errorContent)) + '</pre></div>';
-        html += '</div>';
-      }
-
-      html += '</div>'; // c-tooluse__details
-      html += '</div>'; // collapsible-content
-
-      html += '</div>'; // c-tool-use__container
-      html += '</div>'; // c-tool-use
-
-      return html;
-    }
-
-export function renderToolTrack(toolCalls, panelPrefix) {
-      if (!toolCalls || toolCalls.length === 0) return '';
-      const sorted = [...toolCalls].sort((a, b) => {
-        const tsA = a.timestamp || 0;
-        const tsB = b.timestamp || 0;
-        if (tsA !== tsB) return tsA - tsB;
-        return (a.seq || 0) - (b.seq || 0);
-      });
-
-      // 过滤有效的工具调用
-      const validTools = sorted.filter(tool => {
-        const inputContent = tool.input || '';
-        const outputContent = tool.output || tool.result || tool.error || '';
-        return (inputContent && String(inputContent).trim()) || (outputContent && String(outputContent).trim());
-      });
-
-      if (validTools.length === 0) return '';
-
-      let html = '<div class="tool-track">';
-      validTools.forEach((tool, toolIdx) => {
-        const isLatest = toolIdx === validTools.length - 1;
-        html += renderToolCallItem(tool, toolIdx, panelPrefix, isLatest);
-      });
-      html += '</div>';
-      return html;
-    }
+// 旧的 renderToolCallItem 和 renderToolTrack 函数已被删除
+// 现在使用新的组件渲染器：renderToolCallList (来自 renderers/tool-call-renderer.js)
 
 export function renderStructuredPlanContent(plan) {
       let html = '<div class="structured-plan-content">';
@@ -1138,25 +844,6 @@ export function renderStructuredPlanContent(plan) {
       return html;
     }
 
-
-export function renderImagePreviews() {
-      const container = document.getElementById('image-preview-container');
-      if (attachedImages.length === 0) {
-        container.classList.remove('has-images');
-        container.innerHTML = '';
-        return;
-      }
-      container.classList.add('has-images');
-      let html = '';
-      attachedImages.forEach((img, idx) => {
-        html += '<div class="image-preview-item" data-idx="' + idx + '">';
-        html += '<img src="' + img.dataUrl + '" alt="附加图片" />';
-        html += '<button class="remove-btn" onclick="removeImage(' + idx + ')" title="移除">×</button>';
-        html += '</div>';
-      });
-      html += '<div class="image-preview-hint"><svg viewBox="0 0 16 16"><path d="M6.002 5.5a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0z"/><path d="M2.002 1a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V3a2 2 0 0 0-2-2h-12zm12 1a1 1 0 0 1 1 1v6.5l-3.777-1.947a.5.5 0 0 0-.577.093l-3.71 3.71-2.66-1.772a.5.5 0 0 0-.63.062L1.002 12V3a1 1 0 0 1 1-1h12z"/></svg>' + attachedImages.length + ' 张图片</div>';
-      container.innerHTML = html;
-    }
 
 export function updateEditsBadge() {
       const badge = document.getElementById('edits-badge');
@@ -1242,10 +929,11 @@ export function renderDependencyPanel() {
           html += '</div>';
           html += '</div>';
         }
+
+        html += '</div>'; // Close dependency-panel-content
       }
 
-      html += '</div>';
-      html += '</div>';
+      html += '</div>'; // Close dependency-panel
 
       return html;
     }
@@ -1505,14 +1193,14 @@ export function renderSubtaskStatusList(subtasks) {
       if (!subtasks || subtasks.length === 0) return '';
 
       const statusIcons = {
-        pending: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>',
-        running: '<svg viewBox="0 0 16 16"><path d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/></svg>',
-        paused: '<svg viewBox="0 0 16 16"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M5 6.25a1.25 1.25 0 0 1 2.5 0v3.5a1.25 1.25 0 0 1-2.5 0v-3.5zm3.5 0a1.25 1.25 0 0 1 2.5 0v3.5a1.25 1.25 0 0 1-2.5 0v-3.5z"/></svg>',
-        retrying: '<svg viewBox="0 0 16 16"><path d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/></svg>',
-        completed: '<svg viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/></svg>',
-        failed: '<svg viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM5.354 4.646a.5.5 0 1 0-.708.708L7.293 8l-2.647 2.646a.5.5 0 0 0 .708.708L8 8.707l2.646 2.647a.5.5 0 0 0 .708-.708L8.707 8l2.647-2.646a.5.5 0 0 0-.708-.708L8 7.293 5.354 4.646z"/></svg>',
-        cancelled: '<svg viewBox="0 0 16 16"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg>',
-        skipped: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="2,2"/></svg>'
+        pending: '<svg width="14" height="14" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>',
+        running: '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/></svg>',
+        paused: '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M5 6.25a1.25 1.25 0 0 1 2.5 0v3.5a1.25 1.25 0 0 1-2.5 0v-3.5zm3.5 0a1.25 1.25 0 0 1 2.5 0v3.5a1.25 1.25 0 0 1-2.5 0v-3.5z"/></svg>',
+        retrying: '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/></svg>',
+        completed: '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/></svg>',
+        failed: '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM5.354 4.646a.5.5 0 1 0-.708.708L7.293 8l-2.647 2.646a.5.5 0 0 0 .708.708L8 8.707l2.646 2.647a.5.5 0 0 0 .708-.708L8.707 8l2.647-2.646a.5.5 0 0 0-.708-.708L8 7.293 5.354 4.646z"/></svg>',
+        cancelled: '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg>',
+        skipped: '<svg width="14" height="14" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="2,2"/></svg>'
       };
 
       let html = '<div class="subtask-status-list">';
@@ -1542,10 +1230,10 @@ export function renderSubtaskStatusList(subtasks) {
 export function renderSystemNotice(m, idx) {
       const type = m.noticeType || 'info';
       const icons = {
-        success: '<svg viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/></svg>',
-        error: '<svg viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM5.354 4.646a.5.5 0 1 0-.708.708L7.293 8l-2.647 2.646a.5.5 0 0 0 .708.708L8 8.707l2.646 2.647a.5.5 0 0 0 .708-.708L8.707 8l2.647-2.646a.5.5 0 0 0-.708-.708L8 7.293 5.354 4.646z"/></svg>',
-        warning: '<svg viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>',
-        info: '<svg viewBox="0 0 16 16"><path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16zm.93-9.412-1 4.705c-.07.34.029.533.304.533.194 0 .487-.07.686-.246l-.088.416c-.287.346-.92.598-1.465.598-.703 0-1.002-.422-.808-1.319l.738-3.468c.064-.293.006-.399-.287-.47l-.451-.081.082-.381 2.29-.287zM8 5.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2z"/></svg>'
+        success: '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/></svg>',
+        error: '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM5.354 4.646a.5.5 0 1 0-.708.708L7.293 8l-2.647 2.646a.5.5 0 0 0 .708.708L8 8.707l2.646 2.647a.5.5 0 0 0 .708-.708L8.707 8l2.647-2.646a.5.5 0 0 0-.708-.708L8 7.293 5.354 4.646z"/></svg>',
+        warning: '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>',
+        info: '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16zm.93-9.412-1 4.705c-.07.34.029.533.304.533.194 0 .487-.07.686-.246l-.088.416c-.287.346-.92.598-1.465.598-.703 0-1.002-.422-.808-1.319l.738-3.468c.064-.293.006-.399-.287-.47l-.451-.081.082-.381 2.29-.287zM8 5.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2z"/></svg>'
       };
       // 系统通知保持轻量级样式，不使用完整卡片
       let html = '<div class="system-notice ' + type + '" data-msg-idx="' + idx + '">';
@@ -1585,7 +1273,7 @@ export function renderPlanPreviewCard(m, idx) {
       const footerHtml = reviewStatus === 'rejected'
         ? ''
         : '<button class="plan-confirm-btn confirm plan-start-btn" data-plan-id="' + escapeHtml(m.planId || '') + '">' +
-          '<svg viewBox="0 0 16 16"><path d="M5.5 3.5a.5.5 0 0 1 .8-.4l5 4a.5.5 0 0 1 0 .8l-5 4a.5.5 0 0 1-.8-.4v-8z"/></svg>' +
+          '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M5.5 3.5a.5.5 0 0 1 .8-.4l5 4a.5.5 0 0 1 0 .8l-5 4a.5.5 0 0 1-.8-.4v-8z"/></svg>' +
           '开始执行</button>';
 
       const reviewHtml = m.review?.summary
@@ -1616,10 +1304,10 @@ export function renderPlanConfirmationCard(m, idx) {
       let footerHtml = '';
       if (isPending) {
         footerHtml = '<button class="plan-confirm-btn cancel" data-action="cancel">' +
-          '<svg viewBox="0 0 16 16"><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg>' +
+          '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg>' +
           '取消</button>' +
           '<button class="plan-confirm-btn confirm" data-action="confirm">' +
-          '<svg viewBox="0 0 16 16"><path d="M13.854 3.646a.5.5 0 0 1 0 .708l-7 7a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L6.5 10.293l6.646-6.647a.5.5 0 0 1 .708 0z"/></svg>' +
+          '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M13.854 3.646a.5.5 0 0 1 0 .708l-7 7a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L6.5 10.293l6.646-6.647a.5.5 0 0 1 .708 0z"/></svg>' +
           '确认执行</button>';
       }
 
@@ -1763,7 +1451,7 @@ export function renderWorkerQuestionCard(m, idx) {
       return renderUnifiedCard({
         type: 'worker_question',
         variant: isPending ? 'warning' : (answered ? 'success' : 'error'),
-        icon: '<svg viewBox="0 0 16 16"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M5.255 5.786a.237.237 0 0 0 .241.247h.825c.138 0 .248-.113.266-.25.09-.656.54-1.134 1.342-1.134.686 0 1.314.343 1.314 1.168 0 .635-.374.927-.965 1.371-.673.489-1.206 1.06-1.168 1.987l.003.217a.25.25 0 0 0 .25.246h.811a.25.25 0 0 0 .25-.25v-.105c0-.718.273-.927 1.01-1.486.609-.463 1.244-.977 1.244-2.056 0-1.511-1.276-2.241-2.673-2.241-1.267 0-2.655.59-2.75 2.286zm1.557 5.763c0 .533.425.927 1.01.927.609 0 1.028-.394 1.028-.927 0-.552-.42-.94-1.029-.94-.584 0-1.009.388-1.009.94z"/></svg>',
+        icon: '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M5.255 5.786a.237.237 0 0 0 .241.247h.825c.138 0 .248-.113.266-.25.09-.656.54-1.134 1.342-1.134.686 0 1.314.343 1.314 1.168 0 .635-.374.927-.965 1.371-.673.489-1.206 1.06-1.168 1.987l.003.217a.25.25 0 0 0 .25.246h.811a.25.25 0 0 0 .25-.25v-.105c0-.718.273-.927 1.01-1.486.609-.463 1.244-.977 1.244-2.056 0-1.511-1.276-2.241-2.673-2.241-1.267 0-2.655.59-2.75 2.286zm1.557 5.763c0 .533.425.927 1.01.927.609 0 1.028-.394 1.028-.927 0-.552-.42-.94-1.029-.94-.584 0-1.009.388-1.009.94z"/></svg>',
         title: 'Worker 询问',  // 恢复标题，但不设置 collapsed，所以标题无点击事件
         badges: [{ text: statusText, class: badgeClass }],
         time: m.time || '',
@@ -1793,7 +1481,7 @@ export function renderTasksView() {
         .reverse();  // 按时间倒序
 
       if (tasks.length === 0) {
-        container.innerHTML = '<div class="empty-state"><div class="empty-state-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 2a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v13.5a.5.5 0 0 1-.777.416L8 13.101l-5.223 2.815A.5.5 0 0 1 2 15.5V2zm2-1a1 1 0 0 0-1 1v12.566l4.723-2.482a.5.5 0 0 1 .554 0L13 14.566V2a1 1 0 0 0-1-1H4z"/></svg></div><span class="empty-state-text">暂无任务</span><span class="empty-state-hint">需要 Worker 协助的任务将在此显示</span></div>';
+        container.innerHTML = '<div class="empty-state"><div class="empty-state-icon"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M2 2a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v13.5a.5.5 0 0 1-.777.416L8 13.101l-5.223 2.815A.5.5 0 0 1 2 15.5V2zm2-1a1 1 0 0 0-1 1v12.566l4.723-2.482a.5.5 0 0 1 .554 0L13 14.566V2a1 1 0 0 0-1-1H4z"/></svg></div><span class="empty-state-text">暂无任务</span><span class="empty-state-hint">需要 Worker 协助的任务将在此显示</span></div>';
         return;
       }
 
@@ -1818,7 +1506,7 @@ export function renderTasksView() {
 
         // 任务头部（可点击展开/折叠）
         html += '<div class="task-group-header" onclick="toggleTaskGroup(\'' + task.id + '\')">';
-        html += '<div class="task-group-toggle"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M4.646 1.646a.5.5 0 0 1 .708 0l6 6a.5.5 0 0 1 0 .708l-6 6a.5.5 0 0 1-.708-.708L10.293 8 4.646 2.354a.5.5 0 0 1 0-.708z"/></svg></div>';
+        html += '<div class="task-group-toggle"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M4.646 1.646a.5.5 0 0 1 .708 0l6 6a.5.5 0 0 1 0 .708l-6 6a.5.5 0 0 1-.708-.708L10.293 8 4.646 2.354a.5.5 0 0 1 0-.708z"/></svg></div>';
         html += '<div class="task-status ' + statusClass + '"></div>';
         html += '<div class="task-group-info">';
         html += '<span class="task-group-title">' + escapeHtml((task.prompt || '任务').slice(0, 50)) + (task.prompt && task.prompt.length > 50 ? '...' : '') + '</span>';
@@ -1827,7 +1515,7 @@ export function renderTasksView() {
         if (taskTime) html += ' · ' + taskTime;
         html += '</span></div>';
         if (isRunning) {
-          html += '<button class="btn-icon btn-danger" onclick="event.stopPropagation();interruptTask(\'' + task.id + '\')" title="中断"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M5 3.5h6A1.5 1.5 0 0 1 12.5 5v6a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 11V5A1.5 1.5 0 0 1 5 3.5z"/></svg></button>';
+          html += '<button class="btn-icon btn-danger" onclick="event.stopPropagation();interruptTask(\'' + task.id + '\')" title="中断"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M5 3.5h6A1.5 1.5 0 0 1 12.5 5v6a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 11V5A1.5 1.5 0 0 1 5 3.5z"/></svg></button>';
         }
         html += '</div>';
 
@@ -1868,7 +1556,7 @@ export function renderEditsView() {
       const container = document.getElementById('edits-content');
       if (!container) return;
       if (pendingChanges.length === 0) {
-        container.innerHTML = '<div class="empty-state"><div class="empty-state-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168l10-10z"/></svg></div><span class="empty-state-text">暂无待处理变更</span><span class="empty-state-hint">模型修改文件后将在此显示</span></div>';
+        container.innerHTML = '<div class="empty-state"><div class="empty-state-icon"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168l10-10z"/></svg></div><span class="empty-state-text">暂无待处理变更</span><span class="empty-state-hint">模型修改文件后将在此显示</span></div>';
         return;
       }
       let html = '<div class="edits-header"><span class="edits-count">' + pendingChanges.length + ' 个变更</span>';
@@ -1893,8 +1581,8 @@ export function renderEditsView() {
         if (agentName) html += '<span class="badge badge--xs badge--' + agentClass + '">' + agentName + '</span>';
         html += '</div>';
         html += '<div class="edit-actions" onclick="event.stopPropagation()">';
-        html += '<button class="btn-icon" onclick="approveChange(\'' + escapeHtml(edit.filePath) + '\')" title="批准"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M13.854 3.646a.5.5 0 0 1 0 .708l-7 7a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L6.5 10.293l6.646-6.647a.5.5 0 0 1 .708 0z"/></svg></button>';
-        html += '<button class="btn-icon" onclick="revertChange(\'' + escapeHtml(edit.filePath) + '\')" title="还原"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 3a5 5 0 1 1-4.546 2.914.5.5 0 0 0-.908-.417A6 6 0 1 0 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 0-.41-.192L5.23 2.308a.25.25 0 0 0 0 .384l2.36 1.966A.25.25 0 0 0 8 4.466z"/></svg></button>';
+        html += '<button class="btn-icon" onclick="approveChange(\'' + escapeHtml(edit.filePath) + '\')" title="批准"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M13.854 3.646a.5.5 0 0 1 0 .708l-7 7a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L6.5 10.293l6.646-6.647a.5.5 0 0 1 .708 0z"/></svg></button>';
+        html += '<button class="btn-icon" onclick="revertChange(\'' + escapeHtml(edit.filePath) + '\')" title="还原"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M8 3a5 5 0 1 1-4.546 2.914.5.5 0 0 0-.908-.417A6 6 0 1 0 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 0-.41-.192L5.23 2.308a.25.25 0 0 0 0 .384l2.36 1.966A.25.25 0 0 0 8 4.466z"/></svg></button>';
         html += '</div></div>';
       });
       html += '</div>';
@@ -1923,7 +1611,7 @@ export function renderMCPServerList() {
       if (mcpServers.length === 0) {
         listEl.innerHTML = `
           <div class="empty-state">
-            <svg viewBox="0 0 16 16" width="48" height="48" fill="currentColor" opacity="0.3">
+            <svg width="48" height="48" viewBox="0 0 16 16" fill="currentColor" opacity="0.3">
               <path d="M2 2.5a.5.5 0 0 1 .5-.5h3a.5.5 0 0 1 0 1H3v2.5a.5.5 0 0 1-1 0v-3zm12 0a.5.5 0 0 0-.5-.5h-3a.5.5 0 0 0 0 1H13v2.5a.5.5 0 0 0 1 0v-3zm-12 9a.5.5 0 0 0 .5.5h3a.5.5 0 0 0 0-1H3v-2.5a.5.5 0 0 0-1 0v3zm12 0a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1 0-1H13v-2.5a.5.5 0 0 1 1 0v3z"/>
               <path d="M8 3a5 5 0 1 0 0 10A5 5 0 0 0 8 3zM4 8a4 4 0 1 1 8 0 4 4 0 0 1-8 0z"/>
             </svg>
@@ -1943,18 +1631,18 @@ export function renderMCPServerList() {
             </div>
             <div class="mcp-server-actions">
               <button class="mcp-action-btn" data-action="refresh" data-server-id="${server.id}" title="刷新工具列表">
-                <svg viewBox="0 0 16 16" fill="currentColor">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
                   <path d="M11.534 7h3.932a.25.25 0 0 1 .192.41l-1.966 2.36a.25.25 0 0 1-.384 0l-1.966-2.36a.25.25 0 0 1 .192-.41zm-11 2h3.932a.25.25 0 0 0 .192-.41L2.692 6.23a.25.25 0 0 0-.384 0L.342 8.59A.25.25 0 0 0 .534 9z"/>
                   <path d="M8 3c-1.552 0-2.94.707-3.857 1.818a.5.5 0 1 1-.771-.636A6.002 6.002 0 0 1 13.917 7H12.9A5.002 5.002 0 0 0 8 3zM3.1 9a5.002 5.002 0 0 0 8.757 2.182.5.5 0 1 1 .771.636A6.002 6.002 0 0 1 2.083 9H3.1z"/>
                 </svg>
               </button>
               <button class="mcp-action-btn" data-action="edit" data-server-id="${server.id}" title="编辑服务器">
-                <svg viewBox="0 0 16 16" fill="currentColor">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
                   <path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168l10-10zM11.207 2.5 13.5 4.793 14.793 3.5 12.5 1.207 11.207 2.5zm1.586 3L10.5 3.207 4 9.707V10h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.293l6.5-6.5zm-9.761 5.175-.106.106-1.528 3.821 3.821-1.528.106-.106A.5.5 0 0 1 5 12.5V12h-.5a.5.5 0 0 1-.5-.5V11h-.5a.5.5 0 0 1-.468-.325z"/>
                 </svg>
               </button>
               <button class="mcp-action-btn danger" data-action="delete" data-server-id="${server.id}" title="删除服务器">
-                <svg viewBox="0 0 16 16" fill="currentColor">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
                   <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
                   <path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
                 </svg>
@@ -2252,7 +1940,7 @@ export function renderRepositoryManagementList() {
       if (!repositories || repositories.length === 0) {
         listEl.innerHTML = `
           <div class="empty-state">
-            <svg viewBox="0 0 16 16" width="48" height="48" fill="currentColor">
+            <svg width="48" height="48" viewBox="0 0 16 16" fill="currentColor">
               <path d="M2.5 3.5a.5.5 0 0 1 0-1h11a.5.5 0 0 1 0 1h-11zm0 3a.5.5 0 0 1 0-1h11a.5.5 0 0 1 0 1h-11zm0 3a.5.5 0 0 1 0-1h11a.5.5 0 0 1 0 1h-11zm0 3a.5.5 0 0 1 0-1h11a.5.5 0 0 1 0 1h-11z"/>
             </svg>
             <p>暂无仓库</p>
@@ -2277,14 +1965,14 @@ export function renderRepositoryManagementList() {
             </div>
             <div class="repo-manage-actions">
               <button class="btn-icon btn-icon--sm" id="refresh-btn-${repo.id}" onclick="refreshRepositoryInDialog('${repo.id}')" title="刷新仓库">
-                <svg viewBox="0 0 16 16" fill="currentColor">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
                   <path d="M11.534 7h3.932a.25.25 0 0 1 .192.41l-1.966 2.36a.25.25 0 0 1-.384 0l-1.966-2.36a.25.25 0 0 1 .192-.41zm-11 2h3.932a.25.25 0 0 0 .192-.41L2.692 6.23a.25.25 0 0 0-.384 0L.342 8.59A.25.25 0 0 0 .534 9z"/>
                   <path fill-rule="evenodd" d="M8 3c-1.552 0-2.94.707-3.857 1.818a.5.5 0 1 1-.771-.636A6.002 6.002 0 0 1 13.917 7H12.9A5.002 5.002 0 0 0 8 3zM3.1 9a5.002 5.002 0 0 0 8.757 2.182.5.5 0 1 1 .771.636A6.002 6.002 0 0 1 2.083 9H3.1z"/>
                 </svg>
               </button>
               ${!isBuiltin ? `
                 <button class="btn-icon btn-icon--sm btn-icon--danger" onclick="deleteRepositoryFromDialog('${repo.id}')" title="删除仓库">
-                  <svg viewBox="0 0 16 16" fill="currentColor">
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
                     <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
                     <path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
                   </svg>
@@ -2308,7 +1996,7 @@ export function renderSkillsToolList() {
       if (!skillsConfig || !skillsConfig.builtInTools) {
         listEl.innerHTML = `
           <div class="empty-state">
-            <svg viewBox="0 0 16 16" width="48" height="48" fill="currentColor" opacity="0.3">
+            <svg width="48" height="48" viewBox="0 0 16 16" fill="currentColor" opacity="0.3">
               <path d="M5 2V0H0v5h2v6H0v5h5v-2h6v2h5v-5h-2V5h2V0h-5v2H5zm6 1v2h2v6h-2v2H5v-2H3V5h2V3h6z"/>
             </svg>
             <p>暂无已安装的 Skill</p>
@@ -2355,7 +2043,7 @@ export function renderSkillsToolList() {
       if (enabledSkills.length === 0) {
         listEl.innerHTML = `
           <div class="empty-state">
-            <svg viewBox="0 0 16 16" width="48" height="48" fill="currentColor" opacity="0.3">
+            <svg width="48" height="48" viewBox="0 0 16 16" fill="currentColor" opacity="0.3">
               <path d="M5 2V0H0v5h2v6H0v5h5v-2h6v2h5v-5h-2V5h2V0h-5v2H5zm6 1v2h2v6h-2v2H5v-2H3V5h2V3h6z"/>
             </svg>
             <p>暂无已安装的 Skill</p>
@@ -2386,7 +2074,7 @@ export function renderSkillsToolList() {
         html += `
           <div class="skills-tool-item">
             <div class="skills-tool-icon ${iconClass}">
-              <svg viewBox="0 0 16 16" fill="currentColor">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
                 <path d="M5 2V0H0v5h2v6H0v5h5v-2h6v2h5v-5h-2V5h2V0h-5v2H5zm6 1v2h2v6h-2v2H5v-2H3V5h2V3h6z"/>
               </svg>
             </div>
@@ -2448,7 +2136,7 @@ export function renderSkillLibrary(skills) {
         console.warn('[Skill Library] No skills to display');
         listEl.innerHTML = `
           <div class="empty-state">
-            <svg viewBox="0 0 16 16" width="48" height="48" fill="currentColor">
+            <svg width="48" height="48" viewBox="0 0 16 16" fill="currentColor">
               <path d="M5 2V0H0v5h2v6H0v5h5v-2h6v2h5v-5h-2V5h2V0h-5v2H5zm6 1v2h2v6h-2v2H5v-2H3V5h2V3h6z"/>
             </svg>
             <p>暂无可用的 Skill</p>
@@ -2481,7 +2169,7 @@ export function renderSkillLibrary(skills) {
             <div class="skill-repo-title">${escapeHtml(repoData.name)} (${repoData.skills.length} 个技能)</div>
             ${repoData.skills.map(skill => {
               // 只允许SVG图标，过滤掉emoji
-              let iconSvg = '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M5 2V0H0v5h2v6H0v5h5v-2h6v2h5v-5h-2V5h2V0h-5v2H5zm6 1v2h2v6h-2v2H5v-2H3V5h2V3h6z"/></svg>';
+              let iconSvg = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M5 2V0H0v5h2v6H0v5h5v-2h6v2h5v-5h-2V5h2V0h-5v2H5zm6 1v2h2v6h-2v2H5v-2H3V5h2V3h6z"/></svg>';
               if (skill.icon && skill.icon.trim().startsWith('<svg')) {
                 iconSvg = skill.icon;
               }
@@ -2565,91 +2253,9 @@ export function collectWorkerStatusEntries() {
   return entries;
 }
 
-// 获取消息分组键
-export function getMessageGroupKey(message, source) {
-  if (message.role === 'user') return 'user';
-  const typeKey = message.messageType || message.type || '';
-  return source + '-' + (message.agent || 'ai') + '-' + typeKey;
-}
-
-// 获取角色图标
-export function getRoleIcon(role) {
-  const icons = {
-    orchestrator: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zM2.04 4.326c.325 1.329 2.532 2.54 3.717 3.19.48.263.793.434.743.484-.08.08-.162.158-.242.234-.416.396-.787.749-.758 1.266.035.634.618.824 1.214 1.017.577.188 1.168.38 1.286.983.082.417-.075.988-.22 1.52-.215.782-.406 1.48.22 1.48 1.5-.5 3.798-3.186 4-5 .138-1.243-2-2-3.5-2.5-.478-.16-.755.081-.99.284-.172.15-.322.279-.51.216-.445-.148-2.5-2-1.5-2.5.78-.39.952-.171 1.227.182.078.099.163.208.273.318.609.304.662-.132.723-.633.039-.322.081-.671.277-.867.434-.434 1.265-.791 2.028-1.12.712-.306 1.365-.587 1.579-.88A7 7 0 1 1 2.04 4.327z"/></svg>',
-    claude: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zM0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8z"/><path d="M5.255 5.786a.237.237 0 0 0 .241.247h.825c.138 0 .248-.113.266-.25.09-.656.54-1.134 1.342-1.134.686 0 1.314.343 1.314 1.168 0 .635-.374.927-.965 1.371-.673.489-1.206 1.06-1.168 1.987l.003.217a.25.25 0 0 0 .25.246h.811a.25.25 0 0 0 .25-.25v-.105c0-.718.273-.927 1.01-1.486.609-.463 1.244-.977 1.244-2.056 0-1.511-1.276-2.241-2.673-2.241-1.267 0-2.655.59-2.75 2.286zm1.557 5.763c0 .533.425.927 1.01.927.609 0 1.028-.394 1.028-.927 0-.552-.42-.94-1.029-.94-.584 0-1.009.388-1.009.94z"/></svg>',
-    codex: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M5.854 4.854a.5.5 0 1 0-.708-.708l-3.5 3.5a.5.5 0 0 0 0 .708l3.5 3.5a.5.5 0 0 0 .708-.708L2.707 8l3.147-3.146zm4.292 0a.5.5 0 0 1 .708-.708l3.5 3.5a.5.5 0 0 1 0 .708l-3.5 3.5a.5.5 0 0 1-.708-.708L13.293 8l-3.147-3.146z"/></svg>',
-    gemini: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0zM4.5 7.5a.5.5 0 0 0 0 1h5.793l-2.147 2.146a.5.5 0 0 0 .708.708l3-3a.5.5 0 0 0 0-.708l-3-3a.5.5 0 1 0-.708.708L10.293 7.5H4.5z"/></svg>',
-    task: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M2.5 1A1.5 1.5 0 0 0 1 2.5v11A1.5 1.5 0 0 0 2.5 15h6.086a1.5 1.5 0 0 0 1.06-.44l4.915-4.914A1.5 1.5 0 0 0 15 8.586V2.5A1.5 1.5 0 0 0 13.5 1h-11z"/></svg>',
-    success: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/></svg>',
-    error: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>',
-    warning: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>',
-    info: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16zm.93-9.412-1 4.705c-.07.34.029.533.304.533.194 0 .487-.07.686-.246l-.088.416c-.287.346-.92.598-1.465.598-.703 0-1.002-.422-.808-1.319l.738-3.468c.064-.293.006-.399-.287-.47l-.451-.081.082-.381 2.29-.287zM8 5.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2z"/></svg>',
-    plan: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M3.5 0a.5.5 0 0 1 .5.5V1h8V.5a.5.5 0 0 1 1 0V1h1a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V3a2 2 0 0 1 2-2h1V.5a.5.5 0 0 1 .5-.5zM1 4v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V4H1z"/></svg>',
-    question: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M5.255 5.786a.237.237 0 0 0 .241.247h.825c.138 0 .248-.113.266-.25.09-.656.54-1.134 1.342-1.134.686 0 1.314.343 1.314 1.168 0 .635-.374.927-.965 1.371-.673.489-1.206 1.06-1.168 1.987l.003.217a.25.25 0 0 0 .25.246h.811a.25.25 0 0 0 .25-.25v-.105c0-.718.273-.927 1.01-1.486.609-.463 1.244-.977 1.244-2.056 0-1.511-1.276-2.241-2.673-2.241-1.267 0-2.655.59-2.75 2.286zm1.557 5.763c0 .533.425.927 1.01.927.609 0 1.028-.394 1.028-.927 0-.552-.42-.94-1.029-.94-.584 0-1.009.388-1.009.94z"/></svg>'
-  };
-  return icons[role] || icons.info;
-}
-
-// 获取角色信息
-export function getRoleInfo(message, source, defaultAgent) {
-  if (message.role === 'user') {
-    return { roleName: '', badgeClass: '' };
-  }
-  if (source === 'orchestrator') {
-    return { roleName: 'Orchestrator', badgeClass: 'orchestrator' };
-  }
-  if (message.agent) {
-    return { roleName: message.agent.toUpperCase(), badgeClass: message.agent.toLowerCase() };
-  }
-  if (defaultAgent) {
-    return { roleName: defaultAgent.toUpperCase(), badgeClass: defaultAgent.toLowerCase() };
-  }
-  return { roleName: 'AI', badgeClass: 'assistant' };
-}
-
-// 获取工具图标
-export function getToolIcon(toolName) {
-  const name = (toolName || '').toLowerCase();
-  if (name.includes('read') || name.includes('view') || name.includes('cat')) {
-    return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M14 4.5V14a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2a2 2 0 0 1 2-2h5.5L14 4.5zM10 4a1 1 0 0 1-1-1V1.5L13.5 6H11a1 1 0 0 1-1-1V4z"/></svg>';
-  }
-  if (name.includes('write') || name.includes('edit') || name.includes('save') || name.includes('create') || name.includes('patch')) {
-    return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168l10-10zM11.207 2.5L13.5 4.793 14.793 3.5 12.5 1.207 11.207 2.5zm1.586 3L10.5 3.207 4 9.707V10h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.293l6.5-6.5z"/></svg>';
-  }
-  if (name.includes('search') || name.includes('find') || name.includes('grep') || name.includes('glob')) {
-    return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z"/></svg>';
-  }
-  if (name.includes('bash') || name.includes('shell') || name.includes('exec') || name.includes('run') || name.includes('terminal') || name.includes('command')) {
-    return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M6 9a.5.5 0 0 1 .5-.5h3a.5.5 0 0 1 0 1h-3A.5.5 0 0 1 6 9zM3.854 4.146a.5.5 0 1 0-.708.708L4.793 6.5 3.146 8.146a.5.5 0 1 0 .708.708l2-2a.5.5 0 0 0 0-.708l-2-2z"/><path d="M2 1a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V3a2 2 0 0 0-2-2H2zm12 1a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1h12z"/></svg>';
-  }
-  if (name.includes('list') || name.includes('ls') || name.includes('dir')) {
-    return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M0 2a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V2zm4 0v12h10a1 1 0 0 0 1-1V3a1 1 0 0 0-1-1H4zm-1 0H2a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h1V2z"/></svg>';
-  }
-  if (name.includes('fetch') || name.includes('http') || name.includes('api') || name.includes('web') || name.includes('url')) {
-    return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8zm7.5-6.923c-.67.204-1.335.82-1.887 1.855A7.97 7.97 0 0 0 5.145 4H7.5V1.077zM4.09 4a9.267 9.267 0 0 1 .64-1.539 6.7 6.7 0 0 1 .597-.933A7.025 7.025 0 0 0 2.255 4H4.09zm-.582 3.5c.03-.877.138-1.718.312-2.5H1.674a6.958 6.958 0 0 0-.656 2.5h2.49zM4.847 5a12.5 12.5 0 0 0-.338 2.5H7.5V5H4.847z"/></svg>';
-  }
-  if (name.includes('think') || name.includes('reason') || name.includes('analyze')) {
-    return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16zM7 6.5C7 7.328 6.552 8 6 8s-1-.672-1-1.5S5.448 5 6 5s1 .672 1 1.5zM4.285 9.567a.5.5 0 0 1 .683.183A3.498 3.498 0 0 0 8 11.5a3.498 3.498 0 0 0 3.032-1.75.5.5 0 1 1 .866.5A4.498 4.498 0 0 1 8 12.5a4.498 4.498 0 0 1-3.898-2.25.5.5 0 0 1 .183-.683zM10 8c-.552 0-1-.672-1-1.5S9.448 5 10 5s1 .672 1 1.5S10.552 8 10 8z"/></svg>';
-  }
-  if (name.includes('delete') || name.includes('remove') || name.includes('rm')) {
-    return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/><path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1z"/></svg>';
-  }
-  return '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M1 0L0 1l2.2 3.081a1 1 0 0 0 .815.419h.07a1 1 0 0 1 .708.293l2.675 2.675-2.617 2.654A3.003 3.003 0 0 0 0 13a3 3 0 1 0 5.878-.851l2.654-2.617.968.968-.305.914a1 1 0 0 0 .242 1.023l3.356 3.356a1 1 0 0 0 1.414 0l1.586-1.586a1 1 0 0 0 0-1.414l-3.356-3.356a1 1 0 0 0-1.023-.242l-.914.305-.968-.968 2.617-2.654A3.003 3.003 0 0 0 13 0a3 3 0 1 0-.851 5.878L9.495 8.53 6.82 5.854a1 1 0 0 1-.293-.708v-.07a1 1 0 0 0-.419-.815L1 0zm9.5 5.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm-9 8a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/></svg>';
-}
-
-// 格式化时间
-export function formatTime(date) {
-  if (!date) return '';
-  const d = date instanceof Date ? date : new Date(date);
-  return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-}
-
-// 清理内部协议数据
-export function cleanInternalProtocolData(content) {
-  // 简单实现，移除特殊标记
-  if (!content) return '';
-  return content.replace(/\[INTERNAL:.*?\]/g, '').trim();
-}
+// 注意：getRoleIcon, getRoleInfo, getMessageGroupKey, formatTime, cleanInternalProtocolData
+// 这些函数已从 render-utils.js 导入，不需要在此重复定义
+// 旧的 getToolIcon 函数已删除，使用 renderers/tool-call-renderer.js 中的实现
 
 // 解析 Worker 询问内容，提取有意义的信息
 export function parseWorkerQuestionContent(content) {
@@ -2798,7 +2404,7 @@ window.copyCodeBlock = function(codeId) {
   navigator.clipboard.writeText(text).then(() => {
     const btn = event.currentTarget;
     const originalHtml = btn.innerHTML;
-    btn.innerHTML = '<svg viewBox="0 0 16 16"><path d="M13.854 3.646a.5.5 0 0 1 0 .708l-7 7a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L6.5 10.293l6.646-6.647a.5.5 0 0 1 .708 0z"/></svg>';
+    btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M13.854 3.646a.5.5 0 0 1 0 .708l-7 7a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L6.5 10.293l6.646-6.647a.5.5 0 0 1 .708 0z"/></svg>';
     btn.classList.add('copied');
     setTimeout(() => {
       btn.innerHTML = originalHtml;
@@ -2839,6 +2445,12 @@ export function scheduleRenderMainContent() {
     renderMainContent();
   });
 }
+
+// 初始化 StreamingManager 的渲染回调
+setRenderCallback(scheduleRenderMainContent);
+
+// 导出 streamingManager 供其他模块使用
+export { streamingManager };
 
 // ============================================
 // 内容块提取函数

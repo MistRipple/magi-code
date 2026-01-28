@@ -29,6 +29,7 @@ export function updateModelConnectionStatus(modelStatuses) {
     'timeout': '连接超时',
     'invalid_model': '模型无效',
     'not_installed': '未安装',
+    'checking': '检测中',
     'unknown': '未知错误'
   };
 
@@ -43,6 +44,8 @@ export function updateModelConnectionStatus(modelStatuses) {
     item.classList.remove('available', 'unavailable', 'disabled', 'error');
     if (isAvailable) {
       item.classList.add('available');
+    } else if (status.status === 'checking') {
+      item.classList.add('checking');
     } else if (status.status === 'disabled') {
       item.classList.add('disabled');
     } else {
@@ -72,6 +75,9 @@ export function updateModelConnectionStatus(modelStatuses) {
       if (isAvailable) {
         badge.classList.add('available');
         badge.textContent = '已连接';
+      } else if (status.status === 'checking') {
+        badge.classList.add('checking');
+        badge.textContent = '检测中';
       } else if (status.status === 'disabled') {
         badge.classList.add('disabled');
         badge.textContent = '已禁用';
@@ -439,7 +445,7 @@ export function initializeSettingsPanel() {
   initProfileUI();
 
   // 请求模型连接状态
-  refreshAgentConnections();
+  refreshAgentConnections(false);
 
   // 请求执行统计
   postMessage({ type: 'requestExecutionStats' });
@@ -458,7 +464,7 @@ export function initializeSettingsPanel() {
     refreshBtn.addEventListener('click', () => {
       refreshBtn.classList.add('loading');
       refreshBtn.disabled = true;
-      refreshAgentConnections();
+      refreshAgentConnections(true);
     });
   }
 

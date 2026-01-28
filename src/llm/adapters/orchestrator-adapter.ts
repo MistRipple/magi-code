@@ -82,6 +82,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
 
     this.setState(AdapterState.BUSY);
     this.currentTraceId = this.generateTraceId();
+    let messageId: string | null = null;
 
     try {
       // 自动截断历史以控制 token 消耗
@@ -103,14 +104,15 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       };
 
       // 开始流式响应
-      const messageId = this.normalizer.startStream(this.currentTraceId);
+      const streamId = this.normalizer.startStream(this.currentTraceId);
+      messageId = streamId;
       let fullResponse = '';
 
       // 流式调用 LLM
       const response = await this.client.streamMessage(params, (chunk) => {
         if (chunk.type === 'content_delta' && chunk.content) {
           fullResponse += chunk.content;
-          this.normalizer.processChunk(messageId, chunk.content);
+          this.normalizer.processChunk(streamId, chunk.content);
           this.emit('message', chunk.content);
         }
       });
@@ -122,11 +124,14 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         content: fullResponse,
       });
 
-      this.normalizer.endStream(messageId);
+      this.normalizer.endStream(streamId);
       this.setState(AdapterState.CONNECTED);
 
       return fullResponse;
     } catch (error: any) {
+      if (messageId) {
+        this.normalizer.endStream(messageId, error?.message || 'Request failed');
+      }
       this.setState(AdapterState.ERROR);
       this.emitError(error);
       throw error;

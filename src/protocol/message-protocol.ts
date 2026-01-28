@@ -272,6 +272,8 @@ export interface MessageMetadata {
   questionTimestamp?: number;
   /** 适配器角色 */
   adapterRole?: 'worker' | 'orchestrator';
+  /** 🔧 标记为状态消息（区别于 LLM 对话响应，不参与内容去重） */
+  isStatusMessage?: boolean;
   /** 扩展数据 */
   extra?: Record<string, unknown>;
 }

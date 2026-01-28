@@ -227,6 +227,8 @@ export class VSCodeTerminalExecutor {
 
   /**
    * 使用sendText执行命令（降级方案）
+   * 注意：没有Shell Integration时，无法准确获取输出和退出码
+   * 这是一个降级方案，只适用于用户想要显示终端的场景
    */
   private async executeWithSendText(
     process: TerminalProcess,
@@ -238,17 +240,21 @@ export class VSCodeTerminalExecutor {
     // 发送命令
     terminal.sendText(command);
 
-    // 等待命令完成（简单的超时等待）
-    return new Promise((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
+    // 由于没有 Shell Integration，我们无法获取命令输出
+    // 设置一个较短的等待时间让命令开始执行，然后返回
+    // 终端会保持打开，用户可以看到输出
+    return new Promise((resolve) => {
+      // 给命令一个短暂的启动时间
+      setTimeout(() => {
         process.state = 'completed';
         process.exitCode = 0;
-        logger.warn('Command execution completed by timeout (no shell integration)', undefined, LogCategory.SHELL);
+        process.output = '(命令已发送到终端，请查看终端窗口获取输出)';
+        logger.info('Command sent to terminal (no shell integration)', {
+          command,
+          note: 'Output not captured, please check terminal window',
+        }, LogCategory.SHELL);
         resolve();
-      }, timeout);
-
-      // 注意：没有Shell Integration时，无法准确获取输出和退出码
-      // 这是一个降级方案
+      }, 500); // 给命令500ms启动时间
     });
   }
 

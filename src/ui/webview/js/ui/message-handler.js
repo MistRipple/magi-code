@@ -38,18 +38,21 @@ import {
 import {
   renderMainContent,
   scheduleRenderMainContent,
-  getRoleIcon,
-  getRoleInfo,
-  getMessageGroupKey,
   renderMessageContentSmart,
   renderSessionList,
   extractTextFromBlocks,
   extractCodeBlocksFromBlocks,
   extractThinkingFromBlocks,
-  extractToolCallsFromBlocks
+  extractToolCallsFromBlocks,
+  streamingManager
 } from './message-renderer.js';
 
-import { resetIncrementalState } from '../core/incremental-update.js';
+// 渲染辅助函数（从 render-utils.js 导入）
+import {
+  getRoleIcon,
+  getRoleInfo,
+  getMessageGroupKey
+} from './renderers/render-utils.js';
 
 // 标准消息存储 - 按 messageId 索引
 const standardMessages = new Map();
@@ -164,6 +167,23 @@ export function handleStandardMessage(message) {
       if (message.lifecycle === 'streaming' || message.lifecycle === 'started') {
         setProcessingState(true);
         setProcessingActor(message.source, agent);
+
+        // 🔧 启动 StreamingManager
+        const webviewMsg = isOrchestrator
+          ? threadMessages.find(m => m.standardMessageId === message.id)
+          : (agentOutputs[agent] || []).find(m => m.standardMessageId === message.id);
+
+        if (webviewMsg) {
+          streamingManager.startStream(message.id, {
+            content: webviewMsg.content || '',
+            thinking: webviewMsg.thinking || [],
+            toolCalls: webviewMsg.toolCalls || [],
+            parsedBlocks: webviewMsg.parsedBlocks || [],
+            role: webviewMsg.role,
+            source: message.source,
+            agent: agent
+          });
+        }
       }
 
       saveWebviewState();
@@ -210,16 +230,26 @@ export function handleStandardUpdate(update) {
         }
         Object.assign(webviewMsg, updatedMsg);
 
-        // 尝试增量更新 DOM（基于 blocks 渲染）
+        // 🔧 使用 StreamingManager 进行增量更新
         if (update.updateType === 'append' || update.updateType === 'replace') {
-          const updateSuccess = isOrchestrator
-            ? updateStreamingMessage(webviewMsg.streamKey, webviewMsg.content)
-            : updateAgentStreamingMessage(agent, webviewMsg.content);
+          // 准备增量数据
+          const delta = {
+            content: updatedMsg.content,
+            thinking: updatedMsg.thinking,
+            toolCalls: updatedMsg.toolCalls,
+            parsedBlocks: updatedMsg.parsedBlocks,
+            updateType: update.updateType
+          };
 
-          if (!updateSuccess) {
+          // 尝试通过 StreamingManager 更新
+          const streamUpdated = streamingManager.updateStream(update.messageId, delta);
+
+          // 如果 StreamingManager 更新失败（消息不在流式状态），回退到全量渲染
+          if (!streamUpdated) {
             scheduleRenderMainContent();
           }
         } else {
+          // 其他更新类型，触发全量渲染
           scheduleRenderMainContent();
         }
       }
@@ -228,7 +258,15 @@ export function handleStandardUpdate(update) {
       if (message.source !== 'orchestrator') {
         const mirrorMsg = upsertThreadMirrorFromWorker(message);
         if (mirrorMsg && (update.updateType === 'append' || update.updateType === 'replace')) {
-          updateStreamingMessage(mirrorMsg.streamKey, mirrorMsg.content);
+          // Worker 镜像也通过 StreamingManager 更新
+          const delta = {
+            content: mirrorMsg.content,
+            thinking: mirrorMsg.thinking,
+            toolCalls: mirrorMsg.toolCalls,
+            parsedBlocks: mirrorMsg.parsedBlocks,
+            updateType: update.updateType
+          };
+          streamingManager.updateStream(mirrorMsg.standardMessageId || mirrorMsg.streamKey, delta);
         }
       }
 
@@ -243,6 +281,11 @@ export function handleStandardComplete(message) {
       }
 
       console.log('[Webview] 标准消息完成:', message.id, message.lifecycle);
+
+      // 🔧 完成 StreamingManager 的流式输出
+      if (streamingManager.getStream(message.id)) {
+        streamingManager.completeStream(message.id);
+      }
 
       // 更新存储的消息
       standardMessages.set(message.id, message);
@@ -727,7 +770,7 @@ export function showRecoveryDialog(taskId, error, canRetry, canRollback) {
       dialog.id = 'recovery-dialog';
       dialog.innerHTML = `
         <div class="recovery-dialog-title">
-          <svg viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>
+          <svg width="14" height="14" viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>
           任务执行失败
         </div>
         <div class="recovery-dialog-error">${escapeHtml(error || '')}</div>
@@ -773,7 +816,7 @@ export function showToolAuthorizationDialog(toolName, toolArgs) {
 
       dialog.innerHTML = `
         <div class="tool-auth-dialog-title">
-          <svg viewBox="0 0 16 16"><path d="M8 1a2 2 0 0 1 2 2v4H6V3a2 2 0 0 1 2-2zm3 6V3a3 3 0 0 0-6 0v4a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"/></svg>
+          <svg width="14" height="14" viewBox="0 0 16 16"><path d="M8 1a2 2 0 0 1 2 2v4H6V3a2 2 0 0 1 2-2zm3 6V3a3 3 0 0 0-6 0v4a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"/></svg>
           工具授权请求
         </div>
         <div class="tool-auth-dialog-content">
@@ -945,43 +988,11 @@ export function standardToWebviewMessage(message) {
 
 
 // ============================================
-// 流式消息管理
+// 流式消息管理（已废弃，使用 StreamingManager）
 // ============================================
 
-export function updateStreamingMessage(streamKey, content) {
-      const container = document.getElementById('main-content');
-      if (!container || currentBottomTab !== 'thread') return false;
-
-      // 查找带有 streaming 类的消息元素
-      const streamingMessage = container.querySelector('.message.streaming[data-stream-key="' + streamKey + '"]');
-      if (!streamingMessage) return false;
-
-      const contentEl = streamingMessage.querySelector('.message-content');
-      if (!contentEl) return false;
-
-      const streamingMsg = threadMessages.find(m => m.streaming && m.streamKey === streamKey);
-      const agent = streamingMsg?.agent || 'claude';
-      // 🆕 使用智能渲染：优先使用后端已解析的 blocks
-      const rendered = streamingMsg ? renderMessageContentSmart(streamingMsg, agent) : { html: escapeHtml(content || ''), isMarkdown: false };
-      contentEl.innerHTML = rendered.html;
-      if (rendered.isMarkdown) {
-        contentEl.classList.add('markdown-rendered');
-      } else {
-        contentEl.classList.remove('markdown-rendered');
-      }
-
-      // 🔧 检测特殊内容并添加溢出标记
-      const special = detectSpecialContent(content);
-      if (special.hasSpecial) {
-        contentEl.classList.add('has-special-content');
-      }
-      // 检测内容是否溢出
-      if (contentEl.scrollHeight > contentEl.clientHeight + 20) {
-        contentEl.classList.add('content-overflow');
-      }
-
-      return true;
-    }
+// 注意：以下函数已被 StreamingManager 替代，保留仅用于向后兼容
+// 新代码应使用 streamingManager.startStream/updateStream/completeStream
 
 export function findActiveStreamMessage(source, agent) {
       const prefix = (source || 'orchestrator') + ':' + (agent || 'claude') + ':';
@@ -1016,44 +1027,6 @@ export function ensureThreadStreamMessage(source, agent, initialContent) {
       threadMessages.push(msg);
       const idx = threadMessages.length - 1;
       return { idx, msg: threadMessages[idx] };
-    }
-
-export function updateAgentStreamingMessage(agent, content) {
-      const container = document.getElementById('main-content');
-      if (!container || currentBottomTab !== agent) return false;
-
-      // 查找带有 streaming 类的消息元素
-      const streamingMessage = container.querySelector('.message.streaming[data-agent="' + agent + '"]');
-      if (!streamingMessage) return false;
-
-      const contentEl = streamingMessage.querySelector('.message-content');
-      if (!contentEl) return false;
-
-      const messages = agentOutputs[agent] || [];
-      const lastMsg = messages.find(m => m.streaming);
-      if (lastMsg) {
-        // 🆕 使用智能渲染：优先使用后端已解析的 blocks
-        const rendered = renderMessageContentSmart(lastMsg, agent);
-        contentEl.innerHTML = rendered.html;
-        if (rendered.isMarkdown) {
-          contentEl.classList.add('markdown-rendered');
-        } else {
-          contentEl.classList.remove('markdown-rendered');
-        }
-
-        // 🔧 检测特殊内容并添加溢出标记
-        const special = detectSpecialContent(content || lastMsg.content || '');
-        if (special.hasSpecial) {
-          contentEl.classList.add('has-special-content');
-        }
-        // 检测内容是否溢出
-        if (contentEl.scrollHeight > contentEl.clientHeight + 20) {
-          contentEl.classList.add('content-overflow');
-        }
-      } else {
-        contentEl.textContent = content;
-      }
-      return true;
     }
 
 
@@ -1319,9 +1292,6 @@ export function loadSessionMessages(sessionId) {
       resetInteractionState();
       const sessionMessages = Array.isArray(session.messages) ? session.messages : [];
 
-      // 🔧 重要：切换会话时必须重置增量更新状态，否则 UI 不会刷新
-      resetIncrementalState();
-
       // 转换消息格式：后端存储的是 SessionMessage（只有基本字段），前端需要完整格式
       const convertedMessages = sessionMessages.map(m => ({
         role: m.role,
@@ -1387,9 +1357,6 @@ export function loadSessionFromData(session) {
       resetInteractionState();
       const sessionMessages = Array.isArray(session.messages) ? session.messages : [];
 
-      // 🔧 重要：切换会话时必须重置增量更新状态，否则 UI 不会刷新
-      resetIncrementalState();
-
       const convertedMessages = sessionMessages.map(m => ({
         role: m.role,
         content: m.content,
@@ -1454,10 +1421,10 @@ export function trimMessageLists() {
 
 export function addSystemMessage(message, type = 'info') {
       const icons = {
-        success: '<svg viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/></svg>',
-        error: '<svg viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM5.354 4.646a.5.5 0 1 0-.708.708L7.293 8l-2.647 2.646a.5.5 0 0 0 .708.708L8 8.707l2.646 2.647a.5.5 0 0 0 .708-.708L8.707 8l2.647-2.646a.5.5 0 0 0-.708-.708L8 7.293 5.354 4.646z"/></svg>',
-        warning: '<svg viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>',
-        info: '<svg viewBox="0 0 16 16"><path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16zm.93-9.412-1 4.705c-.07.34.029.533.304.533.194 0 .487-.07.686-.246l-.088.416c-.287.346-.92.598-1.465.598-.703 0-1.002-.422-.808-1.319l.738-3.468c.064-.293.006-.399-.287-.47l-.451-.081.082-.381 2.29-.287zM8 5.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2z"/></svg>'
+        success: '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/></svg>',
+        error: '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM5.354 4.646a.5.5 0 1 0-.708.708L7.293 8l-2.647 2.646a.5.5 0 0 0 .708.708L8 8.707l2.646 2.647a.5.5 0 0 0 .708-.708L8.707 8l2.647-2.646a.5.5 0 0 0-.708-.708L8 7.293 5.354 4.646z"/></svg>',
+        warning: '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>',
+        info: '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16zm.93-9.412-1 4.705c-.07.34.029.533.304.533.194 0 .487-.07.686-.246l-.088.416c-.287.346-.92.598-1.465.598-.703 0-1.002-.422-.808-1.319l.738-3.468c.064-.293.006-.399-.287-.47l-.451-.081.082-.381 2.29-.287zM8 5.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2z"/></svg>'
       };
       const now = new Date();
       const time = now.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
@@ -1534,15 +1501,15 @@ export function updatePromptEnhanceStatus(success, message) {
 
         if (success) {
           promptEnhanceTest.classList.add('success');
-          promptEnhanceTest.innerHTML = '<svg viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>连接成功';
+          promptEnhanceTest.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>连接成功';
         } else {
           promptEnhanceTest.classList.add('error');
-          promptEnhanceTest.innerHTML = '<svg viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 13A6 6 0 1 1 8 2a6 6 0 0 1 0 12zm.75-8.25a.75.75 0 0 0-1.5 0v3.5a.75.75 0 0 0 1.5 0v-3.5zM8 11a1 1 0 1 0 0-2 1 1 0 0 0 0 2z"/></svg>连接失败';
+          promptEnhanceTest.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 13A6 6 0 1 1 8 2a6 6 0 0 1 0 12zm.75-8.25a.75.75 0 0 0-1.5 0v3.5a.75.75 0 0 0 1.5 0v-3.5zM8 11a1 1 0 1 0 0-2 1 1 0 0 0 0 2z"/></svg>连接失败';
         }
 
         setTimeout(() => {
           promptEnhanceTest.classList.remove('success', 'error');
-          promptEnhanceTest.innerHTML = '<svg viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>测试连接';
+          promptEnhanceTest.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>测试连接';
         }, 2000);
       }
 

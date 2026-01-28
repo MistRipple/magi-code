@@ -5,6 +5,9 @@
 // 导入核心模块
 // ============================================
 
+// 导入新设计系统组件渲染器
+import { registerGlobalFunctions } from './ui/renderers/components.js';
+
 import {
   vscode,
   threadMessages,
@@ -18,7 +21,6 @@ import {
   sessions,
   pendingChanges,
   tasks,
-  attachedImages,
   state,
   saveWebviewState,
   restoreWebviewState,
@@ -43,9 +45,6 @@ import {
 
 import { postMessage } from './core/vscode-api.js';
 
-// 增量更新引擎
-import { resetIncrementalState } from './core/incremental-update.js';
-
 // ============================================
 // 导入 UI 模块
 // ============================================
@@ -55,7 +54,6 @@ import {
   scheduleRenderMainContent,
   renderSessionList,
   initSessionSelector,
-  renderImagePreviews,
   renderTasksView,
   renderEditsView,
   updateEditsBadge,
@@ -75,7 +73,6 @@ import {
   handleStandardUpdate,
   handleStandardComplete,
   handleInteractionMessage,
-  updateStreamingMessage,
   showPlanPreview,
   showQuestionRequest,
   showWorkerQuestion,
@@ -89,6 +86,7 @@ import {
   showToolAuthorizationDialog,
   loadSessionMessages,
   loadSessionFromData,
+  resetInteractionState,
   showToast,
   addSystemMessage,
   handlePromptEnhanced,
@@ -101,7 +99,11 @@ import {
   getModeDisplayName,
   showSkillLibraryDialog,
   setWorkerConfigs,
-  setRepoAddLoading
+  setRepoAddLoading,
+  resolveTaskAck,
+  rejectTaskAck,
+  markBackendActivity,
+  resolveMessageReceipt
 } from './ui/event-handlers.js';
 
 import {
@@ -176,12 +178,12 @@ function startConnectionStatusPolling() {
   if (connectionStatusTimer) return;
   connectionStatusTimer = setInterval(() => {
     if (document.hidden) return;
-    postMessage({ type: 'checkWorkerStatus' });
+    postMessage({ type: 'checkWorkerStatus', force: false });
   }, CONNECTION_STATUS_POLL_MS);
 }
 
 function triggerConnectionStatusRefresh() {
-  postMessage({ type: 'checkWorkerStatus' });
+  postMessage({ type: 'checkWorkerStatus', force: false });
 }
 
 function setSaveButtonState(buttonId, state, message) {
@@ -236,6 +238,12 @@ function initializeApp() {
 
   // 1. 恢复状态
   restoreWebviewState();
+  // 1.1 重置交互状态，避免重启后残留"处理中"
+  resetInteractionState();
+
+  // 1.2 初始渲染
+  renderMainContent();
+  renderSessionList();
 
   // 2. 初始化事件监听器
   initializeEventListeners();
@@ -262,6 +270,7 @@ function initializeApp() {
     switch (message.type) {
       case 'standardMessage':
         handleStandardMessage(message.message || message);
+        markBackendActivity();
         break;
 
       case 'standardUpdate':
@@ -270,18 +279,16 @@ function initializeApp() {
         } else {
           handleStandardUpdate(message);
         }
+        markBackendActivity();
         break;
 
       case 'standardComplete':
         handleStandardComplete(message.message || message);
+        markBackendActivity();
         break;
 
       case 'interactionMessage':
         handleInteractionMessage(message);
-        break;
-
-      case 'stream':
-        updateStreamingMessage(message.key, message.content);
         break;
 
       case 'sessionLoaded':
@@ -443,9 +450,22 @@ function initializeApp() {
         }
         break;
 
+      case 'taskAccepted':
+        resolveTaskAck(message.requestId);
+        break;
+
+      case 'taskRejected':
+        rejectTaskAck(message.requestId, message.message);
+        break;
+
+      case 'messageReceived':
+        resolveMessageReceipt(message.requestId);
+        break;
+
       case 'sessionCreated':
         // 新会话创建
         if (message.session) {
+          resetInteractionState();
           sessions.push(message.session);
           setCurrentSessionId(message.session.id);
           threadMessages.length = 0;
@@ -470,7 +490,6 @@ function initializeApp() {
       case 'sessionSwitched':
         if (message.sessionId) {
           setCurrentSessionId(message.sessionId);
-          resetIncrementalState(); // 切换会话时重置增量更新状态
           if (message.session) {
             loadSessionFromData(message.session);
           } else {
@@ -527,6 +546,9 @@ ${message.summary.codeChanges.length > 0 ? `\n[代码变更] ${message.summary.c
           }
           if (!state.isProcessing) {
             stopStreamingHintTimer();
+          }
+          if (state.isProcessing) {
+            markBackendActivity();
           }
         }
         break;
@@ -843,6 +865,9 @@ ${message.summary.codeChanges.length > 0 ? `\n[代码变更] ${message.summary.c
 
       case 'phaseChanged':
         updatePhaseIndicator(message.phase, message.isRunning);
+        if (message.isRunning) {
+          markBackendActivity();
+        }
         break;
 
       case 'verificationResult':
@@ -985,6 +1010,11 @@ ${message.summary.codeChanges.length > 0 ? `\n[代码变更] ${message.summary.c
       }
     });
   }, 1000);
+
+  // 8. 注册新组件渲染器的全局函数
+  console.log('[Main] 开始注册全局函数...');
+  registerGlobalFunctions();
+  console.log('[Main] 全局函数注册完成, __panelEventDelegationSetup =', window.__panelEventDelegationSetup);
 
   console.log('[Main] 应用初始化完成');
 }
