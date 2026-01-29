@@ -8,4 +8,3 @@ export { AtomicOperations, SnapshotOperationResult } from './atomic-operations';
 export { SnapshotCache } from './snapshot-cache';
 export { SnapshotValidator, ValidationResult } from './snapshot-validator';
 export { SnapshotCleaner, CleanupResult, CleanupOptions } from './snapshot-cleaner';
-export { SnapshotCoordinator } from './snapshot-coordinator';

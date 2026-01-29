@@ -31,7 +31,6 @@ import { SessionManagerTaskRepository } from '../../task/session-manager-task-re
 import { globalEventBus } from '../../events';
 import { ContextManager } from '../../context/context-manager';
 import { ProjectKnowledgeBase } from '../../knowledge/project-knowledge-base';
-import { SnapshotCoordinator } from '../../snapshot/snapshot-coordinator';
 import { ToolManager } from '../../tools/tool-manager';
 import { UnifiedMessageBus } from '../../normalizer/unified-message-bus';
 import { MESSAGE_EVENTS, PROCESSING_EVENTS } from '../../protocol/event-names';
@@ -73,7 +72,6 @@ class E2ETestHarness {
   private taskManager: UnifiedTaskManager | null = null;
   private contextManager: ContextManager | null = null;
   private knowledgeBase: ProjectKnowledgeBase | null = null;
-  private snapshotCoordinator: SnapshotCoordinator | null = null;
 
   private capturedMessages: MessageCapture[] = [];
   private streamUpdates: Array<{ messageId: string; content: string; timestamp: number }> = [];
@@ -131,12 +129,6 @@ class E2ETestHarness {
     );
     this.contextManager.setProjectKnowledgeBase(this.knowledgeBase);
     await this.contextManager.initialize(session.id, session.name || 'E2E测试会话');
-
-    // 初始化快照协调器
-    this.snapshotCoordinator = new SnapshotCoordinator(
-      this.sessionManager,
-      this.workspaceRoot
-    );
 
     this.orchestrator = new IntelligentOrchestrator(
       this.adapterFactory,
@@ -262,8 +254,8 @@ class E2ETestHarness {
     return this.knowledgeBase;
   }
 
-  getSnapshotCoordinator(): SnapshotCoordinator | null {
-    return this.snapshotCoordinator;
+  getSnapshotManager(): SnapshotManager {
+    return this.snapshotManager;
   }
 
   getSessionManager(): UnifiedSessionManager {
@@ -768,10 +760,7 @@ class ComprehensiveE2ETests {
     const errors: string[] = [];
     const details: Record<string, any> = {};
 
-    const snapshotCoordinator = this.harness.getSnapshotCoordinator();
-    if (!snapshotCoordinator) {
-   return { name: '快照系统', passed: false, duration: 0, errors: ['SnapshotCoordinator 未初始化'], details: {} };
-    }
+    const snapshotManager = this.harness.getSnapshotManager();
 
     const testFilePath = 'test-snapshot-e2e.txt';
     const fullPath = path.join(this.harness.getWorkspaceRoot(), testFilePath);
@@ -783,7 +772,14 @@ class ComprehensiveE2ETests {
       details.testFileCreated = true;
 
       // 创建快照
-      const snapshot = snapshotCoordinator.createSnapshot(testFilePath, 'claude', 'test-subtask-id', 5);
+      const snapshot = snapshotManager.createSnapshotForMission(
+        testFilePath,
+        'test-mission',
+        'test-assignment',
+        'test-todo',
+        'claude',
+        'E2E snapshot test'
+      );
       details.snapshotCreated = !!snapshot;
       details.snapshotId = snapshot?.id;
 
@@ -792,7 +788,7 @@ class ComprehensiveE2ETests {
 
       // 恢复快照
       if (snapshot) {
-        const restored = snapshotCoordinator.restoreSnapshot(snapshot.id);
+        const restored = snapshotManager.revertToSnapshot(testFilePath);
         details.snapshotRestored = restored;
         if (restored) {
           const restoredContent = fs.readFileSync(fullPath, 'utf-8');

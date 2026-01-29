@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { getState } from '../stores/messages.svelte';
+  import type { Message } from '../types/message';
+  import { getState, setCurrentBottomTab } from '../stores/messages.svelte';
   import MessageList from './MessageList.svelte';
   import InputArea from './InputArea.svelte';
   import PhaseIndicator from './PhaseIndicator.svelte';
@@ -9,19 +10,19 @@
 
   const appState = getState();
 
-  // 底部 Tab: thread/claude/codex/gemini
-  let activeBottomTab = $state<'thread' | 'claude' | 'codex' | 'gemini'>('thread');
+  // 底部 Tab: 使用 store 中的状态，支持从其他组件跳转
+  const activeBottomTab = $derived(appState.currentBottomTab as 'thread' | 'claude' | 'codex' | 'gemini');
 
   function handleBottomTabChange(tab: 'thread' | 'claude' | 'codex' | 'gemini') {
-    activeBottomTab = tab;
+    setCurrentBottomTab(tab);
   }
 
   // 获取消息列表
-  const messages = $derived(ensureArray(appState.threadMessages));
+  const messages = $derived(ensureArray(appState.threadMessages) as Message[]);
   const agentOutputs = $derived({
-    claude: ensureArray(appState.agentOutputs?.claude),
-    codex: ensureArray(appState.agentOutputs?.codex),
-    gemini: ensureArray(appState.agentOutputs?.gemini),
+    claude: ensureArray(appState.agentOutputs?.claude) as Message[],
+    codex: ensureArray(appState.agentOutputs?.codex) as Message[],
+    gemini: ensureArray(appState.agentOutputs?.gemini) as Message[],
   });
 </script>
 

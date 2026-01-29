@@ -160,6 +160,7 @@ export class MissionDrivenEngine extends EventEmitter {
   // 消息总线（用于发送阶段状态消息到主对话区）
   private messageBus?: UnifiedMessageBus;
   private currentSessionId?: string;
+  private contextSessionId: string | null = null;
 
   constructor(
     adapterFactory: IAdapterFactory,
@@ -180,7 +181,7 @@ export class MissionDrivenEngine extends EventEmitter {
     this.guidanceInjector = new GuidanceInjector();
     this.taskAnalyzer = new TaskAnalyzer();
     this.taskAnalyzer.setProfileLoader(this.profileLoader);
-    this.contextManager = new ContextManager(workspaceRoot);
+    this.contextManager = new ContextManager(workspaceRoot, undefined, sessionManager);
     this.planStorage = new PlanStorage(workspaceRoot);
     this.executionStats = new ExecutionStats();
 
@@ -199,6 +200,7 @@ export class MissionDrivenEngine extends EventEmitter {
     this.missionOrchestrator.setSnapshotManager(snapshotManager);
     this.missionOrchestrator.setContextManager(this.contextManager);
     this.missionOrchestrator.setExecutionStats(this.executionStats);
+    this.missionOrchestrator.setAdapterFactory(adapterFactory);
 
     // 初始化 Mission 执行器
     this.missionExecutor = new MissionExecutor(
@@ -210,6 +212,7 @@ export class MissionDrivenEngine extends EventEmitter {
     this.missionExecutor.setSnapshotManager(snapshotManager);
     this.missionExecutor.setWorkspaceRoot(workspaceRoot);
     this.missionExecutor.setAdapterFactory(adapterFactory);
+    this.missionExecutor.setContextManager(this.contextManager);
 
     this.setupEventForwarding();
   }
@@ -448,6 +451,8 @@ export class MissionDrivenEngine extends EventEmitter {
     this.projectKnowledgeBase = knowledgeBase;
     // 同时注入到 MissionOrchestrator
     this.missionOrchestrator.setKnowledgeBase(knowledgeBase);
+    // 注入到 ContextManager（确保 Worker 上下文包含项目知识）
+    this.contextManager.setProjectKnowledgeBase(knowledgeBase);
     logger.info('任务引擎.知识库.已设置', undefined, LogCategory.ORCHESTRATOR);
   }
 
@@ -555,6 +560,7 @@ export class MissionDrivenEngine extends EventEmitter {
     try {
       const resolvedSessionId = sessionId || this.sessionManager.getCurrentSession()?.id || taskId;
       this.currentSessionId = resolvedSessionId;
+      await this.ensureContextReady(resolvedSessionId);
 
       // 发送分析阶段消息
       this.sendPhaseMessage('🔍 正在分析任务...', 'analyzing');
@@ -841,6 +847,7 @@ export class MissionDrivenEngine extends EventEmitter {
    */
   async createPlan(userPrompt: string, taskId: string, sessionId?: string): Promise<PlanRecord> {
     const resolvedSessionId = sessionId || this.sessionManager.getCurrentSession()?.id || taskId;
+    await this.ensureContextReady(resolvedSessionId);
 
     // 创建 Mission
     const { mission } = await this.missionOrchestrator.processRequest(
@@ -887,6 +894,7 @@ export class MissionDrivenEngine extends EventEmitter {
     _userPrompt?: string
   ): Promise<string> {
     const resolvedSessionId = sessionId || this.sessionManager.getCurrentSession()?.id || taskId;
+    await this.ensureContextReady(resolvedSessionId);
 
     // 尝试从存储加载对应的 Mission
     let mission = await this.missionStorage.load(plan.id || taskId);
@@ -943,6 +951,10 @@ export class MissionDrivenEngine extends EventEmitter {
    * 准备上下文
    */
   async prepareContext(_sessionId: string, _userPrompt: string): Promise<string> {
+    const sessionId = _sessionId || this.sessionManager.getCurrentSession()?.id || '';
+    if (sessionId) {
+      await this.ensureContextReady(sessionId);
+    }
     return this.contextManager.getContext(8000);
   }
 
@@ -1116,6 +1128,21 @@ export class MissionDrivenEngine extends EventEmitter {
 
     // 分配职责
     await this.missionOrchestrator.assignResponsibilities(mission, participants);
+  }
+
+  private async ensureContextReady(sessionId: string): Promise<void> {
+    if (!sessionId) {
+      return;
+    }
+    this.contextManager.setSessionManager(this.sessionManager);
+    this.contextManager.setCurrentSessionId(sessionId);
+    if (this.contextSessionId !== sessionId) {
+      const session = this.sessionManager.getSession(sessionId) || this.sessionManager.getCurrentSession();
+      const sessionName = session?.name || session?.id || sessionId;
+      await this.contextManager.initialize(sessionId, sessionName);
+      this.contextSessionId = sessionId;
+      logger.info('编排器.上下文.已初始化', { sessionId, sessionName }, LogCategory.ORCHESTRATOR);
+    }
   }
 
   /**

@@ -6,25 +6,25 @@
 :root {
   /* ==========================================
      1. 颜色系统 (Color System)
+     🔧 支持浅色/深色主题自动适配
      ========================================== */
 
-  /* 基础颜色 - VS Code 主题适配 */
-  --background: var(--vscode-editor-background, #1e1e1e);
-  --foreground: var(--vscode-editor-foreground, #d4d4d4);
-  --foreground-muted: var(--vscode-descriptionForeground, #858585);
-  --border: var(--vscode-panel-border, #3c3c3c);
-  --border-subtle: rgba(255, 255, 255, 0.06);
+  /* 基础颜色 - VS Code 主题适配 (自动适配浅色/深色) */
+  --background: var(--vscode-editor-background);
+  --foreground: var(--vscode-editor-foreground);
+  --foreground-muted: var(--vscode-descriptionForeground);
+  --border: var(--vscode-panel-border, var(--vscode-widget-border));
 
   /* 消息颜色 */
-  --user-message-bg: var(--vscode-inputOption-activeBackground, #2d2d30);
-  --assistant-message-bg: var(--vscode-editor-background, #1e1e1e);
+  --user-message-bg: var(--vscode-inputOption-activeBackground, var(--vscode-list-hoverBackground));
+  --assistant-message-bg: var(--vscode-editor-background);
 
   /* 交互颜色 */
-  --primary: var(--vscode-button-background, #0e639c);
-  --primary-hover: var(--vscode-button-hoverBackground, #1177bb);
+  --primary: var(--vscode-button-background);
+  --primary-hover: var(--vscode-button-hoverBackground);
   --primary-muted: rgba(14, 99, 156, 0.15);
-  --secondary: var(--vscode-button-secondaryBackground, #3a3d41);
-  --secondary-hover: var(--vscode-button-secondaryHoverBackground, #45494e);
+  --secondary: var(--vscode-button-secondaryBackground);
+  --secondary-hover: var(--vscode-button-secondaryHoverBackground);
 
   /* 状态颜色 */
   --success: #10b981;
@@ -48,7 +48,16 @@
   --color-compressor: #6b7280;
   --color-compressor-muted: rgba(107, 114, 128, 0.15);
 
-  /* 表面颜色层次 (Surface Elevation) */
+  /* 遮罩 */
+  --overlay: rgba(0, 0, 0, 0.5);
+  --overlay-heavy: rgba(0, 0, 0, 0.7);
+
+  /* 代码块 */
+  --code-bg: var(--vscode-textCodeBlock-background);
+  --code-border: var(--vscode-panel-border, var(--vscode-widget-border));
+
+  /* 默认表面颜色（深色主题） */
+  --border-subtle: rgba(255, 255, 255, 0.06);
   --surface-0: transparent;
   --surface-1: rgba(255, 255, 255, 0.02);
   --surface-2: rgba(255, 255, 255, 0.04);
@@ -56,14 +65,6 @@
   --surface-hover: rgba(255, 255, 255, 0.08);
   --surface-active: rgba(255, 255, 255, 0.12);
   --surface-selected: rgba(59, 130, 246, 0.12);
-
-  /* 遮罩 */
-  --overlay: rgba(0, 0, 0, 0.5);
-  --overlay-heavy: rgba(0, 0, 0, 0.7);
-
-  /* 代码块 */
-  --code-bg: var(--vscode-textCodeBlock-background, #2d2d30);
-  --code-border: var(--vscode-panel-border, #3c3c3c);
 
   /* ==========================================
      2. 间距系统 (Spacing System) - 4px 基础网格
@@ -192,6 +193,19 @@
   --z-toast: 1300;
 }
 
+/* ==========================================
+   浅色主题覆盖 - 表面颜色使用黑色透明度
+   ========================================== */
+body.vscode-light {
+  --border-subtle: rgba(0, 0, 0, 0.08);
+  --surface-1: rgba(0, 0, 0, 0.02);
+  --surface-2: rgba(0, 0, 0, 0.04);
+  --surface-3: rgba(0, 0, 0, 0.06);
+  --surface-hover: rgba(0, 0, 0, 0.06);
+  --surface-active: rgba(0, 0, 0, 0.10);
+  --surface-selected: rgba(59, 130, 246, 0.15);
+}
+
 /* 基础重置 */
 *,
 *::before,
@@ -232,28 +246,28 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--vscode-scrollbarSlider-background, rgba(121, 121, 121, 0.4));
+  background: var(--vscode-scrollbarSlider-background);
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--vscode-scrollbarSlider-hoverBackground, rgba(100, 100, 100, 0.7));
+  background: var(--vscode-scrollbarSlider-hoverBackground);
 }
 
 /* 选中文本样式 */
 ::selection {
-  background: var(--vscode-editor-selectionBackground, rgba(38, 79, 120, 0.5));
+  background: var(--vscode-editor-selectionBackground);
 }
 
 /* 焦点样式 */
 :focus-visible {
-  outline: 1px solid var(--vscode-focusBorder, #007acc);
+  outline: 1px solid var(--vscode-focusBorder);
   outline-offset: -1px;
 }
 
 /* 链接样式 */
 a {
-  color: var(--vscode-textLink-foreground, #3794ff);
+  color: var(--vscode-textLink-foreground);
   text-decoration: none;
 }
 
@@ -282,15 +296,15 @@ textarea {
   font-family: inherit;
   font-size: inherit;
   color: var(--foreground);
-  background: var(--vscode-input-background, #3c3c3c);
-  border: 1px solid var(--vscode-input-border, #3c3c3c);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--border));
   border-radius: var(--radius-sm);
   padding: var(--spacing-sm);
 }
 
 input:focus,
 textarea:focus {
-  border-color: var(--vscode-focusBorder, #007acc);
+  border-color: var(--vscode-focusBorder);
   outline: none;
 }
 
@@ -515,7 +529,7 @@ pre code {
 }
 
 .badge--success { background: var(--success); }
-.badge--warning { background: var(--warning); color: #000; }
+.badge--warning { background: var(--warning); color: var(--vscode-button-foreground, white); }
 .badge--error { background: var(--error); }
 
 .chip {
@@ -640,7 +654,7 @@ pre code {
   padding: 0 var(--space-3);
   font-size: var(--text-sm);
   color: var(--foreground);
-  background: var(--vscode-input-background, #3c3c3c);
+  background: var(--vscode-input-background);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   outline: none;

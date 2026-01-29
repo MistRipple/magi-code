@@ -7,6 +7,7 @@ import type {
   Message,
   AgentOutputs,
   AgentType,
+  MissionPlan,
   Session,
   TabType,
   ProcessingActor,
@@ -114,6 +115,7 @@ let pendingQuestion = $state<{ questions: string[]; plan?: unknown } | null>(nul
 let pendingClarification = $state<{ questions: string[]; context?: string; ambiguityScore?: number; originalPrompt?: string } | null>(null);
 let pendingWorkerQuestion = $state<{ workerId: string; question: string; context?: string; options?: unknown } | null>(null);
 let pendingToolAuthorization = $state<{ toolName: string; toolArgs: unknown } | null>(null);
+let missionPlan = $state<MissionPlan | null>(null);
 
 // ============ 导出 Getter ============
 
@@ -154,6 +156,8 @@ export function getState() {
     set pendingWorkerQuestion(v) { pendingWorkerQuestion = v; },
     get pendingToolAuthorization() { return pendingToolAuthorization; },
     set pendingToolAuthorization(v) { pendingToolAuthorization = v; },
+    get missionPlan() { return missionPlan; },
+    set missionPlan(v) { missionPlan = v; },
   };
 }
 
@@ -227,6 +231,10 @@ export function setProcessingActor(source: string, agent?: string) {
 
 export function setAppState(nextState: AppState | null) {
   appState = nextState;
+}
+
+export function setMissionPlan(plan: MissionPlan | null) {
+  missionPlan = plan;
 }
 
 // 消息操作

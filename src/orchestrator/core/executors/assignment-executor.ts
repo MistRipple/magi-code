@@ -66,7 +66,7 @@ export class AssignmentExecutor {
     );
 
     // 创建快照
-    await this.createSnapshots(assignment, options.workingDirectory);
+    await this.createSnapshots(mission, assignment);
 
     // 获取上下文快照
     const contextSnapshot = options.contextManager?.getContext(6000);
@@ -116,9 +116,8 @@ export class AssignmentExecutor {
    * 创建快照
    */
   private async createSnapshots(
-    assignment: Assignment,
-    workingDirectory: string,
-    mission?: Mission
+    mission: Mission,
+    assignment: Assignment
   ): Promise<void> {
     if (!this.snapshotManager) {
       return;
@@ -130,28 +129,15 @@ export class AssignmentExecutor {
     }
 
     try {
-      // 如果有 Mission 信息，使用新的 createSnapshotForMission 方法
-      if (mission) {
-        for (const filePath of targetFiles) {
-          this.snapshotManager.createSnapshotForMission(
-            filePath,
-            mission.id,
-            assignment.id,
-            'assignment-init',
-            assignment.workerId,
-            `Assignment 执行前快照: ${assignment.responsibility}`
-          );
-        }
-      } else {
-        // 兼容旧代码：使用旧方法
-        for (const filePath of targetFiles) {
-          this.snapshotManager.createSnapshot(
-            filePath,
-            assignment.workerId,
-            assignment.id,
-            5 // default priority
-          );
-        }
+      for (const filePath of targetFiles) {
+        this.snapshotManager.createSnapshotForMission(
+          filePath,
+          mission.id,
+          assignment.id,
+          'assignment-init',
+          assignment.workerId,
+          `Assignment 执行前快照: ${assignment.responsibility}`
+        );
       }
 
       logger.info(

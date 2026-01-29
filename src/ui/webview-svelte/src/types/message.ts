@@ -44,6 +44,37 @@ export interface ContentBlock {
   thinking?: ThinkingBlock; // 思考块信息
 }
 
+// Worker Todo
+export interface AssignmentTodo {
+  id: string;
+  assignmentId: string;
+  content: string;
+  reasoning?: string;
+  expectedOutput?: string;
+  type: string;
+  priority: number;
+  status: string;
+  outOfScope?: boolean;
+  approvalStatus?: 'pending' | 'approved' | 'rejected';
+  approvalNote?: string;
+}
+
+// Assignment 规划
+export interface AssignmentPlan {
+  id: string;
+  workerId: string;
+  responsibility: string;
+  status?: string;
+  progress?: number;
+  todos: AssignmentTodo[];
+}
+
+// Mission 规划
+export interface MissionPlan {
+  missionId: string;
+  assignments: AssignmentPlan[];
+}
+
 // 单条消息
 export interface Message {
   id: string;

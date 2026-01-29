@@ -40,6 +40,7 @@ export interface FileSnapshotMeta {
   assignmentId: string;
   todoId: string;
   workerId: string;  // Worker 标识（claude/codex/gemini）
+  contributors?: string[];
 
   agentType?: AgentType;
   reason?: string;
@@ -464,6 +465,9 @@ export class UnifiedSessionManager {
       const existingIndex = session.snapshots.findIndex(s => s.filePath === snapshot.filePath);
       if (existingIndex !== -1) {
         const previous = session.snapshots[existingIndex];
+        const previousContributors = previous.contributors ?? [previous.workerId];
+        const nextContributors = snapshot.contributors ?? [snapshot.workerId];
+        snapshot.contributors = Array.from(new Set([...previousContributors, ...nextContributors]));
         session.snapshots[existingIndex] = snapshot;
         if (previous.id !== snapshot.id) {
           const oldFile = this.getSnapshotFilePath(sessionId, previous.id);

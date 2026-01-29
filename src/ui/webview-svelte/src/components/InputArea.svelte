@@ -211,8 +211,9 @@
   .input-wrapper {
     display: flex;
     flex-direction: column;
-    background: var(--vscode-input-background, #3c3c3c);
-    border: 1px solid var(--border);
+    /* 🔧 使用 VS Code 输入框背景色，自动适配浅色/深色主题 */
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, var(--border));
     border-radius: var(--radius-lg);
     transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
     overflow: hidden;

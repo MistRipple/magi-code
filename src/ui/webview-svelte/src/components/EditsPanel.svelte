@@ -2,20 +2,51 @@
   import { getState } from '../stores/messages.svelte';
   import { vscode } from '../lib/vscode-bridge';
   import { ensureArray } from '../lib/utils';
+  import WorkerBadge from './WorkerBadge.svelte';
 
   const appState = getState();
 
   // 变更列表
   const edits = $derived(ensureArray(appState.edits));
 
+  function getContributors(edit: any): string[] {
+    if (Array.isArray(edit?.contributors) && edit.contributors.length > 0) {
+      return edit.contributors;
+    }
+    if (edit?.workerId) {
+      return [edit.workerId];
+    }
+    return [];
+  }
+
   // 打开文件
   function openFile(filePath: string) {
     vscode.postMessage({ type: 'openFile', filepath: filePath });
   }
 
+  function approveChange(filePath: string) {
+    vscode.postMessage({ type: 'approveChange', filePath });
+  }
+
+  function revertChange(filePath: string) {
+    vscode.postMessage({ type: 'revertChange', filePath });
+  }
+
+  function viewDiff(filePath: string) {
+    vscode.postMessage({ type: 'viewDiff', filePath });
+  }
+
+  function approveAllChanges() {
+    vscode.postMessage({ type: 'approveAllChanges' });
+  }
+
+  function revertAllChanges() {
+    vscode.postMessage({ type: 'revertAllChanges' });
+  }
+
   // 获取文件类型图标
-  function getFileIcon(path: string): string {
-    const ext = path.split('.').pop()?.toLowerCase() || '';
+  function getFileIcon(filePath: string): string {
+    const ext = filePath.split('.').pop()?.toLowerCase() || '';
     const iconMap: Record<string, string> = {
       ts: 'M0 0h16v16H0z M1 3h14v10H1z M4 7h3v1H4z M8 7h4v1H8z',
       js: 'M0 0h16v16H0z M1 3h14v10H1z',
@@ -39,31 +70,47 @@
         <div class="empty-hint">代码变更会在此显示</div>
       </div>
     {:else}
+      <div class="edits-actions">
+        <button class="action-btn approve-all" onclick={approveAllChanges}>全部批准</button>
+        <button class="action-btn revert-all" onclick={revertAllChanges}>全部还原</button>
+      </div>
       <div class="edits-list">
         {#each edits as edit}
-          <button class="edit-item" onclick={() => openFile(edit.path)}>
-            <div class="edit-icon">
-              <svg viewBox="0 0 16 16">
-                <path d={getFileIcon(edit.path)}/>
-              </svg>
+          <div class="edit-item">
+            <button class="edit-main" onclick={() => openFile(edit.filePath)}>
+              <div class="edit-icon">
+                <svg viewBox="0 0 16 16">
+                  <path d={getFileIcon(edit.filePath)}/>
+                </svg>
+              </div>
+              <div class="edit-info">
+                <div class="edit-path">{edit.filePath}</div>
+                {#if edit.type}
+                  <div class="edit-type" class:added={edit.type === 'add'} class:modified={edit.type === 'modify'} class:deleted={edit.type === 'delete'}>
+                    {edit.type === 'add' ? '新增' : edit.type === 'modify' ? '修改' : '删除'}
+                  </div>
+                {/if}
+              </div>
+              <div class="edit-stats">
+                {#if edit.additions}
+                  <span class="stat-add">+{edit.additions}</span>
+                {/if}
+                {#if edit.deletions}
+                  <span class="stat-del">-{edit.deletions}</span>
+                {/if}
+              </div>
+            </button>
+            <div class="edit-actions">
+              <div class="edit-workers">
+                {#each getContributors(edit) as worker}
+                  <WorkerBadge worker={worker} size="sm" />
+                {/each}
+              </div>
+              <button class="action-btn diff" onclick={() => viewDiff(edit.filePath)}>对比</button>
+              <button class="action-btn approve" onclick={() => approveChange(edit.filePath)}>批准</button>
+              <button class="action-btn revert" onclick={() => revertChange(edit.filePath)}>还原</button>
             </div>
-            <div class="edit-info">
-              <div class="edit-path">{edit.path}</div>
-              {#if edit.type}
-                <div class="edit-type" class:added={edit.type === 'add'} class:modified={edit.type === 'modify'} class:deleted={edit.type === 'delete'}>
-                  {edit.type === 'add' ? '新增' : edit.type === 'modify' ? '修改' : '删除'}
-                </div>
-              {/if}
-            </div>
-            <div class="edit-stats">
-              {#if edit.additions}
-                <span class="stat-add">+{edit.additions}</span>
-              {/if}
-              {#if edit.deletions}
-                <span class="stat-del">-{edit.deletions}</span>
-              {/if}
-            </div>
-          </button>
+          </div>
         {/each}
       </div>
     {/if}
@@ -113,22 +160,79 @@
     gap: var(--space-2);
   }
 
+  .edits-actions {
+    display: flex;
+    gap: var(--space-2);
+    margin-bottom: var(--space-3);
+  }
+
+  .action-btn {
+    padding: 6px 10px;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border);
+    background: var(--surface-1);
+    color: var(--foreground);
+    cursor: pointer;
+    font-size: var(--text-xs);
+  }
+
+  .action-btn:hover {
+    background: var(--surface-hover);
+    border-color: var(--primary);
+  }
+
+  .action-btn.approve-all,
+  .action-btn.approve {
+    color: var(--success);
+    border-color: color-mix(in srgb, var(--success) 40%, var(--border));
+  }
+
+  .action-btn.revert-all,
+  .action-btn.revert {
+    color: var(--error);
+    border-color: color-mix(in srgb, var(--error) 40%, var(--border));
+  }
+
   .edit-item {
     display: flex;
     align-items: center;
     gap: var(--space-3);
-    padding: var(--space-3) var(--space-4);
     background: var(--surface-1);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    cursor: pointer;
     text-align: left;
     transition: all var(--transition-fast);
+  }
+
+  .edit-main {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    text-align: left;
   }
 
   .edit-item:hover {
     background: var(--surface-hover);
     border-color: var(--primary);
+  }
+
+  .edit-actions {
+    display: flex;
+    gap: var(--space-2);
+    padding-right: var(--space-3);
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .edit-workers {
+    display: flex;
+    gap: var(--space-2);
+    flex-wrap: wrap;
   }
 
   .edit-icon {

@@ -535,6 +535,7 @@ export class SnapshotManager {
       assignmentId,
       todoId,
       workerId,
+      contributors: [workerId],
       reason,
     };
 
@@ -567,52 +568,12 @@ export class SnapshotManager {
       assignmentId,
       todoId,
       workerId,
+      contributors: snapshotMeta.contributors,
       reason,
       originalContent,
     };
   }
 
-  /** 创建文件快照（旧版本 - 兼容性保留，将被移除） */
-  createSnapshot(
-    filePath: string,
-    modifiedBy: AgentType,
-    subTaskId: string,
-    priority: number = 5
-  ): FileSnapshot | null {
-    // 临时映射到新架构
-    // TODO: 移除此方法，所有调用点应使用 createSnapshotForMission
-    return this.createSnapshotForMission(
-      filePath,
-      'legacy-mission',
-      'legacy-assignment',
-      subTaskId,
-      modifiedBy,
-      'Legacy snapshot creation'
-    );
-  }
-
-  /**
-   * 创建文件快照（使用基线内容，适用于任务后补快照）
-   * 旧版本 - 兼容性保留，将被移除
-   */
-  createSnapshotFromBaseline(
-    filePath: string,
-    modifiedBy: AgentType,
-    subTaskId: string,
-    priority: number = 5,
-    baselineContent: string = ''
-  ): FileSnapshot | null {
-    // 临时映射到新架构
-    // TODO: 移除此方法，所有调用点应使用 createSnapshotForMission
-    return this.createSnapshotForMission(
-      filePath,
-      'legacy-mission',
-      'legacy-assignment',
-      subTaskId,
-      modifiedBy,
-      'Legacy baseline snapshot'
-    );
-  }
 
 
   /** 还原文件到快照状态 */
@@ -693,6 +654,7 @@ export class SnapshotManager {
             assignmentId: snapshot.assignmentId,
             todoId: snapshot.todoId,
             workerId: snapshot.workerId,
+            contributors: snapshot.contributors,
             additions,
             deletions,
             status: 'pending',
@@ -705,6 +667,12 @@ export class SnapshotManager {
           ...existing,
           additions: Math.max(existing.additions, additions),
           deletions: Math.max(existing.deletions, deletions),
+          contributors: Array.from(
+            new Set([
+              ...(existing.contributors ?? [existing.workerId]),
+              ...(snapshot.contributors ?? [snapshot.workerId]),
+            ])
+          ),
         };
 
         if (currentTimestamp >= (existing.timestamp ?? 0)) {
@@ -890,18 +858,6 @@ export class SnapshotManager {
   hasSnapshots(): boolean {
     const session = this.sessionManager.getCurrentSession();
     return session ? session.snapshots.length > 0 : false;
-  }
-
-  /** 为多个文件创建快照 */
-  createSnapshots(filePaths: string[], modifiedBy: AgentType, subTaskId: string, priority: number = 5): FileSnapshot[] {  // ✅ 使用 AgentType
-    const snapshots: FileSnapshot[] = [];
-    for (const filePath of filePaths) {
-      const snapshot = this.createSnapshot(filePath, modifiedBy, subTaskId, priority);
-      if (snapshot) {
-        snapshots.push(snapshot);
-      }
-    }
-    return snapshots;
   }
 
   /** 清理会话的所有快照（删除会话时不需要单独调用，会话目录会整体删除） */

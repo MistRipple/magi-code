@@ -13,8 +13,9 @@ import {
   setCurrentSessionId,
   updateSessions,
   setAppState,
+  setMissionPlan,
 } from '../stores/messages.svelte';
-import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock } from '../types/message';
+import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
 import { ensureArray } from './utils';
 
@@ -112,6 +113,38 @@ function handleMessage(message: WebviewMessage) {
 
     case 'toolAuthorizationRequest':
       handleToolAuthorizationRequest(message);
+      break;
+
+    case 'missionPlanned':
+      handleMissionPlanned(message);
+      break;
+
+    case 'assignmentStarted':
+      handleAssignmentStarted(message);
+      break;
+
+    case 'assignmentCompleted':
+      handleAssignmentCompleted(message);
+      break;
+
+    case 'todoStarted':
+      handleTodoStarted(message);
+      break;
+
+    case 'todoCompleted':
+      handleTodoCompleted(message);
+      break;
+
+    case 'todoFailed':
+      handleTodoFailed(message);
+      break;
+
+    case 'dynamicTodoAdded':
+      handleDynamicTodoAdded(message);
+      break;
+
+    case 'todoApprovalRequested':
+      handleTodoApprovalRequested(message);
       break;
 
     // ============ 系统通知类消息 ============
@@ -405,6 +438,111 @@ function handleToolAuthorizationRequest(message: WebviewMessage) {
   setIsProcessing(false);
 }
 
+function handleMissionPlanned(message: WebviewMessage) {
+  const missionId = (message.missionId as string) || '';
+  const assignments = ensureArray(message.assignments) as any[];
+  const mappedAssignments: AssignmentPlan[] = assignments.map((assignment) => ({
+    id: assignment.id,
+    workerId: assignment.workerId,
+    responsibility: assignment.responsibility,
+    status: assignment.status,
+    progress: assignment.progress,
+    todos: ensureArray(assignment.todos).map((todo: any) => ({
+      id: todo.id,
+      assignmentId: assignment.id,
+      content: todo.content || '',
+      reasoning: todo.reasoning,
+      expectedOutput: todo.expectedOutput,
+      type: todo.type || 'implementation',
+      priority: typeof todo.priority === 'number' ? todo.priority : 3,
+      status: todo.status || 'pending',
+      outOfScope: Boolean(todo.outOfScope),
+      approvalStatus: todo.approvalStatus,
+      approvalNote: todo.approvalNote,
+    })),
+  }));
+  const plan: MissionPlan = { missionId, assignments: mappedAssignments };
+  setMissionPlan(plan);
+}
+
+function handleAssignmentStarted(message: WebviewMessage) {
+  const assignmentId = message.assignmentId as string;
+  updateAssignmentPlan(assignmentId, (assignment) => ({
+    ...assignment,
+    status: 'running',
+  }));
+}
+
+function handleAssignmentCompleted(message: WebviewMessage) {
+  const assignmentId = message.assignmentId as string;
+  const success = Boolean(message.success);
+  updateAssignmentPlan(assignmentId, (assignment) => ({
+    ...assignment,
+    status: success ? 'completed' : 'failed',
+    progress: success ? 100 : assignment.progress,
+  }));
+}
+
+function handleTodoStarted(message: WebviewMessage) {
+  const assignmentId = message.assignmentId as string;
+  const todoId = message.todoId as string;
+  updateTodo(assignmentId, todoId, (todo) => ({
+    ...todo,
+    status: 'in_progress',
+  }));
+}
+
+function handleTodoCompleted(message: WebviewMessage) {
+  const assignmentId = message.assignmentId as string;
+  const todoId = message.todoId as string;
+  updateTodo(assignmentId, todoId, (todo) => ({
+    ...todo,
+    status: 'completed',
+  }));
+}
+
+function handleTodoFailed(message: WebviewMessage) {
+  const assignmentId = message.assignmentId as string;
+  const todoId = message.todoId as string;
+  updateTodo(assignmentId, todoId, (todo) => ({
+    ...todo,
+    status: 'failed',
+  }));
+}
+
+function handleDynamicTodoAdded(message: WebviewMessage) {
+  const assignmentId = message.assignmentId as string;
+  const todo = message.todo as any;
+  const newTodo: AssignmentTodo = {
+    id: todo?.id || `todo_${Date.now()}`,
+    assignmentId,
+    content: todo?.content || '',
+    reasoning: todo?.reasoning,
+    expectedOutput: todo?.expectedOutput,
+    type: todo?.type || 'implementation',
+    priority: typeof todo?.priority === 'number' ? todo.priority : 3,
+    status: todo?.status || 'pending',
+    outOfScope: Boolean(todo?.outOfScope),
+    approvalStatus: todo?.approvalStatus,
+    approvalNote: todo?.approvalNote,
+  };
+  updateAssignmentPlan(assignmentId, (assignment) => ({
+    ...assignment,
+    todos: [...assignment.todos, newTodo],
+  }));
+}
+
+function handleTodoApprovalRequested(message: WebviewMessage) {
+  const assignmentId = message.assignmentId as string;
+  const todoId = message.todoId as string;
+  const reason = message.reason as string;
+  updateTodo(assignmentId, todoId, (todo) => ({
+    ...todo,
+    approvalStatus: 'pending',
+    approvalNote: reason,
+  }));
+}
+
 function mapStandardMessage(standard: StandardMessage): Message {
   const blocks = mapStandardBlocks(standard.blocks || []);
   const content = blocksToContent(blocks);
@@ -478,6 +616,41 @@ function hasRenderableContent(message: Message): boolean {
     });
   }
   return false;
+}
+
+function updateAssignmentPlan(assignmentId: string, updater: (assignment: AssignmentPlan) => AssignmentPlan) {
+  const store = getState();
+  const plan = store.missionPlan;
+  if (!plan) return;
+  const index = plan.assignments.findIndex((a) => a.id === assignmentId);
+  if (index === -1) return;
+  const nextAssignments = plan.assignments.map((assignment, i) =>
+    i === index ? updater(assignment) : assignment
+  );
+  setMissionPlan({ ...plan, assignments: nextAssignments });
+}
+
+function updateTodo(
+  assignmentId: string,
+  todoId: string,
+  updater: (todo: AssignmentTodo) => AssignmentTodo
+) {
+  updateAssignmentPlan(assignmentId, (assignment) => {
+    const idx = assignment.todos.findIndex((todo) => todo.id === todoId);
+    if (idx === -1) {
+      const placeholder: AssignmentTodo = {
+        id: todoId,
+        assignmentId,
+        content: '',
+        type: 'implementation',
+        priority: 3,
+        status: 'pending',
+      };
+      return { ...assignment, todos: [...assignment.todos, updater(placeholder)] };
+    }
+    const nextTodos = assignment.todos.map((todo, i) => (i === idx ? updater(todo) : todo));
+    return { ...assignment, todos: nextTodos };
+  });
 }
 
 function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[] {

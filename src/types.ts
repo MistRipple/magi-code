@@ -100,6 +100,7 @@ export interface FileSnapshot {
   assignmentId: string;
   todoId: string;
   workerId: string;
+  contributors?: string[];
   agentType?: AgentType;
   reason?: string;
 }
@@ -120,6 +121,7 @@ export interface PendingChange {
   assignmentId: string;
   todoId: string;
   workerId: string;
+  contributors?: string[];
 }
 
 // ============================================

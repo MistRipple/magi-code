@@ -30,7 +30,14 @@ export class SessionManagerTaskRepository implements TaskRepository {
   // ============================================================================
 
   async saveTask(task: Task): Promise<void> {
-    this.sessionManager.updateTask(this.sessionId, task.id, task);
+    const session = this.sessionManager.getSession(this.sessionId);
+    if (!session) return;
+    const exists = session.tasks.some(t => t.id === task.id);
+    if (exists) {
+      this.sessionManager.updateTask(this.sessionId, task.id, task);
+    } else {
+      this.sessionManager.addTask(this.sessionId, task);
+    }
   }
 
   async getTask(taskId: string): Promise<Task | null> {
