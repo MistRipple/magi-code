@@ -41,11 +41,13 @@ import type { MessageSource } from '../protocol';
  * 创建模型对应的 Normalizer
  */
 export function createNormalizer(
-  agent: WorkerSlot,  // ✅ 使用 WorkerSlot (不包含 orchestrator)
+  model: WorkerSlot,
   source: MessageSource = 'worker',
-  debug = false
+  debug = false,
+  messageAgent?: AgentType
 ): BaseNormalizer {
-  switch (agent) {
+  const agent = messageAgent ?? model;
+  switch (model) {
     case 'claude':
       return new ClaudeNormalizer({ agent, defaultSource: source, debug });
     case 'codex':
@@ -53,6 +55,6 @@ export function createNormalizer(
     case 'gemini':
       return new GeminiNormalizer({ agent, defaultSource: source, debug });
     default:
-      throw new Error(`Unknown agent type: ${agent}`);
+      throw new Error(`Unknown agent type: ${model}`);
   }
 }

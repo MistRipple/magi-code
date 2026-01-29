@@ -7,6 +7,8 @@ import {
   getState,
   addThreadMessage,
   updateThreadMessage,
+  addAgentMessage,
+  updateAgentMessage,
   setIsProcessing,
   setCurrentSessionId,
   updateSessions,
@@ -219,28 +221,53 @@ function handleStandardMessage(message: WebviewMessage) {
   const standard = message.message as StandardMessage;
   if (!standard) return;
   const uiMessage = mapStandardMessage(standard);
-  const state = getState();
-  const existing = state.threadMessages.find(m => m.id === uiMessage.id);
-  if (existing) {
-    updateThreadMessage(uiMessage.id, uiMessage);
-  } else {
+  if (!uiMessage.isStreaming && !hasRenderableContent(uiMessage)) {
+    return;
+  }
+  const target = resolveMessageTarget(standard);
+  const existingLocation = findMessageLocation(uiMessage.id);
+  if (existingLocation) {
+    if (existingLocation.location === 'thread') {
+      updateThreadMessage(uiMessage.id, uiMessage);
+    } else {
+      updateAgentMessage(existingLocation.agent, uiMessage.id, uiMessage);
+    }
+    return;
+  }
+  if (target.location === 'thread') {
     addThreadMessage(uiMessage);
+  } else {
+    addAgentMessage(target.agent, uiMessage);
   }
 }
 
 function handleStandardUpdate(message: WebviewMessage) {
   const update = message.update as StreamUpdate;
   if (!update?.messageId) return;
-  const state = getState();
-  const existing = state.threadMessages.find(m => m.id === update.messageId);
-  if (!existing) return;
-  updateThreadMessage(update.messageId, applyStreamUpdate(existing, update));
+  const location = findMessageLocation(update.messageId);
+  if (!location) return;
+  if (location.location === 'thread') {
+    const existing = getState().threadMessages.find(m => m.id === update.messageId);
+    if (!existing) return;
+    updateThreadMessage(update.messageId, applyStreamUpdate(existing, update));
+  } else {
+    const existing = getState().agentOutputs[location.agent].find(m => m.id === update.messageId);
+    if (!existing) return;
+    updateAgentMessage(location.agent, update.messageId, applyStreamUpdate(existing, update));
+  }
 }
 
 function handleStandardComplete(message: WebviewMessage) {
   const standard = message.message as StandardMessage;
   if (!standard) return;
-  updateThreadMessage(standard.id, mapStandardMessage(standard));
+  const location = findMessageLocation(standard.id);
+  if (!location) return;
+  const uiMessage = mapStandardMessage(standard);
+  if (location.location === 'thread') {
+    updateThreadMessage(standard.id, uiMessage);
+  } else {
+    updateAgentMessage(location.agent, standard.id, uiMessage);
+  }
 }
 
 function handleProcessingStateChange(message: WebviewMessage) {
@@ -405,6 +432,54 @@ function mapStandardMessage(standard: StandardMessage): Message {
   };
 }
 
+type MessageLocation = { location: 'thread' } | { location: 'agent'; agent: 'claude' | 'codex' | 'gemini' };
+
+function resolveMessageTarget(standard: StandardMessage): MessageLocation {
+  const agent = standard.agent;
+  const source = standard.source;
+  const hasSummaryCard = Boolean(standard.metadata && (standard.metadata as { subTaskCard?: unknown }).subTaskCard);
+  const isSystemNotice = standard.type === 'system-notice' || source === 'system' as string;
+  if (hasSummaryCard || isSystemNotice || agent === 'orchestrator' || source === 'orchestrator') {
+    return { location: 'thread' };
+  }
+  if (agent === 'claude' || agent === 'codex' || agent === 'gemini') {
+    return { location: 'agent', agent };
+  }
+  return { location: 'thread' };
+}
+
+function findMessageLocation(messageId: string): MessageLocation | null {
+  const state = getState();
+  if (state.threadMessages.some(m => m.id === messageId)) {
+    return { location: 'thread' };
+  }
+  const agents: Array<'claude' | 'codex' | 'gemini'> = ['claude', 'codex', 'gemini'];
+  for (const agent of agents) {
+    if (state.agentOutputs[agent].some(m => m.id === messageId)) {
+      return { location: 'agent', agent };
+    }
+  }
+  return null;
+}
+
+function hasRenderableContent(message: Message): boolean {
+  if (message.type === 'system-notice') return true;
+  if (message.metadata?.subTaskCard) return true;
+  if (message.content && message.content.trim()) return true;
+  if (message.blocks && message.blocks.length > 0) {
+    return message.blocks.some((block) => {
+      if (block.type === 'text' || block.type === 'code' || block.type === 'thinking') {
+        return Boolean(block.content && block.content.trim());
+      }
+      if (block.type === 'tool_call') {
+        return true;
+      }
+      return false;
+    });
+  }
+  return false;
+}
+
 function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[] {
   return ensureArray<StandardContentBlock>(blocks).map((block) => {
     switch (block.type) {
@@ -476,19 +551,79 @@ function applyStreamUpdate(message: Message, update: StreamUpdate): Partial<Mess
       } else {
         nextBlocks.push({ type: 'text', content: update.appendText });
       }
-      updates.blocks = nextBlocks;
-    }
-  } else if (update.updateType === 'replace' || update.updateType === 'block_update') {
+        updates.blocks = nextBlocks;
+      }
+  } else if (update.updateType === 'replace') {
     if (update.blocks) {
       const blocks = mapStandardBlocks(update.blocks);
       updates.blocks = blocks;
       updates.content = blocksToContent(blocks);
+    }
+  } else if (update.updateType === 'block_update') {
+    if (update.blocks) {
+      const incoming = mapStandardBlocks(update.blocks);
+      const merged = mergeBlocks(message.blocks || [], incoming);
+      updates.blocks = merged;
+      updates.content = blocksToContent(merged);
     }
   } else if (update.updateType === 'lifecycle_change' && update.lifecycle) {
     updates.isStreaming = update.lifecycle === 'streaming' || update.lifecycle === 'started';
     updates.isComplete = update.lifecycle === 'completed';
   }
   return updates;
+}
+
+function mergeBlocks(existing: ContentBlock[], incoming: ContentBlock[]): ContentBlock[] {
+  const next = [...existing];
+  for (const block of incoming) {
+    if (block.type === 'tool_call' && block.toolCall?.id) {
+      const idx = next.findIndex((b) => b.type === 'tool_call' && b.toolCall?.id === block.toolCall?.id);
+      if (idx >= 0) {
+        const prev = next[idx];
+        next[idx] = {
+          ...prev,
+          ...block,
+          toolCall: { ...prev.toolCall, ...block.toolCall },
+        };
+      } else {
+        next.push(block);
+      }
+      continue;
+    }
+    if (block.type === 'thinking') {
+      const idx = next.findIndex((b) => b.type === 'thinking');
+      if (idx >= 0) {
+        const prev = next[idx];
+        // 🔧 修复：确保 content 字段始终有值
+        const prevThinking = prev.thinking || { content: '', isComplete: false };
+        const blockThinking = block.thinking || { content: '', isComplete: false };
+        const mergedThinking = {
+          content: blockThinking.content || prevThinking.content || block.content || prev.content || '',
+          isComplete: blockThinking.isComplete ?? prevThinking.isComplete ?? true,
+        };
+        next[idx] = {
+          ...prev,
+          ...block,
+          thinking: mergedThinking,
+        };
+      } else {
+        next.push(block);
+      }
+      continue;
+    }
+    if (block.type === 'text') {
+      const idx = [...next].map((b) => b.type).lastIndexOf('text');
+      if (idx >= 0) {
+        const prev = next[idx];
+        next[idx] = { ...prev, content: (prev.content || '') + (block.content || '') };
+      } else {
+        next.push(block);
+      }
+      continue;
+    }
+    next.push(block);
+  }
+  return next;
 }
 
 function blocksToContent(blocks: ContentBlock[]): string {

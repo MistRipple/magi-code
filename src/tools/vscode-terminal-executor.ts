@@ -23,12 +23,47 @@ interface TerminalProcess {
 
 /**
  * VSCode Terminal 执行器
+ *
+ * 🔧 优化：实现终端复用，避免每次命令都创建新终端
+ * 只有当终端被占用（正在执行命令）时才创建新终端
  */
 export class VSCodeTerminalExecutor {
   private processes: Map<number, TerminalProcess> = new Map();
   private nextId: number = 1;
   private readonly defaultTimeout: number = 30000; // 30 秒
   private readonly maxTimeout: number = 300000; // 5 分钟
+
+  // 🔧 终端复用：主终端实例
+  private mainTerminal: vscode.Terminal | null = null;
+  private mainTerminalCwd: string | undefined = undefined;
+  private mainTerminalBusy: boolean = false;  // 🔧 新增：终端是否被占用
+  private terminalCloseListener: vscode.Disposable | null = null;
+
+  constructor() {
+    // 监听终端关闭事件，清理主终端引用
+    this.terminalCloseListener = vscode.window.onDidCloseTerminal((closedTerminal) => {
+      if (this.mainTerminal === closedTerminal) {
+        logger.debug('Main terminal closed by user', undefined, LogCategory.SHELL);
+        this.mainTerminal = null;
+        this.mainTerminalCwd = undefined;
+        this.mainTerminalBusy = false;
+      }
+    });
+  }
+
+  /**
+   * 清理资源
+   */
+  dispose(): void {
+    if (this.terminalCloseListener) {
+      this.terminalCloseListener.dispose();
+      this.terminalCloseListener = null;
+    }
+    if (this.mainTerminal) {
+      this.mainTerminal.dispose();
+      this.mainTerminal = null;
+    }
+  }
 
   /**
    * 执行 Shell 命令（使用VSCode Terminal）
@@ -48,9 +83,15 @@ export class VSCodeTerminalExecutor {
     }, LogCategory.SHELL);
 
     try {
-      // 创建终端
+      // 创建或复用终端
       const terminal = await this.createTerminal(options);
       const processId = this.nextId++;
+
+      // 🔧 标记主终端为忙碌状态
+      const isMainTerminal = terminal === this.mainTerminal;
+      if (isMainTerminal) {
+        this.mainTerminalBusy = true;
+      }
 
       // 如果需要显示终端，则显示
       if (options.showTerminal) {
@@ -88,14 +129,25 @@ export class VSCodeTerminalExecutor {
         outputLength: result.stdout.length,
       }, LogCategory.SHELL);
 
-      // 清理
+      // 清理进程记录
       this.processes.delete(processId);
-      if (!options.keepTerminalOpen) {
+
+      // 🔧 命令完成后，标记主终端为空闲
+      if (isMainTerminal) {
+        this.mainTerminalBusy = false;
+      }
+
+      // 🔧 终端复用：只有在明确要求关闭且不是主终端时才关闭
+      // 主终端始终保持打开以便复用
+      if (!options.keepTerminalOpen && terminal !== this.mainTerminal) {
         terminal.dispose();
       }
 
       return result;
     } catch (error: any) {
+      // 🔧 异常时也要重置忙碌状态
+      this.mainTerminalBusy = false;
+
       const duration = Date.now() - startTime;
 
       const result: ShellExecuteResult = {
@@ -116,24 +168,70 @@ export class VSCodeTerminalExecutor {
   }
 
   /**
-   * 创建VSCode终端
+   * 创建或复用 VSCode 终端
+   *
+   * 🔧 优化：实现终端复用
+   * - 如果主终端存在且空闲，复用它
+   * - 如果主终端被占用（正在运行服务等长时间命令），创建新终端
    */
   private async createTerminal(options: ShellExecuteOptions): Promise<vscode.Terminal> {
+    const terminalName = options.name || 'MultiCLI';
+    const targetCwd = options.cwd;
+
+    // 检查是否可以复用主终端（存活且空闲）
+    if (this.mainTerminal && this.isTerminalAlive(this.mainTerminal) && !this.mainTerminalBusy) {
+      logger.debug('Reusing existing main terminal (idle)', {
+        currentCwd: this.mainTerminalCwd,
+        targetCwd
+      }, LogCategory.SHELL);
+
+      // 如果工作目录不同，先切换目录
+      if (targetCwd && targetCwd !== this.mainTerminalCwd) {
+        this.mainTerminal.sendText(`cd "${targetCwd}"`);
+        this.mainTerminalCwd = targetCwd;
+        // 等待 cd 命令执行
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+
+      return this.mainTerminal;
+    }
+
+    // 🔧 主终端被占用时，创建新终端（例如运行服务）
+    if (this.mainTerminal && this.isTerminalAlive(this.mainTerminal) && this.mainTerminalBusy) {
+      logger.debug('Main terminal is busy, creating new terminal', undefined, LogCategory.SHELL);
+    }
+
+    // 创建新终端
     const terminalOptions: vscode.TerminalOptions = {
-      name: options.name || 'MultiCLI',
-      cwd: options.cwd,
+      name: terminalName,
+      cwd: targetCwd,
       env: options.env,
-      isTransient: true, // 不保存到终端历史
+      isTransient: false, // 保留到终端历史以便复用
     };
 
-    logger.debug('Creating VSCode terminal', terminalOptions, LogCategory.SHELL);
+    logger.debug('Creating new VSCode terminal', terminalOptions, LogCategory.SHELL);
 
     const terminal = vscode.window.createTerminal(terminalOptions);
 
     // 等待终端准备就绪
     await this.waitForTerminalReady(terminal);
 
+    // 只有当主终端不存在或已关闭时，才将新终端设为主终端
+    if (!this.mainTerminal || !this.isTerminalAlive(this.mainTerminal)) {
+      this.mainTerminal = terminal;
+      this.mainTerminalCwd = targetCwd;
+      this.mainTerminalBusy = false;
+    }
+
     return terminal;
+  }
+
+  /**
+   * 检查终端是否仍然存活
+   */
+  private isTerminalAlive(terminal: vscode.Terminal): boolean {
+    // 检查终端是否在当前打开的终端列表中
+    return vscode.window.terminals.includes(terminal);
   }
 
   /**

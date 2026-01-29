@@ -207,11 +207,6 @@
               "default": 0.7
             }
           }
-        },
-        "multicli.useSvelteWebview": {
-          "type": "boolean",
-          "default": true,
-          "description": "使用 Svelte 5 新版界面（重启后生效）"
         }
       }
     },

@@ -7,6 +7,7 @@
   import ThinkingBlock from './ThinkingBlock.svelte';
   import ToolCall from './ToolCall.svelte';
   import CodeBlock from './CodeBlock.svelte';
+  import SubTaskSummaryCard from './SubTaskSummaryCard.svelte';
   import Icon from './Icon.svelte';
 
   // Props
@@ -96,6 +97,10 @@
     </div>
 
     <div class="message-content">
+      {#if message.metadata?.subTaskCard}
+        <SubTaskSummaryCard card={message.metadata.subTaskCard as any} />
+      {/if}
+
       {#if message.blocks && message.blocks.length > 0}
         {#each message.blocks as block, i (i)}
           {#if block.type === 'thinking'}
@@ -222,6 +227,7 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
+    margin-left: auto;  /* 确保始终右对齐 */
   }
   .message-time {
     font-size: var(--text-xs);
