@@ -5242,8 +5242,60 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this._view?.webview.postMessage(message);
   }
 
-  /** 获取 HTML 内容 - 从外部模板文件加载 */
+  /** 获取 HTML 内容 - 根据配置使用 Svelte 或传统 webview */
   private getHtmlContent(webview: vscode.Webview): string {
+    // 检查是否使用 Svelte webview（默认使用 Svelte）
+    const useSvelteWebview = vscode.workspace.getConfiguration('multicli').get('useSvelteWebview', true);
+
+    if (useSvelteWebview) {
+      return this.getSvelteHtmlContent(webview);
+    } else {
+      return this.getLegacyHtmlContent(webview);
+    }
+  }
+
+  /** 获取 Svelte webview HTML 内容 */
+  private getSvelteHtmlContent(webview: vscode.Webview): string {
+    // 读取 Svelte 构建输出的 HTML
+    const templatePath = path.join(this.extensionUri.fsPath, 'out', 'webview', 'index.html');
+
+    // 检查文件是否存在
+    if (!fs.existsSync(templatePath)) {
+      logger.warn('界面.Svelte.未构建', { path: templatePath }, LogCategory.UI);
+      return this.getLegacyHtmlContent(webview);
+    }
+
+    let html = fs.readFileSync(templatePath, 'utf-8');
+    const cacheBuster = Date.now().toString();
+
+    // 获取 webview 资源根目录
+    const webviewAssetsUri = webview.asWebviewUri(
+      vscode.Uri.file(path.join(this.extensionUri.fsPath, 'out', 'webview', 'assets'))
+    );
+
+    // 替换资源路径（Vite 构建输出使用 /assets/ 前缀）
+    html = html.replace(/src="\/assets\//g, `src="${webviewAssetsUri}/`);
+    html = html.replace(/href="\/assets\//g, `href="${webviewAssetsUri}/`);
+
+    // 添加缓存破坏参数
+    html = html.replace(/\.js"/g, `.js?v=${cacheBuster}"`);
+    html = html.replace(/\.css"/g, `.css?v=${cacheBuster}"`);
+
+    // 注入 CSP meta 标签（VS Code webview 安全策略）
+    const cspMeta = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src ${webview.cspSource}; font-src ${webview.cspSource}; img-src ${webview.cspSource} https: data:;">`;
+    html = html.replace('<head>', `<head>\n    ${cspMeta}`);
+
+    // 注入初始 sessionId
+    const initialSessionId = this.activeSessionId || '';
+    const sessionScript = `<script>window.__INITIAL_SESSION_ID__ = "${initialSessionId}";</script>`;
+    html = html.replace('</head>', `${sessionScript}\n  </head>`);
+
+    logger.debug('界面.Svelte.已加载', { sessionId: initialSessionId }, LogCategory.UI);
+    return html;
+  }
+
+  /** 获取传统 webview HTML 内容（原生 JS 版本） */
+  private getLegacyHtmlContent(webview: vscode.Webview): string {
     // 读取外部 HTML 模板文件
     const templatePath = path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'index.html');
     let html = fs.readFileSync(templatePath, 'utf-8');
