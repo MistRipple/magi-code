@@ -6,6 +6,7 @@
 import type {
   Message,
   AgentOutputs,
+  AgentType,
   Session,
   TabType,
   ProcessingActor,
@@ -255,6 +256,31 @@ export function updateThreadMessage(messageId: string, updates: Partial<Message>
 
 export function clearThreadMessages() {
   threadMessages = [];
+  saveWebviewState();
+}
+
+export function addAgentMessage(agent: AgentType, message: Message) {
+  const safeMessage = JSON.parse(JSON.stringify(message)) as Message;
+  agentOutputs = {
+    ...agentOutputs,
+    [agent]: [...agentOutputs[agent], safeMessage],
+  };
+  saveWebviewState();
+}
+
+export function updateAgentMessage(agent: AgentType, messageId: string, updates: Partial<Message>) {
+  const list = agentOutputs[agent];
+  const index = list.findIndex((m) => m.id === messageId);
+  if (index !== -1) {
+    const safeUpdates = JSON.parse(JSON.stringify(updates)) as Partial<Message>;
+    const next = list.map((msg, i) => (i === index ? { ...msg, ...safeUpdates } : msg));
+    agentOutputs = { ...agentOutputs, [agent]: next };
+    // 不触发保存，由流式管理器批量保存
+  }
+}
+
+export function clearAgentMessages(agent: AgentType) {
+  agentOutputs = { ...agentOutputs, [agent]: [] };
   saveWebviewState();
 }
 

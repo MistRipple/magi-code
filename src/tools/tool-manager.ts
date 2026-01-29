@@ -318,7 +318,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       cwd,
       timeout,
       showTerminal = true,  // 默认显示终端
-      keepTerminalOpen = false,
+      keepTerminalOpen = true,  // 🔧 修复：默认保持终端打开，避免"一闪而过"
       name
     } = args;
 

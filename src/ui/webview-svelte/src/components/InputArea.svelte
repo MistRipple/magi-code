@@ -269,8 +269,8 @@
     justify-content: space-between;
     align-items: center;
     padding: var(--space-2) var(--space-3);
-    border-top: 1px solid var(--border-subtle);
-    background: var(--surface-1);
+    /* 🔧 移除分层效果，与输入区域保持纯色一致 */
+    background: transparent;
     gap: var(--space-2);
   }
 
@@ -280,8 +280,9 @@
     gap: var(--space-2);
   }
 
+  /* 🔧 统一按钮高度为 28px */
   .model-selector {
-    height: var(--btn-height-sm);
+    height: 28px;
     padding: 0 var(--space-3);
     font-size: var(--text-xs);
     background: transparent;
@@ -294,6 +295,7 @@
 
   .mode-toggle {
     display: flex;
+    height: 28px;
     background: var(--surface-2);
     border-radius: var(--radius-sm);
     overflow: hidden;
@@ -301,7 +303,9 @@
   }
 
   .mode-toggle-option {
-    padding: var(--space-1) var(--space-3);
+    display: flex;
+    align-items: center;
+    padding: 0 var(--space-3);
     font-size: var(--text-xs);
     font-weight: var(--font-medium);
     background: transparent;
@@ -313,12 +317,12 @@
   .mode-toggle-option.active { background: var(--primary); color: white; }
   .mode-toggle-option:hover:not(.active) { background: var(--surface-hover); color: var(--foreground); }
 
-  /* 增强按钮 */
+  /* 增强按钮 - 统一高度 28px */
   .enhance-btn {
     display: flex;
     align-items: center;
     gap: var(--space-1);
-    height: var(--btn-height-sm);
+    height: 28px;
     padding: 0 var(--space-3);
     font-size: var(--text-xs);
     background: transparent;
@@ -336,17 +340,17 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   .enhance-text { font-weight: var(--font-medium); }
 
-  /* 发送按钮 */
+  /* 发送按钮 - 统一高度 28px */
   .send-btn {
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 36px;
-    height: 36px;
+    width: 28px;
+    height: 28px;
     padding: 0;
     background: var(--surface-2);
     border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-sm);
     color: var(--foreground-muted);
     cursor: pointer;
     transition: all var(--transition-fast);
@@ -357,7 +361,7 @@
   .send-btn.stop { background: var(--error); border-color: var(--error); color: white; animation: pulse 1s ease-in-out infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
 
-  /* 图标按钮 */
+  /* 图标按钮 - 统一高度 28px */
   .icon-btn {
     display: flex;
     align-items: center;

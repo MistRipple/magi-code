@@ -155,7 +155,7 @@ class UIInteractionEngineer implements TestEngineer {
       severity: 'medium',
       category: 'UI交互',
       description: '多个待处理状态（确认、问题、澄清）的优先级不明确',
-      location: 'src/ui/webview/index.html:5490-5513',
+      location: 'src/ui/webview-svelte/src/components/InputArea.svelte',
       suggestedFix: '明确定义优先级顺序，添加状态冲突检测'
     });
     

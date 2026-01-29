@@ -5294,16 +5294,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this._view?.webview.postMessage(message);
   }
 
-  /** 获取 HTML 内容 - 根据配置使用 Svelte 或传统 webview */
+  /** 获取 HTML 内容 - 仅使用 Svelte webview */
   private getHtmlContent(webview: vscode.Webview): string {
-    // 检查是否使用 Svelte webview（默认使用 Svelte）
-    const useSvelteWebview = vscode.workspace.getConfiguration('multicli').get('useSvelteWebview', true);
-
-    if (useSvelteWebview) {
-      return this.getSvelteHtmlContent(webview);
-    } else {
-      return this.getLegacyHtmlContent(webview);
-    }
+    return this.getSvelteHtmlContent(webview);
   }
 
   /** 获取 Svelte webview HTML 内容 */
@@ -5311,10 +5304,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 读取 Svelte 构建输出的 HTML
     const templatePath = path.join(this.extensionUri.fsPath, 'out', 'webview', 'index.html');
 
-    // 检查文件是否存在
     if (!fs.existsSync(templatePath)) {
-      logger.warn('界面.Svelte.未构建', { path: templatePath }, LogCategory.UI);
-      return this.getLegacyHtmlContent(webview);
+      const message = `Svelte webview 未构建: ${templatePath}`;
+      logger.error('界面.Svelte.未构建', { path: templatePath }, LogCategory.UI);
+      throw new Error(message);
     }
 
     let html = fs.readFileSync(templatePath, 'utf-8');
@@ -5343,101 +5336,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     html = html.replace('</head>', `${sessionScript}\n  </head>`);
 
     logger.debug('界面.Svelte.已加载', { sessionId: initialSessionId }, LogCategory.UI);
-    return html;
-  }
-
-  /** 获取传统 webview HTML 内容（原生 JS 版本） */
-  private getLegacyHtmlContent(webview: vscode.Webview): string {
-    // 读取外部 HTML 模板文件
-    const templatePath = path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'index.html');
-    let html = fs.readFileSync(templatePath, 'utf-8');
-
-    // 获取 webview 根目录 URI
-    const webviewRoot = webview.asWebviewUri(
-      vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview'))
-    );
-
-    const cacheBuster = Date.now().toString();
-
-    // 替换 CSS 文件路径（设计系统 + 组件 + 模块化 CSS 文件）
-    // 1. 设计系统 CSS
-    const designSystemUri = webview.asWebviewUri(
-      vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'styles', 'design-system.css'))
-    );
-    html = html.replace('href="styles/design-system.css"', `href="${designSystemUri}?v=${cacheBuster}"`);
-
-    // 1.5 tokens.css（设计令牌）
-    const tokensUri = webview.asWebviewUri(
-      vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'styles', 'tokens.css'))
-    );
-    html = html.replace('href="styles/tokens.css"', `href="${tokensUri}?v=${cacheBuster}"`);
-
-    // 2. 组件 CSS 文件（包含 panels.css 用于代码块、思考过程、工具调用面板样式）
-    const componentCssFiles = ['panels.css', 'collapsible.css', 'chat-message.css'];
-    componentCssFiles.forEach(cssFile => {
-      const cssUri = webview.asWebviewUri(
-        vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'styles', 'components', cssFile))
-      );
-      html = html.replace(`href="styles/components/${cssFile}"`, `href="${cssUri}?v=${cacheBuster}"`);
-    });
-
-    // 3. 原有的模块化 CSS 文件
-    const cssFiles = ['base.css', 'layout.css', 'components.css', 'messages.css', 'settings.css', 'modals.css'];
-    cssFiles.forEach(cssFile => {
-      const cssUri = webview.asWebviewUri(
-        vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'styles', cssFile))
-      );
-      html = html.replace(`href="styles/${cssFile}"`, `href="${cssUri}?v=${cacheBuster}"`);
-    });
-
-    // 替换 JavaScript 主入口路径
-    const mainJsUri = webview.asWebviewUri(
-      vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'js', 'main.js'))
-    );
-    const mainJsUriWithVersion = `${mainJsUri.toString()}?v=${cacheBuster}`;
-    html = html.replace('src="js/main.js"', `src="${mainJsUriWithVersion}"`);
-    html = html.replace(/\{\{mainJsUri\}\}/g, mainJsUriWithVersion);
-
-    // 创建 import map 来处理 ES6 模块的相对导入
-    const jsModules = [
-      'core/state.js',
-      'core/utils.js',
-      'core/vscode-api.js',
-      'ui/message-renderer.js',
-      'ui/message-handler.js',
-      'ui/event-handlers.js'
-    ];
-
-    const imports: Record<string, string> = {};
-    jsModules.forEach(modulePath => {
-      const moduleUri = webview.asWebviewUri(
-        vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'js', modulePath))
-      );
-      imports[`./${modulePath}`] = `${moduleUri.toString()}?v=${cacheBuster}`;
-    });
-
-    const importMap = `<script type="importmap">
-{
-  "imports": ${JSON.stringify(imports, null, 2)}
-}
-</script>`;
-
-    // 在 </head> 之前插入 import map
-    html = html.replace('</head>', `${importMap}\n</head>`);
-
-    // lib 目录 URI（用于加载 marked 和 highlight.js）
-    const libUri = webview.asWebviewUri(
-      vscode.Uri.file(path.join(this.extensionUri.fsPath, 'src', 'ui', 'webview', 'lib'))
-    );
-    html = html.replace(/\{\{libUri\}\}/g, libUri.toString());
-
-    // 替换 CSP 占位符
-    html = html.replace(/\{\{cspSource\}\}/g, webview.cspSource);
-
-    // 注入初始 sessionId，确保 webview 加载时就有正确的值（避免时序问题）
-    const initialSessionId = this.activeSessionId || '';
-    html = html.replace(/\{\{initialSessionId\}\}/g, initialSessionId);
-
     return html;
   }
 

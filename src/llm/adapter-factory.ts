@@ -337,7 +337,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     const client = createLLMClient(orchestratorConfig);
 
     // 创建 normalizer
-    const normalizer = createNormalizer('claude', 'orchestrator', false);
+    const normalizer = createNormalizer('claude', 'orchestrator', false, 'orchestrator');
 
     // 创建适配器（注入 MessageBus）
     const adapterConfig: OrchestratorAdapterConfig = {

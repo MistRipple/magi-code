@@ -137,7 +137,7 @@ class StateManagementEngineer implements TestEngineer {
       severity: 'medium',
       category: '并发安全',
       description: '全局 isProcessing 状态可能在多个流并发时产生冲突',
-      location: 'src/ui/webview/index.html',
+      location: 'src/ui/webview-svelte/src/stores/messages.svelte.ts',
       suggestedFix: '考虑为每个消息流维护独立的状态'
     });
     

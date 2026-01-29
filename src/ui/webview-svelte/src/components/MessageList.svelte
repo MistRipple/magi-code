@@ -85,9 +85,8 @@
 
   <!-- 滚动按钮：绝对定位在消息列表右下角 -->
   {#if showScrollBtn}
-    <button class="scroll-to-bottom" onclick={scrollToBottom} title="滚动到底部">
-      <Icon name="chevron-down" size={12} />
-      <span class="scroll-text">新消息</span>
+    <button class="scroll-to-bottom" onclick={scrollToBottom} title="回到底部">
+      <Icon name="chevron-down" size={16} />
     </button>
   {/if}
 </div>
@@ -150,19 +149,18 @@
     right: 20px;
     display: flex;
     align-items: center;
-    gap: 4px;
-    height: 32px;
-    padding: 0 12px;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    padding: 0;
     background: var(--surface-2);
     color: var(--primary);
     border: 1px solid var(--border);
     border-radius: var(--radius-full);
-    font-size: 12px;
-    font-weight: var(--font-medium);
     box-shadow: var(--shadow-lg);
     cursor: pointer;
     transition: all var(--transition-fast);
-    z-index: 100; /* 提高层级 */
+    z-index: 100;
     animation: slideUp 0.2s ease-out;
   }
 
@@ -176,10 +174,6 @@
     color: white;
     border-color: var(--primary);
     transform: translateY(-2px);
-  }
-
-  .scroll-text {
-    white-space: nowrap;
   }
 </style>
 
