@@ -207,6 +207,11 @@
               "default": 0.7
             }
           }
+        },
+        "multicli.useSvelteWebview": {
+          "type": "boolean",
+          "default": true,
+          "description": "使用 Svelte 5 新版界面（重启后生效）"
         }
       }
     },
@@ -230,9 +235,11 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run compile && npm run build:webview",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "build:webview": "cd src/ui/webview-svelte && npm run build",
+    "watch:webview": "cd src/ui/webview-svelte && npm run dev",
     "lint": "eslint src --ext ts",
     "test": "node scripts/run-all-tests.js quick",
     "test:quick": "node scripts/run-all-tests.js quick",
