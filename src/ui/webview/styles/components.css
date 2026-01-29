@@ -93,7 +93,7 @@
     .input-resize-bar:hover::after { opacity: 1; }
     .input-wrapper.resizing .input-resize-bar::after { opacity: 1; background: var(--vscode-focusBorder); }
 
-    .input-box { min-height: 60px; height: 80px; max-height: 300px; padding: var(--spacing-3); background: transparent; border: none; color: var(--vscode-input-foreground); font-family: var(--vscode-font-family); font-size: var(--font-size-3); resize: none; outline: none; line-height: 1.5; }
+    .input-box { min-height: 60px; height: 120px; max-height: 300px; padding: var(--spacing-3); background: transparent; border: none; color: var(--vscode-input-foreground); font-family: var(--vscode-font-family); font-size: var(--font-size-3); resize: none; outline: none; line-height: 1.5; }
     .input-box::placeholder { color: var(--vscode-input-placeholderForeground); }
 
     /* 输入框底部操作栏 - 与输入框背景一致 */

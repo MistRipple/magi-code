@@ -64,6 +64,8 @@ import {
 export class WebviewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'multiCli.mainView';
 
+  private readonly MAX_REASONABLE_ARRAY_LENGTH = 1_000_000;
+
   private _view?: vscode.WebviewView;
   private sessionManager: UnifiedSessionManager;
   private taskManager: UnifiedTaskManager | null = null;
@@ -564,6 +566,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private setupMessageBusListeners(): void {
     // MessageBus 事件转发到前端
     this.messageBus.on(MESSAGE_EVENTS.MESSAGE, (message) => {
+      this.assertBlocks(message.blocks, 'standardMessage.blocks');
       this.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.STANDARD_MESSAGE,
         message,
@@ -573,6 +576,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     this.messageBus.on(MESSAGE_EVENTS.UPDATE, (update) => {
+      if (update.blocks) {
+        this.assertBlocks(update.blocks, 'standardUpdate.blocks');
+      }
       this.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.STANDARD_UPDATE,
         update,
@@ -582,6 +588,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     this.messageBus.on(MESSAGE_EVENTS.COMPLETE, (message) => {
+      this.assertBlocks(message.blocks, 'standardComplete.blocks');
       this.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.STANDARD_COMPLETE,
         message,
@@ -1485,6 +1492,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       type = MessageType.RESULT;
     }
 
+    const safeBlocks: ContentBlock[] = Array.isArray(blocks)
+      ? this.assertBlocks(blocks, 'sendOrchestratorMessage.blocks')
+      : (content ? [{ type: 'text' as const, content, isMarkdown: false }] : []);
+
     const standardMessage: StandardMessage = {
       id: `msg-orch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       traceId: this.activeSessionId || 'default',
@@ -1493,7 +1504,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       agent: 'orchestrator',
       timestamp: Date.now(),
       updatedAt: Date.now(),
-      blocks: Array.isArray(blocks) ? blocks : (content ? [{ type: 'text', content, isMarkdown: false }] : []),
+      blocks: safeBlocks,
       lifecycle,
       metadata: {
         taskId,
@@ -1594,6 +1605,16 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'getStatus':
         await this.handleGetStatusMessage();
         break;
+
+      case 'uiError': {
+        const uiError = message as any;
+        logger.error('界面.UI_错误', {
+          component: uiError.component,
+          detail: uiError.detail,
+          stack: uiError.stack,
+        }, LogCategory.UI);
+        break;
+      }
 
       case 'executeTask':
         logger.info('界面.任务.执行.请求', { promptLength: String((message as any).prompt || '').length, imageCount: (message as any).images?.length || 0, agent: (message as any).agent || 'orchestrator' }, LogCategory.UI);
@@ -5178,7 +5199,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private buildUIState(): UIState {
     const currentSession = this.sessionManager.getCurrentSession();
     const tasks = currentSession?.tasks ?? [];
-    const currentTask = tasks.find(t => t.status === 'running') ?? tasks[tasks.length - 1];
+    this.assertValidArray<any>(tasks, 'uiState.tasks');
+    const currentTask = tasks.find(t => t?.status === 'running') ?? tasks[tasks.length - 1];
     const activePlanRecordRaw = currentSession?.id
       ? this.intelligentOrchestrator.getActivePlanForSession(currentSession.id)
       : null;
@@ -5186,6 +5208,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     // 使用轻量级的会话元数据（而不是完整会话数据）
     const sessionMetas = this.sessionManager.getSessionMetas();
+    this.assertValidArray<any>(sessionMetas, 'uiState.sessions');
 
     // 构建 Worker 状态（基于 LLM 适配器）
     const workerSlots: WorkerSlot[] = ['claude', 'codex', 'gemini'];
@@ -5197,6 +5220,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
 
     const isRunning = currentTask?.status === 'running' || this.intelligentOrchestrator.running;
+    const pendingChanges = this.snapshotManager.getPendingChanges();
+    this.assertValidArray<any>(pendingChanges, 'uiState.pendingChanges');
+    const logs = this.logs;
+    this.assertValidArray<LogEntry>(logs, 'uiState.logs');
 
     return {
       // 使用 activeSessionId 作为单一真相来源，确保与消息发送时的 sessionId 一致
@@ -5205,9 +5232,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       currentTask,
       tasks,
       workerStatuses,  // ✅ 使用 workerStatuses
-      pendingChanges: this.snapshotManager.getPendingChanges(),
+      pendingChanges,
       isRunning,
-      logs: this.logs,
+      logs,
       interactionMode: this.intelligentOrchestrator.getInteractionMode(),
       orchestratorPhase: this.intelligentOrchestrator.phase,
       activePlan: activePlanRecord
@@ -5234,6 +5261,31 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         this.sendStateUpdate();
       }, 200);
     }
+  }
+
+  private assertValidArray<T>(value: unknown, context: string): T[] {
+    if (!Array.isArray(value)) {
+      const error = new Error(`[UIState Validation] ${context} is not an array`);
+      logger.error('界面.状态.数组_非法', { context, valueType: typeof value }, LogCategory.UI);
+      throw error;
+    }
+    const length = value.length;
+    if (!Number.isFinite(length) || length < 0 || length > 0xffffffff) {
+      const error = new Error(`[UIState Validation] ${context} has invalid length: ${length}`);
+      logger.error('界面.状态.数组_长度非法', { context, length }, LogCategory.UI);
+      throw error;
+    }
+    if (length > this.MAX_REASONABLE_ARRAY_LENGTH) {
+      const error = new Error(`[UIState Validation] ${context} length is suspiciously large: ${length}`);
+      logger.error('界面.状态.数组_长度异常', { context, length }, LogCategory.UI);
+      throw error;
+    }
+    return value as T[];
+  }
+
+  private assertBlocks(blocks: ContentBlock[] | undefined, context: string): ContentBlock[] {
+    if (blocks === undefined) return [];
+    return this.assertValidArray<ContentBlock>(blocks, context);
   }
 
 

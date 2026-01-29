@@ -1,5 +1,6 @@
 <script lang="ts">
   import { vscode } from '../lib/vscode-bridge';
+  import { ensureArray } from '../lib/utils';
   import Icon from './Icon.svelte';
 
   // 知识类型定义
@@ -54,8 +55,19 @@
     if (searchQuery.trim()) {
       const query = searchQuery.toLowerCase();
       result = result.filter(adr =>
-        adr.title.toLowerCase().includes(query) ||
-        adr.context?.toLowerCase().includes(query)
+        (() => {
+          if (!adr.title || typeof adr.title !== 'string') {
+            vscode.postMessage({
+              type: 'uiError',
+              component: 'KnowledgePanel',
+              detail: { kind: 'ADR', adr },
+              stack: new Error('KnowledgePanel: invalid ADR title').stack,
+            });
+            throw new Error('KnowledgePanel: invalid ADR title');
+          }
+          return adr.title.toLowerCase().includes(query) ||
+            adr.context?.toLowerCase().includes(query);
+        })()
       );
     }
     return result;
@@ -66,8 +78,19 @@
     if (!searchQuery.trim()) return faqs;
     const query = searchQuery.toLowerCase();
     return faqs.filter(faq =>
-      faq.question.toLowerCase().includes(query) ||
-      faq.answer?.toLowerCase().includes(query)
+      (() => {
+        if (!faq.question || typeof faq.question !== 'string') {
+          vscode.postMessage({
+            type: 'uiError',
+            component: 'KnowledgePanel',
+            detail: { kind: 'FAQ', faq },
+            stack: new Error('KnowledgePanel: invalid FAQ question').stack,
+          });
+          throw new Error('KnowledgePanel: invalid FAQ question');
+        }
+        return faq.question.toLowerCase().includes(query) ||
+          faq.answer?.toLowerCase().includes(query);
+      })()
     );
   });
 
@@ -102,9 +125,16 @@
     const handler = (event: MessageEvent) => {
       const message = event.data;
       if (message.type === 'projectKnowledgeLoaded') {
-        codeIndex = message.codeIndex;
-        adrs = message.adrs || [];
-        faqs = message.faqs || [];
+        codeIndex = message.codeIndex
+          ? {
+              ...message.codeIndex,
+              files: ensureArray(message.codeIndex.files),
+              techStack: ensureArray(message.codeIndex.techStack),
+              entryPoints: ensureArray(message.codeIndex.entryPoints)
+            }
+          : null;
+        adrs = ensureArray(message.adrs);
+        faqs = ensureArray(message.faqs);
         isLoading = false;
       }
     };

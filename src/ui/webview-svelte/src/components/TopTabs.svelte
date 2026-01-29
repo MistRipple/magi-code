@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getState } from '../stores/messages.svelte';
+  import { ensureArray } from '../lib/utils';
 
   interface Props {
     activeTopTab: 'thread' | 'tasks' | 'edits' | 'knowledge';
@@ -11,8 +12,8 @@
   const appState = getState();
 
   // 任务和变更的徽章数量
-  const tasksBadge = $derived(appState.tasks?.length || 0);
-  const editsBadge = $derived(appState.edits?.length || 0);
+  const tasksBadge = $derived(ensureArray(appState.tasks).length);
+  const editsBadge = $derived(ensureArray(appState.edits).length);
 </script>
 
 <div class="top-tabs">
@@ -103,4 +104,3 @@
     line-height: 1;
   }
 </style>
-

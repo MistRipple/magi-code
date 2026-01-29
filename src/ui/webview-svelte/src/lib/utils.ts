@@ -96,3 +96,9 @@ export function truncate(str: string, maxLength: number): string {
   return str.substring(0, maxLength - 3) + '...';
 }
 
+/**
+ * 确保值为数组
+ */
+export function ensureArray<T>(value: unknown): T[] {
+  return Array.isArray(value) ? value : [];
+}

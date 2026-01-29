@@ -1,5 +1,6 @@
 <script lang="ts">
   import { vscode } from '../lib/vscode-bridge';
+  import { ensureArray } from '../lib/utils';
   import Icon from './Icon.svelte';
   import Toggle from './Toggle.svelte';
 
@@ -20,6 +21,7 @@
     executions?: number;
     successRate?: number;
     tokens?: number;
+    error?: string;
   }
 
   // 状态
@@ -60,8 +62,8 @@
 
   // 当前 worker 的画像数据（响应式派生）
   let profileRole = $derived(allWorkerProfiles[profileWorker]?.role || '');
-  let profileFocusAreas = $derived(allWorkerProfiles[profileWorker]?.focus || []);
-  let profileConstraints = $derived(allWorkerProfiles[profileWorker]?.constraints || []);
+  let profileFocusAreas = $derived(ensureArray(allWorkerProfiles[profileWorker]?.focus));
+  let profileConstraints = $derived(ensureArray(allWorkerProfiles[profileWorker]?.constraints));
 
   // Model Tab 状态
   let modelConfigTab = $state<'orch' | 'comp' | 'ace'>('orch');
@@ -113,7 +115,6 @@
     enabled?: boolean;
   }
   let skills = $state<SkillItem[]>([]);
-  let skillsConfig = $state<any>(null);
 
   // 仓库管理
   interface Repository {
@@ -273,9 +274,6 @@
     vscode.postMessage({ type: 'logout' });
   }
 
-  function requestExecutionStats() {
-    vscode.postMessage({ type: 'requestExecutionStats' });
-  }
 
   function closeSettings() {
     onClose?.();
@@ -712,13 +710,6 @@
     totalInputTokens: number;
     totalOutputTokens: number;
   }>>([]);
-  let orchestratorStats = $state<{
-    totalTasks: number;
-    totalSuccess: number;
-    totalFailed: number;
-    totalInputTokens: number;
-    totalOutputTokens: number;
-  }>({ totalTasks: 0, totalSuccess: 0, totalFailed: 0, totalInputTokens: 0, totalOutputTokens: 0 });
 
   // 监听来自扩展的状态更新
   $effect(() => {
@@ -738,7 +729,6 @@
           executionStats = message.stats;
         }
         if (message.orchestratorStats) {
-          orchestratorStats = message.orchestratorStats;
           totalTokens = (message.orchestratorStats.totalInputTokens || 0) + (message.orchestratorStats.totalOutputTokens || 0);
         }
       }
@@ -876,7 +866,8 @@
       }
       // MCP 服务器列表加载
       else if (message.type === 'mcpServersLoaded') {
-        mcpServers = (message.servers || []).map((s: any) => ({
+        const servers = ensureArray<any>(message.servers);
+        mcpServers = servers.map((s: any) => ({
           id: s.id || s.name,
           name: s.name || s.id,
           command: s.command || '',
@@ -901,8 +892,9 @@
       }
       // MCP 工具列表加载（首次获取）
       else if (message.type === 'mcpServerTools') {
-        if (message.serverId && message.tools) {
-          mcpServerTools = { ...mcpServerTools, [message.serverId]: message.tools };
+        if (message.serverId) {
+          const tools = ensureArray(message.tools);
+          mcpServerTools = { ...mcpServerTools, [message.serverId]: tools };
           // 清除刷新状态
           const newSet = new Set(mcpRefreshingServers);
           newSet.delete(message.serverId);
@@ -911,8 +903,9 @@
       }
       // MCP 工具列表刷新
       else if (message.type === 'mcpToolsRefreshed') {
-        if (message.serverId && message.tools) {
-          mcpServerTools = { ...mcpServerTools, [message.serverId]: message.tools };
+        if (message.serverId) {
+          const tools = ensureArray(message.tools);
+          mcpServerTools = { ...mcpServerTools, [message.serverId]: tools };
           // 清除刷新状态
           const newSet = new Set(mcpRefreshingServers);
           newSet.delete(message.serverId);
@@ -921,7 +914,6 @@
       }
       // Skills 配置加载
       else if (message.type === 'skillsConfigLoaded') {
-        skillsConfig = message.config;
         const skillList: SkillItem[] = [];
         // 内置工具 - 显示所有工具（包括禁用的）
         if (message.config?.builtInTools) {
@@ -950,7 +942,8 @@
       }
       // 仓库列表加载
       else if (message.type === 'repositoriesLoaded') {
-        repositories = (message.repositories || []).map((r: any) => ({
+        const repoList = ensureArray<any>(message.repositories);
+        repositories = repoList.map((r: any) => ({
           id: r.id,
           url: r.url,
           name: r.name || r.url,
@@ -976,7 +969,8 @@
       }
       // Skill 库加载
       else if (message.type === 'skillLibraryLoaded') {
-        librarySkills = (message.skills || []).map((s: any) => ({
+        const skillsList = ensureArray<any>(message.skills);
+        librarySkills = skillsList.map((s: any) => ({
           name: s.name,
           fullName: s.fullName || s.name,
           description: s.description || '',
@@ -1775,7 +1769,7 @@
               <p class="empty-state-hint">请先添加 Skill 仓库</p>
             </div>
           {:else}
-            {#each Object.entries(skillsByRepo()) as [repoId, repoData]}
+            {#each Object.entries(skillsByRepo()) as [_, repoData]}
               <div class="skill-repo-group">
                 <div class="skill-repo-title">{repoData.name} ({repoData.skills.length} 个技能)</div>
                 {#each repoData.skills as skill}
@@ -1816,9 +1810,9 @@
 <!-- 重置 Token 确认对话框 -->
 {#if showResetConfirm}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="modal-overlay modal-overlay--top" onclick={cancelResetStats}>
+  <div class="modal-overlay modal-overlay--top" onclick={cancelResetStats} role="presentation">
     <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="modal-dialog modal-dialog--sm" onclick={(e) => e.stopPropagation()}>
+    <div class="modal-dialog modal-dialog--sm" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()}>
       <div class="modal-header">
         <div class="modal-title">确认重置</div>
         <button class="modal-close" onclick={cancelResetStats}>×</button>
@@ -1838,9 +1832,9 @@
 <!-- 通用确认对话框 -->
 {#if showConfirmDialog}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="modal-overlay modal-overlay--top" onclick={handleConfirmNo}>
+  <div class="modal-overlay modal-overlay--top" onclick={handleConfirmNo} role="presentation">
     <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="modal-dialog modal-dialog--sm" onclick={(e) => e.stopPropagation()}>
+    <div class="modal-dialog modal-dialog--sm" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()}>
       <div class="modal-header">
         <div class="modal-title">{confirmDialogTitle}</div>
         <button class="modal-close" onclick={handleConfirmNo}>×</button>
@@ -2454,7 +2448,7 @@
   .mcp-tool-item:hover { border-color: var(--primary-muted); background: var(--surface-hover); }
   .mcp-tool-row { display: flex; align-items: center; gap: var(--space-2); }
   .mcp-tool-name { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .mcp-tool-desc { font-size: var(--text-xs); color: var(--foreground-muted); margin-top: 2px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .mcp-tool-desc { font-size: var(--text-xs); color: var(--foreground-muted); margin-top: 2px; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 
   /* MCP 工具描述查看按钮 */
   .mcp-tool-desc-btn {
@@ -2518,7 +2512,7 @@
 
   .skill-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow: hidden; }
   .skill-name { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); }
-  .skill-desc { font-size: var(--text-xs); color: var(--foreground-muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; cursor: help; }
+  .skill-desc { font-size: var(--text-xs); color: var(--foreground-muted); display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; cursor: help; }
 
   .skill-actions { display: flex; align-items: center; gap: var(--space-2); flex-shrink: 0; }
 
@@ -2790,9 +2784,8 @@
   }
   .skill-library-info { min-width: 0; overflow: hidden; }
   .skill-library-name { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); }
-  .skill-library-desc { font-size: var(--text-xs); color: var(--foreground-muted); margin-top: 4px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; cursor: help; line-height: 1.5; }
+  .skill-library-desc { font-size: var(--text-xs); color: var(--foreground-muted); margin-top: 4px; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; cursor: help; line-height: 1.5; }
   .skill-library-meta { display: flex; gap: var(--space-3); margin-top: var(--space-2); flex-wrap: wrap; }
   .skill-library-meta-item { font-size: var(--text-xs); color: var(--foreground-muted); }
   .skill-library-actions { flex-shrink: 0; align-self: center; }
 </style>
-

@@ -836,6 +836,12 @@ ${conversationText}
    * 获取 ADRs
    */
   getADRs(filter?: { status?: ADRStatus }): ADRRecord[] {
+    const { records, changed } = this.normalizeADRRecords(this.adrs);
+    if (changed) {
+      this.adrs = records;
+      this.saveADRs();
+      logger.warn('项目知识库.ADR.已自动清理(访问时)', { count: this.adrs.length }, LogCategory.SESSION);
+    }
     if (!filter) {
       return this.adrs;
     }
@@ -916,6 +922,12 @@ ${conversationText}
    * 获取所有 FAQs
    */
   getFAQs(filter?: { category?: string }): FAQRecord[] {
+    const { records, changed } = this.normalizeFAQRecords(this.faqs);
+    if (changed) {
+      this.faqs = records;
+      this.saveFAQs();
+      logger.warn('项目知识库.FAQ.已自动清理(访问时)', { count: this.faqs.length }, LogCategory.SESSION);
+    }
     if (!filter) {
       return this.faqs;
     }
@@ -1055,8 +1067,15 @@ ${conversationText}
 
     try {
       const content = fs.readFileSync(filePath, 'utf-8');
-      this.adrs = JSON.parse(content);
-      logger.info('项目知识库.ADR.已加载', { count: this.adrs.length }, LogCategory.SESSION);
+      const raw = JSON.parse(content);
+      const { records, changed } = this.normalizeADRRecords(raw);
+      this.adrs = records;
+      if (changed) {
+        this.saveADRs();
+        logger.warn('项目知识库.ADR.已自动清理', { count: this.adrs.length }, LogCategory.SESSION);
+      } else {
+        logger.info('项目知识库.ADR.已加载', { count: this.adrs.length }, LogCategory.SESSION);
+      }
     } catch (error) {
       logger.error('项目知识库.ADR.加载失败', { error }, LogCategory.SESSION);
     }
@@ -1086,10 +1105,133 @@ ${conversationText}
 
     try {
       const content = fs.readFileSync(filePath, 'utf-8');
-      this.faqs = JSON.parse(content);
-      logger.info('项目知识库.FAQ.已加载', { count: this.faqs.length }, LogCategory.SESSION);
+      const raw = JSON.parse(content);
+      const { records, changed } = this.normalizeFAQRecords(raw);
+      this.faqs = records;
+      if (changed) {
+        this.saveFAQs();
+        logger.warn('项目知识库.FAQ.已自动清理', { count: this.faqs.length }, LogCategory.SESSION);
+      } else {
+        logger.info('项目知识库.FAQ.已加载', { count: this.faqs.length }, LogCategory.SESSION);
+      }
     } catch (error) {
       logger.error('项目知识库.FAQ.加载失败', { error }, LogCategory.SESSION);
     }
+  }
+
+  private normalizeADRRecords(raw: unknown): { records: ADRRecord[]; changed: boolean } {
+    const now = Date.now();
+    if (!Array.isArray(raw)) {
+      return { records: [], changed: true };
+    }
+    let changed = false;
+    const records: ADRRecord[] = [];
+    raw.forEach((item, index) => {
+      if (!item || typeof item !== 'object') {
+        changed = true;
+        return;
+      }
+      const title = typeof (item as any).title === 'string' ? (item as any).title.trim() : '';
+      if (!title) {
+        changed = true;
+        return;
+      }
+      const status = (item as any).status;
+      const normalizedStatus: ADRStatus = status === 'accepted' || status === 'deprecated' || status === 'superseded'
+        ? status
+        : 'proposed';
+      if (normalizedStatus !== status) changed = true;
+
+      const dateValue = typeof (item as any).date === 'number' ? (item as any).date : now;
+      if (dateValue !== (item as any).date) changed = true;
+
+      const context = typeof (item as any).context === 'string' ? (item as any).context : '';
+      const decision = typeof (item as any).decision === 'string' ? (item as any).decision : '';
+      const consequences = typeof (item as any).consequences === 'string' ? (item as any).consequences : '';
+      if (context !== (item as any).context || decision !== (item as any).decision || consequences !== (item as any).consequences) {
+        changed = true;
+      }
+
+      const alternatives = Array.isArray((item as any).alternatives)
+        ? (item as any).alternatives.filter((value: unknown) => typeof value === 'string')
+        : [];
+      const relatedFiles = Array.isArray((item as any).relatedFiles)
+        ? (item as any).relatedFiles.filter((value: unknown) => typeof value === 'string')
+        : [];
+      if (alternatives.length !== ((item as any).alternatives || []).length || relatedFiles.length !== ((item as any).relatedFiles || []).length) {
+        changed = true;
+      }
+
+      records.push({
+        id: typeof (item as any).id === 'string' && (item as any).id ? (item as any).id : `adr-${now}-${index}`,
+        title,
+        date: dateValue,
+        status: normalizedStatus,
+        context,
+        decision,
+        consequences,
+        alternatives,
+        relatedFiles,
+      });
+      if (!((item as any).id)) changed = true;
+    });
+    return { records, changed };
+  }
+
+  private normalizeFAQRecords(raw: unknown): { records: FAQRecord[]; changed: boolean } {
+    const now = Date.now();
+    if (!Array.isArray(raw)) {
+      return { records: [], changed: true };
+    }
+    let changed = false;
+    const records: FAQRecord[] = [];
+    raw.forEach((item, index) => {
+      if (!item || typeof item !== 'object') {
+        changed = true;
+        return;
+      }
+      const question = typeof (item as any).question === 'string' ? (item as any).question.trim() : '';
+      if (!question) {
+        changed = true;
+        return;
+      }
+      const answer = typeof (item as any).answer === 'string' ? (item as any).answer : '';
+      const category = typeof (item as any).category === 'string' ? (item as any).category : 'general';
+      const tags = Array.isArray((item as any).tags)
+        ? (item as any).tags.filter((value: unknown) => typeof value === 'string')
+        : [];
+      const relatedFiles = Array.isArray((item as any).relatedFiles)
+        ? (item as any).relatedFiles.filter((value: unknown) => typeof value === 'string')
+        : [];
+      const createdAt = typeof (item as any).createdAt === 'number' ? (item as any).createdAt : now;
+      const updatedAt = typeof (item as any).updatedAt === 'number' ? (item as any).updatedAt : now;
+      const useCount = typeof (item as any).useCount === 'number' ? (item as any).useCount : 0;
+
+      if (
+        answer !== (item as any).answer ||
+        category !== (item as any).category ||
+        tags.length !== ((item as any).tags || []).length ||
+        relatedFiles.length !== ((item as any).relatedFiles || []).length ||
+        createdAt !== (item as any).createdAt ||
+        updatedAt !== (item as any).updatedAt ||
+        useCount !== (item as any).useCount
+      ) {
+        changed = true;
+      }
+
+      records.push({
+        id: typeof (item as any).id === 'string' && (item as any).id ? (item as any).id : `faq-${now}-${index}`,
+        question,
+        answer,
+        category,
+        tags,
+        relatedFiles,
+        createdAt,
+        updatedAt,
+        useCount,
+      });
+      if (!((item as any).id)) changed = true;
+    });
+    return { records, changed };
   }
 }

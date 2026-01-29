@@ -10,9 +10,12 @@
   import SettingsPanel from './components/SettingsPanel.svelte';
   import SkillPopup from './components/SkillPopup.svelte';
   import ToastContainer from './components/ToastContainer.svelte';
+  import MarkdownContent from './components/MarkdownContent.svelte';
+  import { vscode } from './lib/vscode-bridge';
+  import { getState, setCurrentTopTab, setIsProcessing } from './stores/messages.svelte';
 
   // 当前激活的顶部 Tab
-  let activeTopTab = $state<'thread' | 'tasks' | 'edits' | 'knowledge'>('thread');
+  const appState = getState();
 
   // 设置面板是否打开
   let settingsOpen = $state(false);
@@ -20,8 +23,20 @@
   // 技能弹窗是否打开
   let skillPopupOpen = $state(false);
 
+  // 交互输入
+  let questionAnswer = $state('');
+  let clarificationAnswer = $state('');
+  let workerQuestionAnswer = $state('');
+
+  const pendingConfirmation = $derived(appState.pendingConfirmation);
+  const pendingRecovery = $derived(appState.pendingRecovery);
+  const pendingQuestion = $derived(appState.pendingQuestion);
+  const pendingClarification = $derived(appState.pendingClarification);
+  const pendingWorkerQuestion = $derived(appState.pendingWorkerQuestion);
+  const pendingToolAuthorization = $derived(appState.pendingToolAuthorization);
+
   function handleTabChange(tab: 'thread' | 'tasks' | 'edits' | 'knowledge') {
-    activeTopTab = tab;
+    setCurrentTopTab(tab);
   }
 
   function openSettings() {
@@ -40,20 +55,66 @@
     skillPopupOpen = false;
   }
 
+  function confirmPlan(confirmed: boolean) {
+    vscode.postMessage({ type: 'confirmPlan', confirmed });
+    appState.pendingConfirmation = null;
+    if (confirmed) setIsProcessing(true);
+  }
+
+  function confirmRecovery(decision: 'retry' | 'rollback' | 'continue') {
+    vscode.postMessage({ type: 'confirmRecovery', decision });
+    appState.pendingRecovery = null;
+    setIsProcessing(true);
+  }
+
+  function submitQuestion(cancelled = false) {
+    const answer = cancelled ? null : (questionAnswer.trim() || null);
+    vscode.postMessage({ type: 'answerQuestions', answer });
+    appState.pendingQuestion = null;
+    questionAnswer = '';
+    if (!cancelled) setIsProcessing(true);
+  }
+
+  function submitClarification(cancelled = false) {
+    const answer = cancelled ? null : (clarificationAnswer.trim() || '');
+    vscode.postMessage({
+      type: 'answerClarification',
+      answers: cancelled ? null : { _userResponse: answer },
+      additionalInfo: answer,
+    });
+    appState.pendingClarification = null;
+    clarificationAnswer = '';
+    if (!cancelled) setIsProcessing(true);
+  }
+
+  function submitWorkerQuestion(cancelled = false) {
+    const answer = cancelled ? null : (workerQuestionAnswer.trim() || '');
+    vscode.postMessage({ type: 'answerWorkerQuestion', answer });
+    appState.pendingWorkerQuestion = null;
+    workerQuestionAnswer = '';
+    if (!cancelled) setIsProcessing(true);
+  }
+
+  function respondToolAuthorization(allowed: boolean) {
+    vscode.postMessage({ type: 'toolAuthorizationResponse', allowed });
+    appState.pendingToolAuthorization = null;
+    if (allowed) setIsProcessing(true);
+  }
+
   // 初始化状态
   onMount(() => {
     initializeState();
     console.log('[App] Svelte webview 已初始化');
 
-    // 监听打开技能弹窗的消息
-    const handler = (event: MessageEvent) => {
-      const msg = event.data;
-      if (msg.type === 'openSkillPopup') {
-        skillPopupOpen = true;
-      }
+    // 监听从 InputArea 发来的自定义事件
+    const customEventHandler = () => {
+      skillPopupOpen = true;
     };
-    window.addEventListener('message', handler);
-    return () => window.removeEventListener('message', handler);
+    window.addEventListener('openSkillPopup', customEventHandler);
+
+    return () => {
+      window.removeEventListener('openSkillPopup', customEventHandler);
+    };
   });
 </script>
 
@@ -62,17 +123,17 @@
   <Header onOpenSettings={openSettings} />
 
   <!-- 顶部 Tab 栏：对话/任务/变更/知识 -->
-  <TopTabs {activeTopTab} onTabChange={handleTabChange} />
+  <TopTabs activeTopTab={appState.currentTopTab} onTabChange={handleTabChange} />
 
   <!-- Tab 内容区域 -->
   <div class="tab-content-wrapper">
-    {#if activeTopTab === 'thread'}
+    {#if appState.currentTopTab === 'thread'}
       <ThreadPanel />
-    {:else if activeTopTab === 'tasks'}
+    {:else if appState.currentTopTab === 'tasks'}
       <TasksPanel />
-    {:else if activeTopTab === 'edits'}
+    {:else if appState.currentTopTab === 'edits'}
       <EditsPanel />
-    {:else if activeTopTab === 'knowledge'}
+    {:else if appState.currentTopTab === 'knowledge'}
       <KnowledgePanel />
     {/if}
   </div>
@@ -84,6 +145,131 @@
 
   <!-- 技能弹窗 -->
   <SkillPopup visible={skillPopupOpen} onClose={closeSkillPopup} />
+
+  {#if pendingConfirmation}
+    <div class="modal-overlay" role="presentation">
+      <div class="modal-dialog plan-confirm-dialog" role="dialog" aria-modal="true" tabindex="-1">
+        <div class="modal-header">
+          <h3>执行计划确认</h3>
+        </div>
+        <div class="modal-body">
+          {#if pendingConfirmation.formattedPlan}
+            <MarkdownContent content={pendingConfirmation.formattedPlan} />
+          {:else}
+            <p>需要确认执行计划，是否继续？</p>
+          {/if}
+        </div>
+        <div class="modal-footer">
+          <button class="modal-btn secondary" onclick={() => confirmPlan(false)}>取消</button>
+          <button class="modal-btn primary" onclick={() => confirmPlan(true)}>确认执行</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if pendingRecovery}
+    <div class="modal-overlay" role="presentation">
+      <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
+        <div class="modal-header">
+          <h3>恢复策略确认</h3>
+        </div>
+        <div class="modal-body">
+          <p>任务执行失败，需要选择恢复策略：</p>
+          {#if pendingRecovery.error}
+            <pre class="modal-pre">{String(pendingRecovery.error)}</pre>
+          {/if}
+        </div>
+        <div class="modal-footer">
+          <button class="modal-btn secondary" onclick={() => confirmRecovery('continue')}>继续</button>
+          <button class="modal-btn secondary" disabled={!pendingRecovery.canRollback} onclick={() => confirmRecovery('rollback')}>回滚</button>
+          <button class="modal-btn primary" disabled={!pendingRecovery.canRetry} onclick={() => confirmRecovery('retry')}>重试</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if pendingQuestion}
+    <div class="modal-overlay" role="presentation">
+      <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
+        <div class="modal-header">
+          <h3>需要补充信息</h3>
+        </div>
+        <div class="modal-body">
+          <ol class="question-list">
+            {#each pendingQuestion.questions as q}
+              <li>{q}</li>
+            {/each}
+          </ol>
+          <textarea class="modal-textarea" bind:value={questionAnswer} placeholder="请输入补充信息..."></textarea>
+        </div>
+        <div class="modal-footer">
+          <button class="modal-btn secondary" onclick={() => submitQuestion(true)}>取消</button>
+          <button class="modal-btn primary" onclick={() => submitQuestion(false)}>提交</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if pendingClarification}
+    <div class="modal-overlay" role="presentation">
+      <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
+        <div class="modal-header">
+          <h3>澄清问题</h3>
+        </div>
+        <div class="modal-body">
+          {#if pendingClarification.context}
+            <div class="modal-context">{pendingClarification.context}</div>
+          {/if}
+          <ol class="question-list">
+            {#each pendingClarification.questions as q}
+              <li>{q}</li>
+            {/each}
+          </ol>
+          <textarea class="modal-textarea" bind:value={clarificationAnswer} placeholder="请输入补充信息..."></textarea>
+        </div>
+        <div class="modal-footer">
+          <button class="modal-btn secondary" onclick={() => submitClarification(true)}>取消</button>
+          <button class="modal-btn primary" onclick={() => submitClarification(false)}>提交</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if pendingWorkerQuestion}
+    <div class="modal-overlay" role="presentation">
+      <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
+        <div class="modal-header">
+          <h3>{pendingWorkerQuestion.workerId} 提问</h3>
+        </div>
+        <div class="modal-body">
+          <p>{pendingWorkerQuestion.question}</p>
+          <textarea class="modal-textarea" bind:value={workerQuestionAnswer} placeholder="请输入回答..."></textarea>
+        </div>
+        <div class="modal-footer">
+          <button class="modal-btn secondary" onclick={() => submitWorkerQuestion(true)}>取消</button>
+          <button class="modal-btn primary" onclick={() => submitWorkerQuestion(false)}>提交</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if pendingToolAuthorization}
+    <div class="modal-overlay" role="presentation">
+      <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
+        <div class="modal-header">
+          <h3>工具授权请求</h3>
+        </div>
+        <div class="modal-body">
+          <p>工具: <strong>{pendingToolAuthorization.toolName}</strong></p>
+          <pre class="modal-pre">{JSON.stringify(pendingToolAuthorization.toolArgs, null, 2)}</pre>
+        </div>
+        <div class="modal-footer">
+          <button class="modal-btn secondary" onclick={() => respondToolAuthorization(false)}>拒绝</button>
+          <button class="modal-btn primary" onclick={() => respondToolAuthorization(true)}>允许</button>
+        </div>
+      </div>
+    </div>
+  {/if}
 
   <!-- Toast 通知容器 -->
   <ToastContainer />
@@ -105,5 +291,103 @@
     display: flex;
     flex-direction: column;
   }
-</style>
 
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: var(--overlay);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: var(--z-modal);
+  }
+
+  .modal-dialog {
+    width: 520px;
+    max-width: 92vw;
+    max-height: 80vh;
+    background: var(--background);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xl);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    box-shadow: var(--shadow-xl);
+  }
+
+  .plan-confirm-dialog {
+    width: 720px;
+  }
+
+  .modal-header {
+    padding: var(--space-4);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .modal-body {
+    padding: var(--space-4);
+    overflow-y: auto;
+  }
+
+  .modal-footer {
+    padding: var(--space-3) var(--space-4);
+    border-top: 1px solid var(--border);
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+  }
+
+  .modal-btn {
+    height: var(--btn-height-md);
+    padding: 0 var(--space-4);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border);
+    background: var(--surface-1);
+    color: var(--foreground);
+    cursor: pointer;
+  }
+
+  .modal-btn.primary {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: white;
+  }
+
+  .modal-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .modal-textarea {
+    width: 100%;
+    min-height: 120px;
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-1);
+    color: var(--foreground);
+    resize: vertical;
+  }
+
+  .modal-pre {
+    white-space: pre-wrap;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: var(--space-2);
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+  }
+
+  .question-list {
+    margin: 0 0 var(--space-3);
+    padding-left: var(--space-4);
+    color: var(--foreground);
+  }
+
+  .modal-context {
+    margin-bottom: var(--space-2);
+    color: var(--foreground-muted);
+    font-size: var(--text-sm);
+  }
+</style>

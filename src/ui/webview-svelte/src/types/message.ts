@@ -6,7 +6,13 @@
 export type MessageRole = 'user' | 'assistant' | 'system';
 
 // 消息来源
-export type MessageSource = 'orchestrator' | 'claude' | 'codex' | 'gemini';
+export type MessageSource = 'orchestrator' | 'claude' | 'codex' | 'gemini' | 'system';
+
+// 消息类型
+export type MessageType = 'message' | 'system-notice' | 'tool_call' | 'plan_confirmation' | 'question_request';
+
+// 通知类型
+export type NoticeType = 'info' | 'success' | 'warning' | 'error';
 
 // 工具调用状态
 export type ToolCallStatus = 'pending' | 'running' | 'success' | 'error';
@@ -48,10 +54,14 @@ export interface Message {
   timestamp: number;
   isStreaming: boolean;       // 是否正在流式输出
   isComplete: boolean;        // 是否已完成
+  type?: MessageType;         // 消息类型（notice = 系统通知）
+  noticeType?: NoticeType;    // 通知类型（info/success/warning/error）
   metadata?: {
     model?: string;
     tokens?: number;
     duration?: number;
+    worker?: string;        // Worker 类型（orchestrator, coder, reviewer 等）
+    filePath?: string;      // 相关文件路径
     [key: string]: unknown;
   };
 }
@@ -82,7 +92,7 @@ export interface ProcessingActor {
 }
 
 // Tab 类型
-export type TabType = 'thread' | 'claude' | 'codex' | 'gemini' | 'settings' | 'knowledge';
+export type TabType = 'thread' | 'claude' | 'codex' | 'gemini' | 'settings' | 'knowledge' | 'tasks' | 'edits';
 
 // 滚动位置映射
 export interface ScrollPositions {
@@ -121,4 +131,3 @@ export interface WebviewPersistedState {
   scrollPositions: ScrollPositions;
   autoScrollEnabled: AutoScrollConfig;
 }
-

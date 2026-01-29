@@ -5,6 +5,7 @@
   import PhaseIndicator from './PhaseIndicator.svelte';
   import BottomTabs from './BottomTabs.svelte';
   import AgentTab from './AgentTab.svelte';
+  import { ensureArray } from '../lib/utils';
 
   const appState = getState();
 
@@ -16,15 +17,19 @@
   }
 
   // 获取消息列表
-  const messages = $derived(appState.threadMessages || []);
-  const agentOutputs = $derived(appState.agentOutputs || { claude: [], codex: [], gemini: [] });
+  const messages = $derived(ensureArray(appState.threadMessages));
+  const agentOutputs = $derived({
+    claude: ensureArray(appState.agentOutputs?.claude),
+    codex: ensureArray(appState.agentOutputs?.codex),
+    gemini: ensureArray(appState.agentOutputs?.gemini),
+  });
 </script>
 
 <div class="thread-panel">
   <!-- 阶段进度指示器 -->
   <PhaseIndicator />
 
-  <!-- 消息内容区域 -->
+  <!-- 消息内容区域（使用 position: relative 让滚动按钮相对于消息区域定位） -->
   <div class="main-content">
     {#if activeBottomTab === 'thread'}
       <MessageList {messages} />
@@ -50,8 +55,7 @@
 
   .main-content {
     flex: 1;
-    overflow-y: auto;
-    overflow-x: hidden;
+    overflow: hidden;
+    position: relative;
   }
 </style>
-

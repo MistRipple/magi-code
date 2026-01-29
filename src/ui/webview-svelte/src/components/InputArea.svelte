@@ -1,8 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
-  import { getState } from '../stores/messages.svelte';
+  import { getState, addThreadMessage } from '../stores/messages.svelte';
   import Icon from './Icon.svelte';
+  import { generateId } from '../lib/utils';
 
   const appState = getState();
 
@@ -14,9 +15,12 @@
   let interactionMode = $state<'ask' | 'auto'>('auto');
 
   // 拖动调整大小相关
-  let inputHeight = $state(80);
-  const minHeight = 60;
-  const maxHeight = 300;
+  let inputHeight = $state(120); // 默认高度增加到 120px
+  const minHeight = 80;
+  const maxHeight = 400;
+
+  // 增强按钮状态
+  let isEnhancing = $state(false);
 
   // 是否正在发送
   const isSending = $derived(appState.isProcessing);
@@ -26,11 +30,22 @@
     const content = inputValue.trim();
     if (!content || isSending) return;
 
-    vscode.postMessage({
-      type: 'sendMessage',
+    addThreadMessage({
+      id: generateId(),
+      role: 'user',
+      source: 'orchestrator',
       content,
-      model: selectedModel || undefined,
+      timestamp: Date.now(),
+      isStreaming: false,
+      isComplete: true,
+    });
+
+    vscode.postMessage({
+      type: 'executeTask',
+      prompt: content,
       mode: interactionMode,
+      agent: selectedModel || undefined,
+      requestId: generateId(),
     });
 
     inputValue = '';
@@ -46,18 +61,14 @@
 
   // 停止任务
   function stopTask() {
-    vscode.postMessage({ type: 'stopTask' });
-  }
-
-  // 打开技能弹窗
-  function openSkillPopup() {
-    vscode.postMessage({ type: 'openSkillPopup' });
+    vscode.postMessage({ type: 'interruptTask' });
   }
 
   // 增强提示词
-  function enhancePrompt() {
+  async function enhancePrompt() {
     const content = inputValue.trim();
-    if (!content) return;
+    if (!content || isEnhancing) return;
+    isEnhancing = true;
     vscode.postMessage({ type: 'enhancePrompt', content });
   }
 
@@ -86,14 +97,25 @@
     document.addEventListener('mouseup', onMouseUp);
   }
 
+  // 打开技能弹窗
+  function openSkillPopup() {
+    window.dispatchEvent(new CustomEvent('openSkillPopup'));
+  }
+
   onMount(() => {
     // 监听增强结果
-    window.addEventListener('message', (event) => {
+    const handler = (event: MessageEvent) => {
       const msg = event.data;
-      if (msg.type === 'enhancedPrompt' && msg.content) {
-        inputValue = msg.content;
+      if (msg.type === 'promptEnhanced') {
+        const enhancedPrompt = typeof msg.enhancedPrompt === 'string' ? msg.enhancedPrompt : '';
+        if (enhancedPrompt) {
+          inputValue = enhancedPrompt;
+        }
+        isEnhancing = false;
       }
-    });
+    };
+    window.addEventListener('message', handler);
+    return () => window.removeEventListener('message', handler);
   });
 </script>
 
@@ -115,7 +137,7 @@
       <div class="input-actions-left">
         <!-- 技能按钮 -->
         <button class="icon-btn" onclick={openSkillPopup} title="使用 Skill">
-          <Icon name="skill" size={14} />
+          <Icon name="skill" size={16} />
         </button>
 
         <!-- 模型选择器 -->
@@ -143,9 +165,17 @@
 
       <div class="input-actions-right">
         <!-- 增强按钮 -->
-        <button class="enhance-btn" onclick={enhancePrompt} title="增强提示 (AI 优化)" disabled={!inputValue.trim()}>
-          <Icon name="enhance" size={12} />
-          <span class="enhance-text">增强</span>
+        <button
+          class="enhance-btn"
+          class:enhancing={isEnhancing}
+          onclick={enhancePrompt}
+          title="增强提示 (AI 优化)"
+          disabled={!inputValue.trim() || isEnhancing}
+        >
+          <span class="enhance-icon" class:spinning={isEnhancing}>
+            <Icon name={isEnhancing ? 'loader' : 'enhance'} size={12} />
+          </span>
+          <span class="enhance-text">{isEnhancing ? '增强中...' : '增强'}</span>
         </button>
 
         <!-- 发送/停止按钮 -->
@@ -154,7 +184,13 @@
             <Icon name="stop" size={14} />
           </button>
         {:else}
-          <button class="send-btn" onclick={sendMessage} disabled={!inputValue.trim()} title="发送 (Cmd+Enter)">
+          <button
+            class="send-btn"
+            class:ready={inputValue.trim()}
+            onclick={sendMessage}
+            disabled={!inputValue.trim()}
+            title="发送 (Cmd+Enter)"
+          >
             <Icon name="send" size={14} />
           </button>
         {/if}
@@ -167,8 +203,9 @@
 <style>
   .input-container {
     flex-shrink: 0;
-    padding: var(--space-4);
+    padding: var(--space-3) var(--space-4);
     background: var(--background);
+    border-top: 1px solid var(--border);
   }
 
   .input-wrapper {
@@ -177,47 +214,55 @@
     background: var(--vscode-input-background, #3c3c3c);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
-    transition: border-color var(--transition-fast);
+    transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
     overflow: hidden;
   }
 
   .input-wrapper:focus-within {
     border-color: var(--primary);
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.1);
   }
 
   .input-resize-bar {
-    height: 6px;
+    height: 8px;
     cursor: ns-resize;
     background: transparent;
     border-bottom: 1px solid var(--border-subtle);
     transition: background var(--transition-fast);
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
 
-  .input-resize-bar:hover {
-    background: var(--surface-hover);
+  .input-resize-bar::after {
+    content: '';
+    width: 32px;
+    height: 3px;
+    background: var(--border);
+    border-radius: 2px;
+    opacity: 0;
+    transition: opacity var(--transition-fast);
   }
+
+  .input-resize-bar:hover { background: var(--surface-hover); }
+  .input-resize-bar:hover::after { opacity: 1; }
 
   .input-box {
     flex: 1;
     width: 100%;
     padding: var(--space-3) var(--space-4);
     font-size: var(--text-base);
-    line-height: var(--leading-normal);
+    line-height: var(--leading-relaxed);
     resize: none;
     border: none;
     background: transparent;
     color: var(--foreground);
     outline: none;
+    font-family: inherit;
   }
 
-  .input-box::placeholder {
-    color: var(--foreground-muted);
-  }
-
-  .input-box:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
+  .input-box::placeholder { color: var(--foreground-muted); }
+  .input-box:disabled { opacity: 0.5; cursor: not-allowed; }
 
   .input-actions {
     display: flex;
@@ -226,60 +271,37 @@
     padding: var(--space-2) var(--space-3);
     border-top: 1px solid var(--border-subtle);
     background: var(--surface-1);
+    gap: var(--space-2);
   }
 
-  .input-actions-left,
-  .input-actions-right {
+  .input-actions-left, .input-actions-right {
     display: flex;
     align-items: center;
     gap: var(--space-2);
   }
 
-  .icon-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: var(--btn-height-md);
-    height: var(--btn-height-md);
-    padding: 0;
-    background: transparent;
-    border: none;
-    border-radius: var(--radius-sm);
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: all var(--transition-fast);
-  }
-
-  .icon-btn:hover {
-    background: var(--surface-hover);
-    color: var(--foreground);
-  }
-
   .model-selector {
     height: var(--btn-height-sm);
     padding: 0 var(--space-3);
-    font-size: var(--text-sm);
+    font-size: var(--text-xs);
     background: transparent;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     color: var(--foreground);
     cursor: pointer;
   }
-
-  .model-selector:focus {
-    outline: none;
-    border-color: var(--primary);
-  }
+  .model-selector:focus { outline: none; border-color: var(--primary); }
 
   .mode-toggle {
     display: flex;
     background: var(--surface-2);
     border-radius: var(--radius-sm);
     overflow: hidden;
+    border: 1px solid var(--border);
   }
 
   .mode-toggle-option {
-    padding: var(--space-2) var(--space-3);
+    padding: var(--space-1) var(--space-3);
     font-size: var(--text-xs);
     font-weight: var(--font-medium);
     background: transparent;
@@ -288,24 +310,17 @@
     cursor: pointer;
     transition: all var(--transition-fast);
   }
+  .mode-toggle-option.active { background: var(--primary); color: white; }
+  .mode-toggle-option:hover:not(.active) { background: var(--surface-hover); color: var(--foreground); }
 
-  .mode-toggle-option.active {
-    background: var(--primary);
-    color: white;
-  }
-
-  .mode-toggle-option:hover:not(.active) {
-    background: var(--surface-hover);
-    color: var(--foreground);
-  }
-
+  /* 增强按钮 */
   .enhance-btn {
     display: flex;
     align-items: center;
-    gap: var(--space-2);
+    gap: var(--space-1);
     height: var(--btn-height-sm);
     padding: 0 var(--space-3);
-    font-size: var(--text-sm);
+    font-size: var(--text-xs);
     background: transparent;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
@@ -313,51 +328,53 @@
     cursor: pointer;
     transition: all var(--transition-fast);
   }
+  .enhance-btn:hover:not(:disabled) { background: var(--surface-hover); color: var(--foreground); border-color: var(--primary); }
+  .enhance-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .enhance-btn.enhancing { border-color: var(--info); color: var(--info); }
+  .enhance-icon { display: flex; }
+  .enhance-icon.spinning { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .enhance-text { font-weight: var(--font-medium); }
 
-  .enhance-btn:hover:not(:disabled) {
-    background: var(--surface-hover);
-    color: var(--foreground);
-    border-color: var(--primary);
-  }
-
-  .enhance-btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
-
-  .enhance-text {
-    font-weight: var(--font-medium);
-  }
-
+  /* 发送按钮 */
   .send-btn {
     display: flex;
     align-items: center;
     justify-content: center;
-    width: var(--btn-height-lg);
-    height: var(--btn-height-lg);
+    width: 36px;
+    height: 36px;
     padding: 0;
-    background: var(--primary);
-    border: none;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    color: white;
+    color: var(--foreground-muted);
     cursor: pointer;
     transition: all var(--transition-fast);
   }
+  .send-btn.ready { background: var(--primary); border-color: var(--primary); color: white; }
+  .send-btn.ready:hover { background: var(--primary-hover); transform: scale(1.05); }
+  .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .send-btn.stop { background: var(--error); border-color: var(--error); color: white; animation: pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
 
-  .send-btn:hover:not(:disabled) {
-    background: var(--primary-hover);
+  /* 图标按钮 */
+  .icon-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--foreground-muted);
+    cursor: pointer;
+    transition: all var(--transition-fast);
   }
-
-  .send-btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
-
-  .send-btn.stop {
-    background: var(--error);
-  }
-
-  .send-btn.stop:hover {
-    opacity: 0.9;
+  .icon-btn:hover {
+    background: var(--surface-hover);
+    color: var(--foreground);
+    border-color: var(--primary);
   }
 </style>

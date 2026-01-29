@@ -15,6 +15,7 @@ import type {
   WebviewPersistedState,
 } from '../types/message';
 import { vscode } from '../lib/vscode-bridge';
+import { ensureArray } from '../lib/utils';
 
 // ============ 状态定义 ============
 
@@ -63,6 +64,37 @@ let autoScrollEnabled = $state<AutoScrollConfig>({
 const MAX_THREAD_MESSAGES = 500;
 const MAX_AGENT_MESSAGES = 200;
 
+const MAX_PERSISTED_ARRAY_LENGTH = 10000;
+
+function isValidPersistedArray(value: unknown, max: number): value is unknown[] {
+  if (!Array.isArray(value)) return false;
+  const length = value.length;
+  if (!Number.isFinite(length) || length < 0 || length > max) return false;
+  return true;
+}
+
+function resetPersistedState() {
+  currentTopTab = 'thread';
+  currentBottomTab = 'thread';
+  threadMessages = [];
+  agentOutputs = { claude: [], codex: [], gemini: [] };
+  sessions = [];
+  currentSessionId = null;
+  scrollPositions = { thread: 0, claude: 0, codex: 0, gemini: 0 };
+  autoScrollEnabled = { thread: true, claude: true, codex: true, gemini: true };
+  vscode.setState(null);
+}
+
+function isValidMessageSource(message: Message | null | undefined): boolean {
+  if (!message || typeof message !== 'object') return false;
+  const source = (message as Message).source;
+  return typeof source === 'string' && source.length > 0;
+}
+
+function hasInvalidMessageSource(messages: Message[]): boolean {
+  return messages.some((msg) => !isValidMessageSource(msg));
+}
+
 // 新增状态：任务、变更、阶段、Toast、模型状态
 let tasks = $state<Array<{ id: string; name: string; description?: string; status: string }>>([]);
 let edits = $state<Array<{ path: string; type?: string; additions?: number; deletions?: number }>>([]);
@@ -73,6 +105,14 @@ let modelStatus = $state<Record<string, string>>({
   codex: 'unavailable',
   gemini: 'unavailable',
 });
+
+// 交互请求状态
+let pendingConfirmation = $state<{ plan: unknown; formattedPlan?: string } | null>(null);
+let pendingRecovery = $state<{ taskId: string; error: unknown; canRetry: boolean; canRollback: boolean } | null>(null);
+let pendingQuestion = $state<{ questions: string[]; plan?: unknown } | null>(null);
+let pendingClarification = $state<{ questions: string[]; context?: string; ambiguityScore?: number; originalPrompt?: string } | null>(null);
+let pendingWorkerQuestion = $state<{ workerId: string; question: string; context?: string; options?: unknown } | null>(null);
+let pendingToolAuthorization = $state<{ toolName: string; toolArgs: unknown } | null>(null);
 
 // ============ 导出 Getter ============
 
@@ -101,6 +141,18 @@ export function getState() {
     set toasts(v) { toasts = v; },
     get modelStatus() { return modelStatus; },
     set modelStatus(v) { modelStatus = v; },
+    get pendingConfirmation() { return pendingConfirmation; },
+    set pendingConfirmation(v) { pendingConfirmation = v; },
+    get pendingRecovery() { return pendingRecovery; },
+    set pendingRecovery(v) { pendingRecovery = v; },
+    get pendingQuestion() { return pendingQuestion; },
+    set pendingQuestion(v) { pendingQuestion = v; },
+    get pendingClarification() { return pendingClarification; },
+    set pendingClarification(v) { pendingClarification = v; },
+    get pendingWorkerQuestion() { return pendingWorkerQuestion; },
+    set pendingWorkerQuestion(v) { pendingWorkerQuestion = v; },
+    get pendingToolAuthorization() { return pendingToolAuthorization; },
+    set pendingToolAuthorization(v) { pendingToolAuthorization = v; },
   };
 }
 
@@ -152,7 +204,7 @@ export function setCurrentSessionId(id: string | null) {
 }
 
 export function updateSessions(newSessions: Session[]) {
-  sessions = [...newSessions];
+  sessions = ensureArray(newSessions) as Session[];
   saveWebviewState();
 }
 
@@ -178,14 +230,25 @@ export function setAppState(nextState: AppState | null) {
 
 // 消息操作
 export function addThreadMessage(message: Message) {
-  threadMessages = [...threadMessages, message];
+  // 完全重建数组以确保响应式更新
+  const safeMessage = JSON.parse(JSON.stringify(message)) as Message;
+  threadMessages = [...threadMessages, safeMessage];
   saveWebviewState();
 }
 
 export function updateThreadMessage(messageId: string, updates: Partial<Message>) {
   const index = threadMessages.findIndex((m) => m.id === messageId);
   if (index !== -1) {
-    threadMessages[index] = { ...threadMessages[index], ...updates };
+    // 必须完全重建数组，不能直接修改索引
+    // 使用 JSON 序列化确保脱离响应式代理
+    const safeUpdates = JSON.parse(JSON.stringify(updates)) as Partial<Message>;
+    const newMessages = threadMessages.map((msg, i) => {
+      if (i === index) {
+        return { ...msg, ...safeUpdates };
+      }
+      return msg;
+    });
+    threadMessages = newMessages;
     // 不触发保存，由流式管理器批量保存
   }
 }
@@ -199,14 +262,35 @@ export function clearThreadMessages() {
 export function initializeState() {
   const persisted = vscode.getState<WebviewPersistedState>();
   if (persisted) {
+    const validThread = isValidPersistedArray(persisted.threadMessages, MAX_PERSISTED_ARRAY_LENGTH);
+    const validClaude = isValidPersistedArray(persisted.agentOutputs?.claude, MAX_PERSISTED_ARRAY_LENGTH);
+    const validCodex = isValidPersistedArray(persisted.agentOutputs?.codex, MAX_PERSISTED_ARRAY_LENGTH);
+    const validGemini = isValidPersistedArray(persisted.agentOutputs?.gemini, MAX_PERSISTED_ARRAY_LENGTH);
+    const validSessions = isValidPersistedArray(persisted.sessions, MAX_PERSISTED_ARRAY_LENGTH);
+    if (!validThread || !validClaude || !validCodex || !validGemini || !validSessions) {
+      resetPersistedState();
+      return;
+    }
     currentTopTab = persisted.currentTopTab || 'thread';
     currentBottomTab = persisted.currentBottomTab || 'thread';
-    threadMessages = persisted.threadMessages || [];
-    agentOutputs = persisted.agentOutputs || { claude: [], codex: [], gemini: [] };
-    sessions = persisted.sessions || [];
+    threadMessages = ensureArray<Message>(persisted.threadMessages);
+    agentOutputs = {
+      claude: ensureArray<Message>(persisted.agentOutputs?.claude),
+      codex: ensureArray<Message>(persisted.agentOutputs?.codex),
+      gemini: ensureArray<Message>(persisted.agentOutputs?.gemini),
+    };
+    if (
+      hasInvalidMessageSource(threadMessages) ||
+      hasInvalidMessageSource(agentOutputs.claude) ||
+      hasInvalidMessageSource(agentOutputs.codex) ||
+      hasInvalidMessageSource(agentOutputs.gemini)
+    ) {
+      resetPersistedState();
+      return;
+    }
+    sessions = ensureArray<Session>(persisted.sessions);
     currentSessionId = persisted.currentSessionId || null;
     scrollPositions = persisted.scrollPositions || { thread: 0, claude: 0, codex: 0, gemini: 0 };
     autoScrollEnabled = persisted.autoScrollEnabled || { thread: true, claude: true, codex: true, gemini: true };
   }
 }
-

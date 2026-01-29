@@ -1,4 +1,8 @@
 <script lang="ts">
+  import Icon from './Icon.svelte';
+  import FileSpan from './FileSpan.svelte';
+  import { vscode } from '../lib/vscode-bridge';
+
   // Props
   interface Props {
     name: string;
@@ -9,6 +13,8 @@
     status?: 'pending' | 'running' | 'success' | 'error';
     duration?: number;
     initialExpanded?: boolean;
+    filepath?: string;
+    onOpenFile?: (filepath: string) => void;
   }
 
   let {
@@ -19,11 +25,14 @@
     error,
     status = 'success',
     duration,
-    initialExpanded = false
+    initialExpanded = false,
+    filepath,
+    onOpenFile
   }: Props = $props();
 
   // 折叠状态
   let collapsed = $state(true);
+  let copySuccess = $state(false);
 
   // 初始化
   $effect(() => {
@@ -41,15 +50,48 @@
     }
   }
 
+  // 获取工具图标
+  function getToolIcon(toolName: string): string {
+    if (!toolName || typeof toolName !== 'string') {
+      vscode.postMessage({
+        type: 'uiError',
+        component: 'ToolCall',
+        detail: { toolName, id, status },
+        stack: new Error('ToolCall: invalid toolName').stack,
+      });
+      throw new Error('ToolCall: invalid toolName');
+    }
+    const iconMap: Record<string, string> = {
+      'read_file': 'file-text',
+      'write_file': 'file-plus',
+      'edit_file': 'file-edit',
+      'delete_file': 'file-minus',
+      'list_files': 'folder',
+      'search': 'search',
+      'execute': 'terminal',
+      'bash': 'terminal',
+      'shell': 'terminal',
+      'git': 'git-branch',
+      'browser': 'globe',
+      'fetch': 'download',
+      'mcp': 'plug',
+    };
+    const lowerName = toolName.toLowerCase();
+    for (const [key, icon] of Object.entries(iconMap)) {
+      if (lowerName.includes(key)) return icon;
+    }
+    return 'tool';
+  }
+
   // 状态信息
   const statusInfo = $derived(() => {
-    const map: Record<string, { class: string; text: string }> = {
-      pending: { class: 'pending', text: '等待中' },
-      running: { class: 'running', text: '执行中' },
-      success: { class: 'success', text: '成功' },
-      error: { class: 'error', text: '失败' },
+    const map: Record<string, { class: string; text: string; icon: string }> = {
+      pending: { class: 'pending', text: '等待中', icon: 'clock' },
+      running: { class: 'running', text: '执行中', icon: 'loader' },
+      success: { class: 'success', text: '成功', icon: 'check' },
+      error: { class: 'error', text: '失败', icon: 'close' },
     };
-    return map[status] || { class: 'success', text: '完成' };
+    return map[status] || { class: 'success', text: '完成', icon: 'check' };
   });
 
   // 检查是否有内容
@@ -58,66 +100,101 @@
   const hasError = $derived(!!error && !!error.trim());
   const hasContent = $derived(hasInput || hasOutput || hasError);
 
+  const toolIcon = $derived(getToolIcon(name));
+
   function toggle() {
     collapsed = !collapsed;
+  }
+
+  async function copyOutput() {
+    const content = formatContent(output);
+    if (!content) return;
+    try {
+      await navigator.clipboard.writeText(content);
+      copySuccess = true;
+      setTimeout(() => { copySuccess = false; }, 2000);
+    } catch (e) {
+      console.error('复制失败:', e);
+    }
+  }
+
+  function handleOpenFile() {
+    if (filepath && onOpenFile) {
+      onOpenFile(filepath);
+    }
   }
 </script>
 
 {#if hasContent}
-  <div 
+  <div
     class="tool-call"
     class:collapsed
+    class:has-error={hasError}
     data-status={statusInfo().class}
   >
     <button class="tool-header" onclick={toggle}>
       <span class="chevron">
-        <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
-          <path d="M4.646 1.646a.5.5 0 0 1 .708 0l6 6a.5.5 0 0 1 0 .708l-6 6a.5.5 0 0 1-.708-.708L10.293 8 4.646 2.354a.5.5 0 0 1 0-.708z"/>
-        </svg>
+        <Icon name="chevron-right" size={12} />
       </span>
-      
-      <span class="tool-icon">🔧</span>
-      
+
+      <span class="tool-icon">
+        <Icon name={toolIcon} size={14} />
+      </span>
+
       <span class="tool-title">
         <span class="tool-name">{name || '工具调用'}</span>
-        {#if id}
+        {#if filepath}
+          <FileSpan {filepath} showIcon={false} clickable={!!onOpenFile} onClick={handleOpenFile} />
+        {:else if id}
           <span class="tool-id">#{id}</span>
         {/if}
       </span>
-      
+
       <span class="tool-status status-{statusInfo().class}">
         {#if status === 'running'}
           <span class="spinner"></span>
+        {:else}
+          <Icon name={statusInfo().icon} size={12} />
         {/if}
         {statusInfo().text}
       </span>
     </button>
-    
+
     {#if !collapsed}
       <div class="tool-content">
         {#if hasInput}
           <div class="tool-section">
-            <div class="section-label">输入</div>
+            <div class="section-header">
+              <span class="section-label">输入</span>
+            </div>
             <pre class="section-content">{formatContent(input)}</pre>
           </div>
         {/if}
-        
+
         {#if hasOutput}
           <div class="tool-section">
-            <div class="section-label">输出</div>
+            <div class="section-header">
+              <span class="section-label">输出</span>
+              <button class="copy-btn" onclick={copyOutput} title={copySuccess ? '已复制' : '复制输出'}>
+                <Icon name={copySuccess ? 'check' : 'copy'} size={12} />
+              </button>
+            </div>
             <pre class="section-content">{formatContent(output)}</pre>
           </div>
         {/if}
-        
+
         {#if hasError}
           <div class="tool-section error">
-            <div class="section-label">错误</div>
-            <pre class="section-content">{error}</pre>
+            <div class="section-header">
+              <span class="section-label">错误</span>
+            </div>
+            <pre class="section-content error-content">{error}</pre>
           </div>
         {/if}
-        
+
         {#if duration}
           <div class="tool-meta">
+            <Icon name="clock" size={12} />
             耗时: <strong>{(duration / 1000).toFixed(2)}s</strong>
           </div>
         {/if}
@@ -130,57 +207,64 @@
   .tool-call {
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    margin: var(--spacing-sm) 0;
+    margin: var(--space-2, 8px) 0;
     overflow: hidden;
+    background: var(--surface-1, rgba(255,255,255,0.02));
+  }
+
+  .tool-call.has-error {
+    border-color: var(--error);
   }
 
   .tool-header {
     display: flex;
     align-items: center;
-    gap: var(--spacing-sm);
+    gap: var(--space-2, 8px);
     width: 100%;
-    padding: var(--spacing-sm) var(--spacing-md);
-    background: var(--code-bg);
+    padding: var(--space-2, 8px) var(--space-3, 12px);
+    background: transparent;
+    border: none;
     text-align: left;
     cursor: pointer;
     transition: background var(--transition-fast);
   }
 
   .tool-header:hover {
-    background: var(--vscode-list-hoverBackground, rgba(255,255,255,0.05));
+    background: var(--surface-hover, rgba(255,255,255,0.05));
   }
 
   .chevron {
     display: flex;
+    color: var(--foreground-muted);
     transition: transform var(--transition-fast);
   }
 
-  .collapsed .chevron {
-    transform: rotate(0deg);
-  }
-
-  .tool-call:not(.collapsed) .chevron {
-    transform: rotate(90deg);
-  }
+  .collapsed .chevron { transform: rotate(0deg); }
+  .tool-call:not(.collapsed) .chevron { transform: rotate(90deg); }
 
   .tool-icon {
-    font-size: 14px;
+    display: flex;
+    color: var(--info);
   }
 
   .tool-title {
     flex: 1;
     display: flex;
     align-items: center;
-    gap: var(--spacing-xs);
+    gap: var(--space-2, 8px);
+    min-width: 0;
+    overflow: hidden;
   }
 
   .tool-name {
     font-weight: 500;
+    font-size: var(--text-sm, 13px);
+    white-space: nowrap;
   }
 
   .tool-id {
-    font-size: var(--font-size-sm);
-    color: var(--vscode-descriptionForeground, #888);
+    font-size: var(--text-xs, 11px);
+    color: var(--foreground-muted);
     opacity: 0.7;
   }
 
@@ -188,9 +272,10 @@
     display: flex;
     align-items: center;
     gap: 4px;
-    font-size: var(--font-size-sm);
+    font-size: var(--text-xs, 11px);
     padding: 2px 8px;
-    border-radius: var(--radius-sm);
+    border-radius: var(--radius-full);
+    background: rgba(255,255,255,0.05);
   }
 
   .status-pending { color: var(--warning); }
@@ -207,48 +292,82 @@
     animation: spin 1s linear infinite;
   }
 
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   .tool-content {
-    padding: var(--spacing-md);
+    padding: var(--space-3, 12px);
     border-top: 1px solid var(--border);
+    background: var(--surface-2, rgba(0,0,0,0.1));
+    animation: slideDown 0.2s ease-out;
+    transform-origin: top;
   }
 
-  .tool-section {
-    margin-bottom: var(--spacing-md);
+  @keyframes slideDown {
+    from { opacity: 0; max-height: 0; transform: translateY(-8px); }
+    to { opacity: 1; max-height: 500px; transform: translateY(0); }
   }
 
-  .tool-section:last-child {
-    margin-bottom: 0;
+  .tool-section { margin-bottom: var(--space-3, 12px); }
+  .tool-section:last-child { margin-bottom: 0; }
+
+  .section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: var(--space-1, 4px);
   }
 
   .section-label {
-    font-size: var(--font-size-sm);
-    color: var(--vscode-descriptionForeground, #888);
-    margin-bottom: var(--spacing-xs);
+    font-size: var(--text-xs, 11px);
+    color: var(--foreground-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .copy-btn {
+    display: flex;
+    align-items: center;
+    padding: 2px 6px;
+    background: transparent;
+    border: none;
+    color: var(--foreground-muted);
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: all var(--transition-fast);
+  }
+
+  .copy-btn:hover {
+    background: var(--surface-hover);
+    color: var(--foreground);
   }
 
   .section-content {
     font-family: var(--font-mono);
-    font-size: var(--font-size-sm);
-    background: var(--code-bg);
-    padding: var(--spacing-sm);
+    font-size: var(--text-xs, 11px);
+    background: var(--code-bg, rgba(0,0,0,0.2));
+    padding: var(--space-2, 8px);
     border-radius: var(--radius-sm);
     overflow-x: auto;
     margin: 0;
     white-space: pre-wrap;
     word-break: break-word;
+    max-height: 300px;
+    overflow-y: auto;
   }
 
-  .tool-section.error .section-content {
+  .error-content {
     color: var(--error);
+    background: rgba(239, 68, 68, 0.1);
   }
 
   .tool-meta {
-    font-size: var(--font-size-sm);
-    color: var(--vscode-descriptionForeground, #888);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: var(--text-xs, 11px);
+    color: var(--foreground-muted);
+    margin-top: var(--space-2, 8px);
+    padding-top: var(--space-2, 8px);
+    border-top: 1px dashed var(--border);
   }
 </style>
-

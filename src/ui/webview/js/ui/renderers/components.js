@@ -67,6 +67,31 @@ export function registerGlobalFunctions() {
       applyCodeBlockImpl(codeId);
     };
 
+    // 注册全局 togglePanel 函数，用于兼容旧代码
+    window.togglePanel = (panelId) => {
+      console.log('[Components] Global togglePanel called for', panelId);
+      // 1. 尝试通过ID查找
+      const element = document.getElementById(panelId) || document.querySelector(`[data-panel-id="${panelId}"]`);
+      if (element) {
+        // 判断是 unified-card 还是 thinking-panel
+        if (element.classList.contains('unified-card')) {
+          element.classList.toggle('collapsed');
+          const icon = element.querySelector('.collapsible-icon');
+          if (icon) icon.classList.toggle('expanded');
+          const content = element.querySelector('.collapsible-content');
+          if (content) content.classList.toggle('expanded');
+        } else if (element.classList.contains('thinking-panel')) {
+           // 思考面板通常有自己的 toggle 逻辑，但如果使用 unified-card 结构
+           element.classList.toggle('collapsed');
+        }
+        return;
+      }
+
+      // 2. 尝试查找最近的 collapsible-panel
+      // 这种情况通常是 onclick="togglePanel('xxx')" 绑定在 header 上，但 panelId 可能不直接对应 ID
+      // 这里只是一个 fallback
+    };
+
     // 设置事件委托处理面板切换
     setupPanelEventDelegation();
 

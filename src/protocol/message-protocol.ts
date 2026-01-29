@@ -32,7 +32,7 @@ export enum MessageType {
   /** 需要用户交互（确认/问题/权限） */
   INTERACTION = 'interaction',
   /** 系统通知 */
-  SYSTEM = 'system',
+  SYSTEM = 'system-notice',
   /** 工具调用 */
   TOOL_CALL = 'tool_call',
   /** 思考过程 */

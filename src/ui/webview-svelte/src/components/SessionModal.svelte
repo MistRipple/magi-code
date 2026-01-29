@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getState, setCurrentSessionId } from '../stores/messages.svelte';
+  import { ensureArray } from '../lib/utils';
   import { vscode } from '../lib/vscode-bridge';
   import Icon from './Icon.svelte';
 
@@ -15,7 +16,7 @@
 
   // 会话排序（最近的在前）
   const sortedSessions = $derived(
-    [...appState.sessions].sort((a, b) =>
+    [...ensureArray(appState.sessions)].sort((a, b) =>
       new Date(b.updatedAt || b.createdAt).getTime() -
       new Date(a.updatedAt || a.createdAt).getTime()
     )
@@ -23,19 +24,19 @@
 
   function selectSession(sessionId: string) {
     setCurrentSessionId(sessionId);
-    vscode.postMessage({ type: 'loadSession', sessionId });
+    vscode.postMessage({ type: 'switchSession', sessionId });
     onClose();
   }
 
   function createNewSession() {
-    vscode.postMessage({ type: 'createSession' });
+    vscode.postMessage({ type: 'newSession' });
     onClose();
   }
 
   function deleteSession(sessionId: string, event: MouseEvent) {
     event.stopPropagation();
     if (confirm('确定要删除这个会话吗？')) {
-      vscode.postMessage({ type: 'deleteSession', sessionId });
+      vscode.postMessage({ type: 'closeSession', sessionId });
     }
   }
 
@@ -265,4 +266,3 @@
     color: var(--error);
   }
 </style>
-

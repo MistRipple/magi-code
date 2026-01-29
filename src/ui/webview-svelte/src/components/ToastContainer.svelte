@@ -1,15 +1,16 @@
 <script lang="ts">
   import { getState } from '../stores/messages.svelte';
+  import { ensureArray } from '../lib/utils';
   import Icon from './Icon.svelte';
 
   const appState = getState();
 
   // Toast 列表
-  const toasts = $derived(appState.toasts || []);
+  const toasts = $derived(ensureArray(appState.toasts));
 
   // 移除 toast
   function removeToast(id: string) {
-    appState.toasts = (appState.toasts || []).filter(t => t.id !== id);
+    appState.toasts = ensureArray(appState.toasts).filter(t => t.id !== id);
   }
 </script>
 
@@ -131,4 +132,3 @@
     color: var(--foreground);
   }
 </style>
-

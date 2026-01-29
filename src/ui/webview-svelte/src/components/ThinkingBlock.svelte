@@ -1,4 +1,7 @@
 <script lang="ts">
+  import Icon from './Icon.svelte';
+  import MarkdownContent from './MarkdownContent.svelte';
+
   // Props
   interface Props {
     thinking: Array<string | { content: string }>;
@@ -49,32 +52,32 @@
   }
 </script>
 
-<div 
+<div
   class="thinking-block"
   class:collapsed
   class:streaming={isStreaming}
 >
   <button class="thinking-header" onclick={toggle}>
     <span class="chevron">
-      <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
-        <path d="M4.646 1.646a.5.5 0 0 1 .708 0l6 6a.5.5 0 0 1 0 .708l-6 6a.5.5 0 0 1-.708-.708L10.293 8 4.646 2.354a.5.5 0 0 1 0-.708z"/>
-      </svg>
+      <Icon name="chevron-right" size={12} />
     </span>
-    
-    <span class="thinking-icon">💭</span>
-    
+
+    <span class="thinking-icon">
+      <Icon name="clock" size={14} />
+    </span>
+
     <span class="thinking-title">
       <span class="title-text">思考过程</span>
       <span class="thinking-summary">{summary()}</span>
     </span>
-    
+
     <span class="thinking-badge">{thinking.length} 步</span>
   </button>
-  
+
   {#if !collapsed}
     <div class="thinking-content">
       <div class="thinking-body">
-        {thinkingContent}
+        <MarkdownContent content={thinkingContent} {isStreaming} />
       </div>
     </div>
   {/if}
@@ -84,22 +87,24 @@
   .thinking-block {
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    margin: var(--spacing-sm) 0;
+    margin: var(--space-2, 8px) 0;
     background: rgba(139, 92, 246, 0.05);
     overflow: hidden;
   }
 
   .thinking-block.streaming {
-    border-color: var(--info);
+    border-color: #a855f7;
+    box-shadow: 0 0 0 1px rgba(168, 85, 247, 0.2);
   }
 
   .thinking-header {
     display: flex;
     align-items: center;
-    gap: var(--spacing-sm);
+    gap: var(--space-2, 8px);
     width: 100%;
-    padding: var(--spacing-sm) var(--spacing-md);
+    padding: var(--space-2, 8px) var(--space-3, 12px);
     background: transparent;
+    border: none;
     text-align: left;
     cursor: pointer;
     transition: background var(--transition-fast);
@@ -112,19 +117,15 @@
   .chevron {
     display: flex;
     transition: transform var(--transition-fast);
-    color: var(--vscode-descriptionForeground, #888);
+    color: var(--foreground-muted, #888);
   }
 
-  .collapsed .chevron {
-    transform: rotate(0deg);
-  }
-
-  .thinking-block:not(.collapsed) .chevron {
-    transform: rotate(90deg);
-  }
+  .collapsed .chevron { transform: rotate(0deg); }
+  .thinking-block:not(.collapsed) .chevron { transform: rotate(90deg); }
 
   .thinking-icon {
-    font-size: 14px;
+    display: flex;
+    color: #a855f7;
   }
 
   .thinking-title {
@@ -133,41 +134,51 @@
     flex-direction: column;
     gap: 2px;
     overflow: hidden;
+    min-width: 0;
   }
 
   .title-text {
     font-weight: 500;
-    font-size: var(--font-size-sm);
+    font-size: var(--text-sm, 13px);
+    color: var(--foreground);
   }
 
   .thinking-summary {
-    font-size: 11px;
-    color: var(--vscode-descriptionForeground, #888);
+    font-size: var(--text-xs, 11px);
+    color: var(--foreground-muted, #888);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
 
   .thinking-badge {
-    font-size: 11px;
-    padding: 2px 6px;
+    font-size: var(--text-xs, 11px);
+    padding: 2px 8px;
     background: rgba(139, 92, 246, 0.2);
     color: #a78bfa;
-    border-radius: var(--radius-sm);
+    border-radius: var(--radius-full);
     white-space: nowrap;
+    font-weight: 500;
   }
 
   .thinking-content {
-    padding: var(--spacing-md);
+    padding: var(--space-3, 12px);
     border-top: 1px solid var(--border);
+    background: rgba(139, 92, 246, 0.02);
+    max-height: 400px;
+    overflow-y: auto;
+    animation: expandContent 0.2s ease-out;
+  }
+
+  @keyframes expandContent {
+    from { opacity: 0; transform: translateY(-8px); }
+    to { opacity: 1; transform: translateY(0); }
   }
 
   .thinking-body {
-    font-size: var(--font-size-sm);
+    font-size: var(--text-sm, 13px);
     line-height: 1.6;
-    color: var(--vscode-descriptionForeground, #aaa);
-    white-space: pre-wrap;
-    word-break: break-word;
+    color: var(--foreground-muted, #aaa);
   }
 
   /* 流式动画 */
@@ -175,9 +186,16 @@
     animation: pulse 1.5s ease-in-out infinite;
   }
 
+  .streaming .thinking-icon {
+    animation: spin 2s linear infinite;
+  }
+
   @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.5; }
   }
-</style>
 
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+</style>

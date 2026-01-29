@@ -329,7 +329,13 @@ export function renderMessageList(messages, options) {
           return;
         }
 
-        if (!hasRenderableContent) {
+        // 🔧 修复：跳过 Worker 的空消息（如果是普通文本类型的空消息）
+        // 编排者消息保留渲染（可能有状态意义），流式消息保留渲染
+        if (!isOrchestrator && !m.streaming && !hasRenderableContent && !m.toolCalls?.length && !m.metadata) {
+          return;
+        }
+
+        if (!hasRenderableContent && !isOrchestrator) {
           return;
         }
 

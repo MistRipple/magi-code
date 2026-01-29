@@ -522,6 +522,8 @@ export type WebviewToExtensionMessage =
   | { type: 'addFAQ'; faq: any }
   | { type: 'updateFAQ'; id: string; updates: any }
   | { type: 'deleteFAQ'; id: string }
+  // 新增：前端错误上报
+  | { type: 'uiError'; component: string; detail?: unknown; stack?: string }
   // 新增：工具授权相关
   | { type: 'toolAuthorizationResponse'; allowed: boolean };
 

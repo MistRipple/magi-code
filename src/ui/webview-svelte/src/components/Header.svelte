@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getState } from '../stores/messages.svelte';
+  import { ensureArray } from '../lib/utils';
   import { vscode } from '../lib/vscode-bridge';
   import Icon from './Icon.svelte';
 
@@ -17,7 +18,7 @@
   // 获取当前会话名称
   const currentSessionName = $derived(() => {
     if (!appState.currentSessionId) return '新会话';
-    const session = appState.sessions.find(s => s.id === appState.currentSessionId);
+    const session = ensureArray(appState.sessions).find(s => s.id === appState.currentSessionId);
     return session?.name || '会话';
   });
 
@@ -63,13 +64,13 @@
           </button>
         </div>
         <div class="session-list">
-          {#if appState.sessions.length === 0}
+          {#if ensureArray(appState.sessions).length === 0}
             <div class="session-dropdown-empty">
               <Icon name="chat" size={24} />
               <span>暂无会话历史</span>
             </div>
           {:else}
-            {#each appState.sessions as session}
+            {#each ensureArray(appState.sessions) as session}
               <button
                 class="session-item"
                 class:active={session.id === appState.currentSessionId}
@@ -213,4 +214,3 @@
 
   /* 使用全局 .btn-icon 样式，这里只覆盖必要的 */
 </style>
-

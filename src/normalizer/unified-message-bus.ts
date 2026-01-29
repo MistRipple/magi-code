@@ -123,6 +123,16 @@ export class UnifiedMessageBus extends EventEmitter {
    * 🔧 增强：支持基于内容的去重，防止不同ID但内容相同的消息重复发送
    */
   sendMessage(message: StandardMessage): boolean {
+    if (!message.source || !message.agent) {
+      logger.error('消息总线.消息字段缺失', {
+        id: message.id,
+        source: message.source,
+        agent: message.agent,
+        type: message.type,
+        lifecycle: message.lifecycle
+      }, LogCategory.SYSTEM);
+      throw new Error(`[MessageBus] StandardMessage missing source/agent: ${message.id}`);
+    }
     if (!this.config.enabled) {
       this.emit(MESSAGE_EVENTS.MESSAGE, message);
       return true;

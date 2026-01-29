@@ -476,7 +476,16 @@ export class LLMConfigLoader {
     try {
       const content = fs.readFileSync(this.SKILLS_CONFIG_FILE, 'utf-8');
       const config = JSON.parse(content);
-      return config;
+      const { normalized, changed } = this.normalizeSkillsConfig(config);
+      if (changed) {
+        try {
+          fs.writeFileSync(this.SKILLS_CONFIG_FILE, JSON.stringify(normalized, null, 2), 'utf-8');
+          logger.info('Skills config auto-cleaned', {}, LogCategory.LLM);
+        } catch (error) {
+          logger.error('Failed to auto-clean Skills config', { error }, LogCategory.LLM);
+        }
+      }
+      return normalized;
     } catch (error) {
       logger.warn(`Failed to load Skills config from ${this.SKILLS_CONFIG_FILE}`, { error }, LogCategory.LLM);
       return null;
@@ -489,12 +498,49 @@ export class LLMConfigLoader {
   static saveSkillsConfig(config: any): void {
     this.ensureConfigDir();
     try {
-      fs.writeFileSync(this.SKILLS_CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+      const { normalized } = this.normalizeSkillsConfig(config);
+      fs.writeFileSync(this.SKILLS_CONFIG_FILE, JSON.stringify(normalized, null, 2), 'utf-8');
       logger.info('Skills config saved', {}, LogCategory.LLM);
     } catch (error) {
       logger.error('Failed to save Skills config', { error }, LogCategory.LLM);
       throw error;
     }
+  }
+
+  private static normalizeSkillsConfig(rawConfig: any): { normalized: any; changed: boolean } {
+    const config = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
+    const normalized: any = {
+      builtInTools: config.builtInTools && typeof config.builtInTools === 'object' ? config.builtInTools : {},
+      customTools: Array.isArray(config.customTools) ? config.customTools : [],
+      instructionSkills: Array.isArray(config.instructionSkills) ? config.instructionSkills : [],
+      repositories: Array.isArray(config.repositories) ? config.repositories : [],
+    };
+
+    let changed = false;
+
+    normalized.customTools = normalized.customTools.filter((tool: any, index: number) => {
+      const valid = tool && typeof tool.name === 'string' && tool.name.trim().length > 0;
+      if (!valid) {
+        logger.warn('Skills config: invalid customTool skipped', { index }, LogCategory.LLM);
+        changed = true;
+      }
+      return valid;
+    });
+
+    normalized.instructionSkills = normalized.instructionSkills.filter((skill: any, index: number) => {
+      const valid = skill && typeof skill.name === 'string' && skill.name.trim().length > 0;
+      if (!valid) {
+        logger.warn('Skills config: invalid instructionSkill skipped', { index }, LogCategory.LLM);
+        changed = true;
+      }
+      return valid;
+    });
+
+    if (!Array.isArray(config.customTools) || !Array.isArray(config.instructionSkills) || !Array.isArray(config.repositories)) {
+      changed = true;
+    }
+
+    return { normalized, changed };
   }
 
   // ============================================================================

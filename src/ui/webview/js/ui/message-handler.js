@@ -960,6 +960,9 @@ export function standardToWebviewMessage(message) {
           traceId: message.traceId,
           lifecycle: message.lifecycle,
           messageType: message.type,
+          // 🔧 Fix: Ensure system notice type is correctly passed through, avoiding rendering as card
+          type: (message.type === 'notice' || message.type === 'system_notice' || (textContent && textContent.includes('状态已更新'))) ? 'system_notice' : undefined,
+          noticeType: message.noticeType || 'info',
         };
       }
 

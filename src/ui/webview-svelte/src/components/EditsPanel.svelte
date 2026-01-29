@@ -1,15 +1,16 @@
 <script lang="ts">
   import { getState } from '../stores/messages.svelte';
   import { vscode } from '../lib/vscode-bridge';
+  import { ensureArray } from '../lib/utils';
 
   const appState = getState();
 
   // 变更列表
-  const edits = $derived(appState.edits || []);
+  const edits = $derived(ensureArray(appState.edits));
 
   // 打开文件
   function openFile(filePath: string) {
-    vscode.postMessage({ type: 'openFile', path: filePath });
+    vscode.postMessage({ type: 'openFile', filepath: filePath });
   }
 
   // 获取文件类型图标
@@ -178,4 +179,3 @@
   .stat-add { color: var(--success); }
   .stat-del { color: var(--error); }
 </style>
-

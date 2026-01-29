@@ -3,6 +3,7 @@
   import { getState, setCurrentBottomTab } from '../stores/messages.svelte';
   import MessageList from './MessageList.svelte';
   import AgentTab from './AgentTab.svelte';
+  import { ensureArray } from '../lib/utils';
 
   const appState = getState();
 
@@ -32,7 +33,7 @@
         <span class="tab-dot" style="background: {tab.color}"></span>
         <span class="tab-label">{tab.label}</span>
         {#if tab.id !== 'thread'}
-          {@const count = appState.agentOutputs[tab.id as AgentType]?.length || 0}
+          {@const count = ensureArray(appState.agentOutputs?.[tab.id as AgentType]).length}
           {#if count > 0}
             <span class="tab-badge">{count}</span>
           {/if}
@@ -43,10 +44,10 @@
 
   <div class="tab-content">
     {#if currentTab === 'thread'}
-      <MessageList messages={appState.threadMessages} />
+      <MessageList messages={ensureArray(appState.threadMessages)} />
     {:else if currentTab === 'claude' || currentTab === 'codex' || currentTab === 'gemini'}
       <AgentTab
-        messages={appState.agentOutputs[currentTab as AgentType]}
+        messages={ensureArray(appState.agentOutputs?.[currentTab as AgentType])}
       />
     {/if}
   </div>
@@ -119,4 +120,3 @@
     overflow: hidden;
   }
 </style>
-

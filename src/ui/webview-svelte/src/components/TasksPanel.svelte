@@ -1,10 +1,11 @@
 <script lang="ts">
   import { getState } from '../stores/messages.svelte';
+  import { ensureArray } from '../lib/utils';
 
   const appState = getState();
 
   // 任务列表
-  const tasks = $derived(appState.tasks || []);
+  const tasks = $derived(ensureArray(appState.tasks));
 </script>
 
 <div class="tasks-panel">
@@ -177,4 +178,3 @@
     line-height: var(--leading-normal);
   }
 </style>
-
