@@ -1352,6 +1352,16 @@
         </div>
       {:else if activeTab === 'profile'}
         <!-- 画像配置 Tab -->
+        <div class="settings-section profile-save-bar">
+          <div class="settings-section-header">
+            <div class="settings-section-title">画像与任务分类配置</div>
+            <div class="settings-section-actions">
+              <button class="settings-btn primary" onclick={saveProfile}>保存全部配置</button>
+              <button class="settings-btn secondary" onclick={resetProfile}>重置全部配置</button>
+            </div>
+          </div>
+          <div class="settings-section-desc">保存将同时影响 Worker 画像与任务分类映射</div>
+        </div>
         <!-- Worker 画像卡片 -->
         <div class="settings-section">
           <div class="settings-section-header">
@@ -1440,12 +1450,6 @@
         <div class="settings-section" style="margin-top: var(--space-4);">
           <div class="settings-section-header">
             <div class="settings-section-title">任务分类默认配置</div>
-            <div class="settings-section-actions">
-              <button class="settings-btn primary" onclick={saveProfile}>
-                保存配置
-              </button>
-              <button class="settings-btn secondary" onclick={resetProfile}>重置</button>
-            </div>
           </div>
           <div class="settings-section-desc">配置存储：<code>~/.multicli/</code></div>
           <div class="profile-categories-grid">
@@ -2367,6 +2371,7 @@
   .profile-category-row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); height: var(--btn-height-md); padding: 0 var(--space-3); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); }
   .profile-category-label { font-size: var(--text-sm); color: var(--foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
   .profile-category-select { height: var(--btn-height-xs); padding: 0 var(--space-2); font-size: var(--text-xs); background: var(--vscode-input-background, #3c3c3c); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--foreground); outline: none; }
+  .profile-save-bar { margin-bottom: var(--space-4); }
 
   /* MCP 服务器列表 */
   .mcp-server-list { display: flex; flex-direction: column; gap: var(--space-2); }

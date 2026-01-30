@@ -1,12 +1,14 @@
 /**
  * Skill 安装与指令构建
+ *
+ * 注意：内置工具（execute_shell, text_editor, grep_search 等）由 ToolManager 直接管理
+ * 此模块仅处理指令型 Skills 和自定义工具的安装
  */
 
-import { BuiltInTool, CustomToolDefinition, InstructionSkillDefinition } from './skills-manager';
+import { CustomToolDefinition, InstructionSkillDefinition } from './skills-manager';
 import type { SkillInfo } from './skill-repository-manager';
 
 export interface SkillsConfigFile {
-  builtInTools: Record<string, { enabled: boolean; description?: string }>;
   customTools: CustomToolDefinition[];
   instructionSkills: InstructionSkillDefinition[];
   repositories?: any[];
@@ -15,20 +17,11 @@ export interface SkillsConfigFile {
 export function applySkillInstall(config: SkillsConfigFile, skill: SkillInfo): SkillsConfigFile {
   const nextConfig: SkillsConfigFile = {
     ...config,
-    builtInTools: { ...config.builtInTools },
     customTools: Array.isArray(config.customTools) ? [...config.customTools] : [],
     instructionSkills: Array.isArray(config.instructionSkills) ? [...config.instructionSkills] : [],
   };
 
-  const builtInNames = new Set<string>(Object.values(BuiltInTool));
-  if (builtInNames.has(skill.fullName)) {
-    nextConfig.builtInTools[skill.fullName] = {
-      enabled: true,
-      description: skill.description,
-    };
-    return nextConfig;
-  }
-
+  // 处理指令型 Skill
   if (skill.skillType === 'instruction' || skill.instruction) {
     const instruction = String(skill.instruction || '').trim();
     if (!instruction) {
@@ -57,6 +50,7 @@ export function applySkillInstall(config: SkillsConfigFile, skill: SkillInfo): S
     return nextConfig;
   }
 
+  // 处理自定义工具
   if (!skill.toolDefinition) {
     throw new Error(`Skill "${skill.name}" 缺少 toolDefinition 或 input_schema，无法安装`);
   }

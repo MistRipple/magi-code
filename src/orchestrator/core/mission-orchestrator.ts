@@ -526,7 +526,7 @@ export class MissionOrchestrator extends EventEmitter {
    */
   async selectParticipants(
     mission: Mission,
-    options?: { preferredWorkers?: WorkerSlot[] }
+    options?: { preferredWorkers?: WorkerSlot[]; category?: string; categories?: string[] }
   ): Promise<WorkerSlot[]> {
     const allProfiles = this.profileLoader.getAllProfiles();
     const participants: WorkerSlot[] = [];
@@ -535,40 +535,46 @@ export class MissionOrchestrator extends EventEmitter {
     if (options?.preferredWorkers && options.preferredWorkers.length > 0) {
       participants.push(...options.preferredWorkers);
     } else {
-      // 基于任务分析自动选择
-      const goalText = `${mission.goal} ${mission.analysis}`.toLowerCase();
+      // 仅使用画像系统 + 任务分类配置进行选择
+      const rules = this.profileLoader.getCategoryRules();
+      const rawCategories = options?.categories && options.categories.length > 0
+        ? options.categories
+        : [options?.category || rules.defaultCategory || 'general'];
+      const categories = Array.from(new Set(rawCategories.filter(Boolean)));
+
+      const defaultWorkers: WorkerSlot[] = [];
+      for (const category of categories) {
+        const categoryConfig = this.profileLoader.getCategory(category);
+        const generalConfig = this.profileLoader.getCategory('general');
+        const defaultWorker = (categoryConfig?.defaultWorker || generalConfig?.defaultWorker || 'claude') as WorkerSlot;
+        defaultWorkers.push(defaultWorker);
+      }
 
       for (const [worker, profile] of allProfiles.entries()) {
-        // 检查是否有匹配的分类偏好
-        const hasMatch = profile.preferences.preferredCategories.some(cat =>
-          goalText.includes(cat)
-        );
-
-        // 检查是否有匹配的优势
-        const hasStrength = profile.profile.strengths.some(s =>
-          goalText.includes(s.toLowerCase())
-        );
-
-        if (hasMatch || hasStrength) {
+        if (categories.some(category => profile.preferences.preferredCategories.includes(category))) {
           participants.push(worker as WorkerSlot);
         }
       }
 
-      // 如果没有匹配，默认选择第一个
       if (participants.length === 0) {
-        const firstWorker = allProfiles.keys().next().value;
-        if (firstWorker) {
-          participants.push(firstWorker as WorkerSlot);
+        participants.push(...defaultWorkers);
+      } else {
+        for (const worker of defaultWorkers) {
+          if (!participants.includes(worker) && allProfiles.has(worker)) {
+            participants.unshift(worker);
+          }
         }
       }
     }
 
+    const uniqueParticipants = Array.from(new Set(participants));
+
     mission.phase = 'contract_definition';
     await this.storage.update(mission);
 
-    this.emit('participantsSelected', { missionId: mission.id, participants });
+    this.emit('participantsSelected', { missionId: mission.id, participants: uniqueParticipants });
 
-    return participants;
+    return uniqueParticipants;
   }
 
   /**
@@ -1227,134 +1233,10 @@ export class MissionOrchestrator extends EventEmitter {
       }
     }
 
-    // 6. 保存 Memory
+    // 6. 保存 Memory（含压缩）
     if (memory.isDirty()) {
-      await memory.save();
+      await this.contextManager.saveMemory();
       logger.info('编排器.Memory.写回完成', { missionId: mission.id }, LogCategory.ORCHESTRATOR);
-    }
-  }
-
-  /**
-   * 检查并压缩 Memory（如果需要）
-   * 在任务完成后自动触发
-   */
-  private async compressMemoryIfNeeded(): Promise<void> {
-    if (!this.contextManager) {
-      return;
-    }
-
-    const memory = this.contextManager.getMemoryDocument();
-    if (!memory) {
-      return;
-    }
-
-    // 检查是否需要压缩
-    if (!memory.needsCompression(8000, 200)) {
-      return;
-    }
-
-    logger.info('编排器.Memory.开始压缩', undefined, LogCategory.ORCHESTRATOR);
-
-    // 导入 ContextCompressor
-    const { ContextCompressor } = await import('../../context/context-compressor');
-
-    const compressor = new ContextCompressor(
-      this.adapterFactory ? {
-        sendMessage: async (message: string) => {
-          const startAt = Date.now();
-          const { LLMConfigLoader } = await import('../../llm/config');
-          const { createLLMClient } = await import('../../llm/clients/client-factory');
-          const compressorConfig = LLMConfigLoader.loadCompressorConfig();
-
-          if (compressorConfig.enabled) {
-            try {
-              const client = createLLMClient(compressorConfig);
-              const response = await client.sendMessage({
-                messages: [{ role: 'user', content: message }],
-                maxTokens: 2000,
-                temperature: 0.3,
-              });
-              const duration = Date.now() - startAt;
-              if (this.executionStats) {
-                this.executionStats.recordExecution({
-                  worker: 'compressor',
-                  taskId: 'memory',
-                  subTaskId: 'compress',
-                  success: true,
-                  duration,
-                  inputTokens: response.usage?.inputTokens,
-                  outputTokens: response.usage?.outputTokens,
-                  phase: 'integration',
-                });
-              }
-              return response.content || '';
-            } catch (error: any) {
-              const duration = Date.now() - startAt;
-              if (this.executionStats) {
-                this.executionStats.recordExecution({
-                  worker: 'compressor',
-                  taskId: 'memory',
-                  subTaskId: 'compress',
-                  success: false,
-                  duration,
-                  error: error?.message,
-                  phase: 'integration',
-                });
-              }
-              throw error;
-            }
-          }
-
-          const response = await this.adapterFactory!.sendMessage(
-            'claude',
-            message,
-            undefined,
-            {
-              source: 'orchestrator',
-              streamToUI: false,
-              adapterRole: 'orchestrator',
-            }
-          );
-          const duration = Date.now() - startAt;
-          if (this.executionStats) {
-            this.executionStats.recordExecution({
-              worker: 'claude',
-              taskId: 'memory',
-              subTaskId: 'compress',
-              success: !response.error,
-              duration,
-              error: response.error,
-              inputTokens: response.tokenUsage?.inputTokens,
-              outputTokens: response.tokenUsage?.outputTokens,
-              phase: 'integration',
-            });
-          }
-          return response.content || '';
-        },
-      } : null,
-      {
-        tokenLimit: 8000,
-        lineLimit: 200,
-        compressionRatio: 0.5,
-        retentionPriority: ['currentTasks', 'keyDecisions', 'importantContext', 'codeChanges', 'completedTasks', 'pendingIssues'],
-        truncation: {
-          enabled: true,
-          maxMessageChars: 4000,
-          maxToolOutputChars: 8000,
-          truncationNotice: '[内容已截断]',
-        },
-      }
-    );
-
-    try {
-      const success = await compressor.compress(memory);
-      if (success) {
-        await memory.save();
-        const stats = compressor.getLastStats();
-        logger.info('编排器.Memory.压缩完成', stats, LogCategory.ORCHESTRATOR);
-      }
-    } catch (error) {
-      logger.error('编排器.Memory.压缩失败', error, LogCategory.ORCHESTRATOR);
     }
   }
 
@@ -1469,9 +1351,6 @@ export class MissionOrchestrator extends EventEmitter {
       remainingIssues,
       suggestedNextSteps,
     };
-
-    // 在 Mission 完成后，检查并压缩 Memory（如果需要）
-    await this.compressMemoryIfNeeded();
 
     this.emit('summarizationCompleted', { missionId, summary });
 

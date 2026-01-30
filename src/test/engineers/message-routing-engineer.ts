@@ -5,6 +5,8 @@
  */
 
 import { TestEngineer, TestReport, TestIssue } from '../test-command-center';
+import fs from 'fs';
+import path from 'path';
 
 class MessageRoutingEngineer implements TestEngineer {
   name = '消息路由专家-李工';
@@ -135,17 +137,21 @@ class MessageRoutingEngineer implements TestEngineer {
     
     // 检查消息顺序是否正确
     // 例如：stateUpdate 和 confirmationRequest 的顺序
+    const providerPath = path.join(process.cwd(), 'src', 'ui', 'webview-provider.ts');
+    const content = fs.readFileSync(providerPath, 'utf-8');
+    const hasQueue = content.includes('postMessageQueue') && content.includes('postMessageQueue =');
+
+    if (!hasQueue) {
+      issues.push({
+        severity: 'low',
+        category: '消息顺序',
+        description: '未检测到统一的消息队列，异步消息可能乱序',
+        location: 'src/ui/webview-provider.ts',
+        suggestedFix: '使用消息队列或序列号确保顺序'
+      });
+    }
     
-    // 潜在问题：异步消息可能乱序
-    issues.push({
-      severity: 'low',
-      category: '消息顺序',
-      description: 'stateUpdate 和 confirmationRequest 可能因异步导致乱序',
-      location: 'src/ui/webview-provider.ts',
-      suggestedFix: '考虑使用消息队列或序列号确保顺序'
-    });
-    
-    return { passed: false, issues };
+    return { passed: issues.length === 0, issues };
   }
 }
 

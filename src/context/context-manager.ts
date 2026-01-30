@@ -12,6 +12,7 @@
 import { logger, LogCategory } from '../logging';
 import * as path from 'path';
 import { MemoryDocument } from './memory-document';
+import { ContextCompressor, type CompressorAdapter } from './context-compressor';
 import { TruncationUtils } from './truncation-utils';
 import {
   ContextMessage,
@@ -48,6 +49,9 @@ export class ContextManager {
   private sessionManager: UnifiedSessionManager | null = null;
   private currentSessionId: string | null = null;
   private projectKnowledgeBase: ProjectKnowledgeBase | null = null;
+  private compressorAdapter: CompressorAdapter | null = null;
+  private compressor: ContextCompressor | null = null;
+  private streamingContext: Map<string, ContextMessage> = new Map();
 
   constructor(
     private workspacePath: string,
@@ -79,6 +83,16 @@ export class ContextManager {
   setProjectKnowledgeBase(knowledgeBase: ProjectKnowledgeBase): void {
     this.projectKnowledgeBase = knowledgeBase;
     logger.info('上下文.项目知识库.已设置', undefined, LogCategory.SESSION);
+  }
+
+  /**
+   * 设置压缩器适配器
+   */
+  setCompressorAdapter(adapter: CompressorAdapter | null): void {
+    this.compressorAdapter = adapter;
+    if (this.compressor && adapter) {
+      this.compressor.setAdapter(adapter);
+    }
   }
 
   /**
@@ -144,6 +158,45 @@ export class ContextManager {
 
       logger.info('上下文.即时上下文.已裁剪', { removedCount: toRemove.length }, LogCategory.SESSION);
     }
+  }
+
+  updateStreamingMessage(
+    messageId: string,
+    message: Omit<ContextMessage, 'timestamp'>,
+    applyTruncation: boolean = true
+  ): void {
+    let content = message.content;
+    if (!content) {
+      return;
+    }
+
+    if (applyTruncation && this.config.compression.truncation.enabled) {
+      const truncated = this.truncationUtils.truncateMessage(content);
+      if (truncated.wasTruncated) {
+        logger.info(
+          '上下文.流式_截断.已应用',
+          { originalLength: truncated.originalLength, truncatedLength: truncated.truncatedLength },
+          LogCategory.SESSION
+        );
+        content = truncated.content;
+      }
+    }
+
+    const existing = this.streamingContext.get(messageId);
+    if (existing?.content === content) {
+      return;
+    }
+
+    this.streamingContext.set(messageId, {
+      ...message,
+      content,
+      timestamp: new Date().toISOString(),
+      tokenCount: this.estimateTokens(content),
+    });
+  }
+
+  clearStreamingMessage(messageId: string): void {
+    this.streamingContext.delete(messageId);
   }
 
   /**
@@ -407,9 +460,15 @@ export class ContextManager {
     const result: ContextMessage[] = [];
     let tokens = 0;
 
+    const messages = [
+      ...this.immediateContext,
+      ...Array.from(this.streamingContext.values())
+        .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
+    ];
+
     // 从最新的消息开始添加
-    for (let i = this.immediateContext.length - 1; i >= 0; i--) {
-      const msg = this.immediateContext[i];
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
       const msgTokens = msg.tokenCount || this.estimateTokens(msg.content);
 
       if (tokens + msgTokens > maxTokens) {
@@ -482,6 +541,15 @@ export class ContextManager {
     this.sessionMemory?.addImportantContext(context);
   }
 
+  addToolOutput(toolName: string, output: string): void {
+    if (!output) {
+      return;
+    }
+    const truncated = this.truncateToolOutput(output);
+    const label = truncated.wasTruncated ? ' (truncated)' : '';
+    this.sessionMemory?.addImportantContext(`工具输出${label} [${toolName}]: ${truncated.content}`);
+  }
+
   /**
    * 添加待解决问题
    */
@@ -505,7 +573,34 @@ export class ContextManager {
    */
   async saveMemory(): Promise<void> {
     if (this.sessionMemory?.isDirty()) {
+      if (this.needsCompression()) {
+        await this.compressMemoryIfNeeded();
+      }
       await this.sessionMemory.save();
+    }
+  }
+
+  private getCompressor(): ContextCompressor {
+    if (!this.compressor) {
+      this.compressor = new ContextCompressor(this.compressorAdapter, this.config.compression);
+    }
+    return this.compressor;
+  }
+
+  private async compressMemoryIfNeeded(): Promise<void> {
+    if (!this.sessionMemory) {
+      return;
+    }
+
+    const compressor = this.getCompressor();
+    try {
+      const success = await compressor.compress(this.sessionMemory);
+      if (success) {
+        const stats = compressor.getLastStats();
+        logger.info('上下文.压缩.完成', stats, LogCategory.SESSION);
+      }
+    } catch (error) {
+      logger.error('上下文.压缩.失败', error, LogCategory.SESSION);
     }
   }
 
@@ -514,6 +609,7 @@ export class ContextManager {
    */
   clearImmediateContext(): void {
     this.immediateContext = [];
+    this.streamingContext.clear();
   }
 
   /**
@@ -531,6 +627,10 @@ export class ContextManager {
 
     // 即时上下文
     this.immediateContext.forEach(msg => {
+      total += msg.tokenCount || this.estimateTokens(msg.content);
+    });
+
+    this.streamingContext.forEach(msg => {
       total += msg.tokenCount || this.estimateTokens(msg.content);
     });
 

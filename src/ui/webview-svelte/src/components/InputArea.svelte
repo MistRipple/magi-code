@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
-  import { getState, addThreadMessage } from '../stores/messages.svelte';
+  import { getState, addThreadMessage, addToast, getActiveInteractionType } from '../stores/messages.svelte';
   import Icon from './Icon.svelte';
   import { generateId } from '../lib/utils';
 
@@ -24,11 +24,18 @@
 
   // 是否正在发送
   const isSending = $derived(appState.isProcessing);
+  const activeInteraction = $derived(getActiveInteractionType());
+  const isInteractionBlocking = $derived(Boolean(activeInteraction));
+  const MAX_INPUT_CHARS = 10000;
 
   // 发送消息
   function sendMessage() {
     const content = inputValue.trim();
-    if (!content || isSending) return;
+    if (!content || isSending || isInteractionBlocking) return;
+    if (content.length > MAX_INPUT_CHARS) {
+      addToast('warning', `输入内容过长（${content.length} 字符），请控制在 ${MAX_INPUT_CHARS} 字符以内`);
+      return;
+    }
 
     addThreadMessage({
       id: generateId(),
@@ -186,10 +193,10 @@
         {:else}
           <button
             class="send-btn"
-            class:ready={inputValue.trim()}
+            class:ready={inputValue.trim() && !isInteractionBlocking}
             onclick={sendMessage}
-            disabled={!inputValue.trim()}
-            title="发送 (Cmd+Enter)"
+            disabled={!inputValue.trim() || isInteractionBlocking}
+            title={isInteractionBlocking ? `等待处理：${activeInteraction}` : '发送 (Cmd+Enter)'}
           >
             <Icon name="send" size={14} />
           </button>

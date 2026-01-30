@@ -1,6 +1,7 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
   import FileSpan from './FileSpan.svelte';
+  import MermaidRenderer from './MermaidRenderer.svelte';
   import { vscode } from '../lib/vscode-bridge';
 
   // Props
@@ -62,6 +63,15 @@
       throw new Error('ToolCall: invalid toolName');
     }
     const iconMap: Record<string, string> = {
+      // 内置工具
+      'execute_shell': 'terminal',
+      'text_editor': 'file-edit',
+      'grep_search': 'search',
+      'remove_files': 'file-minus',
+      'web_search': 'search',
+      'web_fetch': 'globe',
+      'mermaid_diagram': 'git-branch',
+      // 通用匹配
       'read_file': 'file-text',
       'write_file': 'file-plus',
       'edit_file': 'file-edit',
@@ -76,6 +86,11 @@
       'fetch': 'download',
       'mcp': 'plug',
     };
+    // 先检查精确匹配
+    if (iconMap[toolName]) {
+      return iconMap[toolName];
+    }
+    // 再检查部分匹配
     const lowerName = toolName.toLowerCase();
     for (const [key, icon] of Object.entries(iconMap)) {
       if (lowerName.includes(key)) return icon;
@@ -99,6 +114,26 @@
   const hasOutput = $derived(!!output && !!formatContent(output));
   const hasError = $derived(!!error && !!error.trim());
   const hasContent = $derived(hasInput || hasOutput || hasError);
+
+  // 检查是否为 Mermaid 工具输出
+  const isMermaidTool = $derived(name === 'mermaid_diagram');
+  const mermaidData = $derived(() => {
+    if (!isMermaidTool || !output) return null;
+    try {
+      const data = typeof output === 'string' ? JSON.parse(output) : output;
+      if (data && (data.type === 'mermaid' || data.type === 'mermaid_diagram') && data.code) {
+        return {
+          code: data.code as string,
+          title: (data.title || '') as string,
+          theme: (data.theme || 'dark') as 'default' | 'dark' | 'forest' | 'neutral',
+          diagramType: (data.diagramType || '') as string,
+        };
+      }
+    } catch {
+      // 忽略解析错误
+    }
+    return null;
+  });
 
   const toolIcon = $derived(getToolIcon(name));
 
@@ -179,7 +214,16 @@
                 <Icon name={copySuccess ? 'check' : 'copy'} size={12} />
               </button>
             </div>
-            <pre class="section-content">{formatContent(output)}</pre>
+            {#if isMermaidTool && mermaidData()}
+              <MermaidRenderer
+                code={mermaidData()?.code || ''}
+                title={mermaidData()?.title}
+                theme={mermaidData()?.theme}
+                diagramType={mermaidData()?.diagramType}
+              />
+            {:else}
+              <pre class="section-content">{formatContent(output)}</pre>
+            {/if}
           </div>
         {/if}
 

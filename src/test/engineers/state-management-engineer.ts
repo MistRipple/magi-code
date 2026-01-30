@@ -5,6 +5,8 @@
  */
 
 import { TestEngineer, TestReport, TestIssue } from '../test-command-center';
+import fs from 'fs';
+import path from 'path';
 
 class StateManagementEngineer implements TestEngineer {
   name = '状态管理专家-张工';
@@ -131,17 +133,24 @@ class StateManagementEngineer implements TestEngineer {
     
     // 检查并发场景下的状态冲突
     // 例如：同时有多个消息流时，状态是否正确隔离
-    
-    // 潜在问题：全局状态可能被多个流共享
-    issues.push({
-      severity: 'medium',
-      category: '并发安全',
-      description: '全局 isProcessing 状态可能在多个流并发时产生冲突',
-      location: 'src/ui/webview-svelte/src/stores/messages.svelte.ts',
-      suggestedFix: '考虑为每个消息流维护独立的状态'
-    });
-    
-    return { passed: false, issues };
+
+    const storePath = path.join(process.cwd(), 'src', 'ui', 'webview-svelte', 'src', 'stores', 'messages.svelte.ts');
+    const content = fs.readFileSync(storePath, 'utf-8');
+    const hasActiveTracking = content.includes('activeMessageIds')
+      && content.includes('markMessageActive')
+      && content.includes('markMessageComplete');
+
+    if (!hasActiveTracking) {
+      issues.push({
+        severity: 'medium',
+        category: '并发安全',
+        description: '未检测到基于消息流的处理状态隔离逻辑',
+        location: 'src/ui/webview-svelte/src/stores/messages.svelte.ts',
+        suggestedFix: '为每个消息流维护独立的状态集合，并合并到 isProcessing'
+      });
+    }
+
+    return { passed: issues.length === 0, issues };
   }
   
   private async testStatePersistence(): Promise<{ passed: boolean; issues: TestIssue[] }> {

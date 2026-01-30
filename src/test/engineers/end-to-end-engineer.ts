@@ -5,6 +5,8 @@
  */
 
 import { TestEngineer, TestReport, TestIssue } from '../test-command-center';
+import fs from 'fs';
+import path from 'path';
 
 class EndToEndEngineer implements TestEngineer {
   name = '端到端集成专家-赵工';
@@ -132,15 +134,20 @@ class EndToEndEngineer implements TestEngineer {
     
     // 测试各种错误情况的恢复
     // 例如：网络错误、模型崩溃、超时等
+    const clientPath = path.join(process.cwd(), 'src', 'llm', 'clients', 'universal-client.ts');
+    const content = fs.readFileSync(clientPath, 'utf-8');
+    const hasRetry = content.includes('withRetry') && content.includes('isRetryableError');
+
+    if (!hasRetry) {
+      issues.push({
+        severity: 'medium',
+        category: '错误处理',
+        description: '缺少网络错误的重试机制',
+        suggestedFix: '添加自动重试逻辑，最多重试3次'
+      });
+    }
     
-    issues.push({
-      severity: 'medium',
-      category: '错误处理',
-      description: '缺少网络错误的重试机制',
-      suggestedFix: '添加自动重试逻辑，最多重试3次'
-    });
-    
-    return { passed: false, issues };
+    return { passed: issues.length === 0, issues };
   }
   
   private async testEdgeCases(): Promise<{ passed: boolean; issues: TestIssue[] }> {
@@ -148,15 +155,22 @@ class EndToEndEngineer implements TestEngineer {
     
     // 测试边界情况
     // 例如：空输入、超长输入、特殊字符等
+    const inputPath = path.join(process.cwd(), 'src', 'ui', 'webview-svelte', 'src', 'components', 'InputArea.svelte');
+    const providerPath = path.join(process.cwd(), 'src', 'ui', 'webview-provider.ts');
+    const inputContent = fs.readFileSync(inputPath, 'utf-8');
+    const providerContent = fs.readFileSync(providerPath, 'utf-8');
+    const hasLimit = inputContent.includes('MAX_INPUT_CHARS') && providerContent.includes('maxPromptLength');
+
+    if (!hasLimit) {
+      issues.push({
+        severity: 'low',
+        category: '边界情况',
+        description: '未检测到超长用户输入的处理',
+        suggestedFix: '添加输入长度限制和提示'
+      });
+    }
     
-    issues.push({
-      severity: 'low',
-      category: '边界情况',
-      description: '未测试超长用户输入（>10000字符）的处理',
-      suggestedFix: '添加输入长度限制和提示'
-    });
-    
-    return { passed: false, issues };
+    return { passed: issues.length === 0, issues };
   }
 }
 

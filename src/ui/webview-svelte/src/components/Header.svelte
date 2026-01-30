@@ -3,6 +3,7 @@
   import { ensureArray } from '../lib/utils';
   import { vscode } from '../lib/vscode-bridge';
   import Icon from './Icon.svelte';
+  import type { Session } from '../types/message';
 
   interface Props {
     onOpenSettings?: () => void;
@@ -18,7 +19,7 @@
   // 获取当前会话名称
   const currentSessionName = $derived(() => {
     if (!appState.currentSessionId) return '新会话';
-    const session = ensureArray(appState.sessions).find(s => s.id === appState.currentSessionId);
+    const session = (ensureArray(appState.sessions) as Session[]).find(s => s.id === appState.currentSessionId);
     return session?.name || '会话';
   });
 
@@ -43,6 +44,25 @@
   function openSettings() {
     onOpenSettings?.();
   }
+
+  // 删除会话
+  function deleteSession(sessionId: string, event: MouseEvent) {
+    event.stopPropagation();
+    if (confirm('确定要删除这个会话吗？')) {
+      vscode.postMessage({ type: 'closeSession', sessionId });
+    }
+  }
+
+  // 格式化日期
+  function formatDate(date: string | number | Date): string {
+    const d = new Date(date);
+    return d.toLocaleDateString('zh-CN', {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  }
 </script>
 
 <header class="header-bar">
@@ -64,20 +84,37 @@
           </button>
         </div>
         <div class="session-list">
-          {#if ensureArray(appState.sessions).length === 0}
+          {#if (ensureArray(appState.sessions) as Session[]).length === 0}
             <div class="session-dropdown-empty">
               <Icon name="chat" size={24} />
               <span>暂无会话历史</span>
             </div>
           {:else}
-            {#each ensureArray(appState.sessions) as session}
-              <button
+            {#each ensureArray(appState.sessions) as session (session.id)}
+              {@const s = session as Session}
+              <div
                 class="session-item"
-                class:active={session.id === appState.currentSessionId}
-                onclick={() => selectSession(session.id)}
+                class:active={s.id === appState.currentSessionId}
+                role="button"
+                tabindex="0"
+                onclick={() => selectSession(s.id)}
+                onkeydown={(e) => e.key === 'Enter' && selectSession(s.id)}
               >
-                {session.name || '未命名会话'}
-              </button>
+                <div class="session-info">
+                  <span class="session-name">{s.name || '未命名会话'}</span>
+                  <div class="session-meta">
+                    <span class="session-count">{s.messageCount ?? 0} 条消息</span>
+                    <span class="session-date">{formatDate(s.updatedAt || s.createdAt)}</span>
+                  </div>
+                </div>
+                <button
+                  class="delete-btn"
+                  onclick={(e) => deleteSession(s.id, e)}
+                  title="删除会话"
+                >
+                  <Icon name="delete" size={14} />
+                </button>
+              </div>
             {/each}
           {/if}
         </div>
@@ -176,7 +213,9 @@
   }
 
   .session-item {
-    display: block;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
     width: 100%;
     padding: var(--space-3) var(--space-4);
     text-align: left;
@@ -195,6 +234,64 @@
   .session-item.active {
     background: var(--surface-selected);
     color: var(--primary);
+  }
+
+  .session-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .session-name {
+    font-size: var(--text-sm);
+    font-weight: var(--font-medium);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .session-meta {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+  }
+
+  .session-count {
+    color: var(--foreground-muted);
+  }
+
+  .session-date {
+    color: var(--foreground-muted);
+  }
+
+  .delete-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: var(--foreground-muted);
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    opacity: 0.5;
+    transition: all var(--transition-fast);
+    flex-shrink: 0;
+  }
+
+  .session-item:hover .delete-btn {
+    opacity: 1;
+  }
+
+  .delete-btn:hover {
+    background: var(--error-muted);
+    color: var(--error);
   }
 
   .session-dropdown-empty {

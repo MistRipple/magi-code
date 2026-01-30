@@ -1,6 +1,15 @@
 /**
  * 统一工具管理器
- * 管理所有工具源：MCP、Skill、内置工具
+ * 管理所有工具源：MCP、内置工具
+ *
+ * 内置工具 (source: 'builtin'):
+ * - execute_shell: 终端命令执行
+ * - text_editor: 文件编辑
+ * - grep_search: 代码搜索
+ * - remove_files: 文件删除
+ * - web_search: 网络搜索
+ * - web_fetch: URL 内容获取
+ * - mermaid_diagram: Mermaid 图表渲染
  */
 
 import { EventEmitter } from 'events';
@@ -10,8 +19,12 @@ import {
   ToolMetadata,
 } from './types';
 import { ToolCall, ToolResult, ToolDefinition } from '../llm/types';
-// ShellExecutor 已废弃，统一使用 VSCodeTerminalExecutor 实现终端可视化
 import { VSCodeTerminalExecutor } from './vscode-terminal-executor';
+import { FileExecutor } from './file-executor';
+import { SearchExecutor } from './search-executor';
+import { RemoveFilesExecutor } from './remove-files-executor';
+import { WebExecutor } from './web-executor';
+import { MermaidExecutor } from './mermaid-executor';
 import { logger, LogCategory } from '../logging';
 import { PermissionMatrix } from '../types';
 
@@ -19,22 +32,54 @@ import { PermissionMatrix } from '../types';
  * 工具管理器
  */
 export class ToolManager extends EventEmitter implements ToolExecutor {
-  // 统一使用 VSCode Terminal 执行器，实现终端可视化
+  // 工作区根目录
+  private workspaceRoot: string;
+
+  // 内置工具执行器
   private terminalExecutor: VSCodeTerminalExecutor;
+  private fileExecutor: FileExecutor;
+  private searchExecutor: SearchExecutor;
+  private removeFilesExecutor: RemoveFilesExecutor;
+  private webExecutor: WebExecutor;
+  private mermaidExecutor: MermaidExecutor;
+
+  // 外部工具执行器
   private mcpExecutors: Map<string, ToolExecutor> = new Map();
-  private skillExecutors: Map<string, ToolExecutor> = new Map();
+
+  // 缓存和权限
   private toolCache: Map<string, ExtendedToolDefinition> = new Map();
   private permissions: PermissionMatrix;
   private authorizationCallback?: (toolName: string, toolArgs: any) => Promise<boolean>;
 
-  constructor(permissions?: PermissionMatrix) {
+  constructor(workspaceRoot?: string, permissions?: PermissionMatrix) {
     super();
+    this.workspaceRoot = workspaceRoot || process.cwd();
+
+    // 初始化所有内置执行器
     this.terminalExecutor = new VSCodeTerminalExecutor();
+    this.fileExecutor = new FileExecutor(this.workspaceRoot);
+    this.searchExecutor = new SearchExecutor(this.workspaceRoot);
+    this.removeFilesExecutor = new RemoveFilesExecutor(this.workspaceRoot);
+    this.webExecutor = new WebExecutor();
+    this.mermaidExecutor = new MermaidExecutor();
+
     this.permissions = permissions || {
       allowEdit: true,
       allowBash: true,
       allowWeb: true,
     };
+  }
+
+  /**
+   * 更新工作区路径（重新初始化依赖工作区的执行器）
+   */
+  setWorkspaceRoot(workspaceRoot: string): void {
+    this.workspaceRoot = workspaceRoot;
+    this.fileExecutor = new FileExecutor(workspaceRoot);
+    this.searchExecutor = new SearchExecutor(workspaceRoot);
+    this.removeFilesExecutor = new RemoveFilesExecutor(workspaceRoot);
+    this.invalidateCache();
+    logger.info('ToolManager workspace root updated', { workspaceRoot }, LogCategory.TOOLS);
   }
 
   /**
@@ -81,22 +126,18 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   }
 
   /**
-   * 注册 Skill 执行器
+   * 内置工具名称列表
    */
-  registerSkillExecutor(skillId: string, executor: ToolExecutor): void {
-    this.skillExecutors.set(skillId, executor);
-    this.invalidateCache();
-    logger.info(`Registered Skill executor: ${skillId}`, undefined, LogCategory.TOOLS);
-  }
-
-  /**
-   * 注销 Skill 执行器
-   */
-  unregisterSkillExecutor(skillId: string): void {
-    this.skillExecutors.delete(skillId);
-    this.invalidateCache();
-    logger.info(`Unregistered Skill executor: ${skillId}`, undefined, LogCategory.TOOLS);
-  }
+  private readonly builtinToolNames = [
+    'execute_shell',
+    'Bash',
+    'text_editor',
+    'grep_search',
+    'remove_files',
+    'web_search',
+    'web_fetch',
+    'mermaid_diagram'
+  ];
 
   /**
    * 执行工具调用
@@ -122,12 +163,12 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         };
       }
 
-      // 检查是否是内置 Shell 工具
-      if (toolCall.name === 'execute_shell' || toolCall.name === 'Bash') {
-        return await this.executeShellTool(toolCall);
+      // 检查是否是内置工具
+      if (this.builtinToolNames.includes(toolCall.name)) {
+        return await this.executeBuiltinTool(toolCall);
       }
 
-      // 查找工具定义
+      // 查找 MCP 工具
       const toolDef = await this.findTool(toolCall.name);
       if (!toolDef) {
         return {
@@ -137,18 +178,16 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         };
       }
 
-      // 根据工具来源执行
+      // 执行 MCP 工具
       if (toolDef.metadata.source === 'mcp') {
         return await this.executeMCPTool(toolCall, toolDef);
-      } else if (toolDef.metadata.source === 'skill') {
-        return await this.executeSkillTool(toolCall, toolDef);
-      } else {
-        return {
-          toolCallId: toolCall.id,
-          content: `Unknown tool source: ${toolDef.metadata.source}`,
-          isError: true,
-        };
       }
+
+      return {
+        toolCallId: toolCall.id,
+        content: `Unknown tool source: ${toolDef.metadata.source}`,
+        isError: true,
+      };
     } catch (error: any) {
       logger.error('Tool execution failed', {
         toolName: toolCall.name,
@@ -160,6 +199,42 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         content: `Tool execution failed: ${error.message}`,
         isError: true,
       };
+    }
+  }
+
+  /**
+   * 执行内置工具
+   */
+  private async executeBuiltinTool(toolCall: ToolCall): Promise<ToolResult> {
+    const { name } = toolCall;
+
+    switch (name) {
+      case 'execute_shell':
+      case 'Bash':
+        return await this.executeShellTool(toolCall);
+
+      case 'text_editor':
+        return await this.fileExecutor.execute(toolCall);
+
+      case 'grep_search':
+        return await this.searchExecutor.execute(toolCall);
+
+      case 'remove_files':
+        return await this.removeFilesExecutor.execute(toolCall);
+
+      case 'web_search':
+      case 'web_fetch':
+        return await this.webExecutor.execute(toolCall);
+
+      case 'mermaid_diagram':
+        return await this.mermaidExecutor.execute(toolCall);
+
+      default:
+        return {
+          toolCallId: toolCall.id,
+          content: `Unknown builtin tool: ${name}`,
+          isError: true,
+        };
     }
   }
 
@@ -233,16 +308,9 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
     const tools: ExtendedToolDefinition[] = [];
 
-    // 添加内置 Shell 工具（使用 VSCode Terminal 实现可视化）
-    const shellTool = this.terminalExecutor.getToolDefinition();
-    tools.push({
-      ...shellTool,
-      metadata: {
-        source: 'builtin',
-        category: 'system',
-        tags: ['shell', 'command', 'execution', 'terminal'],
-      },
-    });
+    // 添加所有内置工具
+    const builtinTools = this.getBuiltinTools();
+    tools.push(...builtinTools);
 
     // 收集所有 MCP 工具
     for (const [serverId, executor] of this.mcpExecutors) {
@@ -256,28 +324,50 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       }
     }
 
-    // 收集所有 Skill 工具
-    for (const [skillId, executor] of this.skillExecutors) {
-      try {
-        const skillTools = await executor.getTools();
-        tools.push(...skillTools);
-      } catch (error: any) {
-        logger.error(`Failed to get tools from Skill: ${skillId}`, {
-          error: error.message,
-        }, LogCategory.TOOLS);
-      }
-    }
-
     // 更新缓存
     for (const tool of tools) {
       this.toolCache.set(tool.name, tool);
     }
 
     logger.info(`Loaded ${tools.length} tools`, {
-      builtin: 1,
+      builtin: builtinTools.length,
       mcp: this.mcpExecutors.size,
-      skills: this.skillExecutors.size,
     }, LogCategory.TOOLS);
+
+    return tools;
+  }
+
+  /**
+   * 获取所有内置工具定义
+   */
+  private getBuiltinTools(): ExtendedToolDefinition[] {
+    const tools: ExtendedToolDefinition[] = [];
+
+    // 1. execute_shell (终端命令)
+    const shellTool = this.terminalExecutor.getToolDefinition();
+    tools.push({
+      ...shellTool,
+      metadata: {
+        source: 'builtin',
+        category: 'system',
+        tags: ['shell', 'command', 'execution', 'terminal'],
+      },
+    });
+
+    // 2. text_editor (文件编辑)
+    tools.push(this.fileExecutor.getToolDefinition());
+
+    // 3. grep_search (代码搜索)
+    tools.push(this.searchExecutor.getToolDefinition());
+
+    // 4. remove_files (文件删除)
+    tools.push(this.removeFilesExecutor.getToolDefinition());
+
+    // 5-6. web_search, web_fetch (网络搜索/获取)
+    tools.push(...this.webExecutor.getToolDefinitions());
+
+    // 7. mermaid_diagram (Mermaid 图表)
+    tools.push(this.mermaidExecutor.getToolDefinition());
 
     return tools;
   }
@@ -286,10 +376,12 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    * 检查工具是否可用
    */
   async isAvailable(toolName: string): Promise<boolean> {
-    if (toolName === 'execute_shell') {
+    // 内置工具始终可用
+    if (this.builtinToolNames.includes(toolName)) {
       return true;
     }
 
+    // 检查 MCP 工具
     const tool = await this.findTool(toolName);
     return !!tool;
   }
@@ -400,41 +492,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   }
 
   /**
-   * 执行 Skill 工具
-   */
-  private async executeSkillTool(
-    toolCall: ToolCall,
-    toolDef: ExtendedToolDefinition
-  ): Promise<ToolResult> {
-    const skillId = toolDef.metadata.sourceId;
-    if (!skillId) {
-      return {
-        toolCallId: toolCall.id,
-        content: 'Skill ID not found in tool metadata',
-        isError: true,
-      };
-    }
-
-    let executor = this.skillExecutors.get(skillId);
-    if (!executor) {
-      if (this.skillExecutors.size === 1) {
-        executor = Array.from(this.skillExecutors.values())[0];
-        logger.warn('Skill executor not found by skillId, falling back to sole executor', {
-          skillId,
-        }, LogCategory.TOOLS);
-      } else {
-        return {
-          toolCallId: toolCall.id,
-          content: `Skill '${skillId}' not found`,
-          isError: true,
-        };
-      }
-    }
-
-    return await executor.execute(toolCall);
-  }
-
-  /**
    * 使缓存失效
    */
   private invalidateCache(): void {
@@ -446,9 +503,16 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    */
   getStats() {
     return {
+      builtinTools: this.builtinToolNames.length,
       mcpServers: this.mcpExecutors.size,
-      skills: this.skillExecutors.size,
       cachedTools: this.toolCache.size,
     };
+  }
+
+  /**
+   * 获取工作区路径
+   */
+  getWorkspaceRoot(): string {
+    return this.workspaceRoot;
   }
 }

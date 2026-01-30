@@ -5,6 +5,7 @@
 import { logger, LogCategory } from './logging';
 import * as vscode from 'vscode';
 import { WebviewProvider } from './ui/webview-provider';
+import { MermaidPanel } from './ui/mermaid-panel';
 import { globalEventBus } from './events';
 import { registerTerminalTest } from './test/terminal-test';
 
@@ -171,6 +172,13 @@ function registerCommands(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand('multiCli.stopTask', () => {
       globalEventBus.emitEvent('task:cancelled', {});
+    })
+  );
+
+  // 注册 Mermaid 图表在新标签页打开命令
+  context.subscriptions.push(
+    vscode.commands.registerCommand('multiCli.openMermaidPanel', (code: string, title?: string) => {
+      MermaidPanel.createOrShow(context.extensionUri, code, title);
     })
   );
 }

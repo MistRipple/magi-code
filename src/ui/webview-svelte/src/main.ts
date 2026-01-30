@@ -5,23 +5,36 @@ import { initMessageHandler } from './lib/message-handler';
 import { getInitialSessionId, vscode } from './lib/vscode-bridge';
 import { setCurrentSessionId } from './stores/messages.svelte';
 
-// 初始化 sessionId（从扩展宿主注入的值）
-const initialSessionId = getInitialSessionId();
-if (initialSessionId) {
-  setCurrentSessionId(initialSessionId);
-  console.log('[Main] 初始 sessionId:', initialSessionId);
+declare global {
+  interface Window {
+    __MULTICLI_WEBVIEW_BOOTED__?: boolean;
+  }
 }
 
-// 初始化消息处理器
-initMessageHandler();
+let app: ReturnType<typeof mount> | undefined;
 
-// 挂载 Svelte 应用
-const app = mount(App, {
-  target: document.getElementById('app')!,
-});
+if (window.__MULTICLI_WEBVIEW_BOOTED__) {
+  console.warn('[Main] webview 已初始化，跳过重复挂载');
+} else {
+  window.__MULTICLI_WEBVIEW_BOOTED__ = true;
 
-// 通知扩展宿主 webview 已就绪
-vscode.postMessage({ type: 'webviewReady' });
+  // 初始化 sessionId（从扩展宿主注入的值）
+  const initialSessionId = getInitialSessionId();
+  if (initialSessionId) {
+    setCurrentSessionId(initialSessionId);
+    console.log('[Main] 初始 sessionId:', initialSessionId);
+  }
+
+  // 初始化消息处理器
+  initMessageHandler();
+
+  // 挂载 Svelte 应用
+  app = mount(App, {
+    target: document.getElementById('app')!,
+  });
+
+  // 通知扩展宿主 webview 已就绪
+  vscode.postMessage({ type: 'webviewReady' });
+}
 
 export default app;
-

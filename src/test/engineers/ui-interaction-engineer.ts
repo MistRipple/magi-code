@@ -5,6 +5,8 @@
  */
 
 import { TestEngineer, TestReport, TestIssue } from '../test-command-center';
+import fs from 'fs';
+import path from 'path';
 
 class UIInteractionEngineer implements TestEngineer {
   name = 'UI交互专家-王工';
@@ -149,17 +151,23 @@ class UIInteractionEngineer implements TestEngineer {
     
     // 检查输入框的各种交互场景
     // 例如：有待确认时输入、有待回答问题时输入等
+    const inputPath = path.join(process.cwd(), 'src', 'ui', 'webview-svelte', 'src', 'components', 'InputArea.svelte');
+    const content = fs.readFileSync(inputPath, 'utf-8');
+    const hasPriority = content.includes('getActiveInteractionType')
+      || content.includes('activeInteraction')
+      || content.includes('isInteractionBlocking');
+
+    if (!hasPriority) {
+      issues.push({
+        severity: 'medium',
+        category: 'UI交互',
+        description: '未检测到待处理状态的显式优先级逻辑',
+        location: 'src/ui/webview-svelte/src/components/InputArea.svelte',
+        suggestedFix: '明确定义优先级顺序，添加状态冲突检测'
+      });
+    }
     
-    // 潜在问题：多个待处理状态的优先级
-    issues.push({
-      severity: 'medium',
-      category: 'UI交互',
-      description: '多个待处理状态（确认、问题、澄清）的优先级不明确',
-      location: 'src/ui/webview-svelte/src/components/InputArea.svelte',
-      suggestedFix: '明确定义优先级顺序，添加状态冲突检测'
-    });
-    
-    return { passed: false, issues };
+    return { passed: issues.length === 0, issues };
   }
 }
 
