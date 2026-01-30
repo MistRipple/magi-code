@@ -1024,6 +1024,35 @@ export class IntelligentOrchestrator {
     this.missionDrivenEngine.resetOrchestratorTokenUsage();
   }
 
+  async recordContextMessage(
+    role: 'user' | 'assistant' | 'system',
+    content: string,
+    sessionId?: string
+  ): Promise<void> {
+    await this.missionDrivenEngine.recordContextMessage(role, content, sessionId);
+  }
+
+  async recordStreamingMessage(
+    messageId: string,
+    role: 'user' | 'assistant' | 'system',
+    content: string,
+    sessionId?: string
+  ): Promise<void> {
+    await this.missionDrivenEngine.recordStreamingMessage(messageId, role, content, sessionId);
+  }
+
+  clearStreamingMessage(messageId: string): void {
+    this.missionDrivenEngine.clearStreamingMessage(messageId);
+  }
+
+  async recordToolOutput(toolName: string, output: string, sessionId?: string): Promise<void> {
+    await this.missionDrivenEngine.recordToolOutput(toolName, output, sessionId);
+  }
+
+  async reloadCompressionAdapter(): Promise<void> {
+    await this.missionDrivenEngine.reloadCompressionAdapter();
+  }
+
   /** 设置扩展上下文（用于持久化统计数据） */
   setExtensionContext(context: import('vscode').ExtensionContext): void {
     this.missionDrivenEngine.setExtensionContext(context);

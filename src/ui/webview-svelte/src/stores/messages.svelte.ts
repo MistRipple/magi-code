@@ -39,6 +39,8 @@ let currentSessionId = $state<string | null>(null);
 
 // 处理状态
 let isProcessing = $state(false);
+let backendProcessing = $state(false);
+let activeMessageIds = $state<Set<string>>(new Set());
 let thinkingStartAt = $state<number | null>(null);
 let processingActor = $state<ProcessingActor>({
   source: 'orchestrator',
@@ -215,7 +217,8 @@ export function updateSessions(newSessions: Session[]) {
 
 // 处理状态操作
 export function setIsProcessing(value: boolean) {
-  isProcessing = value;
+  backendProcessing = value;
+  updateProcessingState();
 }
 
 export function setThinkingStartAt(value: number | null) {
@@ -237,6 +240,64 @@ export function setMissionPlan(plan: MissionPlan | null) {
   missionPlan = plan;
 }
 
+function updateProcessingState() {
+  isProcessing = backendProcessing || activeMessageIds.size > 0;
+}
+
+export function markMessageActive(id: string) {
+  if (!id) return;
+  if (!activeMessageIds.has(id)) {
+    const next = new Set(activeMessageIds);
+    next.add(id);
+    activeMessageIds = next;
+    updateProcessingState();
+  }
+}
+
+export function markMessageComplete(id: string) {
+  if (!id) return;
+  if (activeMessageIds.has(id)) {
+    const next = new Set(activeMessageIds);
+    next.delete(id);
+    activeMessageIds = next;
+    updateProcessingState();
+  }
+}
+
+export function clearProcessingState() {
+  backendProcessing = false;
+  activeMessageIds = new Set();
+  updateProcessingState();
+}
+
+export function clearPendingInteractions() {
+  pendingConfirmation = null;
+  pendingRecovery = null;
+  pendingQuestion = null;
+  pendingClarification = null;
+  pendingWorkerQuestion = null;
+  pendingToolAuthorization = null;
+}
+
+export function addToast(type: string, message: string, title?: string) {
+  const toast = {
+    id: `toast_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    type,
+    title,
+    message,
+  };
+  toasts = [...toasts, toast];
+}
+
+export function getActiveInteractionType(): string | null {
+  if (pendingRecovery) return 'recovery';
+  if (pendingConfirmation) return 'confirmation';
+  if (pendingToolAuthorization) return 'toolAuthorization';
+  if (pendingClarification) return 'clarification';
+  if (pendingQuestion) return 'question';
+  if (pendingWorkerQuestion) return 'workerQuestion';
+  return null;
+}
 // 消息操作
 export function addThreadMessage(message: Message) {
   // 完全重建数组以确保响应式更新
@@ -289,6 +350,44 @@ export function updateAgentMessage(agent: AgentType, messageId: string, updates:
 
 export function clearAgentMessages(agent: AgentType) {
   agentOutputs = { ...agentOutputs, [agent]: [] };
+  saveWebviewState();
+}
+
+export function clearAgentOutputs() {
+  agentOutputs = {
+    claude: [],
+    codex: [],
+    gemini: [],
+  };
+  saveWebviewState();
+}
+
+// 清空所有消息（用于会话切换/新建）
+export function clearAllMessages() {
+  threadMessages = [];
+  agentOutputs = {
+    claude: [],
+    codex: [],
+    gemini: [],
+  };
+  clearPendingInteractions();
+  clearProcessingState();
+  saveWebviewState();
+}
+
+// 设置完整的消息列表（用于会话切换时加载历史）
+export function setThreadMessages(messages: Message[]) {
+  threadMessages = messages.map(m => JSON.parse(JSON.stringify(m)) as Message);
+  saveWebviewState();
+}
+
+// 设置完整的 agent 消息列表（用于会话切换时加载历史）
+export function setAgentOutputs(outputs: AgentOutputs) {
+  agentOutputs = {
+    claude: (outputs.claude || []).map(m => JSON.parse(JSON.stringify(m)) as Message),
+    codex: (outputs.codex || []).map(m => JSON.parse(JSON.stringify(m)) as Message),
+    gemini: (outputs.gemini || []).map(m => JSON.parse(JSON.stringify(m)) as Message),
+  };
   saveWebviewState();
 }
 

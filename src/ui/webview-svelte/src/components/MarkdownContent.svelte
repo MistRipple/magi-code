@@ -1,7 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { marked } from 'marked';
+  import { marked, type Token, type Tokens } from 'marked';
   import hljs from 'highlight.js';
+  import MermaidRenderer from './MermaidRenderer.svelte';
+  import CodeBlock from './CodeBlock.svelte';
 
   // Props
   interface Props {
@@ -10,8 +12,13 @@
   }
   let { content, isStreaming = false }: Props = $props();
 
-  // 渲染后的 HTML
-  let renderedHtml = $state('');
+  // 内容段落类型
+  type ContentSegment =
+    | { type: 'markdown'; html: string }
+    | { type: 'code'; code: string; language: string };
+
+  // 解析后的内容段落
+  let segments = $state<ContentSegment[]>([]);
 
   // 配置 marked
   onMount(() => {
@@ -21,30 +28,64 @@
     });
   });
 
-  // 响应式渲染 Markdown
+  // 解析内容为段落
   $effect(() => {
-    // 依赖 content 变化
-    if (content) {
-      try {
-        // 同步解析 Markdown
-        const result = marked.parse(content, { async: false });
-        renderedHtml = typeof result === 'string' ? result : '';
-      } catch (error) {
-        console.error('[MarkdownContent] 解析错误:', error);
-        renderedHtml = `<p>${content}</p>`;
+    if (!content) {
+      segments = [];
+      return;
+    }
+
+    try {
+      // 使用 marked.lexer 解析 markdown 为 tokens
+      const tokens = marked.lexer(content);
+      const result: ContentSegment[] = [];
+      let pendingTokens: Token[] = [];
+
+      // 将待处理的 tokens 渲染为 HTML
+      function flushPendingTokens() {
+        if (pendingTokens.length > 0) {
+          const html = marked.parser(pendingTokens as Token[]);
+          if (html.trim()) {
+            result.push({ type: 'markdown', html });
+          }
+          pendingTokens = [];
+        }
       }
-    } else {
-      renderedHtml = '';
+
+      // 遍历 tokens，提取代码块
+      for (const token of tokens) {
+        if (token.type === 'code') {
+          const codeToken = token as Tokens.Code;
+          const lang = (codeToken.lang || '').toLowerCase();
+
+          // 代码块：先渲染之前的 markdown，再添加代码段落
+          flushPendingTokens();
+          result.push({
+            type: 'code',
+            code: codeToken.text,
+            language: lang,
+          });
+        } else {
+          // 非代码块：累积到待处理 tokens
+          pendingTokens.push(token);
+        }
+      }
+
+      // 处理剩余的 tokens
+      flushPendingTokens();
+
+      segments = result;
+    } catch (error) {
+      console.error('[MarkdownContent] 解析错误:', error);
+      segments = [{ type: 'markdown', html: `<p>${content}</p>` }];
     }
   });
 
   // 代码高亮处理
   $effect(() => {
-    // 当 renderedHtml 变化后，对代码块进行高亮
-    if (renderedHtml && !isStreaming) {
-      // 使用 tick 或 setTimeout 确保 DOM 更新后执行
+    if (segments.length > 0 && !isStreaming) {
       setTimeout(() => {
-        const codeBlocks = document.querySelectorAll('pre code:not(.hljs)');
+        const codeBlocks = document.querySelectorAll('.markdown-content pre code:not(.hljs)');
         codeBlocks.forEach((block) => {
           hljs.highlightElement(block as HTMLElement);
         });
@@ -54,7 +95,17 @@
 </script>
 
 <div class="markdown-content" class:streaming={isStreaming}>
-  {@html renderedHtml}
+  {#each segments as segment, i (i)}
+    {#if segment.type === 'markdown'}
+      {@html segment.html}
+    {:else if segment.type === 'code'}
+      <CodeBlock
+        code={segment.code}
+        language={segment.language}
+        showLineNumbers={segment.language !== 'mermaid'}
+      />
+    {/if}
+  {/each}
 </div>
 
 <style>
@@ -148,4 +199,3 @@
     border-radius: var(--radius-sm);
   }
 </style>
-

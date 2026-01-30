@@ -404,6 +404,8 @@ export class MissionDrivenEngine extends EventEmitter {
       );
     }
 
+    await this.configureContextCompression();
+
     logger.info('编排器.任务引擎.初始化.完成', undefined, LogCategory.ORCHESTRATOR);
   }
 
@@ -988,6 +990,58 @@ export class MissionDrivenEngine extends EventEmitter {
     logger.debug('编排器.任务引擎.消息.已记录', { length: content.length }, LogCategory.ORCHESTRATOR);
   }
 
+  async recordContextMessage(
+    role: 'user' | 'assistant' | 'system',
+    content: string,
+    sessionId?: string
+  ): Promise<void> {
+    if (!content) {
+      return;
+    }
+    const resolvedSessionId = sessionId || this.sessionManager.getCurrentSession()?.id || '';
+    if (!resolvedSessionId) {
+      return;
+    }
+    await this.ensureContextReady(resolvedSessionId);
+    this.contextManager.addMessage({ role, content });
+  }
+
+  async recordStreamingMessage(
+    messageId: string,
+    role: 'user' | 'assistant' | 'system',
+    content: string,
+    sessionId?: string
+  ): Promise<void> {
+    if (!messageId || !content) {
+      return;
+    }
+    const resolvedSessionId = sessionId || this.sessionManager.getCurrentSession()?.id || '';
+    if (!resolvedSessionId) {
+      return;
+    }
+    await this.ensureContextReady(resolvedSessionId);
+    this.contextManager.updateStreamingMessage(messageId, { role, content });
+  }
+
+  clearStreamingMessage(messageId: string): void {
+    if (!messageId) {
+      return;
+    }
+    this.contextManager.clearStreamingMessage(messageId);
+  }
+
+  async recordToolOutput(toolName: string, output: string, sessionId?: string): Promise<void> {
+    if (!toolName || !output) {
+      return;
+    }
+    const resolvedSessionId = sessionId || this.sessionManager.getCurrentSession()?.id || '';
+    if (!resolvedSessionId) {
+      return;
+    }
+    await this.ensureContextReady(resolvedSessionId);
+    this.contextManager.addToolOutput(toolName, output);
+  }
+
   /**
    * 取消执行
    */
@@ -1019,6 +1073,10 @@ export class MissionDrivenEngine extends EventEmitter {
    */
   resetOrchestratorTokenUsage(): void {
     this.orchestratorTokens = { inputTokens: 0, outputTokens: 0 };
+  }
+
+  async reloadCompressionAdapter(): Promise<void> {
+    await this.configureContextCompression();
   }
 
   /**
@@ -1112,15 +1170,15 @@ export class MissionDrivenEngine extends EventEmitter {
       wantsParallel: analysis.wantsParallel,
     };
     const explicitWorkers = Array.from(new Set((analysis.explicitWorkers || []).filter(Boolean)));
-    const preferredWorker = analysis.recommendedWorker
-      || (analysis.targetFiles.length > 0 ? 'codex' : undefined);
     const preferredWorkers = explicitWorkers.length > 0
       ? explicitWorkers
-      : (preferredWorker ? [preferredWorker] : undefined);
+      : (analysis.recommendedWorker ? [analysis.recommendedWorker] : undefined);
 
     // 选择参与者
     const participants = await this.missionOrchestrator.selectParticipants(mission, {
       preferredWorkers,
+      category: analysis.category,
+      categories: analysis.matchedCategories,
     });
 
     // 定义契约
@@ -1128,6 +1186,66 @@ export class MissionDrivenEngine extends EventEmitter {
 
     // 分配职责
     await this.missionOrchestrator.assignResponsibilities(mission, participants);
+  }
+
+  private async configureContextCompression(): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../../llm/config');
+      const { createLLMClient } = await import('../../llm/clients/client-factory');
+      const compressorConfig = LLMConfigLoader.loadCompressorConfig();
+
+      if (!compressorConfig.enabled) {
+        this.contextManager.setCompressorAdapter(null);
+        logger.info('编排器.上下文.压缩器.未启用', undefined, LogCategory.ORCHESTRATOR);
+        return;
+      }
+
+      const adapter = {
+        sendMessage: async (message: string) => {
+          const startAt = Date.now();
+          try {
+            const client = createLLMClient(compressorConfig);
+            const response = await client.sendMessage({
+              messages: [{ role: 'user', content: message }],
+              maxTokens: 2000,
+              temperature: 0.3,
+            });
+            const duration = Date.now() - startAt;
+            this.executionStats.recordExecution({
+              worker: 'compressor',
+              taskId: 'memory',
+              subTaskId: 'compress',
+              success: true,
+              duration,
+              inputTokens: response.usage?.inputTokens,
+              outputTokens: response.usage?.outputTokens,
+              phase: 'integration',
+            });
+            return response.content || '';
+          } catch (error: any) {
+            const duration = Date.now() - startAt;
+            this.executionStats.recordExecution({
+              worker: 'compressor',
+              taskId: 'memory',
+              subTaskId: 'compress',
+              success: false,
+              duration,
+              error: error?.message,
+              phase: 'integration',
+            });
+            throw error;
+          }
+        },
+      };
+
+      this.contextManager.setCompressorAdapter(adapter);
+      logger.info('编排器.上下文.压缩器.已设置', {
+        model: compressorConfig.model,
+        provider: compressorConfig.provider
+      }, LogCategory.ORCHESTRATOR);
+    } catch (error) {
+      logger.error('编排器.上下文.压缩器.设置失败', error, LogCategory.ORCHESTRATOR);
+    }
   }
 
   private async ensureContextReady(sessionId: string): Promise<void> {

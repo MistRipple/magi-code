@@ -51,8 +51,8 @@ async function runTest(name: string, testFn: () => Promise<any>): Promise<TestRe
 class MockAdapterFactory {
   private toolManager: ToolManager;
 
-  constructor(permissions: PermissionMatrix) {
-    this.toolManager = new ToolManager(permissions);
+  constructor(permissions: PermissionMatrix, workspaceRoot: string = process.cwd()) {
+    this.toolManager = new ToolManager(workspaceRoot, permissions);
   }
 
   getToolManager(): ToolManager {
@@ -80,7 +80,7 @@ class MockAdapterFactory {
  * 创建测试用的编排器
  */
 function createTestOrchestrator(permissions: PermissionMatrix, projectRoot: string): IntelligentOrchestrator {
-  const adapterFactory = new MockAdapterFactory(permissions);
+  const adapterFactory = new MockAdapterFactory(permissions, projectRoot);
   const sessionManager = new UnifiedSessionManager(projectRoot);
   const snapshotManager = new SnapshotManager(sessionManager, projectRoot);
 
@@ -277,7 +277,7 @@ async function runTests(): Promise<void> {
       allowWeb: true,
     };
 
-    const toolManager = new ToolManager(permissions);
+    const toolManager = new ToolManager(process.cwd(), permissions);
 
     const toolCall: ToolCall = {
       id: 'test-bash-1',
@@ -301,7 +301,7 @@ async function runTests(): Promise<void> {
       allowWeb: true,
     };
 
-    const toolManager = new ToolManager(permissions);
+    const toolManager = new ToolManager(process.cwd(), permissions);
 
     const toolCall: ToolCall = {
       id: 'test-bash-2',
@@ -326,7 +326,7 @@ async function runTests(): Promise<void> {
       allowWeb: true,
     };
 
-    const toolManager = new ToolManager(permissions);
+    const toolManager = new ToolManager(process.cwd(), permissions);
 
     const toolCall: ToolCall = {
       id: 'test-edit-1',
@@ -354,7 +354,7 @@ async function runTests(): Promise<void> {
       allowWeb: true,
     };
 
-    const toolManager = new ToolManager(permissions);
+    const toolManager = new ToolManager(process.cwd(), permissions);
 
     const toolCall: ToolCall = {
       id: 'test-write-1',
@@ -381,7 +381,7 @@ async function runTests(): Promise<void> {
       allowWeb: false,
     };
 
-    const toolManager = new ToolManager(permissions);
+    const toolManager = new ToolManager(process.cwd(), permissions);
 
     const toolCall: ToolCall = {
       id: 'test-web-1',
@@ -405,7 +405,7 @@ async function runTests(): Promise<void> {
       allowWeb: false,
     };
 
-    const toolManager = new ToolManager(permissions);
+    const toolManager = new ToolManager(process.cwd(), permissions);
 
     const toolCall: ToolCall = {
       id: 'test-read-1',
@@ -431,7 +431,7 @@ async function runTests(): Promise<void> {
       allowWeb: true,
     };
 
-    const toolManager = new ToolManager(initialPermissions);
+    const toolManager = new ToolManager(process.cwd(), initialPermissions);
 
     // 测试 getPermissions
     const currentPermissions = toolManager.getPermissions();
@@ -545,6 +545,136 @@ async function runTests(): Promise<void> {
     console.log('  - MissionOrchestrator 可以访问知识库 ✓');
 
     console.log('  - 知识库传递链完整');
+  }));
+
+  // ============================================================================
+  // 测试组 5: 内置工具端到端测试
+  // ============================================================================
+  console.log('\n' + '='.repeat(80));
+  console.log('测试组 5: 内置工具端到端测试');
+  console.log('='.repeat(80));
+
+  results.push(await runTest('5.1 - ToolManager 包含所有内置工具', async () => {
+    const toolManager = new ToolManager(process.cwd());
+    const tools = await toolManager.getTools();
+
+    const expectedTools = [
+      'execute_shell',
+      'text_editor',
+      'grep_search',
+      'remove_files',
+      'web_search',
+      'web_fetch',
+      'mermaid_diagram'
+    ];
+
+    for (const toolName of expectedTools) {
+      const tool = tools.find(t => t.name === toolName);
+      if (!tool) throw new Error(`缺少内置工具: ${toolName}`);
+      if (tool.metadata?.source !== 'builtin') {
+        throw new Error(`工具 ${toolName} 的 source 不是 'builtin'`);
+      }
+    }
+
+    console.log(`  - 找到 ${expectedTools.length} 个内置工具`);
+    console.log(`  - 工具列表: ${expectedTools.join(', ')}`);
+  }));
+
+  results.push(await runTest('5.2 - mermaid_diagram 工具执行', async () => {
+    const toolManager = new ToolManager(process.cwd());
+
+    const toolCall: ToolCall = {
+      id: 'test-mermaid-1',
+      name: 'mermaid_diagram',
+      arguments: {
+        code: `graph TD
+    A[开始] --> B{判断}
+    B -->|是| C[执行操作]
+    B -->|否| D[结束]`,
+        title: '测试流程图',
+        theme: 'dark'
+      }
+    };
+
+    const result = await toolManager.execute(toolCall);
+
+    if (result.isError) throw new Error(`执行失败: ${result.content}`);
+
+    // 验证返回的 JSON 格式
+    const data = JSON.parse(result.content);
+    if (data.type !== 'mermaid_diagram') throw new Error('返回类型不正确');
+    if (!data.code) throw new Error('缺少 code 字段');
+    if (data.diagramType !== 'flowchart') throw new Error('diagramType 不正确');
+
+    console.log(`  - 图表类型: ${data.diagramType}`);
+    console.log(`  - 标题: ${data.title}`);
+    console.log(`  - 主题: ${data.theme}`);
+  }));
+
+  results.push(await runTest('5.3 - mermaid_diagram 验证错误的代码', async () => {
+    const toolManager = new ToolManager(process.cwd());
+
+    const toolCall: ToolCall = {
+      id: 'test-mermaid-2',
+      name: 'mermaid_diagram',
+      arguments: {
+        code: 'invalid mermaid code without diagram type'
+      }
+    };
+
+    const result = await toolManager.execute(toolCall);
+
+    if (!result.isError) throw new Error('应该返回错误');
+    if (!result.content.includes('Unrecognized')) {
+      throw new Error(`错误消息不正确: ${result.content}`);
+    }
+
+    console.log(`  - 正确拒绝无效的 Mermaid 代码`);
+  }));
+
+  results.push(await runTest('5.4 - grep_search 工具执行', async () => {
+    const toolManager = new ToolManager(process.cwd());
+
+    const toolCall: ToolCall = {
+      id: 'test-grep-1',
+      name: 'grep_search',
+      arguments: {
+        pattern: 'ToolManager',
+        include: '*.ts'
+      }
+    };
+
+    const result = await toolManager.execute(toolCall);
+
+    if (result.isError) throw new Error(`执行失败: ${result.content}`);
+    if (!result.content.includes('tool-manager.ts')) {
+      throw new Error('未找到预期的文件');
+    }
+
+    console.log(`  - 搜索结果包含 tool-manager.ts`);
+  }));
+
+  results.push(await runTest('5.5 - text_editor view 命令', async () => {
+    const toolManager = new ToolManager(process.cwd());
+
+    const toolCall: ToolCall = {
+      id: 'test-editor-1',
+      name: 'text_editor',
+      arguments: {
+        command: 'view',
+        path: 'package.json',
+        view_range: [1, 5]
+      }
+    };
+
+    const result = await toolManager.execute(toolCall);
+
+    if (result.isError) throw new Error(`执行失败: ${result.content}`);
+    if (!result.content.includes('multicli')) {
+      throw new Error('未找到预期的内容');
+    }
+
+    console.log(`  - 成功读取 package.json 前 5 行`);
   }));
 
   // ============================================================================

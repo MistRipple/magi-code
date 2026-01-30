@@ -46,7 +46,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   constructor(options: { cwd: string }) {
     super();
     this.workspaceRoot = options.cwd;
-    this.toolManager = new ToolManager();
+    this.toolManager = new ToolManager(options.cwd);
     this.profileLoader = new AgentProfileLoader();
     logger.info('LLM Adapter Factory initialized', { cwd: options.cwd }, LogCategory.LLM);
   }
@@ -88,23 +88,25 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   }
 
   /**
-   * 加载并注册 Skills
+   * 加载并注册 Skills（用于指令型 Skills 和自定义工具）
    */
   private async loadSkills(): Promise<void> {
     try {
       // 加载 Skills 配置
       const skillsConfig = LLMConfigLoader.loadSkillsConfig();
 
-      // 创建 SkillsManager
-      this.skillsManager = new SkillsManager(skillsConfig, {
-        workspaceRoot: this.workspaceRoot,
+      // 创建 SkillsManager（仅管理指令型 Skills 和自定义工具）
+      this.skillsManager = new SkillsManager({
+        customTools: skillsConfig?.customTools || [],
+        instructionSkills: skillsConfig?.instructionSkills || [],
       });
 
-      // 注册到 ToolManager
-      this.toolManager.registerSkillExecutor('claude-skills', this.skillsManager);
+      // 注意：内置工具已由 ToolManager 直接管理，不需要注册 SkillsManager
+      // SkillsManager 现在仅用于指令型 Skills 提示注入
 
-      logger.info('Skills loaded and registered', {
-        enabledTools: (await this.skillsManager.getTools()).length
+      logger.info('Skills loaded', {
+        customTools: this.skillsManager.getCustomTools().length,
+        instructionSkills: this.skillsManager.getInstructionSkills().length,
       }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to load skills', { error: error.message }, LogCategory.TOOLS);
@@ -115,12 +117,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
    * 重新加载 Skills（用于安装新 skill 后）
    */
   async reloadSkills(): Promise<void> {
-    // 注销旧的 SkillsManager
-    if (this.skillsManager) {
-      this.toolManager.unregisterSkillExecutor('claude-skills');
-    }
-
-    // 重新加载
+    // 重新加载 Skills 配置
     await this.loadSkills();
 
     // 清除适配器缓存，强制重新创建（以获取新的工具列表）

@@ -110,10 +110,12 @@ export interface AgentOutputs {
 // 会话信息
 export interface Session {
   id: string;
-  name: string;
+  name?: string;  // 可选，未命名会话可能没有 name
   createdAt: number;
   updatedAt: number;
-  messageCount: number;
+  messageCount?: number;
+  preview?: string;  // 会话预览
+  messages?: { id: string; role: string; content: string }[];
 }
 
 // 处理中的 Actor

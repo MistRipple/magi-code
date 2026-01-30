@@ -26,6 +26,7 @@ import {
   MessageLifecycle,
   MessageType,
   ContentBlock,
+  MessageMetadata,
 } from '../protocol/message-protocol';
 import { ADAPTER_EVENTS, MESSAGE_EVENTS, PROCESSING_EVENTS, WEBVIEW_MESSAGE_TYPES } from '../protocol/event-names';
 import { UnifiedSessionManager } from '../session';
@@ -46,6 +47,7 @@ import { parseContentToBlocks } from '../utils/content-parser';
 import { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
 import { InstructionSkillDefinition } from '../tools/skills-manager';
 import { applySkillInstall, buildInstructionSkillPrompt } from '../tools/skill-installation';
+import { MermaidPanel } from './mermaid-panel';
 // Mission-Driven Architecture 类型 - 直接从子模块导入
 import {
   MissionOrchestrator,
@@ -131,7 +133,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private readonly workerStatusSoftTtlMs = 120000;
   private readonly workerStatusTimeoutMs = 4000;
   private readonly workerStatusHardTimeoutMs = 10000;
+  private postMessageQueue: Promise<void> = Promise.resolve();
 
+  private streamingContextCache: Map<string, { content: string; lastFlushAt: number }> = new Map();
+  private messageMetaCache: Map<string, { type?: MessageType; metadata?: Record<string, unknown> | MessageMetadata }> = new Map();
+  private lastRecordedContextBySession: Map<string, { content: string; at: number }> = new Map();
+  private readonly streamingContextFlushMs = 1200;
+  private readonly contextDedupeWindowMs = 10000;
 
   private activeSessionId: string | null = null;
   private logs: LogEntry[] = [];
@@ -567,6 +575,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // MessageBus 事件转发到前端
     this.messageBus.on(MESSAGE_EVENTS.MESSAGE, (message) => {
       this.assertBlocks(message.blocks, 'standardMessage.blocks');
+      this.cacheMessageMeta(message);
+      this.recordStreamingContext(message);
+      this.recordToolOutputsIfAny(message);
       this.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.STANDARD_MESSAGE,
         message,
@@ -579,6 +590,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       if (update.blocks) {
         this.assertBlocks(update.blocks, 'standardUpdate.blocks');
       }
+      this.recordStreamingUpdate(update);
       this.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.STANDARD_UPDATE,
         update,
@@ -589,6 +601,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     this.messageBus.on(MESSAGE_EVENTS.COMPLETE, (message) => {
       this.assertBlocks(message.blocks, 'standardComplete.blocks');
+      this.recordFinalContext(message);
       this.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.STANDARD_COMPLETE,
         message,
@@ -605,6 +618,165 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         sessionId: this.activeSessionId
       } as any);
     });
+  }
+
+  private cacheMessageMeta(message: StandardMessage): void {
+    if (!message?.id) {
+      return;
+    }
+    this.messageMetaCache.set(message.id, {
+      type: message.type,
+      metadata: message.metadata || undefined,
+    });
+  }
+
+  private isRecordableMessage(type?: MessageType, metadata?: Record<string, unknown> | MessageMetadata): boolean {
+    if (metadata && (metadata as any).isStatusMessage) {
+      return false;
+    }
+    if (!type) {
+      return true;
+    }
+    return [
+      MessageType.TEXT,
+      MessageType.RESULT,
+      MessageType.ERROR,
+      MessageType.THINKING,
+      MessageType.INTERACTION,
+    ].includes(type);
+  }
+
+  private extractTextFromBlocks(blocks: ContentBlock[] | undefined): string {
+    if (!blocks || blocks.length === 0) {
+      return '';
+    }
+    return blocks
+      .filter((block) => block.type === 'text' || block.type === 'thinking')
+      .map((block) => (block as any).content || '')
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  private updateStreamingBuffer(messageId: string, nextContent: string, updateType: 'append' | 'replace'): void {
+    if (!messageId || !nextContent) {
+      return;
+    }
+    const entry = this.streamingContextCache.get(messageId);
+    const content = updateType === 'append' && entry ? entry.content + nextContent : nextContent;
+    this.streamingContextCache.set(messageId, {
+      content,
+      lastFlushAt: entry?.lastFlushAt || 0,
+    });
+  }
+
+  private recordStreamingContext(message: StandardMessage): void {
+    if (!message?.id) {
+      return;
+    }
+    if (!this.isRecordableMessage(message.type, message.metadata)) {
+      return;
+    }
+    const content = this.extractTextFromBlocks(message.blocks);
+    if (!content) {
+      return;
+    }
+    this.updateStreamingBuffer(message.id, content, 'replace');
+    this.flushStreamingContext(message.id);
+  }
+
+  private recordStreamingUpdate(update: StreamUpdate): void {
+    if (!update?.messageId) {
+      return;
+    }
+    const meta = this.messageMetaCache.get(update.messageId);
+    if (!this.isRecordableMessage(meta?.type, meta?.metadata)) {
+      return;
+    }
+
+    let content = '';
+    let updateType: 'append' | 'replace' = 'replace';
+    if (update.updateType === 'append' && update.appendText) {
+      content = update.appendText;
+      updateType = 'append';
+    } else if (update.blocks) {
+      content = this.extractTextFromBlocks(update.blocks);
+      updateType = 'replace';
+    }
+
+    if (!content) {
+      return;
+    }
+
+    this.updateStreamingBuffer(update.messageId, content, updateType);
+    this.flushStreamingContext(update.messageId);
+  }
+
+  private flushStreamingContext(messageId: string): void {
+    const entry = this.streamingContextCache.get(messageId);
+    if (!entry) {
+      return;
+    }
+    const now = Date.now();
+    if (now - entry.lastFlushAt < this.streamingContextFlushMs) {
+      return;
+    }
+    entry.lastFlushAt = now;
+    const sessionId = this.activeSessionId || undefined;
+    void this.intelligentOrchestrator.recordStreamingMessage(
+      messageId,
+      'assistant',
+      entry.content,
+      sessionId
+    );
+  }
+
+  private recordFinalContext(message: StandardMessage): void {
+    if (!message?.id) {
+      return;
+    }
+    this.streamingContextCache.delete(message.id);
+    this.intelligentOrchestrator.clearStreamingMessage(message.id);
+
+    if (!this.isRecordableMessage(message.type, message.metadata)) {
+      return;
+    }
+    const content = this.extractTextFromBlocks(message.blocks);
+    if (!content) {
+      return;
+    }
+
+    const sessionId = this.activeSessionId || 'default';
+    const lastRecord = this.lastRecordedContextBySession.get(sessionId);
+    const now = Date.now();
+    if (lastRecord && lastRecord.content === content && now - lastRecord.at < this.contextDedupeWindowMs) {
+      return;
+    }
+    this.lastRecordedContextBySession.set(sessionId, { content, at: now });
+    void this.intelligentOrchestrator.recordContextMessage('assistant', content, sessionId);
+  }
+
+  private recordToolOutputsIfAny(message: StandardMessage): void {
+    if (!message?.blocks || message.blocks.length === 0) {
+      return;
+    }
+    const toolBlocks = message.blocks.filter((block) => block.type === 'tool_call') as Array<{
+      toolName?: string;
+      status?: string;
+      output?: string;
+      error?: string;
+    }>;
+    if (toolBlocks.length === 0) {
+      return;
+    }
+    const sessionId = this.activeSessionId || undefined;
+    for (const tool of toolBlocks) {
+      const toolName = tool.toolName || 'tool';
+      if (tool.status === 'completed' && tool.output) {
+        void this.intelligentOrchestrator.recordToolOutput(toolName, tool.output, sessionId);
+      } else if (tool.status === 'failed' && tool.error) {
+        void this.intelligentOrchestrator.recordToolOutput(toolName, `Error: ${tool.error}`, sessionId);
+      }
+    }
   }
 
   /** 设置智能编排器的 Hard Stop 确认回调 */
@@ -1749,7 +1921,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'renameSession':
         // 重命名会话
         if (this.sessionManager.renameSession(message.sessionId, message.name)) {
-          this.postMessage({ type: 'sessionsUpdated', sessions: this.sessionManager.getAllSessions() as any[] });
+          this.postMessage({ type: 'sessionsUpdated', sessions: this.sessionManager.getSessionMetas() as any[] });
           this.postMessage({ type: 'toast', message: '会话已重命名', toastType: 'success' });
         }
         break;
@@ -1758,12 +1930,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         // 删除会话（统一管理器会清理所有相关资源）
         if (this.sessionManager.deleteSession(message.sessionId)) {
           // 如果删除后没有会话，创建一个新的
-          if (this.sessionManager.getAllSessions().length === 0) {
+          if (this.sessionManager.getSessionMetas().length === 0) {
             const newSession = this.sessionManager.createSession();
             this.activeSessionId = newSession.id;
             this.postMessage({ type: 'sessionCreated', session: newSession as any });
           }
-          this.postMessage({ type: 'sessionsUpdated', sessions: this.sessionManager.getAllSessions() as any[] });
+          this.postMessage({ type: 'sessionsUpdated', sessions: this.sessionManager.getSessionMetas() as any[] });
           this.postMessage({ type: 'toast', message: '会话已删除', toastType: 'info' });
         }
         this.sendStateUpdate();
@@ -2067,6 +2239,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       case 'deleteFAQ':
         await this.handleDeleteFAQ(message.id);
+        break;
+
+      case 'openMermaidPanel':
+        // 在新标签页打开 Mermaid 图表
+        this.handleOpenMermaidPanel((message as any).code, (message as any).title);
         break;
     }
   }
@@ -2680,6 +2857,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       // 保存配置
       LLMConfigLoader.updateCompressorConfig(config);
+
+      await this.intelligentOrchestrator.reloadCompressionAdapter();
 
       this.postMessage({
         type: 'compressorConfigSaved',
@@ -3798,6 +3977,28 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * 在新标签页打开 Mermaid 图表
+   */
+  private handleOpenMermaidPanel(code: string, title?: string): void {
+    if (!code) {
+      logger.warn('Mermaid.打开失败', { reason: '代码为空' }, LogCategory.UI);
+      return;
+    }
+
+    try {
+      MermaidPanel.createOrShow(this.extensionUri, code, title);
+      logger.info('Mermaid.新标签页.已打开', { title }, LogCategory.UI);
+    } catch (error: any) {
+      logger.error('Mermaid.新标签页.失败', { error: error.message }, LogCategory.UI);
+      this.postMessage({
+        type: 'toast',
+        message: `打开图表失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
    * 添加 ADR
    */
   private async handleAddADR(adr: any): Promise<void> {
@@ -4393,14 +4594,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 转换分类配置
       // 注意：keywords 是系统内置配置，不保存到用户配置文件中
       for (const [category, worker] of Object.entries(data.categories)) {
-        if (config.categories?.categories) {
-          (config.categories.categories as any)[category] = {
-            defaultWorker: worker,
-            // keywords 不保存，由系统内置提供
-            priority: 'medium',
-            riskLevel: 'medium',
-          };
-        }
+        if (!config.categories?.categories) continue;
+        (config.categories.categories as any)[category] = {
+          defaultWorker: worker,
+        };
       }
 
       await storage.saveConfig(config);
@@ -4706,6 +4903,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 执行任务 */
   private async executeTask(prompt: string, forceWorker?: WorkerSlot, images?: Array<{dataUrl: string}>): Promise<void> {
     logger.info('界面.任务.执行.开始', { promptLength: prompt.length, imageCount: images?.length || 0, forceWorker: forceWorker || undefined }, LogCategory.UI);
+    const maxPromptLength = 10000;
+    if (prompt.length > maxPromptLength) {
+      this.postMessage({ type: 'toast', message: `输入内容过长（${prompt.length} 字符），请控制在 ${maxPromptLength} 字符以内`, toastType: 'warning' });
+      return;
+    }
 
     // 立即发送 taskAccepted 确认，避免前端超时
     if (this.pendingRequestId) {
@@ -4751,6 +4953,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const effectivePrompt = resolvedSkill.prompt;
 
     this.sessionManager.addMessage('user', prompt);
+    void this.intelligentOrchestrator.recordContextMessage('user', prompt, this.activeSessionId || undefined);
     this.sendStateUpdate();
 
     const orchestrationCommand = this.parseOrchestrationCommand(prompt);
@@ -5087,7 +5290,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     logger.info('界面.会话.已创建', { sessionId: this.activeSessionId }, LogCategory.UI);
     // 通知 webview 新会话已创建
     this.postMessage({ type: 'sessionCreated', session: newSession as any });
-    this.postMessage({ type: 'sessionsUpdated', sessions: this.sessionManager.getAllSessions() as any[] });
+    this.postMessage({ type: 'sessionsUpdated', sessions: this.sessionManager.getSessionMetas() as any[] });
     this.sendStateUpdate();
   }
 
@@ -5097,31 +5300,53 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.activeSessionId = sessionId;
     this.ensureSessionExists(sessionId);
 
-    // 生成会话总结（而不是加载完整历史）
-    const summary = this.sessionManager.getSessionSummary(sessionId);
-    if (summary) {
-      // 发送会话总结给前端
-      this.postMessage({
-        type: 'sessionSummaryLoaded',
-        sessionId,
-        summary: {
-          title: summary.title,
-          objective: summary.objective,
-          completedTasks: summary.completedTasks,
-          inProgressTasks: summary.inProgressTasks,
-          keyDecisions: summary.keyDecisions,
-          codeChanges: summary.codeChanges,
-          pendingIssues: summary.pendingIssues,
-          messageCount: summary.messageCount,
-          lastUpdated: summary.lastUpdated,
+    // 获取会话完整数据
+    const session = this.sessionManager.getSession(sessionId);
+    if (session) {
+      // 分类消息：主对话 vs Worker 消息
+      const threadMessages: any[] = [];
+      const workerMessages: { claude: any[]; codex: any[]; gemini: any[] } = {
+        claude: [],
+        codex: [],
+        gemini: [],
+      };
+
+      for (const m of session.messages) {
+        const formatted = {
+          id: m.id,
+          role: m.role,
+          content: m.content,
+          source: m.source || 'orchestrator',
+          timestamp: m.timestamp,
+          agent: m.agent,
+        };
+
+        // 根据 source 和 agent 分类
+        if (m.source === 'worker' && m.agent) {
+          const agentKey = m.agent as 'claude' | 'codex' | 'gemini';
+          if (workerMessages[agentKey]) {
+            workerMessages[agentKey].push(formatted);
+          }
+        } else {
+          // 主对话消息（orchestrator/system/user）
+          threadMessages.push(formatted);
         }
+      }
+
+      // 发送完整的会话消息历史给前端（包括 worker 消息）
+      this.postMessage({
+        type: 'sessionMessagesLoaded',
+        sessionId,
+        messages: threadMessages,
+        workerMessages,
       });
 
-      logger.info('界面.会话.总结.已加载', {
+      logger.info('界面.会话.消息.已加载', {
         sessionId,
-        messageCount: summary.messageCount,
-        completedTasks: summary.completedTasks.length,
-        codeChanges: summary.codeChanges.length
+        threadCount: threadMessages.length,
+        claudeCount: workerMessages.claude.length,
+        codexCount: workerMessages.codex.length,
+        geminiCount: workerMessages.gemini.length,
       }, LogCategory.UI);
     }
   }
@@ -5161,6 +5386,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
     if (assistantResponse) {
       this.sessionManager.addMessage('assistant', assistantResponse, agent, source);
+      void this.intelligentOrchestrator.recordContextMessage('assistant', assistantResponse, this.activeSessionId || undefined);
     }
     this.sendStateUpdate();
   }
@@ -5291,7 +5517,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 发送消息到 Webview */
   private postMessage(message: ExtensionToWebviewMessage): void {
-    this._view?.webview.postMessage(message);
+    const view = this._view;
+    if (!view) {
+      return;
+    }
+    this.postMessageQueue = this.postMessageQueue
+      .then(async () => {
+        await view.webview.postMessage(message);
+      })
+      .catch((error) => {
+        logger.warn('界面.消息.发送_失败', { error: String(error) }, LogCategory.UI);
+      });
   }
 
   /** 获取 HTML 内容 - 仅使用 Svelte webview */

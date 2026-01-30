@@ -527,7 +527,9 @@ export type WebviewToExtensionMessage =
   // 新增：前端错误上报
   | { type: 'uiError'; component: string; detail?: unknown; stack?: string }
   // 新增：工具授权相关
-  | { type: 'toolAuthorizationResponse'; allowed: boolean };
+  | { type: 'toolAuthorizationResponse'; allowed: boolean }
+  // 新增：Mermaid 图表
+  | { type: 'openMermaidPanel'; code: string; title?: string };
 
 // Extension 发送到 Webview 的消息
 // source 字段用于区分消息来源：'orchestrator' = 编排者, 'worker' = 执行代理
@@ -551,6 +553,7 @@ export type ExtensionToWebviewMessage =
   | { type: 'sessionCreated'; session: Session }
   | { type: 'sessionSwitched'; sessionId: string; session?: Session }
   | { type: 'sessionSummaryLoaded'; sessionId: string; summary: any }
+  | { type: 'sessionMessagesLoaded'; sessionId: string; messages: any[]; workerMessages?: { claude: any[]; codex: any[]; gemini: any[] } }
   | { type: 'sessionsUpdated'; sessions: Session[] }
   | { type: 'showDiff'; filePath: string; diff: string }
   | { type: 'confirmationRequest'; plan: unknown; formattedPlan: string }

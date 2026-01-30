@@ -135,6 +135,7 @@ export class WorkerSelector {
     return DEFAULT_CATEGORIES_CONFIG.categories[category];
   }
 
+
   private getCategoryRules() {
     if (this.useProfileBasedSelection && this.profileLoader) {
       return this.profileLoader.getCategoryRules();
@@ -168,31 +169,13 @@ export class WorkerSelector {
     const defaultGeneral = DEFAULT_CATEGORIES_CONFIG.categories.general?.defaultWorker || 'claude';
     const profileRecommendation = (categoryConfig?.defaultWorker || defaultGeneral) as WorkerSlot;
 
-    const availableWorkers = this.availableWorkers.size > 0
-      ? Array.from(this.availableWorkers)
-      : (['claude', 'codex', 'gemini'] as WorkerSlot[]);
-
-    // 获取执行统计推荐
-    let statsRecommendation: WorkerSlot | undefined;
-    if (this.useStatsBasedSelection && this.executionStats) {
-      statsRecommendation = this.executionStats.recommendWorker(category, availableWorkers);
-    }
-
-    // 使用 ConflictResolver 解决冲突
-    const resolution = this.conflictResolver.resolve({
-      userPreference,
-      profileRecommendation,
-      statsRecommendation,
-      category,
-      availableWorkers,
-    });
-
+    const worker = userPreference || profileRecommendation;
     return {
-      worker: resolution.worker,
-      degraded: resolution.degraded,
-      preferred: profileRecommendation || resolution.worker,
-      reason: resolution.reason,
-      confidence: resolution.confidence,
+      worker,
+      degraded: false,
+      preferred: profileRecommendation,
+      reason: userPreference ? '用户指定 Worker' : `任务类型 "${category}" 的首选 Worker`,
+      confidence: 1,
       category,
     };
   }
@@ -245,70 +228,12 @@ export class WorkerSelector {
     // 如果有画像系统，使用画像配置的默认 Worker
     const categoryConfig = this.getCategoryConfig(category);
     const defaultGeneral = DEFAULT_CATEGORIES_CONFIG.categories.general?.defaultWorker || 'claude';
-    let preferred = (categoryConfig?.defaultWorker || defaultGeneral) as WorkerSlot;
-
-    // 基于统计的智能选择
-    if (this.useStatsBasedSelection && this.executionStats) {
-      const smartSelection = this.selectWithStats(preferred, category);
-      if (smartSelection) {
-        smartSelection.category = category;
-        return smartSelection;
-      }
-    }
-
-    const availableList = this.availableWorkers.size > 0
-      ? Array.from(this.availableWorkers)
-      : (['claude', 'codex', 'gemini'] as WorkerSlot[]);
-
-    if (availableList.includes(preferred)) {
-      return {
-        worker: preferred,
-        degraded: false,
-        preferred,
-        reason: `任务类型 "${category}" 的首选 Worker`,
-        category,
-      };
-    }
-
-    const description = [
-      categoryConfig?.displayName,
-      categoryConfig?.description,
-      category,
-    ].filter(Boolean).join(' ');
-    const scores = this.calculateProfileScores(description, category, {
-      preferredWorker: preferred,
-    });
-    if (this.executionStats) {
-      this.adjustScoresWithStats(scores, category);
-    }
-    if (availableList.length === 0) {
-      return {
-        worker: preferred,
-        degraded: false,
-        preferred,
-        reason: '没有可用的 Worker，保持首选',
-        category,
-      };
-    }
-
-    let bestWorker = availableList[0] as WorkerSlot;
-    let bestScore = scores.get(bestWorker) || 0;
-    for (const worker of availableList) {
-      const score = scores.get(worker as WorkerSlot);
-      if (score !== undefined && score > bestScore) {
-        bestScore = score;
-        bestWorker = worker as WorkerSlot;
-      }
-    }
-
-    const degraded = bestWorker !== preferred;
+    const preferred = (categoryConfig?.defaultWorker || defaultGeneral) as WorkerSlot;
     return {
-      worker: bestWorker,
-      degraded,
+      worker: preferred,
+      degraded: false,
       preferred,
-      reason: degraded
-        ? `首选 ${preferred} 不可用，基于画像选择 ${bestWorker}`
-        : '没有可用的 Worker，保持首选',
+      reason: `任务类型 "${category}" 的首选 Worker`,
       category,
     };
   }
@@ -336,42 +261,12 @@ export class WorkerSelector {
   ): WorkerSelectionResult {
     // 1. 使用画像配置识别任务分类
     const { category, defaultWorker } = this.classifyWithProfile(taskDescription);
-
-    // 2. 计算各 Worker 的匹配分数
-    const scores = this.calculateProfileScores(taskDescription, category, options);
-
-    // 3. 结合执行统计调整分数
-    if (this.executionStats) {
-      this.adjustScoresWithStats(scores, category);
-    }
-
-    // 4. 选择最高分的 Worker
-    const availableList = this.availableWorkers.size > 0
-      ? Array.from(this.availableWorkers)
-      : (['claude', 'codex', 'gemini'] as WorkerSlot[]);
-    let bestWorker = defaultWorker;
-    let bestScore = scores.get(defaultWorker) || 0;
-
-    if (availableList.length > 0 && !this.availableWorkers.has(defaultWorker)) {
-      bestWorker = availableList[0] as WorkerSlot;
-      bestScore = scores.get(bestWorker) || 0;
-    }
-
-    for (const [workerType, score] of scores) {
-      if (score > bestScore && (availableList.length === 0 || this.availableWorkers.has(workerType))) {
-        bestScore = score;
-        bestWorker = workerType;
-      }
-    }
-
-    // 构建选择原因
-    const profile = this.getProfile(bestWorker);
-    const reason = this.buildSelectionReasonSimple(bestWorker, category, profile);
-
+    const profile = this.getProfile(defaultWorker);
+    const reason = this.buildSelectionReasonSimple(defaultWorker, category, profile);
     return {
-      worker: bestWorker,
+      worker: defaultWorker,
       category,
-      score: bestScore,
+      score: 1,
       reason,
     };
   }

@@ -14,6 +14,8 @@ import { DEFAULT_CATEGORIES_CONFIG } from '../orchestrator/profile/defaults';
 export interface TaskAnalysis {
   /** 任务类型 */
   category: TaskCategory;
+  /** 匹配到的多个任务分类（按优先级） */
+  matchedCategories?: TaskCategory[];
   /** 复杂度评分 (1-5) */
   complexity: number;
   /** 识别的目标文件 */
@@ -105,7 +107,7 @@ export class TaskAnalyzer {
     const isQuestion = this.detectIsQuestion(prompt);
 
     // 识别任务类型（优先使用画像系统）
-    const { category, matchedKeywords, categoryConfig } = this.detectCategoryWithProfile(lowerPrompt);
+    const { category, matchedKeywords, categoryConfig, matchedCategories } = this.detectCategoryWithProfile(lowerPrompt);
 
     // 识别目标文件
     const targetFiles = this.extractTargetFiles(prompt);
@@ -142,6 +144,7 @@ export class TaskAnalyzer {
       riskLevel,
       recommendedWorker,
       matchedKeywords,
+      matchedCategories,
       explicitWorkers,
       wantsParallel,
     };
@@ -154,11 +157,13 @@ export class TaskAnalyzer {
     category: TaskCategory;
     matchedKeywords: string[];
     categoryConfig?: CategoryConfig;
+    matchedCategories?: TaskCategory[];
   } {
     const categories = this.profileLoader?.getAllCategories();
     const rules = this.profileLoader?.getCategoryRules() ?? DEFAULT_CATEGORIES_CONFIG.rules;
 
     let bestMatch: { category: string; score: number; keywords: string[]; config: CategoryConfig } | null = null;
+    const matchedCategories: TaskCategory[] = [];
 
     for (const categoryName of rules.categoryPriority) {
       const config = categories?.get(categoryName) || DEFAULT_CATEGORIES_CONFIG.categories[categoryName];
@@ -185,6 +190,10 @@ export class TaskAnalyzer {
       if (score > 0 && (!bestMatch || score > bestMatch.score)) {
         bestMatch = { category: categoryName, score, keywords: matched, config };
       }
+
+      if (score > 0) {
+        matchedCategories.push(categoryName as TaskCategory);
+      }
     }
 
     if (bestMatch) {
@@ -192,12 +201,13 @@ export class TaskAnalyzer {
         category: bestMatch.category as TaskCategory,
         matchedKeywords: bestMatch.keywords,
         categoryConfig: bestMatch.config,
+        matchedCategories,
       };
     }
 
     const defaultCategory = rules.defaultCategory as TaskCategory;
     const defaultConfig = categories?.get(defaultCategory) || DEFAULT_CATEGORIES_CONFIG.categories[defaultCategory];
-    return { category: defaultCategory, matchedKeywords: [], categoryConfig: defaultConfig };
+    return { category: defaultCategory, matchedKeywords: [], categoryConfig: defaultConfig, matchedCategories: [defaultCategory] };
   }
 
   /**

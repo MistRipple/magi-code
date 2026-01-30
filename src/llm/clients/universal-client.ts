@@ -68,16 +68,18 @@ export class UniversalLLMClient extends BaseLLMClient {
   async sendMessage(params: LLMMessageParams): Promise<LLMResponse> {
     this.logRequest(params);
 
-    try {
-      if (this.config.provider === 'anthropic') {
-        return await this.sendAnthropicMessage(params);
-      } else {
-        return await this.sendOpenAIMessage(params);
+    return this.withRetry(async () => {
+      try {
+        if (this.config.provider === 'anthropic') {
+          return await this.sendAnthropicMessage(params);
+        } else {
+          return await this.sendOpenAIMessage(params);
+        }
+      } catch (error) {
+        this.logError(error, 'sendMessage');
+        throw error;
       }
-    } catch (error) {
-      this.logError(error, 'sendMessage');
-      throw error;
-    }
+    }, 'sendMessage');
   }
 
   /**
@@ -89,16 +91,54 @@ export class UniversalLLMClient extends BaseLLMClient {
   ): Promise<LLMResponse> {
     this.logRequest({ ...params, stream: true });
 
-    try {
-      if (this.config.provider === 'anthropic') {
-        return await this.streamAnthropicMessage(params, onChunk);
-      } else {
-        return await this.streamOpenAIMessage(params, onChunk);
+    return this.withRetry(async () => {
+      try {
+        if (this.config.provider === 'anthropic') {
+          return await this.streamAnthropicMessage(params, onChunk);
+        } else {
+          return await this.streamOpenAIMessage(params, onChunk);
+        }
+      } catch (error) {
+        this.logError(error, 'streamMessage');
+        throw error;
       }
-    } catch (error) {
-      this.logError(error, 'streamMessage');
-      throw error;
+    }, 'streamMessage');
+  }
+
+  private async withRetry<T>(fn: () => Promise<T>, context: string): Promise<T> {
+    const maxRetries = 3;
+    const baseDelayMs = 500;
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (error: any) {
+        if (!this.isRetryableError(error) || attempt === maxRetries - 1) {
+          throw error;
+        }
+        const delay = baseDelayMs * Math.pow(2, attempt) + Math.floor(Math.random() * 200);
+        this.logError(error, `${context}.retry_${attempt + 1}`);
+        await this.sleep(delay);
+      }
     }
+    throw new Error(`Retry failed: ${context}`);
+  }
+
+  private isRetryableError(error: any): boolean {
+    const status = error?.status || error?.response?.status;
+    if (typeof status === 'number') {
+      if (status === 408 || status === 429) return true;
+      if (status >= 500 && status <= 599) return true;
+    }
+    const code = error?.code;
+    if (typeof code === 'string') {
+      return ['ETIMEDOUT', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED'].includes(code);
+    }
+    const message = String(error?.message || '');
+    return /timeout|timed out|ECONNRESET|ENOTFOUND|EAI_AGAIN|ECONNREFUSED/i.test(message);
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   // ============================================================================

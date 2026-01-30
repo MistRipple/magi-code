@@ -14,6 +14,9 @@ import {
   updateSessions,
   setAppState,
   setMissionPlan,
+  clearAllMessages,
+  setThreadMessages,
+  setAgentOutputs,
 } from '../stores/messages.svelte';
 import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
@@ -90,7 +93,15 @@ function handleMessage(message: WebviewMessage) {
     case 'sessionSwitched':
       handleSessionChanged(message);
       break;
- 
+
+    case 'sessionSummaryLoaded':
+      handleSessionSummaryLoaded(message);
+      break;
+
+    case 'sessionMessagesLoaded':
+      handleSessionMessagesLoaded(message);
+      break;
+
     case 'confirmationRequest':
       handleConfirmationRequest(message);
       break;
@@ -359,10 +370,103 @@ function handleSessionsUpdated(message: WebviewMessage) {
 }
 
 function handleSessionChanged(message: WebviewMessage) {
-  if (message.sessionId) {
-    setCurrentSessionId(message.sessionId as string);
-  } else if (message.session && (message.session as Session).id) {
-    setCurrentSessionId((message.session as Session).id);
+  // 获取新的 sessionId
+  const newSessionId = message.sessionId as string || (message.session as Session)?.id;
+
+  if (newSessionId) {
+    const store = getState();
+    const currentId = store.currentSessionId;
+
+    // 如果是不同的会话，清空当前消息
+    if (currentId !== newSessionId) {
+      clearAllMessages();
+    }
+
+    setCurrentSessionId(newSessionId);
+  }
+}
+
+function handleSessionSummaryLoaded(message: WebviewMessage) {
+  // 切换会话时，后端发送会话摘要而非完整历史
+  // 清空当前消息并显示会话摘要
+  const sessionId = message.sessionId as string;
+  const summary = message.summary as any;
+
+  if (sessionId) {
+    clearAllMessages();
+    setCurrentSessionId(sessionId);
+
+    // 如果有会话摘要，创建一个系统消息显示摘要
+    if (summary) {
+      const summaryContent = [
+        `**会话恢复: ${summary.title || '未命名会话'}**`,
+        '',
+        summary.objective ? `**目标:** ${summary.objective}` : '',
+        summary.completedTasks?.length ? `**已完成任务:** ${summary.completedTasks.length} 个` : '',
+        summary.inProgressTasks?.length ? `**进行中任务:** ${summary.inProgressTasks.length} 个` : '',
+        summary.codeChanges?.length ? `**代码变更:** ${summary.codeChanges.length} 个文件` : '',
+        summary.pendingIssues?.length ? `**待解决问题:** ${summary.pendingIssues.length} 个` : '',
+        '',
+        `_消息历史: ${summary.messageCount || 0} 条 | 最后更新: ${summary.lastUpdated ? new Date(summary.lastUpdated).toLocaleString() : '未知'}_`,
+      ].filter(Boolean).join('\n');
+
+      addThreadMessage({
+        id: generateId(),
+        role: 'system',
+        content: summaryContent,
+        source: 'system',
+        timestamp: Date.now(),
+        isStreaming: false,
+        isComplete: true,
+        blocks: [{
+          type: 'text',
+          content: summaryContent,
+        }],
+      });
+    }
+  }
+}
+
+function handleSessionMessagesLoaded(message: WebviewMessage) {
+  // 切换会话时，后端发送完整的消息历史（包括主对话和 worker 消息）
+  const sessionId = message.sessionId as string;
+  const messages = message.messages as any[];
+  const workerMessages = message.workerMessages as { claude?: any[]; codex?: any[]; gemini?: any[] } | undefined;
+
+  if (sessionId) {
+    // 先清空当前消息
+    clearAllMessages();
+    setCurrentSessionId(sessionId);
+
+    // 格式化消息的辅助函数
+    const formatMessage = (m: any): Message => ({
+      id: m.id || generateId(),
+      role: m.role || 'assistant',
+      content: m.content || '',
+      source: m.source || 'orchestrator',
+      timestamp: m.timestamp || Date.now(),
+      isStreaming: false,
+      isComplete: true,
+      blocks: m.blocks || [{
+        type: 'text' as const,
+        content: m.content || '',
+      }],
+    });
+
+    // 加载主对话消息
+    if (messages && messages.length > 0) {
+      const formattedMessages: Message[] = messages.map(formatMessage);
+      setThreadMessages(formattedMessages);
+    }
+
+    // 加载 worker 消息
+    if (workerMessages) {
+      setAgentOutputs({
+        claude: (workerMessages.claude || []).map(formatMessage),
+        codex: (workerMessages.codex || []).map(formatMessage),
+        gemini: (workerMessages.gemini || []).map(formatMessage),
+      });
+    }
   }
 }
 
