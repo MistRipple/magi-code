@@ -169,6 +169,10 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     logger.debug('Orchestrator system prompt updated', undefined, LogCategory.LLM);
   }
 
+  getSystemPrompt(): string {
+    return this.systemPrompt;
+  }
+
   /**
    * 获取默认系统提示
    */

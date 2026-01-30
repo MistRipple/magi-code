@@ -143,4 +143,8 @@ export interface FullLLMConfig {
   orchestrator: LLMConfig;
   workers: WorkerLLMConfig;
   compressor: LLMConfig;
+  userRules?: {
+    enabled: boolean;
+    content: string;
+  };
 }

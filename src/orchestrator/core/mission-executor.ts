@@ -16,6 +16,7 @@ import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
 import { ProfileAwareReviewer } from '../review/profile-aware-reviewer';
 import { AutonomousWorker, AutonomousExecutionResult } from '../worker';
+import { LspEnforcer } from '../lsp/lsp-enforcer';
 import {
   Mission,
   Assignment,
@@ -154,6 +155,7 @@ export class MissionExecutor extends EventEmitter {
   private adapterFactory: IAdapterFactory | null = null;
   private contextManager: import('../../context/context-manager').ContextManager | null = null;
   private currentMissionId: string | null = null;
+  private lspEnforcer: LspEnforcer | null = null;
 
   // 🔧 已移除 messageBus 和 currentSessionId 属性
   // Worker 执行摘要现在通过 subtask:completed 事件 + subTaskCard 机制发送
@@ -196,6 +198,7 @@ export class MissionExecutor extends EventEmitter {
    */
   setWorkspaceRoot(workspaceRoot: string): void {
     this.workspaceRoot = workspaceRoot;
+    this.lspEnforcer = new LspEnforcer(workspaceRoot);
   }
 
   /**
@@ -589,8 +592,6 @@ export class MissionExecutor extends EventEmitter {
     mission: Mission,
     options: ExecutionOptions
   ): Promise<AutonomousExecutionResult> {
-    const worker = this.ensureWorker(assignment.workerId);
-
     // 检查阻塞
     const blockingReason = this.checkAssignmentBlocking(assignment, mission);
     if (blockingReason) {
@@ -641,31 +642,63 @@ export class MissionExecutor extends EventEmitter {
       ? this.contextManager.getContext(6000)
       : undefined;
 
-    const result = await worker.executeAssignment(assignment, {
-      workingDirectory: options.workingDirectory,
-      timeout: options.timeout,
-      projectContext: options.projectContext,
-      adapterFactory: options.executionMode === 'adapter' ? this.adapterFactory || undefined : undefined,
-      adapterScope: options.executionMode === 'adapter' ? {
-        source: 'worker',
-        streamToUI: true,
-        adapterRole: 'worker',
-        messageMeta: {
-          taskId: mission.id,
-          subTaskId: assignment.id,
-          contextSnapshot,
-          taskContext: {
-            goal: assignment.responsibility,
-            targetFiles: assignment.scope?.targetPaths,
-            dependencies: assignment.consumerContracts, // 使用 consumerContracts 作为依赖
-            constraints: assignment.scope?.excludes, // 使用 excludes 作为约束
+    if (this.lspEnforcer) {
+      try {
+        await this.lspEnforcer.applyIfNeeded(assignment);
+      } catch (error: any) {
+        logger.warn('LSP 预检失败，继续执行', {
+          assignmentId: assignment.id,
+          error: error?.message
+        }, LogCategory.ORCHESTRATOR);
+      }
+    }
+
+    const executeWithWorker = async (workerId: WorkerSlot): Promise<AutonomousExecutionResult> => {
+      const worker = this.ensureWorker(workerId);
+      return worker.executeAssignment(assignment, {
+        workingDirectory: options.workingDirectory,
+        timeout: options.timeout,
+        projectContext: options.projectContext,
+        adapterFactory: options.executionMode === 'adapter' ? this.adapterFactory || undefined : undefined,
+        adapterScope: options.executionMode === 'adapter' ? {
+          source: 'worker',
+          streamToUI: true,
+          adapterRole: 'worker',
+          messageMeta: {
+            taskId: mission.id,
+            subTaskId: assignment.id,
+            contextSnapshot,
+            taskContext: {
+              goal: assignment.responsibility,
+              targetFiles: assignment.scope?.targetPaths,
+              dependencies: assignment.consumerContracts, // 使用 consumerContracts 作为依赖
+              constraints: assignment.scope?.excludes, // 使用 excludes 作为约束
+            },
           },
+        } : undefined,
+        onOutput: (output) => {
+          options.onOutput?.(assignment.workerId, output);
         },
-      } : undefined,
-      onOutput: (output) => {
-        options.onOutput?.(assignment.workerId, output);
-      },
-    });
+      });
+    };
+
+    let result = await executeWithWorker(assignment.workerId);
+    if (!result.success && this.shouldFallbackWorker(result)) {
+      const fallback = this.pickFallbackWorker(assignment.workerId);
+      if (fallback) {
+        logger.warn('执行器.任务.降级_切换Worker', {
+          assignmentId: assignment.id,
+          from: assignment.workerId,
+          to: fallback,
+          errors: result.errors.slice(0, 2),
+        }, LogCategory.ORCHESTRATOR);
+
+        this.reassignAssignmentWorker(assignment, mission, fallback);
+        this.resetAssignmentTodosForRetry(assignment);
+        result = await executeWithWorker(fallback);
+        result.recoveryAttempts = (result.recoveryAttempts || 0) + 1;
+      }
+    }
 
     // 更新契约状态（执行期解锁消费者任务）
     this.updateContractsFromAssignment(mission, assignment);
@@ -749,6 +782,74 @@ export class MissionExecutor extends EventEmitter {
     });
 
     return result;
+  }
+
+  private shouldFallbackWorker(result: AutonomousExecutionResult): boolean {
+    if (result.errors.length === 0 && result.failedTodos.length === 0) {
+      return false;
+    }
+    const errorText = result.errors.join(' ');
+    const fallbackPatterns = [
+      /LLM\s*执行失败/i,
+      /unauthorized|forbidden|401|403|429/i,
+      /api key|invalid api|auth|permission/i,
+      /quota|insufficient|billing|payment|exceeded|rate limit|limit|suspended|disabled|blocked|account/i,
+      /ENOTFOUND|ECONN|ETIMEDOUT|timed out|timeout|network|fetch failed|socket hang up|tls|certificate/i,
+    ];
+    return fallbackPatterns.some(pattern => pattern.test(errorText));
+  }
+
+  private pickFallbackWorker(current: WorkerSlot): WorkerSlot | null {
+    const candidates = (['claude', 'codex', 'gemini'] as WorkerSlot[]).filter(worker => worker !== current);
+    if (this.adapterFactory) {
+      const connected = candidates.filter(worker => this.adapterFactory?.isConnected(worker));
+      if (connected.length > 0) {
+        return connected[0];
+      }
+    }
+    return candidates[0] || null;
+  }
+
+  private reassignAssignmentWorker(assignment: Assignment, mission: Mission, workerId: WorkerSlot): void {
+    assignment.workerId = workerId;
+    assignment.guidancePrompt = this.buildGuidancePromptForWorker(assignment, mission, workerId);
+  }
+
+  private buildGuidancePromptForWorker(
+    assignment: Assignment,
+    mission: Mission,
+    workerId: WorkerSlot
+  ): string {
+    const profile = this.profileLoader.getProfile(workerId);
+    const collaborators = mission.assignments
+      .map(a => a.workerId)
+      .filter(w => w !== workerId);
+    const taskDescription = assignment.scope?.includes?.length
+      ? assignment.scope.includes.join('; ')
+      : assignment.responsibility;
+    return this.guidanceInjector.buildWorkerPrompt(profile, {
+      taskDescription,
+      category: assignment.assignmentReason?.profileMatch?.category,
+      collaborators: collaborators.length > 0 ? collaborators : undefined,
+    });
+  }
+
+  private resetAssignmentTodosForRetry(assignment: Assignment): void {
+    let completedCount = 0;
+    for (const todo of assignment.todos) {
+      if (todo.status === 'completed') {
+        completedCount += 1;
+        continue;
+      }
+      todo.status = 'pending';
+      todo.output = undefined;
+      todo.startedAt = undefined;
+      todo.completedAt = undefined;
+      todo.blockedReason = undefined;
+    }
+    assignment.progress = assignment.todos.length > 0
+      ? Math.round((completedCount / assignment.todos.length) * 100)
+      : 0;
   }
 
   // 🔧 已移除 sendWorkerSummary 方法

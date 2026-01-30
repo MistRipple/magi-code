@@ -36,6 +36,7 @@ export class LLMConfigLoader {
       orchestrator: this.extractOrchestratorConfig(config),
       workers: this.extractWorkersConfig(config),
       compressor: this.loadCompressorConfig(),
+      userRules: this.loadUserRules(),
     };
   }
 
@@ -126,6 +127,10 @@ export class LLMConfigLoader {
         apiKey: process.env.ANTHROPIC_API_KEY || '',
         model: 'claude-3-haiku-20240307',
         provider: 'anthropic',
+      },
+      userRules: {
+        enabled: true,
+        content: '',
       },
     };
   }
@@ -357,6 +362,34 @@ export class LLMConfigLoader {
   }
 
   /**
+   * 加载用户规则（全局）
+   */
+  static loadUserRules(): { enabled: boolean; content: string } {
+    const config = this.loadLLMConfigFile();
+    const rules = config.userRules || {};
+    const defaults = this.getDefaultLLMConfig().userRules;
+
+    return {
+      enabled: rules.enabled !== false,
+      content: typeof rules.content === 'string' ? rules.content : defaults.content,
+    };
+  }
+
+  /**
+   * 更新用户规则（全局）
+   */
+  static updateUserRules(userRules: { enabled?: boolean; content?: string }): void {
+    const fullConfig = this.loadLLMConfigFile();
+    const defaults = this.getDefaultLLMConfig().userRules;
+    fullConfig.userRules = {
+      enabled: userRules.enabled !== undefined ? userRules.enabled : defaults.enabled,
+      content: typeof userRules.content === 'string' ? userRules.content : defaults.content,
+    };
+    this.saveFullConfig(fullConfig);
+    logger.info('User rules updated', undefined, LogCategory.LLM);
+  }
+
+  /**
    * 加载 Augment 配置
    */
   static loadAugmentConfig(): any {
@@ -510,7 +543,8 @@ export class LLMConfigLoader {
   private static normalizeSkillsConfig(rawConfig: any): { normalized: any; changed: boolean } {
     const config = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
     const normalized: any = {
-      builtInTools: config.builtInTools && typeof config.builtInTools === 'object' ? config.builtInTools : {},
+      // 注意：builtInTools 已废弃，内置工具由 ToolManager 直接管理
+      // 保留字段以兼容旧配置文件读取，但不再使用
       customTools: Array.isArray(config.customTools) ? config.customTools : [],
       instructionSkills: Array.isArray(config.instructionSkills) ? config.instructionSkills : [],
       repositories: Array.isArray(config.repositories) ? config.repositories : [],
@@ -560,7 +594,6 @@ export class LLMConfigLoader {
    */
   static saveRepositories(repositories: any[]): void {
     const config = this.loadSkillsConfig() || {
-      builtInTools: {},
       customTools: [],
       instructionSkills: [],
       repositories: []
@@ -628,13 +661,9 @@ export class LLMConfigLoader {
   }
 
   /**
-   * 删除仓库（内置仓库不可删除）
+   * 删除仓库
    */
   static deleteRepository(id: string): void {
-    if (id === 'builtin') {
-      throw new Error('内置仓库不可删除');
-    }
-
     const repositories = this.loadRepositories();
     const filtered = repositories.filter((r: any) => r.id !== id);
 
@@ -648,13 +677,9 @@ export class LLMConfigLoader {
 
   /**
    * 获取默认仓库
+   * 注意：内置 Skills 仓库已废弃，所有内置工具由 ToolManager 管理
    */
   private static getDefaultRepositories(): any[] {
-    return [
-      {
-        id: 'builtin',
-        url: 'builtin'
-      }
-    ];
+    return [];
   }
 }

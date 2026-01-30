@@ -10,9 +10,16 @@
  * - web_search: 网络搜索
  * - web_fetch: URL 内容获取
  * - mermaid_diagram: Mermaid 图表渲染
+ * - codebase_retrieval: 代码库语义搜索 (ACE)
+ * - lsp_query: LSP 代码智能查询
+ *
+ * ACE 配置来源：~/.multicli/config.json 的 promptEnhance 字段（唯一）
  */
 
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import {
   ToolExecutor,
   ExtendedToolDefinition,
@@ -25,8 +32,34 @@ import { SearchExecutor } from './search-executor';
 import { RemoveFilesExecutor } from './remove-files-executor';
 import { WebExecutor } from './web-executor';
 import { MermaidExecutor } from './mermaid-executor';
+import { AceExecutor } from './ace-executor';
+import { LspExecutor } from './lsp-executor';
 import { logger, LogCategory } from '../logging';
 import { PermissionMatrix } from '../types';
+
+/**
+ * 读取 ACE 配置（唯一配置读取入口）
+ * 配置存储在 ~/.multicli/config.json 的 promptEnhance 字段
+ *
+ * 导出供其他模块使用，确保配置读取逻辑唯一
+ */
+export function loadAceConfigFromFile(): { baseUrl: string; apiKey: string } {
+  try {
+    const configPath = path.join(os.homedir(), '.multicli', 'config.json');
+    if (fs.existsSync(configPath)) {
+      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      if (config.promptEnhance) {
+        return {
+          baseUrl: config.promptEnhance.baseUrl || '',
+          apiKey: config.promptEnhance.apiKey || ''
+        };
+      }
+    }
+  } catch (error) {
+    logger.warn('ToolManager: 读取 ACE 配置失败', { error }, LogCategory.TOOLS);
+  }
+  return { baseUrl: '', apiKey: '' };
+}
 
 /**
  * 工具管理器
@@ -42,6 +75,8 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   private removeFilesExecutor: RemoveFilesExecutor;
   private webExecutor: WebExecutor;
   private mermaidExecutor: MermaidExecutor;
+  private aceExecutor: AceExecutor;
+  private lspExecutor: LspExecutor;
 
   // 外部工具执行器
   private mcpExecutors: Map<string, ToolExecutor> = new Map();
@@ -55,6 +90,9 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     super();
     this.workspaceRoot = workspaceRoot || process.cwd();
 
+    // 读取 ACE 配置（统一入口）
+    const aceConfig = loadAceConfigFromFile();
+
     // 初始化所有内置执行器
     this.terminalExecutor = new VSCodeTerminalExecutor();
     this.fileExecutor = new FileExecutor(this.workspaceRoot);
@@ -62,12 +100,18 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     this.removeFilesExecutor = new RemoveFilesExecutor(this.workspaceRoot);
     this.webExecutor = new WebExecutor();
     this.mermaidExecutor = new MermaidExecutor();
+    this.aceExecutor = new AceExecutor(this.workspaceRoot, aceConfig.baseUrl, aceConfig.apiKey);
+    this.lspExecutor = new LspExecutor(this.workspaceRoot);
 
     this.permissions = permissions || {
       allowEdit: true,
       allowBash: true,
       allowWeb: true,
     };
+
+    if (aceConfig.baseUrl && aceConfig.apiKey) {
+      logger.info('ToolManager: ACE 已配置', { baseUrl: aceConfig.baseUrl }, LogCategory.TOOLS);
+    }
   }
 
   /**
@@ -78,6 +122,12 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     this.fileExecutor = new FileExecutor(workspaceRoot);
     this.searchExecutor = new SearchExecutor(workspaceRoot);
     this.removeFilesExecutor = new RemoveFilesExecutor(workspaceRoot);
+
+    // 重新读取 ACE 配置并更新
+    const aceConfig = loadAceConfigFromFile();
+    this.aceExecutor.updateConfig(workspaceRoot, aceConfig.baseUrl, aceConfig.apiKey);
+
+    this.lspExecutor = new LspExecutor(workspaceRoot);
     this.invalidateCache();
     logger.info('ToolManager workspace root updated', { workspaceRoot }, LogCategory.TOOLS);
   }
@@ -136,7 +186,9 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     'remove_files',
     'web_search',
     'web_fetch',
-    'mermaid_diagram'
+    'mermaid_diagram',
+    'codebase_retrieval',
+    'lsp_query'
   ];
 
   /**
@@ -228,6 +280,12 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
       case 'mermaid_diagram':
         return await this.mermaidExecutor.execute(toolCall);
+
+      case 'codebase_retrieval':
+        return await this.aceExecutor.execute(toolCall);
+
+      case 'lsp_query':
+        return await this.lspExecutor.execute(toolCall);
 
       default:
         return {
@@ -368,6 +426,12 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
     // 7. mermaid_diagram (Mermaid 图表)
     tools.push(this.mermaidExecutor.getToolDefinition());
+
+    // 8. codebase_retrieval (ACE 语义搜索)
+    tools.push(this.aceExecutor.getToolDefinition());
+
+    // 9. lsp_query (LSP 代码智能)
+    tools.push(this.lspExecutor.getToolDefinition());
 
     return tools;
   }
@@ -514,5 +578,28 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    */
   getWorkspaceRoot(): string {
     return this.workspaceRoot;
+  }
+
+  /**
+   * 配置 ACE 语义搜索
+   */
+  configureAce(baseUrl: string, token: string): void {
+    this.aceExecutor.updateConfig(this.workspaceRoot, baseUrl, token);
+    this.invalidateCache();
+    logger.info('ACE configured', { baseUrl }, LogCategory.TOOLS);
+  }
+
+  /**
+   * 获取 ACE 执行器（用于手动触发索引等操作）
+   */
+  getAceExecutor(): AceExecutor {
+    return this.aceExecutor;
+  }
+
+  /**
+   * 检查 ACE 是否已配置
+   */
+  isAceConfigured(): boolean {
+    return this.aceExecutor.isConfigured();
   }
 }

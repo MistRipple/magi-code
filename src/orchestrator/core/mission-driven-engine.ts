@@ -715,7 +715,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
       // 9. 验证结果
       this.setState('verifying');
-      this.sendPhaseMessage('🔬 正在验证执行结果...', 'verifying');
+      // 不再发送空洞的过渡消息，验证结果会在最终总结中统一呈现
 
       const verificationResult = await this.missionOrchestrator.verifyMission(mission.id);
       this.lastExecutionSuccess = executionResult.success && verificationResult.passed;
@@ -762,7 +762,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
       // 11. 生成总结
       this.setState('summarizing');
-      this.sendPhaseMessage('📊 正在生成执行总结...', 'summarizing');
+      // 不再发送空洞的过渡消息，总结内容会直接呈现
 
       const summary = await this.missionOrchestrator.summarizeMission(mission.id);
 
@@ -1170,9 +1170,7 @@ export class MissionDrivenEngine extends EventEmitter {
       wantsParallel: analysis.wantsParallel,
     };
     const explicitWorkers = Array.from(new Set((analysis.explicitWorkers || []).filter(Boolean)));
-    const preferredWorkers = explicitWorkers.length > 0
-      ? explicitWorkers
-      : (analysis.recommendedWorker ? [analysis.recommendedWorker] : undefined);
+    const preferredWorkers = explicitWorkers.length > 0 ? explicitWorkers : undefined;
 
     // 选择参与者
     const participants = await this.missionOrchestrator.selectParticipants(mission, {
@@ -1193,6 +1191,7 @@ export class MissionDrivenEngine extends EventEmitter {
       const { LLMConfigLoader } = await import('../../llm/config');
       const { createLLMClient } = await import('../../llm/clients/client-factory');
       const compressorConfig = LLMConfigLoader.loadCompressorConfig();
+      const orchestratorConfig = LLMConfigLoader.loadOrchestratorConfig();
 
       if (!compressorConfig.enabled) {
         this.contextManager.setCompressorAdapter(null);
@@ -1200,40 +1199,91 @@ export class MissionDrivenEngine extends EventEmitter {
         return;
       }
 
+      const retryDelays = [10000, 20000, 30000];
+      const recordCompression = (
+        success: boolean,
+        duration: number,
+        usage?: { inputTokens?: number; outputTokens?: number },
+        error?: string
+      ) => {
+        this.executionStats.recordExecution({
+          worker: 'compressor',
+          taskId: 'memory',
+          subTaskId: 'compress',
+          success,
+          duration,
+          error,
+          inputTokens: usage?.inputTokens,
+          outputTokens: usage?.outputTokens,
+          phase: 'integration',
+        });
+      };
+
+      const sendWithClient = async (client: any, label: string, payload: string): Promise<string> => {
+        const startAt = Date.now();
+        try {
+          const response = await client.sendMessage({
+            messages: [{ role: 'user', content: payload }],
+            maxTokens: 2000,
+            temperature: 0.3,
+          });
+          const duration = Date.now() - startAt;
+          recordCompression(true, duration, {
+            inputTokens: response.usage?.inputTokens,
+            outputTokens: response.usage?.outputTokens,
+          });
+          return response.content || '';
+        } catch (error: any) {
+          const duration = Date.now() - startAt;
+          recordCompression(false, duration, undefined, error?.message);
+          logger.warn('编排器.上下文.压缩器.调用失败', {
+            model: label,
+            error: this.normalizeErrorMessage(error),
+          }, LogCategory.ORCHESTRATOR);
+          throw error;
+        }
+      };
+
+      const sendWithRetry = async (client: any, label: string, payload: string): Promise<string> => {
+        for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+          try {
+            return await sendWithClient(client, label, payload);
+          } catch (error: any) {
+            if (this.isAuthOrQuotaError(error)) {
+              throw error;
+            }
+            if (!this.isConnectionError(error) || attempt === retryDelays.length) {
+              throw error;
+            }
+            const delay = retryDelays[attempt];
+            logger.warn('编排器.上下文.压缩器.连接失败_重试', {
+              attempt: attempt + 1,
+              delayMs: delay,
+              error: this.normalizeErrorMessage(error),
+              model: label,
+            }, LogCategory.ORCHESTRATOR);
+            await this.sleep(delay);
+          }
+        }
+        throw new Error('Compression retry failed.');
+      };
+
       const adapter = {
         sendMessage: async (message: string) => {
-          const startAt = Date.now();
           try {
             const client = createLLMClient(compressorConfig);
-            const response = await client.sendMessage({
-              messages: [{ role: 'user', content: message }],
-              maxTokens: 2000,
-              temperature: 0.3,
-            });
-            const duration = Date.now() - startAt;
-            this.executionStats.recordExecution({
-              worker: 'compressor',
-              taskId: 'memory',
-              subTaskId: 'compress',
-              success: true,
-              duration,
-              inputTokens: response.usage?.inputTokens,
-              outputTokens: response.usage?.outputTokens,
-              phase: 'integration',
-            });
-            return response.content || '';
+            return await sendWithRetry(client, 'compressor', message);
           } catch (error: any) {
-            const duration = Date.now() - startAt;
-            this.executionStats.recordExecution({
-              worker: 'compressor',
-              taskId: 'memory',
-              subTaskId: 'compress',
-              success: false,
-              duration,
-              error: error?.message,
-              phase: 'integration',
-            });
-            throw error;
+            const shouldFallback = this.isAuthOrQuotaError(error) || this.isConnectionError(error);
+            if (!shouldFallback) {
+              throw error;
+            }
+            logger.warn('编排器.上下文.压缩器.降级_使用编排模型', {
+              reason: this.isAuthOrQuotaError(error) ? 'auth_or_quota' : 'connection',
+              error: this.normalizeErrorMessage(error),
+            }, LogCategory.ORCHESTRATOR);
+            const fallbackClient = createLLMClient(orchestratorConfig);
+            return await sendWithRetry(fallbackClient, 'orchestrator', message);
           }
         },
       };
@@ -1438,6 +1488,36 @@ export class MissionDrivenEngine extends EventEmitter {
     }
 
     return output;
+  }
+
+  private isAuthOrQuotaError(error: any): boolean {
+    const status = error?.status || error?.response?.status;
+    if (status === 401 || status === 403 || status === 429) return true;
+    const message = this.normalizeErrorMessage(error).toLowerCase();
+    return /unauthorized|forbidden|invalid api key|api key|auth|permission|quota|insufficient|billing|payment|exceeded|rate limit|limit|blocked|suspended|disabled|account/i.test(message);
+  }
+
+  private isConnectionError(error: any): boolean {
+    const status = error?.status || error?.response?.status;
+    if (status === 408 || status === 502 || status === 503 || status === 504) return true;
+    const code = typeof error?.code === 'string' ? error.code : '';
+    if (['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'].includes(code)) {
+      return true;
+    }
+    const message = this.normalizeErrorMessage(error).toLowerCase();
+    return /timeout|timed out|network|connection|fetch failed|socket hang up|tls|certificate|econnreset|econnrefused|enotfound|eai_again/.test(message);
+  }
+
+  private normalizeErrorMessage(error: any): string {
+    if (!error) return 'Unknown error';
+    if (typeof error === 'string') return error;
+    if (error instanceof Error && error.message) return error.message;
+    if (error?.message) return String(error.message);
+    return String(error);
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**

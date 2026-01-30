@@ -71,12 +71,12 @@
     vscode.postMessage({ type: 'interruptTask' });
   }
 
-  // 增强提示词
-  async function enhancePrompt() {
+  // 增强提示词 - 直接替换输入框内容
+  function enhancePrompt() {
     const content = inputValue.trim();
     if (!content || isEnhancing) return;
     isEnhancing = true;
-    vscode.postMessage({ type: 'enhancePrompt', content });
+    vscode.postMessage({ type: 'enhancePrompt', prompt: content });
   }
 
   // 切换模式
@@ -114,11 +114,16 @@
     const handler = (event: MessageEvent) => {
       const msg = event.data;
       if (msg.type === 'promptEnhanced') {
-        const enhancedPrompt = typeof msg.enhancedPrompt === 'string' ? msg.enhancedPrompt : '';
-        if (enhancedPrompt) {
-          inputValue = enhancedPrompt;
-        }
         isEnhancing = false;
+        if (msg.error) {
+          addToast('error', msg.error);
+        } else {
+          const enhancedPrompt = typeof msg.enhancedPrompt === 'string' ? msg.enhancedPrompt : '';
+          if (enhancedPrompt) {
+            inputValue = enhancedPrompt;
+            addToast('success', '提示词已增强');
+          }
+        }
       }
     };
     window.addEventListener('message', handler);
@@ -205,7 +210,6 @@
     </div>
   </div>
 </div>
-
 
 <style>
   .input-container {

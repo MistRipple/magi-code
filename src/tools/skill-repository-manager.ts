@@ -54,70 +54,6 @@ export class SkillRepositoryManager {
   private readonly CACHE_TTL = 5 * 60 * 1000; // 5 分钟
 
   /**
-   * 获取内置 Skills
-   */
-  private getBuiltInSkills(): SkillInfo[] {
-    return [
-      {
-        id: 'web_search',
-        name: 'Web Search',
-        fullName: 'web_search_20250305',
-        description: '搜索网络以获取最新信息',
-        author: 'Anthropic',
-        version: '1.0.0',
-        category: 'search',
-        type: 'server-side',
-        icon: '🔍',
-        repositoryId: 'builtin',
-        repositoryName: 'Claude 官方技能',
-        skillType: 'tool'
-      },
-      {
-        id: 'web_fetch',
-        name: 'Web Fetch',
-        fullName: 'web_fetch_20250305',
-        description: '获取并分析网页内容',
-        author: 'Anthropic',
-        version: '1.0.0',
-        category: 'web',
-        type: 'server-side',
-        icon: '🌐',
-        repositoryId: 'builtin',
-        repositoryName: 'Claude 官方技能',
-        skillType: 'tool'
-      },
-      {
-        id: 'text_editor',
-        name: 'Text Editor',
-        fullName: 'text_editor_20250124',
-        description: '编辑文本文件',
-        author: 'Anthropic',
-        version: '1.0.0',
-        category: 'development',
-        type: 'client-side',
-        icon: '📝',
-        repositoryId: 'builtin',
-        repositoryName: 'Claude 官方技能',
-        skillType: 'tool'
-      },
-      {
-        id: 'computer_use',
-        name: 'Computer Use',
-        fullName: 'computer_use_20241022',
-        description: '控制计算机（需要额外权限）',
-        author: 'Anthropic',
-        version: '1.0.0',
-        category: 'system',
-        type: 'client-side',
-        icon: '💻',
-        repositoryId: 'builtin',
-        repositoryName: 'Claude 官方技能',
-        skillType: 'tool'
-      }
-    ];
-  }
-
-  /**
    * 从 JSON 仓库获取 Skills（同时获取仓库名称）
    */
   private async fetchJSONRepository(url: string, repositoryId: string): Promise<{ name: string; skills: SkillInfo[] }> {
@@ -767,22 +703,17 @@ export class SkillRepositoryManager {
 
     let skills: SkillInfo[];
 
-    if (repository.id === 'builtin') {
-      // 内置仓库
-      skills = this.getBuiltInSkills();
-    } else {
-      // 根据类型或 URL 判断仓库类型
-      const isGitHub = repository.type === 'github' || repository.url.includes('github.com');
+    // 根据类型或 URL 判断仓库类型
+    const isGitHub = repository.type === 'github' || repository.url.includes('github.com');
 
-      if (isGitHub) {
-        // GitHub 仓库
-        const result = await this.fetchGitHubRepository(repository.url, repository.id);
-        skills = result.skills;
-      } else {
-        // JSON 仓库
-        const result = await this.fetchJSONRepository(repository.url, repository.id);
-        skills = result.skills;
-      }
+    if (isGitHub) {
+      // GitHub 仓库
+      const result = await this.fetchGitHubRepository(repository.url, repository.id);
+      skills = result.skills;
+    } else {
+      // JSON 仓库
+      const result = await this.fetchJSONRepository(repository.url, repository.id);
+      skills = result.skills;
     }
 
     // 更新缓存

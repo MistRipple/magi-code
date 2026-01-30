@@ -32,15 +32,24 @@ export class FileExecutor implements ToolExecutor {
       description: `Edit text files using commands like view, create, str_replace, insert, and undo_edit.
 
 Commands:
-* view - View file content with line numbers (cat -n style)
+* view - View file content with line numbers (cat -n style). Supports regex search.
 * create - Create a new file (cannot overwrite existing files)
 * str_replace - Replace text in file (old_str must match EXACTLY)
 * insert - Insert text at a specific line number
 * undo_edit - Undo the last edit to a file
 
+View command options:
+* view_range: [start, end] - Show specific line range (1-based, inclusive)
+* search_query_regex: Search for patterns using regex
+* case_sensitive: Control case sensitivity for search (default: false)
+* context_lines: Lines of context around matches (default: 5)
+When using regex search, only matching lines and their context are shown.
+Strongly prefer search_query_regex over view_range when looking for specific symbols.
+
 Notes for str_replace:
 * old_str must match EXACTLY including whitespace
 * new_str can be empty to delete content
+* Use old_str_start_line and old_str_end_line to disambiguate multiple occurrences
 
 Notes for insert:
 * insert_line is 1-based line number
@@ -50,7 +59,8 @@ Notes for insert:
 IMPORTANT:
 * This is the only tool for editing files
 * DO NOT use sed/awk/shell commands for editing
-* Use view command before editing to see file content`,
+* DO NOT fall back to removing and recreating files
+* Use view command with search_query_regex before editing`,
       input_schema: {
         type: 'object',
         properties: {
@@ -75,6 +85,14 @@ IMPORTANT:
             type: 'string',
             description: 'Replacement string (for str_replace)'
           },
+          old_str_start_line: {
+            type: 'number',
+            description: 'Start line number of old_str to disambiguate (1-based, inclusive)'
+          },
+          old_str_end_line: {
+            type: 'number',
+            description: 'End line number of old_str to disambiguate (1-based, inclusive)'
+          },
           insert_line: {
             type: 'number',
             description: 'Line number to insert at (for insert)'
@@ -87,6 +105,18 @@ IMPORTANT:
             type: 'array',
             items: { type: 'number' },
             description: 'Line range [start, end] for view (1-based, inclusive)'
+          },
+          search_query_regex: {
+            type: 'string',
+            description: 'Regex pattern to search within file (for view command)'
+          },
+          case_sensitive: {
+            type: 'boolean',
+            description: 'Case sensitive search (default: false)'
+          },
+          context_lines: {
+            type: 'number',
+            description: 'Context lines around matches (default: 5)'
           }
         },
         required: ['command', 'path']
@@ -186,6 +216,9 @@ IMPORTANT:
     args: Record<string, any>
   ): Promise<ToolResult> {
     const viewRange = args.view_range as [number, number] | undefined;
+    const searchQuery = args.search_query_regex as string | undefined;
+    const caseSensitive = args.case_sensitive as boolean | undefined ?? false;
+    const contextLines = args.context_lines as number | undefined ?? 5;
 
     try {
       const stat = await fs.stat(filePath);
@@ -201,8 +234,20 @@ IMPORTANT:
       }
 
       // 读取文件内容
-      let content = await fs.readFile(filePath, 'utf-8');
+      const content = await fs.readFile(filePath, 'utf-8');
       const lines = content.split('\n');
+
+      // 如果有正则搜索，优先使用搜索模式
+      if (searchQuery) {
+        return this.executeViewWithSearch(
+          toolCallId,
+          lines,
+          searchQuery,
+          caseSensitive,
+          contextLines,
+          viewRange
+        );
+      }
 
       // 应用行范围
       let startLine = 1;
@@ -235,12 +280,142 @@ IMPORTANT:
         isError: false
       };
     } catch (error: any) {
+      // 增强错误反馈：文件不存在时提供相似文件建议
+      if (error.code === 'ENOENT') {
+        const suggestions = await this.findSimilarFiles(filePath);
+        let errorMsg = `Error: File not found: ${path.relative(this.workspaceRoot, filePath)}`;
+        if (suggestions.length > 0) {
+          errorMsg += `\n\nDid you mean one of these?\n${suggestions.map(s => `  - ${s}`).join('\n')}`;
+        }
+        return {
+          toolCallId,
+          content: errorMsg,
+          isError: true
+        };
+      }
       return {
         toolCallId,
         content: `Error reading file: ${error.message}`,
         isError: true
       };
     }
+  }
+
+  /**
+   * 带正则搜索的文件查看
+   */
+  private executeViewWithSearch(
+    toolCallId: string,
+    lines: string[],
+    searchQuery: string,
+    caseSensitive: boolean,
+    contextLines: number,
+    viewRange?: [number, number]
+  ): ToolResult {
+    try {
+      const regex = new RegExp(searchQuery, caseSensitive ? 'g' : 'gi');
+
+      // 确定搜索范围
+      let startLine = 1;
+      let endLine = lines.length;
+      if (viewRange && viewRange.length === 2) {
+        startLine = Math.max(1, viewRange[0]);
+        endLine = viewRange[1] === -1 ? lines.length : Math.min(lines.length, viewRange[1]);
+      }
+
+      // 查找匹配行
+      const matchingLineIndices: number[] = [];
+      for (let i = startLine - 1; i < endLine; i++) {
+        regex.lastIndex = 0;
+        if (regex.test(lines[i])) {
+          matchingLineIndices.push(i);
+        }
+      }
+
+      if (matchingLineIndices.length === 0) {
+        return {
+          toolCallId,
+          content: `No matches found for pattern: ${searchQuery}`,
+          isError: false
+        };
+      }
+
+      // 构建带上下文的输出
+      const outputLines: string[] = [];
+      let lastPrintedLine = -1;
+
+      for (const matchIdx of matchingLineIndices) {
+        const contextStart = Math.max(0, matchIdx - contextLines);
+        const contextEnd = Math.min(lines.length - 1, matchIdx + contextLines);
+
+        // 如果与上一个匹配区域不连续，添加省略号
+        if (lastPrintedLine >= 0 && contextStart > lastPrintedLine + 1) {
+          outputLines.push('...');
+        }
+
+        // 输出上下文和匹配行
+        for (let i = contextStart; i <= contextEnd; i++) {
+          if (i > lastPrintedLine) {
+            const lineNum = String(i + 1).padStart(6);
+            const marker = i === matchIdx ? '>' : ' ';
+            outputLines.push(`${lineNum}${marker}\t${lines[i]}`);
+            lastPrintedLine = i;
+          }
+        }
+      }
+
+      outputLines.push(`\n[Found ${matchingLineIndices.length} matches]`);
+
+      const result = outputLines.join('\n');
+      const maxChars = 50000;
+      if (result.length > maxChars) {
+        return {
+          toolCallId,
+          content: result.substring(0, maxChars) + '\n<response clipped>',
+          isError: false
+        };
+      }
+
+      return {
+        toolCallId,
+        content: result,
+        isError: false
+      };
+    } catch (error: any) {
+      return {
+        toolCallId,
+        content: `Error in regex search: ${error.message}`,
+        isError: true
+      };
+    }
+  }
+
+  /**
+   * 查找相似文件（用于错误提示）
+   */
+  private async findSimilarFiles(targetPath: string): Promise<string[]> {
+    const targetName = path.basename(targetPath).toLowerCase();
+    const targetDir = path.dirname(targetPath);
+    const suggestions: string[] = [];
+
+    try {
+      // 尝试在同目录下查找相似文件
+      const entries = await fs.readdir(targetDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isFile()) {
+          const name = entry.name.toLowerCase();
+          // 简单的相似度检查：包含目标名称的一部分
+          if (name.includes(targetName.slice(0, 3)) || targetName.includes(name.slice(0, 3))) {
+            suggestions.push(path.relative(this.workspaceRoot, path.join(targetDir, entry.name)));
+            if (suggestions.length >= 5) break;
+          }
+        }
+      }
+    } catch {
+      // 目录不存在，忽略
+    }
+
+    return suggestions;
   }
 
   /**
@@ -321,6 +496,8 @@ IMPORTANT:
   ): Promise<ToolResult> {
     const oldStr = args.old_str;
     const newStr = args.new_str ?? '';
+    const startLine = args.old_str_start_line as number | undefined;
+    const endLine = args.old_str_end_line as number | undefined;
 
     if (typeof oldStr !== 'string') {
       return {
@@ -330,10 +507,31 @@ IMPORTANT:
       };
     }
 
+    if (oldStr === newStr) {
+      return {
+        toolCallId,
+        content: 'Error: No replacement was performed because old_str and new_str are identical.',
+        isError: true
+      };
+    }
+
     let content: string;
     try {
       content = await fs.readFile(filePath, 'utf-8');
     } catch (error: any) {
+      // 增强错误反馈：文件不存在时提供相似文件建议
+      if (error.code === 'ENOENT') {
+        const suggestions = await this.findSimilarFiles(filePath);
+        let errorMsg = `Error: File not found: ${path.relative(this.workspaceRoot, filePath)}`;
+        if (suggestions.length > 0) {
+          errorMsg += `\n\nDid you mean one of these?\n${suggestions.map(s => `  - ${s}`).join('\n')}`;
+        }
+        return {
+          toolCallId,
+          content: errorMsg,
+          isError: true
+        };
+      }
       return {
         toolCallId,
         content: `Error: ${error.message}`,
@@ -341,11 +539,83 @@ IMPORTANT:
       };
     }
 
+    const lines = content.split('\n');
+
+    // 如果指定了行号范围，在该范围内查找 old_str
+    if (startLine !== undefined && endLine !== undefined) {
+      // 验证行号范围
+      if (startLine < 1 || endLine < startLine || endLine > lines.length) {
+        return {
+          toolCallId,
+          content: `Error: Invalid line range [${startLine}, ${endLine}]. File has ${lines.length} lines.`,
+          isError: true
+        };
+      }
+
+      // 提取指定行范围的内容
+      const rangeContent = lines.slice(startLine - 1, endLine).join('\n');
+
+      if (!rangeContent.includes(oldStr)) {
+        return {
+          toolCallId,
+          content: `Error: old_str not found in lines ${startLine}-${endLine}.\n\nContent in that range:\n${rangeContent.substring(0, 500)}${rangeContent.length > 500 ? '...' : ''}`,
+          isError: true
+        };
+      }
+
+      // 计算范围内的偏移量
+      let beforeRange = '';
+      if (startLine > 1) {
+        beforeRange = lines.slice(0, startLine - 1).join('\n') + '\n';
+      }
+      const afterRange = endLine < lines.length ? '\n' + lines.slice(endLine).join('\n') : '';
+
+      // 在范围内执行替换
+      const updatedRange = rangeContent.replace(oldStr, newStr);
+
+      // 保存撤销信息
+      this.undoStack.set(filePath, content);
+
+      // 组装最终内容
+      const updated = beforeRange + updatedRange + afterRange;
+      await fs.writeFile(filePath, updated, 'utf-8');
+
+      logger.info('File edited (str_replace with line range)', { path: filePath, startLine, endLine }, LogCategory.TOOLS);
+
+      return {
+        toolCallId,
+        content: `OK: str_replace applied in lines ${startLine}-${endLine}`,
+        isError: false
+      };
+    }
+
+    // 没有行号范围，使用原来的全文搜索逻辑
     const index = content.indexOf(oldStr);
     if (index === -1) {
       return {
         toolCallId,
-        content: 'Error: old_str not found in file',
+        content: 'Error: old_str not found in file. Make sure old_str matches EXACTLY including whitespace.',
+        isError: true
+      };
+    }
+
+    // 检查是否有多个匹配
+    const secondIndex = content.indexOf(oldStr, index + 1);
+    if (secondIndex !== -1) {
+      // 找出所有匹配的行号
+      const matchLines: number[] = [];
+      let searchPos = 0;
+      while (true) {
+        const pos = content.indexOf(oldStr, searchPos);
+        if (pos === -1) break;
+        const lineNum = content.substring(0, pos).split('\n').length;
+        matchLines.push(lineNum);
+        searchPos = pos + 1;
+      }
+
+      return {
+        toolCallId,
+        content: `Error: old_str appears multiple times in the file (at lines: ${matchLines.join(', ')}).\n\nUse old_str_start_line and old_str_end_line parameters to specify which occurrence to replace.`,
         isError: true
       };
     }
