@@ -1,6 +1,7 @@
 <script lang="ts">
   import { getState } from '../stores/messages.svelte';
   import { ensureArray } from '../lib/utils';
+  import { vscode } from '../lib/vscode-bridge';
 
   const appState = getState();
 
@@ -23,6 +24,33 @@
     completed: '已完成',
     failed: '失败',
   };
+
+  const taskStatusLabels: Record<string, string> = {
+    pending: '未开始',
+    paused: '已暂停',
+    running: '进行中',
+    completed: '已完成',
+    failed: '失败',
+    cancelled: '已取消',
+  };
+
+  function canStartTask(status: string) {
+    return status === 'pending' || status === 'paused';
+  }
+
+  function canDeleteTask(status: string) {
+    return status !== 'running';
+  }
+
+  function startTask(taskId?: string) {
+    if (!taskId) return;
+    vscode.postMessage({ type: 'startTask', taskId });
+  }
+
+  function deleteTask(taskId?: string) {
+    if (!taskId) return;
+    vscode.postMessage({ type: 'deleteTask', taskId });
+  }
 </script>
 
 <div class="tasks-panel">
@@ -37,10 +65,9 @@
       </div>
     {:else}
       {#if tasks.length > 0}
-        <div class="section-title">任务</div>
         <div class="tasks-list">
           {#each tasks as task}
-            <div class="task-item" class:completed={task.status === 'completed'} class:failed={task.status === 'failed'}>
+            <div class="task-item" class:completed={task.status === 'completed'} class:failed={task.status === 'failed'} class:cancelled={task.status === 'cancelled'}>
               <div class="task-status">
                 {#if task.status === 'running'}
                   <svg class="status-icon spinning" viewBox="0 0 16 16">
@@ -50,6 +77,10 @@
                 {:else if task.status === 'completed'}
                   <svg class="status-icon success" viewBox="0 0 16 16">
                     <path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425z"/>
+                  </svg>
+                {:else if task.status === 'cancelled'}
+                  <svg class="status-icon muted" viewBox="0 0 16 16">
+                    <path d="M8 2.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11zm0 1a4.5 4.5 0 0 1 3.182 7.682L4.818 4.818A4.5 4.5 0 0 1 8 3.5zm0 9a4.5 4.5 0 0 1-3.182-7.682l6.364 6.364A4.5 4.5 0 0 1 8 12.5z"/>
                   </svg>
                 {:else if task.status === 'failed'}
                   <svg class="status-icon error" viewBox="0 0 16 16">
@@ -66,6 +97,17 @@
                 {#if task.description || task.prompt}
                   <div class="task-desc">{task.description || task.prompt}</div>
                 {/if}
+              </div>
+              <div class="task-meta">
+                <span class="task-badge status-{task.status}">{taskStatusLabels[task.status] || task.status}</span>
+                <div class="task-actions">
+                  <button class="task-action-btn" disabled={!canStartTask(task.status)} onclick={() => startTask(task.id)}>
+                    开始
+                  </button>
+                  <button class="task-action-btn danger" disabled={!canDeleteTask(task.status)} onclick={() => deleteTask(task.id)}>
+                    删除
+                  </button>
+                </div>
               </div>
             </div>
           {/each}
@@ -182,7 +224,7 @@
 
   .task-item {
     display: flex;
-    align-items: flex-start;
+    align-items: center;
     gap: var(--space-3);
     padding: var(--space-3) var(--space-4);
     background: var(--surface-1);
@@ -202,6 +244,10 @@
   .task-item.failed {
     border-color: var(--error-muted);
     background: var(--error-muted);
+  }
+
+  .task-item.cancelled {
+    opacity: 0.7;
   }
 
   .task-status {
@@ -236,6 +282,10 @@
     color: var(--foreground-muted);
   }
 
+  .status-icon.muted {
+    color: var(--foreground-muted);
+  }
+
   @keyframes spin {
     from { transform: rotate(0deg); }
     to { transform: rotate(360deg); }
@@ -244,6 +294,9 @@
   .task-info {
     flex: 1;
     min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
 
   .task-name {
@@ -256,8 +309,61 @@
   .task-desc {
     font-size: var(--text-sm);
     color: var(--foreground-muted);
-    margin-top: var(--space-1);
     line-height: var(--leading-normal);
+  }
+
+  .task-meta {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: var(--space-2);
+    min-width: 140px;
+  }
+
+  .task-badge {
+    padding: 2px 8px;
+    border-radius: var(--radius-full);
+    font-size: var(--text-xs);
+    color: var(--foreground);
+    background: var(--surface-3);
+    border: 1px solid var(--border);
+  }
+
+  .task-badge.status-running { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 35%, transparent); }
+  .task-badge.status-completed { color: var(--success); border-color: color-mix(in srgb, var(--success) 35%, transparent); }
+  .task-badge.status-failed { color: var(--error); border-color: color-mix(in srgb, var(--error) 35%, transparent); }
+  .task-badge.status-cancelled { color: var(--foreground-muted); }
+
+  .task-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .task-action-btn {
+    height: var(--btn-height-xs);
+    padding: 0 var(--space-3);
+    font-size: var(--text-xs);
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--foreground);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+  }
+
+  .task-action-btn:hover:not(:disabled) {
+    background: var(--surface-hover);
+  }
+
+  .task-action-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .task-action-btn.danger {
+    border-color: color-mix(in srgb, var(--error) 40%, transparent);
+    color: var(--error);
   }
 
   .assignment-list {

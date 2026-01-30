@@ -11,6 +11,21 @@
 
   let { messages }: Props = $props();
 
+  // Worker 面板消息过滤：
+  // - 允许任务分配消息（编排者发给 Worker 的指令）
+  // - 过滤掉任务完成摘要（subTaskCard，这些只在主对话区显示）
+  // - 过滤掉系统消息
+  const filteredMessages = $derived(
+    messages.filter(m => {
+      // 过滤系统消息
+      if (m.source === 'system') return false;
+      // 过滤 subTaskCard（任务完成摘要只在主对话区显示）
+      if (m.metadata?.subTaskCard) return false;
+      // 其他消息都允许（包括编排者的任务分配消息）
+      return true;
+    })
+  );
+
   // 滚动相关状态
   let contentEl: HTMLDivElement | null = $state(null);
   let showScrollBtn = $state(false);
@@ -44,7 +59,7 @@
 
   // 当 contentEl 绑定后立即滚动到底部
   $effect(() => {
-    if (contentEl && messages.length > 0 && !hasInitialScrolled) {
+    if (contentEl && filteredMessages.length > 0 && !hasInitialScrolled) {
       // 等待 DOM 完全渲染
       tick().then(() => {
         setTimeout(() => {
@@ -58,7 +73,7 @@
   // 消息变化时自动滚动（如果用户没有手动滚动）
   let prevMessageCount = 0;
   $effect(() => {
-    const currentCount = messages.length;
+    const currentCount = filteredMessages.length;
     // 只有消息数量增加时才自动滚动
     if (hasInitialScrolled && currentCount > prevMessageCount && contentEl && !isUserScrolling) {
       tick().then(() => {
@@ -71,13 +86,13 @@
 
 <div class="agent-tab">
   <div class="agent-content" bind:this={contentEl} onscroll={handleScroll}>
-    {#if messages.length === 0}
+    {#if filteredMessages.length === 0}
       <div class="empty-state">
         <p>暂无输出</p>
       </div>
     {:else}
       <div class="message-list">
-        {#each messages as message (message.id)}
+        {#each filteredMessages as message (message.id)}
           <MessageItem {message} />
         {/each}
       </div>

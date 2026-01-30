@@ -42,6 +42,58 @@ export class Uri {
   }
 }
 
+// Mock Position
+export class Position {
+  readonly line: number;
+  readonly character: number;
+
+  constructor(line: number, character: number) {
+    this.line = line;
+    this.character = character;
+  }
+}
+
+// Mock Range
+export class Range {
+  readonly start: Position;
+  readonly end: Position;
+
+  constructor(start: Position, end: Position) {
+    this.start = start;
+    this.end = end;
+  }
+}
+
+// Mock SymbolKind
+export const SymbolKind = {
+  File: 0,
+  Module: 1,
+  Namespace: 2,
+  Package: 3,
+  Class: 4,
+  Method: 5,
+  Property: 6,
+  Field: 7,
+  Constructor: 8,
+  Enum: 9,
+  Interface: 10,
+  Function: 11,
+  Variable: 12,
+  Constant: 13,
+  String: 14,
+  Number: 15,
+  Boolean: 16,
+  Array: 17,
+  Object: 18,
+  Key: 19,
+  Null: 20,
+  EnumMember: 21,
+  Struct: 22,
+  Event: 23,
+  Operator: 24,
+  TypeParameter: 25
+};
+
 // Mock languages
 export const languages = {
   getDiagnostics: (): Array<[Uri, any[]]> => {
@@ -84,6 +136,14 @@ export const window = {
 // Mock workspace
 export const workspace = {
   workspaceFolders: undefined as any,
+  openTextDocument: async (uri: Uri) => {
+    const ext = uri.fsPath.split('.').pop() || '';
+    let languageId = 'plaintext';
+    if (['ts', 'tsx'].includes(ext)) languageId = 'typescript';
+    if (['js', 'jsx', 'mjs', 'cjs'].includes(ext)) languageId = 'javascript';
+    if (ext === 'py') languageId = 'python';
+    return { uri, languageId };
+  },
   getConfiguration: (section?: string) => ({
     get: <T>(key: string, defaultValue?: T): T | undefined => defaultValue,
     has: (key: string) => false,
@@ -147,4 +207,3 @@ export default {
   ProgressLocation,
   EventEmitter
 };
-

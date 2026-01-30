@@ -9,7 +9,7 @@
  */
 
 import { EventEmitter } from 'events';
-import { AgentType, WorkerSlot } from '../types/agent-types';
+import { AgentType, WorkerSlot, TokenUsage } from '../types/agent-types';
 import { BaseLLMAdapter } from './adapters/base-adapter';
 import { WorkerLLMAdapter, WorkerAdapterConfig } from './adapters/worker-adapter';
 import { OrchestratorLLMAdapter, OrchestratorAdapterConfig } from './adapters/orchestrator-adapter';
@@ -219,10 +219,13 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
 
     const adapter = new WorkerLLMAdapter(adapterConfig);
 
+    let systemPrompt = adapter.getSystemPrompt();
     const skillPrompt = this.buildSkillPromptAppendix();
     if (skillPrompt) {
-      adapter.setSystemPrompt(`${adapter.getSystemPrompt()}\n\n${skillPrompt}`);
+      systemPrompt = `${systemPrompt}\n\n${skillPrompt}`;
     }
+    systemPrompt = this.injectUserRules(systemPrompt);
+    adapter.setSystemPrompt(systemPrompt);
 
     // 只设置错误事件处理（消息由 Adapter 直接发送到 MessageBus）
     this.setupAdapterEvents(adapter, workerSlot);
@@ -290,6 +293,33 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     return blocks.join('\n');
   }
 
+  private injectUserRules(prompt: string): string {
+    const cleaned = this.stripUserRules(prompt);
+    const rules = this.getUserRulesContent();
+    if (!rules) {
+      return cleaned;
+    }
+    const block = [
+      '<!-- USER_RULES_START -->',
+      '## 用户规则',
+      rules,
+      '<!-- USER_RULES_END -->'
+    ].join('\n');
+    return `${cleaned}\n\n${block}`;
+  }
+
+  private stripUserRules(prompt: string): string {
+    return prompt.replace(/\n?<!-- USER_RULES_START -->[\s\S]*?<!-- USER_RULES_END -->\n?/g, '').trim();
+  }
+
+  private getUserRulesContent(): string {
+    const rules = LLMConfigLoader.loadUserRules();
+    if (!rules.enabled) {
+      return '';
+    }
+    return (rules.content || '').trim();
+  }
+
   private formatSkillInstruction(skill: InstructionSkillDefinition): string {
     const toolHint = Array.isArray(skill.allowedTools) && skill.allowedTools.length > 0
       ? `允许使用的工具: ${skill.allowedTools.join(', ')}`
@@ -346,6 +376,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     };
 
     const adapter = new OrchestratorLLMAdapter(adapterConfig);
+    adapter.setSystemPrompt(this.injectUserRules(adapter.getSystemPrompt()));
 
     // 只设置错误事件处理（消息由 Adapter 直接发送到 MessageBus）
     this.setupAdapterEvents(adapter, 'orchestrator');
@@ -422,7 +453,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       };
     }
 
-    try {
+    const sendOnce = async (): Promise<{ content: string; tokenUsage?: TokenUsage }> => {
       const beforeTotals = 'getTotalTokenUsage' in adapter && typeof (adapter as any).getTotalTokenUsage === 'function'
         ? (adapter as any).getTotalTokenUsage()
         : { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
@@ -438,17 +469,69 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
         cacheWriteTokens: (afterTotals.cacheWriteTokens || 0) - (beforeTotals.cacheWriteTokens || 0) || undefined,
       };
 
-      return {
-        content,
-        done: true,
-        tokenUsage,
-      };
-    } catch (error: any) {
-      return {
-        content: '',
-        done: false,
-        error: error.message,
-      };
+      return { content, tokenUsage };
+    };
+
+    const isWorker = agent !== 'orchestrator';
+    const retryDelays = [10000, 20000, 30000];
+
+    try {
+      for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+        try {
+          const { content, tokenUsage } = await sendOnce();
+          return {
+            content,
+            done: true,
+            tokenUsage,
+          };
+        } catch (error: any) {
+          const errorMessage = this.normalizeErrorMessage(error);
+          if (!isWorker) {
+            return {
+              content: '',
+              done: false,
+              error: errorMessage,
+            };
+          }
+
+          if (this.isAuthOrQuotaError(error)) {
+            return {
+              content: '',
+              done: false,
+              error: errorMessage,
+            };
+          }
+
+          if (!this.isConnectionError(error) || attempt === retryDelays.length) {
+            return {
+              content: '',
+              done: false,
+              error: errorMessage,
+            };
+          }
+
+          const delay = retryDelays[attempt];
+          logger.warn('Worker 连接失败，准备重试', {
+            agent,
+            attempt: attempt + 1,
+            delayMs: delay,
+            error: errorMessage,
+          }, LogCategory.LLM);
+
+          try {
+            await adapter.disconnect();
+            await this.ensureConnected(agent, adapter);
+          } catch (reconnectError: any) {
+            logger.warn('Worker 重连失败', {
+              agent,
+              error: this.normalizeErrorMessage(reconnectError),
+            }, LogCategory.LLM);
+          }
+
+          await this.sleep(delay);
+        }
+      }
+      return { content: '', done: false, error: 'Worker request failed after retries.' };
     } finally {
       // 重置 streamToUI 为默认值，避免影响后续请求
       adapter.setStreamToUI(true);
@@ -479,6 +562,36 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     } finally {
       this.connectionPromises.delete(agent);
     }
+  }
+
+  private isAuthOrQuotaError(error: any): boolean {
+    const status = error?.status || error?.response?.status;
+    if (status === 401 || status === 403 || status === 429) return true;
+    const message = this.normalizeErrorMessage(error).toLowerCase();
+    return /unauthorized|forbidden|invalid api key|api key|auth|permission|quota|insufficient|billing|payment|exceeded|rate limit|limit|blocked|suspended|disabled|account/i.test(message);
+  }
+
+  private isConnectionError(error: any): boolean {
+    const status = error?.status || error?.response?.status;
+    if (status === 408 || status === 502 || status === 503 || status === 504) return true;
+    const code = typeof error?.code === 'string' ? error.code : '';
+    if (['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'].includes(code)) {
+      return true;
+    }
+    const message = this.normalizeErrorMessage(error).toLowerCase();
+    return /timeout|timed out|network|connection|fetch failed|socket hang up|tls|certificate|econnreset|econnrefused|enotfound|eai_again/.test(message);
+  }
+
+  private normalizeErrorMessage(error: any): string {
+    if (!error) return 'Unknown error';
+    if (typeof error === 'string') return error;
+    if (error instanceof Error && error.message) return error.message;
+    if (error?.message) return String(error.message);
+    return String(error);
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
@@ -611,6 +724,20 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       }
     }
     logger.info('Cleared all adapter histories', undefined, LogCategory.LLM);
+  }
+
+  /**
+   * 刷新所有适配器的用户规则
+   */
+  refreshUserRules(): void {
+    for (const [agent, adapter] of this.adapters) {
+      if ('getSystemPrompt' in adapter && 'setSystemPrompt' in adapter) {
+        const current = (adapter as any).getSystemPrompt() as string;
+        const updated = this.injectUserRules(current);
+        (adapter as any).setSystemPrompt(updated);
+        logger.debug(`Refreshed user rules for adapter: ${agent}`, undefined, LogCategory.LLM);
+      }
+    }
   }
 
   /**

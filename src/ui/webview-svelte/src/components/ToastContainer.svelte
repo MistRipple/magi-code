@@ -8,10 +8,47 @@
   // Toast 列表
   const toasts = $derived(ensureArray(appState.toasts));
 
+  // 自动关闭定时器（5秒）
+  const AUTO_DISMISS_MS = 5000;
+
+  // 跟踪已设置定时器的 toast ID
+  const activeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
   // 移除 toast
   function removeToast(id: string) {
+    // 清除定时器
+    const timer = activeTimers.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      activeTimers.delete(id);
+    }
     appState.toasts = ensureArray(appState.toasts).filter(t => t.id !== id);
   }
+
+  // 为新增的 toast 设置自动关闭
+  $effect(() => {
+    const currentToasts = toasts;
+    const currentIds = new Set(currentToasts.map(t => t.id));
+
+    // 为新 toast 设置定时器
+    for (const toast of currentToasts) {
+      if (!activeTimers.has(toast.id)) {
+        const timer = setTimeout(() => {
+          activeTimers.delete(toast.id);
+          appState.toasts = ensureArray(appState.toasts).filter(t => t.id !== toast.id);
+        }, AUTO_DISMISS_MS);
+        activeTimers.set(toast.id, timer);
+      }
+    }
+
+    // 清理已移除 toast 的定时器
+    for (const [id, timer] of activeTimers) {
+      if (!currentIds.has(id)) {
+        clearTimeout(timer);
+        activeTimers.delete(id);
+      }
+    }
+  });
 </script>
 
 <div class="toast-container">

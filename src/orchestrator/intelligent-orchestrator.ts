@@ -779,7 +779,6 @@ export class IntelligentOrchestrator {
     const instructionSkills: Array<{ name: string; description?: string; disableModelInvocation?: boolean }> =
       Array.isArray(skillsConfig.instructionSkills) ? skillsConfig.instructionSkills : [];
     const skillTools = Array.isArray(skillsConfig.customTools) ? skillsConfig.customTools : [];
-    const builtInTools = skillsConfig.builtInTools || {};
 
     const tools = await toolManager.getTools();
     const mcpTools = tools.filter(t => t.metadata?.source === 'mcp');

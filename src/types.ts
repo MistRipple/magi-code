@@ -433,6 +433,8 @@ export type WebviewToExtensionMessage =
   | { type: 'executeTask'; prompt: string; images?: Array<{ dataUrl: string }>; mode?: string; agent?: WorkerSlot | null; worker?: WorkerSlot; requestId?: string }
   | { type: 'interruptTask'; taskId?: string; silent?: boolean; reason?: string }
   | { type: 'continueTask'; taskId: string; prompt: string }
+  | { type: 'startTask'; taskId: string }
+  | { type: 'deleteTask'; taskId: string }
   | { type: 'login'; apiKey: string; provider?: string; remember?: boolean }
   | { type: 'logout' }
   | { type: 'getStatus' }
@@ -504,6 +506,7 @@ export type WebviewToExtensionMessage =
   | { type: 'toggleBuiltInTool'; tool: string; enabled: boolean }
   | { type: 'addCustomTool'; tool: any }
   | { type: 'removeCustomTool'; toolName: string }
+  | { type: 'removeInstructionSkill'; skillName: string }
   | { type: 'installSkill'; skillId: string }
   | { type: 'applyInstructionSkill'; skillName: string; args?: string; images?: Array<{ dataUrl: string }>; agent?: WorkerSlot | null; requestId?: string }
   // 新增：Skills 仓库相关
@@ -562,10 +565,10 @@ export type ExtensionToWebviewMessage =
   | { type: 'orchestratorMessage'; content: string; phase: string; taskId?: string; messageType?: string; metadata?: Record<string, unknown>; sessionId?: string | null; timestamp?: number }
   // 新增：Worker 专用消息类型
   | { type: 'workerOutput'; workerId: string; workerType: WorkerSlot; content: string; subTaskId: string }
-  // 交互模式和验证相关
+  // 交互模式相关
   | { type: 'interactionModeChanged'; mode: InteractionMode }
   | { type: 'phaseChanged'; phase: string; taskId: string; isRunning?: boolean }
-  | { type: 'verificationResult'; success: boolean; summary: string; details?: string }
+  // verificationResult 已移除：验证结果在最终总结中统一显示
   | { type: 'recoveryRequest'; taskId: string; error: string; canRetry: boolean; canRollback: boolean }
   | { type: 'recoveryResult'; success: boolean; strategy: string; message: string }
   | { type: 'taskPaused'; taskId: string }
@@ -604,9 +607,11 @@ export type ExtensionToWebviewMessage =
   | { type: 'skillsConfigLoaded'; config: any }
   | { type: 'skillsConfigSaved' }
   | { type: 'profileConfigSaved'; success: boolean; error?: string }
+  | { type: 'profileConfigReset'; success: boolean; error?: string }
   | { type: 'builtInToolToggled'; tool: string; enabled: boolean }
   | { type: 'customToolAdded'; tool: any }
   | { type: 'customToolRemoved'; toolName: string }
+  | { type: 'instructionSkillRemoved'; skillName: string }
   | { type: 'skillInstalled'; skillId: string; skill: any }
   // 新增：Skills 仓库响应
   | { type: 'repositoriesLoaded'; repositories: any[] }

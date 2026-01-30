@@ -175,13 +175,7 @@ function handleMessage(message: WebviewMessage) {
       addSystemMessage('已切换到 ' + getModeDisplayName(message.mode as string) + ' 模式', 'info');
       break;
 
-    case 'verificationResult':
-      if (message.success) {
-        addSystemMessage('验证通过: ' + (message.summary as string), 'success');
-      } else {
-        addSystemMessage('验证失败: ' + (message.summary as string), 'error');
-      }
-      break;
+    // verificationResult 已移除：验证结果在最终总结中统一显示，避免重复
 
     case 'recoveryResult':
       addSystemMessage(message.message as string, message.success ? 'success' : 'error');
@@ -676,20 +670,35 @@ function mapStandardMessage(standard: StandardMessage): Message {
 
 type MessageLocation = { location: 'thread' } | { location: 'agent'; agent: 'claude' | 'codex' | 'gemini' };
 
+/**
+ * 消息路由规则：
+ * - 带 subTaskCard 的消息 → 主对话区（任务完成摘要）
+ * - agent 是 Worker 的消息 → Worker 面板（包括编排者的任务分配）
+ * - orchestrator/system 消息 → 主对话区
+ */
 function resolveMessageTarget(standard: StandardMessage): MessageLocation {
   const agent = standard.agent;
   const source = standard.source;
   const hasSummaryCard = Boolean(standard.metadata && (standard.metadata as { subTaskCard?: unknown }).subTaskCard);
   const isSystemNotice = standard.type === 'system-notice' || source === 'system' as string;
-  if (hasSummaryCard || isSystemNotice || agent === 'orchestrator' || source === 'orchestrator') {
+
+  // 1. 任务摘要卡片、系统通知 → 主对话区
+  if (hasSummaryCard || isSystemNotice) {
     return { location: 'thread' };
   }
+
+  // 2. agent 是 Worker 的消息 → Worker 面板（包括编排者发给 Worker 的任务分配）
   if (agent === 'claude' || agent === 'codex' || agent === 'gemini') {
     return { location: 'agent', agent };
   }
+
+  // 3. 其他编排器消息 → 主对话区
   return { location: 'thread' };
 }
 
+/**
+ * 查找消息位置
+ */
 function findMessageLocation(messageId: string): MessageLocation | null {
   const state = getState();
   if (state.threadMessages.some(m => m.id === messageId)) {

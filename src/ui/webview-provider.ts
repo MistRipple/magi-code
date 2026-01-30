@@ -39,7 +39,6 @@ import { IAdapterFactory } from '../adapters/adapter-factory-interface';
 import { LLMAdapterFactory } from '../llm/adapter-factory';
 import { TaskAnalyzer, WorkerSelector } from '../task';
 import { IntelligentOrchestrator } from '../orchestrator/intelligent-orchestrator';
-import { AceIndexManager } from '../ace/index-manager';
 import { normalizeOrchestratorMessage, isInternalStateMessage } from '../normalizer';
 import { UnifiedMessageBus, type ProcessingState } from '../normalizer/unified-message-bus';
 import { ProfileStorage, StoredProfileConfig } from '../orchestrator/profile';
@@ -47,6 +46,7 @@ import { parseContentToBlocks } from '../utils/content-parser';
 import { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
 import { InstructionSkillDefinition } from '../tools/skills-manager';
 import { applySkillInstall, buildInstructionSkillPrompt } from '../tools/skill-installation';
+import { loadAceConfigFromFile } from '../tools/tool-manager';
 import { MermaidPanel } from './mermaid-panel';
 // Mission-Driven Architecture 类型 - 直接从子模块导入
 import {
@@ -1010,36 +1010,42 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
     globalEventBus.on('subtask:started', (event) => {
       const data = event.data as { agent?: string; description?: string; targetFiles?: string[]; reason?: string; dispatchId?: string };
-      if (data?.description) {
-        // 发送到主对话窗口（使用标准消息）
-        this.sendOrchestratorMessage({
-          content: `子任务开始: ${data.description}`,
-          messageType: 'progress',
-          taskId: event.taskId,
-          metadata: {
-            subTaskId: event.subTaskId || '',
-            status: 'started',
-            agent: data.agent || 'system',
-            description: data.description,
-            dispatchId: data.dispatchId,
-          },
-        });
+      if (data?.description && data?.agent) {
+        const targetWorker = data.agent as WorkerSlot;
 
-        // 发送任务卡片到对应的 Agent 面板
-        if (data.agent) {
-          this.postMessage({
-            type: 'workerTaskCard',
-            worker: data.agent as WorkerSlot,
-            taskId: event.taskId || '',
-            subTaskId: event.subTaskId || '',
-            description: data.description,
-            targetFiles: data.targetFiles || [],
-            reason: data.reason || '',
-            status: 'started',
-            dispatchId: data.dispatchId,
-            sessionId: this.activeSessionId,
-          });
+        // 构建任务分配消息内容
+        const taskLines: string[] = [`**任务分配**\n\n${data.description}`];
+        if (data.targetFiles && data.targetFiles.length > 0) {
+          taskLines.push(`\n**目标文件:** ${data.targetFiles.join(', ')}`);
         }
+        if (data.reason) {
+          taskLines.push(`\n**原因:** ${data.reason}`);
+        }
+        const taskContent = taskLines.join('');
+
+        // 发送任务分配消息到对应的 Worker 面板
+        // source: 'orchestrator' 表示来自编排者
+        // agent: 目标 Worker，这样会路由到对应的 Worker 面板
+        const taskAssignmentMessage: StandardMessage = {
+          id: `msg-task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          traceId: this.activeSessionId || 'default',
+          type: MessageType.TEXT,
+          source: 'orchestrator',
+          agent: targetWorker,
+          timestamp: Date.now(),
+          updatedAt: Date.now(),
+          blocks: [{
+            type: 'text' as const,
+            content: taskContent,
+            isMarkdown: true,
+          }],
+          lifecycle: MessageLifecycle.COMPLETED,
+          metadata: {
+            taskId: event.taskId,
+            subTaskId: event.subTaskId || '',
+          },
+        };
+        this.messageBus.sendMessage(taskAssignmentMessage);
       }
       this.sendStateUpdate();
     });
@@ -1822,6 +1828,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         await this.interruptCurrentTask({ silent: Boolean((message as any).silent) });
         break;
 
+      case 'startTask':
+        await this.handleStartTask((message as any).taskId);
+        break;
+
+      case 'deleteTask':
+        await this.handleDeleteTask((message as any).taskId);
+        break;
+
       case 'pauseTask':
        
         logger.info('界面.任务.暂停.消息', { taskId: (message as any).taskId }, LogCategory.UI);
@@ -2003,7 +2017,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
 
       case 'getProfileConfig':
-        this.sendProfileConfig();
+        await this.sendProfileConfig();
         break;
 
       case 'saveProfileConfig':
@@ -2118,16 +2132,16 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         await this.handleSaveSkillsConfig(message.config);
         break;
 
-      case 'toggleBuiltInTool':
-        await this.handleToggleBuiltInTool(message.tool, message.enabled);
-        break;
-
       case 'addCustomTool':
         await this.handleAddCustomTool(message.tool);
         break;
 
       case 'removeCustomTool':
         await this.handleRemoveCustomTool(message.toolName);
+        break;
+
+      case 'removeInstructionSkill':
+        await this.handleRemoveInstructionSkill(message.skillName);
         break;
 
       case 'installSkill':
@@ -2375,16 +2389,24 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 写入配置文件
       fs.writeFileSync(configPath, JSON.stringify(existingConfig, null, 2), 'utf-8');
       logger.info('界面.提示词_增强.配置.已保存', { path: configPath }, LogCategory.UI);
+
+      // 🔧 同步更新 ToolManager 中的 AceExecutor 配置
+      const toolManager = this.adapterFactory.getToolManager?.();
+      if (toolManager && config.baseUrl && config.apiKey) {
+        toolManager.configureAce(config.baseUrl, config.apiKey);
+        logger.info('界面.提示词_增强.配置.已同步到ToolManager', undefined, LogCategory.UI);
+      }
+
       if (source === 'manual') {
-        this.postMessage({ type: 'promptEnhanceSaved', success: true });
-        this.postMessage({ type: 'toast', message: 'ACE 配置已保存', toastType: 'success' });
+        this.postMessageImmediate({ type: 'promptEnhanceSaved', success: true });
+        this.postMessageImmediate({ type: 'toast', message: 'ACE 配置已保存', toastType: 'success' });
       }
     } catch (error) {
       logger.error('界面.提示词_增强.配置.保存_失败', error, LogCategory.UI);
       if (source === 'manual') {
         const errorMsg = error instanceof Error ? error.message : String(error);
-        this.postMessage({ type: 'promptEnhanceSaved', success: false, error: errorMsg });
-        this.postMessage({ type: 'toast', message: `ACE 配置保存失败: ${errorMsg}`, toastType: 'error' });
+        this.postMessageImmediate({ type: 'promptEnhanceSaved', success: false, error: errorMsg });
+        this.postMessageImmediate({ type: 'toast', message: `ACE 配置保存失败: ${errorMsg}`, toastType: 'error' });
       }
     }
   }
@@ -2394,39 +2416,27 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     return path.join(os.homedir(), '.multicli', 'config.json');
   }
 
-  /** 获取 Prompt 增强配置 - 从 ~/.multicli/config.json 读取 */
+  /** 获取 Prompt 增强配置 - 复用 ToolManager 的配置读取逻辑 */
   private async getPromptEnhanceConfig(): Promise<{ baseUrl: string; apiKey: string }> {
-    try {
-      const configPath = this.getMultiCliConfigPath();
-      if (fs.existsSync(configPath)) {
-        const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-        if (config.promptEnhance) {
-          return {
-            baseUrl: config.promptEnhance.baseUrl || '',
-            apiKey: config.promptEnhance.apiKey || ''
-          };
-        }
-      }
-    } catch (error) {
-      logger.error('界面.提示词_增强.配置.读取_失败', error, LogCategory.UI);
-    }
-    return { baseUrl: '', apiKey: '' };
+    return loadAceConfigFromFile();
   }
 
   /** 发送 Prompt 增强配置到前端 */
   private async sendPromptEnhanceConfig(): Promise<void> {
     const config = await this.getPromptEnhanceConfig();
     this.postMessage({
-      type: 'promptEnhanceConfig',
-      baseUrl: config.baseUrl,
-      apiKey: config.apiKey
+      type: 'promptEnhanceConfigLoaded',
+      config: {
+        baseUrl: config.baseUrl,
+        apiKey: config.apiKey
+      }
     } as any);
   }
 
   /** 测试 Augment API 连接 */
   private async handleTestPromptEnhance(baseUrl: string, apiKey: string): Promise<void> {
     if (!baseUrl || !apiKey) {
-      this.postMessage({ type: 'promptEnhanceResult', success: false, message: '请填写 API 地址和密钥' } as any);
+      this.postMessageImmediate({ type: 'promptEnhanceResult', success: false, message: '请填写 API 地址和密钥' } as any);
       return;
     }
 
@@ -2456,162 +2466,417 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
 
       if (response.ok) {
-        this.postMessage({ type: 'promptEnhanceResult', success: true, message: '连接成功' } as any);
+        this.postMessageImmediate({ type: 'promptEnhanceResult', success: true, message: '连接成功' } as any);
       } else if (response.status === 401) {
-        this.postMessage({ type: 'promptEnhanceResult', success: false, message: 'Token 无效或已过期' } as any);
+        this.postMessageImmediate({ type: 'promptEnhanceResult', success: false, message: 'Token 无效或已过期' } as any);
       } else if (response.status === 403) {
-        this.postMessage({ type: 'promptEnhanceResult', success: false, message: '访问被拒绝' } as any);
+        this.postMessageImmediate({ type: 'promptEnhanceResult', success: false, message: '访问被拒绝' } as any);
       } else {
         const errorText = await response.text().catch(() => '');
-        this.postMessage({ type: 'promptEnhanceResult', success: false, message: `连接失败: ${response.status}` } as any);
+        this.postMessageImmediate({ type: 'promptEnhanceResult', success: false, message: `连接失败: ${response.status}` } as any);
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.postMessage({ type: 'promptEnhanceResult', success: false, message: `连接错误: ${errorMsg}` } as any);
+      this.postMessageImmediate({ type: 'promptEnhanceResult', success: false, message: `连接错误: ${errorMsg}` } as any);
     }
   }
 
-  /** 执行 Prompt 增强 - 使用 Augment prompt-enhancer API + ACE 索引 */
+  /** 执行 Prompt 增强 - 使用压缩模型 + 代码上下文 */
   private async handleEnhancePrompt(prompt: string): Promise<void> {
-    // 从配置读取 Augment API 配置
-    const { baseUrl, apiKey } = await this.getPromptEnhanceConfig();
-
-    if (!baseUrl || !apiKey) {
-      this.postMessage({ type: 'promptEnhanced', enhancedPrompt: '', error: '请先在设置中配置 Augment API' } as any);
-      return;
-    }
-
-    // 获取项目根目录
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    const projectRoot = workspaceFolders?.[0]?.uri.fsPath || '';
-
-    // 1. 自动索引项目并获取 blobs
-    let blobNames: string[] = [];
-    if (projectRoot) {
-      try {
-        logger.info('界面.ACE.索引.开始', { projectRoot }, LogCategory.UI);
-        const aceManager = new AceIndexManager(projectRoot, baseUrl, apiKey);
-        const indexResult = await aceManager.indexProject();
-        if (indexResult.status !== 'error') {
-          blobNames = aceManager.loadIndex();
-          logger.info('界面.ACE.索引.完成', { blobCount: blobNames.length }, LogCategory.UI);
-        }
-      } catch (error) {
-        logger.error('界面.ACE.索引.失败', error, LogCategory.UI);
-        // 索引失败不阻止增强，继续使用空 blobs
-      }
-    }
-
-    // 2. 收集上下文（5-10 轮对话）
-    const conversationHistory = this.sessionManager.formatConversationHistory(10);
-
-    // 3. 检测语言
-    const isChinese = /[\u4e00-\u9fa5]/.test(prompt);
-    const languageGuideline = isChinese ? 'Please respond in Chinese (Simplified Chinese). 请用中文回复。' : '';
-
-    // 4. 解析对话历史为 chat_history 格式
-    const chatHistory = this.parseChatHistory(conversationHistory);
-
-    // 5. 构造符合 Augment prompt-enhancer 格式的 payload（包含 blobs）
-    const payload = {
-      nodes: [{ id: 1, type: 0, text_node: { content: prompt } }],
-      chat_history: chatHistory,
-      blobs: {
-        checkpoint_id: null,
-        added_blobs: blobNames,  // 传入 ACE 索引的 blobs
-        deleted_blobs: [],
-      },
-      conversation_id: null,
-      model: 'claude-sonnet-4-5',
-      mode: 'CHAT',
-      user_guided_blobs: [],
-      external_source_ids: [],
-      user_guidelines: languageGuideline,
-      workspace_guidelines: '',
-      rules: []
-    };
-
     try {
-      const apiUrl = baseUrl.replace(/\/$/, '') + '/prompt-enhancer';
-      const response = await fetch(apiUrl, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(60000)
-      });
+      // 加载压缩模型配置
+      const { LLMConfigLoader } = await import('../llm/config');
+      const compressorConfig = LLMConfigLoader.loadCompressorConfig();
 
-      if (!response.ok) {
-        if (response.status === 401) {
-          this.postMessage({ type: 'promptEnhanced', enhancedPrompt: '', error: 'Token 已失效或无效' } as any);
-        } else if (response.status === 403) {
-          this.postMessage({ type: 'promptEnhanced', enhancedPrompt: '', error: '访问被拒绝' } as any);
-        } else {
-          this.postMessage({ type: 'promptEnhanced', enhancedPrompt: '', error: `API 错误: ${response.status}` } as any);
-        }
+      if (!compressorConfig.enabled) {
+        this.postMessage({ type: 'promptEnhanced', enhancedPrompt: '', error: '请先在设置中启用并配置压缩模型' } as any);
         return;
       }
 
-      const data = await response.json() as { text?: string };
-      let enhancedPrompt = data.text?.trim() || '';
+      if (!compressorConfig.baseUrl || !compressorConfig.apiKey) {
+        this.postMessage({ type: 'promptEnhanced', enhancedPrompt: '', error: '请先在设置中配置压缩模型 API' } as any);
+        return;
+      }
 
-      // 移除 Augment 特定的工具引用
+      // 获取项目根目录
+      const workspaceFolders = vscode.workspace.workspaceFolders;
+      const projectRoot = workspaceFolders?.[0]?.uri.fsPath || '';
+
+      // 收集代码上下文（参考 Augment 方案）
+      let codeContext = '';
+      if (projectRoot) {
+        try {
+          codeContext = await this.collectCodeContext(projectRoot, prompt);
+        } catch (error) {
+          logger.warn('界面.提示词_增强.代码上下文收集失败', { error }, LogCategory.UI);
+          // 代码上下文收集失败不阻止增强
+        }
+      }
+
+      // 收集对话历史（5-10 轮对话）
+      const conversationHistory = this.sessionManager.formatConversationHistory(10);
+
+      // 检测语言
+      const isChinese = /[\u4e00-\u9fa5]/.test(prompt);
+
+      // 构建增强 prompt（参考 Augment 方案）
+      const enhancePrompt = this.buildEnhancePrompt(prompt, conversationHistory, codeContext, isChinese);
+
+      // 创建压缩模型客户端并调用
+      const { UniversalLLMClient } = await import('../llm/clients/universal-client');
+      const client = new UniversalLLMClient({
+        baseUrl: compressorConfig.baseUrl,
+        apiKey: compressorConfig.apiKey,
+        model: compressorConfig.model,
+        provider: compressorConfig.provider,
+        enabled: true,
+      });
+
+      logger.info('界面.提示词_增强.开始', {
+        model: compressorConfig.model,
+        hasCodeContext: codeContext.length > 0,
+        hasConversation: conversationHistory.length > 0
+      }, LogCategory.UI);
+
+      const response = await client.sendMessage({
+        messages: [{ role: 'user', content: enhancePrompt }],
+        maxTokens: 4096,
+        temperature: 0.7,
+      });
+
+      const enhancedPrompt = response.content?.trim() || '';
+
       if (enhancedPrompt) {
-        enhancedPrompt = this.cleanEnhancedPrompt(enhancedPrompt);
+        logger.info('界面.提示词_增强.完成', {
+          originalLength: prompt.length,
+          enhancedLength: enhancedPrompt.length
+        }, LogCategory.UI);
         this.postMessage({ type: 'promptEnhanced', enhancedPrompt, error: '' } as any);
       } else {
         this.postMessage({ type: 'promptEnhanced', enhancedPrompt: '', error: '未获取到增强结果' } as any);
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
+      logger.error('界面.提示词_增强.失败', { error: errorMsg }, LogCategory.UI);
       this.postMessage({ type: 'promptEnhanced', enhancedPrompt: '', error: errorMsg } as any);
     }
   }
 
-  /** 清理增强后的 Prompt，移除 Augment 特定的工具引用 */
-  private cleanEnhancedPrompt(text: string): string {
-    let result = text;
+  /**
+   * 收集代码上下文（参考 Augment 方案）
+   * 优先使用 ACE 语义搜索（复用 ToolManager 中的 AceExecutor），如果不可用则回退到简单文件搜索
+   */
+  private async collectCodeContext(projectRoot: string, prompt: string): Promise<string> {
+    const contextParts: string[] = [];
+    const maxContextLength = 8000; // 限制代码上下文长度
+    let currentLength = 0;
 
-    // 移除 codebase-retrieval 工具引用（子代理本身有代码搜索能力）
-    // 匹配各种格式：`codebase-retrieval`、"codebase-retrieval"、codebase-retrieval 工具等
-    result = result.replace(/使用\s*`?codebase-retrieval`?\s*工具[^。\n]*/g, '');
-    result = result.replace(/通过\s*`?codebase-retrieval`?\s*[^。\n]*/g, '');
-    result = result.replace(/调用\s*`?codebase-retrieval`?\s*[^。\n]*/g, '');
-    result = result.replace(/`codebase-retrieval`/g, '代码搜索');
-    result = result.replace(/codebase-retrieval/g, '代码搜索');
-    result = result.replace(/codebase_retrieval/g, '代码搜索');
+    try {
+      // 1. 尝试使用 ACE 语义搜索（Augment 的核心能力）
+      const aceResult = await this.tryAceSemanticSearch(projectRoot, prompt);
+      if (aceResult) {
+        contextParts.push(`## 相关代码（语义搜索）\n${aceResult}`);
+        currentLength += aceResult.length;
+        logger.info('界面.提示词_增强.ACE语义搜索成功', { resultLength: aceResult.length }, LogCategory.UI);
+      } else {
+        // 2. ACE 不可用，回退到简单文件搜索
+        logger.info('界面.提示词_增强.ACE不可用，使用简单搜索', undefined, LogCategory.UI);
 
-    // 清理多余的空行
-    result = result.replace(/\n{3,}/g, '\n\n');
+        // 获取项目结构概览
+        const projectStructure = await this.getProjectStructure(projectRoot);
+        if (projectStructure && currentLength + projectStructure.length <= maxContextLength) {
+          contextParts.push(`## 项目结构\n${projectStructure}`);
+          currentLength += projectStructure.length;
+        }
 
-    return result.trim();
+        // 从提示词中提取关键词并搜索相关文件
+        const keywords = this.extractKeywords(prompt);
+        if (keywords.length > 0) {
+          const relevantFiles = await this.findRelevantFiles(projectRoot, keywords);
+
+          for (const file of relevantFiles) {
+            if (currentLength >= maxContextLength) break;
+
+            try {
+              const content = fs.readFileSync(file, 'utf-8');
+              const truncatedContent = content.length > 2000
+                ? content.substring(0, 2000) + '\n... (truncated)'
+                : content;
+
+              const relativePath = path.relative(projectRoot, file);
+              const fileContext = `### ${relativePath}\n\`\`\`\n${truncatedContent}\n\`\`\``;
+
+              if (currentLength + fileContext.length <= maxContextLength) {
+                contextParts.push(fileContext);
+                currentLength += fileContext.length;
+              }
+            } catch {
+              // 忽略读取失败的文件
+            }
+          }
+        }
+      }
+
+      // 3. 检查是否有 CLAUDE.md 或类似的项目说明文件
+      const guidelineFiles = ['CLAUDE.md', '.augment-guidelines', 'README.md', 'CONTRIBUTING.md'];
+      for (const guideFile of guidelineFiles) {
+        if (currentLength >= maxContextLength) break;
+
+        const guidePath = path.join(projectRoot, guideFile);
+        if (fs.existsSync(guidePath)) {
+          try {
+            const content = fs.readFileSync(guidePath, 'utf-8');
+            const truncatedContent = content.length > 3000
+              ? content.substring(0, 3000) + '\n... (truncated)'
+              : content;
+
+            if (currentLength + truncatedContent.length <= maxContextLength) {
+              contextParts.push(`## 项目指南 (${guideFile})\n${truncatedContent}`);
+              currentLength += truncatedContent.length;
+              break; // 只取第一个找到的指南文件
+            }
+          } catch {
+            // 忽略读取失败
+          }
+        }
+      }
+    } catch (error) {
+      logger.warn('界面.提示词_增强.代码上下文收集异常', { error }, LogCategory.UI);
+    }
+
+    return contextParts.join('\n\n');
   }
 
-  /** 解析对话历史为 chat_history 格式 */
-  private parseChatHistory(conversationHistory: string): Array<{role: string, content: string}> {
-    if (!conversationHistory) return [];
+  /**
+   * 尝试使用 ACE 语义搜索获取代码上下文
+   * 复用 ToolManager 中的 AceExecutor，避免重复配置读取
+   * @returns 搜索结果，如果 ACE 不可用则返回 null
+   */
+  private async tryAceSemanticSearch(projectRoot: string, prompt: string): Promise<string | null> {
+    try {
+      // 复用 ToolManager 中的 AceExecutor
+      const toolManager = this.adapterFactory.getToolManager?.();
+      if (!toolManager) {
+        logger.debug('界面.提示词_增强.ToolManager不可用', undefined, LogCategory.UI);
+        return null;
+      }
 
-    const lines = conversationHistory.split('\n\n');
-    const chatHistory: Array<{role: string, content: string}> = [];
+      // 检查 ACE 是否已配置
+      if (!toolManager.isAceConfigured()) {
+        logger.debug('界面.提示词_增强.ACE未配置', undefined, LogCategory.UI);
+        return null;
+      }
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith('User:') || trimmed.startsWith('用户:')) {
-        chatHistory.push({
-          role: 'user',
-          content: trimmed.replace(/^(User:|用户:)\s*/, '')
+      // 通过 AceExecutor 执行语义搜索
+      const aceExecutor = toolManager.getAceExecutor();
+      const toolCall = {
+        id: `enhance-ace-${Date.now()}`,
+        name: 'codebase_retrieval',
+        arguments: {
+          query: prompt,
+          ensure_indexed: false  // 不强制重新索引
+        }
+      };
+
+      const result = await aceExecutor.execute(toolCall);
+
+      if (!result.isError && result.content && result.content !== '未找到相关代码') {
+        return result.content;
+      }
+
+      return null;
+    } catch (error) {
+      logger.warn('界面.提示词_增强.ACE搜索异常', { error }, LogCategory.UI);
+      return null;
+    }
+  }
+
+  /**
+   * 获取项目结构概览
+   */
+  private async getProjectStructure(projectRoot: string): Promise<string> {
+    const structure: string[] = [];
+    const maxDepth = 3;
+    const maxFiles = 50;
+    let fileCount = 0;
+
+    const excludeDirs = new Set([
+      'node_modules', '.git', '.vscode', 'dist', 'build', 'out',
+      '__pycache__', '.pytest_cache', 'coverage', '.next', '.nuxt'
+    ]);
+
+    const walk = (dir: string, depth: number, prefix: string = '') => {
+      if (depth > maxDepth || fileCount > maxFiles) return;
+
+      try {
+        const items = fs.readdirSync(dir, { withFileTypes: true });
+        const sortedItems = items.sort((a, b) => {
+          // 目录优先
+          if (a.isDirectory() && !b.isDirectory()) return -1;
+          if (!a.isDirectory() && b.isDirectory()) return 1;
+          return a.name.localeCompare(b.name);
         });
-      } else if (trimmed.startsWith('Assistant:') || trimmed.startsWith('AI:') || trimmed.startsWith('助手:')) {
-        chatHistory.push({
-          role: 'assistant',
-          content: trimmed.replace(/^(Assistant:|AI:|助手:)\s*/, '')
-        });
+
+        for (const item of sortedItems) {
+          if (fileCount > maxFiles) break;
+          if (item.name.startsWith('.') && item.name !== '.env.example') continue;
+          if (excludeDirs.has(item.name)) continue;
+
+          const isLast = items.indexOf(item) === items.length - 1;
+          const connector = isLast ? '└── ' : '├── ';
+          const newPrefix = isLast ? '    ' : '│   ';
+
+          if (item.isDirectory()) {
+            structure.push(`${prefix}${connector}${item.name}/`);
+            walk(path.join(dir, item.name), depth + 1, prefix + newPrefix);
+          } else {
+            structure.push(`${prefix}${connector}${item.name}`);
+            fileCount++;
+          }
+        }
+      } catch {
+        // 忽略权限问题
+      }
+    };
+
+    walk(projectRoot, 0);
+
+    if (structure.length === 0) return '';
+    if (fileCount > maxFiles) {
+      structure.push('... (more files)');
+    }
+
+    return structure.slice(0, 100).join('\n'); // 限制输出行数
+  }
+
+  /**
+   * 从提示词中提取关键词
+   */
+  private extractKeywords(prompt: string): string[] {
+    // 提取可能的文件名、函数名、类名等
+    const words = prompt.split(/[\s,，。.!！?？;；:：()（）[\]【】{}]+/);
+    const keywords: string[] = [];
+
+    for (const word of words) {
+      const cleaned = word.trim();
+      if (cleaned.length < 2) continue;
+      if (cleaned.length > 50) continue;
+
+      // 保留看起来像代码标识符的词
+      if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(cleaned)) {
+        keywords.push(cleaned);
+      }
+      // 保留中文关键词
+      if (/[\u4e00-\u9fa5]{2,}/.test(cleaned)) {
+        keywords.push(cleaned);
+      }
+      // 保留文件扩展名
+      if (/\.[a-z]{1,5}$/i.test(cleaned)) {
+        keywords.push(cleaned);
       }
     }
 
-    return chatHistory;
+    return [...new Set(keywords)].slice(0, 10); // 去重并限制数量
+  }
+
+  /**
+   * 查找与关键词相关的文件
+   */
+  private async findRelevantFiles(projectRoot: string, keywords: string[]): Promise<string[]> {
+    const relevantFiles: string[] = [];
+    const maxFiles = 5;
+    const searchExtensions = ['.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.rs', '.java', '.vue', '.svelte'];
+
+    const excludeDirs = new Set([
+      'node_modules', '.git', 'dist', 'build', 'out', '__pycache__',
+      '.next', '.nuxt', 'coverage', '.vscode'
+    ]);
+
+    const searchDir = (dir: string) => {
+      if (relevantFiles.length >= maxFiles) return;
+
+      try {
+        const items = fs.readdirSync(dir, { withFileTypes: true });
+
+        for (const item of items) {
+          if (relevantFiles.length >= maxFiles) break;
+
+          const fullPath = path.join(dir, item.name);
+
+          if (item.isDirectory()) {
+            if (!excludeDirs.has(item.name) && !item.name.startsWith('.')) {
+              searchDir(fullPath);
+            }
+          } else {
+            const ext = path.extname(item.name).toLowerCase();
+            if (!searchExtensions.includes(ext)) continue;
+
+            // 检查文件名是否包含关键词
+            const fileName = item.name.toLowerCase();
+            const matchesFileName = keywords.some(kw =>
+              fileName.includes(kw.toLowerCase())
+            );
+
+            if (matchesFileName) {
+              relevantFiles.push(fullPath);
+            }
+          }
+        }
+      } catch {
+        // 忽略权限问题
+      }
+    };
+
+    searchDir(projectRoot);
+    return relevantFiles;
+  }
+
+  /** 构建提示词增强的 prompt（参考 Augment 方案） */
+  private buildEnhancePrompt(
+    originalPrompt: string,
+    conversationHistory: string,
+    codeContext: string,
+    isChinese: boolean
+  ): string {
+    const languageInstruction = isChinese
+      ? '请用中文输出增强后的提示词。'
+      : 'Please output the enhanced prompt in English.';
+
+    // 参考 Augment 的增强原则
+    return `You are an expert prompt engineer. Your task is to enhance the user's original prompt to make it clearer, more specific, and more actionable for an AI coding assistant.
+
+## Enhancement Principles (参考 Augment 方案)
+
+1. **Clarify Intent**: Make the task goal crystal clear
+2. **Add Technical Context**: Include relevant technical details, constraints, and requirements
+3. **Structure the Request**: Organize the prompt with clear sections if needed
+4. **Make it Actionable**: Ensure the AI can directly execute the task
+5. **Preserve User Intent**: Do not change the user's original intention
+6. **Use Code Context**: Reference relevant files, functions, or patterns from the codebase when applicable
+7. **Consider Existing Patterns**: Align suggestions with existing code patterns and conventions
+
+${codeContext ? `## Codebase Context
+
+The following is relevant context from the user's project:
+
+${codeContext}
+
+` : ''}## Conversation History
+
+${conversationHistory ? conversationHistory : '(No previous conversation)'}
+
+## Original Prompt
+
+${originalPrompt}
+
+## Output Requirements
+
+- ${languageInstruction}
+- Output ONLY the enhanced prompt, without any explanations or prefixes
+- Do NOT include prefixes like "Enhanced prompt:" or "增强后的提示词："
+- Keep it concise but complete
+- If the original prompt references code or files, make sure to maintain those references
+- Add specific technical details that would help the AI assistant complete the task`;
   }
 
   // ============================================
@@ -2651,13 +2916,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         await (this.adapterFactory as any).clearAdapter(worker);
       }
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'workerConfigSaved',
         worker: worker,
         success: true
       });
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: `${worker} 配置已保存`,
         toastType: 'success'
@@ -2666,13 +2931,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.info('Worker 配置已保存', { worker }, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存 Worker 配置失败', { worker, error: error.message }, LogCategory.LLM);
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'workerConfigSaved',
         worker: worker,
         success: false,
         error: error.message
       });
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: '保存配置失败: ' + error.message,
         toastType: 'error'
@@ -2694,13 +2959,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
 
       if (response && response.content) {
-        this.postMessage({
+        this.postMessageImmediate({
           type: 'workerConnectionTestResult',
           worker: worker,
           success: true
         });
 
-        this.postMessage({
+        this.postMessageImmediate({
           type: 'toast',
           message: `${worker} 连接成功`,
           toastType: 'success'
@@ -2711,14 +2976,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     } catch (error: any) {
       logger.error('Worker 连接测试失败', { worker, error: error.message }, LogCategory.LLM);
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'workerConnectionTestResult',
         worker: worker,
         success: false,
         error: error.message
       });
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: `${worker} 连接失败: ${error.message}`,
         toastType: 'error'
@@ -2759,12 +3024,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         await (this.adapterFactory as any).clearAdapter('orchestrator');
       }
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'orchestratorConfigSaved',
         success: true
       });
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: '编排者配置已保存',
         toastType: 'success'
@@ -2773,12 +3038,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.info('编排者配置已保存', undefined, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存编排者配置失败', { error: error.message }, LogCategory.LLM);
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'orchestratorConfigSaved',
         success: false,
         error: error.message
       });
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: '保存配置失败: ' + error.message,
         toastType: 'error'
@@ -2800,12 +3065,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
 
       if (response && response.content) {
-        this.postMessage({
+        this.postMessageImmediate({
           type: 'orchestratorConnectionTestResult',
           success: true
         });
 
-        this.postMessage({
+        this.postMessageImmediate({
           type: 'toast',
           message: '编排者连接成功',
           toastType: 'success'
@@ -2816,13 +3081,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     } catch (error: any) {
       logger.error('编排者连接测试失败', { error: error.message }, LogCategory.LLM);
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'orchestratorConnectionTestResult',
         success: false,
         error: error.message
       });
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: `编排者连接失败: ${error.message}`,
         toastType: 'error'
@@ -2860,12 +3125,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       await this.intelligentOrchestrator.reloadCompressionAdapter();
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'compressorConfigSaved',
         success: true
       });
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: '压缩器配置已保存',
         toastType: 'success'
@@ -2874,12 +3139,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.info('压缩器配置已保存', undefined, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存压缩器配置失败', { error: error.message }, LogCategory.LLM);
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'compressorConfigSaved',
         success: false,
         error: error.message
       });
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: '保存配置失败: ' + error.message,
         toastType: 'error'
@@ -2901,12 +3166,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
 
       if (response && response.content) {
-        this.postMessage({
+        this.postMessageImmediate({
           type: 'compressorConnectionTestResult',
           success: true
         });
 
-        this.postMessage({
+        this.postMessageImmediate({
           type: 'toast',
           message: '压缩器连接成功',
           toastType: 'success'
@@ -2917,13 +3182,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     } catch (error: any) {
       logger.error('压缩器连接测试失败', { error: error.message }, LogCategory.LLM);
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'compressorConnectionTestResult',
         success: false,
         error: error.message
       });
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: `压缩器连接失败: ${error.message}`,
         toastType: 'error'
@@ -3270,14 +3535,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.postMessage({
         type: 'skillsConfigLoaded',
         config: config || {
-          builtInTools: {
-            web_search_20250305: { enabled: true, description: '搜索网络以获取最新信息' },
-            web_fetch_20250305: { enabled: true, description: '获取网页内容' },
-            text_editor_20250124: { enabled: false, description: '编辑文本文件（需要客户端实现）' },
-            computer_use_20241022: { enabled: false, description: '控制计算机（需要客户端实现）' }
-          },
           customTools: [],
-          instructionSkills: []
+          instructionSkills: [],
+          repositories: []
         }
       });
 
@@ -3300,11 +3560,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const { LLMConfigLoader } = await import('../llm/config');
       LLMConfigLoader.saveSkillsConfig(config);
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'skillsConfigSaved'
       });
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: 'Skills 配置已保存',
         toastType: 'success'
@@ -3315,53 +3575,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.info('Skills 配置已保存', {}, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('保存 Skills 配置失败', { error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: `保存 Skills 配置失败: ${error.message}`,
-        toastType: 'error'
-      });
-    }
-  }
-
-  /**
-   * 切换内置工具启用状态
-   */
-  private async handleToggleBuiltInTool(tool: string, enabled: boolean): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const config = LLMConfigLoader.loadSkillsConfig() || {
-        builtInTools: {},
-        customTools: [],
-        instructionSkills: []
-      };
-
-      if (!config.builtInTools[tool]) {
-        config.builtInTools[tool] = { enabled: false };
-      }
-
-      config.builtInTools[tool].enabled = enabled;
-      LLMConfigLoader.saveSkillsConfig(config);
-
-      this.postMessage({
-        type: 'builtInToolToggled',
-        tool,
-        enabled
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: `工具 "${tool}" 已${enabled ? '启用' : '禁用'}`,
-        toastType: 'success'
-      });
-
-      await this.reloadSkillsIfPossible('toggleBuiltInTool');
-
-      logger.info('内置工具状态已切换', { tool, enabled }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('切换工具状态失败', { tool, error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: `切换工具状态失败: ${error.message}`,
         toastType: 'error'
       });
     }
@@ -3374,9 +3590,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     try {
       const { LLMConfigLoader } = await import('../llm/config');
       const config = LLMConfigLoader.loadSkillsConfig() || {
-        builtInTools: {},
         customTools: [],
-        instructionSkills: []
+        instructionSkills: [],
+        repositories: []
       };
 
       // 检查是否已存在
@@ -3389,12 +3605,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       LLMConfigLoader.saveSkillsConfig(config);
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'customToolAdded',
         tool
       });
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: `自定义工具 "${tool.name}" 已添加`,
         toastType: 'success'
@@ -3405,7 +3621,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.info('自定义工具已添加', { name: tool.name }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('添加自定义工具失败', { error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: `添加自定义工具失败: ${error.message}`,
         toastType: 'error'
@@ -3420,20 +3636,20 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     try {
       const { LLMConfigLoader } = await import('../llm/config');
       const config = LLMConfigLoader.loadSkillsConfig() || {
-        builtInTools: {},
         customTools: [],
-        instructionSkills: []
+        instructionSkills: [],
+        repositories: []
       };
 
       config.customTools = config.customTools.filter((t: any) => t.name !== toolName);
       LLMConfigLoader.saveSkillsConfig(config);
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'customToolRemoved',
         toolName
       });
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: `自定义工具 "${toolName}" 已删除`,
         toastType: 'success'
@@ -3444,9 +3660,48 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.info('自定义工具已删除', { name: toolName }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('删除自定义工具失败', { toolName, error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: `删除自定义工具失败: ${error.message}`,
+        toastType: 'error'
+      });
+    }
+  }
+
+  /**
+   * 删除 Instruction Skill
+   */
+  private async handleRemoveInstructionSkill(skillName: string): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      const config = LLMConfigLoader.loadSkillsConfig() || {
+        customTools: [],
+        instructionSkills: [],
+        repositories: []
+      };
+
+      config.instructionSkills = (config.instructionSkills || []).filter((s: any) => s.name !== skillName);
+      LLMConfigLoader.saveSkillsConfig(config);
+
+      this.postMessageImmediate({
+        type: 'instructionSkillRemoved',
+        skillName
+      });
+
+      this.postMessageImmediate({
+        type: 'toast',
+        message: `Instruction Skill "${skillName}" 已删除`,
+        toastType: 'success'
+      });
+
+      await this.reloadSkillsIfPossible('removeInstructionSkill');
+
+      logger.info('Instruction Skill 已删除', { name: skillName }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('删除 Instruction Skill 失败', { skillName, error: error.message }, LogCategory.TOOLS);
+      this.postMessageImmediate({
+        type: 'toast',
+        message: `删除 Instruction Skill 失败: ${error.message}`,
         toastType: 'error'
       });
     }
@@ -3470,7 +3725,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       // 加载当前配置
       const config = LLMConfigLoader.loadSkillsConfig() || {
-        builtInTools: {},
         customTools: [],
         instructionSkills: [],
         repositories
@@ -3483,13 +3737,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       LLMConfigLoader.saveSkillsConfig(config);
 
       // 发送成功消息
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'skillInstalled',
         skillId,
         skill
       });
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: `Skill "${skill.description}" 已安装`,
         toastType: 'success'
@@ -3504,7 +3758,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.info('Skill 已安装', { skillId, name: skill.name }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('安装 Skill 失败', { skillId, error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: `安装 Skill 失败: ${error.message}`,
         toastType: 'error'
@@ -3532,7 +3786,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.info('Repositories loaded', { count: repositories.length }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to load repositories', { error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: '加载仓库失败: ' + error.message,
         toastType: 'error'
@@ -3559,7 +3813,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       LLMConfigLoader.updateRepositoryName(result.id, repoInfo.name);
       LLMConfigLoader.updateRepository(result.id, { type: repoInfo.type });
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'repositoryAdded',
         repository: {
           id: result.id,
@@ -3570,7 +3824,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         }
       });
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: `仓库 "${repoInfo.name}" 已添加（${repoInfo.skillCount} 个技能）`,
         toastType: 'success'
@@ -3579,7 +3833,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.info('Repository added', { url, name: repoInfo.name, type: repoInfo.type }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to add repository', { url, error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: '添加仓库失败: ' + error.message,
         toastType: 'error'
@@ -3595,12 +3849,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const { LLMConfigLoader } = await import('../llm/config');
       LLMConfigLoader.updateRepository(repositoryId, updates);
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'repositoryUpdated',
         repositoryId
       });
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: '仓库已更新',
         toastType: 'success'
@@ -3612,7 +3866,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.info('Repository updated', { id: repositoryId }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to update repository', { repositoryId, error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: '更新仓库失败: ' + error.message,
         toastType: 'error'
@@ -3628,12 +3882,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const { LLMConfigLoader } = await import('../llm/config');
       LLMConfigLoader.deleteRepository(repositoryId);
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'repositoryDeleted',
         repositoryId
       });
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: '仓库已删除',
         toastType: 'success'
@@ -3645,7 +3899,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.info('Repository deleted', { id: repositoryId }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to delete repository', { repositoryId, error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: '删除仓库失败: ' + error.message,
         toastType: 'error'
@@ -3662,12 +3916,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const manager = new SkillRepositoryManager();
       manager.clearCache(repositoryId);
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'repositoryRefreshed',
         repositoryId
       });
 
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: '仓库缓存已清除',
         toastType: 'success'
@@ -3676,7 +3930,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.info('Repository cache cleared', { id: repositoryId }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to refresh repository', { repositoryId, error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
+      this.postMessageImmediate({
         type: 'toast',
         message: '刷新仓库失败: ' + error.message,
         toastType: 'error'
@@ -3713,13 +3967,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 检查哪些已安装
       const skillsConfig = LLMConfigLoader.loadSkillsConfig();
       const installedSkills = new Set<string>();
-      if (skillsConfig && skillsConfig.builtInTools) {
-        Object.keys(skillsConfig.builtInTools).forEach(name => {
-          if (skillsConfig.builtInTools[name].enabled) {
-            installedSkills.add(name);
-          }
-        });
-      }
+      // 内置工具已迁移到 ToolManager，不再通过 builtInTools 配置管理
       if (skillsConfig && Array.isArray(skillsConfig.customTools)) {
         skillsConfig.customTools.forEach((tool: any) => {
           if (tool?.name) {
@@ -4489,7 +4737,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   // ============================================================================
 
   /** 发送画像配置到 UI */
-  private sendProfileConfig(): void {
+  private async sendProfileConfig(): Promise<void> {
     const storage = new ProfileStorage();
     const storedConfig = storage.getConfig();
 
@@ -4552,11 +4800,19 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    try {
+      const { LLMConfigLoader } = await import('../llm/config');
+      const userRules = LLMConfigLoader.loadUserRules();
+      uiConfig.userRules = userRules.content || '';
+    } catch (error) {
+      logger.warn('加载用户规则失败', { error }, LogCategory.LLM);
+    }
+
     this.postMessage({ type: 'profileConfig', config: uiConfig } as any);
   }
 
   /** 保存画像配置 */
-  private async handleSaveProfileConfig(data: { workers: Record<string, any>; categories: Record<string, string> }): Promise<void> {
+  private async handleSaveProfileConfig(data: { workers: Record<string, any>; categories: Record<string, string>; userRules?: string }): Promise<void> {
     try {
       const storage = new ProfileStorage();
 
@@ -4601,8 +4857,23 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
 
       await storage.saveConfig(config);
-      this.postMessage({ type: 'profileConfigSaved', success: true });
-      this.postMessage({ type: 'toast', message: '画像配置已保存', toastType: 'success' });
+
+      try {
+        const { LLMConfigLoader } = await import('../llm/config');
+        const userRulesContent = typeof data.userRules === 'string' ? data.userRules : '';
+        const trimmed = userRulesContent.trim();
+        LLMConfigLoader.updateUserRules({
+          enabled: trimmed.length > 0,
+          content: userRulesContent,
+        });
+        if (this.adapterFactory && 'refreshUserRules' in this.adapterFactory) {
+          (this.adapterFactory as any).refreshUserRules();
+        }
+      } catch (rulesError) {
+        logger.warn('保存用户规则失败', { error: rulesError }, LogCategory.LLM);
+      }
+      this.postMessageImmediate({ type: 'profileConfigSaved', success: true });
+      this.postMessageImmediate({ type: 'toast', message: '画像配置已保存', toastType: 'success' });
 
       try {
         await this.intelligentOrchestrator.reloadProfiles();
@@ -4610,12 +4881,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         const reloadMsg = reloadError instanceof Error ? reloadError.message : String(reloadError);
         this.postMessage({ type: 'toast', message: `画像重载失败: ${reloadMsg}`, toastType: 'warning' });
       }
-      this.sendProfileConfig();
+      await this.sendProfileConfig();
       logger.info('界面.画像.配置.已保存', { path: ProfileStorage.getConfigDir() }, LogCategory.UI);
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.postMessage({ type: 'profileConfigSaved', success: false, error: errorMsg });
-      this.postMessage({ type: 'toast', message: `保存失败: ${errorMsg}`, toastType: 'error' });
+      this.postMessageImmediate({ type: 'profileConfigSaved', success: false, error: errorMsg });
+      this.postMessageImmediate({ type: 'toast', message: `保存失败: ${errorMsg}`, toastType: 'error' });
     }
   }
 
@@ -4625,16 +4896,27 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const storage = new ProfileStorage();
       await storage.clearConfig();
       try {
+        const { LLMConfigLoader } = await import('../llm/config');
+        LLMConfigLoader.updateUserRules({ enabled: false, content: '' });
+        if (this.adapterFactory && 'refreshUserRules' in this.adapterFactory) {
+          (this.adapterFactory as any).refreshUserRules();
+        }
+      } catch (rulesError) {
+        logger.warn('重置用户规则失败', { error: rulesError }, LogCategory.LLM);
+      }
+      try {
         await this.intelligentOrchestrator.reloadProfiles();
       } catch (reloadError) {
         const reloadMsg = reloadError instanceof Error ? reloadError.message : String(reloadError);
         this.postMessage({ type: 'toast', message: `画像重载失败: ${reloadMsg}`, toastType: 'warning' });
       }
-      this.postMessage({ type: 'toast', message: '画像配置已重置为默认值', toastType: 'success' });
-      this.sendProfileConfig();
+      this.postMessageImmediate({ type: 'toast', message: '画像配置已重置为默认值', toastType: 'success' });
+      this.postMessageImmediate({ type: 'profileConfigReset', success: true });
+      await this.sendProfileConfig();
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.postMessage({ type: 'toast', message: `重置失败: ${errorMsg}`, toastType: 'error' });
+      this.postMessageImmediate({ type: 'profileConfigReset', success: false, error: errorMsg });
+      this.postMessageImmediate({ type: 'toast', message: `重置失败: ${errorMsg}`, toastType: 'error' });
     }
   }
 
@@ -4807,6 +5089,38 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     this.postMessage({ type: 'toast', message: `已清理 ${taskCount} 个任务`, toastType: 'success' });
     this.sendStateUpdate();
+  }
+
+  private async handleStartTask(taskId?: string): Promise<void> {
+    if (!taskId) {
+      this.postMessage({ type: 'toast', message: '缺少任务 ID', toastType: 'error' });
+      return;
+    }
+    try {
+      const taskManager = await this.getTaskManager();
+      await taskManager.startTask(taskId);
+      this.postMessage({ type: 'toast', message: '任务已开始', toastType: 'success' });
+      this.sendStateUpdate();
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      this.postMessage({ type: 'toast', message: `启动失败: ${errorMsg}`, toastType: 'error' });
+    }
+  }
+
+  private async handleDeleteTask(taskId?: string): Promise<void> {
+    if (!taskId) {
+      this.postMessage({ type: 'toast', message: '缺少任务 ID', toastType: 'error' });
+      return;
+    }
+    try {
+      const taskManager = await this.getTaskManager();
+      await taskManager.deleteTask(taskId);
+      this.postMessage({ type: 'toast', message: '任务已删除', toastType: 'success' });
+      this.sendStateUpdate();
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      this.postMessage({ type: 'toast', message: `删除失败: ${errorMsg}`, toastType: 'error' });
+    }
   }
 
   /** 获取最近被打断的任务 */
@@ -5528,6 +5842,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       .catch((error) => {
         logger.warn('界面.消息.发送_失败', { error: String(error) }, LogCategory.UI);
       });
+  }
+
+  /** 立即发送消息到 Webview (绕过队列，避免状态回执被阻塞) */
+  private postMessageImmediate(message: ExtensionToWebviewMessage): void {
+    const view = this._view;
+    if (!view) {
+      return;
+    }
+    view.webview.postMessage(message).then(undefined, (error) => {
+      logger.warn('界面.消息.发送_失败', { error: String(error) }, LogCategory.UI);
+    });
   }
 
   /** 获取 HTML 内容 - 仅使用 Svelte webview */

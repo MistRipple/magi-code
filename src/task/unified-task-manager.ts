@@ -471,6 +471,29 @@ export class UnifiedTaskManager extends EventEmitter {
   }
 
   /**
+   * 删除 Task（从缓存、队列、仓库中移除）
+   */
+  async deleteTask(taskId: string): Promise<void> {
+    const task = await this.getTask(taskId);
+    if (!task) return;
+
+    if (task.status === 'running') {
+      await this.cancelTask(taskId);
+    }
+
+    this.timeoutChecker.remove(taskId);
+    this.taskQueue.remove(taskId);
+    this.taskCache.delete(taskId);
+
+    for (const subTask of task.subTasks || []) {
+      this.timeoutChecker.remove(subTask.id);
+      this.subTaskQueue.remove(subTask.id);
+    }
+
+    await this.repository.deleteTask(taskId);
+  }
+
+  /**
    * 重试 Task
    */
   async retryTask(taskId: string): Promise<void> {

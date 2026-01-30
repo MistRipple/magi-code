@@ -84,6 +84,7 @@ export class ExecutionCoordinator extends EventEmitter {
     private reviewer: ProfileAwareReviewer,
     private snapshotManager: SnapshotManager | null,
     private taskManager: UnifiedTaskManager | null,
+    private workspaceRoot: string,
     private mission: Mission
   ) {
     super();
@@ -94,7 +95,8 @@ export class ExecutionCoordinator extends EventEmitter {
       workers,
       adapterFactory,
       snapshotManager,
-      taskManager
+      taskManager,
+      this.workspaceRoot
     );
     this.reviewExecutor = new ReviewExecutor(workers, profileLoader, reviewer);
     this.contractVerifier = new ContractVerifier();

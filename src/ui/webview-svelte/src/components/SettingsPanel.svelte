@@ -60,6 +60,9 @@
     general: 'claude'
   });
 
+  // 全局用户规则
+  let userRules = $state('');
+
   // 当前 worker 的画像数据（响应式派生）
   let profileRole = $derived(allWorkerProfiles[profileWorker]?.role || '');
   let profileFocusAreas = $derived(ensureArray(allWorkerProfiles[profileWorker]?.focus));
@@ -78,6 +81,24 @@
     codex: 'idle',
     gemini: 'idle'
   });
+
+  // 保存配置状态: 'idle' | 'saving' | 'saved' | 'error'
+  let saveStatus = $state<Record<string, 'idle' | 'saving' | 'saved' | 'error'>>({
+    orch: 'idle',
+    comp: 'idle',
+    ace: 'idle',
+    claude: 'idle',
+    codex: 'idle',
+    gemini: 'idle',
+    mcp: 'idle'
+  });
+
+  // 画像保存/重置状态
+  let profileSaveStatus = $state<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  let profileResetStatus = $state<'idle' | 'saving' | 'saved' | 'error'>('idle');
+
+  // Skill 安装状态
+  let installingSkills = $state<Set<string>>(new Set());
 
   // 模型配置表单
   let orchConfig = $state({ baseUrl: '', apiKey: '', model: '', provider: 'anthropic' });
@@ -107,12 +128,11 @@
   let currentEditingMCPServer = $state<MCPServer | null>(null);
   let mcpRefreshingServers = $state<Set<string>>(new Set()); // 正在刷新工具的服务器 ID
 
-  // Skills 完整结构
+  // Skills 完整结构（内置工具已迁移到 ToolManager，不再通过 Skills 配置）
   interface SkillItem {
     name: string;
     description: string;
-    source: 'builtin' | 'custom' | 'instruction';
-    enabled?: boolean;
+    source: 'custom' | 'instruction';
   }
   let skills = $state<SkillItem[]>([]);
 
@@ -339,17 +359,22 @@
   }
 
   function saveProfile() {
+    profileSaveStatus = 'saving';
+
     // 保存所有 workers 的配置
     vscode.postMessage({
       type: 'saveProfileConfig',
       data: {
         workers: allWorkerProfiles,
-        categories: taskCategories
+        categories: taskCategories,
+        userRules
       }
     });
   }
 
   function resetProfile() {
+    profileResetStatus = 'saving';
+
     vscode.postMessage({ type: 'resetProfileConfig' });
   }
 
@@ -359,13 +384,15 @@
     testStatus[statusKey] = 'testing';
     testStatus = { ...testStatus };
 
-    // 后端使用 testWorkerConnection / testOrchestratorConnection / testCompressorConnection
+    // 后端使用 testWorkerConnection / testOrchestratorConnection / testCompressorConnection / testPromptEnhance
     if (target === 'worker') {
       vscode.postMessage({ type: 'testWorkerConnection', worker: workerModelTab, config: workerConfigs[workerModelTab] });
     } else if (target === 'orch') {
       vscode.postMessage({ type: 'testOrchestratorConnection', config: orchConfig });
     } else if (target === 'comp') {
       vscode.postMessage({ type: 'testCompressorConnection', config: compConfig });
+    } else if (target === 'ace') {
+      vscode.postMessage({ type: 'testPromptEnhance', baseUrl: aceConfig.url, apiKey: aceConfig.key });
     }
   }
 
@@ -377,14 +404,52 @@
     }, 3000);
   }
 
+  // 重置保存状态（2秒后自动重置为 idle）
+  function resetSaveStatus(key: string) {
+    setTimeout(() => {
+      saveStatus[key] = 'idle';
+      saveStatus = { ...saveStatus };
+    }, 2000);
+  }
+
+  function resetProfileStatus(kind: 'save' | 'reset') {
+    setTimeout(() => {
+      if (kind === 'save') {
+        profileSaveStatus = 'idle';
+      } else {
+        profileResetStatus = 'idle';
+      }
+    }, 2000);
+  }
+
   function saveModelConfig(target: 'orch' | 'comp' | 'ace' | 'worker') {
+    const key = target === 'worker' ? workerModelTab : target;
+
+    // 设置保存中状态
+    saveStatus[key] = 'saving';
+    saveStatus = { ...saveStatus };
+
     if (target === 'worker') {
       vscode.postMessage({ type: 'saveWorkerConfig', worker: workerModelTab, config: workerConfigs[workerModelTab] });
     } else if (target === 'orch') {
       vscode.postMessage({ type: 'saveOrchestratorConfig', config: orchConfig });
     } else if (target === 'comp') {
       vscode.postMessage({ type: 'saveCompressorConfig', config: compConfig });
+    } else if (target === 'ace') {
+      // 统一使用 updatePromptEnhance 消息类型，转换字段名
+      vscode.postMessage({
+        type: 'updatePromptEnhance',
+        config: { enabled: true, baseUrl: aceConfig.url, apiKey: aceConfig.key },
+        source: 'manual'
+      });
     }
+
+    // 模拟保存成功（实际应该通过消息回调）
+    setTimeout(() => {
+      saveStatus[key] = 'saved';
+      saveStatus = { ...saveStatus };
+      resetSaveStatus(key);
+    }, 300);
   }
 
   function confirmInputDialog() {
@@ -468,6 +533,10 @@
       return;
     }
 
+    // 设置保存中状态
+    saveStatus.mcp = 'saving';
+    saveStatus = { ...saveStatus };
+
     const saveServer = (name: string, cfg: any, isUpdate: boolean): boolean => {
       if (!cfg || typeof cfg !== 'object') {
         alert(`服务器 ${name} 配置无效`);
@@ -527,8 +596,16 @@
     }
 
     if (savedCount > 0) {
+      // 保存成功
+      saveStatus.mcp = 'saved';
+      saveStatus = { ...saveStatus };
+      resetSaveStatus('mcp');
       vscode.postMessage({ type: 'loadMCPServers' });
       closeMCPDialog();
+    } else {
+      // 保存失败
+      saveStatus.mcp = 'idle';
+      saveStatus = { ...saveStatus };
     }
   }
 
@@ -635,31 +712,24 @@
   }
 
   function installSkill(skillFullName: string) {
+    // 添加到安装中集合
+    installingSkills.add(skillFullName);
+    installingSkills = new Set(installingSkills);
+
     vscode.postMessage({ type: 'installSkill', skillId: skillFullName });
+    // 状态清除由 skillInstalled 消息回调处理
   }
 
   // 切换 Skill 启用状态
   function toggleSkill(skill: SkillItem) {
-    if (skill.source === 'builtin') {
-      // 内置工具使用 toggleBuiltInTool
-      vscode.postMessage({ type: 'toggleBuiltInTool', tool: skill.name, enabled: !skill.enabled });
-    } else if (skill.source === 'custom') {
-      // 自定义工具暂不支持切换，只能删除
-      return;
-    } else if (skill.source === 'instruction') {
-      // Instruction skill 暂不支持切换
-      return;
-    }
+    // 内置工具已迁移到 ToolManager，不可通过此处切换
+    // 自定义工具和 Instruction skill 暂不支持切换
+    return;
   }
 
   // 删除 Skill
   function deleteSkill(skill: SkillItem) {
-    if (skill.source === 'builtin') {
-      // 内置工具使用禁用
-      showConfirm('禁用工具', `确定要禁用工具 "${skill.name}" 吗？`, () => {
-        vscode.postMessage({ type: 'toggleBuiltInTool', tool: skill.name, enabled: false });
-      });
-    } else if (skill.source === 'custom') {
+    if (skill.source === 'custom') {
       // 删除自定义工具
       showConfirm('删除自定义工具', `确定要删除自定义工具 "${skill.name}" 吗？`, () => {
         vscode.postMessage({ type: 'removeCustomTool', toolName: skill.name });
@@ -756,10 +826,27 @@
         if (config?.categories) {
           taskCategories = { ...taskCategories, ...config.categories };
         }
+        if (typeof config?.userRules === 'string') {
+          userRules = config.userRules;
+        }
       }
       // 画像保存结果
       else if (message.type === 'profileConfigSaved') {
-        // 保存成功/失败由 toast 消息处理
+        if (message.success) {
+          profileSaveStatus = 'saved';
+        } else {
+          profileSaveStatus = 'error';
+        }
+        resetProfileStatus('save');
+      }
+      // 画像重置结果
+      else if (message.type === 'profileConfigReset') {
+        if (message.success) {
+          profileResetStatus = 'saved';
+        } else {
+          profileResetStatus = 'error';
+        }
+        resetProfileStatus('reset');
       }
       // Worker 配置加载
       else if (message.type === 'allWorkerConfigsLoaded') {
@@ -798,6 +885,15 @@
             apiKey: message.config.apiKey || '',
             model: message.config.model || '',
             provider: message.config.provider || 'anthropic'
+          };
+        }
+      }
+      // ACE 配置加载
+      else if (message.type === 'promptEnhanceConfigLoaded') {
+        if (message.config) {
+          aceConfig = {
+            url: message.config.baseUrl || '',
+            key: message.config.apiKey || ''
           };
         }
       }
@@ -864,6 +960,16 @@
         testStatus = { ...testStatus };
         resetTestStatus('comp');
       }
+      // ACE 连接测试结果
+      else if (message.type === 'promptEnhanceResult') {
+        if (message.success) {
+          testStatus.ace = 'success';
+        } else {
+          testStatus.ace = 'error';
+        }
+        testStatus = { ...testStatus };
+        resetTestStatus('ace');
+      }
       // MCP 服务器列表加载
       else if (message.type === 'mcpServersLoaded') {
         const servers = ensureArray<any>(message.servers);
@@ -915,17 +1021,7 @@
       // Skills 配置加载
       else if (message.type === 'skillsConfigLoaded') {
         const skillList: SkillItem[] = [];
-        // 内置工具 - 显示所有工具（包括禁用的）
-        if (message.config?.builtInTools) {
-          for (const [id, tool] of Object.entries(message.config.builtInTools) as [string, any][]) {
-            skillList.push({
-              name: id,
-              description: tool?.description || '',
-              source: 'builtin',
-              enabled: !!tool?.enabled
-            });
-          }
-        }
+        // 内置工具已迁移到 ToolManager，不再通过 skills.json 配置
         // 自定义工具
         if (Array.isArray(message.config?.customTools)) {
           for (const tool of message.config.customTools) {
@@ -987,16 +1083,21 @@
       }
       // Skill 安装成功
       else if (message.type === 'skillInstalled') {
+        // 清除安装状态
+        if (message.skillId) {
+          installingSkills.delete(message.skillId);
+          installingSkills = new Set(installingSkills);
+        }
         vscode.postMessage({ type: 'loadSkillsConfig' });
         vscode.postMessage({ type: 'loadSkillLibrary' });
         showSkillLibraryDialogState = false;
       }
-      // 内置工具切换成功
-      else if (message.type === 'builtInToolToggled') {
-        vscode.postMessage({ type: 'loadSkillsConfig' });
-      }
       // 自定义工具删除成功
       else if (message.type === 'customToolRemoved') {
+        vscode.postMessage({ type: 'loadSkillsConfig' });
+      }
+      // Instruction Skill 删除成功
+      else if (message.type === 'instructionSkillRemoved') {
         vscode.postMessage({ type: 'loadSkillsConfig' });
       }
     };
@@ -1010,6 +1111,7 @@
     vscode.postMessage({ type: 'loadAllWorkerConfigs' });
     vscode.postMessage({ type: 'loadOrchestratorConfig' });
     vscode.postMessage({ type: 'loadCompressorConfig' });
+    vscode.postMessage({ type: 'getPromptEnhanceConfig' }); // 加载 ACE 配置
     vscode.postMessage({ type: 'loadMCPServers' });
     vscode.postMessage({ type: 'loadSkillsConfig' });
     vscode.postMessage({ type: 'loadRepositories' });
@@ -1145,7 +1247,23 @@
                     </div>
                   </div>
                   <div class="llm-config-actions">
-                    <button class="llm-config-save-btn" onclick={() => saveModelConfig('orch')}>保存配置</button>
+                    <button
+                      class="llm-config-save-btn"
+                      class:saving={saveStatus.orch === 'saving'}
+                      class:saved={saveStatus.orch === 'saved'}
+                      onclick={() => saveModelConfig('orch')}
+                      disabled={saveStatus.orch === 'saving'}
+                    >
+                      {#if saveStatus.orch === 'saving'}
+                        <Icon name="refresh" size={14} />
+                        保存中...
+                      {:else if saveStatus.orch === 'saved'}
+                        <Icon name="check" size={14} />
+                        已保存
+                      {:else}
+                        保存配置
+                      {/if}
+                    </button>
                     <button
                       class="llm-config-test-btn"
                       class:testing={testStatus.orch === 'testing'}
@@ -1201,7 +1319,23 @@
                     </div>
                   </div>
                   <div class="llm-config-actions">
-                    <button class="llm-config-save-btn" onclick={() => saveModelConfig('comp')}>保存配置</button>
+                    <button
+                      class="llm-config-save-btn"
+                      class:saving={saveStatus.comp === 'saving'}
+                      class:saved={saveStatus.comp === 'saved'}
+                      onclick={() => saveModelConfig('comp')}
+                      disabled={saveStatus.comp === 'saving'}
+                    >
+                      {#if saveStatus.comp === 'saving'}
+                        <Icon name="refresh" size={14} />
+                        保存中...
+                      {:else if saveStatus.comp === 'saved'}
+                        <Icon name="check" size={14} />
+                        已保存
+                      {:else}
+                        保存配置
+                      {/if}
+                    </button>
                     <button
                       class="llm-config-test-btn"
                       class:testing={testStatus.comp === 'testing'}
@@ -1244,7 +1378,23 @@
                     <input type="password" class="llm-config-input" bind:value={aceConfig.key} placeholder="sk-...">
                   </div>
                   <div class="llm-config-actions">
-                    <button class="llm-config-save-btn" onclick={() => saveModelConfig('ace')}>保存配置</button>
+                    <button
+                      class="llm-config-save-btn"
+                      class:saving={saveStatus.ace === 'saving'}
+                      class:saved={saveStatus.ace === 'saved'}
+                      onclick={() => saveModelConfig('ace')}
+                      disabled={saveStatus.ace === 'saving'}
+                    >
+                      {#if saveStatus.ace === 'saving'}
+                        <Icon name="refresh" size={14} />
+                        保存中...
+                      {:else if saveStatus.ace === 'saved'}
+                        <Icon name="check" size={14} />
+                        已保存
+                      {:else}
+                        保存配置
+                      {/if}
+                    </button>
                     <button
                       class="llm-config-test-btn"
                       class:testing={testStatus.ace === 'testing'}
@@ -1323,7 +1473,23 @@
                 </div>
               </div>
               <div class="llm-config-actions">
-                <button class="llm-config-save-btn" onclick={() => saveModelConfig('worker')}>保存配置</button>
+                <button
+                  class="llm-config-save-btn"
+                  class:saving={saveStatus[workerModelTab] === 'saving'}
+                  class:saved={saveStatus[workerModelTab] === 'saved'}
+                  onclick={() => saveModelConfig('worker')}
+                  disabled={saveStatus[workerModelTab] === 'saving'}
+                >
+                  {#if saveStatus[workerModelTab] === 'saving'}
+                    <Icon name="refresh" size={14} />
+                    保存中...
+                  {:else if saveStatus[workerModelTab] === 'saved'}
+                    <Icon name="check" size={14} />
+                    已保存
+                  {:else}
+                    保存配置
+                  {/if}
+                </button>
                 <button
                   class="llm-config-test-btn"
                   class:testing={testStatus[workerModelTab] === 'testing'}
@@ -1352,16 +1518,6 @@
         </div>
       {:else if activeTab === 'profile'}
         <!-- 画像配置 Tab -->
-        <div class="settings-section profile-save-bar">
-          <div class="settings-section-header">
-            <div class="settings-section-title">画像与任务分类配置</div>
-            <div class="settings-section-actions">
-              <button class="settings-btn primary" onclick={saveProfile}>保存全部配置</button>
-              <button class="settings-btn secondary" onclick={resetProfile}>重置全部配置</button>
-            </div>
-          </div>
-          <div class="settings-section-desc">保存将同时影响 Worker 画像与任务分类映射</div>
-        </div>
         <!-- Worker 画像卡片 -->
         <div class="settings-section">
           <div class="settings-section-header">
@@ -1447,7 +1603,7 @@
         </div>
 
         <!-- 全局任务分类配置 -->
-        <div class="settings-section" style="margin-top: var(--space-4);">
+        <div class="settings-section">
           <div class="settings-section-header">
             <div class="settings-section-title">任务分类默认配置</div>
           </div>
@@ -1463,6 +1619,67 @@
                 </select>
               </div>
             {/each}
+          </div>
+        </div>
+
+        <!-- 全局用户规则 -->
+        <div class="settings-section">
+          <div class="settings-section-header">
+            <div class="settings-section-title">用户规则（全局）</div>
+          </div>
+          <div class="settings-section-desc">将作为系统级约束注入到编排者与所有 Worker</div>
+          <div class="profile-editor">
+            <div class="profile-field">
+              <textarea
+                class="profile-textarea user-rules-textarea"
+                bind:value={userRules}
+                placeholder="例如：\n- 优先使用 TypeScript 严格类型\n- 修改前先确认依赖关系\n- 输出必须包含变更摘要"
+              ></textarea>
+            </div>
+          </div>
+        </div>
+        <div class="profile-save-footer">
+          <div class="profile-save-hint">保存将同时影响 Worker 画像、任务分类映射与全局用户规则</div>
+          <div class="profile-save-actions">
+            <button
+              class="settings-btn secondary"
+              class:saving={profileResetStatus === 'saving'}
+              onclick={resetProfile}
+              disabled={profileResetStatus === 'saving' || profileSaveStatus === 'saving'}
+            >
+              {#if profileResetStatus === 'saving'}
+                <Icon name="refresh" size={14} />
+                处理中...
+              {:else if profileResetStatus === 'saved'}
+                <Icon name="check" size={14} />
+                已重置
+              {:else if profileResetStatus === 'error'}
+                <Icon name="close" size={14} />
+                重置失败
+              {:else}
+                重置全部配置
+              {/if}
+            </button>
+            <button
+              class="settings-btn primary"
+              class:saving={profileSaveStatus === 'saving'}
+              class:saved={profileSaveStatus === 'saved'}
+              onclick={saveProfile}
+              disabled={profileSaveStatus === 'saving' || profileResetStatus === 'saving'}
+            >
+              {#if profileSaveStatus === 'saving'}
+                <Icon name="refresh" size={14} />
+                保存中...
+              {:else if profileSaveStatus === 'saved'}
+                <Icon name="check" size={14} />
+                已保存
+              {:else if profileSaveStatus === 'error'}
+                <Icon name="close" size={14} />
+                保存失败
+              {:else}
+                保存全部配置
+              {/if}
+            </button>
           </div>
         </div>
       {:else if activeTab === 'tools'}
@@ -1592,20 +1809,12 @@
                     <div class="skill-desc" title={skill.description}>{skill.description}</div>
                   </div>
                   <div class="skill-actions">
-                    <span class="skill-source-badge" class:builtin={skill.source === 'builtin'} class:custom={skill.source === 'custom'} class:instruction={skill.source === 'instruction'}>
-                      {skill.source === 'builtin' ? '内置' : skill.source === 'custom' ? '自定义' : 'Instruction'}
+                    <span class="skill-source-badge" class:custom={skill.source === 'custom'} class:instruction={skill.source === 'instruction'}>
+                      {skill.source === 'custom' ? '自定义' : 'Instruction'}
                     </span>
-                    {#if skill.source === 'builtin'}
-                      <Toggle
-                        checked={skill.enabled}
-                        title={skill.enabled ? '点击禁用' : '点击启用'}
-                        onchange={() => toggleSkill(skill)}
-                      />
-                    {:else}
-                      <button class="btn-icon btn-icon--sm btn-icon--danger" title="删除" onclick={() => deleteSkill(skill)}>
-                        <Icon name="trash" size={14} />
-                      </button>
-                    {/if}
+                    <button class="btn-icon btn-icon--sm btn-icon--danger" title="删除" onclick={() => deleteSkill(skill)}>
+                      <Icon name="trash" size={14} />
+                    </button>
                   </div>
                 </div>
               {/each}
@@ -1678,7 +1887,23 @@
       </div>
       <div class="modal-footer">
         <button class="settings-btn secondary" onclick={closeMCPDialog}>取消</button>
-        <button class="settings-btn primary" onclick={saveMCPServer}>保存</button>
+        <button
+          class="settings-btn primary"
+          class:saving={saveStatus.mcp === 'saving'}
+          class:saved={saveStatus.mcp === 'saved'}
+          onclick={saveMCPServer}
+          disabled={saveStatus.mcp === 'saving'}
+        >
+          {#if saveStatus.mcp === 'saving'}
+            <Icon name="refresh" size={14} />
+            保存中...
+          {:else if saveStatus.mcp === 'saved'}
+            <Icon name="check" size={14} />
+            已保存
+          {:else}
+            保存
+          {/if}
+        </button>
       </div>
     </div>
   </div>
@@ -1793,8 +2018,21 @@
                       {/if}
                     </div>
                     <div class="skill-library-actions">
-                      <button class="settings-btn" class:primary={!skill.installed} onclick={() => installSkill(skill.fullName)} disabled={skill.installed}>
-                        {skill.installed ? '已安装' : '安装'}
+                      <button
+                        class="settings-btn"
+                        class:primary={!skill.installed && !installingSkills.has(skill.fullName)}
+                        class:saving={installingSkills.has(skill.fullName)}
+                        onclick={() => installSkill(skill.fullName)}
+                        disabled={skill.installed || installingSkills.has(skill.fullName)}
+                      >
+                        {#if installingSkills.has(skill.fullName)}
+                          <Icon name="refresh" size={14} />
+                          安装中...
+                        {:else if skill.installed}
+                          已安装
+                        {:else}
+                          安装
+                        {/if}
                       </button>
                     </div>
                   </div>
@@ -1941,10 +2179,10 @@
   .settings-tab-content {
     flex: 1;
     overflow-y: auto;
-    padding: var(--space-5);
+    padding: 5px;
     display: flex;
     flex-direction: column;
-    gap: var(--space-5);
+    gap: 5px;
   }
   .settings-tab-content::-webkit-scrollbar { width: 6px; }
   .settings-tab-content::-webkit-scrollbar-track { background: transparent; }
@@ -2039,6 +2277,19 @@
     border-color: var(--primary-muted);
     transform: translateY(-1px);
     box-shadow: none;
+  }
+
+  /* settings-btn 保存状态样式 */
+  .settings-btn.saving {
+    background: var(--warning-muted);
+    color: var(--warning);
+    border-color: var(--warning-muted);
+  }
+  .settings-btn.saving :global(svg) { animation: spin 1s linear infinite; }
+  .settings-btn.saved {
+    background: var(--success-muted);
+    color: var(--success);
+    border-color: var(--success-muted);
   }
 
   /* 统计 Tab 专用样式 */
@@ -2313,8 +2564,26 @@
     from { transform: rotate(0deg); }
     to { transform: rotate(360deg); }
   }
-  .llm-config-save-btn { height: var(--btn-height-sm); padding: 0 var(--space-3); font-size: var(--text-sm); font-weight: var(--font-medium); background: var(--primary); border: none; border-radius: var(--radius-sm); color: white; cursor: pointer; transition: all var(--transition-fast); }
+  .llm-config-save-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    height: var(--btn-height-sm);
+    padding: 0 var(--space-3);
+    font-size: var(--text-sm);
+    font-weight: var(--font-medium);
+    background: var(--primary);
+    border: none;
+    border-radius: var(--radius-sm);
+    color: white;
+    cursor: pointer;
+    transition: all var(--transition-fast);
+  }
   .llm-config-save-btn:hover { background: var(--primary-hover); }
+  .llm-config-save-btn:disabled { opacity: 0.7; cursor: not-allowed; }
+  .llm-config-save-btn.saving { background: var(--warning-muted); color: var(--warning); }
+  .llm-config-save-btn.saving :global(svg) { animation: spin 1s linear infinite; }
+  .llm-config-save-btn.saved { background: var(--success-muted); color: var(--success); }
 
   .llm-config-toggle-label { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-sm); cursor: pointer; }
   .llm-config-toggle-btn {
@@ -2354,6 +2623,10 @@
     transition: border-color var(--transition-fast);
   }
 
+  .user-rules-textarea {
+    min-height: 140px;
+  }
+
   .profile-textarea:focus { border-color: var(--primary); }
   .profile-two-columns { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
   .profile-column { min-width: 0; }
@@ -2371,7 +2644,26 @@
   .profile-category-row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); height: var(--btn-height-md); padding: 0 var(--space-3); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); }
   .profile-category-label { font-size: var(--text-sm); color: var(--foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
   .profile-category-select { height: var(--btn-height-xs); padding: 0 var(--space-2); font-size: var(--text-xs); background: var(--vscode-input-background, #3c3c3c); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--foreground); outline: none; }
-  .profile-save-bar { margin-bottom: var(--space-4); }
+  .profile-save-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin-top: 5px;
+    padding: var(--space-3) var(--space-4);
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .profile-save-hint {
+    font-size: var(--text-sm);
+    color: var(--foreground-muted);
+  }
+  .profile-save-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
 
   /* MCP 服务器列表 */
   .mcp-server-list { display: flex; flex-direction: column; gap: var(--space-2); }

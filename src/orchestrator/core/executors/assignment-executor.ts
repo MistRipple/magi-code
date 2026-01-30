@@ -16,6 +16,7 @@ import { Mission, Assignment, WorkerTodo } from '../../mission';
 import { SnapshotManager } from '../../../snapshot-manager';
 import { UnifiedTaskManager } from '../../../task/unified-task-manager';
 import { logger, LogCategory } from '../../../logging';
+import { LspEnforcer } from '../../lsp/lsp-enforcer';
 
 export interface AssignmentExecutionOptions {
   workingDirectory: string;
@@ -35,12 +36,17 @@ export interface AssignmentExecutionResult {
 }
 
 export class AssignmentExecutor {
+  private lspEnforcer: LspEnforcer | null = null;
+
   constructor(
     private workers: Map<WorkerSlot, AutonomousWorker>,
     private adapterFactory: IAdapterFactory,
     private snapshotManager: SnapshotManager | null,
-    private taskManager: UnifiedTaskManager | null
-  ) {}
+    private taskManager: UnifiedTaskManager | null,
+    workspaceRoot: string
+  ) {
+    this.lspEnforcer = new LspEnforcer(workspaceRoot);
+  }
 
   /**
    * 执行单个 Assignment
@@ -73,6 +79,17 @@ export class AssignmentExecutor {
 
     // 收集目标文件
     const targetFiles = this.collectTargetFiles(assignment);
+
+    if (this.lspEnforcer) {
+      try {
+        await this.lspEnforcer.applyIfNeeded(assignment);
+      } catch (error: any) {
+        logger.warn('LSP 预检失败，继续执行', {
+          assignmentId: assignment.id,
+          error: error?.message
+        }, LogCategory.ORCHESTRATOR);
+      }
+    }
 
     // 执行 Assignment
     const result = await worker.executeAssignment(assignment, {

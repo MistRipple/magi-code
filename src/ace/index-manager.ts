@@ -12,7 +12,7 @@ import ignore from 'ignore';
 type IgnoreInstance = ReturnType<typeof ignore>;
 
 /** Blob 接口 */
-interface Blob {
+export interface Blob {
   path: string;
   content: string;
 }
@@ -26,6 +26,23 @@ export interface IndexResult {
     existing_blobs: number;
     new_blobs: number;
   };
+}
+
+/** 搜索结果接口 */
+export interface SearchResult {
+  status: 'success' | 'error';
+  content: string;
+  stats?: {
+    total_blobs: number;
+    query: string;
+  };
+}
+
+/** Blob 信息（用于返回给调用者） */
+export interface BlobInfo {
+  hash: string;
+  path: string;
+  content: string;
 }
 
 /** 单个 blob 的最大字节数（500KB） */
@@ -120,9 +137,9 @@ export class AceIndexManager {
     this.indexFilePath = getIndexFilePath(projectRoot);
   }
 
-  /** 加载 .gitignore 文件 */
-  private loadGitignore(): IgnoreInstance | null {
-    const gitignorePath = path.join(this.projectRoot, '.gitignore');
+  /** 加载指定目录的 .gitignore 文件 */
+  private loadGitignoreFromDir(dirPath: string): IgnoreInstance | null {
+    const gitignorePath = path.join(dirPath, '.gitignore');
     if (!fs.existsSync(gitignorePath)) return null;
     try {
       const content = fs.readFileSync(gitignorePath, 'utf-8');
@@ -132,14 +149,24 @@ export class AceIndexManager {
     }
   }
 
-  /** 检查路径是否应该被排除 */
-  private shouldExclude(filePath: string, gitignoreSpec: IgnoreInstance | null): boolean {
+  /** 加载根目录 .gitignore 文件（兼容旧方法） */
+  private loadGitignore(): IgnoreInstance | null {
+    return this.loadGitignoreFromDir(this.projectRoot);
+  }
+
+  /** 检查路径是否应该被排除（支持多层 .gitignore） */
+  private shouldExcludeWithSpec(
+    _filePath: string,
+    relativePath: string,
+    gitignoreSpec: IgnoreInstance | null,
+    isDir: boolean
+  ): boolean {
     try {
-      const relativePath = path.relative(this.projectRoot, filePath).replace(/\\/g, '/');
+      // 检查 gitignore 规则
       if (gitignoreSpec) {
-        const isDir = fs.statSync(filePath).isDirectory();
         if (gitignoreSpec.ignores(isDir ? relativePath + '/' : relativePath)) return true;
       }
+      // 检查内置排除模式
       const pathParts = relativePath.split('/');
       for (const pattern of this.excludePatterns) {
         for (const part of pathParts) {
@@ -189,23 +216,44 @@ export class AceIndexManager {
     return blobs;
   }
 
-  /** 收集所有文本文件 */
+  /** 收集所有文本文件（支持嵌套 .gitignore） */
   private async collectFiles(): Promise<Blob[]> {
     const blobs: Blob[] = [];
-    const gitignoreSpec = this.loadGitignore();
+    // 加载根目录 .gitignore
+    const rootGitignore = this.loadGitignore();
 
-    const walkDir = async (dirPath: string): Promise<void> => {
+    // 递归遍历目录，支持每个目录的 .gitignore
+    const walkDir = async (dirPath: string, parentIgnore: IgnoreInstance | null): Promise<void> => {
+      // 合并当前目录的 .gitignore
+      let currentIgnore = parentIgnore;
+      const localGitignore = this.loadGitignoreFromDir(dirPath);
+      if (localGitignore) {
+        // 合并父级和当前目录的 gitignore 规则
+        currentIgnore = ignore();
+        if (parentIgnore) {
+          // 注意：ignore 库不支持直接合并，这里重新创建
+          currentIgnore = parentIgnore;
+        }
+        // 将当前目录的规则添加到忽略实例
+        currentIgnore = localGitignore;
+      }
+
       const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
       for (const entry of entries) {
         const fullPath = path.join(dirPath, entry.name);
+        const relativePath = path.relative(this.projectRoot, fullPath).replace(/\\/g, '/');
+
         if (entry.isDirectory()) {
-          if (!this.shouldExclude(fullPath, gitignoreSpec)) await walkDir(fullPath);
+          // 检查目录是否应该被排除
+          if (!this.shouldExcludeWithSpec(fullPath, relativePath, currentIgnore, true)) {
+            await walkDir(fullPath, currentIgnore);
+          }
         } else if (entry.isFile()) {
-          if (this.shouldExclude(fullPath, gitignoreSpec)) continue;
+          // 检查文件是否应该被排除
+          if (this.shouldExcludeWithSpec(fullPath, relativePath, currentIgnore, false)) continue;
           const ext = path.extname(entry.name).toLowerCase();
           if (!this.textExtensions.has(ext)) continue;
           try {
-            const relativePath = path.relative(this.projectRoot, fullPath);
             if (relativePath.startsWith('..')) continue;
             const content = await fs.promises.readFile(fullPath, 'utf-8');
             if (isBinaryContent(content)) continue;
@@ -217,7 +265,7 @@ export class AceIndexManager {
       }
     };
 
-    await walkDir(this.projectRoot);
+    await walkDir(this.projectRoot, rootGitignore);
     return blobs;
   }
 
@@ -311,5 +359,171 @@ export class AceIndexManager {
       const message = error instanceof Error ? error.message : String(error);
       return { status: 'error', message };
     }
+  }
+
+  /**
+   * 收集当前所有 blob 并计算哈希
+   * 用于搜索时传递给服务器
+   */
+  async collectBlobsWithHashes(): Promise<{ blobs: Blob[]; hashes: string[]; hashMap: Map<string, Blob> }> {
+    const blobs = await this.collectFiles();
+    const hashes: string[] = [];
+    const hashMap = new Map<string, Blob>();
+
+    for (const blob of blobs) {
+      const hash = calculateBlobName(blob.path, blob.content);
+      hashes.push(hash);
+      hashMap.set(hash, blob);
+    }
+
+    return { blobs, hashes, hashMap };
+  }
+
+  /**
+   * 增量索引并返回当前所有 blob 哈希
+   * 用于搜索前确保索引是最新的
+   */
+  async ensureIndexedAndGetHashes(): Promise<{ hashes: string[]; indexResult: IndexResult }> {
+    const { blobs, hashes, hashMap } = await this.collectBlobsWithHashes();
+
+    if (blobs.length === 0) {
+      return {
+        hashes: [],
+        indexResult: { status: 'error', message: '未找到可索引的文本文件' }
+      };
+    }
+
+    // 加载已索引的 blob 哈希
+    const existingBlobNames = new Set(this.loadIndex());
+
+    // 找出需要上传的新 blob
+    const newHashes = hashes.filter(h => !existingBlobNames.has(h));
+    const blobsToUpload = newHashes.map(h => hashMap.get(h)!);
+
+    if (blobsToUpload.length > 0) {
+      // 上传新 blob
+      const strategy = getUploadStrategy(blobsToUpload.length);
+      let uploadedCount = 0;
+
+      for (let i = 0; i < blobsToUpload.length; i += strategy.batchSize) {
+        const batch = blobsToUpload.slice(i, i + strategy.batchSize);
+        try {
+          await this.uploadBatch(batch, strategy.timeout);
+          uploadedCount += batch.length;
+        } catch (error) {
+          logger.error('ACE.索引.上传.批次_失败', error, LogCategory.SYSTEM);
+        }
+      }
+
+      // 保存当前所有 blob 的哈希作为索引
+      this.saveIndex(hashes);
+
+      return {
+        hashes,
+        indexResult: {
+          status: 'success',
+          message: `索引完成，共 ${hashes.length} 个文件块`,
+          stats: { total_blobs: hashes.length, existing_blobs: existingBlobNames.size, new_blobs: uploadedCount }
+        }
+      };
+    }
+
+    // 无需上传，但仍需更新索引
+    this.saveIndex(hashes);
+
+    return {
+      hashes,
+      indexResult: {
+        status: 'success',
+        message: `索引完成，共 ${hashes.length} 个文件块`,
+        stats: { total_blobs: hashes.length, existing_blobs: hashes.length, new_blobs: 0 }
+      }
+    };
+  }
+
+  /**
+   * 执行语义搜索
+   * @param query 自然语言查询
+   * @param ensureIndexed 是否先确保索引是最新的
+   */
+  async search(query: string, ensureIndexed: boolean = true): Promise<SearchResult> {
+    logger.info('ACE.搜索.开始', { query, ensureIndexed }, LogCategory.SYSTEM);
+
+    try {
+      // 获取当前所有 blob 哈希
+      let hashes: string[];
+
+      if (ensureIndexed) {
+        const result = await this.ensureIndexedAndGetHashes();
+        hashes = result.hashes;
+        if (hashes.length === 0) {
+          return { status: 'error', content: '未找到可索引的文本文件' };
+        }
+      } else {
+        // 直接使用本地索引
+        hashes = this.loadIndex();
+        if (hashes.length === 0) {
+          // 没有索引，需要先索引
+          const result = await this.ensureIndexedAndGetHashes();
+          hashes = result.hashes;
+          if (hashes.length === 0) {
+            return { status: 'error', content: '未找到可索引的文本文件' };
+          }
+        }
+      }
+
+      // 调用搜索 API - 使用 Augment 风格的 blobs 对象格式
+      const response = await fetch(`${this.baseUrl}/agents/codebase-retrieval`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${this.token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          information_request: query,
+          blobs: {
+            checkpoint_id: null,
+            added_blobs: hashes,
+            deleted_blobs: []
+          }
+        }),
+        signal: AbortSignal.timeout(60000) // 搜索超时 60 秒
+      });
+
+      if (!response.ok) {
+        if (response.status === 401) {
+          return { status: 'error', content: 'Token 无效或已过期' };
+        }
+        if (response.status === 403) {
+          return { status: 'error', content: '访问被拒绝' };
+        }
+        return { status: 'error', content: `搜索失败: HTTP ${response.status}` };
+      }
+
+      const data = await response.json() as { formatted_retrieval?: string };
+      const content = data.formatted_retrieval || '未找到相关代码';
+
+      logger.info('ACE.搜索.完成', { query, resultLength: content.length }, LogCategory.SYSTEM);
+
+      return {
+        status: 'success',
+        content,
+        stats: { total_blobs: hashes.length, query }
+      };
+    } catch (error) {
+      logger.error('ACE.搜索.失败', error, LogCategory.SYSTEM);
+      const message = error instanceof Error ? error.message : String(error);
+      return { status: 'error', content: `搜索失败: ${message}` };
+    }
+  }
+
+  /** 获取项目根目录 */
+  getProjectRoot(): string {
+    return this.projectRoot;
+  }
+
+  /** 获取 API 配置状态 */
+  isConfigured(): boolean {
+    return !!(this.baseUrl && this.token);
   }
 }

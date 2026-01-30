@@ -33,15 +33,28 @@ Use for:
 * State diagrams
 * Gantt charts
 * Pie charts
+* Mind maps (思维导图)
 
 The diagram will be rendered as an interactive SVG with pan/zoom controls.
 
-Example:
+Flowchart Example:
 \`\`\`mermaid
 graph TD
     A[Start] --> B{Decision}
     B -->|Yes| C[Action 1]
     B -->|No| D[Action 2]
+\`\`\`
+
+Mindmap Example (IMPORTANT: use 2-space indentation for hierarchy):
+\`\`\`mermaid
+mindmap
+  root((Central Topic))
+    Branch 1
+      Sub-item 1.1
+      Sub-item 1.2
+    Branch 2
+      Sub-item 2.1
+      Sub-item 2.2
 \`\`\``,
       input_schema: {
         type: 'object',
@@ -179,6 +192,13 @@ graph TD
 
     for (const { pattern, type } of diagramTypes) {
       if (pattern.test(trimmed)) {
+        // mindmap 需要额外验证缩进格式
+        if (type === 'mindmap') {
+          const mindmapValidation = this.validateMindmapIndentation(trimmed);
+          if (!mindmapValidation.valid) {
+            return mindmapValidation;
+          }
+        }
         return { valid: true, diagramType: type };
       }
     }
@@ -188,5 +208,72 @@ graph TD
       valid: false,
       error: 'Unrecognized Mermaid diagram type. Code should start with a valid diagram declaration (e.g., graph, flowchart, sequenceDiagram, classDiagram, etc.)'
     };
+  }
+
+  /**
+   * 验证 mindmap 缩进格式
+   * Mermaid mindmap 语法要求使用缩进表示层级关系
+   */
+  private validateMindmapIndentation(code: string): { valid: boolean; error?: string; diagramType?: string } {
+    const lines = code.split('\n');
+
+    // 跳过第一行 "mindmap"
+    const contentLines = lines.slice(1).filter(line => line.trim() !== '');
+
+    if (contentLines.length === 0) {
+      return { valid: false, error: 'Mindmap has no content after declaration' };
+    }
+
+    // 检查是否有缩进结构
+    let hasIndentedContent = false;
+    let rootFound = false;
+
+    for (const line of contentLines) {
+      const leadingSpaces = line.match(/^(\s*)/)?.[1]?.length || 0;
+      const trimmedLine = line.trim();
+
+      // 检测 root 节点（通常是 root((xxx)) 或 root(xxx) 或 root[xxx]）
+      if (trimmedLine.match(/^root[\(\[\{]/i)) {
+        rootFound = true;
+        continue;
+      }
+
+      // 如果 root 已找到，后续行应该有缩进
+      if (rootFound && leadingSpaces > 0) {
+        hasIndentedContent = true;
+        break;
+      }
+    }
+
+    // 如果找到了 root 但后续内容没有缩进，说明格式错误
+    if (rootFound && contentLines.length > 1 && !hasIndentedContent) {
+      // 检查是否所有内容行都在同一层级（没有缩进）
+      const nonRootLines = contentLines.filter(line => !line.trim().match(/^root[\(\[\{]/i));
+      const allNoIndent = nonRootLines.every(line => {
+        const spaces = line.match(/^(\s*)/)?.[1]?.length || 0;
+        return spaces === 0;
+      });
+
+      if (allNoIndent && nonRootLines.length > 0) {
+        return {
+          valid: false,
+          error: `Mindmap syntax error: Missing indentation for hierarchy.
+Each child node must be indented with spaces to show its level.
+
+Correct format:
+mindmap
+  root((Topic))
+    Branch 1
+      Sub-item 1.1
+    Branch 2
+      Sub-item 2.1
+
+Your code has all nodes at the same level without indentation.
+Please add 2-space indentation for each hierarchy level.`
+        };
+      }
+    }
+
+    return { valid: true, diagramType: 'mindmap' };
   }
 }

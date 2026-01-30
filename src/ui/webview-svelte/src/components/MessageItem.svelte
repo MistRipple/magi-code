@@ -33,6 +33,13 @@
   // 获取 worker 信息（如果有）
   const worker = $derived(message.metadata?.worker || null);
 
+  // 检查是否是纯 subTaskCard 消息（不需要外层包裹）
+  const isSubTaskCardOnly = $derived(
+    Boolean(message.metadata?.subTaskCard) &&
+    (!message.blocks || message.blocks.length === 0) &&
+    !message.content?.trim()
+  );
+
   // 通知类型和对应的图标/颜色（使用 Message 类型中的 noticeType）
   const noticeType = $derived(message.noticeType || 'info');
   const noticeIcons: Record<string, IconName> = {
@@ -73,6 +80,11 @@
   <div class="message-item user" data-message-id={message.id}>
     <div class="user-content">{message.content}</div>
     <div class="user-time">{formatTime(message.timestamp)}</div>
+  </div>
+<!-- subTaskCard 消息：直接显示卡片，不需要外层包裹 -->
+{:else if isSubTaskCardOnly}
+  <div class="message-item subtask-card-only" data-message-id={message.id}>
+    <SubTaskSummaryCard card={message.metadata?.subTaskCard as any} />
   </div>
 <!-- 助手消息：完整显示 -->
 {:else}
@@ -196,6 +208,11 @@
     font-size: var(--text-xs);
     color: var(--foreground-muted);
     margin-top: var(--space-1);
+  }
+
+  /* ===== SubTaskCard 独立样式（无外层包裹） ===== */
+  .message-item.subtask-card-only {
+    padding: var(--space-2) 0;
   }
 
   /* ===== 助手消息样式 ===== */
