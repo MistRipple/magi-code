@@ -39,7 +39,7 @@ import { MessageHub, type SubTaskView as MessageHubSubTaskView } from './message
 import type { WorkerReport, OrchestratorResponse, WorkerEvidence, FileChangeRecord } from '../protocols/worker-report';
 import { WisdomManager, type WisdomStorage } from '../wisdom';
 import { buildIntentClassificationPrompt } from '../prompts/intent-classification';
-import { hasCodeOperationIntent } from '../profile/category-matcher';
+import { buildWorkerNeedDecisionPrompt } from '../prompts/orchestrator-prompts';
 
 /**
  * 用户确认回调类型
@@ -767,6 +767,11 @@ export class MissionDrivenEngine extends EventEmitter {
    * 执行任务 - 主入口
    */
   async execute(userPrompt: string, taskId: string, sessionId?: string): Promise<string> {
+    const trimmedPrompt = userPrompt?.trim() || '';
+    if (!trimmedPrompt) {
+      return '请输入你的需求或问题。';
+    }
+
     if (this.isRunning) {
       throw new Error('引擎正在运行中');
     }
@@ -785,30 +790,38 @@ export class MissionDrivenEngine extends EventEmitter {
       this.currentSessionId = resolvedSessionId;
       await this.ensureContextReady(resolvedSessionId);
 
-      // 1. 意图分析
+      // 1. 意图分析（允许在同一次执行中完成澄清回合）
+      let activePrompt = trimmedPrompt;
       let intentResult = await this.missionOrchestrator.processRequest(
-        userPrompt,
+        activePrompt,
         resolvedSessionId
       );
+      while (intentResult.skipMission && intentResult.mode === IntentHandlerMode.CLARIFY && intentResult.clarificationQuestions) {
+        if (!this.clarificationCallback) {
+          this.currentTaskId = null;
+          return '任务已取消。';
+        }
+        const answers = await this.clarificationCallback(
+          intentResult.clarificationQuestions,
+          '',
+          0.5,
+          activePrompt
+        );
+        if (!answers) {
+          this.currentTaskId = null;
+          return '任务已取消。';
+        }
+        activePrompt = `${activePrompt}\n\n补充信息：${JSON.stringify(answers)}`;
+        intentResult = await this.missionOrchestrator.processRequest(
+          activePrompt,
+          resolvedSessionId
+        );
+      }
 
       // 2. 处理非任务模式
       if (intentResult.skipMission) {
         this._context.mission = null;
-        if (intentResult.mode === IntentHandlerMode.CLARIFY && intentResult.clarificationQuestions) {
-            // 需要澄清
-            if (this.clarificationCallback) {
-              const answers = await this.clarificationCallback(
-                intentResult.clarificationQuestions,
-                '',
-                0.5,
-                userPrompt
-              );
-              if (answers) {
-                // 重新执行带答案的请求
-                const clarifiedPrompt = `${userPrompt}\n\n补充信息：${JSON.stringify(answers)}`;
-                return this.execute(clarifiedPrompt, taskId, sessionId);
-              }
-            }
+        if (intentResult.mode === IntentHandlerMode.CLARIFY) {
           this.currentTaskId = null;
           return '任务已取消。';
         }
@@ -816,7 +829,7 @@ export class MissionDrivenEngine extends EventEmitter {
         if (intentResult.mode === IntentHandlerMode.ASK) {
           // **ASK 模式**: 编排者直接回答，不调用 Worker
           const result = await this.executeAskMode(
-            userPrompt,
+            activePrompt,
             taskId,
             resolvedSessionId
           );
@@ -825,53 +838,67 @@ export class MissionDrivenEngine extends EventEmitter {
         }
 
         if (intentResult.mode === IntentHandlerMode.DIRECT) {
-          // **DIRECT 模式**: 根据是否涉及代码操作决定执行方式
-          const needsWorker = hasCodeOperationIntent(this.profileLoader, userPrompt);
-          if (needsWorker) {
-            // 涉及代码操作 → 调用 Worker 执行
-            const result = await this.executeQuickPath(
-              userPrompt,
-              IntentHandlerMode.DIRECT,
-              taskId,
-              resolvedSessionId
-            );
-            this.currentTaskId = null;
-            return result;
-          } else {
-            // 不涉及代码操作 → 编排者直接回答
+          // **DIRECT 模式**: 由编排者 LLM 决策是否需要 Worker
+          const decision = await this.decideWorkerNeedWithLLM(
+            activePrompt,
+            IntentHandlerMode.DIRECT
+          );
+          if (!decision.needsWorker) {
+            if (decision.directResponse?.trim()) {
+              this.messageHub.orchestratorMessage(decision.directResponse, {
+                metadata: { intent: 'ask', decision: 'llm' },
+              });
+              this.currentTaskId = null;
+              return decision.directResponse;
+            }
             const result = await this.executeAskMode(
-              userPrompt,
+              activePrompt,
               taskId,
               resolvedSessionId
             );
             this.currentTaskId = null;
             return result;
           }
+          const result = await this.executeQuickPath(
+            activePrompt,
+            IntentHandlerMode.DIRECT,
+            taskId,
+            resolvedSessionId
+          );
+          this.currentTaskId = null;
+          return result;
         }
 
         if (intentResult.mode === IntentHandlerMode.EXPLORE) {
-          // **EXPLORE 模式**: 根据是否涉及代码操作决定执行方式
-          const needsWorker = hasCodeOperationIntent(this.profileLoader, userPrompt);
-          if (needsWorker) {
-            // 涉及代码操作 → 调用 Worker 执行
-            const result = await this.executeQuickPath(
-              userPrompt,
-              IntentHandlerMode.EXPLORE,
-              taskId,
-              resolvedSessionId
-            );
-            this.currentTaskId = null;
-            return result;
-          } else {
-            // 不涉及代码操作 → 编排者直接回答
+          // **EXPLORE 模式**: 由编排者 LLM 决策是否需要 Worker
+          const decision = await this.decideWorkerNeedWithLLM(
+            activePrompt,
+            IntentHandlerMode.EXPLORE
+          );
+          if (!decision.needsWorker) {
+            if (decision.directResponse?.trim()) {
+              this.messageHub.orchestratorMessage(decision.directResponse, {
+                metadata: { intent: 'ask', decision: 'llm' },
+              });
+              this.currentTaskId = null;
+              return decision.directResponse;
+            }
             const result = await this.executeAskMode(
-              userPrompt,
+              activePrompt,
               taskId,
               resolvedSessionId
             );
             this.currentTaskId = null;
             return result;
           }
+          const result = await this.executeQuickPath(
+            activePrompt,
+            IntentHandlerMode.EXPLORE,
+            taskId,
+            resolvedSessionId
+          );
+          this.currentTaskId = null;
+          return result;
         }
 
         // 其他非任务模式
@@ -890,7 +917,7 @@ export class MissionDrivenEngine extends EventEmitter {
       this._context.mission = mission;
 
       // 4. 理解目标
-      await this.understandGoalWithLLM(mission, userPrompt, resolvedSessionId);
+      await this.understandGoalWithLLM(mission, activePrompt, resolvedSessionId);
 
       // 5. 规划协作
       this.sendPhaseMessage('📋 正在规划任务分解...', 'planning');
@@ -1629,6 +1656,74 @@ export class MissionDrivenEngine extends EventEmitter {
       this.contextSessionId = sessionId;
       logger.info('编排器.上下文.已初始化', { sessionId, sessionName }, LogCategory.ORCHESTRATOR);
     }
+  }
+
+  /**
+   * 由编排者 LLM 决策是否需要 Worker
+   */
+  private async decideWorkerNeedWithLLM(
+    userPrompt: string,
+    mode: IntentHandlerMode
+  ): Promise<{
+    needsWorker: boolean;
+    codeTask: boolean;
+    profileCategory?: string;
+    needsTooling?: boolean;
+    directResponse?: string;
+    reason?: string;
+  }> {
+    const categoryHints = Array.from(this.profileLoader.getAllCategories().entries())
+      .map(([name, config]) => `- ${name}: ${config.description} (default: ${config.defaultWorker})`)
+      .join('\n');
+    const prompt = buildWorkerNeedDecisionPrompt(userPrompt, mode, categoryHints);
+    const response = await this.adapterFactory.sendMessage(
+      'orchestrator',
+      prompt,
+      undefined,
+      {
+        source: 'orchestrator',
+        streamToUI: false,
+        adapterRole: 'orchestrator',
+        messageMeta: { intent: 'routing', mode },
+      }
+    );
+
+    this.recordOrchestratorTokens(response.tokenUsage);
+
+    if (response.error) {
+      logger.warn('编排器.路由决策.失败', { error: response.error }, LogCategory.ORCHESTRATOR);
+      return { needsWorker: true, codeTask: true, reason: 'decision_failed' };
+    }
+
+    try {
+      const jsonMatch = response.content?.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]) as {
+          codeTask?: boolean;
+          profileCategory?: string;
+          needsTooling?: boolean;
+          directResponse?: string;
+          reason?: string;
+        };
+        const profileCategory = typeof parsed.profileCategory === 'string'
+          ? parsed.profileCategory.trim()
+          : '';
+        const codeTask = Boolean(parsed.codeTask);
+        const needsWorker = codeTask || Boolean(profileCategory);
+        return {
+          needsWorker,
+          codeTask,
+          profileCategory: profileCategory || undefined,
+          needsTooling: Boolean(parsed.needsTooling),
+          directResponse: parsed.directResponse,
+          reason: parsed.reason,
+        };
+      }
+    } catch (error) {
+      logger.warn('编排器.路由决策.解析失败', { error }, LogCategory.ORCHESTRATOR);
+    }
+
+    return { needsWorker: true, codeTask: true, reason: 'parse_failed' };
   }
 
   /**

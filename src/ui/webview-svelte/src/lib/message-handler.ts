@@ -24,7 +24,7 @@ import {
   addWorkerSession,
   updateWorkerSession,
 } from '../stores/messages.svelte';
-import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WaveState, WorkerSessionState } from '../types/message';
+import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WaveState, WorkerSessionState, Task, Edit } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
 import { MessageType } from '../../../../protocol/message-protocol';
 import { routeStandardMessage, getMessageTarget, clearMessageTargets } from './message-router';
@@ -36,6 +36,40 @@ import { resolvePhaseStep } from '../config/phase-map';
 function generateId(): string {
   return `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 }
+
+function normalizeRestoredMessages(messages: Message[]): Message[] {
+  const seen = new Set<string>();
+  const normalized: Message[] = [];
+  for (const msg of ensureArray<Message>(messages)) {
+    if (!msg || typeof msg !== 'object') continue;
+    const rawId = typeof msg.id === 'string' ? msg.id.trim() : '';
+    const id = rawId || generateId();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    normalized.push({ ...msg, id });
+  }
+  return normalized;
+}
+
+// 标准消息的兜底 ID 生成（用于缺失 id 的异常消息）
+function buildFallbackMessageId(standard: StandardMessage): string {
+  const traceId = standard.traceId || 'no-trace';
+  const timestamp = standard.timestamp || standard.updatedAt || Date.now();
+  const source = standard.source || 'unknown';
+  const agent = standard.agent || 'unknown';
+  const type = standard.type || 'unknown';
+  return `msg_fallback_${traceId}_${timestamp}_${source}_${agent}_${type}`;
+}
+
+function normalizeStandardMessage(standard: StandardMessage): StandardMessage {
+  if (standard.id && standard.id.trim()) {
+    return standard;
+  }
+  const fallbackId = buildFallbackMessageId(standard);
+  console.warn('[MessageHandler] 标准消息缺少 id，已使用回退 id', { fallbackId, standard });
+  return { ...standard, id: fallbackId };
+}
+
 
 /**
  * 添加系统通知消息（居中显示的简洁通知）
@@ -279,8 +313,23 @@ function handleStateUpdate(message: WebviewMessage) {
   }
 
   const store = getState();
-  store.tasks = ensureArray(state.tasks);
-  store.edits = ensureArray(state.pendingChanges);
+  store.tasks = ensureArray(state.tasks)
+    .filter((task): task is Task => !!task && typeof task === 'object' && typeof (task as Task).status === 'string')
+    .map((task) => ({
+      id: task.id || `task_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+      name: task.name || task.prompt || '',
+      description: task.description,
+      status: task.status,
+    }));
+  store.edits = ensureArray(state.pendingChanges)
+    .map((change) => ({
+      filePath: change.filePath,
+      type: change.type,
+      additions: change.additions,
+      deletions: change.deletions,
+      contributors: change.contributors,
+      workerId: change.workerId,
+    }));
   if (typeof (state as any).orchestratorPhase === 'string') {
     store.currentPhase = mapPhaseToStep((state as any).orchestratorPhase);
   } else if (typeof (state as any).orchestratorPhase === 'number') {
@@ -312,8 +361,9 @@ function handleStateUpdate(message: WebviewMessage) {
 
 
 function handleStandardMessage(message: WebviewMessage) {
-  const standard = message.message as StandardMessage;
-  if (!standard) return;
+  const rawStandard = message.message as StandardMessage;
+  if (!rawStandard) return;
+  const standard = normalizeStandardMessage(rawStandard);
   const uiMessage = mapStandardMessage(standard);
   if (!uiMessage.isStreaming && !hasRenderableContent(uiMessage)) {
     return;
@@ -322,19 +372,44 @@ function handleStandardMessage(message: WebviewMessage) {
   if (target.location === 'none' || target.location === 'task') {
     return;
   }
-  if (target.location === 'thread') {
-    addThreadMessage(uiMessage);
-  } else if (target.location === 'worker') {
-    addAgentMessage(target.worker, uiMessage);
-  } else if (target.location === 'both') {
-    addThreadMessage(uiMessage);
-    addAgentMessage(target.worker, uiMessage);
-  }
+    if (target.location === 'thread') {
+      const existing = getState().threadMessages.find(m => m.id === uiMessage.id);
+      if (existing) {
+        updateThreadMessage(uiMessage.id, uiMessage);
+      } else {
+        addThreadMessage(uiMessage);
+      }
+    } else if (target.location === 'worker') {
+      const existing = getState().agentOutputs[target.worker].find(m => m.id === uiMessage.id);
+      if (existing) {
+        updateAgentMessage(target.worker, uiMessage.id, uiMessage);
+      } else {
+        addAgentMessage(target.worker, uiMessage);
+      }
+    } else if (target.location === 'both') {
+      const threadExisting = getState().threadMessages.find(m => m.id === uiMessage.id);
+      if (threadExisting) {
+        updateThreadMessage(uiMessage.id, uiMessage);
+      } else {
+        addThreadMessage(uiMessage);
+      }
+      const agentExisting = getState().agentOutputs[target.worker].find(m => m.id === uiMessage.id);
+      if (agentExisting) {
+        updateAgentMessage(target.worker, uiMessage.id, uiMessage);
+      } else {
+        addAgentMessage(target.worker, uiMessage);
+      }
+    }
 }
 
 function handleStandardUpdate(message: WebviewMessage) {
-  const update = message.update as StreamUpdate;
-  if (!update?.messageId) return;
+  const rawUpdate = message.update as StreamUpdate;
+  if (!rawUpdate?.messageId) return;
+  const update = rawUpdate.messageId.trim() ? rawUpdate : null;
+  if (!update) {
+    console.warn('[MessageHandler] 流式更新缺少 messageId，已丢弃', rawUpdate);
+    return;
+  }
   const location = getMessageTarget(update.messageId);
   if (!location) return;
   if (location.location === 'none' || location.location === 'task') {
@@ -367,8 +442,9 @@ function handleStandardUpdate(message: WebviewMessage) {
 }
 
 function handleStandardComplete(message: WebviewMessage) {
-  const standard = message.message as StandardMessage;
-  if (!standard) return;
+  const rawStandard = message.message as StandardMessage;
+  if (!rawStandard) return;
+  const standard = normalizeStandardMessage(rawStandard);
   const location = getMessageTarget(standard.id);
   if (!location) return;
   if (location.location === 'none' || location.location === 'task') {
@@ -515,16 +591,16 @@ function handleSessionMessagesLoaded(message: WebviewMessage) {
 
     // 加载主对话消息
     if (messages && messages.length > 0) {
-      const formattedMessages: Message[] = messages.map(formatMessage);
+      const formattedMessages: Message[] = normalizeRestoredMessages(messages.map(formatMessage));
       setThreadMessages(formattedMessages);
     }
 
     // 加载 worker 消息
     if (workerMessages) {
       setAgentOutputs({
-        claude: (workerMessages.claude || []).map(formatMessage),
-        codex: (workerMessages.codex || []).map(formatMessage),
-        gemini: (workerMessages.gemini || []).map(formatMessage),
+        claude: normalizeRestoredMessages((workerMessages.claude || []).map(formatMessage)),
+        codex: normalizeRestoredMessages((workerMessages.codex || []).map(formatMessage)),
+        gemini: normalizeRestoredMessages((workerMessages.gemini || []).map(formatMessage)),
       });
     }
   }

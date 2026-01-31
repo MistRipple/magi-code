@@ -52,6 +52,7 @@
     refactor: 'claude',
     bugfix: 'codex',
     debug: 'claude',
+    data_analysis: 'codex',
     frontend: 'gemini',
     backend: 'claude',
     test: 'codex',
@@ -235,6 +236,7 @@
     refactor: '代码重构(refactor)',
     bugfix: '缺陷修复(bugfix)',
     debug: '问题排查(debug)',
+    data_analysis: '数据分析(data/analysis)',
     frontend: '前端开发(frontend)',
     backend: '后端开发(backend)',
     test: '测试编写(test)',
@@ -2909,7 +2911,7 @@
     animation: slideUp var(--duration-normal) var(--ease-out);
   }
 
-  .modal-dialog-lg { width: 600px; }
+  .modal-dialog-lg { width: 600px; max-height: 70vh; }
   .modal-dialog--sm { width: 360px; }
   .modal-overlay--top { z-index: calc(var(--z-modal) + 20); }
 
@@ -2948,8 +2950,11 @@
   }
   .modal-body {
     flex: 1;
+    min-height: 0;
     padding: var(--space-5);
-    overflow-y: auto;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
   }
   .modal-body::-webkit-scrollbar { width: 6px; }
   .modal-body::-webkit-scrollbar-track { background: transparent; }
@@ -3034,7 +3039,7 @@
   .repo-actions { display: flex; gap: var(--space-2); flex-shrink: 0; }
 
   /* Skill 库 */
-  .skill-library-search { margin-bottom: var(--space-4); }
+  .skill-library-search { margin-bottom: var(--space-4); flex-shrink: 0; }
   .skill-library-search input {
     width: 100%;
     height: var(--btn-height-lg);
@@ -3054,7 +3059,7 @@
     border-color: var(--primary);
     box-shadow: 0 0 0 3px rgba(var(--primary-rgb, 99, 102, 241), 0.15);
   }
-  .skill-library-list { max-height: 400px; overflow-y: auto; }
+  .skill-library-list { flex: 1; min-height: 0; overflow-y: auto; }
   .skill-library-list::-webkit-scrollbar { width: 6px; }
   .skill-library-list::-webkit-scrollbar-track { background: transparent; }
   .skill-library-list::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.15); border-radius: 3px; }

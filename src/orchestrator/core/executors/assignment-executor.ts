@@ -176,7 +176,9 @@ export class AssignmentExecutor {
 
     // 从 scope 收集
     if (assignment.scope?.targetPaths) {
-      assignment.scope.targetPaths.forEach(p => files.add(p));
+      assignment.scope.targetPaths
+        .filter((p): p is string => typeof p === 'string' && p.trim().length > 0)
+        .forEach(p => files.add(p.trim()));
     }
 
     // 从 todos 收集
@@ -184,7 +186,9 @@ export class AssignmentExecutor {
       assignment.todos.forEach(todo => {
         // WorkerTodo doesn't have targetFiles, collect from output if available
         if (todo.output?.modifiedFiles) {
-          todo.output.modifiedFiles.forEach((f: string) => files.add(f));
+          todo.output.modifiedFiles
+            .filter((f: unknown): f is string => typeof f === 'string' && f.trim().length > 0)
+            .forEach((f: string) => files.add(f.trim()));
         }
       });
     }

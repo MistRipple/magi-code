@@ -180,7 +180,7 @@
             文件变更
           </div>
           <ul class="file-list">
-            {#each card.changes as file}
+            {#each card.changes as file, i (file || i)}
               <li class="file-item">{file}</li>
             {/each}
           </ul>
@@ -193,7 +193,7 @@
             验证结果
           </div>
           <ul class="verification-list">
-            {#each card.verification as item}
+            {#each card.verification as item, i (item || i)}
               <li class="verification-item">{item}</li>
             {/each}
           </ul>

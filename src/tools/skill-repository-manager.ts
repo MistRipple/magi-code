@@ -520,6 +520,76 @@ export class SkillRepositoryManager {
   }
 
   /**
+   * 尝试直接从 skills/ 目录获取 SKILL.md 文件
+   * 支持没有 plugin.json 但有 skills/{skill-name}/SKILL.md 的仓库
+   * 为避免 GitHub API 速率限制，直接尝试常见的路径模式
+   */
+  private async tryFetchSkillsDirectory(
+    owner: string,
+    repo: string,
+    repositoryId: string
+  ): Promise<{ name: string; skills: SkillInfo[] } | null> {
+    const candidateBranches = ['main', 'master'];
+
+    // 常见的 skill 路径模式：skills/{repo-name}/SKILL.md
+    const commonPaths = [
+      `skills/${repo}`,           // skills/planning-with-files/
+      `skills/${repo.toLowerCase()}`,
+      repo,                        // 根目录下直接有 SKILL.md
+    ];
+
+    for (const branch of candidateBranches) {
+      const skills: SkillInfo[] = [];
+
+      for (const path of commonPaths) {
+        const skill = await this.fetchSkillFromDirectory(
+          owner,
+          repo,
+          branch,
+          repositoryId,
+          repo,
+          path
+        );
+        if (skill) {
+          skills.push(skill);
+          break; // 找到一个就够了
+        }
+      }
+
+      if (skills.length > 0) {
+        return { name: repo, skills };
+      }
+    }
+
+    // 如果常见路径都没找到，尝试使用 API 列出目录（可能会被速率限制）
+    for (const branch of candidateBranches) {
+      const skillsDir = await this.listRepoDir(owner, repo, 'skills');
+      if (!skillsDir) continue;
+
+      const skills: SkillInfo[] = [];
+      for (const item of skillsDir.filter((i: any) => i.type === 'dir')) {
+        const skill = await this.fetchSkillFromDirectory(
+          owner,
+          repo,
+          branch,
+          repositoryId,
+          repo,
+          `skills/${item.name}`
+        );
+        if (skill) {
+          skills.push(skill);
+        }
+      }
+
+      if (skills.length > 0) {
+        return { name: repo, skills };
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * 从 GitHub 仓库获取 Skills
    * 支持格式：https://github.com/owner/repo
    */
@@ -615,6 +685,16 @@ export class SkillRepositoryManager {
             }
           } catch (pluginError: any) {
             logger.warn('Failed to fetch Claude Code plugins', { error: pluginError.message }, LogCategory.TOOLS);
+          }
+
+          // 尝试直接从 skills/ 目录获取 SKILL.md
+          try {
+            const skillsDirData = await this.tryFetchSkillsDirectory(owner, repo, repositoryId);
+            if (skillsDirData) {
+              return skillsDirData;
+            }
+          } catch (skillsDirError: any) {
+            logger.warn('Failed to fetch skills directory', { error: skillsDirError.message }, LogCategory.TOOLS);
           }
 
           // 如果也不是 Claude Code 格式，抛出错误

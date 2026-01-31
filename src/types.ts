@@ -19,6 +19,7 @@ export type TaskCategory =
   | 'refactor'      // 代码重构
   | 'bugfix'        // Bug 修复
   | 'debug'         // 问题排查
+  | 'data_analysis' // 数据处理/分析
   | 'frontend'      // 前端开发
   | 'backend'       // 后端开发
   | 'test'          // 测试编写

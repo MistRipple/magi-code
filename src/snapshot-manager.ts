@@ -481,12 +481,15 @@ export class SnapshotManager {
     workerId: string,
     reason?: string
   ): FileSnapshot | null {
+    if (!filePath || typeof filePath !== 'string' || filePath.trim().length === 0) {
+      throw new Error('Snapshot filePath is required');
+    }
     const session = this.sessionManager.getCurrentSession();
     if (!session) return null;
 
     const absolutePath = path.isAbsolute(filePath)
       ? filePath
-      : path.join(this.workspaceRoot, filePath);
+      : path.join(this.workspaceRoot, filePath.trim());
 
     // 安全检查：防止路径遍历攻击
     const normalizedPath = path.normalize(absolutePath);
@@ -497,6 +500,9 @@ export class SnapshotManager {
     }
 
     const relativePath = path.relative(this.workspaceRoot, absolutePath);
+    if (!relativePath || relativePath === '.' || relativePath.trim().length === 0) {
+      throw new Error('Snapshot filePath must be a file within workspace');
+    }
 
     // 检查是否已有该文件的快照（同一 Todo）
     const existingSnapshot = session.snapshots.find(

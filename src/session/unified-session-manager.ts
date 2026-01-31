@@ -462,6 +462,10 @@ export class UnifiedSessionManager {
   addSnapshot(sessionId: string, snapshot: FileSnapshotMeta): void {
     const session = this.sessions.get(sessionId);
     if (session) {
+      if (!this.isValidSnapshotMeta(snapshot)) {
+        logger.error('会话.快照.非法_元数据', { sessionId, snapshot }, LogCategory.SESSION);
+        throw new Error('Invalid snapshot metadata');
+      }
       const existingIndex = session.snapshots.findIndex(s => s.filePath === snapshot.filePath);
       if (existingIndex !== -1) {
         const previous = session.snapshots[existingIndex];
@@ -626,6 +630,12 @@ export class UnifiedSessionManager {
   private normalizeSessionData(session: UnifiedSession): UnifiedSession {
     if (!session || typeof session !== 'object') return session;
     if (!Array.isArray(session.messages)) return session;
+    if (!Array.isArray(session.tasks)) {
+      session.tasks = [];
+    }
+    if (!Array.isArray(session.snapshots)) {
+      session.snapshots = [];
+    }
 
     const now = Date.now();
     session.messages = session.messages.map((msg: any) => {
@@ -647,7 +657,38 @@ export class UnifiedSessionManager {
       } as SessionMessage;
     });
 
+    const normalizedSnapshots: FileSnapshotMeta[] = [];
+    let removedSnapshots = 0;
+    for (const snapshot of session.snapshots) {
+      if (!this.isValidSnapshotMeta(snapshot)) {
+        removedSnapshots++;
+        continue;
+      }
+      normalizedSnapshots.push({
+        ...snapshot,
+        filePath: snapshot.filePath.trim(),
+      });
+    }
+    if (removedSnapshots > 0) {
+      logger.warn('会话.规范化.清理_非法快照', { sessionId: session.id, removed: removedSnapshots }, LogCategory.SESSION);
+    }
+    session.snapshots = normalizedSnapshots;
+
     return session;
+  }
+
+  private isValidSnapshotMeta(snapshot: FileSnapshotMeta | undefined | null): snapshot is FileSnapshotMeta {
+    if (!snapshot || typeof snapshot !== 'object') return false;
+    if (!snapshot.id || typeof snapshot.id !== 'string') return false;
+    if (!snapshot.filePath || typeof snapshot.filePath !== 'string' || snapshot.filePath.trim().length === 0) {
+      return false;
+    }
+    if (typeof snapshot.timestamp !== 'number') return false;
+    if (!snapshot.workerId || typeof snapshot.workerId !== 'string') return false;
+    if (!snapshot.missionId || typeof snapshot.missionId !== 'string') return false;
+    if (!snapshot.assignmentId || typeof snapshot.assignmentId !== 'string') return false;
+    if (!snapshot.todoId || typeof snapshot.todoId !== 'string') return false;
+    return true;
   }
 
   /** 备份损坏的会话文件 */

@@ -7,7 +7,9 @@
   const appState = getState();
 
   // 任务列表
-  const tasks = $derived(ensureArray(appState.tasks) as Task[]);
+  const tasks = $derived(
+    ensureArray(appState.tasks) as Task[]
+  );
   const missionPlan = $derived(appState.missionPlan);
   const workerSessions = $derived(appState.workerSessions);
   const workerSessionList = $derived(
@@ -71,7 +73,7 @@
     {:else}
       {#if tasks.length > 0}
         <div class="tasks-list">
-          {#each tasks as task}
+          {#each tasks as task (task.id || task)}
             <div class="task-item" class:completed={task.status === 'completed'} class:failed={task.status === 'failed'} class:cancelled={task.status === 'cancelled'}>
               <div class="task-status">
                 {#if task.status === 'running'}
@@ -122,7 +124,7 @@
       {#if missionPlan && missionPlan.assignments.length > 0}
         <div class="section-title">Worker Todo</div>
         <div class="assignment-list">
-          {#each missionPlan.assignments as assignment}
+          {#each (ensureArray(missionPlan.assignments) as any[]) as assignment (assignment.id || assignment)}
             {@const assignmentSessions = workerSessionList.filter((session) => session.assignmentId === assignment.id)}
             <div class="assignment-card">
               <div class="assignment-header">
@@ -136,7 +138,7 @@
               </div>
               {#if assignmentSessions.length > 0}
                 <div class="assignment-sessions">
-                  {#each assignmentSessions as session}
+                  {#each assignmentSessions as session (session.sessionId || session)}
                     <div class="session-chip" class:resumed={session.isResumed}>
                       <span class="session-label">Session {session.sessionId}</span>
                       {#if session.isResumed}
@@ -152,9 +154,9 @@
                   <div class="progress-bar" style="width: {assignment.progress}%"></div>
                 </div>
               {/if}
-              {#if assignment.todos.length > 0}
+              {#if ensureArray(assignment.todos).length > 0}
                 <div class="todo-list">
-                  {#each assignment.todos as todo}
+                  {#each (ensureArray(assignment.todos) as any[]) as todo (todo.id || todo)}
                     <div class="todo-item" class:completed={todo.status === 'completed'} class:failed={todo.status === 'failed'}>
                       <div class="todo-main">
                         <span class="todo-status status-{todo.status}">

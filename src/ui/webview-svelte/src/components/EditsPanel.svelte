@@ -8,7 +8,9 @@
   const appState = getState();
 
   // 变更列表
-  const edits = $derived(ensureArray(appState.edits) as Edit[]);
+  const edits = $derived(
+    ensureArray(appState.edits) as Edit[]
+  );
 
   function getContributors(edit: Edit): string[] {
     if (Array.isArray(edit?.contributors) && edit.contributors.length > 0) {
@@ -76,7 +78,7 @@
         <button class="action-btn revert-all" onclick={revertAllChanges}>全部还原</button>
       </div>
       <div class="edits-list">
-        {#each edits as edit}
+        {#each edits as edit (edit.filePath)}
           <div class="edit-item">
             <button class="edit-main" onclick={() => openFile(edit.filePath)}>
               <div class="edit-icon">
