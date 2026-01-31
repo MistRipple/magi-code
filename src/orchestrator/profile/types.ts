@@ -89,6 +89,7 @@ export type CategoryType =
   | 'refactor'
   | 'review'
   | 'feature'
+  | 'data_analysis'
   | 'test'
   | 'documentation'
   | 'optimization'

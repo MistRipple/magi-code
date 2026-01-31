@@ -50,6 +50,20 @@ export const DEFAULT_CATEGORIES_CONFIG: CategoriesConfig = {
       riskLevel: 'low',
     },
 
+    // 数据分析类
+    data_analysis: {
+      displayName: '数据分析',
+      description: '数据处理、脚本、统计、可视化',
+      keywords: [
+        '数据|分析|统计|可视化',
+        '脚本|ETL|清洗',
+        '报表|指标|图表',
+      ],
+      defaultWorker: 'codex',
+      priority: 'medium',
+      riskLevel: 'low',
+    },
+
     // 功能实现类
     implement: {
       displayName: '功能实现',
@@ -189,6 +203,7 @@ export const DEFAULT_CATEGORIES_CONFIG: CategoriesConfig = {
       'debug',
       'bugfix',
       'refactor',
+      'data_analysis',
       'backend',
       'frontend',
       'implement',
@@ -205,4 +220,3 @@ export const DEFAULT_CATEGORIES_CONFIG: CategoriesConfig = {
     },
   },
 };
-

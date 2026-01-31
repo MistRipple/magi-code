@@ -11,7 +11,10 @@
 
   let { messages }: Props = $props();
 
-  const filteredMessages = $derived(messages);
+  // 🛡️ 防御性编程：过滤无效的消息，防止 Svelte 5 "reading 'prev'" 错误
+  const safeMessages = $derived(
+    (messages || []).filter(m => !!m && !!m.id)
+  );
 
   // 滚动相关状态
   let contentEl: HTMLDivElement | null = $state(null);
@@ -46,7 +49,7 @@
 
   // 当 contentEl 绑定后立即滚动到底部
   $effect(() => {
-    if (contentEl && filteredMessages.length > 0 && !hasInitialScrolled) {
+    if (contentEl && safeMessages.length > 0 && !hasInitialScrolled) {
       // 等待 DOM 完全渲染
       tick().then(() => {
         setTimeout(() => {
@@ -60,7 +63,7 @@
   // 消息变化时自动滚动（如果用户没有手动滚动）
   let prevMessageCount = 0;
   $effect(() => {
-    const currentCount = filteredMessages.length;
+    const currentCount = safeMessages.length;
     // 只有消息数量增加时才自动滚动
     if (hasInitialScrolled && currentCount > prevMessageCount && contentEl && !isUserScrolling) {
       tick().then(() => {
@@ -73,13 +76,13 @@
 
 <div class="agent-tab">
   <div class="agent-content" bind:this={contentEl} onscroll={handleScroll}>
-    {#if filteredMessages.length === 0}
+    {#if safeMessages.length === 0}
       <div class="empty-state">
         <p>暂无输出</p>
       </div>
     {:else}
       <div class="message-list">
-        {#each filteredMessages as message (message.id)}
+        {#each safeMessages as message (message.id)}
           <MessageItem {message} />
         {/each}
       </div>

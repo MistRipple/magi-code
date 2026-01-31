@@ -19,21 +19,20 @@
 
 ### 1.2 关键区分：编排者回答 vs Worker 执行
 
+**核心逻辑：AI 决策 + 双信号校验**
+
+- 编排者可使用工具处理非代码请求（检索/总结/推理/规划）
+- **只有两类才派 Worker**：
+  1) `codeTask = true`（涉及代码/文件操作）
+  2) `profileCategory` 命中画像任务类型
+
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                     决策核心：是否涉及代码操作                         │
+│            决策核心：AI 输出 codeTask + profileCategory               │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  不涉及代码操作                    涉及代码操作                       │
-│  ──────────────                    ──────────────                   │
-│  • 知识问答                        • 代码修改                        │
-│  • 身份能力问询                    • 代码分析                        │
-│  • 简单问候                        • 文件创建/删除                   │
-│  • 生成文本/方案                   • 重构/优化代码                   │
-│  • 概念解释                        • Bug 修复                        │
-│         ↓                                ↓                          │
-│  编排者直接回答                    调用 Worker 执行                  │
-│  (executeAskMode)                  (QuickExecutor/MissionOrchestrator)│
+│  codeTask=false 且 profileCategory 为空 → 编排者直接回答               │
+│  codeTask=true  或 profileCategory 命中 → 调用 Worker 执行             │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -64,10 +63,10 @@
           ↓                   ↓                   ↓
    ┌─────────────┐    ┌──────────────┐    ┌──────────────┐
    │  ASK 模式   │    │ DIRECT/EXPLORE│    │  TASK 模式   │
-   │ 编排者回答  │    │   条件判断    │    │ 完整编排流程 │
+   │ 编排者回答  │    │   AI 路由判断 │    │ 完整编排流程 │
    └──────┬──────┘    └──────┬───────┘    └──────┬───────┘
           ↓                   ↓                   ↓
-   executeAskMode    hasCodeOperationIntent?   MissionOrchestrator
+   executeAskMode    decideWorkerNeedWithLLM   MissionOrchestrator
           ↓              ↓         ↓                   ↓
      直接回答        否:编排者  是:Worker         Worker 协作
                       回答       执行
@@ -132,43 +131,55 @@ if (intentResult.mode === IntentHandlerMode.ASK) {
 - "给我生成一个流程图"
 - "帮我写一个营销方案"
 
-### 4.2 DIRECT/EXPLORE 模式 (条件判断)
+### 4.2 DIRECT/EXPLORE 模式 (AI 路由判断)
 
 ```typescript
 // 代码位置: src/orchestrator/core/mission-driven-engine.ts
 if (intentResult.mode === IntentHandlerMode.DIRECT) {
-  const needsWorker = hasCodeOperationIntent(this.profileLoader, userPrompt);
-  if (needsWorker) {
-    // 涉及代码操作 → 调用 Worker 执行
-    const result = await this.executeQuickPath(userPrompt, mode, taskId, sessionId);
-  } else {
-    // 不涉及代码操作 → 编排者直接回答
-    const result = await this.executeAskMode(userPrompt, taskId, sessionId);
+  const decision = await this.decideWorkerNeedWithLLM(userPrompt, IntentHandlerMode.DIRECT);
+  if (!decision.needsWorker) {
+    // 编排者直接回答（可用工具）
+    return decision.directResponse ?? await this.executeAskMode(userPrompt, taskId, sessionId);
   }
+  // 需要 Worker → 快速执行
+  return await this.executeQuickPath(userPrompt, mode, taskId, sessionId);
 }
 ```
 
-**判断依据**: `hasCodeOperationIntent()` 函数
+**判断依据**：编排者 LLM 输出 JSON
 
-```typescript
-// 代码位置: src/orchestrator/profile/category-matcher.ts
-export function hasCodeOperationIntent(profileLoader, prompt): boolean {
-  // 遍历 categories.ts 中定义的所有任务分类关键词
-  // 匹配任何关键词 → 返回 true (涉及代码操作)
-  // 不匹配任何关键词 → 返回 false (不涉及代码操作)
+```json
+{
+  "codeTask": true/false,
+  "profileCategory": "命中的任务类型名称，未命中为空字符串",
+  "needsTooling": true/false,
+  "directResponse": "当不需要 Worker 时必须提供",
+  "reason": "简短判断理由"
 }
 ```
 
-**任务分类配置**: `src/orchestrator/profile/defaults/categories.ts`
+**派发规则（唯一正确路径）**：
+- `needsWorker = codeTask || profileCategory 命中`
+- 其余情况 → 编排者直接回答（可使用工具）
 
-| 分类 | 关键词示例 | 默认 Worker |
-| ---- | ---------- | ----------- |
-| architecture | 架构、设计、模块、重构 | claude |
-| backend | 后端、API、数据库 | claude |
-| frontend | 前端、UI、组件、页面 | gemini |
-| bugfix | 修复、bug、fix、错误 | codex |
-| test | 测试、test、单元测试 | codex |
-| refactor | 重构、优化、改进 | claude |
+**画像任务类型列表**（来源：`src/orchestrator/profile/defaults/categories.ts`）
+
+| 类型 | 显示名 | 描述 | 默认 Worker |
+| --- | --- | --- | --- |
+| architecture | 架构设计 | 系统架构、模块设计、接口定义 | claude |
+| backend | 后端开发 | API 实现、数据库、服务端逻辑 | claude |
+| frontend | 前端开发 | UI 组件、页面、样式、交互 | gemini |
+| implement | 功能实现 | 实现新功能、编写业务逻辑 | codex |
+| refactor | 代码重构 | 优化代码结构、提升可维护性 | claude |
+| bugfix | Bug 修复 | 问题修复、错误处理 | codex |
+| debug | 问题排查 | 调试、问题定位、日志分析 | claude |
+| data_analysis | 数据分析 | 数据处理、脚本、统计、可视化 | codex |
+| test | 测试编写 | 单元测试、集成测试 | codex |
+| document | 文档编写 | README、注释、API 文档 | gemini |
+| review | 代码审查 | 代码审查、质量检查 | claude |
+| general | 通用任务 | 其他未分类任务 | claude |
+| integration | 集成联调 | 跨模块集成、接口对接 | claude |
+| simple | 简单任务 | 小修改、格式调整 | codex |
 
 ### 4.3 TASK 模式 (完整编排流程)
 
@@ -292,9 +303,9 @@ flowchart TB
     end
 
     subgraph DirectExplorePath["⚡ 快速路径 (条件判断)"]
-        E -->|DIRECT/EXPLORE| G1{hasCodeOperationIntent?}
-        G1 -->|否: 不涉及代码| G2[executeAskMode]
-        G1 -->|是: 涉及代码| G4[executeQuickPath]
+        E -->|DIRECT/EXPLORE| G1{LLM 路由判断}
+        G1 -->|不需要 Worker| G2[executeAskMode]
+        G1 -->|需要 Worker| G4[executeQuickPath]
         G4 --> G5[QuickExecutor → Worker]
     end
 
@@ -348,6 +359,7 @@ flowchart TB
 - [ ] 无硬编码的 Worker 名称作为选择逻辑
 - [ ] 所有 Worker 选择来自 ProfileLoader
 - [ ] Worker 不可用时从画像配置获取替代
+- [ ] DIRECT/EXPLORE 路由由 LLM 决策（codeTask/profileCategory）
 
 ### 9.3 消息路由
 
@@ -362,5 +374,3 @@ flowchart TB
 | 版本 | 日期 | 变更 |
 |------|------|------|
 | 1.0 | 2025-01-31 | 初始版本：完整编排流程规范 |
-
-

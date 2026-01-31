@@ -142,6 +142,16 @@ export class UnifiedMessageBus extends EventEmitter {
     const now = Date.now();
     const existingState = this.messageStates.get(id);
 
+    if (existingState && lifecycle === MessageLifecycle.STARTED) {
+      logger.warn('消息总线.重复_START', {
+        id,
+        source: message.source,
+        agent: message.agent,
+        lifecycle,
+      }, LogCategory.SYSTEM);
+      return false;
+    }
+
     // 🔧 新增：对于非流式消息，检查内容重复
     // 状态消息(isStatusMessage)和进度消息(PROGRESS)不参与内容去重
     const isStatusMessage = message.metadata?.isStatusMessage === true;
@@ -181,6 +191,12 @@ export class UnifiedMessageBus extends EventEmitter {
 
     // 3. 已完成的消息：不再发送
     if (existingState.completed) {
+      logger.warn('消息总线.重复_完成', {
+        id,
+        source: message.source,
+        agent: message.agent,
+        lifecycle,
+      }, LogCategory.SYSTEM);
       this.debug('跳过消息 [COMPLETED]', id);
       return false;
     }
@@ -224,11 +240,13 @@ export class UnifiedMessageBus extends EventEmitter {
     const state = this.messageStates.get(update.messageId);
 
     if (!state) {
+      logger.warn('消息总线.更新缺少状态', { messageId: update.messageId }, LogCategory.SYSTEM);
       this.debug('跳过更新 [NO_STATE]', update.messageId);
       return false;
     }
 
     if (state.completed) {
+      logger.warn('消息总线.完成后更新', { messageId: update.messageId }, LogCategory.SYSTEM);
       this.debug('跳过更新 [COMPLETED]', update.messageId);
       return false;
     }

@@ -536,13 +536,24 @@ export class UniversalLLMClient extends BaseLLMClient {
       return message.content.some((block: any) => block?.type === 'tool_result');
     };
 
+    const isUserOrToolResult = (message?: LLMMessage): boolean => {
+      if (!message) {
+        return false;
+      }
+      if (message.role === 'user') {
+        return true;
+      }
+      return isToolResultUser(message);
+    };
+
     const sanitizeToolOrder = (inputMessages: LLMMessage[]): LLMMessage[] => {
       const cleaned: LLMMessage[] = [];
       for (let i = 0; i < inputMessages.length; i++) {
         const msg = inputMessages[i];
         if (msg.role === 'assistant' && hasToolUse(msg)) {
           const next = inputMessages[i + 1];
-          if (!next || !isToolResultUser(next)) {
+          const prev = cleaned[cleaned.length - 1];
+          if (!next || !isToolResultUser(next) || !isUserOrToolResult(prev)) {
             continue;
           }
           cleaned.push(msg);

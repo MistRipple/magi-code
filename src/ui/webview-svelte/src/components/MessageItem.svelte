@@ -40,11 +40,7 @@
 
   // 获取 worker 信息（如果有）
   const worker = $derived(message.metadata?.worker || null);
-  const badgeWorker = $derived(
-    message.source === 'orchestrator'
-      ? 'orchestrator'
-      : (worker || message.source)
-  );
+  const badgeWorker = $derived(worker || (message.source === 'orchestrator' ? 'orchestrator' : message.source));
 
   // 检查是否是 subTaskCard 消息
   // Worker 的消息面板应该作为独立消息存在，不应被 orchestrator 面板包裹
@@ -205,9 +201,9 @@
     margin-top: var(--space-1);
   }
 
-  /* ===== SubTaskCard 独立样式（无外层包裹） ===== */
+  /* ===== SubTaskCard 独立样式（与 assistant 消息保持一致的间距） ===== */
   .message-item.subtask-card-only {
-    padding: var(--space-2) 0;
+    margin-right: var(--space-2);  /* 与 assistant 消息一致 */
   }
 
   /* ===== 助手消息样式 ===== */

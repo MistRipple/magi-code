@@ -188,6 +188,46 @@ ${resultsText}
 }
 
 // ============================================================================
+// Phase 0: 轻量路由判断 Prompt
+// ============================================================================
+
+/**
+ * 构建 Worker 需求判断 Prompt
+ * 由编排者 LLM 决策是否需要 Worker 执行
+ */
+export function buildWorkerNeedDecisionPrompt(
+  userPrompt: string,
+  recommendedMode: string,
+  categoryHints: string
+): string {
+  return `你是一个任务编排者，请判断用户请求是否需要 Worker 执行。
+
+## 用户请求
+${userPrompt}
+
+## 上游推荐模式
+${recommendedMode}
+
+## 画像任务类型（命中这些类型时需要 Worker）
+${categoryHints}
+
+## 判断要求
+1. **需要 Worker 的唯一条件**：'codeTask=true' 或 'profileCategory' 命中画像任务类型
+2. **不需要 Worker**：needsWorker=false，并给出 directResponse
+3. **编排者可使用工具**，但不应因此派发 Worker
+4. 只输出 JSON，不要任何解释或额外文本
+
+## 输出格式（严格 JSON）
+{
+  "codeTask": true/false,
+  "profileCategory": "命中的任务类型名称，未命中则为空字符串",
+  "needsTooling": true/false,
+  "directResponse": "当不需要 Worker 时必须提供",
+  "reason": "简短判断理由"
+}`;
+}
+
+// ============================================================================
 // 格式化函数
 // ============================================================================
 

@@ -20,6 +20,11 @@ export function classifyMessage(standard: StandardMessage): {
   const resolvedWorker = normalizeWorkerSlot(standard.agent) ?? normalizeWorkerSlot(meta?.worker);
   const dispatchToWorker = Boolean(meta?.dispatchToWorker);
   const hasSummaryCard = Boolean(meta?.subTaskCard);
+  const isStatusMessage = Boolean(meta?.isStatusMessage);
+
+  if (isStatusMessage && standard.type === MessageType.PROGRESS) {
+    return { category: MessageCategory.SYSTEM_PHASE };
+  }
 
   if (hasSummaryCard && standard.source === 'worker') {
     return { category: MessageCategory.TASK_SUMMARY_CARD, worker: resolvedWorker ?? undefined };

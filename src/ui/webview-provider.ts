@@ -4847,6 +4847,7 @@ ${originalPrompt}
       frontend: 'gemini',
       implement: 'claude',
       refactor: 'claude',
+      data_analysis: 'codex',
       test: 'codex',
       document: 'claude',
       general: 'claude',
@@ -4903,7 +4904,17 @@ ${originalPrompt}
         categories: {
           categories: {},
           rules: {
-            categoryPriority: ['architecture', 'integration', 'bugfix', 'backend', 'frontend', 'test', 'docs', 'simple'],
+            categoryPriority: [
+              'architecture',
+              'integration',
+              'bugfix',
+              'data_analysis',
+              'backend',
+              'frontend',
+              'test',
+              'docs',
+              'simple',
+            ],
             defaultCategory: 'simple',
             riskMapping: { high: 'fullPath', medium: 'standardPath', low: 'lightPath' },
           },

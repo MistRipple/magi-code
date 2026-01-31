@@ -296,6 +296,10 @@ export interface MessageMetadata {
   subTaskCard?: unknown;
   /** 扩展数据 */
   extra?: Record<string, unknown>;
+  /** 意图类型（ask/task 等） */
+  intent?: string;
+  /** 决策方式（llm/rule 等） */
+  decision?: string;
 }
 
 // ============================================================================

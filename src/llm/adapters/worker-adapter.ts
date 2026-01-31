@@ -268,12 +268,17 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    */
   private async executeToolCalls(toolCalls: ToolCall[]) {
     const results = [];
+    const maxToolResultChars = 20000;
 
     for (const toolCall of toolCalls) {
       try {
         logger.debug(`Executing tool: ${toolCall.name}`, { args: toolCall.arguments }, LogCategory.TOOLS);
 
         const result = await this.toolManager.execute(toolCall);
+        if (typeof result.content === 'string' && result.content.length > maxToolResultChars) {
+          const truncated = result.content.slice(0, maxToolResultChars);
+          result.content = `${truncated}\n...[truncated ${result.content.length - maxToolResultChars} chars]`;
+        }
         results.push(result);
 
         this.emit('toolResult', toolCall.name, result.content);
@@ -407,7 +412,8 @@ Always think step by step and use tools when appropriate.`;
 
       if (this.hasToolUse(msg)) {
         const next = this.conversationHistory[i + 1];
-        if (!this.isToolResultUser(next)) {
+        const prev = cleaned[cleaned.length - 1];
+        if (!this.isToolResultUser(next) || !this.isUserOrToolResult(prev)) {
           continue;
         }
         cleaned.push(msg);
@@ -427,6 +433,16 @@ Always think step by step and use tools when appropriate.`;
     }
 
     this.conversationHistory = cleaned;
+  }
+
+  private isUserOrToolResult(message?: LLMMessage): boolean {
+    if (!message) {
+      return false;
+    }
+    if (message.role === 'user') {
+      return true;
+    }
+    return this.isToolResultUser(message);
   }
 
   private hasToolUse(message?: LLMMessage): boolean {

@@ -461,8 +461,9 @@ export function initializeState() {
       resetPersistedState();
       return;
     }
-    currentTopTab = persisted.currentTopTab || 'thread';
-    currentBottomTab = persisted.currentBottomTab || 'thread';
+    // Tab 状态不持久化，每次打开都默认显示主对话 tab
+    currentTopTab = 'thread';
+    currentBottomTab = 'thread';
     threadMessages = ensureArray<Message>(persisted.threadMessages);
     agentOutputs = {
       claude: ensureArray<Message>(persisted.agentOutputs?.claude),

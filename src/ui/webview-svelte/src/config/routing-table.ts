@@ -7,7 +7,7 @@ export const ROUTING_TABLE: Record<MessageCategory, DisplayTarget | { location: 
   [MessageCategory.ORCHESTRATOR_PLAN]: { location: 'thread' },
   [MessageCategory.ORCHESTRATOR_SUMMARY]: { location: 'thread' },
   [MessageCategory.ORCHESTRATOR_THINKING]: { location: 'thread' },
-  [MessageCategory.WORKER_INSTRUCTION]: { location: 'both' },
+  [MessageCategory.WORKER_INSTRUCTION]: { location: 'worker' },
   [MessageCategory.WORKER_THINKING]: { location: 'worker' },
   [MessageCategory.WORKER_OUTPUT]: { location: 'worker' },
   [MessageCategory.WORKER_TOOL_USE]: { location: 'worker' },
