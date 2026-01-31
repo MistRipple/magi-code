@@ -15,7 +15,7 @@
 
   // 模型连接状态类型
   interface ModelStatus {
-    status: 'available' | 'disabled' | 'not_configured' | 'checking' | 'error';
+    status: 'available' | 'connected' | 'disabled' | 'not_configured' | 'checking' | 'error' | 'unavailable' | 'invalid_model' | 'auth_failed' | 'network_error' | 'timeout' | 'fallback';
     version?: string;
     model?: string;
     executions?: number;
@@ -221,7 +221,12 @@
     not_configured: '未配置',
     checking: '检测中...',
     error: '连接失败',
-    unavailable: '不可用'
+    unavailable: '不可用',
+    invalid_model: '模型不存在',
+    auth_failed: '鉴权失败',
+    network_error: '网络错误',
+    timeout: '连接超时',
+    fallback: '已降级（编排者）'
   };
 
   const categoryLabels: Record<string, string> = {
@@ -241,8 +246,11 @@
   function getStatusClass(status: string): string {
     if (status === 'available' || status === 'connected') return 'success';
     if (status === 'checking') return 'checking';
+    if (status === 'fallback') return 'warning';
     if (status === 'disabled' || status === 'not_configured') return 'disabled';
-    if (status === 'error' || status === 'unavailable') return 'error';
+    if (status === 'error' || status === 'unavailable' || status === 'invalid_model' || status === 'auth_failed' || status === 'network_error' || status === 'timeout') {
+      return 'error';
+    }
     return 'error';
   }
 
@@ -421,6 +429,7 @@
       }
     }, 2000);
   }
+
 
   function saveModelConfig(target: 'orch' | 'comp' | 'ace' | 'worker') {
     const key = target === 'worker' ? workerModelTab : target;
@@ -720,13 +729,6 @@
     // 状态清除由 skillInstalled 消息回调处理
   }
 
-  // 切换 Skill 启用状态
-  function toggleSkill(skill: SkillItem) {
-    // 内置工具已迁移到 ToolManager，不可通过此处切换
-    // 自定义工具和 Instruction skill 暂不支持切换
-    return;
-  }
-
   // 删除 Skill
   function deleteSkill(skill: SkillItem) {
     if (skill.source === 'custom') {
@@ -754,7 +756,7 @@
   );
 
   // 按仓库分组
-  let skillsByRepo = $derived(() => {
+  let skillsByRepo = $derived.by(() => {
     const groups: Record<string, { name: string; skills: LibrarySkill[] }> = {};
     for (const skill of filteredLibrarySkills) {
       const repoId = skill.repositoryId || 'unknown';
@@ -949,9 +951,10 @@
           };
           testStatus.comp = 'success';
         } else {
+          const fallbackModel = message.fallbackModel || modelStatuses.orchestrator?.model;
           modelStatuses.compressor = {
-            status: 'error',
-            model: compConfig.model || modelStatuses.compressor?.model,
+            status: 'fallback',
+            model: fallbackModel ? `编排模型: ${fallbackModel}` : modelStatuses.compressor?.model,
             error: message.error
           };
           testStatus.comp = 'error';
@@ -1025,13 +1028,13 @@
         // 自定义工具
         if (Array.isArray(message.config?.customTools)) {
           for (const tool of message.config.customTools) {
-            skillList.push({ name: tool.name, description: tool.description || '', source: 'custom', enabled: true });
+            skillList.push({ name: tool.name, description: tool.description || '', source: 'custom' });
           }
         }
         // Instruction Skills
         if (Array.isArray(message.config?.instructionSkills)) {
           for (const skill of message.config.instructionSkills) {
-            skillList.push({ name: skill.name, description: skill.description || '', source: 'instruction', enabled: true });
+            skillList.push({ name: skill.name, description: skill.description || '', source: 'instruction' });
           }
         }
         skills = skillList;
@@ -1195,6 +1198,9 @@
                     <span class="model-connection-badge {statusClass}">{statusTexts[status?.status] || statusTexts['checking']}</span>
                   </div>
                   <div class="model-connection-model">{status?.model || '未配置'}</div>
+                  {#if status?.error}
+                    <div class="model-connection-error">{status.error}</div>
+                  {/if}
                   <div class="model-connection-stats-inline">
                     <span>任务: {workerStats?.totalExecutions ?? '--'}</span>
                     <span class="stats-divider">|</span>
@@ -1605,7 +1611,7 @@
         <!-- 全局任务分类配置 -->
         <div class="settings-section">
           <div class="settings-section-header">
-            <div class="settings-section-title">任务分类默认配置</div>
+            <div class="settings-section-title">任务分类配置</div>
           </div>
           <div class="settings-section-desc">配置存储：<code>~/.multicli/</code></div>
           <div class="profile-categories-grid">
@@ -1998,7 +2004,7 @@
               <p class="empty-state-hint">请先添加 Skill 仓库</p>
             </div>
           {:else}
-            {#each Object.entries(skillsByRepo()) as [_, repoData]}
+            {#each Object.entries(skillsByRepo) as [_, repoData]}
               <div class="skill-repo-group">
                 <div class="skill-repo-title">{repoData.name} ({repoData.skills.length} 个技能)</div>
                 {#each repoData.skills as skill}
@@ -2336,6 +2342,9 @@
   .model-connection-item.error {
     border-left: 3px solid var(--error);
   }
+  .model-connection-item.warning {
+    border-left: 3px solid var(--warning);
+  }
   .model-connection-item.disabled {
     border-left: 3px solid var(--foreground-muted);
     opacity: 0.6;
@@ -2394,6 +2403,14 @@
     text-overflow: ellipsis;
     margin-top: 2px;
   }
+  .model-connection-error {
+    font-size: var(--text-xs);
+    color: var(--error);
+    margin-top: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 
   .model-connection-stats-inline {
     display: flex;
@@ -2421,6 +2438,7 @@
 
   .model-connection-badge.success { background: var(--success-muted); color: var(--success); }
   .model-connection-badge.checking { background: var(--info-muted); color: var(--info); }
+  .model-connection-badge.warning { background: rgba(245, 158, 11, 0.15); color: var(--warning); }
   .model-connection-badge.disabled { background: var(--surface-3); color: var(--foreground-muted); }
   .model-connection-badge.error { background: var(--error-muted); color: var(--error); }
 
@@ -2478,7 +2496,7 @@
   .worker-dot.codex { background: var(--color-codex); }
   .worker-dot.gemini { background: var(--color-gemini); }
 
-  /* 兼容旧类名 - Worker Model Tabs 放在标题右侧 */
+  /* Worker Model Tabs - 放在标题右侧 */
   .worker-model-tabs { display: flex; gap: var(--space-2); }
   .worker-model-tab { display: flex; align-items: center; gap: var(--space-2); height: var(--btn-height-sm); padding: 0 var(--space-3); font-size: var(--text-sm); background: transparent; border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--foreground-muted); cursor: pointer; transition: all var(--transition-fast); }
   .worker-model-tab:hover { background: var(--surface-hover); color: var(--foreground); }

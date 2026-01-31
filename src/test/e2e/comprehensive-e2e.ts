@@ -23,7 +23,7 @@
  */
 
 import { LLMAdapterFactory } from '../../llm/adapter-factory';
-import { IntelligentOrchestrator } from '../../orchestrator/intelligent-orchestrator';
+import { MissionDrivenEngine } from '../../orchestrator/core';
 import { SnapshotManager } from '../../snapshot-manager';
 import { UnifiedSessionManager } from '../../session';
 import { UnifiedTaskManager } from '../../task/unified-task-manager';
@@ -68,7 +68,7 @@ class E2ETestHarness {
   private sessionManager: UnifiedSessionManager;
   private snapshotManager: SnapshotManager;
   private messageBus: UnifiedMessageBus;
-  private orchestrator: IntelligentOrchestrator | null = null;
+  private orchestrator: MissionDrivenEngine | null = null;
   private taskManager: UnifiedTaskManager | null = null;
   private contextManager: ContextManager | null = null;
   private knowledgeBase: ProjectKnowledgeBase | null = null;
@@ -130,20 +130,21 @@ class E2ETestHarness {
     this.contextManager.setProjectKnowledgeBase(this.knowledgeBase);
     await this.contextManager.initialize(session.id, session.name || 'E2E测试会话');
 
-    this.orchestrator = new IntelligentOrchestrator(
+    this.orchestrator = new MissionDrivenEngine(
       this.adapterFactory,
-      this.sessionManager,
-      this.snapshotManager,
-      this.workspaceRoot,
       {
+        timeout: 300000,
+        maxRetries: 3,
         review: { selfCheck: false, peerReview: 'never', maxRounds: 0 },
         planReview: { enabled: false },
         verification: { compileCheck: false, lintCheck: false, testCheck: false },
         integration: { enabled: false },
         strategy: { enableVerification: false, enableRecovery: false, autoRollbackOnFailure: false },
-      }
+      },
+      this.workspaceRoot,
+      this.snapshotManager,
+      this.sessionManager
     );
-    this.orchestrator.setTaskManager(this.taskManager, session.id);
 
     // 自动确认回调
     this.orchestrator.setConfirmationCallback(async () => true);
@@ -266,7 +267,7 @@ class E2ETestHarness {
     return this.adapterFactory;
   }
 
-  getOrchestrator(): IntelligentOrchestrator | null {
+  getOrchestrator(): MissionDrivenEngine | null {
     return this.orchestrator;
   }
 

@@ -6,7 +6,7 @@
 
 import { WorkerSlot } from '../../types';
 import { ProfileLoader } from '../profile/profile-loader';
-import { GuidanceInjector } from '../profile/guidance-injector';
+import { GuidanceInjector, TaskStructuredInfo } from '../profile/guidance-injector';
 import {
   Mission,
   Contract,
@@ -34,7 +34,11 @@ export class AssignmentManager {
   async createAssignments(
     mission: Mission,
     participants: WorkerSlot[],
-    contracts: Contract[]
+    contracts: Contract[],
+    options?: {
+      taskInfo?: TaskStructuredInfo;
+      additionalContext?: string;
+    }
   ): Promise<Assignment[]> {
     const assignments: Assignment[] = [];
 
@@ -42,7 +46,8 @@ export class AssignmentManager {
       const assignment = await this.createAssignmentForWorker(
         mission,
         participant,
-        contracts
+        contracts,
+        options
       );
       assignments.push(assignment);
     }
@@ -56,7 +61,11 @@ export class AssignmentManager {
   private async createAssignmentForWorker(
     mission: Mission,
     workerId: WorkerSlot,
-    contracts: Contract[]
+    contracts: Contract[],
+    options?: {
+      taskInfo?: TaskStructuredInfo;
+      additionalContext?: string;
+    }
   ): Promise<Assignment> {
     const profile = this.profileLoader.getProfile(workerId);
 
@@ -79,12 +88,17 @@ export class AssignmentManager {
       .map(c => c.id);
 
     // 生成引导 Prompt
-    const guidancePrompt = this.guidanceInjector.buildWorkerPrompt(profile, {
-      taskDescription: scope.includes.join('; '),
-      category: assignmentReason.profileMatch.category,
-      collaborators: contracts.length > 0 ? this.getCollaborators(contracts, workerId) : undefined,
-      featureContract: this.formatContracts(contracts, workerId),
-    });
+    const guidancePrompt = this.guidanceInjector.buildFullTaskPrompt(
+      profile,
+      {
+        taskDescription: scope.includes.join('; '),
+        category: assignmentReason.profileMatch.category,
+        collaborators: contracts.length > 0 ? this.getCollaborators(contracts, workerId) : undefined,
+        featureContract: this.formatContracts(contracts, workerId),
+      },
+      options?.additionalContext || mission.context,
+      options?.taskInfo
+    );
 
     const now = Date.now();
     return {

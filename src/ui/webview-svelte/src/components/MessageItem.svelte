@@ -4,10 +4,8 @@
   import MarkdownContent from './MarkdownContent.svelte';
   import StreamingIndicator from './StreamingIndicator.svelte';
   import WorkerBadge from './WorkerBadge.svelte';
-  import ThinkingBlock from './ThinkingBlock.svelte';
-  import ToolCall from './ToolCall.svelte';
-  import CodeBlock from './CodeBlock.svelte';
   import SubTaskSummaryCard from './SubTaskSummaryCard.svelte';
+  import BlockRenderer from './BlockRenderer.svelte';
   import Icon from './Icon.svelte';
 
   // Props
@@ -19,7 +17,17 @@
   // 派生状态
   const isUser = $derived(message.role === 'user');
   const isNotice = $derived(message.type === 'system-notice' || message.role === 'system');
+  const interactionMeta = $derived(message.metadata?.interaction as { prompt?: string; type?: string } | undefined);
+  const isInteraction = $derived(Boolean(interactionMeta));
   const isStreaming = $derived(message.isStreaming);
+
+  // 🛡️ 防御性编程：过滤无效的 blocks，防止 Svelte 5 "reading 'prev'" 错误
+  // 确保 loop 中只处理有效的 block 对象
+  const safeBlocks = $derived(
+    (message.blocks || []).filter((b): b is import('../types/message').ContentBlock =>
+      !!b && typeof b === 'object' && 'type' in b
+    )
+  );
 
   // 格式化时间戳
   function formatTime(timestamp: number): string {
@@ -32,13 +40,15 @@
 
   // 获取 worker 信息（如果有）
   const worker = $derived(message.metadata?.worker || null);
-
-  // 检查是否是纯 subTaskCard 消息（不需要外层包裹）
-  const isSubTaskCardOnly = $derived(
-    Boolean(message.metadata?.subTaskCard) &&
-    (!message.blocks || message.blocks.length === 0) &&
-    !message.content?.trim()
+  const badgeWorker = $derived(
+    message.source === 'orchestrator'
+      ? 'orchestrator'
+      : (worker || message.source)
   );
+
+  // 检查是否是 subTaskCard 消息
+  // Worker 的消息面板应该作为独立消息存在，不应被 orchestrator 面板包裹
+  const isSubTaskCardOnly = $derived(Boolean(message.metadata?.subTaskCard));
 
   // 通知类型和对应的图标/颜色（使用 Message 类型中的 noticeType）
   const noticeType = $derived(message.noticeType || 'info');
@@ -77,13 +87,13 @@
   </div>
 <!-- 用户消息：简洁显示 -->
 {:else if isUser}
-  <div class="message-item user" data-message-id={message.id}>
+  <div class="message-item user" data-message-id={message.id} data-source="user">
     <div class="user-content">{message.content}</div>
     <div class="user-time">{formatTime(message.timestamp)}</div>
   </div>
 <!-- subTaskCard 消息：直接显示卡片，不需要外层包裹 -->
 {:else if isSubTaskCardOnly}
-  <div class="message-item subtask-card-only" data-message-id={message.id}>
+  <div class="message-item subtask-card-only" data-message-id={message.id} data-source={message.source}>
     <SubTaskSummaryCard card={message.metadata?.subTaskCard as any} />
   </div>
 <!-- 助手消息：完整显示 -->
@@ -92,11 +102,13 @@
     class="message-item assistant"
     class:streaming={isStreaming}
     data-message-id={message.id}
+    data-source={message.source}
+    data-interaction={isInteraction ? 'true' : 'false'}
   >
     <div class="message-header">
       <div class="message-source">
         <!-- 只显示 WorkerBadge，不再重复显示 source-name -->
-        <WorkerBadge worker={worker || message.source} size="sm" />
+        <WorkerBadge worker={badgeWorker} size="sm" />
       </div>
       <div class="message-meta">
         <span class="message-time">{formatTime(message.timestamp)}</span>
@@ -113,39 +125,22 @@
         <SubTaskSummaryCard card={message.metadata.subTaskCard as any} />
       {/if}
 
-      {#if message.blocks && message.blocks.length > 0}
-        {#each message.blocks as block, i (i)}
-          {#if block.type === 'thinking'}
-            <ThinkingBlock
-              thinking={[{ content: block.thinking?.content || block.content || '' }]}
-              isStreaming={isStreaming && !block.thinking?.isComplete}
-              initialExpanded={false}
-            />
-          {:else if block.type === 'tool_call'}
-            <ToolCall
-              name={block.toolCall?.name || 'Tool'}
-              id={block.toolCall?.id}
-              input={block.toolCall?.arguments}
-              status={block.toolCall?.status}
-              output={block.toolCall?.result}
-              error={block.toolCall?.error}
-              duration={block.toolCall?.endTime && block.toolCall?.startTime ? block.toolCall.endTime - block.toolCall.startTime : undefined}
-            />
-          {:else if block.type === 'code'}
-            <CodeBlock
-              code={block.content || ''}
-              language={block.language || ''}
-              showLineNumbers={true}
-            />
-          {:else}
-            <MarkdownContent content={block.content || ''} {isStreaming} />
-          {/if}
+      {#if isInteraction && interactionMeta?.prompt}
+        <div class="interaction-inline">
+          <Icon name="sparkles" size={14} />
+          <span>{interactionMeta.prompt}</span>
+        </div>
+      {/if}
+
+      {#if !message.metadata?.subTaskCard && safeBlocks.length > 0}
+        {#each safeBlocks as block, i (block.id || `${message.id}-block-${i}`)}
+          <BlockRenderer {block} {isStreaming} />
         {/each}
-      {:else if message.content}
+      {:else if !message.metadata?.subTaskCard && message.content}
         <MarkdownContent content={message.content} {isStreaming} />
       {/if}
 
-      {#if isStreaming && (!message.blocks || message.blocks.length === 0)}
+      {#if isStreaming && safeBlocks.length === 0}
         <StreamingIndicator />
       {/if}
     </div>
@@ -225,6 +220,19 @@
     border: 1px solid var(--border);
     margin-right: var(--space-2);  /* 减少右边距，配合 MessageList 的 padding-right 调整 */
     transition: all var(--transition-fast);
+  }
+
+  .interaction-inline {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    margin-bottom: var(--space-2);
+    border-radius: var(--radius-md);
+    background: var(--info-muted);
+    border: 1px solid color-mix(in srgb, var(--info) 40%, transparent);
+    font-size: var(--text-sm);
+    color: var(--foreground);
   }
   .message-item.streaming { border-color: var(--info); }
 

@@ -24,14 +24,10 @@ export const TYPES = {
   SnapshotManager: Symbol.for('SnapshotManager'),
   TaskManager: Symbol.for('TaskManager'),
 
-  // 编排器
+  // 编排器（MissionExecutor 已合并到 MissionOrchestrator）
   MissionOrchestrator: Symbol.for('MissionOrchestrator'),
-  MissionExecutor: Symbol.for('MissionExecutor'),
 
   // Worker 相关
   ProfileLoader: Symbol.for('ProfileLoader'),
   GuidanceInjector: Symbol.for('GuidanceInjector'),
-
-  // 适配器（已迁移到 LLMAdapterFactory）
-  // CLIAdapterFactory: Symbol.for('CLIAdapterFactory'), // ⚠️ 已废弃，使用 LLMAdapterFactory
 };

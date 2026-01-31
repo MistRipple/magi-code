@@ -9,6 +9,7 @@ import {
   updateThreadMessage,
   addAgentMessage,
   updateAgentMessage,
+  removeAgentMessage,
   setIsProcessing,
   setCurrentSessionId,
   updateSessions,
@@ -17,10 +18,19 @@ import {
   clearAllMessages,
   setThreadMessages,
   setAgentOutputs,
+  removeThreadMessage,
+  setWaveState,
+  updateWaveProgress,
+  addWorkerSession,
+  updateWorkerSession,
 } from '../stores/messages.svelte';
-import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo } from '../types/message';
+import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WaveState, WorkerSessionState } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
+import { MessageType } from '../../../../protocol/message-protocol';
+import { routeStandardMessage, getMessageTarget, clearMessageTargets } from './message-router';
+import { normalizeWorkerSlot } from './message-classifier';
 import { ensureArray } from './utils';
+import { resolvePhaseStep } from '../config/phase-map';
 
 // 生成唯一 ID
 function generateId(): string {
@@ -130,6 +140,10 @@ function handleMessage(message: WebviewMessage) {
       handleMissionPlanned(message);
       break;
 
+    case 'assignmentPlanned':
+      handleAssignmentPlanned(message);
+      break;
+
     case 'assignmentStarted':
       handleAssignmentStarted(message);
       break;
@@ -158,7 +172,33 @@ function handleMessage(message: WebviewMessage) {
       handleTodoApprovalRequested(message);
       break;
 
+    // ============ Wave 执行事件（提案 4.6） ============
+    case 'waveExecutionStarted':
+      handleWaveExecutionStarted(message);
+      break;
+
+    case 'waveStarted':
+      handleWaveStarted(message);
+      break;
+
+    case 'waveCompleted':
+      handleWaveCompleted(message);
+      break;
+
+    // ============ Worker Session 事件（提案 4.1） ============
+    case 'workerSessionCreated':
+      handleWorkerSessionCreated(message);
+      break;
+
+    case 'workerSessionResumed':
+      handleWorkerSessionResumed(message);
+      break;
+
     // ============ 系统通知类消息 ============
+    case 'workerStatusUpdate':
+      handleWorkerStatusUpdate(message);
+      break;
+
     case 'workerStatusChanged':
       addSystemMessage((message.worker as string) + ' 状态已更新', 'info');
       break;
@@ -172,6 +212,7 @@ function handleMessage(message: WebviewMessage) {
       break;
 
     case 'interactionModeChanged':
+      getState().interactionMode = (message.mode as string) === 'ask' ? 'ask' : 'auto';
       addSystemMessage('已切换到 ' + getModeDisplayName(message.mode as string) + ' 模式', 'info');
       break;
 
@@ -183,6 +224,16 @@ function handleMessage(message: WebviewMessage) {
 
     case 'workerFallbackNotice':
       addSystemMessage(`${message.originalWorker} 降级到 ${message.fallbackWorker}: ${message.reason}`, 'warning');
+      break;
+
+    case 'missionExecutionFailed':
+      addSystemMessage((message.error as string) || '任务执行失败', 'error');
+      setIsProcessing(false);
+      break;
+
+    case 'missionFailed':
+      addSystemMessage((message.error as string) || '任务失败', 'error');
+      setIsProcessing(false);
       break;
 
     case 'toast':
@@ -252,6 +303,11 @@ function handleStateUpdate(message: WebviewMessage) {
   } else if (typeof state.isProcessing === 'boolean') {
     setIsProcessing(state.isProcessing);
   }
+
+  if (typeof state.interactionMode === 'string') {
+    const store = getState();
+    store.interactionMode = state.interactionMode === 'ask' ? 'ask' : 'auto';
+  }
 }
 
 
@@ -262,49 +318,81 @@ function handleStandardMessage(message: WebviewMessage) {
   if (!uiMessage.isStreaming && !hasRenderableContent(uiMessage)) {
     return;
   }
-  const target = resolveMessageTarget(standard);
-  const existingLocation = findMessageLocation(uiMessage.id);
-  if (existingLocation) {
-    if (existingLocation.location === 'thread') {
-      updateThreadMessage(uiMessage.id, uiMessage);
-    } else {
-      updateAgentMessage(existingLocation.agent, uiMessage.id, uiMessage);
-    }
+  const target = routeStandardMessage(standard);
+  if (target.location === 'none' || target.location === 'task') {
     return;
   }
   if (target.location === 'thread') {
     addThreadMessage(uiMessage);
-  } else {
-    addAgentMessage(target.agent, uiMessage);
+  } else if (target.location === 'worker') {
+    addAgentMessage(target.worker, uiMessage);
+  } else if (target.location === 'both') {
+    addThreadMessage(uiMessage);
+    addAgentMessage(target.worker, uiMessage);
   }
 }
 
 function handleStandardUpdate(message: WebviewMessage) {
   const update = message.update as StreamUpdate;
   if (!update?.messageId) return;
-  const location = findMessageLocation(update.messageId);
+  const location = getMessageTarget(update.messageId);
   if (!location) return;
+  if (location.location === 'none' || location.location === 'task') {
+    return;
+  }
   if (location.location === 'thread') {
     const existing = getState().threadMessages.find(m => m.id === update.messageId);
-    if (!existing) return;
-    updateThreadMessage(update.messageId, applyStreamUpdate(existing, update));
-  } else {
-    const existing = getState().agentOutputs[location.agent].find(m => m.id === update.messageId);
-    if (!existing) return;
-    updateAgentMessage(location.agent, update.messageId, applyStreamUpdate(existing, update));
+    if (existing) {
+      updateThreadMessage(update.messageId, applyStreamUpdate(existing, update));
+    }
+    return;
+  }
+  if (location.location === 'worker') {
+    const existing = getState().agentOutputs[location.worker].find(m => m.id === update.messageId);
+    if (existing) {
+      updateAgentMessage(location.worker, update.messageId, applyStreamUpdate(existing, update));
+    }
+    return;
+  }
+  if (location.location === 'both') {
+    const threadExisting = getState().threadMessages.find(m => m.id === update.messageId);
+    if (threadExisting) {
+      updateThreadMessage(update.messageId, applyStreamUpdate(threadExisting, update));
+    }
+    const agentExisting = getState().agentOutputs[location.worker].find(m => m.id === update.messageId);
+    if (agentExisting) {
+      updateAgentMessage(location.worker, update.messageId, applyStreamUpdate(agentExisting, update));
+    }
   }
 }
 
 function handleStandardComplete(message: WebviewMessage) {
   const standard = message.message as StandardMessage;
   if (!standard) return;
-  const location = findMessageLocation(standard.id);
+  const location = getMessageTarget(standard.id);
   if (!location) return;
+  if (location.location === 'none' || location.location === 'task') {
+    return;
+  }
   const uiMessage = mapStandardMessage(standard);
+  if (!hasRenderableContent(uiMessage)) {
+    if (location.location === 'thread') {
+      removeThreadMessage(standard.id);
+    } else if (location.location === 'worker') {
+      removeAgentMessage(location.worker, standard.id);
+    } else if (location.location === 'both') {
+      removeThreadMessage(standard.id);
+      removeAgentMessage(location.worker, standard.id);
+    }
+    return;
+  }
   if (location.location === 'thread') {
     updateThreadMessage(standard.id, uiMessage);
-  } else {
-    updateAgentMessage(location.agent, standard.id, uiMessage);
+  } else if (location.location === 'worker') {
+    updateAgentMessage(location.worker, standard.id, uiMessage);
+  } else if (location.location === 'both') {
+    updateThreadMessage(standard.id, uiMessage);
+    updateAgentMessage(location.worker, standard.id, uiMessage);
   }
 }
 
@@ -328,32 +416,7 @@ function handlePhaseChanged(message: WebviewMessage) {
 }
 
 function mapPhaseToStep(phase: string): number {
-  const normalized = phase.toLowerCase();
-  switch (normalized) {
-    case 'clarifying':
-    case 'analyzing':
-      return 1;
-    case 'waiting_confirmation':
-      return 2;
-    case 'dispatching':
-    case 'monitoring':
-    case 'waiting_questions':
-    case 'waiting_worker_answer':
-      return 3;
-    case 'integrating':
-      return 4;
-    case 'verifying':
-      return 5;
-    case 'recovering':
-      return 6;
-    case 'summarizing':
-    case 'completed':
-    case 'failed':
-      return 7;
-    case 'idle':
-    default:
-      return 0;
-  }
+  return resolvePhaseStep(phase);
 }
 
 function handleSessionsUpdated(message: WebviewMessage) {
@@ -374,6 +437,7 @@ function handleSessionChanged(message: WebviewMessage) {
     // 如果是不同的会话，清空当前消息
     if (currentId !== newSessionId) {
       clearAllMessages();
+      clearMessageTargets();
     }
 
     setCurrentSessionId(newSessionId);
@@ -388,6 +452,7 @@ function handleSessionSummaryLoaded(message: WebviewMessage) {
 
   if (sessionId) {
     clearAllMessages();
+    clearMessageTargets();
     setCurrentSessionId(sessionId);
 
     // 如果有会话摘要，创建一个系统消息显示摘要
@@ -430,6 +495,7 @@ function handleSessionMessagesLoaded(message: WebviewMessage) {
   if (sessionId) {
     // 先清空当前消息
     clearAllMessages();
+    clearMessageTargets();
     setCurrentSessionId(sessionId);
 
     // 格式化消息的辅助函数
@@ -478,6 +544,11 @@ function handleToast(message: WebviewMessage) {
 
 function handleConfirmationRequest(message: WebviewMessage) {
   const store = getState();
+  if (store.interactionMode === 'auto') {
+    vscode.postMessage({ type: 'confirmPlan', confirmed: true });
+    setIsProcessing(true);
+    return;
+  }
   store.pendingConfirmation = {
     plan: message.plan,
     formattedPlan: message.formattedPlan as string | undefined,
@@ -487,6 +558,16 @@ function handleConfirmationRequest(message: WebviewMessage) {
 
 function handleRecoveryRequest(message: WebviewMessage) {
   const store = getState();
+  if (store.interactionMode === 'auto') {
+    const canRetry = Boolean(message.canRetry);
+    const canRollback = Boolean(message.canRollback);
+    const decision: 'retry' | 'rollback' | 'continue' = canRetry
+      ? 'retry'
+      : (canRollback ? 'rollback' : 'continue');
+    vscode.postMessage({ type: 'confirmRecovery', decision });
+    setIsProcessing(true);
+    return;
+  }
   store.pendingRecovery = {
     taskId: (message.taskId as string) || '',
     error: message.error,
@@ -498,6 +579,11 @@ function handleRecoveryRequest(message: WebviewMessage) {
 
 function handleQuestionRequest(message: WebviewMessage) {
   const store = getState();
+  if (store.interactionMode === 'auto') {
+    vscode.postMessage({ type: 'answerQuestions', answer: null });
+    setIsProcessing(true);
+    return;
+  }
   store.pendingQuestion = {
     questions: ensureArray<string>(message.questions),
     plan: message.plan,
@@ -507,6 +593,15 @@ function handleQuestionRequest(message: WebviewMessage) {
 
 function handleClarificationRequest(message: WebviewMessage) {
   const store = getState();
+  if (store.interactionMode === 'auto') {
+    vscode.postMessage({
+      type: 'answerClarification',
+      answers: null,
+      additionalInfo: null,
+    });
+    setIsProcessing(true);
+    return;
+  }
   store.pendingClarification = {
     questions: ensureArray<string>(message.questions),
     context: message.context as string | undefined,
@@ -518,6 +613,11 @@ function handleClarificationRequest(message: WebviewMessage) {
 
 function handleWorkerQuestionRequest(message: WebviewMessage) {
   const store = getState();
+  if (store.interactionMode === 'auto') {
+    vscode.postMessage({ type: 'answerWorkerQuestion', answer: null });
+    setIsProcessing(true);
+    return;
+  }
   store.pendingWorkerQuestion = {
     workerId: (message.workerId as string) || '',
     question: (message.question as string) || '',
@@ -529,6 +629,11 @@ function handleWorkerQuestionRequest(message: WebviewMessage) {
 
 function handleToolAuthorizationRequest(message: WebviewMessage) {
   const store = getState();
+  if (store.interactionMode === 'auto') {
+    vscode.postMessage({ type: 'toolAuthorizationResponse', allowed: true });
+    setIsProcessing(true);
+    return;
+  }
   store.pendingToolAuthorization = {
     toolName: (message.toolName as string) || '',
     toolArgs: message.toolArgs,
@@ -561,6 +666,28 @@ function handleMissionPlanned(message: WebviewMessage) {
   }));
   const plan: MissionPlan = { missionId, assignments: mappedAssignments };
   setMissionPlan(plan);
+}
+
+function handleAssignmentPlanned(message: WebviewMessage) {
+  const assignmentId = message.assignmentId as string;
+  const todos = ensureArray(message.todos).map((todo: any) => ({
+    id: todo.id,
+    assignmentId,
+    content: todo.content || '',
+    reasoning: todo.reasoning,
+    expectedOutput: todo.expectedOutput,
+    type: todo.type || 'implementation',
+    priority: typeof todo.priority === 'number' ? todo.priority : 3,
+    status: todo.status || 'pending',
+    outOfScope: Boolean(todo.outOfScope),
+    approvalStatus: todo.approvalStatus,
+    approvalNote: todo.approvalNote,
+  }));
+
+  updateAssignmentPlan(assignmentId, (assignment) => ({
+    ...assignment,
+    todos,
+  }));
 }
 
 function handleAssignmentStarted(message: WebviewMessage) {
@@ -643,74 +770,52 @@ function handleTodoApprovalRequested(message: WebviewMessage) {
 
 function mapStandardMessage(standard: StandardMessage): Message {
   const blocks = mapStandardBlocks(standard.blocks || []);
-  const content = blocksToContent(blocks);
+  const fallbackContent = standard.interaction?.prompt || '';
+  const content = blocksToContent(blocks) || fallbackContent;
   const isStreaming = standard.lifecycle === 'streaming' || standard.lifecycle === 'started';
   const isComplete = standard.lifecycle === 'completed';
-  const isSystemNotice = standard.type === 'system-notice';
+  const isSystemNotice = standard.type === MessageType.SYSTEM || standard.type === MessageType.ERROR;
+  const isErrorNotice = standard.type === MessageType.ERROR;
 
-  // 🔧 修复：确保 source 始终有有效值
-  // 优先级：agent > source > 默认值 'orchestrator'
-  // 注：agent 字段是必需的，但旧消息或某些路径可能遗漏，需要容错
-  const source = standard.agent || standard.source || 'orchestrator';
+  // 🔧 修复：明确区分消息来源与展示来源
+  // - 标准消息的 source 只可能是 orchestrator/worker
+  // - UI 需要展示具体 Worker 槽位（claude/codex/gemini）
+  // - 只有 worker 消息才显示 Worker 徽章
+  const originSource = standard.source;
+  const agentSlot = normalizeWorkerSlot(standard.agent);
+  const metaSlot = normalizeWorkerSlot((standard.metadata as { worker?: unknown } | undefined)?.worker);
+  const resolvedWorker = agentSlot ?? metaSlot ?? null;
+  const displaySource: Message['source'] =
+    originSource === 'orchestrator'
+      ? 'orchestrator'
+      : (resolvedWorker ?? 'orchestrator');
+
+  const baseMetadata = { ...(standard.metadata || {}) } as Record<string, unknown>;
+  if (originSource !== 'worker' && baseMetadata.subTaskCard) {
+    delete baseMetadata.subTaskCard;
+  }
+
+  const dispatchToWorker = Boolean(baseMetadata.dispatchToWorker);
 
   return {
     id: standard.id,
     role: isSystemNotice ? 'system' : 'assistant',
-    source: source as Message['source'],
+    source: displaySource,
     content,
     blocks,
     timestamp: standard.timestamp || Date.now(),
     isStreaming,
     isComplete,
     type: isSystemNotice ? 'system-notice' : 'message',
-    noticeType: isSystemNotice ? 'info' : undefined,
-    metadata: { ...standard.metadata, worker: standard.agent || standard.source },
+    noticeType: isSystemNotice ? (isErrorNotice ? 'error' : 'info') : undefined,
+    metadata: {
+      ...baseMetadata,
+      interaction: standard.interaction,
+      worker: originSource === 'worker'
+        ? (resolvedWorker ?? undefined)
+        : (dispatchToWorker ? (resolvedWorker ?? undefined) : undefined),
+    },
   };
-}
-
-type MessageLocation = { location: 'thread' } | { location: 'agent'; agent: 'claude' | 'codex' | 'gemini' };
-
-/**
- * 消息路由规则：
- * - 带 subTaskCard 的消息 → 主对话区（任务完成摘要）
- * - agent 是 Worker 的消息 → Worker 面板（包括编排者的任务分配）
- * - orchestrator/system 消息 → 主对话区
- */
-function resolveMessageTarget(standard: StandardMessage): MessageLocation {
-  const agent = standard.agent;
-  const source = standard.source;
-  const hasSummaryCard = Boolean(standard.metadata && (standard.metadata as { subTaskCard?: unknown }).subTaskCard);
-  const isSystemNotice = standard.type === 'system-notice' || source === 'system' as string;
-
-  // 1. 任务摘要卡片、系统通知 → 主对话区
-  if (hasSummaryCard || isSystemNotice) {
-    return { location: 'thread' };
-  }
-
-  // 2. agent 是 Worker 的消息 → Worker 面板（包括编排者发给 Worker 的任务分配）
-  if (agent === 'claude' || agent === 'codex' || agent === 'gemini') {
-    return { location: 'agent', agent };
-  }
-
-  // 3. 其他编排器消息 → 主对话区
-  return { location: 'thread' };
-}
-
-/**
- * 查找消息位置
- */
-function findMessageLocation(messageId: string): MessageLocation | null {
-  const state = getState();
-  if (state.threadMessages.some(m => m.id === messageId)) {
-    return { location: 'thread' };
-  }
-  const agents: Array<'claude' | 'codex' | 'gemini'> = ['claude', 'codex', 'gemini'];
-  for (const agent of agents) {
-    if (state.agentOutputs[agent].some(m => m.id === messageId)) {
-      return { location: 'agent', agent };
-    }
-  }
-  return null;
 }
 
 function hasRenderableContent(message: Message): boolean {
@@ -723,6 +828,9 @@ function hasRenderableContent(message: Message): boolean {
         return Boolean(block.content && block.content.trim());
       }
       if (block.type === 'tool_call') {
+        return true;
+      }
+      if (block.type === 'file_change' || block.type === 'plan') {
         return true;
       }
       return false;
@@ -802,12 +910,32 @@ function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[] {
         };
       }
       case 'file_change': {
-        const summary = `文件变更: ${block.filePath} (${block.changeType})`;
-        return { type: 'text', content: summary };
+        return {
+          type: 'file_change',
+          content: '',
+          fileChange: {
+            filePath: block.filePath,
+            changeType: block.changeType,
+            additions: block.additions,
+            deletions: block.deletions,
+            diff: block.diff,
+          },
+        };
       }
       case 'plan': {
-        const formatted = formatPlanBlock(block);
-        return { type: 'text', content: formatted };
+        return {
+          type: 'plan',
+          content: '',
+          plan: {
+            goal: block.goal,
+            analysis: block.analysis,
+            constraints: block.constraints,
+            acceptanceCriteria: block.acceptanceCriteria,
+            riskLevel: block.riskLevel,
+            riskFactors: block.riskFactors,
+            rawJson: block.rawJson,
+          },
+        };
       }
       default:
         return { type: 'text', content: block.content || '' };
@@ -919,6 +1047,12 @@ function blocksToContent(blocks: ContentBlock[]): string {
     if (block.type === 'text' || block.type === 'code' || block.type === 'thinking') {
       if (block.content) textParts.push(block.content);
     }
+    if (block.type === 'file_change' && block.fileChange) {
+      textParts.push(`文件变更: ${block.fileChange.filePath} (${block.fileChange.changeType})`);
+    }
+    if (block.type === 'plan' && block.plan) {
+      textParts.push(formatPlanBlock(block.plan));
+    }
   }
   return textParts.join('\\n\\n');
 }
@@ -962,4 +1096,135 @@ function formatPlanBlock(block: any): string {
     parts.push(`风险因素:\\n- ${block.riskFactors.join('\\n- ')}`);
   }
   return parts.join('\\n\\n');
+}
+
+/**
+ * 处理 Worker 状态更新消息
+ * 将检测到的模型状态同步到全局 store，供 BottomTabs 等组件使用
+ */
+function handleWorkerStatusUpdate(message: WebviewMessage) {
+  const statuses = message.statuses as Record<string, { status: string; model?: string; error?: string }>;
+  if (!statuses) return;
+
+  const store = getState();
+  const statusMap: Record<string, string> = {};
+
+  // 将详细状态映射为简化状态（connected/unavailable）
+  for (const [worker, detail] of Object.entries(statuses)) {
+    if (detail.status === 'available') {
+      statusMap[worker] = 'connected';
+    } else if (detail.status === 'checking') {
+      // 检测中保持原状态
+      continue;
+    } else {
+      statusMap[worker] = 'unavailable';
+    }
+  }
+
+  // 更新全局 modelStatus
+  store.modelStatus = { ...store.modelStatus, ...statusMap };
+}
+
+// ============ Wave 执行事件处理（提案 4.6） ============
+
+function handleWaveExecutionStarted(message: WebviewMessage) {
+  const totalWaves = (message.totalWaves as number) || 0;
+  const waves = (message.waves as string[][]) || [];
+  const criticalPath = (message.criticalPath as string[]) || [];
+
+  const state: WaveState = {
+    currentWave: 0,
+    totalWaves,
+    waves,
+    criticalPath,
+    status: 'executing',
+  };
+
+  setWaveState(state);
+
+  // 添加系统通知
+  addSystemMessage(`开始 Wave 执行: ${totalWaves} 个 Wave`, 'info');
+}
+
+function handleWaveStarted(message: WebviewMessage) {
+  const waveIndex = (message.waveIndex as number) || 0;
+  const totalWaves = (message.totalWaves as number) || 0;
+
+  updateWaveProgress(waveIndex, 'executing');
+
+  // 添加系统通知
+  addSystemMessage(`Wave ${waveIndex + 1}/${totalWaves} 开始执行`, 'info');
+}
+
+function handleWaveCompleted(message: WebviewMessage) {
+  const waveIndex = (message.waveIndex as number) || 0;
+  const totalWaves = (message.totalWaves as number) || 0;
+  const completedCount = (message.completedCount as number) || 0;
+  const failedCount = (message.failedCount as number) || 0;
+
+  // 检查是否所有 Wave 都完成
+  const isLastWave = waveIndex >= totalWaves - 1;
+
+  if (isLastWave) {
+    updateWaveProgress(waveIndex, 'completed');
+  } else {
+    updateWaveProgress(waveIndex + 1, 'executing');
+  }
+
+  // 添加系统通知
+  const statusText = failedCount > 0
+    ? `成功 ${completedCount}, 失败 ${failedCount}`
+    : `成功 ${completedCount}`;
+  addSystemMessage(`Wave ${waveIndex + 1}/${totalWaves} 完成: ${statusText}`, failedCount > 0 ? 'warning' : 'success');
+}
+
+// ============ Worker Session 事件处理（提案 4.1） ============
+
+function handleWorkerSessionCreated(message: WebviewMessage) {
+  const sessionId = (message.sessionId as string) || '';
+  const assignmentId = (message.assignmentId as string) || '';
+  const workerId = (message.workerId as string) || '';
+
+  if (!sessionId) return;
+
+  const session: WorkerSessionState = {
+    sessionId,
+    assignmentId,
+    workerId,
+    isResumed: false,
+    completedTodos: 0,
+  };
+
+  addWorkerSession(session);
+}
+
+function handleWorkerSessionResumed(message: WebviewMessage) {
+  const sessionId = (message.sessionId as string) || '';
+  const assignmentId = (message.assignmentId as string) || '';
+  const completedTodos = (message.completedTodos as number) || 0;
+
+  if (!sessionId) return;
+
+  // 更新现有 session 或创建新的
+  const store = getState();
+  const existing = store.workerSessions.get(sessionId);
+
+  if (existing) {
+    updateWorkerSession(sessionId, {
+      isResumed: true,
+      completedTodos,
+    });
+  } else {
+    const session: WorkerSessionState = {
+      sessionId,
+      assignmentId,
+      workerId: (message.workerId as string) || '',
+      isResumed: true,
+      completedTodos,
+    };
+    addWorkerSession(session);
+  }
+
+  // 添加系统通知
+  addSystemMessage(`Session 已恢复，继续执行 ${completedTodos} 个已完成的 Todo`, 'info');
 }

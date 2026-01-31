@@ -14,8 +14,17 @@
   import { vscode } from './lib/vscode-bridge';
   import { getState, setCurrentTopTab, setIsProcessing } from './stores/messages.svelte';
 
+  type TopTabType = 'thread' | 'tasks' | 'edits' | 'knowledge';
+
   // 当前激活的顶部 Tab
   const appState = getState();
+
+  // 安全获取顶部 Tab（映射非顶部 Tab 到默认值）
+  const currentTopTab = $derived<TopTabType>(
+    ['thread', 'tasks', 'edits', 'knowledge'].includes(appState.currentTopTab as string)
+      ? (appState.currentTopTab as TopTabType)
+      : 'thread'
+  );
 
   // 设置面板是否打开
   let settingsOpen = $state(false);
@@ -34,8 +43,9 @@
   const pendingClarification = $derived(appState.pendingClarification);
   const pendingWorkerQuestion = $derived(appState.pendingWorkerQuestion);
   const pendingToolAuthorization = $derived(appState.pendingToolAuthorization);
+  const interactionMode = $derived(appState.interactionMode || 'auto');
 
-  function handleTabChange(tab: 'thread' | 'tasks' | 'edits' | 'knowledge') {
+  function handleTabChange(tab: TopTabType) {
     setCurrentTopTab(tab);
   }
 
@@ -45,10 +55,6 @@
 
   function closeSettings() {
     settingsOpen = false;
-  }
-
-  function openSkillPopup() {
-    skillPopupOpen = true;
   }
 
   function closeSkillPopup() {
@@ -123,17 +129,17 @@
   <Header onOpenSettings={openSettings} />
 
   <!-- 顶部 Tab 栏：对话/任务/变更/知识 -->
-  <TopTabs activeTopTab={appState.currentTopTab} onTabChange={handleTabChange} />
+  <TopTabs activeTopTab={currentTopTab} onTabChange={handleTabChange} />
 
   <!-- Tab 内容区域 -->
   <div class="tab-content-wrapper">
-    {#if appState.currentTopTab === 'thread'}
+    {#if currentTopTab === 'thread'}
       <ThreadPanel />
-    {:else if appState.currentTopTab === 'tasks'}
+    {:else if currentTopTab === 'tasks'}
       <TasksPanel />
-    {:else if appState.currentTopTab === 'edits'}
+    {:else if currentTopTab === 'edits'}
       <EditsPanel />
-    {:else if appState.currentTopTab === 'knowledge'}
+    {:else if currentTopTab === 'knowledge'}
       <KnowledgePanel />
     {/if}
   </div>
@@ -146,7 +152,7 @@
   <!-- 技能弹窗 -->
   <SkillPopup visible={skillPopupOpen} onClose={closeSkillPopup} />
 
-  {#if pendingConfirmation}
+  {#if pendingConfirmation && interactionMode === 'ask'}
     <div class="modal-overlay" role="presentation">
       <div class="modal-dialog plan-confirm-dialog" role="dialog" aria-modal="true" tabindex="-1">
         <div class="modal-header">
@@ -167,7 +173,7 @@
     </div>
   {/if}
 
-  {#if pendingRecovery}
+  {#if pendingRecovery && interactionMode === 'ask'}
     <div class="modal-overlay" role="presentation">
       <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
         <div class="modal-header">
@@ -188,7 +194,7 @@
     </div>
   {/if}
 
-  {#if pendingQuestion}
+  {#if pendingQuestion && interactionMode === 'ask'}
     <div class="modal-overlay" role="presentation">
       <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
         <div class="modal-header">
@@ -210,7 +216,7 @@
     </div>
   {/if}
 
-  {#if pendingClarification}
+  {#if pendingClarification && interactionMode === 'ask'}
     <div class="modal-overlay" role="presentation">
       <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
         <div class="modal-header">
@@ -235,7 +241,7 @@
     </div>
   {/if}
 
-  {#if pendingWorkerQuestion}
+  {#if pendingWorkerQuestion && interactionMode === 'ask'}
     <div class="modal-overlay" role="presentation">
       <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
         <div class="modal-header">
@@ -253,7 +259,7 @@
     </div>
   {/if}
 
-  {#if pendingToolAuthorization}
+  {#if pendingToolAuthorization && interactionMode === 'ask'}
     <div class="modal-overlay" role="presentation">
       <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
         <div class="modal-header">

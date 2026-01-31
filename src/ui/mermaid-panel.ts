@@ -1,11 +1,22 @@
 /**
  * MermaidPanel - Mermaid 图表独立面板
  * 在 VSCode Tab 页签中展示 Mermaid 图表
+ *
+ * 特性：
+ * - 完整的拖拽和缩放交互（与对话区域一致）
+ * - 持久化支持：重启 VS Code 后自动恢复
+ * - 样式与 Svelte 版本统一
  */
 
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+
+// 持久化存储的面板数据
+interface MermaidPanelState {
+  code: string;
+  title: string;
+}
 
 export class MermaidPanel {
   public static currentPanel: MermaidPanel | undefined;
@@ -35,6 +46,7 @@ export class MermaidPanel {
       MermaidPanel.currentPanel._title = title || 'Mermaid 图表';
       MermaidPanel.currentPanel._panel.reveal(column);
       MermaidPanel.currentPanel._update();
+      MermaidPanel.currentPanel._saveState();
       return;
     }
 
@@ -54,6 +66,27 @@ export class MermaidPanel {
     );
 
     MermaidPanel.currentPanel = new MermaidPanel(panel, extensionUri, code, title);
+    MermaidPanel.currentPanel._saveState();
+  }
+
+  /**
+   * 注册 Webview 序列化器（用于持久化恢复）
+   */
+  public static registerSerializer(context: vscode.ExtensionContext): void {
+    vscode.window.registerWebviewPanelSerializer(MermaidPanel.viewType, {
+      async deserializeWebviewPanel(webviewPanel: vscode.WebviewPanel, state: MermaidPanelState) {
+        // 恢复面板
+        if (state && state.code) {
+          webviewPanel.title = state.title || 'Mermaid 图表';
+          MermaidPanel.currentPanel = new MermaidPanel(
+            webviewPanel,
+            context.extensionUri,
+            state.code,
+            state.title
+          );
+        }
+      }
+    });
   }
 
   private constructor(
@@ -103,6 +136,20 @@ export class MermaidPanel {
       null,
       this._disposables
     );
+  }
+
+  /**
+   * 保存状态（用于持久化）
+   */
+  private _saveState(): void {
+    // 通过 webview state API 保存
+    this._panel.webview.postMessage({
+      type: 'saveState',
+      state: {
+        code: this._code,
+        title: this._title
+      }
+    });
   }
 
   /**
@@ -160,6 +207,7 @@ export class MermaidPanel {
 
   /**
    * 获取 webview HTML 内容
+   * 包含完整的拖拽、缩放交互（与 MermaidRenderer.svelte 一致）
    */
   private _getHtmlForWebview(): string {
     const webview = this._panel.webview;
@@ -176,9 +224,22 @@ export class MermaidPanel {
     :root {
       --bg: #1e1e1e;
       --fg: #e0e0e0;
+      --fg-muted: #888888;
       --border: #3c3c3c;
       --primary: #4a9eff;
-      --surface: #252526;
+      --info: #4a9eff;
+      --surface-1: rgba(255,255,255,0.02);
+      --surface-2: rgba(0,0,0,0.3);
+      --surface-hover: rgba(255,255,255,0.1);
+      --code-bg: rgba(0,0,0,0.3);
+      --radius-sm: 4px;
+      --radius-md: 8px;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --text-sm: 13px;
+      --text-xs: 11px;
     }
 
     * {
@@ -197,145 +258,298 @@ export class MermaidPanel {
       flex-direction: column;
     }
 
-    .toolbar {
+    /* 头部样式 - 与 MermaidRenderer.svelte 一致 */
+    .mermaid-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 8px 16px;
-      background: var(--surface);
+      padding: var(--space-2) var(--space-3);
+      background: var(--surface-2);
       border-bottom: 1px solid var(--border);
     }
 
-    .toolbar-left {
+    .header-left {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: var(--space-2);
+      color: var(--info);
+      overflow: hidden;
     }
 
-    .toolbar-title {
-      font-size: 14px;
+    .header-icon {
+      width: 14px;
+      height: 14px;
+      flex-shrink: 0;
+    }
+
+    .header-type {
+      font-size: var(--text-sm);
       font-weight: 500;
-      color: var(--primary);
+      flex-shrink: 0;
     }
 
-    .toolbar-actions {
-      display: flex;
-      gap: 8px;
+    .header-title {
+      font-size: var(--text-sm);
+      color: var(--fg);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
-    .btn {
+    .header-actions {
       display: flex;
       align-items: center;
       gap: 4px;
-      padding: 6px 12px;
-      background: transparent;
-      border: 1px solid var(--border);
-      color: var(--fg);
-      border-radius: 4px;
-      cursor: pointer;
-      font-size: 12px;
-      transition: all 0.15s;
+      flex-shrink: 0;
     }
 
-    .btn:hover {
-      background: rgba(74, 158, 255, 0.1);
-      border-color: var(--primary);
-    }
-
-    .btn-icon {
-      padding: 6px;
-      min-width: 32px;
-      justify-content: center;
-    }
-
-    .zoom-level {
-      font-size: 12px;
-      color: #888;
-      min-width: 50px;
-      text-align: center;
-    }
-
-    .diagram-container {
-      flex: 1;
-      overflow: auto;
+    .header-btn {
       display: flex;
       align-items: center;
       justify-content: center;
-      padding: 24px;
-      background: var(--bg);
+      width: 28px;
+      height: 28px;
+      background: transparent;
+      border: none;
+      color: var(--fg-muted);
+      cursor: pointer;
+      border-radius: var(--radius-sm);
+      transition: all 0.15s;
     }
 
-    .diagram-wrapper {
+    .header-btn:hover {
+      background: var(--surface-hover);
+      color: var(--fg);
+    }
+
+    /* 图表区域 - 与 MermaidRenderer.svelte 一致 */
+    .mermaid-content {
+      position: relative;
+      flex: 1;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: var(--space-4);
+      background: var(--code-bg);
+      cursor: grab;
+    }
+
+    .mermaid-content.dragging {
+      cursor: grabbing;
+    }
+
+    .svg-wrapper {
       transform-origin: center center;
-      transition: transform 0.15s ease-out;
+      transition: transform 0.05s ease-out;
+      user-select: none;
     }
 
-    .diagram-wrapper svg {
-      max-width: 100%;
+    .mermaid-content.dragging .svg-wrapper {
+      transition: none;
+    }
+
+    .svg-wrapper svg {
+      max-width: none;
       height: auto;
       display: block;
     }
 
+    /* Mermaid SVG 样式 */
+    .svg-wrapper .node rect,
+    .svg-wrapper .node circle,
+    .svg-wrapper .node ellipse,
+    .svg-wrapper .node polygon,
+    .svg-wrapper .node path {
+      fill: #2d2d2d;
+      stroke: #4a9eff;
+    }
+
+    .svg-wrapper .node .label,
+    .svg-wrapper .nodeLabel,
+    .svg-wrapper .label text,
+    .svg-wrapper text {
+      fill: #e0e0e0 !important;
+      color: #e0e0e0 !important;
+    }
+
+    .svg-wrapper .edgePath path,
+    .svg-wrapper .flowchart-link {
+      stroke: #888888;
+    }
+
+    .svg-wrapper .edgeLabel,
+    .svg-wrapper .edgeLabel text {
+      fill: #e0e0e0;
+      background-color: #2d2d2d;
+    }
+
+    .svg-wrapper .cluster rect {
+      fill: #1a1a1a;
+      stroke: #4a9eff;
+    }
+
+    .svg-wrapper marker path {
+      fill: #888888;
+    }
+
+    /* 浮动控制按钮 - 与 MermaidRenderer.svelte 完全一致 */
+    .floating-controls {
+      position: absolute;
+      bottom: var(--space-3);
+      left: var(--space-3);
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-1);
+    }
+
+    .control-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      background: var(--surface-2);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--border);
+      color: var(--fg-muted);
+      cursor: pointer;
+      border-radius: var(--radius-sm);
+      transition: all 0.15s;
+      font-size: 16px;
+    }
+
+    .control-btn:hover {
+      background: var(--surface-hover);
+      color: var(--fg);
+      border-color: var(--primary);
+    }
+
+    /* 右下角导出按钮 */
+    .export-controls {
+      position: absolute;
+      bottom: var(--space-3);
+      right: var(--space-3);
+      display: flex;
+      gap: var(--space-1);
+    }
+
+    .export-btn {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 6px 12px;
+      background: var(--surface-2);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--border);
+      color: var(--fg-muted);
+      cursor: pointer;
+      border-radius: var(--radius-sm);
+      transition: all 0.15s;
+      font-size: var(--text-xs);
+    }
+
+    .export-btn:hover {
+      background: var(--surface-hover);
+      color: var(--fg);
+      border-color: var(--primary);
+    }
+
+    /* 加载状态 */
     .loading {
       display: flex;
       flex-direction: column;
       align-items: center;
-      gap: 12px;
-      color: #888;
+      gap: var(--space-2);
+      color: var(--fg-muted);
+      font-size: var(--text-sm);
     }
 
     .spinner {
-      width: 32px;
-      height: 32px;
-      border: 3px solid var(--border);
+      width: 24px;
+      height: 24px;
+      border: 2px solid var(--border);
       border-top-color: var(--primary);
       border-radius: 50%;
       animation: spin 1s linear infinite;
     }
 
-    @keyframes spin {
-      to { transform: rotate(360deg); }
-    }
+    @keyframes spin { to { transform: rotate(360deg); } }
 
+    /* 错误状态 */
     .error {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--space-2);
+      padding: var(--space-4);
       color: #f44;
       text-align: center;
-      padding: 24px;
     }
 
-    .error pre {
-      margin-top: 12px;
-      padding: 12px;
+    .error-title {
+      font-weight: 500;
+      font-size: var(--text-sm);
+    }
+
+    .error-message {
+      font-family: 'Fira Code', 'SF Mono', Monaco, monospace;
+      font-size: var(--text-xs);
       background: rgba(255, 68, 68, 0.1);
-      border-radius: 4px;
-      font-size: 12px;
+      padding: var(--space-2);
+      border-radius: var(--radius-sm);
+      max-width: 100%;
       overflow-x: auto;
+      margin: 0;
     }
   </style>
 </head>
 <body>
-  <div class="toolbar">
-    <div class="toolbar-left">
-      <span class="toolbar-title" id="title">Mermaid 图表</span>
+  <!-- 头部 -->
+  <div class="mermaid-header">
+    <div class="header-left">
+      <svg class="header-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <line x1="6" y1="3" x2="6" y2="15"></line>
+        <circle cx="18" cy="6" r="3"></circle>
+        <circle cx="6" cy="18" r="3"></circle>
+        <path d="M18 9a9 9 0 0 1-9 9"></path>
+      </svg>
+      <span class="header-type" id="diagram-type">Mermaid</span>
+      <span class="header-title" id="title"></span>
     </div>
-    <div class="toolbar-actions">
-      <button class="btn btn-icon" id="zoom-out" title="缩小">−</button>
-      <span class="zoom-level" id="zoom-level">100%</span>
-      <button class="btn btn-icon" id="zoom-in" title="放大">+</button>
-      <button class="btn btn-icon" id="zoom-reset" title="重置">⟲</button>
-      <button class="btn" id="copy-svg">复制 SVG</button>
-      <button class="btn" id="export-svg">导出 SVG</button>
+    <div class="header-actions">
+      <button class="header-btn" id="copy-svg" title="复制 SVG">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+        </svg>
+      </button>
     </div>
   </div>
 
-  <div class="diagram-container" id="container">
-    <div class="loading">
-      <div class="spinner"></div>
-      <span>加载中...</span>
+  <!-- 图表区域 -->
+  <div class="mermaid-content" id="container">
+    <div class="loading" id="loading">
+      <span class="spinner"></span>
+      <span>渲染中...</span>
     </div>
   </div>
 
-  <div class="diagram-wrapper" id="wrapper" style="display: none;"></div>
+  <!-- SVG 容器 -->
+  <div class="svg-wrapper" id="wrapper" style="display: none;"></div>
+
+  <!-- 浮动控制按钮 -->
+  <div class="floating-controls" id="controls" style="display: none;">
+    <button class="control-btn" id="zoom-in" title="放大">+</button>
+    <button class="control-btn" id="zoom-out" title="缩小">−</button>
+    <button class="control-btn" id="zoom-reset" title="重置视图">↻</button>
+    <button class="control-btn" id="show-code" title="复制代码">{ }</button>
+  </div>
+
+  <!-- 导出按钮 -->
+  <div class="export-controls" id="export-controls" style="display: none;">
+    <button class="export-btn" id="export-svg">导出 SVG</button>
+  </div>
 
   <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js" nonce="${nonce}"></script>
   <script nonce="${nonce}">
@@ -343,9 +557,17 @@ export class MermaidPanel {
 
     // 状态
     let scale = 1;
+    let translateX = 0;
+    let translateY = 0;
+    let isDragging = false;
+    let dragStartX = 0;
+    let dragStartY = 0;
+    let initialTranslateX = 0;
+    let initialTranslateY = 0;
     let svgContent = '';
+    let currentCode = '';
 
-    // 初始化 Mermaid
+    // 初始化 Mermaid（与 MermaidRenderer.svelte 完全一致）
     mermaid.initialize({
       startOnLoad: false,
       theme: 'dark',
@@ -368,42 +590,105 @@ export class MermaidPanel {
         titleColor: '#ffffff',
         edgeLabelBackground: '#2d2d2d',
       },
+      flowchart: {
+        htmlLabels: true,
+        curve: 'basis',
+        nodeSpacing: 50,
+        rankSpacing: 50,
+      },
+      sequence: {
+        diagramMarginX: 20,
+        diagramMarginY: 20,
+        actorMargin: 50,
+        width: 150,
+        height: 65,
+      },
     });
 
     // 元素引用
     const container = document.getElementById('container');
     const wrapper = document.getElementById('wrapper');
-    const zoomLevel = document.getElementById('zoom-level');
+    const loading = document.getElementById('loading');
+    const controls = document.getElementById('controls');
+    const exportControls = document.getElementById('export-controls');
     const titleEl = document.getElementById('title');
+    const typeEl = document.getElementById('diagram-type');
 
-    // 缩放控制
-    function updateZoom() {
-      zoomLevel.textContent = Math.round(scale * 100) + '%';
-      wrapper.style.transform = 'scale(' + scale + ')';
+    // 更新变换
+    function updateTransform() {
+      wrapper.style.transform = 'translate(' + translateX + 'px, ' + translateY + 'px) scale(' + scale + ')';
     }
 
+    // 缩放控制
     document.getElementById('zoom-in').onclick = function() {
-      scale = Math.min(scale * 1.2, 3);
-      updateZoom();
+      scale = Math.min(scale * 1.2, 5);
+      updateTransform();
     };
 
     document.getElementById('zoom-out').onclick = function() {
       scale = Math.max(scale / 1.2, 0.3);
-      updateZoom();
+      updateTransform();
     };
 
     document.getElementById('zoom-reset').onclick = function() {
       scale = 1;
-      updateZoom();
+      translateX = 0;
+      translateY = 0;
+      updateTransform();
     };
+
+    // 复制代码
+    document.getElementById('show-code').onclick = function() {
+      if (currentCode) {
+        navigator.clipboard.writeText(currentCode).then(function() {
+          const btn = document.getElementById('show-code');
+          btn.innerHTML = '✓';
+          setTimeout(function() { btn.innerHTML = '{ }'; }, 1500);
+        });
+      }
+    };
+
+    // 拖拽控制
+    container.addEventListener('mousedown', function(e) {
+      isDragging = true;
+      dragStartX = e.clientX;
+      dragStartY = e.clientY;
+      initialTranslateX = translateX;
+      initialTranslateY = translateY;
+      container.classList.add('dragging');
+      e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', function(e) {
+      if (isDragging) {
+        translateX = initialTranslateX + (e.clientX - dragStartX);
+        translateY = initialTranslateY + (e.clientY - dragStartY);
+        updateTransform();
+      }
+    });
+
+    document.addEventListener('mouseup', function() {
+      isDragging = false;
+      container.classList.remove('dragging');
+    });
+
+    // 滚轮缩放
+    container.addEventListener('wheel', function(e) {
+      e.preventDefault();
+      const delta = e.deltaY > 0 ? 0.9 : 1.1;
+      scale = Math.min(Math.max(scale * delta, 0.3), 5);
+      updateTransform();
+    }, { passive: false });
 
     // 复制 SVG
     document.getElementById('copy-svg').onclick = async function() {
       if (svgContent) {
         try {
           await navigator.clipboard.writeText(svgContent);
-          this.textContent = '已复制!';
-          setTimeout(() => { this.textContent = '复制 SVG'; }, 2000);
+          this.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4a9eff" stroke-width="2"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+          setTimeout(() => {
+            this.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+          }, 2000);
         } catch (e) {
           console.error('复制失败:', e);
         }
@@ -417,25 +702,92 @@ export class MermaidPanel {
       }
     };
 
+    // 检测图表类型
+    function detectDiagramType(code) {
+      const typePatterns = [
+        [/^\\s*flowchart/mi, '流程图'],
+        [/^\\s*graph/mi, '流程图'],
+        [/^\\s*sequenceDiagram/mi, '时序图'],
+        [/^\\s*classDiagram/mi, '类图'],
+        [/^\\s*stateDiagram/mi, '状态图'],
+        [/^\\s*erDiagram/mi, 'ER 图'],
+        [/^\\s*gantt/mi, '甘特图'],
+        [/^\\s*pie/mi, '饼图'],
+        [/^\\s*journey/mi, '用户旅程'],
+        [/^\\s*gitGraph/mi, 'Git 图'],
+        [/^\\s*mindmap/mi, '思维导图'],
+        [/^\\s*timeline/mi, '时间线'],
+      ];
+
+      for (const [pattern, type] of typePatterns) {
+        if (pattern.test(code)) return type;
+      }
+      return 'Mermaid';
+    }
+
+    // 从代码中提取标题
+    function extractTitle(code) {
+      if (!code) return '';
+
+      // YAML frontmatter 格式
+      const yamlMatch = code.match(/^---\\s*\\n(?:.*\\n)*?title:\\s*(.+?)\\n(?:.*\\n)*?---/m);
+      if (yamlMatch) return yamlMatch[1].trim();
+
+      // accTitle 格式
+      const accMatch = code.match(/accTitle:\\s*(.+?)(?:\\n|$)/);
+      if (accMatch) return accMatch[1].trim();
+
+      // 注释格式
+      const commentMatch = code.match(/(?:flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie|mindmap|timeline).*?\\n\\s*%%\\s*(.+?)(?:\\n|$)/);
+      if (commentMatch) return commentMatch[1].trim();
+
+      // 思维导图根节点
+      const mindmapMatch = code.match(/^\\s*mindmap\\s*\\n\\s*root\\s*(?:\\(\\((.+?)\\)\\)|\\((.+?)\\)|\\[(.+?)\\]|(.+?)(?:\\n|$))/m);
+      if (mindmapMatch) {
+        const rootText = mindmapMatch[1] || mindmapMatch[2] || mindmapMatch[3] || mindmapMatch[4];
+        if (rootText) return rootText.trim();
+      }
+
+      // 流程图第一个节点
+      const flowchartMatch = code.match(/(?:flowchart|graph)\\s+(?:TD|TB|BT|RL|LR)\\s*\\n\\s*\\w+\\s*(?:\\[\\[(.+?)\\]\\]|\\[(.+?)\\]|\\(\\((.+?)\\)\\)|\\((.+?)\\)|\\{(.+?)\\})/m);
+      if (flowchartMatch) {
+        const nodeText = flowchartMatch[1] || flowchartMatch[2] || flowchartMatch[3] || flowchartMatch[4] || flowchartMatch[5];
+        if (nodeText) return nodeText.trim();
+      }
+
+      return '';
+    }
+
     // 渲染图表
     async function renderDiagram(code, title) {
-      if (title) {
-        titleEl.textContent = title;
+      currentCode = code;
+
+      // 如果没有传入标题，尝试从代码中提取
+      const displayTitle = title || extractTitle(code);
+      if (displayTitle) {
+        titleEl.textContent = displayTitle;
       }
+
+      typeEl.textContent = detectDiagramType(code);
 
       try {
         const id = 'mermaid-' + Date.now();
         const { svg } = await mermaid.render(id, code.trim());
         svgContent = svg;
 
-        container.innerHTML = '';
+        loading.style.display = 'none';
         wrapper.innerHTML = svg;
         wrapper.style.display = 'block';
         container.appendChild(wrapper);
+        controls.style.display = 'flex';
+        exportControls.style.display = 'flex';
 
-        updateZoom();
+        updateTransform();
+
+        // 保存状态用于持久化
+        vscode.setState({ code: code, title: title || '' });
       } catch (e) {
-        container.innerHTML = '<div class="error"><p>渲染失败</p><pre>' + escapeHtml(e.message || '未知错误') + '</pre></div>';
+        loading.innerHTML = '<div class="error"><span class="error-title">渲染失败</span><pre class="error-message">' + escapeHtml(e.message || '未知错误') + '</pre></div>';
         vscode.postMessage({ type: 'error', error: e.message || '未知错误' });
       }
     }
@@ -449,11 +801,19 @@ export class MermaidPanel {
       const message = event.data;
       if (message.type === 'setCode') {
         renderDiagram(message.code, message.title);
+      } else if (message.type === 'saveState') {
+        vscode.setState(message.state);
       }
     });
 
-    // 通知扩展已准备就绪
-    vscode.postMessage({ type: 'ready' });
+    // 尝试从保存的状态恢复
+    const previousState = vscode.getState();
+    if (previousState && previousState.code) {
+      renderDiagram(previousState.code, previousState.title);
+    } else {
+      // 通知扩展已准备就绪
+      vscode.postMessage({ type: 'ready' });
+    }
   </script>
 </body>
 </html>`;

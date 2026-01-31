@@ -1,7 +1,5 @@
 /**
  * Agent 类型系统
- *
- * 已完全替代原有的 CLIType，现在使用 LLM 模式
  */
 
 /**
@@ -54,6 +52,13 @@ export interface LLMConfig {
   provider: LLMProvider;
   /** 是否启用 */
   enabled: boolean;
+  /**
+   * 是否启用 extended thinking
+   * - true: 强制启用
+   * - false: 强制禁用
+   * - undefined: 自动检测（根据模型名称）
+   */
+  enableThinking?: boolean;
 }
 
 /**

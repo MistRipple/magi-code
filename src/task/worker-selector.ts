@@ -16,13 +16,8 @@ import {
   WorkerProfile,
   WorkerSelectionOptions,
   WorkerSelectionResult,
+  matchCategoryWithProfile,
 } from '../orchestrator/profile';
-import {
-  DEFAULT_CLAUDE_PROFILE,
-  DEFAULT_CODEX_PROFILE,
-  DEFAULT_GEMINI_PROFILE,
-  DEFAULT_CATEGORIES_CONFIG,
-} from '../orchestrator/profile/defaults';
 import {
   ConflictResolver,
   ConflictResolutionConfig,
@@ -128,33 +123,29 @@ export class WorkerSelector {
 
 
   private getCategoryConfig(category: TaskCategory) {
-    if (this.useProfileBasedSelection && this.profileLoader) {
-      const config = this.profileLoader.getCategory(category);
-      if (config) return config;
+    if (!this.useProfileBasedSelection || !this.profileLoader) {
+      throw new Error('WorkerSelector 未配置 ProfileLoader');
     }
-    return DEFAULT_CATEGORIES_CONFIG.categories[category];
+    const config = this.profileLoader.getCategory(category);
+    if (!config) {
+      throw new Error(`任务分类配置缺失: ${category}`);
+    }
+    return config;
   }
 
 
   private getCategoryRules() {
-    if (this.useProfileBasedSelection && this.profileLoader) {
-      return this.profileLoader.getCategoryRules();
+    if (!this.useProfileBasedSelection || !this.profileLoader) {
+      throw new Error('WorkerSelector 未配置 ProfileLoader');
     }
-    return DEFAULT_CATEGORIES_CONFIG.rules;
+    return this.profileLoader.getCategoryRules();
   }
 
   private getProfile(worker: WorkerSlot): WorkerProfile {
-    if (this.useProfileBasedSelection && this.profileLoader) {
-      return this.profileLoader.getProfile(worker);
+    if (!this.useProfileBasedSelection || !this.profileLoader) {
+      throw new Error('WorkerSelector 未配置 ProfileLoader');
     }
-    switch (worker) {
-      case 'codex':
-        return DEFAULT_CODEX_PROFILE;
-      case 'gemini':
-        return DEFAULT_GEMINI_PROFILE;
-      default:
-        return DEFAULT_CLAUDE_PROFILE;
-    }
+    return this.profileLoader.getProfile(worker);
   }
 
   /**
@@ -166,8 +157,10 @@ export class WorkerSelector {
 
     // 获取画像推荐
     const categoryConfig = this.getCategoryConfig(category);
-    const defaultGeneral = DEFAULT_CATEGORIES_CONFIG.categories.general?.defaultWorker || 'claude';
-    const profileRecommendation = (categoryConfig?.defaultWorker || defaultGeneral) as WorkerSlot;
+    if (!categoryConfig.defaultWorker) {
+      throw new Error(`任务分类未配置默认 Worker: ${category}`);
+    }
+    const profileRecommendation = categoryConfig.defaultWorker as WorkerSlot;
 
     const worker = userPreference || profileRecommendation;
     return {
@@ -227,8 +220,10 @@ export class WorkerSelector {
   selectByCategory(category: TaskCategory): WorkerSelection {
     // 如果有画像系统，使用画像配置的默认 Worker
     const categoryConfig = this.getCategoryConfig(category);
-    const defaultGeneral = DEFAULT_CATEGORIES_CONFIG.categories.general?.defaultWorker || 'claude';
-    const preferred = (categoryConfig?.defaultWorker || defaultGeneral) as WorkerSlot;
+    if (!categoryConfig.defaultWorker) {
+      throw new Error(`任务分类未配置默认 Worker: ${category}`);
+    }
+    const preferred = categoryConfig.defaultWorker as WorkerSlot;
     return {
       worker: preferred,
       degraded: false,
@@ -275,50 +270,14 @@ export class WorkerSelector {
    * 使用画像配置分类任务
    */
   private classifyWithProfile(taskDescription: string): { category: string; defaultWorker: WorkerSlot } {
-    const rules = this.getCategoryRules();
-    const categories = this.profileLoader?.getAllCategories();
-    const lowerDesc = taskDescription.toLowerCase();
-
-    let bestMatch: { category: string; score: number; defaultWorker: WorkerSlot } | null = null;
-
-    for (const categoryName of rules.categoryPriority) {
-      const config = categories?.get(categoryName) || DEFAULT_CATEGORIES_CONFIG.categories[categoryName];
-      if (!config) continue;
-
-      let score = 0;
-      for (const pattern of config.keywords) {
-        try {
-          const regex = new RegExp(pattern, 'i');
-          if (regex.test(lowerDesc)) {
-            score += 10;
-          }
-        } catch {
-          if (lowerDesc.includes(pattern.toLowerCase())) {
-            score += 5;
-          }
-        }
-      }
-
-      if (score > 0 && (!bestMatch || score > bestMatch.score)) {
-        bestMatch = {
-          category: categoryName,
-          score,
-          defaultWorker: config.defaultWorker as WorkerSlot,
-        };
-      }
+    if (!this.profileLoader) {
+      throw new Error('WorkerSelector 未配置 ProfileLoader');
     }
-
-    if (bestMatch) {
-      return { category: bestMatch.category, defaultWorker: bestMatch.defaultWorker };
+    const match = matchCategoryWithProfile(this.profileLoader, taskDescription);
+    if (!match.categoryConfig.defaultWorker) {
+      throw new Error(`任务分类未配置默认 Worker: ${match.category}`);
     }
-
-    // 回退到默认分类
-    const defaultCategory = rules.defaultCategory;
-    const defaultConfig = categories?.get(defaultCategory) || DEFAULT_CATEGORIES_CONFIG.categories[defaultCategory];
-    return {
-      category: defaultCategory,
-      defaultWorker: (defaultConfig?.defaultWorker || 'claude') as WorkerSlot,
-    };
+    return { category: match.category, defaultWorker: match.categoryConfig.defaultWorker as WorkerSlot };
   }
 
   /**
@@ -350,7 +309,12 @@ export class WorkerSelector {
   ): Map<WorkerSlot, number> {
     const scores = new Map<WorkerSlot, number>();
 
-    for (const workerType of ['claude', 'codex', 'gemini'] as WorkerSlot[]) {
+    // 从画像配置获取所有 Worker，而不是硬编码
+    const allWorkers = this.profileLoader
+      ? Array.from(this.profileLoader.getAllProfiles().keys())
+      : Array.from(this.availableWorkers);
+
+    for (const workerType of allWorkers) {
       // 排除指定的 Worker
       if (options.excludeWorkers?.includes(workerType)) {
         scores.set(workerType, -Infinity);
@@ -413,42 +377,6 @@ export class WorkerSelector {
 
       scores.set(workerType, score + successRateBonus + healthBonus);
     }
-  }
-
-  /**
-   * 回退选择（无画像时使用）
-   */
-  private fallbackSelection(
-    taskDescription: string,
-    options: WorkerSelectionOptions
-  ): WorkerSelectionResult {
-    // 简单关键词匹配
-    const desc = taskDescription.toLowerCase();
-    let worker: WorkerSlot = 'claude';
-    let category = 'general';
-
-    if (desc.includes('bug') || desc.includes('fix') || desc.includes('修复')) {
-      worker = 'codex';
-      category = 'bugfix';
-    } else if (desc.includes('前端') || desc.includes('ui') || desc.includes('页面')) {
-      worker = 'gemini';
-      category = 'frontend';
-    } else if (desc.includes('架构') || desc.includes('设计') || desc.includes('重构')) {
-      worker = 'claude';
-      category = 'architecture';
-    }
-
-    // 应用偏好
-    if (options.preferredWorker && !options.excludeWorkers?.includes(options.preferredWorker)) {
-      worker = options.preferredWorker;
-    }
-
-    return {
-      worker,
-      category,
-      score: 50,
-      reason: `基于关键词匹配选择 ${worker}`,
-    };
   }
 
   /**

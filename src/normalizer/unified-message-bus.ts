@@ -60,7 +60,7 @@ interface ContentDedupeRecord {
 export interface ProcessingState {
   isProcessing: boolean;
   source: MessageSource | null;
-  agent: string | null;  // ✅ 使用 agent 替代旧字段
+  agent: string | null;
   startedAt: number | null;
 }
 

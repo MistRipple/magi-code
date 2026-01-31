@@ -79,6 +79,12 @@ export class PlanningExecutor {
         contextSnapshot,
       });
 
+      assignment.todos = planResult.todos || [];
+      assignment.planningStatus = 'planned';
+      if (assignment.status === 'pending') {
+        assignment.status = 'ready';
+      }
+
       // PlanningResult returns todos directly, check warnings
       if (planResult.warnings.length > 0) {
         logger.warn(
@@ -121,6 +127,12 @@ export class PlanningExecutor {
         projectContext: options.projectContext,
         contextSnapshot,
       });
+
+      assignment.todos = planResult.todos || [];
+      assignment.planningStatus = 'planned';
+      if (assignment.status === 'pending') {
+        assignment.status = 'ready';
+      }
 
       // PlanningResult returns todos directly, check warnings
       if (planResult.warnings.length > 0) {

@@ -74,6 +74,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // 注册终端测试命令
   registerTerminalTest(context);
 
+  // 注册 Mermaid 面板序列化器（用于持久化恢复）
+  MermaidPanel.registerSerializer(context);
+
   logger.info('扩展.初始化.完成', undefined, LogCategory.SYSTEM);
 }
 

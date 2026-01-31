@@ -27,6 +27,7 @@ export class GeminiNormalizer extends BaseNormalizer {
   private inCodeBlock: boolean = false;
   private codeBlockLang: string = '';
   private jsonBuffer: string = '';
+  private static readonly THINKING_BLOCK_ID = 'gemini-thinking';
 
   constructor(config?: Partial<NormalizerConfig>) {
     super({
@@ -73,11 +74,27 @@ export class GeminiNormalizer extends BaseNormalizer {
 
   private processJsonData(context: ParseContext, data: Record<string, unknown>): StreamUpdate[] {
     const updates: StreamUpdate[] = [];
-    
+
     // 处理 Gemini 的 JSON 响应格式
     if (data.type === 'text' && typeof data.content === 'string') {
       context.pendingText += data.content;
       updates.push(this.createUpdate(context.messageId, 'append', { appendText: data.content }));
+    } else if (data.type === 'thinking' || data.type === 'reasoning') {
+      // 处理 thinking/reasoning 内容
+      const thinkingContent = (data.content as string) || (data.text as string) || '';
+      if (thinkingContent) {
+        if (context.pendingThinking === null) {
+          context.pendingThinking = '';
+        }
+        context.pendingThinking += thinkingContent;
+        updates.push(this.createUpdate(context.messageId, 'block_update', {
+          blocks: [{
+            type: 'thinking',
+            content: context.pendingThinking,
+            blockId: GeminiNormalizer.THINKING_BLOCK_ID,
+          }],
+        }));
+      }
     } else if (data.type === 'tool_call' || data.type === 'function_call') {
       // 后端统一序列化 input 为 JSON 字符串
       const rawInput = data.args || data.input;

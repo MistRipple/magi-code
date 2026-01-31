@@ -17,4 +17,4 @@ export {
 export { ProfileLoader } from './profile-loader';
 export { GuidanceInjector } from './guidance-injector';
 export { ProfileStorage, StoredProfileConfig } from './profile-storage';
-
+export * from './category-matcher';

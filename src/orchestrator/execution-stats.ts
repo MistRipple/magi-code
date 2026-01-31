@@ -328,13 +328,6 @@ export class ExecutionStats {
 
     try {
       const raw = this.context.globalState.get<any>(this.config.persistKey);
-      if (Array.isArray(raw)) {
-        // Legacy format: ExecutionRecord[]
-        this.records = raw;
-        this.saveToStorage();
-        logger.info('编排器.执行_统计.迁移.完成', { count: this.records.length }, LogCategory.ORCHESTRATOR);
-        return;
-      }
       if (raw && typeof raw === 'object' && Array.isArray(raw.records)) {
         this.records = raw.records;
         logger.info('编排器.执行_统计.加载.完成', { count: this.records.length }, LogCategory.ORCHESTRATOR);

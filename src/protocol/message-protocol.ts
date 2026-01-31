@@ -256,8 +256,20 @@ export interface StandardMessage {
 export interface MessageMetadata {
   /** 任务 ID */
   taskId?: string;
+  /** Mission ID */
+  missionId?: string;
   /** 子任务 ID */
   subTaskId?: string;
+  /** Assignment ID */
+  assignmentId?: string;
+  /** Todo ID */
+  todoId?: string;
+  /** 进度百分比 */
+  percentage?: number;
+  /** 修改的文件 */
+  modifiedFiles?: string[];
+  /** 新建的文件 */
+  createdFiles?: string[];
   /** 阶段 */
   phase?: string;
   /** 持续时间（毫秒） */
@@ -274,6 +286,14 @@ export interface MessageMetadata {
   adapterRole?: 'worker' | 'orchestrator';
   /** 🔧 标记为状态消息（区别于 LLM 对话响应，不参与内容去重） */
   isStatusMessage?: boolean;
+  /** 任务分配的目标 Worker（编排者消息） */
+  assignedWorker?: string;
+  /** 目标 Worker（用于路由到对应 Tab） */
+  worker?: string;
+  /** 是否派发给 Worker 的指令消息 */
+  dispatchToWorker?: boolean;
+  /** 子任务摘要卡片（主对话区展示） */
+  subTaskCard?: unknown;
   /** 扩展数据 */
   extra?: Record<string, unknown>;
 }

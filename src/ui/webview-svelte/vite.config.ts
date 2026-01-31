@@ -23,6 +23,8 @@ export default defineConfig({
     // 输出到 VS Code 扩展可以访问的目录
     outDir: '../../../out/webview',
     emptyOutDir: true,
+    // 提高 chunk 大小警告阈值（VS Code webview 场景下大文件可接受）
+    chunkSizeWarningLimit: 1500,
     rollupOptions: {
       input: {
         main: resolve(__dirname, 'index.html'),
@@ -32,6 +34,17 @@ export default defineConfig({
         entryFileNames: 'assets/[name].js',
         chunkFileNames: 'assets/[name].js',
         assetFileNames: 'assets/[name].[ext]',
+        // 手动分割大型依赖
+        manualChunks: {
+          // Mermaid 图表库（约 1.5MB）
+          mermaid: ['mermaid'],
+          // 代码高亮库
+          highlight: ['highlight.js'],
+          // Markdown 解析
+          markdown: ['marked'],
+          // Cytoscape 图形库
+          cytoscape: ['cytoscape'],
+        },
       },
     },
     // 生产环境不生成 sourcemap（VS Code webview CSP 限制）

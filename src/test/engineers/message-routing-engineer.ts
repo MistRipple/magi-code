@@ -139,13 +139,14 @@ class MessageRoutingEngineer implements TestEngineer {
     // 例如：stateUpdate 和 confirmationRequest 的顺序
     const providerPath = path.join(process.cwd(), 'src', 'ui', 'webview-provider.ts');
     const content = fs.readFileSync(providerPath, 'utf-8');
-    const hasQueue = content.includes('postMessageQueue') && content.includes('postMessageQueue =');
+    const hasQueue = (content.includes('postMessageQueue') && content.includes('postMessageQueue ='))
+      || (content.includes('WebviewMessageBus') && content.includes('webviewMessageBus'));
 
     if (!hasQueue) {
       issues.push({
         severity: 'low',
         category: '消息顺序',
-        description: '未检测到统一的消息队列，异步消息可能乱序',
+        description: '未检测到统一的消息队列或优先级消息总线，异步消息可能乱序',
         location: 'src/ui/webview-provider.ts',
         suggestedFix: '使用消息队列或序列号确保顺序'
       });

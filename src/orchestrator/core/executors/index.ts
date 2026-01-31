@@ -28,3 +28,13 @@ export {
   ExecutionOptions,
   ExecutionResult,
 } from './execution-coordinator';
+export {
+  TaskPreAnalyzer,
+  TaskComplexity,
+  ExecutionStrategy,
+  PreAnalysisOptions,
+} from './task-pre-analyzer';
+export {
+  OrchestratorResponder,
+  ResponderOptions,
+} from './orchestrator-responder';

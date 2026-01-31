@@ -8,14 +8,12 @@
   interface Props {
     code: string;
     title?: string;
-    theme?: 'default' | 'dark' | 'forest' | 'neutral';
     diagramType?: string;
   }
 
-  let { code, title = '', theme = 'dark', diagramType = '' }: Props = $props();
+  let { code, title = '', diagramType = '' }: Props = $props();
 
   // 状态
-  let containerRef: HTMLDivElement | null = $state(null);
   let svgContent = $state('');
   let error = $state('');
   let isRendering = $state(true);
@@ -30,8 +28,8 @@
   // 全局初始化标志
   let mermaidInitialized = false;
 
-  // 从 mermaid 代码中提取标题（支持 ---\ntitle: xxx\n--- 格式和 accTitle: xxx 格式）
-  const extractedTitle = $derived(() => {
+  // 从 mermaid 代码中提取标题
+  const extractedTitle = $derived.by(() => {
     if (title) return title;
     if (!code) return '';
 
@@ -47,11 +45,25 @@
     const commentMatch = code.match(/(?:flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie|mindmap|timeline).*?\n\s*%%\s*(.+?)(?:\n|$)/);
     if (commentMatch) return commentMatch[1].trim();
 
+    // 思维导图：从根节点提取标题 root((xxx)) 或 root(xxx) 或 root[xxx] 或直接 root 后的文本
+    const mindmapMatch = code.match(/^\s*mindmap\s*\n\s*root\s*(?:\(\((.+?)\)\)|\((.+?)\)|\[(.+?)\]|(.+?)(?:\n|$))/m);
+    if (mindmapMatch) {
+      const rootText = mindmapMatch[1] || mindmapMatch[2] || mindmapMatch[3] || mindmapMatch[4];
+      if (rootText) return rootText.trim();
+    }
+
+    // 流程图：从第一个节点提取标题
+    const flowchartMatch = code.match(/(?:flowchart|graph)\s+(?:TD|TB|BT|RL|LR)\s*\n\s*\w+\s*(?:\[\[(.+?)\]\]|\[(.+?)\]|\(\((.+?)\)\)|\((.+?)\)|\{(.+?)\})/m);
+    if (flowchartMatch) {
+      const nodeText = flowchartMatch[1] || flowchartMatch[2] || flowchartMatch[3] || flowchartMatch[4] || flowchartMatch[5];
+      if (nodeText) return nodeText.trim();
+    }
+
     return '';
   });
 
   // 检测图表类型
-  const detectedType = $derived(() => {
+  const detectedType = $derived.by(() => {
     if (diagramType) return diagramType;
     if (!code) return '';
 
@@ -77,7 +89,7 @@
   });
 
   // 图表类型显示名
-  const typeDisplayName = $derived(() => {
+  const typeDisplayName = $derived.by(() => {
     const typeMap: Record<string, string> = {
       flowchart: '流程图',
       sequence: '时序图',
@@ -91,7 +103,7 @@
       mindmap: '思维导图',
       timeline: '时间线',
     };
-    return typeMap[detectedType()] || 'Mermaid';
+    return typeMap[detectedType] || 'Mermaid';
   });
 
   onMount(() => {
@@ -240,7 +252,7 @@
     postMessage({
       type: 'openMermaidPanel',
       code: code,
-      title: extractedTitle() || typeDisplayName()
+      title: extractedTitle || typeDisplayName
     });
   }
 </script>
@@ -250,9 +262,9 @@
   <div class="mermaid-header">
     <div class="header-left">
       <Icon name="git-branch" size={14} />
-      <span class="header-type">{typeDisplayName()}</span>
-      {#if extractedTitle()}
-        <span class="header-title">{extractedTitle()}</span>
+      <span class="header-type">{typeDisplayName}</span>
+      {#if extractedTitle}
+        <span class="header-title">{extractedTitle}</span>
       {/if}
     </div>
     <div class="header-actions">
@@ -266,17 +278,17 @@
   </div>
 
   <!-- 图表区域 -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     class="mermaid-content"
-    bind:this={containerRef}
     onmousedown={handleMouseDown}
     onmousemove={handleMouseMove}
     onmouseup={handleMouseUp}
     onmouseleave={handleMouseUp}
     onwheel={handleWheel}
     class:dragging={isDragging}
-    role="img"
-    aria-label="Mermaid diagram"
+    role="application"
+    aria-label="Interactive Mermaid diagram"
   >
     {#if isRendering}
       <div class="loading">

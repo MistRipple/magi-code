@@ -7,8 +7,7 @@
  */
 
 import { TaskCategory, WorkerSlot } from '../types';
-import { ProfileLoader, CategoryConfig, RiskLevel } from '../orchestrator/profile';
-import { DEFAULT_CATEGORIES_CONFIG } from '../orchestrator/profile/defaults';
+import { ProfileLoader, CategoryConfig, RiskLevel, matchCategoryWithProfile } from '../orchestrator/profile';
 
 /** 任务分析结果 */
 export interface TaskAnalysis {
@@ -41,22 +40,6 @@ export interface TaskAnalysis {
   /** 匹配的关键词 */
   matchedKeywords?: string[];
 }
-
-/** 任务类型关键词映射 */
-const CATEGORY_KEYWORDS: Record<TaskCategory, string[]> = {
-  architecture: ['架构', '设计', '重构', 'architecture', 'design', 'refactor', '模块', '结构'],
-  implement: ['实现', '添加', '创建', '开发', 'implement', 'add', 'create', 'develop', '功能'],
-  refactor: ['重构', '优化', '改进', 'refactor', 'optimize', 'improve', '性能'],
-  bugfix: ['修复', 'bug', 'fix', '错误', '问题', 'error', 'issue', '调试', 'debug'],
-  debug: ['调试', 'debug', '排查', '分析', 'trace', '日志'],
-  frontend: ['前端', 'frontend', 'ui', 'css', '样式', '组件', 'component', 'react', 'vue'],
-  backend: ['后端', 'backend', 'api', '服务', 'server', '数据库', 'database'],
-  test: ['测试', 'test', '单元测试', 'unit', '覆盖率', 'coverage', 'jest', 'mocha'],
-  document: ['文档', '注释', 'doc', 'comment', 'readme', '说明'],
-  review: ['审查', 'review', '检查', 'check', '代码审查'],
-  simple: ['简单', '小', '快速', 'simple', 'small', 'quick', '单个'],
-  general: [],
-};
 
 /** 复杂度关键词 */
 const COMPLEXITY_INDICATORS = {
@@ -113,7 +96,7 @@ export class TaskAnalyzer {
     const targetFiles = this.extractTargetFiles(prompt);
 
     // 识别关键词
-    const keywords = this.extractKeywords(lowerPrompt);
+    const keywords = this.extractKeywords(lowerPrompt, matchedKeywords);
 
     // 评估复杂度
     const complexity = this.assessComplexity(prompt, targetFiles, keywords);
@@ -159,55 +142,17 @@ export class TaskAnalyzer {
     categoryConfig?: CategoryConfig;
     matchedCategories?: TaskCategory[];
   } {
-    const categories = this.profileLoader?.getAllCategories();
-    const rules = this.profileLoader?.getCategoryRules() ?? DEFAULT_CATEGORIES_CONFIG.rules;
-
-    let bestMatch: { category: string; score: number; keywords: string[]; config: CategoryConfig } | null = null;
-    const matchedCategories: TaskCategory[] = [];
-
-    for (const categoryName of rules.categoryPriority) {
-      const config = categories?.get(categoryName) || DEFAULT_CATEGORIES_CONFIG.categories[categoryName];
-      if (!config) continue;
-
-      let score = 0;
-      const matched: string[] = [];
-
-      for (const pattern of config.keywords) {
-        try {
-          const regex = new RegExp(pattern, 'i');
-          if (regex.test(lowerPrompt)) {
-            score += 10;
-            matched.push(pattern);
-          }
-        } catch {
-          if (lowerPrompt.includes(pattern.toLowerCase())) {
-            score += 5;
-            matched.push(pattern);
-          }
-        }
-      }
-
-      if (score > 0 && (!bestMatch || score > bestMatch.score)) {
-        bestMatch = { category: categoryName, score, keywords: matched, config };
-      }
-
-      if (score > 0) {
-        matchedCategories.push(categoryName as TaskCategory);
-      }
+    if (!this.profileLoader) {
+      throw new Error('TaskAnalyzer 未配置 ProfileLoader');
     }
 
-    if (bestMatch) {
-      return {
-        category: bestMatch.category as TaskCategory,
-        matchedKeywords: bestMatch.keywords,
-        categoryConfig: bestMatch.config,
-        matchedCategories,
-      };
-    }
-
-    const defaultCategory = rules.defaultCategory as TaskCategory;
-    const defaultConfig = categories?.get(defaultCategory) || DEFAULT_CATEGORIES_CONFIG.categories[defaultCategory];
-    return { category: defaultCategory, matchedKeywords: [], categoryConfig: defaultConfig, matchedCategories: [defaultCategory] };
+    const match = matchCategoryWithProfile(this.profileLoader, lowerPrompt);
+    return {
+      category: match.category,
+      matchedKeywords: match.matchedKeywords,
+      categoryConfig: match.categoryConfig,
+      matchedCategories: match.matchedCategories,
+    };
   }
 
   /**
@@ -256,24 +201,6 @@ export class TaskAnalyzer {
   }
 
   /**
-   * 检测任务类型
-   */
-  private detectCategory(prompt: string): TaskCategory {
-    let maxScore = 0;
-    let detectedCategory: TaskCategory = 'general';
-
-    for (const [category, keywords] of Object.entries(CATEGORY_KEYWORDS)) {
-      const score = keywords.filter(k => prompt.includes(k)).length;
-      if (score > maxScore) {
-        maxScore = score;
-        detectedCategory = category as TaskCategory;
-      }
-    }
-
-    return detectedCategory;
-  }
-
-  /**
    * 提取目标文件
    */
   private extractTargetFiles(prompt: string): string[] {
@@ -286,9 +213,31 @@ export class TaskAnalyzer {
   /**
    * 提取关键词
    */
-  private extractKeywords(prompt: string): string[] {
-    const allKeywords = Object.values(CATEGORY_KEYWORDS).flat();
-    return allKeywords.filter(k => prompt.includes(k));
+  private extractKeywords(prompt: string, matchedKeywords: string[]): string[] {
+    if (!this.profileLoader) {
+      return matchedKeywords;
+    }
+
+    const categories = this.profileLoader.getAllCategories();
+    const keywords: string[] = [];
+
+    for (const config of categories.values()) {
+      for (const pattern of config.keywords) {
+        try {
+          const regex = new RegExp(pattern, 'i');
+          if (regex.test(prompt)) {
+            keywords.push(pattern);
+          }
+        } catch {
+          if (prompt.includes(pattern.toLowerCase())) {
+            keywords.push(pattern);
+          }
+        }
+      }
+    }
+
+    const merged = new Set([...keywords, ...matchedKeywords]);
+    return Array.from(merged);
   }
 
   /**

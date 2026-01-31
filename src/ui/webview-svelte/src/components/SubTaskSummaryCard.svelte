@@ -8,11 +8,24 @@
     description?: string;
     executor?: string;
     agent?: string;
+    worker?: string;
     duration?: string;
     changes?: string[];
     verification?: string[];
     error?: string;
     toolCount?: number;
+    // 新增：Session 相关（提案 4.1）
+    sessionId?: string;
+    isResumed?: boolean;
+    // 新增：Evidence 相关（提案 4.2）
+    evidence?: {
+      commandsRun?: number;
+      testsPassed?: boolean;
+      typeCheckPassed?: boolean;
+      filesChanged?: number;
+    };
+    // 新增：Wave 相关（提案 4.6）
+    waveIndex?: number;
   }
 
   interface Props {
@@ -21,16 +34,22 @@
 
   let { card }: Props = $props();
 
+  // 展开/收起状态
+  let isExpanded = $state(false);
+
   const statusText = $derived(card.status === 'failed' ? '失败' : '完成');
-  const executor = $derived(card.executor || card.agent || '未知');
+  // 优化 executor 显示：支持更多 fallback 选项，并统一使用中文
+  const rawExecutor = $derived(card.executor || card.agent || card.worker || '');
+  const executor = $derived(rawExecutor || '编排者');
 
   // Worker 类型和颜色映射
-  type WorkerType = 'claude' | 'codex' | 'gemini' | 'default';
+  type WorkerType = 'claude' | 'codex' | 'gemini' | 'orchestrator' | 'default';
 
   const workerColorMap: Record<WorkerType, { colorVar: string; icon: string; label: string }> = {
     claude: { colorVar: '--color-claude', icon: '🧠', label: 'Claude' },
     codex: { colorVar: '--color-codex', icon: '⚡', label: 'Codex' },
     gemini: { colorVar: '--color-gemini', icon: '✨', label: 'Gemini' },
+    orchestrator: { colorVar: '--color-orchestrator', icon: '🎯', label: '编排者' },
     default: { colorVar: '--foreground-muted', icon: '🤖', label: 'Worker' },
   };
 
@@ -40,6 +59,8 @@
     if (lower.includes('claude')) return 'claude';
     if (lower.includes('codex')) return 'codex';
     if (lower.includes('gemini')) return 'gemini';
+    // 识别编排者相关的名称
+    if (lower.includes('编排') || lower.includes('orchestrator') || lower === 'unknown') return 'orchestrator';
     return 'default';
   }
 
@@ -47,20 +68,42 @@
   const workerConfig = $derived(workerColorMap[workerType]);
 
   // 点击跳转到对应的 worker tab
-  function handleCardClick() {
-    if (workerType !== 'default') {
+  function handleCardClick(e: MouseEvent) {
+    // 如果点击的是展开按钮，不跳转
+    if ((e.target as HTMLElement).closest('.expand-btn')) {
+      return;
+    }
+    // 只有 Worker 类型可以跳转，编排者和默认类型不跳转
+    if (workerType !== 'default' && workerType !== 'orchestrator') {
       setCurrentBottomTab(workerType);
     }
   }
 
-  // 是否可点击
-  const isClickable = $derived(workerType !== 'default');
+  // 切换展开状态
+  function toggleExpand(e: MouseEvent) {
+    e.stopPropagation();
+    isExpanded = !isExpanded;
+  }
+
+  // 是否可点击跳转
+  const isClickable = $derived(workerType !== 'default' && workerType !== 'orchestrator');
+
+  // 是否有详情可展开
+  const hasDetails = $derived(
+    (card.changes && card.changes.length > 0) ||
+    (card.verification && card.verification.length > 0) ||
+    card.evidence !== undefined
+  );
+
+  // 是否有 Evidence 信息
+  const hasEvidence = $derived(card.evidence !== undefined);
 </script>
 
 <button
   class="worker-progress-card"
   class:failed={card.status === 'failed'}
   class:clickable={isClickable}
+  class:expanded={isExpanded}
   style="--worker-color: var({workerConfig.colorVar})"
   onclick={handleCardClick}
   title={isClickable ? `点击查看 ${workerConfig.label} 详情` : ''}
@@ -70,6 +113,12 @@
     <div class="worker-info">
       <span class="worker-icon">{workerConfig.icon}</span>
       <span class="worker-name">{executor}</span>
+      {#if typeof card.waveIndex === 'number'}
+        <span class="wave-badge" title="Wave {card.waveIndex + 1}">W{card.waveIndex + 1}</span>
+      {/if}
+      {#if card.isResumed}
+        <span class="resumed-badge" title="Session 已恢复">恢复</span>
+      {/if}
     </div>
     <div class="card-meta">
       {#if card.duration}
@@ -78,6 +127,18 @@
       <span class="status-badge" class:failed={card.status === 'failed'}>
         {statusText}
       </span>
+      {#if hasDetails}
+        <span
+          class="expand-btn"
+          role="button"
+          tabindex="0"
+          onclick={toggleExpand}
+          onkeydown={(e) => e.key === 'Enter' && toggleExpand(e as unknown as MouseEvent)}
+          title={isExpanded ? '收起详情' : '展开详情'}
+        >
+          <Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={14} />
+        </span>
+      {/if}
       {#if isClickable}
         <span class="jump-hint">
           <Icon name="chevron-right" size={14} />
@@ -108,6 +169,76 @@
       </span>
     {/if}
   </div>
+
+  <!-- 展开的详情面板 -->
+  {#if isExpanded && hasDetails}
+    <div class="card-details">
+      {#if card.changes && card.changes.length > 0}
+        <div class="detail-section">
+          <div class="detail-title">
+            <Icon name="file" size={12} />
+            文件变更
+          </div>
+          <ul class="file-list">
+            {#each card.changes as file}
+              <li class="file-item">{file}</li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
+      {#if card.verification && card.verification.length > 0}
+        <div class="detail-section">
+          <div class="detail-title">
+            <Icon name="check-circle" size={12} />
+            验证结果
+          </div>
+          <ul class="verification-list">
+            {#each card.verification as item}
+              <li class="verification-item">{item}</li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
+      {#if hasEvidence && card.evidence}
+        <div class="detail-section">
+          <div class="detail-title">
+            <Icon name="shield" size={12} />
+            验证证据
+          </div>
+          <div class="evidence-grid">
+            {#if typeof card.evidence.commandsRun === 'number'}
+              <div class="evidence-item">
+                <span class="evidence-label">命令执行</span>
+                <span class="evidence-value">{card.evidence.commandsRun} 次</span>
+              </div>
+            {/if}
+            {#if typeof card.evidence.testsPassed === 'boolean'}
+              <div class="evidence-item">
+                <span class="evidence-label">测试</span>
+                <span class="evidence-value" class:success={card.evidence.testsPassed} class:error={!card.evidence.testsPassed}>
+                  {card.evidence.testsPassed ? '通过' : '失败'}
+                </span>
+              </div>
+            {/if}
+            {#if typeof card.evidence.typeCheckPassed === 'boolean'}
+              <div class="evidence-item">
+                <span class="evidence-label">类型检查</span>
+                <span class="evidence-value" class:success={card.evidence.typeCheckPassed} class:error={!card.evidence.typeCheckPassed}>
+                  {card.evidence.typeCheckPassed ? '通过' : '失败'}
+                </span>
+              </div>
+            {/if}
+            {#if typeof card.evidence.filesChanged === 'number'}
+              <div class="evidence-item">
+                <span class="evidence-label">文件变更</span>
+                <span class="evidence-value">{card.evidence.filesChanged} 个</span>
+              </div>
+            {/if}
+          </div>
+        </div>
+      {/if}
+    </div>
+  {/if}
 
   <!-- 错误信息（如果有） -->
   {#if card.error}
@@ -238,6 +369,98 @@
     color: var(--foreground-muted);
   }
 
+  /* 展开按钮 */
+  .expand-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    border-radius: var(--radius-sm);
+    color: var(--foreground-muted);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+  }
+
+  .expand-btn:hover {
+    color: var(--foreground);
+    background: var(--surface-2);
+  }
+
+  /* 详情面板 */
+  .card-details {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    padding-top: var(--space-2);
+    border-top: 1px solid var(--border);
+    animation: slideDown 0.2s ease-out;
+  }
+
+  @keyframes slideDown {
+    from {
+      opacity: 0;
+      transform: translateY(-8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .detail-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .detail-title {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+    font-size: var(--text-xs);
+    font-weight: 500;
+    color: var(--foreground-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+
+  .file-list,
+  .verification-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .file-item,
+  .verification-item {
+    font-size: var(--text-xs);
+    color: var(--foreground);
+    padding: 2px 0;
+    padding-left: var(--space-4);
+    position: relative;
+  }
+
+  .file-item::before {
+    content: '•';
+    position: absolute;
+    left: var(--space-1);
+    color: var(--foreground-muted);
+  }
+
+  .verification-item::before {
+    content: '✓';
+    position: absolute;
+    left: var(--space-1);
+    color: var(--success);
+  }
+
   /* 错误信息 */
   .card-error {
     display: flex;
@@ -249,5 +472,60 @@
     color: var(--error);
     font-size: var(--text-sm);
     line-height: 1.4;
+  }
+
+  /* Wave 和 Session 徽章 */
+  .wave-badge {
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: var(--radius-full);
+    background: color-mix(in srgb, var(--primary) 20%, transparent);
+    color: var(--primary);
+    font-weight: 500;
+  }
+
+  .resumed-badge {
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: var(--radius-full);
+    background: color-mix(in srgb, var(--warning) 20%, transparent);
+    color: var(--warning);
+    font-weight: 500;
+  }
+
+  /* Evidence 网格 */
+  .evidence-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: var(--space-2);
+    padding: var(--space-2);
+    background: var(--surface-2);
+    border-radius: var(--radius-sm);
+  }
+
+  .evidence-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .evidence-label {
+    font-size: 10px;
+    color: var(--foreground-muted);
+    text-transform: uppercase;
+  }
+
+  .evidence-value {
+    font-size: var(--text-xs);
+    font-weight: 500;
+    color: var(--foreground);
+  }
+
+  .evidence-value.success {
+    color: var(--success);
+  }
+
+  .evidence-value.error {
+    color: var(--error);
   }
 </style>

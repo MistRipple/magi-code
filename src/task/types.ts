@@ -116,7 +116,7 @@ export interface SubTask {
   /**
    * 关联的 Assignment ID（用于与 Mission 系统的稳定匹配）
    *
-   * 当 SubTask 由 MissionExecutor 创建时，此字段必须提供，
+   * 当 SubTask 由 MissionOrchestrator 创建时，此字段必须提供，
    * 用于在状态更新时通过 getSubTaskByAssignmentId() 进行稳定匹配。
    * 对于非 Mission 路径创建的 SubTask（如简单任务模式），此字段可省略。
    */

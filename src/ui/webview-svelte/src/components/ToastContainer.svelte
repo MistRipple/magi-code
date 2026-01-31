@@ -1,12 +1,13 @@
 <script lang="ts">
   import { getState } from '../stores/messages.svelte';
   import { ensureArray } from '../lib/utils';
+  import type { Toast } from '../types/message';
   import Icon from './Icon.svelte';
 
   const appState = getState();
 
   // Toast 列表
-  const toasts = $derived(ensureArray(appState.toasts));
+  const toasts = $derived(ensureArray(appState.toasts) as Toast[]);
 
   // 自动关闭定时器（5秒）
   const AUTO_DISMISS_MS = 5000;
@@ -22,7 +23,7 @@
       clearTimeout(timer);
       activeTimers.delete(id);
     }
-    appState.toasts = ensureArray(appState.toasts).filter(t => t.id !== id);
+    appState.toasts = (ensureArray(appState.toasts) as Toast[]).filter(t => t.id !== id);
   }
 
   // 为新增的 toast 设置自动关闭
@@ -35,7 +36,7 @@
       if (!activeTimers.has(toast.id)) {
         const timer = setTimeout(() => {
           activeTimers.delete(toast.id);
-          appState.toasts = ensureArray(appState.toasts).filter(t => t.id !== toast.id);
+          appState.toasts = (ensureArray(appState.toasts) as Toast[]).filter(t => t.id !== toast.id);
         }, AUTO_DISMISS_MS);
         activeTimers.set(toast.id, timer);
       }

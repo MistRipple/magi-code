@@ -130,7 +130,7 @@ IMPORTANT:
   }
 
   /**
-   * 获取工具定义列表（兼容多工具执行器）
+   * 获取工具定义列表（多工具执行器接口）
    */
   getToolDefinitions(): ExtendedToolDefinition[] {
     return [this.getToolDefinition()];

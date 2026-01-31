@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
 
@@ -15,18 +16,8 @@
     initialExpanded
   }: Props = $props();
 
-  // 折叠状态
-  let collapsed = $state(true);
-
-  // 初始化折叠状态
-  $effect(() => {
-    // 流式时默认展开，否则使用 initialExpanded 或默认折叠
-    if (isStreaming) {
-      collapsed = false;
-    } else if (initialExpanded !== undefined) {
-      collapsed = !initialExpanded;
-    }
-  });
+  // 折叠状态 - 仅使用初始值，之后由用户手动控制
+  let collapsed = $state(untrack(() => isStreaming ? false : (initialExpanded !== undefined ? !initialExpanded : true)));
 
   // 提取思考内容
   const thinkingContent = $derived(
@@ -37,7 +28,7 @@
   );
 
   // 生成摘要
-  const summary = $derived(() => {
+  const summary = $derived.by(() => {
     if (!thinkingContent) return '正在思考...';
     const plain = thinkingContent
       .replace(/[#*_`~\[\]()]/g, '')
@@ -68,7 +59,7 @@
 
     <span class="thinking-title">
       <span class="title-text">思考过程</span>
-      <span class="thinking-summary">{summary()}</span>
+      <span class="thinking-summary">{summary}</span>
     </span>
 
     <span class="thinking-badge">{thinking.length} 步</span>

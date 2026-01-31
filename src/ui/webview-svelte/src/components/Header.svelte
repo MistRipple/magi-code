@@ -17,7 +17,7 @@
   let dropdownOpen = $state(false);
 
   // 获取当前会话名称
-  const currentSessionName = $derived(() => {
+  const currentSessionName = $derived.by(() => {
     if (!appState.currentSessionId) return '新会话';
     const session = (ensureArray(appState.sessions) as Session[]).find(s => s.id === appState.currentSessionId);
     return session?.name || '会话';
@@ -70,7 +70,7 @@
   <div class="session-selector">
     <button class="session-selector-btn" onclick={toggleDropdown}>
       <Icon name="chat" size={14} class="session-selector-icon" />
-      <span class="session-selector-name">{currentSessionName()}</span>
+      <span class="session-selector-name">{currentSessionName}</span>
       <Icon name="chevronDown" size={12} class="session-selector-chevron" />
     </button>
 
@@ -90,26 +90,25 @@
               <span>暂无会话历史</span>
             </div>
           {:else}
-            {#each ensureArray(appState.sessions) as session (session.id)}
-              {@const s = session as Session}
+            {#each (ensureArray(appState.sessions) as Session[]) as session (session.id)}
               <div
                 class="session-item"
-                class:active={s.id === appState.currentSessionId}
+                class:active={session.id === appState.currentSessionId}
                 role="button"
                 tabindex="0"
-                onclick={() => selectSession(s.id)}
-                onkeydown={(e) => e.key === 'Enter' && selectSession(s.id)}
+                onclick={() => selectSession(session.id)}
+                onkeydown={(e) => e.key === 'Enter' && selectSession(session.id)}
               >
                 <div class="session-info">
-                  <span class="session-name">{s.name || '未命名会话'}</span>
+                  <span class="session-name">{session.name || '未命名会话'}</span>
                   <div class="session-meta">
-                    <span class="session-count">{s.messageCount ?? 0} 条消息</span>
-                    <span class="session-date">{formatDate(s.updatedAt || s.createdAt)}</span>
+                    <span class="session-count">{session.messageCount ?? 0} 条消息</span>
+                    <span class="session-date">{formatDate(session.updatedAt || session.createdAt)}</span>
                   </div>
                 </div>
                 <button
                   class="delete-btn"
-                  onclick={(e) => deleteSession(s.id, e)}
+                  onclick={(e) => deleteSession(session.id, e)}
                   title="删除会话"
                 >
                   <Icon name="delete" size={14} />

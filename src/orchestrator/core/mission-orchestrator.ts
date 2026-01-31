@@ -13,7 +13,7 @@ import fs from 'fs';
 import path from 'path';
 import { WorkerSlot } from '../../types';
 import { ProfileLoader } from '../profile/profile-loader';
-import { GuidanceInjector } from '../profile/guidance-injector';
+import { GuidanceInjector, TaskStructuredInfo } from '../profile/guidance-injector';
 import { ProfileAwareReviewer } from '../review/profile-aware-reviewer';
 import {
   VerificationRunner,
@@ -30,7 +30,7 @@ import { SnapshotManager } from '../../snapshot-manager';
 import { ContextManager } from '../../context/context-manager';
 import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import { logger, LogCategory } from '../../logging';
-import { ExecutionStats } from '../execution-stats';
+import { LLMConfigLoader } from '../../llm/config';
 import {
   MissionStorageManager,
   ContractManager,
@@ -38,10 +38,22 @@ import {
   Mission,
   Contract,
   Assignment,
+  WorkerTodo,
   CreateMissionParams,
   VerificationSpec,
   AcceptanceCriterion,
 } from '../mission';
+import { AutonomousWorker, AutonomousExecutionResult } from '../worker';
+import { PlanTodoManager } from '../plan-todo';
+import type { ReportCallback } from '../protocols/worker-report';
+import {
+  ExecutionCoordinator,
+  TaskPreAnalyzer,
+  ExecutionStrategy,
+  OrchestratorResponder,
+} from './executors';
+import { BlockedItem } from './executors/blocking-manager';
+import { TokenUsage } from '../../types/agent-types';
 
 /**
  * Mission 创建结果
@@ -50,6 +62,72 @@ export interface MissionCreationResult {
   mission: Mission;
   contracts: Contract[];
   assignments: Assignment[];
+}
+
+/**
+ * 执行选项（从 MissionExecutor 合并）
+ */
+export interface ExecutionOptions {
+  /** 工作目录 */
+  workingDirectory: string;
+  /** 超时时间（毫秒） */
+  timeout?: number;
+  /** 项目上下文 */
+  projectContext?: string;
+  /** 并行执行 */
+  parallel?: boolean;
+  /** 并行规划（默认 true） */
+  parallelPlanning?: boolean;
+  /** 阻塞超时时间（毫秒），超时后跳过阻塞项 */
+  blockingTimeout?: number;
+  /** 阻塞检查间隔（毫秒） */
+  blockingCheckInterval?: number;
+  /** 输出回调 */
+  onOutput?: (workerId: WorkerSlot, output: string) => void;
+  /** 进度回调 */
+  onProgress?: (progress: ExecutionProgress) => void;
+  /** 阻塞回调 */
+  onBlocked?: (blockedItem: BlockedItem) => void;
+  /** 解除阻塞回调 */
+  onUnblocked?: (blockedItem: BlockedItem) => void;
+  /** Worker 汇报回调 */
+  onReport?: ReportCallback;
+  /** 汇报超时(ms) */
+  reportTimeout?: number;
+}
+
+/**
+ * 执行进度（从 MissionExecutor 合并）
+ */
+export interface ExecutionProgress {
+  missionId: string;
+  phase: 'planning' | 'executing' | 'reviewing' | 'completed';
+  totalAssignments: number;
+  completedAssignments: number;
+  blockedAssignments: number;
+  currentAssignment?: {
+    id: string;
+    workerId: WorkerSlot;
+    progress: number;
+  };
+  blockedItems: BlockedItem[];
+  overallProgress: number;
+}
+
+/**
+ * 执行结果（从 MissionExecutor 合并）
+ */
+export interface ExecutionResult {
+  mission: Mission;
+  success: boolean;
+  assignmentResults: Map<string, AutonomousExecutionResult>;
+  contractVerifications: Map<string, boolean>;
+  blockedItems: BlockedItem[];
+  resolvedBlockings: BlockedItem[];
+  errors: string[];
+  duration: number;
+  /** 聚合的 Token 使用统计 */
+  tokenUsage?: TokenUsage;
 }
 
 /**
@@ -136,7 +214,9 @@ export class MissionOrchestrator extends EventEmitter {
   private snapshotManager?: SnapshotManager;
   private contextManager?: ContextManager;
   private adapterFactory?: IAdapterFactory;
-  private executionStats?: ExecutionStats;
+
+  // 智能执行组件
+  private taskPreAnalyzer?: TaskPreAnalyzer;
 
   // 项目知识库
   private projectKnowledgeBase?: import('../../knowledge/project-knowledge-base').ProjectKnowledgeBase;
@@ -144,6 +224,12 @@ export class MissionOrchestrator extends EventEmitter {
   // 规划结果缓存（基于 prompt hash）
   private planningCache: Map<string, { mission: Mission; timestamp: number }> = new Map();
   private readonly CACHE_TTL_MS = 5 * 60 * 1000; // 5 分钟缓存过期
+
+  // 执行相关属性（从 MissionExecutor 合并）
+  private workers: Map<WorkerSlot, AutonomousWorker> = new Map();
+  private todoManager?: PlanTodoManager;
+  private currentMissionId: string | null = null;
+  private taskManager?: import('../../task/unified-task-manager').UnifiedTaskManager;
 
   constructor(
     private profileLoader: ProfileLoader,
@@ -200,13 +286,22 @@ export class MissionOrchestrator extends EventEmitter {
    */
   setAdapterFactory(adapterFactory: IAdapterFactory): void {
     this.adapterFactory = adapterFactory;
+    // 初始化智能执行组件
+    this.taskPreAnalyzer = new TaskPreAnalyzer(adapterFactory);
   }
 
   /**
-   * 设置 ExecutionStats（用于记录压缩模型 token 使用）
+   * 设置 TODO 管理器
    */
-  setExecutionStats(executionStats: ExecutionStats): void {
-    this.executionStats = executionStats;
+  setTodoManager(todoManager: PlanTodoManager): void {
+    this.todoManager = todoManager;
+  }
+
+  /**
+   * 设置 TaskManager（用于 SubTask 同步）
+   */
+  setTaskManager(taskManager: import('../../task/unified-task-manager').UnifiedTaskManager): void {
+    this.taskManager = taskManager;
   }
 
   /**
@@ -355,8 +450,12 @@ export class MissionOrchestrator extends EventEmitter {
           };
         }
 
-        // 对于简单模式，跳过 Mission 创建
-        if (mode === IntentHandlerMode.ASK || mode === IntentHandlerMode.DIRECT) {
+        // 对于快速模式，跳过 Mission 创建
+        if (
+          mode === IntentHandlerMode.ASK
+          || mode === IntentHandlerMode.DIRECT
+          || mode === IntentHandlerMode.EXPLORE
+        ) {
           return {
             mode,
             skipMission: true,
@@ -402,6 +501,8 @@ export class MissionOrchestrator extends EventEmitter {
       '是否有相关日志或 Profiling 结果？',
     ];
   }
+
+  
 
   /**
    * 设置存储层事件监听
@@ -530,34 +631,62 @@ export class MissionOrchestrator extends EventEmitter {
   ): Promise<WorkerSlot[]> {
     const allProfiles = this.profileLoader.getAllProfiles();
     const participants: WorkerSlot[] = [];
+    const connectedWorkers = this.getConnectedWorkers(allProfiles);
 
     // 如果指定了首选 Worker
     if (options?.preferredWorkers && options.preferredWorkers.length > 0) {
+      for (const worker of options.preferredWorkers) {
+        if (!allProfiles.has(worker)) {
+          throw new Error(`指定的 Worker 未配置: ${worker}`);
+        }
+        if (!connectedWorkers.has(worker)) {
+          throw new Error(`指定的 Worker 不可用: ${worker}`);
+        }
+      }
       participants.push(...options.preferredWorkers);
     } else {
       // 仅使用画像系统 + 任务分类配置进行选择
       const rules = this.profileLoader.getCategoryRules();
+      if (!rules?.defaultCategory) {
+        throw new Error('任务分类规则缺失: defaultCategory 未配置');
+      }
       const rawCategories = options?.categories && options.categories.length > 0
         ? options.categories
-        : [options?.category || rules.defaultCategory || 'general'];
+        : [options?.category || rules.defaultCategory];
       const categories = Array.from(new Set(rawCategories.filter(Boolean)));
 
       const defaultWorkers: WorkerSlot[] = [];
+      const missingCategories: string[] = [];
       for (const category of categories) {
         const categoryConfig = this.profileLoader.getCategory(category);
-        const generalConfig = this.profileLoader.getCategory('general');
-        const defaultWorker = (categoryConfig?.defaultWorker || generalConfig?.defaultWorker || 'claude') as WorkerSlot;
-        defaultWorkers.push(defaultWorker);
+        if (!categoryConfig) {
+          missingCategories.push(category);
+          continue;
+        }
+        if (!categoryConfig.defaultWorker) {
+          throw new Error(`任务分类未配置默认 Worker: ${category}`);
+        }
+        const desired = categoryConfig.defaultWorker as WorkerSlot;
+        defaultWorkers.push(this.resolveAvailableWorkerForCategory(category, desired, allProfiles, connectedWorkers));
+      }
+
+      if (missingCategories.length > 0) {
+        throw new Error(`任务分类配置缺失: ${missingCategories.join(', ')}`);
       }
 
       for (const [worker, profile] of allProfiles.entries()) {
         if (categories.some(category => profile.preferences.preferredCategories.includes(category))) {
-          participants.push(worker as WorkerSlot);
+          if (connectedWorkers.has(worker)) {
+            participants.push(worker as WorkerSlot);
+          }
         }
       }
 
       if (participants.length === 0) {
-        participants.push(...defaultWorkers);
+        if (defaultWorkers.length === 0) {
+          throw new Error(`未找到可用 Worker（分类: ${categories.join(', ')})`);
+        }
+        participants.push(...defaultWorkers.filter(worker => allProfiles.has(worker)));
       } else {
         for (const worker of defaultWorkers) {
           if (!participants.includes(worker) && allProfiles.has(worker)) {
@@ -568,6 +697,9 @@ export class MissionOrchestrator extends EventEmitter {
     }
 
     const uniqueParticipants = Array.from(new Set(participants));
+    if (uniqueParticipants.length === 0) {
+      throw new Error('未能选择到任何可用 Worker');
+    }
 
     mission.phase = 'contract_definition';
     await this.storage.update(mission);
@@ -575,6 +707,72 @@ export class MissionOrchestrator extends EventEmitter {
     this.emit('participantsSelected', { missionId: mission.id, participants: uniqueParticipants });
 
     return uniqueParticipants;
+  }
+
+  private getConnectedWorkers(allProfiles: Map<WorkerSlot, unknown>): Set<WorkerSlot> {
+    const connected = new Set<WorkerSlot>();
+    for (const worker of allProfiles.keys()) {
+      if (!this.adapterFactory || this.isWorkerAvailable(worker)) {
+        connected.add(worker);
+      }
+    }
+    return connected;
+  }
+
+  private isWorkerAvailable(worker: WorkerSlot): boolean {
+    if (!this.adapterFactory) {
+      return true;
+    }
+    if (this.adapterFactory.isConnected(worker)) {
+      return true;
+    }
+    try {
+      const workers = LLMConfigLoader.loadWorkersConfig();
+      const cfg = workers[worker];
+      return Boolean(cfg?.enabled && cfg.baseUrl && cfg.model);
+    } catch {
+      return false;
+    }
+  }
+
+  private resolveAvailableWorkerForCategory(
+    category: string,
+    preferredWorker: WorkerSlot,
+    profiles: Map<WorkerSlot, import('../profile/types').WorkerProfile>,
+    connectedWorkers: Set<WorkerSlot>
+  ): WorkerSlot {
+    if (connectedWorkers.has(preferredWorker)) {
+      return preferredWorker;
+    }
+
+    const candidates = Array.from(profiles.entries())
+      .filter(([worker, profile]) =>
+        worker !== preferredWorker
+        && connectedWorkers.has(worker)
+        && profile.preferences.preferredCategories.includes(category)
+      )
+      .map(([worker]) => worker);
+
+    if (candidates.length > 0) {
+      logger.warn('编排器.参与者.降级Worker', {
+        category,
+        from: preferredWorker,
+        to: candidates[0],
+      }, LogCategory.ORCHESTRATOR);
+      return candidates[0];
+    }
+
+    const anyConnected = Array.from(connectedWorkers);
+    if (anyConnected.length === 0) {
+      throw new Error(`无可用 Worker（分类: ${category}）`);
+    }
+
+    logger.warn('编排器.参与者.降级Worker_无偏好匹配', {
+      category,
+      from: preferredWorker,
+      to: anyConnected[0],
+    }, LogCategory.ORCHESTRATOR);
+    return anyConnected[0];
   }
 
   /**
@@ -602,10 +800,18 @@ export class MissionOrchestrator extends EventEmitter {
     mission: Mission,
     participants: WorkerSlot[]
   ): Promise<Assignment[]> {
+    const taskInfo = this.buildTaskStructuredInfo(mission);
+    const additionalContext = this.contextManager
+      ? this.contextManager.getContextSlice({ maxTokens: 1200, includeRecent: false })
+      : mission.context;
     const assignments = await this.assignmentManager.createAssignments(
       mission,
       participants,
-      mission.contracts
+      mission.contracts,
+      {
+        taskInfo,
+        additionalContext,
+      }
     );
 
     mission.assignments = assignments;
@@ -615,6 +821,56 @@ export class MissionOrchestrator extends EventEmitter {
     this.emit('responsibilitiesAssigned', { missionId: mission.id, assignments });
 
     return assignments;
+  }
+
+  /**
+   * 任务结构化信息 - 提案 4.3
+   */
+  private buildTaskStructuredInfo(mission: Mission): TaskStructuredInfo | undefined {
+    const taskInfo: TaskStructuredInfo = {};
+
+    if (mission.acceptanceCriteria?.length) {
+      taskInfo.expectedOutcome = mission.acceptanceCriteria.map(c => c.description).filter(Boolean);
+    }
+
+    if (mission.constraints?.length) {
+      const mustDo = mission.constraints
+        .filter(c => c.type === 'must' || c.type === 'should')
+        .map(c => c.description)
+        .filter(Boolean);
+      const mustNotDo = mission.constraints
+        .filter(c => c.type === 'must_not' || c.type === 'should_not')
+        .map(c => c.description)
+        .filter(Boolean);
+
+      if (mustDo.length > 0) {
+        taskInfo.mustDo = mustDo;
+      }
+      if (mustNotDo.length > 0) {
+        taskInfo.mustNotDo = mustNotDo;
+      }
+    }
+
+    const memory = this.contextManager?.getMemoryDocument()?.getContent();
+    if (memory) {
+      if (memory.keyDecisions?.length) {
+        taskInfo.relatedDecisions = memory.keyDecisions
+          .slice(-5)
+          .map(d => `${d.description}: ${d.reason}`);
+      }
+      if (memory.pendingIssues?.length) {
+        taskInfo.pendingIssues = memory.pendingIssues.slice(-5);
+      }
+    }
+
+    const hasContent =
+      (taskInfo.expectedOutcome && taskInfo.expectedOutcome.length > 0) ||
+      (taskInfo.mustDo && taskInfo.mustDo.length > 0) ||
+      (taskInfo.mustNotDo && taskInfo.mustNotDo.length > 0) ||
+      (taskInfo.relatedDecisions && taskInfo.relatedDecisions.length > 0) ||
+      (taskInfo.pendingIssues && taskInfo.pendingIssues.length > 0);
+
+    return hasContent ? taskInfo : undefined;
   }
 
   /**
@@ -747,8 +1003,8 @@ export class MissionOrchestrator extends EventEmitter {
   /**
    * 完成 Mission
    */
-  async completeMission(missionId: string): Promise<Mission> {
-    const mission = await this.storage.load(missionId);
+  async completeMission(missionId: string, missionOverride?: Mission): Promise<Mission> {
+    const mission = missionOverride ?? await this.storage.load(missionId);
     if (!mission) {
       throw new Error(`Mission not found: ${missionId}`);
     }
@@ -766,8 +1022,8 @@ export class MissionOrchestrator extends EventEmitter {
   /**
    * Mission 失败
    */
-  async failMission(missionId: string, error: string): Promise<Mission> {
-    const mission = await this.storage.load(missionId);
+  async failMission(missionId: string, error: string, missionOverride?: Mission): Promise<Mission> {
+    const mission = missionOverride ?? await this.storage.load(missionId);
     if (!mission) {
       throw new Error(`Mission not found: ${missionId}`);
     }
@@ -1441,5 +1697,256 @@ export class MissionOrchestrator extends EventEmitter {
    */
   clearCache(): void {
     this.planningCache.clear();
+  }
+
+  // ============================================================================
+  // 执行相关方法（从 MissionExecutor 合并）
+  // ============================================================================
+
+  /**
+   * 确保 Worker 存在（懒加载创建）
+   */
+  private ensureWorker(workerSlot: WorkerSlot): AutonomousWorker {
+    let worker = this.workers.get(workerSlot);
+    if (!worker) {
+      if (!this.adapterFactory) {
+        throw new Error(`未配置 AdapterFactory，无法创建 Worker: ${workerSlot}`);
+      }
+      worker = new AutonomousWorker(
+        workerSlot,
+        this.profileLoader,
+        this.guidanceInjector
+      );
+      this.workers.set(workerSlot, worker);
+
+      worker.on('sessionCreated', (data: { sessionId: string; assignmentId: string }) => {
+        this.emit('workerSessionCreated', {
+          ...data,
+          workerId: workerSlot,
+        });
+      });
+
+      worker.on('sessionResumed', (data: { sessionId: string; assignmentId: string; completedTodos: number }) => {
+        this.emit('workerSessionResumed', {
+          ...data,
+          workerId: workerSlot,
+        });
+      });
+
+      logger.info('编排器.Worker.创建', { workerSlot }, LogCategory.ORCHESTRATOR);
+    }
+    return worker;
+  }
+
+  /**
+   * 执行 Mission
+   * 合并自 MissionExecutor.execute()
+   *
+   * 智能编排：
+   * 1. 使用 TaskPreAnalyzer 分析任务特性
+   * 2. 根据分析结果动态选择执行阶段
+   * 3. 使用 OrchestratorResponder 处理 Worker 汇报
+   */
+  async execute(
+    mission: Mission,
+    options: ExecutionOptions
+  ): Promise<ExecutionResult> {
+    if (!this.adapterFactory) {
+      throw new Error('未配置 AdapterFactory，无法执行任务');
+    }
+
+    const startTime = Date.now();
+    this.currentMissionId = mission.id;
+
+    this.emit('executionStarted', { missionId: mission.id });
+
+    // ========== 智能编排：任务预分析 ==========
+    let strategy: ExecutionStrategy | null = null;
+    if (this.taskPreAnalyzer) {
+      try {
+        strategy = await this.taskPreAnalyzer.analyze(mission, {
+          projectContext: options.projectContext,
+        });
+
+        logger.info('任务预分析完成', {
+          complexity: strategy.complexity,
+          needsPlanning: strategy.needsPlanning,
+          needsReview: strategy.needsReview,
+          needsVerification: strategy.needsVerification,
+        }, LogCategory.ORCHESTRATOR);
+
+        // 发送分析摘要到 UI
+        this.emit('analysisComplete', {
+          missionId: mission.id,
+          strategy,
+        });
+      } catch (error) {
+        logger.warn('任务预分析失败，使用默认策略', { error }, LogCategory.ORCHESTRATOR);
+      }
+    }
+
+    // 确保所有 Worker 存在
+    for (const assignment of mission.assignments) {
+      this.ensureWorker(assignment.workerId);
+    }
+
+    // 生成 TODO 文件
+    if (this.todoManager && this.snapshotManager) {
+      const session = (this.snapshotManager as any).sessionManager?.getCurrentSession();
+      if (session) {
+        this.todoManager.ensureMissionTodoFile(mission, session.id);
+      }
+    }
+
+    // ========== 创建智能响应器 ==========
+    const responder = new OrchestratorResponder(
+      this.adapterFactory,
+      mission,
+      { useLLM: true }
+    );
+
+    // 创建 ExecutionCoordinator 并执行
+    const coordinator = new ExecutionCoordinator(
+      this.workers,
+      this.adapterFactory,
+      this.profileLoader,
+      this.reviewer,
+      this.snapshotManager || null,
+      this.workspaceRoot || '',
+      mission
+    );
+
+    // 设置 ContextManager
+    if (this.contextManager) {
+      coordinator.setContextManager(this.contextManager);
+    }
+
+    // 设置 TaskManager（用于 SubTask 同步，确保 UI 能显示正确的 assignedWorker）
+    if (this.taskManager) {
+      coordinator.setTaskManager(this.taskManager);
+    }
+
+    // 转发事件
+    coordinator.on('progress', (progress) => {
+      this.emit('progress', progress);
+      options.onProgress?.(progress);
+    });
+
+    coordinator.on('blocked', (blockedItem: BlockedItem) => {
+      this.emit('blocked', blockedItem);
+      options.onBlocked?.(blockedItem);
+    });
+
+    coordinator.on('unblocked', (blockedItem: BlockedItem) => {
+      this.emit('unblocked', blockedItem);
+      options.onUnblocked?.(blockedItem);
+    });
+
+    coordinator.on('assignmentStarted', (data: { assignmentId: string; missionId: string; workerId: WorkerSlot }) => {
+      this.emit('assignmentStarted', data);
+    });
+
+    coordinator.on('assignmentPlanned', (data: { missionId: string; assignmentId: string; todos: WorkerTodo[] }) => {
+      this.emit('assignmentPlanned', data);
+    });
+
+    coordinator.on('assignmentCompleted', (data: { assignmentId: string; missionId: string; workerId: WorkerSlot; success: boolean }) => {
+      this.emit('assignmentCompleted', data);
+    });
+
+    try {
+      // ========== 构建智能执行选项 ==========
+      const executeOptions = {
+        workingDirectory: options.workingDirectory,
+        timeout: options.timeout,
+        projectContext: options.projectContext,
+        parallel: strategy?.parallel ?? options.parallel,
+        parallelPlanning: options.parallelPlanning,
+        blockingTimeout: options.blockingTimeout,
+        blockingCheckInterval: options.blockingCheckInterval,
+        onOutput: options.onOutput,
+        onReport: options.onReport ?? (async (report) => responder.handleReport(report)),
+        reportTimeout: options.reportTimeout,
+        // ========== 智能执行策略 ==========
+        needsPlanning: strategy?.needsPlanning ?? true,
+        needsReview: strategy?.needsReview ?? false,
+        needsVerification: strategy?.needsVerification ?? true,
+        // ========== SubTask 同步 ==========
+        taskId: mission.externalTaskId,
+      };
+
+      const coordResult = await coordinator.execute(executeOptions);
+
+      // 完成或失败 Mission
+      if (coordResult.success) {
+        await this.completeMission(mission.id, mission);
+      } else {
+        await this.failMission(mission.id, coordResult.errors.join('; '), mission);
+      }
+
+      // 构建执行结果
+      const result: ExecutionResult = {
+        mission,
+        success: coordResult.success,
+        assignmentResults: coordResult.assignmentResults, // 使用 ExecutionCoordinator 返回的详细结果
+        contractVerifications: new Map(),
+        blockedItems: [],
+        resolvedBlockings: [],
+        errors: coordResult.errors,
+        duration: Date.now() - startTime,
+        tokenUsage: coordResult.tokenUsage,
+      };
+
+      this.emit('executionCompleted', result);
+      this.currentMissionId = null;
+
+      return result;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      await this.failMission(mission.id, errorMessage, mission);
+
+      this.emit('executionFailed', { missionId: mission.id, error: errorMessage });
+      this.currentMissionId = null;
+
+      return {
+        mission,
+        success: false,
+        assignmentResults: new Map(),
+        contractVerifications: new Map(),
+        blockedItems: [],
+        resolvedBlockings: [],
+        errors: [errorMessage],
+        duration: Date.now() - startTime,
+      };
+    }
+  }
+
+  /**
+   * 获取 Worker
+   */
+  getWorker(workerType: WorkerSlot): AutonomousWorker | undefined {
+    return this.workers.get(workerType);
+  }
+
+  /**
+   * 获取所有 Worker
+   */
+  getAllWorkers(): Map<WorkerSlot, AutonomousWorker> {
+    return new Map(this.workers);
+  }
+
+  /**
+   * 获取当前执行中的 Mission ID
+   */
+  getCurrentMissionId(): string | null {
+    return this.currentMissionId;
+  }
+
+  /**
+   * 检查是否正在执行 Mission
+   */
+  isExecuting(): boolean {
+    return this.currentMissionId !== null;
   }
 }

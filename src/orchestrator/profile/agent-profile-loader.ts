@@ -232,7 +232,7 @@ export class AgentProfileLoader {
   }
 
   /**
-   * 获取底层 ProfileLoader（用于向后兼容）
+   * 获取底层 ProfileLoader
    */
   getProfileLoader(): ProfileLoader {
     return this.profileLoader;

@@ -257,7 +257,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     const blocks: string[] = [];
 
     const header = [
-      '## 可用 Skills（兼容 Claude Code）',
+      '## 可用 Skills',
       '- 你可以在合适的任务中主动使用 Skill。',
       '- 当用户输入 /skill-name 时，必须应用对应 Skill 指令。',
     ].join('\n');

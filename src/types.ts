@@ -397,7 +397,7 @@ export interface UIState {
   currentTask?: Task;
   tasks?: Task[];
   activePlan?: { planId: string; formattedPlan: string; updatedAt: number; review?: { status: 'approved' | 'rejected' | 'skipped'; summary: string } };
-  workerStatuses: WorkerStatus[];  // ✅ 使用 WorkerStatus 替代 cliStatuses
+  workerStatuses: WorkerStatus[];
   pendingChanges: PendingChange[];
   isRunning: boolean;
   logs: LogEntry[];
@@ -544,7 +544,7 @@ export type ExtensionToWebviewMessage =
   | { type: 'taskAccepted'; requestId?: string; sessionId?: string | null }
   | { type: 'taskRejected'; requestId?: string; message: string; sessionId?: string | null }
   | { type: 'taskUpdate'; task: Task }
-  | { type: 'workerStatusUpdate'; statuses: Record<string, { status: string; model?: string }> }
+  | { type: 'workerStatusUpdate'; statuses: Record<string, { status: string; model?: string; error?: string }> }
   | { type: 'workerStatusChanged'; worker: WorkerSlot; available: boolean; model?: string }
   | { type: 'workerError'; worker: string; error: string; source?: MessageSource }
   | { type: 'streamEvent'; phase: 'chunk' | 'complete'; content?: string; error?: string; sessionId?: string | null; source?: MessageSource; worker?: WorkerSlot; append?: boolean; sentAt?: number; target?: 'thread' | 'worker' }
@@ -592,7 +592,7 @@ export type ExtensionToWebviewMessage =
   | { type: 'orchestratorConnectionTestResult'; success: boolean; error?: string }
   | { type: 'compressorConfigLoaded'; config: any }
   | { type: 'compressorConfigSaved'; success?: boolean; error?: string }
-  | { type: 'compressorConnectionTestResult'; success: boolean; error?: string }
+  | { type: 'compressorConnectionTestResult'; success: boolean; error?: string; fallbackModel?: string }
   // 新增：MCP 配置响应
   | { type: 'mcpServersLoaded'; servers: any[] }
   | { type: 'mcpServerAdded'; server: any }

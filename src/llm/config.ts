@@ -147,7 +147,7 @@ export class LLMConfigLoader {
       apiKey: orchestratorConfig.apiKey || defaults.apiKey,
       model: orchestratorConfig.model || defaults.model,
       provider: orchestratorConfig.provider || defaults.provider,
-      enabled: orchestratorConfig.enabled !== false,
+      enabled: true,
     };
   }
 
@@ -319,7 +319,7 @@ export class LLMConfigLoader {
       apiKey: config.apiKey,
       model: config.model,
       provider: config.provider,
-      enabled: config.enabled !== false,
+      enabled: true,
     };
 
     this.saveFullConfig(fullConfig);
@@ -333,7 +333,7 @@ export class LLMConfigLoader {
     const fullConfig = this.loadLLMConfigFile();
 
     fullConfig.compressor = {
-      enabled: config.enabled === true,
+      enabled: Boolean(config.apiKey) || config.enabled === true,
       baseUrl: config.baseUrl,
       apiKey: config.apiKey,
       model: config.model,
@@ -353,7 +353,7 @@ export class LLMConfigLoader {
     const defaults = this.getDefaultLLMConfig().compressor;
 
     return {
-      enabled: compressorConfig.enabled === true,
+      enabled: Boolean(compressorConfig.apiKey) || compressorConfig.enabled === true,
       baseUrl: compressorConfig.baseUrl || defaults.baseUrl,
       apiKey: compressorConfig.apiKey || defaults.apiKey,
       model: compressorConfig.model || defaults.model,
@@ -543,8 +543,7 @@ export class LLMConfigLoader {
   private static normalizeSkillsConfig(rawConfig: any): { normalized: any; changed: boolean } {
     const config = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
     const normalized: any = {
-      // 注意：builtInTools 已废弃，内置工具由 ToolManager 直接管理
-      // 保留字段以兼容旧配置文件读取，但不再使用
+      // 内置工具由 ToolManager 直接管理，此处只处理用户自定义配置
       customTools: Array.isArray(config.customTools) ? config.customTools : [],
       instructionSkills: Array.isArray(config.instructionSkills) ? config.instructionSkills : [],
       repositories: Array.isArray(config.repositories) ? config.repositories : [],

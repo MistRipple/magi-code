@@ -106,6 +106,17 @@ export interface FAQRecord {
 }
 
 /**
+ * 经验记录
+ */
+export interface LearningRecord {
+  id: string;
+  content: string;
+  context: string;
+  createdAt: number;
+  tags?: string[];
+}
+
+/**
  * 项目知识库配置
  */
 export interface ProjectKnowledgeConfig {
@@ -127,6 +138,7 @@ export class ProjectKnowledgeBase {
   private codeIndex: CodeIndex | null = null;
   private adrs: ADRRecord[] = [];
   private faqs: FAQRecord[] = [];
+  private learnings: LearningRecord[] = [];
 
   private indexPatterns: string[];
   private ignorePatterns: string[];
@@ -178,6 +190,7 @@ export class ProjectKnowledgeBase {
     await this.loadCodeIndex();
     await this.loadADRs();
     await this.loadFAQs();
+    await this.loadLearnings();
 
     // 如果没有索引，执行首次索引
     if (!this.codeIndex) {
@@ -187,7 +200,8 @@ export class ProjectKnowledgeBase {
     logger.info('项目知识库.初始化.完成', {
       files: this.codeIndex?.files.length || 0,
       adrs: this.adrs.length,
-      faqs: this.faqs.length
+      faqs: this.faqs.length,
+      learnings: this.learnings.length
     }, LogCategory.SESSION);
   }
 
@@ -993,6 +1007,41 @@ ${conversationText}
   }
 
   // ============================================================================
+  // Learning 管理
+  // ============================================================================
+
+  /**
+   * 添加经验记录
+   */
+  addLearning(content: string, context: string, tags?: string[]): LearningRecord {
+    const now = Date.now();
+    const record: LearningRecord = {
+      id: `learning_${now}_${Math.random().toString(36).substring(2, 8)}`,
+      content,
+      context,
+      createdAt: now,
+      tags,
+    };
+    this.learnings.push(record);
+    this.saveLearnings();
+    logger.info('项目知识库.Learning.已添加', { id: record.id }, LogCategory.SESSION);
+    return record;
+  }
+
+  /**
+   * 获取所有经验记录
+   */
+  getLearnings(): LearningRecord[] {
+    const { records, changed } = this.normalizeLearningRecords(this.learnings);
+    if (changed) {
+      this.learnings = records;
+      this.saveLearnings();
+      logger.warn('项目知识库.Learning.已自动清理(访问时)', { count: this.learnings.length }, LogCategory.SESSION);
+    }
+    return this.learnings;
+  }
+
+  // ============================================================================
   // 持久化
   // ============================================================================
 
@@ -1095,6 +1144,19 @@ ${conversationText}
   }
 
   /**
+   * 保存经验记录
+   */
+  private saveLearnings(): void {
+    const filePath = path.join(this.storageDir, 'learnings.json');
+    try {
+      fs.writeFileSync(filePath, JSON.stringify(this.learnings, null, 2), 'utf-8');
+      logger.info('项目知识库.Learning.已保存', { count: this.learnings.length }, LogCategory.SESSION);
+    } catch (error) {
+      logger.error('项目知识库.Learning.保存失败', { error }, LogCategory.SESSION);
+    }
+  }
+
+  /**
    * 加载 FAQs
    */
   private async loadFAQs(): Promise<void> {
@@ -1116,6 +1178,31 @@ ${conversationText}
       }
     } catch (error) {
       logger.error('项目知识库.FAQ.加载失败', { error }, LogCategory.SESSION);
+    }
+  }
+
+  /**
+   * 加载经验记录
+   */
+  private async loadLearnings(): Promise<void> {
+    const filePath = path.join(this.storageDir, 'learnings.json');
+    if (!fs.existsSync(filePath)) {
+      return;
+    }
+
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const raw = JSON.parse(content);
+      const { records, changed } = this.normalizeLearningRecords(raw);
+      this.learnings = records;
+      if (changed) {
+        this.saveLearnings();
+        logger.warn('项目知识库.Learning.已自动清理', { count: this.learnings.length }, LogCategory.SESSION);
+      } else {
+        logger.info('项目知识库.Learning.已加载', { count: this.learnings.length }, LogCategory.SESSION);
+      }
+    } catch (error) {
+      logger.error('项目知识库.Learning.加载失败', { error }, LogCategory.SESSION);
     }
   }
 
@@ -1229,6 +1316,50 @@ ${conversationText}
         createdAt,
         updatedAt,
         useCount,
+      });
+      if (!((item as any).id)) changed = true;
+    });
+    return { records, changed };
+  }
+
+  private normalizeLearningRecords(raw: unknown): { records: LearningRecord[]; changed: boolean } {
+    const now = Date.now();
+    if (!Array.isArray(raw)) {
+      return { records: [], changed: true };
+    }
+
+    let changed = false;
+    const records: LearningRecord[] = [];
+    raw.forEach((item, index) => {
+      if (!item || typeof item !== 'object') {
+        changed = true;
+        return;
+      }
+      const content = typeof (item as any).content === 'string' ? (item as any).content.trim() : '';
+      if (!content) {
+        changed = true;
+        return;
+      }
+      const context = typeof (item as any).context === 'string' ? (item as any).context : '';
+      const createdAt = typeof (item as any).createdAt === 'number' ? (item as any).createdAt : now;
+      const tags = Array.isArray((item as any).tags)
+        ? (item as any).tags.filter((value: unknown) => typeof value === 'string')
+        : undefined;
+
+      if (
+        context !== (item as any).context ||
+        createdAt !== (item as any).createdAt ||
+        (Array.isArray(tags) && tags.length !== ((item as any).tags || []).length)
+      ) {
+        changed = true;
+      }
+
+      records.push({
+        id: typeof (item as any).id === 'string' && (item as any).id ? (item as any).id : `learning-${now}-${index}`,
+        content,
+        context,
+        createdAt,
+        tags,
       });
       if (!((item as any).id)) changed = true;
     });

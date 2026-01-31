@@ -37,7 +37,21 @@ export abstract class BaseLLMClient extends EventEmitter implements LLMClient {
   ): Promise<LLMResponse>;
 
   /**
-   * 测试连接
+   * 快速测试连接（使用 Models API）
+   *
+   * 使用 /v1/models 端点验证 API Key 有效性，不消耗 tokens。
+   * 比 testConnection() 快约 10 倍。
+   *
+   * @returns 包含成功/失败状态、模型是否存在的结果
+   */
+  abstract testConnectionFast(): Promise<{
+    success: boolean;
+    modelExists?: boolean;
+    error?: string;
+  }>;
+
+  /**
+   * 测试连接（发送真实消息）
    *
    * 注意：此方法会发送一个实际的 LLM 请求来测试连接，可能产生延迟和费用。
    * 不建议在连接阶段调用，Adapter.connect() 已不再使用此方法。

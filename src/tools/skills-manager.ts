@@ -2,7 +2,7 @@
  * Skills Manager (精简版)
  *
  * 仅管理指令型 Skills 和自定义工具
- * 内置工具（execute_shell, text_editor, grep_search 等）已迁移到 ToolManager
+ * 内置工具（execute_shell, text_editor, grep_search 等）由 ToolManager 管理
  */
 
 import { logger, LogCategory } from '../logging/unified-logger';
@@ -72,7 +72,7 @@ export interface SkillsConfig {
  * Skills Manager
  *
  * 管理指令型 Skills 和自定义工具
- * 注意：内置工具已迁移到 ToolManager
+ * 内置工具由 ToolManager 管理
  */
 export class SkillsManager implements ToolExecutor {
   private config: SkillsConfig;

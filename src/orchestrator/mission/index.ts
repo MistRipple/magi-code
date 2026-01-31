@@ -6,7 +6,7 @@
  * - Contract 契约管理
  * - Assignment 职责分配
  * - Storage 存储层
- * - Migration 迁移工具
+ * - StateMapper 状态映射
  */
 
 // 类型导出
@@ -28,11 +28,15 @@ export { ContractManager } from './contract-manager';
 // 职责分配管理
 export { AssignmentManager } from './assignment-manager';
 
-// 迁移工具
+// 状态映射器
 export {
-  MissionMigrationTool,
-  MigrationStats,
-  MigrationOptions,
-  migrateSessionPlans,
-  migrateAllSessions,
-} from './migration-tool';
+  MissionStateMapper,
+  globalMissionStateMapper,
+  type TaskView,
+  type SubTaskView as MissionSubTaskView,
+  type TodoView,
+  type TaskViewStatus,
+  type SubTaskViewStatus,
+  type TodoViewStatus,
+  type StateChangeCallback,
+} from './state-mapper';

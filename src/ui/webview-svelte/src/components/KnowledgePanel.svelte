@@ -47,7 +47,7 @@
   );
 
   // 过滤后的 ADR 列表
-  const filteredAdrs = $derived(() => {
+  const filteredAdrs = $derived.by(() => {
     let result = adrs;
     if (adrFilter !== 'all') {
       result = result.filter(adr => adr.status === adrFilter);
@@ -74,7 +74,7 @@
   });
 
   // 过滤后的 FAQ 列表
-  const filteredFaqs = $derived(() => {
+  const filteredFaqs = $derived.by(() => {
     if (!searchQuery.trim()) return faqs;
     const query = searchQuery.toLowerCase();
     return faqs.filter(faq =>
@@ -274,14 +274,14 @@
             <button class="knowledge-filter-btn" class:active={adrFilter === 'superseded'} onclick={() => adrFilter = 'superseded'}>已替代</button>
           </div>
           <div class="knowledge-list">
-            {#if filteredAdrs().length === 0}
+            {#if filteredAdrs.length === 0}
               <div class="knowledge-empty">
                 <Icon name="document" size={32} class="knowledge-empty-icon" />
                 <div class="knowledge-empty-text">暂无架构决策记录</div>
                 <div class="knowledge-empty-hint">完成任务后会自动提取</div>
               </div>
             {:else}
-              {#each filteredAdrs() as adr (adr.id)}
+              {#each filteredAdrs as adr (adr.id)}
                 <button type="button" class="knowledge-list-item" class:selected={selectedItem === adr} onclick={() => selectAdr(adr)}>
                   <div class="knowledge-item-header">
                     <span class="knowledge-item-title">{adr.title}</span>
@@ -308,14 +308,14 @@
         <!-- FAQ 列表内容 -->
         <div class="knowledge-list-content">
           <div class="knowledge-list">
-            {#if filteredFaqs().length === 0}
+            {#if filteredFaqs.length === 0}
               <div class="knowledge-empty">
                 <Icon name="question" size={32} class="knowledge-empty-icon" />
                 <div class="knowledge-empty-text">暂无常见问题</div>
                 <div class="knowledge-empty-hint">完成任务后会自动提取</div>
               </div>
             {:else}
-              {#each filteredFaqs() as faq (faq.id)}
+              {#each filteredFaqs as faq (faq.id)}
                 <button type="button" class="knowledge-list-item" class:selected={selectedItem === faq} onclick={() => selectFaq(faq)}>
                   <div class="knowledge-item-header">
                     <span class="knowledge-item-title">{faq.question}</span>

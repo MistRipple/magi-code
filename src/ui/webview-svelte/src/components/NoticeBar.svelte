@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
+  import type { IconName } from '../lib/icons';
 
   type NoticeType = 'info' | 'success' | 'warning' | 'error' | 'loading';
 
@@ -18,7 +19,7 @@
   }: Props = $props();
 
   // 类型配置
-  const typeConfig: Record<NoticeType, { icon: string; color: string }> = {
+  const typeConfig: Record<NoticeType, { icon: IconName; color: string }> = {
     info: { icon: 'info', color: 'var(--info)' },
     success: { icon: 'check', color: 'var(--success)' },
     warning: { icon: 'warning', color: 'var(--warning)' },

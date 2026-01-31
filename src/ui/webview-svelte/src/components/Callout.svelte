@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
+  import type { IconName } from '../lib/icons';
 
   // 提示面板类型
   type CalloutType = 'info' | 'success' | 'warning' | 'error' | 'tip' | 'note';
@@ -7,7 +8,7 @@
   interface Props {
     type?: CalloutType;
     title?: string;
-    icon?: string;
+    icon?: IconName;
     closable?: boolean;
     collapsed?: boolean;
     onclose?: () => void;
@@ -25,10 +26,15 @@
   }: Props = $props();
 
   // 内部折叠状态
-  let isCollapsed = $state(collapsed);
+  let isCollapsed = $state(false);
+
+  // 同步外部 collapsed prop
+  $effect(() => {
+    isCollapsed = collapsed;
+  });
 
   // 类型配置
-  const typeConfig: Record<CalloutType, { icon: string; label: string }> = {
+  const typeConfig: Record<CalloutType, { icon: IconName; label: string }> = {
     info: { icon: 'info', label: '信息' },
     success: { icon: 'check', label: '成功' },
     warning: { icon: 'warning', label: '警告' },
@@ -38,7 +44,7 @@
   };
 
   const config = $derived(typeConfig[type] || typeConfig.info);
-  const displayIcon = $derived(icon || config.icon);
+  const displayIcon = $derived<IconName>(icon || config.icon);
   const displayTitle = $derived(title || config.label);
 
   function toggle() {
@@ -48,14 +54,27 @@
   function handleClose() {
     onclose?.();
   }
+
+  function handleKeyDown(event: KeyboardEvent) {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      toggle();
+    }
+  }
 </script>
 
-<div 
+<div
   class="callout callout--{type}"
   class:collapsed={isCollapsed}
   role="alert"
 >
-  <div class="callout-header" onclick={toggle}>
+  <div
+    class="callout-header"
+    onclick={toggle}
+    onkeydown={handleKeyDown}
+    role="button"
+    tabindex="0"
+  >
     <span class="callout-icon">
       <Icon name={displayIcon} size={16} />
     </span>

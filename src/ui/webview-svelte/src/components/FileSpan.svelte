@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
+  import type { IconName } from '../lib/icons';
 
   interface Props {
     filepath: string;
@@ -17,39 +18,39 @@
 
   // 获取文件名
   const filename = $derived(filepath.split('/').pop() || filepath);
-  
+
   // 获取目录路径
-  const directory = $derived(() => {
+  const directory = $derived.by(() => {
     const parts = filepath.split('/');
     parts.pop();
     return parts.join('/');
   });
 
   // 获取文件扩展名图标
-  function getFileIcon(path: string): string {
+  function getFileIcon(path: string): IconName {
     const ext = path.split('.').pop()?.toLowerCase();
-    const iconMap: Record<string, string> = {
-      'ts': 'typescript',
-      'tsx': 'react',
-      'js': 'javascript',
-      'jsx': 'react',
-      'svelte': 'svelte',
-      'vue': 'vue',
-      'py': 'python',
-      'go': 'go',
-      'rs': 'rust',
-      'java': 'java',
-      'md': 'markdown',
-      'json': 'json',
-      'css': 'css',
-      'scss': 'sass',
-      'html': 'html',
-      'yaml': 'yaml',
-      'yml': 'yaml',
+    const iconMap: Record<string, IconName> = {
+      'ts': 'code',
+      'tsx': 'code',
+      'js': 'code',
+      'jsx': 'code',
+      'svelte': 'code',
+      'vue': 'code',
+      'py': 'code',
+      'go': 'code',
+      'rs': 'code',
+      'java': 'code',
+      'md': 'document',
+      'json': 'file-text',
+      'css': 'code',
+      'scss': 'code',
+      'html': 'code',
+      'yaml': 'settings',
+      'yml': 'settings',
       'toml': 'settings',
       'sh': 'terminal',
       'bash': 'terminal',
-      'sql': 'database',
+      'sql': 'file-text',
     };
     return iconMap[ext || ''] || 'file';
   }
@@ -84,8 +85,8 @@
       </span>
     {/if}
     <span class="filespan-name">{filename}</span>
-    {#if directory()}
-      <span class="filespan-dir">{directory()}</span>
+    {#if directory}
+      <span class="filespan-dir">{directory}</span>
     {/if}
   </button>
 {:else}

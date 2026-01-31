@@ -2,9 +2,8 @@
  * Core Module - Mission-Driven Architecture 核心
  *
  * 提供任务编排和执行的核心组件：
- * - MissionOrchestrator: 任务编排核心
- * - MissionExecutor: 任务执行器
- * - MissionDrivenEngine: OrchestratorAgent 替代品（Phase 8 迁移）
+ * - MissionOrchestrator: 任务编排核心（含执行能力，MissionExecutor 已合并）
+ * - MissionDrivenEngine: 编排引擎
  */
 
 export {
@@ -13,19 +12,20 @@ export {
   PlanningOptions,
   MissionVerificationResult,
   MissionSummary,
-} from './mission-orchestrator';
-
-export {
-  MissionExecutor,
+  // 执行相关类型（从 MissionExecutor 合并）
   ExecutionOptions,
   ExecutionProgress,
   ExecutionResult,
+} from './mission-orchestrator';
+
+// 阻塞相关类型
+export {
+  BlockedItem,
   BlockedItemType,
   BlockingReason,
-  BlockedItem,
-} from './mission-executor';
+} from './executors/blocking-manager';
 
-// Phase 8: OrchestratorAgent 替代品
+// 编排引擎
 export {
   MissionDrivenEngine,
   MissionDrivenEngineConfig,
@@ -35,3 +35,15 @@ export {
   ClarificationCallback as MissionClarificationCallback,
   WorkerQuestionCallback as MissionWorkerQuestionCallback,
 } from './mission-driven-engine';
+
+// 统一消息出口
+export {
+  MessageHub,
+  globalMessageHub,
+  type SubTaskView,
+  type ProgressData,
+  type ResultData,
+  type ErrorData,
+  type WorkerOutputData,
+  type MessageHubEvents,
+} from './message-hub';

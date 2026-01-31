@@ -5,10 +5,32 @@
  * - 根据 Worker 画像生成 Prompt 前缀
  * - 通过 Prompt 引导 Worker 行为（而非限制工具）
  * - 支持协作上下文注入
+ * - 提案 4.3: 6-Section 结构化委托提示
+ * - 提案 4.4: 分类别约束
  */
 
 import { WorkerSlot } from '../../types/agent-types';
-import { WorkerProfile, InjectionContext } from './types';
+import { WorkerProfile, InjectionContext, CategoryType } from './types';
+
+// ============================================================================
+// 任务结构化信息 - 提案 4.3
+// ============================================================================
+
+/**
+ * 任务结构化信息
+ */
+export interface TaskStructuredInfo {
+  /** 预期结果 */
+  expectedOutcome?: string[];
+  /** 必须做 */
+  mustDo?: string[];
+  /** 禁止做 */
+  mustNotDo?: string[];
+  /** 相关决策（从 MemoryDocument 获取） */
+  relatedDecisions?: string[];
+  /** 待解决问题（从 MemoryDocument 获取） */
+  pendingIssues?: string[];
+}
 
 export class GuidanceInjector {
   /**
@@ -29,9 +51,9 @@ export class GuidanceInjector {
       sections.push(this.buildFocusSection(profile));
     }
 
-    // 3. 行为约束（建议性）
+    // 3. 行为约束（建议性）- 支持分类别约束
     if (profile.guidance.constraints.length > 0) {
-      sections.push(this.buildConstraintsSection(profile));
+      sections.push(this.buildConstraintsSection(profile, context.category as CategoryType));
     }
 
     // 4. 协作上下文
@@ -69,10 +91,101 @@ export class GuidanceInjector {
 
   /**
    * 构建行为约束部分
+   * 提案 4.4: 支持分类别约束
    */
-  private buildConstraintsSection(profile: WorkerProfile): string {
-    const items = profile.guidance.constraints.map(c => `- ${c}`).join('\n');
-    return `## 注意事项\n${items}`;
+  private buildConstraintsSection(
+    profile: WorkerProfile,
+    category?: CategoryType
+  ): string {
+    const sections: string[] = [];
+
+    // 1. 通用约束
+    const baseItems = profile.guidance.constraints.map(c => `- ${c}`).join('\n');
+    sections.push(`## 注意事项\n\n### 通用约束\n${baseItems}`);
+
+    // 2. 分类别专项约束 - 提案 4.4
+    if (category) {
+      const categoryConstraints = this.getCategoryConstraints(category);
+      if (categoryConstraints.length > 0) {
+        const categoryItems = categoryConstraints.map(c => `- ${c}`).join('\n');
+        sections.push(`### ${category} 任务专项约束\n${categoryItems}`);
+      }
+    }
+
+    return sections.join('\n\n');
+  }
+
+  /**
+   * 获取分类别约束 - 提案 4.4
+   */
+  private getCategoryConstraints(category: CategoryType): string[] {
+    const presets: Record<string, string[]> = {
+      'bugfix': [
+        '只修复指定的 bug，不要顺便重构',
+        '不要添加新功能',
+        '保持代码风格一致',
+        '确保修复不引入新问题',
+      ],
+      'refactor': [
+        '不要改变外部行为',
+        '每次只重构一个模块',
+        '重构前确保测试覆盖',
+        '保持向后兼容（如有需要）',
+      ],
+      'review': [
+        '只分析代码，不要修改',
+        '关注逻辑问题而非风格问题',
+        '提供具体的改进建议',
+      ],
+      'feature': [
+        '遵循现有代码模式',
+        '添加必要的错误处理',
+        '考虑边界情况',
+        '不要过度设计',
+      ],
+      'test': [
+        '测试行为而非实现',
+        '覆盖边界情况',
+        '保持测试独立性',
+        '使用有意义的测试名称',
+      ],
+      'documentation': [
+        '保持文档与代码同步',
+        '使用清晰的语言',
+        '包含必要的示例',
+      ],
+      'optimization': [
+        '先测量再优化',
+        '不要过早优化',
+        '保持代码可读性',
+        '记录优化理由',
+      ],
+      'security': [
+        '遵循安全最佳实践',
+        '验证所有输入',
+        '不要在代码中硬编码敏感信息',
+        '使用安全的加密算法',
+      ],
+      'migration': [
+        '创建回滚计划',
+        '分阶段迁移',
+        '保持数据完整性',
+        '验证迁移结果',
+      ],
+      'config': [
+        '使用环境变量管理敏感配置',
+        '提供合理的默认值',
+        '文档化配置选项',
+      ],
+      'integration': [
+        '使用适配器模式隔离外部依赖',
+        '处理网络超时和重试',
+        '记录集成日志',
+      ],
+      'general': [],
+    };
+
+    return presets[category] || presets['general'] || [];
   }
 
   /**
@@ -131,11 +244,13 @@ export class GuidanceInjector {
   /**
    * 构建完整的任务 Prompt
    * 组合引导 Prompt + 上下文 + 任务描述
+   * 提案 4.3: 支持 TaskStructuredInfo
    */
   buildFullTaskPrompt(
     profile: WorkerProfile,
     context: InjectionContext,
-    additionalContext?: string
+    additionalContext?: string,
+    taskInfo?: TaskStructuredInfo
   ): string {
     const sections: string[] = [];
 
@@ -143,27 +258,69 @@ export class GuidanceInjector {
     const guidancePrompt = this.buildWorkerPrompt(profile, context);
     sections.push(guidancePrompt);
 
-    // 2. 项目上下文（如果有）
+    // 2. 任务结构化信息 - 提案 4.3
+    if (taskInfo) {
+      const structuredSection = this.buildTaskStructuredSection(taskInfo);
+      if (structuredSection) {
+        sections.push(structuredSection);
+      }
+    }
+
+    // 3. 项目上下文（如果有）
     if (additionalContext) {
       sections.push(`## 项目上下文\n${additionalContext}`);
     }
 
-    // 3. 当前任务
+    // 4. 当前任务
     sections.push(`## 当前任务\n${context.taskDescription}`);
 
-    // 4. 目标文件（如果有）
+    // 5. 目标文件（如果有）
     if (context.targetFiles && context.targetFiles.length > 0) {
       const files = context.targetFiles.map(f => `- ${f}`).join('\n');
       sections.push(`## 目标文件\n${files}`);
     }
 
-    // 5. 依赖任务（如果有）
+    // 6. 依赖任务（如果有）
     if (context.dependencies && context.dependencies.length > 0) {
       const deps = context.dependencies.map(d => `- ${d}`).join('\n');
       sections.push(`## 依赖任务\n${deps}`);
     }
 
     return sections.join('\n\n---\n\n');
+  }
+
+  /**
+   * 构建任务结构化信息部分 - 提案 4.3
+   */
+  private buildTaskStructuredSection(taskInfo: TaskStructuredInfo): string | null {
+    const parts: string[] = [];
+
+    // 预期结果
+    if (taskInfo.expectedOutcome && taskInfo.expectedOutcome.length > 0) {
+      parts.push(`## 预期结果\n${taskInfo.expectedOutcome.map(o => `- ${o}`).join('\n')}`);
+    }
+
+    // 必须做
+    if (taskInfo.mustDo && taskInfo.mustDo.length > 0) {
+      parts.push(`## 必须遵守\n${taskInfo.mustDo.map(m => `- ${m}`).join('\n')}`);
+    }
+
+    // 禁止做
+    if (taskInfo.mustNotDo && taskInfo.mustNotDo.length > 0) {
+      parts.push(`## 禁止行为\n${taskInfo.mustNotDo.map(m => `- ❌ ${m}`).join('\n')}`);
+    }
+
+    // 相关决策
+    if (taskInfo.relatedDecisions && taskInfo.relatedDecisions.length > 0) {
+      parts.push(`## 已做决策\n${taskInfo.relatedDecisions.map(d => `- ✓ ${d}`).join('\n')}`);
+    }
+
+    // 待解决问题
+    if (taskInfo.pendingIssues && taskInfo.pendingIssues.length > 0) {
+      parts.push(`## 需要注意\n${taskInfo.pendingIssues.map(i => `- ⚠️ ${i}`).join('\n')}`);
+    }
+
+    return parts.length > 0 ? parts.join('\n\n') : null;
   }
 
   /**

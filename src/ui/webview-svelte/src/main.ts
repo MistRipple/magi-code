@@ -1,6 +1,7 @@
 import { mount } from 'svelte';
 import App from './App.svelte';
 import './styles/global.css';
+import './styles/messages.css';
 import { initMessageHandler } from './lib/message-handler';
 import { getInitialSessionId, vscode } from './lib/vscode-bridge';
 import { setCurrentSessionId } from './stores/messages.svelte';
