@@ -1,7 +1,7 @@
 /**
  * Orchestrator Normalizer - 编排器消息标准化
  *
- * 将 OrchestratorAgent 的 emitUIMessage 转换为标准消息格式
+ * 将编排器的 UI 消息转换为标准消息格式
  * 实现编排器消息与模型消息的统一处理
  */
 
@@ -88,7 +88,7 @@ export function normalizeOrchestratorMessage(
     id: messageId,
     traceId: traceId || `trace-${uuidv4().substring(0, 8)}`,
     type: messageType,
-    agent: 'orchestrator',  // ✅ 使用 agent 替代旧字段
+    agent: 'orchestrator',
     source: 'orchestrator',
     lifecycle,
     timestamp: uiMessage.timestamp || Date.now(),

@@ -2,14 +2,15 @@
   import { getState } from '../stores/messages.svelte';
   import { vscode } from '../lib/vscode-bridge';
   import { ensureArray } from '../lib/utils';
+  import type { Edit } from '../types/message';
   import WorkerBadge from './WorkerBadge.svelte';
 
   const appState = getState();
 
   // 变更列表
-  const edits = $derived(ensureArray(appState.edits));
+  const edits = $derived(ensureArray(appState.edits) as Edit[]);
 
-  function getContributors(edit: any): string[] {
+  function getContributors(edit: Edit): string[] {
     if (Array.isArray(edit?.contributors) && edit.contributors.length > 0) {
       return edit.contributors;
     }

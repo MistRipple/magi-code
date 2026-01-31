@@ -37,11 +37,28 @@ export interface ThinkingBlock {
 
 // 消息内容块
 export interface ContentBlock {
-  type: 'text' | 'code' | 'thinking' | 'tool_call' | 'tool_result';
+  id?: string;                // 唯一标识符，用于 #each 循环的 key
+  type: 'text' | 'code' | 'thinking' | 'tool_call' | 'tool_result' | 'file_change' | 'plan';
   content: string;
   language?: string;        // 代码块语言
   toolCall?: ToolCall;      // 工具调用信息
   thinking?: ThinkingBlock; // 思考块信息
+  fileChange?: {
+    filePath: string;
+    changeType: 'create' | 'modify' | 'delete';
+    additions?: number;
+    deletions?: number;
+    diff?: string;
+  };
+  plan?: {
+    goal: string;
+    analysis?: string;
+    constraints?: string[];
+    acceptanceCriteria?: string[];
+    riskLevel?: 'low' | 'medium' | 'high';
+    riskFactors?: string[];
+    rawJson?: string;
+  };
 }
 
 // Worker Todo
@@ -73,6 +90,34 @@ export interface AssignmentPlan {
 export interface MissionPlan {
   missionId: string;
   assignments: AssignmentPlan[];
+}
+
+// Wave 执行状态（提案 4.6）
+export interface WaveState {
+  /** 当前 Wave 索引 */
+  currentWave: number;
+  /** 总 Wave 数 */
+  totalWaves: number;
+  /** 每个 Wave 的任务 ID */
+  waves: string[][];
+  /** 关键路径 */
+  criticalPath: string[];
+  /** Wave 执行状态 */
+  status: 'idle' | 'executing' | 'completed';
+}
+
+// Worker Session 状态（提案 4.1）
+export interface WorkerSessionState {
+  /** Session ID */
+  sessionId: string;
+  /** Assignment ID */
+  assignmentId: string;
+  /** Worker ID */
+  workerId: string;
+  /** 是否为恢复的 Session */
+  isResumed: boolean;
+  /** 已完成的 Todo 数 */
+  completedTodos: number;
 }
 
 // 单条消息
@@ -143,13 +188,50 @@ export interface AutoScrollConfig {
   gemini: boolean;
 }
 
+// 任务状态
+export type TaskStatus = 'pending' | 'paused' | 'running' | 'completed' | 'failed' | 'cancelled';
+
+// 任务
+export interface Task {
+  id?: string;
+  name?: string;
+  prompt?: string;
+  description?: string;
+  status: TaskStatus;
+}
+
+// 编辑/变更记录
+export type EditType = 'add' | 'modify' | 'delete';
+
+export interface Edit {
+  filePath: string;
+  type?: EditType;
+  additions?: number;
+  deletions?: number;
+  contributors?: string[];
+  workerId?: string;
+}
+
+// Toast 通知
+export type ToastType = 'info' | 'success' | 'warning' | 'error';
+
+export interface Toast {
+  id: string;
+  type: ToastType;
+  title?: string;
+  message: string;
+}
+
 // 应用状态（后端下发的完整状态）
 export interface AppState {
   sessions?: Session[];
   currentSession?: Session;
   isProcessing?: boolean;
   pendingChanges?: unknown[];
-  tasks?: unknown[];
+  tasks?: Task[];
+  edits?: Edit[];
+  toasts?: Toast[];
+  interactionMode?: 'ask' | 'auto';
   [key: string]: unknown;
 }
 

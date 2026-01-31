@@ -26,19 +26,23 @@ export * from './recovery';
 // 核心编排器
 // ============================================================================
 
-// 智能编排器
+// 编排引擎
 export {
-  IntelligentOrchestrator,
-  type ExecutionPlan,
-  type SubTaskPlan,
-  type ExecutionResult,
-  type OrchestratorConfig,
-  type OrchestratorPhase,
-  type ConfirmationCallback,
-  type RecoveryConfirmationCallback,
-  type ClarificationCallback,
-  type WorkerQuestionCallback,
-} from './intelligent-orchestrator';
+  MissionDrivenEngine,
+  type MissionDrivenEngineConfig,
+  type MissionDrivenContext,
+  type MissionConfirmationCallback as ConfirmationCallback,
+  type MissionRecoveryConfirmationCallback as RecoveryConfirmationCallback,
+  type MissionClarificationCallback as ClarificationCallback,
+  type MissionWorkerQuestionCallback as WorkerQuestionCallback,
+} from './core';
+
+// 协议类型
+export type {
+  ExecutionPlan,
+  ExecutionResult,
+  OrchestratorState as OrchestratorPhase,
+} from './protocols';
 
 // 风险策略内核
 export { RiskPolicy } from './risk-policy';
@@ -54,6 +58,18 @@ export {
 
 // 消息总线
 export { MessageBus, globalMessageBus } from './message-bus';
+
+// 统一消息出口（Phase 4）
+export {
+  MessageHub,
+  globalMessageHub,
+  type SubTaskView,
+  type ProgressData,
+  type ResultData,
+  type ErrorData,
+  type WorkerOutputData,
+  type MessageHubEvents,
+} from './core';
 
 // 协议类型
 export * from './protocols';

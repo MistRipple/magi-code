@@ -121,7 +121,7 @@ export class CodexNormalizer extends BaseNormalizer {
       }
     }
 
-    // 兼容 item delta 结构
+    // 处理 item delta 结构
     const delta = (event as { delta?: Record<string, unknown> }).delta;
     if (delta && typeof delta.text === 'string') {
       context.pendingText += delta.text;

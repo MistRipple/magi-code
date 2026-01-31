@@ -130,7 +130,18 @@ export const window = {
         if (value.message) console.log(`[Progress] ${value.message}`);
       }
     });
-  }
+  },
+  onDidCloseTerminal: () => ({ dispose: () => {} }),
+  createTerminal: (options?: any) => ({
+    name: options?.name || 'mock-terminal',
+    processId: Promise.resolve(12345),
+    sendText: (text: string) => console.log(`[Terminal] ${text}`),
+    show: () => {},
+    hide: () => {},
+    dispose: () => {},
+    exitStatus: undefined
+  }),
+  terminals: [] as any[]
 };
 
 // Mock workspace

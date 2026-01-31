@@ -121,6 +121,15 @@ export interface LLMClient {
    * 测试连接
    */
   testConnection(): Promise<boolean>;
+
+  /**
+   * 快速测试连接（使用 Models API，不消耗 tokens）
+   */
+  testConnectionFast(): Promise<{
+    success: boolean;
+    modelExists?: boolean;
+    error?: string;
+  }>;
 }
 
 // ============================================================================

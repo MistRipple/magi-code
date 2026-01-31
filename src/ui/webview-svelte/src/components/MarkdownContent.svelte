@@ -2,7 +2,6 @@
   import { onMount } from 'svelte';
   import { marked, type Token, type Tokens } from 'marked';
   import hljs from 'highlight.js';
-  import MermaidRenderer from './MermaidRenderer.svelte';
   import CodeBlock from './CodeBlock.svelte';
 
   // Props
@@ -95,7 +94,7 @@
 </script>
 
 <div class="markdown-content" class:streaming={isStreaming}>
-  {#each segments as segment, i (i)}
+  {#each segments as segment, i (`segment-${i}-${segment.type}`)}
     {#if segment.type === 'markdown'}
       {@html segment.html}
     {:else if segment.type === 'code'}

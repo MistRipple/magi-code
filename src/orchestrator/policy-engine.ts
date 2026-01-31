@@ -143,11 +143,12 @@ export class PolicyEngine extends EventEmitter {
     // 过滤出可用的 Worker
     const candidates = preferredWorkers.filter(w => available.includes(w));
     if (candidates.length === 0) {
-      // 回退到任何可用的 Worker
+      // 回退到任何可用的 Worker（从画像配置获取优先级）
+      const fallbackWorker = available[0] || this.getDefaultWorkerFromProfile();
       return {
-        recommendedWorker: available[0] || 'claude',
+        recommendedWorker: fallbackWorker,
         fallbackWorkers: available.slice(1),
-        reason: `无首选 Worker 可用，回退到 ${available[0] || 'claude'}`,
+        reason: `无首选 Worker 可用，回退到 ${fallbackWorker}`,
         confidence: 0.5,
       };
     }
@@ -300,7 +301,31 @@ export class PolicyEngine extends EventEmitter {
         available.push(worker);
       }
     }
-    return available.length > 0 ? available : ['claude'];
+    // 如果没有可用 Worker，从画像配置获取默认 Worker
+    return available.length > 0 ? available : [this.getDefaultWorkerFromProfile()];
+  }
+
+  /** 从画像配置获取默认 Worker */
+  private getDefaultWorkerFromProfile(): WorkerSlot {
+    if (this.profileLoader) {
+      const rules = this.profileLoader.getCategoryRules();
+      const defaultCategory = rules?.defaultCategory;
+      if (defaultCategory) {
+        const config = this.profileLoader.getCategory(defaultCategory);
+        if (config?.defaultWorker) {
+          return config.defaultWorker as WorkerSlot;
+        }
+      }
+      // 返回画像中的第一个 Worker
+      const allProfiles = this.profileLoader.getAllProfiles();
+      const firstWorker = allProfiles.keys().next().value;
+      if (firstWorker) {
+        return firstWorker;
+      }
+    }
+    // 兜底：返回健康状态中的第一个 Worker
+    const firstHealthy = this.workerHealthStatus.keys().next().value;
+    return firstHealthy || 'claude';
   }
 
   /** 更新 Worker 健康状态 */

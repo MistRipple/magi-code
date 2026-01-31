@@ -15,6 +15,8 @@ import type {
   AutoScrollConfig,
   AppState,
   WebviewPersistedState,
+  WaveState,
+  WorkerSessionState,
 } from '../types/message';
 import { vscode } from '../lib/vscode-bridge';
 import { ensureArray } from '../lib/utils';
@@ -109,6 +111,14 @@ let modelStatus = $state<Record<string, string>>({
   codex: 'unavailable',
   gemini: 'unavailable',
 });
+let interactionMode = $state<'ask' | 'auto'>('auto');
+
+// Worker 执行状态：idle | executing | completed | failed
+let workerExecutionStatus = $state<Record<string, 'idle' | 'executing' | 'completed' | 'failed'>>({
+  claude: 'idle',
+  codex: 'idle',
+  gemini: 'idle',
+});
 
 // 交互请求状态
 let pendingConfirmation = $state<{ plan: unknown; formattedPlan?: string } | null>(null);
@@ -118,6 +128,12 @@ let pendingClarification = $state<{ questions: string[]; context?: string; ambig
 let pendingWorkerQuestion = $state<{ workerId: string; question: string; context?: string; options?: unknown } | null>(null);
 let pendingToolAuthorization = $state<{ toolName: string; toolArgs: unknown } | null>(null);
 let missionPlan = $state<MissionPlan | null>(null);
+
+// Wave 执行状态（提案 4.6）
+let waveState = $state<WaveState | null>(null);
+
+// Worker Session 状态（提案 4.1）
+let workerSessions = $state<Map<string, WorkerSessionState>>(new Map());
 
 // ============ 导出 Getter ============
 
@@ -146,6 +162,11 @@ export function getState() {
     set toasts(v) { toasts = v; },
     get modelStatus() { return modelStatus; },
     set modelStatus(v) { modelStatus = v; },
+    get interactionMode() { return interactionMode; },
+    set interactionMode(v) { interactionMode = v; },
+    // Worker 状态
+    get workerExecutionStatus() { return workerExecutionStatus; },
+    set workerExecutionStatus(v) { workerExecutionStatus = v; },
     get pendingConfirmation() { return pendingConfirmation; },
     set pendingConfirmation(v) { pendingConfirmation = v; },
     get pendingRecovery() { return pendingRecovery; },
@@ -160,6 +181,12 @@ export function getState() {
     set pendingToolAuthorization(v) { pendingToolAuthorization = v; },
     get missionPlan() { return missionPlan; },
     set missionPlan(v) { missionPlan = v; },
+    // Wave 状态（提案 4.6）
+    get waveState() { return waveState; },
+    set waveState(v) { waveState = v; },
+    // Worker Session 状态（提案 4.1）
+    get workerSessions() { return workerSessions; },
+    set workerSessions(v) { workerSessions = v; },
   };
 }
 
@@ -238,6 +265,21 @@ export function setAppState(nextState: AppState | null) {
 
 export function setMissionPlan(plan: MissionPlan | null) {
   missionPlan = plan;
+}
+
+// Worker 执行状态操作
+export function setWorkerExecutionStatus(
+  worker: 'claude' | 'codex' | 'gemini',
+  status: 'idle' | 'executing' | 'completed' | 'failed'
+) {
+  workerExecutionStatus = { ...workerExecutionStatus, [worker]: status };
+
+  // 完成或失败状态 2 秒后自动重置为 idle
+  if (status === 'completed' || status === 'failed') {
+    setTimeout(() => {
+      workerExecutionStatus = { ...workerExecutionStatus, [worker]: 'idle' };
+    }, 2000);
+  }
 }
 
 function updateProcessingState() {
@@ -323,6 +365,12 @@ export function updateThreadMessage(messageId: string, updates: Partial<Message>
   }
 }
 
+export function removeThreadMessage(messageId: string) {
+  if (!threadMessages.length) return;
+  threadMessages = threadMessages.filter((m) => m.id !== messageId);
+  saveWebviewState();
+}
+
 export function clearThreadMessages() {
   threadMessages = [];
   saveWebviewState();
@@ -346,6 +394,15 @@ export function updateAgentMessage(agent: AgentType, messageId: string, updates:
     agentOutputs = { ...agentOutputs, [agent]: next };
     // 不触发保存，由流式管理器批量保存
   }
+}
+
+export function removeAgentMessage(agent: AgentType, messageId: string) {
+  const list = agentOutputs[agent];
+  if (!list.length) return;
+  const next = list.filter((m) => m.id !== messageId);
+  if (next.length === list.length) return;
+  agentOutputs = { ...agentOutputs, [agent]: next };
+  saveWebviewState();
 }
 
 export function clearAgentMessages(agent: AgentType) {
@@ -426,4 +483,51 @@ export function initializeState() {
     scrollPositions = persisted.scrollPositions || { thread: 0, claude: 0, codex: 0, gemini: 0 };
     autoScrollEnabled = persisted.autoScrollEnabled || { thread: true, claude: true, codex: true, gemini: true };
   }
+}
+
+// ============ Wave 状态操作（提案 4.6） ============
+
+export function setWaveState(state: WaveState | null) {
+  waveState = state;
+}
+
+export function updateWaveProgress(waveIndex: number, status: WaveState['status']) {
+  if (waveState) {
+    waveState = {
+      ...waveState,
+      currentWave: waveIndex,
+      status,
+    };
+  }
+}
+
+export function clearWaveState() {
+  waveState = null;
+}
+
+// ============ Worker Session 状态操作（提案 4.1） ============
+
+export function addWorkerSession(session: WorkerSessionState) {
+  const newSessions = new Map(workerSessions);
+  newSessions.set(session.sessionId, session);
+  workerSessions = newSessions;
+}
+
+export function updateWorkerSession(sessionId: string, updates: Partial<WorkerSessionState>) {
+  const existing = workerSessions.get(sessionId);
+  if (existing) {
+    const newSessions = new Map(workerSessions);
+    newSessions.set(sessionId, { ...existing, ...updates });
+    workerSessions = newSessions;
+  }
+}
+
+export function removeWorkerSession(sessionId: string) {
+  const newSessions = new Map(workerSessions);
+  newSessions.delete(sessionId);
+  workerSessions = newSessions;
+}
+
+export function clearWorkerSessions() {
+  workerSessions = new Map();
 }

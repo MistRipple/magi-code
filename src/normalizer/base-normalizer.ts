@@ -30,7 +30,7 @@ import { MESSAGE_EVENTS } from '../protocol/event-names';
  * Normalizer 配置
  */
 export interface NormalizerConfig {
-  agent: AgentType;  // ✅ 使用 agent 替代旧字段
+  agent: AgentType;
   defaultSource: MessageSource;
   debug?: boolean;
 }
@@ -74,7 +74,7 @@ export abstract class BaseNormalizer extends EventEmitter {
     this.config = config;
   }
 
-  get agent(): AgentType {  // ✅ 使用 agent 替代旧字段
+  get agent(): AgentType {
     return this.config.agent;
   }
 
@@ -122,6 +122,38 @@ export abstract class BaseNormalizer extends EventEmitter {
     for (const update of updates) {
       this.emit(MESSAGE_EVENTS.UPDATE, update);
     }
+  }
+
+  /**
+   * 处理 thinking 内容（用于流式 thinking 输出）
+   */
+  processThinking(messageId: string, thinkingContent: string): void {
+    const context = this.activeContexts.get(messageId);
+    if (!context) {
+      this.debug(`[${this.agent}] 未找到消息上下文: ${messageId}`);
+      return;
+    }
+
+    // 累积 thinking 内容
+    if (context.pendingThinking === null) {
+      context.pendingThinking = '';
+    }
+    context.pendingThinking += thinkingContent;
+
+    // 生成 thinking block ID（如果还没有）
+    if (!context.thinkingBlockId) {
+      context.thinkingBlockId = `${messageId}-thinking`;
+    }
+
+    // 发送 thinking 更新
+    const update = this.createUpdate(messageId, 'block_update', {
+      blocks: [{
+        type: 'thinking',
+        content: context.pendingThinking,
+        blockId: context.thinkingBlockId,
+      }],
+    });
+    this.emit(MESSAGE_EVENTS.UPDATE, update);
   }
 
   endStream(messageId: string, error?: string): StandardMessage | null {

@@ -11,20 +11,7 @@
 
   let { messages }: Props = $props();
 
-  // Worker 面板消息过滤：
-  // - 允许任务分配消息（编排者发给 Worker 的指令）
-  // - 过滤掉任务完成摘要（subTaskCard，这些只在主对话区显示）
-  // - 过滤掉系统消息
-  const filteredMessages = $derived(
-    messages.filter(m => {
-      // 过滤系统消息
-      if (m.source === 'system') return false;
-      // 过滤 subTaskCard（任务完成摘要只在主对话区显示）
-      if (m.metadata?.subTaskCard) return false;
-      // 其他消息都允许（包括编排者的任务分配消息）
-      return true;
-    })
-  );
+  const filteredMessages = $derived(messages);
 
   // 滚动相关状态
   let contentEl: HTMLDivElement | null = $state(null);
@@ -171,4 +158,3 @@
     transform: translateY(-2px);
   }
 </style>
-

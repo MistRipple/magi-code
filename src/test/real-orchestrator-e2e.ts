@@ -1,11 +1,11 @@
 /**
  * 真实 LLM 编排端到端测试
- * - 使用真实 LLM + IntelligentOrchestrator
+ * - 使用真实 LLM + MissionDrivenEngine
  * - 记录消息流、重复内容、dispatchId
  */
 
 import { LLMAdapterFactory } from '../llm/adapter-factory';
-import { IntelligentOrchestrator } from '../orchestrator/intelligent-orchestrator';
+import { MissionDrivenEngine } from '../orchestrator/core';
 import { SnapshotManager } from '../snapshot-manager';
 import { UnifiedSessionManager } from '../session';
 import { UnifiedTaskManager } from '../task/unified-task-manager';
@@ -55,20 +55,24 @@ async function run() {
   const taskManager = new UnifiedTaskManager(session.id, repository);
   await taskManager.initialize();
 
-  const orchestrator = new IntelligentOrchestrator(
+  const orchestrator = new MissionDrivenEngine(
     adapterFactory,
-    sessionManager,
-    snapshotManager,
-    workspaceRoot,
     {
+      timeout: 300000,
+      maxRetries: 3,
       review: { selfCheck: false, peerReview: 'never', maxRounds: 0 },
       planReview: { enabled: false },
       verification: { compileCheck: false, lintCheck: false, testCheck: false },
       integration: { enabled: false },
       strategy: { enableVerification: false, enableRecovery: false, autoRollbackOnFailure: false },
-    }
+    },
+    workspaceRoot,
+    snapshotManager,
+    sessionManager
   );
-  orchestrator.setTaskManager(taskManager, session.id);
+
+  // 关键：传递 taskManager 以确保 SubTask.assignedWorker 正确同步
+  orchestrator.setTaskManager(taskManager);
 
   // 自动确认/澄清/提问回调（避免卡住）
   orchestrator.setConfirmationCallback(async () => true);

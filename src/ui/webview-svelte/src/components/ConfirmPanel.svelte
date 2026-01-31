@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
+  import type { IconName } from '../lib/icons';
 
   type ConfirmType = 'info' | 'warning' | 'danger';
 
@@ -24,13 +25,14 @@
   }: Props = $props();
 
   // 类型配置
-  const typeConfig: Record<ConfirmType, { icon: string; color: string; btnClass: string }> = {
+  const typeConfig: Record<ConfirmType, { icon: IconName; color: string; btnClass: string }> = {
     info: { icon: 'info', color: 'var(--info)', btnClass: 'btn--primary' },
     warning: { icon: 'warning', color: 'var(--warning)', btnClass: 'btn--warning' },
     danger: { icon: 'warning', color: 'var(--error)', btnClass: 'btn--danger' }
   };
 
-  const config = $derived(typeConfig[type]);
+  // 🔧 防御性写法：确保 type 无效时使用默认值
+  const config = $derived(typeConfig[type] || typeConfig.info);
 </script>
 
 <div class="confirm-panel confirm-panel--{type}">

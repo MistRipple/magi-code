@@ -158,8 +158,16 @@ export class ProfileAwareReviewer {
       return candidates[0][0] as WorkerSlot;
     }
 
-    // 没有找到合适的评审者，返回默认
-    return executor === 'claude' ? 'codex' : 'claude';
+    // 没有找到擅长该分类的评审者，选择任意非执行者的 Worker
+    const otherWorkers = Array.from(allProfiles.keys()).filter(w => w !== executor);
+    if (otherWorkers.length > 0) {
+      return otherWorkers[0];
+    }
+
+    // 兜底：返回与执行者不同的任意 Worker（从画像配置获取）
+    const allWorkers = Array.from(allProfiles.keys());
+    const fallback = allWorkers.find(w => w !== executor) || allWorkers[0];
+    return fallback;
   }
 
   /**

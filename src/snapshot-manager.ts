@@ -717,12 +717,6 @@ export class SnapshotManager {
     return files;
   }
 
-  /** 获取指定子任务的实际变更文件（旧版本 - 兼容性保留） */
-  getChangedFilesForSubTask(subTaskId: string): string[] {
-    // 临时映射到新方法
-    return this.getChangedFilesForTodo(subTaskId);
-  }
-
   /** 计算变更行数 */
   private countChanges(original: string, current: string): { additions: number; deletions: number } {
     const originalLines = original.split('\n');

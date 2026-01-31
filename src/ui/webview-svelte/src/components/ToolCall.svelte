@@ -1,8 +1,10 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import FileSpan from './FileSpan.svelte';
   import MermaidRenderer from './MermaidRenderer.svelte';
   import { vscode } from '../lib/vscode-bridge';
+  import type { IconName } from '../lib/icons';
 
   // Props
   interface Props {
@@ -31,14 +33,9 @@
     onOpenFile
   }: Props = $props();
 
-  // 折叠状态
-  let collapsed = $state(true);
+  // 折叠状态 - 仅使用初始值，之后由用户手动控制
+  let collapsed = $state(untrack(() => !initialExpanded));
   let copySuccess = $state(false);
-
-  // 初始化
-  $effect(() => {
-    collapsed = !initialExpanded;
-  });
 
   // 格式化内容
   function formatContent(content: unknown): string {
@@ -52,7 +49,7 @@
   }
 
   // 获取工具图标
-  function getToolIcon(toolName: string): string {
+  function getToolIcon(toolName: string): IconName {
     if (!toolName || typeof toolName !== 'string') {
       vscode.postMessage({
         type: 'uiError',
@@ -62,7 +59,7 @@
       });
       throw new Error('ToolCall: invalid toolName');
     }
-    const iconMap: Record<string, string> = {
+    const iconMap: Record<string, IconName> = {
       // 内置工具
       'execute_shell': 'terminal',
       'text_editor': 'file-edit',
@@ -99,14 +96,14 @@
   }
 
   // 状态信息
-  const statusInfo = $derived(() => {
-    const map: Record<string, { class: string; text: string; icon: string }> = {
+  const statusInfo = $derived.by(() => {
+    const map: Record<string, { class: string; text: string; icon: IconName }> = {
       pending: { class: 'pending', text: '等待中', icon: 'clock' },
       running: { class: 'running', text: '执行中', icon: 'loader' },
       success: { class: 'success', text: '成功', icon: 'check' },
       error: { class: 'error', text: '失败', icon: 'close' },
     };
-    return map[status] || { class: 'success', text: '完成', icon: 'check' };
+    return map[status] || { class: 'success', text: '完成', icon: 'check' as IconName };
   });
 
   // 检查是否有内容
@@ -117,7 +114,7 @@
 
   // 检查是否为 Mermaid 工具输出
   const isMermaidTool = $derived(name === 'mermaid_diagram');
-  const mermaidData = $derived(() => {
+  const mermaidData = $derived.by(() => {
     if (!isMermaidTool || !output) return null;
     try {
       const data = typeof output === 'string' ? JSON.parse(output) : output;
@@ -125,7 +122,6 @@
         return {
           code: data.code as string,
           title: (data.title || '') as string,
-          theme: (data.theme || 'dark') as 'default' | 'dark' | 'forest' | 'neutral',
           diagramType: (data.diagramType || '') as string,
         };
       }
@@ -165,7 +161,7 @@
     class="tool-call"
     class:collapsed
     class:has-error={hasError}
-    data-status={statusInfo().class}
+    data-status={statusInfo.class}
   >
     <button class="tool-header" onclick={toggle}>
       <span class="chevron">
@@ -185,13 +181,13 @@
         {/if}
       </span>
 
-      <span class="tool-status status-{statusInfo().class}">
+      <span class="tool-status status-{statusInfo.class}">
         {#if status === 'running'}
           <span class="spinner"></span>
         {:else}
-          <Icon name={statusInfo().icon} size={12} />
+          <Icon name={statusInfo.icon} size={12} />
         {/if}
-        {statusInfo().text}
+        {statusInfo.text}
       </span>
     </button>
 
@@ -214,12 +210,11 @@
                 <Icon name={copySuccess ? 'check' : 'copy'} size={12} />
               </button>
             </div>
-            {#if isMermaidTool && mermaidData()}
+            {#if isMermaidTool && mermaidData}
               <MermaidRenderer
-                code={mermaidData()?.code || ''}
-                title={mermaidData()?.title}
-                theme={mermaidData()?.theme}
-                diagramType={mermaidData()?.diagramType}
+                code={mermaidData?.code || ''}
+                title={mermaidData?.title}
+                diagramType={mermaidData?.diagramType}
               />
             {:else}
               <pre class="section-content">{formatContent(output)}</pre>

@@ -1,6 +1,5 @@
 /**
  * LLM 适配器抽象基类
- * 替代 LLM 适配器，使用 LLM API 直接通信
  *
  * 消息流架构（4层）：
  * Layer 1: Normalizer.emit('message')

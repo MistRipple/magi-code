@@ -149,7 +149,7 @@ export class AceIndexManager {
     }
   }
 
-  /** 加载根目录 .gitignore 文件（兼容旧方法） */
+  /** 加载根目录 .gitignore 文件 */
   private loadGitignore(): IgnoreInstance | null {
     return this.loadGitignoreFromDir(this.projectRoot);
   }

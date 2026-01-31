@@ -37,9 +37,25 @@ function getVsCodeApi(): VsCodeApi | null {
 export function postMessage(message: WebviewMessage): void {
   const api = getVsCodeApi();
   if (api) {
-    api.postMessage(message);
+    api.postMessage(sanitizeMessage(message));
   } else {
     console.log('[vscode-bridge] postMessage:', message);
+  }
+}
+
+function sanitizeMessage(message: WebviewMessage): WebviewMessage {
+  try {
+    if (typeof structuredClone === 'function') {
+      return structuredClone(message);
+    }
+  } catch {
+    // fall through to JSON clone
+  }
+  try {
+    return JSON.parse(JSON.stringify(message));
+  } catch (error) {
+    console.warn('[vscode-bridge] 消息序列化失败，可能包含不可克隆对象', error);
+    return message;
   }
 }
 
@@ -115,4 +131,3 @@ export function getInitialSessionId(): string {
   }
   return '';
 }
-

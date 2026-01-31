@@ -5,7 +5,6 @@
  * - 执行单个 Assignment
  * - 管理 Todo 执行
  * - 处理快照创建
- * - 同步 SubTask 状态
  */
 
 import { WorkerSlot } from '../../../types';
@@ -14,17 +13,18 @@ import { TokenUsage } from '../../../types/agent-types';
 import { AutonomousWorker, AutonomousExecutionResult } from '../../worker';
 import { Mission, Assignment, WorkerTodo } from '../../mission';
 import { SnapshotManager } from '../../../snapshot-manager';
-import { UnifiedTaskManager } from '../../../task/unified-task-manager';
 import { logger, LogCategory } from '../../../logging';
 import { LspEnforcer } from '../../lsp/lsp-enforcer';
+import type { ReportCallback } from '../../protocols/worker-report';
 
 export interface AssignmentExecutionOptions {
   workingDirectory: string;
   projectContext?: string;
   timeout?: number;
-  taskId?: string;
   contextManager?: import('../../../context/context-manager').ContextManager | null;
   onOutput?: (workerId: WorkerSlot, output: string) => void;
+  onReport?: ReportCallback;
+  reportTimeout?: number;
 }
 
 export interface AssignmentExecutionResult {
@@ -33,6 +33,8 @@ export interface AssignmentExecutionResult {
   dynamicTodos: WorkerTodo[];
   errors: string[];
   tokenUsage?: TokenUsage;
+  /** 完整的 Worker 执行结果（用于统计） */
+  fullResult?: AutonomousExecutionResult;
 }
 
 export class AssignmentExecutor {
@@ -42,7 +44,6 @@ export class AssignmentExecutor {
     private workers: Map<WorkerSlot, AutonomousWorker>,
     private adapterFactory: IAdapterFactory,
     private snapshotManager: SnapshotManager | null,
-    private taskManager: UnifiedTaskManager | null,
     workspaceRoot: string
   ) {
     this.lspEnforcer = new LspEnforcer(workspaceRoot);
@@ -96,6 +97,8 @@ export class AssignmentExecutor {
       workingDirectory: options.workingDirectory,
       projectContext: options.projectContext,
       timeout: options.timeout,
+      onReport: options.onReport,
+      reportTimeout: options.reportTimeout,
       adapterScope: {
         messageMeta: {
           contextSnapshot,
@@ -110,11 +113,6 @@ export class AssignmentExecutor {
     // 更新 ContextManager
     await this.updateContextManager(assignment, result, options.contextManager);
 
-    // 同步 SubTask 状态
-    if (options.taskId) {
-      await this.syncSubTaskStatus(assignment, result, options.taskId);
-    }
-
     logger.info(
       LogCategory.ORCHESTRATOR,
       `Worker ${assignment.workerId} 执行完成: ${result.success ? '成功' : '失败'}`
@@ -126,6 +124,7 @@ export class AssignmentExecutor {
       dynamicTodos: result.dynamicTodos,
       errors: result.errors,
       tokenUsage: result.tokenUsage,
+      fullResult: result, // 保留完整结果用于统计
     };
   }
 
@@ -255,44 +254,4 @@ export class AssignmentExecutor {
     await contextManager.saveMemory();
   }
 
-  /**
-   * 同步 SubTask 状态
-   */
-  private async syncSubTaskStatus(
-    assignment: Assignment,
-    result: AutonomousExecutionResult,
-    taskId: string
-  ): Promise<void> {
-    if (!this.taskManager) {
-      return;
-    }
-
-    try {
-      const subTask = await this.taskManager.getSubTaskByAssignmentId(taskId, assignment.id);
-      if (!subTask) {
-        logger.warn(
-          LogCategory.ORCHESTRATOR,
-          `未找到 Assignment ${assignment.id} 对应的 SubTask`
-        );
-        return;
-      }
-
-      if (result.success) {
-        await this.taskManager.updateSubTask(taskId, {
-          id: subTask.id,
-          status: 'completed'
-        });
-      } else {
-        await this.taskManager.updateSubTask(taskId, {
-          id: subTask.id,
-          status: 'failed'
-        });
-      }
-    } catch (error: any) {
-      logger.warn(
-        LogCategory.ORCHESTRATOR,
-        `同步 SubTask 状态失败: ${error.message}`
-      );
-    }
-  }
 }

@@ -19,3 +19,15 @@ export {
   TodoExecuteOptions,
   AutonomousExecutionResult,
 } from './autonomous-worker';
+
+export {
+  WorkerSession,
+  WorkerSessionManager,
+  SessionCreateOptions,
+  SessionUpdateOptions,
+  ConversationMessage,
+  FileCacheEntry,
+  SessionStateSnapshot,
+  getGlobalSessionManager,
+  resetGlobalSessionManager,
+} from './worker-session';

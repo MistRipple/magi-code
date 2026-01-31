@@ -1,10 +1,10 @@
 /**
  * Mission-Driven Architecture - 核心类型定义
  *
- * 本文件定义了新架构的所有核心数据模型：
- * - Mission: 任务使命（替代 ExecutionPlan）
+ * 本文件定义了核心数据模型：
+ * - Mission: 任务使命
  * - Contract: 协作契约
- * - Assignment: 职责分配（替代 SubTask）
+ * - Assignment: 职责分配
  * - WorkerTodo: Worker 自主规划的工作项
  */
 

@@ -37,9 +37,8 @@ import { DiffGenerator } from '../diff-generator';
 import { globalEventBus } from '../events';
 import { IAdapterFactory } from '../adapters/adapter-factory-interface';
 import { LLMAdapterFactory } from '../llm/adapter-factory';
-import { TaskAnalyzer, WorkerSelector } from '../task';
-import { IntelligentOrchestrator } from '../orchestrator/intelligent-orchestrator';
-import { normalizeOrchestratorMessage, isInternalStateMessage } from '../normalizer';
+import { MissionDrivenEngine } from '../orchestrator/core';
+import { MessageHub } from '../orchestrator/core/message-hub';
 import { UnifiedMessageBus, type ProcessingState } from '../normalizer/unified-message-bus';
 import { ProfileStorage, StoredProfileConfig } from '../orchestrator/profile';
 import { parseContentToBlocks } from '../utils/content-parser';
@@ -51,17 +50,132 @@ import { MermaidPanel } from './mermaid-panel';
 // Mission-Driven Architecture 类型 - 直接从子模块导入
 import {
   MissionOrchestrator,
-  MissionExecutor,
   ExecutionProgress,
-  BlockedItem,
   MissionSummary,
   MissionVerificationResult,
 } from '../orchestrator/core';
+import { BlockedItem } from '../orchestrator/core/executors/blocking-manager';
 import {
   Mission,
   Assignment,
   WorkerTodo,
 } from '../orchestrator/mission';
+
+type WebviewMessagePriority = 'high' | 'normal';
+
+const HIGH_PRIORITY_MESSAGE_TYPES = new Set<ExtensionToWebviewMessage['type']>([
+  'toast',
+  'error',
+  'confirmationRequest',
+  'recoveryRequest',
+  'recoveryResult',
+  'taskPaused',
+  'taskResumed',
+  'phaseChanged',
+  'showDiff',
+  'workerFallbackNotice',
+  'loginSuccess',
+  'loginError',
+  'authStatus',
+  'promptEnhanceResult',
+  'promptEnhanceSaved',
+  'promptEnhanced',
+  'workerConfigSaved',
+  'workerConnectionTestResult',
+  'orchestratorConfigSaved',
+  'orchestratorConnectionTestResult',
+  'compressorConfigSaved',
+  'compressorConnectionTestResult',
+  'skillsConfigSaved',
+  'profileConfigSaved',
+  'profileConfigReset',
+  'customToolAdded',
+  'customToolRemoved',
+  'instructionSkillRemoved',
+  'skillInstalled',
+  'repositoryAdded',
+  'repositoryUpdated',
+  'repositoryDeleted',
+  'repositoryRefreshed',
+  'mcpServerAdded',
+  'mcpServerUpdated',
+  'mcpServerDeleted',
+  'mcpServerConnected',
+  'mcpServerDisconnected',
+  'mcpServerConnectionFailed',
+  'mcpToolsRefreshed',
+  'mcpServerTools',
+]);
+
+const COALESCE_MESSAGE_TYPES = new Set<ExtensionToWebviewMessage['type']>([
+  'stateUpdate',
+  'executionStatsUpdate',
+  'workerStatusUpdate',
+  'sessionsUpdated',
+]);
+
+class WebviewMessageBus {
+  private highQueue: ExtensionToWebviewMessage[] = [];
+  private normalQueue: ExtensionToWebviewMessage[] = [];
+  private processing = false;
+
+  constructor(
+    private readonly getView: () => vscode.WebviewView | undefined,
+    private readonly getPriority: (message: ExtensionToWebviewMessage) => WebviewMessagePriority,
+    private readonly coalesceTypes: Set<ExtensionToWebviewMessage['type']>
+  ) {}
+
+  send(message: ExtensionToWebviewMessage): void {
+    const priority = this.getPriority(message);
+    const queue = priority === 'high' ? this.highQueue : this.normalQueue;
+
+    if (priority === 'normal' && this.coalesceTypes.has(message.type)) {
+      for (let i = queue.length - 1; i >= 0; i -= 1) {
+        if (queue[i].type === message.type) {
+          queue[i] = message;
+          this.flush();
+          return;
+        }
+      }
+    }
+
+    queue.push(message);
+    this.flush();
+  }
+
+  private flush(): void {
+    if (this.processing) {
+      return;
+    }
+    this.processing = true;
+    void this.processLoop();
+  }
+
+  private async processLoop(): Promise<void> {
+    try {
+      while (true) {
+        const next = this.highQueue.shift() ?? this.normalQueue.shift();
+        if (!next) {
+          break;
+        }
+        const view = this.getView();
+        if (!view) {
+          this.highQueue.length = 0;
+          this.normalQueue.length = 0;
+          break;
+        }
+        await view.webview.postMessage(next);
+      }
+    } catch (error) {
+      logger.warn('界面.消息.发送_失败', { error: String(error) }, LogCategory.UI);
+    } finally {
+      this.processing = false;
+      if (this.highQueue.length || this.normalQueue.length) {
+        this.flush();
+      }
+    }
+  }
+}
 
 export class WebviewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'multiCli.mainView';
@@ -77,23 +191,20 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private diffGenerator: DiffGenerator;
   private readonly messageFlowLogEnabled = process.env.MULTICLI_MESSAGE_FLOW_LOG === '1';
   private readonly messageFlowLogPath: string;
+  private webviewMessageBus: WebviewMessageBus;
 
-  // 统一消息总线（替代原有的 MessageDeduplicator）
+  // 统一消息总线
   private messageBus: UnifiedMessageBus;
+  private messageHub: MessageHub;
 
   // 适配器工厂（LLM 模式）
   private adapterFactory: IAdapterFactory;
 
-  // 任务分析器和 Worker 选择器
-  private taskAnalyzer: TaskAnalyzer;
-  private workerSelector: WorkerSelector;
+  // 编排引擎
+  private orchestratorEngine: MissionDrivenEngine;
 
-  // 智能编排器
-  private intelligentOrchestrator: IntelligentOrchestrator;
-
-  // Mission-Driven 编排器（新架构）
+  // Mission-Driven 编排器（新架构）- MissionExecutor 已合并到 MissionOrchestrator
   private missionOrchestrator?: MissionOrchestrator;
-  private missionExecutor?: MissionExecutor;
 
   // 项目知识库
   private projectKnowledgeBase?: ProjectKnowledgeBase;
@@ -133,7 +244,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private readonly workerStatusSoftTtlMs = 120000;
   private readonly workerStatusTimeoutMs = 4000;
   private readonly workerStatusHardTimeoutMs = 10000;
-  private postMessageQueue: Promise<void> = Promise.resolve();
 
   private streamingContextCache: Map<string, { content: string; lastFlushAt: number }> = new Map();
   private messageMetaCache: Map<string, { type?: MessageType; metadata?: Record<string, unknown> | MessageMetadata }> = new Map();
@@ -156,8 +266,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     private readonly workspaceRoot: string
   ) {
     this.messageFlowLogPath = path.join(this.workspaceRoot, '.multicli', 'logs', 'message-flow.jsonl');
+    this.webviewMessageBus = new WebviewMessageBus(
+      () => this._view,
+      this.getWebviewMessagePriority.bind(this),
+      COALESCE_MESSAGE_TYPES
+    );
 
-    // 初始化统一消息总线（替代原有的 MessageDeduplicator）
+    // 初始化统一消息总线
     this.messageBus = new UnifiedMessageBus({
       enabled: true,
       minStreamInterval: 100,
@@ -165,7 +280,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       retentionTime: 5 * 60 * 1000,
       debug: false,
     });
-    this.setupMessageBusListeners();
+    // MessageHub 由 MissionDrivenEngine 创建，初始化后再绑定监听
 
     // 初始化统一会话管理器
     this.sessionManager = new UnifiedSessionManager(workspaceRoot);
@@ -179,8 +294,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       void this.initTaskManagerForSession(this.activeSessionId);
     }
 
-    // 初始化任务分析器（画像系统驱动）
-    this.taskAnalyzer = new TaskAnalyzer();
     const config = vscode.workspace.getConfiguration('multiCli');
     const timeout = config.get<number>('timeout') ?? 300000;
     const idleTimeout = config.get<number>('idleTimeout') ?? 120000;
@@ -202,19 +315,19 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     // 设置错误事件处理（消息由 Adapter 直接发送到 MessageBus，不再通过事件转发）
     this.setupAdapterEvents();
-    this.workerSelector = new WorkerSelector();
 
-    // 初始化智能编排器
-    this.intelligentOrchestrator = new IntelligentOrchestrator(
+    // 初始化编排引擎
+    this.orchestratorEngine = new MissionDrivenEngine(
       this.adapterFactory,
-      this.sessionManager,
-      this.snapshotManager,
+      { timeout, maxRetries: 3, permissions, strategy },
       this.workspaceRoot,
-      { timeout, idleTimeout, maxTimeout, permissions, strategy }
+      this.snapshotManager,
+      this.sessionManager
     );
-    this.intelligentOrchestrator.setExtensionContext(this.context);
-    // 注入 MessageBus 到编排器（用于发送阶段消息到主对话区）
-    this.intelligentOrchestrator.setMessageBus(this.messageBus);
+    this.messageHub = this.orchestratorEngine.getMessageHub();
+    this.setupMessageHubListeners();
+    this.setupMessageBusListeners();
+    this.orchestratorEngine.setExtensionContext(this.context);
     // 设置 Hard Stop 确认回调
     this.setupOrchestratorConfirmation();
     this.setupOrchestratorQuestions();
@@ -255,7 +368,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.taskManagerSessionId = sessionId;
     this.taskManagerReady = manager.initialize();
     await this.taskManagerReady;
-    this.intelligentOrchestrator.setTaskManager(manager, sessionId);
+
+    // 将 taskManager 传递给编排引擎，确保 Assignment 能同步到 SubTask
+    this.orchestratorEngine.setTaskManager(manager);
   }
 
   private async getTaskManager(): Promise<UnifiedTaskManager> {
@@ -300,7 +415,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       await this.setupKnowledgeExtractionClient();
 
       // 注入知识库到编排器
-      this.intelligentOrchestrator.setKnowledgeBase(this.projectKnowledgeBase);
+      this.orchestratorEngine.setKnowledgeBase(this.projectKnowledgeBase);
 
       // 监听任务完成事件，自动提取知识
       this.setupAutoKnowledgeExtraction();
@@ -324,21 +439,22 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       // 加载压缩模型配置
       const compressorConfig = LLMConfigLoader.loadCompressorConfig();
+      const orchestratorConfig = LLMConfigLoader.loadOrchestratorConfig();
 
-      if (!compressorConfig.enabled) {
-        logger.warn('项目知识库.压缩模型未启用', undefined, LogCategory.SESSION);
-        return;
-      }
+      const useCompressor = compressorConfig.enabled
+        && Boolean(compressorConfig.baseUrl && compressorConfig.model);
+      const activeConfig = useCompressor ? compressorConfig : orchestratorConfig;
+      const activeLabel = useCompressor ? 'compressor' : 'orchestrator';
 
       // 创建压缩模型客户端
       const baseClient = new UniversalLLMClient({
-        baseUrl: compressorConfig.baseUrl,
-        apiKey: compressorConfig.apiKey,
-        model: compressorConfig.model,
-        provider: compressorConfig.provider,
+        baseUrl: activeConfig.baseUrl,
+        apiKey: activeConfig.apiKey,
+        model: activeConfig.model,
+        provider: activeConfig.provider,
         enabled: true,
       });
-      const executionStats = this.intelligentOrchestrator.getExecutionStats();
+      const executionStats = this.orchestratorEngine.getExecutionStats();
       const client = {
         config: baseClient.config,
         sendMessage: async (params: any) => {
@@ -348,7 +464,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
             const duration = Date.now() - startedAt;
             if (executionStats) {
               executionStats.recordExecution({
-                worker: 'compressor',
+                worker: activeLabel as any,
                 taskId: 'knowledge',
                 subTaskId: 'extract',
                 success: true,
@@ -363,7 +479,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
             const duration = Date.now() - startedAt;
             if (executionStats) {
               executionStats.recordExecution({
-                worker: 'compressor',
+                worker: activeLabel as any,
                 taskId: 'knowledge',
                 subTaskId: 'extract',
                 success: false,
@@ -382,7 +498,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
             const duration = Date.now() - startedAt;
             if (executionStats) {
               executionStats.recordExecution({
-                worker: 'compressor',
+                worker: activeLabel as any,
                 taskId: 'knowledge',
                 subTaskId: 'extract',
                 success: true,
@@ -397,7 +513,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
             const duration = Date.now() - startedAt;
             if (executionStats) {
               executionStats.recordExecution({
-                worker: 'compressor',
+                worker: activeLabel as any,
                 taskId: 'knowledge',
                 subTaskId: 'extract',
                 success: false,
@@ -422,8 +538,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       knowledgeBase.setLLMClient(client);
 
       logger.info('项目知识库.压缩模型客户端.已设置', {
-        model: compressorConfig.model,
-        provider: compressorConfig.provider
+        model: activeConfig.model,
+        provider: activeConfig.provider,
+        fallbackToOrchestrator: !useCompressor
       }, LogCategory.SESSION);
     } catch (error: any) {
       logger.error('项目知识库.压缩模型客户端.设置失败', { error: error.message }, LogCategory.SESSION);
@@ -572,18 +689,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 设置 MessageBus 事件监听，转发消息到前端 */
   private setupMessageBusListeners(): void {
-    // MessageBus 事件转发到前端
+    // MessageBus 事件转发到 MessageHub（统一出口）
     this.messageBus.on(MESSAGE_EVENTS.MESSAGE, (message) => {
       this.assertBlocks(message.blocks, 'standardMessage.blocks');
       this.cacheMessageMeta(message);
       this.recordStreamingContext(message);
       this.recordToolOutputsIfAny(message);
-      this.postMessage({
-        type: WEBVIEW_MESSAGE_TYPES.STANDARD_MESSAGE,
-        message,
-        sessionId: this.activeSessionId
-      } as any);
-      this.logMessageFlow('standardMessage [SENT]', message);
+      this.messageHub.forwardStandardMessage(message);
+      this.logMessageFlow('standardMessage [FORWARD]', message);
     });
 
     this.messageBus.on(MESSAGE_EVENTS.UPDATE, (update) => {
@@ -591,23 +704,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         this.assertBlocks(update.blocks, 'standardUpdate.blocks');
       }
       this.recordStreamingUpdate(update);
-      this.postMessage({
-        type: WEBVIEW_MESSAGE_TYPES.STANDARD_UPDATE,
-        update,
-        sessionId: this.activeSessionId
-      } as any);
-      this.logMessageFlow('standardUpdate [SENT]', update);
+      this.messageHub.forwardStreamUpdate(update);
+      this.logMessageFlow('standardUpdate [FORWARD]', update);
     });
 
     this.messageBus.on(MESSAGE_EVENTS.COMPLETE, (message) => {
       this.assertBlocks(message.blocks, 'standardComplete.blocks');
       this.recordFinalContext(message);
-      this.postMessage({
-        type: WEBVIEW_MESSAGE_TYPES.STANDARD_COMPLETE,
-        message,
-        sessionId: this.activeSessionId
-      } as any);
-      this.logMessageFlow('standardComplete [SENT]', message);
+      this.messageHub.forwardStandardComplete(message);
+      this.logMessageFlow('standardComplete [FORWARD]', message);
     });
 
     // 处理状态变化 - 推送到前端
@@ -617,6 +722,65 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         state,
         sessionId: this.activeSessionId
       } as any);
+    });
+  }
+
+  /** 设置 MessageHub 事件监听，统一转发到前端 */
+  private setupMessageHubListeners(): void {
+    // 编排者消息（主对话区）
+    // 🔧 修复消息重复：orchestrator:message 已包含 progress/result/error/system:notice 的消息
+    // 不再单独监听这些事件，避免同一消息被发送 2 次
+    this.messageHub.on('orchestrator:message', (message) => {
+      this.postMessage({
+        type: WEBVIEW_MESSAGE_TYPES.STANDARD_MESSAGE,
+        message,
+        sessionId: this.activeSessionId
+      } as any);
+      this.logMessageFlow('messageHub.orchestrator [SENT]', message);
+    });
+
+    // Worker 输出（Worker Tab）
+    this.messageHub.on('worker:output', ({ message }) => {
+      this.postMessage({
+        type: WEBVIEW_MESSAGE_TYPES.STANDARD_MESSAGE,
+        message,
+        sessionId: this.activeSessionId
+      } as any);
+      this.logMessageFlow('messageHub.worker [SENT]', message);
+    });
+
+    // 🔧 已移除对 progress/result/error/system:notice 的重复监听
+    // 原因：MessageHub 的 progress()/result()/error()/systemNotice() 方法
+    // 会同时 emit 两个事件（如 'progress' + 'orchestrator:message'），
+    // 导致 WebviewProvider 对同一消息 postMessage 两次，前端显示重复消息。
+    // 现在只监听 orchestrator:message，它已包含所有编排者消息。
+
+    // 标准流式消息（LLM）
+    this.messageHub.on('standard:message', (message) => {
+      this.postMessage({
+        type: WEBVIEW_MESSAGE_TYPES.STANDARD_MESSAGE,
+        message,
+        sessionId: this.activeSessionId
+      } as any);
+      this.logMessageFlow('messageHub.standardMessage [SENT]', message);
+    });
+
+    this.messageHub.on('standard:update', (update) => {
+      this.postMessage({
+        type: WEBVIEW_MESSAGE_TYPES.STANDARD_UPDATE,
+        update,
+        sessionId: this.activeSessionId
+      } as any);
+      this.logMessageFlow('messageHub.standardUpdate [SENT]', update);
+    });
+
+    this.messageHub.on('standard:complete', (message) => {
+      this.postMessage({
+        type: WEBVIEW_MESSAGE_TYPES.STANDARD_COMPLETE,
+        message,
+        sessionId: this.activeSessionId
+      } as any);
+      this.logMessageFlow('messageHub.standardComplete [SENT]', message);
     });
   }
 
@@ -722,7 +886,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
     entry.lastFlushAt = now;
     const sessionId = this.activeSessionId || undefined;
-    void this.intelligentOrchestrator.recordStreamingMessage(
+    void this.orchestratorEngine.recordStreamingMessage(
       messageId,
       'assistant',
       entry.content,
@@ -735,7 +899,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
     this.streamingContextCache.delete(message.id);
-    this.intelligentOrchestrator.clearStreamingMessage(message.id);
+    this.orchestratorEngine.clearStreamingMessage(message.id);
 
     if (!this.isRecordableMessage(message.type, message.metadata)) {
       return;
@@ -752,7 +916,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
     this.lastRecordedContextBySession.set(sessionId, { content, at: now });
-    void this.intelligentOrchestrator.recordContextMessage('assistant', content, sessionId);
+    void this.orchestratorEngine.recordContextMessage('assistant', content, sessionId);
   }
 
   private recordToolOutputsIfAny(message: StandardMessage): void {
@@ -772,9 +936,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     for (const tool of toolBlocks) {
       const toolName = tool.toolName || 'tool';
       if (tool.status === 'completed' && tool.output) {
-        void this.intelligentOrchestrator.recordToolOutput(toolName, tool.output, sessionId);
+        void this.orchestratorEngine.recordToolOutput(toolName, tool.output, sessionId);
       } else if (tool.status === 'failed' && tool.error) {
-        void this.intelligentOrchestrator.recordToolOutput(toolName, `Error: ${tool.error}`, sessionId);
+        void this.orchestratorEngine.recordToolOutput(toolName, `Error: ${tool.error}`, sessionId);
       }
     }
   }
@@ -782,8 +946,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 设置智能编排器的 Hard Stop 确认回调 */
   private setupOrchestratorConfirmation(): void {
     // 设置 Hard Stop 确认回调
-    this.intelligentOrchestrator.setConfirmationCallback(async (plan, formattedPlan) => {
-      const mode = this.intelligentOrchestrator.getInteractionMode();
+    this.orchestratorEngine.setConfirmationCallback(async (plan, formattedPlan) => {
+      const mode = this.orchestratorEngine.getInteractionMode();
       if (mode === 'auto') {
         logger.info('界面.编排器.确认.自动_跳过', { mode }, LogCategory.UI);
         return true;
@@ -804,7 +968,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     // 设置恢复确认回调
-    this.intelligentOrchestrator.setRecoveryConfirmationCallback(async (failedTask, error, options) => {
+    this.orchestratorEngine.setRecoveryConfirmationCallback(async (failedTask, error, options) => {
       return new Promise<'retry' | 'rollback' | 'continue'>((resolve) => {
         // 保存 resolver
         this.recoveryConfirmationResolver = resolve;
@@ -825,7 +989,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /** 设置编排者补充问题回调 */
   private setupOrchestratorQuestions(): void {
-    this.intelligentOrchestrator.setQuestionCallback(async (questions, plan) => {
+    this.orchestratorEngine.setQuestionCallback(async (questions, plan) => {
       return new Promise<string | null>((resolve, reject) => {
         this.pendingQuestion = { resolve, reject };
         this.postMessage({
@@ -838,7 +1002,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     // 设置需求澄清回调
-    this.intelligentOrchestrator.setClarificationCallback(async (questions, context, ambiguityScore, originalPrompt) => {
+    this.orchestratorEngine.setClarificationCallback(async (questions, context, ambiguityScore, originalPrompt) => {
       return new Promise((resolve, reject) => {
         this.pendingClarification = { resolve, reject };
         this.postMessage({
@@ -854,7 +1018,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     // 设置 Worker 问题回调
-    this.intelligentOrchestrator.setWorkerQuestionCallback(async (workerId, question, context, options) => {
+    this.orchestratorEngine.setWorkerQuestionCallback(async (workerId, question, context, options) => {
       return new Promise((resolve, reject) => {
         this.pendingWorkerQuestion = { resolve, reject };
         this.postMessage({
@@ -1008,135 +1172,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         isRunning: false
       } as any);
     });
-    globalEventBus.on('subtask:started', (event) => {
-      const data = event.data as { agent?: string; description?: string; targetFiles?: string[]; reason?: string; dispatchId?: string };
-      if (data?.description && data?.agent) {
-        const targetWorker = data.agent as WorkerSlot;
-
-        // 构建任务分配消息内容
-        const taskLines: string[] = [`**任务分配**\n\n${data.description}`];
-        if (data.targetFiles && data.targetFiles.length > 0) {
-          taskLines.push(`\n**目标文件:** ${data.targetFiles.join(', ')}`);
-        }
-        if (data.reason) {
-          taskLines.push(`\n**原因:** ${data.reason}`);
-        }
-        const taskContent = taskLines.join('');
-
-        // 发送任务分配消息到对应的 Worker 面板
-        // source: 'orchestrator' 表示来自编排者
-        // agent: 目标 Worker，这样会路由到对应的 Worker 面板
-        const taskAssignmentMessage: StandardMessage = {
-          id: `msg-task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          traceId: this.activeSessionId || 'default',
-          type: MessageType.TEXT,
-          source: 'orchestrator',
-          agent: targetWorker,
-          timestamp: Date.now(),
-          updatedAt: Date.now(),
-          blocks: [{
-            type: 'text' as const,
-            content: taskContent,
-            isMarkdown: true,
-          }],
-          lifecycle: MessageLifecycle.COMPLETED,
-          metadata: {
-            taskId: event.taskId,
-            subTaskId: event.subTaskId || '',
-          },
-        };
-        this.messageBus.sendMessage(taskAssignmentMessage);
-      }
-      this.sendStateUpdate();
-    });
-    globalEventBus.on('subtask:completed', (event) => {
-      const data = event.data as { success?: boolean; agent?: string; description?: string; modifiedFiles?: string[]; duration?: number };
-      const summaryCard = this.buildSubTaskSummaryCard({
-        description: data?.description,
-        agent: data?.agent,
-        duration: data?.duration,
-        modifiedFiles: data?.modifiedFiles,
-        subTaskId: event.subTaskId,
-      }, 'completed');
-      this.sendOrchestratorMessage({
-        content: '',
-        messageType: 'result',
-        taskId: event.taskId,
-        metadata: {
-          subTaskId: event.subTaskId || '',
-          status: 'completed',
-          success: data?.success ?? true,
-          agent: data?.agent || '',
-          description: data?.description,
-          subTaskCard: summaryCard,
-        },
-      });
-      this.sendStateUpdate();
-    });
     globalEventBus.on('execution:stats_updated', () => {
       this.sendExecutionStats();
     });
-    globalEventBus.on('subtask:failed', (event) => {
-      const data = event.data as { error?: string | object; agent?: string; description?: string; modifiedFiles?: string[]; duration?: number };
-
-      let errorMsg = '未知错误';
-      if (data?.error) {
-        if (typeof data.error === 'string') {
-          errorMsg = data.error;
-        } else if (typeof data.error === 'object') {
-          // 尝试提取错误信息
-          const errObj = data.error as { message?: string; error?: string };
-          errorMsg = errObj.message || errObj.error || JSON.stringify(data.error);
-        }
-      }
-      const summaryCard = this.buildSubTaskSummaryCard({
-        description: data?.description,
-        agent: data?.agent,
-        duration: data?.duration,
-        modifiedFiles: data?.modifiedFiles,
-        subTaskId: event.subTaskId,
-        error: errorMsg,
-      }, 'failed');
-      this.sendOrchestratorMessage({
-        content: '',
-        messageType: 'error',
-        taskId: event.taskId,
-        metadata: {
-          subTaskId: event.subTaskId || '',
-          status: 'failed',
-          agent: data?.agent || '',
-          error: errorMsg,
-          description: data?.description,
-          subTaskCard: summaryCard,
-        },
-      });
-      this.sendStateUpdate();
-    });
 
 
-    globalEventBus.on('orchestrator:ui_message', (event) => {
-      const data = event.data as any;
-      if (!data?.content) return;
-
-      // 🔍 检查点 1：记录原始 Worker 数据
-      console.log('[DEBUG-LAYER-1] 原始 Orchestrator 消息:', {
-        type: data.type,
-        contentLength: data.content.length,
-        contentPreview: data.content.substring(0, 200),
-        hasJson: /\{[\s\S]*"[^"]+"\s*:/.test(data.content),
-      });
-
-      // 过滤内部状态消息
-      if (isInternalStateMessage(data)) {
-        return;
-      }
-
-      // 转换为标准消息格式（只发送标准消息）
-      const standardMessage = normalizeOrchestratorMessage(data, event.taskId);
-
-      // 通过统一消息总线发送，确保 processingState 正确更新
-      this.messageBus.sendMessage(standardMessage);
-    });
+    // orchestrator:ui_message 已废弃：所有 UI 消息统一走 MessageHub
 
    
     globalEventBus.on('orchestrator:phase_changed', (event) => {
@@ -1148,7 +1189,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           type: 'phaseChanged',
           phase: data.phase,
           taskId: event.taskId || '',
-          isRunning: data.isRunning ?? this.intelligentOrchestrator.running
+          isRunning: data.isRunning ?? this.orchestratorEngine.running
         } as any);
         // 移除 sendStateUpdate() 调用，避免频繁 DOM 重建导致页面跳动
       }
@@ -1249,7 +1290,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     // ============= Mission-Driven 架构事件 =============
-    // 这些事件来自 MissionOrchestrator 和 MissionExecutor
+    // 这些事件来自 MissionOrchestrator（MissionExecutor 已合并）
     this.bindMissionEvents();
   }
 
@@ -1273,7 +1314,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   /**
    * 绑定 Mission-Driven 架构事件
-   * 将 MissionOrchestrator 和 MissionExecutor 的事件转发到 Webview
+   * 将 MissionOrchestrator 的事件转发到 Webview（MissionExecutor 已合并）
    */
   private bindMissionEvents(): void {
     // 如果 MissionOrchestrator 未初始化，跳过
@@ -1381,11 +1422,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       } as any);
     });
 
-    // 如果 MissionExecutor 未初始化，跳过执行事件
-    if (!this.missionExecutor) return;
-
-    // 执行事件
-    this.missionExecutor.on('executionStarted', (data: { missionId: string }) => {
+    // 执行事件（从 MissionOrchestrator 获取，MissionExecutor 已合并）
+    this.missionOrchestrator.on('executionStarted', (data: { missionId: string }) => {
       this.postMessage({
         type: 'missionExecutionStarted',
         missionId: data.missionId,
@@ -1393,7 +1431,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       } as any);
     });
 
-    this.missionExecutor.on('executionCompleted', (data: any) => {
+    this.missionOrchestrator.on('executionCompleted', (data: any) => {
       this.postMessage({
         type: 'missionExecutionCompleted',
         missionId: data.mission.id,
@@ -1404,7 +1442,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.sendStateUpdate();
     });
 
-    this.missionExecutor.on('executionFailed', (data: { missionId: string; error: string }) => {
+    this.missionOrchestrator.on('executionFailed', (data: { missionId: string; error: string }) => {
       this.postMessage({
         type: 'missionExecutionFailed',
         missionId: data.missionId,
@@ -1415,7 +1453,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     // Assignment 事件
-    this.missionExecutor.on('assignmentStarted', (data: { missionId: string; assignmentId: string; workerId: WorkerSlot }) => {
+    this.missionOrchestrator.on('assignmentStarted', (data: { missionId: string; assignmentId: string; workerId: WorkerSlot }) => {
       this.postMessage({
         type: 'assignmentStarted',
         missionId: data.missionId,
@@ -1425,7 +1463,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       } as any);
     });
 
-    this.missionExecutor.on('assignmentCompleted', (data: { missionId: string; assignmentId: string; success: boolean }) => {
+    this.missionOrchestrator.on('assignmentPlanned', (data: { missionId: string; assignmentId: string; todos: WorkerTodo[]; warnings?: string[] }) => {
+      this.postMessage({
+        type: 'assignmentPlanned',
+        missionId: data.missionId,
+        assignmentId: data.assignmentId,
+        todos: data.todos,
+        warnings: data.warnings,
+        sessionId: this.activeSessionId,
+      } as any);
+    });
+
+    this.missionOrchestrator.on('assignmentCompleted', (data: { missionId: string; assignmentId: string; success: boolean }) => {
       this.postMessage({
         type: 'assignmentCompleted',
         missionId: data.missionId,
@@ -1435,8 +1484,28 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       } as any);
     });
 
+    // Worker Session 事件
+    this.missionOrchestrator.on('workerSessionCreated', (data: { sessionId: string; assignmentId: string; workerId: WorkerSlot }) => {
+      this.postMessage({
+        type: 'workerSessionCreated',
+        sessionId: data.sessionId,
+        assignmentId: data.assignmentId,
+        workerId: data.workerId,
+      } as any);
+    });
+
+    this.missionOrchestrator.on('workerSessionResumed', (data: { sessionId: string; assignmentId: string; workerId: WorkerSlot; completedTodos: number }) => {
+      this.postMessage({
+        type: 'workerSessionResumed',
+        sessionId: data.sessionId,
+        assignmentId: data.assignmentId,
+        workerId: data.workerId,
+        completedTodos: data.completedTodos,
+      } as any);
+    });
+
     // Todo 事件
-    this.missionExecutor.on('todoStarted', (data: { missionId: string; assignmentId: string; todoId: string }) => {
+    this.missionOrchestrator.on('todoStarted', (data: { missionId: string; assignmentId: string; todoId: string }) => {
       this.postMessage({
         type: 'todoStarted',
         missionId: data.missionId,
@@ -1446,7 +1515,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       } as any);
     });
 
-    this.missionExecutor.on('todoCompleted', (data: { missionId: string; assignmentId: string; todoId: string; output: any }) => {
+    this.missionOrchestrator.on('todoCompleted', (data: { missionId: string; assignmentId: string; todoId: string; output: any }) => {
       this.postMessage({
         type: 'todoCompleted',
         missionId: data.missionId,
@@ -1457,7 +1526,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       } as any);
     });
 
-    this.missionExecutor.on('todoFailed', (data: { missionId: string; assignmentId: string; todoId: string; error: string }) => {
+    this.missionOrchestrator.on('todoFailed', (data: { missionId: string; assignmentId: string; todoId: string; error: string }) => {
       this.postMessage({
         type: 'todoFailed',
         missionId: data.missionId,
@@ -1469,7 +1538,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     // 动态 Todo 事件
-    this.missionExecutor.on('dynamicTodoAdded', (data: { missionId: string; assignmentId: string; todo: WorkerTodo }) => {
+    this.missionOrchestrator.on('dynamicTodoAdded', (data: { missionId: string; assignmentId: string; todo: WorkerTodo }) => {
       this.postMessage({
         type: 'dynamicTodoAdded',
         missionId: data.missionId,
@@ -1480,7 +1549,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     // 审批请求事件
-    this.missionExecutor.on('approvalRequested', (data: { missionId: string; assignmentId: string; todoId: string; reason: string }) => {
+    this.missionOrchestrator.on('approvalRequested', (data: { missionId: string; assignmentId: string; todoId: string; reason: string }) => {
       this.postMessage({
         type: 'todoApprovalRequested',
         missionId: data.missionId,
@@ -1492,7 +1561,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     // 阻塞事件
-    this.missionExecutor.on('blocked', (blockedItem: BlockedItem) => {
+    this.missionOrchestrator.on('blocked', (blockedItem: BlockedItem) => {
       this.postMessage({
         type: 'missionBlocked',
         blockedItem,
@@ -1500,7 +1569,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       } as any);
     });
 
-    this.missionExecutor.on('unblocked', (blockedItem: BlockedItem) => {
+    this.missionOrchestrator.on('unblocked', (blockedItem: BlockedItem) => {
       this.postMessage({
         type: 'missionUnblocked',
         blockedItem,
@@ -1509,7 +1578,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     // 进度更新事件
-    this.missionExecutor.on('progressUpdated', (progress: ExecutionProgress) => {
+    this.missionOrchestrator.on('progressUpdated', (progress: ExecutionProgress) => {
       this.postMessage({
         type: 'missionProgress',
         progress,
@@ -1518,7 +1587,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     // 契约验证事件
-    this.missionExecutor.on('contractVerified', (data: { missionId: string; contractId: string; success: boolean }) => {
+    this.missionOrchestrator.on('contractVerified', (data: { missionId: string; contractId: string; success: boolean }) => {
       this.postMessage({
         type: 'contractVerified',
         missionId: data.missionId,
@@ -1539,27 +1608,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * 设置 MissionExecutor
-   * 用于 Mission-Driven 架构
-   */
-  setMissionExecutor(executor: MissionExecutor): void {
-    this.missionExecutor = executor;
-    this.bindMissionEvents();
-  }
-
-  /**
    * 获取 MissionOrchestrator
    */
   getMissionOrchestrator(): MissionOrchestrator | undefined {
     return this.missionOrchestrator;
   }
 
-  /**
-   * 获取 MissionExecutor
-   */
-  getMissionExecutor(): MissionExecutor | undefined {
-    return this.missionExecutor;
-  }
+  // MissionExecutor 已合并到 MissionOrchestrator，移除 setMissionExecutor 和 getMissionExecutor
 
   /** 打断当前任务 - 增强版：添加等待和超时机制 */
   private async interruptCurrentTask(options?: { silent?: boolean }): Promise<void> {
@@ -1569,13 +1624,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const taskManager = await this.getTaskManager();
     const tasks = await taskManager.getAllTasks();
     const runningTasks = tasks.filter(t => t.status === 'running');
-    const hasRunningTask = runningTasks.length > 0 || this.intelligentOrchestrator.running;
+    const hasRunningTask = runningTasks.length > 0 || this.orchestratorEngine.running;
 
 
     // 1. 首先中断 Orchestrator（这会触发 AbortController）
-    if (this.intelligentOrchestrator.running) {
+    if (this.orchestratorEngine.running) {
       logger.info('界面.任务.中断.编排器', undefined, LogCategory.UI);
-      await this.intelligentOrchestrator.interrupt();
+      await this.orchestratorEngine.interrupt();
     }
 
     // 2. 中断所有适配器并等待完成
@@ -1691,9 +1746,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       },
     };
 
-    // 🔧 通过 MessageBus 发送，统一消息流
-    this.messageBus.sendMessage(standardMessage);
-    this.logMessageFlow('orchestratorMessage via MessageBus', standardMessage);
+    // 🔧 通过 MessageHub 统一出口发送
+    this.messageHub.forwardStandardMessage(standardMessage);
+    this.logMessageFlow('orchestratorMessage via MessageHub', standardMessage);
   }
 
   /** 实现 WebviewViewProvider 接口 */
@@ -2398,15 +2453,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
 
       if (source === 'manual') {
-        this.postMessageImmediate({ type: 'promptEnhanceSaved', success: true });
-        this.postMessageImmediate({ type: 'toast', message: 'ACE 配置已保存', toastType: 'success' });
+        this.postMessage({ type: 'promptEnhanceSaved', success: true });
+        this.postMessage({ type: 'toast', message: 'ACE 配置已保存', toastType: 'success' });
       }
     } catch (error) {
       logger.error('界面.提示词_增强.配置.保存_失败', error, LogCategory.UI);
       if (source === 'manual') {
         const errorMsg = error instanceof Error ? error.message : String(error);
-        this.postMessageImmediate({ type: 'promptEnhanceSaved', success: false, error: errorMsg });
-        this.postMessageImmediate({ type: 'toast', message: `ACE 配置保存失败: ${errorMsg}`, toastType: 'error' });
+        this.postMessage({ type: 'promptEnhanceSaved', success: false, error: errorMsg });
+        this.postMessage({ type: 'toast', message: `ACE 配置保存失败: ${errorMsg}`, toastType: 'error' });
       }
     }
   }
@@ -2436,7 +2491,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 测试 Augment API 连接 */
   private async handleTestPromptEnhance(baseUrl: string, apiKey: string): Promise<void> {
     if (!baseUrl || !apiKey) {
-      this.postMessageImmediate({ type: 'promptEnhanceResult', success: false, message: '请填写 API 地址和密钥' } as any);
+      this.postMessage({ type: 'promptEnhanceResult', success: false, message: '请填写 API 地址和密钥' } as any);
       return;
     }
 
@@ -2466,18 +2521,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
 
       if (response.ok) {
-        this.postMessageImmediate({ type: 'promptEnhanceResult', success: true, message: '连接成功' } as any);
+        this.postMessage({ type: 'promptEnhanceResult', success: true, message: '连接成功' } as any);
       } else if (response.status === 401) {
-        this.postMessageImmediate({ type: 'promptEnhanceResult', success: false, message: 'Token 无效或已过期' } as any);
+        this.postMessage({ type: 'promptEnhanceResult', success: false, message: 'Token 无效或已过期' } as any);
       } else if (response.status === 403) {
-        this.postMessageImmediate({ type: 'promptEnhanceResult', success: false, message: '访问被拒绝' } as any);
+        this.postMessage({ type: 'promptEnhanceResult', success: false, message: '访问被拒绝' } as any);
       } else {
         const errorText = await response.text().catch(() => '');
-        this.postMessageImmediate({ type: 'promptEnhanceResult', success: false, message: `连接失败: ${response.status}` } as any);
+        this.postMessage({ type: 'promptEnhanceResult', success: false, message: `连接失败: ${response.status}` } as any);
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.postMessageImmediate({ type: 'promptEnhanceResult', success: false, message: `连接错误: ${errorMsg}` } as any);
+      this.postMessage({ type: 'promptEnhanceResult', success: false, message: `连接错误: ${errorMsg}` } as any);
     }
   }
 
@@ -2487,16 +2542,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 加载压缩模型配置
       const { LLMConfigLoader } = await import('../llm/config');
       const compressorConfig = LLMConfigLoader.loadCompressorConfig();
+      const orchestratorConfig = LLMConfigLoader.loadOrchestratorConfig();
 
-      if (!compressorConfig.enabled) {
-        this.postMessage({ type: 'promptEnhanced', enhancedPrompt: '', error: '请先在设置中启用并配置压缩模型' } as any);
-        return;
-      }
-
-      if (!compressorConfig.baseUrl || !compressorConfig.apiKey) {
-        this.postMessage({ type: 'promptEnhanced', enhancedPrompt: '', error: '请先在设置中配置压缩模型 API' } as any);
-        return;
-      }
+      const useCompressor = compressorConfig.enabled
+        && Boolean(compressorConfig.baseUrl && compressorConfig.model);
+      const activeConfig = useCompressor ? compressorConfig : orchestratorConfig;
+      const activeLabel = useCompressor ? 'compressor' : 'orchestrator';
 
       // 获取项目根目录
       const workspaceFolders = vscode.workspace.workspaceFolders;
@@ -2525,15 +2576,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 创建压缩模型客户端并调用
       const { UniversalLLMClient } = await import('../llm/clients/universal-client');
       const client = new UniversalLLMClient({
-        baseUrl: compressorConfig.baseUrl,
-        apiKey: compressorConfig.apiKey,
-        model: compressorConfig.model,
-        provider: compressorConfig.provider,
+        baseUrl: activeConfig.baseUrl,
+        apiKey: activeConfig.apiKey,
+        model: activeConfig.model,
+        provider: activeConfig.provider,
         enabled: true,
       });
 
       logger.info('界面.提示词_增强.开始', {
-        model: compressorConfig.model,
+        model: activeConfig.model,
+        used: activeLabel,
+        fallbackToOrchestrator: !useCompressor,
         hasCodeContext: codeContext.length > 0,
         hasConversation: conversationHistory.length > 0
       }, LogCategory.UI);
@@ -2916,13 +2969,13 @@ ${originalPrompt}
         await (this.adapterFactory as any).clearAdapter(worker);
       }
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'workerConfigSaved',
         worker: worker,
         success: true
       });
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: `${worker} 配置已保存`,
         toastType: 'success'
@@ -2931,13 +2984,13 @@ ${originalPrompt}
       logger.info('Worker 配置已保存', { worker }, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存 Worker 配置失败', { worker, error: error.message }, LogCategory.LLM);
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'workerConfigSaved',
         worker: worker,
         success: false,
         error: error.message
       });
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: '保存配置失败: ' + error.message,
         toastType: 'error'
@@ -2948,8 +3001,17 @@ ${originalPrompt}
   /** 测试 Worker 连接 */
   private async handleTestWorkerConnection(worker: WorkerSlot, config: any): Promise<void> {
     try {
+      const normalizedConfig = { ...config, enabled: config?.enabled !== false };
+      if (!normalizedConfig.enabled) {
+        this.postMessage({
+          type: 'toast',
+          message: `${worker} 未启用，无法测试连接`,
+          toastType: 'warning'
+        });
+        return;
+      }
       const { createLLMClient } = await import('../llm/clients/client-factory');
-      const client = createLLMClient(config);
+      const client = createLLMClient(normalizedConfig);
 
       // 发送测试请求
       const response = await client.sendMessage({
@@ -2959,13 +3021,13 @@ ${originalPrompt}
       });
 
       if (response && response.content) {
-        this.postMessageImmediate({
+        this.postMessage({
           type: 'workerConnectionTestResult',
           worker: worker,
           success: true
         });
 
-        this.postMessageImmediate({
+        this.postMessage({
           type: 'toast',
           message: `${worker} 连接成功`,
           toastType: 'success'
@@ -2976,14 +3038,14 @@ ${originalPrompt}
     } catch (error: any) {
       logger.error('Worker 连接测试失败', { worker, error: error.message }, LogCategory.LLM);
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'workerConnectionTestResult',
         worker: worker,
         success: false,
         error: error.message
       });
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: `${worker} 连接失败: ${error.message}`,
         toastType: 'error'
@@ -3024,12 +3086,12 @@ ${originalPrompt}
         await (this.adapterFactory as any).clearAdapter('orchestrator');
       }
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'orchestratorConfigSaved',
         success: true
       });
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: '编排者配置已保存',
         toastType: 'success'
@@ -3038,12 +3100,12 @@ ${originalPrompt}
       logger.info('编排者配置已保存', undefined, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存编排者配置失败', { error: error.message }, LogCategory.LLM);
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'orchestratorConfigSaved',
         success: false,
         error: error.message
       });
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: '保存配置失败: ' + error.message,
         toastType: 'error'
@@ -3054,8 +3116,17 @@ ${originalPrompt}
   /** 测试编排者连接 */
   private async handleTestOrchestratorConnection(config: any): Promise<void> {
     try {
+      const normalizedConfig = { ...config, enabled: config?.enabled !== false };
+      if (!normalizedConfig.enabled) {
+        this.postMessage({
+          type: 'toast',
+          message: '编排者未启用，无法测试连接',
+          toastType: 'warning'
+        });
+        return;
+      }
       const { createLLMClient } = await import('../llm/clients/client-factory');
-      const client = createLLMClient(config);
+      const client = createLLMClient(normalizedConfig);
 
       // 发送测试请求
       const response = await client.sendMessage({
@@ -3065,12 +3136,12 @@ ${originalPrompt}
       });
 
       if (response && response.content) {
-        this.postMessageImmediate({
+        this.postMessage({
           type: 'orchestratorConnectionTestResult',
           success: true
         });
 
-        this.postMessageImmediate({
+        this.postMessage({
           type: 'toast',
           message: '编排者连接成功',
           toastType: 'success'
@@ -3081,13 +3152,13 @@ ${originalPrompt}
     } catch (error: any) {
       logger.error('编排者连接测试失败', { error: error.message }, LogCategory.LLM);
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'orchestratorConnectionTestResult',
         success: false,
         error: error.message
       });
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: `编排者连接失败: ${error.message}`,
         toastType: 'error'
@@ -3123,14 +3194,14 @@ ${originalPrompt}
       // 保存配置
       LLMConfigLoader.updateCompressorConfig(config);
 
-      await this.intelligentOrchestrator.reloadCompressionAdapter();
+      await this.orchestratorEngine.reloadCompressionAdapter();
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'compressorConfigSaved',
         success: true
       });
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: '压缩器配置已保存',
         toastType: 'success'
@@ -3139,12 +3210,12 @@ ${originalPrompt}
       logger.info('压缩器配置已保存', undefined, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存压缩器配置失败', { error: error.message }, LogCategory.LLM);
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'compressorConfigSaved',
         success: false,
         error: error.message
       });
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: '保存配置失败: ' + error.message,
         toastType: 'error'
@@ -3154,9 +3225,31 @@ ${originalPrompt}
 
   /** 测试压缩器连接 */
   private async handleTestCompressorConnection(config: any): Promise<void> {
+    let fallbackModel: string | undefined;
     try {
+      const normalizedConfig = { ...config, enabled: Boolean(config?.apiKey) || config?.enabled === true };
+      const { LLMConfigLoader } = await import('../llm/config');
+      const orchestratorConfig = LLMConfigLoader.loadOrchestratorConfig();
+      fallbackModel = orchestratorConfig?.provider && orchestratorConfig?.model
+        ? `${orchestratorConfig.provider} - ${orchestratorConfig.model}`
+        : undefined;
+
+      if (!normalizedConfig.enabled || !normalizedConfig.apiKey || !normalizedConfig.model) {
+        this.postMessage({
+          type: 'compressorConnectionTestResult',
+          success: false,
+          error: '压缩模型未配置或不可用',
+          fallbackModel
+        });
+        this.postMessage({
+          type: 'toast',
+          message: '压缩模型不可用，已降级使用编排者模型',
+          toastType: 'warning'
+        });
+        return;
+      }
       const { createLLMClient } = await import('../llm/clients/client-factory');
-      const client = createLLMClient(config);
+      const client = createLLMClient(normalizedConfig);
 
       // 发送测试请求
       const response = await client.sendMessage({
@@ -3166,12 +3259,12 @@ ${originalPrompt}
       });
 
       if (response && response.content) {
-        this.postMessageImmediate({
+        this.postMessage({
           type: 'compressorConnectionTestResult',
           success: true
         });
 
-        this.postMessageImmediate({
+        this.postMessage({
           type: 'toast',
           message: '压缩器连接成功',
           toastType: 'success'
@@ -3182,16 +3275,17 @@ ${originalPrompt}
     } catch (error: any) {
       logger.error('压缩器连接测试失败', { error: error.message }, LogCategory.LLM);
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'compressorConnectionTestResult',
         success: false,
-        error: error.message
+        error: error.message,
+        fallbackModel
       });
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
-        message: `压缩器连接失败: ${error.message}`,
-        toastType: 'error'
+        message: '压缩器连接失败，已降级使用编排者模型',
+        toastType: 'warning'
       });
     }
   }
@@ -3560,11 +3654,11 @@ ${originalPrompt}
       const { LLMConfigLoader } = await import('../llm/config');
       LLMConfigLoader.saveSkillsConfig(config);
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'skillsConfigSaved'
       });
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: 'Skills 配置已保存',
         toastType: 'success'
@@ -3575,7 +3669,7 @@ ${originalPrompt}
       logger.info('Skills 配置已保存', {}, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('保存 Skills 配置失败', { error: error.message }, LogCategory.TOOLS);
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: `保存 Skills 配置失败: ${error.message}`,
         toastType: 'error'
@@ -3605,12 +3699,12 @@ ${originalPrompt}
 
       LLMConfigLoader.saveSkillsConfig(config);
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'customToolAdded',
         tool
       });
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: `自定义工具 "${tool.name}" 已添加`,
         toastType: 'success'
@@ -3621,7 +3715,7 @@ ${originalPrompt}
       logger.info('自定义工具已添加', { name: tool.name }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('添加自定义工具失败', { error: error.message }, LogCategory.TOOLS);
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: `添加自定义工具失败: ${error.message}`,
         toastType: 'error'
@@ -3644,12 +3738,12 @@ ${originalPrompt}
       config.customTools = config.customTools.filter((t: any) => t.name !== toolName);
       LLMConfigLoader.saveSkillsConfig(config);
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'customToolRemoved',
         toolName
       });
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: `自定义工具 "${toolName}" 已删除`,
         toastType: 'success'
@@ -3660,7 +3754,7 @@ ${originalPrompt}
       logger.info('自定义工具已删除', { name: toolName }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('删除自定义工具失败', { toolName, error: error.message }, LogCategory.TOOLS);
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: `删除自定义工具失败: ${error.message}`,
         toastType: 'error'
@@ -3683,12 +3777,12 @@ ${originalPrompt}
       config.instructionSkills = (config.instructionSkills || []).filter((s: any) => s.name !== skillName);
       LLMConfigLoader.saveSkillsConfig(config);
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'instructionSkillRemoved',
         skillName
       });
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: `Instruction Skill "${skillName}" 已删除`,
         toastType: 'success'
@@ -3699,7 +3793,7 @@ ${originalPrompt}
       logger.info('Instruction Skill 已删除', { name: skillName }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('删除 Instruction Skill 失败', { skillName, error: error.message }, LogCategory.TOOLS);
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: `删除 Instruction Skill 失败: ${error.message}`,
         toastType: 'error'
@@ -3737,13 +3831,13 @@ ${originalPrompt}
       LLMConfigLoader.saveSkillsConfig(config);
 
       // 发送成功消息
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'skillInstalled',
         skillId,
         skill
       });
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: `Skill "${skill.description}" 已安装`,
         toastType: 'success'
@@ -3758,7 +3852,7 @@ ${originalPrompt}
       logger.info('Skill 已安装', { skillId, name: skill.name }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('安装 Skill 失败', { skillId, error: error.message }, LogCategory.TOOLS);
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: `安装 Skill 失败: ${error.message}`,
         toastType: 'error'
@@ -3786,7 +3880,7 @@ ${originalPrompt}
       logger.info('Repositories loaded', { count: repositories.length }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to load repositories', { error: error.message }, LogCategory.TOOLS);
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: '加载仓库失败: ' + error.message,
         toastType: 'error'
@@ -3813,7 +3907,7 @@ ${originalPrompt}
       LLMConfigLoader.updateRepositoryName(result.id, repoInfo.name);
       LLMConfigLoader.updateRepository(result.id, { type: repoInfo.type });
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'repositoryAdded',
         repository: {
           id: result.id,
@@ -3824,7 +3918,7 @@ ${originalPrompt}
         }
       });
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: `仓库 "${repoInfo.name}" 已添加（${repoInfo.skillCount} 个技能）`,
         toastType: 'success'
@@ -3833,7 +3927,7 @@ ${originalPrompt}
       logger.info('Repository added', { url, name: repoInfo.name, type: repoInfo.type }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to add repository', { url, error: error.message }, LogCategory.TOOLS);
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: '添加仓库失败: ' + error.message,
         toastType: 'error'
@@ -3849,12 +3943,12 @@ ${originalPrompt}
       const { LLMConfigLoader } = await import('../llm/config');
       LLMConfigLoader.updateRepository(repositoryId, updates);
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'repositoryUpdated',
         repositoryId
       });
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: '仓库已更新',
         toastType: 'success'
@@ -3866,7 +3960,7 @@ ${originalPrompt}
       logger.info('Repository updated', { id: repositoryId }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to update repository', { repositoryId, error: error.message }, LogCategory.TOOLS);
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: '更新仓库失败: ' + error.message,
         toastType: 'error'
@@ -3882,12 +3976,12 @@ ${originalPrompt}
       const { LLMConfigLoader } = await import('../llm/config');
       LLMConfigLoader.deleteRepository(repositoryId);
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'repositoryDeleted',
         repositoryId
       });
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: '仓库已删除',
         toastType: 'success'
@@ -3899,7 +3993,7 @@ ${originalPrompt}
       logger.info('Repository deleted', { id: repositoryId }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to delete repository', { repositoryId, error: error.message }, LogCategory.TOOLS);
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: '删除仓库失败: ' + error.message,
         toastType: 'error'
@@ -3916,12 +4010,12 @@ ${originalPrompt}
       const manager = new SkillRepositoryManager();
       manager.clearCache(repositoryId);
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'repositoryRefreshed',
         repositoryId
       });
 
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: '仓库缓存已清除',
         toastType: 'success'
@@ -3930,7 +4024,7 @@ ${originalPrompt}
       logger.info('Repository cache cleared', { id: repositoryId }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to refresh repository', { repositoryId, error: error.message }, LogCategory.TOOLS);
-      this.postMessageImmediate({
+      this.postMessage({
         type: 'toast',
         message: '刷新仓库失败: ' + error.message,
         toastType: 'error'
@@ -3967,7 +4061,7 @@ ${originalPrompt}
       // 检查哪些已安装
       const skillsConfig = LLMConfigLoader.loadSkillsConfig();
       const installedSkills = new Set<string>();
-      // 内置工具已迁移到 ToolManager，不再通过 builtInTools 配置管理
+      // 内置工具由 ToolManager 管理，不通过 builtInTools 配置
       if (skillsConfig && Array.isArray(skillsConfig.customTools)) {
         skillsConfig.customTools.forEach((tool: any) => {
           if (tool?.name) {
@@ -4425,15 +4519,23 @@ ${originalPrompt}
 
   private async performWorkerStatusCheck(force: boolean): Promise<void> {
     const { LLMConfigLoader } = await import('../llm/config');
-    const { createLLMClient } = await import('../llm/clients/client-factory');
+    const { getOrCreateLLMClient } = await import('../llm/clients/client-factory');
 
     const config = LLMConfigLoader.loadFullConfig();
     const statuses: Record<string, { status: string; model?: string; error?: string }> = {};
     const now = Date.now();
-    const statusTimeout = force ? this.workerStatusHardTimeoutMs : this.workerStatusTimeoutMs;
     const priorityModels: Array<'orchestrator' | 'compressor'> = ['orchestrator', 'compressor'];
     const workerModels: WorkerSlot[] = ['claude', 'codex', 'gemini'];
     const modelIds = [...priorityModels, ...workerModels];
+    const formatModelLabel = (modelConfig: any): string | undefined => {
+      if (!modelConfig?.provider || !modelConfig?.model) return undefined;
+      return `${modelConfig.provider} - ${modelConfig.model}`;
+    };
+    const orchestratorLabel = formatModelLabel(config.orchestrator);
+    const compressorFallbackLabel = orchestratorLabel ? `编排模型: ${orchestratorLabel}` : '编排模型';
+    const setCompressorFallback = (reason: string) => {
+      statuses.compressor = { status: 'fallback', model: compressorFallbackLabel, error: reason };
+    };
 
     const getCachedStatus = (name: string) => {
       if (!this.workerStatusCache) return null;
@@ -4454,52 +4556,39 @@ ${originalPrompt}
       return false;
     };
 
-    // 测试模型的通用函数
+    // 测试模型的通用函数（使用快速 Models API）
     const testModel = async (name: string, modelConfig: any, isRequired: boolean = false) => {
-      if (!modelConfig.enabled) {
-        statuses[name] = {
-          status: 'disabled',
-          model: '已禁用'
-        };
-        this.postMessage({
-          type: 'workerStatusUpdate',
-          statuses
-        } as ExtensionToWebviewMessage);
-        return;
-      }
-
-      if (!modelConfig.apiKey || !modelConfig.model) {
+      const isCompressor = name === 'compressor';
+      if (!modelConfig.enabled || !modelConfig.apiKey || !modelConfig.model) {
+        if (isCompressor) {
+          setCompressorFallback(!modelConfig.enabled ? '压缩模型未启用' : '压缩模型未配置');
+          return;
+        }
+        if (!modelConfig.enabled) {
+          statuses[name] = {
+            status: 'disabled',
+            model: '已禁用'
+          };
+          return;
+        }
         statuses[name] = {
           status: 'not_configured',
           model: isRequired ? '未配置（必需）' : '未配置'
         };
-        this.postMessage({
-          type: 'workerStatusUpdate',
-          statuses
-        } as ExtensionToWebviewMessage);
         return;
       }
 
-      const modelLabel = `${modelConfig.provider} - ${modelConfig.model}`;
+      const modelLabel = formatModelLabel(modelConfig) || '未配置';
       if (!force) {
         const isConnected = name !== 'compressor'
           && this.adapterFactory.isConnected(name as AgentType);
         if (isConnected) {
           statuses[name] = { status: 'available', model: modelLabel };
-          this.postMessage({
-            type: 'workerStatusUpdate',
-            statuses
-          } as ExtensionToWebviewMessage);
           return;
         }
         if (applyQuickStatus(name, modelLabel)) {
-          this.postMessage({
-            type: 'workerStatusUpdate',
-            statuses
-          } as ExtensionToWebviewMessage);
           return;
         }
-        // 软检测也需要继续执行真实检测，避免长期停留在“检测中”
       }
 
       try {
@@ -4507,75 +4596,62 @@ ${originalPrompt}
           status: 'checking',
           model: modelLabel
         };
-        this.postMessage({
-          type: 'workerStatusUpdate',
-          statuses
-        } as ExtensionToWebviewMessage);
 
-        const client = createLLMClient(modelConfig);
+        // 使用快速连接测试（Models API）
+        const client = getOrCreateLLMClient(modelConfig);
+        const result = await client.testConnectionFast();
 
-        await Promise.race([
-          client.sendMessage({
-            messages: [{ role: 'user', content: 'Hello' }],
-            maxTokens: 10,
-            temperature: 0.7
-          }),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Connection timeout')), statusTimeout)
-          )
-        ]);
+        if (result.success) {
+          // 检查模型是否存在（如果 API 支持）
+          if (result.modelExists === false) {
+            if (isCompressor) {
+              setCompressorFallback(`模型不存在: ${modelConfig.model}`);
+              return;
+            }
+            statuses[name] = { status: 'invalid_model', model: undefined, error: `模型不存在: ${modelConfig.model}` };
+          } else {
+            statuses[name] = {
+              status: 'available',
+              model: modelLabel
+            };
+          }
+        } else {
+          if (isCompressor) {
+            setCompressorFallback(result.error || '压缩模型连接失败');
+            return;
+          }
+          // 根据错误类型设置状态
+          let status = 'error';
+          if (result.error?.includes('API Key')) {
+            status = 'auth_failed';
+          } else if (result.error?.includes('网络') || result.error?.includes('连接')) {
+            status = 'network_error';
+          } else if (result.error?.includes('超时')) {
+            status = 'timeout';
+          }
 
-        statuses[name] = {
-          status: 'available',
-          model: modelLabel
-        };
-        this.postMessage({
-          type: 'workerStatusUpdate',
-          statuses
-        } as ExtensionToWebviewMessage);
-
-        logger.info(`Model connection test succeeded: ${name}`, {
-          provider: modelConfig.provider,
-          model: modelConfig.model
-        }, LogCategory.LLM);
-      } catch (error: any) {
-        let status = 'unknown';
-        let errorMsg = error.message;
-
-        if (error.message.includes('401') || error.message.includes('authentication') || error.message.includes('Unauthorized')) {
-          status = 'auth_failed';
-          errorMsg = 'API Key 无效';
-        } else if (error.message.includes('network') || error.message.includes('ECONNREFUSED') || error.message.includes('ENOTFOUND')) {
-          status = 'network_error';
-          errorMsg = '网络连接失败';
-        } else if (error.message.includes('timeout') || error.message === 'Connection timeout') {
-          status = 'timeout';
-          errorMsg = '连接超时';
-        } else if (error.message.includes('disabled')) {
-          status = 'disabled';
-          errorMsg = '已禁用';
-        } else if (error.message.includes('empty choices') || error.message.includes('model name is invalid')) {
-          status = 'invalid_model';
-          errorMsg = `模型名称无效: ${modelConfig.model}`;
-        } else if (error.message.includes('404') || error.message.includes('not found')) {
-          status = 'invalid_model';
-          errorMsg = `模型不存在: ${modelConfig.model}`;
+          statuses[name] = {
+            status,
+            model: undefined,
+            error: result.error
+          };
         }
 
-        statuses[name] = {
-          status,
-          model: undefined,
-          error: errorMsg
-        };
-        this.postMessage({
-          type: 'workerStatusUpdate',
-          statuses
-        } as ExtensionToWebviewMessage);
+        logger.info(`Model connection test (fast): ${name}`, {
+          provider: modelConfig.provider,
+          model: modelConfig.model,
+          success: result.success,
+          modelExists: result.modelExists,
+        }, LogCategory.LLM);
+      } catch (error: any) {
+        if (isCompressor) {
+          setCompressorFallback(error.message || '压缩模型连接失败');
+          return;
+        }
+        statuses[name] = { status: 'error', model: undefined, error: error.message };
 
         logger.warn(`Model connection test failed: ${name}`, {
-          status,
-          error: errorMsg,
-          originalError: error.message
+          error: error.message
         }, LogCategory.LLM);
       }
     };
@@ -4587,6 +4663,11 @@ ${originalPrompt}
         : name === 'compressor'
           ? config.compressor
           : config.workers[name as WorkerSlot];
+
+      if (name === 'compressor' && (!modelConfig?.enabled || !modelConfig?.apiKey || !modelConfig?.model)) {
+        setCompressorFallback(!modelConfig?.enabled ? '压缩模型未启用' : '压缩模型未配置');
+        return;
+      }
 
       if (!modelConfig?.enabled) {
         statuses[name] = { status: 'disabled', model: '已禁用' };
@@ -4600,7 +4681,7 @@ ${originalPrompt}
         return;
       }
 
-      const modelLabel = `${modelConfig.provider} - ${modelConfig.model}`;
+      const modelLabel = formatModelLabel(modelConfig) || '未配置';
       if (!force) {
         const isConnected = name !== 'compressor'
           && this.adapterFactory.isConnected(name as AgentType);
@@ -4620,12 +4701,12 @@ ${originalPrompt}
       statuses
     } as ExtensionToWebviewMessage);
 
-    // 优先检测编排模型，再检测压缩模型，最后并行检测 Worker
-    await testModel('orchestrator', config.orchestrator, true);
-    await testModel('compressor', config.compressor, true);
-    await Promise.all(
-      workerModels.map(worker => testModel(worker, config.workers[worker]))
-    );
+    // 所有模型并行检测（不再串行）
+    await Promise.all([
+      testModel('orchestrator', config.orchestrator, true),
+      testModel('compressor', config.compressor, true),
+      ...workerModels.map(worker => testModel(worker, config.workers[worker]))
+    ]);
 
     this.workerStatusCache = statuses;
     this.workerStatusCacheAt = Date.now();
@@ -4643,7 +4724,7 @@ ${originalPrompt}
 
   /** 发送执行统计数据到前端 */
   private sendExecutionStats(): void {
-    const executionStats = this.intelligentOrchestrator.getExecutionStats();
+    const executionStats = this.orchestratorEngine.getExecutionStats();
     if (!executionStats) {
       logger.info('界面.执行统计.未初始化', undefined, LogCategory.UI);
       return;
@@ -4722,12 +4803,12 @@ ${originalPrompt}
   }
 
   private async handleResetExecutionStats(): Promise<void> {
-    const executionStats = this.intelligentOrchestrator.getExecutionStats();
+    const executionStats = this.orchestratorEngine.getExecutionStats();
     if (!executionStats) {
       return;
     }
     await executionStats.clearStats();
-    this.intelligentOrchestrator.resetOrchestratorTokenUsage();
+    this.orchestratorEngine.resetOrchestratorTokenUsage();
     this.sendExecutionStats();
     this.postMessage({ type: 'toast', message: '执行统计已重置', toastType: 'info' });
   }
@@ -4872,11 +4953,11 @@ ${originalPrompt}
       } catch (rulesError) {
         logger.warn('保存用户规则失败', { error: rulesError }, LogCategory.LLM);
       }
-      this.postMessageImmediate({ type: 'profileConfigSaved', success: true });
-      this.postMessageImmediate({ type: 'toast', message: '画像配置已保存', toastType: 'success' });
+      this.postMessage({ type: 'profileConfigSaved', success: true });
+      this.postMessage({ type: 'toast', message: '画像配置已保存', toastType: 'success' });
 
       try {
-        await this.intelligentOrchestrator.reloadProfiles();
+        await this.orchestratorEngine.reloadProfiles();
       } catch (reloadError) {
         const reloadMsg = reloadError instanceof Error ? reloadError.message : String(reloadError);
         this.postMessage({ type: 'toast', message: `画像重载失败: ${reloadMsg}`, toastType: 'warning' });
@@ -4885,8 +4966,8 @@ ${originalPrompt}
       logger.info('界面.画像.配置.已保存', { path: ProfileStorage.getConfigDir() }, LogCategory.UI);
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.postMessageImmediate({ type: 'profileConfigSaved', success: false, error: errorMsg });
-      this.postMessageImmediate({ type: 'toast', message: `保存失败: ${errorMsg}`, toastType: 'error' });
+      this.postMessage({ type: 'profileConfigSaved', success: false, error: errorMsg });
+      this.postMessage({ type: 'toast', message: `保存失败: ${errorMsg}`, toastType: 'error' });
     }
   }
 
@@ -4905,25 +4986,25 @@ ${originalPrompt}
         logger.warn('重置用户规则失败', { error: rulesError }, LogCategory.LLM);
       }
       try {
-        await this.intelligentOrchestrator.reloadProfiles();
+        await this.orchestratorEngine.reloadProfiles();
       } catch (reloadError) {
         const reloadMsg = reloadError instanceof Error ? reloadError.message : String(reloadError);
         this.postMessage({ type: 'toast', message: `画像重载失败: ${reloadMsg}`, toastType: 'warning' });
       }
-      this.postMessageImmediate({ type: 'toast', message: '画像配置已重置为默认值', toastType: 'success' });
-      this.postMessageImmediate({ type: 'profileConfigReset', success: true });
+      this.postMessage({ type: 'toast', message: '画像配置已重置为默认值', toastType: 'success' });
+      this.postMessage({ type: 'profileConfigReset', success: true });
       await this.sendProfileConfig();
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.postMessageImmediate({ type: 'profileConfigReset', success: false, error: errorMsg });
-      this.postMessageImmediate({ type: 'toast', message: `重置失败: ${errorMsg}`, toastType: 'error' });
+      this.postMessage({ type: 'profileConfigReset', success: false, error: errorMsg });
+      this.postMessage({ type: 'toast', message: `重置失败: ${errorMsg}`, toastType: 'error' });
     }
   }
 
   /** 处理设置交互模式 */
   private handleSetInteractionMode(mode: import('../types').InteractionMode): void {
     logger.info('界面.交互_模式.变更', { mode }, LogCategory.UI);
-    this.intelligentOrchestrator.setInteractionMode(mode);
+    this.orchestratorEngine.setInteractionMode(mode);
     this.postMessage({ type: 'interactionModeChanged', mode });
     this.postMessage({
       type: 'toast',
@@ -5150,7 +5231,7 @@ ${originalPrompt}
 
   /** 恢复被打断的任务 */
   private async resumeInterruptedTask(extraInstruction?: string): Promise<void> {
-    if (this.intelligentOrchestrator.running) {
+    if (this.orchestratorEngine.running) {
       this.postMessage({ type: 'toast', message: '当前仍有任务在执行', toastType: 'warning' });
       return;
     }
@@ -5175,7 +5256,7 @@ ${originalPrompt}
     logger.info('界面.消息.补充.请求', { taskId, preview: content.substring(0, 50) }, LogCategory.UI);
 
     // 检查是否有正在运行的任务
-    if (!this.intelligentOrchestrator.running) {
+    if (!this.orchestratorEngine.running) {
       this.postMessage({ type: 'toast', message: '没有正在执行的任务', toastType: 'warning' });
       return;
     }
@@ -5267,7 +5348,7 @@ ${originalPrompt}
     const effectivePrompt = resolvedSkill.prompt;
 
     this.sessionManager.addMessage('user', prompt);
-    void this.intelligentOrchestrator.recordContextMessage('user', prompt, this.activeSessionId || undefined);
+    void this.orchestratorEngine.recordContextMessage('user', prompt, this.activeSessionId || undefined);
     this.sendStateUpdate();
 
     const orchestrationCommand = this.parseOrchestrationCommand(prompt);
@@ -5282,7 +5363,7 @@ ${originalPrompt}
 
     if (useIntelligentMode) {
       // 智能编排模式：Claude 分析 → 分配 Worker → 执行 → 总结
-      await this.executeWithIntelligentOrchestrator(effectivePrompt, imagePaths);
+      await this.executeWithOrchestrator(effectivePrompt, imagePaths);
     } else {
       // 直接执行模式：指定 Worker 直接执行
       await this.executeWithDirectWorker(effectivePrompt, forceWorker || this.selectedWorker!, imagePaths);
@@ -5377,7 +5458,7 @@ ${originalPrompt}
     const taskManager = await this.getTaskManager();
     const task = await taskManager.createTask({ prompt: planPrompt });
     try {
-      const record = await this.intelligentOrchestrator.createPlan(
+      const record = await this.orchestratorEngine.createPlan(
         planPrompt,
         task.id,
         this.activeSessionId || task.id
@@ -5397,8 +5478,8 @@ ${originalPrompt}
   private async executeStartWork(planId?: string): Promise<void> {
     const sessionId = this.activeSessionId;
     const record = planId && sessionId
-      ? this.intelligentOrchestrator.getPlanById(planId, sessionId)
-      : (sessionId ? this.intelligentOrchestrator.getActivePlanForSession(sessionId) : null);
+      ? this.orchestratorEngine.getPlanById(planId, sessionId)
+      : (sessionId ? this.orchestratorEngine.getActivePlanForSession(sessionId) : null);
 
     if (!record) {
       this.postMessage({ type: 'toast', message: '未找到可执行的计划，请先使用 /plan 生成计划', toastType: 'warning' });
@@ -5406,7 +5487,7 @@ ${originalPrompt}
     }
 
     try {
-      const result = await this.intelligentOrchestrator.executePlan(
+      const result = await this.orchestratorEngine.executePlanRecord(
         record,
         record.taskId,
         sessionId || record.sessionId
@@ -5456,7 +5537,9 @@ ${originalPrompt}
   private buildSubTaskSummaryCard(data: { description?: string; agent?: string; duration?: number; modifiedFiles?: string[]; subTaskId?: string; error?: string }, status: 'completed' | 'failed') {
     const title = status === 'completed' ? '子任务完成' : '子任务失败';
     const description = data.description || data.subTaskId || '未知子任务';
-    const executor = data.agent || 'unknown';
+    // 优化 executor fallback：使用中文，并提供更友好的默认值
+    // 当 agent 为空时，显示 "编排者" 而不是 "未知"，因为这通常是编排者协调的任务
+    const executor = data.agent || '编排者';
     const duration = this.formatDuration(data.duration);
     const changes = this.buildSubTaskChangeList(data.subTaskId || '', data.modifiedFiles);
     const verification = this.buildVerificationReminderList();
@@ -5472,9 +5555,9 @@ ${originalPrompt}
     };
   }
 
-  /** 智能编排模式执行 */
-  private async executeWithIntelligentOrchestrator(prompt: string, imagePaths: string[]): Promise<void> {
-    logger.info('界面.执行.模式.智能', undefined, LogCategory.UI);
+  /** 编排模式执行 */
+  private async executeWithOrchestrator(prompt: string, imagePaths: string[]): Promise<void> {
+    logger.info('界面.执行.模式.编排', undefined, LogCategory.UI);
 
     // 🔧 初始分析消息已由 MissionDrivenEngine.sendPhaseMessage 统一发送
     // 不再在这里重复发送，避免用户看到两条类似的"正在分析"消息
@@ -5483,11 +5566,11 @@ ${originalPrompt}
       // 调用智能编排器
       // 注意：executeWithTaskContext 内部通过 streamToUI: true 已经将 LLM 响应流式发送到前端
       // 因此不需要再手动调用 sendOrchestratorMessage 发送结果，否则会导致重复消息
-      const taskContext = await this.intelligentOrchestrator.executeWithTaskContext(prompt, this.activeSessionId || undefined);
+      const taskContext = await this.orchestratorEngine.executeWithTaskContext(prompt, this.activeSessionId || undefined);
       const result = taskContext.result;
 
       // 获取执行计划，判断是否需要 Worker
-      const plan = this.intelligentOrchestrator.plan;
+      const plan = this.orchestratorEngine.plan;
       const needsWorker = plan?.needsWorker !== false && (plan?.subTasks?.length ?? 0) > 0;
       logger.info('界面.任务.完成', { needsWorker, subTaskCount: plan?.subTasks?.length || 0 }, LogCategory.UI);
 
@@ -5530,7 +5613,7 @@ ${originalPrompt}
       logger.info('界面.执行.直接.请求', { worker: targetWorker }, LogCategory.UI);
       const response = await this.adapterFactory.sendMessage(targetWorker, prompt, imagePaths);
       logger.info('界面.执行.直接.响应', { worker: targetWorker, preview: response.content?.substring(0, 100) }, LogCategory.UI);
-      const executionStats = this.intelligentOrchestrator.getExecutionStats();
+      const executionStats = this.orchestratorEngine.getExecutionStats();
       if (executionStats) {
         executionStats.recordExecution({
           worker: targetWorker,
@@ -5556,7 +5639,7 @@ ${originalPrompt}
       logger.error('界面.执行.直接.失败', error, LogCategory.UI);
       const errorMsg = error instanceof Error ? error.message : String(error);
       await taskManager.failTask(task.id, errorMsg);
-      const executionStats = this.intelligentOrchestrator.getExecutionStats();
+      const executionStats = this.orchestratorEngine.getExecutionStats();
       if (executionStats) {
         executionStats.recordExecution({
           worker: targetWorker,
@@ -5700,7 +5783,7 @@ ${originalPrompt}
     }
     if (assistantResponse) {
       this.sessionManager.addMessage('assistant', assistantResponse, agent, source);
-      void this.intelligentOrchestrator.recordContextMessage('assistant', assistantResponse, this.activeSessionId || undefined);
+      void this.orchestratorEngine.recordContextMessage('assistant', assistantResponse, this.activeSessionId || undefined);
     }
     this.sendStateUpdate();
   }
@@ -5742,7 +5825,7 @@ ${originalPrompt}
     this.assertValidArray<any>(tasks, 'uiState.tasks');
     const currentTask = tasks.find(t => t?.status === 'running') ?? tasks[tasks.length - 1];
     const activePlanRecordRaw = currentSession?.id
-      ? this.intelligentOrchestrator.getActivePlanForSession(currentSession.id)
+      ? this.orchestratorEngine.getActivePlanForSession(currentSession.id)
       : null;
     const activePlanRecord = activePlanRecordRaw?.plan?.needsWorker === false ? null : activePlanRecordRaw;
 
@@ -5759,7 +5842,7 @@ ${originalPrompt}
     }));
 
 
-    const isRunning = currentTask?.status === 'running' || this.intelligentOrchestrator.running;
+    const isRunning = currentTask?.status === 'running' || this.orchestratorEngine.running;
     const pendingChanges = this.snapshotManager.getPendingChanges();
     this.assertValidArray<any>(pendingChanges, 'uiState.pendingChanges');
     const logs = this.logs;
@@ -5775,8 +5858,8 @@ ${originalPrompt}
       pendingChanges,
       isRunning,
       logs,
-      interactionMode: this.intelligentOrchestrator.getInteractionMode(),
-      orchestratorPhase: this.intelligentOrchestrator.phase,
+      interactionMode: this.orchestratorEngine.getInteractionMode(),
+      orchestratorPhase: this.orchestratorEngine.phase,
       activePlan: activePlanRecord
         ? {
           planId: activePlanRecord.id,
@@ -5828,31 +5911,13 @@ ${originalPrompt}
     return this.assertValidArray<ContentBlock>(blocks, context);
   }
 
-
-  /** 发送消息到 Webview */
-  private postMessage(message: ExtensionToWebviewMessage): void {
-    const view = this._view;
-    if (!view) {
-      return;
-    }
-    this.postMessageQueue = this.postMessageQueue
-      .then(async () => {
-        await view.webview.postMessage(message);
-      })
-      .catch((error) => {
-        logger.warn('界面.消息.发送_失败', { error: String(error) }, LogCategory.UI);
-      });
+  private getWebviewMessagePriority(message: ExtensionToWebviewMessage): WebviewMessagePriority {
+    return HIGH_PRIORITY_MESSAGE_TYPES.has(message.type) ? 'high' : 'normal';
   }
 
-  /** 立即发送消息到 Webview (绕过队列，避免状态回执被阻塞) */
-  private postMessageImmediate(message: ExtensionToWebviewMessage): void {
-    const view = this._view;
-    if (!view) {
-      return;
-    }
-    view.webview.postMessage(message).then(undefined, (error) => {
-      logger.warn('界面.消息.发送_失败', { error: String(error) }, LogCategory.UI);
-    });
+  /** 发送消息到 Webview（统一消息总线，优先级调度） */
+  private postMessage(message: ExtensionToWebviewMessage): void {
+    this.webviewMessageBus.send(message);
   }
 
   /** 获取 HTML 内容 - 仅使用 Svelte webview */
@@ -5911,9 +5976,9 @@ ${originalPrompt}
 
     try {
       // 1. 中断当前任务
-      if (this.intelligentOrchestrator) {
+      if (this.orchestratorEngine) {
         logger.info('界面.销毁.编排器.中断', undefined, LogCategory.UI);
-        this.intelligentOrchestrator.interrupt();
+        this.orchestratorEngine.interrupt();
       }
 
       // 2. 清理适配器（关闭所有连接）

@@ -1,0 +1,64 @@
+/* ============================================
+   消息样式规范 - UI 重构统一样式
+   ============================================ */
+
+:root {
+  /* 用户消息 */
+  --msg-user-bg: var(--primary);
+  --msg-user-border: var(--primary);
+
+  /* 编排者消息 */
+  --msg-orchestrator-bg: var(--surface-1);
+  --msg-orchestrator-border: var(--border);
+
+  /* Worker 消息 */
+  --msg-worker-bg: var(--surface-1);
+  --msg-worker-border: var(--info);
+
+  /* 系统消息 */
+  --msg-system-bg: transparent;
+  --msg-system-color: var(--foreground-muted);
+
+  /* 错误消息 */
+  --msg-error-bg: var(--error-muted);
+  --msg-error-border: var(--error);
+
+  /* 任务摘要卡片 */
+  --msg-summary-bg: var(--success-muted);
+  --msg-summary-border: var(--success);
+}
+
+/* 消息容器样式（基础） */
+.message-item {
+  background: var(--msg-orchestrator-bg);
+  border: 1px solid var(--msg-orchestrator-border);
+}
+
+/* 编排者消息 */
+.message-item.assistant[data-source="orchestrator"] {
+  border-left: 3px solid var(--color-orchestrator);
+}
+
+/* Worker 消息 */
+.message-item.assistant[data-source="claude"] {
+  border-left: 3px solid var(--color-claude);
+}
+
+.message-item.assistant[data-source="codex"] {
+  border-left: 3px solid var(--color-codex);
+}
+
+.message-item.assistant[data-source="gemini"] {
+  border-left: 3px solid var(--color-gemini);
+}
+
+/* 用户消息 */
+.message-item.user[data-source="user"] .user-content {
+  background: var(--msg-user-bg);
+}
+
+/* 任务摘要卡片 */
+.message-item.subtask-card-only {
+  border-color: var(--msg-summary-border);
+  background: var(--msg-summary-bg);
+}

@@ -1,6 +1,7 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
   import FileSpan from './FileSpan.svelte';
+  import type { IconName } from '../lib/icons';
 
   type OperationType = 'create' | 'edit' | 'delete' | 'read' | 'move' | 'copy';
 
@@ -23,7 +24,7 @@
   }: Props = $props();
 
   // 操作配置
-  const operationConfig: Record<OperationType, { icon: string; label: string; color: string }> = {
+  const operationConfig: Record<OperationType, { icon: IconName; label: string; color: string }> = {
     create: { icon: 'file-plus', label: '创建文件', color: 'var(--success)' },
     edit: { icon: 'file-edit', label: '编辑文件', color: 'var(--info)' },
     delete: { icon: 'file-minus', label: '删除文件', color: 'var(--error)' },
@@ -35,7 +36,7 @@
   const config = $derived(operationConfig[operation] || operationConfig.read);
 
   // 状态图标
-  const statusIcon = $derived(() => {
+  const statusIcon = $derived.by<IconName>(() => {
     switch (status) {
       case 'pending': return 'loader';
       case 'success': return 'check';
@@ -60,7 +61,7 @@
     <div class="operation-header">
       <span class="operation-label">{config.label}</span>
       <span class="operation-status status-{status}">
-        <Icon name={statusIcon()} size={12} />
+        <Icon name={statusIcon} size={12} />
       </span>
     </div>
     

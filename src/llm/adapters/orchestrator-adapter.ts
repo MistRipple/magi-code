@@ -117,6 +117,10 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           fullResponse += chunk.content;
           this.normalizer.processChunk(streamId, chunk.content);
           this.emit('message', chunk.content);
+        } else if (chunk.type === 'thinking' && chunk.thinking) {
+          // 处理 thinking 内容
+          this.normalizer.processThinking(streamId, chunk.thinking);
+          this.emit('thinking', chunk.thinking);
         }
       });
       this.recordTokenUsage(response.usage);

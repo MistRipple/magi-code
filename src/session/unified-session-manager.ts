@@ -622,7 +622,7 @@ export class UnifiedSessionManager {
     return true;
   }
 
-  /** 规范化会话数据（修复旧格式/非法字段） */
+  /** 规范化会话数据（验证并修复异常字段） */
   private normalizeSessionData(session: UnifiedSession): UnifiedSession {
     if (!session || typeof session !== 'object') return session;
     if (!Array.isArray(session.messages)) return session;
@@ -748,7 +748,7 @@ export class UnifiedSessionManager {
         const data = fs.readFileSync(filePath, 'utf-8');
         let session = JSON.parse(data) as UnifiedSession;
 
-        // 兼容旧数据：规范化消息结构
+        // 加载时规范化消息结构
         session = this.normalizeSessionData(session);
 
         // 数据完整性验证

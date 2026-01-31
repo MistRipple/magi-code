@@ -89,6 +89,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    * 发送消息
    */
   async sendMessage(message: string, images?: string[]): Promise<string> {
+    return this.sendMessageInternal(message, images, false);
+  }
+
+  private async sendMessageInternal(
+    message: string | undefined,
+    images: string[] | undefined,
+    skipUserMessage: boolean
+  ): Promise<string> {
     if (!this.isConnected) {
       throw new Error('Adapter not connected');
     }
@@ -101,11 +109,16 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       // 自动截断历史以控制 token 消耗
       this.truncateHistoryIfNeeded();
 
+      // 清理可能破坏工具调用链路的历史片段
+      this.normalizeHistoryForTools();
+
       // 添加用户消息到历史
-      this.conversationHistory.push({
-        role: 'user',
-        content: message,
-      });
+      if (!skipUserMessage) {
+        this.conversationHistory.push({
+          role: 'user',
+          content: message || '',
+        });
+      }
 
       // 获取工具定义
       const tools = await this.toolManager.getTools();
@@ -137,6 +150,10 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           fullResponse += chunk.content;
           this.normalizer.processChunk(streamId, chunk.content);
           this.emit('message', chunk.content);
+        } else if (chunk.type === 'thinking' && chunk.thinking) {
+          // 处理 thinking 内容
+          this.normalizer.processThinking(streamId, chunk.thinking);
+          this.emit('thinking', chunk.thinking);
         } else if (chunk.type === 'tool_call_start' && chunk.toolCall) {
           this.emit('toolCall', chunk.toolCall.name || '', chunk.toolCall.arguments || {});
         }
@@ -191,7 +208,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
         // 递归调用以获取最终响应
         this.normalizer.endStream(messageId);
-        return await this.sendMessage('Continue based on the tool results.');
+        return await this.sendMessageInternal(undefined, undefined, true);
       }
 
       // 添加助手响应到历史
@@ -377,5 +394,52 @@ Always think step by step and use tools when appropriate.`;
         currentChars: this.getHistoryChars(),
       }, LogCategory.LLM);
     }
+  }
+
+  private normalizeHistoryForTools(): void {
+    if (this.conversationHistory.length === 0) {
+      return;
+    }
+
+    const cleaned: LLMMessage[] = [];
+    for (let i = 0; i < this.conversationHistory.length; i++) {
+      const msg = this.conversationHistory[i];
+
+      if (this.hasToolUse(msg)) {
+        const next = this.conversationHistory[i + 1];
+        if (!this.isToolResultUser(next)) {
+          continue;
+        }
+        cleaned.push(msg);
+        cleaned.push(next);
+        i += 1;
+        continue;
+      }
+
+      if (this.isToolResultUser(msg)) {
+        const prev = this.conversationHistory[i - 1];
+        if (!this.hasToolUse(prev)) {
+          continue;
+        }
+      }
+
+      cleaned.push(msg);
+    }
+
+    this.conversationHistory = cleaned;
+  }
+
+  private hasToolUse(message?: LLMMessage): boolean {
+    if (!message || !Array.isArray(message.content)) {
+      return false;
+    }
+    return message.content.some((block: any) => block?.type === 'tool_use');
+  }
+
+  private isToolResultUser(message?: LLMMessage): boolean {
+    if (!message || message.role !== 'user' || !Array.isArray(message.content)) {
+      return false;
+    }
+    return message.content.some((block: any) => block?.type === 'tool_result');
   }
 }

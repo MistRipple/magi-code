@@ -78,7 +78,7 @@
   --space-6: 24px;   /* 特大间距: 区块间距 */
   --space-8: 32px;   /* 版块间距 */
 
-  /* 兼容旧变量 */
+  /* 语义化别名 */
   --spacing-xs: var(--space-2);
   --spacing-sm: var(--space-3);
   --spacing-md: var(--space-4);
@@ -102,7 +102,7 @@
   --text-lg: 16px;   /* 标题: 区块标题 */
   --text-xl: 18px;   /* 大标题: 面板标题 */
 
-  /* 兼容旧变量 */
+  /* 语义化别名 */
   --font-size: var(--text-base);
   --font-size-sm: var(--text-sm);
   --font-size-lg: var(--text-md);
@@ -176,7 +176,7 @@
   --ease-out: cubic-bezier(0, 0, 0.2, 1);
   --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
 
-  /* 兼容旧变量 */
+  /* 语义化别名 */
   --transition-fast: var(--duration-fast) var(--ease-default);
   --transition-normal: var(--duration-normal) var(--ease-default);
   --transition-slow: var(--duration-slow) var(--ease-default);

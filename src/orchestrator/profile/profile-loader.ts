@@ -384,7 +384,11 @@ export class ProfileLoader {
    * 获取 Worker 画像
    */
   getProfile(workerType: WorkerSlot): WorkerProfile {
-    return this.profiles.get(workerType) ?? DEFAULT_CLAUDE_PROFILE;
+    const profile = this.profiles.get(workerType);
+    if (!profile) {
+      throw new Error(`Worker 画像未配置: ${workerType}`);
+    }
+    return profile;
   }
 
   /**

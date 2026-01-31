@@ -13,18 +13,19 @@ import { IAdapterFactory } from '../../../adapters/adapter-factory-interface';
 import { TokenUsage } from '../../../types/agent-types';
 import { ProfileLoader } from '../../profile/profile-loader';
 import { ProfileAwareReviewer } from '../../review/profile-aware-reviewer';
-import { AutonomousWorker } from '../../worker';
+import { AutonomousWorker, AutonomousExecutionResult } from '../../worker';
 import { Mission, Assignment } from '../../mission';
 import { SnapshotManager } from '../../../snapshot-manager';
-import { UnifiedTaskManager } from '../../../task/unified-task-manager';
 import { logger, LogCategory } from '../../../logging';
 
 import { PlanningExecutor, PlanningOptions } from './planning-executor';
-import { AssignmentExecutor, AssignmentExecutionOptions } from './assignment-executor';
+import { AssignmentExecutor, AssignmentExecutionOptions, AssignmentExecutionResult } from './assignment-executor';
 import { ReviewExecutor, ReviewOptions } from './review-executor';
 import { ContractVerifier } from './contract-verifier';
 import { ProgressReporter, ExecutionProgress } from './progress-reporter';
 import { BlockingManager, BlockedItem } from './blocking-manager';
+import type { ReportCallback } from '../../protocols/worker-report';
+import { TaskDependencyGraph, ExecutionBatch } from '../../task-dependency-graph';
 
 /**
  * 执行选项
@@ -44,8 +45,6 @@ export interface ExecutionOptions {
   blockingTimeout?: number;
   /** 阻塞检查间隔（毫秒） */
   blockingCheckInterval?: number;
-  /** 外部 Task ID（用于同步 SubTask） */
-  taskId?: string;
   /** 输出回调 */
   onOutput?: (workerId: WorkerSlot, output: string) => void;
   /** 进度回调 */
@@ -54,6 +53,26 @@ export interface ExecutionOptions {
   onBlocked?: (blockedItem: BlockedItem) => void;
   /** 解除阻塞回调 */
   onUnblocked?: (blockedItem: BlockedItem) => void;
+  /** Worker 汇报回调 */
+  onReport?: ReportCallback;
+  /** 汇报超时(ms) */
+  reportTimeout?: number;
+
+  // ============ 智能执行策略选项 ============
+  /** 是否需要规划阶段（由 TaskPreAnalyzer 决定） */
+  needsPlanning?: boolean;
+  /** 是否需要评审阶段（由 TaskPreAnalyzer 决定） */
+  needsReview?: boolean;
+  /** 是否需要验证阶段（由 TaskPreAnalyzer 决定） */
+  needsVerification?: boolean;
+
+  // ============ SubTask 同步选项 ============
+  /** 关联的 Task ID，用于同步 Assignments 到 SubTasks */
+  taskId?: string;
+
+  // ============ Wave 执行选项（提案 4.6） ============
+  /** 使用 Wave 并行分组执行 */
+  useWaveExecution?: boolean;
 }
 
 /**
@@ -65,6 +84,24 @@ export interface ExecutionResult {
   totalAssignments: number;
   errors: string[];
   tokenUsage?: TokenUsage;
+  /** 每个 Assignment 的详细执行结果 */
+  assignmentResults: Map<string, AutonomousExecutionResult>;
+  /** Wave 执行信息（提案 4.6） */
+  waveInfo?: WaveExecutionInfo;
+}
+
+/**
+ * Wave 执行信息（提案 4.6）
+ */
+export interface WaveExecutionInfo {
+  /** 总 Wave 数 */
+  totalWaves: number;
+  /** 已完成的 Wave 数 */
+  completedWaves: number;
+  /** 每个 Wave 的任务 ID */
+  waves: string[][];
+  /** 关键路径 */
+  criticalPath: string[];
 }
 
 export class ExecutionCoordinator extends EventEmitter {
@@ -76,6 +113,10 @@ export class ExecutionCoordinator extends EventEmitter {
   private blockingManager: BlockingManager;
 
   private contextManager: import('../../../context/context-manager').ContextManager | null = null;
+  private taskManager: import('../../../task/unified-task-manager').UnifiedTaskManager | null = null;
+
+  /** 收集每个 Assignment 的执行结果 */
+  private collectedAssignmentResults: Map<string, AutonomousExecutionResult> = new Map();
 
   constructor(
     private workers: Map<WorkerSlot, AutonomousWorker>,
@@ -83,7 +124,6 @@ export class ExecutionCoordinator extends EventEmitter {
     private profileLoader: ProfileLoader,
     private reviewer: ProfileAwareReviewer,
     private snapshotManager: SnapshotManager | null,
-    private taskManager: UnifiedTaskManager | null,
     private workspaceRoot: string,
     private mission: Mission
   ) {
@@ -95,7 +135,6 @@ export class ExecutionCoordinator extends EventEmitter {
       workers,
       adapterFactory,
       snapshotManager,
-      taskManager,
       this.workspaceRoot
     );
     this.reviewExecutor = new ReviewExecutor(workers, profileLoader, reviewer);
@@ -115,15 +154,42 @@ export class ExecutionCoordinator extends EventEmitter {
   }
 
   /**
+   * 设置 TaskManager（用于 SubTask 同步）
+   */
+  setTaskManager(taskManager: import('../../../task/unified-task-manager').UnifiedTaskManager): void {
+    this.taskManager = taskManager;
+  }
+
+  /**
    * 执行 Mission
+   *
+   * 支持动态阶段选择：
+   * - needsPlanning: 是否执行规划阶段（简单任务可跳过）
+   * - needsReview: 是否执行评审阶段（复杂任务需要）
+   * - needsVerification: 是否执行验证阶段（有契约时需要）
    */
   async execute(options: ExecutionOptions): Promise<ExecutionResult> {
-    logger.info(LogCategory.ORCHESTRATOR, `开始执行 Mission: ${this.mission.goal}`);
+    // 默认值：如果未指定，按复杂任务处理（向后兼容）
+    const needsPlanning = options.needsPlanning ?? true;
+    const needsReview = options.needsReview ?? false;
+    const needsVerification = options.needsVerification ?? true;
+
+    logger.info(
+      `开始执行 Mission: ${this.mission.goal}`,
+      {
+        needsPlanning,
+        needsReview,
+        needsVerification,
+        parallel: options.parallel,
+        taskId: options.taskId,
+      },
+      LogCategory.ORCHESTRATOR
+    );
 
     // 添加 Assignments 到 ContextManager
     await this.initializeContextManager();
 
-    // 同步 Assignments 到 SubTasks
+    // 同步 Assignments 到 SubTasks（关键：确保 UI 能显示正确的 assignedWorker）
     if (options.taskId) {
       await this.syncAssignmentsToSubTasks(options.taskId);
     }
@@ -131,52 +197,84 @@ export class ExecutionCoordinator extends EventEmitter {
     const errors: string[] = [];
 
     try {
-      // 阶段 1: 规划
-      this.progressReporter.setPhase('planning');
-      const planningResult = await this.planningExecutor.execute(this.mission, {
-        projectContext: options.projectContext,
-        parallel: options.parallelPlanning,
-        contextManager: this.contextManager,
-      });
+      // ========== 阶段 1: 规划（动态） ==========
+      if (needsPlanning) {
+        this.progressReporter.setPhase('planning');
+        logger.info(LogCategory.ORCHESTRATOR, '执行规划阶段');
 
-      if (!planningResult.success) {
-        errors.push(...planningResult.errors);
-        return this.buildResult(false, errors);
+        const planningResult = await this.planningExecutor.execute(this.mission, {
+          projectContext: options.projectContext,
+          parallel: options.parallelPlanning,
+          contextManager: this.contextManager,
+        });
+
+        if (!planningResult.success) {
+          errors.push(...planningResult.errors);
+          return this.buildResult(false, errors);
+        }
+
+        // 通知规划完成（同步到 UI）
+        for (const assignment of this.mission.assignments) {
+          this.emit('assignmentPlanned', {
+            missionId: this.mission.id,
+            assignmentId: assignment.id,
+            todos: assignment.todos || [],
+          });
+        }
+      } else {
+        logger.info(LogCategory.ORCHESTRATOR, '跳过规划阶段（简单任务）');
       }
 
-      // 阶段 2: 执行
+      // ========== 阶段 2: 执行（总是执行） ==========
       this.progressReporter.setPhase('execution');
-      const executionResult = options.parallel
-        ? await this.executeParallel(options)
-        : await this.executeSequential(options);
+
+      // 选择执行策略：Wave 并行 > 普通并行 > 顺序
+      let executionResult: ExecutionResult;
+      if (options.useWaveExecution || (options.parallel && this.hasContractDependencies())) {
+        // 使用 Wave 分组执行（提案 4.6）
+        executionResult = await this.executeWithWaves(options);
+      } else if (options.parallel) {
+        executionResult = await this.executeParallel(options);
+      } else {
+        executionResult = await this.executeSequential(options);
+      }
 
       if (!executionResult.success) {
         errors.push(...executionResult.errors);
       }
 
-      // 阶段 3: 评审（可选）
-      // Note: Mission doesn't have reviewRequired property, skip for now
-      // if (this.mission.reviewRequired) {
-      //   this.progressReporter.setPhase('review');
-      //   const reviewResult = await this.reviewExecutor.execute(this.mission, {
-      //     workingDirectory: options.workingDirectory,
-      //     projectContext: options.projectContext,
-      //   });
-      //
-      //   if (!reviewResult.success) {
-      //     errors.push(...reviewResult.errors);
-      //   }
-      // }
+      // ========== 阶段 3: 评审（动态） ==========
+      if (needsReview) {
+        this.progressReporter.setPhase('review');
+        logger.info(LogCategory.ORCHESTRATOR, '执行评审阶段');
 
-      // 阶段 4: 验证契约
-      this.progressReporter.setPhase('verification');
-      const verificationResult = await this.contractVerifier.verify(this.mission);
+        const reviewResult = await this.reviewExecutor.execute(this.mission, {
+          workingDirectory: options.workingDirectory,
+          projectContext: options.projectContext,
+        });
 
-      if (!verificationResult.success) {
-        errors.push(...verificationResult.errors);
+        if (!reviewResult.success) {
+          errors.push(...reviewResult.errors);
+        }
+      } else {
+        logger.info(LogCategory.ORCHESTRATOR, '跳过评审阶段');
       }
 
-      // 完成
+      // ========== 阶段 4: 验证契约（动态） ==========
+      if (needsVerification) {
+        this.progressReporter.setPhase('verification');
+        logger.info(LogCategory.ORCHESTRATOR, '执行验证阶段');
+
+        const verificationResult = await this.contractVerifier.verify(this.mission);
+
+        if (!verificationResult.success) {
+          errors.push(...verificationResult.errors);
+        }
+      } else {
+        logger.info(LogCategory.ORCHESTRATOR, '跳过验证阶段');
+      }
+
+      // ========== 完成 ==========
       this.progressReporter.setPhase('completed');
 
       const success = errors.length === 0;
@@ -206,15 +304,22 @@ export class ExecutionCoordinator extends EventEmitter {
     for (const group of groups) {
       for (const assignment of group) {
         this.progressReporter.reportAssignmentStart(assignment);
+        this.markAssignmentStart(assignment);
 
         const result = await this.assignmentExecutor.execute(this.mission, assignment, {
           workingDirectory: options.workingDirectory,
           projectContext: options.projectContext,
           timeout: options.timeout,
-          taskId: options.taskId,
           contextManager: this.contextManager,
           onOutput: options.onOutput,
+          onReport: options.onReport,
+          reportTimeout: options.reportTimeout,
         });
+
+        // 收集详细执行结果
+        if (result.fullResult) {
+          this.collectedAssignmentResults.set(assignment.id, result.fullResult);
+        }
 
         if (result.success) {
           completedCount++;
@@ -226,6 +331,8 @@ export class ExecutionCoordinator extends EventEmitter {
         } else {
           errors.push(...result.errors);
         }
+
+        this.markAssignmentComplete(assignment, result);
       }
     }
 
@@ -245,15 +352,22 @@ export class ExecutionCoordinator extends EventEmitter {
     for (const group of groups) {
       const promises = group.map(async (assignment) => {
         this.progressReporter.reportAssignmentStart(assignment);
+        this.markAssignmentStart(assignment);
 
         const result = await this.assignmentExecutor.execute(this.mission, assignment, {
           workingDirectory: options.workingDirectory,
           projectContext: options.projectContext,
           timeout: options.timeout,
-          taskId: options.taskId,
           contextManager: this.contextManager,
           onOutput: options.onOutput,
+          onReport: options.onReport,
+          reportTimeout: options.reportTimeout,
         });
+
+        // 收集详细执行结果
+        if (result.fullResult) {
+          this.collectedAssignmentResults.set(assignment.id, result.fullResult);
+        }
 
         if (result.success) {
           this.progressReporter.reportAssignmentComplete(
@@ -261,8 +375,10 @@ export class ExecutionCoordinator extends EventEmitter {
             result.completedTodos,
             result.tokenUsage
           );
-          return { success: true, errors: [] };
+          this.markAssignmentComplete(assignment, result);
+          return { success: true, errors: [] as string[] };
         } else {
+          this.markAssignmentComplete(assignment, result);
           return { success: false, errors: result.errors };
         }
       });
@@ -278,6 +394,37 @@ export class ExecutionCoordinator extends EventEmitter {
     }
 
     return this.buildResult(errors.length === 0, errors, completedCount);
+  }
+
+  private markAssignmentStart(assignment: Assignment): void {
+    assignment.status = 'executing';
+    assignment.startedAt = assignment.startedAt || Date.now();
+    assignment.progress = this.calculateAssignmentProgress(assignment);
+    this.emit('assignmentStarted', { assignmentId: assignment.id, missionId: this.mission.id, workerId: assignment.workerId });
+  }
+
+  private markAssignmentComplete(
+    assignment: Assignment,
+    result: AssignmentExecutionResult
+  ): void {
+    assignment.status = result.success ? 'completed' : 'failed';
+    assignment.completedAt = Date.now();
+    assignment.progress = this.calculateAssignmentProgress(assignment);
+    this.emit('assignmentCompleted', {
+      assignmentId: assignment.id,
+      missionId: this.mission.id,
+      workerId: assignment.workerId,
+      success: result.success,
+    });
+  }
+
+  private calculateAssignmentProgress(assignment: Assignment): number {
+    const total = assignment.todos?.length || 0;
+    if (!total) {
+      return assignment.status === 'completed' ? 100 : 0;
+    }
+    const done = assignment.todos.filter(t => t.status === 'completed' || t.status === 'skipped').length;
+    return Math.min(100, Math.round((done / total) * 100));
   }
 
   /**
@@ -348,34 +495,6 @@ export class ExecutionCoordinator extends EventEmitter {
   }
 
   /**
-   * 同步 Assignments 到 SubTasks
-   */
-  private async syncAssignmentsToSubTasks(taskId: string): Promise<void> {
-    if (!this.taskManager) {
-      return;
-    }
-
-    try {
-      for (const assignment of this.mission.assignments) {
-        const existingSubTask = await this.taskManager.getSubTaskByAssignmentId(taskId, assignment.id);
-
-        if (!existingSubTask) {
-          await this.taskManager.createSubTask(taskId, {
-            description: assignment.responsibility,
-            assignedWorker: assignment.workerId,
-            assignmentId: assignment.id,
-          });
-        }
-      }
-    } catch (error: any) {
-      logger.warn(
-        LogCategory.ORCHESTRATOR,
-        `同步 SubTasks 失败: ${error.message}`
-      );
-    }
-  }
-
-  /**
    * 设置事件监听
    */
   private setupEventListeners(): void {
@@ -395,6 +514,210 @@ export class ExecutionCoordinator extends EventEmitter {
   }
 
   /**
+   * 检查是否存在契约依赖
+   */
+  private hasContractDependencies(): boolean {
+    return this.mission.assignments.some(
+      (a) => a.consumerContracts.length > 0 || a.producerContracts.length > 0
+    );
+  }
+
+  /**
+   * 使用 Wave 并行分组执行（提案 4.6）
+   *
+   * Wave 执行策略：
+   * 1. 使用 TaskDependencyGraph 分析 Assignment 依赖
+   * 2. 基于 Contract 依赖和文件冲突自动分组
+   * 3. 每个 Wave 内部并行执行，Wave 之间顺序执行
+   * 4. 发射 waveStarted/waveCompleted 事件供 UI 显示
+   */
+  private async executeWithWaves(options: ExecutionOptions): Promise<ExecutionResult> {
+    const errors: string[] = [];
+    let completedCount = 0;
+
+    // 构建依赖图
+    const graph = this.buildDependencyGraph();
+
+    // 分析得到执行批次（Waves）
+    const analysis = graph.analyze();
+
+    if (analysis.hasCycle) {
+      logger.warn(
+        LogCategory.ORCHESTRATOR,
+        `检测到循环依赖，回退到普通并行执行: ${analysis.cycleNodes?.join(', ')}`
+      );
+      return this.executeParallel(options);
+    }
+
+    const waves = analysis.executionBatches;
+    const totalWaves = waves.length;
+
+    logger.info(
+      LogCategory.ORCHESTRATOR,
+      `Wave 执行: ${totalWaves} 个 Wave，关键路径长度 ${analysis.criticalPath.length}`
+    );
+
+    // 发射 Wave 执行开始事件
+    this.emit('waveExecutionStarted', {
+      missionId: this.mission.id,
+      totalWaves,
+      waves: waves.map((w) => w.taskIds),
+      criticalPath: analysis.criticalPath,
+    });
+
+    let completedWaves = 0;
+
+    for (const wave of waves) {
+      const waveIndex = wave.batchIndex;
+      const assignmentIds = wave.taskIds;
+      const waveAssignments = this.mission.assignments.filter((a) =>
+        assignmentIds.includes(a.id)
+      );
+
+      logger.info(
+        LogCategory.ORCHESTRATOR,
+        `开始 Wave ${waveIndex + 1}/${totalWaves}: ${waveAssignments.length} 个任务`
+      );
+
+      // 发射 Wave 开始事件
+      this.emit('waveStarted', {
+        missionId: this.mission.id,
+        waveIndex,
+        totalWaves,
+        assignmentIds,
+      });
+
+      // Wave 内部并行执行
+      const promises = waveAssignments.map(async (assignment) => {
+        this.progressReporter.reportAssignmentStart(assignment);
+        this.markAssignmentStart(assignment);
+
+        const result = await this.assignmentExecutor.execute(this.mission, assignment, {
+          workingDirectory: options.workingDirectory,
+          projectContext: options.projectContext,
+          timeout: options.timeout,
+          contextManager: this.contextManager,
+          onOutput: options.onOutput,
+          onReport: options.onReport,
+          reportTimeout: options.reportTimeout,
+        });
+
+        // 收集详细执行结果
+        if (result.fullResult) {
+          this.collectedAssignmentResults.set(assignment.id, result.fullResult);
+        }
+
+        if (result.success) {
+          this.progressReporter.reportAssignmentComplete(
+            assignment,
+            result.completedTodos,
+            result.tokenUsage
+          );
+          this.markAssignmentComplete(assignment, result);
+          return { success: true, errors: [] as string[], assignmentId: assignment.id };
+        } else {
+          this.markAssignmentComplete(assignment, result);
+          return { success: false, errors: result.errors, assignmentId: assignment.id };
+        }
+      });
+
+      const results = await Promise.all(promises);
+
+      const waveSuccessCount = results.filter((r) => r.success).length;
+      completedCount += waveSuccessCount;
+
+      results.forEach((result) => {
+        if (!result.success) {
+          errors.push(...result.errors);
+        }
+      });
+
+      completedWaves++;
+
+      // 发射 Wave 完成事件
+      this.emit('waveCompleted', {
+        missionId: this.mission.id,
+        waveIndex,
+        totalWaves,
+        completedCount: waveSuccessCount,
+        failedCount: results.length - waveSuccessCount,
+      });
+
+      logger.info(
+        LogCategory.ORCHESTRATOR,
+        `完成 Wave ${waveIndex + 1}/${totalWaves}: 成功 ${waveSuccessCount}/${waveAssignments.length}`
+      );
+    }
+
+    // 构建带 Wave 信息的结果
+    const waveInfo: WaveExecutionInfo = {
+      totalWaves,
+      completedWaves,
+      waves: waves.map((w) => w.taskIds),
+      criticalPath: analysis.criticalPath,
+    };
+
+    return this.buildResultWithWave(errors.length === 0, errors, completedCount, waveInfo);
+  }
+
+  /**
+   * 构建依赖图
+   */
+  private buildDependencyGraph(): TaskDependencyGraph {
+    const graph = new TaskDependencyGraph();
+
+    // 添加所有 Assignment 作为节点
+    for (const assignment of this.mission.assignments) {
+      graph.addTask(
+        assignment.id,
+        assignment.responsibility,
+        assignment,
+        assignment.scope?.targetPaths || []
+      );
+    }
+
+    // 基于 Contract 添加依赖关系
+    for (const assignment of this.mission.assignments) {
+      for (const contractId of assignment.consumerContracts) {
+        // 找到产出该 Contract 的 Assignment
+        const producer = this.mission.assignments.find((a) =>
+          a.producerContracts.includes(contractId)
+        );
+        if (producer) {
+          graph.addDependency(assignment.id, producer.id);
+        }
+      }
+    }
+
+    // 基于文件冲突自动添加依赖
+    graph.addFileDependencies('sequential');
+
+    return graph;
+  }
+
+  /**
+   * 构建带 Wave 信息的执行结果
+   */
+  private buildResultWithWave(
+    success: boolean,
+    errors: string[],
+    completedCount: number,
+    waveInfo: WaveExecutionInfo
+  ): ExecutionResult {
+    const progress = this.progressReporter.getProgress();
+
+    return {
+      success,
+      completedAssignments: completedCount,
+      totalAssignments: progress.totalAssignments,
+      errors,
+      tokenUsage: progress.tokenUsage,
+      assignmentResults: new Map(this.collectedAssignmentResults),
+      waveInfo,
+    };
+  }
+
+  /**
    * 构建执行结果
    */
   private buildResult(
@@ -410,6 +733,69 @@ export class ExecutionCoordinator extends EventEmitter {
       totalAssignments: progress.totalAssignments,
       errors,
       tokenUsage: progress.tokenUsage,
+      assignmentResults: new Map(this.collectedAssignmentResults),
     };
+  }
+
+  /**
+   * 同步 Assignments 到 SubTasks
+   *
+   * 关键方法：确保每个 Assignment 在 TaskManager 中有对应的 SubTask，
+   * 且 SubTask.assignedWorker 正确设置为 Assignment.workerId。
+   *
+   * 这样当 SubTask 完成时，事件中的 agent 字段能正确显示 Worker 名称。
+   */
+  private async syncAssignmentsToSubTasks(taskId: string): Promise<void> {
+    if (!this.taskManager) {
+      logger.warn(
+        LogCategory.ORCHESTRATOR,
+        'TaskManager 未设置，跳过 SubTask 同步'
+      );
+      return;
+    }
+
+    try {
+      for (const assignment of this.mission.assignments) {
+        const existingSubTask = await this.taskManager.getSubTaskByAssignmentId(taskId, assignment.id);
+
+        if (!existingSubTask) {
+          // 创建 SubTask，确保 assignedWorker 正确设置
+          await this.taskManager.createSubTask(taskId, {
+            description: assignment.responsibility,
+            assignedWorker: assignment.workerId,
+            assignmentId: assignment.id,
+          });
+
+          logger.debug(
+            LogCategory.ORCHESTRATOR,
+            `创建 SubTask: Assignment ${assignment.id} -> Worker ${assignment.workerId}`
+          );
+        } else {
+          // SubTask 已存在，检查 assignedWorker 是否正确
+          if (existingSubTask.assignedWorker !== assignment.workerId) {
+            // 更新 assignedWorker
+            await this.taskManager.updateSubTask(taskId, {
+              id: existingSubTask.id,
+              assignedWorker: assignment.workerId,
+            });
+
+            logger.debug(
+              LogCategory.ORCHESTRATOR,
+              `更新 SubTask assignedWorker: ${existingSubTask.id} -> ${assignment.workerId}`
+            );
+          }
+        }
+      }
+
+      logger.info(
+        LogCategory.ORCHESTRATOR,
+        `已同步 ${this.mission.assignments.length} 个 Assignments 到 SubTasks`
+      );
+    } catch (error: any) {
+      logger.warn(
+        LogCategory.ORCHESTRATOR,
+        `同步 SubTasks 失败: ${error.message}`
+      );
+    }
   }
 }

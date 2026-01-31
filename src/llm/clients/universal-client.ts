@@ -8,6 +8,7 @@ import OpenAI from 'openai';
 import { BaseLLMClient } from './base-client';
 import { LLMConfig } from '../../types/agent-types';
 import {
+  LLMMessage,
   LLMMessageParams,
   LLMResponse,
   LLMStreamChunk,
@@ -59,6 +60,71 @@ export class UniversalLLMClient extends BaseLLMClient {
       }, LogCategory.LLM);
     } else {
       throw new Error(`Unsupported provider: ${this.config.provider}`);
+    }
+  }
+
+  /**
+   * 快速测试连接（使用 Models API）
+   *
+   * 调用 /v1/models 端点验证 API Key，不消耗 tokens。
+   * 同时检查配置的模型是否在列表中。
+   */
+  async testConnectionFast(): Promise<{
+    success: boolean;
+    modelExists?: boolean;
+    error?: string;
+  }> {
+    try {
+      // 构建 models API URL
+      let modelsUrl = this.config.baseUrl;
+      if (!modelsUrl.endsWith('/v1')) {
+        modelsUrl = modelsUrl.replace(/\/$/, '') + '/v1';
+      }
+      modelsUrl += '/models';
+
+      const response = await fetch(modelsUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${this.config.apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(5000), // 5 秒超时
+      });
+
+      if (!response.ok) {
+        const status = response.status;
+        if (status === 401 || status === 403) {
+          return { success: false, error: 'API Key 无效' };
+        }
+        if (status === 404) {
+          // Models API 不支持，回退到简单验证
+          return { success: true, modelExists: undefined };
+        }
+        return { success: false, error: `HTTP ${status}` };
+      }
+
+      const data = await response.json();
+      const models = data?.data || [];
+      const modelExists = models.some((m: any) => m.id === this.config.model);
+
+      logger.debug('Fast connection test succeeded', {
+        provider: this.config.provider,
+        model: this.config.model,
+        modelExists,
+        modelsCount: models.length,
+      }, LogCategory.LLM);
+
+      return { success: true, modelExists };
+    } catch (error: any) {
+      const message = error.message || String(error);
+      if (message.includes('timeout') || message.includes('TimeoutError')) {
+        return { success: false, error: '连接超时' };
+      }
+      if (message.includes('ECONNREFUSED') || message.includes('ENOTFOUND')) {
+        return { success: false, error: '网络连接失败' };
+      }
+      logger.error('Fast connection test failed', { error: message }, LogCategory.LLM);
+      return { success: false, error: message };
     }
   }
 
@@ -164,7 +230,7 @@ export class UniversalLLMClient extends BaseLLMClient {
   }
 
   /**
-   * 清理 JSON Schema，移除不兼容的属性
+   * 清理 JSON Schema，移除某些 API 不支持的属性
    */
   private sanitizeSchema(schema: any): any {
     if (!schema || typeof schema !== 'object') {
@@ -249,6 +315,24 @@ export class UniversalLLMClient extends BaseLLMClient {
     return sanitized;
   }
 
+  /**
+   * 检测是否启用 extended thinking
+   * 策略：对所有 Anthropic 请求默认启用 thinking 参数
+   * - 如果后端支持，会返回 thinking 内容
+   * - 如果后端不支持，参数会被忽略，不影响正常响应
+   *
+   * 配置中可以通过 enableThinking: false 来强制禁用
+   */
+  private shouldEnableThinking(): boolean {
+    // 如果配置中明确禁用，则不启用
+    if (this.config.enableThinking === false) {
+      return false;
+    }
+
+    // 默认对所有请求启用 thinking（让后端决定是否支持）
+    return true;
+  }
+
   private async sendAnthropicMessage(params: LLMMessageParams): Promise<LLMResponse> {
     if (!this.anthropicClient) {
       throw new Error('Anthropic client not initialized');
@@ -257,14 +341,30 @@ export class UniversalLLMClient extends BaseLLMClient {
     const { messages, systemPrompt } = this.convertToAnthropicFormat(params);
     const sanitizedTools = this.sanitizeToolsForAnthropic(params.tools);
 
-    const response = await this.anthropicClient.messages.create({
+    // 检测是否启用 extended thinking
+    const supportsThinking = this.shouldEnableThinking();
+
+    // 构建请求参数
+    const requestParams: any = {
       model: this.config.model,
-      max_tokens: params.maxTokens || 4096,
+      max_tokens: supportsThinking ? Math.max(params.maxTokens || 16000, 16000) : (params.maxTokens || 4096),
       temperature: params.temperature,
       system: systemPrompt,
       messages,
       tools: sanitizedTools as any,
-    });
+    };
+
+    // 为支持 thinking 的模型添加 thinking 参数
+    if (supportsThinking) {
+      requestParams.thinking = {
+        type: 'enabled',
+        budget_tokens: 10000,
+      };
+      // 注意：启用 thinking 时不能设置 temperature
+      delete requestParams.temperature;
+    }
+
+    const response = await this.anthropicClient.messages.create(requestParams);
 
     const result = this.parseAnthropicResponse(response);
     this.logResponse(result);
@@ -282,15 +382,35 @@ export class UniversalLLMClient extends BaseLLMClient {
     const { messages, systemPrompt } = this.convertToAnthropicFormat(params);
     const sanitizedTools = this.sanitizeToolsForAnthropic(params.tools);
 
-    const stream = await this.anthropicClient.messages.create({
+    // 检测是否启用 extended thinking
+    const supportsThinking = this.shouldEnableThinking();
+
+    // 构建请求参数
+    const requestParams: any = {
       model: this.config.model,
-      max_tokens: params.maxTokens || 4096,
+      max_tokens: supportsThinking ? Math.max(params.maxTokens || 16000, 16000) : (params.maxTokens || 4096),
       temperature: params.temperature,
       system: systemPrompt,
       messages,
       tools: sanitizedTools as any,
-      stream: true,
-    });
+      stream: true as const,
+    };
+
+    // 为支持 thinking 的模型添加 thinking 参数
+    if (supportsThinking) {
+      requestParams.thinking = {
+        type: 'enabled',
+        budget_tokens: 10000,
+      };
+      // 注意：启用 thinking 时不能设置 temperature
+      delete requestParams.temperature;
+      logger.debug('Anthropic thinking enabled', {
+        model: this.config.model,
+        budgetTokens: 10000,
+      }, LogCategory.LLM);
+    }
+
+    const stream = this.anthropicClient.messages.stream(requestParams);
 
     let fullContent = '';
     const toolCallBuffers = new Map<string, { id: string; name?: string; argumentsText: string }>();
@@ -301,6 +421,9 @@ export class UniversalLLMClient extends BaseLLMClient {
       if (event.type === 'content_block_start') {
         if (event.content_block.type === 'text') {
           onChunk({ type: 'content_start' });
+        } else if (event.content_block.type === 'thinking') {
+          // Thinking block 开始
+          onChunk({ type: 'thinking', thinking: '' });
         } else if (event.content_block.type === 'tool_use') {
           const toolId = event.content_block.id || '';
           if (toolId) {
@@ -323,6 +446,12 @@ export class UniversalLLMClient extends BaseLLMClient {
         if (event.delta.type === 'text_delta') {
           fullContent += event.delta.text;
           onChunk({ type: 'content_delta', content: event.delta.text });
+        } else if (event.delta.type === 'thinking_delta') {
+          // Thinking delta - 发送 thinking 内容
+          const thinkingContent = (event.delta as any).thinking || '';
+          if (thinkingContent) {
+            onChunk({ type: 'thinking', thinking: thinkingContent });
+          }
         } else if (event.delta.type === 'input_json_delta') {
           const lastTool = [...toolCallBuffers.values()].slice(-1)[0];
           if (lastTool) {
@@ -393,7 +522,50 @@ export class UniversalLLMClient extends BaseLLMClient {
     let systemPrompt: string | undefined;
     const messages: Anthropic.MessageParam[] = [];
 
-    for (const msg of params.messages) {
+    const hasToolUse = (message: LLMMessage): boolean => {
+      if (!Array.isArray(message.content)) {
+        return false;
+      }
+      return message.content.some((block: any) => block?.type === 'tool_use');
+    };
+
+    const isToolResultUser = (message: LLMMessage): boolean => {
+      if (message.role !== 'user' || !Array.isArray(message.content)) {
+        return false;
+      }
+      return message.content.some((block: any) => block?.type === 'tool_result');
+    };
+
+    const sanitizeToolOrder = (inputMessages: LLMMessage[]): LLMMessage[] => {
+      const cleaned: LLMMessage[] = [];
+      for (let i = 0; i < inputMessages.length; i++) {
+        const msg = inputMessages[i];
+        if (msg.role === 'assistant' && hasToolUse(msg)) {
+          const next = inputMessages[i + 1];
+          if (!next || !isToolResultUser(next)) {
+            continue;
+          }
+          cleaned.push(msg);
+          cleaned.push(next);
+          i += 1;
+          continue;
+        }
+
+        if (isToolResultUser(msg)) {
+          const prev = cleaned[cleaned.length - 1];
+          if (!prev || !hasToolUse(prev)) {
+            continue;
+          }
+        }
+
+        cleaned.push(msg);
+      }
+      return cleaned;
+    };
+
+    const sanitizedMessages = sanitizeToolOrder(params.messages);
+
+    for (const msg of sanitizedMessages) {
       if (msg.role === 'system') {
         systemPrompt = typeof msg.content === 'string' ? msg.content : '';
       } else {
@@ -464,13 +636,23 @@ export class UniversalLLMClient extends BaseLLMClient {
 
     const messages = this.convertToOpenAIFormat(params);
 
-    const response = await this.openaiClient.chat.completions.create({
+    // 构建请求参数
+    const requestParams: any = {
       model: this.config.model,
       messages,
       max_tokens: params.maxTokens,
       temperature: params.temperature,
       tools: params.tools as any,
-    });
+    };
+
+    // 对所有请求启用 reasoning（让后端决定是否支持）
+    if (this.shouldEnableThinking()) {
+      requestParams.reasoning_effort = 'medium';
+      // 部分模型启用 reasoning 时不支持 temperature
+      delete requestParams.temperature;
+    }
+
+    const response = await this.openaiClient.chat.completions.create(requestParams);
 
     // 添加调试日志
     logger.info('OpenAI API response received', {
@@ -498,7 +680,8 @@ export class UniversalLLMClient extends BaseLLMClient {
 
     const messages = this.convertToOpenAIFormat(params);
 
-    const stream = await this.openaiClient.chat.completions.create({
+    // 构建请求参数
+    const requestParams: any = {
       model: this.config.model,
       messages,
       max_tokens: params.maxTokens,
@@ -506,7 +689,16 @@ export class UniversalLLMClient extends BaseLLMClient {
       tools: params.tools as any,
       stream: true,
       stream_options: { include_usage: true },
-    });
+    };
+
+    // 对所有请求启用 reasoning（让后端决定是否支持）
+    if (this.shouldEnableThinking()) {
+      requestParams.reasoning_effort = 'medium';
+      // 部分模型启用 reasoning 时不支持 temperature
+      delete requestParams.temperature;
+    }
+
+    const stream = await this.openaiClient.chat.completions.create(requestParams as Parameters<typeof this.openaiClient.chat.completions.create>[0] & { stream: true });
 
     let fullContent = '';
     const toolCallBuffers = new Map<string, { id: string; name?: string; argumentsText: string }>();
@@ -515,6 +707,13 @@ export class UniversalLLMClient extends BaseLLMClient {
 
     for await (const chunk of stream) {
       const delta = chunk.choices[0]?.delta;
+
+      // 处理 reasoning_content (OpenAI o1/o3 模型)
+      // 部分 OpenAI-compatible API 可能使用 reasoning_content 字段
+      const reasoningContent = (delta as any)?.reasoning_content;
+      if (reasoningContent) {
+        onChunk({ type: 'thinking', thinking: reasoningContent });
+      }
 
       if (delta?.content) {
         fullContent += delta.content;

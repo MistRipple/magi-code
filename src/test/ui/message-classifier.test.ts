@@ -1,0 +1,97 @@
+/**
+ * UI MessageClassifier 单元测试
+ */
+
+import { classifyMessage } from '../../ui/webview-svelte/src/lib/message-classifier';
+import { MessageCategory } from '../../ui/webview-svelte/src/types/message-routing';
+import { MessageLifecycle, MessageType, type StandardMessage, type MessageSource } from '../../protocol/message-protocol';
+import { InteractionType } from '../../protocol/message-protocol';
+
+declare const describe: (name: string, fn: () => void) => void;
+declare const test: (name: string, fn: () => void | Promise<void>) => void;
+declare const expect: any;
+
+function createMessage(overrides: Partial<StandardMessage>): StandardMessage {
+  return {
+    id: overrides.id || 'msg-1',
+    traceId: overrides.traceId || 'trace-1',
+    type: overrides.type || MessageType.TEXT,
+    source: overrides.source || ('orchestrator' as MessageSource),
+    agent: overrides.agent || 'claude',
+    lifecycle: overrides.lifecycle || MessageLifecycle.STARTED,
+    blocks: overrides.blocks || [],
+    metadata: overrides.metadata || {},
+    timestamp: overrides.timestamp || Date.now(),
+    updatedAt: overrides.updatedAt || Date.now(),
+    interaction: overrides.interaction,
+  };
+}
+
+describe('MessageClassifier', () => {
+  test('编排者计划消息应路由为 ORCHESTRATOR_PLAN', () => {
+    const msg = createMessage({ type: MessageType.PLAN, source: 'orchestrator' });
+    const result = classifyMessage(msg);
+    expect(result.category).toBe(MessageCategory.ORCHESTRATOR_PLAN);
+  });
+
+  test('编排者派发指令应路由为 WORKER_INSTRUCTION', () => {
+    const msg = createMessage({
+      source: 'orchestrator',
+      metadata: { dispatchToWorker: true, worker: 'codex' },
+      agent: 'codex',
+    });
+    const result = classifyMessage(msg);
+    expect(result.category).toBe(MessageCategory.WORKER_INSTRUCTION);
+    expect(result.worker).toBe('codex');
+  });
+
+  test('Worker 思考应路由为 WORKER_THINKING', () => {
+    const msg = createMessage({ source: 'worker', type: MessageType.THINKING, agent: 'claude' });
+    const result = classifyMessage(msg);
+    expect(result.category).toBe(MessageCategory.WORKER_THINKING);
+    expect(result.worker).toBe('claude');
+  });
+
+  test('Worker 工具调用应路由为 WORKER_TOOL_USE', () => {
+    const msg = createMessage({ source: 'worker', type: MessageType.TOOL_CALL, agent: 'gemini' });
+    const result = classifyMessage(msg);
+    expect(result.category).toBe(MessageCategory.WORKER_TOOL_USE);
+    expect(result.worker).toBe('gemini');
+  });
+
+  test('Worker 子任务摘要卡片应路由为 TASK_SUMMARY_CARD', () => {
+    const msg = createMessage({
+      source: 'worker',
+      agent: 'codex',
+      metadata: { subTaskCard: { title: 'done' } },
+    });
+    const result = classifyMessage(msg);
+    expect(result.category).toBe(MessageCategory.TASK_SUMMARY_CARD);
+    expect(result.worker).toBe('codex');
+  });
+
+  test('非 Worker 子任务摘要卡片不应路由为 TASK_SUMMARY_CARD', () => {
+    const msg = createMessage({
+      source: 'orchestrator',
+      metadata: { subTaskCard: { title: 'invalid' } },
+      type: MessageType.TEXT,
+    });
+    const result = classifyMessage(msg);
+    expect(result.category).toBe(MessageCategory.ORCHESTRATOR_ANALYSIS);
+  });
+
+  test('交互请求应路由为对应的 INTERACTION 类型', () => {
+    const msg = createMessage({
+      source: 'orchestrator',
+      type: MessageType.INTERACTION,
+      interaction: {
+        type: InteractionType.PLAN_CONFIRMATION,
+        requestId: 'req-1',
+        prompt: 'confirm plan',
+        required: true,
+      },
+    });
+    const result = classifyMessage(msg);
+    expect(result.category).toBe(MessageCategory.INTERACTION_CONFIRMATION);
+  });
+});

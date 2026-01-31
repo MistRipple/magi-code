@@ -7,7 +7,7 @@
  * 3. 完整任务执行流程
  */
 
-import { IntelligentOrchestrator } from '../orchestrator/intelligent-orchestrator';
+import { MissionDrivenEngine } from '../orchestrator/core';
 import { ToolManager } from '../tools/tool-manager';
 import { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
 import { PermissionMatrix } from '../types';
@@ -79,16 +79,17 @@ class MockAdapterFactory {
 /**
  * 创建测试用的编排器
  */
-function createTestOrchestrator(permissions: PermissionMatrix, projectRoot: string): IntelligentOrchestrator {
+function createTestOrchestrator(permissions: PermissionMatrix, projectRoot: string): MissionDrivenEngine {
   const adapterFactory = new MockAdapterFactory(permissions, projectRoot);
   const sessionManager = new UnifiedSessionManager(projectRoot);
   const snapshotManager = new SnapshotManager(sessionManager, projectRoot);
 
-  return new IntelligentOrchestrator(
+  return new MissionDrivenEngine(
     adapterFactory as any,
-    sessionManager,
+    { timeout: 300000, maxRetries: 3, permissions },
+    projectRoot,
     snapshotManager,
-    projectRoot
+    sessionManager
   );
 }
 
@@ -530,12 +531,8 @@ async function runTests(): Promise<void> {
     // 设置知识库
     orchestrator.setKnowledgeBase(kb);
 
-    // 验证传递链：IntelligentOrchestrator → MissionDrivenEngine → MissionOrchestrator
-    const engine = (orchestrator as any).missionDrivenEngine;
-    if (!engine) throw new Error('MissionDrivenEngine 未初始化');
-    console.log('  - IntelligentOrchestrator → MissionDrivenEngine ✓');
-
-    const missionOrchestrator = (engine as any).missionOrchestrator;
+    // 验证传递链：MissionDrivenEngine → MissionOrchestrator
+    const missionOrchestrator = (orchestrator as any).missionOrchestrator;
     if (!missionOrchestrator) throw new Error('MissionOrchestrator 未初始化');
     console.log('  - MissionDrivenEngine → MissionOrchestrator ✓');
 

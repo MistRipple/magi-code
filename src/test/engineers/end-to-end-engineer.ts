@@ -7,6 +7,9 @@
 import { TestEngineer, TestReport, TestIssue } from '../test-command-center';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
+import { EventEmitter } from 'events';
+import { WorkerSlot } from '../../types';
 
 class EndToEndEngineer implements TestEngineer {
   name = '端到端集成专家-赵工';
@@ -77,6 +80,18 @@ class EndToEndEngineer implements TestEngineer {
     } else {
       console.log('    ✗ 失败');
       issues.push(...edgeCasesResult.issues);
+    }
+
+    // 测试6：真实工作流（Mock LLM + MissionDrivenEngine）
+    totalTests++;
+    console.log('  [测试6] 真实工作流（编排→分配→执行→汇总）...');
+    const realWorkflowResult = await this.testRealWorkflow();
+    if (realWorkflowResult.passed) {
+      passed++;
+      console.log('    ✓ 通过');
+    } else {
+      console.log('    ✗ 失败');
+      issues.push(...realWorkflowResult.issues);
     }
     
     if (issues.length > 0) {
@@ -170,6 +185,165 @@ class EndToEndEngineer implements TestEngineer {
       });
     }
     
+    return { passed: issues.length === 0, issues };
+  }
+
+  private async testRealWorkflow(): Promise<{ passed: boolean; issues: TestIssue[] }> {
+    const issues: TestIssue[] = [];
+
+    class MockAdapterFactory extends EventEmitter {
+      private connected = new Set<WorkerSlot>(['claude', 'codex', 'gemini']);
+      public orchestratorCalls = 0;
+      public workerCalls = 0;
+
+      async sendMessage(agent: any, message: string): Promise<any> {
+        if (agent === 'orchestrator') {
+          this.orchestratorCalls += 1;
+          if (message.includes('意图类型定义') && message.includes('recommendedMode')) {
+            return {
+              content: JSON.stringify({
+                intent: 'task',
+                recommendedMode: 'task',
+                confidence: 0.92,
+                needsClarification: false,
+                clarificationQuestions: [],
+                reason: '需要规划与执行',
+              }),
+              done: true,
+            };
+          }
+          if (message.includes('分析以下用户请求，提取')) {
+            return {
+              content: JSON.stringify({
+                goal: '生成登录流程图',
+                analysis: '单一任务，结构清晰',
+                constraints: [],
+                acceptanceCriteria: ['输出清晰流程图'],
+                riskLevel: 'low',
+                riskFactors: [],
+              }),
+              done: true,
+            };
+          }
+          return { content: '编排者响应', done: true };
+        }
+
+        this.workerCalls += 1;
+        return {
+          content: [
+            '完成：登录流程图已生成',
+            'Created: docs/login-flow.md',
+          ].join('\n'),
+          done: true,
+          tokenUsage: { inputTokens: 100, outputTokens: 60 },
+        };
+      }
+
+      async interrupt(): Promise<void> {}
+      async shutdown(): Promise<void> {}
+      isConnected(agent: any): boolean {
+        if (agent === 'orchestrator') return true;
+        return this.connected.has(agent as WorkerSlot);
+      }
+      isBusy(): boolean { return false; }
+    }
+
+    const adapterFactory = new MockAdapterFactory();
+    const workspaceRoot = process.cwd();
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'multicli-e2e-'));
+    process.env.HOME = tmpHome;
+    process.env.USERPROFILE = tmpHome;
+
+    const Module = require('module');
+    const originalRequire = Module.prototype.require;
+    const vscodeMock = require('../e2e/vscode-mock');
+    Module.prototype.require = function(id: string) {
+      if (id === 'vscode') {
+        return vscodeMock;
+      }
+      return originalRequire.apply(this, arguments);
+    };
+
+    const { MissionDrivenEngine } = require('../../orchestrator/core');
+    const { SnapshotManager } = require('../../snapshot-manager');
+    const { UnifiedSessionManager } = require('../../session');
+
+    const sessionManager = new UnifiedSessionManager(workspaceRoot);
+    const snapshotManager = new SnapshotManager(sessionManager, workspaceRoot);
+    const orchestrator = new MissionDrivenEngine(
+      adapterFactory as any,
+      {
+        timeout: 300000,
+        maxRetries: 1,
+        strategy: { enableVerification: false, enableRecovery: false, autoRollbackOnFailure: false },
+        verification: { compileCheck: false, lintCheck: false, testCheck: false },
+        planReview: { enabled: false },
+        integration: { enabled: false },
+        review: { selfCheck: false, peerReview: 'never', maxRounds: 0 },
+      },
+      workspaceRoot,
+      snapshotManager,
+      sessionManager
+    );
+
+    orchestrator.setConfirmationCallback(async () => true);
+    orchestrator.setQuestionCallback(async (questions: string[]) => questions.join('\n'));
+    orchestrator.setClarificationCallback(async (questions: string[]) => {
+      const answers: Record<string, string> = {};
+      questions.forEach((q: string) => { answers[q] = '默认处理'; });
+      return { answers, additionalInfo: '' };
+    });
+
+    try {
+      await orchestrator.initialize();
+      const result = await orchestrator.execute('给我一个登录流程图，写成 markdown', 'task-real-workflow');
+
+      if (!result || typeof result !== 'string') {
+        issues.push({
+          severity: 'high',
+          category: '真实工作流',
+          description: '编排执行未返回文本结果',
+          suggestedFix: '检查编排执行最终输出的生成逻辑',
+        });
+      }
+
+      if (adapterFactory.orchestratorCalls < 2) {
+        issues.push({
+          severity: 'high',
+          category: '真实工作流',
+          description: '编排 LLM 调用次数不足（意图/目标分析未触发）',
+          suggestedFix: '确认意图分类与目标理解流程是否完整执行',
+        });
+      }
+
+    } catch (error: any) {
+      issues.push({
+        severity: 'critical',
+        category: '真实工作流',
+        description: `执行异常: ${error?.message || String(error)}`,
+        suggestedFix: '检查编排执行路径和 mock LLM 响应格式',
+      });
+    } finally {
+      Module.prototype.require = originalRequire;
+      try {
+        const missionOrchestrator = (orchestrator as any)?.missionOrchestrator;
+        const workers = missionOrchestrator?.workers;
+        if (workers && typeof workers.values === 'function') {
+          for (const worker of workers.values()) {
+            const sessionManager = worker?.getSessionManager?.();
+            sessionManager?.stopAutoCleanup?.();
+          }
+        }
+      } catch {
+        // ignore
+      }
+      try {
+        await adapterFactory.shutdown();
+      } catch {
+        // ignore
+      }
+    }
+
     return { passed: issues.length === 0, issues };
   }
 }

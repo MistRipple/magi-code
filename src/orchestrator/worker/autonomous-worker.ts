@@ -6,6 +6,7 @@
  * - 支持动态 Todo 添加
  * - 自动生成自检和互检引导
  * - 通过 IAdapterFactory 执行实际命令
+ * - **汇报机制**: 每完成一个 Todo 向编排者汇报
  */
 
 import { EventEmitter } from 'events';
@@ -27,6 +28,25 @@ import {
   TodoOutput,
   TodoStatus,
 } from '../mission/types';
+import {
+  WorkerReport,
+  OrchestratorResponse,
+  OrchestratorAdjustment,
+  ReportOptions,
+  ReportCallback,
+  createProgressReport,
+  createCompletedReport,
+  createFailedReport,
+  createQuestionReport,
+  WorkerProgress,
+  WorkerResult,
+} from '../protocols/worker-report';
+import {
+  WorkerSessionManager,
+  WorkerSession,
+  ConversationMessage,
+} from './worker-session';
+import { logger, LogCategory } from '../../logging';
 
 /**
  * Todo 执行选项
@@ -44,6 +64,16 @@ export interface TodoExecuteOptions {
   adapterFactory?: IAdapterFactory;
   /** 适配器输出范围选项 */
   adapterScope?: AdapterOutputScope;
+  /** 汇报回调（Worker → Orchestrator） */
+  onReport?: ReportCallback;
+  /** 汇报超时(ms)，默认 5000 */
+  reportTimeout?: number;
+  /** Session ID（用于恢复执行） - 提案 4.1 */
+  sessionId?: string;
+  /** 恢复时的额外指令 - 提案 4.1 */
+  resumePrompt?: string;
+  /** Session 管理器（可选，不提供则创建临时管理器） - 提案 4.1 */
+  sessionManager?: WorkerSessionManager;
 }
 
 /**
@@ -62,6 +92,8 @@ export interface AutonomousExecutionResult {
   recoveryAttempts: number;
   /** Token 使用统计 */
   tokenUsage?: TokenUsage;
+  /** Session ID（用于后续恢复） - 提案 4.1 */
+  sessionId?: string;
 }
 
 /**
@@ -71,15 +103,21 @@ export class AutonomousWorker extends EventEmitter {
   private todoPlanner: TodoPlanner;
   private recoveryHandler: ProfileAwareRecoveryHandler;
   private retryCountMap: Map<string, number> = new Map();
+  /** Session 管理器 - 提案 4.1 */
+  private sessionManager: WorkerSessionManager;
+  /** 当前活跃的 Session */
+  private currentSession: WorkerSession | null = null;
 
   constructor(
     private workerType: WorkerSlot,
     private profileLoader: ProfileLoader,
-    private guidanceInjector: GuidanceInjector
+    private guidanceInjector: GuidanceInjector,
+    sessionManager?: WorkerSessionManager
   ) {
     super();
     this.todoPlanner = new TodoPlanner(profileLoader, guidanceInjector);
     this.recoveryHandler = new ProfileAwareRecoveryHandler(profileLoader);
+    this.sessionManager = sessionManager || new WorkerSessionManager({ autoCleanup: true });
   }
 
   /**
@@ -137,13 +175,85 @@ export class AutonomousWorker extends EventEmitter {
     const errors: string[] = [];
     // 聚合 Token 使用统计
     let totalTokenUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
+    // 是否被编排者中止
+    let aborted = false;
+    let abortReason: string | undefined;
 
-    this.emit('assignmentStarted', { assignmentId: assignment.id });
+    // Session 管理 - 提案 4.1
+    const sessionMgr = options.sessionManager || this.sessionManager;
+    let session: WorkerSession | null = null;
+    let isResuming = false;
+
+    // 尝试恢复或创建 Session
+    if (options.sessionId) {
+      session = sessionMgr.get(options.sessionId);
+      if (session) {
+        isResuming = true;
+        sessionMgr.markAsResumed(options.sessionId, options.resumePrompt);
+        logger.info('Worker.Session.恢复', {
+          sessionId: options.sessionId,
+          assignmentId: assignment.id,
+          completedTodos: session.completedTodos.length,
+        }, LogCategory.ORCHESTRATOR);
+
+        // 恢复已完成的 Todo 状态
+        for (const todoId of session.completedTodos) {
+          const todo = assignment.todos.find(t => t.id === todoId);
+          if (todo && todo.status === 'pending') {
+            todo.status = 'completed';
+            completedTodos.push(todo);
+          }
+        }
+
+        this.emit('sessionResumed', {
+          sessionId: session.id,
+          assignmentId: assignment.id,
+          completedTodos: session.completedTodos.length,
+        });
+      } else {
+        logger.warn('Worker.Session.恢复失败.不存在', {
+          sessionId: options.sessionId,
+          assignmentId: assignment.id,
+        }, LogCategory.ORCHESTRATOR);
+      }
+    }
+
+    // 如果没有恢复到 Session，创建新的
+    if (!session) {
+      session = sessionMgr.create({
+        assignmentId: assignment.id,
+        workerId: this.workerType,
+        initialContext: options.projectContext,
+      });
+      logger.info('Worker.Session.创建', {
+        sessionId: session.id,
+        assignmentId: assignment.id,
+      }, LogCategory.ORCHESTRATOR);
+
+      this.emit('sessionCreated', {
+        sessionId: session.id,
+        assignmentId: assignment.id,
+      });
+    }
+
+    this.currentSession = session;
+
+    this.emit('assignmentStarted', {
+      assignmentId: assignment.id,
+      sessionId: session.id,
+      isResuming,
+    });
+    logger.info('Worker.Assignment.开始', {
+      assignmentId: assignment.id,
+      workerId: this.workerType,
+      sessionId: session.id,
+      isResuming,
+    }, LogCategory.ORCHESTRATOR);
 
     // 执行每个 Todo
     let currentTodo = this.getNextExecutableTodo(assignment);
 
-    while (currentTodo) {
+    while (currentTodo && !aborted) {
       try {
         const result = await this.executeTodo(currentTodo, assignment, options);
 
@@ -162,6 +272,38 @@ export class AutonomousWorker extends EventEmitter {
         if (result.success) {
           completedTodos.push(result.todo);
 
+          // 更新 Session - 提案 4.1
+          if (session) {
+            sessionMgr.update(session.id, {
+              completeTodo: result.todo.id,
+              stateSnapshot: {
+                currentTodoIndex: completedTodos.length,
+                lastExecutionAt: Date.now(),
+              },
+            });
+          }
+
+          // **汇报机制**: 每完成一个 Todo 向编排者汇报
+          if (options.onReport) {
+            const orchestratorResponse = await this.reportProgress(
+              assignment,
+              currentTodo,
+              completedTodos,
+              options
+            );
+
+            // 处理编排者响应
+            if (orchestratorResponse.action === 'abort') {
+              aborted = true;
+              abortReason = orchestratorResponse.abortReason || '编排者终止执行';
+              logger.info('Worker.Assignment.被编排者终止', { assignmentId: assignment.id, reason: abortReason }, LogCategory.ORCHESTRATOR);
+              break;
+            } else if (orchestratorResponse.action === 'adjust' && orchestratorResponse.adjustment) {
+              // 处理调整指令
+              this.handleAdjustment(assignment, orchestratorResponse.adjustment);
+            }
+          }
+
           // 检查是否需要动态添加 Todo
           if (result.dynamicTodos && result.dynamicTodos.length > 0) {
             dynamicTodos.push(...result.dynamicTodos);
@@ -173,6 +315,16 @@ export class AutonomousWorker extends EventEmitter {
         } else {
           failedTodos.push(result.todo);
           errors.push(result.error || 'Unknown error');
+
+          // 更新 Session 失败状态 - 提案 4.1
+          if (session) {
+            sessionMgr.update(session.id, {
+              stateSnapshot: {
+                lastError: result.error,
+                lastExecutionAt: Date.now(),
+              },
+            });
+          }
 
           // 检查是否应该跳过依赖的 Todo
           const dependentTodos = this.getDependentTodos(currentTodo, assignment);
@@ -194,6 +346,7 @@ export class AutonomousWorker extends EventEmitter {
           duration: 0,
         };
         failedTodos.push(currentTodo);
+        logger.error('Worker.Todo.执行异常', { todoId: currentTodo.id, error: errorMessage }, LogCategory.ORCHESTRATOR);
       }
 
       // 获取下一个可执行的 Todo
@@ -207,23 +360,218 @@ export class AutonomousWorker extends EventEmitter {
       }
     }
 
+    // 如果被中止，将剩余的 pending Todo 标记为 skipped
+    if (aborted) {
+      for (const todo of assignment.todos) {
+        if (todo.status === 'pending' && !skippedTodos.includes(todo)) {
+          todo.status = 'skipped';
+          todo.blockedReason = abortReason || '被编排者终止';
+          skippedTodos.push(todo);
+        }
+      }
+    }
+
+    const success = failedTodos.length === 0 && !aborted;
     const result: AutonomousExecutionResult = {
       assignment,
-      success: failedTodos.length === 0,
+      success,
       completedTodos,
       failedTodos,
       skippedTodos,
       dynamicTodos,
       recoveredTodos: [],
       totalDuration: Date.now() - startTime,
-      errors,
-      recoveryAttempts: 0,
+      errors: aborted ? [...errors, abortReason || '被编排者终止'] : errors,
+      recoveryAttempts: session?.stateSnapshot.retryCount || 0,
       tokenUsage: totalTokenUsage,
+      sessionId: session?.id, // 提案 4.1: 返回 sessionId 以便后续恢复
     };
 
+    // 清理当前 Session 引用
+    this.currentSession = null;
+
+    // 如果成功，可选择删除 Session；如果失败，保留以便恢复
+    if (success && session) {
+      // 成功时可以选择保留 Session 一段时间，或者立即删除
+      // 这里保留 Session，让它自然过期
+      logger.debug('Worker.Session.保留', { sessionId: session.id }, LogCategory.ORCHESTRATOR);
+    } else if (!success && session) {
+      logger.info('Worker.Session.失败保留', {
+        sessionId: session.id,
+        lastError: errors[0],
+      }, LogCategory.ORCHESTRATOR);
+    }
+
+    // **最终汇报**: 向编排者汇报最终结果
+    if (options.onReport) {
+      const finalResult: WorkerResult = {
+        success,
+        modifiedFiles: completedTodos.flatMap(t => t.output?.modifiedFiles || []),
+        createdFiles: [],
+        summary: success ? `完成 ${completedTodos.length} 个任务` : `失败 ${failedTodos.length} 个任务`,
+        totalDuration: result.totalDuration,
+        tokenUsage: totalTokenUsage.inputTokens > 0 ? {
+          inputTokens: totalTokenUsage.inputTokens,
+          outputTokens: totalTokenUsage.outputTokens,
+        } : undefined,
+      };
+
+      const finalReport = success
+        ? createCompletedReport(this.workerType, assignment.id, finalResult)
+        : createFailedReport(this.workerType, assignment.id, errors[0] || '执行失败', finalResult);
+
+      try {
+        await options.onReport(finalReport);
+      } catch (reportError) {
+        logger.error('Worker.最终汇报失败', { error: reportError instanceof Error ? reportError.message : String(reportError) }, LogCategory.ORCHESTRATOR);
+      }
+    }
+
     this.emit('assignmentCompleted', result);
+    logger.info('Worker.Assignment.完成', {
+      assignmentId: assignment.id,
+      success,
+      completedCount: completedTodos.length,
+      failedCount: failedTodos.length,
+    }, LogCategory.ORCHESTRATOR);
 
     return result;
+  }
+
+  /**
+   * 向编排者汇报进度
+   * @private
+   */
+  private async reportProgress(
+    assignment: Assignment,
+    completedTodo: WorkerTodo,
+    allCompletedTodos: WorkerTodo[],
+    options: TodoExecuteOptions
+  ): Promise<OrchestratorResponse> {
+    if (!options.onReport) {
+      // 如果没有汇报回调，返回默认继续
+      return { action: 'continue', timestamp: Date.now() };
+    }
+
+    const pendingTodos = assignment.todos.filter(t => t.status === 'pending');
+    const completedSteps = allCompletedTodos.map(t => t.content);
+    const remainingSteps = pendingTodos.map(t => t.content);
+    const totalSteps = assignment.todos.length;
+    const percentage = totalSteps > 0 ? Math.round((allCompletedTodos.length / totalSteps) * 100) : 0;
+
+    const progress: WorkerProgress = {
+      currentStep: completedTodo.content,
+      currentTodoId: completedTodo.id,
+      completedSteps,
+      remainingSteps,
+      percentage,
+      stepDuration: completedTodo.output?.duration || 0,
+    };
+
+    const report = createProgressReport(
+      this.workerType,
+      assignment.id,
+      progress
+    );
+
+    try {
+      const response = await Promise.race([
+        options.onReport(report),
+        new Promise<OrchestratorResponse>((_, reject) =>
+          setTimeout(() => reject(new Error('汇报超时')), options.reportTimeout || 5000)
+        ),
+      ]);
+      return response;
+    } catch (error) {
+      logger.warn('Worker.汇报异常，继续执行', {
+        assignmentId: assignment.id,
+        error: error instanceof Error ? error.message : String(error),
+      }, LogCategory.ORCHESTRATOR);
+      // 汇报失败时默认继续执行
+      return { action: 'continue', timestamp: Date.now() };
+    }
+  }
+
+  /**
+   * 处理编排者的调整指令
+   * @private
+   */
+  private handleAdjustment(
+    assignment: Assignment,
+    adjustment: OrchestratorAdjustment
+  ): void {
+    logger.info('Worker.处理调整指令', {
+      assignmentId: assignment.id,
+      hasNewInstructions: !!adjustment.newInstructions,
+      skipSteps: adjustment.skipSteps?.length || 0,
+      addSteps: adjustment.addSteps?.length || 0,
+    }, LogCategory.ORCHESTRATOR);
+
+    // 处理跳过步骤
+    if (adjustment.skipSteps && adjustment.skipSteps.length > 0) {
+      for (const stepContent of adjustment.skipSteps) {
+        const todo = assignment.todos.find(t =>
+          t.status === 'pending' && t.content.includes(stepContent)
+        );
+        if (todo) {
+          todo.status = 'skipped';
+          todo.blockedReason = '编排者跳过';
+          logger.debug('Worker.跳过步骤', { todoId: todo.id, content: stepContent }, LogCategory.ORCHESTRATOR);
+        }
+      }
+    }
+
+    // 处理新增步骤
+    if (adjustment.addSteps && adjustment.addSteps.length > 0) {
+      for (const stepContent of adjustment.addSteps) {
+        const todo: WorkerTodo = {
+          id: `adj-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+          assignmentId: assignment.id,
+          content: stepContent,
+          reasoning: '编排者添加',
+          expectedOutput: '完成任务',
+          type: 'implementation',
+          priority: 3,
+          status: 'pending',
+          dependsOn: [],
+          requiredContracts: [],
+          producesContracts: [],
+          outOfScope: false,
+          createdAt: Date.now(),
+        };
+        assignment.todos.push(todo);
+        logger.debug('Worker.添加步骤', { todoId: todo.id, content: stepContent }, LogCategory.ORCHESTRATOR);
+      }
+    }
+
+    // 处理优先级调整
+    if (adjustment.priorityChanges) {
+      for (const [todoId, newPriority] of Object.entries(adjustment.priorityChanges)) {
+        const todo = assignment.todos.find(t => t.id === todoId);
+        if (todo) {
+          todo.priority = newPriority;
+          logger.debug('Worker.调整优先级', { todoId, newPriority }, LogCategory.ORCHESTRATOR);
+        }
+      }
+      // 根据优先级重新排序 pending 的 todos
+      assignment.todos.sort((a, b) => {
+        if (a.status !== 'pending' || b.status !== 'pending') return 0;
+        return a.priority - b.priority;
+      });
+    }
+
+    // 处理新指令（记录日志，实际执行由 Worker 自行理解）
+    if (adjustment.newInstructions) {
+      logger.info('Worker.收到新指令', {
+        assignmentId: assignment.id,
+        instructions: adjustment.newInstructions.substring(0, 100),
+      }, LogCategory.ORCHESTRATOR);
+    }
+
+    this.emit('adjustmentApplied', {
+      assignmentId: assignment.id,
+      adjustment,
+    });
   }
 
   /**
@@ -889,5 +1237,48 @@ export class AutonomousWorker extends EventEmitter {
    */
   clearAllRetryCounts(): void {
     this.retryCountMap.clear();
+  }
+
+  // ============================================================================
+  // Session 管理方法 - 提案 4.1
+  // ============================================================================
+
+  /**
+   * 获取当前活跃的 Session
+   */
+  getCurrentSession(): WorkerSession | null {
+    return this.currentSession;
+  }
+
+  /**
+   * 获取 Session 管理器
+   */
+  getSessionManager(): WorkerSessionManager {
+    return this.sessionManager;
+  }
+
+  /**
+   * 根据 Assignment ID 获取 Session
+   */
+  getSessionByAssignment(assignmentId: string): WorkerSession | null {
+    return this.sessionManager.getByAssignment(assignmentId);
+  }
+
+  /**
+   * 清理所有 Session
+   */
+  clearAllSessions(): void {
+    this.sessionManager.clear();
+    this.currentSession = null;
+  }
+
+  /**
+   * 销毁 Worker（清理资源）
+   */
+  dispose(): void {
+    this.sessionManager.dispose();
+    this.clearAllRetryCounts();
+    this.currentSession = null;
+    this.removeAllListeners();
   }
 }

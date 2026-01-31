@@ -35,6 +35,8 @@ Use for:
 * Pie charts
 * Mind maps (思维导图)
 
+**IMPORTANT**: Always provide a descriptive 'title' parameter that describes what the diagram represents (e.g., "用户登录流程图", "系统架构图", "订单状态机"). This title will be used as the tab name when opened in VS Code.
+
 The diagram will be rendered as an interactive SVG with pan/zoom controls.
 
 Flowchart Example:
@@ -65,7 +67,7 @@ mindmap
           },
           title: {
             type: 'string',
-            description: 'Optional title for the diagram'
+            description: 'Descriptive title for the diagram (STRONGLY RECOMMENDED). Used as tab name in VS Code. Example: "用户登录流程图", "系统架构思维导图"'
           },
           theme: {
             type: 'string',

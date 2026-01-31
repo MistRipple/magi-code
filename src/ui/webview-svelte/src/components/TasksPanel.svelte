@@ -1,13 +1,18 @@
 <script lang="ts">
   import { getState } from '../stores/messages.svelte';
   import { ensureArray } from '../lib/utils';
+  import type { WorkerSessionState, Task } from '../types/message';
   import { vscode } from '../lib/vscode-bridge';
 
   const appState = getState();
 
   // 任务列表
-  const tasks = $derived(ensureArray(appState.tasks));
+  const tasks = $derived(ensureArray(appState.tasks) as Task[]);
   const missionPlan = $derived(appState.missionPlan);
+  const workerSessions = $derived(appState.workerSessions);
+  const workerSessionList = $derived(
+    workerSessions ? Array.from(workerSessions.values()) as WorkerSessionState[] : []
+  );
 
   const todoStatusLabels: Record<string, string> = {
     pending: '待执行',
@@ -118,6 +123,7 @@
         <div class="section-title">Worker Todo</div>
         <div class="assignment-list">
           {#each missionPlan.assignments as assignment}
+            {@const assignmentSessions = workerSessionList.filter((session) => session.assignmentId === assignment.id)}
             <div class="assignment-card">
               <div class="assignment-header">
                 <div class="assignment-title">{assignment.responsibility}</div>
@@ -128,6 +134,19 @@
                   </span>
                 </div>
               </div>
+              {#if assignmentSessions.length > 0}
+                <div class="assignment-sessions">
+                  {#each assignmentSessions as session}
+                    <div class="session-chip" class:resumed={session.isResumed}>
+                      <span class="session-label">Session {session.sessionId}</span>
+                      {#if session.isResumed}
+                        <span class="session-flag">已恢复</span>
+                      {/if}
+                      <span class="session-meta">完成 {session.completedTodos}</span>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
               {#if typeof assignment.progress === 'number'}
                 <div class="assignment-progress">
                   <div class="progress-bar" style="width: {assignment.progress}%"></div>
@@ -416,6 +435,40 @@
     color: var(--foreground-muted);
     text-transform: uppercase;
     font-size: 10px;
+  }
+
+  .assignment-sessions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
+  }
+
+  .session-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: 2px 8px;
+    border-radius: var(--radius-full);
+    background: var(--surface-2);
+    border: 1px solid var(--border-subtle);
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+  }
+
+  .session-chip.resumed {
+    border-color: var(--info);
+    color: var(--foreground);
+    background: var(--info-muted);
+  }
+
+  .session-flag {
+    color: var(--info);
+    font-weight: var(--font-medium);
+  }
+
+  .session-meta {
+    color: var(--foreground-muted);
   }
 
   .assignment-progress {

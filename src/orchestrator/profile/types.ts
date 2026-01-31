@@ -75,13 +75,28 @@ export interface WorkerProfile {
   guidance: WorkerGuidance;
   /** 协作规则 */
   collaboration: WorkerCollaboration;
-  /** 评审配置（可选，向后兼容） */
+  /** 评审配置（可选） */
   review?: WorkerReviewConfig;
 }
 
 // ============================================================================
 // 任务分类类型
 // ============================================================================
+
+/** 任务分类类型 - 提案 4.4 */
+export type CategoryType =
+  | 'bugfix'
+  | 'refactor'
+  | 'review'
+  | 'feature'
+  | 'test'
+  | 'documentation'
+  | 'optimization'
+  | 'security'
+  | 'migration'
+  | 'config'
+  | 'integration'
+  | 'general';
 
 /** 任务优先级 */
 export type TaskPriority = 'high' | 'medium' | 'low';
@@ -113,7 +128,7 @@ export interface CategoryConfig {
   priority: TaskPriority;
   /** 风险等级 */
   riskLevel: RiskLevel;
-  /** 评审策略（可选，向后兼容） */
+  /** 评审策略（可选） */
   reviewPolicy?: CategoryReviewPolicy;
 }
 
