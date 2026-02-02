@@ -1,5 +1,6 @@
 <script lang="ts">
   import { vscode } from '../lib/vscode-bridge';
+  import { onMount } from 'svelte';
   import type { StandardMessage } from '../../../../protocol/message-protocol';
   import { MessageCategory } from '../../../../protocol/message-protocol';
   import { ensureArray } from '../lib/utils';
@@ -40,36 +41,58 @@
   let userInfo = $state('');
   let showResetConfirm = $state(false);
 
-  // Profile Tab 状态
-  let profileWorker = $state<'claude' | 'codex' | 'gemini'>('claude');
-  // 存储所有 workers 的画像配置
-  let allWorkerProfiles = $state<Record<string, { role: string; focus: string[]; constraints: string[] }>>({
-    claude: { role: '', focus: [], constraints: [] },
-    codex: { role: '', focus: [], constraints: [] },
-    gemini: { role: '', focus: [], constraints: [] }
-  });
+  // Profile Tab 状态（Worker 分工）
   let taskCategories = $state<Record<string, string>>({
     architecture: 'claude',
+    backend: 'claude',
+    frontend: 'gemini',
+    data_analysis: 'codex',
     implement: 'codex',
     refactor: 'claude',
     bugfix: 'codex',
     debug: 'claude',
-    data_analysis: 'codex',
-    frontend: 'gemini',
-    backend: 'claude',
     test: 'codex',
-    document: 'gemini',
     review: 'claude',
+    document: 'gemini',
+    integration: 'claude',
+    simple: 'codex',
     general: 'claude'
   });
+  let categoryGuidance = $state<Record<string, {
+    displayName: string;
+    description: string;
+    guidance: { focus: string[]; constraints: string[] };
+    priority: string;
+    riskLevel: string;
+  }>>({});
+  let categoryPriority = $state<string[]>([]);
+  let openGuidanceCategory = $state<string | null>(null);
+  let guidancePopover = $state<{ category: string; top: number; left: number; width: number } | null>(null);
 
   // 全局用户规则
   let userRules = $state('');
 
-  // 当前 worker 的画像数据（响应式派生）
-  let profileRole = $derived(allWorkerProfiles[profileWorker]?.role || '');
-  let profileFocusAreas = $derived(ensureArray(allWorkerProfiles[profileWorker]?.focus));
-  let profileConstraints = $derived(ensureArray(allWorkerProfiles[profileWorker]?.constraints));
+  // 分类显示顺序
+  let categoryOrder = $derived(
+    categoryPriority.length > 0 ? categoryPriority : Object.keys(categoryLabels)
+  );
+
+  function closeGuidancePopover() {
+    openGuidanceCategory = null;
+    guidancePopover = null;
+  }
+
+  onMount(() => {
+    const handler = () => {
+      closeGuidancePopover();
+    };
+    window.addEventListener('click', handler);
+    window.addEventListener('resize', handler);
+    return () => {
+      window.removeEventListener('click', handler);
+      window.removeEventListener('resize', handler);
+    };
+  });
 
   // Model Tab 状态
   let modelConfigTab = $state<'orch' | 'comp' | 'ace'>('orch');
@@ -244,6 +267,8 @@
     test: '测试编写(test)',
     document: '文档编写(document)',
     review: '代码审查(review)',
+    integration: '集成联调(integration)',
+    simple: '简单任务(simple)',
     general: '通用任务(general)'
   };
 
@@ -311,77 +336,38 @@
     onClose?.();
   }
 
-  // 更新当前 worker 的 role
-  function updateProfileRole(value: string) {
-    allWorkerProfiles[profileWorker] = {
-      ...allWorkerProfiles[profileWorker],
-      role: value
-    };
-    allWorkerProfiles = { ...allWorkerProfiles };
-  }
-
-  function addFocusArea() {
-    inputDialogTitle = '添加专注领域';
-    inputDialogValue = '';
-    inputDialogCallback = (value: string) => {
-      if (value.trim()) {
-        const currentFocus = allWorkerProfiles[profileWorker]?.focus || [];
-        allWorkerProfiles[profileWorker] = {
-          ...allWorkerProfiles[profileWorker],
-          focus: [...currentFocus, value.trim()]
-        };
-        allWorkerProfiles = { ...allWorkerProfiles };
-      }
-    };
-    showInputDialog = true;
-  }
-
-  function removeFocusArea(index: number) {
-    const currentFocus = allWorkerProfiles[profileWorker]?.focus || [];
-    allWorkerProfiles[profileWorker] = {
-      ...allWorkerProfiles[profileWorker],
-      focus: currentFocus.filter((_, i) => i !== index)
-    };
-    allWorkerProfiles = { ...allWorkerProfiles };
-  }
-
-  function addConstraint() {
-    inputDialogTitle = '添加行为约束';
-    inputDialogValue = '';
-    inputDialogCallback = (value: string) => {
-      if (value.trim()) {
-        const currentConstraints = allWorkerProfiles[profileWorker]?.constraints || [];
-        allWorkerProfiles[profileWorker] = {
-          ...allWorkerProfiles[profileWorker],
-          constraints: [...currentConstraints, value.trim()]
-        };
-        allWorkerProfiles = { ...allWorkerProfiles };
-      }
-    };
-    showInputDialog = true;
-  }
-
-  function removeConstraint(index: number) {
-    const currentConstraints = allWorkerProfiles[profileWorker]?.constraints || [];
-    allWorkerProfiles[profileWorker] = {
-      ...allWorkerProfiles[profileWorker],
-      constraints: currentConstraints.filter((_, i) => i !== index)
-    };
-    allWorkerProfiles = { ...allWorkerProfiles };
-  }
-
   function saveProfile() {
     profileSaveStatus = 'saving';
 
-    // 保存所有 workers 的配置
     vscode.postMessage({
       type: 'saveProfileConfig',
       data: {
-        workers: allWorkerProfiles,
-        categories: taskCategories,
+        assignments: taskCategories,
         userRules
       }
     });
+  }
+
+  function updateGuidancePosition(category: string, event: MouseEvent) {
+    const width = Math.min(380, window.innerWidth - 24);
+    const left = Math.min(window.innerWidth - width - 12, Math.max(12, event.clientX + 12));
+    const top = Math.min(window.innerHeight - 12, Math.max(12, event.clientY + 12));
+    openGuidanceCategory = category;
+    guidancePopover = { category, top, left, width };
+  }
+
+  function showGuidance(category: string, event: MouseEvent) {
+    updateGuidancePosition(category, event);
+  }
+
+  function moveGuidance(category: string, event: MouseEvent) {
+    if (openGuidanceCategory !== category) return;
+    updateGuidancePosition(category, event);
+  }
+
+  function hideGuidance(category: string) {
+    if (openGuidanceCategory !== category) return;
+    closeGuidancePopover();
   }
 
   function resetProfile() {
@@ -815,22 +801,14 @@
       // 画像配置加载
       else if (dataType === 'profileConfig') {
         const config = payload?.config;
-        if (config?.workers) {
-          // 存储所有 workers 的配置
-          for (const [worker, profile] of Object.entries(config.workers) as [string, any][]) {
-            if (profile && allWorkerProfiles[worker]) {
-              allWorkerProfiles[worker] = {
-                role: profile.role || '',
-                focus: profile.focus || [],
-                constraints: profile.constraints || []
-              };
-            }
-          }
-          // 触发响应式更新
-          allWorkerProfiles = { ...allWorkerProfiles };
+        if (config?.assignments) {
+          taskCategories = { ...taskCategories, ...config.assignments };
         }
-        if (config?.categories) {
-          taskCategories = { ...taskCategories, ...config.categories };
+        if (config?.categoryGuidance) {
+          categoryGuidance = config.categoryGuidance;
+        }
+        if (Array.isArray(config?.categoryPriority)) {
+          categoryPriority = config.categoryPriority;
         }
         if (typeof config?.userRules === 'string') {
           userRules = config.userRules;
@@ -1143,7 +1121,7 @@
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div class="settings-overlay" onclick={closeSettings}>
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="settings-panel" onclick={(e) => e.stopPropagation()}>
+  <div class="settings-panel" onclick={(e) => { e.stopPropagation(); closeGuidancePopover(); }}>
     <div class="settings-header">
       <span class="settings-title">设置</span>
       {#if userInfo}
@@ -1178,7 +1156,7 @@
     </div>
 
     <!-- Tab 内容区域 -->
-    <div class="settings-tab-content">
+  <div class="settings-tab-content" onscroll={closeGuidancePopover}>
       {#if activeTab === 'stats'}
         <!-- 统计 Tab -->
         <div class="settings-section stats-section">
@@ -1199,6 +1177,12 @@
               {@const status = modelStatuses[worker]}
               {@const workerStats = getWorkerStats(worker)}
               {@const statusClass = getStatusClass(status?.status || 'checking')}
+              {@const modelLabel = status?.model
+                || (status?.status === 'not_configured'
+                  ? '未配置'
+                  : status?.status === 'disabled'
+                    ? '已禁用'
+                    : '未知模型')}
               <div class="model-connection-item {statusClass}" data-worker={worker}>
                 <div class="model-connection-icon {worker}">
                   <Icon name="circle" size={14} />
@@ -1213,7 +1197,7 @@
                     </span>
                     <span class="model-connection-badge {statusClass}">{statusTexts[status?.status] || statusTexts['checking']}</span>
                   </div>
-                  <div class="model-connection-model">{status?.model || '未配置'}</div>
+                  <div class="model-connection-model">{modelLabel}</div>
                   {#if status?.error}
                     <div class="model-connection-error">{status.error}</div>
                   {/if}
@@ -1540,109 +1524,84 @@
         </div>
       {:else if activeTab === 'profile'}
         <!-- 画像配置 Tab -->
-        <!-- Worker 画像卡片 -->
+        <!-- Worker 分工配置 -->
         <div class="settings-section">
           <div class="settings-section-header">
-            <div class="settings-section-title">Worker 画像配置</div>
-            <div class="profile-worker-tabs">
-              <button class="profile-worker-tab" class:active={profileWorker === 'claude'} onclick={() => profileWorker = 'claude'}>
-                <span class="profile-worker-dot claude"></span>
-                Claude
-              </button>
-              <button class="profile-worker-tab" class:active={profileWorker === 'codex'} onclick={() => profileWorker = 'codex'}>
-                <span class="profile-worker-dot codex"></span>
-                Codex
-              </button>
-              <button class="profile-worker-tab" class:active={profileWorker === 'gemini'} onclick={() => profileWorker = 'gemini'}>
-                <span class="profile-worker-dot gemini"></span>
-                Gemini
-              </button>
-            </div>
+            <div class="settings-section-title">Worker 分工配置</div>
           </div>
-
-          <!-- Worker 画像编辑区 -->
-          <div class="profile-editor">
-            <!-- 角色定位 -->
-            <div class="profile-field">
-              <div class="profile-field-label">角色定位</div>
-              <textarea
-                class="profile-textarea"
-                value={profileRole}
-                oninput={(e) => updateProfileRole((e.target as HTMLTextAreaElement).value)}
-                placeholder="描述该 Worker 的角色定位..."
-              ></textarea>
-            </div>
-
-            <!-- 两列布局：专注领域 + 行为约束 -->
-            <div class="profile-two-columns">
-              <!-- 专注领域 -->
-              <div class="profile-field">
-                <div class="profile-field-header">
-                  <span class="profile-field-label">专注领域</span>
-                  <button class="profile-add-btn" onclick={addFocusArea}>
-                    <Icon name="plus" size={12} />
-                  </button>
-                </div>
-                <div class="profile-tags">
-                  {#each profileFocusAreas as area, i}
-                    <span class="profile-tag">
-                      {area}
-                      <button class="profile-tag-remove" onclick={() => removeFocusArea(i)}>
-                        <Icon name="close" size={10} />
-                      </button>
-                    </span>
-                  {/each}
-                  {#if profileFocusAreas.length === 0}
-                    <span class="profile-tags-empty">点击 + 添加专注领域</span>
-                  {/if}
-                </div>
-              </div>
-
-              <!-- 行为约束 -->
-              <div class="profile-field">
-                <div class="profile-field-header">
-                  <span class="profile-field-label">行为约束</span>
-                  <button class="profile-add-btn" onclick={addConstraint}>
-                    <Icon name="plus" size={12} />
-                  </button>
-                </div>
-                <div class="profile-tags">
-                  {#each profileConstraints as constraint, i}
-                    <span class="profile-tag">
-                      {constraint}
-                      <button class="profile-tag-remove" onclick={() => removeConstraint(i)}>
-                        <Icon name="close" size={10} />
-                      </button>
-                    </span>
-                  {/each}
-                  {#if profileConstraints.length === 0}
-                    <span class="profile-tags-empty">点击 + 添加行为约束</span>
-                  {/if}
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- 全局任务分类配置 -->
-        <div class="settings-section">
-          <div class="settings-section-header">
-            <div class="settings-section-title">任务分类配置</div>
-          </div>
-          <div class="settings-section-desc">配置存储：<code>~/.multicli/</code></div>
+          <div class="settings-section-desc">配置存储：<code>~/.multicli/worker-assignments.json</code></div>
           <div class="profile-categories-grid">
-            {#each Object.entries(categoryLabels) as [category, label]}
-              <div class="profile-category-row">
-                <span class="profile-category-label">{label}</span>
+            {#each categoryOrder as category}
+              {#if categoryLabels[category]}
+                <div class="profile-category-row">
+                  <div class="profile-category-label-group">
+                    <span class="profile-category-label">{categoryLabels[category]}</span>
+                  <button
+                    class="profile-guidance-btn"
+                    aria-label="查看分类指导"
+                    aria-expanded={openGuidanceCategory === category}
+                    onmouseenter={(event) => showGuidance(category, event)}
+                    onmousemove={(event) => moveGuidance(category, event)}
+                    onmouseleave={() => hideGuidance(category)}
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.6" />
+                      <path d="M12 10.2v6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+                      <circle cx="12" cy="7.2" r="1.2" fill="currentColor" />
+                    </svg>
+                  </button>
+                </div>
                 <select class="profile-category-select" bind:value={taskCategories[category]}>
                   <option value="claude">Claude</option>
-                  <option value="codex">Codex</option>
-                  <option value="gemini">Gemini</option>
-                </select>
+                    <option value="codex">Codex</option>
+                    <option value="gemini">Gemini</option>
+                  </select>
               </div>
+              {/if}
             {/each}
           </div>
         </div>
+
+        {#if guidancePopover && categoryGuidance[guidancePopover.category]}
+          <div
+            class="profile-guidance-popover"
+            style={`top:${guidancePopover.top}px; left:${guidancePopover.left}px; width:${guidancePopover.width}px;`}
+          >
+            <div class="profile-guidance-header">
+              <div class="profile-guidance-title">
+                {categoryGuidance[guidancePopover.category].displayName}
+                <span class="profile-guidance-id">({guidancePopover.category})</span>
+              </div>
+              <div class="profile-guidance-badges">
+                <span class="profile-badge priority-{categoryGuidance[guidancePopover.category].priority}">
+                  优先级: {categoryGuidance[guidancePopover.category].priority}
+                </span>
+                <span class="profile-badge risk-{categoryGuidance[guidancePopover.category].riskLevel}">
+                  风险: {categoryGuidance[guidancePopover.category].riskLevel}
+                </span>
+              </div>
+            </div>
+            <div class="profile-guidance-desc">{categoryGuidance[guidancePopover.category].description}</div>
+            <div class="profile-guidance-columns">
+              <div class="profile-guidance-block">
+                <div class="profile-guidance-label">专注领域</div>
+                <ul class="profile-guidance-listing">
+                  {#each categoryGuidance[guidancePopover.category].guidance.focus as item}
+                    <li>{item}</li>
+                  {/each}
+                </ul>
+              </div>
+              <div class="profile-guidance-block">
+                <div class="profile-guidance-label">行为约束</div>
+                <ul class="profile-guidance-listing">
+                  {#each categoryGuidance[guidancePopover.category].guidance.constraints as item}
+                    <li>{item}</li>
+                  {/each}
+                </ul>
+              </div>
+            </div>
+          </div>
+        {/if}
 
         <!-- 全局用户规则 -->
         <div class="settings-section">
@@ -1661,7 +1620,7 @@
           </div>
         </div>
         <div class="profile-save-footer">
-          <div class="profile-save-hint">保存将同时影响 Worker 画像、任务分类映射与全局用户规则</div>
+          <div class="profile-save-hint">保存将同时影响 Worker 分工与全局用户规则</div>
           <div class="profile-save-actions">
             <button
               class="settings-btn secondary"
@@ -2656,6 +2615,7 @@
     outline: none;
     transition: border-color var(--transition-fast);
   }
+  .user-rules-textarea { resize: none; }
 
   .user-rules-textarea {
     min-height: 140px;
@@ -2675,9 +2635,34 @@
   .profile-tags-empty { font-size: var(--text-sm); color: var(--foreground-muted); font-style: italic; }
 
   .profile-categories-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--space-2); margin-top: var(--space-3); }
-  .profile-category-row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); height: var(--btn-height-md); padding: 0 var(--space-3); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+  .profile-category-row { position: relative; display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); height: var(--btn-height-md); padding: 0 var(--space-3); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+  .profile-category-label-group { display: flex; align-items: center; gap: var(--space-2); min-width: 0; flex: 1; }
   .profile-category-label { font-size: var(--text-sm); color: var(--foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
   .profile-category-select { height: var(--btn-height-xs); padding: 0 var(--space-2); font-size: var(--text-xs); background: var(--vscode-input-background, #3c3c3c); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--foreground); outline: none; }
+  .profile-guidance-btn { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: var(--radius-full); border: 1px solid var(--border); background: transparent; color: var(--foreground-muted); cursor: pointer; transition: all var(--transition-fast); }
+  .profile-guidance-btn:hover { background: var(--surface-hover); color: var(--foreground); }
+  .profile-guidance-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+  .profile-guidance-btn svg { width: 14px; height: 14px; }
+  .profile-guidance-popover { position: fixed; z-index: var(--z-modal); background: var(--vscode-editor-background, #1e1e1e); border: 1px solid var(--border); border-radius: var(--radius-md); padding: var(--space-4); box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35); display: flex; flex-direction: column; gap: var(--space-3); max-height: 70vh; overflow-y: auto; pointer-events: none; }
+  .profile-guidance-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2); }
+  .profile-guidance-title { font-size: var(--text-md); font-weight: var(--font-semibold); color: var(--foreground); }
+  .profile-guidance-id { font-size: var(--text-xs); color: var(--foreground-muted); margin-left: var(--space-2); }
+  .profile-guidance-badges { display: flex; gap: var(--space-2); }
+  .profile-badge { font-size: var(--text-xs); padding: 2px 8px; border-radius: var(--radius-full); background: var(--surface-3); color: var(--foreground); border: 1px solid var(--border); }
+  .profile-badge.priority-high { background: rgba(255, 153, 51, 0.15); border-color: rgba(255, 153, 51, 0.4); }
+  .profile-badge.priority-medium { background: rgba(88, 196, 255, 0.15); border-color: rgba(88, 196, 255, 0.4); }
+  .profile-badge.priority-low { background: rgba(120, 120, 120, 0.15); border-color: rgba(120, 120, 120, 0.4); }
+  .profile-badge.risk-high { background: rgba(255, 77, 79, 0.15); border-color: rgba(255, 77, 79, 0.4); }
+  .profile-badge.risk-medium { background: rgba(255, 204, 0, 0.15); border-color: rgba(255, 204, 0, 0.4); }
+  .profile-badge.risk-low { background: rgba(52, 199, 89, 0.15); border-color: rgba(52, 199, 89, 0.4); }
+  .profile-guidance-desc { font-size: var(--text-sm); color: var(--foreground-muted); }
+  .profile-guidance-columns { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
+  .profile-guidance-block { display: flex; flex-direction: column; gap: var(--space-2); }
+  .profile-guidance-label { font-size: var(--text-sm); font-weight: var(--font-semibold); color: var(--foreground); }
+  .profile-guidance-listing { margin: 0; padding-left: var(--space-4); color: var(--foreground); font-size: var(--text-sm); }
+  @media (max-width: 720px) {
+    .profile-guidance-columns { grid-template-columns: 1fr; }
+  }
   .profile-save-footer {
     display: flex;
     align-items: center;

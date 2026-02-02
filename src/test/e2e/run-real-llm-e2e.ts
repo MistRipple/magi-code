@@ -21,15 +21,6 @@ Module._resolveFilename = function(request: string, parent: any, isMain: boolean
   return originalResolveFilename.call(this, request, parent, isMain, options);
 };
 
-// 同时保留旧的 require 拦截作为备用
-const originalRequire = Module.prototype.require;
-Module.prototype.require = function(id: string) {
-  if (id === 'vscode') {
-    return vscodeMock;
-  }
-  return originalRequire.apply(this, arguments);
-};
-
 // 预先将 mock 放入缓存
 try {
   require.cache['vscode'] = {

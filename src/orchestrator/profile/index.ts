@@ -1,19 +1,14 @@
 /**
- * Worker Profile System - 模块导出
+ * Worker Profile System - module exports
  */
 
-// 类型导出
 export * from './types';
 
-// 默认配置导出
-export {
-  DEFAULT_CLAUDE_PROFILE,
-  DEFAULT_CODEX_PROFILE,
-  DEFAULT_GEMINI_PROFILE,
-  DEFAULT_CATEGORIES_CONFIG,
-} from './defaults';
+export { WORKER_PERSONAS, CATEGORY_DEFINITIONS, CATEGORY_RULES, DEFAULT_ASSIGNMENTS, WORKER_ASSIGNMENTS_VERSION } from './builtin';
 
-// 核心类导出
 export { ProfileLoader } from './profile-loader';
 export { GuidanceInjector } from './guidance-injector';
-export { ProfileStorage, StoredProfileConfig } from './profile-storage';
+export { PromptBuilder } from './prompt-builder';
+export { CategoryResolver } from './category-resolver';
+export { AssignmentResolver } from './assignment-resolver';
+export { WorkerAssignmentLoader, WorkerAssignmentStorage } from './worker-assignments';

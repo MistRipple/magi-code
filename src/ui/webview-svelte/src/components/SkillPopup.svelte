@@ -4,8 +4,7 @@
   import { MessageCategory } from '../../../../protocol/message-protocol';
   import Icon from './Icon.svelte';
   import { ensureArray, generateId } from '../lib/utils';
-  import { addPendingRequest } from '../stores/messages.svelte';
-  import { addThreadMessage } from '../stores/messages.svelte';
+  // 消息统一走 MessageHub，下发由后端负责
 
   interface InstructionSkill {
     name: string;
@@ -65,22 +64,7 @@
   function applySkill() {
     if (!selectedSkill || !isInvocable) return;
 
-    const content = argsInput.trim()
-      ? `使用 Skill: ${selectedSkill.name}\n${argsInput.trim()}`
-      : `使用 Skill: ${selectedSkill.name}`;
-
-    addThreadMessage({
-      id: generateId(),
-      role: 'user',
-      source: 'orchestrator',
-      content,
-      timestamp: Date.now(),
-      isStreaming: false,
-      isComplete: true,
-    });
-
     const requestId = generateId();
-    addPendingRequest(requestId);
     vscode.postMessage({
       type: 'applyInstructionSkill',
       skillName: selectedSkill.name,

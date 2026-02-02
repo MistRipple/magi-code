@@ -30,7 +30,11 @@ import {
   MessageMetadata,
   DataMessageType,
   NotifyLevel,
+  ControlMessageType,
   createStandardMessage,
+  createTextMessage,
+  createStreamingMessage,
+  createErrorMessage,
 } from '../protocol/message-protocol';
 import { ADAPTER_EVENTS, PROCESSING_EVENTS, WEBVIEW_MESSAGE_TYPES } from '../protocol/event-names';
 import { UnifiedSessionManager } from '../session';
@@ -43,7 +47,7 @@ import { IAdapterFactory } from '../adapters/adapter-factory-interface';
 import { LLMAdapterFactory } from '../llm/adapter-factory';
 import { MissionDrivenEngine } from '../orchestrator/core';
 import { MessageHub } from '../orchestrator/core/message-hub';
-import { ProfileStorage, StoredProfileConfig } from '../orchestrator/profile';
+import { WorkerAssignmentStorage, WORKER_ASSIGNMENTS_VERSION, CATEGORY_DEFINITIONS, CATEGORY_RULES } from '../orchestrator/profile';
 import { parseContentToBlocks } from '../utils/content-parser';
 import { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
 import { InstructionSkillDefinition } from '../tools/skills-manager';
@@ -65,6 +69,13 @@ import {
 } from '../orchestrator/mission';
 
 type WebviewMessagePriority = 'high' | 'normal';
+
+type OrchestratorExecutionResult = { success: boolean; error?: string };
+type OrchestratorQueueItem = {
+  prompt: string;
+  imagePaths: string[];
+  resolve: (result: OrchestratorExecutionResult) => void;
+};
 
 const HIGH_PRIORITY_MESSAGE_TYPES = new Set<ExtensionToWebviewMessage['type']>([
   'unifiedMessage',
@@ -155,6 +166,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   // 统一消息出口
   private messageHub: MessageHub;
+  private requestTimeouts: Map<string, NodeJS.Timeout> = new Map();
 
   // 适配器工厂（LLM 模式）
   private adapterFactory: IAdapterFactory;
@@ -192,7 +204,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   // 当前选择的 Worker（null 表示自动选择/智能编排）
   private selectedWorker: WorkerSlot | null = null;
-  private pendingRequestId: string | null = null;
   private recentRequestIds: Map<string, number> = new Map();
 
   // 模型连接状态缓存（避免频繁真实请求）
@@ -697,6 +708,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         sessionId: this.activeSessionId
       } as any);
       this.logMessageFlow('messageHub.standardMessage [SENT]', message);
+      this.resolveRequestTimeoutFromMessage(message);
     });
 
     this.messageHub.on('unified:update', (update) => {
@@ -715,6 +727,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         sessionId: this.activeSessionId
       } as any);
       this.logMessageFlow('messageHub.standardComplete [SENT]', message);
+      this.resolveRequestTimeoutFromMessage(message);
     });
 
     // ProcessingState 权威来源（同步 UI loading 状态）
@@ -726,6 +739,86 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         startedAt: state.startedAt,
       });
     });
+  }
+
+  private emitUserAndPlaceholder(requestId: string, prompt: string, imageCount: number): {
+    userMessageId: string;
+    placeholderMessageId: string;
+  } {
+    const traceId = this.messageHub.getTraceId();
+    const displayContent = imageCount > 0
+      ? `${prompt}${prompt ? '\n' : ''}[附件: ${imageCount} 张图片]`
+      : prompt;
+
+    const userMessage = createTextMessage(displayContent, 'orchestrator', 'orchestrator', traceId, {
+      metadata: {
+        role: 'user',
+        requestId,
+        sendingAnimation: true,
+      },
+    });
+
+    const placeholderMessage = createStreamingMessage('orchestrator', 'orchestrator', traceId, {
+      metadata: {
+        isPlaceholder: true,
+        placeholderState: 'pending',
+        requestId,
+        userMessageId: userMessage.id,
+      },
+    });
+
+    userMessage.metadata.placeholderMessageId = placeholderMessage.id;
+
+    this.messageHub.sendMessage(userMessage);
+    this.messageHub.sendMessage(placeholderMessage);
+
+    return { userMessageId: userMessage.id, placeholderMessageId: placeholderMessage.id };
+  }
+
+  private scheduleRequestTimeout(requestId: string): void {
+    this.clearRequestTimeout(requestId);
+    const timeout = setTimeout(() => {
+      if (!this.requestTimeouts.has(requestId)) {
+        return;
+      }
+      const traceId = this.messageHub.getTraceId();
+      const timeoutMessage = createErrorMessage(
+        '等待响应超时，请重试',
+        'orchestrator',
+        'orchestrator',
+        traceId,
+        {
+          metadata: {
+            requestId,
+          },
+        }
+      );
+      this.messageHub.sendMessage(timeoutMessage);
+      this.clearRequestTimeout(requestId);
+    }, 8000);
+    this.requestTimeouts.set(requestId, timeout);
+  }
+
+  private clearRequestTimeout(requestId: string): void {
+    const timeout = this.requestTimeouts.get(requestId);
+    if (timeout) {
+      clearTimeout(timeout);
+      this.requestTimeouts.delete(requestId);
+    }
+  }
+
+  private resolveRequestTimeoutFromMessage(message: StandardMessage): void {
+    const meta = message.metadata as Record<string, unknown> | undefined;
+    const requestId = meta?.requestId as string | undefined;
+    if (!requestId) {
+      return;
+    }
+    const isPlaceholder = Boolean(meta?.isPlaceholder);
+    const role = meta?.role as string | undefined;
+    if (isPlaceholder || role === 'user') {
+      return;
+    }
+    this.clearRequestTimeout(requestId);
   }
 
   private cacheMessageMeta(message: StandardMessage): void {
@@ -1042,15 +1135,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     globalEventBus.on('task:state_changed', () => this.sendStateUpdate());
     globalEventBus.on('task:started', (event) => {
       this.sendStateUpdate();
-
-      // 🔧 统一消息通道：phaseChanged 走 MessageHub
-      this.messageHub.phaseChange('started', true, event.taskId || '');
     });
     globalEventBus.on('task:completed', (event) => {
       this.sendStateUpdate();
-
-      // 🔧 统一消息通道：phaseChanged 走 MessageHub
-      this.messageHub.phaseChange('completed', false, event.taskId || '');
     });
     globalEventBus.on('task:failed', (event) => {
       this.sendStateUpdate();
@@ -1075,14 +1162,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         },
       });
 
-      // 🔧 统一消息通道：phaseChanged 走 MessageHub
-      this.messageHub.phaseChange('failed', false, event.taskId || '');
     });
     globalEventBus.on('task:cancelled', (event) => {
       this.sendStateUpdate();
-
-      // 🔧 统一消息通道：phaseChanged 走 MessageHub
-      this.messageHub.phaseChange('cancelled', false, event.taskId || '');
     });
     globalEventBus.on('execution:stats_updated', () => {
       this.sendExecutionStats();
@@ -1145,8 +1227,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     globalEventBus.on('worker:error', (event) => {
       const data = event.data as { worker: string; error: string };
-      // 通知 UI 显示错误
-      this.sendData('workerError', { worker: data.worker, error: data.error });
+      this.sendOrchestratorMessage({
+        content: `${data.worker || 'Worker'}: ${data.error || '发生错误'}`,
+        messageType: 'error',
+        metadata: { worker: data.worker },
+      });
     });
 
     globalEventBus.on('worker:session_event', (event) => {
@@ -1266,6 +1351,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         error: data.error,
         sessionId: this.activeSessionId,
       });
+      this.sendOrchestratorMessage({
+        content: data.error || '任务失败',
+        messageType: 'error',
+        metadata: { missionId: data.mission.id },
+      });
       this.sendStateUpdate();
       void this.tryResumePendingRecovery();
     });
@@ -1344,6 +1434,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         error: data.error,
         sessionId: this.activeSessionId,
       });
+      this.sendOrchestratorMessage({
+        content: data.error || '任务执行失败',
+        messageType: 'error',
+        metadata: { missionId: data.missionId },
+      });
       this.sendStateUpdate();
     });
 
@@ -1393,6 +1488,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         assignmentId: data.assignmentId,
         workerId: data.workerId,
         completedTodos: data.completedTodos,
+      });
+      this.messageHub.systemNotice(`Session 已恢复，继续执行 ${data.completedTodos} 个已完成的 Todo`, {
+        sessionId: data.sessionId,
+        worker: data.workerId,
       });
     });
 
@@ -1560,8 +1659,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.sendToast('任务已打断', 'info');
 
 
-      this.sendData('taskInterrupted', { message: '任务已打断' });
-
       this.sendOrchestratorMessage({
         content: '任务已打断，可在变更中查看已修改的文件，或选择继续执行。',
         messageType: 'text',
@@ -1714,18 +1811,22 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         logger.info('界面.任务.执行.请求', { promptLength: String((message as any).prompt || '').length, imageCount: (message as any).images?.length || 0, agent: (message as any).agent || 'orchestrator' }, LogCategory.UI);
         const execImages = (message as any).images || [];
         const execAgent = (message as any).agent as WorkerSlot | undefined;
-        if (!this.shouldProcessRequest((message as any).requestId)) {
+        const execRequestId = (message as any).requestId as string | undefined;
+        if (!this.shouldProcessRequest(execRequestId)) {
+          if (execRequestId) {
+            this.messageHub.taskRejected(execRequestId, '请求重复，已忽略');
+            this.messageHub.forceProcessingState(false);
+          }
           break;
         }
-        this.pendingRequestId = (message as any).requestId || null;
         try {
-          await this.executeTask((message as any).prompt, execAgent || undefined, execImages);
+          await this.executeTask((message as any).prompt, execAgent || undefined, execImages, execRequestId);
         } catch (error: any) {
           const errorMsg = error instanceof Error ? error.message : String(error);
-          if (this.pendingRequestId || (message as any).requestId) {
-            this.messageHub.taskRejected(this.pendingRequestId || (message as any).requestId, errorMsg);
+          if (execRequestId) {
+            this.messageHub.taskRejected(execRequestId, errorMsg);
+            this.messageHub.forceProcessingState(false);
           }
-          this.pendingRequestId = null;
           throw error;
         }
         break;
@@ -2055,23 +2156,28 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         await this.handleInstallSkill(message.skillId);
         break;
       case 'applyInstructionSkill':
-        if (!this.shouldProcessRequest((message as any).requestId)) {
+        const skillRequestId = (message as any).requestId as string | undefined;
+        if (!this.shouldProcessRequest(skillRequestId)) {
+          if (skillRequestId) {
+            this.messageHub.taskRejected(skillRequestId, '请求重复，已忽略');
+            this.messageHub.forceProcessingState(false);
+          }
           break;
         }
-        this.pendingRequestId = (message as any).requestId || null;
         try {
           await this.handleApplyInstructionSkill(
             (message as any).skillName,
             (message as any).args,
             (message as any).images || [],
-            (message as any).agent || undefined
+            (message as any).agent || undefined,
+            skillRequestId
           );
         } catch (error: any) {
           const errorMsg = error instanceof Error ? error.message : String(error);
-          if (this.pendingRequestId || (message as any).requestId) {
-            this.messageHub.taskRejected(this.pendingRequestId || (message as any).requestId, errorMsg);
+          if (skillRequestId) {
+            this.messageHub.taskRejected(skillRequestId, errorMsg);
+            this.messageHub.forceProcessingState(false);
           }
-          this.pendingRequestId = null;
           throw error;
         }
         break;
@@ -3981,7 +4087,7 @@ ${originalPrompt}
               setCompressorFallback(`模型不存在: ${modelConfig.model}`);
               return;
             }
-            statuses[name] = { status: 'invalid_model', model: undefined, error: `模型不存在: ${modelConfig.model}` };
+            statuses[name] = { status: 'invalid_model', model: modelLabel, error: `模型不存在: ${modelConfig.model}` };
           } else {
             statuses[name] = {
               status: 'available',
@@ -4005,7 +4111,7 @@ ${originalPrompt}
 
           statuses[name] = {
             status,
-            model: undefined,
+            model: modelLabel,
             error: result.error
           };
         }
@@ -4021,7 +4127,7 @@ ${originalPrompt}
           setCompressorFallback(error.message || '压缩模型连接失败');
           return;
         }
-        statuses[name] = { status: 'error', model: undefined, error: error.message };
+        statuses[name] = { status: 'error', model: modelLabel, error: error.message };
 
         logger.warn(`Model connection test failed: ${name}`, {
           error: error.message
@@ -4181,68 +4287,35 @@ ${originalPrompt}
 
   /** 发送画像配置到 UI */
   private async sendProfileConfig(): Promise<void> {
-    const storage = new ProfileStorage();
-    const storedConfig = storage.getConfig();
+    const assignments = WorkerAssignmentStorage.ensureDefaults();
+    const assignmentMap: Record<string, string> = {};
 
-    // 默认配置 - 与系统画像定义完全一致
-    const defaultWorkers: Record<string, any> = {
-      claude: {
-        role: '你是一个资深软件架构师，专注于系统设计、代码质量和可维护性。\n你的代码应该是清晰、可扩展、易于测试的。',
-        focus: ['优先考虑代码的可维护性和扩展性', '在修改前先分析影响范围和依赖关系', '对于跨模块修改，先确认接口契约', '保持代码风格一致性', '添加必要的类型定义和注释'],
-        constraints: ['不要进行不必要的重构', '避免引入新的依赖，除非必要', '大规模修改前先与编排者确认'],
-      },
-      codex: {
-        role: '你是一个高效的代码执行者，专注于快速、准确地完成具体任务。\n你的目标是用最少的代码变更解决问题。',
-        focus: ['精准定位问题，最小化修改范围', '快速实现，不过度设计', '确保修改不引入新问题', '添加必要的错误处理'],
-        constraints: ['不要进行架构级别的修改', '保持修改范围在任务描述内', '遇到需要架构决策的问题，反馈给编排者'],
-      },
-      gemini: {
-        role: '你是一个前端专家和文档专家，专注于用户界面和开发者体验。\n你的代码应该是美观、易用、可访问的。',
-        focus: ['关注用户体验和交互细节', '保持 UI 一致性和美观性', '确保响应式设计和可访问性', '编写清晰的文档和注释'],
-        constraints: ['不要修改后端 API 逻辑', '遵循已定义的接口契约', '样式修改保持设计系统一致性'],
-      },
-    };
+    for (const [worker, categories] of Object.entries(assignments.assignments)) {
+      for (const category of categories) {
+        assignmentMap[category] = worker;
+      }
+    }
 
-    const defaultCategories: Record<string, string> = {
-      architecture: 'claude',
-      bugfix: 'codex',
-      frontend: 'gemini',
-      implement: 'claude',
-      refactor: 'claude',
-      data_analysis: 'codex',
-      test: 'codex',
-      document: 'claude',
-      general: 'claude',
-    };
+    const categoryGuidance: Record<string, any> = {};
+    for (const [category, definition] of Object.entries(CATEGORY_DEFINITIONS)) {
+      categoryGuidance[category] = {
+        displayName: definition.displayName,
+        description: definition.description,
+        guidance: {
+          focus: definition.guidance?.focus || [],
+          constraints: definition.guidance?.constraints || [],
+        },
+        priority: definition.priority,
+        riskLevel: definition.riskLevel,
+      };
+    }
 
-    // 构建 UI 需要的格式，合并存储配置和默认配置
     const uiConfig: any = {
-      workers: { ...defaultWorkers },
-      categories: { ...defaultCategories },
-      configPath: ProfileStorage.getConfigDir(),
+      assignments: assignmentMap,
+      categoryGuidance,
+      categoryPriority: CATEGORY_RULES.categoryPriority,
+      configPath: WorkerAssignmentStorage.getConfigPath(),
     };
-
-    // 覆盖存储的 Worker 配置
-    if (storedConfig?.workers) {
-      for (const [workerType, workerConfig] of Object.entries(storedConfig.workers)) {
-        if (workerConfig) {
-          uiConfig.workers[workerType] = {
-            role: workerConfig.guidance?.role || defaultWorkers[workerType]?.role || '',
-            focus: workerConfig.guidance?.focus || defaultWorkers[workerType]?.focus || [],
-            constraints: workerConfig.guidance?.constraints || defaultWorkers[workerType]?.constraints || [],
-          };
-        }
-      }
-    }
-
-    // 覆盖存储的分类配置
-    if (storedConfig?.categories?.categories) {
-      for (const [category, categoryConfig] of Object.entries(storedConfig.categories.categories)) {
-        if (categoryConfig?.defaultWorker) {
-          uiConfig.categories[category] = categoryConfig.defaultWorker;
-        }
-      }
-    }
 
     try {
       const { LLMConfigLoader } = await import('../llm/config');
@@ -4256,64 +4329,27 @@ ${originalPrompt}
   }
 
   /** 保存画像配置 */
-  private async handleSaveProfileConfig(data: { workers: Record<string, any>; categories: Record<string, string>; userRules?: string }): Promise<void> {
+  private async handleSaveProfileConfig(data: { assignments: Record<string, string>; userRules?: string }): Promise<void> {
     try {
-      const storage = new ProfileStorage();
-
-      // 转换 UI 格式到存储格式
-      const config: StoredProfileConfig = {
-        workers: {},
-        categories: {
-          categories: {},
-          rules: {
-            categoryPriority: [
-              'architecture',
-              'debug',
-              'bugfix',
-              'refactor',
-              'data_analysis',
-              'backend',
-              'frontend',
-              'implement',
-              'test',
-              'review',
-              'document',
-              'general',
-            ],
-            defaultCategory: 'general',
-            riskMapping: { high: 'fullPath', medium: 'standardPath', low: 'lightPath' },
-          },
-        },
+      const workerAssignments: Record<WorkerSlot, string[]> = {
+        claude: [],
+        codex: [],
+        gemini: [],
       };
 
-      // 转换 Worker 配置
-      for (const [workerType, workerData] of Object.entries(data.workers)) {
-        if (workerData) {
-          config.workers[workerType as 'claude' | 'codex' | 'gemini'] = {
-            guidance: {
-              role: workerData.role || '',
-              focus: workerData.focus || [],
-              constraints: workerData.constraints || [],
-              outputPreferences: [],
-            },
-            profile: {
-              strengths: [],
-              weaknesses: [],
-            },
-          };
+      const assignmentMap = data.assignments || {};
+      for (const [category, worker] of Object.entries(assignmentMap)) {
+        const normalizedWorker = String(worker).toLowerCase() as WorkerSlot;
+        if (!['claude', 'codex', 'gemini'].includes(normalizedWorker)) {
+          throw new Error(`未知 Worker: ${worker}`);
         }
+        workerAssignments[normalizedWorker].push(category);
       }
 
-      // 转换分类配置
-      // 注意：keywords 是系统内置配置，不保存到用户配置文件中
-      for (const [category, worker] of Object.entries(data.categories)) {
-        if (!config.categories?.categories) continue;
-        (config.categories.categories as any)[category] = {
-          defaultWorker: worker,
-        };
-      }
-
-      await storage.saveConfig(config);
+      WorkerAssignmentStorage.save({
+        version: WORKER_ASSIGNMENTS_VERSION,
+        assignments: workerAssignments,
+      });
 
       try {
         const { LLMConfigLoader } = await import('../llm/config');
@@ -4337,7 +4373,7 @@ ${originalPrompt}
         this.sendToast(`画像重载失败: ${reloadMsg}`, 'warning');
       }
       await this.sendProfileConfig();
-      logger.info('界面.画像.配置.已保存', { path: ProfileStorage.getConfigDir() }, LogCategory.UI);
+      logger.info('界面.画像.配置.已保存', { path: WorkerAssignmentStorage.getConfigPath() }, LogCategory.UI);
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       this.sendData('profileConfigSaved', { success: false, error: errorMsg });
@@ -4348,8 +4384,8 @@ ${originalPrompt}
   /** 重置画像配置 */
   private async handleResetProfileConfig(): Promise<void> {
     try {
-      const storage = new ProfileStorage();
-      await storage.clearConfig();
+      const defaults = WorkerAssignmentStorage.buildDefault();
+      WorkerAssignmentStorage.save(defaults);
       try {
         const { LLMConfigLoader } = await import('../llm/config');
         LLMConfigLoader.updateUserRules({ enabled: false, content: '' });
@@ -4395,7 +4431,7 @@ ${originalPrompt}
   private recoveryConfirmationResolver: ((decision: 'retry' | 'rollback' | 'continue') => void) | null = null;
   private pendingRecoveryRetry = false;
   private pendingRecoveryPrompt: string | null = null;
-  private pendingExecutionQueue: Array<{ prompt: string; imagePaths: string[] }> = [];
+  private pendingExecutionQueue: OrchestratorQueueItem[] = [];
   private orchestratorQueueRunning = false;
 
   /** 处理恢复确认 */
@@ -4444,12 +4480,18 @@ ${originalPrompt}
     await this.resumeInterruptedTask(prompt);
   }
 
-  private async enqueueOrchestratorExecution(prompt: string, imagePaths: string[]): Promise<void> {
-    this.pendingExecutionQueue.push({ prompt, imagePaths });
-    if (this.orchestratorQueueRunning) {
-      return;
-    }
-    this.orchestratorQueueRunning = true;
+  private enqueueOrchestratorExecution(prompt: string, imagePaths: string[]): Promise<OrchestratorExecutionResult> {
+    return new Promise((resolve) => {
+      this.pendingExecutionQueue.push({ prompt, imagePaths, resolve });
+      if (this.orchestratorQueueRunning) {
+        return;
+      }
+      this.orchestratorQueueRunning = true;
+      void this.processOrchestratorQueue();
+    });
+  }
+
+  private async processOrchestratorQueue(): Promise<void> {
     try {
       while (this.pendingExecutionQueue.length > 0) {
         while (this.orchestratorEngine.running) {
@@ -4460,7 +4502,13 @@ ${originalPrompt}
           continue;
         }
         logger.info('界面.编排器.排队执行_触发', { queueRemaining: this.pendingExecutionQueue.length }, LogCategory.UI);
-        await this.executeWithOrchestrator(next.prompt, next.imagePaths);
+        try {
+          const result = await this.executeWithOrchestrator(next.prompt, next.imagePaths);
+          next.resolve(result);
+        } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : String(error);
+          next.resolve({ success: false, error: errorMsg });
+        }
       }
     } finally {
       this.orchestratorQueueRunning = false;
@@ -4704,73 +4752,149 @@ ${originalPrompt}
   }
 
   /** 执行任务 */
-  private async executeTask(prompt: string, forceWorker?: WorkerSlot, images?: Array<{dataUrl: string}>): Promise<void> {
+  private async executeTask(
+    prompt: string,
+    forceWorker?: WorkerSlot,
+    images?: Array<{ dataUrl: string }>,
+    requestId?: string,
+    displayPrompt?: string
+  ): Promise<void> {
     logger.info('界面.任务.执行.开始', { promptLength: prompt.length, imageCount: images?.length || 0, forceWorker: forceWorker || undefined }, LogCategory.UI);
     const maxPromptLength = 10000;
-    if (prompt.length > maxPromptLength) {
-      this.sendToast(`输入内容过长（${prompt.length} 字符），请控制在 ${maxPromptLength} 字符以内`, 'warning');
-      return;
-    }
+    const requestKey = requestId || `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    let started = false;
+    let rejected = false;
+    let success = false;
+    let failureReason: string | undefined;
 
-    // 🔧 统一消息通道：taskAccepted 走 MessageHub
-    if (this.pendingRequestId) {
-      this.messageHub.taskAccepted(this.pendingRequestId);
-      this.pendingRequestId = null;
-    }
-
-    if (!this.activeSessionId) {
-      const currentSession = this.sessionManager.getCurrentSession();
-      this.activeSessionId = currentSession?.id || null;
-      logger.info('界面.会话.当前.设置', { sessionId: this.activeSessionId }, LogCategory.UI);
-    }
-
-    // 如果有图片，保存到临时文件
-    const imagePaths: string[] = [];
-    if (images && images.length > 0) {
-      const tmpDir = path.join(os.tmpdir(), 'multicli-images');
-      if (!fs.existsSync(tmpDir)) {
-        fs.mkdirSync(tmpDir, { recursive: true });
+    const rejectRequest = (reason: string) => {
+      rejected = true;
+      failureReason = reason;
+      if (requestKey) {
+        this.messageHub.taskRejected(requestKey, reason);
+        const traceId = this.messageHub.getTraceId();
+        const errorMessage = createErrorMessage(
+          reason,
+          'orchestrator',
+          'orchestrator',
+          traceId,
+          { metadata: { requestId: requestKey } }
+        );
+        this.messageHub.sendMessage(errorMessage);
       }
-      for (let i = 0; i < images.length; i++) {
-        const img = images[i];
-        const matches = img.dataUrl.match(/^data:image\/(\w+);base64,(.+)$/);
-        if (matches) {
-          const ext = matches[1] === 'jpeg' ? 'jpg' : matches[1];
-          const base64Data = matches[2];
-          const filePath = path.join(tmpDir, `image_${Date.now()}_${i}.${ext}`);
-          fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
-          imagePaths.push(filePath);
-          logger.info('界面.图片.已保存', { path: filePath }, LogCategory.UI);
+      this.messageHub.forceProcessingState(false);
+      this.clearRequestTimeout(requestKey);
+    };
+
+    try {
+      this.messageHub.setRequestContext(requestKey);
+
+      if (prompt.length > maxPromptLength) {
+        this.sendToast(`输入内容过长（${prompt.length} 字符），请控制在 ${maxPromptLength} 字符以内`, 'warning');
+        rejectRequest(`输入内容过长（${prompt.length} 字符）`);
+        return;
+      }
+
+      if (!this.activeSessionId) {
+        const currentSession = this.sessionManager.getCurrentSession();
+        this.activeSessionId = currentSession?.id || null;
+        logger.info('界面.会话.当前.设置', { sessionId: this.activeSessionId }, LogCategory.UI);
+      }
+
+      // 统一消息通道：由后端发送用户消息与占位消息
+      const promptForDisplay = displayPrompt?.trim() || prompt;
+      this.emitUserAndPlaceholder(requestKey, promptForDisplay, images?.length || 0);
+      this.scheduleRequestTimeout(requestKey);
+
+      // 如果有图片，保存到临时文件
+      const imagePaths: string[] = [];
+      if (images && images.length > 0) {
+        const tmpDir = path.join(os.tmpdir(), 'multicli-images');
+        if (!fs.existsSync(tmpDir)) {
+          fs.mkdirSync(tmpDir, { recursive: true });
+        }
+        for (let i = 0; i < images.length; i++) {
+          const img = images[i];
+          const matches = img.dataUrl.match(/^data:image\/(\w+);base64,(.+)$/);
+          if (matches) {
+            const ext = matches[1] === 'jpeg' ? 'jpg' : matches[1];
+            const base64Data = matches[2];
+            const filePath = path.join(tmpDir, `image_${Date.now()}_${i}.${ext}`);
+            fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
+            imagePaths.push(filePath);
+            logger.info('界面.图片.已保存', { path: filePath }, LogCategory.UI);
+          }
         }
       }
-    }
 
-    // 判断执行模式：智能编排 vs 直接执行
-    const useIntelligentMode = !forceWorker && !this.selectedWorker;
+      // 激活处理状态并确认请求
+      this.messageHub.forceProcessingState(true);
+      started = true;
+      if (requestKey) {
+        this.messageHub.taskAccepted(requestKey);
+      }
+      this.messageHub.sendControl(ControlMessageType.TASK_STARTED, {
+        requestId: requestKey,
+        timestamp: Date.now(),
+      });
 
-    const resolvedSkill = this.resolveInstructionSkillPrompt(prompt);
-    const effectivePrompt = resolvedSkill.prompt;
+      // 判断执行模式：智能编排 vs 直接执行
+      const useIntelligentMode = !forceWorker && !this.selectedWorker;
 
-    this.sessionManager.addMessage('user', prompt);
-    void this.orchestratorEngine.recordContextMessage('user', prompt, this.activeSessionId || undefined);
-    this.sendStateUpdate();
+      const resolvedSkill = this.resolveInstructionSkillPrompt(prompt);
+      const effectivePrompt = resolvedSkill.prompt;
 
-    const orchestrationCommand = this.parseOrchestrationCommand(prompt);
-    if (orchestrationCommand?.type === 'plan') {
-      await this.executePlanOnly(orchestrationCommand.payload, imagePaths);
-      return;
-    }
-    if (orchestrationCommand?.type === 'start-work') {
-      await this.executeStartWork(orchestrationCommand.payload);
-      return;
-    }
+      this.sessionManager.addMessage('user', prompt);
+      void this.orchestratorEngine.recordContextMessage('user', prompt, this.activeSessionId || undefined);
+      this.sendStateUpdate();
 
-    if (useIntelligentMode) {
-      // 智能编排模式：统一串行化，避免引擎并发
-      await this.enqueueOrchestratorExecution(effectivePrompt, imagePaths);
-    } else {
-      // 直接执行模式：指定 Worker 直接执行
-      await this.executeWithDirectWorker(effectivePrompt, forceWorker || this.selectedWorker!, imagePaths);
+      const orchestrationCommand = this.parseOrchestrationCommand(prompt);
+      if (orchestrationCommand?.type === 'plan') {
+        await this.executePlanOnly(orchestrationCommand.payload, imagePaths);
+        success = true;
+        return;
+      }
+      if (orchestrationCommand?.type === 'start-work') {
+        await this.executeStartWork(orchestrationCommand.payload);
+        success = true;
+        return;
+      }
+
+      if (useIntelligentMode) {
+        // 智能编排模式：统一串行化，避免引擎并发
+        const result = await this.enqueueOrchestratorExecution(effectivePrompt, imagePaths);
+        success = result.success;
+        failureReason = result.error;
+      } else {
+        // 直接执行模式：指定 Worker 直接执行
+        const result = await this.executeWithDirectWorker(effectivePrompt, forceWorker || this.selectedWorker!, imagePaths);
+        success = result.success;
+        failureReason = result.error;
+      }
+    } catch (error) {
+      failureReason = error instanceof Error ? error.message : String(error);
+      success = false;
+    } finally {
+      if (started) {
+        if (success) {
+          this.messageHub.sendControl(ControlMessageType.TASK_COMPLETED, {
+            requestId: requestKey,
+            timestamp: Date.now(),
+          });
+        } else {
+          this.messageHub.sendControl(ControlMessageType.TASK_FAILED, {
+            requestId: requestKey,
+            error: failureReason || '执行失败',
+            timestamp: Date.now(),
+          });
+        }
+        this.messageHub.forceProcessingState(false);
+      } else if (!rejected && failureReason && requestKey) {
+        this.messageHub.taskRejected(requestKey, failureReason);
+        this.messageHub.forceProcessingState(false);
+      }
+      this.messageHub.setRequestContext(undefined);
+      this.clearRequestTimeout(requestKey);
     }
   }
 
@@ -4811,7 +4935,8 @@ ${originalPrompt}
     skillName: string,
     args?: string,
     images?: Array<{ dataUrl: string }>,
-    agent?: WorkerSlot
+    agent?: WorkerSlot,
+    requestId?: string
   ): Promise<void> {
     try {
       const { LLMConfigLoader } = await import('../llm/config');
@@ -4824,7 +4949,10 @@ ${originalPrompt}
       }
 
       const prompt = buildInstructionSkillPrompt(skill, args || '');
-      await this.executeTask(prompt, agent || undefined, images || []);
+      const displayPrompt = args && args.trim()
+        ? `使用 Skill: ${skill.name}\n${args.trim()}`
+        : `使用 Skill: ${skill.name}`;
+      await this.executeTask(prompt, agent || undefined, images || [], requestId, displayPrompt);
     } catch (error: any) {
       logger.error('应用 Skill 失败', { skillName, error: error.message }, LogCategory.TOOLS);
       this.sendToast(`应用 Skill 失败: ${error.message}`, 'error');
@@ -4952,12 +5080,14 @@ ${originalPrompt}
   }
 
   /** 编排模式执行 */
-  private async executeWithOrchestrator(prompt: string, imagePaths: string[]): Promise<void> {
+  private async executeWithOrchestrator(prompt: string, imagePaths: string[]): Promise<OrchestratorExecutionResult> {
     logger.info('界面.执行.模式.编排', undefined, LogCategory.UI);
 
     // 🔧 初始分析消息已由 MissionDrivenEngine.sendPhaseMessage 统一发送
     // 不再在这里重复发送，避免用户看到两条类似的"正在分析"消息
 
+    let errorMsg: string | undefined;
+    let success = false;
     try {
       // 调用智能编排器
       // 注意：executeWithTaskContext 内部通过 streamToUI: true 已经将 LLM 响应流式发送到前端
@@ -4976,21 +5106,27 @@ ${originalPrompt}
       // 🔧 移除重复的 sendOrchestratorMessage 调用
       // LLM 响应已通过流式传输发送到前端，无需再次发送
 
+      success = true;
     } catch (error) {
       logger.error('界面.执行.智能.失败', error, LogCategory.UI);
-      const errorMsg = error instanceof Error ? error.message : String(error);
+      errorMsg = error instanceof Error ? error.message : String(error);
 
       this.sendOrchestratorMessage({
         content: errorMsg,
         messageType: 'error',
       });
+      success = false;
     }
 
     this.sendStateUpdate();
+    if (!success) {
+      return { success: false, error: errorMsg };
+    }
+    return { success: true };
   }
 
   /** 直接 Worker 执行模式 */
-  private async executeWithDirectWorker(prompt: string, targetWorker: WorkerSlot, imagePaths: string[]): Promise<void> {
+  private async executeWithDirectWorker(prompt: string, targetWorker: WorkerSlot, imagePaths: string[]): Promise<OrchestratorExecutionResult> {
     logger.info('界面.执行.模式.直接', { agent: targetWorker }, LogCategory.UI);
 
     // 立即发送"正在处理"消息
@@ -5005,6 +5141,8 @@ ${originalPrompt}
     await taskManager.startTask(task.id);
     this.sendStateUpdate();
 
+    let errorMsg: string | undefined;
+    let success = false;
     try {
       logger.info('界面.执行.直接.请求', { worker: targetWorker }, LogCategory.UI);
       const response = await this.adapterFactory.sendMessage(targetWorker, prompt, imagePaths);
@@ -5024,16 +5162,22 @@ ${originalPrompt}
       }
 
       if (response.error) {
+        errorMsg = response.error;
         await taskManager.failTask(task.id, response.error);
-        this.sendData('workerError', { worker: targetWorker, error: response.error });
+        this.sendOrchestratorMessage({
+          content: `${targetWorker.toUpperCase()}: ${response.error}`,
+          messageType: 'error',
+          metadata: { worker: targetWorker },
+        });
       } else {
         await taskManager.completeTask(task.id);
         this.saveMessageToSession(prompt, response.content || '', targetWorker, 'worker');
+        success = true;
       }
 
     } catch (error) {
       logger.error('界面.执行.直接.失败', error, LogCategory.UI);
-      const errorMsg = error instanceof Error ? error.message : String(error);
+      errorMsg = error instanceof Error ? error.message : String(error);
       await taskManager.failTask(task.id, errorMsg);
       const executionStats = this.orchestratorEngine.getExecutionStats();
       if (executionStats) {
@@ -5046,10 +5190,18 @@ ${originalPrompt}
           error: errorMsg,
         });
       }
-      this.sendData('workerError', { worker: targetWorker, error: errorMsg });
+      this.sendOrchestratorMessage({
+        content: `${targetWorker.toUpperCase()}: ${errorMsg}`,
+        messageType: 'error',
+        metadata: { worker: targetWorker },
+      });
     }
 
     this.sendStateUpdate();
+    if (!success) {
+      return { success: false, error: errorMsg };
+    }
+    return { success: true };
   }
 
   /** 发送状态更新到 Webview */

@@ -517,6 +517,24 @@ export interface MessageMetadata {
   intent?: string;
   /** 决策方式（llm/rule 等） */
   decision?: string;
+  /** 请求 ID（用于占位/响应绑定） */
+  requestId?: string;
+  /** 会话 ID（用于跨会话标记） */
+  sessionId?: string;
+  /** 消息角色（user/assistant/system） */
+  role?: 'user' | 'assistant' | 'system';
+  /** 是否为占位消息 */
+  isPlaceholder?: boolean;
+  /** 占位消息状态 */
+  placeholderState?: 'pending' | 'received' | 'thinking' | 'connecting';
+  /** 用户消息 ID（占位关联） */
+  userMessageId?: string;
+  /** 占位消息 ID（占位关联） */
+  placeholderMessageId?: string;
+  /** 发送动画标记 */
+  sendingAnimation?: boolean;
+  /** 曾为占位消息（用于过渡动画） */
+  wasPlaceholder?: boolean;
 }
 
 // ============================================================================

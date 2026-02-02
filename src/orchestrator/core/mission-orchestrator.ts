@@ -14,6 +14,7 @@ import path from 'path';
 import { WorkerSlot } from '../../types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector, TaskStructuredInfo } from '../profile/guidance-injector';
+import { AssignmentResolver } from '../profile/assignment-resolver';
 import { ProfileAwareReviewer } from '../review/profile-aware-reviewer';
 import {
   VerificationRunner,
@@ -225,6 +226,8 @@ export class MissionOrchestrator extends EventEmitter {
   private planningCache: Map<string, { mission: Mission; timestamp: number }> = new Map();
   private readonly CACHE_TTL_MS = 5 * 60 * 1000; // 5 分钟缓存过期
 
+  private assignmentResolver: AssignmentResolver;
+
   // 执行相关属性（从 MissionExecutor 合并）
   private workers: Map<WorkerSlot, AutonomousWorker> = new Map();
   private todoManager?: PlanTodoManager;
@@ -242,6 +245,7 @@ export class MissionOrchestrator extends EventEmitter {
     this.contractManager = new ContractManager();
     this.assignmentManager = new AssignmentManager(profileLoader, guidanceInjector);
     this.reviewer = new ProfileAwareReviewer(profileLoader);
+    this.assignmentResolver = new AssignmentResolver(profileLoader.getAssignmentLoader());
 
     if (workspaceRoot) {
       this.verificationRunner = new VerificationRunner(workspaceRoot);
@@ -600,28 +604,29 @@ export class MissionOrchestrator extends EventEmitter {
     const participants: WorkerSlot[] = [];
     const connectedWorkers = this.getConnectedWorkers(allProfiles);
 
-    // 如果指定了首选 Worker
     if (options?.preferredWorkers && options.preferredWorkers.length > 0) {
-      for (const worker of options.preferredWorkers) {
-        if (!allProfiles.has(worker)) {
-          throw new Error(`指定的 Worker 未配置: ${worker}`);
-        }
-        if (!connectedWorkers.has(worker)) {
-          const fallback = Array.from(connectedWorkers).find(candidate => candidate !== worker);
-          if (!fallback) {
-            throw new Error(`指定的 Worker 不可用: ${worker}`);
-          }
-          logger.warn('编排器.参与者.降级Worker_不可用', {
-            from: worker,
-            to: fallback,
-          }, LogCategory.ORCHESTRATOR);
-          participants.push(fallback);
-          continue;
-        }
-        participants.push(worker);
+      throw new Error('禁止指定 Worker：参与者必须由分类归属唯一决定');
+    }
+
+    const categories = options?.categories && options.categories.length > 0
+      ? options.categories
+      : options?.category
+        ? [options.category]
+        : [];
+
+    if (categories.length === 0) {
+      throw new Error('缺少任务分类，无法选择参与者');
+    }
+
+    for (const category of categories) {
+      if (!this.profileLoader.getCategory(category)) {
+        throw new Error(`未知分类: ${category}`);
       }
-    } else {
-      throw new Error('未指定 Worker：当前流程要求由编排者 LLM 输出 Worker 列表');
+      const worker = this.assignmentResolver.resolveWorker(category);
+      if (!connectedWorkers.has(worker)) {
+        throw new Error(`分类 "${category}" 归属 ${worker}，但当前不可用`);
+      }
+      participants.push(worker);
     }
 
     const uniqueParticipants = Array.from(new Set(participants));
@@ -661,46 +666,6 @@ export class MissionOrchestrator extends EventEmitter {
     } catch {
       return false;
     }
-  }
-
-  private resolveAvailableWorkerForCategory(
-    category: string,
-    preferredWorker: WorkerSlot,
-    profiles: Map<WorkerSlot, import('../profile/types').WorkerProfile>,
-    connectedWorkers: Set<WorkerSlot>
-  ): WorkerSlot {
-    if (connectedWorkers.has(preferredWorker)) {
-      return preferredWorker;
-    }
-
-    const candidates = Array.from(profiles.entries())
-      .filter(([worker, profile]) =>
-        worker !== preferredWorker
-        && connectedWorkers.has(worker)
-        && profile.preferences.preferredCategories.includes(category)
-      )
-      .map(([worker]) => worker);
-
-    if (candidates.length > 0) {
-      logger.warn('编排器.参与者.降级Worker', {
-        category,
-        from: preferredWorker,
-        to: candidates[0],
-      }, LogCategory.ORCHESTRATOR);
-      return candidates[0];
-    }
-
-    const anyConnected = Array.from(connectedWorkers);
-    if (anyConnected.length === 0) {
-      throw new Error(`无可用 Worker（分类: ${category}）`);
-    }
-
-    logger.warn('编排器.参与者.降级Worker_无偏好匹配', {
-      category,
-      from: preferredWorker,
-      to: anyConnected[0],
-    }, LogCategory.ORCHESTRATOR);
-    return anyConnected[0];
   }
 
   /**

@@ -73,7 +73,7 @@
     {:else}
       {#if tasks.length > 0}
         <div class="tasks-list">
-          {#each tasks as task (task.id || task)}
+          {#each tasks as task (task.id)}
             <div class="task-item" class:completed={task.status === 'completed'} class:failed={task.status === 'failed'} class:cancelled={task.status === 'cancelled'}>
               <div class="task-status">
                 {#if task.status === 'running'}
@@ -124,7 +124,7 @@
       {#if missionPlan && missionPlan.assignments.length > 0}
         <div class="section-title">Worker Todo</div>
         <div class="assignment-list">
-          {#each (ensureArray(missionPlan.assignments) as any[]) as assignment (assignment.id || assignment)}
+          {#each (ensureArray(missionPlan.assignments) as any[]) as assignment (assignment.id)}
             {@const assignmentSessions = workerSessionList.filter((session) => session.assignmentId === assignment.id)}
             <div class="assignment-card">
               <div class="assignment-header">
@@ -138,7 +138,7 @@
               </div>
               {#if assignmentSessions.length > 0}
                 <div class="assignment-sessions">
-                  {#each assignmentSessions as session (session.sessionId || session)}
+                  {#each assignmentSessions as session (session.sessionId)}
                     <div class="session-chip" class:resumed={session.isResumed}>
                       <span class="session-label">Session {session.sessionId}</span>
                       {#if session.isResumed}
@@ -156,7 +156,7 @@
               {/if}
               {#if ensureArray(assignment.todos).length > 0}
                 <div class="todo-list">
-                  {#each (ensureArray(assignment.todos) as any[]) as todo (todo.id || todo)}
+                  {#each (ensureArray(assignment.todos) as any[]) as todo (todo.id)}
                     <div class="todo-item" class:completed={todo.status === 'completed'} class:failed={todo.status === 'failed'}>
                       <div class="todo-main">
                         <span class="todo-status status-{todo.status}">

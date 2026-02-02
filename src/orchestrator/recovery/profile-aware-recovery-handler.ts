@@ -3,7 +3,7 @@
  *
  * 核心功能：
  * - 基于 Worker 画像智能选择恢复策略
- * - 弱项相关失败 → 换 Worker 重试
+ * - 弱项相关失败 → 需要人工介入或调整归属
  * - 非弱项失败 → 原有恢复逻辑
  */
 
@@ -21,7 +21,6 @@ import {
  */
 export type RecoveryStrategyType =
   | 'retry_same_worker'      // 同 Worker 重试
-  | 'switch_worker'          // 换 Worker 重试
   | 'simplify_task'          // 简化任务
   | 'request_human_help'     // 请求人工介入
   | 'skip_task';             // 跳过任务
@@ -98,21 +97,13 @@ export class ProfileAwareRecoveryHandler {
     failureAnalysis: FailureAnalysis,
     retryCount: number
   ): RecoveryDecision {
-    // 1. 如果与弱项相关，优先换 Worker
+    // 1. 如果与弱项相关，要求人工介入
     if (failureAnalysis.relatedToWeakness) {
-      const alternativeWorker = this.findAlternativeWorker(
-        assignment,
-        failureAnalysis.matchedWeaknesses
-      );
-
-      if (alternativeWorker) {
-        return {
-          strategy: 'switch_worker',
-          reason: `任务涉及 ${assignment.workerId} 的弱项 (${failureAnalysis.matchedWeaknesses.join(', ')})，建议换 ${alternativeWorker} 重试`,
-          alternativeWorker,
-          confidence: 0.8,
-        };
-      }
+      return {
+        strategy: 'request_human_help',
+        reason: `任务涉及 ${assignment.workerId} 的弱项 (${failureAnalysis.matchedWeaknesses.join(', ')})，需要调整归属或人工介入`,
+        confidence: 0.8,
+      };
     }
 
     // 2. 根据错误类型和重试次数决定策略
@@ -136,16 +127,12 @@ export class ProfileAwareRecoveryHandler {
         };
       }
 
-      // 无法简化，换 Worker
-      const alternativeWorker = this.findAlternativeWorker(assignment, []);
-      if (alternativeWorker) {
-        return {
-          strategy: 'switch_worker',
-          reason: '二次失败，尝试换 Worker',
-          alternativeWorker,
-          confidence: 0.5,
-        };
-      }
+      // 无法简化，人工介入
+      return {
+        strategy: 'request_human_help',
+        reason: '二次失败且无法简化，需人工介入',
+        confidence: 0.6,
+      };
     }
 
     // 3. 多次失败或不可恢复，请求人工介入或跳过
@@ -169,7 +156,7 @@ export class ProfileAwareRecoveryHandler {
    */
   private findWeaknessMatches(text: string, profile: WorkerProfile): string[] {
     const textLower = text.toLowerCase();
-    return profile.profile.weaknesses.filter(w =>
+    return profile.persona.weaknesses.filter(w =>
       textLower.includes(w.toLowerCase())
     );
   }
@@ -229,42 +216,6 @@ export class ProfileAwareRecoveryHandler {
   }
 
   /**
-   * 查找替代 Worker
-   */
-  private findAlternativeWorker(
-    assignment: Assignment,
-    weaknesses: string[]
-  ): WorkerSlot | undefined {
-    const allProfiles = this.profileLoader.getAllProfiles();
-    const currentWorker = assignment.workerId;
-
-    // 查找擅长当前任务且不在弱项的 Worker
-    for (const [worker, profile] of allProfiles.entries()) {
-      if (worker === currentWorker) continue;
-
-      // 检查这个 Worker 是否擅长处理当前弱项相关的任务
-      const hasStrengthForWeakness = weaknesses.some(weakness =>
-        profile.profile.strengths.some(s =>
-          s.toLowerCase().includes(weakness.toLowerCase())
-        )
-      );
-
-      if (hasStrengthForWeakness) {
-        return worker as WorkerSlot;
-      }
-    }
-
-    // 没有特别匹配的，返回第一个不同的 Worker
-    for (const [worker] of allProfiles.entries()) {
-      if (worker !== currentWorker) {
-        return worker as WorkerSlot;
-      }
-    }
-
-    return undefined;
-  }
-
-  /**
    * 判断任务是否可以简化
    */
   private canSimplifyTask(todo: WorkerTodo): boolean {
@@ -310,20 +261,6 @@ export class ProfileAwareRecoveryHandler {
     newTodo?: WorkerTodo;
   }> {
     switch (decision.strategy) {
-      case 'switch_worker':
-        if (decision.alternativeWorker) {
-          // 创建新的 Assignment 给替代 Worker
-          const newAssignment: Assignment = {
-            ...assignment,
-            id: `assignment_recovery_${Date.now()}`,
-            workerId: decision.alternativeWorker,
-            status: 'pending',
-            progress: 0,
-          };
-          return { success: true, newAssignment };
-        }
-        return { success: false };
-
       case 'simplify_task':
         if (decision.simplifiedTask) {
           // 创建简化的 Todo

@@ -7,6 +7,8 @@
 import { WorkerSlot } from '../../types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector, TaskStructuredInfo } from '../profile/guidance-injector';
+import { CategoryResolver } from '../profile/category-resolver';
+import { AssignmentResolver } from '../profile/assignment-resolver';
 import {
   Mission,
   Contract,
@@ -22,10 +24,15 @@ import {
  * AssignmentManager - 职责分配管理器
  */
 export class AssignmentManager {
+  private categoryResolver = new CategoryResolver();
+  private assignmentResolver: AssignmentResolver;
+
   constructor(
     private profileLoader: ProfileLoader,
     private guidanceInjector: GuidanceInjector
-  ) {}
+  ) {
+    this.assignmentResolver = new AssignmentResolver(profileLoader.getAssignmentLoader());
+  }
 
   /**
    * 创建职责分配
@@ -120,7 +127,12 @@ export class AssignmentManager {
       missionId: mission.id,
       workerId,
       assignmentReason,
-      responsibility: this.generateResponsibility(mission, workerId, scope),
+      responsibility: this.generateResponsibility(
+        mission,
+        workerId,
+        scope,
+        assignmentReason.profileMatch.category
+      ),
       delegationBriefing: options?.delegationBriefing,
       scope,
       guidancePrompt,
@@ -147,8 +159,8 @@ export class AssignmentManager {
     const includes: string[] = [];
     const excludes: string[] = [];
 
-    // 基于画像偏好确定职责
-    for (const category of profile.preferences.preferredCategories) {
+    // 基于归属分类确定职责
+    for (const category of profile.assignedCategories) {
       includes.push(`${category} 相关任务`);
     }
 
@@ -164,7 +176,7 @@ export class AssignmentManager {
     }
 
     // 基于画像弱项确定排除项
-    for (const weakness of profile.profile.weaknesses) {
+    for (const weakness of profile.persona.weaknesses) {
       excludes.push(`涉及 ${weakness} 的任务（如必须，需额外审查）`);
     }
 
@@ -195,6 +207,10 @@ export class AssignmentManager {
     routingReason?: string
   ): AssignmentReason {
     if (routingCategory) {
+      const resolvedWorker = this.assignmentResolver.resolveWorker(routingCategory);
+      if (resolvedWorker !== workerId) {
+        throw new Error(`分类 "${routingCategory}" 归属 ${resolvedWorker}，不可分配给 ${workerId}`);
+      }
       return {
         profileMatch: {
           category: routingCategory,
@@ -207,14 +223,18 @@ export class AssignmentManager {
       };
     }
 
-    const category = this.inferCategory(mission, profile);
+    const category = this.resolveCategory(mission);
+    const resolvedWorker = this.assignmentResolver.resolveWorker(category);
+    if (resolvedWorker !== workerId) {
+      throw new Error(`分类 "${category}" 归属 ${resolvedWorker}，不可分配给 ${workerId}`);
+    }
     const score = this.calculateMatchScore(mission, profile);
 
     return {
       profileMatch: {
         category,
         score,
-        matchedKeywords: this.extractMatchedKeywords(mission, profile),
+        matchedKeywords: this.extractMatchedKeywords(mission, category, profile),
       },
       contractRole: 'none', // 由调用方更新
       explanation: `${workerId} 在 ${category} 类任务上有优势，匹配度 ${score}%`,
@@ -223,21 +243,11 @@ export class AssignmentManager {
   }
 
   /**
-   * 推断任务分类
+   * 解析任务分类（唯一规则）
    */
-  private inferCategory(
-    mission: Mission,
-    profile: ReturnType<ProfileLoader['getProfile']>
-  ): string {
+  private resolveCategory(mission: Mission): string {
     const text = `${mission.goal} ${mission.analysis}`.toLowerCase();
-
-    for (const category of profile.preferences.preferredCategories) {
-      if (text.includes(category)) {
-        return category;
-      }
-    }
-
-    return profile.preferences.preferredCategories[0] || 'general';
+    return this.categoryResolver.resolveFromText(text);
   }
 
   /**
@@ -251,23 +261,16 @@ export class AssignmentManager {
     let score = 50; // 基础分
 
     // 优势匹配加分
-    for (const strength of profile.profile.strengths) {
+    for (const strength of profile.persona.strengths) {
       if (text.includes(strength.toLowerCase())) {
         score += 10;
       }
     }
 
     // 弱项匹配减分
-    for (const weakness of profile.profile.weaknesses) {
+    for (const weakness of profile.persona.weaknesses) {
       if (text.includes(weakness.toLowerCase())) {
         score -= 15;
-      }
-    }
-
-    // 偏好分类匹配加分
-    for (const category of profile.preferences.preferredCategories) {
-      if (text.includes(category)) {
-        score += 15;
       }
     }
 
@@ -279,20 +282,31 @@ export class AssignmentManager {
    */
   private extractMatchedKeywords(
     mission: Mission,
+    category: string,
     profile: ReturnType<ProfileLoader['getProfile']>
   ): string[] {
     const text = `${mission.goal} ${mission.analysis}`.toLowerCase();
     const matched: string[] = [];
 
-    for (const strength of profile.profile.strengths) {
+    for (const strength of profile.persona.strengths) {
       if (text.includes(strength.toLowerCase())) {
         matched.push(strength);
       }
     }
 
-    for (const category of profile.preferences.preferredCategories) {
-      if (text.includes(category)) {
-        matched.push(category);
+    const categoryDef = this.profileLoader.getCategory(category);
+    if (categoryDef) {
+      for (const keyword of categoryDef.keywords) {
+        try {
+          const regex = new RegExp(keyword, 'i');
+          if (regex.test(text)) {
+            matched.push(keyword);
+          }
+        } catch {
+          if (text.includes(keyword.toLowerCase())) {
+            matched.push(keyword);
+          }
+        }
       }
     }
 
@@ -305,12 +319,13 @@ export class AssignmentManager {
   private generateResponsibility(
     mission: Mission,
     workerId: WorkerSlot,
-    scope: AssignmentScope
+    scope: AssignmentScope,
+    category: string
   ): string {
     const profile = this.profileLoader.getProfile(workerId);
-    const primaryCategory = profile.preferences.preferredCategories[0] || 'general';
+    const primaryCategory = category || profile.assignedCategories[0] || 'general';
     const parts: string[] = [
-      `作为 ${profile.displayName}，负责 ${primaryCategory} 相关工作。`,
+      `作为 ${profile.persona.displayName}，负责 ${primaryCategory} 相关工作。`,
     ];
 
     const goal = mission.goal || mission.userPrompt;

@@ -481,7 +481,7 @@ export type WebviewToExtensionMessage =
   | { type: 'answerWorkerQuestion'; answer: string | null }
   // 新增：画像配置
   | { type: 'getProfileConfig' }
-  | { type: 'saveProfileConfig'; data: { workers: Record<string, any>; categories: Record<string, string> } }
+  | { type: 'saveProfileConfig'; data: { assignments: Record<string, string>; userRules?: string } }
   | { type: 'resetProfileConfig' }
   // 新增：LLM 配置相关
   | { type: 'loadAllWorkerConfigs' }

@@ -1,47 +1,14 @@
 /**
- * Worker Profile System - 类型定义
- *
- * 设计理念：
- * - 引导而非限制：通过 Prompt 注入引导 Worker 行为，不限制工具权限
- * - LLM 客户端复用：利用成熟模型的完整能力
- * - 执行统计驱动：基于历史数据动态调整 Worker 选择
+ * Worker Profile System - types
  */
 
 import { WorkerSlot } from '../../types/agent-types';
 
 // ============================================================================
-// Worker 画像类型
+// Worker persona types
 // ============================================================================
 
-/** Worker 能力画像 */
-export interface WorkerCapabilityProfile {
-  /** 擅长的领域 */
-  strengths: string[];
-  /** 相对不擅长的领域 */
-  weaknesses: string[];
-}
-
-/** Worker 任务偏好 */
-export interface WorkerPreferences {
-  /** 优先分配的任务分类 */
-  preferredCategories: string[];
-  /** 优先分配的关键词（正则模式） */
-  preferredKeywords: string[];
-}
-
-/** Worker 行为引导 */
-export interface WorkerGuidance {
-  /** 角色定位 */
-  role: string;
-  /** 专注领域 */
-  focus: string[];
-  /** 行为约束（建议性） */
-  constraints: string[];
-  /** 输出格式偏好 */
-  outputPreferences: string[];
-}
-
-/** Worker 协作规则 */
+/** Worker collaboration rules */
 export interface WorkerCollaboration {
   /** 作为主导者时的行为 */
   asLeader: string[];
@@ -49,55 +16,35 @@ export interface WorkerCollaboration {
   asCollaborator: string[];
 }
 
-/** Worker 评审配置 */
-export interface WorkerReviewConfig {
-  /** 被评审时需要重点关注的领域 */
-  focusAreasWhenReviewed: string[];
-  /** 作为评审者时的优势领域 */
-  reviewStrengths: string[];
-  /** 需要严格评审的任务分类 */
-  strictReviewCategories: string[];
-}
-
-/** 完整的 Worker 画像 */
-export interface WorkerProfile {
-  /** Worker 名称 */
-  name: string;
+/** Built-in worker persona */
+export interface WorkerPersona {
   /** 显示名称 */
   displayName: string;
-  /** 配置版本 */
-  version: string;
-  /** 能力画像 */
-  profile: WorkerCapabilityProfile;
-  /** 任务偏好 */
-  preferences: WorkerPreferences;
-  /** 行为引导 */
-  guidance: WorkerGuidance;
+  /** 角色定位 */
+  baseRole: string;
+  /** 擅长领域 */
+  strengths: string[];
+  /** 弱项领域 */
+  weaknesses: string[];
   /** 协作规则 */
   collaboration: WorkerCollaboration;
-  /** 评审配置（可选） */
-  review?: WorkerReviewConfig;
+  /** 输出偏好 */
+  outputPreferences: string[];
+}
+
+/** Runtime worker profile (derived, non-configurable) */
+export interface WorkerProfile {
+  /** Worker 标识 */
+  worker: WorkerSlot;
+  /** 内置 persona */
+  persona: WorkerPersona;
+  /** 归属分类 */
+  assignedCategories: string[];
 }
 
 // ============================================================================
-// 任务分类类型
+// Category types
 // ============================================================================
-
-/** 任务分类类型 - 提案 4.4 */
-export type CategoryType =
-  | 'bugfix'
-  | 'refactor'
-  | 'review'
-  | 'feature'
-  | 'data_analysis'
-  | 'test'
-  | 'documentation'
-  | 'optimization'
-  | 'security'
-  | 'migration'
-  | 'config'
-  | 'integration'
-  | 'general';
 
 /** 任务优先级 */
 export type TaskPriority = 'high' | 'medium' | 'low';
@@ -105,56 +52,40 @@ export type TaskPriority = 'high' | 'medium' | 'low';
 /** 风险等级 */
 export type RiskLevel = 'high' | 'medium' | 'low';
 
-/** 评审策略配置 */
-export interface CategoryReviewPolicy {
-  /** 是否需要互检评审 */
-  requirePeerReview: boolean;
-  /** 偏好的评审者 */
-  preferredReviewer?: WorkerSlot;
-  /** 评审重点 */
-  reviewFocus: string[];
+/** 分类引导 */
+export interface CategoryGuidance {
+  focus: string[];
+  constraints: string[];
 }
 
-/** 任务分类配置 */
-export interface CategoryConfig {
-  /** 显示名称 */
+/** 任务分类定义 */
+export interface CategoryDefinition {
   displayName: string;
-  /** 描述 */
   description: string;
-  /** 匹配关键词（正则模式） */
   keywords: string[];
-  /** 默认 Worker */
-  defaultWorker: WorkerSlot;
-  /** 优先级 */
+  guidance: CategoryGuidance;
   priority: TaskPriority;
-  /** 风险等级 */
   riskLevel: RiskLevel;
-  /** 评审策略（可选） */
-  reviewPolicy?: CategoryReviewPolicy;
 }
 
 /** 分类规则配置 */
 export interface CategoryRules {
-  /** 分类优先级顺序 */
   categoryPriority: string[];
-  /** 默认分类 */
   defaultCategory: string;
-  /** 风险等级映射 */
   riskMapping: Record<RiskLevel, 'fullPath' | 'standardPath' | 'lightPath'>;
 }
 
-/** 完整的分类配置 */
-export interface CategoriesConfig {
-  /** 配置版本 */
+// ============================================================================
+// Assignments
+// ============================================================================
+
+export interface WorkerAssignments {
   version: string;
-  /** 分类定义 */
-  categories: Record<string, CategoryConfig>;
-  /** 分类规则 */
-  rules: CategoryRules;
+  assignments: Record<WorkerSlot, string[]>;
 }
 
 // ============================================================================
-// 引导注入类型
+// Guidance injection
 // ============================================================================
 
 /** 引导注入上下文 */
@@ -171,28 +102,6 @@ export interface InjectionContext {
   collaborators?: WorkerSlot[];
   /** 任务分类 */
   category?: string;
-}
-
-// ============================================================================
-// Worker 选择类型
-// ============================================================================
-
-/** Worker 选择选项 */
-export interface WorkerSelectionOptions {
-  /** 排除的 Worker */
-  excludeWorkers?: WorkerSlot[];
-  /** 偏好的 Worker */
-  preferredWorker?: WorkerSlot;
-}
-
-/** Worker 选择结果 */
-export interface WorkerSelectionResult {
-  /** 选中的 Worker */
-  worker: WorkerSlot;
-  /** 任务分类 */
-  category: string;
-  /** 匹配分数 */
-  score: number;
-  /** 选择原因 */
-  reason: string;
+  /** 是否主导者 */
+  isLeader?: boolean;
 }

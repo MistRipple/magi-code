@@ -5,6 +5,28 @@
 // 消息角色
 export type MessageRole = 'user' | 'assistant' | 'system';
 
+// 占位消息状态
+export type PlaceholderState =
+  | 'pending'    // 等待后端确认
+  | 'received'   // 已接收，预处理中
+  | 'thinking'   // 模型思考中
+  | 'connecting' // 连接模型中（可选）
+  ;
+
+// 请求-响应绑定
+export interface RequestResponseBinding {
+  /** 用户请求 ID（前端生成） */
+  requestId: string;
+  /** 用户消息 ID */
+  userMessageId: string;
+  /** 占位消息 ID（前端生成） */
+  placeholderMessageId: string;
+  /** 真实响应消息 ID（后端生成） */
+  realMessageId?: string;
+  /** 创建时间戳 */
+  createdAt: number;
+}
+
 // 消息来源
 export type MessageSource = 'orchestrator' | 'claude' | 'codex' | 'gemini' | 'system';
 
@@ -138,6 +160,13 @@ export interface Message {
     duration?: number;
     worker?: string;        // Worker 类型（orchestrator, coder, reviewer 等）
     filePath?: string;      // 相关文件路径
+    // 占位消息相关字段
+    isPlaceholder?: boolean;          // 是否为占位消息
+    placeholderState?: PlaceholderState; // 占位消息状态
+    requestId?: string;               // 关联的请求 ID
+    wasPlaceholder?: boolean;         // 是否从占位消息转换而来（用于过渡动画）
+    justCompleted?: boolean;          // 是否刚完成（用于完成动画）
+    sendingAnimation?: boolean;       // 用户消息发送动画
     [key: string]: unknown;
   };
 }
