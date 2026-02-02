@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
-  import { getState, addThreadMessage, addToast, getActiveInteractionType, addPendingRequest } from '../stores/messages.svelte';
+  import { getState, addToast, getActiveInteractionType } from '../stores/messages.svelte';
   import type { StandardMessage } from '../../../../protocol/message-protocol';
   import { MessageCategory } from '../../../../protocol/message-protocol';
   import Icon from './Icon.svelte';
@@ -30,9 +30,9 @@
   const MAX_IMAGE_SIZE = 10 * 1024 * 1024;  // 单张图片最大 10MB
 
   // 是否正在发送
-  const isSending = $derived(appState.isProcessing);
-  const activeInteraction = $derived(getActiveInteractionType());
-  const isInteractionBlocking = $derived(Boolean(activeInteraction));
+  const isSending = $derived.by(() => appState.isProcessing);
+  const activeInteraction = $derived.by(() => getActiveInteractionType());
+  const isInteractionBlocking = $derived.by(() => Boolean(activeInteraction));
   const MAX_INPUT_CHARS = 10000;
 
   // 发送消息（支持图片附件）
@@ -45,37 +45,22 @@
       return;
     }
 
+    // === 第一步：生成所有必要的 ID ===
     const requestId = generateId();
-    // 🔧 乐观更新：立即设置处理状态，用户无需等待后端响应即可看到 Loading 动画
-    addPendingRequest(requestId);
 
-    // 构建用户消息（包含图片预览信息）
-    const displayContent = selectedImages.length > 0
-      ? `${content}${content ? '\n' : ''}[附件: ${selectedImages.length} 张图片]`
-      : content;
-
-    addThreadMessage({
-      id: generateId(),
-      role: 'user',
-      source: 'orchestrator',
-      content: displayContent,
-      timestamp: Date.now(),
-      isStreaming: false,
-      isComplete: true,
-    });
-
-    // 发送到后端（包含图片数据）
+    // === 第六步：发送到后端（包含图片数据） ===
     vscode.postMessage({
       type: 'executeTask',
-      prompt: content || '请分析这些图片',  // 无文字时使用默认提示
+      prompt: content || '请分析这些图片',
       mode: interactionMode,
       agent: selectedModel || undefined,
       requestId,
       images: selectedImages.map(img => ({ dataUrl: img.dataUrl })),
     });
 
+    // === 第七步：清理输入状态 ===
     inputValue = '';
-    selectedImages = [];  // 清空已选图片
+    selectedImages = [];
   }
 
   // 处理键盘事件

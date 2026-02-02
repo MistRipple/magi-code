@@ -9,7 +9,6 @@ import {
   updateThreadMessage,
   addAgentMessage,
   updateAgentMessage,
-  removeAgentMessage,
   setIsProcessing,
   setCurrentSessionId,
   updateSessions,
@@ -24,9 +23,16 @@ import {
   updateWorkerSession,
   markMessageActive,
   markMessageComplete,
+  addPendingRequest,
   clearProcessingState,
   clearPendingRequest,
   setProcessingActor,
+  getBackendProcessing,
+  getRequestBinding,
+  createRequestBinding,
+  updateRequestBinding,
+  clearRequestBinding,
+  clearAllRequestBindings,
 } from '../stores/messages.svelte';
 import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, Edit } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
@@ -75,24 +81,6 @@ function extractTextFromStandardBlocks(blocks?: StandardContentBlock[]): string 
     .map((block) => (block as any).content || '')
     .filter(Boolean)
     .join('\n');
-}
-
-/**
- * 添加系统通知消息（居中显示的简洁通知）
- */
-export function addSystemMessage(content: string, noticeType: 'info' | 'success' | 'warning' | 'error' = 'info') {
-  const message: Message = {
-    id: generateId(),
-    role: 'system',
-    source: 'system',
-    content,
-    timestamp: Date.now(),
-    type: 'system-notice',
-    noticeType,
-    isStreaming: false,
-    isComplete: true,
-  };
-  addThreadMessage(message);
 }
 
 /**
@@ -150,9 +138,12 @@ function handleStateUpdate(message: WebviewMessage) {
   store.tasks = ensureArray(state.tasks)
     .filter((task): task is Task => !!task && typeof task === 'object' && typeof (task as Task).status === 'string')
     .map((task) => {
-      let id = typeof task.id === 'string' && task.id.trim() ? task.id : `task_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-      while (taskSeen.has(id)) {
-        id = `task_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const id = typeof task.id === 'string' && task.id.trim() ? task.id.trim() : '';
+      if (!id) {
+        throw new Error('[MessageHandler] Task 缺少 id');
+      }
+      if (taskSeen.has(id)) {
+        throw new Error(`[MessageHandler] Task id 重复: ${id}`);
       }
       taskSeen.add(id);
       return {
@@ -237,9 +228,113 @@ function handleUnifiedMessage(message: WebviewMessage) {
 
 function handleContentMessage(standard: StandardMessage) {
   const uiMessage = mapStandardMessage(standard);
+  const meta = standard.metadata as Record<string, unknown> | undefined;
+  const requestId = meta?.requestId as string | undefined;
+  const isPlaceholder = Boolean(meta?.isPlaceholder);
+  const isUserMessage = meta?.role === 'user';
+
+  const upsertThreadMessage = (message: Message) => {
+    const existing = getState().threadMessages.find(m => m.id === message.id);
+    if (existing) {
+      updateThreadMessage(message.id, message);
+    } else {
+      addThreadMessage(message);
+    }
+  };
+
+  if (isPlaceholder) {
+    if (!requestId) {
+      throw new Error('[MessageHandler] 占位消息缺少 requestId');
+    }
+    const userMessageId = meta?.userMessageId as string | undefined;
+    if (!userMessageId) {
+      throw new Error('[MessageHandler] 占位消息缺少 userMessageId');
+    }
+    const binding = getRequestBinding(requestId);
+    if (!binding) {
+      createRequestBinding({
+        requestId,
+        userMessageId,
+        placeholderMessageId: standard.id,
+        createdAt: standard.timestamp || Date.now(),
+      });
+    } else {
+      updateRequestBinding(requestId, { placeholderMessageId: standard.id, userMessageId });
+    }
+    addPendingRequest(requestId);
+    upsertThreadMessage(uiMessage);
+    if (uiMessage.isStreaming) {
+      markMessageActive(uiMessage.id);
+    }
+    return;
+  }
+
+  if (isUserMessage) {
+    if (requestId) {
+      const placeholderMessageId = meta?.placeholderMessageId as string | undefined;
+      const binding = getRequestBinding(requestId);
+      if (!binding && placeholderMessageId) {
+        createRequestBinding({
+          requestId,
+          userMessageId: standard.id,
+          placeholderMessageId,
+          createdAt: standard.timestamp || Date.now(),
+        });
+      } else if (binding) {
+        updateRequestBinding(requestId, { userMessageId: standard.id });
+      }
+    }
+    upsertThreadMessage(uiMessage);
+    return;
+  }
+
   if (!uiMessage.isStreaming && !hasRenderableContent(uiMessage)) {
     throw new Error(`[MessageHandler] 内容消息不可渲染: ${standard.id}`);
   }
+
+  // === 检查是否有对应的占位消息需要替换 ===
+  if (requestId) {
+    const binding = getRequestBinding(requestId);
+
+    if (binding && !binding.realMessageId) {
+      // 首次收到真实消息，需要原地替换占位消息
+      const placeholderId = binding.placeholderMessageId;
+      const existingPlaceholder = getState().threadMessages.find(m => m.id === placeholderId);
+      if (!existingPlaceholder) {
+        throw new Error(`[MessageHandler] 未找到占位消息: ${placeholderId}`);
+      }
+
+      // 更新绑定，记录真实消息 ID，并同步占位消息 ID
+      updateRequestBinding(requestId, { realMessageId: standard.id, placeholderMessageId: standard.id });
+
+      const replacementMessage: import('../types/message').Message = {
+        ...uiMessage,
+        id: standard.id,
+        metadata: {
+          ...uiMessage.metadata,
+          isPlaceholder: false,
+          wasPlaceholder: true,
+          placeholderState: undefined,
+          requestId,
+        },
+      };
+
+      // 原地更新占位消息
+      updateThreadMessage(placeholderId, replacementMessage);
+
+      // 注册路由（使用新 ID）
+      routeStandardMessage(standard);
+
+      // 标记为活跃消息
+      if (uiMessage.isStreaming) {
+        markMessageActive(standard.id);
+      }
+
+      return;
+    }
+  }
+
+  // === 后续消息处理（非首次或无占位消息关联） ===
   const target = routeStandardMessage(standard);
 
   // 🔧 调试日志：追踪 Worker 消息路由
@@ -337,11 +432,34 @@ function handleStandardComplete(message: WebviewMessage) {
     throw new Error('[MessageHandler] unifiedComplete 缺少 message');
   }
   const standard = assertStandardMessageId(rawStandard);
+
+  // 尝试获取已注册的路由
   const location = getMessageTarget(standard.id);
   if (!location) {
-    throw new Error(`[MessageHandler] 完成消息缺少路由: ${standard.id}`);
+    // 没有路由说明这个消息没有通过 handleContentMessage 处理过
+    // 可能是控制消息或不需要显示的消息，直接跳过
+    return;
   }
+
   if (location.location === 'none' || location.location === 'task') {
+    return;
+  }
+
+  // 🔧 修复：先检查消息是否存在，如果不存在则跳过
+  // complete 消息是用来"完成"已有消息的
+  let messageExists = false;
+  if (location.location === 'thread') {
+    messageExists = getState().threadMessages.some(m => m.id === standard.id);
+  } else if (location.location === 'worker') {
+    messageExists = getState().agentOutputs[location.worker].some(m => m.id === standard.id);
+  } else if (location.location === 'both') {
+    messageExists = getState().threadMessages.some(m => m.id === standard.id) ||
+                    getState().agentOutputs[location.worker].some(m => m.id === standard.id);
+  }
+
+  if (!messageExists) {
+    // 消息不存在，跳过处理
+    clearMessageTarget(standard.id);
     return;
   }
 
@@ -350,16 +468,56 @@ function handleStandardComplete(message: WebviewMessage) {
 
   const uiMessage = mapStandardMessage(standard);
   if (!hasRenderableContent(uiMessage)) {
-    throw new Error(`[MessageHandler] 完成消息不可渲染: ${standard.id}`);
+    // 消息不可渲染，静默跳过
+    clearMessageTarget(standard.id);
+    return;
   }
+
+  // 添加完成动画标记
+  const completedMessage = {
+    ...uiMessage,
+    metadata: {
+      ...uiMessage.metadata,
+      justCompleted: true,
+    },
+  };
+
+  // 更新已存在的消息
   if (location.location === 'thread') {
-    updateThreadMessage(standard.id, uiMessage);
+    updateThreadMessage(standard.id, completedMessage);
   } else if (location.location === 'worker') {
-    updateAgentMessage(location.worker, standard.id, uiMessage);
+    updateAgentMessage(location.worker, standard.id, completedMessage);
   } else if (location.location === 'both') {
-    updateThreadMessage(standard.id, uiMessage);
-    updateAgentMessage(location.worker, standard.id, uiMessage);
+    updateThreadMessage(standard.id, completedMessage);
+    updateAgentMessage(location.worker, standard.id, completedMessage);
   }
+
+  // 清理请求绑定
+  const requestId = (standard.metadata as { requestId?: string } | undefined)?.requestId;
+  if (requestId) {
+    // 延迟清理，确保动画完成
+    setTimeout(() => {
+      clearRequestBinding(requestId);
+    }, 1000);
+  }
+
+  // 移除 justCompleted 标记（动画完成后）
+  setTimeout(() => {
+    const cleanedMessage = {
+      ...uiMessage,
+      metadata: {
+        ...uiMessage.metadata,
+        justCompleted: false,
+      },
+    };
+    if (location.location === 'thread' || location.location === 'both') {
+      updateThreadMessage(standard.id, cleanedMessage);
+    }
+    if (location.location === 'worker' || location.location === 'both') {
+      updateAgentMessage(location.worker, standard.id, cleanedMessage);
+    }
+  }, 500);
+
   clearMessageTarget(standard.id);
 }
 
@@ -386,9 +544,33 @@ function handleUnifiedControlMessage(standard: StandardMessage) {
       break;
 
     case 'task_accepted': {
+      // 🔧 防御性检查：只有当 backendProcessing 已为 true 时才清除 pending
+      // 正常时序：processingStateChanged:true → backendProcessing=true → task_accepted → 清除 pending
+      // 如果 backendProcessing 仍为 false，说明时序异常，先设置处理状态
       const requestId = payload?.requestId as string | undefined;
       if (requestId) {
+        if (!getBackendProcessing()) {
+          // 异常时序：先确保处理状态为 true，避免 isProcessing 出现空窗期
+          setIsProcessing(true);
+        }
         clearPendingRequest(requestId);
+
+        // 更新占位消息状态：pending → received
+        const binding = getRequestBinding(requestId);
+        if (binding) {
+          const placeholder = getState().threadMessages.find(m => m.id === binding.placeholderMessageId);
+          const baseMetadata = (placeholder?.metadata && typeof placeholder.metadata === 'object')
+            ? placeholder.metadata
+            : {};
+          updateThreadMessage(binding.placeholderMessageId, {
+            metadata: {
+              ...baseMetadata,
+              isPlaceholder: true,
+              placeholderState: 'received',
+              requestId,
+            },
+          });
+        }
       }
       break;
     }
@@ -398,16 +580,32 @@ function handleUnifiedControlMessage(standard: StandardMessage) {
       if (requestId) {
         clearPendingRequest(requestId);
       }
-      const reason = payload?.reason as string | undefined;
-      if (reason) {
-        addSystemMessage(reason, 'error');
-      }
       break;
     }
 
     case 'task_started':
       // 任务开始执行
       setIsProcessing(true);
+      {
+        const requestId = payload?.requestId as string | undefined;
+        if (requestId) {
+          const binding = getRequestBinding(requestId);
+          if (binding) {
+            const placeholder = getState().threadMessages.find(m => m.id === binding.placeholderMessageId);
+            const baseMetadata = (placeholder?.metadata && typeof placeholder.metadata === 'object')
+              ? placeholder.metadata
+              : {};
+            updateThreadMessage(binding.placeholderMessageId, {
+              metadata: {
+                ...baseMetadata,
+                isPlaceholder: true,
+                placeholderState: 'thinking',
+                requestId,
+              },
+            });
+          }
+        }
+      }
       break;
 
     case 'task_completed':
@@ -584,35 +782,24 @@ function handleUnifiedData(standard: StandardMessage) {
       handleWorkerStatusUpdate(asMessage(payload));
       break;
 
-    case 'workerError': {
-      const worker = payload.worker as string | undefined;
-      const error = payload.error as string | undefined;
-      if (worker || error) {
-        addSystemMessage(`${worker || 'Worker'}: ${error || '发生错误'}`, 'error');
-      }
+    case 'workerError':
       break;
-    }
 
     case 'interactionModeChanged':
       getState().interactionMode = (payload.mode as string) === 'ask' ? 'ask' : 'auto';
       break;
 
     case 'missionExecutionFailed':
-      addSystemMessage((payload.error as string) || '任务执行失败', 'error');
       clearProcessingState();
       break;
 
     case 'missionFailed':
-      addSystemMessage((payload.error as string) || '任务失败', 'error');
       clearProcessingState();
       break;
 
-    case 'taskInterrupted': {
-      const msg = (payload.message as string) || '任务已打断';
-      addSystemMessage(msg, 'info');
+    case 'taskInterrupted':
       clearProcessingState();
       break;
-    }
 
     default:
       break;
@@ -638,10 +825,11 @@ function handleSessionChanged(message: WebviewMessage) {
     const store = getState();
     const currentId = store.currentSessionId;
 
-    // 如果是不同的会话，清空当前消息
+    // 如果是不同的会话，清空当前消息和请求绑定
     if (currentId !== newSessionId) {
       clearAllMessages();
       clearMessageTargets();
+      clearAllRequestBindings();
     }
 
     setCurrentSessionId(newSessionId);
@@ -1054,9 +1242,15 @@ function mapStandardMessage(standard: StandardMessage): Message {
 
   const dispatchToWorker = Boolean(baseMetadata.dispatchToWorker);
 
+  const explicitRole = (baseMetadata as { role?: unknown } | undefined)?.role;
+  const resolvedRole =
+    explicitRole === 'user'
+      ? 'user'
+      : (isSystemNotice ? 'system' : 'assistant');
+
   return {
     id: standard.id,
-    role: isSystemNotice ? 'system' : 'assistant',
+    role: resolvedRole,
     source: displaySource,
     content,
     blocks,
@@ -1396,7 +1590,15 @@ function handleWorkerSessionCreated(message: WebviewMessage) {
   const assignmentId = (message.assignmentId as string) || '';
   const workerId = (message.workerId as string) || '';
 
-  if (!sessionId) return;
+  if (!sessionId) {
+    throw new Error('[MessageHandler] WorkerSessionCreated 缺少 sessionId');
+  }
+  if (!assignmentId) {
+    throw new Error('[MessageHandler] WorkerSessionCreated 缺少 assignmentId');
+  }
+  if (!workerId) {
+    throw new Error('[MessageHandler] WorkerSessionCreated 缺少 workerId');
+  }
 
   const session: WorkerSessionState = {
     sessionId,
@@ -1413,8 +1615,17 @@ function handleWorkerSessionResumed(message: WebviewMessage) {
   const sessionId = (message.sessionId as string) || '';
   const assignmentId = (message.assignmentId as string) || '';
   const completedTodos = (message.completedTodos as number) || 0;
+  const workerId = (message.workerId as string) || '';
 
-  if (!sessionId) return;
+  if (!sessionId) {
+    throw new Error('[MessageHandler] WorkerSessionResumed 缺少 sessionId');
+  }
+  if (!assignmentId) {
+    throw new Error('[MessageHandler] WorkerSessionResumed 缺少 assignmentId');
+  }
+  if (!workerId) {
+    throw new Error('[MessageHandler] WorkerSessionResumed 缺少 workerId');
+  }
 
   // 更新现有 session 或创建新的
   const store = getState();
@@ -1429,13 +1640,12 @@ function handleWorkerSessionResumed(message: WebviewMessage) {
     const session: WorkerSessionState = {
       sessionId,
       assignmentId,
-      workerId: (message.workerId as string) || '',
+      workerId,
       isResumed: true,
       completedTodos,
     };
     addWorkerSession(session);
   }
 
-  // 添加系统通知
-  addSystemMessage(`Session 已恢复，继续执行 ${completedTodos} 个已完成的 Todo`, 'info');
+  // 系统通知由 MessageHub 下发，前端不再本地创建
 }

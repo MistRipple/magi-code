@@ -10,11 +10,6 @@
   // 当前阶段 (1-7)
   const currentPhase = $derived(appState.currentPhase || 0);
 
-  // 计算进度百分比
-  const progressPercent = $derived(
-    currentPhase > 0 ? Math.round((currentPhase / phases.length) * 100) : 0
-  );
-
   // 当前阶段描述
   const currentPhaseDesc = $derived(
     currentPhase > 0 && currentPhase <= phases.length
@@ -24,12 +19,6 @@
 </script>
 
 <div class="phase-indicator" class:hidden={currentPhase === 0}>
-  <!-- 全局进度条 -->
-  <div class="progress-bar-container">
-    <div class="progress-bar" style="width: {progressPercent}%"></div>
-    <span class="progress-text">{progressPercent}%</span>
-  </div>
-
   <!-- 阶段步骤指示器 -->
   <div class="phase-steps">
     {#each phases as phase, index}
@@ -73,30 +62,6 @@
 
   .phase-indicator.hidden {
     display: none;
-  }
-
-  /* 全局进度条 */
-  .progress-bar-container {
-    position: relative;
-    height: 6px;
-    background: var(--surface-2);
-    border-radius: var(--radius-full);
-    overflow: hidden;
-  }
-
-  .progress-bar {
-    height: 100%;
-    background: linear-gradient(90deg, var(--primary), var(--success));
-    border-radius: var(--radius-full);
-    transition: width 0.3s ease-out;
-  }
-
-  .progress-text {
-    position: absolute;
-    right: 0;
-    top: -18px;
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
   }
 
   /* 阶段步骤 */
@@ -166,4 +131,3 @@
     to { transform: rotate(360deg); }
   }
 </style>
-

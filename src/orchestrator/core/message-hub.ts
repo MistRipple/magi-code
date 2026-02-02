@@ -185,6 +185,7 @@ const CONTENT_DEDUPE_WINDOW_MS = 30000;  // 30秒窗口
  */
 export class MessageHub extends EventEmitter {
   private traceId: string;
+  private requestId?: string;
 
   // ==========================================================================
   // 🔧 统一消息通道状态（从 UnifiedMessageBus 迁入）
@@ -213,6 +214,14 @@ export class MessageHub extends EventEmitter {
    */
   setTraceId(traceId: string): void {
     this.traceId = traceId;
+  }
+
+  setRequestContext(requestId?: string): void {
+    this.requestId = requestId;
+  }
+
+  getRequestContext(): string | undefined {
+    return this.requestId;
   }
 
   /**
@@ -470,6 +479,15 @@ export class MessageHub extends EventEmitter {
    * - STREAMING 消息间隔不低于 minStreamInterval (100ms)
    */
   sendMessage(message: StandardMessage): boolean {
+    if (this.requestId && !message.metadata?.requestId) {
+      message = {
+        ...message,
+        metadata: {
+          ...(message.metadata || {}),
+          requestId: this.requestId,
+        },
+      };
+    }
     if (!message.id || !message.id.trim()) {
       throw new Error('[MessageHub] StandardMessage missing id');
     }
@@ -522,7 +540,8 @@ export class MessageHub extends EventEmitter {
     // 2. 内容去重（非流式、非状态消息）
     const isStatusMessage = message.metadata?.isStatusMessage === true;
     const isProgressMessage = message.type === 'progress';
-    if (!isStatusMessage && !isProgressMessage && lifecycle !== MessageLifecycle.STARTED && lifecycle !== MessageLifecycle.STREAMING) {
+    const shouldDedupe = isStatusMessage || isProgressMessage;
+    if (shouldDedupe && lifecycle !== MessageLifecycle.STARTED && lifecycle !== MessageLifecycle.STREAMING) {
       const contentHash = this.computeContentHash(message);
       if (contentHash && this.isDuplicateContent(contentHash, now)) {
         this.debugLog('跳过消息 [CONTENT_DUPLICATE]', id);

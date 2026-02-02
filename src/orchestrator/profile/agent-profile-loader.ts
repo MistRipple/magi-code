@@ -7,16 +7,15 @@
  * - 统一配置管理
  *
  * 设计：
- * - AgentProfile = LLM Config + Worker Guidance
- * - Orchestrator 只有 LLM 配置，无 guidance
- * - Worker 有 LLM 配置 + guidance
+ * - AgentProfile = LLM Config (+ optional derived guidance)
+ * - Orchestrator 只有 LLM 配置
+ * - Worker guidance 由 PromptBuilder/GuidanceInjector 动态生成
  */
 
 import { logger, LogCategory } from '../../logging';
-import { AgentType, AgentRole, AgentProfile, WorkerSlot, LLMConfig } from '../../types/agent-types';
+import { AgentType, AgentProfile, WorkerSlot, LLMConfig } from '../../types/agent-types';
 import { LLMConfigLoader } from '../../llm/config';
 import { ProfileLoader } from './profile-loader';
-import { WorkerProfile } from './types';
 
 /**
  * Agent Profile Loader
@@ -50,9 +49,6 @@ export class AgentProfileLoader {
     // 加载 LLM 配置
     const llmConfig = this.loadLLMConfig(agent);
 
-    // 加载 guidance（仅 Worker 有）
-    const guidance = this.loadGuidance(agent);
-
     // 加载高级配置
     const advanced = this.loadAdvancedConfig(agent);
 
@@ -61,7 +57,7 @@ export class AgentProfileLoader {
       agent,
       role: agent === 'orchestrator' ? 'orchestrator' : 'worker',
       llm: llmConfig,
-      guidance,
+      guidance: undefined,
       advanced,
     };
 
@@ -69,7 +65,7 @@ export class AgentProfileLoader {
     this.profileCache.set(agent, profile);
 
     logger.debug(`Loaded agent profile: ${agent}`, {
-      hasGuidance: !!guidance,
+      hasGuidance: false,
       provider: llmConfig.provider,
       model: llmConfig.model,
     }, LogCategory.ORCHESTRATOR);
@@ -87,24 +83,6 @@ export class AgentProfileLoader {
       const workersConfig = LLMConfigLoader.loadWorkersConfig();
       return workersConfig[agent as WorkerSlot];
     }
-  }
-
-  /**
-   * 加载 Worker Guidance（仅 Worker 有）
-   */
-  private loadGuidance(agent: AgentType): AgentProfile['guidance'] | undefined {
-    if (agent === 'orchestrator') {
-      return undefined;
-    }
-
-    // 从 ProfileLoader 加载 Worker 画像
-    const workerProfile = this.profileLoader.getProfile(agent as WorkerSlot);
-
-    return {
-      role: workerProfile.guidance.role,
-      focus: workerProfile.guidance.focus,
-      constraints: workerProfile.guidance.constraints,
-    };
   }
 
   /**
@@ -176,16 +154,6 @@ export class AgentProfileLoader {
       // 验证 LLM 配置
       if (!LLMConfigLoader.validateConfig(profile.llm, agent)) {
         errors.push(`Invalid LLM configuration for ${agent}`);
-      }
-
-      // 验证 Worker guidance
-      if (profile.role === 'worker' && profile.guidance) {
-        if (!profile.guidance.role) {
-          errors.push(`${agent}: guidance.role is required`);
-        }
-        if (!profile.guidance.focus || profile.guidance.focus.length === 0) {
-          errors.push(`${agent}: guidance.focus must be a non-empty array`);
-        }
       }
 
     } catch (error: any) {

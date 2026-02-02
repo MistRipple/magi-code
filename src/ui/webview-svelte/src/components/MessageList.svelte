@@ -7,8 +7,24 @@
   // Props - Svelte 5 语法
   interface Props {
     messages: Message[];
+    /** 空状态配置（可选） */
+    emptyState?: {
+      icon?: string;
+      title?: string;
+      hint?: string;
+    };
   }
-  let { messages }: Props = $props();
+  let { messages, emptyState }: Props = $props();
+
+  // 🛡️ 防御性编程：过滤无效的消息
+  const safeMessages = $derived(
+    (messages || []).filter(m => !!m && !!m.id)
+  );
+
+  // 空状态默认值
+  const emptyIcon = $derived(emptyState?.icon || 'chat');
+  const emptyTitle = $derived(emptyState?.title || '开始一个新对话');
+  const emptyHint = $derived(emptyState?.hint || '在下方输入框中输入你的问题');
 
   // 容器引用
   let containerRef: HTMLDivElement | null = $state(null);
@@ -20,7 +36,7 @@
 
   // 监听消息变化，自动滚动到底部
   $effect(() => {
-    const _len = messages.length;
+    const _len = safeMessages.length;
     void _len;
     if (shouldAutoScroll && containerRef) {
       tick().then(() => {
@@ -38,7 +54,7 @@
     const { scrollTop, scrollHeight, clientHeight } = target;
     const isNearBottom = scrollHeight - scrollTop - clientHeight < 100;
     shouldAutoScroll = isNearBottom;
-    showScrollBtn = !isNearBottom && messages.length > 0;
+    showScrollBtn = !isNearBottom && safeMessages.length > 0;
   }
 
   // 滚动到底部
@@ -68,16 +84,16 @@
     bind:this={containerRef}
     onscroll={handleScroll}
   >
-    {#if messages.length === 0}
+    {#if safeMessages.length === 0}
       <div class="empty-state">
         <div class="empty-icon">
-          <Icon name="chat" size={48} />
+          <Icon name={emptyIcon} size={48} />
         </div>
-        <p class="empty-text">开始一个新对话</p>
-        <p class="empty-hint">在下方输入框中输入你的问题</p>
+        <p class="empty-text">{emptyTitle}</p>
+        <p class="empty-hint">{emptyHint}</p>
       </div>
     {:else}
-      {#each messages as message (message.id)}
+      {#each safeMessages as message (message.id)}
         <MessageItem {message} />
       {/each}
     {/if}

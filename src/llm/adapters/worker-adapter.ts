@@ -438,22 +438,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     }
 
     try {
-      // 加载 Agent 画像
-      const agentProfile = this.profileLoader.loadAgentProfile(this.workerSlot);
+      const workerProfile = this.profileLoader.getProfileLoader().getProfile(this.workerSlot);
+      const guidancePrompt = this.guidanceInjector.buildWorkerPrompt(workerProfile, {
+        taskDescription: '', // 将在实际任务中填充
+      });
 
-      // 如果有 guidance，使用 GuidanceInjector 构建
-      if (agentProfile.guidance) {
-        const workerProfile = this.profileLoader.getProfileLoader().getProfile(this.workerSlot);
-
-        // 构建基础引导 Prompt
-        const guidancePrompt = this.guidanceInjector.buildWorkerPrompt(workerProfile, {
-          taskDescription: '', // 将在实际任务中填充
-        });
-
-        return guidancePrompt;
-      }
-
-      return this.getDefaultSystemPrompt();
+      return guidancePrompt;
     } catch (error: any) {
       logger.warn(`Failed to build system prompt from profile: ${error.message}`, undefined, LogCategory.LLM);
       return this.getDefaultSystemPrompt();

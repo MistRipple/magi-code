@@ -11,6 +11,9 @@ import { RiskPolicy, RiskAssessment, RiskLevel, VerificationLevel } from './risk
 import { ExecutionPlan } from './protocols/types';
 import { VerificationConfig } from './verification-runner';
 import { ProfileLoader } from './profile/profile-loader';
+import { CategoryResolver } from './profile/category-resolver';
+import { AssignmentResolver } from './profile/assignment-resolver';
+import { WorkerAssignmentLoader } from './profile/worker-assignments';
 
 /** Worker 选择策略 */
 export interface WorkerSelectionPolicy {
@@ -69,11 +72,17 @@ export class PolicyEngine extends EventEmitter {
 
   /** 画像加载器 */
   private profileLoader?: ProfileLoader;
+  private categoryResolver = new CategoryResolver();
+  private assignmentResolver: AssignmentResolver;
 
   constructor(profileLoader?: ProfileLoader) {
     super();
     this.riskPolicy = new RiskPolicy();
     this.profileLoader = profileLoader;
+    const assignmentLoader = profileLoader
+      ? profileLoader.getAssignmentLoader()
+      : new WorkerAssignmentLoader();
+    this.assignmentResolver = new AssignmentResolver(assignmentLoader);
     this.initializeWorkerHealth();
   }
 
@@ -82,6 +91,7 @@ export class PolicyEngine extends EventEmitter {
    */
   setProfileLoader(loader: ProfileLoader): void {
     this.profileLoader = loader;
+    this.assignmentResolver = new AssignmentResolver(loader.getAssignmentLoader());
   }
 
   /** 初始化 Worker 健康状态 */
@@ -105,104 +115,33 @@ export class PolicyEngine extends EventEmitter {
    */
   selectWorker(task: SubTask, availableWorkers?: WorkerSlot[]): WorkerSelectionPolicy {
     const available = availableWorkers || this.getAvailableWorkers();
-    const taskType = this.inferTaskType(task);
+    const taskType = this.resolveTaskType(task);
+    const assignedWorker = this.assignmentResolver.resolveWorker(taskType);
 
-    // 从 ProfileLoader 获取该分类的推荐 Worker
-    const preferredWorkers = this.getPreferredWorkersForCategory(taskType);
-
-    // 过滤出可用的 Worker
-    const candidates = preferredWorkers.filter(w => available.includes(w));
-    if (candidates.length === 0) {
-      // 回退到任何可用的 Worker（从画像配置获取优先级）
-      const fallbackWorker = available[0] || this.getDefaultWorkerFromProfile();
-      return {
-        recommendedWorker: fallbackWorker,
-        fallbackWorkers: available.slice(1),
-        reason: `无首选 Worker 可用，回退到 ${fallbackWorker}`,
-        confidence: 0.5,
-      };
+    if (available.length === 0) {
+      throw new Error(`无可用 Worker（分类: ${taskType}）`);
+    }
+    if (!available.includes(assignedWorker)) {
+      throw new Error(`分类 "${taskType}" 归属 ${assignedWorker}，但当前不可用`);
     }
 
-    // 根据健康状态和成功率排序
-    const sorted = this.sortByHealth(candidates);
-    const recommended = sorted[0];
-    const fallbacks = sorted.slice(1);
-
     return {
-      recommendedWorker: recommended,
-      fallbackWorkers: fallbacks,
-      reason: `任务类型 "${taskType}" 推荐使用 ${recommended}`,
-      confidence: this.calculateConfidence(recommended, taskType),
+      recommendedWorker: assignedWorker,
+      fallbackWorkers: [],
+      reason: `任务类型 "${taskType}" 归属 ${assignedWorker}`,
+      confidence: this.calculateConfidence(assignedWorker),
     };
   }
 
-  /**
-   * 从 ProfileLoader 获取分类的推荐 Worker 列表
-   */
-  private getPreferredWorkersForCategory(category: string): WorkerSlot[] {
-    if (!this.profileLoader) {
-      // 降级到默认值
-      return ['claude', 'codex', 'gemini'];
-    }
-
-    const categoryConfig = this.profileLoader.getCategory(category);
-    if (categoryConfig?.defaultWorker) {
-      const defaultWorker = categoryConfig.defaultWorker as WorkerSlot;
-      // 返回默认 Worker 加上其他可选 Worker
-      const allWorkers: WorkerSlot[] = ['claude', 'codex', 'gemini'];
-      const others = allWorkers.filter(w => w !== defaultWorker);
-      return [defaultWorker, ...others];
-    }
-
-    // 如果没有配置，使用默认规则
-    const rules = this.profileLoader.getCategoryRules();
-    const defaultCategory = rules.defaultCategory;
-    const defaultConfig = this.profileLoader.getCategory(defaultCategory);
-    if (defaultConfig?.defaultWorker) {
-      return [defaultConfig.defaultWorker as WorkerSlot, 'claude', 'codex', 'gemini'];
-    }
-
-    return ['claude', 'codex', 'gemini'];
-  }
-
   /** 推断任务类型
-   * 使用 ProfileLoader 的分类配置进行关键词匹配
+   * 使用 CategoryResolver 的唯一规则
    */
-  private inferTaskType(task: SubTask): string {
-    if (!this.profileLoader) {
-      throw new Error('[PolicyEngine] ProfileLoader 未初始化，无法推断任务类型');
-    }
+  private resolveTaskType(task: SubTask): string {
     const description = (task.description || '').toLowerCase();
     const title = (task.title || '').toLowerCase();
     const combinedText = `${description} ${title}`;
 
-    // 使用 ProfileLoader 的分类配置
-    const categories = this.profileLoader.getAllCategories();
-    const rules = this.profileLoader.getCategoryRules();
-
-    // 按优先级顺序匹配
-    for (const categoryName of rules.categoryPriority) {
-      const config = categories.get(categoryName);
-      if (!config) continue;
-
-      // 检查关键词匹配
-      for (const pattern of config.keywords) {
-        try {
-          const regex = new RegExp(pattern, 'i');
-          if (regex.test(combinedText)) {
-            return categoryName;
-          }
-        } catch {
-          // 如果正则表达式无效，使用简单字符串匹配
-          if (combinedText.includes(pattern.toLowerCase())) {
-            return categoryName;
-          }
-        }
-      }
-    }
-
-    // 回退到默认分类
-    return rules.defaultCategory;
+    return this.categoryResolver.resolveFromText(combinedText);
   }
 
   /** 根据健康状态排序 Worker */
@@ -225,18 +164,10 @@ export class PolicyEngine extends EventEmitter {
   /** 计算置信度
    * 基于 ProfileLoader 配置和健康状态
    */
-  private calculateConfidence(worker: WorkerSlot, taskType: string): number {
+  private calculateConfidence(worker: WorkerSlot): number {
     const health = this.workerHealthStatus.get(worker);
     const healthFactor = health?.successRate || 0.5;
-
-    // 检查是否是该分类的首选 Worker
-    let isPreferred = false;
-    if (this.profileLoader) {
-      const categoryConfig = this.profileLoader.getCategory(taskType);
-      isPreferred = categoryConfig?.defaultWorker === worker;
-    }
-
-    const baseConfidence = isPreferred ? 0.9 : 0.7;
+    const baseConfidence = 0.9;
     return Math.min(1, baseConfidence * healthFactor);
   }
 
@@ -248,31 +179,7 @@ export class PolicyEngine extends EventEmitter {
         available.push(worker);
       }
     }
-    // 如果没有可用 Worker，从画像配置获取默认 Worker
-    return available.length > 0 ? available : [this.getDefaultWorkerFromProfile()];
-  }
-
-  /** 从画像配置获取默认 Worker */
-  private getDefaultWorkerFromProfile(): WorkerSlot {
-    if (this.profileLoader) {
-      const rules = this.profileLoader.getCategoryRules();
-      const defaultCategory = rules?.defaultCategory;
-      if (defaultCategory) {
-        const config = this.profileLoader.getCategory(defaultCategory);
-        if (config?.defaultWorker) {
-          return config.defaultWorker as WorkerSlot;
-        }
-      }
-      // 返回画像中的第一个 Worker
-      const allProfiles = this.profileLoader.getAllProfiles();
-      const firstWorker = allProfiles.keys().next().value;
-      if (firstWorker) {
-        return firstWorker;
-      }
-    }
-    // 兜底：返回健康状态中的第一个 Worker
-    const firstHealthy = this.workerHealthStatus.keys().next().value;
-    return firstHealthy || 'claude';
+    return available;
   }
 
   /** 更新 Worker 健康状态 */

@@ -1,11 +1,12 @@
 <script lang="ts">
-  import type { Message } from '../types/message';
+  import type { Message, PlaceholderState } from '../types/message';
   import type { IconName } from '../lib/icons';
   import MarkdownContent from './MarkdownContent.svelte';
   import StreamingIndicator from './StreamingIndicator.svelte';
   import WorkerBadge from './WorkerBadge.svelte';
   import SubTaskSummaryCard from './SubTaskSummaryCard.svelte';
   import BlockRenderer from './BlockRenderer.svelte';
+  import PlaceholderMessage from './PlaceholderMessage.svelte';
   import Icon from './Icon.svelte';
 
   // Props
@@ -20,6 +21,15 @@
   const interactionMeta = $derived(message.metadata?.interaction as { prompt?: string; type?: string } | undefined);
   const isInteraction = $derived(Boolean(interactionMeta));
   const isStreaming = $derived(message.isStreaming);
+
+  // 占位消息相关派生状态
+  const isPlaceholder = $derived(Boolean(message.metadata?.isPlaceholder));
+  const placeholderState = $derived(
+    (message.metadata?.placeholderState as PlaceholderState) || 'pending'
+  );
+  const wasPlaceholder = $derived(Boolean(message.metadata?.wasPlaceholder));
+  const justCompleted = $derived(Boolean(message.metadata?.justCompleted));
+  const sendingAnimation = $derived(Boolean(message.metadata?.sendingAnimation));
 
   // 🛡️ 防御性编程：过滤无效的 blocks，防止 Svelte 5 "reading 'prev'" 错误
   // 确保 loop 中只处理有效的 block 对象
@@ -72,8 +82,12 @@
   }
 </script>
 
+<!-- 占位消息：使用专门组件渲染 -->
+{#if isPlaceholder}
+  <PlaceholderMessage state={placeholderState} />
+
 <!-- 系统通知消息：居中显示 -->
-{#if isNotice}
+{:else if isNotice}
   <div class="system-notice {noticeType}">
     <span class="notice-icon" style="color: {noticeColors[noticeType] || noticeColors.info}">
       <Icon name={noticeIcons[noticeType] || 'info'} size={14} />
@@ -83,7 +97,7 @@
   </div>
 <!-- 用户消息：简洁显示 -->
 {:else if isUser}
-  <div class="message-item user" data-message-id={message.id} data-source="user">
+  <div class="message-item user" class:sending={sendingAnimation} data-message-id={message.id} data-source="user">
     <div class="user-content">{message.content}</div>
     <div class="user-time">{formatTime(message.timestamp)}</div>
   </div>
@@ -97,6 +111,8 @@
   <div
     class="message-item assistant"
     class:streaming={isStreaming}
+    class:was-placeholder={wasPlaceholder}
+    class:just-completed={justCompleted}
     data-message-id={message.id}
     data-source={message.source}
     data-interaction={isInteraction ? 'true' : 'false'}
@@ -108,6 +124,9 @@
       </div>
       <div class="message-meta">
         <span class="message-time">{formatTime(message.timestamp)}</span>
+        {#if isStreaming}
+          <StreamingIndicator />
+        {/if}
         {#if !isStreaming}
           <button class="copy-btn" onclick={handleCopy} title="复制内容">
             <Icon name="copy" size={12} />
@@ -129,16 +148,13 @@
       {/if}
 
       {#if !message.metadata?.subTaskCard && safeBlocks.length > 0}
-        {#each safeBlocks as block, i (block.id || `${message.id}-block-${i}`)}
+        {#each safeBlocks as block, i (`${message.id}-block-${i}`)}
           <BlockRenderer {block} {isStreaming} />
         {/each}
       {:else if !message.metadata?.subTaskCard && message.content}
         <MarkdownContent content={message.content} {isStreaming} />
       {/if}
 
-      {#if isStreaming && safeBlocks.length === 0}
-        <StreamingIndicator />
-      {/if}
     </div>
   </div>
 {/if}

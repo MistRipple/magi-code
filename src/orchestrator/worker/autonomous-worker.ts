@@ -1086,19 +1086,6 @@ export class AutonomousWorker extends EventEmitter {
           }
         }
 
-        // 如果策略是换 Worker，返回新的 Assignment
-        if (decision.strategy === 'switch_worker') {
-          this.emit('recoveryNeedsReassignment', {
-            todoId: todo.id,
-            suggestedWorker: decision.alternativeWorker,
-            newAssignment: recoveryResult.newAssignment,
-          });
-
-          return {
-            success: true,
-            newAssignment: recoveryResult.newAssignment,
-          };
-        }
       }
 
       // 恢复失败

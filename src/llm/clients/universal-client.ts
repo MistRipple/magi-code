@@ -881,6 +881,16 @@ export class UniversalLLMClient extends BaseLLMClient {
             if (block.type === 'text') {
               return { type: 'text', text: block.text };
             }
+            if (block.type === 'image') {
+              const mediaType = block.source?.media_type || 'image/png';
+              const base64Data = block.source?.data || '';
+              return {
+                type: 'image_url',
+                image_url: {
+                  url: `data:${mediaType};base64,${base64Data}`,
+                },
+              };
+            }
             return block;
           }) as any,
         } as OpenAI.ChatCompletionMessageParam);

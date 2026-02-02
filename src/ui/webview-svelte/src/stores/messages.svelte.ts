@@ -18,6 +18,7 @@ import type {
   WebviewPersistedState,
   WaveState,
   WorkerSessionState,
+  RequestResponseBinding,
 } from '../types/message';
 import { vscode } from '../lib/vscode-bridge';
 import { ensureArray, generateId } from '../lib/utils';
@@ -201,6 +202,11 @@ let waveState = $state<WaveState | null>(null);
 
 // Worker Session 状态（提案 4.1）
 let workerSessions = $state<Map<string, WorkerSessionState>>(new Map());
+
+// 请求-响应绑定状态（消息响应流设计）
+let requestBindings = $state<Map<string, RequestResponseBinding>>(new Map());
+
+// 请求超时时间（30秒）
 
 // ============ 导出 Getter ============
 
@@ -405,6 +411,11 @@ export function clearProcessingState() {
   activeMessageIds = new Set();
   pendingRequests = new Set();
   updateProcessingState();
+}
+
+/** 获取后端处理状态（用于时序判断） */
+export function getBackendProcessing(): boolean {
+  return backendProcessing;
 }
 
 export function clearPendingInteractions() {
@@ -662,4 +673,66 @@ export function removeWorkerSession(sessionId: string) {
 
 export function clearWorkerSessions() {
   workerSessions = new Map();
+}
+
+// ============ 请求-响应绑定操作（消息响应流设计） ============
+
+/**
+ * 创建请求绑定
+ */
+export function createRequestBinding(binding: RequestResponseBinding): void {
+  const next = new Map(requestBindings);
+  next.set(binding.requestId, binding);
+  requestBindings = next;
+}
+
+/**
+ * 获取请求绑定
+ */
+export function getRequestBinding(requestId: string): RequestResponseBinding | undefined {
+  return requestBindings.get(requestId);
+}
+
+/**
+ * 更新请求绑定（添加 realMessageId）
+ */
+export function updateRequestBinding(
+  requestId: string,
+  updates: Partial<RequestResponseBinding>
+): void {
+  const existing = requestBindings.get(requestId);
+  if (existing) {
+    const updated = { ...existing, ...updates };
+    const next = new Map(requestBindings);
+    next.set(requestId, updated);
+    requestBindings = next;
+  }
+}
+
+/**
+ * 清除请求绑定
+ */
+export function clearRequestBinding(requestId: string): void {
+  const next = new Map(requestBindings);
+  next.delete(requestId);
+  requestBindings = next;
+}
+
+/**
+ * 根据占位消息 ID 查找请求绑定
+ */
+export function findBindingByPlaceholder(placeholderMessageId: string): RequestResponseBinding | undefined {
+  for (const binding of requestBindings.values()) {
+    if (binding.placeholderMessageId === placeholderMessageId) {
+      return binding;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * 清除所有请求绑定（会话切换时使用）
+ */
+export function clearAllRequestBindings(): void {
+  requestBindings = new Map();
 }

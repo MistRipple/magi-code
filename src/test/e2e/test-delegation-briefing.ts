@@ -27,19 +27,16 @@ async function testDelegationBriefing() {
     .map((entry: [string, any]) => `- ${entry[0]}: ${entry[1].description}`)
     .slice(0, 3)
     .join('\n');
-  const workerHints = '- claude: 架构设计专家\n- codex: 后端开发专家\n- gemini: 前端开发专家';
-
   const prompt = buildWorkerNeedDecisionPrompt(
     '分析 src/types.ts 文件的类型定义',
     'TASK',
-    categoryHints,
-    workerHints
+    categoryHints
   );
 
-  const hasDelegationBriefingsInPrompt = prompt.includes('delegationBriefings');
-  console.log(`Prompt 包含 delegationBriefings 要求: ${hasDelegationBriefingsInPrompt ? '✓ 通过' : '✗ 失败'}`);
+  const hasDelegationBriefingInPrompt = prompt.includes('delegationBriefing');
+  console.log(`Prompt 包含 delegationBriefing 要求: ${hasDelegationBriefingInPrompt ? '✓ 通过' : '✗ 失败'}`);
 
-  if (!hasDelegationBriefingsInPrompt) {
+  if (!hasDelegationBriefingInPrompt) {
     console.log('\nPrompt 内容片段:');
     const startIndex = prompt.indexOf('## 输出格式');
     if (startIndex >= 0) {
@@ -59,8 +56,7 @@ async function testDelegationBriefing() {
   const testPrompt = buildWorkerNeedDecisionPrompt(
     '分析 src/types.ts 文件中的类型定义，给出改进建议',
     'TASK',
-    categoryHints,
-    workerHints
+    categoryHints
   );
 
   console.log('发送请求到 Orchestrator LLM...');
@@ -85,19 +81,15 @@ async function testDelegationBriefing() {
         const parsed = JSON.parse(jsonMatch[0]);
         console.log('\n解析的 JSON 结构:');
         console.log('- needsWorker:', parsed.needsWorker);
-        console.log('- category:', parsed.category);
-        console.log('- workers:', parsed.workers);
-        console.log('- delegationBriefings:', parsed.delegationBriefings ? '存在' : '不存在');
+        console.log('- delegationBriefing:', parsed.delegationBriefing ? '存在' : '不存在');
         console.log('- reason:', parsed.reason);
 
-        if (parsed.delegationBriefings && Array.isArray(parsed.delegationBriefings)) {
-          console.log('\n✓ delegationBriefings 字段存在!');
+        if (parsed.delegationBriefing && typeof parsed.delegationBriefing === 'string') {
+          console.log('\n✓ delegationBriefing 字段存在!');
           console.log('\n委托说明内容（自然语言）:');
-          parsed.delegationBriefings.forEach((briefing: string, i: number) => {
-            console.log(`  [Worker ${i + 1}]: ${briefing.slice(0, 300)}${briefing.length > 300 ? '...' : ''}`);
-          });
+          console.log(`  ${parsed.delegationBriefing.slice(0, 300)}${parsed.delegationBriefing.length > 300 ? '...' : ''}`);
         } else {
-          console.log('\n✗ delegationBriefings 字段不存在或格式错误');
+          console.log('\n✗ delegationBriefing 字段不存在或格式错误');
           console.log('完整 JSON:', JSON.stringify(parsed, null, 2));
         }
       } catch (e) {

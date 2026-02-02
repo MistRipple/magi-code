@@ -34,20 +34,22 @@ import {
 
 // Guidance 相关
 import { GuidanceInjector, TaskStructuredInfo } from '../../orchestrator/profile/guidance-injector';
-import { DEFAULT_CLAUDE_PROFILE } from '../../orchestrator/profile/defaults/claude';
-import { DEFAULT_CODEX_PROFILE } from '../../orchestrator/profile/defaults/codex';
+import { WORKER_PERSONAS, DEFAULT_ASSIGNMENTS } from '../../orchestrator/profile';
 import { WorkerProfile } from '../../orchestrator/profile/types';
+import { WorkerSlot } from '../../types/agent-types';
 
 // Helper to get worker profile
 function getWorkerProfile(workerId: string): WorkerProfile {
-  switch (workerId) {
-    case 'claude':
-      return DEFAULT_CLAUDE_PROFILE;
-    case 'codex':
-      return DEFAULT_CODEX_PROFILE;
-    default:
-      return DEFAULT_CLAUDE_PROFILE;
+  const slot = workerId as WorkerSlot;
+  const persona = WORKER_PERSONAS[slot];
+  if (!persona) {
+    throw new Error(`未知 Worker: ${workerId}`);
   }
+  return {
+    worker: slot,
+    persona,
+    assignedCategories: [...DEFAULT_ASSIGNMENTS[slot]],
+  };
 }
 
 // Wisdom 相关

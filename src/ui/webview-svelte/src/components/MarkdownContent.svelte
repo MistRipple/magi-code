@@ -135,9 +135,10 @@
     font-weight: 600;
   }
 
-  .markdown-content :global(h1) { font-size: 1.5em; }
-  .markdown-content :global(h2) { font-size: 1.3em; }
-  .markdown-content :global(h3) { font-size: 1.1em; }
+  /* 标题字体大小适配消息内容，不宜过大 */
+  .markdown-content :global(h1) { font-size: var(--text-lg); }
+  .markdown-content :global(h2) { font-size: var(--text-md); }
+  .markdown-content :global(h3) { font-size: var(--text-base); }
 
   .markdown-content :global(ul),
   .markdown-content :global(ol) {

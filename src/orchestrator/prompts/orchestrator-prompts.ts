@@ -198,8 +198,7 @@ ${resultsText}
 export function buildWorkerNeedDecisionPrompt(
   userPrompt: string,
   recommendedMode: string,
-  categoryHints: string,
-  workerHints: string
+  categoryHints: string
 ): string {
   return `你是一个任务编排者，请完成意图到分配的统一决策。
 
@@ -212,25 +211,19 @@ ${recommendedMode}
 ## 画像任务类型（仅用于理解任务分类）
 ${categoryHints}
 
-## 可用 Worker（必须从这里选择）
-${workerHints}
-
 ## 判断要求
 1. **仅输出 JSON**，不要任何解释或额外文本
-2. needsWorker=false 时，必须提供 directResponse，并将 workers 置为空数组
-3. needsWorker=true 时，必须给出 category 与 workers（至少 1 个），并为每个 worker 生成 delegationBriefing
-4. workers 必须从上面的可用 Worker 中选择
-5. **涉及代码/文件修改、执行工具或工程性产出（diff/代码/配置）时，必须 needsWorker=true**
-6. 编排者可使用工具，但不应因此强制派发 Worker
-7. requiresModification=true 仅在需要对文件产生实际修改（增删改文件）时设置；仅分析/阅读则为 false
-8. **delegationBriefings**: 当 needsWorker=true 时，为每个 worker 生成一段自然语言的任务委托说明，像同事间的工作交接，包含任务背景、重点关注点、期望产出
+2. needsWorker=false 时，必须提供 directResponse
+3. needsWorker=true 时，只需给出 delegationBriefing（单条说明），不需要选择 Worker 或分类
+4. **涉及代码/文件修改、执行工具或工程性产出（diff/代码/配置）时，必须 needsWorker=true**
+5. 编排者可使用工具，但不应因此强制派发 Worker
+6. requiresModification=true 仅在需要对文件产生实际修改（增删改文件）时设置；仅分析/阅读则为 false
+7. **delegationBriefing**: 当 needsWorker=true 时，生成一段自然语言的任务委托说明，像同事间的工作交接，包含任务背景、重点关注点、期望产出
 
 ## 输出格式（严格 JSON）
 {
   "needsWorker": true/false,
-  "category": "命中的任务类型名称，未命中则为 none",
-  "workers": ["claude","codex","gemini"] ,
-  "delegationBriefings": ["给第一个worker的委托说明", "给第二个worker的委托说明"],
+  "delegationBriefing": "给执行者的委托说明",
   "needsTooling": true/false,
   "requiresModification": true/false,
   "directResponse": "当不需要 Worker 时必须提供",

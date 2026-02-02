@@ -9,6 +9,7 @@
 
 import { WorkerSlot } from '../../types';
 import { ProfileLoader } from '../profile/profile-loader';
+import { AssignmentResolver } from '../profile/assignment-resolver';
 import { WorkerProfile } from '../profile/types';
 import {
   Mission,
@@ -32,7 +33,11 @@ export interface PlanEvaluationResult {
  * ProfileAwareReviewer - 画像感知评审器
  */
 export class ProfileAwareReviewer {
-  constructor(private profileLoader: ProfileLoader) {}
+  private assignmentResolver: AssignmentResolver;
+
+  constructor(private profileLoader: ProfileLoader) {
+    this.assignmentResolver = new AssignmentResolver(profileLoader.getAssignmentLoader());
+  }
 
   /**
    * 计划评审：检查任务分配是否符合 Worker 能力
@@ -43,22 +48,19 @@ export class ProfileAwareReviewer {
 
     for (const assignment of mission.assignments) {
       const profile = this.profileLoader.getProfile(assignment.workerId);
-      const category = this.inferCategory(assignment);
+      const category = this.getAssignmentCategory(assignment);
 
-      // 1. 检查是否分配给了擅长该分类的 Worker
-      if (!profile.preferences.preferredCategories.includes(category)) {
-        const betterWorker = this.findBetterWorker(category, assignment.workerId);
+      const resolvedWorker = this.assignmentResolver.resolveWorker(category);
+      if (resolvedWorker !== assignment.workerId) {
         issues.push({
-          type: 'suboptimal_assignment',
+          type: 'critical',
           taskId: assignment.id,
-          message: `任务分类 "${category}" 不在 ${assignment.workerId} 的擅长领域`,
-          suggestion: betterWorker
-            ? `建议分配给 ${betterWorker}`
-            : undefined,
+          message: `分类 "${category}" 归属 ${resolvedWorker}，但当前分配为 ${assignment.workerId}`,
+          suggestion: `请修正 worker-assignments.json 归属或重新分配该任务`,
         });
       }
 
-      // 2. 检查任务是否涉及 Worker 的弱项
+      // 1. 检查任务是否涉及 Worker 的弱项
       const weaknessHits = this.findWeaknessMatches(
         assignment.responsibility,
         profile
@@ -75,7 +77,7 @@ export class ProfileAwareReviewer {
         );
       }
 
-      // 3. 检查 Todo 列表
+      // 2. 检查 Todo 列表
       for (const todo of assignment.todos) {
         const todoIssues = this.reviewTodo(todo, assignment, profile);
         issues.push(...todoIssues);
@@ -138,43 +140,35 @@ export class ProfileAwareReviewer {
    * 互检评审者选择：基于能力画像匹配
    */
   selectPeerReviewer(assignment: Assignment, executor: WorkerSlot): WorkerSlot {
-    const category = this.inferCategory(assignment);
+    const category = this.getAssignmentCategory(assignment);
     const allProfiles = this.profileLoader.getAllProfiles();
 
-    // 选择擅长该分类且不是执行者的 Worker
+    const categoryDef = this.profileLoader.getCategory(category);
     const candidates = Array.from(allProfiles.entries())
       .filter(([worker]) => worker !== executor)
-      .filter(([_, profile]) =>
-        profile.preferences.preferredCategories.includes(category)
-      )
       .sort((a, b) => {
-        // 优先选择该分类是第一优先的 Worker
-        const aIndex = a[1].preferences.preferredCategories.indexOf(category);
-        const bIndex = b[1].preferences.preferredCategories.indexOf(category);
-        return aIndex - bIndex;
+        if (!categoryDef) return 0;
+        const aScore = this.scorePersonaAgainstCategory(a[1], categoryDef);
+        const bScore = this.scorePersonaAgainstCategory(b[1], categoryDef);
+        return bScore - aScore;
       });
 
     if (candidates.length > 0) {
       return candidates[0][0] as WorkerSlot;
     }
 
-    // 没有找到擅长该分类的评审者，选择任意非执行者的 Worker
     const otherWorkers = Array.from(allProfiles.keys()).filter(w => w !== executor);
-    if (otherWorkers.length > 0) {
-      return otherWorkers[0];
+    if (otherWorkers.length === 0) {
+      throw new Error(`无法选择评审者，当前仅有执行者 ${executor}`);
     }
-
-    // 兜底：返回与执行者不同的任意 Worker（从画像配置获取）
-    const allWorkers = Array.from(allProfiles.keys());
-    const fallback = allWorkers.find(w => w !== executor) || allWorkers[0];
-    return fallback;
+    return otherWorkers[0];
   }
 
   /**
    * 评审严格度：基于分类风险 + Worker 弱项
    */
   determineReviewLevel(assignment: Assignment, executor: WorkerSlot): ReviewLevel {
-    const category = this.inferCategory(assignment);
+    const category = this.getAssignmentCategory(assignment);
     const categoryConfig = this.profileLoader.getCategory(category);
     const profile = this.profileLoader.getProfile(executor);
 
@@ -187,7 +181,7 @@ export class ProfileAwareReviewer {
           : 'light';
 
     // 如果任务涉及 Worker 弱项，提升严格度
-    const involvesWeakness = profile.profile.weaknesses.some(w =>
+    const involvesWeakness = profile.persona.weaknesses.some(w =>
       assignment.responsibility.toLowerCase().includes(w.toLowerCase())
     );
 
@@ -278,39 +272,22 @@ export class ProfileAwareReviewer {
   /**
    * 推断任务分类
    */
-  private inferCategory(assignment: Assignment): string {
-    const text = assignment.responsibility.toLowerCase();
-    const categories = this.profileLoader.getAllCategories();
-
-    for (const [categoryId, config] of Object.entries(categories)) {
-      for (const keywordPattern of config.keywords) {
-        const keywords = keywordPattern.split('|');
-        if (keywords.some((k: string) => text.includes(k.toLowerCase()))) {
-          return categoryId;
-        }
-      }
+  private getAssignmentCategory(assignment: Assignment): string {
+    const category = assignment.assignmentReason?.profileMatch?.category;
+    if (!category) {
+      throw new Error(`Assignment ${assignment.id} 缺少分类信息`);
     }
-
-    return 'general';
+    return category;
   }
 
-  /**
-   * 查找更合适的 Worker
-   */
-  private findBetterWorker(
-    category: string,
-    currentWorker: WorkerSlot
-  ): WorkerSlot | null {
-    const allProfiles = this.profileLoader.getAllProfiles();
-
-    for (const [worker, profile] of allProfiles.entries()) {
-      if (worker === currentWorker) continue;
-      if (profile.preferences.preferredCategories.includes(category)) {
-        return worker as WorkerSlot;
-      }
-    }
-
-    return null;
+  private scorePersonaAgainstCategory(profile: WorkerProfile, categoryDef: { guidance: { focus: string[] } }): number {
+    const focus = categoryDef.guidance?.focus || [];
+    if (focus.length === 0) return 0;
+    const strengths = profile.persona.strengths.map(s => s.toLowerCase());
+    return focus.reduce((score, item) => {
+      const normalized = item.toLowerCase();
+      return strengths.some(s => normalized.includes(s) || s.includes(normalized)) ? score + 1 : score;
+    }, 0);
   }
 
   /**
@@ -318,7 +295,7 @@ export class ProfileAwareReviewer {
    */
   private findWeaknessMatches(text: string, profile: WorkerProfile): string[] {
     const textLower = text.toLowerCase();
-    return profile.profile.weaknesses.filter(w =>
+    return profile.persona.weaknesses.filter(w =>
       textLower.includes(w.toLowerCase())
     );
   }

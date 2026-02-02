@@ -19,6 +19,7 @@ import { PermissionMatrix, StrategyConfig, SubTask, WorkerSlot, InteractionMode,
 import { TokenUsage } from '../../types/agent-types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
+import { CategoryResolver } from '../profile/category-resolver';
 import { PlanRecord, PlanStorage } from '../plan-storage';
 import { ExecutionPlan, OrchestratorState, QuestionCallback } from '../protocols/types';
 import { IntentGate, IntentHandlerMode } from '../intent-gate';
@@ -113,6 +114,7 @@ export class MissionDrivenEngine extends EventEmitter {
   private missionStorage: MissionStorageManager;
   private profileLoader: ProfileLoader;
   private guidanceInjector: GuidanceInjector;
+  private categoryResolver = new CategoryResolver();
 
   // UI 状态展示组件
   private planStorage: PlanStorage;
@@ -137,7 +139,6 @@ export class MissionDrivenEngine extends EventEmitter {
   private lastRoutingDecision: {
     needsWorker: boolean;
     category?: string;
-    workers?: WorkerSlot[];
     delegationBriefings?: string[];
     needsTooling?: boolean;
     requiresModification?: boolean;
@@ -264,8 +265,7 @@ export class MissionDrivenEngine extends EventEmitter {
         verification: 'verifying',
         summary: 'summarizing',
       };
-      this._state = stateMap[phase] || 'idle';
-      this.emit('stateChange', this._state);
+      this.setState(stateMap[phase] || 'idle');
     });
 
     // Mission 执行进度（现在从 MissionOrchestrator 获取）
@@ -337,8 +337,13 @@ export class MissionDrivenEngine extends EventEmitter {
   }
 
   private setState(next: OrchestratorState): void {
+    if (this._state === next) {
+      return;
+    }
     this._state = next;
     this.emit('stateChange', this._state);
+    const isRunning = next !== 'idle' && next !== 'completed' && next !== 'failed';
+    this.messageHub.phaseChange(next, isRunning, this.currentTaskId || undefined);
   }
 
   /**
@@ -368,29 +373,6 @@ export class MissionDrivenEngine extends EventEmitter {
    */
   getMessageHub(): MessageHub {
     return this.messageHub;
-  }
-
-  /**
-   * 发送编排者阶段消息到主对话区
-   * @param content 消息内容
-   * @param phase 阶段标识（用于日志和调试）
-   * @param metadata 额外元数据
-   */
-  private sendPhaseMessage(
-    content: string,
-    phase: string,
-    metadata?: Record<string, unknown>
-  ): void {
-    // 使用 MessageHub 发送（统一消息出口）
-    this.messageHub.progress(phase, content, {
-      metadata: {
-        phase,
-        isStatusMessage: true,
-        ...metadata,
-      },
-    });
-
-    logger.debug('引擎.阶段消息.发送', { phase, content: content.substring(0, 50) }, LogCategory.ORCHESTRATOR);
   }
 
   /**
@@ -818,6 +800,7 @@ export class MissionDrivenEngine extends EventEmitter {
       if (intentResult.skipMission) {
         this._context.mission = null;
         if (intentResult.mode === IntentHandlerMode.CLARIFY) {
+          this.setState('idle');
           this.currentTaskId = null;
           return '任务已取消。';
         }
@@ -829,6 +812,7 @@ export class MissionDrivenEngine extends EventEmitter {
             taskId,
             resolvedSessionId
           );
+          this.setState('idle');
           this.currentTaskId = null;
           return result;
         }
@@ -844,6 +828,7 @@ export class MissionDrivenEngine extends EventEmitter {
               this.messageHub.orchestratorMessage(decision.directResponse, {
                 metadata: { intent: 'ask', decision: 'llm' },
               });
+              this.setState('idle');
               this.currentTaskId = null;
               return decision.directResponse;
             }
@@ -852,6 +837,7 @@ export class MissionDrivenEngine extends EventEmitter {
               taskId,
               resolvedSessionId
             );
+            this.setState('idle');
             this.currentTaskId = null;
             return result;
           }
@@ -863,6 +849,7 @@ export class MissionDrivenEngine extends EventEmitter {
             { forceMode: IntentHandlerMode.TASK }
           );
           if (!intentResult.mission) {
+            this.setState('idle');
             this.currentTaskId = null;
             return '任务已取消。';
           }
@@ -881,6 +868,7 @@ export class MissionDrivenEngine extends EventEmitter {
               this.messageHub.orchestratorMessage(decision.directResponse, {
                 metadata: { intent: 'ask', decision: 'llm' },
               });
+              this.setState('idle');
               this.currentTaskId = null;
               return decision.directResponse;
             }
@@ -889,6 +877,7 @@ export class MissionDrivenEngine extends EventEmitter {
               taskId,
               resolvedSessionId
             );
+            this.setState('idle');
             this.currentTaskId = null;
             return result;
           }
@@ -900,6 +889,7 @@ export class MissionDrivenEngine extends EventEmitter {
             { forceMode: IntentHandlerMode.TASK }
           );
           if (!intentResult.mission) {
+            this.setState('idle');
             this.currentTaskId = null;
             return '任务已取消。';
           }
@@ -909,13 +899,11 @@ export class MissionDrivenEngine extends EventEmitter {
 
         if (intentResult.skipMission) {
           // 其他非任务模式
+          this.setState('idle');
           this.currentTaskId = null;
           return intentResult.suggestion;
         }
       }
-
-      // 发送分析阶段消息（仅任务路径）
-      this.sendPhaseMessage('正在理解你的需求...', 'analyzing');
 
       // 3. 创建并执行 Mission
       const mission = intentResult.mission!;
@@ -928,28 +916,17 @@ export class MissionDrivenEngine extends EventEmitter {
       await this.understandGoalWithLLM(mission, activePrompt, resolvedSessionId);
 
       // 5. 规划协作
-      this.sendPhaseMessage('正在规划任务分配方案...', 'planning');
       if (!this.lastRoutingDecision) {
         const routingDecision = await this.decideWorkerNeedWithLLM(
           activePrompt,
           IntentHandlerMode.TASK
         );
-        if (!routingDecision.needsWorker || !routingDecision.workers?.length) {
-          throw new Error('编排器路由决策无效：TASK 模式必须指定 Worker');
+        if (!routingDecision.needsWorker || !routingDecision.category) {
+          throw new Error('编排器路由决策无效：TASK 模式必须解析分类');
         }
         this.lastRoutingDecision = routingDecision;
       }
       await this.planCollaborationWithLLM(mission, resolvedSessionId);
-
-      // 发送规划完成消息，使用自然语言描述
-      const assignmentCount = mission.assignments.length;
-      const todoCount = mission.assignments.reduce((sum, a) => sum + a.todos.length, 0);
-      const workerNames = [...new Set(mission.assignments.map(a => a.workerId))].join('、');
-      this.sendPhaseMessage(
-        `任务已分解完成，共 ${assignmentCount} 个分配、${todoCount} 个子任务，将由 ${workerNames} 协同执行`,
-        'planned',
-        { assignmentCount, todoCount, workers: workerNames }
-      );
 
       // 向各 Worker 发送任务分配说明（展示在对应 Worker Tab）
       if (mission.assignments.length > 0) {
@@ -978,7 +955,6 @@ export class MissionDrivenEngine extends EventEmitter {
 
       // 8. 执行 Mission
       this.setState('dispatching');
-      this.sendPhaseMessage('开始执行任务...', 'executing');
 
       const analysis = this.lastTaskAnalysis as unknown as {
         wantsParallel?: boolean;
@@ -1229,7 +1205,10 @@ export class MissionDrivenEngine extends EventEmitter {
     await this.ensureContextReady(resolvedSessionId);
 
     // 尝试从存储加载对应的 Mission
-    let mission = await this.missionStorage.load(plan.id || taskId);
+    if (!plan.id || !plan.id.trim()) {
+      throw new Error('ExecutionPlan missing id');
+    }
+    let mission = await this.missionStorage.load(plan.id);
 
     if (!mission) {
       // 如果没有 Mission，从 Plan 创建一个
@@ -1512,18 +1491,18 @@ export class MissionDrivenEngine extends EventEmitter {
    * 使用 LLM 规划协作
    */
   private async planCollaborationWithLLM(mission: Mission, _sessionId: string): Promise<void> {
-    if (!this.lastRoutingDecision?.workers || this.lastRoutingDecision.workers.length === 0) {
-      throw new Error('编排器路由决策缺失：未指定 Worker');
+    if (!this.lastRoutingDecision?.category) {
+      throw new Error('编排器路由决策缺失：未解析分类');
     }
     this.lastTaskAnalysis = {
-      explicitWorkers: this.lastRoutingDecision.workers,
+      explicitWorkers: [],
     };
 
-    // 选择参与者（完全使用 LLM 决策的 Worker）
+    // 选择参与者（完全由分类归属决定）
     const participants = await this.missionOrchestrator.selectParticipants(mission, {
-      preferredWorkers: this.lastRoutingDecision.workers,
       category: this.lastRoutingDecision.category,
     });
+    this.lastTaskAnalysis.explicitWorkers = participants;
 
     // 定义契约
     await this.missionOrchestrator.defineContracts(mission, participants);
@@ -1692,7 +1671,6 @@ export class MissionDrivenEngine extends EventEmitter {
   ): Promise<{
     needsWorker: boolean;
     category?: string;
-    workers?: WorkerSlot[];
     delegationBriefings?: string[];
     needsTooling?: boolean;
     requiresModification?: boolean;
@@ -1700,22 +1678,12 @@ export class MissionDrivenEngine extends EventEmitter {
     reason?: string;
   }> {
     const categoryHints = Array.from(this.profileLoader.getAllCategories().entries())
-      .map(([name, config]) => `- ${name}: ${config.description} (default: ${config.defaultWorker})`)
+      .map(([name, config]) => `- ${name}: ${config.description}`)
       .join('\n');
-    const availableWorkers = Array.from(this.profileLoader.getAllProfiles().keys());
-    const workerHints = availableWorkers.map(worker => {
-      try {
-        const profile = this.profileLoader.getProfile(worker);
-        const role = profile.guidance.role?.trim();
-        return role ? `- ${worker}: ${role}` : `- ${worker}`;
-      } catch {
-        return `- ${worker}`;
-      }
-    }).join('\n');
 
     const prompts = [
-      buildWorkerNeedDecisionPrompt(userPrompt, mode, categoryHints, workerHints),
-      `${buildWorkerNeedDecisionPrompt(userPrompt, mode, categoryHints, workerHints)}\n\n再次强调：必须严格输出 JSON，且 needsWorker/worker/directResponse 字段必须自洽。`,
+      buildWorkerNeedDecisionPrompt(userPrompt, mode, categoryHints),
+      `${buildWorkerNeedDecisionPrompt(userPrompt, mode, categoryHints)}\n\n再次强调：必须严格输出 JSON，且 needsWorker/directResponse 字段必须自洽。`,
     ];
 
     for (const prompt of prompts) {
@@ -1743,43 +1711,39 @@ export class MissionDrivenEngine extends EventEmitter {
         if (jsonMatch) {
           const parsed = JSON.parse(jsonMatch[0]) as {
             needsWorker?: boolean;
-            category?: string;
-            workers?: string[];
             delegationBriefings?: string[];
+            delegationBriefing?: string;
             needsTooling?: boolean;
             requiresModification?: boolean;
             directResponse?: string;
             reason?: string;
           };
-          const category = typeof parsed.category === 'string'
-            ? parsed.category.trim()
-            : '';
-          const workers = Array.isArray(parsed.workers)
-            ? parsed.workers.map(w => String(w).trim().toLowerCase()).filter(Boolean)
-            : [];
-          const filteredWorkers = workers.filter(worker => availableWorkers.includes(worker as WorkerSlot));
           const needsWorker = Boolean(parsed.needsWorker);
           const requiresModification = Boolean(parsed.requiresModification);
           const directResponse = typeof parsed.directResponse === 'string' ? parsed.directResponse.trim() : '';
 
-          // 解析 delegationBriefings（与 workers 一一对应）
-          const delegationBriefings = Array.isArray(parsed.delegationBriefings)
-            ? parsed.delegationBriefings.map(b => typeof b === 'string' ? b.trim() : '').filter(Boolean)
-            : [];
+          // 解析 delegationBriefings（单个或数组均可）
+          const rawBriefings = Array.isArray(parsed.delegationBriefings)
+            ? parsed.delegationBriefings
+            : typeof parsed.delegationBriefing === 'string'
+              ? [parsed.delegationBriefing]
+              : [];
+          const delegationBriefings = rawBriefings
+            .map(b => typeof b === 'string' ? b.trim() : '')
+            .filter(Boolean);
 
           if (!needsWorker && directResponse.length === 0) {
             logger.warn('编排器.路由决策.无效_直答缺失', { mode }, LogCategory.ORCHESTRATOR);
             continue;
           }
-          if (needsWorker && filteredWorkers.length === 0) {
-            logger.warn('编排器.路由决策.无效_Worker缺失', { mode }, LogCategory.ORCHESTRATOR);
-            continue;
-          }
+
+          const resolvedCategory = needsWorker
+            ? this.categoryResolver.resolveFromText(userPrompt)
+            : undefined;
 
           return {
             needsWorker,
-            category: category && category !== 'none' ? category : undefined,
-            workers: filteredWorkers.length > 0 ? (filteredWorkers as WorkerSlot[]) : undefined,
+            category: resolvedCategory,
             delegationBriefings: delegationBriefings.length > 0 ? delegationBriefings : undefined,
             needsTooling: Boolean(parsed.needsTooling),
             requiresModification,
@@ -1907,12 +1871,16 @@ export class MissionDrivenEngine extends EventEmitter {
         status: 'pending' as const,
       })),
       contracts: [],
-      assignments: plan.subTasks.map((subTask) => ({
+      assignments: plan.subTasks.map((subTask) => {
+        const category = this.categoryResolver.resolveFromText(
+          `${subTask.title || ''} ${subTask.description || ''}`.trim()
+        );
+        return {
         id: subTask.id,
         missionId: plan.id,
         workerId: subTask.assignedWorker as WorkerSlot,  // ✅ Type assertion: assignments are only for workers
         assignmentReason: {
-          profileMatch: { category: 'general', score: 0.8, matchedKeywords: [] },
+          profileMatch: { category, score: 0.8, matchedKeywords: [] },
           contractRole: 'none' as const,
           explanation: 'From ExecutionPlan',
           alternatives: [],
@@ -1927,7 +1895,8 @@ export class MissionDrivenEngine extends EventEmitter {
         status: 'pending' as const,
         progress: 0,
         createdAt: now,
-      })),
+      };
+      }),
       riskLevel,
       riskFactors: [],
       executionPath: 'standard',
