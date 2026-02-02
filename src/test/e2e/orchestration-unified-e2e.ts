@@ -4,7 +4,7 @@
  * 基于 orchestration-unified-design.md 第 13 章端到端场景验证清单
  *
  * 验证目标：
- * 1. 快速路径 (QuickExecutor) - ASK/DIRECT/EXPLORE
+ * 1. 非任务模式 (ASK/DIRECT/EXPLORE)
  * 2. 完整路径 (MissionOrchestrator) - 单Worker/多Worker/汇报
  * 3. 消息统一 - MessageHub 统一出口
  * 4. 状态统一 - MissionStateMapper 状态映射
@@ -185,7 +185,7 @@ function createMockMission(options?: {
 }
 
 // ============================================================================
-// 13.1 快速路径场景 (QuickExecutor)
+// 13.1 非任务模式场景 (ASK/DIRECT/EXPLORE)
 // ============================================================================
 
 /**
@@ -441,8 +441,10 @@ function testDIRECTMode(): ScenarioResult[] {
     const hub = new MessageHub();
     let workerOutputReceived = false;
 
-    hub.on('worker:output', () => {
-      workerOutputReceived = true;
+    hub.on('unified:message', (msg: any) => {
+      if (msg?.source === 'worker') {
+        workerOutputReceived = true;
+      }
     });
 
     // 模拟 Worker 输出
@@ -717,8 +719,10 @@ function testSingleWorkerMission(): ScenarioResult[] {
     const hub = new MessageHub();
     let subTaskCardReceived = false;
 
-    hub.on('subTaskCard', () => {
-      subTaskCardReceived = true;
+    hub.on('unified:message', (msg: any) => {
+      if (msg?.metadata?.subTaskCard) {
+        subTaskCardReceived = true;
+      }
     });
 
     // 模拟发送 SubTaskCard
@@ -1089,8 +1093,10 @@ function testWorkerReporting(): ScenarioResult[] {
     const hub = new MessageHub();
     let resultReceived = false;
 
-    hub.on('result', () => {
-      resultReceived = true;
+    hub.on('unified:message', (msg: any) => {
+      if (msg?.type === 'result') {
+        resultReceived = true;
+      }
     });
 
     hub.result('任务完成');
@@ -1248,10 +1254,12 @@ async function testWorkerDegradation(): Promise<ScenarioResult[]> {
     let errorReceived = false;
     let providesOptions = false;
 
-    hub.on('error', (data) => {
-      errorReceived = true;
-      // 检查是否提供重试/放弃选项
-      providesOptions = data?.recoverable === true;
+    hub.on('unified:message', (msg: any) => {
+      if (msg?.type === 'error') {
+        errorReceived = true;
+        // 检查是否提供重试/放弃选项
+        providesOptions = msg?.metadata?.recoverable === true;
+      }
     });
 
     hub.error('所有 Worker 执行失败', { recoverable: true });
@@ -1407,8 +1415,10 @@ async function testNetworkExceptions(): Promise<ScenarioResult[]> {
     const hub = new MessageHub();
     let progressReceived = false;
 
-    hub.on('orchestrator:message', () => {
-      progressReceived = true;
+    hub.on('unified:message', (msg: any) => {
+      if (msg?.type === 'progress' && msg?.source === 'orchestrator') {
+        progressReceived = true;
+      }
     });
 
     hub.progress('rate_limit', '请求限流，等待重试...');
@@ -1644,8 +1654,10 @@ function testUserExceptions(): ScenarioResult[] {
     const hub = new MessageHub();
     let conflictNotified = false;
 
-    hub.on('error', () => {
-      conflictNotified = true;
+    hub.on('unified:message', (msg: any) => {
+      if (msg?.type === 'error') {
+        conflictNotified = true;
+      }
     });
 
     hub.error('检测到文件冲突', { details: { files: userModifiedFiles } });
@@ -1917,26 +1929,27 @@ function testMessageHub(): ScenarioResult[] {
     let orchestratorMessageReceived = false;
     let workerOutputReceived = false;
 
-    hub.on('orchestrator:message', () => {
-      orchestratorMessageReceived = true;
-    });
-
-    hub.on('worker:output', () => {
-      workerOutputReceived = true;
+    hub.on('unified:message', (msg: any) => {
+      if (msg?.source === 'orchestrator') {
+        orchestratorMessageReceived = true;
+      }
+      if (msg?.source === 'worker') {
+        workerOutputReceived = true;
+      }
     });
 
     // 发送编排者进度消息
     hub.progress('planning', '正在分析任务...');
 
     verificationPoints.push({
-      name: '编排者消息触发 orchestrator:message 事件',
+      name: '编排者消息进入统一通道',
       expected: 'true',
       actual: String(orchestratorMessageReceived),
       passed: orchestratorMessageReceived,
     });
 
     verificationPoints.push({
-      name: '编排者消息不触发 worker:output 事件',
+      name: '编排者消息不落入 worker 输出',
       expected: 'false',
       actual: String(workerOutputReceived),
       passed: !workerOutputReceived,
@@ -1962,26 +1975,27 @@ function testMessageHub(): ScenarioResult[] {
     let workerOutputData: any = null;
     let orchestratorMessageFromWorker = false;
 
-    hub.on('orchestrator:message', () => {
-      orchestratorMessageFromWorker = true;
-    });
-
-    hub.on('worker:output', (data) => {
-      workerOutputData = data;
+    hub.on('unified:message', (msg: any) => {
+      if (msg?.source === 'orchestrator') {
+        orchestratorMessageFromWorker = true;
+      }
+      if (msg?.source === 'worker') {
+        workerOutputData = msg;
+      }
     });
 
     // 发送 Worker 输出
     hub.workerOutput('claude', 'Worker 执行中...');
 
     verificationPoints.push({
-      name: 'Worker 输出触发 worker:output 事件',
+      name: 'Worker 输出进入统一通道',
       expected: 'claude',
-      actual: workerOutputData?.worker || 'null',
-      passed: workerOutputData?.worker === 'claude',
+      actual: workerOutputData?.agent || 'null',
+      passed: workerOutputData?.agent === 'claude',
     });
 
     verificationPoints.push({
-      name: 'Worker 输出不触发 orchestrator:message 事件',
+      name: 'Worker 输出不落入编排者通道',
       expected: 'false',
       actual: String(orchestratorMessageFromWorker),
       passed: orchestratorMessageFromWorker === false,
@@ -2007,9 +2021,11 @@ function testMessageHub(): ScenarioResult[] {
     let subTaskCardReceived = false;
     let cardData: any = null;
 
-    hub.on('subTaskCard', (data) => {
-      subTaskCardReceived = true;
-      cardData = data;
+    hub.on('unified:message', (msg: any) => {
+      if (msg?.metadata?.subTaskCard) {
+        subTaskCardReceived = true;
+        cardData = msg.metadata.subTaskCard;
+      }
     });
 
     hub.subTaskCard({
@@ -2052,8 +2068,10 @@ function testMessageHub(): ScenarioResult[] {
 
     let errorData: any = null;
 
-    hub.on('error', (data) => {
-      errorData = data;
+    hub.on('unified:message', (msg: any) => {
+      if (msg?.type === 'error') {
+        errorData = msg;
+      }
     });
 
     // 发送错误消息
@@ -2141,7 +2159,7 @@ function testMessageHub(): ScenarioResult[] {
 
     let messageCount = 0;
 
-    hub.on('orchestrator:message', () => {
+    hub.on('unified:message', () => {
       messageCount++;
     });
 
@@ -2439,8 +2457,8 @@ export async function runOrchestrationUnifiedTests(): Promise<void> {
 
   const allResults: ScenarioResult[] = [];
 
-  // 13.1 快速路径场景
-  console.log('【13.1 快速路径场景 (QuickExecutor)】');
+  // 13.1 非任务模式场景
+  console.log('【13.1 非任务模式场景 (ASK/DIRECT/EXPLORE)】');
 
   console.log('  [ASK 模式]');
   const askResults = testASKMode();

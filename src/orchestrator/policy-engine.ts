@@ -11,7 +11,6 @@ import { RiskPolicy, RiskAssessment, RiskLevel, VerificationLevel } from './risk
 import { ExecutionPlan } from './protocols/types';
 import { VerificationConfig } from './verification-runner';
 import { ProfileLoader } from './profile/profile-loader';
-import { CategoryConfig } from './profile/types';
 
 /** Worker 选择策略 */
 export interface WorkerSelectionPolicy {
@@ -58,35 +57,6 @@ export interface WorkerHealthStatus {
   lastSuccessAt?: number;
 }
 
-
-/**
- * 🗑️ 已废弃: 硬编码的任务映射
- * 现在从 ProfileLoader 读取分类配置
- */
-
-/** 文件类型到任务类型的映射（保留用于文件扩展名推断） */
-const FILE_TYPE_MAPPING: Record<string, string> = {
-  '.tsx': 'frontend',
-  '.jsx': 'frontend',
-  '.vue': 'frontend',
-  '.svelte': 'frontend',
-  '.css': 'styling',
-  '.scss': 'styling',
-  '.less': 'styling',
-  '.ts': 'backend',
-  '.js': 'backend',
-  '.py': 'backend',
-  '.go': 'backend',
-  '.rs': 'backend',
-  '.java': 'backend',
-  '.sql': 'database',
-  '.prisma': 'database',
-  '.md': 'docs',
-  '.test.ts': 'test',
-  '.spec.ts': 'test',
-  '.test.js': 'test',
-  '.spec.js': 'test',
-};
 
 /**
  * 统一策略引擎
@@ -199,63 +169,40 @@ export class PolicyEngine extends EventEmitter {
    * 使用 ProfileLoader 的分类配置进行关键词匹配
    */
   private inferTaskType(task: SubTask): string {
+    if (!this.profileLoader) {
+      throw new Error('[PolicyEngine] ProfileLoader 未初始化，无法推断任务类型');
+    }
     const description = (task.description || '').toLowerCase();
     const title = (task.title || '').toLowerCase();
-    const files = task.targetFiles || [];
     const combinedText = `${description} ${title}`;
 
     // 使用 ProfileLoader 的分类配置
-    if (this.profileLoader) {
-      const categories = this.profileLoader.getAllCategories();
-      const rules = this.profileLoader.getCategoryRules();
+    const categories = this.profileLoader.getAllCategories();
+    const rules = this.profileLoader.getCategoryRules();
 
-      // 按优先级顺序匹配
-      for (const categoryName of rules.categoryPriority) {
-        const config = categories.get(categoryName);
-        if (!config) continue;
+    // 按优先级顺序匹配
+    for (const categoryName of rules.categoryPriority) {
+      const config = categories.get(categoryName);
+      if (!config) continue;
 
-        // 检查关键词匹配
-        for (const pattern of config.keywords) {
-          try {
-            const regex = new RegExp(pattern, 'i');
-            if (regex.test(combinedText)) {
-              return categoryName;
-            }
-          } catch {
-            // 如果正则表达式无效，使用简单字符串匹配
-            if (combinedText.includes(pattern.toLowerCase())) {
-              return categoryName;
-            }
+      // 检查关键词匹配
+      for (const pattern of config.keywords) {
+        try {
+          const regex = new RegExp(pattern, 'i');
+          if (regex.test(combinedText)) {
+            return categoryName;
+          }
+        } catch {
+          // 如果正则表达式无效，使用简单字符串匹配
+          if (combinedText.includes(pattern.toLowerCase())) {
+            return categoryName;
           }
         }
       }
     }
 
-    // 2. 从目标文件推断
-    for (const file of files) {
-      const ext = this.getFileExtension(file);
-      if (FILE_TYPE_MAPPING[ext]) {
-        return FILE_TYPE_MAPPING[ext];
-      }
-    }
-
-    // 3. 回退到默认分类
-    if (this.profileLoader) {
-      const rules = this.profileLoader.getCategoryRules();
-      return rules.defaultCategory;
-    }
-
-    return 'simple';
-  }
-
-  /** 获取文件扩展名 */
-  private getFileExtension(file: string): string {
-    // 处理 .test.ts, .spec.ts 等复合扩展名
-    if (file.includes('.test.') || file.includes('.spec.')) {
-      return file.includes('.test.') ? '.test.ts' : '.spec.ts';
-    }
-    const match = file.match(/\.[^.]+$/);
-    return match ? match[0] : '';
+    // 回退到默认分类
+    return rules.defaultCategory;
   }
 
   /** 根据健康状态排序 Worker */

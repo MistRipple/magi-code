@@ -25,10 +25,14 @@ import {
   StreamUpdate,
   MessageLifecycle,
   MessageType,
+  MessageCategory,
   ContentBlock,
   MessageMetadata,
+  DataMessageType,
+  NotifyLevel,
+  createStandardMessage,
 } from '../protocol/message-protocol';
-import { ADAPTER_EVENTS, MESSAGE_EVENTS, PROCESSING_EVENTS, WEBVIEW_MESSAGE_TYPES } from '../protocol/event-names';
+import { ADAPTER_EVENTS, PROCESSING_EVENTS, WEBVIEW_MESSAGE_TYPES } from '../protocol/event-names';
 import { UnifiedSessionManager } from '../session';
 import { UnifiedTaskManager } from '../task/unified-task-manager';
 import { SessionManagerTaskRepository } from '../task/session-manager-task-repository';
@@ -39,7 +43,6 @@ import { IAdapterFactory } from '../adapters/adapter-factory-interface';
 import { LLMAdapterFactory } from '../llm/adapter-factory';
 import { MissionDrivenEngine } from '../orchestrator/core';
 import { MessageHub } from '../orchestrator/core/message-hub';
-import { UnifiedMessageBus, type ProcessingState } from '../normalizer/unified-message-bus';
 import { ProfileStorage, StoredProfileConfig } from '../orchestrator/profile';
 import { parseContentToBlocks } from '../utils/content-parser';
 import { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
@@ -64,55 +67,12 @@ import {
 type WebviewMessagePriority = 'high' | 'normal';
 
 const HIGH_PRIORITY_MESSAGE_TYPES = new Set<ExtensionToWebviewMessage['type']>([
-  'toast',
-  'error',
-  'confirmationRequest',
-  'recoveryRequest',
-  'recoveryResult',
-  'taskPaused',
-  'taskResumed',
-  'phaseChanged',
-  'showDiff',
-  'workerFallbackNotice',
-  'loginSuccess',
-  'loginError',
-  'authStatus',
-  'promptEnhanceResult',
-  'promptEnhanceSaved',
-  'promptEnhanced',
-  'workerConfigSaved',
-  'workerConnectionTestResult',
-  'orchestratorConfigSaved',
-  'orchestratorConnectionTestResult',
-  'compressorConfigSaved',
-  'compressorConnectionTestResult',
-  'skillsConfigSaved',
-  'profileConfigSaved',
-  'profileConfigReset',
-  'customToolAdded',
-  'customToolRemoved',
-  'instructionSkillRemoved',
-  'skillInstalled',
-  'repositoryAdded',
-  'repositoryUpdated',
-  'repositoryDeleted',
-  'repositoryRefreshed',
-  'mcpServerAdded',
-  'mcpServerUpdated',
-  'mcpServerDeleted',
-  'mcpServerConnected',
-  'mcpServerDisconnected',
-  'mcpServerConnectionFailed',
-  'mcpToolsRefreshed',
-  'mcpServerTools',
+  'unifiedMessage',
+  'unifiedUpdate',
+  'unifiedComplete',
 ]);
 
-const COALESCE_MESSAGE_TYPES = new Set<ExtensionToWebviewMessage['type']>([
-  'stateUpdate',
-  'executionStatsUpdate',
-  'workerStatusUpdate',
-  'sessionsUpdated',
-]);
+const COALESCE_MESSAGE_TYPES = new Set<ExtensionToWebviewMessage['type']>();
 
 class WebviewMessageBus {
   private highQueue: ExtensionToWebviewMessage[] = [];
@@ -193,8 +153,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private readonly messageFlowLogPath: string;
   private webviewMessageBus: WebviewMessageBus;
 
-  // 统一消息总线
-  private messageBus: UnifiedMessageBus;
+  // 统一消息出口
   private messageHub: MessageHub;
 
   // 适配器工厂（LLM 模式）
@@ -272,14 +231,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       COALESCE_MESSAGE_TYPES
     );
 
-    // 初始化统一消息总线
-    this.messageBus = new UnifiedMessageBus({
-      enabled: true,
-      minStreamInterval: 100,
-      batchInterval: 50,
-      retentionTime: 5 * 60 * 1000,
-      debug: false,
-    });
     // MessageHub 由 MissionDrivenEngine 创建，初始化后再绑定监听
 
     // 初始化统一会话管理器
@@ -304,16 +255,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 初始化 LLM 适配器工厂
     this.adapterFactory = new LLMAdapterFactory({ cwd: workspaceRoot });
 
-    // 注入 MessageBus 到 AdapterFactory（必须在创建 Adapter 之前）
-    // 这样 Adapter 可以直接通过 MessageBus 发送消息
-    (this.adapterFactory as LLMAdapterFactory).setMessageBus(this.messageBus);
-
-    // 异步初始化 profile loader
-    void (this.adapterFactory as LLMAdapterFactory).initialize().catch(err => {
-      logger.error('Failed to initialize LLM adapter factory', { error: err.message }, LogCategory.LLM);
-    });
-
-    // 设置错误事件处理（消息由 Adapter 直接发送到 MessageBus，不再通过事件转发）
+    // 设置错误事件处理（消息由 Adapter 直接发送到 MessageHub，不再通过事件转发）
     this.setupAdapterEvents();
 
     // 初始化编排引擎
@@ -325,8 +267,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.sessionManager
     );
     this.messageHub = this.orchestratorEngine.getMessageHub();
+
+    // 🔧 统一消息通道：注入 MessageHub 到 AdapterFactory（必须在创建 Adapter 之前）
+    // MessageHub 从 orchestratorEngine 获取后，立即注入给 AdapterFactory
+    // 这样 Adapter 可以直接通过 MessageHub 发送消息
+    (this.adapterFactory as LLMAdapterFactory).setMessageHub(this.messageHub);
+
+    // 异步初始化 profile loader（在 MessageHub 注入之后）
+    void (this.adapterFactory as LLMAdapterFactory).initialize().catch(err => {
+      logger.error('Failed to initialize LLM adapter factory', { error: err.message }, LogCategory.LLM);
+    });
+
     this.setupMessageHubListeners();
-    this.setupMessageBusListeners();
     this.orchestratorEngine.setExtensionContext(this.context);
     // 设置 Hard Stop 确认回调
     this.setupOrchestratorConfirmation();
@@ -399,6 +351,62 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       enableRecovery: input?.enableRecovery ?? true,
       autoRollbackOnFailure: input?.autoRollbackOnFailure ?? false,
     };
+  }
+
+  private generateEntityId(prefix: string): string {
+    return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  }
+
+  private asArray<T>(value: T[] | undefined | null): T[] {
+    return Array.isArray(value) ? value : [];
+  }
+
+  private normalizeTodo(rawTodo: WorkerTodo | undefined | null, assignmentId: string, seen: Set<string>): WorkerTodo | null {
+    if (!rawTodo || typeof rawTodo !== 'object') {
+      return null;
+    }
+    const rawId = typeof rawTodo.id === 'string' ? rawTodo.id.trim() : '';
+    let id = rawId || this.generateEntityId('todo');
+    while (seen.has(id)) {
+      id = this.generateEntityId('todo');
+    }
+    seen.add(id);
+    return {
+      ...rawTodo,
+      id,
+      assignmentId: rawTodo.assignmentId || assignmentId,
+    };
+  }
+
+  private normalizeAssignments(rawAssignments: Assignment[] | undefined | null): Assignment[] {
+    const assignments: Assignment[] = [];
+    const seen = new Set<string>();
+    for (const raw of this.asArray(rawAssignments)) {
+      if (!raw || typeof raw !== 'object') continue;
+      const rawId = typeof raw.id === 'string' ? raw.id.trim() : '';
+      let id = rawId || this.generateEntityId('assignment');
+      while (seen.has(id)) {
+        id = this.generateEntityId('assignment');
+      }
+      seen.add(id);
+      const todoSeen = new Set<string>();
+      const todos = this.asArray(raw.todos)
+        .map(todo => this.normalizeTodo(todo, id, todoSeen))
+        .filter((todo): todo is WorkerTodo => Boolean(todo));
+      assignments.push({
+        ...raw,
+        id,
+        todos,
+      });
+    }
+    return assignments;
+  }
+
+  private normalizeTodos(rawTodos: WorkerTodo[] | undefined | null, assignmentId: string): WorkerTodo[] {
+    const seen = new Set<string>();
+    return this.asArray(rawTodos)
+      .map(todo => this.normalizeTodo(todo, assignmentId, seen))
+      .filter((todo): todo is WorkerTodo => Boolean(todo));
   }
 
   /**
@@ -629,11 +637,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         }, LogCategory.SESSION);
 
         // 通知前端
-        this.postMessage({
-          type: 'toast',
-          message: `自动提取了 ${adrs.length} 条架构决策记录`,
-          toastType: 'success'
-        });
+        this.sendToast(`自动提取了 ${adrs.length} 条架构决策记录`, 'success');
 
         // 刷新知识库显示
         await this.handleGetProjectKnowledge();
@@ -648,11 +652,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         }, LogCategory.SESSION);
 
         // 通知前端
-        this.postMessage({
-          type: 'toast',
-          message: `自动提取了 ${faqs.length} 条常见问题`,
-          toastType: 'success'
-        });
+        this.sendToast(`自动提取了 ${faqs.length} 条常见问题`, 'success');
 
         // 刷新知识库显示
         await this.handleGetProjectKnowledge();
@@ -687,100 +687,44 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  /** 设置 MessageBus 事件监听，转发消息到前端 */
-  private setupMessageBusListeners(): void {
-    // MessageBus 事件转发到 MessageHub（统一出口）
-    this.messageBus.on(MESSAGE_EVENTS.MESSAGE, (message) => {
-      this.assertBlocks(message.blocks, 'standardMessage.blocks');
-      this.cacheMessageMeta(message);
-      this.recordStreamingContext(message);
-      this.recordToolOutputsIfAny(message);
-      this.messageHub.forwardStandardMessage(message);
-      this.logMessageFlow('standardMessage [FORWARD]', message);
-    });
-
-    this.messageBus.on(MESSAGE_EVENTS.UPDATE, (update) => {
-      if (update.blocks) {
-        this.assertBlocks(update.blocks, 'standardUpdate.blocks');
-      }
-      this.recordStreamingUpdate(update);
-      this.messageHub.forwardStreamUpdate(update);
-      this.logMessageFlow('standardUpdate [FORWARD]', update);
-    });
-
-    this.messageBus.on(MESSAGE_EVENTS.COMPLETE, (message) => {
-      this.assertBlocks(message.blocks, 'standardComplete.blocks');
-      this.recordFinalContext(message);
-      this.messageHub.forwardStandardComplete(message);
-      this.logMessageFlow('standardComplete [FORWARD]', message);
-    });
-
-    // 处理状态变化 - 推送到前端
-    this.messageBus.on(PROCESSING_EVENTS.STATE_CHANGED, (state) => {
-      this.postMessage({
-        type: WEBVIEW_MESSAGE_TYPES.PROCESSING_STATE_CHANGED,
-        state,
-        sessionId: this.activeSessionId
-      } as any);
-    });
-  }
-
   /** 设置 MessageHub 事件监听，统一转发到前端 */
   private setupMessageHubListeners(): void {
-    // 编排者消息（主对话区）
-    // 🔧 修复消息重复：orchestrator:message 已包含 progress/result/error/system:notice 的消息
-    // 不再单独监听这些事件，避免同一消息被发送 2 次
-    this.messageHub.on('orchestrator:message', (message) => {
+    // 标准流式消息（LLM / 编排 / Worker 等统一通道）
+    this.messageHub.on('unified:message', (message) => {
       this.postMessage({
-        type: WEBVIEW_MESSAGE_TYPES.STANDARD_MESSAGE,
-        message,
-        sessionId: this.activeSessionId
-      } as any);
-      this.logMessageFlow('messageHub.orchestrator [SENT]', message);
-    });
-
-    // Worker 输出（Worker Tab）
-    this.messageHub.on('worker:output', ({ message }) => {
-      this.postMessage({
-        type: WEBVIEW_MESSAGE_TYPES.STANDARD_MESSAGE,
-        message,
-        sessionId: this.activeSessionId
-      } as any);
-      this.logMessageFlow('messageHub.worker [SENT]', message);
-    });
-
-    // 🔧 已移除对 progress/result/error/system:notice 的重复监听
-    // 原因：MessageHub 的 progress()/result()/error()/systemNotice() 方法
-    // 会同时 emit 两个事件（如 'progress' + 'orchestrator:message'），
-    // 导致 WebviewProvider 对同一消息 postMessage 两次，前端显示重复消息。
-    // 现在只监听 orchestrator:message，它已包含所有编排者消息。
-
-    // 标准流式消息（LLM）
-    this.messageHub.on('standard:message', (message) => {
-      this.postMessage({
-        type: WEBVIEW_MESSAGE_TYPES.STANDARD_MESSAGE,
+        type: WEBVIEW_MESSAGE_TYPES.UNIFIED_MESSAGE,  // 🔧 统一消息通道：使用新协议
         message,
         sessionId: this.activeSessionId
       } as any);
       this.logMessageFlow('messageHub.standardMessage [SENT]', message);
     });
 
-    this.messageHub.on('standard:update', (update) => {
+    this.messageHub.on('unified:update', (update) => {
       this.postMessage({
-        type: WEBVIEW_MESSAGE_TYPES.STANDARD_UPDATE,
+        type: WEBVIEW_MESSAGE_TYPES.UNIFIED_UPDATE,  // 🔧 统一消息通道：使用新协议
         update,
         sessionId: this.activeSessionId
       } as any);
       this.logMessageFlow('messageHub.standardUpdate [SENT]', update);
     });
 
-    this.messageHub.on('standard:complete', (message) => {
+    this.messageHub.on('unified:complete', (message) => {
       this.postMessage({
-        type: WEBVIEW_MESSAGE_TYPES.STANDARD_COMPLETE,
+        type: WEBVIEW_MESSAGE_TYPES.UNIFIED_COMPLETE,  // 🔧 统一消息通道：使用新协议
         message,
         sessionId: this.activeSessionId
       } as any);
       this.logMessageFlow('messageHub.standardComplete [SENT]', message);
+    });
+
+    // ProcessingState 权威来源（同步 UI loading 状态）
+    this.messageHub.on(PROCESSING_EVENTS.STATE_CHANGED, (state) => {
+      this.sendData('processingStateChanged', {
+        isProcessing: state.isProcessing,
+        source: state.source,
+        agent: state.agent,
+        startedAt: state.startedAt,
+      });
     });
   }
 
@@ -957,11 +901,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         this.pendingConfirmation = { resolve, reject };
 
         // 发送确认请求消息
-        this.postMessage({
-          type: 'confirmationRequest',
+        this.sendData('confirmationRequest', {
           plan: plan,
           formattedPlan: formattedPlan,
-        } as any);
+        });
 
         logger.info('界面.编排器.确认.等待', { mode }, LogCategory.UI);
       });
@@ -974,8 +917,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         this.recoveryConfirmationResolver = resolve;
 
         // 发送恢复请求到 Webview
-        this.postMessage({
-          type: 'recoveryRequest',
+        this.sendData('recoveryRequest', {
           taskId: failedTask.id,
           error: error,
           canRetry: options.retry,
@@ -992,11 +934,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.orchestratorEngine.setQuestionCallback(async (questions, plan) => {
       return new Promise<string | null>((resolve, reject) => {
         this.pendingQuestion = { resolve, reject };
-        this.postMessage({
-          type: 'questionRequest',
+        this.sendData('questionRequest', {
           questions,
           plan
-        } as any);
+        });
         logger.info('界面.编排器.提问.等待', undefined, LogCategory.UI);
       });
     });
@@ -1005,14 +946,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.orchestratorEngine.setClarificationCallback(async (questions, context, ambiguityScore, originalPrompt) => {
       return new Promise((resolve, reject) => {
         this.pendingClarification = { resolve, reject };
-        this.postMessage({
-          type: 'clarificationRequest',
+        this.sendData('clarificationRequest', {
           questions,
           context,
           ambiguityScore,
           originalPrompt,
           sessionId: this.activeSessionId
-        } as any);
+        });
         logger.info('界面.编排器.澄清.等待', { ambiguityScore }, LogCategory.UI);
       });
     });
@@ -1021,14 +961,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.orchestratorEngine.setWorkerQuestionCallback(async (workerId, question, context, options) => {
       return new Promise((resolve, reject) => {
         this.pendingWorkerQuestion = { resolve, reject };
-        this.postMessage({
-          type: 'workerQuestionRequest',
+        this.sendData('workerQuestionRequest', {
           workerId,
           question,
           context,
           options,
           sessionId: this.activeSessionId
-        } as any);
+        });
         logger.info('界面.子代理.提问.等待', { workerId }, LogCategory.UI);
       });
     });
@@ -1042,11 +981,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.pendingConfirmation = null;
 
       // 通知 Webview 确认已处理
-      this.postMessage({
-        type: 'toast',
-        message: confirmed ? '执行计划已确认，开始执行...' : '执行计划已取消',
-        toastType: confirmed ? 'success' : 'info',
-      });
+      this.sendToast(
+        confirmed ? '执行计划已确认，开始执行...' : '执行计划已取消',
+        confirmed ? 'success' : 'info'
+      );
     }
   }
 
@@ -1056,11 +994,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const normalized = answer && answer.trim().length > 0 ? answer.trim() : null;
       this.pendingQuestion.resolve(normalized);
       this.pendingQuestion = null;
-      this.postMessage({
-        type: 'toast',
-        message: normalized ? '已提交问题回答，继续分析...' : '已取消问题补充',
-        toastType: normalized ? 'success' : 'info',
-      });
+      this.sendToast(
+        normalized ? '已提交问题回答，继续分析...' : '已取消问题补充',
+        normalized ? 'success' : 'info'
+      );
     }
   }
 
@@ -1069,18 +1006,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     if (this.pendingClarification) {
       if (answers && Object.keys(answers).length > 0) {
         this.pendingClarification.resolve({ answers, additionalInfo });
-        this.postMessage({
-          type: 'toast',
-          message: '已提交澄清信息，继续分析...',
-          toastType: 'success',
-        });
+        this.sendToast('已提交澄清信息，继续分析...', 'success');
       } else {
         this.pendingClarification.resolve(null);
-        this.postMessage({
-          type: 'toast',
-          message: '已跳过澄清，使用原始需求...',
-          toastType: 'info',
-        });
+        this.sendToast('已跳过澄清，使用原始需求...', 'info');
       }
       this.pendingClarification = null;
     }
@@ -1091,11 +1020,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     if (this.pendingWorkerQuestion) {
       this.pendingWorkerQuestion.resolve(answer);
       this.pendingWorkerQuestion = null;
-      this.postMessage({
-        type: 'toast',
-        message: answer ? '已回答 Worker 问题，继续执行...' : '已跳过 Worker 问题...',
-        toastType: answer ? 'success' : 'info',
-      });
+      this.sendToast(
+        answer ? '已回答 Worker 问题，继续执行...' : '已跳过 Worker 问题...',
+        answer ? 'success' : 'info'
+      );
     }
   }
 
@@ -1115,22 +1043,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     globalEventBus.on('task:started', (event) => {
       this.sendStateUpdate();
 
-      this.postMessage({
-        type: 'phaseChanged',
-        phase: 'started',
-        taskId: event.taskId || '',
-        isRunning: true
-      } as any);
+      // 🔧 统一消息通道：phaseChanged 走 MessageHub
+      this.messageHub.phaseChange('started', true, event.taskId || '');
     });
     globalEventBus.on('task:completed', (event) => {
       this.sendStateUpdate();
-     
-      this.postMessage({
-        type: 'phaseChanged',
-        phase: 'completed',
-        taskId: event.taskId || '',
-        isRunning: false
-      } as any);
+
+      // 🔧 统一消息通道：phaseChanged 走 MessageHub
+      this.messageHub.phaseChange('completed', false, event.taskId || '');
     });
     globalEventBus.on('task:failed', (event) => {
       this.sendStateUpdate();
@@ -1154,23 +1074,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           stack: data?.stack,
         },
       });
-     
-      this.postMessage({
-        type: 'phaseChanged',
-        phase: 'failed',
-        taskId: event.taskId || '',
-        isRunning: false
-      } as any);
+
+      // 🔧 统一消息通道：phaseChanged 走 MessageHub
+      this.messageHub.phaseChange('failed', false, event.taskId || '');
     });
     globalEventBus.on('task:cancelled', (event) => {
       this.sendStateUpdate();
 
-      this.postMessage({
-        type: 'phaseChanged',
-        phase: 'cancelled',
-        taskId: event.taskId || '',
-        isRunning: false
-      } as any);
+      // 🔧 统一消息通道：phaseChanged 走 MessageHub
+      this.messageHub.phaseChange('cancelled', false, event.taskId || '');
     });
     globalEventBus.on('execution:stats_updated', () => {
       this.sendExecutionStats();
@@ -1183,14 +1095,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     globalEventBus.on('orchestrator:phase_changed', (event) => {
       const data = event.data as { phase: string; isRunning?: boolean; timestamp?: number };
       if (data?.phase) {
-        // 修复页面跳动：只发送 phaseChanged 消息，不触发 sendStateUpdate
+        // 🔧 统一消息通道：phaseChanged 走 MessageHub
         // phaseChanged 只更新阶段指示器，不会重建整个 DOM
-        this.postMessage({
-          type: 'phaseChanged',
-          phase: data.phase,
-          taskId: event.taskId || '',
-          isRunning: data.isRunning ?? this.orchestratorEngine.running
-        } as any);
+        this.messageHub.phaseChange(
+          data.phase,
+          data.isRunning ?? this.orchestratorEngine.running,
+          event.taskId || ''
+        );
         // 移除 sendStateUpdate() 调用，避免频繁 DOM 重建导致页面跳动
       }
     });
@@ -1209,12 +1120,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
 
       // 发送完整依赖分析数据到前端进行可视化
-      if (this._view) {
-        this._view.webview.postMessage({
-          type: 'dependencyAnalysis',
-          data: event.data,
-        });
-      }
+      this.sendData('dependencyAnalysis', { data: event.data });
     });
 
     // 打断任务事件
@@ -1230,7 +1136,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const data = event.data as { worker: string; available: boolean; model?: string };
       this.sendStateUpdate();
       // 通知 UI Worker 状态变化
-      this.postMessage({ type: 'workerStatusChanged', worker: data.worker as WorkerSlot, available: data.available, model: data.model });
+      this.messageHub.workerStatus(data.worker, data.available, data.model);
     });
 
     globalEventBus.on('worker:healthCheck', () => {
@@ -1240,7 +1146,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     globalEventBus.on('worker:error', (event) => {
       const data = event.data as { worker: string; error: string };
       // 通知 UI 显示错误
-      this.postMessage({ type: 'workerError', worker: data.worker, error: data.error });
+      this.sendData('workerError', { worker: data.worker, error: data.error });
     });
 
     globalEventBus.on('worker:session_event', (event) => {
@@ -1279,8 +1185,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       };
 
       // 发送授权请求到前端
-      this.postMessage({
-        type: 'toolAuthorizationRequest',
+      this.sendData('toolAuthorizationRequest', {
         toolName: data.toolName,
         toolArgs: data.toolArgs,
       });
@@ -1322,279 +1227,263 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     // Mission 生命周期事件
     this.missionOrchestrator.on('missionCreated', (data: { mission: Mission }) => {
-      this.postMessage({
-        type: 'missionCreated',
+      this.sendData('missionCreated', {
         mission: data.mission,
         sessionId: this.activeSessionId,
-      } as any);
+      });
       this.sendStateUpdate();
     });
 
     this.missionOrchestrator.on('missionPlanned', (data: { mission: Mission; contracts: any[]; assignments: Assignment[] }) => {
-      this.postMessage({
-        type: 'missionPlanned',
+      const assignments = this.normalizeAssignments(data.assignments);
+      this.sendData('missionPlanned', {
         missionId: data.mission.id,
         contracts: data.contracts,
-        assignments: data.assignments,
+        assignments,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     this.missionOrchestrator.on('missionApproved', (data: { mission: Mission }) => {
-      this.postMessage({
-        type: 'missionApproved',
+      this.sendData('missionApproved', {
         missionId: data.mission.id,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     this.missionOrchestrator.on('missionCompleted', (data: { mission: Mission }) => {
-      this.postMessage({
-        type: 'missionCompleted',
+      this.sendData('missionCompleted', {
         missionId: data.mission.id,
         sessionId: this.activeSessionId,
-      } as any);
+      });
       this.sendStateUpdate();
+      void this.tryResumePendingRecovery();
     });
 
     this.missionOrchestrator.on('missionFailed', (data: { mission: Mission; error: string }) => {
-      this.postMessage({
-        type: 'missionFailed',
+      this.sendData('missionFailed', {
         missionId: data.mission.id,
         error: data.error,
         sessionId: this.activeSessionId,
-      } as any);
+      });
       this.sendStateUpdate();
+      void this.tryResumePendingRecovery();
     });
 
     this.missionOrchestrator.on('missionPaused', (data: { mission: Mission; reason: string }) => {
-      this.postMessage({
-        type: 'missionPaused',
+      this.sendData('missionPaused', {
         missionId: data.mission.id,
         reason: data.reason,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     this.missionOrchestrator.on('missionResumed', (data: { mission: Mission }) => {
-      this.postMessage({
-        type: 'missionResumed',
+      this.sendData('missionResumed', {
         missionId: data.mission.id,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     this.missionOrchestrator.on('missionCancelled', (data: { mission: Mission; reason: string }) => {
-      this.postMessage({
-        type: 'missionCancelled',
+      this.sendData('missionCancelled', {
         missionId: data.mission.id,
         reason: data.reason,
         sessionId: this.activeSessionId,
-      } as any);
+      });
       this.sendStateUpdate();
+      void this.tryResumePendingRecovery();
     });
 
     // 验证事件
     this.missionOrchestrator.on('verificationStarted', (data: { missionId: string }) => {
-      this.postMessage({
-        type: 'missionVerificationStarted',
+      this.sendData('missionVerificationStarted', {
         missionId: data.missionId,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     this.missionOrchestrator.on('verificationCompleted', (data: { missionId: string; result: MissionVerificationResult }) => {
-      this.postMessage({
-        type: 'missionVerificationCompleted',
+      this.sendData('missionVerificationCompleted', {
         missionId: data.missionId,
         result: data.result,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     // 总结事件
     this.missionOrchestrator.on('summarizationCompleted', (data: { missionId: string; summary: MissionSummary }) => {
-      this.postMessage({
-        type: 'missionSummary',
+      this.sendData('missionSummary', {
         missionId: data.missionId,
         summary: data.summary,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     // 执行事件（从 MissionOrchestrator 获取，MissionExecutor 已合并）
     this.missionOrchestrator.on('executionStarted', (data: { missionId: string }) => {
-      this.postMessage({
-        type: 'missionExecutionStarted',
+      this.sendData('missionExecutionStarted', {
         missionId: data.missionId,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     this.missionOrchestrator.on('executionCompleted', (data: any) => {
-      this.postMessage({
-        type: 'missionExecutionCompleted',
+      this.sendData('missionExecutionCompleted', {
         missionId: data.mission.id,
         success: data.success,
         duration: data.duration,
         sessionId: this.activeSessionId,
-      } as any);
+      });
       this.sendStateUpdate();
     });
 
     this.missionOrchestrator.on('executionFailed', (data: { missionId: string; error: string }) => {
-      this.postMessage({
-        type: 'missionExecutionFailed',
+      this.sendData('missionExecutionFailed', {
         missionId: data.missionId,
         error: data.error,
         sessionId: this.activeSessionId,
-      } as any);
+      });
       this.sendStateUpdate();
     });
 
     // Assignment 事件
     this.missionOrchestrator.on('assignmentStarted', (data: { missionId: string; assignmentId: string; workerId: WorkerSlot }) => {
-      this.postMessage({
-        type: 'assignmentStarted',
+      this.sendData('assignmentStarted', {
         missionId: data.missionId,
         assignmentId: data.assignmentId,
         workerId: data.workerId,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     this.missionOrchestrator.on('assignmentPlanned', (data: { missionId: string; assignmentId: string; todos: WorkerTodo[]; warnings?: string[] }) => {
-      this.postMessage({
-        type: 'assignmentPlanned',
+      const assignmentId = data.assignmentId || this.generateEntityId('assignment');
+      const todos = this.normalizeTodos(data.todos, assignmentId);
+      this.sendData('assignmentPlanned', {
         missionId: data.missionId,
-        assignmentId: data.assignmentId,
-        todos: data.todos,
+        assignmentId,
+        todos,
         warnings: data.warnings,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     this.missionOrchestrator.on('assignmentCompleted', (data: { missionId: string; assignmentId: string; success: boolean }) => {
-      this.postMessage({
-        type: 'assignmentCompleted',
+      this.sendData('assignmentCompleted', {
         missionId: data.missionId,
         assignmentId: data.assignmentId,
         success: data.success,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     // Worker Session 事件
     this.missionOrchestrator.on('workerSessionCreated', (data: { sessionId: string; assignmentId: string; workerId: WorkerSlot }) => {
-      this.postMessage({
-        type: 'workerSessionCreated',
+      this.sendData('workerSessionCreated', {
         sessionId: data.sessionId,
         assignmentId: data.assignmentId,
         workerId: data.workerId,
-      } as any);
+      });
     });
 
     this.missionOrchestrator.on('workerSessionResumed', (data: { sessionId: string; assignmentId: string; workerId: WorkerSlot; completedTodos: number }) => {
-      this.postMessage({
-        type: 'workerSessionResumed',
+      this.sendData('workerSessionResumed', {
         sessionId: data.sessionId,
         assignmentId: data.assignmentId,
         workerId: data.workerId,
         completedTodos: data.completedTodos,
-      } as any);
+      });
     });
 
     // Todo 事件
     this.missionOrchestrator.on('todoStarted', (data: { missionId: string; assignmentId: string; todoId: string }) => {
-      this.postMessage({
-        type: 'todoStarted',
+      this.sendData('todoStarted', {
         missionId: data.missionId,
         assignmentId: data.assignmentId,
         todoId: data.todoId,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     this.missionOrchestrator.on('todoCompleted', (data: { missionId: string; assignmentId: string; todoId: string; output: any }) => {
-      this.postMessage({
-        type: 'todoCompleted',
+      this.sendData('todoCompleted', {
         missionId: data.missionId,
         assignmentId: data.assignmentId,
         todoId: data.todoId,
         output: data.output,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     this.missionOrchestrator.on('todoFailed', (data: { missionId: string; assignmentId: string; todoId: string; error: string }) => {
-      this.postMessage({
-        type: 'todoFailed',
+      this.sendData('todoFailed', {
         missionId: data.missionId,
         assignmentId: data.assignmentId,
         todoId: data.todoId,
         error: data.error,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     // 动态 Todo 事件
     this.missionOrchestrator.on('dynamicTodoAdded', (data: { missionId: string; assignmentId: string; todo: WorkerTodo }) => {
-      this.postMessage({
-        type: 'dynamicTodoAdded',
+      const assignmentId = data.assignmentId || this.generateEntityId('assignment');
+      const normalizedTodo = this.normalizeTodos([data.todo], assignmentId)[0];
+      if (!normalizedTodo) {
+        logger.warn('动态 Todo 无效，已跳过发送', { assignmentId, missionId: data.missionId }, LogCategory.ORCHESTRATOR);
+        return;
+      }
+      this.sendData('dynamicTodoAdded', {
         missionId: data.missionId,
-        assignmentId: data.assignmentId,
-        todo: data.todo,
+        assignmentId,
+        todo: normalizedTodo,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     // 审批请求事件
     this.missionOrchestrator.on('approvalRequested', (data: { missionId: string; assignmentId: string; todoId: string; reason: string }) => {
-      this.postMessage({
-        type: 'todoApprovalRequested',
+      this.sendData('todoApprovalRequested', {
         missionId: data.missionId,
         assignmentId: data.assignmentId,
         todoId: data.todoId,
         reason: data.reason,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     // 阻塞事件
     this.missionOrchestrator.on('blocked', (blockedItem: BlockedItem) => {
-      this.postMessage({
-        type: 'missionBlocked',
+      this.sendData('missionBlocked', {
         blockedItem,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     this.missionOrchestrator.on('unblocked', (blockedItem: BlockedItem) => {
-      this.postMessage({
-        type: 'missionUnblocked',
+      this.sendData('missionUnblocked', {
         blockedItem,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     // 进度更新事件
     this.missionOrchestrator.on('progressUpdated', (progress: ExecutionProgress) => {
-      this.postMessage({
-        type: 'missionProgress',
+      this.sendData('missionProgress', {
         progress,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
 
     // 契约验证事件
     this.missionOrchestrator.on('contractVerified', (data: { missionId: string; contractId: string; success: boolean }) => {
-      this.postMessage({
-        type: 'contractVerified',
+      this.sendData('contractVerified', {
         missionId: data.missionId,
         contractId: data.contractId,
         success: data.success,
         sessionId: this.activeSessionId,
-      } as any);
+      });
     });
   }
 
@@ -1663,18 +1552,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 清理编排者流式输出缓存，避免跨任务串流
     this.streamMessageIds.clear();
     // 强制清理消息总线处理状态，避免前端残留“处理中”
-    this.messageBus.forceProcessingState(false);
+    this.messageHub.forceProcessingState(false);
 
 
     if (hasRunningTask && !options?.silent) {
       // 4. 通知 UI
-      this.postMessage({ type: 'toast', message: '任务已打断', toastType: 'info' });
+      this.sendToast('任务已打断', 'info');
 
 
-      this.postMessage({
-        type: 'taskInterrupted',
-        message: '任务已打断'
-      } as any);
+      this.sendData('taskInterrupted', { message: '任务已打断' });
 
       this.sendOrchestratorMessage({
         content: '任务已打断，可在变更中查看已修改的文件，或选择继续执行。',
@@ -1729,14 +1615,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       ? this.assertBlocks(blocks, 'sendOrchestratorMessage.blocks')
       : (content ? [{ type: 'text' as const, content, isMarkdown: false }] : []);
 
-    const standardMessage: StandardMessage = {
-      id: `msg-orch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    const standardMessage = createStandardMessage({
       traceId: this.activeSessionId || 'default',
+      category: MessageCategory.CONTENT,  // 🔧 统一消息通道：编排器消息为 CONTENT 类别
       type,
       source: 'orchestrator',
       agent: 'orchestrator',
-      timestamp: Date.now(),
-      updatedAt: Date.now(),
       blocks: safeBlocks,
       lifecycle,
       metadata: {
@@ -1744,10 +1628,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         isStatusMessage: true, // 标记为状态消息，区别于 LLM 对话响应
         ...metadata,
       },
-    };
+    });
 
     // 🔧 通过 MessageHub 统一出口发送
-    this.messageHub.forwardStandardMessage(standardMessage);
+    this.messageHub.sendMessage(standardMessage);
     this.logMessageFlow('orchestratorMessage via MessageHub', standardMessage);
   }
 
@@ -1777,40 +1661,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // Webview 初始化时强制中断可能残留的任务，避免重启后状态错乱
     void this.interruptCurrentTask({ silent: true });
 
-    // 启动时检测所有 Agent 的可用性
-    this.checkWorkerAvailability();
+    // 🔧 启动时进行真正的 LLM 连接测试（替代浅层检查）
+    // 使用 sendWorkerStatus(true) 强制检测所有模型连接状态
+    // 这会发送 workerStatusUpdate 消息，前端能正确处理并更新 BottomTabs 状态
+    void this.sendWorkerStatus(true).catch((error) => {
+      logger.warn('界面.启动.模型状态检测_失败', { error: String(error) }, LogCategory.UI);
+    });
+
+    // 发送执行统计数据
+    this.sendExecutionStats();
   }
 
-  /** 检测所有 Agent 的可用性并更新状态 */
-  private async checkWorkerAvailability(): Promise<void> {
-    try {
-      // TODO: LLM mode - check adapter connectivity instead of worker availability
-      const availability = {
-        claude: this.adapterFactory.isConnected('claude'),
-        codex: this.adapterFactory.isConnected('codex'),
-        gemini: this.adapterFactory.isConnected('gemini'),
-      };
-      logger.info('界面.适配器.可用性', availability, LogCategory.UI);
-
-      // 通知 UI 更新状态
-      this.sendStateUpdate();
-
-      // 发送单独的状态变更通知
-      const workerSlots: WorkerSlot[] = ['claude', 'codex', 'gemini'];
-      for (const worker of workerSlots) {
-        this.postMessage({
-          type: 'workerStatusChanged',
-          worker,
-          available: availability[worker],
-        });
-      }
-
-      // 发送执行统计数据
-      this.sendExecutionStats();
-    } catch (error) {
-      logger.error('界面.Worker.可用性_失败', error, LogCategory.UI);
-    }
-  }
 
   /** 处理 Webview 消息 */
   private async handleMessage(message: WebviewToExtensionMessage): Promise<void> {
@@ -1853,11 +1714,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         logger.info('界面.任务.执行.请求', { promptLength: String((message as any).prompt || '').length, imageCount: (message as any).images?.length || 0, agent: (message as any).agent || 'orchestrator' }, LogCategory.UI);
         const execImages = (message as any).images || [];
         const execAgent = (message as any).agent as WorkerSlot | undefined;
-        this.postMessage({
-          type: 'messageReceived',
-          requestId: (message as any).requestId,
-          sessionId: this.activeSessionId
-        } as any);
         if (!this.shouldProcessRequest((message as any).requestId)) {
           break;
         }
@@ -1866,12 +1722,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           await this.executeTask((message as any).prompt, execAgent || undefined, execImages);
         } catch (error: any) {
           const errorMsg = error instanceof Error ? error.message : String(error);
-          this.postMessage({
-            type: 'taskRejected',
-            requestId: this.pendingRequestId || (message as any).requestId,
-            message: errorMsg,
-            sessionId: this.activeSessionId
-          } as any);
+          if (this.pendingRequestId || (message as any).requestId) {
+            this.messageHub.taskRejected(this.pendingRequestId || (message as any).requestId, errorMsg);
+          }
           this.pendingRequestId = null;
           throw error;
         }
@@ -1894,7 +1747,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'pauseTask':
        
         logger.info('界面.任务.暂停.消息', { taskId: (message as any).taskId }, LogCategory.UI);
-        this.postMessage({ type: 'toast', message: '暂停功能开发中', toastType: 'info' });
+        this.sendToast('暂停功能开发中', 'info');
         break;
 
       case 'resumeTask':
@@ -1913,13 +1766,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         // 批准单个变更
         this.snapshotManager.acceptChange(message.filePath);
         globalEventBus.emitEvent('change:approved', { data: { filePath: message.filePath } });
-        this.postMessage({ type: 'toast', message: '变更已批准', toastType: 'success' });
+        this.sendToast('变更已批准', 'success');
         this.sendStateUpdate();
         break;
 
       case 'revertChange':
         this.snapshotManager.revertToSnapshot(message.filePath);
-        this.postMessage({ type: 'toast', message: '变更已还原', toastType: 'info' });
+        this.sendToast('变更已还原', 'info');
         this.sendStateUpdate();
         break;
 
@@ -1930,7 +1783,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           for (const change of allChanges) {
             this.snapshotManager.acceptChange(change.filePath);
           }
-          this.postMessage({ type: 'toast', message: `已批准 ${allChanges.length} 个变更`, toastType: 'success' });
+          this.sendToast(`已批准 ${allChanges.length} 个变更`, 'success');
         }
         this.sendStateUpdate();
         break;
@@ -1942,7 +1795,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           for (const change of changes) {
             this.snapshotManager.revertToSnapshot(change.filePath);
           }
-          this.postMessage({ type: 'toast', message: `已还原 ${changes.length} 个变更`, toastType: 'info' });
+          this.sendToast(`已还原 ${changes.length} 个变更`, 'info');
         }
         this.sendStateUpdate();
         break;
@@ -1978,8 +1831,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
           this.activeSessionId = message.sessionId;
           // 恢复 Worker sessionIds
-          this.postMessage({
-            type: 'sessionSwitched',
+          this.sendData('sessionSwitched', {
             sessionId: message.sessionId,
             session: switchedSession as any,
           });
@@ -1990,8 +1842,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'renameSession':
         // 重命名会话
         if (this.sessionManager.renameSession(message.sessionId, message.name)) {
-          this.postMessage({ type: 'sessionsUpdated', sessions: this.sessionManager.getSessionMetas() as any[] });
-          this.postMessage({ type: 'toast', message: '会话已重命名', toastType: 'success' });
+          this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() as any[] });
+          this.sendToast('会话已重命名', 'success');
         }
         break;
 
@@ -2002,10 +1854,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           if (this.sessionManager.getSessionMetas().length === 0) {
             const newSession = this.sessionManager.createSession();
             this.activeSessionId = newSession.id;
-            this.postMessage({ type: 'sessionCreated', session: newSession as any });
+            this.sendData('sessionCreated', { session: newSession as any });
           }
-          this.postMessage({ type: 'sessionsUpdated', sessions: this.sessionManager.getSessionMetas() as any[] });
-          this.postMessage({ type: 'toast', message: '会话已删除', toastType: 'info' });
+          this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() as any[] });
+          this.sendToast('会话已删除', 'info');
         }
         this.sendStateUpdate();
         break;
@@ -2203,11 +2055,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         await this.handleInstallSkill(message.skillId);
         break;
       case 'applyInstructionSkill':
-        this.postMessage({
-          type: 'messageReceived',
-          requestId: (message as any).requestId,
-          sessionId: this.activeSessionId
-        } as any);
         if (!this.shouldProcessRequest((message as any).requestId)) {
           break;
         }
@@ -2221,12 +2068,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           );
         } catch (error: any) {
           const errorMsg = error instanceof Error ? error.message : String(error);
-          this.postMessage({
-            type: 'taskRejected',
-            requestId: this.pendingRequestId || (message as any).requestId,
-            message: errorMsg,
-            sessionId: this.activeSessionId
-          } as any);
+          if (this.pendingRequestId || (message as any).requestId) {
+            this.messageHub.taskRejected(this.pendingRequestId || (message as any).requestId, errorMsg);
+          }
           this.pendingRequestId = null;
           throw error;
         }
@@ -2320,14 +2164,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 处理登录消息 */
   private async handleLoginMessage(message: Extract<WebviewToExtensionMessage, { type: 'login' }>): Promise<void> {
     if (this.loginInFlight) {
-      this.postMessage({ type: 'loginError', message: '登录处理中，请稍后重试' } as any);
+      this.sendData('loginError', { message: '登录处理中，请稍后重试' });
       return;
     }
 
     const rawApiKey = message.apiKey;
     const apiKey = typeof rawApiKey === 'string' ? rawApiKey.trim() : '';
     if (!apiKey) {
-      this.postMessage({ type: 'loginError', message: 'API Key 不能为空' } as any);
+      this.sendData('loginError', { message: 'API Key 不能为空' });
       return;
     }
 
@@ -2335,7 +2179,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     try {
       await this.storeApiKey(apiKey);
       await this.context.globalState.update(this.authStatusKey, true);
-      this.postMessage({ type: 'loginSuccess' } as any);
+      this.sendData('loginSuccess', {});
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       try {
@@ -2343,7 +2187,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       } catch {
         // 忽略回滚失败，避免覆盖原始错误
       }
-      this.postMessage({ type: 'loginError', message: `登录失败: ${errorMsg}` } as any);
+      this.sendData('loginError', { message: `登录失败: ${errorMsg}` });
     } finally {
       this.loginInFlight = false;
     }
@@ -2352,17 +2196,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 处理登出消息 */
   private async handleLogoutMessage(): Promise<void> {
     if (this.loginInFlight) {
-      this.postMessage({ type: 'loginError', message: '登录处理中，无法登出' } as any);
+      this.sendData('loginError', { message: '登录处理中，无法登出' });
       return;
     }
 
     try {
       await this.removeApiKey();
       await this.context.globalState.update(this.authStatusKey, false);
-      this.postMessage({ type: 'authStatus', loggedIn: false } as any);
+      this.sendData('authStatus', { loggedIn: false });
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.postMessage({ type: 'loginError', message: `登出失败: ${errorMsg}` } as any);
+      this.sendData('loginError', { message: `登出失败: ${errorMsg}` });
     }
   }
 
@@ -2370,10 +2214,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private async handleGetStatusMessage(): Promise<void> {
     try {
       const loggedIn = await this.isLoggedIn();
-      this.postMessage({ type: 'authStatus', loggedIn } as any);
+      this.sendData('authStatus', { loggedIn });
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.postMessage({ type: 'loginError', message: `获取状态失败: ${errorMsg}` } as any);
+      this.sendData('loginError', { message: `获取状态失败: ${errorMsg}` });
     }
   }
 
@@ -2453,15 +2297,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
 
       if (source === 'manual') {
-        this.postMessage({ type: 'promptEnhanceSaved', success: true });
-        this.postMessage({ type: 'toast', message: 'ACE 配置已保存', toastType: 'success' });
+        this.sendData('promptEnhanceSaved', { success: true });
+        this.sendToast('ACE 配置已保存', 'success');
       }
     } catch (error) {
       logger.error('界面.提示词_增强.配置.保存_失败', error, LogCategory.UI);
       if (source === 'manual') {
         const errorMsg = error instanceof Error ? error.message : String(error);
-        this.postMessage({ type: 'promptEnhanceSaved', success: false, error: errorMsg });
-        this.postMessage({ type: 'toast', message: `ACE 配置保存失败: ${errorMsg}`, toastType: 'error' });
+        this.sendData('promptEnhanceSaved', { success: false, error: errorMsg });
+        this.sendToast(`ACE 配置保存失败: ${errorMsg}`, 'error');
       }
     }
   }
@@ -2479,19 +2323,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 发送 Prompt 增强配置到前端 */
   private async sendPromptEnhanceConfig(): Promise<void> {
     const config = await this.getPromptEnhanceConfig();
-    this.postMessage({
-      type: 'promptEnhanceConfigLoaded',
+    this.sendData('promptEnhanceConfigLoaded', {
       config: {
         baseUrl: config.baseUrl,
         apiKey: config.apiKey
       }
-    } as any);
+    });
   }
 
   /** 测试 Augment API 连接 */
   private async handleTestPromptEnhance(baseUrl: string, apiKey: string): Promise<void> {
     if (!baseUrl || !apiKey) {
-      this.postMessage({ type: 'promptEnhanceResult', success: false, message: '请填写 API 地址和密钥' } as any);
+      this.sendData('promptEnhanceResult', { success: false, message: '请填写 API 地址和密钥' });
       return;
     }
 
@@ -2521,18 +2364,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
 
       if (response.ok) {
-        this.postMessage({ type: 'promptEnhanceResult', success: true, message: '连接成功' } as any);
+        this.sendData('promptEnhanceResult', { success: true, message: '连接成功' });
       } else if (response.status === 401) {
-        this.postMessage({ type: 'promptEnhanceResult', success: false, message: 'Token 无效或已过期' } as any);
+        this.sendData('promptEnhanceResult', { success: false, message: 'Token 无效或已过期' });
       } else if (response.status === 403) {
-        this.postMessage({ type: 'promptEnhanceResult', success: false, message: '访问被拒绝' } as any);
+        this.sendData('promptEnhanceResult', { success: false, message: '访问被拒绝' });
       } else {
         const errorText = await response.text().catch(() => '');
-        this.postMessage({ type: 'promptEnhanceResult', success: false, message: `连接失败: ${response.status}` } as any);
+        this.sendData('promptEnhanceResult', { success: false, message: `连接失败: ${response.status}` });
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.postMessage({ type: 'promptEnhanceResult', success: false, message: `连接错误: ${errorMsg}` } as any);
+      this.sendData('promptEnhanceResult', { success: false, message: `连接错误: ${errorMsg}` });
     }
   }
 
@@ -2604,14 +2447,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           originalLength: prompt.length,
           enhancedLength: enhancedPrompt.length
         }, LogCategory.UI);
-        this.postMessage({ type: 'promptEnhanced', enhancedPrompt, error: '' } as any);
+        this.sendData('promptEnhanced', { enhancedPrompt, error: '' });
       } else {
-        this.postMessage({ type: 'promptEnhanced', enhancedPrompt: '', error: '未获取到增强结果' } as any);
+        this.sendData('promptEnhanced', { enhancedPrompt: '', error: '未获取到增强结果' });
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       logger.error('界面.提示词_增强.失败', { error: errorMsg }, LogCategory.UI);
-      this.postMessage({ type: 'promptEnhanced', enhancedPrompt: '', error: errorMsg } as any);
+      this.sendData('promptEnhanced', { enhancedPrompt: '', error: errorMsg });
     }
   }
 
@@ -2942,17 +2785,10 @@ ${originalPrompt}
       const { LLMConfigLoader } = await import('../llm/config');
       const fullConfig = LLMConfigLoader.loadFullConfig();
 
-      this.postMessage({
-        type: 'allWorkerConfigsLoaded',
-        configs: fullConfig.workers
-      });
+      this.sendData('allWorkerConfigsLoaded', { configs: fullConfig.workers });
     } catch (error: any) {
       logger.error('加载 Worker 配置失败', { error: error.message }, LogCategory.LLM);
-      this.postMessage({
-        type: 'toast',
-        message: '加载配置失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendToast(`加载配置失败: ${error.message}`, 'error');
     }
   }
 
@@ -2965,36 +2801,16 @@ ${originalPrompt}
       LLMConfigLoader.updateWorkerConfig(worker, config);
 
       // 清除适配器缓存
-      if (this.adapterFactory && 'clearAdapter' in this.adapterFactory) {
-        await (this.adapterFactory as any).clearAdapter(worker);
-      }
+      await this.adapterFactory.clearAdapter(worker);
 
-      this.postMessage({
-        type: 'workerConfigSaved',
-        worker: worker,
-        success: true
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: `${worker} 配置已保存`,
-        toastType: 'success'
-      });
+      this.sendData('workerConfigSaved', { worker, success: true });
+      this.sendToast(`${worker} 配置已保存`, 'success');
 
       logger.info('Worker 配置已保存', { worker }, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存 Worker 配置失败', { worker, error: error.message }, LogCategory.LLM);
-      this.postMessage({
-        type: 'workerConfigSaved',
-        worker: worker,
-        success: false,
-        error: error.message
-      });
-      this.postMessage({
-        type: 'toast',
-        message: '保存配置失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendData('workerConfigSaved', { worker, success: false, error: error.message });
+      this.sendToast(`保存配置失败: ${error.message}`, 'error');
     }
   }
 
@@ -3003,11 +2819,7 @@ ${originalPrompt}
     try {
       const normalizedConfig = { ...config, enabled: config?.enabled !== false };
       if (!normalizedConfig.enabled) {
-        this.postMessage({
-          type: 'toast',
-          message: `${worker} 未启用，无法测试连接`,
-          toastType: 'warning'
-        });
+        this.sendToast(`${worker} 未启用，无法测试连接`, 'warning');
         return;
       }
       const { createLLMClient } = await import('../llm/clients/client-factory');
@@ -3021,35 +2833,16 @@ ${originalPrompt}
       });
 
       if (response && response.content) {
-        this.postMessage({
-          type: 'workerConnectionTestResult',
-          worker: worker,
-          success: true
-        });
-
-        this.postMessage({
-          type: 'toast',
-          message: `${worker} 连接成功`,
-          toastType: 'success'
-        });
+        this.sendData('workerConnectionTestResult', { worker, success: true });
+        this.sendToast(`${worker} 连接成功`, 'success');
       } else {
         throw new Error('No response from LLM');
       }
     } catch (error: any) {
       logger.error('Worker 连接测试失败', { worker, error: error.message }, LogCategory.LLM);
 
-      this.postMessage({
-        type: 'workerConnectionTestResult',
-        worker: worker,
-        success: false,
-        error: error.message
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: `${worker} 连接失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendData('workerConnectionTestResult', { worker, success: false, error: error.message });
+      this.sendToast(`${worker} 连接失败: ${error.message}`, 'error');
     }
   }
 
@@ -3059,17 +2852,10 @@ ${originalPrompt}
       const { LLMConfigLoader } = await import('../llm/config');
       const config = LLMConfigLoader.loadOrchestratorConfig();
 
-      this.postMessage({
-        type: 'orchestratorConfigLoaded',
-        config: config
-      });
+      this.sendData('orchestratorConfigLoaded', { config });
     } catch (error: any) {
       logger.error('加载编排者配置失败', { error: error.message }, LogCategory.LLM);
-      this.postMessage({
-        type: 'toast',
-        message: '加载配置失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendToast(`加载配置失败: ${error.message}`, 'error');
     }
   }
 
@@ -3082,34 +2868,16 @@ ${originalPrompt}
       LLMConfigLoader.updateOrchestratorConfig(config);
 
       // 清除适配器缓存
-      if (this.adapterFactory && 'clearAdapter' in this.adapterFactory) {
-        await (this.adapterFactory as any).clearAdapter('orchestrator');
-      }
+      await this.adapterFactory.clearAdapter('orchestrator');
 
-      this.postMessage({
-        type: 'orchestratorConfigSaved',
-        success: true
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: '编排者配置已保存',
-        toastType: 'success'
-      });
+      this.sendData('orchestratorConfigSaved', { success: true });
+      this.sendToast('编排者配置已保存', 'success');
 
       logger.info('编排者配置已保存', undefined, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存编排者配置失败', { error: error.message }, LogCategory.LLM);
-      this.postMessage({
-        type: 'orchestratorConfigSaved',
-        success: false,
-        error: error.message
-      });
-      this.postMessage({
-        type: 'toast',
-        message: '保存配置失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendData('orchestratorConfigSaved', { success: false, error: error.message });
+      this.sendToast(`保存配置失败: ${error.message}`, 'error');
     }
   }
 
@@ -3118,11 +2886,7 @@ ${originalPrompt}
     try {
       const normalizedConfig = { ...config, enabled: config?.enabled !== false };
       if (!normalizedConfig.enabled) {
-        this.postMessage({
-          type: 'toast',
-          message: '编排者未启用，无法测试连接',
-          toastType: 'warning'
-        });
+        this.sendToast('编排者未启用，无法测试连接', 'warning');
         return;
       }
       const { createLLMClient } = await import('../llm/clients/client-factory');
@@ -3136,33 +2900,16 @@ ${originalPrompt}
       });
 
       if (response && response.content) {
-        this.postMessage({
-          type: 'orchestratorConnectionTestResult',
-          success: true
-        });
-
-        this.postMessage({
-          type: 'toast',
-          message: '编排者连接成功',
-          toastType: 'success'
-        });
+        this.sendData('orchestratorConnectionTestResult', { success: true });
+        this.sendToast('编排者连接成功', 'success');
       } else {
         throw new Error('No response from LLM');
       }
     } catch (error: any) {
       logger.error('编排者连接测试失败', { error: error.message }, LogCategory.LLM);
 
-      this.postMessage({
-        type: 'orchestratorConnectionTestResult',
-        success: false,
-        error: error.message
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: `编排者连接失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendData('orchestratorConnectionTestResult', { success: false, error: error.message });
+      this.sendToast(`编排者连接失败: ${error.message}`, 'error');
     }
   }
 
@@ -3172,17 +2919,10 @@ ${originalPrompt}
       const { LLMConfigLoader } = await import('../llm/config');
       const config = LLMConfigLoader.loadCompressorConfig();
 
-      this.postMessage({
-        type: 'compressorConfigLoaded',
-        config: config
-      });
+      this.sendData('compressorConfigLoaded', { config });
     } catch (error: any) {
       logger.error('加载压缩器配置失败', { error: error.message }, LogCategory.LLM);
-      this.postMessage({
-        type: 'toast',
-        message: '加载配置失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendToast(`加载配置失败: ${error.message}`, 'error');
     }
   }
 
@@ -3196,30 +2936,14 @@ ${originalPrompt}
 
       await this.orchestratorEngine.reloadCompressionAdapter();
 
-      this.postMessage({
-        type: 'compressorConfigSaved',
-        success: true
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: '压缩器配置已保存',
-        toastType: 'success'
-      });
+      this.sendData('compressorConfigSaved', { success: true });
+      this.sendToast('压缩器配置已保存', 'success');
 
       logger.info('压缩器配置已保存', undefined, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存压缩器配置失败', { error: error.message }, LogCategory.LLM);
-      this.postMessage({
-        type: 'compressorConfigSaved',
-        success: false,
-        error: error.message
-      });
-      this.postMessage({
-        type: 'toast',
-        message: '保存配置失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendData('compressorConfigSaved', { success: false, error: error.message });
+      this.sendToast(`保存配置失败: ${error.message}`, 'error');
     }
   }
 
@@ -3235,17 +2959,12 @@ ${originalPrompt}
         : undefined;
 
       if (!normalizedConfig.enabled || !normalizedConfig.apiKey || !normalizedConfig.model) {
-        this.postMessage({
-          type: 'compressorConnectionTestResult',
+        this.sendData('compressorConnectionTestResult', {
           success: false,
           error: '压缩模型未配置或不可用',
           fallbackModel
         });
-        this.postMessage({
-          type: 'toast',
-          message: '压缩模型不可用，已降级使用编排者模型',
-          toastType: 'warning'
-        });
+        this.sendToast('压缩模型不可用，已降级使用编排者模型', 'warning');
         return;
       }
       const { createLLMClient } = await import('../llm/clients/client-factory');
@@ -3259,34 +2978,20 @@ ${originalPrompt}
       });
 
       if (response && response.content) {
-        this.postMessage({
-          type: 'compressorConnectionTestResult',
-          success: true
-        });
-
-        this.postMessage({
-          type: 'toast',
-          message: '压缩器连接成功',
-          toastType: 'success'
-        });
+        this.sendData('compressorConnectionTestResult', { success: true });
+        this.sendToast('压缩器连接成功', 'success');
       } else {
         throw new Error('No response from LLM');
       }
     } catch (error: any) {
       logger.error('压缩器连接测试失败', { error: error.message }, LogCategory.LLM);
 
-      this.postMessage({
-        type: 'compressorConnectionTestResult',
+      this.sendData('compressorConnectionTestResult', {
         success: false,
         error: error.message,
         fallbackModel
       });
-
-      this.postMessage({
-        type: 'toast',
-        message: '压缩器连接失败，已降级使用编排者模型',
-        toastType: 'warning'
-      });
+      this.sendToast('压缩器连接失败，已降级使用编排者模型', 'warning');
     }
   }
 
@@ -3294,24 +2999,15 @@ ${originalPrompt}
   // MCP 配置处理方法
   // ============================================================================
 
-  private mcpManager: any = null;
-
   /**
    * 获取或创建 MCP 管理器
    */
   private async getMCPManager(): Promise<any> {
-    if (this.adapterFactory && 'getMCPExecutor' in this.adapterFactory) {
-      const executor = (this.adapterFactory as any).getMCPExecutor?.();
-      if (executor?.getMCPManager) {
-        return executor.getMCPManager();
-      }
+    const executor = this.adapterFactory.getMCPExecutor();
+    if (!executor || typeof (executor as any).getMCPManager !== 'function') {
+      throw new Error('MCP executor not available');
     }
-
-    if (!this.mcpManager) {
-      const { MCPManager } = await import('../tools/mcp-manager');
-      this.mcpManager = new MCPManager();
-    }
-    return this.mcpManager;
+    return (executor as any).getMCPManager();
   }
 
   /**
@@ -3321,18 +3017,22 @@ ${originalPrompt}
     try {
       const { LLMConfigLoader } = await import('../llm/config');
       const servers = LLMConfigLoader.loadMCPConfig();
+      for (const server of servers) {
+        if (!server || typeof server !== 'object') {
+          throw new Error('Invalid MCP server entry');
+        }
+        if (!server.id || typeof server.id !== 'string' || !server.id.trim()) {
+          throw new Error('MCP server missing id');
+        }
+        if (!server.name || typeof server.name !== 'string' || !server.name.trim()) {
+          throw new Error(`MCP server ${server.id || '<unknown>'} missing name`);
+        }
+      }
 
-      this.postMessage({
-        type: 'mcpServersLoaded',
-        servers
-      });
+      this.sendData('mcpServersLoaded', { servers });
     } catch (error: any) {
       logger.error('加载 MCP 服务器列表失败', { error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: `加载 MCP 服务器失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`加载 MCP 服务器失败: ${error.message}`, 'error');
     }
   }
 
@@ -3343,37 +3043,28 @@ ${originalPrompt}
     try {
       const { LLMConfigLoader } = await import('../llm/config');
 
-      // 生成 ID
-      if (!server.id) {
-        server.id = `mcp-${Date.now()}`;
+      if (!server || typeof server !== 'object') {
+        throw new Error('Invalid MCP server payload');
+      }
+      if (!server.id || typeof server.id !== 'string' || !server.id.trim()) {
+        throw new Error('MCP server missing id');
+      }
+      if (!server.name || typeof server.name !== 'string' || !server.name.trim()) {
+        throw new Error('MCP server missing name');
       }
 
       LLMConfigLoader.addMCPServer(server);
 
-      this.postMessage({
-        type: 'mcpServerAdded',
-        server
-      });
+      this.sendData('mcpServerAdded', { server });
+      this.sendToast(`MCP 服务器 "${server.name}" 已添加`, 'success');
 
-      this.postMessage({
-        type: 'toast',
-        message: `MCP 服务器 "${server.name}" 已添加`,
-        toastType: 'success'
-      });
-
-      if (this.adapterFactory && 'reloadMCP' in this.adapterFactory) {
-        await (this.adapterFactory as any).reloadMCP();
-        logger.info('MCP reloaded in adapter factory', { id: server.id }, LogCategory.TOOLS);
-      }
+      await this.adapterFactory.reloadMCP();
+      logger.info('MCP reloaded in adapter factory', { id: server.id }, LogCategory.TOOLS);
 
       logger.info('MCP 服务器已添加', { id: server.id, name: server.name }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('添加 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: `添加 MCP 服务器失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`添加 MCP 服务器失败: ${error.message}`, 'error');
     }
   }
 
@@ -3385,30 +3076,16 @@ ${originalPrompt}
       const { LLMConfigLoader } = await import('../llm/config');
       LLMConfigLoader.updateMCPServer(serverId, updates);
 
-      this.postMessage({
-        type: 'mcpServerUpdated',
-        serverId
-      });
+      this.sendData('mcpServerUpdated', { serverId });
+      this.sendToast('MCP 服务器已更新', 'success');
 
-      this.postMessage({
-        type: 'toast',
-        message: 'MCP 服务器已更新',
-        toastType: 'success'
-      });
-
-      if (this.adapterFactory && 'reloadMCP' in this.adapterFactory) {
-        await (this.adapterFactory as any).reloadMCP();
-        logger.info('MCP reloaded in adapter factory', { id: serverId }, LogCategory.TOOLS);
-      }
+      await this.adapterFactory.reloadMCP();
+      logger.info('MCP reloaded in adapter factory', { id: serverId }, LogCategory.TOOLS);
 
       logger.info('MCP 服务器已更新', { id: serverId }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('更新 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: `更新 MCP 服务器失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`更新 MCP 服务器失败: ${error.message}`, 'error');
     }
   }
 
@@ -3426,30 +3103,16 @@ ${originalPrompt}
       // 删除配置
       LLMConfigLoader.deleteMCPServer(serverId);
 
-      this.postMessage({
-        type: 'mcpServerDeleted',
-        serverId
-      });
+      this.sendData('mcpServerDeleted', { serverId });
+      this.sendToast('MCP 服务器已删除', 'success');
 
-      this.postMessage({
-        type: 'toast',
-        message: 'MCP 服务器已删除',
-        toastType: 'success'
-      });
-
-      if (this.adapterFactory && 'reloadMCP' in this.adapterFactory) {
-        await (this.adapterFactory as any).reloadMCP();
-        logger.info('MCP reloaded in adapter factory', { id: serverId }, LogCategory.TOOLS);
-      }
+      await this.adapterFactory.reloadMCP();
+      logger.info('MCP reloaded in adapter factory', { id: serverId }, LogCategory.TOOLS);
 
       logger.info('MCP 服务器已删除', { id: serverId }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('删除 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: `删除 MCP 服务器失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`删除 MCP 服务器失败: ${error.message}`, 'error');
     }
   }
 
@@ -3475,33 +3138,15 @@ ${originalPrompt}
 
       const tools = manager.getServerTools(serverId);
 
-      this.postMessage({
-        type: 'mcpServerConnected',
-        serverId,
-        toolCount: tools.length
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: `MCP 服务器 "${server.name}" 已连接，发现 ${tools.length} 个工具`,
-        toastType: 'success'
-      });
+      this.sendData('mcpServerConnected', { serverId, toolCount: tools.length });
+      this.sendToast(`MCP 服务器 "${server.name}" 已连接，发现 ${tools.length} 个工具`, 'success');
 
       logger.info('MCP 服务器已连接', { id: serverId, toolCount: tools.length }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('连接 MCP 服务器失败', { serverId, error: error.message }, LogCategory.TOOLS);
 
-      this.postMessage({
-        type: 'mcpServerConnectionFailed',
-        serverId,
-        error: error.message
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: `连接 MCP 服务器失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendData('mcpServerConnectionFailed', { serverId, error: error.message });
+      this.sendToast(`连接 MCP 服务器失败: ${error.message}`, 'error');
     }
   }
 
@@ -3513,25 +3158,13 @@ ${originalPrompt}
       const manager = await this.getMCPManager();
       await manager.disconnectServer(serverId);
 
-      this.postMessage({
-        type: 'mcpServerDisconnected',
-        serverId
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: 'MCP 服务器已断开连接',
-        toastType: 'success'
-      });
+      this.sendData('mcpServerDisconnected', { serverId });
+      this.sendToast('MCP 服务器已断开连接', 'success');
 
       logger.info('MCP 服务器已断开', { id: serverId }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('断开 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: `断开 MCP 服务器失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`断开 MCP 服务器失败: ${error.message}`, 'error');
     }
   }
 
@@ -3561,26 +3194,13 @@ ${originalPrompt}
 
       tools = await manager.refreshServerTools(serverId);
 
-      this.postMessage({
-        type: 'mcpToolsRefreshed',
-        serverId,
-        tools
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: `工具列表已刷新，发现 ${tools.length} 个工具`,
-        toastType: 'success'
-      });
+      this.sendData('mcpToolsRefreshed', { serverId, tools });
+      this.sendToast(`工具列表已刷新，发现 ${tools.length} 个工具`, 'success');
 
       logger.info('MCP 工具列表已刷新', { serverId, toolCount: tools.length }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('刷新 MCP 工具列表失败', { error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: `刷新工具列表失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`刷新工具列表失败: ${error.message}`, 'error');
     }
   }
 
@@ -3592,18 +3212,10 @@ ${originalPrompt}
       const manager = await this.getMCPManager();
       const tools = manager.getServerTools(serverId);
 
-      this.postMessage({
-        type: 'mcpServerTools',
-        serverId,
-        tools
-      });
+      this.sendData('mcpServerTools', { serverId, tools });
     } catch (error: any) {
       logger.error('获取 MCP 工具列表失败', { error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: `获取工具列表失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`获取工具列表失败: ${error.message}`, 'error');
     }
   }
 
@@ -3612,10 +3224,8 @@ ${originalPrompt}
   // ============================================================================
 
   private async reloadSkillsIfPossible(reason: string): Promise<void> {
-    if (this.adapterFactory && 'reloadSkills' in this.adapterFactory) {
-      await (this.adapterFactory as any).reloadSkills();
-      logger.info('Skills reloaded in adapter factory', { reason }, LogCategory.TOOLS);
-    }
+    await this.adapterFactory.reloadSkills();
+    logger.info('Skills reloaded in adapter factory', { reason }, LogCategory.TOOLS);
   }
 
   /**
@@ -3626,8 +3236,7 @@ ${originalPrompt}
       const { LLMConfigLoader } = await import('../llm/config');
       const config = LLMConfigLoader.loadSkillsConfig();
 
-      this.postMessage({
-        type: 'skillsConfigLoaded',
+      this.sendData('skillsConfigLoaded', {
         config: config || {
           customTools: [],
           instructionSkills: [],
@@ -3638,11 +3247,7 @@ ${originalPrompt}
       logger.info('Skills 配置已加载', {}, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('加载 Skills 配置失败', { error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: `加载 Skills 配置失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`加载 Skills 配置失败: ${error.message}`, 'error');
     }
   }
 
@@ -3654,26 +3259,15 @@ ${originalPrompt}
       const { LLMConfigLoader } = await import('../llm/config');
       LLMConfigLoader.saveSkillsConfig(config);
 
-      this.postMessage({
-        type: 'skillsConfigSaved'
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: 'Skills 配置已保存',
-        toastType: 'success'
-      });
+      this.sendData('skillsConfigSaved', {});
+      this.sendToast('Skills 配置已保存', 'success');
 
       await this.reloadSkillsIfPossible('saveSkillsConfig');
 
       logger.info('Skills 配置已保存', {}, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('保存 Skills 配置失败', { error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: `保存 Skills 配置失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`保存 Skills 配置失败: ${error.message}`, 'error');
     }
   }
 
@@ -3699,27 +3293,15 @@ ${originalPrompt}
 
       LLMConfigLoader.saveSkillsConfig(config);
 
-      this.postMessage({
-        type: 'customToolAdded',
-        tool
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: `自定义工具 "${tool.name}" 已添加`,
-        toastType: 'success'
-      });
+      this.sendData('customToolAdded', { tool });
+      this.sendToast(`自定义工具 "${tool.name}" 已添加`, 'success');
 
       await this.reloadSkillsIfPossible('addCustomTool');
 
       logger.info('自定义工具已添加', { name: tool.name }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('添加自定义工具失败', { error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: `添加自定义工具失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`添加自定义工具失败: ${error.message}`, 'error');
     }
   }
 
@@ -3738,27 +3320,15 @@ ${originalPrompt}
       config.customTools = config.customTools.filter((t: any) => t.name !== toolName);
       LLMConfigLoader.saveSkillsConfig(config);
 
-      this.postMessage({
-        type: 'customToolRemoved',
-        toolName
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: `自定义工具 "${toolName}" 已删除`,
-        toastType: 'success'
-      });
+      this.sendData('customToolRemoved', { toolName });
+      this.sendToast(`自定义工具 "${toolName}" 已删除`, 'success');
 
       await this.reloadSkillsIfPossible('removeCustomTool');
 
       logger.info('自定义工具已删除', { name: toolName }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('删除自定义工具失败', { toolName, error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: `删除自定义工具失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`删除自定义工具失败: ${error.message}`, 'error');
     }
   }
 
@@ -3777,27 +3347,15 @@ ${originalPrompt}
       config.instructionSkills = (config.instructionSkills || []).filter((s: any) => s.name !== skillName);
       LLMConfigLoader.saveSkillsConfig(config);
 
-      this.postMessage({
-        type: 'instructionSkillRemoved',
-        skillName
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: `Instruction Skill "${skillName}" 已删除`,
-        toastType: 'success'
-      });
+      this.sendData('instructionSkillRemoved', { skillName });
+      this.sendToast(`Instruction Skill "${skillName}" 已删除`, 'success');
 
       await this.reloadSkillsIfPossible('removeInstructionSkill');
 
       logger.info('Instruction Skill 已删除', { name: skillName }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('删除 Instruction Skill 失败', { skillName, error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: `删除 Instruction Skill 失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`删除 Instruction Skill 失败: ${error.message}`, 'error');
     }
   }
 
@@ -3831,17 +3389,8 @@ ${originalPrompt}
       LLMConfigLoader.saveSkillsConfig(config);
 
       // 发送成功消息
-      this.postMessage({
-        type: 'skillInstalled',
-        skillId,
-        skill
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: `Skill "${skill.description}" 已安装`,
-        toastType: 'success'
-      });
+      this.sendData('skillInstalled', { skillId, skill });
+      this.sendToast(`Skill "${skill.description}" 已安装`, 'success');
 
       // 重新加载配置以更新前端
       await this.handleLoadSkillsConfig();
@@ -3852,11 +3401,7 @@ ${originalPrompt}
       logger.info('Skill 已安装', { skillId, name: skill.name }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('安装 Skill 失败', { skillId, error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: `安装 Skill 失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`安装 Skill 失败: ${error.message}`, 'error');
     }
   }
 
@@ -3872,19 +3417,12 @@ ${originalPrompt}
       const { LLMConfigLoader } = await import('../llm/config');
       const repositories = LLMConfigLoader.loadRepositories();
 
-      this.postMessage({
-        type: 'repositoriesLoaded',
-        repositories
-      });
+      this.sendData('repositoriesLoaded', { repositories });
 
       logger.info('Repositories loaded', { count: repositories.length }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to load repositories', { error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: '加载仓库失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendToast(`加载仓库失败: ${error.message}`, 'error');
     }
   }
 
@@ -3907,8 +3445,7 @@ ${originalPrompt}
       LLMConfigLoader.updateRepositoryName(result.id, repoInfo.name);
       LLMConfigLoader.updateRepository(result.id, { type: repoInfo.type });
 
-      this.postMessage({
-        type: 'repositoryAdded',
+      this.sendData('repositoryAdded', {
         repository: {
           id: result.id,
           url,
@@ -3917,21 +3454,12 @@ ${originalPrompt}
           enabled: true
         }
       });
-
-      this.postMessage({
-        type: 'toast',
-        message: `仓库 "${repoInfo.name}" 已添加（${repoInfo.skillCount} 个技能）`,
-        toastType: 'success'
-      });
+      this.sendToast(`仓库 "${repoInfo.name}" 已添加（${repoInfo.skillCount} 个技能）`, 'success');
 
       logger.info('Repository added', { url, name: repoInfo.name, type: repoInfo.type }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to add repository', { url, error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: '添加仓库失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendToast(`添加仓库失败: ${error.message}`, 'error');
     }
   }
 
@@ -3943,16 +3471,8 @@ ${originalPrompt}
       const { LLMConfigLoader } = await import('../llm/config');
       LLMConfigLoader.updateRepository(repositoryId, updates);
 
-      this.postMessage({
-        type: 'repositoryUpdated',
-        repositoryId
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: '仓库已更新',
-        toastType: 'success'
-      });
+      this.sendData('repositoryUpdated', { repositoryId });
+      this.sendToast('仓库已更新', 'success');
 
       // 重新加载仓库列表
       await this.handleLoadRepositories();
@@ -3960,11 +3480,7 @@ ${originalPrompt}
       logger.info('Repository updated', { id: repositoryId }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to update repository', { repositoryId, error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: '更新仓库失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendToast(`更新仓库失败: ${error.message}`, 'error');
     }
   }
 
@@ -3976,16 +3492,8 @@ ${originalPrompt}
       const { LLMConfigLoader } = await import('../llm/config');
       LLMConfigLoader.deleteRepository(repositoryId);
 
-      this.postMessage({
-        type: 'repositoryDeleted',
-        repositoryId
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: '仓库已删除',
-        toastType: 'success'
-      });
+      this.sendData('repositoryDeleted', { repositoryId });
+      this.sendToast('仓库已删除', 'success');
 
       // 重新加载仓库列表
       await this.handleLoadRepositories();
@@ -3993,11 +3501,7 @@ ${originalPrompt}
       logger.info('Repository deleted', { id: repositoryId }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to delete repository', { repositoryId, error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: '删除仓库失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendToast(`删除仓库失败: ${error.message}`, 'error');
     }
   }
 
@@ -4010,25 +3514,13 @@ ${originalPrompt}
       const manager = new SkillRepositoryManager();
       manager.clearCache(repositoryId);
 
-      this.postMessage({
-        type: 'repositoryRefreshed',
-        repositoryId
-      });
-
-      this.postMessage({
-        type: 'toast',
-        message: '仓库缓存已清除',
-        toastType: 'success'
-      });
+      this.sendData('repositoryRefreshed', { repositoryId });
+      this.sendToast('仓库缓存已清除', 'success');
 
       logger.info('Repository cache cleared', { id: repositoryId }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to refresh repository', { repositoryId, error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: '刷新仓库失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendToast(`刷新仓库失败: ${error.message}`, 'error');
     }
   }
 
@@ -4083,10 +3575,7 @@ ${originalPrompt}
         installed: installedSkills.has(skill.fullName)
       }));
 
-      this.postMessage({
-        type: 'skillLibraryLoaded',
-        skills: skillsWithStatus
-      });
+      this.sendData('skillLibraryLoaded', { skills: skillsWithStatus });
 
       logger.info('Skill library loaded', {
         totalSkills: skillsWithStatus.length,
@@ -4094,11 +3583,7 @@ ${originalPrompt}
       }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to load skill library', { error: error.message, stack: error.stack }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: '加载 Skill 库失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendToast(`加载 Skill 库失败: ${error.message}`, 'error');
     }
   }
 
@@ -4109,11 +3594,7 @@ ${originalPrompt}
     try {
       const kb = this.projectKnowledgeBase;
       if (!kb) {
-        this.postMessage({
-          type: 'toast',
-          message: '项目知识库未初始化',
-          toastType: 'warning'
-        });
+        this.sendToast('项目知识库未初始化', 'warning');
         return;
       }
 
@@ -4121,12 +3602,7 @@ ${originalPrompt}
       const adrs = kb.getADRs();
       const faqs = kb.getFAQs();
 
-      this.postMessage({
-        type: 'projectKnowledgeLoaded',
-        codeIndex,
-        adrs,
-        faqs
-      });
+      this.sendData('projectKnowledgeLoaded', { codeIndex, adrs, faqs });
 
       logger.info('项目知识.已加载', {
         files: codeIndex ? codeIndex.files.length : 0,
@@ -4135,11 +3611,7 @@ ${originalPrompt}
       }, LogCategory.SESSION);
     } catch (error: any) {
       logger.error('项目知识.加载失败', { error: error.message }, LogCategory.SESSION);
-      this.postMessage({
-        type: 'toast',
-        message: '加载项目知识失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendToast(`加载项目知识失败: ${error.message}`, 'error');
     }
   }
 
@@ -4150,16 +3622,16 @@ ${originalPrompt}
     try {
       const kb = this.projectKnowledgeBase;
       if (!kb) {
-        this.postMessage({ type: 'adrsLoaded', adrs: [] });
+        this.sendData('adrsLoaded', { adrs: [] });
         return;
       }
 
       const adrs = kb.getADRs(filter as any);
-      this.postMessage({ type: 'adrsLoaded', adrs });
+      this.sendData('adrsLoaded', { adrs });
       logger.info('ADR.已加载', { count: adrs.length, filter }, LogCategory.SESSION);
     } catch (error: any) {
       logger.error('ADR.加载失败', { error: error.message }, LogCategory.SESSION);
-      this.postMessage({ type: 'adrsLoaded', adrs: [] });
+      this.sendData('adrsLoaded', { adrs: [] });
     }
   }
 
@@ -4170,16 +3642,16 @@ ${originalPrompt}
     try {
       const kb = this.projectKnowledgeBase;
       if (!kb) {
-        this.postMessage({ type: 'faqsLoaded', faqs: [] });
+        this.sendData('faqsLoaded', { faqs: [] });
         return;
       }
 
       const faqs = kb.getFAQs(filter);
-      this.postMessage({ type: 'faqsLoaded', faqs });
+      this.sendData('faqsLoaded', { faqs });
       logger.info('FAQ.已加载', { count: faqs.length, filter }, LogCategory.SESSION);
     } catch (error: any) {
       logger.error('FAQ.加载失败', { error: error.message }, LogCategory.SESSION);
-      this.postMessage({ type: 'faqsLoaded', faqs: [] });
+      this.sendData('faqsLoaded', { faqs: [] });
     }
   }
 
@@ -4190,16 +3662,16 @@ ${originalPrompt}
     try {
       const kb = this.projectKnowledgeBase;
       if (!kb) {
-        this.postMessage({ type: 'faqSearchResults', results: [] });
+        this.sendData('faqSearchResults', { results: [] });
         return;
       }
 
       const results = kb.searchFAQs(keyword);
-      this.postMessage({ type: 'faqSearchResults', results });
+      this.sendData('faqSearchResults', { results });
       logger.info('FAQ.搜索完成', { keyword, count: results.length }, LogCategory.SESSION);
     } catch (error: any) {
       logger.error('FAQ.搜索失败', { error: error.message }, LogCategory.SESSION);
-      this.postMessage({ type: 'faqSearchResults', results: [] });
+      this.sendData('faqSearchResults', { results: [] });
     }
   }
 
@@ -4210,32 +3682,20 @@ ${originalPrompt}
     try {
       const kb = this.projectKnowledgeBase;
       if (!kb) {
-        this.postMessage({
-          type: 'toast',
-          message: '项目知识库未初始化',
-          toastType: 'warning'
-        });
+        this.sendToast('项目知识库未初始化', 'warning');
         return;
       }
 
       const success = kb.deleteADR(id);
       if (success) {
-        this.postMessage({ type: 'adrDeleted', id });
+        this.sendData('adrDeleted', { id });
         logger.info('ADR.删除成功', { id }, LogCategory.SESSION);
       } else {
-        this.postMessage({
-          type: 'toast',
-          message: 'ADR 删除失败',
-          toastType: 'error'
-        });
+        this.sendToast('ADR 删除失败', 'error');
       }
     } catch (error: any) {
       logger.error('ADR.删除失败', { error: error.message }, LogCategory.SESSION);
-      this.postMessage({
-        type: 'toast',
-        message: `删除失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`删除失败: ${error.message}`, 'error');
     }
   }
 
@@ -4246,32 +3706,20 @@ ${originalPrompt}
     try {
       const kb = this.projectKnowledgeBase;
       if (!kb) {
-        this.postMessage({
-          type: 'toast',
-          message: '项目知识库未初始化',
-          toastType: 'warning'
-        });
+        this.sendToast('项目知识库未初始化', 'warning');
         return;
       }
 
       const success = kb.deleteFAQ(id);
       if (success) {
-        this.postMessage({ type: 'faqDeleted', id });
+        this.sendData('faqDeleted', { id });
         logger.info('FAQ.删除成功', { id }, LogCategory.SESSION);
       } else {
-        this.postMessage({
-          type: 'toast',
-          message: 'FAQ 删除失败',
-          toastType: 'error'
-        });
+        this.sendToast('FAQ 删除失败', 'error');
       }
     } catch (error: any) {
       logger.error('FAQ.删除失败', { error: error.message }, LogCategory.SESSION);
-      this.postMessage({
-        type: 'toast',
-        message: `删除失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`删除失败: ${error.message}`, 'error');
     }
   }
 
@@ -4282,11 +3730,7 @@ ${originalPrompt}
     try {
       const kb = this.projectKnowledgeBase;
       if (!kb) {
-        this.postMessage({
-          type: 'toast',
-          message: '项目知识库未初始化',
-          toastType: 'warning'
-        });
+        this.sendToast('项目知识库未初始化', 'warning');
         return;
       }
 
@@ -4295,11 +3739,7 @@ ${originalPrompt}
 
       // 检查文件是否存在
       if (!fs.existsSync(fullPath)) {
-        this.postMessage({
-          type: 'toast',
-          message: '文件不存在',
-          toastType: 'error'
-        });
+        this.sendToast('文件不存在', 'error');
         return;
       }
 
@@ -4310,11 +3750,7 @@ ${originalPrompt}
       logger.info('文件.已打开', { path: filePath }, LogCategory.SESSION);
     } catch (error: any) {
       logger.error('文件.打开失败', { error: error.message }, LogCategory.SESSION);
-      this.postMessage({
-        type: 'toast',
-        message: `打开文件失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`打开文件失败: ${error.message}`, 'error');
     }
   }
 
@@ -4332,11 +3768,7 @@ ${originalPrompt}
       logger.info('Mermaid.新标签页.已打开', { title }, LogCategory.UI);
     } catch (error: any) {
       logger.error('Mermaid.新标签页.失败', { error: error.message }, LogCategory.UI);
-      this.postMessage({
-        type: 'toast',
-        message: `打开图表失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`打开图表失败: ${error.message}`, 'error');
     }
   }
 
@@ -4347,29 +3779,17 @@ ${originalPrompt}
     try {
       const kb = this.projectKnowledgeBase;
       if (!kb) {
-        this.postMessage({
-          type: 'toast',
-          message: '项目知识库未初始化',
-          toastType: 'warning'
-        });
+        this.sendToast('项目知识库未初始化', 'warning');
         return;
       }
 
       kb.addADR(adr);
-      this.postMessage({ type: 'adrAdded', adr });
-      this.postMessage({
-        type: 'toast',
-        message: 'ADR 已添加',
-        toastType: 'success'
-      });
+      this.sendData('adrAdded', { adr });
+      this.sendToast('ADR 已添加', 'success');
       logger.info('ADR.已添加', { id: adr.id, title: adr.title }, LogCategory.SESSION);
     } catch (error: any) {
       logger.error('ADR.添加失败', { error: error.message }, LogCategory.SESSION);
-      this.postMessage({
-        type: 'toast',
-        message: '添加 ADR 失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendToast(`添加 ADR 失败: ${error.message}`, 'error');
     }
   }
 
@@ -4380,37 +3800,21 @@ ${originalPrompt}
     try {
       const kb = this.projectKnowledgeBase;
       if (!kb) {
-        this.postMessage({
-          type: 'toast',
-          message: '项目知识库未初始化',
-          toastType: 'warning'
-        });
+        this.sendToast('项目知识库未初始化', 'warning');
         return;
       }
 
       const success = kb.updateADR(id, updates);
       if (success) {
-        this.postMessage({ type: 'adrUpdated', id });
-        this.postMessage({
-          type: 'toast',
-          message: 'ADR 已更新',
-          toastType: 'success'
-        });
+        this.sendData('adrUpdated', { id });
+        this.sendToast('ADR 已更新', 'success');
         logger.info('ADR.已更新', { id }, LogCategory.SESSION);
       } else {
-        this.postMessage({
-          type: 'toast',
-          message: 'ADR 不存在',
-          toastType: 'warning'
-        });
+        this.sendToast('ADR 不存在', 'warning');
       }
     } catch (error: any) {
       logger.error('ADR.更新失败', { error: error.message }, LogCategory.SESSION);
-      this.postMessage({
-        type: 'toast',
-        message: '更新 ADR 失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendToast(`更新 ADR 失败: ${error.message}`, 'error');
     }
   }
 
@@ -4421,29 +3825,17 @@ ${originalPrompt}
     try {
       const kb = this.projectKnowledgeBase;
       if (!kb) {
-        this.postMessage({
-          type: 'toast',
-          message: '项目知识库未初始化',
-          toastType: 'warning'
-        });
+        this.sendToast('项目知识库未初始化', 'warning');
         return;
       }
 
       kb.addFAQ(faq);
-      this.postMessage({ type: 'faqAdded', faq });
-      this.postMessage({
-        type: 'toast',
-        message: 'FAQ 已添加',
-        toastType: 'success'
-      });
+      this.sendData('faqAdded', { faq });
+      this.sendToast('FAQ 已添加', 'success');
       logger.info('FAQ.已添加', { id: faq.id, question: faq.question }, LogCategory.SESSION);
     } catch (error: any) {
       logger.error('FAQ.添加失败', { error: error.message }, LogCategory.SESSION);
-      this.postMessage({
-        type: 'toast',
-        message: '添加 FAQ 失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendToast(`添加 FAQ 失败: ${error.message}`, 'error');
     }
   }
 
@@ -4454,37 +3846,21 @@ ${originalPrompt}
     try {
       const kb = this.projectKnowledgeBase;
       if (!kb) {
-        this.postMessage({
-          type: 'toast',
-          message: '项目知识库未初始化',
-          toastType: 'warning'
-        });
+        this.sendToast('项目知识库未初始化', 'warning');
         return;
       }
 
       const success = kb.updateFAQ(id, updates);
       if (success) {
-        this.postMessage({ type: 'faqUpdated', id });
-        this.postMessage({
-          type: 'toast',
-          message: 'FAQ 已更新',
-          toastType: 'success'
-        });
+        this.sendData('faqUpdated', { id });
+        this.sendToast('FAQ 已更新', 'success');
         logger.info('FAQ.已更新', { id }, LogCategory.SESSION);
       } else {
-        this.postMessage({
-          type: 'toast',
-          message: 'FAQ 不存在',
-          toastType: 'warning'
-        });
+        this.sendToast('FAQ 不存在', 'warning');
       }
     } catch (error: any) {
       logger.error('FAQ.更新失败', { error: error.message }, LogCategory.SESSION);
-      this.postMessage({
-        type: 'toast',
-        message: '更新 FAQ 失败: ' + error.message,
-        toastType: 'error'
-      });
+      this.sendToast(`更新 FAQ 失败: ${error.message}`, 'error');
     }
   }
 
@@ -4493,10 +3869,7 @@ ${originalPrompt}
     try {
       const now = Date.now();
       if (!force && this.workerStatusCache && (now - this.workerStatusCacheAt) < this.workerStatusCacheTtlMs) {
-        this.postMessage({
-          type: 'workerStatusUpdate',
-          statuses: this.workerStatusCache
-        } as ExtensionToWebviewMessage);
+        this.sendData('workerStatusUpdate', { statuses: this.workerStatusCache });
         return;
       }
 
@@ -4696,10 +4069,7 @@ ${originalPrompt}
       statuses[name] = { status: 'checking', model: modelLabel };
     });
 
-    this.postMessage({
-      type: 'workerStatusUpdate',
-      statuses
-    } as ExtensionToWebviewMessage);
+    this.sendData('workerStatusUpdate', { statuses });
 
     // 所有模型并行检测（不再串行）
     await Promise.all([
@@ -4711,10 +4081,7 @@ ${originalPrompt}
     this.workerStatusCache = statuses;
     this.workerStatusCacheAt = Date.now();
 
-    this.postMessage({
-      type: 'workerStatusUpdate',
-      statuses
-    } as ExtensionToWebviewMessage);
+    this.sendData('workerStatusUpdate', { statuses });
 
     logger.info('Model connection status check completed', {
       results: Object.entries(statuses).map(([name, s]) => `${name}: ${s.status}`),
@@ -4755,12 +4122,7 @@ ${originalPrompt}
       totalOutputTokens: stats.reduce((sum, s) => sum + (s.totalOutputTokens || 0), 0),
     };
 
-    this.postMessage({
-      type: 'executionStatsUpdate',
-      stats,
-      orchestratorStats,
-      modelCatalog,
-    } as ExtensionToWebviewMessage);
+    this.sendData('executionStatsUpdate', { stats, orchestratorStats, modelCatalog });
   }
 
   private buildModelCatalog(): { id: string; label: string; model?: string; provider?: string; enabled?: boolean; role?: 'worker' | 'orchestrator' | 'compressor' | 'unknown' }[] {
@@ -4810,7 +4172,7 @@ ${originalPrompt}
     await executionStats.clearStats();
     this.orchestratorEngine.resetOrchestratorTokenUsage();
     this.sendExecutionStats();
-    this.postMessage({ type: 'toast', message: '执行统计已重置', toastType: 'info' });
+    this.sendToast('执行统计已重置', 'info');
   }
 
   // ============================================================================
@@ -4890,7 +4252,7 @@ ${originalPrompt}
       logger.warn('加载用户规则失败', { error }, LogCategory.LLM);
     }
 
-    this.postMessage({ type: 'profileConfig', config: uiConfig } as any);
+    this.sendData('profileConfig', { config: uiConfig });
   }
 
   /** 保存画像配置 */
@@ -4906,16 +4268,19 @@ ${originalPrompt}
           rules: {
             categoryPriority: [
               'architecture',
-              'integration',
+              'debug',
               'bugfix',
+              'refactor',
               'data_analysis',
               'backend',
               'frontend',
+              'implement',
               'test',
-              'docs',
-              'simple',
+              'review',
+              'document',
+              'general',
             ],
-            defaultCategory: 'simple',
+            defaultCategory: 'general',
             riskMapping: { high: 'fullPath', medium: 'standardPath', low: 'lightPath' },
           },
         },
@@ -4958,27 +4323,25 @@ ${originalPrompt}
           enabled: trimmed.length > 0,
           content: userRulesContent,
         });
-        if (this.adapterFactory && 'refreshUserRules' in this.adapterFactory) {
-          (this.adapterFactory as any).refreshUserRules();
-        }
+        this.adapterFactory.refreshUserRules();
       } catch (rulesError) {
         logger.warn('保存用户规则失败', { error: rulesError }, LogCategory.LLM);
       }
-      this.postMessage({ type: 'profileConfigSaved', success: true });
-      this.postMessage({ type: 'toast', message: '画像配置已保存', toastType: 'success' });
+      this.sendData('profileConfigSaved', { success: true });
+      this.sendToast('画像配置已保存', 'success');
 
       try {
         await this.orchestratorEngine.reloadProfiles();
       } catch (reloadError) {
         const reloadMsg = reloadError instanceof Error ? reloadError.message : String(reloadError);
-        this.postMessage({ type: 'toast', message: `画像重载失败: ${reloadMsg}`, toastType: 'warning' });
+        this.sendToast(`画像重载失败: ${reloadMsg}`, 'warning');
       }
       await this.sendProfileConfig();
       logger.info('界面.画像.配置.已保存', { path: ProfileStorage.getConfigDir() }, LogCategory.UI);
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.postMessage({ type: 'profileConfigSaved', success: false, error: errorMsg });
-      this.postMessage({ type: 'toast', message: `保存失败: ${errorMsg}`, toastType: 'error' });
+      this.sendData('profileConfigSaved', { success: false, error: errorMsg });
+      this.sendToast(`保存失败: ${errorMsg}`, 'error');
     }
   }
 
@@ -4990,9 +4353,7 @@ ${originalPrompt}
       try {
         const { LLMConfigLoader } = await import('../llm/config');
         LLMConfigLoader.updateUserRules({ enabled: false, content: '' });
-        if (this.adapterFactory && 'refreshUserRules' in this.adapterFactory) {
-          (this.adapterFactory as any).refreshUserRules();
-        }
+        this.adapterFactory.refreshUserRules();
       } catch (rulesError) {
         logger.warn('重置用户规则失败', { error: rulesError }, LogCategory.LLM);
       }
@@ -5000,15 +4361,15 @@ ${originalPrompt}
         await this.orchestratorEngine.reloadProfiles();
       } catch (reloadError) {
         const reloadMsg = reloadError instanceof Error ? reloadError.message : String(reloadError);
-        this.postMessage({ type: 'toast', message: `画像重载失败: ${reloadMsg}`, toastType: 'warning' });
+        this.sendToast(`画像重载失败: ${reloadMsg}`, 'warning');
       }
-      this.postMessage({ type: 'toast', message: '画像配置已重置为默认值', toastType: 'success' });
-      this.postMessage({ type: 'profileConfigReset', success: true });
+      this.sendToast('画像配置已重置为默认值', 'success');
+      this.sendData('profileConfigReset', { success: true });
       await this.sendProfileConfig();
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.postMessage({ type: 'profileConfigReset', success: false, error: errorMsg });
-      this.postMessage({ type: 'toast', message: `重置失败: ${errorMsg}`, toastType: 'error' });
+      this.sendData('profileConfigReset', { success: false, error: errorMsg });
+      this.sendToast(`重置失败: ${errorMsg}`, 'error');
     }
   }
 
@@ -5016,12 +4377,8 @@ ${originalPrompt}
   private handleSetInteractionMode(mode: import('../types').InteractionMode): void {
     logger.info('界面.交互_模式.变更', { mode }, LogCategory.UI);
     this.orchestratorEngine.setInteractionMode(mode);
-    this.postMessage({ type: 'interactionModeChanged', mode });
-    this.postMessage({
-      type: 'toast',
-      message: `已切换到 ${this.getModeDisplayName(mode)} 模式`,
-      toastType: 'info'
-    });
+    this.sendData('interactionModeChanged', { mode });
+    this.sendToast(`已切换到 ${this.getModeDisplayName(mode)} 模式`, 'info');
     this.sendStateUpdate();
   }
 
@@ -5036,6 +4393,10 @@ ${originalPrompt}
 
   /** 恢复确认回调的 Promise resolver */
   private recoveryConfirmationResolver: ((decision: 'retry' | 'rollback' | 'continue') => void) | null = null;
+  private pendingRecoveryRetry = false;
+  private pendingRecoveryPrompt: string | null = null;
+  private pendingExecutionQueue: Array<{ prompt: string; imagePaths: string[] }> = [];
+  private orchestratorQueueRunning = false;
 
   /** 处理恢复确认 */
   private async handleRecoveryConfirmation(decision: 'retry' | 'rollback' | 'continue'): Promise<void> {
@@ -5049,7 +4410,7 @@ ${originalPrompt}
     if (decision === 'rollback') {
       const count = this.snapshotManager.revertAllChanges();
       const message = count > 0 ? `已回滚 ${count} 个变更` : '没有可回滚的变更';
-      this.postMessage({ type: 'toast', message, toastType: 'info' });
+      this.sendToast(message, 'info');
       this.sendOrchestratorMessage({
         content: `回滚完成：${message}`,
         messageType: 'result',
@@ -5059,18 +4420,58 @@ ${originalPrompt}
     }
 
     if (decision === 'retry') {
+      if (this.orchestratorEngine.running) {
+        this.pendingRecoveryRetry = true;
+        this.pendingRecoveryPrompt = '请继续完成之前失败的任务';
+        logger.warn('界面.编排器.恢复.重试_延迟_引擎运行中', undefined, LogCategory.UI);
+        this.sendToast('当前任务仍在运行，已排队重试', 'info');
+        return;
+      }
       await this.resumeInterruptedTask('请继续完成之前失败的任务');
       return;
     }
 
-    this.postMessage({ type: 'toast', message: '已选择继续执行，未进行回滚', toastType: 'info' });
+    this.sendToast('已选择继续执行，未进行回滚', 'info');
+  }
+
+  private async tryResumePendingRecovery(): Promise<void> {
+    if (!this.pendingRecoveryRetry) return;
+    if (this.orchestratorEngine.running) return;
+    const prompt = this.pendingRecoveryPrompt || '请继续完成之前失败的任务';
+    this.pendingRecoveryRetry = false;
+    this.pendingRecoveryPrompt = null;
+    logger.info('界面.编排器.恢复.重试_触发', undefined, LogCategory.UI);
+    await this.resumeInterruptedTask(prompt);
+  }
+
+  private async enqueueOrchestratorExecution(prompt: string, imagePaths: string[]): Promise<void> {
+    this.pendingExecutionQueue.push({ prompt, imagePaths });
+    if (this.orchestratorQueueRunning) {
+      return;
+    }
+    this.orchestratorQueueRunning = true;
+    try {
+      while (this.pendingExecutionQueue.length > 0) {
+        while (this.orchestratorEngine.running) {
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        const next = this.pendingExecutionQueue.shift();
+        if (!next) {
+          continue;
+        }
+        logger.info('界面.编排器.排队执行_触发', { queueRemaining: this.pendingExecutionQueue.length }, LogCategory.UI);
+        await this.executeWithOrchestrator(next.prompt, next.imagePaths);
+      }
+    } finally {
+      this.orchestratorQueueRunning = false;
+    }
   }
 
   /** 在 VS Code 原生 diff 视图中打开文件变更（类似 Augment） */
   private async openVscodeDiff(filePath: string): Promise<void> {
     const session = this.sessionManager.getCurrentSession();
     if (!session) {
-      this.postMessage({ type: 'toast', message: '没有活动会话', toastType: 'warning' });
+      this.sendToast('没有活动会话', 'warning');
       return;
     }
 
@@ -5080,7 +4481,7 @@ ${originalPrompt}
 
     const snapshot = this.sessionManager.getSnapshot(session.id, relativePath);
     if (!snapshot) {
-      this.postMessage({ type: 'toast', message: '未找到该文件的快照', toastType: 'warning' });
+      this.sendToast('未找到该文件的快照', 'warning');
       return;
     }
 
@@ -5124,7 +4525,7 @@ ${originalPrompt}
 
     } catch (error) {
       logger.error('界面.差异.打开_失败', error, LogCategory.UI);
-      this.postMessage({ type: 'toast', message: '打开 diff 视图失败', toastType: 'error' });
+      this.sendToast('打开 diff 视图失败', 'error');
     }
   }
 
@@ -5142,7 +4543,7 @@ ${originalPrompt}
 
       // 检查文件是否存在
       if (!fs.existsSync(absolutePath)) {
-        this.postMessage({ type: 'toast', message: `文件不存在: ${filepath}`, toastType: 'warning' });
+        this.sendToast(`文件不存在: ${filepath}`, 'warning');
         return;
       }
 
@@ -5155,7 +4556,7 @@ ${originalPrompt}
       });
     } catch (error) {
       logger.error('界面.文件.打开_失败', error, LogCategory.UI);
-      this.postMessage({ type: 'toast', message: `打开文件失败: ${filepath}`, toastType: 'error' });
+      this.sendToast(`打开文件失败: ${filepath}`, 'error');
     }
   }
 
@@ -5163,14 +4564,14 @@ ${originalPrompt}
   private handleClearAllTasks(): void {
     const session = this.sessionManager.getCurrentSession();
     if (!session) {
-      this.postMessage({ type: 'toast', message: '没有活动会话', toastType: 'warning' });
+      this.sendToast('没有活动会话', 'warning');
       return;
     }
 
     // 检查是否有正在运行的任务
     const runningTask = session.tasks.find(t => t.status === 'running');
     if (runningTask) {
-      this.postMessage({ type: 'toast', message: '有任务正在执行，无法清理', toastType: 'warning' });
+      this.sendToast('有任务正在执行，无法清理', 'warning');
       return;
     }
 
@@ -5179,39 +4580,39 @@ ${originalPrompt}
     session.tasks = [];
     this.sessionManager.saveCurrentSession();
 
-    this.postMessage({ type: 'toast', message: `已清理 ${taskCount} 个任务`, toastType: 'success' });
+    this.sendToast(`已清理 ${taskCount} 个任务`, 'success');
     this.sendStateUpdate();
   }
 
   private async handleStartTask(taskId?: string): Promise<void> {
     if (!taskId) {
-      this.postMessage({ type: 'toast', message: '缺少任务 ID', toastType: 'error' });
+      this.sendToast('缺少任务 ID', 'error');
       return;
     }
     try {
       const taskManager = await this.getTaskManager();
       await taskManager.startTask(taskId);
-      this.postMessage({ type: 'toast', message: '任务已开始', toastType: 'success' });
+      this.sendToast('任务已开始', 'success');
       this.sendStateUpdate();
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.postMessage({ type: 'toast', message: `启动失败: ${errorMsg}`, toastType: 'error' });
+      this.sendToast(`启动失败: ${errorMsg}`, 'error');
     }
   }
 
   private async handleDeleteTask(taskId?: string): Promise<void> {
     if (!taskId) {
-      this.postMessage({ type: 'toast', message: '缺少任务 ID', toastType: 'error' });
+      this.sendToast('缺少任务 ID', 'error');
       return;
     }
     try {
       const taskManager = await this.getTaskManager();
       await taskManager.deleteTask(taskId);
-      this.postMessage({ type: 'toast', message: '任务已删除', toastType: 'success' });
+      this.sendToast('任务已删除', 'success');
       this.sendStateUpdate();
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.postMessage({ type: 'toast', message: `删除失败: ${errorMsg}`, toastType: 'error' });
+      this.sendToast(`删除失败: ${errorMsg}`, 'error');
     }
   }
 
@@ -5243,13 +4644,13 @@ ${originalPrompt}
   /** 恢复被打断的任务 */
   private async resumeInterruptedTask(extraInstruction?: string): Promise<void> {
     if (this.orchestratorEngine.running) {
-      this.postMessage({ type: 'toast', message: '当前仍有任务在执行', toastType: 'warning' });
+      this.sendToast('当前仍有任务在执行', 'warning');
       return;
     }
 
     const lastTask = await this.getLastInterruptedTask();
     if (!lastTask) {
-      this.postMessage({ type: 'toast', message: '没有可恢复的任务', toastType: 'info' });
+      this.sendToast('没有可恢复的任务', 'info');
       return;
     }
 
@@ -5268,7 +4669,7 @@ ${originalPrompt}
 
     // 检查是否有正在运行的任务
     if (!this.orchestratorEngine.running) {
-      this.postMessage({ type: 'toast', message: '没有正在执行的任务', toastType: 'warning' });
+      this.sendToast('没有正在执行的任务', 'warning');
       return;
     }
 
@@ -5276,18 +4677,14 @@ ${originalPrompt}
     // 未来可以扩展为真正的追加到当前执行上下文
     try {
       // 添加用户消息到对话
-      this.postMessage({
-        type: 'toast',
-        message: '补充内容已发送',
-        toastType: 'info'
-      });
+      this.sendToast('补充内容已发送', 'info');
 
       // 发送到当前活跃的 Worker
       // 注意：这是一个简化实现，真正的追加需要 Worker 支持
       logger.info('界面.消息.补充.降级', { reason: 'simplified_implementation' }, LogCategory.UI);
     } catch (error) {
       logger.error('界面.消息.补充.失败', error, LogCategory.UI);
-      this.postMessage({ type: 'toast', message: '补充内容失败', toastType: 'error' });
+      this.sendToast('补充内容失败', 'error');
     }
   }
 
@@ -5303,7 +4700,7 @@ ${originalPrompt}
       config.update('timeout', parseInt(value as string, 10), vscode.ConfigurationTarget.Global);
     }
 
-    this.postMessage({ type: 'toast', message: '设置已保存', toastType: 'success' });
+    this.sendToast('设置已保存', 'success');
   }
 
   /** 执行任务 */
@@ -5311,17 +4708,13 @@ ${originalPrompt}
     logger.info('界面.任务.执行.开始', { promptLength: prompt.length, imageCount: images?.length || 0, forceWorker: forceWorker || undefined }, LogCategory.UI);
     const maxPromptLength = 10000;
     if (prompt.length > maxPromptLength) {
-      this.postMessage({ type: 'toast', message: `输入内容过长（${prompt.length} 字符），请控制在 ${maxPromptLength} 字符以内`, toastType: 'warning' });
+      this.sendToast(`输入内容过长（${prompt.length} 字符），请控制在 ${maxPromptLength} 字符以内`, 'warning');
       return;
     }
 
-    // 立即发送 taskAccepted 确认，避免前端超时
+    // 🔧 统一消息通道：taskAccepted 走 MessageHub
     if (this.pendingRequestId) {
-      this.postMessage({
-        type: 'taskAccepted',
-        requestId: this.pendingRequestId,
-        sessionId: this.activeSessionId
-      } as any);
+      this.messageHub.taskAccepted(this.pendingRequestId);
       this.pendingRequestId = null;
     }
 
@@ -5373,8 +4766,8 @@ ${originalPrompt}
     }
 
     if (useIntelligentMode) {
-      // 智能编排模式：Claude 分析 → 分配 Worker → 执行 → 总结
-      await this.executeWithOrchestrator(effectivePrompt, imagePaths);
+      // 智能编排模式：统一串行化，避免引擎并发
+      await this.enqueueOrchestratorExecution(effectivePrompt, imagePaths);
     } else {
       // 直接执行模式：指定 Worker 直接执行
       await this.executeWithDirectWorker(effectivePrompt, forceWorker || this.selectedWorker!, imagePaths);
@@ -5426,11 +4819,7 @@ ${originalPrompt}
       const skills: InstructionSkillDefinition[] = Array.isArray(config?.instructionSkills) ? config.instructionSkills : [];
       const skill = skills.find((item) => item.name === skillName);
       if (!skill) {
-        this.postMessage({
-          type: 'toast',
-          message: `未找到 Skill: ${skillName}`,
-          toastType: 'error'
-        });
+        this.sendToast(`未找到 Skill: ${skillName}`, 'error');
         return;
       }
 
@@ -5438,11 +4827,7 @@ ${originalPrompt}
       await this.executeTask(prompt, agent || undefined, images || []);
     } catch (error: any) {
       logger.error('应用 Skill 失败', { skillName, error: error.message }, LogCategory.TOOLS);
-      this.postMessage({
-        type: 'toast',
-        message: `应用 Skill 失败: ${error.message}`,
-        toastType: 'error'
-      });
+      this.sendToast(`应用 Skill 失败: ${error.message}`, 'error');
     }
   }
 
@@ -5463,7 +4848,7 @@ ${originalPrompt}
   private async executePlanOnly(payload: string | undefined, imagePaths: string[]): Promise<void> {
     const planPrompt = (payload || '').trim();
     if (!planPrompt) {
-      this.postMessage({ type: 'toast', message: '请输入计划内容，例如：/plan 实现登录功能', toastType: 'warning' });
+      this.sendToast('请输入计划内容，例如：/plan 实现登录功能', 'warning');
       return;
     }
     const taskManager = await this.getTaskManager();
@@ -5493,7 +4878,7 @@ ${originalPrompt}
       : (sessionId ? this.orchestratorEngine.getActivePlanForSession(sessionId) : null);
 
     if (!record) {
-      this.postMessage({ type: 'toast', message: '未找到可执行的计划，请先使用 /plan 生成计划', toastType: 'warning' });
+      this.sendToast('未找到可执行的计划，请先使用 /plan 生成计划', 'warning');
       return;
     }
 
@@ -5640,7 +5025,7 @@ ${originalPrompt}
 
       if (response.error) {
         await taskManager.failTask(task.id, response.error);
-        this.postMessage({ type: 'workerError', worker: targetWorker, error: response.error });
+        this.sendData('workerError', { worker: targetWorker, error: response.error });
       } else {
         await taskManager.completeTask(task.id);
         this.saveMessageToSession(prompt, response.content || '', targetWorker, 'worker');
@@ -5661,7 +5046,7 @@ ${originalPrompt}
           error: errorMsg,
         });
       }
-      this.postMessage({ type: 'workerError', worker: targetWorker, error: errorMsg });
+      this.sendData('workerError', { worker: targetWorker, error: errorMsg });
     }
 
     this.sendStateUpdate();
@@ -5670,7 +5055,7 @@ ${originalPrompt}
   /** 发送状态更新到 Webview */
   private sendStateUpdate(): void {
     const state = this.buildUIState();
-    this.postMessage({ type: 'stateUpdate', state });
+    this.sendData('stateUpdate', { state });
   }
 
   private sendCurrentSessionToWebview(): void {
@@ -5678,7 +5063,7 @@ ${originalPrompt}
     if (!session) {
       return;
     }
-    this.postMessage({ type: 'sessionLoaded', session: session as any });
+    this.sendData('sessionLoaded', { session: session as any });
   }
 
   /** 创建并切换到新会话（对齐任务/对话会话） */
@@ -5697,8 +5082,8 @@ ${originalPrompt}
     this.activeSessionId = newSession.id;
     logger.info('界面.会话.已创建', { sessionId: this.activeSessionId }, LogCategory.UI);
     // 通知 webview 新会话已创建
-    this.postMessage({ type: 'sessionCreated', session: newSession as any });
-    this.postMessage({ type: 'sessionsUpdated', sessions: this.sessionManager.getSessionMetas() as any[] });
+    this.sendData('sessionCreated', { session: newSession as any });
+    this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() as any[] });
     this.sendStateUpdate();
   }
 
@@ -5720,6 +5105,18 @@ ${originalPrompt}
       };
 
       for (const m of session.messages) {
+        if (!m?.id || typeof m.id !== 'string' || !m.id.trim()) {
+          throw new Error('Session message missing id');
+        }
+        if (m.role !== 'user' && m.role !== 'assistant' && m.role !== 'system') {
+          throw new Error(`Session message role invalid: ${String(m.role)}`);
+        }
+        if (typeof m.content !== 'string') {
+          throw new Error('Session message content invalid');
+        }
+        if (typeof m.timestamp !== 'number') {
+          throw new Error('Session message timestamp invalid');
+        }
         const formatted = {
           id: m.id,
           role: m.role,
@@ -5742,8 +5139,7 @@ ${originalPrompt}
       }
 
       // 发送完整的会话消息历史给前端（包括 worker 消息）
-      this.postMessage({
-        type: 'sessionMessagesLoaded',
+      this.sendData('sessionMessagesLoaded', {
         sessionId,
         messages: threadMessages,
         workerMessages,
@@ -5807,22 +5203,36 @@ ${originalPrompt}
       return;
     }
 
-    // 转换前端消息格式为后端格式
-    const normalizeRole = (role: any): 'user' | 'assistant' | 'system' => {
-      if (role === 'user') return 'user';
-      if (role === 'assistant' || role === 'system') return role;
-      return 'assistant';
-    };
-
-    const sessionMessages = messages.map(m => ({
-      id: m.id || `msg-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-      role: normalizeRole(m.role),
-      content: m.content,
-      agent: m.agent,
-      timestamp: typeof m.timestamp === 'number' ? m.timestamp : Date.now(),
-      images: m.images,
-      source: m.source,
-    }));
+    const seen = new Set<string>();
+    const sessionMessages = messages.map((m) => {
+      const id = typeof m?.id === 'string' && m.id.trim() ? m.id.trim() : '';
+      if (!id) {
+        throw new Error('[WebviewProvider] Session message 缺少 id');
+      }
+      if (seen.has(id)) {
+        throw new Error(`[WebviewProvider] Session message id 重复: ${id}`);
+      }
+      seen.add(id);
+      const role = m?.role;
+      if (role !== 'user' && role !== 'assistant' && role !== 'system') {
+        throw new Error(`[WebviewProvider] Session message role 无效: ${String(role)}`);
+      }
+      if (typeof m?.content !== 'string') {
+        throw new Error('[WebviewProvider] Session message content 非字符串');
+      }
+      if (typeof m?.timestamp !== 'number') {
+        throw new Error('[WebviewProvider] Session message timestamp 无效');
+      }
+      return {
+        id,
+        role,
+        content: m.content,
+        agent: m.agent,
+        timestamp: m.timestamp,
+        images: m.images,
+        source: m.source,
+      };
+    });
 
     // 使用新的 API 保存会话数据
     this.sessionManager.updateSessionData(currentSession.id, sessionMessages);  // ✅ 移除 cliOutputs 参数
@@ -5919,11 +5329,24 @@ ${originalPrompt}
 
   private assertBlocks(blocks: ContentBlock[] | undefined, context: string): ContentBlock[] {
     if (blocks === undefined) return [];
-    return this.assertValidArray<ContentBlock>(blocks, context);
+    const safeBlocks = this.assertValidArray<ContentBlock>(blocks, context)
+      .filter((block) => !!block && typeof block === 'object' && typeof (block as ContentBlock).type === 'string');
+    if (safeBlocks.length !== blocks.length) {
+      logger.warn('界面.消息.块_清理', { context, removed: blocks.length - safeBlocks.length }, LogCategory.UI);
+    }
+    return safeBlocks;
   }
 
   private getWebviewMessagePriority(message: ExtensionToWebviewMessage): WebviewMessagePriority {
     return HIGH_PRIORITY_MESSAGE_TYPES.has(message.type) ? 'high' : 'normal';
+  }
+
+  private sendData(dataType: DataMessageType, payload: Record<string, unknown>): void {
+    this.messageHub.data(dataType, payload);
+  }
+
+  private sendToast(message: string, level: NotifyLevel = 'info', duration?: number): void {
+    this.messageHub.notify(message, level, duration);
   }
 
   /** 发送消息到 Webview（统一消息总线，优先级调度） */

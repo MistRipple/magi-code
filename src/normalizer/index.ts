@@ -23,12 +23,7 @@ export {
 } from './orchestrator-normalizer';
 export { MessageBatcher, type BatcherConfig, type BatchCallback } from './message-batcher';
 export { MessageDeduplicator, type DeduplicationConfig } from './message-deduplicator';
-export {
-  UnifiedMessageBus,
-  type MessageBusConfig,
-  type MessageBusEvents,
-  type ProcessingState,
-} from './unified-message-bus';
+// 🔧 统一消息通道：UnifiedMessageBus 已废弃，功能迁移到 MessageHub
 
 import type { AgentType, WorkerSlot } from '../types/agent-types';  // ✅ 使用 AgentType
 import { BaseNormalizer } from './base-normalizer';

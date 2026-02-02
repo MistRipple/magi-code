@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebSocket 客户端演示</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+      overflow: hidden;
+    }
+
+    .header {
+      background: linear-gradient(135deg, #5f72bd 0%, #9b23ea 100%);
+      color: white;
+      padding: 25px 30px;
+      text-align: center;
+    }
+
+    .header h1 {
+      font-size: 28px;
+      margin-bottom: 8px;
+    }
+
+    .status {
+      display: inline-block;
+      padding: 6px 16px;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 600;
+      margin-top: 10px;
+    }
+
+    .status.connected {
+      background: #10b981;
+    }
+
+    .status.disconnected {
+      background: #ef4444;
+    }
+
+    .status.connecting {
+      background: #f59e0b;
+    }
+
+    .controls {
+      padding: 20px 30px;
+      background: #f8fafc;
+      border-bottom: 1px solid #e2e8f0;
+    }
+
+    .control-group {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 15px;
+    }
+
+    .control-group:last-child {
+      margin-bottom: 0;
+    }
+
+    input[type="text"] {
+      flex: 1;
+      padding: 12px 16px;
+      border: 2px solid #e2e8f0;
+      border-radius: 8px;
+      font-size: 14px;
+      transition: border-color 0.2s;
+    }
+
+    input[type="text"]:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+
+    button {
+      padding: 12px 24px;
+      background: #667eea;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    button:hover {
+      background: #5a67d8;
+      transform: translateY(-1px);
+    }
+
+    button:active {
+      transform: translateY(0);
+    }
+
+    button:disabled {
+      background: #cbd5e1;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    button.danger {
+      background: #ef4444;
+    }
+
+    button.danger:hover {
+      background: #dc2626;
+    }
+
+    button.success {
+      background: #10b981;
+    }
+
+    button.success:hover {
+      background: #059669;
+    }
+
+    .messages {
+      height: 400px;
+      overflow-y: auto;
+      padding: 20px 30px;
+      background: white;
+    }
+
+    .message {
+      margin-bottom: 12px;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 14px;
+      line-height: 1.5;
+      animation: slideIn 0.3s ease;
+    }
+
+    @keyframes slideIn {
+      from {
+        opacity: 0;
+        transform: translateY(-10px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .message.system {
+      background: #e0e7ff;
+      border-left: 4px solid #667eea;
+    }
+
+    .message.sent {
+      background: #d1fae5;
+      border-left: 4px solid #10b981;
+    }
+
+    .message.received {
+      background: #fef3c7;
+      border-left: 4px solid #f59e0b;
+    }
+
+    .message.error {
+      background: #fee2e2;
+      border-left: 4px solid #ef4444;
+    }
+
+    .message .time {
+      font-size: 11px;
+      color: #64748b;
+      margin-top: 4px;
+    }
+
+    .stats {
+      padding: 15px 30px;
+      background: #f1f5f9;
+      border-top: 1px solid #e2e8f0;
+      display: flex;
+      justify-content: space-around;
+      font-size: 13px;
+      color: #475569;
+    }
+
+    .stats .stat {
+      text-align: center;
+    }
+
+    .stats .stat-value {
+      font-size: 24px;
+      font-weight: 700;
+      color: #1e293b;
+    }
+
+    .stats .stat-label {
+      margin-top: 4px;
+    }
+
+    ::-webkit-scrollbar {
+      width: 8px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: #f1f5f9;
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 4px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background: #94a3b8;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🚀 WebSocket 客户端演示</h1>
+      <div class="status disconnected" id="status">未连接</div>
+      <div style="margin-top: 8px; font-size: 12px;" id="connectionId"></div>
+    </div>
+
+    <div class="controls">
+      <div class="control-group">
+        <input type="text" id="serverUrl" value="ws://localhost:8080" placeholder="服务器地址">
+        <button id="connectBtn" class="success">连接</button>
+        <button id="disconnectBtn" class="danger" disabled>断开</button>
+      </div>
+      
+      <div class="control-group">
+        <input type="text" id="messageInput" placeholder="输入消息内容..." disabled>
+        <button id="sendBtn" disabled>发送</button>
+        <button id="broadcastBtn" disabled>广播测试</button>
+      </div>
+    </div>
+
+    <div class="messages" id="messages"></div>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="stat-value" id="sentCount">0</div>
+        <div class="stat-label">已发送</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value" id="receivedCount">0</div>
+        <div class="stat-label">已接收</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value" id="reconnectCount">0</div>
+        <div class="stat-label">重连次数</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="websocket-client.js"></script>
+  <script>
+    // 状态管理
+    let client = null;
+    let sentCount = 0;
+    let receivedCount = 0;
+    let reconnectCount = 0;
+
+    // DOM 元素
+    const statusEl = document.getElementById('status');
+    const connectionIdEl = document.getElementById('connectionId');
+    const serverUrlInput = document.getElementById('serverUrl');
+    const messageInput = document.getElementById('messageInput');
+    const messagesDiv = document.getElementById('messages');
+    const connectBtn = document.getElementById('connectBtn');
+    const disconnectBtn = document.getElementById('disconnectBtn');
+    const sendBtn = document.getElementById('sendBtn');
+    const broadcastBtn = document.getElementById('broadcastBtn');
+    const sentCountEl = document.getElementById('sentCount');
+    const receivedCountEl = document.getElementById('receivedCount');
+    const reconnectCountEl = document.getElementById('reconnectCount');
+
+    // 更新状态显示
+    function updateStatus(status, text) {
+      statusEl.className = `status ${status}`;
+      statusEl.textContent = text;
+    }
+
+    // 添加消息到界面
+    function addMessage(type, content) {
+      const messageEl = document.createElement('div');
+      messageEl.className = `message ${type}`;
+      
+      const contentDiv = document.createElement('div');
+      contentDiv.textContent = content;
+      
+      const timeDiv = document.createElement('div');
+      timeDiv.className = 'time';
+      timeDiv.textContent = new Date().toLocaleTimeString();
+      
+      messageEl.appendChild(contentDiv);
+      messageEl.appendChild(timeDiv);
+      messagesDiv.appendChild(messageEl);
+      
+      // 自动滚动到底部
+      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    }
+
+    // 更新统计
+    function updateStats() {
+      sentCountEl.textContent = sentCount;
+      receivedCountEl.textContent = receivedCount;
+      reconnectCountEl.textContent = reconnectCount;
+    }
+
+    // 连接服务器
+    connectBtn.addEventListener('click', () => {
+      const url = serverUrlInput.value.trim();
+      if (!url) {
+        alert('请输入服务器地址');
+        return;
+      }
+
+      updateStatus('connecting', '连接中...');
+      addMessage('system', `正在连接到: ${url}`);
+
+      // 创建客户端
+      client = new WebSocketClient(url, {
+        reconnectInterval: 3000,
+        maxReconnectAttempts: 5,
+        heartbeatInterval: 25000
+      });
+
+      // 注册事件
+      client.onOpen(() => {
+        updateStatus('connected', '已连接');
+        addMessage('system', '✅ 连接成功！');
+        
+        connectBtn.disabled = true;
+        disconnectBtn.disabled = false;
+        messageInput.disabled = false;
+        sendBtn.disabled = false;
+        broadcastBtn.disabled = false;
+        serverUrlInput.disabled = true;
+      });
+
+      client.onMessage((message) => {
+        receivedCount++;
+        updateStats();
+
+        if (message.type === 'connected') {
+          connectionIdEl.textContent = `连接ID: ${message.connectionId}`;
+          addMessage('system', `分配的连接ID: ${message.connectionId}`);
+        } else if (message.type === 'chat') {
+          addMessage('received', `📢 广播消息 [${message.from}]: ${message.content}`);
+        } else if (message.type === 'private') {
+          addMessage('received', `🔒 私聊消息 [${message.from}]: ${message.content}`);
+        } else if (message.type === 'echo') {
+          addMessage('received', `🔄 回显: ${JSON.stringify(message.original)}`);
+        } else {
+          addMessage('received', JSON.stringify(message, null, 2));
+        }
+      });
+
+      client.onClose((event) => {
+        updateStatus('disconnected', '已断开');
+        addMessage('system', `❌ 连接已断开 (代码: ${event.code})`);
+        
+        connectBtn.disabled = false;
+        disconnectBtn.disabled = true;
+        messageInput.disabled = true;
+        sendBtn.disabled = true;
+        broadcastBtn.disabled = true;
+        serverUrlInput.disabled = false;
+        connectionIdEl.textContent = '';
+      });
+
+      client.onError((error) => {
+        addMessage('error', `⚠️ 连接错误: ${error.message || '未知错误'}`);
+      });
+
+      client.onReconnecting((attempt, delay) => {
+        reconnectCount++;
+        updateStats();
+        updateStatus('connecting', `重连中 (${attempt}/5)`);
+        addMessage('system', `🔄 第 ${attempt} 次重连，延迟 ${delay}ms`);
+      });
+
+      client.onReconnectFailed((attempts) => {
+        addMessage('error', `🚫 重连失败，已尝试 ${attempts} 次`);
+      });
+
+      // 开始连接
+      client.connect();
+    });
+
+    // 断开连接
+    disconnectBtn.addEventListener('click', () => {
+      if (client) {
+        client.close();
+        addMessage('system', '📴 主动断开连接');
+      }
+    });
+
+    // 发送消息
+    sendBtn.addEventListener('click', () => {
+      const content = messageInput.value.trim();
+      if (!content) {
+        alert('请输入消息内容');
+        return;
+      }
+
+      if (client && client.sendChat(content)) {
+        sentCount++;
+        updateStats();
+        addMessage('sent', `📤 发送: ${content}`);
+        messageInput.value = '';
+      } else {
+        addMessage('error', '❌ 发送失败');
+      }
+    });
+
+    // 广播测试
+    broadcastBtn.addEventListener('click', () => {
+      if (client && client.sendChat('这是一条测试广播消息')) {
+        sentCount++;
+        updateStats();
+        addMessage('sent', '📤 广播测试消息已发送');
+      } else {
+        addMessage('error', '❌ 发送失败');
+      }
+    });
+
+    // 回车发送
+    messageInput.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        sendBtn.click();
+      }
+    });
+
+    // 初始化消息
+    addMessage('system', '💡 请点击"连接"按钮连接到 WebSocket 服务器');
+  </script>
+</body>
+</html>

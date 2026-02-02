@@ -39,6 +39,159 @@ export enum MessageType {
   THINKING = 'thinking',
 }
 
+// ============================================================================
+// 统一消息分类（unified-message-channel-design.md v2.5）
+// ============================================================================
+
+/**
+ * 消息大类（MessageCategory）
+ *
+ * 用于统一消息通道的顶层分类路由：
+ * - CONTENT: 内容消息（LLM 响应、结果等），使用 blocks 渲染
+ * - CONTROL: 控制消息（阶段、任务状态），驱动前端状态机
+ * - NOTIFY: 通知消息（Toast），短暂提示
+ * - DATA: 数据消息（状态同步），后端数据下发
+ */
+export enum MessageCategory {
+  /** 内容消息（LLM 响应、结果、错误） */
+  CONTENT = 'content',
+  /** 控制消息（阶段变化、任务状态） */
+  CONTROL = 'control',
+  /** 通知消息（Toast 提示） */
+  NOTIFY = 'notify',
+  /** 数据消息（状态同步、配置加载） */
+  DATA = 'data',
+}
+
+/**
+ * 控制消息子类型（ControlMessageType）
+ *
+ * CONTROL 类别消息的具体类型，用于前端状态机处理
+ */
+export enum ControlMessageType {
+  /** 阶段变化 */
+  PHASE_CHANGED = 'phase_changed',
+  /** 任务已接受 */
+  TASK_ACCEPTED = 'task_accepted',
+  /** 任务被拒绝 */
+  TASK_REJECTED = 'task_rejected',
+  /** 任务开始执行 */
+  TASK_STARTED = 'task_started',
+  /** 任务完成 */
+  TASK_COMPLETED = 'task_completed',
+  /** 任务失败 */
+  TASK_FAILED = 'task_failed',
+  /** Worker 状态更新 */
+  WORKER_STATUS = 'worker_status',
+}
+
+/**
+ * 通知消息级别（NotifyLevel）
+ */
+export type NotifyLevel = 'info' | 'success' | 'warning' | 'error';
+
+/**
+ * 数据消息类型（DataMessageType）
+ */
+export type DataMessageType =
+  | 'adrAdded'
+  | 'adrDeleted'
+  | 'adrUpdated'
+  | 'adrsLoaded'
+  | 'allWorkerConfigsLoaded'
+  | 'assignmentCompleted'
+  | 'assignmentPlanned'
+  | 'assignmentStarted'
+  | 'authStatus'
+  | 'clarificationRequest'
+  | 'compressorConfigLoaded'
+  | 'compressorConfigSaved'
+  | 'compressorConnectionTestResult'
+  | 'confirmationRequest'
+  | 'contractVerified'
+  | 'customToolAdded'
+  | 'customToolRemoved'
+  | 'dependencyAnalysis'
+  | 'dynamicTodoAdded'
+  | 'executionStatsUpdate'
+  | 'faqAdded'
+  | 'faqDeleted'
+  | 'faqSearchResults'
+  | 'faqUpdated'
+  | 'faqsLoaded'
+  | 'instructionSkillRemoved'
+  | 'interactionModeChanged'
+  | 'loginError'
+  | 'loginSuccess'
+  | 'mcpServerAdded'
+  | 'mcpServerConnected'
+  | 'mcpServerConnectionFailed'
+  | 'mcpServerDeleted'
+  | 'mcpServerDisconnected'
+  | 'mcpServerTools'
+  | 'mcpServerUpdated'
+  | 'mcpServersLoaded'
+  | 'mcpToolsRefreshed'
+  | 'missionApproved'
+  | 'missionBlocked'
+  | 'missionCancelled'
+  | 'missionCompleted'
+  | 'missionCreated'
+  | 'missionExecutionCompleted'
+  | 'missionExecutionFailed'
+  | 'missionExecutionStarted'
+  | 'missionFailed'
+  | 'missionPaused'
+  | 'missionPlanned'
+  | 'missionProgress'
+  | 'missionResumed'
+  | 'missionSummary'
+  | 'missionUnblocked'
+  | 'missionVerificationCompleted'
+  | 'missionVerificationStarted'
+  | 'orchestratorConfigLoaded'
+  | 'orchestratorConfigSaved'
+  | 'orchestratorConnectionTestResult'
+  | 'profileConfig'
+  | 'profileConfigReset'
+  | 'profileConfigSaved'
+  | 'projectKnowledgeLoaded'
+  | 'processingStateChanged'
+  | 'promptEnhanceConfigLoaded'
+  | 'promptEnhanceResult'
+  | 'promptEnhanceSaved'
+  | 'promptEnhanced'
+  | 'questionRequest'
+  | 'recoveryRequest'
+  | 'repositoriesLoaded'
+  | 'repositoryAdded'
+  | 'repositoryDeleted'
+  | 'repositoryRefreshed'
+  | 'repositoryUpdated'
+  | 'sessionCreated'
+  | 'sessionLoaded'
+  | 'sessionMessagesLoaded'
+  | 'sessionSwitched'
+  | 'sessionsUpdated'
+  | 'skillInstalled'
+  | 'skillLibraryLoaded'
+  | 'skillsConfigLoaded'
+  | 'skillsConfigSaved'
+  | 'stateUpdate'
+  | 'taskInterrupted'
+  | 'todoApprovalRequested'
+  | 'todoCompleted'
+  | 'todoFailed'
+  | 'todoStarted'
+  | 'toolAuthorizationRequest'
+  | 'workerConfigSaved'
+  | 'workerConnectionTestResult'
+  | 'workerError'
+  | 'workerQuestionRequest'
+  | 'workerSessionCreated'
+  | 'workerSessionResumed'
+  | 'workerStatusUpdate';
+
 /**
  * 消息生命周期状态
  * 明确的状态机，消除 streaming/pendingComplete 等混乱标记
@@ -116,6 +269,8 @@ export interface ToolCallBlock {
   output?: string;
   /** 错误信息 */
   error?: string;
+  /** 是否可恢复（用于错误/降级判断） */
+  recoverable?: boolean;
   /** 持续时间（毫秒） */
   duration?: number;
 }
@@ -210,10 +365,44 @@ export interface InteractionRequest {
 // ============================================================================
 
 /**
+ * CONTROL 类别专属字段
+ */
+export interface ControlPayload {
+  /** 控制消息子类型 */
+  controlType: ControlMessageType;
+  /** 控制消息负载 */
+  payload: Record<string, unknown>;
+}
+
+/**
+ * NOTIFY 类别专属字段
+ */
+export interface NotifyPayload {
+  /** 通知级别 */
+  level: NotifyLevel;
+  /** 显示时长（毫秒），默认 3000 */
+  duration?: number;
+}
+
+/**
+ * DATA 类别专属字段
+ */
+export interface DataPayload {
+  /** 数据消息类型 */
+  dataType: DataMessageType;
+  /** 数据负载 */
+  payload: Record<string, unknown>;
+}
+
+/**
  * 标准消息 - 统一消息协议的核心
  *
  * 所有 Agent 输出经过 Normalizer 转换后都变成这个格式
  * Webview 只需要根据这个接口渲染，无需任何解析逻辑
+ *
+ * 🔧 统一消息通道（unified-message-channel-design.md v2.5）：
+ * - 新增 category 字段（必填），用于顶层分类路由
+ * - 新增 control/notify/data 专属字段
  */
 export interface StandardMessage {
   /** 消息唯一标识 */
@@ -221,6 +410,12 @@ export interface StandardMessage {
 
   /** 追踪 ID（用于关联同一任务的多条消息） */
   traceId: string;
+
+  /**
+   * 🔧 消息大类（必填）
+   * 用于前端路由：CONTENT → 渲染，CONTROL → 状态机，NOTIFY → Toast，DATA → 同步
+   */
+  category: MessageCategory;
 
   /** 消息类型 */
   type: MessageType;
@@ -248,6 +443,26 @@ export interface StandardMessage {
 
   /** 更新时间（流式消息会持续更新） */
   updatedAt: number;
+
+  // ========== 分类专属字段 ==========
+
+  /**
+   * 🔧 CONTROL 类别专属
+   * 当 category === CONTROL 时必填
+   */
+  control?: ControlPayload;
+
+  /**
+   * 🔧 NOTIFY 类别专属
+   * 当 category === NOTIFY 时必填
+   */
+  notify?: NotifyPayload;
+
+  /**
+   * 🔧 DATA 类别专属
+   * 当 category === DATA 时必填
+   */
+  data?: DataPayload;
 }
 
 /**
@@ -276,6 +491,8 @@ export interface MessageMetadata {
   duration?: number;
   /** 错误信息 */
   error?: string;
+  /** 是否可恢复（用于错误/降级判断） */
+  recoverable?: boolean;
   /** Worker 询问唯一 ID */
   questionId?: string;
   /** Worker 询问匹配模式 */
@@ -369,6 +586,7 @@ export function createTextMessage(
   options?: Partial<StandardMessage>
 ): StandardMessage {
   return createStandardMessage({
+    category: MessageCategory.CONTENT,
     type: MessageType.TEXT,
     source,
     agent,
@@ -390,6 +608,7 @@ export function createStreamingMessage(
   options?: Partial<StandardMessage>
 ): StandardMessage {
   return createStandardMessage({
+    category: MessageCategory.CONTENT,
     type: MessageType.TEXT,
     source,
     agent,
@@ -412,6 +631,7 @@ export function createErrorMessage(
   options?: Partial<StandardMessage>
 ): StandardMessage {
   return createStandardMessage({
+    category: MessageCategory.CONTENT,
     type: MessageType.ERROR,
     source,
     agent,
@@ -434,6 +654,7 @@ export function createInteractionMessage(
   options?: Partial<StandardMessage>
 ): StandardMessage {
   return createStandardMessage({
+    category: MessageCategory.CONTENT,
     type: MessageType.INTERACTION,
     source,
     agent,
@@ -442,6 +663,80 @@ export function createInteractionMessage(
     blocks: [{ type: 'text', content: interaction.prompt }],
     interaction,
     metadata: {},
+    ...options,
+  });
+}
+
+// ============================================================================
+// 统一消息通道工厂函数（unified-message-channel-design.md v2.5）
+// ============================================================================
+
+/**
+ * 创建控制消息
+ */
+export function createControlMessage(
+  controlType: ControlMessageType,
+  payload: Record<string, unknown>,
+  traceId: string,
+  options?: Partial<StandardMessage>
+): StandardMessage {
+  return createStandardMessage({
+    category: MessageCategory.CONTROL,
+    type: MessageType.SYSTEM,
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    traceId,
+    lifecycle: MessageLifecycle.COMPLETED,
+    blocks: [],
+    metadata: {},
+    control: { controlType, payload },
+    ...options,
+  });
+}
+
+/**
+ * 创建通知消息（Toast）
+ */
+export function createNotifyMessage(
+  content: string,
+  level: NotifyLevel,
+  traceId: string,
+  duration?: number,
+  options?: Partial<StandardMessage>
+): StandardMessage {
+  return createStandardMessage({
+    category: MessageCategory.NOTIFY,
+    type: MessageType.SYSTEM,
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    traceId,
+    lifecycle: MessageLifecycle.COMPLETED,
+    blocks: [{ type: 'text', content }],
+    metadata: {},
+    notify: { level, duration },
+    ...options,
+  });
+}
+
+/**
+ * 创建数据消息
+ */
+export function createDataMessage(
+  dataType: DataMessageType,
+  payload: Record<string, unknown>,
+  traceId: string,
+  options?: Partial<StandardMessage>
+): StandardMessage {
+  return createStandardMessage({
+    category: MessageCategory.DATA,
+    type: MessageType.SYSTEM,
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    traceId,
+    lifecycle: MessageLifecycle.COMPLETED,
+    blocks: [],
+    metadata: {},
+    data: { dataType, payload },
     ...options,
   });
 }

@@ -53,7 +53,7 @@ MultiCLI 是一个 VS Code 扩展，核心定位是**编排多个 AI CLI 工具 
 
 ### 1.3 解决方案
 
-1. **双轨制执行**：快速路径 + 完整路径，根据任务复杂度自动分流
+1. **单一路径执行**：ASK 直答；需要 Worker 的请求统一进入 MissionOrchestrator
 2. **简化层级**：6 层 → 3 层，合并冗余中间层
 3. **Worker 汇报机制**：建立编排者与 Worker 的双向通信协议
 4. **统一状态**：Mission 作为唯一状态源
@@ -202,12 +202,12 @@ Phase 9: 生成总结 (summarizeMission)
 │  │                      (意图识别模块)                         │  │
 │  └────────────────────────────────────────────────────────────┘  │
 │                                │                                  │
-│                ┌───────────────┴───────────────┐                 │
-│                ↓                               ↓                 │
-│  ┌───────────────────────┐       ┌───────────────────────────┐  │
-│  │     QuickExecutor     │       │    MissionOrchestrator    │  │
-│  │    (快速执行路径)      │       │    (完整编排路径)         │  │
-│  └───────────────────────┘       └───────────────────────────┘  │
+│                └───────────────────────────────┐                 │
+│                                                ↓                 │
+│  ┌───────────────────────────────────────────┐                  │
+│  │          MissionOrchestrator              │                  │
+│  │  (需要 Worker 的完整编排路径)             │                  │
+│  └───────────────────────────────────────────┘                  │
 └───────────────────────────────┬──────────────────────────────────┘
                                 ↓
 ┌──────────────────────────────────────────────────────────────────┐
@@ -223,7 +223,7 @@ Phase 9: 生成总结 (summarizeMission)
 | 入口层级 | 6 层 | 3 层 | 删除中间层 |
 | IntelligentOrchestrator | 独立层 | 合并到 MissionDrivenEngine | **删除文件** |
 | MissionExecutor | 独立层 | 合并到 MissionOrchestrator | **删除文件** |
-| 简单任务 | 走完整流程 | QuickExecutor 快速路径 | 新增 |
+| 简单任务 | 走完整流程 | ASK 直答；DIRECT/EXPLORE 需要 Worker 则进入 Mission | 调整 |
 | Worker 执行 | 黑盒 | 带汇报机制 | 重构 |
 | 消息发送 | 分散多处 | 统一由 MessageHub 发送 | 删除旧调用 |
 | 兼容层/开关 | 临时保留 | 禁止存在 | 直接移除 |
@@ -482,27 +482,84 @@ TaskView (派生，用于 UI)
   └── subTasks = Mission.assignments.map(...)
 ```
 
-### 7.4 MessageHub 设计
+### 7.4 MessageHub 设计（统一消息出口）
+
+> **重要变更**：MessageHub 已合并 UnifiedMessageBus 的能力，成为唯一的消息出口。
+> 详细设计见 `docs/unified-message-channel-design.md`。
 
 ```typescript
-// 统一消息出口
+/**
+ * MessageHub - 统一消息出口
+ *
+ * 设计原则：
+ * - 所有 UI 消息统一走 MessageHub（无直接 postMessage）
+ * - 内置去重、节流、生命周期管理（原 UnifiedMessageBus 能力）
+ * - ProcessingState 权威来源
+ */
 class MessageHub extends EventEmitter {
-  // 进度消息
-  progress(phase: string, content: string): void;
+  // ========== 语义 API ==========
 
-  // 结果消息
-  result(content: string, metadata?: any): void;
+  // 进度消息（主对话区）
+  progress(phase: string, content: string, options?: ProgressOptions): void;
+
+  // 结果消息（主对话区）
+  result(content: string, options?: ResultOptions): void;
 
   // Worker 输出（路由到对应 Tab）
-  workerOutput(worker: WorkerSlot, content: string): void;
+  workerOutput(worker: WorkerSlot, content: string, options?: WorkerOutputOptions): void;
 
-  // 子任务卡片（显示在主对话区）
+  // 子任务卡片（主对话区）
   subTaskCard(subTask: SubTaskView): void;
 
   // 错误消息
-  error(error: string, details?: any): void;
+  error(error: string, options?: ErrorOptions): void;
+
+  // 系统通知
+  systemNotice(content: string, metadata?: MessageMetadata): void;
+
+  // ========== 控制 API ==========
+
+  // 发送控制消息（阶段变化、任务状态等）
+  sendControl(controlType: ControlMessageType, payload: Record<string, unknown>): void;
+
+  // 阶段变化快捷方法
+  phaseChange(phase: string, isRunning: boolean, taskId?: string): void;
+
+  // 任务确认/拒绝
+  taskAccepted(requestId: string): void;
+  taskRejected(requestId: string, message: string): void;
+
+  // ========== 流式消息 API ==========
+
+  // 发送标准消息（内置去重/节流）
+  sendMessage(message: StandardMessage): boolean;
+  sendUpdate(update: StreamUpdate): boolean;
+
+  // ========== 状态查询 ==========
+
+  getProcessingState(): ProcessingState;
+  forceProcessingState(isProcessing: boolean): void;
 }
 ```
+
+#### 7.4.1 消息分类
+
+| 分类 | 说明 | 示例 |
+|------|------|------|
+| CONTENT | 内容消息（LLM 响应、结果） | progress, result, workerOutput |
+| CONTROL | 控制消息（阶段、任务状态） | phaseChange, taskAccepted |
+| NOTIFY | 通知消息（Toast） | toast, workerError |
+| DATA | 数据消息（状态同步） | stateUpdate, sessionsUpdated |
+
+#### 7.4.2 架构变化
+
+| 变化项 | 原设计 | 新设计 |
+|--------|--------|--------|
+| 消息出口 | MessageHub + UnifiedMessageBus 两层 | MessageHub 单一出口 |
+| 去重/节流 | UnifiedMessageBus 负责 | MessageHub 内置 |
+| 控制消息 | 直接 postMessage | MessageHub.sendControl() |
+| 状态管理 | 分散管理 | MessageHub 为权威源 |
+| UnifiedMessageBus | 独立模块 | **删除** |
 
 ---
 

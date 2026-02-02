@@ -11,6 +11,7 @@ import type {
   Session,
   TabType,
   ProcessingActor,
+  ContentBlock,
   ScrollPositions,
   AutoScrollConfig,
   AppState,
@@ -19,7 +20,7 @@ import type {
   WorkerSessionState,
 } from '../types/message';
 import { vscode } from '../lib/vscode-bridge';
-import { ensureArray } from '../lib/utils';
+import { ensureArray, generateId } from '../lib/utils';
 
 // ============ 状态定义 ============
 
@@ -43,6 +44,7 @@ let currentSessionId = $state<string | null>(null);
 let isProcessing = $state(false);
 let backendProcessing = $state(false);
 let activeMessageIds = $state<Set<string>>(new Set());
+let pendingRequests = $state<Set<string>>(new Set());
 let thinkingStartAt = $state<number | null>(null);
 let processingActor = $state<ProcessingActor>({
   source: 'orchestrator',
@@ -79,18 +81,6 @@ function isValidPersistedArray(value: unknown, max: number): value is unknown[] 
   return true;
 }
 
-function resetPersistedState() {
-  currentTopTab = 'thread';
-  currentBottomTab = 'thread';
-  threadMessages = [];
-  agentOutputs = { claude: [], codex: [], gemini: [] };
-  sessions = [];
-  currentSessionId = null;
-  scrollPositions = { thread: 0, claude: 0, codex: 0, gemini: 0 };
-  autoScrollEnabled = { thread: true, claude: true, codex: true, gemini: true };
-  vscode.setState(null);
-}
-
 function isValidMessageSource(message: Message | null | undefined): boolean {
   if (!message || typeof message !== 'object') return false;
   const source = (message as Message).source;
@@ -103,7 +93,7 @@ function hasInvalidMessageSource(messages: Message[]): boolean {
 
 // 新增状态：任务、变更、阶段、Toast、模型状态
 let tasks = $state<Array<{ id: string; name: string; description?: string; status: string }>>([]);
-let edits = $state<Array<{ path: string; type?: string; additions?: number; deletions?: number }>>([]);
+let edits = $state<Array<{ filePath: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string }>>([]);
 let currentPhase = $state(0);
 let toasts = $state<Array<{ id: string; type: string; title?: string; message: string }>>([]);
 let modelStatus = $state<Record<string, string>>({
@@ -119,6 +109,83 @@ let workerExecutionStatus = $state<Record<string, 'idle' | 'executing' | 'comple
   codex: 'idle',
   gemini: 'idle',
 });
+
+function sanitizeMessageBlocks(blocks: unknown): ContentBlock[] {
+  const list = ensureArray(blocks);
+  const invalid = list.filter(
+    (block) => !block || typeof block !== 'object' || !('type' in (block as Record<string, unknown>))
+  );
+  if (invalid.length > 0) {
+    throw new Error('[MessagesStore] 消息块无效');
+  }
+  return list as ContentBlock[];
+}
+
+function normalizePersistedMessages(messages: Message[] | undefined): Message[] {
+  const seen = new Set<string>();
+  const normalized: Message[] = [];
+  for (const msg of ensureArray<Message>(messages)) {
+    if (!msg || typeof msg !== 'object') {
+      throw new Error('[MessagesStore] 持久化消息包含无效对象');
+    }
+    const id = typeof msg.id === 'string' && msg.id.trim().length > 0 ? msg.id.trim() : '';
+    if (!id) {
+      throw new Error('[MessagesStore] 持久化消息缺少 id');
+    }
+    if (seen.has(id)) {
+      throw new Error(`[MessagesStore] 持久化消息 id 重复: ${id}`);
+    }
+    seen.add(id);
+    const blocks = sanitizeMessageBlocks(msg.blocks);
+    normalized.push({ ...msg, id, blocks: blocks.length > 0 ? blocks : undefined });
+  }
+  return normalized;
+}
+
+function normalizeIncomingMessage(message: Message): Message {
+  if (!message || typeof message !== 'object') {
+    throw new Error('[MessagesStore] 输入消息无效');
+  }
+  const id = typeof message.id === 'string' && message.id.trim().length > 0 ? message.id.trim() : '';
+  if (!id) {
+    throw new Error('[MessagesStore] 输入消息缺少 id');
+  }
+  const blocks = sanitizeMessageBlocks(message.blocks);
+  return { ...message, id, blocks: blocks.length > 0 ? blocks : undefined };
+}
+
+function normalizeMissionPlan(plan: MissionPlan | null): MissionPlan | null {
+  if (!plan || typeof plan !== 'object') return null;
+  const assignmentSeen = new Set<string>();
+  const assignments = ensureArray(plan.assignments)
+    .filter((assignment: any) => assignment && typeof assignment === 'object')
+    .map((assignment: any) => {
+      const assignmentId = typeof assignment.id === 'string' && assignment.id.trim() ? assignment.id.trim() : '';
+      if (!assignmentId) {
+        throw new Error('[MessagesStore] MissionPlan assignment 缺少 id');
+      }
+      if (assignmentSeen.has(assignmentId)) {
+        throw new Error(`[MessagesStore] MissionPlan assignment id 重复: ${assignmentId}`);
+      }
+      assignmentSeen.add(assignmentId);
+      const todoSeen = new Set<string>();
+      const todos = ensureArray(assignment.todos)
+        .filter((todo: any) => todo && typeof todo === 'object')
+        .map((todo: any) => {
+          const todoId = typeof todo.id === 'string' && todo.id.trim() ? todo.id.trim() : '';
+          if (!todoId) {
+            throw new Error('[MessagesStore] MissionPlan todo 缺少 id');
+          }
+          if (todoSeen.has(todoId)) {
+            throw new Error(`[MessagesStore] MissionPlan todo id 重复: ${todoId}`);
+          }
+          todoSeen.add(todoId);
+          return { ...todo, id: todoId, assignmentId };
+        });
+      return { ...assignment, id: assignmentId, todos };
+    });
+  return { ...plan, missionId: plan.missionId || '', assignments };
+}
 
 // 交互请求状态
 let pendingConfirmation = $state<{ plan: unknown; formattedPlan?: string } | null>(null);
@@ -238,7 +305,14 @@ export function setCurrentSessionId(id: string | null) {
 }
 
 export function updateSessions(newSessions: Session[]) {
-  sessions = ensureArray(newSessions) as Session[];
+  const seen = new Set<string>();
+  sessions = ensureArray<Session>(newSessions)
+    .filter((session): session is Session => !!session && typeof session === 'object' && typeof session.id === 'string' && session.id.trim().length > 0)
+    .filter((session) => {
+      if (seen.has(session.id)) return false;
+      seen.add(session.id);
+      return true;
+    });
   saveWebviewState();
 }
 
@@ -264,7 +338,7 @@ export function setAppState(nextState: AppState | null) {
 }
 
 export function setMissionPlan(plan: MissionPlan | null) {
-  missionPlan = plan;
+  missionPlan = normalizeMissionPlan(plan);
 }
 
 // Worker 执行状态操作
@@ -283,7 +357,7 @@ export function setWorkerExecutionStatus(
 }
 
 function updateProcessingState() {
-  isProcessing = backendProcessing || activeMessageIds.size > 0;
+  isProcessing = backendProcessing || activeMessageIds.size > 0 || pendingRequests.size > 0;
 }
 
 export function markMessageActive(id: string) {
@@ -306,9 +380,30 @@ export function markMessageComplete(id: string) {
   }
 }
 
+export function addPendingRequest(id: string) {
+  if (!id) return;
+  if (!pendingRequests.has(id)) {
+    const next = new Set(pendingRequests);
+    next.add(id);
+    pendingRequests = next;
+    updateProcessingState();
+  }
+}
+
+export function clearPendingRequest(id: string) {
+  if (!id) return;
+  if (pendingRequests.has(id)) {
+    const next = new Set(pendingRequests);
+    next.delete(id);
+    pendingRequests = next;
+    updateProcessingState();
+  }
+}
+
 export function clearProcessingState() {
   backendProcessing = false;
   activeMessageIds = new Set();
+  pendingRequests = new Set();
   updateProcessingState();
 }
 
@@ -343,7 +438,10 @@ export function getActiveInteractionType(): string | null {
 // 消息操作
 export function addThreadMessage(message: Message) {
   // 完全重建数组以确保响应式更新
-  const safeMessage = JSON.parse(JSON.stringify(message)) as Message;
+  const safeMessage = JSON.parse(JSON.stringify(normalizeIncomingMessage(message))) as Message;
+  if (threadMessages.some((m) => m.id === safeMessage.id)) {
+    throw new Error(`[MessagesStore] 重复的 thread message id: ${safeMessage.id}`);
+  }
   threadMessages = [...threadMessages, safeMessage];
   saveWebviewState();
 }
@@ -353,7 +451,12 @@ export function updateThreadMessage(messageId: string, updates: Partial<Message>
   if (index !== -1) {
     // 必须完全重建数组，不能直接修改索引
     // 使用 JSON 序列化确保脱离响应式代理
-    const safeUpdates = JSON.parse(JSON.stringify(updates)) as Partial<Message>;
+    const normalizedUpdates: Partial<Message> = { ...updates };
+    if ('blocks' in normalizedUpdates) {
+      const blocks = sanitizeMessageBlocks(normalizedUpdates.blocks);
+      normalizedUpdates.blocks = blocks.length > 0 ? blocks : undefined;
+    }
+    const safeUpdates = JSON.parse(JSON.stringify(normalizedUpdates)) as Partial<Message>;
     const newMessages = threadMessages.map((msg, i) => {
       if (i === index) {
         return { ...msg, ...safeUpdates };
@@ -377,11 +480,29 @@ export function clearThreadMessages() {
 }
 
 export function addAgentMessage(agent: AgentType, message: Message) {
-  const safeMessage = JSON.parse(JSON.stringify(message)) as Message;
+  const safeMessage = JSON.parse(JSON.stringify(normalizeIncomingMessage(message))) as Message;
+  if (agentOutputs[agent].some((m) => m.id === safeMessage.id)) {
+    throw new Error(`[MessagesStore] 重复的 agent message id: ${safeMessage.id}`);
+  }
+
+  // 🔧 调试日志：追踪 Worker 消息添加
+  console.log('[DEBUG] addAgentMessage:', {
+    agent,
+    messageId: safeMessage.id,
+    contentPreview: safeMessage.content?.substring(0, 100),
+    currentCount: agentOutputs[agent]?.length || 0,
+  });
+
   agentOutputs = {
     ...agentOutputs,
     [agent]: [...agentOutputs[agent], safeMessage],
   };
+
+  console.log('[DEBUG] addAgentMessage 完成:', {
+    agent,
+    newCount: agentOutputs[agent]?.length || 0,
+  });
+
   saveWebviewState();
 }
 
@@ -389,7 +510,12 @@ export function updateAgentMessage(agent: AgentType, messageId: string, updates:
   const list = agentOutputs[agent];
   const index = list.findIndex((m) => m.id === messageId);
   if (index !== -1) {
-    const safeUpdates = JSON.parse(JSON.stringify(updates)) as Partial<Message>;
+    const normalizedUpdates: Partial<Message> = { ...updates };
+    if ('blocks' in normalizedUpdates) {
+      const blocks = sanitizeMessageBlocks(normalizedUpdates.blocks);
+      normalizedUpdates.blocks = blocks.length > 0 ? blocks : undefined;
+    }
+    const safeUpdates = JSON.parse(JSON.stringify(normalizedUpdates)) as Partial<Message>;
     const next = list.map((msg, i) => (i === index ? { ...msg, ...safeUpdates } : msg));
     agentOutputs = { ...agentOutputs, [agent]: next };
     // 不触发保存，由流式管理器批量保存
@@ -434,16 +560,16 @@ export function clearAllMessages() {
 
 // 设置完整的消息列表（用于会话切换时加载历史）
 export function setThreadMessages(messages: Message[]) {
-  threadMessages = messages.map(m => JSON.parse(JSON.stringify(m)) as Message);
+  threadMessages = normalizePersistedMessages(messages).map(m => JSON.parse(JSON.stringify(m)) as Message);
   saveWebviewState();
 }
 
 // 设置完整的 agent 消息列表（用于会话切换时加载历史）
 export function setAgentOutputs(outputs: AgentOutputs) {
   agentOutputs = {
-    claude: (outputs.claude || []).map(m => JSON.parse(JSON.stringify(m)) as Message),
-    codex: (outputs.codex || []).map(m => JSON.parse(JSON.stringify(m)) as Message),
-    gemini: (outputs.gemini || []).map(m => JSON.parse(JSON.stringify(m)) as Message),
+    claude: normalizePersistedMessages(outputs.claude).map(m => JSON.parse(JSON.stringify(m)) as Message),
+    codex: normalizePersistedMessages(outputs.codex).map(m => JSON.parse(JSON.stringify(m)) as Message),
+    gemini: normalizePersistedMessages(outputs.gemini).map(m => JSON.parse(JSON.stringify(m)) as Message),
   };
   saveWebviewState();
 }
@@ -458,17 +584,16 @@ export function initializeState() {
     const validGemini = isValidPersistedArray(persisted.agentOutputs?.gemini, MAX_PERSISTED_ARRAY_LENGTH);
     const validSessions = isValidPersistedArray(persisted.sessions, MAX_PERSISTED_ARRAY_LENGTH);
     if (!validThread || !validClaude || !validCodex || !validGemini || !validSessions) {
-      resetPersistedState();
-      return;
+      throw new Error('[MessagesStore] 持久化数据结构无效');
     }
     // Tab 状态不持久化，每次打开都默认显示主对话 tab
     currentTopTab = 'thread';
     currentBottomTab = 'thread';
-    threadMessages = ensureArray<Message>(persisted.threadMessages);
+    threadMessages = normalizePersistedMessages(persisted.threadMessages);
     agentOutputs = {
-      claude: ensureArray<Message>(persisted.agentOutputs?.claude),
-      codex: ensureArray<Message>(persisted.agentOutputs?.codex),
-      gemini: ensureArray<Message>(persisted.agentOutputs?.gemini),
+      claude: normalizePersistedMessages(persisted.agentOutputs?.claude),
+      codex: normalizePersistedMessages(persisted.agentOutputs?.codex),
+      gemini: normalizePersistedMessages(persisted.agentOutputs?.gemini),
     };
     if (
       hasInvalidMessageSource(threadMessages) ||
@@ -476,10 +601,16 @@ export function initializeState() {
       hasInvalidMessageSource(agentOutputs.codex) ||
       hasInvalidMessageSource(agentOutputs.gemini)
     ) {
-      resetPersistedState();
-      return;
+      throw new Error('[MessagesStore] 持久化消息来源无效');
     }
-    sessions = ensureArray<Session>(persisted.sessions);
+    const sessionSeen = new Set<string>();
+    sessions = ensureArray<Session>(persisted.sessions)
+      .filter((session) => !!session && typeof session.id === 'string' && session.id.trim().length > 0)
+      .filter((session) => {
+        if (sessionSeen.has(session.id)) return false;
+        sessionSeen.add(session.id);
+        return true;
+      });
     currentSessionId = persisted.currentSessionId || null;
     scrollPositions = persisted.scrollPositions || { thread: 0, claude: 0, codex: 0, gemini: 0 };
     autoScrollEnabled = persisted.autoScrollEnabled || { thread: true, claude: true, codex: true, gemini: true };

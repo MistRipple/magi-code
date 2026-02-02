@@ -37,6 +37,36 @@ export class MCPManager {
   private clients: Map<string, Client> = new Map();
   private tools: Map<string, MCPToolInfo[]> = new Map();
 
+  private static readonly DEFAULT_CONNECT_TIMEOUT_MS = Number(
+    process.env.MCP_CONNECT_TIMEOUT_MS || 15000,
+  );
+  private static readonly DEFAULT_LIST_TOOLS_TIMEOUT_MS = Number(
+    process.env.MCP_LIST_TOOLS_TIMEOUT_MS || 15000,
+  );
+  private static readonly DEFAULT_CALL_TOOL_TIMEOUT_MS = Number(
+    process.env.MCP_CALL_TOOL_TIMEOUT_MS || 60000,
+  );
+
+  private async withTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    context: string,
+  ): Promise<T> {
+    let timer: NodeJS.Timeout | null = null;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(context)), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
   /**
    * 连接到 MCP 服务器
    */
@@ -53,10 +83,19 @@ export class MCPManager {
       }
 
       // 创建 stdio 传输
+      // 过滤掉 undefined 值，确保类型兼容
+      const envVars: Record<string, string> = {};
+      for (const [key, value] of Object.entries(process.env)) {
+        if (value !== undefined) {
+          envVars[key] = value;
+        }
+      }
+      Object.assign(envVars, config.env || {});
+
       const transport = new StdioClientTransport({
         command: config.command,
         args: config.args || [],
-        env: config.env || {},
+        env: envVars,
       });
 
       // 创建客户端
@@ -68,10 +107,18 @@ export class MCPManager {
       });
 
       // 连接
-      await client.connect(transport);
+      await this.withTimeout(
+        client.connect(transport),
+        MCPManager.DEFAULT_CONNECT_TIMEOUT_MS,
+        `MCP connect timed out after ${MCPManager.DEFAULT_CONNECT_TIMEOUT_MS}ms`,
+      );
 
       // 获取工具列表
-      const toolsResponse = await client.listTools();
+      const toolsResponse = await this.withTimeout(
+        client.listTools(),
+        MCPManager.DEFAULT_LIST_TOOLS_TIMEOUT_MS,
+        `MCP listTools timed out after ${MCPManager.DEFAULT_LIST_TOOLS_TIMEOUT_MS}ms`,
+      );
       const tools: MCPToolInfo[] = (toolsResponse.tools || []).map((tool: any) => ({
         name: tool.name,
         description: tool.description || '',
@@ -185,7 +232,11 @@ export class MCPManager {
     try {
       logger.info('Refreshing MCP server tools', { id: serverId }, LogCategory.TOOLS);
 
-      const toolsResponse = await client.listTools();
+      const toolsResponse = await this.withTimeout(
+        client.listTools(),
+        MCPManager.DEFAULT_LIST_TOOLS_TIMEOUT_MS,
+        `MCP listTools timed out after ${MCPManager.DEFAULT_LIST_TOOLS_TIMEOUT_MS}ms`,
+      );
       const tools: MCPToolInfo[] = (toolsResponse.tools || []).map((tool: any) => ({
         name: tool.name,
         description: tool.description || '',
@@ -227,10 +278,14 @@ export class MCPManager {
         args,
       }, LogCategory.TOOLS);
 
-      const result = await client.callTool({
-        name: toolName,
-        arguments: args,
-      });
+      const result = await this.withTimeout(
+        client.callTool({
+          name: toolName,
+          arguments: args,
+        }),
+        MCPManager.DEFAULT_CALL_TOOL_TIMEOUT_MS,
+        `MCP callTool timed out after ${MCPManager.DEFAULT_CALL_TOOL_TIMEOUT_MS}ms`,
+      );
 
       logger.info('MCP tool call completed', {
         serverId,

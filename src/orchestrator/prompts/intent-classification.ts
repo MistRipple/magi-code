@@ -52,7 +52,7 @@ export const INTENT_CLASSIFICATION_PROMPT = `
    - 代码分析："分析一下 src/index.ts 这段代码"
    - 文件操作："在项目中创建一个新组件"
 
-4. **优先快速路径**：如果能用 ask 处理，就不要升级到 direct/explore/task
+4. **优先编排者直答**：如果能用 ask 处理，就不要升级到 direct/explore/task
 
 ## 输出格式
 

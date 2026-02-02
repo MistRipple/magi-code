@@ -1,7 +1,10 @@
 <script lang="ts">
   import { vscode } from '../lib/vscode-bridge';
+  import type { StandardMessage } from '../../../../protocol/message-protocol';
+  import { MessageCategory } from '../../../../protocol/message-protocol';
   import Icon from './Icon.svelte';
   import { ensureArray, generateId } from '../lib/utils';
+  import { addPendingRequest } from '../stores/messages.svelte';
   import { addThreadMessage } from '../stores/messages.svelte';
 
   interface InstructionSkill {
@@ -76,12 +79,14 @@
       isComplete: true,
     });
 
+    const requestId = generateId();
+    addPendingRequest(requestId);
     vscode.postMessage({
       type: 'applyInstructionSkill',
       skillName: selectedSkill.name,
       args: argsInput.trim(),
       agent: selectedAgent || null,
-      requestId: generateId(),
+      requestId,
     });
 
     closePopup();
@@ -94,14 +99,15 @@
   });
 
   $effect(() => {
-    const handler = (event: MessageEvent) => {
-      const msg = event.data;
-      if (msg.type === 'skillsConfigLoaded') {
-        skillsConfig = msg.config || null;
-      }
-    };
-    window.addEventListener('message', handler);
-    return () => window.removeEventListener('message', handler);
+    const unsubscribe = vscode.onMessage((msg) => {
+      if (msg.type !== 'unifiedMessage') return;
+      const standard = msg.message as StandardMessage;
+      if (!standard || standard.category !== MessageCategory.DATA || !standard.data) return;
+      if (standard.data.dataType !== 'skillsConfigLoaded') return;
+      const payload = standard.data.payload as { config?: any };
+      skillsConfig = payload?.config || null;
+    });
+    return () => unsubscribe();
   });
 </script>
 

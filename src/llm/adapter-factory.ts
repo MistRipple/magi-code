@@ -2,9 +2,11 @@
  * LLM 适配器工厂
  * 创建和管理 LLM 适配器实例
  *
+ * 🔧 统一消息通道（unified-message-channel-design.md v2.5）
+ *
  * 消息流职责：
- * - 创建 Adapter 并注入 MessageBus
- * - Adapter 直接通过 MessageBus 发送消息
+ * - 创建 Adapter 并注入 MessageHub
+ * - Adapter 直接通过 MessageHub 发送消息
  * - 只转发错误事件
  */
 
@@ -19,7 +21,7 @@ import { createNormalizer } from '../normalizer';
 import { ToolManager } from '../tools/tool-manager';
 import { SkillsManager, InstructionSkillDefinition } from '../tools/skills-manager';
 import { MCPToolExecutor } from '../tools/mcp-executor';
-import { UnifiedMessageBus } from '../normalizer/unified-message-bus';
+import { MessageHub } from '../orchestrator/core/message-hub';
 import { logger, LogCategory } from '../logging';
 import { IAdapterFactory, AdapterOutputScope, AdapterResponse } from '../adapters/adapter-factory-interface';
 import { AgentProfileLoader } from '../orchestrator/profile/agent-profile-loader';
@@ -38,10 +40,11 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   private connectionPromises = new Map<AgentType, Promise<void>>();
 
   /**
-   * 消息总线 - 注入给 Adapter，用于直接发送消息
-   * 必须在创建 Adapter 之前通过 setMessageBus() 设置
+   * 消息出口 - 注入给 Adapter，用于直接发送消息
+   * 🔧 统一消息通道：替代 UnifiedMessageBus
+   * 必须在创建 Adapter 之前通过 setMessageHub() 设置
    */
-  private messageBus: UnifiedMessageBus | null = null;
+  private messageHub: MessageHub | null = null;
 
   constructor(options: { cwd: string }) {
     super();
@@ -52,23 +55,24 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   }
 
   /**
-   * 设置 MessageBus（由 WebviewProvider 在初始化时调用）
+   * 设置 MessageHub（由 WebviewProvider 在初始化时调用）
+   * 🔧 统一消息通道：替代 setMessageBus
    * 必须在创建任何 Adapter 之前调用
    */
-  setMessageBus(messageBus: UnifiedMessageBus): void {
-    this.messageBus = messageBus;
-    logger.info('MessageBus 已注入到 AdapterFactory', undefined, LogCategory.LLM);
+  setMessageHub(messageHub: MessageHub): void {
+    this.messageHub = messageHub;
+    logger.info('MessageHub 已注入到 AdapterFactory', undefined, LogCategory.LLM);
   }
 
   /**
-   * 获取 MessageBus（内部使用）
-   * @throws 如果 MessageBus 未设置
+   * 获取 MessageHub（内部使用）
+   * @throws 如果 MessageHub 未设置
    */
-  private getMessageBus(): UnifiedMessageBus {
-    if (!this.messageBus) {
-      throw new Error('MessageBus 未设置，请先调用 setMessageBus()');
+  private getMessageHub(): MessageHub {
+    if (!this.messageHub) {
+      throw new Error('MessageHub 未设置，请先调用 setMessageHub()');
     }
-    return this.messageBus;
+    return this.messageHub;
   }
 
   /**
@@ -102,7 +106,8 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       });
 
       // 注意：内置工具已由 ToolManager 直接管理，不需要注册 SkillsManager
-      // SkillsManager 现在仅用于指令型 Skills 提示注入
+      // SkillsManager 现在用于指令型 Skills 提示注入 + 自定义工具执行
+      this.toolManager.registerSkillExecutor(this.skillsManager);
 
       logger.info('Skills loaded', {
         customTools: this.skillsManager.getCustomTools().length,
@@ -206,13 +211,13 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     // 创建 normalizer
     const normalizer = createNormalizer(workerSlot, 'worker', false);
 
-    // 创建适配器（注入 MessageBus）
+    // 创建适配器（注入 MessageHub）
     const adapterConfig: WorkerAdapterConfig = {
       client,
       normalizer,
       toolManager: this.toolManager,
       config: workerConfig,
-      messageBus: this.getMessageBus(),
+      messageHub: this.getMessageHub(),  // 🔧 统一消息通道：使用 messageHub
       workerSlot,
       profileLoader: this.profileLoader,
     };
@@ -227,7 +232,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     systemPrompt = this.injectUserRules(systemPrompt);
     adapter.setSystemPrompt(systemPrompt);
 
-    // 只设置错误事件处理（消息由 Adapter 直接发送到 MessageBus）
+    // 只设置错误事件处理（消息由 Adapter 直接发送到 MessageHub）
     this.setupAdapterEvents(adapter, workerSlot);
 
     this.adapters.set(workerSlot, adapter);
@@ -366,19 +371,19 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     // 创建 normalizer
     const normalizer = createNormalizer('claude', 'orchestrator', false, 'orchestrator');
 
-    // 创建适配器（注入 MessageBus）
+    // 创建适配器（注入 MessageHub）
     const adapterConfig: OrchestratorAdapterConfig = {
       client,
       normalizer,
       toolManager: this.toolManager,
       config: orchestratorConfig,
-      messageBus: this.getMessageBus(),
+      messageHub: this.getMessageHub(),  // 🔧 统一消息通道：使用 messageHub
     };
 
     const adapter = new OrchestratorLLMAdapter(adapterConfig);
     adapter.setSystemPrompt(this.injectUserRules(adapter.getSystemPrompt()));
 
-    // 只设置错误事件处理（消息由 Adapter 直接发送到 MessageBus）
+    // 只设置错误事件处理（消息由 Adapter 直接发送到 MessageHub）
     this.setupAdapterEvents(adapter, 'orchestrator');
 
     this.adapters.set('orchestrator', adapter);
@@ -394,7 +399,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   /**
    * 设置适配器错误事件处理
    *
-   * 消息事件不再转发：Adapter 直接通过 MessageBus 发送消息
+   * 🔧 统一消息通道：消息事件不再转发，Adapter 直接通过 MessageHub 发送消息
    * 只转发错误事件，供上层统一处理
    */
   private setupAdapterEvents(adapter: BaseLLMAdapter, _agent: AgentType): void {

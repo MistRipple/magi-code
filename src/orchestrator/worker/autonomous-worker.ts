@@ -688,8 +688,13 @@ export class AutonomousWorker extends EventEmitter {
   ): string {
     const sections: string[] = [];
 
-    // 1. 职责上下文
-    sections.push(`## 职责分配\n${assignment.responsibility}`);
+    // 1. 任务委托说明（优先使用 AI 生成的自然语言委托）
+    if (assignment.delegationBriefing) {
+      sections.push(`## 任务委托\n${assignment.delegationBriefing}`);
+    } else {
+      // 兜底：使用结构化的职责描述
+      sections.push(`## 职责分配\n${assignment.responsibility}`);
+    }
 
     // 2. 当前 Todo
     sections.push(`## 当前任务\n${todo.content}`);
@@ -699,6 +704,14 @@ export class AutonomousWorker extends EventEmitter {
     // 3. 职责范围提醒
     if (assignment.scope.excludes.length > 0) {
       sections.push(`## 注意：以下内容不在你的职责范围内\n${assignment.scope.excludes.map(e => `- ${e}`).join('\n')}`);
+    }
+
+    // 3.1 目标文件（若有）
+    if (assignment.scope.targetPaths && assignment.scope.targetPaths.length > 0) {
+      const requirement = assignment.scope.requiresModification
+        ? '要求：必须使用 text_editor 修改上述文件并保存结果，禁止使用 search_context。'
+        : '要求：仅需读取/分析，不要修改文件。';
+      sections.push(`## 目标文件\n${assignment.scope.targetPaths.map(p => `- ${p}`).join('\n')}\n\n${requirement}`);
     }
 
     // 4. 契约信息
@@ -764,7 +777,7 @@ export class AutonomousWorker extends EventEmitter {
       // 解析响应
       const summary = response.content || response.error || '执行完成';
       const modifiedFiles = this.extractModifiedFiles(response.content || '');
-      const dynamicTodos = this.extractDynamicTodos(response.content || '');
+      const dynamicTodos = this.extractDynamicTodos(response.content || '', assignment.id);
 
       // 调用输出回调
       if (options.onOutput && response.content) {
@@ -818,7 +831,7 @@ export class AutonomousWorker extends EventEmitter {
   /**
    * 从输出中提取动态 Todo
    */
-  private extractDynamicTodos(output: string): WorkerTodo[] {
+  private extractDynamicTodos(output: string, assignmentId: string): WorkerTodo[] {
     // 检测输出中是否有需要动态添加的任务
     // 这是一个简化实现，实际可能需要更复杂的解析
     const todos: WorkerTodo[] = [];
@@ -833,7 +846,7 @@ export class AutonomousWorker extends EventEmitter {
         // 创建动态 Todo（需要审批）
         todos.push({
           id: `dynamic-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
-          assignmentId: '',
+          assignmentId,
           content,
           reasoning: '执行过程中发现的额外任务',
           expectedOutput: '完成额外任务',

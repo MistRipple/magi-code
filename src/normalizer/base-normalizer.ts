@@ -15,6 +15,7 @@ import {
   MessageType,
   MessageLifecycle,
   MessageSource,
+  MessageCategory,
   InteractionRequest,
   TextBlock,
   ThinkingBlock,
@@ -205,13 +206,13 @@ export abstract class BaseNormalizer extends EventEmitter {
 
   // 辅助方法
   protected buildFinalMessage(context: ParseContext, error?: string): StandardMessage {
-    const blocks = [...context.blocks];
+    const blocks = this.sanitizeBlocks([...context.blocks], 'buildFinalMessage');
 
     if (context.pendingText.trim()) {
       const parsedBlocks = parseContentToBlocks(context.pendingText.trim());
 
       if (parsedBlocks.length > 0) {
-        blocks.push(...parsedBlocks);
+        blocks.push(...this.sanitizeBlocks(parsedBlocks, 'buildFinalMessage.pendingText'));
       }
     }
 
@@ -235,17 +236,34 @@ export abstract class BaseNormalizer extends EventEmitter {
       messageType = MessageType.TOOL_CALL;
     }
 
+    const safeBlocks = this.sanitizeBlocks(blocks, 'buildFinalMessage.final');
     return createStandardMessage({
       id: context.messageId,
       traceId: context.traceId,
+      category: MessageCategory.CONTENT,  // 🔧 统一消息通道：LLM 输出为 CONTENT 类别
       type: messageType,
       source: this.config.defaultSource,
       agent: this.config.agent,  // ✅ 使用 agent
       lifecycle: error ? MessageLifecycle.FAILED : MessageLifecycle.COMPLETED,
-      blocks,
+      blocks: safeBlocks,
       interaction: context.interaction || undefined,
       metadata: { duration: Date.now() - context.startTime, error },
     });
+  }
+
+  protected sanitizeBlocks(blocks: ContentBlock[], context: string): ContentBlock[] {
+    const invalid = (blocks || []).filter(
+      (block) => !block || typeof block !== 'object' || typeof (block as ContentBlock).type !== 'string'
+    );
+    if (invalid.length > 0) {
+      logger.error('规范化.块_无效', {
+        agent: this.config.agent,
+        context,
+        invalidCount: invalid.length,
+      }, LogCategory.SYSTEM);
+      throw new Error(`Invalid content blocks in ${context}`);
+    }
+    return blocks || [];
   }
 
   protected createUpdate(messageId: string, updateType: StreamUpdate['updateType'], data: Partial<StreamUpdate>): StreamUpdate {

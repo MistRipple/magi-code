@@ -185,28 +185,35 @@ export class ContextCompressor {
     const maxResultLength = 200;   // 任务结果最大长度
 
     // 截断重要上下文中的长文本
-    result.importantContext = result.importantContext.map(ctx => {
-      if (ctx.length > maxContextLength) {
-        return ctx.substring(0, maxContextLength) + '...';
-      }
-      return ctx;
-    });
+    const safeImportant = Array.isArray(result.importantContext) ? result.importantContext : [];
+    result.importantContext = safeImportant
+      .filter((ctx) => typeof ctx === 'string')
+      .map(ctx => ctx.length > maxContextLength ? ctx.substring(0, maxContextLength) + '...' : ctx);
 
     // 截断任务结果
-    result.completedTasks = result.completedTasks.map(task => ({
-      ...task,
-      result: task.result && task.result.length > maxResultLength
-        ? task.result.substring(0, maxResultLength) + '...'
-        : task.result
-    }));
+    const safeCompleted = Array.isArray(result.completedTasks) ? result.completedTasks : [];
+    result.completedTasks = safeCompleted
+      .filter((task) => task && typeof task === 'object')
+      .map(task => ({
+        ...task,
+        result: typeof task.result === 'string' && task.result.length > maxResultLength
+          ? task.result.substring(0, maxResultLength) + '...'
+          : task.result
+      }));
 
     // 截断代码变更摘要
-    result.codeChanges = result.codeChanges.map(change => ({
-      ...change,
-      summary: change.summary.length > maxContextLength
-        ? change.summary.substring(0, maxContextLength) + '...'
-        : change.summary
-    }));
+    const safeChanges = Array.isArray(result.codeChanges) ? result.codeChanges : [];
+    result.codeChanges = safeChanges
+      .filter((change) => change && typeof change === 'object')
+      .map(change => {
+        const summary = typeof change.summary === 'string' ? change.summary : '';
+        return {
+          ...change,
+          summary: summary.length > maxContextLength
+            ? summary.substring(0, maxContextLength) + '...'
+            : summary
+        };
+      });
 
     return result;
   }

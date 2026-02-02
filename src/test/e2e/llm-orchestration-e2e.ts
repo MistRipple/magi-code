@@ -131,7 +131,7 @@ async function executeScenario(
 }
 
 // ============================================================================
-// 13.1 快速路径场景 (QuickExecutor)
+// 13.1 非任务模式场景 (ASK/DIRECT/EXPLORE)
 // ============================================================================
 
 /**
@@ -896,8 +896,8 @@ async function main() {
     console.log(`Workers: ${Array.from(ctx.workerClients.keys()).join(', ') || '无可用 Worker'}`);
     console.log('');
 
-    // 13.1 快速路径场景
-    console.log('【13.1 快速路径场景 (QuickExecutor)】');
+    // 13.1 非任务模式场景
+    console.log('【13.1 非任务模式场景 (ASK/DIRECT/EXPLORE)】');
 
     console.log('  [ASK 模式]');
     const askResults = await testASKMode(ctx);

@@ -26,9 +26,8 @@ export const DEFAULT_GEMINI_PROFILE: WorkerProfile = {
   preferences: {
     preferredCategories: [
       'frontend',
-      'ui',
-      'docs',
-      'analysis',
+      'document',
+      'data_analysis',
     ],
     preferredKeywords: [
       '前端|UI|组件|页面',
@@ -72,4 +71,3 @@ export const DEFAULT_GEMINI_PROFILE: WorkerProfile = {
     ],
   },
 };
-

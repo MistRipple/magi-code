@@ -29,6 +29,8 @@ export interface PlanningContext {
   scope: {
     includes: string[];
     excludes: string[];
+    targetPaths?: string[];
+    requiresModification?: boolean;
   };
   /** 可用契约 */
   availableContracts: string[];
@@ -196,10 +198,15 @@ export class TodoPlanner {
     }
 
     // 3. 实现 Todo（核心）
+    const targetPaths = context.scope.targetPaths && context.scope.targetPaths.length > 0
+      ? context.scope.requiresModification
+        ? `目标文件: ${context.scope.targetPaths.join(', ')}。必须使用工具直接编辑并保存。`
+        : `目标文件: ${context.scope.targetPaths.join(', ')}。只需读取/分析，不要修改文件。`
+      : '';
     todos.push(
       this.createTodo({
         assignmentId: assignment.id,
-        content: `执行职责任务：${assignment.responsibility}`,
+        content: `执行职责任务：${assignment.responsibility}${targetPaths ? `\n${targetPaths}` : ''}`,
         reasoning: '完成职责的主要工作',
         expectedOutput: assignment.responsibility,
         type: 'implementation',

@@ -1,13 +1,15 @@
 /**
  * Worker LLM 适配器
  * 用于 Worker 代理（claude, codex, gemini）
+ *
+ * 🔧 统一消息通道：使用 MessageHub 替代 UnifiedMessageBus
  */
 
 import { AgentType, AgentRole, LLMConfig, WorkerSlot } from '../../types/agent-types';
 import { LLMClient, LLMMessageParams, LLMMessage, ToolCall } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager } from '../../tools/tool-manager';
-import { UnifiedMessageBus } from '../../normalizer/unified-message-bus';
+import { MessageHub } from '../../orchestrator/core/message-hub';
 import { BaseLLMAdapter, AdapterState } from './base-adapter';
 import { logger, LogCategory } from '../../logging';
 import { AgentProfileLoader } from '../../orchestrator/profile/agent-profile-loader';
@@ -33,7 +35,7 @@ export interface WorkerAdapterConfig {
   normalizer: BaseNormalizer;
   toolManager: ToolManager;
   config: LLMConfig;
-  messageBus: UnifiedMessageBus;  // 必选：消息总线
+  messageHub: MessageHub;  // 🔧 统一消息通道：替代 messageBus
   workerSlot: WorkerSlot;
   systemPrompt?: string;
   profileLoader?: AgentProfileLoader;
@@ -58,7 +60,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       adapterConfig.normalizer,
       adapterConfig.toolManager,
       adapterConfig.config,
-      adapterConfig.messageBus
+      adapterConfig.messageHub  // 🔧 统一消息通道：使用 messageHub
     );
     this.workerSlot = adapterConfig.workerSlot;
     this.profileLoader = adapterConfig.profileLoader;
@@ -95,7 +97,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   private async sendMessageInternal(
     message: string | undefined,
     images: string[] | undefined,
-    skipUserMessage: boolean
+    skipUserMessage: boolean,
+    recursionDepth: number = 0
   ): Promise<string> {
     if (!this.isConnected) {
       throw new Error('Adapter not connected');
@@ -112,12 +115,54 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       // 清理可能破坏工具调用链路的历史片段
       this.normalizeHistoryForTools();
 
-      // 添加用户消息到历史
+      // 添加用户消息到历史（支持图片）
       if (!skipUserMessage) {
-        this.conversationHistory.push({
-          role: 'user',
-          content: message || '',
-        });
+        // 🔧 如果有图片，构建多模态内容块
+        if (images && images.length > 0) {
+          const contentBlocks: any[] = [];
+
+          // 添加图片内容块
+          for (const imagePath of images) {
+            try {
+              const fs = require('fs');
+              const path = require('path');
+              const imageBuffer = fs.readFileSync(imagePath);
+              const base64Data = imageBuffer.toString('base64');
+              const ext = path.extname(imagePath).toLowerCase().slice(1);
+              const mediaType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+
+              contentBlocks.push({
+                type: 'image',
+                source: {
+                  type: 'base64',
+                  media_type: mediaType,
+                  data: base64Data,
+                },
+              });
+            } catch (err) {
+              logger.warn('Worker适配器.图片读取失败', { path: imagePath, error: String(err) }, LogCategory.LLM);
+            }
+          }
+
+          // 添加文本内容块
+          if (message) {
+            contentBlocks.push({
+              type: 'text',
+              text: message,
+            });
+          }
+
+          this.conversationHistory.push({
+            role: 'user',
+            content: contentBlocks,
+          });
+        } else {
+          // 纯文本消息
+          this.conversationHistory.push({
+            role: 'user',
+            content: message || '',
+          });
+        }
       }
 
       // 获取工具定义
@@ -128,14 +173,63 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         input_schema: tool.input_schema,
       }));
 
+      const extractText = (content: unknown): string => {
+        if (!content) return '';
+        if (typeof content === 'string') return content;
+        if (Array.isArray(content)) {
+          return content
+            .map((block) => {
+              if (!block || typeof block !== 'object') return '';
+              const maybeText = (block as { text?: string }).text;
+              return typeof maybeText === 'string' ? maybeText : '';
+            })
+            .filter(Boolean)
+            .join('\n');
+        }
+        return '';
+      };
+
+      const combinedContent = [
+        this.systemPrompt || '',
+        message || '',
+        ...this.conversationHistory.map((entry) => extractText(entry.content)),
+      ]
+        .filter(Boolean)
+        .join('\n');
+      const hasFileTarget = Boolean(
+        combinedContent &&
+        /[\w\-./]+\.(ts|js|tsx|jsx|py|java|go|rs|cpp|c|h|hpp|css|scss|html|json|md|yaml|yml|txt)/i.test(combinedContent)
+      );
+      const readOnlyIntent = Boolean(
+        combinedContent &&
+        /(不要修改|仅需读取|只需读取|只读分析)/.test(combinedContent)
+      );
+      const forceToolUse = Boolean(
+        toolDefinitions.length > 0 &&
+        !readOnlyIntent &&
+        (/必须使用工具/.test(combinedContent) ||
+          /必须使用\s*text_editor/.test(combinedContent) ||
+          /\btext_editor\b/.test(combinedContent) ||
+          /目标文件/.test(combinedContent) ||
+          /目标路径/.test(combinedContent) ||
+          hasFileTarget)
+      );
+
+      const preferredTool = toolDefinitions.find(tool => tool.name === 'text_editor')?.name;
+      const effectiveTools = forceToolUse && preferredTool
+        ? toolDefinitions.filter(tool => tool.name === preferredTool)
+        : toolDefinitions;
+      const toolChoice = undefined;
+
       // 构建请求参数
       const params: LLMMessageParams = {
         messages: this.conversationHistory,
         systemPrompt: this.systemPrompt,
-        tools: toolDefinitions.length > 0 ? toolDefinitions : undefined,
+        tools: effectiveTools.length > 0 ? effectiveTools : undefined,
         stream: true,
         maxTokens: 4096,
         temperature: 0.7,
+        toolChoice,
       };
 
       // 开始流式响应
@@ -163,6 +257,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       // 处理工具调用
       if (response.toolCalls && response.toolCalls.length > 0) {
         toolCalls = response.toolCalls;
+        const allowedTool = forceToolUse && preferredTool ? preferredTool : null;
 
         // 添加助手响应到历史（包含工具调用）
         const assistantContent: any[] = [];
@@ -191,7 +286,20 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         });
 
         // 执行工具调用
-        const toolResults = await this.executeToolCalls(toolCalls);
+        const toolResults = await (async () => {
+          if (!allowedTool) {
+            return await this.executeToolCalls(toolCalls);
+          }
+          const allowedCalls = toolCalls.filter(call => call.name === allowedTool);
+          const blockedCalls = toolCalls.filter(call => call.name !== allowedTool);
+          const blockedResults = blockedCalls.map(call => ({
+            toolCallId: call.id,
+            content: `Tool blocked: only '${allowedTool}' is permitted for this task. Use text_editor to edit target files.`,
+            isError: true,
+          }));
+          const allowedResults = await this.executeToolCalls(allowedCalls);
+          return [...blockedResults, ...allowedResults];
+        })();
 
         // 添加工具结果到历史（使用 ContentBlock 格式）
         const toolResultContent: any[] = toolResults.map(result => ({
@@ -208,7 +316,26 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
         // 递归调用以获取最终响应
         this.normalizer.endStream(messageId);
-        return await this.sendMessageInternal(undefined, undefined, true);
+        if (recursionDepth >= 3) {
+          return '多次工具调用后仍未产出最终回复，已中止以避免无限循环。';
+        }
+        return await this.sendMessageInternal(undefined, undefined, true, recursionDepth + 1);
+      }
+
+      if (forceToolUse && preferredTool && !response.toolCalls?.length) {
+        this.conversationHistory.push({
+          role: 'assistant',
+          content: fullResponse,
+        });
+        this.conversationHistory.push({
+          role: 'user',
+          content: `必须使用 ${preferredTool} 完成目标文件修改。请调用该工具后继续。`,
+        });
+        this.normalizer.endStream(messageId);
+        if (recursionDepth >= 3) {
+          return '多次工具调用后仍未产出最终回复，已中止以避免无限循环。';
+        }
+        return await this.sendMessageInternal(undefined, undefined, true, recursionDepth + 1);
       }
 
       // 添加助手响应到历史

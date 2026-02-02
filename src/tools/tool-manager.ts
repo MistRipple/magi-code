@@ -80,6 +80,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
   // 外部工具执行器
   private mcpExecutors: Map<string, ToolExecutor> = new Map();
+  private skillExecutor: ToolExecutor | null = null;
 
   // 缓存和权限
   private toolCache: Map<string, ExtendedToolDefinition> = new Map();
@@ -176,6 +177,26 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   }
 
   /**
+   * 注册 Skills 执行器（自定义工具 / 指令型 Skills）
+   */
+  registerSkillExecutor(executor: ToolExecutor): void {
+    this.skillExecutor = executor;
+    this.invalidateCache();
+    logger.info('Registered Skill executor', undefined, LogCategory.TOOLS);
+  }
+
+  /**
+   * 注销 Skills 执行器
+   */
+  unregisterSkillExecutor(): void {
+    if (this.skillExecutor) {
+      this.skillExecutor = null;
+      this.invalidateCache();
+      logger.info('Unregistered Skill executor', undefined, LogCategory.TOOLS);
+    }
+  }
+
+  /**
    * 内置工具名称列表
    */
   private readonly builtinToolNames = [
@@ -233,6 +254,18 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       // 执行 MCP 工具
       if (toolDef.metadata.source === 'mcp') {
         return await this.executeMCPTool(toolCall, toolDef);
+      }
+
+      // 执行 Skill 工具
+      if (toolDef.metadata.source === 'skill') {
+        if (!this.skillExecutor) {
+          return {
+            toolCallId: toolCall.id,
+            content: 'Skill executor not registered',
+            isError: true,
+          };
+        }
+        return await this.skillExecutor.execute(toolCall);
       }
 
       return {
@@ -336,7 +369,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     }
 
     // Edit/Write 工具需要 allowEdit 权限
-    if (toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit') {
+    if (toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit' || toolName === 'text_editor' || toolName === 'remove_files') {
       if (!this.permissions.allowEdit) {
         return { allowed: false, reason: 'File editing is disabled' };
       }
@@ -382,6 +415,18 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       }
     }
 
+    // 收集 Skills 自定义工具
+    if (this.skillExecutor) {
+      try {
+        const skillTools = await this.skillExecutor.getTools();
+        tools.push(...skillTools);
+      } catch (error: any) {
+        logger.error('Failed to get tools from skill executor', {
+          error: error.message,
+        }, LogCategory.TOOLS);
+      }
+    }
+
     // 更新缓存
     for (const tool of tools) {
       this.toolCache.set(tool.name, tool);
@@ -390,6 +435,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     logger.info(`Loaded ${tools.length} tools`, {
       builtin: builtinTools.length,
       mcp: this.mcpExecutors.size,
+      skill: this.skillExecutor ? 1 : 0,
     }, LogCategory.TOOLS);
 
     return tools;

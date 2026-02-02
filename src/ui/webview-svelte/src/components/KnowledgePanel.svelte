@@ -1,5 +1,7 @@
 <script lang="ts">
   import { vscode } from '../lib/vscode-bridge';
+  import type { StandardMessage } from '../../../../protocol/message-protocol';
+  import { MessageCategory } from '../../../../protocol/message-protocol';
   import { ensureArray } from '../lib/utils';
   import Icon from './Icon.svelte';
 
@@ -122,29 +124,30 @@
 
   // 监听来自扩展的消息
   $effect(() => {
-    const handler = (event: MessageEvent) => {
-      const message = event.data;
-      if (message.type === 'projectKnowledgeLoaded') {
-        codeIndex = message.codeIndex
-          ? {
-              ...message.codeIndex,
-              files: ensureArray(message.codeIndex.files),
-              techStack: ensureArray(message.codeIndex.techStack),
-              entryPoints: ensureArray(message.codeIndex.entryPoints)
-            }
-          : null;
-        adrs = ensureArray(message.adrs);
-        faqs = ensureArray(message.faqs);
-        isLoading = false;
-      }
-    };
+    const unsubscribe = vscode.onMessage((msg) => {
+      if (msg.type !== 'unifiedMessage') return;
+      const standard = msg.message as StandardMessage;
+      if (!standard || standard.category !== MessageCategory.DATA || !standard.data) return;
+      if (standard.data.dataType !== 'projectKnowledgeLoaded') return;
 
-    window.addEventListener('message', handler);
+      const payload = standard.data.payload as { codeIndex?: any; adrs?: any[]; faqs?: any[] };
+      codeIndex = payload?.codeIndex
+        ? {
+            ...payload.codeIndex,
+            files: ensureArray(payload.codeIndex.files),
+            techStack: ensureArray(payload.codeIndex.techStack),
+            entryPoints: ensureArray(payload.codeIndex.entryPoints)
+          }
+        : null;
+      adrs = ensureArray(payload?.adrs);
+      faqs = ensureArray(payload?.faqs);
+      isLoading = false;
+    });
 
     // 初始化时请求数据
     vscode.postMessage({ type: 'getProjectKnowledge' });
 
-    return () => window.removeEventListener('message', handler);
+    return () => unsubscribe();
   });
 </script>
 

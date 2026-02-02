@@ -60,11 +60,11 @@ export interface ExecutionOptions {
 
   // ============ 智能执行策略选项 ============
   /** 是否需要规划阶段（由 TaskPreAnalyzer 决定） */
-  needsPlanning?: boolean;
+  needsPlanning: boolean;
   /** 是否需要评审阶段（由 TaskPreAnalyzer 决定） */
-  needsReview?: boolean;
+  needsReview: boolean;
   /** 是否需要验证阶段（由 TaskPreAnalyzer 决定） */
-  needsVerification?: boolean;
+  needsVerification: boolean;
 
   // ============ SubTask 同步选项 ============
   /** 关联的 Task ID，用于同步 Assignments 到 SubTasks */
@@ -169,10 +169,16 @@ export class ExecutionCoordinator extends EventEmitter {
    * - needsVerification: 是否执行验证阶段（有契约时需要）
    */
   async execute(options: ExecutionOptions): Promise<ExecutionResult> {
-    // 默认值：如果未指定，按复杂任务处理（向后兼容）
-    const needsPlanning = options.needsPlanning ?? true;
-    const needsReview = options.needsReview ?? false;
-    const needsVerification = options.needsVerification ?? true;
+    if (
+      options.needsPlanning === undefined
+      || options.needsReview === undefined
+      || options.needsVerification === undefined
+    ) {
+      throw new Error('[ExecutionCoordinator] 必须显式指定 needsPlanning/needsReview/needsVerification');
+    }
+    const needsPlanning = options.needsPlanning;
+    const needsReview = options.needsReview;
+    const needsVerification = options.needsVerification;
 
     logger.info(
       `开始执行 Mission: ${this.mission.goal}`,

@@ -439,17 +439,6 @@ export class MissionOrchestrator extends EventEmitter {
           };
         }
 
-        // 兜底启发式：模糊请求需要澄清（避免直接执行）
-        const heuristicQuestions = this.getHeuristicClarificationQuestions(userPrompt);
-        if (heuristicQuestions.length > 0) {
-          return {
-            mode: IntentHandlerMode.CLARIFY,
-            skipMission: true,
-            clarificationQuestions: heuristicQuestions,
-            suggestion: '需要用户补充信息以继续执行',
-          };
-        }
-
         // 对于快速模式，跳过 Mission 创建
         if (
           mode === IntentHandlerMode.ASK
@@ -478,28 +467,6 @@ export class MissionOrchestrator extends EventEmitter {
       skipMission: false,
       suggestion,
     };
-  }
-
-  private getHeuristicClarificationQuestions(userPrompt: string): string[] {
-    const prompt = (userPrompt || '').trim();
-    if (!prompt) return [];
-    const hasFileHint = /[\\w./-]+\\.(ts|js|tsx|jsx|py|java|go|rs|cpp|c|css|scss|html|json|md|yaml|yml|txt)/i.test(prompt);
-    const hasPathHint = /[\\\\/]/.test(prompt);
-    const hasSpecificTarget = /(接口|页面|模块|组件|数据库|查询|渲染|路由|加载|启动|api|sql|缓存|ui|后端|前端|服务|日志|profil|profile|指标|延迟|latency|throughput|qps|fps|cpu|内存)/i.test(prompt);
-
-    const isPerformanceVague = /(优化|性能|改进|提升)/i.test(prompt)
-      && !hasFileHint
-      && !hasPathHint
-      && !hasSpecificTarget
-      && prompt.length <= 40;
-
-    if (!isPerformanceVague) return [];
-
-    return [
-      '需要优化的具体功能/页面/接口是什么？',
-      '是否有复现步骤或性能指标（响应时间/吞吐/CPU/内存）？',
-      '是否有相关日志或 Profiling 结果？',
-    ];
   }
 
   
@@ -640,60 +607,21 @@ export class MissionOrchestrator extends EventEmitter {
           throw new Error(`指定的 Worker 未配置: ${worker}`);
         }
         if (!connectedWorkers.has(worker)) {
-          throw new Error(`指定的 Worker 不可用: ${worker}`);
-        }
-      }
-      participants.push(...options.preferredWorkers);
-    } else {
-      // 仅使用画像系统 + 任务分类配置进行选择
-      const rules = this.profileLoader.getCategoryRules();
-      if (!rules?.defaultCategory) {
-        throw new Error('任务分类规则缺失: defaultCategory 未配置');
-      }
-      const rawCategories = options?.categories && options.categories.length > 0
-        ? options.categories
-        : [options?.category || rules.defaultCategory];
-      const categories = Array.from(new Set(rawCategories.filter(Boolean)));
-
-      const defaultWorkers: WorkerSlot[] = [];
-      const missingCategories: string[] = [];
-      for (const category of categories) {
-        const categoryConfig = this.profileLoader.getCategory(category);
-        if (!categoryConfig) {
-          missingCategories.push(category);
+          const fallback = Array.from(connectedWorkers).find(candidate => candidate !== worker);
+          if (!fallback) {
+            throw new Error(`指定的 Worker 不可用: ${worker}`);
+          }
+          logger.warn('编排器.参与者.降级Worker_不可用', {
+            from: worker,
+            to: fallback,
+          }, LogCategory.ORCHESTRATOR);
+          participants.push(fallback);
           continue;
         }
-        if (!categoryConfig.defaultWorker) {
-          throw new Error(`任务分类未配置默认 Worker: ${category}`);
-        }
-        const desired = categoryConfig.defaultWorker as WorkerSlot;
-        defaultWorkers.push(this.resolveAvailableWorkerForCategory(category, desired, allProfiles, connectedWorkers));
+        participants.push(worker);
       }
-
-      if (missingCategories.length > 0) {
-        throw new Error(`任务分类配置缺失: ${missingCategories.join(', ')}`);
-      }
-
-      for (const [worker, profile] of allProfiles.entries()) {
-        if (categories.some(category => profile.preferences.preferredCategories.includes(category))) {
-          if (connectedWorkers.has(worker)) {
-            participants.push(worker as WorkerSlot);
-          }
-        }
-      }
-
-      if (participants.length === 0) {
-        if (defaultWorkers.length === 0) {
-          throw new Error(`未找到可用 Worker（分类: ${categories.join(', ')})`);
-        }
-        participants.push(...defaultWorkers.filter(worker => allProfiles.has(worker)));
-      } else {
-        for (const worker of defaultWorkers) {
-          if (!participants.includes(worker) && allProfiles.has(worker)) {
-            participants.unshift(worker);
-          }
-        }
-      }
+    } else {
+      throw new Error('未指定 Worker：当前流程要求由编排者 LLM 输出 Worker 列表');
     }
 
     const uniqueParticipants = Array.from(new Set(participants));
@@ -798,7 +726,13 @@ export class MissionOrchestrator extends EventEmitter {
    */
   async assignResponsibilities(
     mission: Mission,
-    participants: WorkerSlot[]
+    participants: WorkerSlot[],
+    options?: {
+      routingCategory?: string;
+      routingReason?: string;
+      requiresModification?: boolean;
+      delegationBriefings?: string[];
+    }
   ): Promise<Assignment[]> {
     const taskInfo = this.buildTaskStructuredInfo(mission);
     const additionalContext = this.contextManager
@@ -811,6 +745,10 @@ export class MissionOrchestrator extends EventEmitter {
       {
         taskInfo,
         additionalContext,
+        routingCategory: options?.routingCategory,
+        routingReason: options?.routingReason,
+        requiresModification: options?.requiresModification,
+        delegationBriefings: options?.delegationBriefings,
       }
     );
 
@@ -1761,29 +1699,25 @@ export class MissionOrchestrator extends EventEmitter {
     this.emit('executionStarted', { missionId: mission.id });
 
     // ========== 智能编排：任务预分析 ==========
-    let strategy: ExecutionStrategy | null = null;
-    if (this.taskPreAnalyzer) {
-      try {
-        strategy = await this.taskPreAnalyzer.analyze(mission, {
-          projectContext: options.projectContext,
-        });
-
-        logger.info('任务预分析完成', {
-          complexity: strategy.complexity,
-          needsPlanning: strategy.needsPlanning,
-          needsReview: strategy.needsReview,
-          needsVerification: strategy.needsVerification,
-        }, LogCategory.ORCHESTRATOR);
-
-        // 发送分析摘要到 UI
-        this.emit('analysisComplete', {
-          missionId: mission.id,
-          strategy,
-        });
-      } catch (error) {
-        logger.warn('任务预分析失败，使用默认策略', { error }, LogCategory.ORCHESTRATOR);
-      }
+    if (!this.taskPreAnalyzer) {
+      throw new Error('未配置 TaskPreAnalyzer，无法执行任务');
     }
+    const strategy = await this.taskPreAnalyzer.analyze(mission, {
+      projectContext: options.projectContext,
+    });
+
+    logger.info('任务预分析完成', {
+      complexity: strategy.complexity,
+      needsPlanning: strategy.needsPlanning,
+      needsReview: strategy.needsReview,
+      needsVerification: strategy.needsVerification,
+    }, LogCategory.ORCHESTRATOR);
+
+    // 发送分析摘要到 UI
+    this.emit('analysisComplete', {
+      missionId: mission.id,
+      strategy,
+    });
 
     // 确保所有 Worker 存在
     for (const assignment of mission.assignments) {
@@ -1860,7 +1794,7 @@ export class MissionOrchestrator extends EventEmitter {
         workingDirectory: options.workingDirectory,
         timeout: options.timeout,
         projectContext: options.projectContext,
-        parallel: strategy?.parallel ?? options.parallel,
+        parallel: strategy.parallel,
         parallelPlanning: options.parallelPlanning,
         blockingTimeout: options.blockingTimeout,
         blockingCheckInterval: options.blockingCheckInterval,
@@ -1868,9 +1802,9 @@ export class MissionOrchestrator extends EventEmitter {
         onReport: options.onReport ?? (async (report) => responder.handleReport(report)),
         reportTimeout: options.reportTimeout,
         // ========== 智能执行策略 ==========
-        needsPlanning: strategy?.needsPlanning ?? true,
-        needsReview: strategy?.needsReview ?? false,
-        needsVerification: strategy?.needsVerification ?? true,
+        needsPlanning: strategy.needsPlanning,
+        needsReview: strategy.needsReview,
+        needsVerification: strategy.needsVerification,
         // ========== SubTask 同步 ==========
         taskId: mission.externalTaskId,
       };

@@ -1,4 +1,3 @@
-import { getState } from '../stores/messages.svelte';
 import type { DisplayTarget } from '../types/message-routing';
 import { classifyMessage } from './message-classifier';
 import { resolveDisplayTarget } from '../config/routing-table';
@@ -14,41 +13,13 @@ export function routeStandardMessage(standard: StandardMessage): DisplayTarget {
 }
 
 export function getMessageTarget(messageId: string): DisplayTarget | null {
-  const cached = messageTargetMap.get(messageId);
-  if (cached) return cached;
-
-  const state = getState();
-  const inThread = state.threadMessages.some(m => m.id === messageId);
-  const agents: Array<'claude' | 'codex' | 'gemini'> = ['claude', 'codex', 'gemini'];
-  let workerMatch: 'claude' | 'codex' | 'gemini' | null = null;
-  for (const agent of agents) {
-    if (state.agentOutputs[agent].some(m => m.id === messageId)) {
-      workerMatch = agent;
-      break;
-    }
-  }
-
-  if (inThread && workerMatch) {
-    const target: DisplayTarget = { location: 'both', worker: workerMatch };
-    messageTargetMap.set(messageId, target);
-    return target;
-  }
-
-  if (inThread) {
-    const target: DisplayTarget = { location: 'thread' };
-    messageTargetMap.set(messageId, target);
-    return target;
-  }
-
-  if (workerMatch) {
-    const target: DisplayTarget = { location: 'worker', worker: workerMatch };
-    messageTargetMap.set(messageId, target);
-    return target;
-  }
-
-  return null;
+  return messageTargetMap.get(messageId) || null;
 }
 
 export function clearMessageTargets(): void {
   messageTargetMap.clear();
+}
+
+export function clearMessageTarget(messageId: string): void {
+  messageTargetMap.delete(messageId);
 }

@@ -126,6 +126,12 @@ export interface SubTask {
   assignedWorker: AgentType;
   reason?: string;
   prompt?: string;
+  /**
+   * AI 生成的委托说明（自然语言）
+   * 由 Orchestrator 在理解用户意图后生成，向 Worker 传达任务背景和期望
+   * 比 prompt 更丰富，包含上下文理解、重点关注点、期望产出等
+   */
+  delegationBriefing?: string;
 
   // 文件跟踪
   targetFiles: string[];

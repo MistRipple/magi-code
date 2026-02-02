@@ -4,7 +4,9 @@
  */
 
 import { EventEmitter } from 'events';
-import { AgentType, WorkerSlot } from '../types/agent-types';
+import { AgentType } from '../types/agent-types';
+import type { ToolManager } from '../tools/tool-manager';
+import type { MCPToolExecutor } from '../tools/mcp-executor';
 
 /**
  * 适配器输出范围配置
@@ -100,5 +102,30 @@ export interface IAdapterFactory extends EventEmitter {
   /**
    * 获取 ToolManager（可选）
    */
-  getToolManager?(): import('../tools/tool-manager').ToolManager;
+  getToolManager(): ToolManager;
+
+  /**
+   * 清除特定适配器
+   */
+  clearAdapter(agent: AgentType): Promise<void>;
+
+  /**
+   * 获取 MCP 执行器
+   */
+  getMCPExecutor(): MCPToolExecutor | null;
+
+  /**
+   * 重新加载 MCP 配置
+   */
+  reloadMCP(): Promise<void>;
+
+  /**
+   * 重新加载 Skills
+   */
+  reloadSkills(): Promise<void>;
+
+  /**
+   * 刷新用户规则
+   */
+  refreshUserRules(): void;
 }

@@ -44,10 +44,11 @@ export interface ToolResult {
 // ============================================================================
 
 /**
- * 内容块（支持文本和工具调用）
+ * 内容块（支持文本、图片和工具调用）
  */
 export type ContentBlock =
   | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
   | { type: 'tool_use'; id: string; name: string; input: Record<string, any> }
   | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean };
 
@@ -69,7 +70,15 @@ export interface LLMMessageParams {
   tools?: ToolDefinition[];
   stream?: boolean;
   systemPrompt?: string;
+  toolChoice?: ToolChoice;
 }
+
+export type ToolChoice =
+  | 'auto'
+  | 'none'
+  | 'required'
+  | { type: 'any' }
+  | { type: 'tool'; name: string };
 
 /**
  * LLM 响应

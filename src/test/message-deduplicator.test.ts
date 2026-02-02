@@ -3,7 +3,7 @@
  */
 
 import { MessageDeduplicator } from '../normalizer/message-deduplicator';
-import { StandardMessage, MessageLifecycle, MessageType, MessageSource } from '../protocol';
+import { StandardMessage, MessageLifecycle, MessageType, MessageSource, MessageCategory } from '../protocol';
 
 declare const describe: (name: string, fn: () => void) => void;
 declare const test: (name: string, fn: () => void | Promise<void>) => void;
@@ -19,6 +19,7 @@ function createTestMessage(
   return {
     id,
     traceId: 'test-trace',
+    category: MessageCategory.CONTENT,  // 🔧 统一消息通道：默认 CONTENT
     type: 'text' as MessageType,
     source,
     agent: 'claude',  // ✅ 使用 agent

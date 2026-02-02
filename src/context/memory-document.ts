@@ -35,7 +35,8 @@ export class MemoryDocument {
     try {
       if (fs.existsSync(this.filePath)) {
         const data = fs.readFileSync(this.filePath, 'utf-8');
-        this.content = JSON.parse(data);
+        const parsed = JSON.parse(data);
+        this.content = this.normalizeContent(parsed);
         logger.info('上下文记忆.加载.完成', { sessionId: this.sessionId }, LogCategory.SESSION);
       } else {
         logger.info('上下文记忆.加载.新建', { sessionId: this.sessionId }, LogCategory.SESSION);
@@ -57,6 +58,7 @@ export class MemoryDocument {
         fs.mkdirSync(dir, { recursive: true });
       }
       
+      this.content = this.normalizeContent(this.content);
       this.content.lastUpdated = new Date().toISOString();
       this.content.tokenEstimate = this.estimateTokens();
       
@@ -80,6 +82,18 @@ export class MemoryDocument {
    * 添加当前任务
    */
   addCurrentTask(task: Omit<TaskRecord, 'timestamp'>): void {
+    if (!task || typeof task !== 'object') {
+      logger.warn('上下文记忆.任务_无效', { reason: 'task invalid' }, LogCategory.SESSION);
+      return;
+    }
+    if (typeof task.id !== 'string' || task.id.trim().length === 0) {
+      logger.warn('上下文记忆.任务_无效', { reason: 'missing id' }, LogCategory.SESSION);
+      return;
+    }
+    if (typeof task.description !== 'string' || task.description.trim().length === 0) {
+      logger.warn('上下文记忆.任务_无效', { reason: 'missing description', taskId: task.id }, LogCategory.SESSION);
+      return;
+    }
     this.content.currentTasks.push({
       ...task,
       timestamp: new Date().toISOString()
@@ -94,7 +108,11 @@ export class MemoryDocument {
     const task = this.content.currentTasks.find(t => t.id === taskId);
     if (task) {
       task.status = status;
-      if (result) task.result = result;
+      if (typeof result === 'string') {
+        task.result = result;
+      } else if (result !== undefined) {
+        logger.warn('上下文记忆.任务_结果_无效', { taskId }, LogCategory.SESSION);
+      }
       
       // 如果任务完成或失败，移动到已完成列表
       if (status === 'completed' || status === 'failed') {
@@ -120,8 +138,21 @@ export class MemoryDocument {
    * 添加代码变更记录
    */
   addCodeChange(change: Omit<CodeChange, 'timestamp'>): void {
+    if (!change || typeof change !== 'object') {
+      logger.warn('上下文记忆.变更_无效', { reason: 'change invalid' }, LogCategory.SESSION);
+      return;
+    }
+    const file = typeof change.file === 'string' ? change.file.trim() : '';
+    const summary = typeof change.summary === 'string' ? change.summary : '';
+    const action = change.action;
+    if (!file || !['add', 'modify', 'delete'].includes(String(action))) {
+      logger.warn('上下文记忆.变更_无效', { file, action }, LogCategory.SESSION);
+      return;
+    }
     this.content.codeChanges.push({
       ...change,
+      file,
+      summary,
       timestamp: new Date().toISOString()
     });
     this.dirty = true;
@@ -131,8 +162,16 @@ export class MemoryDocument {
    * 添加重要上下文
    */
   addImportantContext(context: string): void {
-    if (!this.content.importantContext.includes(context)) {
-      this.content.importantContext.push(context);
+    if (typeof context !== 'string') {
+      logger.warn('上下文记忆.重要上下文_无效', { reason: 'not string' }, LogCategory.SESSION);
+      return;
+    }
+    const trimmed = context.trim();
+    if (!trimmed) {
+      return;
+    }
+    if (!this.content.importantContext.includes(trimmed)) {
+      this.content.importantContext.push(trimmed);
       this.dirty = true;
     }
   }
@@ -153,6 +192,133 @@ export class MemoryDocument {
   resolvePendingIssue(issue: string): void {
     this.content.pendingIssues = this.content.pendingIssues.filter(i => i !== issue);
     this.dirty = true;
+  }
+
+  /**
+   * 规范化 Memory 内容（结构校验 + 非法数据剔除）
+   */
+  private normalizeContent(raw: unknown): MemoryContent {
+    const base = createEmptyMemoryContent(this.sessionId, this.sessionName);
+    const now = new Date().toISOString();
+    if (!raw || typeof raw !== 'object') {
+      return base;
+    }
+    const source = raw as Record<string, unknown>;
+
+    const result: MemoryContent = {
+      ...base,
+      created: typeof source.created === 'string' && source.created ? source.created : base.created,
+      lastUpdated: typeof source.lastUpdated === 'string' && source.lastUpdated ? source.lastUpdated : base.lastUpdated,
+      tokenEstimate: typeof source.tokenEstimate === 'number' && Number.isFinite(source.tokenEstimate)
+        ? source.tokenEstimate
+        : base.tokenEstimate,
+    };
+
+    let dropped = 0;
+    const safeTasks = Array.isArray(source.currentTasks) ? source.currentTasks : [];
+    result.currentTasks = safeTasks
+      .filter((t) => t && typeof t === 'object')
+      .map((t) => {
+        const task = t as Record<string, unknown>;
+        const id = typeof task.id === 'string' ? task.id.trim() : '';
+        const description = typeof task.description === 'string' ? task.description.trim() : '';
+        const status = task.status;
+        if (!id || !description || !['pending', 'in_progress', 'completed', 'failed'].includes(String(status))) {
+          dropped += 1;
+          return null;
+        }
+        return {
+          id,
+          description,
+          status: status as TaskRecord['status'],
+          assignedWorker: typeof task.assignedWorker === 'string' ? task.assignedWorker : undefined,
+          result: typeof task.result === 'string' ? task.result : undefined,
+          timestamp: typeof task.timestamp === 'string' ? task.timestamp : now,
+        } as TaskRecord;
+      })
+      .filter(Boolean) as TaskRecord[];
+
+    const safeCompleted = Array.isArray(source.completedTasks) ? source.completedTasks : [];
+    result.completedTasks = safeCompleted
+      .filter((t) => t && typeof t === 'object')
+      .map((t) => {
+        const task = t as Record<string, unknown>;
+        const id = typeof task.id === 'string' ? task.id.trim() : '';
+        const description = typeof task.description === 'string' ? task.description.trim() : '';
+        const status = task.status;
+        if (!id || !description || !['pending', 'in_progress', 'completed', 'failed'].includes(String(status))) {
+          dropped += 1;
+          return null;
+        }
+        return {
+          id,
+          description,
+          status: status as TaskRecord['status'],
+          assignedWorker: typeof task.assignedWorker === 'string' ? task.assignedWorker : undefined,
+          result: typeof task.result === 'string' ? task.result : undefined,
+          timestamp: typeof task.timestamp === 'string' ? task.timestamp : now,
+        } as TaskRecord;
+      })
+      .filter(Boolean) as TaskRecord[];
+
+    const safeDecisions = Array.isArray(source.keyDecisions) ? source.keyDecisions : [];
+    result.keyDecisions = safeDecisions
+      .filter((d) => d && typeof d === 'object')
+      .map((d) => {
+        const decision = d as Record<string, unknown>;
+        const id = typeof decision.id === 'string' ? decision.id.trim() : '';
+        const description = typeof decision.description === 'string' ? decision.description.trim() : '';
+        const reason = typeof decision.reason === 'string' ? decision.reason.trim() : '';
+        if (!id || !description || !reason) {
+          dropped += 1;
+          return null;
+        }
+        return {
+          id,
+          description,
+          reason,
+          timestamp: typeof decision.timestamp === 'string' ? decision.timestamp : now,
+        } as Decision;
+      })
+      .filter(Boolean) as Decision[];
+
+    const safeChanges = Array.isArray(source.codeChanges) ? source.codeChanges : [];
+    result.codeChanges = safeChanges
+      .filter((c) => c && typeof c === 'object')
+      .map((c) => {
+        const change = c as Record<string, unknown>;
+        const file = typeof change.file === 'string' ? change.file.trim() : '';
+        const action = change.action;
+        const summary = typeof change.summary === 'string' ? change.summary : '';
+        if (!file || !['add', 'modify', 'delete'].includes(String(action))) {
+          dropped += 1;
+          return null;
+        }
+        return {
+          file,
+          action: action as CodeChange['action'],
+          summary,
+          timestamp: typeof change.timestamp === 'string' ? change.timestamp : now,
+        } as CodeChange;
+      })
+      .filter(Boolean) as CodeChange[];
+
+    const safeContext = Array.isArray(source.importantContext) ? source.importantContext : [];
+    result.importantContext = safeContext
+      .filter((ctx) => typeof ctx === 'string')
+      .map((ctx) => ctx.trim())
+      .filter(Boolean);
+
+    const safeIssues = Array.isArray(source.pendingIssues) ? source.pendingIssues : [];
+    result.pendingIssues = safeIssues
+      .filter((issue) => typeof issue === 'string')
+      .map((issue) => issue.trim())
+      .filter(Boolean);
+
+    if (dropped > 0) {
+      logger.warn('上下文记忆.规范化.丢弃无效记录', { dropped }, LogCategory.SESSION);
+    }
+    return result;
   }
 
   /**

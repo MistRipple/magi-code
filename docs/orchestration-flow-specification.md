@@ -141,8 +141,9 @@ if (intentResult.mode === IntentHandlerMode.DIRECT) {
     // 编排者直接回答（可用工具）
     return decision.directResponse ?? await this.executeAskMode(userPrompt, taskId, sessionId);
   }
-  // 需要 Worker → 快速执行
-  return await this.executeQuickPath(userPrompt, mode, taskId, sessionId);
+  // 需要 Worker → 进入完整 Mission 流程
+  intentResult = await this.missionOrchestrator.processRequest(userPrompt, sessionId, { forceMode: IntentHandlerMode.TASK });
+  // 之后走 MissionOrchestrator 的规划-执行路径
 }
 ```
 
@@ -302,11 +303,10 @@ flowchart TB
         F1 --> F2[编排者 LLM 直接回答]
     end
 
-    subgraph DirectExplorePath["⚡ 快速路径 (条件判断)"]
+    subgraph DirectExplorePath["🧭 DIRECT/EXPLORE 路由判断"]
         E -->|DIRECT/EXPLORE| G1{LLM 路由判断}
         G1 -->|不需要 Worker| G2[executeAskMode]
-        G1 -->|需要 Worker| G4[executeQuickPath]
-        G4 --> G5[QuickExecutor → Worker]
+        G1 -->|需要 Worker| H1
     end
 
     subgraph TaskPath["🔧 完整编排路径"]
@@ -344,9 +344,42 @@ flowchart TB
 
 ---
 
-## 9. 验收检查清单
+## 9. MessageHub 统一消息出口
 
-### 9.1 意图分类
+> **重要**：MessageHub 是所有 UI 消息的唯一出口，已合并原 UnifiedMessageBus 的去重/节流能力。
+> 详细设计见 `docs/unified-message-channel-design.md`。
+
+### 9.1 核心职责
+
+| 职责 | 说明 |
+|------|------|
+| 语义 API | `progress()`, `result()`, `workerOutput()`, `error()` |
+| 控制 API | `phaseChange()`, `taskAccepted()`, `sendControl()` |
+| 去重/节流 | 消息 ID 去重、内容哈希去重、流式节流（100ms） |
+| 状态管理 | `ProcessingState` 权威来源 |
+
+### 9.2 消息分类
+
+```typescript
+enum MessageCategory {
+  CONTENT = 'content',   // 内容消息（LLM 响应、结果）
+  CONTROL = 'control',   // 控制消息（阶段、任务状态）
+  NOTIFY = 'notify',     // 通知消息（Toast）
+  DATA = 'data',         // 数据消息（状态同步）
+}
+```
+
+### 9.3 禁止事项
+
+- ❌ 禁止直接调用 `postMessage`（必须使用 MessageHub）
+- ❌ 禁止绕过消息分类（所有消息必须有明确 category）
+- ❌ 禁止分散管理 `isProcessing`（由 MessageHub 统一管理）
+
+---
+
+## 10. 验收检查清单
+
+### 10.1 意图分类
 
 - [ ] "你是谁" → ASK 模式 → 编排者直接回答
 - [ ] "给我生成一个流程图" → ASK 模式 → 编排者直接回答
@@ -354,14 +387,14 @@ flowchart TB
 - [ ] "分析这段代码" → EXPLORE 模式 → Worker 执行
 - [ ] "重构登录模块" → TASK 模式 → 完整 Mission 流程
 
-### 9.2 Worker 选择
+### 10.2 Worker 选择
 
 - [ ] 无硬编码的 Worker 名称作为选择逻辑
 - [ ] 所有 Worker 选择来自 ProfileLoader
 - [ ] Worker 不可用时从画像配置获取替代
 - [ ] DIRECT/EXPLORE 路由由 LLM 决策（codeTask/profileCategory）
 
-### 9.3 消息路由
+### 10.3 消息路由
 
 - [ ] 主对话区只有编排者叙事
 - [ ] Worker 输出只在对应 Tab
@@ -369,8 +402,9 @@ flowchart TB
 
 ---
 
-## 10. 版本历史
+## 11. 版本历史
 
-| 版本 | 日期 | 变更 |
-|------|------|------|
-| 1.0 | 2025-01-31 | 初始版本：完整编排流程规范 |
+| 版本 | 日期       | 变更                                                 |
+|------|------------|------------------------------------------------------|
+| 1.0  | 2025-01-31 | 初始版本：完整编排流程规范                           |
+| 1.1  | 2025-02-01 | 新增第 9 节 MessageHub 统一消息出口，反映合并架构    |

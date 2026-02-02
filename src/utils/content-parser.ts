@@ -199,21 +199,6 @@ function tryExtractJsonAt(content: string, startIndex: number): { jsonText: stri
 }
 
 /**
- * 提取单个代码块
- */
-export function extractSingleCodeFence(content: string): { lang: string; body: string; filepath?: string } | null {
-  if (!content) return null;
-  const trimmed = content.trim();
-  // 匹配 ```lang:filepath 或 ```lang filepath 或 ```lang
-  const match = trimmed.match(/^```(\w*)(?::([^\s\n]+)|\s+([^\n]+))?\s*\n([\s\S]*?)\n?```\s*$/);
-  if (!match) return null;
-  const lang = match[1] || '';
-  const filepath = match[2] || match[3] || undefined;
-  const body = match[4] || '';
-  return { lang, body, filepath };
-}
-
-/**
  * 判断是否应该渲染为代码块
  * 🔧 修复：避免误判 Markdown 有序列表
  */
@@ -256,46 +241,6 @@ export function hasMarkdownSyntax(content: string): boolean {
   if (!content) return false;
   // 代码块、标题、列表、粗体、引用、分隔线
   return /```|^#{1,3} |^\* |\*\*|^\d+\. |^> |^---$/m.test(content);
-}
-
-/**
- * 检测是否为任务摘要
- */
-export function isSummaryContent(content: string): boolean {
-  if (!content) return false;
-  return content.includes('执行完成') ||
-         content.includes('任务完成') ||
-         content.includes('已完成');
-}
-
-/**
- * 检测是否为任务分析
- */
-export function isTaskContent(content: string): boolean {
-  if (!content) return false;
-  return content.includes('任务分析') || content.includes('执行计划');
-}
-
-/**
- * 检测是否为进度信息
- */
-export function isProgressContent(content: string): boolean {
-  if (!content) return false;
-  return content.includes('正在') ||
-         content.includes('开始') ||
-         content.includes('处理中');
-}
-
-/**
- * 检测是否为错误信息
- */
-export function isErrorContent(content: string): boolean {
-  if (!content) return false;
-  const lower = content.toLowerCase();
-  return lower.includes('error') ||
-         lower.includes('错误') ||
-         lower.includes('失败') ||
-         lower.includes('exception');
 }
 
 /**

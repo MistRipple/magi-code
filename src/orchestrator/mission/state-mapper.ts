@@ -172,7 +172,7 @@ export class MissionStateMapper {
 
     const subTaskView: SubTaskView = {
       id: assignment.id,
-      title: assignment.responsibility,
+      title: assignment.delegationBriefing || assignment.responsibility,
       worker: assignment.workerId,
       status: this.mapAssignmentStatus(assignment.status),
       progress: assignment.progress,

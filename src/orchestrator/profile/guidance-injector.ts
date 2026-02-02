@@ -71,6 +71,9 @@ export class GuidanceInjector {
       sections.push(this.buildOutputSection(profile));
     }
 
+    // 7. 工具使用规则（通用）
+    sections.push(this.buildToolUsageSection());
+
     return sections.join('\n\n');
   }
 
@@ -130,7 +133,6 @@ export class GuidanceInjector {
         '不要改变外部行为',
         '每次只重构一个模块',
         '重构前确保测试覆盖',
-        '保持向后兼容（如有需要）',
       ],
       'review': [
         '只分析代码，不要修改',
@@ -220,6 +222,13 @@ export class GuidanceInjector {
   private buildOutputSection(profile: WorkerProfile): string {
     const items = profile.guidance.outputPreferences.map(p => `- ${p}`).join('\n');
     return `## 输出要求\n${items}`;
+  }
+
+  /**
+   * 构建工具使用规则（通用）
+   */
+  private buildToolUsageSection(): string {
+    return `## 工具使用\n- 涉及代码/文件修改时，必须使用工具直接编辑文件并保存结果\n- 若无法使用工具完成修改，需明确说明原因并停止\n- 修改完成后需简要说明改动要点`;
   }
 
   /**
@@ -460,4 +469,3 @@ export class GuidanceInjector {
     return checks;
   }
 }
-

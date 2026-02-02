@@ -1,13 +1,15 @@
 /**
  * Orchestrator LLM 适配器
  * 用于编排者代理
+ *
+ * 🔧 统一消息通道：使用 MessageHub 替代 UnifiedMessageBus
  */
 
 import { AgentType, AgentRole, LLMConfig } from '../../types/agent-types';
 import { LLMClient, LLMMessageParams, LLMMessage } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager } from '../../tools/tool-manager';
-import { UnifiedMessageBus } from '../../normalizer/unified-message-bus';
+import { MessageHub } from '../../orchestrator/core/message-hub';
 import { BaseLLMAdapter, AdapterState } from './base-adapter';
 import { logger, LogCategory } from '../../logging';
 
@@ -31,7 +33,7 @@ export interface OrchestratorAdapterConfig {
   normalizer: BaseNormalizer;
   toolManager: ToolManager;
   config: LLMConfig;
-  messageBus: UnifiedMessageBus;  // 必选：消息总线
+  messageHub: MessageHub;  // 🔧 统一消息通道：替代 messageBus
   systemPrompt?: string;
   historyConfig?: OrchestratorHistoryConfig;
 }
@@ -51,7 +53,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       adapterConfig.normalizer,
       adapterConfig.toolManager,
       adapterConfig.config,
-      adapterConfig.messageBus
+      adapterConfig.messageHub  // 🔧 统一消息通道：使用 messageHub
     );
     this.systemPrompt = adapterConfig.systemPrompt || this.getDefaultSystemPrompt();
     this.historyConfig = {
@@ -91,11 +93,52 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       // 自动截断历史以控制 token 消耗
       this.truncateHistoryIfNeeded();
 
-      // 添加用户消息到历史
-      this.conversationHistory.push({
-        role: 'user',
-        content: message,
-      });
+      // 添加用户消息到历史（支持图片）
+      if (images && images.length > 0) {
+        const contentBlocks: any[] = [];
+
+        // 添加图片内容块
+        for (const imagePath of images) {
+          try {
+            const fs = require('fs');
+            const path = require('path');
+            const imageBuffer = fs.readFileSync(imagePath);
+            const base64Data = imageBuffer.toString('base64');
+            const ext = path.extname(imagePath).toLowerCase().slice(1);
+            const mediaType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+
+            contentBlocks.push({
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: mediaType,
+                data: base64Data,
+              },
+            });
+          } catch (err) {
+            logger.warn('Orchestrator适配器.图片读取失败', { path: imagePath, error: String(err) }, LogCategory.LLM);
+          }
+        }
+
+        // 添加文本内容块
+        if (message) {
+          contentBlocks.push({
+            type: 'text',
+            text: message,
+          });
+        }
+
+        this.conversationHistory.push({
+          role: 'user',
+          content: contentBlocks,
+        });
+      } else {
+        // 纯文本消息
+        this.conversationHistory.push({
+          role: 'user',
+          content: message,
+        });
+      }
 
       // Orchestrator 通常不需要工具，但可以根据需要启用
       const params: LLMMessageParams = {
