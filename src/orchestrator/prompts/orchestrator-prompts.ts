@@ -105,7 +105,7 @@ ${projectContext ? `## 项目上下文\n${projectContext}\n` : ''}
       "reason": "选择该 Worker 的原因",
       "targetFiles": ["预计修改的文件列表"],
       "dependencies": [],
-      "prompt": "发送给该 Worker 的具体指令（英文，详细明确）",
+      "delegationBriefing": "用自然语言向 Worker 说明任务背景、你的理解、重点关注什么、期望产出是什么。像同事间的工作委托，而非机械指令。",
       "background": false
     }
   ],
@@ -198,9 +198,10 @@ ${resultsText}
 export function buildWorkerNeedDecisionPrompt(
   userPrompt: string,
   recommendedMode: string,
-  categoryHints: string
+  categoryHints: string,
+  workerHints: string
 ): string {
-  return `你是一个任务编排者，请判断用户请求是否需要 Worker 执行。
+  return `你是一个任务编排者，请完成意图到分配的统一决策。
 
 ## 用户请求
 ${userPrompt}
@@ -208,20 +209,30 @@ ${userPrompt}
 ## 上游推荐模式
 ${recommendedMode}
 
-## 画像任务类型（命中这些类型时需要 Worker）
+## 画像任务类型（仅用于理解任务分类）
 ${categoryHints}
 
+## 可用 Worker（必须从这里选择）
+${workerHints}
+
 ## 判断要求
-1. **需要 Worker 的唯一条件**：'codeTask=true' 或 'profileCategory' 命中画像任务类型
-2. **不需要 Worker**：needsWorker=false，并给出 directResponse
-3. **编排者可使用工具**，但不应因此派发 Worker
-4. 只输出 JSON，不要任何解释或额外文本
+1. **仅输出 JSON**，不要任何解释或额外文本
+2. needsWorker=false 时，必须提供 directResponse，并将 workers 置为空数组
+3. needsWorker=true 时，必须给出 category 与 workers（至少 1 个），并为每个 worker 生成 delegationBriefing
+4. workers 必须从上面的可用 Worker 中选择
+5. **涉及代码/文件修改、执行工具或工程性产出（diff/代码/配置）时，必须 needsWorker=true**
+6. 编排者可使用工具，但不应因此强制派发 Worker
+7. requiresModification=true 仅在需要对文件产生实际修改（增删改文件）时设置；仅分析/阅读则为 false
+8. **delegationBriefings**: 当 needsWorker=true 时，为每个 worker 生成一段自然语言的任务委托说明，像同事间的工作交接，包含任务背景、重点关注点、期望产出
 
 ## 输出格式（严格 JSON）
 {
-  "codeTask": true/false,
-  "profileCategory": "命中的任务类型名称，未命中则为空字符串",
+  "needsWorker": true/false,
+  "category": "命中的任务类型名称，未命中则为 none",
+  "workers": ["claude","codex","gemini"] ,
+  "delegationBriefings": ["给第一个worker的委托说明", "给第二个worker的委托说明"],
   "needsTooling": true/false,
+  "requiresModification": true/false,
   "directResponse": "当不需要 Worker 时必须提供",
   "reason": "简短判断理由"
 }`;
@@ -394,7 +405,7 @@ export function buildCompactAnalysisPrompt(
 Workers: ${workers}
 ${context ? `上下文: ${context}\n` : ''}
 输出纯JSON:
-{"analysis":"分析","isSimpleTask":bool,"needsWorker":bool,"directResponse":"直接回答(可选)","needsUserInput":bool,"questions":[],"needsCollaboration":bool,"subTasks":[{"id":"1","description":"描述","assignedWorker":"worker","targetFiles":[],"dependencies":[],"prompt":"Worker指令"}],"executionMode":"parallel/sequential","summary":"总结"}
+{"analysis":"分析","isSimpleTask":bool,"needsWorker":bool,"directResponse":"直接回答(可选)","needsUserInput":bool,"questions":[],"needsCollaboration":bool,"subTasks":[{"id":"1","description":"描述","assignedWorker":"worker","targetFiles":[],"dependencies":[],"delegationBriefing":"自然语言委托说明"}],"executionMode":"parallel/sequential","summary":"总结"}
 
 规则: 前端→Gemini, 后端→Codex, 复杂→Claude. 禁止tool_use.`;
 }

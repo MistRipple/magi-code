@@ -225,6 +225,21 @@ class EndToEndEngineer implements TestEngineer {
               done: true,
             };
           }
+          if (message.includes('needsWorker') && message.includes('directResponse')) {
+            return {
+              content: JSON.stringify({
+                needsWorker: true,
+                category: 'simple',
+                workers: ['codex'],
+                delegationBriefings: ['生成登录流程图，输出 markdown'],
+                needsTooling: false,
+                requiresModification: false,
+                directResponse: '',
+                reason: '需要生成结构化内容，交由 worker 执行',
+              }),
+              done: true,
+            };
+          }
           return { content: '编排者响应', done: true };
         }
 

@@ -19,57 +19,63 @@ import {
   setThreadMessages,
   setAgentOutputs,
   removeThreadMessage,
-  setWaveState,
-  updateWaveProgress,
+  addToast,
   addWorkerSession,
   updateWorkerSession,
+  markMessageActive,
+  markMessageComplete,
+  clearProcessingState,
+  clearPendingRequest,
+  setProcessingActor,
 } from '../stores/messages.svelte';
-import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WaveState, WorkerSessionState, Task, Edit } from '../types/message';
+import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, Edit } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
-import { MessageType } from '../../../../protocol/message-protocol';
-import { routeStandardMessage, getMessageTarget, clearMessageTargets } from './message-router';
+import { MessageType, MessageCategory } from '../../../../protocol/message-protocol';
+import { routeStandardMessage, getMessageTarget, clearMessageTargets, clearMessageTarget } from './message-router';
 import { normalizeWorkerSlot } from './message-classifier';
 import { ensureArray } from './utils';
 import { resolvePhaseStep } from '../config/phase-map';
 
 // 生成唯一 ID
 function generateId(): string {
-  return `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  return `msg_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
 }
 
 function normalizeRestoredMessages(messages: Message[]): Message[] {
   const seen = new Set<string>();
   const normalized: Message[] = [];
   for (const msg of ensureArray<Message>(messages)) {
-    if (!msg || typeof msg !== 'object') continue;
+    if (!msg || typeof msg !== 'object') {
+      throw new Error('[MessageHandler] 恢复消息包含无效对象');
+    }
     const rawId = typeof msg.id === 'string' ? msg.id.trim() : '';
-    const id = rawId || generateId();
-    if (seen.has(id)) continue;
-    seen.add(id);
-    normalized.push({ ...msg, id });
+    if (!rawId) {
+      throw new Error('[MessageHandler] 恢复消息缺少 id');
+    }
+    if (seen.has(rawId)) {
+      throw new Error(`[MessageHandler] 恢复消息 id 重复: ${rawId}`);
+    }
+    seen.add(rawId);
+    normalized.push({ ...msg, id: rawId });
   }
   return normalized;
 }
 
-// 标准消息的兜底 ID 生成（用于缺失 id 的异常消息）
-function buildFallbackMessageId(standard: StandardMessage): string {
-  const traceId = standard.traceId || 'no-trace';
-  const timestamp = standard.timestamp || standard.updatedAt || Date.now();
-  const source = standard.source || 'unknown';
-  const agent = standard.agent || 'unknown';
-  const type = standard.type || 'unknown';
-  return `msg_fallback_${traceId}_${timestamp}_${source}_${agent}_${type}`;
-}
-
-function normalizeStandardMessage(standard: StandardMessage): StandardMessage {
+function assertStandardMessageId(standard: StandardMessage): StandardMessage {
   if (standard.id && standard.id.trim()) {
     return standard;
   }
-  const fallbackId = buildFallbackMessageId(standard);
-  console.warn('[MessageHandler] 标准消息缺少 id，已使用回退 id', { fallbackId, standard });
-  return { ...standard, id: fallbackId };
+  throw new Error('[MessageHandler] 标准消息缺少 id');
 }
 
+function extractTextFromStandardBlocks(blocks?: StandardContentBlock[]): string {
+  if (!Array.isArray(blocks) || blocks.length === 0) return '';
+  return blocks
+    .filter((block) => block.type === 'text' || block.type === 'thinking')
+    .map((block) => (block as any).content || '')
+    .filter(Boolean)
+    .join('\n');
+}
 
 /**
  * 添加系统通知消息（居中显示的简洁通知）
@@ -104,174 +110,16 @@ function handleMessage(message: WebviewMessage) {
   const { type } = message;
 
   switch (type) {
-    case 'stateUpdate':
-      handleStateUpdate(message);
+    case 'unifiedMessage':
+      handleUnifiedMessage(message);
       break;
 
-    case 'standardMessage':
-      handleStandardMessage(message);
-      break;
-
-    case 'standardUpdate':
+    case 'unifiedUpdate':
       handleStandardUpdate(message);
       break;
 
-    case 'standardComplete':
+    case 'unifiedComplete':
       handleStandardComplete(message);
-      break;
-
-    case 'processingStateChanged':
-      handleProcessingStateChange(message);
-      break;
-
-    case 'phaseChanged':
-      handlePhaseChanged(message);
-      break;
-
-    case 'sessionsUpdated':
-      handleSessionsUpdated(message);
-      break;
-
-    case 'sessionCreated':
-    case 'sessionLoaded':
-    case 'sessionSwitched':
-      handleSessionChanged(message);
-      break;
-
-    case 'sessionSummaryLoaded':
-      handleSessionSummaryLoaded(message);
-      break;
-
-    case 'sessionMessagesLoaded':
-      handleSessionMessagesLoaded(message);
-      break;
-
-    case 'confirmationRequest':
-      handleConfirmationRequest(message);
-      break;
-
-    case 'recoveryRequest':
-      handleRecoveryRequest(message);
-      break;
-
-    case 'questionRequest':
-      handleQuestionRequest(message);
-      break;
-
-    case 'clarificationRequest':
-      handleClarificationRequest(message);
-      break;
-
-    case 'workerQuestionRequest':
-      handleWorkerQuestionRequest(message);
-      break;
-
-    case 'toolAuthorizationRequest':
-      handleToolAuthorizationRequest(message);
-      break;
-
-    case 'missionPlanned':
-      handleMissionPlanned(message);
-      break;
-
-    case 'assignmentPlanned':
-      handleAssignmentPlanned(message);
-      break;
-
-    case 'assignmentStarted':
-      handleAssignmentStarted(message);
-      break;
-
-    case 'assignmentCompleted':
-      handleAssignmentCompleted(message);
-      break;
-
-    case 'todoStarted':
-      handleTodoStarted(message);
-      break;
-
-    case 'todoCompleted':
-      handleTodoCompleted(message);
-      break;
-
-    case 'todoFailed':
-      handleTodoFailed(message);
-      break;
-
-    case 'dynamicTodoAdded':
-      handleDynamicTodoAdded(message);
-      break;
-
-    case 'todoApprovalRequested':
-      handleTodoApprovalRequested(message);
-      break;
-
-    // ============ Wave 执行事件（提案 4.6） ============
-    case 'waveExecutionStarted':
-      handleWaveExecutionStarted(message);
-      break;
-
-    case 'waveStarted':
-      handleWaveStarted(message);
-      break;
-
-    case 'waveCompleted':
-      handleWaveCompleted(message);
-      break;
-
-    // ============ Worker Session 事件（提案 4.1） ============
-    case 'workerSessionCreated':
-      handleWorkerSessionCreated(message);
-      break;
-
-    case 'workerSessionResumed':
-      handleWorkerSessionResumed(message);
-      break;
-
-    // ============ 系统通知类消息 ============
-    case 'workerStatusUpdate':
-      handleWorkerStatusUpdate(message);
-      break;
-
-    case 'workerStatusChanged':
-      addSystemMessage((message.worker as string) + ' 状态已更新', 'info');
-      break;
-
-    case 'workerError':
-      addSystemMessage((message.worker as string) + ': ' + (message.error as string), 'error');
-      break;
-
-    case 'error':
-      addSystemMessage((message.message as string) || '发生错误', 'error');
-      break;
-
-    case 'interactionModeChanged':
-      getState().interactionMode = (message.mode as string) === 'ask' ? 'ask' : 'auto';
-      addSystemMessage('已切换到 ' + getModeDisplayName(message.mode as string) + ' 模式', 'info');
-      break;
-
-    // verificationResult 已移除：验证结果在最终总结中统一显示，避免重复
-
-    case 'recoveryResult':
-      addSystemMessage(message.message as string, message.success ? 'success' : 'error');
-      break;
-
-    case 'workerFallbackNotice':
-      addSystemMessage(`${message.originalWorker} 降级到 ${message.fallbackWorker}: ${message.reason}`, 'warning');
-      break;
-
-    case 'missionExecutionFailed':
-      addSystemMessage((message.error as string) || '任务执行失败', 'error');
-      setIsProcessing(false);
-      break;
-
-    case 'missionFailed':
-      addSystemMessage((message.error as string) || '任务失败', 'error');
-      setIsProcessing(false);
-      break;
-
-    case 'toast':
-      handleToast(message);
       break;
 
     default:
@@ -279,21 +127,6 @@ function handleMessage(message: WebviewMessage) {
       // console.log('[MessageHandler] 未知消息类型:', type, message);
       break;
   }
-}
-
-/**
- * 获取交互模式显示名称
- */
-function getModeDisplayName(mode: string): string {
-  const modeNames: Record<string, string> = {
-    'ask': '对话',
-    'agent': '智能体',
-    'orchestrator': '智能编排',
-    'plan': '规划',
-    'code': '编码',
-    'auto': '自动',
-  };
-  return modeNames[mode] || mode;
 }
 
 // ============ 消息处理函数 ============
@@ -313,15 +146,32 @@ function handleStateUpdate(message: WebviewMessage) {
   }
 
   const store = getState();
+  const taskSeen = new Set<string>();
   store.tasks = ensureArray(state.tasks)
     .filter((task): task is Task => !!task && typeof task === 'object' && typeof (task as Task).status === 'string')
-    .map((task) => ({
-      id: task.id || `task_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+    .map((task) => {
+      let id = typeof task.id === 'string' && task.id.trim() ? task.id : `task_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      while (taskSeen.has(id)) {
+        id = `task_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      }
+      taskSeen.add(id);
+      return {
+        id,
       name: task.name || task.prompt || '',
       description: task.description,
       status: task.status,
-    }));
+      };
+    });
+  const editSeen = new Set<string>();
   store.edits = ensureArray(state.pendingChanges)
+    .filter((change): change is Edit => !!change && typeof change === 'object' && typeof (change as Edit).filePath === 'string' && !!(change as Edit).filePath)
+    .filter((change) => {
+      if (editSeen.has(change.filePath)) {
+        return false;
+      }
+      editSeen.add(change.filePath);
+      return true;
+    })
     .map((change) => ({
       filePath: change.filePath,
       type: change.type,
@@ -360,18 +210,57 @@ function handleStateUpdate(message: WebviewMessage) {
 }
 
 
-function handleStandardMessage(message: WebviewMessage) {
+function handleUnifiedMessage(message: WebviewMessage) {
   const rawStandard = message.message as StandardMessage;
-  if (!rawStandard) return;
-  const standard = normalizeStandardMessage(rawStandard);
+  if (!rawStandard) {
+    throw new Error('[MessageHandler] unifiedMessage 缺少 message');
+  }
+  const standard = assertStandardMessageId(rawStandard);
+
+  switch (standard.category) {
+    case MessageCategory.CONTENT:
+      handleContentMessage(standard);
+      break;
+    case MessageCategory.CONTROL:
+      handleUnifiedControlMessage(standard);
+      break;
+    case MessageCategory.NOTIFY:
+      handleUnifiedNotify(standard);
+      break;
+    case MessageCategory.DATA:
+      handleUnifiedData(standard);
+      break;
+    default:
+      break;
+  }
+}
+
+function handleContentMessage(standard: StandardMessage) {
   const uiMessage = mapStandardMessage(standard);
   if (!uiMessage.isStreaming && !hasRenderableContent(uiMessage)) {
-    return;
+    throw new Error(`[MessageHandler] 内容消息不可渲染: ${standard.id}`);
   }
   const target = routeStandardMessage(standard);
+
+  // 🔧 调试日志：追踪 Worker 消息路由
+  console.log('[DEBUG] handleContentMessage: 消息路由', {
+    id: standard.id,
+    source: standard.source,
+    agent: standard.agent,
+    category: standard.category,
+    targetLocation: target.location,
+    targetWorker: (target as { worker?: string }).worker,
+  });
+
   if (target.location === 'none' || target.location === 'task') {
     return;
   }
+
+  // 🔧 修复：流式消息需要标记为活跃，驱动 isProcessing 状态
+  if (uiMessage.isStreaming) {
+    markMessageActive(uiMessage.id);
+  }
+
     if (target.location === 'thread') {
       const existing = getState().threadMessages.find(m => m.id === uiMessage.id);
       if (existing) {
@@ -402,16 +291,17 @@ function handleStandardMessage(message: WebviewMessage) {
     }
 }
 
+
 function handleStandardUpdate(message: WebviewMessage) {
   const rawUpdate = message.update as StreamUpdate;
-  if (!rawUpdate?.messageId) return;
-  const update = rawUpdate.messageId.trim() ? rawUpdate : null;
-  if (!update) {
-    console.warn('[MessageHandler] 流式更新缺少 messageId，已丢弃', rawUpdate);
-    return;
+  if (!rawUpdate?.messageId || !rawUpdate.messageId.trim()) {
+    throw new Error('[MessageHandler] 流式更新缺少 messageId');
   }
+  const update = rawUpdate;
   const location = getMessageTarget(update.messageId);
-  if (!location) return;
+  if (!location) {
+    throw new Error(`[MessageHandler] 未找到流式更新的路由: ${update.messageId}`);
+  }
   if (location.location === 'none' || location.location === 'task') {
     return;
   }
@@ -443,24 +333,24 @@ function handleStandardUpdate(message: WebviewMessage) {
 
 function handleStandardComplete(message: WebviewMessage) {
   const rawStandard = message.message as StandardMessage;
-  if (!rawStandard) return;
-  const standard = normalizeStandardMessage(rawStandard);
+  if (!rawStandard) {
+    throw new Error('[MessageHandler] unifiedComplete 缺少 message');
+  }
+  const standard = assertStandardMessageId(rawStandard);
   const location = getMessageTarget(standard.id);
-  if (!location) return;
+  if (!location) {
+    throw new Error(`[MessageHandler] 完成消息缺少路由: ${standard.id}`);
+  }
   if (location.location === 'none' || location.location === 'task') {
     return;
   }
+
+  // 🔧 修复：消息完成时标记为非活跃，驱动 isProcessing 状态
+  markMessageComplete(standard.id);
+
   const uiMessage = mapStandardMessage(standard);
   if (!hasRenderableContent(uiMessage)) {
-    if (location.location === 'thread') {
-      removeThreadMessage(standard.id);
-    } else if (location.location === 'worker') {
-      removeAgentMessage(location.worker, standard.id);
-    } else if (location.location === 'both') {
-      removeThreadMessage(standard.id);
-      removeAgentMessage(location.worker, standard.id);
-    }
-    return;
+    throw new Error(`[MessageHandler] 完成消息不可渲染: ${standard.id}`);
   }
   if (location.location === 'thread') {
     updateThreadMessage(standard.id, uiMessage);
@@ -470,24 +360,262 @@ function handleStandardComplete(message: WebviewMessage) {
     updateThreadMessage(standard.id, uiMessage);
     updateAgentMessage(location.worker, standard.id, uiMessage);
   }
+  clearMessageTarget(standard.id);
 }
 
-function handleProcessingStateChange(message: WebviewMessage) {
-  const state = (message.state as { isProcessing?: boolean }) || {};
-  if (typeof state.isProcessing === 'boolean') {
-    setIsProcessing(state.isProcessing);
+
+/**
+ * 🔧 统一消息通道：处理控制消息
+ *
+ * 控制消息通过 MessageHub.sendControl() 发送，包含 controlType 和 payload
+ */
+function handleUnifiedControlMessage(standard: StandardMessage) {
+  if (!standard.control) {
+    throw new Error('[MessageHandler] 控制消息缺少 control 字段');
+  }
+
+  const { controlType, payload } = standard.control as {
+    controlType: string;
+    payload: Record<string, unknown>;
+  };
+
+  switch (controlType) {
+    case 'phase_changed':
+      // 阶段变化：更新 currentPhase 和 isProcessing
+      handlePhaseChangedFromControl(payload);
+      break;
+
+    case 'task_accepted': {
+      const requestId = payload?.requestId as string | undefined;
+      if (requestId) {
+        clearPendingRequest(requestId);
+      }
+      break;
+    }
+
+    case 'task_rejected': {
+      const requestId = payload?.requestId as string | undefined;
+      if (requestId) {
+        clearPendingRequest(requestId);
+      }
+      const reason = payload?.reason as string | undefined;
+      if (reason) {
+        addSystemMessage(reason, 'error');
+      }
+      break;
+    }
+
+    case 'task_started':
+      // 任务开始执行
+      setIsProcessing(true);
+      break;
+
+    case 'task_completed':
+    case 'task_failed':
+      // 任务完成/失败：清理状态
+      clearProcessingState();
+      break;
+
+    case 'worker_status': {
+      // Worker 状态更新：从控制消息同步状态到 UI
+      const store = getState();
+      const worker = payload?.worker as string | undefined;
+      const available = payload?.available as boolean | undefined;
+      if (worker && typeof available === 'boolean') {
+        store.modelStatus = {
+          ...store.modelStatus,
+          [worker]: available ? 'connected' : 'unavailable',
+        };
+      }
+      break;
+    }
+
+    default:
+      throw new Error(`[MessageHandler] 未知控制消息类型: ${controlType}`);
   }
 }
 
-function handlePhaseChanged(message: WebviewMessage) {
+/**
+ * 从 control:message 的 payload 中提取阶段信息并处理
+ */
+function handlePhaseChangedFromControl(payload: Record<string, unknown>) {
   const store = getState();
-  if (typeof message.phase === 'string') {
-    store.currentPhase = mapPhaseToStep(message.phase);
-  } else if (Number.isFinite(message.phase as number)) {
-    store.currentPhase = message.phase as number;
+  const phase = payload.phase as string | undefined;
+  const isRunning = payload.isRunning as boolean | undefined;
+
+  if (typeof phase === 'string') {
+    store.currentPhase = mapPhaseToStep(phase);
   }
-  if (typeof message.isRunning === 'boolean') {
-    setIsProcessing(message.isRunning);
+
+  if (typeof isRunning === 'boolean') {
+    if (isRunning) {
+      setIsProcessing(true);
+    } else {
+      clearProcessingState();
+    }
+  }
+}
+
+function handleUnifiedNotify(standard: StandardMessage) {
+  const level = standard.notify?.level || 'info';
+  const content = extractTextFromStandardBlocks(standard.blocks);
+  if (!content) {
+    throw new Error('[MessageHandler] 通知消息缺少内容');
+  }
+  addToast(level, content);
+}
+
+function handleUnifiedData(standard: StandardMessage) {
+  const data = standard.data;
+  if (!data) {
+    throw new Error('[MessageHandler] 数据消息缺少 data 字段');
+  }
+  const { dataType, payload } = data;
+  const asMessage = (extra: Record<string, unknown>) => ({ ...extra } as WebviewMessage);
+
+  switch (dataType) {
+    case 'stateUpdate':
+      handleStateUpdate(asMessage({ state: payload.state }));
+      break;
+
+    case 'processingStateChanged': {
+      const isProcessing = payload.isProcessing as boolean | undefined;
+      if (typeof isProcessing === 'boolean') {
+        setIsProcessing(isProcessing);
+      }
+      const source = payload.source as string | undefined;
+      const agent = payload.agent as string | undefined;
+      if (source) {
+        setProcessingActor(source, agent);
+      }
+      break;
+    }
+
+    case 'sessionsUpdated':
+      handleSessionsUpdated(asMessage({ sessions: payload.sessions }));
+      break;
+
+    case 'sessionCreated':
+    case 'sessionLoaded':
+    case 'sessionSwitched':
+      handleSessionChanged(asMessage({
+        sessionId: payload.sessionId,
+        session: payload.session
+      }));
+      break;
+
+    case 'sessionMessagesLoaded':
+      handleSessionMessagesLoaded(asMessage({
+        sessionId: payload.sessionId,
+        messages: payload.messages,
+        workerMessages: payload.workerMessages
+      }));
+      break;
+
+    case 'confirmationRequest':
+      handleConfirmationRequest(asMessage(payload));
+      break;
+
+    case 'recoveryRequest':
+      handleRecoveryRequest(asMessage(payload));
+      break;
+
+    case 'questionRequest':
+      handleQuestionRequest(asMessage(payload));
+      break;
+
+    case 'clarificationRequest':
+      handleClarificationRequest(asMessage(payload));
+      break;
+
+    case 'workerQuestionRequest':
+      handleWorkerQuestionRequest(asMessage(payload));
+      break;
+
+    case 'toolAuthorizationRequest':
+      handleToolAuthorizationRequest(asMessage(payload));
+      break;
+
+    case 'missionPlanned':
+      handleMissionPlanned(asMessage(payload));
+      break;
+
+    case 'assignmentPlanned':
+      handleAssignmentPlanned(asMessage(payload));
+      break;
+
+    case 'assignmentStarted':
+      handleAssignmentStarted(asMessage(payload));
+      break;
+
+    case 'assignmentCompleted':
+      handleAssignmentCompleted(asMessage(payload));
+      break;
+
+    case 'todoStarted':
+      handleTodoStarted(asMessage(payload));
+      break;
+
+    case 'todoCompleted':
+      handleTodoCompleted(asMessage(payload));
+      break;
+
+    case 'todoFailed':
+      handleTodoFailed(asMessage(payload));
+      break;
+
+    case 'dynamicTodoAdded':
+      handleDynamicTodoAdded(asMessage(payload));
+      break;
+
+    case 'todoApprovalRequested':
+      handleTodoApprovalRequested(asMessage(payload));
+      break;
+
+    case 'workerSessionCreated':
+      handleWorkerSessionCreated(asMessage(payload));
+      break;
+
+    case 'workerSessionResumed':
+      handleWorkerSessionResumed(asMessage(payload));
+      break;
+
+    case 'workerStatusUpdate':
+      handleWorkerStatusUpdate(asMessage(payload));
+      break;
+
+    case 'workerError': {
+      const worker = payload.worker as string | undefined;
+      const error = payload.error as string | undefined;
+      if (worker || error) {
+        addSystemMessage(`${worker || 'Worker'}: ${error || '发生错误'}`, 'error');
+      }
+      break;
+    }
+
+    case 'interactionModeChanged':
+      getState().interactionMode = (payload.mode as string) === 'ask' ? 'ask' : 'auto';
+      break;
+
+    case 'missionExecutionFailed':
+      addSystemMessage((payload.error as string) || '任务执行失败', 'error');
+      clearProcessingState();
+      break;
+
+    case 'missionFailed':
+      addSystemMessage((payload.error as string) || '任务失败', 'error');
+      clearProcessingState();
+      break;
+
+    case 'taskInterrupted': {
+      const msg = (payload.message as string) || '任务已打断';
+      addSystemMessage(msg, 'info');
+      clearProcessingState();
+      break;
+    }
+
+    default:
+      break;
   }
 }
 
@@ -520,48 +648,6 @@ function handleSessionChanged(message: WebviewMessage) {
   }
 }
 
-function handleSessionSummaryLoaded(message: WebviewMessage) {
-  // 切换会话时，后端发送会话摘要而非完整历史
-  // 清空当前消息并显示会话摘要
-  const sessionId = message.sessionId as string;
-  const summary = message.summary as any;
-
-  if (sessionId) {
-    clearAllMessages();
-    clearMessageTargets();
-    setCurrentSessionId(sessionId);
-
-    // 如果有会话摘要，创建一个系统消息显示摘要
-    if (summary) {
-      const summaryContent = [
-        `**会话恢复: ${summary.title || '未命名会话'}**`,
-        '',
-        summary.objective ? `**目标:** ${summary.objective}` : '',
-        summary.completedTasks?.length ? `**已完成任务:** ${summary.completedTasks.length} 个` : '',
-        summary.inProgressTasks?.length ? `**进行中任务:** ${summary.inProgressTasks.length} 个` : '',
-        summary.codeChanges?.length ? `**代码变更:** ${summary.codeChanges.length} 个文件` : '',
-        summary.pendingIssues?.length ? `**待解决问题:** ${summary.pendingIssues.length} 个` : '',
-        '',
-        `_消息历史: ${summary.messageCount || 0} 条 | 最后更新: ${summary.lastUpdated ? new Date(summary.lastUpdated).toLocaleString() : '未知'}_`,
-      ].filter(Boolean).join('\n');
-
-      addThreadMessage({
-        id: generateId(),
-        role: 'system',
-        content: summaryContent,
-        source: 'system',
-        timestamp: Date.now(),
-        isStreaming: false,
-        isComplete: true,
-        blocks: [{
-          type: 'text',
-          content: summaryContent,
-        }],
-      });
-    }
-  }
-}
-
 function handleSessionMessagesLoaded(message: WebviewMessage) {
   // 切换会话时，后端发送完整的消息历史（包括主对话和 worker 消息）
   const sessionId = message.sessionId as string;
@@ -575,19 +661,39 @@ function handleSessionMessagesLoaded(message: WebviewMessage) {
     setCurrentSessionId(sessionId);
 
     // 格式化消息的辅助函数
-    const formatMessage = (m: any): Message => ({
-      id: m.id || generateId(),
-      role: m.role || 'assistant',
-      content: m.content || '',
-      source: m.source || 'orchestrator',
-      timestamp: m.timestamp || Date.now(),
-      isStreaming: false,
-      isComplete: true,
-      blocks: m.blocks || [{
-        type: 'text' as const,
-        content: m.content || '',
-      }],
-    });
+    const formatMessage = (m: any): Message => {
+      const id = typeof m?.id === 'string' && m.id.trim() ? m.id.trim() : '';
+      if (!id) {
+        throw new Error('[MessageHandler] SessionMessagesLoaded 消息缺少 id');
+      }
+      const role = m?.role;
+      if (role !== 'user' && role !== 'assistant' && role !== 'system') {
+        throw new Error('[MessageHandler] SessionMessagesLoaded 消息 role 无效');
+      }
+      if (typeof m?.content !== 'string') {
+        throw new Error('[MessageHandler] SessionMessagesLoaded 消息 content 非字符串');
+      }
+      if (typeof m?.timestamp !== 'number') {
+        throw new Error('[MessageHandler] SessionMessagesLoaded 消息 timestamp 无效');
+      }
+      return {
+        id,
+        role,
+        content: m.content,
+        source: m.source || 'orchestrator',
+        timestamp: m.timestamp,
+        isStreaming: false,
+        isComplete: true,
+        blocks: mapStandardBlocks(
+          (Array.isArray(m.blocks) && m.blocks.length > 0)
+            ? m.blocks
+            : [{
+                type: 'text' as const,
+                content: m.content || '',
+              }]
+        ),
+      };
+    };
 
     // 加载主对话消息
     if (messages && messages.length > 0) {
@@ -604,18 +710,6 @@ function handleSessionMessagesLoaded(message: WebviewMessage) {
       });
     }
   }
-}
-
-function handleToast(message: WebviewMessage) {
-  const store = getState();
-  const toast = {
-    id: `toast_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-    type: (message.toastType as string) || 'info',
-    title: message.title as string | undefined,
-    message: (message.message as string) || '',
-  };
-  const currentToasts = ensureArray(store.toasts) as typeof toast[];
-  store.toasts = [...currentToasts, toast];
 }
 
 function handleConfirmationRequest(message: WebviewMessage) {
@@ -718,47 +812,95 @@ function handleToolAuthorizationRequest(message: WebviewMessage) {
 }
 
 function handleMissionPlanned(message: WebviewMessage) {
-  const missionId = (message.missionId as string) || '';
+  const missionId = typeof message.missionId === 'string' && message.missionId.trim() ? message.missionId.trim() : '';
+  if (!missionId) {
+    throw new Error('[MessageHandler] MissionPlanned 缺少 missionId');
+  }
   const assignments = ensureArray(message.assignments) as any[];
-  const mappedAssignments: AssignmentPlan[] = assignments.map((assignment) => ({
-    id: assignment.id,
-    workerId: assignment.workerId,
-    responsibility: assignment.responsibility,
-    status: assignment.status,
-    progress: assignment.progress,
-    todos: ensureArray(assignment.todos).map((todo: any) => ({
-      id: todo.id,
-      assignmentId: assignment.id,
-      content: todo.content || '',
-      reasoning: todo.reasoning,
-      expectedOutput: todo.expectedOutput,
-      type: todo.type || 'implementation',
-      priority: typeof todo.priority === 'number' ? todo.priority : 3,
-      status: todo.status || 'pending',
-      outOfScope: Boolean(todo.outOfScope),
-      approvalStatus: todo.approvalStatus,
-      approvalNote: todo.approvalNote,
-    })),
-  }));
+  const assignmentSeen = new Set<string>();
+  const mappedAssignments: AssignmentPlan[] = assignments
+    .filter((assignment) => assignment && typeof assignment === 'object')
+    .map((assignment) => {
+      const assignmentId = typeof assignment.id === 'string' && assignment.id.trim() ? assignment.id.trim() : '';
+      if (!assignmentId) {
+        throw new Error('[MessageHandler] MissionPlanned assignment 缺少 id');
+      }
+      if (assignmentSeen.has(assignmentId)) {
+        throw new Error(`[MessageHandler] MissionPlanned assignment id 重复: ${assignmentId}`);
+      }
+      assignmentSeen.add(assignmentId);
+      const todoSeen = new Set<string>();
+      const todos = ensureArray(assignment.todos)
+        .filter((todo: any) => !!todo && typeof todo === 'object')
+        .map((todo: any) => {
+          const todoId = typeof todo.id === 'string' && todo.id.trim() ? todo.id.trim() : '';
+          if (!todoId) {
+            throw new Error('[MessageHandler] MissionPlanned todo 缺少 id');
+          }
+          if (todoSeen.has(todoId)) {
+            throw new Error(`[MessageHandler] MissionPlanned todo id 重复: ${todoId}`);
+          }
+          todoSeen.add(todoId);
+          return {
+            id: todoId,
+            assignmentId,
+            content: todo.content || '',
+            reasoning: todo.reasoning,
+            expectedOutput: todo.expectedOutput,
+            type: todo.type || 'implementation',
+            priority: typeof todo.priority === 'number' ? todo.priority : 3,
+            status: todo.status || 'pending',
+            outOfScope: Boolean(todo.outOfScope),
+            approvalStatus: todo.approvalStatus,
+            approvalNote: todo.approvalNote,
+          } as AssignmentTodo;
+        });
+      return {
+        id: assignmentId,
+        workerId: assignment.workerId,
+        responsibility: assignment.responsibility,
+        status: assignment.status,
+        progress: assignment.progress,
+        todos,
+      };
+    });
   const plan: MissionPlan = { missionId, assignments: mappedAssignments };
   setMissionPlan(plan);
 }
 
 function handleAssignmentPlanned(message: WebviewMessage) {
-  const assignmentId = message.assignmentId as string;
-  const todos = ensureArray(message.todos).map((todo: any) => ({
-    id: todo.id,
-    assignmentId,
-    content: todo.content || '',
-    reasoning: todo.reasoning,
-    expectedOutput: todo.expectedOutput,
-    type: todo.type || 'implementation',
-    priority: typeof todo.priority === 'number' ? todo.priority : 3,
-    status: todo.status || 'pending',
-    outOfScope: Boolean(todo.outOfScope),
-    approvalStatus: todo.approvalStatus,
-    approvalNote: todo.approvalNote,
-  }));
+  const assignmentId = typeof message.assignmentId === 'string' && message.assignmentId.trim()
+    ? message.assignmentId.trim()
+    : '';
+  if (!assignmentId) {
+    throw new Error('[MessageHandler] AssignmentPlanned 缺少 assignmentId');
+  }
+  const todoSeen = new Set<string>();
+  const todos = ensureArray(message.todos)
+    .filter((todo: any) => !!todo && typeof todo === 'object')
+    .map((todo: any) => {
+      const todoId = typeof todo.id === 'string' && todo.id.trim() ? todo.id.trim() : '';
+      if (!todoId) {
+        throw new Error('[MessageHandler] AssignmentPlanned todo 缺少 id');
+      }
+      if (todoSeen.has(todoId)) {
+        throw new Error(`[MessageHandler] AssignmentPlanned todo id 重复: ${todoId}`);
+      }
+      todoSeen.add(todoId);
+      return {
+        id: todoId,
+        assignmentId,
+        content: todo.content || '',
+        reasoning: todo.reasoning,
+        expectedOutput: todo.expectedOutput,
+        type: todo.type || 'implementation',
+        priority: typeof todo.priority === 'number' ? todo.priority : 3,
+        status: todo.status || 'pending',
+        outOfScope: Boolean(todo.outOfScope),
+        approvalStatus: todo.approvalStatus,
+        approvalNote: todo.approvalNote,
+      };
+    });
 
   updateAssignmentPlan(assignmentId, (assignment) => ({
     ...assignment,
@@ -768,6 +910,9 @@ function handleAssignmentPlanned(message: WebviewMessage) {
 
 function handleAssignmentStarted(message: WebviewMessage) {
   const assignmentId = message.assignmentId as string;
+  if (!assignmentId || !assignmentId.trim()) {
+    throw new Error('[MessageHandler] AssignmentStarted 缺少 assignmentId');
+  }
   updateAssignmentPlan(assignmentId, (assignment) => ({
     ...assignment,
     status: 'running',
@@ -776,6 +921,9 @@ function handleAssignmentStarted(message: WebviewMessage) {
 
 function handleAssignmentCompleted(message: WebviewMessage) {
   const assignmentId = message.assignmentId as string;
+  if (!assignmentId || !assignmentId.trim()) {
+    throw new Error('[MessageHandler] AssignmentCompleted 缺少 assignmentId');
+  }
   const success = Boolean(message.success);
   updateAssignmentPlan(assignmentId, (assignment) => ({
     ...assignment,
@@ -787,6 +935,12 @@ function handleAssignmentCompleted(message: WebviewMessage) {
 function handleTodoStarted(message: WebviewMessage) {
   const assignmentId = message.assignmentId as string;
   const todoId = message.todoId as string;
+  if (!assignmentId || !assignmentId.trim()) {
+    throw new Error('[MessageHandler] TodoStarted 缺少 assignmentId');
+  }
+  if (!todoId || !todoId.trim()) {
+    throw new Error('[MessageHandler] TodoStarted 缺少 todoId');
+  }
   updateTodo(assignmentId, todoId, (todo) => ({
     ...todo,
     status: 'in_progress',
@@ -796,6 +950,12 @@ function handleTodoStarted(message: WebviewMessage) {
 function handleTodoCompleted(message: WebviewMessage) {
   const assignmentId = message.assignmentId as string;
   const todoId = message.todoId as string;
+  if (!assignmentId || !assignmentId.trim()) {
+    throw new Error('[MessageHandler] TodoCompleted 缺少 assignmentId');
+  }
+  if (!todoId || !todoId.trim()) {
+    throw new Error('[MessageHandler] TodoCompleted 缺少 todoId');
+  }
   updateTodo(assignmentId, todoId, (todo) => ({
     ...todo,
     status: 'completed',
@@ -805,6 +965,12 @@ function handleTodoCompleted(message: WebviewMessage) {
 function handleTodoFailed(message: WebviewMessage) {
   const assignmentId = message.assignmentId as string;
   const todoId = message.todoId as string;
+  if (!assignmentId || !assignmentId.trim()) {
+    throw new Error('[MessageHandler] TodoFailed 缺少 assignmentId');
+  }
+  if (!todoId || !todoId.trim()) {
+    throw new Error('[MessageHandler] TodoFailed 缺少 todoId');
+  }
   updateTodo(assignmentId, todoId, (todo) => ({
     ...todo,
     status: 'failed',
@@ -813,9 +979,19 @@ function handleTodoFailed(message: WebviewMessage) {
 
 function handleDynamicTodoAdded(message: WebviewMessage) {
   const assignmentId = message.assignmentId as string;
+  if (!assignmentId || !assignmentId.trim()) {
+    throw new Error('[MessageHandler] DynamicTodoAdded 缺少 assignmentId');
+  }
   const todo = message.todo as any;
+  if (!todo || typeof todo !== 'object') {
+    throw new Error('[MessageHandler] DynamicTodoAdded 缺少 todo');
+  }
+  const todoId = typeof todo.id === 'string' && todo.id.trim() ? todo.id.trim() : '';
+  if (!todoId) {
+    throw new Error('[MessageHandler] DynamicTodoAdded todo 缺少 id');
+  }
   const newTodo: AssignmentTodo = {
-    id: todo?.id || `todo_${Date.now()}`,
+    id: todoId,
     assignmentId,
     content: todo?.content || '',
     reasoning: todo?.reasoning,
@@ -837,6 +1013,15 @@ function handleTodoApprovalRequested(message: WebviewMessage) {
   const assignmentId = message.assignmentId as string;
   const todoId = message.todoId as string;
   const reason = message.reason as string;
+  if (!assignmentId || !assignmentId.trim()) {
+    throw new Error('[MessageHandler] TodoApprovalRequested 缺少 assignmentId');
+  }
+  if (!todoId || !todoId.trim()) {
+    throw new Error('[MessageHandler] TodoApprovalRequested 缺少 todoId');
+  }
+  if (!reason || !reason.trim()) {
+    throw new Error('[MessageHandler] TodoApprovalRequested 缺少 reason');
+  }
   updateTodo(assignmentId, todoId, (todo) => ({
     ...todo,
     approvalStatus: 'pending',
@@ -846,8 +1031,7 @@ function handleTodoApprovalRequested(message: WebviewMessage) {
 
 function mapStandardMessage(standard: StandardMessage): Message {
   const blocks = mapStandardBlocks(standard.blocks || []);
-  const fallbackContent = standard.interaction?.prompt || '';
-  const content = blocksToContent(blocks) || fallbackContent;
+  const content = blocksToContent(blocks);
   const isStreaming = standard.lifecycle === 'streaming' || standard.lifecycle === 'started';
   const isComplete = standard.lifecycle === 'completed';
   const isSystemNotice = standard.type === MessageType.SYSTEM || standard.type === MessageType.ERROR;
@@ -867,9 +1051,6 @@ function mapStandardMessage(standard: StandardMessage): Message {
       : (resolvedWorker ?? 'orchestrator');
 
   const baseMetadata = { ...(standard.metadata || {}) } as Record<string, unknown>;
-  if (originSource !== 'worker' && baseMetadata.subTaskCard) {
-    delete baseMetadata.subTaskCard;
-  }
 
   const dispatchToWorker = Boolean(baseMetadata.dispatchToWorker);
 
@@ -951,7 +1132,12 @@ function updateTodo(
 }
 
 function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[] {
-  return ensureArray<StandardContentBlock>(blocks).map((block) => {
+  const list = ensureArray<StandardContentBlock>(blocks);
+  const invalid = list.filter((block) => !block || typeof block !== 'object' || !('type' in block));
+  if (invalid.length > 0) {
+    throw new Error('[MessageHandler] 标准消息块无效');
+  }
+  return list.map((block) => {
     switch (block.type) {
       case 'code':
         return {
@@ -1064,8 +1250,10 @@ function applyStreamUpdate(message: Message, update: StreamUpdate): Partial<Mess
 }
 
 function mergeBlocks(existing: ContentBlock[], incoming: ContentBlock[]): ContentBlock[] {
-  const next = [...existing];
-  for (const block of incoming) {
+  const safeExisting = ensureArray(existing).filter((block): block is ContentBlock => !!block && typeof block === 'object' && 'type' in block);
+  const safeIncoming = ensureArray(incoming).filter((block): block is ContentBlock => !!block && typeof block === 'object' && 'type' in block);
+  const next = [...safeExisting];
+  for (const block of safeIncoming) {
     if (block.type === 'tool_call' && block.toolCall?.id) {
       const idx = next.findIndex((b) => b.type === 'tool_call' && b.toolCall?.id === block.toolCall?.id);
       if (idx >= 0) {
@@ -1199,59 +1387,6 @@ function handleWorkerStatusUpdate(message: WebviewMessage) {
 
   // 更新全局 modelStatus
   store.modelStatus = { ...store.modelStatus, ...statusMap };
-}
-
-// ============ Wave 执行事件处理（提案 4.6） ============
-
-function handleWaveExecutionStarted(message: WebviewMessage) {
-  const totalWaves = (message.totalWaves as number) || 0;
-  const waves = (message.waves as string[][]) || [];
-  const criticalPath = (message.criticalPath as string[]) || [];
-
-  const state: WaveState = {
-    currentWave: 0,
-    totalWaves,
-    waves,
-    criticalPath,
-    status: 'executing',
-  };
-
-  setWaveState(state);
-
-  // 添加系统通知
-  addSystemMessage(`开始 Wave 执行: ${totalWaves} 个 Wave`, 'info');
-}
-
-function handleWaveStarted(message: WebviewMessage) {
-  const waveIndex = (message.waveIndex as number) || 0;
-  const totalWaves = (message.totalWaves as number) || 0;
-
-  updateWaveProgress(waveIndex, 'executing');
-
-  // 添加系统通知
-  addSystemMessage(`Wave ${waveIndex + 1}/${totalWaves} 开始执行`, 'info');
-}
-
-function handleWaveCompleted(message: WebviewMessage) {
-  const waveIndex = (message.waveIndex as number) || 0;
-  const totalWaves = (message.totalWaves as number) || 0;
-  const completedCount = (message.completedCount as number) || 0;
-  const failedCount = (message.failedCount as number) || 0;
-
-  // 检查是否所有 Wave 都完成
-  const isLastWave = waveIndex >= totalWaves - 1;
-
-  if (isLastWave) {
-    updateWaveProgress(waveIndex, 'completed');
-  } else {
-    updateWaveProgress(waveIndex + 1, 'executing');
-  }
-
-  // 添加系统通知
-  const statusText = failedCount > 0
-    ? `成功 ${completedCount}, 失败 ${failedCount}`
-    : `成功 ${completedCount}`;
-  addSystemMessage(`Wave ${waveIndex + 1}/${totalWaves} 完成: ${statusText}`, failedCount > 0 ? 'warning' : 'success');
 }
 
 // ============ Worker Session 事件处理（提案 4.1） ============

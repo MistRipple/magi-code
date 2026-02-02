@@ -11,6 +11,7 @@ import {
   StreamUpdate,
   MessageLifecycle,
   MessageType,
+  MessageCategory,
   ContentBlock,
   TextBlock,
 } from '../protocol';
@@ -64,6 +65,11 @@ export function normalizeOrchestratorMessage(
     blocks.push(...planBlocks);
   }
 
+  // 🔧 清理非法块，避免下游 keyed each 崩溃
+  const safeBlocks = blocks.filter(
+    (block) => !!block && typeof block === 'object' && typeof (block as ContentBlock).type === 'string'
+  );
+
   // 确定消息类型
   let messageType: MessageType = MessageType.TEXT;
   if (uiMessage.type === 'error') {
@@ -87,13 +93,14 @@ export function normalizeOrchestratorMessage(
   return {
     id: messageId,
     traceId: traceId || `trace-${uuidv4().substring(0, 8)}`,
+    category: MessageCategory.CONTENT,  // 🔧 统一消息通道：编排器输出为 CONTENT 类别
     type: messageType,
     agent: 'orchestrator',
     source: 'orchestrator',
     lifecycle,
     timestamp: uiMessage.timestamp || Date.now(),
     updatedAt: Date.now(),
-    blocks,
+    blocks: safeBlocks,
     metadata: {
       taskId: uiMessage.taskId,
       phase: uiMessage.metadata?.phase,

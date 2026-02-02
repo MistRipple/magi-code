@@ -24,7 +24,7 @@ import { SnapshotManager } from '../../snapshot-manager';
 import { UnifiedSessionManager } from '../../session';
 import { UnifiedTaskManager } from '../../task/unified-task-manager';
 import { SessionManagerTaskRepository } from '../../task/session-manager-task-repository';
-import { UnifiedMessageBus } from '../../normalizer/unified-message-bus';
+import { MessageHub } from '../../orchestrator/core/message-hub';
 
 async function runTest(): Promise<void> {
   console.log('=== setTaskManager 数据流验证测试 ===\n');
@@ -37,15 +37,9 @@ async function runTest(): Promise<void> {
   const snapshotManager = new SnapshotManager(sessionManager, workspaceRoot);
   const adapterFactory = new LLMAdapterFactory({ cwd: workspaceRoot });
 
-  // 设置 MessageBus
-  const messageBus = new UnifiedMessageBus({
-    enabled: true,
-    minStreamInterval: 50,
-    batchInterval: 100,
-    retentionTime: 60000,
-    debug: false,
-  });
-  adapterFactory.setMessageBus(messageBus);
+  // 设置 MessageHub
+  const messageHub = new MessageHub();
+  adapterFactory.setMessageHub(messageHub);
 
   await adapterFactory.initialize();
 
@@ -113,4 +107,3 @@ runTest()
     console.error('❌ 测试失败:', err);
     process.exit(1);
   });
-

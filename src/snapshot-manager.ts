@@ -204,11 +204,16 @@ export class SnapshotManager {
       return this.fileContentCache.get(filePath)!;
     }
 
+    return this.readFileFresh(filePath);
+  }
+
+  /** 读取文件内容（强制从磁盘读取，并更新缓存） */
+  private readFileFresh(filePath: string): string {
     let content = '';
     if (fs.existsSync(filePath)) {
       content = fs.readFileSync(filePath, 'utf-8');
-      this.addToCache(this.fileContentCache, filePath, content);
     }
+    this.addToCache(this.fileContentCache, filePath, content);
     return content;
   }
 
@@ -530,7 +535,7 @@ export class SnapshotManager {
     }
 
     // 读取原始文件内容（使用缓存）
-    const originalContent = this.readFileWithCache(absolutePath);
+    const originalContent = this.readFileFresh(absolutePath);
 
     const snapshotId = generateId();
     const snapshotMeta: FileSnapshotMeta = {
@@ -640,7 +645,7 @@ export class SnapshotManager {
 
     for (const snapshot of session.snapshots) {
       const absolutePath = path.join(this.workspaceRoot, snapshot.filePath);
-      const currentContent = this.readFileWithCache(absolutePath);
+      const currentContent = this.readFileFresh(absolutePath);
 
       // 读取原始内容（使用缓存）
       const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);
@@ -710,7 +715,7 @@ export class SnapshotManager {
         continue;
       }
       const absolutePath = path.join(this.workspaceRoot, snapshot.filePath);
-      const currentContent = this.readFileWithCache(absolutePath);
+      const currentContent = this.readFileFresh(absolutePath);
 
       // 读取原始内容（使用缓存）
       const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);
@@ -778,7 +783,7 @@ export class SnapshotManager {
     }
 
     // 读取当前文件内容 (确认后的状态，使用缓存)
-    const currentContent = this.readFileWithCache(absolutePath);
+    const currentContent = this.readFileFresh(absolutePath);
 
     // 创建新快照 ID
     const newSnapshotId = generateId();

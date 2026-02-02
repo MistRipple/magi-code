@@ -340,11 +340,32 @@ export class ProfileLoader {
     base: CategoriesConfig,
     override: Partial<CategoriesConfig>
   ): CategoriesConfig {
+    const normalizeCategoryName = (name: string) => (name === 'docs' ? 'document' : name);
+    const normalizedOverride: Partial<CategoriesConfig> = { ...override };
+    if (override.categories) {
+      const remapped: Record<string, CategoryConfig> = {};
+      for (const [name, config] of Object.entries(override.categories)) {
+        remapped[normalizeCategoryName(name)] = config;
+      }
+      normalizedOverride.categories = remapped;
+    }
+    if (override.rules) {
+      normalizedOverride.rules = {
+        ...override.rules,
+        categoryPriority: override.rules.categoryPriority
+          ? override.rules.categoryPriority.map(normalizeCategoryName)
+          : override.rules.categoryPriority,
+        defaultCategory: override.rules.defaultCategory
+          ? normalizeCategoryName(override.rules.defaultCategory)
+          : override.rules.defaultCategory,
+      };
+    }
+
     // 深度合并 categories
     const mergedCategories: Record<string, CategoryConfig> = { ...base.categories };
 
-    if (override.categories) {
-      for (const [name, userConfig] of Object.entries(override.categories)) {
+    if (normalizedOverride.categories) {
+      for (const [name, userConfig] of Object.entries(normalizedOverride.categories)) {
         const baseConfig = base.categories[name];
         if (baseConfig) {
           // 深度合并单个分类配置
@@ -367,14 +388,14 @@ export class ProfileLoader {
     }
 
     return {
-      version: override.version ?? base.version,
+      version: normalizedOverride.version ?? base.version,
       categories: mergedCategories,
       rules: {
-        categoryPriority: override.rules?.categoryPriority ?? base.rules.categoryPriority,
-        defaultCategory: override.rules?.defaultCategory ?? base.rules.defaultCategory,
+        categoryPriority: normalizedOverride.rules?.categoryPriority ?? base.rules.categoryPriority,
+        defaultCategory: normalizedOverride.rules?.defaultCategory ?? base.rules.defaultCategory,
         riskMapping: {
           ...base.rules.riskMapping,
-          ...override.rules?.riskMapping,
+          ...normalizedOverride.rules?.riskMapping,
         },
       },
     };

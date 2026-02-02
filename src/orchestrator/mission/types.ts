@@ -359,8 +359,14 @@ export interface Assignment {
   assignmentReason: AssignmentReason;
 
   // ===== 职责定义 =====
-  /** 职责描述 */
+  /** 职责描述（结构化，用于日志和内部逻辑） */
   responsibility: string;
+  /**
+   * AI 生成的委托说明（自然语言）
+   * 由 Orchestrator 在理解用户意图后生成，用于向 Worker 传达任务背景和期望
+   * 比 responsibility 更丰富，包含上下文理解、重点关注点、期望产出等
+   */
+  delegationBriefing?: string;
   /** 职责范围 */
   scope: AssignmentScope;
   /** 引导 Prompt（从画像生成） */
@@ -401,6 +407,8 @@ export interface AssignmentScope {
   excludes: string[];
   /** 目标文件/目录 */
   targetPaths?: string[];
+  /** 是否需要对目标文件产生实际修改 */
+  requiresModification?: boolean;
 }
 
 /**

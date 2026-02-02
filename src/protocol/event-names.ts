@@ -58,19 +58,21 @@ export const ADAPTER_EVENTS = {
 
 /**
  * Webview 消息类型（用于 postMessage）
+ *
+ * 🔧 统一消息通道（unified-message-channel-design.md v2.5）：
+ * - 新增 UNIFIED_* 系列，替代 STANDARD_* 系列
+ * - 前端仅接受 UNIFIED_* 系列，拒绝旧类型
  */
 export const WEBVIEW_MESSAGE_TYPES = {
-  /** 标准消息 */
-  STANDARD_MESSAGE: 'standardMessage',
+  // ========== 统一消息通道（UNIFIED_*）==========
+  /** 统一消息 */
+  UNIFIED_MESSAGE: 'unifiedMessage',
 
-  /** 标准更新 */
-  STANDARD_UPDATE: 'standardUpdate',
+  /** 统一更新 */
+  UNIFIED_UPDATE: 'unifiedUpdate',
 
-  /** 标准完成 */
-  STANDARD_COMPLETE: 'standardComplete',
-
-  /** 处理状态变化 */
-  PROCESSING_STATE_CHANGED: 'processingStateChanged',
+  /** 统一完成 */
+  UNIFIED_COMPLETE: 'unifiedComplete',
 } as const;
 
 // 类型导出
@@ -78,4 +80,3 @@ export type MessageEventName = typeof MESSAGE_EVENTS[keyof typeof MESSAGE_EVENTS
 export type ProcessingEventName = typeof PROCESSING_EVENTS[keyof typeof PROCESSING_EVENTS];
 export type AdapterEventName = typeof ADAPTER_EVENTS[keyof typeof ADAPTER_EVENTS];
 export type WebviewMessageType = typeof WEBVIEW_MESSAGE_TYPES[keyof typeof WEBVIEW_MESSAGE_TYPES];
-

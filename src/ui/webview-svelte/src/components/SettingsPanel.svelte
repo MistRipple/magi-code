@@ -1,5 +1,7 @@
 <script lang="ts">
   import { vscode } from '../lib/vscode-bridge';
+  import type { StandardMessage } from '../../../../protocol/message-protocol';
+  import { MessageCategory } from '../../../../protocol/message-protocol';
   import { ensureArray } from '../lib/utils';
   import Icon from './Icon.svelte';
   import Toggle from './Toggle.svelte';
@@ -572,6 +574,7 @@
       }
 
       const serverData = {
+        id: name,
         name,
         command,
         args,
@@ -787,32 +790,31 @@
 
   // 监听来自扩展的状态更新
   $effect(() => {
-    const handler = (event: MessageEvent) => {
-      const message = event.data;
+    const unsubscribe = vscode.onMessage((msg) => {
+      if (msg.type !== 'unifiedMessage') return;
+      const standard = msg.message as StandardMessage;
+      if (!standard || standard.category !== MessageCategory.DATA || !standard.data) return;
+      const { dataType, payload } = standard.data as { dataType: string; payload: any };
 
       // Worker 状态更新 (模型连接状态)
-      if (message.type === 'workerStatusUpdate') {
-        if (message.statuses) {
-          modelStatuses = { ...modelStatuses, ...message.statuses };
+      if (dataType === 'workerStatusUpdate') {
+        if (payload?.statuses) {
+          modelStatuses = { ...modelStatuses, ...payload.statuses };
         }
         isRefreshing = false;
       }
       // 执行统计更新
-      else if (message.type === 'executionStatsUpdate') {
-        if (message.stats) {
-          executionStats = message.stats;
+      else if (dataType === 'executionStatsUpdate') {
+        if (payload?.stats) {
+          executionStats = payload.stats;
         }
-        if (message.orchestratorStats) {
-          totalTokens = (message.orchestratorStats.totalInputTokens || 0) + (message.orchestratorStats.totalOutputTokens || 0);
+        if (payload?.orchestratorStats) {
+          totalTokens = (payload.orchestratorStats.totalInputTokens || 0) + (payload.orchestratorStats.totalOutputTokens || 0);
         }
-      }
-      // 用户信息
-      else if (message.type === 'userInfo') {
-        userInfo = message.data;
       }
       // 画像配置加载
-      else if (message.type === 'profileConfig') {
-        const config = message.config;
+      else if (dataType === 'profileConfig') {
+        const config = payload?.config;
         if (config?.workers) {
           // 存储所有 workers 的配置
           for (const [worker, profile] of Object.entries(config.workers) as [string, any][]) {
@@ -835,8 +837,8 @@
         }
       }
       // 画像保存结果
-      else if (message.type === 'profileConfigSaved') {
-        if (message.success) {
+      else if (dataType === 'profileConfigSaved') {
+        if (payload?.success) {
           profileSaveStatus = 'saved';
         } else {
           profileSaveStatus = 'error';
@@ -844,8 +846,8 @@
         resetProfileStatus('save');
       }
       // 画像重置结果
-      else if (message.type === 'profileConfigReset') {
-        if (message.success) {
+      else if (dataType === 'profileConfigReset') {
+        if (payload?.success) {
           profileResetStatus = 'saved';
         } else {
           profileResetStatus = 'error';
@@ -853,10 +855,10 @@
         resetProfileStatus('reset');
       }
       // Worker 配置加载
-      else if (message.type === 'allWorkerConfigsLoaded') {
-        if (message.configs) {
+      else if (dataType === 'allWorkerConfigsLoaded') {
+        if (payload?.configs) {
           // 将后端配置格式转换为前端格式
-          const configs = message.configs;
+          const configs = payload.configs;
           for (const [worker, config] of Object.entries(configs) as [string, any][]) {
             if (config && workerConfigs[worker]) {
               workerConfigs[worker] = {
@@ -871,41 +873,41 @@
         }
       }
       // 编排者配置加载
-      else if (message.type === 'orchestratorConfigLoaded') {
-        if (message.config) {
+      else if (dataType === 'orchestratorConfigLoaded') {
+        if (payload?.config) {
           orchConfig = {
-            baseUrl: message.config.baseUrl || '',
-            apiKey: message.config.apiKey || '',
-            model: message.config.model || '',
-            provider: message.config.provider || 'anthropic'
+            baseUrl: payload.config.baseUrl || '',
+            apiKey: payload.config.apiKey || '',
+            model: payload.config.model || '',
+            provider: payload.config.provider || 'anthropic'
           };
         }
       }
       // 压缩器配置加载
-      else if (message.type === 'compressorConfigLoaded') {
-        if (message.config) {
+      else if (dataType === 'compressorConfigLoaded') {
+        if (payload?.config) {
           compConfig = {
-            baseUrl: message.config.baseUrl || '',
-            apiKey: message.config.apiKey || '',
-            model: message.config.model || '',
-            provider: message.config.provider || 'anthropic'
+            baseUrl: payload.config.baseUrl || '',
+            apiKey: payload.config.apiKey || '',
+            model: payload.config.model || '',
+            provider: payload.config.provider || 'anthropic'
           };
         }
       }
       // ACE 配置加载
-      else if (message.type === 'promptEnhanceConfigLoaded') {
-        if (message.config) {
+      else if (dataType === 'promptEnhanceConfigLoaded') {
+        if (payload?.config) {
           aceConfig = {
-            url: message.config.baseUrl || '',
-            key: message.config.apiKey || ''
+            url: payload.config.baseUrl || '',
+            key: payload.config.apiKey || ''
           };
         }
       }
       // Worker 连接测试结果 - 更新统计 Tab 状态和测试按钮状态
-      else if (message.type === 'workerConnectionTestResult') {
-        const worker = message.worker;
+      else if (dataType === 'workerConnectionTestResult') {
+        const worker = payload?.worker;
         if (worker && modelStatuses[worker]) {
-          if (message.success) {
+          if (payload?.success) {
             modelStatuses[worker] = {
               status: 'available',
               model: workerConfigs[worker]?.model || modelStatuses[worker]?.model
@@ -915,7 +917,7 @@
             modelStatuses[worker] = {
               status: 'error',
               model: workerConfigs[worker]?.model || modelStatuses[worker]?.model,
-              error: message.error
+              error: payload?.error
             };
             testStatus[worker] = 'error';
           }
@@ -925,8 +927,8 @@
         }
       }
       // 编排者连接测试结果 - 更新统计 Tab 状态和测试按钮状态
-      else if (message.type === 'orchestratorConnectionTestResult') {
-        if (message.success) {
+      else if (dataType === 'orchestratorConnectionTestResult') {
+        if (payload?.success) {
           modelStatuses.orchestrator = {
             status: 'available',
             model: orchConfig.model || modelStatuses.orchestrator?.model
@@ -936,7 +938,7 @@
           modelStatuses.orchestrator = {
             status: 'error',
             model: orchConfig.model || modelStatuses.orchestrator?.model,
-            error: message.error
+            error: payload?.error
           };
           testStatus.orch = 'error';
         }
@@ -945,19 +947,19 @@
         resetTestStatus('orch');
       }
       // 压缩器连接测试结果 - 更新统计 Tab 状态和测试按钮状态
-      else if (message.type === 'compressorConnectionTestResult') {
-        if (message.success) {
+      else if (dataType === 'compressorConnectionTestResult') {
+        if (payload?.success) {
           modelStatuses.compressor = {
             status: 'available',
             model: compConfig.model || modelStatuses.compressor?.model
           };
           testStatus.comp = 'success';
         } else {
-          const fallbackModel = message.fallbackModel || modelStatuses.orchestrator?.model;
+          const fallbackModel = payload?.fallbackModel || modelStatuses.orchestrator?.model;
           modelStatuses.compressor = {
             status: 'fallback',
             model: fallbackModel ? `编排模型: ${fallbackModel}` : modelStatuses.compressor?.model,
-            error: message.error
+            error: payload?.error
           };
           testStatus.comp = 'error';
         }
@@ -966,8 +968,8 @@
         resetTestStatus('comp');
       }
       // ACE 连接测试结果
-      else if (message.type === 'promptEnhanceResult') {
-        if (message.success) {
+      else if (dataType === 'promptEnhanceResult') {
+        if (payload?.success) {
           testStatus.ace = 'success';
         } else {
           testStatus.ace = 'error';
@@ -976,74 +978,84 @@
         resetTestStatus('ace');
       }
       // MCP 服务器列表加载
-      else if (message.type === 'mcpServersLoaded') {
-        const servers = ensureArray<any>(message.servers);
-        mcpServers = servers.map((s: any) => ({
-          id: s.id || s.name,
-          name: s.name || s.id,
-          command: s.command || '',
-          args: s.args || [],
-          env: s.env || {},
-          enabled: s.enabled !== false,
-          connected: s.connected || false,
-          error: s.error
-        }));
+      else if (dataType === 'mcpServersLoaded') {
+        const servers = ensureArray<any>(payload?.servers);
+        mcpServers = servers.map((s: any) => {
+          const id = typeof s?.id === 'string' && s.id.trim() ? s.id.trim() : '';
+          if (!id) {
+            throw new Error('[SettingsPanel] MCP server 缺少 id');
+          }
+          const name = typeof s?.name === 'string' && s.name.trim() ? s.name.trim() : '';
+          if (!name) {
+            throw new Error(`[SettingsPanel] MCP server ${id} 缺少 name`);
+          }
+          return {
+            id,
+            name,
+            command: s.command || '',
+            args: s.args || [],
+            env: s.env || {},
+            enabled: s.enabled !== false,
+            connected: s.connected || false,
+            error: s.error
+          };
+        });
       }
       // MCP 服务器添加成功
-      else if (message.type === 'mcpServerAdded') {
+      else if (dataType === 'mcpServerAdded') {
         vscode.postMessage({ type: 'loadMCPServers' });
       }
       // MCP 服务器更新成功
-      else if (message.type === 'mcpServerUpdated') {
+      else if (dataType === 'mcpServerUpdated') {
         vscode.postMessage({ type: 'loadMCPServers' });
       }
       // MCP 服务器删除成功
-      else if (message.type === 'mcpServerDeleted') {
-        mcpServers = mcpServers.filter(s => s.id !== message.serverId);
+      else if (dataType === 'mcpServerDeleted') {
+        mcpServers = mcpServers.filter(s => s.id !== payload?.serverId);
       }
       // MCP 工具列表加载（首次获取）
-      else if (message.type === 'mcpServerTools') {
-        if (message.serverId) {
-          const tools = ensureArray(message.tools);
-          mcpServerTools = { ...mcpServerTools, [message.serverId]: tools };
+      else if (dataType === 'mcpServerTools') {
+        if (payload?.serverId) {
+          const tools = ensureArray(payload.tools);
+          mcpServerTools = { ...mcpServerTools, [payload.serverId]: tools };
           // 清除刷新状态
           const newSet = new Set(mcpRefreshingServers);
-          newSet.delete(message.serverId);
+          newSet.delete(payload.serverId);
           mcpRefreshingServers = newSet;
         }
       }
       // MCP 工具列表刷新
-      else if (message.type === 'mcpToolsRefreshed') {
-        if (message.serverId) {
-          const tools = ensureArray(message.tools);
-          mcpServerTools = { ...mcpServerTools, [message.serverId]: tools };
+      else if (dataType === 'mcpToolsRefreshed') {
+        if (payload?.serverId) {
+          const tools = ensureArray(payload.tools);
+          mcpServerTools = { ...mcpServerTools, [payload.serverId]: tools };
           // 清除刷新状态
           const newSet = new Set(mcpRefreshingServers);
-          newSet.delete(message.serverId);
+          newSet.delete(payload.serverId);
           mcpRefreshingServers = newSet;
         }
       }
       // Skills 配置加载
-      else if (message.type === 'skillsConfigLoaded') {
+      else if (dataType === 'skillsConfigLoaded') {
         const skillList: SkillItem[] = [];
         // 内置工具已迁移到 ToolManager，不再通过 skills.json 配置
         // 自定义工具
-        if (Array.isArray(message.config?.customTools)) {
-          for (const tool of message.config.customTools) {
+        if (Array.isArray(payload?.config?.customTools)) {
+          for (const tool of payload.config.customTools) {
             skillList.push({ name: tool.name, description: tool.description || '', source: 'custom' });
           }
         }
         // Instruction Skills
-        if (Array.isArray(message.config?.instructionSkills)) {
-          for (const skill of message.config.instructionSkills) {
+        if (Array.isArray(payload?.config?.instructionSkills)) {
+          for (const skill of payload.config.instructionSkills) {
             skillList.push({ name: skill.name, description: skill.description || '', source: 'instruction' });
           }
         }
         skills = skillList;
       }
       // 仓库列表加载
-      else if (message.type === 'repositoriesLoaded') {
-        const repoList = ensureArray<any>(message.repositories);
+      else if (dataType === 'repositoriesLoaded') {
+        const repoList = ensureArray<any>(payload?.repositories);
         repositories = repoList.map((r: any) => ({
           id: r.id,
           url: r.url,
@@ -1055,22 +1067,22 @@
         repositoriesLoading = false; // 清除加载状态
       }
       // 仓库添加成功
-      else if (message.type === 'repositoryAdded') {
+      else if (dataType === 'repositoryAdded') {
         vscode.postMessage({ type: 'loadRepositories' });
         repoAddLoading = false;
         repoAddUrl = '';
       }
       // 仓库删除成功
-      else if (message.type === 'repositoryDeleted') {
-        repositories = repositories.filter(r => r.id !== message.repositoryId);
+      else if (dataType === 'repositoryDeleted') {
+        repositories = repositories.filter(r => r.id !== payload?.repositoryId);
       }
       // 仓库刷新成功
-      else if (message.type === 'repositoryRefreshed') {
+      else if (dataType === 'repositoryRefreshed') {
         vscode.postMessage({ type: 'loadRepositories' });
       }
       // Skill 库加载
-      else if (message.type === 'skillLibraryLoaded') {
-        const skillsList = ensureArray<any>(message.skills);
+      else if (dataType === 'skillLibraryLoaded') {
+        const skillsList = ensureArray<any>(payload?.skills);
         librarySkills = skillsList.map((s: any) => ({
           name: s.name,
           fullName: s.fullName || s.name,
@@ -1087,27 +1099,29 @@
         skillLibraryLoading = false; // 清除加载状态
       }
       // Skill 安装成功
-      else if (message.type === 'skillInstalled') {
+      else if (dataType === 'skillInstalled') {
         // 清除安装状态
-        if (message.skillId) {
-          installingSkills.delete(message.skillId);
+        if (payload?.skillId) {
+          installingSkills.delete(payload.skillId);
           installingSkills = new Set(installingSkills);
         }
         vscode.postMessage({ type: 'loadSkillsConfig' });
         vscode.postMessage({ type: 'loadSkillLibrary' });
         showSkillLibraryDialogState = false;
       }
+      // 自定义工具添加成功
+      else if (dataType === 'customToolAdded') {
+        vscode.postMessage({ type: 'loadSkillsConfig' });
+      }
       // 自定义工具删除成功
-      else if (message.type === 'customToolRemoved') {
+      else if (dataType === 'customToolRemoved') {
         vscode.postMessage({ type: 'loadSkillsConfig' });
       }
       // Instruction Skill 删除成功
-      else if (message.type === 'instructionSkillRemoved') {
+      else if (dataType === 'instructionSkillRemoved') {
         vscode.postMessage({ type: 'loadSkillsConfig' });
       }
-    };
-
-    window.addEventListener('message', handler);
+    });
 
     // 初始化请求数据
     vscode.postMessage({ type: 'checkWorkerStatus', force: false });
@@ -1121,7 +1135,7 @@
     vscode.postMessage({ type: 'loadSkillsConfig' });
     vscode.postMessage({ type: 'loadRepositories' });
 
-    return () => window.removeEventListener('message', handler);
+    return () => unsubscribe();
   });
 </script>
 

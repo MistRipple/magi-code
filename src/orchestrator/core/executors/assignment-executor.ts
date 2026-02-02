@@ -13,6 +13,8 @@ import { TokenUsage } from '../../../types/agent-types';
 import { AutonomousWorker, AutonomousExecutionResult } from '../../worker';
 import { Mission, Assignment, WorkerTodo } from '../../mission';
 import { SnapshotManager } from '../../../snapshot-manager';
+import fs from 'fs';
+import path from 'path';
 import { logger, LogCategory } from '../../../logging';
 import { LspEnforcer } from '../../lsp/lsp-enforcer';
 import type { ReportCallback } from '../../protocols/worker-report';
@@ -44,7 +46,7 @@ export class AssignmentExecutor {
     private workers: Map<WorkerSlot, AutonomousWorker>,
     private adapterFactory: IAdapterFactory,
     private snapshotManager: SnapshotManager | null,
-    workspaceRoot: string
+    private workspaceRoot: string
   ) {
     this.lspEnforcer = new LspEnforcer(workspaceRoot);
   }
@@ -67,9 +69,11 @@ export class AssignmentExecutor {
       };
     }
 
+    // 日志显示任务描述（优先使用 AI 生成的自然语言描述）
+    const taskDescription = assignment.delegationBriefing || assignment.responsibility;
     logger.info(
       LogCategory.ORCHESTRATOR,
-      `Worker ${assignment.workerId} 开始执行: ${assignment.responsibility}`
+      `Worker ${assignment.workerId} 开始执行: ${taskDescription}`
     );
 
     // 创建快照
@@ -80,6 +84,8 @@ export class AssignmentExecutor {
 
     // 收集目标文件
     const targetFiles = this.collectTargetFiles(assignment);
+    const normalizedTargets = this.normalizeTargetFiles(targetFiles);
+    const preExecutionContents = this.captureTargetContents(normalizedTargets);
 
     if (this.lspEnforcer) {
       try {
@@ -93,12 +99,13 @@ export class AssignmentExecutor {
     }
 
     // 执行 Assignment
-    const result = await worker.executeAssignment(assignment, {
+    let result = await worker.executeAssignment(assignment, {
       workingDirectory: options.workingDirectory,
       projectContext: options.projectContext,
       timeout: options.timeout,
       onReport: options.onReport,
       reportTimeout: options.reportTimeout,
+      adapterFactory: this.adapterFactory,
       adapterScope: {
         messageMeta: {
           contextSnapshot,
@@ -109,6 +116,56 @@ export class AssignmentExecutor {
         },
       },
     });
+
+    if (this.shouldEnforceTargetChanges(assignment, targetFiles)) {
+      const hasChanges = this.hasAssignmentChanges(assignment.id, normalizedTargets)
+        || this.hasContentChanges(normalizedTargets, preExecutionContents);
+      if (!hasChanges) {
+        logger.warn(
+          `Worker ${assignment.workerId} 未产生目标文件变更，触发一次强制重试`,
+          { assignmentId: assignment.id, targetFiles: normalizedTargets },
+          LogCategory.ORCHESTRATOR
+        );
+
+        const originalGuidance = assignment.guidancePrompt;
+        assignment.guidancePrompt = `${originalGuidance}\n\n${this.buildForceChangeGuidance(normalizedTargets)}`;
+
+        result = await worker.executeAssignment(assignment, {
+          workingDirectory: options.workingDirectory,
+          projectContext: options.projectContext,
+          timeout: options.timeout,
+          onReport: options.onReport,
+          reportTimeout: options.reportTimeout,
+          adapterFactory: this.adapterFactory,
+          adapterScope: {
+            messageMeta: {
+              contextSnapshot,
+              taskContext: {
+                goal: assignment.responsibility,
+                targetFiles,
+              },
+            },
+          },
+        });
+
+        assignment.guidancePrompt = originalGuidance;
+
+        const retryHasChanges = this.hasAssignmentChanges(assignment.id, normalizedTargets)
+          || this.hasContentChanges(normalizedTargets, preExecutionContents);
+        if (!retryHasChanges) {
+          if (!result.errors) {
+            result.errors = [];
+          }
+          result.errors.push('未检测到对目标文件的修改');
+          result.success = false;
+          logger.error(
+            `Worker ${assignment.workerId} 重试后仍未产生目标文件变更`,
+            { assignmentId: assignment.id, targetFiles: normalizedTargets },
+            LogCategory.ORCHESTRATOR
+          );
+        }
+      }
+    }
 
     // 更新 ContextManager
     await this.updateContextManager(assignment, result, options.contextManager);
@@ -194,6 +251,87 @@ export class AssignmentExecutor {
     }
 
     return Array.from(files);
+  }
+
+  private normalizeTargetFiles(files: string[]): string[] {
+    const normalized = new Set<string>();
+    for (const filePath of files) {
+      const trimmed = filePath.trim();
+      if (!trimmed) continue;
+      const relative = path.isAbsolute(trimmed)
+        ? path.relative(this.workspaceRoot, trimmed)
+        : trimmed;
+      normalized.add(path.normalize(relative));
+    }
+    return Array.from(normalized);
+  }
+
+  private captureTargetContents(targetFiles: string[]): Map<string, string> {
+    const contents = new Map<string, string>();
+    for (const filePath of targetFiles) {
+      const absolute = this.getAbsolutePath(filePath);
+      let content = '';
+      if (fs.existsSync(absolute)) {
+        content = fs.readFileSync(absolute, 'utf-8');
+      }
+      contents.set(filePath, content);
+    }
+    return contents;
+  }
+
+  private hasContentChanges(targetFiles: string[], before: Map<string, string>): boolean {
+    for (const filePath of targetFiles) {
+      const absolute = this.getAbsolutePath(filePath);
+      const previous = before.get(filePath);
+      if (previous === undefined) continue;
+      if (!fs.existsSync(absolute)) {
+        if (previous !== '') return true;
+        continue;
+      }
+      const current = fs.readFileSync(absolute, 'utf-8');
+      if (current !== previous) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private shouldEnforceTargetChanges(assignment: Assignment, targetFiles: string[]): boolean {
+    return Boolean(
+      this.snapshotManager &&
+      targetFiles.length > 0 &&
+      assignment.scope?.requiresModification
+    );
+  }
+
+  private hasAssignmentChanges(assignmentId: string, targetFiles: string[]): boolean {
+    if (!this.snapshotManager) return false;
+    if (targetFiles.length === 0) return false;
+    const targetSet = new Set(targetFiles.map(file => path.normalize(file)));
+    const pending = this.snapshotManager.getPendingChanges();
+    return pending.some(change => {
+      if (change.assignmentId !== assignmentId) return false;
+      const normalized = path.normalize(change.filePath);
+      return targetSet.has(normalized);
+    });
+  }
+
+  private getAbsolutePath(filePath: string): string {
+    return path.isAbsolute(filePath)
+      ? filePath
+      : path.join(this.workspaceRoot, filePath);
+  }
+
+  private buildForceChangeGuidance(targetFiles: string[]): string {
+    const files = targetFiles.length > 0
+      ? `必须修改以下文件之一并保存：${targetFiles.join(', ')}。`
+      : '必须对目标文件进行实际修改并保存。';
+    return [
+      '【强制要求】',
+      '你之前没有对目标文件产生实际修改。',
+      files,
+      '禁止仅给出说明或计划，必须通过工具编辑文件并保存后再输出结果。',
+    ].join('\n');
   }
 
   /**

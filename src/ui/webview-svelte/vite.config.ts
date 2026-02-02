@@ -47,10 +47,11 @@ export default defineConfig({
         },
       },
     },
-    // 生产环境不生成 sourcemap（VS Code webview CSP 限制）
-    sourcemap: false,
+    // 生成 inline sourcemap 以确保 VS Code webview 可定位 Svelte 组件行号
+    sourcemap: 'inline',
     // 使用 esbuild 压缩（更快，不需要额外安装）
-    minify: 'esbuild',
+    //minify: 'esbuild',
+    minify: false,
   },
   // 开发服务器配置（用于独立开发调试）
   server: {
@@ -58,4 +59,3 @@ export default defineConfig({
     open: true,
   },
 });
-

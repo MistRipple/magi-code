@@ -1,7 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
-  import { getState, addThreadMessage, addToast, getActiveInteractionType } from '../stores/messages.svelte';
+  import { getState, addThreadMessage, addToast, getActiveInteractionType, addPendingRequest } from '../stores/messages.svelte';
+  import type { StandardMessage } from '../../../../protocol/message-protocol';
+  import { MessageCategory } from '../../../../protocol/message-protocol';
   import Icon from './Icon.svelte';
   import { generateId } from '../lib/utils';
 
@@ -22,40 +24,58 @@
   // 增强按钮状态
   let isEnhancing = $state(false);
 
+  // 🔧 图片上传相关状态
+  let selectedImages = $state<Array<{ id: string; dataUrl: string; name: string }>>([]);
+  const MAX_IMAGES = 5;  // 最多支持 5 张图片
+  const MAX_IMAGE_SIZE = 10 * 1024 * 1024;  // 单张图片最大 10MB
+
   // 是否正在发送
   const isSending = $derived(appState.isProcessing);
   const activeInteraction = $derived(getActiveInteractionType());
   const isInteractionBlocking = $derived(Boolean(activeInteraction));
   const MAX_INPUT_CHARS = 10000;
 
-  // 发送消息
+  // 发送消息（支持图片附件）
   function sendMessage() {
     const content = inputValue.trim();
-    if (!content || isSending || isInteractionBlocking) return;
+    // 允许只发送图片（无文字）或只发送文字
+    if ((!content && selectedImages.length === 0) || isSending || isInteractionBlocking) return;
     if (content.length > MAX_INPUT_CHARS) {
       addToast('warning', `输入内容过长（${content.length} 字符），请控制在 ${MAX_INPUT_CHARS} 字符以内`);
       return;
     }
 
+    const requestId = generateId();
+    // 🔧 乐观更新：立即设置处理状态，用户无需等待后端响应即可看到 Loading 动画
+    addPendingRequest(requestId);
+
+    // 构建用户消息（包含图片预览信息）
+    const displayContent = selectedImages.length > 0
+      ? `${content}${content ? '\n' : ''}[附件: ${selectedImages.length} 张图片]`
+      : content;
+
     addThreadMessage({
       id: generateId(),
       role: 'user',
       source: 'orchestrator',
-      content,
+      content: displayContent,
       timestamp: Date.now(),
       isStreaming: false,
       isComplete: true,
     });
 
+    // 发送到后端（包含图片数据）
     vscode.postMessage({
       type: 'executeTask',
-      prompt: content,
+      prompt: content || '请分析这些图片',  // 无文字时使用默认提示
       mode: interactionMode,
       agent: selectedModel || undefined,
-      requestId: generateId(),
+      requestId,
+      images: selectedImages.map(img => ({ dataUrl: img.dataUrl })),
     });
 
     inputValue = '';
+    selectedImages = [];  // 清空已选图片
   }
 
   // 处理键盘事件
@@ -109,25 +129,80 @@
     window.dispatchEvent(new CustomEvent('openSkillPopup'));
   }
 
-  onMount(() => {
-    // 监听增强结果
-    const handler = (event: MessageEvent) => {
-      const msg = event.data;
-      if (msg.type === 'promptEnhanced') {
-        isEnhancing = false;
-        if (msg.error) {
-          addToast('error', msg.error);
-        } else {
-          const enhancedPrompt = typeof msg.enhancedPrompt === 'string' ? msg.enhancedPrompt : '';
-          if (enhancedPrompt) {
-            inputValue = enhancedPrompt;
-            addToast('success', '提示词已增强');
+  // 🔧 处理粘贴事件（支持图片粘贴）
+  function handlePaste(event: ClipboardEvent) {
+    const items = event.clipboardData?.items;
+    if (!items) return;
+
+    for (const item of items) {
+      if (item.type.startsWith('image/')) {
+        event.preventDefault();  // 阻止默认粘贴行为
+
+        if (selectedImages.length >= MAX_IMAGES) {
+          addToast('warning', `最多支持 ${MAX_IMAGES} 张图片`);
+          return;
+        }
+
+        const file = item.getAsFile();
+        if (!file) continue;
+
+        if (file.size > MAX_IMAGE_SIZE) {
+          addToast('warning', `图片过大（${(file.size / 1024 / 1024).toFixed(1)}MB），请控制在 10MB 以内`);
+          continue;
+        }
+
+        // 读取图片为 DataURL
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const dataUrl = e.target?.result as string;
+          if (dataUrl) {
+            selectedImages = [...selectedImages, {
+              id: generateId(),
+              dataUrl,
+              name: file.name || `粘贴图片_${selectedImages.length + 1}`,
+            }];
+            addToast('success', '图片已添加');
           }
+        };
+        reader.onerror = () => {
+          addToast('error', '图片读取失败');
+        };
+        reader.readAsDataURL(file);
+        break;  // 一次只处理一张图片
+      }
+    }
+  }
+
+  // 🔧 删除已选图片
+  function removeImage(imageId: string) {
+    selectedImages = selectedImages.filter(img => img.id !== imageId);
+  }
+
+  // 🔧 清空所有图片
+  function clearAllImages() {
+    selectedImages = [];
+  }
+
+  onMount(() => {
+    const unsubscribe = vscode.onMessage((msg) => {
+      if (msg.type !== 'unifiedMessage') return;
+      const standard = msg.message as StandardMessage;
+      if (!standard || standard.category !== MessageCategory.DATA || !standard.data) return;
+      if (standard.data.dataType !== 'promptEnhanced') return;
+
+      const payload = standard.data.payload as { enhancedPrompt?: string; error?: string };
+      isEnhancing = false;
+      if (payload?.error) {
+        addToast('error', payload.error);
+      } else {
+        const enhancedPrompt = typeof payload?.enhancedPrompt === 'string' ? payload.enhancedPrompt : '';
+        if (enhancedPrompt) {
+          inputValue = enhancedPrompt;
+          addToast('success', '提示词已增强');
         }
       }
-    };
-    window.addEventListener('message', handler);
-    return () => window.removeEventListener('message', handler);
+    });
+    return () => unsubscribe();
   });
 </script>
 
@@ -137,13 +212,39 @@
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="input-resize-bar" onmousedown={startResize}></div>
 
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
     <textarea
       bind:value={inputValue}
       class="input-box"
-      placeholder="描述你的任务..."
+      class:has-images={selectedImages.length > 0}
+      placeholder={selectedImages.length > 0 ? "添加描述（可选）..." : "描述你的任务... (Ctrl+V 粘贴图片)"}
       disabled={isSending}
       onkeydown={handleKeydown}
+      onpaste={handlePaste}
     ></textarea>
+
+    <!-- 🔧 图片预览区域 -->
+    {#if selectedImages.length > 0}
+      <div class="image-preview-area">
+        {#each selectedImages as img (img.id)}
+          <div class="image-preview-item">
+            <img src={img.dataUrl} alt={img.name} class="preview-thumbnail" />
+            <button
+              class="remove-image-btn"
+              onclick={() => removeImage(img.id)}
+              title="移除图片"
+            >
+              <Icon name="close" size={12} />
+            </button>
+          </div>
+        {/each}
+        {#if selectedImages.length > 1}
+          <button class="clear-all-images-btn" onclick={clearAllImages} title="清空所有图片">
+            清空
+          </button>
+        {/if}
+      </div>
+    {/if}
 
     <div class="input-actions">
       <div class="input-actions-left">
@@ -198,9 +299,9 @@
         {:else}
           <button
             class="send-btn"
-            class:ready={inputValue.trim() && !isInteractionBlocking}
+            class:ready={(inputValue.trim() || selectedImages.length > 0) && !isInteractionBlocking}
             onclick={sendMessage}
-            disabled={!inputValue.trim() || isInteractionBlocking}
+            disabled={(!inputValue.trim() && selectedImages.length === 0) || isInteractionBlocking}
             title={isInteractionBlocking ? `等待处理：${activeInteraction}` : '发送 (Cmd+Enter)'}
           >
             <Icon name="send" size={14} />
@@ -392,5 +493,80 @@
     background: var(--surface-hover);
     color: var(--foreground);
     border-color: var(--primary);
+  }
+
+  /* 🔧 图片预览区域样式 */
+  .image-preview-area {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-top: 1px solid var(--border-subtle);
+    background: var(--surface-1);
+  }
+
+  .image-preview-item {
+    position: relative;
+    width: 60px;
+    height: 60px;
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+
+  .preview-thumbnail {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .remove-image-btn {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 18px;
+    height: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    background: rgba(0, 0, 0, 0.6);
+    border: none;
+    border-radius: 50%;
+    color: white;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity var(--transition-fast);
+  }
+
+  .image-preview-item:hover .remove-image-btn {
+    opacity: 1;
+  }
+
+  .remove-image-btn:hover {
+    background: var(--destructive);
+  }
+
+  .clear-all-images-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: var(--space-1) var(--space-2);
+    font-size: var(--text-xs);
+    background: transparent;
+    border: 1px dashed var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--foreground-muted);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+  }
+
+  .clear-all-images-btn:hover {
+    border-color: var(--destructive);
+    color: var(--destructive);
+  }
+
+  .input-box.has-images {
+    min-height: 40px;
   }
 </style>

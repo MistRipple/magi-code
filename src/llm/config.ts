@@ -15,7 +15,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { LLMConfig, WorkerSlot } from '../types/agent-types';
+import { LLMConfig, LLMProvider, WorkerSlot } from '../types/agent-types';
 import { FullLLMConfig, WorkerLLMConfig } from './types';
 import { logger, LogCategory } from '../logging';
 
@@ -143,10 +143,10 @@ export class LLMConfigLoader {
     const defaults = this.getDefaultLLMConfig().orchestrator;
 
     return {
-      baseUrl: orchestratorConfig.baseUrl || defaults.baseUrl,
-      apiKey: orchestratorConfig.apiKey || defaults.apiKey,
-      model: orchestratorConfig.model || defaults.model,
-      provider: orchestratorConfig.provider || defaults.provider,
+      baseUrl: this.normalizeString(orchestratorConfig.baseUrl, defaults.baseUrl),
+      apiKey: this.normalizeString(orchestratorConfig.apiKey, defaults.apiKey),
+      model: this.normalizeString(orchestratorConfig.model, defaults.model),
+      provider: this.normalizeString(orchestratorConfig.provider, defaults.provider) as LLMProvider,
       enabled: true,
     };
   }
@@ -174,12 +174,20 @@ export class LLMConfigLoader {
     }
 
     return {
-      baseUrl: workerConfig.baseUrl || defaults.baseUrl,
-      apiKey: workerConfig.apiKey || defaults.apiKey,
-      model: workerConfig.model || defaults.model,
-      provider: workerConfig.provider || defaults.provider,
+      baseUrl: this.normalizeString(workerConfig.baseUrl, defaults.baseUrl),
+      apiKey: this.normalizeString(workerConfig.apiKey, defaults.apiKey),
+      model: this.normalizeString(workerConfig.model, defaults.model),
+      provider: this.normalizeString(workerConfig.provider, defaults.provider) as LLMProvider,
       enabled: workerConfig.enabled !== false,
     };
+  }
+
+  private static normalizeString(value: any, fallback: string): string {
+    if (typeof value !== 'string') {
+      return fallback;
+    }
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : fallback;
   }
 
   /**

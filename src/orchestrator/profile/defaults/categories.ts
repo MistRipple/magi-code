@@ -132,7 +132,7 @@ export const DEFAULT_CATEGORIES_CONFIG: CategoriesConfig = {
       riskLevel: 'low',
     },
 
-    // 文档类 (注意：类型定义使用 'document'，但这里保持 'docs' 作为内部标识)
+    // 文档类
     document: {
       displayName: '文档编写',
       description: 'README、注释、API 文档',

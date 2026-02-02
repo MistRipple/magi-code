@@ -26,7 +26,7 @@ export function classifyMessage(standard: StandardMessage): {
     return { category: MessageCategory.SYSTEM_PHASE };
   }
 
-  if (hasSummaryCard && standard.source === 'worker') {
+  if (hasSummaryCard) {
     return { category: MessageCategory.TASK_SUMMARY_CARD, worker: resolvedWorker ?? undefined };
   }
 

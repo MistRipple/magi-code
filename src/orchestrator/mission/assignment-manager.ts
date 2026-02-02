@@ -38,16 +38,23 @@ export class AssignmentManager {
     options?: {
       taskInfo?: TaskStructuredInfo;
       additionalContext?: string;
+      routingCategory?: string;
+      routingReason?: string;
+      requiresModification?: boolean;
+      /** AI 生成的委托说明（按 worker 索引对应） */
+      delegationBriefings?: string[];
     }
   ): Promise<Assignment[]> {
     const assignments: Assignment[] = [];
 
-    for (const participant of participants) {
+    for (let i = 0; i < participants.length; i++) {
+      const participant = participants[i];
+      const delegationBriefing = options?.delegationBriefings?.[i];
       const assignment = await this.createAssignmentForWorker(
         mission,
         participant,
         contracts,
-        options
+        { ...options, delegationBriefing }
       );
       assignments.push(assignment);
     }
@@ -65,18 +72,25 @@ export class AssignmentManager {
     options?: {
       taskInfo?: TaskStructuredInfo;
       additionalContext?: string;
+      routingCategory?: string;
+      routingReason?: string;
+      requiresModification?: boolean;
+      /** AI 生成的委托说明 */
+      delegationBriefing?: string;
     }
   ): Promise<Assignment> {
     const profile = this.profileLoader.getProfile(workerId);
 
     // 确定职责范围
-    const scope = this.determineScope(mission, workerId, contracts);
+    const scope = this.determineScope(mission, workerId, contracts, options?.requiresModification);
 
     // 生成分配原因
     const assignmentReason = this.generateAssignmentReason(
       mission,
       workerId,
-      profile
+      profile,
+      options?.routingCategory,
+      options?.routingReason
     );
 
     // 确定契约关系
@@ -107,6 +121,7 @@ export class AssignmentManager {
       workerId,
       assignmentReason,
       responsibility: this.generateResponsibility(mission, workerId, scope),
+      delegationBriefing: options?.delegationBriefing,
       scope,
       guidancePrompt,
       producerContracts,
@@ -125,7 +140,8 @@ export class AssignmentManager {
   private determineScope(
     mission: Mission,
     workerId: WorkerSlot,
-    contracts: Contract[]
+    contracts: Contract[],
+    requiresModification?: boolean
   ): AssignmentScope {
     const profile = this.profileLoader.getProfile(workerId);
     const includes: string[] = [];
@@ -158,6 +174,7 @@ export class AssignmentManager {
       includes,
       excludes,
       targetPaths,
+      requiresModification,
     };
   }
 
@@ -173,8 +190,23 @@ export class AssignmentManager {
   private generateAssignmentReason(
     mission: Mission,
     workerId: WorkerSlot,
-    profile: ReturnType<ProfileLoader['getProfile']>
+    profile: ReturnType<ProfileLoader['getProfile']>,
+    routingCategory?: string,
+    routingReason?: string
   ): AssignmentReason {
+    if (routingCategory) {
+      return {
+        profileMatch: {
+          category: routingCategory,
+          score: 100,
+          matchedKeywords: [],
+        },
+        contractRole: 'none',
+        explanation: routingReason || `编排者路由指定 ${workerId} 执行 ${routingCategory} 类任务`,
+        alternatives: [],
+      };
+    }
+
     const category = this.inferCategory(mission, profile);
     const score = this.calculateMatchScore(mission, profile);
 

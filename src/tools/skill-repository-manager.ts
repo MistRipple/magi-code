@@ -52,6 +52,8 @@ export class SkillRepositoryManager {
   private cache: Map<string, SkillInfo[]> = new Map();
   private cacheExpiry: Map<string, number> = new Map();
   private readonly CACHE_TTL = 5 * 60 * 1000; // 5 分钟
+  private readonly REQUEST_TIMEOUT = 5000; // 5 秒超时
+  private readonly MAX_CONCURRENT = 3; // 最大并发仓库数
 
   /**
    * 从 JSON 仓库获取 Skills（同时获取仓库名称）
@@ -61,7 +63,7 @@ export class SkillRepositoryManager {
       logger.info('Fetching JSON repository', { url, repositoryId }, LogCategory.TOOLS);
 
       const response = await axios.get(url, {
-        timeout: 10000,
+        timeout: this.REQUEST_TIMEOUT,
         headers: {
           'Accept': 'application/json',
           'User-Agent': 'MultiCLI-SkillManager/1.0'
@@ -146,7 +148,7 @@ export class SkillRepositoryManager {
       // 检查是否有 plugins 目录
       const pluginsUrl = `https://api.github.com/repos/${owner}/${repo}/contents/plugins`;
       const pluginsResponse = await axios.get(pluginsUrl, {
-        timeout: 10000,
+        timeout: this.REQUEST_TIMEOUT,
         headers: {
           'Accept': 'application/vnd.github.v3+json',
           'User-Agent': 'MultiCLI-SkillManager/1.0'
@@ -160,19 +162,14 @@ export class SkillRepositoryManager {
 
       logger.info('Found Claude Code plugins directory', { pluginCount: plugins.length }, LogCategory.TOOLS);
 
-      // 转换每个插件
-      const skills: SkillInfo[] = [];
-      for (const plugin of plugins) {
+      // 并行获取所有插件的 README（限制并发数）
+      const fetchPluginInfo = async (plugin: any): Promise<SkillInfo> => {
         const pluginName = plugin.name;
-
         try {
-          // 尝试读取插件的 README.md
           const readmeUrl = `https://raw.githubusercontent.com/${owner}/${repo}/main/plugins/${pluginName}/README.md`;
           const readmeResponse = await axios.get(readmeUrl, {
-            timeout: 5000,
-            headers: {
-              'User-Agent': 'MultiCLI-SkillManager/1.0'
-            }
+            timeout: this.REQUEST_TIMEOUT,
+            headers: { 'User-Agent': 'MultiCLI-SkillManager/1.0' }
           });
 
           const readme = readmeResponse.data;
@@ -180,7 +177,7 @@ export class SkillRepositoryManager {
           const title = lines[0]?.replace(/^#\s*/, '') || pluginName;
           const description = lines[1] || `Claude Code plugin: ${pluginName}`;
 
-          skills.push({
+          return {
             id: pluginName.replace(/-/g, '_'),
             name: title,
             fullName: `${pluginName.replace(/-/g, '_')}_v1`,
@@ -194,12 +191,9 @@ export class SkillRepositoryManager {
             repositoryName: `${repo} (Claude Code Plugins)`,
             skillType: 'instruction',
             instruction: readme
-          });
-
-          logger.debug('Converted Claude Code plugin', { pluginName, title }, LogCategory.TOOLS);
-        } catch (readmeError) {
-          // 如果读取 README 失败，使用默认信息
-          skills.push({
+          };
+        } catch {
+          return {
             id: pluginName.replace(/-/g, '_'),
             name: pluginName,
             fullName: `${pluginName.replace(/-/g, '_')}_v1`,
@@ -213,10 +207,17 @@ export class SkillRepositoryManager {
             repositoryName: `${repo} (Claude Code Plugins)`,
             skillType: 'instruction',
             instruction: `Claude Code plugin: ${pluginName}`
-          });
-
-          logger.debug('Converted Claude Code plugin (no README)', { pluginName }, LogCategory.TOOLS);
+          };
         }
+      };
+
+      // 分批并行处理，每批最多 5 个
+      const skills: SkillInfo[] = [];
+      const batchSize = 5;
+      for (let i = 0; i < plugins.length; i += batchSize) {
+        const batch = plugins.slice(i, i + batchSize);
+        const batchResults = await Promise.all(batch.map(fetchPluginInfo));
+        skills.push(...batchResults);
       }
 
       logger.info('Claude Code plugins converted', {
@@ -239,7 +240,7 @@ export class SkillRepositoryManager {
     const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${filePath}`;
     try {
       const response = await axios.get(rawUrl, {
-        timeout: 10000,
+        timeout: this.REQUEST_TIMEOUT,
         headers: {
           'User-Agent': 'MultiCLI-SkillManager/1.0'
         }
@@ -260,7 +261,7 @@ export class SkillRepositoryManager {
     const url = `https://api.github.com/repos/${owner}/${repo}/contents/${dirPath}`;
     try {
       const response = await axios.get(url, {
-        timeout: 10000,
+        timeout: this.REQUEST_TIMEOUT,
         headers: {
           'Accept': 'application/vnd.github.v3+json',
           'User-Agent': 'MultiCLI-SkillManager/1.0'
@@ -359,13 +360,12 @@ export class SkillRepositoryManager {
   private async fetchSkillFromDirectory(
     owner: string,
     repo: string,
-    branch: string,
     repositoryId: string,
     repositoryName: string,
     skillDirPath: string
   ): Promise<SkillInfo | null> {
-    const skillMd = await this.fetchRawFile(owner, repo, branch, `${skillDirPath}/SKILL.md`);
-    const fallbackMd = skillMd ?? await this.fetchRawFile(owner, repo, branch, `${skillDirPath}/skill.md`);
+    const skillMd = await this.fetchRawFile(owner, repo, 'HEAD', `${skillDirPath}/SKILL.md`);
+    const fallbackMd = skillMd ?? await this.fetchRawFile(owner, repo, 'HEAD', `${skillDirPath}/skill.md`);
     if (!fallbackMd) {
       return null;
     }
@@ -420,7 +420,6 @@ export class SkillRepositoryManager {
     owner: string,
     repo: string,
     repositoryId: string,
-    branch: string,
     basePath: string,
     pluginJson: any
   ): Promise<SkillInfo[]> {
@@ -433,7 +432,6 @@ export class SkillRepositoryManager {
       const directSkill = await this.fetchSkillFromDirectory(
         owner,
         repo,
-        branch,
         repositoryId,
         pluginJson.name || repo,
         normalized
@@ -449,7 +447,7 @@ export class SkillRepositoryManager {
       const dirs = entries.filter((item: any) => item.type === 'dir');
       for (const dir of dirs) {
         const skillDirPath = dir.path;
-        const skill = await this.fetchSkillFromDirectory(owner, repo, branch, repositoryId, pluginJson.name || repo, skillDirPath);
+        const skill = await this.fetchSkillFromDirectory(owner, repo, repositoryId, pluginJson.name || repo, skillDirPath);
         if (skill) {
           skills.push(skill);
         }
@@ -462,26 +460,32 @@ export class SkillRepositoryManager {
   private async tryFetchClaudeCodePluginRepository(
     owner: string,
     repo: string,
-    repositoryId: string,
-    branch: string
+    repositoryId: string
   ): Promise<{ name: string; skills: SkillInfo[] } | null> {
     const pluginJsonPaths = ['.claude-plugin/plugin.json', 'plugin.json'];
-    const candidateBranches = [branch, 'main', 'master'].filter((value, index, arr) => value && arr.indexOf(value) === index);
 
-    for (const pluginJsonPath of pluginJsonPaths) {
-      for (const candidateBranch of candidateBranches) {
-        const raw = await this.fetchRawFile(owner, repo, candidateBranch, pluginJsonPath);
-        if (!raw) continue;
+    // 并行尝试两个路径（使用 HEAD 默认分支）
+    const results = await Promise.all(
+      pluginJsonPaths.map(async (p) => {
+        const raw = await this.fetchRawFile(owner, repo, 'HEAD', p);
+        if (!raw) return null;
         try {
           const pluginJson = JSON.parse(raw);
-          const skills = await this.fetchClaudeCodePluginSkills(owner, repo, repositoryId, candidateBranch, '', pluginJson);
+          const skills = await this.fetchClaudeCodePluginSkills(owner, repo, repositoryId, '', pluginJson);
           if (skills.length > 0) {
             return { name: pluginJson.name || repo, skills };
           }
-        } catch (error: any) {
-          logger.warn('Failed to parse plugin.json', { error: error.message }, LogCategory.TOOLS);
+        } catch {
+          // ignore parse errors
         }
-      }
+        return null;
+      })
+    );
+
+    // 返回第一个成功的结果
+    const success = results.find(r => r !== null);
+    if (success) {
+      return success;
     }
 
     // 支持 monorepo plugins/ 目录
@@ -490,28 +494,32 @@ export class SkillRepositoryManager {
       return null;
     }
 
-    const skills: SkillInfo[] = [];
-    for (const pluginDir of pluginsDir.filter((item: any) => item.type === 'dir')) {
-      const basePath = `plugins/${pluginDir.name}`;
-      for (const pluginJsonPath of ['.claude-plugin/plugin.json', 'plugin.json']) {
-        const raw = await this.fetchRawFile(owner, repo, branch, `${basePath}/${pluginJsonPath}`);
-        if (!raw) continue;
-        try {
-          const pluginJson = JSON.parse(raw);
-          const pluginSkills = await this.fetchClaudeCodePluginSkills(owner, repo, repositoryId, branch, basePath, pluginJson);
-          if (pluginSkills.length > 0) {
-            pluginSkills.forEach((skill) => {
-              skill.repositoryName = pluginJson.name || pluginDir.name || repo;
-            });
-            skills.push(...pluginSkills);
+    // 并行处理所有插件目录
+    const pluginDirs = pluginsDir.filter((item: any) => item.type === 'dir');
+    const pluginResults = await Promise.all(
+      pluginDirs.map(async (pluginDir: any) => {
+        const basePath = `plugins/${pluginDir.name}`;
+        for (const pluginJsonPath of pluginJsonPaths) {
+          const raw = await this.fetchRawFile(owner, repo, 'HEAD', `${basePath}/${pluginJsonPath}`);
+          if (!raw) continue;
+          try {
+            const pluginJson = JSON.parse(raw);
+            const pluginSkills = await this.fetchClaudeCodePluginSkills(owner, repo, repositoryId, basePath, pluginJson);
+            if (pluginSkills.length > 0) {
+              pluginSkills.forEach((skill) => {
+                skill.repositoryName = pluginJson.name || pluginDir.name || repo;
+              });
+              return pluginSkills;
+            }
+          } catch {
+            // ignore
           }
-          break;
-        } catch (error: any) {
-          logger.warn('Failed to parse plugin.json', { error: error.message }, LogCategory.TOOLS);
         }
-      }
-    }
+        return [];
+      })
+    );
 
+    const skills = pluginResults.flat();
     if (skills.length === 0) {
       return null;
     }
@@ -522,68 +530,51 @@ export class SkillRepositoryManager {
   /**
    * 尝试直接从 skills/ 目录获取 SKILL.md 文件
    * 支持没有 plugin.json 但有 skills/{skill-name}/SKILL.md 的仓库
-   * 为避免 GitHub API 速率限制，直接尝试常见的路径模式
+   * 直接使用 HEAD（默认分支）
    */
   private async tryFetchSkillsDirectory(
     owner: string,
     repo: string,
     repositoryId: string
   ): Promise<{ name: string; skills: SkillInfo[] } | null> {
-    const candidateBranches = ['main', 'master'];
-
-    // 常见的 skill 路径模式：skills/{repo-name}/SKILL.md
+    // 常见的 skill 路径模式
     const commonPaths = [
-      `skills/${repo}`,           // skills/planning-with-files/
+      `skills/${repo}`,
       `skills/${repo.toLowerCase()}`,
-      repo,                        // 根目录下直接有 SKILL.md
+      repo,
     ];
 
-    for (const branch of candidateBranches) {
-      const skills: SkillInfo[] = [];
-
-      for (const path of commonPaths) {
-        const skill = await this.fetchSkillFromDirectory(
-          owner,
-          repo,
-          branch,
-          repositoryId,
-          repo,
-          path
-        );
-        if (skill) {
-          skills.push(skill);
-          break; // 找到一个就够了
-        }
-      }
-
-      if (skills.length > 0) {
-        return { name: repo, skills };
+    // 先尝试常见路径
+    for (const path of commonPaths) {
+      const skill = await this.fetchSkillFromDirectory(
+        owner,
+        repo,
+        repositoryId,
+        repo,
+        path
+      );
+      if (skill) {
+        return { name: repo, skills: [skill] };
       }
     }
 
-    // 如果常见路径都没找到，尝试使用 API 列出目录（可能会被速率限制）
-    for (const branch of candidateBranches) {
-      const skillsDir = await this.listRepoDir(owner, repo, 'skills');
-      if (!skillsDir) continue;
+    // 如果常见路径都没找到，尝试使用 API 列出 skills/ 目录
+    const skillsDir = await this.listRepoDir(owner, repo, 'skills');
+    if (!skillsDir) {
+      return null;
+    }
 
-      const skills: SkillInfo[] = [];
-      for (const item of skillsDir.filter((i: any) => i.type === 'dir')) {
-        const skill = await this.fetchSkillFromDirectory(
-          owner,
-          repo,
-          branch,
-          repositoryId,
-          repo,
-          `skills/${item.name}`
-        );
-        if (skill) {
-          skills.push(skill);
-        }
-      }
+    // 并行处理所有 skill 目录
+    const skillDirs = skillsDir.filter((i: any) => i.type === 'dir');
+    const skillResults = await Promise.all(
+      skillDirs.map((item: any) =>
+        this.fetchSkillFromDirectory(owner, repo, repositoryId, repo, `skills/${item.name}`)
+      )
+    );
 
-      if (skills.length > 0) {
-        return { name: repo, skills };
-      }
+    const skills = skillResults.filter((s): s is SkillInfo => s !== null);
+    if (skills.length > 0) {
+      return { name: repo, skills };
     }
 
     return null;
@@ -591,119 +582,73 @@ export class SkillRepositoryManager {
 
   /**
    * 从 GitHub 仓库获取 Skills
-   * 支持格式：https://github.com/owner/repo
+   * 直接使用仓库默认分支（HEAD），无需探测
    */
   private async fetchGitHubRepository(url: string, repositoryId: string): Promise<{ name: string; skills: SkillInfo[] }> {
     try {
       logger.info('Fetching GitHub repository', { url, repositoryId }, LogCategory.TOOLS);
 
       // 解析 GitHub URL
-      const match = url.match(/github\.com\/([^\/]+)\/([^\/]+)/);
-      if (!match) {
+      const repoMatch = url.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+      if (!repoMatch) {
         throw new Error('Invalid GitHub URL format');
       }
 
-      const owner = match[1];
-      const repo = match[2].replace(/\.git$/, '');
+      const owner = repoMatch[1];
+      const repo = repoMatch[2].replace(/\.git$/, '').replace(/\/.*$/, '');
 
-      // 获取仓库信息（可能被 GitHub API 速率限制阻断）
-      let repoName = repo;
-      let repoDescription = '';
-      let defaultBranch = 'main';
-      try {
-        const repoInfoUrl = `https://api.github.com/repos/${owner}/${repo}`;
-        const repoInfoResponse = await axios.get(repoInfoUrl, {
-          timeout: 10000,
-          headers: {
-            'Accept': 'application/vnd.github.v3+json',
-            'User-Agent': 'MultiCLI-SkillManager/1.0'
-          }
-        });
-
-        const repoInfo = repoInfoResponse.data;
-        repoName = repoInfo.name || repo;
-        repoDescription = repoInfo.description || '';
-        defaultBranch = repoInfo.default_branch || 'main';
-      } catch (error: any) {
-        logger.warn('Failed to fetch GitHub repo info, falling back to branch guesses', {
-          url,
-          error: error.message
-        }, LogCategory.TOOLS);
-      }
-
-      // 尝试获取 skills.json 文件
-      const skillsJsonUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/skills.json`;
+      // 直接使用 HEAD（默认分支）
+      const skillsJsonUrl = `https://raw.githubusercontent.com/${owner}/${repo}/HEAD/skills.json`;
       let skillsData: any;
+      let repoName = repo;
 
       try {
-        const skillsResponse = await axios.get(skillsJsonUrl, {
-          timeout: 10000,
+        const response = await axios.get(skillsJsonUrl, {
+          timeout: this.REQUEST_TIMEOUT,
           headers: {
             'Accept': 'application/json',
             'User-Agent': 'MultiCLI-SkillManager/1.0'
           }
         });
-        skillsData = skillsResponse.data;
-      } catch (defaultBranchError: any) {
-        const fallbackBranches = ['main', 'master'].filter(branch => branch !== defaultBranch);
-        let fetched = false;
-        for (const branch of fallbackBranches) {
-          const fallbackUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/skills.json`;
-          try {
-            const skillsResponse = await axios.get(fallbackUrl, {
-              timeout: 10000,
-              headers: {
-                'Accept': 'application/json',
-                'User-Agent': 'MultiCLI-SkillManager/1.0'
-              }
-            });
-            skillsData = skillsResponse.data;
-            fetched = true;
-            break;
-          } catch {
-            // continue
+        skillsData = response.data;
+        logger.debug('Found skills.json', { owner, repo }, LogCategory.TOOLS);
+      } catch {
+        // skills.json 不存在，尝试其他格式
+        logger.info('No skills.json found, trying alternative formats', { owner, repo }, LogCategory.TOOLS);
+
+        // 尝试 Claude Code 插件格式
+        try {
+          const pluginSkills = await this.tryFetchClaudeCodePluginRepository(owner, repo, repositoryId);
+          if (pluginSkills) {
+            return pluginSkills;
           }
+        } catch {
+          // continue
         }
 
-        if (!fetched) {
-          // 两个分支都没有 skills.json，尝试检测 Claude Code 插件格式
-          logger.info('No skills.json found, trying Claude Code plugins format', { owner, repo }, LogCategory.TOOLS);
-
-          try {
-            const pluginSkills = await this.tryFetchClaudeCodePluginRepository(owner, repo, repositoryId, defaultBranch);
-            if (pluginSkills) {
-              return pluginSkills;
-            }
-          } catch (pluginError: any) {
-            logger.warn('Failed to fetch Claude Code plugins', { error: pluginError.message }, LogCategory.TOOLS);
+        try {
+          const pluginsData = await this.fetchClaudeCodePlugins(owner, repo, repositoryId);
+          if (pluginsData) {
+            return pluginsData;
           }
-
-          try {
-            const pluginsData = await this.fetchClaudeCodePlugins(owner, repo, repositoryId);
-            if (pluginsData) {
-              return pluginsData;
-            }
-          } catch (pluginError: any) {
-            logger.warn('Failed to fetch Claude Code plugins', { error: pluginError.message }, LogCategory.TOOLS);
-          }
-
-          // 尝试直接从 skills/ 目录获取 SKILL.md
-          try {
-            const skillsDirData = await this.tryFetchSkillsDirectory(owner, repo, repositoryId);
-            if (skillsDirData) {
-              return skillsDirData;
-            }
-          } catch (skillsDirError: any) {
-            logger.warn('Failed to fetch skills directory', { error: skillsDirError.message }, LogCategory.TOOLS);
-          }
-
-          // 如果也不是 Claude Code 格式，抛出错误
-          throw new Error(
-            `GitHub 仓库 ${owner}/${repo} 中没有找到 skills.json 或 Claude Code 插件技能。\n` +
-            `请确保仓库根目录包含 skills.json 文件（${defaultBranch} 分支优先），或符合 Claude Code 插件格式。\n` +
-            `参考格式请查看 example-skills-repository.json 文件。`
-          );
+        } catch {
+          // continue
         }
+
+        // 尝试 skills/ 目录
+        try {
+          const skillsDirData = await this.tryFetchSkillsDirectory(owner, repo, repositoryId);
+          if (skillsDirData) {
+            return skillsDirData;
+          }
+        } catch {
+          // continue
+        }
+
+        throw new Error(
+          `GitHub 仓库 ${owner}/${repo} 中没有找到 skills.json 或 Claude Code 插件技能。\n` +
+          `请确保仓库根目录包含 skills.json 文件，或符合 Claude Code 插件格式。`
+        );
       }
 
       // 验证 skills.json 格式
@@ -804,32 +749,38 @@ export class SkillRepositoryManager {
   }
 
   /**
-   * 获取所有仓库的 Skills
+   * 获取所有仓库的 Skills（受控并发，避免过多请求）
    */
   async getAllSkills(repositories: RepositoryConfig[]): Promise<SkillInfo[]> {
     logger.info('Fetching skills from repositories', {
       totalRepos: repositories.length
     }, LogCategory.TOOLS);
 
-    const results = await Promise.allSettled(
-      repositories.map(repo => this.fetchRepository(repo))
-    );
-
     const allSkills: SkillInfo[] = [];
-    results.forEach((result, index) => {
-      if (result.status === 'fulfilled') {
-        allSkills.push(...result.value);
-        logger.debug('Repository fetched successfully', {
-          repositoryId: repositories[index].id,
-          skillCount: result.value.length
-        }, LogCategory.TOOLS);
-      } else {
-        logger.warn('Failed to fetch repository', {
-          repositoryId: repositories[index].id,
-          error: result.reason?.message || result.reason
-        }, LogCategory.TOOLS);
-      }
-    });
+
+    // 分批处理，每批最多 MAX_CONCURRENT 个
+    for (let i = 0; i < repositories.length; i += this.MAX_CONCURRENT) {
+      const batch = repositories.slice(i, i + this.MAX_CONCURRENT);
+      const results = await Promise.allSettled(
+        batch.map(repo => this.fetchRepository(repo))
+      );
+
+      results.forEach((result, index) => {
+        const repoIndex = i + index;
+        if (result.status === 'fulfilled') {
+          allSkills.push(...result.value);
+          logger.debug('Repository fetched successfully', {
+            repositoryId: repositories[repoIndex].id,
+            skillCount: result.value.length
+          }, LogCategory.TOOLS);
+        } else {
+          logger.warn('Failed to fetch repository', {
+            repositoryId: repositories[repoIndex].id,
+            error: result.reason?.message || result.reason
+          }, LogCategory.TOOLS);
+        }
+      });
+    }
 
     logger.info('All skills fetched', { totalSkills: allSkills.length }, LogCategory.TOOLS);
 
@@ -839,25 +790,91 @@ export class SkillRepositoryManager {
   /**
    * 验证并获取仓库信息（用于添加仓库时）
    */
+  /**
+   * 验证仓库是否有效（快速验证，不获取所有 skills 详情）
+   */
   async validateRepository(url: string): Promise<{ name: string; skillCount: number; type: 'json' | 'github' }> {
     try {
-      const tempId = 'temp-' + Date.now();
-
-      // 判断是否为 GitHub 仓库
       const isGitHub = url.includes('github.com');
 
       if (isGitHub) {
-        const result = await this.fetchGitHubRepository(url, tempId);
-        return {
-          name: result.name,
-          skillCount: result.skills.length,
-          type: 'github'
-        };
+        // 解析 GitHub URL
+        const repoMatch = url.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+        if (!repoMatch) {
+          throw new Error('Invalid GitHub URL format');
+        }
+        const owner = repoMatch[1];
+        const repo = repoMatch[2].replace(/\.git$/, '').replace(/\/.*$/, '');
+
+        // 快速检查：尝试获取 skills.json
+        const skillsJsonUrl = `https://raw.githubusercontent.com/${owner}/${repo}/HEAD/skills.json`;
+        try {
+          const response = await axios.get(skillsJsonUrl, {
+            timeout: this.REQUEST_TIMEOUT,
+            headers: { 'Accept': 'application/json', 'User-Agent': 'MultiCLI-SkillManager/1.0' }
+          });
+          const data = response.data;
+          return {
+            name: data.name || repo,
+            skillCount: Array.isArray(data.skills) ? data.skills.length : 0,
+            type: 'github'
+          };
+        } catch {
+          // 没有 skills.json，检查是否有 plugin.json
+          const pluginPaths = ['.claude-plugin/plugin.json', 'plugin.json'];
+          for (const p of pluginPaths) {
+            const raw = await this.fetchRawFile(owner, repo, 'HEAD', p);
+            if (raw) {
+              try {
+                const pluginJson = JSON.parse(raw);
+                const skillPaths = this.normalizeSkillPaths(pluginJson.skills);
+                return {
+                  name: pluginJson.name || repo,
+                  skillCount: skillPaths.length,
+                  type: 'github'
+                };
+              } catch {
+                // continue
+              }
+            }
+          }
+
+          // 检查 plugins/ 目录
+          const pluginsDir = await this.listRepoDir(owner, repo, 'plugins');
+          if (pluginsDir && pluginsDir.length > 0) {
+            const dirs = pluginsDir.filter((i: any) => i.type === 'dir');
+            return {
+              name: repo,
+              skillCount: dirs.length,
+              type: 'github'
+            };
+          }
+
+          // 检查 skills/ 目录 (Agent Skills 标准格式)
+          const skillsDir = await this.listRepoDir(owner, repo, 'skills');
+          if (skillsDir && skillsDir.length > 0) {
+            const dirs = skillsDir.filter((i: any) => i.type === 'dir');
+            if (dirs.length > 0) {
+              return {
+                name: repo,
+                skillCount: dirs.length,
+                type: 'github'
+              };
+            }
+          }
+
+          throw new Error('仓库中未找到有效的 skills 配置');
+        }
       } else {
-        const result = await this.fetchJSONRepository(url, tempId);
+        // JSON 仓库
+        const response = await axios.get(url, {
+          timeout: this.REQUEST_TIMEOUT,
+          headers: { 'Accept': 'application/json', 'User-Agent': 'MultiCLI-SkillManager/1.0' }
+        });
+        const data = response.data;
         return {
-          name: result.name,
-          skillCount: result.skills.length,
+          name: data.name || 'Unknown',
+          skillCount: Array.isArray(data.skills) ? data.skills.length : 0,
           type: 'json'
         };
       }

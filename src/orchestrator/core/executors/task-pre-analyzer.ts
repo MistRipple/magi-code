@@ -62,8 +62,6 @@ export interface ExecutionStrategy {
 export interface PreAnalysisOptions {
   /** 项目上下文 */
   projectContext?: string;
-  /** 跳过 LLM 分析（使用规则分析） */
-  skipLLMAnalysis?: boolean;
 }
 
 /**
@@ -81,70 +79,9 @@ export class TaskPreAnalyzer {
   ): Promise<ExecutionStrategy> {
     logger.info('任务预分析.开始', { missionId: mission.id, goal: mission.goal }, LogCategory.ORCHESTRATOR);
 
-    // 首先使用规则进行快速分析
-    const ruleBasedStrategy = this.analyzeByRules(mission);
-
-    // 如果是简单任务或跳过 LLM 分析，直接返回规则分析结果
-    if (ruleBasedStrategy.complexity === TaskComplexity.SIMPLE || options.skipLLMAnalysis) {
-      logger.info('任务预分析.规则分析', { strategy: ruleBasedStrategy }, LogCategory.ORCHESTRATOR);
-      return ruleBasedStrategy;
-    }
-
-    // 复杂任务使用 LLM 进行深度分析
-    try {
-      const llmStrategy = await this.analyzeWithLLM(mission, options);
-      logger.info('任务预分析.LLM分析', { strategy: llmStrategy }, LogCategory.ORCHESTRATOR);
-      return llmStrategy;
-    } catch (error) {
-      logger.warn('任务预分析.LLM分析失败，回退规则分析', { error }, LogCategory.ORCHESTRATOR);
-      return ruleBasedStrategy;
-    }
-  }
-
-  /**
-   * 基于规则的快速分析
-   */
-  private analyzeByRules(mission: Mission): ExecutionStrategy {
-    const assignmentCount = mission.assignments.length;
-    const hasContracts = mission.contracts && mission.contracts.length > 0;
-    const goalLength = mission.goal.length;
-
-    // 简单任务判定
-    if (assignmentCount <= 1 && !hasContracts && goalLength < 200) {
-      return {
-        complexity: TaskComplexity.SIMPLE,
-        needsPlanning: false, // 简单任务不需要规划
-        needsReview: false,
-        needsVerification: false,
-        parallel: false,
-        reasoning: '单一 Assignment，无契约依赖，跳过规划和评审',
-        analysisSummary: '📋 简单任务，直接执行',
-      };
-    }
-
-    // 中等任务判定
-    if (assignmentCount <= 3 && !hasContracts) {
-      return {
-        complexity: TaskComplexity.MODERATE,
-        needsPlanning: true,
-        needsReview: false,
-        needsVerification: true,
-        parallel: assignmentCount > 1,
-        reasoning: '多个 Assignment，需要规划协调，无需评审',
-        analysisSummary: `📋 中等任务，${assignmentCount} 个子任务，需要规划`,
-      };
-    }
-
-    // 复杂任务
-    return {
-      complexity: TaskComplexity.COMPLEX,
-      needsPlanning: true,
-      needsReview: true,
-      needsVerification: true,
-      parallel: true,
-      reasoning: '多 Worker 协作或有契约依赖，需要完整流程',
-      analysisSummary: `📋 复杂任务，${assignmentCount} 个子任务，需要完整编排`,
-    };
+    const llmStrategy = await this.analyzeWithLLM(mission, options);
+    logger.info('任务预分析.LLM分析', { strategy: llmStrategy }, LogCategory.ORCHESTRATOR);
+    return llmStrategy;
   }
 
   /**
@@ -173,8 +110,8 @@ export class TaskPreAnalyzer {
         tokenUsage: response.tokenUsage,
       };
     } catch (error) {
-      logger.warn('任务预分析.解析失败', { error, response: response.content }, LogCategory.ORCHESTRATOR);
-      return this.analyzeByRules(mission);
+      logger.error('任务预分析.解析失败', { error, response: response.content }, LogCategory.ORCHESTRATOR);
+      throw new Error('任务预分析解析失败');
     }
   }
 
@@ -240,7 +177,7 @@ ${options.projectContext ? `## 项目上下文\n${options.projectContext}` : ''}
       needsVerification: Boolean(parsed.needsVerification),
       parallel: Boolean(parsed.parallel),
       reasoning: String(parsed.reasoning || ''),
-      analysisSummary: String(parsed.analysisSummary || '📋 任务分析完成'),
+      analysisSummary: String(parsed.analysisSummary || '任务分析完成'),
     };
   }
 

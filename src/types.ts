@@ -9,6 +9,7 @@
 
 // ✅ 导入并重新导出新的 AgentType 系统
 import type { AgentType, WorkerSlot, AgentRole } from './types/agent-types';
+import type { StandardMessage, StreamUpdate } from './protocol/message-protocol';
 export type { AgentType, WorkerSlot, AgentRole };
 
 
@@ -540,100 +541,9 @@ export type WebviewToExtensionMessage =
 export type MessageSource = 'orchestrator' | 'worker' | 'system';
 
 export type ExtensionToWebviewMessage =
-  | { type: 'stateUpdate'; state: UIState }
-  | { type: 'messageReceived'; requestId?: string; sessionId?: string | null }
-  | { type: 'taskAccepted'; requestId?: string; sessionId?: string | null }
-  | { type: 'taskRejected'; requestId?: string; message: string; sessionId?: string | null }
-  | { type: 'taskUpdate'; task: Task }
-  | { type: 'workerStatusUpdate'; statuses: Record<string, { status: string; model?: string; error?: string }> }
-  | { type: 'workerStatusChanged'; worker: WorkerSlot; available: boolean; model?: string }
-  | { type: 'workerError'; worker: string; error: string; source?: MessageSource }
-  | { type: 'streamEvent'; phase: 'chunk' | 'complete'; content?: string; error?: string; sessionId?: string | null; source?: MessageSource; worker?: WorkerSlot; append?: boolean; sentAt?: number; target?: 'thread' | 'worker' }
-  | { type: 'loginSuccess' }
-  | { type: 'loginError'; message: string }
-  | { type: 'authStatus'; loggedIn: boolean }
-  | { type: 'toast'; message: string; toastType?: 'success' | 'error' | 'warning' | 'info'; duration?: number }
-  | { type: 'sessionLoaded'; session: Session }
-  | { type: 'sessionCreated'; session: Session }
-  | { type: 'sessionSwitched'; sessionId: string; session?: Session }
-  | { type: 'sessionSummaryLoaded'; sessionId: string; summary: any }
-  | { type: 'sessionMessagesLoaded'; sessionId: string; messages: any[]; workerMessages?: { claude: any[]; codex: any[]; gemini: any[] } }
-  | { type: 'sessionsUpdated'; sessions: Session[] }
-  | { type: 'showDiff'; filePath: string; diff: string }
-  | { type: 'confirmationRequest'; plan: unknown; formattedPlan: string }
-  | { type: 'error'; message: string }
-  // 新增：编排者专用消息类型
-  | { type: 'orchestratorMessage'; content: string; phase: string; taskId?: string; messageType?: string; metadata?: Record<string, unknown>; sessionId?: string | null; timestamp?: number }
-  // 新增：Worker 专用消息类型
-  | { type: 'workerOutput'; workerId: string; workerType: WorkerSlot; content: string; subTaskId: string }
-  // 交互模式相关
-  | { type: 'interactionModeChanged'; mode: InteractionMode }
-  | { type: 'phaseChanged'; phase: string; taskId: string; isRunning?: boolean }
-  // verificationResult 已移除：验证结果在最终总结中统一显示
-  | { type: 'recoveryRequest'; taskId: string; error: string; canRetry: boolean; canRollback: boolean }
-  | { type: 'recoveryResult'; success: boolean; strategy: string; message: string }
-  | { type: 'taskPaused'; taskId: string }
-  | { type: 'taskResumed'; taskId: string }
-
-  | { type: 'executionStatsUpdate'; stats: WorkerExecutionStats[]; orchestratorStats?: { totalTasks: number; totalSuccess: number; totalFailed: number; totalInputTokens: number; totalOutputTokens: number }; modelCatalog?: ModelCatalogEntry[] }
-  | { type: 'workerFallbackNotice'; originalWorker: WorkerSlot; fallbackWorker: WorkerSlot; reason: string }
-
-  | { type: 'workerTaskCard'; worker: WorkerSlot; taskId: string; subTaskId: string; description: string; targetFiles?: string[]; reason?: string; status: string; dispatchId?: string; sessionId?: string | null }
-
-  | { type: 'promptEnhanceResult'; success: boolean; message: string }
-  | { type: 'promptEnhanceSaved'; success: boolean; error?: string }
-
-  | { type: 'promptEnhanced'; enhancedPrompt: string; error: string }
-  // 新增：LLM 配置响应
-  | { type: 'allWorkerConfigsLoaded'; configs: any }
-  | { type: 'workerConfigSaved'; worker: WorkerSlot; success?: boolean; error?: string }
-  | { type: 'workerConnectionTestResult'; worker: WorkerSlot; success: boolean; error?: string }
-  | { type: 'orchestratorConfigLoaded'; config: any }
-  | { type: 'orchestratorConfigSaved'; success?: boolean; error?: string }
-  | { type: 'orchestratorConnectionTestResult'; success: boolean; error?: string }
-  | { type: 'compressorConfigLoaded'; config: any }
-  | { type: 'compressorConfigSaved'; success?: boolean; error?: string }
-  | { type: 'compressorConnectionTestResult'; success: boolean; error?: string; fallbackModel?: string }
-  // 新增：MCP 配置响应
-  | { type: 'mcpServersLoaded'; servers: any[] }
-  | { type: 'mcpServerAdded'; server: any }
-  | { type: 'mcpServerUpdated'; serverId: string }
-  | { type: 'mcpServerDeleted'; serverId: string }
-  | { type: 'mcpServerConnected'; serverId: string; toolCount: number }
-  | { type: 'mcpServerDisconnected'; serverId: string }
-  | { type: 'mcpServerConnectionFailed'; serverId: string; error: string }
-  | { type: 'mcpToolsRefreshed'; serverId: string; tools: any[] }
-  | { type: 'mcpServerTools'; serverId: string; tools: any[] }
-  // 新增：Skills 配置响应
-  | { type: 'skillsConfigLoaded'; config: any }
-  | { type: 'skillsConfigSaved' }
-  | { type: 'profileConfigSaved'; success: boolean; error?: string }
-  | { type: 'profileConfigReset'; success: boolean; error?: string }
-  | { type: 'builtInToolToggled'; tool: string; enabled: boolean }
-  | { type: 'customToolAdded'; tool: any }
-  | { type: 'customToolRemoved'; toolName: string }
-  | { type: 'instructionSkillRemoved'; skillName: string }
-  | { type: 'skillInstalled'; skillId: string; skill: any }
-  // 新增：Skills 仓库响应
-  | { type: 'repositoriesLoaded'; repositories: any[] }
-  | { type: 'repositoryAdded'; repository: any }
-  | { type: 'repositoryUpdated'; repositoryId: string }
-  | { type: 'repositoryDeleted'; repositoryId: string }
-  | { type: 'repositoryRefreshed'; repositoryId: string }
-  | { type: 'skillLibraryLoaded'; skills: any[] }
-  // 新增：项目知识响应
-  | { type: 'projectKnowledgeLoaded'; codeIndex: any; adrs: any[]; faqs: any[] }
-  | { type: 'adrsLoaded'; adrs: any[] }
-  | { type: 'faqsLoaded'; faqs: any[] }
-  | { type: 'faqSearchResults'; results: any[] }
-  | { type: 'adrAdded'; adr: any }
-  | { type: 'adrUpdated'; id: string }
-  | { type: 'adrDeleted'; id: string }
-  | { type: 'faqAdded'; faq: any }
-  | { type: 'faqUpdated'; id: string }
-  | { type: 'faqDeleted'; id: string }
-  // 新增：工具授权相关
-  | { type: 'toolAuthorizationRequest'; toolName: string; toolArgs: any };
+  | { type: 'unifiedMessage'; message: StandardMessage; sessionId?: string | null }
+  | { type: 'unifiedUpdate'; update: StreamUpdate; sessionId?: string | null }
+  | { type: 'unifiedComplete'; message: StandardMessage; sessionId?: string | null };
 
 /** Worker 执行统计数据（用于 UI 显示） */
 export interface WorkerExecutionStats {

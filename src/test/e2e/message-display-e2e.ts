@@ -5,7 +5,7 @@
  */
 
 import { routeStandardMessage } from '../../ui/webview-svelte/src/lib/message-router';
-import { MessageLifecycle, MessageType, type StandardMessage } from '../../protocol/message-protocol';
+import { MessageLifecycle, MessageType, MessageCategory, type StandardMessage } from '../../protocol/message-protocol';
 
 declare const describe: (name: string, fn: () => void) => void;
 declare const test: (name: string, fn: () => void | Promise<void>) => void;
@@ -15,6 +15,7 @@ function createMessage(overrides: Partial<StandardMessage>): StandardMessage {
   return {
     id: overrides.id || `msg-${Date.now()}`,
     traceId: overrides.traceId || 'trace',
+    category: overrides.category || MessageCategory.CONTENT,  // 🔧 统一消息通道：默认 CONTENT
     type: overrides.type || MessageType.TEXT,
     source: overrides.source || 'orchestrator',
     agent: overrides.agent || 'claude',

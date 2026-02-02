@@ -64,10 +64,6 @@ export {
   MessageHub,
   globalMessageHub,
   type SubTaskView,
-  type ProgressData,
-  type ResultData,
-  type ErrorData,
-  type WorkerOutputData,
   type MessageHubEvents,
 } from './core';
 

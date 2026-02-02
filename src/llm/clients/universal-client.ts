@@ -229,6 +229,51 @@ export class UniversalLLMClient extends BaseLLMClient {
     });
   }
 
+  private mapToolsForOpenAI(tools?: ToolDefinition[]): any[] | undefined {
+    if (!tools || tools.length === 0) {
+      return undefined;
+    }
+
+    return tools.map(tool => ({
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description || 'No description available',
+        parameters: this.sanitizeSchema(tool.input_schema),
+      },
+    }));
+  }
+
+  private mapToolChoiceForOpenAI(choice?: LLMMessageParams['toolChoice']): any | undefined {
+    if (!choice) return undefined;
+    if (typeof choice === 'string') {
+      if (choice === 'auto' || choice === 'none' || choice === 'required') return choice;
+      return undefined;
+    }
+    if (choice.type === 'any') {
+      return 'required';
+    }
+    if (choice.type === 'tool' && choice.name) {
+      return { type: 'function', function: { name: choice.name } };
+    }
+    return undefined;
+  }
+
+  private mapToolChoiceForAnthropic(choice?: LLMMessageParams['toolChoice']): any | undefined {
+    if (!choice) return undefined;
+    if (typeof choice === 'string') {
+      if (choice === 'required') return { type: 'any' };
+      return undefined;
+    }
+    if (choice.type === 'any') {
+      return { type: 'any' };
+    }
+    if (choice.type === 'tool' && choice.name) {
+      return { type: 'tool', name: choice.name };
+    }
+    return undefined;
+  }
+
   /**
    * 清理 JSON Schema，移除某些 API 不支持的属性
    */
@@ -354,6 +399,11 @@ export class UniversalLLMClient extends BaseLLMClient {
       tools: sanitizedTools as any,
     };
 
+    const anthropicToolChoice = this.mapToolChoiceForAnthropic(params.toolChoice);
+    if (anthropicToolChoice) {
+      requestParams.tool_choice = anthropicToolChoice;
+    }
+
     // 为支持 thinking 的模型添加 thinking 参数
     if (supportsThinking) {
       requestParams.thinking = {
@@ -395,6 +445,11 @@ export class UniversalLLMClient extends BaseLLMClient {
       tools: sanitizedTools as any,
       stream: true as const,
     };
+
+    const anthropicToolChoice = this.mapToolChoiceForAnthropic(params.toolChoice);
+    if (anthropicToolChoice) {
+      requestParams.tool_choice = anthropicToolChoice;
+    }
 
     // 为支持 thinking 的模型添加 thinking 参数
     if (supportsThinking) {
@@ -648,13 +703,19 @@ export class UniversalLLMClient extends BaseLLMClient {
     const messages = this.convertToOpenAIFormat(params);
 
     // 构建请求参数
+    const openAiTools = this.mapToolsForOpenAI(params.tools);
     const requestParams: any = {
       model: this.config.model,
       messages,
       max_tokens: params.maxTokens,
       temperature: params.temperature,
-      tools: params.tools as any,
+      tools: openAiTools,
     };
+
+    const openAiToolChoice = this.mapToolChoiceForOpenAI(params.toolChoice);
+    if (openAiToolChoice && openAiTools && openAiTools.length > 0) {
+      requestParams.tool_choice = openAiToolChoice;
+    }
 
     // 对所有请求启用 reasoning（让后端决定是否支持）
     if (this.shouldEnableThinking()) {
@@ -692,15 +753,21 @@ export class UniversalLLMClient extends BaseLLMClient {
     const messages = this.convertToOpenAIFormat(params);
 
     // 构建请求参数
+    const openAiTools = this.mapToolsForOpenAI(params.tools);
     const requestParams: any = {
       model: this.config.model,
       messages,
       max_tokens: params.maxTokens,
       temperature: params.temperature,
-      tools: params.tools as any,
+      tools: openAiTools,
       stream: true,
       stream_options: { include_usage: true },
     };
+
+    const openAiToolChoice = this.mapToolChoiceForOpenAI(params.toolChoice);
+    if (openAiToolChoice && openAiTools && openAiTools.length > 0) {
+      requestParams.tool_choice = openAiToolChoice;
+    }
 
     // 对所有请求启用 reasoning（让后端决定是否支持）
     if (this.shouldEnableThinking()) {

@@ -17,13 +17,14 @@
  *
  * 消息流架构（4层）：
  * Layer 1: Normalizer.emit('message')
- * Layer 2: Adapter → messageBus.sendMessage() [直接调用]
+ * Layer 2: Adapter → messageHub.sendMessage() [直接调用]
  * Layer 3: MessageBus → emit('message')
  * Layer 4: 测试捕获 / WebviewProvider → postMessage()
  */
 
 import { LLMAdapterFactory } from '../../llm/adapter-factory';
 import { MissionDrivenEngine } from '../../orchestrator/core';
+import { MessageHub } from '../../orchestrator/core/message-hub';
 import { SnapshotManager } from '../../snapshot-manager';
 import { UnifiedSessionManager } from '../../session';
 import { UnifiedTaskManager } from '../../task/unified-task-manager';
@@ -32,8 +33,6 @@ import { globalEventBus } from '../../events';
 import { ContextManager } from '../../context/context-manager';
 import { ProjectKnowledgeBase } from '../../knowledge/project-knowledge-base';
 import { ToolManager } from '../../tools/tool-manager';
-import { UnifiedMessageBus } from '../../normalizer/unified-message-bus';
-import { MESSAGE_EVENTS, PROCESSING_EVENTS } from '../../protocol/event-names';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -67,7 +66,7 @@ class E2ETestHarness {
   private adapterFactory: LLMAdapterFactory;
   private sessionManager: UnifiedSessionManager;
   private snapshotManager: SnapshotManager;
-  private messageBus: UnifiedMessageBus;
+  private messageHub!: MessageHub;  // 🔧 统一消息通道：替代 messageBus
   private orchestrator: MissionDrivenEngine | null = null;
   private taskManager: UnifiedTaskManager | null = null;
   private contextManager: ContextManager | null = null;
@@ -81,23 +80,11 @@ class E2ETestHarness {
     this.sessionManager = new UnifiedSessionManager(workspaceRoot);
     this.snapshotManager = new SnapshotManager(this.sessionManager, workspaceRoot);
 
-    // 创建 MessageBus（消息总线）
-    this.messageBus = new UnifiedMessageBus({
-      enabled: true,
-      minStreamInterval: 50,
-      batchInterval: 100,
-      retentionTime: 60000,
-      debug: true,
-    });
-
-    // 创建 AdapterFactory 并注入 MessageBus
+    // 🔧 统一消息通道：AdapterFactory 创建后，在 initialize() 中通过 orchestrator 获取 MessageHub
     this.adapterFactory = new LLMAdapterFactory({ cwd: workspaceRoot });
-    this.adapterFactory.setMessageBus(this.messageBus);
   }
 
   async initialize(): Promise<void> {
-    await this.adapterFactory.initialize();
-
     const session = this.sessionManager.getOrCreateCurrentSession();
     const repository = new SessionManagerTaskRepository(this.sessionManager, session.id);
     this.taskManager = new UnifiedTaskManager(session.id, repository);
@@ -146,6 +133,13 @@ class E2ETestHarness {
       this.sessionManager
     );
 
+    // 🔧 统一消息通道：从 orchestrator 获取 MessageHub 并注入给 AdapterFactory
+    this.messageHub = this.orchestrator.getMessageHub();
+    this.adapterFactory.setMessageHub(this.messageHub);
+
+    // 异步初始化 adapter factory（在 MessageHub 注入之后）
+    await this.adapterFactory.initialize();
+
     // 自动确认回调
     this.orchestrator.setConfirmationCallback(async () => true);
     this.orchestrator.setQuestionCallback(async (questions) =>
@@ -165,15 +159,14 @@ class E2ETestHarness {
   /**
    * 设置消息捕获
    *
-   * 消息流架构（4层）：
+   * 🔧 统一消息通道架构（3层）：
    * Layer 1: Normalizer.emit('message')
-   * Layer 2: Adapter → messageBus.sendMessage() [直接调用]
-   * Layer 3: MessageBus → emit('message') ← 测试在此捕获
-   * Layer 4: WebviewProvider → postMessage()
+   * Layer 2: Adapter → messageHub.sendMessage() [直接调用]
+   * Layer 3: MessageHub → emit('unified:message') ← 测试在此捕获
    */
   private setupMessageCapture(): void {
-    // 监听 MessageBus 的消息事件（Layer 3）
-    this.messageBus.on(MESSAGE_EVENTS.MESSAGE, (msg: any) => {
+    // 监听 MessageHub 的统一消息事件（Layer 3）
+    this.messageHub.on('unified:message', (msg: any) => {
       this.capturedMessages.push({
         id: msg.id || '',
         source: msg.source || 'unknown',
@@ -185,7 +178,7 @@ class E2ETestHarness {
       });
     });
 
-    this.messageBus.on(MESSAGE_EVENTS.COMPLETE, (msg: any) => {
+    this.messageHub.on('unified:complete', (msg: any) => {
       this.capturedMessages.push({
         id: msg.id || '',
         source: msg.source || 'unknown',
@@ -198,7 +191,7 @@ class E2ETestHarness {
     });
 
     // 捕获流式更新
-    this.messageBus.on(MESSAGE_EVENTS.UPDATE, (update: any) => {
+    this.messageHub.on('unified:update', (update: any) => {
       this.streamUpdates.push({
         messageId: update.messageId || '',
         content: update.appendText || update.content || '',
@@ -206,8 +199,8 @@ class E2ETestHarness {
       });
     });
 
-    // 捕获处理状态变化
-    this.messageBus.on(PROCESSING_EVENTS.STATE_CHANGED, (state: any) => {
+    // 捕获处理状态变化（通过 MessageHub 的 control 事件）
+    this.messageHub.on('processingStateChanged', (state: any) => {
       this.processingStateChanges.push({
         isProcessing: state.isProcessing,
         timestamp: Date.now()

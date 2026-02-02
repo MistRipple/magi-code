@@ -10,11 +10,6 @@
   }
   let { messages }: Props = $props();
 
-  // 🛡️ 防御性编程：过滤无效的消息，防止 Svelte 5 "reading 'prev'" 错误
-  const safeMessages = $derived(
-    (messages || []).filter(m => !!m && !!m.id)
-  );
-
   // 容器引用
   let containerRef: HTMLDivElement | null = $state(null);
 
@@ -73,7 +68,7 @@
     bind:this={containerRef}
     onscroll={handleScroll}
   >
-    {#if safeMessages.length === 0}
+    {#if messages.length === 0}
       <div class="empty-state">
         <div class="empty-icon">
           <Icon name="chat" size={48} />
@@ -82,7 +77,7 @@
         <p class="empty-hint">在下方输入框中输入你的问题</p>
       </div>
     {:else}
-      {#each safeMessages as message (message.id)}
+      {#each messages as message (message.id)}
         <MessageItem {message} />
       {/each}
     {/if}
@@ -181,4 +176,3 @@
     transform: translateY(-2px);
   }
 </style>
-

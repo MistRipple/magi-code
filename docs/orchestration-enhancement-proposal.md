@@ -34,7 +34,7 @@
 
 MultiCLI 已完成 `orchestration-unified-design.md` 中定义的核心架构重构，包括：
 
-- 双轨制执行（QuickExecutor + MissionOrchestrator）
+- 单路径执行（ASK 直答；需要 Worker 进入 MissionOrchestrator）
 - 层级简化（6 层 → 3 层）
 - Worker 汇报协议
 - 统一消息出口（MessageHub）
@@ -351,7 +351,8 @@ if (!verifyWorkerClaims(result)) {
 ```
 IntentGate
     │
-    ├── ASK/DIRECT/EXPLORE → QuickExecutor (快速路径)
+    ├── ASK → 编排者直答
+    ├── DIRECT/EXPLORE → LLM 决策（需要 Worker 则进入 MissionOrchestrator）
     │
     └── TASK → MissionOrchestrator (完整路径)
 ```

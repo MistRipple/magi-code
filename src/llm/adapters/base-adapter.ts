@@ -1,11 +1,12 @@
 /**
  * LLM 适配器抽象基类
  *
- * 消息流架构（4层）：
+ * 🔧 统一消息通道（unified-message-channel-design.md v2.5）
+ *
+ * 消息流架构（3层）：
  * Layer 1: Normalizer.emit('message')
- * Layer 2: Adapter.setupNormalizerEvents() → messageBus.sendMessage() [直接调用]
- * Layer 3: MessageBus → emit('message')
- * Layer 4: WebviewProvider.setupMessageBusListeners() → postMessage()
+ * Layer 2: Adapter.setupNormalizerEvents() → messageHub.sendMessage() [直接调用]
+ * Layer 3: MessageHub → emit('standard:message') → WebviewProvider.postMessage()
  */
 
 import { EventEmitter } from 'events';
@@ -13,7 +14,7 @@ import { AgentType, AgentRole, LLMConfig, TokenUsage } from '../../types/agent-t
 import { LLMClient } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager } from '../../tools/tool-manager';
-import { UnifiedMessageBus } from '../../normalizer/unified-message-bus';
+import { MessageHub } from '../../orchestrator/core/message-hub';
 import { logger, LogCategory } from '../../logging';
 import { MESSAGE_EVENTS, ADAPTER_EVENTS } from '../../protocol/event-names';
 
@@ -42,8 +43,8 @@ export interface AdapterEvents {
 /**
  * LLM 适配器基类
  *
- * 直接持有 MessageBus 引用，消息通过 MessageBus 发送到前端。
- * 不再通过事件转发链，减少层级，提高效率。
+ * 🔧 统一消息通道：持有 MessageHub 引用，消息通过 MessageHub 发送到前端。
+ * 不再通过 UnifiedMessageBus 事件转发链，减少层级，提高效率。
  */
 export abstract class BaseLLMAdapter extends EventEmitter {
   protected state: AdapterState = AdapterState.DISCONNECTED;
@@ -56,10 +57,10 @@ export abstract class BaseLLMAdapter extends EventEmitter {
   protected totalTokenUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
 
   /**
-   * 消息总线 - 直接发送消息到前端
-   * 这是消息的唯一出口，不再通过事件转发
+   * 消息出口 - 直接发送消息到前端
+   * 🔧 统一消息通道：替代 UnifiedMessageBus，成为唯一出口
    */
-  protected messageBus: UnifiedMessageBus;
+  protected messageHub: MessageHub;
 
   /**
    * 控制是否将消息流式传输到 UI
@@ -73,16 +74,16 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     normalizer: BaseNormalizer,
     toolManager: ToolManager,
     config: LLMConfig,
-    messageBus: UnifiedMessageBus
+    messageHub: MessageHub
   ) {
     super();
     this.client = client;
     this.normalizer = normalizer;
     this.toolManager = toolManager;
     this.config = config;
-    this.messageBus = messageBus;
+    this.messageHub = messageHub;
 
-    // 设置 Normalizer 事件处理，直接发送到 MessageBus
+    // 设置 Normalizer 事件处理，直接发送到 MessageHub
     this.setupNormalizerEvents();
   }
 
@@ -103,30 +104,30 @@ export abstract class BaseLLMAdapter extends EventEmitter {
   /**
    * 设置 Normalizer 事件处理
    *
-   * 消息直接发送到 MessageBus（Layer 2 → Layer 3）：
+   * 🔧 统一消息通道：消息直接发送到 MessageHub（Layer 2 → Layer 3）：
    * - 根据 streamToUI 控制是否发送
    * - 跳过 AdapterFactory 和 WebviewProvider 的中间转发层
    * - 错误事件仍通过 EventEmitter 传递（需要特殊处理）
    */
   private setupNormalizerEvents(): void {
-    // 消息开始/流式：直接发送到 MessageBus
+    // 消息开始/流式：直接发送到 MessageHub
     this.normalizer.on(MESSAGE_EVENTS.MESSAGE, (message) => {
       if (this._streamToUI) {
-        this.messageBus.sendMessage(message);
+        this.messageHub.sendMessage(message);
       }
     });
 
-    // 消息完成：直接发送到 MessageBus
+    // 消息完成：直接发送到 MessageHub
     this.normalizer.on(MESSAGE_EVENTS.COMPLETE, (_messageId, message) => {
       if (this._streamToUI) {
-        this.messageBus.sendMessage(message);
+        this.messageHub.sendMessage(message);
       }
     });
 
-    // 流式更新：直接发送到 MessageBus
+    // 流式更新：直接发送到 MessageHub
     this.normalizer.on(MESSAGE_EVENTS.UPDATE, (update) => {
       if (this._streamToUI) {
-        this.messageBus.sendUpdate(update);
+        this.messageHub.sendUpdate(update);
       }
     });
 

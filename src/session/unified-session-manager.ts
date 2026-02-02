@@ -299,6 +299,20 @@ export class UnifiedSessionManager {
   updateSessionData(sessionId: string, messages: SessionMessage[]): boolean {  // ✅ 移除 cliOutputs 参数
     const session = this.sessions.get(sessionId);
     if (session) {
+      for (const msg of messages) {
+        if (!msg.id || typeof msg.id !== 'string' || !msg.id.trim()) {
+          throw new Error('Session message missing id');
+        }
+        if (!msg.role || !['user', 'assistant', 'system'].includes(msg.role)) {
+          throw new Error('Session message role invalid');
+        }
+        if (typeof msg.content !== 'string') {
+          throw new Error('Session message content invalid');
+        }
+        if (typeof msg.timestamp !== 'number') {
+          throw new Error('Session message timestamp invalid');
+        }
+      }
       session.messages = messages;
       // ✅ 移除 cliOutputs 更新逻辑
       session.updatedAt = Date.now();
@@ -617,64 +631,25 @@ export class UnifiedSessionManager {
 
     // 消息数据验证
     for (const msg of session.messages) {
-      if (!msg.id || !msg.role || !['user', 'assistant', 'system'].includes(msg.role)) {
-        logger.error('会话.验证.消息_非法', { message: msg }, LogCategory.SESSION);
+      if (!msg.id || typeof msg.id !== 'string' || !msg.id.trim()) {
+        logger.error('会话.验证.消息_缺失_id', { message: msg }, LogCategory.SESSION);
+        return false;
+      }
+      if (!msg.role || !['user', 'assistant', 'system'].includes(msg.role)) {
+        logger.error('会话.验证.消息_非法_role', { message: msg }, LogCategory.SESSION);
+        return false;
+      }
+      if (typeof msg.content !== 'string') {
+        logger.error('会话.验证.消息_非法_content', { message: msg }, LogCategory.SESSION);
+        return false;
+      }
+      if (typeof msg.timestamp !== 'number') {
+        logger.error('会话.验证.消息_非法_timestamp', { message: msg }, LogCategory.SESSION);
         return false;
       }
     }
 
     return true;
-  }
-
-  /** 规范化会话数据（验证并修复异常字段） */
-  private normalizeSessionData(session: UnifiedSession): UnifiedSession {
-    if (!session || typeof session !== 'object') return session;
-    if (!Array.isArray(session.messages)) return session;
-    if (!Array.isArray(session.tasks)) {
-      session.tasks = [];
-    }
-    if (!Array.isArray(session.snapshots)) {
-      session.snapshots = [];
-    }
-
-    const now = Date.now();
-    session.messages = session.messages.map((msg: any) => {
-      const role = msg?.role;
-      const normalizedRole = role === 'user'
-        ? 'user'
-        : role === 'assistant' || role === 'system'
-          ? role
-          : 'assistant';
-
-      return {
-        ...msg,
-        id: msg?.id || `msg-${now}-${Math.random().toString(36).substring(2, 6)}`,
-        role: normalizedRole,
-        content: typeof msg?.content === 'string'
-          ? msg.content
-          : (msg?.content ? JSON.stringify(msg.content) : ''),
-        timestamp: typeof msg?.timestamp === 'number' ? msg.timestamp : now,
-      } as SessionMessage;
-    });
-
-    const normalizedSnapshots: FileSnapshotMeta[] = [];
-    let removedSnapshots = 0;
-    for (const snapshot of session.snapshots) {
-      if (!this.isValidSnapshotMeta(snapshot)) {
-        removedSnapshots++;
-        continue;
-      }
-      normalizedSnapshots.push({
-        ...snapshot,
-        filePath: snapshot.filePath.trim(),
-      });
-    }
-    if (removedSnapshots > 0) {
-      logger.warn('会话.规范化.清理_非法快照', { sessionId: session.id, removed: removedSnapshots }, LogCategory.SESSION);
-    }
-    session.snapshots = normalizedSnapshots;
-
-    return session;
   }
 
   private isValidSnapshotMeta(snapshot: FileSnapshotMeta | undefined | null): snapshot is FileSnapshotMeta {
@@ -789,12 +764,10 @@ export class UnifiedSessionManager {
         const data = fs.readFileSync(filePath, 'utf-8');
         let session = JSON.parse(data) as UnifiedSession;
 
-        // 加载时规范化消息结构
-        session = this.normalizeSessionData(session);
-
         // 数据完整性验证
         if (!this.validateSessionData(session)) {
           logger.error('会话.加载.校验_失败', { sessionId }, LogCategory.SESSION);
+          this.backupCorruptedSession(sessionId, filePath);
           return null;
         }
 
