@@ -254,19 +254,7 @@ export class MissionDrivenEngine extends EventEmitter {
    * 设置事件转发
    */
   private setupEventForwarding(): void {
-    // Mission 状态变化 -> OrchestratorState 变化
-    this.missionOrchestrator.on('missionPhaseChanged', ({ phase }) => {
-      const stateMap: Record<string, OrchestratorState> = {
-        goal_understanding: 'analyzing',
-        collaboration_planning: 'analyzing',
-        worker_planning: 'dispatching',
-        plan_review: 'verifying',
-        execution: 'monitoring',
-        verification: 'verifying',
-        summary: 'summarizing',
-      };
-      this.setState(stateMap[phase] || 'idle');
-    });
+    // Mission Phase 仍可用于内部统计，但不驱动编排者状态机
 
     // Mission 执行进度（现在从 MissionOrchestrator 获取）
     this.missionOrchestrator.on('progress', (progress: ExecutionProgress) => {
@@ -628,14 +616,38 @@ export class MissionDrivenEngine extends EventEmitter {
           'orchestrator',
           classificationPrompt,
           undefined,
-          { source: 'orchestrator', adapterRole: 'orchestrator', streamToUI: false }
+          {
+            source: 'orchestrator',
+            adapterRole: 'orchestrator',
+            streamToUI: false,
+            // 使用独立会话和空 System Prompt，确保意图分类不受编排器默认上下文影响
+            isolatedSession: true,
+            systemPrompt: '你是一个意图分析助手。请严格按照用户提供的指令格式输出 JSON。',
+          }
         );
         this.recordOrchestratorTokens(response.tokenUsage);
+
+        // 详细日志：捕获 LLM 原始响应
+        logger.info('编排器.意图分类.LLM原始响应', {
+          promptPreview: prompt.substring(0, 30),
+          responseContent: response.content?.substring(0, 200),
+        }, LogCategory.ORCHESTRATOR);
+
         try {
           const jsonMatch = response.content?.match(/\{[\s\S]*\}/);
           if (jsonMatch) {
             const parsed = JSON.parse(jsonMatch[0]);
-            return {
+
+            // 详细日志：捕获解析结果
+            logger.info('编排器.意图分类.解析结果', {
+              prompt: prompt.substring(0, 30),
+              parsedIntent: parsed.intent,
+              parsedMode: parsed.recommendedMode,
+              parsedConfidence: parsed.confidence,
+              parsedReason: parsed.reason,
+            }, LogCategory.ORCHESTRATOR);
+
+            const result = {
               intent: parsed.intent || 'task',
               recommendedMode: this.mapToHandlerMode(parsed.recommendedMode),
               confidence: parsed.confidence || 0.8,
@@ -643,6 +655,16 @@ export class MissionDrivenEngine extends EventEmitter {
               clarificationQuestions: parsed.clarificationQuestions || [],
               reason: parsed.reason || '',
             };
+
+            // 详细日志：最终结果
+            logger.info('编排器.意图分类.最终结果', {
+              prompt: prompt.substring(0, 30),
+              intent: result.intent,
+              recommendedMode: result.recommendedMode,
+              confidence: result.confidence,
+            }, LogCategory.ORCHESTRATOR);
+
+            return result;
           }
         } catch (e) {
           logger.warn('意图分类解析失败，准备重试', { error: e }, LogCategory.ORCHESTRATOR);
@@ -756,7 +778,7 @@ export class MissionDrivenEngine extends EventEmitter {
       this.isRunning = true;
       this.currentTaskId = taskId || null;
       this.lastMissionId = null;
-      this.setState('analyzing');
+      this.setState('running');
       this.lastTaskAnalysis = null;
       this.lastRoutingDecision = null;
 
@@ -774,6 +796,11 @@ export class MissionDrivenEngine extends EventEmitter {
         activePrompt,
         resolvedSessionId
       );
+      logger.info('编排器.意图分析.结果', {
+        mode: intentResult.mode,
+        skipMission: intentResult.skipMission,
+        promptPreview: activePrompt.substring(0, 50),
+      }, LogCategory.ORCHESTRATOR);
       while (intentResult.skipMission && intentResult.mode === IntentHandlerMode.CLARIFY && intentResult.clarificationQuestions) {
         if (!this.clarificationCallback) {
           this.currentTaskId = null;
@@ -807,6 +834,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
         if (intentResult.mode === IntentHandlerMode.ASK) {
           // **ASK 模式**: 编排者直接回答，不调用 Worker
+          logger.info('编排器.执行.ASK模式', { prompt: activePrompt.substring(0, 50) }, LogCategory.ORCHESTRATOR);
           const result = await this.executeAskMode(
             activePrompt,
             taskId,
@@ -819,12 +847,23 @@ export class MissionDrivenEngine extends EventEmitter {
 
         if (intentResult.mode === IntentHandlerMode.DIRECT) {
           // **DIRECT 模式**: 由编排者 LLM 决策是否需要 Worker
+          logger.info('编排器.执行.DIRECT模式', { prompt: activePrompt.substring(0, 50) }, LogCategory.ORCHESTRATOR);
           const decision = await this.decideWorkerNeedWithLLM(
             activePrompt,
             IntentHandlerMode.DIRECT
           );
+          logger.info('编排器.DIRECT决策结果', {
+            needsWorker: decision.needsWorker,
+            hasDirectResponse: !!decision.directResponse?.trim(),
+            directResponseLength: decision.directResponse?.length || 0,
+            reason: decision.reason,
+          }, LogCategory.ORCHESTRATOR);
           if (!decision.needsWorker) {
             if (decision.directResponse?.trim()) {
+              logger.info('编排器.DIRECT模式.发送响应', {
+                contentLength: decision.directResponse.length,
+                contentPreview: decision.directResponse.substring(0, 100),
+              }, LogCategory.ORCHESTRATOR);
               this.messageHub.orchestratorMessage(decision.directResponse, {
                 metadata: { intent: 'ask', decision: 'llm' },
               });
@@ -832,6 +871,7 @@ export class MissionDrivenEngine extends EventEmitter {
               this.currentTaskId = null;
               return decision.directResponse;
             }
+            logger.info('编排器.DIRECT模式.无直接响应.转ASK', undefined, LogCategory.ORCHESTRATOR);
             const result = await this.executeAskMode(
               activePrompt,
               taskId,
@@ -859,12 +899,23 @@ export class MissionDrivenEngine extends EventEmitter {
 
         if (intentResult.mode === IntentHandlerMode.EXPLORE) {
           // **EXPLORE 模式**: 由编排者 LLM 决策是否需要 Worker
+          logger.info('编排器.执行.EXPLORE模式', { prompt: activePrompt.substring(0, 50) }, LogCategory.ORCHESTRATOR);
           const decision = await this.decideWorkerNeedWithLLM(
             activePrompt,
             IntentHandlerMode.EXPLORE
           );
+          logger.info('编排器.EXPLORE决策结果', {
+            needsWorker: decision.needsWorker,
+            hasDirectResponse: !!decision.directResponse?.trim(),
+            directResponseLength: decision.directResponse?.length || 0,
+            reason: decision.reason,
+          }, LogCategory.ORCHESTRATOR);
           if (!decision.needsWorker) {
             if (decision.directResponse?.trim()) {
+              logger.info('编排器.EXPLORE模式.发送响应', {
+                contentLength: decision.directResponse.length,
+                contentPreview: decision.directResponse.substring(0, 100),
+              }, LogCategory.ORCHESTRATOR);
               this.messageHub.orchestratorMessage(decision.directResponse, {
                 metadata: { intent: 'ask', decision: 'llm' },
               });
@@ -872,6 +923,7 @@ export class MissionDrivenEngine extends EventEmitter {
               this.currentTaskId = null;
               return decision.directResponse;
             }
+            logger.info('编排器.EXPLORE模式.无直接响应.转ASK', undefined, LogCategory.ORCHESTRATOR);
             const result = await this.executeAskMode(
               activePrompt,
               taskId,
@@ -954,7 +1006,6 @@ export class MissionDrivenEngine extends EventEmitter {
       await this.missionOrchestrator.approveMission(mission.id);
 
       // 8. 执行 Mission
-      this.setState('dispatching');
 
       const analysis = this.lastTaskAnalysis as unknown as {
         wantsParallel?: boolean;
@@ -1001,7 +1052,6 @@ export class MissionDrivenEngine extends EventEmitter {
       }
 
       // 9. 验证结果
-      this.setState('verifying');
       // 不再发送空洞的过渡消息，验证结果会在最终总结中统一呈现
 
       const verificationResult = await this.missionOrchestrator.verifyMission(mission.id);
@@ -1048,7 +1098,6 @@ export class MissionDrivenEngine extends EventEmitter {
       }
 
       // 11. 生成总结
-      this.setState('summarizing');
       // 不再发送空洞的过渡消息，总结内容会直接呈现
 
       const summary = await this.missionOrchestrator.summarizeMission(mission.id);
@@ -1528,7 +1577,7 @@ export class MissionDrivenEngine extends EventEmitter {
         && LLMConfigLoader.validateConfig(compressorConfig, 'compressor');
 
       if (!compressorReady) {
-        logger.warn('编排器.上下文.压缩器.不可用_降级编排模型', {
+        logger.warn('编排器.上下文.压缩模型.不可用_降级编排模型', {
           enabled: compressorConfig.enabled,
           hasBaseUrl: Boolean(compressorConfig.baseUrl),
           hasModel: Boolean(compressorConfig.model),
@@ -1572,7 +1621,7 @@ export class MissionDrivenEngine extends EventEmitter {
         } catch (error: any) {
           const duration = Date.now() - startAt;
           recordCompression(false, duration, undefined, error?.message);
-          logger.warn('编排器.上下文.压缩器.调用失败', {
+          logger.warn('编排器.上下文.压缩模型.调用失败', {
             model: label,
             error: this.normalizeErrorMessage(error),
           }, LogCategory.ORCHESTRATOR);
@@ -1592,7 +1641,7 @@ export class MissionDrivenEngine extends EventEmitter {
               throw error;
             }
             const delay = retryDelays[attempt];
-            logger.warn('编排器.上下文.压缩器.连接失败_重试', {
+            logger.warn('编排器.上下文.压缩模型.连接失败_重试', {
               attempt: attempt + 1,
               delayMs: delay,
               error: this.normalizeErrorMessage(error),
@@ -1621,7 +1670,7 @@ export class MissionDrivenEngine extends EventEmitter {
             if (!shouldFallback) {
               throw error;
             }
-            logger.warn('编排器.上下文.压缩器.降级_使用编排模型', {
+            logger.warn('编排器.上下文.压缩模型.降级_使用编排模型', {
               reason: !compressorReady ? 'not_available'
                 : this.isAuthOrQuotaError(error) ? 'auth_or_quota'
                 : this.isConnectionError(error) ? 'connection'
@@ -1637,13 +1686,13 @@ export class MissionDrivenEngine extends EventEmitter {
 
       this.contextManager.setCompressorAdapter(adapter);
       const activeConfig = compressorReady ? compressorConfig : orchestratorConfig;
-      logger.info('编排器.上下文.压缩器.已设置', {
+      logger.info('编排器.上下文.压缩模型.已设置', {
         model: activeConfig.model,
         provider: activeConfig.provider,
         fallbackToOrchestrator: !compressorReady,
       }, LogCategory.ORCHESTRATOR);
     } catch (error) {
-      logger.error('编排器.上下文.压缩器.设置失败', error, LogCategory.ORCHESTRATOR);
+      logger.error('编排器.上下文.压缩模型.设置失败', error, LogCategory.ORCHESTRATOR);
     }
   }
 
@@ -1767,10 +1816,22 @@ export class MissionDrivenEngine extends EventEmitter {
     taskId: string,
     sessionId: string
   ): Promise<string> {
+    logger.info('编排器.ASK模式.开始', {
+      promptLength: userPrompt.length,
+      promptPreview: userPrompt.substring(0, 50),
+      taskId,
+      sessionId,
+    }, LogCategory.ORCHESTRATOR);
+
     const context = await this.prepareContext(sessionId, userPrompt);
     const prompt = context
       ? `请结合以下会话上下文回答用户问题。\n\n${context}\n\n## 用户问题\n${userPrompt}`
       : userPrompt;
+
+    logger.info('编排器.ASK模式.发送LLM请求', {
+      streamToUI: true,
+      hasContext: !!context,
+    }, LogCategory.ORCHESTRATOR);
 
     const response = await this.adapterFactory.sendMessage(
       'orchestrator',
@@ -1784,6 +1845,12 @@ export class MissionDrivenEngine extends EventEmitter {
       }
     );
 
+    logger.info('编排器.ASK模式.LLM响应', {
+      hasContent: !!response.content?.trim(),
+      contentLength: response.content?.length || 0,
+      hasError: !!response.error,
+    }, LogCategory.ORCHESTRATOR);
+
     this.recordOrchestratorTokens(response.tokenUsage);
 
     if (response.error) {
@@ -1793,6 +1860,8 @@ export class MissionDrivenEngine extends EventEmitter {
     if (response.content && response.content.trim()) {
       return response.content;
     }
+
+    logger.info('编排器.ASK模式.尝试fallback', undefined, LogCategory.ORCHESTRATOR);
 
     const fallbackResponse = await this.adapterFactory.sendMessage(
       'orchestrator',
@@ -1810,7 +1879,32 @@ export class MissionDrivenEngine extends EventEmitter {
       throw new Error(fallbackResponse.error);
     }
 
-    return fallbackResponse.content || '';
+    const fallbackContent = fallbackResponse.content || '';
+    logger.info('编排器.ASK模式.fallback响应', {
+      hasContent: !!fallbackContent.trim(),
+      contentLength: fallbackContent.length,
+    }, LogCategory.ORCHESTRATOR);
+
+    if (fallbackContent.trim()) {
+      const requestId = this.messageHub.getRequestContext();
+      const stats = requestId ? this.messageHub.getRequestMessageStats(requestId) : undefined;
+      const hasAssistantOutput = (stats?.assistantThreadContent ?? 0) > 0;
+      logger.info('编排器.ASK模式.检查是否需要强制发送', {
+        requestId,
+        assistantThreadContent: stats?.assistantThreadContent ?? 0,
+        hasAssistantOutput,
+      }, LogCategory.ORCHESTRATOR);
+      if (!hasAssistantOutput) {
+        logger.info('编排器.ASK模式.强制发送fallback消息', {
+          contentLength: fallbackContent.length,
+        }, LogCategory.ORCHESTRATOR);
+        this.messageHub.orchestratorMessage(fallbackContent, {
+          metadata: { intent: 'ask', reason: 'fallback', forced: true },
+        });
+      }
+    }
+
+    return fallbackContent;
   }
 
   /**

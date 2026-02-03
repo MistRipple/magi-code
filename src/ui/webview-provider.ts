@@ -131,13 +131,36 @@ class WebviewMessageBus {
         }
         const view = this.getView();
         if (!view) {
+          // 🔧 调试日志：Webview 不可用
+          console.warn('[WebviewMessageBus] ⚠️ Webview 不可用，清空队列:', {
+            highQueueLen: this.highQueue.length,
+            normalQueueLen: this.normalQueue.length,
+            droppedType: next.type,
+            droppedMessageId: (next as any).message?.id,
+          });
           this.highQueue.length = 0;
           this.normalQueue.length = 0;
           break;
         }
-        await view.webview.postMessage(next);
+        // 🔧 调试日志：追踪发送到 webview 的消息
+        console.log('[WebviewMessageBus] 发送消息到 webview:', {
+          type: next.type,
+          hasMessage: !!(next as any).message,
+          messageId: (next as any).message?.id,
+          category: (next as any).message?.category,
+        });
+        try {
+          await view.webview.postMessage(next);
+          console.log('[WebviewMessageBus] ✅ 消息发送成功:', (next as any).message?.id);
+        } catch (postError) {
+          console.error('[WebviewMessageBus] ❌ postMessage 失败:', {
+            messageId: (next as any).message?.id,
+            error: String(postError),
+          });
+        }
       }
     } catch (error) {
+      console.error('[WebviewMessageBus] ❌ processLoop 异常:', String(error));
       logger.warn('界面.消息.发送_失败', { error: String(error) }, LogCategory.UI);
     } finally {
       this.processing = false;
@@ -287,6 +310,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 异步初始化 profile loader（在 MessageHub 注入之后）
     void (this.adapterFactory as LLMAdapterFactory).initialize().catch(err => {
       logger.error('Failed to initialize LLM adapter factory', { error: err.message }, LogCategory.LLM);
+    });
+
+    // 初始化编排引擎（设置 IntentGate 等关键组件）
+    void this.orchestratorEngine.initialize().catch(err => {
+      logger.error('Failed to initialize orchestrator engine', { error: err.message }, LogCategory.ORCHESTRATOR);
     });
 
     this.setupMessageHubListeners();
@@ -702,6 +730,16 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private setupMessageHubListeners(): void {
     // 标准流式消息（LLM / 编排 / Worker 等统一通道）
     this.messageHub.on('unified:message', (message) => {
+      console.log('[WebviewProvider] unified:message received:', {
+        id: message?.id,
+        category: message?.category,
+        type: message?.type,
+        lifecycle: message?.lifecycle,
+        source: message?.source,
+        agent: message?.agent,
+        blocksCount: message?.blocks?.length,
+        requestId: message?.metadata?.requestId,
+      });
       this.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.UNIFIED_MESSAGE,  // 🔧 统一消息通道：使用新协议
         message,
@@ -741,7 +779,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private emitUserAndPlaceholder(requestId: string, prompt: string, imageCount: number): {
+  private emitUserAndPlaceholder(requestId: string, prompt: string, imageCount: number, images?: Array<{ dataUrl: string }>): {
     userMessageId: string;
     placeholderMessageId: string;
   } {
@@ -755,6 +793,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         role: 'user',
         requestId,
         sendingAnimation: true,
+        // 🔧 新增：附带图片数据供前端展示
+        images: images && images.length > 0 ? images : undefined,
       },
     });
 
@@ -769,8 +809,30 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     userMessage.metadata.placeholderMessageId = placeholderMessage.id;
 
-    this.messageHub.sendMessage(userMessage);
-    this.messageHub.sendMessage(placeholderMessage);
+    // 🔧 调试日志：追踪用户消息和占位消息的发送
+    console.log('[WebviewProvider] emitUserAndPlaceholder:', {
+      userMessageId: userMessage.id,
+      userMessageLifecycle: userMessage.lifecycle,
+      userMessageCategory: userMessage.category,
+      placeholderMessageId: placeholderMessage.id,
+      placeholderMessageLifecycle: placeholderMessage.lifecycle,
+      placeholderMessageCategory: placeholderMessage.category,
+      placeholderIsPlaceholder: placeholderMessage.metadata?.isPlaceholder,
+    });
+
+    const userSent = this.messageHub.sendMessage(userMessage);
+    const placeholderSent = this.messageHub.sendMessage(placeholderMessage);
+
+    if (!userSent || !placeholderSent) {
+      logger.error('界面.消息.占位发送_失败', {
+        userSent,
+        placeholderSent,
+        requestId,
+        userMessageId: userMessage.id,
+        placeholderMessageId: placeholderMessage.id,
+      }, LogCategory.UI);
+      throw new Error('消息发送失败：用户消息或占位消息未成功发送');
+    }
 
     return { userMessageId: userMessage.id, placeholderMessageId: placeholderMessage.id };
   }
@@ -1178,7 +1240,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const data = event.data as { phase: string; isRunning?: boolean; timestamp?: number };
       if (data?.phase) {
         // 🔧 统一消息通道：phaseChanged 走 MessageHub
-        // phaseChanged 只更新阶段指示器，不会重建整个 DOM
+        // UI 不再展示阶段步骤，仅用于同步运行态与日志
         this.messageHub.phaseChange(
           data.phase,
           data.isRunning ?? this.orchestratorEngine.running,
@@ -1201,8 +1263,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         });
       }
 
-      // 发送完整依赖分析数据到前端进行可视化
-      this.sendData('dependencyAnalysis', { data: event.data });
+      // 依赖分析目前不向前端分发，避免产生未消费的数据事件
     });
 
     // 打断任务事件
@@ -1311,11 +1372,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     if (!this.missionOrchestrator) return;
 
     // Mission 生命周期事件
-    this.missionOrchestrator.on('missionCreated', (data: { mission: Mission }) => {
-      this.sendData('missionCreated', {
-        mission: data.mission,
-        sessionId: this.activeSessionId,
-      });
+    this.missionOrchestrator.on('missionCreated', () => {
       this.sendStateUpdate();
     });
 
@@ -1329,18 +1386,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
     });
 
-    this.missionOrchestrator.on('missionApproved', (data: { mission: Mission }) => {
-      this.sendData('missionApproved', {
-        missionId: data.mission.id,
-        sessionId: this.activeSessionId,
-      });
-    });
-
     this.missionOrchestrator.on('missionCompleted', (data: { mission: Mission }) => {
-      this.sendData('missionCompleted', {
-        missionId: data.mission.id,
-        sessionId: this.activeSessionId,
-      });
       this.sendStateUpdate();
       void this.tryResumePendingRecovery();
     });
@@ -1360,71 +1406,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       void this.tryResumePendingRecovery();
     });
 
-    this.missionOrchestrator.on('missionPaused', (data: { mission: Mission; reason: string }) => {
-      this.sendData('missionPaused', {
-        missionId: data.mission.id,
-        reason: data.reason,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-    this.missionOrchestrator.on('missionResumed', (data: { mission: Mission }) => {
-      this.sendData('missionResumed', {
-        missionId: data.mission.id,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-    this.missionOrchestrator.on('missionCancelled', (data: { mission: Mission; reason: string }) => {
-      this.sendData('missionCancelled', {
-        missionId: data.mission.id,
-        reason: data.reason,
-        sessionId: this.activeSessionId,
-      });
+    this.missionOrchestrator.on('missionCancelled', () => {
       this.sendStateUpdate();
       void this.tryResumePendingRecovery();
     });
 
-    // 验证事件
-    this.missionOrchestrator.on('verificationStarted', (data: { missionId: string }) => {
-      this.sendData('missionVerificationStarted', {
-        missionId: data.missionId,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-    this.missionOrchestrator.on('verificationCompleted', (data: { missionId: string; result: MissionVerificationResult }) => {
-      this.sendData('missionVerificationCompleted', {
-        missionId: data.missionId,
-        result: data.result,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-    // 总结事件
-    this.missionOrchestrator.on('summarizationCompleted', (data: { missionId: string; summary: MissionSummary }) => {
-      this.sendData('missionSummary', {
-        missionId: data.missionId,
-        summary: data.summary,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-    // 执行事件（从 MissionOrchestrator 获取，MissionExecutor 已合并）
-    this.missionOrchestrator.on('executionStarted', (data: { missionId: string }) => {
-      this.sendData('missionExecutionStarted', {
-        missionId: data.missionId,
-        sessionId: this.activeSessionId,
-      });
-    });
-
     this.missionOrchestrator.on('executionCompleted', (data: any) => {
-      this.sendData('missionExecutionCompleted', {
-        missionId: data.mission.id,
-        success: data.success,
-        duration: data.duration,
-        sessionId: this.activeSessionId,
-      });
       this.sendStateUpdate();
     });
 
@@ -1552,38 +1539,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
     });
 
-    // 阻塞事件
-    this.missionOrchestrator.on('blocked', (blockedItem: BlockedItem) => {
-      this.sendData('missionBlocked', {
-        blockedItem,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-    this.missionOrchestrator.on('unblocked', (blockedItem: BlockedItem) => {
-      this.sendData('missionUnblocked', {
-        blockedItem,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-    // 进度更新事件
-    this.missionOrchestrator.on('progressUpdated', (progress: ExecutionProgress) => {
-      this.sendData('missionProgress', {
-        progress,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-    // 契约验证事件
-    this.missionOrchestrator.on('contractVerified', (data: { missionId: string; contractId: string; success: boolean }) => {
-      this.sendData('contractVerified', {
-        missionId: data.missionId,
-        contractId: data.contractId,
-        success: data.success,
-        sessionId: this.activeSessionId,
-      });
-    });
   }
 
   /**
@@ -1815,6 +1770,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         if (!this.shouldProcessRequest(execRequestId)) {
           if (execRequestId) {
             this.messageHub.taskRejected(execRequestId, '请求重复，已忽略');
+            const traceId = this.messageHub.getTraceId();
+            const errorMessage = createErrorMessage(
+              '请求重复，已忽略',
+              'orchestrator',
+              'orchestrator',
+              traceId,
+              { metadata: { requestId: execRequestId } }
+            );
+            this.messageHub.sendMessage(errorMessage);
             this.messageHub.forceProcessingState(false);
           }
           break;
@@ -1927,10 +1891,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         }
         // 切换会话
         await this.switchToSession(message.sessionId);
-        const switchedSession = this.sessionManager.switchSession(message.sessionId);
+        const switchedSession = this.sessionManager.getCurrentSession();
         if (switchedSession) {
-
-          this.activeSessionId = message.sessionId;
           // 恢复 Worker sessionIds
           this.sendData('sessionSwitched', {
             sessionId: message.sessionId,
@@ -1962,6 +1924,28 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         }
         this.sendStateUpdate();
         break;
+
+      case 'deleteSession': {
+        // 🔧 新增：带确认的删除会话（VS Code Webview 沙盒不支持 confirm()）
+        const sessionIdToDelete = message.sessionId;
+        const needConfirm = message.requireConfirm;
+
+        if (needConfirm) {
+          vscode.window.showWarningMessage(
+            '确定要删除这个会话吗？此操作不可撤销。',
+            { modal: true },
+            '确定删除'
+          ).then((selection) => {
+            if (selection === '确定删除') {
+              this.performSessionDelete(sessionIdToDelete);
+            }
+          });
+        } else {
+          // 无需确认直接删除
+          this.performSessionDelete(sessionIdToDelete);
+        }
+        break;
+      }
 
       case 'selectWorker':
         // 用户手动选择 Worker（null 表示自动选择）
@@ -2270,14 +2254,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 处理登录消息 */
   private async handleLoginMessage(message: Extract<WebviewToExtensionMessage, { type: 'login' }>): Promise<void> {
     if (this.loginInFlight) {
-      this.sendData('loginError', { message: '登录处理中，请稍后重试' });
+      // 登录处理中，不向前端发送未消费事件
       return;
     }
 
     const rawApiKey = message.apiKey;
     const apiKey = typeof rawApiKey === 'string' ? rawApiKey.trim() : '';
     if (!apiKey) {
-      this.sendData('loginError', { message: 'API Key 不能为空' });
+      // API Key 为空，不向前端发送未消费事件
       return;
     }
 
@@ -2285,7 +2269,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     try {
       await this.storeApiKey(apiKey);
       await this.context.globalState.update(this.authStatusKey, true);
-      this.sendData('loginSuccess', {});
+      // 登录成功状态仅记录本地
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       try {
@@ -2293,7 +2277,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       } catch {
         // 忽略回滚失败，避免覆盖原始错误
       }
-      this.sendData('loginError', { message: `登录失败: ${errorMsg}` });
+      // 登录失败，不向前端发送未消费事件
     } finally {
       this.loginInFlight = false;
     }
@@ -2302,17 +2286,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 处理登出消息 */
   private async handleLogoutMessage(): Promise<void> {
     if (this.loginInFlight) {
-      this.sendData('loginError', { message: '登录处理中，无法登出' });
+      // 登出处理中，不向前端发送未消费事件
       return;
     }
 
     try {
       await this.removeApiKey();
       await this.context.globalState.update(this.authStatusKey, false);
-      this.sendData('authStatus', { loggedIn: false });
+      // auth 状态仅记录本地
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.sendData('loginError', { message: `登出失败: ${errorMsg}` });
+      // 登出失败，不向前端发送未消费事件
     }
   }
 
@@ -2320,10 +2304,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private async handleGetStatusMessage(): Promise<void> {
     try {
       const loggedIn = await this.isLoggedIn();
-      this.sendData('authStatus', { loggedIn });
+      // auth 状态仅记录本地
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.sendData('loginError', { message: `获取状态失败: ${errorMsg}` });
+      // 获取状态失败，不向前端发送未消费事件
     }
   }
 
@@ -2403,14 +2387,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
 
       if (source === 'manual') {
-        this.sendData('promptEnhanceSaved', { success: true });
         this.sendToast('ACE 配置已保存', 'success');
       }
     } catch (error) {
       logger.error('界面.提示词_增强.配置.保存_失败', error, LogCategory.UI);
       if (source === 'manual') {
         const errorMsg = error instanceof Error ? error.message : String(error);
-        this.sendData('promptEnhanceSaved', { success: false, error: errorMsg });
         this.sendToast(`ACE 配置保存失败: ${errorMsg}`, 'error');
       }
     }
@@ -2909,13 +2891,11 @@ ${originalPrompt}
       // 清除适配器缓存
       await this.adapterFactory.clearAdapter(worker);
 
-      this.sendData('workerConfigSaved', { worker, success: true });
       this.sendToast(`${worker} 配置已保存`, 'success');
 
       logger.info('Worker 配置已保存', { worker }, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存 Worker 配置失败', { worker, error: error.message }, LogCategory.LLM);
-      this.sendData('workerConfigSaved', { worker, success: false, error: error.message });
       this.sendToast(`保存配置失败: ${error.message}`, 'error');
     }
   }
@@ -2976,13 +2956,11 @@ ${originalPrompt}
       // 清除适配器缓存
       await this.adapterFactory.clearAdapter('orchestrator');
 
-      this.sendData('orchestratorConfigSaved', { success: true });
       this.sendToast('编排者配置已保存', 'success');
 
       logger.info('编排者配置已保存', undefined, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存编排者配置失败', { error: error.message }, LogCategory.LLM);
-      this.sendData('orchestratorConfigSaved', { success: false, error: error.message });
       this.sendToast(`保存配置失败: ${error.message}`, 'error');
     }
   }
@@ -3007,19 +2985,19 @@ ${originalPrompt}
 
       if (response && response.content) {
         this.sendData('orchestratorConnectionTestResult', { success: true });
-        this.sendToast('编排者连接成功', 'success');
+        this.sendToast('编排模型连接成功', 'success');
       } else {
         throw new Error('No response from LLM');
       }
     } catch (error: any) {
-      logger.error('编排者连接测试失败', { error: error.message }, LogCategory.LLM);
+      logger.error('编模型连接测试失败', { error: error.message }, LogCategory.LLM);
 
       this.sendData('orchestratorConnectionTestResult', { success: false, error: error.message });
-      this.sendToast(`编排者连接失败: ${error.message}`, 'error');
+      this.sendToast(`编排模型连接失败: ${error.message}`, 'error');
     }
   }
 
-  /** 加载压缩器配置 */
+  /** 加载压缩模型配置 */
   private async handleLoadCompressorConfig(): Promise<void> {
     try {
       const { LLMConfigLoader } = await import('../llm/config');
@@ -3027,12 +3005,12 @@ ${originalPrompt}
 
       this.sendData('compressorConfigLoaded', { config });
     } catch (error: any) {
-      logger.error('加载压缩器配置失败', { error: error.message }, LogCategory.LLM);
+      logger.error('加载压缩模型配置失败', { error: error.message }, LogCategory.LLM);
       this.sendToast(`加载配置失败: ${error.message}`, 'error');
     }
   }
 
-  /** 保存压缩器配置 */
+  /** 保存压缩模型配置 */
   private async handleSaveCompressorConfig(config: any): Promise<void> {
     try {
       const { LLMConfigLoader } = await import('../llm/config');
@@ -3042,18 +3020,16 @@ ${originalPrompt}
 
       await this.orchestratorEngine.reloadCompressionAdapter();
 
-      this.sendData('compressorConfigSaved', { success: true });
-      this.sendToast('压缩器配置已保存', 'success');
+      this.sendToast('压缩模型配置已保存', 'success');
 
-      logger.info('压缩器配置已保存', undefined, LogCategory.LLM);
+      logger.info('压缩模型配置已保存', undefined, LogCategory.LLM);
     } catch (error: any) {
-      logger.error('保存压缩器配置失败', { error: error.message }, LogCategory.LLM);
-      this.sendData('compressorConfigSaved', { success: false, error: error.message });
+      logger.error('保存压缩模型配置失败', { error: error.message }, LogCategory.LLM);
       this.sendToast(`保存配置失败: ${error.message}`, 'error');
     }
   }
 
-  /** 测试压缩器连接 */
+  /** 测试压缩模型连接 */
   private async handleTestCompressorConnection(config: any): Promise<void> {
     let fallbackModel: string | undefined;
     try {
@@ -3085,19 +3061,19 @@ ${originalPrompt}
 
       if (response && response.content) {
         this.sendData('compressorConnectionTestResult', { success: true });
-        this.sendToast('压缩器连接成功', 'success');
+        this.sendToast('压缩模型连接成功', 'success');
       } else {
         throw new Error('No response from LLM');
       }
     } catch (error: any) {
-      logger.error('压缩器连接测试失败', { error: error.message }, LogCategory.LLM);
+      logger.error('压缩模型连接测试失败', { error: error.message }, LogCategory.LLM);
 
       this.sendData('compressorConnectionTestResult', {
         success: false,
         error: error.message,
         fallbackModel
       });
-      this.sendToast('压缩器连接失败，已降级使用编排者模型', 'warning');
+      this.sendToast('压缩模型连接失败，已降级使用编排者模型', 'warning');
     }
   }
 
@@ -3244,14 +3220,12 @@ ${originalPrompt}
 
       const tools = manager.getServerTools(serverId);
 
-      this.sendData('mcpServerConnected', { serverId, toolCount: tools.length });
       this.sendToast(`MCP 服务器 "${server.name}" 已连接，发现 ${tools.length} 个工具`, 'success');
 
       logger.info('MCP 服务器已连接', { id: serverId, toolCount: tools.length }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('连接 MCP 服务器失败', { serverId, error: error.message }, LogCategory.TOOLS);
 
-      this.sendData('mcpServerConnectionFailed', { serverId, error: error.message });
       this.sendToast(`连接 MCP 服务器失败: ${error.message}`, 'error');
     }
   }
@@ -3264,7 +3238,6 @@ ${originalPrompt}
       const manager = await this.getMCPManager();
       await manager.disconnectServer(serverId);
 
-      this.sendData('mcpServerDisconnected', { serverId });
       this.sendToast('MCP 服务器已断开连接', 'success');
 
       logger.info('MCP 服务器已断开', { id: serverId }, LogCategory.TOOLS);
@@ -3365,7 +3338,6 @@ ${originalPrompt}
       const { LLMConfigLoader } = await import('../llm/config');
       LLMConfigLoader.saveSkillsConfig(config);
 
-      this.sendData('skillsConfigSaved', {});
       this.sendToast('Skills 配置已保存', 'success');
 
       await this.reloadSkillsIfPossible('saveSkillsConfig');
@@ -3577,7 +3549,6 @@ ${originalPrompt}
       const { LLMConfigLoader } = await import('../llm/config');
       LLMConfigLoader.updateRepository(repositoryId, updates);
 
-      this.sendData('repositoryUpdated', { repositoryId });
       this.sendToast('仓库已更新', 'success');
 
       // 重新加载仓库列表
@@ -3728,16 +3699,16 @@ ${originalPrompt}
     try {
       const kb = this.projectKnowledgeBase;
       if (!kb) {
-        this.sendData('adrsLoaded', { adrs: [] });
+        this.sendToast('项目知识库未初始化', 'warning');
         return;
       }
 
       const adrs = kb.getADRs(filter as any);
-      this.sendData('adrsLoaded', { adrs });
       logger.info('ADR.已加载', { count: adrs.length, filter }, LogCategory.SESSION);
+      await this.handleGetProjectKnowledge();
     } catch (error: any) {
       logger.error('ADR.加载失败', { error: error.message }, LogCategory.SESSION);
-      this.sendData('adrsLoaded', { adrs: [] });
+      this.sendToast(`加载 ADR 失败: ${error.message}`, 'error');
     }
   }
 
@@ -3748,16 +3719,16 @@ ${originalPrompt}
     try {
       const kb = this.projectKnowledgeBase;
       if (!kb) {
-        this.sendData('faqsLoaded', { faqs: [] });
+        this.sendToast('项目知识库未初始化', 'warning');
         return;
       }
 
       const faqs = kb.getFAQs(filter);
-      this.sendData('faqsLoaded', { faqs });
       logger.info('FAQ.已加载', { count: faqs.length, filter }, LogCategory.SESSION);
+      await this.handleGetProjectKnowledge();
     } catch (error: any) {
       logger.error('FAQ.加载失败', { error: error.message }, LogCategory.SESSION);
-      this.sendData('faqsLoaded', { faqs: [] });
+      this.sendToast(`加载 FAQ 失败: ${error.message}`, 'error');
     }
   }
 
@@ -3768,16 +3739,16 @@ ${originalPrompt}
     try {
       const kb = this.projectKnowledgeBase;
       if (!kb) {
-        this.sendData('faqSearchResults', { results: [] });
+        this.sendToast('项目知识库未初始化', 'warning');
         return;
       }
 
       const results = kb.searchFAQs(keyword);
-      this.sendData('faqSearchResults', { results });
       logger.info('FAQ.搜索完成', { keyword, count: results.length }, LogCategory.SESSION);
+      await this.handleGetProjectKnowledge();
     } catch (error: any) {
       logger.error('FAQ.搜索失败', { error: error.message }, LogCategory.SESSION);
-      this.sendData('faqSearchResults', { results: [] });
+      this.sendToast(`搜索 FAQ 失败: ${error.message}`, 'error');
     }
   }
 
@@ -3794,8 +3765,9 @@ ${originalPrompt}
 
       const success = kb.deleteADR(id);
       if (success) {
-        this.sendData('adrDeleted', { id });
+        this.sendToast('ADR 已删除', 'success');
         logger.info('ADR.删除成功', { id }, LogCategory.SESSION);
+        await this.handleGetProjectKnowledge();
       } else {
         this.sendToast('ADR 删除失败', 'error');
       }
@@ -3818,8 +3790,9 @@ ${originalPrompt}
 
       const success = kb.deleteFAQ(id);
       if (success) {
-        this.sendData('faqDeleted', { id });
+        this.sendToast('FAQ 已删除', 'success');
         logger.info('FAQ.删除成功', { id }, LogCategory.SESSION);
+        await this.handleGetProjectKnowledge();
       } else {
         this.sendToast('FAQ 删除失败', 'error');
       }
@@ -3890,9 +3863,9 @@ ${originalPrompt}
       }
 
       kb.addADR(adr);
-      this.sendData('adrAdded', { adr });
       this.sendToast('ADR 已添加', 'success');
       logger.info('ADR.已添加', { id: adr.id, title: adr.title }, LogCategory.SESSION);
+      await this.handleGetProjectKnowledge();
     } catch (error: any) {
       logger.error('ADR.添加失败', { error: error.message }, LogCategory.SESSION);
       this.sendToast(`添加 ADR 失败: ${error.message}`, 'error');
@@ -3912,9 +3885,9 @@ ${originalPrompt}
 
       const success = kb.updateADR(id, updates);
       if (success) {
-        this.sendData('adrUpdated', { id });
         this.sendToast('ADR 已更新', 'success');
         logger.info('ADR.已更新', { id }, LogCategory.SESSION);
+        await this.handleGetProjectKnowledge();
       } else {
         this.sendToast('ADR 不存在', 'warning');
       }
@@ -3936,9 +3909,9 @@ ${originalPrompt}
       }
 
       kb.addFAQ(faq);
-      this.sendData('faqAdded', { faq });
       this.sendToast('FAQ 已添加', 'success');
       logger.info('FAQ.已添加', { id: faq.id, question: faq.question }, LogCategory.SESSION);
+      await this.handleGetProjectKnowledge();
     } catch (error: any) {
       logger.error('FAQ.添加失败', { error: error.message }, LogCategory.SESSION);
       this.sendToast(`添加 FAQ 失败: ${error.message}`, 'error');
@@ -3958,9 +3931,9 @@ ${originalPrompt}
 
       const success = kb.updateFAQ(id, updates);
       if (success) {
-        this.sendData('faqUpdated', { id });
         this.sendToast('FAQ 已更新', 'success');
         logger.info('FAQ.已更新', { id }, LogCategory.SESSION);
+        await this.handleGetProjectKnowledge();
       } else {
         this.sendToast('FAQ 不存在', 'warning');
       }
@@ -4803,7 +4776,7 @@ ${originalPrompt}
 
       // 统一消息通道：由后端发送用户消息与占位消息
       const promptForDisplay = displayPrompt?.trim() || prompt;
-      this.emitUserAndPlaceholder(requestKey, promptForDisplay, images?.length || 0);
+      this.emitUserAndPlaceholder(requestKey, promptForDisplay, images?.length || 0, images);
       this.scheduleRequestTimeout(requestKey);
 
       // 如果有图片，保存到临时文件
@@ -4844,7 +4817,7 @@ ${originalPrompt}
       const resolvedSkill = this.resolveInstructionSkillPrompt(prompt);
       const effectivePrompt = resolvedSkill.prompt;
 
-      this.sessionManager.addMessage('user', prompt);
+      this.sessionManager.addMessage('user', prompt, undefined, undefined, images);
       void this.orchestratorEngine.recordContextMessage('user', prompt, this.activeSessionId || undefined);
       this.sendStateUpdate();
 
@@ -4875,6 +4848,40 @@ ${originalPrompt}
       failureReason = error instanceof Error ? error.message : String(error);
       success = false;
     } finally {
+      // 🔧 移除基于统计的误判检查
+      // 原因：LLM 流式输出通过 Normalizer -> MessageHub 直接发送到前端
+      // 但统计机制依赖 requestId 注入，流式消息可能在 requestId 设置前就开始发送
+      // 导致 assistantContent 统计为 0，误判为"未产生响应"
+      //
+      // 实际行为：如果 LLM 有输出，消息已经通过流式通道发送到 UI
+      // 如果确实需要检测消息通道故障，应该在 Adapter/Normalizer 层面实现
+      const requestStats = requestKey ? this.messageHub.getRequestMessageStats(requestKey) : undefined;
+      if (requestKey) {
+        const stats = requestStats ?? {
+          assistantContent: 0,
+          assistantThreadContent: 0,
+          assistantWorkerContent: 0,
+          assistantDispatchContent: 0,
+          userContent: 0,
+          placeholderContent: 0,
+          totalContent: 0,
+          dataCount: 0,
+        };
+        logger.info('界面.消息.通道_统计', {
+          requestId: requestKey,
+          success,
+          rejected,
+          assistantContent: stats.assistantContent,
+          assistantThreadContent: stats.assistantThreadContent,
+          assistantWorkerContent: stats.assistantWorkerContent,
+          assistantDispatchContent: stats.assistantDispatchContent,
+          userContent: stats.userContent,
+          placeholderContent: stats.placeholderContent,
+          totalContent: stats.totalContent,
+          dataCount: stats.dataCount,
+          statsMissing: !requestStats,
+        }, LogCategory.UI);
+      }
       if (started) {
         if (success) {
           this.messageHub.sendControl(ControlMessageType.TASK_COMPLETED, {
@@ -4887,12 +4894,24 @@ ${originalPrompt}
             error: failureReason || '执行失败',
             timestamp: Date.now(),
           });
+          if (!rejected && failureReason) {
+            const traceId = this.messageHub.getTraceId();
+            const errorMessage = createErrorMessage(
+              failureReason,
+              'orchestrator',
+              'orchestrator',
+              traceId,
+              { metadata: { requestId: requestKey } }
+            );
+            this.messageHub.sendMessage(errorMessage);
+          }
         }
         this.messageHub.forceProcessingState(false);
       } else if (!rejected && failureReason && requestKey) {
         this.messageHub.taskRejected(requestKey, failureReason);
         this.messageHub.forceProcessingState(false);
       }
+      this.messageHub.finalizeRequestContext(requestKey);
       this.messageHub.setRequestContext(undefined);
       this.clearRequestTimeout(requestKey);
     }
@@ -5098,13 +5117,19 @@ ${originalPrompt}
       // 获取执行计划，判断是否需要 Worker
       const plan = this.orchestratorEngine.plan;
       const needsWorker = plan?.needsWorker !== false && (plan?.subTasks?.length ?? 0) > 0;
-      logger.info('界面.任务.完成', { needsWorker, subTaskCount: plan?.subTasks?.length || 0 }, LogCategory.UI);
+      logger.info('界面.任务.完成', { needsWorker, subTaskCount: plan?.subTasks?.length || 0, hasResult: !!result?.trim(), resultLength: result?.length || 0 }, LogCategory.UI);
 
       // 保存消息历史
       this.saveMessageToSession(prompt, result, undefined, 'orchestrator');
 
-      // 🔧 移除重复的 sendOrchestratorMessage 调用
-      // LLM 响应已通过流式传输发送到前端，无需再次发送
+      // 🔧 移除误判的安全检查
+      // 原因：LLM 流式输出通过 Normalizer -> MessageHub 直接发送到前端
+      // 统计机制依赖 requestId 注入，但流式消息可能在 requestId 设置前就开始发送
+      // 导致 assistantThreadContent 统计为 0，误触发强制补发，产生重复消息
+      //
+      // 正确的行为：
+      // - 如果 LLM 有输出（result 非空），消息已经通过流式通道发送
+      // - 如果 LLM 无输出（result 为空），应该在 engine 层面处理，而非此处补发
 
       success = true;
     } catch (error) {
@@ -5172,6 +5197,18 @@ ${originalPrompt}
       } else {
         await taskManager.completeTask(task.id);
         this.saveMessageToSession(prompt, response.content || '', targetWorker, 'worker');
+        const requestId = this.messageHub.getRequestContext();
+        const requestStats = requestId ? this.messageHub.getRequestMessageStats(requestId) : undefined;
+        const assistantWorkerContent = requestStats?.assistantWorkerContent ?? 0;
+        if (requestId && assistantWorkerContent === 0 && response.content?.trim()) {
+          this.messageHub.workerOutput(targetWorker, response.content, {
+            metadata: {
+              requestId,
+              forced: true,
+              reason: 'missing_llm_stream',
+            },
+          });
+        }
         success = true;
       }
 
@@ -5208,6 +5245,21 @@ ${originalPrompt}
   private sendStateUpdate(): void {
     const state = this.buildUIState();
     this.sendData('stateUpdate', { state });
+  }
+
+  /** 执行会话删除逻辑（供 deleteSession 消息使用） */
+  private performSessionDelete(sessionId: string): void {
+    if (this.sessionManager.deleteSession(sessionId)) {
+      // 如果删除后没有会话，创建一个新的
+      if (this.sessionManager.getSessionMetas().length === 0) {
+        const newSession = this.sessionManager.createSession();
+        this.activeSessionId = newSession.id;
+        this.sendData('sessionCreated', { session: newSession as any });
+      }
+      this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() as any[] });
+      this.sendToast('会话已删除', 'info');
+    }
+    this.sendStateUpdate();
   }
 
   private sendCurrentSessionToWebview(): void {

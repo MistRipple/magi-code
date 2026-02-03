@@ -71,6 +71,28 @@
     info: '#3b82f6'
   };
 
+  // 获取消息中的图片
+  // 优先从 message.images，其次从 message.metadata?.images
+  const messageImages = $derived(
+    message.images || (message.metadata?.images as Array<{ dataUrl: string }>) || []
+  );
+
+  // 图片预览弹窗状态
+  let showImagePreview = $state(false);
+  let previewImageUrl = $state('');
+
+  // 点击图片放大预览
+  function openImagePreview(imageUrl: string) {
+    previewImageUrl = imageUrl;
+    showImagePreview = true;
+  }
+
+  // 关闭图片预览
+  function closeImagePreview() {
+    showImagePreview = false;
+    previewImageUrl = '';
+  }
+
   // 复制内容
   async function handleCopy() {
     if (!message.content) return;
@@ -98,6 +120,16 @@
 <!-- 用户消息：简洁显示 -->
 {:else if isUser}
   <div class="message-item user" class:sending={sendingAnimation} data-message-id={message.id} data-source="user">
+    <!-- 🔧 显示用户上传的图片缩略图 -->
+    {#if messageImages.length > 0}
+      <div class="user-images">
+        {#each messageImages as img, i (`${message.id}-img-${i}`)}
+          <button class="user-image-thumb" onclick={() => openImagePreview(img.dataUrl)} type="button" title="点击放大">
+            <img src={img.dataUrl} alt="附件图片 {i + 1}" />
+          </button>
+        {/each}
+      </div>
+    {/if}
     <div class="user-content">{message.content}</div>
     <div class="user-time">{formatTime(message.timestamp)}</div>
   </div>
@@ -153,8 +185,27 @@
         {/each}
       {:else if !message.metadata?.subTaskCard && message.content}
         <MarkdownContent content={message.content} {isStreaming} />
+      {:else if isStreaming}
+        <!-- 流式消息占位符：确保卡片在内容加载前有高度 -->
+        <div class="streaming-placeholder">
+          <span class="streaming-dot"></span>
+          <span class="streaming-dot"></span>
+          <span class="streaming-dot"></span>
+        </div>
       {/if}
 
+    </div>
+  </div>
+{/if}
+
+<!-- 🔧 图片预览弹窗 -->
+{#if showImagePreview}
+  <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
+  <div class="image-preview-overlay" onclick={closeImagePreview} role="dialog" aria-modal="true" tabindex="-1">
+    <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
+    <div class="image-preview-content" role="document" onclick={(e) => e.stopPropagation()}>
+      <button class="image-preview-close" onclick={closeImagePreview} type="button" aria-label="关闭">×</button>
+      <img src={previewImageUrl} alt="图片预览" class="image-preview-img" />
     </div>
   </div>
 {/if}
@@ -307,5 +358,124 @@
     background: linear-gradient(transparent, var(--assistant-message-bg));
     pointer-events: none;
     opacity: 0.5;
+  }
+
+  /* 流式消息占位符：确保卡片在内容加载前有高度 */
+  .streaming-placeholder {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: var(--space-2) 0;
+    min-height: 24px;
+  }
+
+  .streaming-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--foreground-muted);
+    opacity: 0.4;
+    animation: streamingPulse 1.4s ease-in-out infinite;
+  }
+
+  .streaming-dot:nth-child(2) {
+    animation-delay: 0.2s;
+  }
+
+  .streaming-dot:nth-child(3) {
+    animation-delay: 0.4s;
+  }
+
+  @keyframes streamingPulse {
+    0%, 80%, 100% {
+      opacity: 0.4;
+      transform: scale(1);
+    }
+    40% {
+      opacity: 1;
+      transform: scale(1.2);
+    }
+  }
+
+  /* ===== 用户消息图片缩略图 ===== */
+  .user-images {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+
+  .user-image-thumb {
+    width: 80px;
+    height: 80px;
+    border-radius: 8px;
+    overflow: hidden;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    background: var(--background);
+    padding: 0;
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+
+  .user-image-thumb:hover {
+    transform: scale(1.05);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  }
+
+  .user-image-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  /* ===== 图片预览弹窗 ===== */
+  .image-preview-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.85);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9999;
+    cursor: pointer;
+  }
+
+  .image-preview-content {
+    position: relative;
+    max-width: 90vw;
+    max-height: 90vh;
+    cursor: default;
+  }
+
+  .image-preview-close {
+    position: absolute;
+    top: -40px;
+    right: 0;
+    background: transparent;
+    border: none;
+    color: white;
+    font-size: 32px;
+    cursor: pointer;
+    width: 40px;
+    height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.8;
+    transition: opacity 0.2s;
+  }
+
+  .image-preview-close:hover {
+    opacity: 1;
+  }
+
+  .image-preview-img {
+    max-width: 90vw;
+    max-height: 85vh;
+    border-radius: 4px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
   }
 </style>

@@ -34,6 +34,19 @@ export interface AdapterOutputScope {
 
   /** 附加元数据，会传递到消息中 */
   messageMeta?: Record<string, any>;
+
+  /**
+   * 临时系统提示词（可选）
+   * 如果提供，将覆盖适配器的默认系统提示词（仅对当前请求生效）
+   */
+  systemPrompt?: string;
+
+  /**
+   * 是否使用独立会话（可选）
+   * - true: 不使用历史记录，每次请求独立
+   * - false（默认）: 使用累积的对话历史
+   */
+  isolatedSession?: boolean;
 }
 
 /**

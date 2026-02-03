@@ -737,6 +737,86 @@ pre code {
   border-top: 1px solid var(--border);
 }
 
+/* 模态框按钮 */
+.modal-btn {
+  height: var(--btn-height-md);
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  color: var(--foreground);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium);
+  transition: all var(--transition-fast);
+}
+
+.modal-btn:hover {
+  background: var(--surface-hover);
+}
+
+.modal-btn.primary {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: white;
+}
+
+.modal-btn.primary:hover {
+  opacity: 0.9;
+}
+
+.modal-btn.secondary {
+  background: var(--surface-2);
+  border-color: var(--border);
+  color: var(--foreground);
+}
+
+.modal-btn.secondary:hover {
+  background: var(--surface-hover);
+}
+
+.modal-btn.danger {
+  background: var(--error);
+  border-color: var(--error);
+  color: white;
+}
+
+.modal-btn.danger:hover {
+  opacity: 0.9;
+}
+
+.modal-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 模态框关闭按钮 */
+.modal-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--foreground-muted);
+  font-size: 18px;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.modal-close:hover {
+  background: var(--surface-hover);
+  color: var(--foreground);
+}
+
+/* 小尺寸模态框 */
+.modal-dialog--sm {
+  width: 400px;
+}
+
 /* ------------------------------------------
    工具类 (Utility Classes)
    ------------------------------------------ */

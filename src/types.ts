@@ -452,6 +452,7 @@ export type WebviewToExtensionMessage =
   | { type: 'switchSession'; sessionId: string }
   | { type: 'renameSession'; sessionId: string; name: string }
   | { type: 'closeSession'; sessionId: string }
+  | { type: 'deleteSession'; sessionId: string; requireConfirm?: boolean }
   | { type: 'selectWorker'; worker: WorkerSlot | null }
   | { type: 'updateSetting'; key: string; value: unknown }
   | { type: 'viewDiff'; filePath: string }

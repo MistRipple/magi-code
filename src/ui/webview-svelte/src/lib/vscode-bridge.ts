@@ -102,8 +102,24 @@ export function onMessage(listener: MessageListener): () => void {
 
 // 全局消息监听
 if (typeof window !== 'undefined') {
+  console.log('[vscode-bridge] 🔧 开始监听消息...');
   window.addEventListener('message', (event) => {
     const message = event.data as WebviewMessage;
+    const msgType = message?.type;
+    const msgId = (message as any)?.message?.id;
+    // 🔧 调试日志：追踪所有收到的消息
+    console.log(`[vscode-bridge] 收到消息: type=${msgType}, id=${msgId}, listeners=${listeners.size}`);
+    if (msgType === 'unifiedMessage' || msgType === 'unifiedUpdate' || msgType === 'unifiedComplete') {
+      console.log('[vscode-bridge] 详细消息内容:', JSON.stringify({
+        type: msgType,
+        messageId: msgId,
+        category: (message as any)?.message?.category,
+        lifecycle: (message as any)?.message?.lifecycle,
+        blocksCount: (message as any)?.message?.blocks?.length ?? 0,
+        isPlaceholder: (message as any)?.message?.metadata?.isPlaceholder,
+        role: (message as any)?.message?.metadata?.role,
+      }));
+    }
     listeners.forEach((listener) => {
       try {
         listener(message);

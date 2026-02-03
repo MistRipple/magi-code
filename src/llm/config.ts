@@ -335,7 +335,7 @@ export class LLMConfigLoader {
   }
 
   /**
-   * 更新压缩器配置
+   * 更新压缩模型配置
    */
   static updateCompressorConfig(config: any): void {
     const fullConfig = this.loadLLMConfigFile();
@@ -353,7 +353,7 @@ export class LLMConfigLoader {
   }
 
   /**
-   * 加载压缩器配置
+   * 加载压缩模型配置
    */
   static loadCompressorConfig(): any {
     const config = this.loadLLMConfigFile();

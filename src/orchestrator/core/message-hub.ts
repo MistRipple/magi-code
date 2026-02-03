@@ -137,6 +137,33 @@ interface MessageState {
   completed: boolean;
 }
 
+/** 请求级消息统计 */
+interface RequestMessageStats {
+  totalContent: number;
+  assistantContent: number;
+  assistantThreadContent: number;
+  assistantWorkerContent: number;
+  assistantDispatchContent: number;
+  userContent: number;
+  placeholderContent: number;
+  dataCount: number;
+  messageIds: Set<string>;
+  /** 创建时间戳（用于自动清理） */
+  createdAt: number;
+}
+
+/** 请求级消息统计摘要（对外暴露） */
+export interface RequestMessageSummary {
+  totalContent: number;
+  assistantContent: number;
+  assistantThreadContent: number;
+  assistantWorkerContent: number;
+  assistantDispatchContent: number;
+  userContent: number;
+  placeholderContent: number;
+  dataCount: number;
+}
+
 /** 内容去重记录 */
 interface ContentDedupeRecord {
   messageId: string;
@@ -198,9 +225,57 @@ export class MessageHub extends EventEmitter {
     agent: null,
     startedAt: null,
   };
-  private activeMessageIds: Set<string> = new Set();
+  // 🔧 根治：移除 activeMessageIds Set，消除双数据源同步问题
+  // 活动消息状态完全由 messageStates.completed 派生
   private cleanupTimer: NodeJS.Timeout | null = null;
   private contentDedupeRecords: ContentDedupeRecord[] = [];
+  /** 防止事件发射触发的重入调用 */
+  private processingMessageIds: Set<string> = new Set();
+  private requestMessageStats: Map<string, RequestMessageStats> = new Map();
+  private streamBuffers: Map<string, { text: string; lastBlocks?: ContentBlock[] }> = new Map();
+
+  // ==========================================================================
+  // 🔧 状态一致性：统一使用 messageStates 管理活动消息
+  // 根治：消除 activeMessageIds 双数据源，单一数据源保证一致性
+  // ==========================================================================
+
+  /**
+   * 添加活动消息
+   */
+  private addActiveMessage(id: string, message: StandardMessage, timestamp: number): void {
+    this.messageStates.set(id, {
+      message,
+      lastSentAt: timestamp,
+      lastStreamAt: timestamp,
+      completed: false,
+    });
+  }
+
+  /**
+   * 标记消息完成
+   */
+  private markMessageComplete(id: string, message: StandardMessage, timestamp: number): void {
+    const state = this.messageStates.get(id);
+    if (state) {
+      state.message = message;
+      state.lastSentAt = timestamp;
+      state.completed = true;
+    }
+    this.streamBuffers.delete(id);
+  }
+
+  /**
+   * 检查是否有活动消息
+   * 🔧 根治：直接从 messageStates 派生，无需兜底逻辑
+   */
+  private hasActiveMessages(): boolean {
+    for (const state of this.messageStates.values()) {
+      if (!state.completed) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   constructor(traceId?: string, config?: Partial<MessageHubConfig>) {
     super();
@@ -222,6 +297,23 @@ export class MessageHub extends EventEmitter {
 
   getRequestContext(): string | undefined {
     return this.requestId;
+  }
+
+  getRequestMessageStats(requestId: string): RequestMessageSummary | undefined {
+    const stats = this.requestMessageStats.get(requestId);
+    if (!stats) {
+      return undefined;
+    }
+    return this.toRequestSummary(stats);
+  }
+
+  finalizeRequestContext(requestId: string): RequestMessageSummary | undefined {
+    const stats = this.requestMessageStats.get(requestId);
+    if (!stats) {
+      return undefined;
+    }
+    this.requestMessageStats.delete(requestId);
+    return this.toRequestSummary(stats);
   }
 
   /**
@@ -272,6 +364,7 @@ export class MessageHub extends EventEmitter {
   result(content: string, options?: { success?: boolean; metadata?: MessageMetadata }): void {
     // 过滤空内容
     if (!content || !content.trim()) {
+      logger.warn('MessageHub.result.空内容跳过', undefined, LogCategory.SYSTEM);
       return;
     }
 
@@ -283,6 +376,14 @@ export class MessageHub extends EventEmitter {
       blocks: [{ type: 'text', content, isMarkdown: true }],
       metadata: options?.metadata || {},
     });
+
+    logger.info('MessageHub.result.发送', {
+      id: message.id,
+      category: message.category,
+      contentLength: content.length,
+      contentPreview: content.substring(0, 100),
+      metadata: options?.metadata,
+    }, LogCategory.SYSTEM);
 
     // 🔧 统一出口：所有消息通过 sendMessage 进入统一通道
     this.sendMessage(message);
@@ -414,6 +515,7 @@ export class MessageHub extends EventEmitter {
   orchestratorMessage(content: string, options?: { type?: MessageType; metadata?: MessageMetadata }): void {
     // 过滤空内容
     if (!content || !content.trim()) {
+      logger.warn('MessageHub.orchestratorMessage.空内容跳过', undefined, LogCategory.SYSTEM);
       return;
     }
 
@@ -425,6 +527,13 @@ export class MessageHub extends EventEmitter {
       blocks: [{ type: 'text', content, isMarkdown: true }],
       metadata: options?.metadata || {},
     });
+
+    logger.info('MessageHub.orchestratorMessage.发送', {
+      id: message.id,
+      category: message.category,
+      contentLength: content.length,
+      contentPreview: content.substring(0, 100),
+    }, LogCategory.SYSTEM);
 
     // 🔧 统一出口：所有消息通过 sendMessage 进入统一通道
     this.sendMessage(message);
@@ -453,7 +562,7 @@ export class MessageHub extends EventEmitter {
 
     // 3. 触发广播事件 (专门的广播通道)
     // 订阅者可以通过监听 'broadcast' 事件来接收所有广播消息
-    this.emit('broadcast', {
+    this.safeEmit('broadcast', {
       message: standardMessage,
       target: options?.target,
       timestamp: Date.now()
@@ -479,6 +588,42 @@ export class MessageHub extends EventEmitter {
    * - STREAMING 消息间隔不低于 minStreamInterval (100ms)
    */
   sendMessage(message: StandardMessage): boolean {
+    // 🔧 调试日志：追踪所有进入 sendMessage 的消息
+    console.log('[MessageHub] sendMessage 入口:', {
+      id: message.id,
+      category: message.category,
+      type: message.type,
+      lifecycle: message.lifecycle,
+      source: message.source,
+      agent: message.agent,
+      blocksCount: message.blocks?.length,
+      hasRequestId: !!message.metadata?.requestId,
+      currentRequestContext: this.requestId,
+    });
+
+    // 🔧 重入保护：防止事件监听器触发的递归调用
+    if (message.id && this.processingMessageIds.has(message.id)) {
+      this.debugLog('跳过消息 [RE-ENTRANT]', message.id);
+      return false;
+    }
+
+    if (message.id) {
+      this.processingMessageIds.add(message.id);
+    }
+
+    try {
+      return this.doSendMessage(message);
+    } finally {
+      if (message.id) {
+        this.processingMessageIds.delete(message.id);
+      }
+    }
+  }
+
+  /**
+   * 实际的消息发送逻辑（内部方法）
+   */
+  private doSendMessage(message: StandardMessage): boolean {
     if (this.requestId && !message.metadata?.requestId) {
       message = {
         ...message,
@@ -487,6 +632,20 @@ export class MessageHub extends EventEmitter {
           requestId: this.requestId,
         },
       };
+    }
+
+    if (message.category === MessageCategory.CONTENT) {
+      const requestId = message.metadata?.requestId;
+      if (typeof requestId !== 'string' || !requestId.trim()) {
+        // 🔧 改为警告而非抛出异常，避免阻塞消息流
+        // requestId 缺失时记录警告，但仍然发送消息
+        logger.warn('MessageHub.内容消息缺少requestId', {
+          id: message.id,
+          source: message.source,
+          agent: message.agent,
+          lifecycle: message.lifecycle,
+        }, LogCategory.SYSTEM);
+      }
     }
     if (!message.id || !message.id.trim()) {
       throw new Error('[MessageHub] StandardMessage missing id');
@@ -516,8 +675,55 @@ export class MessageHub extends EventEmitter {
       throw new Error(`[MessageHub] StandardMessage missing source/agent: ${message.id}`);
     }
 
+    // 🔧 严格校验消息类别与专属字段，禁止 data-only 误用
+    if (!message.category) {
+      throw new Error(`[MessageHub] StandardMessage missing category: ${message.id}`);
+    }
+
+    // 🔧 修复：对于 CONTENT 消息，先从流缓冲区填充 blocks，再进行验证
+    // 避免 COMPLETED 消息因 blocks 为空而被误拦截
+    if (message.category === MessageCategory.CONTENT) {
+      this.updateStreamBufferFromMessage(message);
+      message = this.ensureContentBlocksFromBuffer(message);
+    }
+
+    switch (message.category) {
+      case MessageCategory.CONTENT: {
+        const isPlaceholder = message.metadata?.isPlaceholder === true;
+        const isStreaming = message.lifecycle === MessageLifecycle.STARTED || message.lifecycle === MessageLifecycle.STREAMING;
+        const isCompleted = message.lifecycle === MessageLifecycle.COMPLETED;
+        const hasBlocks = Array.isArray(message.blocks) && message.blocks.length > 0;
+        // 🔧 修复：COMPLETED 消息允许无 blocks（可能所有内容已通过流式更新发送）
+        if (!hasBlocks && !isPlaceholder && !isStreaming && !isCompleted) {
+          throw new Error(`[MessageHub] Content message missing blocks: ${message.id}`);
+        }
+        break;
+      }
+      case MessageCategory.CONTROL:
+        if (!message.control) {
+          throw new Error(`[MessageHub] Control message missing control payload: ${message.id}`);
+        }
+        break;
+      case MessageCategory.NOTIFY:
+        if (!message.notify) {
+          throw new Error(`[MessageHub] Notify message missing notify payload: ${message.id}`);
+        }
+        break;
+      case MessageCategory.DATA:
+        if (!message.data) {
+          throw new Error(`[MessageHub] Data message missing data payload: ${message.id}`);
+        }
+        if (Array.isArray(message.blocks) && message.blocks.length > 0) {
+          throw new Error(`[MessageHub] Data message must not carry blocks: ${message.id}`);
+        }
+        break;
+      default:
+        throw new Error(`[MessageHub] Unknown message category: ${String(message.category)} (${message.id})`);
+    }
+
     // 如果禁用去重/节流，直接发送
     if (!this.config.enabled) {
+      this.recordRequestMessage(message);
       this.emitByCategory(message);
       return true;
     }
@@ -554,8 +760,15 @@ export class MessageHub extends EventEmitter {
 
     // 3. STARTED 消息：总是发送，激活 processingState
     if (lifecycle === MessageLifecycle.STARTED) {
+      console.log('[MessageHub] 发送 STARTED 消息:', {
+        id,
+        source: message.source,
+        agent: message.agent,
+        isPlaceholder: message.metadata?.isPlaceholder,
+      });
       this.recordMessage(message, now);
       this.updateProcessingState(true, message.source, message.agent);
+      this.recordRequestMessage(message);
       this.emitByCategory(message);
       this.debugLog('发送消息 [STARTED]', id);
       return true;
@@ -563,14 +776,23 @@ export class MessageHub extends EventEmitter {
 
     // 4. 新消息：发送
     if (!existingState) {
+      console.log('[MessageHub] 发送 NEW 消息:', {
+        id,
+        lifecycle,
+        source: message.source,
+        agent: message.agent,
+        category: message.category,
+        blocksCount: message.blocks?.length ?? 0,
+      });
       this.recordMessage(message, now);
       if (lifecycle === MessageLifecycle.STREAMING) {
         this.updateProcessingState(true, message.source, message.agent);
       }
+      this.recordRequestMessage(message);
       this.emitByCategory(message);
       if (this.isTerminalLifecycle(lifecycle)) {
         this.completeMessage(id, message, now);
-        this.emit('unified:complete', message);
+        this.safeEmit('unified:complete', message);
         this.checkAndUpdateProcessingState();
       }
       this.debugLog('发送消息 [NEW]', id);
@@ -598,6 +820,7 @@ export class MessageHub extends EventEmitter {
       }
       existingState.lastStreamAt = now;
       existingState.message = message;
+      this.recordRequestMessage(message);
       this.emitByCategory(message);
       this.debugLog('发送消息 [STREAMING]', id);
       return true;
@@ -606,7 +829,8 @@ export class MessageHub extends EventEmitter {
     // 7. 终态消息（COMPLETED/FAILED/CANCELLED）：标记完成，发送
     if (this.isTerminalLifecycle(lifecycle)) {
       this.completeMessage(id, message, now);
-      this.emit('unified:complete', message);
+      this.recordRequestMessage(message);
+      this.safeEmit('unified:complete', message);
       this.checkAndUpdateProcessingState();
       this.debugLog('发送消息 [COMPLETE]', id);
       return true;
@@ -616,12 +840,38 @@ export class MessageHub extends EventEmitter {
   }
 
   /**
+   * 安全的事件发射方法
+   *
+   * 🔧 设计决策：
+   * - 记录监听器异常并继续执行，确保消息流不会因单个监听器错误而中断
+   * - 始终记录错误到日志，便于问题排查
+   * - 在 debug 模式下会重新抛出异常，帮助开发者定位问题
+   */
+  private safeEmit(event: string, data: unknown): boolean {
+    try {
+      return this.emit(event, data);
+    } catch (error) {
+      logger.error('MessageHub.event_emit_failed', {
+        event,
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+        messageId: (data as StandardMessage)?.id,
+      }, LogCategory.SYSTEM);
+      // 🔧 debug 模式下重新抛出，帮助开发者定位问题
+      if (this.config.debug) {
+        throw error;
+      }
+      return false;
+    }
+  }
+
+  /**
    * 根据消息分类发送到对应事件通道
    *
    * 🔧 统一消息通道：统一走 unified:message
    */
   private emitByCategory(message: StandardMessage): void {
-    this.emit('unified:message', message);
+    this.safeEmit('unified:message', message);
   }
 
   /**
@@ -648,11 +898,13 @@ export class MessageHub extends EventEmitter {
 
     // 如果禁用节流，直接发送
     if (!this.config.enabled) {
-      this.emit('unified:update', update);
+      this.updateStreamBufferFromUpdate(update);
+      this.safeEmit('unified:update', update);
       return true;
     }
 
     const now = Date.now();
+    this.updateStreamBufferFromUpdate(update);
     const state = this.messageStates.get(update.messageId);
 
     // 无状态：拒绝
@@ -677,7 +929,7 @@ export class MessageHub extends EventEmitter {
     }
 
     state.lastStreamAt = now;
-    this.emit('unified:update', update);
+    this.safeEmit('unified:update', update);
     this.debugLog('发送更新', update.messageId);
     return true;
   }
@@ -694,7 +946,15 @@ export class MessageHub extends EventEmitter {
    */
   forceProcessingState(isProcessing: boolean): void {
     if (!isProcessing) {
-      this.activeMessageIds.clear();
+      // 🔧 根治：直接遍历 messageStates 标记完成，无需额外数据结构
+      const now = Date.now();
+      for (const state of this.messageStates.values()) {
+        if (!state.completed) {
+          state.completed = true;
+          state.lastSentAt = now;
+        }
+      }
+      this.processingMessageIds.clear();
     }
     this.updateProcessingState(isProcessing, null, null);
   }
@@ -821,29 +1081,103 @@ export class MessageHub extends EventEmitter {
   // ==========================================================================
 
   /**
-   * 记录消息状态
+   * 记录消息状态（委托给统一方法）
    */
   private recordMessage(message: StandardMessage, timestamp: number): void {
-    this.messageStates.set(message.id, {
-      message,
-      lastSentAt: timestamp,
-      lastStreamAt: timestamp,
-      completed: false,
-    });
-    this.activeMessageIds.add(message.id);
+    this.addActiveMessage(message.id, message, timestamp);
+  }
+
+  private recordRequestMessage(message: StandardMessage): void {
+    const requestId = message.metadata?.requestId;
+    if (!requestId) {
+      return;
+    }
+    const now = Date.now();
+    const stats = this.requestMessageStats.get(requestId) || {
+      totalContent: 0,
+      assistantContent: 0,
+      assistantThreadContent: 0,
+      assistantWorkerContent: 0,
+      assistantDispatchContent: 0,
+      userContent: 0,
+      placeholderContent: 0,
+      dataCount: 0,
+      messageIds: new Set<string>(),
+      createdAt: now,
+    };
+    if (stats.messageIds.has(message.id)) {
+      return;
+    }
+    stats.messageIds.add(message.id);
+
+    if (message.category === MessageCategory.DATA) {
+      stats.dataCount += 1;
+      this.requestMessageStats.set(requestId, stats);
+      return;
+    }
+
+    if (message.category !== MessageCategory.CONTENT) {
+      this.requestMessageStats.set(requestId, stats);
+      return;
+    }
+
+    const isStatusMessage = message.metadata?.isStatusMessage === true;
+    const isProgressMessage = message.type === MessageType.PROGRESS;
+    if (isStatusMessage || isProgressMessage) {
+      this.requestMessageStats.set(requestId, stats);
+      return;
+    }
+
+    const hasText = Boolean(this.extractTextFromBlocks(message.blocks))
+      || Boolean(this.streamBuffers.get(message.id)?.text);
+    const isPlaceholder = message.metadata?.isPlaceholder === true;
+    const isUser = message.metadata?.role === 'user';
+    const isDispatchToWorker = message.metadata?.dispatchToWorker === true;
+    const isWorkerSource = message.source === 'worker';
+    const isOrchestratorSource = message.source === 'orchestrator';
+
+    if (!hasText && !isPlaceholder && !isUser) {
+      this.requestMessageStats.set(requestId, stats);
+      return;
+    }
+
+    stats.totalContent += 1;
+    if (isPlaceholder) {
+      stats.placeholderContent += 1;
+    } else if (isUser) {
+      stats.userContent += 1;
+    } else if (isWorkerSource) {
+      stats.assistantWorkerContent += 1;
+      stats.assistantContent += 1;
+    } else if (isDispatchToWorker) {
+      stats.assistantDispatchContent += 1;
+    } else if (isOrchestratorSource) {
+      stats.assistantThreadContent += 1;
+      stats.assistantContent += 1;
+    } else {
+      stats.assistantContent += 1;
+    }
+    this.requestMessageStats.set(requestId, stats);
+  }
+
+  private toRequestSummary(stats: RequestMessageStats): RequestMessageSummary {
+    return {
+      totalContent: stats.totalContent,
+      assistantContent: stats.assistantContent,
+      assistantThreadContent: stats.assistantThreadContent,
+      assistantWorkerContent: stats.assistantWorkerContent,
+      assistantDispatchContent: stats.assistantDispatchContent,
+      userContent: stats.userContent,
+      placeholderContent: stats.placeholderContent,
+      dataCount: stats.dataCount,
+    };
   }
 
   /**
-   * 标记消息完成
+   * 标记消息完成（委托给统一方法）
    */
   private completeMessage(id: string, message: StandardMessage, timestamp: number): void {
-    const state = this.messageStates.get(id);
-    if (state) {
-      state.message = message;
-      state.lastSentAt = timestamp;
-      state.completed = true;
-    }
-    this.activeMessageIds.delete(id);
+    this.markMessageComplete(id, message, timestamp);
   }
 
   /**
@@ -869,7 +1203,7 @@ export class MessageHub extends EventEmitter {
       startedAt: isProcessing ? (this.processingState.startedAt || Date.now()) : null,
     };
     if (prev !== isProcessing) {
-      this.emit(PROCESSING_EVENTS.STATE_CHANGED, this.getProcessingState());
+      this.safeEmit(PROCESSING_EVENTS.STATE_CHANGED, this.getProcessingState());
     }
   }
 
@@ -877,7 +1211,7 @@ export class MessageHub extends EventEmitter {
    * 检查并更新处理状态
    */
   private checkAndUpdateProcessingState(): void {
-    if (this.activeMessageIds.size === 0) {
+    if (!this.hasActiveMessages()) {
       this.updateProcessingState(false, null, null);
     }
   }
@@ -887,15 +1221,53 @@ export class MessageHub extends EventEmitter {
    */
   private startCleanupTimer(): void {
     this.cleanupTimer = setInterval(() => {
-      const now = Date.now();
-      const expireTime = now - this.config.retentionTime;
-      for (const [id, state] of this.messageStates) {
-        if (state.completed && state.lastSentAt < expireTime) {
+      try {
+        const now = Date.now();
+        const expireTime = now - this.config.retentionTime;
+
+        // 🔧 修复：先收集要删除的 ID，避免迭代中删除
+        const messageIdsToDelete: string[] = [];
+        for (const [id, state] of this.messageStates) {
+          if (state.completed && state.lastSentAt < expireTime) {
+            messageIdsToDelete.push(id);
+          }
+        }
+        for (const id of messageIdsToDelete) {
           this.messageStates.delete(id);
         }
+
+        // 🔧 清理孤立的 streamBuffers（无对应 state 或已过期）
+        const bufferIdsToDelete: string[] = [];
+        for (const [id] of this.streamBuffers) {
+          const state = this.messageStates.get(id);
+          if (!state || state.completed) {
+            bufferIdsToDelete.push(id);
+          }
+        }
+        for (const id of bufferIdsToDelete) {
+          this.streamBuffers.delete(id);
+        }
+
+        // 🔧 根治：清理过期的 requestMessageStats（超过保留时间）
+        const requestIdsToDelete: string[] = [];
+        for (const [requestId, stats] of this.requestMessageStats) {
+          if (stats.createdAt < expireTime) {
+            requestIdsToDelete.push(requestId);
+          }
+        }
+        for (const requestId of requestIdsToDelete) {
+          this.requestMessageStats.delete(requestId);
+        }
+
+        // 清理过期的内容去重记录
+        this.cleanupContentDedupeRecords(now);
+      } catch (error) {
+        logger.error('MessageHub.cleanup_timer_failed', {
+          error: error instanceof Error ? error.message : String(error),
+          messageStatesSize: this.messageStates.size,
+          streamBuffersSize: this.streamBuffers.size,
+        }, LogCategory.SYSTEM);
       }
-      // 清理过期的内容去重记录
-      this.cleanupContentDedupeRecords(now);
     }, 60 * 1000);
   }
 
@@ -984,6 +1356,64 @@ export class MessageHub extends EventEmitter {
     );
   }
 
+  private extractTextFromBlocks(blocks?: ContentBlock[]): string {
+    if (!Array.isArray(blocks) || blocks.length === 0) {
+      return '';
+    }
+    return blocks
+      .filter((block) => block?.type === 'text' || block?.type === 'thinking')
+      .map((block) => (block as any).content || '')
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  private updateStreamBufferFromMessage(message: StandardMessage): void {
+    if (message.category !== MessageCategory.CONTENT) {
+      return;
+    }
+    const text = this.extractTextFromBlocks(message.blocks);
+    if (!text) {
+      return;
+    }
+    const buffer = this.streamBuffers.get(message.id) || { text: '' };
+    buffer.text = text;
+    buffer.lastBlocks = message.blocks;
+    this.streamBuffers.set(message.id, buffer);
+  }
+
+  private updateStreamBufferFromUpdate(update: StreamUpdate): void {
+    const buffer = this.streamBuffers.get(update.messageId) || { text: '' };
+    if (update.updateType === 'append' && update.appendText) {
+      buffer.text = `${buffer.text}${update.appendText}`;
+    } else if ((update.updateType === 'replace' || update.updateType === 'block_update') && update.blocks) {
+      buffer.text = this.extractTextFromBlocks(update.blocks);
+      buffer.lastBlocks = update.blocks;
+    }
+    this.streamBuffers.set(update.messageId, buffer);
+  }
+
+  private ensureContentBlocksFromBuffer(message: StandardMessage): StandardMessage {
+    if (message.category !== MessageCategory.CONTENT) {
+      return message;
+    }
+    if (message.metadata?.isPlaceholder) {
+      return message;
+    }
+    const existingText = this.extractTextFromBlocks(message.blocks);
+    if (existingText && existingText.trim()) {
+      return message;
+    }
+    const buffer = this.streamBuffers.get(message.id);
+    if (!buffer?.text || !buffer.text.trim()) {
+      return message;
+    }
+    return {
+      ...message,
+      blocks: [{ type: 'text', content: buffer.text, isMarkdown: true }],
+      updatedAt: Date.now(),
+    };
+  }
+
   /**
    * 销毁 MessageHub
    */
@@ -993,8 +1423,18 @@ export class MessageHub extends EventEmitter {
       this.cleanupTimer = null;
     }
     this.messageStates.clear();
-    this.activeMessageIds.clear();
+    this.processingMessageIds.clear();
     this.contentDedupeRecords = [];
+    this.requestMessageStats.clear();
+    this.streamBuffers.clear();
+    // 🔧 重置状态，确保完全清理
+    this.processingState = {
+      isProcessing: false,
+      source: null,
+      agent: null,
+      startedAt: null,
+    };
+    this.requestId = undefined;
     this.removeAllListeners();
   }
 }

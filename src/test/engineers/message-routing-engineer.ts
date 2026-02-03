@@ -78,6 +78,18 @@ class MessageRoutingEngineer implements TestEngineer {
       console.log('    ✗ 失败');
       issues.push(...orderingResult.issues);
     }
+
+    // 测试6：data-only 防护
+    totalTests++;
+    console.log('  [测试6] data-only 防护机制...');
+    const guardResult = await this.testDataOnlyGuard();
+    if (guardResult.passed) {
+      passed++;
+      console.log('    ✓ 通过');
+    } else {
+      console.log('    ✗ 失败');
+      issues.push(...guardResult.issues);
+    }
     
     if (issues.length > 0) {
       suggestions.push('建议添加消息追踪ID，便于调试消息流');
@@ -152,6 +164,41 @@ class MessageRoutingEngineer implements TestEngineer {
       });
     }
     
+    return { passed: issues.length === 0, issues };
+  }
+
+  private async testDataOnlyGuard(): Promise<{ passed: boolean; issues: TestIssue[] }> {
+    const issues: TestIssue[] = [];
+    const providerPath = path.join(process.cwd(), 'src', 'ui', 'webview-provider.ts');
+    const hubPath = path.join(process.cwd(), 'src', 'orchestrator', 'core', 'message-hub.ts');
+    const providerContent = fs.readFileSync(providerPath, 'utf-8');
+    const hubContent = fs.readFileSync(hubPath, 'utf-8');
+
+    const hasRequestStatsCheck = providerContent.includes('assistantContent')
+      && providerContent.includes('消息通道异常：未产生任何响应内容');
+    const hasStreamBuffer = hubContent.includes('streamBuffers')
+      && hubContent.includes('ensureContentBlocksFromBuffer');
+
+    if (!hasRequestStatsCheck) {
+      issues.push({
+        severity: 'high',
+        category: '消息防护',
+        description: '未检测到 data-only 防护（assistantContent 校验缺失）',
+        location: 'src/ui/webview-provider.ts',
+        suggestedFix: '在请求结束时强制校验 assistantContent > 0，失败时发出可见错误'
+      });
+    }
+
+    if (!hasStreamBuffer) {
+      issues.push({
+        severity: 'high',
+        category: '流式完整性',
+        description: '未检测到流式内容缓存/补全机制，可能导致响应内容丢失',
+        location: 'src/orchestrator/core/message-hub.ts',
+        suggestedFix: '为 StreamUpdate 增加缓存，completion 时补全 content blocks'
+      });
+    }
+
     return { passed: issues.length === 0, issues };
   }
 }

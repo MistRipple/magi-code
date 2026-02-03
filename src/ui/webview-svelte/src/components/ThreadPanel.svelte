@@ -1,35 +1,38 @@
 <script lang="ts">
   import type { Message } from '../types/message';
-  import { getState, setCurrentBottomTab } from '../stores/messages.svelte';
+  import {
+    messagesState,
+    setCurrentBottomTab
+  } from '../stores/messages.svelte';
   import MessageList from './MessageList.svelte';
   import InputArea from './InputArea.svelte';
-  import PhaseIndicator from './PhaseIndicator.svelte';
   import BottomTabs from './BottomTabs.svelte';
   import AgentTab from './AgentTab.svelte';
   import { ensureArray } from '../lib/utils';
 
-  const appState = getState();
+  // 🔧 修复响应式追踪问题：直接使用 messagesState 对象
+  // Svelte 5 官方推荐：导出对象并访问其属性，确保响应式追踪正常
 
   // 底部 Tab: 使用 store 中的状态，支持从其他组件跳转
-  const activeBottomTab = $derived(appState.currentBottomTab as 'thread' | 'claude' | 'codex' | 'gemini');
+  const activeBottomTab = $derived(messagesState.currentBottomTab as 'thread' | 'claude' | 'codex' | 'gemini');
 
   function handleBottomTabChange(tab: 'thread' | 'claude' | 'codex' | 'gemini') {
     setCurrentBottomTab(tab);
   }
 
-  // 获取消息列表
-  const messages = $derived(ensureArray(appState.threadMessages) as Message[]);
-  const agentOutputs = $derived({
-    claude: ensureArray(appState.agentOutputs?.claude) as Message[],
-    codex: ensureArray(appState.agentOutputs?.codex) as Message[],
-    gemini: ensureArray(appState.agentOutputs?.gemini) as Message[],
+  // 获取消息列表 - 直接访问 messagesState 属性以正确追踪响应式
+  const messages = $derived(ensureArray(messagesState.threadMessages) as Message[]);
+  const agentOutputs = $derived.by(() => {
+    const outputs = messagesState.agentOutputs;
+    return {
+      claude: ensureArray(outputs?.claude) as Message[],
+      codex: ensureArray(outputs?.codex) as Message[],
+      gemini: ensureArray(outputs?.gemini) as Message[],
+    };
   });
 </script>
 
 <div class="thread-panel">
-  <!-- 阶段进度指示器 -->
-  <PhaseIndicator />
-
   <!-- 消息内容区域（使用 position: relative 让滚动按钮相对于消息区域定位） -->
   <div class="main-content">
     {#if activeBottomTab === 'thread'}

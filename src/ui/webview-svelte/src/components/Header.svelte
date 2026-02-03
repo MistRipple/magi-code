@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getState } from '../stores/messages.svelte';
+  import { messagesState } from '../stores/messages.svelte';
   import { ensureArray } from '../lib/utils';
   import { vscode } from '../lib/vscode-bridge';
   import Icon from './Icon.svelte';
@@ -11,27 +11,62 @@
 
   let { onOpenSettings }: Props = $props();
 
-  const appState = getState();
-
   // 下拉菜单状态
   let dropdownOpen = $state(false);
 
+  // 删除确认对话框状态
+  let showDeleteConfirm = $state(false);
+  let pendingDeleteSessionId = $state<string | null>(null);
+  let pendingDeleteSessionName = $state('');
+
+  // 切换会话确认对话框状态
+  let showSwitchConfirm = $state(false);
+  let pendingSwitchSessionId = $state<string | null>(null);
+  let pendingSwitchSessionName = $state('');
+
+  // 🔧 修复响应式：直接使用 messagesState 对象属性
   // 获取当前会话名称
   const currentSessionName = $derived.by(() => {
-    if (!appState.currentSessionId) return '新会话';
-    const session = (ensureArray(appState.sessions) as Session[]).find(s => s.id === appState.currentSessionId);
+    if (!messagesState.currentSessionId) return '新会话';
+    const session = (ensureArray(messagesState.sessions) as Session[]).find(s => s.id === messagesState.currentSessionId);
     return session?.name || '会话';
   });
+
+  // 🔧 修复响应式：会话列表
+  const sessions = $derived(ensureArray(messagesState.sessions) as Session[]);
 
   // 切换下拉菜单
   function toggleDropdown() {
     dropdownOpen = !dropdownOpen;
   }
 
-  // 选择会话
-  function selectSession(sessionId: string) {
-    vscode.postMessage({ type: 'switchSession', sessionId });
+  // 点击会话项 - 如果是当前会话则忽略，否则弹出确认
+  function handleSessionClick(sessionId: string, sessionName: string) {
+    // 如果点击的就是当前会话，直接关闭下拉菜单，不做任何操作
+    if (sessionId === messagesState.currentSessionId) {
+      dropdownOpen = false;
+      return;
+    }
+    // 弹出切换确认对话框
+    pendingSwitchSessionId = sessionId;
+    pendingSwitchSessionName = sessionName || '未命名会话';
+    showSwitchConfirm = true;
+  }
+
+  // 确认切换会话
+  function confirmSwitch() {
+    if (pendingSwitchSessionId) {
+      vscode.postMessage({ type: 'switchSession', sessionId: pendingSwitchSessionId });
+    }
+    closeSwitchConfirm();
     dropdownOpen = false;
+  }
+
+  // 取消切换
+  function closeSwitchConfirm() {
+    showSwitchConfirm = false;
+    pendingSwitchSessionId = null;
+    pendingSwitchSessionName = '';
   }
 
   // 新建会话
@@ -45,12 +80,28 @@
     onOpenSettings?.();
   }
 
-  // 删除会话
-  function deleteSession(sessionId: string, event: MouseEvent) {
+  // 点击删除按钮 - 显示插件内置确认弹窗
+  function handleDeleteClick(sessionId: string, sessionName: string, event: MouseEvent) {
     event.stopPropagation();
-    if (confirm('确定要删除这个会话吗？')) {
-      vscode.postMessage({ type: 'closeSession', sessionId });
+    pendingDeleteSessionId = sessionId;
+    pendingDeleteSessionName = sessionName || '未命名会话';
+    showDeleteConfirm = true;
+  }
+
+  // 确认删除
+  function confirmDelete() {
+    if (pendingDeleteSessionId) {
+      // 直接删除，无需后端再确认
+      vscode.postMessage({ type: 'deleteSession', sessionId: pendingDeleteSessionId, requireConfirm: false });
     }
+    closeDeleteConfirm();
+  }
+
+  // 取消删除
+  function closeDeleteConfirm() {
+    showDeleteConfirm = false;
+    pendingDeleteSessionId = null;
+    pendingDeleteSessionName = '';
   }
 
   // 格式化日期
@@ -75,6 +126,9 @@
     </button>
 
     {#if dropdownOpen}
+      <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+      <!-- 点击外部区域关闭下拉菜单的遮罩层 -->
+      <div class="dropdown-backdrop" onclick={() => dropdownOpen = false} role="presentation"></div>
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div class="session-dropdown">
         <div class="session-dropdown-header">
@@ -84,20 +138,20 @@
           </button>
         </div>
         <div class="session-list">
-          {#if (ensureArray(appState.sessions) as Session[]).length === 0}
+          {#if sessions.length === 0}
             <div class="session-dropdown-empty">
               <Icon name="chat" size={24} />
               <span>暂无会话历史</span>
             </div>
           {:else}
-            {#each (ensureArray(appState.sessions) as Session[]) as session (session.id)}
+            {#each sessions as session (session.id)}
               <div
                 class="session-item"
-                class:active={session.id === appState.currentSessionId}
+                class:active={session.id === messagesState.currentSessionId}
                 role="button"
                 tabindex="0"
-                onclick={() => selectSession(session.id)}
-                onkeydown={(e) => e.key === 'Enter' && selectSession(session.id)}
+                onclick={() => handleSessionClick(session.id, session.name || '')}
+                onkeydown={(e) => e.key === 'Enter' && handleSessionClick(session.id, session.name || '')}
               >
                 <div class="session-info">
                   <span class="session-name">{session.name || '未命名会话'}</span>
@@ -108,7 +162,7 @@
                 </div>
                 <button
                   class="delete-btn"
-                  onclick={(e) => deleteSession(session.id, e)}
+                  onclick={(e) => handleDeleteClick(session.id, session.name || '', e)}
                   title="删除会话"
                 >
                   <Icon name="delete" size={14} />
@@ -131,6 +185,48 @@
     </button>
   </div>
 </header>
+
+<!-- 删除确认对话框 -->
+{#if showDeleteConfirm}
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+  <div class="modal-overlay" onclick={closeDeleteConfirm} role="presentation">
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+    <div class="modal-dialog modal-dialog--sm" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()}>
+      <div class="modal-header">
+        <h3 class="modal-title">删除会话</h3>
+        <button class="modal-close" onclick={closeDeleteConfirm}>×</button>
+      </div>
+      <div class="modal-body">
+        <p>确定要删除会话 "<strong>{pendingDeleteSessionName}</strong>" 吗？此操作不可撤销。</p>
+      </div>
+      <div class="modal-footer">
+        <button class="modal-btn secondary" onclick={closeDeleteConfirm}>取消</button>
+        <button class="modal-btn danger" onclick={confirmDelete}>确定删除</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- 切换会话确认对话框 -->
+{#if showSwitchConfirm}
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+  <div class="modal-overlay" onclick={closeSwitchConfirm} role="presentation">
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+    <div class="modal-dialog modal-dialog--sm" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()}>
+      <div class="modal-header">
+        <h3 class="modal-title">切换会话</h3>
+        <button class="modal-close" onclick={closeSwitchConfirm}>×</button>
+      </div>
+      <div class="modal-body">
+        <p>确定要切换到会话 "<strong>{pendingSwitchSessionName}</strong>" 吗？</p>
+      </div>
+      <div class="modal-footer">
+        <button class="modal-btn secondary" onclick={closeSwitchConfirm}>取消</button>
+        <button class="modal-btn primary" onclick={confirmSwitch}>确定切换</button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   .header-bar {
@@ -306,6 +402,14 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
+  }
+
+  /* 下拉菜单背景遮罩 - 点击外部区域关闭 */
+  .dropdown-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: calc(var(--z-dropdown) - 1);
+    background: transparent;
   }
 
   /* 使用全局 .btn-icon 样式，这里只覆盖必要的 */
