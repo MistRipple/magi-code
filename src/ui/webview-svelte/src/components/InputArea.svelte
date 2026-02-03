@@ -1,13 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
-  import { getState, addToast, getActiveInteractionType } from '../stores/messages.svelte';
+  import { addToast, getActiveInteractionType, messagesState } from '../stores/messages.svelte';
   import type { StandardMessage } from '../../../../protocol/message-protocol';
   import { MessageCategory } from '../../../../protocol/message-protocol';
   import Icon from './Icon.svelte';
   import { generateId } from '../lib/utils';
-
-  const appState = getState();
 
   // 输入内容
   let inputValue = $state('');
@@ -29,8 +27,8 @@
   const MAX_IMAGES = 5;  // 最多支持 5 张图片
   const MAX_IMAGE_SIZE = 10 * 1024 * 1024;  // 单张图片最大 10MB
 
-  // 是否正在发送
-  const isSending = $derived.by(() => appState.isProcessing);
+  // 🔧 修复响应式：直接访问 messagesState 属性确保正确追踪
+  const isSending = $derived(messagesState.isProcessing);
   const activeInteraction = $derived.by(() => getActiveInteractionType());
   const isInteractionBlocking = $derived.by(() => Boolean(activeInteraction));
   const MAX_INPUT_CHARS = 10000;

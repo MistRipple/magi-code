@@ -351,12 +351,23 @@
     background: var(--surface-1);
     color: var(--foreground);
     cursor: pointer;
+    font-size: var(--text-sm);
+    font-weight: var(--font-medium);
+    transition: all var(--transition-fast);
+  }
+
+  .modal-btn:hover {
+    background: var(--surface-hover);
   }
 
   .modal-btn.primary {
     background: var(--primary);
     border-color: var(--primary);
     color: white;
+  }
+
+  .modal-btn.primary:hover {
+    opacity: 0.9;
   }
 
   .modal-btn:disabled {

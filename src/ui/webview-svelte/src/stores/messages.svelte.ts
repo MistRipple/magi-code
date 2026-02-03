@@ -19,55 +19,82 @@ import type {
   WaveState,
   WorkerSessionState,
   RequestResponseBinding,
+  ModelStatusMap,
 } from '../types/message';
 import { vscode } from '../lib/vscode-bridge';
-import { ensureArray, generateId } from '../lib/utils';
+import { ensureArray } from '../lib/utils';
 
 // ============ 状态定义 ============
+// 🔧 修复：使用对象属性模式确保跨模块响应式正常工作
+// Svelte 5 官方推荐：导出对象并修改其属性，而非重新赋值独立变量
 
-// Tab 状态
-let currentTopTab = $state<TabType>('thread');
-let currentBottomTab = $state<TabType>('thread');
+/**
+ * 核心消息状态
+ * 使用对象属性模式确保跨模块响应式追踪
+ */
+export const messagesState = $state({
+  // Tab 状态
+  currentTopTab: 'thread' as TabType,
+  currentBottomTab: 'thread' as TabType,
 
-// 消息状态
-let threadMessages = $state<Message[]>([]);
-let agentOutputs = $state<AgentOutputs>({
-  claude: [],
-  codex: [],
-  gemini: [],
+  // 消息状态
+  threadMessages: [] as Message[],
+  agentOutputs: {
+    claude: [],
+    codex: [],
+    gemini: [],
+  } as AgentOutputs,
+
+  // 会话状态
+  sessions: [] as Session[],
+  currentSessionId: null as string | null,
+
+  // 处理状态
+  isProcessing: false,
+  backendProcessing: false,
+  activeMessageIds: new Set<string>(),
+  pendingRequests: new Set<string>(),
+  thinkingStartAt: null as number | null,
+  processingActor: {
+    source: 'orchestrator',
+    agent: 'claude',
+  } as ProcessingActor,
+
+  // 后端下发的完整状态
+  appState: null as AppState | null,
+
+  // 滚动状态
+  scrollPositions: {
+    thread: 0,
+    claude: 0,
+    codex: 0,
+    gemini: 0,
+  } as ScrollPositions,
+  autoScrollEnabled: {
+    thread: true,
+    claude: true,
+    codex: true,
+    gemini: true,
+  } as AutoScrollConfig,
 });
 
-// 会话状态
-let sessions = $state<Session[]>([]);
-let currentSessionId = $state<string | null>(null);
-
-// 处理状态
-let isProcessing = $state(false);
-let backendProcessing = $state(false);
-let activeMessageIds = $state<Set<string>>(new Set());
-let pendingRequests = $state<Set<string>>(new Set());
-let thinkingStartAt = $state<number | null>(null);
-let processingActor = $state<ProcessingActor>({
-  source: 'orchestrator',
-  agent: 'claude',
-});
-
-// 后端下发的完整状态
-let appState = $state<AppState | null>(null);
-
-// 滚动状态
-let scrollPositions = $state<ScrollPositions>({
-  thread: 0,
-  claude: 0,
-  codex: 0,
-  gemini: 0,
-});
-let autoScrollEnabled = $state<AutoScrollConfig>({
-  thread: true,
-  claude: true,
-  codex: true,
-  gemini: true,
-});
+// 🔧 兼容层：保留原有的独立变量引用（逐步迁移）
+// 这些变量现在指向 messagesState 的属性
+let currentTopTab = $derived(messagesState.currentTopTab);
+let currentBottomTab = $derived(messagesState.currentBottomTab);
+let threadMessages = $derived(messagesState.threadMessages);
+let agentOutputs = $derived(messagesState.agentOutputs);
+let sessions = $derived(messagesState.sessions);
+let currentSessionId = $derived(messagesState.currentSessionId);
+let isProcessing = $derived(messagesState.isProcessing);
+let backendProcessing = $derived(messagesState.backendProcessing);
+let activeMessageIds = $derived(messagesState.activeMessageIds);
+let pendingRequests = $derived(messagesState.pendingRequests);
+let thinkingStartAt = $derived(messagesState.thinkingStartAt);
+let processingActor = $derived(messagesState.processingActor);
+let appState = $derived(messagesState.appState);
+let scrollPositions = $derived(messagesState.scrollPositions);
+let autoScrollEnabled = $derived(messagesState.autoScrollEnabled);
 
 // 消息列表限制
 const MAX_THREAD_MESSAGES = 500;
@@ -95,12 +122,13 @@ function hasInvalidMessageSource(messages: Message[]): boolean {
 // 新增状态：任务、变更、阶段、Toast、模型状态
 let tasks = $state<Array<{ id: string; name: string; description?: string; status: string }>>([]);
 let edits = $state<Array<{ filePath: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string }>>([]);
-let currentPhase = $state(0);
 let toasts = $state<Array<{ id: string; type: string; title?: string; message: string }>>([]);
-let modelStatus = $state<Record<string, string>>({
-  claude: 'unavailable',
-  codex: 'unavailable',
-  gemini: 'unavailable',
+let modelStatus = $state<ModelStatusMap>({
+  claude: { status: 'checking' },
+  codex: { status: 'checking' },
+  gemini: { status: 'checking' },
+  orchestrator: { status: 'checking' },
+  compressor: { status: 'checking' },
 });
 let interactionMode = $state<'ask' | 'auto'>('auto');
 
@@ -208,29 +236,141 @@ let requestBindings = $state<Map<string, RequestResponseBinding>>(new Map());
 
 // 请求超时时间（30秒）
 
-// ============ 导出 Getter ============
+// ============ 直接导出响应式状态（Svelte 5 推荐方式）============
+// 🔧 修复响应式追踪问题：通过 messagesState 对象属性访问
+// Svelte 5 官方推荐：导出对象属性读取，确保响应式追踪正常
+
+export function getThreadMessages() {
+  return messagesState.threadMessages;
+}
+
+export function getAgentOutputs() {
+  return messagesState.agentOutputs;
+}
+
+export function getCurrentBottomTab() {
+  return messagesState.currentBottomTab;
+}
+
+export function getCurrentTopTab() {
+  return messagesState.currentTopTab;
+}
+
+export function getIsProcessing() {
+  return messagesState.isProcessing;
+}
+
+export function getThinkingStartAt() {
+  return messagesState.thinkingStartAt;
+}
+
+export function getProcessingActor() {
+  return messagesState.processingActor;
+}
+
+export function getSessions() {
+  return messagesState.sessions;
+}
+
+export function getCurrentSessionId() {
+  return messagesState.currentSessionId;
+}
+
+export function getAppState() {
+  return messagesState.appState;
+}
+
+export function getScrollPositions() {
+  return messagesState.scrollPositions;
+}
+
+export function getAutoScrollEnabled() {
+  return messagesState.autoScrollEnabled;
+}
+
+export function getTasks() {
+  return tasks;
+}
+
+export function getEdits() {
+  return edits;
+}
+
+export function getToasts() {
+  return toasts;
+}
+
+export function getModelStatus() {
+  return modelStatus;
+}
+
+export function getInteractionMode() {
+  return interactionMode;
+}
+
+export function getWorkerExecutionStatus() {
+  return workerExecutionStatus;
+}
+
+export function getPendingConfirmation() {
+  return pendingConfirmation;
+}
+
+export function getPendingRecovery() {
+  return pendingRecovery;
+}
+
+export function getPendingQuestion() {
+  return pendingQuestion;
+}
+
+export function getPendingClarification() {
+  return pendingClarification;
+}
+
+export function getPendingWorkerQuestion() {
+  return pendingWorkerQuestion;
+}
+
+export function getPendingToolAuthorization() {
+  return pendingToolAuthorization;
+}
+
+export function getMissionPlan() {
+  return missionPlan;
+}
+
+export function getWaveState() {
+  return waveState;
+}
+
+export function getWorkerSessions() {
+  return workerSessions;
+}
+
+// ============ 兼容旧版 getState()（逐步迁移）============
+// ⚠️ 已废弃：此函数返回的对象无法被 Svelte 5 正确追踪
+// 请使用上面的独立 getter 函数或直接使用 messagesState
 
 export function getState() {
   return {
-    get currentTopTab() { return currentTopTab; },
-    get currentBottomTab() { return currentBottomTab; },
-    get threadMessages() { return threadMessages; },
-    get agentOutputs() { return agentOutputs; },
-    get sessions() { return sessions; },
-    get currentSessionId() { return currentSessionId; },
-    get isProcessing() { return isProcessing; },
-    get thinkingStartAt() { return thinkingStartAt; },
-    get processingActor() { return processingActor; },
-    get appState() { return appState; },
-    get scrollPositions() { return scrollPositions; },
-    get autoScrollEnabled() { return autoScrollEnabled; },
+    get currentTopTab() { return messagesState.currentTopTab; },
+    get currentBottomTab() { return messagesState.currentBottomTab; },
+    get threadMessages() { return messagesState.threadMessages; },
+    get agentOutputs() { return messagesState.agentOutputs; },
+    get sessions() { return messagesState.sessions; },
+    get currentSessionId() { return messagesState.currentSessionId; },
+    get isProcessing() { return messagesState.isProcessing; },
+    get thinkingStartAt() { return messagesState.thinkingStartAt; },
+    get processingActor() { return messagesState.processingActor; },
+    get appState() { return messagesState.appState; },
+    get scrollPositions() { return messagesState.scrollPositions; },
+    get autoScrollEnabled() { return messagesState.autoScrollEnabled; },
     // 新增
     get tasks() { return tasks; },
     set tasks(v) { tasks = v; },
     get edits() { return edits; },
     set edits(v) { edits = v; },
-    get currentPhase() { return currentPhase; },
-    set currentPhase(v) { currentPhase = v; },
     get toasts() { return toasts; },
     set toasts(v) { toasts = v; },
     get modelStatus() { return modelStatus; },
@@ -267,12 +407,15 @@ export function getState() {
 
 // 裁剪消息列表
 function trimMessageLists() {
-  if (threadMessages.length > MAX_THREAD_MESSAGES) {
-    threadMessages = threadMessages.slice(-MAX_THREAD_MESSAGES);
+  if (messagesState.threadMessages.length > MAX_THREAD_MESSAGES) {
+    messagesState.threadMessages = messagesState.threadMessages.slice(-MAX_THREAD_MESSAGES);
   }
   (['claude', 'codex', 'gemini'] as const).forEach((agent) => {
-    if (agentOutputs[agent].length > MAX_AGENT_MESSAGES) {
-      agentOutputs[agent] = agentOutputs[agent].slice(-MAX_AGENT_MESSAGES);
+    if (messagesState.agentOutputs[agent].length > MAX_AGENT_MESSAGES) {
+      messagesState.agentOutputs = {
+        ...messagesState.agentOutputs,
+        [agent]: messagesState.agentOutputs[agent].slice(-MAX_AGENT_MESSAGES),
+      };
     }
   });
 }
@@ -281,38 +424,38 @@ function trimMessageLists() {
 function saveWebviewState() {
   trimMessageLists();
   const state: WebviewPersistedState = {
-    currentTopTab,
-    currentBottomTab,
-    threadMessages,
-    agentOutputs,
-    sessions,
-    currentSessionId,
-    scrollPositions,
-    autoScrollEnabled,
+    currentTopTab: messagesState.currentTopTab,
+    currentBottomTab: messagesState.currentBottomTab,
+    threadMessages: messagesState.threadMessages,
+    agentOutputs: messagesState.agentOutputs,
+    sessions: messagesState.sessions,
+    currentSessionId: messagesState.currentSessionId,
+    scrollPositions: messagesState.scrollPositions,
+    autoScrollEnabled: messagesState.autoScrollEnabled,
   };
   vscode.setState(state);
 }
 
 // Tab 操作
 export function setCurrentTopTab(tab: TabType) {
-  currentTopTab = tab;
+  messagesState.currentTopTab = tab;
   saveWebviewState();
 }
 
 export function setCurrentBottomTab(tab: TabType) {
-  currentBottomTab = tab;
+  messagesState.currentBottomTab = tab;
   saveWebviewState();
 }
 
 // 会话操作
 export function setCurrentSessionId(id: string | null) {
-  currentSessionId = id;
+  messagesState.currentSessionId = id;
   saveWebviewState();
 }
 
 export function updateSessions(newSessions: Session[]) {
   const seen = new Set<string>();
-  sessions = ensureArray<Session>(newSessions)
+  messagesState.sessions = ensureArray<Session>(newSessions)
     .filter((session): session is Session => !!session && typeof session === 'object' && typeof session.id === 'string' && session.id.trim().length > 0)
     .filter((session) => {
       if (seen.has(session.id)) return false;
@@ -324,7 +467,7 @@ export function updateSessions(newSessions: Session[]) {
 
 // 处理状态操作
 export function setIsProcessing(value: boolean) {
-  backendProcessing = value;
+  messagesState.backendProcessing = value;
   updateProcessingState();
 }
 
@@ -363,53 +506,53 @@ export function setWorkerExecutionStatus(
 }
 
 function updateProcessingState() {
-  isProcessing = backendProcessing || activeMessageIds.size > 0 || pendingRequests.size > 0;
+  messagesState.isProcessing = messagesState.backendProcessing || messagesState.activeMessageIds.size > 0 || messagesState.pendingRequests.size > 0;
 }
 
 export function markMessageActive(id: string) {
   if (!id) return;
-  if (!activeMessageIds.has(id)) {
-    const next = new Set(activeMessageIds);
+  if (!messagesState.activeMessageIds.has(id)) {
+    const next = new Set(messagesState.activeMessageIds);
     next.add(id);
-    activeMessageIds = next;
+    messagesState.activeMessageIds = next;
     updateProcessingState();
   }
 }
 
 export function markMessageComplete(id: string) {
   if (!id) return;
-  if (activeMessageIds.has(id)) {
-    const next = new Set(activeMessageIds);
+  if (messagesState.activeMessageIds.has(id)) {
+    const next = new Set(messagesState.activeMessageIds);
     next.delete(id);
-    activeMessageIds = next;
+    messagesState.activeMessageIds = next;
     updateProcessingState();
   }
 }
 
 export function addPendingRequest(id: string) {
   if (!id) return;
-  if (!pendingRequests.has(id)) {
-    const next = new Set(pendingRequests);
+  if (!messagesState.pendingRequests.has(id)) {
+    const next = new Set(messagesState.pendingRequests);
     next.add(id);
-    pendingRequests = next;
+    messagesState.pendingRequests = next;
     updateProcessingState();
   }
 }
 
 export function clearPendingRequest(id: string) {
   if (!id) return;
-  if (pendingRequests.has(id)) {
-    const next = new Set(pendingRequests);
+  if (messagesState.pendingRequests.has(id)) {
+    const next = new Set(messagesState.pendingRequests);
     next.delete(id);
-    pendingRequests = next;
+    messagesState.pendingRequests = next;
     updateProcessingState();
   }
 }
 
 export function clearProcessingState() {
-  backendProcessing = false;
-  activeMessageIds = new Set();
-  pendingRequests = new Set();
+  messagesState.backendProcessing = false;
+  messagesState.activeMessageIds = new Set();
+  messagesState.pendingRequests = new Set();
   updateProcessingState();
 }
 
@@ -450,15 +593,29 @@ export function getActiveInteractionType(): string | null {
 export function addThreadMessage(message: Message) {
   // 完全重建数组以确保响应式更新
   const safeMessage = JSON.parse(JSON.stringify(normalizeIncomingMessage(message))) as Message;
-  if (threadMessages.some((m) => m.id === safeMessage.id)) {
-    throw new Error(`[MessagesStore] 重复的 thread message id: ${safeMessage.id}`);
+  console.log('[MessagesStore] addThreadMessage 开始:', {
+    id: safeMessage.id,
+    role: safeMessage.role,
+    type: safeMessage.type,
+    currentCount: messagesState.threadMessages.length,
+  });
+  if (messagesState.threadMessages.some((m) => m.id === safeMessage.id)) {
+    console.warn(`[MessagesStore] 跳过重复消息: ${safeMessage.id}`);
+    // 🔧 改为警告而非抛出错误，避免中断
+    return;
   }
-  threadMessages = [...threadMessages, safeMessage];
+  // 🔧 修复：使用对象属性赋值，确保响应式追踪
+  messagesState.threadMessages = [...messagesState.threadMessages, safeMessage];
+  console.log('[MessagesStore] addThreadMessage 完成:', {
+    id: safeMessage.id,
+    newCount: messagesState.threadMessages.length,
+    allIds: messagesState.threadMessages.map(m => m.id),
+  });
   saveWebviewState();
 }
 
 export function updateThreadMessage(messageId: string, updates: Partial<Message>) {
-  const index = threadMessages.findIndex((m) => m.id === messageId);
+  const index = messagesState.threadMessages.findIndex((m) => m.id === messageId);
   if (index !== -1) {
     // 必须完全重建数组，不能直接修改索引
     // 使用 JSON 序列化确保脱离响应式代理
@@ -468,32 +625,50 @@ export function updateThreadMessage(messageId: string, updates: Partial<Message>
       normalizedUpdates.blocks = blocks.length > 0 ? blocks : undefined;
     }
     const safeUpdates = JSON.parse(JSON.stringify(normalizedUpdates)) as Partial<Message>;
-    const newMessages = threadMessages.map((msg, i) => {
+    const newMessages = messagesState.threadMessages.map((msg, i) => {
       if (i === index) {
         return { ...msg, ...safeUpdates };
       }
       return msg;
     });
-    threadMessages = newMessages;
+    messagesState.threadMessages = newMessages;
     // 不触发保存，由流式管理器批量保存
   }
 }
 
+export function replaceThreadMessage(oldMessageId: string, message: Message) {
+  const safeMessage = JSON.parse(JSON.stringify(normalizeIncomingMessage(message))) as Message;
+  const index = messagesState.threadMessages.findIndex((m) => m.id === oldMessageId);
+  if (index === -1) {
+    addThreadMessage(safeMessage);
+    return;
+  }
+  if (messagesState.threadMessages.some((m, i) => m.id === safeMessage.id && i !== index)) {
+    console.warn(`[MessagesStore] 替换消息 id 冲突: ${safeMessage.id}`);
+    return;
+  }
+  const next = [...messagesState.threadMessages];
+  next[index] = safeMessage;
+  messagesState.threadMessages = next;
+  saveWebviewState();
+}
+
 export function removeThreadMessage(messageId: string) {
-  if (!threadMessages.length) return;
-  threadMessages = threadMessages.filter((m) => m.id !== messageId);
+  if (!messagesState.threadMessages.length) return;
+  messagesState.threadMessages = messagesState.threadMessages.filter((m) => m.id !== messageId);
   saveWebviewState();
 }
 
 export function clearThreadMessages() {
-  threadMessages = [];
+  messagesState.threadMessages = [];
   saveWebviewState();
 }
 
 export function addAgentMessage(agent: AgentType, message: Message) {
   const safeMessage = JSON.parse(JSON.stringify(normalizeIncomingMessage(message))) as Message;
-  if (agentOutputs[agent].some((m) => m.id === safeMessage.id)) {
-    throw new Error(`[MessagesStore] 重复的 agent message id: ${safeMessage.id}`);
+  if (messagesState.agentOutputs[agent].some((m) => m.id === safeMessage.id)) {
+    console.warn(`[MessagesStore] 跳过重复的 agent message: ${safeMessage.id}`);
+    return;
   }
 
   // 🔧 调试日志：追踪 Worker 消息添加
@@ -501,24 +676,24 @@ export function addAgentMessage(agent: AgentType, message: Message) {
     agent,
     messageId: safeMessage.id,
     contentPreview: safeMessage.content?.substring(0, 100),
-    currentCount: agentOutputs[agent]?.length || 0,
+    currentCount: messagesState.agentOutputs[agent]?.length || 0,
   });
 
-  agentOutputs = {
-    ...agentOutputs,
-    [agent]: [...agentOutputs[agent], safeMessage],
+  messagesState.agentOutputs = {
+    ...messagesState.agentOutputs,
+    [agent]: [...messagesState.agentOutputs[agent], safeMessage],
   };
 
   console.log('[DEBUG] addAgentMessage 完成:', {
     agent,
-    newCount: agentOutputs[agent]?.length || 0,
+    newCount: messagesState.agentOutputs[agent]?.length || 0,
   });
 
   saveWebviewState();
 }
 
 export function updateAgentMessage(agent: AgentType, messageId: string, updates: Partial<Message>) {
-  const list = agentOutputs[agent];
+  const list = messagesState.agentOutputs[agent];
   const index = list.findIndex((m) => m.id === messageId);
   if (index !== -1) {
     const normalizedUpdates: Partial<Message> = { ...updates };
@@ -528,27 +703,44 @@ export function updateAgentMessage(agent: AgentType, messageId: string, updates:
     }
     const safeUpdates = JSON.parse(JSON.stringify(normalizedUpdates)) as Partial<Message>;
     const next = list.map((msg, i) => (i === index ? { ...msg, ...safeUpdates } : msg));
-    agentOutputs = { ...agentOutputs, [agent]: next };
+    messagesState.agentOutputs = { ...messagesState.agentOutputs, [agent]: next };
     // 不触发保存，由流式管理器批量保存
   }
 }
 
+export function replaceAgentMessage(agent: AgentType, oldMessageId: string, message: Message) {
+  const safeMessage = JSON.parse(JSON.stringify(normalizeIncomingMessage(message))) as Message;
+  const index = messagesState.agentOutputs[agent].findIndex((m) => m.id === oldMessageId);
+  if (index === -1) {
+    addAgentMessage(agent, safeMessage);
+    return;
+  }
+  if (messagesState.agentOutputs[agent].some((m, i) => m.id === safeMessage.id && i !== index)) {
+    console.warn(`[MessagesStore] 替换 agent message id 冲突: ${safeMessage.id}`);
+    return;
+  }
+  const next = [...messagesState.agentOutputs[agent]];
+  next[index] = safeMessage;
+  messagesState.agentOutputs = { ...messagesState.agentOutputs, [agent]: next };
+  saveWebviewState();
+}
+
 export function removeAgentMessage(agent: AgentType, messageId: string) {
-  const list = agentOutputs[agent];
+  const list = messagesState.agentOutputs[agent];
   if (!list.length) return;
   const next = list.filter((m) => m.id !== messageId);
   if (next.length === list.length) return;
-  agentOutputs = { ...agentOutputs, [agent]: next };
+  messagesState.agentOutputs = { ...messagesState.agentOutputs, [agent]: next };
   saveWebviewState();
 }
 
 export function clearAgentMessages(agent: AgentType) {
-  agentOutputs = { ...agentOutputs, [agent]: [] };
+  messagesState.agentOutputs = { ...messagesState.agentOutputs, [agent]: [] };
   saveWebviewState();
 }
 
 export function clearAgentOutputs() {
-  agentOutputs = {
+  messagesState.agentOutputs = {
     claude: [],
     codex: [],
     gemini: [],
@@ -558,8 +750,8 @@ export function clearAgentOutputs() {
 
 // 清空所有消息（用于会话切换/新建）
 export function clearAllMessages() {
-  threadMessages = [];
-  agentOutputs = {
+  messagesState.threadMessages = [];
+  messagesState.agentOutputs = {
     claude: [],
     codex: [],
     gemini: [],
@@ -571,13 +763,13 @@ export function clearAllMessages() {
 
 // 设置完整的消息列表（用于会话切换时加载历史）
 export function setThreadMessages(messages: Message[]) {
-  threadMessages = normalizePersistedMessages(messages).map(m => JSON.parse(JSON.stringify(m)) as Message);
+  messagesState.threadMessages = normalizePersistedMessages(messages).map(m => JSON.parse(JSON.stringify(m)) as Message);
   saveWebviewState();
 }
 
 // 设置完整的 agent 消息列表（用于会话切换时加载历史）
 export function setAgentOutputs(outputs: AgentOutputs) {
-  agentOutputs = {
+  messagesState.agentOutputs = {
     claude: normalizePersistedMessages(outputs.claude).map(m => JSON.parse(JSON.stringify(m)) as Message),
     codex: normalizePersistedMessages(outputs.codex).map(m => JSON.parse(JSON.stringify(m)) as Message),
     gemini: normalizePersistedMessages(outputs.gemini).map(m => JSON.parse(JSON.stringify(m)) as Message),
@@ -598,33 +790,33 @@ export function initializeState() {
       throw new Error('[MessagesStore] 持久化数据结构无效');
     }
     // Tab 状态不持久化，每次打开都默认显示主对话 tab
-    currentTopTab = 'thread';
-    currentBottomTab = 'thread';
-    threadMessages = normalizePersistedMessages(persisted.threadMessages);
-    agentOutputs = {
+    messagesState.currentTopTab = 'thread';
+    messagesState.currentBottomTab = 'thread';
+    messagesState.threadMessages = normalizePersistedMessages(persisted.threadMessages);
+    messagesState.agentOutputs = {
       claude: normalizePersistedMessages(persisted.agentOutputs?.claude),
       codex: normalizePersistedMessages(persisted.agentOutputs?.codex),
       gemini: normalizePersistedMessages(persisted.agentOutputs?.gemini),
     };
     if (
-      hasInvalidMessageSource(threadMessages) ||
-      hasInvalidMessageSource(agentOutputs.claude) ||
-      hasInvalidMessageSource(agentOutputs.codex) ||
-      hasInvalidMessageSource(agentOutputs.gemini)
+      hasInvalidMessageSource(messagesState.threadMessages) ||
+      hasInvalidMessageSource(messagesState.agentOutputs.claude) ||
+      hasInvalidMessageSource(messagesState.agentOutputs.codex) ||
+      hasInvalidMessageSource(messagesState.agentOutputs.gemini)
     ) {
       throw new Error('[MessagesStore] 持久化消息来源无效');
     }
     const sessionSeen = new Set<string>();
-    sessions = ensureArray<Session>(persisted.sessions)
+    messagesState.sessions = ensureArray<Session>(persisted.sessions)
       .filter((session) => !!session && typeof session.id === 'string' && session.id.trim().length > 0)
       .filter((session) => {
         if (sessionSeen.has(session.id)) return false;
         sessionSeen.add(session.id);
         return true;
       });
-    currentSessionId = persisted.currentSessionId || null;
-    scrollPositions = persisted.scrollPositions || { thread: 0, claude: 0, codex: 0, gemini: 0 };
-    autoScrollEnabled = persisted.autoScrollEnabled || { thread: true, claude: true, codex: true, gemini: true };
+    messagesState.currentSessionId = persisted.currentSessionId || null;
+    messagesState.scrollPositions = persisted.scrollPositions || { thread: 0, claude: 0, codex: 0, gemini: 0 };
+    messagesState.autoScrollEnabled = persisted.autoScrollEnabled || { thread: true, claude: true, codex: true, gemini: true };
   }
 }
 

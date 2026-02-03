@@ -27,6 +27,8 @@ export interface SessionMessage {
   source?: 'orchestrator' | 'worker' | 'system';
   timestamp: number;
   attachments?: { name: string; path: string; mimeType?: string }[];
+  /** 用户上传的图片（base64 Data URL 格式） */
+  images?: Array<{ dataUrl: string }>;
 }
 
 /** 文件快照元数据 */
@@ -253,7 +255,8 @@ export class UnifiedSessionManager {
     role: 'user' | 'assistant',
     content: string,
     agent?: AgentType,  // ✅ 使用 AgentType
-    source?: 'orchestrator' | 'worker' | 'system'
+    source?: 'orchestrator' | 'worker' | 'system',
+    images?: Array<{ dataUrl: string }>  // 🔧 新增：用户上传的图片
   ): SessionMessage {
     const session = this.getOrCreateCurrentSession();
     const message: SessionMessage = {
@@ -263,6 +266,7 @@ export class UnifiedSessionManager {
       agent,  // ✅ 使用 agent
       source,
       timestamp: Date.now(),
+      images: images && images.length > 0 ? images : undefined,  // 🔧 保存图片
     };
 
     session.messages.push(message);

@@ -94,63 +94,30 @@ export type NotifyLevel = 'info' | 'success' | 'warning' | 'error';
  * 数据消息类型（DataMessageType）
  */
 export type DataMessageType =
-  | 'adrAdded'
-  | 'adrDeleted'
-  | 'adrUpdated'
-  | 'adrsLoaded'
   | 'allWorkerConfigsLoaded'
   | 'assignmentCompleted'
   | 'assignmentPlanned'
   | 'assignmentStarted'
-  | 'authStatus'
   | 'clarificationRequest'
   | 'compressorConfigLoaded'
-  | 'compressorConfigSaved'
   | 'compressorConnectionTestResult'
   | 'confirmationRequest'
-  | 'contractVerified'
   | 'customToolAdded'
   | 'customToolRemoved'
-  | 'dependencyAnalysis'
   | 'dynamicTodoAdded'
   | 'executionStatsUpdate'
-  | 'faqAdded'
-  | 'faqDeleted'
-  | 'faqSearchResults'
-  | 'faqUpdated'
-  | 'faqsLoaded'
   | 'instructionSkillRemoved'
   | 'interactionModeChanged'
-  | 'loginError'
-  | 'loginSuccess'
   | 'mcpServerAdded'
-  | 'mcpServerConnected'
-  | 'mcpServerConnectionFailed'
   | 'mcpServerDeleted'
-  | 'mcpServerDisconnected'
   | 'mcpServerTools'
   | 'mcpServerUpdated'
   | 'mcpServersLoaded'
   | 'mcpToolsRefreshed'
-  | 'missionApproved'
-  | 'missionBlocked'
-  | 'missionCancelled'
-  | 'missionCompleted'
-  | 'missionCreated'
-  | 'missionExecutionCompleted'
   | 'missionExecutionFailed'
-  | 'missionExecutionStarted'
   | 'missionFailed'
-  | 'missionPaused'
   | 'missionPlanned'
-  | 'missionProgress'
-  | 'missionResumed'
-  | 'missionSummary'
-  | 'missionUnblocked'
-  | 'missionVerificationCompleted'
-  | 'missionVerificationStarted'
   | 'orchestratorConfigLoaded'
-  | 'orchestratorConfigSaved'
   | 'orchestratorConnectionTestResult'
   | 'profileConfig'
   | 'profileConfigReset'
@@ -159,7 +126,6 @@ export type DataMessageType =
   | 'processingStateChanged'
   | 'promptEnhanceConfigLoaded'
   | 'promptEnhanceResult'
-  | 'promptEnhanceSaved'
   | 'promptEnhanced'
   | 'questionRequest'
   | 'recoveryRequest'
@@ -167,7 +133,6 @@ export type DataMessageType =
   | 'repositoryAdded'
   | 'repositoryDeleted'
   | 'repositoryRefreshed'
-  | 'repositoryUpdated'
   | 'sessionCreated'
   | 'sessionLoaded'
   | 'sessionMessagesLoaded'
@@ -176,17 +141,13 @@ export type DataMessageType =
   | 'skillInstalled'
   | 'skillLibraryLoaded'
   | 'skillsConfigLoaded'
-  | 'skillsConfigSaved'
   | 'stateUpdate'
-  | 'taskInterrupted'
   | 'todoApprovalRequested'
   | 'todoCompleted'
   | 'todoFailed'
   | 'todoStarted'
   | 'toolAuthorizationRequest'
-  | 'workerConfigSaved'
   | 'workerConnectionTestResult'
-  | 'workerError'
   | 'workerQuestionRequest'
   | 'workerSessionCreated'
   | 'workerSessionResumed'
@@ -517,6 +478,10 @@ export interface MessageMetadata {
   intent?: string;
   /** 决策方式（llm/rule 等） */
   decision?: string;
+  /** 是否为强制补发内容 */
+  forced?: boolean;
+  /** 触发原因（用于诊断） */
+  reason?: string;
   /** 请求 ID（用于占位/响应绑定） */
   requestId?: string;
   /** 会话 ID（用于跨会话标记） */
@@ -535,6 +500,8 @@ export interface MessageMetadata {
   sendingAnimation?: boolean;
   /** 曾为占位消息（用于过渡动画） */
   wasPlaceholder?: boolean;
+  /** 用户上传的图片（base64 Data URL 格式） */
+  images?: Array<{ dataUrl: string }>;
 }
 
 // ============================================================================

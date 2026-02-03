@@ -446,6 +446,16 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     const streamToUI = options?.streamToUI !== false;
     adapter.setStreamToUI(streamToUI);
 
+    // 为 orchestrator 适配器应用临时配置
+    if (agent === 'orchestrator' && adapter instanceof OrchestratorLLMAdapter) {
+      if (options?.systemPrompt) {
+        adapter.setTempSystemPrompt(options.systemPrompt);
+      }
+      if (options?.isolatedSession) {
+        adapter.setTempIsolatedSession(options.isolatedSession);
+      }
+    }
+
     try {
       await this.ensureConnected(agent, adapter);
     } catch (error: any) {

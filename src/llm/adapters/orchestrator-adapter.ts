@@ -47,6 +47,12 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   private abortController?: AbortController;
   private historyConfig: Required<OrchestratorHistoryConfig>;
 
+  /**
+   * 临时配置（仅对下一次请求生效）
+   */
+  private tempSystemPrompt?: string;
+  private tempIsolatedSession?: boolean;
+
   constructor(adapterConfig: OrchestratorAdapterConfig) {
     super(
       adapterConfig.client,
@@ -89,61 +95,41 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     this.currentTraceId = this.generateTraceId();
     let messageId: string | null = null;
 
+    // 获取临时配置（使用后清除）
+    const useIsolatedSession = this.tempIsolatedSession ?? false;
+    const effectiveSystemPrompt = this.tempSystemPrompt ?? this.systemPrompt;
+    this.tempIsolatedSession = undefined;
+    this.tempSystemPrompt = undefined;
+
     try {
-      // 自动截断历史以控制 token 消耗
-      this.truncateHistoryIfNeeded();
+      // 准备消息历史
+      let messagesToSend: LLMMessage[];
 
-      // 添加用户消息到历史（支持图片）
-      if (images && images.length > 0) {
-        const contentBlocks: any[] = [];
-
-        // 添加图片内容块
-        for (const imagePath of images) {
-          try {
-            const fs = require('fs');
-            const path = require('path');
-            const imageBuffer = fs.readFileSync(imagePath);
-            const base64Data = imageBuffer.toString('base64');
-            const ext = path.extname(imagePath).toLowerCase().slice(1);
-            const mediaType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
-
-            contentBlocks.push({
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: mediaType,
-                data: base64Data,
-              },
-            });
-          } catch (err) {
-            logger.warn('Orchestrator适配器.图片读取失败', { path: imagePath, error: String(err) }, LogCategory.LLM);
-          }
-        }
-
-        // 添加文本内容块
-        if (message) {
-          contentBlocks.push({
-            type: 'text',
-            text: message,
-          });
-        }
-
-        this.conversationHistory.push({
-          role: 'user',
-          content: contentBlocks,
-        });
+      if (useIsolatedSession) {
+        // 独立会话模式：不使用历史记录
+        messagesToSend = [];
       } else {
-        // 纯文本消息
-        this.conversationHistory.push({
-          role: 'user',
-          content: message,
-        });
+        // 自动截断历史以控制 token 消耗
+        this.truncateHistoryIfNeeded();
+        messagesToSend = this.conversationHistory;
+      }
+
+      // 添加用户消息
+      const userMessage = this.buildUserMessage(message, images);
+
+      if (useIsolatedSession) {
+        // 独立会话模式：只发送当前消息
+        messagesToSend = [userMessage];
+      } else {
+        // 正常模式：添加到历史
+        this.conversationHistory.push(userMessage);
+        messagesToSend = this.conversationHistory;
       }
 
       // Orchestrator 通常不需要工具，但可以根据需要启用
       const params: LLMMessageParams = {
-        messages: this.conversationHistory,
-        systemPrompt: this.systemPrompt,
+        messages: messagesToSend,
+        systemPrompt: effectiveSystemPrompt,
         stream: true,
         maxTokens: 8192, // Orchestrator 可能需要更多 tokens
         temperature: 0.3, // 更低的温度以获得更确定的规划
@@ -168,11 +154,13 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       });
       this.recordTokenUsage(response.usage);
 
-      // 添加助手响应到历史
-      this.conversationHistory.push({
-        role: 'assistant',
-        content: fullResponse,
-      });
+      // 独立会话模式下不更新历史
+      if (!useIsolatedSession) {
+        this.conversationHistory.push({
+          role: 'assistant',
+          content: fullResponse,
+        });
+      }
 
       this.normalizer.endStream(streamId);
       this.setState(AdapterState.CONNECTED);
@@ -186,6 +174,57 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       this.emitError(error);
       throw error;
     }
+  }
+
+  /**
+   * 构建用户消息（支持图片）
+   */
+  private buildUserMessage(message: string, images?: string[]): LLMMessage {
+    if (images && images.length > 0) {
+      const contentBlocks: any[] = [];
+
+      // 添加图片内容块
+      for (const imagePath of images) {
+        try {
+          const fs = require('fs');
+          const path = require('path');
+          const imageBuffer = fs.readFileSync(imagePath);
+          const base64Data = imageBuffer.toString('base64');
+          const ext = path.extname(imagePath).toLowerCase().slice(1);
+          const mediaType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+
+          contentBlocks.push({
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: mediaType,
+              data: base64Data,
+            },
+          });
+        } catch (err) {
+          logger.warn('Orchestrator适配器.图片读取失败', { path: imagePath, error: String(err) }, LogCategory.LLM);
+        }
+      }
+
+      // 添加文本内容块
+      if (message) {
+        contentBlocks.push({
+          type: 'text',
+          text: message,
+        });
+      }
+
+      return {
+        role: 'user',
+        content: contentBlocks,
+      };
+    }
+
+    // 纯文本消息
+    return {
+      role: 'user',
+      content: message,
+    };
   }
 
   /**
@@ -218,6 +257,20 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
 
   getSystemPrompt(): string {
     return this.systemPrompt;
+  }
+
+  /**
+   * 设置临时系统提示（仅对下一次请求生效）
+   */
+  setTempSystemPrompt(prompt: string): void {
+    this.tempSystemPrompt = prompt;
+  }
+
+  /**
+   * 设置临时独立会话模式（仅对下一次请求生效）
+   */
+  setTempIsolatedSession(isolated: boolean): void {
+    this.tempIsolatedSession = isolated;
   }
 
   /**

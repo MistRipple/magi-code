@@ -11,12 +11,14 @@
 
   const appState = getState();
 
-  // 模型连接状态
-  const modelStatus = $derived(appState.modelStatus || {
-    claude: 'unavailable',
-    codex: 'unavailable',
-    gemini: 'unavailable'
-  });
+  // 模型连接状态（使用全局统一的 modelStatus）
+  const modelStatus = $derived(appState.modelStatus);
+
+  // 判断模型是否可用（available 或 connected 都表示可用）
+  function isModelAvailable(worker: string): boolean {
+    const status = modelStatus[worker]?.status;
+    return status === 'available' || status === 'connected';
+  }
 
   // Worker 执行状态
   const executionStatus = $derived(appState.workerExecutionStatus || {
@@ -55,7 +57,7 @@
       {:else if executionStatus.claude === 'failed'}
         <Icon name="x-circle" size={14} class="status-error" />
       {:else}
-        <span class="dot" class:available={modelStatus.claude === 'connected'}></span>
+        <span class="dot" class:available={isModelAvailable('claude')}></span>
       {/if}
     </span>
     Claude
@@ -74,7 +76,7 @@
       {:else if executionStatus.codex === 'failed'}
         <Icon name="x-circle" size={14} class="status-error" />
       {:else}
-        <span class="dot" class:available={modelStatus.codex === 'connected'}></span>
+        <span class="dot" class:available={isModelAvailable('codex')}></span>
       {/if}
     </span>
     Codex
@@ -93,7 +95,7 @@
       {:else if executionStatus.gemini === 'failed'}
         <Icon name="x-circle" size={14} class="status-error" />
       {:else}
-        <span class="dot" class:available={modelStatus.gemini === 'connected'}></span>
+        <span class="dot" class:available={isModelAvailable('gemini')}></span>
       {/if}
     </span>
     Gemini

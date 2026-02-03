@@ -9,6 +9,7 @@ import {
   updateThreadMessage,
   addAgentMessage,
   updateAgentMessage,
+  replaceThreadMessage,
   setIsProcessing,
   setCurrentSessionId,
   updateSessions,
@@ -17,7 +18,6 @@ import {
   clearAllMessages,
   setThreadMessages,
   setAgentOutputs,
-  removeThreadMessage,
   addToast,
   addWorkerSession,
   updateWorkerSession,
@@ -34,18 +34,12 @@ import {
   clearRequestBinding,
   clearAllRequestBindings,
 } from '../stores/messages.svelte';
-import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, Edit } from '../types/message';
+import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, Edit, ModelStatusMap } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
 import { MessageType, MessageCategory } from '../../../../protocol/message-protocol';
 import { routeStandardMessage, getMessageTarget, clearMessageTargets, clearMessageTarget } from './message-router';
 import { normalizeWorkerSlot } from './message-classifier';
 import { ensureArray } from './utils';
-import { resolvePhaseStep } from '../config/phase-map';
-
-// 生成唯一 ID
-function generateId(): string {
-  return `msg_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
-}
 
 function normalizeRestoredMessages(messages: Message[]): Message[] {
   const seen = new Set<string>();
@@ -97,6 +91,14 @@ export function initMessageHandler() {
 function handleMessage(message: WebviewMessage) {
   const { type } = message;
 
+  // 🔧 调试日志：追踪所有收到的消息
+  console.log('[MessageHandler] 收到消息:', {
+    type,
+    hasMessage: !!(message as any).message,
+    messageId: (message as any).message?.id,
+    category: (message as any).message?.category,
+  });
+
   switch (type) {
     case 'unifiedMessage':
       handleUnifiedMessage(message);
@@ -111,8 +113,8 @@ function handleMessage(message: WebviewMessage) {
       break;
 
     default:
-      // 其他未处理的消息类型，静默忽略或记录日志
-      // console.log('[MessageHandler] 未知消息类型:', type, message);
+      // 🔧 调试日志：追踪未处理的消息类型
+      console.warn('[MessageHandler] 未知消息类型:', type, message);
       break;
   }
 }
@@ -171,19 +173,13 @@ function handleStateUpdate(message: WebviewMessage) {
       contributors: change.contributors,
       workerId: change.workerId,
     }));
-  if (typeof (state as any).orchestratorPhase === 'string') {
-    store.currentPhase = mapPhaseToStep((state as any).orchestratorPhase);
-  } else if (typeof (state as any).orchestratorPhase === 'number') {
-    store.currentPhase = (state as any).orchestratorPhase;
-  } else {
-    store.currentPhase = 0;
-  }
-
   if (Array.isArray((state as any).workerStatuses)) {
-    const statusMap: Record<string, string> = {};
+    const statusMap: ModelStatusMap = {};
     for (const status of (state as any).workerStatuses) {
       if (!status?.worker) continue;
-      statusMap[status.worker] = status.available ? 'connected' : 'unavailable';
+      statusMap[status.worker] = {
+        status: status.available ? 'available' : 'unavailable',
+      };
     }
     store.modelStatus = { ...store.modelStatus, ...statusMap };
   }
@@ -204,36 +200,72 @@ function handleStateUpdate(message: WebviewMessage) {
 function handleUnifiedMessage(message: WebviewMessage) {
   const rawStandard = message.message as StandardMessage;
   if (!rawStandard) {
+    console.error('[MessageHandler] unifiedMessage 缺少 message 字段:', message);
     throw new Error('[MessageHandler] unifiedMessage 缺少 message');
   }
   const standard = assertStandardMessageId(rawStandard);
 
+  // 🔧 调试日志：追踪消息分类
+  console.log('[MessageHandler] handleUnifiedMessage:', {
+    id: standard.id,
+    category: standard.category,
+    expectedContentCategory: MessageCategory.CONTENT,
+    isContentMatch: standard.category === MessageCategory.CONTENT,
+    source: standard.source,
+    agent: standard.agent,
+    lifecycle: standard.lifecycle,
+  });
+
   switch (standard.category) {
     case MessageCategory.CONTENT:
+      console.log('[MessageHandler] 进入 handleContentMessage');
       handleContentMessage(standard);
       break;
     case MessageCategory.CONTROL:
+      console.log('[MessageHandler] 进入 handleUnifiedControlMessage');
       handleUnifiedControlMessage(standard);
       break;
     case MessageCategory.NOTIFY:
+      console.log('[MessageHandler] 进入 handleUnifiedNotify');
       handleUnifiedNotify(standard);
       break;
     case MessageCategory.DATA:
+      console.log('[MessageHandler] 进入 handleUnifiedData');
       handleUnifiedData(standard);
       break;
     default:
+      console.warn('[MessageHandler] 未知消息类别:', standard.category, standard);
       break;
   }
 }
 
 function handleContentMessage(standard: StandardMessage) {
+  // 🔧 调试日志：进入 handleContentMessage
+  console.log('[MessageHandler] handleContentMessage 开始处理:', {
+    id: standard.id,
+    source: standard.source,
+    agent: standard.agent,
+    lifecycle: standard.lifecycle,
+    blocksCount: standard.blocks?.length ?? 0,
+    metadata: standard.metadata,
+  });
+
   const uiMessage = mapStandardMessage(standard);
   const meta = standard.metadata as Record<string, unknown> | undefined;
   const requestId = meta?.requestId as string | undefined;
   const isPlaceholder = Boolean(meta?.isPlaceholder);
   const isUserMessage = meta?.role === 'user';
 
+  console.log('[MessageHandler] 消息类型判断:', {
+    isPlaceholder,
+    isUserMessage,
+    requestId,
+    isStreaming: uiMessage.isStreaming,
+    hasRenderableContent: hasRenderableContent(uiMessage),
+  });
+
   const upsertThreadMessage = (message: Message) => {
+    console.log('[MessageHandler] upsertThreadMessage:', { id: message.id, type: message.type });
     const existing = getState().threadMessages.find(m => m.id === message.id);
     if (existing) {
       updateThreadMessage(message.id, message);
@@ -243,6 +275,7 @@ function handleContentMessage(standard: StandardMessage) {
   };
 
   if (isPlaceholder) {
+    console.log('[MessageHandler] 处理占位消息');
     if (!requestId) {
       throw new Error('[MessageHandler] 占位消息缺少 requestId');
     }
@@ -289,48 +322,60 @@ function handleContentMessage(standard: StandardMessage) {
   }
 
   if (!uiMessage.isStreaming && !hasRenderableContent(uiMessage)) {
-    throw new Error(`[MessageHandler] 内容消息不可渲染: ${standard.id}`);
+    console.warn('[MessageHandler] 消息不可渲染，跳过:', { id: standard.id, uiMessage });
+    // 🔧 改为警告而非抛出错误，避免中断消息处理
+    return;
   }
 
   // === 检查是否有对应的占位消息需要替换 ===
   if (requestId) {
     const binding = getRequestBinding(requestId);
+    console.log('[MessageHandler] 检查占位消息绑定:', {
+      requestId,
+      hasBinding: !!binding,
+      realMessageId: binding?.realMessageId,
+      placeholderMessageId: binding?.placeholderMessageId,
+    });
 
     if (binding && !binding.realMessageId) {
       // 首次收到真实消息，需要原地替换占位消息
       const placeholderId = binding.placeholderMessageId;
       const existingPlaceholder = getState().threadMessages.find(m => m.id === placeholderId);
       if (!existingPlaceholder) {
-        throw new Error(`[MessageHandler] 未找到占位消息: ${placeholderId}`);
+        console.warn(`[MessageHandler] 未找到占位消息: ${placeholderId}，继续正常添加消息`);
+        // 🔧 改为警告并继续，而非抛出错误
+      } else {
+        console.log('[MessageHandler] 替换占位消息:', { placeholderId, newId: standard.id });
+        // 更新绑定，记录真实消息 ID，并同步占位消息 ID
+        updateRequestBinding(requestId, { realMessageId: standard.id, placeholderMessageId: standard.id });
+
+        const replacementMessage: import('../types/message').Message = {
+          ...uiMessage,
+          id: standard.id,
+          metadata: {
+            ...uiMessage.metadata,
+            isPlaceholder: false,
+            wasPlaceholder: true,
+            placeholderState: undefined,
+            requestId,
+          },
+        };
+
+        // 🔧 根治：替换占位消息时不再原地修改 id，避免 keyed each 崩溃
+        markMessageComplete(placeholderId);
+        replaceThreadMessage(placeholderId, replacementMessage);
+        clearMessageTarget(placeholderId);
+
+        // 注册路由（使用新 ID）
+        routeStandardMessage(standard);
+
+        // 标记为活跃消息
+        if (uiMessage.isStreaming) {
+          markMessageActive(standard.id);
+        }
+
+        return;
       }
-
-      // 更新绑定，记录真实消息 ID，并同步占位消息 ID
-      updateRequestBinding(requestId, { realMessageId: standard.id, placeholderMessageId: standard.id });
-
-      const replacementMessage: import('../types/message').Message = {
-        ...uiMessage,
-        id: standard.id,
-        metadata: {
-          ...uiMessage.metadata,
-          isPlaceholder: false,
-          wasPlaceholder: true,
-          placeholderState: undefined,
-          requestId,
-        },
-      };
-
-      // 原地更新占位消息
-      updateThreadMessage(placeholderId, replacementMessage);
-
-      // 注册路由（使用新 ID）
-      routeStandardMessage(standard);
-
-      // 标记为活跃消息
-      if (uiMessage.isStreaming) {
-        markMessageActive(standard.id);
-      }
-
-      return;
     }
   }
 
@@ -395,7 +440,8 @@ function handleStandardUpdate(message: WebviewMessage) {
   const update = rawUpdate;
   const location = getMessageTarget(update.messageId);
   if (!location) {
-    throw new Error(`[MessageHandler] 未找到流式更新的路由: ${update.messageId}`);
+    console.warn(`[MessageHandler] 未找到流式更新的路由，跳过更新: ${update.messageId}`);
+    return;
   }
   if (location.location === 'none' || location.location === 'task') {
     return;
@@ -433,11 +479,60 @@ function handleStandardComplete(message: WebviewMessage) {
   }
   const standard = assertStandardMessageId(rawStandard);
 
+  // 🔧 根治：只处理 CONTENT 类别的消息，其他类别直接跳过
+  // DATA/CONTROL/NOTIFY 消息不应该进入对话列表
+  if (standard.category !== MessageCategory.CONTENT) {
+    return;
+  }
+
   // 尝试获取已注册的路由
   const location = getMessageTarget(standard.id);
   if (!location) {
     // 没有路由说明这个消息没有通过 handleContentMessage 处理过
-    // 可能是控制消息或不需要显示的消息，直接跳过
+    // 直接按完成消息插入，避免丢失最终输出
+    const uiMessage = mapStandardMessage(standard);
+    if (!hasRenderableContent(uiMessage)) {
+      return;
+    }
+    const target = routeStandardMessage(standard);
+    if (target.location === 'none' || target.location === 'task') {
+      return;
+    }
+    const completedMessage = {
+      ...uiMessage,
+      metadata: {
+        ...uiMessage.metadata,
+        justCompleted: true,
+      },
+    };
+    if (target.location === 'thread') {
+      const existing = getState().threadMessages.find(m => m.id === completedMessage.id);
+      if (existing) {
+        updateThreadMessage(completedMessage.id, completedMessage);
+      } else {
+        addThreadMessage(completedMessage);
+      }
+    } else if (target.location === 'worker') {
+      const existing = getState().agentOutputs[target.worker].find(m => m.id === completedMessage.id);
+      if (existing) {
+        updateAgentMessage(target.worker, completedMessage.id, completedMessage);
+      } else {
+        addAgentMessage(target.worker, completedMessage);
+      }
+    } else if (target.location === 'both') {
+      const threadExisting = getState().threadMessages.find(m => m.id === completedMessage.id);
+      if (threadExisting) {
+        updateThreadMessage(completedMessage.id, completedMessage);
+      } else {
+        addThreadMessage(completedMessage);
+      }
+      const agentExisting = getState().agentOutputs[target.worker].find(m => m.id === completedMessage.id);
+      if (agentExisting) {
+        updateAgentMessage(target.worker, completedMessage.id, completedMessage);
+      } else {
+        addAgentMessage(target.worker, completedMessage);
+      }
+    }
     return;
   }
 
@@ -539,8 +634,17 @@ function handleUnifiedControlMessage(standard: StandardMessage) {
 
   switch (controlType) {
     case 'phase_changed':
-      // 阶段变化：更新 currentPhase 和 isProcessing
-      handlePhaseChangedFromControl(payload);
+      // 阶段变化：仅同步运行态（不再展示阶段步骤）
+      {
+        const isRunning = payload?.isRunning as boolean | undefined;
+        if (typeof isRunning === 'boolean') {
+          if (isRunning) {
+            setIsProcessing(true);
+          } else {
+            clearProcessingState();
+          }
+        }
+      }
       break;
 
     case 'task_accepted': {
@@ -622,7 +726,7 @@ function handleUnifiedControlMessage(standard: StandardMessage) {
       if (worker && typeof available === 'boolean') {
         store.modelStatus = {
           ...store.modelStatus,
-          [worker]: available ? 'connected' : 'unavailable',
+          [worker]: { status: available ? 'available' : 'unavailable' },
         };
       }
       break;
@@ -630,27 +734,6 @@ function handleUnifiedControlMessage(standard: StandardMessage) {
 
     default:
       throw new Error(`[MessageHandler] 未知控制消息类型: ${controlType}`);
-  }
-}
-
-/**
- * 从 control:message 的 payload 中提取阶段信息并处理
- */
-function handlePhaseChangedFromControl(payload: Record<string, unknown>) {
-  const store = getState();
-  const phase = payload.phase as string | undefined;
-  const isRunning = payload.isRunning as boolean | undefined;
-
-  if (typeof phase === 'string') {
-    store.currentPhase = mapPhaseToStep(phase);
-  }
-
-  if (typeof isRunning === 'boolean') {
-    if (isRunning) {
-      setIsProcessing(true);
-    } else {
-      clearProcessingState();
-    }
   }
 }
 
@@ -782,9 +865,6 @@ function handleUnifiedData(standard: StandardMessage) {
       handleWorkerStatusUpdate(asMessage(payload));
       break;
 
-    case 'workerError':
-      break;
-
     case 'interactionModeChanged':
       getState().interactionMode = (payload.mode as string) === 'ask' ? 'ask' : 'auto';
       break;
@@ -797,17 +877,9 @@ function handleUnifiedData(standard: StandardMessage) {
       clearProcessingState();
       break;
 
-    case 'taskInterrupted':
-      clearProcessingState();
-      break;
-
     default:
       break;
   }
-}
-
-function mapPhaseToStep(phase: string): number {
-  return resolvePhaseStep(phase);
 }
 
 function handleSessionsUpdated(message: WebviewMessage) {
@@ -1558,29 +1630,17 @@ function formatPlanBlock(block: any): string {
 
 /**
  * 处理 Worker 状态更新消息
- * 将检测到的模型状态同步到全局 store，供 BottomTabs 等组件使用
+ * 将检测到的模型状态同步到全局 store，供 BottomTabs 和 SettingsPanel 共用
  */
 function handleWorkerStatusUpdate(message: WebviewMessage) {
-  const statuses = message.statuses as Record<string, { status: string; model?: string; error?: string }>;
+  const statuses = message.statuses as ModelStatusMap;
   if (!statuses) return;
 
   const store = getState();
-  const statusMap: Record<string, string> = {};
 
-  // 将详细状态映射为简化状态（connected/unavailable）
-  for (const [worker, detail] of Object.entries(statuses)) {
-    if (detail.status === 'available') {
-      statusMap[worker] = 'connected';
-    } else if (detail.status === 'checking') {
-      // 检测中保持原状态
-      continue;
-    } else {
-      statusMap[worker] = 'unavailable';
-    }
-  }
-
-  // 更新全局 modelStatus
-  store.modelStatus = { ...store.modelStatus, ...statusMap };
+  // 直接存储完整的状态信息，不再简化
+  // 这样 BottomTabs 和 SettingsPanel 可以使用同一个数据源
+  store.modelStatus = { ...store.modelStatus, ...statuses };
 }
 
 // ============ Worker Session 事件处理（提案 4.1） ============

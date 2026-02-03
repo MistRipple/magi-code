@@ -86,7 +86,7 @@ export class ContextManager {
   }
 
   /**
-   * 设置压缩器适配器
+   * 设置压缩模型适配器
    */
   setCompressorAdapter(adapter: CompressorAdapter | null): void {
     this.compressorAdapter = adapter;

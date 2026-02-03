@@ -112,15 +112,40 @@ export abstract class BaseLLMAdapter extends EventEmitter {
   private setupNormalizerEvents(): void {
     // 消息开始/流式：直接发送到 MessageHub
     this.normalizer.on(MESSAGE_EVENTS.MESSAGE, (message) => {
+      console.log('[BaseAdapter] Normalizer MESSAGE event:', {
+        messageId: message?.id,
+        category: message?.category,
+        lifecycle: message?.lifecycle,
+        streamToUI: this._streamToUI,
+        hasMessageHub: !!this.messageHub,
+      });
       if (this._streamToUI) {
         this.messageHub.sendMessage(message);
+      } else {
+        console.log('[BaseAdapter] 消息被阻止 (streamToUI=false):', {
+          messageId: message?.id,
+          category: message?.category,
+        });
       }
     });
 
     // 消息完成：直接发送到 MessageHub
     this.normalizer.on(MESSAGE_EVENTS.COMPLETE, (_messageId, message) => {
+      console.log('[BaseAdapter] Normalizer COMPLETE event:', {
+        messageId: message?.id,
+        category: message?.category,
+        lifecycle: message?.lifecycle,
+        blocksCount: message?.blocks?.length,
+        streamToUI: this._streamToUI,
+      });
       if (this._streamToUI) {
         this.messageHub.sendMessage(message);
+      } else {
+        console.log('[BaseAdapter] 完成消息被阻止 (streamToUI=false):', {
+          messageId: message?.id,
+          category: message?.category,
+          blocksCount: message?.blocks?.length,
+        });
       }
     });
 

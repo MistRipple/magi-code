@@ -114,6 +114,32 @@ export interface MissionPlan {
   assignments: AssignmentPlan[];
 }
 
+// 模型连接状态类型（统一的连接状态，供 BottomTabs 和 SettingsPanel 共用）
+export type ModelStatusType =
+  | 'available'       // 可用（已连接）
+  | 'connected'       // 已连接
+  | 'disabled'        // 已禁用
+  | 'not_configured'  // 未配置
+  | 'checking'        // 检测中
+  | 'error'           // 错误
+  | 'unavailable'     // 不可用
+  | 'invalid_model'   // 无效模型
+  | 'auth_failed'     // 认证失败
+  | 'network_error'   // 网络错误
+  | 'timeout'         // 超时
+  | 'fallback';       // 回退
+
+export interface ModelStatus {
+  status: ModelStatusType;
+  model?: string;
+  version?: string;
+  tokens?: number;
+  error?: string;
+}
+
+// 模型状态映射
+export type ModelStatusMap = Record<string, ModelStatus>;
+
 // Wave 执行状态（提案 4.6）
 export interface WaveState {
   /** 当前 Wave 索引 */
@@ -154,6 +180,8 @@ export interface Message {
   isComplete: boolean;        // 是否已完成
   type?: MessageType;         // 消息类型（notice = 系统通知）
   noticeType?: NoticeType;    // 通知类型（info/success/warning/error）
+  /** 用户上传的图片（base64 Data URL 格式） */
+  images?: Array<{ dataUrl: string }>;
   metadata?: {
     model?: string;
     tokens?: number;
@@ -167,6 +195,7 @@ export interface Message {
     wasPlaceholder?: boolean;         // 是否从占位消息转换而来（用于过渡动画）
     justCompleted?: boolean;          // 是否刚完成（用于完成动画）
     sendingAnimation?: boolean;       // 用户消息发送动画
+    images?: Array<{ dataUrl: string }>; // 🔧 从 metadata 提取的图片（后端传递）
     [key: string]: unknown;
   };
 }

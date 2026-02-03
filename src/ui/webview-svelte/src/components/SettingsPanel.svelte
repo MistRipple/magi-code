@@ -6,6 +6,8 @@
   import { ensureArray } from '../lib/utils';
   import Icon from './Icon.svelte';
   import Toggle from './Toggle.svelte';
+  import { getState } from '../stores/messages.svelte';
+  import type { ModelStatus } from '../types/message';
 
   interface Props {
     onClose?: () => void;
@@ -16,25 +18,9 @@
   // 当前激活的 Tab
   let activeTab = $state<'stats' | 'model' | 'profile' | 'tools'>('stats');
 
-  // 模型连接状态类型
-  interface ModelStatus {
-    status: 'available' | 'connected' | 'disabled' | 'not_configured' | 'checking' | 'error' | 'unavailable' | 'invalid_model' | 'auth_failed' | 'network_error' | 'timeout' | 'fallback';
-    version?: string;
-    model?: string;
-    executions?: number;
-    successRate?: number;
-    tokens?: number;
-    error?: string;
-  }
-
-  // 状态
-  let modelStatuses = $state<Record<string, ModelStatus>>({
-    claude: { status: 'checking' },
-    codex: { status: 'checking' },
-    gemini: { status: 'checking' },
-    orchestrator: { status: 'checking' },
-    compressor: { status: 'checking' }
-  });
+  // 使用全局 store 的模型状态（与 BottomTabs 共用）
+  const appState = getState();
+  const modelStatuses = $derived(appState.modelStatus);
 
   let isRefreshing = $state(false);
   let totalTokens = $state(0);
@@ -300,8 +286,8 @@
   function refreshConnections() {
     if (isRefreshing) return;
     isRefreshing = true;
-    // 将所有模型状态设为 checking
-    modelStatuses = {
+    // 将所有模型状态设为 checking（更新全局 store）
+    appState.modelStatus = {
       claude: { status: 'checking' },
       codex: { status: 'checking' },
       gemini: { status: 'checking' },
@@ -783,10 +769,9 @@
       const { dataType, payload } = standard.data as { dataType: string; payload: any };
 
       // Worker 状态更新 (模型连接状态)
+      // 注意：状态现在由 message-handler.ts 统一更新到全局 store
+      // SettingsPanel 只需要重置 isRefreshing 标志
       if (dataType === 'workerStatusUpdate') {
-        if (payload?.statuses) {
-          modelStatuses = { ...modelStatuses, ...payload.statuses };
-        }
         isRefreshing = false;
       }
       // 执行统计更新
@@ -861,7 +846,7 @@
           };
         }
       }
-      // 压缩器配置加载
+      // 压缩模型配置加载
       else if (dataType === 'compressorConfigLoaded') {
         if (payload?.config) {
           compConfig = {
@@ -886,20 +871,25 @@
         const worker = payload?.worker;
         if (worker && modelStatuses[worker]) {
           if (payload?.success) {
-            modelStatuses[worker] = {
-              status: 'available',
-              model: workerConfigs[worker]?.model || modelStatuses[worker]?.model
+            appState.modelStatus = {
+              ...appState.modelStatus,
+              [worker]: {
+                status: 'available',
+                model: workerConfigs[worker]?.model || modelStatuses[worker]?.model
+              }
             };
             testStatus[worker] = 'success';
           } else {
-            modelStatuses[worker] = {
-              status: 'error',
-              model: workerConfigs[worker]?.model || modelStatuses[worker]?.model,
-              error: payload?.error
+            appState.modelStatus = {
+              ...appState.modelStatus,
+              [worker]: {
+                status: 'error',
+                model: workerConfigs[worker]?.model || modelStatuses[worker]?.model,
+                error: payload?.error
+              }
             };
             testStatus[worker] = 'error';
           }
-          modelStatuses = { ...modelStatuses };
           testStatus = { ...testStatus };
           resetTestStatus(worker);
         }
@@ -907,41 +897,51 @@
       // 编排者连接测试结果 - 更新统计 Tab 状态和测试按钮状态
       else if (dataType === 'orchestratorConnectionTestResult') {
         if (payload?.success) {
-          modelStatuses.orchestrator = {
-            status: 'available',
-            model: orchConfig.model || modelStatuses.orchestrator?.model
+          appState.modelStatus = {
+            ...appState.modelStatus,
+            orchestrator: {
+              status: 'available',
+              model: orchConfig.model || modelStatuses.orchestrator?.model
+            }
           };
           testStatus.orch = 'success';
         } else {
-          modelStatuses.orchestrator = {
-            status: 'error',
-            model: orchConfig.model || modelStatuses.orchestrator?.model,
-            error: payload?.error
+          appState.modelStatus = {
+            ...appState.modelStatus,
+            orchestrator: {
+              status: 'error',
+              model: orchConfig.model || modelStatuses.orchestrator?.model,
+              error: payload?.error
+            }
           };
           testStatus.orch = 'error';
         }
-        modelStatuses = { ...modelStatuses };
         testStatus = { ...testStatus };
         resetTestStatus('orch');
       }
-      // 压缩器连接测试结果 - 更新统计 Tab 状态和测试按钮状态
+      // 压缩模型连接测试结果 - 更新统计 Tab 状态和测试按钮状态
       else if (dataType === 'compressorConnectionTestResult') {
         if (payload?.success) {
-          modelStatuses.compressor = {
-            status: 'available',
-            model: compConfig.model || modelStatuses.compressor?.model
+          appState.modelStatus = {
+            ...appState.modelStatus,
+            compressor: {
+              status: 'available',
+              model: compConfig.model || modelStatuses.compressor?.model
+            }
           };
           testStatus.comp = 'success';
         } else {
           const fallbackModel = payload?.fallbackModel || modelStatuses.orchestrator?.model;
-          modelStatuses.compressor = {
-            status: 'fallback',
-            model: fallbackModel ? `编排模型: ${fallbackModel}` : modelStatuses.compressor?.model,
-            error: payload?.error
+          appState.modelStatus = {
+            ...appState.modelStatus,
+            compressor: {
+              status: 'fallback',
+              model: fallbackModel ? `编排模型: ${fallbackModel}` : modelStatuses.compressor?.model,
+              error: payload?.error
+            }
           };
           testStatus.comp = 'error';
         }
-        modelStatuses = { ...modelStatuses };
         testStatus = { ...testStatus };
         resetTestStatus('comp');
       }
