@@ -197,6 +197,7 @@ async function executeScenario(
   const startTime = Date.now();
   let response = '';
   let error: string | undefined;
+  const requestId = `e2e_${scenarioId}_${Date.now()}`;
 
   // 清理之前的消息
   ctx.messages.length = 0;
@@ -207,11 +208,16 @@ async function executeScenario(
       throw new Error('No enabled workers configured for real LLM E2E');
     }
 
+    ctx.messageHub.setRequestContext(requestId);
+
     // 执行编排
     const result = await ctx.orchestrator.execute(prompt, '');
     response = typeof result === 'string' ? result : JSON.stringify(result);
   } catch (e) {
     error = e instanceof Error ? e.message : String(e);
+  } finally {
+    ctx.messageHub.finalizeRequestContext(requestId);
+    ctx.messageHub.setRequestContext(undefined);
   }
 
   const verificationPoints = verify(response, ctx);

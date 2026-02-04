@@ -92,14 +92,6 @@ export function initMessageHandler() {
 function handleMessage(message: WebviewMessage) {
   const { type } = message;
 
-  // 🔧 调试日志：追踪所有收到的消息
-  console.log('[MessageHandler] 收到消息:', {
-    type,
-    hasMessage: !!(message as any).message,
-    messageId: (message as any).message?.id,
-    category: (message as any).message?.category,
-  });
-
   switch (type) {
     case 'unifiedMessage':
       handleUnifiedMessage(message);
@@ -114,7 +106,6 @@ function handleMessage(message: WebviewMessage) {
       break;
 
     default:
-      // 🔧 调试日志：追踪未处理的消息类型
       console.warn('[MessageHandler] 未知消息类型:', type, message);
       break;
   }
@@ -215,32 +206,17 @@ function handleUnifiedMessage(message: WebviewMessage) {
   }
   const standard = assertStandardMessageId(rawStandard);
 
-  // 🔧 调试日志：追踪消息分类
-  console.log('[MessageHandler] handleUnifiedMessage:', {
-    id: standard.id,
-    category: standard.category,
-    expectedContentCategory: MessageCategory.CONTENT,
-    isContentMatch: standard.category === MessageCategory.CONTENT,
-    source: standard.source,
-    agent: standard.agent,
-    lifecycle: standard.lifecycle,
-  });
-
   switch (standard.category) {
     case MessageCategory.CONTENT:
-      console.log('[MessageHandler] 进入 handleContentMessage');
       handleContentMessage(standard);
       break;
     case MessageCategory.CONTROL:
-      console.log('[MessageHandler] 进入 handleUnifiedControlMessage');
       handleUnifiedControlMessage(standard);
       break;
     case MessageCategory.NOTIFY:
-      console.log('[MessageHandler] 进入 handleUnifiedNotify');
       handleUnifiedNotify(standard);
       break;
     case MessageCategory.DATA:
-      console.log('[MessageHandler] 进入 handleUnifiedData');
       handleUnifiedData(standard);
       break;
     default:
@@ -256,11 +232,6 @@ function queueStreamUpdate(update: StreamUpdate): void {
   const list = pendingStreamUpdates.get(update.messageId) || [];
   list.push(update);
   pendingStreamUpdates.set(update.messageId, list);
-  console.warn('[MessageHandler] 缓存流式更新', {
-    messageId: update.messageId,
-    updateType: update.updateType,
-    cachedCount: list.length,
-  });
 }
 
 function applyUpdateToLocation(location: ReturnType<typeof getMessageTarget>, update: StreamUpdate): boolean {
@@ -334,11 +305,6 @@ function flushPendingStreamUpdates(messageId: string): void {
   if (!location) {
     return;
   }
-  console.log('[MessageHandler] 回放缓存流式更新', {
-    messageId,
-    pendingCount: updates.length,
-    location: location.location,
-  });
   const remaining: StreamUpdate[] = [];
   for (const update of updates) {
     const applied = applyUpdateToLocation(location, update);
@@ -348,43 +314,19 @@ function flushPendingStreamUpdates(messageId: string): void {
   }
   if (remaining.length > 0) {
     pendingStreamUpdates.set(messageId, remaining);
-    console.warn('[MessageHandler] 流式更新仍未应用', {
-      messageId,
-      remainingCount: remaining.length,
-    });
   } else {
     pendingStreamUpdates.delete(messageId);
-    console.log('[MessageHandler] 流式更新回放完成', { messageId });
   }
 }
 
 function handleContentMessage(standard: StandardMessage) {
-  // 🔧 调试日志：进入 handleContentMessage
-  console.log('[MessageHandler] handleContentMessage 开始处理:', {
-    id: standard.id,
-    source: standard.source,
-    agent: standard.agent,
-    lifecycle: standard.lifecycle,
-    blocksCount: standard.blocks?.length ?? 0,
-    metadata: standard.metadata,
-  });
-
   const uiMessage = mapStandardMessage(standard);
   const meta = standard.metadata as Record<string, unknown> | undefined;
   const requestId = meta?.requestId as string | undefined;
   const isPlaceholder = Boolean(meta?.isPlaceholder);
   const isUserMessage = meta?.role === 'user';
 
-  console.log('[MessageHandler] 消息类型判断:', {
-    isPlaceholder,
-    isUserMessage,
-    requestId,
-    isStreaming: uiMessage.isStreaming,
-    hasRenderableContent: hasRenderableContent(uiMessage),
-  });
-
   const upsertThreadMessage = (message: Message) => {
-    console.log('[MessageHandler] upsertThreadMessage:', { id: message.id, type: message.type });
     const existing = getState().threadMessages.find(m => m.id === message.id);
     if (existing) {
       updateThreadMessage(message.id, message);
@@ -394,7 +336,6 @@ function handleContentMessage(standard: StandardMessage) {
   };
 
   if (isPlaceholder) {
-    console.log('[MessageHandler] 处理占位消息');
     if (!requestId) {
       throw new Error('[MessageHandler] 占位消息缺少 requestId');
     }
@@ -471,7 +412,6 @@ function handleContentMessage(standard: StandardMessage) {
   }
 
   if (!uiMessage.isStreaming && !hasRenderableContent(uiMessage)) {
-    console.warn('[MessageHandler] 消息不可渲染，跳过:', { id: standard.id, uiMessage });
     // 🔧 改为警告而非抛出错误，避免中断消息处理
     return;
   }
@@ -479,12 +419,6 @@ function handleContentMessage(standard: StandardMessage) {
   // === 检查是否有对应的占位消息需要替换 ===
   if (requestId) {
     const binding = getRequestBinding(requestId);
-    console.log('[MessageHandler] 检查占位消息绑定:', {
-      requestId,
-      hasBinding: !!binding,
-      realMessageId: binding?.realMessageId,
-      placeholderMessageId: binding?.placeholderMessageId,
-    });
 
     if (binding && !binding.realMessageId) {
       // 首次收到真实消息，需要原地替换占位消息
@@ -536,16 +470,6 @@ function handleContentMessage(standard: StandardMessage) {
 
   // === 后续消息处理（非首次或无占位消息关联） ===
   const target = routeStandardMessage(standard);
-
-  // 🔧 调试日志：追踪 Worker 消息路由
-  console.log('[DEBUG] handleContentMessage: 消息路由', {
-    id: standard.id,
-    source: standard.source,
-    agent: standard.agent,
-    category: standard.category,
-    targetLocation: target.location,
-    targetWorker: (target as { worker?: string }).worker,
-  });
 
   if (target.location === 'none' || target.location === 'task') {
     return;
@@ -619,29 +543,15 @@ function handleStandardComplete(message: WebviewMessage) {
   }
   const standard = assertStandardMessageId(rawStandard);
 
-  console.log('[MessageHandler] handleStandardComplete 开始:', {
-    id: standard.id,
-    category: standard.category,
-    lifecycle: standard.lifecycle,
-    requestId: (standard.metadata as Record<string, unknown> | undefined)?.requestId,
-  });
-
   // 🔧 根治：只处理 CONTENT 类别的消息，其他类别直接跳过
   // DATA/CONTROL/NOTIFY 消息不应该进入对话列表
   if (standard.category !== MessageCategory.CONTENT) {
-    console.log('[MessageHandler] handleStandardComplete: 非 CONTENT 类别，跳过');
     return;
   }
 
   const requestId = (standard.metadata as Record<string, unknown> | undefined)?.requestId as string | undefined;
   const actualMessageId = standard.id;
   const location = getMessageTarget(actualMessageId);
-  console.log('[MessageHandler] handleStandardComplete 路由查找:', {
-    originalId: standard.id,
-    actualMessageId,
-    hasLocation: !!location,
-    locationInfo: location,
-  });
   if (!location) {
     throw new Error(`[MessageHandler] 完成消息缺少路由: ${standard.id}`);
   }

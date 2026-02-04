@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { marked, type Token, type Tokens } from 'marked';
-  import hljs from 'highlight.js';
   import CodeBlock from './CodeBlock.svelte';
+  import { preprocessMarkdown } from '../lib/markdown-utils';
 
   // Props
   interface Props {
@@ -19,28 +19,34 @@
   // 解析后的内容段落
   let segments = $state<ContentSegment[]>([]);
 
-  // 配置 marked
+  // 渲染控制：使用引用对象存储最新内容，彻底解决闭包旧值问题
+  // 字符串是值传递，对象是引用传递。定时器读取 contentRef.val 永远是新的。
+  const contentRef = { val: '' };
+  
+  // 节流控制
+  let lastRenderTime = 0;
+  let renderTimer: ReturnType<typeof setTimeout> | undefined;
+
   onMount(() => {
-    marked.setOptions({
-      breaks: true,
-      gfm: true,
-    });
+    marked.setOptions({ breaks: true, gfm: true });
+    return () => {
+      if (renderTimer) clearTimeout(renderTimer);
+    };
   });
 
-  // 解析内容为段落
-  $effect(() => {
-    if (!content) {
+  function doRender() {
+    const text = contentRef.val;
+    if (!text) {
       segments = [];
       return;
     }
 
     try {
-      // 使用 marked.lexer 解析 markdown 为 tokens
-      const tokens = marked.lexer(content);
+      const contentToParse = preprocessMarkdown(text, isStreaming);
+      const tokens = marked.lexer(contentToParse);
       const result: ContentSegment[] = [];
       let pendingTokens: Token[] = [];
 
-      // 将待处理的 tokens 渲染为 HTML
       function flushPendingTokens() {
         if (pendingTokens.length > 0) {
           const html = marked.parser(pendingTokens as Token[]);
@@ -51,44 +57,70 @@
         }
       }
 
-      // 遍历 tokens，提取代码块
       for (const token of tokens) {
         if (token.type === 'code') {
           const codeToken = token as Tokens.Code;
-          const lang = (codeToken.lang || '').toLowerCase();
+          const isFenced = /^ {0,3}(`{3,}|~{3,})/.test(token.raw);
 
-          // 代码块：先渲染之前的 markdown，再添加代码段落
-          flushPendingTokens();
-          result.push({
-            type: 'code',
-            code: codeToken.text,
-            language: lang,
-          });
+          if (isFenced) {
+            const lang = (codeToken.lang || '').toLowerCase();
+            flushPendingTokens();
+            result.push({
+              type: 'code',
+              code: codeToken.text,
+              language: lang,
+            });
+          } else {
+            pendingTokens.push(token);
+          }
         } else {
-          // 非代码块：累积到待处理 tokens
           pendingTokens.push(token);
         }
       }
 
-      // 处理剩余的 tokens
       flushPendingTokens();
-
       segments = result;
     } catch (error) {
       console.error('[MarkdownContent] 解析错误:', error);
-      segments = [{ type: 'markdown', html: `<p>${content}</p>` }];
+      segments = [{ type: 'markdown', html: `<p>${text}</p>` }];
     }
-  });
+  }
 
-  // 代码高亮处理
+  // 统一响应逻辑
   $effect(() => {
-    if (segments.length > 0 && !isStreaming) {
-      setTimeout(() => {
-        const codeBlocks = document.querySelectorAll('.markdown-content pre code:not(.hljs)');
-        codeBlocks.forEach((block) => {
-          hljs.highlightElement(block as HTMLElement);
-        });
-      }, 0);
+    // 1. 同步最新内容到引用对象 (同步操作，极快)
+    contentRef.val = content || '';
+
+    // 2. 决策渲染时机
+    if (!isStreaming || !contentRef.val) {
+      // 非流式或空内容：立即渲染
+      if (renderTimer) {
+        clearTimeout(renderTimer);
+        renderTimer = undefined;
+      }
+      doRender();
+      return;
+    }
+
+    // 流式：节流控制
+    const now = Date.now();
+    const dynamicDelay = Math.min(100, 32 + Math.floor(contentRef.val.length / 500) * 5);
+
+    // 如果已经有定时器在跑，说明已经安排了下一次渲染，无需操作
+    // 定时器执行时会读取 contentRef.val 的最新值
+    if (!renderTimer) {
+      if (now - lastRenderTime >= dynamicDelay) {
+        // 距离上次渲染已够久，立即执行
+        doRender();
+        lastRenderTime = now;
+      } else {
+        // 还没到时间，安排延后执行
+        renderTimer = setTimeout(() => {
+          doRender();
+          lastRenderTime = Date.now();
+          renderTimer = undefined;
+        }, dynamicDelay - (now - lastRenderTime));
+      }
     }
   });
 </script>
@@ -102,6 +134,7 @@
         code={segment.code}
         language={segment.language}
         showLineNumbers={segment.language !== 'mermaid'}
+        isStreaming={isStreaming}
       />
     {/if}
   {/each}

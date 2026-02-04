@@ -552,11 +552,12 @@ export function createStandardMessage(
   params: Omit<StandardMessage, 'id' | 'timestamp' | 'updatedAt'> & { id?: string }
 ): StandardMessage {
   const now = Date.now();
+  const { id, ...rest } = params;
   return {
-    id: params.id || generateMessageId(),
+    id: id || generateMessageId(),
     timestamp: now,
     updatedAt: now,
-    ...params,
+    ...rest,
   };
 }
 

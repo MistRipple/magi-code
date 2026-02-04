@@ -134,54 +134,14 @@ export class CodexNormalizer extends BaseNormalizer {
 
   private processTextChunk(context: ParseContext, chunk: string): StreamUpdate[] {
     const updates: StreamUpdate[] = [];
-    // Codex 输出是纯文本，逐行处理
-    const lines = (context.pendingText + chunk).split('\n');
-    context.pendingText = '';
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const isLastLine = i === lines.length - 1;
-
-      // 检测代码块开始
-      const codeBlockStart = line.match(/^```(\w*)/);
-      if (codeBlockStart && !this.inCodeBlock) {
-        this.inCodeBlock = true;
-        this.codeBlockLang = codeBlockStart[1] || 'text';
-        this.codeBlockBuffer = '';
-        continue;
-      }
-
-      // 检测代码块结束
-      if (line.trim() === '```' && this.inCodeBlock) {
-        this.inCodeBlock = false;
-        if (this.codeBlockBuffer.trim()) {
-          const codeBlock: CodeBlock = {
-            type: 'code',
-            language: this.codeBlockLang,
-            content: this.codeBlockBuffer.trim(),
-          };
-          context.blocks.push(codeBlock);
-          updates.push(this.createUpdate(context.messageId, 'block_update', { blocks: [codeBlock] }));
-        }
-        this.codeBlockBuffer = '';
-        this.codeBlockLang = '';
-        continue;
-      }
-
-      // 在代码块内
-      if (this.inCodeBlock) {
-        this.codeBlockBuffer += line + '\n';
-        continue;
-      }
-
-      // 普通文本
-      if (isLastLine) {
-        // 最后一行可能不完整，保留
-        context.pendingText = line;
-      } else {
-        context.pendingText += line + '\n';
-        updates.push(this.createUpdate(context.messageId, 'append', { appendText: line + '\n' }));
-      }
-    }
+    
+    // 🔧 优化：直接流式传输所有文本，不再手动缓冲代码块
+    // 前端 MarkdownContent 已具备强大的流式解析能力（包括自动补全未闭合代码块）
+    // 直接传输可以让用户实时看到代码生成过程，而不是等待代码块结束
+    
+    context.pendingText += chunk;
+    updates.push(this.createUpdate(context.messageId, 'append', { appendText: chunk }));
+    
     return updates;
   }
 
