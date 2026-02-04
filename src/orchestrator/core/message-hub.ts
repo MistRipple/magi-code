@@ -182,7 +182,11 @@ export interface ProcessingState {
 /** 默认配置 */
 const DEFAULT_HUB_CONFIG: MessageHubConfig = {
   enabled: true,
-  minStreamInterval: 100,  // 100ms 节流间隔
+  // 🔧 修复：禁用流式节流 (设置为 0)
+  // 原有的节流逻辑会直接丢弃中间的 update (delta)，导致流式内容丢失/断层。
+  // 前端 (MarkdownContent) 现已实现高性能的 Render Loop 和动态节流，
+  // 完全有能力处理后端的高频消息，因此后端应全速透传以保证数据完整性。
+  minStreamInterval: 0,
   retentionTime: 5 * 60 * 1000,  // 5分钟保留
   debug: false,
 };

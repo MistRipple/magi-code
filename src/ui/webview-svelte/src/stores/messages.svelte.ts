@@ -593,24 +593,14 @@ export function getActiveInteractionType(): string | null {
 export function addThreadMessage(message: Message) {
   // 完全重建数组以确保响应式更新
   const safeMessage = JSON.parse(JSON.stringify(normalizeIncomingMessage(message))) as Message;
-  console.log('[MessagesStore] addThreadMessage 开始:', {
-    id: safeMessage.id,
-    role: safeMessage.role,
-    type: safeMessage.type,
-    currentCount: messagesState.threadMessages.length,
-  });
+  
   if (messagesState.threadMessages.some((m) => m.id === safeMessage.id)) {
-    console.warn(`[MessagesStore] 跳过重复消息: ${safeMessage.id}`);
     // 🔧 改为警告而非抛出错误，避免中断
     return;
   }
   // 🔧 修复：使用对象属性赋值，确保响应式追踪
   messagesState.threadMessages = [...messagesState.threadMessages, safeMessage];
-  console.log('[MessagesStore] addThreadMessage 完成:', {
-    id: safeMessage.id,
-    newCount: messagesState.threadMessages.length,
-    allIds: messagesState.threadMessages.map(m => m.id),
-  });
+  
   saveWebviewState();
 }
 
@@ -638,31 +628,19 @@ export function updateThreadMessage(messageId: string, updates: Partial<Message>
 
 export function replaceThreadMessage(oldMessageId: string, message: Message) {
   const safeMessage = JSON.parse(JSON.stringify(normalizeIncomingMessage(message))) as Message;
-  console.log('[MessagesStore] replaceThreadMessage 开始:', {
-    oldMessageId,
-    newMessageId: safeMessage.id,
-    isPlaceholder: safeMessage.metadata?.isPlaceholder,
-    wasPlaceholder: safeMessage.metadata?.wasPlaceholder,
-    requestId: safeMessage.metadata?.requestId,
-  });
+  
   const index = messagesState.threadMessages.findIndex((m) => m.id === oldMessageId);
   if (index === -1) {
-    console.log('[MessagesStore] replaceThreadMessage: 未找到旧消息，添加新消息');
     addThreadMessage(safeMessage);
     return;
   }
   if (messagesState.threadMessages.some((m, i) => m.id === safeMessage.id && i !== index)) {
-    console.warn(`[MessagesStore] 替换消息 id 冲突: ${safeMessage.id}，跳过替换`);
     return;
   }
   const next = [...messagesState.threadMessages];
   next[index] = safeMessage;
   messagesState.threadMessages = next;
-  console.log('[MessagesStore] replaceThreadMessage 完成:', {
-    oldMessageId,
-    newMessageId: safeMessage.id,
-    totalMessages: messagesState.threadMessages.length,
-  });
+  
   saveWebviewState();
 }
 

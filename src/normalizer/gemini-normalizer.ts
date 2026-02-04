@@ -23,9 +23,6 @@ import {
  * Gemini LLM Normalizer
  */
 export class GeminiNormalizer extends BaseNormalizer {
-  private codeBlockBuffer: string = '';
-  private inCodeBlock: boolean = false;
-  private codeBlockLang: string = '';
   private jsonBuffer: string = '';
   private static readonly THINKING_BLOCK_ID = 'gemini-thinking';
 
@@ -122,51 +119,12 @@ export class GeminiNormalizer extends BaseNormalizer {
   private processTextChunk(context: ParseContext, chunk: string): StreamUpdate[] {
     const updates: StreamUpdate[] = [];
     
-    // 逐行处理文本
-    const lines = (context.pendingText + chunk).split('\n');
-    context.pendingText = '';
+    // 🔧 优化：直接流式传输所有文本，不再手动缓冲代码块
+    // 前端已具备强大的流式 Markdown 解析能力（包括自动补全未闭合代码块），
+    // 直接传输可以让用户实时看到代码生成过程，而不是等待代码块结束。
     
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const isLastLine = i === lines.length - 1;
-      
-      // 检测代码块
-      const codeBlockStart = line.match(/^```(\w*)/);
-      if (codeBlockStart && !this.inCodeBlock) {
-        this.inCodeBlock = true;
-        this.codeBlockLang = codeBlockStart[1] || 'text';
-        this.codeBlockBuffer = '';
-        continue;
-      }
-      
-      if (line.trim() === '```' && this.inCodeBlock) {
-        this.inCodeBlock = false;
-        if (this.codeBlockBuffer.trim()) {
-          const codeBlock: CodeBlock = {
-            type: 'code',
-            language: this.codeBlockLang,
-            content: this.codeBlockBuffer.trim(),
-          };
-          context.blocks.push(codeBlock);
-          updates.push(this.createUpdate(context.messageId, 'block_update', { blocks: [codeBlock] }));
-        }
-        this.codeBlockBuffer = '';
-        continue;
-      }
-      
-      if (this.inCodeBlock) {
-        this.codeBlockBuffer += line + '\n';
-        continue;
-      }
-      
-      // 普通文本
-      if (isLastLine) {
-        context.pendingText = line;
-      } else {
-        context.pendingText += line + '\n';
-        updates.push(this.createUpdate(context.messageId, 'append', { appendText: line + '\n' }));
-      }
-    }
+    context.pendingText += chunk;
+    updates.push(this.createUpdate(context.messageId, 'append', { appendText: chunk }));
     
     return updates;
   }
@@ -177,18 +135,6 @@ export class GeminiNormalizer extends BaseNormalizer {
       context.pendingText += this.jsonBuffer;
     }
     this.jsonBuffer = '';
-    
-    // 处理未完成的代码块
-    if (this.inCodeBlock && this.codeBlockBuffer.trim()) {
-      const codeBlock: CodeBlock = {
-        type: 'code',
-        language: this.codeBlockLang || 'text',
-        content: this.codeBlockBuffer.trim(),
-      };
-      context.blocks.push(codeBlock);
-    }
-    this.inCodeBlock = false;
-    this.codeBlockBuffer = '';
   }
 
   protected detectInteraction(context: ParseContext, text: string): InteractionRequest | null {

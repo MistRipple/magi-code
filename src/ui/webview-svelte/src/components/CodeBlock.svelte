@@ -9,6 +9,7 @@
     filepath?: string;
     showLineNumbers?: boolean;
     showCopyButton?: boolean;
+    isStreaming?: boolean;
   }
 
   let {
@@ -16,18 +17,12 @@
     language = '',
     filepath = '',
     showLineNumbers = false,
-    showCopyButton = true
+    showCopyButton = true,
+    isStreaming = false
   }: Props = $props();
 
   // 检测是否是 Mermaid 代码
   const isMermaid = $derived(language.toLowerCase() === 'mermaid');
-
-  // 调试日志
-  $effect(() => {
-    if (isMermaid) {
-      console.log('[CodeBlock] Mermaid detected, language:', language, 'code length:', code?.length);
-    }
-  });
 
   // 状态
   let collapsed = $state(false);
@@ -49,18 +44,30 @@
     language ? (LANG_NAMES[language.toLowerCase()] || language.toUpperCase()) : 'Code'
   );
 
-  const trimmedCode = $derived(code.trim());
+  // 🔧 优化：保留代码缩进，仅移除末尾空格和开头的首个换行符
+  const trimmedCode = $derived(code.trimEnd().replace(/^\n/, ''));
   const lines = $derived(trimmedCode.split('\n'));
 
-  // 代码高亮
+  // 代码高亮 (带防抖优化)
   $effect(() => {
-    if (codeRef && trimmedCode && !collapsed) {
+    if (!codeRef || !trimmedCode || collapsed) return;
+
+    // 🔧 防抖：避免在流式输出时每字符触发高亮导致 UI 卡顿
+    const timer = setTimeout(() => {
       try {
-        hljs.highlightElement(codeRef);
+        if (codeRef) {
+          // 重置 class 以便重新高亮 (如果语言变化)
+          codeRef.className = `code-text ${language ? `language-${language}` : ''}`;
+          // 移除可能存在的 hljs 属性
+          codeRef.removeAttribute('data-highlighted');
+          hljs.highlightElement(codeRef);
+        }
       } catch (e) {
         console.warn('[CodeBlock] 高亮失败:', e);
       }
-    }
+    }, 80); // 80ms 延迟，平衡性能与视觉响应
+
+    return () => clearTimeout(timer);
   });
 
   function toggle() {
@@ -79,11 +86,11 @@
 </script>
 
 <div class="code-block" class:collapsed>
-  {#if isMermaid}
-    <!-- Mermaid 图表渲染 -->
+  {#if isMermaid && !isStreaming}
+    <!-- Mermaid 图表渲染 (非流式状态下) -->
     <MermaidRenderer code={trimmedCode} />
   {:else}
-    <!-- 普通代码块 -->
+    <!-- 普通代码块 (或流式中的 Mermaid) -->
     <div class="code-header">
       <button class="header-left" onclick={toggle}>
         <span class="chevron">
@@ -100,6 +107,9 @@
 
         <span class="code-title">
           <span class="lang-name">{langName}</span>
+          {#if isMermaid && isStreaming}
+            <span class="streaming-badge">生成中...</span>
+          {/if}
           {#if filepath}
             <span class="filepath" title={filepath}>{filepath}</span>
           {/if}
@@ -210,6 +220,15 @@
     white-space: nowrap;
   }
 
+  .streaming-badge {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 99px;
+    background: var(--primary-muted);
+    color: var(--primary);
+    font-weight: 500;
+  }
+
   .copy-btn {
     display: flex;
     align-items: center;
@@ -234,6 +253,8 @@
   .code-content {
     display: flex;
     overflow-x: auto;
+    /* 🔧 确保行号和代码背景高度同步 */
+    align-items: stretch;
   }
 
   .line-numbers {
@@ -244,6 +265,7 @@
     border-right: 1px solid var(--border);
     text-align: right;
     user-select: none;
+    background: rgba(0, 0, 0, 0.1); /* 微弱底色区分行号区域 */
   }
 
   .line-num {
@@ -255,15 +277,23 @@
 
   .code-pre {
     flex: 1;
-    margin: 0;
-    padding: var(--spacing-sm) var(--spacing-md);
+    /* 🔧 增强防御性：防止 MarkdownContent 的 global(pre) 干扰对齐 */
+    margin: 0 !important;
+    padding: var(--spacing-sm) var(--spacing-md) !important;
     overflow-x: auto;
+    background: transparent !important;
   }
 
   .code-text {
     font-family: var(--font-mono);
     font-size: var(--font-size-sm);
     line-height: 1.5;
+    /* 🔧 修复行号对齐问题：重置可能由 hljs 引入的内边距和外边距 */
+    padding: 0 !important;
+    margin: 0 !important;
+    background: transparent !important;
+    display: block;
+    white-space: pre; /* 确保不换行，与行号一一对应 */
   }
 </style>
 

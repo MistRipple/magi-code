@@ -182,6 +182,8 @@
     /* 右侧减少间距以补偿滚动条宽度，使内容视觉对称 */
     padding: var(--space-4);
     padding-right: var(--space-2);
+    /* 🔧 优化：禁用浏览器默认的滚动锚定，防止与自动滚动逻辑冲突导致抖动 */
+    overflow-anchor: none;
   }
 
   .empty-state {
