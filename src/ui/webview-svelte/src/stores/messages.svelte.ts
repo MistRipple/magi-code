@@ -638,18 +638,31 @@ export function updateThreadMessage(messageId: string, updates: Partial<Message>
 
 export function replaceThreadMessage(oldMessageId: string, message: Message) {
   const safeMessage = JSON.parse(JSON.stringify(normalizeIncomingMessage(message))) as Message;
+  console.log('[MessagesStore] replaceThreadMessage 开始:', {
+    oldMessageId,
+    newMessageId: safeMessage.id,
+    isPlaceholder: safeMessage.metadata?.isPlaceholder,
+    wasPlaceholder: safeMessage.metadata?.wasPlaceholder,
+    requestId: safeMessage.metadata?.requestId,
+  });
   const index = messagesState.threadMessages.findIndex((m) => m.id === oldMessageId);
   if (index === -1) {
+    console.log('[MessagesStore] replaceThreadMessage: 未找到旧消息，添加新消息');
     addThreadMessage(safeMessage);
     return;
   }
   if (messagesState.threadMessages.some((m, i) => m.id === safeMessage.id && i !== index)) {
-    console.warn(`[MessagesStore] 替换消息 id 冲突: ${safeMessage.id}`);
+    console.warn(`[MessagesStore] 替换消息 id 冲突: ${safeMessage.id}，跳过替换`);
     return;
   }
   const next = [...messagesState.threadMessages];
   next[index] = safeMessage;
   messagesState.threadMessages = next;
+  console.log('[MessagesStore] replaceThreadMessage 完成:', {
+    oldMessageId,
+    newMessageId: safeMessage.id,
+    totalMessages: messagesState.threadMessages.length,
+  });
   saveWebviewState();
 }
 

@@ -102,6 +102,28 @@ export abstract class BaseLLMAdapter extends EventEmitter {
   }
 
   /**
+   * 使用当前请求上下文启动流式消息
+   * 优先复用占位消息 ID，确保 UI 端流式更新命中同一条消息
+   */
+  protected startStreamWithContext(): string {
+    if (!this.currentTraceId) {
+      this.currentTraceId = this.messageHub.getTraceId();
+    }
+    const requestId = this.messageHub.getRequestContext();
+    const boundMessageId = requestId ? this.messageHub.getRequestMessageId(requestId) : undefined;
+
+    // 🔧 调试日志：追踪 ID 复用机制
+    console.log('[BaseAdapter] startStreamWithContext:', {
+      requestId,
+      boundMessageId,
+      hasRequestId: !!requestId,
+      hasBoundMessageId: !!boundMessageId,
+    });
+
+    return this.normalizer.startStream(this.currentTraceId, undefined, boundMessageId);
+  }
+
+  /**
    * 设置 Normalizer 事件处理
    *
    * 🔧 统一消息通道：消息直接发送到 MessageHub（Layer 2 → Layer 3）：

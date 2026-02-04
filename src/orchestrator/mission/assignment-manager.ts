@@ -46,6 +46,7 @@ export class AssignmentManager {
       taskInfo?: TaskStructuredInfo;
       additionalContext?: string;
       routingCategory?: string;
+      routingCategories?: Record<string, string>;
       routingReason?: string;
       requiresModification?: boolean;
       /** AI 生成的委托说明（按 worker 索引对应） */
@@ -57,11 +58,13 @@ export class AssignmentManager {
     for (let i = 0; i < participants.length; i++) {
       const participant = participants[i];
       const delegationBriefing = options?.delegationBriefings?.[i];
+      // 使用 per-worker 分类，如果有的话
+      const workerCategory = options?.routingCategories?.[participant] || options?.routingCategory;
       const assignment = await this.createAssignmentForWorker(
         mission,
         participant,
         contracts,
-        { ...options, delegationBriefing }
+        { ...options, delegationBriefing, routingCategory: workerCategory }
       );
       assignments.push(assignment);
     }

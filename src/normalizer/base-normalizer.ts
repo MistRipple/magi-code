@@ -79,8 +79,14 @@ export abstract class BaseNormalizer extends EventEmitter {
     return this.config.agent;
   }
 
-  startStream(traceId: string, source?: MessageSource): string {
-    const messageId = generateMessageId();
+  startStream(traceId: string, source?: MessageSource, messageIdOverride?: string): string {
+    const normalizedId = typeof messageIdOverride === 'string' && messageIdOverride.trim()
+      ? messageIdOverride.trim()
+      : undefined;
+    const messageId = normalizedId || generateMessageId();
+    if (this.activeContexts.has(messageId)) {
+      throw new Error(`[${this.agent}] Stream messageId already active: ${messageId}`);
+    }
     const context: ParseContext = {
       messageId,
       traceId,
@@ -123,6 +129,24 @@ export abstract class BaseNormalizer extends EventEmitter {
     for (const update of updates) {
       this.emit(MESSAGE_EVENTS.UPDATE, update);
     }
+  }
+
+  /**
+   * 处理已经标准化的文本增量（不走 JSON 解析）
+   *
+   * 适用于 LLM 客户端已输出结构化 delta 的场景，避免依赖行分隔 JSON。
+   */
+  processTextDelta(messageId: string, delta: string): void {
+    const context = this.activeContexts.get(messageId);
+    if (!context) {
+      this.debug(`[${this.agent}] 未找到消息上下文: ${messageId}`);  // ✅ 使用 agent
+      return;
+    }
+    if (!delta) return;
+    context.pendingText += delta;
+    context.hasAssistantText = true;
+    const update = this.createUpdate(messageId, 'append', { appendText: delta });
+    this.emit(MESSAGE_EVENTS.UPDATE, update);
   }
 
   /**

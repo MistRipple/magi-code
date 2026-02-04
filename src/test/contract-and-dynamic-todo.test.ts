@@ -112,11 +112,13 @@ function createTestAssignment(id: string, missionId: string, workerId: WorkerSlo
 function createTestTodo(id: string, assignmentId: string, outOfScope = false): WorkerTodo {
   return {
     id,
+    missionId: 'test-mission',
     assignmentId,
     content: `Test todo ${id}`,
     reasoning: 'Test reasoning',
     expectedOutput: 'Test output',
     type: 'implementation',
+    workerId: 'claude',
     priority: 3,
     outOfScope,
     approvalStatus: outOfScope ? 'pending' : undefined,
@@ -124,6 +126,9 @@ function createTestTodo(id: string, assignmentId: string, outOfScope = false): W
     requiredContracts: [],
     producesContracts: [],
     status: 'pending',
+    progress: 0,
+    retryCount: 0,
+    maxRetries: 3,
     createdAt: Date.now(),
   };
 }

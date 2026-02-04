@@ -5,12 +5,11 @@
 // 消息角色
 export type MessageRole = 'user' | 'assistant' | 'system';
 
-// 占位消息状态
+// 占位消息状态（符合 message-response-flow-design.md 规范）
 export type PlaceholderState =
-  | 'pending'    // 等待后端确认
-  | 'received'   // 已接收，预处理中
-  | 'thinking'   // 模型思考中
-  | 'connecting' // 连接模型中（可选）
+  | 'pending'    // 正在准备...（发送后立即）
+  | 'received'   // 已接收...（后端确认接收）
+  | 'thinking'   // 正在思考...（编排进入分析）
   ;
 
 // 请求-响应绑定
@@ -25,6 +24,8 @@ export interface RequestResponseBinding {
   realMessageId?: string;
   /** 创建时间戳 */
   createdAt: number;
+  /** 首 token 超时定时器 ID */
+  timeoutId?: ReturnType<typeof setTimeout>;
 }
 
 // 消息来源

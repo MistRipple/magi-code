@@ -240,7 +240,30 @@ class EndToEndEngineer implements TestEngineer {
               done: true,
             };
           }
-          return { content: '编排者响应', done: true };
+          // TaskPreAnalyzer 分析 prompt
+          if (message.includes('分析以下任务') && message.includes('complexity')) {
+            return {
+              content: JSON.stringify({
+                complexity: 'simple',
+                needsPlanning: false,
+                needsReview: false,
+                needsVerification: false,
+                parallel: false,
+                reasoning: '单一简单任务，无复杂依赖',
+                analysisSummary: '📝 简单任务，直接执行',
+              }),
+              done: true,
+            };
+          }
+          // 兜底响应：返回有效 JSON 而非纯文本
+          return {
+            content: JSON.stringify({
+              status: 'ok',
+              message: '编排者响应',
+              fallback: true,
+            }),
+            done: true,
+          };
         }
 
         this.workerCalls += 1;
@@ -265,6 +288,17 @@ class EndToEndEngineer implements TestEngineer {
 
     const adapterFactory = new MockAdapterFactory();
     const workspaceRoot = process.cwd();
+
+    // ⚠️ 关键：在修改 HOME 之前先加载 LLMConfigLoader
+    // 这确保其静态 CONFIG_DIR 属性使用正确的用户主目录
+    const { LLMConfigLoader } = require('../../llm/config');
+    const { clearClientCache } = require('../../llm/clients/client-factory');
+    clearClientCache(); // 清除可能的旧缓存
+    // 预加载配置，确保 CONFIG_DIR 已初始化为正确路径
+    LLMConfigLoader.loadOrchestratorConfig();
+
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
     const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'multicli-e2e-'));
     process.env.HOME = tmpHome;
     process.env.USERPROFILE = tmpHome;
@@ -339,6 +373,13 @@ class EndToEndEngineer implements TestEngineer {
         suggestedFix: '检查编排执行路径和 mock LLM 响应格式',
       });
     } finally {
+      // 恢复原始环境变量
+      if (originalHome !== undefined) {
+        process.env.HOME = originalHome;
+      }
+      if (originalUserProfile !== undefined) {
+        process.env.USERPROFILE = originalUserProfile;
+      }
       Module.prototype.require = originalRequire;
       try {
         const missionOrchestrator = (orchestrator as any)?.missionOrchestrator;

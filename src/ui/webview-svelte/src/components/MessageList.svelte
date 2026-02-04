@@ -21,8 +21,62 @@
     (messages || []).filter(m => !!m && !!m.id)
   );
 
+  /**
+   * 生成消息的稳定 Svelte key
+   *
+   * 核心问题：
+   * 1. 用户消息和占位消息共享同一个 requestId，但它们是两条不同的消息
+   * 2. 一个 requestId 可能对应多条响应消息（多轮流式、多个 Worker 等）
+   *
+   * 解决方案：
+   * - 用户消息：使用 message.id（唯一）
+   * - 占位消息：使用 response-${requestId}（用于与首条真实消息共享 key）
+   * - 从占位消息转换的首条真实消息（wasPlaceholder=true）：使用 response-${requestId}
+   * - 其他所有消息：使用 message.id（避免 key 冲突）
+   */
+  function getMessageKey(message: import('../types/message').Message): string {
+    // 1. 用户消息：使用自己的 ID（唯一，不会与响应消息冲突）
+    const isUserMessage = message.role === 'user' || message.metadata?.role === 'user';
+    if (isUserMessage) {
+      return message.id;
+    }
+
+    // 2. 占位消息：使用 response-${requestId}
+    //    这是为了让首条真实消息替换占位消息时，Svelte 认为是同一个元素
+    if (message.metadata?.isPlaceholder) {
+      const requestId = message.metadata?.requestId;
+      if (requestId) {
+        return `response-${requestId}`;
+      }
+      return message.id;
+    }
+
+    // 3. 从占位消息转换而来的首条真实消息（wasPlaceholder=true）
+    //    使用与占位消息相同的 key，实现 DOM 原地更新
+    if (message.metadata?.wasPlaceholder) {
+      const requestId = message.metadata?.requestId;
+      if (requestId) {
+        return `response-${requestId}`;
+      }
+      return message.id;
+    }
+
+    // 4. 其他所有消息（后续流式消息、多轮响应等）：使用 message.id
+    //    每条消息有唯一的 key，避免冲突
+    return message.id;
+  }
+
+  /* 🔧 计算流式消息的内容签名，用于触发滚动
+     当任何流式消息的内容变化时，需要重新滚动到底部 */
+  const streamingContentSignature = $derived.by(() => {
+    const streamingMsgs = safeMessages.filter(m => m.isStreaming);
+    if (streamingMsgs.length === 0) return '';
+    // 使用内容长度作为签名，避免频繁的字符串比较
+    return streamingMsgs.map(m => `${m.id}:${(m.content || '').length}:${(m.blocks || []).length}`).join('|');
+  });
+
   // 空状态默认值
-  const emptyIcon = $derived(emptyState?.icon || 'chat');
+  const emptyIcon = $derived((emptyState?.icon || 'chat') as import('../lib/icons').IconName);
   const emptyTitle = $derived(emptyState?.title || '开始一个新对话');
   const emptyHint = $derived(emptyState?.hint || '在下方输入框中输入你的问题');
 
@@ -35,9 +89,12 @@
   let showScrollBtn = $state(false);
 
   // 监听消息变化，自动滚动到底部
+  // 🔧 同时监听流式消息内容变化，确保内容增长时也能自动滚动
   $effect(() => {
     const _len = safeMessages.length;
+    const _sig = streamingContentSignature; // 订阅流式内容变化
     void _len;
+    void _sig;
     if (shouldAutoScroll && containerRef) {
       tick().then(() => {
         if (containerRef) {
@@ -93,7 +150,7 @@
         <p class="empty-hint">{emptyHint}</p>
       </div>
     {:else}
-      {#each safeMessages as message (message.id)}
+      {#each safeMessages as message (getMessageKey(message))}
         <MessageItem {message} />
       {/each}
     {/if}

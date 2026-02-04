@@ -10,6 +10,7 @@ import {
   addAgentMessage,
   updateAgentMessage,
   replaceThreadMessage,
+  removeThreadMessage,
   setIsProcessing,
   setCurrentSessionId,
   updateSessions,
@@ -177,11 +178,20 @@ function handleStateUpdate(message: WebviewMessage) {
     const statusMap: ModelStatusMap = {};
     for (const status of (state as any).workerStatuses) {
       if (!status?.worker) continue;
-      statusMap[status.worker] = {
-        status: status.available ? 'available' : 'unavailable',
-      };
+      const worker = status.worker;
+      const currentStatus = store.modelStatus[worker]?.status;
+      // 🔧 修复：只有当前状态为 'checking'（初始状态）时才使用 workerStatuses 更新
+      // workerStatusUpdate 通过真实 LLM 连接测试得出，比 adapter.isConnected() 更准确
+      // 避免 stateUpdate 中的 available: false 覆盖已经检测到的可用状态
+      if (currentStatus === 'checking') {
+        statusMap[worker] = {
+          status: status.available ? 'available' : 'unavailable',
+        };
+      }
     }
-    store.modelStatus = { ...store.modelStatus, ...statusMap };
+    if (Object.keys(statusMap).length > 0) {
+      store.modelStatus = { ...store.modelStatus, ...statusMap };
+    }
   }
 
   if (typeof (state as any).isRunning === 'boolean') {
@@ -239,6 +249,115 @@ function handleUnifiedMessage(message: WebviewMessage) {
   }
 }
 
+// ===== 流式更新缓冲：防止 update 先于 message 到达导致更新丢失 =====
+const pendingStreamUpdates = new Map<string, StreamUpdate[]>();
+
+function queueStreamUpdate(update: StreamUpdate): void {
+  const list = pendingStreamUpdates.get(update.messageId) || [];
+  list.push(update);
+  pendingStreamUpdates.set(update.messageId, list);
+  console.warn('[MessageHandler] 缓存流式更新', {
+    messageId: update.messageId,
+    updateType: update.updateType,
+    cachedCount: list.length,
+  });
+}
+
+function applyUpdateToLocation(location: ReturnType<typeof getMessageTarget>, update: StreamUpdate): boolean {
+  if (!location) return false;
+  if (location.location === 'none' || location.location === 'task') {
+    return true;
+  }
+
+  let applied = false;
+  if (location.location === 'thread') {
+    const existing = getState().threadMessages.find(m => m.id === update.messageId);
+    if (existing) {
+      const streamUpdates = applyStreamUpdate(existing, update);
+      let nextMessage: Message = { ...existing, ...streamUpdates };
+      if (existing.metadata?.isPlaceholder && hasRenderableContent(nextMessage)) {
+        nextMessage = {
+          ...nextMessage,
+          metadata: {
+            ...(nextMessage.metadata || {}),
+            isPlaceholder: false,
+            wasPlaceholder: true,
+            placeholderState: undefined,
+          },
+        };
+      }
+      updateThreadMessage(update.messageId, nextMessage);
+      applied = true;
+    }
+  } else if (location.location === 'worker') {
+    const existing = getState().agentOutputs[location.worker].find(m => m.id === update.messageId);
+    if (existing) {
+      const streamUpdates = applyStreamUpdate(existing, update);
+      updateAgentMessage(location.worker, update.messageId, { ...existing, ...streamUpdates });
+      applied = true;
+    }
+  } else if (location.location === 'both') {
+    const threadExisting = getState().threadMessages.find(m => m.id === update.messageId);
+    if (threadExisting) {
+      const streamUpdates = applyStreamUpdate(threadExisting, update);
+      let nextMessage: Message = { ...threadExisting, ...streamUpdates };
+      if (threadExisting.metadata?.isPlaceholder && hasRenderableContent(nextMessage)) {
+        nextMessage = {
+          ...nextMessage,
+          metadata: {
+            ...(nextMessage.metadata || {}),
+            isPlaceholder: false,
+            wasPlaceholder: true,
+            placeholderState: undefined,
+          },
+        };
+      }
+      updateThreadMessage(update.messageId, nextMessage);
+      applied = true;
+    }
+    const agentExisting = getState().agentOutputs[location.worker].find(m => m.id === update.messageId);
+    if (agentExisting) {
+      const streamUpdates = applyStreamUpdate(agentExisting, update);
+      updateAgentMessage(location.worker, update.messageId, { ...agentExisting, ...streamUpdates });
+      applied = true;
+    }
+  }
+  return applied;
+}
+
+function flushPendingStreamUpdates(messageId: string): void {
+  const updates = pendingStreamUpdates.get(messageId);
+  if (!updates || updates.length === 0) {
+    return;
+  }
+  const location = getMessageTarget(messageId);
+  if (!location) {
+    return;
+  }
+  console.log('[MessageHandler] 回放缓存流式更新', {
+    messageId,
+    pendingCount: updates.length,
+    location: location.location,
+  });
+  const remaining: StreamUpdate[] = [];
+  for (const update of updates) {
+    const applied = applyUpdateToLocation(location, update);
+    if (!applied) {
+      remaining.push(update);
+    }
+  }
+  if (remaining.length > 0) {
+    pendingStreamUpdates.set(messageId, remaining);
+    console.warn('[MessageHandler] 流式更新仍未应用', {
+      messageId,
+      remainingCount: remaining.length,
+    });
+  } else {
+    pendingStreamUpdates.delete(messageId);
+    console.log('[MessageHandler] 流式更新回放完成', { messageId });
+  }
+}
+
 function handleContentMessage(standard: StandardMessage) {
   // 🔧 调试日志：进入 handleContentMessage
   console.log('[MessageHandler] handleContentMessage 开始处理:', {
@@ -284,21 +403,51 @@ function handleContentMessage(standard: StandardMessage) {
       throw new Error('[MessageHandler] 占位消息缺少 userMessageId');
     }
     const binding = getRequestBinding(requestId);
+
+    // 🔧 创建 60 秒超时定时器（首 token 超时保护）
+    const timeoutId = setTimeout(() => {
+      const currentBinding = getRequestBinding(requestId);
+      // 只有在没有收到真实消息时才触发超时
+      if (currentBinding && !currentBinding.realMessageId) {
+        console.warn('[MessageHandler] 首 token 超时，移除占位消息:', requestId);
+        // 移除占位消息
+        removeThreadMessage(currentBinding.placeholderMessageId);
+        clearMessageTarget(currentBinding.placeholderMessageId);
+        // 清理请求绑定
+        clearRequestBinding(requestId);
+        clearPendingRequest(requestId);
+        markMessageComplete(currentBinding.placeholderMessageId);
+        // 显示超时错误提示
+        addToast('error', '等待响应超时，请重试');
+      }
+    }, 60000); // 60 秒超时
+
     if (!binding) {
       createRequestBinding({
         requestId,
         userMessageId,
         placeholderMessageId: standard.id,
         createdAt: standard.timestamp || Date.now(),
+        timeoutId,
       });
     } else {
-      updateRequestBinding(requestId, { placeholderMessageId: standard.id, userMessageId });
+      // 清除旧的超时定时器
+      if (binding.timeoutId) {
+        clearTimeout(binding.timeoutId);
+      }
+      updateRequestBinding(requestId, { placeholderMessageId: standard.id, userMessageId, timeoutId });
     }
     addPendingRequest(requestId);
+    // 🔧 立即渲染占位消息：与真实消息保持一致的卡片结构，仅显示底部三点动画
+    // 提供“发送即响应”的体验，避免等待首 token 才出现卡片
     upsertThreadMessage(uiMessage);
+    // 🔧 为占位消息建立路由，确保流式更新可以命中同一条消息
+    routeStandardMessage(standard);
     if (uiMessage.isStreaming) {
       markMessageActive(uiMessage.id);
     }
+    // 🔧 回放可能提前到达的流式更新
+    flushPendingStreamUpdates(standard.id);
     return;
   }
 
@@ -339,43 +488,49 @@ function handleContentMessage(standard: StandardMessage) {
 
     if (binding && !binding.realMessageId) {
       // 首次收到真实消息，需要原地替换占位消息
+      // 🔧 清除超时定时器（已收到真实消息）
+      if (binding.timeoutId) {
+        clearTimeout(binding.timeoutId);
+      }
       const placeholderId = binding.placeholderMessageId;
       const existingPlaceholder = getState().threadMessages.find(m => m.id === placeholderId);
       if (!existingPlaceholder) {
-        console.warn(`[MessageHandler] 未找到占位消息: ${placeholderId}，继续正常添加消息`);
-        // 🔧 改为警告并继续，而非抛出错误
-      } else {
-        console.log('[MessageHandler] 替换占位消息:', { placeholderId, newId: standard.id });
-        // 更新绑定，记录真实消息 ID，并同步占位消息 ID
-        updateRequestBinding(requestId, { realMessageId: standard.id, placeholderMessageId: standard.id });
+        throw new Error(`[MessageHandler] 未找到占位消息: ${placeholderId}`);
+      }
 
-        const replacementMessage: import('../types/message').Message = {
-          ...uiMessage,
-          id: standard.id,
-          metadata: {
-            ...uiMessage.metadata,
-            isPlaceholder: false,
-            wasPlaceholder: true,
-            placeholderState: undefined,
-            requestId,
-          },
-        };
+      if (placeholderId !== standard.id) {
+        throw new Error(`[MessageHandler] 首条响应消息 ID 不匹配占位消息: placeholder=${placeholderId} real=${standard.id}`);
+      }
 
-        // 🔧 根治：替换占位消息时不再原地修改 id，避免 keyed each 崩溃
-        markMessageComplete(placeholderId);
-        replaceThreadMessage(placeholderId, replacementMessage);
-        clearMessageTarget(placeholderId);
-
-        // 注册路由（使用新 ID）
-        routeStandardMessage(standard);
-
-        // 标记为活跃消息
-        if (uiMessage.isStreaming) {
-          markMessageActive(standard.id);
-        }
-
+      if (!hasRenderableContent(uiMessage)) {
         return;
       }
+
+      // 🔧 统一消息 ID：占位消息即真实消息，直接在同一条消息上更新
+      updateRequestBinding(requestId, { realMessageId: standard.id, placeholderMessageId: standard.id });
+      const mergedMessage: import('../types/message').Message = {
+        ...existingPlaceholder,
+        ...uiMessage,
+        metadata: {
+          ...(existingPlaceholder.metadata || {}),
+          ...(uiMessage.metadata || {}),
+          isPlaceholder: false,
+          wasPlaceholder: true,
+          placeholderState: undefined,
+          requestId,
+        },
+      };
+      updateThreadMessage(placeholderId, mergedMessage);
+
+      // 标记为活跃消息
+      if (uiMessage.isStreaming) {
+        markMessageActive(placeholderId);
+      }
+
+      // 可能存在提前到达的流式更新，立即补齐
+      flushPendingStreamUpdates(standard.id);
+
+      return;
     }
   }
 
@@ -429,6 +584,9 @@ function handleContentMessage(standard: StandardMessage) {
         addAgentMessage(target.worker, uiMessage);
       }
     }
+
+    // 🔧 可能存在提前到达的流式更新，立即补齐
+    flushPendingStreamUpdates(standard.id);
 }
 
 
@@ -438,37 +596,19 @@ function handleStandardUpdate(message: WebviewMessage) {
     throw new Error('[MessageHandler] 流式更新缺少 messageId');
   }
   const update = rawUpdate;
+
+  // 查找路由
   const location = getMessageTarget(update.messageId);
+
   if (!location) {
-    console.warn(`[MessageHandler] 未找到流式更新的路由，跳过更新: ${update.messageId}`);
+    console.warn(`[MessageHandler] 未找到流式更新的路由，暂存更新: ${update.messageId}`);
+    queueStreamUpdate(update);
     return;
   }
-  if (location.location === 'none' || location.location === 'task') {
-    return;
-  }
-  if (location.location === 'thread') {
-    const existing = getState().threadMessages.find(m => m.id === update.messageId);
-    if (existing) {
-      updateThreadMessage(update.messageId, applyStreamUpdate(existing, update));
-    }
-    return;
-  }
-  if (location.location === 'worker') {
-    const existing = getState().agentOutputs[location.worker].find(m => m.id === update.messageId);
-    if (existing) {
-      updateAgentMessage(location.worker, update.messageId, applyStreamUpdate(existing, update));
-    }
-    return;
-  }
-  if (location.location === 'both') {
-    const threadExisting = getState().threadMessages.find(m => m.id === update.messageId);
-    if (threadExisting) {
-      updateThreadMessage(update.messageId, applyStreamUpdate(threadExisting, update));
-    }
-    const agentExisting = getState().agentOutputs[location.worker].find(m => m.id === update.messageId);
-    if (agentExisting) {
-      updateAgentMessage(location.worker, update.messageId, applyStreamUpdate(agentExisting, update));
-    }
+
+  const applied = applyUpdateToLocation(location, update);
+  if (!applied) {
+    queueStreamUpdate(update);
   }
 }
 
@@ -479,116 +619,117 @@ function handleStandardComplete(message: WebviewMessage) {
   }
   const standard = assertStandardMessageId(rawStandard);
 
+  console.log('[MessageHandler] handleStandardComplete 开始:', {
+    id: standard.id,
+    category: standard.category,
+    lifecycle: standard.lifecycle,
+    requestId: (standard.metadata as Record<string, unknown> | undefined)?.requestId,
+  });
+
   // 🔧 根治：只处理 CONTENT 类别的消息，其他类别直接跳过
   // DATA/CONTROL/NOTIFY 消息不应该进入对话列表
   if (standard.category !== MessageCategory.CONTENT) {
+    console.log('[MessageHandler] handleStandardComplete: 非 CONTENT 类别，跳过');
     return;
   }
 
-  // 尝试获取已注册的路由
-  const location = getMessageTarget(standard.id);
+  const requestId = (standard.metadata as Record<string, unknown> | undefined)?.requestId as string | undefined;
+  const actualMessageId = standard.id;
+  const location = getMessageTarget(actualMessageId);
+  console.log('[MessageHandler] handleStandardComplete 路由查找:', {
+    originalId: standard.id,
+    actualMessageId,
+    hasLocation: !!location,
+    locationInfo: location,
+  });
   if (!location) {
-    // 没有路由说明这个消息没有通过 handleContentMessage 处理过
-    // 直接按完成消息插入，避免丢失最终输出
-    const uiMessage = mapStandardMessage(standard);
-    if (!hasRenderableContent(uiMessage)) {
-      return;
-    }
-    const target = routeStandardMessage(standard);
-    if (target.location === 'none' || target.location === 'task') {
-      return;
-    }
-    const completedMessage = {
-      ...uiMessage,
-      metadata: {
-        ...uiMessage.metadata,
-        justCompleted: true,
-      },
-    };
-    if (target.location === 'thread') {
-      const existing = getState().threadMessages.find(m => m.id === completedMessage.id);
-      if (existing) {
-        updateThreadMessage(completedMessage.id, completedMessage);
-      } else {
-        addThreadMessage(completedMessage);
-      }
-    } else if (target.location === 'worker') {
-      const existing = getState().agentOutputs[target.worker].find(m => m.id === completedMessage.id);
-      if (existing) {
-        updateAgentMessage(target.worker, completedMessage.id, completedMessage);
-      } else {
-        addAgentMessage(target.worker, completedMessage);
-      }
-    } else if (target.location === 'both') {
-      const threadExisting = getState().threadMessages.find(m => m.id === completedMessage.id);
-      if (threadExisting) {
-        updateThreadMessage(completedMessage.id, completedMessage);
-      } else {
-        addThreadMessage(completedMessage);
-      }
-      const agentExisting = getState().agentOutputs[target.worker].find(m => m.id === completedMessage.id);
-      if (agentExisting) {
-        updateAgentMessage(target.worker, completedMessage.id, completedMessage);
-      } else {
-        addAgentMessage(target.worker, completedMessage);
-      }
-    }
-    return;
+    throw new Error(`[MessageHandler] 完成消息缺少路由: ${standard.id}`);
   }
 
   if (location.location === 'none' || location.location === 'task') {
     return;
   }
 
-  // 🔧 修复：先检查消息是否存在，如果不存在则跳过
+  // 🔧 修复：先检查消息是否存在，使用 actualMessageId
   // complete 消息是用来"完成"已有消息的
   let messageExists = false;
   if (location.location === 'thread') {
-    messageExists = getState().threadMessages.some(m => m.id === standard.id);
+    messageExists = getState().threadMessages.some(m => m.id === actualMessageId);
   } else if (location.location === 'worker') {
-    messageExists = getState().agentOutputs[location.worker].some(m => m.id === standard.id);
+    messageExists = getState().agentOutputs[location.worker].some(m => m.id === actualMessageId);
   } else if (location.location === 'both') {
-    messageExists = getState().threadMessages.some(m => m.id === standard.id) ||
-                    getState().agentOutputs[location.worker].some(m => m.id === standard.id);
+    messageExists = getState().threadMessages.some(m => m.id === actualMessageId) ||
+                    getState().agentOutputs[location.worker].some(m => m.id === actualMessageId);
   }
 
   if (!messageExists) {
-    // 消息不存在，跳过处理
-    clearMessageTarget(standard.id);
-    return;
+    throw new Error(`[MessageHandler] 完成消息未找到对应卡片: ${actualMessageId}`);
   }
 
   // 🔧 修复：消息完成时标记为非活跃，驱动 isProcessing 状态
-  markMessageComplete(standard.id);
+  markMessageComplete(actualMessageId);
 
   const uiMessage = mapStandardMessage(standard);
-  if (!hasRenderableContent(uiMessage)) {
-    // 消息不可渲染，静默跳过
-    clearMessageTarget(standard.id);
+  const hasContent = hasRenderableContent(uiMessage);
+
+  // 保留已有内容：complete 消息可能没有 blocks/content
+  const getExistingMessage = () => {
+    if (location.location === 'thread') {
+      return getState().threadMessages.find(m => m.id === actualMessageId);
+    }
+    if (location.location === 'worker') {
+      return getState().agentOutputs[location.worker].find(m => m.id === actualMessageId);
+    }
+    if (location.location === 'both') {
+      return getState().threadMessages.find(m => m.id === actualMessageId)
+        || getState().agentOutputs[location.worker].find(m => m.id === actualMessageId);
+    }
+    return undefined;
+  };
+
+  const existingMessage = getExistingMessage();
+  const baseMessage = hasContent ? uiMessage : (existingMessage || uiMessage);
+  if (!baseMessage) {
+    clearMessageTarget(actualMessageId);
     return;
   }
 
-  // 添加完成动画标记
+  const shouldConvertFromPlaceholder = Boolean(existingMessage?.metadata?.isPlaceholder)
+    && hasRenderableContent(baseMessage);
+
+  // 添加完成动画标记，并确保流式结束
   const completedMessage = {
-    ...uiMessage,
+    ...baseMessage,
+    id: actualMessageId, // 使用实际的消息 ID
+    isStreaming: false,
+    isComplete: true,
     metadata: {
-      ...uiMessage.metadata,
+      ...(baseMessage.metadata || {}),
       justCompleted: true,
+      ...(shouldConvertFromPlaceholder
+        ? {
+            isPlaceholder: false,
+            wasPlaceholder: true,
+            placeholderState: undefined,
+          }
+        : {}),
     },
   };
 
   // 更新已存在的消息
   if (location.location === 'thread') {
-    updateThreadMessage(standard.id, completedMessage);
+    updateThreadMessage(actualMessageId, completedMessage);
   } else if (location.location === 'worker') {
-    updateAgentMessage(location.worker, standard.id, completedMessage);
+    updateAgentMessage(location.worker, actualMessageId, completedMessage);
   } else if (location.location === 'both') {
-    updateThreadMessage(standard.id, completedMessage);
-    updateAgentMessage(location.worker, standard.id, completedMessage);
+    updateThreadMessage(actualMessageId, completedMessage);
+    updateAgentMessage(location.worker, actualMessageId, completedMessage);
   }
 
+  // 🔧 补齐可能提前到达的流式更新
+  flushPendingStreamUpdates(actualMessageId);
+
   // 清理请求绑定
-  const requestId = (standard.metadata as { requestId?: string } | undefined)?.requestId;
   if (requestId) {
     // 延迟清理，确保动画完成
     setTimeout(() => {
@@ -599,21 +740,21 @@ function handleStandardComplete(message: WebviewMessage) {
   // 移除 justCompleted 标记（动画完成后）
   setTimeout(() => {
     const cleanedMessage = {
-      ...uiMessage,
+      ...completedMessage,
       metadata: {
-        ...uiMessage.metadata,
+        ...(completedMessage.metadata || {}),
         justCompleted: false,
       },
     };
     if (location.location === 'thread' || location.location === 'both') {
-      updateThreadMessage(standard.id, cleanedMessage);
+      updateThreadMessage(actualMessageId, cleanedMessage);
     }
     if (location.location === 'worker' || location.location === 'both') {
-      updateAgentMessage(location.worker, standard.id, cleanedMessage);
+      updateAgentMessage(location.worker, actualMessageId, cleanedMessage);
     }
   }, 500);
 
-  clearMessageTarget(standard.id);
+  clearMessageTarget(actualMessageId);
 }
 
 
@@ -1024,10 +1165,12 @@ function handleQuestionRequest(message: WebviewMessage) {
 function handleClarificationRequest(message: WebviewMessage) {
   const store = getState();
   if (store.interactionMode === 'auto') {
+    // auto 模式下静默跳过澄清，不显示 toast
     vscode.postMessage({
       type: 'answerClarification',
       answers: null,
       additionalInfo: null,
+      autoSkipped: true,  // 标记为自动跳过
     });
     setIsProcessing(true);
     return;

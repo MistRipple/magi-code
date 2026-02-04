@@ -174,8 +174,9 @@ class MessageRoutingEngineer implements TestEngineer {
     const providerContent = fs.readFileSync(providerPath, 'utf-8');
     const hubContent = fs.readFileSync(hubPath, 'utf-8');
 
+    // 检查 data-only 防护：assistantContent 校验 + 错误处理
     const hasRequestStatsCheck = providerContent.includes('assistantContent')
-      && providerContent.includes('消息通道异常：未产生任何响应内容');
+      && (providerContent.includes('未收到模型输出内容') || providerContent.includes('stats.assistantContent <= 0'));
     const hasStreamBuffer = hubContent.includes('streamBuffers')
       && hubContent.includes('ensureContentBlocksFromBuffer');
 

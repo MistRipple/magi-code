@@ -232,6 +232,7 @@ export class MessageHub extends EventEmitter {
   /** 防止事件发射触发的重入调用 */
   private processingMessageIds: Set<string> = new Set();
   private requestMessageStats: Map<string, RequestMessageStats> = new Map();
+  private requestMessageIdMap: Map<string, string> = new Map();
   private streamBuffers: Map<string, { text: string; lastBlocks?: ContentBlock[] }> = new Map();
 
   // ==========================================================================
@@ -313,7 +314,12 @@ export class MessageHub extends EventEmitter {
       return undefined;
     }
     this.requestMessageStats.delete(requestId);
+    this.requestMessageIdMap.delete(requestId);
     return this.toRequestSummary(stats);
+  }
+
+  getRequestMessageId(requestId: string): string | undefined {
+    return this.requestMessageIdMap.get(requestId);
   }
 
   /**
@@ -368,7 +374,12 @@ export class MessageHub extends EventEmitter {
       return;
     }
 
-    const message = this.createMessage({
+    const requestId = (options?.metadata as { requestId?: string } | undefined)?.requestId || this.requestId;
+    const reuseMessageId = requestId ? this.getRequestMessageId(requestId) : undefined;
+    const message = createStandardMessage({
+      id: reuseMessageId,
+      traceId: this.traceId,
+      category: MessageCategory.CONTENT,
       type: MessageType.RESULT,
       source: 'orchestrator',
       agent: 'orchestrator',
@@ -634,8 +645,41 @@ export class MessageHub extends EventEmitter {
       };
     }
 
+    const requestId = message.metadata?.requestId;
+    if (requestId && message.metadata?.isPlaceholder === true) {
+      this.requestMessageIdMap.set(requestId, message.id);
+      console.log('[MessageHub] 注册占位消息 ID 映射:', {
+        requestId,
+        placeholderMessageId: message.id,
+        mapSize: this.requestMessageIdMap.size,
+      });
+    }
+
+    const isPlaceholder = message.metadata?.isPlaceholder === true;
+    const isUser = message.metadata?.role === 'user';
+    const isStatusMessageMeta = message.metadata?.isStatusMessage === true;
+    const hasSubTaskCard = Boolean(message.metadata?.subTaskCard);
+    const dispatchToWorker = message.metadata?.dispatchToWorker === true;
+    if (
+      message.category === MessageCategory.CONTENT
+      && message.source === 'orchestrator'
+      && requestId
+      && !isPlaceholder
+      && !isUser
+      && !isStatusMessageMeta
+      && !hasSubTaskCard
+      && !dispatchToWorker
+    ) {
+      const boundMessageId = this.getRequestMessageId(requestId);
+      if (!boundMessageId) {
+        throw new Error(`[MessageHub] 主响应消息缺少占位绑定: requestId=${requestId}`);
+      }
+      if (message.id !== boundMessageId) {
+        message = { ...message, id: boundMessageId };
+      }
+    }
+
     if (message.category === MessageCategory.CONTENT) {
-      const requestId = message.metadata?.requestId;
       if (typeof requestId !== 'string' || !requestId.trim()) {
         // 🔧 改为警告而非抛出异常，避免阻塞消息流
         // requestId 缺失时记录警告，但仍然发送消息
@@ -691,10 +735,10 @@ export class MessageHub extends EventEmitter {
       case MessageCategory.CONTENT: {
         const isPlaceholder = message.metadata?.isPlaceholder === true;
         const isStreaming = message.lifecycle === MessageLifecycle.STARTED || message.lifecycle === MessageLifecycle.STREAMING;
-        const isCompleted = message.lifecycle === MessageLifecycle.COMPLETED;
+        const isUser = message.metadata?.role === 'user';
         const hasBlocks = Array.isArray(message.blocks) && message.blocks.length > 0;
-        // 🔧 修复：COMPLETED 消息允许无 blocks（可能所有内容已通过流式更新发送）
-        if (!hasBlocks && !isPlaceholder && !isStreaming && !isCompleted) {
+        // 🔧 根治：禁止 data-only 内容流。非占位、非流式、非用户消息必须有内容块。
+        if (!hasBlocks && !isPlaceholder && !isStreaming && !isUser) {
           throw new Error(`[MessageHub] Content message missing blocks: ${message.id}`);
         }
         break;
@@ -1130,13 +1174,15 @@ export class MessageHub extends EventEmitter {
 
     const hasText = Boolean(this.extractTextFromBlocks(message.blocks))
       || Boolean(this.streamBuffers.get(message.id)?.text);
+    const hasBlocks = this.hasRenderableBlocks(message.blocks)
+      || this.hasRenderableBlocks(this.streamBuffers.get(message.id)?.lastBlocks);
     const isPlaceholder = message.metadata?.isPlaceholder === true;
     const isUser = message.metadata?.role === 'user';
     const isDispatchToWorker = message.metadata?.dispatchToWorker === true;
     const isWorkerSource = message.source === 'worker';
     const isOrchestratorSource = message.source === 'orchestrator';
 
-    if (!hasText && !isPlaceholder && !isUser) {
+    if (!hasText && !hasBlocks && !isPlaceholder && !isUser) {
       this.requestMessageStats.set(requestId, stats);
       return;
     }
@@ -1367,17 +1413,38 @@ export class MessageHub extends EventEmitter {
       .join('\n');
   }
 
+  private hasRenderableBlocks(blocks?: ContentBlock[]): boolean {
+    if (!Array.isArray(blocks) || blocks.length === 0) {
+      return false;
+    }
+    return blocks.some((block) => {
+      if (!block || typeof block !== 'object') return false;
+      switch (block.type) {
+        case 'text':
+        case 'thinking':
+          return Boolean((block as any).content && String((block as any).content).trim());
+        case 'tool_call':
+        case 'file_change':
+        case 'plan':
+          return true;
+        default:
+          return Boolean((block as any).content && String((block as any).content).trim());
+      }
+    });
+  }
+
   private updateStreamBufferFromMessage(message: StandardMessage): void {
     if (message.category !== MessageCategory.CONTENT) {
       return;
     }
-    const text = this.extractTextFromBlocks(message.blocks);
-    if (!text) {
-      return;
-    }
     const buffer = this.streamBuffers.get(message.id) || { text: '' };
-    buffer.text = text;
-    buffer.lastBlocks = message.blocks;
+    if (Array.isArray(message.blocks) && message.blocks.length > 0) {
+      buffer.lastBlocks = message.blocks;
+    }
+    const text = this.extractTextFromBlocks(message.blocks);
+    if (text) {
+      buffer.text = text;
+    }
     this.streamBuffers.set(message.id, buffer);
   }
 
@@ -1399,11 +1466,19 @@ export class MessageHub extends EventEmitter {
     if (message.metadata?.isPlaceholder) {
       return message;
     }
+    const hasBlocks = Array.isArray(message.blocks) && message.blocks.length > 0;
     const existingText = this.extractTextFromBlocks(message.blocks);
-    if (existingText && existingText.trim()) {
+    if (hasBlocks && existingText && existingText.trim()) {
       return message;
     }
     const buffer = this.streamBuffers.get(message.id);
+    if (buffer?.lastBlocks && buffer.lastBlocks.length > 0) {
+      return {
+        ...message,
+        blocks: buffer.lastBlocks,
+        updatedAt: Date.now(),
+      };
+    }
     if (!buffer?.text || !buffer.text.trim()) {
       return message;
     }

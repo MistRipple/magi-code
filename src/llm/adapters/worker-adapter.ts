@@ -233,7 +233,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       };
 
       // 开始流式响应
-      const streamId = this.normalizer.startStream(this.currentTraceId);
+      const streamId = this.startStreamWithContext();
       messageId = streamId;
       let fullResponse = '';
       let toolCalls: ToolCall[] = [];
@@ -242,7 +242,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       const response = await this.client.streamMessage(params, (chunk) => {
         if (chunk.type === 'content_delta' && chunk.content) {
           fullResponse += chunk.content;
-          this.normalizer.processChunk(streamId, chunk.content);
+          this.normalizer.processTextDelta(streamId, chunk.content);
           this.emit('message', chunk.content);
         } else if (chunk.type === 'thinking' && chunk.thinking) {
           // 处理 thinking 内容

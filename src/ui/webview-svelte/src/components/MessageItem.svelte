@@ -2,11 +2,9 @@
   import type { Message, PlaceholderState } from '../types/message';
   import type { IconName } from '../lib/icons';
   import MarkdownContent from './MarkdownContent.svelte';
-  import StreamingIndicator from './StreamingIndicator.svelte';
   import WorkerBadge from './WorkerBadge.svelte';
   import SubTaskSummaryCard from './SubTaskSummaryCard.svelte';
   import BlockRenderer from './BlockRenderer.svelte';
-  import PlaceholderMessage from './PlaceholderMessage.svelte';
   import Icon from './Icon.svelte';
 
   // Props
@@ -24,9 +22,7 @@
 
   // 占位消息相关派生状态
   const isPlaceholder = $derived(Boolean(message.metadata?.isPlaceholder));
-  const placeholderState = $derived(
-    (message.metadata?.placeholderState as PlaceholderState) || 'pending'
-  );
+  const placeholderState = $derived((message.metadata?.placeholderState || 'pending') as PlaceholderState);
   const wasPlaceholder = $derived(Boolean(message.metadata?.wasPlaceholder));
   const justCompleted = $derived(Boolean(message.metadata?.justCompleted));
   const sendingAnimation = $derived(Boolean(message.metadata?.sendingAnimation));
@@ -104,12 +100,8 @@
   }
 </script>
 
-<!-- 占位消息：使用专门组件渲染 -->
-{#if isPlaceholder}
-  <PlaceholderMessage state={placeholderState} />
-
 <!-- 系统通知消息：居中显示 -->
-{:else if isNotice}
+{#if isNotice}
   <div class="system-notice {noticeType}">
     <span class="notice-icon" style="color: {noticeColors[noticeType] || noticeColors.info}">
       <Icon name={noticeIcons[noticeType] || 'info'} size={14} />
@@ -138,28 +130,41 @@
   <div class="message-item subtask-card-only" data-message-id={message.id} data-source={message.source}>
     <SubTaskSummaryCard card={message.metadata?.subTaskCard as any} />
   </div>
-<!-- 助手消息：完整显示 -->
+<!-- 助手消息：完整显示（包括占位状态） -->
 {:else}
   <div
     class="message-item assistant"
     class:streaming={isStreaming}
+    class:placeholder={isPlaceholder}
     class:was-placeholder={wasPlaceholder}
     class:just-completed={justCompleted}
     data-message-id={message.id}
     data-source={message.source}
     data-interaction={isInteraction ? 'true' : 'false'}
+    data-placeholder-state={isPlaceholder ? placeholderState : undefined}
   >
     <div class="message-header">
       <div class="message-source">
         <!-- 只显示 WorkerBadge，不再重复显示 source-name -->
         <WorkerBadge worker={badgeWorker} size="sm" />
+        <!-- 占位状态显示状态文字 -->
+        {#if isPlaceholder}
+          <span class="placeholder-status">
+            {#if placeholderState === 'pending'}
+              正在准备...
+            {:else if placeholderState === 'received'}
+              已接收...
+            {:else if placeholderState === 'thinking'}
+              正在思考...
+            {:else}
+              处理中...
+            {/if}
+          </span>
+        {/if}
       </div>
       <div class="message-meta">
         <span class="message-time">{formatTime(message.timestamp)}</span>
-        {#if isStreaming}
-          <StreamingIndicator />
-        {/if}
-        {#if !isStreaming}
+        {#if !isStreaming && !isPlaceholder}
           <button class="copy-btn" onclick={handleCopy} title="复制内容">
             <Icon name="copy" size={12} />
           </button>
@@ -168,46 +173,70 @@
     </div>
 
     <div class="message-content">
-      {#if message.metadata?.subTaskCard}
-        <SubTaskSummaryCard card={message.metadata.subTaskCard as any} />
-      {/if}
-
-      {#if isInteraction && interactionMeta?.prompt}
-        <div class="interaction-inline">
-          <Icon name="sparkles" size={14} />
-          <span>{interactionMeta.prompt}</span>
+      {#if isPlaceholder}
+        <!-- 🔧 占位状态：显示加载动画，保持统一的卡片结构 -->
+        <div class="placeholder-content">
+          <div class="streaming-indicator-bottom">
+            <span class="streaming-dot"></span>
+            <span class="streaming-dot"></span>
+            <span class="streaming-dot"></span>
+          </div>
         </div>
-      {/if}
+      {:else}
+        {#if message.metadata?.subTaskCard}
+          <SubTaskSummaryCard card={message.metadata.subTaskCard as any} />
+        {/if}
 
-      {#if !message.metadata?.subTaskCard && safeBlocks.length > 0}
-        {#each safeBlocks as block, i (`${message.id}-block-${i}`)}
-          <BlockRenderer {block} {isStreaming} />
-        {/each}
-      {:else if !message.metadata?.subTaskCard && message.content}
-        <MarkdownContent content={message.content} {isStreaming} />
-      {:else if isStreaming}
-        <!-- 流式消息占位符：确保卡片在内容加载前有高度 -->
-        <div class="streaming-placeholder">
-          <span class="streaming-dot"></span>
-          <span class="streaming-dot"></span>
-          <span class="streaming-dot"></span>
-        </div>
-      {/if}
+        {#if isInteraction && interactionMeta?.prompt}
+          <div class="interaction-inline">
+            <Icon name="sparkles" size={14} />
+            <span>{interactionMeta.prompt}</span>
+          </div>
+        {/if}
 
+        {#if !message.metadata?.subTaskCard}
+          <!--
+            🔧 统一渲染逻辑：
+            1. 优先渲染 blocks（支持 Thinking、ToolCall 等富内容块）
+            2. 如果没有 blocks 但有 content，则渲染纯 Markdown
+            3. 流式期间，blocks 和 content 都会实时更新
+          -->
+          {#if safeBlocks.length > 0}
+            {#each safeBlocks as block, i (`${message.id}-block-${i}-${block.type}`)}
+              <BlockRenderer {block} {isStreaming} />
+            {/each}
+          {:else if message.content}
+            <MarkdownContent content={message.content} {isStreaming} />
+          {/if}
+
+          <!-- 🔧 流式消息底部加载指示器：始终在所有内容之后显示 -->
+          {#if isStreaming}
+            <div class="streaming-indicator-bottom">
+              <span class="streaming-dot"></span>
+              <span class="streaming-dot"></span>
+              <span class="streaming-dot"></span>
+            </div>
+          {/if}
+        {/if}
+      {/if}
     </div>
   </div>
 {/if}
 
 <!-- 🔧 图片预览弹窗 -->
 {#if showImagePreview}
-  <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
-  <div class="image-preview-overlay" onclick={closeImagePreview} role="dialog" aria-modal="true" tabindex="-1">
-    <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
-    <div class="image-preview-content" role="document" onclick={(e) => e.stopPropagation()}>
-      <button class="image-preview-close" onclick={closeImagePreview} type="button" aria-label="关闭">×</button>
+  <button
+    class="image-preview-overlay"
+    onclick={closeImagePreview}
+    onkeydown={(e) => e.key === 'Escape' && closeImagePreview()}
+    type="button"
+    aria-label="关闭图片预览"
+  >
+    <div class="image-preview-content" role="document">
+      <span class="image-preview-close" aria-hidden="true">×</span>
       <img src={previewImageUrl} alt="图片预览" class="image-preview-img" />
     </div>
-  </div>
+  </button>
 {/if}
 
 <style>
@@ -282,7 +311,17 @@
     background: var(--assistant-message-bg);
     border: 1px solid var(--border);
     margin-right: var(--space-2);  /* 减少右边距，配合 MessageList 的 padding-right 调整 */
-    transition: all var(--transition-fast);
+    /* 平滑过渡：仅边框颜色和阴影，高度由内容自然撑开 */
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    /* 🔧 强制高度自适应：禁止压缩，确保高度随内容（包括流式输出）自动撑开 */
+    flex-shrink: 0;
+    height: auto;
+    overflow: visible;
+  }
+
+  /* 流式消息卡片：高度完全由内容与动画驱动，避免占位感 */
+  .message-item.assistant.streaming {
+    min-height: 48px; /* 🔧 保持与 placeholder 高度一致，防止切换时塌陷 */
   }
 
   .interaction-inline {
@@ -346,35 +385,55 @@
     word-wrap: break-word;
     overflow-wrap: break-word;
     font-size: var(--text-base);
+    /* 🔧 确保内容区域高度由内容自然撑开 */
+    min-height: 0;
+    height: auto;
   }
-  .message-item.streaming .message-content { position: relative; }
-  .message-item.streaming .message-content::after {
-    content: '';
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    height: 20px;
-    background: linear-gradient(transparent, var(--assistant-message-bg));
-    pointer-events: none;
-    opacity: 0.5;
+  /* 🔧 移除流式消息的渐变遮罩，它会干扰视觉并增加复杂性 */
+
+  /* 🔧 占位→真实消息过渡动画（符合 message-response-flow-design.md 规范） */
+  .message-item.assistant.was-placeholder {
+    animation: contentFadeIn 0.15s ease-out;
   }
 
-  /* 流式消息占位符：确保卡片在内容加载前有高度 */
-  .streaming-placeholder {
+  @keyframes contentFadeIn {
+    from {
+      opacity: 0.7;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  /* 🔧 完成动画：边框颜色过渡 */
+  .message-item.assistant.just-completed {
+    animation: completeBorderFade 0.3s ease-out;
+  }
+
+  @keyframes completeBorderFade {
+    from {
+      border-color: var(--info);
+    }
+    to {
+      border-color: var(--border);
+    }
+  }
+
+  /* 流式消息底部加载指示器：统一的三个点动画 */
+  .streaming-indicator-bottom {
     display: flex;
     align-items: center;
     gap: 4px;
     padding: var(--space-2) 0;
-    min-height: 24px;
+    margin-top: var(--space-2);
   }
 
   .streaming-dot {
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: var(--foreground-muted);
-    opacity: 0.4;
+    background: var(--info);
+    opacity: 0.6;
     animation: streamingPulse 1.4s ease-in-out infinite;
   }
 
@@ -395,6 +454,30 @@
       opacity: 1;
       transform: scale(1.2);
     }
+  }
+
+  /* ===== 占位消息样式（统一在 assistant 卡片内） ===== */
+  .message-item.assistant.placeholder {
+    border-left: 3px solid var(--info);
+  }
+
+  .placeholder-status {
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    font-style: italic;
+  }
+
+  .placeholder-content {
+    min-height: 48px;
+    display: flex;
+    align-items: center;
+    padding: var(--space-3) 0;
+  }
+
+  /* 占位消息的加载指示器：居左显示，无上边距 */
+  .placeholder-content .streaming-indicator-bottom {
+    margin-top: 0;
+    padding: var(--space-2) 0;
   }
 
   /* ===== 用户消息图片缩略图 ===== */
@@ -441,6 +524,11 @@
     justify-content: center;
     z-index: 9999;
     cursor: pointer;
+    border: none;
+    padding: 0;
+    margin: 0;
+    width: 100vw;
+    height: 100vh;
   }
 
   .image-preview-content {
@@ -448,6 +536,7 @@
     max-width: 90vw;
     max-height: 90vh;
     cursor: default;
+    pointer-events: none;
   }
 
   .image-preview-close {
@@ -458,18 +547,12 @@
     border: none;
     color: white;
     font-size: 32px;
-    cursor: pointer;
     width: 40px;
     height: 40px;
     display: flex;
     align-items: center;
     justify-content: center;
     opacity: 0.8;
-    transition: opacity 0.2s;
-  }
-
-  .image-preview-close:hover {
-    opacity: 1;
   }
 
   .image-preview-img {
@@ -477,5 +560,6 @@
     max-height: 85vh;
     border-radius: 4px;
     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+    pointer-events: auto;
   }
 </style>

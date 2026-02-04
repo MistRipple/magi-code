@@ -126,17 +126,22 @@ function createMockMission(options?: {
     for (let j = 0; j < todoCount; j++) {
       todos.push({
         id: `todo-${i}-${j}`,
+        missionId: id,
         assignmentId: `assign-${i}`,
         content: `任务 ${j + 1}`,
         reasoning: '测试',
         expectedOutput: '完成',
         type: 'implementation',
+        workerId: worker,
         priority: j + 1,
         outOfScope: false,
         dependsOn: [],
         requiredContracts: [],
         producesContracts: [],
         status: j === 0 ? 'completed' : 'pending',
+        progress: j === 0 ? 100 : 0,
+        retryCount: 0,
+        maxRetries: 3,
         createdAt: Date.now(),
       });
     }

@@ -35,4 +35,44 @@ export class CategoryResolver {
 
     return CATEGORY_RULES.defaultCategory;
   }
+
+  /**
+   * 解析所有匹配的分类（用于多 Worker 协作场景）
+   */
+  resolveAllFromText(text: string): string[] {
+    const normalized = text.toLowerCase();
+    const matchedCategories: string[] = [];
+
+    for (const category of CATEGORY_RULES.categoryPriority) {
+      const definition = CATEGORY_DEFINITIONS[category];
+      if (!definition || !definition.keywords || definition.keywords.length === 0) {
+        continue;
+      }
+
+      for (const pattern of definition.keywords) {
+        let matched = false;
+        try {
+          const regex = new RegExp(pattern, 'i');
+          if (regex.test(normalized)) {
+            matched = true;
+          }
+        } catch {
+          if (normalized.includes(pattern.toLowerCase())) {
+            matched = true;
+          }
+        }
+        if (matched && !matchedCategories.includes(category)) {
+          matchedCategories.push(category);
+          break; // 已匹配此分类，继续下一个分类
+        }
+      }
+    }
+
+    // 如果没有匹配任何分类，返回默认分类
+    if (matchedCategories.length === 0) {
+      return [CATEGORY_RULES.defaultCategory];
+    }
+
+    return matchedCategories;
+  }
 }

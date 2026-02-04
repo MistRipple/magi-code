@@ -9,6 +9,8 @@ import { StateManagementEngineer } from './engineers/state-management-engineer';
 import { MessageRoutingEngineer } from './engineers/message-routing-engineer';
 import { UIInteractionEngineer } from './engineers/ui-interaction-engineer';
 import { EndToEndEngineer } from './engineers/end-to-end-engineer';
+import { IntentClassificationE2EEngineer } from './engineers/intent-classification-e2e';
+import { MessageHubE2EEngineer } from './engineers/message-hub-e2e-engineer';
 
 async function main() {
   console.log('========================================');
@@ -24,6 +26,8 @@ async function main() {
   commandCenter.registerEngineer(new MessageRoutingEngineer());
   commandCenter.registerEngineer(new UIInteractionEngineer());
   commandCenter.registerEngineer(new EndToEndEngineer());
+  commandCenter.registerEngineer(new IntentClassificationE2EEngineer());
+  commandCenter.registerEngineer(new MessageHubE2EEngineer());
   
   // 执行所有测试
   await commandCenter.runAllTests();

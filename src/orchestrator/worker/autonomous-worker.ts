@@ -16,7 +16,7 @@ import { AdapterOutputScope } from '../../adapters/adapter-factory-interface';
 import { TokenUsage } from '../../types/agent-types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
-import { TodoPlanner, PlanningContext, PlanningResult } from './todo-planner';
+import { TodoManager, UnifiedTodo, TodoPlanningContext, TodoPlanningResult, TodoOutput } from '../../todo';
 import {
   ProfileAwareRecoveryHandler,
   RecoveryDecision,
@@ -24,9 +24,6 @@ import {
 } from '../recovery/profile-aware-recovery-handler';
 import {
   Assignment,
-  WorkerTodo,
-  TodoOutput,
-  TodoStatus,
 } from '../mission/types';
 import {
   WorkerReport,
@@ -82,11 +79,11 @@ export interface TodoExecuteOptions {
 export interface AutonomousExecutionResult {
   assignment: Assignment;
   success: boolean;
-  completedTodos: WorkerTodo[];
-  failedTodos: WorkerTodo[];
-  skippedTodos: WorkerTodo[];
-  dynamicTodos: WorkerTodo[];
-  recoveredTodos: WorkerTodo[];
+  completedTodos: UnifiedTodo[];
+  failedTodos: UnifiedTodo[];
+  skippedTodos: UnifiedTodo[];
+  dynamicTodos: UnifiedTodo[];
+  recoveredTodos: UnifiedTodo[];
   totalDuration: number;
   errors: string[];
   recoveryAttempts: number;
@@ -100,7 +97,7 @@ export interface AutonomousExecutionResult {
  * AutonomousWorker - 自主 Worker
  */
 export class AutonomousWorker extends EventEmitter {
-  private todoPlanner: TodoPlanner;
+  private todoManager: TodoManager;
   private recoveryHandler: ProfileAwareRecoveryHandler;
   private retryCountMap: Map<string, number> = new Map();
   /** Session 管理器 - 提案 4.1 */
@@ -112,10 +109,11 @@ export class AutonomousWorker extends EventEmitter {
     private workerType: WorkerSlot,
     private profileLoader: ProfileLoader,
     private guidanceInjector: GuidanceInjector,
+    todoManager: TodoManager,
     sessionManager?: WorkerSessionManager
   ) {
     super();
-    this.todoPlanner = new TodoPlanner(profileLoader, guidanceInjector);
+    this.todoManager = todoManager;
     this.recoveryHandler = new ProfileAwareRecoveryHandler(profileLoader);
     this.sessionManager = sessionManager || new WorkerSessionManager({ autoCleanup: true });
   }
@@ -136,19 +134,21 @@ export class AutonomousWorker extends EventEmitter {
       projectContext?: string;
       contextSnapshot?: string;
     }
-  ): Promise<PlanningResult> {
-    const context: PlanningContext = {
+  ): Promise<TodoPlanningResult> {
+    const context: TodoPlanningContext = {
+      missionId: assignment.missionId,
+      assignmentId: assignment.id,
       responsibility: assignment.responsibility,
       scope: assignment.scope,
       availableContracts: [
         ...assignment.producerContracts,
         ...assignment.consumerContracts,
       ],
+      workerId: assignment.workerId,
       projectContext: options?.projectContext,
-      contextSnapshot: options?.contextSnapshot,
     };
 
-    const result = await this.todoPlanner.planTodos(assignment, context);
+    const result = await this.todoManager.planTodos(context);
 
     this.emit('planningCompleted', {
       assignmentId: assignment.id,
@@ -168,10 +168,10 @@ export class AutonomousWorker extends EventEmitter {
     options: TodoExecuteOptions
   ): Promise<AutonomousExecutionResult> {
     const startTime = Date.now();
-    const completedTodos: WorkerTodo[] = [];
-    const failedTodos: WorkerTodo[] = [];
-    const skippedTodos: WorkerTodo[] = [];
-    const dynamicTodos: WorkerTodo[] = [];
+    const completedTodos: UnifiedTodo[] = [];
+    const failedTodos: UnifiedTodo[] = [];
+    const skippedTodos: UnifiedTodo[] = [];
+    const dynamicTodos: UnifiedTodo[] = [];
     const errors: string[] = [];
     // 聚合 Token 使用统计
     let totalTokenUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
@@ -300,7 +300,7 @@ export class AutonomousWorker extends EventEmitter {
               break;
             } else if (orchestratorResponse.action === 'adjust' && orchestratorResponse.adjustment) {
               // 处理调整指令
-              this.handleAdjustment(assignment, orchestratorResponse.adjustment);
+              await this.handleAdjustment(assignment, orchestratorResponse.adjustment);
             }
           }
 
@@ -364,6 +364,7 @@ export class AutonomousWorker extends EventEmitter {
     if (aborted) {
       for (const todo of assignment.todos) {
         if (todo.status === 'pending' && !skippedTodos.includes(todo)) {
+          await this.todoManager.skip(todo.id);
           todo.status = 'skipped';
           todo.blockedReason = abortReason || '被编排者终止';
           skippedTodos.push(todo);
@@ -444,8 +445,8 @@ export class AutonomousWorker extends EventEmitter {
    */
   private async reportProgress(
     assignment: Assignment,
-    completedTodo: WorkerTodo,
-    allCompletedTodos: WorkerTodo[],
+    completedTodo: UnifiedTodo,
+    allCompletedTodos: UnifiedTodo[],
     options: TodoExecuteOptions
   ): Promise<OrchestratorResponse> {
     if (!options.onReport) {
@@ -496,10 +497,10 @@ export class AutonomousWorker extends EventEmitter {
    * 处理编排者的调整指令
    * @private
    */
-  private handleAdjustment(
+  private async handleAdjustment(
     assignment: Assignment,
     adjustment: OrchestratorAdjustment
-  ): void {
+  ): Promise<void> {
     logger.info('Worker.处理调整指令', {
       assignmentId: assignment.id,
       hasNewInstructions: !!adjustment.newInstructions,
@@ -514,6 +515,7 @@ export class AutonomousWorker extends EventEmitter {
           t.status === 'pending' && t.content.includes(stepContent)
         );
         if (todo) {
+          await this.todoManager.skip(todo.id);
           todo.status = 'skipped';
           todo.blockedReason = '编排者跳过';
           logger.debug('Worker.跳过步骤', { todoId: todo.id, content: stepContent }, LogCategory.ORCHESTRATOR);
@@ -524,19 +526,24 @@ export class AutonomousWorker extends EventEmitter {
     // 处理新增步骤
     if (adjustment.addSteps && adjustment.addSteps.length > 0) {
       for (const stepContent of adjustment.addSteps) {
-        const todo: WorkerTodo = {
+        const todo: UnifiedTodo = {
           id: `adj-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+          missionId: assignment.missionId,
           assignmentId: assignment.id,
+          workerId: assignment.workerId,
           content: stepContent,
           reasoning: '编排者添加',
           expectedOutput: '完成任务',
           type: 'implementation',
           priority: 3,
           status: 'pending',
+          progress: 0,
           dependsOn: [],
           requiredContracts: [],
           producesContracts: [],
           outOfScope: false,
+          retryCount: 0,
+          maxRetries: 3,
           createdAt: Date.now(),
         };
         assignment.todos.push(todo);
@@ -578,14 +585,14 @@ export class AutonomousWorker extends EventEmitter {
    * 执行单个 Todo
    */
   async executeTodo(
-    todo: WorkerTodo,
+    todo: UnifiedTodo,
     assignment: Assignment,
     options: TodoExecuteOptions
   ): Promise<{
     success: boolean;
-    todo: WorkerTodo;
+    todo: UnifiedTodo;
     error?: string;
-    dynamicTodos?: WorkerTodo[];
+    dynamicTodos?: UnifiedTodo[];
     tokenUsage?: TokenUsage;
   }> {
     const startTime = Date.now();
@@ -599,8 +606,11 @@ export class AutonomousWorker extends EventEmitter {
       };
     }
 
-    // 更新状态
-    todo.status = 'in_progress';
+    // 更新状态 - 使用 TodoManager
+    await this.todoManager.prepareForExecution(todo.id);
+    await this.todoManager.start(todo.id);
+    // 同步本地对象状态
+    todo.status = 'running';
     todo.startedAt = Date.now();
 
     this.emit('todoStarted', {
@@ -629,15 +639,18 @@ export class AutonomousWorker extends EventEmitter {
         options
       );
 
-      // 更新 Todo 状态
-      todo.status = 'completed';
-      todo.completedAt = Date.now();
-      todo.output = {
+      // 更新 Todo 状态 - 使用 TodoManager
+      const todoOutput: TodoOutput = {
         success: true,
         summary: output.summary,
         modifiedFiles: output.modifiedFiles || [],
         duration: Date.now() - startTime,
       };
+      await this.todoManager.complete(todo.id, todoOutput);
+      // 同步本地对象状态
+      todo.status = 'completed';
+      todo.completedAt = Date.now();
+      todo.output = todoOutput;
 
       this.emit('todoCompleted', {
         assignmentId: assignment.id,
@@ -654,6 +667,9 @@ export class AutonomousWorker extends EventEmitter {
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
 
+      // 使用 TodoManager 标记失败
+      await this.todoManager.fail(todo.id, errorMessage);
+      // 同步本地对象状态
       todo.status = 'failed';
       todo.completedAt = Date.now();
       todo.output = {
@@ -682,7 +698,7 @@ export class AutonomousWorker extends EventEmitter {
    * 构建执行 Prompt
    */
   private buildExecutionPrompt(
-    todo: WorkerTodo,
+    todo: UnifiedTodo,
     assignment: Assignment,
     projectContext?: string
   ): string {
@@ -738,7 +754,7 @@ export class AutonomousWorker extends EventEmitter {
    * 通过 AdapterFactory 发送消息到 LLM API
    */
   private async executeWithWorker(
-    todo: WorkerTodo,
+    todo: UnifiedTodo,
     assignment: Assignment,
     executionPrompt: string,
     selfCheckGuidance: string,
@@ -746,7 +762,7 @@ export class AutonomousWorker extends EventEmitter {
   ): Promise<{
     summary: string;
     modifiedFiles?: string[];
-    dynamicTodos?: WorkerTodo[];
+    dynamicTodos?: UnifiedTodo[];
     tokenUsage?: TokenUsage;
   }> {
     // 必须提供 adapterFactory
@@ -777,7 +793,7 @@ export class AutonomousWorker extends EventEmitter {
       // 解析响应
       const summary = response.content || response.error || '执行完成';
       const modifiedFiles = this.extractModifiedFiles(response.content || '');
-      const dynamicTodos = this.extractDynamicTodos(response.content || '', assignment.id);
+      const dynamicTodos = this.extractDynamicTodos(response.content || '', assignment);
 
       // 调用输出回调
       if (options.onOutput && response.content) {
@@ -831,10 +847,10 @@ export class AutonomousWorker extends EventEmitter {
   /**
    * 从输出中提取动态 Todo
    */
-  private extractDynamicTodos(output: string, assignmentId: string): WorkerTodo[] {
+  private extractDynamicTodos(output: string, assignment: Assignment): UnifiedTodo[] {
     // 检测输出中是否有需要动态添加的任务
     // 这是一个简化实现，实际可能需要更复杂的解析
-    const todos: WorkerTodo[] = [];
+    const todos: UnifiedTodo[] = [];
 
     // 匹配 "TODO:" 或 "需要额外处理:" 等模式
     const todoPattern = /(?:TODO|需要额外处理|Additional task)[：:]?\s*(.+)/gi;
@@ -846,18 +862,23 @@ export class AutonomousWorker extends EventEmitter {
         // 创建动态 Todo（需要审批）
         todos.push({
           id: `dynamic-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
-          assignmentId,
+          missionId: assignment.missionId,
+          assignmentId: assignment.id,
+          workerId: assignment.workerId,
           content,
           reasoning: '执行过程中发现的额外任务',
           expectedOutput: '完成额外任务',
           type: 'implementation',
           priority: 3, // 中等优先级
           status: 'pending',
+          progress: 0,
           dependsOn: [],
           requiredContracts: [],
           producesContracts: [],
           outOfScope: true,
           approvalStatus: 'pending',
+          retryCount: 0,
+          maxRetries: 3,
           createdAt: Date.now(),
         });
       }
@@ -886,7 +907,7 @@ export class AutonomousWorker extends EventEmitter {
   /**
    * 获取下一个可执行的 Todo
    */
-  private getNextExecutableTodo(assignment: Assignment): WorkerTodo | null {
+  private getNextExecutableTodo(assignment: Assignment): UnifiedTodo | null {
     for (const todo of assignment.todos) {
       if (todo.status !== 'pending') continue;
 
@@ -910,7 +931,7 @@ export class AutonomousWorker extends EventEmitter {
   /**
    * 获取依赖于指定 Todo 的所有 Todo
    */
-  private getDependentTodos(todo: WorkerTodo, assignment: Assignment): WorkerTodo[] {
+  private getDependentTodos(todo: UnifiedTodo, assignment: Assignment): UnifiedTodo[] {
     return assignment.todos.filter(t =>
       t.dependsOn.includes(todo.id) && t.status === 'pending'
     );
@@ -919,17 +940,19 @@ export class AutonomousWorker extends EventEmitter {
   /**
    * 动态添加 Todo
    */
-  addDynamicTodo(
+  async addDynamicTodo(
     assignment: Assignment,
     content: string,
     reasoning: string,
-    type: WorkerTodo['type']
-  ): WorkerTodo {
-    const todo = this.todoPlanner.addDynamicTodo(assignment, {
+    type: UnifiedTodo['type']
+  ): Promise<UnifiedTodo> {
+    const todo = await this.todoManager.create({
+      missionId: assignment.missionId,
       assignmentId: assignment.id,
       content,
       reasoning,
       type,
+      workerId: assignment.workerId,
     });
 
     this.emit('dynamicTodoAdded', {
@@ -943,7 +966,7 @@ export class AutonomousWorker extends EventEmitter {
   /**
    * 请求审批超范围 Todo
    */
-  requestApproval(todo: WorkerTodo, reason: string): void {
+  requestApproval(todo: UnifiedTodo, reason: string): void {
     this.emit('approvalRequested', {
       todoId: todo.id,
       content: todo.content,
@@ -954,7 +977,7 @@ export class AutonomousWorker extends EventEmitter {
   /**
    * 批准超范围 Todo
    */
-  approveTodo(todo: WorkerTodo, note?: string): void {
+  approveTodo(todo: UnifiedTodo, note?: string): void {
     todo.approvalStatus = 'approved';
     todo.approvalNote = note;
 
@@ -967,9 +990,10 @@ export class AutonomousWorker extends EventEmitter {
   /**
    * 拒绝超范围 Todo
    */
-  rejectTodo(todo: WorkerTodo, reason: string): void {
+  async rejectTodo(todo: UnifiedTodo, reason: string): Promise<void> {
     todo.approvalStatus = 'rejected';
     todo.approvalNote = reason;
+    await this.todoManager.skip(todo.id);
     todo.status = 'skipped';
 
     this.emit('todoRejected', {
@@ -984,7 +1008,7 @@ export class AutonomousWorker extends EventEmitter {
    * 基于 ProfileAwareRecoveryHandler 分析失败原因并决定恢复策略
    */
   async planRecovery(
-    todo: WorkerTodo,
+    todo: UnifiedTodo,
     assignment: Assignment,
     output: TodoOutput
   ): Promise<RecoveryDecision> {
@@ -1024,12 +1048,12 @@ export class AutonomousWorker extends EventEmitter {
    */
   async executeRecovery(
     decision: RecoveryDecision,
-    todo: WorkerTodo,
+    todo: UnifiedTodo,
     assignment: Assignment,
     options: TodoExecuteOptions
   ): Promise<{
     success: boolean;
-    recoveredTodo?: WorkerTodo;
+    recoveredTodo?: UnifiedTodo;
     newAssignment?: Assignment;
   }> {
     this.emit('recoveryStarted', {
@@ -1120,11 +1144,11 @@ export class AutonomousWorker extends EventEmitter {
     maxRecoveryAttempts: number = 3
   ): Promise<AutonomousExecutionResult> {
     const startTime = Date.now();
-    const completedTodos: WorkerTodo[] = [];
-    const failedTodos: WorkerTodo[] = [];
-    const skippedTodos: WorkerTodo[] = [];
-    const dynamicTodos: WorkerTodo[] = [];
-    const recoveredTodos: WorkerTodo[] = [];
+    const completedTodos: UnifiedTodo[] = [];
+    const failedTodos: UnifiedTodo[] = [];
+    const skippedTodos: UnifiedTodo[] = [];
+    const dynamicTodos: UnifiedTodo[] = [];
+    const recoveredTodos: UnifiedTodo[] = [];
     const errors: string[] = [];
     let recoveryAttempts = 0;
 
@@ -1218,7 +1242,7 @@ export class AutonomousWorker extends EventEmitter {
    * 获取失败分析
    */
   getFailureAnalysis(
-    todo: WorkerTodo,
+    todo: UnifiedTodo,
     assignment: Assignment,
     output: TodoOutput
   ): FailureAnalysis {

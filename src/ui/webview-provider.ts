@@ -784,9 +784,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     placeholderMessageId: string;
   } {
     const traceId = this.messageHub.getTraceId();
-    const displayContent = imageCount > 0
-      ? `${prompt}${prompt ? '\n' : ''}[附件: ${imageCount} 张图片]`
-      : prompt;
+    // 🔧 图片已通过缩略图展示，不再在文本中附加 [附件: X 张图片]
+    const displayContent = prompt;
 
     const userMessage = createTextMessage(displayContent, 'orchestrator', 'orchestrator', traceId, {
       metadata: {
@@ -1157,14 +1156,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /** 处理用户澄清回答 */
-  private handleClarificationAnswer(answers: Record<string, string> | null, additionalInfo?: string): void {
+  private handleClarificationAnswer(answers: Record<string, string> | null, additionalInfo?: string, autoSkipped = false): void {
     if (this.pendingClarification) {
       if (answers && Object.keys(answers).length > 0) {
         this.pendingClarification.resolve({ answers, additionalInfo });
         this.sendToast('已提交澄清信息，继续分析...', 'success');
       } else {
         this.pendingClarification.resolve(null);
-        this.sendToast('已跳过澄清，使用原始需求...', 'info');
+        // auto 模式下静默跳过，不显示 toast
+        if (!autoSkipped) {
+          this.sendToast('已跳过澄清，使用原始需求...', 'info');
+        }
       }
       this.pendingClarification = null;
     }
@@ -1966,7 +1968,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         // 用户回答澄清问题
         this.handleClarificationAnswer(
           (message as any).answers ?? null,
-          (message as any).additionalInfo
+          (message as any).additionalInfo,
+          (message as any).autoSkipped ?? false
         );
         break;
 
@@ -4762,9 +4765,17 @@ ${originalPrompt}
     try {
       this.messageHub.setRequestContext(requestKey);
 
-      if (prompt.length > maxPromptLength) {
-        this.sendToast(`输入内容过长（${prompt.length} 字符），请控制在 ${maxPromptLength} 字符以内`, 'warning');
-        rejectRequest(`输入内容过长（${prompt.length} 字符）`);
+      // 📝 长度验证逻辑：
+      // - 普通用户输入：验证 prompt 长度（防止粘贴过长内容）
+      // - Skill 调用：displayPrompt 存在且与 prompt 不同时，只验证 displayPrompt 长度
+      //   （Skill 指令内容由系统生成，可能很长，不应受用户输入限制）
+      const isSkillInvocation = displayPrompt && displayPrompt !== prompt;
+      const lengthToValidate = isSkillInvocation ? displayPrompt.length : prompt.length;
+
+      if (lengthToValidate > maxPromptLength) {
+        const displayLength = isSkillInvocation ? displayPrompt.length : prompt.length;
+        this.sendToast(`输入内容过长（${displayLength} 字符），请控制在 ${maxPromptLength} 字符以内`, 'warning');
+        rejectRequest(`输入内容过长（${displayLength} 字符）`);
         return;
       }
 
@@ -4881,6 +4892,21 @@ ${originalPrompt}
           dataCount: stats.dataCount,
           statsMissing: !requestStats,
         }, LogCategory.UI);
+
+        // 🔧 硬性校验：禁止 data-only 流程，必须有有效 assistantContent
+        if (!rejected && stats.assistantContent <= 0) {
+          success = false;
+          failureReason = '未收到模型输出内容';
+          const traceId = this.messageHub.getTraceId();
+          const errorMessage = createErrorMessage(
+            failureReason,
+            'orchestrator',
+            'orchestrator',
+            traceId,
+            { metadata: { requestId: requestKey } }
+          );
+          this.messageHub.sendMessage(errorMessage);
+        }
       }
       if (started) {
         if (success) {

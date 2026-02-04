@@ -36,7 +36,7 @@ export type SubTaskViewStatus = 'pending' | 'planning' | 'running' | 'blocked' |
 /**
  * UI Todo 状态
  */
-export type TodoViewStatus = 'pending' | 'blocked' | 'running' | 'completed' | 'failed' | 'skipped';
+export type TodoViewStatus = 'pending' | 'blocked' | 'ready' | 'running' | 'completed' | 'failed' | 'skipped';
 
 /**
  * TaskView - UI 任务视图
@@ -243,7 +243,8 @@ export class MissionStateMapper {
     const statusMap: Record<TodoStatus, TodoViewStatus> = {
       'pending': 'pending',
       'blocked': 'blocked',
-      'in_progress': 'running',
+      'ready': 'ready',
+      'running': 'running',
       'completed': 'completed',
       'failed': 'failed',
       'skipped': 'skipped',
@@ -307,8 +308,8 @@ export class MissionStateMapper {
     }
 
     if (assignment.status === 'executing') {
-      const inProgressTodo = assignment.todos.find(t => t.status === 'in_progress');
-      return inProgressTodo?.content || `进行中 (${completedCount}/${totalCount})`;
+      const runningTodo = assignment.todos.find(t => t.status === 'running');
+      return runningTodo?.content || `进行中 (${completedCount}/${totalCount})`;
     }
 
     return `${completedCount}/${totalCount} 个任务`;

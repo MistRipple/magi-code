@@ -33,6 +33,8 @@
   background: var(--msg-orchestrator-bg);
   border: 1px solid var(--msg-orchestrator-border);
   animation: messageEnter var(--duration-fast) var(--ease-out);
+  /* 🔧 根源修复：禁止 Flex 容器压缩消息卡片高度，确保卡片始终包裹内容 */
+  flex-shrink: 0;
 }
 
 @keyframes messageEnter {
@@ -80,13 +82,14 @@
 /* 流式输出时的轻量动效 */
 .message-item.assistant.streaming {
   position: relative;
-  overflow: hidden;
 }
 
 .message-item.assistant.streaming::after {
   content: '';
   position: absolute;
   inset: 0;
+  /* 🔧 手动应用圆角以防止动画溢出 */
+  border-radius: var(--radius-lg);
   background: linear-gradient(90deg, transparent, var(--stream-accent, var(--color-orchestrator)), transparent);
   opacity: 0.08;
   transform: translateX(-100%);

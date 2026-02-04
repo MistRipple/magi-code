@@ -20,6 +20,21 @@ export interface MCPToolInfo {
 }
 
 /**
+ * MCP Prompt 信息（提示词模板）
+ */
+export interface MCPPromptInfo {
+  name: string;
+  description: string;
+  arguments?: Array<{
+    name: string;
+    description?: string;
+    required?: boolean;
+  }>;
+  serverId: string;
+  serverName: string;
+}
+
+/**
  * MCP 服务器连接状态
  */
 export interface MCPServerStatus {
@@ -36,6 +51,7 @@ export interface MCPServerStatus {
 export class MCPManager {
   private clients: Map<string, Client> = new Map();
   private tools: Map<string, MCPToolInfo[]> = new Map();
+  private prompts: Map<string, MCPPromptInfo[]> = new Map();
 
   private static readonly DEFAULT_CONNECT_TIMEOUT_MS = Number(
     process.env.MCP_CONNECT_TIMEOUT_MS || 15000,
@@ -127,14 +143,39 @@ export class MCPManager {
         serverName: config.name,
       }));
 
-      // 保存客户端和工具列表
+      // 获取 Prompts 列表（MCP 协议支持的提示词模板）
+      let prompts: MCPPromptInfo[] = [];
+      try {
+        const promptsResponse = await this.withTimeout(
+          client.listPrompts(),
+          MCPManager.DEFAULT_LIST_TOOLS_TIMEOUT_MS,
+          `MCP listPrompts timed out after ${MCPManager.DEFAULT_LIST_TOOLS_TIMEOUT_MS}ms`,
+        );
+        prompts = (promptsResponse.prompts || []).map((prompt: any) => ({
+          name: prompt.name,
+          description: prompt.description || '',
+          arguments: prompt.arguments || [],
+          serverId: config.id,
+          serverName: config.name,
+        }));
+      } catch (error: any) {
+        // 某些 MCP 服务器可能不支持 Prompts，忽略错误
+        logger.debug('MCP server does not support prompts or listPrompts failed', {
+          id: config.id,
+          error: error.message,
+        }, LogCategory.TOOLS);
+      }
+
+      // 保存客户端、工具列表和 Prompts
       this.clients.set(config.id, client);
       this.tools.set(config.id, tools);
+      this.prompts.set(config.id, prompts);
 
       logger.info('MCP server connected', {
         id: config.id,
         name: config.name,
         toolCount: tools.length,
+        promptCount: prompts.length,
       }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to connect MCP server', {
@@ -156,6 +197,7 @@ export class MCPManager {
         await client.close();
         this.clients.delete(serverId);
         this.tools.delete(serverId);
+        this.prompts.delete(serverId);
         logger.info('MCP server disconnected', { id: serverId }, LogCategory.TOOLS);
       } catch (error: any) {
         logger.error('Failed to disconnect MCP server', {
@@ -182,6 +224,24 @@ export class MCPManager {
       allTools.push(...tools);
     }
     return allTools;
+  }
+
+  /**
+   * 获取服务器的 Prompts 列表
+   */
+  getServerPrompts(serverId: string): MCPPromptInfo[] {
+    return this.prompts.get(serverId) || [];
+  }
+
+  /**
+   * 获取所有 Prompts 列表
+   */
+  getAllPrompts(): MCPPromptInfo[] {
+    const allPrompts: MCPPromptInfo[] = [];
+    for (const prompts of this.prompts.values()) {
+      allPrompts.push(...prompts);
+    }
+    return allPrompts;
   }
 
   /**

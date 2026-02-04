@@ -139,6 +139,7 @@ export class MissionDrivenEngine extends EventEmitter {
   private lastRoutingDecision: {
     needsWorker: boolean;
     category?: string;
+    categories?: string[];
     delegationBriefings?: string[];
     needsTooling?: boolean;
     requiresModification?: boolean;
@@ -864,7 +865,7 @@ export class MissionDrivenEngine extends EventEmitter {
                 contentLength: decision.directResponse.length,
                 contentPreview: decision.directResponse.substring(0, 100),
               }, LogCategory.ORCHESTRATOR);
-              this.messageHub.orchestratorMessage(decision.directResponse, {
+              this.messageHub.result(decision.directResponse, {
                 metadata: { intent: 'ask', decision: 'llm' },
               });
               this.setState('idle');
@@ -916,7 +917,7 @@ export class MissionDrivenEngine extends EventEmitter {
                 contentLength: decision.directResponse.length,
                 contentPreview: decision.directResponse.substring(0, 100),
               }, LogCategory.ORCHESTRATOR);
-              this.messageHub.orchestratorMessage(decision.directResponse, {
+              this.messageHub.result(decision.directResponse, {
                 metadata: { intent: 'ask', decision: 'llm' },
               });
               this.setState('idle');
@@ -1540,25 +1541,37 @@ export class MissionDrivenEngine extends EventEmitter {
    * 使用 LLM 规划协作
    */
   private async planCollaborationWithLLM(mission: Mission, _sessionId: string): Promise<void> {
-    if (!this.lastRoutingDecision?.category) {
+    if (!this.lastRoutingDecision?.category && !this.lastRoutingDecision?.categories?.length) {
       throw new Error('编排器路由决策缺失：未解析分类');
     }
     this.lastTaskAnalysis = {
       explicitWorkers: [],
     };
 
-    // 选择参与者（完全由分类归属决定）
+    // 选择参与者（使用多分类以支持多 Worker 协作）
+    const categories = this.lastRoutingDecision.categories ||
+      (this.lastRoutingDecision.category ? [this.lastRoutingDecision.category] : []);
+
     const participants = await this.missionOrchestrator.selectParticipants(mission, {
-      category: this.lastRoutingDecision.category,
+      categories,
     });
     this.lastTaskAnalysis.explicitWorkers = participants;
+
+    // 为每个 Worker 构建其分类映射
+    const routingCategories: Record<string, string> = {};
+    for (const category of categories) {
+      const worker = this.profileLoader.getWorkerForCategory(category);
+      if (worker && !routingCategories[worker]) {
+        routingCategories[worker] = category;
+      }
+    }
 
     // 定义契约
     await this.missionOrchestrator.defineContracts(mission, participants);
 
-    // 分配职责（传递 AI 生成的委托说明）
+    // 分配职责（传递 AI 生成的委托说明和每个 Worker 的分类）
     await this.missionOrchestrator.assignResponsibilities(mission, participants, {
-      routingCategory: this.lastRoutingDecision?.category,
+      routingCategories,
       routingReason: this.lastRoutingDecision?.reason,
       requiresModification: this.lastRoutingDecision?.requiresModification,
       delegationBriefings: this.lastRoutingDecision?.delegationBriefings,
@@ -1720,6 +1733,7 @@ export class MissionDrivenEngine extends EventEmitter {
   ): Promise<{
     needsWorker: boolean;
     category?: string;
+    categories?: string[];
     delegationBriefings?: string[];
     needsTooling?: boolean;
     requiresModification?: boolean;
@@ -1786,13 +1800,16 @@ export class MissionDrivenEngine extends EventEmitter {
             continue;
           }
 
-          const resolvedCategory = needsWorker
-            ? this.categoryResolver.resolveFromText(userPrompt)
+          // 使用多分类解析以支持多 Worker 协作
+          const resolvedCategories = needsWorker
+            ? this.categoryResolver.resolveAllFromText(userPrompt)
             : undefined;
+          const resolvedCategory = resolvedCategories?.[0];
 
           return {
             needsWorker,
             category: resolvedCategory,
+            categories: resolvedCategories,
             delegationBriefings: delegationBriefings.length > 0 ? delegationBriefings : undefined,
             needsTooling: Boolean(parsed.needsTooling),
             requiresModification,

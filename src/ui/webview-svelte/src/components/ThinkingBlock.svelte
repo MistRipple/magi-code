@@ -16,8 +16,16 @@
     initialExpanded
   }: Props = $props();
 
-  // 折叠状态 - 仅使用初始值，之后由用户手动控制
+  // 🔧 折叠状态：流式期间自动展开，完成后根据 initialExpanded 决定
+  // 使用 $effect 监听 isStreaming 变化，实现动态展开/折叠
   let collapsed = $state(untrack(() => isStreaming ? false : (initialExpanded !== undefined ? !initialExpanded : true)));
+
+  // 🔧 当流式开始时自动展开面板
+  $effect(() => {
+    if (isStreaming && collapsed) {
+      collapsed = false;
+    }
+  });
 
   // 提取思考内容
   const thinkingContent = $derived(

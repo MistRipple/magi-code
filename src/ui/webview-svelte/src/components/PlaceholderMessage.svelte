@@ -2,6 +2,7 @@
   import type { PlaceholderState } from '../types/message';
   import type { IconName } from '../lib/icons';
   import WorkerBadge from './WorkerBadge.svelte';
+  import StreamingIndicator from './StreamingIndicator.svelte';
   import Icon from './Icon.svelte';
 
   interface Props {
@@ -9,6 +10,7 @@
   }
   let { state }: Props = $props();
 
+  // 状态配置（符合 message-response-flow-design.md 规范）
   const stateConfig: Record<PlaceholderState, { text: string; icon: IconName }> = {
     pending: {
       text: '正在准备...',
@@ -22,10 +24,6 @@
       text: '正在思考...',
       icon: 'brain',
     },
-    connecting: {
-      text: '连接模型中...',
-      icon: 'globe',
-    },
   };
 
   const config = $derived(stateConfig[state] || stateConfig.pending);
@@ -35,17 +33,16 @@
   <div class="placeholder-header">
     <WorkerBadge worker="orchestrator" size="sm" />
     <div class="placeholder-status">
-      <span class="status-icon" class:spinning={state === 'pending' || state === 'connecting'}>
+      <span class="status-icon" class:spinning={state === 'pending'}>
         <Icon name={config.icon} size={14} />
       </span>
       <span class="status-text">{config.text}</span>
     </div>
   </div>
 
-  <div class="placeholder-dots">
-    <span class="dot"></span>
-    <span class="dot"></span>
-    <span class="dot"></span>
+  <!-- 复用 StreamingIndicator 组件，统一跳动点样式 -->
+  <div class="placeholder-indicator">
+    <StreamingIndicator />
   </div>
 </div>
 
@@ -56,11 +53,12 @@
     background: var(--assistant-message-bg);
     border: 1px solid var(--border);
     border-left: 3px solid var(--color-orchestrator, var(--primary));
-    animation: placeholderEnter 0.25s ease-out;
+    animation: fadeSlideIn 0.2s ease-out;
     margin-right: var(--space-2);
   }
 
-  @keyframes placeholderEnter {
+  /* 动画名称统一为 fadeSlideIn（符合设计文档） */
+  @keyframes fadeSlideIn {
     from {
       opacity: 0;
       transform: translateY(8px);
@@ -108,34 +106,9 @@
     50% { opacity: 1; }
   }
 
-  /* Loading dots styles (for pending/connecting states) */
-  .placeholder-dots {
-    display: flex;
-    gap: 4px;
+  /* StreamingIndicator 容器样式 */
+  .placeholder-indicator {
     padding: var(--space-2) 0;
-  }
-
-  .dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--info);
-    animation: dotBounce 1.4s ease-in-out infinite;
-  }
-
-  .dot:nth-child(1) { animation-delay: 0s; }
-  .dot:nth-child(2) { animation-delay: 0.2s; }
-  .dot:nth-child(3) { animation-delay: 0.4s; }
-
-  @keyframes dotBounce {
-    0%, 80%, 100% {
-      transform: translateY(0);
-      opacity: 0.4;
-    }
-    40% {
-      transform: translateY(-6px);
-      opacity: 1;
-    }
   }
 
   /* State-specific border colors */
@@ -149,11 +122,7 @@
 
   .placeholder-message[data-state="thinking"] {
     border-left-color: var(--primary);
-    animation: placeholderEnter 0.25s ease-out, thinkingPulse 2s ease-in-out infinite;
-  }
-
-  .placeholder-message[data-state="connecting"] {
-    border-left-color: var(--warning);
+    animation: fadeSlideIn 0.2s ease-out, thinkingPulse 2s ease-in-out infinite;
   }
 
   @keyframes thinkingPulse {

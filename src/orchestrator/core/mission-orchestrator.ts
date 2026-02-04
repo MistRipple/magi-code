@@ -46,6 +46,7 @@ import {
 } from '../mission';
 import { AutonomousWorker, AutonomousExecutionResult } from '../worker';
 import { PlanTodoManager } from '../plan-todo';
+import { TodoManager } from '../../todo';
 import type { ReportCallback } from '../protocols/worker-report';
 import {
   ExecutionCoordinator,
@@ -231,6 +232,7 @@ export class MissionOrchestrator extends EventEmitter {
   // 执行相关属性（从 MissionExecutor 合并）
   private workers: Map<WorkerSlot, AutonomousWorker> = new Map();
   private todoManager?: PlanTodoManager;
+  private unifiedTodoManager?: TodoManager;
   private currentMissionId: string | null = null;
   private taskManager?: import('../../task/unified-task-manager').UnifiedTaskManager;
 
@@ -614,6 +616,11 @@ export class MissionOrchestrator extends EventEmitter {
         ? [options.category]
         : [];
 
+    logger.info('编排器.选择参与者.分类', {
+      categories,
+      connectedWorkers: Array.from(connectedWorkers)
+    }, LogCategory.ORCHESTRATOR);
+
     if (categories.length === 0) {
       throw new Error('缺少任务分类，无法选择参与者');
     }
@@ -630,6 +637,12 @@ export class MissionOrchestrator extends EventEmitter {
     }
 
     const uniqueParticipants = Array.from(new Set(participants));
+
+    logger.info('编排器.选择参与者.结果', {
+      uniqueParticipants,
+      rawParticipants: participants
+    }, LogCategory.ORCHESTRATOR);
+
     if (uniqueParticipants.length === 0) {
       throw new Error('未能选择到任何可用 Worker');
     }
@@ -694,6 +707,7 @@ export class MissionOrchestrator extends EventEmitter {
     participants: WorkerSlot[],
     options?: {
       routingCategory?: string;
+      routingCategories?: Record<string, string>;
       routingReason?: string;
       requiresModification?: boolean;
       delegationBriefings?: string[];
@@ -711,6 +725,7 @@ export class MissionOrchestrator extends EventEmitter {
         taskInfo,
         additionalContext,
         routingCategory: options?.routingCategory,
+        routingCategories: options?.routingCategories,
         routingReason: options?.routingReason,
         requiresModification: options?.requiresModification,
         delegationBriefings: options?.delegationBriefings,
@@ -1615,10 +1630,18 @@ export class MissionOrchestrator extends EventEmitter {
       if (!this.adapterFactory) {
         throw new Error(`未配置 AdapterFactory，无法创建 Worker: ${workerSlot}`);
       }
+      // 确保 TodoManager 存在
+      if (!this.unifiedTodoManager && this.workspaceRoot) {
+        this.unifiedTodoManager = new TodoManager(this.workspaceRoot);
+      }
+      if (!this.unifiedTodoManager) {
+        throw new Error('未配置 TodoManager，无法创建 Worker');
+      }
       worker = new AutonomousWorker(
         workerSlot,
         this.profileLoader,
-        this.guidanceInjector
+        this.guidanceInjector,
+        this.unifiedTodoManager
       );
       this.workers.set(workerSlot, worker);
 

@@ -5,10 +5,12 @@
  * - Mission: 任务使命
  * - Contract: 协作契约
  * - Assignment: 职责分配
- * - WorkerTodo: Worker 自主规划的工作项
+ *
+ * 注意：WorkerTodo 已迁移到 src/todo/types.ts (UnifiedTodo)
  */
 
 import { WorkerSlot } from '../../types';
+import { UnifiedTodo, TodoType, TodoStatus, TodoOutput } from '../../todo/types';
 
 // ============================================================================
 // 状态枚举
@@ -87,28 +89,9 @@ export type PlanningStatus =
   | 'approved'  // 已批准
   | 'rejected'; // 已拒绝
 
-/**
- * Todo 类型
- */
-export type TodoType =
-  | 'discovery'      // 探索/调研
-  | 'design'         // 设计/规划
-  | 'implementation' // 实现
-  | 'verification'   // 验证/测试
-  | 'integration'    // 集成
-  | 'fix'            // 修复
-  | 'refactor';      // 重构
-
-/**
- * Todo 状态
- */
-export type TodoStatus =
-  | 'pending'     // 等待执行
-  | 'blocked'     // 被阻塞
-  | 'in_progress' // 执行中
-  | 'completed'   // 完成
-  | 'failed'      // 失败
-  | 'skipped';    // 跳过
+// TodoType 和 TodoStatus 已迁移到 src/todo/types.ts
+// 重新导出以保持兼容性
+export { TodoType, TodoStatus } from '../../todo/types';
 
 /**
  * 评审级别
@@ -379,8 +362,11 @@ export interface Assignment {
   consumerContracts: string[];
 
   // ===== Worker 规划 =====
-  /** Worker 自主规划的 Todo 列表 */
-  todos: WorkerTodo[];
+  /**
+   * Todo 列表 - 使用统一的 UnifiedTodo 类型
+   * 由 TodoManager 管理，这里保留引用以便快速访问
+   */
+  todos: UnifiedTodo[];
   /** 规划状态 */
   planningStatus: PlanningStatus;
   /** 规划审查结果 */
@@ -456,88 +442,18 @@ export interface PlanIssue {
 }
 
 // ============================================================================
-// WorkerTodo 接口
+// WorkerTodo - DEPRECATED
 // ============================================================================
+// WorkerTodo 接口已迁移到 src/todo/types.ts 中的 UnifiedTodo
+// 请使用 import { UnifiedTodo } from '../../todo/types'
 
 /**
- * WorkerTodo - Worker 自主规划的工作项
- * 这是新架构的核心：Worker 自己决定怎么完成职责
+ * @deprecated 使用 UnifiedTodo 替代
  */
-export interface WorkerTodo {
-  id: string;
-  assignmentId: string;
+export type WorkerTodo = UnifiedTodo;
 
-  // ===== 内容 =====
-  /** 工作内容 */
-  content: string;
-  /** 为什么需要这个 Todo */
-  reasoning: string;
-  /** 预期产出 */
-  expectedOutput: string;
-
-  // ===== 分类 =====
-  type: TodoType;
-  /** 优先级 1-5，1 最高 */
-  priority: number;
-
-  // ===== 范围检查 =====
-  /** 是否超出职责范围 */
-  outOfScope: boolean;
-  /** 超范围审批状态 */
-  approvalStatus?: 'pending' | 'approved' | 'rejected';
-  /** 审批说明 */
-  approvalNote?: string;
-
-  // ===== 依赖 =====
-  /** 依赖的 Todo（同 Assignment 内） */
-  dependsOn: string[];
-  /** 依赖的契约 */
-  requiredContracts: string[];
-  /** 生成的契约（由此 Todo 实现） */
-  producesContracts: string[];
-  /** 被阻塞原因 */
-  blockedReason?: string;
-
-  // ===== 状态 =====
-  status: TodoStatus;
-
-  // ===== 执行结果 =====
-  output?: TodoOutput;
-
-  // ===== 恢复信息 =====
-  /** 重试次数 */
-  retryCount?: number;
-
-  // ===== 时间戳 =====
-  createdAt: number;
-  startedAt?: number;
-  completedAt?: number;
-}
-
-/**
- * Todo 输出
- */
-export interface TodoOutput {
-  /** 是否成功 */
-  success: boolean;
-  /** 输出摘要 */
-  summary: string;
-  /** 修改的文件 */
-  modifiedFiles: string[];
-  /** 产生的新契约（如果有） */
-  newContracts?: Partial<Contract>[];
-  /** 发现的问题 */
-  issues?: string[];
-  /** 错误信息 */
-  error?: string;
-  /** 执行时长 */
-  duration: number;
-  /** Token 使用 */
-  tokenUsage?: {
-    input: number;
-    output: number;
-  };
-}
+// 重新导出 TodoOutput 以保持兼容性
+export { TodoOutput } from '../../todo/types';
 
 // ============================================================================
 // 创建参数接口
@@ -578,20 +494,9 @@ export interface CreateAssignmentParams {
   consumerContracts?: string[];
 }
 
-/**
- * WorkerTodo 创建参数
- */
-export interface CreateTodoParams {
-  assignmentId: string;
-  content: string;
-  reasoning: string;
-  type: TodoType;
-  priority?: number;
-  expectedOutput?: string;
-  dependsOn?: string[];
-  requiredContracts?: string[];
-  producesContracts?: string[];
-}
+// CreateTodoParams 已迁移到 src/todo/types.ts
+// 请使用 import { CreateTodoParams } from '../../todo/types'
+export { CreateTodoParams } from '../../todo/types';
 
 // ============================================================================
 // 事件类型
@@ -616,19 +521,12 @@ export interface MissionEvents {
 export interface AssignmentEvents {
   assignmentCreated: { assignment: Assignment };
   assignmentStatusChanged: { assignmentId: string; oldStatus: AssignmentStatus; newStatus: AssignmentStatus };
-  planningCompleted: { assignmentId: string; todos: WorkerTodo[] };
+  planningCompleted: { assignmentId: string; todoIds: string[] };
   planReviewCompleted: { assignmentId: string; result: PlanReviewResult };
 }
 
-/**
- * Todo 事件
- */
-export interface TodoEvents {
-  todoStarted: { missionId: string; assignmentId: string; todoId: string };
-  todoCompleted: { missionId: string; assignmentId: string; todoId: string; output: TodoOutput };
-  todoFailed: { missionId: string; assignmentId: string; todoId: string; error: string };
-  dynamicTodoAdded: { missionId: string; assignmentId: string; todo: WorkerTodo };
-}
+// Todo 事件已迁移到 src/todo/types.ts
+// 请使用 import { TodoEvents } from '../../todo/types'
 
 /**
  * Contract 事件

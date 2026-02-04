@@ -6,7 +6,7 @@
 import { logger, LogCategory } from '../logging';
 import { ToolExecutor, ExtendedToolDefinition, MCPServerConfig } from './types';
 import { ToolCall, ToolResult } from '../llm/types';
-import { MCPManager, MCPToolInfo } from './mcp-manager';
+import { MCPManager, MCPToolInfo, MCPPromptInfo } from './mcp-manager';
 import { LLMConfigLoader } from '../llm/config';
 
 /**
@@ -149,6 +149,33 @@ export class MCPToolExecutor implements ToolExecutor {
         tags: ['mcp', tool.serverName],
       },
     }));
+  }
+
+  /**
+   * 🔧 同步获取已缓存的 MCP 工具信息
+   * 用于构建系统提示时避免异步调用
+   */
+  getCachedTools(): Array<{ name: string; description: string; serverId: string; serverName: string }> {
+    if (!this.initialized) {
+      return [];
+    }
+    const allTools = this.mcpManager.getAllTools();
+    return allTools.map((tool: MCPToolInfo) => ({
+      name: tool.name,
+      description: tool.description,
+      serverId: tool.serverId,
+      serverName: tool.serverName,
+    }));
+  }
+
+  /**
+   * 获取所有 MCP Prompts（提示词模板）
+   */
+  getPrompts(): MCPPromptInfo[] {
+    if (!this.initialized) {
+      return [];
+    }
+    return this.mcpManager.getAllPrompts();
   }
 
   /**

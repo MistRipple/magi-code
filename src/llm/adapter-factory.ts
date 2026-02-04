@@ -8,6 +8,11 @@
  * - 创建 Adapter 并注入 MessageHub
  * - Adapter 直接通过 MessageHub 发送消息
  * - 只转发错误事件
+ *
+ * 🔧 单一真相来源架构：
+ * - 工具、MCP、Skills 统一由 ToolManager 管理
+ * - 环境上下文由 EnvironmentContextProvider 统一生成
+ * - Orchestrator 和 Worker 都通过同一入口获取上下文
  */
 
 import { EventEmitter } from 'events';
@@ -19,13 +24,14 @@ import { LLMConfigLoader } from './config';
 import { createLLMClient } from './clients/client-factory';
 import { createNormalizer } from '../normalizer';
 import { ToolManager } from '../tools/tool-manager';
-import { SkillsManager, InstructionSkillDefinition } from '../tools/skills-manager';
+import { SkillsManager } from '../tools/skills-manager';
 import { MCPToolExecutor } from '../tools/mcp-executor';
 import { MessageHub } from '../orchestrator/core/message-hub';
 import { logger, LogCategory } from '../logging';
 import { IAdapterFactory, AdapterOutputScope, AdapterResponse } from '../adapters/adapter-factory-interface';
 import { AgentProfileLoader } from '../orchestrator/profile/agent-profile-loader';
 import { ADAPTER_EVENTS } from '../protocol/event-names';
+import { EnvironmentContextProvider } from '../context/environment-context-provider';
 
 /**
  * LLM 适配器工厂
@@ -35,9 +41,13 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   private toolManager: ToolManager;
   private skillsManager: SkillsManager | null = null;
   private mcpExecutor: MCPToolExecutor | null = null;
-  private workspaceRoot: string;
   private profileLoader: AgentProfileLoader;
   private connectionPromises = new Map<AgentType, Promise<void>>();
+
+  /**
+   * 🔧 环境上下文提供者（单一真相来源）
+   */
+  private environmentContextProvider: EnvironmentContextProvider;
 
   /**
    * 消息出口 - 注入给 Adapter，用于直接发送消息
@@ -48,9 +58,15 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
 
   constructor(options: { cwd: string }) {
     super();
-    this.workspaceRoot = options.cwd;
     this.toolManager = new ToolManager(options.cwd);
     this.profileLoader = new AgentProfileLoader();
+
+    // 创建环境上下文提供者并注入 ToolManager
+    this.environmentContextProvider = new EnvironmentContextProvider({
+      workspace: options.cwd,
+    });
+    this.environmentContextProvider.setToolManager(this.toolManager);
+
     logger.info('LLM Adapter Factory initialized', { cwd: options.cwd }, LogCategory.LLM);
   }
 
@@ -87,6 +103,9 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
 
     // 加载并注册 MCP
     await this.loadMCP();
+
+    // 🔧 刷新环境上下文缓存（从 ToolManager 获取最新数据）
+    await this.environmentContextProvider.refresh();
 
     logger.info('LLM Adapter Factory initialized', { configDir: LLMConfigLoader.getConfigDir() }, LogCategory.LLM);
   }
@@ -125,6 +144,9 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     // 重新加载 Skills 配置
     await this.loadSkills();
 
+    // 🔧 刷新环境上下文缓存
+    await this.environmentContextProvider.refresh();
+
     // 清除适配器缓存，强制重新创建（以获取新的工具列表）
     this.adapters.clear();
 
@@ -146,8 +168,10 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       this.toolManager.registerMCPExecutor('mcp-servers', this.mcpExecutor);
 
       const tools = await this.mcpExecutor.getTools();
+      const prompts = this.mcpExecutor.getPrompts();
       logger.info('MCP loaded and registered', {
-        toolCount: tools.length
+        toolCount: tools.length,
+        promptCount: prompts.length,
       }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to load MCP', { error: error.message }, LogCategory.TOOLS);
@@ -167,6 +191,9 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     // 重新加载
     await this.loadMCP();
 
+    // 🔧 刷新环境上下文缓存
+    await this.environmentContextProvider.refresh();
+
     // 清除适配器缓存，强制重新创建（以获取新的工具列表）
     this.adapters.clear();
 
@@ -182,6 +209,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
 
   /**
    * 创建 Worker 适配器
+   * 🔧 使用 EnvironmentContextProvider 统一注入环境上下文
    */
   private createWorkerAdapter(workerSlot: WorkerSlot): WorkerLLMAdapter {
     // 检查缓存
@@ -224,12 +252,12 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
 
     const adapter = new WorkerLLMAdapter(adapterConfig);
 
+    // 🔧 使用 EnvironmentContextProvider 统一注入环境上下文
     let systemPrompt = adapter.getSystemPrompt();
-    const skillPrompt = this.buildSkillPromptAppendix();
-    if (skillPrompt) {
-      systemPrompt = `${systemPrompt}\n\n${skillPrompt}`;
+    const environmentPrompt = this.environmentContextProvider.getEnvironmentPrompt();
+    if (environmentPrompt) {
+      systemPrompt = `${systemPrompt}\n\n${environmentPrompt}`;
     }
-    systemPrompt = this.injectUserRules(systemPrompt);
     adapter.setSystemPrompt(systemPrompt);
 
     // 只设置错误事件处理（消息由 Adapter 直接发送到 MessageHub）
@@ -245,103 +273,9 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     return adapter;
   }
 
-  private buildSkillPromptAppendix(): string {
-    const skillsConfig = LLMConfigLoader.loadSkillsConfig();
-    const instructionSkills: InstructionSkillDefinition[] = Array.isArray(skillsConfig?.instructionSkills)
-      ? skillsConfig.instructionSkills
-      : [];
-
-    if (instructionSkills.length === 0) {
-      return '';
-    }
-
-    const autoSkills = instructionSkills.filter(skill => !skill.disableModelInvocation);
-    const manualSkills = instructionSkills.filter(skill => skill.disableModelInvocation);
-    const maxChars = 6000;
-    let usedChars = 0;
-    const blocks: string[] = [];
-
-    const header = [
-      '## 可用 Skills',
-      '- 你可以在合适的任务中主动使用 Skill。',
-      '- 当用户输入 /skill-name 时，必须应用对应 Skill 指令。',
-    ].join('\n');
-
-    blocks.push(header);
-
-    if (instructionSkills.length > 0) {
-      blocks.push('\n### Skill 列表');
-      instructionSkills.forEach((skill) => {
-        const flag = skill.disableModelInvocation ? '（仅手动 /skill）' : '';
-        blocks.push(`- ${skill.name}${flag}: ${skill.description || ''}`);
-      });
-    }
-
-    blocks.push('\n### Skill 指令（可自动调用）');
-    for (const skill of autoSkills) {
-      const contentBlock = this.formatSkillInstruction(skill);
-      if (usedChars + contentBlock.length > maxChars) {
-        blocks.push(`- ${skill.name}: 指令内容过长，需在 /${skill.name} 调用时加载`);
-        continue;
-      }
-      blocks.push(contentBlock);
-      usedChars += contentBlock.length;
-    }
-
-    if (manualSkills.length > 0) {
-      blocks.push('\n### 仅在 /skill 调用时启用的 Skills');
-      manualSkills.forEach((skill) => {
-        blocks.push(`- ${skill.name}: ${skill.description || ''}`);
-      });
-    }
-
-    return blocks.join('\n');
-  }
-
-  private injectUserRules(prompt: string): string {
-    const cleaned = this.stripUserRules(prompt);
-    const rules = this.getUserRulesContent();
-    if (!rules) {
-      return cleaned;
-    }
-    const block = [
-      '<!-- USER_RULES_START -->',
-      '## 用户规则',
-      rules,
-      '<!-- USER_RULES_END -->'
-    ].join('\n');
-    return `${cleaned}\n\n${block}`;
-  }
-
-  private stripUserRules(prompt: string): string {
-    return prompt.replace(/\n?<!-- USER_RULES_START -->[\s\S]*?<!-- USER_RULES_END -->\n?/g, '').trim();
-  }
-
-  private getUserRulesContent(): string {
-    const rules = LLMConfigLoader.loadUserRules();
-    if (!rules.enabled) {
-      return '';
-    }
-    return (rules.content || '').trim();
-  }
-
-  private formatSkillInstruction(skill: InstructionSkillDefinition): string {
-    const toolHint = Array.isArray(skill.allowedTools) && skill.allowedTools.length > 0
-      ? `允许使用的工具: ${skill.allowedTools.join(', ')}`
-      : '';
-    const argHint = skill.argumentHint ? `参数提示: ${skill.argumentHint}` : '';
-    const hints = [toolHint, argHint].filter(Boolean).join(' | ');
-
-    return [
-      `\n[Skill: ${skill.name}]`,
-      skill.description ? `描述: ${skill.description}` : '',
-      hints ? `提示: ${hints}` : '',
-      skill.content ? `指令:\n${skill.content}` : '',
-    ].filter(Boolean).join('\n');
-  }
-
   /**
    * 创建 Orchestrator 适配器
+   * 🔧 使用 EnvironmentContextProvider 统一注入环境上下文
    */
   private createOrchestratorAdapter(): OrchestratorLLMAdapter {
     // 检查缓存
@@ -381,7 +315,15 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     };
 
     const adapter = new OrchestratorLLMAdapter(adapterConfig);
-    adapter.setSystemPrompt(this.injectUserRules(adapter.getSystemPrompt()));
+
+    // 🔧 使用 EnvironmentContextProvider 统一注入环境上下文
+    // 工具、MCP、Skills 统一由 ToolManager 管理，EnvironmentContextProvider 统一格式化
+    let systemPrompt = adapter.getSystemPrompt();
+    const environmentPrompt = this.environmentContextProvider.getEnvironmentPrompt();
+    if (environmentPrompt) {
+      systemPrompt = `${systemPrompt}\n\n${environmentPrompt}`;
+    }
+    adapter.setSystemPrompt(systemPrompt);
 
     // 只设置错误事件处理（消息由 Adapter 直接发送到 MessageHub）
     this.setupAdapterEvents(adapter, 'orchestrator');
@@ -733,7 +675,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
    * 清除所有适配器的对话历史（不断开连接）
    */
   clearAllAdapterHistories(): void {
-    for (const [agent, adapter] of this.adapters) {
+    for (const [, adapter] of this.adapters) {
       if ('clearHistory' in adapter && typeof adapter.clearHistory === 'function') {
         adapter.clearHistory();
       }
@@ -742,17 +684,17 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   }
 
   /**
-   * 刷新所有适配器的用户规则
+   * 刷新所有适配器的环境上下文
+   * 🔧 通过 EnvironmentContextProvider 统一处理
    */
-  refreshUserRules(): void {
-    for (const [agent, adapter] of this.adapters) {
-      if ('getSystemPrompt' in adapter && 'setSystemPrompt' in adapter) {
-        const current = (adapter as any).getSystemPrompt() as string;
-        const updated = this.injectUserRules(current);
-        (adapter as any).setSystemPrompt(updated);
-        logger.debug(`Refreshed user rules for adapter: ${agent}`, undefined, LogCategory.LLM);
-      }
-    }
+  async refreshUserRules(): Promise<void> {
+    // 刷新环境上下文缓存
+    await this.environmentContextProvider.refresh();
+
+    // 清除适配器缓存，强制重新创建（以获取新的环境上下文）
+    this.adapters.clear();
+
+    logger.info('Environment context refreshed', undefined, LogCategory.LLM);
   }
 
   /**

@@ -36,6 +36,30 @@ import { AceExecutor } from './ace-executor';
 import { LspExecutor } from './lsp-executor';
 import { logger, LogCategory } from '../logging';
 import { PermissionMatrix } from '../types';
+import type { SkillsManager, InstructionSkillDefinition } from './skills-manager';
+import type { MCPToolExecutor } from './mcp-executor';
+import type { MCPPromptInfo } from './mcp-manager';
+
+/**
+ * 统一 Prompt 信息接口（MCP Prompts + Instruction Skills）
+ */
+export interface UnifiedPromptInfo {
+  name: string;
+  description: string;
+  content?: string;  // instructionSkills 有 content，MCP Prompts 没有
+  source: 'mcp' | 'skill';
+  sourceId?: string;  // MCP server ID 或 skill 来源
+  arguments?: Array<{
+    name: string;
+    description?: string;
+    required?: boolean;
+  }>;
+  // Skill 特有属性
+  allowedTools?: string[];
+  disableModelInvocation?: boolean;
+  userInvocable?: boolean;
+  argumentHint?: string;
+}
 
 /**
  * 读取 ACE 配置（唯一配置读取入口）
@@ -624,6 +648,76 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    */
   getWorkspaceRoot(): string {
     return this.workspaceRoot;
+  }
+
+  /**
+   * 获取所有 Prompts（统一入口：MCP Prompts + Instruction Skills）
+   *
+   * 这是单一真相来源：所有提示词/指令都通过此方法获取
+   */
+  getPrompts(): UnifiedPromptInfo[] {
+    const prompts: UnifiedPromptInfo[] = [];
+
+    // 1. 收集 MCP Prompts
+    for (const [serverId, executor] of this.mcpExecutors) {
+      // 检查是否是 MCPToolExecutor
+      const mcpExecutor = executor as MCPToolExecutor;
+      if (typeof mcpExecutor.getPrompts === 'function') {
+        const mcpPrompts = mcpExecutor.getPrompts();
+        for (const prompt of mcpPrompts) {
+          prompts.push({
+            name: prompt.name,
+            description: prompt.description,
+            source: 'mcp',
+            sourceId: prompt.serverId,
+            arguments: prompt.arguments,
+          });
+        }
+      }
+    }
+
+    // 2. 收集 Instruction Skills
+    if (this.skillExecutor) {
+      const skillsManager = this.skillExecutor as SkillsManager;
+      if (typeof skillsManager.getInstructionSkills === 'function') {
+        const skills = skillsManager.getInstructionSkills();
+        for (const skill of skills) {
+          prompts.push({
+            name: skill.name,
+            description: skill.description,
+            content: skill.content,
+            source: 'skill',
+            sourceId: skill.repositoryId,
+            allowedTools: skill.allowedTools,
+            disableModelInvocation: skill.disableModelInvocation,
+            userInvocable: skill.userInvocable,
+            argumentHint: skill.argumentHint,
+          });
+        }
+      }
+    }
+
+    logger.debug('ToolManager.getPrompts', {
+      total: prompts.length,
+      mcp: prompts.filter(p => p.source === 'mcp').length,
+      skill: prompts.filter(p => p.source === 'skill').length,
+    }, LogCategory.TOOLS);
+
+    return prompts;
+  }
+
+  /**
+   * 获取 Skill 执行器（用于 EnvironmentContextProvider）
+   */
+  getSkillExecutor(): SkillsManager | null {
+    return this.skillExecutor as SkillsManager | null;
+  }
+
+  /**
+   * 获取 MCP 执行器（用于 EnvironmentContextProvider）
+   */
+  getMCPExecutors(): Map<string, ToolExecutor> {
+    return this.mcpExecutors;
   }
 
   /**
