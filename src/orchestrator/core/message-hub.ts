@@ -21,9 +21,11 @@
  * - `result(content: string, options?)`: 汇报最终执行结果
  * - `orchestratorMessage(content: string, options?)`: 发送分析/规划类消息
  * - `subTaskCard(subTask: SubTaskView)`: 展示/更新子任务卡片状态
+ * - `taskAssignment(assignments)`: 发送任务分配宣告（主对话区）
  *
  * ### 3. Worker 交互 (Worker Tab)
  * - `workerOutput(worker: string, content: string, options?)`: 发送 Worker 执行日志
+ * - `workerInstruction(worker, content, metadata?)`: 发送任务说明到 Worker Tab
  *
  * ### 4. 系统与错误
  * - `systemNotice(content: string, metadata?)`: 发送系统级通知
@@ -88,7 +90,7 @@ import type { AgentType } from '../../types/agent-types';
 export interface SubTaskView {
   id: string;
   title: string;
-  status: 'pending' | 'running' | 'completed' | 'failed';
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'stopped' | 'skipped';
   worker: WorkerSlot;
   summary?: string;
   modifiedFiles?: string[];
@@ -131,7 +133,8 @@ export interface MessageHubConfig {
 
 /** 消息状态 */
 interface MessageState {
-  message: StandardMessage;
+  message: StandardMessage | null;  // 🔧 允许 null，用于 UPDATE 先于 STARTED 的临时状态
+  createdAt: number;
   lastSentAt: number;
   lastStreamAt: number;
   completed: boolean;
@@ -164,13 +167,6 @@ export interface RequestMessageSummary {
   dataCount: number;
 }
 
-/** 内容去重记录 */
-interface ContentDedupeRecord {
-  messageId: string;
-  contentHash: string;
-  timestamp: number;
-}
-
 /** 处理状态（导出供外部使用） */
 export interface ProcessingState {
   isProcessing: boolean;
@@ -190,12 +186,6 @@ const DEFAULT_HUB_CONFIG: MessageHubConfig = {
   retentionTime: 5 * 60 * 1000,  // 5分钟保留
   debug: false,
 };
-
-// ============================================================================
-// 内容去重常量
-// ============================================================================
-
-const CONTENT_DEDUPE_WINDOW_MS = 30000;  // 30秒窗口
 
 /**
  * MessageHub - 统一消息出口
@@ -232,7 +222,6 @@ export class MessageHub extends EventEmitter {
   // 🔧 根治：移除 activeMessageIds Set，消除双数据源同步问题
   // 活动消息状态完全由 messageStates.completed 派生
   private cleanupTimer: NodeJS.Timeout | null = null;
-  private contentDedupeRecords: ContentDedupeRecord[] = [];
   /** 防止事件发射触发的重入调用 */
   private processingMessageIds: Set<string> = new Set();
   private requestMessageStats: Map<string, RequestMessageStats> = new Map();
@@ -250,6 +239,7 @@ export class MessageHub extends EventEmitter {
   private addActiveMessage(id: string, message: StandardMessage, timestamp: number): void {
     this.messageStates.set(id, {
       message,
+      createdAt: timestamp,
       lastSentAt: timestamp,
       lastStreamAt: timestamp,
       completed: false,
@@ -409,10 +399,8 @@ export class MessageHub extends EventEmitter {
    * 路由到对应 Worker Tab，不在主对话区显示
    */
   workerOutput(worker: WorkerSlot, content: string, options?: { blocks?: ContentBlock[]; metadata?: MessageMetadata }): void {
-    // 过滤空内容
-    if (!content || !content.trim()) {
-      return;
-    }
+    // 🔧 允许空内容：流式消息可能以空内容开始（仅用于占位）
+    // 后续通过 sendUpdate 填充内容
 
     const blocks: ContentBlock[] = options?.blocks || [{ type: 'text', content, isMarkdown: true }];
 
@@ -430,33 +418,171 @@ export class MessageHub extends EventEmitter {
   }
 
   /**
+   * 发送 Worker 错误
+   * 强制路由到主对话区
+   */
+  workerError(worker: WorkerSlot, content: string, options?: { metadata?: MessageMetadata }): void {
+    const errorContent = content || '执行失败';
+
+    const message = this.createMessage({
+      type: MessageType.ERROR,
+      source: 'worker',
+      agent: worker as AgentType,
+      lifecycle: MessageLifecycle.FAILED,
+      blocks: [{ type: 'text', content: errorContent }],
+      metadata: options?.metadata || {},
+    });
+
+    this.sendMessage(message);
+  }
+
+  /**
+   * 发送 Worker 执行摘要
+   * 路由到 Worker Tab 底部，作为最终总结
+   */
+  workerSummary(worker: WorkerSlot, content: string, options?: { metadata?: MessageMetadata }): void {
+    if (!content || !content.trim()) return;
+
+    const message = this.createMessage({
+      type: MessageType.RESULT, // RESULT 类型会被 message-classifier 识别为 WORKER_SUMMARY
+      source: 'worker',
+      agent: worker as AgentType,
+      lifecycle: MessageLifecycle.COMPLETED,
+      blocks: [{ type: 'text', content, isMarkdown: true }],
+      metadata: options?.metadata || {},
+    });
+
+    this.sendMessage(message);
+  }
+
+  /**
+   * 发送任务分配宣告（主对话区）
+   *
+   * 在 Worker 执行前，向用户说明将安排哪些 Worker 执行哪些任务
+   *
+   * 示例输出：
+   * "我将安排 2 个 Worker 协作完成：
+   *   • Claude: 分析依赖
+   *   • Gemini: 优化性能"
+   *
+   * @param assignments 任务分配列表，包含 worker 和简短标题
+   */
+  taskAssignment(assignments: Array<{
+    worker: WorkerSlot;
+    shortTitle: string;
+  }>, options?: { reason?: string }): void {
+    if (assignments.length === 0) return;
+
+    const workerList = assignments
+      .map(a => `• ${a.worker}: ${a.shortTitle}`)
+      .join('\n');
+
+    let content = assignments.length === 1
+      ? `我将安排 ${assignments[0].worker} 执行：${assignments[0].shortTitle}`
+      : `我将安排 ${assignments.length} 个 Worker 协作完成：\n${workerList}`;
+
+    // 添加路由原因说明，帮助用户理解 Worker 选择依据
+    if (options?.reason) {
+      content += `\n\n> ${options.reason}`;
+    }
+
+    this.orchestratorMessage(content, {
+      metadata: {
+        phase: 'task_assignment',
+        isStatusMessage: true,
+      }
+    });
+  }
+
+  /**
+   * 发送任务说明到 Worker Tab
+   *
+   * 显示为带"任务说明"标识的卡片
+   * 这是编排者派发给 Worker 的详细任务说明
+   *
+   * @param worker 目标 Worker
+   * @param content 任务说明内容
+   * @param metadata 可选元数据（assignmentId, missionId 等）
+   */
+  workerInstruction(worker: WorkerSlot, content: string, metadata?: {
+    assignmentId?: string;
+    missionId?: string;
+  }): void {
+    if (!content || !content.trim()) return;
+
+    const message = this.createMessage({
+      type: MessageType.INSTRUCTION,  // 使用新的 INSTRUCTION 类型
+      source: 'orchestrator',
+      agent: worker as AgentType,
+      lifecycle: MessageLifecycle.COMPLETED,
+      blocks: [{ type: 'text', content, isMarkdown: true }],
+      metadata: {
+        ...metadata,
+        dispatchToWorker: true,
+        worker: worker,
+      },
+    });
+
+    this.sendMessage(message);
+  }
+
+  /**
    * 发送子任务卡片
    * 显示在主对话区，用于展示子任务完成摘要
    *
    * 使用自然语言格式，不再使用固定模板
+   *
+   * 🔧 修复：使用固定消息 ID（基于 subTask.id），确保同一任务的多次状态更新
+   * 复用同一条消息，避免前端渲染多张重复卡片
    */
   subTaskCard(subTask: SubTaskView): void {
     // 生成自然语言的状态描述
+    // 🔧 每种状态生成不同内容，避免内容去重导致状态更新丢失
     let content: string;
     const workerName = subTask.worker;
 
-    if (subTask.status === 'completed') {
-      // 完成状态：使用摘要或标题
-      if (subTask.summary) {
-        content = `${workerName} 已完成：${subTask.summary}`;
-      } else {
-        content = `${workerName} 完成了任务`;
-      }
-    } else if (subTask.status === 'failed') {
-      // 失败状态：显示错误信息
-      content = `${workerName} 执行遇到问题：${subTask.summary || '执行失败'}`;
-    } else {
-      // 进行中状态：显示任务标题
-      content = `${workerName} 正在处理：${subTask.title}`;
+    switch (subTask.status) {
+      case 'completed':
+        // 完成状态：使用摘要或标题
+        content = subTask.summary
+          ? `${workerName} 已完成：${subTask.summary}`
+          : `${workerName} 完成了任务`;
+        break;
+      case 'failed':
+        // 失败状态：显示错误信息
+        content = `${workerName} 执行遇到问题：${subTask.summary || '执行失败'}`;
+        break;
+      case 'pending':
+        // 等待确认状态
+        content = `${workerName} 等待确认：${subTask.title}`;
+        break;
+      case 'stopped':
+        // 已停止状态
+        content = `${workerName} 已停止：${subTask.title}`;
+        break;
+      case 'skipped':
+        // 已跳过状态
+        content = `${workerName} 已跳过：${subTask.title}`;
+        break;
+      case 'running':
+      default:
+        // 执行中状态
+        content = `${workerName} 正在处理：${subTask.title}`;
+        break;
     }
 
-    const message = this.createMessage({
-      type: MessageType.RESULT,
+    // 🔧 关键修复：使用固定消息 ID，确保同一任务的状态更新复用同一条消息
+    // 前端根据消息 ID 判断是更新还是新增，相同 ID 会触发更新逻辑
+    const stableMessageId = `subtask-card-${subTask.id}`;
+
+    // 🔧 关键修复：状态卡片需要允许重复更新
+    // 问题：COMPLETED lifecycle 的消息会被标记为已完成，后续更新会被跳过
+    // 方案：在发送前清除旧的消息状态，允许新状态覆盖
+    this.clearMessageState(stableMessageId);
+
+    const message = createStandardMessage({
+      id: stableMessageId,  // 🔧 使用固定 ID 而不是自动生成
+      type: MessageType.TASK_CARD,
       source: 'orchestrator',
       agent: 'orchestrator',
       lifecycle: MessageLifecycle.COMPLETED,
@@ -467,10 +593,20 @@ export class MessageHub extends EventEmitter {
         isStatusMessage: true,
         subTaskCard: subTask,
       },
+      traceId: this.traceId,
+      category: MessageCategory.CONTENT,
     });
 
     // 🔧 统一出口：所有消息通过 sendMessage 进入统一通道
     this.sendMessage(message);
+  }
+
+  /**
+   * 清除消息状态，允许重新发送
+   * 用于状态卡片等需要多次更新的场景
+   */
+  private clearMessageState(messageId: string): void {
+    this.messageStates.delete(messageId);
   }
 
   /**
@@ -528,12 +664,8 @@ export class MessageHub extends EventEmitter {
    * 显示在主对话区
    */
   orchestratorMessage(content: string, options?: { type?: MessageType; metadata?: MessageMetadata }): void {
-    // 过滤空内容
-    if (!content || !content.trim()) {
-      logger.warn('MessageHub.orchestratorMessage.空内容跳过', undefined, LogCategory.SYSTEM);
-      return;
-    }
-
+    // 🔧 允许空内容：流式消息可能以空内容开始
+    
     const message = this.createMessage({
       type: options?.type || MessageType.TEXT,
       source: 'orchestrator',
@@ -660,19 +792,20 @@ export class MessageHub extends EventEmitter {
     }
 
     const isPlaceholder = message.metadata?.isPlaceholder === true;
-    const isUser = message.metadata?.role === 'user';
+    const isUserInput = message.type === MessageType.USER_INPUT;
     const isStatusMessageMeta = message.metadata?.isStatusMessage === true;
-    const hasSubTaskCard = Boolean(message.metadata?.subTaskCard);
-    const dispatchToWorker = message.metadata?.dispatchToWorker === true;
+    const isTaskCard = message.type === MessageType.TASK_CARD;
+    // 方案 B：使用 MessageType.INSTRUCTION 判断任务说明消息
+    const isInstruction = message.type === MessageType.INSTRUCTION;
     if (
       message.category === MessageCategory.CONTENT
       && message.source === 'orchestrator'
       && requestId
       && !isPlaceholder
-      && !isUser
+      && !isUserInput
       && !isStatusMessageMeta
-      && !hasSubTaskCard
-      && !dispatchToWorker
+      && !isTaskCard
+      && !isInstruction
     ) {
       const boundMessageId = this.getRequestMessageId(requestId);
       if (!boundMessageId) {
@@ -739,10 +872,10 @@ export class MessageHub extends EventEmitter {
       case MessageCategory.CONTENT: {
         const isPlaceholder = message.metadata?.isPlaceholder === true;
         const isStreaming = message.lifecycle === MessageLifecycle.STARTED || message.lifecycle === MessageLifecycle.STREAMING;
-        const isUser = message.metadata?.role === 'user';
+        const isUserInput = message.type === MessageType.USER_INPUT;
         const hasBlocks = Array.isArray(message.blocks) && message.blocks.length > 0;
         // 🔧 根治：禁止 data-only 内容流。非占位、非流式、非用户消息必须有内容块。
-        if (!hasBlocks && !isPlaceholder && !isStreaming && !isUser) {
+        if (!hasBlocks && !isPlaceholder && !isStreaming && !isUserInput) {
           throw new Error(`[MessageHub] Content message missing blocks: ${message.id}`);
         }
         break;
@@ -780,8 +913,19 @@ export class MessageHub extends EventEmitter {
     const now = Date.now();
     const existingState = this.messageStates.get(id);
 
-    // 1. 重复 STARTED 消息：拒绝
+    // 1. 重复 STARTED 消息：拒绝（除非是由 UPDATE 创建的临时状态）
     if (existingState && lifecycle === MessageLifecycle.STARTED) {
+      // 🔧 如果是由 UPDATE 创建的临时状态（message 为 null），则补充完整信息
+      if (existingState.message === null) {
+        console.log('[MessageHub] 补充 STARTED 消息到临时状态:', id);
+        existingState.message = message;
+        existingState.lastSentAt = now;
+        this.updateProcessingState(true, message.source, message.agent);
+        this.recordRequestMessage(message);
+        this.emitByCategory(message);
+        this.debugLog('发送消息 [STARTED_AFTER_UPDATE]', id);
+        return true;
+      }
       logger.warn('MessageHub.重复_START', {
         id,
         source: message.source,
@@ -791,22 +935,11 @@ export class MessageHub extends EventEmitter {
       return false;
     }
 
-    // 2. 内容去重（非流式、非状态消息）
-    const isStatusMessage = message.metadata?.isStatusMessage === true;
-    const isProgressMessage = message.type === 'progress';
-    const shouldDedupe = isStatusMessage || isProgressMessage;
-    if (shouldDedupe && lifecycle !== MessageLifecycle.STARTED && lifecycle !== MessageLifecycle.STREAMING) {
-      const contentHash = this.computeContentHash(message);
-      if (contentHash && this.isDuplicateContent(contentHash, now)) {
-        this.debugLog('跳过消息 [CONTENT_DUPLICATE]', id);
-        return false;
-      }
-      if (contentHash) {
-        this.recordContentHash(id, contentHash, now);
-      }
-    }
+    // 🔧 移除内容去重逻辑
+    // 原因：AI不会输出重复内容，如果出现重复应该修复代码bug而不是用去重掩盖
+    // 内容去重会导致合法的状态更新（如 subTaskCard 状态变化）被误删
 
-    // 3. STARTED 消息：总是发送，激活 processingState
+    // 2. STARTED 消息：总是发送，激活 processingState
     if (lifecycle === MessageLifecycle.STARTED) {
       console.log('[MessageHub] 发送 STARTED 消息:', {
         id,
@@ -878,6 +1011,9 @@ export class MessageHub extends EventEmitter {
     if (this.isTerminalLifecycle(lifecycle)) {
       this.completeMessage(id, message, now);
       this.recordRequestMessage(message);
+      // 🔧 修复：COMPLETED 消息也需要发送 unified:message 事件
+      // 确保前端能接收到完整的消息内容（特别是 Worker 消息）
+      this.emitByCategory(message);
       this.safeEmit('unified:complete', message);
       this.checkAndUpdateProcessingState();
       this.debugLog('发送消息 [COMPLETE]', id);
@@ -953,13 +1089,22 @@ export class MessageHub extends EventEmitter {
 
     const now = Date.now();
     this.updateStreamBufferFromUpdate(update);
-    const state = this.messageStates.get(update.messageId);
+    let state = this.messageStates.get(update.messageId);
 
-    // 无状态：拒绝
+    // 🔧 修复：如果 UPDATE 先于 STARTED 消息到达，自动创建临时状态
+    // 这解决了 Normalizer 发送 UPDATE 事件时，STARTED 消息还未被 MessageHub 处理的时序问题
+    // 典型场景：Worker 的 thinking 内容在流式开始后立即发送
     if (!state) {
-      logger.warn('MessageHub.更新缺少状态', { messageId: update.messageId }, LogCategory.SYSTEM);
-      this.debugLog('跳过更新 [NO_STATE]', update.messageId);
-      return false;
+      console.log('[MessageHub] 创建临时状态 (UPDATE 先于 STARTED):', update.messageId);
+      const tempState: MessageState = {
+        message: null,  // 稍后由 STARTED 消息填充
+        createdAt: now,
+        lastSentAt: 0,
+        lastStreamAt: 0,
+        completed: false,
+      };
+      this.messageStates.set(update.messageId, tempState);
+      state = tempState;
     }
 
     // 已完成：拒绝
@@ -1181,12 +1326,13 @@ export class MessageHub extends EventEmitter {
     const hasBlocks = this.hasRenderableBlocks(message.blocks)
       || this.hasRenderableBlocks(this.streamBuffers.get(message.id)?.lastBlocks);
     const isPlaceholder = message.metadata?.isPlaceholder === true;
-    const isUser = message.metadata?.role === 'user';
-    const isDispatchToWorker = message.metadata?.dispatchToWorker === true;
+    const isUserInput = message.type === MessageType.USER_INPUT;
+    // 方案 B：使用 MessageType.INSTRUCTION 判断任务说明消息
+    const isInstruction = message.type === MessageType.INSTRUCTION;
     const isWorkerSource = message.source === 'worker';
     const isOrchestratorSource = message.source === 'orchestrator';
 
-    if (!hasText && !hasBlocks && !isPlaceholder && !isUser) {
+    if (!hasText && !hasBlocks && !isPlaceholder && !isUserInput) {
       this.requestMessageStats.set(requestId, stats);
       return;
     }
@@ -1194,12 +1340,12 @@ export class MessageHub extends EventEmitter {
     stats.totalContent += 1;
     if (isPlaceholder) {
       stats.placeholderContent += 1;
-    } else if (isUser) {
+    } else if (isUserInput) {
       stats.userContent += 1;
     } else if (isWorkerSource) {
       stats.assistantWorkerContent += 1;
       stats.assistantContent += 1;
-    } else if (isDispatchToWorker) {
+    } else if (isInstruction) {
       stats.assistantDispatchContent += 1;
     } else if (isOrchestratorSource) {
       stats.assistantThreadContent += 1;
@@ -1308,9 +1454,6 @@ export class MessageHub extends EventEmitter {
         for (const requestId of requestIdsToDelete) {
           this.requestMessageStats.delete(requestId);
         }
-
-        // 清理过期的内容去重记录
-        this.cleanupContentDedupeRecords(now);
       } catch (error) {
         logger.error('MessageHub.cleanup_timer_failed', {
           error: error instanceof Error ? error.message : String(error),
@@ -1328,82 +1471,6 @@ export class MessageHub extends EventEmitter {
     if (this.config.debug) {
       logger.debug('MessageHub.' + action, { messageId }, LogCategory.SYSTEM);
     }
-  }
-
-  // ==========================================================================
-  // 🔧 内容去重辅助方法（从 UnifiedMessageBus 迁入）
-  // ==========================================================================
-
-  /**
-   * 计算消息内容的哈希值
-   */
-  private computeContentHash(message: StandardMessage): string | null {
-    const textParts: string[] = [];
-    for (const block of message.blocks || []) {
-      if (block.type === 'text' && block.content) {
-        textParts.push(block.content);
-      }
-    }
-
-    if (textParts.length === 0) {
-      return null;  // 无文本内容，不参与去重
-    }
-
-    // 规范化内容
-    const normalized = textParts
-      .join(' ')
-      .replace(/#{1,6}\s*/g, '')  // 移除 markdown 标题符号
-      .replace(/\s+/g, ' ')
-      .trim()
-      .toLowerCase();
-
-    if (normalized.length < 10) {
-      return null;  // 内容太短，不参与去重
-    }
-
-    // 简单哈希：取前100字符 + 长度 + 来源
-    return `${message.source}:${normalized.slice(0, 100)}:${normalized.length}`;
-  }
-
-  /**
-   * 检查是否存在重复内容
-   */
-  private isDuplicateContent(contentHash: string, now: number): boolean {
-    const windowStart = now - CONTENT_DEDUPE_WINDOW_MS;
-
-    for (const record of this.contentDedupeRecords) {
-      if (record.timestamp >= windowStart && record.contentHash === contentHash) {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  /**
-   * 记录内容哈希
-   */
-  private recordContentHash(messageId: string, contentHash: string, timestamp: number): void {
-    this.contentDedupeRecords.push({
-      messageId,
-      contentHash,
-      timestamp,
-    });
-
-    // 限制记录数量
-    if (this.contentDedupeRecords.length > 100) {
-      this.contentDedupeRecords = this.contentDedupeRecords.slice(-50);
-    }
-  }
-
-  /**
-   * 清理过期的内容去重记录
-   */
-  private cleanupContentDedupeRecords(now: number): void {
-    const windowStart = now - CONTENT_DEDUPE_WINDOW_MS;
-    this.contentDedupeRecords = this.contentDedupeRecords.filter(
-      record => record.timestamp >= windowStart
-    );
   }
 
   private extractTextFromBlocks(blocks?: ContentBlock[]): string {
@@ -1483,14 +1550,14 @@ export class MessageHub extends EventEmitter {
         updatedAt: Date.now(),
       };
     }
-    if (!buffer?.text || !buffer.text.trim()) {
-      return message;
+    if (buffer?.text && buffer.text.trim()) {
+      return {
+        ...message,
+        blocks: [{ type: 'text', content: buffer.text, isMarkdown: true }],
+        updatedAt: Date.now(),
+      };
     }
-    return {
-      ...message,
-      blocks: [{ type: 'text', content: buffer.text, isMarkdown: true }],
-      updatedAt: Date.now(),
-    };
+    return message;
   }
 
   /**
@@ -1503,7 +1570,6 @@ export class MessageHub extends EventEmitter {
     }
     this.messageStates.clear();
     this.processingMessageIds.clear();
-    this.contentDedupeRecords = [];
     this.requestMessageStats.clear();
     this.streamBuffers.clear();
     // 🔧 重置状态，确保完全清理

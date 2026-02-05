@@ -61,8 +61,10 @@ describe('MessageClassifier', () => {
   });
 
   test('Worker 子任务摘要卡片应路由为 TASK_SUMMARY_CARD', () => {
+    // 方案 B：使用 MessageType.TASK_CARD 进行类型识别
     const msg = createMessage({
-      source: 'worker',
+      source: 'orchestrator', // 🔧 修正：只有编排者可以发送状态卡片
+      type: MessageType.TASK_CARD,
       agent: 'codex',
       metadata: { subTaskCard: { title: 'done' } },
     });
@@ -71,14 +73,13 @@ describe('MessageClassifier', () => {
     expect(result.worker).toBe('codex');
   });
 
-  test('非 Worker 子任务摘要卡片不应路由为 TASK_SUMMARY_CARD', () => {
+  test('普通文本消息应路由为 ORCHESTRATOR_RESPONSE', () => {
     const msg = createMessage({
       source: 'orchestrator',
-      metadata: { subTaskCard: { title: 'invalid' } },
       type: MessageType.TEXT,
     });
     const result = classifyMessage(msg);
-    expect(result.category).toBe(UIMessageCategory.ORCHESTRATOR_ANALYSIS);
+    expect(result.category).toBe(UIMessageCategory.ORCHESTRATOR_RESPONSE);
   });
 
   test('交互请求应路由为对应的 INTERACTION 类型', () => {

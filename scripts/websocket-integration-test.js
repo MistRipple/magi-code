@@ -5,8 +5,8 @@
  * {{ AURA: Add - 创建集成测试验证所有核心功能 }}
  */
 
-import WebSocketServerCore from '../server/websocket-server.js';
-import WebSocketClientNode from '../client/websocket-client-node.js';
+import WebSocketServerCore from '../websocket-system/server/websocket-server.js';
+import WebSocketClientNode from '../websocket-system/client/websocket-client-node.js';
 
 console.log('═'.repeat(70));
 console.log('🧪 WebSocket 系统核心功能测试');

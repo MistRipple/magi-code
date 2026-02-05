@@ -37,6 +37,14 @@ export enum MessageType {
   TOOL_CALL = 'tool_call',
   /** 思考过程 */
   THINKING = 'thinking',
+
+  // ============== 新增消息类型（方案 B 扩展）==============
+  /** 用户输入消息 */
+  USER_INPUT = 'user_input',
+  /** 任务状态卡片（Worker 执行状态摘要，主对话区展示） */
+  TASK_CARD = 'task_card',
+  /** 任务说明（编排者派发给 Worker 的详细任务描述） */
+  INSTRUCTION = 'instruction',
 }
 
 // ============================================================================
@@ -470,7 +478,7 @@ export interface MessageMetadata {
   worker?: string;
   /** 是否派发给 Worker 的指令消息 */
   dispatchToWorker?: boolean;
-  /** 子任务摘要卡片（主对话区展示） */
+  /** 子任务数据（主对话区 TASK_CARD 消息携带的完整数据） */
   subTaskCard?: unknown;
   /** 扩展数据 */
   extra?: Record<string, unknown>;
@@ -502,6 +510,8 @@ export interface MessageMetadata {
   wasPlaceholder?: boolean;
   /** 用户上传的图片（base64 Data URL 格式） */
   images?: Array<{ dataUrl: string }>;
+  /** P0-3: 是否为补充指令（执行中发送的追加消息） */
+  isSupplementary?: boolean;
 }
 
 // ============================================================================
@@ -527,6 +537,12 @@ export interface StreamUpdate {
 
   /** 新的生命周期状态（updateType='lifecycle_change' 时） */
   lifecycle?: MessageLifecycle;
+
+  /** Token 使用统计（实时更新） */
+  tokenUsage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+  };
 
   /** 时间戳 */
   timestamp: number;
@@ -576,6 +592,28 @@ export function createTextMessage(
     type: MessageType.TEXT,
     source,
     agent,
+    traceId,
+    lifecycle: MessageLifecycle.COMPLETED,
+    blocks: [{ type: 'text', content: text, isMarkdown: true }],
+    metadata: {},
+    ...options,
+  });
+}
+
+/**
+ * 创建用户输入消息
+ * 使用 MessageType.USER_INPUT 类型，无需 metadata.role 标识
+ */
+export function createUserInputMessage(
+  text: string,
+  traceId: string,
+  options?: Partial<StandardMessage>
+): StandardMessage {
+  return createStandardMessage({
+    category: MessageCategory.CONTENT,
+    type: MessageType.USER_INPUT,
+    source: 'orchestrator',  // 用户消息通过编排者中转
+    agent: 'orchestrator',
     traceId,
     lifecycle: MessageLifecycle.COMPLETED,
     blocks: [{ type: 'text', content: text, isMarkdown: true }],

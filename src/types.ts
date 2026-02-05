@@ -35,7 +35,10 @@ export type TaskCategory =
 
 /**
  * 导入并重新导出统一的 Task 和 SubTask 类型
- * 这些类型来自新的任务系统架构
+ * 任务系统使用 task/types.ts 中的完整定义
+ *
+ * 注意：UI 层使用 TaskView/SubTaskView（从 task-view-adapter.ts）
+ * 内部逻辑仍使用完整的 Task/SubTask 类型
  */
 import type {
   Task,
@@ -57,6 +60,21 @@ export type {
   WorkerResult,
 };
 
+// 导出视图类型（供 UI 层使用）
+import type {
+  TaskView,
+  SubTaskView,
+  TaskViewStatus,
+  SubTaskViewStatus,
+} from './task/task-view-adapter';
+
+export type {
+  TaskView,
+  SubTaskView,
+  TaskViewStatus,
+  SubTaskViewStatus,
+};
+
 // ============================================
 // Session 和 Task 管理
 // ============================================
@@ -64,12 +82,14 @@ export type {
 /**
  * Session - 插件窗口会话
  * 打开插件窗口时创建，关闭时结束
+ *
+ * 注意：任务管理已迁移到 Mission 系统
+ * 使用 MissionDrivenEngine.listTaskViews() 获取任务列表
  */
 export interface Session {
   id: string;
   createdAt: number;
   status: SessionStatus;
-  tasks: Task[];
   snapshots: FileSnapshot[];
   /** 对话消息历史 */
   messages?: SessionMessage[];
@@ -532,8 +552,8 @@ export type WebviewToExtensionMessage =
   | { type: 'deleteFAQ'; id: string }
   // 新增：前端错误上报
   | { type: 'uiError'; component: string; detail?: unknown; stack?: string }
-  // 新增：工具授权相关
   | { type: 'toolAuthorizationResponse'; allowed: boolean }
+  | { type: 'interactionResponse'; requestId: string; response: any }
   // 新增：Mermaid 图表
   | { type: 'openMermaidPanel'; code: string; title?: string };
 

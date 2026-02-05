@@ -5,9 +5,10 @@
   interface Props {
     block: ContentBlock;
     isStreaming?: boolean;
+    readOnly?: boolean;
   }
 
-  let { block, isStreaming = false }: Props = $props();
+  let { block, isStreaming = false, readOnly = false }: Props = $props();
 
   // 🔧 防御性检查：确保 block 有效且有 type 属性
   const isValidBlock = $derived(block && typeof block === 'object' && 'type' in block);
@@ -15,5 +16,5 @@
 </script>
 
 {#if Renderer}
-  <Renderer {block} {isStreaming} />
+  <Renderer {block} {isStreaming} {readOnly} />
 {/if}

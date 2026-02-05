@@ -97,10 +97,14 @@ export interface LLMResponse {
  * LLM 流式块
  */
 export interface LLMStreamChunk {
-  type: 'content_start' | 'content_delta' | 'content_end' | 'tool_call_start' | 'tool_call_delta' | 'tool_call_end' | 'thinking';
+  type: 'content_start' | 'content_delta' | 'content_end' | 'tool_call_start' | 'tool_call_delta' | 'tool_call_end' | 'thinking' | 'usage';
   content?: string;
   toolCall?: Partial<ToolCall>;
   thinking?: string;
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+  };
 }
 
 // ============================================================================

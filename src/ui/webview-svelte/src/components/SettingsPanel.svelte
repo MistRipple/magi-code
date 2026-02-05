@@ -776,11 +776,38 @@
       }
       // 执行统计更新
       else if (dataType === 'executionStatsUpdate') {
-        if (payload?.stats) {
-          executionStats = payload.stats;
-        }
-        if (payload?.orchestratorStats) {
-          totalTokens = (payload.orchestratorStats.totalInputTokens || 0) + (payload.orchestratorStats.totalOutputTokens || 0);
+        if (payload?.realtimeUpdate) {
+          // 实时增量更新
+          const worker = payload.worker;
+          const usage = payload.usage;
+          if (worker && usage) {
+            // 更新列表中的统计
+            const statsIndex = executionStats.findIndex(s => s.worker === worker);
+            if (statsIndex >= 0) {
+              const current = executionStats[statsIndex];
+              // 注意：这里的 usage 是该 worker 的累计值，直接替换即可
+              const oldTotal = (current.totalInputTokens || 0) + (current.totalOutputTokens || 0);
+              const newTotal = (usage.inputTokens || 0) + (usage.outputTokens || 0);
+              const delta = newTotal - oldTotal;
+
+              executionStats[statsIndex] = {
+                ...current,
+                totalInputTokens: usage.inputTokens || 0,
+                totalOutputTokens: usage.outputTokens || 0
+              };
+              
+              // 更新总数
+              totalTokens += delta;
+            }
+          }
+        } else {
+          // 全量更新
+          if (payload?.stats) {
+            executionStats = payload.stats;
+          }
+          if (payload?.orchestratorStats) {
+            totalTokens = (payload.orchestratorStats.totalInputTokens || 0) + (payload.orchestratorStats.totalOutputTokens || 0);
+          }
         }
       }
       // 画像配置加载

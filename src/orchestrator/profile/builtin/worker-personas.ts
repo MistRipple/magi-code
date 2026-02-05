@@ -37,6 +37,11 @@ export const WORKER_PERSONAS: Record<'claude' | 'codex' | 'gemini', WorkerPerson
       '复杂逻辑添加注释',
       '提供修改摘要',
     ],
+    reasoningGuidelines: [
+      '分析任务时，先阐述对问题的理解和分析思路',
+      '执行前说明选择该方案的原因',
+      '遇到复杂决策时，列出可选方案并解释取舍',
+    ],
   },
   codex: {
     displayName: 'Codex',
@@ -66,6 +71,10 @@ export const WORKER_PERSONAS: Record<'claude' | 'codex' | 'gemini', WorkerPerson
       '简洁的修改说明',
       '列出修改的文件和行数',
     ],
+    reasoningGuidelines: [
+      '执行前简述任务理解和执行步骤',
+      '说明关键决策点的选择依据',
+    ],
   },
   gemini: {
     displayName: 'Gemini',
@@ -94,6 +103,10 @@ export const WORKER_PERSONAS: Record<'claude' | 'codex' | 'gemini', WorkerPerson
     outputPreferences: [
       '说明 UI 变更的视觉效果',
       '提供交互说明',
+    ],
+    reasoningGuidelines: [
+      '分析任务时，说明对需求的理解',
+      '解释设计决策和用户体验考量',
     ],
   },
 };

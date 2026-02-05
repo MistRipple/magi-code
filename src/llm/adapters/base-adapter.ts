@@ -38,6 +38,7 @@ export interface AdapterEvents {
   message: (content: string) => void;
   toolCall: (toolName: string, args: any) => void;
   toolResult: (toolName: string, result: string) => void;
+  thinking: (content: string) => void;
 }
 
 /**
@@ -68,6 +69,12 @@ export abstract class BaseLLMAdapter extends EventEmitter {
    * - false: 静默模式，用于内部后台操作（如内存压缩）
    */
   protected _streamToUI: boolean = true;
+  protected decisionHook?: (event: {
+    type: 'thinking' | 'tool_call' | 'tool_result';
+    toolName?: string;
+    toolArgs?: any;
+    toolResult?: string;
+  }) => string[];
 
   constructor(
     client: LLMClient,
@@ -102,6 +109,18 @@ export abstract class BaseLLMAdapter extends EventEmitter {
   }
 
   /**
+   * 设置决策点回调
+   */
+  setDecisionHook(hook?: (event: {
+    type: 'thinking' | 'tool_call' | 'tool_result';
+    toolName?: string;
+    toolArgs?: any;
+    toolResult?: string;
+  }) => string[]): void {
+    this.decisionHook = hook;
+  }
+
+  /**
    * 使用当前请求上下文启动流式消息
    * 优先复用占位消息 ID，确保 UI 端流式更新命中同一条消息
    */
@@ -121,6 +140,44 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     });
 
     return this.normalizer.startStream(this.currentTraceId, undefined, boundMessageId);
+  }
+
+  // 节流定时器
+  private tokenUpdateTimer: NodeJS.Timeout | null = null;
+  // 待发送的 Token 更新
+  private pendingTokenUpdate = false;
+
+  /**
+   * 发送实时 Token 更新（节流 1000ms）
+   */
+  private sendRealtimeTokenUpdate(): void {
+    if (this.tokenUpdateTimer) {
+      this.pendingTokenUpdate = true;
+      return;
+    }
+
+    this.emitTokenUpdate();
+
+    this.tokenUpdateTimer = setTimeout(() => {
+      this.tokenUpdateTimer = null;
+      if (this.pendingTokenUpdate) {
+        this.pendingTokenUpdate = false;
+        this.emitTokenUpdate();
+      }
+    }, 1000);
+  }
+
+  private emitTokenUpdate(): void {
+    if (!this.messageHub) return;
+    
+    this.messageHub.data('executionStatsUpdate', {
+      realtimeUpdate: true,
+      worker: this.agent,
+      usage: {
+        inputTokens: this.totalTokenUsage.inputTokens,
+        outputTokens: this.totalTokenUsage.outputTokens
+      }
+    });
   }
 
   /**
@@ -173,6 +230,12 @@ export abstract class BaseLLMAdapter extends EventEmitter {
 
     // 流式更新：直接发送到 MessageHub
     this.normalizer.on(MESSAGE_EVENTS.UPDATE, (update) => {
+      // 实时 Token 统计
+      if (update.tokenUsage) {
+        this.recordTokenUsage(update.tokenUsage);
+        this.sendRealtimeTokenUpdate();
+      }
+
       if (this._streamToUI) {
         this.messageHub.sendUpdate(update);
       }

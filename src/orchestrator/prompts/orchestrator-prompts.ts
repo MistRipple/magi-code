@@ -100,6 +100,7 @@ ${projectContext ? `## 项目上下文\n${projectContext}\n` : ''}
   "subTasks": [
     {
       "id": "1",
+      "shortTitle": "简短标题（≤20字，用于 Worker 卡片显示，如：分析依赖、重构模块）",
       "description": "子任务描述",
       "assignedWorker": "claude/codex/gemini",
       "reason": "选择该 Worker 的原因",
@@ -188,12 +189,87 @@ ${resultsText}
 }
 
 // ============================================================================
-// Phase 0: 轻量路由判断 Prompt
+// Phase 2: 需求分析 Prompt（合并目标理解 + 路由决策）
+// ============================================================================
+
+/**
+ * 构建需求分析 Prompt
+ * Phase 2: 一次 LLM 调用，同时输出目标理解和路由决策
+ *
+ * @see docs/workflow-design.md - 5 阶段工作流
+ */
+export function buildRequirementAnalysisPrompt(
+  userPrompt: string,
+  recommendedMode: string,
+  categoryHints: string
+): string {
+  return `你是一个任务编排者，请完成需求分析，同时输出目标理解和路由决策。
+
+## 用户请求
+${userPrompt}
+
+## 上游推荐模式
+${recommendedMode}
+
+## 画像任务类型（仅用于理解任务分类）
+${categoryHints}
+
+## 分析要求
+
+### 1. 目标理解
+- 用户想要达成什么（goal）
+- 任务的复杂度和关键点（analysis）
+- 任何限制条件（constraints）
+- 如何判断任务完成（acceptanceCriteria）
+- 风险评估（riskLevel: low/medium/high, riskFactors）
+
+### 2. 路由决策
+- needsWorker=false 时，必须提供 directResponse
+- needsWorker=true 时，给出 delegationBriefings（任务委派说明）
+- **涉及代码/文件修改、执行工具或工程性产出时，必须 needsWorker=true**
+- **复杂工程任务必须 needsWorker=true**：
+  - 包含"搭建"、"开发"、"实现"、"创建"等动词 + 系统/模块/后台/平台等名词
+  - 涉及多个功能模块
+  - 需要创建多个文件或目录结构
+- 根据任务性质选择 executionMode：
+  - direct: 简单任务（无需 Todo）
+  - sequential: 有依赖或需按序执行
+  - parallel: 多模块且无依赖
+  - dependency_chain: 明确依赖链（前置产出作为后续输入）
+
+## 输出格式
+
+用自然语言简要说明你的理解，然后输出 JSON。不要使用固定的标题格式。
+
+JSON 结构：
+\`\`\`json
+{
+  "goal": "用户想要达成什么",
+  "analysis": "任务的复杂度和关键点",
+  "constraints": ["任何限制条件"],
+  "acceptanceCriteria": ["如何判断任务完成"],
+  "riskLevel": "low|medium|high",
+  "riskFactors": ["可能的风险因素"],
+  "needsWorker": true/false,
+  "directResponse": "当不需要 Worker 时必须提供",
+  "delegationBriefings": ["给执行者的委托说明（可多条，对应多个 Worker）"],
+  "executionMode": "direct|sequential|parallel|dependency_chain",
+  "needsTooling": true/false,
+  "requiresModification": true/false,
+  "reason": "决策理由（用户可见）"
+}
+\`\`\``;
+}
+
+// ============================================================================
+// Phase 0: 轻量路由判断 Prompt（已废弃，保留向后兼容）
 // ============================================================================
 
 /**
  * 构建 Worker 需求判断 Prompt
  * 由编排者 LLM 决策是否需要 Worker 执行
+ *
+ * @deprecated 请使用 buildRequirementAnalysisPrompt，它合并了目标理解和路由决策
  */
 export function buildWorkerNeedDecisionPrompt(
   userPrompt: string,
@@ -212,15 +288,23 @@ ${recommendedMode}
 ${categoryHints}
 
 ## 判断要求
-1. **仅输出 JSON**，不要任何解释或额外文本
-2. needsWorker=false 时，必须提供 directResponse
-3. needsWorker=true 时，只需给出 delegationBriefing（单条说明），不需要选择 Worker 或分类
-4. **涉及代码/文件修改、执行工具或工程性产出（diff/代码/配置）时，必须 needsWorker=true**
+1. needsWorker=false 时，必须提供 directResponse
+2. needsWorker=true 时，只需给出 delegationBriefing（单条说明），不需要选择 Worker 或分类
+3. **涉及代码/文件修改、执行工具或工程性产出（diff/代码/配置）时，必须 needsWorker=true**
+4. **【关键】复杂工程任务必须 needsWorker=true**：
+   - 包含"搭建"、"开发"、"实现"、"创建"等动词 + 系统/模块/后台/平台等名词 → **必须 needsWorker=true**
+   - 涉及多个功能模块（如"商品管理、订单系统、数据看板"）→ **必须 needsWorker=true**
+   - 需要创建多个文件或目录结构 → **必须 needsWorker=true**
 5. 编排者可使用工具，但不应因此强制派发 Worker
 6. requiresModification=true 仅在需要对文件产生实际修改（增删改文件）时设置；仅分析/阅读则为 false
 7. **delegationBriefing**: 当 needsWorker=true 时，生成一段自然语言的任务委托说明，像同事间的工作交接，包含任务背景、重点关注点、期望产出
 
-## 输出格式（严格 JSON）
+## 输出格式
+
+用自然语言简要说明你的判断，然后输出 JSON。不要使用固定的标题格式。
+
+JSON 结构：
+\`\`\`json
 {
   "needsWorker": true/false,
   "delegationBriefing": "给执行者的委托说明",
@@ -228,7 +312,8 @@ ${categoryHints}
   "requiresModification": true/false,
   "directResponse": "当不需要 Worker 时必须提供",
   "reason": "简短判断理由"
-}`;
+}
+\`\`\``;
 }
 
 // ============================================================================
@@ -398,7 +483,7 @@ export function buildCompactAnalysisPrompt(
 Workers: ${workers}
 ${context ? `上下文: ${context}\n` : ''}
 输出纯JSON:
-{"analysis":"分析","isSimpleTask":bool,"needsWorker":bool,"directResponse":"直接回答(可选)","needsUserInput":bool,"questions":[],"needsCollaboration":bool,"subTasks":[{"id":"1","description":"描述","assignedWorker":"worker","targetFiles":[],"dependencies":[],"delegationBriefing":"自然语言委托说明"}],"executionMode":"parallel/sequential","summary":"总结"}
+{"analysis":"分析","isSimpleTask":bool,"needsWorker":bool,"directResponse":"直接回答(可选)","needsUserInput":bool,"questions":[],"needsCollaboration":bool,"subTasks":[{"id":"1","shortTitle":"≤10字标题","description":"描述","assignedWorker":"worker","targetFiles":[],"dependencies":[],"delegationBriefing":"自然语言委托说明"}],"executionMode":"parallel/sequential","summary":"总结"}
 
 规则: 前端→Gemini, 后端→Codex, 复杂→Claude. 禁止tool_use.`;
 }

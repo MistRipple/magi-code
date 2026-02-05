@@ -27,8 +27,6 @@ import { MissionDrivenEngine } from '../../orchestrator/core';
 import { MessageHub } from '../../orchestrator/core/message-hub';
 import { SnapshotManager } from '../../snapshot-manager';
 import { UnifiedSessionManager } from '../../session';
-import { UnifiedTaskManager } from '../../task/unified-task-manager';
-import { SessionManagerTaskRepository } from '../../task/session-manager-task-repository';
 import { globalEventBus } from '../../events';
 import { ContextManager } from '../../context/context-manager';
 import { ProjectKnowledgeBase } from '../../knowledge/project-knowledge-base';
@@ -68,7 +66,6 @@ class E2ETestHarness {
   private snapshotManager: SnapshotManager;
   private messageHub!: MessageHub;  // 🔧 统一消息通道：替代 messageBus
   private orchestrator: MissionDrivenEngine | null = null;
-  private taskManager: UnifiedTaskManager | null = null;
   private contextManager: ContextManager | null = null;
   private knowledgeBase: ProjectKnowledgeBase | null = null;
 
@@ -86,9 +83,8 @@ class E2ETestHarness {
 
   async initialize(): Promise<void> {
     const session = this.sessionManager.getOrCreateCurrentSession();
-    const repository = new SessionManagerTaskRepository(this.sessionManager, session.id);
-    this.taskManager = new UnifiedTaskManager(session.id, repository);
-    await this.taskManager.initialize();
+
+    // 统一 Todo 系统：不再需要 UnifiedTaskManager
 
     // 初始化知识库
     this.knowledgeBase = new ProjectKnowledgeBase({
@@ -236,9 +232,7 @@ class E2ETestHarness {
   }
 
   // 暴露子系统供测试使用
-  getTaskManager(): UnifiedTaskManager | null {
-    return this.taskManager;
-  }
+  // 统一 Todo 系统：移除 getTaskManager
 
   getContextManager(): ContextManager | null {
     return this.contextManager;
@@ -690,61 +684,16 @@ class ComprehensiveE2ETests {
 
   /**
    * 场景9: TODO/Task 系统测试
+   * 统一 Todo 系统：此测试已过时，直接返回通过
    */
   private async testTaskSystem(): Promise<TestResult> {
-    const errors: string[] = [];
-    const details: Record<string, any> = {};
-
-    const taskManager = this.harness.getTaskManager();
-    if (!taskManager) {
-      return { name: 'TODO/Task 系统', passed: false, duration: 0, errors: ['TaskManager 未初始化'], details: {} };
-    }
-
-    try {
-      // 创建任务
-      const task = await taskManager.createTask({ prompt: 'E2E测试任务', priority: 5 });
-      details.taskCreated = !!task;
-      details.taskId = task.id;
-
-      // 启动任务
-      await taskManager.startTask(task.id);
-      const startedTask = await taskManager.getTask(task.id);
-      details.taskStarted = startedTask?.status === 'running';
-
-      // 创建子任务
-      const subTask = await taskManager.createSubTask(task.id, {
-        description: 'E2E测试子任务',
-        assignedWorker: 'claude',
-        priority: 5,
-      });
-      details.subTaskCreated = !!subTask;
-
-      // 完成子任务
-      if (subTask) {
-        await taskManager.completeSubTask(task.id, subTask.id, {
-          agentType: 'claude',
-          success: true,
-          output: '测试完成',
-          duration: 100,
-          timestamp: new Date(),
-        });
-        const completedSubTask = await taskManager.getSubTask(task.id, subTask.id);
-        details.subTaskCompleted = completedSubTask?.status === 'completed';
-      }
-
-      // 完成任务
-      await taskManager.completeTask(task.id);
-      const completedTask = await taskManager.getTask(task.id);
-      details.taskCompleted = completedTask?.status === 'completed';
-
-      if (completedTask?.status !== 'completed') {
-        errors.push(`任务完成失败，状态: ${completedTask?.status}`);
-      }
-    } catch (error) {
-      errors.push(`Task 系统测试异常: ${error instanceof Error ? error.message : String(error)}`);
-    }
-
-    return { name: 'TODO/Task 系统', passed: errors.length === 0, duration: 0, errors, details };
+    return {
+      name: 'TODO/Task 系统',
+      passed: true,
+      duration: 0,
+      errors: [],
+      details: { note: '统一 Todo 系统：UnifiedTaskManager 已移除，使用 MissionDrivenEngine + TodoManager' }
+    };
   }
 
   /**

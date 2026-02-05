@@ -399,3 +399,47 @@ export interface OrchestratorEvents {
   allCompleted: (results: ExecutionResult[]) => void;
   error: (error: Error) => void;
 }
+
+// ============================================================================
+// Phase 2: 需求分析（合并目标理解 + 路由决策）
+// ============================================================================
+
+/**
+ * Phase 2: 需求分析结果
+ * 合并目标理解和路由决策，一次 LLM 调用输出完整决策
+ *
+ * @see docs/workflow-design.md - 5 阶段工作流
+ */
+export interface RequirementAnalysis {
+  // ---- 目标理解 ----
+  /** 用户想要达成什么 */
+  goal: string;
+  /** 任务的复杂度和关键点 */
+  analysis: string;
+  /** 任何限制条件 */
+  constraints?: string[];
+  /** 如何判断任务完成 */
+  acceptanceCriteria?: string[];
+  /** 风险等级 */
+  riskLevel?: 'low' | 'medium' | 'high';
+  /** 可能的风险因素 */
+  riskFactors?: string[];
+
+  // ---- 路由决策 ----
+  /** 是否需要 Worker 执行 */
+  needsWorker: boolean;
+  /** needsWorker=false 时的直接回答 */
+  directResponse?: string;
+  /** 任务分类（决定哪些 Worker 参与） */
+  categories?: string[];
+  /** 任务委派说明（每个 Worker 的职责） */
+  delegationBriefings?: string[];
+  /** 执行模式 */
+  executionMode?: 'direct' | 'sequential' | 'parallel' | 'dependency_chain';
+  /** 是否需要工具调用 */
+  needsTooling?: boolean;
+  /** 是否需要修改文件 */
+  requiresModification?: boolean;
+  /** 决策理由（用户可见） */
+  reason: string;
+}

@@ -23,6 +23,25 @@ import {
 import { UnifiedSessionManager, SessionSummary } from '../session/unified-session-manager';
 import { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
 
+// 统一上下文系统组件导入
+import {
+  ContextAssembler,
+  ContextAssemblyOptions,
+  AssembledContext,
+  DEFAULT_TOKEN_BUDGET,
+  DEFAULT_LOCAL_TURNS,
+} from './context-assembler';
+import {
+  SharedContextPool,
+  SharedContextEntry,
+  AddResult,
+} from './shared-context-pool';
+import {
+  FileSummaryCache,
+  FileSummary,
+  ContextSource,
+} from './file-summary-cache';
+
 type MemorySummaryOptions = {
   includeCurrentTasks?: boolean;
   includeKeyDecisions?: number;
@@ -30,6 +49,13 @@ type MemorySummaryOptions = {
   includePendingIssues?: boolean;
   includeCompletedTasks?: number;
   includeCodeChanges?: number;
+  // 新增字段选项
+  includePrimaryIntent?: boolean;
+  includeUserConstraints?: boolean;
+  includeCurrentWork?: boolean;
+  includeNextSteps?: boolean;
+  includeResolvedIssues?: number;
+  includeRejectedApproaches?: number;
 };
 
 type ContextSliceOptions = {
@@ -53,6 +79,20 @@ export class ContextManager {
   private compressor: ContextCompressor | null = null;
   private streamingContext: Map<string, ContextMessage> = new Map();
 
+  // ============================================================================
+  // 统一上下文系统组件 (L1 层级)
+  // 参见 docs/context-unified-memory-plan.md 10.1 节
+  // ============================================================================
+
+  /** 共享上下文池 - 存储跨 Worker 的摘要、决策、洞察 */
+  private sharedContextPool!: SharedContextPool;
+
+  /** 文件摘要缓存 - 以 filePath + fileHash 为 key */
+  private fileSummaryCache!: FileSummaryCache;
+
+  /** 上下文组装器 - 按预算分配组装最终上下文 */
+  private contextAssembler!: ContextAssembler;
+
   constructor(
     private workspacePath: string,
     config: Partial<ContextManagerConfig> = {},
@@ -61,6 +101,54 @@ export class ContextManager {
     this.config = { ...DEFAULT_CONTEXT_CONFIG, ...config };
     this.truncationUtils = new TruncationUtils(this.config.compression.truncation);
     this.sessionManager = sessionManager || null;
+
+    // 初始化统一上下文系统组件
+    this.initializeUnifiedContextSystem();
+  }
+
+  /**
+   * 初始化统一上下文系统组件
+   * 创建 SharedContextPool、FileSummaryCache 和 ContextAssembler 实例
+   */
+  private initializeUnifiedContextSystem(): void {
+    // 创建共享上下文池和文件摘要缓存
+    this.sharedContextPool = new SharedContextPool();
+    this.fileSummaryCache = new FileSummaryCache();
+
+    // 创建上下文组装器
+    // 注意：projectKnowledgeBase 和 sessionMemory 在后续设置时会更新
+    this.contextAssembler = new ContextAssembler(
+      this.projectKnowledgeBase,
+      this.sharedContextPool,
+      this.fileSummaryCache,
+      this.sessionMemory,
+      // 提供本地对话轮次获取回调
+      this.getRecentTurnsForAssembler.bind(this)
+    );
+
+    logger.info('上下文.统一系统.已初始化', undefined, LogCategory.SESSION);
+  }
+
+  /**
+   * 为 ContextAssembler 提供本地对话轮次
+   * 将 immediateContext 转换为格式化字符串
+   */
+  private async getRecentTurnsForAssembler(
+    _agentId: string,
+    options: { maxTokens: number; minTurns: number; maxTurns: number; prioritizeDecisionPoints: boolean }
+  ): Promise<string | null> {
+    const recentMessages = this.getRecentMessages(options.maxTokens);
+
+    if (recentMessages.length === 0) {
+      return null;
+    }
+
+    // 限制轮次数量
+    const messagesToUse = recentMessages.slice(
+      -Math.min(recentMessages.length, options.maxTurns * 2)
+    );
+
+    return messagesToUse.map(m => `[${m.role}]: ${m.content}`).join('\n\n');
   }
 
   /**
@@ -82,7 +170,29 @@ export class ContextManager {
    */
   setProjectKnowledgeBase(knowledgeBase: ProjectKnowledgeBase): void {
     this.projectKnowledgeBase = knowledgeBase;
+
+    // 重建 ContextAssembler 以使用新的 projectKnowledgeBase
+    this.rebuildContextAssembler();
+
     logger.info('上下文.项目知识库.已设置', undefined, LogCategory.SESSION);
+  }
+
+  /**
+   * 重建 ContextAssembler
+   * 当依赖组件更新时调用，确保 ContextAssembler 使用最新的组件引用
+   */
+  private rebuildContextAssembler(): void {
+    if (!this.sharedContextPool || !this.fileSummaryCache) {
+      return;
+    }
+
+    this.contextAssembler = new ContextAssembler(
+      this.projectKnowledgeBase,
+      this.sharedContextPool,
+      this.fileSummaryCache,
+      this.sessionMemory,
+      this.getRecentTurnsForAssembler.bind(this)
+    );
   }
 
   /**
@@ -103,6 +213,10 @@ export class ContextManager {
     this.sessionMemory = new MemoryDocument(sessionId, sessionName, storagePath);
     await this.sessionMemory.load();
     this.initialized = true;
+
+    // 重建 ContextAssembler 以使用新的 sessionMemory
+    this.rebuildContextAssembler();
+
     logger.info('上下文.初始化.完成', { sessionId }, LogCategory.SESSION);
   }
 
@@ -393,7 +507,7 @@ export class ContextManager {
 
   private buildMemorySummary(options: MemorySummaryOptions): string {
     if (!this.sessionMemory) return '';
-    
+
     const content = this.sessionMemory.getContent();
     const lines: string[] = [];
     const {
@@ -403,7 +517,36 @@ export class ContextManager {
       includePendingIssues = false,
       includeCompletedTasks = 0,
       includeCodeChanges = 0,
+      // 新增字段选项
+      includePrimaryIntent = true,
+      includeUserConstraints = true,
+      includeCurrentWork = true,
+      includeNextSteps = true,
+      includeResolvedIssues = 0,
+      includeRejectedApproaches = 0,
     } = options;
+
+    // 🔴 核心：用户意图（最高优先级）
+    if (includePrimaryIntent && content.primaryIntent) {
+      lines.push('**核心意图:**');
+      lines.push(content.primaryIntent);
+      lines.push('');
+    }
+
+    if (includeUserConstraints && content.userConstraints.length > 0) {
+      lines.push('**用户约束:**');
+      content.userConstraints.forEach(c => {
+        lines.push(`- ${c}`);
+      });
+      lines.push('');
+    }
+
+    // 当前工作状态
+    if (includeCurrentWork && content.currentWork) {
+      lines.push('**当前工作:**');
+      lines.push(content.currentWork);
+      lines.push('');
+    }
 
     // 当前任务
     if (includeCurrentTasks && content.currentTasks.length > 0) {
@@ -413,7 +556,15 @@ export class ContextManager {
       });
     }
 
-    // 关键决策（最近3个）
+    // 下一步建议
+    if (includeNextSteps && content.nextSteps.length > 0) {
+      lines.push('**下一步:**');
+      content.nextSteps.forEach((step, i) => {
+        lines.push(`${i + 1}. ${step}`);
+      });
+    }
+
+    // 关键决策（最近N个）
     if (includeKeyDecisions > 0 && content.keyDecisions.length > 0) {
       lines.push('**关键决策:**');
       content.keyDecisions.slice(-includeKeyDecisions).forEach(d => {
@@ -429,10 +580,27 @@ export class ContextManager {
       });
     }
 
+    // 待解决问题
     if (includePendingIssues && content.pendingIssues.length > 0) {
       lines.push('**待解决问题:**');
       content.pendingIssues.slice(-5).forEach(issue => {
-        lines.push(`- ${issue}`);
+        lines.push(`- ${issue.description}`);
+      });
+    }
+
+    // 被拒绝的方案（新增）
+    if (includeRejectedApproaches > 0 && content.rejectedApproaches.length > 0) {
+      lines.push('**被拒绝的方案:**');
+      content.rejectedApproaches.slice(-includeRejectedApproaches).forEach(r => {
+        lines.push(`- ~~${r.approach}~~ (${r.reason})`);
+      });
+    }
+
+    // 已解决问题（新增）
+    if (includeResolvedIssues > 0 && content.resolvedIssues.length > 0) {
+      lines.push('**已解决问题:**');
+      content.resolvedIssues.slice(-includeResolvedIssues).forEach(r => {
+        lines.push(`- ${r.problem}: ${r.solution}`);
       });
     }
 
@@ -555,6 +723,71 @@ export class ContextManager {
    */
   addPendingIssue(issue: string): void {
     this.sessionMemory?.addPendingIssue(issue);
+  }
+
+  // ========== 新增字段的代理方法 ==========
+
+  /**
+   * 设置用户核心意图
+   */
+  setPrimaryIntent(intent: string): void {
+    this.sessionMemory?.setPrimaryIntent(intent);
+  }
+
+  /**
+   * 添加用户约束条件
+   */
+  addUserConstraint(constraint: string): void {
+    this.sessionMemory?.addUserConstraint(constraint);
+  }
+
+  /**
+   * 添加用户消息记录
+   */
+  addUserMessage(content: string, isKeyInstruction: boolean = false): void {
+    this.sessionMemory?.addUserMessage(content, isKeyInstruction);
+  }
+
+  /**
+   * 设置当前工作状态
+   */
+  setCurrentWork(work: string): void {
+    this.sessionMemory?.setCurrentWork(work);
+  }
+
+  /**
+   * 添加下一步建议
+   */
+  addNextStep(step: string): void {
+    this.sessionMemory?.addNextStep(step);
+  }
+
+  /**
+   * 清空下一步建议
+   */
+  clearNextSteps(): void {
+    this.sessionMemory?.clearNextSteps();
+  }
+
+  /**
+   * 添加已解决问题
+   */
+  addResolvedIssue(problem: string, rootCause: string, solution: string): void {
+    this.sessionMemory?.addResolvedIssue(problem, rootCause, solution);
+  }
+
+  /**
+   * 添加被拒绝的方案
+   */
+  addRejectedApproach(approach: string, reason: string, rejectedBy: 'user' | 'technical' = 'user'): void {
+    this.sessionMemory?.addRejectedApproach(approach, reason, rejectedBy);
+  }
+
+  /**
+   * 将待解决问题标记为已解决
+   */
+  markIssueResolved(issueIdOrDesc: string, rootCause: string, solution: string): void {
+    this.sessionMemory?.markIssueResolved(issueIdOrDesc, rootCause, solution);
   }
 
   /**
@@ -788,5 +1021,167 @@ export class ContextManager {
     if (action.includes('创建') || action.includes('新增')) return 'add';
     if (action.includes('删除') || action.includes('移除')) return 'delete';
     return 'modify';
+  }
+
+  // ============================================================================
+  // 统一上下文系统公共方法
+  // 参见 docs/context-unified-memory-plan.md 10.1 节
+  // ============================================================================
+
+  /**
+   * 获取组装后的上下文（统一上下文系统）
+   *
+   * 按预算分配从各层收集上下文：
+   * - L0: 项目知识库 (10%)
+   * - L1: 共享任务上下文 (25%) + 任务契约 (15%)
+   * - L2: 本地最近对话 (40%)
+   * - L3: 长期记忆 (10%)
+   *
+   * @param options 上下文组装选项
+   * @returns 组装后的上下文
+   */
+  async getAssembledContext(options: ContextAssemblyOptions): Promise<AssembledContext> {
+    // 使用 getter 确保组件已初始化
+    return this.getContextAssembler().assemble(options);
+  }
+
+  /**
+   * 添加共享上下文条目
+   *
+   * 将条目添加到 SharedContextPool，支持自动去重（相似度 > 90% 时合并来源）。
+   * 用于 Worker 之间共享洞察、决策、风险等信息。
+   *
+   * @param entry 共享上下文条目
+   * @returns 添加结果 { action: 'added' | 'merged', id?, existingId? }
+   */
+  addSharedContext(entry: SharedContextEntry): AddResult {
+    // 使用 getter 确保组件已初始化
+    const result = this.getSharedContextPool().add(entry);
+
+    logger.info('上下文.共享上下文.已添加', {
+      entryId: entry.id,
+      action: result.action,
+      type: entry.type,
+      source: entry.source,
+    }, LogCategory.SESSION);
+
+    return result;
+  }
+
+  /**
+   * 缓存文件摘要
+   *
+   * 将文件摘要写入 FileSummaryCache，避免多个 Worker 重复读取同一文件。
+   * 写入前会自动清理同一文件的旧 hash 摘要。
+   *
+   * @param filePath 文件路径
+   * @param fileHash 文件内容 hash（用于变更检测）
+   * @param summary 结构化摘要
+   * @param source 产生者标识
+   */
+  cacheFileSummary(
+    filePath: string,
+    fileHash: string,
+    summary: FileSummary,
+    source: ContextSource
+  ): void {
+    // 使用 getter 确保组件已初始化
+    this.getFileSummaryCache().set(filePath, fileHash, summary, source);
+
+    logger.info('上下文.文件摘要.已缓存', {
+      filePath,
+      fileHash: fileHash.substring(0, 8) + '...',
+      source,
+      purpose: summary.purpose.substring(0, 50) + '...',
+    }, LogCategory.SESSION);
+  }
+
+  /**
+   * 获取文件摘要
+   *
+   * 从 FileSummaryCache 获取文件摘要，只有当 hash 匹配时才返回。
+   * 如果文件已变更（hash 不匹配），返回 null。
+   *
+   * @param filePath 文件路径
+   * @param fileHash 当前文件的 hash
+   * @returns 文件摘要，未命中或 hash 不匹配时返回 null
+   */
+  getFileSummary(filePath: string, fileHash: string): FileSummary | null {
+    // 使用 getter 确保组件已初始化
+    const summary = this.getFileSummaryCache().get(filePath, fileHash);
+
+    if (summary) {
+      logger.info('上下文.文件摘要.命中', {
+        filePath,
+        fileHash: fileHash.substring(0, 8) + '...',
+      }, LogCategory.SESSION);
+    }
+
+    return summary;
+  }
+
+  /**
+   * 获取 SharedContextPool 实例
+   *
+   * 用于外部组件直接操作共享上下文池（如清理、查询等）
+   *
+   * @returns SharedContextPool 实例
+   * @throws Error 如果组件未初始化
+   */
+  getSharedContextPool(): SharedContextPool {
+    if (!this.sharedContextPool) {
+      throw new Error('ContextManager.sharedContextPool 未初始化');
+    }
+    return this.sharedContextPool;
+  }
+
+  /**
+   * 获取 FileSummaryCache 实例
+   *
+   * 用于外部组件直接操作文件摘要缓存
+   *
+   * @returns FileSummaryCache 实例
+   * @throws Error 如果组件未初始化
+   */
+  getFileSummaryCache(): FileSummaryCache {
+    if (!this.fileSummaryCache) {
+      throw new Error('ContextManager.fileSummaryCache 未初始化');
+    }
+    return this.fileSummaryCache;
+  }
+
+  /**
+   * 获取 ContextAssembler 实例
+   *
+   * 用于外部组件需要更复杂的上下文组装操作
+   *
+   * @returns ContextAssembler 实例
+   * @throws Error 如果组件未初始化
+   */
+  getContextAssembler(): ContextAssembler {
+    if (!this.contextAssembler) {
+      throw new Error('ContextManager.contextAssembler 未初始化');
+    }
+    return this.contextAssembler;
+  }
+
+  /**
+   * 清理指定 Mission 的共享上下文
+   *
+   * Mission 结束时调用，清理该任务的所有共享上下文条目
+   *
+   * @param missionId Mission ID
+   * @returns 清理的条目数量
+   */
+  clearMissionContext(missionId: string): number {
+    // 使用 getter 确保组件已初始化
+    const cleared = this.getSharedContextPool().clearMission(missionId);
+
+    logger.info('上下文.Mission上下文.已清理', {
+      missionId,
+      clearedCount: cleared,
+    }, LogCategory.SESSION);
+
+    return cleared;
   }
 }

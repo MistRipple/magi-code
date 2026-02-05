@@ -16,8 +16,6 @@ import { LLMAdapterFactory } from '../../llm/adapter-factory';
 import { MissionDrivenEngine } from '../../orchestrator/core';
 import { UnifiedSessionManager } from '../../session';
 import { SnapshotManager } from '../../snapshot-manager';
-import { UnifiedTaskManager } from '../../task/unified-task-manager';
-import { SessionManagerTaskRepository } from '../../task/session-manager-task-repository';
 import { MessageHub } from '../../orchestrator/core/message-hub';
 import { WorkerSlot } from '../../types';
 import { LLMConfigLoader } from '../../llm/config';
@@ -69,11 +67,7 @@ async function testImageRecognition(imagePath: string): Promise<void> {
   // 初始化 adapter factory
   await adapterFactory.initialize();
 
-  // 创建 session
-  const session = sessionManager.getOrCreateCurrentSession();
-  const taskRepository = new SessionManagerTaskRepository(sessionManager, session.id);
-  const taskManager = new UnifiedTaskManager(session.id, taskRepository);
-  await taskManager.initialize();
+  // 统一 Todo 系统：不再需要 UnifiedTaskManager
 
   // 获取启用的 workers
   const fullConfig = LLMConfigLoader.loadFullConfig();
@@ -108,7 +102,7 @@ async function testImageRecognition(imagePath: string): Promise<void> {
   );
 
   orchestrator.setKnowledgeBase(knowledgeBase);
-  orchestrator.setTaskManager(taskManager);
+  // 统一 Todo 系统：不再需要 setTaskManager
 
   // 自动确认/澄清回调
   orchestrator.setConfirmationCallback(async () => true);

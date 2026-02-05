@@ -324,7 +324,8 @@ function handleContentMessage(standard: StandardMessage) {
   const meta = standard.metadata as Record<string, unknown> | undefined;
   const requestId = meta?.requestId as string | undefined;
   const isPlaceholder = Boolean(meta?.isPlaceholder);
-  const isUserMessage = meta?.role === 'user';
+  // 方案 B：使用 MessageType.USER_INPUT 判断用户消息
+  const isUserMessage = standard.type === MessageType.USER_INPUT;
 
   const upsertThreadMessage = (message: Message) => {
     const existing = getState().threadMessages.find(m => m.id === message.id);
@@ -408,6 +409,8 @@ function handleContentMessage(standard: StandardMessage) {
       }
     }
     upsertThreadMessage(uiMessage);
+    // 🔧 注册用户消息的路由，确保后续 Complete 消息能找到目标
+    routeStandardMessage(standard);
     return;
   }
 
@@ -433,7 +436,34 @@ function handleContentMessage(standard: StandardMessage) {
       }
 
       if (placeholderId !== standard.id) {
-        throw new Error(`[MessageHandler] 首条响应消息 ID 不匹配占位消息: placeholder=${placeholderId} real=${standard.id}`);
+        // 🔧 修复：ID 不匹配时不再报错，而是执行原地替换
+        // 后端可能生成了新的 ID 而未复用占位 ID，这是允许的
+        console.warn(`[MessageHandler] 响应 ID 变更，执行原地替换: ${placeholderId} -> ${standard.id}`);
+
+        // 1. 更新绑定关系指向新 ID
+        updateRequestBinding(requestId, { realMessageId: standard.id, placeholderMessageId: standard.id });
+
+        // 2. 构造新消息对象
+        const newMessage: import('../types/message').Message = {
+          ...uiMessage,
+          metadata: {
+            ...(uiMessage.metadata || {}),
+            requestId, // 保持请求关联
+            isPlaceholder: false,
+            wasPlaceholder: true,
+          },
+        };
+
+        // 3. 在 UI 中原地替换（保持滚动位置和顺序）
+        replaceThreadMessage(placeholderId, newMessage);
+
+        // 4. 标记活跃并回放缓冲
+        if (newMessage.isStreaming) {
+          markMessageActive(newMessage.id);
+        }
+        flushPendingStreamUpdates(standard.id);
+
+        return;
       }
 
       if (!hasRenderableContent(uiMessage)) {
@@ -469,7 +499,18 @@ function handleContentMessage(standard: StandardMessage) {
   }
 
   // === 后续消息处理（非首次或无占位消息关联） ===
-  const target = routeStandardMessage(standard);
+  let target = routeStandardMessage(standard);
+
+  // 🔧 强校验：主对话区 (Thread) 禁止 Worker 直接写入（除了重要消息）
+  // 例外情况：ERROR 和 INTERACTION 类型允许 Worker 写入主对话区，确保用户能看到
+  if (target.location === 'thread' && standard.source === 'worker') {
+    const allowedInThread = [MessageType.ERROR, MessageType.INTERACTION].includes(standard.type as MessageType);
+    if (!allowedInThread) {
+      console.warn('[MessageHandler] 安全拦截: Worker 试图写入主对话区，强制重定向', { id: standard.id });
+      const workerSlot = normalizeWorkerSlot(standard.agent) || 'claude';
+      target = { location: 'worker', worker: workerSlot };
+    }
+  }
 
   if (target.location === 'none' || target.location === 'task') {
     return;
@@ -488,11 +529,18 @@ function handleContentMessage(standard: StandardMessage) {
         addThreadMessage(uiMessage);
       }
     } else if (target.location === 'worker') {
+      console.log('[MessageHandler] 🎯 路由 Worker 消息:', {
+        messageId: uiMessage.id,
+        worker: target.worker,
+        isStreaming: uiMessage.isStreaming,
+        blocksCount: uiMessage.blocks?.length ?? 0,
+      });
       const existing = getState().agentOutputs[target.worker].find(m => m.id === uiMessage.id);
       if (existing) {
         updateAgentMessage(target.worker, uiMessage.id, uiMessage);
       } else {
         addAgentMessage(target.worker, uiMessage);
+        console.log('[MessageHandler] ✅ Worker 消息已添加:', target.worker, uiMessage.id);
       }
     } else if (target.location === 'both') {
       const threadExisting = getState().threadMessages.find(m => m.id === uiMessage.id);
@@ -553,7 +601,9 @@ function handleStandardComplete(message: WebviewMessage) {
   const actualMessageId = standard.id;
   const location = getMessageTarget(actualMessageId);
   if (!location) {
-    throw new Error(`[MessageHandler] 完成消息缺少路由: ${standard.id}`);
+    // 🔧 容错处理：如果找不到路由（可能是用户消息或已被清理），记录警告并忽略
+    console.warn(`[MessageHandler] 完成消息缺少路由，忽略: ${standard.id}`);
+    return;
   }
 
   if (location.location === 'none' || location.location === 'task') {
@@ -573,7 +623,10 @@ function handleStandardComplete(message: WebviewMessage) {
   }
 
   if (!messageExists) {
-    throw new Error(`[MessageHandler] 完成消息未找到对应卡片: ${actualMessageId}`);
+    // 🔧 修复：如果消息不存在，说明 STARTED 消息可能未被处理
+    // 改为警告并忽略，而不是抛出异常阻塞消息处理
+    console.warn(`[MessageHandler] 完成消息未找到对应卡片，忽略: ${actualMessageId}`);
+    return;
   }
 
   // 🔧 修复：消息完成时标记为非活跃，驱动 isProcessing 状态
@@ -987,6 +1040,27 @@ function handleSessionMessagesLoaded(message: WebviewMessage) {
       if (typeof m?.timestamp !== 'number') {
         throw new Error('[MessageHandler] SessionMessagesLoaded 消息 timestamp 无效');
       }
+
+      // 方案 B：根据 role 或已有 type 字段映射 MessageType
+      // 优先使用已有 type 字段，兼容新旧格式
+      let resolvedType: import('../types/message').MessageType;
+      if (m.type && typeof m.type === 'string') {
+        // 新格式：直接使用已有 type
+        resolvedType = m.type as import('../types/message').MessageType;
+      } else {
+        // 旧格式：根据 role 映射
+        switch (role) {
+          case 'user':
+            resolvedType = 'user_input';
+            break;
+          case 'system':
+            resolvedType = 'system-notice';
+            break;
+          default:
+            resolvedType = 'text';
+        }
+      }
+
       return {
         id,
         role,
@@ -995,6 +1069,7 @@ function handleSessionMessagesLoaded(message: WebviewMessage) {
         timestamp: m.timestamp,
         isStreaming: false,
         isComplete: true,
+        type: resolvedType,
         blocks: mapStandardBlocks(
           (Array.isArray(m.blocks) && m.blocks.length > 0)
             ? m.blocks
@@ -1367,11 +1442,13 @@ function mapStandardMessage(standard: StandardMessage): Message {
 
   const dispatchToWorker = Boolean(baseMetadata.dispatchToWorker);
 
-  const explicitRole = (baseMetadata as { role?: unknown } | undefined)?.role;
-  const resolvedRole =
-    explicitRole === 'user'
-      ? 'user'
-      : (isSystemNotice ? 'system' : 'assistant');
+  // 方案 B：role 字段仅用于系统消息兼容，用户消息通过 type 判断
+  const resolvedRole: 'user' | 'assistant' | 'system' =
+    isSystemNotice ? 'system' : 'assistant';
+
+  // 方案 B：直接传递 MessageType，不做转换
+  // UI 层使用 type === 'user_input' 判断用户消息
+  const resolvedType = standard.type as import('../types/message').MessageType;
 
   return {
     id: standard.id,
@@ -1382,7 +1459,7 @@ function mapStandardMessage(standard: StandardMessage): Message {
     timestamp: standard.timestamp || Date.now(),
     isStreaming,
     isComplete,
-    type: isSystemNotice ? 'system-notice' : 'message',
+    type: resolvedType,
     noticeType: isSystemNotice ? (isErrorNotice ? 'error' : 'info') : undefined,
     metadata: {
       ...baseMetadata,
@@ -1396,7 +1473,9 @@ function mapStandardMessage(standard: StandardMessage): Message {
 
 function hasRenderableContent(message: Message): boolean {
   if (message.type === 'system-notice') return true;
-  if (message.metadata?.subTaskCard) return true;
+  if (message.type === 'task_card') return true;  // 方案 B：使用 MessageType.TASK_CARD
+  if (message.type === 'instruction') return true;  // 方案 B：任务说明始终可渲染
+  if (message.type === 'thinking') return true;  // 思考过程始终可渲染
   if (message.content && message.content.trim()) return true;
   if (message.blocks && message.blocks.length > 0) {
     return message.blocks.some((block) => {

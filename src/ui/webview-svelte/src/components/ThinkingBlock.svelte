@@ -164,8 +164,9 @@
     padding: var(--space-3, 12px);
     border-top: 1px solid var(--border);
     background: rgba(139, 92, 246, 0.02);
-    max-height: 400px;
-    overflow-y: auto;
+    /* 🔧 移除固定高度限制，让内容自然撑开 */
+    /* max-height: 400px; */
+    /* overflow-y: auto; */
     animation: expandContent 0.2s ease-out;
   }
 

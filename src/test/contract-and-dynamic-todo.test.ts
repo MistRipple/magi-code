@@ -94,6 +94,7 @@ function createTestAssignment(id: string, missionId: string, workerId: WorkerSlo
       alternatives: [],
     },
     responsibility: 'Test responsibility',
+    shortTitle: '测试任务',
     scope: { includes: ['test'], excludes: [] },
     guidancePrompt: '',
     producerContracts: [],

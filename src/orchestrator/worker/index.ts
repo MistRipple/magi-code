@@ -13,6 +13,7 @@ export {
   AutonomousWorker,
   TodoExecuteOptions,
   AutonomousExecutionResult,
+  SharedContextDependencies,
 } from './autonomous-worker';
 
 export {

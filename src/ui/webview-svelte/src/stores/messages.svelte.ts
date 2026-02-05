@@ -132,8 +132,8 @@ let modelStatus = $state<ModelStatusMap>({
 });
 let interactionMode = $state<'ask' | 'auto'>('auto');
 
-// Worker 执行状态：idle | executing | completed | failed
-let workerExecutionStatus = $state<Record<string, 'idle' | 'executing' | 'completed' | 'failed'>>({
+// Worker 执行状态：idle | executing | completed | failed | stopped | skipped
+let workerExecutionStatus = $state<Record<string, 'idle' | 'executing' | 'completed' | 'failed' | 'stopped' | 'skipped'>>({
   claude: 'idle',
   codex: 'idle',
   gemini: 'idle',
@@ -493,12 +493,12 @@ export function setMissionPlan(plan: MissionPlan | null) {
 // Worker 执行状态操作
 export function setWorkerExecutionStatus(
   worker: 'claude' | 'codex' | 'gemini',
-  status: 'idle' | 'executing' | 'completed' | 'failed'
+  status: 'idle' | 'executing' | 'completed' | 'failed' | 'stopped' | 'skipped'
 ) {
   workerExecutionStatus = { ...workerExecutionStatus, [worker]: status };
 
-  // 完成或失败状态 2 秒后自动重置为 idle
-  if (status === 'completed' || status === 'failed') {
+  // 完成、失败、停止、跳过状态 2 秒后自动重置为 idle
+  if (status === 'completed' || status === 'failed' || status === 'stopped' || status === 'skipped') {
     setTimeout(() => {
       workerExecutionStatus = { ...workerExecutionStatus, [worker]: 'idle' };
     }, 2000);

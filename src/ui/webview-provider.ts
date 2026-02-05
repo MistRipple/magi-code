@@ -31,15 +31,17 @@ import {
   DataMessageType,
   NotifyLevel,
   ControlMessageType,
+  InteractionType,
   createStandardMessage,
   createTextMessage,
+  createUserInputMessage,
   createStreamingMessage,
   createErrorMessage,
+  createInteractionMessage,
 } from '../protocol/message-protocol';
 import { ADAPTER_EVENTS, PROCESSING_EVENTS, WEBVIEW_MESSAGE_TYPES } from '../protocol/event-names';
 import { UnifiedSessionManager } from '../session';
-import { UnifiedTaskManager } from '../task/unified-task-manager';
-import { SessionManagerTaskRepository } from '../task/session-manager-task-repository';
+import { TaskView } from '../task/task-view-adapter';
 import { SnapshotManager } from '../snapshot-manager';
 import { DiffGenerator } from '../diff-generator';
 import { globalEventBus } from '../events';
@@ -178,9 +180,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   private _view?: vscode.WebviewView;
   private sessionManager: UnifiedSessionManager;
-  private taskManager: UnifiedTaskManager | null = null;
-  private taskManagerSessionId: string | null = null;
-  private taskManagerReady: Promise<void> | null = null;
   private snapshotManager: SnapshotManager;
   private diffGenerator: DiffGenerator;
   private readonly messageFlowLogEnabled = process.env.MULTICLI_MESSAGE_FLOW_LOG === '1';
@@ -275,9 +274,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     // 确保有当前会话
     this.ensureSessionAlignment();
-    if (this.activeSessionId) {
-      void this.initTaskManagerForSession(this.activeSessionId);
-    }
 
     const config = vscode.workspace.getConfiguration('multiCli');
     const timeout = config.get<number>('timeout') ?? 300000;
@@ -349,31 +345,16 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async initTaskManagerForSession(sessionId: string): Promise<void> {
-    if (this.taskManager && this.taskManagerSessionId === sessionId) {
-      return;
-    }
-    const repository = new SessionManagerTaskRepository(this.sessionManager, sessionId);
-    const manager = new UnifiedTaskManager(sessionId, repository);
-    this.taskManager = manager;
-    this.taskManagerSessionId = sessionId;
-    this.taskManagerReady = manager.initialize();
-    await this.taskManagerReady;
-
-    // 将 taskManager 传递给编排引擎，确保 Assignment 能同步到 SubTask
-    this.orchestratorEngine.setTaskManager(manager);
-  }
-
-  private async getTaskManager(): Promise<UnifiedTaskManager> {
+  /**
+   * 获取当前会话的所有任务视图
+   * 统一 Todo 系统 - 替代 UnifiedTaskManager
+   */
+  private async getTaskViews(): Promise<TaskView[]> {
     const sessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id;
     if (!sessionId) {
-      throw new Error('未找到有效的会话 ID');
+      return [];
     }
-    await this.initTaskManagerForSession(sessionId);
-    if (!this.taskManager) {
-      throw new Error('UnifiedTaskManager 未初始化');
-    }
-    return this.taskManager;
+    return this.orchestratorEngine.listTaskViews(sessionId);
   }
 
   private normalizePermissions(input?: Partial<PermissionMatrix>): PermissionMatrix {
@@ -787,9 +768,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 🔧 图片已通过缩略图展示，不再在文本中附加 [附件: X 张图片]
     const displayContent = prompt;
 
-    const userMessage = createTextMessage(displayContent, 'orchestrator', 'orchestrator', traceId, {
+    const userMessage = createUserInputMessage(displayContent, traceId, {
       metadata: {
-        role: 'user',
         requestId,
         sendingAnimation: true,
         // 🔧 新增：附带图片数据供前端展示
@@ -875,8 +855,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const isPlaceholder = Boolean(meta?.isPlaceholder);
-    const role = meta?.role as string | undefined;
-    if (isPlaceholder || role === 'user') {
+    // 方案 B：使用 MessageType.USER_INPUT 判断用户消息
+    const isUserInput = message.type === MessageType.USER_INPUT;
+    if (isPlaceholder || isUserInput) {
       return;
     }
     this.clearRequestTimeout(requestId);
@@ -1054,7 +1035,25 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         // 保存 resolve/reject 以便后续处理用户响应
         this.pendingConfirmation = { resolve, reject };
 
-        // 发送确认请求消息
+        // 🔧 P3: 发送交互消息到主对话区
+        const traceId = this.messageHub.getTraceId();
+        const interactionMsg = createInteractionMessage(
+          {
+            type: InteractionType.PLAN_CONFIRMATION,
+            requestId: `confirm-${Date.now()}`,
+            prompt: '请确认执行计划',
+            required: true
+          },
+          'orchestrator',
+          'orchestrator',
+          traceId,
+          {
+            blocks: [{ type: 'text', content: formattedPlan, isMarkdown: true }]
+          }
+        );
+        this.messageHub.sendMessage(interactionMsg);
+
+        // 发送确认请求消息 (触发 UI 状态/弹窗)
         this.sendData('confirmationRequest', {
           plan: plan,
           formattedPlan: formattedPlan,
@@ -1069,6 +1068,26 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       return new Promise<'retry' | 'rollback' | 'continue'>((resolve) => {
         // 保存 resolver
         this.recoveryConfirmationResolver = resolve;
+
+        // 🔧 P3: 发送交互消息到主对话区
+        const traceId = this.messageHub.getTraceId();
+        const interactionMsg = createInteractionMessage(
+          {
+            type: InteractionType.QUESTION, // 复用 QUESTION 类型或新增 RECOVERY 类型
+            requestId: `recovery-${Date.now()}`,
+            prompt: `任务执行出错: ${error}\n\n请选择恢复策略：`,
+            options: [
+              options.retry ? { value: 'retry', label: '重试' } : null,
+              options.rollback ? { value: 'rollback', label: '回滚' } : null,
+              { value: 'continue', label: '继续(跳过)' }
+            ].filter(Boolean) as any,
+            required: true
+          },
+          'orchestrator',
+          'orchestrator',
+          traceId
+        );
+        this.messageHub.sendMessage(interactionMsg);
 
         // 发送恢复请求到 Webview
         this.sendData('recoveryRequest', {
@@ -1088,6 +1107,22 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.orchestratorEngine.setQuestionCallback(async (questions, plan) => {
       return new Promise<string | null>((resolve, reject) => {
         this.pendingQuestion = { resolve, reject };
+
+        // 🔧 P3: 发送交互消息
+        const traceId = this.messageHub.getTraceId();
+        const interactionMsg = createInteractionMessage(
+          {
+            type: InteractionType.QUESTION,
+            requestId: `question-${Date.now()}`,
+            prompt: '需要补充以下信息：\n' + questions.join('\n'),
+            required: true
+          },
+          'orchestrator',
+          'orchestrator',
+          traceId
+        );
+        this.messageHub.sendMessage(interactionMsg);
+
         this.sendData('questionRequest', {
           questions,
           plan
@@ -1100,6 +1135,22 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.orchestratorEngine.setClarificationCallback(async (questions, context, ambiguityScore, originalPrompt) => {
       return new Promise((resolve, reject) => {
         this.pendingClarification = { resolve, reject };
+
+        // 🔧 P3: 发送交互消息
+        const traceId = this.messageHub.getTraceId();
+        const interactionMsg = createInteractionMessage(
+          {
+            type: InteractionType.CLARIFICATION,
+            requestId: `clarify-${Date.now()}`,
+            prompt: '需求存在歧义，请澄清：\n' + questions.join('\n'),
+            required: true
+          },
+          'orchestrator',
+          'orchestrator',
+          traceId
+        );
+        this.messageHub.sendMessage(interactionMsg);
+
         this.sendData('clarificationRequest', {
           questions,
           context,
@@ -1115,6 +1166,24 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.orchestratorEngine.setWorkerQuestionCallback(async (workerId, question, context, options) => {
       return new Promise((resolve, reject) => {
         this.pendingWorkerQuestion = { resolve, reject };
+
+        // 🔧 P3: 发送交互消息
+        const traceId = this.messageHub.getTraceId();
+        const optionItems = options?.map(o => ({ value: o, label: o })) || [];
+        const interactionMsg = createInteractionMessage(
+          {
+            type: InteractionType.QUESTION,
+            requestId: `worker-q-${Date.now()}`,
+            prompt: `**${workerId}** 需要确认：\n${question}`,
+            options: optionItems.length > 0 ? optionItems : undefined,
+            required: true
+          },
+          'orchestrator',
+          'orchestrator',
+          traceId
+        );
+        this.messageHub.sendMessage(interactionMsg);
+
         this.sendData('workerQuestionRequest', {
           workerId,
           question,
@@ -1189,6 +1258,56 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     if (this.toolAuthorizationCallback) {
       this.toolAuthorizationCallback(allowed);
       this.toolAuthorizationCallback = null;
+    }
+  }
+
+  /** 处理交互响应 */
+  private async handleInteractionResponse(requestId: string, response: any): Promise<void> {
+    if (!requestId) return;
+
+    // 处理动态任务审批
+    if (requestId.startsWith('approval-')) {
+      const todoId = requestId.replace('approval-', '');
+      // 允许的肯定响应值
+      const isApproved = response === true || response === 'approved' || response === 'yes' || 
+                        (typeof response === 'object' && response.value === 'approved');
+
+      if (isApproved) {
+        try {
+          const orchestrator = this.orchestratorEngine.getMissionOrchestrator();
+          if (orchestrator) {
+            await orchestrator.approveTodo(todoId);
+            this.sendToast('任务已批准', 'success');
+
+            // 尝试恢复当前 Mission
+            const currentMission = this.orchestratorEngine.context.mission;
+            if (currentMission && (currentMission.status === 'paused' || currentMission.status === 'pending_approval')) {
+              this.sendOrchestratorMessage({
+                content: '审批通过，继续执行任务...',
+                messageType: 'text',
+              });
+              // 异步恢复，避免阻塞
+              void this.orchestratorEngine.resumeMission(currentMission.id);
+            }
+          }
+        } catch (error) {
+          logger.error('界面.交互.审批_失败', error, LogCategory.UI);
+          this.sendToast('审批操作失败', 'error');
+        }
+      } else {
+        // 拒绝逻辑
+        this.sendToast('任务已拒绝', 'info');
+
+        // 【新增】记录被拒绝的方案到 Memory
+        const contextManager = this.orchestratorEngine.getContextManager();
+        if (contextManager) {
+          contextManager.addRejectedApproach(
+            '任务审批被用户拒绝',
+            '用户选择不执行此任务',
+            'user'
+          );
+        }
+      }
     }
   }
 
@@ -1532,6 +1651,21 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     // 审批请求事件
     this.missionOrchestrator.on('approvalRequested', (data: { missionId: string; assignmentId: string; todoId: string; reason: string }) => {
+      // 🔧 P3: 发送交互消息
+      const traceId = this.messageHub.getTraceId();
+      const interactionMsg = createInteractionMessage(
+        {
+          type: InteractionType.PERMISSION,
+          requestId: `approval-${data.todoId}`,
+          prompt: `**动态任务审批**\n\n原因: ${data.reason}\n\n请决定是否批准。`,
+          required: true
+        },
+        'orchestrator',
+        'orchestrator',
+        traceId
+      );
+      this.messageHub.sendMessage(interactionMsg);
+
       this.sendData('todoApprovalRequested', {
         missionId: data.missionId,
         assignmentId: data.assignmentId,
@@ -1565,9 +1699,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private async interruptCurrentTask(options?: { silent?: boolean }): Promise<void> {
     logger.info('界面.任务.中断.请求', undefined, LogCategory.UI);
 
-
-    const taskManager = await this.getTaskManager();
-    const tasks = await taskManager.getAllTasks();
+    // 统一 Todo 系统 - 使用 TaskView
+    const tasks = await this.getTaskViews();
     const runningTasks = tasks.filter(t => t.status === 'running');
     const hasRunningTask = runningTasks.length > 0 || this.orchestratorEngine.running;
 
@@ -1601,7 +1734,24 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 3. 更新任务状态
     if (runningTasks.length > 0) {
       for (const task of runningTasks) {
-        await taskManager.cancelTask(task.id);
+        await this.orchestratorEngine.cancelTaskById(task.id);
+
+        // 🔧 P1-4: 发送停止状态卡片，确保 UI 视觉反馈
+        // 遍历该任务下的所有子任务，更新其状态
+        if (task.subTasks && task.subTasks.length > 0) {
+          for (const subTask of task.subTasks) {
+            // 仅更新未完成的子任务
+            if (subTask.status !== 'completed' && subTask.status !== 'failed' && subTask.status !== 'skipped') {
+              this.messageHub.subTaskCard({
+                id: subTask.assignmentId || subTask.id, // 优先使用 assignmentId 以匹配 Mission 体系
+                title: subTask.title || subTask.description || '子任务',
+                status: 'stopped',
+                worker: subTask.assignedWorker as any, // 类型兼容性转换
+                summary: '用户终止',
+              });
+            }
+          }
+        }
       }
     }
 
@@ -1981,6 +2131,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'toolAuthorizationResponse':
         // 用户响应工具授权请求
         this.handleToolAuthorizationResponse((message as any).allowed ?? false);
+        break;
+
+      case 'interactionResponse':
+        // 🔧 P3: 处理交互响应 (如动态审批)
+        await this.handleInteractionResponse((message as any).requestId, (message as any).response);
         break;
 
       case 'updateSetting':
@@ -4584,25 +4739,30 @@ ${originalPrompt}
     }
   }
 
-  /** 清理所有任务 */
-  private handleClearAllTasks(): void {
-    const session = this.sessionManager.getCurrentSession();
-    if (!session) {
+  /** 清理所有任务（统一使用 Mission 系统） */
+  private async handleClearAllTasks(): Promise<void> {
+    const sessionId = this.activeSessionId;
+    if (!sessionId) {
       this.sendToast('没有活动会话', 'warning');
       return;
     }
 
     // 检查是否有正在运行的任务
-    const runningTask = session.tasks.find(t => t.status === 'running');
-    if (runningTask) {
+    if (this.orchestratorEngine.running) {
       this.sendToast('有任务正在执行，无法清理', 'warning');
       return;
     }
 
-    // 清空任务列表
-    const taskCount = session.tasks.length;
-    session.tasks = [];
-    this.sessionManager.saveCurrentSession();
+    // 统一 Todo 系统：从 Mission 获取并清理任务
+    const taskViews = await this.getTaskViews();
+    const taskCount = taskViews.length;
+
+    // 删除所有 Mission（使用 deleteTaskById 方法）
+    for (const tv of taskViews) {
+      if (tv.missionId) {
+        await this.orchestratorEngine.deleteTaskById(tv.missionId);
+      }
+    }
 
     this.sendToast(`已清理 ${taskCount} 个任务`, 'success');
     this.sendStateUpdate();
@@ -4614,8 +4774,8 @@ ${originalPrompt}
       return;
     }
     try {
-      const taskManager = await this.getTaskManager();
-      await taskManager.startTask(taskId);
+      // 统一 Todo 系统 - 使用 orchestratorEngine
+      await this.orchestratorEngine.startTaskById(taskId);
       this.sendToast('任务已开始', 'success');
       this.sendStateUpdate();
     } catch (error) {
@@ -4630,8 +4790,8 @@ ${originalPrompt}
       return;
     }
     try {
-      const taskManager = await this.getTaskManager();
-      await taskManager.deleteTask(taskId);
+      // 统一 Todo 系统 - 使用 orchestratorEngine
+      await this.orchestratorEngine.deleteTaskById(taskId);
       this.sendToast('任务已删除', 'success');
       this.sendStateUpdate();
     } catch (error) {
@@ -4642,8 +4802,8 @@ ${originalPrompt}
 
   /** 获取最近被打断的任务 */
   private async getLastInterruptedTask(): Promise<{ id: string; prompt: string } | null> {
-    const taskManager = await this.getTaskManager();
-    const tasks = await taskManager.getAllTasks();
+    // 统一 Todo 系统 - 使用 TaskView
+    const tasks = await this.getTaskViews();
     const interrupted = [...tasks].reverse().find(t => t.status === 'cancelled');
     if (!interrupted) return null;
     return { id: interrupted.id, prompt: interrupted.prompt };
@@ -4687,7 +4847,7 @@ ${originalPrompt}
     await this.executeTask(prompt, undefined, []);
   }
 
-  /** 处理补充内容消息 */
+  /** 处理补充内容消息 (P0-3: 补充指令链路) */
   private async handleAppendMessage(taskId: string, content: string): Promise<void> {
     logger.info('界面.消息.补充.请求', { taskId, preview: content.substring(0, 50) }, LogCategory.UI);
 
@@ -4697,15 +4857,51 @@ ${originalPrompt}
       return;
     }
 
-    // 目前的实现：将补充内容作为新消息发送到当前 Worker
-    // 未来可以扩展为真正的追加到当前执行上下文
-    try {
-      // 添加用户消息到对话
-      this.sendToast('补充内容已发送', 'info');
+    const trimmedContent = content.trim();
+    if (!trimmedContent) {
+      this.sendToast('补充内容不能为空', 'warning');
+      return;
+    }
 
-      // 发送到当前活跃的 Worker
-      // 注意：这是一个简化实现，真正的追加需要 Worker 支持
-      logger.info('界面.消息.补充.降级', { reason: 'simplified_implementation' }, LogCategory.UI);
+    try {
+      // 注入补充指令到引擎队列
+      const injected = this.orchestratorEngine.injectSupplementaryInstruction(trimmedContent);
+
+      if (injected) {
+        // 发送用户消息到对话区（让用户看到自己发送的补充指令）
+        // 使用新的 MessageType.USER_INPUT 类型
+        const traceId = this.messageHub.getTraceId();
+        const userMessage = createUserInputMessage(
+          trimmedContent,
+          traceId,
+          {
+            metadata: {
+              role: 'user',
+              isSupplementary: true,  // 标记为补充指令
+            },
+          }
+        );
+        this.messageHub.sendMessage(userMessage);
+
+        // 发送编排者确认消息
+        const ackMessage = createTextMessage(
+          `收到补充指令，将在下一决策点生效。`,
+          'orchestrator',
+          'orchestrator',
+          traceId,
+          {
+            metadata: {
+              isStatusMessage: true,
+            },
+          }
+        );
+        this.messageHub.sendMessage(ackMessage);
+
+        logger.info('界面.消息.补充.成功', { taskId }, LogCategory.UI);
+      } else {
+        this.sendToast('补充指令注入失败', 'error');
+        logger.warn('界面.消息.补充.注入失败', { taskId }, LogCategory.UI);
+      }
     } catch (error) {
       logger.error('界面.消息.补充.失败', error, LogCategory.UI);
       this.sendToast('补充内容失败', 'error');
@@ -4789,6 +4985,12 @@ ${originalPrompt}
       const promptForDisplay = displayPrompt?.trim() || prompt;
       this.emitUserAndPlaceholder(requestKey, promptForDisplay, images?.length || 0, images);
       this.scheduleRequestTimeout(requestKey);
+
+      // 🔧 性能优化：强制让出事件循环 (Yield Event Loop)
+      // 原因：emitUserAndPlaceholder 只是将消息入队，实际的 webview.postMessage 需要事件循环 Tick 才能执行。
+      // 如果不在此处让出控制权，后续的同步 FS 操作（图片保存）和 Orchestrator 初始化会阻塞主线程，
+      // 导致前端迟迟收不到用户消息的回显，造成"点击发送后卡顿"的假象。
+      await new Promise(resolve => setTimeout(resolve, 0));
 
       // 如果有图片，保存到临时文件
       const imagePaths: string[] = [];
@@ -5024,8 +5226,9 @@ ${originalPrompt}
       this.sendToast('请输入计划内容，例如：/plan 实现登录功能', 'warning');
       return;
     }
-    const taskManager = await this.getTaskManager();
-    const task = await taskManager.createTask({ prompt: planPrompt });
+    // 统一 Todo 系统 - 使用 orchestratorEngine
+    const sessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id || 'default';
+    const task = await this.orchestratorEngine.createTaskFromPrompt(sessionId, planPrompt);
     try {
       const record = await this.orchestratorEngine.createPlan(
         planPrompt,
@@ -5187,9 +5390,10 @@ ${originalPrompt}
     });
 
     const startTime = Date.now();
-    const taskManager = await this.getTaskManager();
-    const task = await taskManager.createTask({ prompt });
-    await taskManager.startTask(task.id);
+    // 统一 Todo 系统 - 使用 orchestratorEngine
+    const sessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id || 'default';
+    const task = await this.orchestratorEngine.createTaskFromPrompt(sessionId, prompt);
+    await this.orchestratorEngine.startTaskById(task.id);
     this.sendStateUpdate();
 
     let errorMsg: string | undefined;
@@ -5214,14 +5418,14 @@ ${originalPrompt}
 
       if (response.error) {
         errorMsg = response.error;
-        await taskManager.failTask(task.id, response.error);
+        await this.orchestratorEngine.failTaskById(task.id, response.error);
         this.sendOrchestratorMessage({
           content: `${targetWorker.toUpperCase()}: ${response.error}`,
           messageType: 'error',
           metadata: { worker: targetWorker },
         });
       } else {
-        await taskManager.completeTask(task.id);
+        await this.orchestratorEngine.completeTaskById(task.id);
         this.saveMessageToSession(prompt, response.content || '', targetWorker, 'worker');
         const requestId = this.messageHub.getRequestContext();
         const requestStats = requestId ? this.messageHub.getRequestMessageStats(requestId) : undefined;
@@ -5241,7 +5445,7 @@ ${originalPrompt}
     } catch (error) {
       logger.error('界面.执行.直接.失败', error, LogCategory.UI);
       errorMsg = error instanceof Error ? error.message : String(error);
-      await taskManager.failTask(task.id, errorMsg);
+      await this.orchestratorEngine.failTaskById(task.id, errorMsg);
       const executionStats = this.orchestratorEngine.getExecutionStats();
       if (executionStats) {
         executionStats.recordExecution({
@@ -5269,8 +5473,12 @@ ${originalPrompt}
 
   /** 发送状态更新到 Webview */
   private sendStateUpdate(): void {
-    const state = this.buildUIState();
-    this.sendData('stateUpdate', { state });
+    // 统一 Todo 系统：异步获取 TaskView 列表
+    void this.buildUIState().then((state: UIState) => {
+      this.sendData('stateUpdate', { state });
+    }).catch((err: unknown) => {
+      logger.error('界面.状态.构建失败', { error: err instanceof Error ? err.message : String(err) }, LogCategory.UI);
+    });
   }
 
   /** 执行会话删除逻辑（供 deleteSession 消息使用） */
@@ -5469,10 +5677,32 @@ ${originalPrompt}
     logger.info('界面.会话.保存.完成', { messageCount: sessionMessages.length }, LogCategory.UI);
   }
 
-  /** 构建 UI 状态 */
-  private buildUIState(): UIState {
+  /** 构建 UI 状态（统一使用 Mission + TaskView） */
+  private async buildUIState(): Promise<UIState> {
     const currentSession = this.sessionManager.getCurrentSession();
-    const tasks = currentSession?.tasks ?? [];
+    const sessionId = this.activeSessionId || currentSession?.id;
+
+    // 统一 Todo 系统：从 Mission 获取 TaskView 列表
+    let tasks: any[] = [];
+    if (sessionId) {
+      const taskViews = await this.getTaskViews();
+      // 将 TaskView 转换为 UI Task 格式
+      tasks = taskViews.map(tv => ({
+        id: tv.id,
+        name: tv.goal || tv.prompt,
+        prompt: tv.prompt,
+        description: tv.goal,
+        status: tv.status,
+        priority: tv.priority,
+        subTasks: tv.subTasks,
+        createdAt: tv.createdAt,
+        startedAt: tv.startedAt,
+        completedAt: tv.completedAt,
+        progress: tv.progress,
+        missionId: tv.missionId,
+      }));
+    }
+
     this.assertValidArray<any>(tasks, 'uiState.tasks');
     const currentTask = tasks.find(t => t?.status === 'running') ?? tasks[tasks.length - 1];
     const activePlanRecordRaw = currentSession?.id
@@ -5489,9 +5719,8 @@ ${originalPrompt}
     const workerStatuses: WorkerStatus[] = workerSlots.map(worker => ({
       worker,
       available: this.adapterFactory.isConnected(worker),
-      enabled: true,  // TODO: 从配置读取
+      enabled: true,
     }));
-
 
     const isRunning = currentTask?.status === 'running' || this.orchestratorEngine.running;
     const pendingChanges = this.snapshotManager.getPendingChanges();
@@ -5500,12 +5729,11 @@ ${originalPrompt}
     this.assertValidArray<LogEntry>(logs, 'uiState.logs');
 
     return {
-      // 使用 activeSessionId 作为单一真相来源，确保与消息发送时的 sessionId 一致
       currentSessionId: this.activeSessionId ?? currentSession?.id,
-      sessions: sessionMetas as any[],  // 使用轻量级元数据
+      sessions: sessionMetas as any[],
       currentTask,
       tasks,
-      workerStatuses,  // ✅ 使用 workerStatuses
+      workerStatuses,
       pendingChanges,
       isRunning,
       logs,

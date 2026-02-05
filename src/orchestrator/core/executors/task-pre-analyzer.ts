@@ -98,7 +98,7 @@ export class TaskPreAnalyzer {
       prompt,
       undefined,
       {
-        streamToUI: false,
+        streamToUI: true,  // 🔧 让用户看到任务分析过程
         adapterRole: 'orchestrator',
       }
     );
@@ -136,8 +136,16 @@ ${mission.contracts?.length ? mission.contracts.map(c => `- ${c.description || c
 
 ${options.projectContext ? `## 项目上下文\n${options.projectContext}` : ''}
 
-## 请分析并返回 JSON
+## 输出格式
 
+**重要：为了让用户理解你的分析过程，请先用自然语言解释你的思考，然后输出 JSON。**
+
+格式如下：
+
+### 任务分析
+[用 2-3 句话向用户解释你对这个任务的理解、复杂度评估和执行策略选择的理由]
+
+### 执行策略
 \`\`\`json
 {
   "complexity": "simple|moderate|complex",

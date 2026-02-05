@@ -241,7 +241,9 @@
     "test:full": "node scripts/run-all-tests.js full",
     "test:unit": "node scripts/run-all-tests.js unit",
     "test:e2e": "node scripts/run-all-tests.js e2e",
-    "check-ui": "bash scripts/check-ui-duplicates.sh"
+    "test:websocket": "node scripts/websocket-quick-verify.js",
+    "test:websocket-full": "node scripts/websocket-integration-test.js",
+    "test:websocket-contract": "node scripts/websocket-contract-integration-test.js"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",

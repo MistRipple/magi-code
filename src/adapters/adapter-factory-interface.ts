@@ -36,6 +36,17 @@ export interface AdapterOutputScope {
   messageMeta?: Record<string, any>;
 
   /**
+   * 决策点回调（工具调用前/后/思考阶段）
+   * 返回需要注入的补充指令列表
+   */
+  decisionHook?: (event: {
+    type: 'thinking' | 'tool_call' | 'tool_result';
+    toolName?: string;
+    toolArgs?: any;
+    toolResult?: string;
+  }) => string[];
+
+  /**
    * 临时系统提示词（可选）
    * 如果提供，将覆盖适配器的默认系统提示词（仅对当前请求生效）
    */

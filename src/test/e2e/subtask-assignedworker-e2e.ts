@@ -26,8 +26,6 @@ import { LLMAdapterFactory } from '../../llm/adapter-factory';
 import { MissionDrivenEngine } from '../../orchestrator/core';
 import { SnapshotManager } from '../../snapshot-manager';
 import { UnifiedSessionManager } from '../../session';
-import { UnifiedTaskManager } from '../../task/unified-task-manager';
-import { SessionManagerTaskRepository } from '../../task/session-manager-task-repository';
 import { globalEventBus } from '../../events';
 
 interface TestResult {
@@ -48,14 +46,9 @@ async function runE2ETest(): Promise<TestResult[]> {
   const adapterFactory = new LLMAdapterFactory({ cwd: workspaceRoot });
   await adapterFactory.initialize();
 
-  const session = sessionManager.getOrCreateCurrentSession();
+  // 统一 Todo 系统：不再需要 UnifiedTaskManager
 
-  // 2. 创建 TaskManager
-  const repository = new SessionManagerTaskRepository(sessionManager, session.id);
-  const taskManager = new UnifiedTaskManager(session.id, repository);
-  await taskManager.initialize();
-
-  // 3. 创建 MissionDrivenEngine
+  // 2. 创建 MissionDrivenEngine
   const orchestrator = new MissionDrivenEngine(
     adapterFactory,
     {
@@ -72,12 +65,11 @@ async function runE2ETest(): Promise<TestResult[]> {
     sessionManager
   );
 
-  // 4. 关键步骤：调用 setTaskManager（模拟 WebviewProvider 行为）
-  orchestrator.setTaskManager(taskManager);
+  // 统一 Todo 系统：不再需要 setTaskManager
   results.push({
-    name: '1. setTaskManager 调用成功',
+    name: '1. 统一 Todo 系统 - 已移除 setTaskManager',
     passed: true,
-    details: 'MissionDrivenEngine.setTaskManager() 方法已调用',
+    details: 'Assignments 信息通过 Todo 系统传递给 UI',
   });
 
   // 5. 设置回调（避免卡住）

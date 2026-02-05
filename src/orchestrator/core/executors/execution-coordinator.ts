@@ -57,6 +57,8 @@ export interface ExecutionOptions {
   onReport?: ReportCallback;
   /** 汇报超时(ms) */
   reportTimeout?: number;
+  /** 获取补充指令（在决策点注入） */
+  getSupplementaryInstructions?: (workerId: WorkerSlot) => string[];
 
   // ============ 智能执行策略选项 ============
   /** 是否需要规划阶段（由 TaskPreAnalyzer 决定） */
@@ -88,6 +90,8 @@ export interface ExecutionResult {
   assignmentResults: Map<string, AutonomousExecutionResult>;
   /** Wave 执行信息（提案 4.6） */
   waveInfo?: WaveExecutionInfo;
+  /** 是否有等待审批的任务 */
+  hasPendingApprovals?: boolean;
 }
 
 /**
@@ -113,7 +117,6 @@ export class ExecutionCoordinator extends EventEmitter {
   private blockingManager: BlockingManager;
 
   private contextManager: import('../../../context/context-manager').ContextManager | null = null;
-  private taskManager: import('../../../task/unified-task-manager').UnifiedTaskManager | null = null;
 
   /** 收集每个 Assignment 的执行结果 */
   private collectedAssignmentResults: Map<string, AutonomousExecutionResult> = new Map();
@@ -154,13 +157,6 @@ export class ExecutionCoordinator extends EventEmitter {
   }
 
   /**
-   * 设置 TaskManager（用于 SubTask 同步）
-   */
-  setTaskManager(taskManager: import('../../../task/unified-task-manager').UnifiedTaskManager): void {
-    this.taskManager = taskManager;
-  }
-
-  /**
    * 执行 Mission
    *
    * 支持动态阶段选择：
@@ -195,10 +191,8 @@ export class ExecutionCoordinator extends EventEmitter {
     // 添加 Assignments 到 ContextManager
     await this.initializeContextManager();
 
-    // 同步 Assignments 到 SubTasks（关键：确保 UI 能显示正确的 assignedWorker）
-    if (options.taskId) {
-      await this.syncAssignmentsToSubTasks(options.taskId);
-    }
+    // 统一 Todo 系统：不再需要同步到 SubTasks
+    // Assignments 信息通过 Todo 系统传递给 UI
 
     const errors: string[] = [];
 
@@ -229,6 +223,8 @@ export class ExecutionCoordinator extends EventEmitter {
         }
       } else {
         logger.info(LogCategory.ORCHESTRATOR, '跳过规划阶段（简单任务）');
+        // 默认 Todo 由 MissionOrchestrator 通过 TodoManager 创建
+        // 此处仅记录日志，确保 assignment.todos 已被填充
       }
 
       // ========== 阶段 2: 执行（总是执行） ==========
@@ -303,6 +299,7 @@ export class ExecutionCoordinator extends EventEmitter {
   private async executeSequential(options: ExecutionOptions): Promise<ExecutionResult> {
     const errors: string[] = [];
     let completedCount = 0;
+    let anyPendingApprovals = false;
 
     // 按依赖关系分组
     const groups = this.groupByDependencies();
@@ -320,6 +317,9 @@ export class ExecutionCoordinator extends EventEmitter {
           onOutput: options.onOutput,
           onReport: options.onReport,
           reportTimeout: options.reportTimeout,
+          getSupplementaryInstructions: options.getSupplementaryInstructions
+            ? () => options.getSupplementaryInstructions!(assignment.workerId)
+            : undefined,
         });
 
         // 收集详细执行结果
@@ -328,7 +328,11 @@ export class ExecutionCoordinator extends EventEmitter {
         }
 
         if (result.success) {
-          completedCount++;
+          if (result.hasPendingApprovals) {
+            anyPendingApprovals = true;
+          } else {
+            completedCount++;
+          }
           this.progressReporter.reportAssignmentComplete(
             assignment,
             result.completedTodos,
@@ -342,7 +346,7 @@ export class ExecutionCoordinator extends EventEmitter {
       }
     }
 
-    return this.buildResult(errors.length === 0, errors, completedCount);
+    return this.buildResult(errors.length === 0, errors, completedCount, anyPendingApprovals);
   }
 
   /**
@@ -351,6 +355,7 @@ export class ExecutionCoordinator extends EventEmitter {
   private async executeParallel(options: ExecutionOptions): Promise<ExecutionResult> {
     const errors: string[] = [];
     let completedCount = 0;
+    let anyPendingApprovals = false;
 
     // 按依赖关系分组
     const groups = this.groupByDependencies();
@@ -368,6 +373,9 @@ export class ExecutionCoordinator extends EventEmitter {
           onOutput: options.onOutput,
           onReport: options.onReport,
           reportTimeout: options.reportTimeout,
+          getSupplementaryInstructions: options.getSupplementaryInstructions
+            ? () => options.getSupplementaryInstructions!(assignment.workerId)
+            : undefined,
         });
 
         // 收集详细执行结果
@@ -382,7 +390,7 @@ export class ExecutionCoordinator extends EventEmitter {
             result.tokenUsage
           );
           this.markAssignmentComplete(assignment, result);
-          return { success: true, errors: [] as string[] };
+          return { success: true, errors: [] as string[], hasPendingApprovals: result.hasPendingApprovals };
         } else {
           this.markAssignmentComplete(assignment, result);
           return { success: false, errors: result.errors };
@@ -392,14 +400,18 @@ export class ExecutionCoordinator extends EventEmitter {
       const results = await Promise.all(promises);
       results.forEach(result => {
         if (result.success) {
-          completedCount++;
+          if (result.hasPendingApprovals) {
+            anyPendingApprovals = true;
+          } else {
+            completedCount++;
+          }
         } else {
           errors.push(...result.errors);
         }
       });
     }
 
-    return this.buildResult(errors.length === 0, errors, completedCount);
+    return this.buildResult(errors.length === 0, errors, completedCount, anyPendingApprovals);
   }
 
   private markAssignmentStart(assignment: Assignment): void {
@@ -606,6 +618,9 @@ export class ExecutionCoordinator extends EventEmitter {
           onOutput: options.onOutput,
           onReport: options.onReport,
           reportTimeout: options.reportTimeout,
+          getSupplementaryInstructions: options.getSupplementaryInstructions
+            ? () => options.getSupplementaryInstructions!(assignment.workerId)
+            : undefined,
         });
 
         // 收集详细执行结果
@@ -729,7 +744,8 @@ export class ExecutionCoordinator extends EventEmitter {
   private buildResult(
     success: boolean,
     errors: string[],
-    completedCount?: number
+    completedCount?: number,
+    hasPendingApprovals?: boolean
   ): ExecutionResult {
     const progress = this.progressReporter.getProgress();
 
@@ -740,68 +756,7 @@ export class ExecutionCoordinator extends EventEmitter {
       errors,
       tokenUsage: progress.tokenUsage,
       assignmentResults: new Map(this.collectedAssignmentResults),
+      hasPendingApprovals,
     };
-  }
-
-  /**
-   * 同步 Assignments 到 SubTasks
-   *
-   * 关键方法：确保每个 Assignment 在 TaskManager 中有对应的 SubTask，
-   * 且 SubTask.assignedWorker 正确设置为 Assignment.workerId。
-   *
-   * 这样当 SubTask 完成时，事件中的 agent 字段能正确显示 Worker 名称。
-   */
-  private async syncAssignmentsToSubTasks(taskId: string): Promise<void> {
-    if (!this.taskManager) {
-      logger.warn(
-        LogCategory.ORCHESTRATOR,
-        'TaskManager 未设置，跳过 SubTask 同步'
-      );
-      return;
-    }
-
-    try {
-      for (const assignment of this.mission.assignments) {
-        const existingSubTask = await this.taskManager.getSubTaskByAssignmentId(taskId, assignment.id);
-
-        if (!existingSubTask) {
-          // 创建 SubTask，确保 assignedWorker 正确设置
-          await this.taskManager.createSubTask(taskId, {
-            description: assignment.responsibility,
-            assignedWorker: assignment.workerId,
-            assignmentId: assignment.id,
-          });
-
-          logger.debug(
-            LogCategory.ORCHESTRATOR,
-            `创建 SubTask: Assignment ${assignment.id} -> Worker ${assignment.workerId}`
-          );
-        } else {
-          // SubTask 已存在，检查 assignedWorker 是否正确
-          if (existingSubTask.assignedWorker !== assignment.workerId) {
-            // 更新 assignedWorker
-            await this.taskManager.updateSubTask(taskId, {
-              id: existingSubTask.id,
-              assignedWorker: assignment.workerId,
-            });
-
-            logger.debug(
-              LogCategory.ORCHESTRATOR,
-              `更新 SubTask assignedWorker: ${existingSubTask.id} -> ${assignment.workerId}`
-            );
-          }
-        }
-      }
-
-      logger.info(
-        LogCategory.ORCHESTRATOR,
-        `已同步 ${this.mission.assignments.length} 个 Assignments 到 SubTasks`
-      );
-    } catch (error: any) {
-      logger.warn(
-        LogCategory.ORCHESTRATOR,
-        `同步 SubTasks 失败: ${error.message}`
-      );
-    }
   }
 }

@@ -6,8 +6,8 @@
  * {{ AURA: Add - 创建快速验证脚本，便于一键测试 }}
  */
 
-import WebSocketServerCore from '../server/websocket-server.js';
-import WebSocketClientNode from '../client/websocket-client-node.js';
+import WebSocketServerCore from '../websocket-system/server/websocket-server.js';
+import WebSocketClientNode from '../websocket-system/client/websocket-client-node.js';
 
 console.log('╔═══════════════════════════════════════════════════════════╗');
 console.log('║   WebSocket 实时消息推送系统 - 快速验证                    ║');

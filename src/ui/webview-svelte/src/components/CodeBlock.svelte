@@ -158,103 +158,15 @@
     margin: var(--spacing-sm) 0;
     overflow: hidden;
     background: var(--code-bg);
-  }
-
-  .code-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    background: rgba(0, 0, 0, 0.2);
-  }
-
-  .header-left {
-    display: flex;
-    align-items: center;
-    gap: var(--spacing-sm);
-    padding: var(--spacing-xs) var(--spacing-md);
-    flex: 1;
-    text-align: left;
-    cursor: pointer;
-  }
-
-  .header-left:hover {
-    background: rgba(255, 255, 255, 0.05);
-  }
-
-  .chevron {
-    display: flex;
-    transition: transform var(--transition-fast);
-    color: var(--vscode-descriptionForeground, #888);
-  }
-
-  .collapsed .chevron {
-    transform: rotate(0deg);
-  }
-
-  .code-block:not(.collapsed) .chevron {
-    transform: rotate(90deg);
-  }
-
-  .code-icon {
-    display: flex;
-    color: var(--vscode-descriptionForeground, #888);
-  }
-
-  .code-title {
-    display: flex;
-    align-items: center;
-    gap: var(--spacing-sm);
-    font-size: var(--font-size-sm);
-  }
-
-  .lang-name {
-    font-weight: 500;
-  }
-
-  .filepath {
-    color: var(--vscode-descriptionForeground, #888);
-    font-size: 11px;
-    max-width: 200px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .streaming-badge {
-    font-size: 10px;
-    padding: 1px 6px;
-    border-radius: 99px;
-    background: var(--primary-muted);
-    color: var(--primary);
-    font-weight: 500;
-  }
-
-  .copy-btn {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    padding: var(--spacing-xs) var(--spacing-sm);
-    margin-right: var(--spacing-sm);
-    font-size: 11px;
-    color: var(--vscode-descriptionForeground, #888);
-    border-radius: var(--radius-sm);
-    transition: all var(--transition-fast);
-  }
-
-  .copy-btn:hover {
-    background: rgba(255, 255, 255, 0.1);
-    color: var(--foreground);
-  }
-
-  .copy-btn.copied {
-    color: var(--success);
+    /* 🔧 定义局部变量确保行号和代码严格对齐 */
+    --code-line-height: 1.5;
+    --code-font-size: var(--font-size-sm, 12px);
   }
 
   .code-content {
     display: flex;
-    overflow-x: auto;
-    /* 🔧 确保行号和代码背景高度同步 */
-    align-items: stretch;
+    flex-direction: row;
+    align-items: flex-start;
   }
 
   .line-numbers {
@@ -270,9 +182,15 @@
 
   .line-num {
     font-family: var(--font-mono);
-    font-size: var(--font-size-sm);
-    line-height: 1.5;
+    font-size: var(--code-font-size) !important;
+    line-height: var(--code-line-height) !important;
+    /* 🔧 强制高度：使用 calc 确保像素级对齐 */
+    height: calc(var(--code-font-size) * var(--code-line-height));
     color: var(--vscode-editorLineNumber-foreground, #858585);
+    white-space: nowrap;
+    display: flex; /* 确保垂直居中 */
+    align-items: center;
+    justify-content: flex-end;
   }
 
   .code-pre {
@@ -286,8 +204,8 @@
 
   .code-text {
     font-family: var(--font-mono);
-    font-size: var(--font-size-sm);
-    line-height: 1.5;
+    font-size: var(--code-font-size) !important;
+    line-height: var(--code-line-height) !important;
     /* 🔧 修复行号对齐问题：重置可能由 hljs 引入的内边距和外边距 */
     padding: 0 !important;
     margin: 0 !important;

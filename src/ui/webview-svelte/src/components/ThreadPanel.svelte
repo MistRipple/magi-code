@@ -36,7 +36,7 @@
   <!-- 消息内容区域（使用 position: relative 让滚动按钮相对于消息区域定位） -->
   <div class="main-content">
     {#if activeBottomTab === 'thread'}
-      <MessageList {messages} />
+      <MessageList {messages} readOnly={true} />
     {:else}
       <AgentTab messages={agentOutputs[activeBottomTab] || []} />
     {/if}

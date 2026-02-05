@@ -53,6 +53,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   private profileLoader?: AgentProfileLoader;
   private guidanceInjector: GuidanceInjector;
   private historyConfig: Required<HistoryManagementConfig>;
+  private seenThinking = false;
+  private decisionHookAppliedForThinking = false;
 
   constructor(adapterConfig: WorkerAdapterConfig) {
     super(
@@ -109,6 +111,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     let messageId: string | null = null;
 
     try {
+      this.seenThinking = false;
+      this.decisionHookAppliedForThinking = false;
       // 自动截断历史以控制 token 消耗
       this.truncateHistoryIfNeeded();
 
@@ -165,7 +169,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         }
       }
 
-      // 获取工具定义
+      // 获取所有工具定义，让 AI 自主选择使用
       const tools = await this.toolManager.getTools();
       const toolDefinitions = tools.map((tool) => ({
         name: tool.name,
@@ -173,63 +177,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         input_schema: tool.input_schema,
       }));
 
-      const extractText = (content: unknown): string => {
-        if (!content) return '';
-        if (typeof content === 'string') return content;
-        if (Array.isArray(content)) {
-          return content
-            .map((block) => {
-              if (!block || typeof block !== 'object') return '';
-              const maybeText = (block as { text?: string }).text;
-              return typeof maybeText === 'string' ? maybeText : '';
-            })
-            .filter(Boolean)
-            .join('\n');
-        }
-        return '';
-      };
-
-      const combinedContent = [
-        this.systemPrompt || '',
-        message || '',
-        ...this.conversationHistory.map((entry) => extractText(entry.content)),
-      ]
-        .filter(Boolean)
-        .join('\n');
-      const hasFileTarget = Boolean(
-        combinedContent &&
-        /[\w\-./]+\.(ts|js|tsx|jsx|py|java|go|rs|cpp|c|h|hpp|css|scss|html|json|md|yaml|yml|txt)/i.test(combinedContent)
-      );
-      const readOnlyIntent = Boolean(
-        combinedContent &&
-        /(不要修改|仅需读取|只需读取|只读分析)/.test(combinedContent)
-      );
-      const forceToolUse = Boolean(
-        toolDefinitions.length > 0 &&
-        !readOnlyIntent &&
-        (/必须使用工具/.test(combinedContent) ||
-          /必须使用\s*text_editor/.test(combinedContent) ||
-          /\btext_editor\b/.test(combinedContent) ||
-          /目标文件/.test(combinedContent) ||
-          /目标路径/.test(combinedContent) ||
-          hasFileTarget)
-      );
-
-      const preferredTool = toolDefinitions.find(tool => tool.name === 'text_editor')?.name;
-      const effectiveTools = forceToolUse && preferredTool
-        ? toolDefinitions.filter(tool => tool.name === preferredTool)
-        : toolDefinitions;
-      const toolChoice = undefined;
-
-      // 构建请求参数
+      // 构建请求参数（AI 根据 System Prompt 和任务上下文自主决定工具使用）
       const params: LLMMessageParams = {
         messages: this.conversationHistory,
         systemPrompt: this.systemPrompt,
-        tools: effectiveTools.length > 0 ? effectiveTools : undefined,
+        tools: toolDefinitions.length > 0 ? toolDefinitions : undefined,
         stream: true,
         maxTokens: 4096,
         temperature: 0.7,
-        toolChoice,
       };
 
       // 开始流式响应
@@ -241,6 +196,10 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       // 流式调用 LLM
       const response = await this.client.streamMessage(params, (chunk) => {
         if (chunk.type === 'content_delta' && chunk.content) {
+          if (this.seenThinking && !this.decisionHookAppliedForThinking) {
+            this.decisionHookAppliedForThinking = true;
+            this.applyDecisionHook({ type: 'thinking' });
+          }
           fullResponse += chunk.content;
           this.normalizer.processTextDelta(streamId, chunk.content);
           this.emit('message', chunk.content);
@@ -248,8 +207,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           // 处理 thinking 内容
           this.normalizer.processThinking(streamId, chunk.thinking);
           this.emit('thinking', chunk.thinking);
+          this.seenThinking = true;
         } else if (chunk.type === 'tool_call_start' && chunk.toolCall) {
           this.emit('toolCall', chunk.toolCall.name || '', chunk.toolCall.arguments || {});
+          this.applyDecisionHook({
+            type: 'tool_call',
+            toolName: chunk.toolCall.name || '',
+            toolArgs: chunk.toolCall.arguments || {},
+          });
         }
       });
       this.recordTokenUsage(response.usage);
@@ -257,7 +222,19 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       // 处理工具调用
       if (response.toolCalls && response.toolCalls.length > 0) {
         toolCalls = response.toolCalls;
-        const allowedTool = forceToolUse && preferredTool ? preferredTool : null;
+
+        // 🔧 修复：将工具调用同步到 Normalizer，确保消息有 blocks
+        // 这是根本原因修复：之前工具调用信息没有同步到 Normalizer，
+        // 导致 endStream() 时 context.activeToolCalls 为空，消息没有 blocks
+        for (const toolCall of toolCalls) {
+          this.normalizer.addToolCall(messageId, {
+            type: 'tool_call',
+            toolName: toolCall.name,
+            toolId: toolCall.id,
+            status: 'running',
+            input: JSON.stringify(toolCall.arguments, null, 2),
+          });
+        }
 
         // 添加助手响应到历史（包含工具调用）
         const assistantContent: any[] = [];
@@ -285,21 +262,18 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           content: assistantContent,
         });
 
-        // 执行工具调用
-        const toolResults = await (async () => {
-          if (!allowedTool) {
-            return await this.executeToolCalls(toolCalls);
-          }
-          const allowedCalls = toolCalls.filter(call => call.name === allowedTool);
-          const blockedCalls = toolCalls.filter(call => call.name !== allowedTool);
-          const blockedResults = blockedCalls.map(call => ({
-            toolCallId: call.id,
-            content: `Tool blocked: only '${allowedTool}' is permitted for this task. Use text_editor to edit target files.`,
-            isError: true,
-          }));
-          const allowedResults = await this.executeToolCalls(allowedCalls);
-          return [...blockedResults, ...allowedResults];
-        })();
+        // 执行所有工具调用（AI 自主选择的工具）
+        const toolResults = await this.executeToolCalls(toolCalls);
+
+        // 🔧 修复：工具执行完成后更新 Normalizer 中的工具调用状态
+        for (const result of toolResults) {
+          this.normalizer.finishToolCall(
+            messageId,
+            result.toolCallId,
+            result.isError ? undefined : result.content,
+            result.isError ? result.content : undefined
+          );
+        }
 
         // 添加工具结果到历史（使用 ContentBlock 格式）
         const toolResultContent: any[] = toolResults.map(result => ({
@@ -314,23 +288,10 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           content: toolResultContent,
         });
 
-        // 递归调用以获取最终响应
-        this.normalizer.endStream(messageId);
-        if (recursionDepth >= 3) {
-          return '多次工具调用后仍未产出最终回复，已中止以避免无限循环。';
-        }
-        return await this.sendMessageInternal(undefined, undefined, true, recursionDepth + 1);
-      }
+        // 工具执行完成后决策点（工具调用后）
+        this.applyDecisionHook({ type: 'tool_result' });
 
-      if (forceToolUse && preferredTool && !response.toolCalls?.length) {
-        this.conversationHistory.push({
-          role: 'assistant',
-          content: fullResponse,
-        });
-        this.conversationHistory.push({
-          role: 'user',
-          content: `必须使用 ${preferredTool} 完成目标文件修改。请调用该工具后继续。`,
-        });
+        // 递归调用以获取最终响应
         this.normalizer.endStream(messageId);
         if (recursionDepth >= 3) {
           return '多次工具调用后仍未产出最终回复，已中止以避免无限循环。';
@@ -346,6 +307,11 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
       this.normalizer.endStream(streamId);
       this.setState(AdapterState.CONNECTED);
+
+      // 🔧 如果流式传输完成但没有内容，抛出明确错误而非静默返回空
+      if (!fullResponse.trim()) {
+        throw new Error('LLM 响应为空：流式传输完成但未收到有效内容');
+      }
 
       return fullResponse;
     } catch (error: any) {
@@ -388,6 +354,24 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
   getSystemPrompt(): string {
     return this.systemPrompt;
+  }
+
+  /**
+   * 决策点补充指令注入
+   */
+  private applyDecisionHook(event: { type: 'thinking' | 'tool_call' | 'tool_result'; toolName?: string; toolArgs?: any; toolResult?: string }): void {
+    if (!this.decisionHook) {
+      return;
+    }
+    const instructions = this.decisionHook(event) || [];
+    if (instructions.length === 0) {
+      return;
+    }
+    const content = `[System] 用户补充指令：\n${instructions.map(i => `- ${i}`).join('\n')}`;
+    this.conversationHistory.push({
+      role: 'user',
+      content,
+    });
   }
 
   /**

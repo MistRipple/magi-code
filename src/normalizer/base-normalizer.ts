@@ -181,6 +181,22 @@ export abstract class BaseNormalizer extends EventEmitter {
     this.emit(MESSAGE_EVENTS.UPDATE, update);
   }
 
+  /**
+   * 处理 Token 使用统计
+   */
+  processUsage(messageId: string, usage: { inputTokens?: number; outputTokens?: number }): void {
+    const context = this.activeContexts.get(messageId);
+    if (!context) {
+      this.debug(`[${this.agent}] 未找到消息上下文: ${messageId}`);
+      return;
+    }
+
+    const update = this.createUpdate(messageId, 'block_update', {
+      tokenUsage: usage
+    });
+    this.emit(MESSAGE_EVENTS.UPDATE, update);
+  }
+
   endStream(messageId: string, error?: string): StandardMessage | null {
     const context = this.activeContexts.get(messageId);
     if (!context) {
@@ -258,6 +274,9 @@ export abstract class BaseNormalizer extends EventEmitter {
       messageType = MessageType.PLAN;
     } else if (blocks.some(b => b.type === 'tool_call')) {
       messageType = MessageType.TOOL_CALL;
+    } else if (blocks.some(b => b.type === 'thinking')) {
+      // 🔧 方案 B 修复：如果包含思考块，设置消息类型为 THINKING
+      messageType = MessageType.THINKING;
     }
 
     const safeBlocks = this.sanitizeBlocks(blocks, 'buildFinalMessage.final');
@@ -308,6 +327,35 @@ export abstract class BaseNormalizer extends EventEmitter {
 
   protected upsertToolCall(context: ParseContext, toolCall: ToolCallBlock): void {
     context.activeToolCalls.set(toolCall.toolId, toolCall);
+  }
+
+  /**
+   * 添加工具调用到消息上下文（public 接口）
+   * 用于外部模块（如 worker-adapter）在获取到工具调用信息后同步到 Normalizer
+   */
+  public addToolCall(messageId: string, toolCall: ToolCallBlock): void {
+    const context = this.activeContexts.get(messageId);
+    if (!context) {
+      this.debug(`[${this.agent}] addToolCall: 未找到消息上下文: ${messageId}`);
+      return;
+    }
+    this.upsertToolCall(context, toolCall);
+    // 发送更新通知
+    const update = this.createUpdate(messageId, 'block_update', { blocks: [toolCall] });
+    this.emit(MESSAGE_EVENTS.UPDATE, update);
+  }
+
+  /**
+   * 完成工具调用（public 接口）
+   * 用于外部模块在工具执行完成后更新状态
+   */
+  public finishToolCall(messageId: string, toolId: string, output?: string, error?: string): void {
+    const context = this.activeContexts.get(messageId);
+    if (!context) {
+      this.debug(`[${this.agent}] finishToolCall: 未找到消息上下文: ${messageId}`);
+      return;
+    }
+    this.completeToolCall(context, toolId, output, error);
   }
 
   protected completeToolCall(context: ParseContext, toolId: string, output?: string, error?: string): void {

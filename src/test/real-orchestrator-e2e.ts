@@ -8,8 +8,6 @@ import { LLMAdapterFactory } from '../llm/adapter-factory';
 import { MissionDrivenEngine } from '../orchestrator/core';
 import { SnapshotManager } from '../snapshot-manager';
 import { UnifiedSessionManager } from '../session';
-import { UnifiedTaskManager } from '../task/unified-task-manager';
-import { SessionManagerTaskRepository } from '../task/session-manager-task-repository';
 import { globalEventBus } from '../events';
 
 type StandardMsg = {
@@ -50,10 +48,7 @@ async function run() {
   // 初始化 adapter factory（加载 profile）
   await adapterFactory.initialize();
 
-  const session = sessionManager.getOrCreateCurrentSession();
-  const repository = new SessionManagerTaskRepository(sessionManager, session.id);
-  const taskManager = new UnifiedTaskManager(session.id, repository);
-  await taskManager.initialize();
+  // 统一 Todo 系统：不再需要 UnifiedTaskManager
 
   const orchestrator = new MissionDrivenEngine(
     adapterFactory,
@@ -71,8 +66,7 @@ async function run() {
     sessionManager
   );
 
-  // 关键：传递 taskManager 以确保 SubTask.assignedWorker 正确同步
-  orchestrator.setTaskManager(taskManager);
+  // 统一 Todo 系统：不再需要 setTaskManager
 
   // 自动确认/澄清/提问回调（避免卡住）
   orchestrator.setConfirmationCallback(async () => true);

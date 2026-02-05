@@ -8,7 +8,7 @@
 /** AI 意图决策 */
 export interface IntentDecision {
   /** 意图类型（用于分析/记录） */
-  intent: 'question' | 'trivial' | 'exploratory' | 'task' | 'ambiguous' | 'open_ended';
+  intent: 'question' | 'trivial' | 'exploratory' | 'task' | 'demo' | 'ambiguous' | 'open_ended';
   /** 推荐的处理模式 */
   recommendedMode: IntentHandlerMode;
   /** 置信度 (0-1) */
@@ -47,6 +47,8 @@ export enum IntentHandlerMode {
   EXPLORE = 'explore',
   /** 任务模式：需要计划和执行 */
   TASK = 'task',
+  /** 演示模式：测试/演示系统功能，Orchestrator 自主选择场景 */
+  DEMO = 'demo',
   /** 澄清模式：需要用户提供更多信息 */
   CLARIFY = 'clarify',
 }
@@ -128,6 +130,7 @@ export class IntentGate {
       [IntentHandlerMode.DIRECT]: '直接执行简单操作',
       [IntentHandlerMode.EXPLORE]: '探索分析代码库',
       [IntentHandlerMode.TASK]: '进入任务分析和执行流程',
+      [IntentHandlerMode.DEMO]: '自主选择测试场景并执行',
       [IntentHandlerMode.CLARIFY]: '请求用户提供更多信息',
     };
 

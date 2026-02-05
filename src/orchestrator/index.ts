@@ -82,10 +82,10 @@ export {
   type IDEDiagnosticResult,
 } from './verification-runner';
 
-// 恢复处理器
+// 恢复处理器 - 使用 ProfileAwareRecoveryHandler (已移至 recovery/ 目录)
 export {
-  RecoveryHandler,
-  type RecoveryStrategy,
-  type RecoveryResult,
-  type RecoveryConfig,
-} from './recovery-handler';
+  ProfileAwareRecoveryHandler,
+  type RecoveryStrategyType,
+  type RecoveryDecision,
+  type FailureAnalysis,
+} from './recovery';

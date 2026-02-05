@@ -14,7 +14,7 @@
 import { logger, LogCategory } from '../logging';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Task, FileSnapshot } from '../types';
+import { FileSnapshot } from '../types';
 import { AgentType } from '../types/agent-types';
 import { globalEventBus } from '../events';
 
@@ -65,7 +65,11 @@ export interface SessionSummary {
   lastUpdated: number;            // 最后更新时间
 }
 
-/** 统一会话数据结构 */
+/** 统一会话数据结构
+ *
+ * 注意：任务管理已迁移到 Mission 系统
+ * 使用 MissionDrivenEngine.listTaskViews() 获取任务列表
+ */
 export interface UnifiedSession {
   id: string;
   name?: string;
@@ -74,8 +78,6 @@ export interface UnifiedSession {
   updatedAt: number;
   /** 聊天消息 */
   messages: SessionMessage[];
-  /** 任务列表 */
-  tasks: Task[];
   /** 快照元数据 */
   snapshots: FileSnapshotMeta[];
 }
@@ -170,7 +172,6 @@ export class UnifiedSessionManager {
       createdAt: now,
       updatedAt: now,
       messages: [],
-      tasks: [],
       snapshots: [],
     };
 
@@ -430,49 +431,6 @@ export class UnifiedSessionManager {
   }
 
   // ============================================================================
-  // Task 管理
-  // ============================================================================
-
-  /** 添加 Task 到会话 */
-  addTask(sessionId: string, task: Task): void {
-    const session = this.sessions.get(sessionId);
-    if (session) {
-      session.tasks.push(task);
-      session.updatedAt = Date.now();
-      this.saveSession(session);
-    }
-  }
-
-  /** 更新 Task */
-  updateTask(sessionId: string, taskId: string, updates: Partial<Task>): void {
-    const session = this.sessions.get(sessionId);
-    if (session) {
-      const taskIndex = session.tasks.findIndex(t => t.id === taskId);
-      if (taskIndex !== -1) {
-        session.tasks[taskIndex] = { ...session.tasks[taskIndex], ...updates };
-        session.updatedAt = Date.now();
-        this.saveSession(session);
-      }
-    }
-  }
-
-  /** 获取会话的所有任务 */
-  getTasks(sessionId: string): Task[] {
-    const session = this.sessions.get(sessionId);
-    return session?.tasks ?? [];
-  }
-
-  /** 清空会话的任务列表 */
-  clearTasks(sessionId: string): void {
-    const session = this.sessions.get(sessionId);
-    if (session) {
-      session.tasks = [];
-      session.updatedAt = Date.now();
-      this.saveSession(session);
-    }
-  }
-
-  // ============================================================================
   // 快照管理
   // ============================================================================
 
@@ -620,11 +578,6 @@ export class UnifiedSessionManager {
     // 数组字段验证
     if (!Array.isArray(session.messages)) {
       logger.error('会话.验证.消息_非数组', undefined, LogCategory.SESSION);
-      return false;
-    }
-
-    if (!Array.isArray(session.tasks)) {
-      logger.error('会话.验证.任务_非数组', undefined, LogCategory.SESSION);
       return false;
     }
 
@@ -834,22 +787,19 @@ export class UnifiedSessionManager {
   // 会话总结生成（用于会话恢复）
   // ============================================================================
 
-  /** 生成会话总结（用于会话切换时的上下文注入） */
+  /** 生成会话总结（用于会话切换时的上下文注入）
+   * 注意：任务信息现在从 Mission 系统获取，此方法返回的任务信息可能为空
+   * 调用方应使用 MissionDrivenEngine.listTaskViews() 获取完整任务列表
+   */
   getSessionSummary(sessionId?: string): SessionSummary | null {
     const session = sessionId ? this.sessions.get(sessionId) : this.getCurrentSession();
     if (!session) return null;
 
-    // 提取已完成任务
-    const completedTasks = session.tasks
-      .filter(t => t.status === 'completed')
-      .map(t => t.prompt || '未命名任务')
-      .slice(0, 10); // 最多 10 个
-
-    // 提取进行中任务
-    const inProgressTasks = session.tasks
-      .filter(t => t.status === 'running' || t.status === 'pending')
-      .map(t => t.prompt || '未命名任务')
-      .slice(0, 5); // 最多 5 个
+    // 任务信息已迁移到 Mission 系统，这里返回空数组
+    // 调用方应使用 MissionDrivenEngine.listTaskViews() 获取任务
+    const completedTasks: string[] = [];
+    const inProgressTasks: string[] = [];
+    const pendingIssues: string[] = [];
 
     // 提取代码变更摘要
     const codeChanges = session.snapshots
@@ -858,12 +808,6 @@ export class UnifiedSessionManager {
 
     // 提取关键决策（从消息中提取）
     const keyDecisions = this.extractKeyDecisions(session.messages);
-
-    // 提取待解决问题（从任务中提取）
-    const pendingIssues = session.tasks
-      .filter(t => t.status === 'failed')
-      .map(t => t.prompt || '未命名问题')
-      .slice(0, 5); // 最多 5 个
 
     // 生成会话目标（从第一条用户消息或会话名称）
     const objective = this.extractObjective(session);

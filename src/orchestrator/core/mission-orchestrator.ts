@@ -45,7 +45,6 @@ import {
   AcceptanceCriterion,
 } from '../mission';
 import { AutonomousWorker, AutonomousExecutionResult } from '../worker';
-import { PlanTodoManager } from '../plan-todo';
 import { TodoManager } from '../../todo';
 import type { ReportCallback } from '../protocols/worker-report';
 import {
@@ -78,6 +77,8 @@ export interface ExecutionOptions {
   projectContext?: string;
   /** 并行执行 */
   parallel?: boolean;
+  /** 使用 Wave 并行分组执行 */
+  useWaveExecution?: boolean;
   /** 并行规划（默认 true） */
   parallelPlanning?: boolean;
   /** 阻塞超时时间（毫秒），超时后跳过阻塞项 */
@@ -96,6 +97,8 @@ export interface ExecutionOptions {
   onReport?: ReportCallback;
   /** 汇报超时(ms) */
   reportTimeout?: number;
+  /** 获取补充指令（在决策点注入） */
+  getSupplementaryInstructions?: (workerId: WorkerSlot) => string[];
 }
 
 /**
@@ -130,6 +133,7 @@ export interface ExecutionResult {
   duration: number;
   /** 聚合的 Token 使用统计 */
   tokenUsage?: TokenUsage;
+  hasPendingApprovals?: boolean;
 }
 
 /**
@@ -231,10 +235,8 @@ export class MissionOrchestrator extends EventEmitter {
 
   // 执行相关属性（从 MissionExecutor 合并）
   private workers: Map<WorkerSlot, AutonomousWorker> = new Map();
-  private todoManager?: PlanTodoManager;
-  private unifiedTodoManager?: TodoManager;
+  private todoManager?: TodoManager;
   private currentMissionId: string | null = null;
-  private taskManager?: import('../../task/unified-task-manager').UnifiedTaskManager;
 
   constructor(
     private profileLoader: ProfileLoader,
@@ -294,20 +296,6 @@ export class MissionOrchestrator extends EventEmitter {
     this.adapterFactory = adapterFactory;
     // 初始化智能执行组件
     this.taskPreAnalyzer = new TaskPreAnalyzer(adapterFactory);
-  }
-
-  /**
-   * 设置 TODO 管理器
-   */
-  setTodoManager(todoManager: PlanTodoManager): void {
-    this.todoManager = todoManager;
-  }
-
-  /**
-   * 设置 TaskManager（用于 SubTask 同步）
-   */
-  setTaskManager(taskManager: import('../../task/unified-task-manager').UnifiedTaskManager): void {
-    this.taskManager = taskManager;
   }
 
   /**
@@ -556,6 +544,13 @@ export class MissionOrchestrator extends EventEmitter {
         description: desc,
         source: 'system' as const,
       }));
+
+      // 【新增】将约束条件记录到 Memory
+      if (this.contextManager) {
+        for (const constraint of analysis.constraints) {
+          this.contextManager.addUserConstraint(constraint);
+        }
+      }
     }
 
     if (analysis.acceptanceCriteria) {
@@ -586,6 +581,11 @@ export class MissionOrchestrator extends EventEmitter {
     mission.riskLevel = analysis.riskLevel || 'medium';
     mission.riskFactors = analysis.riskFactors || [];
     mission.phase = 'participant_selection';
+
+    // 【新增】设置当前工作状态
+    if (this.contextManager) {
+      this.contextManager.setCurrentWork(`理解目标: ${analysis.goal}`);
+    }
 
     await this.storage.update(mission);
 
@@ -777,7 +777,10 @@ export class MissionOrchestrator extends EventEmitter {
           .map(d => `${d.description}: ${d.reason}`);
       }
       if (memory.pendingIssues?.length) {
-        taskInfo.pendingIssues = memory.pendingIssues.slice(-5);
+        // 将 Issue 对象转换为 string 数组
+        taskInfo.pendingIssues = memory.pendingIssues
+          .slice(-5)
+          .map(issue => issue.description);
       }
     }
 
@@ -932,6 +935,11 @@ export class MissionOrchestrator extends EventEmitter {
     mission.completedAt = Date.now();
     await this.storage.update(mission);
 
+    // 清理该 Mission 的共享上下文
+    if (this.contextManager) {
+      this.contextManager.clearMissionContext(missionId);
+    }
+
     this.emit('missionCompleted', { mission });
 
     return mission;
@@ -948,6 +956,11 @@ export class MissionOrchestrator extends EventEmitter {
 
     mission.status = 'failed';
     await this.storage.update(mission);
+
+    // 清理该 Mission 的共享上下文
+    if (this.contextManager) {
+      this.contextManager.clearMissionContext(missionId);
+    }
 
     this.emit('missionFailed', { mission, error });
 
@@ -1405,9 +1418,22 @@ export class MissionOrchestrator extends EventEmitter {
           });
         }
       }
+
+      // 【新增】6. 任务成功完成时，将之前的 pendingIssue 标记为已解决
+      if (assignment.status === 'completed') {
+        const pendingIssues = memory.getContent().pendingIssues;
+        const relatedIssue = pendingIssues.find(issue => issue.description.includes(assignment.workerId));
+        if (relatedIssue) {
+          memory.markIssueResolved(
+            relatedIssue.id,
+            '任务重试后成功完成',
+            `${assignment.workerId} 完成了 ${assignment.todos.filter(t => t.status === 'completed').length} 个子任务`
+          );
+        }
+      }
     }
 
-    // 6. 保存 Memory（含压缩）
+    // 7. 保存 Memory（含压缩）
     if (memory.isDirty()) {
       await this.contextManager.saveMemory();
       logger.info('编排器.Memory.写回完成', { missionId: mission.id }, LogCategory.ORCHESTRATOR);
@@ -1624,24 +1650,49 @@ export class MissionOrchestrator extends EventEmitter {
   /**
    * 确保 Worker 存在（懒加载创建）
    */
-  private ensureWorker(workerSlot: WorkerSlot): AutonomousWorker {
+  private async ensureWorker(workerSlot: WorkerSlot): Promise<AutonomousWorker> {
     let worker = this.workers.get(workerSlot);
     if (!worker) {
       if (!this.adapterFactory) {
         throw new Error(`未配置 AdapterFactory，无法创建 Worker: ${workerSlot}`);
       }
       // 确保 TodoManager 存在
-      if (!this.unifiedTodoManager && this.workspaceRoot) {
-        this.unifiedTodoManager = new TodoManager(this.workspaceRoot);
+      if (!this.todoManager && this.workspaceRoot) {
+        try {
+          this.todoManager = new TodoManager(this.workspaceRoot);
+          await this.todoManager.initialize();
+          logger.info('编排器.TodoManager.已初始化', {
+            workspaceRoot: this.workspaceRoot,
+            forWorker: workerSlot,
+          }, LogCategory.ORCHESTRATOR);
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          logger.error('编排器.TodoManager.初始化失败', {
+            error: errorMessage,
+            workspaceRoot: this.workspaceRoot,
+            workerSlot,
+          }, LogCategory.ORCHESTRATOR);
+          throw new Error(`初始化 TodoManager 失败 (workspace: ${this.workspaceRoot}, worker: ${workerSlot}): ${errorMessage}`);
+        }
       }
-      if (!this.unifiedTodoManager) {
+      if (!this.todoManager) {
         throw new Error('未配置 TodoManager，无法创建 Worker');
       }
+      // 确保 ContextManager 存在以获取共享上下文依赖
+      if (!this.contextManager) {
+        throw new Error('未配置 ContextManager，无法创建 Worker');
+      }
+      const sharedContextDeps = {
+        contextAssembler: this.contextManager.getContextAssembler(),
+        fileSummaryCache: this.contextManager.getFileSummaryCache(),
+        sharedContextPool: this.contextManager.getSharedContextPool(),
+      };
       worker = new AutonomousWorker(
         workerSlot,
         this.profileLoader,
         this.guidanceInjector,
-        this.unifiedTodoManager
+        this.todoManager,
+        sharedContextDeps
       );
       this.workers.set(workerSlot, worker);
 
@@ -1658,6 +1709,12 @@ export class MissionOrchestrator extends EventEmitter {
           workerId: workerSlot,
         });
       });
+
+      // 🔧 转发 Todo 事件，确保 UI 能实时更新子任务状态
+      worker.on('todoStarted', (data) => this.emit('todoStarted', { ...data, missionId: this.currentMissionId }));
+      worker.on('todoCompleted', (data) => this.emit('todoCompleted', { ...data, missionId: this.currentMissionId }));
+      worker.on('todoFailed', (data) => this.emit('todoFailed', { ...data, missionId: this.currentMissionId }));
+      worker.on('dynamicTodoAdded', (data) => this.emit('dynamicTodoAdded', { ...data, missionId: this.currentMissionId }));
 
       logger.info('编排器.Worker.创建', { workerSlot }, LogCategory.ORCHESTRATOR);
     }
@@ -1709,15 +1766,7 @@ export class MissionOrchestrator extends EventEmitter {
 
     // 确保所有 Worker 存在
     for (const assignment of mission.assignments) {
-      this.ensureWorker(assignment.workerId);
-    }
-
-    // 生成 TODO 文件
-    if (this.todoManager && this.snapshotManager) {
-      const session = (this.snapshotManager as any).sessionManager?.getCurrentSession();
-      if (session) {
-        this.todoManager.ensureMissionTodoFile(mission, session.id);
-      }
+      await this.ensureWorker(assignment.workerId);
     }
 
     // ========== 创建智能响应器 ==========
@@ -1743,10 +1792,8 @@ export class MissionOrchestrator extends EventEmitter {
       coordinator.setContextManager(this.contextManager);
     }
 
-    // 设置 TaskManager（用于 SubTask 同步，确保 UI 能显示正确的 assignedWorker）
-    if (this.taskManager) {
-      coordinator.setTaskManager(this.taskManager);
-    }
+    // 统一 Todo 系统：不再需要 TaskManager
+    // Assignments 信息通过 Todo 系统传递给 UI
 
     // 转发事件
     coordinator.on('progress', (progress) => {
@@ -1778,17 +1825,22 @@ export class MissionOrchestrator extends EventEmitter {
 
     try {
       // ========== 构建智能执行选项 ==========
+      // 注意：简单任务不创建 Todo，Worker 直接执行 assignment.responsibility
+      // Todo 系统仅用于复杂多步骤任务，由编排者 LLM 语义理解决定
+      const parallel = typeof options.parallel === 'boolean' ? options.parallel : strategy.parallel;
       const executeOptions = {
         workingDirectory: options.workingDirectory,
         timeout: options.timeout,
         projectContext: options.projectContext,
-        parallel: strategy.parallel,
+        parallel,
+        useWaveExecution: options.useWaveExecution,
         parallelPlanning: options.parallelPlanning,
         blockingTimeout: options.blockingTimeout,
         blockingCheckInterval: options.blockingCheckInterval,
         onOutput: options.onOutput,
         onReport: options.onReport ?? (async (report) => responder.handleReport(report)),
         reportTimeout: options.reportTimeout,
+        getSupplementaryInstructions: options.getSupplementaryInstructions,
         // ========== 智能执行策略 ==========
         needsPlanning: strategy.needsPlanning,
         needsReview: strategy.needsReview,
@@ -1799,9 +1851,21 @@ export class MissionOrchestrator extends EventEmitter {
 
       const coordResult = await coordinator.execute(executeOptions);
 
-      // 完成或失败 Mission
+      // 完成、暂停或失败 Mission
       if (coordResult.success) {
-        await this.completeMission(mission.id, mission);
+        if (coordResult.hasPendingApprovals) {
+          // 暂停任务等待审批
+          mission.status = 'pending_approval';
+          await this.storage.update(mission);
+          logger.info('Mission 等待审批', { missionId: mission.id }, LogCategory.ORCHESTRATOR);
+          this.emit('missionStatusChanged', { 
+            missionId: mission.id, 
+            oldStatus: 'executing', 
+            newStatus: 'pending_approval' 
+          });
+        } else {
+          await this.completeMission(mission.id, mission);
+        }
       } else {
         await this.failMission(mission.id, coordResult.errors.join('; '), mission);
       }
@@ -1817,6 +1881,7 @@ export class MissionOrchestrator extends EventEmitter {
         errors: coordResult.errors,
         duration: Date.now() - startTime,
         tokenUsage: coordResult.tokenUsage,
+        hasPendingApprovals: coordResult.hasPendingApprovals,
       };
 
       this.emit('executionCompleted', result);
@@ -1842,6 +1907,16 @@ export class MissionOrchestrator extends EventEmitter {
         duration: Date.now() - startTime,
       };
     }
+  }
+
+  /**
+   * 批准 Todo (用于动态任务审批)
+   */
+  async approveTodo(todoId: string): Promise<void> {
+    if (!this.todoManager) {
+      throw new Error('TodoManager not initialized');
+    }
+    await this.todoManager.approve(todoId);
   }
 
   /**

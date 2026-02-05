@@ -16,13 +16,17 @@ import { LLMAdapterFactory } from '../../llm/adapter-factory';
 import { MissionDrivenEngine } from '../../orchestrator/core';
 import { SnapshotManager } from '../../snapshot-manager';
 import { UnifiedSessionManager } from '../../session';
-import { UnifiedTaskManager } from '../../task/unified-task-manager';
-import { SessionManagerTaskRepository } from '../../task/session-manager-task-repository';
 import { globalEventBus } from '../../events';
 import { WorkerSlot } from '../../types';
 import { MessageHub } from '../../orchestrator/core/message-hub';
 import { LLMConfigLoader } from '../../llm/config';
 import { ProjectKnowledgeBase } from '../../knowledge/project-knowledge-base';
+import {
+  MessageCategory,
+  MessageType,
+  MessageLifecycle,
+  createStandardMessage,
+} from '../../protocol/message-protocol';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -54,7 +58,6 @@ interface TestContext {
   orchestrator: MissionDrivenEngine;
   sessionManager: UnifiedSessionManager;
   snapshotManager: SnapshotManager;
-  taskManager: UnifiedTaskManager;
   workspaceRoot: string;
   messageHub: MessageHub;
   messages: any[];
@@ -85,10 +88,7 @@ async function createTestContext(): Promise<TestContext> {
   // 初始化 adapter factory（加载 profile 和配置）
   await adapterFactory.initialize();
 
-  const session = sessionManager.getOrCreateCurrentSession();
-  const repository = new SessionManagerTaskRepository(sessionManager, session.id);
-  const taskManager = new UnifiedTaskManager(session.id, repository);
-  await taskManager.initialize();
+  // 统一 Todo 系统：不再需要 UnifiedTaskManager
 
   const fullConfig = LLMConfigLoader.loadFullConfig();
   const enabledWorkers = Object.entries(fullConfig.workers)
@@ -119,8 +119,7 @@ async function createTestContext(): Promise<TestContext> {
 
   orchestrator.setKnowledgeBase(knowledgeBase);
 
-  // 关键：传递 taskManager 以确保 SubTask.assignedWorker 正确同步
-  orchestrator.setTaskManager(taskManager);
+  // 统一 Todo 系统：不再需要 setTaskManager
 
   // 自动确认/澄清/提问回调（避免卡住）
   orchestrator.setConfirmationCallback(async () => true);
@@ -151,7 +150,6 @@ async function createTestContext(): Promise<TestContext> {
     orchestrator,
     sessionManager,
     snapshotManager,
-    taskManager,
     workspaceRoot,
     messageHub,
     messages,
@@ -209,6 +207,25 @@ async function executeScenario(
     }
 
     ctx.messageHub.setRequestContext(requestId);
+
+    // 🔧 修复：发送占位消息以注册 requestId -> placeholderMessageId 映射
+    // 这模拟了真实 UI 中 InputArea.svelte 发送占位消息的行为
+    const placeholderMessageId = `placeholder_${requestId}`;
+    const placeholderMessage = createStandardMessage({
+      id: placeholderMessageId,
+      traceId: 'e2e-test',
+      category: MessageCategory.CONTENT,
+      type: MessageType.TEXT,
+      source: 'orchestrator',
+      agent: 'orchestrator',
+      lifecycle: MessageLifecycle.STARTED,
+      blocks: [],
+      metadata: {
+        isPlaceholder: true,
+        requestId,
+      },
+    });
+    ctx.messageHub.sendMessage(placeholderMessage);
 
     // 执行编排
     const result = await ctx.orchestrator.execute(prompt, '');

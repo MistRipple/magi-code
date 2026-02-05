@@ -10,6 +10,8 @@
  */
 
 import { EventEmitter } from 'events';
+import * as fs from 'fs/promises';
+import * as crypto from 'crypto';
 import { WorkerSlot, SubTask } from '../../types';
 import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import { AdapterOutputScope } from '../../adapters/adapter-factory-interface';
@@ -44,6 +46,55 @@ import {
   ConversationMessage,
 } from './worker-session';
 import { logger, LogCategory } from '../../logging';
+// 共享上下文与文件摘要缓存模块
+import {
+  ContextAssembler,
+  ISharedContextPool,
+  IFileSummaryCache,
+  FileSummary,
+  ContextSource,
+  AssembledContext,
+  DEFAULT_TOKEN_BUDGET,
+  generateSharedContextId,
+  createSharedContextEntry,
+} from '../../context';
+
+/**
+ * 文件读取结果
+ * 用于 readFileWithCache 方法返回值，标识读取类型和来源
+ */
+export interface FileReadResult {
+  /** 返回类型: 'summary' 表示返回摘要, 'full' 表示返回完整文件内容 */
+  type: 'summary' | 'full';
+  /** 内容（摘要格式化后的字符串或原始文件内容） */
+  content: string;
+  /** 是否来自缓存 */
+  fromCache: boolean;
+}
+
+/**
+ * Worker 洞察（用于写入 SharedContextPool）
+ */
+export interface WorkerInsight {
+  /** 洞察内容 */
+  content: string;
+  /** 标签（用于订阅筛选） */
+  tags: string[];
+  /** 重要性级别 */
+  importance: 'critical' | 'high' | 'medium' | 'low';
+}
+
+/**
+ * 共享上下文依赖（强制注入）
+ */
+export interface SharedContextDependencies {
+  /** 上下文组装器 - 负责按预算分配组装上下文 */
+  contextAssembler: ContextAssembler;
+  /** 文件摘要缓存 - 减少重复读取同一文件 */
+  fileSummaryCache: IFileSummaryCache;
+  /** 共享上下文池 - 跨 Worker 知识共享 */
+  sharedContextPool: ISharedContextPool;
+}
 
 /**
  * Todo 执行选项
@@ -65,6 +116,8 @@ export interface TodoExecuteOptions {
   onReport?: ReportCallback;
   /** 汇报超时(ms)，默认 5000 */
   reportTimeout?: number;
+  /** 获取补充指令（在决策点注入） */
+  getSupplementaryInstructions?: () => string[];
   /** Session ID（用于恢复执行） - 提案 4.1 */
   sessionId?: string;
   /** 恢复时的额外指令 - 提案 4.1 */
@@ -91,6 +144,20 @@ export interface AutonomousExecutionResult {
   tokenUsage?: TokenUsage;
   /** Session ID（用于后续恢复） - 提案 4.1 */
   sessionId?: string;
+  /** 是否有等待审批的 Todo */
+  hasPendingApprovals?: boolean;
+  /** 是否为直接执行模式（简单任务无 Todo） */
+  directExecution?: boolean;
+  /** 直接执行模式的输出 */
+  directOutput?: DirectExecutionOutput;
+}
+
+/**
+ * 直接执行模式的输出（简单任务）
+ */
+export interface DirectExecutionOutput {
+  summary: string;
+  modifiedFiles?: string[];
 }
 
 /**
@@ -105,17 +172,54 @@ export class AutonomousWorker extends EventEmitter {
   /** 当前活跃的 Session */
   private currentSession: WorkerSession | null = null;
 
+  // ============================================================================
+  // 共享上下文依赖 - 提案 9.2（强制注入）
+  // ============================================================================
+
+  /** 上下文组装器 - 按预算分配组装上下文 */
+  private contextAssembler: ContextAssembler;
+  /** 文件摘要缓存 - 减少重复读取同一文件 */
+  private fileSummaryCache: IFileSummaryCache;
+  /** 共享上下文池 - 跨 Worker 知识共享 */
+  private sharedContextPool: ISharedContextPool;
+  /** 当前 Mission ID（用于写入共享上下文） */
+  private currentMissionId?: string;
+
   constructor(
     private workerType: WorkerSlot,
     private profileLoader: ProfileLoader,
     private guidanceInjector: GuidanceInjector,
     todoManager: TodoManager,
+    sharedContextDeps: SharedContextDependencies,
     sessionManager?: WorkerSessionManager
   ) {
     super();
+
+    // 运行时验证：强制依赖参数（TypeScript 类型在运行时不存在）
+    if (!todoManager) {
+      throw new Error(`创建 Worker[${workerType}] 失败: todoManager 为必需依赖`);
+    }
+    if (!sharedContextDeps) {
+      throw new Error(`创建 Worker[${workerType}] 失败: sharedContextDeps 为必需依赖`);
+    }
+    if (!sharedContextDeps.contextAssembler) {
+      throw new Error(`创建 Worker[${workerType}] 失败: 缺少 contextAssembler`);
+    }
+    if (!sharedContextDeps.fileSummaryCache) {
+      throw new Error(`创建 Worker[${workerType}] 失败: 缺少 fileSummaryCache`);
+    }
+    if (!sharedContextDeps.sharedContextPool) {
+      throw new Error(`创建 Worker[${workerType}] 失败: 缺少 sharedContextPool`);
+    }
+
     this.todoManager = todoManager;
     this.recoveryHandler = new ProfileAwareRecoveryHandler(profileLoader);
     this.sessionManager = sessionManager || new WorkerSessionManager({ autoCleanup: true });
+
+    // 强制依赖：共享上下文组件（运行时已验证非空）
+    this.contextAssembler = sharedContextDeps.contextAssembler;
+    this.fileSummaryCache = sharedContextDeps.fileSummaryCache;
+    this.sharedContextPool = sharedContextDeps.sharedContextPool;
   }
 
   /**
@@ -178,6 +282,17 @@ export class AutonomousWorker extends EventEmitter {
     // 是否被编排者中止
     let aborted = false;
     let abortReason: string | undefined;
+
+    // 设置当前 Mission ID（用于共享上下文写入） - 提案 9.2
+    this.currentMissionId = assignment.missionId;
+
+    // 组装共享上下文 - 提案 9.2（强制依赖已保证可用）
+    // 从 scope.includes 提取标签，如果没有则使用空数组
+    const tags = assignment.scope.includes || [];
+    const sharedContext = await this.assembleSharedContext(
+      assignment.missionId,
+      tags
+    );
 
     // Session 管理 - 提案 4.1
     const sessionMgr = options.sessionManager || this.sessionManager;
@@ -250,12 +365,61 @@ export class AutonomousWorker extends EventEmitter {
       isResuming,
     }, LogCategory.ORCHESTRATOR);
 
+    // ========== 双模式执行：直接执行 vs Todo 循环 ==========
+    // 由编排者 LLM 语义理解决定：
+    //   - 简单任务：assignment.todos 为空，直接执行
+    //   - 复杂任务：assignment.todos 非空，按 Todo 循环执行
+
+    if (!assignment.todos || assignment.todos.length === 0) {
+      // ========== 直接执行模式（简单任务） ==========
+      logger.info('Worker.直接执行模式', {
+        assignmentId: assignment.id,
+        workerId: this.workerType,
+        responsibility: assignment.responsibility.substring(0, 50),
+      }, LogCategory.ORCHESTRATOR);
+
+      const directResult = await this.executeDirectly(assignment, options);
+
+      // 构建结果
+      const result: AutonomousExecutionResult = {
+        assignment,
+        success: directResult.success,
+        completedTodos: [],
+        failedTodos: [],
+        skippedTodos: [],
+        dynamicTodos: [],
+        recoveredTodos: [],
+        totalDuration: Date.now() - startTime,
+        errors: directResult.error ? [directResult.error] : [],
+        recoveryAttempts: 0,
+        tokenUsage: directResult.tokenUsage || totalTokenUsage,
+        sessionId: session?.id,
+        hasPendingApprovals: false,
+        directExecution: true, // 标记为直接执行模式
+        directOutput: directResult.output, // 直接执行的输出
+      };
+
+      // 清理 Session
+      this.currentSession = null;
+      if (result.success && session) {
+        logger.debug('Worker.Session.保留', { sessionId: session.id }, LogCategory.ORCHESTRATOR);
+      } else if (!result.success && session) {
+        logger.info('Worker.Session.失败保留', { sessionId: session.id, lastError: result.errors[0] }, LogCategory.ORCHESTRATOR);
+      }
+
+      this.emit('assignmentCompleted', result);
+
+      return result;
+    }
+
+    // ========== Todo 循环模式（复杂任务） ==========
     // 执行每个 Todo
     let currentTodo = this.getNextExecutableTodo(assignment);
 
     while (currentTodo && !aborted) {
       try {
-        const result = await this.executeTodo(currentTodo, assignment, options);
+        // 传递共享上下文到 Todo 执行 - 提案 9.2
+        const result = await this.executeTodo(currentTodo, assignment, options, sharedContext);
 
         // 聚合 Token 统计
         if (result.tokenUsage) {
@@ -360,6 +524,9 @@ export class AutonomousWorker extends EventEmitter {
       }
     }
 
+    // 检查是否有等待审批的 Todo
+    const hasPendingApprovals = assignment.todos.some(t => t.status === 'pending' && t.approvalStatus === 'pending');
+
     // 如果被中止，将剩余的 pending Todo 标记为 skipped
     if (aborted) {
       for (const todo of assignment.todos) {
@@ -385,7 +552,8 @@ export class AutonomousWorker extends EventEmitter {
       errors: aborted ? [...errors, abortReason || '被编排者终止'] : errors,
       recoveryAttempts: session?.stateSnapshot.retryCount || 0,
       tokenUsage: totalTokenUsage,
-      sessionId: session?.id, // 提案 4.1: 返回 sessionId 以便后续恢复
+      sessionId: session?.id,
+      hasPendingApprovals, // 返回 pendingApproval 状态
     };
 
     // 清理当前 Session 引用
@@ -569,6 +737,7 @@ export class AutonomousWorker extends EventEmitter {
 
     // 处理新指令（记录日志，实际执行由 Worker 自行理解）
     if (adjustment.newInstructions) {
+      this.appendSupplementaryInstructions(assignment, [adjustment.newInstructions]);
       logger.info('Worker.收到新指令', {
         assignmentId: assignment.id,
         instructions: adjustment.newInstructions.substring(0, 100),
@@ -582,12 +751,29 @@ export class AutonomousWorker extends EventEmitter {
   }
 
   /**
+   * 追加补充指令到 Assignment 引导
+   */
+  private appendSupplementaryInstructions(assignment: Assignment, instructions: string[]): void {
+    const normalized = instructions
+      .map(i => i.trim())
+      .filter(Boolean);
+    if (normalized.length === 0) {
+      return;
+    }
+    const content = `[System] 用户补充指令：\n${normalized.map(i => `- ${i}`).join('\n')}`;
+    assignment.guidancePrompt = assignment.guidancePrompt
+      ? `${assignment.guidancePrompt}\n\n${content}`
+      : content;
+  }
+
+  /**
    * 执行单个 Todo
    */
   async executeTodo(
     todo: UnifiedTodo,
     assignment: Assignment,
-    options: TodoExecuteOptions
+    options: TodoExecuteOptions,
+    sharedContext?: AssembledContext | null
   ): Promise<{
     success: boolean;
     todo: UnifiedTodo;
@@ -620,9 +806,14 @@ export class AutonomousWorker extends EventEmitter {
     });
 
     try {
-      // 构建执行 prompt
+      // 构建执行 prompt（注入共享上下文） - 提案 9.2
       const profile = this.profileLoader.getProfile(this.workerType);
-      const executionPrompt = this.buildExecutionPrompt(todo, assignment, options.projectContext);
+      const executionPrompt = this.buildExecutionPrompt(
+        todo,
+        assignment,
+        options.projectContext,
+        sharedContext
+      );
 
       // 生成自检引导
       const selfCheckGuidance = this.guidanceInjector.buildSelfCheckGuidance(
@@ -700,9 +891,35 @@ export class AutonomousWorker extends EventEmitter {
   private buildExecutionPrompt(
     todo: UnifiedTodo,
     assignment: Assignment,
-    projectContext?: string
+    projectContext?: string,
+    sharedContext?: AssembledContext | null
   ): string {
     const sections: string[] = [];
+
+    // 0. 共享上下文注入（如果可用） - 提案 9.2
+    if (sharedContext && sharedContext.parts.length > 0) {
+      const sharedSections: string[] = [];
+      for (const part of sharedContext.parts) {
+        switch (part.type) {
+          case 'project_knowledge':
+            sharedSections.push(`### 项目知识\n${part.content}`);
+            break;
+          case 'shared_context':
+            sharedSections.push(`### 共享上下文\n${part.content}`);
+            break;
+          case 'contracts':
+            sharedSections.push(`### 任务契约\n${part.content}`);
+            break;
+          case 'long_term_memory':
+            sharedSections.push(`### 历史记忆\n${part.content}`);
+            break;
+          // recent_turns 由对话历史管理，不在此注入
+        }
+      }
+      if (sharedSections.length > 0) {
+        sections.push(`## 共享知识\n\n${sharedSections.join('\n\n')}`);
+      }
+    }
 
     // 1. 任务委托说明（优先使用 AI 生成的自然语言委托）
     if (assignment.delegationBriefing) {
@@ -725,8 +942,8 @@ export class AutonomousWorker extends EventEmitter {
     // 3.1 目标文件（若有）
     if (assignment.scope.targetPaths && assignment.scope.targetPaths.length > 0) {
       const requirement = assignment.scope.requiresModification
-        ? '要求：必须使用 text_editor 修改上述文件并保存结果，禁止使用 search_context。'
-        : '要求：仅需读取/分析，不要修改文件。';
+        ? '任务性质：需要对上述文件进行实际修改并保存。'
+        : '任务性质：仅需读取/分析，无需修改文件。';
       sections.push(`## 目标文件\n${assignment.scope.targetPaths.map(p => `- ${p}`).join('\n')}\n\n${requirement}`);
     }
 
@@ -774,6 +991,16 @@ export class AutonomousWorker extends EventEmitter {
     const fullPrompt = `${executionPrompt}\n\n## 自检要点\n${selfCheckGuidance}`;
 
     try {
+      const decisionHook = options.getSupplementaryInstructions
+        ? () => {
+            const instructions = options.getSupplementaryInstructions?.() || [];
+            if (instructions.length > 0) {
+              this.appendSupplementaryInstructions(assignment, instructions);
+            }
+            return instructions;
+          }
+        : undefined;
+
       const response = await options.adapterFactory.sendMessage(
         this.workerType,
         fullPrompt,
@@ -783,6 +1010,7 @@ export class AutonomousWorker extends EventEmitter {
           streamToUI: true,
           adapterRole: 'worker',
           ...options.adapterScope,
+          decisionHook,
         }
       );
 
@@ -905,11 +1133,162 @@ export class AutonomousWorker extends EventEmitter {
   }
 
   /**
+   * 直接执行模式（简单任务，无 Todo）
+   *
+   * 由编排者 LLM 语义理解决定使用此模式，Worker 直接执行 assignment.responsibility
+   */
+  private async executeDirectly(
+    assignment: Assignment,
+    options: TodoExecuteOptions
+  ): Promise<{
+    success: boolean;
+    output?: DirectExecutionOutput;
+    error?: string;
+    tokenUsage?: TokenUsage;
+  }> {
+    const startTime = Date.now();
+
+    try {
+      // 构建执行 prompt（复用现有逻辑，但不依赖 Todo）
+      const executionPrompt = this.buildDirectExecutionPrompt(assignment, options.projectContext);
+
+      // 生成自检引导
+      const profile = this.profileLoader.getProfile(this.workerType);
+      const selfCheckGuidance = this.guidanceInjector.buildSelfCheckGuidance(
+        profile,
+        assignment.responsibility
+      );
+
+      // 必须提供 adapterFactory
+      if (!options.adapterFactory) {
+        throw new Error('adapterFactory 是必需的，当前项目仅支持 LLM API 模式');
+      }
+
+      // 组合执行 prompt 和自检引导
+      const fullPrompt = `${executionPrompt}\n\n## 自检要点\n${selfCheckGuidance}`;
+
+      logger.debug('Worker.直接执行.Prompt', {
+        assignmentId: assignment.id,
+        promptLength: fullPrompt.length,
+      }, LogCategory.ORCHESTRATOR);
+
+      const decisionHook = options.getSupplementaryInstructions
+        ? () => {
+            const instructions = options.getSupplementaryInstructions?.() || [];
+            if (instructions.length > 0) {
+              this.appendSupplementaryInstructions(assignment, instructions);
+            }
+            return instructions;
+          }
+        : undefined;
+
+      const response = await options.adapterFactory.sendMessage(
+        this.workerType,
+        fullPrompt,
+        undefined, // 无图片
+        {
+          source: 'worker',
+          streamToUI: true,
+          adapterRole: 'worker',
+          ...options.adapterScope,
+          decisionHook,
+        }
+      );
+
+      if (response.error) {
+        throw new Error(response.error);
+      }
+
+      // 解析响应
+      const summary = response.content || '执行完成';
+      const modifiedFiles = this.extractModifiedFiles(response.content || '');
+
+      // 调用输出回调
+      if (options.onOutput && response.content) {
+        options.onOutput(response.content);
+      }
+
+      logger.info('Worker.直接执行.完成', {
+        assignmentId: assignment.id,
+        duration: Date.now() - startTime,
+        modifiedFilesCount: modifiedFiles.length,
+      }, LogCategory.ORCHESTRATOR);
+
+      return {
+        success: true,
+        output: {
+          summary,
+          modifiedFiles,
+        },
+        tokenUsage: response.tokenUsage,
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      logger.error('Worker.直接执行.失败', {
+        assignmentId: assignment.id,
+        error: errorMessage,
+        duration: Date.now() - startTime,
+      }, LogCategory.ORCHESTRATOR);
+
+      return {
+        success: false,
+        error: errorMessage,
+      };
+    }
+  }
+
+  /**
+   * 构建直接执行 Prompt（简单任务，无 Todo）
+   */
+  private buildDirectExecutionPrompt(
+    assignment: Assignment,
+    projectContext?: string
+  ): string {
+    const sections: string[] = [];
+
+    // 1. 任务委托说明（优先使用 AI 生成的自然语言委托）
+    if (assignment.delegationBriefing) {
+      sections.push(`## 任务\n${assignment.delegationBriefing}`);
+    } else {
+      // 兜底：使用结构化的职责描述
+      sections.push(`## 任务\n${assignment.responsibility}`);
+    }
+
+    // 2. 职责范围提醒
+    if (assignment.scope.excludes.length > 0) {
+      sections.push(`## 注意：以下内容不在你的职责范围内\n${assignment.scope.excludes.map(e => `- ${e}`).join('\n')}`);
+    }
+
+    // 3. 目标文件（若有）
+    if (assignment.scope.targetPaths && assignment.scope.targetPaths.length > 0) {
+      const requirement = assignment.scope.requiresModification
+        ? '任务性质：需要对上述文件进行实际修改并保存。'
+        : '任务性质：仅需读取/分析，无需修改文件。';
+      sections.push(`## 目标文件\n${assignment.scope.targetPaths.map(p => `- ${p}`).join('\n')}\n\n${requirement}`);
+    }
+
+    // 4. 引导 Prompt
+    if (assignment.guidancePrompt) {
+      sections.push(`## 角色引导\n${assignment.guidancePrompt}`);
+    }
+
+    // 5. 项目上下文
+    if (projectContext) {
+      sections.push(`## 项目上下文\n${projectContext}`);
+    }
+
+    return sections.join('\n\n');
+  }
+
+  /**
    * 获取下一个可执行的 Todo
    */
   private getNextExecutableTodo(assignment: Assignment): UnifiedTodo | null {
     for (const todo of assignment.todos) {
-      if (todo.status !== 'pending') continue;
+      // pending 或 ready 状态的 Todo 都可以执行
+      // (TodoManager.create 会根据依赖自动将 pending 转为 ready)
+      if (todo.status !== 'pending' && todo.status !== 'ready') continue;
 
       // 检查超范围审批
       if (todo.outOfScope && todo.approvalStatus !== 'approved') continue;
@@ -1089,11 +1468,13 @@ export class AutonomousWorker extends EventEmitter {
         targetTodo.output = undefined;
 
         // 如果策略是重新执行，尝试执行
+        // 注意：恢复执行时不传递共享上下文（已在原执行时注入）
         if (decision.strategy === 'retry_same_worker' || decision.strategy === 'simplify_task') {
           const executeResult = await this.executeTodo(
             targetTodo,
             targetAssignment,
-            options
+            options,
+            undefined // 恢复执行时不重复注入共享上下文
           );
 
           if (executeResult.success) {
@@ -1152,12 +1533,24 @@ export class AutonomousWorker extends EventEmitter {
     const errors: string[] = [];
     let recoveryAttempts = 0;
 
+    // 设置当前 Mission ID - 提案 9.2
+    this.currentMissionId = assignment.missionId;
+
+    // 组装共享上下文（强制依赖已保证可用）
+    // 从 scope.includes 提取标签，如果没有则使用空数组
+    const tags = assignment.scope.includes || [];
+    const sharedContextForRecovery = await this.assembleSharedContext(
+      assignment.missionId,
+      tags
+    );
+
     this.emit('assignmentStarted', { assignmentId: assignment.id });
 
     let currentTodo = this.getNextExecutableTodo(assignment);
 
     while (currentTodo) {
-      const result = await this.executeTodo(currentTodo, assignment, options);
+      // 传递共享上下文 - 提案 9.2
+      const result = await this.executeTodo(currentTodo, assignment, options, sharedContextForRecovery);
 
       if (result.success) {
         completedTodos.push(result.todo);
@@ -1303,6 +1696,433 @@ export class AutonomousWorker extends EventEmitter {
     this.sessionManager.dispose();
     this.clearAllRetryCounts();
     this.currentSession = null;
+    this.currentMissionId = undefined;
     this.removeAllListeners();
+  }
+
+  // ============================================================================
+  // 共享上下文与文件摘要缓存方法 - 提案 9.2
+  // ============================================================================
+
+  /**
+   * 读取文件（优先查缓存）
+   *
+   * 按照 docs/context-unified-memory-plan.md 9.2 节规范实现：
+   * 1. 计算当前文件 hash
+   * 2. 查询 FileSummaryCache
+   * 3. 缓存命中则返回摘要
+   * 4. 缓存未命中则读取原文件，并异步生成摘要
+   *
+   * @param filePath - 文件绝对路径
+   * @returns 文件读取结果
+   */
+  async readFileWithCache(filePath: string): Promise<FileReadResult> {
+    try {
+      // 1. 计算当前文件 hash
+      const currentHash = await this.computeFileHash(filePath);
+
+      // 2. 查询缓存（强制依赖已保证 fileSummaryCache 可用）
+      const cachedSummary = this.fileSummaryCache.get(filePath, currentHash);
+
+      if (cachedSummary) {
+        // 缓存命中，返回格式化后的摘要
+        logger.debug('Worker.文件缓存.命中', {
+          filePath,
+          workerId: this.workerType,
+        }, LogCategory.ORCHESTRATOR);
+
+        return {
+          type: 'summary',
+          content: this.formatSummary(cachedSummary),
+          fromCache: true,
+        };
+      }
+
+      // 3. 缓存未命中，读取原文件
+      logger.debug('Worker.文件缓存.未命中', {
+        filePath,
+        workerId: this.workerType,
+      }, LogCategory.ORCHESTRATOR);
+
+      const content = await fs.readFile(filePath, 'utf-8');
+
+      // 4. 异步生成并缓存摘要（不阻塞主流程）
+      this.generateAndCacheSummary(filePath, currentHash, content).catch(error => {
+        logger.warn('Worker.文件摘要.生成失败', {
+          filePath,
+          error: error instanceof Error ? error.message : String(error),
+        }, LogCategory.ORCHESTRATOR);
+      });
+
+      return {
+        type: 'full',
+        content,
+        fromCache: false,
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      throw new Error(`读取文件失败: ${filePath}, 错误: ${errorMessage}`);
+    }
+  }
+
+  /**
+   * 生成并缓存摘要
+   *
+   * 生成结构化文件摘要并写入 FileSummaryCache 和 SharedContextPool
+   *
+   * @param filePath - 文件路径
+   * @param fileHash - 文件内容 hash
+   * @param content - 文件内容
+   */
+  async generateAndCacheSummary(
+    filePath: string,
+    fileHash: string,
+    content: string
+  ): Promise<void> {
+    try {
+      // 生成结构化摘要（强制依赖已保证 fileSummaryCache 可用）
+      const summary = this.generateFileSummaryFromContent(content, filePath);
+      const source = this.mapWorkerTypeToContextSource();
+
+      // 写入文件摘要缓存
+      this.fileSummaryCache.set(filePath, fileHash, summary, source);
+
+      logger.debug('Worker.文件摘要.已缓存', {
+        filePath,
+        lineCount: summary.lineCount,
+        workerId: this.workerType,
+      }, LogCategory.ORCHESTRATOR);
+
+      // 如果有当前 Mission，同时写入共享上下文（sharedContextPool 强制依赖已保证可用）
+      if (this.currentMissionId) {
+        const entry = createSharedContextEntry({
+          missionId: this.currentMissionId,
+          source,
+          type: 'file_summary',
+          content: this.formatSummary(summary),
+          tags: this.extractTagsFromFilePath(filePath),
+          fileRefs: [{ path: filePath, hash: fileHash }],
+          importance: 'medium',
+        });
+
+        const result = this.sharedContextPool.add(entry);
+        logger.debug('Worker.文件摘要.已共享', {
+          filePath,
+          action: result.action,
+          missionId: this.currentMissionId,
+        }, LogCategory.ORCHESTRATOR);
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logger.warn('Worker.文件摘要.生成失败', {
+        filePath,
+        error: errorMessage,
+      }, LogCategory.ORCHESTRATOR);
+      throw error;
+    }
+  }
+
+  /**
+   * 组装共享上下文（如果依赖可用）
+   *
+   * 在任务执行前调用，按预算分配组装上下文注入到 prompt
+   *
+   * @param missionId - Mission ID
+   * @param tags - 订阅标签
+   * @returns 组装后的上下文（如果依赖可用）
+   */
+  async assembleSharedContext(
+    missionId: string,
+    tags: string[] = []
+  ): Promise<AssembledContext | null> {
+    try {
+      // 强制依赖已保证 contextAssembler 可用
+      const context = await this.contextAssembler.assemble({
+        missionId,
+        subscription: {
+          agentId: this.workerType,
+          subscribedTags: tags,
+        },
+        budget: {
+          total: 8000,
+          projectKnowledgeRatio: 0.10,
+          sharedContextRatio: 0.25,
+          contractsRatio: 0.15,
+          localWindowRatio: 0.40,
+          longTermMemoryRatio: 0.10,
+        },
+      });
+
+      logger.info('Worker.共享上下文.组装完成', {
+        missionId,
+        workerId: this.workerType,
+        totalTokens: context.totalTokens,
+        budgetUsage: `${(context.budgetUsage * 100).toFixed(1)}%`,
+        partsCount: context.parts.length,
+      }, LogCategory.ORCHESTRATOR);
+
+      return context;
+    } catch (error) {
+      logger.warn('Worker.共享上下文.组装失败', {
+        missionId,
+        error: error instanceof Error ? error.message : String(error),
+      }, LogCategory.ORCHESTRATOR);
+      return null;
+    }
+  }
+
+  /**
+   * 写入洞察到共享上下文池
+   *
+   * 将 Worker 执行过程中产生的关键结论写入共享上下文池
+   *
+   * @param insight - 洞察内容
+   */
+  async writeInsight(insight: WorkerInsight): Promise<void> {
+    // 仅检查业务状态：currentMissionId（sharedContextPool 强制依赖已保证可用）
+    if (!this.currentMissionId) {
+      logger.debug('Worker.洞察.跳过写入', {
+        reason: '无当前 Mission',
+      }, LogCategory.ORCHESTRATOR);
+      return;
+    }
+
+    const entry = createSharedContextEntry({
+      missionId: this.currentMissionId,
+      source: this.mapWorkerTypeToContextSource(),
+      type: 'insight',
+      content: insight.content,
+      tags: insight.tags,
+      importance: insight.importance,
+    });
+
+    const result = this.sharedContextPool.add(entry);
+    logger.info('Worker.洞察.已写入', {
+      missionId: this.currentMissionId,
+      workerId: this.workerType,
+      action: result.action,
+      importance: insight.importance,
+    }, LogCategory.ORCHESTRATOR);
+  }
+
+  // ============================================================================
+  // 共享上下文私有辅助方法
+  // ============================================================================
+
+  /**
+   * 计算文件内容 hash
+   *
+   * @param filePath - 文件路径
+   * @returns 文件内容的 SHA-256 hash（取前 16 位）
+   */
+  private async computeFileHash(filePath: string): Promise<string> {
+    const content = await fs.readFile(filePath, 'utf-8');
+    const hash = crypto.createHash('sha256').update(content).digest('hex');
+    return hash.substring(0, 16); // 取前 16 位作为短 hash
+  }
+
+  /**
+   * 从文件内容生成结构化摘要
+   *
+   * 简化实现：基于代码结构提取摘要
+   * 完整实现应调用 LLM 生成更精确的摘要
+   *
+   * @param content - 文件内容
+   * @param filePath - 文件路径
+   * @returns 结构化摘要
+   */
+  private generateFileSummaryFromContent(content: string, filePath: string): FileSummary {
+    const lines = content.split('\n');
+    const lineCount = lines.length;
+
+    // 提取文件目的（从顶部注释或文件名推断）
+    const purpose = this.extractPurposeFromContent(content, filePath);
+
+    // 提取核心逻辑概述
+    const coreLogic = this.extractCoreLogic(content);
+
+    // 提取关键导出
+    const keyExports = this.extractKeyExports(content);
+
+    // 提取依赖
+    const dependencies = this.extractDependencies(content);
+
+    // 检测敏感逻辑
+    const hasSensitiveLogic = this.detectSensitiveLogic(content);
+
+    return {
+      purpose,
+      coreLogic,
+      keyExports: keyExports.length > 0 ? keyExports : undefined,
+      dependencies: dependencies.length > 0 ? dependencies : undefined,
+      lineCount,
+      hasSensitiveLogic,
+    };
+  }
+
+  /**
+   * 从内容中提取文件目的
+   */
+  private extractPurposeFromContent(content: string, filePath: string): string {
+    // 尝试从文件顶部注释提取
+    const commentMatch = content.match(/^(?:\/\*\*[\s\S]*?\*\/|\/\/[^\n]*)/);
+    if (commentMatch) {
+      const comment = commentMatch[0]
+        .replace(/\/\*\*|\*\/|\/\/|\*/g, '')
+        .trim()
+        .split('\n')[0]
+        .trim();
+      if (comment.length > 10 && comment.length < 200) {
+        return comment;
+      }
+    }
+
+    // 回退：从文件名推断
+    const fileName = filePath.split('/').pop() || filePath;
+    return `${fileName} 模块`;
+  }
+
+  /**
+   * 提取核心逻辑概述
+   */
+  private extractCoreLogic(content: string): string {
+    // 统计类和函数数量
+    const classMatches = content.match(/\bclass\s+\w+/g) || [];
+    const functionMatches = content.match(/(?:function\s+\w+|(?:async\s+)?(?:get|set)?\s*\w+\s*\([^)]*\)\s*(?::\s*\w+)?\s*\{)/g) || [];
+    const interfaceMatches = content.match(/\binterface\s+\w+/g) || [];
+
+    const parts: string[] = [];
+    if (classMatches.length > 0) {
+      parts.push(`定义了 ${classMatches.length} 个类`);
+    }
+    if (functionMatches.length > 0) {
+      parts.push(`包含 ${functionMatches.length} 个函数/方法`);
+    }
+    if (interfaceMatches.length > 0) {
+      parts.push(`声明了 ${interfaceMatches.length} 个接口`);
+    }
+
+    return parts.length > 0 ? parts.join('，') + '。' : '代码逻辑待分析。';
+  }
+
+  /**
+   * 提取关键导出
+   */
+  private extractKeyExports(content: string): string[] {
+    const exports: string[] = [];
+
+    // 匹配 export class/function/interface/const
+    const exportMatches = content.matchAll(/export\s+(?:default\s+)?(?:class|function|interface|const|let|var|type|enum)\s+(\w+)/g);
+    for (const match of exportMatches) {
+      if (match[1] && exports.length < 5) {
+        exports.push(match[1]);
+      }
+    }
+
+    return exports;
+  }
+
+  /**
+   * 提取依赖
+   */
+  private extractDependencies(content: string): string[] {
+    const deps: string[] = [];
+
+    // 匹配 import from 语句
+    const importMatches = content.matchAll(/import\s+.*?from\s+['"]([^'"]+)['"]/g);
+    for (const match of importMatches) {
+      if (match[1] && deps.length < 3) {
+        // 只保留外部依赖（非相对路径）
+        if (!match[1].startsWith('.') && !match[1].startsWith('/')) {
+          deps.push(match[1]);
+        }
+      }
+    }
+
+    return deps;
+  }
+
+  /**
+   * 检测敏感逻辑
+   */
+  private detectSensitiveLogic(content: string): boolean {
+    const sensitivePatterns = [
+      /password/i,
+      /secret/i,
+      /api[_-]?key/i,
+      /credential/i,
+      /token/i,
+      /private[_-]?key/i,
+    ];
+
+    return sensitivePatterns.some(pattern => pattern.test(content));
+  }
+
+  /**
+   * 格式化摘要为可读字符串
+   *
+   * @param summary - 结构化摘要
+   * @returns 格式化后的摘要字符串
+   */
+  private formatSummary(summary: FileSummary): string {
+    const lines: string[] = [];
+
+    lines.push(`**目的**: ${summary.purpose}`);
+    lines.push(`**核心逻辑**: ${summary.coreLogic}`);
+
+    if (summary.keyExports && summary.keyExports.length > 0) {
+      lines.push(`**关键导出**: ${summary.keyExports.join(', ')}`);
+    }
+
+    if (summary.dependencies && summary.dependencies.length > 0) {
+      lines.push(`**依赖**: ${summary.dependencies.join(', ')}`);
+    }
+
+    lines.push(`**代码行数**: ${summary.lineCount}`);
+
+    if (summary.hasSensitiveLogic) {
+      lines.push(`**注意**: 包含敏感逻辑`);
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * 从文件路径提取标签
+   *
+   * @param filePath - 文件路径
+   * @returns 标签数组
+   */
+  private extractTagsFromFilePath(filePath: string): string[] {
+    const tags: string[] = [];
+    const pathParts = filePath.split('/');
+
+    // 从路径中提取模块名称作为标签
+    for (const part of pathParts) {
+      if (part === 'src' || part === 'test' || part === 'tests') continue;
+      if (part.endsWith('.ts') || part.endsWith('.js')) continue;
+      if (part.length > 2 && part.length < 30) {
+        tags.push(part);
+      }
+    }
+
+    // 限制标签数量
+    return tags.slice(-3);
+  }
+
+  /**
+   * 将 WorkerSlot 映射为 ContextSource
+   */
+  private mapWorkerTypeToContextSource(): ContextSource {
+    switch (this.workerType) {
+      case 'claude':
+        return 'claude';
+      case 'codex':
+        return 'codex';
+      case 'gemini':
+        return 'gemini';
+      default:
+        return 'orchestrator';
+    }
   }
 }

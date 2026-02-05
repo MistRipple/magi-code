@@ -1,10 +1,14 @@
 <script lang="ts">
   import { setCurrentBottomTab } from '../stores/messages.svelte';
   import Icon from './Icon.svelte';
+  import type { IconName } from '../lib/icons';
+
+  // 扩展的 Worker 状态类型
+  type WorkerStatus = 'idle' | 'executing' | 'completed' | 'failed' | 'stopped' | 'skipped';
 
   interface SummaryCard {
     title?: string;
-    status?: 'completed' | 'failed';
+    status?: WorkerStatus;
     description?: string;
     executor?: string;
     agent?: string;
@@ -28,16 +32,37 @@
     waveIndex?: number;
   }
 
-  interface Props {
-    card: SummaryCard;
+  // 状态徽章配置：颜色变量、图标、标签、是否旋转
+  interface StatusBadgeConfig {
+    colorVar: string;
+    icon: IconName;
+    label: string;
+    spinning?: boolean;
   }
 
-  let { card }: Props = $props();
+  const statusBadgeMap: Record<WorkerStatus, StatusBadgeConfig> = {
+    idle: { colorVar: '--foreground-muted', icon: 'hourglass', label: '待执行' },
+    executing: { colorVar: '--info', icon: 'loader', label: '执行中', spinning: true },
+    completed: { colorVar: '--success', icon: 'check', label: '完成' },
+    failed: { colorVar: '--error', icon: 'x', label: '失败' },
+    stopped: { colorVar: '--warning', icon: 'stop', label: '已停止' },
+    skipped: { colorVar: '--foreground-muted', icon: 'skip-forward', label: '已跳过' },
+  };
+
+  interface Props {
+    card: SummaryCard;
+    readOnly?: boolean;
+  }
+
+  let { card, readOnly = false }: Props = $props();
 
   // 展开/收起状态
   let isExpanded = $state(false);
 
-  const statusText = $derived(card.status === 'failed' ? '失败' : '完成');
+  // 获取当前状态的徽章配置（默认为 completed）
+  const currentStatus = $derived((card.status || 'completed') as WorkerStatus);
+  const statusConfig = $derived(statusBadgeMap[currentStatus] || statusBadgeMap.completed);
+
   // 优化 executor 显示：支持更多 fallback 选项，并统一使用中文
   const rawExecutor = $derived(card.executor || card.agent || card.worker || '');
   const executor = $derived(rawExecutor || '编排者');
@@ -101,10 +126,15 @@
 
 <button
   class="worker-progress-card"
-  class:failed={card.status === 'failed'}
+  class:idle={currentStatus === 'idle'}
+  class:executing={currentStatus === 'executing'}
+  class:completed={currentStatus === 'completed'}
+  class:failed={currentStatus === 'failed'}
+  class:stopped={currentStatus === 'stopped'}
+  class:skipped={currentStatus === 'skipped'}
   class:clickable={isClickable}
   class:expanded={isExpanded}
-  style="--worker-color: var({workerConfig.colorVar})"
+  style="--worker-color: var({workerConfig.colorVar}); --status-color: var({statusConfig.colorVar})"
   onclick={handleCardClick}
   title={isClickable ? `点击查看 ${workerConfig.label} 详情` : ''}
 >
@@ -124,10 +154,22 @@
       {#if card.duration}
         <span class="duration">{card.duration}</span>
       {/if}
-      <span class="status-badge" class:failed={card.status === 'failed'}>
-        {statusText}
+      <!-- 状态徽章：图标 + 文字 -->
+      <span
+        class="status-badge"
+        class:idle={currentStatus === 'idle'}
+        class:executing={currentStatus === 'executing'}
+        class:completed={currentStatus === 'completed'}
+        class:failed={currentStatus === 'failed'}
+        class:stopped={currentStatus === 'stopped'}
+        class:skipped={currentStatus === 'skipped'}
+      >
+        <span class="status-icon" class:spinning={statusConfig.spinning}>
+          <Icon name={statusConfig.icon} size={12} />
+        </span>
+        <span class="status-text">{statusConfig.label}</span>
       </span>
-      {#if hasDetails}
+      {#if hasDetails && !readOnly}
         <span
           class="expand-btn"
           role="button"
@@ -280,8 +322,25 @@
     border-color: color-mix(in srgb, var(--worker-color) 50%, var(--border));
   }
 
+  /* 根据状态覆盖 worker 颜色 */
   .worker-progress-card.failed {
     --worker-color: var(--error);
+  }
+
+  .worker-progress-card.stopped {
+    --worker-color: var(--warning);
+  }
+
+  .worker-progress-card.skipped {
+    --worker-color: var(--foreground-muted);
+  }
+
+  .worker-progress-card.executing {
+    --worker-color: var(--info);
+  }
+
+  .worker-progress-card.idle {
+    --worker-color: var(--foreground-muted);
   }
 
   /* 卡片头部 */
@@ -321,18 +380,78 @@
     color: var(--foreground-muted);
   }
 
+  /* 状态徽章 - 带图标和边框 */
   .status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
     font-size: var(--text-xs);
     padding: 2px 8px;
-    border-radius: var(--radius-full);
+    border-radius: var(--radius-sm);
+    font-weight: 500;
+    /* 默认完成状态 */
     background: color-mix(in srgb, var(--success) 15%, transparent);
     color: var(--success);
-    font-weight: 500;
+    border: 1px solid color-mix(in srgb, var(--success) 30%, transparent);
+  }
+
+  .status-badge.idle {
+    background: color-mix(in srgb, var(--foreground-muted) 15%, transparent);
+    color: var(--foreground-muted);
+    border-color: color-mix(in srgb, var(--foreground-muted) 30%, transparent);
+  }
+
+  .status-badge.executing {
+    background: color-mix(in srgb, var(--info) 15%, transparent);
+    color: var(--info);
+    border-color: color-mix(in srgb, var(--info) 30%, transparent);
+  }
+
+  .status-badge.completed {
+    background: color-mix(in srgb, var(--success) 15%, transparent);
+    color: var(--success);
+    border-color: color-mix(in srgb, var(--success) 30%, transparent);
   }
 
   .status-badge.failed {
     background: color-mix(in srgb, var(--error) 15%, transparent);
     color: var(--error);
+    border-color: color-mix(in srgb, var(--error) 30%, transparent);
+  }
+
+  .status-badge.stopped {
+    background: color-mix(in srgb, var(--warning) 15%, transparent);
+    color: var(--warning);
+    border-color: color-mix(in srgb, var(--warning) 30%, transparent);
+  }
+
+  .status-badge.skipped {
+    background: color-mix(in srgb, var(--foreground-muted) 15%, transparent);
+    color: var(--foreground-muted);
+    border-color: color-mix(in srgb, var(--foreground-muted) 30%, transparent);
+  }
+
+  .status-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .status-icon.spinning {
+    animation: spin 1s linear infinite;
+  }
+
+  @keyframes spin {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  .status-text {
+    white-space: nowrap;
   }
 
   .jump-hint {

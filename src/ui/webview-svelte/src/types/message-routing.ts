@@ -1,10 +1,11 @@
 export enum MessageCategory {
   // =========== 主对话区消息 ===========
   USER_INPUT = 'user_input',
-  ORCHESTRATOR_ANALYSIS = 'orchestrator_analysis',
+  ORCHESTRATOR_RESPONSE = 'orchestrator_response',
   ORCHESTRATOR_PLAN = 'orchestrator_plan',
   ORCHESTRATOR_SUMMARY = 'orchestrator_summary',
   ORCHESTRATOR_THINKING = 'orchestrator_thinking',
+  ORCHESTRATOR_TOOL_USE = 'orchestrator_tool_use',  // 编排者工具调用
 
   // =========== Worker 面板消息 ===========
   WORKER_INSTRUCTION = 'worker_instruction',
@@ -12,6 +13,7 @@ export enum MessageCategory {
   WORKER_OUTPUT = 'worker_output',
   WORKER_TOOL_USE = 'worker_tool_use',
   WORKER_CODE = 'worker_code',
+  WORKER_SUMMARY = 'worker_summary',
 
   // =========== 系统消息 ===========
   SYSTEM_NOTICE = 'system_notice',

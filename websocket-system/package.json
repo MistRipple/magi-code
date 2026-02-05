@@ -7,8 +7,8 @@
   "scripts": {
     "start": "node server/index.js",
     "demo": "node demo/app.js",
-    "test": "node test/integration-test.js",
-    "verify": "node test/quick-verify.js"
+    "test": "node ../scripts/websocket-integration-test.js",
+    "verify": "node ../scripts/websocket-quick-verify.js"
   },
   "keywords": ["websocket", "push", "realtime", "chat", "notification"],
   "author": "Codex Team",

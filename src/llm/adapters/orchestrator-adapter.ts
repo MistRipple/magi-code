@@ -165,6 +165,11 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       this.normalizer.endStream(streamId);
       this.setState(AdapterState.CONNECTED);
 
+      // 🔧 如果流式传输完成但没有内容，抛出明确错误而非静默返回空
+      if (!fullResponse.trim()) {
+        throw new Error('LLM 响应为空：流式传输完成但未收到有效内容');
+      }
+
       return fullResponse;
     } catch (error: any) {
       if (messageId) {

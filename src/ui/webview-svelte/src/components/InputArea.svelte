@@ -33,30 +33,64 @@
   const isInteractionBlocking = $derived.by(() => Boolean(activeInteraction));
   const MAX_INPUT_CHARS = 10000;
 
+  // P0-2: 按钮双态状态 - 使用 $derived 计算
+  const hasContent = $derived(inputValue.trim().length > 0 || selectedImages.length > 0);
+  const showStopButton = $derived(isSending && !hasContent);
+
+  // P1-1: 限频机制 - 执行中 1 秒/条，空闲 300ms/条
+  let lastSendTime = $state(0);
+  const RATE_LIMIT_IDLE = 300;      // 空闲状态：300ms
+  const RATE_LIMIT_PROCESSING = 1000;  // 执行中：1 秒
+
   // 发送消息（支持图片附件）
+  // P0-1/P0-2: 执行中仍可发送补充指令，不再用 isSending 阻止
   function sendMessage() {
     const content = inputValue.trim();
     // 允许只发送图片（无文字）或只发送文字
-    if ((!content && selectedImages.length === 0) || isSending || isInteractionBlocking) return;
+    // 🔧 移除 isSending 检查：执行中仍可输入发送新消息（补充指令）
+    if ((!content && selectedImages.length === 0) || isInteractionBlocking) return;
+
+    // P1-1: 限频检查
+    const now = Date.now();
+    const minInterval = isSending ? RATE_LIMIT_PROCESSING : RATE_LIMIT_IDLE;
+    if (now - lastSendTime < minInterval) {
+      addToast('warning', '发送过快，请稍后再试');
+      return;
+    }
+    lastSendTime = now;
+
     if (content.length > MAX_INPUT_CHARS) {
       addToast('warning', `输入内容过长（${content.length} 字符），请控制在 ${MAX_INPUT_CHARS} 字符以内`);
       return;
     }
 
-    // === 第一步：生成所有必要的 ID ===
-    const requestId = generateId();
+    // P0-3: 根据是否正在执行，区分发送新任务还是补充指令
+    if (isSending) {
+      // 执行中：发送补充指令
+      // 注意：补充指令暂不支持图片
+      if (selectedImages.length > 0) {
+        addToast('warning', '执行中暂不支持发送图片，请先停止当前任务');
+        return;
+      }
+      vscode.postMessage({
+        type: 'appendMessage',
+        taskId: '',  // 后端自动关联当前任务
+        content: content,
+      });
+    } else {
+      // 空闲状态：发送新任务
+      const requestId = generateId();
+      vscode.postMessage({
+        type: 'executeTask',
+        prompt: content || '请分析这些图片',
+        mode: interactionMode,
+        agent: selectedModel || undefined,
+        requestId,
+        images: selectedImages.map(img => ({ dataUrl: img.dataUrl })),
+      });
+    }
 
-    // === 第六步：发送到后端（包含图片数据） ===
-    vscode.postMessage({
-      type: 'executeTask',
-      prompt: content || '请分析这些图片',
-      mode: interactionMode,
-      agent: selectedModel || undefined,
-      requestId,
-      images: selectedImages.map(img => ({ dataUrl: img.dataUrl })),
-    });
-
-    // === 第七步：清理输入状态 ===
+    // 清理输入状态
     inputValue = '';
     selectedImages = [];
   }
@@ -196,12 +230,13 @@
     <div class="input-resize-bar" onmousedown={startResize}></div>
 
     <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <!-- P0-1: 执行中仍可输入，仅在需要用户确认时禁用 -->
     <textarea
       bind:value={inputValue}
       class="input-box"
       class:has-images={selectedImages.length > 0}
       placeholder={selectedImages.length > 0 ? "添加描述（可选）..." : "描述你的任务... (Ctrl+V 粘贴图片)"}
-      disabled={isSending}
+      disabled={isInteractionBlocking}
       onkeydown={handleKeydown}
       onpaste={handlePaste}
     ></textarea>
@@ -274,18 +309,20 @@
           <span class="enhance-text">{isEnhancing ? '增强中...' : '增强'}</span>
         </button>
 
-        <!-- 发送/停止按钮 -->
-        {#if isSending}
+        <!-- P0-2: 按钮双态逻辑 -->
+        <!-- 执行中有内容=发送（补充指令），执行中无内容=停止 -->
+        <!-- 空闲时始终显示发送按钮 -->
+        {#if showStopButton}
           <button class="send-btn stop" onclick={stopTask} title="停止">
             <Icon name="stop" size={14} />
           </button>
         {:else}
           <button
             class="send-btn"
-            class:ready={(inputValue.trim() || selectedImages.length > 0) && !isInteractionBlocking}
+            class:ready={hasContent && !isInteractionBlocking}
             onclick={sendMessage}
-            disabled={(!inputValue.trim() && selectedImages.length === 0) || isInteractionBlocking}
-            title={isInteractionBlocking ? `等待处理：${activeInteraction}` : '发送 (Cmd+Enter)'}
+            disabled={!hasContent || isInteractionBlocking}
+            title={isInteractionBlocking ? `等待处理：${activeInteraction}` : (isSending ? '发送补充指令 (Cmd+Enter)' : '发送 (Cmd+Enter)')}
           >
             <Icon name="send" size={14} />
           </button>

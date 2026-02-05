@@ -3,15 +3,17 @@ import { MessageCategory } from '../types/message-routing';
 
 export const ROUTING_TABLE: Record<MessageCategory, DisplayTarget | { location: 'worker' | 'both' | 'thread' | 'task' | 'none' }> = {
   [MessageCategory.USER_INPUT]: { location: 'thread' },
-  [MessageCategory.ORCHESTRATOR_ANALYSIS]: { location: 'thread' },
+  [MessageCategory.ORCHESTRATOR_RESPONSE]: { location: 'thread' },
   [MessageCategory.ORCHESTRATOR_PLAN]: { location: 'thread' },
   [MessageCategory.ORCHESTRATOR_SUMMARY]: { location: 'thread' },
   [MessageCategory.ORCHESTRATOR_THINKING]: { location: 'thread' },
+  [MessageCategory.ORCHESTRATOR_TOOL_USE]: { location: 'thread' },  // 编排者工具调用显示在主对话区
   [MessageCategory.WORKER_INSTRUCTION]: { location: 'worker' },
   [MessageCategory.WORKER_THINKING]: { location: 'worker' },
   [MessageCategory.WORKER_OUTPUT]: { location: 'worker' },
   [MessageCategory.WORKER_TOOL_USE]: { location: 'worker' },
   [MessageCategory.WORKER_CODE]: { location: 'worker' },
+  [MessageCategory.WORKER_SUMMARY]: { location: 'worker' },
   [MessageCategory.SYSTEM_NOTICE]: { location: 'thread' },
   [MessageCategory.SYSTEM_PHASE]: { location: 'none' },
   [MessageCategory.SYSTEM_ERROR]: { location: 'thread' },

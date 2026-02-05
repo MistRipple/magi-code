@@ -4,18 +4,21 @@
   import MarkdownContent from './MarkdownContent.svelte';
   import WorkerBadge from './WorkerBadge.svelte';
   import SubTaskSummaryCard from './SubTaskSummaryCard.svelte';
+  import InstructionCard from './InstructionCard.svelte';
   import BlockRenderer from './BlockRenderer.svelte';
   import Icon from './Icon.svelte';
 
   // Props
   interface Props {
     message: Message;
+    readOnly?: boolean;
   }
-  let { message }: Props = $props();
+  let { message, readOnly = false }: Props = $props();
 
   // 派生状态
-  const isUser = $derived(message.role === 'user');
-  const isNotice = $derived(message.type === 'system-notice' || message.role === 'system');
+  // 方案 B：使用 MessageType.USER_INPUT 判断用户消息
+  const isUser = $derived(message.type === 'user_input');
+  const isNotice = $derived(message.type === 'system-notice' || message.type === 'error');
   const interactionMeta = $derived(message.metadata?.interaction as { prompt?: string; type?: string } | undefined);
   const isInteraction = $derived(Boolean(interactionMeta));
   const isStreaming = $derived(message.isStreaming);
@@ -48,9 +51,16 @@
   const worker = $derived(message.metadata?.worker || null);
   const badgeWorker = $derived(worker || (message.source === 'orchestrator' ? 'orchestrator' : message.source));
 
-  // 检查是否是 subTaskCard 消息
+  // 方案 B：使用 MessageType.TASK_CARD 判断子任务卡片消息
   // Worker 的消息面板应该作为独立消息存在，不应被 orchestrator 面板包裹
-  const isSubTaskCardOnly = $derived(Boolean(message.metadata?.subTaskCard));
+  const isSubTaskCardOnly = $derived(message.type === 'task_card');
+
+  // 方案 B：使用 MessageType.INSTRUCTION 判断任务说明消息
+  // 编排者派发给 Worker 的任务说明
+  const isInstruction = $derived(message.type === 'instruction');
+  const instructionTargetWorker = $derived(
+    (message.metadata?.worker || message.metadata?.agent) as string | undefined
+  );
 
   // 通知类型和对应的图标/颜色（使用 Message 类型中的 noticeType）
   const noticeType = $derived(message.noticeType || 'info');
@@ -128,7 +138,16 @@
 <!-- subTaskCard 消息：直接显示卡片，不需要外层包裹 -->
 {:else if isSubTaskCardOnly}
   <div class="message-item subtask-card-only" data-message-id={message.id} data-source={message.source}>
-    <SubTaskSummaryCard card={message.metadata?.subTaskCard as any} />
+    <SubTaskSummaryCard card={message.metadata?.subTaskCard as any} {readOnly} />
+  </div>
+<!-- WORKER_INSTRUCTION 消息：任务说明卡片 -->
+{:else if isInstruction}
+  <div class="message-item instruction-card-only" data-message-id={message.id} data-source={message.source}>
+    <InstructionCard
+      content={message.content}
+      targetWorker={instructionTargetWorker}
+      isStreaming={isStreaming}
+    />
   </div>
 <!-- 助手消息：完整显示（包括占位状态） -->
 {:else}
@@ -183,8 +202,8 @@
           </div>
         </div>
       {:else}
-        {#if message.metadata?.subTaskCard}
-          <SubTaskSummaryCard card={message.metadata.subTaskCard as any} />
+        {#if message.type === 'task_card' && message.metadata?.subTaskCard}
+          <SubTaskSummaryCard card={message.metadata.subTaskCard as any} {readOnly} />
         {/if}
 
         {#if isInteraction && interactionMeta?.prompt}
@@ -194,7 +213,7 @@
           </div>
         {/if}
 
-        {#if !message.metadata?.subTaskCard}
+        {#if message.type !== 'task_card'}
           <!--
             🔧 统一渲染逻辑：
             1. 优先渲染 blocks（支持 Thinking、ToolCall 等富内容块）
@@ -203,7 +222,7 @@
           -->
           {#if safeBlocks.length > 0}
             {#each safeBlocks as block, i (`${message.id}-block-${i}-${block.type}`)}
-              <BlockRenderer {block} {isStreaming} />
+              <BlockRenderer {block} {isStreaming} {readOnly} />
             {/each}
           {:else if message.content}
             <MarkdownContent content={message.content} {isStreaming} />
@@ -299,6 +318,11 @@
 
   /* ===== SubTaskCard 独立样式（与 assistant 消息保持一致的间距） ===== */
   .message-item.subtask-card-only {
+    margin-right: var(--space-2);  /* 与 assistant 消息一致 */
+  }
+
+  /* ===== InstructionCard 独立样式（任务说明卡片） ===== */
+  .message-item.instruction-card-only {
     margin-right: var(--space-2);  /* 与 assistant 消息一致 */
   }
 

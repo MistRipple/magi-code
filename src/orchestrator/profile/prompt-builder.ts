@@ -38,8 +38,14 @@ export class PromptBuilder {
       sections.push(`## 协作规则\n${this.buildCollaborationSection(persona, context)}`);
     }
 
-    if (persona.outputPreferences.length > 0) {
-      sections.push(`## 输出要求\n${persona.outputPreferences.map(p => `- ${p}`).join('\n')}`);
+    const reasoningGuidelines = persona.reasoningGuidelines ?? [];
+    if (reasoningGuidelines.length > 0) {
+      sections.push(`## 推理过程\n${reasoningGuidelines.map(r => `- ${r}`).join('\n')}`);
+    }
+
+    const outputPreferences = persona.outputPreferences ?? [];
+    if (outputPreferences.length > 0) {
+      sections.push(`## 输出要求\n${outputPreferences.map(p => `- ${p}`).join('\n')}`);
     }
 
     sections.push(this.buildToolUsageSection());
@@ -53,7 +59,10 @@ export class PromptBuilder {
 
   private buildCollaborationSection(persona: WorkerPersona, context: InjectionContext): string {
     const isLeader = context.isLeader === true;
-    const rules = isLeader ? persona.collaboration.asLeader : persona.collaboration.asCollaborator;
+    const collaboration = persona.collaboration ?? { asLeader: [], asCollaborator: [] };
+    const rules = isLeader
+      ? (collaboration.asLeader ?? [])
+      : (collaboration.asCollaborator ?? []);
     if (rules.length === 0) {
       return '';
     }
@@ -62,6 +71,10 @@ export class PromptBuilder {
   }
 
   private buildToolUsageSection(): string {
-    return `## 工具使用\n- 涉及代码/文件修改时，必须使用工具直接编辑文件并保存结果\n- 若无法使用工具完成修改，需明确说明原因并停止\n- 修改完成后需简要说明改动要点`;
+    return `## 工具使用
+- 你可以使用系统提供的工具来完成任务（如文件编辑、代码搜索、命令执行等）
+- 涉及代码/文件修改时，应使用工具直接编辑文件并保存结果
+- 若无法使用工具完成修改，需明确说明原因
+- 修改完成后需简要说明改动要点`;
   }
 }

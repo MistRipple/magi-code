@@ -110,15 +110,33 @@ if (typeof window !== 'undefined') {
     // 🔧 调试日志：追踪所有收到的消息
     console.log(`[vscode-bridge] 收到消息: type=${msgType}, id=${msgId}, listeners=${listeners.size}`);
     if (msgType === 'unifiedMessage' || msgType === 'unifiedUpdate' || msgType === 'unifiedComplete') {
-      console.log('[vscode-bridge] 详细消息内容:', JSON.stringify({
-        type: msgType,
-        messageId: msgId,
-        category: (message as any)?.message?.category,
-        lifecycle: (message as any)?.message?.lifecycle,
-        blocksCount: (message as any)?.message?.blocks?.length ?? 0,
-        isPlaceholder: (message as any)?.message?.metadata?.isPlaceholder,
-        role: (message as any)?.message?.metadata?.role,
-      }));
+      const source = (message as any)?.message?.source;
+      const agent = (message as any)?.message?.agent;
+      // 🔧 增强调试：特别关注 Worker 消息
+      if (source === 'worker') {
+        console.log('[vscode-bridge] 🎯 WORKER 消息:', JSON.stringify({
+          type: msgType,
+          messageId: msgId,
+          messageType: (message as any)?.message?.type,
+          category: (message as any)?.message?.category,
+          lifecycle: (message as any)?.message?.lifecycle,
+          source,
+          agent,
+          blocksCount: (message as any)?.message?.blocks?.length ?? 0,
+        }));
+      } else {
+        console.log('[vscode-bridge] 详细消息内容:', JSON.stringify({
+          type: msgType,
+          messageId: msgId,
+          messageType: (message as any)?.message?.type,  // 方案 B：使用 MessageType
+          category: (message as any)?.message?.category,
+          lifecycle: (message as any)?.message?.lifecycle,
+          source,
+          agent,
+          blocksCount: (message as any)?.message?.blocks?.length ?? 0,
+          isPlaceholder: (message as any)?.message?.metadata?.isPlaceholder,
+        }));
+      }
     }
     listeners.forEach((listener) => {
       try {

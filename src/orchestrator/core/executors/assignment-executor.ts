@@ -27,6 +27,7 @@ export interface AssignmentExecutionOptions {
   onOutput?: (workerId: WorkerSlot, output: string) => void;
   onReport?: ReportCallback;
   reportTimeout?: number;
+  getSupplementaryInstructions?: () => string[];
 }
 
 export interface AssignmentExecutionResult {
@@ -37,6 +38,8 @@ export interface AssignmentExecutionResult {
   tokenUsage?: TokenUsage;
   /** 完整的 Worker 执行结果（用于统计） */
   fullResult?: AutonomousExecutionResult;
+  /** 是否有等待审批的 Todo */
+  hasPendingApprovals?: boolean;
 }
 
 export class AssignmentExecutor {
@@ -105,6 +108,7 @@ export class AssignmentExecutor {
       timeout: options.timeout,
       onReport: options.onReport,
       reportTimeout: options.reportTimeout,
+      getSupplementaryInstructions: options.getSupplementaryInstructions,
       adapterFactory: this.adapterFactory,
       adapterScope: {
         messageMeta: {
@@ -136,6 +140,7 @@ export class AssignmentExecutor {
           timeout: options.timeout,
           onReport: options.onReport,
           reportTimeout: options.reportTimeout,
+          getSupplementaryInstructions: options.getSupplementaryInstructions,
           adapterFactory: this.adapterFactory,
           adapterScope: {
             messageMeta: {
@@ -172,7 +177,7 @@ export class AssignmentExecutor {
 
     logger.info(
       LogCategory.ORCHESTRATOR,
-      `Worker ${assignment.workerId} 执行完成: ${result.success ? '成功' : '失败'}`
+      `Worker ${assignment.workerId} 执行完成: ${result.success ? '成功' : '失败'}${result.hasPendingApprovals ? ' (等待审批)' : ''}`
     );
 
     return {
@@ -181,7 +186,8 @@ export class AssignmentExecutor {
       dynamicTodos: result.dynamicTodos,
       errors: result.errors,
       tokenUsage: result.tokenUsage,
-      fullResult: result, // 保留完整结果用于统计
+      fullResult: result,
+      hasPendingApprovals: result.hasPendingApprovals,
     };
   }
 
@@ -347,12 +353,21 @@ export class AssignmentExecutor {
     }
 
     if (result.success) {
-      // 更新任务状态
-      contextManager.updateTaskStatus(
-        assignment.id,
-        'completed',
-        `完成 ${result.completedTodos.length} 个 Todo`
-      );
+      if (result.hasPendingApprovals) {
+        // 等待审批时，状态设为进行中 (in_progress) 或 paused
+        contextManager.updateTaskStatus(
+          assignment.id,
+          'in_progress',
+          `等待审批: 完成 ${result.completedTodos.length} 个 Todo`
+        );
+      } else {
+        // 更新任务状态
+        contextManager.updateTaskStatus(
+          assignment.id,
+          'completed',
+          `完成 ${result.completedTodos.length} 个 Todo`
+        );
+      }
 
       // 添加代码变更记录
       const modifiedFiles = new Set<string>();
@@ -378,6 +393,17 @@ export class AssignmentExecutor {
           `${assignment.workerId} 动态添加了 ${result.dynamicTodos.length} 个 Todo`
         );
       }
+
+      // 【新增】任务成功完成后，添加下一步建议
+      if (result.completedTodos.length > 0) {
+        const lastTodo = result.completedTodos[result.completedTodos.length - 1];
+        if (lastTodo.output?.summary) {
+          contextManager.addNextStep(`验证 ${assignment.workerId} 的输出: ${lastTodo.output.summary.substring(0, 50)}...`);
+        }
+      }
+
+      // 【新增】更新当前工作状态
+      contextManager.setCurrentWork(`${assignment.workerId} 已完成: ${assignment.responsibility}`);
     } else {
       // 失败时更新状态和添加待解决问题
       contextManager.updateTaskStatus(
@@ -391,6 +417,9 @@ export class AssignmentExecutor {
           `${assignment.workerId} 执行失败: ${result.errors[0]}`
         );
       }
+
+      // 【新增】更新当前工作状态为失败
+      contextManager.setCurrentWork(`${assignment.workerId} 执行失败，需要排查: ${result.errors[0]?.substring(0, 50) || '未知错误'}`);
     }
 
     await contextManager.saveMemory();

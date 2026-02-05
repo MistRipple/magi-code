@@ -30,6 +30,8 @@ export interface WorkerPersona {
   collaboration: WorkerCollaboration;
   /** 输出偏好 */
   outputPreferences: string[];
+  /** 推理过程要求 */
+  reasoningGuidelines: string[];
 }
 
 /** Runtime worker profile (derived, non-configurable) */

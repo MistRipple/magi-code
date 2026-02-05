@@ -9,8 +9,8 @@
  * - contract_1770010232546_dzyfec7i4 (数据结构契约)
  */
 
-import WebSocketServiceAdapter from '../contracts/service-adapter.js';
-import WebSocketClientNode from '../client/websocket-client-node.js';
+import WebSocketServiceAdapter from '../websocket-system/contracts/service-adapter.js';
+import WebSocketClientNode from '../websocket-system/client/websocket-client-node.js';
 
 console.log('╔═══════════════════════════════════════════════════════════╗');
 console.log('║   WebSocket 系统契约集成验证测试                           ║');

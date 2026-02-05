@@ -11,6 +11,10 @@ import {
   TaskRecord,
   Decision,
   CodeChange,
+  Issue,
+  ResolvedIssue,
+  RejectedApproach,
+  UserMessage,
   createEmptyMemoryContent
 } from './types';
 
@@ -179,9 +183,18 @@ export class MemoryDocument {
   /**
    * 添加待解决问题
    */
-  addPendingIssue(issue: string): void {
-    if (!this.content.pendingIssues.includes(issue)) {
-      this.content.pendingIssues.push(issue);
+  addPendingIssue(issue: string | Issue): void {
+    const issueObj: Issue = typeof issue === 'string'
+      ? {
+          id: `issue_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+          description: issue,
+          source: 'system',
+          timestamp: new Date().toISOString()
+        }
+      : issue;
+
+    if (!this.content.pendingIssues.some(i => i.id === issueObj.id || i.description === issueObj.description)) {
+      this.content.pendingIssues.push(issueObj);
       this.dirty = true;
     }
   }
@@ -189,9 +202,138 @@ export class MemoryDocument {
   /**
    * 移除已解决的问题
    */
-  resolvePendingIssue(issue: string): void {
-    this.content.pendingIssues = this.content.pendingIssues.filter(i => i !== issue);
+  resolvePendingIssue(issueIdOrDesc: string): void {
+    this.content.pendingIssues = this.content.pendingIssues.filter(
+      i => i.id !== issueIdOrDesc && i.description !== issueIdOrDesc
+    );
     this.dirty = true;
+  }
+
+  // ========== 新增字段的辅助方法 ==========
+
+  /**
+   * 设置用户核心意图
+   */
+  setPrimaryIntent(intent: string): void {
+    if (typeof intent === 'string' && intent.trim()) {
+      this.content.primaryIntent = intent.trim();
+      this.dirty = true;
+    }
+  }
+
+  /**
+   * 添加用户约束条件
+   */
+  addUserConstraint(constraint: string): void {
+    if (typeof constraint === 'string' && constraint.trim()) {
+      const trimmed = constraint.trim();
+      if (!this.content.userConstraints.includes(trimmed)) {
+        this.content.userConstraints.push(trimmed);
+        this.dirty = true;
+      }
+    }
+  }
+
+  /**
+   * 添加用户消息记录
+   */
+  addUserMessage(content: string, isKeyInstruction: boolean = false): void {
+    if (typeof content === 'string' && content.trim()) {
+      this.content.userMessages.push({
+        content: content.trim(),
+        timestamp: new Date().toISOString(),
+        isKeyInstruction
+      });
+      this.dirty = true;
+    }
+  }
+
+  /**
+   * 设置当前工作状态
+   */
+  setCurrentWork(work: string): void {
+    if (typeof work === 'string') {
+      this.content.currentWork = work.trim();
+      this.dirty = true;
+    }
+  }
+
+  /**
+   * 添加下一步建议
+   */
+  addNextStep(step: string): void {
+    if (typeof step === 'string' && step.trim()) {
+      const trimmed = step.trim();
+      if (!this.content.nextSteps.includes(trimmed)) {
+        this.content.nextSteps.push(trimmed);
+        this.dirty = true;
+      }
+    }
+  }
+
+  /**
+   * 清空下一步建议（任务完成时调用）
+   */
+  clearNextSteps(): void {
+    if (this.content.nextSteps.length > 0) {
+      this.content.nextSteps = [];
+      this.dirty = true;
+    }
+  }
+
+  /**
+   * 添加已解决问题
+   */
+  addResolvedIssue(problem: string, rootCause: string, solution: string): void {
+    if (typeof problem === 'string' && problem.trim()) {
+      const resolved: ResolvedIssue = {
+        id: `resolved_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        problem: problem.trim(),
+        rootCause: rootCause?.trim() || '',
+        solution: solution?.trim() || '',
+        timestamp: new Date().toISOString()
+      };
+      this.content.resolvedIssues.push(resolved);
+      this.dirty = true;
+    }
+  }
+
+  /**
+   * 添加被拒绝的方案
+   */
+  addRejectedApproach(approach: string, reason: string, rejectedBy: 'user' | 'technical' = 'user'): void {
+    if (typeof approach === 'string' && approach.trim()) {
+      // 检查是否已存在相同方案
+      const exists = this.content.rejectedApproaches.some(r => r.approach === approach.trim());
+      if (!exists) {
+        const rejected: RejectedApproach = {
+          id: `rejected_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+          approach: approach.trim(),
+          reason: reason?.trim() || '',
+          rejectedBy,
+          timestamp: new Date().toISOString()
+        };
+        this.content.rejectedApproaches.push(rejected);
+        this.dirty = true;
+      }
+    }
+  }
+
+  /**
+   * 将待解决问题标记为已解决（移动并记录）
+   */
+  markIssueResolved(issueIdOrDesc: string, rootCause: string, solution: string): void {
+    const issueIndex = this.content.pendingIssues.findIndex(
+      i => i.id === issueIdOrDesc || i.description === issueIdOrDesc
+    );
+    if (issueIndex !== -1) {
+      const issue = this.content.pendingIssues[issueIndex];
+      // 添加到已解决列表
+      this.addResolvedIssue(issue.description, rootCause, solution);
+      // 从待解决列表移除
+      this.content.pendingIssues.splice(issueIndex, 1);
+      this.dirty = true;
+    }
   }
 
   /**
@@ -212,6 +354,15 @@ export class MemoryDocument {
       tokenEstimate: typeof source.tokenEstimate === 'number' && Number.isFinite(source.tokenEstimate)
         ? source.tokenEstimate
         : base.tokenEstimate,
+      // 用户意图（新增字段）
+      primaryIntent: typeof source.primaryIntent === 'string' ? source.primaryIntent : '',
+      userConstraints: Array.isArray(source.userConstraints)
+        ? source.userConstraints.filter((c): c is string => typeof c === 'string')
+        : [],
+      currentWork: typeof source.currentWork === 'string' ? source.currentWork : '',
+      nextSteps: Array.isArray(source.nextSteps)
+        ? source.nextSteps.filter((s): s is string => typeof s === 'string')
+        : [],
     };
 
     let dropped = 0;
@@ -311,9 +462,75 @@ export class MemoryDocument {
 
     const safeIssues = Array.isArray(source.pendingIssues) ? source.pendingIssues : [];
     result.pendingIssues = safeIssues
-      .filter((issue) => typeof issue === 'string')
-      .map((issue) => issue.trim())
-      .filter(Boolean);
+      .map((i: any) => {
+        if (typeof i === 'string') {
+           return {
+             id: `issue_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+             description: i,
+             source: 'system',
+             timestamp: now
+           } as Issue;
+        }
+        if (typeof i === 'object' && i !== null && typeof i.description === 'string') {
+          return {
+            id: i.id || `issue_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+            description: i.description,
+            source: i.source || 'system',
+            timestamp: i.timestamp || now
+          } as Issue;
+        }
+        return null;
+      })
+      .filter((i): i is Issue => i !== null);
+
+    // 规范化 userMessages
+    const safeUserMessages = Array.isArray(source.userMessages) ? source.userMessages : [];
+    result.userMessages = safeUserMessages
+      .map((m: any) => {
+        if (typeof m === 'object' && m !== null && typeof m.content === 'string') {
+          return {
+            content: m.content,
+            timestamp: typeof m.timestamp === 'string' ? m.timestamp : now,
+            isKeyInstruction: m.isKeyInstruction === true
+          } as UserMessage;
+        }
+        return null;
+      })
+      .filter((m): m is UserMessage => m !== null);
+
+    // 规范化 resolvedIssues
+    const safeResolved = Array.isArray(source.resolvedIssues) ? source.resolvedIssues : [];
+    result.resolvedIssues = safeResolved
+      .map((r: any) => {
+        if (typeof r === 'object' && r !== null && typeof r.problem === 'string') {
+          return {
+            id: r.id || `resolved_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+            problem: r.problem,
+            rootCause: typeof r.rootCause === 'string' ? r.rootCause : '',
+            solution: typeof r.solution === 'string' ? r.solution : '',
+            timestamp: typeof r.timestamp === 'string' ? r.timestamp : now
+          } as ResolvedIssue;
+        }
+        return null;
+      })
+      .filter((r): r is ResolvedIssue => r !== null);
+
+    // 规范化 rejectedApproaches
+    const safeRejected = Array.isArray(source.rejectedApproaches) ? source.rejectedApproaches : [];
+    result.rejectedApproaches = safeRejected
+      .map((r: any) => {
+        if (typeof r === 'object' && r !== null && typeof r.approach === 'string') {
+          return {
+            id: r.id || `rejected_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+            approach: r.approach,
+            reason: typeof r.reason === 'string' ? r.reason : '',
+            rejectedBy: r.rejectedBy === 'user' ? 'user' : 'technical',
+            timestamp: typeof r.timestamp === 'string' ? r.timestamp : now
+          } as RejectedApproach;
+        }
+        return null;
+      })
+      .filter((r): r is RejectedApproach => r !== null);
 
     if (dropped > 0) {
       logger.warn('上下文记忆.规范化.丢弃无效记录', { dropped }, LogCategory.SESSION);
@@ -347,6 +564,7 @@ export class MemoryDocument {
 
   /**
    * 转换为 Markdown 格式（用于展示和压缩）
+   * 完整版：包含所有新增字段
    */
   toMarkdown(): string {
     const c = this.content;
@@ -358,9 +576,43 @@ export class MemoryDocument {
       ''
     ];
 
+    // ========== 用户意图（核心）==========
+    if (c.primaryIntent) {
+      lines.push('## 🎯 用户核心意图');
+      lines.push(c.primaryIntent);
+      lines.push('');
+    }
+
+    if (c.userConstraints.length > 0) {
+      lines.push('## ⚠️ 用户约束条件');
+      c.userConstraints.forEach(constraint => {
+        lines.push(`- ${constraint}`);
+      });
+      lines.push('');
+    }
+
+    if (c.userMessages.length > 0) {
+      lines.push('## 💬 用户关键消息');
+      // 只显示标记为关键的消息，或最近5条
+      const keyMessages = c.userMessages.filter(m => m.isKeyInstruction);
+      const displayMessages = keyMessages.length > 0 ? keyMessages : c.userMessages.slice(-5);
+      displayMessages.forEach(msg => {
+        const marker = msg.isKeyInstruction ? '🔑' : '💬';
+        lines.push(`- ${marker} "${msg.content}"`);
+      });
+      lines.push('');
+    }
+
+    // ========== 当前状态 ==========
+    if (c.currentWork) {
+      lines.push('## 🔄 当前工作');
+      lines.push(c.currentWork);
+      lines.push('');
+    }
+
     // 当前任务
     if (c.currentTasks.length > 0) {
-      lines.push('## 当前任务');
+      lines.push('## 📋 当前任务');
       c.currentTasks.forEach(t => {
         const status = t.status === 'in_progress' ? '[/]' : '[ ]';
         lines.push(`- ${status} ${t.description}${t.assignedWorker ? ` (${t.assignedWorker})` : ''}`);
@@ -368,28 +620,28 @@ export class MemoryDocument {
       lines.push('');
     }
 
-    // 已完成任务
-    if (c.completedTasks.length > 0) {
-      lines.push('## 已完成任务');
-      c.completedTasks.slice(-10).forEach(t => { // 只显示最近10个
-        const status = t.status === 'completed' ? '[x]' : '[!]';
-        lines.push(`- ${status} ${t.description}${t.result ? ` - ${t.result}` : ''}`);
+    // 下一步建议
+    if (c.nextSteps.length > 0) {
+      lines.push('## ⏭️ 下一步建议');
+      c.nextSteps.forEach((step, i) => {
+        lines.push(`${i + 1}. ${step}`);
       });
       lines.push('');
     }
 
+    // ========== 技术上下文 ==========
     // 关键决策
     if (c.keyDecisions.length > 0) {
-      lines.push('## 关键决策');
+      lines.push('## 🔧 关键决策');
       c.keyDecisions.forEach((d, i) => {
-        lines.push(`${i + 1}. ${d.description}: ${d.reason}`);
+        lines.push(`${i + 1}. **${d.description}**: ${d.reason}`);
       });
       lines.push('');
     }
 
     // 代码变更
     if (c.codeChanges.length > 0) {
-      lines.push('## 代码变更摘要');
+      lines.push('## 📝 代码变更摘要');
       c.codeChanges.slice(-20).forEach(ch => { // 只显示最近20个
         lines.push(`- \`${ch.file}\`: ${ch.summary}`);
       });
@@ -398,18 +650,54 @@ export class MemoryDocument {
 
     // 重要上下文
     if (c.importantContext.length > 0) {
-      lines.push('## 重要上下文');
+      lines.push('## 📚 重要上下文');
       c.importantContext.forEach(ctx => {
         lines.push(`- ${ctx}`);
       });
       lines.push('');
     }
 
+    // ========== 问题跟踪 ==========
     // 待解决问题
     if (c.pendingIssues.length > 0) {
       lines.push('## 📌 待解决问题');
       c.pendingIssues.forEach(issue => {
-        lines.push(`- ${issue}`);
+        lines.push(`- [${issue.source}] ${issue.description}`);
+      });
+      lines.push('');
+    }
+
+    // 已解决问题
+    if (c.resolvedIssues.length > 0) {
+      lines.push('## ✅ 已解决问题');
+      c.resolvedIssues.slice(-5).forEach(issue => { // 只显示最近5个
+        lines.push(`- **问题**: ${issue.problem}`);
+        if (issue.rootCause) {
+          lines.push(`  - **根因**: ${issue.rootCause}`);
+        }
+        if (issue.solution) {
+          lines.push(`  - **方案**: ${issue.solution}`);
+        }
+      });
+      lines.push('');
+    }
+
+    // 被拒绝的方案
+    if (c.rejectedApproaches.length > 0) {
+      lines.push('## ❌ 被拒绝的方案');
+      c.rejectedApproaches.forEach(r => {
+        const byLabel = r.rejectedBy === 'user' ? '用户拒绝' : '技术不可行';
+        lines.push(`- ~~${r.approach}~~ (${byLabel}: ${r.reason})`);
+      });
+      lines.push('');
+    }
+
+    // ========== 已完成任务（放最后，可压缩）==========
+    if (c.completedTasks.length > 0) {
+      lines.push('## ✓ 已完成任务');
+      c.completedTasks.slice(-10).forEach(t => { // 只显示最近10个
+        const status = t.status === 'completed' ? '[x]' : '[!]';
+        lines.push(`- ${status} ${t.description}${t.result ? ` - ${t.result}` : ''}`);
       });
       lines.push('');
     }
@@ -432,14 +720,55 @@ export class MemoryDocument {
 
   /**
    * 清理旧数据（保留最近的记录）
+   * 升级版：支持所有新字段
    */
-  pruneOldData(keepCompletedTasks: number = 5, keepCodeChanges: number = 10): void {
+  pruneOldData(options: {
+    keepCompletedTasks?: number;
+    keepCodeChanges?: number;
+    keepUserMessages?: number;
+    keepResolvedIssues?: number;
+    keepRejectedApproaches?: number;
+  } = {}): void {
+    const {
+      keepCompletedTasks = 5,
+      keepCodeChanges = 10,
+      keepUserMessages = 10,
+      keepResolvedIssues = 5,
+      keepRejectedApproaches = 5
+    } = options;
+
+    let changed = false;
+
     if (this.content.completedTasks.length > keepCompletedTasks) {
       this.content.completedTasks = this.content.completedTasks.slice(-keepCompletedTasks);
+      changed = true;
     }
     if (this.content.codeChanges.length > keepCodeChanges) {
       this.content.codeChanges = this.content.codeChanges.slice(-keepCodeChanges);
+      changed = true;
     }
-    this.dirty = true;
+    if (this.content.userMessages.length > keepUserMessages) {
+      // 优先保留关键指令
+      const keyMessages = this.content.userMessages.filter(m => m.isKeyInstruction);
+      const regularMessages = this.content.userMessages.filter(m => !m.isKeyInstruction);
+      const keepRegular = Math.max(0, keepUserMessages - keyMessages.length);
+      this.content.userMessages = [
+        ...keyMessages,
+        ...regularMessages.slice(-keepRegular)
+      ];
+      changed = true;
+    }
+    if (this.content.resolvedIssues.length > keepResolvedIssues) {
+      this.content.resolvedIssues = this.content.resolvedIssues.slice(-keepResolvedIssues);
+      changed = true;
+    }
+    if (this.content.rejectedApproaches.length > keepRejectedApproaches) {
+      this.content.rejectedApproaches = this.content.rejectedApproaches.slice(-keepRejectedApproaches);
+      changed = true;
+    }
+
+    if (changed) {
+      this.dirty = true;
+    }
   }
 }

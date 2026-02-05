@@ -383,10 +383,15 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     options?: AdapterOutputScope
   ): Promise<AdapterResponse> {
     const adapter = this.getOrCreateAdapter(agent);
+    const decisionHook = options?.decisionHook;
 
     // 应用 streamToUI 配置（默认为 true）
     const streamToUI = options?.streamToUI !== false;
     adapter.setStreamToUI(streamToUI);
+
+    if (typeof (adapter as any).setDecisionHook === 'function') {
+      (adapter as any).setDecisionHook(decisionHook);
+    }
 
     // 为 orchestrator 适配器应用临时配置
     if (agent === 'orchestrator' && adapter instanceof OrchestratorLLMAdapter) {
@@ -403,6 +408,9 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     } catch (error: any) {
       // 重置 streamToUI 为默认值
       adapter.setStreamToUI(true);
+      if (typeof (adapter as any).setDecisionHook === 'function') {
+        (adapter as any).setDecisionHook(undefined);
+      }
       return {
         content: '',
         done: false,
@@ -492,6 +500,10 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     } finally {
       // 重置 streamToUI 为默认值，避免影响后续请求
       adapter.setStreamToUI(true);
+      // 清理决策点回调，避免跨请求泄漏
+      if (typeof (adapter as any).setDecisionHook === 'function') {
+        (adapter as any).setDecisionHook(undefined);
+      }
     }
   }
 

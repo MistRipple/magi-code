@@ -1,60 +1,47 @@
 /**
  * Worker 子代理 System Prompt
- * 
+ *
  * 角色定义：
  * - 接收编排者分配的任务
  * - 独立执行编码任务
  * - 直接修改文件，拥有完整写入权限
  * - 向编排者汇报执行结果
- * 
+ *
  * 设计原则：
- * - 极简：Worker 只需要知道"做什么"和"怎么做"
- * - 高效：减少冗余指令，提高执行效率
- * - 专注：每个 Worker 专注于自己的专业领域
+ * - 思考优先：展示完整的推理过程（Chain of Thought）
+ * - 解释决策：说明为什么这样做
+ * - 专注任务：每个 Worker 专注于自己的专业领域
+ * - 自然对话：像工程师之间的技术讨论
  */
 
 import { WorkerSlot } from '../orchestrator/protocols/types';
 
 /**
- * Worker 通用 System Prompt - 极简版
- * Token 估算: ~150 tokens
+ * Worker 通用 System Prompt
+ *
+ * 设计原则：
+ * - 不规定输出格式，让 LLM 自然表达
+ * - 强调思考过程，但不限制思考方式
+ * - 像真正的工程师一样工作
  */
-export const WORKER_SYSTEM_PROMPT_BASE = `# Worker 执行协议
+export const WORKER_SYSTEM_PROMPT_BASE = `你是一个经验丰富的代码工程师。
 
-## 角色
-你是一个**代码执行者**，负责完成编排者分配的编码任务。
+像你平时工作一样完成任务：
+- 先理解要做什么，想清楚再动手
+- 遇到问题就分析，找到原因再解决
+- 改代码时知道为什么这样改
 
-## 执行规范
-1. **直接修改**：你拥有完整文件写入权限，直接修改代码
-2. **专注任务**：只完成分配的任务，不扩展范围
-3. **中文回复**：使用中文回复，包括代码注释
-4. **简要汇报**：完成后提供简短的变更说明
-
-## 输出格式
-完成后输出：
-1. 修改了哪些文件
-2. 做了什么变更
-3. 是否有遗留问题
+你有完整的文件读写权限，直接修改代码完成任务。
+用中文自然地表达你的思考和行动。
 `;
 
 /**
- * Worker 专业领域描述
+ * Worker 专业领域提示（简洁版，不强制格式）
  */
 const WORKER_SPECIALIZATIONS: Record<WorkerSlot, string> = {
-  claude: `## 专业领域：复杂架构
-- 多文件重构、架构设计
-- 代码审查、技术方案
-- 复杂逻辑实现`,
-
-  codex: `## 专业领域：后端开发
-- 快速代码生成、Bug修复
-- 算法实现、单元测试
-- API开发、数据处理`,
-
-  gemini: `## 专业领域：前端开发
-- UI/UX组件、CSS样式
-- React/Vue组件开发
-- 多模态理解、图片分析`,
+  claude: `你擅长复杂架构设计、多文件重构和代码审查。`,
+  codex: `你擅长快速代码生成、Bug修复和算法实现。`,
+  gemini: `你擅长前端UI开发、CSS样式和多模态分析。`,
 };
 
 /**
@@ -72,15 +59,14 @@ export function buildWorkerSystemPrompt(
   const additionalContext = options?.additionalContext || '';
 
   let prompt = `${WORKER_SYSTEM_PROMPT_BASE}
-
 ${specialization}`;
 
   if (workspace) {
-    prompt += `\n\n---\n**工作区**: ${workspace}\n`;
+    prompt += `\n工作目录: ${workspace}`;
   }
 
   if (additionalContext) {
-    prompt += `\n**上下文**:\n${additionalContext}`;
+    prompt += `\n${additionalContext}`;
   }
 
   return prompt;
@@ -88,7 +74,7 @@ ${specialization}`;
 
 /**
  * 构建 Worker 任务执行 Prompt
- * 提供任务执行的系统级引导
+ * 只提供必要信息，不规定输出格式
  */
 export function buildWorkerTaskPrompt(options: {
   taskDescription: string;
@@ -98,26 +84,19 @@ export function buildWorkerTaskPrompt(options: {
 }): string {
   const { taskDescription, targetFiles, context, isIntegrationTask } = options;
 
-  const filesHint = targetFiles?.length
-    ? `\n\n**目标文件**: ${targetFiles.join(', ')}`
-    : '';
+  let prompt = taskDescription;
 
-  const contextHint = context
-    ? `\n\n**上下文**:\n${context}`
-    : '';
-
-  if (isIntegrationTask) {
-    return `${taskDescription}${filesHint}${contextHint}
-
-**执行模式**: 联调审查
-- 只做分析与检查，不修改文件
-- 验证接口契约是否一致
-- 输出 JSON 格式报告`;
+  if (targetFiles?.length) {
+    prompt += `\n\n相关文件: ${targetFiles.join(', ')}`;
   }
 
-  return `${taskDescription}${filesHint}${contextHint}
+  if (context) {
+    prompt += `\n\n背景信息:\n${context}`;
+  }
 
-**执行模式**: 直接修改
-- 直接修改文件完成任务
-- 完成后简要说明变更`;
+  if (isIntegrationTask) {
+    prompt += `\n\n这是一个联调检查任务，只需分析不要修改文件。`;
+  }
+
+  return prompt;
 }

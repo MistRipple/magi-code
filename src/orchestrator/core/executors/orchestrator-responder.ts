@@ -189,7 +189,7 @@ ${question.questionType}
       prompt,
       undefined,
       {
-        streamToUI: false,
+        streamToUI: true,  // 🔧 让用户看到决策过程
         adapterRole: 'orchestrator',
       }
     );

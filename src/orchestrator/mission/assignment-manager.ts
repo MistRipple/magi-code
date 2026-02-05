@@ -125,17 +125,19 @@ export class AssignmentManager {
     );
 
     const now = Date.now();
+    const responsibility = this.generateResponsibility(
+      mission,
+      workerId,
+      scope,
+      assignmentReason.profileMatch.category
+    );
     return {
       id: `assignment_${now}_${Math.random().toString(36).substr(2, 9)}`,
       missionId: mission.id,
       workerId,
       assignmentReason,
-      responsibility: this.generateResponsibility(
-        mission,
-        workerId,
-        scope,
-        assignmentReason.profileMatch.category
-      ),
+      shortTitle: (mission.goal || mission.userPrompt || responsibility).substring(0, 20),
+      responsibility,
       delegationBriefing: options?.delegationBriefing,
       scope,
       guidancePrompt,

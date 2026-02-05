@@ -156,6 +156,7 @@ function createMockMission(options?: {
         alternatives: [],
       },
       responsibility: `职责 ${i + 1}`,
+      shortTitle: `任务 ${i + 1}`,
       scope: { includes: ['src/'], excludes: [] },
       guidancePrompt: '请执行任务',
       producerContracts: [],
@@ -725,7 +726,8 @@ function testSingleWorkerMission(): ScenarioResult[] {
     let subTaskCardReceived = false;
 
     hub.on('unified:message', (msg: any) => {
-      if (msg?.metadata?.subTaskCard) {
+      // 方案 B：使用 MessageType.TASK_CARD 识别
+      if (msg?.type === 'task_card' && msg?.metadata?.subTaskCard) {
         subTaskCardReceived = true;
       }
     });
@@ -2027,7 +2029,8 @@ function testMessageHub(): ScenarioResult[] {
     let cardData: any = null;
 
     hub.on('unified:message', (msg: any) => {
-      if (msg?.metadata?.subTaskCard) {
+      // 方案 B：使用 MessageType.TASK_CARD 识别
+      if (msg?.type === 'task_card' && msg?.metadata?.subTaskCard) {
         subTaskCardReceived = true;
         cardData = msg.metadata.subTaskCard;
       }

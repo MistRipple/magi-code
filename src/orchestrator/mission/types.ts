@@ -342,6 +342,8 @@ export interface Assignment {
   assignmentReason: AssignmentReason;
 
   // ===== 职责定义 =====
+  /** 简短标题，用于 Worker 卡片显示（如"分析依赖"），≤20字 */
+  shortTitle: string;
   /** 职责描述（结构化，用于日志和内部逻辑） */
   responsibility: string;
   /**
@@ -487,6 +489,7 @@ export interface CreateContractParams {
 export interface CreateAssignmentParams {
   missionId: string;
   workerId: WorkerSlot;
+  shortTitle: string;
   responsibility: string;
   scope: AssignmentScope;
   assignmentReason: AssignmentReason;

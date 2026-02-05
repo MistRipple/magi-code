@@ -18,6 +18,13 @@ import {
 } from '../types';
 import { logger, LogCategory } from '../../logging';
 
+class NonRetryableError extends Error {
+  constructor(message: string, public originalError?: unknown) {
+    super(message);
+    this.name = 'NonRetryableError';
+  }
+}
+
 /**
  * 通用 LLM 客户端
  * 支持 OpenAI 和 Anthropic API
@@ -157,14 +164,24 @@ export class UniversalLLMClient extends BaseLLMClient {
   ): Promise<LLMResponse> {
     this.logRequest({ ...params, stream: true });
 
+    let hasReceivedData = false;
+    const wrappedOnChunk = (chunk: LLMStreamChunk) => {
+      hasReceivedData = true;
+      onChunk(chunk);
+    };
+
     return this.withRetry(async () => {
       try {
         if (this.config.provider === 'anthropic') {
-          return await this.streamAnthropicMessage(params, onChunk);
+          return await this.streamAnthropicMessage(params, wrappedOnChunk);
         } else {
-          return await this.streamOpenAIMessage(params, onChunk);
+          return await this.streamOpenAIMessage(params, wrappedOnChunk);
         }
       } catch (error) {
+        // 如果已经收到数据后发生错误，禁止重试，避免内容重复
+        if (hasReceivedData) {
+          throw new NonRetryableError('Stream interrupted after data received', error);
+        }
         this.logError(error, 'streamMessage');
         throw error;
       }
@@ -178,6 +195,9 @@ export class UniversalLLMClient extends BaseLLMClient {
       try {
         return await fn();
       } catch (error: any) {
+        if (error instanceof NonRetryableError) {
+          throw error.originalError || error;
+        }
         if (!this.isRetryableError(error) || attempt === maxRetries - 1) {
           throw error;
         }
@@ -530,6 +550,10 @@ export class UniversalLLMClient extends BaseLLMClient {
       } else if (event.type === 'message_delta') {
         if (event.usage) {
           usage.outputTokens = event.usage.output_tokens;
+          onChunk({
+            type: 'usage',
+            usage: { outputTokens: event.usage.output_tokens }
+          });
         }
         if (event.delta.stop_reason) {
           stopReason = this.mapAnthropicStopReason(event.delta.stop_reason);
@@ -537,6 +561,10 @@ export class UniversalLLMClient extends BaseLLMClient {
       } else if (event.type === 'message_start') {
         if (event.message.usage) {
           usage.inputTokens = event.message.usage.input_tokens;
+          onChunk({
+            type: 'usage',
+            usage: { inputTokens: event.message.usage.input_tokens }
+          });
         }
       }
     }
@@ -832,6 +860,13 @@ export class UniversalLLMClient extends BaseLLMClient {
       if (chunk.usage) {
         usage.inputTokens = chunk.usage.prompt_tokens || 0;
         usage.outputTokens = chunk.usage.completion_tokens || 0;
+        onChunk({
+          type: 'usage',
+          usage: {
+            inputTokens: chunk.usage.prompt_tokens || 0,
+            outputTokens: chunk.usage.completion_tokens || 0,
+          },
+        });
       }
     }
 

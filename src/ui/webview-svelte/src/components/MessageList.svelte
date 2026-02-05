@@ -13,8 +13,10 @@
       title?: string;
       hint?: string;
     };
+    /** 是否为只读模式（主对话区模式），隐藏冗余操作按钮 */
+    readOnly?: boolean;
   }
-  let { messages, emptyState }: Props = $props();
+  let { messages, emptyState, readOnly = false }: Props = $props();
 
   // 🛡️ 防御性编程：过滤无效的消息
   const safeMessages = $derived(
@@ -36,7 +38,8 @@
    */
   function getMessageKey(message: import('../types/message').Message): string {
     // 1. 用户消息：使用自己的 ID（唯一，不会与响应消息冲突）
-    const isUserMessage = message.role === 'user' || message.metadata?.role === 'user';
+    // 方案 B：使用 MessageType.USER_INPUT 判断用户消息
+    const isUserMessage = message.type === 'user_input';
     if (isUserMessage) {
       return message.id;
     }
@@ -151,7 +154,7 @@
       </div>
     {:else}
       {#each safeMessages as message (getMessageKey(message))}
-        <MessageItem {message} />
+        <MessageItem {message} {readOnly} />
       {/each}
     {/if}
   </div>

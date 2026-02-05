@@ -31,8 +31,22 @@ export interface RequestResponseBinding {
 // 消息来源
 export type MessageSource = 'orchestrator' | 'claude' | 'codex' | 'gemini' | 'system';
 
-// 消息类型
-export type MessageType = 'message' | 'system-notice' | 'tool_call' | 'plan_confirmation' | 'question_request';
+// 消息类型 - 与协议层 MessageType 完全对齐
+export type MessageType =
+  // 协议层核心类型
+  | 'text'
+  | 'plan'
+  | 'progress'
+  | 'result'
+  | 'error'
+  | 'interaction'
+  | 'system-notice'
+  | 'tool_call'
+  | 'thinking'
+  // 方案 B 扩展类型
+  | 'user_input'
+  | 'task_card'
+  | 'instruction';
 
 // 通知类型
 export type NoticeType = 'info' | 'success' | 'warning' | 'error';

@@ -4,13 +4,17 @@
 
   interface Props {
     block: ContentBlock;
+    isStreaming?: boolean;
+    readOnly?: boolean;
   }
 
-  let { block }: Props = $props();
+  let { block, isStreaming = false, readOnly = false }: Props = $props();
 </script>
 
 <CodeBlock
   code={block.content || ''}
   language={block.language || ''}
   showLineNumbers={true}
+  {isStreaming}
+  showCopyButton={!readOnly}
 />
