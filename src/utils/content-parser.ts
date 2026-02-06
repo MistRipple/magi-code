@@ -290,12 +290,6 @@ export function tryParsePlanJson(jsonContent: string): PlanBlock | null {
       planBlock.riskFactors = parsed.riskFactors.filter((c: unknown) => typeof c === 'string');
     }
 
-    console.log('[content-parser] 成功解析规划 JSON:', {
-      goal: planBlock.goal.substring(0, 50) + '...',
-      hasAnalysis: !!planBlock.analysis,
-      constraintsCount: planBlock.constraints?.length || 0,
-    });
-
     return planBlock;
   } catch {
     return null;
@@ -391,19 +385,9 @@ export function parseContentToBlocks(
 
   const blocks: ContentBlock[] = [];
 
-  // 2. 🔧 移除裸露的 JSON 对象（用户不需要看到原始 JSON）
+  // 2. 移除裸露的 JSON 对象（用户不需要看到原始 JSON）
   const embeddedJsons = extractEmbeddedJson(content);
   if (embeddedJsons.length > 0) {
-    console.log('[content-parser] 发现裸露 JSON:', embeddedJsons.length, '个');
-    embeddedJsons.forEach((json, idx) => {
-      console.log(`[content-parser] JSON ${idx + 1}:`, {
-        startIndex: json.startIndex,
-        endIndex: json.endIndex,
-        length: json.jsonText.length,
-        preview: json.jsonText.substring(0, 100) + '...'
-      });
-    });
-
     // 从后往前移除，避免索引变化
     for (let i = embeddedJsons.length - 1; i >= 0; i--) {
       const json = embeddedJsons[i];
@@ -412,24 +396,13 @@ export function parseContentToBlocks(
       const after = content.substring(json.endIndex).trimStart();
       content = before + (before && after ? '\n\n' : '') + after;
     }
-
-    console.log('[content-parser] 移除 JSON 后的内容长度:', content.length);
   }
 
   // 3. 提取代码块
   const codeBlocks = extractCodeBlocks(content);
 
-  // 🔧 新增：检查内容是否以代码块开头
+  // 检查内容是否以代码块开头
   const startsWithCodeBlock = codeBlocks.length > 0 && codeBlocks[0].startIndex === 0;
-
-  console.log('[content-parser] 代码块检查:', {
-    codeBlocksCount: codeBlocks.length,
-    startsWithCodeBlock,
-    firstCodeBlockLang: codeBlocks[0]?.lang,
-    // 🔍 增强调试：记录首个代码块的首行内容
-    firstCodeBlockFirstLine: codeBlocks[0]?.code?.split('\n')[0] || 'N/A',
-    firstCodeBlockContentLength: codeBlocks[0]?.code?.length || 0,
-  });
 
   if (codeBlocks.length > 0) {
     // 有代码块，需要分段处理
@@ -444,12 +417,8 @@ export function parseContentToBlocks(
         }
       }
 
-      // 🔧 新增：如果不是以代码块开头，且当前代码块是 JSON，则标记为嵌入式
+      // 如果不是以代码块开头，且当前代码块是 JSON，则标记为嵌入式
       if (!startsWithCodeBlock && codeBlock.lang === 'json') {
-        console.log('[content-parser] 标记嵌入式 JSON 代码块:', {
-          startIndex: codeBlock.startIndex,
-          length: codeBlock.code.length,
-        });
         // 添加 isEmbedded 标记，前端会隐藏这个代码块
         blocks.push({
           type: 'code',

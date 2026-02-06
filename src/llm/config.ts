@@ -182,12 +182,12 @@ export class LLMConfigLoader {
     };
   }
 
-  private static normalizeString(value: any, fallback: string): string {
+  private static normalizeString(value: any, defaultValue: string): string {
     if (typeof value !== 'string') {
-      return fallback;
+      return defaultValue;
     }
     const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : fallback;
+    return trimmed.length > 0 ? trimmed : defaultValue;
   }
 
   /**
@@ -684,7 +684,7 @@ export class LLMConfigLoader {
 
   /**
    * 获取默认仓库
-   * 注意：内置 Skills 仓库已废弃，所有内置工具由 ToolManager 管理
+   * 注意：内置 Skills 仓库已迁移，内置工具由 ToolManager 管理
    */
   private static getDefaultRepositories(): any[] {
     return [];

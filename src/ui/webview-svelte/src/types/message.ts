@@ -142,7 +142,7 @@ export type ModelStatusType =
   | 'auth_failed'     // 认证失败
   | 'network_error'   // 网络错误
   | 'timeout'         // 超时
-  | 'fallback';       // 回退
+  | 'orchestrator';  // 使用编排者模型
 
 export interface ModelStatus {
   status: ModelStatusType;
@@ -305,6 +305,7 @@ export interface AppState {
   edits?: Edit[];
   toasts?: Toast[];
   interactionMode?: 'ask' | 'auto';
+  interactionModeUpdatedAt?: number;
   [key: string]: unknown;
 }
 

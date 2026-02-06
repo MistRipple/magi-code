@@ -5,6 +5,7 @@
  */
 
 import { WorkerSlot } from '../../types';
+import type { UnifiedTodo } from '../../todo/types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector, TaskStructuredInfo } from '../profile/guidance-injector';
 import { CategoryResolver } from '../profile/category-resolver';
@@ -17,7 +18,6 @@ import {
   AssignmentScope,
   AssignmentReason,
   CreateAssignmentParams,
-  WorkerTodo,
 } from './types';
 
 /**
@@ -424,7 +424,7 @@ export class AssignmentManager {
   /**
    * 添加 Todo 到 Assignment
    */
-  addTodo(assignment: Assignment, todo: WorkerTodo): Assignment {
+  addTodo(assignment: Assignment, todo: UnifiedTodo): Assignment {
     return {
       ...assignment,
       todos: [...assignment.todos, todo],
@@ -434,7 +434,7 @@ export class AssignmentManager {
   /**
    * 更新 Assignment 中的 Todo
    */
-  updateTodo(assignment: Assignment, todo: WorkerTodo): Assignment {
+  updateTodo(assignment: Assignment, todo: UnifiedTodo): Assignment {
     const todoIndex = assignment.todos.findIndex(t => t.id === todo.id);
     if (todoIndex === -1) {
       throw new Error(`Todo not found: ${todo.id}`);
@@ -472,7 +472,7 @@ export class AssignmentManager {
   /**
    * 获取下一个可执行的 Todo
    */
-  getNextExecutableTodo(assignment: Assignment): WorkerTodo | null {
+  getNextExecutableTodo(assignment: Assignment): UnifiedTodo | null {
     for (const todo of assignment.todos) {
       if (todo.status !== 'pending') continue;
 

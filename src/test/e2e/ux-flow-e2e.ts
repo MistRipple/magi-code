@@ -1,7 +1,7 @@
 /**
  * UX/UI 流程端到端测试
  *
- * 基于 docs/ux-flow-specification.md 的交互规范
+ * 基于 docs/workflow/ux-flow-specification.md 的交互规范
  *
  * 测试目标：
  * 1. 双区域职责划分（主对话区 vs Worker Tab）
@@ -22,8 +22,8 @@ import {
   Mission,
   MissionStatus,
   Assignment,
-  WorkerTodo,
 } from '../../orchestrator/mission';
+import type { UnifiedTodo } from '../../todo/types';
 import { WorkerSlot } from '../../types';
 import { StandardMessage, MessageType, MessageCategory } from '../../protocol/message-protocol';
 
@@ -65,7 +65,7 @@ function createMockMission(options?: {
   const assignments: Assignment[] = [];
   for (let i = 0; i < assignmentCount; i++) {
     const worker = workers[i % workers.length];
-    const todos: WorkerTodo[] = [];
+    const todos: UnifiedTodo[] = [];
     for (let j = 0; j < todoCount; j++) {
       todos.push({
         id: `todo-${i}-${j}`,
@@ -1097,7 +1097,7 @@ function testTodoStatusIcons(): UXTestResult[] {
 }
 
 // ============================================================================
-// UX-11: 任务分配宣告与任务说明 (refactor-orchestration-messaging.md)
+// UX-11: 任务分配宣告与任务说明 (orchestration-messaging-refactor.md)
 // ============================================================================
 
 /**
@@ -1410,7 +1410,7 @@ function testTaskAssignmentAndInstruction(): UXTestResult[] {
 export async function runUXFlowTests(): Promise<void> {
   console.log('='.repeat(60));
   console.log('UX/UI 流程端到端测试');
-  console.log('基于 docs/ux-flow-specification.md');
+  console.log('基于 docs/workflow/ux-flow-specification.md');
   console.log('='.repeat(60));
   console.log('');
 
@@ -1476,7 +1476,7 @@ export async function runUXFlowTests(): Promise<void> {
   allResults.push(...todoIconResults);
   printResults(todoIconResults);
 
-  // UX-11: 任务分配宣告与任务说明 (refactor-orchestration-messaging.md)
+  // UX-11: 任务分配宣告与任务说明 (orchestration-messaging-refactor.md)
   console.log('【UX-11 任务分配宣告与任务说明】');
   const assignmentResults = testTaskAssignmentAndInstruction();
   allResults.push(...assignmentResults);

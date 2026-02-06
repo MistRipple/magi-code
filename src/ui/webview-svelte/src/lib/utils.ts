@@ -80,11 +80,11 @@ export function throttle<T extends (...args: unknown[]) => void>(
 /**
  * 安全的 JSON 解析
  */
-export function safeJsonParse<T>(str: string, fallback: T): T {
+export function safeJsonParse<T>(str: string, defaultValue: T): T {
   try {
     return JSON.parse(str) as T;
   } catch {
-    return fallback;
+    return defaultValue;
   }
 }
 

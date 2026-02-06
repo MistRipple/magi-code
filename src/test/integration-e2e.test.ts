@@ -271,7 +271,7 @@ async function runTests(): Promise<void> {
   console.log('测试组 3: 工具权限验证');
   console.log('='.repeat(80));
 
-  results.push(await runTest('3.1 - Bash 工具权限检查（禁用）', async () => {
+  results.push(await runTest('3.1 - launch-process 工具权限检查（禁用）', async () => {
     const permissions: PermissionMatrix = {
       allowBash: false,
       allowEdit: true,
@@ -281,21 +281,21 @@ async function runTests(): Promise<void> {
     const toolManager = new ToolManager(process.cwd(), permissions);
 
     const toolCall: ToolCall = {
-      id: 'test-bash-1',
-      name: 'Bash',
-      arguments: { command: 'ls -la' },
+      id: 'test-launch-process-1',
+      name: 'launch-process',
+      arguments: { command: 'ls -la', wait: false, max_wait_seconds: 5, name: 'orchestrator' },
     };
 
     const result = await toolManager.execute(toolCall);
 
     if (!result.isError) throw new Error('应该返回错误');
-    if (!result.content.includes('Permission denied')) throw new Error('错误信息不正确');
-    if (!result.content.includes('Bash execution is disabled')) throw new Error('缺少具体原因');
+    if (!result.content.includes('Tool blocked')) throw new Error('错误信息不正确');
+    if (!result.content.includes('Terminal command execution is disabled')) throw new Error('缺少具体原因');
 
     console.log(`  - 权限拒绝消息: ${result.content}`);
   }));
 
-  results.push(await runTest('3.2 - Bash 工具权限检查（允许）', async () => {
+  results.push(await runTest('3.2 - launch-process 工具权限检查（允许）', async () => {
     const permissions: PermissionMatrix = {
       allowBash: true,
       allowEdit: true,
@@ -305,19 +305,18 @@ async function runTests(): Promise<void> {
     const toolManager = new ToolManager(process.cwd(), permissions);
 
     const toolCall: ToolCall = {
-      id: 'test-bash-2',
-      name: 'Bash',
-      arguments: { command: 'echo "test"' },
+      id: 'test-launch-process-2',
+      name: 'launch-process',
+      arguments: { command: 'echo "test"', wait: true, max_wait_seconds: 5, name: 'orchestrator' }
     };
 
     const result = await toolManager.execute(toolCall);
 
-    // 注意：实际执行可能失败（因为没有真实的 shell 环境），但不应该是权限错误
     if (result.isError && result.content.includes('Permission denied')) {
       throw new Error('不应该返回权限错误');
     }
 
-    console.log('  - Bash 工具权限检查通过');
+    console.log('  - launch-process 工具权限检查通过');
   }));
 
   results.push(await runTest('3.3 - Edit 工具权限检查（禁用）', async () => {
@@ -556,7 +555,11 @@ async function runTests(): Promise<void> {
     const tools = await toolManager.getTools();
 
     const expectedTools = [
-      'execute_shell',
+      'launch-process',
+      'read-process',
+      'write-process',
+      'kill-process',
+      'list-processes',
       'text_editor',
       'grep_search',
       'remove_files',

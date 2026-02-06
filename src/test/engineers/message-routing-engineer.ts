@@ -174,29 +174,36 @@ class MessageRoutingEngineer implements TestEngineer {
     const providerContent = fs.readFileSync(providerPath, 'utf-8');
     const hubContent = fs.readFileSync(hubPath, 'utf-8');
 
-    // 检查 data-only 防护：assistantContent 校验 + 错误处理
-    const hasRequestStatsCheck = providerContent.includes('assistantContent')
-      && (providerContent.includes('未收到模型输出内容') || providerContent.includes('stats.assistantContent <= 0'));
+    // 检查内容通道防护：
+    // 1) Provider 不再使用 assistantContent 做成败硬判（避免误杀正常流式输出）
+    // 2) MessageHub 负责内容完整性兜底（stream buffer + completion 补块 + content guard）
+    const hasLegacyAssistantHardFail =
+      providerContent.includes('未收到模型输出内容')
+      || providerContent.includes('stats.assistantContent <= 0');
+
     const hasStreamBuffer = hubContent.includes('streamBuffers')
       && hubContent.includes('ensureContentBlocksFromBuffer');
 
-    if (!hasRequestStatsCheck) {
+    const hasContentGuard = hubContent.includes('Content message missing blocks')
+      && hubContent.includes('ensureContentBlocksFromBuffer');
+
+    if (hasLegacyAssistantHardFail) {
       issues.push({
         severity: 'high',
         category: '消息防护',
-        description: '未检测到 data-only 防护（assistantContent 校验缺失）',
+        description: '检测到过时的 assistantContent 硬失败判定，可能误判正常流式响应',
         location: 'src/ui/webview-provider.ts',
-        suggestedFix: '在请求结束时强制校验 assistantContent > 0，失败时发出可见错误'
+        suggestedFix: '移除 assistantContent 成败硬判，改由 MessageHub 生命周期与内容完整性守卫判定'
       });
     }
 
-    if (!hasStreamBuffer) {
+    if (!hasStreamBuffer || !hasContentGuard) {
       issues.push({
         severity: 'high',
         category: '流式完整性',
-        description: '未检测到流式内容缓存/补全机制，可能导致响应内容丢失',
+        description: '未检测到完整的流式缓存与 completion 内容补全守卫，可能导致响应内容丢失或空内容透传',
         location: 'src/orchestrator/core/message-hub.ts',
-        suggestedFix: '为 StreamUpdate 增加缓存，completion 时补全 content blocks'
+        suggestedFix: '确保 streamBuffers + ensureContentBlocksFromBuffer + Content message missing blocks 守卫同时存在'
       });
     }
 

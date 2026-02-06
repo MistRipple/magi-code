@@ -1,7 +1,7 @@
 /**
  * ConflictResolver - Worker 选择冲突解决器（单一数据源）
  *
- * 仅允许根据分类归属进行选择，不支持多源兜底或降级。
+ * 仅允许根据分类归属进行选择，不支持多源兜底或替代分支。
  */
 
 import { WorkerSlot } from '../types';
@@ -12,10 +12,6 @@ import { WorkerAssignmentLoader } from '../orchestrator/profile/worker-assignmen
 export interface ConflictResolutionInput {
   /** 用户手动选择的 Worker */
   userPreference?: WorkerSlot;
-  /** 画像推荐的 Worker（已废弃，不再使用） */
-  profileRecommendation?: WorkerSlot;
-  /** 执行统计推荐的 Worker（已废弃，不再使用） */
-  statsRecommendation?: WorkerSlot;
   /** 任务分类 */
   category?: string;
   /** 可用的 Worker 列表 */
@@ -30,8 +26,8 @@ export interface ConflictResolutionResult {
   reason: string;
   /** 使用的决策层级 */
   level: 'user' | 'profile';
-  /** 是否发生了降级 */
-  degraded: boolean;
+  /** 是否发生了切换 */
+  switched: boolean;
   /** 置信度 (0-1) */
   confidence: number;
 }
@@ -69,7 +65,7 @@ export class ConflictResolver {
       worker,
       reason: `分类 "${category}" 归属 ${worker}`,
       level: userPreference ? 'user' : 'profile',
-      degraded: false,
+      switched: false,
       confidence: 1.0,
     };
   }

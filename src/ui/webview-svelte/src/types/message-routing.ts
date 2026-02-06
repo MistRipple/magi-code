@@ -31,8 +31,8 @@ export enum MessageCategory {
 }
 
 export type DisplayTarget =
-  | { location: 'thread' }
-  | { location: 'worker'; worker: 'claude' | 'codex' | 'gemini' }
-  | { location: 'both'; worker: 'claude' | 'codex' | 'gemini' }
-  | { location: 'task' }
-  | { location: 'none' };
+  | { location: 'thread'; reason?: string }
+  | { location: 'worker'; worker: 'claude' | 'codex' | 'gemini'; reason?: string }
+  | { location: 'both'; worker: 'claude' | 'codex' | 'gemini'; reason?: string }
+  | { location: 'task'; reason?: string }
+  | { location: 'none'; reason?: string };

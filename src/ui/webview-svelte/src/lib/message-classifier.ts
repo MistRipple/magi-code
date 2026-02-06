@@ -108,7 +108,7 @@ export function classifyMessage(standard: StandardMessage): {
       case MessageType.RESULT:
         return { category: MessageCategory.WORKER_SUMMARY, worker: resolvedWorker ?? undefined };
       case MessageType.INTERACTION:
-        // 🔧 Worker 交互消息：根据交互类型分类（而不是降级为普通文本）
+        // 🔧 Worker 交互消息：根据交互类型分类（而不是归并为普通文本）
         if (standard.interaction) {
           switch (standard.interaction.type) {
             case InteractionType.PERMISSION:

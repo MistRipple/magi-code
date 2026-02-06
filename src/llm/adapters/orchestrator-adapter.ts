@@ -6,7 +6,7 @@
  */
 
 import { AgentType, AgentRole, LLMConfig } from '../../types/agent-types';
-import { LLMClient, LLMMessageParams, LLMMessage } from '../types';
+import { LLMClient, LLMMessageParams, LLMMessage, ToolCall } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager } from '../../tools/tool-manager';
 import { MessageHub } from '../../orchestrator/core/message-hub';
@@ -51,7 +51,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
    * 临时配置（仅对下一次请求生效）
    */
   private tempSystemPrompt?: string;
-  private tempIsolatedSession?: boolean;
+  private tempEnableToolCalls?: boolean;
 
   constructor(adapterConfig: OrchestratorAdapterConfig) {
     super(
@@ -96,35 +96,29 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     let messageId: string | null = null;
 
     // 获取临时配置（使用后清除）
-    const useIsolatedSession = this.tempIsolatedSession ?? false;
     const effectiveSystemPrompt = this.tempSystemPrompt ?? this.systemPrompt;
-    this.tempIsolatedSession = undefined;
+    const enableToolCalls = this.tempEnableToolCalls ?? false;
     this.tempSystemPrompt = undefined;
+    this.tempEnableToolCalls = undefined;
 
     try {
-      // 准备消息历史
-      let messagesToSend: LLMMessage[];
-
-      if (useIsolatedSession) {
-        // 独立会话模式：不使用历史记录
-        messagesToSend = [];
-      } else {
-        // 自动截断历史以控制 token 消耗
-        this.truncateHistoryIfNeeded();
-        messagesToSend = this.conversationHistory;
+      if (enableToolCalls) {
+        const content = await this.sendMessageWithTools(
+          message,
+          images,
+          effectiveSystemPrompt
+        );
+        this.setState(AdapterState.CONNECTED);
+        return content;
       }
+
+      // 准备消息历史（自动截断以控制 token 消耗）
+      this.truncateHistoryIfNeeded();
 
       // 添加用户消息
       const userMessage = this.buildUserMessage(message, images);
-
-      if (useIsolatedSession) {
-        // 独立会话模式：只发送当前消息
-        messagesToSend = [userMessage];
-      } else {
-        // 正常模式：添加到历史
-        this.conversationHistory.push(userMessage);
-        messagesToSend = this.conversationHistory;
-      }
+      this.conversationHistory.push(userMessage);
+      const messagesToSend = this.conversationHistory;
 
       // Orchestrator 通常不需要工具，但可以根据需要启用
       const params: LLMMessageParams = {
@@ -154,13 +148,11 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       });
       this.recordTokenUsage(response.usage);
 
-      // 独立会话模式下不更新历史
-      if (!useIsolatedSession) {
-        this.conversationHistory.push({
-          role: 'assistant',
-          content: fullResponse,
-        });
-      }
+      // 将助手响应添加到历史
+      this.conversationHistory.push({
+        role: 'assistant',
+        content: fullResponse,
+      });
 
       this.normalizer.endStream(streamId);
       this.setState(AdapterState.CONNECTED);
@@ -270,38 +262,37 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   setTempSystemPrompt(prompt: string): void {
     this.tempSystemPrompt = prompt;
   }
-
   /**
-   * 设置临时独立会话模式（仅对下一次请求生效）
+   * 设置临时工具调用开关（仅对下一次请求生效）
    */
-  setTempIsolatedSession(isolated: boolean): void {
-    this.tempIsolatedSession = isolated;
+  setTempEnableToolCalls(enabled: boolean): void {
+    this.tempEnableToolCalls = enabled;
   }
 
   /**
    * 获取默认系统提示
    */
   private getDefaultSystemPrompt(): string {
-    return `You are an intelligent task orchestrator for a multi-agent development system.
+    return `你是 MultiCLI 的任务编排者，负责协调多个专业 AI 协作完成开发任务。
 
-Your responsibilities:
-1. Analyze user requirements and break them down into subtasks
-2. Assign subtasks to appropriate worker agents (claude, codex, gemini)
-3. Define clear acceptance criteria for each subtask
-4. Monitor progress and coordinate between workers
-5. Ensure quality and consistency across all work
+你的职责：
+1. 分析用户需求，拆解为可执行的子任务
+2. 将子任务分配给合适的 Worker（Claude、Codex、Gemini）
+3. 定义清晰的验收标准
+4. 监控执行进度，协调各 Worker 之间的协作
+5. 确保输出质量和一致性
 
-Available workers:
-- claude: General-purpose coding, refactoring, documentation
-- codex: Code generation, API integration, testing
-- gemini: UI/UX, frontend development, design
+可用的 Worker：
+- Claude: 架构设计、代码重构、深度分析
+- Codex: 代码生成、API 集成、测试编写
+- Gemini: 前端 UI/UX、长文档分析、多模态理解
 
-Guidelines:
-- Break complex tasks into manageable subtasks
-- Assign tasks based on worker strengths
-- Define clear, testable acceptance criteria
-- Consider dependencies between subtasks
-- Provide context and guidance to workers`;
+执行原则：
+- 将复杂任务拆解为可管理的子任务
+- 根据 Worker 特长分配任务
+- 定义可测试的验收标准
+- 考虑子任务之间的依赖关系
+- 为 Worker 提供充分的上下文`;
   }
 
   /**
@@ -381,5 +372,173 @@ Guidelines:
       role: 'assistant',
       content,
     });
+  }
+
+  /**
+   * 编排者工具调用模式（仅在显式启用时）
+   */
+  private async sendMessageWithTools(
+    message: string,
+    images: string[] | undefined,
+    systemPrompt: string
+  ): Promise<string> {
+    // 自动截断历史以控制 token 消耗
+    this.truncateHistoryIfNeeded();
+
+    // 添加用户消息到历史
+    this.conversationHistory.push(this.buildUserMessage(message, images));
+
+    return await this.runToolCallingRound(this.conversationHistory, systemPrompt, 0);
+  }
+
+  /**
+   * 单轮工具调用 + 递归收敛
+   */
+  private async runToolCallingRound(
+    history: LLMMessage[],
+    systemPrompt: string,
+    recursionDepth: number
+  ): Promise<string> {
+    const tools = await this.toolManager.getTools();
+    const toolDefinitions = tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      input_schema: tool.input_schema,
+    }));
+
+    const params: LLMMessageParams = {
+      messages: history,
+      systemPrompt,
+      tools: toolDefinitions.length > 0 ? toolDefinitions : undefined,
+      stream: true,
+      maxTokens: 8192,
+      temperature: 0.3,
+    };
+
+    const streamId = this.startStreamWithContext();
+    let accumulatedText = '';
+    let toolCalls: ToolCall[] = [];
+
+    try {
+      const response = await this.client.streamMessage(params, (chunk) => {
+        if (chunk.type === 'content_delta' && chunk.content) {
+          accumulatedText += chunk.content;
+          this.normalizer.processTextDelta(streamId, chunk.content);
+          this.emit('message', chunk.content);
+        } else if (chunk.type === 'thinking' && chunk.thinking) {
+          this.normalizer.processThinking(streamId, chunk.thinking);
+          this.emit('thinking', chunk.thinking);
+        } else if (chunk.type === 'tool_call_start' && chunk.toolCall) {
+          this.emit('toolCall', chunk.toolCall.name || '', chunk.toolCall.arguments || {});
+        }
+      });
+      this.recordTokenUsage(response.usage);
+
+      if (response.toolCalls && response.toolCalls.length > 0) {
+        toolCalls = response.toolCalls;
+      }
+
+      const assistantText = accumulatedText || response.content || '';
+      if (toolCalls.length > 0) {
+        for (const toolCall of toolCalls) {
+          this.normalizer.addToolCall(streamId, {
+            type: 'tool_call',
+            toolName: toolCall.name,
+            toolId: toolCall.id,
+            status: 'running',
+            input: JSON.stringify(toolCall.arguments, null, 2),
+          });
+        }
+
+        const assistantContent: any[] = [];
+        if (assistantText) {
+          assistantContent.push({
+            type: 'text',
+            text: assistantText,
+          });
+        }
+        for (const toolCall of toolCalls) {
+          assistantContent.push({
+            type: 'tool_use',
+            id: toolCall.id,
+            name: toolCall.name,
+            input: toolCall.arguments,
+          });
+        }
+        history.push({
+          role: 'assistant',
+          content: assistantContent,
+        });
+
+        const toolResults = await this.executeToolCalls(toolCalls);
+        for (const result of toolResults) {
+          this.normalizer.finishToolCall(
+            streamId,
+            result.toolCallId,
+            result.isError ? undefined : result.content,
+            result.isError ? result.content : undefined
+          );
+        }
+
+        history.push({
+          role: 'user',
+          content: toolResults.map((result) => ({
+            type: 'tool_result',
+            tool_use_id: result.toolCallId,
+            content: result.content,
+            is_error: result.isError,
+          })),
+        });
+
+        this.normalizer.endStream(streamId);
+
+        if (recursionDepth >= 3) {
+          return '多次工具调用后仍未产出最终回复，已中止以避免无限循环。';
+        }
+        return await this.runToolCallingRound(history, systemPrompt, recursionDepth + 1);
+      }
+
+      history.push({
+        role: 'assistant',
+        content: assistantText,
+      });
+
+      this.normalizer.endStream(streamId);
+      if (!assistantText.trim()) {
+        throw new Error('LLM 响应为空：流式传输完成但未收到有效内容');
+      }
+      return assistantText;
+    } catch (error: any) {
+      this.normalizer.endStream(streamId, error?.message || 'Request failed');
+      throw error;
+    }
+  }
+
+  /**
+   * 执行工具调用
+   */
+  private async executeToolCalls(toolCalls: ToolCall[]) {
+    const results = [];
+    const maxToolResultChars = 20000;
+
+    for (const toolCall of toolCalls) {
+      try {
+        const result = await this.toolManager.execute(toolCall);
+        if (typeof result.content === 'string' && result.content.length > maxToolResultChars) {
+          const truncated = result.content.slice(0, maxToolResultChars);
+          result.content = `${truncated}\n...[truncated ${result.content.length - maxToolResultChars} chars]`;
+        }
+        results.push(result);
+        this.emit('toolResult', toolCall.name, result.content);
+      } catch (error: any) {
+        results.push({
+          toolCallId: toolCall.id,
+          content: `Error: ${error?.message || String(error)}`,
+          isError: true,
+        });
+      }
+    }
+
+    return results;
   }
 }

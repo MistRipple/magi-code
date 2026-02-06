@@ -7,13 +7,13 @@
  *
  * 设计目标：
  * - 统一使用 Todo 系统作为数据源
- * - 废弃 UnifiedTaskManager + Task/SubTask 持久化
+ * - 统一使用 Todo 系统替代 UnifiedTaskManager + Task/SubTask 持久化
  * - UI 层通过视图适配器获取展示数据
  */
 
 import { Mission, Assignment, MissionStatus } from '../orchestrator/mission/types';
 import { UnifiedTodo, TodoStatus } from '../todo/types';
-import { AgentType } from '../types/agent-types';
+import type { WorkerSlot } from '../types/agent-types';
 
 // ============================================================================
 // 视图类型定义（UI 层使用，不持久化）
@@ -88,7 +88,7 @@ export interface SubTaskView {
   title?: string;           // = UnifiedTodo.content 截取
 
   // Worker 分配
-  assignedWorker: AgentType; // = UnifiedTodo.workerId
+  assignedWorker: WorkerSlot; // = UnifiedTodo.workerId
   assignmentId: string;     // = UnifiedTodo.assignmentId
 
   // 状态
@@ -165,7 +165,7 @@ export function todoToSubTaskView(todo: UnifiedTodo, missionId: string): SubTask
     taskId: missionId,
     description: todo.content,
     title: todo.content.length > 50 ? todo.content.substring(0, 50) + '...' : todo.content,
-    assignedWorker: todo.workerId as AgentType,
+    assignedWorker: todo.workerId,
     assignmentId: todo.assignmentId,
     status: mapTodoStatusToSubTaskViewStatus(todo.status),
     progress: todo.progress,

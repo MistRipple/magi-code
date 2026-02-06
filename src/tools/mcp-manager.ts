@@ -99,7 +99,7 @@ export class MCPManager {
       }
 
       // 创建 stdio 传输
-      // 过滤掉 undefined 值，确保类型兼容
+      // 过滤掉 undefined 值，确保类型正确
       const envVars: Record<string, string> = {};
       for (const [key, value] of Object.entries(process.env)) {
         if (value !== undefined) {

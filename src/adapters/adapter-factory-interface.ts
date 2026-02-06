@@ -23,11 +23,12 @@ export interface AdapterOutputScope {
   source?: 'orchestrator' | 'worker' | 'user';
 
   /**
-   * 是否将响应流式传输到 UI
-   * - true（默认）: 消息会实时显示给用户
-   * - false: 静默模式，用于内部后台操作（如内存压缩、内部分析）
+   * 消息可见性
+   * - 'user': 用户可见（默认）
+   * - 'system': 仅系统日志可见
+   * - 'debug': 仅调试模式可见
    */
-  streamToUI?: boolean;
+  visibility?: 'user' | 'system' | 'debug';
 
   /** 适配器角色 */
   adapterRole?: 'orchestrator' | 'worker';
@@ -51,13 +52,6 @@ export interface AdapterOutputScope {
    * 如果提供，将覆盖适配器的默认系统提示词（仅对当前请求生效）
    */
   systemPrompt?: string;
-
-  /**
-   * 是否使用独立会话（可选）
-   * - true: 不使用历史记录，每次请求独立
-   * - false（默认）: 使用累积的对话历史
-   */
-  isolatedSession?: boolean;
 }
 
 /**

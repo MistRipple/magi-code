@@ -23,7 +23,7 @@ async function testMessageCategories() {
       id: message.id,
       category: message.category,
       type: message.type,
-      content: message.blocks?.[0]?.content?.substring(0, 50),
+      content: message.blocks?.[0]?.type === 'text' ? message.blocks[0].content?.substring(0, 50) : undefined,
     });
     console.log(`[收到消息] id=${message.id}, category=${message.category}, type=${message.type}`);
   });

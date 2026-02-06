@@ -761,7 +761,7 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
       return content.substring(startMarkerIndex + OUTPUT_START_MARKER.length, endMarkerIndex);
     }
 
-    // 降级：返回文件尾部内容
+    // 备用：返回文件尾部内容
     const lines = content.split('\n');
     const lastLines = lines.slice(-50);
     return lastLines.join('\n');

@@ -20,7 +20,7 @@ import {
   DEFAULT_CONTEXT_CONFIG,
   MemoryContent
 } from './types';
-import { UnifiedSessionManager, SessionSummary } from '../session/unified-session-manager';
+import { UnifiedSessionManager, SessionMessage } from '../session/unified-session-manager';
 import { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
 
 // 统一上下文系统组件导入
@@ -28,6 +28,7 @@ import {
   ContextAssembler,
   ContextAssemblyOptions,
   AssembledContext,
+  ContextPartType,
   DEFAULT_TOKEN_BUDGET,
   DEFAULT_LOCAL_TURNS,
 } from './context-assembler';
@@ -35,6 +36,7 @@ import {
   SharedContextPool,
   SharedContextEntry,
   AddResult,
+  ImportanceLevel,
 } from './shared-context-pool';
 import {
   FileSummaryCache,
@@ -42,28 +44,8 @@ import {
   ContextSource,
 } from './file-summary-cache';
 
-type MemorySummaryOptions = {
-  includeCurrentTasks?: boolean;
-  includeKeyDecisions?: number;
-  includeImportantContext?: boolean;
-  includePendingIssues?: boolean;
-  includeCompletedTasks?: number;
-  includeCodeChanges?: number;
-  // 新增字段选项
-  includePrimaryIntent?: boolean;
-  includeUserConstraints?: boolean;
-  includeCurrentWork?: boolean;
-  includeNextSteps?: boolean;
-  includeResolvedIssues?: number;
-  includeRejectedApproaches?: number;
-};
-
-type ContextSliceOptions = {
-  maxTokens: number;
-  memoryRatio?: number;
-  includeMemory?: boolean;
-  includeRecent?: boolean;
-  memorySummary?: MemorySummaryOptions;
+type AssembledContextFormatOptions = {
+  excludePartTypes?: ContextPartType[];
 };
 
 export class ContextManager {
@@ -81,7 +63,7 @@ export class ContextManager {
 
   // ============================================================================
   // 统一上下文系统组件 (L1 层级)
-  // 参见 docs/context-unified-memory-plan.md 10.1 节
+  // 参见 docs/context/unified-memory-plan.md 10.1 节
   // ============================================================================
 
   /** 共享上下文池 - 存储跨 Worker 的摘要、决策、洞察 */
@@ -134,9 +116,19 @@ export class ContextManager {
    * 将 immediateContext 转换为格式化字符串
    */
   private async getRecentTurnsForAssembler(
-    _agentId: string,
+    agentId: string,
     options: { maxTokens: number; minTurns: number; maxTurns: number; prioritizeDecisionPoints: boolean }
   ): Promise<string | null> {
+    const agentScopedTurns = this.getAgentScopedTurnsFromSession(
+      agentId,
+      options.maxTokens,
+      options.minTurns,
+      options.maxTurns
+    );
+    if (agentScopedTurns) {
+      return agentScopedTurns;
+    }
+
     const recentMessages = this.getRecentMessages(options.maxTokens);
 
     if (recentMessages.length === 0) {
@@ -149,6 +141,91 @@ export class ContextManager {
     );
 
     return messagesToUse.map(m => `[${m.role}]: ${m.content}`).join('\n\n');
+  }
+
+  /**
+   * 从会话消息中提取 agent 级最近对话
+   */
+  private getAgentScopedTurnsFromSession(
+    agentId: string,
+    maxTokens: number,
+    minTurns: number,
+    maxTurns: number
+  ): string | null {
+    if (!this.sessionManager || !this.currentSessionId) {
+      return null;
+    }
+
+    const session = this.sessionManager.getSession(this.currentSessionId) || this.sessionManager.getCurrentSession();
+    if (!session || session.messages.length === 0) {
+      return null;
+    }
+
+    const messagesToUse: SessionMessage[] = [];
+    let usedTokens = 0;
+    const maxMessages = Math.max(2, maxTurns * 2);
+
+    for (let i = session.messages.length - 1; i >= 0; i--) {
+      const message = session.messages[i];
+      if (!this.shouldIncludeSessionMessageForAgent(message, agentId)) {
+        continue;
+      }
+
+      const messageTokens = this.estimateTokens(message.content);
+      if (usedTokens + messageTokens > maxTokens) {
+        break;
+      }
+
+      messagesToUse.unshift(message);
+      usedTokens += messageTokens;
+
+      if (messagesToUse.length >= maxMessages) {
+        break;
+      }
+    }
+
+    if (messagesToUse.length === 0) {
+      return null;
+    }
+    if (messagesToUse.length < Math.max(1, minTurns)) {
+      return null;
+    }
+
+    return messagesToUse
+      .map(message => `[${this.resolveSessionMessageSpeaker(message)}]: ${message.content}`)
+      .join('\n\n');
+  }
+
+  /**
+   * 判断某条会话消息是否应进入 agent 本地窗口
+   */
+  private shouldIncludeSessionMessageForAgent(message: SessionMessage, agentId: string): boolean {
+    if (message.role === 'user') {
+      return true;
+    }
+
+    if (message.agent === agentId) {
+      return true;
+    }
+
+    if (message.agent === 'orchestrator') {
+      return true;
+    }
+
+    return message.source === 'system';
+  }
+
+  /**
+   * 解析会话消息的展示角色
+   */
+  private resolveSessionMessageSpeaker(message: SessionMessage): string {
+    if (message.role === 'user') {
+      return 'user';
+    }
+    if (message.agent) {
+      return message.agent;
+    }
+    return message.role;
   }
 
   /**
@@ -334,291 +411,6 @@ export class ContextManager {
       content: result.content,
       wasTruncated: result.wasTruncated
     };
-  }
-
-  /**
-   * 获取组装后的上下文（用于发送给 LLM）
-   */
-  getContext(maxTokens: number = 8000): string {
-    return this.getContextSlice({ maxTokens });
-  }
-
-  /**
-   * 获取受限上下文切片（用于 Worker 精简上下文）
-   */
-  getContextSlice(options: ContextSliceOptions): string {
-    const {
-      maxTokens,
-      memoryRatio = 0.3,
-      includeMemory = true,
-      includeRecent = true,
-      memorySummary = {},
-    } = options;
-    const parts: string[] = [];
-    let currentTokens = 0;
-
-    // 0. 添加项目知识（如果有 ProjectKnowledgeBase）- 最高优先级
-    if (this.projectKnowledgeBase) {
-      const projectBudget = Math.floor(maxTokens * 0.1); // 最多占用 10% 的 token 预算
-      const projectContext = this.projectKnowledgeBase.getProjectContext(projectBudget);
-
-      if (projectContext) {
-        const projectTokens = this.estimateTokens(projectContext);
-        parts.push('## 项目知识\n' + projectContext);
-        currentTokens += projectTokens;
-        logger.info('上下文.项目知识.已注入', {
-          tokens: projectTokens,
-          budget: projectBudget
-        }, LogCategory.SESSION);
-      }
-    }
-
-    // 1. 添加会话总结（如果有 SessionManager 和当前会话 ID）
-    if (this.sessionManager && this.currentSessionId) {
-      const sessionSummary = this.sessionManager.getSessionSummary(this.currentSessionId);
-      if (sessionSummary) {
-        const summaryText = this.formatSessionSummaryForContext(sessionSummary);
-        const summaryTokens = this.estimateTokens(summaryText);
-        const summaryBudget = Math.floor(maxTokens * 0.2); // 最多占用 20% 的 token 预算
-
-        if (summaryTokens <= summaryBudget) {
-          parts.push(summaryText);
-          currentTokens += summaryTokens;
-          logger.info('上下文.会话总结.已注入', {
-            sessionId: this.currentSessionId,
-            tokens: summaryTokens
-          }, LogCategory.SESSION);
-        } else {
-          // 如果总结太长，进行截断
-          const truncated = this.truncationUtils.truncateMessage(summaryText, summaryBudget * 4);
-          parts.push(truncated.content);
-          currentTokens += this.estimateTokens(truncated.content);
-          logger.info('上下文.会话总结.已截断', {
-            sessionId: this.currentSessionId,
-            originalTokens: summaryTokens,
-            truncatedTokens: this.estimateTokens(truncated.content)
-          }, LogCategory.SESSION);
-        }
-      }
-    }
-
-    // 2. 添加会话 Memory 摘要（高优先级）
-    if (includeMemory && this.sessionMemory) {
-      const summary = this.buildMemorySummary(memorySummary);
-      if (summary) {
-        const memoryTokens = this.estimateTokens(summary);
-        const memoryBudget = Math.max(0, Math.floor((maxTokens - currentTokens) * memoryRatio));
-        if (memoryBudget > 0) {
-          if (memoryTokens <= memoryBudget) {
-            parts.push('## 会话上下文\n' + summary);
-            currentTokens += memoryTokens;
-          } else {
-            const truncated = this.truncationUtils.truncateMessage(summary, memoryBudget * 4);
-            parts.push('## 会话上下文\n' + truncated.content);
-            currentTokens += this.estimateTokens(truncated.content);
-          }
-        }
-      }
-    }
-
-    // 3. 添加即时上下文（最近对话）
-    if (includeRecent) {
-      const remainingTokens = maxTokens - currentTokens;
-      const recentMessages = this.getRecentMessages(remainingTokens);
-      if (recentMessages.length > 0) {
-        parts.push('## 最近对话\n' + recentMessages.map(m =>
-          `[${m.role}]: ${m.content}`
-        ).join('\n\n'));
-      }
-    }
-
-    return parts.join('\n\n---\n\n');
-  }
-
-  /**
-   * 格式化会话总结为上下文文本
-   */
-  private formatSessionSummaryForContext(summary: SessionSummary): string {
-    const lines: string[] = [];
-
-    lines.push('## 会话总结');
-    lines.push('');
-    lines.push(`**会话**: ${summary.title}`);
-    lines.push(`**目标**: ${summary.objective}`);
-    lines.push(`**消息数**: ${summary.messageCount} 条`);
-    lines.push('');
-
-    if (summary.completedTasks.length > 0) {
-      lines.push('**已完成任务**:');
-      summary.completedTasks.forEach((task, i) => {
-        lines.push(`${i + 1}. ${task}`);
-      });
-      lines.push('');
-    }
-
-    if (summary.inProgressTasks.length > 0) {
-      lines.push('**进行中任务**:');
-      summary.inProgressTasks.forEach((task, i) => {
-        lines.push(`${i + 1}. ${task}`);
-      });
-      lines.push('');
-    }
-
-    if (summary.keyDecisions.length > 0) {
-      lines.push('**关键决策**:');
-      summary.keyDecisions.forEach((decision, i) => {
-        lines.push(`${i + 1}. ${decision}`);
-      });
-      lines.push('');
-    }
-
-    if (summary.codeChanges.length > 0) {
-      lines.push('**代码变更**:');
-      summary.codeChanges.slice(0, 10).forEach((change, i) => {
-        lines.push(`${i + 1}. ${change}`);
-      });
-      if (summary.codeChanges.length > 10) {
-        lines.push(`... 还有 ${summary.codeChanges.length - 10} 个文件`);
-      }
-      lines.push('');
-    }
-
-    if (summary.pendingIssues.length > 0) {
-      lines.push('**待解决问题**:');
-      summary.pendingIssues.forEach((issue, i) => {
-        lines.push(`${i + 1}. ${issue}`);
-      });
-      lines.push('');
-    }
-
-    return lines.join('\n');
-  }
-
-  /**
-   * 获取 Memory 摘要
-   */
-  private getMemorySummary(): string {
-    return this.buildMemorySummary({
-      includeCurrentTasks: true,
-      includeKeyDecisions: 3,
-      includeImportantContext: true,
-    });
-  }
-
-  private buildMemorySummary(options: MemorySummaryOptions): string {
-    if (!this.sessionMemory) return '';
-
-    const content = this.sessionMemory.getContent();
-    const lines: string[] = [];
-    const {
-      includeCurrentTasks = false,
-      includeKeyDecisions = 0,
-      includeImportantContext = false,
-      includePendingIssues = false,
-      includeCompletedTasks = 0,
-      includeCodeChanges = 0,
-      // 新增字段选项
-      includePrimaryIntent = true,
-      includeUserConstraints = true,
-      includeCurrentWork = true,
-      includeNextSteps = true,
-      includeResolvedIssues = 0,
-      includeRejectedApproaches = 0,
-    } = options;
-
-    // 🔴 核心：用户意图（最高优先级）
-    if (includePrimaryIntent && content.primaryIntent) {
-      lines.push('**核心意图:**');
-      lines.push(content.primaryIntent);
-      lines.push('');
-    }
-
-    if (includeUserConstraints && content.userConstraints.length > 0) {
-      lines.push('**用户约束:**');
-      content.userConstraints.forEach(c => {
-        lines.push(`- ${c}`);
-      });
-      lines.push('');
-    }
-
-    // 当前工作状态
-    if (includeCurrentWork && content.currentWork) {
-      lines.push('**当前工作:**');
-      lines.push(content.currentWork);
-      lines.push('');
-    }
-
-    // 当前任务
-    if (includeCurrentTasks && content.currentTasks.length > 0) {
-      lines.push('**当前任务:**');
-      content.currentTasks.forEach(t => {
-        lines.push(`- ${t.description} (${t.status})`);
-      });
-    }
-
-    // 下一步建议
-    if (includeNextSteps && content.nextSteps.length > 0) {
-      lines.push('**下一步:**');
-      content.nextSteps.forEach((step, i) => {
-        lines.push(`${i + 1}. ${step}`);
-      });
-    }
-
-    // 关键决策（最近N个）
-    if (includeKeyDecisions > 0 && content.keyDecisions.length > 0) {
-      lines.push('**关键决策:**');
-      content.keyDecisions.slice(-includeKeyDecisions).forEach(d => {
-        lines.push(`- ${d.description}`);
-      });
-    }
-
-    // 重要上下文
-    if (includeImportantContext && content.importantContext.length > 0) {
-      lines.push('**重要上下文:**');
-      content.importantContext.forEach(ctx => {
-        lines.push(`- ${ctx}`);
-      });
-    }
-
-    // 待解决问题
-    if (includePendingIssues && content.pendingIssues.length > 0) {
-      lines.push('**待解决问题:**');
-      content.pendingIssues.slice(-5).forEach(issue => {
-        lines.push(`- ${issue.description}`);
-      });
-    }
-
-    // 被拒绝的方案（新增）
-    if (includeRejectedApproaches > 0 && content.rejectedApproaches.length > 0) {
-      lines.push('**被拒绝的方案:**');
-      content.rejectedApproaches.slice(-includeRejectedApproaches).forEach(r => {
-        lines.push(`- ~~${r.approach}~~ (${r.reason})`);
-      });
-    }
-
-    // 已解决问题（新增）
-    if (includeResolvedIssues > 0 && content.resolvedIssues.length > 0) {
-      lines.push('**已解决问题:**');
-      content.resolvedIssues.slice(-includeResolvedIssues).forEach(r => {
-        lines.push(`- ${r.problem}: ${r.solution}`);
-      });
-    }
-
-    if (includeCompletedTasks > 0 && content.completedTasks.length > 0) {
-      lines.push('**近期完成:**');
-      content.completedTasks.slice(-includeCompletedTasks).forEach(task => {
-        lines.push(`- ${task.description}`);
-      });
-    }
-
-    if (includeCodeChanges > 0 && content.codeChanges.length > 0) {
-      lines.push('**近期代码变更:**');
-      content.codeChanges.slice(-includeCodeChanges).forEach(change => {
-        lines.push(`- ${change.file}: ${change.summary}`);
-      });
-    }
-
-    return lines.join('\n');
   }
 
   /**
@@ -1025,7 +817,7 @@ export class ContextManager {
 
   // ============================================================================
   // 统一上下文系统公共方法
-  // 参见 docs/context-unified-memory-plan.md 10.1 节
+  // 参见 docs/context/unified-memory-plan.md 10.1 节
   // ============================================================================
 
   /**
@@ -1043,6 +835,83 @@ export class ContextManager {
   async getAssembledContext(options: ContextAssemblyOptions): Promise<AssembledContext> {
     // 使用 getter 确保组件已初始化
     return this.getContextAssembler().assemble(options);
+  }
+
+  /**
+   * 构造默认的上下文组装配置
+   *
+   * 统一预算、最近轮次和最小重要性，避免执行层散落多份配置。
+   */
+  buildAssemblyOptions(
+    missionId: string,
+    agentId: string,
+    totalTokens: number,
+    subscribedTags: string[] = [],
+    minImportance: ImportanceLevel = 'medium'
+  ): ContextAssemblyOptions {
+    return {
+      missionId,
+      subscription: {
+        agentId,
+        subscribedTags,
+      },
+      budget: {
+        ...DEFAULT_TOKEN_BUDGET,
+        total: totalTokens,
+      },
+      minImportance,
+      localTurns: DEFAULT_LOCAL_TURNS,
+    };
+  }
+
+  /**
+   * 获取组装后的上下文文本（供 Prompt 注入）
+   */
+  async getAssembledContextText(
+    options: ContextAssemblyOptions,
+    formatOptions: AssembledContextFormatOptions = {}
+  ): Promise<string> {
+    const assembled = await this.getAssembledContext(options);
+    return this.formatAssembledContext(assembled, formatOptions);
+  }
+
+  /**
+   * 将组装结果渲染为 Prompt 文本
+   */
+  formatAssembledContext(
+    context: AssembledContext,
+    options: AssembledContextFormatOptions = {}
+  ): string {
+    if (!context.parts || context.parts.length === 0) {
+      return '';
+    }
+
+    const excluded = new Set(options.excludePartTypes || []);
+    const sections = context.parts
+      .filter(part => !excluded.has(part.type))
+      .map(part => {
+        const title = this.getPartTitle(part.type);
+        return `## ${title}\n${part.content}`;
+      });
+
+    return sections.join('\n\n');
+  }
+
+  private getPartTitle(type: ContextPartType): string {
+    switch (type) {
+      case 'project_knowledge':
+        return '项目知识';
+      case 'shared_context':
+        return '共享事实';
+      case 'contracts':
+        return '任务契约';
+      case 'recent_turns':
+        return '最近对话';
+      case 'long_term_memory':
+        return '长期记忆';
+      default:
+        return '上下文';
+    }
   }
 
   /**

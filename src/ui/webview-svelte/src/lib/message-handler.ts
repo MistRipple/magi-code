@@ -16,6 +16,9 @@ import {
   updateSessions,
   setAppState,
   setMissionPlan,
+  setInteractionMode,
+  clearRequestedInteractionMode,
+  clearPendingInteractions,
   clearAllMessages,
   setThreadMessages,
   setAgentOutputs,
@@ -25,10 +28,10 @@ import {
   markMessageActive,
   markMessageComplete,
   addPendingRequest,
-  clearProcessingState,
   clearPendingRequest,
   setProcessingActor,
   getBackendProcessing,
+  getActiveInteractionType,
   getRequestBinding,
   createRequestBinding,
   updateRequestBinding,
@@ -113,9 +116,117 @@ function handleMessage(message: WebviewMessage) {
 
 // ============ 消息处理函数 ============
 
+function resolveInteractionMode(raw: unknown): 'ask' | 'auto' | null {
+  if (raw === 'ask' || raw === 'auto') {
+    return raw;
+  }
+  return null;
+}
+
+function resolvePendingInteractionsOnAutoMode(): void {
+  const store = getState();
+  const hasPending = Boolean(
+    store.pendingToolAuthorization
+    || store.pendingConfirmation
+    || store.pendingRecovery
+    || store.pendingQuestion
+    || store.pendingClarification
+    || store.pendingWorkerQuestion
+  );
+  if (!hasPending) {
+    return;
+  }
+
+  const pendingToolAuth = store.pendingToolAuthorization;
+  if (pendingToolAuth?.requestId) {
+    vscode.postMessage({ type: 'toolAuthorizationResponse', requestId: pendingToolAuth.requestId, allowed: true });
+  }
+
+  if (store.pendingConfirmation) {
+    vscode.postMessage({ type: 'confirmPlan', confirmed: true });
+  }
+
+  if (store.pendingRecovery) {
+    const decision: 'retry' | 'rollback' | 'continue' = store.pendingRecovery.canRetry
+      ? 'retry'
+      : (store.pendingRecovery.canRollback ? 'rollback' : 'continue');
+    vscode.postMessage({ type: 'confirmRecovery', decision });
+  }
+
+  if (store.pendingQuestion) {
+    vscode.postMessage({ type: 'answerQuestions', answer: null });
+  }
+
+  if (store.pendingClarification) {
+    vscode.postMessage({
+      type: 'answerClarification',
+      answers: null,
+      additionalInfo: null,
+      autoSkipped: true,
+    });
+  }
+
+  if (store.pendingWorkerQuestion) {
+    vscode.postMessage({ type: 'answerWorkerQuestion', answer: null });
+  }
+
+  clearPendingInteractions();
+  clearRequestedInteractionMode();
+  setIsProcessing(true);
+  addToast('info', '已切换到自动模式，待处理交互已按自动策略继续');
+}
+
+function applyInteractionModeFromPayload(rawMode: unknown, source: string, rawUpdatedAt?: unknown): void {
+  const resolved = resolveInteractionMode(rawMode);
+  if (!resolved) {
+    console.error(`[MessageHandler] ${source} 收到非法 interactionMode:`, rawMode);
+    addToast('error', '收到非法交互模式，已忽略该更新');
+    return;
+  }
+  const updatedAt = typeof rawUpdatedAt === 'number' ? rawUpdatedAt : undefined;
+  setInteractionMode(resolved, updatedAt);
+  if (resolved === 'auto') {
+    resolvePendingInteractionsOnAutoMode();
+  }
+}
+
+function isStaleInteractionModeUpdate(payload: Record<string, unknown>, source: string): boolean {
+  const incomingUpdatedAt = typeof payload.updatedAt === 'number' ? payload.updatedAt : undefined;
+  if (incomingUpdatedAt === undefined) return false;
+
+  const currentUpdatedAt = typeof getState().appState?.interactionModeUpdatedAt === 'number'
+    ? (getState().appState?.interactionModeUpdatedAt as number)
+    : undefined;
+
+  if (currentUpdatedAt === undefined) return false;
+  const stale = incomingUpdatedAt < currentUpdatedAt;
+  if (stale) {
+    console.warn(`[MessageHandler] 忽略过期 interactionMode 更新(${source})`, {
+      incomingUpdatedAt,
+      currentUpdatedAt,
+      mode: payload.mode,
+    });
+  }
+  return stale;
+}
+
 function handleStateUpdate(message: WebviewMessage) {
   const state = message.state as AppState;
   if (!state) return;
+
+  const nextUpdatedAt = typeof state.interactionModeUpdatedAt === 'number' ? state.interactionModeUpdatedAt : undefined;
+  const currentUpdatedAt = typeof getState().appState?.interactionModeUpdatedAt === 'number'
+    ? (getState().appState?.interactionModeUpdatedAt as number)
+    : undefined;
+
+  if (nextUpdatedAt !== undefined && currentUpdatedAt !== undefined && nextUpdatedAt < currentUpdatedAt) {
+    console.warn('[MessageHandler] 忽略过期 stateUpdate.interactionMode', {
+      incomingUpdatedAt: nextUpdatedAt,
+      currentUpdatedAt,
+      mode: state.interactionMode,
+    });
+    return;
+  }
 
   setAppState(state);
 
@@ -192,8 +303,7 @@ function handleStateUpdate(message: WebviewMessage) {
   }
 
   if (typeof state.interactionMode === 'string') {
-    const store = getState();
-    store.interactionMode = state.interactionMode === 'ask' ? 'ask' : 'auto';
+    applyInteractionModeFromPayload(state.interactionMode, 'stateUpdate', state.interactionModeUpdatedAt);
   }
 }
 
@@ -414,10 +524,9 @@ function handleContentMessage(standard: StandardMessage) {
     return;
   }
 
-  if (!uiMessage.isStreaming && !hasRenderableContent(uiMessage)) {
-    // 🔧 改为警告而非抛出错误，避免中断消息处理
-    return;
-  }
+  // 🔧 根据 message-flow-design.md 设计方案：
+  // 移除 hasRenderableContent 过滤逻辑，空内容消息由 L6 渲染层决定如何展示（显示加载态）
+  // 不再在 L5 路由层过滤空内容消息
 
   // === 检查是否有对应的占位消息需要替换 ===
   if (requestId) {
@@ -457,7 +566,12 @@ function handleContentMessage(standard: StandardMessage) {
         // 3. 在 UI 中原地替换（保持滚动位置和顺序）
         replaceThreadMessage(placeholderId, newMessage);
 
-        // 4. 标记活跃并回放缓冲
+        // 4. 修复根因：真实消息 ID 与占位 ID 不一致时，必须重建路由
+        // 否则 unifiedUpdate/unifiedComplete 会因找不到 messageId 对应目标而被暂存/忽略
+        clearMessageTarget(placeholderId);
+        routeStandardMessage(standard);
+
+        // 5. 标记活跃并回放缓冲
         if (newMessage.isStreaming) {
           markMessageActive(newMessage.id);
         }
@@ -466,9 +580,8 @@ function handleContentMessage(standard: StandardMessage) {
         return;
       }
 
-      if (!hasRenderableContent(uiMessage)) {
-        return;
-      }
+      // 🔧 根据 message-flow-design.md 设计方案：
+      // 移除 hasRenderableContent 过滤逻辑，空内容消息由 L6 渲染层决定如何展示
 
       // 🔧 统一消息 ID：占位消息即真实消息，直接在同一条消息上更新
       updateRequestBinding(requestId, { realMessageId: standard.id, placeholderMessageId: standard.id });
@@ -694,6 +807,11 @@ function handleStandardComplete(message: WebviewMessage) {
 
   // 清理请求绑定
   if (requestId) {
+    // 🔧 确保清除超时计时器（防止完成后仍触发超时提示）
+    const binding = getRequestBinding(requestId);
+    if (binding?.timeoutId) {
+      clearTimeout(binding.timeoutId);
+    }
     // 延迟清理，确保动画完成
     setTimeout(() => {
       clearRequestBinding(requestId);
@@ -738,15 +856,13 @@ function handleUnifiedControlMessage(standard: StandardMessage) {
 
   switch (controlType) {
     case 'phase_changed':
-      // 阶段变化：仅同步运行态（不再展示阶段步骤）
+      // 阶段变化：仅同步后端运行态
+      // 重要：禁止在这里清空 activeMessageIds/pendingRequests，
+      // 避免 Worker 仍在流式输出时 Stop 按钮提前恢复。
       {
         const isRunning = payload?.isRunning as boolean | undefined;
-        if (typeof isRunning === 'boolean') {
-          if (isRunning) {
-            setIsProcessing(true);
-          } else {
-            clearProcessingState();
-          }
+        if (isRunning === true) {
+          setIsProcessing(true);
         }
       }
       break;
@@ -817,10 +933,15 @@ function handleUnifiedControlMessage(standard: StandardMessage) {
       break;
 
     case 'task_completed':
-    case 'task_failed':
-      // 任务完成/失败：清理状态
-      clearProcessingState();
+    case 'task_failed': {
+      // 任务生命周期结束：以控制消息为准清理运行态
+      setIsProcessing(false);
+      const requestId = payload?.requestId as string | undefined;
+      if (requestId) {
+        clearPendingRequest(requestId);
+      }
       break;
+    }
 
     case 'worker_status': {
       // Worker 状态更新：从控制消息同步状态到 UI
@@ -865,8 +986,10 @@ function handleUnifiedData(standard: StandardMessage) {
 
     case 'processingStateChanged': {
       const isProcessing = payload.isProcessing as boolean | undefined;
-      if (typeof isProcessing === 'boolean') {
-        setIsProcessing(isProcessing);
+      // 仅将 true 作为兜底提升信号，禁止用该通道提前清空运行态
+      // 运行态结束必须由 task_completed/task_failed 决定
+      if (isProcessing === true) {
+        setIsProcessing(true);
       }
       const source = payload.source as string | undefined;
       const agent = payload.agent as string | undefined;
@@ -970,16 +1093,19 @@ function handleUnifiedData(standard: StandardMessage) {
       break;
 
     case 'interactionModeChanged':
-      getState().interactionMode = (payload.mode as string) === 'ask' ? 'ask' : 'auto';
+      if (isStaleInteractionModeUpdate(payload, 'interactionModeChanged')) {
+        break;
+      }
+      applyInteractionModeFromPayload(payload.mode, 'interactionModeChanged', payload.updatedAt);
       break;
 
     case 'missionExecutionFailed':
-      clearProcessingState();
+    case 'missionFailed': {
+      // Mission 级失败：只同步 backendProcessing=false。
+      // activeMessageIds/pendingRequests 应由消息完成链路和请求绑定分别清理。
+      setIsProcessing(false);
       break;
-
-    case 'missionFailed':
-      clearProcessingState();
-      break;
+    }
 
     default:
       break;
@@ -1042,7 +1168,7 @@ function handleSessionMessagesLoaded(message: WebviewMessage) {
       }
 
       // 方案 B：根据 role 或已有 type 字段映射 MessageType
-      // 优先使用已有 type 字段，兼容新旧格式
+      // 优先使用已有 type 字段，统一处理消息格式
       let resolvedType: import('../types/message').MessageType;
       if (m.type && typeof m.type === 'string') {
         // 新格式：直接使用已有 type
@@ -1100,8 +1226,10 @@ function handleSessionMessagesLoaded(message: WebviewMessage) {
 
 function handleConfirmationRequest(message: WebviewMessage) {
   const store = getState();
-  if (store.interactionMode === 'auto') {
+  if (store.appState?.interactionMode === 'auto') {
+    addToast('info', '自动模式已确认执行计划并继续');
     vscode.postMessage({ type: 'confirmPlan', confirmed: true });
+    clearRequestedInteractionMode();
     setIsProcessing(true);
     return;
   }
@@ -1114,12 +1242,13 @@ function handleConfirmationRequest(message: WebviewMessage) {
 
 function handleRecoveryRequest(message: WebviewMessage) {
   const store = getState();
-  if (store.interactionMode === 'auto') {
+  if (store.appState?.interactionMode === 'auto') {
     const canRetry = Boolean(message.canRetry);
     const canRollback = Boolean(message.canRollback);
     const decision: 'retry' | 'rollback' | 'continue' = canRetry
       ? 'retry'
       : (canRollback ? 'rollback' : 'continue');
+    addToast('info', `自动处理恢复请求：已选择${decision === 'retry' ? '重试' : decision === 'rollback' ? '回滚' : '继续'}`);
     vscode.postMessage({ type: 'confirmRecovery', decision });
     setIsProcessing(true);
     return;
@@ -1135,7 +1264,8 @@ function handleRecoveryRequest(message: WebviewMessage) {
 
 function handleQuestionRequest(message: WebviewMessage) {
   const store = getState();
-  if (store.interactionMode === 'auto') {
+  if (store.appState?.interactionMode === 'auto') {
+    addToast('info', '自动处理提问：未提供答案，按默认策略继续');
     vscode.postMessage({ type: 'answerQuestions', answer: null });
     setIsProcessing(true);
     return;
@@ -1149,8 +1279,8 @@ function handleQuestionRequest(message: WebviewMessage) {
 
 function handleClarificationRequest(message: WebviewMessage) {
   const store = getState();
-  if (store.interactionMode === 'auto') {
-    // auto 模式下静默跳过澄清，不显示 toast
+  if (store.appState?.interactionMode === 'auto') {
+    addToast('info', '自动模式已跳过澄清并继续执行');
     vscode.postMessage({
       type: 'answerClarification',
       answers: null,
@@ -1171,7 +1301,8 @@ function handleClarificationRequest(message: WebviewMessage) {
 
 function handleWorkerQuestionRequest(message: WebviewMessage) {
   const store = getState();
-  if (store.interactionMode === 'auto') {
+  if (store.appState?.interactionMode === 'auto') {
+    addToast('info', '自动处理 Worker 提问：未提供答案，按默认策略继续');
     vscode.postMessage({ type: 'answerWorkerQuestion', answer: null });
     setIsProcessing(true);
     return;
@@ -1187,12 +1318,37 @@ function handleWorkerQuestionRequest(message: WebviewMessage) {
 
 function handleToolAuthorizationRequest(message: WebviewMessage) {
   const store = getState();
-  if (store.interactionMode === 'auto') {
-    vscode.postMessage({ type: 'toolAuthorizationResponse', allowed: true });
+  const requestId = typeof message.requestId === 'string' && message.requestId.trim().length > 0
+    ? message.requestId.trim()
+    : '';
+  if (!requestId) {
+    console.error('[MessageHandler] toolAuthorizationRequest 缺少 requestId:', message);
+    addToast('error', '工具授权请求缺少标识，已忽略该请求');
+    return;
+  }
+
+  if (store.appState?.interactionMode === 'auto') {
+    addToast('info', '自动模式已自动授权工具调用并继续');
+    vscode.postMessage({ type: 'toolAuthorizationResponse', requestId, allowed: true });
+    clearRequestedInteractionMode();
     setIsProcessing(true);
     return;
   }
+
+  // ask 模式下若已有交互弹窗，按规范拒绝并提示，避免覆盖当前待处理请求
+  if (getActiveInteractionType()) {
+    console.warn('[MessageHandler] toolAuthorizationRequest 与现有交互冲突，自动拒绝:', {
+      requestId,
+      activeInteraction: getActiveInteractionType(),
+    });
+    vscode.postMessage({ type: 'toolAuthorizationResponse', requestId, allowed: false });
+    addToast('warning', '当前有待处理交互，已自动拒绝本次工具授权请求');
+    return;
+  }
+
+  clearPendingInteractions();
   store.pendingToolAuthorization = {
+    requestId,
     toolName: (message.toolName as string) || '',
     toolArgs: message.toolArgs,
   };
@@ -1442,7 +1598,7 @@ function mapStandardMessage(standard: StandardMessage): Message {
 
   const dispatchToWorker = Boolean(baseMetadata.dispatchToWorker);
 
-  // 方案 B：role 字段仅用于系统消息兼容，用户消息通过 type 判断
+  // role 字段仅用于系统消息，用户消息通过 type 判断
   const resolvedRole: 'user' | 'assistant' | 'system' =
     isSystemNotice ? 'system' : 'assistant';
 

@@ -4,7 +4,7 @@
  * 实现文件摘要的缓存机制，减少 Worker 重复读取同一文件
  * 缓存 key 格式: `${filePath}::${fileHash}`
  *
- * 设计参考：docs/context-unified-memory-plan.md 5.2 节和 8.1 节
+ * 设计参考：docs/context/unified-memory-plan.md 5.2 节和 8.1 节
  */
 
 // ============================================================================

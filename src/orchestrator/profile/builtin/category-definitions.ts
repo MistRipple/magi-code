@@ -185,7 +185,7 @@ export const CATEGORY_DEFINITIONS: Record<string, CategoryDefinition> = {
       '跨模块|跨端',
     ],
     guidance: {
-      focus: ['接口兼容', '错误处理', '联调测试'],
+      focus: ['接口一致性', '错误处理', '联调测试'],
       constraints: ['确认接口契约', '做好回滚准备'],
     },
     priority: 'high',

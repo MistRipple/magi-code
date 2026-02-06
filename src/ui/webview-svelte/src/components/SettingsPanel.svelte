@@ -7,7 +7,7 @@
   import Icon from './Icon.svelte';
   import Toggle from './Toggle.svelte';
   import { getState } from '../stores/messages.svelte';
-  import type { ModelStatus } from '../types/message';
+
 
   interface Props {
     onClose?: () => void;
@@ -238,7 +238,7 @@
     auth_failed: '鉴权失败',
     network_error: '网络错误',
     timeout: '连接超时',
-    fallback: '已降级（编排者）'
+    orchestrator: '使用编排者模型'
   };
 
   const categoryLabels: Record<string, string> = {
@@ -261,7 +261,7 @@
   function getStatusClass(status: string): string {
     if (status === 'available' || status === 'connected') return 'success';
     if (status === 'checking') return 'checking';
-    if (status === 'fallback') return 'warning';
+    if (status === 'orchestrator') return 'warning';
     if (status === 'disabled' || status === 'not_configured') return 'disabled';
     if (status === 'error' || status === 'unavailable' || status === 'invalid_model' || status === 'auth_failed' || status === 'network_error' || status === 'timeout') {
       return 'error';
@@ -958,12 +958,12 @@
           };
           testStatus.comp = 'success';
         } else {
-          const fallbackModel = payload?.fallbackModel || modelStatuses.orchestrator?.model;
+          const orchestratorModel = payload?.orchestratorModel || modelStatuses.orchestrator?.model;
           appState.modelStatus = {
             ...appState.modelStatus,
             compressor: {
-              status: 'fallback',
-              model: fallbackModel ? `编排模型: ${fallbackModel}` : modelStatuses.compressor?.model,
+              status: 'orchestrator',
+              model: orchestratorModel ? `编排模型: ${orchestratorModel}` : modelStatuses.compressor?.model,
               error: payload?.error
             }
           };

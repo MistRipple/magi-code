@@ -8,13 +8,13 @@
  */
 
 import { WorkerSlot } from '../../types';
+import type { UnifiedTodo } from '../../todo/types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { AssignmentResolver } from '../profile/assignment-resolver';
 import { WorkerProfile } from '../profile/types';
 import {
   Mission,
   Assignment,
-  WorkerTodo,
   PlanIssue,
   PlanReviewResult,
   ReviewLevel,
@@ -95,7 +95,7 @@ export class ProfileAwareReviewer {
    * 评审单个 Todo
    */
   private reviewTodo(
-    todo: WorkerTodo,
+    todo: UnifiedTodo,
     assignment: Assignment,
     profile: WorkerProfile
   ): PlanIssue[] {
@@ -196,7 +196,7 @@ export class ProfileAwareReviewer {
    * 评审 Todo 执行结果
    */
   async reviewTodoOutput(
-    todo: WorkerTodo,
+    todo: UnifiedTodo,
     assignment: Assignment
   ): Promise<PlanReviewResult> {
     const executor = assignment.workerId;

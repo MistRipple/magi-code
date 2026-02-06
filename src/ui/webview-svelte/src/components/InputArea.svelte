@@ -1,7 +1,15 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
-  import { addToast, getActiveInteractionType, messagesState } from '../stores/messages.svelte';
+  import {
+    addToast,
+    getActiveInteractionType,
+    getInteractionMode,
+    getRequestedInteractionMode,
+    isInteractionModeSyncing,
+    requestInteractionMode,
+    messagesState,
+  } from '../stores/messages.svelte';
   import type { StandardMessage } from '../../../../protocol/message-protocol';
   import { MessageCategory } from '../../../../protocol/message-protocol';
   import Icon from './Icon.svelte';
@@ -12,7 +20,9 @@
 
   // 模式和模型选择
   let selectedModel = $state('');
-  let interactionMode = $state<'ask' | 'auto'>('auto');
+  const interactionMode = $derived.by(() => getInteractionMode());
+  const requestedInteractionMode = $derived.by(() => getRequestedInteractionMode());
+  const isModeSyncing = $derived.by(() => isInteractionModeSyncing());
 
   // 拖动调整大小相关
   let inputHeight = $state(120); // 默认高度增加到 120px
@@ -34,7 +44,12 @@
   const MAX_INPUT_CHARS = 10000;
 
   // P0-2: 按钮双态状态 - 使用 $derived 计算
-  const hasContent = $derived(inputValue.trim().length > 0 || selectedImages.length > 0);
+  const hasContent = $derived.by(() => {
+    if (inputValue.trim().length > 0) return true;
+    // 执行中补充指令不支持图片，避免“有内容可发送”与实际能力不一致
+    if (isSending) return false;
+    return selectedImages.length > 0;
+  });
   const showStopButton = $derived(isSending && !hasContent);
 
   // P1-1: 限频机制 - 执行中 1 秒/条，空闲 300ms/条
@@ -43,11 +58,16 @@
   const RATE_LIMIT_PROCESSING = 1000;  // 执行中：1 秒
 
   // 发送消息（支持图片附件）
-  // P0-1/P0-2: 执行中仍可发送补充指令，不再用 isSending 阻止
+  // 执行中发送输入 = 打断当前执行并按新输入重新开始
   function sendMessage() {
+    if (isModeSyncing) {
+      addToast('warning', '交互模式切换尚未完成，请稍候再发送');
+      return;
+    }
+
     const content = inputValue.trim();
     // 允许只发送图片（无文字）或只发送文字
-    // 🔧 移除 isSending 检查：执行中仍可输入发送新消息（补充指令）
+    // 执行中允许发送，后端将执行“打断并重启”
     if ((!content && selectedImages.length === 0) || isInteractionBlocking) return;
 
     // P1-1: 限频检查
@@ -64,10 +84,10 @@
       return;
     }
 
-    // P0-3: 根据是否正在执行，区分发送新任务还是补充指令
+    // 根据是否正在执行，区分发送新任务还是打断重启
     if (isSending) {
-      // 执行中：发送补充指令
-      // 注意：补充指令暂不支持图片
+      // 执行中：发送重启输入（后端立即中断并重启）
+      // 注意：执行中暂不支持图片
       if (selectedImages.length > 0) {
         addToast('warning', '执行中暂不支持发送图片，请先停止当前任务');
         return;
@@ -118,7 +138,11 @@
 
   // 切换模式
   function setMode(mode: 'ask' | 'auto') {
-    interactionMode = mode;
+    if (isModeSyncing && requestedInteractionMode === mode) {
+      return;
+    }
+    requestInteractionMode(mode);
+    vscode.postMessage({ type: 'setInteractionMode', mode });
   }
 
   // 拖动调整大小
@@ -280,16 +304,22 @@
         </select>
 
         <!-- 模式切换 -->
-        <div class="mode-toggle">
+        <div class="mode-toggle" class:syncing={isModeSyncing}>
           <button
             class="mode-toggle-option"
             class:active={interactionMode === 'ask'}
+            class:pending={requestedInteractionMode === 'ask' && isModeSyncing}
             onclick={() => setMode('ask')}
+            disabled={isModeSyncing && requestedInteractionMode !== 'ask'}
+            title={isModeSyncing && requestedInteractionMode === 'ask' ? '正在切换到 Ask…' : 'Ask'}
           >Ask</button>
           <button
             class="mode-toggle-option"
             class:active={interactionMode === 'auto'}
+            class:pending={requestedInteractionMode === 'auto' && isModeSyncing}
             onclick={() => setMode('auto')}
+            disabled={isModeSyncing && requestedInteractionMode !== 'auto'}
+            title={isModeSyncing && requestedInteractionMode === 'auto' ? '正在切换到 Auto…' : 'Auto'}
           >Auto</button>
         </div>
       </div>
@@ -309,8 +339,8 @@
           <span class="enhance-text">{isEnhancing ? '增强中...' : '增强'}</span>
         </button>
 
-        <!-- P0-2: 按钮双态逻辑 -->
-        <!-- 执行中有内容=发送（补充指令），执行中无内容=停止 -->
+        <!-- 按钮双态逻辑 -->
+        <!-- 执行中有内容=发送（打断重启），执行中无内容=停止 -->
         <!-- 空闲时始终显示发送按钮 -->
         {#if showStopButton}
           <button class="send-btn stop" onclick={stopTask} title="停止">
@@ -319,10 +349,12 @@
         {:else}
           <button
             class="send-btn"
-            class:ready={hasContent && !isInteractionBlocking}
+            class:ready={hasContent && !isInteractionBlocking && !isModeSyncing}
             onclick={sendMessage}
-            disabled={!hasContent || isInteractionBlocking}
-            title={isInteractionBlocking ? `等待处理：${activeInteraction}` : (isSending ? '发送补充指令 (Cmd+Enter)' : '发送 (Cmd+Enter)')}
+            disabled={!hasContent || isInteractionBlocking || isModeSyncing}
+            title={isModeSyncing
+              ? '交互模式切换中，请稍候'
+              : (isInteractionBlocking ? `等待处理：${activeInteraction}` : (isSending ? '打断并重启执行 (Cmd+Enter)' : '发送 (Cmd+Enter)'))}
           >
             <Icon name="send" size={14} />
           </button>
@@ -447,8 +479,28 @@
     cursor: pointer;
     transition: all var(--transition-fast);
   }
+  .mode-toggle.syncing {
+    border-color: var(--warning);
+  }
   .mode-toggle-option.active { background: var(--primary); color: white; }
-  .mode-toggle-option:hover:not(.active) { background: var(--surface-hover); color: var(--foreground); }
+  .mode-toggle-option.pending {
+    position: relative;
+    background: color-mix(in srgb, var(--warning) 22%, transparent);
+    color: var(--warning);
+  }
+  .mode-toggle-option.pending::after {
+    content: '';
+    position: absolute;
+    right: 4px;
+    top: 50%;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: currentColor;
+    transform: translateY(-50%);
+  }
+  .mode-toggle-option:hover:not(.active):not(:disabled) { background: var(--surface-hover); color: var(--foreground); }
+  .mode-toggle-option:disabled { opacity: 0.6; cursor: not-allowed; }
 
   /* 增强按钮 - 统一高度 28px */
   .enhance-btn {

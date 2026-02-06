@@ -396,7 +396,7 @@ export class UnifiedLogger extends EventEmitter {
       return level >= categoryLevel;
     }
 
-    // 回退到全局级别
+    // 使用全局级别
     return level >= this.config.level;
   }
 

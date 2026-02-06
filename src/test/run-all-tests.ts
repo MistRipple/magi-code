@@ -12,22 +12,51 @@ import { EndToEndEngineer } from './engineers/end-to-end-engineer';
 import { IntentClassificationE2EEngineer } from './engineers/intent-classification-e2e';
 import { MessageHubE2EEngineer } from './engineers/message-hub-e2e-engineer';
 
-async function main() {
-  console.log('========================================');
-  console.log('MultiCLI 全方位测试系统');
-  console.log('========================================');
-  console.log('模拟多个代理工程师协作进行全面测试\n');
-  
-  // 创建测试指挥中心
-  const commandCenter = new TestCommandCenter();
-  
-  // 注册所有测试工程师
+type TestMode = 'quick' | 'full' | 'unit' | 'e2e';
+
+function resolveTestMode(rawMode: string | undefined): TestMode {
+  const mode = (rawMode ?? 'quick').toLowerCase();
+  if (mode === 'quick' || mode === 'full' || mode === 'unit' || mode === 'e2e') {
+    return mode;
+  }
+  return 'quick';
+}
+
+function registerEngineersByMode(commandCenter: TestCommandCenter, mode: TestMode): void {
+  if (mode === 'unit') {
+    commandCenter.registerEngineer(new StateManagementEngineer());
+    commandCenter.registerEngineer(new MessageRoutingEngineer());
+    commandCenter.registerEngineer(new UIInteractionEngineer());
+    return;
+  }
+
   commandCenter.registerEngineer(new StateManagementEngineer());
   commandCenter.registerEngineer(new MessageRoutingEngineer());
   commandCenter.registerEngineer(new UIInteractionEngineer());
   commandCenter.registerEngineer(new EndToEndEngineer());
+
+  if (mode === 'quick') {
+    return;
+  }
+
   commandCenter.registerEngineer(new IntentClassificationE2EEngineer());
   commandCenter.registerEngineer(new MessageHubE2EEngineer());
+}
+
+async function main() {
+  const mode = resolveTestMode(process.argv[2]);
+
+  console.log('========================================');
+  console.log('MultiCLI 全方位测试系统');
+  console.log('========================================');
+  console.log('模拟多个代理工程师协作进行全面测试\n');
+  console.log(`测试模式: ${mode}\n`);
+  
+  // 创建测试指挥中心
+  const commandCenter = new TestCommandCenter();
+  
+  // 按模式注册测试工程师
+  registerEngineersByMode(commandCenter, mode);
   
   // 执行所有测试
   await commandCenter.runAllTests();

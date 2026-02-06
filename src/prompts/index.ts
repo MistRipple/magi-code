@@ -12,10 +12,6 @@
  * │  Worker (子代理)                                             │
  * │  ├── System Prompt: worker-system.ts (~150 tokens)          │
  * │  └── Task Prompts: 动态生成 (buildWorkerTaskPrompt)          │
- * ├─────────────────────────────────────────────────────────────┤
- * │  AURA 协议 (可选，用于外部 AI 集成)                           │
- * │  ├── Lite: ~450 tokens                                       │
- * │  └── Full: ~1100 tokens                                      │
  * └─────────────────────────────────────────────────────────────┘
  */
 
@@ -32,21 +28,12 @@ export {
   buildWorkerTaskPrompt,
 } from './worker-system';
 
-// AURA 协议（可选）
-export {
-  AURA_PROTOCOL_LITE,
-  AURA_PROTOCOL_FULL,
-  buildSystemPrompt as buildAuraSystemPrompt,
-} from './aura-protocol';
-
 /**
  * Prompt Token 估算
  */
 export const PROMPT_TOKEN_ESTIMATES = {
   orchestratorSystem: 300,
   workerSystem: 150,
-  auraLite: 450,
-  auraFull: 1100,
 } as const;
 
 /**

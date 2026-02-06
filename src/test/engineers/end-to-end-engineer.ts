@@ -193,13 +193,38 @@ class EndToEndEngineer implements TestEngineer {
 
     class MockAdapterFactory extends EventEmitter {
       private connected = new Set<WorkerSlot>(['claude', 'codex', 'gemini']);
+      private toolManager = {
+        setPermissions: (_permissions: any) => {
+          // Mock 仅用于通过权限同步链路，不执行真实权限控制
+        },
+      };
       public orchestratorCalls = 0;
       public workerCalls = 0;
+
+      async clearAdapter(_agent: any): Promise<void> {}
+      getMCPExecutor(): any { return null; }
+      async reloadMCP(): Promise<void> {}
+      async reloadSkills(): Promise<void> {}
+      refreshUserRules(): void {}
 
       async sendMessage(agent: any, message: string): Promise<any> {
         if (agent === 'orchestrator') {
           this.orchestratorCalls += 1;
-          if (message.includes('意图类型定义') && message.includes('recommendedMode')) {
+          const isIntentPrompt =
+            message.includes('现在需要判断用户的请求属于哪种类型') &&
+            message.includes('recommendedMode');
+          const isRequirementAnalysisPrompt =
+            message.includes('完成需求分析') &&
+            message.includes('"goal"') &&
+            message.includes('"needsWorker"');
+          const isLegacyRequirementPrompt = message.includes('分析以下用户请求，提取');
+          const isWorkerNeedPrompt =
+            message.includes('完成意图到分配的统一决策') ||
+            (message.includes('needsWorker') && message.includes('directResponse'));
+          const isTaskPreAnalyzePrompt =
+            message.includes('分析以下任务') && message.includes('complexity');
+
+          if (isIntentPrompt) {
             return {
               content: JSON.stringify({
                 intent: 'task',
@@ -212,7 +237,7 @@ class EndToEndEngineer implements TestEngineer {
               done: true,
             };
           }
-          if (message.includes('分析以下用户请求，提取')) {
+          if (isRequirementAnalysisPrompt || isLegacyRequirementPrompt) {
             return {
               content: JSON.stringify({
                 goal: '生成登录流程图',
@@ -221,11 +246,18 @@ class EndToEndEngineer implements TestEngineer {
                 acceptanceCriteria: ['输出清晰流程图'],
                 riskLevel: 'low',
                 riskFactors: [],
+                needsWorker: true,
+                directResponse: '',
+                delegationBriefings: ['生成登录流程图，输出 markdown'],
+                executionMode: 'direct',
+                needsTooling: false,
+                requiresModification: false,
+                reason: '需要规划并交由 worker 执行',
               }),
               done: true,
             };
           }
-          if (message.includes('needsWorker') && message.includes('directResponse')) {
+          if (isWorkerNeedPrompt) {
             return {
               content: JSON.stringify({
                 needsWorker: true,
@@ -241,7 +273,7 @@ class EndToEndEngineer implements TestEngineer {
             };
           }
           // TaskPreAnalyzer 分析 prompt
-          if (message.includes('分析以下任务') && message.includes('complexity')) {
+          if (isTaskPreAnalyzePrompt) {
             return {
               content: JSON.stringify({
                 complexity: 'simple',
@@ -255,15 +287,7 @@ class EndToEndEngineer implements TestEngineer {
               done: true,
             };
           }
-          // 兜底响应：返回有效 JSON 而非纯文本
-          return {
-            content: JSON.stringify({
-              status: 'ok',
-              message: '编排者响应',
-              fallback: true,
-            }),
-            done: true,
-          };
+          throw new Error(`MockAdapterFactory 未匹配到预期 orchestrator prompt: ${message.slice(0, 120)}`);
         }
 
         this.workerCalls += 1;
@@ -277,8 +301,9 @@ class EndToEndEngineer implements TestEngineer {
         };
       }
 
-      async interrupt(): Promise<void> {}
+      async interrupt(_agent?: any): Promise<void> {}
       async shutdown(): Promise<void> {}
+      getToolManager(): any { return this.toolManager; }
       isConnected(agent: any): boolean {
         if (agent === 'orchestrator') return true;
         return this.connected.has(agent as WorkerSlot);
@@ -300,52 +325,115 @@ class EndToEndEngineer implements TestEngineer {
     const originalHome = process.env.HOME;
     const originalUserProfile = process.env.USERPROFILE;
     const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'multicli-e2e-'));
-    process.env.HOME = tmpHome;
-    process.env.USERPROFILE = tmpHome;
 
     const Module = require('module');
     const originalRequire = Module.prototype.require;
     const vscodeMock = require('../e2e/vscode-mock');
-    Module.prototype.require = function(id: string) {
-      if (id === 'vscode') {
-        return vscodeMock;
-      }
-      return originalRequire.apply(this, arguments);
-    };
 
-    const { MissionDrivenEngine } = require('../../orchestrator/core');
-    const { SnapshotManager } = require('../../snapshot-manager');
-    const { UnifiedSessionManager } = require('../../session');
-
-    const sessionManager = new UnifiedSessionManager(workspaceRoot);
-    const snapshotManager = new SnapshotManager(sessionManager, workspaceRoot);
-    const orchestrator = new MissionDrivenEngine(
-      adapterFactory as any,
-      {
-        timeout: 300000,
-        maxRetries: 1,
-        strategy: { enableVerification: false, enableRecovery: false, autoRollbackOnFailure: false },
-        verification: { compileCheck: false, lintCheck: false, testCheck: false },
-        planReview: { enabled: false },
-        integration: { enabled: false },
-        review: { selfCheck: false, peerReview: 'never', maxRounds: 0 },
-      },
-      workspaceRoot,
-      snapshotManager,
-      sessionManager
-    );
-
-    orchestrator.setConfirmationCallback(async () => true);
-    orchestrator.setQuestionCallback(async (questions: string[]) => questions.join('\n'));
-    orchestrator.setClarificationCallback(async (questions: string[]) => {
-      const answers: Record<string, string> = {};
-      questions.forEach((q: string) => { answers[q] = '默认处理'; });
-      return { answers, additionalInfo: '' };
-    });
+    let orchestrator: import('../../orchestrator/core').MissionDrivenEngine | null = null;
 
     try {
-      await orchestrator.initialize();
-      const result = await orchestrator.execute('给我一个登录流程图，写成 markdown', 'task-real-workflow');
+      process.env.HOME = tmpHome;
+      process.env.USERPROFILE = tmpHome;
+      Module.prototype.require = function(id: string) {
+        if (id === 'vscode') {
+          return vscodeMock;
+        }
+        return originalRequire.apply(this, arguments);
+      };
+
+      const { MissionDrivenEngine } = require('../../orchestrator/core');
+      const { SnapshotManager } = require('../../snapshot-manager');
+      const { UnifiedSessionManager } = require('../../session');
+
+      const sessionManager = new UnifiedSessionManager(workspaceRoot);
+      const snapshotManager = new SnapshotManager(sessionManager, workspaceRoot);
+      orchestrator = new MissionDrivenEngine(
+        adapterFactory as any,
+        {
+          timeout: 300000,
+          maxRetries: 1,
+          strategy: { enableVerification: false, enableRecovery: false, autoRollbackOnFailure: false },
+          verification: { compileCheck: false, lintCheck: false, testCheck: false },
+          planReview: { enabled: false },
+          integration: { enabled: false },
+          review: { selfCheck: false, peerReview: 'never', maxRounds: 0 },
+        },
+        workspaceRoot,
+        snapshotManager,
+        sessionManager
+      );
+
+      if (!orchestrator) {
+        throw new Error('MissionDrivenEngine 初始化失败');
+      }
+      const orchestratorEngine = orchestrator;
+
+      orchestratorEngine.setConfirmationCallback(async () => true);
+      orchestratorEngine.setQuestionCallback(async (questions: string[]) => questions.join('\n'));
+      orchestratorEngine.setClarificationCallback(async (questions: string[]) => {
+        const answers: Record<string, string> = {};
+        questions.forEach((q: string) => { answers[q] = '默认处理'; });
+        return { answers, additionalInfo: '' };
+      });
+      orchestratorEngine.setWorkerQuestionCallback(async () => '按默认方案继续');
+
+      await orchestratorEngine.initialize();
+
+      const executionTimeoutMs = 120000;
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
+      const executionPromise = orchestratorEngine.execute('给我一个登录流程图，写成 markdown', 'task-real-workflow');
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error(`真实工作流执行超时（>${executionTimeoutMs}ms）`));
+        }, executionTimeoutMs);
+      });
+
+      let result = '';
+      try {
+        result = await Promise.race([executionPromise, timeoutPromise]);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes('真实工作流执行超时')) {
+          const interruptTimeoutMs = 10000;
+          let interruptTimer: ReturnType<typeof setTimeout> | null = null;
+          let interruptResult: 'completed' | 'timeout' = 'completed';
+          try {
+            interruptResult = await Promise.race([
+              orchestratorEngine.interrupt().then(() => 'completed' as const),
+              new Promise<'timeout'>(resolve => {
+                interruptTimer = setTimeout(() => resolve('timeout'), interruptTimeoutMs);
+              }),
+            ]);
+          } catch (interruptError: any) {
+            issues.push({
+              severity: 'high',
+              category: '真实工作流',
+              description: `超时后中断执行异常: ${interruptError?.message || String(interruptError)}`,
+              suggestedFix: '检查 interrupt 链路中的异常传播与资源释放',
+            });
+          } finally {
+            if (interruptTimer) {
+              clearTimeout(interruptTimer);
+              interruptTimer = null;
+            }
+          }
+          if (interruptResult === 'timeout') {
+            issues.push({
+              severity: 'high',
+              category: '真实工作流',
+              description: `超时后中断未在 ${interruptTimeoutMs}ms 内完成`,
+              suggestedFix: '检查 interrupt 链路中的阻塞点与未释放句柄',
+            });
+          }
+        }
+        throw error;
+      } finally {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+      }
 
       if (!result || typeof result !== 'string') {
         issues.push({
@@ -373,30 +461,47 @@ class EndToEndEngineer implements TestEngineer {
         suggestedFix: '检查编排执行路径和 mock LLM 响应格式',
       });
     } finally {
+      Module.prototype.require = originalRequire;
       // 恢复原始环境变量
-      if (originalHome !== undefined) {
+      if (originalHome === undefined) {
+        delete process.env.HOME;
+      } else {
         process.env.HOME = originalHome;
       }
-      if (originalUserProfile !== undefined) {
+      if (originalUserProfile === undefined) {
+        delete process.env.USERPROFILE;
+      } else {
         process.env.USERPROFILE = originalUserProfile;
       }
-      Module.prototype.require = originalRequire;
       try {
-        const missionOrchestrator = (orchestrator as any)?.missionOrchestrator;
-        const workers = missionOrchestrator?.workers;
-        if (workers && typeof workers.values === 'function') {
-          for (const worker of workers.values()) {
-            const sessionManager = worker?.getSessionManager?.();
-            sessionManager?.stopAutoCleanup?.();
-          }
-        }
-      } catch {
-        // ignore
+        orchestrator?.dispose();
+      } catch (disposeError: any) {
+        issues.push({
+          severity: 'medium',
+          category: '真实工作流',
+          description: `编排器释放异常: ${disposeError?.message || String(disposeError)}`,
+          suggestedFix: '检查 MissionDrivenEngine.dispose 资源释放链路',
+        });
       }
       try {
         await adapterFactory.shutdown();
-      } catch {
-        // ignore
+      } catch (shutdownError: any) {
+        issues.push({
+          severity: 'medium',
+          category: '真实工作流',
+          description: `AdapterFactory 关闭异常: ${shutdownError?.message || String(shutdownError)}`,
+          suggestedFix: '检查适配器会话关闭流程和残留连接',
+        });
+      }
+      try {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      } catch (cleanupError: any) {
+        issues.push({
+          severity: 'low',
+          category: '真实工作流',
+          description: `清理临时目录失败: ${cleanupError?.message || String(cleanupError)}`,
+          suggestedFix: '检查临时目录权限与占用句柄',
+        });
       }
     }
 

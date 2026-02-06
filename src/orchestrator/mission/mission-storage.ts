@@ -5,11 +5,11 @@
  */
 
 import { EventEmitter } from 'events';
+import type { UnifiedTodo } from '../../todo/types';
 import {
   Mission,
   Contract,
   Assignment,
-  WorkerTodo,
   MissionStatus,
   CreateMissionParams,
 } from './types';
@@ -229,7 +229,7 @@ export class MissionStorageManager extends EventEmitter {
   /**
    * 更新 Assignment 中的 Todo
    */
-  async updateTodo(missionId: string, assignmentId: string, todo: WorkerTodo): Promise<void> {
+  async updateTodo(missionId: string, assignmentId: string, todo: UnifiedTodo): Promise<void> {
     const mission = await this.load(missionId);
     if (!mission) {
       throw new Error(`Mission not found: ${missionId}`);

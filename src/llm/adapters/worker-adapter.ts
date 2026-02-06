@@ -438,9 +438,9 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    * 获取默认系统提示
    */
   private getDefaultSystemPrompt(): string {
-    return `You are a helpful AI assistant specialized in software development.
-You have access to various tools to help complete tasks.
-Always think step by step and use tools when appropriate.`;
+    return `你是一个专业的软件开发助手。
+你可以使用系统提供的工具来完成任务。
+请逐步思考，在适当时使用工具。`;
   }
 
   /**

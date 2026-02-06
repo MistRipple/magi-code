@@ -15,9 +15,9 @@ import type {
   Mission,
   Contract,
   Assignment,
-  WorkerTodo,
   ContractViolation,
 } from '../orchestrator/mission/types';
+import type { UnifiedTodo } from '../todo/types';
 import type { WorkerSlot } from '../types';
 
 /**
@@ -110,7 +110,7 @@ function createTestAssignment(id: string, missionId: string, workerId: WorkerSlo
 /**
  * 创建测试 Todo
  */
-function createTestTodo(id: string, assignmentId: string, outOfScope = false): WorkerTodo {
+function createTestTodo(id: string, assignmentId: string, outOfScope = false): UnifiedTodo {
   return {
     id,
     missionId: 'test-mission',
@@ -307,7 +307,7 @@ async function runTests(): Promise<void> {
     assignment = assignmentManager.addTodo(assignment, todo2);
 
     // 完成第一个 Todo
-    const completedTodo1: WorkerTodo = { ...assignment.todos[0], status: 'completed' };
+    const completedTodo1: UnifiedTodo = { ...assignment.todos[0], status: 'completed' };
     assignment = assignmentManager.updateTodo(assignment, completedTodo1);
 
     if (assignment.progress !== 50) {
@@ -315,7 +315,7 @@ async function runTests(): Promise<void> {
     }
 
     // 完成第二个 Todo
-    const completedTodo2: WorkerTodo = { ...assignment.todos[1], status: 'completed' };
+    const completedTodo2: UnifiedTodo = { ...assignment.todos[1], status: 'completed' };
     assignment = assignmentManager.updateTodo(assignment, completedTodo2);
 
     if (assignment.progress !== 100) {
@@ -387,7 +387,7 @@ async function runTests(): Promise<void> {
     }
 
     // 完成 todo-1
-    const completedTodo1: WorkerTodo = { ...assignment.todos[0], status: 'completed' };
+    const completedTodo1: UnifiedTodo = { ...assignment.todos[0], status: 'completed' };
     assignment = assignmentManager.updateTodo(assignment, completedTodo1);
 
     // 现在 todo-2 应该可执行
@@ -416,7 +416,7 @@ async function runTests(): Promise<void> {
     }
 
     // 手动审批
-    const approvedTodo: WorkerTodo = {
+    const approvedTodo: UnifiedTodo = {
       ...assignment.todos[0],
       approvalStatus: 'approved',
     };
@@ -449,7 +449,7 @@ async function runTests(): Promise<void> {
     }
 
     // 完成一个
-    const completedTodo1: WorkerTodo = { ...assignment.todos[0], status: 'completed' };
+    const completedTodo1: UnifiedTodo = { ...assignment.todos[0], status: 'completed' };
     assignment = assignmentManager.updateTodo(assignment, completedTodo1);
 
     if (assignmentManager.isAssignmentComplete(assignment)) {
@@ -457,7 +457,7 @@ async function runTests(): Promise<void> {
     }
 
     // 跳过另一个
-    const skippedTodo2: WorkerTodo = { ...assignment.todos[1], status: 'skipped' };
+    const skippedTodo2: UnifiedTodo = { ...assignment.todos[1], status: 'skipped' };
     assignment = assignmentManager.updateTodo(assignment, skippedTodo2);
 
     if (!assignmentManager.isAssignmentComplete(assignment)) {

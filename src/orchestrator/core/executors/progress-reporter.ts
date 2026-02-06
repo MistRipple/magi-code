@@ -10,7 +10,8 @@
 import { EventEmitter } from 'events';
 import { WorkerSlot } from '../../../types';
 import { TokenUsage } from '../../../types/agent-types';
-import { Mission, Assignment, WorkerTodo } from '../../mission';
+import { Mission, Assignment } from '../../mission';
+import type { UnifiedTodo } from '../../../todo/types';
 
 /**
  * 执行进度
@@ -74,7 +75,7 @@ export class ProgressReporter extends EventEmitter {
    */
   reportAssignmentComplete(
     assignment: Assignment,
-    completedTodos: WorkerTodo[],
+    completedTodos: UnifiedTodo[],
     tokenUsage?: TokenUsage
   ): void {
     this.completedAssignments++;
@@ -90,7 +91,7 @@ export class ProgressReporter extends EventEmitter {
   /**
    * 报告 Todo 完成
    */
-  reportTodoComplete(todo: WorkerTodo, tokenUsage?: TokenUsage): void {
+  reportTodoComplete(todo: UnifiedTodo, tokenUsage?: TokenUsage): void {
     this.completedTodos++;
 
     if (tokenUsage) {

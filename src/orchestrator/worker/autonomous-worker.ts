@@ -12,6 +12,7 @@
 import { EventEmitter } from 'events';
 import * as fs from 'fs/promises';
 import * as crypto from 'crypto';
+import * as path from 'path';
 import { WorkerSlot, SubTask } from '../../types';
 import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import { AdapterOutputScope } from '../../adapters/adapter-factory-interface';
@@ -43,7 +44,6 @@ import {
 import {
   WorkerSessionManager,
   WorkerSession,
-  ConversationMessage,
 } from './worker-session';
 import { logger, LogCategory } from '../../logging';
 // 共享上下文与文件摘要缓存模块
@@ -54,8 +54,6 @@ import {
   FileSummary,
   ContextSource,
   AssembledContext,
-  DEFAULT_TOKEN_BUDGET,
-  generateSharedContextId,
   createSharedContextEntry,
 } from '../../context';
 
@@ -184,6 +182,16 @@ export class AutonomousWorker extends EventEmitter {
   private sharedContextPool: ISharedContextPool;
   /** 当前 Mission ID（用于写入共享上下文） */
   private currentMissionId?: string;
+  /** 当前 Assignment 的缓存读取统计（用于质量门禁） */
+  private cacheReadStats: {
+    lookups: number;
+    cacheHits: number;
+    cacheMisses: number;
+  } = {
+    lookups: 0,
+    cacheHits: 0,
+    cacheMisses: 0,
+  };
 
   constructor(
     private workerType: WorkerSlot,
@@ -285,6 +293,7 @@ export class AutonomousWorker extends EventEmitter {
 
     // 设置当前 Mission ID（用于共享上下文写入） - 提案 9.2
     this.currentMissionId = assignment.missionId;
+    this.resetCacheReadStats();
 
     // 组装共享上下文 - 提案 9.2（强制依赖已保证可用）
     // 从 scope.includes 提取标签，如果没有则使用空数组
@@ -378,7 +387,7 @@ export class AutonomousWorker extends EventEmitter {
         responsibility: assignment.responsibility.substring(0, 50),
       }, LogCategory.ORCHESTRATOR);
 
-      const directResult = await this.executeDirectly(assignment, options);
+      const directResult = await this.executeDirectly(assignment, options, sharedContext);
 
       // 构建结果
       const result: AutonomousExecutionResult = {
@@ -398,18 +407,21 @@ export class AutonomousWorker extends EventEmitter {
         directExecution: true, // 标记为直接执行模式
         directOutput: directResult.output, // 直接执行的输出
       };
+      const qualityCheckedResult = this.applyQualityGate(assignment, result, sharedContext, startTime);
 
       // 清理 Session
       this.currentSession = null;
-      if (result.success && session) {
+      this.currentMissionId = undefined;
+      this.resetCacheReadStats();
+      if (qualityCheckedResult.success && session) {
         logger.debug('Worker.Session.保留', { sessionId: session.id }, LogCategory.ORCHESTRATOR);
-      } else if (!result.success && session) {
-        logger.info('Worker.Session.失败保留', { sessionId: session.id, lastError: result.errors[0] }, LogCategory.ORCHESTRATOR);
+      } else if (!qualityCheckedResult.success && session) {
+        logger.info('Worker.Session.失败保留', { sessionId: session.id, lastError: qualityCheckedResult.errors[0] }, LogCategory.ORCHESTRATOR);
       }
 
-      this.emit('assignmentCompleted', result);
+      this.emit('assignmentCompleted', qualityCheckedResult);
 
-      return result;
+      return qualityCheckedResult;
     }
 
     // ========== Todo 循环模式（复杂任务） ==========
@@ -555,39 +567,42 @@ export class AutonomousWorker extends EventEmitter {
       sessionId: session?.id,
       hasPendingApprovals, // 返回 pendingApproval 状态
     };
+    const qualityCheckedResult = this.applyQualityGate(assignment, result, sharedContext, startTime);
 
     // 清理当前 Session 引用
     this.currentSession = null;
+    this.currentMissionId = undefined;
+    this.resetCacheReadStats();
 
     // 如果成功，可选择删除 Session；如果失败，保留以便恢复
-    if (success && session) {
+    if (qualityCheckedResult.success && session) {
       // 成功时可以选择保留 Session 一段时间，或者立即删除
       // 这里保留 Session，让它自然过期
       logger.debug('Worker.Session.保留', { sessionId: session.id }, LogCategory.ORCHESTRATOR);
-    } else if (!success && session) {
+    } else if (!qualityCheckedResult.success && session) {
       logger.info('Worker.Session.失败保留', {
         sessionId: session.id,
-        lastError: errors[0],
+        lastError: qualityCheckedResult.errors[0],
       }, LogCategory.ORCHESTRATOR);
     }
 
     // **最终汇报**: 向编排者汇报最终结果
     if (options.onReport) {
       const finalResult: WorkerResult = {
-        success,
+        success: qualityCheckedResult.success,
         modifiedFiles: completedTodos.flatMap(t => t.output?.modifiedFiles || []),
         createdFiles: [],
-        summary: success ? `完成 ${completedTodos.length} 个任务` : `失败 ${failedTodos.length} 个任务`,
-        totalDuration: result.totalDuration,
+        summary: qualityCheckedResult.success ? `完成 ${completedTodos.length} 个任务` : `失败 ${failedTodos.length} 个任务`,
+        totalDuration: qualityCheckedResult.totalDuration,
         tokenUsage: totalTokenUsage.inputTokens > 0 ? {
           inputTokens: totalTokenUsage.inputTokens,
           outputTokens: totalTokenUsage.outputTokens,
         } : undefined,
       };
 
-      const finalReport = success
+      const finalReport = qualityCheckedResult.success
         ? createCompletedReport(this.workerType, assignment.id, finalResult)
-        : createFailedReport(this.workerType, assignment.id, errors[0] || '执行失败', finalResult);
+        : createFailedReport(this.workerType, assignment.id, qualityCheckedResult.errors[0] || '执行失败', finalResult);
 
       try {
         await options.onReport(finalReport);
@@ -596,15 +611,15 @@ export class AutonomousWorker extends EventEmitter {
       }
     }
 
-    this.emit('assignmentCompleted', result);
+    this.emit('assignmentCompleted', qualityCheckedResult);
     logger.info('Worker.Assignment.完成', {
       assignmentId: assignment.id,
-      success,
+      success: qualityCheckedResult.success,
       completedCount: completedTodos.length,
       failedCount: failedTodos.length,
     }, LogCategory.ORCHESTRATOR);
 
-    return result;
+    return qualityCheckedResult;
   }
 
   /**
@@ -808,11 +823,20 @@ export class AutonomousWorker extends EventEmitter {
     try {
       // 构建执行 prompt（注入共享上下文） - 提案 9.2
       const profile = this.profileLoader.getProfile(this.workerType);
+      const extraTargets = this.extractTargetFiles(
+        `${todo.content}\n${todo.reasoning || ''}\n${todo.expectedOutput || ''}`
+      );
+      const targetFileContext = await this.buildTargetFileContext(
+        assignment,
+        options.workingDirectory,
+        extraTargets
+      );
       const executionPrompt = this.buildExecutionPrompt(
         todo,
         assignment,
         options.projectContext,
-        sharedContext
+        sharedContext,
+        targetFileContext
       );
 
       // 生成自检引导
@@ -842,6 +866,7 @@ export class AutonomousWorker extends EventEmitter {
       todo.status = 'completed';
       todo.completedAt = Date.now();
       todo.output = todoOutput;
+      await this.writeInsight(this.buildSuccessInsight(assignment, output.summary, output.modifiedFiles || [], todo));
 
       this.emit('todoCompleted', {
         assignmentId: assignment.id,
@@ -870,6 +895,7 @@ export class AutonomousWorker extends EventEmitter {
         error: errorMessage,
         duration: Date.now() - startTime,
       };
+      await this.writeInsight(this.buildFailureInsight(assignment, errorMessage, todo));
 
       this.emit('todoFailed', {
         assignmentId: assignment.id,
@@ -892,33 +918,15 @@ export class AutonomousWorker extends EventEmitter {
     todo: UnifiedTodo,
     assignment: Assignment,
     projectContext?: string,
-    sharedContext?: AssembledContext | null
+    sharedContext?: AssembledContext | null,
+    targetFileContext?: string | null
   ): string {
     const sections: string[] = [];
 
     // 0. 共享上下文注入（如果可用） - 提案 9.2
-    if (sharedContext && sharedContext.parts.length > 0) {
-      const sharedSections: string[] = [];
-      for (const part of sharedContext.parts) {
-        switch (part.type) {
-          case 'project_knowledge':
-            sharedSections.push(`### 项目知识\n${part.content}`);
-            break;
-          case 'shared_context':
-            sharedSections.push(`### 共享上下文\n${part.content}`);
-            break;
-          case 'contracts':
-            sharedSections.push(`### 任务契约\n${part.content}`);
-            break;
-          case 'long_term_memory':
-            sharedSections.push(`### 历史记忆\n${part.content}`);
-            break;
-          // recent_turns 由对话历史管理，不在此注入
-        }
-      }
-      if (sharedSections.length > 0) {
-        sections.push(`## 共享知识\n\n${sharedSections.join('\n\n')}`);
-      }
+    const sharedKnowledge = this.buildSharedKnowledgeSection(sharedContext);
+    if (sharedKnowledge) {
+      sections.push(sharedKnowledge);
     }
 
     // 1. 任务委托说明（优先使用 AI 生成的自然语言委托）
@@ -945,6 +953,11 @@ export class AutonomousWorker extends EventEmitter {
         ? '任务性质：需要对上述文件进行实际修改并保存。'
         : '任务性质：仅需读取/分析，无需修改文件。';
       sections.push(`## 目标文件\n${assignment.scope.targetPaths.map(p => `- ${p}`).join('\n')}\n\n${requirement}`);
+    }
+
+    // 3.2 目标文件摘要（强制缓存前置读取）
+    if (targetFileContext) {
+      sections.push(`## 目标文件摘要\n${targetFileContext}`);
     }
 
     // 4. 契约信息
@@ -1007,7 +1020,6 @@ export class AutonomousWorker extends EventEmitter {
         undefined, // 无图片
         {
           source: 'worker',
-          streamToUI: true,
           adapterRole: 'worker',
           ...options.adapterScope,
           decisionHook,
@@ -1139,7 +1151,8 @@ export class AutonomousWorker extends EventEmitter {
    */
   private async executeDirectly(
     assignment: Assignment,
-    options: TodoExecuteOptions
+    options: TodoExecuteOptions,
+    sharedContext?: AssembledContext | null
   ): Promise<{
     success: boolean;
     output?: DirectExecutionOutput;
@@ -1150,7 +1163,20 @@ export class AutonomousWorker extends EventEmitter {
 
     try {
       // 构建执行 prompt（复用现有逻辑，但不依赖 Todo）
-      const executionPrompt = this.buildDirectExecutionPrompt(assignment, options.projectContext);
+      const directTargets = this.extractTargetFiles(
+        `${assignment.responsibility}\n${assignment.delegationBriefing || ''}`
+      );
+      const targetFileContext = await this.buildTargetFileContext(
+        assignment,
+        options.workingDirectory,
+        directTargets
+      );
+      const executionPrompt = this.buildDirectExecutionPrompt(
+        assignment,
+        options.projectContext,
+        sharedContext,
+        targetFileContext
+      );
 
       // 生成自检引导
       const profile = this.profileLoader.getProfile(this.workerType);
@@ -1188,7 +1214,6 @@ export class AutonomousWorker extends EventEmitter {
         undefined, // 无图片
         {
           source: 'worker',
-          streamToUI: true,
           adapterRole: 'worker',
           ...options.adapterScope,
           decisionHook,
@@ -1202,6 +1227,7 @@ export class AutonomousWorker extends EventEmitter {
       // 解析响应
       const summary = response.content || '执行完成';
       const modifiedFiles = this.extractModifiedFiles(response.content || '');
+      await this.writeInsight(this.buildSuccessInsight(assignment, summary, modifiedFiles));
 
       // 调用输出回调
       if (options.onOutput && response.content) {
@@ -1230,6 +1256,7 @@ export class AutonomousWorker extends EventEmitter {
         error: errorMessage,
         duration: Date.now() - startTime,
       }, LogCategory.ORCHESTRATOR);
+      await this.writeInsight(this.buildFailureInsight(assignment, errorMessage));
 
       return {
         success: false,
@@ -1243,9 +1270,16 @@ export class AutonomousWorker extends EventEmitter {
    */
   private buildDirectExecutionPrompt(
     assignment: Assignment,
-    projectContext?: string
+    projectContext?: string,
+    sharedContext?: AssembledContext | null,
+    targetFileContext?: string | null
   ): string {
     const sections: string[] = [];
+
+    const sharedKnowledge = this.buildSharedKnowledgeSection(sharedContext);
+    if (sharedKnowledge) {
+      sections.push(sharedKnowledge);
+    }
 
     // 1. 任务委托说明（优先使用 AI 生成的自然语言委托）
     if (assignment.delegationBriefing) {
@@ -1268,6 +1302,10 @@ export class AutonomousWorker extends EventEmitter {
       sections.push(`## 目标文件\n${assignment.scope.targetPaths.map(p => `- ${p}`).join('\n')}\n\n${requirement}`);
     }
 
+    if (targetFileContext) {
+      sections.push(`## 目标文件摘要\n${targetFileContext}`);
+    }
+
     // 4. 引导 Prompt
     if (assignment.guidancePrompt) {
       sections.push(`## 角色引导\n${assignment.guidancePrompt}`);
@@ -1279,6 +1317,269 @@ export class AutonomousWorker extends EventEmitter {
     }
 
     return sections.join('\n\n');
+  }
+
+  /**
+   * 构建共享知识片段
+   */
+  private buildSharedKnowledgeSection(sharedContext?: AssembledContext | null): string | null {
+    if (!sharedContext || sharedContext.parts.length === 0) {
+      return null;
+    }
+
+    const sharedSections: string[] = [];
+
+    for (const part of sharedContext.parts) {
+      switch (part.type) {
+        case 'project_knowledge':
+          sharedSections.push(`### 项目知识\n${part.content}`);
+          break;
+        case 'shared_context':
+          sharedSections.push(`### 共享上下文\n${part.content}`);
+          break;
+        case 'contracts':
+          sharedSections.push(`### 任务契约\n${part.content}`);
+          break;
+        case 'long_term_memory':
+          sharedSections.push(`### 历史记忆\n${part.content}`);
+          break;
+        default:
+          break;
+      }
+    }
+
+    if (sharedSections.length === 0) {
+      return null;
+    }
+
+    return `## 共享知识\n\n${sharedSections.join('\n\n')}`;
+  }
+
+  /**
+   * 构建目标文件上下文（强制经缓存读取）
+   */
+  private async buildTargetFileContext(
+    assignment: Assignment,
+    workingDirectory: string,
+    extraTargets: string[] = []
+  ): Promise<string | null> {
+    const targetPaths = Array.from(new Set([...(assignment.scope.targetPaths || []), ...extraTargets]));
+    if (targetPaths.length === 0) {
+      return null;
+    }
+
+    const maxFiles = 5;
+    const selectedPaths = targetPaths.slice(0, maxFiles);
+    const sections: string[] = [];
+
+    for (const targetPath of selectedPaths) {
+      const absolutePath = path.isAbsolute(targetPath)
+        ? targetPath
+        : path.resolve(workingDirectory, targetPath);
+
+      try {
+        const fileResult = await this.readFileWithCache(absolutePath);
+        const content = fileResult.type === 'summary'
+          ? fileResult.content
+          : this.formatSummary(this.generateFileSummaryFromContent(fileResult.content, absolutePath));
+        const sourceLabel = fileResult.fromCache ? '缓存摘要' : '实时摘要';
+        sections.push(`### ${targetPath}\n来源: ${sourceLabel}\n${content}`);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger.warn('Worker.目标文件.读取失败', {
+          assignmentId: assignment.id,
+          workerId: this.workerType,
+          targetPath,
+          error: errorMessage,
+        }, LogCategory.ORCHESTRATOR);
+        sections.push(`### ${targetPath}\n来源: 读取失败\n${errorMessage}`);
+      }
+    }
+
+    if (targetPaths.length > maxFiles) {
+      sections.push(`已按预算裁剪，额外省略 ${targetPaths.length - maxFiles} 个目标文件。`);
+    }
+
+    return sections.join('\n\n');
+  }
+
+  /**
+   * 构建成功洞察
+   */
+  private buildSuccessInsight(
+    assignment: Assignment,
+    summary: string,
+    modifiedFiles: string[] = [],
+    todo?: UnifiedTodo
+  ): WorkerInsight {
+    const scopeText = todo ? todo.content : assignment.responsibility;
+    const summaryText = this.trimInsightContent(summary, 600);
+    const fileText = modifiedFiles.length > 0
+      ? `涉及文件: ${modifiedFiles.slice(0, 6).join(', ')}`
+      : '未检测到明确文件变更。';
+
+    return {
+      content: `任务成功: ${scopeText}\n结论: ${summaryText}\n${fileText}`,
+      tags: this.buildInsightTags(assignment, modifiedFiles),
+      importance: modifiedFiles.length > 0 ? 'high' : 'medium',
+    };
+  }
+
+  /**
+   * 构建失败洞察
+   */
+  private buildFailureInsight(
+    assignment: Assignment,
+    errorMessage: string,
+    todo?: UnifiedTodo
+  ): WorkerInsight {
+    const scopeText = todo ? todo.content : assignment.responsibility;
+    const errorText = this.trimInsightContent(errorMessage, 400);
+    return {
+      content: `任务失败: ${scopeText}\n错误: ${errorText}`,
+      tags: this.buildInsightTags(assignment),
+      importance: 'high',
+    };
+  }
+
+  /**
+   * 生成洞察标签
+   */
+  private buildInsightTags(assignment: Assignment, files: string[] = []): string[] {
+    const tagSet = new Set<string>();
+
+    for (const includeTag of assignment.scope.includes || []) {
+      if (includeTag && includeTag.trim()) {
+        tagSet.add(includeTag.trim());
+      }
+    }
+
+    const fileCandidates = [
+      ...(assignment.scope.targetPaths || []),
+      ...files,
+    ];
+    for (const filePath of fileCandidates) {
+      const tags = this.extractTagsFromFilePath(filePath);
+      for (const tag of tags) {
+        tagSet.add(tag);
+      }
+    }
+
+    tagSet.add(this.workerType);
+    return Array.from(tagSet).slice(0, 8);
+  }
+
+  /**
+   * 限制洞察内容长度，避免写入超限
+   */
+  private trimInsightContent(content: string, maxLength: number): string {
+    const normalized = content.replace(/\s+/g, ' ').trim();
+    if (normalized.length <= maxLength) {
+      return normalized;
+    }
+    return `${normalized.slice(0, maxLength)}...`;
+  }
+
+  /**
+   * 重置缓存读取统计
+   */
+  private resetCacheReadStats(): void {
+    this.cacheReadStats = {
+      lookups: 0,
+      cacheHits: 0,
+      cacheMisses: 0,
+    };
+  }
+
+  /**
+   * 执行结果质量门禁
+   */
+  private applyQualityGate(
+    assignment: Assignment,
+    result: AutonomousExecutionResult,
+    sharedContext?: AssembledContext | null,
+    startedAt?: number
+  ): AutonomousExecutionResult {
+    const gateErrors: string[] = [];
+
+    if (sharedContext && sharedContext.budgetUsage > 1) {
+      gateErrors.push('质量门禁失败: 共享上下文预算超限。');
+    }
+
+    if (result.success) {
+      if (!sharedContext) {
+        gateErrors.push('质量门禁失败: 未注入共享上下文。');
+      }
+
+      if (!this.hasWorkerSharedFacts(assignment.missionId, startedAt)) {
+        gateErrors.push('质量门禁失败: 未写入可复用共享事实。');
+      }
+
+      const hasTargetFiles = (assignment.scope.targetPaths?.length || 0) > 0;
+      if (hasTargetFiles && this.cacheReadStats.lookups === 0) {
+        gateErrors.push('质量门禁失败: 目标文件未经过缓存前置读取。');
+      }
+
+      const unknownRequiredContracts = this.collectUnknownRequiredContracts(assignment);
+      if (unknownRequiredContracts.length > 0) {
+        gateErrors.push(`质量门禁失败: 发现未声明的契约依赖 ${unknownRequiredContracts.join(', ')}`);
+      }
+    }
+
+    if (gateErrors.length === 0) {
+      return result;
+    }
+
+    logger.warn('Worker.质量门禁.失败', {
+      assignmentId: assignment.id,
+      workerId: this.workerType,
+      gateErrors,
+      cacheReadStats: this.cacheReadStats,
+    }, LogCategory.ORCHESTRATOR);
+
+    return {
+      ...result,
+      success: false,
+      errors: [...result.errors, ...gateErrors],
+    };
+  }
+
+  /**
+   * 检查 Worker 是否写入可复用共享事实
+   */
+  private hasWorkerSharedFacts(missionId: string, startedAt?: number): boolean {
+    const source = this.mapWorkerTypeToContextSource();
+    const entries = this.sharedContextPool.getByMission(missionId);
+    return entries.some(entry => {
+      if (startedAt && entry.createdAt < startedAt) {
+        return false;
+      }
+      if (entry.source === source) {
+        return true;
+      }
+      return entry.sources?.includes(source) || false;
+    });
+  }
+
+  /**
+   * 收集未声明的契约依赖
+   */
+  private collectUnknownRequiredContracts(assignment: Assignment): string[] {
+    const declaredContracts = new Set<string>([
+      ...assignment.producerContracts,
+      ...assignment.consumerContracts,
+    ]);
+    const unknownContracts = new Set<string>();
+
+    for (const todo of assignment.todos) {
+      for (const requiredContract of todo.requiredContracts || []) {
+        if (!declaredContracts.has(requiredContract)) {
+          unknownContracts.add(requiredContract);
+        }
+      }
+    }
+
+    return Array.from(unknownContracts);
   }
 
   /**
@@ -1467,14 +1768,18 @@ export class AutonomousWorker extends EventEmitter {
         targetTodo.status = 'pending';
         targetTodo.output = undefined;
 
-        // 如果策略是重新执行，尝试执行
-        // 注意：恢复执行时不传递共享上下文（已在原执行时注入）
+        // 如果策略是重新执行，尝试执行（恢复路径同样注入共享上下文）
         if (decision.strategy === 'retry_same_worker' || decision.strategy === 'simplify_task') {
+          const recoveryTags = targetAssignment.scope.includes || [];
+          const recoverySharedContext = await this.assembleSharedContext(
+            targetAssignment.missionId,
+            recoveryTags
+          );
           const executeResult = await this.executeTodo(
             targetTodo,
             targetAssignment,
             options,
-            undefined // 恢复执行时不重复注入共享上下文
+            recoverySharedContext
           );
 
           if (executeResult.success) {
@@ -1535,6 +1840,7 @@ export class AutonomousWorker extends EventEmitter {
 
     // 设置当前 Mission ID - 提案 9.2
     this.currentMissionId = assignment.missionId;
+    this.resetCacheReadStats();
 
     // 组装共享上下文（强制依赖已保证可用）
     // 从 scope.includes 提取标签，如果没有则使用空数组
@@ -1625,10 +1931,18 @@ export class AutonomousWorker extends EventEmitter {
       errors,
       recoveryAttempts,
     };
+    const qualityCheckedResult = this.applyQualityGate(
+      assignment,
+      finalResult,
+      sharedContextForRecovery,
+      startTime
+    );
 
-    this.emit('assignmentCompleted', finalResult);
+    this.currentMissionId = undefined;
+    this.resetCacheReadStats();
+    this.emit('assignmentCompleted', qualityCheckedResult);
 
-    return finalResult;
+    return qualityCheckedResult;
   }
 
   /**
@@ -1707,7 +2021,7 @@ export class AutonomousWorker extends EventEmitter {
   /**
    * 读取文件（优先查缓存）
    *
-   * 按照 docs/context-unified-memory-plan.md 9.2 节规范实现：
+   * 按照 docs/context/unified-memory-plan.md 9.2 节规范实现：
    * 1. 计算当前文件 hash
    * 2. 查询 FileSummaryCache
    * 3. 缓存命中则返回摘要
@@ -1718,14 +2032,18 @@ export class AutonomousWorker extends EventEmitter {
    */
   async readFileWithCache(filePath: string): Promise<FileReadResult> {
     try {
-      // 1. 计算当前文件 hash
-      const currentHash = await this.computeFileHash(filePath);
+      this.cacheReadStats.lookups++;
+
+      // 1. 读取文件并计算当前 hash（避免重复 I/O）
+      const content = await fs.readFile(filePath, 'utf-8');
+      const currentHash = this.computeContentHash(content);
 
       // 2. 查询缓存（强制依赖已保证 fileSummaryCache 可用）
       const cachedSummary = this.fileSummaryCache.get(filePath, currentHash);
 
       if (cachedSummary) {
         // 缓存命中，返回格式化后的摘要
+        this.cacheReadStats.cacheHits++;
         logger.debug('Worker.文件缓存.命中', {
           filePath,
           workerId: this.workerType,
@@ -1738,13 +2056,12 @@ export class AutonomousWorker extends EventEmitter {
         };
       }
 
-      // 3. 缓存未命中，读取原文件
+      // 3. 缓存未命中，使用已读取的原文件内容
+      this.cacheReadStats.cacheMisses++;
       logger.debug('Worker.文件缓存.未命中', {
         filePath,
         workerId: this.workerType,
       }, LogCategory.ORCHESTRATOR);
-
-      const content = await fs.readFile(filePath, 'utf-8');
 
       // 4. 异步生成并缓存摘要（不阻塞主流程）
       this.generateAndCacheSummary(filePath, currentHash, content).catch(error => {
@@ -1760,6 +2077,7 @@ export class AutonomousWorker extends EventEmitter {
         fromCache: false,
       };
     } catch (error) {
+      this.cacheReadStats.cacheMisses++;
       const errorMessage = error instanceof Error ? error.message : String(error);
       throw new Error(`读取文件失败: ${filePath}, 错误: ${errorMessage}`);
     }
@@ -1910,15 +2228,11 @@ export class AutonomousWorker extends EventEmitter {
   // ============================================================================
 
   /**
-   * 计算文件内容 hash
-   *
-   * @param filePath - 文件路径
-   * @returns 文件内容的 SHA-256 hash（取前 16 位）
+   * 计算内容 hash（取前 16 位短 hash）
    */
-  private async computeFileHash(filePath: string): Promise<string> {
-    const content = await fs.readFile(filePath, 'utf-8');
+  private computeContentHash(content: string): string {
     const hash = crypto.createHash('sha256').update(content).digest('hex');
-    return hash.substring(0, 16); // 取前 16 位作为短 hash
+    return hash.substring(0, 16);
   }
 
   /**
@@ -1977,7 +2291,7 @@ export class AutonomousWorker extends EventEmitter {
       }
     }
 
-    // 回退：从文件名推断
+    // 备用：从文件名推断
     const fileName = filePath.split('/').pop() || filePath;
     return `${fileName} 模块`;
   }

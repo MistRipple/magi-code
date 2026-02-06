@@ -176,7 +176,7 @@ export class ClaudeNormalizer extends BaseNormalizer {
             updates.push(this.createUpdate(context.messageId, 'append', { appendText: tail }));
           }
         } else if (!context.pendingText || !context.pendingText.includes(resultText)) {
-          // 回退: 只在未包含时追加，避免重复
+          // 追加保护: 只在未包含时追加，避免重复
           context.pendingText += resultText;
           updates.push(this.createUpdate(context.messageId, 'append', { appendText: resultText }));
         }

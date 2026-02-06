@@ -775,12 +775,10 @@ class ComprehensiveE2ETests {
       contextManager.addImportantContext('E2E测试重要上下文');
       details.importantContextAdded = true;
 
-      // 获取上下文切片
-      const contextSlice = contextManager.getContextSlice({
-        maxTokens: 4000,
-        includeMemory: true,
-        includeRecent: true,
-      });
+      // 获取组装上下文
+      const contextSlice = await contextManager.getAssembledContextText(
+        contextManager.buildAssemblyOptions('e2e-context-memory', 'orchestrator', 4000)
+      );
       details.contextSliceLength = contextSlice.length;
       details.hasContextContent = contextSlice.length > 0;
 

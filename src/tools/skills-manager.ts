@@ -2,7 +2,7 @@
  * Skills Manager (精简版)
  *
  * 仅管理指令型 Skills 和自定义工具
- * 内置工具（execute_shell, text_editor, grep_search 等）由 ToolManager 管理
+ * 内置工具（launch-process/read-process/write-process/kill-process/list-processes, text_editor, grep_search 等）由 ToolManager 管理
  */
 
 import { logger, LogCategory } from '../logging/unified-logger';

@@ -41,10 +41,16 @@ export const INTENT_CLASSIFICATION_PROMPT = `
 判断要点：
 1. 不涉及代码文件 → ask
 2. 简单代码操作 → direct
+   - 即使用户没有给出文件路径或函数实现，只要操作本身明确（如“加注释”“改变量名”），也应判为 direct，不要判为 clarify
+   - 示例：“给这个函数加上 JSDoc 注释” → direct
+   - 示例：“把 getUserInfo 改名为 fetchUserProfile” → direct
 3. 分析代码但不改 → explore
 4. 复杂代码任务（搭建/开发/实现系统）→ task
-5. "测试"、"演示"、"随便试试" → demo
+5. "测试"、"演示"、"随便试试" 需要区分：
+   - 明确是“验证系统整体能力/端到端流程/多 Worker 协作” → demo
+   - 明确是“单步工具调用验证（如打开终端执行一条命令）” → direct
 6. 目标模糊 → clarify
+   - clarify 仅用于目标本身不明确（如“优化一下”“改进性能”）
 
 输出：简要说明你的判断，然后输出 JSON。
 
@@ -61,13 +67,21 @@ export const INTENT_CLASSIFICATION_PROMPT = `
 
 ---
 
+{{SESSION_CONTEXT_BLOCK}}
+
 用户输入: {{USER_PROMPT}}
 `;
 
 /**
  * 生成意图分类 prompt
  */
-export function buildIntentClassificationPrompt(userPrompt: string): string {
-  return INTENT_CLASSIFICATION_PROMPT.replace('{{USER_PROMPT}}', userPrompt);
-}
+export function buildIntentClassificationPrompt(userPrompt: string, sessionContext?: string): string {
+  const trimmedContext = sessionContext?.trim() || '';
+  const contextBlock = trimmedContext
+    ? `最近会话上下文（用于解析“继续/然后/接着”等省略指令）:\n${trimmedContext}\n\n---`
+    : '';
 
+  return INTENT_CLASSIFICATION_PROMPT
+    .replace('{{SESSION_CONTEXT_BLOCK}}', contextBlock)
+    .replace('{{USER_PROMPT}}', userPrompt);
+}

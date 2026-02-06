@@ -11,7 +11,8 @@ import { WorkerSlot } from '../../../types';
 import { IAdapterFactory } from '../../../adapters/adapter-factory-interface';
 import { TokenUsage } from '../../../types/agent-types';
 import { AutonomousWorker, AutonomousExecutionResult } from '../../worker';
-import { Mission, Assignment, WorkerTodo } from '../../mission';
+import { Mission, Assignment } from '../../mission';
+import type { UnifiedTodo } from '../../../todo/types';
 import { SnapshotManager } from '../../../snapshot-manager';
 import fs from 'fs';
 import path from 'path';
@@ -32,8 +33,8 @@ export interface AssignmentExecutionOptions {
 
 export interface AssignmentExecutionResult {
   success: boolean;
-  completedTodos: WorkerTodo[];
-  dynamicTodos: WorkerTodo[];
+  completedTodos: UnifiedTodo[];
+  dynamicTodos: UnifiedTodo[];
   errors: string[];
   tokenUsage?: TokenUsage;
   /** 完整的 Worker 执行结果（用于统计） */
@@ -83,7 +84,11 @@ export class AssignmentExecutor {
     await this.createSnapshots(mission, assignment);
 
     // 获取上下文快照
-    const contextSnapshot = options.contextManager?.getContext(6000);
+    const contextSnapshot = await this.generateContextSnapshot(
+      mission.id,
+      assignment.workerId,
+      options.contextManager
+    );
 
     // 收集目标文件
     const targetFiles = this.collectTargetFiles(assignment);
@@ -106,6 +111,9 @@ export class AssignmentExecutor {
       workingDirectory: options.workingDirectory,
       projectContext: options.projectContext,
       timeout: options.timeout,
+      onOutput: options.onOutput
+        ? (output) => options.onOutput!(assignment.workerId, output)
+        : undefined,
       onReport: options.onReport,
       reportTimeout: options.reportTimeout,
       getSupplementaryInstructions: options.getSupplementaryInstructions,
@@ -138,6 +146,9 @@ export class AssignmentExecutor {
           workingDirectory: options.workingDirectory,
           projectContext: options.projectContext,
           timeout: options.timeout,
+          onOutput: options.onOutput
+            ? (output) => options.onOutput!(assignment.workerId, output)
+            : undefined,
           onReport: options.onReport,
           reportTimeout: options.reportTimeout,
           getSupplementaryInstructions: options.getSupplementaryInstructions,
@@ -189,6 +200,20 @@ export class AssignmentExecutor {
       fullResult: result,
       hasPendingApprovals: result.hasPendingApprovals,
     };
+  }
+
+  private async generateContextSnapshot(
+    missionId: string,
+    workerId: WorkerSlot,
+    contextManager?: import('../../../context/context-manager').ContextManager | null
+  ): Promise<string | undefined> {
+    if (!contextManager) {
+      return undefined;
+    }
+
+    return contextManager.getAssembledContextText(
+      contextManager.buildAssemblyOptions(missionId, workerId, 6000)
+    );
   }
 
   /**
@@ -247,7 +272,7 @@ export class AssignmentExecutor {
     // 从 todos 收集
     if (assignment.todos) {
       assignment.todos.forEach(todo => {
-        // WorkerTodo doesn't have targetFiles, collect from output if available
+        // Todo 可能没有 targetFiles，尽量从 output 中收集
         if (todo.output?.modifiedFiles) {
           todo.output.modifiedFiles
             .filter((f: unknown): f is string => typeof f === 'string' && f.trim().length > 0)

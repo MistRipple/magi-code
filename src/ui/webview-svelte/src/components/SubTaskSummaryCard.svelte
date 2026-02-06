@@ -3,8 +3,8 @@
   import Icon from './Icon.svelte';
   import type { IconName } from '../lib/icons';
 
-  // 扩展的 Worker 状态类型
-  type WorkerStatus = 'idle' | 'executing' | 'completed' | 'failed' | 'stopped' | 'skipped';
+  // Worker 状态类型（与 MessageHub subTaskCard 状态值对齐）
+  type WorkerStatus = 'pending' | 'running' | 'completed' | 'failed' | 'stopped' | 'skipped';
 
   interface SummaryCard {
     title?: string;
@@ -41,8 +41,8 @@
   }
 
   const statusBadgeMap: Record<WorkerStatus, StatusBadgeConfig> = {
-    idle: { colorVar: '--foreground-muted', icon: 'hourglass', label: '待执行' },
-    executing: { colorVar: '--info', icon: 'loader', label: '执行中', spinning: true },
+    pending: { colorVar: '--warning', icon: 'hourglass', label: '等待确认' },
+    running: { colorVar: '--info', icon: 'loader', label: '执行中', spinning: true },
     completed: { colorVar: '--success', icon: 'check', label: '完成' },
     failed: { colorVar: '--error', icon: 'x', label: '失败' },
     stopped: { colorVar: '--warning', icon: 'stop', label: '已停止' },
@@ -63,7 +63,7 @@
   const currentStatus = $derived((card.status || 'completed') as WorkerStatus);
   const statusConfig = $derived(statusBadgeMap[currentStatus] || statusBadgeMap.completed);
 
-  // 优化 executor 显示：支持更多 fallback 选项，并统一使用中文
+  // 优化 executor 显示：支持更多来源字段，并统一使用中文
   const rawExecutor = $derived(card.executor || card.agent || card.worker || '');
   const executor = $derived(rawExecutor || '编排者');
 
@@ -126,8 +126,8 @@
 
 <button
   class="worker-progress-card"
-  class:idle={currentStatus === 'idle'}
-  class:executing={currentStatus === 'executing'}
+  class:pending={currentStatus === 'pending'}
+  class:running={currentStatus === 'running'}
   class:completed={currentStatus === 'completed'}
   class:failed={currentStatus === 'failed'}
   class:stopped={currentStatus === 'stopped'}
@@ -157,8 +157,8 @@
       <!-- 状态徽章：图标 + 文字 -->
       <span
         class="status-badge"
-        class:idle={currentStatus === 'idle'}
-        class:executing={currentStatus === 'executing'}
+        class:pending={currentStatus === 'pending'}
+        class:running={currentStatus === 'running'}
         class:completed={currentStatus === 'completed'}
         class:failed={currentStatus === 'failed'}
         class:stopped={currentStatus === 'stopped'}
@@ -335,12 +335,12 @@
     --worker-color: var(--foreground-muted);
   }
 
-  .worker-progress-card.executing {
+  .worker-progress-card.running {
     --worker-color: var(--info);
   }
 
-  .worker-progress-card.idle {
-    --worker-color: var(--foreground-muted);
+  .worker-progress-card.pending {
+    --worker-color: var(--warning);
   }
 
   /* 卡片头部 */
@@ -395,13 +395,13 @@
     border: 1px solid color-mix(in srgb, var(--success) 30%, transparent);
   }
 
-  .status-badge.idle {
-    background: color-mix(in srgb, var(--foreground-muted) 15%, transparent);
-    color: var(--foreground-muted);
-    border-color: color-mix(in srgb, var(--foreground-muted) 30%, transparent);
+  .status-badge.pending {
+    background: color-mix(in srgb, var(--warning) 15%, transparent);
+    color: var(--warning);
+    border-color: color-mix(in srgb, var(--warning) 30%, transparent);
   }
 
-  .status-badge.executing {
+  .status-badge.running {
     background: color-mix(in srgb, var(--info) 15%, transparent);
     color: var(--info);
     border-color: color-mix(in srgb, var(--info) 30%, transparent);

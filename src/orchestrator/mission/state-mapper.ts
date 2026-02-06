@@ -9,17 +9,17 @@
  * 状态映射：
  * Mission -> TaskView (UI 展示)
  * Assignment -> SubTaskView (子任务卡片)
- * WorkerTodo -> TodoView (Todo 列表)
+ * UnifiedTodo -> TodoView (Todo 列表)
  */
 
 import type { WorkerSlot } from '../../types';
+import type { UnifiedTodo } from '../../todo/types';
 import type {
   Mission,
   MissionStatus,
   MissionPhase,
   Assignment,
   AssignmentStatus,
-  WorkerTodo,
   TodoStatus,
 } from './types';
 
@@ -75,7 +75,7 @@ export interface SubTaskView {
 
 /**
  * TodoView - UI Todo 视图
- * 由 WorkerTodo 派生
+ * 由 UnifiedTodo 派生
  */
 export interface TodoView {
   id: string;
@@ -187,9 +187,9 @@ export class MissionStateMapper {
   }
 
   /**
-   * 将 WorkerTodo 映射为 TodoView
+   * 将 UnifiedTodo 映射为 TodoView
    */
-  mapTodoToTodoView(todo: WorkerTodo): TodoView {
+  mapTodoToTodoView(todo: UnifiedTodo): TodoView {
     return {
       id: todo.id,
       content: todo.content,

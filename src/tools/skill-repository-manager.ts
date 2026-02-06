@@ -365,12 +365,12 @@ export class SkillRepositoryManager {
     skillDirPath: string
   ): Promise<SkillInfo | null> {
     const skillMd = await this.fetchRawFile(owner, repo, 'HEAD', `${skillDirPath}/SKILL.md`);
-    const fallbackMd = skillMd ?? await this.fetchRawFile(owner, repo, 'HEAD', `${skillDirPath}/skill.md`);
-    if (!fallbackMd) {
+    const selectedMd = skillMd ?? await this.fetchRawFile(owner, repo, 'HEAD', `${skillDirPath}/skill.md`);
+    if (!selectedMd) {
       return null;
     }
 
-    const { meta, body } = this.parseSkillMarkdown(fallbackMd);
+    const { meta, body } = this.parseSkillMarkdown(selectedMd);
     const dirName = skillDirPath.split('/').filter(Boolean).pop() || 'skill';
     const name = this.normalizeSkillName(meta.name || dirName);
     const description = meta.description || body.split('\n').find(line => line.trim()) || '';

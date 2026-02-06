@@ -8,7 +8,7 @@
 
 import { LLMAdapterFactory } from '../../llm/adapter-factory';
 import { MessageHub } from '../../orchestrator/core/message-hub';
-import { buildWorkerNeedDecisionPrompt } from '../../orchestrator/prompts/orchestrator-prompts';
+import { buildRequirementAnalysisPrompt } from '../../orchestrator/prompts/orchestrator-prompts';
 import { ProfileLoader } from '../../orchestrator/profile/profile-loader';
 
 async function testDelegationBriefing() {
@@ -27,16 +27,16 @@ async function testDelegationBriefing() {
     .map((entry: [string, any]) => `- ${entry[0]}: ${entry[1].description}`)
     .slice(0, 3)
     .join('\n');
-  const prompt = buildWorkerNeedDecisionPrompt(
+  const prompt = buildRequirementAnalysisPrompt(
     '分析 src/types.ts 文件的类型定义',
     'TASK',
     categoryHints
   );
 
-  const hasDelegationBriefingInPrompt = prompt.includes('delegationBriefing');
-  console.log(`Prompt 包含 delegationBriefing 要求: ${hasDelegationBriefingInPrompt ? '✓ 通过' : '✗ 失败'}`);
+  const hasDelegationBriefingsInPrompt = prompt.includes('delegationBriefings');
+  console.log(`Prompt 包含 delegationBriefings 要求: ${hasDelegationBriefingsInPrompt ? '✓ 通过' : '✗ 失败'}`);
 
-  if (!hasDelegationBriefingInPrompt) {
+  if (!hasDelegationBriefingsInPrompt) {
     console.log('\nPrompt 内容片段:');
     const startIndex = prompt.indexOf('## 输出格式');
     if (startIndex >= 0) {
@@ -53,7 +53,7 @@ async function testDelegationBriefing() {
   adapterFactory.setMessageHub(messageHub);
   await adapterFactory.initialize();
 
-  const testPrompt = buildWorkerNeedDecisionPrompt(
+  const testPrompt = buildRequirementAnalysisPrompt(
     '分析 src/types.ts 文件中的类型定义，给出改进建议',
     'TASK',
     categoryHints
@@ -67,7 +67,7 @@ async function testDelegationBriefing() {
     undefined,
     {
       source: 'orchestrator',
-      streamToUI: false,
+      visibility: 'system',  // 🔧 v2: 使用 visibility
       adapterRole: 'orchestrator',
     }
   );

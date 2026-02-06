@@ -5,12 +5,10 @@
  * - Mission: 任务使命
  * - Contract: 协作契约
  * - Assignment: 职责分配
- *
- * 注意：WorkerTodo 已迁移到 src/todo/types.ts (UnifiedTodo)
  */
 
 import { WorkerSlot } from '../../types';
-import { UnifiedTodo, TodoType, TodoStatus, TodoOutput } from '../../todo/types';
+import { UnifiedTodo, TodoType, TodoStatus } from '../../todo/types';
 
 // ============================================================================
 // 状态枚举
@@ -90,7 +88,7 @@ export type PlanningStatus =
   | 'rejected'; // 已拒绝
 
 // TodoType 和 TodoStatus 已迁移到 src/todo/types.ts
-// 重新导出以保持兼容性
+// 重新导出
 export { TodoType, TodoStatus } from '../../todo/types';
 
 /**
@@ -443,18 +441,7 @@ export interface PlanIssue {
   reviewLevel?: ReviewLevel;
 }
 
-// ============================================================================
-// WorkerTodo - DEPRECATED
-// ============================================================================
-// WorkerTodo 接口已迁移到 src/todo/types.ts 中的 UnifiedTodo
-// 请使用 import { UnifiedTodo } from '../../todo/types'
-
-/**
- * @deprecated 使用 UnifiedTodo 替代
- */
-export type WorkerTodo = UnifiedTodo;
-
-// 重新导出 TodoOutput 以保持兼容性
+// 重新导出 TodoOutput
 export { TodoOutput } from '../../todo/types';
 
 // ============================================================================

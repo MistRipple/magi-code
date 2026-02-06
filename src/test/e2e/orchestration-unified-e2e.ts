@@ -22,9 +22,9 @@ import {
   MissionPhase,
   Assignment,
   AssignmentStatus,
-  WorkerTodo,
   TodoStatus,
 } from '../../orchestrator/mission';
+import type { UnifiedTodo } from '../../todo/types';
 import {
   WorkerReport,
   WorkerProgress,
@@ -122,7 +122,7 @@ function createMockMission(options?: {
   const assignments: Assignment[] = [];
   for (let i = 0; i < assignmentCount; i++) {
     const worker = workers[i % workers.length];
-    const todos: WorkerTodo[] = [];
+    const todos: UnifiedTodo[] = [];
     for (let j = 0; j < todoCount; j++) {
       todos.push({
         id: `todo-${i}-${j}`,

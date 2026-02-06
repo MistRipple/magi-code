@@ -53,4 +53,5 @@ coverage/
 
 # Augment artifacts
 augment*
+.tmp-augment-map-sources/
 Users/

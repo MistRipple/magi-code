@@ -8,11 +8,11 @@
  */
 
 import { WorkerSlot } from '../../types';
+import type { UnifiedTodo } from '../../todo/types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { WorkerProfile } from '../profile/types';
 import {
   Assignment,
-  WorkerTodo,
   TodoOutput,
 } from '../mission/types';
 
@@ -60,7 +60,7 @@ export class ProfileAwareRecoveryHandler {
    * 分析失败原因
    */
   analyzeFailure(
-    todo: WorkerTodo,
+    todo: UnifiedTodo,
     assignment: Assignment,
     output: TodoOutput
   ): FailureAnalysis {
@@ -92,7 +92,7 @@ export class ProfileAwareRecoveryHandler {
    * 决定恢复策略
    */
   decideRecoveryStrategy(
-    todo: WorkerTodo,
+    todo: UnifiedTodo,
     assignment: Assignment,
     failureAnalysis: FailureAnalysis,
     retryCount: number
@@ -218,7 +218,7 @@ export class ProfileAwareRecoveryHandler {
   /**
    * 判断任务是否可以简化
    */
-  private canSimplifyTask(todo: WorkerTodo): boolean {
+  private canSimplifyTask(todo: UnifiedTodo): boolean {
     // 如果任务描述较长，可能可以简化
     return todo.content.length > 50 || todo.content.includes('和') || todo.content.includes('并');
   }
@@ -226,7 +226,7 @@ export class ProfileAwareRecoveryHandler {
   /**
    * 简化任务
    */
-  private simplifyTask(todo: WorkerTodo): string {
+  private simplifyTask(todo: UnifiedTodo): string {
     const content = todo.content;
 
     // 尝试拆分复合任务
@@ -253,18 +253,18 @@ export class ProfileAwareRecoveryHandler {
    */
   async executeRecovery(
     decision: RecoveryDecision,
-    todo: WorkerTodo,
+    todo: UnifiedTodo,
     assignment: Assignment
   ): Promise<{
     success: boolean;
     newAssignment?: Assignment;
-    newTodo?: WorkerTodo;
+    newTodo?: UnifiedTodo;
   }> {
     switch (decision.strategy) {
       case 'simplify_task':
         if (decision.simplifiedTask) {
           // 创建简化的 Todo
-          const newTodo: WorkerTodo = {
+          const newTodo: UnifiedTodo = {
             ...todo,
             id: `todo_simplified_${Date.now()}`,
             content: decision.simplifiedTask,
@@ -276,7 +276,7 @@ export class ProfileAwareRecoveryHandler {
 
       case 'retry_same_worker':
         // 重置 Todo 状态
-        const retryTodo: WorkerTodo = {
+        const retryTodo: UnifiedTodo = {
           ...todo,
           status: 'pending',
           output: undefined,
@@ -287,7 +287,7 @@ export class ProfileAwareRecoveryHandler {
 
       case 'skip_task':
         // 标记为跳过
-        const skippedTodo: WorkerTodo = {
+        const skippedTodo: UnifiedTodo = {
           ...todo,
           status: 'skipped',
           blockedReason: decision.reason,

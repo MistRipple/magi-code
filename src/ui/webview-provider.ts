@@ -33,7 +33,6 @@ import {
   ControlMessageType,
   InteractionType,
   createStandardMessage,
-  createTextMessage,
   createUserInputMessage,
   createStreamingMessage,
   createErrorMessage,
@@ -64,11 +63,8 @@ import {
   MissionVerificationResult,
 } from '../orchestrator/core';
 import { BlockedItem } from '../orchestrator/core/executors/blocking-manager';
-import {
-  Mission,
-  Assignment,
-  WorkerTodo,
-} from '../orchestrator/mission';
+import { Mission, Assignment } from '../orchestrator/mission';
+import type { UnifiedTodo } from '../todo/types';
 
 type WebviewMessagePriority = 'high' | 'normal';
 
@@ -133,37 +129,27 @@ class WebviewMessageBus {
         }
         const view = this.getView();
         if (!view) {
-          // 🔧 调试日志：Webview 不可用
-          console.warn('[WebviewMessageBus] ⚠️ Webview 不可用，清空队列:', {
+          // Webview 不可用，清空队列
+          logger.warn('界面.消息.Webview不可用', {
             highQueueLen: this.highQueue.length,
             normalQueueLen: this.normalQueue.length,
             droppedType: next.type,
-            droppedMessageId: (next as any).message?.id,
-          });
+          }, LogCategory.UI);
           this.highQueue.length = 0;
           this.normalQueue.length = 0;
           break;
         }
-        // 🔧 调试日志：追踪发送到 webview 的消息
-        console.log('[WebviewMessageBus] 发送消息到 webview:', {
-          type: next.type,
-          hasMessage: !!(next as any).message,
-          messageId: (next as any).message?.id,
-          category: (next as any).message?.category,
-        });
         try {
           await view.webview.postMessage(next);
-          console.log('[WebviewMessageBus] ✅ 消息发送成功:', (next as any).message?.id);
         } catch (postError) {
-          console.error('[WebviewMessageBus] ❌ postMessage 失败:', {
+          logger.warn('界面.消息.发送失败', {
             messageId: (next as any).message?.id,
             error: String(postError),
-          });
+          }, LogCategory.UI);
         }
       }
     } catch (error) {
-      console.error('[WebviewMessageBus] ❌ processLoop 异常:', String(error));
-      logger.warn('界面.消息.发送_失败', { error: String(error) }, LogCategory.UI);
+      logger.warn('界面.消息.循环异常', { error: String(error) }, LogCategory.UI);
     } finally {
       this.processing = false;
       if (this.highQueue.length || this.normalQueue.length) {
@@ -221,8 +207,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     resolve: (answer: string | null) => void;
     reject: (error: Error) => void;
   } | null = null;
-  // 工具授权回调
-  private toolAuthorizationCallback: ((allowed: boolean) => void) | null = null;
+  // 工具授权回调（按请求 ID 管理，避免并发覆盖）
+  private toolAuthorizationCallbacks = new Map<string, (allowed: boolean) => void>();
+  private toolAuthorizationQueue: Array<{ requestId: string; toolName: string; toolArgs: any }> = [];
+  private activeToolAuthorizationRequestId: string | null = null;
+  private activeToolAuthorizationTimer: NodeJS.Timeout | null = null;
+  private readonly toolAuthorizationTimeoutMs = 60000;
 
   // 当前选择的 Worker（null 表示自动选择/智能编排）
   private selectedWorker: WorkerSlot | null = null;
@@ -231,6 +221,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   // 模型连接状态缓存（避免频繁真实请求）
   private workerStatusCache: Record<string, { status: string; model?: string; error?: string }> | null = null;
   private workerStatusCacheAt = 0;
+  private interactionModeUpdatedAt = 0;
   private workerStatusInFlight: Promise<void> | null = null;
   private readonly workerStatusCacheTtlMs = 30000;
   private readonly workerStatusSoftTtlMs = 120000;
@@ -313,6 +304,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.error('Failed to initialize orchestrator engine', { error: err.message }, LogCategory.ORCHESTRATOR);
     });
 
+    this.interactionModeUpdatedAt = Date.now();
+
     this.setupMessageHubListeners();
     this.orchestratorEngine.setExtensionContext(this.context);
     // 设置 Hard Stop 确认回调
@@ -381,7 +374,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     return Array.isArray(value) ? value : [];
   }
 
-  private normalizeTodo(rawTodo: WorkerTodo | undefined | null, assignmentId: string, seen: Set<string>): WorkerTodo | null {
+  private normalizeTodo(rawTodo: UnifiedTodo | undefined | null, assignmentId: string, seen: Set<string>): UnifiedTodo | null {
     if (!rawTodo || typeof rawTodo !== 'object') {
       return null;
     }
@@ -412,7 +405,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const todoSeen = new Set<string>();
       const todos = this.asArray(raw.todos)
         .map(todo => this.normalizeTodo(todo, id, todoSeen))
-        .filter((todo): todo is WorkerTodo => Boolean(todo));
+        .filter((todo): todo is UnifiedTodo => Boolean(todo));
       assignments.push({
         ...raw,
         id,
@@ -422,11 +415,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     return assignments;
   }
 
-  private normalizeTodos(rawTodos: WorkerTodo[] | undefined | null, assignmentId: string): WorkerTodo[] {
+  private normalizeTodos(rawTodos: UnifiedTodo[] | undefined | null, assignmentId: string): UnifiedTodo[] {
     const seen = new Set<string>();
     return this.asArray(rawTodos)
       .map(todo => this.normalizeTodo(todo, assignmentId, seen))
-      .filter((todo): todo is WorkerTodo => Boolean(todo));
+      .filter((todo): todo is UnifiedTodo => Boolean(todo));
   }
 
   /**
@@ -711,16 +704,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private setupMessageHubListeners(): void {
     // 标准流式消息（LLM / 编排 / Worker 等统一通道）
     this.messageHub.on('unified:message', (message) => {
-      console.log('[WebviewProvider] unified:message received:', {
-        id: message?.id,
-        category: message?.category,
-        type: message?.type,
-        lifecycle: message?.lifecycle,
-        source: message?.source,
-        agent: message?.agent,
-        blocksCount: message?.blocks?.length,
-        requestId: message?.metadata?.requestId,
-      });
       this.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.UNIFIED_MESSAGE,  // 🔧 统一消息通道：使用新协议
         message,
@@ -787,17 +770,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     userMessage.metadata.placeholderMessageId = placeholderMessage.id;
-
-    // 🔧 调试日志：追踪用户消息和占位消息的发送
-    console.log('[WebviewProvider] emitUserAndPlaceholder:', {
-      userMessageId: userMessage.id,
-      userMessageLifecycle: userMessage.lifecycle,
-      userMessageCategory: userMessage.category,
-      placeholderMessageId: placeholderMessage.id,
-      placeholderMessageLifecycle: placeholderMessage.lifecycle,
-      placeholderMessageCategory: placeholderMessage.category,
-      placeholderIsPlaceholder: placeholderMessage.metadata?.isPlaceholder,
-    });
 
     const userSent = this.messageHub.sendMessage(userMessage);
     const placeholderSent = this.messageHub.sendMessage(placeholderMessage);
@@ -1253,12 +1225,69 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** 处理工具授权响应 */
-  private handleToolAuthorizationResponse(allowed: boolean): void {
-    if (this.toolAuthorizationCallback) {
-      this.toolAuthorizationCallback(allowed);
-      this.toolAuthorizationCallback = null;
+  private clearActiveToolAuthorizationTimer(): void {
+    if (this.activeToolAuthorizationTimer) {
+      clearTimeout(this.activeToolAuthorizationTimer);
+      this.activeToolAuthorizationTimer = null;
     }
+  }
+
+  private pumpToolAuthorizationQueue(): void {
+    if (this.activeToolAuthorizationRequestId) {
+      return;
+    }
+    const next = this.toolAuthorizationQueue.shift();
+    if (!next) {
+      return;
+    }
+
+    this.activeToolAuthorizationRequestId = next.requestId;
+    this.sendData('toolAuthorizationRequest', {
+      requestId: next.requestId,
+      toolName: next.toolName,
+      toolArgs: next.toolArgs,
+    });
+
+    this.clearActiveToolAuthorizationTimer();
+    this.activeToolAuthorizationTimer = setTimeout(() => {
+      const requestId = this.activeToolAuthorizationRequestId;
+      if (!requestId) {
+        return;
+      }
+      const callback = this.toolAuthorizationCallbacks.get(requestId);
+      if (callback) {
+        logger.warn('界面.工具授权.响应超时', { requestId }, LogCategory.UI);
+        this.toolAuthorizationCallbacks.delete(requestId);
+        callback(false);
+      }
+      this.activeToolAuthorizationRequestId = null;
+      this.activeToolAuthorizationTimer = null;
+      this.pumpToolAuthorizationQueue();
+    }, this.toolAuthorizationTimeoutMs);
+  }
+
+  /** 处理工具授权响应 */
+  private handleToolAuthorizationResponse(requestId: string | undefined, allowed: boolean): void {
+    if (!requestId) {
+      logger.warn('界面.工具授权.响应缺少请求ID', undefined, LogCategory.UI);
+      this.sendToast('工具授权响应缺少请求标识，已忽略', 'warning');
+      return;
+    }
+
+    const callback = this.toolAuthorizationCallbacks.get(requestId);
+    if (!callback) {
+      logger.warn('界面.工具授权.回调不存在', { requestId }, LogCategory.UI);
+      return;
+    }
+
+    this.toolAuthorizationCallbacks.delete(requestId);
+    if (this.activeToolAuthorizationRequestId === requestId) {
+      this.activeToolAuthorizationRequestId = null;
+      this.clearActiveToolAuthorizationTimer();
+    }
+
+    callback(allowed);
+    this.pumpToolAuthorizationQueue();
   }
 
   /** 处理交互响应 */
@@ -1346,17 +1375,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
 
     });
-    globalEventBus.on('task:cancelled', (event) => {
+    // task:cancelled 事件：同时更新状态和中断任务
+    globalEventBus.on('task:cancelled', () => {
       this.sendStateUpdate();
+      this.interruptCurrentTask();
     });
     globalEventBus.on('execution:stats_updated', () => {
       this.sendExecutionStats();
     });
 
-
     // orchestrator:ui_message 已废弃：所有 UI 消息统一走 MessageHub
 
-   
     globalEventBus.on('orchestrator:phase_changed', (event) => {
       const data = event.data as { phase: string; isRunning?: boolean; timestamp?: number };
       if (data?.phase) {
@@ -1385,11 +1414,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
 
       // 依赖分析目前不向前端分发，避免产生未消费的数据事件
-    });
-
-    // 打断任务事件
-    globalEventBus.on('task:cancelled', () => {
-      this.interruptCurrentTask();
     });
 
     globalEventBus.on('snapshot:created', () => this.sendStateUpdate());
@@ -1450,15 +1474,16 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         toolArgs: any;
         callback: (allowed: boolean) => void;
       };
+      const requestId = `tool-auth-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-      // 发送授权请求到前端
-      this.sendData('toolAuthorizationRequest', {
+      // 存储回调并入队，按序发送授权请求（避免并发覆盖）
+      this.toolAuthorizationCallbacks.set(requestId, data.callback);
+      this.toolAuthorizationQueue.push({
+        requestId,
         toolName: data.toolName,
         toolArgs: data.toolArgs,
       });
-
-      // 存储回调以便后续响应
-      this.toolAuthorizationCallback = data.callback;
+      this.pumpToolAuthorizationQueue();
     });
 
     // ============= Mission-Driven 架构事件 =============
@@ -1560,7 +1585,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
     });
 
-    this.missionOrchestrator.on('assignmentPlanned', (data: { missionId: string; assignmentId: string; todos: WorkerTodo[]; warnings?: string[] }) => {
+    this.missionOrchestrator.on('assignmentPlanned', (data: { missionId: string; assignmentId: string; todos: UnifiedTodo[]; warnings?: string[] }) => {
       const assignmentId = data.assignmentId || this.generateEntityId('assignment');
       const todos = this.normalizeTodos(data.todos, assignmentId);
       this.sendData('assignmentPlanned', {
@@ -1634,7 +1659,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     // 动态 Todo 事件
-    this.missionOrchestrator.on('dynamicTodoAdded', (data: { missionId: string; assignmentId: string; todo: WorkerTodo }) => {
+    this.missionOrchestrator.on('dynamicTodoAdded', (data: { missionId: string; assignmentId: string; todo: UnifiedTodo }) => {
       const assignmentId = data.assignmentId || this.generateEntityId('assignment');
       const normalizedTodo = this.normalizeTodos([data.todo], assignmentId)[0];
       if (!normalizedTodo) {
@@ -1712,23 +1737,16 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
 
     // 2. 中断所有适配器并等待完成
+    // 关键：仅在“真正完成停止”后才允许清空 processing，避免 UI 假空闲
+    let adapterInterruptCompleted = false;
     logger.info('界面.任务.中断.适配器.开始', undefined, LogCategory.UI);
     try {
-      const interruptCompleted = await Promise.race([
-        this.adapterFactory.shutdown().then(() => true),
-        new Promise<boolean>((resolve) => setTimeout(resolve, 5000, false)) // 5秒超时
-      ]);
-      if (!interruptCompleted) {
-        logger.warn('界面.任务.中断.适配器.超时', undefined, LogCategory.UI);
-      }
+      await this.adapterFactory.shutdown();
+      adapterInterruptCompleted = true;
       logger.info('界面.任务.中断.适配器.完成', undefined, LogCategory.UI);
     } catch (error) {
       logger.error('界面.任务.中断.适配器.错误', error, LogCategory.UI);
-      try {
-        await this.adapterFactory.shutdown();
-      } catch (cleanupError) {
-        logger.error('界面.任务.中断.Worker.清理_失败', cleanupError, LogCategory.UI);
-      }
+      adapterInterruptCompleted = false;
     }
 
     // 3. 更新任务状态
@@ -1757,9 +1775,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     // 清理编排者流式输出缓存，避免跨任务串流
     this.streamMessageIds.clear();
-    // 强制清理消息总线处理状态，避免前端残留“处理中”
-    this.messageHub.forceProcessingState(false);
-
+    // 仅在适配器已确认中断完成时清理处理状态，避免“Stop 提前恢复、Worker 仍执行”。
+    if (adapterInterruptCompleted) {
+      this.messageHub.forceProcessingState(false);
+    }
 
     if (hasRunningTask && !options?.silent) {
       // 4. 通知 UI
@@ -1919,6 +1938,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         const execImages = (message as any).images || [];
         const execAgent = (message as any).agent as WorkerSlot | undefined;
         const execRequestId = (message as any).requestId as string | undefined;
+        const requestedModeRaw = (message as any).mode;
+        const requestedMode = requestedModeRaw === 'ask' || requestedModeRaw === 'auto' ? requestedModeRaw : undefined;
+        if (typeof requestedModeRaw === 'string' && !requestedMode) {
+          logger.warn('界面.任务.执行.模式_非法', { requestedModeRaw, requestId: execRequestId }, LogCategory.UI);
+          this.sendToast('收到非法交互模式参数，已按当前模式执行', 'warning');
+        }
         if (!this.shouldProcessRequest(execRequestId)) {
           if (execRequestId) {
             this.messageHub.taskRejected(execRequestId, '请求重复，已忽略');
@@ -1931,17 +1956,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
               { metadata: { requestId: execRequestId } }
             );
             this.messageHub.sendMessage(errorMessage);
-            this.messageHub.forceProcessingState(false);
           }
           break;
         }
         try {
+          if (requestedMode) {
+            this.handleSetInteractionMode(requestedMode);
+          }
           await this.executeTask((message as any).prompt, execAgent || undefined, execImages, execRequestId);
         } catch (error: any) {
           const errorMsg = error instanceof Error ? error.message : String(error);
           if (execRequestId) {
             this.messageHub.taskRejected(execRequestId, errorMsg);
-            this.messageHub.forceProcessingState(false);
           }
           throw error;
         }
@@ -2130,7 +2156,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       case 'toolAuthorizationResponse':
         // 用户响应工具授权请求
-        this.handleToolAuthorizationResponse((message as any).allowed ?? false);
+        this.handleToolAuthorizationResponse((message as any).requestId as string | undefined, (message as any).allowed ?? false);
         break;
 
       case 'interactionResponse':
@@ -2302,7 +2328,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         if (!this.shouldProcessRequest(skillRequestId)) {
           if (skillRequestId) {
             this.messageHub.taskRejected(skillRequestId, '请求重复，已忽略');
-            this.messageHub.forceProcessingState(false);
           }
           break;
         }
@@ -2318,7 +2343,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           const errorMsg = error instanceof Error ? error.message : String(error);
           if (skillRequestId) {
             this.messageHub.taskRejected(skillRequestId, errorMsg);
-            this.messageHub.forceProcessingState(false);
           }
           throw error;
         }
@@ -4542,11 +4566,31 @@ ${originalPrompt}
 
   /** 处理设置交互模式 */
   private handleSetInteractionMode(mode: import('../types').InteractionMode): void {
-    logger.info('界面.交互_模式.变更', { mode }, LogCategory.UI);
-    this.orchestratorEngine.setInteractionMode(mode);
-    this.sendData('interactionModeChanged', { mode });
-    this.sendToast(`已切换到 ${this.getModeDisplayName(mode)} 模式`, 'info');
-    this.sendStateUpdate();
+    if (mode !== 'ask' && mode !== 'auto') {
+      logger.error('界面.交互_模式.非法值', { mode }, LogCategory.UI);
+      this.sendToast('交互模式无效，已忽略本次切换请求', 'error');
+      return;
+    }
+
+    const currentMode = this.orchestratorEngine.getInteractionMode();
+    const changed = currentMode !== mode;
+
+    if (changed) {
+      logger.info('界面.交互_模式.变更', { mode }, LogCategory.UI);
+      this.orchestratorEngine.setInteractionMode(mode);
+      this.interactionModeUpdatedAt = Date.now();
+      this.sendToast(`已切换到 ${this.getModeDisplayName(mode)} 模式`, 'info');
+    } else {
+      logger.info('界面.交互_模式.保持', { mode }, LogCategory.UI);
+      if (!this.interactionModeUpdatedAt) {
+        this.interactionModeUpdatedAt = Date.now();
+      }
+    }
+
+    this.sendData('interactionModeChanged', { mode, updatedAt: this.interactionModeUpdatedAt });
+    if (changed) {
+      this.sendStateUpdate();
+    }
   }
 
   /** 获取模式显示名称 */
@@ -4847,15 +4891,9 @@ ${originalPrompt}
     await this.executeTask(prompt, undefined, []);
   }
 
-  /** 处理补充内容消息 (P0-3: 补充指令链路) */
+  /** 处理执行中追加输入：默认语义为“打断并按新输入重启” */
   private async handleAppendMessage(taskId: string, content: string): Promise<void> {
     logger.info('界面.消息.补充.请求', { taskId, preview: content.substring(0, 50) }, LogCategory.UI);
-
-    // 检查是否有正在运行的任务
-    if (!this.orchestratorEngine.running) {
-      this.sendToast('没有正在执行的任务', 'warning');
-      return;
-    }
 
     const trimmedContent = content.trim();
     if (!trimmedContent) {
@@ -4864,44 +4902,16 @@ ${originalPrompt}
     }
 
     try {
-      // 注入补充指令到引擎队列
-      const injected = this.orchestratorEngine.injectSupplementaryInstruction(trimmedContent);
+      const wasRunning = this.orchestratorEngine.running;
 
-      if (injected) {
-        // 发送用户消息到对话区（让用户看到自己发送的补充指令）
-        // 使用新的 MessageType.USER_INPUT 类型
-        const traceId = this.messageHub.getTraceId();
-        const userMessage = createUserInputMessage(
-          trimmedContent,
-          traceId,
-          {
-            metadata: {
-              role: 'user',
-              isSupplementary: true,  // 标记为补充指令
-            },
-          }
-        );
-        this.messageHub.sendMessage(userMessage);
-
-        // 发送编排者确认消息
-        const ackMessage = createTextMessage(
-          `收到补充指令，将在下一决策点生效。`,
-          'orchestrator',
-          'orchestrator',
-          traceId,
-          {
-            metadata: {
-              isStatusMessage: true,
-            },
-          }
-        );
-        this.messageHub.sendMessage(ackMessage);
-
-        logger.info('界面.消息.补充.成功', { taskId }, LogCategory.UI);
-      } else {
-        this.sendToast('补充指令注入失败', 'error');
-        logger.warn('界面.消息.补充.注入失败', { taskId }, LogCategory.UI);
+      // 默认语义：追加输入 = 打断当前执行并基于最新输入重新开始
+      if (wasRunning) {
+        await this.interruptCurrentTask({ silent: true });
+        this.sendToast('已打断当前执行，正在按新输入重新开始', 'info');
       }
+
+      await this.executeTask(trimmedContent, undefined, []);
+      logger.info('界面.消息.补充.重启执行_成功', { taskId, wasRunning }, LogCategory.UI);
     } catch (error) {
       logger.error('界面.消息.补充.失败', error, LogCategory.UI);
       this.sendToast('补充内容失败', 'error');
@@ -4954,7 +4964,6 @@ ${originalPrompt}
         );
         this.messageHub.sendMessage(errorMessage);
       }
-      this.messageHub.forceProcessingState(false);
       this.clearRequestTimeout(requestKey);
     };
 
@@ -5013,8 +5022,7 @@ ${originalPrompt}
         }
       }
 
-      // 激活处理状态并确认请求
-      this.messageHub.forceProcessingState(true);
+      // 任务开始：发送控制消息，由 MessageHub 按真实消息生命周期驱动处理态
       started = true;
       if (requestKey) {
         this.messageHub.taskAccepted(requestKey);
@@ -5095,20 +5103,9 @@ ${originalPrompt}
           statsMissing: !requestStats,
         }, LogCategory.UI);
 
-        // 🔧 硬性校验：禁止 data-only 流程，必须有有效 assistantContent
-        if (!rejected && stats.assistantContent <= 0) {
-          success = false;
-          failureReason = '未收到模型输出内容';
-          const traceId = this.messageHub.getTraceId();
-          const errorMessage = createErrorMessage(
-            failureReason,
-            'orchestrator',
-            'orchestrator',
-            traceId,
-            { metadata: { requestId: requestKey } }
-          );
-          this.messageHub.sendMessage(errorMessage);
-        }
+        // 不再使用 assistantContent 统计做成败硬判定。
+        // 请求是否成功以执行链路返回值(success/failureReason)为准，
+        // 流式可见性由 MessageHub 消息生命周期统一驱动。
       }
       if (started) {
         if (success) {
@@ -5134,10 +5131,8 @@ ${originalPrompt}
             this.messageHub.sendMessage(errorMessage);
           }
         }
-        this.messageHub.forceProcessingState(false);
       } else if (!rejected && failureReason && requestKey) {
         this.messageHub.taskRejected(requestKey, failureReason);
-        this.messageHub.forceProcessingState(false);
       }
       this.messageHub.finalizeRequestContext(requestKey);
       this.messageHub.setRequestContext(undefined);
@@ -5338,7 +5333,7 @@ ${originalPrompt}
     let success = false;
     try {
       // 调用智能编排器
-      // 注意：executeWithTaskContext 内部通过 streamToUI: true 已经将 LLM 响应流式发送到前端
+      // 注意：executeWithTaskContext 内部已将 LLM 响应流式发送到前端
       // 因此不需要再手动调用 sendOrchestratorMessage 发送结果，否则会导致重复消息
       const taskContext = await this.orchestratorEngine.executeWithTaskContext(prompt, this.activeSessionId || undefined);
       const result = taskContext.result;
@@ -5738,6 +5733,7 @@ ${originalPrompt}
       isRunning,
       logs,
       interactionMode: this.orchestratorEngine.getInteractionMode(),
+      interactionModeUpdatedAt: this.interactionModeUpdatedAt,
       orchestratorPhase: this.orchestratorEngine.phase,
       activePlan: activePlanRecord
         ? {
@@ -5879,11 +5875,20 @@ ${originalPrompt}
         await this.adapterFactory.shutdown();
       }
 
-      // 3. 移除事件监听器
+      // 3. 主动拒绝所有待处理工具授权，避免悬挂
+      this.clearActiveToolAuthorizationTimer();
+      this.activeToolAuthorizationRequestId = null;
+      this.toolAuthorizationQueue = [];
+      for (const callback of this.toolAuthorizationCallbacks.values()) {
+        callback(false);
+      }
+      this.toolAuthorizationCallbacks.clear();
+
+      // 4. 移除事件监听器
       globalEventBus.clear();
       logger.info('界面.销毁.事件.已清理', undefined, LogCategory.UI);
 
-      // 4. 清理待确认的 Promise
+      // 5. 清理待确认的 Promise
       if (this.pendingConfirmation) {
         this.pendingConfirmation.reject(new Error('扩展已停用'));
         this.pendingConfirmation = null;
@@ -5892,8 +5897,7 @@ ${originalPrompt}
         this.pendingQuestion.reject(new Error('扩展已停用'));
         this.pendingQuestion = null;
       }
-
-      // 5. 清理 Webview
+      // 6. 清理 Webview
       this._view = undefined;
 
       logger.info('界面.销毁.完成', undefined, LogCategory.UI);

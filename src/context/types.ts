@@ -2,7 +2,7 @@
  * 上下文管理系统类型定义
  *
  * 设计参考：Claude Code 上下文压缩格式
- * @see docs/context-compression-format-reference.md
+ * @see docs/context/compression-format-reference.md
  */
 
 // Memory 文档内容结构

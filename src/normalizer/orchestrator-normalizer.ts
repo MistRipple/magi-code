@@ -18,16 +18,6 @@ import {
 import { OrchestratorUIMessage, OrchestratorState } from '../orchestrator/protocols/types';
 import { parseContentToBlocks } from '../utils/content-parser';
 
-/** 编排器消息类型到内容块类型的映射 */
-const MESSAGE_TYPE_MAP: Record<string, ContentBlock['type']> = {
-  progress_update: 'text',
-  plan_ready: 'text',
-  summary: 'text',
-  direct_response: 'text',
-  confirmationRequest: 'text',
-  error: 'text',
-};
-
 /**
  * 将 OrchestratorUIMessage 转换为 StandardMessage
  */
@@ -105,66 +95,8 @@ export function normalizeOrchestratorMessage(
       taskId: uiMessage.taskId,
       phase: uiMessage.metadata?.phase,
       subTaskId: uiMessage.metadata?.subTaskId,
-      // 🔧 移除 summaryCard - 总结内容作为普通消息显示
     },
   };
-}
-
-function parseSummaryCard(content: string): { title: string; sections: Array<{ title: string; items: string[] }> } | null {
-  if (!content) return null;
-  const lines = content.split('\n').map(line => line.trim()).filter(Boolean);
-  if (lines.length === 0) return null;
-
-  let title = '';
-  const sections: Array<{ title: string; items: string[] }> = [];
-  let current: { title: string; items: string[] } | null = null;
-
-  const pushCurrent = () => {
-    if (current && current.items.length > 0) {
-      sections.push(current);
-    }
-    current = null;
-  };
-
-  for (const line of lines) {
-    if (line.startsWith('## ')) {
-      pushCurrent();
-      current = { title: line.replace(/^##\s+/, '').trim(), items: [] };
-      continue;
-    }
-
-    if (/:$/.test(line) || /：$/.test(line)) {
-      pushCurrent();
-      current = { title: line.replace(/[:：]\s*$/, '').trim(), items: [] };
-      continue;
-    }
-
-    if (!title) {
-      title = line;
-      continue;
-    }
-
-    if (!current) {
-      current = { title: '内容', items: [] };
-    }
-
-    const cleaned = line.replace(/^[-*•]\s+/, '').replace(/^\d+\.\s+/, '');
-    if (cleaned) {
-      current.items.push(cleaned);
-    }
-  }
-
-  pushCurrent();
-
-  if (!title) {
-    title = '执行总结';
-  }
-
-  if (sections.length === 0) {
-    return null;
-  }
-
-  return { title, sections };
 }
 
 /**

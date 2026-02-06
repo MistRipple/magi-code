@@ -183,6 +183,14 @@ export enum MessageLifecycle {
  */
 export type MessageSource = 'orchestrator' | 'worker';
 
+/**
+ * 消息可见性
+ * - 'user': 用户可见（默认）
+ * - 'system': 仅系统日志可见，不展示给用户
+ * - 'debug': 仅调试模式可见
+ */
+export type MessageVisibility = 'user' | 'system' | 'debug';
+
 // ============================================================================
 // 内容块类型
 // ============================================================================
@@ -238,7 +246,7 @@ export interface ToolCallBlock {
   output?: string;
   /** 错误信息 */
   error?: string;
-  /** 是否可恢复（用于错误/降级判断） */
+  /** 是否可恢复（用于错误/切换判断） */
   recoverable?: boolean;
   /** 持续时间（毫秒） */
   duration?: number;
@@ -432,6 +440,14 @@ export interface StandardMessage {
    * 当 category === DATA 时必填
    */
   data?: DataPayload;
+
+  /**
+   * 消息可见性（仅 CONTENT 类别需要）
+   * - 'user': 用户可见（默认）
+   * - 'system': 仅系统日志可见，不展示给用户
+   * - 'debug': 仅调试模式可见
+   */
+  visibility?: MessageVisibility;
 }
 
 /**
@@ -460,7 +476,7 @@ export interface MessageMetadata {
   duration?: number;
   /** 错误信息 */
   error?: string;
-  /** 是否可恢复（用于错误/降级判断） */
+  /** 是否可恢复（用于错误/切换判断） */
   recoverable?: boolean;
   /** Worker 询问唯一 ID */
   questionId?: string;
@@ -573,6 +589,7 @@ export function createStandardMessage(
     id: id || generateMessageId(),
     timestamp: now,
     updatedAt: now,
+    visibility: 'user',  // 默认用户可见
     ...rest,
   };
 }
@@ -640,6 +657,7 @@ export function createStreamingMessage(
     lifecycle: MessageLifecycle.STARTED,
     blocks: [],
     metadata: {},
+    visibility: 'user',  // 默认用户可见
     ...options,
   });
 }

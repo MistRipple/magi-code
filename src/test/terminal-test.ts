@@ -18,45 +18,47 @@ export async function testVSCodeTerminal() {
   try {
     // 测试 1: 简单命令（不显示终端）
     output.appendLine('测试 1: 执行简单命令（后台）');
-    const result1 = await executor.execute({
+    const launch1 = await executor.launchProcess({
       command: 'echo "Hello from MultiCLI"',
-      useVSCodeTerminal: true,
+      wait: true,
+      maxWaitSeconds: 5,
       showTerminal: false,
+      name: 'orchestrator',
     });
     output.appendLine(`✅ 命令执行成功`);
-    output.appendLine(`   退出码: ${result1.exitCode}`);
-    output.appendLine(`   输出: ${result1.stdout}`);
-    output.appendLine(`   耗时: ${result1.duration}ms`);
+    output.appendLine(`   状态: ${launch1.status}`);
+    output.appendLine(`   退出码: ${launch1.return_code}`);
+    output.appendLine(`   输出: ${launch1.output}`);
     output.appendLine('');
 
     // 测试 2: 显示终端窗口
     output.appendLine('测试 2: 显示终端窗口执行命令');
-    const result2 = await executor.execute({
+    const launch2 = await executor.launchProcess({
       command: 'echo "This should appear in a terminal window"',
-      useVSCodeTerminal: true,
+      wait: true,
+      maxWaitSeconds: 5,
       showTerminal: true,
-      keepTerminalOpen: true,
-      name: 'MultiCLI Test Terminal',
+      name: 'worker-claude',
     });
     output.appendLine(`✅ 终端窗口已打开`);
-    output.appendLine(`   退出码: ${result2.exitCode}`);
-    output.appendLine(`   输出: ${result2.stdout}`);
-    output.appendLine(`   耗时: ${result2.duration}ms`);
+    output.appendLine(`   状态: ${launch2.status}`);
+    output.appendLine(`   退出码: ${launch2.return_code}`);
+    output.appendLine(`   输出: ${launch2.output}`);
     output.appendLine('');
 
     // 测试 3: 列出文件
     output.appendLine('测试 3: 列出当前目录文件');
-    const result3 = await executor.execute({
+    const launch3 = await executor.launchProcess({
       command: 'ls -la',
-      useVSCodeTerminal: true,
+      wait: true,
+      maxWaitSeconds: 10,
       showTerminal: true,
-      keepTerminalOpen: false,
-      name: 'List Files',
+      name: 'worker-gemini',
     });
     output.appendLine(`✅ 命令执行成功`);
-    output.appendLine(`   退出码: ${result3.exitCode}`);
-    output.appendLine(`   输出长度: ${result3.stdout.length} 字符`);
-    output.appendLine(`   耗时: ${result3.duration}ms`);
+    output.appendLine(`   状态: ${launch3.status}`);
+    output.appendLine(`   退出码: ${launch3.return_code}`);
+    output.appendLine(`   输出长度: ${launch3.output.length} 字符`);
     output.appendLine('');
 
     // 测试 4: 获取进程列表

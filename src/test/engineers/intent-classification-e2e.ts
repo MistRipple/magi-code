@@ -6,6 +6,7 @@
  */
 
 import { TestEngineer, TestReport, TestIssue } from '../test-command-center';
+import { extractEmbeddedJson } from '../../utils/content-parser';
 
 interface IntentTestCase {
   name: string;
@@ -340,20 +341,32 @@ class IntentClassificationE2EEngineer implements TestEngineer {
       const config = LLMConfigLoader.loadOrchestratorConfig();
       const client = createLLMClient(config);
 
-      const prompt = buildIntentClassificationPrompt(testCase.input);
-      const response = await client.sendMessage({
-        messages: [{ role: 'user', content: prompt }],
-        maxTokens: 500,
-        temperature: 0.1,
-      });
+      const prompts = [
+        buildIntentClassificationPrompt(testCase.input),
+        `${buildIntentClassificationPrompt(testCase.input)}\n\n请严格只输出 JSON，不要包含多余文字。`,
+      ];
 
-      const content = response.content || '';
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        return { passed: false, actualMode: 'parse_error', actualIntent: 'parse_error' };
+      let parsed: { recommendedMode?: string; intent?: string } | null = null;
+      for (const prompt of prompts) {
+        const response = await client.sendMessage({
+          messages: [{ role: 'user', content: prompt }],
+          maxTokens: 500,
+          temperature: 0.1,
+        });
+        parsed = this.extractIntentPayload(response.content || '');
+        if (parsed) {
+          break;
+        }
       }
 
-      const parsed = JSON.parse(jsonMatch[0]);
+      if (!parsed) {
+        return {
+          passed: false,
+          actualMode: 'parse_error',
+          actualIntent: 'parse_error',
+        };
+      }
+
       const actualMode = parsed.recommendedMode || 'unknown';
       const actualIntent = parsed.intent || 'unknown';
 
@@ -368,6 +381,59 @@ class IntentClassificationE2EEngineer implements TestEngineer {
       };
     } catch (error: any) {
       throw error;
+    }
+  }
+
+  private extractIntentPayload(content: string): {
+    recommendedMode?: string;
+    intent?: string;
+  } | null {
+    const fencedJsonRegex = /```json\s*([\s\S]*?)```/gi;
+    let fencedMatch: RegExpExecArray | null = fencedJsonRegex.exec(content);
+    while (fencedMatch) {
+      const parsed = this.tryParseIntentPayload(fencedMatch[1]);
+      if (parsed) {
+        return parsed;
+      }
+      fencedMatch = fencedJsonRegex.exec(content);
+    }
+
+    const embeddedJsons = extractEmbeddedJson(content);
+    for (const embedded of embeddedJsons) {
+      const parsed = this.tryParseIntentPayload(embedded.jsonText);
+      if (parsed) {
+        return parsed;
+      }
+    }
+
+    return this.tryParseIntentPayload(content);
+  }
+
+  private tryParseIntentPayload(candidate: string): {
+    recommendedMode?: string;
+    intent?: string;
+  } | null {
+    try {
+      const parsed = JSON.parse(candidate.trim()) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return null;
+      }
+
+      const payload = parsed as Record<string, unknown>;
+      const recommendedMode = typeof payload.recommendedMode === 'string'
+        ? payload.recommendedMode
+        : undefined;
+      const intent = typeof payload.intent === 'string'
+        ? payload.intent
+        : undefined;
+
+      if (!recommendedMode && !intent) {
+        return null;
+      }
+
+      return { recommendedMode, intent };
+    } catch {
+      return null;
     }
   }
 

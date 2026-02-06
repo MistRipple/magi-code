@@ -104,7 +104,7 @@ export class UniversalLLMClient extends BaseLLMClient {
           return { success: false, error: 'API Key 无效' };
         }
         if (status === 404) {
-          // Models API 不支持，回退到简单验证
+          // Models API 不支持，使用简化验证
           return { success: true, modelExists: undefined };
         }
         return { success: false, error: `HTTP ${status}` };

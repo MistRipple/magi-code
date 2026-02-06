@@ -98,7 +98,6 @@ export class TaskPreAnalyzer {
       prompt,
       undefined,
       {
-        streamToUI: true,  // 🔧 让用户看到任务分析过程
         adapterRole: 'orchestrator',
       }
     );

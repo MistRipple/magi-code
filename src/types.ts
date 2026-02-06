@@ -157,7 +157,7 @@ export interface WorkerRole {
   strengths: string[];
   taskAffinity: TaskCategory[];
   keywords: string[];
-  priority: number;  // 1 最高，用于降级时选择
+  priority: number;  // 1 最高，用于替代选择
 }
 
 
@@ -218,8 +218,8 @@ export interface WorkerDetailedStatus {
 }
 
 
-// 降级等级
-export enum DegradationLevel {
+// 运行模式等级
+export enum OperationModeLevel {
   FULL = 3,           // 全功能：Claude + Codex + Gemini
   DUAL = 2,           // 双 Agent：Claude + 任一
   SINGLE_CLAUDE = 1,  // 单 Agent：仅 Claude (智能模式)
@@ -227,15 +227,15 @@ export enum DegradationLevel {
   NONE = 0            // 无可用模型
 }
 
-// 降级策略结果
-export interface DegradationStrategy {
-  level: DegradationLevel;
+// 韧性策略结果
+export interface ResilienceStrategy {
+  level: OperationModeLevel;
   availableWorkers: WorkerSlot[];
   missingWorkers: WorkerSlot[];
   hasOrchestrator: boolean;  // Claude 是否可用作编排者
   recommendation: string;
   canProceed: boolean;
-  fallbackMap: Partial<Record<WorkerSlot, WorkerSlot>>;  // 降级映射
+  alternativeMap: Partial<Record<WorkerSlot, WorkerSlot>>;  // 替代映射
 }
 
 // Diff 块
@@ -425,6 +425,8 @@ export interface UIState {
   logs: LogEntry[];
   /** 当前交互模式 */
   interactionMode: InteractionMode;
+  /** 交互模式更新时间戳（用于前端时序防护） */
+  interactionModeUpdatedAt?: number;
   /** 当前编排器阶段 */
   orchestratorPhase?: string;
 }
@@ -552,7 +554,7 @@ export type WebviewToExtensionMessage =
   | { type: 'deleteFAQ'; id: string }
   // 新增：前端错误上报
   | { type: 'uiError'; component: string; detail?: unknown; stack?: string }
-  | { type: 'toolAuthorizationResponse'; allowed: boolean }
+  | { type: 'toolAuthorizationResponse'; requestId: string; allowed: boolean }
   | { type: 'interactionResponse'; requestId: string; response: any }
   // 新增：Mermaid 图表
   | { type: 'openMermaidPanel'; code: string; title?: string };

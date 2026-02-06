@@ -41,6 +41,8 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   private toolManager: ToolManager;
   private skillsManager: SkillsManager | null = null;
   private mcpExecutor: MCPToolExecutor | null = null;
+  private readonly mcpExecutorDefaultId = 'mcp-servers';
+  private mcpExecutorBindings = new Set<string>();
   private profileLoader: AgentProfileLoader;
   private connectionPromises = new Map<AgentType, Promise<void>>();
 
@@ -164,8 +166,8 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       // 初始化（连接所有配置的 MCP 服务器）
       await this.mcpExecutor.initialize();
 
-      // 注册到 ToolManager
-      this.toolManager.registerMCPExecutor('mcp-servers', this.mcpExecutor);
+      // 注册到 ToolManager（默认别名 + 实际 serverId，避免 sourceId 不匹配触发备用路径）
+      this.registerMCPExecutorBindings(this.mcpExecutor);
 
       const tools = await this.mcpExecutor.getTools();
       const prompts = this.mcpExecutor.getPrompts();
@@ -185,7 +187,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     // 注销旧的 MCP 执行器
     if (this.mcpExecutor) {
       await this.mcpExecutor.shutdown();
-      this.toolManager.unregisterMCPExecutor('mcp-servers');
+      this.unregisterMCPExecutorBindings();
     }
 
     // 重新加载
@@ -372,7 +374,6 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
    * @param message - 消息内容
    * @param images - 图片（可选）
    * @param options - 输出范围配置
-   *   - streamToUI: 是否将响应流式传输到 UI（默认 true）
    *   - source: 消息来源
    *   - adapterRole: 适配器角色
    */
@@ -385,10 +386,6 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     const adapter = this.getOrCreateAdapter(agent);
     const decisionHook = options?.decisionHook;
 
-    // 应用 streamToUI 配置（默认为 true）
-    const streamToUI = options?.streamToUI !== false;
-    adapter.setStreamToUI(streamToUI);
-
     if (typeof (adapter as any).setDecisionHook === 'function') {
       (adapter as any).setDecisionHook(decisionHook);
     }
@@ -398,16 +395,14 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       if (options?.systemPrompt) {
         adapter.setTempSystemPrompt(options.systemPrompt);
       }
-      if (options?.isolatedSession) {
-        adapter.setTempIsolatedSession(options.isolatedSession);
+      if (typeof options?.includeToolCalls === 'boolean') {
+        adapter.setTempEnableToolCalls(options.includeToolCalls);
       }
     }
 
     try {
       await this.ensureConnected(agent, adapter);
     } catch (error: any) {
-      // 重置 streamToUI 为默认值
-      adapter.setStreamToUI(true);
       if (typeof (adapter as any).setDecisionHook === 'function') {
         (adapter as any).setDecisionHook(undefined);
       }
@@ -498,8 +493,6 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       }
       return { content: '', done: false, error: 'Worker request failed after retries.' };
     } finally {
-      // 重置 streamToUI 为默认值，避免影响后续请求
-      adapter.setStreamToUI(true);
       // 清理决策点回调，避免跨请求泄漏
       if (typeof (adapter as any).setDecisionHook === 'function') {
         (adapter as any).setDecisionHook(undefined);
@@ -594,6 +587,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     if (this.mcpExecutor) {
       try {
         await this.mcpExecutor.shutdown();
+        this.unregisterMCPExecutorBindings();
         logger.info('MCP executor shut down', undefined, LogCategory.TOOLS);
       } catch (error: any) {
         logger.error('Failed to shut down MCP executor', {
@@ -603,6 +597,36 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     }
 
     logger.info('All adapters shut down', undefined, LogCategory.LLM);
+  }
+
+  /**
+   * 注册 MCP 执行器绑定
+   * 同时绑定默认别名和真实 serverId，确保 executeMCPTool 能直接命中。
+   */
+  private registerMCPExecutorBindings(executor: MCPToolExecutor): void {
+    this.unregisterMCPExecutorBindings();
+
+    const bindingIds = new Set<string>([this.mcpExecutorDefaultId]);
+    for (const status of executor.getMCPManager().getAllServerStatuses()) {
+      if (status.id) {
+        bindingIds.add(status.id);
+      }
+    }
+
+    for (const serverId of bindingIds) {
+      this.toolManager.registerMCPExecutor(serverId, executor);
+      this.mcpExecutorBindings.add(serverId);
+    }
+  }
+
+  /**
+   * 注销全部 MCP 执行器绑定
+   */
+  private unregisterMCPExecutorBindings(): void {
+    for (const serverId of this.mcpExecutorBindings) {
+      this.toolManager.unregisterMCPExecutor(serverId);
+    }
+    this.mcpExecutorBindings.clear();
   }
 
   /**

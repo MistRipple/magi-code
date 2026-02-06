@@ -8,7 +8,7 @@
  */
 
 import { EventEmitter } from 'events';
-import { Mission, Assignment, WorkerTodo } from '../../mission';
+import { Mission } from '../../mission';
 import { logger, LogCategory } from '../../../logging';
 
 /**

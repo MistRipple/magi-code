@@ -2,7 +2,7 @@
  * Codex LLM Normalizer
  * 
  * 解析 Codex Agent 输出
- * 支持 --json 事件流与纯文本降级
+ * 支持 --json 事件流与纯文本输出
  */
 
 import {

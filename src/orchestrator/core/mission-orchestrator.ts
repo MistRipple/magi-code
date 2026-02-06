@@ -39,13 +39,13 @@ import {
   Mission,
   Contract,
   Assignment,
-  WorkerTodo,
   CreateMissionParams,
   VerificationSpec,
   AcceptanceCriterion,
 } from '../mission';
 import { AutonomousWorker, AutonomousExecutionResult } from '../worker';
 import { TodoManager } from '../../todo';
+import type { UnifiedTodo } from '../../todo/types';
 import type { ReportCallback } from '../protocols/worker-report';
 import {
   ExecutionCoordinator,
@@ -715,7 +715,10 @@ export class MissionOrchestrator extends EventEmitter {
   ): Promise<Assignment[]> {
     const taskInfo = this.buildTaskStructuredInfo(mission);
     const additionalContext = this.contextManager
-      ? this.contextManager.getContextSlice({ maxTokens: 1200, includeRecent: false })
+      ? await this.contextManager.getAssembledContextText(
+          this.contextManager.buildAssemblyOptions(mission.id, 'orchestrator', 1200),
+          { excludePartTypes: ['recent_turns'] }
+        )
       : mission.context;
     const assignments = await this.assignmentManager.createAssignments(
       mission,
@@ -1815,7 +1818,7 @@ export class MissionOrchestrator extends EventEmitter {
       this.emit('assignmentStarted', data);
     });
 
-    coordinator.on('assignmentPlanned', (data: { missionId: string; assignmentId: string; todos: WorkerTodo[] }) => {
+    coordinator.on('assignmentPlanned', (data: { missionId: string; assignmentId: string; todos: UnifiedTodo[] }) => {
       this.emit('assignmentPlanned', data);
     });
 
@@ -1945,5 +1948,24 @@ export class MissionOrchestrator extends EventEmitter {
    */
   isExecuting(): boolean {
     return this.currentMissionId !== null;
+  }
+
+  /**
+   * 销毁编排器（清理资源）
+   */
+  dispose(): void {
+    // 销毁所有 Worker
+    for (const worker of this.workers.values()) {
+      worker.dispose();
+    }
+    this.workers.clear();
+
+    // 清理缓存
+    this.planningCache.clear();
+
+    // 移除所有事件监听器
+    this.removeAllListeners();
+
+    logger.info('任务编排器.销毁', undefined, LogCategory.ORCHESTRATOR);
   }
 }

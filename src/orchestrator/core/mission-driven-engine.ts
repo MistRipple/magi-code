@@ -22,7 +22,7 @@ import { GuidanceInjector } from '../profile/guidance-injector';
 import { CategoryResolver } from '../profile/category-resolver';
 import { PlanRecord, PlanStorage } from '../plan-storage';
 import { ExecutionPlan, OrchestratorState, QuestionCallback, RequirementAnalysis } from '../protocols/types';
-import { IntentGate, IntentHandlerMode } from '../intent-gate';
+import { IntentDecision, IntentGate, IntentHandlerMode } from '../intent-gate';
 import { VerificationRunner, VerificationConfig } from '../verification-runner';
 import { MissionOrchestrator, ExecutionProgress } from './mission-orchestrator';
 import {
@@ -46,7 +46,8 @@ import type { WorkerReport, OrchestratorResponse, WorkerEvidence, FileChangeReco
 import { createAdjustResponse } from '../protocols/worker-report';
 import { WisdomManager, type WisdomStorage } from '../wisdom';
 import { buildIntentClassificationPrompt } from '../prompts/intent-classification';
-import { buildWorkerNeedDecisionPrompt, buildRequirementAnalysisPrompt } from '../prompts/orchestrator-prompts';
+import { buildRequirementAnalysisPrompt } from '../prompts/orchestrator-prompts';
+import { extractEmbeddedJson } from '../../utils/content-parser';
 
 /**
  * 用户确认回调类型
@@ -533,7 +534,7 @@ export class MissionDrivenEngine extends EventEmitter {
       return [];
     }
 
-    // 兼容旧接口：未提供 workerId 时，直接消费全部
+    // 未提供 workerId 时，消费全部待处理指令
     if (!workerId) {
       const instructions = this.supplementaryInstructions.map(i => i.content);
       const count = instructions.length;
@@ -659,6 +660,95 @@ export class MissionDrivenEngine extends EventEmitter {
   }
 
   /**
+   * 构建子任务卡片标题前缀（依赖链序号）
+   */
+  private buildSubTaskTitlePrefix(mission: Mission, assignmentId: string): string {
+    const assignmentIndex = mission.assignments.findIndex(a => a.id === assignmentId);
+    const totalAssignments = mission.assignments.length;
+    if (assignmentIndex < 0 || totalAssignments <= 1) {
+      return '';
+    }
+    return `[${assignmentIndex + 1}/${totalAssignments}] `;
+  }
+
+  /**
+   * 发送子任务状态更新卡片（主对话区）
+   */
+  private emitSubTaskStatusCard(
+    report: Pick<WorkerReport, 'assignmentId' | 'workerId'>,
+    status: MessageHubSubTaskView['status'],
+    summary?: string
+  ): boolean {
+    const mission = this._context.mission;
+    if (!mission) {
+      logger.error('编排器.Worker汇报.状态卡更新失败', {
+        reason: 'mission_missing',
+        workerId: report.workerId,
+        assignmentId: report.assignmentId,
+        status,
+      }, LogCategory.ORCHESTRATOR);
+      this.messageHub.systemNotice('任务状态同步失败：任务上下文缺失', {
+        phase: 'subtask_status_sync',
+        reason: 'mission_missing',
+        worker: report.workerId,
+        assignmentId: report.assignmentId,
+        extra: { status },
+      });
+      return false;
+    }
+
+    if (!report.assignmentId) {
+      logger.error('编排器.Worker汇报.状态卡更新失败', {
+        reason: 'assignment_id_missing',
+        workerId: report.workerId,
+        status,
+      }, LogCategory.ORCHESTRATOR);
+      this.messageHub.systemNotice('任务状态同步失败：缺少任务分配标识', {
+        phase: 'subtask_status_sync',
+        reason: 'assignment_id_missing',
+        worker: report.workerId,
+        extra: { status },
+      });
+      return false;
+    }
+
+    const assignment = mission.assignments.find(a => a.id === report.assignmentId);
+    if (!assignment) {
+      logger.error('编排器.Worker汇报.状态卡更新失败', {
+        reason: 'assignment_not_found',
+        missionId: mission.id,
+        assignmentId: report.assignmentId,
+        workerId: report.workerId,
+        status,
+      }, LogCategory.ORCHESTRATOR);
+      this.messageHub.systemNotice('任务状态同步失败：未找到对应任务分配', {
+        phase: 'subtask_status_sync',
+        reason: 'assignment_not_found',
+        missionId: mission.id,
+        assignmentId: report.assignmentId,
+        worker: report.workerId,
+        extra: { status },
+      });
+      return false;
+    }
+
+    const mapped = this.missionStateMapper.mapAssignmentToSubTaskView(assignment);
+    const subTask: MessageHubSubTaskView = {
+      id: mapped.id,
+      title: this.buildSubTaskTitlePrefix(mission, assignment.id) + mapped.title,
+      worker: mapped.worker,
+      status,
+      summary: summary || mapped.summary,
+      modifiedFiles: mapped.modifiedFiles,
+      createdFiles: mapped.createdFiles,
+      duration: mapped.duration,
+    };
+
+    this.messageHub.subTaskCard(subTask);
+    return true;
+  }
+
+  /**
    * Worker 汇报回调（统一由编排者处理）
    */
   private async handleWorkerReport(report: WorkerReport): Promise<OrchestratorResponse> {
@@ -711,11 +801,56 @@ export class MissionDrivenEngine extends EventEmitter {
     // Worker 提问 → 交给 UI 回答（阻塞则需用户决策）
     if (report.type === 'question' && report.question) {
       const question = report.question;
-      const answer = this.workerQuestionCallback
-        ? await this.workerQuestionCallback(report.workerId, question.content, '', question.options)
-        : null;
+
+      // 提问期间主对话区卡片进入 pending（等待确认）
+      this.emitSubTaskStatusCard(report, 'pending');
+
+      let answer: string | null = null;
+      if (this.workerQuestionCallback) {
+        try {
+          answer = await this.workerQuestionCallback(report.workerId, question.content, '', question.options);
+        } catch (error) {
+          if (error instanceof Error) {
+            logger.error('编排器.Worker提问.回调异常', {
+              workerId: report.workerId,
+              assignmentId: report.assignmentId,
+              blocking: question.blocking,
+              errorName: error.name,
+              errorMessage: error.message,
+              stack: error.stack,
+            }, LogCategory.ORCHESTRATOR);
+          } else {
+            logger.error('编排器.Worker提问.回调异常_非Error对象', {
+              workerId: report.workerId,
+              assignmentId: report.assignmentId,
+              blocking: question.blocking,
+              error: String(error),
+            }, LogCategory.ORCHESTRATOR);
+          }
+          this.emitSubTaskStatusCard(report, 'failed', '提问处理失败：提问回调执行异常');
+          return {
+            action: 'abort',
+            timestamp,
+            abortReason: '提问处理失败：提问回调执行异常',
+          };
+        }
+      } else {
+        logger.error('编排器.Worker提问.回调缺失', {
+          workerId: report.workerId,
+          assignmentId: report.assignmentId,
+          blocking: question.blocking,
+        }, LogCategory.ORCHESTRATOR);
+        this.emitSubTaskStatusCard(report, 'failed', '提问处理失败：提问通道未配置');
+        return {
+          action: 'abort',
+          timestamp,
+          abortReason: '提问处理失败：提问通道未配置',
+        };
+      }
 
       if (answer && answer.trim()) {
+        // 收到用户回答后恢复 running
+        this.emitSubTaskStatusCard(report, 'running');
         return {
           action: 'answer',
           timestamp,
@@ -724,6 +859,13 @@ export class MissionDrivenEngine extends EventEmitter {
       }
 
       if (question.blocking) {
+        // 阻塞问题无回答：终止并明确状态
+        logger.warn('编排器.Worker提问.阻塞未回答_终止', {
+          workerId: report.workerId,
+          assignmentId: report.assignmentId,
+          questionType: question.questionType,
+        }, LogCategory.ORCHESTRATOR);
+        this.emitSubTaskStatusCard(report, 'stopped', '等待用户回答超时，任务已终止');
         return {
           action: 'abort',
           timestamp,
@@ -731,6 +873,13 @@ export class MissionDrivenEngine extends EventEmitter {
         };
       }
 
+      // 非阻塞问题无回答：继续执行并恢复 running
+      logger.warn('编排器.Worker提问.非阻塞未回答_继续', {
+        workerId: report.workerId,
+        assignmentId: report.assignmentId,
+        questionType: question.questionType,
+      }, LogCategory.ORCHESTRATOR);
+      this.emitSubTaskStatusCard(report, 'running', '未收到用户回答，按默认策略继续执行');
       return baseResponse;
     }
 
@@ -862,12 +1011,14 @@ export class MissionDrivenEngine extends EventEmitter {
   async initialize(): Promise<void> {
     // 加载画像配置
     await this.profileLoader.load();
+    this.applyToolPermissions();
 
     // 初始化 IntentGate（使用适配器进行意图决策）
     const decider = async (prompt: string) => {
+      const sessionContext = await this.prepareDecisionContext();
       const attempts = [
-        buildIntentClassificationPrompt(prompt),
-        `${buildIntentClassificationPrompt(prompt)}\n\n请严格只输出 JSON，不要包含多余文字。`
+        buildIntentClassificationPrompt(prompt, sessionContext),
+        `${buildIntentClassificationPrompt(prompt, sessionContext)}\n\n请严格只输出 JSON，不要包含多余文字。`
       ];
 
       for (const classificationPrompt of attempts) {
@@ -878,9 +1029,7 @@ export class MissionDrivenEngine extends EventEmitter {
           {
             source: 'orchestrator',
             adapterRole: 'orchestrator',
-            streamToUI: false,  // 🔧 意图分类是内部决策，不应输出到 UI
-            // 使用独立会话和空 System Prompt，确保意图分类不受编排器默认上下文影响
-            isolatedSession: true,
+            visibility: 'system',  // 🔧 意图分类是内部决策，不应输出到 UI
             systemPrompt: '你是一个意图分析助手。请严格按照用户提供的指令格式输出 JSON。',
           }
         );
@@ -893,9 +1042,8 @@ export class MissionDrivenEngine extends EventEmitter {
         }, LogCategory.ORCHESTRATOR);
 
         try {
-          const jsonMatch = response.content?.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const parsed = JSON.parse(jsonMatch[0]);
+          const parsed = this.extractIntentClassificationPayload(response.content ?? '');
+          if (parsed) {
 
             // 详细日志：捕获解析结果
             logger.info('编排器.意图分类.解析结果', {
@@ -906,8 +1054,8 @@ export class MissionDrivenEngine extends EventEmitter {
               parsedReason: parsed.reason,
             }, LogCategory.ORCHESTRATOR);
 
-            const result = {
-              intent: parsed.intent || 'task',
+            const result: IntentDecision = {
+              intent: this.normalizeIntent(parsed.intent),
               recommendedMode: this.mapToHandlerMode(parsed.recommendedMode),
               confidence: parsed.confidence || 0.8,
               needsClarification: Boolean(parsed.needsClarification),
@@ -949,9 +1097,23 @@ export class MissionDrivenEngine extends EventEmitter {
   }
 
   /**
+   * 将引擎权限配置同步到 ToolManager（默认全开）
+   */
+  private applyToolPermissions(): void {
+    const permissions: PermissionMatrix = {
+      allowEdit: this.config.permissions?.allowEdit ?? true,
+      allowBash: this.config.permissions?.allowBash ?? true,
+      allowWeb: this.config.permissions?.allowWeb ?? true,
+    };
+
+    this.adapterFactory.getToolManager().setPermissions(permissions);
+    logger.info('编排器.工具权限.已同步', permissions, LogCategory.ORCHESTRATOR);
+  }
+
+  /**
    * 映射到 IntentHandlerMode
    */
-  private mapToHandlerMode(mode: string): IntentHandlerMode {
+  private mapToHandlerMode(mode?: string): IntentHandlerMode {
     const modeMap: Record<string, IntentHandlerMode> = {
       ask: IntentHandlerMode.ASK,
       direct: IntentHandlerMode.DIRECT,
@@ -960,7 +1122,91 @@ export class MissionDrivenEngine extends EventEmitter {
       demo: IntentHandlerMode.DEMO,
       clarify: IntentHandlerMode.CLARIFY,
     };
-    return modeMap[mode] || IntentHandlerMode.TASK;
+    return modeMap[mode ?? 'task'] || IntentHandlerMode.TASK;
+  }
+
+  private normalizeIntent(intent?: string): IntentDecision['intent'] {
+    switch (intent) {
+      case 'question':
+      case 'trivial':
+      case 'exploratory':
+      case 'task':
+      case 'demo':
+      case 'ambiguous':
+      case 'open_ended':
+        return intent;
+      default:
+        return 'task';
+    }
+  }
+
+  /**
+   * 从 LLM 响应中提取意图分类 JSON（优先 fenced json，其次嵌入 JSON）
+   */
+  private extractIntentClassificationPayload(content: string): {
+    intent?: string;
+    recommendedMode?: string;
+    confidence?: number;
+    needsClarification?: boolean;
+    clarificationQuestions?: string[];
+    reason?: string;
+  } | null {
+    const fencedJsonRegex = /```json\s*([\s\S]*?)```/gi;
+    let fencedMatch: RegExpExecArray | null = fencedJsonRegex.exec(content);
+    while (fencedMatch) {
+      const parsed = this.tryParseIntentClassificationPayload(fencedMatch[1]);
+      if (parsed) {
+        return parsed;
+      }
+      fencedMatch = fencedJsonRegex.exec(content);
+    }
+
+    const embeddedJsons = extractEmbeddedJson(content);
+    for (const embedded of embeddedJsons) {
+      const parsed = this.tryParseIntentClassificationPayload(embedded.jsonText);
+      if (parsed) {
+        return parsed;
+      }
+    }
+
+    return this.tryParseIntentClassificationPayload(content);
+  }
+
+  private tryParseIntentClassificationPayload(candidate: string): {
+    intent?: string;
+    recommendedMode?: string;
+    confidence?: number;
+    needsClarification?: boolean;
+    clarificationQuestions?: string[];
+    reason?: string;
+  } | null {
+    try {
+      const parsed = JSON.parse(candidate.trim()) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return null;
+      }
+
+      const payload = parsed as Record<string, unknown>;
+      const hasKey =
+        typeof payload.intent === 'string' ||
+        typeof payload.recommendedMode === 'string';
+      if (!hasKey) {
+        return null;
+      }
+
+      return {
+        intent: typeof payload.intent === 'string' ? payload.intent : undefined,
+        recommendedMode: typeof payload.recommendedMode === 'string' ? payload.recommendedMode : undefined,
+        confidence: typeof payload.confidence === 'number' ? payload.confidence : undefined,
+        needsClarification: typeof payload.needsClarification === 'boolean' ? payload.needsClarification : undefined,
+        clarificationQuestions: Array.isArray(payload.clarificationQuestions)
+          ? payload.clarificationQuestions.filter((q): q is string => typeof q === 'string')
+          : undefined,
+        reason: typeof payload.reason === 'string' ? payload.reason : undefined,
+      };
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1041,6 +1287,7 @@ export class MissionDrivenEngine extends EventEmitter {
       this.setState('running');
       this.lastTaskAnalysis = null;
       this.lastRoutingDecision = null;
+      this._cachedRequirementAnalysis = null;
       this.resetSupplementaryInstructions();
 
       // 保存 sessionId 用于消息发送
@@ -1118,11 +1365,30 @@ export class MissionDrivenEngine extends EventEmitter {
 
           logger.info('编排器.DIRECT需求分析结果', {
             needsWorker: requirementAnalysis.needsWorker,
+            needsTooling: requirementAnalysis.needsTooling,
+            requiresModification: requirementAnalysis.requiresModification,
             hasDirectResponse: !!requirementAnalysis.directResponse?.trim(),
             directResponseLength: requirementAnalysis.directResponse?.length || 0,
             goal: requirementAnalysis.goal?.substring(0, 50),
             reason: requirementAnalysis.reason,
           }, LogCategory.ORCHESTRATOR);
+
+          const shouldUseOrchestratorTooling = this.shouldUseOrchestratorToolingPath(requirementAnalysis);
+          if (shouldUseOrchestratorTooling) {
+            logger.info('编排器.DIRECT模式.编排者直执工具', {
+              reason: requirementAnalysis.reason,
+            }, LogCategory.ORCHESTRATOR);
+            const result = await this.executeOrchestratorToolingMode(
+              activePrompt,
+              taskId,
+              resolvedSessionId,
+              'direct',
+              requirementAnalysis
+            );
+            this.setState('idle');
+            this.currentTaskId = null;
+            return result;
+          }
 
           if (!requirementAnalysis.needsWorker) {
             if (requirementAnalysis.directResponse?.trim()) {
@@ -1190,10 +1456,28 @@ export class MissionDrivenEngine extends EventEmitter {
 
           logger.info('编排器.DEMO需求分析结果', {
             needsWorker: requirementAnalysis.needsWorker,
+            needsTooling: requirementAnalysis.needsTooling,
+            requiresModification: requirementAnalysis.requiresModification,
             goal: requirementAnalysis.goal?.substring(0, 50),
             categories: requirementAnalysis.categories,
             reason: requirementAnalysis.reason,
           }, LogCategory.ORCHESTRATOR);
+
+          if (this.shouldUseOrchestratorToolingPath(requirementAnalysis)) {
+            logger.info('编排器.DEMO模式.编排者直执工具', {
+              reason: requirementAnalysis.reason,
+            }, LogCategory.ORCHESTRATOR);
+            const result = await this.executeOrchestratorToolingMode(
+              activePrompt,
+              taskId,
+              resolvedSessionId,
+              'demo',
+              requirementAnalysis
+            );
+            this.setState('idle');
+            this.currentTaskId = null;
+            return result;
+          }
 
           // DEMO 模式强制需要 Worker
           const categories = requirementAnalysis.categories?.length
@@ -1241,11 +1525,30 @@ export class MissionDrivenEngine extends EventEmitter {
 
           logger.info('编排器.EXPLORE需求分析结果', {
             needsWorker: requirementAnalysis.needsWorker,
+            needsTooling: requirementAnalysis.needsTooling,
+            requiresModification: requirementAnalysis.requiresModification,
             hasDirectResponse: !!requirementAnalysis.directResponse?.trim(),
             directResponseLength: requirementAnalysis.directResponse?.length || 0,
             goal: requirementAnalysis.goal?.substring(0, 50),
             reason: requirementAnalysis.reason,
           }, LogCategory.ORCHESTRATOR);
+
+          const shouldUseOrchestratorTooling = this.shouldUseOrchestratorToolingPath(requirementAnalysis);
+          if (shouldUseOrchestratorTooling) {
+            logger.info('编排器.EXPLORE模式.编排者直执工具', {
+              reason: requirementAnalysis.reason,
+            }, LogCategory.ORCHESTRATOR);
+            const result = await this.executeOrchestratorToolingMode(
+              activePrompt,
+              taskId,
+              resolvedSessionId,
+              'explore',
+              requirementAnalysis
+            );
+            this.setState('idle');
+            this.currentTaskId = null;
+            return result;
+          }
 
           if (!requirementAnalysis.needsWorker) {
             if (requirementAnalysis.directResponse?.trim()) {
@@ -1317,7 +1620,7 @@ export class MissionDrivenEngine extends EventEmitter {
       this._context.mission = mission;
 
       // Phase 2: 需求分析（合并目标理解 + 路由决策）
-      // 检查是否有缓存的需求分析结果（来自 DIRECT 模式转换）
+      // 检查是否有缓存的需求分析结果（来自 DIRECT/EXPLORE/DEMO 模式转换）
       if (this._cachedRequirementAnalysis) {
         const cachedAnalysis = this._cachedRequirementAnalysis;
         this._cachedRequirementAnalysis = null; // 清除缓存
@@ -1331,13 +1634,32 @@ export class MissionDrivenEngine extends EventEmitter {
           riskLevel: cachedAnalysis.riskLevel,
           riskFactors: cachedAnalysis.riskFactors,
         });
-      } else if (!this.lastRoutingDecision) {
+      } else {
         const requirementAnalysis = await this.analyzeRequirement(
           activePrompt,
           IntentHandlerMode.TASK
         );
 
-        // 验证：TASK 模式必须需要 Worker
+        if (this.shouldUseOrchestratorToolingPath(requirementAnalysis)) {
+          logger.info('编排器.TASK模式.降级为编排者直执工具', {
+            missionId: mission.id,
+            reason: requirementAnalysis.reason,
+          }, LogCategory.ORCHESTRATOR);
+          await this.missionOrchestrator.cancelMission(mission.id, '降级为编排者直执工具');
+          this._context.mission = null;
+          this.currentTaskId = null;
+          this.lastMissionId = null;
+          const result = await this.executeOrchestratorToolingMode(
+            activePrompt,
+            taskId,
+            resolvedSessionId,
+            'task',
+            requirementAnalysis
+          );
+          this.setState('idle');
+          return result;
+        }
+
         if (!requirementAnalysis.needsWorker) {
           throw new Error('需求分析结果无效：TASK 模式必须 needsWorker=true');
         }
@@ -1345,7 +1667,7 @@ export class MissionDrivenEngine extends EventEmitter {
           throw new Error('需求分析结果无效：TASK 模式必须解析分类');
         }
 
-        // 保存路由决策（兼容旧接口）
+        // 保存路由决策
         this.lastRoutingDecision = {
           needsWorker: requirementAnalysis.needsWorker,
           category: requirementAnalysis.categories[0],
@@ -1367,14 +1689,6 @@ export class MissionDrivenEngine extends EventEmitter {
           riskLevel: requirementAnalysis.riskLevel,
           riskFactors: requirementAnalysis.riskFactors,
         });
-      } else {
-        // 防御性分支：如果已有路由决策但没有缓存（理论上不应该发生）
-        // 所有模式（DIRECT/EXPLORE/DEMO）现在都应该设置缓存
-        logger.warn('编排器.需求分析.回退路径', {
-          hasRoutingDecision: !!this.lastRoutingDecision,
-          hasCachedAnalysis: !!this._cachedRequirementAnalysis,
-        }, LogCategory.ORCHESTRATOR);
-        await this.understandGoalWithLLM(mission, activePrompt, resolvedSessionId);
       }
 
       // Phase 3: 协作规划
@@ -1684,8 +1998,13 @@ export class MissionDrivenEngine extends EventEmitter {
       IntentHandlerMode.TASK
     );
 
-    // 验证：TASK 模式必须需要 Worker
+    if (this.shouldUseOrchestratorToolingPath(requirementAnalysis)) {
+      await this.missionOrchestrator.cancelMission(mission.id, 'createPlan 不适用于编排者直执工具任务');
+      throw new Error('createPlan 不适用于编排者直执工具任务，请直接执行该请求');
+    }
+
     if (!requirementAnalysis.needsWorker) {
+      await this.missionOrchestrator.cancelMission(mission.id, '需求分析无效：createPlan 需要 Worker');
       throw new Error('需求分析结果无效：createPlan 必须 needsWorker=true');
     }
     if (!requirementAnalysis.categories || requirementAnalysis.categories.length === 0) {
@@ -1761,25 +2080,43 @@ export class MissionDrivenEngine extends EventEmitter {
       await this.missionStorage.save(mission);
     }
 
-    // 执行 Mission（使用 MissionOrchestrator）
-    this.applySupplementaryInstructionsToMission(mission);
-    const executionResult = await this.missionOrchestrator.execute(mission, {
-      workingDirectory: this.workspaceRoot,
-      timeout: this.config.timeout,
-      parallel: plan.executionMode === 'parallel',
-      getSupplementaryInstructions: (workerId) => this.consumeSupplementaryInstructions(workerId),
-    });
+    this.isRunning = true;
+    this.currentTaskId = mission.externalTaskId || taskId || null;
+    this.lastMissionId = mission.id;
+    this._context.mission = mission;
+    this.setState('running');
 
-    // 验证和总结
-    const verification = await this.missionOrchestrator.verifyMission(mission.id);
-    this.lastExecutionSuccess = executionResult.success && verification.passed;
-    this.lastExecutionErrors = [
-      ...(executionResult.errors || []),
-      ...(verification.passed ? [] : [verification.summary || '验证未通过']),
-    ];
-    const summary = await this.missionOrchestrator.summarizeMission(mission.id);
+    try {
+      // 执行 Mission（使用 MissionOrchestrator）
+      this.applySupplementaryInstructionsToMission(mission);
+      const executionResult = await this.missionOrchestrator.execute(mission, {
+        workingDirectory: this.workspaceRoot,
+        timeout: this.config.timeout,
+        parallel: plan.executionMode === 'parallel',
+        onOutput: (workerId, output) => {
+          this.emit('workerOutput', { workerId, output });
+        },
+        onReport: (report) => this.handleWorkerReport(report),
+        reportTimeout: 5000,
+        getSupplementaryInstructions: (workerId) => this.consumeSupplementaryInstructions(workerId),
+      });
 
-    return this.formatSummary(summary, this.lastExecutionSuccess, this.lastExecutionErrors);
+      // 验证和总结
+      const verification = await this.missionOrchestrator.verifyMission(mission.id);
+      this.lastExecutionSuccess = executionResult.success && verification.passed;
+      this.lastExecutionErrors = [
+        ...(executionResult.errors || []),
+        ...(verification.passed ? [] : [verification.summary || '验证未通过']),
+      ];
+      const summary = await this.missionOrchestrator.summarizeMission(mission.id);
+
+      return this.formatSummary(summary, this.lastExecutionSuccess, this.lastExecutionErrors);
+    } finally {
+      this.setState('idle');
+      this.currentTaskId = null;
+      this.isRunning = false;
+      this._context.mission = null;
+    }
   }
 
   /**
@@ -1883,6 +2220,29 @@ export class MissionDrivenEngine extends EventEmitter {
   }
 
   /**
+   * 准备决策上下文（用于意图分类/需求分析）
+   *
+   * 只注入“最近对话 + 长期记忆”，避免把项目知识和共享上下文带入决策阶段导致噪声。
+   * 该上下文用于解析“继续/然后/接着”等省略指令。
+   */
+  private async prepareDecisionContext(): Promise<string> {
+    const sessionId = this.currentSessionId || this.contextSessionId || this.sessionManager.getCurrentSession()?.id || '';
+    if (!sessionId) {
+      return '';
+    }
+
+    await this.ensureContextReady(sessionId);
+
+    const missionId = this._context.mission?.id || this.lastMissionId || `session:${sessionId}`;
+    const options = this.contextManager.buildAssemblyOptions(missionId, 'orchestrator', 2400);
+    options.localTurns = { min: 1, max: 8 };
+
+    return this.contextManager.getAssembledContextText(options, {
+      excludePartTypes: ['project_knowledge', 'shared_context', 'contracts'],
+    });
+  }
+
+  /**
    * 准备上下文
    */
   async prepareContext(_sessionId: string, _userPrompt: string): Promise<string> {
@@ -1890,7 +2250,18 @@ export class MissionDrivenEngine extends EventEmitter {
     if (sessionId) {
       await this.ensureContextReady(sessionId);
     }
-    return this.contextManager.getContext(8000);
+
+    const missionId = this._context.mission?.id || this.lastMissionId;
+    if (missionId) {
+      return this.contextManager.getAssembledContextText(
+        this.contextManager.buildAssemblyOptions(missionId, 'orchestrator', 8000)
+      );
+    }
+
+    const defaultMissionId = sessionId ? `session:${sessionId}` : 'session:default';
+    return this.contextManager.getAssembledContextText(
+      this.contextManager.buildAssemblyOptions(defaultMissionId, 'orchestrator', 8000)
+    );
   }
 
   /**
@@ -2208,6 +2579,8 @@ export class MissionDrivenEngine extends EventEmitter {
    * 销毁引擎
    */
   dispose(): void {
+    this.messageHub.dispose();
+    this.missionOrchestrator.dispose();
     this.removeAllListeners();
     logger.info('编排器.任务引擎.销毁.完成', undefined, LogCategory.ORCHESTRATOR);
   }
@@ -2216,68 +2589,6 @@ export class MissionDrivenEngine extends EventEmitter {
   // 私有方法
   // ============================================================================
 
-  /**
-   * 使用 LLM 理解目标
-   *
-   * @deprecated 请使用 analyzeRequirement()，它合并了目标理解和路由决策
-   */
-  private async understandGoalWithLLM(
-    mission: Mission,
-    userPrompt: string,
-    _sessionId: string
-  ): Promise<void> {
-    // 使用 Claude 分析用户请求
-    const response = await this.adapterFactory.sendMessage(
-      'orchestrator',
-      `分析以下用户请求，提取关键信息并用自然语言向用户解释你的理解。
-
-用户请求：${userPrompt}
-
-## 输出格式
-
-**重要：为了让用户理解你的分析过程，请先用自然语言解释你的理解，然后输出 JSON。**
-
-格式如下：
-
-### 需求理解
-[用 2-3 句话向用户解释你对这个需求的理解，包括目标、关键点和可能的风险]
-
-### 分析结果
-\`\`\`json
-{
-  "goal": "用户想要达成什么",
-  "analysis": "任务的复杂度和关键点",
-  "constraints": ["任何限制条件"],
-  "acceptanceCriteria": ["如何判断任务完成"],
-  "riskLevel": "low|medium|high",
-  "riskFactors": ["可能的风险因素"]
-}
-\`\`\``,
-      undefined,
-      { source: 'orchestrator', adapterRole: 'orchestrator', streamToUI: true }
-    );
-
-    this.recordOrchestratorTokens(response.tokenUsage);
-
-    try {
-      const jsonMatch = response.content?.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        const analysis = JSON.parse(jsonMatch[0]);
-        await this.missionOrchestrator.understandGoal(mission, analysis);
-      }
-    } catch (error) {
-      logger.warn('编排器.任务引擎.目标_分析.解析_失败', { error }, LogCategory.ORCHESTRATOR);
-      // 使用默认值
-      await this.missionOrchestrator.understandGoal(mission, {
-        goal: userPrompt,
-        analysis: '用户请求',
-        constraints: [],
-        acceptanceCriteria: ['任务完成'],
-        riskLevel: 'low',
-        riskFactors: [],
-      });
-    }
-  }
 
   /**
    * 使用 LLM 规划协作
@@ -2332,7 +2643,7 @@ export class MissionDrivenEngine extends EventEmitter {
         && LLMConfigLoader.validateConfig(compressorConfig, 'compressor');
 
       if (!compressorReady) {
-        logger.warn('编排器.上下文.压缩模型.不可用_降级编排模型', {
+        logger.warn('编排器.上下文.压缩模型.不可用_切换编排模型', {
           enabled: compressorConfig.enabled,
           hasBaseUrl: Boolean(compressorConfig.baseUrl),
           hasModel: Boolean(compressorConfig.model),
@@ -2417,15 +2728,15 @@ export class MissionDrivenEngine extends EventEmitter {
             const client = createLLMClient(compressorConfig);
             return await sendWithRetry(client, 'compressor', message);
           } catch (error: any) {
-            const shouldFallback = !compressorReady
+            const shouldSwitchToOrchestrator = !compressorReady
               || this.isAuthOrQuotaError(error)
               || this.isConnectionError(error)
               || this.isModelError(error)
               || this.isConfigError(error);
-            if (!shouldFallback) {
+            if (!shouldSwitchToOrchestrator) {
               throw error;
             }
-            logger.warn('编排器.上下文.压缩模型.降级_使用编排模型', {
+            logger.warn('编排器.上下文.压缩模型.切换_使用编排模型', {
               reason: !compressorReady ? 'not_available'
                 : this.isAuthOrQuotaError(error) ? 'auth_or_quota'
                 : this.isConnectionError(error) ? 'connection'
@@ -2433,8 +2744,8 @@ export class MissionDrivenEngine extends EventEmitter {
                 : 'config',
               error: this.normalizeErrorMessage(error),
             }, LogCategory.ORCHESTRATOR);
-            const fallbackClient = createLLMClient(orchestratorConfig);
-            return await sendWithRetry(fallbackClient, 'orchestrator', message);
+            const orchestratorClient = createLLMClient(orchestratorConfig);
+            return await sendWithRetry(orchestratorClient, 'orchestrator', message);
           }
         },
       };
@@ -2444,7 +2755,7 @@ export class MissionDrivenEngine extends EventEmitter {
       logger.info('编排器.上下文.压缩模型.已设置', {
         model: activeConfig.model,
         provider: activeConfig.provider,
-        fallbackToOrchestrator: !compressorReady,
+        useOrchestratorModel: !compressorReady,
       }, LogCategory.ORCHESTRATOR);
     } catch (error) {
       logger.error('编排器.上下文.压缩模型.设置失败', error, LogCategory.ORCHESTRATOR);
@@ -2466,108 +2777,6 @@ export class MissionDrivenEngine extends EventEmitter {
     }
   }
 
-  /**
-   * 由编排者 LLM 决策是否需要 Worker
-   *
-   * @deprecated 请使用 analyzeRequirement()，它合并了目标理解和路由决策
-   */
-  private async decideWorkerNeedWithLLM(
-    userPrompt: string,
-    mode: IntentHandlerMode
-  ): Promise<{
-    needsWorker: boolean;
-    category?: string;
-    categories?: string[];
-    delegationBriefings?: string[];
-    needsTooling?: boolean;
-    requiresModification?: boolean;
-    directResponse?: string;
-    reason?: string;
-  }> {
-    const categoryHints = Array.from(this.profileLoader.getAllCategories().entries())
-      .map(([name, config]) => `- ${name}: ${config.description}`)
-      .join('\n');
-
-    const prompts = [
-      buildWorkerNeedDecisionPrompt(userPrompt, mode, categoryHints),
-      `${buildWorkerNeedDecisionPrompt(userPrompt, mode, categoryHints)}\n\n再次强调：必须严格输出 JSON，且 needsWorker/directResponse 字段必须自洽。`,
-    ];
-
-    for (const prompt of prompts) {
-      const response = await this.adapterFactory.sendMessage(
-        'orchestrator',
-        prompt,
-        undefined,
-        {
-          source: 'orchestrator',
-          streamToUI: false,  // 🔧 路由决策是内部决策，不应输出到 UI
-          adapterRole: 'orchestrator',
-          messageMeta: { intent: 'routing', mode },
-        }
-      );
-
-      this.recordOrchestratorTokens(response.tokenUsage);
-
-      if (response.error) {
-        logger.warn('编排器.路由决策.失败', { error: response.error }, LogCategory.ORCHESTRATOR);
-        continue;
-      }
-
-      try {
-        const jsonMatch = response.content?.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]) as {
-            needsWorker?: boolean;
-            delegationBriefings?: string[];
-            delegationBriefing?: string;
-            needsTooling?: boolean;
-            requiresModification?: boolean;
-            directResponse?: string;
-            reason?: string;
-          };
-          const needsWorker = Boolean(parsed.needsWorker);
-          const requiresModification = Boolean(parsed.requiresModification);
-          const directResponse = typeof parsed.directResponse === 'string' ? parsed.directResponse.trim() : '';
-
-          // 解析 delegationBriefings（单个或数组均可）
-          const rawBriefings = Array.isArray(parsed.delegationBriefings)
-            ? parsed.delegationBriefings
-            : typeof parsed.delegationBriefing === 'string'
-              ? [parsed.delegationBriefing]
-              : [];
-          const delegationBriefings = rawBriefings
-            .map(b => typeof b === 'string' ? b.trim() : '')
-            .filter(Boolean);
-
-          if (!needsWorker && directResponse.length === 0) {
-            logger.warn('编排器.路由决策.无效_直答缺失', { mode }, LogCategory.ORCHESTRATOR);
-            continue;
-          }
-
-          // 使用多分类解析以支持多 Worker 协作
-          const resolvedCategories = needsWorker
-            ? this.categoryResolver.resolveAllFromText(userPrompt)
-            : undefined;
-          const resolvedCategory = resolvedCategories?.[0];
-
-          return {
-            needsWorker,
-            category: resolvedCategory,
-            categories: resolvedCategories,
-            delegationBriefings: delegationBriefings.length > 0 ? delegationBriefings : undefined,
-            needsTooling: Boolean(parsed.needsTooling),
-            requiresModification,
-            directResponse: directResponse || undefined,
-            reason: parsed.reason,
-          };
-        }
-      } catch (error) {
-        logger.warn('编排器.路由决策.解析失败', { error }, LogCategory.ORCHESTRATOR);
-      }
-    }
-
-    throw new Error('编排器.路由决策.解析失败');
-  }
 
   // ============================================================================
   // Phase 2: 需求分析（合并目标理解 + 路由决策）
@@ -2577,7 +2786,7 @@ export class MissionDrivenEngine extends EventEmitter {
    * Phase 2: 需求分析
    * 一次 LLM 调用，同时输出目标理解和路由决策
    *
-   * @see docs/workflow-design.md - 5 阶段工作流
+   * @see docs/workflow/workflow-design.md - 5 阶段工作流
    */
   private async analyzeRequirement(
     userPrompt: string,
@@ -2587,7 +2796,8 @@ export class MissionDrivenEngine extends EventEmitter {
       .map(([name, config]) => `- ${name}: ${config.description}`)
       .join('\n');
 
-    const prompt = buildRequirementAnalysisPrompt(userPrompt, mode, categoryHints);
+    const sessionContext = await this.prepareDecisionContext();
+    const prompt = buildRequirementAnalysisPrompt(userPrompt, mode, categoryHints, sessionContext);
 
     const response = await this.adapterFactory.sendMessage(
       'orchestrator',
@@ -2595,7 +2805,7 @@ export class MissionDrivenEngine extends EventEmitter {
       undefined,
       {
         source: 'orchestrator',
-        streamToUI: true,  // Phase 2 输出用户可见
+        visibility: 'system',  // 🔧 需求分析是内部决策，不应输出到 UI
         adapterRole: 'orchestrator',
         messageMeta: { intent: 'requirement_analysis', mode },
       }
@@ -2627,7 +2837,12 @@ export class MissionDrivenEngine extends EventEmitter {
           reason?: string;
         };
 
-        const needsWorker = Boolean(parsed.needsWorker);
+        if (typeof parsed.needsWorker !== 'boolean') {
+          throw new Error('需求分析结果无效：needsWorker 必须显式为 true 或 false');
+        }
+        const needsWorker = parsed.needsWorker;
+        const needsTooling = Boolean(parsed.needsTooling);
+        const requiresModification = Boolean(parsed.requiresModification);
         const directResponse = typeof parsed.directResponse === 'string' ? parsed.directResponse.trim() : '';
 
         // 解析 delegationBriefings（单个或数组均可）
@@ -2640,9 +2855,13 @@ export class MissionDrivenEngine extends EventEmitter {
           .map(b => typeof b === 'string' ? b.trim() : '')
           .filter(Boolean);
 
-        // 验证：needsWorker=false 时必须有 directResponse
-        if (!needsWorker && directResponse.length === 0) {
+        // 验证：非工具直执场景下，needsWorker=false 必须有 directResponse
+        if (!needsWorker && !needsTooling && directResponse.length === 0) {
           throw new Error('需求分析结果无效：needsWorker=false 但缺少 directResponse');
+        }
+        // 验证：涉及文件修改时必须走 Worker
+        if (!needsWorker && requiresModification) {
+          throw new Error('需求分析结果无效：requiresModification=true 时必须 needsWorker=true');
         }
 
         // 使用多分类解析以支持多 Worker 协作
@@ -2662,8 +2881,8 @@ export class MissionDrivenEngine extends EventEmitter {
           executionMode: parsed.executionMode,
           categories: resolvedCategories,
           delegationBriefings: delegationBriefings.length > 0 ? delegationBriefings : undefined,
-          needsTooling: Boolean(parsed.needsTooling),
-          requiresModification: Boolean(parsed.requiresModification),
+          needsTooling,
+          requiresModification,
           reason: parsed.reason || '需求分析完成',
         };
       }
@@ -2695,7 +2914,6 @@ export class MissionDrivenEngine extends EventEmitter {
       : userPrompt;
 
     logger.info('编排器.ASK模式.发送LLM请求', {
-      streamToUI: true,
       hasContext: !!context,
     }, LogCategory.ORCHESTRATOR);
 
@@ -2705,7 +2923,6 @@ export class MissionDrivenEngine extends EventEmitter {
       undefined,
       {
         source: 'orchestrator',
-        streamToUI: true,
         adapterRole: 'orchestrator',
         messageMeta: { taskId, intent: 'ask' },
       }
@@ -2724,6 +2941,85 @@ export class MissionDrivenEngine extends EventEmitter {
     }
 
     // 🔧 简化逻辑：adapter 层已保证空内容会抛出错误，这里直接返回
+    return response.content || '';
+  }
+
+  /**
+   * 判断是否应走“编排者工具直执”路径
+   */
+  private shouldUseOrchestratorToolingPath(requirementAnalysis: RequirementAnalysis): boolean {
+    if (!requirementAnalysis.needsTooling || requirementAnalysis.requiresModification) {
+      return false;
+    }
+
+    // needsWorker=true 时，只有明确 direct 才允许降级，避免误判复杂流程
+    if (requirementAnalysis.needsWorker && requirementAnalysis.executionMode !== 'direct') {
+      return false;
+    }
+
+    // 仅允许 direct 场景，避免将复杂工具链误降级为编排者直执
+    if (!requirementAnalysis.needsWorker && requirementAnalysis.executionMode && requirementAnalysis.executionMode !== 'direct') {
+      return false;
+    }
+
+    // 高风险任务仍需 Worker 协作执行
+    if (requirementAnalysis.riskLevel === 'high') {
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * 编排者直接执行工具任务（不委派 Worker）
+   */
+  private async executeOrchestratorToolingMode(
+    userPrompt: string,
+    taskId: string,
+    sessionId: string,
+    mode: 'direct' | 'explore' | 'task' | 'demo',
+    requirementAnalysis?: RequirementAnalysis
+  ): Promise<string> {
+    logger.info('编排器.工具直执.开始', {
+      mode,
+      promptLength: userPrompt.length,
+      taskId,
+      sessionId,
+    }, LogCategory.ORCHESTRATOR);
+
+    const context = await this.prepareContext(sessionId, userPrompt);
+    const toolExecutionInstruction = `你需要作为编排者直接调用工具完成这次请求。
+- 必须通过工具真实执行，不要只给建议。
+- 如果需要终端命令，优先使用 launch-process/read-process，且 launch-process 的 name 必须是 orchestrator。
+- 仅执行低风险、只读或验证型操作；不要修改文件。
+- 若用户未指定命令，执行一次最小验证命令（如 pwd 或 ls）并返回结果。
+- 最终输出包含：执行了什么、关键输出、是否成功。`;
+
+    const prompt = context
+      ? `${toolExecutionInstruction}\n\n## 会话上下文\n${context}\n\n## 用户请求\n${userPrompt}`
+      : `${toolExecutionInstruction}\n\n## 用户请求\n${userPrompt}`;
+
+    const response = await this.adapterFactory.sendMessage(
+      'orchestrator',
+      prompt,
+      undefined,
+      {
+        source: 'orchestrator',
+        adapterRole: 'orchestrator',
+        includeToolCalls: true,
+        messageMeta: {
+          taskId,
+          intent: 'orchestrator_tooling',
+          mode,
+          reason: requirementAnalysis?.reason,
+        },
+      }
+    );
+
+    this.recordOrchestratorTokens(response.tokenUsage);
+    if (response.error) {
+      throw new Error(response.error);
+    }
     return response.content || '';
   }
 

@@ -61,13 +61,17 @@ export class PlanningExecutor {
     mission: Mission,
     options: PlanningOptions
   ): Promise<void> {
-    const contextSnapshot = this.generateContextSnapshot(options.contextManager);
-
     const planningPromises = mission.assignments.map(async (assignment) => {
       const worker = this.workers.get(assignment.workerId);
       if (!worker) {
         throw new Error(`Worker ${assignment.workerId} not found`);
       }
+
+      const contextSnapshot = await this.generateContextSnapshot(
+        mission.id,
+        assignment.workerId,
+        options.contextManager
+      );
 
       logger.info(
         LogCategory.ORCHESTRATOR,
@@ -116,7 +120,11 @@ export class PlanningExecutor {
       }
 
       // 每次规划前生成最新的上下文快照
-      const contextSnapshot = this.generateContextSnapshot(options.contextManager);
+      const contextSnapshot = await this.generateContextSnapshot(
+        mission.id,
+        assignment.workerId,
+        options.contextManager
+      );
 
       logger.info(
         LogCategory.ORCHESTRATOR,
@@ -152,21 +160,17 @@ export class PlanningExecutor {
   /**
    * 生成上下文快照
    */
-  private generateContextSnapshot(
+  private async generateContextSnapshot(
+    missionId: string,
+    workerId: WorkerSlot,
     contextManager?: import('../../../context/context-manager').ContextManager | null
-  ): string | undefined {
+  ): Promise<string | undefined> {
     if (!contextManager) {
       return undefined;
     }
 
-    return contextManager.getContextSlice({
-      maxTokens: 4000,
-      memoryRatio: 0.4,
-      memorySummary: {
-        includeCurrentTasks: true,
-        includeKeyDecisions: 3,
-        includeCodeChanges: 5,
-      },
-    });
+    return contextManager.getAssembledContextText(
+      contextManager.buildAssemblyOptions(missionId, workerId, 4000)
+    );
   }
 }

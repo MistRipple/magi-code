@@ -408,7 +408,7 @@ export interface OrchestratorEvents {
  * Phase 2: 需求分析结果
  * 合并目标理解和路由决策，一次 LLM 调用输出完整决策
  *
- * @see docs/workflow-design.md - 5 阶段工作流
+ * @see docs/workflow/workflow-design.md - 5 阶段工作流
  */
 export interface RequirementAnalysis {
   // ---- 目标理解 ----

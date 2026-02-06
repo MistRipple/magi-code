@@ -63,12 +63,6 @@ export abstract class BaseLLMAdapter extends EventEmitter {
    */
   protected messageHub: MessageHub;
 
-  /**
-   * 控制是否将消息流式传输到 UI
-   * - true: 消息会发送到前端（默认）
-   * - false: 静默模式，用于内部后台操作（如内存压缩）
-   */
-  protected _streamToUI: boolean = true;
   protected decisionHook?: (event: {
     type: 'thinking' | 'tool_call' | 'tool_result';
     toolName?: string;
@@ -95,20 +89,6 @@ export abstract class BaseLLMAdapter extends EventEmitter {
   }
 
   /**
-   * 设置是否流式传输到 UI
-   */
-  setStreamToUI(enabled: boolean): void {
-    this._streamToUI = enabled;
-  }
-
-  /**
-   * 获取当前 streamToUI 状态
-   */
-  get streamToUI(): boolean {
-    return this._streamToUI;
-  }
-
-  /**
    * 设置决策点回调
    */
   setDecisionHook(hook?: (event: {
@@ -130,14 +110,6 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     }
     const requestId = this.messageHub.getRequestContext();
     const boundMessageId = requestId ? this.messageHub.getRequestMessageId(requestId) : undefined;
-
-    // 🔧 调试日志：追踪 ID 复用机制
-    console.log('[BaseAdapter] startStreamWithContext:', {
-      requestId,
-      boundMessageId,
-      hasRequestId: !!requestId,
-      hasBoundMessageId: !!boundMessageId,
-    });
 
     return this.normalizer.startStream(this.currentTraceId, undefined, boundMessageId);
   }
@@ -184,48 +156,19 @@ export abstract class BaseLLMAdapter extends EventEmitter {
    * 设置 Normalizer 事件处理
    *
    * 🔧 统一消息通道：消息直接发送到 MessageHub（Layer 2 → Layer 3）：
-   * - 根据 streamToUI 控制是否发送
+   * - 消息无条件发送，不再有静默丢弃逻辑
    * - 跳过 AdapterFactory 和 WebviewProvider 的中间转发层
    * - 错误事件仍通过 EventEmitter 传递（需要特殊处理）
    */
   private setupNormalizerEvents(): void {
     // 消息开始/流式：直接发送到 MessageHub
     this.normalizer.on(MESSAGE_EVENTS.MESSAGE, (message) => {
-      console.log('[BaseAdapter] Normalizer MESSAGE event:', {
-        messageId: message?.id,
-        category: message?.category,
-        lifecycle: message?.lifecycle,
-        streamToUI: this._streamToUI,
-        hasMessageHub: !!this.messageHub,
-      });
-      if (this._streamToUI) {
-        this.messageHub.sendMessage(message);
-      } else {
-        console.log('[BaseAdapter] 消息被阻止 (streamToUI=false):', {
-          messageId: message?.id,
-          category: message?.category,
-        });
-      }
+      this.messageHub.sendMessage(message);
     });
 
     // 消息完成：直接发送到 MessageHub
     this.normalizer.on(MESSAGE_EVENTS.COMPLETE, (_messageId, message) => {
-      console.log('[BaseAdapter] Normalizer COMPLETE event:', {
-        messageId: message?.id,
-        category: message?.category,
-        lifecycle: message?.lifecycle,
-        blocksCount: message?.blocks?.length,
-        streamToUI: this._streamToUI,
-      });
-      if (this._streamToUI) {
-        this.messageHub.sendMessage(message);
-      } else {
-        console.log('[BaseAdapter] 完成消息被阻止 (streamToUI=false):', {
-          messageId: message?.id,
-          category: message?.category,
-          blocksCount: message?.blocks?.length,
-        });
-      }
+      this.messageHub.sendMessage(message);
     });
 
     // 流式更新：直接发送到 MessageHub
@@ -236,9 +179,7 @@ export abstract class BaseLLMAdapter extends EventEmitter {
         this.sendRealtimeTokenUpdate();
       }
 
-      if (this._streamToUI) {
-        this.messageHub.sendUpdate(update);
-      }
+      this.messageHub.sendUpdate(update);
     });
 
     // 错误事件：通过 EventEmitter 传递（需要特殊处理）
@@ -385,5 +326,22 @@ export abstract class BaseLLMAdapter extends EventEmitter {
    */
   protected generateTraceId(): string {
     return `trace-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  /**
+   * 销毁适配器（清理资源）
+   */
+  dispose(): void {
+    // 清理定时器
+    if (this.tokenUpdateTimer) {
+      clearTimeout(this.tokenUpdateTimer);
+      this.tokenUpdateTimer = null;
+    }
+    this.pendingTokenUpdate = false;
+
+    // 移除所有事件监听器
+    this.removeAllListeners();
+
+    logger.debug(`${this.agent} adapter disposed`, undefined, LogCategory.LLM);
   }
 }

@@ -3,7 +3,7 @@
  * 管理所有工具源：MCP、内置工具
  *
  * 内置工具 (source: 'builtin'):
- * - execute_shell: 终端命令执行
+ * - launch-process/read-process/write-process/kill-process/list-processes: 终端运行时 V2
  * - text_editor: 文件编辑
  * - grep_search: 代码搜索
  * - remove_files: 文件删除
@@ -224,8 +224,11 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    * 内置工具名称列表
    */
   private readonly builtinToolNames = [
-    'execute_shell',
-    'Bash',
+    'launch-process',
+    'read-process',
+    'write-process',
+    'kill-process',
+    'list-processes',
     'text_editor',
     'grep_search',
     'remove_files',
@@ -318,9 +321,20 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     const { name } = toolCall;
 
     switch (name) {
-      case 'execute_shell':
-      case 'Bash':
-        return await this.executeShellTool(toolCall);
+      case 'launch-process':
+        return await this.executeLaunchProcessTool(toolCall);
+
+      case 'read-process':
+        return await this.executeReadProcessTool(toolCall);
+
+      case 'write-process':
+        return await this.executeWriteProcessTool(toolCall);
+
+      case 'kill-process':
+        return await this.executeKillProcessTool(toolCall);
+
+      case 'list-processes':
+        return await this.executeListProcessesTool(toolCall);
 
       case 'text_editor':
         return await this.fileExecutor.execute(toolCall);
@@ -385,7 +399,13 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    */
   private checkPermission(toolName: string): { allowed: boolean; reason?: string } {
     // 终端命令工具需要 allowBash 权限（通过 VSCode Terminal 执行）
-    if (toolName === 'Bash' || toolName === 'execute_shell') {
+    if (
+      toolName === 'launch-process'
+      || toolName === 'read-process'
+      || toolName === 'write-process'
+      || toolName === 'kill-process'
+      || toolName === 'list-processes'
+    ) {
       if (!this.permissions.allowBash) {
         return { allowed: false, reason: 'Terminal command execution is disabled' };
       }
@@ -471,36 +491,101 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   private getBuiltinTools(): ExtendedToolDefinition[] {
     const tools: ExtendedToolDefinition[] = [];
 
-    // 1. execute_shell (终端命令)
-    const shellTool = this.terminalExecutor.getToolDefinition();
-    tools.push({
-      ...shellTool,
-      metadata: {
-        source: 'builtin',
-        category: 'system',
-        tags: ['shell', 'command', 'execution', 'terminal'],
-      },
-    });
+    // 1-5. Terminal Runtime V2 工具
+    const terminalV2Tools: ToolDefinition[] = [
+      {
+        name: 'launch-process',
+        description: '启动一个 agent 专属终端进程，可选择等待完成。name 必填且仅支持 orchestrator、worker-claude、worker-gemini、worker-codex。',
+        input_schema: {
+          type: 'object',
+          properties: {
+            command: { type: 'string', description: '要执行的 shell 命令' },
+            cwd: { type: 'string', description: '命令执行目录（可选）' },
+            wait: { type: 'boolean', description: '是否等待进程完成（默认 true）' },
+            max_wait_seconds: { type: 'number', description: '最大等待秒数（默认 30）' },
 
-    // 2. text_editor (文件编辑)
+            name: { type: 'string', description: 'agent 终端名称（必填：orchestrator、worker-claude、worker-gemini、worker-codex）' },
+            showTerminal: { type: 'boolean', description: '是否显示终端窗口（默认 true）' },
+          },
+          required: ['command', 'name'],
+        },
+      },
+      {
+        name: 'read-process',
+        description: '读取终端进程输出与状态，可选择等待。',
+        input_schema: {
+          type: 'object',
+          properties: {
+            terminal_id: { type: 'number', description: 'terminal_id（来自 launch-process）' },
+            wait: { type: 'boolean', description: '是否等待状态变化（默认 false）' },
+            max_wait_seconds: { type: 'number', description: '最大等待秒数（默认 30）' },
+          },
+          required: ['terminal_id'],
+        },
+      },
+      {
+        name: 'write-process',
+        description: '向运行中的终端进程写入 stdin。',
+        input_schema: {
+          type: 'object',
+          properties: {
+            terminal_id: { type: 'number', description: 'terminal_id（来自 launch-process）' },
+            input_text: { type: 'string', description: '写入终端的文本' },
+          },
+          required: ['terminal_id', 'input_text'],
+        },
+      },
+      {
+        name: 'kill-process',
+        description: '终止指定终端进程。',
+        input_schema: {
+          type: 'object',
+          properties: {
+            terminal_id: { type: 'number', description: 'terminal_id（来自 launch-process）' },
+          },
+          required: ['terminal_id'],
+        },
+      },
+      {
+        name: 'list-processes',
+        description: '列出当前所有终端进程记录。',
+        input_schema: {
+          type: 'object',
+          properties: {},
+        },
+      },
+    ];
+
+    for (const tool of terminalV2Tools) {
+      tools.push({
+        ...tool,
+        metadata: {
+          source: 'builtin',
+          category: 'system',
+          tags: ['shell', 'terminal', 'runtime-v2'],
+        },
+      });
+    }
+
+    // 6. text_editor (文件编辑)
     tools.push(this.fileExecutor.getToolDefinition());
 
-    // 3. grep_search (代码搜索)
+    // 7. grep_search (代码搜索)
     tools.push(this.searchExecutor.getToolDefinition());
 
-    // 4. remove_files (文件删除)
+    // 8. remove_files (文件删除)
     tools.push(this.removeFilesExecutor.getToolDefinition());
 
-    // 5-6. web_search, web_fetch (网络搜索/获取)
+    // 9-10. web_search, web_fetch (网络搜索/获取)
     tools.push(...this.webExecutor.getToolDefinitions());
 
-    // 7. mermaid_diagram (Mermaid 图表)
+    // 11. mermaid_diagram (Mermaid 图表)
     tools.push(this.mermaidExecutor.getToolDefinition());
 
-    // 8. codebase_retrieval (ACE 语义搜索)
+    // 12. codebase_retrieval (ACE 语义搜索)
     tools.push(this.aceExecutor.getToolDefinition());
 
-    // 9. lsp_query (LSP 代码智能)
+    // 13. lsp_query (LSP 代码智能)
     tools.push(this.lspExecutor.getToolDefinition());
 
     return tools;
@@ -534,21 +619,10 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     return tools.find((t) => t.name === toolName);
   }
 
-  /**
-   * 执行 Shell 工具（统一使用 VSCode Terminal 实现可视化）
-   */
-  private async executeShellTool(toolCall: ToolCall): Promise<ToolResult> {
+  private async executeLaunchProcessTool(toolCall: ToolCall): Promise<ToolResult> {
     const args = toolCall.arguments as any;
-    const {
-      command,
-      cwd,
-      timeout,
-      showTerminal = true,  // 默认显示终端
-      keepTerminalOpen = true,  // 🔧 修复：默认保持终端打开，避免"一闪而过"
-      name
-    } = args;
+    const { command, cwd, wait = true, max_wait_seconds = 30, name, showTerminal = true } = args;
 
-    // 验证命令安全性
     const validation = this.terminalExecutor.validateCommand(command);
     if (!validation.valid) {
       return {
@@ -558,34 +632,63 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       };
     }
 
-    logger.debug('Executing shell command in VSCode Terminal', {
-      command,
-      showTerminal,
-      keepTerminalOpen,
-    }, LogCategory.TOOLS);
-
-    // 统一使用 VSCode Terminal 执行器
-    const result = await this.terminalExecutor.execute({
+    const result = await this.terminalExecutor.launchProcess({
       command,
       cwd,
-      timeout,
+      wait,
+      maxWaitSeconds: max_wait_seconds,
       name,
       showTerminal,
-      keepTerminalOpen,
-      useVSCodeTerminal: true,
     });
-
-    if (result.exitCode !== 0) {
-      return {
-        toolCallId: toolCall.id,
-        content: `Command failed with exit code ${result.exitCode}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
-        isError: true,
-      };
-    }
 
     return {
       toolCallId: toolCall.id,
-      content: result.stdout || '(no output)',
+      content: JSON.stringify(result),
+      isError: false,
+    };
+  }
+
+  private async executeReadProcessTool(toolCall: ToolCall): Promise<ToolResult> {
+    const args = toolCall.arguments as any;
+    const { terminal_id, wait = false, max_wait_seconds = 30 } = args;
+
+    const result = await this.terminalExecutor.readProcess(terminal_id, wait, max_wait_seconds);
+    return {
+      toolCallId: toolCall.id,
+      content: JSON.stringify(result),
+      isError: false,
+    };
+  }
+
+  private async executeWriteProcessTool(toolCall: ToolCall): Promise<ToolResult> {
+    const args = toolCall.arguments as any;
+    const { terminal_id, input_text } = args;
+
+    const result = await this.terminalExecutor.writeProcess(terminal_id, input_text);
+    return {
+      toolCallId: toolCall.id,
+      content: JSON.stringify(result),
+      isError: false,
+    };
+  }
+
+  private async executeKillProcessTool(toolCall: ToolCall): Promise<ToolResult> {
+    const args = toolCall.arguments as any;
+    const { terminal_id } = args;
+
+    const result = await this.terminalExecutor.killProcess(terminal_id);
+    return {
+      toolCallId: toolCall.id,
+      content: JSON.stringify(result),
+      isError: false,
+    };
+  }
+
+  private async executeListProcessesTool(toolCall: ToolCall): Promise<ToolResult> {
+    const result = this.terminalExecutor.listProcessRecords();
+    return {
+      toolCallId: toolCall.id,
+      content: JSON.stringify(result),
       isError: false,
     };
   }

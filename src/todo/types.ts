@@ -1,9 +1,7 @@
 /**
  * Unified Todo System - Type Definitions
  *
- * 统一的 Todo 类型定义，合并原有的：
- * - SubTask (UnifiedTaskManager)
- * - WorkerTodo (Mission Architecture)
+ * 统一的 Todo 类型定义
  *
  * 设计原则：
  * - 单一数据源：不再有两套 Todo 系统
@@ -65,8 +63,6 @@ export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
 
 /**
  * UnifiedTodo - 统一的工作项
- *
- * 合并了 SubTask 和 WorkerTodo 的所有功能
  */
 export interface UnifiedTodo {
   // ===== 标识 =====

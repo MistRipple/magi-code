@@ -38,7 +38,7 @@
   let adrs = $state<ADR[]>([]);
   let faqs = $state<FAQ[]>([]);
   let searchQuery = $state('');
-  let adrFilter = $state<'all' | 'proposed' | 'accepted' | 'deprecated' | 'superseded'>('all');
+  let adrFilter = $state<'all' | 'proposed' | 'accepted' | 'archived' | 'superseded'>('all');
   let selectedItem = $state<ADR | FAQ | null>(null);
   let selectedType = $state<'adr' | 'faq' | null>(null);
 
@@ -273,7 +273,7 @@
             <button class="knowledge-filter-btn" class:active={adrFilter === 'all'} onclick={() => adrFilter = 'all'}>全部</button>
             <button class="knowledge-filter-btn" class:active={adrFilter === 'proposed'} onclick={() => adrFilter = 'proposed'}>提议中</button>
             <button class="knowledge-filter-btn" class:active={adrFilter === 'accepted'} onclick={() => adrFilter = 'accepted'}>已接受</button>
-            <button class="knowledge-filter-btn" class:active={adrFilter === 'deprecated'} onclick={() => adrFilter = 'deprecated'}>已废弃</button>
+            <button class="knowledge-filter-btn" class:active={adrFilter === 'archived'} onclick={() => adrFilter = 'archived'}>已归档</button>
             <button class="knowledge-filter-btn" class:active={adrFilter === 'superseded'} onclick={() => adrFilter = 'superseded'}>已替代</button>
           </div>
           <div class="knowledge-list">
@@ -787,7 +787,7 @@
 
   .knowledge-item-status.proposed { background: var(--info-muted); color: var(--info); }
   .knowledge-item-status.accepted { background: var(--success-muted); color: var(--success); }
-  .knowledge-item-status.deprecated { background: var(--error-muted); color: var(--error); }
+  .knowledge-item-status.archived { background: var(--error-muted); color: var(--error); }
   .knowledge-item-status.superseded { background: var(--warning-muted); color: var(--warning); }
   .knowledge-item-category { background: var(--surface-2); color: var(--foreground-muted); }
 
@@ -854,7 +854,7 @@
 
   .knowledge-detail-status.proposed { background: var(--info-muted); color: var(--info); }
   .knowledge-detail-status.accepted { background: var(--success-muted); color: var(--success); }
-  .knowledge-detail-status.deprecated { background: var(--error-muted); color: var(--error); }
+  .knowledge-detail-status.archived { background: var(--error-muted); color: var(--error); }
   .knowledge-detail-status.superseded { background: var(--warning-muted); color: var(--warning); }
   .knowledge-detail-category { background: var(--surface-2); color: var(--foreground-muted); }
 

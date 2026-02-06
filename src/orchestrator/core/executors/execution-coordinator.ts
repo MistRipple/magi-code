@@ -562,7 +562,7 @@ export class ExecutionCoordinator extends EventEmitter {
     if (analysis.hasCycle) {
       logger.warn(
         LogCategory.ORCHESTRATOR,
-        `检测到循环依赖，回退到普通并行执行: ${analysis.cycleNodes?.join(', ')}`
+        `检测到循环依赖，切换为普通并行执行: ${analysis.cycleNodes?.join(', ')}`
       );
       return this.executeParallel(options);
     }
@@ -758,5 +758,14 @@ export class ExecutionCoordinator extends EventEmitter {
       assignmentResults: new Map(this.collectedAssignmentResults),
       hasPendingApprovals,
     };
+  }
+
+  /**
+   * 销毁协调器（清理资源）
+   */
+  dispose(): void {
+    this.collectedAssignmentResults.clear();
+    this.removeAllListeners();
+    logger.debug('执行协调器.销毁', undefined, LogCategory.ORCHESTRATOR);
   }
 }

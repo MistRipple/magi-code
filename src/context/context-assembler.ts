@@ -8,7 +8,7 @@
  * - 本地最近 N 轮对话 (L2): 40%
  * - 长期记忆召回 (L3): 10%
  *
- * @see docs/context-unified-memory-plan.md 5.3 节和 7.1-7.3 节
+ * @see docs/context/unified-memory-plan.md 5.3 节和 7.1-7.3 节
  */
 
 import { logger, LogCategory } from '../logging';
@@ -136,14 +136,12 @@ export interface AssembledContext {
 
 /**
  * 共享上下文查询选项
- * 该类型是 QueryOptions 的别名，保持向后兼容
+ * 该类型是 QueryOptions 的别名
  */
 export type SharedContextQueryOptions = QueryOptions;
 
 /**
  * SharedContextPool 接口定义
- * 共享上下文池，存储跨 Worker 的摘要、决策、洞察
- * 该接口与 SharedContextPool 类兼容
  */
 export interface ISharedContextPool {
   /**
@@ -213,7 +211,7 @@ export const DEFAULT_TOKEN_BUDGET: TokenBudgetConfig = {
  * 默认本地对话轮数配置
  */
 export const DEFAULT_LOCAL_TURNS = {
-  min: 3,
+  min: 1,
   max: 10,
 };
 

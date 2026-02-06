@@ -4,8 +4,8 @@
  * 实现跨 Worker 的知识共享机制，存储任务级共享的摘要、决策、契约、风险等上下文条目。
  *
  * 设计规范参考：
- * @see docs/context-unified-memory-plan.md 5.1 节（SharedContextEntry）
- * @see docs/context-unified-memory-plan.md 8.2 节（共享上下文去重）
+ * @see docs/context/unified-memory-plan.md 5.1 节（SharedContextEntry）
+ * @see docs/context/unified-memory-plan.md 8.2 节（共享上下文去重）
  *
  * 核心功能：
  * - 添加条目（自动去重，内容相似度 > 90% 时合并来源）
@@ -17,6 +17,7 @@
 
 // 导入 ContextSource 类型，避免重复定义
 import { ContextSource } from './file-summary-cache';
+import { logger, LogCategory } from '../logging';
 
 // 重新导出 ContextSource，方便使用者从此模块导入
 export { ContextSource };
@@ -156,6 +157,17 @@ const IMPORTANCE_SCORES: Record<ImportanceLevel, number> = {
   low: 1
 };
 
+const VALID_SOURCES: ContextSource[] = ['orchestrator', 'claude', 'codex', 'gemini'];
+const VALID_IMPORTANCE: ImportanceLevel[] = ['critical', 'high', 'medium', 'low'];
+const VALID_TYPES: SharedContextEntryType[] = [
+  'decision',
+  'contract',
+  'file_summary',
+  'risk',
+  'constraint',
+  'insight',
+];
+
 // ============================================================================
 // SharedContextPool 实现
 // ============================================================================
@@ -189,7 +201,7 @@ export class SharedContextPool {
     // 1. 验证条目合法性
     const validation = this.validate(entry);
     if (!validation.allowed) {
-      console.warn(`[SharedContextPool] 拒绝写入: ${validation.reason}`);
+      logger.warn('共享上下文.拒绝写入', { reason: validation.reason }, LogCategory.SESSION);
       // 返回 merged 表示未实际添加，但不抛出错误
       return { action: 'merged', existingId: undefined };
     }
@@ -450,7 +462,61 @@ export class SharedContextPool {
    * 3. 必须包含 missionId
    */
   private validate(entry: SharedContextEntry): ValidationResult {
+    if (!entry.id || typeof entry.id !== 'string') {
+      return {
+        allowed: false,
+        reason: '缺少唯一标识 (id)'
+      };
+    }
+
+    if (!entry.type || !VALID_TYPES.includes(entry.type)) {
+      return {
+        allowed: false,
+        reason: `非法条目类型 (type=${entry.type})`
+      };
+    }
+
+    if (!entry.missionId || typeof entry.missionId !== 'string' || !entry.missionId.trim()) {
+      return {
+        allowed: false,
+        reason: '缺少任务标识 (missionId)'
+      };
+    }
+
+    if (!entry.source || !VALID_SOURCES.includes(entry.source)) {
+      return {
+        allowed: false,
+        reason: `缺少或非法来源标识 (source=${entry.source})`
+      };
+    }
+
+    if (!VALID_IMPORTANCE.includes(entry.importance)) {
+      return {
+        allowed: false,
+        reason: `非法重要性级别 (importance=${entry.importance})`
+      };
+    }
+
+    if (!Array.isArray(entry.tags)) {
+      return {
+        allowed: false,
+        reason: '缺少标签集合 (tags)'
+      };
+    }
+    if (entry.tags.some(tag => typeof tag !== 'string' || !tag.trim())) {
+      return {
+        allowed: false,
+        reason: '标签包含非法值 (tags)'
+      };
+    }
+
     // 规则 1: 内容长度限制
+    if (!entry.content || !entry.content.trim()) {
+      return {
+        allowed: false,
+        reason: '内容为空 (content)'
+      };
+    }
     if (entry.content.length > MAX_CONTENT_LENGTH) {
       return {
         allowed: false,
@@ -458,30 +524,68 @@ export class SharedContextPool {
       };
     }
 
-    // 规则 2: 必须带来源和时间戳
-    if (!entry.source) {
+    // 规则 2: 必须带时间戳
+    if (typeof entry.createdAt !== 'number' || !Number.isFinite(entry.createdAt) || entry.createdAt <= 0) {
       return {
         allowed: false,
-        reason: '缺少来源标识 (source)'
+        reason: '缺少或非法时间戳 (createdAt)'
       };
     }
 
-    if (!entry.createdAt) {
-      return {
-        allowed: false,
-        reason: '缺少时间戳 (createdAt)'
-      };
+    if (entry.expiresAt !== undefined) {
+      if (typeof entry.expiresAt !== 'number' || !Number.isFinite(entry.expiresAt)) {
+        return {
+          allowed: false,
+          reason: '失效时间非法 (expiresAt)'
+        };
+      }
+      if (entry.expiresAt <= entry.createdAt) {
+        return {
+          allowed: false,
+          reason: '失效时间必须晚于创建时间 (expiresAt <= createdAt)'
+        };
+      }
     }
 
-    // 规则 3: 必须带 missionId
-    if (!entry.missionId) {
+    // 规则 3: file_summary 必须带 fileRefs
+    if (entry.type === 'file_summary') {
+      if (!entry.fileRefs || entry.fileRefs.length === 0) {
+        return {
+          allowed: false,
+          reason: 'file_summary 缺少 fileRefs'
+        };
+      }
+      if (!this.isValidFileRefs(entry.fileRefs)) {
+        return {
+          allowed: false,
+          reason: 'fileRefs 格式非法'
+        };
+      }
+      return { allowed: true };
+    }
+
+    // 非 file_summary 条目，如提供 fileRefs 也必须合法
+    if (entry.fileRefs && !this.isValidFileRefs(entry.fileRefs)) {
       return {
         allowed: false,
-        reason: '缺少任务标识 (missionId)'
+        reason: 'fileRefs 格式非法'
       };
     }
 
     return { allowed: true };
+  }
+
+  /**
+   * 校验文件引用
+   */
+  private isValidFileRefs(fileRefs: FileReference[]): boolean {
+    return fileRefs.every(ref =>
+      ref &&
+      typeof ref.path === 'string' &&
+      ref.path.trim().length > 0 &&
+      typeof ref.hash === 'string' &&
+      ref.hash.trim().length > 0
+    );
   }
 
   /**

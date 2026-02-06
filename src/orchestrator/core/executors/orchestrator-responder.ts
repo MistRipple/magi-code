@@ -155,7 +155,7 @@ export class OrchestratorResponder {
       return createAbortResponse(`累计失败 ${this.state.failureCount} 次，终止执行`);
     }
 
-    // 可以在这里添加重试或降级逻辑
+    // 可以在这里添加重试逻辑
     return createContinueResponse();
   }
 
@@ -189,7 +189,6 @@ ${question.questionType}
       prompt,
       undefined,
       {
-        streamToUI: true,  // 🔧 让用户看到决策过程
         adapterRole: 'orchestrator',
       }
     );

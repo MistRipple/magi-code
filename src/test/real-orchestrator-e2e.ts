@@ -20,6 +20,26 @@ type StandardMsg = {
   metadata?: any;
 };
 
+type SharedEntryLike = {
+  id: string;
+  missionId: string;
+  type: string;
+  source: string;
+  sources?: string[];
+};
+
+type SharedContextMetrics = {
+  missionId: string;
+  assignments: number;
+  targetTypeCounts: Record<'decision' | 'contract' | 'risk' | 'constraint', number>;
+  totalTargetEntries: number;
+  writeDensityPerAssignment: number;
+  readCoverageRate: number;
+  reuseRate: number;
+  avgReadTimes: number;
+  mergedSourceRate: number;
+};
+
 function normalizeText(input: string): string {
   return input
     .replace(/^#{1,6}\s*/gm, '')
@@ -80,6 +100,45 @@ async function run() {
   });
 
   await orchestrator.initialize();
+
+  // 共享上下文读写统计（用于回归验收）
+  const contextManager = (orchestrator as any).contextManager as any;
+  const sharedContextPool = contextManager?.getSharedContextPool?.();
+  const missionSnapshots = new Map<string, SharedEntryLike[]>();
+  const readCountByEntry = new Map<string, number>();
+  if (contextManager && sharedContextPool) {
+    const originalPoolGetByMission = sharedContextPool.getByMission.bind(sharedContextPool);
+    const originalPoolGetByType = sharedContextPool.getByType.bind(sharedContextPool);
+    const originalClearMissionContext = contextManager.clearMissionContext.bind(contextManager);
+
+    sharedContextPool.getByMission = (missionId: string, options: any) => {
+      const entries = originalPoolGetByMission(missionId, options);
+      for (const entry of entries) {
+        readCountByEntry.set(entry.id, (readCountByEntry.get(entry.id) || 0) + 1);
+      }
+      return entries;
+    };
+
+    sharedContextPool.getByType = (missionId: string, type: string, maxTokens?: number) => {
+      const entries = originalPoolGetByType(missionId, type, maxTokens);
+      for (const entry of entries) {
+        readCountByEntry.set(entry.id, (readCountByEntry.get(entry.id) || 0) + 1);
+      }
+      return entries;
+    };
+
+    contextManager.clearMissionContext = (missionId: string) => {
+      const entries = originalPoolGetByMission(missionId, {});
+      missionSnapshots.set(
+        missionId,
+        entries.map((entry: SharedEntryLike) => ({
+          ...entry,
+          sources: Array.isArray(entry.sources) ? [...entry.sources] : undefined,
+        }))
+      );
+      return originalClearMissionContext(missionId);
+    };
+  }
 
   // TODO: LLM mode - check adapter connectivity instead of worker availability
   const availability = {
@@ -194,6 +253,62 @@ async function run() {
     return acc;
   }, {} as Record<string, number>);
   console.log('按来源统计:', bySource);
+
+  const missionId = (orchestrator as any).lastMissionId as string | null;
+  if (missionId && contextManager && sharedContextPool) {
+    const missionOrchestrator = (orchestrator as any).missionOrchestrator as any;
+    const mission = await missionOrchestrator?.getMission?.(missionId);
+    const snapshotEntries: SharedEntryLike[] =
+      missionSnapshots.get(missionId) || sharedContextPool.getByMission(missionId, {});
+    const targetTypes = ['decision', 'contract', 'risk', 'constraint'] as const;
+    const targetEntries = snapshotEntries.filter((entry) => targetTypes.includes(entry.type as any));
+
+    const typeCounts: Record<'decision' | 'contract' | 'risk' | 'constraint', number> = {
+      decision: 0,
+      contract: 0,
+      risk: 0,
+      constraint: 0,
+    };
+    for (const entry of targetEntries) {
+      const key = entry.type as keyof typeof typeCounts;
+      if (key in typeCounts) {
+        typeCounts[key] += 1;
+      }
+    }
+
+    const readCounts = targetEntries.map((entry) => readCountByEntry.get(entry.id) || 0);
+    const readCoverageCount = readCounts.filter((count) => count > 0).length;
+    const reuseCount = readCounts.filter((count) => count > 1).length;
+    const totalReads = readCounts.reduce((sum, count) => sum + count, 0);
+    const mergedSourceCount = targetEntries.filter((entry) => (entry.sources?.length || 0) > 1).length;
+    const assignments = mission?.assignments?.length || 0;
+
+    const metrics: SharedContextMetrics = {
+      missionId,
+      assignments,
+      targetTypeCounts: typeCounts,
+      totalTargetEntries: targetEntries.length,
+      writeDensityPerAssignment: assignments > 0 ? targetEntries.length / assignments : targetEntries.length,
+      readCoverageRate: targetEntries.length > 0 ? readCoverageCount / targetEntries.length : 0,
+      reuseRate: targetEntries.length > 0 ? reuseCount / targetEntries.length : 0,
+      avgReadTimes: targetEntries.length > 0 ? totalReads / targetEntries.length : 0,
+      mergedSourceRate: targetEntries.length > 0 ? mergedSourceCount / targetEntries.length : 0,
+    };
+
+    console.log('\n=== SharedContextPool 统计（decision/contract/risk/constraint） ===');
+    console.log(`missionId: ${metrics.missionId}`);
+    console.log(`assignments: ${metrics.assignments}`);
+    console.log(`typeCounts: ${JSON.stringify(metrics.targetTypeCounts)}`);
+    console.log(`totalEntries: ${metrics.totalTargetEntries}`);
+    console.log(`writeDensityPerAssignment: ${metrics.writeDensityPerAssignment.toFixed(2)}`);
+    console.log(`readCoverageRate: ${(metrics.readCoverageRate * 100).toFixed(1)}%`);
+    console.log(`reuseRate(读取>1): ${(metrics.reuseRate * 100).toFixed(1)}%`);
+    console.log(`avgReadTimes: ${metrics.avgReadTimes.toFixed(2)}`);
+    console.log(`mergedSourceRate: ${(metrics.mergedSourceRate * 100).toFixed(1)}%`);
+  } else {
+    console.log('\n=== SharedContextPool 统计 ===');
+    console.log('未获取到 missionId 或 SharedContextPool，无法统计写入密度与复用率。');
+  }
 
   process.exit(error ? 1 : 0);
 }

@@ -43,7 +43,7 @@ export class TokenCounter {
           return tokens.length;
         }
       } catch (error) {
-        // 降级到估算
+        // 切换到估算
       }
     }
 
@@ -79,7 +79,7 @@ export class TokenCounter {
           return total;
         }
       } catch (error) {
-        // 降级到估算
+        // 切换到估算
       }
     }
 
@@ -115,7 +115,7 @@ export class TokenCounter {
           return texts.map(text => (text ? encoder.encode(text).length : 0));
         }
       } catch (error) {
-        // 降级到估算
+        // 切换到估算
       }
     }
 

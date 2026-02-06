@@ -13,7 +13,14 @@ import * as vscode from 'vscode';
 /**
  * 进程状态
  */
-export type ProcessState = 'running' | 'completed' | 'killed';
+export type ProcessState =
+  | 'queued'
+  | 'starting'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'killed'
+  | 'timeout';
 
 /**
  * Shell 类型
@@ -42,6 +49,10 @@ export interface TerminalProcess {
   exitCode: number | null;
   /** 开始时间 */
   startTime: number;
+  /** 结束时间 */
+  endTime?: number;
+  /** 最后更新时间 */
+  updatedAt?: number;
   /** Shell Integration 执行对象 */
   execution?: vscode.TerminalShellExecution;
   /** 输出流 */

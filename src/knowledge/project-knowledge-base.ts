@@ -73,7 +73,7 @@ export interface CodeIndex {
 /**
  * ADR 状态
  */
-export type ADRStatus = 'proposed' | 'accepted' | 'deprecated' | 'superseded';
+export type ADRStatus = 'proposed' | 'accepted' | 'archived' | 'superseded';
 
 /**
  * 架构决策记录
@@ -1224,7 +1224,7 @@ ${conversationText}
         return;
       }
       const status = (item as any).status;
-      const normalizedStatus: ADRStatus = status === 'accepted' || status === 'deprecated' || status === 'superseded'
+      const normalizedStatus: ADRStatus = status === 'accepted' || status === 'archived' || status === 'superseded'
         ? status
         : 'proposed';
       if (normalizedStatus !== status) changed = true;

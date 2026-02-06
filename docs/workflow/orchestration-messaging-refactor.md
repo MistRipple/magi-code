@@ -65,7 +65,7 @@ Worker 执行时
 
 ### 2.1 消息类型完整列表
 
-> 来源：`docs/ux-flow-specification.md` 第 596-610 行
+> 来源：`docs/workflow/ux-flow-specification.md` 第 596-610 行
 
 #### 协议层 MessageType 枚举（12 种）
 
@@ -113,7 +113,7 @@ Worker 执行时
 
 ### 2.3 Worker 状态卡片格式
 
-> 来源：`docs/ux-flow-specification.md` 第 63-65 行、219-235 行
+> 来源：`docs/workflow/ux-flow-specification.md` 第 63-65 行、219-235 行
 
 ```
 🟡 Claude [1/3]
@@ -513,7 +513,7 @@ title: assignment.shortTitle || assignment.responsibility,
 
 | 文件路径 | 用途 |
 |---------|------|
-| `docs/ux-flow-specification.md` | UX 规范定义 |
+| `docs/workflow/ux-flow-specification.md` | UX 规范定义 |
 | `src/orchestrator/mission/types.ts` | Assignment 类型定义 |
 | `src/orchestrator/mission/state-mapper.ts` | 状态映射 |
 | `src/orchestrator/core/message-hub.ts` | 消息发送 API |

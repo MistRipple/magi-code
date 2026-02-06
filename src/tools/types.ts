@@ -120,6 +120,7 @@ export interface ShellExecuteOptions {
   showTerminal?: boolean; // 是否显示终端窗口
   keepTerminalOpen?: boolean; // 是否保持终端打开
   useVSCodeTerminal?: boolean; // 是否使用VSCode终端（默认false，使用child_process）
+
 }
 
 /**
@@ -128,6 +129,55 @@ export interface ShellExecuteOptions {
 export interface ShellExecuteResult {
   stdout: string;
   stderr: string;
-  exitCode: number;
+  exitCode: number | null;
   duration: number;
+}
+
+/**
+ * launch-process 选项
+ */
+export interface LaunchProcessOptions {
+  command: string;
+  cwd?: string;
+  wait: boolean;
+  maxWaitSeconds: number;
+  name: string;
+  showTerminal?: boolean;
+}
+
+/**
+ * launch-process 结果
+ */
+export interface LaunchProcessResult {
+  terminal_id: number;
+  status: 'queued' | 'starting' | 'running' | 'completed' | 'failed' | 'killed' | 'timeout';
+  output: string;
+  return_code: number | null;
+}
+
+/**
+ * read-process 结果
+ */
+export interface ReadProcessResult {
+  status: 'queued' | 'starting' | 'running' | 'completed' | 'failed' | 'killed' | 'timeout';
+  output: string;
+  return_code: number | null;
+  cwd?: string;
+}
+
+/**
+ * write-process 结果
+ */
+export interface WriteProcessResult {
+  accepted: boolean;
+  status: 'queued' | 'starting' | 'running' | 'completed' | 'failed' | 'killed' | 'timeout';
+}
+
+/**
+ * kill-process 结果
+ */
+export interface KillProcessResult {
+  killed: boolean;
+  final_output: string;
+  return_code: number | null;
 }

@@ -4,13 +4,19 @@
  *
  * 采用双策略模式：
  * 1. VSCodeEventsStrategy - 当 Shell Integration 可用时使用
- * 2. ScriptCaptureStrategy - 降级策略，使用 script 命令捕获输出
+ * 2. ScriptCaptureStrategy - 备用策略，使用 script 命令捕获输出
  *
  * 参考 Augment 插件实现
  */
 
 import * as vscode from 'vscode';
-import { ShellExecuteOptions, ShellExecuteResult } from './types';
+import {
+  KillProcessResult,
+  LaunchProcessOptions,
+  LaunchProcessResult,
+  ReadProcessResult,
+  WriteProcessResult,
+} from './types';
 import { logger, LogCategory } from '../logging';
 import {
   ShellType,
@@ -20,12 +26,25 @@ import {
 import { VSCodeEventsStrategy } from './terminal/vscode-events-strategy';
 import { ScriptCaptureStrategy } from './terminal/script-capture-strategy';
 
+// ============================================================================
+// 超时常量
+// ============================================================================
+
+/** 终端初始化超时 (ms) */
+const TERMINAL_INIT_TIMEOUT_MS = 5000;
+
+/** 基础模式命令发送后等待时间 (ms) */
+const SEND_TEXT_WAIT_MS = 500;
+
+/** 轮询起始延迟 (ms) */
+const POLL_START_DELAY_MS = 100;
+
 /**
  * 检测 Shell 类型
  */
 function detectShellType(terminal?: vscode.Terminal): ShellType {
   const shellPath = (terminal as any)?._creationOptions?.shellPath
-    || vscode.env.shell
+    || vscode.env?.shell
     || process.env.SHELL
     || '';
 
@@ -40,6 +59,13 @@ function detectShellType(terminal?: vscode.Terminal): ShellType {
   return 'bash'; // 默认 bash
 }
 
+const ALLOWED_AGENT_TERMINAL_NAMES = new Set([
+  'orchestrator',
+  'worker-claude',
+  'worker-gemini',
+  'worker-codex',
+]);
+
 /**
  * VSCode Terminal 执行器
  *
@@ -53,8 +79,11 @@ export class VSCodeTerminalExecutor {
 
   // 终端复用
   private mainTerminal: vscode.Terminal | null = null;
-  private mainTerminalCwd: string | undefined = undefined;
-  private mainTerminalBusy: boolean = false;
+  private terminalCwds: Map<vscode.Terminal, string | undefined> = new Map();
+  private terminalBusy: Map<vscode.Terminal, boolean> = new Map();
+  private managedTerminals: Set<vscode.Terminal> = new Set();
+  private agentTerminals: Map<string, vscode.Terminal> = new Map();
+  private terminalAgentNames: Map<vscode.Terminal, string> = new Map();
   private terminalCloseListener: vscode.Disposable | null = null;
 
   // 双策略
@@ -71,12 +100,10 @@ export class VSCodeTerminalExecutor {
 
     // 监听终端关闭事件
     this.terminalCloseListener = vscode.window.onDidCloseTerminal((closedTerminal) => {
+      this.cleanupTerminal(closedTerminal);
+
       if (this.mainTerminal === closedTerminal) {
         logger.debug('主终端被用户关闭', undefined, LogCategory.SHELL);
-        this.cleanupTerminal(closedTerminal);
-        this.mainTerminal = null;
-        this.mainTerminalCwd = undefined;
-        this.mainTerminalBusy = false;
       }
     });
   }
@@ -90,183 +117,259 @@ export class VSCodeTerminalExecutor {
       this.terminalCloseListener = null;
     }
 
-    // 清理所有终端
-    if (this.mainTerminal) {
-      this.cleanupTerminal(this.mainTerminal);
-      this.mainTerminal.dispose();
-      this.mainTerminal = null;
+    for (const terminal of this.managedTerminals) {
+      this.cleanupTerminal(terminal);
+      terminal.dispose();
     }
 
+    this.mainTerminal = null;
+    this.terminalCwds.clear();
+    this.terminalBusy.clear();
+    this.managedTerminals.clear();
+    this.agentTerminals.clear();
+    this.terminalAgentNames.clear();
     this.terminalInitialized.clear();
     this.terminalShellType.clear();
   }
 
-  /**
-   * 执行 Shell 命令（使用VSCode Terminal）
-   */
-  async execute(options: ShellExecuteOptions): Promise<ShellExecuteResult> {
-    const startTime = Date.now();
-    const timeout = Math.min(
-      options.timeout || this.defaultTimeout,
-      this.maxTimeout
-    );
 
-    logger.debug('执行 Shell 命令', {
-      command: options.command,
+  async launchProcess(options: LaunchProcessOptions): Promise<LaunchProcessResult> {
+    const timeout = Math.min(Math.max(options.maxWaitSeconds, 1) * 1000, this.maxTimeout);
+    const agentName = (options.name || '').trim();
+    if (!agentName) {
+      throw new Error('launch-process 必须提供 agent 终端名称（orchestrator、worker-claude、worker-gemini、worker-codex）');
+    }
+    if (!ALLOWED_AGENT_TERMINAL_NAMES.has(agentName)) {
+      throw new Error('launch-process name 仅支持 orchestrator、worker-claude、worker-gemini、worker-codex');
+    }
+
+    const terminal = await this.getOrCreateTerminal({
       cwd: options.cwd,
-      timeout,
-      showTerminal: options.showTerminal,
-    }, LogCategory.SHELL);
+      env: undefined,
+      name: agentName,
+    });
 
-    try {
-      // 创建或复用终端
-      const terminal = await this.getOrCreateTerminal(options);
-      const processId = this.nextId++;
+    if (options.showTerminal ?? true) {
+      terminal.show(true);
+    }
 
-      // 标记主终端为忙碌状态
-      const isMainTerminal = terminal === this.mainTerminal;
-      if (isMainTerminal) {
-        this.mainTerminalBusy = true;
-      }
+    const processId = this.nextId++;
+    const shellType = this.terminalShellType.get(terminal) || detectShellType(terminal);
+    const process: TerminalProcess = {
+      id: processId,
+      terminal,
+      command: options.command,
+      actualCommand: options.command,
+      lastCommand: '',
+      startTime: Date.now(),
+      output: '',
+      exitCode: null,
+      state: 'starting',
+    };
+    this.processes.set(processId, process);
+    this.terminalBusy.set(terminal, true);
 
-      // 如果需要显示终端
-      if (options.showTerminal) {
-        terminal.show(true);
-      }
+    process.state = 'running';
+    void this.executeCommand(process, options.command, timeout, shellType)
+      .then(() => {
+        if (process.state === 'running') {
+          process.state = process.exitCode === 0 ? 'completed' : 'failed';
+        }
+      })
+      .catch((error: any) => {
+        if (process.state !== 'killed' && process.state !== 'timeout') {
+          process.state = 'failed';
+          process.exitCode = process.exitCode ?? 1;
+          process.output = process.output || String(error?.message || error);
+        }
+      })
+      .finally(() => {
+        process.endTime = Date.now();
+        this.terminalBusy.set(terminal, false);
+      });
 
-      // 获取 Shell 类型
-      const shellType = this.terminalShellType.get(terminal) || detectShellType(terminal);
+    if (options.wait) {
+      await this.waitForProcessState(processId, timeout);
+    }
 
-      // 注册进程
-      const process: TerminalProcess = {
-        id: processId,
-        terminal,
-        command: options.command,
-        actualCommand: options.command,
-        lastCommand: '',
-        startTime,
-        output: '',
-        exitCode: null,
-        state: 'running' as ProcessState,
+    return {
+      terminal_id: processId,
+      status: process.state,
+      output: process.output,
+      return_code: process.exitCode,
+    };
+  }
+
+  async readProcess(terminalId: number, wait: boolean, maxWaitSeconds: number): Promise<ReadProcessResult> {
+    const process = this.processes.get(terminalId);
+    if (!process) {
+      throw new Error(`终端进程不存在: ${terminalId}`);
+    }
+
+    if (wait && (process.state === 'running' || process.state === 'starting')) {
+      const timeout = Math.min(Math.max(maxWaitSeconds, 1) * 1000, this.maxTimeout);
+      await this.waitForProcessState(terminalId, timeout);
+    }
+
+    const cwd = this.terminalCwds.get(process.terminal) || this.getCwd(process.terminal);
+    return {
+      status: process.state,
+      output: process.output,
+      return_code: process.exitCode,
+      cwd,
+    };
+  }
+
+  async writeProcess(terminalId: number, inputText: string): Promise<WriteProcessResult> {
+    const process = this.processes.get(terminalId);
+    if (!process) {
+      throw new Error(`终端进程不存在: ${terminalId}`);
+    }
+
+    if (process.state !== 'running') {
+      return {
+        accepted: false,
+        status: process.state,
       };
-      this.processes.set(processId, process);
+    }
 
-      // 执行命令
-      await this.executeCommand(process, options.command, timeout, shellType);
+    process.terminal.sendText(inputText);
+    return {
+      accepted: true,
+      status: process.state,
+    };
+  }
 
-      const duration = Date.now() - startTime;
-
-      const result: ShellExecuteResult = {
-        stdout: process.output,
-        stderr: '',
-        exitCode: process.exitCode || 0,
-        duration,
+  async killProcess(terminalId: number): Promise<KillProcessResult> {
+    const process = this.processes.get(terminalId);
+    if (!process) {
+      return {
+        killed: false,
+        final_output: '',
+        return_code: null,
       };
+    }
 
-      logger.debug('Shell 命令完成', {
-        command: options.command,
-        exitCode: result.exitCode,
-        duration,
-        outputLength: result.stdout.length,
-      }, LogCategory.SHELL);
+    process.state = 'killed';
+    process.exitCode = process.exitCode ?? -1;
+    process.terminal.sendText('\x03');
+    await this.delay(100);
 
-      // 清理进程记录
-      this.processes.delete(processId);
+    process.endTime = Date.now();
+    this.terminalBusy.set(process.terminal, false);
 
-      // 命令完成后，标记主终端为空闲
-      if (isMainTerminal) {
-        this.mainTerminalBusy = false;
+    return {
+      killed: true,
+      final_output: process.output,
+      return_code: process.exitCode,
+    };
+  }
+
+  listProcessRecords(): Array<{
+    terminal_id: number;
+    status: ProcessState;
+    command: string;
+    started_at: number;
+  }> {
+    const result: Array<{
+      terminal_id: number;
+      status: ProcessState;
+      command: string;
+      started_at: number;
+    }> = [];
+
+    for (const [id, process] of this.processes.entries()) {
+      result.push({
+        terminal_id: id,
+        status: process.state,
+        command: process.command,
+        started_at: process.startTime,
+      });
+    }
+
+    return result;
+  }
+
+  private async waitForProcessState(processId: number, timeoutMs: number): Promise<void> {
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const process = this.processes.get(processId);
+      if (!process) {
+        return;
       }
 
-      // 终端复用：只有在明确要求关闭且不是主终端时才关闭
-      if (!options.keepTerminalOpen && terminal !== this.mainTerminal) {
-        terminal.dispose();
+      if (process.state !== 'running' && process.state !== 'starting') {
+        return;
       }
 
-      return result;
-    } catch (error: any) {
-      // 异常时也要重置忙碌状态
-      this.mainTerminalBusy = false;
+      await this.delay(100);
+    }
 
-      const duration = Date.now() - startTime;
-
-      const result: ShellExecuteResult = {
-        stdout: '',
-        stderr: error.message,
-        exitCode: 1,
-        duration,
-      };
-
-      logger.error('Shell 命令失败', {
-        command: options.command,
-        duration,
-        error: error.message,
-      }, LogCategory.SHELL);
-
-      return result;
+    const process = this.processes.get(processId);
+    if (process && (process.state === 'running' || process.state === 'starting')) {
+      process.state = 'timeout';
+      process.exitCode = process.exitCode ?? null;
+      process.endTime = Date.now();
+      this.terminalBusy.set(process.terminal, false);
     }
   }
+
+
 
   /**
    * 获取或创建终端
    */
-  private async getOrCreateTerminal(options: ShellExecuteOptions): Promise<vscode.Terminal> {
-    const terminalName = options.name || 'MultiCLI';
+  private async getOrCreateTerminal(
+    options: { cwd?: string; env?: Record<string, string>; name?: string }
+  ): Promise<vscode.Terminal> {
+    const agentName = (options.name || '').trim();
     const targetCwd = options.cwd;
 
-    // 检查是否可以复用主终端（存活且空闲）
-    if (this.mainTerminal && this.isTerminalAlive(this.mainTerminal) && !this.mainTerminalBusy) {
-      logger.debug('复用现有主终端 (空闲)', {
-        currentCwd: this.mainTerminalCwd,
-        targetCwd
-      }, LogCategory.SHELL);
+    if (!agentName) {
+      throw new Error('终端名称不能为空');
+    }
 
-      // 如果工作目录不同，先切换目录
-      if (targetCwd && targetCwd !== this.mainTerminalCwd) {
-        this.mainTerminal.sendText(`cd "${targetCwd}"`);
-        this.mainTerminalCwd = targetCwd;
+    const agentTerminal = this.agentTerminals.get(agentName);
+
+    if (agentTerminal && this.isTerminalAlive(agentTerminal) && !this.terminalBusy.get(agentTerminal)) {
+      const currentCwd = this.terminalCwds.get(agentTerminal);
+      logger.debug('复用 agent 专属终端', { agentName, currentCwd, targetCwd }, LogCategory.SHELL);
+
+      if (targetCwd && targetCwd !== currentCwd) {
+        agentTerminal.sendText(`cd "${targetCwd}"`);
+        this.terminalCwds.set(agentTerminal, targetCwd);
         await this.delay(100);
       }
 
-      // 确保终端策略可用
-      await this.ensureTerminalReady(this.mainTerminal);
-
-      return this.mainTerminal;
+      await this.ensureTerminalReady(agentTerminal);
+      this.mainTerminal = agentTerminal;
+      return agentTerminal;
     }
 
-    // 主终端被占用时，创建新终端
-    if (this.mainTerminal && this.isTerminalAlive(this.mainTerminal) && this.mainTerminalBusy) {
-      logger.debug('主终端忙碌，创建新终端', undefined, LogCategory.SHELL);
+    if (agentTerminal && !this.isTerminalAlive(agentTerminal)) {
+      this.cleanupTerminal(agentTerminal);
     }
 
-    // 创建新终端
-    const terminalOptions: vscode.TerminalOptions = {
-      name: terminalName,
+    logger.debug('创建 agent 专属终端', { agentName, cwd: targetCwd }, LogCategory.SHELL);
+    const terminal = vscode.window.createTerminal({
+      name: agentName,
       cwd: targetCwd,
       env: options.env,
       isTransient: false,
-    };
-
-    logger.debug('创建新 VSCode 终端', terminalOptions, LogCategory.SHELL);
-
-    const terminal = vscode.window.createTerminal(terminalOptions);
-
-    // 等待终端准备就绪
+    });
     await this.waitForTerminalReady(terminal);
 
-    // 检测 Shell 类型
     const shellType = detectShellType(terminal);
     this.terminalShellType.set(terminal, shellType);
-
-    // 初始化终端策略
     await this.initializeTerminalStrategy(terminal, shellType);
 
-    // 设为主终端
-    if (!this.mainTerminal || !this.isTerminalAlive(this.mainTerminal)) {
-      this.mainTerminal = terminal;
-      this.mainTerminalCwd = targetCwd;
-      this.mainTerminalBusy = false;
-    }
+    this.managedTerminals.add(terminal);
+    this.terminalCwds.set(terminal, targetCwd);
+    this.terminalBusy.set(terminal, false);
+    this.agentTerminals.set(agentName, terminal);
+    this.terminalAgentNames.set(terminal, agentName);
+    this.mainTerminal = terminal;
 
     return terminal;
   }
@@ -287,7 +390,7 @@ export class VSCodeTerminalExecutor {
       return;
     }
 
-    // 降级到 ScriptCapture 策略
+    // 切换到 ScriptCapture 策略
     logger.debug('Shell Integration 不可用，使用 ScriptCapture 策略', { shellType }, LogCategory.SHELL);
     const success = await this.scriptCaptureStrategy.setupTerminal(terminal, shellType);
 
@@ -339,6 +442,22 @@ export class VSCodeTerminalExecutor {
     this.scriptCaptureStrategy.cleanupTerminal(terminal);
     this.terminalInitialized.delete(terminal);
     this.terminalShellType.delete(terminal);
+    this.terminalCwds.delete(terminal);
+    this.terminalBusy.delete(terminal);
+    this.managedTerminals.delete(terminal);
+
+    const agentName = this.terminalAgentNames.get(terminal);
+    if (agentName) {
+      const mappedTerminal = this.agentTerminals.get(agentName);
+      if (mappedTerminal === terminal) {
+        this.agentTerminals.delete(agentName);
+      }
+      this.terminalAgentNames.delete(terminal);
+    }
+
+    if (this.mainTerminal === terminal) {
+      this.mainTerminal = null;
+    }
   }
 
   /**
@@ -355,7 +474,7 @@ export class VSCodeTerminalExecutor {
     const processId = await Promise.race([
       terminal.processId,
       new Promise<number>((_, reject) =>
-        setTimeout(() => reject(new Error('终端初始化超时')), 5000)
+        setTimeout(() => reject(new Error('终端初始化超时')), TERMINAL_INIT_TIMEOUT_MS)
       ),
     ]);
 
@@ -507,7 +626,7 @@ export class VSCodeTerminalExecutor {
       };
 
       // 等待一小段时间让命令开始执行
-      setTimeout(poll, 100);
+      setTimeout(poll, POLL_START_DELAY_MS);
     });
   }
 
@@ -533,7 +652,7 @@ export class VSCodeTerminalExecutor {
           note: '无法捕获输出，请查看终端窗口',
         }, LogCategory.SHELL);
         resolve();
-      }, 500);
+      }, SEND_TEXT_WAIT_MS);
     });
   }
 
@@ -653,51 +772,6 @@ export class VSCodeTerminalExecutor {
     return { valid: true };
   }
 
-  /**
-   * 获取工具定义（用于 LLM）
-   */
-  getToolDefinition() {
-    return {
-      name: 'execute_shell',
-      description: 'Execute a shell command in a VSCode terminal window. The terminal is shown to the user for visibility and interactive commands.',
-      input_schema: {
-        type: 'object' as const,
-        properties: {
-          command: {
-            type: 'string' as const,
-            description: 'The shell command to execute',
-            required: true,
-          },
-          cwd: {
-            type: 'string' as const,
-            description: 'Working directory for the command (optional)',
-            required: false,
-          },
-          timeout: {
-            type: 'number' as const,
-            description: 'Timeout in milliseconds (default: 30000, max: 300000)',
-            required: false,
-          },
-          showTerminal: {
-            type: 'boolean' as const,
-            description: 'Whether to show the terminal window to the user (default: true)',
-            required: false,
-          },
-          keepTerminalOpen: {
-            type: 'boolean' as const,
-            description: 'Whether to keep the terminal open after command completes (default: false)',
-            required: false,
-          },
-          name: {
-            type: 'string' as const,
-            description: 'Name for the terminal window (default: "MultiCLI")',
-            required: false,
-          },
-        },
-        required: ['command'],
-      },
-    };
-  }
 
   private delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));

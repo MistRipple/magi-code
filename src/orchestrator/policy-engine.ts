@@ -19,8 +19,8 @@ import { WorkerAssignmentLoader } from './profile/worker-assignments';
 export interface WorkerSelectionPolicy {
   /** 推荐的 Worker */
   recommendedWorker: WorkerSlot;
-  /** 备选 Worker 列表 */
-  fallbackWorkers: WorkerSlot[];
+  /** 候选 Worker 列表 */
+  alternativeWorkers: WorkerSlot[];
   /** 选择原因 */
   reason: string;
   /** 置信度 (0-1) */
@@ -127,7 +127,7 @@ export class PolicyEngine extends EventEmitter {
 
     return {
       recommendedWorker: assignedWorker,
-      fallbackWorkers: [],
+      alternativeWorkers: [],
       reason: `任务类型 "${taskType}" 归属 ${assignedWorker}`,
       confidence: this.calculateConfidence(assignedWorker),
     };
@@ -432,20 +432,20 @@ export class PolicyEngine extends EventEmitter {
     return false;
   }
 
-  // ========== 降级策略 ==========
+  // ========== 替代策略 ==========
 
   /**
-   * 获取 Worker 降级顺序
+   * 获取 Worker 候选顺序
    */
-  getFallbackOrder(primaryWorker: WorkerSlot): WorkerSlot[] {
+  getAlternativeOrder(primaryWorker: WorkerSlot): WorkerSlot[] {
     const allWorkers: WorkerSlot[] = ['claude', 'codex', 'gemini'];
     const available = this.getAvailableWorkers();
 
-    // 移除主 Worker，按健康状态排序剩余的
-    const fallbacks = allWorkers
+    // 移除主 Worker，按健康状态排序剩余候选
+    const alternatives = allWorkers
       .filter(w => w !== primaryWorker && available.includes(w));
 
-    return this.sortByHealth(fallbacks);
+    return this.sortByHealth(alternatives);
   }
 
   /**
@@ -455,9 +455,9 @@ export class PolicyEngine extends EventEmitter {
     // 更新健康状态
     this.updateWorkerHealth(failedWorker, false, 0, error);
 
-    // 获取降级选项
-    const fallbacks = this.getFallbackOrder(failedWorker);
-    return fallbacks.length > 0 ? fallbacks[0] : null;
+    // 获取候选选项
+    const alternatives = this.getAlternativeOrder(failedWorker);
+    return alternatives.length > 0 ? alternatives[0] : null;
   }
 
   // ========== 执行策略 ==========

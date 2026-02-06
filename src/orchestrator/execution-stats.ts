@@ -1,7 +1,7 @@
 /**
  * 执行统计模块
  * 记录每个模型的执行历史、成功率、平均耗时等统计数据
- * 用于智能模型选择和降级决策
+ * 用于智能模型选择与替代建议决策
  */
 
 import { logger, LogCategory } from '../logging';
@@ -52,8 +52,8 @@ export interface WorkerStats {
 }
 
 
-/** 降级建议 */
-export interface FallbackSuggestion {
+/** 替代建议 */
+export interface AlternativeSuggestion {
   originalWorker: WorkerSlot;
   suggestedWorker: WorkerSlot;
   reason: string;
@@ -228,12 +228,12 @@ export class ExecutionStats {
       .map(s => s.worker as WorkerSlot);
   }
 
-  /** 获取降级建议 */
-  getFallbackSuggestion(
+  /** 获取替代建议 */
+  getAlternativeSuggestion(
     failedWorker: WorkerSlot,
     excludeWorkers: WorkerSlot[] = [],
     availableWorkers?: WorkerSlot[]
-  ): FallbackSuggestion | null {
+  ): AlternativeSuggestion | null {
     const allStats = this.getAllStats();
     const candidates = allStats
       .filter(s => this.isWorkerSlot(s.worker))
@@ -259,7 +259,7 @@ export class ExecutionStats {
     return {
       originalWorker: failedWorker,
       suggestedWorker: best.worker as WorkerSlot,
-      reason: this.buildFallbackReason(failedStats, best),
+      reason: this.buildSuggestionReason(failedStats, best),
       confidence: this.calculateConfidence(best),
     };
   }
@@ -297,8 +297,8 @@ export class ExecutionStats {
     return 'unknown';
   }
 
-  /** 构建降级原因说明 */
-  private buildFallbackReason(failed: WorkerStats, suggested: WorkerStats): string {
+  /** 构建建议原因说明 */
+  private buildSuggestionReason(failed: WorkerStats, suggested: WorkerStats): string {
     const reasons: string[] = [];
 
     if (failed.recentFailures > 3) {
@@ -314,7 +314,7 @@ export class ExecutionStats {
     return reasons.join('；') || `${suggested.worker} 当前状态更稳定`;
   }
 
-  /** 计算降级建议的置信度 */
+  /** 计算建议的置信度 */
   private calculateConfidence(stats: WorkerStats): number {
     const sampleFactor = Math.min(stats.totalExecutions / 10, 1);
     const successFactor = stats.successRate;

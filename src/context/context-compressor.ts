@@ -5,13 +5,14 @@
  * 策略优先级：
  * 1. 预防性截断（Augment 风格）- 从源头控制大小
  * 2. LLM 智能压缩 - 保留语义信息
- * 3. 简单压缩（降级方案）- 基于重要性评分
+ * 3. 简单压缩（备用方案）- 基于重要性评分
  */
 
 import { logger, LogCategory } from '../logging';
 import { MemoryDocument } from './memory-document';
 import { CompressionConfig, MemoryContent, DEFAULT_TRUNCATION_CONFIG } from './types';
 import { TruncationUtils, TruncationResult } from './truncation-utils';
+import { extractEmbeddedJson } from '../utils/content-parser';
 
 // 压缩提示词（升级版：对齐 Claude Code 压缩格式）
 const COMPRESSION_PROMPT = `你是一个专业的上下文压缩助手。请对以下会话 Memory 进行压缩，保留关键信息。
@@ -133,7 +134,7 @@ export class ContextCompressor {
 
   /**
    * 压缩 Memory 文档
-   * 混合策略：预防性截断 + LLM 智能压缩 + 简单压缩（降级）
+   * 混合策略：预防性截断 + LLM 智能压缩 + 简单压缩（备用方案）
    */
   async compress(memory: MemoryDocument): Promise<boolean> {
     const content = memory.getContent();
@@ -164,10 +165,10 @@ export class ContextCompressor {
         this.updateStats(originalTokens, memory.estimateTokens(), 'llm', truncationApplied);
         return true;
       }
-      logger.info('上下文压缩.LLM.降级_为_简单', undefined, LogCategory.SESSION);
+      logger.info('上下文压缩.LLM.切换_为_简单', undefined, LogCategory.SESSION);
     }
 
-    // 第三步：简单压缩（降级方案）
+    // 第三步：简单压缩（备用方案）
     logger.info('上下文压缩.简单.开始', undefined, LogCategory.SESSION);
     if (this.trySimpleCompression(memory)) {
       this.updateStats(originalTokens, memory.estimateTokens(), 'simple', truncationApplied);
@@ -510,27 +511,83 @@ export class ContextCompressor {
       logger.info('上下文压缩.LLM.开始', undefined, LogCategory.SESSION);
       const response = await this.adapter.sendMessage(prompt);
 
-      // 解析 JSON 响应
-      const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/);
-      if (!jsonMatch) {
-        logger.error('上下文压缩.LLM.解析_失败', undefined, LogCategory.SESSION);
+      const candidates = this.extractCompressionCandidates(response);
+      if (candidates.length === 0) {
+        logger.error('上下文压缩.LLM.解析_失败', { reason: '未提取到 JSON 候选' }, LogCategory.SESSION);
         return false;
       }
 
-      const compressed = JSON.parse(jsonMatch[1]);
-      const validated = this.validateMemoryContent(compressed);
-      if (!validated.valid) {
-        logger.error('上下文压缩.LLM.解析_失败', { reason: validated.error }, LogCategory.SESSION);
-        return false;
+      let lastValidationError = '无可用候选';
+      for (const candidate of candidates) {
+        const validated = this.validateMemoryContent(candidate);
+        if (validated.valid) {
+          memory.replaceContent(validated.content);
+          logger.info('上下文压缩.LLM.完成', {
+            candidates: candidates.length,
+          }, LogCategory.SESSION);
+          return true;
+        }
+        lastValidationError = validated.error;
       }
-      memory.replaceContent(validated.content);
 
-      logger.info('上下文压缩.LLM.完成', undefined, LogCategory.SESSION);
-      return true;
+      logger.error('上下文压缩.LLM.解析_失败', {
+        reason: lastValidationError,
+        candidates: candidates.length,
+      }, LogCategory.SESSION);
+      return false;
     } catch (error) {
       logger.error('上下文压缩.LLM.失败', error, LogCategory.SESSION);
       return false;
     }
+  }
+
+  /**
+   * 从 LLM 响应中提取压缩结果候选 JSON
+   *
+   * 提取顺序：
+   * 1. fenced code block（```json ... ``` 或 ``` ... ```）
+   * 2. 混合文本中的嵌入 JSON
+   * 3. 纯 JSON 响应
+   */
+  private extractCompressionCandidates(response: string): any[] {
+    const candidates: any[] = [];
+    const rawJsonTexts: string[] = [];
+
+    const fencedRegex = /```(?:json)?\s*([\s\S]*?)\s*```/gi;
+    let match: RegExpExecArray | null = null;
+    while ((match = fencedRegex.exec(response)) !== null) {
+      const jsonText = (match[1] || '').trim();
+      if (jsonText) {
+        rawJsonTexts.push(jsonText);
+      }
+    }
+
+    const embeddedJson = extractEmbeddedJson(response);
+    for (const item of embeddedJson) {
+      const jsonText = item.jsonText.trim();
+      if (jsonText) {
+        rawJsonTexts.push(jsonText);
+      }
+    }
+
+    const trimmed = response.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      rawJsonTexts.push(trimmed);
+    }
+
+    const uniqueTexts = Array.from(new Set(rawJsonTexts));
+    for (const jsonText of uniqueTexts) {
+      try {
+        const parsed = JSON.parse(jsonText);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          candidates.push(parsed);
+        }
+      } catch {
+        // 忽略非法 JSON 片段，继续尝试其他候选
+      }
+    }
+
+    return candidates;
   }
 
   private validateMemoryContent(input: any): { valid: true; content: MemoryContent } | { valid: false; error: string } {
@@ -557,7 +614,7 @@ export class ContextCompressor {
       }
     }
 
-    // ========== 数组字段验证 ==========
+    // ========== 数组字段归一化 ==========
     const arrayFields = [
       'currentTasks', 'completedTasks', 'keyDecisions', 'codeChanges',
       'importantContext', 'pendingIssues', 'userConstraints', 'userMessages',
@@ -570,91 +627,263 @@ export class ContextCompressor {
       }
     }
 
-    // ========== 类型验证函数 ==========
-    const isTaskRecord = (task: any) =>
-      task &&
-      typeof task.id === 'string' &&
-      typeof task.description === 'string' &&
-      typeof task.status === 'string' &&
-      typeof task.timestamp === 'string';
+    const now = new Date().toISOString();
+    const toNonEmptyString = (value: unknown): string | undefined => {
+      if (typeof value !== 'string') {
+        return undefined;
+      }
+      const trimmed = value.trim();
+      return trimmed ? trimmed : undefined;
+    };
+    const autoId = (prefix: string, index: number): string =>
+      `${prefix}_${Date.now().toString(36)}_${index.toString(36)}`;
 
-    const isDecision = (decision: any) =>
-      decision &&
-      typeof decision.id === 'string' &&
-      typeof decision.description === 'string' &&
-      typeof decision.reason === 'string' &&
-      typeof decision.timestamp === 'string';
+    const normalizeTaskStatus = (
+      status: unknown,
+      defaultStatus: 'pending' | 'in_progress' | 'completed' | 'failed'
+    ): 'pending' | 'in_progress' | 'completed' | 'failed' => {
+      if (typeof status !== 'string') {
+        return defaultStatus;
+      }
+      const normalized = status.toLowerCase().replace(/[\s-]/g, '_');
+      switch (normalized) {
+        case 'pending':
+        case 'todo':
+          return 'pending';
+        case 'in_progress':
+        case 'doing':
+        case 'running':
+          return 'in_progress';
+        case 'completed':
+        case 'done':
+        case 'success':
+          return 'completed';
+        case 'failed':
+        case 'failure':
+        case 'error':
+          return 'failed';
+        default:
+          return defaultStatus;
+      }
+    };
 
-    const isCodeChange = (change: any) =>
-      change &&
-      typeof change.file === 'string' &&
-      typeof change.action === 'string' &&
-      typeof change.summary === 'string' &&
-      typeof change.timestamp === 'string';
+    const normalizeTaskRecord = (
+      task: unknown,
+      index: number,
+      defaultTaskStatus: 'pending' | 'in_progress' | 'completed' | 'failed'
+    ): any | null => {
+      if (typeof task === 'string') {
+        const description = toNonEmptyString(task);
+        if (!description) {
+          return null;
+        }
+        return {
+          id: autoId('task', index),
+          description,
+          status: defaultTaskStatus,
+          timestamp: now,
+        };
+      }
+      if (!task || typeof task !== 'object') {
+        return null;
+      }
 
-    const isIssue = (issue: any) =>
-      issue &&
-      typeof issue.id === 'string' &&
-      typeof issue.description === 'string' &&
-      typeof issue.source === 'string' &&
-      typeof issue.timestamp === 'string';
+      const record = task as Record<string, unknown>;
+      const description = toNonEmptyString(record.description)
+        || toNonEmptyString(record.title)
+        || toNonEmptyString(record.task)
+        || toNonEmptyString(record.name);
+      if (!description) {
+        return null;
+      }
 
-    const isResolvedIssue = (issue: any) =>
-      issue &&
-      typeof issue.id === 'string' &&
-      typeof issue.problem === 'string' &&
-      typeof issue.rootCause === 'string' &&
-      typeof issue.solution === 'string' &&
-      typeof issue.timestamp === 'string';
+      return {
+        id: toNonEmptyString(record.id) || autoId('task', index),
+        description,
+        status: normalizeTaskStatus(record.status, defaultTaskStatus),
+        assignedWorker: toNonEmptyString(record.assignedWorker) || toNonEmptyString(record.worker),
+        result: toNonEmptyString(record.result) || toNonEmptyString(record.summary),
+        timestamp: toNonEmptyString(record.timestamp) || now,
+      };
+    };
 
-    const isRejectedApproach = (approach: any) =>
-      approach &&
-      typeof approach.id === 'string' &&
-      typeof approach.approach === 'string' &&
-      typeof approach.reason === 'string' &&
-      typeof approach.rejectedBy === 'string' &&
-      typeof approach.timestamp === 'string';
+    const normalizeTasks = (
+      tasks: unknown[],
+      defaultTaskStatus: 'pending' | 'in_progress' | 'completed' | 'failed'
+    ): any[] => tasks
+      .map((task, index) => normalizeTaskRecord(task, index, defaultTaskStatus))
+      .filter((task): task is Record<string, unknown> => Boolean(task));
 
-    const isUserMessage = (msg: any) =>
-      msg &&
-      typeof msg.content === 'string' &&
-      typeof msg.timestamp === 'string' &&
-      typeof msg.isKeyInstruction === 'boolean';
+    input.currentTasks = normalizeTasks(input.currentTasks as unknown[], 'pending');
+    input.completedTasks = normalizeTasks(input.completedTasks as unknown[], 'completed');
 
-    // ========== 执行验证 ==========
-    if (!input.currentTasks.every(isTaskRecord)) {
-      return { valid: false, error: 'currentTasks invalid' };
-    }
-    if (!input.completedTasks.every(isTaskRecord)) {
-      return { valid: false, error: 'completedTasks invalid' };
-    }
-    if (!input.keyDecisions.every(isDecision)) {
-      return { valid: false, error: 'keyDecisions invalid' };
-    }
-    if (!input.codeChanges.every(isCodeChange)) {
-      return { valid: false, error: 'codeChanges invalid' };
-    }
-    if (!input.importantContext.every((v: any) => typeof v === 'string')) {
-      return { valid: false, error: 'importantContext invalid' };
-    }
-    if (!input.pendingIssues.every(isIssue)) {
-      return { valid: false, error: 'pendingIssues invalid' };
-    }
-    if (!input.userConstraints.every((v: any) => typeof v === 'string')) {
-      return { valid: false, error: 'userConstraints invalid' };
-    }
-    if (!input.userMessages.every(isUserMessage)) {
-      return { valid: false, error: 'userMessages invalid' };
-    }
-    if (!input.nextSteps.every((v: any) => typeof v === 'string')) {
-      return { valid: false, error: 'nextSteps invalid' };
-    }
-    if (!input.resolvedIssues.every(isResolvedIssue)) {
-      return { valid: false, error: 'resolvedIssues invalid' };
-    }
-    if (!input.rejectedApproaches.every(isRejectedApproach)) {
-      return { valid: false, error: 'rejectedApproaches invalid' };
-    }
+    input.keyDecisions = (input.keyDecisions as unknown[])
+      .map((decision, index) => {
+        if (typeof decision === 'string') {
+          const description = toNonEmptyString(decision);
+          if (!description) {
+            return null;
+          }
+          return {
+            id: autoId('decision', index),
+            description,
+            reason: '压缩保留',
+            timestamp: now,
+          };
+        }
+        if (!decision || typeof decision !== 'object') {
+          return null;
+        }
+        const value = decision as Record<string, unknown>;
+        const description = toNonEmptyString(value.description);
+        if (!description) {
+          return null;
+        }
+        return {
+          id: toNonEmptyString(value.id) || autoId('decision', index),
+          description,
+          reason: toNonEmptyString(value.reason) || '压缩保留',
+          timestamp: toNonEmptyString(value.timestamp) || now,
+        };
+      })
+      .filter(Boolean);
+
+    const normalizeCodeAction = (action: unknown): 'add' | 'modify' | 'delete' => {
+      if (typeof action !== 'string') {
+        return 'modify';
+      }
+      const normalized = action.toLowerCase();
+      if (normalized.includes('add') || normalized.includes('create') || normalized.includes('new')) {
+        return 'add';
+      }
+      if (normalized.includes('delete') || normalized.includes('remove')) {
+        return 'delete';
+      }
+      return 'modify';
+    };
+
+    input.codeChanges = (input.codeChanges as unknown[])
+      .map((change) => {
+        if (!change || typeof change !== 'object') {
+          return null;
+        }
+        const value = change as Record<string, unknown>;
+        const file = toNonEmptyString(value.file) || toNonEmptyString(value.path);
+        if (!file) {
+          return null;
+        }
+        return {
+          file,
+          action: normalizeCodeAction(value.action),
+          summary: toNonEmptyString(value.summary) || toNonEmptyString(value.description) || '',
+          timestamp: toNonEmptyString(value.timestamp) || now,
+        };
+      })
+      .filter(Boolean);
+
+    input.importantContext = (input.importantContext as unknown[])
+      .map((item) => toNonEmptyString(item))
+      .filter((item): item is string => Boolean(item));
+
+    input.pendingIssues = (input.pendingIssues as unknown[])
+      .map((issue, index) => {
+        if (typeof issue === 'string') {
+          const description = toNonEmptyString(issue);
+          if (!description) {
+            return null;
+          }
+          return {
+            id: autoId('issue', index),
+            description,
+            source: 'system',
+            timestamp: now,
+          };
+        }
+        if (!issue || typeof issue !== 'object') {
+          return null;
+        }
+        const value = issue as Record<string, unknown>;
+        const description = toNonEmptyString(value.description) || toNonEmptyString(value.problem);
+        if (!description) {
+          return null;
+        }
+        const source = toNonEmptyString(value.source);
+        const normalizedSource = (source === 'user' || source === 'system' || source === 'ai') ? source : 'system';
+        return {
+          id: toNonEmptyString(value.id) || autoId('issue', index),
+          description,
+          source: normalizedSource,
+          timestamp: toNonEmptyString(value.timestamp) || now,
+        };
+      })
+      .filter(Boolean);
+
+    input.userConstraints = (input.userConstraints as unknown[])
+      .map((item) => toNonEmptyString(item))
+      .filter((item): item is string => Boolean(item));
+
+    input.userMessages = (input.userMessages as unknown[])
+      .map((msg) => {
+        if (!msg || typeof msg !== 'object') {
+          return null;
+        }
+        const value = msg as Record<string, unknown>;
+        const content = toNonEmptyString(value.content);
+        if (!content) {
+          return null;
+        }
+        return {
+          content,
+          timestamp: toNonEmptyString(value.timestamp) || now,
+          isKeyInstruction: Boolean(value.isKeyInstruction),
+        };
+      })
+      .filter(Boolean);
+
+    input.nextSteps = (input.nextSteps as unknown[])
+      .map((item) => toNonEmptyString(item))
+      .filter((item): item is string => Boolean(item));
+
+    input.resolvedIssues = (input.resolvedIssues as unknown[])
+      .map((issue, index) => {
+        if (!issue || typeof issue !== 'object') {
+          return null;
+        }
+        const value = issue as Record<string, unknown>;
+        const problem = toNonEmptyString(value.problem) || toNonEmptyString(value.description);
+        if (!problem) {
+          return null;
+        }
+        return {
+          id: toNonEmptyString(value.id) || autoId('resolved', index),
+          problem,
+          rootCause: toNonEmptyString(value.rootCause) || 'unknown',
+          solution: toNonEmptyString(value.solution) || '',
+          timestamp: toNonEmptyString(value.timestamp) || now,
+        };
+      })
+      .filter(Boolean);
+
+    input.rejectedApproaches = (input.rejectedApproaches as unknown[])
+      .map((approach, index) => {
+        if (!approach || typeof approach !== 'object') {
+          return null;
+        }
+        const value = approach as Record<string, unknown>;
+        const detail = toNonEmptyString(value.approach) || toNonEmptyString(value.description);
+        if (!detail) {
+          return null;
+        }
+        const rejectedBy = toNonEmptyString(value.rejectedBy) === 'technical' ? 'technical' : 'user';
+        return {
+          id: toNonEmptyString(value.id) || autoId('rejected', index),
+          approach: detail,
+          reason: toNonEmptyString(value.reason) || '',
+          rejectedBy,
+          timestamp: toNonEmptyString(value.timestamp) || now,
+        };
+      })
+      .filter(Boolean);
 
     // ========== 设置默认值 ==========
     if (input.primaryIntent === undefined) {
@@ -663,6 +892,7 @@ export class ContextCompressor {
     if (input.currentWork === undefined) {
       input.currentWork = '';
     }
+    input.tokenEstimate = Math.max(0, Math.floor(input.tokenEstimate));
 
     return { valid: true, content: input as MemoryContent };
   }

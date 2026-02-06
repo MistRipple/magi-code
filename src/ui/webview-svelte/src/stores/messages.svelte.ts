@@ -78,7 +78,7 @@ export const messagesState = $state({
   } as AutoScrollConfig,
 });
 
-// 🔧 兼容层：保留原有的独立变量引用（逐步迁移）
+// 🔧 状态入口保留：沿用原有独立变量引用（Svelte 5 迁移中）
 // 这些变量现在指向 messagesState 的属性
 let currentTopTab = $derived(messagesState.currentTopTab);
 let currentBottomTab = $derived(messagesState.currentBottomTab);
@@ -92,7 +92,6 @@ let activeMessageIds = $derived(messagesState.activeMessageIds);
 let pendingRequests = $derived(messagesState.pendingRequests);
 let thinkingStartAt = $derived(messagesState.thinkingStartAt);
 let processingActor = $derived(messagesState.processingActor);
-let appState = $derived(messagesState.appState);
 let scrollPositions = $derived(messagesState.scrollPositions);
 let autoScrollEnabled = $derived(messagesState.autoScrollEnabled);
 
@@ -131,6 +130,10 @@ let modelStatus = $state<ModelStatusMap>({
   compressor: { status: 'checking' },
 });
 let interactionMode = $state<'ask' | 'auto'>('auto');
+let requestedInteractionMode = $state<'ask' | 'auto' | null>(null);
+let interactionModeUpdatedAt = $state<number>(0);
+const INTERACTION_MODE_SYNC_TIMEOUT_MS = 10000;
+let interactionModeSyncTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Worker 执行状态：idle | executing | completed | failed | stopped | skipped
 let workerExecutionStatus = $state<Record<string, 'idle' | 'executing' | 'completed' | 'failed' | 'stopped' | 'skipped'>>({
@@ -222,7 +225,7 @@ let pendingRecovery = $state<{ taskId: string; error: unknown; canRetry: boolean
 let pendingQuestion = $state<{ questions: string[]; plan?: unknown } | null>(null);
 let pendingClarification = $state<{ questions: string[]; context?: string; ambiguityScore?: number; originalPrompt?: string } | null>(null);
 let pendingWorkerQuestion = $state<{ workerId: string; question: string; context?: string; options?: unknown } | null>(null);
-let pendingToolAuthorization = $state<{ toolName: string; toolArgs: unknown } | null>(null);
+let pendingToolAuthorization = $state<{ requestId: string; toolName: string; toolArgs: unknown } | null>(null);
 let missionPlan = $state<MissionPlan | null>(null);
 
 // Wave 执行状态（提案 4.6）
@@ -308,6 +311,63 @@ export function getInteractionMode() {
   return interactionMode;
 }
 
+export function getRequestedInteractionMode() {
+  return requestedInteractionMode;
+}
+
+export function isInteractionModeSyncing() {
+  return requestedInteractionMode !== null && requestedInteractionMode !== interactionMode;
+}
+
+export function getInteractionModeUpdatedAt() {
+  return interactionModeUpdatedAt;
+}
+
+function clearInteractionModeSyncTimer() {
+  if (interactionModeSyncTimer) {
+    clearTimeout(interactionModeSyncTimer);
+    interactionModeSyncTimer = null;
+  }
+}
+
+function scheduleInteractionModeSyncTimeout(expectedMode: 'ask' | 'auto') {
+  clearInteractionModeSyncTimer();
+  interactionModeSyncTimer = setTimeout(() => {
+    if (requestedInteractionMode === expectedMode) {
+      requestedInteractionMode = null;
+      addToast('warning', '交互模式切换超时，已回退同步状态');
+    }
+    interactionModeSyncTimer = null;
+  }, INTERACTION_MODE_SYNC_TIMEOUT_MS);
+}
+
+export function requestInteractionMode(mode: 'ask' | 'auto') {
+  requestedInteractionMode = mode;
+  scheduleInteractionModeSyncTimeout(mode);
+}
+
+export function clearRequestedInteractionMode() {
+  requestedInteractionMode = null;
+  clearInteractionModeSyncTimer();
+}
+
+export function setInteractionMode(mode: 'ask' | 'auto', updatedAt?: number) {
+  const nextUpdatedAt = typeof updatedAt === 'number' ? updatedAt : Date.now();
+  interactionMode = mode;
+  interactionModeUpdatedAt = nextUpdatedAt;
+  if (messagesState.appState) {
+    messagesState.appState = {
+      ...messagesState.appState,
+      interactionMode: mode,
+      interactionModeUpdatedAt: nextUpdatedAt,
+    };
+  }
+  if (requestedInteractionMode === mode) {
+    requestedInteractionMode = null;
+    clearInteractionModeSyncTimer();
+  }
+}
+
 export function getWorkerExecutionStatus() {
   return workerExecutionStatus;
 }
@@ -348,9 +408,9 @@ export function getWorkerSessions() {
   return workerSessions;
 }
 
-// ============ 兼容旧版 getState()（逐步迁移）============
-// ⚠️ 已废弃：此函数返回的对象无法被 Svelte 5 正确追踪
-// 请使用上面的独立 getter 函数或直接使用 messagesState
+// ============ getState() 仅用于现有调用方（Svelte 5 迁移中）============
+// ⚠️ 注意：此函数返回的对象无法被 Svelte 5 正确追踪
+// 建议使用上面的独立 getter 函数或直接使用 messagesState
 
 export function getState() {
   return {
@@ -376,7 +436,10 @@ export function getState() {
     get modelStatus() { return modelStatus; },
     set modelStatus(v) { modelStatus = v; },
     get interactionMode() { return interactionMode; },
-    set interactionMode(v) { interactionMode = v; },
+    set interactionMode(v) {
+      const nextMode = v === 'ask' ? 'ask' : 'auto';
+      setInteractionMode(nextMode);
+    },
     // Worker 状态
     get workerExecutionStatus() { return workerExecutionStatus; },
     set workerExecutionStatus(v) { workerExecutionStatus = v; },
@@ -483,7 +546,7 @@ export function setProcessingActor(source: string, agent?: string) {
 }
 
 export function setAppState(nextState: AppState | null) {
-  appState = nextState;
+  messagesState.appState = nextState;
 }
 
 export function setMissionPlan(plan: MissionPlan | null) {

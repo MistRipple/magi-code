@@ -123,10 +123,12 @@ export interface SessionUpdateOptions {
 export class WorkerSessionManager {
   private sessions: Map<string, WorkerSession> = new Map();
   private readonly SESSION_TTL_MS: number;
+  private readonly CLEANUP_INTERVAL_MS: number;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
-  constructor(options?: { sessionTtlMs?: number; autoCleanup?: boolean }) {
+  constructor(options?: { sessionTtlMs?: number; cleanupIntervalMs?: number; autoCleanup?: boolean }) {
     this.SESSION_TTL_MS = options?.sessionTtlMs ?? 30 * 60 * 1000; // 默认 30 分钟
+    this.CLEANUP_INTERVAL_MS = options?.cleanupIntervalMs ?? 5 * 60 * 1000; // 默认 5 分钟
 
     // 启动自动清理
     if (options?.autoCleanup !== false) {
@@ -335,10 +337,9 @@ export class WorkerSessionManager {
    * 启动自动清理定时器
    */
   private startAutoCleanup(): void {
-    // 每 5 分钟清理一次
     this.cleanupTimer = setInterval(() => {
       this.cleanup();
-    }, 5 * 60 * 1000);
+    }, this.CLEANUP_INTERVAL_MS);
   }
 
   /**

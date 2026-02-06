@@ -1,6 +1,7 @@
 <script lang="ts">
   import hljs from 'highlight.js';
   import MermaidRenderer from './MermaidRenderer.svelte';
+  import { escapeHtml } from '../lib/markdown-utils'; // 需确保此工具函数存在，如不存在需内联
 
   // Props
   interface Props {
@@ -27,7 +28,8 @@
   // 状态
   let collapsed = $state(false);
   let copied = $state(false);
-  let codeRef: HTMLElement | null = $state(null);
+  // 移除直接 DOM 引用，改用数据驱动
+  // let codeRef: HTMLElement | null = $state(null);
 
   // 语言名称映射
   const LANG_NAMES: Record<string, string> = {
@@ -48,26 +50,46 @@
   const trimmedCode = $derived(code.trimEnd().replace(/^\n/, ''));
   const lines = $derived(trimmedCode.split('\n'));
 
-  // 代码高亮 (带防抖优化)
+  // 🔧 计算高亮 HTML
+  // 策略：
+  // 1. 流式传输期间 (isStreaming=true): 为避免 JSON 等格式不完整导致解析错误或不显示，且为了性能，直接显示转义后的纯文本。
+  // 2. 传输完成 (isStreaming=false): 执行完整的高亮逻辑。
+  let highlightedHtml = $state('');
+
+  // 简易转义函数（如果 markdown-utils 中没有导出，可以在这里定义）
+  function safeEscape(str: string) {
+    return str
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+
   $effect(() => {
-    if (!codeRef || !trimmedCode || collapsed) return;
+    // 只有非折叠状态才处理内容
+    if (collapsed) return;
 
-    // 🔧 防抖：避免在流式输出时每字符触发高亮导致 UI 卡顿
-    const timer = setTimeout(() => {
-      try {
-        if (codeRef) {
-          // 重置 class 以便重新高亮 (如果语言变化)
-          codeRef.className = `code-text ${language ? `language-${language}` : ''}`;
-          // 移除可能存在的 hljs 属性
-          codeRef.removeAttribute('data-highlighted');
-          hljs.highlightElement(codeRef);
+    if (isStreaming) {
+      // 流式期间：只转义，不高亮。保证内容绝对可见且流畅。
+      highlightedHtml = safeEscape(trimmedCode);
+    } else {
+      // 非流式：尝试高亮
+      // 使用 setTimeout 宏任务，避免阻塞主线程（虽然 hljs 是同步的）
+      const timer = setTimeout(() => {
+        try {
+          if (language && hljs.getLanguage(language)) {
+            highlightedHtml = hljs.highlight(trimmedCode, { language }).value;
+          } else {
+            highlightedHtml = safeEscape(trimmedCode);
+          }
+        } catch (e) {
+          console.warn('[CodeBlock] 高亮失败:', e);
+          highlightedHtml = safeEscape(trimmedCode);
         }
-      } catch (e) {
-        console.warn('[CodeBlock] 高亮失败:', e);
-      }
-    }, 80); // 80ms 延迟，平衡性能与视觉响应
-
-    return () => clearTimeout(timer);
+      }, 0);
+      return () => clearTimeout(timer);
+    }
   });
 
   function toggle() {
@@ -142,10 +164,10 @@
             {/each}
           </div>
         {/if}
+        <!-- 🔧 改用 {@html} 渲染，彻底避免 DOM 操作冲突 -->
         <pre class="code-pre"><code
-          bind:this={codeRef}
           class="code-text {language ? `language-${language}` : ''}"
-        >{trimmedCode}</code></pre>
+        >{@html highlightedHtml}</code></pre>
       </div>
     {/if}
   {/if}
@@ -158,60 +180,195 @@
     margin: var(--spacing-sm) 0;
     overflow: hidden;
     background: var(--code-bg);
-    /* 🔧 定义局部变量确保行号和代码严格对齐 */
-    --code-line-height: 1.5;
-    --code-font-size: var(--font-size-sm, 12px);
+    
+    /* 🔧 头部高度 */
+    --header-height: 36px;
   }
 
+  .code-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: var(--header-height);
+    padding: 0 var(--spacing-sm);
+    background: var(--code-header-bg, rgba(255, 255, 255, 0.03));
+    border-bottom: 1px solid var(--code-border);
+    user-select: none;
+  }
+
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    flex: 1;
+    height: 100%;
+    background: transparent;
+    border: none;
+    padding: 0;
+    color: var(--foreground);
+    font-family: inherit;
+    cursor: pointer;
+    overflow: hidden;
+    outline: none;
+  }
+
+  .header-left:hover .chevron {
+    color: var(--foreground);
+  }
+
+  /* 折叠图标 */
+  .chevron {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    transition: transform var(--transition-fast);
+    color: var(--foreground-muted, #888);
+  }
+
+  .code-block.collapsed .chevron {
+    transform: rotate(0deg);
+  }
+
+  .code-block:not(.collapsed) .chevron {
+    transform: rotate(90deg);
+  }
+
+  .code-icon {
+    display: flex;
+    align-items: center;
+    color: var(--foreground-muted);
+  }
+
+  .code-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: var(--font-size-xs);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .lang-name {
+    font-weight: 600;
+    color: var(--accent-color, #646cff);
+    text-transform: uppercase;
+  }
+
+  .filepath {
+    opacity: 0.6;
+    font-family: var(--font-mono);
+  }
+
+  .streaming-badge {
+    font-size: 10px;
+    background: var(--accent-color);
+    color: white;
+    padding: 0 4px;
+    border-radius: 4px;
+    animation: pulse 1.5s infinite;
+  }
+
+  .copy-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 4px 8px;
+    color: var(--foreground-muted);
+    font-size: var(--font-size-xs);
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .copy-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--foreground);
+  }
+
+  .copy-btn.copied {
+    color: var(--success-color, #4caf50);
+    border-color: var(--success-color);
+    background: rgba(76, 175, 80, 0.1);
+  }
+
+  /* 
+   * 🔧 核心修复：内容区域布局
+   * 1. 在父容器统一字号、行高、字体。
+   * 2. 子元素 (行号、代码) 全部 inherit，确保严格对齐。
+   */
   .code-content {
     display: flex;
     flex-direction: row;
     align-items: flex-start;
+    background: var(--code-bg);
+    position: relative;
+    
+    /* 统一定义排版属性 */
+    font-family: var(--font-mono);
+    font-size: var(--font-size-sm, 12px); /* 使用明确的小字号 */
+    line-height: 1.5;
   }
 
   .line-numbers {
     display: flex;
     flex-direction: column;
-    padding: var(--spacing-sm);
-    padding-right: var(--spacing-sm);
+    padding: var(--spacing-sm) 0;
+    width: 40px;
+    min-width: 40px;
     border-right: 1px solid var(--border);
     text-align: right;
     user-select: none;
-    background: rgba(0, 0, 0, 0.1); /* 微弱底色区分行号区域 */
+    background: rgba(0, 0, 0, 0.02);
+    flex-shrink: 0;
+    
+    /* 强制继承父级排版 */
+    font-family: inherit;
+    font-size: inherit;
+    line-height: inherit;
   }
 
   .line-num {
-    font-family: var(--font-mono);
-    font-size: var(--code-font-size) !important;
-    line-height: var(--code-line-height) !important;
-    /* 🔧 强制高度：使用 calc 确保像素级对齐 */
-    height: calc(var(--code-font-size) * var(--code-line-height));
-    color: var(--vscode-editorLineNumber-foreground, #858585);
+    display: block;
+    padding-right: 8px;
+    color: var(--foreground-muted);
+    opacity: 0.5;
     white-space: nowrap;
-    display: flex; /* 确保垂直居中 */
-    align-items: center;
-    justify-content: flex-end;
+    font-variant-numeric: tabular-nums;
   }
 
   .code-pre {
     flex: 1;
-    /* 🔧 增强防御性：防止 MarkdownContent 的 global(pre) 干扰对齐 */
     margin: 0 !important;
     padding: var(--spacing-sm) var(--spacing-md) !important;
     overflow-x: auto;
     background: transparent !important;
+    min-width: 0;
+    border: none !important;
   }
 
   .code-text {
-    font-family: var(--font-mono);
-    font-size: var(--code-font-size) !important;
-    line-height: var(--code-line-height) !important;
-    /* 🔧 修复行号对齐问题：重置可能由 hljs 引入的内边距和外边距 */
-    padding: 0 !important;
-    margin: 0 !important;
-    background: transparent !important;
     display: block;
-    white-space: pre; /* 确保不换行，与行号一一对应 */
+    margin: 0 !important;
+    padding: 0 !important;
+    background: transparent !important;
+    white-space: pre;
+    color: var(--code-fg, inherit);
+    border: none !important;
+    
+    /* 🔧 关键：强制继承，覆盖全局 code { font-size: 0.9em } */
+    font-family: inherit !important;
+    font-size: inherit !important;
+    line-height: inherit !important;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
   }
 </style>
 

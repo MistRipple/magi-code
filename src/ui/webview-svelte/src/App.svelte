@@ -43,7 +43,7 @@
   const pendingClarification = $derived(appState.pendingClarification);
   const pendingWorkerQuestion = $derived(appState.pendingWorkerQuestion);
   const pendingToolAuthorization = $derived(appState.pendingToolAuthorization);
-  const interactionMode = $derived(appState.interactionMode || 'auto');
+  const interactionMode = $derived(appState.appState?.interactionMode || 'auto');
 
   function handleTabChange(tab: TopTabType) {
     setCurrentTopTab(tab);
@@ -102,7 +102,12 @@
   }
 
   function respondToolAuthorization(allowed: boolean) {
-    vscode.postMessage({ type: 'toolAuthorizationResponse', allowed });
+    const requestId = appState.pendingToolAuthorization?.requestId;
+    if (!requestId) {
+      appState.pendingToolAuthorization = null;
+      return;
+    }
+    vscode.postMessage({ type: 'toolAuthorizationResponse', requestId, allowed });
     appState.pendingToolAuthorization = null;
     if (allowed) setIsProcessing(true);
   }
