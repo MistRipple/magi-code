@@ -1,7 +1,16 @@
 /**
  * Intent Gate - 意图门控（AI 决策版）
  *
- * 作为编排器的入口层，在处理任何消息前先进行意图分类和路由。
+ * 定位：Layer 3（plan_mission 路径）的前置意图分类器。
+ * 在 MissionOrchestrator.processRequest() 中被调用，用于决定处理模式：
+ *   - ASK/DIRECT/EXPLORE → 跳过 Mission 创建，直接响应
+ *   - TASK/DEMO → 进入完整 Mission 流程
+ *   - CLARIFY → 向用户提问后重新分类
+ *
+ * 注意：Layer 2（dispatch_task 路径）不经过此组件，
+ * 其意图判断融入 buildUnifiedSystemPrompt 系统提示词中，
+ * 由 orchestrator LLM 自主通过工具选择表达决策。
+ *
  * 意图判定完全由 AI 决策。
  */
 

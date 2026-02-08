@@ -102,19 +102,19 @@ export function onMessage(listener: MessageListener): () => void {
 
 // 全局消息监听
 if (typeof window !== 'undefined') {
-  console.log('[vscode-bridge] 🔧 开始监听消息...');
+  console.log('[vscode-bridge] 开始监听消息...');
   window.addEventListener('message', (event) => {
     const message = event.data as WebviewMessage;
     const msgType = message?.type;
     const msgId = (message as any)?.message?.id;
-    // 🔧 调试日志：追踪所有收到的消息
+    // 调试日志：追踪所有收到的消息
     console.log(`[vscode-bridge] 收到消息: type=${msgType}, id=${msgId}, listeners=${listeners.size}`);
     if (msgType === 'unifiedMessage' || msgType === 'unifiedUpdate' || msgType === 'unifiedComplete') {
       const source = (message as any)?.message?.source;
       const agent = (message as any)?.message?.agent;
-      // 🔧 增强调试：特别关注 Worker 消息
+      // 增强调试：特别关注 Worker 消息
       if (source === 'worker') {
-        console.log('[vscode-bridge] 🎯 WORKER 消息:', JSON.stringify({
+        console.log('[vscode-bridge] WORKER 消息:', JSON.stringify({
           type: msgType,
           messageId: msgId,
           messageType: (message as any)?.message?.type,
@@ -128,7 +128,7 @@ if (typeof window !== 'undefined') {
         console.log('[vscode-bridge] 详细消息内容:', JSON.stringify({
           type: msgType,
           messageId: msgId,
-          messageType: (message as any)?.message?.type,  // 方案 B：使用 MessageType
+          messageType: (message as any)?.message?.type,
           category: (message as any)?.message?.category,
           lifecycle: (message as any)?.message?.lifecycle,
           source,

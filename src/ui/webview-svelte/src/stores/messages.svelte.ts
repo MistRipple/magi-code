@@ -654,14 +654,11 @@ export function getActiveInteractionType(): string | null {
 }
 // 消息操作
 export function addThreadMessage(message: Message) {
-  // 完全重建数组以确保响应式更新
   const safeMessage = JSON.parse(JSON.stringify(normalizeIncomingMessage(message))) as Message;
-  
+
   if (messagesState.threadMessages.some((m) => m.id === safeMessage.id)) {
-    // 🔧 改为警告而非抛出错误，避免中断
     return;
   }
-  // 🔧 修复：使用对象属性赋值，确保响应式追踪
   messagesState.threadMessages = [...messagesState.threadMessages, safeMessage];
   
   saveWebviewState();
@@ -671,16 +668,16 @@ export function updateThreadMessage(messageId: string, updates: Partial<Message>
   const index = messagesState.threadMessages.findIndex((m) => m.id === messageId);
   if (index !== -1) {
     // 必须完全重建数组，不能直接修改索引
-    // 使用 JSON 序列化确保脱离响应式代理
-    const normalizedUpdates: Partial<Message> = { ...updates };
+    // 使用 JSON 序列化确保脱离 Svelte 5 $state 响应式代理
+    // structuredClone 无法克隆 Proxy 对象，改用 JSON 往返
+    const normalizedUpdates: Partial<Message> = JSON.parse(JSON.stringify(updates));
     if ('blocks' in normalizedUpdates) {
       const blocks = sanitizeMessageBlocks(normalizedUpdates.blocks);
       normalizedUpdates.blocks = blocks.length > 0 ? blocks : undefined;
     }
-    const safeUpdates = JSON.parse(JSON.stringify(normalizedUpdates)) as Partial<Message>;
     const newMessages = messagesState.threadMessages.map((msg, i) => {
       if (i === index) {
-        return { ...msg, ...safeUpdates };
+        return { ...msg, ...normalizedUpdates };
       }
       return msg;
     });
@@ -691,7 +688,7 @@ export function updateThreadMessage(messageId: string, updates: Partial<Message>
 
 export function replaceThreadMessage(oldMessageId: string, message: Message) {
   const safeMessage = JSON.parse(JSON.stringify(normalizeIncomingMessage(message))) as Message;
-  
+
   const index = messagesState.threadMessages.findIndex((m) => m.id === oldMessageId);
   if (index === -1) {
     addThreadMessage(safeMessage);
@@ -750,13 +747,13 @@ export function updateAgentMessage(agent: AgentType, messageId: string, updates:
   const list = messagesState.agentOutputs[agent];
   const index = list.findIndex((m) => m.id === messageId);
   if (index !== -1) {
-    const normalizedUpdates: Partial<Message> = { ...updates };
+    // 使用 JSON 序列化确保脱离 Svelte 5 $state 响应式代理
+    const normalizedUpdates: Partial<Message> = JSON.parse(JSON.stringify(updates));
     if ('blocks' in normalizedUpdates) {
       const blocks = sanitizeMessageBlocks(normalizedUpdates.blocks);
       normalizedUpdates.blocks = blocks.length > 0 ? blocks : undefined;
     }
-    const safeUpdates = JSON.parse(JSON.stringify(normalizedUpdates)) as Partial<Message>;
-    const next = list.map((msg, i) => (i === index ? { ...msg, ...safeUpdates } : msg));
+    const next = list.map((msg, i) => (i === index ? { ...msg, ...normalizedUpdates } : msg));
     messagesState.agentOutputs = { ...messagesState.agentOutputs, [agent]: next };
     // 不触发保存，由流式管理器批量保存
   }

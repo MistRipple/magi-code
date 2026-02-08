@@ -1,13 +1,13 @@
-# 消息链路架构设计 v1.0
+# 消息链路架构设计
 
 ## 分层架构总览
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                    后端 (Extension Host)                         │
 ├─────────────────────────────────────────────────────────────────┤
-│  L1 生产层    Normalizer → Adapter                              │
-│  L2 中枢层    MessageHub                                        │
+│  L1 生产层    Normalizer + Adapter + MessageFactory             │
+│  L2 中枢层    MessageHub (= Bus + Pipeline)                     │
 │  L3 桥接层    WebviewProvider                                   │
 ├─────────────────────────────────────────────────────────────────┤
 │                    ↓ postMessage (跨进程边界) ↓                  │
@@ -24,22 +24,28 @@
 
 | 层级 | 名称 | 位置 | 核心组件 | 唯一职责 |
 | ---- | ---- | ---- | -------- | -------- |
-| L1 | 生产层 | 后端 | Normalizer, Adapter | 生产 StandardMessage |
-| L2 | 中枢层 | 后端 | MessageHub | 去重、节流、生命周期、事件发射 |
+| L1 | 生产层 | 后端 | Normalizer, Adapter, MessageFactory | 创建 StandardMessage / StreamUpdate，**决定消息的 ID** |
+| L2 | 中枢层 | 后端 | MessageHub (= MessageBus + MessagePipeline) | 协议保护：去重、节流、生命周期状态管理、事件分发 |
 | L3 | 桥接层 | 后端 | WebviewProvider | 监听 Hub 事件，postMessage 到前端 |
 | L4 | 接收层 | 前端 | vscode-bridge | 接收 postMessage，分发给 listeners |
-| L5 | 路由层 | 前端 | message-handler, message-router | 按类别/可见性决定消息去向 |
-| L6 | 渲染层 | 前端 | Store, Components | 状态管理，UI 渲染 |
+| L5 | 路由层 | 前端 | message-handler, message-router | 所有「是否展示」「展示在哪」的决策在此层完成 |
+| L6 | 渲染层 | 前端 | Store, Components | 状态管理（响应式 Store）+ UI 渲染 |
+
+### 核心原则：各层只做本层职责范围内的事，禁止越权
+
+> **设计教训**：Pipeline（L2）曾越权承担「根据消息类型将 ID 映射到占位符 ID」的职责，
+> 导致独立消息（INTERACTION、RESULT 等）被错误映射到流式卡片，覆盖已有内容。
+> 根因是 L2 做了本应由 L1（ID 分配）决定的事情。已通过移除 `messageIdAliasMap` 修复。
 
 ### 层间边界（5 个接口）
 
 | 边界 | 上层 | 下层 | 接口方式 |
 | ---- | ---- | ---- | -------- |
-| L1→L2 | Adapter | MessageHub | `messageHub.sendMessage(msg)` |
-| L2→L3 | MessageHub | WebviewProvider | `emit('unified:message', msg)` |
+| L1→L2 | Adapter | MessageHub | `messageHub.sendMessage(msg)` / `messageHub.sendUpdate(update)` |
+| L2→L3 | MessageHub | WebviewProvider | `emit('unified:message/update/complete', msg)` |
 | L3→L4 | WebviewProvider | vscode-bridge | `postMessage({ type, message })` |
 | L4→L5 | vscode-bridge | message-handler | `listener(message)` 回调 |
-| L5→L6 | message-handler | Store | `addThreadMessage(msg)` 等 |
+| L5→L6 | message-handler | Store | `addThreadMessage(msg)` / `addAgentMessage(msg)` 等 |
 
 ---
 
@@ -50,48 +56,72 @@
 **组件**：
 - `src/normalizer/*.ts` - 各 LLM 的响应解析器
 - `src/llm/adapters/*.ts` - 各 LLM 的适配器
+- `src/protocol/message-protocol.ts` - MessageFactory（消息创建工厂）
 
-**职责**：
-- 接收 LLM API 原始响应
-- 解析为统一的 StandardMessage 格式
-- 转发到 MessageHub
+**唯一职责**：创建 StandardMessage / StreamUpdate，**决定消息的 ID**
+
+**流式输出**：Normalizer 接收 LLM 原始 chunk → 解析 → emit MESSAGE(STARTED) / UPDATE / COMPLETE
+
+**ID 分配**：
+- 流式消息：`adapter.startStreamWithContext()` 查询占位符 ID → `normalizer.startStream(boundId)` → 流式 chunk 使用占位符 ID
+- 独立消息：MessageFactory `createStandardMessage()` 生成随机 ID（INTERACTION、RESULT、PROGRESS 等）
 
 **代码路径**：
-```
+
+```text
 LLM API Response
     ↓
-Normalizer.processChunk()
-    ↓ emit(MESSAGE_EVENTS.MESSAGE)
-Adapter.setupNormalizerEvents()
-    ↓ messageHub.sendMessage(message)
+Normalizer.startStream(boundId) → emit MESSAGE(id=boundId, STARTED)
+Normalizer.processTextDelta()   → emit UPDATE(messageId=boundId)
+Normalizer.endStream()          → emit COMPLETE(messageId=boundId)
+    ↓ adapter.setupNormalizerEvents()
+    ↓ messageHub.sendMessage(message) / messageHub.sendUpdate(update)
 进入 L2
 ```
 
-**禁止行为**：不做任何过滤或丢弃
+**禁止行为**：
+- **不做过滤或丢弃**
+- 不做路由决策（不判断消息应该展示在哪个区域）
 
 ---
 
 ### L2 中枢层（后端）
 
 **组件**：
-- `src/orchestrator/core/message-hub.ts`
+- `src/orchestrator/core/message-hub.ts` (MessageBus)
+- `src/orchestrator/core/message-pipeline.ts` (MessagePipeline)
 
-**职责**：
-- 消息去重（同 ID + lifecycle 只发一次）
-- 流式节流（100ms 间隔）
-- 生命周期管理（started → streaming → completed）
-- 事件发射（unified:message/update/complete）
+**唯一职责**：协议保护——去重、节流、生命周期状态管理、事件分发
+
+**流式输出**：接收 L1 消息 → 状态机管理 (STARTED→STREAMING→COMPLETED) → emit unified:message/update/complete
+
+**提供的服务**：
+
+- 维护 `requestMessageIdMap`（供 L1 adapter 查询占位符 ID）
+- 生成 `eventSeq`（会话内全局单调递增）
+- 管理 `sealedCards`（封口保护）
+- 管理 `messageStates`（生命周期跟踪）
 
 **代码路径**：
-```
+
+```text
 messageHub.sendMessage(message)
     ↓
-去重检查 → 节流检查 → 生命周期更新
+Pipeline.process() → 去重检查 → 状态管理 → 生命周期更新
     ↓ emit('unified:message', message)
+messageHub.sendUpdate(update)
+    ↓
+Pipeline.processUpdate() → 节流(100ms) → 封口检查
+    ↓ emit('unified:update', update)
 进入 L3
 ```
 
-**禁止行为**：不做内容过滤（只做协议层保护）
+**禁止行为**：
+
+- **不修改消息 ID**（不做 ID 映射/重写）
+- 不做内容过滤（只做协议层保护）
+- 不判断消息类型决定归属
+- 不做展示决策
 
 ---
 
@@ -100,13 +130,15 @@ messageHub.sendMessage(message)
 **组件**：
 - `src/ui/webview-provider.ts` 的 `setupMessageHubListeners()`
 
-**职责**：
-- 监听 MessageHub 事件
-- 封装为 postMessage 格式
-- 发送到前端 Webview
+**唯一职责**：监听 L2 事件，封装为 postMessage 格式，发送到前端
+
+**流式输出**：`on('unified:message')` → `postMessage({ type: 'unifiedMessage', message })`
+
+**附加职责**：创建占位符消息（`emitUserAndPlaceholder`）——占位符本身是一条 L1 层级的消息
 
 **代码路径**：
-```
+
+```text
 messageHub.on('unified:message', (message) => {
     ↓
 this.postMessage({ type: 'unifiedMessage', message })
@@ -114,7 +146,11 @@ this.postMessage({ type: 'unifiedMessage', message })
 进入 L4
 ```
 
-**禁止行为**：不做任何过滤或转换
+**禁止行为**：
+
+- **不做过滤或转换**
+- 不修改消息内容或 ID
+- 不做路由决策
 
 ---
 
@@ -123,12 +159,11 @@ this.postMessage({ type: 'unifiedMessage', message })
 **组件**：
 - `src/ui/webview-svelte/src/lib/vscode-bridge.ts`
 
-**职责**：
-- 监听 window message 事件
-- 分发给注册的 listeners
+**唯一职责**：接收 postMessage，分发给注册的 listeners
 
 **代码路径**：
-```
+
+```text
 window.addEventListener('message', (event) => {
     ↓
 listeners.forEach(listener => listener(message))
@@ -136,7 +171,10 @@ listeners.forEach(listener => listener(message))
 进入 L5
 ```
 
-**禁止行为**：不做任何过滤或转换
+**禁止行为**：
+
+- **不做过滤或转换**
+- 纯透传
 
 ---
 
@@ -146,13 +184,22 @@ listeners.forEach(listener => listener(message))
 - `src/ui/webview-svelte/src/lib/message-handler.ts`
 - `src/ui/webview-svelte/src/lib/message-router.ts`
 
-**职责**：
-- 按消息类别分发（CONTENT/CONTROL/NOTIFY/DATA）
-- 按可见性决定去向（user→thread/worker, system→none）
-- 建立路由表（messageId → DisplayTarget）
+**唯一职责**：所有「是否展示」「展示在哪」的决策在此层完成
+
+**流式输出**：
+
+- `handleContentMessage` 处理消息归属（占位替换 / 独立卡片）
+- `handleStandardUpdate` 路由增量更新
+- `handleStandardComplete` 标记完成
+
+**提供的服务**：
+
+- `messageTargetMap`（messageId → DisplayTarget）
+- `requestBinding`（requestId → 占位符关联）
 
 **代码路径**：
-```
+
+```text
 handleMessage(message)
     ↓ switch(type)
 handleUnifiedMessage() → handleContentMessage()
@@ -164,7 +211,10 @@ addThreadMessage() / addAgentMessage()
 进入 L6
 ```
 
-**关键决策点**：所有「是否展示」的决策在此层完成
+**禁止行为**：
+
+- **不修改消息内容**
+- 不做渲染逻辑（只做路由写入 Store）
 
 ---
 
@@ -174,60 +224,60 @@ addThreadMessage() / addAgentMessage()
 - `src/ui/webview-svelte/src/stores/messages.svelte.ts`
 - `src/ui/webview-svelte/src/components/*.svelte`
 
-**职责**：
-- 状态管理（响应式 Store）
-- UI 渲染（消息列表、Worker 面板等）
-- 空内容处理（显示加载态）
+**唯一职责**：状态管理（响应式 Store）+ UI 渲染
 
-**禁止行为**：不做消息过滤（只做渲染决策）
+**流式输出**：Store 中消息数组变化 → Svelte 响应式更新 → 卡片组件增量渲染
 
----
+**禁止行为**：
 
-## 现有过滤节点与层级归属
-
-| # | 过滤节点 | 代码位置 | 当前层级 | 行为 | 状态 |
-| ---- | ---- | ---- | ---- | ---- | ---- |
-| 1 | `streamToUI=false` | base-adapter.ts:186,193,206 | L1 生产层 | 消息完全不发送 | 🔴 问题 |
-| 2 | MessageHub 去重 | message-hub.ts:739-754 | L2 中枢层 | 同 ID 消息只发一次 | ✅ 正常 |
-| 3 | MessageHub 节流 | message-hub.ts:1059-1103 | L2 中枢层 | 流式更新间隔 100ms | ✅ 正常 |
-| 4 | 消息类别分发 | message-handler.ts:319-335 | L5 路由层 | 按 category 分发 | ✅ 正常 |
-| 5 | `hasRenderableContent` | message-handler.ts:527,584 | L5 路由层 | 无内容消息被丢弃 | 🔴 问题 |
-| 6 | 路由表缺失保护 | message-handler.ts:690-693 | L5 路由层 | update 暂存到队列 | ✅ 正常 |
-| 7 | Complete 类别过滤 | message-handler.ts:711-713 | L5 路由层 | 非 CONTENT 跳过 | ✅ 正常 |
-
-### 问题节点分析
-
-**#1 streamToUI（L1 生产层）**：消息在最上游被拦截，L2-L6 完全无感知，链路断裂。
-
-**#5 hasRenderableContent（L5 路由层）**：消息到达前端后被静默丢弃，无日志无追踪。
+- **不做消息过滤**（只做渲染决策，如空内容显示加载态）
+- 不做路由决策
 
 ---
 
-## 长期方案：过滤职责归一到 L5
+## 层间数据流（流式输出完整链路）
 
-| 原节点 | 新设计 | 归属层级 |
-| ---- | ---- | ---- |
-| `streamToUI=false` | 改为 `visibility: 'system'`，消息正常流经全链路 | L5 路由层决策 |
-| `hasRenderableContent` | 移除，空内容消息由 L6 渲染层决定如何展示 | L6 渲染层 |
-| MessageHub 去重/节流 | 保留，协议层保护 | L2 中枢层 |
-| 消息类别分发 | 保留，正常分流 | L5 路由层 |
-| Complete 类别过滤 | 保留，业务正确性 | L5 路由层 |
+```text
+L1: Normalizer.startStream(boundId) → emit MESSAGE(id=boundId, STARTED)
+    Normalizer.processTextDelta()   → emit UPDATE(messageId=boundId)
+    Normalizer.endStream()          → emit COMPLETE(messageId=boundId)
+      ↓ adapter.setupNormalizerEvents → messageHub.sendMessage / sendUpdate
+L2: Pipeline.process(message)       → 状态管理 → emit unified:message
+    Pipeline.processUpdate(update)  → 节流/去重 → emit unified:update
+      ↓ messageHub events
+L3: WebviewProvider.on('unified:*') → postMessage({ type, message/update })
+      ↓ 跨进程边界
+L4: vscode-bridge                   → listener(message)
+      ↓
+L5: message-handler                 → 路由决策 → addThreadMessage / addAgentMessage
+      ↓
+L6: Store → Components              → 渲染卡片
+```
 
 ---
 
-## 消息可见性控制（新设计）
+## 消息过滤规范
 
-### 问题：如何处理「不应展示给用户」的内部调用？
+各层允许的过滤行为及其归属：
 
-**旧方案（废弃）**：`streamToUI: false` 静默模式
+| # | 过滤节点 | 归属层级 | 行为 | 说明 |
+| ---- | ---- | ---- | ---- | ---- |
+| 1 | MessageHub 去重 | L2 中枢层 | 同 ID + lifecycle 消息只发一次 | 协议层保护 |
+| 2 | MessageHub 节流 | L2 中枢层 | 流式更新间隔 100ms | 协议层保护 |
+| 3 | 消息类别分发 | L5 路由层 | 按 category 分发到不同处理器 | 路由决策 |
+| 4 | `visibility` 可见性 | L5 路由层 | 按 visibility 决定展示去向 | 路由决策 |
+| 5 | 路由表缺失保护 | L5 路由层 | update 暂存到队列等待路由建立 | 时序保护 |
+| 6 | Complete 类别过滤 | L5 路由层 | 非 CONTENT 的 complete 跳过 | 业务正确性 |
 
-- 问题：消息链路断裂，无法追踪
+---
 
-**新方案**：`visibility` 字段 + L5 路由层决策
+## 消息可见性控制
+
+### visibility 字段定义
 
 ```typescript
 interface StandardMessage {
-  // ... 现有字段
+  // ... 其他字段
 
   /**
    * 消息可见性
@@ -239,40 +289,14 @@ interface StandardMessage {
 }
 ```
 
-**处理流程**：
+### 处理规则
 
-1. 后端设置 `visibility` 字段
-2. 消息正常流经 L1 → L2 → L3 → L4 → L5
+1. 后端在创建消息时设置 `visibility` 字段（默认 `'user'`）。
+2. 消息正常流经 L1 → L2 → L3 → L4 → L5，各层不因 visibility 做拦截。
 3. L5 路由层根据 `visibility` 决定去向：
-   - `user`: 正常路由到 thread/worker
-   - `system`: 路由到 `location: 'none'`（系统日志区）
-   - `debug`: 仅在调试模式下显示
-
----
-
-## 迁移计划
-
-### Phase 1: 引入 visibility 字段（向后兼容）
-
-1. 在 `message-protocol.ts` 中添加 `visibility` 字段（默认 `'user'`）
-2. 更新 `MessageHub.createMessage()` 支持 `visibility` 参数
-3. L5 路由层根据 `visibility` 决定去向
-
-### Phase 2: 迁移内部调用
-
-1. 将 `streamToUI: false` 调用改为 `visibility: 'system'`
-2. 保留消息完整流经链路，仅改变前端展示
-
-### Phase 3: 移除 streamToUI
-
-1. 移除 `BaseAdapter._streamToUI` 字段
-2. 移除 `AdapterFactory.sendMessage()` 中的 `streamToUI` 处理
-3. 移除 `AdapterOutputScope.streamToUI` 选项
-
-### Phase 4: 清理前端过滤逻辑
-
-1. 移除 `hasRenderableContent` 过滤
-2. 空内容消息由 L6 UI 组件处理（显示加载态或占位符）
+   - `user`：正常路由到 thread/worker。
+   - `system`：路由到 `location: 'none'`（系统日志区），不展示给用户。
+   - `debug`：仅在调试模式下显示。
 
 ---
 
@@ -312,13 +336,3 @@ console.log('[vscode-bridge]', messageId, type);
 // L5 路由层
 console.log('[message-handler]', messageId, category, location);
 ```
-
----
-
-## 长期演进方向
-
-1. **消息持久化**：所有消息存储到本地数据库，支持历史回放
-2. **消息订阅**：前端可选择性订阅特定类型的消息
-3. **消息压缩**：对长对话进行消息合并和摘要
-4. **消息加密**：敏感信息端到端加密
-

@@ -65,6 +65,14 @@ export function routeStandardMessage(standard: StandardMessage): DisplayTarget {
   return target;
 }
 
+export function setMessageTarget(messageId: string, target: DisplayTarget): void {
+  const normalizedId = typeof messageId === 'string' ? messageId.trim() : '';
+  if (!normalizedId) {
+    throw new Error('[MessageRouter] messageId 不能为空');
+  }
+  messageTargetMap.set(normalizedId, target);
+}
+
 export function getMessageTarget(messageId: string): DisplayTarget | null {
   return messageTargetMap.get(messageId) || null;
 }

@@ -533,8 +533,7 @@ export type WebviewToExtensionMessage =
   | { type: 'removeCustomTool'; toolName: string }
   | { type: 'removeInstructionSkill'; skillName: string }
   | { type: 'installSkill'; skillId: string }
-  | { type: 'applyInstructionSkill'; skillName: string; args?: string; images?: Array<{ dataUrl: string }>; agent?: WorkerSlot | null; requestId?: string }
-  // 新增：Skills 仓库相关
+  // Skills 仓库相关
   | { type: 'loadRepositories' }
   | { type: 'addRepository'; url: string }
   | { type: 'updateRepository'; repositoryId: string; updates: any }
@@ -552,6 +551,7 @@ export type WebviewToExtensionMessage =
   | { type: 'addFAQ'; faq: any }
   | { type: 'updateFAQ'; id: string; updates: any }
   | { type: 'deleteFAQ'; id: string }
+  | { type: 'clearProjectKnowledge' }
   // 新增：前端错误上报
   | { type: 'uiError'; component: string; detail?: unknown; stack?: string }
   | { type: 'toolAuthorizationResponse'; requestId: string; allowed: boolean }

@@ -104,14 +104,14 @@ export abstract class BaseLLMAdapter extends EventEmitter {
    * 使用当前请求上下文启动流式消息
    * 优先复用占位消息 ID，确保 UI 端流式更新命中同一条消息
    */
-  protected startStreamWithContext(): string {
+  protected startStreamWithContext(visibility?: 'user' | 'system' | 'debug'): string {
     if (!this.currentTraceId) {
       this.currentTraceId = this.messageHub.getTraceId();
     }
     const requestId = this.messageHub.getRequestContext();
     const boundMessageId = requestId ? this.messageHub.getRequestMessageId(requestId) : undefined;
 
-    return this.normalizer.startStream(this.currentTraceId, undefined, boundMessageId);
+    return this.normalizer.startStream(this.currentTraceId, undefined, boundMessageId, visibility);
   }
 
   // 节流定时器

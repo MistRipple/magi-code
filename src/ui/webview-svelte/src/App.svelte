@@ -8,7 +8,6 @@
   import EditsPanel from './components/EditsPanel.svelte';
   import KnowledgePanel from './components/KnowledgePanel.svelte';
   import SettingsPanel from './components/SettingsPanel.svelte';
-  import SkillPopup from './components/SkillPopup.svelte';
   import ToastContainer from './components/ToastContainer.svelte';
   import MarkdownContent from './components/MarkdownContent.svelte';
   import { vscode } from './lib/vscode-bridge';
@@ -28,9 +27,6 @@
 
   // 设置面板是否打开
   let settingsOpen = $state(false);
-
-  // 技能弹窗是否打开
-  let skillPopupOpen = $state(false);
 
   // 交互输入
   let questionAnswer = $state('');
@@ -55,10 +51,6 @@
 
   function closeSettings() {
     settingsOpen = false;
-  }
-
-  function closeSkillPopup() {
-    skillPopupOpen = false;
   }
 
   function confirmPlan(confirmed: boolean) {
@@ -116,16 +108,6 @@
   onMount(() => {
     initializeState();
     console.log('[App] Svelte webview 已初始化');
-
-    // 监听从 InputArea 发来的自定义事件
-    const customEventHandler = () => {
-      skillPopupOpen = true;
-    };
-    window.addEventListener('openSkillPopup', customEventHandler);
-
-    return () => {
-      window.removeEventListener('openSkillPopup', customEventHandler);
-    };
   });
 </script>
 
@@ -153,9 +135,6 @@
   {#if settingsOpen}
     <SettingsPanel onClose={closeSettings} />
   {/if}
-
-  <!-- 技能弹窗 -->
-  <SkillPopup visible={skillPopupOpen} onClose={closeSkillPopup} />
 
   {#if pendingConfirmation && interactionMode === 'ask'}
     <div class="modal-overlay" role="presentation">
@@ -298,6 +277,7 @@
 
   .tab-content-wrapper {
     flex: 1;
+    min-height: 0; /* flex 布局防溢出：防止子元素撑破容器产生页面级滚动条 */
     overflow: hidden;
     display: flex;
     flex-direction: column;

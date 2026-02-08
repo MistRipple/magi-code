@@ -8,7 +8,7 @@
 import { EventEmitter } from 'events';
 import { logger, LogCategory } from '../../logging';
 import type { StandardMessage, ContentBlock, StreamUpdate, MessageSource } from '../../protocol/message-protocol';
-import { MessageType, MessageLifecycle, MessageCategory } from '../../protocol/message-protocol';
+import { MessageType, MessageLifecycle, MessageCategory, createStandardMessage } from '../../protocol/message-protocol';
 
 /** Pipeline 配置 */
 export interface PipelineConfig {
@@ -24,6 +24,29 @@ interface MessageState {
   lastSentAt: number;
   lastStreamAt: number;
   completed: boolean;
+  cardId: string;
+  lastCardStreamSeq: number;
+  finalCardStreamSeq?: number;
+}
+
+interface SealedCardState {
+  cardId: string;
+  finalStreamSeq: number;
+  sealedAt: number;
+  source: MessageSource;
+  agent: StandardMessage['agent'];
+  traceId: string;
+  requestId?: string;
+}
+
+interface DeadLetterEntry {
+  reason: 'sealed_duplicate' | 'sealed_late' | 'sealed_late_empty' | 'out_of_order_update';
+  cardId: string;
+  messageId: string;
+  cardStreamSeq: number;
+  eventSeq: number;
+  timestamp: number;
+  requestId?: string;
 }
 
 interface RequestMessageStats {
@@ -68,6 +91,10 @@ export class MessagePipeline {
   private bus: EventEmitter;
   private config: PipelineConfig;
   private messageStates: Map<string, MessageState> = new Map();
+  private sealedCards: Map<string, SealedCardState> = new Map();
+  private cardStreamSeqCounters: Map<string, number> = new Map();
+  private deadLetters: DeadLetterEntry[] = [];
+  private eventSeqCounter = 0;
   private processingState: ProcessingState = { isProcessing: false, source: null, agent: null, startedAt: null };
   private processingMessageIds: Set<string> = new Set();
   private requestMessageStats: Map<string, RequestMessageStats> = new Map();
@@ -81,13 +108,198 @@ export class MessagePipeline {
     this.startCleanupTimer();
   }
 
+  private generateEventId(prefix: string): string {
+    return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  private nextEventSeq(): number {
+    this.eventSeqCounter += 1;
+    return this.eventSeqCounter;
+  }
+
+  /**
+   * 统一收口 eventSeq：
+   * - 外部提供的序号只有在大于当前计数器时才接纳
+   * - 否则由 Pipeline 重新分配，保证全局单调递增
+   */
+  private resolveEventSeq(explicitSeq?: number): number {
+    if (typeof explicitSeq === 'number' && Number.isFinite(explicitSeq)) {
+      const normalized = Math.floor(explicitSeq);
+      if (normalized > this.eventSeqCounter) {
+        this.eventSeqCounter = normalized;
+        return normalized;
+      }
+    }
+    return this.nextEventSeq();
+  }
+
+  private resolveCardId(messageId: string, metadata?: StandardMessage['metadata']): string {
+    if (metadata?.cardId && metadata.cardId.trim()) {
+      return metadata.cardId.trim();
+    }
+    return messageId;
+  }
+
+  private nextCardStreamSeq(cardId: string): number {
+    const current = this.cardStreamSeqCounters.get(cardId) || 0;
+    const next = current + 1;
+    this.cardStreamSeqCounters.set(cardId, next);
+    return next;
+  }
+
+  private ensureMessageEnvelope(message: StandardMessage): StandardMessage {
+    const metadata = message.metadata || {};
+    const cardId = this.resolveCardId(message.id, metadata);
+    const cardStreamSeq = typeof metadata.cardStreamSeq === 'number' && Number.isFinite(metadata.cardStreamSeq)
+      ? metadata.cardStreamSeq
+      : this.nextCardStreamSeq(cardId);
+    const knownCardSeq = this.cardStreamSeqCounters.get(cardId) || 0;
+    if (cardStreamSeq > knownCardSeq) {
+      this.cardStreamSeqCounters.set(cardId, cardStreamSeq);
+    }
+    return {
+      ...message,
+      eventId: message.eventId || this.generateEventId('evt'),
+      eventSeq: this.resolveEventSeq(message.eventSeq),
+      metadata: {
+        ...metadata,
+        cardId,
+        cardStreamSeq,
+      },
+    };
+  }
+
+  private ensureUpdateEnvelope(update: StreamUpdate, fallbackCardId?: string): StreamUpdate {
+    const cardId = (update.cardId && update.cardId.trim())
+      || (fallbackCardId && fallbackCardId.trim())
+      || update.messageId;
+    const cardStreamSeq = typeof update.cardStreamSeq === 'number' && Number.isFinite(update.cardStreamSeq)
+      ? update.cardStreamSeq
+      : this.nextCardStreamSeq(cardId);
+    const knownCardSeq = this.cardStreamSeqCounters.get(cardId) || 0;
+    if (cardStreamSeq > knownCardSeq) {
+      this.cardStreamSeqCounters.set(cardId, cardStreamSeq);
+    }
+    return {
+      ...update,
+      cardId,
+      cardStreamSeq,
+      eventId: update.eventId || this.generateEventId('upd'),
+      eventSeq: this.resolveEventSeq(update.eventSeq),
+    };
+  }
+
+  private recordDeadLetter(entry: DeadLetterEntry): void {
+    this.deadLetters.push(entry);
+    if (this.deadLetters.length > 2000) {
+      this.deadLetters.splice(0, this.deadLetters.length - 2000);
+    }
+    logger.warn('MessagePipeline.dead_letter', entry, LogCategory.SYSTEM);
+  }
+
+  getDeadLetterCount(): number {
+    return this.deadLetters.length;
+  }
+
+  private maybeEmitLateSupplementMessage(update: StreamUpdate, sealed: SealedCardState): boolean {
+    const lateText = update.updateType === 'append'
+      ? (update.appendText || '')
+      : this.extractTextFromBlocks(update.blocks);
+    const hasRenderableBlocks = this.hasRenderableBlocks(update.blocks);
+    if (!lateText.trim() && !hasRenderableBlocks) {
+      this.recordDeadLetter({
+        reason: 'sealed_late_empty',
+        cardId: sealed.cardId,
+        messageId: update.messageId,
+        cardStreamSeq: update.cardStreamSeq || 0,
+        eventSeq: update.eventSeq || 0,
+        timestamp: Date.now(),
+        requestId: sealed.requestId,
+      });
+      return false;
+    }
+
+    const supplementCardId = `${sealed.cardId}::late::${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    const supplementBlocks = Array.isArray(update.blocks) && update.blocks.length > 0
+      ? update.blocks
+      : [{ type: 'text' as const, content: lateText || '[补遗] 收到延迟输出' }];
+    const supplement = createStandardMessage({
+      category: MessageCategory.CONTENT,
+      type: MessageType.TEXT,
+      source: sealed.source,
+      agent: sealed.agent,
+      traceId: sealed.traceId,
+      lifecycle: MessageLifecycle.COMPLETED,
+      blocks: supplementBlocks,
+      metadata: {
+        requestId: sealed.requestId,
+        cardId: supplementCardId,
+        parentCardId: sealed.cardId,
+        lateArrival: true,
+        lateFromCardId: sealed.cardId,
+      },
+    });
+
+    this.recordDeadLetter({
+      reason: 'sealed_late',
+      cardId: sealed.cardId,
+      messageId: update.messageId,
+      cardStreamSeq: update.cardStreamSeq || 0,
+      eventSeq: update.eventSeq || 0,
+      timestamp: Date.now(),
+      requestId: sealed.requestId,
+    });
+
+    this.process(supplement, sealed.requestId);
+    return true;
+  }
+
+  private sealCard(message: StandardMessage, state?: MessageState): void {
+    const cardId = this.resolveCardId(message.id, message.metadata);
+    const finalStreamSeq = typeof message.metadata?.cardStreamSeq === 'number'
+      ? message.metadata.cardStreamSeq
+      : (state?.lastCardStreamSeq || 0);
+    const sealed: SealedCardState = {
+      cardId,
+      finalStreamSeq,
+      sealedAt: Date.now(),
+      source: message.source,
+      agent: message.agent,
+      traceId: message.traceId,
+      requestId: message.metadata?.requestId,
+    };
+    this.sealedCards.set(cardId, sealed);
+    if (state) {
+      state.finalCardStreamSeq = finalStreamSeq;
+    }
+  }
+
   private addActiveMessage(id: string, message: StandardMessage, ts: number): void {
-    this.messageStates.set(id, { message, createdAt: ts, lastSentAt: ts, lastStreamAt: ts, completed: false });
+    const cardId = this.resolveCardId(id, message.metadata);
+    this.messageStates.set(id, {
+      message,
+      createdAt: ts,
+      lastSentAt: ts,
+      lastStreamAt: ts,
+      completed: false,
+      cardId,
+      lastCardStreamSeq: message.metadata?.cardStreamSeq || 0,
+    });
   }
 
   private markMessageComplete(id: string, message: StandardMessage, ts: number): void {
     const state = this.messageStates.get(id);
-    if (state) { state.message = message; state.lastSentAt = ts; state.completed = true; }
+    if (state) {
+      state.message = message;
+      state.lastSentAt = ts;
+      state.completed = true;
+      if (typeof message.metadata?.cardStreamSeq === 'number') {
+        state.lastCardStreamSeq = Math.max(state.lastCardStreamSeq, message.metadata.cardStreamSeq);
+      }
+      this.sealCard(message, state);
+    } else {
+      this.sealCard(message);
+    }
     this.streamBuffers.delete(id);
   }
 
@@ -96,7 +308,14 @@ export class MessagePipeline {
     return false;
   }
 
-  clearMessageState(messageId: string): void { this.messageStates.delete(messageId); }
+  clearMessageState(messageId: string): void {
+    const state = this.messageStates.get(messageId);
+    if (state?.cardId) {
+      this.sealedCards.delete(state.cardId);
+      this.cardStreamSeqCounters.delete(state.cardId);
+    }
+    this.messageStates.delete(messageId);
+  }
 
   getRequestMessageStats(requestId: string): RequestMessageSummary | undefined {
     const stats = this.requestMessageStats.get(requestId);
@@ -127,15 +346,81 @@ export class MessagePipeline {
       const invalid = update.blocks.filter(b => !b || typeof b !== 'object' || typeof (b as any).type !== 'string');
       if (invalid.length > 0) throw new Error(`[MessagePipeline] Invalid update blocks: ${update.messageId}`);
     }
-    if (!this.config.enabled) { this.updateStreamBufferFromUpdate(update); this.safeEmit('unified:update', update); return true; }
+    // 消息 ID 由生产者（adapter/normalizer）在 startStreamWithContext 时设置为正确值
+    // Pipeline 不做 ID 映射，直接使用原始 messageId
+    const existingState = this.messageStates.get(update.messageId);
+    const effectiveUpdate = this.ensureUpdateEnvelope(update, existingState?.cardId);
+    const cardId = effectiveUpdate.cardId || update.messageId;
+    const sealed = this.sealedCards.get(cardId);
+
+    if (sealed) {
+      const incomingSeq = effectiveUpdate.cardStreamSeq || 0;
+      if (incomingSeq <= sealed.finalStreamSeq) {
+        this.recordDeadLetter({
+          reason: 'sealed_duplicate',
+          cardId,
+          messageId: effectiveUpdate.messageId,
+          cardStreamSeq: incomingSeq,
+          eventSeq: effectiveUpdate.eventSeq || 0,
+          timestamp: Date.now(),
+          requestId: sealed.requestId,
+        });
+      } else {
+        this.maybeEmitLateSupplementMessage(effectiveUpdate, sealed);
+      }
+      return false;
+    }
+
+    if (!this.config.enabled) {
+      this.updateStreamBufferFromUpdate(effectiveUpdate);
+      this.safeEmit('unified:update', effectiveUpdate);
+      return true;
+    }
+
     const now = Date.now();
-    this.updateStreamBufferFromUpdate(update);
-    let state = this.messageStates.get(update.messageId);
-    if (!state) { state = { message: null, createdAt: now, lastSentAt: 0, lastStreamAt: 0, completed: false }; this.messageStates.set(update.messageId, state); }
-    if (state.completed) { logger.warn('MessagePipeline.完成后更新', { messageId: update.messageId }, LogCategory.SYSTEM); return false; }
+    this.updateStreamBufferFromUpdate(effectiveUpdate);
+    const hadState = Boolean(existingState);
+    let state = existingState;
+    if (!state) {
+      state = {
+        message: null,
+        createdAt: now,
+        lastSentAt: 0,
+        lastStreamAt: 0,
+        completed: false,
+        cardId,
+        lastCardStreamSeq: effectiveUpdate.cardStreamSeq || 0,
+      };
+      this.messageStates.set(effectiveUpdate.messageId, state);
+    }
+    if (state.completed) {
+      // 重新激活：同一 boundId 的新一轮流式 UPDATE
+      // 上一轮 endStream 标记了 completed，但新一轮的 MESSAGE(STARTED) 应已重新激活 state
+      // 如果 UPDATE 先于 MESSAGE 到达（理论上不应发生），也允许继续
+      state.completed = false;
+      state.lastStreamAt = 0;
+    }
+    if (
+      hadState
+      && typeof effectiveUpdate.cardStreamSeq === 'number'
+      && effectiveUpdate.cardStreamSeq <= state.lastCardStreamSeq
+    ) {
+      this.recordDeadLetter({
+        reason: 'out_of_order_update',
+        cardId,
+        messageId: effectiveUpdate.messageId,
+        cardStreamSeq: effectiveUpdate.cardStreamSeq,
+        eventSeq: effectiveUpdate.eventSeq || 0,
+        timestamp: Date.now(),
+      });
+      return false;
+    }
     if (now - state.lastStreamAt < this.config.minStreamInterval) return false;
     state.lastStreamAt = now;
-    this.safeEmit('unified:update', update);
+    if (typeof effectiveUpdate.cardStreamSeq === 'number') {
+      state.lastCardStreamSeq = Math.max(state.lastCardStreamSeq, effectiveUpdate.cardStreamSeq);
+    }
+    this.safeEmit('unified:update', effectiveUpdate);
     return true;
   }
 
@@ -157,20 +442,23 @@ export class MessagePipeline {
     const msgRequestId = message.metadata?.requestId;
     if (msgRequestId && message.metadata?.isPlaceholder === true) this.requestMessageIdMap.set(msgRequestId, message.id);
 
-    const isPlaceholder = message.metadata?.isPlaceholder === true;
-    const isUserInput = message.type === MessageType.USER_INPUT;
-    const isStatusMsg = message.metadata?.isStatusMessage === true;
-    const isTaskCard = message.type === MessageType.TASK_CARD;
-    const isInstruction = message.type === MessageType.INSTRUCTION;
-
-    if (message.category === MessageCategory.CONTENT && message.source === 'orchestrator' && msgRequestId && !isPlaceholder && !isUserInput && !isStatusMsg && !isTaskCard && !isInstruction) {
-      const boundId = this.getRequestMessageId(msgRequestId);
-      if (!boundId) throw new Error(`[MessagePipeline] 主响应消息缺少占位绑定: requestId=${msgRequestId}`);
-      if (message.id !== boundId) message = { ...message, id: boundId };
-    }
+    // 消息 ID 由生产者负责：
+    // - 流式 LLM 输出：adapter.startStreamWithContext() → normalizer.startStream(boundId) 确保 ID = 占位符 ID
+    // - 独立消息（INTERACTION、RESULT 等）：factory 创建时使用独立 ID
+    // Pipeline 不做 ID 映射，只做状态管理、节流和事件分发
 
     this.validate(message, msgRequestId);
-    if (message.category === MessageCategory.CONTENT) { this.updateStreamBufferFromMessage(message); message = this.ensureContentBlocksFromBuffer(message); }
+    if (message.category === MessageCategory.CONTENT) {
+      message = this.ensureMessageEnvelope(message);
+      this.updateStreamBufferFromMessage(message);
+      message = this.ensureContentBlocksFromBuffer(message);
+    } else {
+      message = {
+        ...message,
+        eventId: message.eventId || this.generateEventId('evt'),
+        eventSeq: this.resolveEventSeq(message.eventSeq),
+      };
+    }
     this.validateCategory(message);
 
     if (!this.config.enabled) { this.recordRequestMessage(message); this.emitByCategory(message); return true; }
@@ -180,8 +468,45 @@ export class MessagePipeline {
     const existingState = this.messageStates.get(id);
 
     if (existingState && lifecycle === MessageLifecycle.STARTED) {
+      if (existingState.completed) {
+        // 重新激活：同一 boundId 的新一轮流式消息（tool calling round 或多阶段 LLM 调用）
+        // 上一轮 endStream 标记了 completed 并 sealCard，新一轮需要重置以继续更新同一张卡片
+        existingState.completed = false;
+        // 必须清除 sealedCards，否则后续 processUpdate 会被 sealed 拦截，
+        // 触发 maybeEmitLateSupplementMessage 为每个 update 创建独立卡片
+        const sealKey = existingState.cardId || id;
+        this.sealedCards.delete(sealKey);
+        existingState.message = message;
+        existingState.lastSentAt = now;
+        existingState.lastStreamAt = 0;
+        existingState.cardId = this.resolveCardId(id, message.metadata);
+        if (typeof message.metadata?.cardStreamSeq === 'number') {
+          existingState.lastCardStreamSeq = Math.max(existingState.lastCardStreamSeq, message.metadata.cardStreamSeq);
+        }
+        this.updateProcessingState(true, message.source, message.agent);
+        this.recordRequestMessage(message); this.emitByCategory(message);
+        return true;
+      }
       if (existingState.message === null) {
-        existingState.message = message; existingState.lastSentAt = now;
+        existingState.message = message;
+        existingState.lastSentAt = now;
+        existingState.cardId = this.resolveCardId(id, message.metadata);
+        if (typeof message.metadata?.cardStreamSeq === 'number') {
+          existingState.lastCardStreamSeq = Math.max(existingState.lastCardStreamSeq, message.metadata.cardStreamSeq);
+        }
+        this.updateProcessingState(true, message.source, message.agent);
+        this.recordRequestMessage(message); this.emitByCategory(message);
+        return true;
+      }
+      // 占位消息 → 真实 LLM 消息转换：占位消息是 UI 桩，真实 STARTED 消息是 LLM 实际响应的起点
+      // 允许真实消息替换占位消息，确保 requestId 等元数据正确传播到前端
+      if (existingState.message?.metadata?.isPlaceholder) {
+        existingState.message = message;
+        existingState.lastSentAt = now;
+        existingState.cardId = this.resolveCardId(id, message.metadata);
+        if (typeof message.metadata?.cardStreamSeq === 'number') {
+          existingState.lastCardStreamSeq = Math.max(existingState.lastCardStreamSeq, message.metadata.cardStreamSeq);
+        }
         this.updateProcessingState(true, message.source, message.agent);
         this.recordRequestMessage(message); this.emitByCategory(message);
         return true;
@@ -201,23 +526,84 @@ export class MessagePipeline {
       this.addActiveMessage(id, message, now);
       if (lifecycle === MessageLifecycle.STREAMING) this.updateProcessingState(true, message.source, message.agent);
       this.recordRequestMessage(message); this.emitByCategory(message);
-      if (this.isTerminalLifecycle(lifecycle)) { this.markMessageComplete(id, message, now); this.safeEmit('unified:complete', message); this.checkAndUpdateProcessingState(); }
+      if (this.isTerminalLifecycle(lifecycle)) {
+        const finalSeq = message.metadata?.cardStreamSeq || 0;
+        const completedMessage: StandardMessage = {
+          ...message,
+          metadata: {
+            ...(message.metadata || {}),
+            finalStreamSeq: finalSeq,
+          },
+        };
+        this.markMessageComplete(id, completedMessage, now);
+        this.safeEmit('unified:complete', completedMessage);
+        this.checkAndUpdateProcessingState();
+      }
       return true;
     }
 
-    if (existingState.completed) { logger.warn('MessagePipeline.重复_完成', { id, source: message.source, agent: message.agent, lifecycle }, LogCategory.SYSTEM); return false; }
+    if (existingState.completed) {
+      // 已完成的 state 收到新消息：允许终态消息更新内容（如 result 替换最终输出）
+      if (this.isTerminalLifecycle(lifecycle)) {
+        existingState.message = message;
+        existingState.lastSentAt = now;
+        const finalSeq = message.metadata?.cardStreamSeq || existingState.lastCardStreamSeq || 0;
+        const completedMessage: StandardMessage = {
+          ...message,
+          metadata: {
+            ...(message.metadata || {}),
+            finalStreamSeq: finalSeq,
+          },
+        };
+        this.recordRequestMessage(completedMessage); this.emitByCategory(completedMessage);
+        return true;
+      }
+      // 非终态消息（STREAMING）：重新激活 state
+      existingState.completed = false;
+      existingState.lastStreamAt = 0;
+      // 清除 sealedCards 以允许后续 processUpdate 正常通过
+      const sealKey = existingState.cardId || id;
+      this.sealedCards.delete(sealKey);
+    }
 
     if (lifecycle === MessageLifecycle.STREAMING) {
+      if (
+        typeof message.metadata?.cardStreamSeq === 'number'
+        && message.metadata.cardStreamSeq <= existingState.lastCardStreamSeq
+      ) {
+        logger.warn('MessagePipeline.乱序_STREAMING', {
+          id,
+          cardId: existingState.cardId,
+          incomingCardStreamSeq: message.metadata.cardStreamSeq,
+          lastCardStreamSeq: existingState.lastCardStreamSeq,
+        }, LogCategory.SYSTEM);
+        return false;
+      }
       if (now - existingState.lastStreamAt < this.config.minStreamInterval) return false;
-      existingState.lastStreamAt = now; existingState.message = message;
+      existingState.lastStreamAt = now;
+      existingState.message = message;
+      existingState.cardId = this.resolveCardId(id, message.metadata);
+      if (typeof message.metadata?.cardStreamSeq === 'number') {
+        existingState.lastCardStreamSeq = Math.max(existingState.lastCardStreamSeq, message.metadata.cardStreamSeq);
+      }
       this.recordRequestMessage(message); this.emitByCategory(message);
       return true;
     }
 
     if (this.isTerminalLifecycle(lifecycle)) {
-      this.markMessageComplete(id, message, now);
-      this.recordRequestMessage(message); this.emitByCategory(message);
-      this.safeEmit('unified:complete', message); this.checkAndUpdateProcessingState();
+      const finalSeq = message.metadata?.cardStreamSeq || existingState.lastCardStreamSeq || 0;
+      const completedMessage: StandardMessage = {
+        ...message,
+        metadata: {
+          ...(message.metadata || {}),
+          finalStreamSeq: finalSeq,
+        },
+      };
+      this.markMessageComplete(id, completedMessage, now);
+      this.recordRequestMessage(completedMessage);
+      this.emitByCategory(completedMessage);
+      this.safeEmit('unified:complete', completedMessage);
+      this.checkAndUpdateProcessingState();
       return true;
     }
     return true;
@@ -319,12 +705,29 @@ export class MessagePipeline {
         const now = Date.now();
         const expireTime = now - this.config.retentionTime;
         const msgToDelete: string[] = [], bufToDelete: string[] = [], reqToDelete: string[] = [];
+        const cardToDelete = new Set<string>();
         for (const [id, state] of this.messageStates) { if (state.completed && state.lastSentAt < expireTime) msgToDelete.push(id); }
-        for (const id of msgToDelete) this.messageStates.delete(id);
+        for (const id of msgToDelete) {
+          const state = this.messageStates.get(id);
+          if (state?.cardId) {
+            cardToDelete.add(state.cardId);
+          }
+          this.messageStates.delete(id);
+        }
         for (const [id] of this.streamBuffers) { const state = this.messageStates.get(id); if (!state || state.completed) bufToDelete.push(id); }
         for (const id of bufToDelete) this.streamBuffers.delete(id);
         for (const [requestId, stats] of this.requestMessageStats) { if (stats.createdAt < expireTime) reqToDelete.push(requestId); }
         for (const requestId of reqToDelete) this.requestMessageStats.delete(requestId);
+        for (const [cardId, sealed] of this.sealedCards) {
+          if (sealed.sealedAt < expireTime) {
+            cardToDelete.add(cardId);
+            this.sealedCards.delete(cardId);
+          }
+        }
+        for (const cardId of cardToDelete) {
+          this.cardStreamSeqCounters.delete(cardId);
+        }
+        this.deadLetters = this.deadLetters.filter((entry) => entry.timestamp >= expireTime);
       } catch (error) { logger.error('MessagePipeline.cleanup_timer_failed', { error: error instanceof Error ? error.message : String(error) }, LogCategory.SYSTEM); }
     }, 60 * 1000);
   }
@@ -375,6 +778,10 @@ export class MessagePipeline {
   dispose(): void {
     if (this.cleanupTimer) { clearInterval(this.cleanupTimer); this.cleanupTimer = null; }
     this.messageStates.clear();
+    this.sealedCards.clear();
+    this.cardStreamSeqCounters.clear();
+    this.deadLetters = [];
+    this.eventSeqCounter = 0;
     this.processingMessageIds.clear();
     this.requestMessageStats.clear();
     this.requestMessageIdMap.clear();

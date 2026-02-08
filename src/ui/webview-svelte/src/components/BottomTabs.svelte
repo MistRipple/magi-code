@@ -35,67 +35,68 @@
   };
 </script>
 
-<div class="bottom-tabs">
+<div class="bt-bar">
   <button
-    class="bottom-tab"
+    class="bt-tab"
     class:active={activeTab === 'thread'}
     onclick={() => onTabChange('thread')}
   >
-    对话
+    <Icon name="chat" size={12} />
+    主线
   </button>
   <button
-    class="bottom-tab worker-tab"
+    class="bt-tab bt-worker"
     class:active={activeTab === 'claude'}
-    style="--tab-worker-color: {workerColors.claude}"
+    style="--w-color: {workerColors.claude}"
     onclick={() => onTabChange('claude')}
   >
-    <span class="status-indicator">
+    <span class="bt-dot-wrap">
       {#if executionStatus.claude === 'executing'}
-        <Icon name="loader" size={14} class="spinning" />
+        <Icon name="loader" size={12} class="spinning" />
       {:else if executionStatus.claude === 'completed'}
-        <Icon name="check-circle" size={14} class="status-success" />
+        <Icon name="check-circle" size={12} class="bt-ok" />
       {:else if executionStatus.claude === 'failed'}
-        <Icon name="x-circle" size={14} class="status-error" />
+        <Icon name="x-circle" size={12} class="bt-err" />
       {:else}
-        <span class="dot" class:available={isModelAvailable('claude')}></span>
+        <span class="bt-dot" class:on={isModelAvailable('claude')}></span>
       {/if}
     </span>
     Claude
   </button>
   <button
-    class="bottom-tab worker-tab"
+    class="bt-tab bt-worker"
     class:active={activeTab === 'codex'}
-    style="--tab-worker-color: {workerColors.codex}"
+    style="--w-color: {workerColors.codex}"
     onclick={() => onTabChange('codex')}
   >
-    <span class="status-indicator">
+    <span class="bt-dot-wrap">
       {#if executionStatus.codex === 'executing'}
-        <Icon name="loader" size={14} class="spinning" />
+        <Icon name="loader" size={12} class="spinning" />
       {:else if executionStatus.codex === 'completed'}
-        <Icon name="check-circle" size={14} class="status-success" />
+        <Icon name="check-circle" size={12} class="bt-ok" />
       {:else if executionStatus.codex === 'failed'}
-        <Icon name="x-circle" size={14} class="status-error" />
+        <Icon name="x-circle" size={12} class="bt-err" />
       {:else}
-        <span class="dot" class:available={isModelAvailable('codex')}></span>
+        <span class="bt-dot" class:on={isModelAvailable('codex')}></span>
       {/if}
     </span>
     Codex
   </button>
   <button
-    class="bottom-tab worker-tab"
+    class="bt-tab bt-worker"
     class:active={activeTab === 'gemini'}
-    style="--tab-worker-color: {workerColors.gemini}"
+    style="--w-color: {workerColors.gemini}"
     onclick={() => onTabChange('gemini')}
   >
-    <span class="status-indicator">
+    <span class="bt-dot-wrap">
       {#if executionStatus.gemini === 'executing'}
-        <Icon name="loader" size={14} class="spinning" />
+        <Icon name="loader" size={12} class="spinning" />
       {:else if executionStatus.gemini === 'completed'}
-        <Icon name="check-circle" size={14} class="status-success" />
+        <Icon name="check-circle" size={12} class="bt-ok" />
       {:else if executionStatus.gemini === 'failed'}
-        <Icon name="x-circle" size={14} class="status-error" />
+        <Icon name="x-circle" size={12} class="bt-err" />
       {:else}
-        <span class="dot" class:available={isModelAvailable('gemini')}></span>
+        <span class="bt-dot" class:on={isModelAvailable('gemini')}></span>
       {/if}
     </span>
     Gemini
@@ -103,95 +104,89 @@
 </div>
 
 <style>
-  .bottom-tabs {
+  /* ============================================
+     BottomTabs - Agent 切换栏
+     设计参考: Cursor 底部 worker 状态栏
+     ============================================ */
+  .bt-bar {
     display: flex;
-    gap: var(--space-1);
-    padding: 0 var(--space-4);
+    padding: 0 var(--space-3);
     background: var(--background);
     border-top: 1px solid var(--border);
     flex-shrink: 0;
   }
 
-  .bottom-tab {
-    display: flex;
+  .bt-tab {
+    display: inline-flex;
     align-items: center;
-    gap: var(--space-2);
-    padding: var(--space-3) var(--space-4);
-    font-size: var(--text-sm);
+    gap: var(--space-1);
+    padding: 5px var(--space-3);
+    font-size: var(--text-xs);
     font-weight: var(--font-medium);
     color: var(--foreground-muted);
     background: transparent;
     border: none;
     border-top: 2px solid transparent;
     cursor: pointer;
-    transition: all var(--transition-fast);
-    position: relative;
+    transition: color var(--transition-fast), border-color var(--transition-fast);
+    white-space: nowrap;
   }
 
-  .bottom-tab:hover {
+  .bt-tab:hover {
     color: var(--foreground);
-    background: var(--surface-1);
   }
 
-  .bottom-tab.active {
-    color: var(--primary);
+  .bt-tab.active {
+    color: var(--foreground);
     border-top-color: var(--primary);
   }
 
-  /* Worker Tab 激活时使用对应颜色 */
-  .bottom-tab.worker-tab.active {
-    color: var(--tab-worker-color);
-    border-top-color: var(--tab-worker-color);
+  /* Worker Tab 激活时使用品牌色 */
+  .bt-worker.active {
+    color: var(--w-color);
+    border-top-color: var(--w-color);
   }
 
-  .status-indicator {
-    display: flex;
+  .bt-dot-wrap {
+    display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 14px;
-    height: 14px;
+    width: 12px;
+    height: 12px;
     flex-shrink: 0;
   }
 
-  .dot {
-    width: 6px;
-    height: 6px;
+  .bt-dot {
+    width: 5px;
+    height: 5px;
     border-radius: var(--radius-full);
     background: var(--foreground-muted);
-    transition: background var(--transition-fast);
-    flex-shrink: 0;
+    opacity: 0.4;
+    transition: all var(--transition-fast);
   }
 
-  .dot.available {
+  .bt-dot.on {
     background: var(--success);
+    opacity: 1;
   }
 
-  /* 执行中旋转动画 */
-  :global(.status-indicator .spinning) {
-    animation: spin 1s linear infinite;
-    color: var(--tab-worker-color, var(--primary));
+  /* 执行状态动画 */
+  :global(.bt-dot-wrap .spinning) {
+    animation: bt-spin 1s linear infinite;
+    color: var(--w-color, var(--primary));
   }
 
-  /* 成功状态 */
-  :global(.status-indicator .status-success) {
+  :global(.bt-ok) {
     color: var(--success);
-    animation: fadeIn 0.2s ease-out;
   }
 
-  /* 失败状态 */
-  :global(.status-indicator .status-error) {
+  :global(.bt-err) {
     color: var(--error);
-    animation: fadeIn 0.2s ease-out;
   }
 
-  @keyframes spin {
+  @keyframes bt-spin {
     from { transform: rotate(0deg); }
     to { transform: rotate(360deg); }
-  }
-
-  @keyframes fadeIn {
-    from { opacity: 0; transform: scale(0.8); }
-    to { opacity: 1; transform: scale(1); }
   }
 </style>
 

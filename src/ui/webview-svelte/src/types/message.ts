@@ -70,6 +70,7 @@ export interface ToolCall {
 export interface ThinkingBlock {
   content: string;
   isComplete: boolean;
+  summary?: string;
 }
 
 // 消息内容块
@@ -210,6 +211,14 @@ export interface Message {
     wasPlaceholder?: boolean;         // 是否从占位消息转换而来（用于过渡动画）
     justCompleted?: boolean;          // 是否刚完成（用于完成动画）
     sendingAnimation?: boolean;       // 用户消息发送动画
+    eventId?: string;                 // 事件 ID（后端下发）
+    eventSeq?: number;                // 事件序号（会话内单调递增）
+    cardId?: string;                  // 卡片实体 ID
+    cardStreamSeq?: number;           // 卡片流式序号
+    parentCardId?: string;            // 父卡片 ID（补遗卡片）
+    finalStreamSeq?: number;          // 封口流式序号
+    lateArrival?: boolean;            // 是否为晚到补遗
+    lateFromCardId?: string;          // 晚到来源 cardId
     images?: Array<{ dataUrl: string }>; // 🔧 从 metadata 提取的图片（后端传递）
     [key: string]: unknown;
   };

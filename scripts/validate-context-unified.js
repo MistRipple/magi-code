@@ -51,14 +51,14 @@ function run() {
     {
       file: 'autonomous-worker.ts',
       content: workerContent,
-      regex: /await this\.writeInsight\(this\.buildSuccessInsight\(/,
-      description: '成功路径必须写入 insight',
+      regex: /await this\.writeInsights\(this\.buildSuccessInsights\(/,
+      description: '成功路径必须写入结构化共享洞察',
     },
     {
       file: 'autonomous-worker.ts',
       content: workerContent,
-      regex: /await this\.writeInsight\(this\.buildFailureInsight\(/,
-      description: '失败路径必须写入 insight',
+      regex: /await this\.writeInsights\(this\.buildFailureInsights\(/,
+      description: '失败路径必须写入结构化共享洞察',
     },
     {
       file: 'autonomous-worker.ts',

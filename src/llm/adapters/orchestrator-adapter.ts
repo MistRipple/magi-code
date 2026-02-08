@@ -52,6 +52,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
    */
   private tempSystemPrompt?: string;
   private tempEnableToolCalls?: boolean;
+  private tempVisibility?: 'user' | 'system' | 'debug';
 
   constructor(adapterConfig: OrchestratorAdapterConfig) {
     super(
@@ -98,15 +99,18 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     // 获取临时配置（使用后清除）
     const effectiveSystemPrompt = this.tempSystemPrompt ?? this.systemPrompt;
     const enableToolCalls = this.tempEnableToolCalls ?? false;
+    const silent = this.tempVisibility === 'system';
     this.tempSystemPrompt = undefined;
     this.tempEnableToolCalls = undefined;
+    this.tempVisibility = undefined;
 
     try {
       if (enableToolCalls) {
         const content = await this.sendMessageWithTools(
           message,
           images,
-          effectiveSystemPrompt
+          effectiveSystemPrompt,
+          silent ? 'system' : undefined
         );
         this.setState(AdapterState.CONNECTED);
         return content;
@@ -129,8 +133,16 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         temperature: 0.3, // 更低的温度以获得更确定的规划
       };
 
-      // 开始流式响应
-      const streamId = this.startStreamWithContext();
+      // visibility: 'system' 时不绑定 placeholder，使用独立 messageId，且标记 visibility 让前端拦截
+      let streamId: string;
+      if (silent) {
+        if (!this.currentTraceId) {
+          this.currentTraceId = this.generateTraceId();
+        }
+        streamId = this.normalizer.startStream(this.currentTraceId, undefined, undefined, 'system');
+      } else {
+        streamId = this.startStreamWithContext();
+      }
       messageId = streamId;
       let fullResponse = '';
 
@@ -141,7 +153,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           this.normalizer.processTextDelta(streamId, chunk.content);
           this.emit('message', chunk.content);
         } else if (chunk.type === 'thinking' && chunk.thinking) {
-          // 处理 thinking 内容
           this.normalizer.processThinking(streamId, chunk.thinking);
           this.emit('thinking', chunk.thinking);
         }
@@ -268,6 +279,13 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   setTempEnableToolCalls(enabled: boolean): void {
     this.tempEnableToolCalls = enabled;
   }
+  /**
+   * 设置临时可见性（仅对下一次请求生效）
+   * visibility: 'system' 时，LLM 调用跳过 normalizer，不产生前端消息
+   */
+  setTempVisibility(visibility: 'user' | 'system' | 'debug'): void {
+    this.tempVisibility = visibility;
+  }
 
   /**
    * 获取默认系统提示
@@ -376,29 +394,23 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
 
   /**
    * 编排者工具调用模式（仅在显式启用时）
+   *
+   * 使用迭代循环（而非递归）实现工具调用链，
+   * 整个循环共享一个 streamId，确保用户只看到一条流式消息。
    */
   private async sendMessageWithTools(
     message: string,
     images: string[] | undefined,
-    systemPrompt: string
+    systemPrompt: string,
+    visibility?: 'user' | 'system' | 'debug'
   ): Promise<string> {
     // 自动截断历史以控制 token 消耗
     this.truncateHistoryIfNeeded();
 
     // 添加用户消息到历史
-    this.conversationHistory.push(this.buildUserMessage(message, images));
+    const history = this.conversationHistory;
+    history.push(this.buildUserMessage(message, images));
 
-    return await this.runToolCallingRound(this.conversationHistory, systemPrompt, 0);
-  }
-
-  /**
-   * 单轮工具调用 + 递归收敛
-   */
-  private async runToolCallingRound(
-    history: LLMMessage[],
-    systemPrompt: string,
-    recursionDepth: number
-  ): Promise<string> {
     const tools = await this.toolManager.getTools();
     const toolDefinitions = tools.map((tool) => ({
       name: tool.name,
@@ -406,40 +418,56 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       input_schema: tool.input_schema,
     }));
 
-    const params: LLMMessageParams = {
-      messages: history,
-      systemPrompt,
-      tools: toolDefinitions.length > 0 ? toolDefinitions : undefined,
-      stream: true,
-      maxTokens: 8192,
-      temperature: 0.3,
-    };
-
-    const streamId = this.startStreamWithContext();
-    let accumulatedText = '';
-    let toolCalls: ToolCall[] = [];
+    // 整个工具循环共享一个 streamId，保证前端只显示一条消息
+    const streamId = visibility === 'system'
+      ? this.normalizer.startStream(this.currentTraceId!, undefined, undefined, 'system')
+      : this.startStreamWithContext();
+    const MAX_ROUNDS = 4;
 
     try {
-      const response = await this.client.streamMessage(params, (chunk) => {
-        if (chunk.type === 'content_delta' && chunk.content) {
-          accumulatedText += chunk.content;
-          this.normalizer.processTextDelta(streamId, chunk.content);
-          this.emit('message', chunk.content);
-        } else if (chunk.type === 'thinking' && chunk.thinking) {
-          this.normalizer.processThinking(streamId, chunk.thinking);
-          this.emit('thinking', chunk.thinking);
-        } else if (chunk.type === 'tool_call_start' && chunk.toolCall) {
-          this.emit('toolCall', chunk.toolCall.name || '', chunk.toolCall.arguments || {});
+      let finalText = '';
+
+      for (let round = 0; round < MAX_ROUNDS; round++) {
+        const params: LLMMessageParams = {
+          messages: history,
+          systemPrompt,
+          tools: toolDefinitions.length > 0 ? toolDefinitions : undefined,
+          stream: true,
+          maxTokens: 8192,
+          temperature: 0.3,
+        };
+
+        let accumulatedText = '';
+        let toolCalls: ToolCall[] = [];
+
+        const response = await this.client.streamMessage(params, (chunk) => {
+          if (chunk.type === 'content_delta' && chunk.content) {
+            accumulatedText += chunk.content;
+            this.normalizer.processTextDelta(streamId, chunk.content);
+            this.emit('message', chunk.content);
+          } else if (chunk.type === 'thinking' && chunk.thinking) {
+            this.normalizer.processThinking(streamId, chunk.thinking);
+            this.emit('thinking', chunk.thinking);
+          } else if (chunk.type === 'tool_call_start' && chunk.toolCall) {
+            this.emit('toolCall', chunk.toolCall.name || '', chunk.toolCall.arguments || {});
+          }
+        });
+        this.recordTokenUsage(response.usage);
+
+        if (response.toolCalls && response.toolCalls.length > 0) {
+          toolCalls = response.toolCalls;
         }
-      });
-      this.recordTokenUsage(response.usage);
 
-      if (response.toolCalls && response.toolCalls.length > 0) {
-        toolCalls = response.toolCalls;
-      }
+        const assistantText = accumulatedText || response.content || '';
 
-      const assistantText = accumulatedText || response.content || '';
-      if (toolCalls.length > 0) {
+        // 无工具调用 → 收敛，结束循环
+        if (toolCalls.length === 0) {
+          history.push({ role: 'assistant', content: assistantText });
+          finalText = assistantText;
+          break;
+        }
+
+        // 有工具调用 → 执行工具，将结果追加到历史，继续循环
         for (const toolCall of toolCalls) {
           this.normalizer.addToolCall(streamId, {
             type: 'tool_call',
@@ -452,10 +480,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
 
         const assistantContent: any[] = [];
         if (assistantText) {
-          assistantContent.push({
-            type: 'text',
-            text: assistantText,
-          });
+          assistantContent.push({ type: 'text', text: assistantText });
         }
         for (const toolCall of toolCalls) {
           assistantContent.push({
@@ -465,10 +490,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             input: toolCall.arguments,
           });
         }
-        history.push({
-          role: 'assistant',
-          content: assistantContent,
-        });
+        history.push({ role: 'assistant', content: assistantContent });
 
         const toolResults = await this.executeToolCalls(toolCalls);
         for (const result of toolResults) {
@@ -490,24 +512,18 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           })),
         });
 
-        this.normalizer.endStream(streamId);
-
-        if (recursionDepth >= 3) {
-          return '多次工具调用后仍未产出最终回复，已中止以避免无限循环。';
+        // 达到最大轮次仍有工具调用 → 强制收敛
+        if (round === MAX_ROUNDS - 1) {
+          finalText = assistantText || '多次工具调用后仍未产出最终回复，已中止以避免无限循环。';
         }
-        return await this.runToolCallingRound(history, systemPrompt, recursionDepth + 1);
       }
-
-      history.push({
-        role: 'assistant',
-        content: assistantText,
-      });
 
       this.normalizer.endStream(streamId);
-      if (!assistantText.trim()) {
+
+      if (!finalText.trim()) {
         throw new Error('LLM 响应为空：流式传输完成但未收到有效内容');
       }
-      return assistantText;
+      return finalText;
     } catch (error: any) {
       this.normalizer.endStream(streamId, error?.message || 'Request failed');
       throw error;

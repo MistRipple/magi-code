@@ -13,7 +13,7 @@ export const ROUTING_TABLE: Record<MessageCategory, DisplayTarget | { location: 
   [MessageCategory.WORKER_OUTPUT]: { location: 'worker' },
   [MessageCategory.WORKER_TOOL_USE]: { location: 'worker' },
   [MessageCategory.WORKER_CODE]: { location: 'worker' },
-  [MessageCategory.WORKER_SUMMARY]: { location: 'worker' },
+  [MessageCategory.WORKER_SUMMARY]: { location: 'both' },
   [MessageCategory.SYSTEM_NOTICE]: { location: 'thread' },
   [MessageCategory.SYSTEM_PHASE]: { location: 'none' },
   [MessageCategory.SYSTEM_ERROR]: { location: 'thread' },

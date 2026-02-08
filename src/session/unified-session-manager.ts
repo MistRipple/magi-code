@@ -227,7 +227,7 @@ export class UnifiedSessionManager {
     return this.getAllSessions().map(s => ({
       id: s.id,
       name: s.name,
-      messageCount: s.messages.length,
+      messageCount: s.messages.filter(m => m.role === 'user').length,
       createdAt: s.createdAt,
       updatedAt: s.updatedAt,
       preview: this.getSessionPreview(s),
@@ -821,7 +821,7 @@ export class UnifiedSessionManager {
       keyDecisions,
       codeChanges,
       pendingIssues,
-      messageCount: session.messages.length,
+      messageCount: session.messages.filter(m => m.role === 'user').length,
       lastUpdated: session.updatedAt,
     };
   }

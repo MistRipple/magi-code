@@ -83,6 +83,15 @@ export class AssignmentExecutor {
     // 创建快照
     await this.createSnapshots(mission, assignment);
 
+    // 设置工具级快照上下文（确保 Worker 工具调用时自动创建快照）
+    const toolManager = this.adapterFactory.getToolManager();
+    toolManager.setSnapshotContext({
+      missionId: mission.id,
+      assignmentId: assignment.id,
+      todoId: 'assignment-level',
+      workerId: assignment.workerId,
+    });
+
     // 获取上下文快照
     const contextSnapshot = await this.generateContextSnapshot(
       mission.id,
@@ -107,7 +116,9 @@ export class AssignmentExecutor {
     }
 
     // 执行 Assignment
-    let result = await worker.executeAssignment(assignment, {
+    let result: AutonomousExecutionResult;
+    try {
+      result = await worker.executeAssignment(assignment, {
       workingDirectory: options.workingDirectory,
       projectContext: options.projectContext,
       timeout: options.timeout,
@@ -185,6 +196,10 @@ export class AssignmentExecutor {
 
     // 更新 ContextManager
     await this.updateContextManager(assignment, result, options.contextManager);
+    } finally {
+      // 清除快照上下文（无论成功或失败）
+      toolManager.clearSnapshotContext();
+    }
 
     logger.info(
       LogCategory.ORCHESTRATOR,

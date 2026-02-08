@@ -19,8 +19,19 @@ export class FileExecutor implements ToolExecutor {
   private workspaceRoot: string;
   private undoStack: Map<string, string> = new Map();
 
+  /** 文件写入前回调（用于快照系统在写入前保存原始内容） */
+  private onBeforeWrite?: (filePath: string) => void;
+
   constructor(workspaceRoot: string) {
     this.workspaceRoot = workspaceRoot;
+  }
+
+  /**
+   * 设置文件写入前回调
+   * 每次 create/str_replace/insert 写入文件前会调用此回调
+   */
+  setBeforeWriteCallback(callback: (filePath: string) => void): void {
+    this.onBeforeWrite = callback;
   }
 
   /**
@@ -474,6 +485,9 @@ IMPORTANT:
     // 创建目录
     await fs.mkdir(path.dirname(filePath), { recursive: true });
 
+    // 快照回调（新文件不存在原始内容，但仍通知快照系统记录"文件创建"事件）
+    this.onBeforeWrite?.(filePath);
+
     // 写入文件
     await fs.writeFile(filePath, fileText, 'utf-8');
 
@@ -576,6 +590,9 @@ IMPORTANT:
       // 保存撤销信息
       this.undoStack.set(filePath, content);
 
+      // 快照回调
+      this.onBeforeWrite?.(filePath);
+
       // 组装最终内容
       const updated = beforeRange + updatedRange + afterRange;
       await fs.writeFile(filePath, updated, 'utf-8');
@@ -622,6 +639,9 @@ IMPORTANT:
 
     // 保存撤销信息
     this.undoStack.set(filePath, content);
+
+    // 快照回调
+    this.onBeforeWrite?.(filePath);
 
     // 执行替换
     const updated = content.replace(oldStr, newStr);
@@ -681,6 +701,9 @@ IMPORTANT:
 
     // 保存撤销信息
     this.undoStack.set(filePath, content);
+
+    // 快照回调
+    this.onBeforeWrite?.(filePath);
 
     // 在指定行后插入
     lines.splice(insertLine, 0, insertText);

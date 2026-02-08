@@ -1,7 +1,6 @@
 <script lang="ts">
   import hljs from 'highlight.js';
   import MermaidRenderer from './MermaidRenderer.svelte';
-  import { escapeHtml } from '../lib/markdown-utils'; // 需确保此工具函数存在，如不存在需内联
 
   // Props
   interface Props {
@@ -75,6 +74,11 @@
       highlightedHtml = safeEscape(trimmedCode);
     } else {
       // 非流式：尝试高亮
+      // 超长代码块跳过高亮，避免主线程阻塞
+      if (trimmedCode.length > 50000) {
+        highlightedHtml = safeEscape(trimmedCode);
+        return;
+      }
       // 使用 setTimeout 宏任务，避免阻塞主线程（虽然 hljs 是同步的）
       const timer = setTimeout(() => {
         try {
@@ -371,4 +375,3 @@
     50% { opacity: 0.6; }
   }
 </style>
-

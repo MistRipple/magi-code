@@ -10,8 +10,7 @@
   import AgentTab from './AgentTab.svelte';
   import { ensureArray } from '../lib/utils';
 
-  // 🔧 修复响应式追踪问题：直接使用 messagesState 对象
-  // Svelte 5 官方推荐：导出对象并访问其属性，确保响应式追踪正常
+  // 直接使用 messagesState 对象，确保 Svelte 5 响应式追踪正常
 
   // 底部 Tab: 使用 store 中的状态，支持从其他组件跳转
   const activeBottomTab = $derived(messagesState.currentBottomTab as 'thread' | 'claude' | 'codex' | 'gemini');
@@ -36,7 +35,7 @@
   <!-- 消息内容区域（使用 position: relative 让滚动按钮相对于消息区域定位） -->
   <div class="main-content">
     {#if activeBottomTab === 'thread'}
-      <MessageList {messages} readOnly={true} />
+      <MessageList {messages} />
     {:else}
       <AgentTab messages={agentOutputs[activeBottomTab] || []} />
     {/if}
@@ -54,11 +53,13 @@
     display: flex;
     flex-direction: column;
     height: 100%;
+    min-height: 0; /* flex 布局防溢出 */
     overflow: hidden;
   }
 
   .main-content {
     flex: 1;
+    min-height: 0; /* flex 布局防溢出 */
     overflow: hidden;
     position: relative;
   }

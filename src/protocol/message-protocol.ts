@@ -385,6 +385,12 @@ export interface StandardMessage {
   /** 消息唯一标识 */
   id: string;
 
+  /** 事件唯一标识（用于事件流排障） */
+  eventId?: string;
+
+  /** 事件顺序号（会话内单调递增） */
+  eventSeq?: number;
+
   /** 追踪 ID（用于关联同一任务的多条消息） */
   traceId: string;
 
@@ -508,6 +514,18 @@ export interface MessageMetadata {
   reason?: string;
   /** 请求 ID（用于占位/响应绑定） */
   requestId?: string;
+  /** 卡片实体 ID（流式更新必须绑定同一 cardId） */
+  cardId?: string;
+  /** 父卡片 ID（补遗卡片或衍生卡片回溯来源） */
+  parentCardId?: string;
+  /** 单卡片内流式序号（严格递增） */
+  cardStreamSeq?: number;
+  /** 卡片封口时的最终流式序号 */
+  finalStreamSeq?: number;
+  /** 是否为晚到流式补遗 */
+  lateArrival?: boolean;
+  /** 晚到流式来源的原 cardId */
+  lateFromCardId?: string;
   /** 会话 ID（用于跨会话标记） */
   sessionId?: string;
   /** 消息角色（user/assistant/system） */
@@ -541,6 +559,18 @@ export interface MessageMetadata {
 export interface StreamUpdate {
   /** 消息 ID */
   messageId: string;
+
+  /** 事件唯一标识（用于事件流排障） */
+  eventId?: string;
+
+  /** 事件顺序号（会话内单调递增） */
+  eventSeq?: number;
+
+  /** 卡片实体 ID（默认回退为 messageId） */
+  cardId?: string;
+
+  /** 单卡片内流式序号（严格递增） */
+  cardStreamSeq?: number;
 
   /** 更新类型 */
   updateType: 'append' | 'replace' | 'block_update' | 'lifecycle_change';

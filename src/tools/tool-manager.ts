@@ -3,7 +3,7 @@
  * 管理所有工具源：MCP、内置工具
  *
  * 内置工具 (source: 'builtin'):
- * - launch-process/read-process/write-process/kill-process/list-processes: 终端运行时 V2
+ * - launch-process/read-process/write-process/kill-process/list-processes: 终端运行时
  * - text_editor: 文件编辑
  * - grep_search: 代码搜索
  * - remove_files: 文件删除
@@ -12,6 +12,9 @@
  * - mermaid_diagram: Mermaid 图表渲染
  * - codebase_retrieval: 代码库语义搜索 (ACE)
  * - lsp_query: LSP 代码智能查询
+ * - dispatch_task: 将子任务分配给专业 Worker
+ * - plan_mission: 创建多 Worker 协作计划
+ * - send_worker_message: 向 Worker 面板发送消息
  *
  * ACE 配置来源：~/.multicli/config.json 的 promptEnhance 字段（唯一）
  */
@@ -34,11 +37,23 @@ import { WebExecutor } from './web-executor';
 import { MermaidExecutor } from './mermaid-executor';
 import { AceExecutor } from './ace-executor';
 import { LspExecutor } from './lsp-executor';
+import { OrchestrationExecutor } from './orchestration-executor';
 import { logger, LogCategory } from '../logging';
 import { PermissionMatrix } from '../types';
+import type { SnapshotManager } from '../snapshot-manager';
 import type { SkillsManager, InstructionSkillDefinition } from './skills-manager';
 import type { MCPToolExecutor } from './mcp-executor';
 import type { MCPPromptInfo } from './mcp-manager';
+
+/**
+ * 快照执行上下文（标识当前正在执行的 mission/assignment/worker）
+ */
+export interface SnapshotContext {
+  missionId: string;
+  assignmentId: string;
+  todoId: string;
+  workerId: string;
+}
 
 /**
  * 统一 Prompt 信息接口（MCP Prompts + Instruction Skills）
@@ -101,6 +116,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   private mermaidExecutor: MermaidExecutor;
   private aceExecutor: AceExecutor;
   private lspExecutor: LspExecutor;
+  private orchestrationExecutor: OrchestrationExecutor;
 
   // 外部工具执行器
   private mcpExecutors: Map<string, ToolExecutor> = new Map();
@@ -110,6 +126,10 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   private toolCache: Map<string, ExtendedToolDefinition> = new Map();
   private permissions: PermissionMatrix;
   private authorizationCallback?: (toolName: string, toolArgs: any) => Promise<boolean>;
+
+  // 快照系统
+  private snapshotManager?: SnapshotManager;
+  private snapshotContext?: SnapshotContext;
 
   constructor(workspaceRoot?: string, permissions?: PermissionMatrix) {
     super();
@@ -127,6 +147,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     this.mermaidExecutor = new MermaidExecutor();
     this.aceExecutor = new AceExecutor(this.workspaceRoot, aceConfig.baseUrl, aceConfig.apiKey);
     this.lspExecutor = new LspExecutor(this.workspaceRoot);
+    this.orchestrationExecutor = new OrchestrationExecutor();
 
     this.permissions = permissions || {
       allowEdit: true,
@@ -148,6 +169,9 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     this.searchExecutor = new SearchExecutor(workspaceRoot);
     this.removeFilesExecutor = new RemoveFilesExecutor(workspaceRoot);
 
+    // 重新注入快照回调（因为执行器被重建了）
+    this.injectSnapshotCallbacks();
+
     // 重新读取 ACE 配置并更新
     const aceConfig = loadAceConfigFromFile();
     this.aceExecutor.updateConfig(workspaceRoot, aceConfig.baseUrl, aceConfig.apiKey);
@@ -155,6 +179,75 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     this.lspExecutor = new LspExecutor(workspaceRoot);
     this.invalidateCache();
     logger.info('ToolManager workspace root updated', { workspaceRoot }, LogCategory.TOOLS);
+  }
+
+  /**
+   * 注入 SnapshotManager
+   * 在文件写入/删除前自动创建快照，确保精确记录所有变更
+   */
+  setSnapshotManager(snapshotManager: SnapshotManager): void {
+    this.snapshotManager = snapshotManager;
+    this.injectSnapshotCallbacks();
+    logger.info('ToolManager: SnapshotManager 已注入', undefined, LogCategory.TOOLS);
+  }
+
+  /**
+   * 设置快照执行上下文
+   * 在 Assignment 执行前调用，标识当前正在执行的任务信息
+   */
+  setSnapshotContext(context: SnapshotContext): void {
+    this.snapshotContext = context;
+  }
+
+  /**
+   * 更新快照上下文的 todoId（在每个 Todo 执行开始时调用）
+   * 确保文件变更精确关联到具体的 Todo
+   */
+  updateSnapshotTodoId(todoId: string): void {
+    if (this.snapshotContext) {
+      this.snapshotContext.todoId = todoId;
+    }
+  }
+
+  /**
+   * 清除快照执行上下文
+   * 在 Assignment 执行后调用
+   */
+  clearSnapshotContext(): void {
+    this.snapshotContext = undefined;
+  }
+
+  /**
+   * 向 FileExecutor 和 RemoveFilesExecutor 注入快照回调
+   */
+  private injectSnapshotCallbacks(): void {
+    if (!this.snapshotManager) return;
+
+    const snapshotManager = this.snapshotManager;
+    const self = this;
+
+    const beforeWriteCallback = (filePath: string) => {
+      if (!self.snapshotContext) return;
+      try {
+        snapshotManager.createSnapshotForMission(
+          filePath,
+          self.snapshotContext.missionId,
+          self.snapshotContext.assignmentId,
+          self.snapshotContext.todoId,
+          self.snapshotContext.workerId,
+          'tool-level-snapshot'
+        );
+      } catch (error: any) {
+        // 快照失败不应阻断工具执行
+        logger.warn('ToolManager: 工具级快照创建失败', {
+          filePath,
+          error: error?.message
+        }, LogCategory.TOOLS);
+      }
+    };
+
+    this.fileExecutor.setBeforeWriteCallback(beforeWriteCallback);
+    this.removeFilesExecutor.setBeforeWriteCallback(beforeWriteCallback);
   }
 
   /**
@@ -236,7 +329,10 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     'web_fetch',
     'mermaid_diagram',
     'codebase_retrieval',
-    'lsp_query'
+    'lsp_query',
+    'dispatch_task',
+    'plan_mission',
+    'send_worker_message',
   ];
 
   /**
@@ -358,6 +454,11 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       case 'lsp_query':
         return await this.lspExecutor.execute(toolCall);
 
+      case 'dispatch_task':
+      case 'plan_mission':
+      case 'send_worker_message':
+        return await this.orchestrationExecutor.execute(toolCall);
+
       default:
         return {
           toolCallId: toolCall.id,
@@ -428,6 +529,11 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       return { allowed: true };
     }
 
+    // 编排工具默认允许（内部调度不需要额外权限）
+    if (toolName === 'dispatch_task' || toolName === 'plan_mission' || toolName === 'send_worker_message') {
+      return { allowed: true };
+    }
+
     // 其他工具默认允许（Read, Grep, Glob 等只读工具）
     return { allowed: true };
   }
@@ -491,8 +597,8 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   private getBuiltinTools(): ExtendedToolDefinition[] {
     const tools: ExtendedToolDefinition[] = [];
 
-    // 1-5. Terminal Runtime V2 工具
-    const terminalV2Tools: ToolDefinition[] = [
+    // 1-5. 终端运行时工具
+    const terminalTools: ToolDefinition[] = [
       {
         name: 'launch-process',
         description: '启动一个 agent 专属终端进程，可选择等待完成。name 必填且仅支持 orchestrator、worker-claude、worker-gemini、worker-codex。',
@@ -556,13 +662,13 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       },
     ];
 
-    for (const tool of terminalV2Tools) {
+    for (const tool of terminalTools) {
       tools.push({
         ...tool,
         metadata: {
           source: 'builtin',
           category: 'system',
-          tags: ['shell', 'terminal', 'runtime-v2'],
+          tags: ['shell', 'terminal', 'runtime'],
         },
       });
     }
@@ -587,6 +693,9 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
     // 13. lsp_query (LSP 代码智能)
     tools.push(this.lspExecutor.getToolDefinition());
+
+    // 14-16. 编排工具 (dispatch_task, plan_mission, send_worker_message)
+    tools.push(...this.orchestrationExecutor.getToolDefinitions());
 
     return tools;
   }
@@ -837,6 +946,13 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    */
   getAceExecutor(): AceExecutor {
     return this.aceExecutor;
+  }
+
+  /**
+   * 获取编排工具执行器（用于注入回调处理器）
+   */
+  getOrchestrationExecutor(): OrchestrationExecutor {
+    return this.orchestrationExecutor;
   }
 
   /**

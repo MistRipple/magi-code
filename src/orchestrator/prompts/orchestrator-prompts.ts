@@ -1,192 +1,14 @@
 /**
  * 编排者专用 Prompt 模板
- * 
+ *
  * 核心理念：
  * - 编排者 Claude 专职编排，不执行任何编码任务
  * - 所有 Prompt 都围绕"分析、规划、监控、汇总"设计
+ * - 统一编排模式：单次 LLM 调用 + 工具循环（ReAct 模式）
  */
 
-import { WorkerSlot, ExecutionResult, SubTask, ExecutionPlan } from '../protocols/types';
-
-// ============================================================================
-// 模型能力描述
-// ============================================================================
-
-/** 获取 Worker 能力描述 */
-export function getWorkerDescription(worker: WorkerSlot): string {
-  const descriptions: Record<WorkerSlot, string> = {
-    claude: `Worker Claude (代码执行者)
-      - 擅长: 复杂代码实现、架构重构、多文件修改、代码审查
-      - 最适合: 需要深度理解的编码任务、复杂重构、架构调整
-      - 特点: 推理能力强，适合需要深度思考的编码任务`,
-    codex: `Worker Codex (后端专家)
-      - 擅长: 快速代码生成、Bug 修复、代码补全、测试编写、算法实现
-      - 最适合: 简单 Bug 修复、功能实现、单元测试、代码调试
-      - 特点: 执行速度快，适合明确的编码任务`,
-    gemini: `Worker Gemini (前端专家)
-      - 擅长: 多模态理解、前端 UI/UX、CSS 样式、React/Vue 组件
-      - 最适合: 前端开发、UI 组件、样式优化、图片理解
-      - 特点: 多模态能力强，适合视觉相关任务`,
-  };
-  return descriptions[worker] || '通用编程助手';
-}
-
-// ============================================================================
-// Phase 1: 任务分析 Prompt
-// ============================================================================
-
-/**
- * 构建任务分析 Prompt
- * 编排者分析用户需求，生成执行计划
- */
-export function buildOrchestratorAnalysisPrompt(
-  userPrompt: string,
-  availableWorkers: WorkerSlot[],
-  projectContext?: string
-): string {
-  const workersDesc = availableWorkers
-    .map(w => `- ${w}: ${getWorkerDescription(w)}`)
-    .join('\n');
-
-  return `你是一个智能任务编排器（Orchestrator）。你的职责是分析用户需求并制定执行计划。
-
-**重要**：你只负责分析和规划，不执行任何编码任务。所有编码工作将由 Worker 执行。
-**严禁输出计划之外的说明性文本**（例如“我将先探索项目”、“我处于计划模式”等），这些都会导致计划被丢弃。
-
-## 用户需求
-${userPrompt}
-
-## 可用的 Worker
-${workersDesc}
-
-${projectContext ? `## 项目上下文\n${projectContext}\n` : ''}
-
-## 分析任务
-请分析用户需求，判断：
-1. 这个任务是否需要多 Worker 协作？
-2. 如果需要协作，应该如何分配任务？
-3. 任务之间是否有依赖关系（需要串行）还是可以并行？
-4. 是否为简单任务（单个 Worker 即可完成）？
-5. 如果是咨询/解释/方案建议等不需要执行的内容，直接给出回答
-
-## 工具限制
-本阶段禁止调用任何工具（包括文件读取、命令执行等）。只根据当前提示生成计划。
-**禁止产生 tool_use/tool_call 相关内容或任何结构化工具调用。**
-
-## 强制规则
-1. 若任务涉及前后端协作（或同时需要 Codex 与 Gemini），必须包含 **Claude 架构/契约任务**，并让其他子任务依赖该任务。
-2. 架构任务需明确：目录结构、接口契约、前后端对接约束。
-3. **禁止返回解释性文本**。不要说"我现在..."、"让我..."、"首先需要..."等。
-
-## 输出格式 - 严格要求
-**关键：你的回复必须是纯 JSON，第一个字符是 {，最后一个字符是 }**
-**不要输出任何解释、前缀、后缀或代码块标记（如 \`\`\`json）**
-**不要输出除 JSON 之外的任何字符**
-**直接输出以下 JSON 对象：**
-{
-  "analysis": "对任务的简要分析",
-  "isSimpleTask": true/false,
-  "needsWorker": true/false,
-  "directResponse": "如果不需要 Worker，直接在此回答用户问题（可选）",
-  "needsUserInput": true/false,
-  "questions": ["需要用户补充的关键问题 1", "问题 2"],
-  "skipReason": "如果不需要 Worker，说明原因",
-  "needsCollaboration": true/false,
-  "featureContract": "功能契约（接口、数据结构、交互约束的统一描述）",
-  "acceptanceCriteria": [
-    "验收标准 1",
-    "验收标准 2"
-  ],
-  "subTasks": [
-    {
-      "id": "1",
-      "shortTitle": "简短标题（≤20字，用于 Worker 卡片显示，如：分析依赖、重构模块）",
-      "description": "子任务描述",
-      "assignedWorker": "claude/codex/gemini",
-      "reason": "选择该 Worker 的原因",
-      "targetFiles": ["预计修改的文件列表"],
-      "dependencies": [],
-      "delegationBriefing": "用自然语言向 Worker 说明任务背景、你的理解、重点关注什么、期望产出是什么。像同事间的工作委托，而非机械指令。",
-      "background": false
-    }
-  ],
-  "executionMode": "parallel/sequential",
-  "summary": "执行计划总结"
-}
-
-## 重要判断
-- **不需要 Worker 的情况**（设置 needsWorker: false）：
-  - 用户只是问问题、请求解释、咨询建议
-  - 不涉及代码修改、文件创建、功能实现
-  - 例如："这段代码什么意思？"、"如何实现 X？"、"帮我解释一下"
-  - 此时直接在 directResponse 中回答，subTasks 留空
-
-- **需要用户补充信息的情况**（设置 needsUserInput: true）：
-  - 关键信息缺失，无法合理决策技术栈、范围或约束
-  - 必须输出 questions 列表，等待用户补充后再生成计划
-  - **禁止默认假设**或直接选定技术栈
-
-- **需要 Worker 的情况**（设置 needsWorker: true）：
-  - 需要修改代码、创建文件、实现功能
-  - 例如："帮我重构这个函数"、"实现 X 功能"、"修复这个 bug"
-
-## 重要约束
-- **前端/UI/样式任务** → 分配给 Gemini
-- **后端/逻辑/算法/Bug修复任务** → 分配给 Codex
-- **复杂架构/重构/多文件修改** → 分配给 Claude
-- **避免文件冲突**：不同 Worker 负责不同文件，有冲突时改为串行执行
-- **Prompt 要详细**：每个子任务的 prompt 必须足够详细，Worker 能独立完成`;
-}
-
-// ============================================================================
-// Phase 6: 汇总报告 Prompt
-// ============================================================================
-
-/**
- * 构建汇总报告 Prompt
- * 编排者整合所有 Worker 的执行结果
- */
-export function buildOrchestratorSummaryPrompt(
-  originalPrompt: string,
-  executionResults: ExecutionResult[]
-): string {
-  const sanitizeOutput = (content: string): string => {
-    const withoutFences = content.replace(/```[\s\S]*?```/g, '[代码块已省略]');
-    const trimmed = withoutFences.trim();
-    if (!trimmed) return '无';
-    if (trimmed.length <= 400) return trimmed;
-    return `${trimmed.slice(0, 400)}...(已截断)`;
-  };
-
-  const resultsText = executionResults
-    .map(r => `### ${r.workerType} (${r.workerId}) 执行结果 (${r.success ? '[成功]' : '[失败]'})
-**子任务 ID**: ${r.subTaskId}
-**耗时**: ${r.duration}ms
-**修改文件**: ${r.modifiedFiles?.join(', ') || '无'}
-**输出**:
-${sanitizeOutput(r.result || '')}
-${r.error ? `**错误**: ${r.error}` : ''}
-`)
-    .join('\n');
-
-  return `请根据以下执行结果，为用户生成一份简洁的总结报告。
-
-## 原始需求
-${originalPrompt}
-
-## 各 Worker 执行结果
-${resultsText}
-
-## 要求
-1. 总结完成了哪些工作
-2. 如果有失败的任务，说明原因和建议
-3. 不要输出代码块、diff 或文件清单（这些已在 Worker 面板中展示）
-4. 避免重复叙述，同一内容只出现一次
-5. 控制在 12-15 行以内，保持简洁
-6. 给出后续建议（如需要）
-
-请用简洁清晰的中文回复，使用 Markdown 格式。`;
-}
+import { WorkerSlot } from '../protocols/types';
+import type { DispatchEntry } from '../core/dispatch-batch';
 
 // ============================================================================
 // Phase 2: 需求分析 Prompt（合并目标理解 + 路由决策）
@@ -202,11 +24,19 @@ export function buildRequirementAnalysisPrompt(
   userPrompt: string,
   recommendedMode: string,
   categoryHints: string,
-  sessionContext?: string
+  sessionContext?: string,
+  availableToolsSummary?: string
 ): string {
   const contextSection = sessionContext?.trim()
     ? `## 最近会话上下文（用于解析省略指令）
 ${sessionContext}
+
+`
+    : '';
+
+  const toolsSection = availableToolsSummary?.trim()
+    ? `## 当前可用的工具和能力
+${availableToolsSummary}
 
 `
     : '';
@@ -216,7 +46,7 @@ ${sessionContext}
 ## 用户请求
 ${userPrompt}
 
-${contextSection}## 上游推荐模式
+${contextSection}${toolsSection}## 上游推荐模式
 ${recommendedMode}
 
 ## 画像任务类型（仅用于理解任务分类）
@@ -237,16 +67,28 @@ ${categoryHints}
 - needsWorker=false 且 needsTooling=true 时，directResponse 可选（用于说明将执行的动作）
 - needsWorker=true 时，给出 delegationBriefings（任务委派说明）
 - **涉及代码/文件修改时，必须 needsWorker=true**
-- **工具调用任务按复杂度分级**：
-  - 单步、低风险、无需改文件的工具验证（如终端命令连通性检查）可设置 needsWorker=false，needsTooling=true，executionMode=direct
-  - 多步工具链、需要改文件、或有中高风险时必须 needsWorker=true
+- **工具调用任务判定（积极使用工具）**：
+  - 以下场景必须设置 needsWorker=false，needsTooling=true，executionMode=direct：
+    - 执行终端命令（ls、pwd、cat、grep、find、which、echo 等）
+    - 查看文件内容、目录结构
+    - 运行编译/测试/构建命令（npm run build、npm test 等）
+    - 检查进程、端口、环境变量
+    - 执行 git 查询命令（git status、git log、git diff 等）
+    - **搜索互联网信息（使用 web_search 工具，而非启动浏览器）**
+    - **获取网页内容（使用 web_fetch 工具，而非启动浏览器）**
+    - 用户明确要求"执行/运行/查看/检查/列出"某个操作
+    - **用户的请求可以通过已安装的 MCP 工具或 Skill 完成**
+    - **用户提到的关键词与某个已安装的 MCP/Skill 工具名或描述匹配**
+    - 任何可以通过一次或几次工具调用完成、且不涉及代码编写/文件创建修改的任务
+  - **优先使用工具**：当用户请求既可以纯文字回答、也可以通过工具获得更准确的结果时，优先选择 needsTooling=true
+  - 仅在以下情况才需要 needsWorker=true：需要修改/创建文件、多步复杂工具链、或高风险操作
 - **复杂工程任务必须 needsWorker=true**：
   - 包含"搭建"、"开发"、"实现"、"创建"等动词 + 系统/模块/后台/平台等名词
   - 涉及多个功能模块
   - 需要创建多个文件或目录结构
-- **若用户输入是“继续/然后/接着/按刚才方案”等省略指令**：
-  - 必须优先结合“最近会话上下文”还原真实目标
-  - 仅当上下文确实为空或无法判定时，才允许输出“缺乏上下文”
+- **若用户输入是"继续/然后/接着/按刚才方案"等省略指令**：
+  - 必须优先结合"最近会话上下文"还原真实目标
+  - 仅当上下文确实为空或无法判定时，才允许输出"缺乏上下文"
 - 根据任务性质选择 executionMode：
   - direct: 简单任务（无需 Todo）
   - sequential: 有依赖或需按序执行
@@ -277,191 +119,166 @@ JSON 结构：
 \`\`\``;
 }
 
-
 // ============================================================================
-// 格式化函数
-// ============================================================================
-
-/**
- * 格式化执行计划为用户可读的文本
- */
-export function formatPlanForUser(plan: ExecutionPlan): string {
-  if (plan.isSimpleTask) {
-    return `## 任务分析结果
-
-**分析**: ${plan.analysis}
-
-**注意**: 这是一个简单任务，无需多 Worker 协作。
-原因: ${plan.skipReason || '任务复杂度较低'}
-
----
-**是否同意直接执行？**`;
-  }
-
-  const tasksText = plan.subTasks
-    .map((t, i) => {
-      const filesInfo = t.targetFiles?.length
-        ? `\n   - 目标文件: ${t.targetFiles.join(', ')}`
-        : '';
-      const depsInfo = t.dependencies.length
-        ? `\n   - 依赖: ${t.dependencies.join(', ')}`
-        : '';
-      return `${i + 1}. **${t.description}**
-   - 分配给: \`${t.assignedWorker}\`
-   - 原因: ${t.reason}${filesInfo}${depsInfo}`;
-    })
-    .join('\n');
-
-  const hasDependencies = plan.subTasks.some(task => task.dependencies && task.dependencies.length > 0);
-  const executionModeText = hasDependencies
-    ? '依赖图调度（含并行批次）'
-    : (plan.executionMode === 'parallel' ? '并行执行' : '串行执行');
-
-  return `## 执行计划
-
-**分析**: ${plan.analysis}
-
-### 功能契约
-${plan.featureContract}
-
-### 验收清单
-${(plan.acceptanceCriteria || []).map(item => `- ${item}`).join('\n') || '- 未提供'}
-
-### 子任务列表
-${tasksText}
-
-**执行模式**: ${executionModeText}
-
-**总结**: ${plan.summary}
-
----
-**注意**: 各 Worker 将直接修改文件。
-
-**确认执行此计划？**`;
-}
-
-/**
- * 构建进度更新消息
- */
-export function buildProgressMessage(
-  completedTasks: number,
-  totalTasks: number,
-  currentWorker?: WorkerSlot,
-  currentTask?: string
-): string {
-  const safeTotal = totalTasks > 0 ? totalTasks : 0;
-  const rawProgress = safeTotal > 0 ? (completedTasks / safeTotal) * 100 : 0;
-  const progress = Math.min(100, Math.max(0, Math.round(rawProgress)));
-  const filled = Math.min(10, Math.max(0, Math.floor(progress / 10)));
-  const progressBar = '█'.repeat(filled) + '░'.repeat(10 - filled);
-
-  let message = `**进度**: [${progressBar}] ${progress}% (${completedTasks}/${totalTasks})`;
-
-  if (currentWorker && currentTask) {
-    message += `\n**当前**: ${currentWorker} 正在执行 "${currentTask}"`;
-  }
-
-  return message;
-}
-
-// ============================================================================
-// Prompt 优化工具
+// 统一编排：系统提示词构建器
 // ============================================================================
 
 /**
- * Prompt 压缩选项
+ * 统一系统提示词上下文
  */
-export interface PromptCompressionOptions {
-  /** 移除多余空白行 */
-  removeExtraWhitespace?: boolean;
-  /** 移除注释块 */
-  removeComments?: boolean;
-  /** 截断上下文长度 */
-  maxContextLength?: number;
-  /** 使用紧凑格式 */
-  compact?: boolean;
+export interface UnifiedPromptContext {
+  /** 可用 Worker 列表 */
+  availableWorkers: WorkerSlot[];
+  /** Worker 画像（动态来源于 ProfileLoader）。提供时使用画像数据，否则回退硬编码 */
+  workerProfiles?: Array<{ worker: WorkerSlot; displayName: string; strengths: string[] }>;
+  /** 项目上下文（项目信息、技术栈等） */
+  projectContext?: string;
+  /** 会话历史摘要 */
+  sessionSummary?: string;
+  /** 知识库 ADR */
+  relevantADRs?: string;
+  /** 动态可用工具摘要（内置 + MCP + Skill，由 ToolManager 生成） */
+  availableToolsSummary?: string;
 }
 
 /**
- * 压缩 Prompt 以减少 Token 使用
+ * 构建统一系统提示词（ReAct 模式）
+ *
+ * 取代 IntentGate + analyzeRequirement 的两阶段调用，
+ * 将角色定义、Worker 能力、决策原则、项目上下文融合为单一提示词。
+ * LLM 在此提示词下通过工具循环自主决策：直接回答 / 工具操作 / 分配 Worker。
  */
-export function compressPrompt(prompt: string, options: PromptCompressionOptions = {}): string {
-  let result = prompt;
+export function buildUnifiedSystemPrompt(context: UnifiedPromptContext): string {
+  const { availableWorkers, workerProfiles, projectContext, sessionSummary, relevantADRs, availableToolsSummary } = context;
 
-  // 移除多余空白行
-  if (options.removeExtraWhitespace !== false) {
-    result = result.replace(/\n{3,}/g, '\n\n');
-    result = result.replace(/[ \t]+$/gm, '');
-  }
-
-  // 移除注释块（可选）
-  if (options.removeComments) {
-    result = result.replace(/\/\*[\s\S]*?\*\//g, '');
-    result = result.replace(/\/\/.*$/gm, '');
-  }
-
-  // 截断上下文
-  if (options.maxContextLength && result.length > options.maxContextLength) {
-    result = result.slice(0, options.maxContextLength) + '\n...[已截断]';
-  }
-
-  return result.trim();
-}
-
-/**
- * 估算 Token 数量（粗略估计：中文约 1.5 token/字，英文约 0.25 token/字）
- */
-export function estimateTokenCount(text: string): number {
-  const chineseChars = (text.match(/[\u4e00-\u9fff]/g) || []).length;
-  const otherChars = text.length - chineseChars;
-  return Math.ceil(chineseChars * 1.5 + otherChars * 0.25);
-}
-
-/**
- * 构建紧凑版任务分析 Prompt（减少约 30% Token）
- */
-export function buildCompactAnalysisPrompt(
-  userPrompt: string,
-  availableWorkers: WorkerSlot[],
-  projectContext?: string
-): string {
-  const workers = availableWorkers.map(w => {
-    const short: Record<WorkerSlot, string> = {
-      claude: 'Claude: 架构/重构/复杂任务',
-      codex: 'Codex: 后端/算法/Bug修复',
-      gemini: 'Gemini: 前端/UI/样式',
+  // Worker 能力描述表（优先使用动态画像，回退硬编码）
+  const workerTable = availableWorkers.map(w => {
+    const profile = workerProfiles?.find(p => p.worker === w);
+    if (profile) {
+      return `| ${w} | ${profile.displayName} | ${profile.strengths.join('、')} |`;
+    }
+    const fallback: Record<WorkerSlot, { model: string; strengths: string }> = {
+      claude: { model: 'Claude', strengths: '架构设计、深度分析、代码重构、复杂多文件修改' },
+      codex: { model: 'Codex', strengths: '快速代码生成、Bug 修复、测试编写、API 开发' },
+      gemini: { model: 'Gemini', strengths: '多模态理解、前端 UI/UX、文档分析、样式优化' },
     };
-    return short[w];
-  }).join(' | ');
+    const { model, strengths } = fallback[w];
+    return `| ${w} | ${model} | ${strengths} |`;
+  }).join('\n');
 
-  const context = projectContext
-    ? compressPrompt(projectContext, { maxContextLength: 2000 })
-    : '';
+  const sections: string[] = [];
 
-  return `任务编排器。分析需求，制定计划。禁止执行代码。
+  // 角色定义
+  sections.push(`你是 MultiCLI，一个能协调多个专业 AI 协作完成复杂开发任务的编程助手。
 
-需求: ${userPrompt}
+## 身份
+- 你运行在 VSCode 插件中，拥有完整的文件系统和终端访问能力
+- 你可以直接回答问题、使用工具操作代码、或将复杂任务分配给专业 Worker
+- 你的回答应当简洁、专业、直接`);
 
-Workers: ${workers}
-${context ? `上下文: ${context}\n` : ''}
-输出纯JSON:
-{"analysis":"分析","isSimpleTask":bool,"needsWorker":bool,"directResponse":"直接回答(可选)","needsUserInput":bool,"questions":[],"needsCollaboration":bool,"subTasks":[{"id":"1","shortTitle":"≤10字标题","description":"描述","assignedWorker":"worker","targetFiles":[],"dependencies":[],"delegationBriefing":"自然语言委托说明"}],"executionMode":"parallel/sequential","summary":"总结"}
+  // Worker 能力
+  sections.push(`## 可用 Worker
+当任务涉及多步代码操作或需要专业领域知识时，使用 dispatch_task 分配给 Worker：
 
-规则: 前端→Gemini, 后端→Codex, 复杂→Claude. 禁止tool_use.`;
+| Worker | 模型 | 擅长领域 |
+|--------|------|----------|
+${workerTable}
+
+对于超复杂的多 Worker 协作任务，使用 plan_mission 创建完整的协作计划。`);
+
+  // 决策原则（三层执行模型）— 层级2工具列表从 ToolManager 动态注入
+  const toolsListSection = availableToolsSummary?.trim()
+    ? `\n${availableToolsSummary}`
+    : `
+- 文件操作：text_editor、grep_search、remove_files
+- 终端命令：launch-process、read-process、write-process、kill-process、list-processes
+- 网络工具：web_search、web_fetch
+- 代码智能：codebase_retrieval、lsp_query
+- 可视化：mermaid_diagram`;
+
+  sections.push(`## 决策原则
+根据任务复杂度，选择最经济的执行方式：
+
+**层级 1 - 直接响应**：不调用任何工具
+- 问候、知识问答、代码解释、方案建议
+- 简短的概念说明或技术对比
+
+**层级 2 - 工具操作**：调用已注册工具自行完成
+${toolsListSection}
+- 需要查找文档、搜索信息时，直接调用 web_search 而非启动浏览器
+- 需要多步工具操作的中等任务
+
+**层级 3 - 分配 Worker**：使用 dispatch_task 委托
+- 需要多文件修改的代码实现任务
+- 需要专业领域知识的任务（前端 → gemini，后端 → codex，架构 → claude）
+- 大规模重构或新功能开发
+- 需要多个 Worker 协作时，拆分为多个 dispatch_task 或使用 plan_mission
+
+**原则**：能层级 1 解决的不用层级 2，能层级 2 解决的不用层级 3。`);
+
+  // dispatch_task 使用指南
+  sections.push(`## dispatch_task 使用指南
+- task 参数应包含清晰的目标、约束和验收标准
+- files 参数帮助 Worker 定位关键文件，尽量提供
+- Worker 执行是异步的，执行完成后结果会自动返回
+- 多个独立的 dispatch_task 可以依次发起，Worker 会并行执行`);
+
+  // 项目上下文
+  if (projectContext) {
+    sections.push(`## 项目上下文\n${projectContext}`);
+  }
+
+  // ADR
+  if (relevantADRs) {
+    sections.push(`## 相关架构决策\n${relevantADRs}`);
+  }
+
+  // 会话上下文
+  if (sessionSummary) {
+    sections.push(`## 当前会话\n${sessionSummary}`);
+  }
+
+  return sections.join('\n\n');
 }
 
 // ============================================================================
-// 导出
+// Phase C: dispatch_task 汇总提示词
 // ============================================================================
 
-export const OrchestratorPrompts = {
-  getWorkerDescription,
-  buildOrchestratorAnalysisPrompt,
-  buildOrchestratorSummaryPrompt,
-  formatPlanForUser,
-  buildProgressMessage,
-  // 新增优化工具
-  compressPrompt,
-  estimateTokenCount,
-  buildCompactAnalysisPrompt,
-};
+/**
+ * 构建 dispatch_task Phase C 汇总提示词
+ * 基于 DispatchBatch 中所有 Worker 的执行结果，生成面向用户的最终结论
+ */
+export function buildDispatchSummaryPrompt(
+  userPrompt: string,
+  entries: DispatchEntry[],
+): string {
+  const resultsText = entries
+    .map(e => {
+      const statusLabel = e.status === 'completed' ? '成功' : e.status === 'failed' ? '失败' : '跳过';
+      const files = e.result?.modifiedFiles?.join(', ') || '无';
+      const summary = e.result?.summary || '无输出';
+      const errors = e.result?.errors?.join('; ') || '';
+      return `### Worker ${e.worker} [${statusLabel}]
+**任务**: ${e.task.substring(0, 120)}
+**修改文件**: ${files}
+**摘要**: ${summary}${errors ? `\n**错误**: ${errors}` : ''}`;
+    })
+    .join('\n\n');
+
+  return `请根据以下 Worker 执行结果，为用户生成简洁的任务完成总结。
+
+## 用户原始需求
+${userPrompt}
+
+## Worker 执行结果
+${resultsText}
+
+## 要求
+1. 用 1-3 句话概括完成情况
+2. 列出关键修改内容和涉及的文件
+3. 如有失败的 Worker，说明原因和建议
+4. 不要输出代码块或 diff
+5. 保持简洁，控制在 10 行以内
+6. 用中文回复，Markdown 格式`;
+}

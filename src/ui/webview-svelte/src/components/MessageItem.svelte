@@ -16,7 +16,6 @@
   let { message, readOnly = false }: Props = $props();
 
   // 派生状态
-  // 方案 B：使用 MessageType.USER_INPUT 判断用户消息
   const isUser = $derived(message.type === 'user_input');
   const isNotice = $derived(message.type === 'system-notice' || message.type === 'error');
   const interactionMeta = $derived(message.metadata?.interaction as { prompt?: string; type?: string } | undefined);
@@ -30,8 +29,7 @@
   const justCompleted = $derived(Boolean(message.metadata?.justCompleted));
   const sendingAnimation = $derived(Boolean(message.metadata?.sendingAnimation));
 
-  // 🛡️ 防御性编程：过滤无效的 blocks，防止 Svelte 5 "reading 'prev'" 错误
-  // 确保 loop 中只处理有效的 block 对象
+  // 过滤无效的 blocks
   const safeBlocks = $derived(
     (message.blocks || []).filter((b): b is import('../types/message').ContentBlock =>
       !!b && typeof b === 'object' && 'type' in b
@@ -51,12 +49,10 @@
   const worker = $derived(message.metadata?.worker || null);
   const badgeWorker = $derived(worker || (message.source === 'orchestrator' ? 'orchestrator' : message.source));
 
-  // 方案 B：使用 MessageType.TASK_CARD 判断子任务卡片消息
-  // Worker 的消息面板应该作为独立消息存在，不应被 orchestrator 面板包裹
+  // 子任务卡片消息，作为独立消息存在
   const isSubTaskCardOnly = $derived(message.type === 'task_card');
 
-  // 方案 B：使用 MessageType.INSTRUCTION 判断任务说明消息
-  // 编排者派发给 Worker 的任务说明
+  // 任务说明消息（编排者派发给 Worker）
   const isInstruction = $derived(message.type === 'instruction');
   const instructionTargetWorker = $derived(
     (message.metadata?.worker || message.metadata?.agent) as string | undefined
@@ -71,10 +67,10 @@
     info: 'info'
   };
   const noticeColors: Record<string, string> = {
-    success: '#22c55e',
-    error: '#ef4444',
-    warning: '#f59e0b',
-    info: '#3b82f6'
+    success: 'var(--success)',
+    error: 'var(--error)',
+    warning: 'var(--warning)',
+    info: 'var(--info)',
   };
 
   // 获取消息中的图片
@@ -122,7 +118,7 @@
 <!-- 用户消息：简洁显示 -->
 {:else if isUser}
   <div class="message-item user" class:sending={sendingAnimation} data-message-id={message.id} data-source="user">
-    <!-- 🔧 显示用户上传的图片缩略图 -->
+    <!-- 用户上传的图片缩略图 -->
     {#if messageImages.length > 0}
       <div class="user-images">
         {#each messageImages as img, i (`${message.id}-img-${i}`)}
@@ -193,7 +189,7 @@
 
     <div class="message-content">
       {#if isPlaceholder}
-        <!-- 🔧 占位状态：显示加载动画，保持统一的卡片结构 -->
+        <!-- 占位状态：显示加载动画 -->
         <div class="placeholder-content">
           <div class="streaming-indicator-bottom">
             <span class="streaming-dot"></span>
@@ -202,10 +198,6 @@
           </div>
         </div>
       {:else}
-        {#if message.type === 'task_card' && message.metadata?.subTaskCard}
-          <SubTaskSummaryCard card={message.metadata.subTaskCard as any} {readOnly} />
-        {/if}
-
         {#if isInteraction && interactionMeta?.prompt}
           <div class="interaction-inline">
             <Icon name="sparkles" size={14} />
@@ -213,14 +205,7 @@
           </div>
         {/if}
 
-        {#if message.type !== 'task_card'}
-          <!--
-            🔧 统一渲染逻辑：
-            1. 优先渲染 blocks（支持 Thinking、ToolCall 等富内容块）
-            2. 如果没有 blocks 但有 content，则渲染纯 Markdown
-            3. 流式期间，blocks 和 content 都会实时更新
-          -->
-          {#if safeBlocks.length > 0}
+        {#if safeBlocks.length > 0}
             {#each safeBlocks as block, i (`${message.id}-block-${i}-${block.type}`)}
               <BlockRenderer {block} {isStreaming} {readOnly} />
             {/each}
@@ -228,7 +213,7 @@
             <MarkdownContent content={message.content} {isStreaming} />
           {/if}
 
-          <!-- 🔧 流式消息底部加载指示器：始终在所有内容之后显示 -->
+          <!-- 流式消息底部加载指示器 -->
           {#if isStreaming}
             <div class="streaming-indicator-bottom">
               <span class="streaming-dot"></span>
@@ -236,13 +221,12 @@
               <span class="streaming-dot"></span>
             </div>
           {/if}
-        {/if}
       {/if}
     </div>
   </div>
 {/if}
 
-<!-- 🔧 图片预览弹窗 -->
+<!-- 图片预览弹窗 -->
 {#if showImagePreview}
   <button
     class="image-preview-overlay"
@@ -337,7 +321,7 @@
     margin-right: var(--space-2);  /* 减少右边距，配合 MessageList 的 padding-right 调整 */
     /* 平滑过渡：仅边框颜色和阴影，高度由内容自然撑开 */
     transition: border-color 0.2s ease, box-shadow 0.2s ease;
-    /* 🔧 强制高度自适应：禁止压缩，确保高度随内容（包括流式输出）自动撑开 */
+    /* 高度自适应：禁止压缩，确保高度随内容自动撑开 */
     flex-shrink: 0;
     height: auto;
     overflow: visible;
@@ -345,7 +329,7 @@
 
   /* 流式消息卡片：高度完全由内容与动画驱动，避免占位感 */
   .message-item.assistant.streaming {
-    min-height: 48px; /* 🔧 保持与 placeholder 高度一致，防止切换时塌陷 */
+    min-height: 48px; /* 保持与 placeholder 高度一致，防止切换时塌陷 */
   }
 
   .interaction-inline {
@@ -409,13 +393,13 @@
     word-wrap: break-word;
     overflow-wrap: break-word;
     font-size: var(--text-base);
-    /* 🔧 确保内容区域高度由内容自然撑开 */
+    /* 确保内容区域高度由内容自然撑开 */
     min-height: 0;
     height: auto;
   }
-  /* 🔧 移除流式消息的渐变遮罩，它会干扰视觉并增加复杂性 */
+  /* 移除流式消息的渐变遮罩，避免干扰视觉 */
 
-  /* 🔧 占位→真实消息过渡动画（符合 message-response-flow-design.md 规范） */
+  /* 占位→真实消息过渡动画 */
   .message-item.assistant.was-placeholder {
     animation: contentFadeIn 0.15s ease-out;
   }
@@ -429,7 +413,7 @@
     }
   }
 
-  /* 🔧 完成动画：边框颜色过渡 */
+  /* 完成动画：边框颜色过渡 */
   .message-item.assistant.just-completed {
     animation: completeBorderFade 0.3s ease-out;
   }

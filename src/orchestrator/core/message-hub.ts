@@ -4,7 +4,7 @@
  * MessageHub 是系统的统一消息与事件中心，负责协调编排者(Orchestrator)、工作单元(Worker)和系统(System)之间的消息流转。
  * 它实现了消息的去重、节流和统一路由，确保 UI 呈现的一致性。
  *
- * ## 架构设计（v2.0 门面模式）
+ * ## 架构设计（门面模式）
  *
  * MessageHub 现在是一个薄的门面层，内部组合三个组件：
  * - MessageFactory（业务层）：语义化 API，构造 StandardMessage
@@ -190,6 +190,10 @@ export class MessageHub {
 
   getRequestMessageId(requestId: string): string | undefined {
     return this.pipeline.getRequestMessageId(requestId);
+  }
+
+  getDeadLetterCount(): number {
+    return this.pipeline.getDeadLetterCount();
   }
 
   // ==========================================================================

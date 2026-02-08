@@ -3,130 +3,166 @@
   import { vscode } from '../lib/vscode-bridge';
   import { ensureArray } from '../lib/utils';
   import type { Edit } from '../types/message';
+  import Icon from './Icon.svelte';
   import WorkerBadge from './WorkerBadge.svelte';
 
   const appState = getState();
 
-  // 变更列表
-  const edits = $derived(
-    ensureArray(appState.edits) as Edit[]
-  );
+  const edits = $derived(ensureArray(appState.edits) as Edit[]);
+
+  // 统计汇总
+  const totalAdditions = $derived(edits.reduce((s, e) => s + (e.additions ?? 0), 0));
+  const totalDeletions = $derived(edits.reduce((s, e) => s + (e.deletions ?? 0), 0));
+  const addedCount = $derived(edits.filter(e => e.type === 'add').length);
+  const modifiedCount = $derived(edits.filter(e => e.type === 'modify').length);
+  const deletedCount = $derived(edits.filter(e => e.type === 'delete').length);
 
   function getContributors(edit: Edit): string[] {
-    if (Array.isArray(edit?.contributors) && edit.contributors.length > 0) {
-      return edit.contributors;
-    }
-    if (edit?.workerId) {
-      return [edit.workerId];
-    }
+    if (Array.isArray(edit?.contributors) && edit.contributors.length > 0) return edit.contributors;
+    if (edit?.workerId) return [edit.workerId];
     return [];
   }
 
-  // 打开文件
-  function openFile(filePath: string) {
-    vscode.postMessage({ type: 'openFile', filepath: filePath });
+  // 拆分文件名和目录
+  function splitPath(filePath: string): { dir: string; name: string } {
+    const lastSlash = filePath.lastIndexOf('/');
+    if (lastSlash === -1) return { dir: '', name: filePath };
+    return { dir: filePath.substring(0, lastSlash + 1), name: filePath.substring(lastSlash + 1) };
   }
 
-  function approveChange(filePath: string) {
-    vscode.postMessage({ type: 'approveChange', filePath });
+  // 文件类型图标名
+  function getFileIconName(filePath: string): 'file-plus' | 'file-minus' | 'file-edit' | 'file-text' {
+    const edit = edits.find(e => e.filePath === filePath);
+    if (edit?.type === 'add') return 'file-plus';
+    if (edit?.type === 'delete') return 'file-minus';
+    if (edit?.type === 'modify') return 'file-edit';
+    return 'file-text';
   }
 
-  function revertChange(filePath: string) {
-    vscode.postMessage({ type: 'revertChange', filePath });
+  // 增删比例条（5 格小方块，类似 GitHub）
+  function getChangeBlocks(additions: number, deletions: number): ('add' | 'del' | 'neutral')[] {
+    const total = additions + deletions;
+    if (total === 0) return ['neutral', 'neutral', 'neutral', 'neutral', 'neutral'];
+    const addBlocks = Math.round((additions / total) * 5);
+    const delBlocks = 5 - addBlocks;
+    return [
+      ...Array(addBlocks).fill('add') as 'add'[],
+      ...Array(delBlocks).fill('del') as 'del'[],
+    ];
   }
 
-  function viewDiff(filePath: string) {
-    vscode.postMessage({ type: 'viewDiff', filePath });
-  }
-
-  function approveAllChanges() {
-    vscode.postMessage({ type: 'approveAllChanges' });
-  }
-
-  function revertAllChanges() {
-    vscode.postMessage({ type: 'revertAllChanges' });
-  }
-
-  // 获取文件类型图标
-  function getFileIcon(filePath: string): string {
-    const ext = filePath.split('.').pop()?.toLowerCase() || '';
-    const iconMap: Record<string, string> = {
-      ts: 'M0 0h16v16H0z M1 3h14v10H1z M4 7h3v1H4z M8 7h4v1H8z',
-      js: 'M0 0h16v16H0z M1 3h14v10H1z',
-      svelte: 'M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0z',
-      vue: 'M8 0L0 14h16L8 0z',
-      css: 'M0 0h16v16H0z M2 4h12v8H2z',
-      json: 'M2 2v12h12V2H2zm11 11H3V3h10v10z',
-    };
-    return iconMap[ext] || 'M14 4.5V14a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2a2 2 0 0 1 2-2h5.5L14 4.5z';
-  }
+  function openFile(filePath: string) { vscode.postMessage({ type: 'openFile', filepath: filePath }); }
+  function approveChange(filePath: string) { vscode.postMessage({ type: 'approveChange', filePath }); }
+  function revertChange(filePath: string) { vscode.postMessage({ type: 'revertChange', filePath }); }
+  function viewDiff(filePath: string) { vscode.postMessage({ type: 'viewDiff', filePath }); }
+  function approveAllChanges() { vscode.postMessage({ type: 'approveAllChanges' }); }
+  function revertAllChanges() { vscode.postMessage({ type: 'revertAllChanges' }); }
 </script>
 
 <div class="edits-panel">
-  <div class="edits-content">
-    {#if edits.length === 0}
-      <div class="empty-state">
-        <svg class="empty-icon" viewBox="0 0 16 16">
-          <path d="M12.854.146a.5.5 0 0 0-.707 0L10.5 1.793 14.207 5.5l1.647-1.646a.5.5 0 0 0 0-.708l-3-3zm.646 6.061L9.793 2.5 3.293 9H3.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.207l6.5-6.5zm-7.468 7.468A.5.5 0 0 1 6 13.5V13h-.5a.5.5 0 0 1-.5-.5V12h-.5a.5.5 0 0 1-.5-.5V11h-.5a.5.5 0 0 1-.5-.5V10h-.5a.499.499 0 0 1-.175-.032l-.179.178a.5.5 0 0 0-.11.168l-2 5a.5.5 0 0 0 .65.65l5-2a.5.5 0 0 0 .168-.11l.178-.178z"/>
-        </svg>
-        <div class="empty-text">暂无变更</div>
-        <div class="empty-hint">代码变更会在此显示</div>
+  {#if edits.length === 0}
+    <div class="empty-state">
+      <Icon name="file-edit" size={32} />
+      <div class="empty-text">暂无变更</div>
+      <div class="empty-hint">Worker 产生的代码变更会在此显示</div>
+    </div>
+  {:else}
+    <!-- 顶部统计条 -->
+    <div class="summary-bar">
+      <div class="summary-left">
+        <span class="summary-count">{edits.length} 个文件</span>
+        {#if addedCount > 0}<span class="summary-chip add">{addedCount} 新增</span>{/if}
+        {#if modifiedCount > 0}<span class="summary-chip modify">{modifiedCount} 修改</span>{/if}
+        {#if deletedCount > 0}<span class="summary-chip del">{deletedCount} 删除</span>{/if}
       </div>
-    {:else}
-      <div class="edits-actions">
-        <button class="action-btn approve-all" onclick={approveAllChanges}>全部批准</button>
-        <button class="action-btn revert-all" onclick={revertAllChanges}>全部还原</button>
+      <div class="summary-right">
+        <span class="stat-add">+{totalAdditions}</span>
+        <span class="stat-del">-{totalDeletions}</span>
       </div>
-      <div class="edits-list">
-        {#each edits as edit (edit.filePath)}
-          <div class="edit-item">
-            <button class="edit-main" onclick={() => openFile(edit.filePath)}>
-              <div class="edit-icon">
-                <svg viewBox="0 0 16 16">
-                  <path d={getFileIcon(edit.filePath)}/>
-                </svg>
-              </div>
-              <div class="edit-info">
-                <div class="edit-path">{edit.filePath}</div>
-                {#if edit.type}
-                  <div class="edit-type" class:added={edit.type === 'add'} class:modified={edit.type === 'modify'} class:deleted={edit.type === 'delete'}>
-                    {edit.type === 'add' ? '新增' : edit.type === 'modify' ? '修改' : '删除'}
-                  </div>
-                {/if}
-              </div>
-              <div class="edit-stats">
-                {#if edit.additions}
-                  <span class="stat-add">+{edit.additions}</span>
-                {/if}
-                {#if edit.deletions}
-                  <span class="stat-del">-{edit.deletions}</span>
-                {/if}
-              </div>
-            </button>
-            <div class="edit-actions">
-              <div class="edit-workers">
-                {#each getContributors(edit) as worker}
-                  <WorkerBadge worker={worker} size="sm" />
-                {/each}
-              </div>
-              <button class="action-btn diff" onclick={() => viewDiff(edit.filePath)}>对比</button>
-              <button class="action-btn approve" onclick={() => approveChange(edit.filePath)}>批准</button>
-              <button class="action-btn revert" onclick={() => revertChange(edit.filePath)}>还原</button>
+    </div>
+
+    <!-- 批量操作 -->
+    <div class="bulk-actions">
+      <button class="bulk-btn approve" onclick={approveAllChanges} title="批准所有变更">
+        <Icon name="check-circle" size={13} />
+        <span>全部批准</span>
+      </button>
+      <button class="bulk-btn revert" onclick={revertAllChanges} title="还原所有变更">
+        <Icon name="undo" size={13} />
+        <span>全部还原</span>
+      </button>
+    </div>
+
+    <!-- 文件列表 -->
+    <div class="file-list">
+      {#each edits as edit (edit.filePath)}
+        {@const { dir, name } = splitPath(edit.filePath)}
+        {@const blocks = getChangeBlocks(edit.additions ?? 0, edit.deletions ?? 0)}
+        {@const contributors = getContributors(edit)}
+        <div class="file-row" role="button" tabindex="0" onclick={() => viewDiff(edit.filePath)} onkeydown={(e) => e.key === 'Enter' && viewDiff(edit.filePath)}>
+          <!-- 变更类型指示器 -->
+          <div class="type-indicator" class:add={edit.type === 'add'} class:modify={edit.type === 'modify'} class:del={edit.type === 'delete'}></div>
+
+          <!-- 文件图标 -->
+          <div class="file-icon" class:add={edit.type === 'add'} class:modify={edit.type === 'modify'} class:del={edit.type === 'delete'}>
+            <Icon name={getFileIconName(edit.filePath)} size={14} />
+          </div>
+
+          <!-- 文件名与路径 -->
+          <div class="file-info">
+            <span class="file-name">{name}</span>
+            {#if dir}
+              <span class="file-dir">{dir}</span>
+            {/if}
+          </div>
+
+          <!-- Worker 贡献者 -->
+          {#if contributors.length > 0}
+            <div class="file-workers">
+              {#each contributors as worker}
+                <WorkerBadge {worker} size="sm" />
+              {/each}
+            </div>
+          {/if}
+
+          <!-- 增删统计 + 比例条 -->
+          <div class="file-stats">
+            {#if edit.additions}<span class="stat-add">+{edit.additions}</span>{/if}
+            {#if edit.deletions}<span class="stat-del">-{edit.deletions}</span>{/if}
+            <div class="change-blocks">
+              {#each blocks as block}
+                <span class="block" class:add={block === 'add'} class:del={block === 'del'} class:neutral={block === 'neutral'}></span>
+              {/each}
             </div>
           </div>
-        {/each}
-      </div>
-    {/if}
-  </div>
+
+          <!-- hover 操作按钮 -->
+          <div class="file-actions">
+            <button class="action-icon" title="打开文件" onclick={(e) => { e.stopPropagation(); openFile(edit.filePath); }}>
+              <Icon name="file-text" size={14} />
+            </button>
+            <button class="action-icon approve" title="批准变更" onclick={(e) => { e.stopPropagation(); approveChange(edit.filePath); }}>
+              <Icon name="check" size={14} />
+            </button>
+            <button class="action-icon revert" title="还原变更" onclick={(e) => { e.stopPropagation(); revertChange(edit.filePath); }}>
+              <Icon name="undo" size={14} />
+            </button>
+          </div>
+        </div>
+      {/each}
+    </div>
+  {/if}
 </div>
 
 <style>
   .edits-panel {
     height: 100%;
+    min-height: 0; /* flex 布局防溢出 */
     overflow-y: auto;
-    padding: var(--space-4);
+    padding: var(--space-3);
   }
 
+  /* 空状态 */
   .empty-state {
     display: flex;
     flex-direction: column;
@@ -135,154 +171,248 @@
     padding: var(--space-8) var(--space-5);
     color: var(--foreground-muted);
     text-align: center;
-  }
-
-  .empty-icon {
-    width: var(--icon-2xl);
-    height: var(--icon-2xl);
-    fill: currentColor;
-    opacity: 0.3;
-    margin-bottom: var(--space-4);
+    gap: var(--space-2);
   }
 
   .empty-text {
     font-size: var(--text-base);
     font-weight: var(--font-medium);
     color: var(--foreground);
-    margin-bottom: var(--space-2);
   }
 
   .empty-hint {
     font-size: var(--text-sm);
-    opacity: 0.7;
+    opacity: 0.6;
   }
 
-  .edits-list {
+  /* 统计条 */
+  .summary-bar {
     display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-  }
-
-  .edits-actions {
-    display: flex;
-    gap: var(--space-2);
-    margin-bottom: var(--space-3);
-  }
-
-  .action-btn {
-    padding: 6px 10px;
+    align-items: center;
+    justify-content: space-between;
+    padding: var(--space-2) var(--space-3);
+    margin-bottom: var(--space-2);
+    background: var(--surface-1);
     border-radius: var(--radius-md);
     border: 1px solid var(--border);
-    background: var(--surface-1);
-    color: var(--foreground);
-    cursor: pointer;
-    font-size: var(--text-xs);
   }
 
-  .action-btn:hover {
-    background: var(--surface-hover);
-    border-color: var(--primary);
-  }
-
-  .action-btn.approve-all,
-  .action-btn.approve {
-    color: var(--success);
-    border-color: color-mix(in srgb, var(--success) 40%, var(--border));
-  }
-
-  .action-btn.revert-all,
-  .action-btn.revert {
-    color: var(--error);
-    border-color: color-mix(in srgb, var(--error) 40%, var(--border));
-  }
-
-  .edit-item {
+  .summary-left {
     display: flex;
     align-items: center;
-    gap: var(--space-3);
-    background: var(--surface-1);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    text-align: left;
-    transition: all var(--transition-fast);
-  }
-
-  .edit-main {
-    flex: 1;
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    padding: var(--space-3) var(--space-4);
-    background: transparent;
-    border: none;
-    cursor: pointer;
-    text-align: left;
-  }
-
-  .edit-item:hover {
-    background: var(--surface-hover);
-    border-color: var(--primary);
-  }
-
-  .edit-actions {
-    display: flex;
-    gap: var(--space-2);
-    padding-right: var(--space-3);
-    align-items: center;
-    flex-wrap: wrap;
-  }
-
-  .edit-workers {
-    display: flex;
     gap: var(--space-2);
     flex-wrap: wrap;
   }
 
-  .edit-icon {
-    flex-shrink: 0;
-    width: var(--icon-lg);
-    height: var(--icon-lg);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: var(--foreground-muted);
-  }
-
-  .edit-icon svg {
-    width: var(--icon-md);
-    height: var(--icon-md);
-    fill: currentColor;
-  }
-
-  .edit-info {
-    flex: 1;
-    min-width: 0;
-  }
-
-  .edit-path {
+  .summary-count {
     font-size: var(--text-sm);
+    font-weight: var(--font-medium);
     color: var(--foreground);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 
-  .edit-type {
-    font-size: var(--text-xs);
-    margin-top: var(--space-1);
+  .summary-chip {
+    font-size: var(--text-2xs);
+    padding: 1px 6px;
+    border-radius: var(--radius-full);
+    font-weight: var(--font-medium);
   }
 
-  .edit-type.added { color: var(--success); }
-  .edit-type.modified { color: var(--warning); }
-  .edit-type.deleted { color: var(--error); }
+  .summary-chip.add { color: var(--success); background: var(--success-muted); }
+  .summary-chip.modify { color: var(--warning); background: var(--warning-muted); }
+  .summary-chip.del { color: var(--error); background: var(--error-muted); }
 
-  .edit-stats {
+  .summary-right {
     display: flex;
     gap: var(--space-2);
     font-size: var(--text-xs);
-    font-weight: var(--font-medium);
+    font-weight: var(--font-semibold);
+    font-variant-numeric: tabular-nums;
   }
 
   .stat-add { color: var(--success); }
   .stat-del { color: var(--error); }
+
+  /* 批量操作 */
+  .bulk-actions {
+    display: flex;
+    gap: var(--space-2);
+    margin-bottom: var(--space-2);
+  }
+
+  .bulk-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--surface-1);
+    color: var(--foreground-muted);
+    cursor: pointer;
+    font-size: var(--text-xs);
+    transition: all var(--transition-fast);
+  }
+
+  .bulk-btn:hover {
+    background: var(--surface-hover);
+    color: var(--foreground);
+  }
+
+  .bulk-btn.approve:hover {
+    color: var(--success);
+    border-color: var(--success);
+  }
+
+  .bulk-btn.revert:hover {
+    color: var(--error);
+    border-color: var(--error);
+  }
+
+  /* 文件列表 */
+  .file-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+  }
+
+  .file-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    background: var(--surface-1);
+    cursor: pointer;
+    transition: background var(--transition-fast);
+    position: relative;
+  }
+
+  .file-row:hover {
+    background: var(--surface-hover);
+  }
+
+  /* 左侧变更类型彩条 */
+  .type-indicator {
+    width: 3px;
+    height: 20px;
+    border-radius: 2px;
+    flex-shrink: 0;
+    background: var(--foreground-muted);
+    opacity: 0.3;
+  }
+
+  .type-indicator.add { background: var(--success); opacity: 1; }
+  .type-indicator.modify { background: var(--warning); opacity: 1; }
+  .type-indicator.del { background: var(--error); opacity: 1; }
+
+  /* 文件图标 */
+  .file-icon {
+    flex-shrink: 0;
+    color: var(--foreground-muted);
+    display: flex;
+    align-items: center;
+  }
+
+  .file-icon.add { color: var(--success); }
+  .file-icon.modify { color: var(--warning); }
+  .file-icon.del { color: var(--error); }
+
+  /* 文件名 */
+  .file-info {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    overflow: hidden;
+  }
+
+  .file-name {
+    font-size: var(--text-sm);
+    font-weight: var(--font-medium);
+    color: var(--foreground);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .file-dir {
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    opacity: 0.7;
+  }
+
+  /* Worker 标识 */
+  .file-workers {
+    display: flex;
+    gap: var(--space-1);
+    flex-shrink: 0;
+  }
+
+  /* 增删统计 */
+  .file-stats {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium);
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+  }
+
+  /* GitHub 风格增删比例条 */
+  .change-blocks {
+    display: flex;
+    gap: 1px;
+  }
+
+  .change-blocks .block {
+    width: 7px;
+    height: 7px;
+    border-radius: 1px;
+  }
+
+  .block.add { background: var(--success); }
+  .block.del { background: var(--error); }
+  .block.neutral { background: var(--surface-3); }
+
+  /* hover 操作按钮 */
+  .file-actions {
+    display: flex;
+    gap: var(--space-1);
+    opacity: 0;
+    transition: opacity var(--transition-fast);
+    flex-shrink: 0;
+  }
+
+  .file-row:hover .file-actions {
+    opacity: 1;
+  }
+
+  .action-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border-radius: var(--radius-sm);
+    border: none;
+    background: transparent;
+    color: var(--foreground-muted);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+  }
+
+  .action-icon:hover {
+    background: var(--surface-active);
+    color: var(--foreground);
+  }
+
+  .action-icon.approve:hover { color: var(--success); }
+  .action-icon.revert:hover { color: var(--error); }
 </style>

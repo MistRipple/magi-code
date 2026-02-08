@@ -1042,6 +1042,32 @@ ${conversationText}
   }
 
   // ============================================================================
+  // 清空操作
+  // ============================================================================
+
+  /**
+   * 清空所有知识（ADR + FAQ + Learning）
+   */
+  clearAll(): { adrs: number; faqs: number; learnings: number } {
+    const counts = {
+      adrs: this.adrs.length,
+      faqs: this.faqs.length,
+      learnings: this.learnings.length,
+    };
+
+    this.adrs = [];
+    this.faqs = [];
+    this.learnings = [];
+
+    this.saveADRs();
+    this.saveFAQs();
+    this.saveLearnings();
+
+    logger.info('项目知识库.已清空', counts, LogCategory.SESSION);
+    return counts;
+  }
+
+  // ============================================================================
   // 持久化
   // ============================================================================
 

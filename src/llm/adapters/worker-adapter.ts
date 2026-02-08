@@ -96,11 +96,16 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     return this.sendMessageInternal(message, images, false);
   }
 
+  /**
+   * 迭代式工具调用模式
+   *
+   * 整个工具调用循环共享一个 streamId，确保 Worker Tab 中只呈现一条
+   * 包含完整推理过程（thinking → tool_call → tool_result → 最终回复）的消息。
+   */
   private async sendMessageInternal(
     message: string | undefined,
     images: string[] | undefined,
     skipUserMessage: boolean,
-    recursionDepth: number = 0
   ): Promise<string> {
     if (!this.isConnected) {
       throw new Error('Adapter not connected');
@@ -108,126 +113,112 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
     this.setState(AdapterState.BUSY);
     this.currentTraceId = this.generateTraceId();
-    let messageId: string | null = null;
+
+    // 自动截断历史以控制 token 消耗
+    this.truncateHistoryIfNeeded();
+    // 清理可能破坏工具调用链路的历史片段
+    this.normalizeHistoryForTools();
+
+    // 添加用户消息到历史（支持图片）
+    if (!skipUserMessage) {
+      if (images && images.length > 0) {
+        const contentBlocks: any[] = [];
+        for (const imagePath of images) {
+          try {
+            const fs = require('fs');
+            const path = require('path');
+            const imageBuffer = fs.readFileSync(imagePath);
+            const base64Data = imageBuffer.toString('base64');
+            const ext = path.extname(imagePath).toLowerCase().slice(1);
+            const mediaType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+            contentBlocks.push({
+              type: 'image',
+              source: { type: 'base64', media_type: mediaType, data: base64Data },
+            });
+          } catch (err) {
+            logger.warn('Worker适配器.图片读取失败', { path: imagePath, error: String(err) }, LogCategory.LLM);
+          }
+        }
+        if (message) {
+          contentBlocks.push({ type: 'text', text: message });
+        }
+        this.conversationHistory.push({ role: 'user', content: contentBlocks });
+      } else {
+        this.conversationHistory.push({ role: 'user', content: message || '' });
+      }
+    }
+
+    // 获取工具定义
+    const tools = await this.toolManager.getTools();
+    const toolDefinitions = tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      input_schema: tool.input_schema,
+    }));
+
+    // 整个工具调用循环共享一个 streamId，Worker Tab 中呈现完整推理过程
+    const streamId = this.startStreamWithContext();
+    const MAX_ROUNDS = 4;
 
     try {
-      this.seenThinking = false;
-      this.decisionHookAppliedForThinking = false;
-      // 自动截断历史以控制 token 消耗
-      this.truncateHistoryIfNeeded();
+      let finalText = '';
 
-      // 清理可能破坏工具调用链路的历史片段
-      this.normalizeHistoryForTools();
+      for (let round = 0; round < MAX_ROUNDS; round++) {
+        this.seenThinking = false;
+        this.decisionHookAppliedForThinking = false;
 
-      // 添加用户消息到历史（支持图片）
-      if (!skipUserMessage) {
-        // 🔧 如果有图片，构建多模态内容块
-        if (images && images.length > 0) {
-          const contentBlocks: any[] = [];
+        const params: LLMMessageParams = {
+          messages: this.conversationHistory,
+          systemPrompt: this.systemPrompt,
+          tools: toolDefinitions.length > 0 ? toolDefinitions : undefined,
+          stream: true,
+          maxTokens: 4096,
+          temperature: 0.7,
+        };
 
-          // 添加图片内容块
-          for (const imagePath of images) {
-            try {
-              const fs = require('fs');
-              const path = require('path');
-              const imageBuffer = fs.readFileSync(imagePath);
-              const base64Data = imageBuffer.toString('base64');
-              const ext = path.extname(imagePath).toLowerCase().slice(1);
-              const mediaType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+        let accumulatedText = '';
+        let toolCalls: ToolCall[] = [];
 
-              contentBlocks.push({
-                type: 'image',
-                source: {
-                  type: 'base64',
-                  media_type: mediaType,
-                  data: base64Data,
-                },
-              });
-            } catch (err) {
-              logger.warn('Worker适配器.图片读取失败', { path: imagePath, error: String(err) }, LogCategory.LLM);
+        const response = await this.client.streamMessage(params, (chunk) => {
+          if (chunk.type === 'content_delta' && chunk.content) {
+            if (this.seenThinking && !this.decisionHookAppliedForThinking) {
+              this.decisionHookAppliedForThinking = true;
+              this.applyDecisionHook({ type: 'thinking' });
             }
-          }
-
-          // 添加文本内容块
-          if (message) {
-            contentBlocks.push({
-              type: 'text',
-              text: message,
+            accumulatedText += chunk.content;
+            this.normalizer.processTextDelta(streamId, chunk.content);
+            this.emit('message', chunk.content);
+          } else if (chunk.type === 'thinking' && chunk.thinking) {
+            this.normalizer.processThinking(streamId, chunk.thinking);
+            this.emit('thinking', chunk.thinking);
+            this.seenThinking = true;
+          } else if (chunk.type === 'tool_call_start' && chunk.toolCall) {
+            this.emit('toolCall', chunk.toolCall.name || '', chunk.toolCall.arguments || {});
+            this.applyDecisionHook({
+              type: 'tool_call',
+              toolName: chunk.toolCall.name || '',
+              toolArgs: chunk.toolCall.arguments || {},
             });
           }
+        });
+        this.recordTokenUsage(response.usage);
 
-          this.conversationHistory.push({
-            role: 'user',
-            content: contentBlocks,
-          });
-        } else {
-          // 纯文本消息
-          this.conversationHistory.push({
-            role: 'user',
-            content: message || '',
-          });
+        if (response.toolCalls && response.toolCalls.length > 0) {
+          toolCalls = response.toolCalls;
         }
-      }
 
-      // 获取所有工具定义，让 AI 自主选择使用
-      const tools = await this.toolManager.getTools();
-      const toolDefinitions = tools.map((tool) => ({
-        name: tool.name,
-        description: tool.description,
-        input_schema: tool.input_schema,
-      }));
+        const assistantText = accumulatedText || response.content || '';
 
-      // 构建请求参数（AI 根据 System Prompt 和任务上下文自主决定工具使用）
-      const params: LLMMessageParams = {
-        messages: this.conversationHistory,
-        systemPrompt: this.systemPrompt,
-        tools: toolDefinitions.length > 0 ? toolDefinitions : undefined,
-        stream: true,
-        maxTokens: 4096,
-        temperature: 0.7,
-      };
-
-      // 开始流式响应
-      const streamId = this.startStreamWithContext();
-      messageId = streamId;
-      let fullResponse = '';
-      let toolCalls: ToolCall[] = [];
-
-      // 流式调用 LLM
-      const response = await this.client.streamMessage(params, (chunk) => {
-        if (chunk.type === 'content_delta' && chunk.content) {
-          if (this.seenThinking && !this.decisionHookAppliedForThinking) {
-            this.decisionHookAppliedForThinking = true;
-            this.applyDecisionHook({ type: 'thinking' });
-          }
-          fullResponse += chunk.content;
-          this.normalizer.processTextDelta(streamId, chunk.content);
-          this.emit('message', chunk.content);
-        } else if (chunk.type === 'thinking' && chunk.thinking) {
-          // 处理 thinking 内容
-          this.normalizer.processThinking(streamId, chunk.thinking);
-          this.emit('thinking', chunk.thinking);
-          this.seenThinking = true;
-        } else if (chunk.type === 'tool_call_start' && chunk.toolCall) {
-          this.emit('toolCall', chunk.toolCall.name || '', chunk.toolCall.arguments || {});
-          this.applyDecisionHook({
-            type: 'tool_call',
-            toolName: chunk.toolCall.name || '',
-            toolArgs: chunk.toolCall.arguments || {},
-          });
+        // 无工具调用 → 收敛，结束循环
+        if (toolCalls.length === 0) {
+          this.conversationHistory.push({ role: 'assistant', content: assistantText });
+          finalText = assistantText;
+          break;
         }
-      });
-      this.recordTokenUsage(response.usage);
 
-      // 处理工具调用
-      if (response.toolCalls && response.toolCalls.length > 0) {
-        toolCalls = response.toolCalls;
-
-        // 🔧 修复：将工具调用同步到 Normalizer，确保消息有 blocks
-        // 这是根本原因修复：之前工具调用信息没有同步到 Normalizer，
-        // 导致 endStream() 时 context.activeToolCalls 为空，消息没有 blocks
+        // 有工具调用 → 同步到 Normalizer，执行工具，继续下一轮
         for (const toolCall of toolCalls) {
-          this.normalizer.addToolCall(messageId, {
+          this.normalizer.addToolCall(streamId, {
             type: 'tool_call',
             toolName: toolCall.name,
             toolId: toolCall.id,
@@ -238,86 +229,59 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
         // 添加助手响应到历史（包含工具调用）
         const assistantContent: any[] = [];
-
-        // 如果有文本内容，添加文本块
-        if (response.content) {
-          assistantContent.push({
-            type: 'text',
-            text: response.content
-          });
+        if (assistantText) {
+          assistantContent.push({ type: 'text', text: assistantText });
         }
-
-        // 添加工具使用块
         for (const toolCall of toolCalls) {
           assistantContent.push({
             type: 'tool_use',
             id: toolCall.id,
             name: toolCall.name,
-            input: toolCall.arguments
+            input: toolCall.arguments,
           });
         }
+        this.conversationHistory.push({ role: 'assistant', content: assistantContent });
 
-        this.conversationHistory.push({
-          role: 'assistant',
-          content: assistantContent,
-        });
-
-        // 执行所有工具调用（AI 自主选择的工具）
+        // 执行工具
         const toolResults = await this.executeToolCalls(toolCalls);
-
-        // 🔧 修复：工具执行完成后更新 Normalizer 中的工具调用状态
         for (const result of toolResults) {
           this.normalizer.finishToolCall(
-            messageId,
+            streamId,
             result.toolCallId,
             result.isError ? undefined : result.content,
-            result.isError ? result.content : undefined
+            result.isError ? result.content : undefined,
           );
         }
 
-        // 添加工具结果到历史（使用 ContentBlock 格式）
-        const toolResultContent: any[] = toolResults.map(result => ({
-          type: 'tool_result',
-          tool_use_id: result.toolCallId,
-          content: result.content,
-          is_error: result.isError
-        }));
-
+        // 工具结果追加到历史
         this.conversationHistory.push({
           role: 'user',
-          content: toolResultContent,
+          content: toolResults.map((result) => ({
+            type: 'tool_result',
+            tool_use_id: result.toolCallId,
+            content: result.content,
+            is_error: result.isError,
+          })),
         });
 
-        // 工具执行完成后决策点（工具调用后）
         this.applyDecisionHook({ type: 'tool_result' });
 
-        // 递归调用以获取最终响应
-        this.normalizer.endStream(messageId);
-        if (recursionDepth >= 3) {
-          return '多次工具调用后仍未产出最终回复，已中止以避免无限循环。';
+        // 达到最大轮次仍有工具调用 → 强制收敛
+        if (round === MAX_ROUNDS - 1) {
+          finalText = assistantText || '多次工具调用后仍未产出最终回复，已中止以避免无限循环。';
         }
-        return await this.sendMessageInternal(undefined, undefined, true, recursionDepth + 1);
       }
-
-      // 添加助手响应到历史
-      this.conversationHistory.push({
-        role: 'assistant',
-        content: fullResponse,
-      });
 
       this.normalizer.endStream(streamId);
       this.setState(AdapterState.CONNECTED);
 
-      // 🔧 如果流式传输完成但没有内容，抛出明确错误而非静默返回空
-      if (!fullResponse.trim()) {
+      if (!finalText.trim()) {
         throw new Error('LLM 响应为空：流式传输完成但未收到有效内容');
       }
 
-      return fullResponse;
+      return finalText;
     } catch (error: any) {
-      if (messageId) {
-        this.normalizer.endStream(messageId, error?.message || 'Request failed');
-      }
+      this.normalizer.endStream(streamId, error?.message || 'Request failed');
       this.setState(AdapterState.ERROR);
       this.emitError(error);
       throw error;

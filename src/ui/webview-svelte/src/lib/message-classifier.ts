@@ -13,7 +13,7 @@ export function normalizeWorkerSlot(value: unknown): 'claude' | 'codex' | 'gemin
 }
 
 /**
- * 消息分类器 - 方案 B
+ * 消息分类器
  *
  * 完全基于 MessageType 进行分类，不依赖 metadata 魔术字段
  * 分类优先级：
@@ -42,9 +42,9 @@ export function classifyMessage(standard: StandardMessage): {
     return { category: MessageCategory.TASK_SUMMARY_CARD, worker: resolvedWorker ?? undefined };
   }
 
-  // 任务说明（编排者→Worker）
+  // 任务说明（编排者→Worker）：必须路由到 Worker Tab，worker 缺失时降级到 claude
   if (standard.type === MessageType.INSTRUCTION) {
-    return { category: MessageCategory.WORKER_INSTRUCTION, worker: resolvedWorker ?? undefined };
+    return { category: MessageCategory.WORKER_INSTRUCTION, worker: resolvedWorker ?? 'claude' };
   }
 
   // ============== 第二优先级：系统状态消息 ==============
@@ -103,12 +103,12 @@ export function classifyMessage(standard: StandardMessage): {
       case MessageType.TOOL_CALL:
         return { category: MessageCategory.WORKER_TOOL_USE, worker: resolvedWorker ?? undefined };
       case MessageType.ERROR:
-        // 🔧 Worker 错误应该显示在主对话区，让用户注意到
+        // Worker 错误显示在主对话区，确保用户可见
         return { category: MessageCategory.SYSTEM_ERROR, worker: resolvedWorker ?? undefined };
       case MessageType.RESULT:
         return { category: MessageCategory.WORKER_SUMMARY, worker: resolvedWorker ?? undefined };
       case MessageType.INTERACTION:
-        // 🔧 Worker 交互消息：根据交互类型分类（而不是归并为普通文本）
+        // Worker 交互消息：根据交互类型分类
         if (standard.interaction) {
           switch (standard.interaction.type) {
             case InteractionType.PERMISSION:
@@ -122,10 +122,10 @@ export function classifyMessage(standard: StandardMessage): {
         }
         return { category: MessageCategory.WORKER_OUTPUT, worker: resolvedWorker ?? undefined };
       case MessageType.PLAN:
-        // 🔧 Worker 计划消息：显示在 Worker Tab
+        // Worker 计划消息
         return { category: MessageCategory.WORKER_OUTPUT, worker: resolvedWorker ?? undefined };
       case MessageType.SYSTEM:
-        // 🔧 Worker 系统消息
+        // Worker 系统消息
         return { category: MessageCategory.SYSTEM_NOTICE, worker: resolvedWorker ?? undefined };
       case MessageType.TEXT:
         // 代码输出：包含 CodeBlock 的文本消息

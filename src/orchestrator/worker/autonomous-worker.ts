@@ -46,6 +46,7 @@ import {
   WorkerSession,
 } from './worker-session';
 import { logger, LogCategory } from '../../logging';
+import type { CancellationToken } from '../core/dispatch-batch';
 // 共享上下文与文件摘要缓存模块
 import {
   ContextAssembler,
@@ -54,6 +55,7 @@ import {
   FileSummary,
   ContextSource,
   AssembledContext,
+  SharedContextEntryType,
   createSharedContextEntry,
 } from '../../context';
 
@@ -70,10 +72,14 @@ export interface FileReadResult {
   fromCache: boolean;
 }
 
+type WorkerInsightType = Extract<SharedContextEntryType, 'decision' | 'contract' | 'risk' | 'constraint'>;
+
 /**
  * Worker 洞察（用于写入 SharedContextPool）
  */
 export interface WorkerInsight {
+  /** 洞察类型 */
+  type: WorkerInsightType;
   /** 洞察内容 */
   content: string;
   /** 标签（用于订阅筛选） */
@@ -122,6 +128,8 @@ export interface TodoExecuteOptions {
   resumePrompt?: string;
   /** Session 管理器（可选，不提供则创建临时管理器） - 提案 4.1 */
   sessionManager?: WorkerSessionManager;
+  /** 取消信号 Token（C-09），循环入口检查 + LLM 请求中断 */
+  cancellationToken?: CancellationToken;
 }
 
 /**
@@ -381,6 +389,8 @@ export class AutonomousWorker extends EventEmitter {
 
     if (!assignment.todos || assignment.todos.length === 0) {
       // ========== 直接执行模式（简单任务） ==========
+      // 取消信号检查
+      options.cancellationToken?.throwIfCancelled();
       logger.info('Worker.直接执行模式', {
         assignmentId: assignment.id,
         workerId: this.workerType,
@@ -429,6 +439,14 @@ export class AutonomousWorker extends EventEmitter {
     let currentTodo = this.getNextExecutableTodo(assignment);
 
     while (currentTodo && !aborted) {
+      // 取消信号检查（每次迭代入口）
+      if (options.cancellationToken?.isCancelled) {
+        aborted = true;
+        abortReason = options.cancellationToken.reason || '任务被取消';
+        logger.info('Worker.Assignment.取消信号', { assignmentId: assignment.id, reason: abortReason }, LogCategory.ORCHESTRATOR);
+        break;
+      }
+
       try {
         // 传递共享上下文到 Todo 执行 - 提案 9.2
         const result = await this.executeTodo(currentTodo, assignment, options, sharedContext);
@@ -814,6 +832,9 @@ export class AutonomousWorker extends EventEmitter {
     todo.status = 'running';
     todo.startedAt = Date.now();
 
+    // 更新快照上下文的 todoId（确保当前 Todo 的文件变更精确关联）
+    options.adapterFactory?.getToolManager().updateSnapshotTodoId(todo.id);
+
     this.emit('todoStarted', {
       assignmentId: assignment.id,
       todoId: todo.id,
@@ -866,7 +887,7 @@ export class AutonomousWorker extends EventEmitter {
       todo.status = 'completed';
       todo.completedAt = Date.now();
       todo.output = todoOutput;
-      await this.writeInsight(this.buildSuccessInsight(assignment, output.summary, output.modifiedFiles || [], todo));
+      await this.writeInsights(this.buildSuccessInsights(assignment, output.summary, output.modifiedFiles || [], todo));
 
       this.emit('todoCompleted', {
         assignmentId: assignment.id,
@@ -895,7 +916,7 @@ export class AutonomousWorker extends EventEmitter {
         error: errorMessage,
         duration: Date.now() - startTime,
       };
-      await this.writeInsight(this.buildFailureInsight(assignment, errorMessage, todo));
+      await this.writeInsights(this.buildFailureInsights(assignment, errorMessage, todo));
 
       this.emit('todoFailed', {
         assignmentId: assignment.id,
@@ -1227,7 +1248,7 @@ export class AutonomousWorker extends EventEmitter {
       // 解析响应
       const summary = response.content || '执行完成';
       const modifiedFiles = this.extractModifiedFiles(response.content || '');
-      await this.writeInsight(this.buildSuccessInsight(assignment, summary, modifiedFiles));
+      await this.writeInsights(this.buildSuccessInsights(assignment, summary, modifiedFiles));
 
       // 调用输出回调
       if (options.onOutput && response.content) {
@@ -1256,7 +1277,7 @@ export class AutonomousWorker extends EventEmitter {
         error: errorMessage,
         duration: Date.now() - startTime,
       }, LogCategory.ORCHESTRATOR);
-      await this.writeInsight(this.buildFailureInsight(assignment, errorMessage));
+      await this.writeInsights(this.buildFailureInsights(assignment, errorMessage));
 
       return {
         success: false,
@@ -1406,40 +1427,57 @@ export class AutonomousWorker extends EventEmitter {
   /**
    * 构建成功洞察
    */
-  private buildSuccessInsight(
+  private buildSuccessInsights(
     assignment: Assignment,
     summary: string,
     modifiedFiles: string[] = [],
     todo?: UnifiedTodo
-  ): WorkerInsight {
+  ): WorkerInsight[] {
     const scopeText = todo ? todo.content : assignment.responsibility;
     const summaryText = this.trimInsightContent(summary, 600);
-    const fileText = modifiedFiles.length > 0
+    const fileSummary = modifiedFiles.length > 0
       ? `涉及文件: ${modifiedFiles.slice(0, 6).join(', ')}`
       : '未检测到明确文件变更。';
+    const tags = this.buildInsightTags(assignment, modifiedFiles);
+    const facts = this.extractTypedFacts(summaryText);
+    const fallbackTypes = this.getDefaultInsightTypes('success');
+    const typeOrder: WorkerInsightType[] = Array.from(new Set([
+      ...facts.map((fact) => fact.type),
+      ...fallbackTypes,
+    ])).slice(0, 2);
+    const insights: WorkerInsight[] = [];
 
-    return {
-      content: `任务成功: ${scopeText}\n结论: ${summaryText}\n${fileText}`,
-      tags: this.buildInsightTags(assignment, modifiedFiles),
-      importance: modifiedFiles.length > 0 ? 'high' : 'medium',
-    };
+    for (const type of typeOrder) {
+      const typedFact = facts.find((fact) => fact.type === type)?.content || summaryText;
+      insights.push({
+        type,
+        content: `任务成功: ${scopeText}\n结论(${this.describeInsightType(type)}): ${typedFact}\n${fileSummary}`,
+        tags: Array.from(new Set([...tags, type])),
+        importance: modifiedFiles.length > 0 ? 'high' : 'medium',
+      });
+    }
+
+    return insights;
   }
 
   /**
    * 构建失败洞察
    */
-  private buildFailureInsight(
+  private buildFailureInsights(
     assignment: Assignment,
     errorMessage: string,
     todo?: UnifiedTodo
-  ): WorkerInsight {
+  ): WorkerInsight[] {
     const scopeText = todo ? todo.content : assignment.responsibility;
     const errorText = this.trimInsightContent(errorMessage, 400);
-    return {
-      content: `任务失败: ${scopeText}\n错误: ${errorText}`,
-      tags: this.buildInsightTags(assignment),
+    const tags = this.buildInsightTags(assignment);
+    const typeOrder = this.getDefaultInsightTypes('failure');
+    return typeOrder.map((type) => ({
+      type,
+      content: `任务失败: ${scopeText}\n结论(${this.describeInsightType(type)}): ${errorText}`,
+      tags: Array.from(new Set([...tags, type])),
       importance: 'high',
-    };
+    }));
   }
 
   /**
@@ -2196,7 +2234,7 @@ export class AutonomousWorker extends EventEmitter {
    *
    * @param insight - 洞察内容
    */
-  async writeInsight(insight: WorkerInsight): Promise<void> {
+  async writeInsights(insights: WorkerInsight[]): Promise<void> {
     // 仅检查业务状态：currentMissionId（sharedContextPool 强制依赖已保证可用）
     if (!this.currentMissionId) {
       logger.debug('Worker.洞察.跳过写入', {
@@ -2205,22 +2243,39 @@ export class AutonomousWorker extends EventEmitter {
       return;
     }
 
-    const entry = createSharedContextEntry({
-      missionId: this.currentMissionId,
-      source: this.mapWorkerTypeToContextSource(),
-      type: 'insight',
-      content: insight.content,
-      tags: insight.tags,
-      importance: insight.importance,
-    });
+    for (const insight of insights) {
+      const entry = createSharedContextEntry({
+        missionId: this.currentMissionId,
+        source: this.mapWorkerTypeToContextSource(),
+        type: insight.type,
+        content: insight.content,
+        tags: insight.tags,
+        importance: insight.importance,
+      });
 
-    const result = this.sharedContextPool.add(entry);
-    logger.info('Worker.洞察.已写入', {
-      missionId: this.currentMissionId,
-      workerId: this.workerType,
-      action: result.action,
-      importance: insight.importance,
-    }, LogCategory.ORCHESTRATOR);
+      const result = this.sharedContextPool.add(entry);
+      logger.info('Worker.洞察.已写入', {
+        missionId: this.currentMissionId,
+        workerId: this.workerType,
+        action: result.action,
+        type: insight.type,
+        importance: insight.importance,
+      }, LogCategory.ORCHESTRATOR);
+
+      // 高优先级洞察通知 UI，让用户可见
+      if (insight.importance === 'critical' || insight.importance === 'high') {
+        this.emit('insightGenerated', {
+          workerId: this.workerType,
+          type: insight.type,
+          content: insight.content,
+          importance: insight.importance,
+        });
+      }
+    }
+  }
+
+  async writeInsight(insight: WorkerInsight): Promise<void> {
+    await this.writeInsights([insight]);
   }
 
   // ============================================================================
@@ -2438,5 +2493,99 @@ export class AutonomousWorker extends EventEmitter {
       default:
         return 'orchestrator';
     }
+  }
+
+  private describeInsightType(type: WorkerInsightType): string {
+    switch (type) {
+      case 'decision':
+        return '决策';
+      case 'contract':
+        return '契约';
+      case 'risk':
+        return '风险';
+      case 'constraint':
+        return '约束';
+      default:
+        return type;
+    }
+  }
+
+  private getDefaultInsightTypes(mode: 'success' | 'failure'): WorkerInsightType[] {
+    if (mode === 'failure') {
+      return ['risk'];
+    }
+    switch (this.workerType) {
+      case 'claude':
+        return ['decision', 'constraint'];
+      case 'codex':
+        return ['risk', 'constraint'];
+      case 'gemini':
+        return ['contract', 'decision'];
+      default:
+        return ['decision'];
+    }
+  }
+
+  private extractTypedFacts(summaryText: string): Array<{ type: WorkerInsightType; content: string }> {
+    const candidates = summaryText
+      .split(/\n+/)
+      .map((line) => line.replace(/^\s*[-*•\d.)]+\s*/, '').trim())
+      .filter((line) => line.length >= 8);
+    if (candidates.length === 0 && summaryText.trim()) {
+      candidates.push(summaryText.trim());
+    }
+
+    const facts = new Map<WorkerInsightType, string>();
+    for (const candidate of candidates) {
+      const type = this.inferInsightType(candidate);
+      if (!type || facts.has(type)) {
+        continue;
+      }
+      facts.set(type, this.trimInsightContent(candidate, 280));
+      if (facts.size >= 4) {
+        break;
+      }
+    }
+
+    return Array.from(facts.entries()).map(([type, content]) => ({ type, content }));
+  }
+
+  private inferInsightType(content: string): WorkerInsightType | null {
+    const text = content.toLowerCase();
+    const labeledMatchers: Array<{ type: WorkerInsightType; regex: RegExp }> = [
+      { type: 'decision', regex: /^\s*(decision|决策|方案|选择)\s*[:：]/i },
+      { type: 'contract', regex: /^\s*(contract|契约|接口约定|协议)\s*[:：]/i },
+      { type: 'risk', regex: /^\s*(risk|风险|隐患|问题)\s*[:：]/i },
+      { type: 'constraint', regex: /^\s*(constraint|约束|限制|前提)\s*[:：]/i },
+    ];
+    for (const matcher of labeledMatchers) {
+      if (matcher.regex.test(content)) {
+        return matcher.type;
+      }
+    }
+
+    const scoredKeywords: Array<{ type: WorkerInsightType; keywords: string[] }> = [
+      { type: 'decision', keywords: ['决策', '方案', '选择', '架构', 'adopt', 'decision'] },
+      { type: 'contract', keywords: ['契约', '接口', '协议', 'contract', 'api', 'schema', '输入', '输出'] },
+      { type: 'risk', keywords: ['风险', '隐患', '失败', '故障', '回归', 'risk', 'unstable', 'timeout'] },
+      { type: 'constraint', keywords: ['约束', '限制', '禁止', '必须', '不能', 'constraint', 'boundary'] },
+    ];
+
+    let bestType: WorkerInsightType | null = null;
+    let bestScore = 0;
+    for (const item of scoredKeywords) {
+      let score = 0;
+      for (const keyword of item.keywords) {
+        if (text.includes(keyword.toLowerCase())) {
+          score += 1;
+        }
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestType = item.type;
+      }
+    }
+
+    return bestScore > 0 ? bestType : null;
   }
 }

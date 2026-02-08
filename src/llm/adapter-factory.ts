@@ -398,6 +398,9 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       if (typeof options?.includeToolCalls === 'boolean') {
         adapter.setTempEnableToolCalls(options.includeToolCalls);
       }
+      if (options?.visibility) {
+        adapter.setTempVisibility(options.visibility);
+      }
     }
 
     try {
@@ -414,13 +417,24 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     }
 
     const sendOnce = async (): Promise<{ content: string; tokenUsage?: TokenUsage }> => {
+      // requestContext 是全局状态，只有编排器的 LLM 输出才应绑定到 placeholder。
+      // Worker 或 visibility:'system' 调用必须临时清除 requestContext，
+      // 否则 Worker 的流式输出会复用编排器的 placeholder messageId，导致消息归属错误。
+      const shouldDetachRequest = options?.visibility === 'system' || agent !== 'orchestrator';
+      let savedRequestContext: string | undefined;
+      if (shouldDetachRequest && this.messageHub) {
+        savedRequestContext = this.messageHub.getRequestContext();
+        this.messageHub.setRequestContext(undefined);
+      }
+
       const beforeTotals = 'getTotalTokenUsage' in adapter && typeof (adapter as any).getTotalTokenUsage === 'function'
         ? (adapter as any).getTotalTokenUsage()
         : { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
-      const content = await adapter.sendMessage(message, images);
-      const afterTotals = 'getTotalTokenUsage' in adapter && typeof (adapter as any).getTotalTokenUsage === 'function'
-        ? (adapter as any).getTotalTokenUsage()
-        : { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+      try {
+        const content = await adapter.sendMessage(message, images);
+        const afterTotals = 'getTotalTokenUsage' in adapter && typeof (adapter as any).getTotalTokenUsage === 'function'
+          ? (adapter as any).getTotalTokenUsage()
+          : { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
 
       const tokenUsage = {
         inputTokens: Math.max(0, (afterTotals.inputTokens || 0) - (beforeTotals.inputTokens || 0)),
@@ -430,6 +444,12 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       };
 
       return { content, tokenUsage };
+      } finally {
+        // 恢复 requestContext（无论成功或异常）
+        if (shouldDetachRequest && this.messageHub && savedRequestContext !== undefined) {
+          this.messageHub.setRequestContext(savedRequestContext);
+        }
+      }
     };
 
     const isWorker = agent !== 'orchestrator';

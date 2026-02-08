@@ -171,6 +171,7 @@
   .message-list-wrapper {
     position: relative;
     height: 100%;
+    min-height: 0; /* flex 布局防溢出 */
     display: flex;
     flex-direction: column;
   }
@@ -180,6 +181,7 @@
     flex-direction: column;
     gap: var(--space-3);
     flex: 1;
+    min-height: 0; /* flex 布局防溢出 */
     overflow-y: auto;
     overflow-x: hidden;
     /* 右侧减少间距以补偿滚动条宽度，使内容视觉对称 */

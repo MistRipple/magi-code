@@ -175,6 +175,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   // 统一消息出口
   private messageHub: MessageHub;
   private requestTimeouts: Map<string, NodeJS.Timeout> = new Map();
+  // messageId → requestId 映射，用于 StreamUpdate 事件中清除超时
+  private messageIdToRequestId: Map<string, string> = new Map();
 
   // 适配器工厂（LLM 模式）
   private adapterFactory: IAdapterFactory;
@@ -293,6 +295,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // MessageHub 从 orchestratorEngine 获取后，立即注入给 AdapterFactory
     // 这样 Adapter 可以直接通过 MessageHub 发送消息
     (this.adapterFactory as LLMAdapterFactory).setMessageHub(this.messageHub);
+
+    // 注入 SnapshotManager 到 ToolManager（确保工具级文件写入自动创建快照）
+    (this.adapterFactory as LLMAdapterFactory).getToolManager().setSnapshotManager(this.snapshotManager);
 
     // 异步初始化 profile loader（在 MessageHub 注入之后）
     void (this.adapterFactory as LLMAdapterFactory).initialize().catch(err => {
@@ -644,6 +649,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 提取 ADR
       const adrs = await knowledgeBase.extractADRFromSession(messages);
       if (adrs.length > 0) {
+        // 存储提取到的 ADR
+        for (const adr of adrs) {
+          knowledgeBase.addADR(adr);
+        }
+
         logger.info('项目知识库.ADR提取成功', {
           count: adrs.length,
           titles: adrs.map(a => a.title)
@@ -659,6 +669,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 提取 FAQ
       const faqs = await knowledgeBase.extractFAQFromSession(messages);
       if (faqs.length > 0) {
+        // 存储提取到的 FAQ
+        for (const faq of faqs) {
+          knowledgeBase.addFAQ(faq);
+        }
+
         logger.info('项目知识库.FAQ提取成功', {
           count: faqs.length,
           questions: faqs.map(f => f.question)
@@ -705,7 +720,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 标准流式消息（LLM / 编排 / Worker 等统一通道）
     this.messageHub.on('unified:message', (message) => {
       this.postMessage({
-        type: WEBVIEW_MESSAGE_TYPES.UNIFIED_MESSAGE,  // 🔧 统一消息通道：使用新协议
+        type: WEBVIEW_MESSAGE_TYPES.UNIFIED_MESSAGE,
         message,
         sessionId: this.activeSessionId
       } as any);
@@ -715,16 +730,21 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     this.messageHub.on('unified:update', (update) => {
       this.postMessage({
-        type: WEBVIEW_MESSAGE_TYPES.UNIFIED_UPDATE,  // 🔧 统一消息通道：使用新协议
+        type: WEBVIEW_MESSAGE_TYPES.UNIFIED_UPDATE,
         update,
         sessionId: this.activeSessionId
       } as any);
       this.logMessageFlow('messageHub.standardUpdate [SENT]', update);
+      // 收到流式更新即表明 LLM 已响应，清除首 token 超时
+      const reqId = this.messageIdToRequestId.get(update.messageId);
+      if (reqId) {
+        this.clearRequestTimeout(reqId);
+      }
     });
 
     this.messageHub.on('unified:complete', (message) => {
       this.postMessage({
-        type: WEBVIEW_MESSAGE_TYPES.UNIFIED_COMPLETE,  // 🔧 统一消息通道：使用新协议
+        type: WEBVIEW_MESSAGE_TYPES.UNIFIED_COMPLETE,
         message,
         sessionId: this.activeSessionId
       } as any);
@@ -748,14 +768,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     placeholderMessageId: string;
   } {
     const traceId = this.messageHub.getTraceId();
-    // 🔧 图片已通过缩略图展示，不再在文本中附加 [附件: X 张图片]
+    // 图片已通过缩略图展示，不再在文本中附加 [附件: X 张图片]
     const displayContent = prompt;
 
     const userMessage = createUserInputMessage(displayContent, traceId, {
       metadata: {
         requestId,
         sendingAnimation: true,
-        // 🔧 新增：附带图片数据供前端展示
+        // 附带图片数据供前端展示
         images: images && images.length > 0 ? images : undefined,
       },
     });
@@ -784,6 +804,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }, LogCategory.UI);
       throw new Error('消息发送失败：用户消息或占位消息未成功发送');
     }
+
+    // 注册 messageId → requestId 映射，供 StreamUpdate 超时清除使用
+    this.messageIdToRequestId.set(placeholderMessage.id, requestId);
 
     return { userMessageId: userMessage.id, placeholderMessageId: placeholderMessage.id };
   }
@@ -818,6 +841,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       clearTimeout(timeout);
       this.requestTimeouts.delete(requestId);
     }
+    // 清理 messageId → requestId 映射
+    for (const [msgId, reqId] of this.messageIdToRequestId) {
+      if (reqId === requestId) {
+        this.messageIdToRequestId.delete(msgId);
+        break;
+      }
+    }
   }
 
   private resolveRequestTimeoutFromMessage(message: StandardMessage): void {
@@ -827,7 +857,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const isPlaceholder = Boolean(meta?.isPlaceholder);
-    // 方案 B：使用 MessageType.USER_INPUT 判断用户消息
+    // 使用 MessageType.USER_INPUT 判断用户消息
     const isUserInput = message.type === MessageType.USER_INPUT;
     if (isPlaceholder || isUserInput) {
       return;
@@ -1242,6 +1272,21 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
 
     this.activeToolAuthorizationRequestId = next.requestId;
+
+    // 发送留痕消息：与 confirmationRequest/questionRequest 一致
+    const interactionMsg = createInteractionMessage(
+      {
+        type: InteractionType.PERMISSION,
+        requestId: next.requestId,
+        prompt: `工具授权请求: ${next.toolName}`,
+        required: true,
+      },
+      'orchestrator',
+      'orchestrator',
+      next.requestId,
+    );
+    this.messageHub.sendMessage(interactionMsg);
+
     this.sendData('toolAuthorizationRequest', {
       requestId: next.requestId,
       toolName: next.toolName,
@@ -2323,30 +2368,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'installSkill':
         await this.handleInstallSkill(message.skillId);
         break;
-      case 'applyInstructionSkill':
-        const skillRequestId = (message as any).requestId as string | undefined;
-        if (!this.shouldProcessRequest(skillRequestId)) {
-          if (skillRequestId) {
-            this.messageHub.taskRejected(skillRequestId, '请求重复，已忽略');
-          }
-          break;
-        }
-        try {
-          await this.handleApplyInstructionSkill(
-            (message as any).skillName,
-            (message as any).args,
-            (message as any).images || [],
-            (message as any).agent || undefined,
-            skillRequestId
-          );
-        } catch (error: any) {
-          const errorMsg = error instanceof Error ? error.message : String(error);
-          if (skillRequestId) {
-            this.messageHub.taskRejected(skillRequestId, errorMsg);
-          }
-          throw error;
-        }
-        break;
 
       // Skills 仓库管理
       case 'loadRepositories':
@@ -2410,10 +2431,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         await this.handleUpdateADR(message.id, message.updates);
         break;
 
-      case 'deleteADR':
-        await this.handleDeleteADR(message.id);
-        break;
-
       case 'addFAQ':
         await this.handleAddFAQ(message.faq);
         break;
@@ -2422,8 +2439,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         await this.handleUpdateFAQ(message.id, message.updates);
         break;
 
-      case 'deleteFAQ':
-        await this.handleDeleteFAQ(message.id);
+      case 'clearProjectKnowledge':
+        await this.handleClearProjectKnowledge();
         break;
 
       case 'openMermaidPanel':
@@ -3875,6 +3892,28 @@ ${originalPrompt}
   }
 
   /**
+   * 清空项目知识库
+   */
+  private async handleClearProjectKnowledge(): Promise<void> {
+    try {
+      const kb = this.projectKnowledgeBase;
+      if (!kb) {
+        this.sendToast('项目知识库未初始化', 'warning');
+        return;
+      }
+
+      const counts = kb.clearAll();
+      const total = counts.adrs + counts.faqs + counts.learnings;
+      this.sendToast(`已清空 ${total} 条知识记录（ADR: ${counts.adrs}, FAQ: ${counts.faqs}, 经验: ${counts.learnings}）`, 'success');
+      logger.info('项目知识库.已清空', counts, LogCategory.SESSION);
+      await this.handleGetProjectKnowledge();
+    } catch (error: any) {
+      logger.error('项目知识库.清空失败', { error: error.message }, LogCategory.SESSION);
+      this.sendToast(`清空失败: ${error.message}`, 'error');
+    }
+  }
+
+  /**
    * 获取 ADR 列表
    */
   private async handleGetADRs(filter?: { status?: string }): Promise<void> {
@@ -4818,13 +4857,16 @@ ${originalPrompt}
       return;
     }
     try {
-      // 统一 Todo 系统 - 使用 orchestratorEngine
+      // 先通知用户任务正在启动
+      this.sendToast('任务启动中...', 'info');
+      this.sendStateUpdate();
+      // 触发完整执行链路（意图分析 → 规划 → 执行）
       await this.orchestratorEngine.startTaskById(taskId);
-      this.sendToast('任务已开始', 'success');
       this.sendStateUpdate();
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       this.sendToast(`启动失败: ${errorMsg}`, 'error');
+      this.sendStateUpdate();
     }
   }
 
@@ -4891,7 +4933,7 @@ ${originalPrompt}
     await this.executeTask(prompt, undefined, []);
   }
 
-  /** 处理执行中追加输入：默认语义为“打断并按新输入重启” */
+  /** 处理执行中追加输入：默认语义为“补充指令（下一决策点生效）” */
   private async handleAppendMessage(taskId: string, content: string): Promise<void> {
     logger.info('界面.消息.补充.请求', { taskId, preview: content.substring(0, 50) }, LogCategory.UI);
 
@@ -4904,14 +4946,27 @@ ${originalPrompt}
     try {
       const wasRunning = this.orchestratorEngine.running;
 
-      // 默认语义：追加输入 = 打断当前执行并基于最新输入重新开始
       if (wasRunning) {
-        await this.interruptCurrentTask({ silent: true });
-        this.sendToast('已打断当前执行，正在按新输入重新开始', 'info');
+        const accepted = this.orchestratorEngine.injectSupplementaryInstruction(trimmedContent);
+        if (!accepted) {
+          this.sendToast('当前任务不可注入补充指令，请重试', 'warning');
+          return;
+        }
+        const pendingCount = this.orchestratorEngine.getPendingInstructionCount();
+        this.messageHub.systemNotice('收到补充指令，将在下一决策点生效。', {
+          phase: 'supplementary_instruction',
+          isStatusMessage: true,
+          extra: {
+            pendingInstructionCount: pendingCount,
+          },
+        });
+        this.sendToast('补充指令已加入队列', 'info');
+        logger.info('界面.消息.补充.已入队', { taskId, pendingCount }, LogCategory.UI);
+        return;
       }
 
       await this.executeTask(trimmedContent, undefined, []);
-      logger.info('界面.消息.补充.重启执行_成功', { taskId, wasRunning }, LogCategory.UI);
+      logger.info('界面.消息.补充.空闲直执_成功', { taskId, wasRunning }, LogCategory.UI);
     } catch (error) {
       logger.error('界面.消息.补充.失败', error, LogCategory.UI);
       this.sendToast('补充内容失败', 'error');
@@ -5173,34 +5228,6 @@ ${originalPrompt}
     }
   }
 
-  private async handleApplyInstructionSkill(
-    skillName: string,
-    args?: string,
-    images?: Array<{ dataUrl: string }>,
-    agent?: WorkerSlot,
-    requestId?: string
-  ): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const config = LLMConfigLoader.loadSkillsConfig();
-      const skills: InstructionSkillDefinition[] = Array.isArray(config?.instructionSkills) ? config.instructionSkills : [];
-      const skill = skills.find((item) => item.name === skillName);
-      if (!skill) {
-        this.sendToast(`未找到 Skill: ${skillName}`, 'error');
-        return;
-      }
-
-      const prompt = buildInstructionSkillPrompt(skill, args || '');
-      const displayPrompt = args && args.trim()
-        ? `使用 Skill: ${skill.name}\n${args.trim()}`
-        : `使用 Skill: ${skill.name}`;
-      await this.executeTask(prompt, agent || undefined, images || [], requestId, displayPrompt);
-    } catch (error: any) {
-      logger.error('应用 Skill 失败', { skillName, error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`应用 Skill 失败: ${error.message}`, 'error');
-    }
-  }
-
   private parseOrchestrationCommand(prompt: string): { type: 'plan' | 'start-work'; payload?: string } | null {
     const trimmed = prompt.trim();
     if (!trimmed) return null;
@@ -5388,12 +5415,20 @@ ${originalPrompt}
     // 统一 Todo 系统 - 使用 orchestratorEngine
     const sessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id || 'default';
     const task = await this.orchestratorEngine.createTaskFromPrompt(sessionId, prompt);
-    await this.orchestratorEngine.startTaskById(task.id);
+    await this.orchestratorEngine.markTaskExecuting(task.id);
     this.sendStateUpdate();
 
     let errorMsg: string | undefined;
     let success = false;
+    const toolManager = (this.adapterFactory as LLMAdapterFactory).getToolManager();
     try {
+      // 设置快照上下文（直接 Worker 模式也需要精确记录文件变更）
+      toolManager.setSnapshotContext({
+        missionId: task.id,
+        assignmentId: `direct-${task.id}`,
+        todoId: `direct-${task.id}`,
+        workerId: targetWorker,
+      });
       logger.info('界面.执行.直接.请求', { worker: targetWorker }, LogCategory.UI);
       const response = await this.adapterFactory.sendMessage(targetWorker, prompt, imagePaths);
       logger.info('界面.执行.直接.响应', { worker: targetWorker, preview: response.content?.substring(0, 100) }, LogCategory.UI);
@@ -5457,6 +5492,9 @@ ${originalPrompt}
         messageType: 'error',
         metadata: { worker: targetWorker },
       });
+    } finally {
+      // 清除快照上下文
+      toolManager.clearSnapshotContext();
     }
 
     this.sendStateUpdate();

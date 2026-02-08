@@ -61,6 +61,7 @@ export interface ParseContext {
   activeToolCalls: Map<string, ToolCallBlock>;
   interaction: InteractionRequest | null;
   startTime: number;
+  visibility?: 'user' | 'system' | 'debug';
 }
 
 /**
@@ -79,7 +80,7 @@ export abstract class BaseNormalizer extends EventEmitter {
     return this.config.agent;
   }
 
-  startStream(traceId: string, source?: MessageSource, messageIdOverride?: string): string {
+  startStream(traceId: string, source?: MessageSource, messageIdOverride?: string, visibility?: 'user' | 'system' | 'debug'): string {
     const normalizedId = typeof messageIdOverride === 'string' && messageIdOverride.trim()
       ? messageIdOverride.trim()
       : undefined;
@@ -99,6 +100,7 @@ export abstract class BaseNormalizer extends EventEmitter {
       activeToolCalls: new Map(),
       interaction: null,
       startTime: Date.now(),
+      visibility,
     };
 
     this.activeContexts.set(messageId, context);
@@ -107,7 +109,7 @@ export abstract class BaseNormalizer extends EventEmitter {
       source || this.config.defaultSource,
       this.config.agent,  // ✅ 使用 agent
       traceId,
-      { id: messageId }
+      { id: messageId, visibility: visibility || 'user' }
     );
 
     this.emit(MESSAGE_EVENTS.MESSAGE, message);
@@ -290,6 +292,7 @@ export abstract class BaseNormalizer extends EventEmitter {
       lifecycle: error ? MessageLifecycle.FAILED : MessageLifecycle.COMPLETED,
       blocks: safeBlocks,
       interaction: context.interaction || undefined,
+      visibility: context.visibility || 'user',
       metadata: { duration: Date.now() - context.startTime, error },
     });
   }
@@ -356,6 +359,19 @@ export abstract class BaseNormalizer extends EventEmitter {
       return;
     }
     this.completeToolCall(context, toolId, output, error);
+
+    // 发送 UPDATE 事件，通知前端工具执行完成状态
+    const update = this.createUpdate(messageId, 'block_update', {
+      blocks: [{
+        type: 'tool_call',
+        toolName: '',
+        toolId,
+        status: error ? 'failed' : 'completed',
+        output,
+        error,
+      }],
+    });
+    this.emit(MESSAGE_EVENTS.UPDATE, update);
   }
 
   protected completeToolCall(context: ParseContext, toolId: string, output?: string, error?: string): void {

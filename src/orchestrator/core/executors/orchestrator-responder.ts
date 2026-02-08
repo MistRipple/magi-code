@@ -34,6 +34,8 @@ export interface ResponderOptions {
   maxFailures?: number;
   /** 最大问题次数（超过则终止） */
   maxQuestions?: number;
+  /** Phase B+ 中间调用最小间隔（毫秒，默认 30000） */
+  minReportInterval?: number;
 }
 
 /**
@@ -46,6 +48,10 @@ interface ResponderState {
   questionCount: number;
   /** 历史汇报 */
   reportHistory: WorkerReport[];
+  /** 每个 Worker 上次触发 LLM 调用的时间 */
+  lastLLMCallTimestamps: Map<string, number>;
+  /** 频率限制导致的排队汇报 */
+  pendingReports: WorkerReport[];
 }
 
 /**
@@ -56,7 +62,11 @@ export class OrchestratorResponder {
     failureCount: 0,
     questionCount: 0,
     reportHistory: [],
+    lastLLMCallTimestamps: new Map(),
+    pendingReports: [],
   };
+  /** Phase B+ 中间调用最小间隔（毫秒） */
+  private readonly minReportInterval: number;
 
   constructor(
     private adapterFactory: IAdapterFactory,
@@ -67,12 +77,18 @@ export class OrchestratorResponder {
       useLLM: true,
       maxFailures: 3,
       maxQuestions: 5,
+      minReportInterval: 30_000,
       ...options,
     };
+    this.minReportInterval = this.options.minReportInterval!;
   }
 
   /**
    * 处理 Worker 汇报并生成响应
+   *
+   * 频率限制策略：
+   * - progress 类型：受频率限制，距上次 LLM 调用 < minReportInterval 时排队
+   * - question / failed / completed：紧急类型，始终立即处理
    */
   async handleReport(report: WorkerReport): Promise<OrchestratorResponse> {
     this.state.reportHistory.push(report);
@@ -88,6 +104,15 @@ export class OrchestratorResponder {
 
     switch (report.type) {
       case 'progress':
+        // 频率限制：进度汇报受节流控制
+        if (this.shouldThrottle(report.workerId)) {
+          this.state.pendingReports.push(report);
+          logger.debug('Phase B+ 频率限制：进度汇报已排队', {
+            workerId: report.workerId,
+            pendingCount: this.state.pendingReports.length,
+          }, LogCategory.ORCHESTRATOR);
+          return createContinueResponse();
+        }
         return this.handleProgress(report);
       case 'question':
         return this.handleQuestion(report);
@@ -101,16 +126,16 @@ export class OrchestratorResponder {
   }
 
   /**
-   * 处理进度汇报
+   * 处理进度汇报（通过频率限制后）
    */
   private async handleProgress(report: WorkerReport): Promise<OrchestratorResponse> {
-    // 进度汇报通常直接继续
-    // 可以在这里添加动态调整逻辑（如发现偏离目标）
+    this.recordLLMCall(report.workerId);
+    // 进度汇报通常直接继续，可在此添加动态调整逻辑（如偏离目标检测）
     return createContinueResponse();
   }
 
   /**
-   * 处理问题汇报
+   * 处理问题汇报（紧急类型，不受频率限制）
    */
   private async handleQuestion(report: WorkerReport): Promise<OrchestratorResponse> {
     this.state.questionCount++;
@@ -127,6 +152,7 @@ export class OrchestratorResponder {
     // 使用 LLM 回答问题
     if (this.options.useLLM) {
       try {
+        this.recordLLMCall(report.workerId);
         const answer = await this.generateAnswer(report);
         return createAnswerResponse(answer);
       } catch (error) {
@@ -139,14 +165,15 @@ export class OrchestratorResponder {
   }
 
   /**
-   * 处理完成汇报
+   * 处理完成汇报（紧急类型）
    */
   private async handleCompleted(report: WorkerReport): Promise<OrchestratorResponse> {
+    this.recordLLMCall(report.workerId);
     return createContinueResponse();
   }
 
   /**
-   * 处理失败汇报
+   * 处理失败汇报（紧急类型）
    */
   private async handleFailed(report: WorkerReport): Promise<OrchestratorResponse> {
     this.state.failureCount++;
@@ -155,8 +182,74 @@ export class OrchestratorResponder {
       return createAbortResponse(`累计失败 ${this.state.failureCount} 次，终止执行`);
     }
 
-    // 可以在这里添加重试逻辑
+    this.recordLLMCall(report.workerId);
     return createContinueResponse();
+  }
+
+  // ============================================================================
+  // Phase B+ 频率限制
+  // ============================================================================
+
+  /**
+   * 判断指定 Worker 是否应被节流
+   */
+  private shouldThrottle(workerId: string): boolean {
+    const lastCall = this.state.lastLLMCallTimestamps.get(workerId);
+    if (!lastCall) return false;
+    return (Date.now() - lastCall) < this.minReportInterval;
+  }
+
+  /**
+   * 记录 LLM 调用时间戳
+   */
+  private recordLLMCall(workerId: string): void {
+    this.state.lastLLMCallTimestamps.set(workerId, Date.now());
+  }
+
+  /**
+   * 处理排队中的汇报（由外部定时器或事件触发）
+   *
+   * 合并同一 Worker 的多个 progress 汇报为一个，避免 LLM 调用风暴。
+   * 返回实际处理的汇报数量。
+   */
+  async processPendingReports(): Promise<number> {
+    if (this.state.pendingReports.length === 0) return 0;
+
+    // 按 workerId 分组，每个 Worker 只保留最新的一条
+    const latestByWorker = new Map<string, WorkerReport>();
+    for (const report of this.state.pendingReports) {
+      latestByWorker.set(report.workerId, report);
+    }
+
+    // 清空排队
+    this.state.pendingReports = [];
+
+    let processedCount = 0;
+    for (const [workerId, report] of latestByWorker) {
+      if (!this.shouldThrottle(workerId)) {
+        await this.handleProgress(report);
+        processedCount++;
+      } else {
+        // 仍在冷却期，重新入队
+        this.state.pendingReports.push(report);
+      }
+    }
+
+    if (processedCount > 0) {
+      logger.debug('Phase B+ 处理排队汇报', {
+        processed: processedCount,
+        remaining: this.state.pendingReports.length,
+      }, LogCategory.ORCHESTRATOR);
+    }
+
+    return processedCount;
+  }
+
+  /**
+   * 获取排队汇报数量
+   */
+  getPendingCount(): number {
+    return this.state.pendingReports.length;
   }
 
   /**
@@ -228,6 +321,8 @@ ${question.questionType}
       failureCount: 0,
       questionCount: 0,
       reportHistory: [],
+      lastLLMCallTimestamps: new Map(),
+      pendingReports: [],
     };
   }
 }

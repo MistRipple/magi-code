@@ -41,7 +41,7 @@ import {
 import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, Edit, ModelStatusMap } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
 import { MessageType, MessageCategory } from '../../../../protocol/message-protocol';
-import { routeStandardMessage, getMessageTarget, clearMessageTargets, clearMessageTarget } from './message-router';
+import { routeStandardMessage, getMessageTarget, clearMessageTargets, clearMessageTarget, setMessageTarget } from './message-router';
 import { normalizeWorkerSlot } from './message-classifier';
 import { ensureArray } from './utils';
 
@@ -89,11 +89,103 @@ export function initMessageHandler() {
   console.log('[MessageHandler] 消息处理器已初始化');
 }
 
+let lastAppliedEventSeq = 0;
+const processedEventKeys = new Set<string>();
+const processedEventKeyQueue: string[] = [];
+const MAX_TRACKED_EVENT_KEYS = 4000;
+
+function resetEventSeqTracking(): void {
+  lastAppliedEventSeq = 0;
+  processedEventKeys.clear();
+  processedEventKeyQueue.length = 0;
+}
+
+function rememberProcessedEventKey(eventKey: string): void {
+  if (processedEventKeys.has(eventKey)) {
+    return;
+  }
+  processedEventKeys.add(eventKey);
+  processedEventKeyQueue.push(eventKey);
+  if (processedEventKeyQueue.length > MAX_TRACKED_EVENT_KEYS) {
+    const oldest = processedEventKeyQueue.shift();
+    if (oldest) {
+      processedEventKeys.delete(oldest);
+    }
+  }
+}
+
+function resolveEventSeqAndKey(message: WebviewMessage): { eventSeq?: number; eventKey?: string } {
+  if (message.type === 'unifiedUpdate') {
+    const update = message.update as StreamUpdate | undefined;
+    const seq = update?.eventSeq;
+    if (typeof seq !== 'number' || !Number.isFinite(seq)) {
+      return {};
+    }
+    const eventId = typeof update?.eventId === 'string' && update.eventId.trim()
+      ? update.eventId.trim()
+      : `upd:${update?.messageId || 'unknown'}:${update?.updateType || 'unknown'}:${update?.cardStreamSeq || 0}:${seq}`;
+    return { eventSeq: seq, eventKey: `unifiedUpdate:${eventId}:${seq}` };
+  }
+  if (message.type === 'unifiedMessage' || message.type === 'unifiedComplete') {
+    const standard = message.message as StandardMessage | undefined;
+    const seq = standard?.eventSeq;
+    if (typeof seq !== 'number' || !Number.isFinite(seq)) {
+      return {};
+    }
+    const eventId = typeof standard?.eventId === 'string' && standard.eventId.trim()
+      ? standard.eventId.trim()
+      : `msg:${standard?.id || 'unknown'}:${standard?.lifecycle || 'unknown'}:${standard?.category || 'unknown'}:${seq}`;
+    return { eventSeq: seq, eventKey: `${message.type}:${eventId}:${seq}` };
+  }
+  return {};
+}
+
+function shouldProcessByEventSeq(message: WebviewMessage): boolean {
+  const { eventSeq, eventKey } = resolveEventSeqAndKey(message);
+  if (eventSeq === undefined) {
+    return true;
+  }
+  if (eventKey && processedEventKeys.has(eventKey)) {
+    console.warn('[MessageHandler] 忽略重复事件', {
+      eventSeq,
+      eventKey,
+      type: message.type,
+    });
+    return false;
+  }
+  // 多通道并发时事件到达顺序与 eventSeq 可能存在短暂交错，
+  // 不丢弃逆序事件。真正去重由 eventKey 与 cardStreamSeq 负责。
+  if (eventSeq < lastAppliedEventSeq) {
+    console.warn('[MessageHandler] 检测到事件逆序到达，继续处理', {
+      eventSeq,
+      lastAppliedEventSeq,
+      type: message.type,
+    });
+  }
+  if (eventSeq > lastAppliedEventSeq + 1 && lastAppliedEventSeq > 0) {
+    console.warn('[MessageHandler] 检测到事件序号跳跃', {
+      eventSeq,
+      lastAppliedEventSeq,
+      gap: eventSeq - lastAppliedEventSeq,
+      type: message.type,
+    });
+  }
+  lastAppliedEventSeq = Math.max(lastAppliedEventSeq, eventSeq);
+  if (eventKey) {
+    rememberProcessedEventKey(eventKey);
+  }
+  return true;
+}
+
 /**
  * 处理来自扩展的消息
  */
 function handleMessage(message: WebviewMessage) {
   const { type } = message;
+
+  if (!shouldProcessByEventSeq(message)) {
+    return;
+  }
 
   switch (type) {
     case 'unifiedMessage':
@@ -268,23 +360,33 @@ function handleStateUpdate(message: WebviewMessage) {
       editSeen.add(change.filePath);
       return true;
     })
-    .map((change) => ({
-      filePath: change.filePath,
-      type: change.type,
-      additions: change.additions,
-      deletions: change.deletions,
-      contributors: change.contributors,
-      workerId: change.workerId,
-    }));
+    .map((change) => {
+      // 推断变更类型：后端 PendingChange 不含 type，根据增删行数推断
+      let inferredType = change.type;
+      if (!inferredType) {
+        const adds = change.additions ?? 0;
+        const dels = change.deletions ?? 0;
+        if (adds > 0 && dels === 0) inferredType = 'add';
+        else if (adds === 0 && dels > 0) inferredType = 'delete';
+        else inferredType = 'modify';
+      }
+      return {
+        filePath: change.filePath,
+        type: inferredType,
+        additions: change.additions,
+        deletions: change.deletions,
+        contributors: change.contributors,
+        workerId: change.workerId,
+      };
+    });
   if (Array.isArray((state as any).workerStatuses)) {
     const statusMap: ModelStatusMap = {};
     for (const status of (state as any).workerStatuses) {
       if (!status?.worker) continue;
       const worker = status.worker;
       const currentStatus = store.modelStatus[worker]?.status;
-      // 🔧 修复：只有当前状态为 'checking'（初始状态）时才使用 workerStatuses 更新
-      // workerStatusUpdate 通过真实 LLM 连接测试得出，比 adapter.isConnected() 更准确
-      // 避免 stateUpdate 中的 available: false 覆盖已经检测到的可用状态
+      // 只有初始状态 'checking' 时才使用 workerStatuses 更新，
+      // 避免覆盖 workerStatusUpdate 通过真实连接测试得出的结果
       if (currentStatus === 'checking') {
         statusMap[worker] = {
           status: status.available ? 'available' : 'unavailable',
@@ -337,11 +439,233 @@ function handleUnifiedMessage(message: WebviewMessage) {
 
 // ===== 流式更新缓冲：防止 update 先于 message 到达导致更新丢失 =====
 const pendingStreamUpdates = new Map<string, StreamUpdate[]>();
+const pendingStreamUpdateWarnings = new Set<string>();
+const pendingStreamUpdateTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const STREAM_UPDATE_BUFFER_TIMEOUT = 30000; // 30 秒超时自动清理
+// ===== complete 缓冲：防止 complete 先于 message 到达导致卡片不收口 =====
+const pendingCompletes = new Map<string, { message: WebviewMessage; retryCount: number; timerId: ReturnType<typeof setTimeout> }>();
+const MAX_COMPLETE_RETRIES = 3;
+const COMPLETE_RETRY_INTERVAL = 1000;
+const WORKER_SLOTS = ['claude', 'codex', 'gemini'] as const;
+type WorkerSlot = typeof WORKER_SLOTS[number];
+type ResolvedTarget = NonNullable<ReturnType<typeof getMessageTarget>>;
+
+function clearPendingStreamUpdateBuffer(): void {
+  pendingStreamUpdates.clear();
+  pendingStreamUpdateWarnings.clear();
+  for (const timerId of pendingStreamUpdateTimers.values()) {
+    clearTimeout(timerId);
+  }
+  pendingStreamUpdateTimers.clear();
+  for (const pending of pendingCompletes.values()) {
+    clearTimeout(pending.timerId);
+  }
+  pendingCompletes.clear();
+}
+
+function rebuildSessionMessageTargets(
+  threadMessages: Message[],
+  workerMessages: { claude: Message[]; codex: Message[]; gemini: Message[] }
+): void {
+  const workerByMessageId = new Map<string, WorkerSlot>();
+  for (const worker of WORKER_SLOTS) {
+    for (const message of workerMessages[worker]) {
+      const existingWorker = workerByMessageId.get(message.id);
+      if (existingWorker && existingWorker !== worker) {
+        throw new Error(`[MessageHandler] SessionMessagesLoaded worker 消息 id 冲突: ${message.id}`);
+      }
+      workerByMessageId.set(message.id, worker);
+    }
+  }
+
+  const threadMessageIds = new Set<string>();
+  for (const message of threadMessages) {
+    threadMessageIds.add(message.id);
+    const worker = workerByMessageId.get(message.id);
+    if (worker) {
+      setMessageTarget(message.id, { location: 'both', worker, reason: 'session-restored' });
+      continue;
+    }
+    setMessageTarget(message.id, { location: 'thread', reason: 'session-restored' });
+  }
+
+  for (const worker of WORKER_SLOTS) {
+    for (const message of workerMessages[worker]) {
+      if (threadMessageIds.has(message.id)) {
+        continue;
+      }
+      setMessageTarget(message.id, { location: 'worker', worker, reason: 'session-restored' });
+    }
+  }
+}
 
 function queueStreamUpdate(update: StreamUpdate): void {
   const list = pendingStreamUpdates.get(update.messageId) || [];
   list.push(update);
   pendingStreamUpdates.set(update.messageId, list);
+
+  // 超时自动清理：避免缓冲永久驻留
+  if (!pendingStreamUpdateTimers.has(update.messageId)) {
+    const timerId = setTimeout(() => {
+      const stale = pendingStreamUpdates.get(update.messageId);
+      if (stale) {
+        console.warn(`[MessageHandler] 流式缓冲超时清理: ${update.messageId} (${stale.length} 条更新)`);
+        pendingStreamUpdates.delete(update.messageId);
+        pendingStreamUpdateWarnings.delete(update.messageId);
+      }
+      pendingStreamUpdateTimers.delete(update.messageId);
+    }, STREAM_UPDATE_BUFFER_TIMEOUT);
+    pendingStreamUpdateTimers.set(update.messageId, timerId);
+  }
+}
+
+function hasRenderableUpdatePayload(update: StreamUpdate): boolean {
+  if (update.updateType === 'append') {
+    return Boolean(update.appendText && update.appendText.length > 0);
+  }
+  if (update.updateType === 'replace' || update.updateType === 'block_update') {
+    return Array.isArray(update.blocks) && update.blocks.length > 0;
+  }
+  return false;
+}
+
+function recoverTargetByMessageId(messageId: string): ResolvedTarget | null {
+  const state = getState();
+  const inThread = state.threadMessages.some((msg) => msg.id === messageId);
+  let workerHit: WorkerSlot | null = null;
+  for (const worker of WORKER_SLOTS) {
+    if (state.agentOutputs[worker].some((msg) => msg.id === messageId)) {
+      workerHit = worker;
+      break;
+    }
+  }
+  if (inThread && workerHit) {
+    const target = { location: 'both' as const, worker: workerHit, reason: 'stream-recover-by-id' };
+    setMessageTarget(messageId, target);
+    return target;
+  }
+  if (inThread) {
+    const target = { location: 'thread' as const, reason: 'stream-recover-by-id' };
+    setMessageTarget(messageId, target);
+    return target;
+  }
+  if (workerHit) {
+    const target = { location: 'worker' as const, worker: workerHit, reason: 'stream-recover-by-id' };
+    setMessageTarget(messageId, target);
+    return target;
+  }
+  return null;
+}
+
+function findLastMessageByCardId(messages: Message[], cardId: string): Message | undefined {
+  for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+    if (messages[idx]?.metadata?.cardId === cardId) {
+      return messages[idx];
+    }
+  }
+  return undefined;
+}
+
+function recoverTargetByCardId(cardId: string): { target: ResolvedTarget; messageId: string } | null {
+  if (!cardId.trim()) {
+    return null;
+  }
+  const state = getState();
+  const threadMessage = findLastMessageByCardId(state.threadMessages, cardId);
+  const workerMatches: Array<{ worker: WorkerSlot; message: Message }> = [];
+  for (const worker of WORKER_SLOTS) {
+    const message = findLastMessageByCardId(state.agentOutputs[worker], cardId);
+    if (message) {
+      workerMatches.push({ worker, message });
+    }
+  }
+
+  if (threadMessage && workerMatches.length > 0) {
+    const workerMatch = workerMatches[0];
+    const target = { location: 'both' as const, worker: workerMatch.worker, reason: 'stream-recover-by-cardId' };
+    return { target, messageId: threadMessage.id };
+  }
+  if (threadMessage) {
+    return {
+      target: { location: 'thread' as const, reason: 'stream-recover-by-cardId' },
+      messageId: threadMessage.id,
+    };
+  }
+  if (workerMatches.length > 0) {
+    return {
+      target: { location: 'worker' as const, worker: workerMatches[0].worker, reason: 'stream-recover-by-cardId' },
+      messageId: workerMatches[0].message.id,
+    };
+  }
+  return null;
+}
+
+function createRecoveryStreamingCard(update: StreamUpdate): ResolvedTarget {
+  const actor = getState().processingActor;
+  const actorSource = String(actor.source || '');
+  const worker = normalizeWorkerSlot(actorSource) || (actorSource === 'worker' ? normalizeWorkerSlot(actor.agent) : null);
+  const timestamp = typeof update.timestamp === 'number' ? update.timestamp : Date.now();
+  const fallbackTarget = worker
+    ? { location: 'worker' as const, worker, reason: 'stream-recover-create-card' }
+    : { location: 'thread' as const, reason: 'stream-recover-create-card' };
+  const syntheticMessage: Message = {
+    id: update.messageId,
+    role: 'assistant',
+    source: worker ?? 'orchestrator',
+    content: '',
+    blocks: [],
+    timestamp,
+    isStreaming: true,
+    isComplete: false,
+    type: 'text',
+    metadata: {
+      cardId: update.cardId || update.messageId,
+      cardStreamSeq: update.cardStreamSeq,
+      eventId: update.eventId,
+      eventSeq: update.eventSeq,
+      streamRecoveryCreated: true,
+    },
+  };
+
+  if (fallbackTarget.location === 'worker') {
+    addAgentMessage(fallbackTarget.worker, syntheticMessage);
+  } else {
+    addThreadMessage(syntheticMessage);
+  }
+  setMessageTarget(update.messageId, fallbackTarget);
+  return fallbackTarget;
+}
+
+function shouldIgnoreSealedUpdate(existing: Message, update: StreamUpdate): boolean {
+  const finalStreamSeq = typeof existing.metadata?.finalStreamSeq === 'number'
+    ? existing.metadata.finalStreamSeq
+    : undefined;
+  if (finalStreamSeq === undefined) {
+    return false;
+  }
+
+  const incomingStreamSeq = typeof update.cardStreamSeq === 'number'
+    ? update.cardStreamSeq
+    : undefined;
+  if (incomingStreamSeq === undefined) {
+    console.warn('[MessageHandler] 已封口卡片收到无序号更新，忽略', {
+      messageId: existing.id,
+      cardId: existing.metadata?.cardId,
+    });
+    return true;
+  }
+
+  if (incomingStreamSeq <= finalStreamSeq) {
+    return true;
+  }
+
+  console.warn('[MessageHandler] 已封口卡片收到晚到更新，已忽略（应由后端补遗）', {
+    messageId: existing.id,
+    cardId: existing.metadata?.cardId,
+    incomingStreamSeq,
+    finalStreamSeq,
+  });
+  return true;
 }
 
 function applyUpdateToLocation(location: ReturnType<typeof getMessageTarget>, update: StreamUpdate): boolean {
@@ -354,6 +678,9 @@ function applyUpdateToLocation(location: ReturnType<typeof getMessageTarget>, up
   if (location.location === 'thread') {
     const existing = getState().threadMessages.find(m => m.id === update.messageId);
     if (existing) {
+      if (shouldIgnoreSealedUpdate(existing, update)) {
+        return true;
+      }
       const streamUpdates = applyStreamUpdate(existing, update);
       let nextMessage: Message = { ...existing, ...streamUpdates };
       if (existing.metadata?.isPlaceholder && hasRenderableContent(nextMessage)) {
@@ -373,6 +700,9 @@ function applyUpdateToLocation(location: ReturnType<typeof getMessageTarget>, up
   } else if (location.location === 'worker') {
     const existing = getState().agentOutputs[location.worker].find(m => m.id === update.messageId);
     if (existing) {
+      if (shouldIgnoreSealedUpdate(existing, update)) {
+        return true;
+      }
       const streamUpdates = applyStreamUpdate(existing, update);
       updateAgentMessage(location.worker, update.messageId, { ...existing, ...streamUpdates });
       applied = true;
@@ -380,6 +710,9 @@ function applyUpdateToLocation(location: ReturnType<typeof getMessageTarget>, up
   } else if (location.location === 'both') {
     const threadExisting = getState().threadMessages.find(m => m.id === update.messageId);
     if (threadExisting) {
+      if (shouldIgnoreSealedUpdate(threadExisting, update)) {
+        return true;
+      }
       const streamUpdates = applyStreamUpdate(threadExisting, update);
       let nextMessage: Message = { ...threadExisting, ...streamUpdates };
       if (threadExisting.metadata?.isPlaceholder && hasRenderableContent(nextMessage)) {
@@ -398,6 +731,9 @@ function applyUpdateToLocation(location: ReturnType<typeof getMessageTarget>, up
     }
     const agentExisting = getState().agentOutputs[location.worker].find(m => m.id === update.messageId);
     if (agentExisting) {
+      if (shouldIgnoreSealedUpdate(agentExisting, update)) {
+        return true;
+      }
       const streamUpdates = applyStreamUpdate(agentExisting, update);
       updateAgentMessage(location.worker, update.messageId, { ...agentExisting, ...streamUpdates });
       applied = true;
@@ -426,6 +762,13 @@ function flushPendingStreamUpdates(messageId: string): void {
     pendingStreamUpdates.set(messageId, remaining);
   } else {
     pendingStreamUpdates.delete(messageId);
+    pendingStreamUpdateWarnings.delete(messageId);
+    // 缓冲已全部消费，清理对应的超时定时器
+    const timerId = pendingStreamUpdateTimers.get(messageId);
+    if (timerId) {
+      clearTimeout(timerId);
+      pendingStreamUpdateTimers.delete(messageId);
+    }
   }
 }
 
@@ -434,7 +777,6 @@ function handleContentMessage(standard: StandardMessage) {
   const meta = standard.metadata as Record<string, unknown> | undefined;
   const requestId = meta?.requestId as string | undefined;
   const isPlaceholder = Boolean(meta?.isPlaceholder);
-  // 方案 B：使用 MessageType.USER_INPUT 判断用户消息
   const isUserMessage = standard.type === MessageType.USER_INPUT;
 
   const upsertThreadMessage = (message: Message) => {
@@ -456,7 +798,7 @@ function handleContentMessage(standard: StandardMessage) {
     }
     const binding = getRequestBinding(requestId);
 
-    // 🔧 创建 60 秒超时定时器（首 token 超时保护）
+    // 创建 60 秒超时定时器（首 token 超时保护）
     const timeoutId = setTimeout(() => {
       const currentBinding = getRequestBinding(requestId);
       // 只有在没有收到真实消息时才触发超时
@@ -490,15 +832,12 @@ function handleContentMessage(standard: StandardMessage) {
       updateRequestBinding(requestId, { placeholderMessageId: standard.id, userMessageId, timeoutId });
     }
     addPendingRequest(requestId);
-    // 🔧 立即渲染占位消息：与真实消息保持一致的卡片结构，仅显示底部三点动画
-    // 提供“发送即响应”的体验，避免等待首 token 才出现卡片
     upsertThreadMessage(uiMessage);
-    // 🔧 为占位消息建立路由，确保流式更新可以命中同一条消息
     routeStandardMessage(standard);
     if (uiMessage.isStreaming) {
       markMessageActive(uiMessage.id);
     }
-    // 🔧 回放可能提前到达的流式更新
+    // 回放可能提前到达的流式更新
     flushPendingStreamUpdates(standard.id);
     return;
   }
@@ -519,14 +858,10 @@ function handleContentMessage(standard: StandardMessage) {
       }
     }
     upsertThreadMessage(uiMessage);
-    // 🔧 注册用户消息的路由，确保后续 Complete 消息能找到目标
+    // 注册用户消息的路由
     routeStandardMessage(standard);
     return;
   }
-
-  // 🔧 根据 message-flow-design.md 设计方案：
-  // 移除 hasRenderableContent 过滤逻辑，空内容消息由 L6 渲染层决定如何展示（显示加载态）
-  // 不再在 L5 路由层过滤空内容消息
 
   // === 检查是否有对应的占位消息需要替换 ===
   if (requestId) {
@@ -534,88 +869,95 @@ function handleContentMessage(standard: StandardMessage) {
 
     if (binding && !binding.realMessageId) {
       // 首次收到真实消息，需要原地替换占位消息
-      // 🔧 清除超时定时器（已收到真实消息）
+      // 清除超时定时器（已收到真实消息）
       if (binding.timeoutId) {
         clearTimeout(binding.timeoutId);
       }
       const placeholderId = binding.placeholderMessageId;
       const existingPlaceholder = getState().threadMessages.find(m => m.id === placeholderId);
       if (!existingPlaceholder) {
-        throw new Error(`[MessageHandler] 未找到占位消息: ${placeholderId}`);
-      }
+        console.warn('[MessageHandler] 占位消息不存在，改为按真实消息接入主链路', {
+          requestId,
+          placeholderId,
+          incomingMessageId: standard.id,
+        });
+        if (placeholderId !== standard.id) {
+          clearMessageTarget(placeholderId);
+        }
+        updateRequestBinding(requestId, { realMessageId: standard.id, placeholderMessageId: standard.id, timeoutId: undefined });
+      } else {
+        if (placeholderId !== standard.id) {
+          // ID 不匹配时执行原地替换
+          // 后端可能生成了新的 ID 而未复用占位 ID
+          console.warn(`[MessageHandler] 响应 ID 变更，执行原地替换: ${placeholderId} -> ${standard.id}`);
 
-      if (placeholderId !== standard.id) {
-        // 🔧 修复：ID 不匹配时不再报错，而是执行原地替换
-        // 后端可能生成了新的 ID 而未复用占位 ID，这是允许的
-        console.warn(`[MessageHandler] 响应 ID 变更，执行原地替换: ${placeholderId} -> ${standard.id}`);
+          // 1. 更新绑定关系指向新 ID
+          updateRequestBinding(requestId, { realMessageId: standard.id, placeholderMessageId: standard.id });
 
-        // 1. 更新绑定关系指向新 ID
+          // 2. 构造新消息对象
+          const newMessage: import('../types/message').Message = {
+            ...uiMessage,
+            metadata: {
+              ...(uiMessage.metadata || {}),
+              requestId, // 保持请求关联
+              isPlaceholder: false,
+              wasPlaceholder: true,
+            },
+          };
+
+          // 3. 在 UI 中原地替换（保持滚动位置和顺序）
+          replaceThreadMessage(placeholderId, newMessage);
+
+          // 4. 真实消息 ID 与占位 ID 不一致时，必须重建路由
+          // 否则 unifiedUpdate/unifiedComplete 会因找不到 messageId 对应目标而被暂存/忽略
+          clearMessageTarget(placeholderId);
+          routeStandardMessage(standard);
+
+          // 5. 标记活跃并回放缓冲
+          if (newMessage.isStreaming) {
+            markMessageActive(newMessage.id);
+          }
+          flushPendingStreamUpdates(standard.id);
+
+          return;
+        }
+
+        // 占位消息即真实消息，直接在同一条消息上更新
         updateRequestBinding(requestId, { realMessageId: standard.id, placeholderMessageId: standard.id });
-
-        // 2. 构造新消息对象
-        const newMessage: import('../types/message').Message = {
+        const mergedMessage: import('../types/message').Message = {
+          ...existingPlaceholder,
           ...uiMessage,
           metadata: {
+            ...(existingPlaceholder.metadata || {}),
             ...(uiMessage.metadata || {}),
-            requestId, // 保持请求关联
             isPlaceholder: false,
             wasPlaceholder: true,
+            placeholderState: undefined,
+            requestId,
           },
         };
+        updateThreadMessage(placeholderId, mergedMessage);
 
-        // 3. 在 UI 中原地替换（保持滚动位置和顺序）
-        replaceThreadMessage(placeholderId, newMessage);
-
-        // 4. 修复根因：真实消息 ID 与占位 ID 不一致时，必须重建路由
-        // 否则 unifiedUpdate/unifiedComplete 会因找不到 messageId 对应目标而被暂存/忽略
-        clearMessageTarget(placeholderId);
-        routeStandardMessage(standard);
-
-        // 5. 标记活跃并回放缓冲
-        if (newMessage.isStreaming) {
-          markMessageActive(newMessage.id);
+        // 标记为活跃消息
+        if (uiMessage.isStreaming) {
+          markMessageActive(placeholderId);
         }
+
+        // 可能存在提前到达的流式更新，立即补齐
         flushPendingStreamUpdates(standard.id);
 
         return;
       }
-
-      // 🔧 根据 message-flow-design.md 设计方案：
-      // 移除 hasRenderableContent 过滤逻辑，空内容消息由 L6 渲染层决定如何展示
-
-      // 🔧 统一消息 ID：占位消息即真实消息，直接在同一条消息上更新
-      updateRequestBinding(requestId, { realMessageId: standard.id, placeholderMessageId: standard.id });
-      const mergedMessage: import('../types/message').Message = {
-        ...existingPlaceholder,
-        ...uiMessage,
-        metadata: {
-          ...(existingPlaceholder.metadata || {}),
-          ...(uiMessage.metadata || {}),
-          isPlaceholder: false,
-          wasPlaceholder: true,
-          placeholderState: undefined,
-          requestId,
-        },
-      };
-      updateThreadMessage(placeholderId, mergedMessage);
-
-      // 标记为活跃消息
-      if (uiMessage.isStreaming) {
-        markMessageActive(placeholderId);
-      }
-
-      // 可能存在提前到达的流式更新，立即补齐
-      flushPendingStreamUpdates(standard.id);
-
-      return;
     }
   }
 
   // === 后续消息处理（非首次或无占位消息关联） ===
   let target = routeStandardMessage(standard);
 
-  // 🔧 强校验：主对话区 (Thread) 禁止 Worker 直接写入（除了重要消息）
-  // 例外情况：ERROR 和 INTERACTION 类型允许 Worker 写入主对话区，确保用户能看到
+  // L5 路由层安全拦截：routing-table 已将 WORKER_* 类别路由到 worker，
+  // 此检查作为防御性补充——当分类器未能识别 Worker 消息类别时，
+  // 根据 source 字段拦截并重定向，防止 Worker 内容意外写入主对话区。
+  // 例外：ERROR 和 INTERACTION 类型允许 Worker 写入主对话区，确保用户可见。
   if (target.location === 'thread' && standard.source === 'worker') {
     const allowedInThread = [MessageType.ERROR, MessageType.INTERACTION].includes(standard.type as MessageType);
     if (!allowedInThread) {
@@ -629,7 +971,7 @@ function handleContentMessage(standard: StandardMessage) {
     return;
   }
 
-  // 🔧 修复：流式消息需要标记为活跃，驱动 isProcessing 状态
+  // 流式消息标记为活跃，驱动 isProcessing 状态
   if (uiMessage.isStreaming) {
     markMessageActive(uiMessage.id);
   }
@@ -670,7 +1012,7 @@ function handleContentMessage(standard: StandardMessage) {
       }
     }
 
-    // 🔧 可能存在提前到达的流式更新，立即补齐
+    // 可能存在提前到达的流式更新，立即补齐
     flushPendingStreamUpdates(standard.id);
 }
 
@@ -680,21 +1022,50 @@ function handleStandardUpdate(message: WebviewMessage) {
   if (!rawUpdate?.messageId || !rawUpdate.messageId.trim()) {
     throw new Error('[MessageHandler] 流式更新缺少 messageId');
   }
-  const update = rawUpdate;
+  let update = rawUpdate;
 
   // 查找路由
-  const location = getMessageTarget(update.messageId);
+  let location = getMessageTarget(update.messageId);
 
   if (!location) {
-    console.warn(`[MessageHandler] 未找到流式更新的路由，暂存更新: ${update.messageId}`);
+    location = recoverTargetByMessageId(update.messageId);
+  }
+
+  if (!location && update.cardId) {
+    const recovered = recoverTargetByCardId(update.cardId);
+    if (recovered) {
+      location = recovered.target;
+      setMessageTarget(update.messageId, recovered.target);
+      if (recovered.messageId !== update.messageId) {
+        update = { ...update, messageId: recovered.messageId };
+      }
+    }
+  }
+
+  if (!location && hasRenderableUpdatePayload(update)) {
+    location = createRecoveryStreamingCard(update);
+  }
+
+  if (!location) {
+    if (!pendingStreamUpdateWarnings.has(update.messageId)) {
+      console.warn(`[MessageHandler] 未找到流式更新路由，已暂存并等待主消息: ${update.messageId}`);
+      pendingStreamUpdateWarnings.add(update.messageId);
+    }
     queueStreamUpdate(update);
     return;
   }
 
+  pendingStreamUpdateWarnings.delete(update.messageId);
   const applied = applyUpdateToLocation(location, update);
   if (!applied) {
+    if (!pendingStreamUpdateWarnings.has(update.messageId)) {
+      console.warn(`[MessageHandler] 流式更新路由已命中但目标未就绪，继续暂存: ${update.messageId}`);
+      pendingStreamUpdateWarnings.add(update.messageId);
+    }
     queueStreamUpdate(update);
+    return;
   }
+  pendingStreamUpdateWarnings.delete(update.messageId);
 }
 
 function handleStandardComplete(message: WebviewMessage) {
@@ -704,18 +1075,41 @@ function handleStandardComplete(message: WebviewMessage) {
   }
   const standard = assertStandardMessageId(rawStandard);
 
-  // 🔧 根治：只处理 CONTENT 类别的消息，其他类别直接跳过
-  // DATA/CONTROL/NOTIFY 消息不应该进入对话列表
+  // 只处理 CONTENT 类别的消息，其他类别不参与卡片渲染
   if (standard.category !== MessageCategory.CONTENT) {
+    console.debug('[MessageHandler] 跳过非 CONTENT 类别的 complete 消息:', standard.category, standard.id);
     return;
   }
 
   const requestId = (standard.metadata as Record<string, unknown> | undefined)?.requestId as string | undefined;
   const actualMessageId = standard.id;
-  const location = getMessageTarget(actualMessageId);
+
+  // 清除该消息的暂存重试（如果是重试触发的调用）
+  const pendingEntry = pendingCompletes.get(actualMessageId);
+  if (pendingEntry) {
+    clearTimeout(pendingEntry.timerId);
+    pendingCompletes.delete(actualMessageId);
+  }
+
+  // 路由查找：先查缓存，缺失时尝试恢复（与 handleStandardUpdate 一致的策略）
+  let location = getMessageTarget(actualMessageId);
   if (!location) {
-    // 🔧 容错处理：如果找不到路由（可能是用户消息或已被清理），记录警告并忽略
-    console.warn(`[MessageHandler] 完成消息缺少路由，忽略: ${standard.id}`);
+    location = recoverTargetByMessageId(actualMessageId);
+  }
+  if (!location) {
+    // 路由恢复失败，暂存并延迟重试
+    const retryCount = pendingEntry ? pendingEntry.retryCount + 1 : 0;
+    if (retryCount < MAX_COMPLETE_RETRIES) {
+      const timerId = setTimeout(() => {
+        handleStandardComplete(message);
+      }, COMPLETE_RETRY_INTERVAL);
+      pendingCompletes.set(actualMessageId, { message, retryCount, timerId });
+      console.warn(`[MessageHandler] 完成消息缺少路由，暂存等待重试 (${retryCount + 1}/${MAX_COMPLETE_RETRIES}): ${standard.id}`);
+    } else {
+      console.warn(`[MessageHandler] 完成消息路由恢复失败，已达最大重试次数，放弃: ${standard.id}`);
+      // 即使路由找不到，也标记完成以清理活跃状态
+      markMessageComplete(actualMessageId);
+    }
     return;
   }
 
@@ -723,7 +1117,7 @@ function handleStandardComplete(message: WebviewMessage) {
     return;
   }
 
-  // 🔧 修复：先检查消息是否存在，使用 actualMessageId
+  // 先检查消息是否存在
   // complete 消息是用来"完成"已有消息的
   let messageExists = false;
   if (location.location === 'thread') {
@@ -736,13 +1130,21 @@ function handleStandardComplete(message: WebviewMessage) {
   }
 
   if (!messageExists) {
-    // 🔧 修复：如果消息不存在，说明 STARTED 消息可能未被处理
-    // 改为警告并忽略，而不是抛出异常阻塞消息处理
-    console.warn(`[MessageHandler] 完成消息未找到对应卡片，忽略: ${actualMessageId}`);
+    // 消息实体不存在，使用与路由缺失相同的重试策略
+    const retryCount = pendingEntry ? pendingEntry.retryCount + 1 : 0;
+    if (retryCount < MAX_COMPLETE_RETRIES) {
+      const timerId = setTimeout(() => {
+        handleStandardComplete(message);
+      }, COMPLETE_RETRY_INTERVAL);
+      pendingCompletes.set(actualMessageId, { message, retryCount, timerId });
+      console.warn(`[MessageHandler] 完成消息未找到对应卡片，暂存等待重试 (${retryCount + 1}/${MAX_COMPLETE_RETRIES}): ${actualMessageId}`);
+    } else {
+      console.warn(`[MessageHandler] 完成消息对应卡片始终不存在，放弃: ${actualMessageId}`);
+      markMessageComplete(actualMessageId);
+    }
     return;
   }
 
-  // 🔧 修复：消息完成时标记为非活跃，驱动 isProcessing 状态
   markMessageComplete(actualMessageId);
 
   const uiMessage = mapStandardMessage(standard);
@@ -764,7 +1166,10 @@ function handleStandardComplete(message: WebviewMessage) {
   };
 
   const existingMessage = getExistingMessage();
-  const baseMessage = hasContent ? uiMessage : (existingMessage || uiMessage);
+  // 优先保留流式累积的内容，避免 COMPLETE 的结构化 blocks 替换导致 DOM 重构闪烁
+  const baseMessage = existingMessage && hasRenderableContent(existingMessage)
+    ? existingMessage
+    : (hasContent ? uiMessage : (existingMessage || uiMessage));
   if (!baseMessage) {
     clearMessageTarget(actualMessageId);
     return;
@@ -781,6 +1186,7 @@ function handleStandardComplete(message: WebviewMessage) {
     isComplete: true,
     metadata: {
       ...(baseMessage.metadata || {}),
+      ...(uiMessage.metadata || {}),
       justCompleted: true,
       ...(shouldConvertFromPlaceholder
         ? {
@@ -802,12 +1208,11 @@ function handleStandardComplete(message: WebviewMessage) {
     updateAgentMessage(location.worker, actualMessageId, completedMessage);
   }
 
-  // 🔧 补齐可能提前到达的流式更新
+  // 补齐可能提前到达的流式更新
   flushPendingStreamUpdates(actualMessageId);
 
   // 清理请求绑定
   if (requestId) {
-    // 🔧 确保清除超时计时器（防止完成后仍触发超时提示）
     const binding = getRequestBinding(requestId);
     if (binding?.timeoutId) {
       clearTimeout(binding.timeoutId);
@@ -835,12 +1240,13 @@ function handleStandardComplete(message: WebviewMessage) {
     }
   }, 500);
 
-  clearMessageTarget(actualMessageId);
+  // 不立即清除 messageTarget：同一 requestId 下可能有后续流式轮次（tool calling round）
+  // messageTarget 会在 clearMessageTargets()（新会话/重置时）或 requestBinding 清理时被清除
 }
 
 
 /**
- * 🔧 统一消息通道：处理控制消息
+ * 处理控制消息
  *
  * 控制消息通过 MessageHub.sendControl() 发送，包含 controlType 和 payload
  */
@@ -868,9 +1274,7 @@ function handleUnifiedControlMessage(standard: StandardMessage) {
       break;
 
     case 'task_accepted': {
-      // 🔧 防御性检查：只有当 backendProcessing 已为 true 时才清除 pending
-      // 正常时序：processingStateChanged:true → backendProcessing=true → task_accepted → 清除 pending
-      // 如果 backendProcessing 仍为 false，说明时序异常，先设置处理状态
+      // 防御性检查：backendProcessing 仍为 false 时先设置处理状态
       const requestId = payload?.requestId as string | undefined;
       if (requestId) {
         if (!getBackendProcessing()) {
@@ -1132,6 +1536,8 @@ function handleSessionChanged(message: WebviewMessage) {
       clearAllMessages();
       clearMessageTargets();
       clearAllRequestBindings();
+      clearPendingStreamUpdateBuffer();
+      resetEventSeqTracking();
     }
 
     setCurrentSessionId(newSessionId);
@@ -1148,6 +1554,9 @@ function handleSessionMessagesLoaded(message: WebviewMessage) {
     // 先清空当前消息
     clearAllMessages();
     clearMessageTargets();
+    clearAllRequestBindings();
+    clearPendingStreamUpdateBuffer();
+    resetEventSeqTracking();
     setCurrentSessionId(sessionId);
 
     // 格式化消息的辅助函数
@@ -1167,14 +1576,12 @@ function handleSessionMessagesLoaded(message: WebviewMessage) {
         throw new Error('[MessageHandler] SessionMessagesLoaded 消息 timestamp 无效');
       }
 
-      // 方案 B：根据 role 或已有 type 字段映射 MessageType
-      // 优先使用已有 type 字段，统一处理消息格式
+      // 优先使用已有 type 字段，否则根据 role 映射
       let resolvedType: import('../types/message').MessageType;
       if (m.type && typeof m.type === 'string') {
-        // 新格式：直接使用已有 type
         resolvedType = m.type as import('../types/message').MessageType;
       } else {
-        // 旧格式：根据 role 映射
+        // role 回退映射
         switch (role) {
           case 'user':
             resolvedType = 'user_input';
@@ -1193,9 +1600,10 @@ function handleSessionMessagesLoaded(message: WebviewMessage) {
         content: m.content,
         source: m.source || 'orchestrator',
         timestamp: m.timestamp,
-        isStreaming: false,
-        isComplete: true,
+        isStreaming: Boolean(m?.isStreaming),
+        isComplete: typeof m?.isComplete === 'boolean' ? Boolean(m.isComplete) : !Boolean(m?.isStreaming),
         type: resolvedType,
+        noticeType: typeof m?.noticeType === 'string' ? m.noticeType : undefined,
         blocks: mapStandardBlocks(
           (Array.isArray(m.blocks) && m.blocks.length > 0)
             ? m.blocks
@@ -1204,23 +1612,24 @@ function handleSessionMessagesLoaded(message: WebviewMessage) {
                 content: m.content || '',
               }]
         ),
+        metadata: m?.metadata && typeof m.metadata === 'object'
+          ? { ...(m.metadata as Record<string, unknown>) }
+          : undefined,
       };
     };
 
-    // 加载主对话消息
-    if (messages && messages.length > 0) {
-      const formattedMessages: Message[] = normalizeRestoredMessages(messages.map(formatMessage));
-      setThreadMessages(formattedMessages);
-    }
+    const formattedThreadMessages: Message[] = normalizeRestoredMessages(
+      ensureArray(messages).map(formatMessage)
+    );
+    const formattedWorkerMessages = {
+      claude: normalizeRestoredMessages(ensureArray(workerMessages?.claude).map(formatMessage)),
+      codex: normalizeRestoredMessages(ensureArray(workerMessages?.codex).map(formatMessage)),
+      gemini: normalizeRestoredMessages(ensureArray(workerMessages?.gemini).map(formatMessage)),
+    };
 
-    // 加载 worker 消息
-    if (workerMessages) {
-      setAgentOutputs({
-        claude: normalizeRestoredMessages((workerMessages.claude || []).map(formatMessage)),
-        codex: normalizeRestoredMessages((workerMessages.codex || []).map(formatMessage)),
-        gemini: normalizeRestoredMessages((workerMessages.gemini || []).map(formatMessage)),
-      });
-    }
+    setThreadMessages(formattedThreadMessages);
+    setAgentOutputs(formattedWorkerMessages);
+    rebuildSessionMessageTargets(formattedThreadMessages, formattedWorkerMessages);
   }
 }
 
@@ -1581,10 +1990,8 @@ function mapStandardMessage(standard: StandardMessage): Message {
   const isSystemNotice = standard.type === MessageType.SYSTEM || standard.type === MessageType.ERROR;
   const isErrorNotice = standard.type === MessageType.ERROR;
 
-  // 🔧 修复：明确区分消息来源与展示来源
-  // - 标准消息的 source 只可能是 orchestrator/worker
-  // - UI 需要展示具体 Worker 槽位（claude/codex/gemini）
-  // - 只有 worker 消息才显示 Worker 徽章
+  // 区分消息来源与展示来源：
+  // 标准消息 source 为 orchestrator/worker，UI 展示具体 Worker 槽位
   const originSource = standard.source;
   const agentSlot = normalizeWorkerSlot(standard.agent);
   const metaSlot = normalizeWorkerSlot((standard.metadata as { worker?: unknown } | undefined)?.worker);
@@ -1592,9 +1999,12 @@ function mapStandardMessage(standard: StandardMessage): Message {
   const displaySource: Message['source'] =
     originSource === 'orchestrator'
       ? 'orchestrator'
-      : (resolvedWorker ?? 'orchestrator');
+      : (resolvedWorker ?? 'claude');
 
   const baseMetadata = { ...(standard.metadata || {}) } as Record<string, unknown>;
+  const cardId = typeof baseMetadata.cardId === 'string' && baseMetadata.cardId.trim()
+    ? baseMetadata.cardId.trim()
+    : standard.id;
 
   const dispatchToWorker = Boolean(baseMetadata.dispatchToWorker);
 
@@ -1602,8 +2012,7 @@ function mapStandardMessage(standard: StandardMessage): Message {
   const resolvedRole: 'user' | 'assistant' | 'system' =
     isSystemNotice ? 'system' : 'assistant';
 
-  // 方案 B：直接传递 MessageType，不做转换
-  // UI 层使用 type === 'user_input' 判断用户消息
+  // 直接传递 MessageType，UI 层使用 type === 'user_input' 判断用户消息
   const resolvedType = standard.type as import('../types/message').MessageType;
 
   return {
@@ -1619,6 +2028,9 @@ function mapStandardMessage(standard: StandardMessage): Message {
     noticeType: isSystemNotice ? (isErrorNotice ? 'error' : 'info') : undefined,
     metadata: {
       ...baseMetadata,
+      eventId: standard.eventId,
+      eventSeq: standard.eventSeq,
+      cardId,
       interaction: standard.interaction,
       worker: originSource === 'worker'
         ? (resolvedWorker ?? undefined)
@@ -1629,9 +2041,9 @@ function mapStandardMessage(standard: StandardMessage): Message {
 
 function hasRenderableContent(message: Message): boolean {
   if (message.type === 'system-notice') return true;
-  if (message.type === 'task_card') return true;  // 方案 B：使用 MessageType.TASK_CARD
-  if (message.type === 'instruction') return true;  // 方案 B：任务说明始终可渲染
-  if (message.type === 'thinking') return true;  // 思考过程始终可渲染
+  if (message.type === 'task_card') return true;
+  if (message.type === 'instruction') return true;
+  if (message.type === 'thinking') return true;
   if (message.content && message.content.trim()) return true;
   if (message.blocks && message.blocks.length > 0) {
     return message.blocks.some((block) => {
@@ -1703,6 +2115,7 @@ function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[] {
         const thinking: ThinkingBlock = {
           content: block.content || '',
           isComplete: true,
+          summary: (block as any).summary,
         };
         return {
           type: 'thinking',
@@ -1763,26 +2176,24 @@ function applyStreamUpdate(message: Message, update: StreamUpdate): Partial<Mess
   const updates: Partial<Message> = {};
   if (update.updateType === 'append' && update.appendText) {
     updates.content = (message.content || '') + update.appendText;
-    if (message.blocks && message.blocks.length > 0) {
-      const nextBlocks = [...message.blocks];
-      let lastTextIndex = -1;
-      for (let i = nextBlocks.length - 1; i >= 0; i--) {
-        if (nextBlocks[i].type === 'text') {
-          lastTextIndex = i;
-          break;
-        }
+    const nextBlocks = [...(message.blocks || [])];
+    let lastTextIndex = -1;
+    for (let i = nextBlocks.length - 1; i >= 0; i--) {
+      if (nextBlocks[i].type === 'text') {
+        lastTextIndex = i;
+        break;
       }
-      if (lastTextIndex >= 0) {
-        const current = nextBlocks[lastTextIndex];
-        nextBlocks[lastTextIndex] = {
-          ...current,
-          content: (current.content || '') + update.appendText,
-        };
-      } else {
-        nextBlocks.push({ type: 'text', content: update.appendText });
-      }
-        updates.blocks = nextBlocks;
-      }
+    }
+    if (lastTextIndex >= 0) {
+      const current = nextBlocks[lastTextIndex];
+      nextBlocks[lastTextIndex] = {
+        ...current,
+        content: (current.content || '') + update.appendText,
+      };
+    } else {
+      nextBlocks.push({ type: 'text', content: update.appendText });
+    }
+    updates.blocks = nextBlocks;
   } else if (update.updateType === 'replace') {
     if (update.blocks) {
       const blocks = mapStandardBlocks(update.blocks);
@@ -1799,6 +2210,16 @@ function applyStreamUpdate(message: Message, update: StreamUpdate): Partial<Mess
   } else if (update.updateType === 'lifecycle_change' && update.lifecycle) {
     updates.isStreaming = update.lifecycle === 'streaming' || update.lifecycle === 'started';
     updates.isComplete = update.lifecycle === 'completed';
+  }
+
+  if (update.cardId || typeof update.cardStreamSeq === 'number' || update.eventId || typeof update.eventSeq === 'number') {
+    updates.metadata = {
+      ...(message.metadata || {}),
+      ...(update.cardId ? { cardId: update.cardId } : {}),
+      ...(typeof update.cardStreamSeq === 'number' ? { cardStreamSeq: update.cardStreamSeq } : {}),
+      ...(update.eventId ? { eventId: update.eventId } : {}),
+      ...(typeof update.eventSeq === 'number' ? { eventSeq: update.eventSeq } : {}),
+    };
   }
   return updates;
 }
@@ -1826,7 +2247,6 @@ function mergeBlocks(existing: ContentBlock[], incoming: ContentBlock[]): Conten
       const idx = next.findIndex((b) => b.type === 'thinking');
       if (idx >= 0) {
         const prev = next[idx];
-        // 🔧 修复：确保 content 字段始终有值
         const prevThinking = prev.thinking || { content: '', isComplete: false };
         const blockThinking = block.thinking || { content: '', isComplete: false };
         const mergedThinking = {

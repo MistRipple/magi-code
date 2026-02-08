@@ -1718,6 +1718,7 @@ export class MissionOrchestrator extends EventEmitter {
       worker.on('todoCompleted', (data) => this.emit('todoCompleted', { ...data, missionId: this.currentMissionId }));
       worker.on('todoFailed', (data) => this.emit('todoFailed', { ...data, missionId: this.currentMissionId }));
       worker.on('dynamicTodoAdded', (data) => this.emit('dynamicTodoAdded', { ...data, missionId: this.currentMissionId }));
+      worker.on('insightGenerated', (data) => this.emit('insightGenerated', { ...data, missionId: this.currentMissionId }));
 
       logger.info('编排器.Worker.创建', { workerSlot }, LogCategory.ORCHESTRATOR);
     }
@@ -1927,6 +1928,13 @@ export class MissionOrchestrator extends EventEmitter {
    */
   getWorker(workerType: WorkerSlot): AutonomousWorker | undefined {
     return this.workers.get(workerType);
+  }
+
+  /**
+   * 确保 Worker 存在（公开接口，供 dispatch_task 使用）
+   */
+  async ensureWorkerForDispatch(workerSlot: WorkerSlot): Promise<AutonomousWorker> {
+    return this.ensureWorker(workerSlot);
   }
 
   /**

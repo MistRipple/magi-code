@@ -18,8 +18,18 @@ export class RemoveFilesExecutor implements ToolExecutor {
   private workspaceRoot: string;
   private deletedFiles: Map<string, string> = new Map(); // 用于恢复
 
+  /** 文件删除前回调（用于快照系统在删除前保存原始内容） */
+  private onBeforeWrite?: (filePath: string) => void;
+
   constructor(workspaceRoot: string) {
     this.workspaceRoot = workspaceRoot;
+  }
+
+  /**
+   * 设置文件删除前回调
+   */
+  setBeforeWriteCallback(callback: (filePath: string) => void): void {
+    this.onBeforeWrite = callback;
   }
 
   /**
@@ -113,6 +123,9 @@ IMPORTANT:
         // 备份文件内容（用于恢复）
         const content = await fs.readFile(resolved, 'utf-8');
         this.deletedFiles.set(resolved, content);
+
+        // 快照回调（在删除前通知快照系统保存原始内容）
+        this.onBeforeWrite?.(resolved);
 
         // 删除文件
         await fs.unlink(resolved);
