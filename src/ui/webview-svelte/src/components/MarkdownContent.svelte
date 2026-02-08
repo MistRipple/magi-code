@@ -221,9 +221,7 @@
   }
 
   .markdown-content :global(hr) {
-    border: none;
-    border-top: 1px solid var(--border);
-    margin: var(--spacing-md) 0;
+    display: none;
   }
 
   .markdown-content :global(img) {

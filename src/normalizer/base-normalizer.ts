@@ -266,6 +266,10 @@ export abstract class BaseNormalizer extends EventEmitter {
       blocks.push(toolCall);
     }
 
+    // 按语义顺序排序：thinking → text → plan → tool_call
+    const typeOrder: Record<string, number> = { thinking: 0, text: 1, plan: 2, tool_call: 3 };
+    blocks.sort((a, b) => (typeOrder[a.type] ?? 1) - (typeOrder[b.type] ?? 1));
+
     let messageType = MessageType.TEXT;
     if (error) {
       messageType = MessageType.ERROR;

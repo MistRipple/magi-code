@@ -99,8 +99,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   /**
    * 迭代式工具调用模式
    *
-   * 整个工具调用循环共享一个 streamId，确保 Worker Tab 中只呈现一条
-   * 包含完整推理过程（thinking → tool_call → tool_result → 最终回复）的消息。
+   * 每轮 LLM 调用使用独立 streamId，首轮绑定 placeholder，后续轮次生成新 messageId。
+   * 每张卡片包含当轮的 thinking + text + tool_call + tool_result。
    */
   private async sendMessageInternal(
     message: string | undefined,
@@ -156,9 +156,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       input_schema: tool.input_schema,
     }));
 
-    // 整个工具调用循环共享一个 streamId，Worker Tab 中呈现完整推理过程
-    const streamId = this.startStreamWithContext();
-    const MAX_ROUNDS = 4;
+    // 每轮 LLM 调用独立一个 stream，确保时间轴正确：
+    // 当轮 stream 内包含 thinking + text + tool_call + tool_result，
+    // endStream 后再产生新消息或下一轮 stream，时间顺序天然正确。
+    // Worker 执行实际编码任务时需要多轮工具调用（读文件、搜索、写文件、验证），
+    // 上限需要足够宽裕以支撑完整的任务执行流程。
+    const MAX_ROUNDS = 25;
 
     try {
       let finalText = '';
@@ -166,6 +169,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       for (let round = 0; round < MAX_ROUNDS; round++) {
         this.seenThinking = false;
         this.decisionHookAppliedForThinking = false;
+
+        // 只有首轮使用 startStreamWithContext 绑定 placeholder messageId，
+        // 后续轮次生成新 messageId，避免复用同一个 ID 导致 Pipeline 重新激活覆盖前一轮内容
+        const streamId = round === 0
+          ? this.startStreamWithContext()
+          : this.normalizer.startStream(this.currentTraceId!);
 
         const params: LLMMessageParams = {
           messages: this.conversationHistory,
@@ -179,100 +188,105 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         let accumulatedText = '';
         let toolCalls: ToolCall[] = [];
 
-        const response = await this.client.streamMessage(params, (chunk) => {
-          if (chunk.type === 'content_delta' && chunk.content) {
-            if (this.seenThinking && !this.decisionHookAppliedForThinking) {
-              this.decisionHookAppliedForThinking = true;
-              this.applyDecisionHook({ type: 'thinking' });
+        try {
+          const response = await this.client.streamMessage(params, (chunk) => {
+            if (chunk.type === 'content_delta' && chunk.content) {
+              if (this.seenThinking && !this.decisionHookAppliedForThinking) {
+                this.decisionHookAppliedForThinking = true;
+                this.applyDecisionHook({ type: 'thinking' });
+              }
+              accumulatedText += chunk.content;
+              this.normalizer.processTextDelta(streamId, chunk.content);
+              this.emit('message', chunk.content);
+            } else if (chunk.type === 'thinking' && chunk.thinking) {
+              this.normalizer.processThinking(streamId, chunk.thinking);
+              this.emit('thinking', chunk.thinking);
+              this.seenThinking = true;
+            } else if (chunk.type === 'tool_call_start' && chunk.toolCall) {
+              this.emit('toolCall', chunk.toolCall.name || '', chunk.toolCall.arguments || {});
+              this.applyDecisionHook({
+                type: 'tool_call',
+                toolName: chunk.toolCall.name || '',
+                toolArgs: chunk.toolCall.arguments || {},
+              });
             }
-            accumulatedText += chunk.content;
-            this.normalizer.processTextDelta(streamId, chunk.content);
-            this.emit('message', chunk.content);
-          } else if (chunk.type === 'thinking' && chunk.thinking) {
-            this.normalizer.processThinking(streamId, chunk.thinking);
-            this.emit('thinking', chunk.thinking);
-            this.seenThinking = true;
-          } else if (chunk.type === 'tool_call_start' && chunk.toolCall) {
-            this.emit('toolCall', chunk.toolCall.name || '', chunk.toolCall.arguments || {});
-            this.applyDecisionHook({
+          });
+          this.recordTokenUsage(response.usage);
+
+          if (response.toolCalls && response.toolCalls.length > 0) {
+            toolCalls = response.toolCalls;
+          }
+
+          const assistantText = accumulatedText || response.content || '';
+
+          // 无工具调用 → 收敛
+          if (toolCalls.length === 0) {
+            this.conversationHistory.push({ role: 'assistant', content: assistantText });
+            finalText = assistantText;
+            this.normalizer.endStream(streamId);
+            break;
+          }
+
+          // 有工具调用 → 同步到当轮 stream，执行工具，endStream 后进入下一轮
+          for (const toolCall of toolCalls) {
+            this.normalizer.addToolCall(streamId, {
               type: 'tool_call',
-              toolName: chunk.toolCall.name || '',
-              toolArgs: chunk.toolCall.arguments || {},
+              toolName: toolCall.name,
+              toolId: toolCall.id,
+              status: 'running',
+              input: JSON.stringify(toolCall.arguments, null, 2),
             });
           }
-        });
-        this.recordTokenUsage(response.usage);
 
-        if (response.toolCalls && response.toolCalls.length > 0) {
-          toolCalls = response.toolCalls;
-        }
+          const assistantContent: any[] = [];
+          if (assistantText) {
+            assistantContent.push({ type: 'text', text: assistantText });
+          }
+          for (const toolCall of toolCalls) {
+            assistantContent.push({
+              type: 'tool_use',
+              id: toolCall.id,
+              name: toolCall.name,
+              input: toolCall.arguments,
+            });
+          }
+          this.conversationHistory.push({ role: 'assistant', content: assistantContent });
 
-        const assistantText = accumulatedText || response.content || '';
+          const toolResults = await this.executeToolCalls(toolCalls);
+          for (const result of toolResults) {
+            this.normalizer.finishToolCall(
+              streamId,
+              result.toolCallId,
+              result.isError ? undefined : result.content,
+              result.isError ? result.content : undefined,
+            );
+          }
 
-        // 无工具调用 → 收敛，结束循环
-        if (toolCalls.length === 0) {
-          this.conversationHistory.push({ role: 'assistant', content: assistantText });
-          finalText = assistantText;
-          break;
-        }
-
-        // 有工具调用 → 同步到 Normalizer，执行工具，继续下一轮
-        for (const toolCall of toolCalls) {
-          this.normalizer.addToolCall(streamId, {
-            type: 'tool_call',
-            toolName: toolCall.name,
-            toolId: toolCall.id,
-            status: 'running',
-            input: JSON.stringify(toolCall.arguments, null, 2),
+          this.conversationHistory.push({
+            role: 'user',
+            content: toolResults.map((result) => ({
+              type: 'tool_result',
+              tool_use_id: result.toolCallId,
+              content: result.content,
+              is_error: result.isError,
+            })),
           });
-        }
 
-        // 添加助手响应到历史（包含工具调用）
-        const assistantContent: any[] = [];
-        if (assistantText) {
-          assistantContent.push({ type: 'text', text: assistantText });
-        }
-        for (const toolCall of toolCalls) {
-          assistantContent.push({
-            type: 'tool_use',
-            id: toolCall.id,
-            name: toolCall.name,
-            input: toolCall.arguments,
-          });
-        }
-        this.conversationHistory.push({ role: 'assistant', content: assistantContent });
+          this.applyDecisionHook({ type: 'tool_result' });
 
-        // 执行工具
-        const toolResults = await this.executeToolCalls(toolCalls);
-        for (const result of toolResults) {
-          this.normalizer.finishToolCall(
-            streamId,
-            result.toolCallId,
-            result.isError ? undefined : result.content,
-            result.isError ? result.content : undefined,
-          );
-        }
+          // 当轮 stream 结束，下一轮开启新 stream
+          this.normalizer.endStream(streamId);
 
-        // 工具结果追加到历史
-        this.conversationHistory.push({
-          role: 'user',
-          content: toolResults.map((result) => ({
-            type: 'tool_result',
-            tool_use_id: result.toolCallId,
-            content: result.content,
-            is_error: result.isError,
-          })),
-        });
-
-        this.applyDecisionHook({ type: 'tool_result' });
-
-        // 达到最大轮次仍有工具调用 → 强制收敛
-        if (round === MAX_ROUNDS - 1) {
-          finalText = assistantText || '多次工具调用后仍未产出最终回复，已中止以避免无限循环。';
+          // 达到最大轮次 → 强制收敛
+          if (round === MAX_ROUNDS - 1) {
+            finalText = assistantText || '已达到工具调用轮次上限，自动收敛。';
+          }
+        } catch (error: any) {
+          this.normalizer.endStream(streamId, error?.message || 'Request failed');
+          throw error;
         }
       }
 
-      this.normalizer.endStream(streamId);
       this.setState(AdapterState.CONNECTED);
 
       if (!finalText.trim()) {
@@ -281,7 +295,6 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
       return finalText;
     } catch (error: any) {
-      this.normalizer.endStream(streamId, error?.message || 'Request failed');
       this.setState(AdapterState.ERROR);
       this.emitError(error);
       throw error;

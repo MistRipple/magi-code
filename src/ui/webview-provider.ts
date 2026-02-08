@@ -586,6 +586,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     globalEventBus.on('task:completed', async (event: any) => {
       completedTaskCount++;
 
+      // 触发代码索引刷新（防抖，不会每次都全量扫描）
+      this.projectKnowledgeBase?.refreshIndex();
+
       // 达到阈值时提取知识
       if (completedTaskCount >= EXTRACTION_THRESHOLD) {
         completedTaskCount = 0; // 重置计数器
@@ -5362,7 +5365,7 @@ ${originalPrompt}
       // 调用智能编排器
       // 注意：executeWithTaskContext 内部已将 LLM 响应流式发送到前端
       // 因此不需要再手动调用 sendOrchestratorMessage 发送结果，否则会导致重复消息
-      const taskContext = await this.orchestratorEngine.executeWithTaskContext(prompt, this.activeSessionId || undefined);
+      const taskContext = await this.orchestratorEngine.executeWithTaskContext(prompt, this.activeSessionId || undefined, imagePaths);
       const result = taskContext.result;
 
       // 获取执行计划，判断是否需要 Worker

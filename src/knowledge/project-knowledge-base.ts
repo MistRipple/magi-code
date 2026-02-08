@@ -549,6 +549,35 @@ export class ProjectKnowledgeBase {
     return languageMap[ext];
   }
 
+  // 防抖定时器：避免短时间内频繁重新索引
+  private refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly REFRESH_DEBOUNCE_MS = 30_000; // 30 秒防抖
+
+  /**
+   * 延迟刷新代码索引（防抖）
+   * 任务完成后调用，避免短时间多次任务完成触发多次全量扫描
+   */
+  refreshIndex(): void {
+    if (this.refreshTimer) {
+      clearTimeout(this.refreshTimer);
+    }
+    this.refreshTimer = setTimeout(async () => {
+      this.refreshTimer = null;
+      try {
+        logger.info('项目知识库.索引.刷新开始', undefined, LogCategory.SESSION);
+        await this.indexProject();
+        logger.info('项目知识库.索引.刷新完成', {
+          files: this.codeIndex?.files.length || 0,
+        }, LogCategory.SESSION);
+      } catch (error) {
+        logger.error('项目知识库.索引.刷新失败', { error }, LogCategory.SESSION);
+      }
+    }, ProjectKnowledgeBase.REFRESH_DEBOUNCE_MS);
+    logger.debug('项目知识库.索引.刷新已排队', {
+      debounceMs: ProjectKnowledgeBase.REFRESH_DEBOUNCE_MS,
+    }, LogCategory.SESSION);
+  }
+
   /**
    * 获取代码索引
    */

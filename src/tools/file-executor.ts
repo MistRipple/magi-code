@@ -40,10 +40,10 @@ export class FileExecutor implements ToolExecutor {
   getToolDefinition(): ExtendedToolDefinition {
     return {
       name: 'text_editor',
-      description: `Edit text files using commands like view, create, str_replace, insert, and undo_edit.
+      description: `A versatile file tool for viewing, creating, and editing files.
 
 Commands:
-* view - View file content with line numbers (cat -n style). Supports regex search.
+* view - View file content with line numbers, or list directory structure (up to 2 levels deep). When path is a directory, returns a tree listing of its contents. Supports regex search within files.
 * create - Create a new file (cannot overwrite existing files)
 * str_replace - Replace text in file (old_str must match EXACTLY)
 * insert - Insert text at a specific line number
@@ -58,9 +58,11 @@ When using regex search, only matching lines and their context are shown.
 Strongly prefer search_query_regex over view_range when looking for specific symbols.
 
 Notes for str_replace:
+* ALWAYS use view command to read the file before editing
 * old_str must match EXACTLY including whitespace
 * new_str can be empty to delete content
 * Use old_str_start_line and old_str_end_line to disambiguate multiple occurrences
+* Try to fit as many edits in one tool call as possible
 
 Notes for insert:
 * insert_line is 1-based line number
@@ -68,7 +70,10 @@ Notes for insert:
 * Use insert_line: 0 to insert at the beginning
 
 IMPORTANT:
-* This is the only tool for editing files
+* This is the primary tool for all file operations - reading, browsing, creating, and editing
+* Use view command on a directory path to explore project structure (e.g. path: "." or path: "src")
+* Use view command on a file path to read file contents
+* DO NOT use launch-process with ls/find/cat to explore files - use this tool instead
 * DO NOT use sed/awk/shell commands for editing
 * DO NOT fall back to removing and recreating files
 * Use view command with search_query_regex before editing`,

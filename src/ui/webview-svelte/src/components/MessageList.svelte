@@ -2,7 +2,8 @@
   import type { Message } from '../types/message';
   import MessageItem from './MessageItem.svelte';
   import Icon from './Icon.svelte';
-  import { onMount, tick } from 'svelte';
+  import { onMount, onDestroy, tick } from 'svelte';
+  import { messagesState } from '../stores/messages.svelte';
 
   // Props - Svelte 5 语法
   interface Props {
@@ -15,8 +16,10 @@
     };
     /** 是否为只读模式（主对话区模式），隐藏冗余操作按钮 */
     readOnly?: boolean;
+    /** 显示上下文：thread=主对话区, worker=Worker面板 */
+    displayContext?: 'thread' | 'worker';
   }
-  let { messages, emptyState, readOnly = false }: Props = $props();
+  let { messages, emptyState, readOnly = false, displayContext = 'thread' }: Props = $props();
 
   // 🛡️ 防御性编程：过滤无效的消息
   const safeMessages = $derived(
@@ -77,6 +80,55 @@
     // 使用内容长度作为签名，避免频繁的字符串比较
     return streamingMsgs.map(m => `${m.id}:${(m.content || '').length}:${(m.blocks || []).length}`).join('|');
   });
+
+  // 对话级处理指示器：isProcessing 期间始终显示
+  // 流式消息自身的三点动画表示「正在输出内容」，此指示器表示「对话仍在进行」，语义不同
+  const showProcessingIndicator = $derived(
+    messagesState.isProcessing && safeMessages.length > 0
+  );
+
+  // 本轮对话计时：从最后一条用户消息的时间戳开始
+  const lastUserMessageTime = $derived.by(() => {
+    for (let i = safeMessages.length - 1; i >= 0; i--) {
+      if (safeMessages[i].type === 'user_input') {
+        return safeMessages[i].timestamp;
+      }
+    }
+    return 0;
+  });
+
+  let elapsedSeconds = $state(0);
+  let timerInterval: ReturnType<typeof setInterval> | null = null;
+
+  $effect(() => {
+    const shouldRun = showProcessingIndicator && lastUserMessageTime > 0;
+    if (shouldRun) {
+      // 立即计算一次
+      elapsedSeconds = Math.floor((Date.now() - lastUserMessageTime) / 1000);
+      timerInterval = setInterval(() => {
+        elapsedSeconds = Math.floor((Date.now() - lastUserMessageTime) / 1000);
+      }, 1000);
+    } else {
+      if (timerInterval) {
+        clearInterval(timerInterval);
+        timerInterval = null;
+      }
+      elapsedSeconds = 0;
+    }
+    return () => {
+      if (timerInterval) {
+        clearInterval(timerInterval);
+        timerInterval = null;
+      }
+    };
+  });
+
+  function formatElapsed(seconds: number): string {
+    if (seconds < 60) return `${seconds}s`;
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m}m ${s}s`;
+  }
 
   // 空状态默认值
   const emptyIcon = $derived((emptyState?.icon || 'chat') as import('../lib/icons').IconName);
@@ -154,8 +206,19 @@
       </div>
     {:else}
       {#each safeMessages as message (getMessageKey(message))}
-        <MessageItem {message} {readOnly} />
+        <MessageItem {message} {readOnly} {displayContext} />
       {/each}
+      <!-- 对话级处理指示器：无流式消息但仍在处理中时显示 -->
+      {#if showProcessingIndicator}
+        <div class="conversation-processing-indicator">
+          <span class="streaming-dot"></span>
+          <span class="streaming-dot"></span>
+          <span class="streaming-dot"></span>
+          {#if elapsedSeconds > 0}
+            <span class="elapsed-time">{formatElapsed(elapsedSeconds)}</span>
+          {/if}
+        </div>
+      {/if}
     {/if}
   </div>
 
@@ -254,5 +317,46 @@
     color: white;
     border-color: var(--primary);
     transform: translateY(-2px);
+  }
+
+  /* 对话级处理指示器 */
+  .conversation-processing-indicator {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: var(--space-2) var(--space-4);
+  }
+
+  .conversation-processing-indicator .streaming-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--info);
+    opacity: 0.6;
+    animation: processingPulse 1.4s ease-in-out infinite;
+  }
+  .conversation-processing-indicator .streaming-dot:nth-child(2) {
+    animation-delay: 0.2s;
+  }
+  .conversation-processing-indicator .streaming-dot:nth-child(3) {
+    animation-delay: 0.4s;
+  }
+
+  .elapsed-time {
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    margin-left: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  @keyframes processingPulse {
+    0%, 80%, 100% {
+      opacity: 0.4;
+      transform: scale(1);
+    }
+    40% {
+      opacity: 1;
+      transform: scale(1.2);
+    }
   }
 </style>

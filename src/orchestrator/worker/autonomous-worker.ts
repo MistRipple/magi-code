@@ -383,13 +383,12 @@ export class AutonomousWorker extends EventEmitter {
     }, LogCategory.ORCHESTRATOR);
 
     // ========== 双模式执行：直接执行 vs Todo 循环 ==========
-    // 由编排者 LLM 语义理解决定：
-    //   - 简单任务：assignment.todos 为空，直接执行
-    //   - 复杂任务：assignment.todos 非空，按 Todo 循环执行
+    // - 简单/中等任务：assignment.todos 为空，走直接执行模式
+    //   Worker LLM 在 ReAct 循环中自主执行，通过 report_progress 工具汇报进度
+    // - 复杂任务：assignment.todos 非空（由上层预设），走 Todo 循环模式
 
     if (!assignment.todos || assignment.todos.length === 0) {
-      // ========== 直接执行模式（简单任务） ==========
-      // 取消信号检查
+      // ========== 直接执行模式 ==========
       options.cancellationToken?.throwIfCancelled();
       logger.info('Worker.直接执行模式', {
         assignmentId: assignment.id,
@@ -892,6 +891,7 @@ export class AutonomousWorker extends EventEmitter {
       this.emit('todoCompleted', {
         assignmentId: assignment.id,
         todoId: todo.id,
+        content: todo.content,
         output: todo.output,
       });
 
@@ -921,6 +921,7 @@ export class AutonomousWorker extends EventEmitter {
       this.emit('todoFailed', {
         assignmentId: assignment.id,
         todoId: todo.id,
+        content: todo.content,
         error: errorMessage,
       });
 
@@ -1336,6 +1337,17 @@ export class AutonomousWorker extends EventEmitter {
     if (projectContext) {
       sections.push(`## 项目上下文\n${projectContext}`);
     }
+
+    // 6. 进度汇报指引
+    // 注入 assignmentId，让 Worker LLM 在调用 report_progress 时携带 context_id
+    sections.push(`## 进度汇报
+任务上下文 ID: ${assignment.id}
+当你的任务涉及多个步骤时（如：阅读分析 → 设计方案 → 实施修改 → 验证结果），
+请在每个关键阶段调用 report_progress 工具汇报进度，参数：
+- context_id: "${assignment.id}"
+- step: 当前步骤描述
+- percentage: 预估完成百分比 (0-100)
+这能让用户实时了解你的工作进展。`);
 
     return sections.join('\n\n');
   }

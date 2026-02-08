@@ -17,5 +17,5 @@
   };
 </script>
 
-<!-- 直接复用 MessageList 组件，保持样式统一 -->
-<MessageList {messages} {emptyState} />
+<!-- 复用 MessageList 组件，displayContext='worker' 标识 Worker 面板 -->
+<MessageList {messages} {emptyState} displayContext="worker" />

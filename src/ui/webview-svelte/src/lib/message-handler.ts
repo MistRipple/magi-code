@@ -37,6 +37,7 @@ import {
   updateRequestBinding,
   clearRequestBinding,
   clearAllRequestBindings,
+  clearProcessingState,
 } from '../stores/messages.svelte';
 import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, Edit, ModelStatusMap } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
@@ -398,11 +399,10 @@ function handleStateUpdate(message: WebviewMessage) {
     }
   }
 
-  if (typeof (state as any).isRunning === 'boolean') {
-    setIsProcessing(Boolean((state as any).isRunning));
-  } else if (typeof state.isProcessing === 'boolean') {
-    setIsProcessing(state.isProcessing);
-  }
+  // 🔧 已移除 isRunning/isProcessing 对处理状态的设置
+  // 根因：sendStateUpdate() 是异步 fire-and-forget，stateUpdate 可能在 task_completed 之后
+  // 延迟到达前端，携带过期的 isRunning=true，导致 clearProcessingState() 被覆盖。
+  // 处理状态只由控制消息（task_started/task_completed）和消息生命周期驱动，不再接受 stateUpdate 的冗余信号。
 
   if (typeof state.interactionMode === 'string') {
     applyInteractionModeFromPayload(state.interactionMode, 'stateUpdate', state.interactionModeUpdatedAt);
@@ -1338,12 +1338,10 @@ function handleUnifiedControlMessage(standard: StandardMessage) {
 
     case 'task_completed':
     case 'task_failed': {
-      // 任务生命周期结束：以控制消息为准清理运行态
-      setIsProcessing(false);
-      const requestId = payload?.requestId as string | undefined;
-      if (requestId) {
-        clearPendingRequest(requestId);
-      }
+      // 任务生命周期终极信号：彻底清除所有处理态
+      // 清除 backendProcessing + activeMessageIds + pendingRequests 三重条件，
+      // 防止 Worker 多轮工具调用中间消息的 COMPLETE 事件延迟或丢失导致按钮状态残留
+      clearProcessingState();
       break;
     }
 

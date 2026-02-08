@@ -12,8 +12,10 @@
   interface Props {
     message: Message;
     readOnly?: boolean;
+    /** 显示上下文：thread=主对话区, worker=Worker面板 */
+    displayContext?: 'thread' | 'worker';
   }
-  let { message, readOnly = false }: Props = $props();
+  let { message, readOnly = false, displayContext = 'thread' }: Props = $props();
 
   // 派生状态
   const isUser = $derived(message.type === 'user_input');
@@ -21,6 +23,14 @@
   const interactionMeta = $derived(message.metadata?.interaction as { prompt?: string; type?: string } | undefined);
   const isInteraction = $derived(Boolean(interactionMeta));
   const isStreaming = $derived(message.isStreaming);
+
+  // 主角色判断：主对话区的主角色是 orchestrator，Worker 面板的主角色是具体 Worker（claude/codex/gemini）
+  // 主角色消息使用 inline 模式（无卡片包裹），客角色消息使用 card 模式
+  const isNativeSource = $derived(
+    displayContext === 'thread'
+      ? message.source === 'orchestrator'
+      : message.source !== 'orchestrator' && message.source !== 'system'
+  );
 
   // 占位消息相关派生状态
   const isPlaceholder = $derived(Boolean(message.metadata?.isPlaceholder));
@@ -145,8 +155,49 @@
       isStreaming={isStreaming}
     />
   </div>
-<!-- 助手消息：完整显示（包括占位状态） -->
+<!-- 助手消息：根据 displayContext 区分主角色（inline）和客角色（card） -->
+{:else if isNativeSource}
+  <!-- 主角色消息：inline 模式，无卡片边框和 header -->
+  <div
+    class="message-item assistant native"
+    class:streaming={isStreaming}
+    class:placeholder={isPlaceholder}
+    class:was-placeholder={wasPlaceholder}
+    data-message-id={message.id}
+    data-source={message.source}
+    data-interaction={isInteraction ? 'true' : 'false'}
+    data-placeholder-state={isPlaceholder ? placeholderState : undefined}
+  >
+    <div class="message-content">
+      {#if isPlaceholder}
+        <div class="placeholder-content">
+          <div class="streaming-indicator-bottom">
+            <span class="streaming-dot"></span>
+            <span class="streaming-dot"></span>
+            <span class="streaming-dot"></span>
+          </div>
+        </div>
+      {:else}
+        {#if isInteraction && interactionMeta?.prompt}
+          <div class="interaction-inline">
+            <Icon name="sparkles" size={14} />
+            <span>{interactionMeta.prompt}</span>
+          </div>
+        {/if}
+
+        {#if safeBlocks.length > 0}
+            {#each safeBlocks as block, i (`${message.id}-block-${i}-${block.type}`)}
+              <BlockRenderer {block} {isStreaming} {readOnly} />
+            {/each}
+          {:else if message.content}
+            <MarkdownContent content={message.content} {isStreaming} />
+          {/if}
+
+      {/if}
+    </div>
+  </div>
 {:else}
+  <!-- 客角色消息：card 模式，有卡片边框和 header -->
   <div
     class="message-item assistant"
     class:streaming={isStreaming}
@@ -160,9 +211,7 @@
   >
     <div class="message-header">
       <div class="message-source">
-        <!-- 只显示 WorkerBadge，不再重复显示 source-name -->
         <WorkerBadge worker={badgeWorker} size="sm" />
-        <!-- 占位状态显示状态文字 -->
         {#if isPlaceholder}
           <span class="placeholder-status">
             {#if placeholderState === 'pending'}
@@ -189,7 +238,6 @@
 
     <div class="message-content">
       {#if isPlaceholder}
-        <!-- 占位状态：显示加载动画 -->
         <div class="placeholder-content">
           <div class="streaming-indicator-bottom">
             <span class="streaming-dot"></span>
@@ -211,15 +259,6 @@
             {/each}
           {:else if message.content}
             <MarkdownContent content={message.content} {isStreaming} />
-          {/if}
-
-          <!-- 流式消息底部加载指示器 -->
-          {#if isStreaming}
-            <div class="streaming-indicator-bottom">
-              <span class="streaming-dot"></span>
-              <span class="streaming-dot"></span>
-              <span class="streaming-dot"></span>
-            </div>
           {/if}
       {/if}
     </div>
@@ -310,7 +349,7 @@
     margin-right: var(--space-2);  /* 与 assistant 消息一致 */
   }
 
-  /* ===== 助手消息样式 ===== */
+  /* ===== 助手消息样式（card 模式：客角色） ===== */
   .message-item.assistant {
     display: flex;
     flex-direction: column;
@@ -318,13 +357,20 @@
     border-radius: var(--radius-lg);
     background: var(--assistant-message-bg);
     border: 1px solid var(--border);
-    margin-right: var(--space-2);  /* 减少右边距，配合 MessageList 的 padding-right 调整 */
-    /* 平滑过渡：仅边框颜色和阴影，高度由内容自然撑开 */
+    margin-right: var(--space-2);
     transition: border-color 0.2s ease, box-shadow 0.2s ease;
-    /* 高度自适应：禁止压缩，确保高度随内容自动撑开 */
     flex-shrink: 0;
     height: auto;
     overflow: visible;
+  }
+
+  /* ===== 主角色消息样式（inline 模式：无卡片包裹） ===== */
+  .message-item.assistant.native {
+    background: transparent;
+    border: none;
+    padding: 0 var(--space-4);
+    border-radius: 0;
+    margin-top: calc(-1 * var(--space-2));
   }
 
   /* 流式消息卡片：高度完全由内容与动画驱动，避免占位感 */

@@ -40,7 +40,7 @@ interface SealedCardState {
 }
 
 interface DeadLetterEntry {
-  reason: 'sealed_duplicate' | 'sealed_late' | 'sealed_late_empty' | 'out_of_order_update';
+  reason: 'sealed_duplicate' | 'sealed_late' | 'out_of_order_update';
   cardId: string;
   messageId: string;
   cardStreamSeq: number;
@@ -201,59 +201,6 @@ export class MessagePipeline {
     return this.deadLetters.length;
   }
 
-  private maybeEmitLateSupplementMessage(update: StreamUpdate, sealed: SealedCardState): boolean {
-    const lateText = update.updateType === 'append'
-      ? (update.appendText || '')
-      : this.extractTextFromBlocks(update.blocks);
-    const hasRenderableBlocks = this.hasRenderableBlocks(update.blocks);
-    if (!lateText.trim() && !hasRenderableBlocks) {
-      this.recordDeadLetter({
-        reason: 'sealed_late_empty',
-        cardId: sealed.cardId,
-        messageId: update.messageId,
-        cardStreamSeq: update.cardStreamSeq || 0,
-        eventSeq: update.eventSeq || 0,
-        timestamp: Date.now(),
-        requestId: sealed.requestId,
-      });
-      return false;
-    }
-
-    const supplementCardId = `${sealed.cardId}::late::${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-    const supplementBlocks = Array.isArray(update.blocks) && update.blocks.length > 0
-      ? update.blocks
-      : [{ type: 'text' as const, content: lateText || '[补遗] 收到延迟输出' }];
-    const supplement = createStandardMessage({
-      category: MessageCategory.CONTENT,
-      type: MessageType.TEXT,
-      source: sealed.source,
-      agent: sealed.agent,
-      traceId: sealed.traceId,
-      lifecycle: MessageLifecycle.COMPLETED,
-      blocks: supplementBlocks,
-      metadata: {
-        requestId: sealed.requestId,
-        cardId: supplementCardId,
-        parentCardId: sealed.cardId,
-        lateArrival: true,
-        lateFromCardId: sealed.cardId,
-      },
-    });
-
-    this.recordDeadLetter({
-      reason: 'sealed_late',
-      cardId: sealed.cardId,
-      messageId: update.messageId,
-      cardStreamSeq: update.cardStreamSeq || 0,
-      eventSeq: update.eventSeq || 0,
-      timestamp: Date.now(),
-      requestId: sealed.requestId,
-    });
-
-    this.process(supplement, sealed.requestId);
-    return true;
-  }
-
   private sealCard(message: StandardMessage, state?: MessageState): void {
     const cardId = this.resolveCardId(message.id, message.metadata);
     const finalStreamSeq = typeof message.metadata?.cardStreamSeq === 'number'
@@ -354,20 +301,17 @@ export class MessagePipeline {
     const sealed = this.sealedCards.get(cardId);
 
     if (sealed) {
+      // sealed card 不应再收到任何 update，统一记录 dead letter
       const incomingSeq = effectiveUpdate.cardStreamSeq || 0;
-      if (incomingSeq <= sealed.finalStreamSeq) {
-        this.recordDeadLetter({
-          reason: 'sealed_duplicate',
-          cardId,
-          messageId: effectiveUpdate.messageId,
-          cardStreamSeq: incomingSeq,
-          eventSeq: effectiveUpdate.eventSeq || 0,
-          timestamp: Date.now(),
-          requestId: sealed.requestId,
-        });
-      } else {
-        this.maybeEmitLateSupplementMessage(effectiveUpdate, sealed);
-      }
+      this.recordDeadLetter({
+        reason: incomingSeq <= sealed.finalStreamSeq ? 'sealed_duplicate' : 'sealed_late',
+        cardId,
+        messageId: effectiveUpdate.messageId,
+        cardStreamSeq: incomingSeq,
+        eventSeq: effectiveUpdate.eventSeq || 0,
+        timestamp: Date.now(),
+        requestId: sealed.requestId,
+      });
       return false;
     }
 
@@ -394,11 +338,12 @@ export class MessagePipeline {
       this.messageStates.set(effectiveUpdate.messageId, state);
     }
     if (state.completed) {
-      // 重新激活：同一 boundId 的新一轮流式 UPDATE
-      // 上一轮 endStream 标记了 completed，但新一轮的 MESSAGE(STARTED) 应已重新激活 state
-      // 如果 UPDATE 先于 MESSAGE 到达（理论上不应发生），也允许继续
-      state.completed = false;
-      state.lastStreamAt = 0;
+      // 新架构：endStream 后不应再有 UPDATE 到同一 messageId
+      logger.warn('MessagePipeline.已完成_收到_UPDATE', {
+        messageId: update.messageId,
+        updateType: update.updateType,
+      }, LogCategory.SYSTEM);
+      return false;
     }
     if (
       hadState
@@ -469,23 +414,9 @@ export class MessagePipeline {
 
     if (existingState && lifecycle === MessageLifecycle.STARTED) {
       if (existingState.completed) {
-        // 重新激活：同一 boundId 的新一轮流式消息（tool calling round 或多阶段 LLM 调用）
-        // 上一轮 endStream 标记了 completed 并 sealCard，新一轮需要重置以继续更新同一张卡片
-        existingState.completed = false;
-        // 必须清除 sealedCards，否则后续 processUpdate 会被 sealed 拦截，
-        // 触发 maybeEmitLateSupplementMessage 为每个 update 创建独立卡片
-        const sealKey = existingState.cardId || id;
-        this.sealedCards.delete(sealKey);
-        existingState.message = message;
-        existingState.lastSentAt = now;
-        existingState.lastStreamAt = 0;
-        existingState.cardId = this.resolveCardId(id, message.metadata);
-        if (typeof message.metadata?.cardStreamSeq === 'number') {
-          existingState.lastCardStreamSeq = Math.max(existingState.lastCardStreamSeq, message.metadata.cardStreamSeq);
-        }
-        this.updateProcessingState(true, message.source, message.agent);
-        this.recordRequestMessage(message); this.emitByCategory(message);
-        return true;
+        // 新架构：每轮 tool calling 使用独立 messageId，不应出现同 ID 的二次 STARTED
+        logger.warn('MessagePipeline.已完成_重复_START', { id, source: message.source, agent: message.agent }, LogCategory.SYSTEM);
+        return false;
       }
       if (existingState.message === null) {
         existingState.message = message;
@@ -558,12 +489,9 @@ export class MessagePipeline {
         this.recordRequestMessage(completedMessage); this.emitByCategory(completedMessage);
         return true;
       }
-      // 非终态消息（STREAMING）：重新激活 state
-      existingState.completed = false;
-      existingState.lastStreamAt = 0;
-      // 清除 sealedCards 以允许后续 processUpdate 正常通过
-      const sealKey = existingState.cardId || id;
-      this.sealedCards.delete(sealKey);
+      // 非终态消息到达已完成 state：拒绝处理
+      logger.warn('MessagePipeline.已完成_收到_非终态', { id, lifecycle, source: message.source, agent: message.agent }, LogCategory.SYSTEM);
+      return false;
     }
 
     if (lifecycle === MessageLifecycle.STREAMING) {

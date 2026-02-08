@@ -333,6 +333,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     'dispatch_task',
     'plan_mission',
     'send_worker_message',
+    'report_progress',
   ];
 
   /**
@@ -459,6 +460,9 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       case 'send_worker_message':
         return await this.orchestrationExecutor.execute(toolCall);
 
+      case 'report_progress':
+        return this.executeReportProgressTool(toolCall);
+
       default:
         return {
           toolCallId: toolCall.id,
@@ -466,6 +470,42 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
           isError: true,
         };
     }
+  }
+
+  /**
+   * 执行 report_progress 工具 — Worker 主动汇报任务进度
+   *
+   * 不执行任何实际操作，仅通过 EventEmitter 发出 progress:reported 事件。
+   * 上层（MissionDrivenEngine）监听此事件并更新 subTaskCard。
+   * context_id 由 Worker LLM 从 prompt 中获取（即 assignmentId），
+   * 确保并行 Worker 场景下事件能正确关联到对应的任务。
+   */
+  private executeReportProgressTool(toolCall: ToolCall): ToolResult {
+    const args = toolCall.arguments || {};
+    const contextId = args.context_id as string || '';
+    const step = args.step as string || '';
+    const percentage = typeof args.percentage === 'number' ? args.percentage : undefined;
+    const details = args.details as string || undefined;
+
+    logger.info('Tool.report_progress', {
+      contextId,
+      step,
+      percentage,
+      details: details?.substring(0, 80),
+    }, LogCategory.TOOLS);
+
+    this.emit('progress:reported', {
+      contextId,
+      step,
+      percentage,
+      details,
+    });
+
+    return {
+      toolCallId: toolCall.id,
+      content: '进度已汇报',
+      isError: false,
+    };
   }
 
   /**
@@ -601,7 +641,16 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     const terminalTools: ToolDefinition[] = [
       {
         name: 'launch-process',
-        description: '启动一个 agent 专属终端进程，可选择等待完成。name 必填且仅支持 orchestrator、worker-claude、worker-gemini、worker-codex。',
+        description: `Launch a shell command in an agent-dedicated terminal. name is required (orchestrator, worker-claude, worker-gemini, worker-codex).
+
+Use wait=true for short commands (build, test, git), wait=false for long-running processes (dev server).
+
+IMPORTANT: If a more specific tool can perform the task, use that tool instead:
+- To read files or browse directories: use text_editor (view command), NOT cat/ls/find
+- To search code content: use grep_search, NOT grep/rg
+- To search the web: use web_search, NOT curl
+- To fetch a URL: use web_fetch, NOT curl/wget
+- Only use launch-process for commands that truly need a shell (build, test, git, start server, etc.)`,
         input_schema: {
           type: 'object',
           properties: {
@@ -696,6 +745,27 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
     // 14-16. 编排工具 (dispatch_task, plan_mission, send_worker_message)
     tools.push(...this.orchestrationExecutor.getToolDefinitions());
+
+    // 17. report_progress (Worker 进度汇报)
+    tools.push({
+      name: 'report_progress',
+      description: '汇报当前任务的执行进度。当任务涉及多个步骤时使用此工具，让用户实时了解你在做什么。',
+      input_schema: {
+        type: 'object',
+        properties: {
+          context_id: { type: 'string', description: '任务上下文 ID（从任务说明中获取）' },
+          step: { type: 'string', description: '当前正在执行的步骤描述' },
+          percentage: { type: 'number', description: '预估完成百分比 0-100' },
+          details: { type: 'string', description: '补充细节信息（可选）' },
+        },
+        required: ['context_id', 'step'],
+      },
+      metadata: {
+        source: 'builtin' as const,
+        category: 'system',
+        tags: ['progress', 'reporting'],
+      },
+    });
 
     return tools;
   }

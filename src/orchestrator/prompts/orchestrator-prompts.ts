@@ -69,11 +69,13 @@ ${categoryHints}
 - **涉及代码/文件修改时，必须 needsWorker=true**
 - **工具调用任务判定（积极使用工具）**：
   - 以下场景必须设置 needsWorker=false，needsTooling=true，executionMode=direct：
-    - 执行终端命令（ls、pwd、cat、grep、find、which、echo 等）
-    - 查看文件内容、目录结构
-    - 运行编译/测试/构建命令（npm run build、npm test 等）
-    - 检查进程、端口、环境变量
-    - 执行 git 查询命令（git status、git log、git diff 等）
+    - 分析/理解项目结构（使用 codebase_retrieval 语义搜索 + lsp_query 符号分析，禁止逐个读取所有文件）
+    - 查看特定文件内容（使用 text_editor view，不要用终端 ls/cat/find）
+    - 搜索代码内容（使用 grep_search 精确匹配或 codebase_retrieval 语义搜索，不要用终端 grep/rg）
+    - 查找符号定义/引用关系（使用 lsp_query definition/references/workspaceSymbols）
+    - 运行编译/测试/构建命令（npm run build、npm test 等，使用 launch-process）
+    - 执行 git 命令（git status、git log、git diff 等，使用 launch-process）
+    - 检查进程、端口、环境变量（使用 launch-process）
     - **搜索互联网信息（使用 web_search 工具，而非启动浏览器）**
     - **获取网页内容（使用 web_fetch 工具，而非启动浏览器）**
     - 用户明确要求"执行/运行/查看/检查/列出"某个操作
@@ -205,8 +207,28 @@ ${workerTable}
 
 **层级 2 - 工具操作**：调用已注册工具自行完成
 ${toolsListSection}
-- 需要查找文档、搜索信息时，直接调用 web_search 而非启动浏览器
-- 需要多步工具操作的中等任务
+
+**工具选择优先级**（当有多个工具可完成同一任务时，选择更专用的工具）：
+- 理解项目/分析代码 → codebase_retrieval（语义搜索）或 lsp_query（结构化分析），而非逐个读取文件
+- 查找符号定义/引用 → lsp_query(definition/references)，而非 grep_search
+- 搜索代码内容 → grep_search（精确匹配）或 codebase_retrieval（语义搜索），而非 launch-process grep/rg
+- 读取特定文件内容 → text_editor(view)，而非 launch-process cat
+- 浏览目录结构 → text_editor(view + 目录路径)，而非 launch-process ls/find
+- 搜索互联网 → web_search，而非 launch-process curl
+- 获取网页内容 → web_fetch，而非 launch-process curl/wget
+- launch-process 仅用于需要真正运行进程的场景：构建(npm build)、测试(npm test)、git 操作、启动服务等
+
+**工具协作链**：
+
+分析/理解项目时（禁止逐个读取所有文件）：
+1. codebase_retrieval — 语义搜索，快速找到与问题相关的代码区域
+2. lsp_query(workspaceSymbols/documentSymbols) — 理解模块结构和符号关系
+3. text_editor(view) — 仅读取真正需要细看的关键文件
+
+编辑文件前必须先理解代码：
+1. codebase_retrieval 或 lsp_query(definition/references) — 定位相关代码
+2. grep_search — 精确匹配具体修改点
+3. text_editor(str_replace) — 精确修改
 
 **层级 3 - 分配 Worker**：使用 dispatch_task 委托
 - 需要多文件修改的代码实现任务

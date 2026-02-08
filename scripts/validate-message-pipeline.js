@@ -175,11 +175,6 @@ assertRule('L2', 'messageHub',
   /sendUpdate\([^)]*\)[^{]*\{[^}]*pipeline\.processUpdate\(/s,
   'MessageHub.sendUpdate 必须委托给 pipeline.processUpdate');
 
-// L2-11: 补遗消息使用新的 messageId，不回写原卡片
-assertRule('L2', 'messagePipeline',
-  /maybeEmitLateSupplementMessage/,
-  '晚到事件必须有补遗机制（maybeEmitLateSupplementMessage）');
-
 // L2-12: dead letter 记录机制存在
 assertRule('L2', 'messagePipeline',
   /recordDeadLetter/,

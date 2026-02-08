@@ -185,17 +185,18 @@ WebviewProvider.emitUserAndPlaceholder(requestId)
 
 ### 5.4 多轮流式场景（Tool Calling Round）
 
-当同一 requestId 下有多轮流式输出时（例如 tool calling 递归）：
+当同一 requestId 下有多轮流式输出时（例如 tool calling 迭代循环）：
 
 ```
-第 1 轮: startStreamWithContext() → boundId=P → 流式输出 → endStream
-         Pipeline: state.completed = true
-第 2 轮: startStreamWithContext() → boundId=P → 流式输出 → endStream
-         Pipeline: 检测到 existingState.completed → 重新激活（reset completed）
-         → 新内容追加到同一卡片
+第 1 轮 (round=0): startStreamWithContext() → boundId=P → 流式输出 → endStream
+                    Pipeline: 占位符 → 真实消息替换 → state.completed = true → sealCard
+第 2 轮 (round=1): normalizer.startStream(traceId) → 生成新 messageId=M2 → 流式输出 → endStream
+                    Pipeline: 新 messageId，独立卡片，不与占位符关联
+第 3 轮 (round=2): normalizer.startStream(traceId) → 生成新 messageId=M3 → 流式输出 → endStream
+                    Pipeline: 同上，每轮独立
 ```
 
-每一轮的 Normalizer 都通过 `startStreamWithContext` 获取同一个占位符 ID，在同一张卡片内追加内容。Pipeline 在检测到已完成状态收到新的 STARTED 消息时，重新激活该状态。
+**核心原则**：只有第 1 轮（round=0）通过 `startStreamWithContext()` 绑定占位符 ID，后续轮次使用 `normalizer.startStream(traceId)` 生成全新 messageId。每轮在时间轴上形成独立卡片，不存在"重激活"机制。Pipeline 对同一 messageId 的重复 STARTED 消息会直接拒绝。
 
 ### 5.5 标准行为示例
 
