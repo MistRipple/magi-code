@@ -10,39 +10,10 @@ import {
   CompletionStrategy,
   CompletionCheckResult,
   ShellType,
+  getDisableHistExpansionCommand,
+  getClearCommand,
 } from './types';
 import { logger, LogCategory } from '../../logging';
-
-/**
- * 获取禁用历史展开命令
- */
-function getDisableHistExpansionCommand(shellName: ShellType): string {
-  switch (shellName.toLowerCase()) {
-    case 'bash':
-    case 'zsh':
-      return 'set +o histexpand';
-    case 'fish':
-    case 'powershell':
-    default:
-      return '';
-  }
-}
-
-/**
- * 获取清屏命令
- */
-function getClearCommand(shellName: ShellType): string {
-  switch (shellName.toLowerCase()) {
-    case 'bash':
-    case 'zsh':
-    case 'fish':
-      return 'clear';
-    case 'powershell':
-      return 'cls';
-    default:
-      return 'clear';
-  }
-}
 
 /**
  * VSCode Events 完成检测策略

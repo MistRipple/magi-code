@@ -561,7 +561,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       return true;
     }
     const message = this.normalizeErrorMessage(error).toLowerCase();
-    return /timeout|timed out|network|connection|fetch failed|socket hang up|tls|certificate|econnreset|econnrefused|enotfound|eai_again/.test(message);
+    return /timeout|timed out|network|connection|fetch failed|socket hang up|tls|certificate|econnreset|econnrefused|enotfound|eai_again|request ended without sending|stream ended|overloaded/.test(message);
   }
 
   private normalizeErrorMessage(error: any): string {

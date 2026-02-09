@@ -3,10 +3,8 @@
  * 提供基于VSCode Terminal API的命令执行能力
  *
  * 采用双策略模式：
- * 1. VSCodeEventsStrategy - 当 Shell Integration 可用时使用
- * 2. ScriptCaptureStrategy - 备用策略，使用 script 命令捕获输出
- *
- * 参考 Augment 插件实现
+ * 1. ScriptCaptureStrategy - 主策略，使用 script 命令捕获输出
+ * 2. VSCodeEventsStrategy - Shell Integration 可用时使用
  */
 
 import * as vscode from 'vscode';
@@ -492,17 +490,18 @@ export class VSCodeTerminalExecutor {
   ): Promise<void> {
     const terminal = process.terminal;
 
-    // 使用 Shell Integration（如果可用）
-    if (terminal.shellIntegration) {
-      logger.debug('使用 Shell Integration 执行命令', undefined, LogCategory.SHELL);
-      await this.executeWithShellIntegration(process, command, timeout);
-      return;
-    }
-
-    // 使用 ScriptCapture 策略
+    // 优先使用初始化时选定的策略，避免策略混用
+    // ScriptCapture 已就绪时，即使 Shell Integration 后来变为可用，也继续使用 ScriptCapture
     if (this.scriptCaptureStrategy.isReady(terminal)) {
       logger.debug('使用 ScriptCapture 策略执行命令', undefined, LogCategory.SHELL);
       await this.executeWithScriptCapture(process, command, timeout, shellType);
+      return;
+    }
+
+    // 使用 Shell Integration（仅在 ScriptCapture 未初始化时）
+    if (terminal.shellIntegration) {
+      logger.debug('使用 Shell Integration 执行命令', undefined, LogCategory.SHELL);
+      await this.executeWithShellIntegration(process, command, timeout);
       return;
     }
 
@@ -612,7 +611,7 @@ export class VSCodeTerminalExecutor {
     // 轮询检测完成状态
     return new Promise((resolve, reject) => {
       const startTime = Date.now();
-      const pollInterval = 200; // 200ms 轮询间隔
+      const pollInterval = 150; // 150ms 轮询间隔
 
       const poll = () => {
         // 检查超时

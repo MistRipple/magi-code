@@ -1,7 +1,5 @@
 /**
  * 终端系统类型定义
- *
- * 参考 Augment 插件的终端实现，提供更可靠的命令执行能力
  */
 
 import * as vscode from 'vscode';
@@ -235,9 +233,38 @@ export interface ShellInfo {
 /**
  * 输出开始标记（ANSI OSC 序列）
  */
-export const OUTPUT_START_MARKER = '\x1B]8888;augment-output-start\x07';
+export const OUTPUT_START_MARKER = '\x1B]8888;multicli-output-start\x07';
 
 /**
  * 输出结束标记（ANSI OSC 序列）
  */
-export const OUTPUT_END_MARKER = '\x1B]8889;augment-output-end\x07';
+export const OUTPUT_END_MARKER = '\x1B]8889;multicli-output-end\x07';
+
+// ============================================================================
+// Shell 通用工具函数
+// ============================================================================
+
+/**
+ * 获取禁用历史展开命令
+ */
+export function getDisableHistExpansionCommand(shellName: ShellType): string {
+  switch (shellName) {
+    case 'bash':
+    case 'zsh':
+      return 'set +o histexpand';
+    default:
+      return '';
+  }
+}
+
+/**
+ * 获取清屏命令
+ */
+export function getClearCommand(shellName: ShellType): string {
+  switch (shellName) {
+    case 'powershell':
+      return 'cls';
+    default:
+      return 'clear';
+  }
+}

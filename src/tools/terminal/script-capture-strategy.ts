@@ -3,8 +3,6 @@
  *
  * 使用 `script` 命令捕获终端输出到临时文件
  * 通过 ANSI 标记检测命令边界和完成状态
- *
- * 参考 Augment 插件实现
  */
 
 import * as vscode from 'vscode';
@@ -20,38 +18,11 @@ import {
   TerminalSessionData,
   OUTPUT_START_MARKER,
   OUTPUT_END_MARKER,
+  getDisableHistExpansionCommand,
+  getClearCommand,
 } from './types';
 import { CwdTracker } from './cwd-tracker';
 import { logger, LogCategory } from '../../logging';
-
-/**
- * 获取禁用历史展开命令
- */
-function getDisableHistExpansionCommand(shellName: ShellType): string {
-  switch (shellName.toLowerCase()) {
-    case 'bash':
-    case 'zsh':
-      return 'set +o histexpand';
-    default:
-      return '';
-  }
-}
-
-/**
- * 获取清屏命令
- */
-function getClearCommand(shellName: ShellType): string {
-  switch (shellName.toLowerCase()) {
-    case 'bash':
-    case 'zsh':
-    case 'fish':
-      return 'clear';
-    case 'powershell':
-      return 'cls';
-    default:
-      return 'clear';
-  }
-}
 
 /**
  * 生成输出开始标记设置命令
@@ -59,11 +30,11 @@ function getClearCommand(shellName: ShellType): string {
 function getOutputStartMarkerSetup(shellName: ShellType): string {
   switch (shellName.toLowerCase()) {
     case 'zsh':
-      return `{ __multicli_output_marker() { printf $'\\x1b]8888;augment-output-start\\x07'; }; preexec_functions+=(__multicli_output_marker); }`;
+      return `{ __multicli_output_marker() { printf $'\\x1b]8888;multicli-output-start\\x07'; }; preexec_functions+=(__multicli_output_marker); }`;
     case 'bash':
-      return `{ __multicli_ps0_func() { printf $'\\x1b]8888;augment-output-start\\x07'; }; PS0='$(__multicli_ps0_func)'"$PS0"; }`;
+      return `{ __multicli_ps0_func() { printf $'\\x1b]8888;multicli-output-start\\x07'; }; PS0='$(__multicli_ps0_func)'"$PS0"; }`;
     case 'fish':
-      return `{ function __multicli_preexec --on-event fish_preexec; printf '\\x1b]8888;augment-output-start\\x07'; end; }`;
+      return `{ function __multicli_preexec --on-event fish_preexec; printf '\\x1b]8888;multicli-output-start\\x07'; end; }`;
     default:
       return '';
   }
@@ -75,11 +46,11 @@ function getOutputStartMarkerSetup(shellName: ShellType): string {
 function getOutputEndMarkerSetup(shellName: ShellType): string {
   switch (shellName.toLowerCase()) {
     case 'zsh':
-      return `{ __multicli_output_end_marker() { printf $'\\x1b]8889;augment-output-end\\x07'; }; precmd_functions+=(__multicli_output_end_marker); }`;
+      return `{ __multicli_output_end_marker() { printf $'\\x1b]8889;multicli-output-end\\x07'; }; precmd_functions+=(__multicli_output_end_marker); }`;
     case 'bash':
-      return `{ __multicli_output_end_marker() { printf $'\\x1b]8889;augment-output-end\\x07'; }; if [ -n "$PROMPT_COMMAND" ]; then export PROMPT_COMMAND="$PROMPT_COMMAND"$'\\n'"__multicli_output_end_marker"; else export PROMPT_COMMAND="__multicli_output_end_marker"; fi; }`;
+      return `{ __multicli_output_end_marker() { printf $'\\x1b]8889;multicli-output-end\\x07'; }; if [ -n "$PROMPT_COMMAND" ]; then export PROMPT_COMMAND="$PROMPT_COMMAND"$'\\n'"__multicli_output_end_marker"; else export PROMPT_COMMAND="__multicli_output_end_marker"; fi; }`;
     case 'fish':
-      return `{ function __multicli_postexec --on-event fish_postexec; printf '\\x1b]8889;augment-output-end\\x07'; end; }`;
+      return `{ function __multicli_postexec --on-event fish_postexec; printf '\\x1b]8889;multicli-output-end\\x07'; end; }`;
     default:
       return '';
   }
@@ -475,18 +446,20 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
   // ============================================================================
 
   private generateScriptStartCommand(shellName: ShellType, scriptFile: string): string {
-    const platform = process.platform;
+    const isLinux = process.platform === 'linux';
 
-    if (platform === 'darwin') {
-      // macOS: script -q 静默模式
-      return `script -q ${scriptFile} ${shellName}`;
-    } else if (platform === 'linux') {
-      // Linux: script -q -c 执行指定 shell
-      return `script -q -c ${shellName} ${scriptFile}`;
+    switch (shellName) {
+      case 'powershell':
+        return `Start-Transcript -Path ${scriptFile} -Append`;
+      case 'zsh':
+      case 'bash':
+      case 'fish':
+      default:
+        // -q: 静默模式; -F(macOS)/-f(Linux): 实时 flush 输出到文件
+        return isLinux
+          ? `script -q -f ${scriptFile}\n`
+          : `script -q -F ${scriptFile}\n`;
     }
-
-    // 其他平台不支持
-    return '';
   }
 
   private async waitForScriptReady(
@@ -747,8 +720,8 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
       if (grown.hasGrown) {
         // 文件增长了但没有子进程 → 增加稳定计数
         session.noChildStableCount++;
-        // 连续 3 次（~600ms）确认无子进程且文件已增长 → 认为完成
-        if (session.noChildStableCount >= 3) {
+        // 连续 2 次确认无子进程且文件已增长 → 认为完成
+        if (session.noChildStableCount >= 2) {
           session.processCheckInProgress = false;
           return { isCompleted: true };
         }
