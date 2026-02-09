@@ -82,13 +82,7 @@ Actions:
 - hover: fetch type info and documentation at position
 - documentSymbols: list symbols in a file (with signatures)
 - workspaceSymbols: search symbols in workspace
-- callHierarchy: trace incoming/outgoing call chains from a function
-
-Notes:
-- line/character are 0-based.
-- Supported languages: TS/JS and Python.
-- filePath can be absolute or workspace-relative.
-`,
+- callHierarchy: trace incoming/outgoing call chains from a function`,
       input_schema: {
         type: 'object',
         properties: {
@@ -119,7 +113,7 @@ Notes:
           },
           query: {
             type: 'string',
-            description: 'Query string for workspaceSymbols'
+            description: 'Symbol name to search for (only for workspaceSymbols action, e.g. "FileExecutor")'
           },
           direction: {
             type: 'string',

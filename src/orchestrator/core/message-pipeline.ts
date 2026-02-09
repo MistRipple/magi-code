@@ -404,7 +404,7 @@ export class MessagePipeline {
         eventSeq: this.resolveEventSeq(message.eventSeq),
       };
     }
-    this.validateCategory(message);
+    if (!this.validateCategory(message)) return false;
 
     if (!this.config.enabled) { this.recordRequestMessage(message); this.emitByCategory(message); return true; }
 
@@ -550,24 +550,28 @@ export class MessagePipeline {
     }
   }
 
-  private validateCategory(message: StandardMessage): void {
+  private validateCategory(message: StandardMessage): boolean {
     switch (message.category) {
       case MessageCategory.CONTENT: {
         const isPlaceholder = message.metadata?.isPlaceholder === true;
         const isStreaming = message.lifecycle === MessageLifecycle.STARTED || message.lifecycle === MessageLifecycle.STREAMING;
         const isUserInput = message.type === MessageType.USER_INPUT;
         const hasBlocks = Array.isArray(message.blocks) && message.blocks.length > 0;
-        if (!hasBlocks && !isPlaceholder && !isStreaming && !isUserInput) throw new Error(`[MessagePipeline] Content message missing blocks: ${message.id}`);
+        if (!hasBlocks && !isPlaceholder && !isStreaming && !isUserInput) {
+          logger.warn('MessagePipeline: Content message missing blocks, 跳过', { id: message.id, type: message.type, lifecycle: message.lifecycle }, LogCategory.SYSTEM);
+          return false;
+        }
         break;
       }
-      case MessageCategory.CONTROL: if (!message.control) throw new Error(`[MessagePipeline] Control message missing control payload: ${message.id}`); break;
-      case MessageCategory.NOTIFY: if (!message.notify) throw new Error(`[MessagePipeline] Notify message missing notify payload: ${message.id}`); break;
+      case MessageCategory.CONTROL: if (!message.control) { logger.warn('MessagePipeline: Control message missing control payload, 跳过', { id: message.id }, LogCategory.SYSTEM); return false; } break;
+      case MessageCategory.NOTIFY: if (!message.notify) { logger.warn('MessagePipeline: Notify message missing notify payload, 跳过', { id: message.id }, LogCategory.SYSTEM); return false; } break;
       case MessageCategory.DATA:
-        if (!message.data) throw new Error(`[MessagePipeline] Data message missing data payload: ${message.id}`);
-        if (Array.isArray(message.blocks) && message.blocks.length > 0) throw new Error(`[MessagePipeline] Data message must not carry blocks: ${message.id}`);
+        if (!message.data) { logger.warn('MessagePipeline: Data message missing data payload, 跳过', { id: message.id }, LogCategory.SYSTEM); return false; }
+        if (Array.isArray(message.blocks) && message.blocks.length > 0) { logger.warn('MessagePipeline: Data message must not carry blocks, 跳过', { id: message.id }, LogCategory.SYSTEM); return false; }
         break;
-      default: throw new Error(`[MessagePipeline] Unknown message category: ${String(message.category)} (${message.id})`);
+      default: logger.warn(`MessagePipeline: Unknown message category, 跳过`, { category: String(message.category), id: message.id }, LogCategory.SYSTEM); return false;
     }
+    return true;
   }
 
   private safeEmit(event: string, data: unknown): boolean {

@@ -97,6 +97,8 @@ export interface TerminalSessionData {
   lastChildProcesses: Set<number>;
   /** 进程检测是否进行中（防止并发） */
   processCheckInProgress?: boolean;
+  /** "无子进程"稳定计数器 — 连续检测到无子进程的次数 */
+  noChildStableCount: number;
 }
 
 /**

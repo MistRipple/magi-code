@@ -250,6 +250,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
+    "@types/turndown": "^5.0.6",
     "@types/uuid": "^10.0.0",
     "@types/vscode": "^1.93.0",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
@@ -269,6 +270,7 @@
     "openai": "^6.16.0",
     "reflect-metadata": "^0.2.2",
     "tiktoken": "^1.0.22",
+    "turndown": "^7.2.2",
     "uuid": "^13.0.0"
   }
 }

@@ -164,7 +164,7 @@ export class OrchestrationExecutor {
           files: {
             type: 'array',
             items: { type: 'string' },
-            description: '任务涉及的关键文件路径（可选，帮助 Worker 定位）',
+            description: '任务涉及的关键文件路径，相对于工作区根目录（可选，帮助 Worker 定位。例如 "src/tools/search-executor.ts"）',
           },
           depends_on: {
             type: 'array',

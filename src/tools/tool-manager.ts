@@ -650,7 +650,7 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
           type: 'object',
           properties: {
             command: { type: 'string', description: '要执行的 shell 命令' },
-            cwd: { type: 'string', description: '命令执行目录（可选）' },
+            cwd: { type: 'string', description: '命令执行目录，相对于工作区根目录（可选，默认为工作区根目录）' },
             wait: { type: 'boolean', description: '是否等待进程完成（默认 true）' },
             max_wait_seconds: { type: 'number', description: '最大等待秒数（默认 30）' },
 
@@ -741,7 +741,7 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
     // 16. report_progress (Worker 进度汇报)
     tools.push({
       name: 'report_progress',
-      description: '汇报当前任务的执行进度。当任务涉及多个步骤时使用此工具，让用户实时了解你在做什么。',
+      description: '汇报当前任务的执行进度。仅在阶段转换时调用（如：分析完成→开始修改、修改完成→开始验证），不要在每次工具调用后都汇报。一个任务通常汇报 2-4 次即可。',
       input_schema: {
         type: 'object',
         properties: {

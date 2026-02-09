@@ -513,6 +513,9 @@ export class VSCodeTerminalExecutor {
 
   /**
    * 使用 Shell Integration 执行命令
+   *
+   * 同时监听 onDidEndTerminalShellExecution 事件和流结束，
+   * 以事件为主（可获取退出码）、流结束为兜底，避免流不终止导致挂起。
    */
   private async executeWithShellIntegration(
     process: TerminalProcess,
@@ -528,32 +531,56 @@ export class VSCodeTerminalExecutor {
     const stream = execution.read();
 
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const settle = (action: 'resolve' | 'reject', error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutId);
+        endListener?.dispose();
+        if (action === 'resolve') {
+          resolve();
+        } else {
+          reject(error);
+        }
+      };
+
       const timeoutId = setTimeout(() => {
-        process.state = 'killed';
+        process.state = 'timeout';
         process.exitCode = -1;
-        reject(new Error(`命令执行超时 (${timeout}ms)`));
+        settle('reject', new Error(`命令执行超时 (${timeout}ms)`));
       }, timeout);
 
       let output = '';
 
+      // 方式1: 监听 onDidEndTerminalShellExecution 事件（可获取退出码）
+      const endListener = vscode.window.onDidEndTerminalShellExecution?.((e) => {
+        if (e.execution === execution) {
+          process.exitCode = e.exitCode ?? 0;
+          process.state = process.exitCode === 0 ? 'completed' : 'failed';
+          process.output = output;
+          settle('resolve');
+        }
+      });
+
+      // 方式2: 读取流收集输出，流结束作为兜底完成信号
       (async () => {
         try {
           for await (const data of stream) {
+            if (settled) break;
             output += data;
             process.output = output;
           }
-
-          clearTimeout(timeoutId);
-          process.state = 'completed';
-          process.exitCode = 0;
-          process.output = output;
-          resolve();
+          // 流结束 — 如果事件还没触发，以流结束为准
+          if (!settled) {
+            process.state = 'completed';
+            process.exitCode = process.exitCode ?? 0;
+            process.output = output;
+            settle('resolve');
+          }
         } catch (error: any) {
-          clearTimeout(timeoutId);
-          process.state = 'completed';
           process.exitCode = 1;
           process.output = output;
-          reject(error);
+          settle('reject', error);
         }
       })();
     });

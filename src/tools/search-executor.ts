@@ -37,29 +37,17 @@ export class SearchExecutor implements ToolExecutor {
   getToolDefinition(): ExtendedToolDefinition {
     return {
       name: 'grep_search',
-      description: `Search for patterns in the codebase using regex.
-
-* Uses regex for pattern matching
-* Returns matching files and lines with context
-* Respects .gitignore by default
-
-Parameters:
-* pattern: Regex search pattern (required)
-* path: Directory to search in (default: workspace root)
-* include: Glob pattern for files to include (e.g., "*.ts")
-* exclude: Glob pattern for files to exclude (e.g., "node_modules")
-* context_lines: Number of context lines before/after match (default: 5)
-* case_sensitive: Case sensitive search (default: false)`,
+      description: 'Search for text or regex in the codebase. Returns matching files, line numbers, and surrounding context. Respects .gitignore by default.',
       input_schema: {
         type: 'object',
         properties: {
           pattern: {
             type: 'string',
-            description: 'Regex search pattern'
+            description: 'The regex to search for (required). Example: "export.*ContentBlock"'
           },
           path: {
             type: 'string',
-            description: 'Directory to search in (relative to workspace)'
+            description: 'Directory to search in, relative to workspace root (e.g. "src/tools"). Defaults to workspace root.'
           },
           include: {
             type: 'string',

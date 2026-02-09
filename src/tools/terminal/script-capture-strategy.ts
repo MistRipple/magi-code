@@ -157,6 +157,7 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
       lastFileEndPosition: 0,
       cwdTrackingFile: cwdFile,
       lastChildProcesses: new Set(),
+      noChildStableCount: 0,
     });
 
     // 执行启动脚本
@@ -237,6 +238,7 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
     // 捕获子进程快照
     if (session.shellPid && captureOutput) {
       this.captureChildProcessesSnapshot(session.shellPid, session);
+      session.noChildStableCount = 0;
     }
 
     // ScriptCapture 策略不需要包装命令，依赖 hook 注入标记
@@ -705,14 +707,6 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
       return { isCompleted: false };
     }
 
-    const grown = this.hasScriptFileGrown(processId, session);
-    if (!grown.hasGrown) {
-      if (session.processCheckInProgress) {
-        session.processCheckInProgress = false;
-      }
-      return { isCompleted: false };
-    }
-
     session.processCheckInProgress = true;
 
     try {
@@ -729,13 +723,35 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
           .forEach(p => currentChildren.add(p));
       }
 
-      // 如果之前有子进程，现在没有了，说明命令完成
       const hadChildren = session.lastChildProcesses.size > 0;
       const hasChildren = currentChildren.size > 0;
 
-      if (hadChildren && !hasChildren) {
+      if (hasChildren) {
+        // 有子进程在运行 — 重置稳定计数器，更新快照
+        session.noChildStableCount = 0;
+        session.lastChildProcesses = currentChildren;
+        session.processCheckInProgress = false;
+        return { isCompleted: false };
+      }
+
+      // 当前没有子进程
+      if (hadChildren) {
+        // 之前有子进程、现在消失了 → 命令完成
         session.processCheckInProgress = false;
         return { isCompleted: true };
+      }
+
+      // 之前也没有子进程（快速命令场景）— 使用稳定计数器
+      // 检查 script 文件是否曾经增长过（说明命令确实执行了）
+      const grown = this.hasScriptFileGrown(processId, session);
+      if (grown.hasGrown) {
+        // 文件增长了但没有子进程 → 增加稳定计数
+        session.noChildStableCount++;
+        // 连续 3 次（~600ms）确认无子进程且文件已增长 → 认为完成
+        if (session.noChildStableCount >= 3) {
+          session.processCheckInProgress = false;
+          return { isCompleted: true };
+        }
       }
 
       session.lastChildProcesses = currentChildren;

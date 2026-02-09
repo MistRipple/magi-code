@@ -1345,11 +1345,13 @@ export class AutonomousWorker extends EventEmitter {
     sections.push(`## 进度汇报
 任务上下文 ID: ${assignment.id}
 当你的任务涉及多个步骤时（如：阅读分析 → 设计方案 → 实施修改 → 验证结果），
-请在每个关键阶段调用 report_progress 工具汇报进度，参数：
+请仅在关键阶段转换时调用 report_progress 工具汇报进度，参数：
 - context_id: "${assignment.id}"
-- step: 当前步骤描述
+- step: 当前阶段描述（如"分析代码结构"、"开始修改"、"验证修改结果"）
 - percentage: 预估完成百分比 (0-100)
-这能让用户实时了解你的工作进展。`);
+
+注意：不要在每次工具调用后都汇报进度，只在阶段转换时汇报（通常 2-4 次即可）。
+例如：开始分析时汇报一次，开始修改时汇报一次，验证完成时汇报一次。`);
 
     return sections.join('\n\n');
   }

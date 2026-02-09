@@ -87,7 +87,7 @@ IMPORTANT:
           },
           path: {
             type: 'string',
-            description: 'File path relative to workspace'
+            description: 'File path relative to workspace root (e.g. "src/index.ts"). Absolute paths and paths outside the workspace are rejected.'
           },
           file_text: {
             type: 'string',

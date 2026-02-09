@@ -188,22 +188,26 @@ function handleMessage(message: WebviewMessage) {
     return;
   }
 
-  switch (type) {
-    case 'unifiedMessage':
-      handleUnifiedMessage(message);
-      break;
+  try {
+    switch (type) {
+      case 'unifiedMessage':
+        handleUnifiedMessage(message);
+        break;
 
-    case 'unifiedUpdate':
-      handleStandardUpdate(message);
-      break;
+      case 'unifiedUpdate':
+        handleStandardUpdate(message);
+        break;
 
-    case 'unifiedComplete':
-      handleStandardComplete(message);
-      break;
+      case 'unifiedComplete':
+        handleStandardComplete(message);
+        break;
 
-    default:
-      console.warn('[MessageHandler] 未知消息类型:', type, message);
-      break;
+      default:
+        console.warn('[MessageHandler] 未知消息类型:', type, message);
+        break;
+    }
+  } catch (error) {
+    console.error('[MessageHandler] 处理消息时发生未捕获异常:', error, message);
   }
 }
 
@@ -413,8 +417,8 @@ function handleStateUpdate(message: WebviewMessage) {
 function handleUnifiedMessage(message: WebviewMessage) {
   const rawStandard = message.message as StandardMessage;
   if (!rawStandard) {
-    console.error('[MessageHandler] unifiedMessage 缺少 message 字段:', message);
-    throw new Error('[MessageHandler] unifiedMessage 缺少 message');
+    console.warn('[MessageHandler] unifiedMessage 缺少 message 字段:', message);
+    return;
   }
   const standard = assertStandardMessageId(rawStandard);
 
@@ -1360,7 +1364,7 @@ function handleUnifiedControlMessage(standard: StandardMessage) {
     }
 
     default:
-      throw new Error(`[MessageHandler] 未知控制消息类型: ${controlType}`);
+      console.warn(`[MessageHandler] 未知控制消息类型: ${controlType}`, standard);
   }
 }
 
@@ -1368,7 +1372,8 @@ function handleUnifiedNotify(standard: StandardMessage) {
   const level = standard.notify?.level || 'info';
   const content = extractTextFromStandardBlocks(standard.blocks);
   if (!content) {
-    throw new Error('[MessageHandler] 通知消息缺少内容');
+    console.warn('[MessageHandler] 通知消息缺少内容，跳过:', standard);
+    return;
   }
   addToast(level, content);
 }
@@ -1376,7 +1381,8 @@ function handleUnifiedNotify(standard: StandardMessage) {
 function handleUnifiedData(standard: StandardMessage) {
   const data = standard.data;
   if (!data) {
-    throw new Error('[MessageHandler] 数据消息缺少 data 字段');
+    console.warn('[MessageHandler] 数据消息缺少 data 字段，跳过:', standard);
+    return;
   }
   const { dataType, payload } = data;
   const asMessage = (extra: Record<string, unknown>) => ({ ...extra } as WebviewMessage);

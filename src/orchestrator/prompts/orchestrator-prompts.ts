@@ -222,13 +222,15 @@ ${toolsListSection}
 1. codebase_retrieval — 语义搜索，快速找到相关代码区域
 2. text_editor(view) — 仅读取真正需要细看的关键文件
 
-编辑文件前必须先理解代码：
-1. codebase_retrieval — 定位相关代码
-2. grep_search — 精确匹配具体修改点
-3. text_editor(str_replace) — 精确修改
+简单文件修改（改名、typo、改配置等 1-3 个文件内的小改动）：
+1. text_editor(view) — 先查看要修改的文件
+2. text_editor(str_replace) — 精确修改
+
+**编排者直改规则**：你可以直接修改最多 3 个文件。超过 3 个文件的修改必须通过 dispatch_task 委派给 Worker。
+涉及代码逻辑的复杂修改（新功能、重构、多文件联动），即使不超过 3 个文件也应优先委派 Worker。
 
 **层级 3 - 分配 Worker**：使用 dispatch_task 委托
-- 需要多文件修改的代码实现任务
+- 涉及代码逻辑的复杂修改（新功能开发、重构、多文件联动）
 - 需要专业领域知识的任务（前端 → gemini，后端 → codex，架构 → claude）
 - 大规模重构或新功能开发
 - 需要多个 Worker 协作时，拆分为多个 dispatch_task 或使用 plan_mission

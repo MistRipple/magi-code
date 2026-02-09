@@ -42,10 +42,16 @@ export interface OrchestratorAdapterConfig {
  * Orchestrator LLM 适配器
  */
 export class OrchestratorLLMAdapter extends BaseLLMAdapter {
+  /** 编排者单次会话中允许直接修改的最大文件数 */
+  private static readonly MAX_ORCHESTRATOR_EDIT_FILES = 3;
+
   private systemPrompt: string;
   private conversationHistory: LLMMessage[] = [];
   private abortController?: AbortController;
   private historyConfig: Required<OrchestratorHistoryConfig>;
+
+  /** 当前会话中编排者已修改的文件路径集合（用于规模限制） */
+  private editedFiles = new Set<string>();
 
   /**
    * 临时配置（仅对下一次请求生效）
@@ -252,6 +258,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
    */
   clearHistory(): void {
     this.conversationHistory = [];
+    this.editedFiles.clear();
     logger.debug('Orchestrator conversation history cleared', undefined, LogCategory.LLM);
   }
 
@@ -577,6 +584,17 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     const maxToolResultChars = 20000;
 
     for (const toolCall of toolCalls) {
+      // 编排者角色约束：禁止文件写入操作
+      const blocked = this.checkOrchestratorToolRestriction(toolCall);
+      if (blocked) {
+        results.push({
+          toolCallId: toolCall.id,
+          content: blocked,
+          isError: true,
+        });
+        continue;
+      }
+
       try {
         const result = await this.toolManager.execute(toolCall);
         if (typeof result.content === 'string' && result.content.length > maxToolResultChars) {
@@ -595,5 +613,42 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     }
 
     return results;
+  }
+
+  /**
+   * 编排者工具调用限制检查
+   * 编排者可执行简单的单文件操作（改名、typo、改配置），
+   * 但多文件/复杂修改应委派给 Worker。
+   * 通过累计写入文件数追踪，超过阈值时拒绝并引导使用 dispatch_task。
+   * 返回 null 表示允许，返回字符串表示拒绝原因。
+   */
+  private checkOrchestratorToolRestriction(toolCall: ToolCall): string | null {
+    const { name, arguments: args } = toolCall;
+
+    // report_progress 仅供 Worker 使用，编排者无需汇报进度
+    if (name === 'report_progress') {
+      return 'report_progress 仅供 Worker 使用，编排者不需要调用此工具。直接执行任务即可。';
+    }
+
+    if (name === 'text_editor') {
+      const command = args?.command as string | undefined;
+      if (command && command !== 'view') {
+        const filePath = (args?.path || args?.file_path || '') as string;
+        this.editedFiles.add(filePath);
+        if (this.editedFiles.size > OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES) {
+          return `编排者已修改 ${this.editedFiles.size} 个文件（超过 ${OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES} 个），多文件修改应通过 dispatch_task 委派给 Worker。`;
+        }
+      }
+    }
+
+    if (name === 'remove_files') {
+      const filePath = (args?.path || args?.file_path || '') as string;
+      this.editedFiles.add(filePath);
+      if (this.editedFiles.size > OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES) {
+        return `编排者已修改 ${this.editedFiles.size} 个文件（超过 ${OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES} 个），多文件操作应通过 dispatch_task 委派给 Worker。`;
+      }
+    }
+
+    return null;
   }
 }

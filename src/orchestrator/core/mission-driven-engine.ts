@@ -2296,9 +2296,9 @@ ${this.activeUserPrompt}
       lines.push('内置工具:');
       // 分类映射：工具名 → 用途说明
       const builtinToolDescriptions: Record<string, { category: string; desc: string }> = {
-        'text_editor': { category: '文件操作', desc: '查看目录结构、读取/编辑/创建文件（优先使用）' },
+        'text_editor': { category: '文件操作', desc: '查看目录结构、读取/编辑/创建文件（编排者限改 3 个文件内的简单修改，复杂修改委派 Worker）' },
         'grep_search': { category: '文件操作', desc: '正则搜索代码内容（优先使用）' },
-        'remove_files': { category: '文件操作', desc: '删除文件' },
+        'remove_files': { category: '文件操作', desc: '删除文件（编排者限 3 个文件内）' },
         'launch-process': { category: '终端命令', desc: '执行构建/测试/启动服务等进程（不要用于读文件或浏览目录）' },
         'read-process': { category: '终端命令', desc: '读取终端进程输出' },
         'write-process': { category: '终端命令', desc: '向运行中的终端写入输入' },
