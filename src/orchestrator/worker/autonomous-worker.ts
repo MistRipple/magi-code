@@ -1889,6 +1889,8 @@ export class AutonomousWorker extends EventEmitter {
     const recoveredTodos: UnifiedTodo[] = [];
     const errors: string[] = [];
     let recoveryAttempts = 0;
+    // 聚合 Token 使用统计
+    let totalTokenUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
 
     // 设置当前 Mission ID - 提案 9.2
     this.currentMissionId = assignment.missionId;
@@ -1909,6 +1911,12 @@ export class AutonomousWorker extends EventEmitter {
     while (currentTodo) {
       // 传递共享上下文 - 提案 9.2
       const result = await this.executeTodo(currentTodo, assignment, options, sharedContextForRecovery);
+
+      // 聚合 Token 统计
+      if (result.tokenUsage) {
+        totalTokenUsage.inputTokens += result.tokenUsage.inputTokens || 0;
+        totalTokenUsage.outputTokens += result.tokenUsage.outputTokens || 0;
+      }
 
       if (result.success) {
         completedTodos.push(result.todo);
@@ -1982,6 +1990,7 @@ export class AutonomousWorker extends EventEmitter {
       totalDuration: Date.now() - startTime,
       errors,
       recoveryAttempts,
+      tokenUsage: totalTokenUsage,
     };
     const qualityCheckedResult = this.applyQualityGate(
       assignment,

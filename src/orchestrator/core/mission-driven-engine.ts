@@ -1313,8 +1313,6 @@ export class MissionDrivenEngine extends EventEmitter {
    * 创建 Assignment、获取 Worker 实例、在后台执行。
    * 执行过程中通过 subTaskCard 回传进度，完成后更新 DispatchBatch 状态。
    */
-  private static readonly WORKER_TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟
-
   private launchDispatchWorker(taskId: string, worker: WorkerSlot, task: string, files?: string[]): void {
     const batch = this.activeBatch;
 
@@ -1384,9 +1382,9 @@ export class MissionDrivenEngine extends EventEmitter {
       });
 
       try {
-      // C-10: Worker 级超时，Promise.race 包裹
       // C-09: 传递 cancellationToken 到 Worker，建立取消信号链
-      const workerPromise = workerInstance.executeAssignment(assignment, {
+      // 不设置总时间超时 — Worker 可以运行任意长时间，失败检测由 Worker 内部的连续失败机制处理
+      const result = await workerInstance.executeAssignment(assignment, {
         workingDirectory: this.workspaceRoot,
         adapterFactory: this.adapterFactory,
         projectContext,
@@ -1394,17 +1392,6 @@ export class MissionDrivenEngine extends EventEmitter {
         cancellationToken: batch?.cancellationToken,
         imagePaths: this.activeImagePaths,
       });
-
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        const timer = setTimeout(
-          () => reject(new Error(`Worker ${worker} 执行超时（${MissionDrivenEngine.WORKER_TIMEOUT_MS / 60000} 分钟）`)),
-          MissionDrivenEngine.WORKER_TIMEOUT_MS,
-        );
-        // 取消时清除超时计时器，避免泄漏
-        batch?.cancellationToken.onCancel(() => clearTimeout(timer));
-      });
-
-      const result = await Promise.race([workerPromise, timeoutPromise]);
 
       const summary = result.directOutput?.summary
         || (result.completedTodos.length > 0
@@ -1436,6 +1423,11 @@ export class MissionDrivenEngine extends EventEmitter {
       } else {
         batch?.markFailed(taskId, dispatchResult);
       }
+
+      // 记录 Worker Token 使用到 executionStats
+      const singleResult = new Map<string, import('../worker').AutonomousExecutionResult>();
+      singleResult.set(taskId, result);
+      this.recordWorkerTokenUsage(singleResult);
 
       logger.info('编排工具.dispatch_task.Worker完成', {
         worker, taskId, success: result.success, summary,
@@ -2108,6 +2100,9 @@ ${this.activeUserPrompt}
         getSupplementaryInstructions: (workerId) => this.consumeSupplementaryInstructions(workerId),
       });
 
+      // 记录 Worker Token 使用到 executionStats
+      this.recordWorkerTokenUsage(executionResult.assignmentResults);
+
       // 验证和总结
       const verification = await this.missionOrchestrator.verifyMission(mission.id);
       this.lastExecutionSuccess = executionResult.success && verification.passed;
@@ -2171,6 +2166,9 @@ ${this.activeUserPrompt}
         timeout: this.config.timeout,
         getSupplementaryInstructions: (workerId) => this.consumeSupplementaryInstructions(workerId),
       });
+
+      // 记录 Worker Token 使用到 executionStats
+      this.recordWorkerTokenUsage(executionResult.assignmentResults);
 
       // 验证和总结
       let summaryContent = '';
@@ -2380,6 +2378,33 @@ ${this.activeUserPrompt}
     return this.contextManager.getAssembledContextText(
       this.contextManager.buildAssemblyOptions(defaultMissionId, 'orchestrator', 8000)
     );
+  }
+
+  /**
+   * 记录 Worker 执行的 Token 使用（按 Assignment 维度）
+   * 从 ExecutionResult.assignmentResults 中遍历每个 assignment，
+   * 将其 tokenUsage 写入 executionStats
+   */
+  private recordWorkerTokenUsage(
+    assignmentResults: Map<string, import('../worker').AutonomousExecutionResult>
+  ): void {
+    for (const [assignmentId, assignmentResult] of assignmentResults) {
+      const tokenUsage = assignmentResult.tokenUsage;
+      if (!tokenUsage || (tokenUsage.inputTokens === 0 && tokenUsage.outputTokens === 0)) {
+        continue;
+      }
+
+      this.executionStats.recordExecution({
+        worker: assignmentResult.assignment.workerId,
+        taskId: assignmentId,
+        subTaskId: 'assignment',
+        success: assignmentResult.success,
+        duration: assignmentResult.totalDuration,
+        inputTokens: tokenUsage.inputTokens,
+        outputTokens: tokenUsage.outputTokens,
+        phase: 'execution',
+      });
+    }
   }
 
   /**

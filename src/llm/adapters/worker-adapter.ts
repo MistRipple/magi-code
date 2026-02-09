@@ -159,14 +159,18 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     // 每轮 LLM 调用独立一个 stream，确保时间轴正确：
     // 当轮 stream 内包含 thinking + text + tool_call + tool_result，
     // endStream 后再产生新消息或下一轮 stream，时间顺序天然正确。
-    // Worker 执行实际编码任务时需要多轮工具调用（读文件、搜索、写文件、验证），
-    // 上限需要足够宽裕以支撑完整的任务执行流程。
-    const MAX_ROUNDS = 25;
+    // 无轮次上限 — Worker 可执行任意多轮工具调用，
+    // 异常终止完全依赖连续失败检测机制：连续 5 次失败 → 提示换方式，累计 25 轮失败 → 终止
+    const CONSECUTIVE_FAIL_THRESHOLD = 5;
+    const TOTAL_FAIL_LIMIT = 25;
 
     try {
       let finalText = '';
+      let consecutiveFailures = 0;
+      let totalFailures = 0;
 
-      for (let round = 0; round < MAX_ROUNDS; round++) {
+      let round = 0;
+      while (true) {
         this.seenThinking = false;
         this.decisionHookAppliedForThinking = false;
 
@@ -272,15 +276,36 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
             })),
           });
 
+          // 连续失败检测
+          const allFailed = toolResults.every(r => r.isError);
+          if (allFailed) {
+            consecutiveFailures++;
+            totalFailures++;
+
+            if (totalFailures >= TOTAL_FAIL_LIMIT) {
+              // 累计失败达到上限 → 终止
+              finalText = assistantText || `工具调用累计失败 ${TOTAL_FAIL_LIMIT} 轮，判定为异常终止。`;
+              this.normalizer.endStream(streamId);
+              break;
+            }
+
+            if (consecutiveFailures >= CONSECUTIVE_FAIL_THRESHOLD) {
+              // 连续失败达到阈值 → 注入提示让 LLM 换方式
+              consecutiveFailures = 0;
+              this.conversationHistory.push({
+                role: 'user',
+                content: `[System] 工具调用已连续失败 ${CONSECUTIVE_FAIL_THRESHOLD} 次，请换一种方式或策略继续处理任务。`,
+              });
+            }
+          } else {
+            consecutiveFailures = 0;
+          }
+
           this.applyDecisionHook({ type: 'tool_result' });
 
           // 当轮 stream 结束，下一轮开启新 stream
           this.normalizer.endStream(streamId);
-
-          // 达到最大轮次 → 强制收敛
-          if (round === MAX_ROUNDS - 1) {
-            finalText = assistantText || '已达到工具调用轮次上限，自动收敛。';
-          }
+          round++;
         } catch (error: any) {
           this.normalizer.endStream(streamId, error?.message || 'Request failed');
           throw error;

@@ -422,12 +422,18 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     // 当轮 stream 内包含 thinking + text + tool_call + tool_result，
     // endStream 后工具副作用产生的新消息（如 subTaskCard）自然排在后面，
     // 下一轮 stream 再开启新卡片，时间顺序天然正确。
-    const MAX_ROUNDS = 10;
+    // 无轮次上限 — 编排者可执行任意多轮工具调用，
+    // 异常终止完全依赖连续失败检测机制：连续 5 次失败 → 提示换方式，累计 25 轮失败 → 终止
+    const CONSECUTIVE_FAIL_THRESHOLD = 5;
+    const TOTAL_FAIL_LIMIT = 25;
 
     try {
       let finalText = '';
+      let consecutiveFailures = 0;
+      let totalFailures = 0;
 
-      for (let round = 0; round < MAX_ROUNDS; round++) {
+      let round = 0;
+      while (true) {
         // 只有首轮使用 startStreamWithContext 绑定 placeholder messageId，
         // 后续轮次生成新 messageId，避免复用同一个 ID 导致 Pipeline 重新激活覆盖前一轮内容
         const streamId = visibility === 'system'
@@ -522,13 +528,32 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             })),
           });
 
+          // 连续失败检测
+          const allFailed = toolResults.every(r => r.isError);
+          if (allFailed) {
+            consecutiveFailures++;
+            totalFailures++;
+
+            if (totalFailures >= TOTAL_FAIL_LIMIT) {
+              finalText = assistantText || `工具调用累计失败 ${TOTAL_FAIL_LIMIT} 轮，判定为异常终止。`;
+              this.normalizer.endStream(streamId);
+              break;
+            }
+
+            if (consecutiveFailures >= CONSECUTIVE_FAIL_THRESHOLD) {
+              consecutiveFailures = 0;
+              history.push({
+                role: 'user',
+                content: `[System] 工具调用已连续失败 ${CONSECUTIVE_FAIL_THRESHOLD} 次，请换一种方式或策略继续处理任务。`,
+              });
+            }
+          } else {
+            consecutiveFailures = 0;
+          }
+
           // 当轮 stream 结束，工具副作用（subTaskCard 等）已自然排在后面
           this.normalizer.endStream(streamId);
-
-          // 达到最大轮次 → 强制收敛
-          if (round === MAX_ROUNDS - 1) {
-            finalText = assistantText || '已达到工具调用轮次上限，自动收敛。';
-          }
+          round++;
         } catch (error: any) {
           this.normalizer.endStream(streamId, error?.message || 'Request failed');
           throw error;

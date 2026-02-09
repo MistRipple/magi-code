@@ -191,8 +191,8 @@
 
   <!-- 任务描述 -->
   {#if card.title || card.description}
-    <div class="card-body">
-      {card.title || card.description}
+    <div class="card-body" title={card.title || card.description}>
+      {(card.title || card.description || '').replace(/^#{1,6}\s+/gm, '').trim()}
     </div>
   {/if}
 
@@ -471,6 +471,11 @@
     font-size: var(--text-sm);
     color: var(--foreground);
     line-height: 1.5;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   /* 统计信息 */
