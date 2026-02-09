@@ -341,12 +341,14 @@
 
   /* ===== SubTaskCard 独立样式（与 assistant 消息保持一致的间距） ===== */
   .message-item.subtask-card-only {
-    margin-right: var(--space-2);  /* 与 assistant 消息一致 */
+    padding: 0 var(--space-4);
+    margin-right: var(--space-2);
   }
 
   /* ===== InstructionCard 独立样式（任务说明卡片） ===== */
   .message-item.instruction-card-only {
-    margin-right: var(--space-2);  /* 与 assistant 消息一致 */
+    padding: 0 var(--space-4);
+    margin-right: var(--space-2);
   }
 
   /* ===== 助手消息样式（card 模式：客角色） ===== */

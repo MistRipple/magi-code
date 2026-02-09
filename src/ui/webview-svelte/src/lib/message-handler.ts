@@ -2290,7 +2290,7 @@ function blocksToContent(blocks: ContentBlock[]): string {
       textParts.push(formatPlanBlock(block.plan));
     }
   }
-  return textParts.join('\\n\\n');
+  return textParts.join('\n\n');
 }
 
 function mapToolStatus(status: string | undefined): ToolCall['status'] {
@@ -2322,16 +2322,16 @@ function formatPlanBlock(block: any): string {
   if (block.goal) parts.push(`目标: ${block.goal}`);
   if (block.analysis) parts.push(`分析: ${block.analysis}`);
   if (Array.isArray(block.constraints) && block.constraints.length > 0) {
-    parts.push(`约束:\\n- ${block.constraints.join('\\n- ')}`);
+    parts.push(`约束:\n- ${block.constraints.join('\n- ')}`);
   }
   if (Array.isArray(block.acceptanceCriteria) && block.acceptanceCriteria.length > 0) {
-    parts.push(`验收标准:\\n- ${block.acceptanceCriteria.join('\\n- ')}`);
+    parts.push(`验收标准:\n- ${block.acceptanceCriteria.join('\n- ')}`);
   }
   if (block.riskLevel) parts.push(`风险等级: ${block.riskLevel}`);
   if (Array.isArray(block.riskFactors) && block.riskFactors.length > 0) {
-    parts.push(`风险因素:\\n- ${block.riskFactors.join('\\n- ')}`);
+    parts.push(`风险因素:\n- ${block.riskFactors.join('\n- ')}`);
   }
-  return parts.join('\\n\\n');
+  return parts.join('\n\n');
 }
 
 /**

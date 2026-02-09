@@ -188,7 +188,7 @@
 
   // 缩放控制
   function zoomIn() {
-    scale = Math.min(scale * 1.2, 5);
+    scale = Math.min(scale * 1.2, 10);
   }
 
   function zoomOut() {
@@ -209,7 +209,6 @@
   let initialTranslateY = 0;
 
   function handleMouseDown(e: MouseEvent) {
-    // 允许任何时候拖拽
     isDragging = true;
     dragStartX = e.clientX;
     dragStartY = e.clientY;
@@ -227,13 +226,6 @@
 
   function handleMouseUp() {
     isDragging = false;
-  }
-
-  // 滚轮缩放
-  function handleWheel(e: WheelEvent) {
-    e.preventDefault();
-    const delta = e.deltaY > 0 ? 0.9 : 1.1;
-    scale = Math.min(Math.max(scale * delta, 0.3), 5);
   }
 
   // 复制 SVG
@@ -285,7 +277,6 @@
     onmousemove={handleMouseMove}
     onmouseup={handleMouseUp}
     onmouseleave={handleMouseUp}
-    onwheel={handleWheel}
     class:dragging={isDragging}
     role="application"
     aria-label="Interactive Mermaid diagram"

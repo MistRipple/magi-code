@@ -70,44 +70,15 @@ export class ClaudeNormalizer extends BaseNormalizer {
 
   constructor(config?: Partial<NormalizerConfig>) {
     super({
-      agent: 'claude',  // ✅ 使用 agent
+      agent: 'claude',
       defaultSource: 'worker',
       ...config,
     });
   }
 
-  /**
-   * 🔧 覆盖 processTextDelta
-   *
-   * WorkerLLMAdapter 调用此方法传入文本增量。
-   * 对于 Claude，这些文本增量是需要解析的 JSON 事件流。
-   * 因此我们将其重定向到 parseChunk 以利用 JSON 解析逻辑。
-   */
-  processTextDelta(messageId: string, delta: string): void {
-    const context = this.getContext(messageId);
-    if (!context) {
-      this.debug(`[claude] 未找到消息上下文: ${messageId}`);
-      return;
-    }
-
-    // 🔧 必须更新 rawBuffer，因为 parseChunk 中的 detectInteraction 依赖它
-    context.rawBuffer += delta;
-
-    // 调用 parseChunk 进行 JSON 解析（而不是像父类那样直接 append）
-    const updates = this.parseChunk(context, delta);
-
-    // 触发更新事件
-    for (const update of updates) {
-      this.emit(MESSAGE_EVENTS.UPDATE, update);
-    }
-  }
-
-  /**
-   * 获取活跃上下文（暴露给 processTextDelta 使用）
-   */
-  private getContext(messageId: string): ParseContext | undefined {
-    return this.activeContexts.get(messageId);
-  }
+  // processTextDelta 使用 BaseNormalizer 默认实现（直接 append）
+  // UniversalClient 已完成 SDK 事件解析，传入的是标准化纯文本 delta
+  // 不再重定向到 parseChunk 的 JSON 行解析，避免空行丢失/trim 破坏 markdown 结构
 
   protected parseChunk(context: ParseContext, chunk: string): StreamUpdate[] {
     const updates: StreamUpdate[] = [];

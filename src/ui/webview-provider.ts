@@ -2206,6 +2206,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         await this.openFileInEditor(message.filepath);
         break;
 
+      case 'openLink':
+        // 在外部浏览器中打开链接（从 markdown 链接点击）
+        if (message.url && typeof message.url === 'string') {
+          vscode.env.openExternal(vscode.Uri.parse(message.url));
+        }
+        break;
+
       case 'newSession':
         await this.handleNewSession();
         break;

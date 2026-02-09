@@ -621,7 +621,7 @@ export class MermaidPanel {
 
     // 缩放控制
     document.getElementById('zoom-in').onclick = function() {
-      scale = Math.min(scale * 1.2, 5);
+      scale = Math.min(scale * 1.2, 15);
       updateTransform();
     };
 
@@ -676,7 +676,7 @@ export class MermaidPanel {
     container.addEventListener('wheel', function(e) {
       e.preventDefault();
       const delta = e.deltaY > 0 ? 0.9 : 1.1;
-      scale = Math.min(Math.max(scale * delta, 0.3), 5);
+      scale = Math.min(Math.max(scale * delta, 0.3), 15);
       updateTransform();
     }, { passive: false });
 

@@ -3,6 +3,7 @@
   import { marked, type Token, type Tokens } from 'marked';
   import CodeBlock from './CodeBlock.svelte';
   import { preprocessMarkdown } from '../lib/markdown-utils';
+  import { vscode } from '../lib/vscode-bridge';
 
   // Props
   interface Props {
@@ -22,15 +23,57 @@
   // 渲染控制：使用引用对象存储最新内容，彻底解决闭包旧值问题
   // 字符串是值传递，对象是引用传递。定时器读取 contentRef.val 永远是新的。
   const contentRef = { val: '' };
-  
+
   // 节流控制
   let lastRenderTime = 0;
   let renderTimer: ReturnType<typeof setTimeout> | undefined;
 
+  // 参考 Augment 的自定义 renderer 方案：
+  // 通过 marked.use() 配置自定义 renderer，控制链接、图片等元素的 HTML 输出
+  // 而非 Augment 的全量 Token 组件化（改造量过大），用 renderer 覆盖达到同等效果
+  const renderer: Parameters<typeof marked.use>[0]['renderer'] = {
+    // 链接：在 webview 中通过 postMessage 打开，避免直接导航
+    link({ href, title, tokens }) {
+      const text = this.parser.parseInline(tokens);
+      const safeHref = escapeAttr(href || '');
+      const titleAttr = title ? ` title="${escapeAttr(title)}"` : '';
+      return `<a href="${safeHref}" class="md-link" data-href="${safeHref}"${titleAttr}>${text}</a>`;
+    },
+    // 图片：限制 src、添加 loading=lazy
+    image({ href, title, text }) {
+      const safeHref = escapeAttr(href || '');
+      const safAlt = escapeAttr(text || '');
+      const titleAttr = title ? ` title="${escapeAttr(title)}"` : '';
+      return `<img src="${safeHref}" alt="${safAlt}"${titleAttr} loading="lazy" />`;
+    },
+  };
+
+  function escapeAttr(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // 初始化 marked 配置（模块级，确保首次渲染也生效）
+  marked.setOptions({ breaks: true, gfm: true });
+  marked.use({ renderer });
+
+  let containerEl: HTMLDivElement;
+
   onMount(() => {
-    marked.setOptions({ breaks: true, gfm: true });
+    // 事件委托：处理 markdown 中链接的点击（参考 Augment 的 os() 链接分发）
+    function handleLinkClick(e: MouseEvent) {
+      const target = (e.target as HTMLElement).closest('a.md-link') as HTMLAnchorElement | null;
+      if (!target) return;
+      e.preventDefault();
+      const href = target.getAttribute('data-href') || target.href;
+      if (href) {
+        vscode.postMessage({ type: 'openLink', url: href });
+      }
+    }
+    containerEl?.addEventListener('click', handleLinkClick);
+
     return () => {
       if (renderTimer) clearTimeout(renderTimer);
+      containerEl?.removeEventListener('click', handleLinkClick);
     };
   });
 
@@ -125,7 +168,7 @@
   });
 </script>
 
-<div class="markdown-content" class:streaming={isStreaming}>
+<div class="markdown-content" class:streaming={isStreaming} bind:this={containerEl}>
   {#each segments as segment, i (`segment-${i}-${segment.type}`)}
     {#if segment.type === 'markdown'}
       {@html segment.html}
@@ -221,7 +264,27 @@
   }
 
   .markdown-content :global(hr) {
-    display: none;
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: var(--spacing-md) 0;
+  }
+
+  /* 链接样式 */
+  .markdown-content :global(a.md-link) {
+    color: var(--primary);
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  .markdown-content :global(a.md-link:hover) {
+    text-decoration: underline;
+  }
+
+  /* 内联代码样式 */
+  .markdown-content :global(:not(pre) > code) {
+    background: var(--code-bg, rgba(0,0,0,0.2));
+    padding: 1px 4px;
+    border-radius: var(--radius-sm, 3px);
   }
 
   .markdown-content :global(img) {

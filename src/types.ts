@@ -479,6 +479,7 @@ export type WebviewToExtensionMessage =
   | { type: 'updateSetting'; key: string; value: unknown }
   | { type: 'viewDiff'; filePath: string }
   | { type: 'openFile'; filepath: string }
+  | { type: 'openLink'; url: string }
   | { type: 'confirmPlan'; confirmed: boolean }
   | { type: 'answerQuestions'; answer: string | null }
   | { type: 'getState' }
