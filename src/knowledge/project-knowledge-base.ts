@@ -15,6 +15,7 @@ import * as path from 'path';
 import { logger, LogCategory } from '../logging';
 import { LLMConfigLoader } from '../llm/config';
 import { LLMClient, LLMMessageParams } from '../llm/types';
+import { LocalSearchEngine, SearchOptions, SearchResult } from './local-search-engine';
 
 // ============================================================================
 // 类型定义
@@ -144,6 +145,7 @@ export class ProjectKnowledgeBase {
   private ignorePatterns: string[];
 
   private llmClient: LLMClient | null = null;
+  private localSearchEngine: LocalSearchEngine | null = null;
 
   constructor(config: ProjectKnowledgeConfig) {
     this.projectRoot = config.projectRoot;
@@ -197,11 +199,15 @@ export class ProjectKnowledgeBase {
       await this.indexProject();
     }
 
+    // 构建本地搜索引擎索引
+    await this.buildSearchEngineIndex();
+
     logger.info('项目知识库.初始化.完成', {
       files: this.codeIndex?.files.length || 0,
       adrs: this.adrs.length,
       faqs: this.faqs.length,
-      learnings: this.learnings.length
+      learnings: this.learnings.length,
+      searchEngine: this.localSearchEngine?.getStats() || null,
     }, LogCategory.SESSION);
   }
 
@@ -566,8 +572,10 @@ export class ProjectKnowledgeBase {
       try {
         logger.info('项目知识库.索引.刷新开始', undefined, LogCategory.SESSION);
         await this.indexProject();
+        await this.buildSearchEngineIndex();
         logger.info('项目知识库.索引.刷新完成', {
           files: this.codeIndex?.files.length || 0,
+          searchEngine: this.localSearchEngine?.getStats() || null,
         }, LogCategory.SESSION);
       } catch (error) {
         logger.error('项目知识库.索引.刷新失败', { error }, LogCategory.SESSION);
@@ -583,6 +591,24 @@ export class ProjectKnowledgeBase {
    */
   getCodeIndex(): CodeIndex | null {
     return this.codeIndex;
+  }
+
+  /**
+   * 本地搜索入口（LocalSearchEngine 代理）
+   * 当 ACE 不可用时，通过此方法进行本地代码上下文检索
+   */
+  async search(query: string, options: SearchOptions = {}): Promise<SearchResult[]> {
+    if (!this.localSearchEngine || !this.localSearchEngine.isReady) {
+      return [];
+    }
+    return this.localSearchEngine.search(query, options);
+  }
+
+  /**
+   * 获取本地搜索引擎实例（用于外部直接访问增量更新等）
+   */
+  getSearchEngine(): LocalSearchEngine | null {
+    return this.localSearchEngine;
   }
 
   /**
@@ -644,11 +670,37 @@ export class ProjectKnowledgeBase {
   }
 
   /**
-   * 设置 LLM 客户端（用于自动知识提取）
+   * 设置 LLM 客户端（用于自动知识提取 + 搜索引擎查询扩展）
    */
   setLLMClient(client: LLMClient): void {
     this.llmClient = client;
+
+    // 同步传递给搜索引擎用于查询扩展
+    if (this.localSearchEngine) {
+      this.localSearchEngine.setLLMClient(client);
+    }
+
     logger.info('项目知识库.LLM客户端.已设置', undefined, LogCategory.SESSION);
+  }
+
+  /**
+   * 文件变更事件入口（由外部 FileSystemWatcher 调用）
+   * 将事件转发给搜索引擎进行增量更新
+   */
+  onFileEvent(filePath: string, type: 'changed' | 'created' | 'deleted'): void {
+    if (!this.localSearchEngine) return;
+
+    switch (type) {
+      case 'changed':
+        this.localSearchEngine.onFileChanged(filePath);
+        break;
+      case 'created':
+        this.localSearchEngine.onFileCreated(filePath);
+        break;
+      case 'deleted':
+        this.localSearchEngine.onFileDeleted(filePath);
+        break;
+    }
   }
 
   /**
@@ -1094,6 +1146,33 @@ ${conversationText}
 
     logger.info('项目知识库.已清空', counts, LogCategory.SESSION);
     return counts;
+  }
+
+  // ============================================================================
+  // 本地搜索引擎
+  // ============================================================================
+
+  /**
+   * 构建本地搜索引擎索引（从 codeIndex 的文件列表复用）
+   */
+  private async buildSearchEngineIndex(): Promise<void> {
+    if (!this.codeIndex || this.codeIndex.files.length === 0) return;
+
+    try {
+      this.localSearchEngine = new LocalSearchEngine(this.projectRoot);
+
+      // 传递 LLM 客户端用于查询扩展
+      if (this.llmClient) {
+        this.localSearchEngine.setLLMClient(this.llmClient);
+      }
+
+      await this.localSearchEngine.buildIndex(
+        this.codeIndex.files.map(f => ({ path: f.path, type: f.type }))
+      );
+    } catch (error) {
+      logger.warn('项目知识库.搜索引擎.构建失败', { error }, LogCategory.SESSION);
+      this.localSearchEngine = null;
+    }
   }
 
   // ============================================================================

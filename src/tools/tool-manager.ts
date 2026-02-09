@@ -11,7 +11,6 @@
  * - web_fetch: URL 内容获取
  * - mermaid_diagram: Mermaid 图表渲染
  * - codebase_retrieval: 代码库语义搜索 (ACE)
- * - lsp_query: LSP 代码智能查询
  * - dispatch_task: 将子任务分配给专业 Worker
  * - plan_mission: 创建多 Worker 协作计划
  * - send_worker_message: 向 Worker 面板发送消息
@@ -329,7 +328,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     'web_fetch',
     'mermaid_diagram',
     'codebase_retrieval',
-    'lsp_query',
     'dispatch_task',
     'plan_mission',
     'send_worker_message',
@@ -451,9 +449,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
       case 'codebase_retrieval':
         return await this.aceExecutor.execute(toolCall);
-
-      case 'lsp_query':
-        return await this.lspExecutor.execute(toolCall);
 
       case 'dispatch_task':
       case 'plan_mission':
@@ -740,13 +735,10 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
     // 12. codebase_retrieval (ACE 语义搜索)
     tools.push(this.aceExecutor.getToolDefinition());
 
-    // 13. lsp_query (LSP 代码智能)
-    tools.push(this.lspExecutor.getToolDefinition());
-
-    // 14-16. 编排工具 (dispatch_task, plan_mission, send_worker_message)
+    // 13-15. 编排工具 (dispatch_task, plan_mission, send_worker_message)
     tools.push(...this.orchestrationExecutor.getToolDefinitions());
 
-    // 17. report_progress (Worker 进度汇报)
+    // 16. report_progress (Worker 进度汇报)
     tools.push({
       name: 'report_progress',
       description: '汇报当前任务的执行进度。当任务涉及多个步骤时使用此工具，让用户实时了解你在做什么。',
@@ -1023,6 +1015,20 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
    */
   getOrchestrationExecutor(): OrchestrationExecutor {
     return this.orchestrationExecutor;
+  }
+
+  /**
+   * 获取搜索执行器（用于本地上下文检索回退）
+   */
+  getSearchExecutor(): SearchExecutor {
+    return this.searchExecutor;
+  }
+
+  /**
+   * 获取 LSP 执行器（用于本地上下文检索回退）
+   */
+  getLspExecutor(): LspExecutor {
+    return this.lspExecutor;
   }
 
   /**

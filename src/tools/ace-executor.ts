@@ -11,6 +11,10 @@
  * - 实时索引，结果反映代码库当前状态
  * - 支持 .gitignore 配置隔离
  *
+ * 降级策略：
+ * - ACE 可用时：优先使用远程语义搜索
+ * - ACE 不可用时：自动回退到 LocalSearchEngine（TF-IDF + 符号 + 依赖图）
+ *
  * 配置来源：由 ToolManager 通过 configureAce() 方法统一管理
  * 配置存储：~/.multicli/config.json 的 promptEnhance 字段
  */
@@ -21,10 +25,17 @@ import { AceIndexManager, IndexResult, SearchResult } from '../ace/index-manager
 import { logger, LogCategory } from '../logging';
 
 /**
+ * 本地搜索回退函数签名
+ * 由外部（webview-provider）注入 LocalSearchEngine 的搜索能力
+ */
+export type LocalSearchFallback = (query: string, maxResults?: number) => Promise<string | null>;
+
+/**
  * ACE 执行器
  * 提供代码库语义搜索功能
  *
  * 注意：配置由 ToolManager 统一管理，不直接读取配置文件
+ * 降级：当 ACE 不可用时，通过 localSearchFallback 回退到本地索引搜索
  */
 export class AceExecutor implements ToolExecutor {
   private workspaceRoot: string;
@@ -33,6 +44,9 @@ export class AceExecutor implements ToolExecutor {
   private indexManager: AceIndexManager | null = null;
   private isIndexing = false;
   private lastIndexResult: IndexResult | null = null;
+  private localSearchFallback: LocalSearchFallback | null = null;
+  /** ACE 搜索超时（毫秒），超时后自动降级到本地搜索 */
+  private static readonly ACE_SEARCH_TIMEOUT = 8000;
 
   constructor(workspaceRoot: string, baseUrl?: string, token?: string) {
     this.workspaceRoot = workspaceRoot;
@@ -119,7 +133,17 @@ Parameters:
   }
 
   /**
+   * 注入本地搜索回退
+   * 由 webview-provider 在 PKB 初始化后调用
+   */
+  setLocalSearchFallback(fallback: LocalSearchFallback): void {
+    this.localSearchFallback = fallback;
+    logger.info('AceExecutor.本地搜索回退已注入', undefined, LogCategory.TOOLS);
+  }
+
+  /**
    * 执行工具调用
+   * 策略：ACE 可用 → 远程语义搜索；ACE 不可用 → 本地索引搜索
    */
   async execute(toolCall: ToolCall): Promise<ToolResult> {
     const args = toolCall.arguments as {
@@ -135,61 +159,125 @@ Parameters:
       };
     }
 
-    const ensureIndexed = args.ensure_indexed !== false; // 默认 true
+    const ensureIndexed = args.ensure_indexed !== false;
 
     logger.debug('AceExecutor executing', {
       query: args.query,
-      ensureIndexed
+      ensureIndexed,
+      hasAce: !!this.indexManager,
+      hasFallback: !!this.localSearchFallback,
     }, LogCategory.TOOLS);
 
     try {
-      // 检查是否配置了 ACE API
-      if (!this.indexManager) {
+      // 策略 1: ACE 远程语义搜索（带超时降级）
+      if (this.indexManager) {
+        const searchPromise = this.indexManager.search(args.query, ensureIndexed);
+        const timeoutPromise = new Promise<SearchResult>((_, reject) =>
+          setTimeout(() => reject(new Error('ACE_TIMEOUT')), AceExecutor.ACE_SEARCH_TIMEOUT)
+        );
+
+        let result: SearchResult;
+        try {
+          result = await Promise.race([searchPromise, timeoutPromise]);
+        } catch (raceError: any) {
+          if (raceError?.message === 'ACE_TIMEOUT') {
+            logger.warn('AceExecutor.ACE搜索超时，降级到本地搜索', {
+              query: args.query.substring(0, 50),
+              timeout: AceExecutor.ACE_SEARCH_TIMEOUT,
+            }, LogCategory.TOOLS);
+            return await this.executeLocalFallback(toolCall.id, args.query, `超时 ${AceExecutor.ACE_SEARCH_TIMEOUT}ms`);
+          }
+          throw raceError;
+        }
+
+        if (result.status === 'error') {
+          // ACE 搜索失败，尝试回退到本地
+          logger.warn('AceExecutor.ACE搜索失败，尝试本地回退', {
+            error: result.content,
+          }, LogCategory.TOOLS);
+          return await this.executeLocalFallback(toolCall.id, args.query);
+        }
+
+        const output: string[] = [];
+        if (result.stats) {
+          output.push(`Query: "${result.stats.query}"`);
+          output.push(`Searched ${result.stats.total_blobs} code blocks`);
+          output.push('');
+        }
+        output.push(result.content);
+
         return {
           toolCallId: toolCall.id,
-          content: `Error: ACE API not configured.
+          content: output.join('\n'),
+          isError: false
+        };
+      }
 
-To enable semantic code search, configure the following:
+      // 策略 2: ACE 未配置，使用本地索引搜索
+      return await this.executeLocalFallback(toolCall.id, args.query);
+    } catch (error: any) {
+      logger.error('AceExecutor error', { error: error.message }, LogCategory.TOOLS);
+      // ACE 异常时仍尝试本地回退
+      return await this.executeLocalFallback(toolCall.id, args.query, error.message);
+    }
+  }
+
+  /**
+   * 本地搜索回退
+   * 使用 LocalSearchEngine（TF-IDF + 符号索引 + 依赖图）作为 ACE 替代
+   */
+  private async executeLocalFallback(
+    toolCallId: string,
+    query: string,
+    aceError?: string
+  ): Promise<ToolResult> {
+    if (!this.localSearchFallback) {
+      return {
+        toolCallId,
+        content: `Error: ACE API not configured and local search fallback not available.
+
+To enable semantic code search, configure ACE:
 - ACE_API_URL: The ACE server URL
 - ACE_API_TOKEN: The authentication token
 
-Without ACE configuration, please use grep_search for pattern-based code search.`,
-          isError: true
-        };
-      }
+Without ACE, use grep_search for pattern-based code search.`,
+        isError: true
+      };
+    }
 
-      // 执行语义搜索
-      const result = await this.indexManager.search(args.query, ensureIndexed);
+    try {
+      const localResult = await this.localSearchFallback(query, 10);
 
-      if (result.status === 'error') {
+      if (localResult) {
+        const header = aceError
+          ? `[ACE 不可用 (${aceError})，已回退到本地索引搜索]\n\n`
+          : `[本地索引搜索 — ACE 未配置]\n\n`;
+
+        logger.info('AceExecutor.本地回退搜索成功', {
+          query: query.substring(0, 50),
+          resultLength: localResult.length,
+        }, LogCategory.TOOLS);
+
         return {
-          toolCallId: toolCall.id,
-          content: `Search failed: ${result.content}`,
-          isError: true
+          toolCallId,
+          content: header + localResult,
+          isError: false
         };
       }
-
-      // 格式化输出
-      const output: string[] = [];
-
-      if (result.stats) {
-        output.push(`Query: "${result.stats.query}"`);
-        output.push(`Searched ${result.stats.total_blobs} code blocks`);
-        output.push('');
-      }
-
-      output.push(result.content);
 
       return {
-        toolCallId: toolCall.id,
-        content: output.join('\n'),
+        toolCallId,
+        content: '未找到相关代码（本地索引搜索无结果）',
         isError: false
       };
-    } catch (error: any) {
-      logger.error('AceExecutor error', { error: error.message }, LogCategory.TOOLS);
+    } catch (fallbackError: any) {
+      logger.warn('AceExecutor.本地回退搜索失败', {
+        error: fallbackError.message,
+      }, LogCategory.TOOLS);
+
       return {
-        toolCallId: toolCall.id,
-        content: `Error: ${error.message}`,
+        toolCallId,
+        content: `Search unavailable: ACE not configured, local fallback error: ${fallbackError.message}`,
         isError: true
       };
     }

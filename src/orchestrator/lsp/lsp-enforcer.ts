@@ -93,6 +93,57 @@ export class LspEnforcer {
     return true;
   }
 
+  /**
+   * 获取目标文件的当前诊断快照（供 postCheck 对比用）
+   */
+  async captureDiagnostics(assignment: Assignment): Promise<string[]> {
+    const targetFiles = this.collectTargetFiles(assignment);
+    const supportedTargets = targetFiles.filter((file) => this.isSupportedFile(file)).slice(0, MAX_FILES);
+    const diagnostics: string[] = [];
+
+    for (const target of supportedTargets) {
+      const diag = await this.queryLsp('diagnostics', target);
+      if (diag.ok) {
+        diagnostics.push(...this.formatDiagnostics(target, diag.data));
+      }
+    }
+
+    return diagnostics;
+  }
+
+  /**
+   * 执行后诊断验证：对比执行前后的诊断列表，找出新增项
+   */
+  async postCheck(
+    assignment: Assignment,
+    preflightDiagnostics: string[]
+  ): Promise<{ newErrors: string[] } | null> {
+    try {
+      const currentDiagnostics = await this.captureDiagnostics(assignment);
+      const preSet = new Set(preflightDiagnostics);
+      const newErrors = currentDiagnostics.filter(
+        (d) => !preSet.has(d) && d.includes('[Error]')
+      );
+
+      if (newErrors.length === 0) {
+        return null;
+      }
+
+      logger.warn('LSP 后检发现新增编译错误', {
+        assignmentId: assignment.id,
+        newErrorCount: newErrors.length
+      }, LogCategory.ORCHESTRATOR);
+
+      return { newErrors: newErrors.slice(0, MAX_DIAGNOSTICS) };
+    } catch (error: any) {
+      logger.warn('LSP 后检失败，跳过', {
+        assignmentId: assignment.id,
+        error: error?.message
+      }, LogCategory.ORCHESTRATOR);
+      return null;
+    }
+  }
+
   private hasLspInjected(assignment: Assignment): boolean {
     return assignment.guidancePrompt.includes('## LSP 预检');
   }
@@ -271,7 +322,7 @@ export class LspEnforcer {
       sections.push('符号摘要:');
       summary.symbols.forEach((line) => sections.push(`- ${line}`));
     }
-    sections.push('要求: 在修改前先确认诊断与符号信息；如需精确定位引用/定义，必须调用 lsp_query 进行进一步查询。');
+    sections.push('要求: 在修改前先确认以上诊断与符号信息，确保修改不会引入新的编译错误。');
 
     const injected = sections.join('\n');
     return original ? `${original}\n\n${injected}` : injected;

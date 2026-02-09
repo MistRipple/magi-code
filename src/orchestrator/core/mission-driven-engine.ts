@@ -190,6 +190,8 @@ export class MissionDrivenEngine extends EventEmitter {
   private activeBatch: DispatchBatch | null = null;
   // 当前执行的用户原始请求（Phase C 汇总引用）
   private activeUserPrompt: string = '';
+  // 当前执行的用户原始图片路径（Worker dispatch 传递）
+  private activeImagePaths?: string[];
 
   // 交互模式
   private interactionMode: InteractionMode = 'auto';
@@ -1390,6 +1392,7 @@ export class MissionDrivenEngine extends EventEmitter {
         projectContext,
         onReport: (report) => this.handleDispatchWorkerReport(report, batch),
         cancellationToken: batch?.cancellationToken,
+        imagePaths: this.activeImagePaths,
       });
 
       const timeoutPromise = new Promise<never>((_, reject) => {
@@ -1871,6 +1874,7 @@ ${this.activeUserPrompt}
       this.resetSupplementaryInstructions();
       this.currentSessionId = sessionId;
       this.activeUserPrompt = trimmedPrompt;
+      this.activeImagePaths = imagePaths;
 
       try {
         const resolvedSessionId = sessionId || this.sessionManager.getCurrentSession()?.id || taskId;
@@ -2305,7 +2309,6 @@ ${this.activeUserPrompt}
         'web_search': { category: '网络工具', desc: '搜索互联网信息（无需浏览器）' },
         'web_fetch': { category: '网络工具', desc: '获取 URL 页面内容（无需浏览器）' },
         'codebase_retrieval': { category: '代码智能', desc: '语义搜索代码库' },
-        'lsp_query': { category: '代码智能', desc: 'LSP 代码智能查询（定义、引用、符号）' },
         'mermaid_diagram': { category: '可视化', desc: '生成 Mermaid 图表' },
       };
 

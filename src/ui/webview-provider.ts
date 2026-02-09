@@ -240,7 +240,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private logs: LogEntry[] = [];
   private logFlushTimer: NodeJS.Timeout | null = null;
 
- 
+
   private readonly authSecretKey = 'multiCli.apiKey';
   private readonly authStatusKey = 'multiCli.loggedIn';
   private loginInFlight = false;
@@ -446,6 +446,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 监听任务完成事件，自动提取知识
       this.setupAutoKnowledgeExtraction();
 
+      // 设置文件监听器，支持搜索引擎增量更新
+      this.setupFileSystemWatcher();
+
+      // 注入本地搜索回退到 AceExecutor（ACE 不可用时自动降级）
+      this.injectLocalSearchFallback();
+
       const codeIndex = this.projectKnowledgeBase.getCodeIndex();
       logger.info('项目知识库.已初始化', {
         files: codeIndex ? codeIndex.files.length : 0
@@ -607,6 +613,105 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     logger.info('项目知识库.自动提取.已启用', {
       threshold: EXTRACTION_THRESHOLD
     }, LogCategory.SESSION);
+  }
+
+  /**
+   * 设置文件监听器
+   * 监听工作区文件变更，通知搜索引擎进行增量更新
+   */
+  private setupFileSystemWatcher(): void {
+    if (!this.projectKnowledgeBase) return;
+
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(this.workspaceRoot, '**/*.{ts,js,tsx,jsx,json,md,yml,yaml}')
+    );
+
+    const pkb = this.projectKnowledgeBase;
+
+    watcher.onDidChange((uri) => {
+      pkb.onFileEvent(uri.fsPath, 'changed');
+    });
+
+    watcher.onDidCreate((uri) => {
+      pkb.onFileEvent(uri.fsPath, 'created');
+    });
+
+    watcher.onDidDelete((uri) => {
+      pkb.onFileEvent(uri.fsPath, 'deleted');
+    });
+
+    // 注册到扩展上下文，确保扩展停用时自动释放
+    this.context.subscriptions.push(watcher);
+
+    logger.info('项目知识库.文件监听器.已启用', undefined, LogCategory.SESSION);
+  }
+
+  /**
+   * 注入本地搜索回退到 AceExecutor
+   * 当 ACE 不可用时，codebase_retrieval 工具自动降级到 LocalSearchEngine
+   */
+  private injectLocalSearchFallback(): void {
+    if (!this.projectKnowledgeBase) return;
+
+    const toolManager = this.adapterFactory.getToolManager?.();
+    if (!toolManager) return;
+
+    const aceExecutor = toolManager.getAceExecutor();
+    const pkb = this.projectKnowledgeBase;
+
+    aceExecutor.setLocalSearchFallback(async (query: string, maxResults?: number) => {
+      const parts: string[] = [];
+      const limit = maxResults || 10;
+      const maxContextLength = 6000;
+      let currentLength = 0;
+      const keywords = this.extractKeywords(query);
+
+      // Level 1: 知识库索引搜索（TF-IDF + 符号 + 依赖图）
+      const results = await pkb.search(query, {
+        maxResults: limit,
+        maxContextLength: Math.floor(maxContextLength * 0.6),
+      });
+
+      if (results.length > 0) {
+        const formatted = results
+          .map(r => {
+            const snippetText = r.snippets
+              .map(s => `\`\`\`\n${s.content}\n\`\`\``)
+              .join('\n');
+            return `### ${r.filePath} (score: ${r.score.toFixed(2)})\n${snippetText}`;
+          })
+          .join('\n\n');
+        parts.push(formatted);
+        currentLength += formatted.length;
+      }
+
+      // Level 2: Grep 精确匹配搜索
+      if (currentLength < maxContextLength * 0.8) {
+        const grepResult = await this.grepSearchForContext(
+          toolManager, keywords, maxContextLength - currentLength
+        );
+        if (grepResult) {
+          parts.push(`## 关键词匹配\n${grepResult}`);
+          currentLength += grepResult.length;
+        }
+      }
+
+      // Level 3: LSP 符号搜索
+      if (currentLength < maxContextLength * 0.9) {
+        const symbolResult = await this.lspSymbolSearchForContext(
+          toolManager, keywords, maxContextLength - currentLength
+        );
+        if (symbolResult) {
+          parts.push(`## 符号定义\n${symbolResult}`);
+        }
+      }
+
+      if (parts.length === 0) return null;
+
+      return `Query: "${query}"\nSearched via local index (TF-IDF + Symbol + Grep + LSP)\n\n${parts.join('\n\n')}`;
+    });
+
+    logger.info('AceExecutor.本地搜索回退.已注入（三级搜索）', undefined, LogCategory.SESSION);
   }
 
   /**
@@ -1346,7 +1451,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     if (requestId.startsWith('approval-')) {
       const todoId = requestId.replace('approval-', '');
       // 允许的肯定响应值
-      const isApproved = response === true || response === 'approved' || response === 'yes' || 
+      const isApproved = response === true || response === 'approved' || response === 'yes' ||
                         (typeof response === 'object' && response.value === 'approved');
 
       if (isApproved) {
@@ -2022,7 +2127,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'interruptTask':
-       
+
         logger.info('界面.任务.中断.消息', { taskId: message.taskId }, LogCategory.UI);
         await this.interruptCurrentTask({ silent: Boolean((message as any).silent) });
         break;
@@ -2036,19 +2141,19 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'pauseTask':
-       
+
         logger.info('界面.任务.暂停.消息', { taskId: (message as any).taskId }, LogCategory.UI);
         this.sendToast('暂停功能开发中', 'info');
         break;
 
       case 'resumeTask':
-       
+
         logger.info('界面.任务.恢复.消息', { taskId: (message as any).taskId }, LogCategory.UI);
         await this.resumeInterruptedTask();
         break;
 
       case 'appendMessage':
-       
+
         logger.info('界面.消息.补充.请求', undefined, LogCategory.UI);
         await this.handleAppendMessage((message as any).taskId, (message as any).content);
         break;
@@ -2228,7 +2333,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'requestExecutionStats':
-       
+
         this.sendExecutionStats();
         break;
       case 'resetExecutionStats':
@@ -2253,7 +2358,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'clearAllTasks':
-       
+
         this.handleClearAllTasks();
         break;
 
@@ -2765,41 +2870,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         currentLength += aceResult.length;
         logger.info('界面.提示词_增强.ACE语义搜索成功', { resultLength: aceResult.length }, LogCategory.UI);
       } else {
-        // 2. ACE 不可用，回退到简单文件搜索
-        logger.info('界面.提示词_增强.ACE不可用，使用简单搜索', undefined, LogCategory.UI);
+        // 2. ACE 不可用，使用本地多策略搜索（grep + 符号搜索 + 知识库索引）
+        logger.info('界面.提示词_增强.ACE不可用，使用本地多策略搜索', undefined, LogCategory.UI);
 
-        // 获取项目结构概览
-        const projectStructure = await this.getProjectStructure(projectRoot);
-        if (projectStructure && currentLength + projectStructure.length <= maxContextLength) {
-          contextParts.push(`## 项目结构\n${projectStructure}`);
-          currentLength += projectStructure.length;
-        }
-
-        // 从提示词中提取关键词并搜索相关文件
-        const keywords = this.extractKeywords(prompt);
-        if (keywords.length > 0) {
-          const relevantFiles = await this.findRelevantFiles(projectRoot, keywords);
-
-          for (const file of relevantFiles) {
-            if (currentLength >= maxContextLength) break;
-
-            try {
-              const content = fs.readFileSync(file, 'utf-8');
-              const truncatedContent = content.length > 2000
-                ? content.substring(0, 2000) + '\n... (truncated)'
-                : content;
-
-              const relativePath = path.relative(projectRoot, file);
-              const fileContext = `### ${relativePath}\n\`\`\`\n${truncatedContent}\n\`\`\``;
-
-              if (currentLength + fileContext.length <= maxContextLength) {
-                contextParts.push(fileContext);
-                currentLength += fileContext.length;
-              }
-            } catch {
-              // 忽略读取失败的文件
-            }
-          }
+        const localResult = await this.performLocalContextSearch(projectRoot, prompt, maxContextLength);
+        if (localResult) {
+          contextParts.push(localResult);
+          currentLength += localResult.length;
         }
       }
 
@@ -2873,6 +2950,219 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       return null;
     } catch (error) {
       logger.warn('界面.提示词_增强.ACE搜索异常', { error }, LogCategory.UI);
+      return null;
+    }
+  }
+
+  /**
+   * 本地多策略上下文搜索
+   * 当 ACE 语义搜索不可用时，组合 grep + LSP 符号搜索 + 知识库索引进行检索
+   * @returns 搜索结果文本，不可用则返回 null
+   */
+  private async performLocalContextSearch(
+    projectRoot: string,
+    prompt: string,
+    maxContextLength: number
+  ): Promise<string | null> {
+    const toolManager = this.adapterFactory.getToolManager?.();
+    if (!toolManager) {
+      return null;
+    }
+
+    const parts: string[] = [];
+    let currentLength = 0;
+
+    // 1. 提取搜索关键词（取最重要的前 5 个）
+    const keywords = this.extractKeywords(prompt);
+    if (keywords.length === 0) {
+      // 无关键词，退化为项目结构
+      const structure = await this.getProjectStructure(projectRoot);
+      return structure ? `## 项目结构\n${structure}` : null;
+    }
+
+    // 2. 知识库项目上下文（技术栈、入口点等元信息）
+    if (this.projectKnowledgeBase) {
+      const projectContext = this.projectKnowledgeBase.getProjectContext(400);
+      if (projectContext) {
+        parts.push(`## 项目概览\n${projectContext}`);
+        currentLength += projectContext.length;
+      }
+
+      // 2.5 本地搜索引擎（倒排索引 + TF-IDF）
+      try {
+        const searchResults = await this.projectKnowledgeBase.search(prompt, {
+          maxResults: 8,
+          maxContextLength: Math.floor((maxContextLength - currentLength) * 0.6),
+        });
+        if (searchResults.length > 0) {
+          const snippetText = searchResults
+            .map(r => `### ${r.filePath} (得分: ${r.score.toFixed(2)})\n` +
+              r.snippets.map(s => `\`\`\`\n${s.content}\n\`\`\``).join('\n'))
+            .join('\n\n');
+          parts.push(`## 相关代码（索引检索）\n${snippetText}`);
+          currentLength += snippetText.length;
+          logger.info('界面.提示词_增强.本地索引搜索命中', {
+            hits: searchResults.length,
+            length: snippetText.length,
+          }, LogCategory.UI);
+        }
+      } catch (error) {
+        logger.warn('界面.提示词_增强.本地索引搜索失败', { error }, LogCategory.UI);
+      }
+    }
+
+    // 3. grep 搜索文件内容（对最重要的关键词执行正则搜索）
+    const grepResults = await this.grepSearchForContext(toolManager, keywords, maxContextLength - currentLength);
+    if (grepResults) {
+      parts.push(`## 相关代码（关键词匹配）\n${grepResults}`);
+      currentLength += grepResults.length;
+    }
+
+    // 4. LSP 工作空间符号搜索（查找类、函数、接口定义）
+    if (currentLength < maxContextLength * 0.8) {
+      const symbolResults = await this.lspSymbolSearchForContext(
+        toolManager, keywords, maxContextLength - currentLength
+      );
+      if (symbolResults) {
+        parts.push(`## 相关符号定义\n${symbolResults}`);
+        currentLength += symbolResults.length;
+      }
+    }
+
+    if (parts.length === 0) {
+      // 所有策略都无结果，退化为项目结构
+      const structure = await this.getProjectStructure(projectRoot);
+      return structure ? `## 项目结构\n${structure}` : null;
+    }
+
+    logger.info('界面.提示词_增强.本地搜索完成', {
+      strategies: parts.length,
+      totalLength: currentLength,
+      keywords: keywords.slice(0, 3),
+    }, LogCategory.UI);
+
+    return parts.join('\n\n');
+  }
+
+  /**
+   * 使用 grep 搜索关键词对应的代码片段
+   */
+  private async grepSearchForContext(
+    toolManager: any,
+    keywords: string[],
+    maxLength: number
+  ): Promise<string | null> {
+    try {
+      const searchExecutor = toolManager.getSearchExecutor();
+      if (!searchExecutor) return null;
+
+      const results: string[] = [];
+      let totalLength = 0;
+      // 对最重要的前 3 个关键词执行搜索
+      const searchKeywords = keywords.filter(kw => kw.length >= 3).slice(0, 3);
+
+      for (const keyword of searchKeywords) {
+        if (totalLength >= maxLength) break;
+
+        try {
+          // 构造 grep 搜索用的正则：转义特殊字符
+          const escapedKeyword = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const toolCall = {
+            id: `ctx-grep-${Date.now()}-${keyword}`,
+            name: 'grep_search',
+            arguments: {
+              pattern: escapedKeyword,
+              include: '*.ts,*.tsx,*.js,*.jsx,*.py,*.go,*.rs,*.java,*.c,*.cpp,*.h,*.hpp,*.cs,*.php,*.rb,*.swift,*.kt,*.m,*.vue',
+              context_lines: 2,
+              case_sensitive: false,
+            }
+          };
+
+          const result = await searchExecutor.execute(toolCall);
+          if (!result.isError && result.content && result.content !== 'No matches found') {
+            // 截断单个搜索结果，避免一个关键词占满上下文
+            const maxPerKeyword = Math.floor(maxLength / searchKeywords.length);
+            const truncated = result.content.length > maxPerKeyword
+              ? result.content.substring(0, maxPerKeyword) + '\n... (更多结果已省略)'
+              : result.content;
+
+            results.push(`### 关键词: "${keyword}"\n${truncated}`);
+            totalLength += truncated.length;
+          }
+        } catch {
+          // 单个关键词搜索失败不影响其他
+        }
+      }
+
+      return results.length > 0 ? results.join('\n\n') : null;
+    } catch (error) {
+      logger.warn('界面.本地搜索.grep失败', { error }, LogCategory.UI);
+      return null;
+    }
+  }
+
+  /**
+   * 使用 workspaceSymbols 搜索相关符号定义
+   */
+  private async lspSymbolSearchForContext(
+    toolManager: any,
+    keywords: string[],
+    maxLength: number
+  ): Promise<string | null> {
+    try {
+      const lspExecutor = toolManager.getLspExecutor();
+      if (!lspExecutor) return null;
+
+      const symbolEntries: string[] = [];
+      let totalLength = 0;
+      // 对最重要的前 3 个代码标识符搜索符号
+      const symbolKeywords = keywords
+        .filter(kw => /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(kw) && kw.length >= 3)
+        .slice(0, 3);
+
+      for (const keyword of symbolKeywords) {
+        if (totalLength >= maxLength) break;
+
+        try {
+          const toolCall = {
+            id: `ctx-lsp-${Date.now()}-${keyword}`,
+            name: 'lsp_query',
+            arguments: {
+              action: 'workspaceSymbols',
+              query: keyword,
+            }
+          };
+
+          const result = await lspExecutor.execute(toolCall);
+          if (!result.isError && result.content) {
+            const parsed = JSON.parse(result.content);
+            const symbols = parsed.symbols || [];
+            if (symbols.length === 0) continue;
+
+            // 格式化符号列表（限制每个关键词最多 10 个符号）
+            const formatted = symbols.slice(0, 10).map((sym: any) => {
+              const loc = sym.location;
+              const uri = loc?.uri || '';
+              // 从 file:///path 中提取相对路径
+              const filePath = uri.replace(/^file:\/\//, '').replace(this.workspaceRoot + '/', '');
+              const line = loc?.range?.start?.line ?? '?';
+              return `  - ${sym.kindName || 'symbol'} **${sym.name}** → ${filePath}:${line}`;
+            }).join('\n');
+
+            const entry = `### "${keyword}" 的符号定义\n${formatted}`;
+            if (totalLength + entry.length <= maxLength) {
+              symbolEntries.push(entry);
+              totalLength += entry.length;
+            }
+          }
+        } catch {
+          // 单个符号搜索失败不影响其他
+        }
+      }
+
+      return symbolEntries.length > 0 ? symbolEntries.join('\n\n') : null;
+    } catch (error) {
+      logger.warn('界面.本地搜索.LSP符号失败', { error }, LogCategory.UI);
       return null;
     }
   }
@@ -2963,58 +3253,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
 
     return [...new Set(keywords)].slice(0, 10); // 去重并限制数量
-  }
-
-  /**
-   * 查找与关键词相关的文件
-   */
-  private async findRelevantFiles(projectRoot: string, keywords: string[]): Promise<string[]> {
-    const relevantFiles: string[] = [];
-    const maxFiles = 5;
-    const searchExtensions = ['.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.rs', '.java', '.vue', '.svelte'];
-
-    const excludeDirs = new Set([
-      'node_modules', '.git', 'dist', 'build', 'out', '__pycache__',
-      '.next', '.nuxt', 'coverage', '.vscode'
-    ]);
-
-    const searchDir = (dir: string) => {
-      if (relevantFiles.length >= maxFiles) return;
-
-      try {
-        const items = fs.readdirSync(dir, { withFileTypes: true });
-
-        for (const item of items) {
-          if (relevantFiles.length >= maxFiles) break;
-
-          const fullPath = path.join(dir, item.name);
-
-          if (item.isDirectory()) {
-            if (!excludeDirs.has(item.name) && !item.name.startsWith('.')) {
-              searchDir(fullPath);
-            }
-          } else {
-            const ext = path.extname(item.name).toLowerCase();
-            if (!searchExtensions.includes(ext)) continue;
-
-            // 检查文件名是否包含关键词
-            const fileName = item.name.toLowerCase();
-            const matchesFileName = keywords.some(kw =>
-              fileName.includes(kw.toLowerCase())
-            );
-
-            if (matchesFileName) {
-              relevantFiles.push(fullPath);
-            }
-          }
-        }
-      } catch {
-        // 忽略权限问题
-      }
-    };
-
-    searchDir(projectRoot);
-    return relevantFiles;
   }
 
   /** 构建提示词增强的 prompt（参考 Augment 方案） */
@@ -5408,12 +5646,6 @@ ${originalPrompt}
   private async executeWithDirectWorker(prompt: string, targetWorker: WorkerSlot, imagePaths: string[]): Promise<OrchestratorExecutionResult> {
     logger.info('界面.执行.模式.直接', { agent: targetWorker }, LogCategory.UI);
 
-    // 立即发送"正在处理"消息
-    this.sendOrchestratorMessage({
-      content: `${targetWorker.toUpperCase()} 正在处理您的请求...`,
-      messageType: 'progress'
-    });
-
     const startTime = Date.now();
     // 统一 Todo 系统 - 使用 orchestratorEngine
     const sessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id || 'default';
@@ -5461,17 +5693,11 @@ ${originalPrompt}
         await this.orchestratorEngine.completeTaskById(task.id);
         this.saveMessageToSession(prompt, response.content || '', targetWorker, 'worker');
         const requestId = this.messageHub.getRequestContext();
-        const requestStats = requestId ? this.messageHub.getRequestMessageStats(requestId) : undefined;
-        const assistantWorkerContent = requestStats?.assistantWorkerContent ?? 0;
-        if (requestId && assistantWorkerContent === 0 && response.content?.trim()) {
-          this.messageHub.workerOutput(targetWorker, response.content, {
-            metadata: {
-              requestId,
-              forced: true,
-              reason: 'missing_llm_stream',
-            },
-          });
-        }
+        // 向主对话区发送完成消息（复用占位消息 ID，替换占位为完成态）
+        this.messageHub.result(
+          `${targetWorker.toUpperCase()} 已完成任务。详细内容请查看 ${targetWorker.toUpperCase()} 面板。`,
+          { metadata: { requestId, worker: targetWorker } },
+        );
         success = true;
       }
 
