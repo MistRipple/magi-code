@@ -130,6 +130,8 @@ export interface TodoExecuteOptions {
   sessionManager?: WorkerSessionManager;
   /** 取消信号 Token（C-09），循环入口检查 + LLM 请求中断 */
   cancellationToken?: CancellationToken;
+  /** 用户原始图片路径（仅首轮 LLM 调用时传递） */
+  imagePaths?: string[];
 }
 
 /**
@@ -1039,7 +1041,7 @@ export class AutonomousWorker extends EventEmitter {
       const response = await options.adapterFactory.sendMessage(
         this.workerType,
         fullPrompt,
-        undefined, // 无图片
+        options.imagePaths,
         {
           source: 'worker',
           adapterRole: 'worker',
@@ -1233,7 +1235,7 @@ export class AutonomousWorker extends EventEmitter {
       const response = await options.adapterFactory.sendMessage(
         this.workerType,
         fullPrompt,
-        undefined, // 无图片
+        options.imagePaths,
         {
           source: 'worker',
           adapterRole: 'worker',

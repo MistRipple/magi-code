@@ -104,9 +104,12 @@ export class AssignmentExecutor {
     const normalizedTargets = this.normalizeTargetFiles(targetFiles);
     const preExecutionContents = this.captureTargetContents(normalizedTargets);
 
+    // LSP 预检 + 保存诊断快照
+    let preflightDiagnostics: string[] = [];
     if (this.lspEnforcer) {
       try {
         await this.lspEnforcer.applyIfNeeded(assignment);
+        preflightDiagnostics = await this.lspEnforcer.captureDiagnostics(assignment);
       } catch (error: any) {
         logger.warn('LSP 预检失败，继续执行', {
           assignmentId: assignment.id,
@@ -196,6 +199,24 @@ export class AssignmentExecutor {
 
     // 更新 ContextManager
     await this.updateContextManager(assignment, result, options.contextManager);
+
+    // LSP 后检：检测新增编译错误
+    if (this.lspEnforcer && preflightDiagnostics.length >= 0) {
+      try {
+        const postResult = await this.lspEnforcer.postCheck(assignment, preflightDiagnostics);
+        if (postResult && postResult.newErrors.length > 0) {
+          if (!result.errors) {
+            result.errors = [];
+          }
+          result.errors.push(`LSP 后检发现 ${postResult.newErrors.length} 个新增编译错误：${postResult.newErrors.join('；')}`);
+        }
+      } catch (error: any) {
+        logger.warn('LSP 后检异常，跳过', {
+          assignmentId: assignment.id,
+          error: error?.message
+        }, LogCategory.ORCHESTRATOR);
+      }
+    }
     } finally {
       // 清除快照上下文（无论成功或失败）
       toolManager.clearSnapshotContext();

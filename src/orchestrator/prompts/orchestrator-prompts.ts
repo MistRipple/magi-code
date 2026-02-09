@@ -69,10 +69,9 @@ ${categoryHints}
 - **涉及代码/文件修改时，必须 needsWorker=true**
 - **工具调用任务判定（积极使用工具）**：
   - 以下场景必须设置 needsWorker=false，needsTooling=true，executionMode=direct：
-    - 分析/理解项目结构（使用 codebase_retrieval 语义搜索 + lsp_query 符号分析，禁止逐个读取所有文件）
+    - 分析/理解项目结构（使用 codebase_retrieval 语义搜索，禁止逐个读取所有文件）
     - 查看特定文件内容（使用 text_editor view，不要用终端 ls/cat/find）
     - 搜索代码内容（使用 grep_search 精确匹配或 codebase_retrieval 语义搜索，不要用终端 grep/rg）
-    - 查找符号定义/引用关系（使用 lsp_query definition/references/workspaceSymbols）
     - 运行编译/测试/构建命令（npm run build、npm test 等，使用 launch-process）
     - 执行 git 命令（git status、git log、git diff 等，使用 launch-process）
     - 检查进程、端口、环境变量（使用 launch-process）
@@ -195,7 +194,7 @@ ${workerTable}
 - 文件操作：text_editor、grep_search、remove_files
 - 终端命令：launch-process、read-process、write-process、kill-process、list-processes
 - 网络工具：web_search、web_fetch
-- 代码智能：codebase_retrieval、lsp_query
+- 代码智能：codebase_retrieval
 - 可视化：mermaid_diagram`;
 
   sections.push(`## 决策原则
@@ -209,8 +208,7 @@ ${workerTable}
 ${toolsListSection}
 
 **工具选择优先级**（当有多个工具可完成同一任务时，选择更专用的工具）：
-- 理解项目/分析代码 → codebase_retrieval（语义搜索）或 lsp_query（结构化分析），而非逐个读取文件
-- 查找符号定义/引用 → lsp_query(definition/references)，而非 grep_search
+- 理解项目/分析代码 → codebase_retrieval（语义搜索），而非逐个读取文件
 - 搜索代码内容 → grep_search（精确匹配）或 codebase_retrieval（语义搜索），而非 launch-process grep/rg
 - 读取特定文件内容 → text_editor(view)，而非 launch-process cat
 - 浏览目录结构 → text_editor(view + 目录路径)，而非 launch-process ls/find
@@ -221,12 +219,11 @@ ${toolsListSection}
 **工具协作链**：
 
 分析/理解项目时（禁止逐个读取所有文件）：
-1. codebase_retrieval — 语义搜索，快速找到与问题相关的代码区域
-2. lsp_query(workspaceSymbols/documentSymbols) — 理解模块结构和符号关系
-3. text_editor(view) — 仅读取真正需要细看的关键文件
+1. codebase_retrieval — 语义搜索，快速找到相关代码区域
+2. text_editor(view) — 仅读取真正需要细看的关键文件
 
 编辑文件前必须先理解代码：
-1. codebase_retrieval 或 lsp_query(definition/references) — 定位相关代码
+1. codebase_retrieval — 定位相关代码
 2. grep_search — 精确匹配具体修改点
 3. text_editor(str_replace) — 精确修改
 
