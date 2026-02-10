@@ -89,7 +89,7 @@ class E2ETestHarness {
     // 初始化知识库
     this.knowledgeBase = new ProjectKnowledgeBase({
       projectRoot: this.workspaceRoot,
-      storageDir: path.join(this.workspaceRoot, '.multicli', 'knowledge'),
+      storageDir: path.join(this.workspaceRoot, '.magi', 'knowledge'),
     });
     await this.knowledgeBase.initialize();
 
@@ -97,7 +97,7 @@ class E2ETestHarness {
     this.contextManager = new ContextManager(
       this.workspaceRoot,
       {
-        storagePath: path.join(this.workspaceRoot, '.multicli', 'sessions'),
+        storagePath: path.join(this.workspaceRoot, '.magi', 'sessions'),
         immediateContextRounds: 5,
         compression: {
           tokenLimit: 8000,
@@ -630,7 +630,7 @@ class ComprehensiveE2ETests {
       details.responseLength = response.length;
       details.responsePreview = response.substring(0, 300);
 
-      const hasPackageContent = response.includes('multicli') ||
+      const hasPackageContent = response.includes('magi') ||
                                  response.includes('name') ||
                                  response.includes('version') ||
                                  response.includes('dependencies');

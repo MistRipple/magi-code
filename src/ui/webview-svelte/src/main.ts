@@ -8,16 +8,16 @@ import { setCurrentSessionId } from './stores/messages.svelte';
 
 declare global {
   interface Window {
-    __MULTICLI_WEBVIEW_BOOTED__?: boolean;
+    __MAGI_WEBVIEW_BOOTED__?: boolean;
   }
 }
 
 let app: ReturnType<typeof mount> | undefined;
 
-if (window.__MULTICLI_WEBVIEW_BOOTED__) {
+if (window.__MAGI_WEBVIEW_BOOTED__) {
   console.warn('[Main] webview 已初始化，跳过重复挂载');
 } else {
-  window.__MULTICLI_WEBVIEW_BOOTED__ = true;
+  window.__MAGI_WEBVIEW_BOOTED__ = true;
 
   // 初始化 sessionId（从扩展宿主注入的值）
   const initialSessionId = getInitialSessionId();

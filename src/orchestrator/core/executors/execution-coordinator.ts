@@ -23,6 +23,7 @@ import { AssignmentExecutor, AssignmentExecutionOptions, AssignmentExecutionResu
 import { ReviewExecutor, ReviewOptions } from './review-executor';
 import { ContractVerifier } from './contract-verifier';
 import { ProgressReporter, ExecutionProgress } from './progress-reporter';
+import { TodoManager } from '../../../todo';
 import { BlockingManager, BlockedItem } from './blocking-manager';
 import type { ReportCallback } from '../../protocols/worker-report';
 import { TaskDependencyGraph, ExecutionBatch } from '../../task-dependency-graph';
@@ -128,12 +129,13 @@ export class ExecutionCoordinator extends EventEmitter {
     private reviewer: ProfileAwareReviewer,
     private snapshotManager: SnapshotManager | null,
     private workspaceRoot: string,
-    private mission: Mission
+    private mission: Mission,
+    todoManager: TodoManager
   ) {
     super();
 
     // 初始化各个执行器
-    this.planningExecutor = new PlanningExecutor(workers);
+    this.planningExecutor = new PlanningExecutor(workers, todoManager);
     this.assignmentExecutor = new AssignmentExecutor(
       workers,
       adapterFactory,

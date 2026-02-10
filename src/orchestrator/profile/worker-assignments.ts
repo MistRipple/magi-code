@@ -14,7 +14,7 @@ import { DEFAULT_ASSIGNMENTS, WORKER_ASSIGNMENTS_VERSION } from './builtin/defau
 const WORKERS: WorkerSlot[] = ['claude', 'codex', 'gemini'];
 
 export class WorkerAssignmentStorage {
-  private static readonly CONFIG_DIR = path.join(os.homedir(), '.multicli');
+  private static readonly CONFIG_DIR = path.join(os.homedir(), '.magi');
   private static readonly ASSIGNMENTS_FILE = path.join(this.CONFIG_DIR, 'worker-assignments.json');
 
   static getConfigDir(): string {

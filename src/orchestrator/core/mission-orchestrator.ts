@@ -1788,7 +1788,8 @@ export class MissionOrchestrator extends EventEmitter {
       this.reviewer,
       this.snapshotManager || null,
       this.workspaceRoot || '',
-      mission
+      mission,
+      this.todoManager!
     );
 
     // 设置 ContextManager
@@ -1935,6 +1936,13 @@ export class MissionOrchestrator extends EventEmitter {
    */
   async ensureWorkerForDispatch(workerSlot: WorkerSlot): Promise<AutonomousWorker> {
     return this.ensureWorker(workerSlot);
+  }
+
+  /**
+   * 获取 TodoManager 实例（确保已初始化）
+   */
+  getTodoManager(): TodoManager | undefined {
+    return this.todoManager;
   }
 
   /**

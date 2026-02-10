@@ -15,7 +15,7 @@
  * - plan_mission: 创建多 Worker 协作计划
  * - send_worker_message: 向 Worker 面板发送消息
  *
- * ACE 配置来源：~/.multicli/config.json 的 promptEnhance 字段（唯一）
+ * ACE 配置来源：~/.magi/config.json 的 promptEnhance 字段（唯一）
  */
 
 import { EventEmitter } from 'events';
@@ -77,13 +77,13 @@ export interface UnifiedPromptInfo {
 
 /**
  * 读取 ACE 配置（唯一配置读取入口）
- * 配置存储在 ~/.multicli/config.json 的 promptEnhance 字段
+ * 配置存储在 ~/.magi/config.json 的 promptEnhance 字段
  *
  * 导出供其他模块使用，确保配置读取逻辑唯一
  */
 export function loadAceConfigFromFile(): { baseUrl: string; apiKey: string } {
   try {
-    const configPath = path.join(os.homedir(), '.multicli', 'config.json');
+    const configPath = path.join(os.homedir(), '.magi', 'config.json');
     if (fs.existsSync(configPath)) {
       const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
       if (config.promptEnhance) {
@@ -331,7 +331,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     'dispatch_task',
     'plan_mission',
     'send_worker_message',
-    'report_progress',
   ];
 
   /**
@@ -366,9 +365,10 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       // 查找 MCP 工具
       const toolDef = await this.findTool(toolCall.name);
       if (!toolDef) {
+        const available = this.builtinToolNames.join(', ');
         return {
           toolCallId: toolCall.id,
-          content: `Tool '${toolCall.name}' not found`,
+          content: `工具 '${toolCall.name}' 不存在。只能使用以下工具: ${available}。请直接使用已有工具完成任务。`,
           isError: true,
         };
       }
@@ -455,9 +455,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       case 'send_worker_message':
         return await this.orchestrationExecutor.execute(toolCall);
 
-      case 'report_progress':
-        return this.executeReportProgressTool(toolCall);
-
       default:
         return {
           toolCallId: toolCall.id,
@@ -465,42 +462,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
           isError: true,
         };
     }
-  }
-
-  /**
-   * 执行 report_progress 工具 — Worker 主动汇报任务进度
-   *
-   * 不执行任何实际操作，仅通过 EventEmitter 发出 progress:reported 事件。
-   * 上层（MissionDrivenEngine）监听此事件并更新 subTaskCard。
-   * context_id 由 Worker LLM 从 prompt 中获取（即 assignmentId），
-   * 确保并行 Worker 场景下事件能正确关联到对应的任务。
-   */
-  private executeReportProgressTool(toolCall: ToolCall): ToolResult {
-    const args = toolCall.arguments || {};
-    const contextId = args.context_id as string || '';
-    const step = args.step as string || '';
-    const percentage = typeof args.percentage === 'number' ? args.percentage : undefined;
-    const details = args.details as string || undefined;
-
-    logger.info('Tool.report_progress', {
-      contextId,
-      step,
-      percentage,
-      details: details?.substring(0, 80),
-    }, LogCategory.TOOLS);
-
-    this.emit('progress:reported', {
-      contextId,
-      step,
-      percentage,
-      details,
-    });
-
-    return {
-      toolCallId: toolCall.id,
-      content: '进度已汇报',
-      isError: false,
-    };
   }
 
   /**
@@ -737,27 +698,6 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
 
     // 13-15. 编排工具 (dispatch_task, plan_mission, send_worker_message)
     tools.push(...this.orchestrationExecutor.getToolDefinitions());
-
-    // 16. report_progress (Worker 进度汇报)
-    tools.push({
-      name: 'report_progress',
-      description: '汇报当前任务的执行进度。仅在阶段转换时调用（如：分析完成→开始修改、修改完成→开始验证），不要在每次工具调用后都汇报。一个任务通常汇报 2-4 次即可。',
-      input_schema: {
-        type: 'object',
-        properties: {
-          context_id: { type: 'string', description: '任务上下文 ID（从任务说明中获取）' },
-          step: { type: 'string', description: '当前正在执行的步骤描述' },
-          percentage: { type: 'number', description: '预估完成百分比 0-100' },
-          details: { type: 'string', description: '补充细节信息（可选）' },
-        },
-        required: ['context_id', 'step'],
-      },
-      metadata: {
-        source: 'builtin' as const,
-        category: 'system',
-        tags: ['progress', 'reporting'],
-      },
-    });
 
     return tools;
   }

@@ -16,7 +16,7 @@
  * - ACE 不可用时：自动回退到 LocalSearchEngine（TF-IDF + 符号 + 依赖图）
  *
  * 配置来源：由 ToolManager 通过 configureAce() 方法统一管理
- * 配置存储：~/.multicli/config.json 的 promptEnhance 字段
+ * 配置存储：~/.magi/config.json 的 promptEnhance 字段
  */
 
 import { ToolExecutor, ExtendedToolDefinition } from './types';

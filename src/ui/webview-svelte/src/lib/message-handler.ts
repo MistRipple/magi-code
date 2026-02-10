@@ -1801,6 +1801,7 @@ function handleMissionPlanned(message: WebviewMessage) {
           return {
             id: todoId,
             assignmentId,
+            parentId: todo.parentId,
             content: todo.content || '',
             reasoning: todo.reasoning,
             expectedOutput: todo.expectedOutput,
@@ -1847,6 +1848,7 @@ function handleAssignmentPlanned(message: WebviewMessage) {
       return {
         id: todoId,
         assignmentId,
+        parentId: todo.parentId,
         content: todo.content || '',
         reasoning: todo.reasoning,
         expectedOutput: todo.expectedOutput,
@@ -1950,6 +1952,7 @@ function handleDynamicTodoAdded(message: WebviewMessage) {
   const newTodo: AssignmentTodo = {
     id: todoId,
     assignmentId,
+    parentId: todo?.parentId,
     content: todo?.content || '',
     reasoning: todo?.reasoning,
     expectedOutput: todo?.expectedOutput,

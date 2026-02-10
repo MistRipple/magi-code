@@ -75,7 +75,7 @@ const DEFAULT_EXCLUDE_PATTERNS = [
   '*.mp3', '*.mp4', '*.pdf', '*.doc', '*.xls',
   '*.woff', '*.woff2', '*.ttf', '*.eot',
   '*.db', '*.sqlite', '*.sqlite3',
-  '.ace-tool', '.multicli'
+  '.ace-tool', '.magi'
 ];
 
 /** 计算 blob 名称（SHA-256 哈希） */

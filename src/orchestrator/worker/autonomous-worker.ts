@@ -19,7 +19,7 @@ import { AdapterOutputScope } from '../../adapters/adapter-factory-interface';
 import { TokenUsage } from '../../types/agent-types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
-import { TodoManager, UnifiedTodo, TodoPlanningContext, TodoPlanningResult, TodoOutput } from '../../todo';
+import { TodoManager, UnifiedTodo, TodoOutput } from '../../todo';
 import {
   ProfileAwareRecoveryHandler,
   RecoveryDecision,
@@ -154,18 +154,6 @@ export interface AutonomousExecutionResult {
   sessionId?: string;
   /** 是否有等待审批的 Todo */
   hasPendingApprovals?: boolean;
-  /** 是否为直接执行模式（简单任务无 Todo） */
-  directExecution?: boolean;
-  /** 直接执行模式的输出 */
-  directOutput?: DirectExecutionOutput;
-}
-
-/**
- * 直接执行模式的输出（简单任务）
- */
-export interface DirectExecutionOutput {
-  summary: string;
-  modifiedFiles?: string[];
 }
 
 /**
@@ -245,41 +233,6 @@ export class AutonomousWorker extends EventEmitter {
    */
   getWorkerType(): WorkerSlot {
     return this.workerType;
-  }
-
-  /**
-   * 规划 Assignment 的 Todo 列表
-   */
-  async planAssignment(
-    assignment: Assignment,
-    options?: {
-      projectContext?: string;
-      contextSnapshot?: string;
-    }
-  ): Promise<TodoPlanningResult> {
-    const context: TodoPlanningContext = {
-      missionId: assignment.missionId,
-      assignmentId: assignment.id,
-      responsibility: assignment.responsibility,
-      scope: assignment.scope,
-      availableContracts: [
-        ...assignment.producerContracts,
-        ...assignment.consumerContracts,
-      ],
-      workerId: assignment.workerId,
-      projectContext: options?.projectContext,
-    };
-
-    const result = await this.todoManager.planTodos(context);
-
-    this.emit('planningCompleted', {
-      assignmentId: assignment.id,
-      todos: result.todos,
-      outOfScopeTodos: result.outOfScopeTodos,
-      warnings: result.warnings,
-    });
-
-    return result;
   }
 
   /**
@@ -384,58 +337,7 @@ export class AutonomousWorker extends EventEmitter {
       isResuming,
     }, LogCategory.ORCHESTRATOR);
 
-    // ========== 双模式执行：直接执行 vs Todo 循环 ==========
-    // - 简单/中等任务：assignment.todos 为空，走直接执行模式
-    //   Worker LLM 在 ReAct 循环中自主执行，通过 report_progress 工具汇报进度
-    // - 复杂任务：assignment.todos 非空（由上层预设），走 Todo 循环模式
-
-    if (!assignment.todos || assignment.todos.length === 0) {
-      // ========== 直接执行模式 ==========
-      options.cancellationToken?.throwIfCancelled();
-      logger.info('Worker.直接执行模式', {
-        assignmentId: assignment.id,
-        workerId: this.workerType,
-        responsibility: assignment.responsibility.substring(0, 50),
-      }, LogCategory.ORCHESTRATOR);
-
-      const directResult = await this.executeDirectly(assignment, options, sharedContext);
-
-      // 构建结果
-      const result: AutonomousExecutionResult = {
-        assignment,
-        success: directResult.success,
-        completedTodos: [],
-        failedTodos: [],
-        skippedTodos: [],
-        dynamicTodos: [],
-        recoveredTodos: [],
-        totalDuration: Date.now() - startTime,
-        errors: directResult.error ? [directResult.error] : [],
-        recoveryAttempts: 0,
-        tokenUsage: directResult.tokenUsage || totalTokenUsage,
-        sessionId: session?.id,
-        hasPendingApprovals: false,
-        directExecution: true, // 标记为直接执行模式
-        directOutput: directResult.output, // 直接执行的输出
-      };
-      const qualityCheckedResult = this.applyQualityGate(assignment, result, sharedContext, startTime);
-
-      // 清理 Session
-      this.currentSession = null;
-      this.currentMissionId = undefined;
-      this.resetCacheReadStats();
-      if (qualityCheckedResult.success && session) {
-        logger.debug('Worker.Session.保留', { sessionId: session.id }, LogCategory.ORCHESTRATOR);
-      } else if (!qualityCheckedResult.success && session) {
-        logger.info('Worker.Session.失败保留', { sessionId: session.id, lastError: qualityCheckedResult.errors[0] }, LogCategory.ORCHESTRATOR);
-      }
-
-      this.emit('assignmentCompleted', qualityCheckedResult);
-
-      return qualityCheckedResult;
-    }
-
-    // ========== Todo 循环模式（复杂任务） ==========
+    // ========== 统一 Todo 循环模式 ==========
     // 执行每个 Todo
     let currentTodo = this.getNextExecutableTodo(assignment);
 
@@ -1057,7 +959,7 @@ export class AutonomousWorker extends EventEmitter {
       // 解析响应
       const summary = response.content || response.error || '执行完成';
       const modifiedFiles = this.extractModifiedFiles(response.content || '');
-      const dynamicTodos = this.extractDynamicTodos(response.content || '', assignment);
+      const dynamicTodos = this.extractDynamicTodos(response.content || '', assignment, todo.id);
 
       // 调用输出回调
       if (options.onOutput && response.content) {
@@ -1111,7 +1013,7 @@ export class AutonomousWorker extends EventEmitter {
   /**
    * 从输出中提取动态 Todo
    */
-  private extractDynamicTodos(output: string, assignment: Assignment): UnifiedTodo[] {
+  private extractDynamicTodos(output: string, assignment: Assignment, parentTodoId?: string): UnifiedTodo[] {
     // 检测输出中是否有需要动态添加的任务
     // 这是一个简化实现，实际可能需要更复杂的解析
     const todos: UnifiedTodo[] = [];
@@ -1123,11 +1025,12 @@ export class AutonomousWorker extends EventEmitter {
     while ((match = todoPattern.exec(output)) !== null) {
       const content = match[1].trim();
       if (content) {
-        // 创建动态 Todo（需要审批）
+        // 创建动态 Todo（需要审批），挂载为父 Todo 的子任务
         todos.push({
           id: `dynamic-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
           missionId: assignment.missionId,
           assignmentId: assignment.id,
+          parentId: parentTodoId,
           workerId: assignment.workerId,
           content,
           reasoning: '执行过程中发现的额外任务',
@@ -1166,194 +1069,6 @@ export class AutonomousWorker extends EventEmitter {
       default:
         return 'implementation';
     }
-  }
-
-  /**
-   * 直接执行模式（简单任务，无 Todo）
-   *
-   * 由编排者 LLM 语义理解决定使用此模式，Worker 直接执行 assignment.responsibility
-   */
-  private async executeDirectly(
-    assignment: Assignment,
-    options: TodoExecuteOptions,
-    sharedContext?: AssembledContext | null
-  ): Promise<{
-    success: boolean;
-    output?: DirectExecutionOutput;
-    error?: string;
-    tokenUsage?: TokenUsage;
-  }> {
-    const startTime = Date.now();
-
-    try {
-      // 构建执行 prompt（复用现有逻辑，但不依赖 Todo）
-      const directTargets = this.extractTargetFiles(
-        `${assignment.responsibility}\n${assignment.delegationBriefing || ''}`
-      );
-      const targetFileContext = await this.buildTargetFileContext(
-        assignment,
-        options.workingDirectory,
-        directTargets
-      );
-      const executionPrompt = this.buildDirectExecutionPrompt(
-        assignment,
-        options.projectContext,
-        sharedContext,
-        targetFileContext
-      );
-
-      // 生成自检引导
-      const profile = this.profileLoader.getProfile(this.workerType);
-      const selfCheckGuidance = this.guidanceInjector.buildSelfCheckGuidance(
-        profile,
-        assignment.responsibility
-      );
-
-      // 必须提供 adapterFactory
-      if (!options.adapterFactory) {
-        throw new Error('adapterFactory 是必需的，当前项目仅支持 LLM API 模式');
-      }
-
-      // 组合执行 prompt 和自检引导
-      const fullPrompt = `${executionPrompt}\n\n## 自检要点\n${selfCheckGuidance}`;
-
-      logger.debug('Worker.直接执行.Prompt', {
-        assignmentId: assignment.id,
-        promptLength: fullPrompt.length,
-      }, LogCategory.ORCHESTRATOR);
-
-      const decisionHook = options.getSupplementaryInstructions
-        ? () => {
-            const instructions = options.getSupplementaryInstructions?.() || [];
-            if (instructions.length > 0) {
-              this.appendSupplementaryInstructions(assignment, instructions);
-            }
-            return instructions;
-          }
-        : undefined;
-
-      const response = await options.adapterFactory.sendMessage(
-        this.workerType,
-        fullPrompt,
-        options.imagePaths,
-        {
-          source: 'worker',
-          adapterRole: 'worker',
-          ...options.adapterScope,
-          decisionHook,
-        }
-      );
-
-      if (response.error) {
-        throw new Error(response.error);
-      }
-
-      // 解析响应
-      const summary = response.content || '执行完成';
-      const modifiedFiles = this.extractModifiedFiles(response.content || '');
-      await this.writeInsights(this.buildSuccessInsights(assignment, summary, modifiedFiles));
-
-      // 调用输出回调
-      if (options.onOutput && response.content) {
-        options.onOutput(response.content);
-      }
-
-      logger.info('Worker.直接执行.完成', {
-        assignmentId: assignment.id,
-        duration: Date.now() - startTime,
-        modifiedFilesCount: modifiedFiles.length,
-      }, LogCategory.ORCHESTRATOR);
-
-      return {
-        success: true,
-        output: {
-          summary,
-          modifiedFiles,
-        },
-        tokenUsage: response.tokenUsage,
-      };
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-
-      logger.error('Worker.直接执行.失败', {
-        assignmentId: assignment.id,
-        error: errorMessage,
-        duration: Date.now() - startTime,
-      }, LogCategory.ORCHESTRATOR);
-      await this.writeInsights(this.buildFailureInsights(assignment, errorMessage));
-
-      return {
-        success: false,
-        error: errorMessage,
-      };
-    }
-  }
-
-  /**
-   * 构建直接执行 Prompt（简单任务，无 Todo）
-   */
-  private buildDirectExecutionPrompt(
-    assignment: Assignment,
-    projectContext?: string,
-    sharedContext?: AssembledContext | null,
-    targetFileContext?: string | null
-  ): string {
-    const sections: string[] = [];
-
-    const sharedKnowledge = this.buildSharedKnowledgeSection(sharedContext);
-    if (sharedKnowledge) {
-      sections.push(sharedKnowledge);
-    }
-
-    // 1. 任务委托说明（优先使用 AI 生成的自然语言委托）
-    if (assignment.delegationBriefing) {
-      sections.push(`## 任务\n${assignment.delegationBriefing}`);
-    } else {
-      // 兜底：使用结构化的职责描述
-      sections.push(`## 任务\n${assignment.responsibility}`);
-    }
-
-    // 2. 职责范围提醒
-    if (assignment.scope.excludes.length > 0) {
-      sections.push(`## 注意：以下内容不在你的职责范围内\n${assignment.scope.excludes.map(e => `- ${e}`).join('\n')}`);
-    }
-
-    // 3. 目标文件（若有）
-    if (assignment.scope.targetPaths && assignment.scope.targetPaths.length > 0) {
-      const requirement = assignment.scope.requiresModification
-        ? '任务性质：需要对上述文件进行实际修改并保存。'
-        : '任务性质：仅需读取/分析，无需修改文件。';
-      sections.push(`## 目标文件\n${assignment.scope.targetPaths.map(p => `- ${p}`).join('\n')}\n\n${requirement}`);
-    }
-
-    if (targetFileContext) {
-      sections.push(`## 目标文件摘要\n${targetFileContext}`);
-    }
-
-    // 4. 引导 Prompt
-    if (assignment.guidancePrompt) {
-      sections.push(`## 角色引导\n${assignment.guidancePrompt}`);
-    }
-
-    // 5. 项目上下文
-    if (projectContext) {
-      sections.push(`## 项目上下文\n${projectContext}`);
-    }
-
-    // 6. 进度汇报指引
-    // 注入 assignmentId，让 Worker LLM 在调用 report_progress 时携带 context_id
-    sections.push(`## 进度汇报
-任务上下文 ID: ${assignment.id}
-当你的任务涉及多个步骤时（如：阅读分析 → 设计方案 → 实施修改 → 验证结果），
-请仅在关键阶段转换时调用 report_progress 工具汇报进度，参数：
-- context_id: "${assignment.id}"
-- step: 当前阶段描述（如"分析代码结构"、"开始修改"、"验证修改结果"）
-- percentage: 预估完成百分比 (0-100)
-
-注意：不要在每次工具调用后都汇报进度，只在阶段转换时汇报（通常 2-4 次即可）。
-例如：开始分析时汇报一次，开始修改时汇报一次，验证完成时汇报一次。`);
-
-    return sections.join('\n\n');
   }
 
   /**
@@ -1678,11 +1393,13 @@ export class AutonomousWorker extends EventEmitter {
     assignment: Assignment,
     content: string,
     reasoning: string,
-    type: UnifiedTodo['type']
+    type: UnifiedTodo['type'],
+    parentId?: string
   ): Promise<UnifiedTodo> {
     const todo = await this.todoManager.create({
       missionId: assignment.missionId,
       assignmentId: assignment.id,
+      parentId,
       content,
       reasoning,
       type,

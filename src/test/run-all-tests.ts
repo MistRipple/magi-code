@@ -47,7 +47,7 @@ async function main() {
   const mode = resolveTestMode(process.argv[2]);
 
   console.log('========================================');
-  console.log('MultiCLI 全方位测试系统');
+  console.log('Magi 全方位测试系统');
   console.log('========================================');
   console.log('模拟多个代理工程师协作进行全面测试\n');
   console.log(`测试模式: ${mode}\n`);

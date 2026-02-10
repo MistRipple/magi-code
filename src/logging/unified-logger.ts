@@ -128,7 +128,7 @@ const DEFAULT_CONFIG: LogConfig = {
   },
   file: {
     enabled: false,
-    path: '.multicli-logs',
+    path: '.magi-logs',
     maxSize: 10 * 1024 * 1024, // 10MB
     maxFiles: 5,
   },
@@ -217,13 +217,13 @@ export class UnifiedLogger extends EventEmitter {
 
   private loadConfigFromEnv(): void {
     // 全局开关
-    if (process.env.MULTICLI_LOG_ENABLED !== undefined) {
-      this.config.enabled = process.env.MULTICLI_LOG_ENABLED === 'true';
+    if (process.env.MAGI_LOG_ENABLED !== undefined) {
+      this.config.enabled = process.env.MAGI_LOG_ENABLED === 'true';
     }
 
     // 全局级别
-    if (process.env.MULTICLI_LOG_LEVEL) {
-      const level = process.env.MULTICLI_LOG_LEVEL.toUpperCase();
+    if (process.env.MAGI_LOG_LEVEL) {
+      const level = process.env.MAGI_LOG_LEVEL.toUpperCase();
       if (level in LogLevel) {
         this.config.level = LogLevel[level as keyof typeof LogLevel];
       }
@@ -231,7 +231,7 @@ export class UnifiedLogger extends EventEmitter {
 
     // 分类级别
     Object.values(LogCategory).forEach(category => {
-      const envKey = `MULTICLI_LOG_${category.toUpperCase()}`;
+      const envKey = `MAGI_LOG_${category.toUpperCase()}`;
       if (process.env[envKey]) {
         const level = process.env[envKey]!.toUpperCase();
         if (level in LogLevel) {
@@ -241,11 +241,11 @@ export class UnifiedLogger extends EventEmitter {
     });
 
     // Agent 消息日志
-    if (process.env.MULTICLI_LOG_AGENT_MESSAGES !== undefined) {
-      this.config.agent.logMessages = process.env.MULTICLI_LOG_AGENT_MESSAGES === 'true';
+    if (process.env.MAGI_LOG_AGENT_MESSAGES !== undefined) {
+      this.config.agent.logMessages = process.env.MAGI_LOG_AGENT_MESSAGES === 'true';
     }
-    if (process.env.MULTICLI_LOG_AGENT_RESPONSES !== undefined) {
-      this.config.agent.logResponses = process.env.MULTICLI_LOG_AGENT_RESPONSES === 'true';
+    if (process.env.MAGI_LOG_AGENT_RESPONSES !== undefined) {
+      this.config.agent.logResponses = process.env.MAGI_LOG_AGENT_RESPONSES === 'true';
     }
   }
 
@@ -624,7 +624,7 @@ export class UnifiedLogger extends EventEmitter {
       fs.mkdirSync(logDir, { recursive: true });
     }
 
-    const logFile = path.join(logDir, `multicli-${Date.now()}.log`);
+    const logFile = path.join(logDir, `magi-${Date.now()}.log`);
     this.fileStream = fs.createWriteStream(logFile, { flags: 'a' });
     this.currentFileSize = 0;
 
@@ -724,7 +724,7 @@ export class UnifiedLogger extends EventEmitter {
     this.cleanOldLogFiles();
 
     // 创建新文件
-    const logFile = path.join(this.config.file.path, `multicli-${Date.now()}.log`);
+    const logFile = path.join(this.config.file.path, `magi-${Date.now()}.log`);
     this.fileStream = fs.createWriteStream(logFile, { flags: 'a' });
     this.currentFileSize = 0;
   }
@@ -734,7 +734,7 @@ export class UnifiedLogger extends EventEmitter {
     if (!fs.existsSync(logDir)) return;
 
     const files = fs.readdirSync(logDir)
-      .filter(f => f.startsWith('multicli-') && f.endsWith('.log'))
+      .filter(f => f.startsWith('magi-') && f.endsWith('.log'))
       .map(f => ({
         name: f,
         path: path.join(logDir, f),

@@ -870,6 +870,31 @@ export class UniversalLLMClient extends BaseLLMClient {
       }
     }
 
+    // Fallback：如果 API 未返回 usage（第三方 OpenAI 兼容 API 常见），使用本地估算
+    if (usage.inputTokens === 0 && usage.outputTokens === 0) {
+      const inputText = messages.map(m => {
+        if (typeof m.content === 'string') return m.content;
+        if (Array.isArray(m.content)) return m.content.map((b: any) => b.text || b.content || '').join('');
+        return '';
+      }).join('');
+      const outputText = fullContent;
+      // 估算：约 4 字符 ≈ 1 token（通用近似）
+      usage.inputTokens = Math.ceil(inputText.length / 4);
+      usage.outputTokens = Math.ceil(outputText.length / 4);
+      logger.debug('OpenAI 流式未返回 usage，使用本地估算', {
+        estimatedInput: usage.inputTokens,
+        estimatedOutput: usage.outputTokens,
+        model: this.config.model,
+      }, LogCategory.LLM);
+      onChunk({
+        type: 'usage',
+        usage: {
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+        },
+      });
+    }
+
     const toolCalls: ToolCall[] = [];
     for (const tool of toolCallBuffers.values()) {
       if (!tool.id) continue;

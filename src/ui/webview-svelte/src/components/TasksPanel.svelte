@@ -196,38 +196,64 @@
                     <span class="worker-responsibility">{assignment.responsibility || ''}</span>
                   </div>
                 {/if}
-                {#each (ensureArray(assignment.todos) as any[]) as todo (todo.id)}
-                  <div class="todo-row" class:is-done={todo.status === 'completed' || todo.status === 'skipped'} class:is-failed={todo.status === 'failed'} class:is-running={todo.status === 'in_progress'}>
-                    <span class="todo-check">
-                      {#if todo.status === 'completed' || todo.status === 'skipped'}
-                        <Icon name="check" size={12} />
-                      {:else if todo.status === 'in_progress'}
-                        <Icon name="loader" size={12} class="spinning" />
-                      {:else if todo.status === 'failed'}
-                        <Icon name="x-circle" size={12} />
-                      {:else if todo.status === 'blocked'}
-                        <Icon name="alert-circle" size={12} />
-                      {:else}
-                        <span class="todo-circle"></span>
+                {#each (ensureArray(assignment.todos) as any[]) as todo, todoIdx (todo.id)}
+                  {#if !todo.parentId}
+                    {@const seqNum = (ensureArray(assignment.todos) as any[]).filter((t: any) => !t.parentId).indexOf(todo) + 1}
+                    {@const children = (ensureArray(assignment.todos) as any[]).filter((t: any) => t.parentId === todo.id)}
+                    <div class="todo-row" class:is-done={todo.status === 'completed' || todo.status === 'skipped'} class:is-failed={todo.status === 'failed'} class:is-running={todo.status === 'in_progress'}>
+                      <span class="todo-seq">{seqNum}.</span>
+                      <span class="todo-check">
+                        {#if todo.status === 'completed' || todo.status === 'skipped'}
+                          <Icon name="check" size={12} />
+                        {:else if todo.status === 'in_progress'}
+                          <Icon name="loader" size={12} class="spinning" />
+                        {:else if todo.status === 'failed'}
+                          <Icon name="x-circle" size={12} />
+                        {:else if todo.status === 'blocked'}
+                          <Icon name="alert-circle" size={12} />
+                        {:else}
+                          <span class="todo-circle"></span>
+                        {/if}
+                      </span>
+                      <span class="todo-text">{todo.content || '未命名'}</span>
+                      {#if task.assignments.length <= 1 && assignment.workerId}
+                        <span class="todo-worker" style="color: {workerColors[assignment.workerId] || 'var(--foreground-muted)'}">{assignment.workerId}</span>
                       {/if}
-                    </span>
-                    <span class="todo-text">{todo.content || '未命名'}</span>
-                    {#if task.assignments.length <= 1 && assignment.workerId}
-                      <span class="todo-worker" style="color: {workerColors[assignment.workerId] || 'var(--foreground-muted)'}">{assignment.workerId}</span>
-                    {/if}
-                    {#if todo.priority !== undefined && todo.priority <= 1}
-                      <span class="todo-priority-badge">P{todo.priority}</span>
-                    {/if}
-                    {#if todo.outOfScope}
-                      <span class="todo-flag">超范围</span>
-                    {/if}
-                  </div>
+                      {#if todo.priority !== undefined && todo.priority <= 1}
+                        <span class="todo-priority-badge">P{todo.priority}</span>
+                      {/if}
+                      {#if todo.outOfScope}
+                        <span class="todo-flag">超范围</span>
+                      {/if}
+                    </div>
+                    {#each children as child, childIdx (child.id)}
+                      <div class="todo-row todo-child" class:is-done={child.status === 'completed' || child.status === 'skipped'} class:is-failed={child.status === 'failed'} class:is-running={child.status === 'in_progress'}>
+                        <span class="todo-seq sub">{seqNum}.{childIdx + 1}</span>
+                        <span class="todo-check">
+                          {#if child.status === 'completed' || child.status === 'skipped'}
+                            <Icon name="check" size={12} />
+                          {:else if child.status === 'in_progress'}
+                            <Icon name="loader" size={12} class="spinning" />
+                          {:else if child.status === 'failed'}
+                            <Icon name="x-circle" size={12} />
+                          {:else}
+                            <span class="todo-circle"></span>
+                          {/if}
+                        </span>
+                        <span class="todo-text">{child.content || '未命名'}</span>
+                        {#if child.outOfScope}
+                          <span class="todo-flag">超范围</span>
+                        {/if}
+                      </div>
+                    {/each}
+                  {/if}
                 {/each}
               {/each}
               <!-- 没有 assignment 但有 subTasks 的情况 -->
               {#if task.assignments.length === 0 && task.subTasks.length > 0}
-                {#each task.subTasks as sub (sub.id || sub.name)}
+                {#each task.subTasks as sub, subIdx (sub.id || sub.name)}
                   <div class="todo-row" class:is-done={sub.status === 'completed'} class:is-failed={sub.status === 'failed'} class:is-running={sub.status === 'running'}>
+                    <span class="todo-seq">{subIdx + 1}.</span>
                     <span class="todo-check">
                       {#if sub.status === 'completed'}
                         <Icon name="check" size={12} />
@@ -279,21 +305,46 @@
             {/if}
             {#if isExpanded && todos.length > 0}
               <div class="task-children">
-                {#each todos as todo (todo.id)}
-                  <div class="todo-row" class:is-done={todo.status === 'completed' || todo.status === 'skipped'} class:is-failed={todo.status === 'failed'} class:is-running={todo.status === 'in_progress'}>
-                    <span class="todo-check">
-                      {#if todo.status === 'completed' || todo.status === 'skipped'}
-                        <Icon name="check" size={12} />
-                      {:else if todo.status === 'in_progress'}
-                        <Icon name="loader" size={12} class="spinning" />
-                      {:else if todo.status === 'failed'}
-                        <Icon name="x-circle" size={12} />
-                      {:else}
-                        <span class="todo-circle"></span>
-                      {/if}
-                    </span>
-                    <span class="todo-text">{todo.content || '未命名'}</span>
-                  </div>
+                {#each todos as todo, todoIdx (todo.id)}
+                  {#if !todo.parentId}
+                    {@const seqNum = todos.filter((t: any) => !t.parentId).indexOf(todo) + 1}
+                    {@const children = todos.filter((t: any) => t.parentId === todo.id)}
+                    <div class="todo-row" class:is-done={todo.status === 'completed' || todo.status === 'skipped'} class:is-failed={todo.status === 'failed'} class:is-running={todo.status === 'in_progress'}>
+                      <span class="todo-seq">{seqNum}.</span>
+                      <span class="todo-check">
+                        {#if todo.status === 'completed' || todo.status === 'skipped'}
+                          <Icon name="check" size={12} />
+                        {:else if todo.status === 'in_progress'}
+                          <Icon name="loader" size={12} class="spinning" />
+                        {:else if todo.status === 'failed'}
+                          <Icon name="x-circle" size={12} />
+                        {:else}
+                          <span class="todo-circle"></span>
+                        {/if}
+                      </span>
+                      <span class="todo-text">{todo.content || '未命名'}</span>
+                    </div>
+                    {#each children as child, childIdx (child.id)}
+                      <div class="todo-row todo-child" class:is-done={child.status === 'completed' || child.status === 'skipped'} class:is-failed={child.status === 'failed'} class:is-running={child.status === 'in_progress'}>
+                        <span class="todo-seq sub">{seqNum}.{childIdx + 1}</span>
+                        <span class="todo-check">
+                          {#if child.status === 'completed' || child.status === 'skipped'}
+                            <Icon name="check" size={12} />
+                          {:else if child.status === 'in_progress'}
+                            <Icon name="loader" size={12} class="spinning" />
+                          {:else if child.status === 'failed'}
+                            <Icon name="x-circle" size={12} />
+                          {:else}
+                            <span class="todo-circle"></span>
+                          {/if}
+                        </span>
+                        <span class="todo-text">{child.content || '未命名'}</span>
+                        {#if child.outOfScope}
+                          <span class="todo-flag">超范围</span>
+                        {/if}
+                      </div>
+                    {/each}
+                  {/if}
                 {/each}
               </div>
             {/if}
@@ -634,6 +685,22 @@
 
   .todo-row.is-running {
     color: var(--primary);
+  }
+
+  .todo-row.todo-child {
+    padding-left: var(--space-6);
+  }
+
+  .todo-seq {
+    font-size: var(--text-2xs);
+    color: var(--foreground-muted);
+    min-width: 18px;
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .todo-seq.sub {
+    min-width: 24px;
   }
 
   .todo-check {

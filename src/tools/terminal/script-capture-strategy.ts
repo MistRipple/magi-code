@@ -30,11 +30,11 @@ import { logger, LogCategory } from '../../logging';
 function getOutputStartMarkerSetup(shellName: ShellType): string {
   switch (shellName.toLowerCase()) {
     case 'zsh':
-      return `{ __multicli_output_marker() { printf $'\\x1b]8888;multicli-output-start\\x07'; }; preexec_functions+=(__multicli_output_marker); }`;
+      return `{ __magi_output_marker() { printf $'\\x1b]8888;magi-output-start\\x07'; }; preexec_functions+=(__magi_output_marker); }`;
     case 'bash':
-      return `{ __multicli_ps0_func() { printf $'\\x1b]8888;multicli-output-start\\x07'; }; PS0='$(__multicli_ps0_func)'"$PS0"; }`;
+      return `{ __magi_ps0_func() { printf $'\\x1b]8888;magi-output-start\\x07'; }; PS0='$(__magi_ps0_func)'"$PS0"; }`;
     case 'fish':
-      return `{ function __multicli_preexec --on-event fish_preexec; printf '\\x1b]8888;multicli-output-start\\x07'; end; }`;
+      return `{ function __magi_preexec --on-event fish_preexec; printf '\\x1b]8888;magi-output-start\\x07'; end; }`;
     default:
       return '';
   }
@@ -46,11 +46,11 @@ function getOutputStartMarkerSetup(shellName: ShellType): string {
 function getOutputEndMarkerSetup(shellName: ShellType): string {
   switch (shellName.toLowerCase()) {
     case 'zsh':
-      return `{ __multicli_output_end_marker() { printf $'\\x1b]8889;multicli-output-end\\x07'; }; precmd_functions+=(__multicli_output_end_marker); }`;
+      return `{ __magi_output_end_marker() { printf $'\\x1b]8889;magi-output-end\\x07'; }; precmd_functions+=(__magi_output_end_marker); }`;
     case 'bash':
-      return `{ __multicli_output_end_marker() { printf $'\\x1b]8889;multicli-output-end\\x07'; }; if [ -n "$PROMPT_COMMAND" ]; then export PROMPT_COMMAND="$PROMPT_COMMAND"$'\\n'"__multicli_output_end_marker"; else export PROMPT_COMMAND="__multicli_output_end_marker"; fi; }`;
+      return `{ __magi_output_end_marker() { printf $'\\x1b]8889;magi-output-end\\x07'; }; if [ -n "$PROMPT_COMMAND" ]; then export PROMPT_COMMAND="$PROMPT_COMMAND"$'\\n'"__magi_output_end_marker"; else export PROMPT_COMMAND="__magi_output_end_marker"; fi; }`;
     case 'fish':
-      return `{ function __multicli_postexec --on-event fish_postexec; printf '\\x1b]8889;multicli-output-end\\x07'; end; }`;
+      return `{ function __magi_postexec --on-event fish_postexec; printf '\\x1b]8889;magi-output-end\\x07'; end; }`;
     default:
       return '';
   }
@@ -90,8 +90,8 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
     // 生成临时文件路径
     const tmpDir = os.tmpdir();
     const uniqueId = crypto.randomBytes(8).toString('hex');
-    const scriptFile = path.join(tmpDir, `multicli-script-${uniqueId}.log`);
-    const cwdFile = path.join(tmpDir, `multicli-cwd-${uniqueId}.txt`);
+    const scriptFile = path.join(tmpDir, `magi-script-${uniqueId}.log`);
+    const cwdFile = path.join(tmpDir, `magi-cwd-${uniqueId}.txt`);
 
     // 生成并执行 script 启动命令
     const scriptStartCmd = this.generateScriptStartCommand(shellName, scriptFile);

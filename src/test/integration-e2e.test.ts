@@ -670,7 +670,7 @@ async function runTests(): Promise<void> {
     const result = await toolManager.execute(toolCall);
 
     if (result.isError) throw new Error(`执行失败: ${result.content}`);
-    if (!result.content.includes('multicli')) {
+    if (!result.content.includes('magi')) {
       throw new Error('未找到预期的内容');
     }
 

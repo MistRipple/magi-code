@@ -11,9 +11,9 @@ scripts/**
 augment-extension/**
 websocket-system/**
 node_modules/**
-src/ui/webview-svelte/node_modules/**
-out/webview/**/*.map
-**/*.ts
+out/**
+esbuild.mjs
+**/*.map
 **/*.svelte
 **/tsconfig.json
 **/.gitignore

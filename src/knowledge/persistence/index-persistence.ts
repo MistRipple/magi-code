@@ -77,7 +77,7 @@ export class IndexPersistence {
   private debounceMs: number;
 
   constructor(projectRoot: string, debounceMs = DEFAULT_DEBOUNCE_MS) {
-    this.cacheFilePath = path.join(projectRoot, '.multicli', 'cache', 'search-index.json');
+    this.cacheFilePath = path.join(projectRoot, '.magi', 'cache', 'search-index.json');
     this.debounceMs = debounceMs;
   }
 

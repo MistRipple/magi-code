@@ -1,8 +1,8 @@
-# MultiCLI 统一编排架构设计方案
+# Magi 统一编排架构设计方案
 
 ## 一、产品定位
 
-**MultiCLI** 是一个 VSCode 插件，编排多个专业 AI（Claude / Codex / Gemini）协作完成复杂开发任务。
+**Magi** 是一个 VSCode 插件，编排多个专业 AI（Claude / Codex / Gemini）协作完成复杂开发任务。
 
 **核心价值**：用户像和一个全能编程助手对话，背后由最合适的 AI 自动执行。
 
@@ -101,7 +101,7 @@
 | status | string | 固定为 "dispatched" |
 | worker | string | 实际分配的 Worker |
 
-**worker 参数动态生成**：dispatch_task 的 worker enum 值和描述文案由系统在注册工具时从 ProfileLoader 读取当前生效的分工配置动态构建。用户通过 `~/.multicli/worker-assignments.json` 调整分工后，工具描述自动更新，无需修改代码。
+**worker 参数动态生成**：dispatch_task 的 worker enum 值和描述文案由系统在注册工具时从 ProfileLoader 读取当前生效的分工配置动态构建。用户通过 `~/.magi/worker-assignments.json` 调整分工后，工具描述自动更新，无需修改代码。
 
 ### plan_mission
 
@@ -368,7 +368,7 @@ Worker 之间**不直接发送消息**，所有协作通过以下两种机制完
 
 **Worker 能力描述动态构建流程**：
 
-1. ProfileLoader 从内置画像（WorkerPersona）+ 用户可配置的分工文件（`~/.multicli/worker-assignments.json`）组合生成每个 Worker 的完整画像（WorkerProfile）
+1. ProfileLoader 从内置画像（WorkerPersona）+ 用户可配置的分工文件（`~/.magi/worker-assignments.json`）组合生成每个 Worker 的完整画像（WorkerProfile）
 2. 系统提示词构建器遍历所有可用 Worker 的 WorkerProfile，动态生成 Worker 能力描述段落
 3. 用户调整分工配置后，下次 LLM 调用时系统提示词自动更新，无需重启
 

@@ -211,7 +211,7 @@ async function runTests(): Promise<void> {
 
     const result = await fileExecutor.execute(toolCall);
     if (result.isError) throw new Error(result.content);
-    if (!result.content.includes('multicli')) throw new Error('内容不正确');
+    if (!result.content.includes('magi')) throw new Error('内容不正确');
 
     console.log(`  - 成功读取 package.json`);
   }));

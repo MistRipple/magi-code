@@ -879,9 +879,9 @@ async function main() {
   console.log('');
 
   // 检查 LLM 配置
-  const configPath = path.join(os.homedir(), '.multicli', 'llm.json');
+  const configPath = path.join(os.homedir(), '.magi', 'llm.json');
   if (!fs.existsSync(configPath)) {
-    console.error('错误: 未找到 LLM 配置文件 (~/.multicli/llm.json)');
+    console.error('错误: 未找到 LLM 配置文件 (~/.magi/llm.json)');
     console.error('请先配置 LLM API');
     process.exit(1);
   }

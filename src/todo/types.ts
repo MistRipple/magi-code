@@ -72,6 +72,8 @@ export interface UnifiedTodo {
   missionId: string;
   /** 所属 Assignment ID */
   assignmentId: string;
+  /** 父 Todo ID（动态拆分时指向宏观 Todo） */
+  parentId?: string;
 
   // ===== 内容 =====
   /** 任务描述 */
@@ -177,6 +179,7 @@ export interface TodoOutput {
 export interface CreateTodoParams {
   missionId: string;
   assignmentId: string;
+  parentId?: string;
   content: string;
   reasoning: string;
   type: TodoType;
@@ -232,43 +235,6 @@ export interface TodoEvents {
 // ============================================================================
 // 规划相关
 // ============================================================================
-
-/**
- * Todo 规划上下文
- */
-export interface TodoPlanningContext {
-  /** Mission ID */
-  missionId: string;
-  /** Assignment ID */
-  assignmentId: string;
-  /** 职责描述 */
-  responsibility: string;
-  /** 职责范围 */
-  scope: {
-    includes: string[];
-    excludes: string[];
-    targetPaths?: string[];
-    requiresModification?: boolean;
-  };
-  /** 可用契约 */
-  availableContracts: string[];
-  /** Worker */
-  workerId: WorkerSlot;
-  /** 项目上下文 */
-  projectContext?: string;
-}
-
-/**
- * Todo 规划结果
- */
-export interface TodoPlanningResult {
-  /** 生成的 Todos */
-  todos: UnifiedTodo[];
-  /** 超范围的 Todos */
-  outOfScopeTodos: UnifiedTodo[];
-  /** 警告信息 */
-  warnings: string[];
-}
 
 /**
  * 规划审查反馈

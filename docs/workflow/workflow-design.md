@@ -1,4 +1,4 @@
-# MultiCLI 统一工作流架构设计
+# Magi 统一工作流架构设计
 
 > 版本: 3.0 | 更新日期: 2025-02-05
 
@@ -17,7 +17,7 @@
 
 ### 1.1 项目定位
 
-MultiCLI 是一个 **AI 驱动的多智能体编排开发插件**，核心特点：
+Magi 是一个 **AI 驱动的多智能体编排开发插件**，核心特点：
 
 | 特性 | 说明 |
 |------|------|
@@ -77,7 +77,7 @@ MultiCLI 是一个 **AI 驱动的多智能体编排开发插件**，核心特点
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         MultiCLI 统一工作流（5 阶段）                          │
+│                         Magi 统一工作流（5 阶段）                          │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  用户输入                                                                    │
@@ -310,7 +310,7 @@ interface ExecutionStrategy {
 
 ### 3.4 ExecutionPlan
 
-```typescript /Users/xie/code/MultiCLI/src/orchestrator/protocols/types.ts
+```typescript /Users/xie/code/Magi/src/orchestrator/protocols/types.ts
 interface ExecutionPlan {
   id: string;
   analysis: string;
@@ -975,7 +975,7 @@ workerInstruction({
 
 ## 十四、总结
 
-本文档定义了 MultiCLI 的统一工作流架构（5 阶段设计），核心特点：
+本文档定义了 Magi 的统一工作流架构（5 阶段设计），核心特点：
 
 1. **5 阶段流程**：意图门控 → 需求分析 → 协作规划 → 执行 → 总结
 2. **语义驱动**：通过 AI 理解用户意图，非硬编码规则

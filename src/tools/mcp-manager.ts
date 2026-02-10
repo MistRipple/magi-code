@@ -116,7 +116,7 @@ export class MCPManager {
 
       // 创建客户端
       const client = new Client({
-        name: 'multicli',
+        name: 'magi',
         version: '0.1.0',
       }, {
         capabilities: {},

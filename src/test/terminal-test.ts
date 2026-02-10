@@ -7,7 +7,7 @@ import * as vscode from 'vscode';
 import { VSCodeTerminalExecutor } from '../tools/vscode-terminal-executor';
 
 export async function testVSCodeTerminal() {
-  const output = vscode.window.createOutputChannel('MultiCLI Terminal Test');
+  const output = vscode.window.createOutputChannel('Magi Terminal Test');
   output.show();
   
   output.appendLine('=== VSCode Terminal Executor 测试 ===');
@@ -19,7 +19,7 @@ export async function testVSCodeTerminal() {
     // 测试 1: 简单命令（不显示终端）
     output.appendLine('测试 1: 执行简单命令（后台）');
     const launch1 = await executor.launchProcess({
-      command: 'echo "Hello from MultiCLI"',
+      command: 'echo "Hello from Magi"',
       wait: true,
       maxWaitSeconds: 5,
       showTerminal: false,
@@ -90,7 +90,7 @@ export async function testVSCodeTerminal() {
  */
 export function registerTerminalTest(context: vscode.ExtensionContext) {
   const disposable = vscode.commands.registerCommand(
-    'multicli.testTerminal',
+    'magi.testTerminal',
     testVSCodeTerminal
   );
   context.subscriptions.push(disposable);

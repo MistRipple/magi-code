@@ -27,8 +27,6 @@ import {
   UpdateTodoParams,
   TodoQuery,
   TodoStats,
-  TodoPlanningContext,
-  TodoPlanningResult,
   PlanReviewFeedback,
 } from './types';
 import { TodoRepository, FileTodoRepository } from './todo-repository';
@@ -181,6 +179,7 @@ export class TodoManager extends EventEmitter {
       id: `todo_${now}_${Math.random().toString(36).substr(2, 9)}`,
       missionId: params.missionId,
       assignmentId: params.assignmentId,
+      parentId: params.parentId,
       content: params.content,
       reasoning: params.reasoning,
       expectedOutput: params.expectedOutput,
@@ -663,24 +662,6 @@ export class TodoManager extends EventEmitter {
   // ============================================================================
 
   /**
-   * 检查范围
-   */
-  checkScope(
-    todo: UnifiedTodo,
-    scope: { includes: string[]; excludes: string[] }
-  ): { outOfScope: boolean; reason?: string } {
-    const content = todo.content.toLowerCase();
-
-    for (const exclude of scope.excludes) {
-      if (content.includes(exclude.toLowerCase())) {
-        return { outOfScope: true, reason: `涉及排除项: "${exclude}"` };
-      }
-    }
-
-    return { outOfScope: false };
-  }
-
-  /**
    * 请求超范围审批
    */
   async requestApproval(todoId: string, note?: string): Promise<void> {
@@ -724,108 +705,6 @@ export class TodoManager extends EventEmitter {
     await this.repository.save(todo);
     await this.skip(todoId);
     this.emit('todo:rejected', todo);
-  }
-
-  // ============================================================================
-  // 规划功能
-  // ============================================================================
-
-  /**
-   * 为 Assignment 生成 Todo 规划
-   */
-  async planTodos(context: TodoPlanningContext): Promise<TodoPlanningResult> {
-    const todos: UnifiedTodo[] = [];
-    const outOfScopeTodos: UnifiedTodo[] = [];
-    const warnings: string[] = [];
-    const responsibility = context.responsibility.toLowerCase();
-
-    // 1. 探索 Todo
-    if (this.needsDiscovery(responsibility)) {
-      const todo = await this.create({
-        missionId: context.missionId,
-        assignmentId: context.assignmentId,
-        content: '探索和了解相关代码结构',
-        reasoning: '在实现前需要了解现有代码',
-        type: 'discovery',
-        workerId: context.workerId,
-        priority: 1,
-      });
-      todos.push(todo);
-    }
-
-    // 2. 设计 Todo
-    if (this.needsDesign(responsibility)) {
-      const todo = await this.create({
-        missionId: context.missionId,
-        assignmentId: context.assignmentId,
-        content: '设计实现方案',
-        reasoning: '需要先规划实现路径',
-        type: 'design',
-        workerId: context.workerId,
-        priority: 2,
-        dependsOn: todos.length > 0 ? [todos[todos.length - 1].id] : [],
-      });
-      todos.push(todo);
-    }
-
-    // 3. 实现 Todo
-    const targetPaths = context.scope.targetPaths?.length
-      ? context.scope.requiresModification
-        ? `目标文件: ${context.scope.targetPaths.join(', ')}。必须使用工具直接编辑并保存。`
-        : `目标文件: ${context.scope.targetPaths.join(', ')}。只需读取/分析，不要修改文件。`
-      : '';
-
-    const implTodo = await this.create({
-      missionId: context.missionId,
-      assignmentId: context.assignmentId,
-      content: `执行职责任务：${context.responsibility}${targetPaths ? `\n${targetPaths}` : ''}`,
-      reasoning: '完成职责的主要工作',
-      expectedOutput: context.responsibility,
-      type: 'implementation',
-      workerId: context.workerId,
-      priority: 3,
-      dependsOn: todos.length > 0 ? [todos[todos.length - 1].id] : [],
-      targetFiles: context.scope.targetPaths,
-    });
-    todos.push(implTodo);
-
-    // 4. 验证 Todo
-    const verifyTodo = await this.create({
-      missionId: context.missionId,
-      assignmentId: context.assignmentId,
-      content: `验证任务结果是否满足目标：${context.responsibility}`,
-      reasoning: '确保实现正确',
-      type: 'verification',
-      workerId: context.workerId,
-      priority: 4,
-      dependsOn: [implTodo.id],
-    });
-    todos.push(verifyTodo);
-
-    // 检查范围
-    for (const todo of todos) {
-      const scopeCheck = this.checkScope(todo, context.scope);
-      if (scopeCheck.outOfScope) {
-        todo.outOfScope = true;
-        todo.approvalStatus = 'pending';
-        todo.approvalNote = scopeCheck.reason;
-        await this.repository.save(todo);
-        outOfScopeTodos.push(todo);
-        warnings.push(`Todo "${todo.content}" 超出职责范围: ${scopeCheck.reason}`);
-      }
-    }
-
-    return { todos, outOfScopeTodos, warnings };
-  }
-
-  private needsDiscovery(responsibility: string): boolean {
-    const keywords = ['理解', '了解', '分析', '探索', 'understand', 'analyze', 'explore'];
-    return keywords.some((k) => responsibility.includes(k));
-  }
-
-  private needsDesign(responsibility: string): boolean {
-    const keywords = ['新增', '创建', '设计', '实现', 'new', 'create', 'design', 'implement'];
-    return keywords.some((k) => responsibility.includes(k));
   }
 
   /**

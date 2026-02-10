@@ -154,7 +154,7 @@ class MessageHubE2EEngineer implements TestEngineer {
           severity: 'high',
           category: 'LLM配置',
           description: '编排模型未配置完整 (缺少 apiKey 或 model)',
-          suggestedFix: '配置 ~/.multicli/llm.json 中的编排模型',
+          suggestedFix: '配置 ~/.magi/llm.json 中的编排模型',
         });
         return { passed: false, issues };
       }
@@ -334,7 +334,7 @@ class MessageHubE2EEngineer implements TestEngineer {
       LLMConfigLoader.loadOrchestratorConfig();
 
       // 创建临时目录（用于隔离其他配置）
-      const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'multicli-hub-e2e-'));
+      const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'magi-hub-e2e-'));
 
       // Mock vscode
       const Module = require('module');

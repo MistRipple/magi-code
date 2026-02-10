@@ -1,4 +1,4 @@
-# MultiCLI 产品定位与价值基线
+# Magi 产品定位与价值基线
 
 > 版本: 1.0  
 > 更新时间: 2026-02-06  
@@ -16,7 +16,7 @@
 
 ## 2. 一句话定位
 
-MultiCLI 是一个在 VSCode 内运行的多智能体工程编排系统：以 Orchestrator 为控制面，按语义决策协调 Claude/Codex/Gemini 等 Worker，在统一上下文与统一运行时之上稳定交付真实工程任务。
+Magi 是一个在 VSCode 内运行的多智能体工程编排系统：以 Orchestrator 为控制面，按语义决策协调 Claude/Codex/Gemini 等 Worker，在统一上下文与统一运行时之上稳定交付真实工程任务。
 
 ## 3. 目标用户与典型场景
 

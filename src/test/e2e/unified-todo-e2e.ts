@@ -14,7 +14,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import { TodoManager } from '../../todo/todo-manager';
-import { UnifiedTodo, TodoStatus, CreateTodoParams, TodoPlanningContext } from '../../todo/types';
+import { UnifiedTodo, TodoStatus, CreateTodoParams } from '../../todo/types';
 import { UniversalLLMClient } from '../../llm/clients/universal-client';
 import { LLMConfigLoader } from '../../llm/config';
 import { LLMConfig } from '../../types/agent-types';
@@ -42,7 +42,7 @@ interface TestContext {
 // ============================================================================
 
 function createTestDir(): string {
-  const testDir = path.join(os.tmpdir(), `multicli-todo-test-${Date.now()}`);
+  const testDir = path.join(os.tmpdir(), `magi-todo-test-${Date.now()}`);
   fs.mkdirSync(testDir, { recursive: true });
   return testDir;
 }
@@ -685,9 +685,9 @@ async function main() {
   console.log('============================================================');
   console.log('');
 
-  const configPath = path.join(os.homedir(), '.multicli', 'llm.json');
+  const configPath = path.join(os.homedir(), '.magi', 'llm.json');
   if (!fs.existsSync(configPath)) {
-    console.error('错误: 未找到 LLM 配置文件 (~/.multicli/llm.json)');
+    console.error('错误: 未找到 LLM 配置文件 (~/.magi/llm.json)');
     process.exit(1);
   }
 

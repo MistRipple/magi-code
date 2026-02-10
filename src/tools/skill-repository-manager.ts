@@ -66,7 +66,7 @@ export class SkillRepositoryManager {
         timeout: this.REQUEST_TIMEOUT,
         headers: {
           'Accept': 'application/json',
-          'User-Agent': 'MultiCLI-SkillManager/1.0'
+          'User-Agent': 'Magi-SkillManager/1.0'
         }
       });
 
@@ -151,7 +151,7 @@ export class SkillRepositoryManager {
         timeout: this.REQUEST_TIMEOUT,
         headers: {
           'Accept': 'application/vnd.github.v3+json',
-          'User-Agent': 'MultiCLI-SkillManager/1.0'
+          'User-Agent': 'Magi-SkillManager/1.0'
         }
       });
 
@@ -169,7 +169,7 @@ export class SkillRepositoryManager {
           const readmeUrl = `https://raw.githubusercontent.com/${owner}/${repo}/main/plugins/${pluginName}/README.md`;
           const readmeResponse = await axios.get(readmeUrl, {
             timeout: this.REQUEST_TIMEOUT,
-            headers: { 'User-Agent': 'MultiCLI-SkillManager/1.0' }
+            headers: { 'User-Agent': 'Magi-SkillManager/1.0' }
           });
 
           const readme = readmeResponse.data;
@@ -242,7 +242,7 @@ export class SkillRepositoryManager {
       const response = await axios.get(rawUrl, {
         timeout: this.REQUEST_TIMEOUT,
         headers: {
-          'User-Agent': 'MultiCLI-SkillManager/1.0'
+          'User-Agent': 'Magi-SkillManager/1.0'
         }
       });
       if (typeof response.data === 'string') {
@@ -264,7 +264,7 @@ export class SkillRepositoryManager {
         timeout: this.REQUEST_TIMEOUT,
         headers: {
           'Accept': 'application/vnd.github.v3+json',
-          'User-Agent': 'MultiCLI-SkillManager/1.0'
+          'User-Agent': 'Magi-SkillManager/1.0'
         }
       });
       return Array.isArray(response.data) ? response.data : null;
@@ -607,7 +607,7 @@ export class SkillRepositoryManager {
           timeout: this.REQUEST_TIMEOUT,
           headers: {
             'Accept': 'application/json',
-            'User-Agent': 'MultiCLI-SkillManager/1.0'
+            'User-Agent': 'Magi-SkillManager/1.0'
           }
         });
         skillsData = response.data;
@@ -811,7 +811,7 @@ export class SkillRepositoryManager {
         try {
           const response = await axios.get(skillsJsonUrl, {
             timeout: this.REQUEST_TIMEOUT,
-            headers: { 'Accept': 'application/json', 'User-Agent': 'MultiCLI-SkillManager/1.0' }
+            headers: { 'Accept': 'application/json', 'User-Agent': 'Magi-SkillManager/1.0' }
           });
           const data = response.data;
           return {
@@ -869,7 +869,7 @@ export class SkillRepositoryManager {
         // JSON 仓库
         const response = await axios.get(url, {
           timeout: this.REQUEST_TIMEOUT,
-          headers: { 'Accept': 'application/json', 'User-Agent': 'MultiCLI-SkillManager/1.0' }
+          headers: { 'Accept': 'application/json', 'User-Agent': 'Magi-SkillManager/1.0' }
         });
         const data = response.data;
         return {

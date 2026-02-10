@@ -25,7 +25,7 @@ export interface PlanReview {
 /**
  * 计划存储管理器
  *
- * 存储位置：.multicli/sessions/{sessionId}/plans/
+ * 存储位置：.magi/sessions/{sessionId}/plans/
  * 每个会话的计划存储在对应会话目录下
  */
 export class PlanStorage {
@@ -37,7 +37,7 @@ export class PlanStorage {
 
   /** 获取会话的计划目录 */
   private getPlansDir(sessionId: string): string {
-    return path.join(this.workspaceRoot, '.multicli', 'sessions', sessionId, 'plans');
+    return path.join(this.workspaceRoot, '.magi', 'sessions', sessionId, 'plans');
   }
 
   private ensureDir(sessionId: string): void {

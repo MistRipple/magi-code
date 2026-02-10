@@ -103,6 +103,7 @@ export interface ContentBlock {
 export interface AssignmentTodo {
   id: string;
   assignmentId: string;
+  parentId?: string;
   content: string;
   reasoning?: string;
   expectedOutput?: string;

@@ -233,12 +233,12 @@ export interface ShellInfo {
 /**
  * 输出开始标记（ANSI OSC 序列）
  */
-export const OUTPUT_START_MARKER = '\x1B]8888;multicli-output-start\x07';
+export const OUTPUT_START_MARKER = '\x1B]8888;magi-output-start\x07';
 
 /**
  * 输出结束标记（ANSI OSC 序列）
  */
-export const OUTPUT_END_MARKER = '\x1B]8889;multicli-output-end\x07';
+export const OUTPUT_END_MARKER = '\x1B]8889;magi-output-end\x07';
 
 // ============================================================================
 // Shell 通用工具函数

@@ -170,7 +170,7 @@ export function buildUnifiedSystemPrompt(context: UnifiedPromptContext): string 
   const sections: string[] = [];
 
   // 角色定义
-  sections.push(`你是 MultiCLI，一个能协调多个专业 AI 协作完成复杂开发任务的编程助手。
+  sections.push(`你是 Magi，一个能协调多个专业 AI 协作完成复杂开发任务的编程助手。
 
 ## 身份
 - 你运行在 VSCode 插件中，拥有完整的文件系统和终端访问能力
@@ -281,7 +281,7 @@ export function buildDispatchSummaryPrompt(
       const summary = e.result?.summary || '无输出';
       const errors = e.result?.errors?.join('; ') || '';
       return `### Worker ${e.worker} [${statusLabel}]
-**任务**: ${e.task.substring(0, 120)}
+**任务**: ${e.task.length > 120 ? e.task.substring(0, 120) + '...' : e.task}
 **修改文件**: ${files}
 **摘要**: ${summary}${errors ? `\n**错误**: ${errors}` : ''}`;
     })

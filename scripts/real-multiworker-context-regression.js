@@ -33,7 +33,7 @@ Module.prototype.require = function patchedRequire(id) {
       workspace: {
         workspaceFolders: [{ uri: { fsPath: process.cwd() } }],
         getConfiguration: () => ({
-          get: (key) => (key === 'multiCli.timeout' ? 120000 : undefined),
+          get: (key) => (key === 'magi.timeout' ? 120000 : undefined),
           update: () => Promise.resolve(),
         }),
         onDidChangeConfiguration: event,
@@ -79,7 +79,7 @@ function buildPromptCandidates(userPrompt) {
     return [userPrompt.trim()];
   }
   return [
-    '分析对象固定为当前工作区代码库 MultiCLI（路径：/Users/xie/code/MultiCLI）。请直接并行执行 2 个 worker（claude 与 codex），无需规划阶段、无需拆分 Todo、禁止调用任何工具。只做只读分析：claude 输出 1 条 decision + 1 条 constraint，codex 输出 1 条 risk + 1 条 constraint。禁止修改任何文件，最后由编排者输出合并结论。',
+    '分析对象固定为当前工作区代码库 Magi（路径：/Users/xie/code/Magi）。请直接并行执行 2 个 worker（claude 与 codex），无需规划阶段、无需拆分 Todo、禁止调用任何工具。只做只读分析：claude 输出 1 条 decision + 1 条 constraint，codex 输出 1 条 risk + 1 条 constraint。禁止修改任何文件，最后由编排者输出合并结论。',
   ];
 }
 
@@ -93,7 +93,7 @@ function answerClarification(question, workspaceRoot) {
     || q.includes('分析对象')
     || q.includes('范围')
   ) {
-    return `分析对象是当前工作区代码库 MultiCLI，路径为 ${workspaceRoot}。`;
+    return `分析对象是当前工作区代码库 Magi，路径为 ${workspaceRoot}。`;
   }
   if (q.includes('工具') || q.includes('读取') || q.includes('访问')) {
     return '保持只读分析，不修改文件，不执行命令，不访问外网。';

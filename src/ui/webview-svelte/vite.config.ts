@@ -21,7 +21,7 @@ export default defineConfig({
   },
   build: {
     // 输出到 VS Code 扩展可以访问的目录
-    outDir: '../../../out/webview',
+    outDir: '../../../dist/webview',
     emptyOutDir: true,
     // 提高 chunk 大小警告阈值（VS Code webview 场景下大文件可接受）
     chunkSizeWarningLimit: 1500,

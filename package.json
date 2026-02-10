@@ -1,9 +1,10 @@
 {
-  "name": "multicli",
-  "displayName": "MultiCLI",
-  "description": "编排多个 AI CLI 工具 (Claude/Codex/Gemini) 协作完成复杂任务",
+  "name": "magi",
+  "displayName": "Magi",
+  "description": "多智能体工程编排系统 — 意图分析、任务拆解、异构专家协作",
   "version": "0.1.0",
-  "publisher": "xie",
+  "license": "UNLICENSED",
+  "publisher": "MistRipple",
   "engines": {
     "vscode": "^1.93.0"
   },
@@ -13,108 +14,108 @@
   ],
   "keywords": [
     "ai",
+    "magi",
+    "multi-agent",
+    "orchestration",
     "claude",
-    "codex",
-    "gemini",
-    "cli",
-    "orchestration"
+    "gemini"
   ],
   "activationEvents": [
     "onStartupFinished"
   ],
-  "main": "./out/extension.js",
+  "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "multiCli.startTask",
-        "title": "MultiCLI: 启动任务"
+        "command": "magi.startTask",
+        "title": "Magi: 启动任务"
       },
       {
-        "command": "multiCli.checkCLIs",
-        "title": "MultiCLI: 检测 CLI 状态"
+        "command": "magi.checkCLIs",
+        "title": "Magi: 检测 CLI 状态"
       },
       {
-        "command": "multiCli.showPanel",
-        "title": "MultiCLI: 显示控制面板"
+        "command": "magi.showPanel",
+        "title": "Magi: 显示控制面板"
       },
       {
-        "command": "multiCli.openPanel",
-        "title": "MultiCLI: 打开控制面板"
+        "command": "magi.openPanel",
+        "title": "Magi: 打开控制面板"
       },
       {
-        "command": "multiCli.newSession",
-        "title": "MultiCLI: 新建会话"
+        "command": "magi.newSession",
+        "title": "Magi: 新建会话"
       },
       {
-        "command": "multiCli.showStatus",
-        "title": "MultiCLI: 显示 CLI 状态"
+        "command": "magi.showStatus",
+        "title": "Magi: 显示 CLI 状态"
       },
       {
-        "command": "multiCli.stopTask",
-        "title": "MultiCLI: 停止当前任务"
+        "command": "magi.stopTask",
+        "title": "Magi: 停止当前任务"
       },
       {
-        "command": "multiCli.interruptTask",
-        "title": "MultiCLI: 打断当前任务"
+        "command": "magi.interruptTask",
+        "title": "Magi: 打断当前任务"
       },
       {
-        "command": "multiCli.testClaudePty",
-        "title": "MultiCLI: 测试 Claude PTY 初始化"
+        "command": "magi.testClaudePty",
+        "title": "Magi: 测试 Claude PTY 初始化"
       },
       {
-        "command": "multicli.testTerminal",
-        "title": "MultiCLI: 测试 VSCode 终端"
+        "command": "magi.testTerminal",
+        "title": "Magi: 测试 VSCode 终端"
       }
     ],
     "keybindings": [
       {
-        "command": "multiCli.showPanel",
+        "command": "magi.showPanel",
         "key": "ctrl+shift+a",
         "mac": "cmd+shift+a"
       },
       {
-        "command": "multiCli.startTask",
+        "command": "magi.startTask",
         "key": "ctrl+shift+enter",
         "mac": "cmd+shift+enter",
-        "when": "view == multiCli.mainView"
+        "when": "view == magi.mainView"
       },
       {
-        "command": "multiCli.newSession",
+        "command": "magi.newSession",
         "key": "ctrl+alt+n",
         "mac": "cmd+alt+n",
-        "when": "view == multiCli.mainView"
+        "when": "view == magi.mainView"
       },
       {
-        "command": "multiCli.stopTask",
+        "command": "magi.stopTask",
         "key": "ctrl+shift+backspace",
         "mac": "cmd+shift+backspace",
-        "when": "multiCliTaskRunning"
+        "when": "magiTaskRunning"
       },
       {
-        "command": "multiCli.interruptTask",
+        "command": "magi.interruptTask",
         "key": "escape",
-        "when": "multiCliTaskRunning"
+        "when": "magiTaskRunning"
       }
     ],
     "configuration": {
-      "title": "MultiCLI",
+      "title": "Magi",
       "properties": {
-        "multiCli.claude.path": {
+        "magi.claude.path": {
           "type": "string",
           "default": "claude",
           "description": "Claude CLI 可执行文件路径"
         },
-        "multiCli.codex.path": {
+        "magi.codex.path": {
           "type": "string",
           "default": "codex",
           "description": "Codex CLI 可执行文件路径"
         },
-        "multiCli.gemini.path": {
+        "magi.gemini.path": {
           "type": "string",
           "default": "gemini",
           "description": "Gemini CLI 可执行文件路径"
         },
-        "multiCli.defaultMode": {
+        "magi.defaultMode": {
           "type": "string",
           "enum": [
             "auto",
@@ -124,27 +125,27 @@
           "default": "auto",
           "description": "默认执行模式"
         },
-        "multiCli.timeout": {
+        "magi.timeout": {
           "type": "number",
           "default": 300000,
           "description": "CLI 最大执行超时时间（毫秒）"
         },
-        "multiCli.idleTimeout": {
+        "magi.idleTimeout": {
           "type": "number",
           "default": 120000,
           "description": "CLI 空闲超时时间（毫秒，持续无输出才触发）"
         },
-        "multiCli.maxTimeout": {
+        "magi.maxTimeout": {
           "type": "number",
           "default": 900000,
           "description": "CLI 最大执行超时时间（毫秒）"
         },
-        "multiCli.autoSnapshot": {
+        "magi.autoSnapshot": {
           "type": "boolean",
           "default": true,
           "description": "执行任务前自动创建文件快照"
         },
-        "multiCli.permissions": {
+        "magi.permissions": {
           "type": "object",
           "default": {
             "allowEdit": true,
@@ -167,7 +168,7 @@
             }
           }
         },
-        "multiCli.strategy": {
+        "magi.strategy": {
           "type": "object",
           "default": {
             "enableVerification": true,
@@ -190,7 +191,7 @@
             }
           }
         },
-        "multiCli.cliSelection": {
+        "magi.cliSelection": {
           "type": "object",
           "default": {
             "enabled": true,
@@ -213,26 +214,28 @@
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "multiCli",
-          "title": "MultiCLI",
+          "id": "magi",
+          "title": "Magi",
           "icon": "resources/icon.svg"
         }
       ]
     },
     "views": {
-      "multiCli": [
+      "magi": [
         {
           "type": "webview",
-          "id": "multiCli.mainView",
-          "name": "MultiCLI"
+          "id": "magi.mainView",
+          "name": "Magi"
         }
       ]
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile && npm run build:webview",
+    "vscode:prepublish": "npm run build:extension && npm run build:webview",
     "compile": "tsc -p ./",
+    "build:extension": "node esbuild.mjs --production",
     "watch": "tsc -watch -p ./",
+    "watch:extension": "node esbuild.mjs --watch",
     "build:webview": "cd src/ui/webview-svelte && npm run build",
     "watch:webview": "cd src/ui/webview-svelte && npm run dev",
     "lint": "eslint src --ext ts",
@@ -255,6 +258,7 @@
     "@types/vscode": "^1.93.0",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",
+    "esbuild": "^0.27.3",
     "eslint": "^8.54.0",
     "typescript": "^5.3.0"
   },

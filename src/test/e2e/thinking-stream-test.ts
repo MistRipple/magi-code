@@ -33,7 +33,7 @@ function log(prefix: string, message: string, color: string = colors.reset) {
 
 // 加载 LLM 配置
 function loadLLMConfig(): any {
-  const configPath = path.join(os.homedir(), '.multicli', 'llm.json');
+  const configPath = path.join(os.homedir(), '.magi', 'llm.json');
   if (fs.existsSync(configPath)) {
     return JSON.parse(fs.readFileSync(configPath, 'utf-8'));
   }

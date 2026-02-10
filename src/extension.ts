@@ -1,5 +1,5 @@
 /**
- * MultiCLI VSCode 扩展入口
+ * Magi VSCode 扩展入口
  */
 
 import { logger, LogCategory } from './logging';
@@ -21,7 +21,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // 获取工作区根目录
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (!workspaceRoot) {
-    vscode.window.showWarningMessage('MultiCLI: 请先打开一个工作区');
+    vscode.window.showWarningMessage('Magi: 请先打开一个工作区');
     return;
   }
 
@@ -46,26 +46,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     100
   );
   updateStatusBar('idle');
-  statusBarItem.command = 'multiCli.showPanel';
+  statusBarItem.command = 'magi.showPanel';
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
 
   // 监听任务状态变化，更新状态栏
   globalEventBus.on('task:started', () => {
     updateStatusBar('running');
-    vscode.commands.executeCommand('setContext', 'multiCliTaskRunning', true);
+    vscode.commands.executeCommand('setContext', 'magiTaskRunning', true);
   });
   globalEventBus.on('task:completed', () => {
     updateStatusBar('completed');
-    vscode.commands.executeCommand('setContext', 'multiCliTaskRunning', false);
+    vscode.commands.executeCommand('setContext', 'magiTaskRunning', false);
   });
   globalEventBus.on('task:failed', () => {
     updateStatusBar('failed');
-    vscode.commands.executeCommand('setContext', 'multiCliTaskRunning', false);
+    vscode.commands.executeCommand('setContext', 'magiTaskRunning', false);
   });
   globalEventBus.on('task:cancelled', () => {
     updateStatusBar('cancelled');
-    vscode.commands.executeCommand('setContext', 'multiCliTaskRunning', false);
+    vscode.commands.executeCommand('setContext', 'magiTaskRunning', false);
   });
 
   // 注册命令
@@ -88,31 +88,31 @@ function updateStatusBar(status: 'idle' | 'running' | 'completed' | 'failed' | '
 
   switch (status) {
     case 'idle':
-      statusBarItem.text = '$(robot) MultiCLI';
-      statusBarItem.tooltip = '点击打开 MultiCLI';
+      statusBarItem.text = '$(robot) Magi';
+      statusBarItem.tooltip = '点击打开 Magi';
       statusBarItem.backgroundColor = undefined;
       break;
     case 'running':
-      statusBarItem.text = '$(sync~spin) MultiCLI';
+      statusBarItem.text = '$(sync~spin) Magi';
       statusBarItem.tooltip = '任务执行中... 按 Escape 打断';
       statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
       break;
     case 'completed':
-      statusBarItem.text = '$(check) MultiCLI';
+      statusBarItem.text = '$(check) Magi';
       statusBarItem.tooltip = '任务已完成';
       statusBarItem.backgroundColor = undefined;
       // 3秒后恢复默认状态
       setTimeout(() => updateStatusBar('idle'), 3000);
       break;
     case 'failed':
-      statusBarItem.text = '$(error) MultiCLI';
+      statusBarItem.text = '$(error) Magi';
       statusBarItem.tooltip = '任务执行失败';
       statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
       // 5秒后恢复默认状态
       setTimeout(() => updateStatusBar('idle'), 5000);
       break;
     case 'cancelled':
-      statusBarItem.text = '$(debug-pause) MultiCLI';
+      statusBarItem.text = '$(debug-pause) Magi';
       statusBarItem.tooltip = '任务已取消';
       statusBarItem.backgroundColor = undefined;
       // 3秒后恢复默认状态
@@ -126,61 +126,61 @@ function updateStatusBar(status: 'idle' | 'running' | 'completed' | 'failed' | '
  */
 function registerCommands(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
-    vscode.commands.registerCommand('multiCli.openPanel', () => {
-      vscode.commands.executeCommand('workbench.view.extension.multiCli');
+    vscode.commands.registerCommand('magi.openPanel', () => {
+      vscode.commands.executeCommand('workbench.view.extension.magi');
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('multiCli.showPanel', () => {
-      vscode.commands.executeCommand('workbench.view.extension.multiCli');
+    vscode.commands.registerCommand('magi.showPanel', () => {
+      vscode.commands.executeCommand('workbench.view.extension.magi');
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('multiCli.startTask', () => {
-      vscode.commands.executeCommand('workbench.view.extension.multiCli');
+    vscode.commands.registerCommand('magi.startTask', () => {
+      vscode.commands.executeCommand('workbench.view.extension.magi');
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('multiCli.newSession', async () => {
+    vscode.commands.registerCommand('magi.newSession', async () => {
       if (!webviewProvider) {
-        vscode.window.showWarningMessage('MultiCLI: 面板未初始化');
+        vscode.window.showWarningMessage('Magi: 面板未初始化');
         return;
       }
       try {
         await webviewProvider.createNewSession();
-        vscode.window.showInformationMessage('MultiCLI: 新会话已创建');
+        vscode.window.showInformationMessage('Magi: 新会话已创建');
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        vscode.window.showErrorMessage(`MultiCLI: 创建会话失败 - ${msg}`);
+        vscode.window.showErrorMessage(`Magi: 创建会话失败 - ${msg}`);
       }
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('multiCli.showStatus', async () => {
-      vscode.window.showInformationMessage('MultiCLI: 使用 LLM API 模式运行');
+    vscode.commands.registerCommand('magi.showStatus', async () => {
+      vscode.window.showInformationMessage('Magi: 使用 LLM API 模式运行');
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('multiCli.interruptTask', () => {
+    vscode.commands.registerCommand('magi.interruptTask', () => {
       globalEventBus.emitEvent('task:cancelled', {});
-      vscode.window.showInformationMessage('MultiCLI: 正在取消任务...');
+      vscode.window.showInformationMessage('Magi: 正在取消任务...');
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('multiCli.stopTask', () => {
+    vscode.commands.registerCommand('magi.stopTask', () => {
       globalEventBus.emitEvent('task:cancelled', {});
     })
   );
 
   // 注册 Mermaid 图表在新标签页打开命令
   context.subscriptions.push(
-    vscode.commands.registerCommand('multiCli.openMermaidPanel', (code: string, title?: string) => {
+    vscode.commands.registerCommand('magi.openMermaidPanel', (code: string, title?: string) => {
       MermaidPanel.createOrShow(context.extensionUri, code, title);
     })
   );

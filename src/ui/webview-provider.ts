@@ -160,7 +160,7 @@ class WebviewMessageBus {
 }
 
 export class WebviewProvider implements vscode.WebviewViewProvider {
-  public static readonly viewType = 'multiCli.mainView';
+  public static readonly viewType = 'magi.mainView';
 
   private readonly MAX_REASONABLE_ARRAY_LENGTH = 1_000_000;
 
@@ -168,7 +168,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private sessionManager: UnifiedSessionManager;
   private snapshotManager: SnapshotManager;
   private diffGenerator: DiffGenerator;
-  private readonly messageFlowLogEnabled = process.env.MULTICLI_MESSAGE_FLOW_LOG === '1';
+  private readonly messageFlowLogEnabled = process.env.MAGI_MESSAGE_FLOW_LOG === '1';
   private readonly messageFlowLogPath: string;
   private webviewMessageBus: WebviewMessageBus;
 
@@ -241,8 +241,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private logFlushTimer: NodeJS.Timeout | null = null;
 
 
-  private readonly authSecretKey = 'multiCli.apiKey';
-  private readonly authStatusKey = 'multiCli.loggedIn';
+  private readonly authSecretKey = 'magi.apiKey';
+  private readonly authStatusKey = 'magi.loggedIn';
   private loginInFlight = false;
 
   constructor(
@@ -250,7 +250,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     private readonly context: vscode.ExtensionContext,
     private readonly workspaceRoot: string
   ) {
-    this.messageFlowLogPath = path.join(this.workspaceRoot, '.multicli', 'logs', 'message-flow.jsonl');
+    this.messageFlowLogPath = path.join(this.workspaceRoot, '.magi', 'logs', 'message-flow.jsonl');
     this.webviewMessageBus = new WebviewMessageBus(
       () => this._view,
       this.getWebviewMessagePriority.bind(this),
@@ -268,7 +268,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 确保有当前会话
     this.ensureSessionAlignment();
 
-    const config = vscode.workspace.getConfiguration('multiCli');
+    const config = vscode.workspace.getConfiguration('magi');
     const timeout = config.get<number>('timeout') ?? 300000;
     const idleTimeout = config.get<number>('idleTimeout') ?? 120000;
     const maxTimeout = config.get<number>('maxTimeout') ?? 900000;
@@ -2659,7 +2659,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** 处理 Prompt 增强配置更新 - 存储到 ~/.multicli/config.json */
+  /** 处理 Prompt 增强配置更新 - 存储到 ~/.magi/config.json */
   private async handleUpdatePromptEnhance(
     config: { enabled: boolean; baseUrl: string; apiKey: string },
     source: 'auto' | 'manual' = 'auto'
@@ -2712,9 +2712,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** 获取 MultiCLI 配置文件路径 */
+  /** 获取 Magi 配置文件路径 */
   private getMultiCliConfigPath(): string {
-    return path.join(os.homedir(), '.multicli', 'config.json');
+    return path.join(os.homedir(), '.magi', 'config.json');
   }
 
   /** 获取 Prompt 增强配置 - 复用 ToolManager 的配置读取逻辑 */
@@ -5005,7 +5005,7 @@ ${originalPrompt}
       }
 
       // 创建临时文件存储原始内容（用于 diff 左侧）
-      const tempDir = path.join(os.tmpdir(), 'multicli-diff');
+      const tempDir = path.join(os.tmpdir(), 'magi-diff');
       if (!fs.existsSync(tempDir)) {
         fs.mkdirSync(tempDir, { recursive: true });
       }
@@ -5223,7 +5223,7 @@ ${originalPrompt}
 
   /** 处理设置更新 */
   private handleSettingUpdate(key: string, value: unknown): void {
-    const config = vscode.workspace.getConfiguration('multiCli');
+    const config = vscode.workspace.getConfiguration('magi');
 
     // 处理其他配置
     if (key === 'autoSnapshot') {
@@ -5307,7 +5307,7 @@ ${originalPrompt}
       // 如果有图片，保存到临时文件
       const imagePaths: string[] = [];
       if (images && images.length > 0) {
-        const tmpDir = path.join(os.tmpdir(), 'multicli-images');
+        const tmpDir = path.join(os.tmpdir(), 'magi-images');
         if (!fs.existsSync(tmpDir)) {
           fs.mkdirSync(tmpDir, { recursive: true });
         }
@@ -6090,7 +6090,7 @@ ${originalPrompt}
   /** 获取 Svelte webview HTML 内容 */
   private getSvelteHtmlContent(webview: vscode.Webview): string {
     // 读取 Svelte 构建输出的 HTML
-    const templatePath = path.join(this.extensionUri.fsPath, 'out', 'webview', 'index.html');
+    const templatePath = path.join(this.extensionUri.fsPath, 'dist', 'webview', 'index.html');
 
     if (!fs.existsSync(templatePath)) {
       const message = `Svelte webview 未构建: ${templatePath}`;
@@ -6103,7 +6103,7 @@ ${originalPrompt}
 
     // 获取 webview 资源根目录
     const webviewAssetsUri = webview.asWebviewUri(
-      vscode.Uri.file(path.join(this.extensionUri.fsPath, 'out', 'webview', 'assets'))
+      vscode.Uri.file(path.join(this.extensionUri.fsPath, 'dist', 'webview', 'assets'))
     );
 
     // 替换资源路径（Vite 构建输出使用 /assets/ 前缀）

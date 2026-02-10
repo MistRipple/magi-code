@@ -2,7 +2,7 @@
  * 快照管理器
  * 文件快照创建、存储、还原
  *
- * 存储路径：.multicli/sessions/{sessionId}/snapshots/
+ * 存储路径：.magi/sessions/{sessionId}/snapshots/
  */
 
 import { logger, LogCategory } from './logging';

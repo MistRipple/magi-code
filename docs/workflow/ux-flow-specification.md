@@ -1,4 +1,4 @@
-# MultiCLI UX/UI 流程规范
+# Magi UX/UI 流程规范
 
 > 本文档定义了主对话面板与 Worker Tab 之间的任务编排通讯交互规范
 

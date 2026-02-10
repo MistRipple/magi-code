@@ -18,7 +18,7 @@ function isDebugMode(): boolean {
     }
     // 检查 localStorage 中的调试模式设置
     try {
-      const debugSetting = localStorage.getItem('multicli:debugMode');
+      const debugSetting = localStorage.getItem('magi:debugMode');
       if (debugSetting === 'true') {
         return true;
       }

@@ -80,7 +80,7 @@ async function testImageRecognition(imagePath: string): Promise<void> {
   // 初始化知识库
   const knowledgeBase = new ProjectKnowledgeBase({
     projectRoot: workspaceRoot,
-    storageDir: path.join(workspaceRoot, '.multicli', 'knowledge'),
+    storageDir: path.join(workspaceRoot, '.magi', 'knowledge'),
   });
   await knowledgeBase.initialize();
 

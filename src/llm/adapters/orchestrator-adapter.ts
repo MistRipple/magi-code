@@ -298,7 +298,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
    * 获取默认系统提示
    */
   private getDefaultSystemPrompt(): string {
-    return `你是 MultiCLI 的任务编排者，负责协调多个专业 AI 协作完成开发任务。
+    return `你是 Magi 的任务编排者，负责协调多个专业 AI 协作完成开发任务。
 
 你的职责：
 1. 分析用户需求，拆解为可执行的子任务
@@ -624,11 +624,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
    */
   private checkOrchestratorToolRestriction(toolCall: ToolCall): string | null {
     const { name, arguments: args } = toolCall;
-
-    // report_progress 仅供 Worker 使用，编排者无需汇报进度
-    if (name === 'report_progress') {
-      return 'report_progress 仅供 Worker 使用，编排者不需要调用此工具。直接执行任务即可。';
-    }
 
     if (name === 'text_editor') {
       const command = args?.command as string | undefined;

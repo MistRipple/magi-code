@@ -324,7 +324,7 @@ class EndToEndEngineer implements TestEngineer {
 
     const originalHome = process.env.HOME;
     const originalUserProfile = process.env.USERPROFILE;
-    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'multicli-e2e-'));
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'magi-e2e-'));
 
     const Module = require('module');
     const originalRequire = Module.prototype.require;

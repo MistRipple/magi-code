@@ -18,7 +18,7 @@ export class FileLock {
   private acquired: boolean = false;
 
   constructor(resourceId: string, lockDir?: string) {
-    this.lockDir = lockDir || path.join(os.tmpdir(), 'multicli-locks');
+    this.lockDir = lockDir || path.join(os.tmpdir(), 'magi-locks');
     this.lockFile = path.join(this.lockDir, `${this.sanitizeId(resourceId)}.lock`);
   }
 

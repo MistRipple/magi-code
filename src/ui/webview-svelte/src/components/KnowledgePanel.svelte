@@ -349,11 +349,11 @@
                   {#if adr.status}
                     <span class="kp-status-badge {adr.status}">{statusLabel(adr.status)}</span>
                   {/if}
+                  <button class="kp-card-delete" title="删除" onclick={(e) => deleteAdr(adr.id, e)}>
+                    <Icon name="trash" size={12} />
+                  </button>
                   <Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={12} />
                 </div>
-                <button class="kp-card-delete" title="删除" onclick={(e) => deleteAdr(adr.id, e)}>
-                  <Icon name="trash" size={12} />
-                </button>
               </div>
               {#if isExpanded}
                 <div class="kp-card-body">
@@ -420,11 +420,11 @@
                   {#if faq.category}
                     <span class="kp-category-badge">{faq.category}</span>
                   {/if}
+                  <button class="kp-card-delete" title="删除" onclick={(e) => deleteFaq(faq.id, e)}>
+                    <Icon name="trash" size={12} />
+                  </button>
                   <Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={12} />
                 </div>
-                <button class="kp-card-delete" title="删除" onclick={(e) => deleteFaq(faq.id, e)}>
-                  <Icon name="trash" size={12} />
-                </button>
               </div>
               {#if isExpanded}
                 <div class="kp-card-body">
@@ -870,7 +870,6 @@
     background: transparent;
     border: none;
     color: inherit;
-    position: relative;
   }
 
   .kp-card-header:hover .kp-card-delete {
@@ -925,9 +924,6 @@
   }
 
   .kp-card-delete {
-    position: absolute;
-    top: var(--space-2);
-    right: var(--space-2);
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -940,6 +936,7 @@
     color: var(--foreground-muted);
     cursor: pointer;
     opacity: 0;
+    flex-shrink: 0;
     transition: all var(--transition-fast);
   }
 

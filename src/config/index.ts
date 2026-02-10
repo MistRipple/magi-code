@@ -1,5 +1,5 @@
 /**
- * MultiCLI 配置管理系统
+ * Magi 配置管理系统
  *
  * 统一管理所有配置项，支持：
  * - 环境变量覆盖
@@ -80,7 +80,7 @@ export interface PerformanceConfig {
 /**
  * 完整配置接口
  */
-export interface MultiCLIConfig {
+export interface MagiConfig {
   context: ContextConfig;
   task: TaskConfig;
   snapshot: SnapshotConfig;
@@ -91,7 +91,7 @@ export interface MultiCLIConfig {
 /**
  * 默认配置
  */
-export const DEFAULT_CONFIG: MultiCLIConfig = {
+export const DEFAULT_CONFIG: MagiConfig = {
   context: {
     maxTokens: 8000,
     immediateContextRounds: 5,
@@ -127,11 +127,11 @@ export const DEFAULT_CONFIG: MultiCLIConfig = {
  */
 export class ConfigManager {
   private static instance: ConfigManager | null = null;
-  private config: MultiCLIConfig;
+  private config: MagiConfig;
   private configPath: string;
 
   private constructor() {
-    this.configPath = path.join(os.homedir(), '.multicli', 'config.json');
+    this.configPath = path.join(os.homedir(), '.magi', 'config.json');
     this.config = this.loadConfig();
   }
 
@@ -155,7 +155,7 @@ export class ConfigManager {
   /**
    * 加载配置
    */
-  private loadConfig(): MultiCLIConfig {
+  private loadConfig(): MagiConfig {
     let config = { ...DEFAULT_CONFIG };
 
     // 1. 尝试从配置文件加载
@@ -177,30 +177,30 @@ export class ConfigManager {
   /**
    * 从环境变量加载配置
    */
-  private loadFromEnv(config: MultiCLIConfig): MultiCLIConfig {
+  private loadFromEnv(config: MagiConfig): MagiConfig {
     const result = { ...config };
 
     // Context
-    if (process.env.MULTICLI_CONTEXT_MAX_TOKENS) {
-      result.context.maxTokens = parseInt(process.env.MULTICLI_CONTEXT_MAX_TOKENS, 10);
+    if (process.env.MAGI_CONTEXT_MAX_TOKENS) {
+      result.context.maxTokens = parseInt(process.env.MAGI_CONTEXT_MAX_TOKENS, 10);
     }
-    if (process.env.MULTICLI_CONTEXT_ROUNDS) {
-      result.context.immediateContextRounds = parseInt(process.env.MULTICLI_CONTEXT_ROUNDS, 10);
+    if (process.env.MAGI_CONTEXT_ROUNDS) {
+      result.context.immediateContextRounds = parseInt(process.env.MAGI_CONTEXT_ROUNDS, 10);
     }
 
     // Task
-    if (process.env.MULTICLI_TASK_CACHE_SIZE) {
-      result.task.maxCacheSize = parseInt(process.env.MULTICLI_TASK_CACHE_SIZE, 10);
+    if (process.env.MAGI_TASK_CACHE_SIZE) {
+      result.task.maxCacheSize = parseInt(process.env.MAGI_TASK_CACHE_SIZE, 10);
     }
 
     // Snapshot
-    if (process.env.MULTICLI_SNAPSHOT_CACHE_SIZE) {
-      result.snapshot.maxCacheSize = parseInt(process.env.MULTICLI_SNAPSHOT_CACHE_SIZE, 10);
+    if (process.env.MAGI_SNAPSHOT_CACHE_SIZE) {
+      result.snapshot.maxCacheSize = parseInt(process.env.MAGI_SNAPSHOT_CACHE_SIZE, 10);
     }
 
     // Performance
-    if (process.env.MULTICLI_PRECISE_TOKENS) {
-      result.performance.enablePreciseTokenCounting = process.env.MULTICLI_PRECISE_TOKENS === 'true';
+    if (process.env.MAGI_PRECISE_TOKENS) {
+      result.performance.enablePreciseTokenCounting = process.env.MAGI_PRECISE_TOKENS === 'true';
     }
 
     return result;
@@ -209,7 +209,7 @@ export class ConfigManager {
   /**
    * 合并配置
    */
-  private mergeConfig(base: MultiCLIConfig, override: Partial<MultiCLIConfig>): MultiCLIConfig {
+  private mergeConfig(base: MagiConfig, override: Partial<MagiConfig>): MagiConfig {
     return {
       context: { ...base.context, ...override.context },
       task: { ...base.task, ...override.task },
@@ -222,21 +222,21 @@ export class ConfigManager {
   /**
    * 获取配置
    */
-  get<K extends keyof MultiCLIConfig>(key: K): MultiCLIConfig[K] {
+  get<K extends keyof MagiConfig>(key: K): MagiConfig[K] {
     return this.config[key];
   }
 
   /**
    * 设置配置
    */
-  set<K extends keyof MultiCLIConfig>(key: K, value: MultiCLIConfig[K]): void {
+  set<K extends keyof MagiConfig>(key: K, value: MagiConfig[K]): void {
     this.config[key] = value;
   }
 
   /**
    * 获取完整配置
    */
-  getAll(): MultiCLIConfig {
+  getAll(): MagiConfig {
     return { ...this.config };
   }
 

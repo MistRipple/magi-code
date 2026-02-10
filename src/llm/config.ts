@@ -1,7 +1,7 @@
 /**
  * LLM 配置加载器
  *
- * 配置存储位置：~/.multicli/
+ * 配置存储位置：~/.magi/
  * - llm.json              - 所有 LLM 配置（augment, orchestrator, workers, compressor）
  * - claude.json           - Claude Worker 画像
  * - codex.json            - Codex Worker 画像
@@ -20,10 +20,10 @@ import { FullLLMConfig, WorkerLLMConfig } from './types';
 import { logger, LogCategory } from '../logging';
 
 /**
- * LLM 配置加载器（从 ~/.multicli/ 加载）
+ * LLM 配置加载器（从 ~/.magi/ 加载）
  */
 export class LLMConfigLoader {
-  private static readonly CONFIG_DIR = path.join(os.homedir(), '.multicli');
+  private static readonly CONFIG_DIR = path.join(os.homedir(), '.magi');
   private static readonly LLM_CONFIG_FILE = path.join(this.CONFIG_DIR, 'llm.json');
 
   /**

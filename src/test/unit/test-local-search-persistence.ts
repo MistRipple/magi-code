@@ -57,7 +57,7 @@ function mkProject(): string {
     '  verify(t: string): boolean { return t.startsWith("tok_"); }',
     '}',
   ].join('\n'));
-  fs.mkdirSync(path.join(d, '.multicli', 'cache'), { recursive: true });
+  fs.mkdirSync(path.join(d, '.magi', 'cache'), { recursive: true });
   return d;
 }
 function rmDir(d: string) { fs.rmSync(d, { recursive: true, force: true }); }
@@ -130,7 +130,7 @@ async function t4(d: string) {
   ]);
   const p = new IndexPersistence(d);
   p.save(d, ii, si, dg, FILES);
-  ok(fs.existsSync(path.join(d, '.multicli', 'cache', 'search-index.json')), '缓存文件在');
+  ok(fs.existsSync(path.join(d, '.magi', 'cache', 'search-index.json')), '缓存文件在');
   const snap = p.load();
   ok(snap !== null, 'load非null');
   eq(snap!.fileManifest.length, 3, 'manifest=3');

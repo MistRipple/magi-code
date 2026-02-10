@@ -20,7 +20,7 @@ interface MermaidPanelState {
 
 export class MermaidPanel {
   public static currentPanel: MermaidPanel | undefined;
-  private static readonly viewType = 'multiCli.mermaidDiagram';
+  private static readonly viewType = 'magi.mermaidDiagram';
 
   private readonly _panel: vscode.WebviewPanel;
   private readonly _extensionUri: vscode.Uri;

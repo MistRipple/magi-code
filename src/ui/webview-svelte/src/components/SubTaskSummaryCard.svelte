@@ -587,8 +587,11 @@
 
   /* 错误信息 */
   .card-error {
-    display: flex;
-    align-items: flex-start;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    text-overflow: ellipsis;
     gap: var(--space-2);
     padding: var(--space-2) var(--space-3);
     border-radius: var(--radius-sm);

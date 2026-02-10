@@ -78,7 +78,6 @@
       'dispatch_task': 'tools',
       'plan_mission': 'list',
       'send_worker_message': 'send',
-      'report_progress': 'clock',
     };
 
     if (iconMap[toolName]) {
@@ -158,7 +157,6 @@
       'dispatch_task': 'dispatch',
       'plan_mission': 'plan',
       'send_worker_message': 'message',
-      'report_progress': 'progress',
     };
 
     return displayNameMap[toolName] ?? toolName;

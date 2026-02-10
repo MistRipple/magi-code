@@ -754,6 +754,20 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   }
 
   /**
+   * 获取环境提示词（IDE 状态 + 工具 + 用户规则等）
+   */
+  getEnvironmentPrompt(): string {
+    return this.environmentContextProvider.getEnvironmentPrompt();
+  }
+
+  /**
+   * 获取用户规则提示词
+   */
+  getUserRulesPrompt(): string {
+    return this.environmentContextProvider.getUserRulesPrompt();
+  }
+
+  /**
    * 获取适配器历史信息（用于监控 token 消耗）
    */
   getAdapterHistoryInfo(agent: AgentType): { messages: number; chars: number } | null {

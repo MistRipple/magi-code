@@ -81,10 +81,13 @@
     return streamingMsgs.map(m => `${m.id}:${(m.content || '').length}:${(m.blocks || []).length}`).join('|');
   });
 
-  // 对话级处理指示器：isProcessing 期间始终显示
-  // 流式消息自身的三点动画表示「正在输出内容」，此指示器表示「对话仍在进行」，语义不同
+  // 对话级处理指示器
+  // - thread: 全局 isProcessing 驱动，表示「对话仍在进行」
+  // - worker: 只看当前 tab 内消息的流式状态，Worker 完成后立即消失
   const showProcessingIndicator = $derived(
-    messagesState.isProcessing && safeMessages.length > 0
+    displayContext === 'worker'
+      ? safeMessages.some(m => m.isStreaming)
+      : messagesState.isProcessing && safeMessages.length > 0
   );
 
   // 本轮对话计时：从最后一条用户消息的时间戳开始

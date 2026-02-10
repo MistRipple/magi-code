@@ -1556,7 +1556,7 @@
           <div class="settings-section-header">
             <div class="settings-section-title">Worker 分工配置</div>
           </div>
-          <div class="settings-section-desc">配置存储：<code>~/.multicli/worker-assignments.json</code></div>
+          <div class="settings-section-desc">配置存储：<code>~/.magi/worker-assignments.json</code></div>
           <div class="profile-categories-grid">
             {#each categoryOrder as category}
               {#if categoryLabels[category]}

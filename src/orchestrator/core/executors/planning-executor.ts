@@ -2,14 +2,19 @@
  * Planning Executor - 规划执行器
  *
  * 职责：
- * - 协调 Worker 规划 Todo
+ * - 编排层为每个 Assignment 创建宏观 Todo
  * - 支持并行和顺序规划
  * - 生成和传递上下文快照
+ *
+ * 设计原则：
+ * - Todo 创建权归编排层，Worker 只负责执行
+ * - Worker 执行过程中如果任务过大，可通过 addDynamicTodo 自行拆分
  */
 
 import { WorkerSlot } from '../../../types';
 import { AutonomousWorker } from '../../worker';
 import { Mission, Assignment } from '../../mission';
+import { TodoManager } from '../../../todo';
 import { logger, LogCategory } from '../../../logging';
 
 export interface PlanningOptions {
@@ -25,7 +30,8 @@ export interface PlanningResult {
 
 export class PlanningExecutor {
   constructor(
-    private workers: Map<WorkerSlot, AutonomousWorker>
+    private workers: Map<WorkerSlot, AutonomousWorker>,
+    private todoManager: TodoManager
   ) {}
 
   /**
@@ -62,45 +68,7 @@ export class PlanningExecutor {
     options: PlanningOptions
   ): Promise<void> {
     const planningPromises = mission.assignments.map(async (assignment) => {
-      const worker = this.workers.get(assignment.workerId);
-      if (!worker) {
-        throw new Error(`Worker ${assignment.workerId} not found`);
-      }
-
-      const contextSnapshot = await this.generateContextSnapshot(
-        mission.id,
-        assignment.workerId,
-        options.contextManager
-      );
-
-      logger.info(
-        LogCategory.ORCHESTRATOR,
-        `Worker ${assignment.workerId} 开始规划: ${assignment.responsibility}`
-      );
-
-      const planResult = await worker.planAssignment(assignment, {
-        projectContext: options.projectContext,
-        contextSnapshot,
-      });
-
-      assignment.todos = planResult.todos || [];
-      assignment.planningStatus = 'planned';
-      if (assignment.status === 'pending') {
-        assignment.status = 'ready';
-      }
-
-      // PlanningResult returns todos directly, check warnings
-      if (planResult.warnings.length > 0) {
-        logger.warn(
-          LogCategory.ORCHESTRATOR,
-          `Worker ${assignment.workerId} 规划警告: ${planResult.warnings.join(', ')}`
-        );
-      }
-
-      logger.info(
-        LogCategory.ORCHESTRATOR,
-        `Worker ${assignment.workerId} 规划完成，生成 ${planResult.todos.length} 个 Todo`
-      );
+      await this.createTodoForAssignment(mission, assignment);
     });
 
     await Promise.all(planningPromises);
@@ -114,63 +82,50 @@ export class PlanningExecutor {
     options: PlanningOptions
   ): Promise<void> {
     for (const assignment of mission.assignments) {
-      const worker = this.workers.get(assignment.workerId);
-      if (!worker) {
-        throw new Error(`Worker ${assignment.workerId} not found`);
-      }
-
-      // 每次规划前生成最新的上下文快照
-      const contextSnapshot = await this.generateContextSnapshot(
-        mission.id,
-        assignment.workerId,
-        options.contextManager
-      );
-
-      logger.info(
-        LogCategory.ORCHESTRATOR,
-        `Worker ${assignment.workerId} 开始规划: ${assignment.responsibility}`
-      );
-
-      const planResult = await worker.planAssignment(assignment, {
-        projectContext: options.projectContext,
-        contextSnapshot,
-      });
-
-      assignment.todos = planResult.todos || [];
-      assignment.planningStatus = 'planned';
-      if (assignment.status === 'pending') {
-        assignment.status = 'ready';
-      }
-
-      // PlanningResult returns todos directly, check warnings
-      if (planResult.warnings.length > 0) {
-        logger.warn(
-          LogCategory.ORCHESTRATOR,
-          `Worker ${assignment.workerId} 规划警告: ${planResult.warnings.join(', ')}`
-        );
-      }
-
-      logger.info(
-        LogCategory.ORCHESTRATOR,
-        `Worker ${assignment.workerId} 规划完成，生成 ${planResult.todos.length} 个 Todo`
-      );
+      await this.createTodoForAssignment(mission, assignment);
     }
   }
 
   /**
-   * 生成上下文快照
+   * 为 Assignment 创建宏观 Todo（编排层职责）
+   *
+   * 编排者创建 1 个 implementation Todo 代表整个 Assignment 的职责。
+   * Worker 执行过程中如果发现任务过大，可通过 addDynamicTodo 自行拆分。
    */
-  private async generateContextSnapshot(
-    missionId: string,
-    workerId: WorkerSlot,
-    contextManager?: import('../../../context/context-manager').ContextManager | null
-  ): Promise<string | undefined> {
-    if (!contextManager) {
-      return undefined;
+  private async createTodoForAssignment(
+    mission: Mission,
+    assignment: Assignment
+  ): Promise<void> {
+    logger.info(
+      LogCategory.ORCHESTRATOR,
+      `为 ${assignment.workerId} 创建宏观 Todo: ${assignment.responsibility}`
+    );
+
+    const targetPaths = assignment.scope?.targetPaths?.length
+      ? assignment.scope.requiresModification
+        ? `\n目标文件: ${assignment.scope.targetPaths.join(', ')}。必须使用工具直接编辑并保存。`
+        : `\n目标文件: ${assignment.scope.targetPaths.join(', ')}。只需读取/分析，不要修改文件。`
+      : '';
+
+    const todo = await this.todoManager.create({
+      missionId: mission.id,
+      assignmentId: assignment.id,
+      content: `${assignment.responsibility}${targetPaths}`,
+      reasoning: assignment.delegationBriefing || assignment.responsibility,
+      type: 'implementation',
+      workerId: assignment.workerId,
+      targetFiles: assignment.scope?.targetPaths,
+    });
+
+    assignment.todos = [todo];
+    assignment.planningStatus = 'planned';
+    if (assignment.status === 'pending') {
+      assignment.status = 'ready';
     }
 
-    return contextManager.getAssembledContextText(
-      contextManager.buildAssemblyOptions(missionId, workerId, 4000)
+    logger.info(
+      LogCategory.ORCHESTRATOR,
+      `${assignment.workerId} 宏观 Todo 已创建: ${todo.id}`
     );
   }
 }

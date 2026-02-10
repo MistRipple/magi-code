@@ -296,7 +296,7 @@ export class MissionStorageManager extends EventEmitter {
  * 将 Mission 持久化到文件系统，按 session 目录存储
  *
  * 目录结构：
- * .multicli/sessions/{sessionId}/missions/{missionId}.json
+ * .magi/sessions/{sessionId}/missions/{missionId}.json
  */
 export class FileBasedMissionStorage implements IMissionStorage {
   private sessionsDir: string;
@@ -461,7 +461,7 @@ export function createMissionStorage(): MissionStorageManager {
 
 /**
  * 创建文件系统 MissionStorage 实例
- * @param sessionsDir sessions 基础目录（.multicli/sessions）
+ * @param sessionsDir sessions 基础目录（.magi/sessions）
  */
 export function createFileBasedMissionStorage(sessionsDir: string): MissionStorageManager {
   return new MissionStorageManager(new FileBasedMissionStorage(sessionsDir));

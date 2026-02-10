@@ -24,7 +24,7 @@ export class CwdTracker {
     switch (shellName) {
       case 'zsh':
         // zsh 使用 chpwd_functions hook
-        return `__multicli_chpwd_tracker() { echo "$(pwd)" > ${cwdFile}; }; chpwd_functions+=(__multicli_chpwd_tracker); echo "$(pwd)" > ${cwdFile}`;
+        return `__magi_chpwd_tracker() { echo "$(pwd)" > ${cwdFile}; }; chpwd_functions+=(__magi_chpwd_tracker); echo "$(pwd)" > ${cwdFile}`;
 
       case 'bash':
         // bash 使用 PROMPT_COMMAND
@@ -32,7 +32,7 @@ export class CwdTracker {
 
       case 'fish':
         // fish 使用 PWD 变量监听
-        return `{ function multicli_track_cwd --on-variable PWD; echo $PWD > ${cwdFile}; end; echo (pwd) > ${cwdFile}; }`;
+        return `{ function magi_track_cwd --on-variable PWD; echo $PWD > ${cwdFile}; end; echo (pwd) > ${cwdFile}; }`;
 
       default:
         return '';
@@ -44,7 +44,7 @@ export class CwdTracker {
    */
   static generateCwdFilePath(terminalId: string): string {
     const tmpDir = os.tmpdir();
-    return path.join(tmpDir, `multicli-cwd-${terminalId}.txt`);
+    return path.join(tmpDir, `magi-cwd-${terminalId}.txt`);
   }
 
   /**

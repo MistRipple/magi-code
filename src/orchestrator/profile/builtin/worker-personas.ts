@@ -74,6 +74,8 @@ export const WORKER_PERSONAS: Record<'claude' | 'codex' | 'gemini', WorkerPerson
     reasoningGuidelines: [
       '执行前简述任务理解和执行步骤',
       '说明关键决策点的选择依据',
+      '快速搜索定位关键代码后立即动手修改，不要反复搜索同一信息',
+      '搜索/检索工具仅用于首次定位，找到目标后直接用 text_editor 编辑',
     ],
   },
   gemini: {
@@ -107,6 +109,8 @@ export const WORKER_PERSONAS: Record<'claude' | 'codex' | 'gemini', WorkerPerson
     reasoningGuidelines: [
       '分析任务时，说明对需求的理解',
       '解释设计决策和用户体验考量',
+      '快速搜索定位关键代码后立即动手修改，不要反复搜索同一信息',
+      '搜索/检索工具仅用于首次定位，找到目标后直接用 text_editor 编辑',
     ],
   },
 };

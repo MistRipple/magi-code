@@ -277,6 +277,9 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     const cacheReadTokens = usage.cacheReadTokens || 0;
     const cacheWriteTokens = usage.cacheWriteTokens || 0;
 
+    // 跳过全零的 usage（无意义更新）
+    if (inputTokens === 0 && outputTokens === 0) return;
+
     this.lastTokenUsage = {
       inputTokens,
       outputTokens,
@@ -294,6 +297,9 @@ export abstract class BaseLLMAdapter extends EventEmitter {
       this.totalTokenUsage.cacheWriteTokens =
         (this.totalTokenUsage.cacheWriteTokens || 0) + cacheWriteTokens;
     }
+
+    // 主动推送实时 Token 更新到前端
+    this.sendRealtimeTokenUpdate();
   }
 
   /**

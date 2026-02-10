@@ -3,7 +3,7 @@
  * 将所有会话相关数据按会话ID组织存储
  * 
  * 目录结构：
- * .multicli/sessions/{sessionId}/
+ * .magi/sessions/{sessionId}/
  * ├── session.json          # 会话主数据
  * ├── plans/                # 计划文件
  * ├── tasks.json            # 子任务状态
@@ -118,7 +118,7 @@ export class UnifiedSessionManager {
 
   constructor(workspaceRoot: string) {
     this.workspaceRoot = workspaceRoot;
-    this.baseDir = path.join(workspaceRoot, '.multicli', 'sessions');
+    this.baseDir = path.join(workspaceRoot, '.magi', 'sessions');
     this.ensureBaseDir();
     this.loadAllSessions();
   }
@@ -964,7 +964,7 @@ export class UnifiedSessionManager {
     for (const message of session.messages) {
       if (message.attachments && message.attachments.length > 0) {
         for (const attachment of message.attachments) {
-          if (attachment.path.includes('.multicli/attachments') && fs.existsSync(attachment.path)) {
+          if (attachment.path.includes('.magi/attachments') && fs.existsSync(attachment.path)) {
             try {
               fs.unlinkSync(attachment.path);
               logger.info('会话.清理.附件.成功', { path: attachment.path }, LogCategory.SESSION);

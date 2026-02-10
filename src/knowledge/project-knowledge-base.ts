@@ -122,7 +122,7 @@ export interface LearningRecord {
  */
 export interface ProjectKnowledgeConfig {
   projectRoot: string;
-  storageDir?: string;  // 默认 .multicli/knowledge
+  storageDir?: string;  // 默认 .magi/knowledge
   indexPatterns?: string[];  // 要索引的文件模式
   ignorePatterns?: string[]; // 要忽略的文件模式
 }
@@ -150,7 +150,7 @@ export class ProjectKnowledgeBase {
   constructor(config: ProjectKnowledgeConfig) {
     this.projectRoot = config.projectRoot;
     this.projectName = path.basename(this.projectRoot);
-    this.storageDir = config.storageDir || path.join(this.projectRoot, '.multicli', 'knowledge');
+    this.storageDir = config.storageDir || path.join(this.projectRoot, '.magi', 'knowledge');
 
     // 默认索引模式
     this.indexPatterns = config.indexPatterns || [

@@ -75,7 +75,7 @@ export class FileTodoRepository implements TodoRepository {
 
   constructor(workspaceRoot: string) {
     this.workspaceRoot = workspaceRoot;
-    this.storageDir = path.join(workspaceRoot, '.multicli', 'todos');
+    this.storageDir = path.join(workspaceRoot, '.magi', 'todos');
     this.todosFile = path.join(this.storageDir, 'todos.json');
     this.ensureStorageDir();
     this.loadCache();

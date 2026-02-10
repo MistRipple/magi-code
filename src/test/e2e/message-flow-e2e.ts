@@ -434,7 +434,7 @@ function testMessageFlow() {
   info('模拟 ASK 模式：用户问"你是谁"');
 
   // Step 1: 编排者直接回答（不应该有意图分类输出）
-  hub.result('我是 MultiCLI 智能编排者（Orchestrator），一个 VSCode 插件中的 AI 助手核心。我可以调度多个专业 Worker 协作完成任务，使用系统工具，并负责任务编排。', {
+  hub.result('我是 Magi 智能编排者（Orchestrator），一个 VSCode 插件中的 AI 助手核心。我可以调度多个专业 Worker 协作完成任务，使用系统工具，并负责任务编排。', {
     metadata: { intent: 'ask' }
   });
 

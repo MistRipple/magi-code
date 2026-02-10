@@ -37,9 +37,9 @@ export enum ErrorSeverity {
 }
 
 /**
- * MultiCLI 基础错误类
+ * Magi 基础错误类
  */
-export class MultiCLIError extends Error {
+export class MagiError extends Error {
   constructor(
     message: string,
     public code: string,
@@ -49,7 +49,7 @@ export class MultiCLIError extends Error {
     public context?: Record<string, any>
   ) {
     super(message);
-    this.name = 'MultiCLIError';
+    this.name = 'MagiError';
     Error.captureStackTrace(this, this.constructor);
   }
 
@@ -73,7 +73,7 @@ export class MultiCLIError extends Error {
 /**
  * 配置错误
  */
-export class ConfigurationError extends MultiCLIError {
+export class ConfigurationError extends MagiError {
   constructor(message: string, context?: Record<string, any>) {
     super(
       message,
@@ -90,7 +90,7 @@ export class ConfigurationError extends MultiCLIError {
 /**
  * 编排错误
  */
-export class OrchestrationError extends MultiCLIError {
+export class OrchestrationError extends MagiError {
   constructor(message: string, recoverable: boolean = true, context?: Record<string, any>) {
     super(
       message,
@@ -107,7 +107,7 @@ export class OrchestrationError extends MultiCLIError {
 /**
  * 执行错误
  */
-export class ExecutionError extends MultiCLIError {
+export class ExecutionError extends MagiError {
   constructor(message: string, recoverable: boolean = true, context?: Record<string, any>) {
     super(
       message,
@@ -124,7 +124,7 @@ export class ExecutionError extends MultiCLIError {
 /**
  * 上下文错误
  */
-export class ContextError extends MultiCLIError {
+export class ContextError extends MagiError {
   constructor(message: string, context?: Record<string, any>) {
     super(
       message,
@@ -141,7 +141,7 @@ export class ContextError extends MultiCLIError {
 /**
  * 快照错误
  */
-export class SnapshotError extends MultiCLIError {
+export class SnapshotError extends MagiError {
   constructor(message: string, recoverable: boolean = true, context?: Record<string, any>) {
     super(
       message,
@@ -158,7 +158,7 @@ export class SnapshotError extends MultiCLIError {
 /**
  * 任务错误
  */
-export class TaskError extends MultiCLIError {
+export class TaskError extends MagiError {
   constructor(message: string, context?: Record<string, any>) {
     super(
       message,
@@ -175,7 +175,7 @@ export class TaskError extends MultiCLIError {
 /**
  * 画像错误
  */
-export class ProfileError extends MultiCLIError {
+export class ProfileError extends MagiError {
   constructor(message: string, context?: Record<string, any>) {
     super(
       message,
@@ -192,7 +192,7 @@ export class ProfileError extends MultiCLIError {
 /**
  * 验证错误
  */
-export class ValidationError extends MultiCLIError {
+export class ValidationError extends MagiError {
   constructor(message: string, context?: Record<string, any>) {
     super(
       message,
@@ -228,8 +228,8 @@ export class ErrorHandler {
    * 处理错误
    */
   static handle(error: Error, context?: Record<string, any>): ErrorHandlingResult {
-    if (error instanceof MultiCLIError) {
-      return this.handleMultiCLIError(error);
+    if (error instanceof MagiError) {
+      return this.handleMagiError(error);
     }
 
     // 未知错误
@@ -244,9 +244,9 @@ export class ErrorHandler {
   }
 
   /**
-   * 处理 MultiCLI 错误
+   * 处理 Magi 错误
    */
-  private static handleMultiCLIError(error: MultiCLIError): ErrorHandlingResult {
+  private static handleMagiError(error: MagiError): ErrorHandlingResult {
     // 记录日志
     const logCategory = this.mapCategoryToLogCategory(error.category);
     const logLevel = this.mapSeverityToLogLevel(error.severity);
@@ -310,10 +310,10 @@ export class ErrorHandler {
   /**
    * 获取建议的操作
    */
-  private static getSuggestedAction(error: MultiCLIError): string {
+  private static getSuggestedAction(error: MagiError): string {
     switch (error.category) {
       case ErrorCategory.CONFIGURATION:
-        return '检查配置文件 ~/.multicli/config.json 或环境变量';
+        return '检查配置文件 ~/.magi/config.json 或环境变量';
       case ErrorCategory.ORCHESTRATION:
         return error.recoverable ? '重试操作或调整计划' : '检查任务定义和依赖关系';
       case ErrorCategory.EXECUTION:

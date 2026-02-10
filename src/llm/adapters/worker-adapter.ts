@@ -148,26 +148,34 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       }
     }
 
-    // 获取工具定义
+    // 获取工具定义（Worker 过滤掉编排工具，编排权限仅属于 Orchestrator）
+    const ORCHESTRATION_TOOLS = ['dispatch_task', 'plan_mission', 'send_worker_message'];
     const tools = await this.toolManager.getTools();
-    const toolDefinitions = tools.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      input_schema: tool.input_schema,
-    }));
+    const toolDefinitions = tools
+      .filter((tool) => !ORCHESTRATION_TOOLS.includes(tool.name))
+      .map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        input_schema: tool.input_schema,
+      }));
 
     // 每轮 LLM 调用独立一个 stream，确保时间轴正确：
     // 当轮 stream 内包含 thinking + text + tool_call + tool_result，
     // endStream 后再产生新消息或下一轮 stream，时间顺序天然正确。
     // 无轮次上限 — Worker 可执行任意多轮工具调用，
-    // 异常终止完全依赖连续失败检测机制：连续 5 次失败 → 提示换方式，累计 25 轮失败 → 终止
+    // 异常终止依赖两类检测机制：
+    // 1. 连续失败检测：连续 5 次失败 → 提示换方式，累计 25 轮失败 → 终止
+    // 2. 搜索空转检测：连续只调用只读工具 → 提示开始行动，超限 → 终止
     const CONSECUTIVE_FAIL_THRESHOLD = 5;
     const TOTAL_FAIL_LIMIT = 25;
+    const READ_ONLY_STALL_WARN_THRESHOLD = 5;   // 连续只读轮次达此值 → 注入行动提示
+    const READ_ONLY_STALL_ABORT_THRESHOLD = 15;  // 连续只读轮次达此值 → 强制终止
 
     try {
       let finalText = '';
       let consecutiveFailures = 0;
       let totalFailures = 0;
+      let consecutiveReadOnlyRounds = 0;
 
       let round = 0;
       while (true) {
@@ -299,6 +307,31 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
             }
           } else {
             consecutiveFailures = 0;
+          }
+
+          // 搜索空转检测：连续只调用只读工具 → 提示行动 → 超限终止
+          if (!allFailed) {
+            const allReadOnly = toolCalls.every(tc => this.isReadOnlyToolCall(tc));
+            if (allReadOnly) {
+              consecutiveReadOnlyRounds++;
+
+              if (consecutiveReadOnlyRounds >= READ_ONLY_STALL_ABORT_THRESHOLD) {
+                finalText = assistantText || `连续 ${READ_ONLY_STALL_ABORT_THRESHOLD} 轮仅调用搜索/检索类工具而无实质修改，判定为搜索空转终止。`;
+                logger.warn(`${this.agent} 搜索空转终止: ${consecutiveReadOnlyRounds} 轮只读`, undefined, LogCategory.LLM);
+                this.normalizer.endStream(streamId);
+                break;
+              }
+
+              if (consecutiveReadOnlyRounds === READ_ONLY_STALL_WARN_THRESHOLD) {
+                logger.warn(`${this.agent} 搜索空转警告: 连续 ${consecutiveReadOnlyRounds} 轮只读工具调用`, undefined, LogCategory.LLM);
+                this.conversationHistory.push({
+                  role: 'user',
+                  content: `[System] 你已连续 ${consecutiveReadOnlyRounds} 轮仅使用搜索/检索类工具，尚未对代码做出任何实质修改。你收集的信息已经足够，请立即开始使用 text_editor 修改代码或执行具体操作来推进任务。不要继续搜索。`,
+                });
+              }
+            } else {
+              consecutiveReadOnlyRounds = 0;
+            }
           }
 
           this.applyDecisionHook({ type: 'tool_result' });
@@ -560,5 +593,44 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       return false;
     }
     return message.content.some((block: any) => block?.type === 'tool_result');
+  }
+
+  /**
+   * 判断工具调用是否为只读操作（搜索/检索/查看类）
+   *
+   * 用于搜索空转检测：连续多轮只调用只读工具而无写入操作时，
+   * 注入提示推动 Worker 开始行动。
+   */
+  private isReadOnlyToolCall(toolCall: ToolCall): boolean {
+    const name = toolCall.name;
+
+    // 明确的只读内置工具
+    const READ_ONLY_BUILTINS = [
+      'codebase_retrieval',
+      'grep_search',
+      'list-processes',
+      'read-process',
+      'web_search',
+      'web_fetch',
+      'mermaid_diagram',
+    ];
+    if (READ_ONLY_BUILTINS.includes(name)) {
+      return true;
+    }
+
+    // text_editor：view/list 命令是只读，write/create/undo_edit 是写入
+    if (name === 'text_editor') {
+      const command = toolCall.arguments?.command;
+      return command === 'view' || command === 'list';
+    }
+
+    // MCP 工具：通过名称模式判断（搜索/检索/读取/查看类）
+    const READ_ONLY_PATTERNS = /retrieval|search|read|fetch|view|get[_-]|list[_-]|query|deepwiki|resolve/i;
+    if (READ_ONLY_PATTERNS.test(name)) {
+      return true;
+    }
+
+    // 其他工具视为写入操作
+    return false;
   }
 }
