@@ -55,6 +55,7 @@ import { InstructionSkillDefinition } from '../tools/skills-manager';
 import { applySkillInstall, buildInstructionSkillPrompt } from '../tools/skill-installation';
 import { loadAceConfigFromFile } from '../tools/tool-manager';
 import { MermaidPanel } from './mermaid-panel';
+import { isAbortError } from '../errors';
 // Mission-Driven Architecture 类型 - 直接从子模块导入
 import {
   MissionOrchestrator,
@@ -1517,6 +1518,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         }
       }
 
+      // 中断导致的 abort 错误不向前端发送错误消息
+      if (isAbortError(errorMsg)) {
+        return;
+      }
+
       this.sendOrchestratorMessage({
         content: errorMsg,
         messageType: 'error',
@@ -1889,12 +1895,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       await this.orchestratorEngine.interrupt();
     }
 
-    // 2. 中断所有适配器并等待完成
-    // 关键：仅在“真正完成停止”后才允许清空 processing，避免 UI 假空闲
+    // 2. 中断所有适配器的当前请求（不销毁适配器，保留连接供后续使用）
+    // 关键：仅在"真正完成停止"后才允许清空 processing，避免 UI 假空闲
     let adapterInterruptCompleted = false;
     logger.info('界面.任务.中断.适配器.开始', undefined, LogCategory.UI);
     try {
-      await this.adapterFactory.shutdown();
+      await this.adapterFactory.interruptAll();
       adapterInterruptCompleted = true;
       logger.info('界面.任务.中断.适配器.完成', undefined, LogCategory.UI);
     } catch (error) {
@@ -2060,6 +2066,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'requestState':
+        this.sendStateUpdate();
+        this.sendCurrentSessionToWebview();
+        break;
+
+      case 'webviewReady':
+        // Webview 就绪后立即推送完整系统数据（任务、变更、会话等）
+        // 这些数据不在 vscode.getState() 持久化范围内，必须由后端主动推送
+        logger.info('界面.Webview.就绪', undefined, LogCategory.UI);
         this.sendStateUpdate();
         this.sendCurrentSessionToWebview();
         break;
@@ -2424,6 +2438,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       case 'testCompressorConnection':
         await this.handleTestCompressorConnection(message.config);
+        break;
+
+      case 'fetchModelList':
+        await this.handleFetchModelList((message as any).config, (message as any).target);
         break;
 
       // MCP 配置相关
@@ -3524,6 +3542,59 @@ ${originalPrompt}
     }
   }
 
+  /** 获取模型列表（直接调用 /v1/models，无需创建 LLMClient） */
+  private async handleFetchModelList(config: any, target: string): Promise<void> {
+    try {
+      if (!config?.baseUrl || !config?.apiKey) {
+        this.sendData('modelListFetched', { target, success: false, models: [], error: '请先填写 Base URL 和 API Key' });
+        return;
+      }
+
+      let modelsUrl = config.baseUrl;
+      if (!modelsUrl.endsWith('/v1')) {
+        modelsUrl = modelsUrl.replace(/\/$/, '') + '/v1';
+      }
+      modelsUrl += '/models';
+
+      const response = await fetch(modelsUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${config.apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(10000),
+      });
+
+      if (!response.ok) {
+        const status = response.status;
+        let error = `HTTP ${status}`;
+        if (status === 401 || status === 403) error = 'API Key 无效';
+        else if (status === 404) error = '该 API 不支持模型列表查询';
+        this.sendData('modelListFetched', { target, success: false, models: [], error });
+        this.sendToast(`获取模型列表失败: ${error}`, 'error');
+        return;
+      }
+
+      const data = await response.json();
+      const models: string[] = (data?.data || [])
+        .map((m: any) => m.id)
+        .filter((id: any) => typeof id === 'string' && id.length > 0)
+        .sort();
+
+      this.sendData('modelListFetched', { target, success: true, models });
+      this.sendToast(`获取到 ${models.length} 个模型`, 'success');
+    } catch (error: any) {
+      const message = error.message || String(error);
+      let displayError = message;
+      if (message.includes('timeout') || message.includes('TimeoutError')) displayError = '连接超时';
+      else if (message.includes('ECONNREFUSED') || message.includes('ENOTFOUND')) displayError = '网络连接失败';
+
+      logger.error('获取模型列表失败', { target, error: message }, LogCategory.LLM);
+      this.sendData('modelListFetched', { target, success: false, models: [], error: displayError });
+      this.sendToast(`获取模型列表失败: ${displayError}`, 'error');
+    }
+  }
+
   // ============================================================================
   // MCP 配置处理方法
   // ============================================================================
@@ -3985,6 +4056,7 @@ ${originalPrompt}
     } catch (error: any) {
       logger.error('Failed to add repository', { url, error: error.message }, LogCategory.TOOLS);
       this.sendToast(`添加仓库失败: ${error.message}`, 'error');
+      this.sendData('repositoryAddFailed', { error: error.message });
     }
   }
 
@@ -5411,9 +5483,18 @@ ${originalPrompt}
         // 流式可见性由 MessageHub 消息生命周期统一驱动。
       }
       if (started) {
+        // 判断是否为中断导致的失败——中断场景不应发送错误消息
+        const isAbort = !success && failureReason && isAbortError(failureReason);
         if (success) {
           this.messageHub.sendControl(ControlMessageType.TASK_COMPLETED, {
             requestId: requestKey,
+            timestamp: Date.now(),
+          });
+        } else if (isAbort) {
+          // 中断场景：仅发送 TASK_FAILED 控制消息用于状态流转，不发送用户可见的错误消息
+          this.messageHub.sendControl(ControlMessageType.TASK_FAILED, {
+            requestId: requestKey,
+            error: '任务已中断',
             timestamp: Date.now(),
           });
         } else {
@@ -5440,6 +5521,9 @@ ${originalPrompt}
       this.messageHub.finalizeRequestContext(requestKey);
       this.messageHub.setRequestContext(undefined);
       this.clearRequestTimeout(requestKey);
+      // 任务执行链路结束，强制重置 processing 状态
+      // 避免因流式消息缺少 COMPLETED lifecycle 导致 processing 动画卡住
+      this.messageHub.forceProcessingState(false);
     }
   }
 
@@ -5632,14 +5716,19 @@ ${originalPrompt}
 
       success = true;
     } catch (error) {
-      logger.error('界面.执行.智能.失败', error, LogCategory.UI);
-      errorMsg = error instanceof Error ? error.message : String(error);
-
-      this.sendOrchestratorMessage({
-        content: errorMsg,
-        messageType: 'error',
-      });
-      success = false;
+      // 中断导致的 abort 错误静默处理，不向前端发送错误消息
+      if (isAbortError(error)) {
+        logger.info('界面.执行.智能.中断', undefined, LogCategory.UI);
+        success = false;
+      } else {
+        logger.error('界面.执行.智能.失败', error, LogCategory.UI);
+        errorMsg = error instanceof Error ? error.message : String(error);
+        this.sendOrchestratorMessage({
+          content: errorMsg,
+          messageType: 'error',
+        });
+        success = false;
+      }
     }
 
     this.sendStateUpdate();
@@ -5709,25 +5798,31 @@ ${originalPrompt}
       }
 
     } catch (error) {
-      logger.error('界面.执行.直接.失败', error, LogCategory.UI);
-      errorMsg = error instanceof Error ? error.message : String(error);
-      await this.orchestratorEngine.failTaskById(task.id, errorMsg);
-      const executionStats = this.orchestratorEngine.getExecutionStats();
-      if (executionStats) {
-        executionStats.recordExecution({
-          worker: targetWorker,
-          taskId: task.id,
-          subTaskId: `direct-${task.id}`,
-          success: false,
-          duration: Date.now() - startTime,
-          error: errorMsg,
+      // 中断导致的 abort 错误静默处理，不向前端发送错误消息
+      if (isAbortError(error)) {
+        logger.info('界面.执行.直接.中断', { worker: targetWorker }, LogCategory.UI);
+        await this.orchestratorEngine.cancelTaskById(task.id);
+      } else {
+        logger.error('界面.执行.直接.失败', error, LogCategory.UI);
+        errorMsg = error instanceof Error ? error.message : String(error);
+        await this.orchestratorEngine.failTaskById(task.id, errorMsg);
+        const executionStats = this.orchestratorEngine.getExecutionStats();
+        if (executionStats) {
+          executionStats.recordExecution({
+            worker: targetWorker,
+            taskId: task.id,
+            subTaskId: `direct-${task.id}`,
+            success: false,
+            duration: Date.now() - startTime,
+            error: errorMsg,
+          });
+        }
+        this.sendOrchestratorMessage({
+          content: `${targetWorker.toUpperCase()}: ${errorMsg}`,
+          messageType: 'error',
+          metadata: { worker: targetWorker },
         });
       }
-      this.sendOrchestratorMessage({
-        content: `${targetWorker.toUpperCase()}: ${errorMsg}`,
-        messageType: 'error',
-        metadata: { worker: targetWorker },
-      });
     } finally {
       // 清除快照上下文
       toolManager.clearSnapshotContext();

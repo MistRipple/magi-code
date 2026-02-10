@@ -88,6 +88,11 @@ export interface IAdapterFactory extends EventEmitter {
   interrupt(agent: AgentType): Promise<void>;
 
   /**
+   * 中断所有适配器的当前请求（不销毁适配器）
+   */
+  interruptAll(): Promise<void>;
+
+  /**
    * 关闭所有适配器
    */
   shutdown(): Promise<void>;

@@ -5,6 +5,8 @@
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { logger, LogCategory } from '../logging';
 import { MCPServerConfig } from './types';
 
@@ -88,31 +90,99 @@ export class MCPManager {
    */
   async connectServer(config: MCPServerConfig): Promise<void> {
     try {
-      logger.info('Connecting to MCP server', { id: config.id, name: config.name }, LogCategory.TOOLS);
+      logger.info('Connecting to MCP server', { id: config.id, name: config.name, type: config.type }, LogCategory.TOOLS);
 
-      if (config.type !== 'stdio') {
+      // 根据传输类型创建 transport
+      let transport;
+
+      if (config.type === 'stdio') {
+        if (!config.command) {
+          throw new Error('MCP server command is required for stdio type');
+        }
+
+        // 过滤掉 undefined 值，确保类型正确
+        const envVars: Record<string, string> = {};
+        for (const [key, value] of Object.entries(process.env)) {
+          if (value !== undefined) {
+            envVars[key] = value;
+          }
+        }
+        Object.assign(envVars, config.env || {});
+
+        transport = new StdioClientTransport({
+          command: config.command,
+          args: config.args || [],
+          env: envVars,
+        });
+      } else if (config.type === 'sse') {
+        if (!config.url) {
+          throw new Error('MCP server url is required for sse type');
+        }
+        const sseOpts: any = {};
+        if (config.headers) {
+          sseOpts.requestInit = { headers: config.headers };
+          sseOpts.eventSourceInit = { fetch: (url: string | URL, init?: RequestInit) => fetch(url, { ...init, headers: { ...init?.headers as Record<string, string>, ...config.headers } }) };
+        }
+        transport = new SSEClientTransport(new URL(config.url), sseOpts);
+      } else if (config.type === 'streamable-http') {
+        if (!config.url) {
+          throw new Error('MCP server url is required for streamable-http type');
+        }
+        // 先尝试 Streamable HTTP，失败后回退到 SSE（MCP 规范要求的客户端行为）
+        const httpOpts: any = {};
+        if (config.headers) {
+          httpOpts.requestInit = { headers: config.headers };
+        }
+        transport = new StreamableHTTPClientTransport(new URL(config.url), httpOpts);
+
+        try {
+          const probeClient = new Client({ name: 'magi', version: '0.1.0' }, { capabilities: {} });
+          await this.withTimeout(probeClient.connect(transport), MCPManager.DEFAULT_CONNECT_TIMEOUT_MS, `MCP streamable-http connect timed out`);
+
+          // Streamable HTTP 连接成功，直接使用此 client
+          const toolsResponse = await this.withTimeout(
+            probeClient.listTools(),
+            MCPManager.DEFAULT_LIST_TOOLS_TIMEOUT_MS,
+            `MCP listTools timed out`,
+          );
+          const tools: MCPToolInfo[] = (toolsResponse.tools || []).map((tool: any) => ({
+            name: tool.name,
+            description: tool.description || '',
+            inputSchema: tool.inputSchema || {},
+            serverId: config.id,
+            serverName: config.name,
+          }));
+
+          let prompts: MCPPromptInfo[] = [];
+          try {
+            const promptsResponse = await this.withTimeout(probeClient.listPrompts(), MCPManager.DEFAULT_LIST_TOOLS_TIMEOUT_MS, `MCP listPrompts timed out`);
+            prompts = (promptsResponse.prompts || []).map((prompt: any) => ({
+              name: prompt.name,
+              description: prompt.description || '',
+              arguments: prompt.arguments || [],
+              serverId: config.id,
+              serverName: config.name,
+            }));
+          } catch { /* 服务器可能不支持 prompts */ }
+
+          this.clients.set(config.id, probeClient);
+          this.tools.set(config.id, tools);
+          this.prompts.set(config.id, prompts);
+
+          logger.info('MCP server connected (streamable-http)', { id: config.id, name: config.name, toolCount: tools.length, promptCount: prompts.length }, LogCategory.TOOLS);
+          return;
+        } catch (httpError: any) {
+          logger.info('Streamable HTTP failed, falling back to SSE', { id: config.id, error: httpError.message }, LogCategory.TOOLS);
+          const sseOpts: any = {};
+          if (config.headers) {
+            sseOpts.requestInit = { headers: config.headers };
+            sseOpts.eventSourceInit = { fetch: (url: string | URL, init?: RequestInit) => fetch(url, { ...init, headers: { ...init?.headers as Record<string, string>, ...config.headers } }) };
+          }
+          transport = new SSEClientTransport(new URL(config.url), sseOpts);
+        }
+      } else {
         throw new Error(`Unsupported MCP server type: ${config.type}`);
       }
-
-      if (!config.command) {
-        throw new Error('MCP server command is required');
-      }
-
-      // 创建 stdio 传输
-      // 过滤掉 undefined 值，确保类型正确
-      const envVars: Record<string, string> = {};
-      for (const [key, value] of Object.entries(process.env)) {
-        if (value !== undefined) {
-          envVars[key] = value;
-        }
-      }
-      Object.assign(envVars, config.env || {});
-
-      const transport = new StdioClientTransport({
-        command: config.command,
-        args: config.args || [],
-        env: envVars,
-      });
 
       // 创建客户端
       const client = new Client({

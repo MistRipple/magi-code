@@ -148,6 +148,8 @@ export class LLMConfigLoader {
       model: this.normalizeString(orchestratorConfig.model, defaults.model),
       provider: this.normalizeString(orchestratorConfig.provider, defaults.provider) as LLMProvider,
       enabled: true,
+      enableThinking: orchestratorConfig.enableThinking ?? defaults.enableThinking,
+      reasoningEffort: orchestratorConfig.reasoningEffort ?? defaults.reasoningEffort,
     };
   }
 
@@ -179,6 +181,8 @@ export class LLMConfigLoader {
       model: this.normalizeString(workerConfig.model, defaults.model),
       provider: this.normalizeString(workerConfig.provider, defaults.provider) as LLMProvider,
       enabled: workerConfig.enabled !== false,
+      enableThinking: workerConfig.enableThinking ?? defaults.enableThinking,
+      reasoningEffort: workerConfig.reasoningEffort ?? defaults.reasoningEffort,
     };
   }
 
@@ -310,6 +314,8 @@ export class LLMConfigLoader {
       model: config.model,
       provider: config.provider,
       enabled: config.enabled !== false,
+      // reasoningEffort 仅对 openai provider 有意义
+      ...(config.provider === 'openai' && config.reasoningEffort ? { reasoningEffort: config.reasoningEffort } : {}),
     };
 
     this.saveFullConfig(fullConfig);
@@ -328,6 +334,7 @@ export class LLMConfigLoader {
       model: config.model,
       provider: config.provider,
       enabled: true,
+      ...(config.provider === 'openai' && config.reasoningEffort ? { reasoningEffort: config.reasoningEffort } : {}),
     };
 
     this.saveFullConfig(fullConfig);

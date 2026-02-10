@@ -64,11 +64,12 @@ export interface ToolExecutor {
 export interface MCPServerConfig {
   id: string;
   name: string;
-  type: 'stdio' | 'sse';
+  type: 'stdio' | 'sse' | 'streamable-http';
   command?: string; // stdio 类型
   args?: string[];
   env?: Record<string, string>;
-  url?: string; // sse 类型
+  url?: string; // sse / streamable-http 类型
+  headers?: Record<string, string>; // sse / streamable-http 自定义请求头
   enabled: boolean;
 }
 

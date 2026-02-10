@@ -189,9 +189,9 @@
 <!-- 删除确认对话框 -->
 {#if showDeleteConfirm}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="modal-overlay" onclick={closeDeleteConfirm} role="presentation">
+  <div class="modal-overlay" role="presentation">
     <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="modal-dialog modal-dialog--sm" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()}>
+    <div class="modal-dialog modal-dialog--sm" role="dialog" aria-modal="true" tabindex="-1">
       <div class="modal-header">
         <h3 class="modal-title">删除会话</h3>
         <button class="modal-close" onclick={closeDeleteConfirm}>×</button>
@@ -210,9 +210,9 @@
 <!-- 切换会话确认对话框 -->
 {#if showSwitchConfirm}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="modal-overlay" onclick={closeSwitchConfirm} role="presentation">
+  <div class="modal-overlay" role="presentation">
     <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="modal-dialog modal-dialog--sm" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()}>
+    <div class="modal-dialog modal-dialog--sm" role="dialog" aria-modal="true" tabindex="-1">
       <div class="modal-header">
         <h3 class="modal-title">切换会话</h3>
         <button class="modal-close" onclick={closeSwitchConfirm}>×</button>
