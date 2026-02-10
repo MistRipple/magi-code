@@ -59,6 +59,13 @@ export interface LLMConfig {
    * - undefined: 自动检测（根据模型名称）
    */
   enableThinking?: boolean;
+  /**
+   * 推理强度（仅对支持 reasoning 的模型生效）
+   * - 'low': 低推理强度，速度快
+   * - 'medium': 中等推理强度（默认）
+   * - 'high': 高推理强度，质量高
+   */
+  reasoningEffort?: 'low' | 'medium' | 'high';
 }
 
 /**

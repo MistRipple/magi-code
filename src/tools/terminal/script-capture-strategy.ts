@@ -100,6 +100,10 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
     // 等待 script 进程就绪
     const scriptReady = await this.waitForScriptReady(scriptStartCmd, scriptFile, shellName);
 
+    // script 就绪后立即清屏，清除 script 启动命令的回显
+    terminal.sendText(getClearCommand(shellName), true);
+    await this.delay(200);
+
     let scriptPid: number | undefined;
     let shellPid: number | undefined;
 

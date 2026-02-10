@@ -71,6 +71,8 @@ export interface LLMMessageParams {
   stream?: boolean;
   systemPrompt?: string;
   toolChoice?: ToolChoice;
+  /** 取消信号，用于中断正在进行的 LLM 请求 */
+  signal?: AbortSignal;
 }
 
 export type ToolChoice =

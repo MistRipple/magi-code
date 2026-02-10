@@ -165,20 +165,36 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     // 无轮次上限 — Worker 可执行任意多轮工具调用，
     // 异常终止依赖两类检测机制：
     // 1. 连续失败检测：连续 5 次失败 → 提示换方式，累计 25 轮失败 → 终止
-    // 2. 搜索空转检测：连续只调用只读工具 → 提示开始行动，超限 → 终止
+    // 2. 智能空转检测：基于空转分数（区分探索 vs 重复空转），多级渐进式警告
     const CONSECUTIVE_FAIL_THRESHOLD = 5;
     const TOTAL_FAIL_LIMIT = 25;
-    const READ_ONLY_STALL_WARN_THRESHOLD = 5;   // 连续只读轮次达此值 → 注入行动提示
-    const READ_ONLY_STALL_ABORT_THRESHOLD = 15;  // 连续只读轮次达此值 → 强制终止
+    // 空转分数阈值（替代简单计数）
+    // 探索型只读（查看新文件）+0.5/轮，重复型只读（反复查看已看过的文件）+1.5/轮
+    const STALL_WARN_LEVEL_1 = 5;    // 第一级提醒：温和建议开始行动
+    const STALL_WARN_LEVEL_2 = 10;   // 第二级提醒：明确要求修改代码
+    const STALL_WARN_LEVEL_3 = 18;   // 第三级提醒：最终警告
+    const STALL_ABORT_THRESHOLD = 25; // 终止阈值
 
     try {
       let finalText = '';
       let consecutiveFailures = 0;
       let totalFailures = 0;
-      let consecutiveReadOnlyRounds = 0;
+      // 智能空转检测状态
+      let readOnlyStallScore = 0;             // 空转分数（浮点数）
+      let readOnlyConsecutiveRounds = 0;      // 连续只读轮次（用于日志和提示）
+      const visitedPaths = new Set<string>(); // 累计已访问的唯一文件路径
+      let lastStallWarnLevel = 0;             // 上次发出的警告级别（避免重复警告）
+
+      // 创建 AbortController，供 interrupt() 中断 LLM 请求
+      this.abortController = new AbortController();
 
       let round = 0;
       while (true) {
+        // 中断检查：每轮迭代入口检测 abort 信号
+        if (this.abortController.signal.aborted) {
+          break;
+        }
+
         this.seenThinking = false;
         this.decisionHookAppliedForThinking = false;
 
@@ -195,6 +211,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           stream: true,
           maxTokens: 4096,
           temperature: 0.7,
+          signal: this.abortController.signal,
         };
 
         let accumulatedText = '';
@@ -309,28 +326,59 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
             consecutiveFailures = 0;
           }
 
-          // 搜索空转检测：连续只调用只读工具 → 提示行动 → 超限终止
+          // 智能空转检测：基于空转分数区分"有目的的代码探索"和"无意义的搜索循环"
           if (!allFailed) {
             const allReadOnly = toolCalls.every(tc => this.isReadOnlyToolCall(tc));
             if (allReadOnly) {
-              consecutiveReadOnlyRounds++;
+              readOnlyConsecutiveRounds++;
 
-              if (consecutiveReadOnlyRounds >= READ_ONLY_STALL_ABORT_THRESHOLD) {
-                finalText = assistantText || `连续 ${READ_ONLY_STALL_ABORT_THRESHOLD} 轮仅调用搜索/检索类工具而无实质修改，判定为搜索空转终止。`;
-                logger.warn(`${this.agent} 搜索空转终止: ${consecutiveReadOnlyRounds} 轮只读`, undefined, LogCategory.LLM);
+              // 提取本轮访问的文件路径，用于计算探索度
+              const roundPaths = this.extractAccessedPaths(toolCalls);
+              const newPaths = roundPaths.filter(p => !visitedPaths.has(p));
+              for (const p of roundPaths) visitedPaths.add(p);
+
+              // 根据探索度计算空转增量
+              // 查看新文件 = 有目的探索（低增量），反复查看旧文件 = 空转（高增量）
+              const newRatio = roundPaths.length > 0 ? newPaths.length / roundPaths.length : 0;
+              const stallIncrement = newRatio >= 0.5 ? 0.5 : 1.5;
+              readOnlyStallScore += stallIncrement;
+
+              // 多级渐进式警告
+              if (readOnlyStallScore >= STALL_ABORT_THRESHOLD) {
+                finalText = assistantText || `连续 ${readOnlyConsecutiveRounds} 轮仅调用只读工具（空转分数 ${readOnlyStallScore.toFixed(1)}），已查看 ${visitedPaths.size} 个文件，判定为搜索空转终止。`;
+                logger.warn(`${this.agent} 空转终止`, { rounds: readOnlyConsecutiveRounds, score: readOnlyStallScore, uniquePaths: visitedPaths.size }, LogCategory.LLM);
                 this.normalizer.endStream(streamId);
                 break;
               }
 
-              if (consecutiveReadOnlyRounds === READ_ONLY_STALL_WARN_THRESHOLD) {
-                logger.warn(`${this.agent} 搜索空转警告: 连续 ${consecutiveReadOnlyRounds} 轮只读工具调用`, undefined, LogCategory.LLM);
+              if (readOnlyStallScore >= STALL_WARN_LEVEL_3 && lastStallWarnLevel < 3) {
+                lastStallWarnLevel = 3;
+                logger.warn(`${this.agent} 空转最终警告`, { rounds: readOnlyConsecutiveRounds, score: readOnlyStallScore, uniquePaths: visitedPaths.size }, LogCategory.LLM);
                 this.conversationHistory.push({
                   role: 'user',
-                  content: `[System] 你已连续 ${consecutiveReadOnlyRounds} 轮仅使用搜索/检索类工具，尚未对代码做出任何实质修改。你收集的信息已经足够，请立即开始使用 text_editor 修改代码或执行具体操作来推进任务。不要继续搜索。`,
+                  content: `[System] ⚠️ 最终警告：你已连续 ${readOnlyConsecutiveRounds} 轮仅使用只读工具（已查看 ${visitedPaths.size} 个不同文件）。如果下一轮仍不使用 text_editor 的 write 命令修改代码，任务将被强制终止。请立即动手修改。`,
+                });
+              } else if (readOnlyStallScore >= STALL_WARN_LEVEL_2 && lastStallWarnLevel < 2) {
+                lastStallWarnLevel = 2;
+                logger.warn(`${this.agent} 空转二级警告`, { rounds: readOnlyConsecutiveRounds, score: readOnlyStallScore, uniquePaths: visitedPaths.size }, LogCategory.LLM);
+                this.conversationHistory.push({
+                  role: 'user',
+                  content: `[System] 你已连续 ${readOnlyConsecutiveRounds} 轮仅使用搜索/查看类工具，已查看 ${visitedPaths.size} 个不同文件。你收集的信息已经足够，请立即使用 text_editor 的 write 命令开始修改代码。不要再查看文件。`,
+                });
+              } else if (readOnlyStallScore >= STALL_WARN_LEVEL_1 && lastStallWarnLevel < 1) {
+                lastStallWarnLevel = 1;
+                logger.info(`${this.agent} 空转一级提醒`, { rounds: readOnlyConsecutiveRounds, score: readOnlyStallScore, uniquePaths: visitedPaths.size }, LogCategory.LLM);
+                this.conversationHistory.push({
+                  role: 'user',
+                  content: `[System] 你已连续 ${readOnlyConsecutiveRounds} 轮仅使用只读工具查看代码（已查看 ${visitedPaths.size} 个文件）。请考虑开始使用 text_editor 修改代码来推进任务。`,
                 });
               }
             } else {
-              consecutiveReadOnlyRounds = 0;
+              // 包含写入操作 → 重置空转状态
+              readOnlyStallScore = 0;
+              readOnlyConsecutiveRounds = 0;
+              lastStallWarnLevel = 0;
+              // 注意：visitedPaths 不重置，保持全局去重
             }
           }
 
@@ -341,18 +389,28 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           round++;
         } catch (error: any) {
           this.normalizer.endStream(streamId, error?.message || 'Request failed');
+          // abort 中断不视为异常，优雅退出循环
+          if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
+            break;
+          }
           throw error;
         }
       }
 
       this.setState(AdapterState.CONNECTED);
 
-      if (!finalText.trim()) {
+      // abort 中断时不要求必须有内容
+      if (!finalText.trim() && !this.abortController?.signal.aborted) {
         throw new Error('LLM 响应为空：流式传输完成但未收到有效内容');
       }
 
-      return finalText;
+      return finalText || '任务已中断';
     } catch (error: any) {
+      // abort 中断不视为错误状态
+      if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
+        this.setState(AdapterState.CONNECTED);
+        return '任务已中断';
+      }
       this.setState(AdapterState.ERROR);
       this.emitError(error);
       throw error;
@@ -598,8 +656,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   /**
    * 判断工具调用是否为只读操作（搜索/检索/查看类）
    *
-   * 用于搜索空转检测：连续多轮只调用只读工具而无写入操作时，
-   * 注入提示推动 Worker 开始行动。
+   * 用于智能空转检测：连续多轮只调用只读工具而无写入操作时，
+   * 根据探索度计算空转分数，渐进式注入提示推动 Worker 开始行动。
    */
   private isReadOnlyToolCall(toolCall: ToolCall): boolean {
     const name = toolCall.name;
@@ -632,5 +690,33 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
     // 其他工具视为写入操作
     return false;
+  }
+
+  /**
+   * 从一批工具调用中提取访问的文件路径（用于空转探索度判定）
+   *
+   * 提取逻辑：
+   * - text_editor view → arguments.path
+   * - grep_search → arguments.path（搜索路径）
+   * - codebase_retrieval → arguments.query（搜索关键词作为伪路径）
+   * - MCP 工具 → 尝试从 arguments 中提取 path/file/filepath 等字段
+   */
+  private extractAccessedPaths(toolCalls: ToolCall[]): string[] {
+    const paths: string[] = [];
+    for (const tc of toolCalls) {
+      const args = tc.arguments || {};
+      // 优先提取明确的文件路径字段
+      const path = args.path || args.file || args.filepath || args.filePath || args.file_path;
+      if (typeof path === 'string' && path.trim()) {
+        paths.push(path.trim());
+        continue;
+      }
+      // codebase_retrieval 等搜索工具：用 query 作为伪路径标识
+      const query = args.query || args.pattern || args.search;
+      if (typeof query === 'string' && query.trim()) {
+        paths.push(`__query:${query.trim()}`);
+      }
+    }
+    return paths;
   }
 }

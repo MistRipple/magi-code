@@ -55,3 +55,7 @@ coverage/
 augment*
 .tmp-augment-map-sources/
 Users/
+
+.issues/
+.github/
+scripts/sync-issues.js

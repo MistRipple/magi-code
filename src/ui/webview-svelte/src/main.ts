@@ -29,6 +29,26 @@ if (window.__MAGI_WEBVIEW_BOOTED__) {
   // 初始化消息处理器
   initMessageHandler();
 
+  // 剪贴板快捷键支持（VS Code Webview 中非输入框元素的复制/剪切/全选）
+  document.addEventListener('keydown', (e) => {
+    const meta = e.metaKey || e.ctrlKey;
+    if (!meta) return;
+
+    // 焦点在 input/textarea 中时，浏览器原生处理即可，避免重复
+    const active = document.activeElement;
+    const isEditable = active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement || (active as HTMLElement)?.isContentEditable;
+    if (isEditable) return;
+
+    if (e.key === 'c') {
+      document.execCommand('copy');
+    } else if (e.key === 'x') {
+      document.execCommand('cut');
+    } else if (e.key === 'a') {
+      e.preventDefault();
+      document.execCommand('selectAll');
+    }
+  });
+
   // 挂载 Svelte 应用
   app = mount(App, {
     target: document.getElementById('app')!,

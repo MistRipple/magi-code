@@ -69,8 +69,13 @@
   }
 
   onMount(() => {
-    const handler = () => {
+    const handler = (e: Event) => {
       closeGuidancePopover();
+      // 关闭模型下拉（如果点击区域不在 combobox 内也不在 dropdown 内）
+      const target = e.target as HTMLElement;
+      if (!target?.closest?.('.model-combobox') && !target?.closest?.('.model-dropdown')) {
+        closeAllModelDropdowns();
+      }
     };
     window.addEventListener('click', handler);
     window.addEventListener('resize', handler);
@@ -94,6 +99,54 @@
     gemini: 'idle'
   });
 
+  // 模型列表（从 API 获取）
+  let modelLists = $state<Record<string, string[]>>({
+    orch: [],
+    comp: [],
+    claude: [],
+    codex: [],
+    gemini: [],
+  });
+  // 模型列表获取状态
+  let fetchingModels = $state<Record<string, boolean>>({
+    orch: false,
+    comp: false,
+    claude: false,
+    codex: false,
+    gemini: false,
+  });
+  // 模型下拉是否展开
+  let modelDropdownOpen = $state<Record<string, boolean>>({
+    orch: false,
+    comp: false,
+    claude: false,
+    codex: false,
+    gemini: false,
+  });
+
+  // 模型下拉的 fixed 定位坐标（用于突破 overflow 容器限制）
+  let dropdownPosition = $state({ top: 0, left: 0, width: 0 });
+
+  function openModelDropdown(key: string, inputEl: EventTarget | null) {
+    const el = inputEl as HTMLElement;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    dropdownPosition = { top: rect.bottom, left: rect.left, width: rect.width };
+    modelDropdownOpen[key] = true;
+    modelDropdownOpen = { ...modelDropdownOpen };
+  }
+
+  function closeAllModelDropdowns() {
+    let changed = false;
+    for (const key of Object.keys(modelDropdownOpen)) {
+      if (modelDropdownOpen[key]) {
+        modelDropdownOpen[key] = false;
+        changed = true;
+      }
+    }
+    if (changed) modelDropdownOpen = { ...modelDropdownOpen };
+  }
+
   // 保存配置状态: 'idle' | 'saving' | 'saved' | 'error'
   let saveStatus = $state<Record<string, 'idle' | 'saving' | 'saved' | 'error'>>({
     orch: 'idle',
@@ -113,13 +166,13 @@
   let installingSkills = $state<Set<string>>(new Set());
 
   // 模型配置表单
-  let orchConfig = $state({ baseUrl: '', apiKey: '', model: '', provider: 'anthropic' });
+  let orchConfig = $state({ baseUrl: '', apiKey: '', model: '', provider: 'anthropic', reasoningEffort: 'medium' });
   let compConfig = $state({ baseUrl: '', apiKey: '', model: '', provider: 'anthropic' });
   let aceConfig = $state({ url: '', key: '' });
-  let workerConfigs = $state<Record<string, { baseUrl: string; apiKey: string; model: string; provider: string; enabled: boolean }>>({
-    claude: { baseUrl: '', apiKey: '', model: '', provider: 'anthropic', enabled: true },
-    codex: { baseUrl: '', apiKey: '', model: '', provider: 'openai', enabled: true },
-    gemini: { baseUrl: '', apiKey: '', model: '', provider: 'openai', enabled: true }
+  let workerConfigs = $state<Record<string, { baseUrl: string; apiKey: string; model: string; provider: string; enabled: boolean; reasoningEffort: string }>>({
+    claude: { baseUrl: '', apiKey: '', model: '', provider: 'anthropic', enabled: true, reasoningEffort: 'medium' },
+    codex: { baseUrl: '', apiKey: '', model: '', provider: 'openai', enabled: true, reasoningEffort: 'medium' },
+    gemini: { baseUrl: '', apiKey: '', model: '', provider: 'openai', enabled: true, reasoningEffort: 'medium' }
   });
 
   // Tools Tab 状态 - MCP 服务器完整结构
@@ -185,6 +238,7 @@
   let showMCPDialogState = $state(false);
   let mcpDialogIsEdit = $state(false);
   let mcpDialogJson = $state('');
+  let mcpDialogError = $state('');
 
   // 仓库管理对话框
   let showRepoDialogState = $state(false);
@@ -380,6 +434,35 @@
     }
   }
 
+  function fetchModelList(target: 'orch' | 'comp' | 'worker') {
+    const key = target === 'worker' ? workerModelTab : target;
+    fetchingModels[key] = true;
+    fetchingModels = { ...fetchingModels };
+
+    let config: any;
+    if (target === 'worker') {
+      config = workerConfigs[workerModelTab];
+    } else if (target === 'orch') {
+      config = orchConfig;
+    } else {
+      config = compConfig;
+    }
+
+    vscode.postMessage({ type: 'fetchModelList', config, target: key });
+  }
+
+  function selectModel(target: string, model: string) {
+    if (target === 'orch') {
+      orchConfig.model = model;
+    } else if (target === 'comp') {
+      compConfig.model = model;
+    } else if (workerConfigs[target]) {
+      workerConfigs[target].model = model;
+    }
+    modelDropdownOpen[target] = false;
+    modelDropdownOpen = { ...modelDropdownOpen };
+  }
+
   // 重置测试状态（3秒后自动重置为 idle）
   function resetTestStatus(key: string) {
     setTimeout(() => {
@@ -479,12 +562,14 @@
     showMCPDialogState = false;
     currentEditingMCPServer = null;
     mcpDialogJson = '';
+    mcpDialogError = '';
   }
 
   function saveMCPServer() {
+    mcpDialogError = '';
     const jsonText = mcpDialogJson.trim();
     if (!jsonText) {
-      alert('请输入 MCP JSON 配置');
+      mcpDialogError = '请输入 MCP JSON 配置';
       return;
     }
 
@@ -492,29 +577,29 @@
     try {
       parsed = JSON.parse(jsonText);
     } catch (error: any) {
-      alert('JSON 格式错误：' + error.message);
+      mcpDialogError = 'JSON 格式错误：' + error.message;
       return;
     }
 
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      alert('JSON 必须是对象');
+      mcpDialogError = 'JSON 必须是对象';
       return;
     }
 
     const servers = parsed.mcpServers;
     if (!servers || typeof servers !== 'object' || Array.isArray(servers)) {
-      alert('缺少 mcpServers 对象');
+      mcpDialogError = '缺少 mcpServers 对象';
       return;
     }
 
     const serverNames = Object.keys(servers);
     if (serverNames.length === 0) {
-      alert('mcpServers 不能为空');
+      mcpDialogError = 'mcpServers 不能为空';
       return;
     }
 
     if (serverNames.length > 1 && mcpDialogIsEdit) {
-      alert('编辑模式仅支持一个服务器');
+      mcpDialogError = '编辑模式仅支持一个服务器';
       return;
     }
 
@@ -524,36 +609,61 @@
 
     const saveServer = (name: string, cfg: any, isUpdate: boolean): boolean => {
       if (!cfg || typeof cfg !== 'object') {
-        alert(`服务器 ${name} 配置无效`);
+        mcpDialogError = `服务器 ${name} 配置无效`;
         return false;
       }
+
       const command = String(cfg.command || '').trim();
-      if (!command) {
-        alert(`服务器 ${name} 缺少 command`);
+      const url = String(cfg.url || '').trim();
+
+      // command 和 url 至少要有一个
+      if (!command && !url) {
+        mcpDialogError = `服务器 ${name} 缺少 command 或 url`;
         return false;
       }
 
-      const args = cfg.args ?? [];
-      if (!Array.isArray(args)) {
-        alert(`服务器 ${name} 的 args 必须是数组`);
-        return false;
-      }
+      let serverData: any;
 
-      const env = cfg.env ?? {};
-      if (typeof env !== 'object' || Array.isArray(env)) {
-        alert(`服务器 ${name} 的 env 必须是对象`);
-        return false;
-      }
+      if (url) {
+        // HTTP (SSE / Streamable HTTP) 类型
+        const headers = cfg.headers ?? {};
+        if (typeof headers !== 'object' || Array.isArray(headers)) {
+          mcpDialogError = `服务器 ${name} 的 headers 必须是对象`;
+          return false;
+        }
 
-      const serverData = {
-        id: name,
-        name,
-        command,
-        args,
-        env,
-        enabled: cfg.enabled !== false,
-        type: 'stdio'
-      };
+        serverData = {
+          id: name,
+          name,
+          url,
+          headers: Object.keys(headers).length > 0 ? headers : undefined,
+          enabled: cfg.enabled !== false,
+          type: 'streamable-http'
+        };
+      } else {
+        // stdio 类型
+        const args = cfg.args ?? [];
+        if (!Array.isArray(args)) {
+          mcpDialogError = `服务器 ${name} 的 args 必须是数组`;
+          return false;
+        }
+
+        const env = cfg.env ?? {};
+        if (typeof env !== 'object' || Array.isArray(env)) {
+          mcpDialogError = `服务器 ${name} 的 env 必须是对象`;
+          return false;
+        }
+
+        serverData = {
+          id: name,
+          name,
+          command,
+          args,
+          env,
+          enabled: cfg.enabled !== false,
+          type: 'stdio'
+        };
+      }
 
       if (isUpdate && currentEditingMCPServer) {
         vscode.postMessage({
@@ -663,7 +773,6 @@
   function addRepository() {
     const url = repoAddUrl.trim();
     if (!url) {
-      alert('请输入仓库 URL');
       return;
     }
     repoAddLoading = true;
@@ -856,7 +965,8 @@
                 apiKey: config.apiKey || '',
                 model: config.model || '',
                 provider: config.provider || 'anthropic',
-                enabled: config.enabled !== false
+                enabled: config.enabled !== false,
+                reasoningEffort: config.reasoningEffort || 'medium'
               };
             }
           }
@@ -869,7 +979,8 @@
             baseUrl: payload.config.baseUrl || '',
             apiKey: payload.config.apiKey || '',
             model: payload.config.model || '',
-            provider: payload.config.provider || 'anthropic'
+            provider: payload.config.provider || 'anthropic',
+            reasoningEffort: payload.config.reasoningEffort || ''
           };
         }
       }
@@ -982,6 +1093,23 @@
         testStatus = { ...testStatus };
         resetTestStatus('ace');
       }
+      // 模型列表获取结果
+      else if (dataType === 'modelListFetched') {
+        const target = payload?.target as string;
+        if (target) {
+          fetchingModels[target] = false;
+          fetchingModels = { ...fetchingModels };
+          if (payload?.success && Array.isArray(payload.models)) {
+            modelLists[target] = payload.models as string[];
+            modelLists = { ...modelLists };
+            // 自动展开下拉
+            if ((payload.models as string[]).length > 0) {
+              modelDropdownOpen[target] = true;
+              modelDropdownOpen = { ...modelDropdownOpen };
+            }
+          }
+        }
+      }
       // MCP 服务器列表加载
       else if (dataType === 'mcpServersLoaded') {
         const servers = ensureArray<any>(payload?.servers);
@@ -1077,6 +1205,10 @@
         repoAddLoading = false;
         repoAddUrl = '';
       }
+      // 仓库添加失败
+      else if (dataType === 'repositoryAddFailed') {
+        repoAddLoading = false;
+      }
       // 仓库删除成功
       else if (dataType === 'repositoryDeleted') {
         repositories = repositories.filter(r => r.id !== payload?.repositoryId);
@@ -1146,9 +1278,9 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-<div class="settings-overlay" onclick={closeSettings}>
+<div class="settings-overlay">
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="settings-panel" onclick={(e) => { e.stopPropagation(); closeGuidancePopover(); }}>
+  <div class="settings-panel" onclick={() => closeGuidancePopover()}>
     <div class="settings-header">
       <span class="settings-title">设置</span>
       {#if userInfo}
@@ -1183,7 +1315,7 @@
     </div>
 
     <!-- Tab 内容区域 -->
-  <div class="settings-tab-content" onscroll={closeGuidancePopover}>
+  <div class="settings-tab-content" onscroll={() => { closeGuidancePopover(); closeAllModelDropdowns(); }}>
       {#if activeTab === 'stats'}
         <!-- 统计 Tab -->
         <div class="settings-section stats-section">
@@ -1266,10 +1398,30 @@
                     <label class="llm-config-label">API Key</label>
                     <input type="password" class="llm-config-input" bind:value={orchConfig.apiKey} placeholder="sk-ant-...">
                   </div>
-                  <div class="llm-config-field-row">
+                  <div class="llm-config-field-row" class:has-reasoning={orchConfig.provider === 'openai'}>
                     <div class="llm-config-field">
                       <label class="llm-config-label">Model</label>
-                      <input type="text" class="llm-config-input" bind:value={orchConfig.model} placeholder="claude-3-5-sonnet-20241022">
+                      <div class="model-combobox">
+                        <input type="text" class="llm-config-input" bind:value={orchConfig.model} placeholder="claude-3-5-sonnet-20241022"
+                          onfocus={(e) => { if (modelLists.orch.length > 0) openModelDropdown('orch', e.currentTarget); }}
+                        >
+                        {#if !orchConfig.model && modelLists.orch.length === 0}
+                          <button class="model-fetch-btn" onclick={() => fetchModelList('orch')} disabled={fetchingModels.orch || !orchConfig.baseUrl || !orchConfig.apiKey}>
+                            {#if fetchingModels.orch}
+                              <Icon name="refresh" size={12} />
+                            {:else}
+                              <Icon name="download" size={12} />
+                            {/if}
+                          </button>
+                        {/if}
+                        {#if modelDropdownOpen.orch && modelLists.orch.length > 0}
+                          <div class="model-dropdown" style="top: {dropdownPosition.top}px; left: {dropdownPosition.left}px; width: {dropdownPosition.width}px;">
+                            {#each modelLists.orch as m}
+                              <button class="model-dropdown-item" class:selected={orchConfig.model === m} onclick={() => selectModel('orch', m)}>{m}</button>
+                            {/each}
+                          </div>
+                        {/if}
+                      </div>
                     </div>
                     <div class="llm-config-field">
                       <label class="llm-config-label">Provider</label>
@@ -1278,6 +1430,16 @@
                         <option value="anthropic">Anthropic</option>
                       </select>
                     </div>
+                    {#if orchConfig.provider === 'openai'}
+                    <div class="llm-config-field">
+                      <label class="llm-config-label">推理等级</label>
+                      <select class="llm-config-select" bind:value={orchConfig.reasoningEffort}>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                      </select>
+                    </div>
+                    {/if}
                   </div>
                   <div class="llm-config-actions">
                     <button
@@ -1341,7 +1503,27 @@
                   <div class="llm-config-field-row">
                     <div class="llm-config-field">
                       <label class="llm-config-label">Model</label>
-                      <input type="text" class="llm-config-input" bind:value={compConfig.model} placeholder="claude-3-haiku-20240307">
+                      <div class="model-combobox">
+                        <input type="text" class="llm-config-input" bind:value={compConfig.model} placeholder="claude-3-haiku-20240307"
+                          onfocus={(e) => { if (modelLists.comp.length > 0) openModelDropdown('comp', e.currentTarget); }}
+                        >
+                        {#if !compConfig.model && modelLists.comp.length === 0}
+                          <button class="model-fetch-btn" onclick={() => fetchModelList('comp')} disabled={fetchingModels.comp || !compConfig.baseUrl || !compConfig.apiKey}>
+                            {#if fetchingModels.comp}
+                              <Icon name="refresh" size={12} />
+                            {:else}
+                              <Icon name="download" size={12} />
+                            {/if}
+                          </button>
+                        {/if}
+                        {#if modelDropdownOpen.comp && modelLists.comp.length > 0}
+                          <div class="model-dropdown" style="top: {dropdownPosition.top}px; left: {dropdownPosition.left}px; width: {dropdownPosition.width}px;">
+                            {#each modelLists.comp as m}
+                              <button class="model-dropdown-item" class:selected={compConfig.model === m} onclick={() => selectModel('comp', m)}>{m}</button>
+                            {/each}
+                          </div>
+                        {/if}
+                      </div>
                     </div>
                     <div class="llm-config-field">
                       <label class="llm-config-label">Provider</label>
@@ -1477,25 +1659,10 @@
             </div>
             <!-- svelte-ignore a11y_label_has_associated_control -->
             <div class="llm-config-form">
-              <div class="llm-config-field">
-                <label class="llm-config-label">Base URL</label>
-                <input type="text" class="llm-config-input" bind:value={workerConfigs[workerModelTab].baseUrl} placeholder="https://api.anthropic.com">
-              </div>
-              <div class="llm-config-field">
-                <label class="llm-config-label">API Key</label>
-                <input type="password" class="llm-config-input" bind:value={workerConfigs[workerModelTab].apiKey} placeholder="sk-ant-...">
-              </div>
-              <div class="llm-config-field-row inline-toggle-row">
+              <div class="llm-config-field-row url-toggle-row">
                 <div class="llm-config-field">
-                  <label class="llm-config-label">Model</label>
-                  <input type="text" class="llm-config-input" bind:value={workerConfigs[workerModelTab].model} placeholder="claude-3-5-sonnet-20241022">
-                </div>
-                <div class="llm-config-field">
-                  <label class="llm-config-label">Provider</label>
-                  <select class="llm-config-select" bind:value={workerConfigs[workerModelTab].provider}>
-                    <option value="openai">OpenAI</option>
-                    <option value="anthropic">Anthropic</option>
-                  </select>
+                  <label class="llm-config-label">Base URL</label>
+                  <input type="text" class="llm-config-input" bind:value={workerConfigs[workerModelTab].baseUrl} placeholder="https://api.anthropic.com">
                 </div>
                 <div class="llm-config-field inline-toggle">
                   <label class="llm-config-label">状态</label>
@@ -1504,6 +1671,53 @@
                     <span>启用</span>
                   </button>
                 </div>
+              </div>
+              <div class="llm-config-field">
+                <label class="llm-config-label">API Key</label>
+                <input type="password" class="llm-config-input" bind:value={workerConfigs[workerModelTab].apiKey} placeholder="sk-ant-...">
+              </div>
+              <div class="llm-config-field-row" class:has-reasoning={workerConfigs[workerModelTab].provider === 'openai'}>
+                <div class="llm-config-field">
+                  <label class="llm-config-label">Model</label>
+                  <div class="model-combobox">
+                    <input type="text" class="llm-config-input" bind:value={workerConfigs[workerModelTab].model} placeholder="claude-3-5-sonnet-20241022"
+                      onfocus={(e) => { if (modelLists[workerModelTab]?.length > 0) openModelDropdown(workerModelTab, e.currentTarget); }}
+                    >
+                    {#if !workerConfigs[workerModelTab].model && (!modelLists[workerModelTab] || modelLists[workerModelTab].length === 0)}
+                      <button class="model-fetch-btn" onclick={() => fetchModelList('worker')} disabled={fetchingModels[workerModelTab] || !workerConfigs[workerModelTab].baseUrl || !workerConfigs[workerModelTab].apiKey}>
+                        {#if fetchingModels[workerModelTab]}
+                          <Icon name="refresh" size={12} />
+                        {:else}
+                          <Icon name="download" size={12} />
+                        {/if}
+                      </button>
+                    {/if}
+                    {#if modelDropdownOpen[workerModelTab] && modelLists[workerModelTab]?.length > 0}
+                      <div class="model-dropdown" style="top: {dropdownPosition.top}px; left: {dropdownPosition.left}px; width: {dropdownPosition.width}px;">
+                        {#each modelLists[workerModelTab] as m}
+                          <button class="model-dropdown-item" class:selected={workerConfigs[workerModelTab].model === m} onclick={() => selectModel(workerModelTab, m)}>{m}</button>
+                        {/each}
+                      </div>
+                    {/if}
+                  </div>
+                </div>
+                <div class="llm-config-field">
+                  <label class="llm-config-label">Provider</label>
+                  <select class="llm-config-select" bind:value={workerConfigs[workerModelTab].provider}>
+                    <option value="openai">OpenAI</option>
+                    <option value="anthropic">Anthropic</option>
+                  </select>
+                </div>
+                {#if workerConfigs[workerModelTab].provider === 'openai'}
+                <div class="llm-config-field">
+                  <label class="llm-config-label">推理等级</label>
+                  <select class="llm-config-select" bind:value={workerConfigs[workerModelTab].reasoningEffort}>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </div>
+                {/if}
               </div>
               <div class="llm-config-actions">
                 <button
@@ -1855,9 +2069,9 @@
 <!-- 输入对话框 -->
 {#if showInputDialog}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="modal-overlay modal-overlay--top" onclick={cancelInputDialog} onkeydown={(e) => e.key === 'Escape' && cancelInputDialog()} role="presentation">
+  <div class="modal-overlay modal-overlay--top" onkeydown={(e) => e.key === 'Escape' && cancelInputDialog()} role="presentation">
     <!-- svelte-ignore a11y_no_static_element_interactions a11y_interactive_supports_focus -->
-    <div class="modal-dialog modal-dialog--sm" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="modal-dialog modal-dialog--sm" onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
       <div class="modal-header">
         <h3>{inputDialogTitle}</h3>
       </div>
@@ -1877,9 +2091,9 @@
 <!-- MCP 对话框 -->
 {#if showMCPDialogState}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="modal-overlay" onclick={closeMCPDialog} onkeydown={(e) => e.key === 'Escape' && closeMCPDialog()} role="presentation">
+  <div class="modal-overlay" onkeydown={(e) => e.key === 'Escape' && closeMCPDialog()} role="presentation">
     <!-- svelte-ignore a11y_no_static_element_interactions a11y_interactive_supports_focus -->
-    <div class="modal-dialog" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="modal-dialog" onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
       <div class="modal-header">
         <h3>{mcpDialogIsEdit ? '编辑 MCP 服务器' : '添加 MCP 服务器'}</h3>
         <button class="modal-close" onclick={closeMCPDialog}>×</button>
@@ -1887,10 +2101,14 @@
       <div class="modal-body">
         <div class="form-field">
           <label for="mcp-json">MCP 服务器 JSON</label>
-          <textarea id="mcp-json" rows="12" placeholder="粘贴 MCP JSON 配置" bind:value={mcpDialogJson}></textarea>
-          <div class="form-help">
-            支持格式：{'{'} "mcpServers": {'{'} "name": {'{'} "command": "...", "args": [...], "env": {'{'} ... {'}'} {'}'} {'}'} {'}'}
-          </div>
+          <textarea id="mcp-json" rows="12" placeholder="粘贴 MCP JSON 配置" bind:value={mcpDialogJson} oninput={() => mcpDialogError = ''}></textarea>
+          {#if mcpDialogError}
+            <div class="form-error">{mcpDialogError}</div>
+          {:else}
+            <div class="form-help">
+              支持 stdio 和 HTTP 两种格式。stdio: {'{'} "mcpServers": {'{'} "name": {'{'} "command": "...", "args": [...] {'}'} {'}'} {'}'}；HTTP: {'{'} "mcpServers": {'{'} "name": {'{'} "url": "https://...", "headers": {'{'} ... {'}'} {'}'} {'}'} {'}'}
+            </div>
+          {/if}
         </div>
       </div>
       <div class="modal-footer">
@@ -1920,9 +2138,9 @@
 <!-- 仓库管理对话框 -->
 {#if showRepoDialogState}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="modal-overlay" onclick={closeRepoDialog} onkeydown={(e) => e.key === 'Escape' && closeRepoDialog()} role="presentation">
+  <div class="modal-overlay" onkeydown={(e) => e.key === 'Escape' && closeRepoDialog()} role="presentation">
     <!-- svelte-ignore a11y_no_static_element_interactions a11y_interactive_supports_focus -->
-    <div class="modal-dialog modal-dialog-lg" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="modal-dialog modal-dialog-lg" onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
       <div class="modal-header">
         <h3>管理技能仓库</h3>
         <button class="modal-close" onclick={closeRepoDialog}>×</button>
@@ -1932,7 +2150,7 @@
           <div class="repo-add-form">
             <div class="form-field" style="flex: 1; margin-bottom: 0;">
               <label for="repo-url">仓库 URL</label>
-              <input type="text" id="repo-url" placeholder="https://example.com/skills.json" bind:value={repoAddUrl}>
+              <input type="text" id="repo-url" placeholder="https://example.com/skills" bind:value={repoAddUrl}>
             </div>
             <button class="settings-btn primary" onclick={addRepository} disabled={repoAddLoading}>
               <Icon name="plus" size={14} />
@@ -1982,9 +2200,9 @@
 <!-- Skill 库对话框 -->
 {#if showSkillLibraryDialogState}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="modal-overlay" onclick={closeSkillLibraryDialog} onkeydown={(e) => e.key === 'Escape' && closeSkillLibraryDialog()} role="presentation">
+  <div class="modal-overlay" onkeydown={(e) => e.key === 'Escape' && closeSkillLibraryDialog()} role="presentation">
     <!-- svelte-ignore a11y_no_static_element_interactions a11y_interactive_supports_focus -->
-    <div class="modal-dialog modal-dialog-lg" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="modal-dialog modal-dialog-lg" onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
       <div class="modal-header">
         <h3>Skill 库</h3>
         <button class="modal-close" onclick={closeSkillLibraryDialog}>×</button>
@@ -2060,9 +2278,9 @@
 <!-- 重置 Token 确认对话框 -->
 {#if showResetConfirm}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="modal-overlay modal-overlay--top" onclick={cancelResetStats} role="presentation">
+  <div class="modal-overlay modal-overlay--top" role="presentation">
     <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="modal-dialog modal-dialog--sm" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()}>
+    <div class="modal-dialog modal-dialog--sm" role="dialog" aria-modal="true" tabindex="-1">
       <div class="modal-header">
         <div class="modal-title">确认重置</div>
         <button class="modal-close" onclick={cancelResetStats}>×</button>
@@ -2082,9 +2300,9 @@
 <!-- 通用确认对话框 -->
 {#if showConfirmDialog}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="modal-overlay modal-overlay--top" onclick={handleConfirmNo} role="presentation">
+  <div class="modal-overlay modal-overlay--top" role="presentation">
     <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="modal-dialog modal-dialog--sm" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()}>
+    <div class="modal-dialog modal-dialog--sm" role="dialog" aria-modal="true" tabindex="-1">
       <div class="modal-header">
         <div class="modal-title">{confirmDialogTitle}</div>
         <button class="modal-close" onclick={handleConfirmNo}>×</button>
@@ -2553,8 +2771,9 @@
 
   .llm-config-form { display: flex; flex-direction: column; gap: var(--space-3); }
   .llm-config-field { display: flex; flex-direction: column; gap: var(--space-2); }
-  .llm-config-field-row { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); }
-  .llm-config-field-row.inline-toggle-row { grid-template-columns: 1fr 140px 100px; align-items: end; }
+  .llm-config-field-row { display: grid; grid-template-columns: 1fr 120px; gap: var(--space-3); }
+  .llm-config-field-row.has-reasoning { grid-template-columns: 1fr 120px 100px; }
+  .llm-config-field-row.url-toggle-row { grid-template-columns: 1fr 80px; align-items: end; }
   .llm-config-label { font-size: var(--text-sm); color: var(--foreground-muted); }
 
   .llm-config-input, .llm-config-select {
@@ -2572,6 +2791,61 @@
   }
 
   .llm-config-input:focus, .llm-config-select:focus { border-color: var(--primary); }
+
+  .model-combobox { position: relative; }
+  .model-combobox .llm-config-input { padding-right: 32px; }
+  .model-fetch-btn {
+    position: absolute;
+    right: 4px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--foreground-muted);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+  }
+  .model-fetch-btn:hover:not(:disabled) { background: var(--secondary); color: var(--foreground); }
+  .model-fetch-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .model-fetch-btn :global(svg) { animation: none; }
+  .model-combobox:has(.model-fetch-btn:disabled) .model-fetch-btn :global(svg) { animation: none; }
+  /* fetchingModels 状态下的旋转动画，由 Icon name="refresh" 触发 */
+
+  .model-dropdown {
+    position: fixed;
+    z-index: 10000;
+    max-height: 200px;
+    overflow-y: auto;
+    background: var(--vscode-input-background, #3c3c3c);
+    border: 1px solid var(--border);
+    border-top: none;
+    border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  }
+  .model-dropdown-item {
+    display: block;
+    width: 100%;
+    padding: 6px var(--space-3);
+    font-size: var(--text-sm);
+    text-align: left;
+    border: none;
+    background: transparent;
+    color: var(--foreground);
+    cursor: pointer;
+    transition: background var(--transition-fast);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .model-dropdown-item:hover { background: var(--secondary); }
+  .model-dropdown-item.selected { color: var(--primary); background: var(--primary-muted, rgba(var(--primary-rgb, 100,149,237), 0.1)); }
 
   .llm-config-actions { display: flex; justify-content: flex-end; gap: var(--space-2); margin-top: var(--space-3); }
   .llm-config-test-btn { display: flex; align-items: center; gap: var(--space-2); height: var(--btn-height-sm); padding: 0 var(--space-3); font-size: var(--text-sm); background: var(--secondary); border: none; border-radius: var(--radius-sm); color: var(--foreground); cursor: pointer; transition: all var(--transition-fast); }
@@ -3026,6 +3300,7 @@
     box-shadow: 0 0 0 3px rgba(var(--primary-rgb, 99, 102, 241), 0.15);
   }
   .form-help { font-size: var(--text-xs); color: var(--foreground-muted); margin-top: var(--space-2); line-height: 1.5; }
+  .form-error { font-size: var(--text-xs); color: var(--error); margin-top: var(--space-2); line-height: 1.5; }
 
   /* 仓库管理 */
   .repo-add-section {

@@ -484,6 +484,7 @@ export type WebviewToExtensionMessage =
   | { type: 'answerQuestions'; answer: string | null }
   | { type: 'getState' }
   | { type: 'requestState' }
+  | { type: 'webviewReady' }
   // 新增：交互模式相关
   | { type: 'setInteractionMode'; mode: InteractionMode }
   | { type: 'confirmRecovery'; decision: 'retry' | 'rollback' | 'continue' }
@@ -517,6 +518,7 @@ export type WebviewToExtensionMessage =
   | { type: 'loadCompressorConfig' }
   | { type: 'saveCompressorConfig'; config: any }
   | { type: 'testCompressorConnection'; config: any }
+  | { type: 'fetchModelList'; config: any; target: string }
   // 新增：MCP 配置相关
   | { type: 'loadMCPServers' }
   | { type: 'addMCPServer'; server: any }

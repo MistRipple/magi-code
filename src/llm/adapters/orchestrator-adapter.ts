@@ -130,6 +130,9 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       this.conversationHistory.push(userMessage);
       const messagesToSend = this.conversationHistory;
 
+      // 创建 AbortController，供 interrupt() 中断 LLM 请求
+      this.abortController = new AbortController();
+
       // Orchestrator 通常不需要工具，但可以根据需要启用
       const params: LLMMessageParams = {
         messages: messagesToSend,
@@ -137,6 +140,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         stream: true,
         maxTokens: 8192, // Orchestrator 可能需要更多 tokens
         temperature: 0.3, // 更低的温度以获得更确定的规划
+        signal: this.abortController.signal,
       };
 
       // visibility: 'system' 时不绑定 placeholder，使用独立 messageId，且标记 visibility 让前端拦截
@@ -181,6 +185,14 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
 
       return fullResponse;
     } catch (error: any) {
+      // abort 中断不视为错误
+      if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
+        if (messageId) {
+          this.normalizer.endStream(messageId);
+        }
+        this.setState(AdapterState.CONNECTED);
+        return '任务已中断';
+      }
       if (messageId) {
         this.normalizer.endStream(messageId, error?.message || 'Request failed');
       }
@@ -439,8 +451,16 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       let consecutiveFailures = 0;
       let totalFailures = 0;
 
+      // 创建 AbortController，供 interrupt() 中断 LLM 请求
+      this.abortController = new AbortController();
+
       let round = 0;
       while (true) {
+        // 中断检查：每轮迭代入口检测 abort 信号
+        if (this.abortController.signal.aborted) {
+          break;
+        }
+
         // 只有首轮使用 startStreamWithContext 绑定 placeholder messageId，
         // 后续轮次生成新 messageId，避免复用同一个 ID 导致 Pipeline 重新激活覆盖前一轮内容
         const streamId = visibility === 'system'
@@ -456,6 +476,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           stream: true,
           maxTokens: 8192,
           temperature: 0.3,
+          signal: this.abortController.signal,
         };
 
         let accumulatedText = '';
@@ -563,15 +584,24 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           round++;
         } catch (error: any) {
           this.normalizer.endStream(streamId, error?.message || 'Request failed');
+          // abort 中断不视为异常，优雅退出循环
+          if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
+            break;
+          }
           throw error;
         }
       }
 
-      if (!finalText.trim()) {
+      // abort 中断时不要求必须有内容
+      if (!finalText.trim() && !this.abortController?.signal.aborted) {
         throw new Error('LLM 响应为空：流式传输完成但未收到有效内容');
       }
-      return finalText;
+      return finalText || '任务已中断';
     } catch (error: any) {
+      // abort 中断不视为错误
+      if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
+        return '任务已中断';
+      }
       throw error;
     }
   }

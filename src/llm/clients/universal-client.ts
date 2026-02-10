@@ -485,7 +485,9 @@ export class UniversalLLMClient extends BaseLLMClient {
       }, LogCategory.LLM);
     }
 
-    const stream = this.anthropicClient.messages.stream(requestParams);
+    const stream = this.anthropicClient.messages.stream(requestParams, {
+      signal: params.signal,
+    });
 
     let fullContent = '';
     const toolCallBuffers = new Map<string, { id: string; name?: string; argumentsText: string }>();
@@ -745,10 +747,9 @@ export class UniversalLLMClient extends BaseLLMClient {
       requestParams.tool_choice = openAiToolChoice;
     }
 
-    // 对所有请求启用 reasoning（让后端决定是否支持）
-    if (this.shouldEnableThinking()) {
-      requestParams.reasoning_effort = 'medium';
-      // 部分模型启用 reasoning 时不支持 temperature
+    // 仅在配置中明确指定 reasoningEffort 时才添加（该参数仅部分模型支持，盲目添加会导致 400）
+    if (this.config.reasoningEffort) {
+      requestParams.reasoning_effort = this.config.reasoningEffort;
       delete requestParams.temperature;
     }
 
@@ -797,14 +798,16 @@ export class UniversalLLMClient extends BaseLLMClient {
       requestParams.tool_choice = openAiToolChoice;
     }
 
-    // 对所有请求启用 reasoning（让后端决定是否支持）
-    if (this.shouldEnableThinking()) {
-      requestParams.reasoning_effort = 'medium';
-      // 部分模型启用 reasoning 时不支持 temperature
+    // 仅在配置中明确指定 reasoningEffort 时才添加（该参数仅部分模型支持，盲目添加会导致 400）
+    if (this.config.reasoningEffort) {
+      requestParams.reasoning_effort = this.config.reasoningEffort;
       delete requestParams.temperature;
     }
 
-    const stream = await this.openaiClient.chat.completions.create(requestParams as Parameters<typeof this.openaiClient.chat.completions.create>[0] & { stream: true });
+    const stream = await this.openaiClient.chat.completions.create(
+      requestParams as Parameters<typeof this.openaiClient.chat.completions.create>[0] & { stream: true },
+      { signal: params.signal },
+    );
 
     let fullContent = '';
     const toolCallBuffers = new Map<string, { id: string; name?: string; argumentsText: string }>();

@@ -587,6 +587,19 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   }
 
   /**
+   * 中断所有适配器的当前请求（不销毁适配器）
+   */
+  async interruptAll(): Promise<void> {
+    for (const [agent, adapter] of this.adapters) {
+      try {
+        await adapter.interrupt();
+      } catch (error: any) {
+        logger.error(`Failed to interrupt adapter: ${agent}`, { error: error.message }, LogCategory.LLM);
+      }
+    }
+  }
+
+  /**
    * 关闭所有适配器（实现 IAdapterFactory 接口）
    */
   async shutdown(): Promise<void> {

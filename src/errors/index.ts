@@ -207,6 +207,24 @@ export class ValidationError extends MagiError {
 }
 
 /**
+ * 判断错误是否为中断/取消导致的 abort 错误
+ * 统一检测 AbortError、Request was aborted、The operation was aborted 等变体
+ */
+export function isAbortError(error: unknown): boolean {
+  if (!error) return false;
+  if (error instanceof Error) {
+    if (error.name === 'AbortError') return true;
+    const msg = error.message.toLowerCase();
+    return msg.includes('aborted') || msg.includes('abort') || msg.includes('cancelled');
+  }
+  if (typeof error === 'string') {
+    const msg = error.toLowerCase();
+    return msg.includes('aborted') || msg.includes('abort') || msg.includes('cancelled');
+  }
+  return false;
+}
+
+/**
  * 错误处理结果
  */
 export interface ErrorHandlingResult {

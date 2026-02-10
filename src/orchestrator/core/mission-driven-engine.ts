@@ -34,6 +34,7 @@ import {
   MissionStateMapper,
 } from '../mission';
 import { ExecutionStats } from '../execution-stats';
+import { LLMConfigLoader } from '../../llm/config';
 import { MessageHub, type SubTaskView as MessageHubSubTaskView } from './message-hub';
 import {
   MessageType,
@@ -48,6 +49,7 @@ import { WisdomManager, type WisdomStorage } from '../wisdom';
 import { buildIntentClassificationPrompt } from '../prompts/intent-classification';
 import { buildRequirementAnalysisPrompt, buildUnifiedSystemPrompt, buildDispatchSummaryPrompt } from '../prompts/orchestrator-prompts';
 import { extractEmbeddedJson } from '../../utils/content-parser';
+import { isAbortError } from '../../errors';
 // AutonomousWorker 和 TodoExecuteOptions 通过 MissionOrchestrator 间接使用，不直接引用
 import { DispatchBatch, CancellationError, type DispatchEntry, type DispatchResult, type DispatchStatus } from './dispatch-batch';
 import { createSharedContextEntry } from '../../context/shared-context-pool';
@@ -1220,6 +1222,12 @@ export class MissionDrivenEngine extends EventEmitter {
           worker, taskPreview: task.substring(0, 80), dependsOn,
         }, LogCategory.ORCHESTRATOR);
 
+        // 校验 Worker 是否已启用
+        const workerFullConfig = LLMConfigLoader.loadFullConfig();
+        if (workerFullConfig.workers[worker as WorkerSlot]?.enabled === false) {
+          return { task_id: '', status: 'failed' as const, worker, error: `Worker "${worker}" 未启用，请检查 LLM 配置` };
+        }
+
         // 生成唯一 task_id
         const taskId = `dispatch-${Date.now()}-${worker}-${Math.random().toString(36).substring(2, 5)}`;
 
@@ -1937,8 +1945,14 @@ ${this.activeUserPrompt}
 
         // 3. 构建统一系统提示词（Worker 列表从 ProfileLoader 动态获取，工具列表从 ToolManager 动态加载）
         const allProfiles = this.profileLoader.getAllProfiles();
-        const availableWorkers = Array.from(allProfiles.keys());
-        const workerProfiles = Array.from(allProfiles.values()).map(p => ({
+        // 仅保留 LLM 配置中已启用（enabled=true 且 apiKey 有效）的 Worker，
+        // 避免编排器将任务分配给未配置的 Worker 导致运行时错误
+        const fullConfig = LLMConfigLoader.loadFullConfig();
+        const availableWorkers = Array.from(allProfiles.keys())
+          .filter(w => fullConfig.workers[w]?.enabled !== false);
+        const workerProfiles = Array.from(allProfiles.values())
+          .filter(p => availableWorkers.includes(p.worker))
+          .map(p => ({
           worker: p.worker,
           displayName: p.persona.displayName,
           strengths: p.persona.strengths,
@@ -1987,6 +2001,15 @@ ${this.activeUserPrompt}
 
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
+        // 中断导致的 abort 不视为执行失败，静默处理
+        if (isAbortError(error)) {
+          logger.info('编排器.统一执行.中断', { error: errorMessage }, LogCategory.ORCHESTRATOR);
+          this.lastExecutionSuccess = false;
+          this.lastExecutionErrors = [];
+          this.setState('idle');
+          this.currentTaskId = null;
+          return '';
+        }
         this.lastExecutionSuccess = false;
         this.lastExecutionErrors = [errorMessage];
         logger.error('编排器.统一执行.失败', { error: errorMessage }, LogCategory.ORCHESTRATOR);
@@ -1998,7 +2021,8 @@ ${this.activeUserPrompt}
         // 发布任务完成/失败事件，驱动知识库自动提取、状态栏更新等
         if (this.lastExecutionSuccess) {
           globalEventBus.emitEvent('task:completed', { data: { taskId } });
-        } else {
+        } else if (this.lastExecutionErrors.length > 0) {
+          // 仅在有真实错误时才 emit task:failed，中断场景 lastExecutionErrors 为空不触发
           globalEventBus.emitEvent('task:failed', { data: { taskId, error: this.lastExecutionErrors[0] } });
         }
       }
