@@ -286,8 +286,8 @@ export class ClaudeNormalizer extends BaseNormalizer {
         const event = JSON.parse(this.jsonBuffer) as ClaudeStreamEvent;
         this.processEvent(context, event);
       } catch {
-        // 作为纯文本处理
-        context.pendingText += this.jsonBuffer;
+        // 流被中断时 jsonBuffer 通常是不完整的 JSON 协议片段（含 thinking 标签等），
+        // 直接丢弃，避免将原始协议内容泄露到用户可见的消息中
       }
     }
     this.jsonBuffer = '';

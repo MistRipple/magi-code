@@ -131,7 +131,7 @@ export class VSCodeTerminalExecutor {
   }
 
 
-  async launchProcess(options: LaunchProcessOptions): Promise<LaunchProcessResult> {
+  async launchProcess(options: LaunchProcessOptions, signal?: AbortSignal): Promise<LaunchProcessResult> {
     const timeout = Math.min(Math.max(options.maxWaitSeconds, 1) * 1000, this.maxTimeout);
     const agentName = (options.name || '').trim();
     if (!agentName) {
@@ -187,7 +187,7 @@ export class VSCodeTerminalExecutor {
       });
 
     if (options.wait) {
-      await this.waitForProcessState(processId, timeout);
+      await this.waitForProcessState(processId, timeout, signal);
     }
 
     return {
@@ -288,10 +288,23 @@ export class VSCodeTerminalExecutor {
     return result;
   }
 
-  private async waitForProcessState(processId: number, timeoutMs: number): Promise<void> {
+  private async waitForProcessState(processId: number, timeoutMs: number, signal?: AbortSignal): Promise<void> {
     const startedAt = Date.now();
 
     while (Date.now() - startedAt < timeoutMs) {
+      // 中断检查：收到 abort 信号时 kill 进程并退出等待
+      if (signal?.aborted) {
+        const process = this.processes.get(processId);
+        if (process && (process.state === 'running' || process.state === 'starting')) {
+          process.state = 'killed';
+          process.exitCode = process.exitCode ?? -1;
+          process.terminal.sendText('\x03');
+          process.endTime = Date.now();
+          this.terminalBusy.set(process.terminal, false);
+        }
+        return;
+      }
+
       const process = this.processes.get(processId);
       if (!process) {
         return;

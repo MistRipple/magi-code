@@ -274,13 +274,45 @@ export interface AutoScrollConfig {
 // 任务状态
 export type TaskStatus = 'pending' | 'paused' | 'running' | 'completed' | 'failed' | 'cancelled';
 
-// 任务
+// 子任务状态（对齐后端 SubTaskViewStatus）
+export type SubTaskStatus =
+  | 'pending'
+  | 'running'
+  | 'paused'
+  | 'completed'
+  | 'failed'
+  | 'skipped'
+  | 'blocked'
+  | 'cancelled'
+  | 'in_progress'; // 增量事件可能发送此值
+
+// 子任务（对齐后端 SubTaskView）
+export interface SubTaskItem {
+  id: string;
+  description: string;
+  title?: string;
+  assignedWorker: string;
+  assignmentId: string;
+  status: SubTaskStatus;
+  progress: number;
+  priority: number;
+  targetFiles: string[];
+  modifiedFiles?: string[];
+  error?: string;
+  startedAt?: number;
+  completedAt?: number;
+}
+
+// 任务（对齐后端 TaskView）
 export interface Task {
-  id?: string;
-  name?: string;
+  id: string;
+  name: string;
   prompt?: string;
   description?: string;
   status: TaskStatus;
+  subTasks: SubTaskItem[];
+  progress: number;
+  missionId: string;
 }
 
 // 编辑/变更记录

@@ -282,6 +282,13 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           this.conversationHistory.push({ role: 'assistant', content: assistantContent });
 
           const toolResults = await this.executeToolCalls(toolCalls);
+
+          // 中断检查：工具执行完成后立即检测 abort，跳过后续处理直接退出循环
+          if (this.abortController?.signal.aborted) {
+            this.normalizer.endStream(streamId);
+            break;
+          }
+
           for (const result of toolResults) {
             this.normalizer.finishToolCall(
               streamId,
@@ -475,10 +482,20 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     const maxToolResultChars = 20000;
 
     for (const toolCall of toolCalls) {
+      // 中断检查：工具调用之间检测 abort 信号，避免中断后继续执行后续工具
+      if (this.abortController?.signal.aborted) {
+        results.push({
+          toolCallId: toolCall.id,
+          content: '任务已中断',
+          isError: true,
+        });
+        continue;
+      }
+
       try {
         logger.debug(`Executing tool: ${toolCall.name}`, { args: toolCall.arguments }, LogCategory.TOOLS);
 
-        const result = await this.toolManager.execute(toolCall);
+        const result = await this.toolManager.execute(toolCall, this.abortController?.signal);
         if (typeof result.content === 'string' && result.content.length > maxToolResultChars) {
           const truncated = result.content.slice(0, maxToolResultChars);
           result.content = `${truncated}\n...[truncated ${result.content.length - maxToolResultChars} chars]`;

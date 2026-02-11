@@ -40,8 +40,9 @@ export interface ExtendedToolDefinition extends ToolDefinition {
 export interface ToolExecutor {
   /**
    * 执行工具调用
+   * @param signal 可选的中断信号，用于在用户取消时终止长时间运行的工具
    */
-  execute(toolCall: ToolCall): Promise<ToolResult>;
+  execute(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult>;
 
   /**
    * 获取工具定义列表

@@ -133,7 +133,7 @@ Tips:
   /**
    * 执行工具调用
    */
-  async execute(toolCall: ToolCall): Promise<ToolResult> {
+  async execute(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     const { name } = toolCall;
 
     logger.debug('WebExecutor executing', { tool: name }, LogCategory.TOOLS);
@@ -141,9 +141,9 @@ Tips:
     try {
       switch (name) {
         case 'web_search':
-          return await this.executeWebSearch(toolCall);
+          return await this.executeWebSearch(toolCall, signal);
         case 'web_fetch':
-          return await this.executeWebFetch(toolCall);
+          return await this.executeWebFetch(toolCall, signal);
         default:
           return {
             toolCallId: toolCall.id,
@@ -164,7 +164,7 @@ Tips:
   /**
    * 执行网络搜索
    */
-  private async executeWebSearch(toolCall: ToolCall): Promise<ToolResult> {
+  private async executeWebSearch(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     const { query } = toolCall.arguments as { query: string };
 
     if (!query) {
@@ -186,7 +186,7 @@ Tips:
           'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
         },
         redirect: 'follow',
-        signal: AbortSignal.timeout(15000),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
       });
 
       if (!response.ok) {
@@ -287,7 +287,7 @@ Tips:
   /**
    * 执行 URL 内容获取
    */
-  private async executeWebFetch(toolCall: ToolCall): Promise<ToolResult> {
+  private async executeWebFetch(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     const { url, prompt } = toolCall.arguments as { url: string; prompt?: string };
 
     if (!url) {
@@ -319,7 +319,7 @@ Tips:
           'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
         },
         redirect: 'follow',
-        signal: AbortSignal.timeout(30000),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30000)]) : AbortSignal.timeout(30000),
       });
 
       if (!response.ok) {

@@ -1485,7 +1485,7 @@ export class MissionDrivenEngine extends EventEmitter {
       }, LogCategory.ORCHESTRATOR);
       } finally {
         // 清除快照上下文（无论成功或失败）
-        toolManager.clearSnapshotContext();
+        toolManager.clearSnapshotContext(worker);
       }
     })().catch(async (error: any) => {
       // C-09: 取消异常不按失败处理，cancelAll 已标记 cancelled 状态
@@ -1973,7 +1973,16 @@ ${this.activeUserPrompt}
           systemPrompt = `${systemPrompt}\n\n${userRulesPrompt}`;
         }
 
-        // 4. 单次 LLM 调用（自动包含工具循环）
+        // 4. 设置编排者快照上下文（确保编排者直接工具调用也能记录快照）
+        const orchestratorToolManager = this.adapterFactory.getToolManager();
+        orchestratorToolManager.setSnapshotContext({
+          missionId: taskId,
+          assignmentId: `orchestrator-${taskId}`,
+          todoId: `orchestrator-${taskId}`,
+          workerId: 'orchestrator',
+        });
+
+        // 5. 单次 LLM 调用（自动包含工具循环）
         const response = await this.adapterFactory.sendMessage(
           'orchestrator',
           trimmedPrompt,
@@ -2018,6 +2027,8 @@ ${this.activeUserPrompt}
         throw error;
       } finally {
         this.isRunning = false;
+        // 清除编排者快照上下文
+        this.adapterFactory.getToolManager().clearSnapshotContext('orchestrator');
         // 发布任务完成/失败事件，驱动知识库自动提取、状态栏更新等
         if (this.lastExecutionSuccess) {
           globalEventBus.emitEvent('task:completed', { data: { taskId } });

@@ -141,7 +141,7 @@ Bad query examples (use grep_search instead):
    * 执行工具调用
    * 策略：ACE 可用 → 远程语义搜索；ACE 不可用 → 本地索引搜索
    */
-  async execute(toolCall: ToolCall): Promise<ToolResult> {
+  async execute(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     const args = toolCall.arguments as {
       query: string;
       ensure_indexed?: boolean;
@@ -151,6 +151,15 @@ Bad query examples (use grep_search instead):
       return {
         toolCallId: toolCall.id,
         content: 'Error: query is required',
+        isError: true
+      };
+    }
+
+    // 中断检查
+    if (signal?.aborted) {
+      return {
+        toolCallId: toolCall.id,
+        content: '任务已中断',
         isError: true
       };
     }
