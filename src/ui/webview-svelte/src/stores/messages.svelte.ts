@@ -20,6 +20,7 @@ import type {
   WorkerSessionState,
   RequestResponseBinding,
   ModelStatusMap,
+  Task,
 } from '../types/message';
 import { vscode } from '../lib/vscode-bridge';
 import { ensureArray } from '../lib/utils';
@@ -119,7 +120,7 @@ function hasInvalidMessageSource(messages: Message[]): boolean {
 }
 
 // 新增状态：任务、变更、阶段、Toast、模型状态
-let tasks = $state<Array<{ id: string; name: string; description?: string; status: string }>>([]);
+let tasks = $state<Task[]>([]);
 let edits = $state<Array<{ filePath: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string }>>([]);
 let toasts = $state<Array<{ id: string; type: string; title?: string; message: string }>>([]);
 let modelStatus = $state<ModelStatusMap>({
@@ -226,7 +227,7 @@ let pendingQuestion = $state<{ questions: string[]; plan?: unknown } | null>(nul
 let pendingClarification = $state<{ questions: string[]; context?: string; ambiguityScore?: number; originalPrompt?: string } | null>(null);
 let pendingWorkerQuestion = $state<{ workerId: string; question: string; context?: string; options?: unknown } | null>(null);
 let pendingToolAuthorization = $state<{ requestId: string; toolName: string; toolArgs: unknown } | null>(null);
-let missionPlan = $state<MissionPlan | null>(null);
+let missionPlan = $state<Map<string, MissionPlan>>(new Map());
 
 // Wave 执行状态（提案 4.6）
 let waveState = $state<WaveState | null>(null);
@@ -396,7 +397,7 @@ export function getPendingToolAuthorization() {
   return pendingToolAuthorization;
 }
 
-export function getMissionPlan() {
+export function getMissionPlan(): Map<string, MissionPlan> {
   return missionPlan;
 }
 
@@ -550,7 +551,11 @@ export function setAppState(nextState: AppState | null) {
 }
 
 export function setMissionPlan(plan: MissionPlan | null) {
-  missionPlan = normalizeMissionPlan(plan);
+  const normalized = normalizeMissionPlan(plan);
+  if (!normalized) return;
+  const next = new Map(missionPlan);
+  next.set(normalized.missionId, normalized);
+  missionPlan = next;
 }
 
 // Worker 执行状态操作

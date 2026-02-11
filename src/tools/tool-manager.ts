@@ -128,7 +128,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
   // 快照系统
   private snapshotManager?: SnapshotManager;
-  private snapshotContext?: SnapshotContext;
+  private snapshotContextMap: Map<string, SnapshotContext> = new Map();
 
   constructor(workspaceRoot?: string, permissions?: PermissionMatrix) {
     super();
@@ -193,27 +193,43 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   /**
    * 设置快照执行上下文
    * 在 Assignment 执行前调用，标识当前正在执行的任务信息
+   * 以 workerId 为 key 存储，支持多 Worker 并行执行
    */
   setSnapshotContext(context: SnapshotContext): void {
-    this.snapshotContext = context;
+    this.snapshotContextMap.set(context.workerId, context);
   }
 
   /**
    * 更新快照上下文的 todoId（在每个 Todo 执行开始时调用）
    * 确保文件变更精确关联到具体的 Todo
    */
-  updateSnapshotTodoId(todoId: string): void {
-    if (this.snapshotContext) {
-      this.snapshotContext.todoId = todoId;
+  updateSnapshotTodoId(workerId: string, todoId: string): void {
+    const context = this.snapshotContextMap.get(workerId);
+    if (context) {
+      context.todoId = todoId;
     }
   }
 
   /**
    * 清除快照执行上下文
-   * 在 Assignment 执行后调用
+   * 在 Assignment 执行后调用，按 workerId 精确清除
    */
-  clearSnapshotContext(): void {
-    this.snapshotContext = undefined;
+  clearSnapshotContext(workerId: string): void {
+    this.snapshotContextMap.delete(workerId);
+  }
+
+  /**
+   * 获取当前活跃的快照上下文
+   * 多 Worker 并行时，返回最近设置的上下文
+   */
+  private getActiveSnapshotContext(): SnapshotContext | undefined {
+    if (this.snapshotContextMap.size === 0) return undefined;
+    // 返回 Map 中最后一个值（最近设置的上下文）
+    let last: SnapshotContext | undefined;
+    for (const ctx of this.snapshotContextMap.values()) {
+      last = ctx;
+    }
+    return last;
   }
 
   /**
@@ -226,14 +242,19 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     const self = this;
 
     const beforeWriteCallback = (filePath: string) => {
-      if (!self.snapshotContext) return;
+      // 从 Map 中获取活跃的快照上下文（多 Worker 并行安全）
+      const context = self.getActiveSnapshotContext();
+      if (!context) {
+        logger.debug('ToolManager: 无活跃快照上下文，跳过快照', { filePath }, LogCategory.TOOLS);
+        return;
+      }
       try {
         snapshotManager.createSnapshotForMission(
           filePath,
-          self.snapshotContext.missionId,
-          self.snapshotContext.assignmentId,
-          self.snapshotContext.todoId,
-          self.snapshotContext.workerId,
+          context.missionId,
+          context.assignmentId,
+          context.todoId,
+          context.workerId,
           'tool-level-snapshot'
         );
       } catch (error: any) {
@@ -336,13 +357,22 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   /**
    * 执行工具调用
    */
-  async execute(toolCall: ToolCall): Promise<ToolResult> {
+  async execute(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     logger.debug('Executing tool call', {
       toolName: toolCall.name,
       toolCallId: toolCall.id,
     }, LogCategory.TOOLS);
 
     try {
+      // 中断检查：执行前检测 abort 信号
+      if (signal?.aborted) {
+        return {
+          toolCallId: toolCall.id,
+          content: '任务已中断',
+          isError: true,
+        };
+      }
+
       // 检查授权（包括权限和用户授权）
       const authCheck = await this.checkAuthorization(toolCall);
       if (!authCheck.allowed) {
@@ -359,7 +389,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
       // 检查是否是内置工具
       if (this.builtinToolNames.includes(toolCall.name)) {
-        return await this.executeBuiltinTool(toolCall);
+        return await this.executeBuiltinTool(toolCall, signal);
       }
 
       // 查找 MCP 工具
@@ -375,7 +405,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
       // 执行 MCP 工具
       if (toolDef.metadata.source === 'mcp') {
-        return await this.executeMCPTool(toolCall, toolDef);
+        return await this.executeMCPTool(toolCall, toolDef, signal);
       }
 
       // 执行 Skill 工具
@@ -387,7 +417,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
             isError: true,
           };
         }
-        return await this.skillExecutor.execute(toolCall);
+        return await this.skillExecutor.execute(toolCall, signal);
       }
 
       return {
@@ -412,12 +442,12 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   /**
    * 执行内置工具
    */
-  private async executeBuiltinTool(toolCall: ToolCall): Promise<ToolResult> {
+  private async executeBuiltinTool(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     const { name } = toolCall;
 
     switch (name) {
       case 'launch-process':
-        return await this.executeLaunchProcessTool(toolCall);
+        return await this.executeLaunchProcessTool(toolCall, signal);
 
       case 'read-process':
         return await this.executeReadProcessTool(toolCall);
@@ -442,13 +472,13 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
       case 'web_search':
       case 'web_fetch':
-        return await this.webExecutor.execute(toolCall);
+        return await this.webExecutor.execute(toolCall, signal);
 
       case 'mermaid_diagram':
         return await this.mermaidExecutor.execute(toolCall);
 
       case 'codebase_retrieval':
-        return await this.aceExecutor.execute(toolCall);
+        return await this.aceExecutor.execute(toolCall, signal);
 
       case 'dispatch_task':
       case 'plan_mission':
@@ -730,7 +760,7 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
     return tools.find((t) => t.name === toolName);
   }
 
-  private async executeLaunchProcessTool(toolCall: ToolCall): Promise<ToolResult> {
+  private async executeLaunchProcessTool(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     const args = toolCall.arguments as any;
     const { command, cwd, wait = true, max_wait_seconds = 30, name, showTerminal = true } = args;
 
@@ -750,7 +780,7 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
       maxWaitSeconds: max_wait_seconds,
       name,
       showTerminal,
-    });
+    }, signal);
 
     return {
       toolCallId: toolCall.id,
@@ -809,7 +839,8 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
    */
   private async executeMCPTool(
     toolCall: ToolCall,
-    toolDef: ExtendedToolDefinition
+    toolDef: ExtendedToolDefinition,
+    signal?: AbortSignal
   ): Promise<ToolResult> {
     const serverId = toolDef.metadata.sourceId;
     if (!serverId) {
@@ -836,7 +867,7 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
       }
     }
 
-    return await executor.execute(toolCall);
+    return await executor.execute(toolCall, signal);
   }
 
   /**

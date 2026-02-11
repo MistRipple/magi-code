@@ -1934,10 +1934,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     // 清理编排者流式输出缓存，避免跨任务串流
     this.streamMessageIds.clear();
-    // 仅在适配器已确认中断完成时清理处理状态，避免“Stop 提前恢复、Worker 仍执行”。
-    if (adapterInterruptCompleted) {
-      this.messageHub.forceProcessingState(false);
-    }
+    // 发送 task_failed 控制消息，确保前端 clearProcessingState() 被触发
+    // 前端只响应 task_completed/task_failed 来清除处理态，processingStateChanged(false) 会被忽略
+    this.messageHub.sendControl(ControlMessageType.TASK_FAILED, {
+      error: '用户取消',
+      cancelled: true,
+      timestamp: Date.now(),
+    });
+    // 同步清理后端管道的处理态
+    this.messageHub.forceProcessingState(false);
 
     if (hasRunningTask && !options?.silent) {
       // 4. 通知 UI
@@ -5825,7 +5830,7 @@ ${originalPrompt}
       }
     } finally {
       // 清除快照上下文
-      toolManager.clearSnapshotContext();
+      toolManager.clearSnapshotContext(targetWorker);
     }
 
     this.sendStateUpdate();

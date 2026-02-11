@@ -736,7 +736,7 @@ export class AutonomousWorker extends EventEmitter {
     todo.startedAt = Date.now();
 
     // 更新快照上下文的 todoId（确保当前 Todo 的文件变更精确关联）
-    options.adapterFactory?.getToolManager().updateSnapshotTodoId(todo.id);
+    options.adapterFactory?.getToolManager().updateSnapshotTodoId(assignment.workerId, todo.id);
 
     this.emit('todoStarted', {
       assignmentId: assignment.id,
@@ -959,7 +959,7 @@ export class AutonomousWorker extends EventEmitter {
       // 解析响应
       const summary = response.content || response.error || '执行完成';
       const modifiedFiles = this.extractModifiedFiles(response.content || '');
-      const dynamicTodos = this.extractDynamicTodos(response.content || '', assignment, todo.id);
+      const dynamicTodos = await this.extractDynamicTodos(response.content || '', assignment, todo.id);
 
       // 调用输出回调
       if (options.onOutput && response.content) {
@@ -1012,43 +1012,38 @@ export class AutonomousWorker extends EventEmitter {
 
   /**
    * 从输出中提取动态 Todo
+   * 通过 TodoManager 持久化，确保 Todo 可追踪和恢复
    */
-  private extractDynamicTodos(output: string, assignment: Assignment, parentTodoId?: string): UnifiedTodo[] {
-    // 检测输出中是否有需要动态添加的任务
-    // 这是一个简化实现，实际可能需要更复杂的解析
+  private async extractDynamicTodos(output: string, assignment: Assignment, parentTodoId?: string): Promise<UnifiedTodo[]> {
     const todos: UnifiedTodo[] = [];
 
-    // 匹配 "TODO:" 或 "需要额外处理:" 等模式
-    const todoPattern = /(?:TODO|需要额外处理|Additional task)[：:]?\s*(.+)/gi;
+    // 扩展匹配模式，覆盖常见的中英文任务标记
+    const todoPattern = /(?:TODO|FIXME|需要额外处理|需要补充|还需要|待办|额外任务|Additional task|Follow-up)[：:]?\s*(.+)/gi;
     let match;
 
     while ((match = todoPattern.exec(output)) !== null) {
       const content = match[1].trim();
-      if (content) {
-        // 创建动态 Todo（需要审批），挂载为父 Todo 的子任务
-        todos.push({
-          id: `dynamic-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+      if (content && content.length > 2) {
+        // 通过 TodoManager 持久化创建，确保可追踪
+        const todo = await this.todoManager.create({
           missionId: assignment.missionId,
           assignmentId: assignment.id,
           parentId: parentTodoId,
-          workerId: assignment.workerId,
           content,
           reasoning: '执行过程中发现的额外任务',
-          expectedOutput: '完成额外任务',
           type: 'implementation',
-          priority: 3, // 中等优先级
-          status: 'pending',
-          progress: 0,
-          dependsOn: [],
-          requiredContracts: [],
-          producesContracts: [],
-          outOfScope: true,
-          approvalStatus: 'pending',
-          retryCount: 0,
-          maxRetries: 3,
-          createdAt: Date.now(),
+          workerId: assignment.workerId,
+          priority: 3,
         });
+        todos.push(todo);
       }
+    }
+
+    if (todos.length > 0) {
+      logger.info('Worker.动态Todo.提取', {
+        workerId: assignment.workerId,
+        count: todos.length,
+      }, LogCategory.ORCHESTRATOR);
     }
 
     return todos;

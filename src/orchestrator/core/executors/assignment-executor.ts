@@ -219,7 +219,7 @@ export class AssignmentExecutor {
     }
     } finally {
       // 清除快照上下文（无论成功或失败）
-      toolManager.clearSnapshotContext();
+      toolManager.clearSnapshotContext(assignment.workerId);
     }
 
     logger.info(

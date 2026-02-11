@@ -395,7 +395,7 @@ export class MCPManager {
   /**
    * 调用工具
    */
-  async callTool(serverId: string, toolName: string, args: any): Promise<any> {
+  async callTool(serverId: string, toolName: string, args: any, signal?: AbortSignal): Promise<any> {
     const client = this.clients.get(serverId);
     if (!client) {
       throw new Error(`MCP server not connected: ${serverId}`);
@@ -408,14 +408,33 @@ export class MCPManager {
         args,
       }, LogCategory.TOOLS);
 
-      const result = await this.withTimeout(
-        client.callTool({
-          name: toolName,
-          arguments: args,
-        }),
-        MCPManager.DEFAULT_CALL_TOOL_TIMEOUT_MS,
-        `MCP callTool timed out after ${MCPManager.DEFAULT_CALL_TOOL_TIMEOUT_MS}ms`,
-      );
+      const callPromise = client.callTool({
+        name: toolName,
+        arguments: args,
+      });
+
+      // 将外部中断信号与超时合并：任一触发即终止等待
+      const races: Promise<any>[] = [
+        this.withTimeout(
+          callPromise,
+          MCPManager.DEFAULT_CALL_TOOL_TIMEOUT_MS,
+          `MCP callTool timed out after ${MCPManager.DEFAULT_CALL_TOOL_TIMEOUT_MS}ms`,
+        ),
+      ];
+
+      if (signal) {
+        races.push(new Promise((_, reject) => {
+          if (signal.aborted) {
+            reject(new DOMException('任务已中断', 'AbortError'));
+            return;
+          }
+          signal.addEventListener('abort', () => {
+            reject(new DOMException('任务已中断', 'AbortError'));
+          }, { once: true });
+        }));
+      }
+
+      const result = await Promise.race(races);
 
       logger.info('MCP tool call completed', {
         serverId,

@@ -61,10 +61,19 @@ export class MCPToolExecutor implements ToolExecutor {
   /**
    * 执行工具调用
    */
-  async execute(toolCall: ToolCall): Promise<ToolResult> {
+  async execute(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     // 确保已初始化
     if (!this.initialized) {
       await this.initialize();
+    }
+
+    // 中断检查
+    if (signal?.aborted) {
+      return {
+        toolCallId: toolCall.id,
+        content: '任务已中断',
+        isError: true,
+      };
     }
 
     // 查找工具所属的服务器
@@ -83,7 +92,8 @@ export class MCPToolExecutor implements ToolExecutor {
       const result = await this.mcpManager.callTool(
         tool.serverId,
         toolCall.name,
-        toolCall.arguments
+        toolCall.arguments,
+        signal
       );
 
       // 格式化结果

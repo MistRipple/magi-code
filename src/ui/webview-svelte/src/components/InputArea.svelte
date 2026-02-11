@@ -488,30 +488,28 @@
           </span>
         </button>
 
-        <!-- 发送 / 停止 -->
-        {#if isSending}
+        <!-- 发送 / 停止（互斥，同一位置） -->
+        {#if hasContent}
+          <!-- 有内容：显示发送按钮 -->
+          <button
+            class="ia-send ready"
+            onclick={sendMessage}
+            disabled={isInteractionBlocking || isModeSyncing}
+            title={isModeSyncing ? '模式切换中' : (isSending ? '发送补充指令 (⌘+Enter)' : '发送 (⌘+Enter)')}
+          >
+            <Icon name="send" size={14} />
+          </button>
+        {:else if isSending}
+          <!-- 无内容 + 运行中：显示停止按钮 -->
           <button class="ia-send stop" onclick={stopTask} title="停止">
             <Icon name="stop" size={14} />
           </button>
-          {#if hasContent}
-            <button
-              class="ia-send ready"
-              onclick={sendMessage}
-              disabled={isInteractionBlocking || isModeSyncing}
-              title={isModeSyncing ? '模式切换中' : '打断并重启 (⌘+Enter)'}
-            >
-              <Icon name="send" size={14} />
-            </button>
-          {/if}
         {:else}
+          <!-- 无内容 + 空闲：显示禁用的发送按钮 -->
           <button
             class="ia-send"
-            class:ready={hasContent && !isInteractionBlocking && !isModeSyncing}
-            onclick={sendMessage}
-            disabled={!hasContent || isInteractionBlocking || isModeSyncing}
-            title={isModeSyncing
-              ? '模式切换中'
-              : (isInteractionBlocking ? `等待：${activeInteraction}` : '发送 (⌘+Enter)')}
+            disabled
+            title="发送 (⌘+Enter)"
           >
             <Icon name="send" size={14} />
           </button>

@@ -39,7 +39,7 @@ import {
   clearAllRequestBindings,
   clearProcessingState,
 } from '../stores/messages.svelte';
-import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, Edit, ModelStatusMap } from '../types/message';
+import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, SubTaskItem, Edit, ModelStatusMap } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
 import { MessageType, MessageCategory } from '../../../../protocol/message-protocol';
 import { routeStandardMessage, getMessageTarget, clearMessageTargets, clearMessageTarget, setMessageTarget } from './message-router';
@@ -338,9 +338,10 @@ function handleStateUpdate(message: WebviewMessage) {
   const store = getState();
   const taskSeen = new Set<string>();
   store.tasks = ensureArray(state.tasks)
-    .filter((task): task is Task => !!task && typeof task === 'object' && typeof (task as Task).status === 'string')
+    .filter((task): task is Record<string, unknown> => !!task && typeof task === 'object' && typeof (task as Record<string, unknown>).status === 'string')
     .map((task) => {
-      const id = typeof task.id === 'string' && task.id.trim() ? task.id.trim() : '';
+      const raw = task as Record<string, unknown>;
+      const id = typeof raw.id === 'string' && (raw.id as string).trim() ? (raw.id as string).trim() : '';
       if (!id) {
         throw new Error('[MessageHandler] Task 缺少 id');
       }
@@ -348,12 +349,32 @@ function handleStateUpdate(message: WebviewMessage) {
         throw new Error(`[MessageHandler] Task id 重复: ${id}`);
       }
       taskSeen.add(id);
+      const subTasks: SubTaskItem[] = ensureArray(raw.subTasks)
+        .filter((st): st is Record<string, unknown> => !!st && typeof st === 'object')
+        .map((st) => ({
+          id: String(st.id || ''),
+          description: String(st.description || ''),
+          title: typeof st.title === 'string' ? st.title : undefined,
+          assignedWorker: String(st.assignedWorker || ''),
+          assignmentId: String(st.assignmentId || ''),
+          status: String(st.status || 'pending') as SubTaskItem['status'],
+          progress: typeof st.progress === 'number' ? st.progress : 0,
+          priority: typeof st.priority === 'number' ? st.priority : 3,
+          targetFiles: Array.isArray(st.targetFiles) ? st.targetFiles as string[] : [],
+          modifiedFiles: Array.isArray(st.modifiedFiles) ? st.modifiedFiles as string[] : undefined,
+          error: typeof st.error === 'string' ? st.error : undefined,
+          startedAt: typeof st.startedAt === 'number' ? st.startedAt : undefined,
+          completedAt: typeof st.completedAt === 'number' ? st.completedAt : undefined,
+        }));
       return {
         id,
-      name: task.name || task.prompt || '',
-      description: task.description,
-      status: task.status,
-      };
+        name: String(raw.name || raw.prompt || ''),
+        description: typeof raw.description === 'string' ? raw.description : undefined,
+        status: String(raw.status) as Task['status'],
+        subTasks,
+        progress: typeof raw.progress === 'number' ? raw.progress : 0,
+        missionId: typeof raw.missionId === 'string' ? raw.missionId : id,
+      } satisfies Task;
     });
   const editSeen = new Set<string>();
   store.edits = ensureArray(state.pendingChanges)
@@ -1904,6 +1925,7 @@ function handleTodoStarted(message: WebviewMessage) {
     ...todo,
     status: 'in_progress',
   }));
+  syncSubTaskStatus(todoId, 'in_progress');
 }
 
 function handleTodoCompleted(message: WebviewMessage) {
@@ -1919,6 +1941,7 @@ function handleTodoCompleted(message: WebviewMessage) {
     ...todo,
     status: 'completed',
   }));
+  syncSubTaskStatus(todoId, 'completed');
 }
 
 function handleTodoFailed(message: WebviewMessage) {
@@ -1934,6 +1957,7 @@ function handleTodoFailed(message: WebviewMessage) {
     ...todo,
     status: 'failed',
   }));
+  syncSubTaskStatus(todoId, 'failed');
 }
 
 function handleDynamicTodoAdded(message: WebviewMessage) {
@@ -1967,6 +1991,24 @@ function handleDynamicTodoAdded(message: WebviewMessage) {
     ...assignment,
     todos: [...assignment.todos, newTodo],
   }));
+  // 同步到 store.tasks：遍历 missionPlan Map 查找包含该 assignmentId 的 plan
+  const planMap = getState().missionPlan;
+  for (const [, plan] of planMap) {
+    if (plan.assignments.some(a => a.id === assignmentId)) {
+      const newSubTask: SubTaskItem = {
+        id: todoId,
+        description: newTodo.content,
+        assignedWorker: todo?.workerId || '',
+        assignmentId,
+        status: (newTodo.status || 'pending') as SubTaskItem['status'],
+        progress: 0,
+        priority: newTodo.priority,
+        targetFiles: [],
+      };
+      syncSubTaskAdd(plan.missionId, newSubTask);
+      break;
+    }
+  }
 }
 
 function handleTodoApprovalRequested(message: WebviewMessage) {
@@ -2071,14 +2113,17 @@ function hasRenderableContent(message: Message): boolean {
 
 function updateAssignmentPlan(assignmentId: string, updater: (assignment: AssignmentPlan) => AssignmentPlan) {
   const store = getState();
-  const plan = store.missionPlan;
-  if (!plan) return;
-  const index = plan.assignments.findIndex((a) => a.id === assignmentId);
-  if (index === -1) return;
-  const nextAssignments = plan.assignments.map((assignment, i) =>
-    i === index ? updater(assignment) : assignment
-  );
-  setMissionPlan({ ...plan, assignments: nextAssignments });
+  const planMap = store.missionPlan;
+  for (const [missionId, plan] of planMap) {
+    const index = plan.assignments.findIndex((a) => a.id === assignmentId);
+    if (index !== -1) {
+      const nextAssignments = plan.assignments.map((assignment, i) =>
+        i === index ? updater(assignment) : assignment
+      );
+      setMissionPlan({ ...plan, assignments: nextAssignments });
+      return;
+    }
+  }
 }
 
 function updateTodo(
@@ -2101,6 +2146,51 @@ function updateTodo(
     }
     const nextTodos = assignment.todos.map((todo, i) => (i === idx ? updater(todo) : todo));
     return { ...assignment, todos: nextTodos };
+  });
+}
+
+/**
+ * 增量同步 store.tasks 中的 subTask 状态
+ * 当增量事件到达时，直接更新 tasks 中对应 subTask 的 status，
+ * 避免等待下次 stateUpdate 全量同步才更新 UI
+ */
+function syncSubTaskStatus(todoId: string, status: SubTaskItem['status']): void {
+  const store = getState();
+  const tasksList = store.tasks;
+  for (let ti = 0; ti < tasksList.length; ti++) {
+    const task = tasksList[ti];
+    const subTasks = task.subTasks;
+    for (let si = 0; si < subTasks.length; si++) {
+      if (subTasks[si].id === todoId) {
+        const updatedSubTasks = subTasks.map((st, idx) =>
+          idx === si ? { ...st, status } : st
+        );
+        const completedCount = updatedSubTasks.filter(
+          st => st.status === 'completed' || st.status === 'skipped'
+        ).length;
+        const progress = updatedSubTasks.length > 0
+          ? Math.round((completedCount / updatedSubTasks.length) * 100)
+          : task.progress;
+        store.tasks = tasksList.map((t, idx) =>
+          idx === ti ? { ...t, subTasks: updatedSubTasks, progress } : t
+        );
+        return;
+      }
+    }
+  }
+}
+
+/**
+ * 增量向 store.tasks 添加动态 subTask
+ */
+function syncSubTaskAdd(missionId: string, subTask: SubTaskItem): void {
+  const store = getState();
+  store.tasks = store.tasks.map(task => {
+    if (task.missionId !== missionId && task.id !== missionId) return task;
+    // 防重复
+    if (task.subTasks.some(st => st.id === subTask.id)) return task;
+    const updatedSubTasks = [...task.subTasks, subTask];
+    return { ...task, subTasks: updatedSubTasks };
   });
 }
 

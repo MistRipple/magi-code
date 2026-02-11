@@ -739,6 +739,10 @@ IMPORTANT:
     }
 
     const previous = this.undoStack.get(filePath)!;
+
+    // 快照回调（undo 也是文件变更，需要在写入前记录原始状态）
+    this.onBeforeWrite?.(filePath);
+
     await fs.writeFile(filePath, previous, 'utf-8');
     this.undoStack.delete(filePath);
 
