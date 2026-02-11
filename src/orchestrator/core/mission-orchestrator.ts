@@ -47,13 +47,6 @@ import { AutonomousWorker, AutonomousExecutionResult } from '../worker';
 import { TodoManager } from '../../todo';
 import type { UnifiedTodo } from '../../todo/types';
 import type { ReportCallback } from '../protocols/worker-report';
-import {
-  ExecutionCoordinator,
-  TaskPreAnalyzer,
-  ExecutionStrategy,
-  OrchestratorResponder,
-} from './executors';
-import { BlockedItem } from './executors/blocking-manager';
 import { TokenUsage } from '../../types/agent-types';
 
 /**
@@ -90,9 +83,9 @@ export interface ExecutionOptions {
   /** 进度回调 */
   onProgress?: (progress: ExecutionProgress) => void;
   /** 阻塞回调 */
-  onBlocked?: (blockedItem: BlockedItem) => void;
+  onBlocked?: (blockedItem: any) => void;
   /** 解除阻塞回调 */
-  onUnblocked?: (blockedItem: BlockedItem) => void;
+  onUnblocked?: (blockedItem: any) => void;
   /** Worker 汇报回调 */
   onReport?: ReportCallback;
   /** 汇报超时(ms) */
@@ -115,7 +108,7 @@ export interface ExecutionProgress {
     workerId: WorkerSlot;
     progress: number;
   };
-  blockedItems: BlockedItem[];
+  blockedItems: any[];
   overallProgress: number;
 }
 
@@ -127,8 +120,8 @@ export interface ExecutionResult {
   success: boolean;
   assignmentResults: Map<string, AutonomousExecutionResult>;
   contractVerifications: Map<string, boolean>;
-  blockedItems: BlockedItem[];
-  resolvedBlockings: BlockedItem[];
+  blockedItems: any[];
+  resolvedBlockings: any[];
   errors: string[];
   duration: number;
   /** 聚合的 Token 使用统计 */
@@ -218,11 +211,8 @@ export class MissionOrchestrator extends EventEmitter {
   private verificationRunner?: VerificationRunner;
   private intentGate?: IntentGate;
   private snapshotManager?: SnapshotManager;
-  private contextManager?: ContextManager;
-  private adapterFactory?: IAdapterFactory;
-
-  // 智能执行组件
-  private taskPreAnalyzer?: TaskPreAnalyzer;
+  private contextManager: ContextManager;
+  private adapterFactory: IAdapterFactory;
 
   // 项目知识库
   private projectKnowledgeBase?: import('../../knowledge/project-knowledge-base').ProjectKnowledgeBase;
@@ -241,10 +231,16 @@ export class MissionOrchestrator extends EventEmitter {
   constructor(
     private profileLoader: ProfileLoader,
     private guidanceInjector: GuidanceInjector,
+    adapterFactory: IAdapterFactory,
+    contextManager: ContextManager,
     storage?: MissionStorageManager,
-    private workspaceRoot?: string
+    private workspaceRoot?: string,
+    snapshotManager?: SnapshotManager,
   ) {
     super();
+    this.adapterFactory = adapterFactory;
+    this.contextManager = contextManager;
+    this.snapshotManager = snapshotManager;
     this.storage = storage || new MissionStorageManager();
     this.contractManager = new ContractManager();
     this.assignmentManager = new AssignmentManager(profileLoader, guidanceInjector);
@@ -253,18 +249,9 @@ export class MissionOrchestrator extends EventEmitter {
 
     if (workspaceRoot) {
       this.verificationRunner = new VerificationRunner(workspaceRoot);
-      this.contextManager = new ContextManager(workspaceRoot);
     }
 
     this.setupStorageListeners();
-  }
-
-  /**
-   * 设置 SnapshotManager
-   * 用于文件快照和回滚
-   */
-  setSnapshotManager(snapshotManager: SnapshotManager): void {
-    this.snapshotManager = snapshotManager;
   }
 
   /**
@@ -275,27 +262,10 @@ export class MissionOrchestrator extends EventEmitter {
   }
 
   /**
-   * 设置 ContextManager
-   * 用于上下文管理
-   */
-  setContextManager(contextManager: ContextManager): void {
-    this.contextManager = contextManager;
-  }
-
-  /**
    * 获取 ContextManager
    */
   getContextManager(): ContextManager | undefined {
     return this.contextManager;
-  }
-
-  /**
-   * 设置 AdapterFactory
-   */
-  setAdapterFactory(adapterFactory: IAdapterFactory): void {
-    this.adapterFactory = adapterFactory;
-    // 初始化智能执行组件
-    this.taskPreAnalyzer = new TaskPreAnalyzer(adapterFactory);
   }
 
   /**
@@ -658,7 +628,7 @@ export class MissionOrchestrator extends EventEmitter {
   private getConnectedWorkers(allProfiles: Map<WorkerSlot, unknown>): Set<WorkerSlot> {
     const connected = new Set<WorkerSlot>();
     for (const worker of allProfiles.keys()) {
-      if (!this.adapterFactory || this.isWorkerAvailable(worker)) {
+      if (this.isWorkerAvailable(worker)) {
         connected.add(worker);
       }
     }
@@ -666,9 +636,6 @@ export class MissionOrchestrator extends EventEmitter {
   }
 
   private isWorkerAvailable(worker: WorkerSlot): boolean {
-    if (!this.adapterFactory) {
-      return true;
-    }
     if (this.adapterFactory.isConnected(worker)) {
       return true;
     }
@@ -772,7 +739,7 @@ export class MissionOrchestrator extends EventEmitter {
       }
     }
 
-    const memory = this.contextManager?.getMemoryDocument()?.getContent();
+    const memory = this.contextManager.getMemoryDocument()?.getContent();
     if (memory) {
       if (memory.keyDecisions?.length) {
         taskInfo.relatedDecisions = memory.keyDecisions
@@ -795,59 +762,6 @@ export class MissionOrchestrator extends EventEmitter {
       (taskInfo.pendingIssues && taskInfo.pendingIssues.length > 0);
 
     return hasContent ? taskInfo : undefined;
-  }
-
-  /**
-   * 完整规划流程
-   * 一次性完成从目标理解到职责分配
-   */
-  async planMission(
-    mission: Mission,
-    goalAnalysis: {
-      goal: string;
-      analysis: string;
-      constraints?: string[];
-      acceptanceCriteria?: string[];
-      riskLevel?: 'low' | 'medium' | 'high';
-      riskFactors?: string[];
-    },
-    options?: PlanningOptions
-  ): Promise<MissionCreationResult> {
-    // 1. 理解目标
-    mission = await this.understandGoal(mission, goalAnalysis);
-
-    // 2. 选择参与者
-    const participants = options?.participants ||
-      await this.selectParticipants(mission);
-
-    // 3. 定义契约
-    const contracts = await this.defineContracts(mission, participants);
-
-    // 4. 分配职责
-    const assignments = await this.assignResponsibilities(mission, participants);
-
-    // 5. 评审规划
-    const reviewResult = await this.reviewer.reviewPlan(mission);
-
-    if (reviewResult.issues.length > 0) {
-      this.emit('planReviewIssues', {
-        missionId: mission.id,
-        issues: reviewResult.issues,
-        suggestions: reviewResult.suggestions,
-      });
-    }
-
-    // 6. 更新状态
-    if (options?.requireApproval) {
-      mission.status = 'pending_approval';
-    } else {
-      mission.status = 'planning';
-    }
-    await this.storage.update(mission);
-
-    this.emit('missionPlanned', { mission, contracts, assignments });
-
-    return { mission, contracts, assignments };
   }
 
   /**
@@ -1353,10 +1267,6 @@ export class MissionOrchestrator extends EventEmitter {
    * 记录：任务状态、关键决策、代码变更、失败原因
    */
   private async writeExecutionToMemory(mission: Mission): Promise<void> {
-    if (!this.contextManager) {
-      return;
-    }
-
     const memory = this.contextManager.getMemoryDocument();
     if (!memory) {
       return;
@@ -1560,20 +1470,6 @@ export class MissionOrchestrator extends EventEmitter {
     return summary;
   }
 
-  /**
-   * 设置 VerificationRunner
-   */
-  setVerificationRunner(runner: VerificationRunner): void {
-    this.verificationRunner = runner;
-  }
-
-  /**
-   * 获取 VerificationRunner
-   */
-  getVerificationRunner(): VerificationRunner | undefined {
-    return this.verificationRunner;
-  }
-
   // ============================================================================
   // 缓存管理
   // ============================================================================
@@ -1656,9 +1552,6 @@ export class MissionOrchestrator extends EventEmitter {
   private async ensureWorker(workerSlot: WorkerSlot): Promise<AutonomousWorker> {
     let worker = this.workers.get(workerSlot);
     if (!worker) {
-      if (!this.adapterFactory) {
-        throw new Error(`未配置 AdapterFactory，无法创建 Worker: ${workerSlot}`);
-      }
       // 确保 TodoManager 存在
       if (!this.todoManager && this.workspaceRoot) {
         try {
@@ -1682,9 +1575,6 @@ export class MissionOrchestrator extends EventEmitter {
         throw new Error('未配置 TodoManager，无法创建 Worker');
       }
       // 确保 ContextManager 存在以获取共享上下文依赖
-      if (!this.contextManager) {
-        throw new Error('未配置 ContextManager，无法创建 Worker');
-      }
       const sharedContextDeps = {
         contextAssembler: this.contextManager.getContextAssembler(),
         fileSummaryCache: this.contextManager.getFileSummaryCache(),
@@ -1723,195 +1613,6 @@ export class MissionOrchestrator extends EventEmitter {
       logger.info('编排器.Worker.创建', { workerSlot }, LogCategory.ORCHESTRATOR);
     }
     return worker;
-  }
-
-  /**
-   * 执行 Mission
-   * 合并自 MissionExecutor.execute()
-   *
-   * 智能编排：
-   * 1. 使用 TaskPreAnalyzer 分析任务特性
-   * 2. 根据分析结果动态选择执行阶段
-   * 3. 使用 OrchestratorResponder 处理 Worker 汇报
-   */
-  async execute(
-    mission: Mission,
-    options: ExecutionOptions
-  ): Promise<ExecutionResult> {
-    if (!this.adapterFactory) {
-      throw new Error('未配置 AdapterFactory，无法执行任务');
-    }
-
-    const startTime = Date.now();
-    this.currentMissionId = mission.id;
-
-    this.emit('executionStarted', { missionId: mission.id });
-
-    // ========== 智能编排：任务预分析 ==========
-    if (!this.taskPreAnalyzer) {
-      throw new Error('未配置 TaskPreAnalyzer，无法执行任务');
-    }
-    const strategy = await this.taskPreAnalyzer.analyze(mission, {
-      projectContext: options.projectContext,
-    });
-
-    logger.info('任务预分析完成', {
-      complexity: strategy.complexity,
-      needsPlanning: strategy.needsPlanning,
-      needsReview: strategy.needsReview,
-      needsVerification: strategy.needsVerification,
-    }, LogCategory.ORCHESTRATOR);
-
-    // 发送分析摘要到 UI
-    this.emit('analysisComplete', {
-      missionId: mission.id,
-      strategy,
-    });
-
-    // 确保所有 Worker 存在
-    for (const assignment of mission.assignments) {
-      await this.ensureWorker(assignment.workerId);
-    }
-
-    // ========== 创建智能响应器 ==========
-    const responder = new OrchestratorResponder(
-      this.adapterFactory,
-      mission,
-      { useLLM: true }
-    );
-
-    // 创建 ExecutionCoordinator 并执行
-    const coordinator = new ExecutionCoordinator(
-      this.workers,
-      this.adapterFactory,
-      this.profileLoader,
-      this.reviewer,
-      this.snapshotManager || null,
-      this.workspaceRoot || '',
-      mission,
-      this.todoManager!
-    );
-
-    // 设置 ContextManager
-    if (this.contextManager) {
-      coordinator.setContextManager(this.contextManager);
-    }
-
-    // 统一 Todo 系统：不再需要 TaskManager
-    // Assignments 信息通过 Todo 系统传递给 UI
-
-    // 转发事件
-    coordinator.on('progress', (progress) => {
-      this.emit('progress', progress);
-      options.onProgress?.(progress);
-    });
-
-    coordinator.on('blocked', (blockedItem: BlockedItem) => {
-      this.emit('blocked', blockedItem);
-      options.onBlocked?.(blockedItem);
-    });
-
-    coordinator.on('unblocked', (blockedItem: BlockedItem) => {
-      this.emit('unblocked', blockedItem);
-      options.onUnblocked?.(blockedItem);
-    });
-
-    coordinator.on('assignmentStarted', (data: { assignmentId: string; missionId: string; workerId: WorkerSlot }) => {
-      this.emit('assignmentStarted', data);
-    });
-
-    coordinator.on('assignmentPlanned', (data: { missionId: string; assignmentId: string; todos: UnifiedTodo[] }) => {
-      this.emit('assignmentPlanned', data);
-    });
-
-    coordinator.on('assignmentCompleted', (data: { assignmentId: string; missionId: string; workerId: WorkerSlot; success: boolean }) => {
-      this.emit('assignmentCompleted', data);
-    });
-
-    try {
-      // ========== 构建智能执行选项 ==========
-      // 注意：简单任务不创建 Todo，Worker 直接执行 assignment.responsibility
-      // Todo 系统仅用于复杂多步骤任务，由编排者 LLM 语义理解决定
-      const parallel = typeof options.parallel === 'boolean' ? options.parallel : strategy.parallel;
-      const executeOptions = {
-        workingDirectory: options.workingDirectory,
-        timeout: options.timeout,
-        projectContext: options.projectContext,
-        parallel,
-        useWaveExecution: options.useWaveExecution,
-        parallelPlanning: options.parallelPlanning,
-        blockingTimeout: options.blockingTimeout,
-        blockingCheckInterval: options.blockingCheckInterval,
-        onOutput: options.onOutput,
-        onReport: options.onReport ?? (async (report) => responder.handleReport(report)),
-        reportTimeout: options.reportTimeout,
-        getSupplementaryInstructions: options.getSupplementaryInstructions,
-        // ========== 智能执行策略 ==========
-        needsPlanning: strategy.needsPlanning,
-        needsReview: strategy.needsReview,
-        needsVerification: strategy.needsVerification,
-        // ========== SubTask 同步 ==========
-        taskId: mission.externalTaskId,
-      };
-
-      const coordResult = await coordinator.execute(executeOptions);
-
-      // 完成、暂停或失败 Mission
-      if (coordResult.success) {
-        if (coordResult.hasPendingApprovals) {
-          // 暂停任务等待审批
-          mission.status = 'pending_approval';
-          await this.storage.update(mission);
-          logger.info('Mission 等待审批', { missionId: mission.id }, LogCategory.ORCHESTRATOR);
-          this.emit('missionStatusChanged', { 
-            missionId: mission.id, 
-            oldStatus: 'executing', 
-            newStatus: 'pending_approval' 
-          });
-        } else {
-          await this.completeMission(mission.id, mission);
-        }
-      } else {
-        await this.failMission(mission.id, coordResult.errors.join('; '), mission);
-      }
-
-      // 构建执行结果
-      const result: ExecutionResult = {
-        mission,
-        success: coordResult.success,
-        assignmentResults: coordResult.assignmentResults, // 使用 ExecutionCoordinator 返回的详细结果
-        contractVerifications: new Map(),
-        blockedItems: [],
-        resolvedBlockings: [],
-        errors: coordResult.errors,
-        duration: Date.now() - startTime,
-        tokenUsage: coordResult.tokenUsage,
-        hasPendingApprovals: coordResult.hasPendingApprovals,
-      };
-
-      this.emit('executionCompleted', result);
-      this.currentMissionId = null;
-
-      return result;
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-
-      await this.failMission(mission.id, errorMessage, mission);
-
-      this.emit('executionFailed', { missionId: mission.id, error: errorMessage });
-      this.currentMissionId = null;
-
-      return {
-        mission,
-        success: false,
-        assignmentResults: new Map(),
-        contractVerifications: new Map(),
-        blockedItems: [],
-        resolvedBlockings: [],
-        errors: [errorMessage],
-        duration: Date.now() - startTime,
-      };
-    }
   }
 
   /**
@@ -1957,6 +1658,14 @@ export class MissionOrchestrator extends EventEmitter {
    */
   getCurrentMissionId(): string | null {
     return this.currentMissionId;
+  }
+
+  /**
+   * 设置当前 Mission ID（供 DispatchManager 编排模式使用）
+   * 确保 Worker 转发的 Todo 事件能关联到正确的 Mission
+   */
+  setCurrentMissionId(missionId: string | null): void {
+    this.currentMissionId = missionId;
   }
 
   /**

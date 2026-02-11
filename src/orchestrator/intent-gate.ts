@@ -1,7 +1,7 @@
 /**
  * Intent Gate - 意图门控（AI 决策版）
  *
- * 定位：Layer 3（plan_mission 路径）的前置意图分类器。
+ * 定位：MissionOrchestrator 的前置意图分类器。
  * 在 MissionOrchestrator.processRequest() 中被调用，用于决定处理模式：
  *   - ASK/DIRECT/EXPLORE → 跳过 Mission 创建，直接响应
  *   - TASK/DEMO → 进入完整 Mission 流程

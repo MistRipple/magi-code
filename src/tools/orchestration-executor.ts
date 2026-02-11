@@ -1,10 +1,9 @@
 /**
  * 编排工具执行器
- * 提供 dispatch_task、plan_mission、send_worker_message 三个元工具
+ * 提供 dispatch_task、send_worker_message 两个元工具
  *
  * 这些工具使 orchestrator LLM 能够：
  * - dispatch_task: 将子任务分配给专业 Worker 执行
- * - plan_mission: 为复杂多 Worker 任务创建协作执行计划
  * - send_worker_message: 向 Worker 面板发送消息
  */
 
@@ -30,20 +29,6 @@ export type DispatchTaskHandler = (params: {
 }>;
 
 /**
- * plan_mission 回调：由 MissionDrivenEngine 注入，创建 Mission 并执行规划
- */
-export type PlanMissionHandler = (params: {
-  goal: string;
-  constraints?: string[];
-  workers?: WorkerSlot[];
-}) => Promise<{
-  success: boolean;
-  missionId?: string;
-  summary: string;
-  errors?: string[];
-}>;
-
-/**
  * send_worker_message 回调：由 MissionDrivenEngine 注入，向 Worker 面板发送消息
  */
 export type SendWorkerMessageHandler = (params: {
@@ -58,12 +43,11 @@ export type SendWorkerMessageHandler = (params: {
  */
 export class OrchestrationExecutor {
   private dispatchHandler?: DispatchTaskHandler;
-  private planHandler?: PlanMissionHandler;
   private sendMessageHandler?: SendWorkerMessageHandler;
   /** 动态 Worker 列表（必须由 MissionDrivenEngine 从 ProfileLoader 注入） */
   private availableWorkers: { slot: WorkerSlot; description: string }[] = [];
 
-  private static readonly TOOL_NAMES = ['dispatch_task', 'plan_mission', 'send_worker_message'] as const;
+  private static readonly TOOL_NAMES = ['dispatch_task', 'send_worker_message'] as const;
 
   /**
    * 设置可用 Worker 列表（由 MissionDrivenEngine 从 ProfileLoader 注入）
@@ -90,11 +74,9 @@ export class OrchestrationExecutor {
    */
   setHandlers(handlers: {
     dispatch?: DispatchTaskHandler;
-    plan?: PlanMissionHandler;
     sendMessage?: SendWorkerMessageHandler;
   }): void {
     this.dispatchHandler = handlers.dispatch;
-    this.planHandler = handlers.plan;
     this.sendMessageHandler = handlers.sendMessage;
   }
 
@@ -111,7 +93,6 @@ export class OrchestrationExecutor {
   getToolDefinitions(): ExtendedToolDefinition[] {
     return [
       this.getDispatchTaskDefinition(),
-      this.getPlanMissionDefinition(),
       this.getSendWorkerMessageDefinition(),
     ];
   }
@@ -128,8 +109,6 @@ export class OrchestrationExecutor {
     switch (toolCall.name) {
       case 'dispatch_task':
         return this.executeDispatchTask(toolCall);
-      case 'plan_mission':
-        return this.executePlanMission(toolCall);
       case 'send_worker_message':
         return this.executeSendWorkerMessage(toolCall);
       default:
@@ -235,92 +214,6 @@ export class OrchestrationExecutor {
       return {
         toolCallId: toolCall.id,
         content: `dispatch_task failed: ${error.message}`,
-        isError: true,
-      };
-    }
-  }
-
-  // ===========================================================================
-  // plan_mission
-  // ===========================================================================
-
-  private getPlanMissionDefinition(): ExtendedToolDefinition {
-    return {
-      name: 'plan_mission',
-      description: '为复杂的多步骤任务创建协作执行计划。适用于需要多个 Worker 协作、涉及架构变更、或需要用户审批的重大任务。会生成详细的任务分解、Worker 间协作契约和验收标准，并征求用户确认。',
-      input_schema: {
-        type: 'object',
-        properties: {
-          goal: {
-            type: 'string',
-            description: '任务目标的完整描述',
-          },
-          constraints: {
-            type: 'array',
-            items: { type: 'string' },
-            description: '约束条件',
-          },
-          workers: {
-            type: 'array',
-            items: {
-              type: 'string',
-              enum: this.getWorkerEnum(),
-            },
-            description: '建议参与的 Worker',
-          },
-        },
-        required: ['goal'],
-      },
-      metadata: {
-        source: 'builtin',
-        category: 'orchestration',
-        tags: ['orchestration', 'mission', 'planning'],
-      },
-    };
-  }
-
-  private async executePlanMission(toolCall: ToolCall): Promise<ToolResult> {
-    if (!this.planHandler) {
-      return {
-        toolCallId: toolCall.id,
-        content: 'plan_mission handler not configured',
-        isError: true,
-      };
-    }
-
-    const args = toolCall.arguments as { goal: string; constraints?: string[]; workers?: string[] };
-
-    if (!args.goal) {
-      return {
-        toolCallId: toolCall.id,
-        content: 'Error: goal is required',
-        isError: true,
-      };
-    }
-
-    logger.info('plan_mission 开始', {
-      goalPreview: args.goal.substring(0, 80),
-      constraints: args.constraints,
-      workers: args.workers,
-    }, LogCategory.TOOLS);
-
-    try {
-      const result = await this.planHandler({
-        goal: args.goal,
-        constraints: args.constraints,
-        workers: args.workers as WorkerSlot[] | undefined,
-      });
-
-      return {
-        toolCallId: toolCall.id,
-        content: JSON.stringify(result),
-        isError: !result.success,
-      };
-    } catch (error: any) {
-      logger.error('plan_mission 执行失败', { error: error.message }, LogCategory.TOOLS);
-      return {
-        toolCallId: toolCall.id,
-        content: `plan_mission failed: ${error.message}`,
         isError: true,
       };
     }

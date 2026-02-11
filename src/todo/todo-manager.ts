@@ -482,6 +482,11 @@ export class TodoManager extends EventEmitter {
 
     // 触发依赖此 Todo 的其他 Todos 检查
     await this.triggerDependentTodos(todoId);
+
+    // 如果是二级 Todo 完成，检查是否可以自动 complete 一级 Todo
+    if (todo.parentId) {
+      await this.tryCompleteParent(todo.parentId);
+    }
   }
 
   /**
@@ -521,6 +526,11 @@ export class TodoManager extends EventEmitter {
 
     // 触发依赖此 Todo 的其他 Todos 检查
     await this.triggerDependentTodos(todoId);
+
+    // 如果是二级 Todo 被跳过，检查是否可以自动 complete 一级 Todo
+    if (todo.parentId) {
+      await this.tryCompleteParent(todo.parentId);
+    }
   }
 
   /**
@@ -552,6 +562,30 @@ export class TodoManager extends EventEmitter {
   }
 
   /**
+   * 重置 Todo 为 pending 状态（用于 WorkerPipeline 强制重试）
+   *
+   * 与 retry() 不同，此方法接受 completed 和 failed 两种状态，
+   * 且不增加 retryCount（因为这是外部治理层发起的重试，不是 Todo 自身的错误恢复）。
+   */
+  async resetToPending(todoId: string): Promise<void> {
+    const todo = await this.get(todoId);
+    if (!todo) return;
+
+    if (todo.status !== 'completed' && todo.status !== 'failed') {
+      return; // 仅重置已完成或已失败的 Todo
+    }
+
+    todo.status = 'pending';
+    todo.completedAt = undefined;
+    todo.output = undefined;
+    todo.error = undefined;
+    todo.progress = 0;
+
+    await this.repository.save(todo);
+    await this.checkAndUpdateStatus(todo);
+  }
+
+  /**
    * 触发依赖此 Todo 的其他 Todos 检查
    */
   private async triggerDependentTodos(todoId: string): Promise<void> {
@@ -561,6 +595,39 @@ export class TodoManager extends EventEmitter {
         await this.checkAndUpdateStatus(todo);
       }
     }
+  }
+
+  /**
+   * 检查父 Todo 的所有子 Todo 是否都已完成
+   * 如果是，自动将父 Todo 标记为 completed
+   */
+  private async tryCompleteParent(parentId: string): Promise<void> {
+    const parent = await this.get(parentId);
+    if (!parent || parent.status === 'completed') return;
+
+    // 查找所有子 Todo（同一 assignmentId + parentId 匹配）
+    const allTodos = await this.repository.query({ assignmentId: parent.assignmentId });
+    const children = allTodos.filter(t => t.parentId === parentId);
+    if (children.length === 0) return;
+
+    const allDone = children.every(c =>
+      c.status === 'completed' || c.status === 'skipped'
+    );
+    if (!allDone) return;
+
+    // 所有子 Todo 完成，自动 complete 父 Todo
+    // 先确保父 Todo 处于 running 状态（满足 complete() 的前置条件）
+    if (parent.status !== 'running') {
+      parent.status = 'running';
+      await this.repository.save(parent);
+    }
+
+    await this.complete(parentId, {
+      success: true,
+      summary: `所有 ${children.length} 个子步骤已完成`,
+      modifiedFiles: children.flatMap(c => c.output?.modifiedFiles || []),
+      duration: Date.now() - (parent.startedAt || parent.createdAt),
+    });
   }
 
   // ============================================================================

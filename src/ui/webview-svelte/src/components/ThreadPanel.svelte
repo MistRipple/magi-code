@@ -32,13 +32,21 @@
 </script>
 
 <div class="thread-panel">
-  <!-- 消息内容区域（使用 position: relative 让滚动按钮相对于消息区域定位） -->
+  <!-- 消息内容区域：四个面板同时存在，CSS 控制显隐 -->
+  <!-- 每个 Worker 拥有独立的 MessageList 实例和计时器状态 -->
   <div class="main-content">
-    {#if activeBottomTab === 'thread'}
+    <div class="tab-pane" class:active={activeBottomTab === 'thread'}>
       <MessageList {messages} />
-    {:else}
-      <AgentTab messages={agentOutputs[activeBottomTab] || []} />
-    {/if}
+    </div>
+    <div class="tab-pane" class:active={activeBottomTab === 'claude'}>
+      <AgentTab messages={agentOutputs.claude} />
+    </div>
+    <div class="tab-pane" class:active={activeBottomTab === 'codex'}>
+      <AgentTab messages={agentOutputs.codex} />
+    </div>
+    <div class="tab-pane" class:active={activeBottomTab === 'gemini'}>
+      <AgentTab messages={agentOutputs.gemini} />
+    </div>
   </div>
 
   <!-- 底部 Agent Tab 栏 - 在输入框上方 -->
@@ -62,5 +70,17 @@
     min-height: 0; /* flex 布局防溢出 */
     overflow: hidden;
     position: relative;
+  }
+
+  /* 面板默认隐藏，激活时显示 */
+  .tab-pane {
+    display: none;
+    height: 100%;
+    min-height: 0;
+  }
+
+  .tab-pane.active {
+    display: flex;
+    flex-direction: column;
   }
 </style>

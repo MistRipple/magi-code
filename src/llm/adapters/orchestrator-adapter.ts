@@ -68,7 +68,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       adapterConfig.config,
       adapterConfig.messageHub  // 🔧 统一消息通道：使用 messageHub
     );
-    this.systemPrompt = adapterConfig.systemPrompt || this.getDefaultSystemPrompt();
+    this.systemPrompt = adapterConfig.systemPrompt ?? '';
     this.historyConfig = {
       maxMessages: adapterConfig.historyConfig?.maxMessages ?? 30,
       maxChars: adapterConfig.historyConfig?.maxChars ?? 80000,
@@ -306,31 +306,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     this.tempVisibility = visibility;
   }
 
-  /**
-   * 获取默认系统提示
-   */
-  private getDefaultSystemPrompt(): string {
-    return `你是 Magi 的任务编排者，负责协调多个专业 AI 协作完成开发任务。
 
-你的职责：
-1. 分析用户需求，拆解为可执行的子任务
-2. 将子任务分配给合适的 Worker（Claude、Codex、Gemini）
-3. 定义清晰的验收标准
-4. 监控执行进度，协调各 Worker 之间的协作
-5. 确保输出质量和一致性
-
-可用的 Worker：
-- Claude: 架构设计、代码重构、深度分析
-- Codex: 代码生成、API 集成、测试编写
-- Gemini: 前端 UI/UX、长文档分析、多模态理解
-
-执行原则：
-- 将复杂任务拆解为可管理的子任务
-- 根据 Worker 特长分配任务
-- 定义可测试的验收标准
-- 考虑子任务之间的依赖关系
-- 为 Worker 提供充分的上下文`;
-  }
 
   /**
    * 获取对话历史

@@ -2,9 +2,13 @@
   "name": "magi",
   "displayName": "Magi",
   "description": "多智能体工程编排系统 — 意图分析、任务拆解、异构专家协作",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "UNLICENSED",
   "publisher": "MistRipple",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MistRipple/magi"
+  },
   "engines": {
     "vscode": "^1.93.0"
   },
@@ -238,18 +242,7 @@
     "watch:extension": "node esbuild.mjs --watch",
     "build:webview": "cd src/ui/webview-svelte && npm run build",
     "watch:webview": "cd src/ui/webview-svelte && npm run dev",
-    "lint": "eslint src --ext ts",
-    "test": "node scripts/run-all-tests.js quick",
-    "test:quick": "node scripts/run-all-tests.js quick",
-    "test:full": "node scripts/run-all-tests.js full",
-    "test:unit": "node scripts/run-all-tests.js unit",
-    "test:e2e": "node scripts/run-all-tests.js e2e",
-    "test:websocket": "node scripts/websocket-quick-verify.js",
-    "test:websocket-full": "node scripts/websocket-integration-test.js",
-    "test:websocket-contract": "node scripts/websocket-contract-integration-test.js",
-    "verify:static": "node scripts/workflow-e2e-test.js && node scripts/validate-context-unified.js && node scripts/guard-orchestrator-context-api.js",
-    "verify:ci": "npm run verify:static && npm run compile && npm run regress:shared-context:real",
-    "regress:shared-context:real": "node scripts/real-multiworker-context-regression.js"
+    "lint": "eslint src --ext ts"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
@@ -268,11 +261,9 @@
     "axios": "^1.13.2",
     "diff": "^5.1.0",
     "highlight.js": "^11.11.1",
-    "inversify": "^7.11.0",
     "marked": "^17.0.1",
     "morphdom": "^2.7.8",
     "openai": "^6.16.0",
-    "reflect-metadata": "^0.2.2",
     "tiktoken": "^1.0.22",
     "turndown": "^7.2.2",
     "uuid": "^13.0.0"

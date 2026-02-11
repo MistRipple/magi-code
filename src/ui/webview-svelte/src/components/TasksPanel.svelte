@@ -220,7 +220,7 @@
                         <span class="todo-circle"></span>
                       {/if}
                     </span>
-                    <span class="todo-text">{todo.description || todo.content || '未命名'}</span>
+                    <span class="todo-text">{todo.description || '未命名'}</span>
                     {#if task.workerGroups.length <= 1 && group.workerId}
                       <span class="todo-worker" style="color: {workerColors[group.workerId] || 'var(--foreground-muted)'}">{group.workerId}</span>
                     {/if}

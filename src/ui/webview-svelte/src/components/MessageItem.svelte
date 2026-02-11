@@ -38,6 +38,7 @@
   const wasPlaceholder = $derived(Boolean(message.metadata?.wasPlaceholder));
   const justCompleted = $derived(Boolean(message.metadata?.justCompleted));
   const sendingAnimation = $derived(Boolean(message.metadata?.sendingAnimation));
+  const isSupplementary = $derived(Boolean(message.metadata?.isSupplementary));
 
   // 过滤无效的 blocks
   const safeBlocks = $derived(
@@ -127,7 +128,7 @@
   </div>
 <!-- 用户消息：简洁显示 -->
 {:else if isUser}
-  <div class="message-item user" class:sending={sendingAnimation} data-message-id={message.id} data-source="user">
+  <div class="message-item user" class:sending={sendingAnimation} class:supplementary={isSupplementary} data-message-id={message.id} data-source="user">
     <!-- 用户上传的图片缩略图 -->
     {#if messageImages.length > 0}
       <div class="user-images">
@@ -139,7 +140,10 @@
       </div>
     {/if}
     <div class="user-content">{message.content}</div>
-    <div class="user-time">{formatTime(message.timestamp)}</div>
+    <div class="user-time">
+      {#if isSupplementary}<span class="supplementary-tag">补充指令</span>{/if}
+      {formatTime(message.timestamp)}
+    </div>
   </div>
 <!-- subTaskCard 消息：直接显示卡片，不需要外层包裹 -->
 {:else if isSubTaskCardOnly}
@@ -337,6 +341,24 @@
     font-size: var(--text-xs);
     color: var(--foreground-muted);
     margin-top: var(--space-1);
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    justify-content: flex-end;
+  }
+
+  /* ===== 补充指令标签 ===== */
+  .supplementary-tag {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: var(--radius-sm);
+    background: var(--foreground-muted);
+    color: var(--background);
+    opacity: 0.7;
+  }
+  .message-item.user.supplementary .user-content {
+    background: var(--primary);
+    opacity: 0.85;
   }
 
   /* ===== SubTaskCard 独立样式（与 assistant 消息保持一致的间距） ===== */

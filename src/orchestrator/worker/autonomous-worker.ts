@@ -400,15 +400,6 @@ export class AutonomousWorker extends EventEmitter {
               await this.handleAdjustment(assignment, orchestratorResponse.adjustment);
             }
           }
-
-          // 检查是否需要动态添加 Todo
-          if (result.dynamicTodos && result.dynamicTodos.length > 0) {
-            dynamicTodos.push(...result.dynamicTodos);
-            // 将动态 Todo 添加到 assignment
-            for (const todo of result.dynamicTodos) {
-              assignment.todos.push(todo);
-            }
-          }
         } else {
           failedTodos.push(result.todo);
           errors.push(result.error || 'Unknown error');
@@ -472,7 +463,7 @@ export class AutonomousWorker extends EventEmitter {
       }
     }
 
-    const success = failedTodos.length === 0 && !aborted;
+    const success = completedTodos.length > 0 && failedTodos.length === 0 && !aborted;
     const result: AutonomousExecutionResult = {
       assignment,
       success,
@@ -627,29 +618,17 @@ export class AutonomousWorker extends EventEmitter {
       }
     }
 
-    // 处理新增步骤
+    // 处理新增步骤（统一走 addDynamicTodo → TodoManager，创建二级 Todo）
     if (adjustment.addSteps && adjustment.addSteps.length > 0) {
+      const parentTodo = assignment.todos.find(t => !t.parentId);
       for (const stepContent of adjustment.addSteps) {
-        const todo: UnifiedTodo = {
-          id: `adj-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
-          missionId: assignment.missionId,
-          assignmentId: assignment.id,
-          workerId: assignment.workerId,
-          content: stepContent,
-          reasoning: '编排者添加',
-          expectedOutput: '完成任务',
-          type: 'implementation',
-          priority: 3,
-          status: 'pending',
-          progress: 0,
-          dependsOn: [],
-          requiredContracts: [],
-          producesContracts: [],
-          outOfScope: false,
-          retryCount: 0,
-          maxRetries: 3,
-          createdAt: Date.now(),
-        };
+        const todo = await this.addDynamicTodo(
+          assignment,
+          stepContent,
+          '编排者调整指令添加',
+          'implementation',
+          parentTodo?.id
+        );
         assignment.todos.push(todo);
         logger.debug('Worker.添加步骤', { todoId: todo.id, content: stepContent }, LogCategory.ORCHESTRATOR);
       }
@@ -714,7 +693,6 @@ export class AutonomousWorker extends EventEmitter {
     success: boolean;
     todo: UnifiedTodo;
     error?: string;
-    dynamicTodos?: UnifiedTodo[];
     tokenUsage?: TokenUsage;
   }> {
     const startTime = Date.now();
@@ -802,7 +780,6 @@ export class AutonomousWorker extends EventEmitter {
       return {
         success: true,
         todo,
-        dynamicTodos: output.dynamicTodos,
         tokenUsage: output.tokenUsage,
       };
     } catch (error) {
@@ -918,7 +895,6 @@ export class AutonomousWorker extends EventEmitter {
   ): Promise<{
     summary: string;
     modifiedFiles?: string[];
-    dynamicTodos?: UnifiedTodo[];
     tokenUsage?: TokenUsage;
   }> {
     // 必须提供 adapterFactory
@@ -959,7 +935,6 @@ export class AutonomousWorker extends EventEmitter {
       // 解析响应
       const summary = response.content || response.error || '执行完成';
       const modifiedFiles = this.extractModifiedFiles(response.content || '');
-      const dynamicTodos = await this.extractDynamicTodos(response.content || '', assignment, todo.id);
 
       // 调用输出回调
       if (options.onOutput && response.content) {
@@ -969,7 +944,6 @@ export class AutonomousWorker extends EventEmitter {
       return {
         summary,
         modifiedFiles,
-        dynamicTodos,
         tokenUsage: response.tokenUsage,
       };
     } catch (error) {
@@ -1008,45 +982,6 @@ export class AutonomousWorker extends EventEmitter {
     const filePattern = /[\w\-./]+\.(ts|js|tsx|jsx|py|java|go|rs|cpp|c|css|scss|html|json|md|yaml|yml|txt)/gi;
     const matches = text.match(filePattern);
     return matches ? [...new Set(matches)] : [];
-  }
-
-  /**
-   * 从输出中提取动态 Todo
-   * 通过 TodoManager 持久化，确保 Todo 可追踪和恢复
-   */
-  private async extractDynamicTodos(output: string, assignment: Assignment, parentTodoId?: string): Promise<UnifiedTodo[]> {
-    const todos: UnifiedTodo[] = [];
-
-    // 扩展匹配模式，覆盖常见的中英文任务标记
-    const todoPattern = /(?:TODO|FIXME|需要额外处理|需要补充|还需要|待办|额外任务|Additional task|Follow-up)[：:]?\s*(.+)/gi;
-    let match;
-
-    while ((match = todoPattern.exec(output)) !== null) {
-      const content = match[1].trim();
-      if (content && content.length > 2) {
-        // 通过 TodoManager 持久化创建，确保可追踪
-        const todo = await this.todoManager.create({
-          missionId: assignment.missionId,
-          assignmentId: assignment.id,
-          parentId: parentTodoId,
-          content,
-          reasoning: '执行过程中发现的额外任务',
-          type: 'implementation',
-          workerId: assignment.workerId,
-          priority: 3,
-        });
-        todos.push(todo);
-      }
-    }
-
-    if (todos.length > 0) {
-      logger.info('Worker.动态Todo.提取', {
-        workerId: assignment.workerId,
-        count: todos.length,
-      }, LogCategory.ORCHESTRATOR);
-    }
-
-    return todos;
   }
 
   private mapTodoKind(todoType: string): SubTask['kind'] {
@@ -1634,13 +1569,6 @@ export class AutonomousWorker extends EventEmitter {
 
       if (result.success) {
         completedTodos.push(result.todo);
-
-        if (result.dynamicTodos && result.dynamicTodos.length > 0) {
-          dynamicTodos.push(...result.dynamicTodos);
-          for (const todo of result.dynamicTodos) {
-            assignment.todos.push(todo);
-          }
-        }
       } else {
         // 尝试恢复
         const todoRetryCount = this.retryCountMap.get(currentTodo.id) || 0;
@@ -1695,7 +1623,7 @@ export class AutonomousWorker extends EventEmitter {
 
     const finalResult: AutonomousExecutionResult = {
       assignment,
-      success: failedTodos.length === 0,
+      success: completedTodos.length > 0 && failedTodos.length === 0,
       completedTodos,
       failedTodos,
       skippedTodos,

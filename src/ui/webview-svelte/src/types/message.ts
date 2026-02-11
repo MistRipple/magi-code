@@ -286,7 +286,7 @@ export type SubTaskStatus =
   | 'cancelled'
   | 'in_progress'; // 增量事件可能发送此值
 
-// 子任务（对齐后端 SubTaskView）
+// 子任务（对齐后端 TodoItemView）
 export interface SubTaskItem {
   id: string;
   description: string;

@@ -29,7 +29,7 @@ import { MCPToolExecutor } from '../tools/mcp-executor';
 import { MessageHub } from '../orchestrator/core/message-hub';
 import { logger, LogCategory } from '../logging';
 import { IAdapterFactory, AdapterOutputScope, AdapterResponse } from '../adapters/adapter-factory-interface';
-import { AgentProfileLoader } from '../orchestrator/profile/agent-profile-loader';
+import { ProfileLoader } from '../orchestrator/profile/profile-loader';
 import { ADAPTER_EVENTS } from '../protocol/event-names';
 import { EnvironmentContextProvider } from '../context/environment-context-provider';
 
@@ -43,7 +43,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   private mcpExecutor: MCPToolExecutor | null = null;
   private readonly mcpExecutorDefaultId = 'mcp-servers';
   private mcpExecutorBindings = new Set<string>();
-  private profileLoader: AgentProfileLoader;
+  private profileLoader: ProfileLoader;
   private connectionPromises = new Map<AgentType, Promise<void>>();
 
   /**
@@ -61,7 +61,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   constructor(options: { cwd: string }) {
     super();
     this.toolManager = new ToolManager(options.cwd);
-    this.profileLoader = new AgentProfileLoader();
+    this.profileLoader = ProfileLoader.getInstance();
 
     // 创建环境上下文提供者并注入 ToolManager
     this.environmentContextProvider = new EnvironmentContextProvider({
@@ -98,7 +98,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
    */
   async initialize(): Promise<void> {
     LLMConfigLoader.ensureDefaults();
-    await this.profileLoader.initialize();
+    await this.profileLoader.load();
 
     // 加载并注册 Skills
     await this.loadSkills();

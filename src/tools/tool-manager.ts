@@ -12,7 +12,6 @@
  * - mermaid_diagram: Mermaid 图表渲染
  * - codebase_retrieval: 代码库语义搜索 (ACE)
  * - dispatch_task: 将子任务分配给专业 Worker
- * - plan_mission: 创建多 Worker 协作计划
  * - send_worker_message: 向 Worker 面板发送消息
  *
  * ACE 配置来源：~/.magi/config.json 的 promptEnhance 字段（唯一）
@@ -350,7 +349,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     'mermaid_diagram',
     'codebase_retrieval',
     'dispatch_task',
-    'plan_mission',
     'send_worker_message',
   ];
 
@@ -481,7 +479,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         return await this.aceExecutor.execute(toolCall, signal);
 
       case 'dispatch_task':
-      case 'plan_mission':
       case 'send_worker_message':
         return await this.orchestrationExecutor.execute(toolCall);
 
@@ -556,7 +553,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     }
 
     // 编排工具默认允许（内部调度不需要额外权限）
-    if (toolName === 'dispatch_task' || toolName === 'plan_mission' || toolName === 'send_worker_message') {
+    if (toolName === 'dispatch_task' || toolName === 'send_worker_message') {
       return { allowed: true };
     }
 
@@ -615,6 +612,104 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     }, LogCategory.TOOLS);
 
     return tools;
+  }
+
+  /**
+   * 生成可用工具的自然语言摘要（单一 source of truth）
+   *
+   * Orchestrator 和 Worker 共用此方法获取工具信息，
+   * 消除多处硬编码工具列表的维护负担。
+   *
+   * @param options.role 调用角色：'orchestrator' 包含编排者专用说明，'worker' 省略
+   * @param options.excludeOrchestrationTools 是否排除编排工具（Worker 默认排除）
+   */
+  async buildToolsSummary(options?: {
+    role?: 'orchestrator' | 'worker';
+    excludeOrchestrationTools?: boolean;
+  }): Promise<string> {
+    const role = options?.role ?? 'worker';
+    const excludeOrch = options?.excludeOrchestrationTools ?? true;
+
+    const tools = await this.getTools();
+    if (tools.length === 0) {
+      return '';
+    }
+
+    const orchestrationToolNames = ['dispatch_task', 'send_worker_message'];
+
+    // 内置工具描述映射（中文用途说明）
+    const builtinToolDescriptions: Record<string, { category: string; desc: string }> = {
+      'text_editor': { category: '文件操作', desc: '查看目录结构、读取/编辑/创建文件' },
+      'grep_search': { category: '文件操作', desc: '正则搜索代码内容' },
+      'remove_files': { category: '文件操作', desc: '删除文件' },
+      'launch-process': { category: '终端命令', desc: '执行构建/测试/启动服务等进程（不要用于读文件或浏览目录）' },
+      'read-process': { category: '终端命令', desc: '读取终端进程输出' },
+      'write-process': { category: '终端命令', desc: '向运行中的终端写入输入' },
+      'kill-process': { category: '终端命令', desc: '终止终端进程' },
+      'list-processes': { category: '终端命令', desc: '列出所有终端进程' },
+      'web_search': { category: '网络工具', desc: '搜索互联网信息' },
+      'web_fetch': { category: '网络工具', desc: '获取 URL 页面内容' },
+      'codebase_retrieval': { category: '代码智能', desc: '语义搜索代码库' },
+      'mermaid_diagram': { category: '可视化', desc: '生成 Mermaid 图表' },
+    };
+
+    // 编排者专用的附加说明
+    const orchestratorNotes: Record<string, string> = {
+      'text_editor': '（编排者限改 3 个文件内的简单修改，复杂修改委派 Worker）',
+      'remove_files': '（编排者限 3 个文件内）',
+    };
+
+    const lines: string[] = [];
+
+    // 内置工具：按类别分组
+    lines.push('内置工具:');
+    const categoryOrder = ['文件操作', '终端命令', '网络工具', '代码智能', '可视化'];
+    for (const category of categoryOrder) {
+      const categoryTools = Object.entries(builtinToolDescriptions)
+        .filter(([, v]) => v.category === category);
+      if (categoryTools.length > 0) {
+        const toolList = categoryTools.map(([name, v]) => {
+          const note = role === 'orchestrator' ? (orchestratorNotes[name] || '') : '';
+          return `${name}（${v.desc}${note}）`;
+        }).join('、');
+        lines.push(`- ${category}：${toolList}`);
+      }
+    }
+
+    // 动态发现新增的未映射内置工具
+    const builtinTools = tools.filter(t =>
+      t.metadata?.source === 'builtin' &&
+      (!excludeOrch || !orchestrationToolNames.includes(t.name))
+    );
+    const unmappedTools = builtinTools.filter(t => !builtinToolDescriptions[t.name]);
+    for (const tool of unmappedTools) {
+      const desc = tool.description ? tool.description.split(/[。\n]/)[0].substring(0, 60) : '';
+      lines.push(`- 其他：${tool.name}（${desc}）`);
+    }
+
+    // MCP 工具
+    const mcpTools = tools.filter(t => t.metadata?.source === 'mcp');
+    if (mcpTools.length > 0) {
+      lines.push('');
+      lines.push('MCP 扩展工具（用户已安装，可直接调用）:');
+      for (const tool of mcpTools) {
+        const desc = tool.description ? ` - ${tool.description.substring(0, 80)}` : '';
+        lines.push(`- ${tool.name}${desc}`);
+      }
+    }
+
+    // Skill 自定义工具
+    const skillTools = tools.filter(t => t.metadata?.source === 'skill');
+    if (skillTools.length > 0) {
+      lines.push('');
+      lines.push('Skill 自定义工具（用户已安装，可直接调用）:');
+      for (const tool of skillTools) {
+        const desc = tool.description ? ` - ${tool.description.substring(0, 80)}` : '';
+        lines.push(`- ${tool.name}${desc}`);
+      }
+    }
+
+    return lines.join('\n');
   }
 
   /**
@@ -726,7 +821,7 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
     // 12. codebase_retrieval (ACE 语义搜索)
     tools.push(this.aceExecutor.getToolDefinition());
 
-    // 13-15. 编排工具 (dispatch_task, plan_mission, send_worker_message)
+    // 13-14. 编排工具 (dispatch_task, send_worker_message)
     tools.push(...this.orchestrationExecutor.getToolDefinitions());
 
     return tools;

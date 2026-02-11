@@ -12,7 +12,7 @@ import { ToolManager } from '../../tools/tool-manager';
 import { MessageHub } from '../../orchestrator/core/message-hub';
 import { BaseLLMAdapter, AdapterState } from './base-adapter';
 import { logger, LogCategory } from '../../logging';
-import { AgentProfileLoader } from '../../orchestrator/profile/agent-profile-loader';
+import { ProfileLoader } from '../../orchestrator/profile/profile-loader';
 import { GuidanceInjector } from '../../orchestrator/profile/guidance-injector';
 
 /**
@@ -38,7 +38,7 @@ export interface WorkerAdapterConfig {
   messageHub: MessageHub;  // 🔧 统一消息通道：替代 messageBus
   workerSlot: WorkerSlot;
   systemPrompt?: string;
-  profileLoader?: AgentProfileLoader;
+  profileLoader: ProfileLoader;
   historyConfig?: HistoryManagementConfig;
 }
 
@@ -50,11 +50,13 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   private systemPrompt: string;
   private conversationHistory: LLMMessage[] = [];
   private abortController?: AbortController;
-  private profileLoader?: AgentProfileLoader;
+  private profileLoader: ProfileLoader;
   private guidanceInjector: GuidanceInjector;
   private historyConfig: Required<HistoryManagementConfig>;
   private seenThinking = false;
   private decisionHookAppliedForThinking = false;
+  /** 工具摘要是否已注入到 systemPrompt（lazy init，仅执行一次） */
+  private toolsSummaryInjected = false;
 
   constructor(adapterConfig: WorkerAdapterConfig) {
     super(
@@ -114,6 +116,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     this.setState(AdapterState.BUSY);
     this.currentTraceId = this.generateTraceId();
 
+    // 首次调用时异步注入动态工具摘要到 systemPrompt
+    if (!this.toolsSummaryInjected) {
+      this.toolsSummaryInjected = true;
+      await this.injectToolsSummary();
+    }
+
     // 自动截断历史以控制 token 消耗
     this.truncateHistoryIfNeeded();
     // 清理可能破坏工具调用链路的历史片段
@@ -149,7 +157,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     }
 
     // 获取工具定义（Worker 过滤掉编排工具，编排权限仅属于 Orchestrator）
-    const ORCHESTRATION_TOOLS = ['dispatch_task', 'plan_mission', 'send_worker_message'];
+    const ORCHESTRATION_TOOLS = ['dispatch_task', 'send_worker_message'];
     const tools = await this.toolManager.getTools();
     const toolDefinitions = tools
       .filter((tool) => !ORCHESTRATION_TOOLS.includes(tool.name))
@@ -174,6 +182,13 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     const STALL_WARN_LEVEL_2 = 10;   // 第二级提醒：明确要求修改代码
     const STALL_WARN_LEVEL_3 = 18;   // 第三级提醒：最终警告
     const STALL_ABORT_THRESHOLD = 25; // 终止阈值
+    // 总轮次硬上限（安全网：防止任何场景下的无限循环）
+    const MAX_TOTAL_ROUNDS = 40;
+    const MAX_ROUNDS_FINAL_WARN = 35;
+    // 无实质文本输出检测（捕获 Worker 只做工具调用但不产出用户可见内容的场景）
+    const NO_OUTPUT_WARN = 5;        // 连续 5 轮无实质输出 → 一级提醒
+    const NO_OUTPUT_FORCE = 8;       // 连续 8 轮无实质输出 → 强制要求产出
+    const NO_OUTPUT_ABORT = 12;      // 连续 12 轮无实质输出 → 终止
 
     try {
       let finalText = '';
@@ -184,6 +199,9 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       let readOnlyConsecutiveRounds = 0;      // 连续只读轮次（用于日志和提示）
       const visitedPaths = new Set<string>(); // 累计已访问的唯一文件路径
       let lastStallWarnLevel = 0;             // 上次发出的警告级别（避免重复警告）
+      // 无实质文本输出检测状态
+      let noSubstantiveOutputRounds = 0;      // 连续无实质输出轮次
+      let lastNoOutputWarnLevel = 0;          // 上次警告级别
 
       // 创建 AbortController，供 interrupt() 中断 LLM 请求
       this.abortController = new AbortController();
@@ -193,6 +211,19 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         // 中断检查：每轮迭代入口检测 abort 信号
         if (this.abortController.signal.aborted) {
           break;
+        }
+
+        // 总轮次安全网：防止任何场景下的无限循环
+        if (round >= MAX_TOTAL_ROUNDS) {
+          logger.warn(`${this.agent} 达到总轮次上限`, { round }, LogCategory.LLM);
+          finalText = finalText || `已执行 ${round} 轮工具调用，达到安全上限，任务终止。请检查任务是否需要拆分。`;
+          break;
+        }
+        if (round === MAX_ROUNDS_FINAL_WARN) {
+          this.conversationHistory.push({
+            role: 'user',
+            content: `[System] 你已执行 ${round} 轮工具调用，即将达到上限（${MAX_TOTAL_ROUNDS} 轮）。请立即总结当前进展，输出最终结果。不要再调用工具。`,
+          });
         }
 
         this.seenThinking = false;
@@ -389,6 +420,40 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
             }
           }
 
+          // 无实质文本输出检测：Worker 不断调用工具但不给用户产出可见内容
+          // （与只读空转检测互补，覆盖 execute+search 混合循环的场景）
+          const SUBSTANTIVE_TEXT_THRESHOLD = 20;
+          if (accumulatedText.trim().length < SUBSTANTIVE_TEXT_THRESHOLD) {
+            noSubstantiveOutputRounds++;
+
+            if (noSubstantiveOutputRounds >= NO_OUTPUT_ABORT) {
+              finalText = accumulatedText || `连续 ${noSubstantiveOutputRounds} 轮未产出实质性文本内容，仅调用工具。任务终止，请检查任务描述是否足够明确。`;
+              logger.warn(`${this.agent} 无实质输出终止`, { rounds: noSubstantiveOutputRounds, totalRound: round }, LogCategory.LLM);
+              this.normalizer.endStream(streamId);
+              break;
+            }
+
+            if (noSubstantiveOutputRounds >= NO_OUTPUT_FORCE && lastNoOutputWarnLevel < 2) {
+              lastNoOutputWarnLevel = 2;
+              logger.warn(`${this.agent} 无实质输出二级警告`, { rounds: noSubstantiveOutputRounds }, LogCategory.LLM);
+              this.conversationHistory.push({
+                role: 'user',
+                content: `[System] 你已连续 ${noSubstantiveOutputRounds} 轮仅调用工具而未产出任何面向用户的文本内容。你必须在下一轮输出具体的分析结果、代码修改方案或最终结论。如果继续仅调用工具，任务将被终止。`,
+              });
+            } else if (noSubstantiveOutputRounds >= NO_OUTPUT_WARN && lastNoOutputWarnLevel < 1) {
+              lastNoOutputWarnLevel = 1;
+              logger.info(`${this.agent} 无实质输出一级提醒`, { rounds: noSubstantiveOutputRounds }, LogCategory.LLM);
+              this.conversationHistory.push({
+                role: 'user',
+                content: `[System] 你已连续 ${noSubstantiveOutputRounds} 轮仅调用工具。请开始输出你的分析结论或执行结果，而不是继续调用更多工具。`,
+              });
+            }
+          } else {
+            // 有实质文本输出 → 重置
+            noSubstantiveOutputRounds = 0;
+            lastNoOutputWarnLevel = 0;
+          }
+
           this.applyDecisionHook({ type: 'tool_result' });
 
           // 当轮 stream 结束，下一轮开启新 stream
@@ -526,31 +591,41 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   /**
    * 构建系统提示（使用 Agent 画像）
    */
-  private buildSystemPrompt(): string {
-    if (!this.profileLoader) {
-      return this.getDefaultSystemPrompt();
-    }
+  private buildSystemPrompt(toolsSummary?: string): string {
+    const workerProfile = this.profileLoader.getProfile(this.workerSlot);
+    const guidancePrompt = this.guidanceInjector.buildWorkerPrompt(workerProfile, {
+      taskDescription: '', // 将在实际任务中填充
+      availableToolsSummary: toolsSummary,
+    });
 
-    try {
-      const workerProfile = this.profileLoader.getProfileLoader().getProfile(this.workerSlot);
-      const guidancePrompt = this.guidanceInjector.buildWorkerPrompt(workerProfile, {
-        taskDescription: '', // 将在实际任务中填充
-      });
-
-      return guidancePrompt;
-    } catch (error: any) {
-      logger.warn(`Failed to build system prompt from profile: ${error.message}`, undefined, LogCategory.LLM);
-      return this.getDefaultSystemPrompt();
-    }
+    return guidancePrompt;
   }
 
   /**
-   * 获取默认系统提示
+   * 异步注入动态工具摘要到 systemPrompt（首次 sendMessage 时执行一次）
+   *
+   * 从 ToolManager.buildToolsSummary() 获取完整工具列表（内置 + MCP + Skill），
+   * 重新构建包含工具信息的 systemPrompt。
    */
-  private getDefaultSystemPrompt(): string {
-    return `你是一个专业的软件开发助手。
-你可以使用系统提供的工具来完成任务。
-请逐步思考，在适当时使用工具。`;
+  private async injectToolsSummary(): Promise<void> {
+    try {
+      const toolsSummary = await this.toolManager.buildToolsSummary({ role: 'worker' });
+      if (toolsSummary) {
+        // 重建包含工具摘要的 systemPrompt，保留已拼接的环境上下文
+        const basePrompt = this.buildSystemPrompt(toolsSummary);
+        // 保留 adapter-factory 在创建后追加的环境上下文部分
+        const currentPrompt = this.systemPrompt;
+        const oldBasePrompt = this.buildSystemPrompt();
+        if (currentPrompt.startsWith(oldBasePrompt)) {
+          const suffix = currentPrompt.slice(oldBasePrompt.length);
+          this.systemPrompt = basePrompt + suffix;
+        } else {
+          this.systemPrompt = basePrompt;
+        }
+      }
+    } catch (error) {
+      logger.warn(`${this.agent} 工具摘要注入失败，使用无工具列表的系统提示`, { error }, LogCategory.LLM);
+    }
   }
 
   /**

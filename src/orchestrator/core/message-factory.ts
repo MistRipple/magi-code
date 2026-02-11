@@ -8,13 +8,14 @@ import type { WorkerSlot, AgentType } from '../../types/agent-types';
 import type { StandardMessage, MessageMetadata, ContentBlock, MessageSource, NotifyLevel, DataMessageType } from '../../protocol/message-protocol';
 import { MessageType, MessageLifecycle, MessageCategory, ControlMessageType, createStandardMessage, createControlMessage, createNotifyMessage, createDataMessage } from '../../protocol/message-protocol';
 
-/** 子任务视图 - 用于 SubTaskCard 消息 */
-export interface SubTaskView {
+/** 子任务卡片载荷 - 用于 SubTaskCard 消息 */
+export interface SubTaskCardPayload {
   id: string;
   title: string;
   status: 'pending' | 'running' | 'completed' | 'failed' | 'stopped' | 'skipped';
   worker: WorkerSlot;
   summary?: string;
+  error?: string;
   modifiedFiles?: string[];
   createdFiles?: string[];
   duration?: number;
@@ -95,9 +96,9 @@ export class MessageFactory {
   }
 
   /** 发送子任务卡片 - 显示在主对话区 */
-  subTaskCard(subTask: SubTaskView): void {
+  subTaskCard(subTask: SubTaskCardPayload): void {
     const w = subTask.worker;
-    const statusContentMap: Record<SubTaskView['status'], string> = {
+    const statusContentMap: Record<SubTaskCardPayload['status'], string> = {
       completed: subTask.summary ? `${w} 已完成：${subTask.summary}` : `${w} 完成了任务`,
       failed: `${w} 执行遇到问题：${subTask.summary || '执行失败'}`,
       pending: `${w} 等待确认：${subTask.title}`,

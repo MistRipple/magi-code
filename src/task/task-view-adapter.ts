@@ -2,7 +2,7 @@
  * Task View Adapter - 任务视图适配器
  *
  * 职责：
- * - 将 Mission + UnifiedTodo 转换为 UI 需要的 TaskView + SubTaskView 格式
+ * - 将 Mission + UnifiedTodo 转换为 UI 需要的 TaskView + TodoItemView 格式
  * - 纯函数，无状态，不持久化
  *
  * 设计目标：
@@ -61,7 +61,7 @@ export interface TaskView {
   priority: number;         // 默认 5
 
   // 子任务
-  subTasks: SubTaskView[];  // 从 UnifiedTodo 聚合
+  subTasks: TodoItemView[];  // 从 UnifiedTodo 聚合
 
   // 时间戳
   createdAt: number;
@@ -77,10 +77,10 @@ export interface TaskView {
 }
 
 /**
- * SubTaskView - 子任务视图
+ * TodoItemView - 子任务视图
  * 从 UnifiedTodo 转换而来，供 UI 层使用
  */
-export interface SubTaskView {
+export interface TodoItemView {
   // 基础信息
   id: string;               // = UnifiedTodo.id
   taskId: string;           // = Mission.id
@@ -157,9 +157,9 @@ export function mapTodoStatusToSubTaskViewStatus(status: TodoStatus): SubTaskVie
 // ============================================================================
 
 /**
- * 将 UnifiedTodo 转换为 SubTaskView
+ * 将 UnifiedTodo 转换为 TodoItemView
  */
-export function todoToSubTaskView(todo: UnifiedTodo, missionId: string): SubTaskView {
+export function todoToTodoItemView(todo: UnifiedTodo, missionId: string): TodoItemView {
   return {
     id: todo.id,
     taskId: missionId,
@@ -185,7 +185,7 @@ export function todoToSubTaskView(todo: UnifiedTodo, missionId: string): SubTask
  * 将 Mission + UnifiedTodo[] 转换为 TaskView
  */
 export function missionToTaskView(mission: Mission, todos: UnifiedTodo[]): TaskView {
-  const subTasks = todos.map(todo => todoToSubTaskView(todo, mission.id));
+  const subTasks = todos.map(todo => todoToTodoItemView(todo, mission.id));
 
   // 计算进度
   const completedCount = subTasks.filter(

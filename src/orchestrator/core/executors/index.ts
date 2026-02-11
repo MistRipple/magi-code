@@ -1,40 +1,7 @@
 /**
  * Executors Module - 执行器模块
  *
- * 导出所有执行器
+ * 仅保留 PlanningExecutor（一级 Todo 创建入口）
  */
 
 export { PlanningExecutor, PlanningOptions, PlanningResult } from './planning-executor';
-export {
-  AssignmentExecutor,
-  AssignmentExecutionOptions,
-  AssignmentExecutionResult,
-} from './assignment-executor';
-export { ReviewExecutor, ReviewOptions, ReviewResult } from './review-executor';
-export { ContractVerifier, ContractVerificationResult } from './contract-verifier';
-export {
-  ProgressReporter,
-  ExecutionProgress,
-} from './progress-reporter';
-export {
-  BlockingManager,
-  BlockedItem,
-  BlockedItemType,
-  BlockingReason,
-  BlockingOptions,
-} from './blocking-manager';
-export {
-  ExecutionCoordinator,
-  ExecutionOptions,
-  ExecutionResult,
-} from './execution-coordinator';
-export {
-  TaskPreAnalyzer,
-  TaskComplexity,
-  ExecutionStrategy,
-  PreAnalysisOptions,
-} from './task-pre-analyzer';
-export {
-  OrchestratorResponder,
-  ResponderOptions,
-} from './orchestrator-responder';

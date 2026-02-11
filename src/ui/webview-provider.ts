@@ -48,23 +48,23 @@ import { IAdapterFactory } from '../adapters/adapter-factory-interface';
 import { LLMAdapterFactory } from '../llm/adapter-factory';
 import { MissionDrivenEngine } from '../orchestrator/core';
 import { MessageHub } from '../orchestrator/core/message-hub';
-import { WorkerAssignmentStorage, WORKER_ASSIGNMENTS_VERSION, CATEGORY_DEFINITIONS, CATEGORY_RULES } from '../orchestrator/profile';
-import { parseContentToBlocks } from '../utils/content-parser';
 import { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
 import { InstructionSkillDefinition } from '../tools/skills-manager';
-import { applySkillInstall, buildInstructionSkillPrompt } from '../tools/skill-installation';
-import { loadAceConfigFromFile } from '../tools/tool-manager';
+import { buildInstructionSkillPrompt } from '../tools/skill-installation';
 import { MermaidPanel } from './mermaid-panel';
+import type { CommandHandler, CommandHandlerContext } from './handlers/types';
+import { ConfigCommandHandler, McpCommandHandler, SkillsCommandHandler, KnowledgeCommandHandler } from './handlers';
 import { isAbortError } from '../errors';
+import { PromptEnhancerService } from '../services/prompt-enhancer-service';
+import { DirectExecutionService } from '../services/direct-execution-service';
 // Mission-Driven Architecture 类型 - 直接从子模块导入
 import {
   MissionOrchestrator,
-  ExecutionProgress,
   MissionSummary,
   MissionVerificationResult,
 } from '../orchestrator/core';
-import { BlockedItem } from '../orchestrator/core/executors/blocking-manager';
 import { Mission, Assignment } from '../orchestrator/mission';
+import { normalizeAssignments, normalizeTodos, generateEntityId } from '../orchestrator/mission/data-normalizer';
 import type { UnifiedTodo } from '../todo/types';
 
 type WebviewMessagePriority = 'high' | 'normal';
@@ -191,6 +191,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   // 项目知识库
   private projectKnowledgeBase?: ProjectKnowledgeBase;
 
+  // 提示词增强服务
+  private promptEnhancer: PromptEnhancerService;
+  private directExecutor: DirectExecutionService;
+
   // Hard Stop 确认机制
   private pendingConfirmation: {
     resolve: (confirmed: boolean) => void;
@@ -245,6 +249,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private readonly authSecretKey = 'magi.apiKey';
   private readonly authStatusKey = 'magi.loggedIn';
   private loginInFlight = false;
+
+  // CommandHandler 委派
+  private readonly commandHandlers: CommandHandler[];
+  private readonly handlerCtx: CommandHandlerContext;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -321,6 +329,57 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 初始化项目知识库
     this.initializeProjectKnowledgeBase();
 
+    // 初始化提示词增强服务
+    this.promptEnhancer = new PromptEnhancerService({
+      workspaceRoot: this.workspaceRoot,
+      getToolManager: () => this.adapterFactory.getToolManager?.(),
+      getKnowledgeBase: () => this.projectKnowledgeBase,
+      getConversationHistory: (maxRounds) => this.sessionManager.formatConversationHistory(maxRounds),
+    });
+
+    // 初始化直接执行服务
+    this.directExecutor = new DirectExecutionService({
+      getSessionId: () => this.activeSessionId || this.sessionManager.getCurrentSession()?.id || 'default',
+      getToolManager: () => (this.adapterFactory as LLMAdapterFactory).getToolManager(),
+      sendMessage: (worker, prompt, images) => this.adapterFactory.sendMessage(worker, prompt, images),
+      createTaskFromPrompt: (sid, p) => this.orchestratorEngine.createTaskFromPrompt(sid, p),
+      markTaskExecuting: (id) => this.orchestratorEngine.markTaskExecuting(id),
+      completeTaskById: (id) => this.orchestratorEngine.completeTaskById(id),
+      failTaskById: (id, err) => this.orchestratorEngine.failTaskById(id, err),
+      cancelTaskById: (id) => this.orchestratorEngine.cancelTaskById(id),
+      getExecutionStats: () => this.orchestratorEngine.getExecutionStats(),
+      sendStateUpdate: () => this.sendStateUpdate(),
+      sendErrorMessage: (content, worker) => this.sendOrchestratorMessage({
+        content,
+        messageType: 'error',
+        metadata: { worker },
+      }),
+      sendResultMessage: (content, worker) => {
+        const requestId = this.messageHub.getRequestContext();
+        this.messageHub.result(content, { metadata: { requestId, worker } });
+      },
+      saveMessageToSession: (prompt, content, worker) => this.saveMessageToSession(prompt, content, worker, 'worker'),
+    });
+
+    // 初始化 CommandHandler 委派
+    this.handlerCtx = {
+      sendData: (dataType, payload) => this.sendData(dataType, payload),
+      sendToast: (msg, level, duration) => this.sendToast(msg, level, duration),
+      sendStateUpdate: () => this.sendStateUpdate(),
+      getAdapterFactory: () => this.adapterFactory,
+      getOrchestratorEngine: () => this.orchestratorEngine,
+      getProjectKnowledgeBase: () => this.projectKnowledgeBase,
+      getWorkspaceRoot: () => this.workspaceRoot,
+      getPromptEnhancer: () => this.promptEnhancer,
+      getExtensionUri: () => this.extensionUri,
+    };
+    this.commandHandlers = [
+      new ConfigCommandHandler(),
+      new McpCommandHandler(),
+      new SkillsCommandHandler(),
+      new KnowledgeCommandHandler(),
+    ];
+
     // 绑定事件
     this.bindEvents();
   }
@@ -372,62 +431,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     };
   }
 
-  private generateEntityId(prefix: string): string {
-    return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-  }
-
-  private asArray<T>(value: T[] | undefined | null): T[] {
-    return Array.isArray(value) ? value : [];
-  }
-
-  private normalizeTodo(rawTodo: UnifiedTodo | undefined | null, assignmentId: string, seen: Set<string>): UnifiedTodo | null {
-    if (!rawTodo || typeof rawTodo !== 'object') {
-      return null;
-    }
-    const rawId = typeof rawTodo.id === 'string' ? rawTodo.id.trim() : '';
-    let id = rawId || this.generateEntityId('todo');
-    while (seen.has(id)) {
-      id = this.generateEntityId('todo');
-    }
-    seen.add(id);
-    return {
-      ...rawTodo,
-      id,
-      assignmentId: rawTodo.assignmentId || assignmentId,
-    };
-  }
-
-  private normalizeAssignments(rawAssignments: Assignment[] | undefined | null): Assignment[] {
-    const assignments: Assignment[] = [];
-    const seen = new Set<string>();
-    for (const raw of this.asArray(rawAssignments)) {
-      if (!raw || typeof raw !== 'object') continue;
-      const rawId = typeof raw.id === 'string' ? raw.id.trim() : '';
-      let id = rawId || this.generateEntityId('assignment');
-      while (seen.has(id)) {
-        id = this.generateEntityId('assignment');
-      }
-      seen.add(id);
-      const todoSeen = new Set<string>();
-      const todos = this.asArray(raw.todos)
-        .map(todo => this.normalizeTodo(todo, id, todoSeen))
-        .filter((todo): todo is UnifiedTodo => Boolean(todo));
-      assignments.push({
-        ...raw,
-        id,
-        todos,
-      });
-    }
-    return assignments;
-  }
-
-  private normalizeTodos(rawTodos: UnifiedTodo[] | undefined | null, assignmentId: string): UnifiedTodo[] {
-    const seen = new Set<string>();
-    return this.asArray(rawTodos)
-      .map(todo => this.normalizeTodo(todo, assignmentId, seen))
-      .filter((todo): todo is UnifiedTodo => Boolean(todo));
-  }
-
   /**
    * 初始化项目知识库
    */
@@ -462,104 +465,23 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** 向 Webview 推送最新的知识库数据 */
+  private sendProjectKnowledgeToWebview(): void {
+    if (!this.projectKnowledgeBase) { return; }
+    const codeIndex = this.projectKnowledgeBase.getCodeIndex();
+    const adrs = this.projectKnowledgeBase.getADRs();
+    const faqs = this.projectKnowledgeBase.getFAQs();
+    this.sendData('projectKnowledgeLoaded', { codeIndex, adrs, faqs });
+  }
+
   /**
    * 设置知识提取客户端（使用压缩模型）
    */
   private async setupKnowledgeExtractionClient(): Promise<void> {
     try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const { UniversalLLMClient } = await import('../llm/clients/universal-client');
-
-      // 加载压缩模型配置
-      const compressorConfig = LLMConfigLoader.loadCompressorConfig();
-      const orchestratorConfig = LLMConfigLoader.loadOrchestratorConfig();
-
-      const useCompressor = compressorConfig.enabled
-        && Boolean(compressorConfig.baseUrl && compressorConfig.model);
-      const activeConfig = useCompressor ? compressorConfig : orchestratorConfig;
-      const activeLabel = useCompressor ? 'compressor' : 'orchestrator';
-
-      // 创建压缩模型客户端
-      const baseClient = new UniversalLLMClient({
-        baseUrl: activeConfig.baseUrl,
-        apiKey: activeConfig.apiKey,
-        model: activeConfig.model,
-        provider: activeConfig.provider,
-        enabled: true,
-      });
+      const { createKnowledgeExtractionClient } = await import('../knowledge/knowledge-extraction-client');
       const executionStats = this.orchestratorEngine.getExecutionStats();
-      const client = {
-        config: baseClient.config,
-        sendMessage: async (params: any) => {
-          const startedAt = Date.now();
-          try {
-            const response = await baseClient.sendMessage(params);
-            const duration = Date.now() - startedAt;
-            if (executionStats) {
-              executionStats.recordExecution({
-                worker: activeLabel as any,
-                taskId: 'knowledge',
-                subTaskId: 'extract',
-                success: true,
-                duration,
-                inputTokens: response.usage?.inputTokens,
-                outputTokens: response.usage?.outputTokens,
-                phase: 'integration',
-              });
-            }
-            return response;
-          } catch (error: any) {
-            const duration = Date.now() - startedAt;
-            if (executionStats) {
-              executionStats.recordExecution({
-                worker: activeLabel as any,
-                taskId: 'knowledge',
-                subTaskId: 'extract',
-                success: false,
-                duration,
-                error: error?.message,
-                phase: 'integration',
-              });
-            }
-            throw error;
-          }
-        },
-        streamMessage: async (params: any, onChunk: any) => {
-          const startedAt = Date.now();
-          try {
-            const response = await baseClient.streamMessage(params, onChunk);
-            const duration = Date.now() - startedAt;
-            if (executionStats) {
-              executionStats.recordExecution({
-                worker: activeLabel as any,
-                taskId: 'knowledge',
-                subTaskId: 'extract',
-                success: true,
-                duration,
-                inputTokens: response.usage?.inputTokens,
-                outputTokens: response.usage?.outputTokens,
-                phase: 'integration',
-              });
-            }
-            return response;
-          } catch (error: any) {
-            const duration = Date.now() - startedAt;
-            if (executionStats) {
-              executionStats.recordExecution({
-                worker: activeLabel as any,
-                taskId: 'knowledge',
-                subTaskId: 'extract',
-                success: false,
-                duration,
-                error: error?.message,
-                phase: 'integration',
-              });
-            }
-            throw error;
-          }
-        },
-        testConnection: baseClient.testConnection.bind(baseClient),
-      } as import('../llm/types').LLMClient;
+      const client = await createKnowledgeExtractionClient(executionStats);
 
       const knowledgeBase = this.projectKnowledgeBase;
       if (!knowledgeBase) {
@@ -567,14 +489,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      // 设置到知识库
       knowledgeBase.setLLMClient(client);
-
-      logger.info('项目知识库.压缩模型客户端.已设置', {
-        model: activeConfig.model,
-        provider: activeConfig.provider,
-        fallbackToOrchestrator: !useCompressor
-      }, LogCategory.SESSION);
     } catch (error: any) {
       logger.error('项目知识库.压缩模型客户端.设置失败', { error: error.message }, LogCategory.SESSION);
     }
@@ -665,7 +580,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const limit = maxResults || 10;
       const maxContextLength = 6000;
       let currentLength = 0;
-      const keywords = this.extractKeywords(query);
+      const keywords = this.promptEnhancer.extractKeywords(query);
 
       // Level 1: 知识库索引搜索（TF-IDF + 符号 + 依赖图）
       const results = await pkb.search(query, {
@@ -688,7 +603,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       // Level 2: Grep 精确匹配搜索
       if (currentLength < maxContextLength * 0.8) {
-        const grepResult = await this.grepSearchForContext(
+        const grepResult = await this.promptEnhancer.grepSearchForContext(
           toolManager, keywords, maxContextLength - currentLength
         );
         if (grepResult) {
@@ -699,7 +614,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       // Level 3: LSP 符号搜索
       if (currentLength < maxContextLength * 0.9) {
-        const symbolResult = await this.lspSymbolSearchForContext(
+        const symbolResult = await this.promptEnhancer.lspSymbolSearchForContext(
           toolManager, keywords, maxContextLength - currentLength
         );
         if (symbolResult) {
@@ -772,7 +687,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         this.sendToast(`自动提取了 ${adrs.length} 条架构决策记录`, 'success');
 
         // 刷新知识库显示
-        await this.handleGetProjectKnowledge();
+        this.sendProjectKnowledgeToWebview();
       }
 
       // 提取 FAQ
@@ -792,7 +707,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         this.sendToast(`自动提取了 ${faqs.length} 条常见问题`, 'success');
 
         // 刷新知识库显示
-        await this.handleGetProjectKnowledge();
+        this.sendProjectKnowledgeToWebview();
       }
 
       if (adrs.length === 0 && faqs.length === 0) {
@@ -872,7 +787,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private emitUserAndPlaceholder(requestId: string, prompt: string, imageCount: number, images?: Array<{ dataUrl: string }>): {
+  private emitUserAndPlaceholder(requestId: string, prompt: string, imageCount: number, images?: Array<{ dataUrl: string }>, targetWorker?: string): {
     userMessageId: string;
     placeholderMessageId: string;
   } {
@@ -886,6 +801,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         sendingAnimation: true,
         // 附带图片数据供前端展示
         images: images && images.length > 0 ? images : undefined,
+        // 指定 Worker 直接对话时，标记目标 Worker，前端据此在 Worker 面板展示用户消息
+        ...(targetWorker ? { targetWorker } : {}),
       },
     });
 
@@ -1470,7 +1387,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
                 messageType: 'text',
               });
               // 异步恢复，避免阻塞
-              void this.orchestratorEngine.resumeMission(currentMission.id);
+              void orchestrator.resumeMission(currentMission.id);
             }
           }
         } catch (error) {
@@ -1682,7 +1599,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     this.missionOrchestrator.on('missionPlanned', (data: { mission: Mission; contracts: any[]; assignments: Assignment[] }) => {
-      const assignments = this.normalizeAssignments(data.assignments);
+      const assignments = normalizeAssignments(data.assignments);
       this.sendData('missionPlanned', {
         missionId: data.mission.id,
         contracts: data.contracts,
@@ -1745,8 +1662,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
 
     this.missionOrchestrator.on('assignmentPlanned', (data: { missionId: string; assignmentId: string; todos: UnifiedTodo[]; warnings?: string[] }) => {
-      const assignmentId = data.assignmentId || this.generateEntityId('assignment');
-      const todos = this.normalizeTodos(data.todos, assignmentId);
+      const assignmentId = data.assignmentId || generateEntityId('assignment');
+      const todos = normalizeTodos(data.todos, assignmentId);
       this.sendData('assignmentPlanned', {
         missionId: data.missionId,
         assignmentId,
@@ -1819,8 +1736,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     // 动态 Todo 事件
     this.missionOrchestrator.on('dynamicTodoAdded', (data: { missionId: string; assignmentId: string; todo: UnifiedTodo }) => {
-      const assignmentId = data.assignmentId || this.generateEntityId('assignment');
-      const normalizedTodo = this.normalizeTodos([data.todo], assignmentId)[0];
+      const assignmentId = data.assignmentId || generateEntityId('assignment');
+      const normalizedTodo = normalizeTodos([data.todo], assignmentId)[0];
       if (!normalizedTodo) {
         logger.warn('动态 Todo 无效，已跳过发送', { assignmentId, missionId: data.missionId }, LogCategory.ORCHESTRATOR);
         return;
@@ -1889,14 +1806,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const hasRunningTask = runningTasks.length > 0 || this.orchestratorEngine.running;
 
 
-    // 1. 首先中断 Orchestrator（这会触发 AbortController）
-    if (this.orchestratorEngine.running) {
-      logger.info('界面.任务.中断.编排器', undefined, LogCategory.UI);
-      await this.orchestratorEngine.interrupt();
-    }
-
-    // 2. 中断所有适配器的当前请求（不销毁适配器，保留连接供后续使用）
-    // 关键：仅在"真正完成停止"后才允许清空 processing，避免 UI 假空闲
+    // 1. 先中断所有适配器，第一时间触发 AbortController，避免等待引擎状态切换导致中断滞后
     let adapterInterruptCompleted = false;
     logger.info('界面.任务.中断.适配器.开始', undefined, LogCategory.UI);
     try {
@@ -1906,6 +1816,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     } catch (error) {
       logger.error('界面.任务.中断.适配器.错误', error, LogCategory.UI);
       adapterInterruptCompleted = false;
+    }
+
+    // 2. 再同步编排引擎状态（Mission/Batch 状态收敛）
+    if (this.orchestratorEngine.running) {
+      logger.info('界面.任务.中断.编排器', undefined, LogCategory.UI);
+      await this.orchestratorEngine.interrupt();
     }
 
     // 3. 更新任务状态
@@ -2063,6 +1979,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 处理 Webview 消息 */
   private async handleMessage(message: WebviewToExtensionMessage): Promise<void> {
     logger.info('界面.Webview.消息.收到', { type: message.type }, LogCategory.UI);
+
+    // Handler 委派：Config / MCP / Skills / Knowledge
+    for (const handler of this.commandHandlers) {
+      if (handler.supportedTypes.has(message.type)) {
+        await handler.handle(message, this.handlerCtx);
+        return;
+      }
+    }
 
     switch (message.type) {
       case 'getState':
@@ -2268,18 +2192,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'closeSession':
-        // 删除会话（统一管理器会清理所有相关资源）
-        if (this.sessionManager.deleteSession(message.sessionId)) {
-          // 如果删除后没有会话，创建一个新的
-          if (this.sessionManager.getSessionMetas().length === 0) {
-            const newSession = this.sessionManager.createSession();
-            this.activeSessionId = newSession.id;
-            this.sendData('sessionCreated', { session: newSession as any });
-          }
-          this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() as any[] });
-          this.sendToast('会话已删除', 'info');
-        }
-        this.sendStateUpdate();
+        this.performSessionDelete(message.sessionId);
         break;
 
       case 'deleteSession': {
@@ -2371,214 +2284,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
 
-      case 'getProfileConfig':
-        await this.sendProfileConfig();
-        break;
-
-      case 'saveProfileConfig':
-        await this.handleSaveProfileConfig(message.data);
-        break;
-
-      case 'resetProfileConfig':
-        await this.handleResetProfileConfig();
-        break;
-
       case 'clearAllTasks':
 
         this.handleClearAllTasks();
-        break;
-
-      case 'getPromptEnhanceConfig':
-        // 获取 Prompt 增强配置（从系统级存储）
-        this.sendPromptEnhanceConfig();
-        break;
-
-      case 'updatePromptEnhance':
-        // 更新 Prompt 增强配置
-        this.handleUpdatePromptEnhance((message as any).config, (message as any).source);
-        break;
-
-      case 'testPromptEnhance':
-        // 测试 Prompt 增强连接
-        this.handleTestPromptEnhance((message as any).baseUrl, (message as any).apiKey);
-        break;
-
-      case 'enhancePrompt':
-        // 执行 Prompt 增强（从系统级存储读取配置）
-        this.handleEnhancePrompt((message as any).prompt);
-        break;
-
-      // LLM 配置相关
-      case 'loadAllWorkerConfigs':
-        await this.handleLoadAllWorkerConfigs();
-        break;
-
-      case 'saveWorkerConfig':
-        await this.handleSaveWorkerConfig(message.worker, message.config);
-        break;
-
-      case 'testWorkerConnection':
-        await this.handleTestWorkerConnection(message.worker, message.config);
-        break;
-
-      case 'loadOrchestratorConfig':
-        await this.handleLoadOrchestratorConfig();
-        break;
-
-      case 'saveOrchestratorConfig':
-        await this.handleSaveOrchestratorConfig(message.config);
-        break;
-
-      case 'testOrchestratorConnection':
-        await this.handleTestOrchestratorConnection(message.config);
-        break;
-
-      case 'loadCompressorConfig':
-        await this.handleLoadCompressorConfig();
-        break;
-
-      case 'saveCompressorConfig':
-        await this.handleSaveCompressorConfig(message.config);
-        break;
-
-      case 'testCompressorConnection':
-        await this.handleTestCompressorConnection(message.config);
-        break;
-
-      case 'fetchModelList':
-        await this.handleFetchModelList((message as any).config, (message as any).target);
-        break;
-
-      // MCP 配置相关
-      case 'loadMCPServers':
-        await this.handleLoadMCPServers();
-        break;
-
-      case 'addMCPServer':
-        await this.handleAddMCPServer(message.server);
-        break;
-
-      case 'updateMCPServer':
-        await this.handleUpdateMCPServer(message.serverId, message.updates);
-        break;
-
-      case 'deleteMCPServer':
-        await this.handleDeleteMCPServer(message.serverId);
-        break;
-
-      case 'connectMCPServer':
-        await this.handleConnectMCPServer(message.serverId);
-        break;
-
-      case 'disconnectMCPServer':
-        await this.handleDisconnectMCPServer(message.serverId);
-        break;
-
-      case 'refreshMCPTools':
-        await this.handleRefreshMCPTools(message.serverId);
-        break;
-
-      case 'getMCPServerTools':
-        await this.handleGetMCPServerTools(message.serverId);
-        break;
-
-      // Skills 配置相关
-      case 'loadSkillsConfig':
-        await this.handleLoadSkillsConfig();
-        break;
-
-      case 'saveSkillsConfig':
-        await this.handleSaveSkillsConfig(message.config);
-        break;
-
-      case 'addCustomTool':
-        await this.handleAddCustomTool(message.tool);
-        break;
-
-      case 'removeCustomTool':
-        await this.handleRemoveCustomTool(message.toolName);
-        break;
-
-      case 'removeInstructionSkill':
-        await this.handleRemoveInstructionSkill(message.skillName);
-        break;
-
-      case 'installSkill':
-        await this.handleInstallSkill(message.skillId);
-        break;
-
-      // Skills 仓库管理
-      case 'loadRepositories':
-        await this.handleLoadRepositories();
-        break;
-
-      case 'addRepository':
-        await this.handleAddRepository(message.url);
-        break;
-
-      case 'updateRepository':
-        await this.handleUpdateRepository(message.repositoryId, message.updates);
-        break;
-
-      case 'deleteRepository':
-        await this.handleDeleteRepository(message.repositoryId);
-        break;
-
-      case 'refreshRepository':
-        await this.handleRefreshRepository(message.repositoryId);
-        break;
-
-      case 'loadSkillLibrary':
-        await this.handleLoadSkillLibrary();
-        break;
-
-      // 项目知识相关
-      case 'getProjectKnowledge':
-        await this.handleGetProjectKnowledge();
-        break;
-
-      case 'getADRs':
-        await this.handleGetADRs(message.filter);
-        break;
-
-      case 'getFAQs':
-        await this.handleGetFAQs(message.filter);
-        break;
-
-      case 'searchFAQs':
-        await this.handleSearchFAQs(message.keyword);
-        break;
-
-      case 'deleteADR':
-        await this.handleDeleteADR(message.id);
-        break;
-
-      case 'deleteFAQ':
-        await this.handleDeleteFAQ(message.id);
-        break;
-
-      case 'openFile':
-        await this.handleOpenFile(message.filepath);
-        break;
-
-      case 'addADR':
-        await this.handleAddADR(message.adr);
-        break;
-
-      case 'updateADR':
-        await this.handleUpdateADR(message.id, message.updates);
-        break;
-
-      case 'addFAQ':
-        await this.handleAddFAQ(message.faq);
-        break;
-
-      case 'updateFAQ':
-        await this.handleUpdateFAQ(message.id, message.updates);
-        break;
-
-      case 'clearProjectKnowledge':
-        await this.handleClearProjectKnowledge();
         break;
 
       case 'openMermaidPanel':
@@ -2682,1703 +2390,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** 处理 Prompt 增强配置更新 - 存储到 ~/.magi/config.json */
-  private async handleUpdatePromptEnhance(
-    config: { enabled: boolean; baseUrl: string; apiKey: string },
-    source: 'auto' | 'manual' = 'auto'
-  ): Promise<void> {
-    try {
-      const configPath = this.getMultiCliConfigPath();
-      const configDir = path.dirname(configPath);
-
-      // 确保目录存在
-      if (!fs.existsSync(configDir)) {
-        fs.mkdirSync(configDir, { recursive: true });
-      }
-
-      // 读取现有配置或创建新配置
-      let existingConfig: any = {};
-      if (fs.existsSync(configPath)) {
-        try {
-          existingConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-        } catch {
-          existingConfig = {};
-        }
-      }
-
-      // 更新 promptEnhance 配置
-      existingConfig.promptEnhance = {
-        baseUrl: config.baseUrl,
-        apiKey: config.apiKey
-      };
-
-      // 写入配置文件
-      fs.writeFileSync(configPath, JSON.stringify(existingConfig, null, 2), 'utf-8');
-      logger.info('界面.提示词_增强.配置.已保存', { path: configPath }, LogCategory.UI);
-
-      // 🔧 同步更新 ToolManager 中的 AceExecutor 配置
-      const toolManager = this.adapterFactory.getToolManager?.();
-      if (toolManager && config.baseUrl && config.apiKey) {
-        toolManager.configureAce(config.baseUrl, config.apiKey);
-        logger.info('界面.提示词_增强.配置.已同步到ToolManager', undefined, LogCategory.UI);
-      }
-
-      if (source === 'manual') {
-        this.sendToast('ACE 配置已保存', 'success');
-      }
-    } catch (error) {
-      logger.error('界面.提示词_增强.配置.保存_失败', error, LogCategory.UI);
-      if (source === 'manual') {
-        const errorMsg = error instanceof Error ? error.message : String(error);
-        this.sendToast(`ACE 配置保存失败: ${errorMsg}`, 'error');
-      }
-    }
-  }
-
-  /** 获取 Magi 配置文件路径 */
-  private getMultiCliConfigPath(): string {
-    return path.join(os.homedir(), '.magi', 'config.json');
-  }
-
-  /** 获取 Prompt 增强配置 - 复用 ToolManager 的配置读取逻辑 */
-  private async getPromptEnhanceConfig(): Promise<{ baseUrl: string; apiKey: string }> {
-    return loadAceConfigFromFile();
-  }
-
-  /** 发送 Prompt 增强配置到前端 */
-  private async sendPromptEnhanceConfig(): Promise<void> {
-    const config = await this.getPromptEnhanceConfig();
-    this.sendData('promptEnhanceConfigLoaded', {
-      config: {
-        baseUrl: config.baseUrl,
-        apiKey: config.apiKey
-      }
-    });
-  }
-
-  /** 测试 Augment API 连接 */
-  private async handleTestPromptEnhance(baseUrl: string, apiKey: string): Promise<void> {
-    if (!baseUrl || !apiKey) {
-      this.sendData('promptEnhanceResult', { success: false, message: '请填写 API 地址和密钥' });
-      return;
-    }
-
-    try {
-      // 使用 prompt-enhancer 端点测试连接（发送一个简单的测试请求）
-      const testUrl = baseUrl.replace(/\/$/, '') + '/prompt-enhancer';
-      const response = await fetch(testUrl, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          nodes: [{ id: 1, type: 0, text_node: { content: 'test' } }],
-          chat_history: [],
-          blobs: { checkpoint_id: null, added_blobs: [], deleted_blobs: [] },
-          conversation_id: null,
-          model: 'claude-sonnet-4-5',
-          mode: 'CHAT',
-          user_guided_blobs: [],
-          external_source_ids: [],
-          user_guidelines: '',
-          workspace_guidelines: '',
-          rules: []
-        }),
-        signal: AbortSignal.timeout(15000)
-      });
-
-      if (response.ok) {
-        this.sendData('promptEnhanceResult', { success: true, message: '连接成功' });
-      } else if (response.status === 401) {
-        this.sendData('promptEnhanceResult', { success: false, message: 'Token 无效或已过期' });
-      } else if (response.status === 403) {
-        this.sendData('promptEnhanceResult', { success: false, message: '访问被拒绝' });
-      } else {
-        const errorText = await response.text().catch(() => '');
-        this.sendData('promptEnhanceResult', { success: false, message: `连接失败: ${response.status}` });
-      }
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      this.sendData('promptEnhanceResult', { success: false, message: `连接错误: ${errorMsg}` });
-    }
-  }
-
-  /** 执行 Prompt 增强 - 使用压缩模型 + 代码上下文 */
-  private async handleEnhancePrompt(prompt: string): Promise<void> {
-    try {
-      // 加载压缩模型配置
-      const { LLMConfigLoader } = await import('../llm/config');
-      const compressorConfig = LLMConfigLoader.loadCompressorConfig();
-      const orchestratorConfig = LLMConfigLoader.loadOrchestratorConfig();
-
-      const useCompressor = compressorConfig.enabled
-        && Boolean(compressorConfig.baseUrl && compressorConfig.model);
-      const activeConfig = useCompressor ? compressorConfig : orchestratorConfig;
-      const activeLabel = useCompressor ? 'compressor' : 'orchestrator';
-
-      // 获取项目根目录
-      const workspaceFolders = vscode.workspace.workspaceFolders;
-      const projectRoot = workspaceFolders?.[0]?.uri.fsPath || '';
-
-      // 收集代码上下文（参考 Augment 方案）
-      let codeContext = '';
-      if (projectRoot) {
-        try {
-          codeContext = await this.collectCodeContext(projectRoot, prompt);
-        } catch (error) {
-          logger.warn('界面.提示词_增强.代码上下文收集失败', { error }, LogCategory.UI);
-          // 代码上下文收集失败不阻止增强
-        }
-      }
-
-      // 收集对话历史（5-10 轮对话）
-      const conversationHistory = this.sessionManager.formatConversationHistory(10);
-
-      // 检测语言
-      const isChinese = /[\u4e00-\u9fa5]/.test(prompt);
-
-      // 构建增强 prompt（参考 Augment 方案）
-      const enhancePrompt = this.buildEnhancePrompt(prompt, conversationHistory, codeContext, isChinese);
-
-      // 创建压缩模型客户端并调用
-      const { UniversalLLMClient } = await import('../llm/clients/universal-client');
-      const client = new UniversalLLMClient({
-        baseUrl: activeConfig.baseUrl,
-        apiKey: activeConfig.apiKey,
-        model: activeConfig.model,
-        provider: activeConfig.provider,
-        enabled: true,
-      });
-
-      logger.info('界面.提示词_增强.开始', {
-        model: activeConfig.model,
-        used: activeLabel,
-        fallbackToOrchestrator: !useCompressor,
-        hasCodeContext: codeContext.length > 0,
-        hasConversation: conversationHistory.length > 0
-      }, LogCategory.UI);
-
-      const response = await client.sendMessage({
-        messages: [{ role: 'user', content: enhancePrompt }],
-        maxTokens: 4096,
-        temperature: 0.7,
-      });
-
-      const enhancedPrompt = response.content?.trim() || '';
-
-      if (enhancedPrompt) {
-        logger.info('界面.提示词_增强.完成', {
-          originalLength: prompt.length,
-          enhancedLength: enhancedPrompt.length
-        }, LogCategory.UI);
-        this.sendData('promptEnhanced', { enhancedPrompt, error: '' });
-      } else {
-        this.sendData('promptEnhanced', { enhancedPrompt: '', error: '未获取到增强结果' });
-      }
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      logger.error('界面.提示词_增强.失败', { error: errorMsg }, LogCategory.UI);
-      this.sendData('promptEnhanced', { enhancedPrompt: '', error: errorMsg });
-    }
-  }
-
-  /**
-   * 收集代码上下文（参考 Augment 方案）
-   * 优先使用 ACE 语义搜索（复用 ToolManager 中的 AceExecutor），如果不可用则回退到简单文件搜索
-   */
-  private async collectCodeContext(projectRoot: string, prompt: string): Promise<string> {
-    const contextParts: string[] = [];
-    const maxContextLength = 8000; // 限制代码上下文长度
-    let currentLength = 0;
-
-    try {
-      // 1. 尝试使用 ACE 语义搜索（Augment 的核心能力）
-      const aceResult = await this.tryAceSemanticSearch(projectRoot, prompt);
-      if (aceResult) {
-        contextParts.push(`## 相关代码（语义搜索）\n${aceResult}`);
-        currentLength += aceResult.length;
-        logger.info('界面.提示词_增强.ACE语义搜索成功', { resultLength: aceResult.length }, LogCategory.UI);
-      } else {
-        // 2. ACE 不可用，使用本地多策略搜索（grep + 符号搜索 + 知识库索引）
-        logger.info('界面.提示词_增强.ACE不可用，使用本地多策略搜索', undefined, LogCategory.UI);
-
-        const localResult = await this.performLocalContextSearch(projectRoot, prompt, maxContextLength);
-        if (localResult) {
-          contextParts.push(localResult);
-          currentLength += localResult.length;
-        }
-      }
-
-      // 3. 检查是否有 CLAUDE.md 或类似的项目说明文件
-      const guidelineFiles = ['CLAUDE.md', '.augment-guidelines', 'README.md', 'CONTRIBUTING.md'];
-      for (const guideFile of guidelineFiles) {
-        if (currentLength >= maxContextLength) break;
-
-        const guidePath = path.join(projectRoot, guideFile);
-        if (fs.existsSync(guidePath)) {
-          try {
-            const content = fs.readFileSync(guidePath, 'utf-8');
-            const truncatedContent = content.length > 3000
-              ? content.substring(0, 3000) + '\n... (truncated)'
-              : content;
-
-            if (currentLength + truncatedContent.length <= maxContextLength) {
-              contextParts.push(`## 项目指南 (${guideFile})\n${truncatedContent}`);
-              currentLength += truncatedContent.length;
-              break; // 只取第一个找到的指南文件
-            }
-          } catch {
-            // 忽略读取失败
-          }
-        }
-      }
-    } catch (error) {
-      logger.warn('界面.提示词_增强.代码上下文收集异常', { error }, LogCategory.UI);
-    }
-
-    return contextParts.join('\n\n');
-  }
-
-  /**
-   * 尝试使用 ACE 语义搜索获取代码上下文
-   * 复用 ToolManager 中的 AceExecutor，避免重复配置读取
-   * @returns 搜索结果，如果 ACE 不可用则返回 null
-   */
-  private async tryAceSemanticSearch(projectRoot: string, prompt: string): Promise<string | null> {
-    try {
-      // 复用 ToolManager 中的 AceExecutor
-      const toolManager = this.adapterFactory.getToolManager?.();
-      if (!toolManager) {
-        logger.debug('界面.提示词_增强.ToolManager不可用', undefined, LogCategory.UI);
-        return null;
-      }
-
-      // 检查 ACE 是否已配置
-      if (!toolManager.isAceConfigured()) {
-        logger.debug('界面.提示词_增强.ACE未配置', undefined, LogCategory.UI);
-        return null;
-      }
-
-      // 通过 AceExecutor 执行语义搜索
-      const aceExecutor = toolManager.getAceExecutor();
-      const toolCall = {
-        id: `enhance-ace-${Date.now()}`,
-        name: 'codebase_retrieval',
-        arguments: {
-          query: prompt,
-          ensure_indexed: false  // 不强制重新索引
-        }
-      };
-
-      const result = await aceExecutor.execute(toolCall);
-
-      if (!result.isError && result.content && result.content !== '未找到相关代码') {
-        return result.content;
-      }
-
-      return null;
-    } catch (error) {
-      logger.warn('界面.提示词_增强.ACE搜索异常', { error }, LogCategory.UI);
-      return null;
-    }
-  }
-
-  /**
-   * 本地多策略上下文搜索
-   * 当 ACE 语义搜索不可用时，组合 grep + LSP 符号搜索 + 知识库索引进行检索
-   * @returns 搜索结果文本，不可用则返回 null
-   */
-  private async performLocalContextSearch(
-    projectRoot: string,
-    prompt: string,
-    maxContextLength: number
-  ): Promise<string | null> {
-    const toolManager = this.adapterFactory.getToolManager?.();
-    if (!toolManager) {
-      return null;
-    }
-
-    const parts: string[] = [];
-    let currentLength = 0;
-
-    // 1. 提取搜索关键词（取最重要的前 5 个）
-    const keywords = this.extractKeywords(prompt);
-    if (keywords.length === 0) {
-      // 无关键词，退化为项目结构
-      const structure = await this.getProjectStructure(projectRoot);
-      return structure ? `## 项目结构\n${structure}` : null;
-    }
-
-    // 2. 知识库项目上下文（技术栈、入口点等元信息）
-    if (this.projectKnowledgeBase) {
-      const projectContext = this.projectKnowledgeBase.getProjectContext(400);
-      if (projectContext) {
-        parts.push(`## 项目概览\n${projectContext}`);
-        currentLength += projectContext.length;
-      }
-
-      // 2.5 本地搜索引擎（倒排索引 + TF-IDF）
-      try {
-        const searchResults = await this.projectKnowledgeBase.search(prompt, {
-          maxResults: 8,
-          maxContextLength: Math.floor((maxContextLength - currentLength) * 0.6),
-        });
-        if (searchResults.length > 0) {
-          const snippetText = searchResults
-            .map(r => `### ${r.filePath} (得分: ${r.score.toFixed(2)})\n` +
-              r.snippets.map(s => `\`\`\`\n${s.content}\n\`\`\``).join('\n'))
-            .join('\n\n');
-          parts.push(`## 相关代码（索引检索）\n${snippetText}`);
-          currentLength += snippetText.length;
-          logger.info('界面.提示词_增强.本地索引搜索命中', {
-            hits: searchResults.length,
-            length: snippetText.length,
-          }, LogCategory.UI);
-        }
-      } catch (error) {
-        logger.warn('界面.提示词_增强.本地索引搜索失败', { error }, LogCategory.UI);
-      }
-    }
-
-    // 3. grep 搜索文件内容（对最重要的关键词执行正则搜索）
-    const grepResults = await this.grepSearchForContext(toolManager, keywords, maxContextLength - currentLength);
-    if (grepResults) {
-      parts.push(`## 相关代码（关键词匹配）\n${grepResults}`);
-      currentLength += grepResults.length;
-    }
-
-    // 4. LSP 工作空间符号搜索（查找类、函数、接口定义）
-    if (currentLength < maxContextLength * 0.8) {
-      const symbolResults = await this.lspSymbolSearchForContext(
-        toolManager, keywords, maxContextLength - currentLength
-      );
-      if (symbolResults) {
-        parts.push(`## 相关符号定义\n${symbolResults}`);
-        currentLength += symbolResults.length;
-      }
-    }
-
-    if (parts.length === 0) {
-      // 所有策略都无结果，退化为项目结构
-      const structure = await this.getProjectStructure(projectRoot);
-      return structure ? `## 项目结构\n${structure}` : null;
-    }
-
-    logger.info('界面.提示词_增强.本地搜索完成', {
-      strategies: parts.length,
-      totalLength: currentLength,
-      keywords: keywords.slice(0, 3),
-    }, LogCategory.UI);
-
-    return parts.join('\n\n');
-  }
-
-  /**
-   * 使用 grep 搜索关键词对应的代码片段
-   */
-  private async grepSearchForContext(
-    toolManager: any,
-    keywords: string[],
-    maxLength: number
-  ): Promise<string | null> {
-    try {
-      const searchExecutor = toolManager.getSearchExecutor();
-      if (!searchExecutor) return null;
-
-      const results: string[] = [];
-      let totalLength = 0;
-      // 对最重要的前 3 个关键词执行搜索
-      const searchKeywords = keywords.filter(kw => kw.length >= 3).slice(0, 3);
-
-      for (const keyword of searchKeywords) {
-        if (totalLength >= maxLength) break;
-
-        try {
-          // 构造 grep 搜索用的正则：转义特殊字符
-          const escapedKeyword = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          const toolCall = {
-            id: `ctx-grep-${Date.now()}-${keyword}`,
-            name: 'grep_search',
-            arguments: {
-              pattern: escapedKeyword,
-              include: '*.ts,*.tsx,*.js,*.jsx,*.py,*.go,*.rs,*.java,*.c,*.cpp,*.h,*.hpp,*.cs,*.php,*.rb,*.swift,*.kt,*.m,*.vue',
-              context_lines: 2,
-              case_sensitive: false,
-            }
-          };
-
-          const result = await searchExecutor.execute(toolCall);
-          if (!result.isError && result.content && result.content !== 'No matches found') {
-            // 截断单个搜索结果，避免一个关键词占满上下文
-            const maxPerKeyword = Math.floor(maxLength / searchKeywords.length);
-            const truncated = result.content.length > maxPerKeyword
-              ? result.content.substring(0, maxPerKeyword) + '\n... (更多结果已省略)'
-              : result.content;
-
-            results.push(`### 关键词: "${keyword}"\n${truncated}`);
-            totalLength += truncated.length;
-          }
-        } catch {
-          // 单个关键词搜索失败不影响其他
-        }
-      }
-
-      return results.length > 0 ? results.join('\n\n') : null;
-    } catch (error) {
-      logger.warn('界面.本地搜索.grep失败', { error }, LogCategory.UI);
-      return null;
-    }
-  }
-
-  /**
-   * 使用 workspaceSymbols 搜索相关符号定义
-   */
-  private async lspSymbolSearchForContext(
-    toolManager: any,
-    keywords: string[],
-    maxLength: number
-  ): Promise<string | null> {
-    try {
-      const lspExecutor = toolManager.getLspExecutor();
-      if (!lspExecutor) return null;
-
-      const symbolEntries: string[] = [];
-      let totalLength = 0;
-      // 对最重要的前 3 个代码标识符搜索符号
-      const symbolKeywords = keywords
-        .filter(kw => /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(kw) && kw.length >= 3)
-        .slice(0, 3);
-
-      for (const keyword of symbolKeywords) {
-        if (totalLength >= maxLength) break;
-
-        try {
-          const toolCall = {
-            id: `ctx-lsp-${Date.now()}-${keyword}`,
-            name: 'lsp_query',
-            arguments: {
-              action: 'workspaceSymbols',
-              query: keyword,
-            }
-          };
-
-          const result = await lspExecutor.execute(toolCall);
-          if (!result.isError && result.content) {
-            const parsed = JSON.parse(result.content);
-            const symbols = parsed.symbols || [];
-            if (symbols.length === 0) continue;
-
-            // 格式化符号列表（限制每个关键词最多 10 个符号）
-            const formatted = symbols.slice(0, 10).map((sym: any) => {
-              const loc = sym.location;
-              const uri = loc?.uri || '';
-              // 从 file:///path 中提取相对路径
-              const filePath = uri.replace(/^file:\/\//, '').replace(this.workspaceRoot + '/', '');
-              const line = loc?.range?.start?.line ?? '?';
-              return `  - ${sym.kindName || 'symbol'} **${sym.name}** → ${filePath}:${line}`;
-            }).join('\n');
-
-            const entry = `### "${keyword}" 的符号定义\n${formatted}`;
-            if (totalLength + entry.length <= maxLength) {
-              symbolEntries.push(entry);
-              totalLength += entry.length;
-            }
-          }
-        } catch {
-          // 单个符号搜索失败不影响其他
-        }
-      }
-
-      return symbolEntries.length > 0 ? symbolEntries.join('\n\n') : null;
-    } catch (error) {
-      logger.warn('界面.本地搜索.LSP符号失败', { error }, LogCategory.UI);
-      return null;
-    }
-  }
-
-  /**
-   * 获取项目结构概览
-   */
-  private async getProjectStructure(projectRoot: string): Promise<string> {
-    const structure: string[] = [];
-    const maxDepth = 3;
-    const maxFiles = 50;
-    let fileCount = 0;
-
-    const excludeDirs = new Set([
-      'node_modules', '.git', '.vscode', 'dist', 'build', 'out',
-      '__pycache__', '.pytest_cache', 'coverage', '.next', '.nuxt'
-    ]);
-
-    const walk = (dir: string, depth: number, prefix: string = '') => {
-      if (depth > maxDepth || fileCount > maxFiles) return;
-
-      try {
-        const items = fs.readdirSync(dir, { withFileTypes: true });
-        const sortedItems = items.sort((a, b) => {
-          // 目录优先
-          if (a.isDirectory() && !b.isDirectory()) return -1;
-          if (!a.isDirectory() && b.isDirectory()) return 1;
-          return a.name.localeCompare(b.name);
-        });
-
-        for (const item of sortedItems) {
-          if (fileCount > maxFiles) break;
-          if (item.name.startsWith('.') && item.name !== '.env.example') continue;
-          if (excludeDirs.has(item.name)) continue;
-
-          const isLast = items.indexOf(item) === items.length - 1;
-          const connector = isLast ? '└── ' : '├── ';
-          const newPrefix = isLast ? '    ' : '│   ';
-
-          if (item.isDirectory()) {
-            structure.push(`${prefix}${connector}${item.name}/`);
-            walk(path.join(dir, item.name), depth + 1, prefix + newPrefix);
-          } else {
-            structure.push(`${prefix}${connector}${item.name}`);
-            fileCount++;
-          }
-        }
-      } catch {
-        // 忽略权限问题
-      }
-    };
-
-    walk(projectRoot, 0);
-
-    if (structure.length === 0) return '';
-    if (fileCount > maxFiles) {
-      structure.push('... (more files)');
-    }
-
-    return structure.slice(0, 100).join('\n'); // 限制输出行数
-  }
-
-  /**
-   * 从提示词中提取关键词
-   */
-  private extractKeywords(prompt: string): string[] {
-    // 提取可能的文件名、函数名、类名等
-    const words = prompt.split(/[\s,，。.!！?？;；:：()（）[\]【】{}]+/);
-    const keywords: string[] = [];
-
-    for (const word of words) {
-      const cleaned = word.trim();
-      if (cleaned.length < 2) continue;
-      if (cleaned.length > 50) continue;
-
-      // 保留看起来像代码标识符的词
-      if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(cleaned)) {
-        keywords.push(cleaned);
-      }
-      // 保留中文关键词
-      if (/[\u4e00-\u9fa5]{2,}/.test(cleaned)) {
-        keywords.push(cleaned);
-      }
-      // 保留文件扩展名
-      if (/\.[a-z]{1,5}$/i.test(cleaned)) {
-        keywords.push(cleaned);
-      }
-    }
-
-    return [...new Set(keywords)].slice(0, 10); // 去重并限制数量
-  }
-
-  /** 构建提示词增强的 prompt（参考 Augment 方案） */
-  private buildEnhancePrompt(
-    originalPrompt: string,
-    conversationHistory: string,
-    codeContext: string,
-    isChinese: boolean
-  ): string {
-    const languageInstruction = isChinese
-      ? '请用中文输出增强后的提示词。'
-      : 'Please output the enhanced prompt in English.';
-
-    // 参考 Augment 的增强原则
-    return `You are an expert prompt engineer. Your task is to enhance the user's original prompt to make it clearer, more specific, and more actionable for an AI coding assistant.
-
-## Enhancement Principles (参考 Augment 方案)
-
-1. **Clarify Intent**: Make the task goal crystal clear
-2. **Add Technical Context**: Include relevant technical details, constraints, and requirements
-3. **Structure the Request**: Organize the prompt with clear sections if needed
-4. **Make it Actionable**: Ensure the AI can directly execute the task
-5. **Preserve User Intent**: Do not change the user's original intention
-6. **Use Code Context**: Reference relevant files, functions, or patterns from the codebase when applicable
-7. **Consider Existing Patterns**: Align suggestions with existing code patterns and conventions
-
-${codeContext ? `## Codebase Context
-
-The following is relevant context from the user's project:
-
-${codeContext}
-
-` : ''}## Conversation History
-
-${conversationHistory ? conversationHistory : '(No previous conversation)'}
-
-## Original Prompt
-
-${originalPrompt}
-
-## Output Requirements
-
-- ${languageInstruction}
-- Output ONLY the enhanced prompt, without any explanations or prefixes
-- Do NOT include prefixes like "Enhanced prompt:" or "增强后的提示词："
-- Keep it concise but complete
-- If the original prompt references code or files, make sure to maintain those references
-- Add specific technical details that would help the AI assistant complete the task`;
-  }
-
-  // ============================================
-  // LLM 配置管理方法
-  // ============================================
-
-  /** 加载所有 Worker 配置 */
-  private async handleLoadAllWorkerConfigs(): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const fullConfig = LLMConfigLoader.loadFullConfig();
-
-      this.sendData('allWorkerConfigsLoaded', { configs: fullConfig.workers });
-    } catch (error: any) {
-      logger.error('加载 Worker 配置失败', { error: error.message }, LogCategory.LLM);
-      this.sendToast(`加载配置失败: ${error.message}`, 'error');
-    }
-  }
-
-  /** 保存 Worker 配置 */
-  private async handleSaveWorkerConfig(worker: WorkerSlot, config: any): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-
-      // 保存配置
-      LLMConfigLoader.updateWorkerConfig(worker, config);
-
-      // 清除适配器缓存
-      await this.adapterFactory.clearAdapter(worker);
-
-      this.sendToast(`${worker} 配置已保存`, 'success');
-
-      logger.info('Worker 配置已保存', { worker }, LogCategory.LLM);
-    } catch (error: any) {
-      logger.error('保存 Worker 配置失败', { worker, error: error.message }, LogCategory.LLM);
-      this.sendToast(`保存配置失败: ${error.message}`, 'error');
-    }
-  }
-
-  /** 测试 Worker 连接 */
-  private async handleTestWorkerConnection(worker: WorkerSlot, config: any): Promise<void> {
-    try {
-      const normalizedConfig = { ...config, enabled: config?.enabled !== false };
-      if (!normalizedConfig.enabled) {
-        this.sendToast(`${worker} 未启用，无法测试连接`, 'warning');
-        return;
-      }
-      const { createLLMClient } = await import('../llm/clients/client-factory');
-      const client = createLLMClient(normalizedConfig);
-
-      // 发送测试请求
-      const response = await client.sendMessage({
-        messages: [{ role: 'user', content: 'Hello' }],
-        maxTokens: 10,
-        temperature: 0.7
-      });
-
-      if (response && response.content) {
-        this.sendData('workerConnectionTestResult', { worker, success: true });
-        this.sendToast(`${worker} 连接成功`, 'success');
-      } else {
-        throw new Error('No response from LLM');
-      }
-    } catch (error: any) {
-      logger.error('Worker 连接测试失败', { worker, error: error.message }, LogCategory.LLM);
-
-      this.sendData('workerConnectionTestResult', { worker, success: false, error: error.message });
-      this.sendToast(`${worker} 连接失败: ${error.message}`, 'error');
-    }
-  }
-
-  /** 加载编排者配置 */
-  private async handleLoadOrchestratorConfig(): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const config = LLMConfigLoader.loadOrchestratorConfig();
-
-      this.sendData('orchestratorConfigLoaded', { config });
-    } catch (error: any) {
-      logger.error('加载编排者配置失败', { error: error.message }, LogCategory.LLM);
-      this.sendToast(`加载配置失败: ${error.message}`, 'error');
-    }
-  }
-
-  /** 保存编排者配置 */
-  private async handleSaveOrchestratorConfig(config: any): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-
-      // 保存配置
-      LLMConfigLoader.updateOrchestratorConfig(config);
-
-      // 清除适配器缓存
-      await this.adapterFactory.clearAdapter('orchestrator');
-
-      this.sendToast('编排者配置已保存', 'success');
-
-      logger.info('编排者配置已保存', undefined, LogCategory.LLM);
-    } catch (error: any) {
-      logger.error('保存编排者配置失败', { error: error.message }, LogCategory.LLM);
-      this.sendToast(`保存配置失败: ${error.message}`, 'error');
-    }
-  }
-
-  /** 测试编排者连接 */
-  private async handleTestOrchestratorConnection(config: any): Promise<void> {
-    try {
-      const normalizedConfig = { ...config, enabled: config?.enabled !== false };
-      if (!normalizedConfig.enabled) {
-        this.sendToast('编排者未启用，无法测试连接', 'warning');
-        return;
-      }
-      const { createLLMClient } = await import('../llm/clients/client-factory');
-      const client = createLLMClient(normalizedConfig);
-
-      // 发送测试请求
-      const response = await client.sendMessage({
-        messages: [{ role: 'user', content: 'Hello' }],
-        maxTokens: 10,
-        temperature: 0.7
-      });
-
-      if (response && response.content) {
-        this.sendData('orchestratorConnectionTestResult', { success: true });
-        this.sendToast('编排模型连接成功', 'success');
-      } else {
-        throw new Error('No response from LLM');
-      }
-    } catch (error: any) {
-      logger.error('编模型连接测试失败', { error: error.message }, LogCategory.LLM);
-
-      this.sendData('orchestratorConnectionTestResult', { success: false, error: error.message });
-      this.sendToast(`编排模型连接失败: ${error.message}`, 'error');
-    }
-  }
-
-  /** 加载压缩模型配置 */
-  private async handleLoadCompressorConfig(): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const config = LLMConfigLoader.loadCompressorConfig();
-
-      this.sendData('compressorConfigLoaded', { config });
-    } catch (error: any) {
-      logger.error('加载压缩模型配置失败', { error: error.message }, LogCategory.LLM);
-      this.sendToast(`加载配置失败: ${error.message}`, 'error');
-    }
-  }
-
-  /** 保存压缩模型配置 */
-  private async handleSaveCompressorConfig(config: any): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-
-      // 保存配置
-      LLMConfigLoader.updateCompressorConfig(config);
-
-      await this.orchestratorEngine.reloadCompressionAdapter();
-
-      this.sendToast('压缩模型配置已保存', 'success');
-
-      logger.info('压缩模型配置已保存', undefined, LogCategory.LLM);
-    } catch (error: any) {
-      logger.error('保存压缩模型配置失败', { error: error.message }, LogCategory.LLM);
-      this.sendToast(`保存配置失败: ${error.message}`, 'error');
-    }
-  }
-
-  /** 测试压缩模型连接 */
-  private async handleTestCompressorConnection(config: any): Promise<void> {
-    let fallbackModel: string | undefined;
-    try {
-      const normalizedConfig = { ...config, enabled: Boolean(config?.apiKey) || config?.enabled === true };
-      const { LLMConfigLoader } = await import('../llm/config');
-      const orchestratorConfig = LLMConfigLoader.loadOrchestratorConfig();
-      fallbackModel = orchestratorConfig?.provider && orchestratorConfig?.model
-        ? `${orchestratorConfig.provider} - ${orchestratorConfig.model}`
-        : undefined;
-
-      if (!normalizedConfig.enabled || !normalizedConfig.apiKey || !normalizedConfig.model) {
-        this.sendData('compressorConnectionTestResult', {
-          success: false,
-          error: '压缩模型未配置或不可用',
-          fallbackModel
-        });
-        this.sendToast('压缩模型不可用，已降级使用编排者模型', 'warning');
-        return;
-      }
-      const { createLLMClient } = await import('../llm/clients/client-factory');
-      const client = createLLMClient(normalizedConfig);
-
-      // 发送测试请求
-      const response = await client.sendMessage({
-        messages: [{ role: 'user', content: 'Hello' }],
-        maxTokens: 10,
-        temperature: 0.7
-      });
-
-      if (response && response.content) {
-        this.sendData('compressorConnectionTestResult', { success: true });
-        this.sendToast('压缩模型连接成功', 'success');
-      } else {
-        throw new Error('No response from LLM');
-      }
-    } catch (error: any) {
-      logger.error('压缩模型连接测试失败', { error: error.message }, LogCategory.LLM);
-
-      this.sendData('compressorConnectionTestResult', {
-        success: false,
-        error: error.message,
-        fallbackModel
-      });
-      this.sendToast('压缩模型连接失败，已降级使用编排者模型', 'warning');
-    }
-  }
-
-  /** 获取模型列表（直接调用 /v1/models，无需创建 LLMClient） */
-  private async handleFetchModelList(config: any, target: string): Promise<void> {
-    try {
-      if (!config?.baseUrl || !config?.apiKey) {
-        this.sendData('modelListFetched', { target, success: false, models: [], error: '请先填写 Base URL 和 API Key' });
-        return;
-      }
-
-      let modelsUrl = config.baseUrl;
-      if (!modelsUrl.endsWith('/v1')) {
-        modelsUrl = modelsUrl.replace(/\/$/, '') + '/v1';
-      }
-      modelsUrl += '/models';
-
-      const response = await fetch(modelsUrl, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${config.apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        signal: AbortSignal.timeout(10000),
-      });
-
-      if (!response.ok) {
-        const status = response.status;
-        let error = `HTTP ${status}`;
-        if (status === 401 || status === 403) error = 'API Key 无效';
-        else if (status === 404) error = '该 API 不支持模型列表查询';
-        this.sendData('modelListFetched', { target, success: false, models: [], error });
-        this.sendToast(`获取模型列表失败: ${error}`, 'error');
-        return;
-      }
-
-      const data = await response.json();
-      const models: string[] = (data?.data || [])
-        .map((m: any) => m.id)
-        .filter((id: any) => typeof id === 'string' && id.length > 0)
-        .sort();
-
-      this.sendData('modelListFetched', { target, success: true, models });
-      this.sendToast(`获取到 ${models.length} 个模型`, 'success');
-    } catch (error: any) {
-      const message = error.message || String(error);
-      let displayError = message;
-      if (message.includes('timeout') || message.includes('TimeoutError')) displayError = '连接超时';
-      else if (message.includes('ECONNREFUSED') || message.includes('ENOTFOUND')) displayError = '网络连接失败';
-
-      logger.error('获取模型列表失败', { target, error: message }, LogCategory.LLM);
-      this.sendData('modelListFetched', { target, success: false, models: [], error: displayError });
-      this.sendToast(`获取模型列表失败: ${displayError}`, 'error');
-    }
-  }
-
-  // ============================================================================
-  // MCP 配置处理方法
-  // ============================================================================
-
-  /**
-   * 获取或创建 MCP 管理器
-   */
-  private async getMCPManager(): Promise<any> {
-    const executor = this.adapterFactory.getMCPExecutor();
-    if (!executor || typeof (executor as any).getMCPManager !== 'function') {
-      throw new Error('MCP executor not available');
-    }
-    return (executor as any).getMCPManager();
-  }
-
-  /**
-   * 加载 MCP 服务器列表
-   */
-  private async handleLoadMCPServers(): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const servers = LLMConfigLoader.loadMCPConfig();
-      for (const server of servers) {
-        if (!server || typeof server !== 'object') {
-          throw new Error('Invalid MCP server entry');
-        }
-        if (!server.id || typeof server.id !== 'string' || !server.id.trim()) {
-          throw new Error('MCP server missing id');
-        }
-        if (!server.name || typeof server.name !== 'string' || !server.name.trim()) {
-          throw new Error(`MCP server ${server.id || '<unknown>'} missing name`);
-        }
-      }
-
-      this.sendData('mcpServersLoaded', { servers });
-    } catch (error: any) {
-      logger.error('加载 MCP 服务器列表失败', { error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`加载 MCP 服务器失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 添加 MCP 服务器
-   */
-  private async handleAddMCPServer(server: any): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-
-      if (!server || typeof server !== 'object') {
-        throw new Error('Invalid MCP server payload');
-      }
-      if (!server.id || typeof server.id !== 'string' || !server.id.trim()) {
-        throw new Error('MCP server missing id');
-      }
-      if (!server.name || typeof server.name !== 'string' || !server.name.trim()) {
-        throw new Error('MCP server missing name');
-      }
-
-      LLMConfigLoader.addMCPServer(server);
-
-      this.sendData('mcpServerAdded', { server });
-      this.sendToast(`MCP 服务器 "${server.name}" 已添加`, 'success');
-
-      await this.adapterFactory.reloadMCP();
-      logger.info('MCP reloaded in adapter factory', { id: server.id }, LogCategory.TOOLS);
-
-      logger.info('MCP 服务器已添加', { id: server.id, name: server.name }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('添加 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`添加 MCP 服务器失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 更新 MCP 服务器
-   */
-  private async handleUpdateMCPServer(serverId: string, updates: any): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      LLMConfigLoader.updateMCPServer(serverId, updates);
-
-      this.sendData('mcpServerUpdated', { serverId });
-      this.sendToast('MCP 服务器已更新', 'success');
-
-      await this.adapterFactory.reloadMCP();
-      logger.info('MCP reloaded in adapter factory', { id: serverId }, LogCategory.TOOLS);
-
-      logger.info('MCP 服务器已更新', { id: serverId }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('更新 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`更新 MCP 服务器失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 删除 MCP 服务器
-   */
-  private async handleDeleteMCPServer(serverId: string): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-
-      // 先断开连接
-      const manager = await this.getMCPManager();
-      await manager.disconnectServer(serverId);
-
-      // 删除配置
-      LLMConfigLoader.deleteMCPServer(serverId);
-
-      this.sendData('mcpServerDeleted', { serverId });
-      this.sendToast('MCP 服务器已删除', 'success');
-
-      await this.adapterFactory.reloadMCP();
-      logger.info('MCP reloaded in adapter factory', { id: serverId }, LogCategory.TOOLS);
-
-      logger.info('MCP 服务器已删除', { id: serverId }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('删除 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`删除 MCP 服务器失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 连接 MCP 服务器
-   */
-  private async handleConnectMCPServer(serverId: string): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const servers = LLMConfigLoader.loadMCPConfig();
-      const server = servers.find((s: any) => s.id === serverId);
-
-      if (!server) {
-        throw new Error(`MCP 服务器不存在: ${serverId}`);
-      }
-
-      if (!server.enabled) {
-        throw new Error('MCP 服务器未启用');
-      }
-
-      const manager = await this.getMCPManager();
-      await manager.connectServer(server);
-
-      const tools = manager.getServerTools(serverId);
-
-      this.sendToast(`MCP 服务器 "${server.name}" 已连接，发现 ${tools.length} 个工具`, 'success');
-
-      logger.info('MCP 服务器已连接', { id: serverId, toolCount: tools.length }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('连接 MCP 服务器失败', { serverId, error: error.message }, LogCategory.TOOLS);
-
-      this.sendToast(`连接 MCP 服务器失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 断开 MCP 服务器连接
-   */
-  private async handleDisconnectMCPServer(serverId: string): Promise<void> {
-    try {
-      const manager = await this.getMCPManager();
-      await manager.disconnectServer(serverId);
-
-      this.sendToast('MCP 服务器已断开连接', 'success');
-
-      logger.info('MCP 服务器已断开', { id: serverId }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('断开 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`断开 MCP 服务器失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 刷新 MCP 服务器工具列表
-   */
-  private async handleRefreshMCPTools(serverId: string): Promise<void> {
-    try {
-      const manager = await this.getMCPManager();
-      let tools: any[] = [];
-
-      if (!manager.getServerStatus(serverId)) {
-        const { LLMConfigLoader } = await import('../llm/config');
-        const servers = LLMConfigLoader.loadMCPConfig();
-        const server = servers.find((s: any) => s.id === serverId);
-
-        if (!server) {
-          throw new Error(`MCP 服务器不存在: ${serverId}`);
-        }
-
-        if (!server.enabled) {
-          throw new Error('MCP 服务器未启用');
-        }
-
-        await manager.connectServer(server);
-      }
-
-      tools = await manager.refreshServerTools(serverId);
-
-      this.sendData('mcpToolsRefreshed', { serverId, tools });
-      this.sendToast(`工具列表已刷新，发现 ${tools.length} 个工具`, 'success');
-
-      logger.info('MCP 工具列表已刷新', { serverId, toolCount: tools.length }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('刷新 MCP 工具列表失败', { error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`刷新工具列表失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 获取 MCP 服务器工具列表
-   */
-  private async handleGetMCPServerTools(serverId: string): Promise<void> {
-    try {
-      const manager = await this.getMCPManager();
-      const tools = manager.getServerTools(serverId);
-
-      this.sendData('mcpServerTools', { serverId, tools });
-    } catch (error: any) {
-      logger.error('获取 MCP 工具列表失败', { error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`获取工具列表失败: ${error.message}`, 'error');
-    }
-  }
-
-  // ============================================================================
-  // Skills 配置处理
-  // ============================================================================
-
-  private async reloadSkillsIfPossible(reason: string): Promise<void> {
-    await this.adapterFactory.reloadSkills();
-    logger.info('Skills reloaded in adapter factory', { reason }, LogCategory.TOOLS);
-  }
-
-  /**
-   * 加载 Skills 配置
-   */
-  private async handleLoadSkillsConfig(): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const config = LLMConfigLoader.loadSkillsConfig();
-
-      this.sendData('skillsConfigLoaded', {
-        config: config || {
-          customTools: [],
-          instructionSkills: [],
-          repositories: []
-        }
-      });
-
-      logger.info('Skills 配置已加载', {}, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('加载 Skills 配置失败', { error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`加载 Skills 配置失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 保存 Skills 配置
-   */
-  private async handleSaveSkillsConfig(config: any): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      LLMConfigLoader.saveSkillsConfig(config);
-
-      this.sendToast('Skills 配置已保存', 'success');
-
-      await this.reloadSkillsIfPossible('saveSkillsConfig');
-
-      logger.info('Skills 配置已保存', {}, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('保存 Skills 配置失败', { error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`保存 Skills 配置失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 添加自定义工具
-   */
-  private async handleAddCustomTool(tool: any): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const config = LLMConfigLoader.loadSkillsConfig() || {
-        customTools: [],
-        instructionSkills: [],
-        repositories: []
-      };
-
-      // 检查是否已存在
-      const existingIndex = config.customTools.findIndex((t: any) => t.name === tool.name);
-      if (existingIndex >= 0) {
-        config.customTools[existingIndex] = tool;
-      } else {
-        config.customTools.push(tool);
-      }
-
-      LLMConfigLoader.saveSkillsConfig(config);
-
-      this.sendData('customToolAdded', { tool });
-      this.sendToast(`自定义工具 "${tool.name}" 已添加`, 'success');
-
-      await this.reloadSkillsIfPossible('addCustomTool');
-
-      logger.info('自定义工具已添加', { name: tool.name }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('添加自定义工具失败', { error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`添加自定义工具失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 删除自定义工具
-   */
-  private async handleRemoveCustomTool(toolName: string): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const config = LLMConfigLoader.loadSkillsConfig() || {
-        customTools: [],
-        instructionSkills: [],
-        repositories: []
-      };
-
-      config.customTools = config.customTools.filter((t: any) => t.name !== toolName);
-      LLMConfigLoader.saveSkillsConfig(config);
-
-      this.sendData('customToolRemoved', { toolName });
-      this.sendToast(`自定义工具 "${toolName}" 已删除`, 'success');
-
-      await this.reloadSkillsIfPossible('removeCustomTool');
-
-      logger.info('自定义工具已删除', { name: toolName }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('删除自定义工具失败', { toolName, error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`删除自定义工具失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 删除 Instruction Skill
-   */
-  private async handleRemoveInstructionSkill(skillName: string): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const config = LLMConfigLoader.loadSkillsConfig() || {
-        customTools: [],
-        instructionSkills: [],
-        repositories: []
-      };
-
-      config.instructionSkills = (config.instructionSkills || []).filter((s: any) => s.name !== skillName);
-      LLMConfigLoader.saveSkillsConfig(config);
-
-      this.sendData('instructionSkillRemoved', { skillName });
-      this.sendToast(`Instruction Skill "${skillName}" 已删除`, 'success');
-
-      await this.reloadSkillsIfPossible('removeInstructionSkill');
-
-      logger.info('Instruction Skill 已删除', { name: skillName }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('删除 Instruction Skill 失败', { skillName, error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`删除 Instruction Skill 失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 安装 Skill
-   */
-  private async handleInstallSkill(skillId: string): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const { SkillRepositoryManager } = await import('../tools/skill-repository-manager');
-
-      const repositories = LLMConfigLoader.loadRepositories();
-      const manager = new SkillRepositoryManager();
-      const skills = await manager.getAllSkills(repositories);
-      const skill = skills.find((item: any) => item.fullName === skillId || item.id === skillId);
-      if (!skill) {
-        throw new Error(`未找到 Skill: ${skillId}`);
-      }
-
-      // 加载当前配置
-      const config = LLMConfigLoader.loadSkillsConfig() || {
-        customTools: [],
-        instructionSkills: [],
-        repositories
-      };
-
-      const updatedConfig = applySkillInstall(config, skill);
-      Object.assign(config, updatedConfig);
-
-      // 保存配置
-      LLMConfigLoader.saveSkillsConfig(config);
-
-      // 发送成功消息
-      this.sendData('skillInstalled', { skillId, skill });
-      this.sendToast(`Skill "${skill.description}" 已安装`, 'success');
-
-      // 重新加载配置以更新前端
-      await this.handleLoadSkillsConfig();
-
-      // 重新加载 Skills 到 ToolManager（让工具真正可用）
-      await this.reloadSkillsIfPossible('installSkill');
-
-      logger.info('Skill 已安装', { skillId, name: skill.name }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('安装 Skill 失败', { skillId, error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`安装 Skill 失败: ${error.message}`, 'error');
-    }
-  }
-
-  // ============================================================================
-  // Skills 仓库管理
-  // ============================================================================
-
-  /**
-   * 加载仓库配置
-   */
-  private async handleLoadRepositories(): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const repositories = LLMConfigLoader.loadRepositories();
-
-      this.sendData('repositoriesLoaded', { repositories });
-
-      logger.info('Repositories loaded', { count: repositories.length }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('Failed to load repositories', { error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`加载仓库失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 添加仓库（简化版：只需要 URL）
-   */
-  private async handleAddRepository(url: string): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const { SkillRepositoryManager } = await import('../tools/skill-repository-manager');
-
-      // 先验证仓库
-      const manager = new SkillRepositoryManager();
-      const repoInfo = await manager.validateRepository(url);
-
-      // 添加仓库
-      const result = await LLMConfigLoader.addRepository(url);
-
-      // 更新仓库名称和类型
-      LLMConfigLoader.updateRepositoryName(result.id, repoInfo.name);
-      LLMConfigLoader.updateRepository(result.id, { type: repoInfo.type });
-
-      this.sendData('repositoryAdded', {
-        repository: {
-          id: result.id,
-          url,
-          name: repoInfo.name,
-          type: repoInfo.type,
-          enabled: true
-        }
-      });
-      this.sendToast(`仓库 "${repoInfo.name}" 已添加（${repoInfo.skillCount} 个技能）`, 'success');
-
-      logger.info('Repository added', { url, name: repoInfo.name, type: repoInfo.type }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('Failed to add repository', { url, error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`添加仓库失败: ${error.message}`, 'error');
-      this.sendData('repositoryAddFailed', { error: error.message });
-    }
-  }
-
-  /**
-   * 更新仓库
-   */
-  private async handleUpdateRepository(repositoryId: string, updates: any): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      LLMConfigLoader.updateRepository(repositoryId, updates);
-
-      this.sendToast('仓库已更新', 'success');
-
-      // 重新加载仓库列表
-      await this.handleLoadRepositories();
-
-      logger.info('Repository updated', { id: repositoryId }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('Failed to update repository', { repositoryId, error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`更新仓库失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 删除仓库
-   */
-  private async handleDeleteRepository(repositoryId: string): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      LLMConfigLoader.deleteRepository(repositoryId);
-
-      this.sendData('repositoryDeleted', { repositoryId });
-      this.sendToast('仓库已删除', 'success');
-
-      // 重新加载仓库列表
-      await this.handleLoadRepositories();
-
-      logger.info('Repository deleted', { id: repositoryId }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('Failed to delete repository', { repositoryId, error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`删除仓库失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 刷新仓库缓存
-   */
-  private async handleRefreshRepository(repositoryId: string): Promise<void> {
-    try {
-      const { SkillRepositoryManager } = await import('../tools/skill-repository-manager');
-      const manager = new SkillRepositoryManager();
-      manager.clearCache(repositoryId);
-
-      this.sendData('repositoryRefreshed', { repositoryId });
-      this.sendToast('仓库缓存已清除', 'success');
-
-      logger.info('Repository cache cleared', { id: repositoryId }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('Failed to refresh repository', { repositoryId, error: error.message }, LogCategory.TOOLS);
-      this.sendToast(`刷新仓库失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 加载 Skill 库（从所有启用的仓库）
-   */
-  private async handleLoadSkillLibrary(): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const { SkillRepositoryManager } = await import('../tools/skill-repository-manager');
-
-      // 加载仓库配置
-      const repositories = LLMConfigLoader.loadRepositories();
-      logger.info('Loaded repositories for skill library', {
-        count: repositories.length,
-        repositories: repositories.map((r: any) => ({ id: r.id, url: r.url }))
-      }, LogCategory.TOOLS);
-
-      // 获取所有 Skills
-      const manager = new SkillRepositoryManager();
-      const skills = await manager.getAllSkills(repositories);
-      logger.info('Fetched skills from all repositories', {
-        totalSkills: skills.length,
-        byRepository: skills.reduce((acc: any, skill) => {
-          acc[skill.repositoryId] = (acc[skill.repositoryId] || 0) + 1;
-          return acc;
-        }, {})
-      }, LogCategory.TOOLS);
-
-      // 检查哪些已安装
-      const skillsConfig = LLMConfigLoader.loadSkillsConfig();
-      const installedSkills = new Set<string>();
-      // 内置工具由 ToolManager 管理，不通过 builtInTools 配置
-      if (skillsConfig && Array.isArray(skillsConfig.customTools)) {
-        skillsConfig.customTools.forEach((tool: any) => {
-          if (tool?.name) {
-            installedSkills.add(tool.name);
-          }
-        });
-      }
-      if (skillsConfig && Array.isArray(skillsConfig.instructionSkills)) {
-        skillsConfig.instructionSkills.forEach((skill: any) => {
-          if (skill?.name) {
-            installedSkills.add(skill.name);
-          }
-        });
-      }
-
-      // 添加安装状态
-      const skillsWithStatus = skills.map(skill => ({
-        ...skill,
-        installed: installedSkills.has(skill.fullName)
-      }));
-
-      this.sendData('skillLibraryLoaded', { skills: skillsWithStatus });
-
-      logger.info('Skill library loaded', {
-        totalSkills: skillsWithStatus.length,
-        installedCount: skillsWithStatus.filter(s => s.installed).length
-      }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('Failed to load skill library', { error: error.message, stack: error.stack }, LogCategory.TOOLS);
-      this.sendToast(`加载 Skill 库失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 获取项目知识（代码索引、ADR、FAQ）
-   */
-  private async handleGetProjectKnowledge(): Promise<void> {
-    try {
-      const kb = this.projectKnowledgeBase;
-      if (!kb) {
-        this.sendToast('项目知识库未初始化', 'warning');
-        return;
-      }
-
-      const codeIndex = kb.getCodeIndex();
-      const adrs = kb.getADRs();
-      const faqs = kb.getFAQs();
-
-      this.sendData('projectKnowledgeLoaded', { codeIndex, adrs, faqs });
-
-      logger.info('项目知识.已加载', {
-        files: codeIndex ? codeIndex.files.length : 0,
-        adrs: adrs.length,
-        faqs: faqs.length
-      }, LogCategory.SESSION);
-    } catch (error: any) {
-      logger.error('项目知识.加载失败', { error: error.message }, LogCategory.SESSION);
-      this.sendToast(`加载项目知识失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 清空项目知识库
-   */
-  private async handleClearProjectKnowledge(): Promise<void> {
-    try {
-      const kb = this.projectKnowledgeBase;
-      if (!kb) {
-        this.sendToast('项目知识库未初始化', 'warning');
-        return;
-      }
-
-      const counts = kb.clearAll();
-      const total = counts.adrs + counts.faqs + counts.learnings;
-      this.sendToast(`已清空 ${total} 条知识记录（ADR: ${counts.adrs}, FAQ: ${counts.faqs}, 经验: ${counts.learnings}）`, 'success');
-      logger.info('项目知识库.已清空', counts, LogCategory.SESSION);
-      await this.handleGetProjectKnowledge();
-    } catch (error: any) {
-      logger.error('项目知识库.清空失败', { error: error.message }, LogCategory.SESSION);
-      this.sendToast(`清空失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 获取 ADR 列表
-   */
-  private async handleGetADRs(filter?: { status?: string }): Promise<void> {
-    try {
-      const kb = this.projectKnowledgeBase;
-      if (!kb) {
-        this.sendToast('项目知识库未初始化', 'warning');
-        return;
-      }
-
-      const adrs = kb.getADRs(filter as any);
-      logger.info('ADR.已加载', { count: adrs.length, filter }, LogCategory.SESSION);
-      await this.handleGetProjectKnowledge();
-    } catch (error: any) {
-      logger.error('ADR.加载失败', { error: error.message }, LogCategory.SESSION);
-      this.sendToast(`加载 ADR 失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 获取 FAQ 列表
-   */
-  private async handleGetFAQs(filter?: { category?: string }): Promise<void> {
-    try {
-      const kb = this.projectKnowledgeBase;
-      if (!kb) {
-        this.sendToast('项目知识库未初始化', 'warning');
-        return;
-      }
-
-      const faqs = kb.getFAQs(filter);
-      logger.info('FAQ.已加载', { count: faqs.length, filter }, LogCategory.SESSION);
-      await this.handleGetProjectKnowledge();
-    } catch (error: any) {
-      logger.error('FAQ.加载失败', { error: error.message }, LogCategory.SESSION);
-      this.sendToast(`加载 FAQ 失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 搜索 FAQ
-   */
-  private async handleSearchFAQs(keyword: string): Promise<void> {
-    try {
-      const kb = this.projectKnowledgeBase;
-      if (!kb) {
-        this.sendToast('项目知识库未初始化', 'warning');
-        return;
-      }
-
-      const results = kb.searchFAQs(keyword);
-      logger.info('FAQ.搜索完成', { keyword, count: results.length }, LogCategory.SESSION);
-      await this.handleGetProjectKnowledge();
-    } catch (error: any) {
-      logger.error('FAQ.搜索失败', { error: error.message }, LogCategory.SESSION);
-      this.sendToast(`搜索 FAQ 失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 删除 ADR
-   */
-  private async handleDeleteADR(id: string): Promise<void> {
-    try {
-      const kb = this.projectKnowledgeBase;
-      if (!kb) {
-        this.sendToast('项目知识库未初始化', 'warning');
-        return;
-      }
-
-      const success = kb.deleteADR(id);
-      if (success) {
-        this.sendToast('ADR 已删除', 'success');
-        logger.info('ADR.删除成功', { id }, LogCategory.SESSION);
-        await this.handleGetProjectKnowledge();
-      } else {
-        this.sendToast('ADR 删除失败', 'error');
-      }
-    } catch (error: any) {
-      logger.error('ADR.删除失败', { error: error.message }, LogCategory.SESSION);
-      this.sendToast(`删除失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 删除 FAQ
-   */
-  private async handleDeleteFAQ(id: string): Promise<void> {
-    try {
-      const kb = this.projectKnowledgeBase;
-      if (!kb) {
-        this.sendToast('项目知识库未初始化', 'warning');
-        return;
-      }
-
-      const success = kb.deleteFAQ(id);
-      if (success) {
-        this.sendToast('FAQ 已删除', 'success');
-        logger.info('FAQ.删除成功', { id }, LogCategory.SESSION);
-        await this.handleGetProjectKnowledge();
-      } else {
-        this.sendToast('FAQ 删除失败', 'error');
-      }
-    } catch (error: any) {
-      logger.error('FAQ.删除失败', { error: error.message }, LogCategory.SESSION);
-      this.sendToast(`删除失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 在编辑器中打开文件
-   */
-  private async handleOpenFile(filePath: string): Promise<void> {
-    try {
-      const kb = this.projectKnowledgeBase;
-      if (!kb) {
-        this.sendToast('项目知识库未初始化', 'warning');
-        return;
-      }
-
-      // 构建完整路径
-      const fullPath = path.join(kb['projectRoot'], filePath);
-
-      // 检查文件是否存在
-      if (!fs.existsSync(fullPath)) {
-        this.sendToast('文件不存在', 'error');
-        return;
-      }
-
-      // 在编辑器中打开文件
-      const document = await vscode.workspace.openTextDocument(fullPath);
-      await vscode.window.showTextDocument(document);
-
-      logger.info('文件.已打开', { path: filePath }, LogCategory.SESSION);
-    } catch (error: any) {
-      logger.error('文件.打开失败', { error: error.message }, LogCategory.SESSION);
-      this.sendToast(`打开文件失败: ${error.message}`, 'error');
-    }
-  }
-
   /**
    * 在新标签页打开 Mermaid 图表
    */
@@ -4394,98 +2405,6 @@ ${originalPrompt}
     } catch (error: any) {
       logger.error('Mermaid.新标签页.失败', { error: error.message }, LogCategory.UI);
       this.sendToast(`打开图表失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 添加 ADR
-   */
-  private async handleAddADR(adr: any): Promise<void> {
-    try {
-      const kb = this.projectKnowledgeBase;
-      if (!kb) {
-        this.sendToast('项目知识库未初始化', 'warning');
-        return;
-      }
-
-      kb.addADR(adr);
-      this.sendToast('ADR 已添加', 'success');
-      logger.info('ADR.已添加', { id: adr.id, title: adr.title }, LogCategory.SESSION);
-      await this.handleGetProjectKnowledge();
-    } catch (error: any) {
-      logger.error('ADR.添加失败', { error: error.message }, LogCategory.SESSION);
-      this.sendToast(`添加 ADR 失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 更新 ADR
-   */
-  private async handleUpdateADR(id: string, updates: any): Promise<void> {
-    try {
-      const kb = this.projectKnowledgeBase;
-      if (!kb) {
-        this.sendToast('项目知识库未初始化', 'warning');
-        return;
-      }
-
-      const success = kb.updateADR(id, updates);
-      if (success) {
-        this.sendToast('ADR 已更新', 'success');
-        logger.info('ADR.已更新', { id }, LogCategory.SESSION);
-        await this.handleGetProjectKnowledge();
-      } else {
-        this.sendToast('ADR 不存在', 'warning');
-      }
-    } catch (error: any) {
-      logger.error('ADR.更新失败', { error: error.message }, LogCategory.SESSION);
-      this.sendToast(`更新 ADR 失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 添加 FAQ
-   */
-  private async handleAddFAQ(faq: any): Promise<void> {
-    try {
-      const kb = this.projectKnowledgeBase;
-      if (!kb) {
-        this.sendToast('项目知识库未初始化', 'warning');
-        return;
-      }
-
-      kb.addFAQ(faq);
-      this.sendToast('FAQ 已添加', 'success');
-      logger.info('FAQ.已添加', { id: faq.id, question: faq.question }, LogCategory.SESSION);
-      await this.handleGetProjectKnowledge();
-    } catch (error: any) {
-      logger.error('FAQ.添加失败', { error: error.message }, LogCategory.SESSION);
-      this.sendToast(`添加 FAQ 失败: ${error.message}`, 'error');
-    }
-  }
-
-  /**
-   * 更新 FAQ
-   */
-  private async handleUpdateFAQ(id: string, updates: any): Promise<void> {
-    try {
-      const kb = this.projectKnowledgeBase;
-      if (!kb) {
-        this.sendToast('项目知识库未初始化', 'warning');
-        return;
-      }
-
-      const success = kb.updateFAQ(id, updates);
-      if (success) {
-        this.sendToast('FAQ 已更新', 'success');
-        logger.info('FAQ.已更新', { id }, LogCategory.SESSION);
-        await this.handleGetProjectKnowledge();
-      } else {
-        this.sendToast('FAQ 不存在', 'warning');
-      }
-    } catch (error: any) {
-      logger.error('FAQ.更新失败', { error: error.message }, LogCategory.SESSION);
-      this.sendToast(`更新 FAQ 失败: ${error.message}`, 'error');
     }
   }
 
@@ -4798,134 +2717,6 @@ ${originalPrompt}
     this.orchestratorEngine.resetOrchestratorTokenUsage();
     this.sendExecutionStats();
     this.sendToast('执行统计已重置', 'info');
-  }
-
-  // ============================================================================
-  // 画像配置处理
-  // ============================================================================
-
-  /** 发送画像配置到 UI */
-  private async sendProfileConfig(): Promise<void> {
-    const assignments = WorkerAssignmentStorage.ensureDefaults();
-    const assignmentMap: Record<string, string> = {};
-
-    for (const [worker, categories] of Object.entries(assignments.assignments)) {
-      for (const category of categories) {
-        assignmentMap[category] = worker;
-      }
-    }
-
-    const categoryGuidance: Record<string, any> = {};
-    for (const [category, definition] of Object.entries(CATEGORY_DEFINITIONS)) {
-      categoryGuidance[category] = {
-        displayName: definition.displayName,
-        description: definition.description,
-        guidance: {
-          focus: definition.guidance?.focus || [],
-          constraints: definition.guidance?.constraints || [],
-        },
-        priority: definition.priority,
-        riskLevel: definition.riskLevel,
-      };
-    }
-
-    const uiConfig: any = {
-      assignments: assignmentMap,
-      categoryGuidance,
-      categoryPriority: CATEGORY_RULES.categoryPriority,
-      configPath: WorkerAssignmentStorage.getConfigPath(),
-    };
-
-    try {
-      const { LLMConfigLoader } = await import('../llm/config');
-      const userRules = LLMConfigLoader.loadUserRules();
-      uiConfig.userRules = userRules.content || '';
-    } catch (error) {
-      logger.warn('加载用户规则失败', { error }, LogCategory.LLM);
-    }
-
-    this.sendData('profileConfig', { config: uiConfig });
-  }
-
-  /** 保存画像配置 */
-  private async handleSaveProfileConfig(data: { assignments: Record<string, string>; userRules?: string }): Promise<void> {
-    try {
-      const workerAssignments: Record<WorkerSlot, string[]> = {
-        claude: [],
-        codex: [],
-        gemini: [],
-      };
-
-      const assignmentMap = data.assignments || {};
-      for (const [category, worker] of Object.entries(assignmentMap)) {
-        const normalizedWorker = String(worker).toLowerCase() as WorkerSlot;
-        if (!['claude', 'codex', 'gemini'].includes(normalizedWorker)) {
-          throw new Error(`未知 Worker: ${worker}`);
-        }
-        workerAssignments[normalizedWorker].push(category);
-      }
-
-      WorkerAssignmentStorage.save({
-        version: WORKER_ASSIGNMENTS_VERSION,
-        assignments: workerAssignments,
-      });
-
-      try {
-        const { LLMConfigLoader } = await import('../llm/config');
-        const userRulesContent = typeof data.userRules === 'string' ? data.userRules : '';
-        const trimmed = userRulesContent.trim();
-        LLMConfigLoader.updateUserRules({
-          enabled: trimmed.length > 0,
-          content: userRulesContent,
-        });
-        this.adapterFactory.refreshUserRules();
-      } catch (rulesError) {
-        logger.warn('保存用户规则失败', { error: rulesError }, LogCategory.LLM);
-      }
-      this.sendData('profileConfigSaved', { success: true });
-      this.sendToast('画像配置已保存', 'success');
-
-      try {
-        await this.orchestratorEngine.reloadProfiles();
-      } catch (reloadError) {
-        const reloadMsg = reloadError instanceof Error ? reloadError.message : String(reloadError);
-        this.sendToast(`画像重载失败: ${reloadMsg}`, 'warning');
-      }
-      await this.sendProfileConfig();
-      logger.info('界面.画像.配置.已保存', { path: WorkerAssignmentStorage.getConfigPath() }, LogCategory.UI);
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      this.sendData('profileConfigSaved', { success: false, error: errorMsg });
-      this.sendToast(`保存失败: ${errorMsg}`, 'error');
-    }
-  }
-
-  /** 重置画像配置 */
-  private async handleResetProfileConfig(): Promise<void> {
-    try {
-      const defaults = WorkerAssignmentStorage.buildDefault();
-      WorkerAssignmentStorage.save(defaults);
-      try {
-        const { LLMConfigLoader } = await import('../llm/config');
-        LLMConfigLoader.updateUserRules({ enabled: false, content: '' });
-        this.adapterFactory.refreshUserRules();
-      } catch (rulesError) {
-        logger.warn('重置用户规则失败', { error: rulesError }, LogCategory.LLM);
-      }
-      try {
-        await this.orchestratorEngine.reloadProfiles();
-      } catch (reloadError) {
-        const reloadMsg = reloadError instanceof Error ? reloadError.message : String(reloadError);
-        this.sendToast(`画像重载失败: ${reloadMsg}`, 'warning');
-      }
-      this.sendToast('画像配置已重置为默认值', 'success');
-      this.sendData('profileConfigReset', { success: true });
-      await this.sendProfileConfig();
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      this.sendData('profileConfigReset', { success: false, error: errorMsg });
-      this.sendToast(`重置失败: ${errorMsg}`, 'error');
-    }
   }
 
   /** 处理设置交互模式 */
@@ -5272,6 +3063,16 @@ ${originalPrompt}
       const wasRunning = this.orchestratorEngine.running;
 
       if (wasRunning) {
+        // 1. 在对话区显示用户追加的消息气泡（解决追加消息不可见的问题）
+        const traceId = this.messageHub.getTraceId();
+        const userMessage = createUserInputMessage(trimmedContent, traceId, {
+          metadata: {
+            isSupplementary: true,
+          },
+        });
+        this.messageHub.sendMessage(userMessage);
+
+        // 2. 注入补充指令队列，在下一决策点生效
         const accepted = this.orchestratorEngine.injectSupplementaryInstruction(trimmedContent);
         if (!accepted) {
           this.sendToast('当前任务不可注入补充指令，请重试', 'warning');
@@ -5285,12 +3086,13 @@ ${originalPrompt}
             pendingInstructionCount: pendingCount,
           },
         });
-        this.sendToast('补充指令已加入队列', 'info');
         logger.info('界面.消息.补充.已入队', { taskId, pendingCount }, LogCategory.UI);
         return;
       }
 
-      await this.executeTask(trimmedContent, undefined, []);
+      // 竞态保护：前端认为执行中但后端已完成，作为新任务执行
+      const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      await this.executeTask(trimmedContent, undefined, [], requestId);
       logger.info('界面.消息.补充.空闲直执_成功', { taskId, wasRunning }, LogCategory.UI);
     } catch (error) {
       logger.error('界面.消息.补充.失败', error, LogCategory.UI);
@@ -5372,7 +3174,8 @@ ${originalPrompt}
 
       // 统一消息通道：由后端发送用户消息与占位消息
       const promptForDisplay = displayPrompt?.trim() || prompt;
-      this.emitUserAndPlaceholder(requestKey, promptForDisplay, images?.length || 0, images);
+      const resolvedTargetWorker = forceWorker || this.selectedWorker || undefined;
+      this.emitUserAndPlaceholder(requestKey, promptForDisplay, images?.length || 0, images, resolvedTargetWorker);
       this.scheduleRequestTimeout(requestKey);
 
       // 🔧 性能优化：强制让出事件循环 (Yield Event Loop)
@@ -5422,18 +3225,6 @@ ${originalPrompt}
       void this.orchestratorEngine.recordContextMessage('user', prompt, this.activeSessionId || undefined);
       this.sendStateUpdate();
 
-      const orchestrationCommand = this.parseOrchestrationCommand(prompt);
-      if (orchestrationCommand?.type === 'plan') {
-        await this.executePlanOnly(orchestrationCommand.payload, imagePaths);
-        success = true;
-        return;
-      }
-      if (orchestrationCommand?.type === 'start-work') {
-        await this.executeStartWork(orchestrationCommand.payload);
-        success = true;
-        return;
-      }
-
       if (useIntelligentMode) {
         // 智能编排模式：统一串行化，避免引擎并发
         const result = await this.enqueueOrchestratorExecution(effectivePrompt, imagePaths);
@@ -5441,7 +3232,7 @@ ${originalPrompt}
         failureReason = result.error;
       } else {
         // 直接执行模式：指定 Worker 直接执行
-        const result = await this.executeWithDirectWorker(effectivePrompt, forceWorker || this.selectedWorker!, imagePaths);
+        const result = await this.directExecutor.execute(effectivePrompt, forceWorker || this.selectedWorker!, imagePaths);
         success = result.success;
         failureReason = result.error;
       }
@@ -5537,9 +3328,6 @@ ${originalPrompt}
     if (!trimmed) {
       return { prompt };
     }
-    if (trimmed.startsWith('/plan') || trimmed.startsWith('@plan') || trimmed.startsWith('/start-work') || trimmed.startsWith('/start')) {
-      return { prompt };
-    }
 
     const match = trimmed.match(/^\/([^\s]+)(\s+([\s\S]*))?$/);
     if (!match) {
@@ -5562,76 +3350,6 @@ ${originalPrompt}
     } catch (error: any) {
       logger.warn('Failed to resolve instruction skill', { error: error.message }, LogCategory.TOOLS);
       return { prompt };
-    }
-  }
-
-  private parseOrchestrationCommand(prompt: string): { type: 'plan' | 'start-work'; payload?: string } | null {
-    const trimmed = prompt.trim();
-    if (!trimmed) return null;
-    if (trimmed.startsWith('/plan') || trimmed.startsWith('@plan')) {
-      const payload = trimmed.replace(/^[@/]+plan\b/i, '').trim();
-      return { type: 'plan', payload };
-    }
-    if (trimmed.startsWith('/start-work') || trimmed.startsWith('/start')) {
-      const payload = trimmed.replace(/^\/start-work\b/i, '').replace(/^\/start\b/i, '').trim();
-      return { type: 'start-work', payload };
-    }
-    return null;
-  }
-
-  private async executePlanOnly(payload: string | undefined, imagePaths: string[]): Promise<void> {
-    const planPrompt = (payload || '').trim();
-    if (!planPrompt) {
-      this.sendToast('请输入计划内容，例如：/plan 实现登录功能', 'warning');
-      return;
-    }
-    // 统一 Todo 系统 - 使用 orchestratorEngine
-    const sessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id || 'default';
-    const task = await this.orchestratorEngine.createTaskFromPrompt(sessionId, planPrompt);
-    try {
-      const record = await this.orchestratorEngine.createPlan(
-        planPrompt,
-        task.id,
-        this.activeSessionId || task.id
-      );
-      this.saveMessageToSession(planPrompt, record.formattedPlan, undefined, 'orchestrator');
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      this.sendOrchestratorMessage({
-        content: errorMsg,
-        messageType: 'error',
-      });
-    } finally {
-      this.sendStateUpdate();
-    }
-  }
-
-  private async executeStartWork(planId?: string): Promise<void> {
-    const sessionId = this.activeSessionId;
-    const record = planId && sessionId
-      ? this.orchestratorEngine.getPlanById(planId, sessionId)
-      : (sessionId ? this.orchestratorEngine.getActivePlanForSession(sessionId) : null);
-
-    if (!record) {
-      this.sendToast('未找到可执行的计划，请先使用 /plan 生成计划', 'warning');
-      return;
-    }
-
-    try {
-      const result = await this.orchestratorEngine.executePlanRecord(
-        record,
-        record.taskId,
-        sessionId || record.sessionId
-      );
-      this.saveMessageToSession('/start-work', result, undefined, 'orchestrator');
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      this.sendOrchestratorMessage({
-        content: errorMsg,
-        messageType: 'error',
-      });
-    } finally {
-      this.sendStateUpdate();
     }
   }
 
@@ -5734,103 +3452,6 @@ ${originalPrompt}
         });
         success = false;
       }
-    }
-
-    this.sendStateUpdate();
-    if (!success) {
-      return { success: false, error: errorMsg };
-    }
-    return { success: true };
-  }
-
-  /** 直接 Worker 执行模式 */
-  private async executeWithDirectWorker(prompt: string, targetWorker: WorkerSlot, imagePaths: string[]): Promise<OrchestratorExecutionResult> {
-    logger.info('界面.执行.模式.直接', { agent: targetWorker }, LogCategory.UI);
-
-    const startTime = Date.now();
-    // 统一 Todo 系统 - 使用 orchestratorEngine
-    const sessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id || 'default';
-    const task = await this.orchestratorEngine.createTaskFromPrompt(sessionId, prompt);
-    await this.orchestratorEngine.markTaskExecuting(task.id);
-    this.sendStateUpdate();
-
-    let errorMsg: string | undefined;
-    let success = false;
-    const toolManager = (this.adapterFactory as LLMAdapterFactory).getToolManager();
-    try {
-      // 设置快照上下文（直接 Worker 模式也需要精确记录文件变更）
-      toolManager.setSnapshotContext({
-        missionId: task.id,
-        assignmentId: `direct-${task.id}`,
-        todoId: `direct-${task.id}`,
-        workerId: targetWorker,
-      });
-      logger.info('界面.执行.直接.请求', { worker: targetWorker }, LogCategory.UI);
-      const response = await this.adapterFactory.sendMessage(targetWorker, prompt, imagePaths);
-      logger.info('界面.执行.直接.响应', { worker: targetWorker, preview: response.content?.substring(0, 100) }, LogCategory.UI);
-      const executionStats = this.orchestratorEngine.getExecutionStats();
-      if (executionStats) {
-        executionStats.recordExecution({
-          worker: targetWorker,
-          taskId: task.id,
-          subTaskId: `direct-${task.id}`,
-          success: !response.error,
-          duration: Date.now() - startTime,
-          error: response.error,
-          inputTokens: response.tokenUsage?.inputTokens,
-          outputTokens: response.tokenUsage?.outputTokens,
-        });
-      }
-
-      if (response.error) {
-        errorMsg = response.error;
-        await this.orchestratorEngine.failTaskById(task.id, response.error);
-        this.sendOrchestratorMessage({
-          content: `${targetWorker.toUpperCase()}: ${response.error}`,
-          messageType: 'error',
-          metadata: { worker: targetWorker },
-        });
-      } else {
-        await this.orchestratorEngine.completeTaskById(task.id);
-        this.saveMessageToSession(prompt, response.content || '', targetWorker, 'worker');
-        const requestId = this.messageHub.getRequestContext();
-        // 向主对话区发送完成消息（复用占位消息 ID，替换占位为完成态）
-        this.messageHub.result(
-          `${targetWorker.toUpperCase()} 已完成任务。详细内容请查看 ${targetWorker.toUpperCase()} 面板。`,
-          { metadata: { requestId, worker: targetWorker } },
-        );
-        success = true;
-      }
-
-    } catch (error) {
-      // 中断导致的 abort 错误静默处理，不向前端发送错误消息
-      if (isAbortError(error)) {
-        logger.info('界面.执行.直接.中断', { worker: targetWorker }, LogCategory.UI);
-        await this.orchestratorEngine.cancelTaskById(task.id);
-      } else {
-        logger.error('界面.执行.直接.失败', error, LogCategory.UI);
-        errorMsg = error instanceof Error ? error.message : String(error);
-        await this.orchestratorEngine.failTaskById(task.id, errorMsg);
-        const executionStats = this.orchestratorEngine.getExecutionStats();
-        if (executionStats) {
-          executionStats.recordExecution({
-            worker: targetWorker,
-            taskId: task.id,
-            subTaskId: `direct-${task.id}`,
-            success: false,
-            duration: Date.now() - startTime,
-            error: errorMsg,
-          });
-        }
-        this.sendOrchestratorMessage({
-          content: `${targetWorker.toUpperCase()}: ${errorMsg}`,
-          messageType: 'error',
-          metadata: { worker: targetWorker },
-        });
-      }
-    } finally {
-      // 清除快照上下文
-      toolManager.clearSnapshotContext(targetWorker);
     }
 
     this.sendStateUpdate();
@@ -6074,10 +3695,6 @@ ${originalPrompt}
 
     this.assertValidArray<any>(tasks, 'uiState.tasks');
     const currentTask = tasks.find(t => t?.status === 'running') ?? tasks[tasks.length - 1];
-    const activePlanRecordRaw = currentSession?.id
-      ? this.orchestratorEngine.getActivePlanForSession(currentSession.id)
-      : null;
-    const activePlanRecord = activePlanRecordRaw?.plan?.needsWorker === false ? null : activePlanRecordRaw;
 
     // 使用轻量级的会话元数据（而不是完整会话数据）
     const sessionMetas = this.sessionManager.getSessionMetas();
@@ -6109,16 +3726,7 @@ ${originalPrompt}
       interactionMode: this.orchestratorEngine.getInteractionMode(),
       interactionModeUpdatedAt: this.interactionModeUpdatedAt,
       orchestratorPhase: this.orchestratorEngine.phase,
-      activePlan: activePlanRecord
-        ? {
-          planId: activePlanRecord.id,
-          formattedPlan: activePlanRecord.formattedPlan,
-          updatedAt: activePlanRecord.updatedAt,
-          review: activePlanRecord.review
-            ? { status: activePlanRecord.review.status, summary: activePlanRecord.review.summary }
-            : undefined,
-        }
-        : undefined,
+      activePlan: undefined,
     };
   }
 

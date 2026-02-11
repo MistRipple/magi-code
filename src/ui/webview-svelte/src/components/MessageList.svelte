@@ -90,8 +90,19 @@
       : messagesState.isProcessing && safeMessages.length > 0
   );
 
-  // 本轮对话计时：从最后一条用户消息的时间戳开始
-  const lastUserMessageTime = $derived.by(() => {
+  // 本轮计时起点：
+  // - thread: 从最后一条用户消息的时间戳开始
+  // - worker: 从本轮第一条消息的时间戳开始（Worker 对话开始的时间）
+  const timerStartTime = $derived.by(() => {
+    if (displayContext === 'worker') {
+      // Worker 面板：使用第一条消息的时间戳作为计时起点
+      // 不依赖 isStreaming 状态，避免新消息到来时计时器被重置
+      if (safeMessages.length > 0) {
+        return safeMessages[0].timestamp;
+      }
+      return 0;
+    }
+    // 主对话区：从最后一条用户消息开始计时
     for (let i = safeMessages.length - 1; i >= 0; i--) {
       if (safeMessages[i].type === 'user_input') {
         return safeMessages[i].timestamp;
@@ -104,12 +115,12 @@
   let timerInterval: ReturnType<typeof setInterval> | null = null;
 
   $effect(() => {
-    const shouldRun = showProcessingIndicator && lastUserMessageTime > 0;
+    const shouldRun = showProcessingIndicator && timerStartTime > 0;
     if (shouldRun) {
       // 立即计算一次
-      elapsedSeconds = Math.floor((Date.now() - lastUserMessageTime) / 1000);
+      elapsedSeconds = Math.floor((Date.now() - timerStartTime) / 1000);
       timerInterval = setInterval(() => {
-        elapsedSeconds = Math.floor((Date.now() - lastUserMessageTime) / 1000);
+        elapsedSeconds = Math.floor((Date.now() - timerStartTime) / 1000);
       }, 1000);
     } else {
       if (timerInterval) {

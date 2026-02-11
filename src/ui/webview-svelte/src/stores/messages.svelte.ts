@@ -624,6 +624,101 @@ export function clearProcessingState() {
   updateProcessingState();
 }
 
+/**
+ * 终结所有未完成的流式消息和残留占位消息
+ *
+ * 任务结束（完成/打断/失败）时调用，确保：
+ * 1. 已输出内容的流式消息标记为完成，保留内容展示
+ * 2. 无内容的空占位消息被移除（避免残留"正在思考..."动画）
+ * 3. 有内容的占位消息转为正常消息（去除占位标记）
+ */
+export function sealAllStreamingMessages() {
+  let threadChanged = false;
+  let agentChanged = false;
+
+  // 判断消息是否有可渲染内容
+  const hasContent = (m: Message): boolean => {
+    if (m.content && m.content.trim().length > 0) return true;
+    if (m.blocks && m.blocks.length > 0) {
+      return m.blocks.some(b => {
+        if (!b || typeof b !== 'object') return false;
+        if ('content' in b && typeof b.content === 'string' && b.content.trim().length > 0) return true;
+        if (b.type === 'tool_call') return true;
+        return false;
+      });
+    }
+    return false;
+  };
+
+  // 处理单条消息：返回 null 表示应移除，返回新对象表示应更新
+  const sealMessage = (m: Message): Message | null => {
+    const isPlaceholder = Boolean(m.metadata?.isPlaceholder);
+    const isStreaming = m.isStreaming;
+
+    if (!isPlaceholder && !isStreaming) return m; // 无需处理
+
+    // 空占位消息（无内容）→ 移除
+    if (isPlaceholder && !hasContent(m)) return null;
+
+    // 有内容的流式消息 / 有内容的占位消息 → 标记完成，保留内容
+    return {
+      ...m,
+      isStreaming: false,
+      isComplete: true,
+      metadata: {
+        ...(m.metadata || {}),
+        isPlaceholder: false,
+        placeholderState: undefined,
+        wasPlaceholder: isPlaceholder ? true : m.metadata?.wasPlaceholder,
+      },
+    };
+  };
+
+  // 处理 threadMessages
+  const sealedThread: Message[] = [];
+  for (const m of messagesState.threadMessages) {
+    const result = sealMessage(m);
+    if (result === null) {
+      threadChanged = true; // 消息被移除
+    } else if (result !== m) {
+      sealedThread.push(result);
+      threadChanged = true; // 消息被更新
+    } else {
+      sealedThread.push(m);
+    }
+  }
+  if (threadChanged) {
+    messagesState.threadMessages = sealedThread;
+  }
+
+  // 处理 agentOutputs
+  const agents: AgentType[] = ['claude', 'codex', 'gemini'];
+  for (const agent of agents) {
+    const list = messagesState.agentOutputs[agent];
+    const sealedList: Message[] = [];
+    let changed = false;
+    for (const m of list) {
+      const result = sealMessage(m);
+      if (result === null) {
+        changed = true;
+      } else if (result !== m) {
+        sealedList.push(result);
+        changed = true;
+      } else {
+        sealedList.push(m);
+      }
+    }
+    if (changed) {
+      messagesState.agentOutputs = { ...messagesState.agentOutputs, [agent]: sealedList };
+      agentChanged = true;
+    }
+  }
+
+  if (threadChanged || agentChanged) {
+    saveWebviewState();
+  }
+}
+
 /** 获取后端处理状态（用于时序判断） */
 export function getBackendProcessing(): boolean {
   return backendProcessing;
