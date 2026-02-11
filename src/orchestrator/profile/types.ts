@@ -106,4 +106,6 @@ export interface InjectionContext {
   category?: string;
   /** 是否主导者 */
   isLeader?: boolean;
+  /** 动态可用工具摘要（内置 + MCP + Skill，由 ToolManager.buildToolsSummary() 生成） */
+  availableToolsSummary?: string;
 }

@@ -31,12 +31,9 @@ export { AssignmentManager } from './assignment-manager';
 // 状态映射器
 export {
   MissionStateMapper,
-  globalMissionStateMapper,
-  type TaskView,
-  type SubTaskView as MissionSubTaskView,
+  type AssignmentView,
   type TodoView,
-  type TaskViewStatus,
-  type SubTaskViewStatus,
-  type TodoViewStatus,
-  type StateChangeCallback,
 } from './state-mapper';
+
+// 数据规范化
+export { normalizeAssignments, normalizeTodos, generateEntityId } from './data-normalizer';

@@ -227,6 +227,143 @@ export class UniversalLLMClient extends BaseLLMClient {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  /**
+   * 检测是否为 400 状态码错误
+   */
+  private is400Error(error: any): boolean {
+    const status = error?.status || error?.response?.status;
+    return status === 400;
+  }
+
+  /**
+   * 检测是否为 400 工具 schema 不兼容错误
+   * Gemini OpenAI 兼容 API 对 JSON Schema 严格校验，
+   * MCP 工具的 schema 可能包含不支持的属性导致 400。
+   */
+  private is400ToolSchemaError(error: any): boolean {
+    const status = error?.status || error?.response?.status;
+    if (status !== 400) return false;
+    const msg = String(error?.message || error?.error?.message || '');
+    return /invalid.argument|invalid.*schema|invalid.*tool|invalid.*function/i.test(msg);
+  }
+
+  /**
+   * 400 工具不兼容容错（非流式）
+   *
+   * 渐进式降级策略：
+   * 1. 二分法排除不兼容工具，保留兼容工具重试
+   * 2. 多次失败后才去掉全部工具
+   */
+  private async retryWithToolElimination(requestParams: any, originalError: any): Promise<any> {
+    const allTools: any[] = requestParams.tools;
+    logger.warn('400 工具不兼容，启动渐进式排除', {
+      model: this.config.model,
+      toolCount: allTools.length,
+      error: originalError?.message?.substring(0, 200),
+    }, LogCategory.LLM);
+
+    // 二分法找出可用工具子集
+    const compatibleTools = await this.findCompatibleTools(
+      allTools,
+      (tools) => {
+        requestParams.tools = tools.length > 0 ? tools : undefined;
+        if (!requestParams.tools) delete requestParams.tool_choice;
+        return this.openaiClient!.chat.completions.create(requestParams);
+      },
+    );
+
+    requestParams.tools = compatibleTools.length > 0 ? compatibleTools : undefined;
+    if (!requestParams.tools) delete requestParams.tool_choice;
+    return this.openaiClient!.chat.completions.create(requestParams);
+  }
+
+  /**
+   * 400 工具不兼容容错（流式）
+   */
+  private async retryStreamWithToolElimination(requestParams: any, signal?: AbortSignal, originalError?: any): Promise<any> {
+    const allTools: any[] = requestParams.tools;
+    logger.warn('400(stream) 工具不兼容，启动渐进式排除', {
+      model: this.config.model,
+      toolCount: allTools.length,
+      error: originalError?.message?.substring(0, 200),
+    }, LogCategory.LLM);
+
+    const createStream = (tools: any[]) => {
+      requestParams.tools = tools.length > 0 ? tools : undefined;
+      if (!requestParams.tools) delete requestParams.tool_choice;
+      return (this.openaiClient!.chat.completions.create as any)(
+        { ...requestParams, stream: true },
+        { signal },
+      );
+    };
+
+    const compatibleTools = await this.findCompatibleTools(allTools, createStream);
+
+    requestParams.tools = compatibleTools.length > 0 ? compatibleTools : undefined;
+    if (!requestParams.tools) delete requestParams.tool_choice;
+    return (this.openaiClient!.chat.completions.create as any)(
+      { ...requestParams, stream: true },
+      { signal },
+    );
+  }
+
+  /**
+   * 二分法查找兼容工具子集
+   *
+   * 策略：将工具列表对半分，分别尝试，保留不触发 400 的那半。
+   * 如果两半都失败则继续递归，直到找到可用子集或全部排除。
+   * 最多 log2(N) 轮 API 调用。
+   */
+  private async findCompatibleTools(
+    tools: any[],
+    tryRequest: (tools: any[]) => Promise<any>,
+  ): Promise<any[]> {
+    if (tools.length <= 1) {
+      // 单个工具：直接尝试，失败则排除
+      if (tools.length === 0) return [];
+      try {
+        await tryRequest(tools);
+        return tools;
+      } catch (error: any) {
+        if (this.is400ToolSchemaError(error)) {
+          logger.warn('排除不兼容工具', {
+            toolName: tools[0]?.function?.name || 'unknown',
+          }, LogCategory.LLM);
+          return [];
+        }
+        throw error;
+      }
+    }
+
+    // 先整体尝试
+    try {
+      await tryRequest(tools);
+      return tools;
+    } catch (error: any) {
+      if (!this.is400ToolSchemaError(error)) throw error;
+    }
+
+    // 整体失败 → 对半分
+    const mid = Math.ceil(tools.length / 2);
+    const firstHalf = tools.slice(0, mid);
+    const secondHalf = tools.slice(mid);
+
+    const [compatible1, compatible2] = await Promise.all([
+      this.findCompatibleTools(firstHalf, tryRequest),
+      this.findCompatibleTools(secondHalf, tryRequest),
+    ]);
+
+    const merged = [...compatible1, ...compatible2];
+
+    logger.info('工具兼容性排除完成', {
+      original: tools.length,
+      retained: merged.length,
+      removed: tools.length - merged.length,
+    }, LogCategory.LLM);
+
+    return merged;
+  }
+
   // ============================================================================
   // Anthropic 实现
   // ============================================================================
@@ -356,10 +493,7 @@ export class UniversalLLMClient extends BaseLLMClient {
       sanitized.enum = prop.enum;
     }
 
-    // 处理默认值
-    if (prop.default !== undefined) {
-      sanitized.default = prop.default;
-    }
+    // 注意：不传递 default 属性（Gemini OpenAI 兼容 API 不支持）
 
     // 处理数组类型
     if (prop.type === 'array' && prop.items) {
@@ -382,20 +516,10 @@ export class UniversalLLMClient extends BaseLLMClient {
 
   /**
    * 检测是否启用 extended thinking
-   * 策略：对所有 Anthropic 请求默认启用 thinking 参数
-   * - 如果后端支持，会返回 thinking 内容
-   * - 如果后端不支持，参数会被忽略，不影响正常响应
-   *
-   * 配置中可以通过 enableThinking: false 来强制禁用
+   * 仅在配置中明确启用 enableThinking: true 时才开启
    */
   private shouldEnableThinking(): boolean {
-    // 如果配置中明确禁用，则不启用
-    if (this.config.enableThinking === false) {
-      return false;
-    }
-
-    // 默认对所有请求启用 thinking（让后端决定是否支持）
-    return true;
+    return this.config.enableThinking === true;
   }
 
   private async sendAnthropicMessage(params: LLMMessageParams): Promise<LLMResponse> {
@@ -747,14 +871,23 @@ export class UniversalLLMClient extends BaseLLMClient {
       requestParams.tool_choice = openAiToolChoice;
     }
 
-    // 仅在配置中明确指定 reasoningEffort 时才添加（该参数仅部分模型支持，盲目添加会导致 400）
-    if (this.config.reasoningEffort) {
+    // 仅在启用 thinking 且配置了 reasoningEffort 时才添加（该参数仅部分模型支持，盲目添加会导致 400）
+    if (this.shouldEnableThinking() && this.config.reasoningEffort) {
       requestParams.reasoning_effort = this.config.reasoningEffort;
       delete requestParams.temperature;
     }
 
-    const response = await this.openaiClient.chat.completions.create(requestParams);
-
+    let response;
+    try {
+      response = await this.openaiClient.chat.completions.create(requestParams);
+    } catch (error: any) {
+      if (this.is400ToolSchemaError(error) && requestParams.tools?.length > 0) {
+        const result = await this.retryWithToolElimination(requestParams, error);
+        response = result;
+      } else {
+        throw error;
+      }
+    }
     // 添加调试日志
     logger.info('OpenAI API response received', {
       model: this.config.model,
@@ -798,16 +931,44 @@ export class UniversalLLMClient extends BaseLLMClient {
       requestParams.tool_choice = openAiToolChoice;
     }
 
-    // 仅在配置中明确指定 reasoningEffort 时才添加（该参数仅部分模型支持，盲目添加会导致 400）
-    if (this.config.reasoningEffort) {
+    // 仅在启用 thinking 且配置了 reasoningEffort 时才添加（该参数仅部分模型支持，盲目添加会导致 400）
+    if (this.shouldEnableThinking() && this.config.reasoningEffort) {
       requestParams.reasoning_effort = this.config.reasoningEffort;
       delete requestParams.temperature;
     }
 
-    const stream = await this.openaiClient.chat.completions.create(
-      requestParams as Parameters<typeof this.openaiClient.chat.completions.create>[0] & { stream: true },
-      { signal: params.signal },
-    );
+    let stream;
+    try {
+      stream = await this.openaiClient.chat.completions.create(
+        requestParams as Parameters<typeof this.openaiClient.chat.completions.create>[0] & { stream: true },
+        { signal: params.signal },
+      );
+    } catch (error: any) {
+      if (this.is400Error(error) && requestParams.stream_options) {
+        // 渐进式降级：先去掉 stream_options（Gemini 等 OpenAI 兼容 API 不支持）
+        logger.warn('400 stream_options 不兼容，降级重试', {
+          model: this.config.model,
+          error: error?.message?.substring(0, 200),
+        }, LogCategory.LLM);
+        delete requestParams.stream_options;
+        try {
+          stream = await this.openaiClient.chat.completions.create(
+            requestParams as Parameters<typeof this.openaiClient.chat.completions.create>[0] & { stream: true },
+            { signal: params.signal },
+          );
+        } catch (retryError: any) {
+          if (this.is400ToolSchemaError(retryError) && requestParams.tools?.length > 0) {
+            stream = await this.retryStreamWithToolElimination(requestParams, params.signal, retryError);
+          } else {
+            throw retryError;
+          }
+        }
+      } else if (this.is400ToolSchemaError(error) && requestParams.tools?.length > 0) {
+        stream = await this.retryStreamWithToolElimination(requestParams, params.signal, error);
+      } else {
+        throw error;
+      }
+    }
 
     let fullContent = '';
     const toolCallBuffers = new Map<string, { id: string; name?: string; argumentsText: string }>();
@@ -817,11 +978,15 @@ export class UniversalLLMClient extends BaseLLMClient {
     for await (const chunk of stream) {
       const delta = chunk.choices[0]?.delta;
 
-      // 处理 reasoning_content (OpenAI o1/o3 模型)
-      // 部分 OpenAI-compatible API 可能使用 reasoning_content 字段
-      const reasoningContent = (delta as any)?.reasoning_content;
-      if (reasoningContent) {
-        onChunk({ type: 'thinking', thinking: reasoningContent });
+      // 处理推理模型的思考内容
+      // 不同 OpenAI 兼容 API 可能使用不同的字段名返回推理内容
+      // 仅在启用 thinking 时才转发，否则忽略模型自带的推理内容
+      if (this.shouldEnableThinking()) {
+        const d = delta as any;
+        const reasoningContent = d?.reasoning_content || d?.reasoning || d?.thinking_content || d?.thinking;
+        if (reasoningContent) {
+          onChunk({ type: 'thinking', thinking: reasoningContent });
+        }
       }
 
       if (delta?.content) {

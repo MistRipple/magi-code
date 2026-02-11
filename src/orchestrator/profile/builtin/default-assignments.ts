@@ -10,21 +10,21 @@ export const DEFAULT_ASSIGNMENTS: WorkerAssignments['assignments'] = {
   claude: [
     'architecture',
     'refactor',
-    'backend',
     'review',
     'debug',
     'integration',
-    'general',
   ],
   codex: [
+    'backend',
     'bugfix',
     'implement',
     'test',
     'simple',
-    'data_analysis',
+    'general',
   ],
   gemini: [
     'frontend',
     'document',
+    'data_analysis',
   ],
 };

@@ -37,7 +37,7 @@ export type TaskCategory =
  * 导入并重新导出统一的 Task 和 SubTask 类型
  * 任务系统使用 task/types.ts 中的完整定义
  *
- * 注意：UI 层使用 TaskView/SubTaskView（从 task-view-adapter.ts）
+ * 注意：UI 层使用 TaskView/TodoItemView（从 task-view-adapter.ts）
  * 内部逻辑仍使用完整的 Task/SubTask 类型
  */
 import type {
@@ -63,14 +63,14 @@ export type {
 // 导出视图类型（供 UI 层使用）
 import type {
   TaskView,
-  SubTaskView,
+  TodoItemView,
   TaskViewStatus,
   SubTaskViewStatus,
 } from './task/task-view-adapter';
 
 export type {
   TaskView,
-  SubTaskView,
+  TodoItemView,
   TaskViewStatus,
   SubTaskViewStatus,
 };

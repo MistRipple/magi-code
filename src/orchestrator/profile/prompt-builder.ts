@@ -1,21 +1,23 @@
 /**
  * PromptBuilder (single prompt assembly)
+ *
+ * 工具信息由 ToolManager.buildToolsSummary() 动态注入，
+ * 核心能力由 ProfileLoader 从 assignedCategories 推导后通过 persona.strengths 传入，
+ * 不在此处硬编码具体工具名或能力声明。
  */
 
-import { WorkerSlot } from '../../types/agent-types';
 import { WorkerPersona, InjectionContext } from './types';
 import { CATEGORY_DEFINITIONS } from './builtin/category-definitions';
-import { WORKER_PERSONAS } from './builtin/worker-personas';
 
 export class PromptBuilder {
-  buildWorkerPrompt(worker: WorkerSlot, context: InjectionContext): string {
-    const persona = WORKER_PERSONAS[worker];
-    if (!persona) {
-      throw new Error(`未知 Worker: ${worker}`);
-    }
-
+  buildWorkerPrompt(persona: WorkerPersona, context: InjectionContext): string {
     const sections: string[] = [];
     sections.push(this.buildRoleSection(persona));
+
+    // 核心能力（从 assignedCategories 推导，由 ProfileLoader 填充到 persona.strengths）
+    if (persona.strengths.length > 0) {
+      sections.push(`## 核心能力\n${persona.strengths.map(s => `- ${s}`).join('\n')}`);
+    }
 
     if (context.category) {
       const categoryDef = CATEGORY_DEFINITIONS[context.category];
@@ -48,7 +50,7 @@ export class PromptBuilder {
       sections.push(`## 输出要求\n${outputPreferences.map(p => `- ${p}`).join('\n')}`);
     }
 
-    sections.push(this.buildToolUsageSection());
+    sections.push(this.buildToolUsageSection(context.availableToolsSummary));
 
     return sections.join('\n\n');
   }
@@ -70,13 +72,34 @@ export class PromptBuilder {
     return `### ${roleType}\n${rules.map(r => `- ${r}`).join('\n')}`;
   }
 
-  private buildToolUsageSection(): string {
-    return `## 工具使用
-- 只能使用系统提供的工具，严禁自行创建或假设任何未列出的工具
-- 涉及代码/文件修改时，应使用工具直接编辑文件并保存结果
-- 直接使用工具行动，不要在行动前做冗长的规划描述
-- 修改完成后简要说明改动要点
-- 搜索/检索工具用于快速定位目标代码，找到后立即用 text_editor 修改，避免反复搜索同一内容
-- 禁止连续多轮仅使用搜索类工具而不产出实际修改`;
+  /**
+   * 构建工具使用规范段落
+   *
+   * 可用工具列表由 ToolManager.buildToolsSummary() 动态生成并注入，
+   * 此处只定义工具使用策略（工作流 + 禁止行为），不硬编码具体工具名。
+   */
+  private buildToolUsageSection(toolsSummary?: string): string {
+    const sections: string[] = [];
+
+    sections.push('## 工具使用规范');
+
+    // 动态工具列表（内置 + MCP + Skill）
+    if (toolsSummary?.trim()) {
+      sections.push(`### 可用工具\n${toolsSummary}`);
+    }
+
+    // 工具使用策略（与具体工具名解耦）
+    sections.push(`### 工作流
+1. **定位**（1-2 轮）：通过语义搜索或文本匹配找到目标代码
+2. **查看**（1 轮）：读取目标文件，确认要修改的内容
+3. **修改**（N 轮）：使用精确替换逐处修改
+4. **完成**：输出简短摘要
+
+### 禁止行为
+- 禁止用终端命令执行文件读取、目录浏览、内容搜索等操作——使用对应的专用工具
+- 禁止输出未经工具执行的代码块（所有修改通过文件编辑工具完成）
+- 禁止在每轮工具调用前做冗长的"接下来我将..."规划描述`);
+
+    return sections.join('\n\n');
   }
 }

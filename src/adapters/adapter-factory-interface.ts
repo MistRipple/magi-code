@@ -150,7 +150,7 @@ export interface IAdapterFactory extends EventEmitter {
   /**
    * 刷新用户规则
    */
-  refreshUserRules(): void;
+  refreshUserRules(): Promise<void>;
 
   /**
    * 获取环境提示词（IDE 状态 + 工具 + 用户规则等）

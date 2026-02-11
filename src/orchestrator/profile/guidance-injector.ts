@@ -40,7 +40,7 @@ export class GuidanceInjector {
     context: InjectionContext
   ): string {
     const isLeader = this.isLeaderRole(profile, context);
-    return this.promptBuilder.buildWorkerPrompt(profile.worker, {
+    return this.promptBuilder.buildWorkerPrompt(profile.persona, {
       ...context,
       isLeader,
     });
@@ -132,26 +132,21 @@ export class GuidanceInjector {
 
   /**
    * 构建自检引导 Prompt
+   *
+   * 注意：不注入 Worker 弱项标签——告诉 LLM "你不擅长 X" 是提示词反模式，
+   * 会降低其在 X 领域的表现。弱项标签仅用于任务路由（assignment-manager），
+   * 不应出现在 Worker 的执行提示词中。
    */
-  buildSelfCheckGuidance(profile: WorkerProfile, taskDescription: string): string {
+  buildSelfCheckGuidance(_profile: WorkerProfile, taskDescription: string): string {
     const sections: string[] = [];
 
-    sections.push('## 自检清单');
+    sections.push('## 完成检查');
 
-    if (profile.persona.weaknesses.length > 0) {
-      sections.push('### 重点关注（你的潜在弱项）');
-      const weaknessChecks = profile.persona.weaknesses.map(weakness =>
-        `- [ ] 检查是否存在 "${weakness}" 相关问题`
-      );
-      sections.push(weaknessChecks.join('\n'));
-    }
-
-    sections.push('### 通用检查');
+    sections.push('### 必查项');
     const generalChecks = [
-      '- [ ] 代码是否符合项目规范',
-      '- [ ] 是否处理了边界情况',
-      '- [ ] 错误处理是否完善',
-      '- [ ] 是否有潜在的性能问题',
+      '- [ ] 所有修改的文件已保存',
+      '- [ ] 修改后的代码不会引入编译错误',
+      '- [ ] 没有遗漏任务要求中的任何一项',
     ];
     sections.push(generalChecks.join('\n'));
 
@@ -166,11 +161,14 @@ export class GuidanceInjector {
 
   /**
    * 构建互检引导 Prompt
+   *
+   * 注意：不注入执行者弱项标签（同 buildSelfCheckGuidance 原因）。
+   * 评审者通过自身擅长领域聚焦审查，而非被告知对方"弱在哪里"。
    */
   buildPeerReviewGuidance(
     reviewerProfile: WorkerProfile,
-    executorProfile: WorkerProfile,
-    taskDescription: string
+    _executorProfile: WorkerProfile,
+    _taskDescription: string
   ): string {
     const sections: string[] = [];
 
@@ -183,15 +181,6 @@ export class GuidanceInjector {
     );
     sections.push(reviewerFocus.join('\n'));
 
-    if (executorProfile.persona.weaknesses.length > 0) {
-      sections.push(`### 执行者潜在弱项（${executorProfile.persona.displayName}）`);
-      sections.push('请特别关注以下可能存在问题的领域：');
-      const weaknessWarnings = executorProfile.persona.weaknesses.map(weakness =>
-        `- ⚠️ ${weakness}：可能需要额外审查`
-      );
-      sections.push(weaknessWarnings.join('\n'));
-    }
-
     sections.push('### 评审清单');
     const reviewChecklist = [
       '- [ ] 代码逻辑是否正确',
@@ -201,11 +190,6 @@ export class GuidanceInjector {
       '- [ ] 是否需要补充测试',
     ];
     sections.push(reviewChecklist.join('\n'));
-
-    sections.push('### 评审反馈建议');
-    sections.push('- 指出问题时请提供具体的改进建议');
-    sections.push('- 对于复杂问题，可以提供代码示例');
-    sections.push('- 区分"必须修改"和"建议优化"');
 
     return sections.join('\n\n');
   }

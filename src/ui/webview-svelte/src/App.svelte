@@ -108,33 +108,6 @@
   onMount(() => {
     initializeState();
     console.log('[App] Svelte webview 已初始化');
-
-    // 修复 VSCode webview 中标准编辑快捷键被宿主拦截的问题
-    // VSCode 的 keybinding service 会拦截 Ctrl/Cmd+C/V/X/Z/A 等快捷键，
-    // 导致 webview 内的 input/textarea 无法使用剪贴板和撤销等操作。
-    // document.execCommand 虽已标记废弃，但在 VSCode webview iframe 中是唯一可行的绕过方案。
-    const SHORTCUT_COMMANDS: Record<string, string> = {
-      c: 'copy', v: 'paste', x: 'cut', a: 'selectAll', y: 'redo',
-    };
-    const handleKeyboardShortcuts = (e: KeyboardEvent) => {
-      const el = document.activeElement;
-      if (!el) return;
-      const tag = el.tagName;
-      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && !(el as HTMLElement).isContentEditable) return;
-      if (!e.ctrlKey && !e.metaKey) return;
-
-      const key = e.key.toLowerCase();
-      let cmd = SHORTCUT_COMMANDS[key];
-      if (key === 'z') cmd = e.shiftKey ? 'redo' : 'undo';
-      // eslint-disable-next-line @typescript-eslint/no-deprecated
-      if (cmd) document.execCommand(cmd);
-    };
-
-    document.addEventListener('keydown', handleKeyboardShortcuts);
-
-    return () => {
-      document.removeEventListener('keydown', handleKeyboardShortcuts);
-    };
   });
 </script>
 

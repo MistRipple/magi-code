@@ -342,7 +342,7 @@
 </script>
 
 <div class="ia-container">
-  <div class="ia-wrapper" style="height: {inputHeight}px">
+  <div class="ia-wrapper" style="min-height: {inputHeight}px">
     <!-- 拖动调整大小 -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="ia-resize" onmousedown={startResize}></div>
@@ -534,6 +534,7 @@
   .ia-wrapper {
     display: flex;
     flex-direction: column;
+    max-height: 50vh;
     background: var(--vscode-input-background);
     border: 1px solid var(--vscode-input-border, var(--border));
     border-radius: var(--radius-lg);
@@ -575,6 +576,7 @@
   /* 文本框 */
   .ia-textarea {
     flex: 1;
+    min-height: 36px;
     width: 100%;
     padding: var(--space-2) var(--space-3);
     font-size: var(--text-sm);
@@ -646,6 +648,7 @@
     align-items: center;
     padding: 4px var(--space-2);
     gap: var(--space-1);
+    flex-shrink: 0;
     border-radius: 0 0 var(--radius-lg) var(--radius-lg);
   }
 
@@ -917,9 +920,13 @@
   /* 图片预览 */
   .ia-images {
     display: flex;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    flex-shrink: 0;
     gap: var(--space-2);
     padding: var(--space-2) var(--space-3);
+    max-height: 90px;
+    overflow-x: auto;
+    overflow-y: hidden;
     border-top: 1px solid var(--border-subtle);
   }
 

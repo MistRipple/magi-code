@@ -38,6 +38,7 @@ import {
   clearRequestBinding,
   clearAllRequestBindings,
   clearProcessingState,
+  sealAllStreamingMessages,
 } from '../stores/messages.svelte';
 import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, SubTaskItem, Edit, ModelStatusMap } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
@@ -885,6 +886,12 @@ function handleContentMessage(standard: StandardMessage) {
     upsertThreadMessage(uiMessage);
     // 注册用户消息的路由
     routeStandardMessage(standard);
+
+    // 如果用户指定了 Worker 直接对话，同时把用户消息添加到对应 Worker 面板
+    const targetWorker = normalizeWorkerSlot(meta?.targetWorker);
+    if (targetWorker) {
+      addAgentMessage(targetWorker, uiMessage);
+    }
     return;
   }
 
@@ -1367,6 +1374,8 @@ function handleUnifiedControlMessage(standard: StandardMessage) {
       // 清除 backendProcessing + activeMessageIds + pendingRequests 三重条件，
       // 防止 Worker 多轮工具调用中间消息的 COMPLETE 事件延迟或丢失导致按钮状态残留
       clearProcessingState();
+      // 终结所有未完成的流式消息：保留已输出内容，移除空占位消息，停止 streaming 动画
+      sealAllStreamingMessages();
       break;
     }
 
@@ -2114,7 +2123,7 @@ function hasRenderableContent(message: Message): boolean {
 function updateAssignmentPlan(assignmentId: string, updater: (assignment: AssignmentPlan) => AssignmentPlan) {
   const store = getState();
   const planMap = store.missionPlan;
-  for (const [missionId, plan] of planMap) {
+  for (const [, plan] of planMap) {
     const index = plan.assignments.findIndex((a) => a.id === assignmentId);
     if (index !== -1) {
       const nextAssignments = plan.assignments.map((assignment, i) =>

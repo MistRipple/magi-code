@@ -7,7 +7,6 @@ import * as vscode from 'vscode';
 import { WebviewProvider } from './ui/webview-provider';
 import { MermaidPanel } from './ui/mermaid-panel';
 import { globalEventBus } from './events';
-import { registerTerminalTest } from './test/terminal-test';
 
 let webviewProvider: WebviewProvider | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
@@ -70,9 +69,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // 注册命令
   registerCommands(context);
-
-  // 注册终端测试命令
-  registerTerminalTest(context);
 
   // 注册 Mermaid 面板序列化器（用于持久化恢复）
   MermaidPanel.registerSerializer(context);

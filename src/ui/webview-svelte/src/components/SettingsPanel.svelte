@@ -166,14 +166,17 @@
   let installingSkills = $state<Set<string>>(new Set());
 
   // 模型配置表单
-  let orchConfig = $state({ baseUrl: '', apiKey: '', model: '', provider: 'anthropic', reasoningEffort: 'medium' });
+  let orchConfig = $state({ baseUrl: '', apiKey: '', model: '', provider: 'anthropic', thinking: false, reasoningEffort: 'medium' });
   let compConfig = $state({ baseUrl: '', apiKey: '', model: '', provider: 'anthropic' });
   let aceConfig = $state({ url: '', key: '' });
-  let workerConfigs = $state<Record<string, { baseUrl: string; apiKey: string; model: string; provider: string; enabled: boolean; reasoningEffort: string }>>({
-    claude: { baseUrl: '', apiKey: '', model: '', provider: 'anthropic', enabled: true, reasoningEffort: 'medium' },
-    codex: { baseUrl: '', apiKey: '', model: '', provider: 'openai', enabled: true, reasoningEffort: 'medium' },
-    gemini: { baseUrl: '', apiKey: '', model: '', provider: 'openai', enabled: true, reasoningEffort: 'medium' }
+  let workerConfigs = $state<Record<string, { baseUrl: string; apiKey: string; model: string; provider: string; enabled: boolean; thinking: boolean; reasoningEffort: string }>>({
+    claude: { baseUrl: '', apiKey: '', model: '', provider: 'anthropic', enabled: true, thinking: false, reasoningEffort: 'medium' },
+    codex: { baseUrl: '', apiKey: '', model: '', provider: 'openai', enabled: true, thinking: false, reasoningEffort: 'medium' },
+    gemini: { baseUrl: '', apiKey: '', model: '', provider: 'openai', enabled: true, thinking: false, reasoningEffort: 'medium' }
   });
+
+  // API Key 明文可见状态
+  let keyVisible = $state<Record<string, boolean>>({ orch: false, comp: false, ace: false, worker: false });
 
   // Tools Tab 状态 - MCP 服务器完整结构
   interface MCPServer {
@@ -498,9 +501,16 @@
     saveStatus = { ...saveStatus };
 
     if (target === 'worker') {
-      vscode.postMessage({ type: 'saveWorkerConfig', worker: workerModelTab, config: workerConfigs[workerModelTab] });
+      const wc = workerConfigs[workerModelTab];
+      vscode.postMessage({ type: 'saveWorkerConfig', worker: workerModelTab, config: {
+        baseUrl: wc.baseUrl, apiKey: wc.apiKey, model: wc.model, provider: wc.provider,
+        enabled: wc.enabled, enableThinking: wc.thinking, reasoningEffort: wc.reasoningEffort
+      }});
     } else if (target === 'orch') {
-      vscode.postMessage({ type: 'saveOrchestratorConfig', config: orchConfig });
+      vscode.postMessage({ type: 'saveOrchestratorConfig', config: {
+        baseUrl: orchConfig.baseUrl, apiKey: orchConfig.apiKey, model: orchConfig.model, provider: orchConfig.provider,
+        enableThinking: orchConfig.thinking, reasoningEffort: orchConfig.reasoningEffort
+      }});
     } else if (target === 'comp') {
       vscode.postMessage({ type: 'saveCompressorConfig', config: compConfig });
     } else if (target === 'ace') {
@@ -966,6 +976,7 @@
                 model: config.model || '',
                 provider: config.provider || 'anthropic',
                 enabled: config.enabled !== false,
+                thinking: config.enableThinking === true,
                 reasoningEffort: config.reasoningEffort || 'medium'
               };
             }
@@ -980,7 +991,8 @@
             apiKey: payload.config.apiKey || '',
             model: payload.config.model || '',
             provider: payload.config.provider || 'anthropic',
-            reasoningEffort: payload.config.reasoningEffort || ''
+            thinking: payload.config.enableThinking === true,
+            reasoningEffort: payload.config.reasoningEffort || 'medium'
           };
         }
       }
@@ -1396,9 +1408,14 @@
                   </div>
                   <div class="llm-config-field">
                     <label class="llm-config-label">API Key</label>
-                    <input type="password" class="llm-config-input" bind:value={orchConfig.apiKey} placeholder="sk-ant-...">
+                    <div class="api-key-wrapper">
+                      <input type={keyVisible.orch ? 'text' : 'password'} class="llm-config-input api-key-input" bind:value={orchConfig.apiKey} placeholder="sk-ant-...">
+                      <button type="button" class="api-key-toggle" onclick={() => keyVisible.orch = !keyVisible.orch} title={keyVisible.orch ? '隐藏密钥' : '显示密钥'}>
+                        <Icon name={keyVisible.orch ? 'eye-slash' : 'eye'} size={14} />
+                      </button>
+                    </div>
                   </div>
-                  <div class="llm-config-field-row" class:has-reasoning={orchConfig.provider === 'openai'}>
+                  <div class="llm-config-field-row has-thinking" class:has-level={orchConfig.provider === 'openai'}>
                     <div class="llm-config-field">
                       <label class="llm-config-label">Model</label>
                       <div class="model-combobox">
@@ -1432,7 +1449,7 @@
                     </div>
                     {#if orchConfig.provider === 'openai'}
                     <div class="llm-config-field">
-                      <label class="llm-config-label">推理等级</label>
+                      <label class="llm-config-label">Level</label>
                       <select class="llm-config-select" bind:value={orchConfig.reasoningEffort}>
                         <option value="low">Low</option>
                         <option value="medium">Medium</option>
@@ -1440,6 +1457,12 @@
                       </select>
                     </div>
                     {/if}
+                    <div class="llm-config-field inline-toggle">
+                      <label class="llm-config-label">Thinking</label>
+                      <button type="button" class="llm-config-toggle-btn" title={orchConfig.thinking ? '关闭思考' : '开启思考'} onclick={() => orchConfig.thinking = !orchConfig.thinking}>
+                        <span class="toggle-switch" class:active={orchConfig.thinking}></span>
+                      </button>
+                    </div>
                   </div>
                   <div class="llm-config-actions">
                     <button
@@ -1498,7 +1521,12 @@
                   </div>
                   <div class="llm-config-field">
                     <label class="llm-config-label">API Key</label>
-                    <input type="password" class="llm-config-input" bind:value={compConfig.apiKey} placeholder="sk-ant-...">
+                    <div class="api-key-wrapper">
+                      <input type={keyVisible.comp ? 'text' : 'password'} class="llm-config-input api-key-input" bind:value={compConfig.apiKey} placeholder="sk-ant-...">
+                      <button type="button" class="api-key-toggle" onclick={() => keyVisible.comp = !keyVisible.comp} title={keyVisible.comp ? '隐藏密钥' : '显示密钥'}>
+                        <Icon name={keyVisible.comp ? 'eye-slash' : 'eye'} size={14} />
+                      </button>
+                    </div>
                   </div>
                   <div class="llm-config-field-row">
                     <div class="llm-config-field">
@@ -1590,7 +1618,12 @@
                   </div>
                   <div class="llm-config-field">
                     <label class="llm-config-label">API 密钥</label>
-                    <input type="password" class="llm-config-input" bind:value={aceConfig.key} placeholder="sk-...">
+                    <div class="api-key-wrapper">
+                      <input type={keyVisible.ace ? 'text' : 'password'} class="llm-config-input api-key-input" bind:value={aceConfig.key} placeholder="sk-...">
+                      <button type="button" class="api-key-toggle" onclick={() => keyVisible.ace = !keyVisible.ace} title={keyVisible.ace ? '隐藏密钥' : '显示密钥'}>
+                        <Icon name={keyVisible.ace ? 'eye-slash' : 'eye'} size={14} />
+                      </button>
+                    </div>
                   </div>
                   <div class="llm-config-actions">
                     <button
@@ -1674,9 +1707,14 @@
               </div>
               <div class="llm-config-field">
                 <label class="llm-config-label">API Key</label>
-                <input type="password" class="llm-config-input" bind:value={workerConfigs[workerModelTab].apiKey} placeholder="sk-ant-...">
+                <div class="api-key-wrapper">
+                  <input type={keyVisible.worker ? 'text' : 'password'} class="llm-config-input api-key-input" bind:value={workerConfigs[workerModelTab].apiKey} placeholder="sk-ant-...">
+                  <button type="button" class="api-key-toggle" onclick={() => keyVisible.worker = !keyVisible.worker} title={keyVisible.worker ? '隐藏密钥' : '显示密钥'}>
+                    <Icon name={keyVisible.worker ? 'eye-slash' : 'eye'} size={14} />
+                  </button>
+                </div>
               </div>
-              <div class="llm-config-field-row" class:has-reasoning={workerConfigs[workerModelTab].provider === 'openai'}>
+              <div class="llm-config-field-row has-thinking" class:has-level={workerConfigs[workerModelTab].provider === 'openai'}>
                 <div class="llm-config-field">
                   <label class="llm-config-label">Model</label>
                   <div class="model-combobox">
@@ -1710,7 +1748,7 @@
                 </div>
                 {#if workerConfigs[workerModelTab].provider === 'openai'}
                 <div class="llm-config-field">
-                  <label class="llm-config-label">推理等级</label>
+                  <label class="llm-config-label">Level</label>
                   <select class="llm-config-select" bind:value={workerConfigs[workerModelTab].reasoningEffort}>
                     <option value="low">Low</option>
                     <option value="medium">Medium</option>
@@ -1718,6 +1756,12 @@
                   </select>
                 </div>
                 {/if}
+                <div class="llm-config-field inline-toggle">
+                  <label class="llm-config-label">Thinking</label>
+                  <button type="button" class="llm-config-toggle-btn" title={workerConfigs[workerModelTab].thinking ? '关闭思考' : '开启思考'} onclick={() => workerConfigs[workerModelTab].thinking = !workerConfigs[workerModelTab].thinking}>
+                    <span class="toggle-switch" class:active={workerConfigs[workerModelTab].thinking}></span>
+                  </button>
+                </div>
               </div>
               <div class="llm-config-actions">
                 <button
@@ -2772,7 +2816,8 @@
   .llm-config-form { display: flex; flex-direction: column; gap: var(--space-3); }
   .llm-config-field { display: flex; flex-direction: column; gap: var(--space-2); }
   .llm-config-field-row { display: grid; grid-template-columns: 1fr 120px; gap: var(--space-3); }
-  .llm-config-field-row.has-reasoning { grid-template-columns: 1fr 120px 100px; }
+  .llm-config-field-row.has-thinking { grid-template-columns: 1fr 120px 80px; }
+  .llm-config-field-row.has-thinking.has-level { grid-template-columns: 1fr 120px 100px 80px; }
   .llm-config-field-row.url-toggle-row { grid-template-columns: 1fr 80px; align-items: end; }
   .llm-config-label { font-size: var(--text-sm); color: var(--foreground-muted); }
 
@@ -2791,6 +2836,29 @@
   }
 
   .llm-config-input:focus, .llm-config-select:focus { border-color: var(--primary); }
+
+  .api-key-wrapper { position: relative; }
+  .api-key-wrapper .api-key-input { padding-right: 32px; }
+  .api-key-toggle {
+    position: absolute;
+    right: 4px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--foreground-muted);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+    opacity: 0.6;
+  }
+  .api-key-toggle:hover { background: var(--secondary); color: var(--foreground); opacity: 1; }
 
   .model-combobox { position: relative; }
   .model-combobox .llm-config-input { padding-right: 32px; }

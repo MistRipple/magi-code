@@ -144,11 +144,16 @@ export class DispatchBatch extends EventEmitter {
   readonly cancellationToken = new CancellationToken();
   /** 累计 Token 消耗 */
   private _tokenConsumption = { inputTokens: 0, outputTokens: 0 };
+  /** 归档等待队列：等待 batch 归档（Worker 执行 + Phase C 完成）的 Promise resolve 函数 */
+  private archiveResolvers: Array<() => void> = [];
+  /** 最后活动时间戳：任何 Worker 状态变化都会刷新 */
+  private _lastActivityAt: number;
 
   constructor(batchId?: string) {
     super();
     this.id = batchId || `batch-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     this.createdAt = Date.now();
+    this._lastActivityAt = Date.now();
   }
 
   get status(): BatchStatus {
@@ -209,6 +214,16 @@ export class DispatchBatch extends EventEmitter {
   }
 
   /**
+   * 刷新活动时间戳
+   *
+   * 供 Worker 上报进度、LLM chunk 等活动信号调用，
+   * 让 waitForArchive 的 idle 超时检测知道 batch 仍在活跃工作。
+   */
+  touchActivity(): void {
+    this._lastActivityAt = Date.now();
+  }
+
+  /**
    * 更新任务状态
    */
   updateStatus(taskId: string, status: DispatchStatus, result?: DispatchResult): void {
@@ -218,6 +233,7 @@ export class DispatchBatch extends EventEmitter {
       return;
     }
 
+    this._lastActivityAt = Date.now();
     entry.status = status;
     if (status === 'running' && !entry.startedAt) {
       entry.startedAt = Date.now();
@@ -549,6 +565,9 @@ export class DispatchBatch extends EventEmitter {
     }
 
     this._status = 'archived';
+    // 释放所有等待归档的 Promise（与 archive() 对齐）
+    for (const resolve of this.archiveResolvers) resolve();
+    this.archiveResolvers = [];
     this.emit('batch:cancelled', this.id, reason, this.getEntries());
 
     logger.info('DispatchBatch.取消', {
@@ -563,11 +582,55 @@ export class DispatchBatch extends EventEmitter {
    */
   archive(): void {
     this._status = 'archived';
+    // 释放所有等待归档的 Promise
+    for (const resolve of this.archiveResolvers) resolve();
+    this.archiveResolvers = [];
     logger.info('DispatchBatch.归档', {
       batchId: this.id,
       summary: this.getSummary(),
       tokenConsumption: this.getTokenConsumption(),
     }, LogCategory.ORCHESTRATOR);
+  }
+
+  /**
+   * 等待 Batch 归档（所有 Worker 完成 + Phase C 汇总完成）
+   *
+   * 用于 MissionDrivenEngine.execute() 在 sendMessage 返回后同步等待
+   * dispatch 链路真正结束，确保 TASK_COMPLETED 在正确时机发出。
+   *
+   * 超时策略（idle 模式）：
+   * - 每 30 秒检查一次最后活动时间戳
+   * - 如果距离最后活动超过 idleTimeoutMs（默认 5 分钟），判定为阻断
+   * - 正常工作中的 Worker 会通过 updateStatus / touchActivity 持续刷新时间戳
+   * - 超时后自动 cancelAll 并归档，防止永久阻塞
+   */
+  waitForArchive(idleTimeoutMs: number = 5 * 60 * 1000): Promise<void> {
+    if (this._status === 'archived') return Promise.resolve();
+    return new Promise<void>(resolve => {
+      const CHECK_INTERVAL = 30_000; // 30 秒检查一次
+      const checker = setInterval(() => {
+        if (this._status === 'archived') {
+          clearInterval(checker);
+          return;
+        }
+        const idleTime = Date.now() - this._lastActivityAt;
+        if (idleTime > idleTimeoutMs) {
+          clearInterval(checker);
+          logger.warn('DispatchBatch.waitForArchive.idle超时', {
+            batchId: this.id,
+            idleTimeMs: idleTime,
+            idleTimeoutMs,
+            summary: this.getSummary(),
+          }, LogCategory.ORCHESTRATOR);
+          this.cancelAll(`无活动超时 (idle ${Math.round(idleTime / 1000)}s)`);
+        }
+      }, CHECK_INTERVAL);
+
+      this.archiveResolvers.push(() => {
+        clearInterval(checker);
+        resolve();
+      });
+    });
   }
 
   // ============================================================================

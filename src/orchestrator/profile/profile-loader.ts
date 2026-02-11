@@ -1,8 +1,10 @@
 /**
  * Worker Profile System - 画像加载器（单一数据源版）
  *
- * 仅使用内置 personas/category definitions + worker-assignments.json。
- * 不读取任何旧配置文件。
+ * 核心逻辑：
+ * - 内置 personas 提供角色身份 + 工作方法 + 行为约束（纯 LLM 行为矫正）
+ * - strengths/weaknesses 从 assignedCategories 动态推导，不再硬编码
+ * - 推导规则：strengths = 分配分类的 displayName；weaknesses = 未分配的高/中优先级分类
  */
 
 import { WorkerSlot } from '../../types/agent-types';
@@ -63,12 +65,51 @@ export class ProfileLoader {
       }
 
       const assignedCategories = assignments[worker] || [];
+
+      // 从 assignedCategories 推导 strengths
+      const derivedStrengths = this.deriveStrengths(assignedCategories);
+
+      // 从未分配的高/中优先级分类推导 weaknesses
+      const derivedWeaknesses = this.deriveWeaknesses(assignedCategories);
+
+      // 创建含推导值的 persona 副本（保持 persona 其余属性不变）
+      const enrichedPersona = {
+        ...persona,
+        strengths: derivedStrengths,
+        weaknesses: derivedWeaknesses,
+      };
+
       this.profiles.set(worker, {
         worker,
-        persona,
+        persona: enrichedPersona,
         assignedCategories: [...assignedCategories],
       });
     }
+  }
+
+  /**
+   * 从 assignedCategories 推导 strengths
+   * 规则：每个分配分类的 displayName 即为一项能力
+   * 过滤：排除泛化分类（simple/general），因其不具备能力区分度
+   */
+  private deriveStrengths(assignedCategories: string[]): string[] {
+    const GENERIC_CATEGORIES = new Set(['simple', 'general']);
+    return assignedCategories
+      .filter(cat => !GENERIC_CATEGORIES.has(cat))
+      .map(cat => CATEGORY_DEFINITIONS[cat]?.displayName)
+      .filter((name): name is string => !!name);
+  }
+
+  /**
+   * 从未分配的分类推导 weaknesses
+   * 规则：取未分配的高/中优先级分类的 displayName，最多 3 项
+   */
+  private deriveWeaknesses(assignedCategories: string[]): string[] {
+    const assigned = new Set(assignedCategories);
+    return Object.entries(CATEGORY_DEFINITIONS)
+      .filter(([cat, def]) => !assigned.has(cat) && (def.priority === 'high' || def.priority === 'medium'))
+      .map(([, def]) => def.displayName)
+      .slice(0, 3);
   }
 
   getProfile(workerType: WorkerSlot): WorkerProfile {

@@ -63,7 +63,7 @@ export { MessageBus, globalMessageBus } from './message-bus';
 export {
   MessageHub,
   globalMessageHub,
-  type SubTaskView,
+  type SubTaskCardPayload,
   type MessageHubEvents,
 } from './core';
 

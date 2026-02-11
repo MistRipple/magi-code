@@ -97,6 +97,7 @@ export class LLMConfigLoader {
         model: 'claude-3-5-sonnet-20241022',
         provider: 'anthropic',
         enabled: true,
+        enableThinking: false,
       },
       workers: {
         claude: {
@@ -105,6 +106,7 @@ export class LLMConfigLoader {
           model: 'claude-3-5-sonnet-20241022',
           provider: 'anthropic',
           enabled: true,
+          enableThinking: false,
         },
         codex: {
           baseUrl: 'https://api.openai.com/v1',
@@ -112,6 +114,7 @@ export class LLMConfigLoader {
           model: 'gpt-4-turbo-preview',
           provider: 'openai',
           enabled: true,
+          enableThinking: false,
         },
         gemini: {
           baseUrl: 'https://api.openai.com/v1',
@@ -119,6 +122,7 @@ export class LLMConfigLoader {
           model: 'gpt-4-turbo-preview',
           provider: 'openai',
           enabled: true,
+          enableThinking: false,
         },
       },
       compressor: {
@@ -314,8 +318,8 @@ export class LLMConfigLoader {
       model: config.model,
       provider: config.provider,
       enabled: config.enabled !== false,
-      // reasoningEffort 仅对 openai provider 有意义
-      ...(config.provider === 'openai' && config.reasoningEffort ? { reasoningEffort: config.reasoningEffort } : {}),
+      enableThinking: config.enableThinking === true,
+      ...(config.reasoningEffort ? { reasoningEffort: config.reasoningEffort } : {}),
     };
 
     this.saveFullConfig(fullConfig);
@@ -334,7 +338,8 @@ export class LLMConfigLoader {
       model: config.model,
       provider: config.provider,
       enabled: true,
-      ...(config.provider === 'openai' && config.reasoningEffort ? { reasoningEffort: config.reasoningEffort } : {}),
+      enableThinking: config.enableThinking === true,
+      ...(config.reasoningEffort ? { reasoningEffort: config.reasoningEffort } : {}),
     };
 
     this.saveFullConfig(fullConfig);

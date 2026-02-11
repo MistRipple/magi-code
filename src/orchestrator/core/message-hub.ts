@@ -27,7 +27,7 @@
  * - `progress(phase: string, content: string, options?)`: 汇报当前阶段进度
  * - `result(content: string, options?)`: 汇报最终执行结果
  * - `orchestratorMessage(content: string, options?)`: 发送分析/规划类消息
- * - `subTaskCard(subTask: SubTaskView)`: 展示/更新子任务卡片状态
+ * - `subTaskCard(subTask: SubTaskCardPayload)`: 展示/更新子任务卡片状态
  * - `taskAssignment(assignments)`: 发送任务分配宣告（主对话区）
  *
  * ### 3. Worker 交互 (Worker Tab)
@@ -90,10 +90,10 @@ import { MessageType, ControlMessageType } from '../../protocol/message-protocol
 // 导入三层组件
 import { MessageBus, type ProcessingState, type BroadcastData } from './message-bus';
 import { MessagePipeline, type PipelineConfig, type RequestMessageSummary } from './message-pipeline';
-import { MessageFactory, type SubTaskView } from './message-factory';
+import { MessageFactory, type SubTaskCardPayload } from './message-factory';
 
 // 重新导出类型，保持向后兼容
-export type { SubTaskView } from './message-factory';
+export type { SubTaskCardPayload } from './message-factory';
 export type { ProcessingState, BroadcastData } from './message-bus';
 export type { RequestMessageSummary, PipelineConfig } from './message-pipeline';
 
@@ -212,7 +212,7 @@ export class MessageHub {
     this.factory.orchestratorMessage(content, options);
   }
 
-  subTaskCard(subTask: SubTaskView): void {
+  subTaskCard(subTask: SubTaskCardPayload): void {
     this.factory.subTaskCard(subTask);
   }
 

@@ -76,7 +76,6 @@
       'mermaid_diagram': 'git-branch',
       'codebase_retrieval': 'search',
       'dispatch_task': 'tools',
-      'plan_mission': 'list',
       'send_worker_message': 'send',
     };
 
@@ -155,7 +154,6 @@
       'mermaid_diagram': 'diagram',
       'codebase_retrieval': 'retrieval',
       'dispatch_task': 'dispatch',
-      'plan_mission': 'plan',
       'send_worker_message': 'message',
     };
 
