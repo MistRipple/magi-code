@@ -160,13 +160,26 @@ Magi 基于现代化的技术栈构建，确保高性能与可扩展性：
 Magi 的诞生离不开开源社区和早期支持者的帮助。
 
 <div align="center">
-  <a href="https://github.com/andyhome163">
-    <img src="https://github.com/andyhome163.png" width="80" height="80" alt="andyhome163" style="border-radius: 50%">
-  </a>
-  <br/>
-  <b>赞助者: andyhome163</b>
-  <br/>
-  (Augment 悟空版作者)
+  <table>
+    <tr>
+      <td align="center">
+        <a href="https://github.com/andyhome163">
+          <img src="https://github.com/andyhome163.png" width="80" height="80" alt="andyhome163" style="border-radius: 50%">
+        </a>
+        <br/>
+        <b>赞助者: andyhome163</b>
+        <br/>
+        (Augment 悟空版作者)
+      </td>
+      <td align="center">
+        <a href="https://github.com/Poonwai">
+          <img src="https://github.com/Poonwai.png" width="80" height="80" alt="Poonwai" style="border-radius: 50%">
+        </a>
+        <br/>
+        <b>赞助者: Poonwai</b>
+      </td>
+    </tr>
+  </table>
 </div>
 
 <br/>
