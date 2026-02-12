@@ -200,5 +200,7 @@ Magi 的诞生离不开开源社区和早期支持者的帮助。
 2.  **商业授权**：如果您不希望受到 GPL 协议的限制（例如：将代码集成到闭源的商业产品中，或不愿公开您的源代码），您可以购买商业授权。
 
 **如有商业授权需求或任何疑问，请联系作者：**
+
 *   **WeChat**: MistRipple
-*   **GitHub**: [andyhome163](https://github.com/andyhome163)
+
+*   **GitHub**: [MistRipple](https://github.com/MistRipple)
