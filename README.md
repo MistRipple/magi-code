@@ -160,33 +160,19 @@ Magi 基于现代化的技术栈构建，确保高性能与可扩展性：
 
 Magi 的诞生离不开早期支持者的帮助。
 
-<div align="center">
-  <table border="0">
-    <tr>
-      <td align="center" style="border: none;">
-        <a href="https://github.com/Poonwai">
-          <img src="https://github.com/Poonwai.png" width="80" height="80" alt="Poonwai" style="border-radius: 50%">
-        </a>
-        <br/>
-        <b>Poonwai</b>
-      </td>
-      <td align="center" style="border: none;">
-        <a href="https://github.com/agassiz">
-          <img src="https://github.com/agassiz.png" width="80" height="80" alt="agassiz" style="border-radius: 50%">
-        </a>
-        <br/>
-        <b>agassiz</b>
-      </td>
-      <td align="center" style="border: none;">
-        <a href="https://github.com/StoneFancyX">
-          <img src="https://github.com/StoneFancyX.png" width="80" height="80" alt="StoneFancyX" style="border-radius: 50%">
-        </a>
-        <br/>
-        <b>StoneFancyX</b>
-      </td>
-    </tr>
-  </table>
-</div>
+<p align="left">
+  <a href="https://github.com/Poonwai">
+    <img src="https://images.weserv.nl/?url=https://github.com/Poonwai.png&mask=circle&w=80" alt="Poonwai">
+  </a>
+  &nbsp;&nbsp;
+  <a href="https://github.com/agassiz">
+    <img src="https://images.weserv.nl/?url=https://github.com/agassiz.png&mask=circle&w=80" alt="agassiz">
+  </a>
+  &nbsp;&nbsp;
+  <a href="https://github.com/StoneFancyX">
+    <img src="https://images.weserv.nl/?url=https://github.com/StoneFancyX.png&mask=circle&w=80" alt="StoneFancyX">
+  </a>
+</p>
 
 *   **Token支持**: [BinCode 中转站](https://newapi.stonefancyx.com/)
 
@@ -196,22 +182,14 @@ Magi 的诞生离不开早期支持者的帮助。
 
 无论是功能建议、Bug 反馈还是商务合作，欢迎随时交流。
 
-<div align="center">
-  <table border="0">
-    <tr>
-      <td align="center" style="border: none; vertical-align: middle;">
-        <img src="image/wechat.png" alt="个人微信" height="180" />
-        <br/>
-        <sub>如有问题或需商务合作<br/>请联系个人微信</sub>
-      </td>
-      <td align="center" style="border: none; vertical-align: middle;">
-        <img src="image/image.png" alt="Magi 交流群" height="180" />
-        <br/>
-        <sub>想要抢先体验的同学<br/>请扫码加微信进群</sub>
-      </td>
-    </tr>
-  </table>
-</div>
+<p align="left">
+  <img src="image/wechat.png" height="180" />
+  &nbsp;&nbsp;
+  <img src="image/image.png" height="180" />
+</p>
+
+> [!NOTE]
+> **左侧**：个人微信（商务合作/问题反馈） | **右侧**：Magi 交流群二维码
 
 ---
 
