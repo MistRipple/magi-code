@@ -1,9 +1,9 @@
 {
   "name": "magi",
   "displayName": "Magi",
-  "description": "多智能体工程编排系统 — 意图分析、任务拆解、异构专家协作",
+  "description": "多智能体工程编排 system — 意图分析、任务拆解、异构专家协作",
   "version": "0.1.1",
-  "license": "UNLICENSED",
+  "license": "GPL-3.0-or-later",
   "publisher": "MistRipple",
   "repository": {
     "type": "git",
