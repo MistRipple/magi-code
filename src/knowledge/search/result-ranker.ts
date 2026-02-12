@@ -15,6 +15,7 @@
 import { IndexSearchHit } from '../indexing/inverted-index';
 import { SymbolSearchHit } from '../indexing/symbol-index';
 import { DependencyGraph } from '../indexing/dependency-graph';
+import { MinHeap } from '../utils/min-heap';
 
 // ============================================================================
 // 类型定义
@@ -156,8 +157,8 @@ export class ResultRanker {
       }
     }
 
-    // 5. 计算最终得分并排序
-    const results: RankedResult[] = [];
+    // 优化 #17: MinHeap Top-K 替换全量 sort+slice
+    const heap = new MinHeap<RankedResult>(maxResults, (a, b) => a.finalScore - b.finalScore);
 
     for (const [filePath, entry] of fileMap.entries()) {
       const breakdown: ScoreDimensions = {
@@ -185,7 +186,7 @@ export class ResultRanker {
         finalScore *= 1.10;
       }
 
-      results.push({
+      heap.push({
         filePath,
         finalScore,
         breakdown,
@@ -193,9 +194,7 @@ export class ResultRanker {
       });
     }
 
-    return results
-      .sort((a, b) => b.finalScore - a.finalScore)
-      .slice(0, maxResults);
+    return heap.toSortedDescArray();
   }
 
   // ==========================================================================

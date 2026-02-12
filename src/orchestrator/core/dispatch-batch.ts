@@ -114,15 +114,24 @@ export interface TokenConsumption {
   totalTokens: number;
 }
 
-/** DispatchBatch 状态 */
-export type BatchStatus = 'active' | 'all_completed' | 'archived';
+/** DispatchBatch 阶段（显式状态机） */
+export type BatchPhase = 'active' | 'summarizing' | 'archived';
+
+/** 合法的阶段转换路径 */
+const ALLOWED_PHASE_TRANSITIONS: Record<BatchPhase, BatchPhase[]> = {
+  active: ['summarizing', 'archived'],     // 正常完成 → summarizing，取消 → archived
+  summarizing: ['archived'],               // Phase C 完成后归档
+  archived: [],                            // 终态，不可转换
+};
 
 /** DispatchBatch 事件 */
 export interface DispatchBatchEvents {
   /** 单个任务状态变化 */
   'task:statusChanged': (taskId: string, status: DispatchStatus, result?: DispatchResult) => void;
-  /** 所有任务完成（触发 Phase C） */
+  /** 所有任务完成（进入 summarizing 阶段，触发 Phase C） */
   'batch:allCompleted': (batchId: string, entries: DispatchEntry[]) => void;
+  /** 阶段转换 */
+  'phase:changed': (batchId: string, phase: BatchPhase) => void;
   /** 任务就绪可执行（依赖已满足） */
   'task:ready': (taskId: string, entry: DispatchEntry) => void;
   /** Batch 被取消 */
@@ -136,7 +145,7 @@ export interface DispatchBatchEvents {
 export class DispatchBatch extends EventEmitter {
   readonly id: string;
   private entries: Map<string, DispatchEntry> = new Map();
-  private _status: BatchStatus = 'active';
+  private _phase: BatchPhase = 'active';
   private readonly createdAt: number;
   /** 触发本 Batch 的用户原始请求（Phase C 汇总需要） */
   userPrompt: string = '';
@@ -156,12 +165,36 @@ export class DispatchBatch extends EventEmitter {
     this._lastActivityAt = Date.now();
   }
 
-  get status(): BatchStatus {
-    return this._status;
+  get status(): BatchPhase {
+    return this._phase;
+  }
+
+  get phase(): BatchPhase {
+    return this._phase;
   }
 
   get size(): number {
     return this.entries.size;
+  }
+
+  /**
+   * 显式阶段转换（状态机）
+   *
+   * 合法路径: active → summarizing → archived
+   *           active → archived（取消场景）
+   */
+  transitionTo(next: BatchPhase): void {
+    if (this._phase === next) return;
+    const allowed = ALLOWED_PHASE_TRANSITIONS[this._phase];
+    if (!allowed.includes(next)) {
+      throw new Error(`DispatchBatch 非法阶段转换: ${this._phase} → ${next} (batch: ${this.id})`);
+    }
+    const prev = this._phase;
+    this._phase = next;
+    this.emit('phase:changed', this.id, next);
+    logger.info('DispatchBatch.阶段转换', {
+      batchId: this.id, from: prev, to: next,
+    }, LogCategory.ORCHESTRATOR);
   }
 
   /**
@@ -174,7 +207,7 @@ export class DispatchBatch extends EventEmitter {
     files?: string[];
     dependsOn?: string[];
   }): DispatchEntry {
-    if (this._status === 'archived') {
+    if (this._phase === 'archived') {
       throw new Error(`DispatchBatch ${this.id} 已归档，无法注册新任务`);
     }
 
@@ -549,7 +582,7 @@ export class DispatchBatch extends EventEmitter {
    * 已完成的任务不受影响，不触发 Phase C。
    */
   cancelAll(reason: string = '用户取消'): void {
-    if (this._status !== 'active') return;
+    if (this._phase !== 'active') return;
 
     // 发出取消信号
     this.cancellationToken.cancel(reason);
@@ -564,7 +597,7 @@ export class DispatchBatch extends EventEmitter {
       }
     }
 
-    this._status = 'archived';
+    this.transitionTo('archived');
     // 释放所有等待归档的 Promise（与 archive() 对齐）
     for (const resolve of this.archiveResolvers) resolve();
     this.archiveResolvers = [];
@@ -581,7 +614,7 @@ export class DispatchBatch extends EventEmitter {
    * 归档 Batch
    */
   archive(): void {
-    this._status = 'archived';
+    this.transitionTo('archived');
     // 释放所有等待归档的 Promise
     for (const resolve of this.archiveResolvers) resolve();
     this.archiveResolvers = [];
@@ -605,11 +638,11 @@ export class DispatchBatch extends EventEmitter {
    * - 超时后自动 cancelAll 并归档，防止永久阻塞
    */
   waitForArchive(idleTimeoutMs: number = 5 * 60 * 1000): Promise<void> {
-    if (this._status === 'archived') return Promise.resolve();
+    if (this._phase === 'archived') return Promise.resolve();
     return new Promise<void>(resolve => {
       const CHECK_INTERVAL = 30_000; // 30 秒检查一次
       const checker = setInterval(() => {
-        if (this._status === 'archived') {
+        if (this._phase === 'archived') {
           clearInterval(checker);
           return;
         }
@@ -684,8 +717,8 @@ export class DispatchBatch extends EventEmitter {
    * 检查是否所有任务完成
    */
   private checkAllCompleted(): void {
-    if (this.isAllCompleted() && this._status === 'active') {
-      this._status = 'all_completed';
+    if (this.isAllCompleted() && this._phase === 'active') {
+      this.transitionTo('summarizing');
       this.emit('batch:allCompleted', this.id, this.getEntries());
     }
   }

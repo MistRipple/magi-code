@@ -28,6 +28,81 @@ export interface HistoryManagementConfig {
 }
 
 /**
+ * 停滞检测配置
+ *
+ * 按 Worker 模型特性差异化：
+ *   - Codex 倾向大范围只读扫描，需要更早干预（参考 Augment 的 25 轮硬上限）
+ *   - Claude 深度推理型，可以给更宽松的探索空间
+ */
+export interface StallDetectionConfig {
+  /** 连续失败终止阈值 */
+  consecutiveFailThreshold: number;
+  /** 累计失败终止阈值 */
+  totalFailLimit: number;
+  /** 空转分数警告阈值：一级（温和建议） */
+  stallWarnLevel1: number;
+  /** 空转分数警告阈值：二级（明确要求） */
+  stallWarnLevel2: number;
+  /** 空转分数警告阈值：三级（最终警告） */
+  stallWarnLevel3: number;
+  /** 空转分数终止阈值 */
+  stallAbortThreshold: number;
+  /** 总轮次硬上限 */
+  maxTotalRounds: number;
+  /** 无实质输出一级提醒阈值 */
+  noOutputWarn: number;
+  /** 无实质输出强制产出阈值 */
+  noOutputForce: number;
+  /** 无实质输出终止阈值 */
+  noOutputAbort: number;
+}
+
+/** 停滞检测预设：按 WorkerSlot 选择合适的阈值 */
+const STALL_DETECTION_PRESETS: Record<WorkerSlot, StallDetectionConfig> = {
+  claude: {
+    consecutiveFailThreshold: 5,
+    totalFailLimit: 25,
+    stallWarnLevel1: 5,
+    stallWarnLevel2: 10,
+    stallWarnLevel3: 18,
+    stallAbortThreshold: 25,
+    maxTotalRounds: 40,
+    noOutputWarn: 5,
+    noOutputForce: 8,
+    noOutputAbort: 12,
+  },
+  codex: {
+    consecutiveFailThreshold: 5,
+    totalFailLimit: 15,
+    stallWarnLevel1: 3,
+    stallWarnLevel2: 6,
+    stallWarnLevel3: 10,
+    stallAbortThreshold: 15,
+    maxTotalRounds: 25,
+    noOutputWarn: 3,
+    noOutputForce: 5,
+    noOutputAbort: 8,
+  },
+  gemini: {
+    consecutiveFailThreshold: 5,
+    totalFailLimit: 25,
+    stallWarnLevel1: 5,
+    stallWarnLevel2: 10,
+    stallWarnLevel3: 18,
+    stallAbortThreshold: 25,
+    maxTotalRounds: 40,
+    noOutputWarn: 5,
+    noOutputForce: 8,
+    noOutputAbort: 12,
+  },
+};
+
+/** 获取指定 WorkerSlot 的停滞检测预设（返回副本，避免外部篡改） */
+export function getStallDetectionPreset(workerSlot: WorkerSlot): StallDetectionConfig {
+  return { ...STALL_DETECTION_PRESETS[workerSlot] };
+}
+
+/**
  * Worker 适配器配置
  */
 export interface WorkerAdapterConfig {
@@ -40,6 +115,7 @@ export interface WorkerAdapterConfig {
   systemPrompt?: string;
   profileLoader: ProfileLoader;
   historyConfig?: HistoryManagementConfig;
+  stallConfig?: StallDetectionConfig;
 }
 
 /**
@@ -53,6 +129,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   private profileLoader: ProfileLoader;
   private guidanceInjector: GuidanceInjector;
   private historyConfig: Required<HistoryManagementConfig>;
+  private stallConfig: StallDetectionConfig;
   private seenThinking = false;
   private decisionHookAppliedForThinking = false;
   /** 工具摘要是否已注入到 systemPrompt（lazy init，仅执行一次） */
@@ -69,6 +146,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     this.workerSlot = adapterConfig.workerSlot;
     this.profileLoader = adapterConfig.profileLoader;
     this.guidanceInjector = new GuidanceInjector();
+    this.stallConfig = adapterConfig.stallConfig ?? getStallDetectionPreset(adapterConfig.workerSlot);
     this.systemPrompt = adapterConfig.systemPrompt || this.buildSystemPrompt();
     this.historyConfig = {
       maxMessages: adapterConfig.historyConfig?.maxMessages ?? 50,
@@ -170,25 +248,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     // 每轮 LLM 调用独立一个 stream，确保时间轴正确：
     // 当轮 stream 内包含 thinking + text + tool_call + tool_result，
     // endStream 后再产生新消息或下一轮 stream，时间顺序天然正确。
-    // 无轮次上限 — Worker 可执行任意多轮工具调用，
     // 异常终止依赖两类检测机制：
-    // 1. 连续失败检测：连续 5 次失败 → 提示换方式，累计 25 轮失败 → 终止
+    // 1. 连续失败检测：连续 N 次失败 → 提示换方式，累计 M 轮失败 → 终止
     // 2. 智能空转检测：基于空转分数（区分探索 vs 重复空转），多级渐进式警告
-    const CONSECUTIVE_FAIL_THRESHOLD = 5;
-    const TOTAL_FAIL_LIMIT = 25;
-    // 空转分数阈值（替代简单计数）
-    // 探索型只读（查看新文件）+0.5/轮，重复型只读（反复查看已看过的文件）+1.5/轮
-    const STALL_WARN_LEVEL_1 = 5;    // 第一级提醒：温和建议开始行动
-    const STALL_WARN_LEVEL_2 = 10;   // 第二级提醒：明确要求修改代码
-    const STALL_WARN_LEVEL_3 = 18;   // 第三级提醒：最终警告
-    const STALL_ABORT_THRESHOLD = 25; // 终止阈值
-    // 总轮次硬上限（安全网：防止任何场景下的无限循环）
-    const MAX_TOTAL_ROUNDS = 40;
-    const MAX_ROUNDS_FINAL_WARN = 35;
-    // 无实质文本输出检测（捕获 Worker 只做工具调用但不产出用户可见内容的场景）
-    const NO_OUTPUT_WARN = 5;        // 连续 5 轮无实质输出 → 一级提醒
-    const NO_OUTPUT_FORCE = 8;       // 连续 8 轮无实质输出 → 强制要求产出
-    const NO_OUTPUT_ABORT = 12;      // 连续 12 轮无实质输出 → 终止
+    // 阈值来自 this.stallConfig，由创建者按模型特性注入
+    const sc = this.stallConfig;
+    const MAX_ROUNDS_FINAL_WARN = sc.maxTotalRounds - 5;
 
     try {
       let finalText = '';
@@ -214,7 +279,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         }
 
         // 总轮次安全网：防止任何场景下的无限循环
-        if (round >= MAX_TOTAL_ROUNDS) {
+        if (round >= sc.maxTotalRounds) {
           logger.warn(`${this.agent} 达到总轮次上限`, { round }, LogCategory.LLM);
           finalText = finalText || `已执行 ${round} 轮工具调用，达到安全上限，任务终止。请检查任务是否需要拆分。`;
           break;
@@ -222,7 +287,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         if (round === MAX_ROUNDS_FINAL_WARN) {
           this.conversationHistory.push({
             role: 'user',
-            content: `[System] 你已执行 ${round} 轮工具调用，即将达到上限（${MAX_TOTAL_ROUNDS} 轮）。请立即总结当前进展，输出最终结果。不要再调用工具。`,
+            content: `[System] 你已执行 ${round} 轮工具调用，即将达到上限（${sc.maxTotalRounds} 轮）。请立即总结当前进展，输出最终结果。不要再调用工具。`,
           });
         }
 
@@ -345,19 +410,19 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
             consecutiveFailures++;
             totalFailures++;
 
-            if (totalFailures >= TOTAL_FAIL_LIMIT) {
+            if (totalFailures >= sc.totalFailLimit) {
               // 累计失败达到上限 → 终止
-              finalText = assistantText || `工具调用累计失败 ${TOTAL_FAIL_LIMIT} 轮，判定为异常终止。`;
+              finalText = assistantText || `工具调用累计失败 ${sc.totalFailLimit} 轮，判定为异常终止。`;
               this.normalizer.endStream(streamId);
               break;
             }
 
-            if (consecutiveFailures >= CONSECUTIVE_FAIL_THRESHOLD) {
+            if (consecutiveFailures >= sc.consecutiveFailThreshold) {
               // 连续失败达到阈值 → 注入提示让 LLM 换方式
               consecutiveFailures = 0;
               this.conversationHistory.push({
                 role: 'user',
-                content: `[System] 工具调用已连续失败 ${CONSECUTIVE_FAIL_THRESHOLD} 次，请换一种方式或策略继续处理任务。`,
+                content: `[System] 工具调用已连续失败 ${sc.consecutiveFailThreshold} 次，请换一种方式或策略继续处理任务。`,
               });
             }
           } else {
@@ -382,28 +447,28 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
               readOnlyStallScore += stallIncrement;
 
               // 多级渐进式警告
-              if (readOnlyStallScore >= STALL_ABORT_THRESHOLD) {
+              if (readOnlyStallScore >= sc.stallAbortThreshold) {
                 finalText = assistantText || `连续 ${readOnlyConsecutiveRounds} 轮仅调用只读工具（空转分数 ${readOnlyStallScore.toFixed(1)}），已查看 ${visitedPaths.size} 个文件，判定为搜索空转终止。`;
                 logger.warn(`${this.agent} 空转终止`, { rounds: readOnlyConsecutiveRounds, score: readOnlyStallScore, uniquePaths: visitedPaths.size }, LogCategory.LLM);
                 this.normalizer.endStream(streamId);
                 break;
               }
 
-              if (readOnlyStallScore >= STALL_WARN_LEVEL_3 && lastStallWarnLevel < 3) {
+              if (readOnlyStallScore >= sc.stallWarnLevel3 && lastStallWarnLevel < 3) {
                 lastStallWarnLevel = 3;
                 logger.warn(`${this.agent} 空转最终警告`, { rounds: readOnlyConsecutiveRounds, score: readOnlyStallScore, uniquePaths: visitedPaths.size }, LogCategory.LLM);
                 this.conversationHistory.push({
                   role: 'user',
                   content: `[System] ⚠️ 最终警告：你已连续 ${readOnlyConsecutiveRounds} 轮仅使用只读工具（已查看 ${visitedPaths.size} 个不同文件）。如果下一轮仍不使用 text_editor 的 write 命令修改代码，任务将被强制终止。请立即动手修改。`,
                 });
-              } else if (readOnlyStallScore >= STALL_WARN_LEVEL_2 && lastStallWarnLevel < 2) {
+              } else if (readOnlyStallScore >= sc.stallWarnLevel2 && lastStallWarnLevel < 2) {
                 lastStallWarnLevel = 2;
                 logger.warn(`${this.agent} 空转二级警告`, { rounds: readOnlyConsecutiveRounds, score: readOnlyStallScore, uniquePaths: visitedPaths.size }, LogCategory.LLM);
                 this.conversationHistory.push({
                   role: 'user',
                   content: `[System] 你已连续 ${readOnlyConsecutiveRounds} 轮仅使用搜索/查看类工具，已查看 ${visitedPaths.size} 个不同文件。你收集的信息已经足够，请立即使用 text_editor 的 write 命令开始修改代码。不要再查看文件。`,
                 });
-              } else if (readOnlyStallScore >= STALL_WARN_LEVEL_1 && lastStallWarnLevel < 1) {
+              } else if (readOnlyStallScore >= sc.stallWarnLevel1 && lastStallWarnLevel < 1) {
                 lastStallWarnLevel = 1;
                 logger.info(`${this.agent} 空转一级提醒`, { rounds: readOnlyConsecutiveRounds, score: readOnlyStallScore, uniquePaths: visitedPaths.size }, LogCategory.LLM);
                 this.conversationHistory.push({
@@ -426,21 +491,21 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           if (accumulatedText.trim().length < SUBSTANTIVE_TEXT_THRESHOLD) {
             noSubstantiveOutputRounds++;
 
-            if (noSubstantiveOutputRounds >= NO_OUTPUT_ABORT) {
+            if (noSubstantiveOutputRounds >= sc.noOutputAbort) {
               finalText = accumulatedText || `连续 ${noSubstantiveOutputRounds} 轮未产出实质性文本内容，仅调用工具。任务终止，请检查任务描述是否足够明确。`;
               logger.warn(`${this.agent} 无实质输出终止`, { rounds: noSubstantiveOutputRounds, totalRound: round }, LogCategory.LLM);
               this.normalizer.endStream(streamId);
               break;
             }
 
-            if (noSubstantiveOutputRounds >= NO_OUTPUT_FORCE && lastNoOutputWarnLevel < 2) {
+            if (noSubstantiveOutputRounds >= sc.noOutputForce && lastNoOutputWarnLevel < 2) {
               lastNoOutputWarnLevel = 2;
               logger.warn(`${this.agent} 无实质输出二级警告`, { rounds: noSubstantiveOutputRounds }, LogCategory.LLM);
               this.conversationHistory.push({
                 role: 'user',
                 content: `[System] 你已连续 ${noSubstantiveOutputRounds} 轮仅调用工具而未产出任何面向用户的文本内容。你必须在下一轮输出具体的分析结果、代码修改方案或最终结论。如果继续仅调用工具，任务将被终止。`,
               });
-            } else if (noSubstantiveOutputRounds >= NO_OUTPUT_WARN && lastNoOutputWarnLevel < 1) {
+            } else if (noSubstantiveOutputRounds >= sc.noOutputWarn && lastNoOutputWarnLevel < 1) {
               lastNoOutputWarnLevel = 1;
               logger.info(`${this.agent} 无实质输出一级提醒`, { rounds: noSubstantiveOutputRounds }, LogCategory.LLM);
               this.conversationHistory.push({

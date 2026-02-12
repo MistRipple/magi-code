@@ -9,7 +9,6 @@ import fs from 'fs';
 import path from 'path';
 import { logger, LogCategory } from '../logging';
 import type { ToolManager } from '../tools/tool-manager';
-import type { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
 
 /**
  * PromptEnhancerService 依赖接口
@@ -18,7 +17,6 @@ import type { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
 export interface PromptEnhancerDeps {
   workspaceRoot: string;
   getToolManager: () => ToolManager | undefined;
-  getKnowledgeBase: () => ProjectKnowledgeBase | undefined;
   getConversationHistory: (maxRounds: number) => string;
 }
 
@@ -112,7 +110,7 @@ export class PromptEnhancerService {
 
   /**
    * 收集代码上下文
-   * 优先使用 ACE 语义搜索，回退到本地多策略搜索
+   * 统一通过 AceExecutor 获取（ACE 可用时语义搜索，不可用时自动降级到本地三级搜索）
    */
   private async collectCodeContext(projectRoot: string, prompt: string): Promise<string> {
     const contextParts: string[] = [];
@@ -120,23 +118,28 @@ export class PromptEnhancerService {
     let currentLength = 0;
 
     try {
-      // 1. 尝试 ACE 语义搜索
-      const aceResult = await this.tryAceSemanticSearch(projectRoot, prompt);
-      if (aceResult) {
-        contextParts.push(`## 相关代码（语义搜索）\n${aceResult}`);
-        currentLength += aceResult.length;
-        logger.info('提示词增强.ACE语义搜索成功', { resultLength: aceResult.length }, LogCategory.UI);
-      } else {
-        // 2. ACE 不可用，使用本地多策略搜索
-        logger.info('提示词增强.ACE不可用，使用本地多策略搜索', undefined, LogCategory.UI);
-        const localResult = await this.performLocalContextSearch(projectRoot, prompt, maxContextLength);
-        if (localResult) {
-          contextParts.push(localResult);
-          currentLength += localResult.length;
+      // 1. 通过 AceExecutor 统一获取代码上下文（自动降级）
+      const toolManager = this.deps.getToolManager();
+      if (toolManager) {
+        const aceExecutor = toolManager.getAceExecutor();
+        const toolCall = {
+          id: `enhance-ace-${Date.now()}`,
+          name: 'codebase_retrieval',
+          arguments: {
+            query: prompt,
+            ensure_indexed: false,
+          },
+        };
+
+        const result = await aceExecutor.execute(toolCall);
+        if (!result.isError && result.content && result.content !== '未找到相关代码（本地三级搜索无结果）') {
+          contextParts.push(`## 相关代码\n${result.content}`);
+          currentLength += result.content.length;
+          logger.info('提示词增强.代码上下文获取成功', { resultLength: result.content.length }, LogCategory.UI);
         }
       }
 
-      // 3. 检查项目说明文件
+      // 2. 检查项目说明文件
       const guidelineFiles = ['CLAUDE.md', '.augment-guidelines', 'README.md', 'CONTRIBUTING.md'];
       for (const guideFile of guidelineFiles) {
         if (currentLength >= maxContextLength) break;
@@ -166,294 +169,9 @@ export class PromptEnhancerService {
     return contextParts.join('\n\n');
   }
 
-  /**
-   * 使用 ACE 语义搜索获取代码上下文
-   */
-  private async tryAceSemanticSearch(_projectRoot: string, prompt: string): Promise<string | null> {
-    try {
-      const toolManager = this.deps.getToolManager();
-      if (!toolManager) return null;
-      if (!toolManager.isAceConfigured()) return null;
-
-      const aceExecutor = toolManager.getAceExecutor();
-      const toolCall = {
-        id: `enhance-ace-${Date.now()}`,
-        name: 'codebase_retrieval',
-        arguments: {
-          query: prompt,
-          ensure_indexed: false,
-        },
-      };
-
-      const result = await aceExecutor.execute(toolCall);
-      if (!result.isError && result.content && result.content !== '未找到相关代码') {
-        return result.content;
-      }
-
-      return null;
-    } catch (error) {
-      logger.warn('提示词增强.ACE搜索异常', { error }, LogCategory.UI);
-      return null;
-    }
-  }
-
-  /**
-   * 本地多策略上下文搜索（grep + LSP + 知识库索引）
-   */
-  private async performLocalContextSearch(
-    projectRoot: string,
-    prompt: string,
-    maxContextLength: number,
-  ): Promise<string | null> {
-    const toolManager = this.deps.getToolManager();
-    if (!toolManager) return null;
-
-    const parts: string[] = [];
-    let currentLength = 0;
-
-    // 1. 提取搜索关键词
-    const keywords = this.extractKeywords(prompt);
-    if (keywords.length === 0) {
-      const structure = await this.getProjectStructure(projectRoot);
-      return structure ? `## 项目结构\n${structure}` : null;
-    }
-
-    // 2. 知识库项目上下文
-    const knowledgeBase = this.deps.getKnowledgeBase();
-    if (knowledgeBase) {
-      const projectContext = knowledgeBase.getProjectContext(400);
-      if (projectContext) {
-        parts.push(`## 项目概览\n${projectContext}`);
-        currentLength += projectContext.length;
-      }
-
-      // 倒排索引 + TF-IDF
-      try {
-        const searchResults = await knowledgeBase.search(prompt, {
-          maxResults: 8,
-          maxContextLength: Math.floor((maxContextLength - currentLength) * 0.6),
-        });
-        if (searchResults.length > 0) {
-          const snippetText = searchResults
-            .map(r => `### ${r.filePath} (得分: ${r.score.toFixed(2)})\n` +
-              r.snippets.map(s => `\`\`\`\n${s.content}\n\`\`\``).join('\n'))
-            .join('\n\n');
-          parts.push(`## 相关代码（索引检索）\n${snippetText}`);
-          currentLength += snippetText.length;
-          logger.info('提示词增强.本地索引搜索命中', {
-            hits: searchResults.length,
-            length: snippetText.length,
-          }, LogCategory.UI);
-        }
-      } catch (error) {
-        logger.warn('提示词增强.本地索引搜索失败', { error }, LogCategory.UI);
-      }
-    }
-
-    // 3. grep 搜索
-    const grepResults = await this.grepSearchForContext(toolManager, keywords, maxContextLength - currentLength);
-    if (grepResults) {
-      parts.push(`## 相关代码（关键词匹配）\n${grepResults}`);
-      currentLength += grepResults.length;
-    }
-
-    // 4. LSP 符号搜索
-    if (currentLength < maxContextLength * 0.8) {
-      const symbolResults = await this.lspSymbolSearchForContext(
-        toolManager, keywords, maxContextLength - currentLength,
-      );
-      if (symbolResults) {
-        parts.push(`## 相关符号定义\n${symbolResults}`);
-        currentLength += symbolResults.length;
-      }
-    }
-
-    if (parts.length === 0) {
-      const structure = await this.getProjectStructure(projectRoot);
-      return structure ? `## 项目结构\n${structure}` : null;
-    }
-
-    logger.info('提示词增强.本地搜索完成', {
-      strategies: parts.length,
-      totalLength: currentLength,
-      keywords: keywords.slice(0, 3),
-    }, LogCategory.UI);
-
-    return parts.join('\n\n');
-  }
-
-  // ============================================================================
-  // 搜索策略（公开方法，供 ACE 本地搜索回退复用）
-  // ============================================================================
-
-  async grepSearchForContext(
-    toolManager: ToolManager,
-    keywords: string[],
-    maxLength: number,
-  ): Promise<string | null> {
-    try {
-      const searchExecutor = toolManager.getSearchExecutor();
-      if (!searchExecutor) return null;
-
-      const results: string[] = [];
-      let totalLength = 0;
-      const searchKeywords = keywords.filter(kw => kw.length >= 3).slice(0, 3);
-
-      for (const keyword of searchKeywords) {
-        if (totalLength >= maxLength) break;
-
-        try {
-          const escapedKeyword = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          const toolCall = {
-            id: `ctx-grep-${Date.now()}-${keyword}`,
-            name: 'grep_search',
-            arguments: {
-              pattern: escapedKeyword,
-              include: '*.ts,*.tsx,*.js,*.jsx,*.py,*.go,*.rs,*.java,*.c,*.cpp,*.h,*.hpp,*.cs,*.php,*.rb,*.swift,*.kt,*.m,*.vue',
-              context_lines: 2,
-              case_sensitive: false,
-            },
-          };
-
-          const result = await searchExecutor.execute(toolCall);
-          if (!result.isError && result.content && result.content !== 'No matches found') {
-            const maxPerKeyword = Math.floor(maxLength / searchKeywords.length);
-            const truncated = result.content.length > maxPerKeyword
-              ? result.content.substring(0, maxPerKeyword) + '\n... (更多结果已省略)'
-              : result.content;
-
-            results.push(`### 关键词: "${keyword}"\n${truncated}`);
-            totalLength += truncated.length;
-          }
-        } catch (error) {
-          logger.debug('提示词增强.grep单关键词搜索失败', { keyword, error }, LogCategory.UI);
-        }
-      }
-
-      return results.length > 0 ? results.join('\n\n') : null;
-    } catch (error) {
-      logger.warn('提示词增强.grep搜索失败', { error }, LogCategory.UI);
-      return null;
-    }
-  }
-
-  async lspSymbolSearchForContext(
-    toolManager: ToolManager,
-    keywords: string[],
-    maxLength: number,
-  ): Promise<string | null> {
-    try {
-      const lspExecutor = toolManager.getLspExecutor();
-      if (!lspExecutor) return null;
-
-      const symbolEntries: string[] = [];
-      let totalLength = 0;
-      const symbolKeywords = keywords
-        .filter(kw => /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(kw) && kw.length >= 3)
-        .slice(0, 3);
-
-      for (const keyword of symbolKeywords) {
-        if (totalLength >= maxLength) break;
-
-        try {
-          const toolCall = {
-            id: `ctx-lsp-${Date.now()}-${keyword}`,
-            name: 'lsp_query',
-            arguments: {
-              action: 'workspaceSymbols',
-              query: keyword,
-            },
-          };
-
-          const result = await lspExecutor.execute(toolCall);
-          if (!result.isError && result.content) {
-            const parsed = JSON.parse(result.content);
-            const symbols = parsed.symbols || [];
-            if (symbols.length === 0) continue;
-
-            const formatted = symbols.slice(0, 10).map((sym: any) => {
-              const loc = sym.location;
-              const uri = loc?.uri || '';
-              const filePath = uri.replace(/^file:\/\//, '').replace(this.deps.workspaceRoot + '/', '');
-              const line = loc?.range?.start?.line ?? '?';
-              return `  - ${sym.kindName || 'symbol'} **${sym.name}** → ${filePath}:${line}`;
-            }).join('\n');
-
-            const entry = `### "${keyword}" 的符号定义\n${formatted}`;
-            if (totalLength + entry.length <= maxLength) {
-              symbolEntries.push(entry);
-              totalLength += entry.length;
-            }
-          }
-        } catch (error) {
-          logger.debug('提示词增强.LSP单符号搜索失败', { keyword, error }, LogCategory.UI);
-        }
-      }
-
-      return symbolEntries.length > 0 ? symbolEntries.join('\n\n') : null;
-    } catch (error) {
-      logger.warn('提示词增强.LSP符号搜索失败', { error }, LogCategory.UI);
-      return null;
-    }
-  }
-
   // ============================================================================
   // 辅助方法
   // ============================================================================
-
-  private async getProjectStructure(projectRoot: string): Promise<string> {
-    const structure: string[] = [];
-    const maxDepth = 3;
-    const maxFiles = 50;
-    let fileCount = 0;
-
-    const excludeDirs = new Set([
-      'node_modules', '.git', '.vscode', 'dist', 'build', 'out',
-      '__pycache__', '.pytest_cache', 'coverage', '.next', '.nuxt',
-    ]);
-
-    const walk = (dir: string, depth: number, prefix: string = '') => {
-      if (depth > maxDepth || fileCount > maxFiles) return;
-
-      try {
-        const items = fs.readdirSync(dir, { withFileTypes: true });
-        const sortedItems = items.sort((a, b) => {
-          if (a.isDirectory() && !b.isDirectory()) return -1;
-          if (!a.isDirectory() && b.isDirectory()) return 1;
-          return a.name.localeCompare(b.name);
-        });
-
-        for (const item of sortedItems) {
-          if (fileCount > maxFiles) break;
-          if (item.name.startsWith('.') && item.name !== '.env.example') continue;
-          if (excludeDirs.has(item.name)) continue;
-
-          const isLast = items.indexOf(item) === items.length - 1;
-          const connector = isLast ? '└── ' : '├── ';
-          const newPrefix = isLast ? '    ' : '│   ';
-
-          if (item.isDirectory()) {
-            structure.push(`${prefix}${connector}${item.name}/`);
-            walk(path.join(dir, item.name), depth + 1, prefix + newPrefix);
-          } else {
-            structure.push(`${prefix}${connector}${item.name}`);
-            fileCount++;
-          }
-        }
-      } catch (error) {
-        logger.debug('提示词增强.目录遍历权限问题', { dir, error }, LogCategory.UI);
-      }
-    };
-
-    walk(projectRoot, 0);
-
-    if (structure.length === 0) return '';
-    if (fileCount > maxFiles) {
-      structure.push('... (more files)');
-    }
-
-    return structure.slice(0, 100).join('\n');
-  }
 
   extractKeywords(prompt: string): string[] {
     const words = prompt.split(/[\s,，。.!！?？;；:：()（）[\]【】{}]+/);

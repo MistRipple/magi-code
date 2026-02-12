@@ -65,7 +65,7 @@ Magi 是一个 **VSCode 插件形态的多智能体编排系统**：
 
 本次审查覆盖 Magi 项目全部核心源码。二次审查在原始发现基础上，结合产品定位重新定级，补充了遗漏的核心问题，并标注了已修复项。
 
-当前状态：**2 个严重问题（1 个已修复）、4 个中等问题、5 个轻微问题**。
+当前状态：**2 个严重问题（2 个已修复）、4 个中等问题（4 个已修复）、5 个轻微问题（3 个已修复）**。
 
 核心结论：**系统的领域建模和协议设计（Mission/Contract/Assignment 架构、消息协议、画像系统）质量很高。当前最大的架构风险不是 God Object 的行数膨胀，而是多智能体编排系统的「事件可追踪性」不足——5 层事件转发链路直接削弱了产品的核心竞争力。**
 
@@ -73,15 +73,15 @@ Magi 是一个 **VSCode 插件形态的多智能体编排系统**：
 
 | 指标 | 数值 |
 |------|------|
-| 最大单文件行数 | 6282 行 (`webview-provider.ts`) |
+| 最大单文件行数 | 2606 行 (`webview-provider.ts`) |
 | 次大单文件行数 | 3484 行 (`mission-driven-engine.ts`) |
-| WebviewProvider 私有方法/属性数 | 229 个 |
-| handleMessage switch-case 分支数 | 93 个 |
+| WebviewProvider 私有方法/属性数 | ~120 个 |
+| handleMessage switch-case 分支数 | 38 个 |
 | MissionDrivenEngine 实例变量数 | ~30 个 |
 | DI 容器实际绑定数 / 应绑定数 | 6 / 20+ |
 | MissionOrchestrator setter 注入数 | 6 个 |
 | 事件转发层数 | 5 层 (Worker → MO → MDE → MessageHub → WP) |
-| 后端 `as any` 使用数 | 55 处 (`webview-provider.ts`) |
+| 后端 `as any` 使用数 | 0 处 (`webview-provider.ts`) |
 
 ---
 
@@ -93,9 +93,9 @@ Magi 是一个 **VSCode 插件形态的多智能体编排系统**：
 | 🔴 | P0-2 | 前端 Task/Todo 双数据路径 | `message-handler.ts` + `messages.svelte.ts` | 前端数据层 | ✅ 已修复 |
 | 🟡 | P1-1 | WebviewProvider 业务逻辑越界 | `webview-provider.ts` | UI 层 | ✅ 已修复 |
 | 🟡 | P1-2 | Setter 注入时序耦合 | `mission-orchestrator.ts` | 编排层 | ✅ 已修复 |
-| 🟡 | P1-3 | WebviewProvider 消息路由膨胀 | `webview-provider.ts` | UI 层 | 待修复 |
+| 🟡 | P1-3 | WebviewProvider 消息路由膨胀 | `webview-provider.ts` | UI 层 | ✅ 已修复 |
 | 🟡 | P1-4 | MissionDrivenEngine 职责过多 | `mission-driven-engine.ts` | 编排层 | ✅ 已修复 |
-| 🟢 | P2-1 | handleMessage 中大量 `as any` | `webview-provider.ts` | UI 层 | 部分已修复 |
+| 🟢 | P2-1 | handleMessage 中大量 `as any` | `webview-provider.ts` | UI 层 | ✅ 已修复 |
 | 🟢 | P2-2 | 双重 ContextManager 创建 | MO + MDE 构造器 | 编排层 | ✅ 已修复 |
 | 🟢 | P2-3 | 重复的会话删除逻辑 | `webview-provider.ts` | UI 层 | ✅ 已修复 |
 | 🟢 | P2-4 | DI 容器形同虚设 | `di/container.ts` | 全局 | 待修复 |
@@ -258,7 +258,7 @@ constructor(
 
 ### P1-3: WebviewProvider 消息路由膨胀
 
-> 原 P0-1 的次要子问题，降为 P1。
+> 原 P0-1 的次要子问题，降为 P1。已于 2025-02 修复。
 >
 > **定级理由**：93 个 case 分支确实多，但在 VSCode 扩展中 WebviewProvider 天然是前后端通信的唯一桥梁。switch-case 多本身不是病——拆分为 CommandHandler 可以降低阅读成本，但不是架构级风险。
 
@@ -266,14 +266,29 @@ constructor(
 
 **表象**: `handleMessage()` 包含 93 个 case 分支，覆盖 UI 状态、任务执行、配置管理、MCP、Skills、知识库等所有业务域。
 
-**改进建议**: 按业务域拆分为 CommandHandler，每个 Handler 注册自己关心的 message type：
+**修复内容** (Wave 4.2 #18):
+
+1. **死代码清理** (-218 行): 删除 `sendWorkerHistory`、`sendDetailedWorkerMessages`、`sendLLMLogsDirect`、`getLogsForWorker` 等 6 个未引用的 handler 方法
+2. **CommandHandler 模式拆分** (已有): 按业务域拆分为独立 Handler:
+   - `ConfigCommandHandler` → LLM / MCP / Skills / Profile 配置管理 (23KB)
+   - `KnowledgeCommandHandler` → ADR / FAQ / 知识库 CRUD (10KB)
+   - `McpCommandHandler` → MCP 服务器管理 (9KB)
+   - `SkillsCommandHandler` → 技能系统管理 (14KB)
+3. **EventBindingService 提取** (-454 行): 将所有事件绑定逻辑（globalEventBus 39 个事件监听、MessageHub 订阅、Adapter 错误监听、MissionOrchestrator 14 个事件、工具授权状态机）提取到独立服务
+4. **WorkerStatusService 提取** (-225 行): 将 Worker 模型连接状态检查（5 个缓存字段 + 2 个方法）提取到独立服务
+
+**修复后**:
+
+- WVP: 6282 → 2606 行 (-58.5%)
+- handleMessage switch-case: 93 → 38 个分支
+- 新增独立服务: EventBindingService (513 行) + WorkerStatusService (264 行)
+- 架构模式:
 
 ```
-WebviewProvider (纯 UI 层：Webview 生命周期 + 消息路由分发)
-  ├── ConfigCommandHandler      → LLM / MCP / Skills / Profile 配置管理
-  ├── KnowledgeCommandHandler   → ADR / FAQ / 知识库 CRUD
-  ├── SessionCommandHandler     → 会话管理 (new/switch/delete)
-  └── ExecutionCommandHandler   → 任务执行调度
+WebviewProvider (2606 行：Webview 生命周期 + 消息路由 + 核心执行)
+  ├── CommandHandler (4个)  → 配置 / 知识库 / MCP / Skills
+  ├── EventBindingService   → 事件绑定 + 工具授权状态机
+  └── WorkerStatusService   → Worker 连接状态检查 + 缓存
 ```
 
 ---

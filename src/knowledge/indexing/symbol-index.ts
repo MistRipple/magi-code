@@ -11,6 +11,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { logger, LogCategory } from '../../logging';
+import { MinHeap } from '../utils/min-heap';
 
 // ============================================================================
 // 类型定义
@@ -357,44 +358,94 @@ export class SymbolIndex {
   }
 
   /**
-   * 多 token 联合搜索（优化 #12）
-   * 先搜索原始查询（可能是完整符号名），再对每个 token 分别搜索，
-   * 按 filePath+symbolName+line 去重，取最高分
-   * @param tokens 扩展后的搜索 token 列表
-   * @param maxResults 最大返回数
-   * @param originalQuery 原始查询字符串（优先完整搜索）
+   * 多 token 联合搜索（优化 #12 → #16: 单次遍历优化）
+   *
+   * 将原来的 N+1 次全表扫描合并为 1 次遍历：
+   * - 对每个符号名，一次性检查所有 queryTerms（exact > prefix > contains > fuzzy）
+   * - fuzzyMatch 仅对 originalQuery 执行（扩展 token 的 fuzzy 匹配价值低、代价高）
+   * - 命中 exact 时提前 break（无需检查剩余 terms）
+   *
+   * 复杂度: 从 O(S × (N+1)) 降为 O(S × 1)（单次 Map 遍历 + 内循环短路）
    */
   searchMulti(tokens: string[], maxResults = 20, originalQuery?: string): SymbolSearchHit[] {
     if (!this._isReady || tokens.length === 0) return [];
 
-    // key = filePath:symbolName:line → 去重
-    const hitMap = new Map<string, SymbolSearchHit>();
+    // 预处理查询词：lowercase + 去重 + 过滤短词
+    const queryTerms: string[] = [];
+    const seen = new Set<string>();
+    let originalQueryLower: string | null = null;
 
-    // 先搜索原始查询（可能是完整的符号名，如 "searchSymbolsMultiToken"）
     if (originalQuery && originalQuery.trim().length >= 2) {
-      const directHits = this.search(originalQuery.trim(), maxResults);
-      for (const hit of directHits) {
-        const key = `${hit.symbol.filePath}:${hit.symbol.name}:${hit.symbol.line}`;
-        hitMap.set(key, hit);
-      }
+      originalQueryLower = originalQuery.trim().toLowerCase();
+      queryTerms.push(originalQueryLower);
+      seen.add(originalQueryLower);
     }
 
-    // 再对每个扩展 token 搜索（短 token 跳过，避免噪音）
     for (const token of tokens) {
       if (!token || token.length < 2) continue;
-      const tokenHits = this.search(token, Math.ceil(maxResults / 2));
-      for (const hit of tokenHits) {
-        const key = `${hit.symbol.filePath}:${hit.symbol.name}:${hit.symbol.line}`;
-        const existing = hitMap.get(key);
-        if (!existing || hit.score > existing.score) {
-          hitMap.set(key, hit);
+      const tl = token.toLowerCase();
+      if (seen.has(tl)) continue;
+      seen.add(tl);
+      queryTerms.push(tl);
+    }
+
+    if (queryTerms.length === 0) return [];
+
+    // 单次遍历所有符号
+    const hitMap = new Map<string, SymbolSearchHit>();
+
+    for (const [name, entries] of this.symbols.entries()) {
+      const nameLower = name.toLowerCase();
+
+      let bestMatchType: SymbolSearchHit['matchType'] | null = null;
+      let bestScore = 0;
+
+      // 对当前符号名，检查所有 queryTerms
+      for (const term of queryTerms) {
+        let matchType: SymbolSearchHit['matchType'] | null = null;
+        let score = 0;
+
+        if (nameLower === term) {
+          matchType = 'exact'; score = 1.0;
+        } else if (nameLower.startsWith(term)) {
+          matchType = 'prefix'; score = 0.8;
+        } else if (nameLower.includes(term)) {
+          matchType = 'contains'; score = 0.5;
+        }
+
+        if (matchType && score > bestScore) {
+          bestScore = score;
+          bestMatchType = matchType;
+          if (score >= 1.0) break; // exact 命中，无需继续检查
+        }
+      }
+
+      // fuzzyMatch 仅对 originalQuery 执行（代价较高，限制范围）
+      if (!bestMatchType && originalQueryLower && this.fuzzyMatch(originalQueryLower, nameLower)) {
+        bestMatchType = 'fuzzy';
+        bestScore = 0.3;
+      }
+
+      if (bestMatchType) {
+        for (const entry of entries) {
+          const exportBonus = entry.isExported ? 0.15 : 0;
+          const kindWeight = this.getKindWeight(entry.kind);
+          const finalScore = Math.min(1.0, bestScore + exportBonus + kindWeight * 0.1);
+          const key = `${entry.filePath}:${name}:${entry.line}`;
+          const existing = hitMap.get(key);
+          if (!existing || finalScore > existing.score) {
+            hitMap.set(key, { symbol: entry, score: finalScore, matchType: bestMatchType });
+          }
         }
       }
     }
 
-    return Array.from(hitMap.values())
-      .sort((a, b) => b.score - a.score)
-      .slice(0, maxResults);
+    // 优化 #17: MinHeap Top-K 替换全量 sort+slice
+    const heap = new MinHeap<SymbolSearchHit>(maxResults, (a, b) => a.score - b.score);
+    for (const hit of hitMap.values()) {
+      heap.push(hit);
+    }
+    return heap.toSortedDescArray();
   }
 
   /**

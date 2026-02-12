@@ -409,13 +409,10 @@ export type EventListener = (event: AppEvent) => void;
 // ============================================
 
 // UI 状态
-export interface UIChatSession extends Session {
-  workerOutputs?: Record<string, any[]>;
-}
 
 export interface UIState {
   currentSessionId?: string;
-  sessions?: UIChatSession[];
+  sessions?: import('./session').SessionMeta[];
   currentTask?: Task;
   tasks?: Task[];
   activePlan?: { planId: string; formattedPlan: string; updatedAt: number; review?: { status: 'approved' | 'rejected' | 'skipped'; summary: string } };
@@ -495,6 +492,15 @@ export type WebviewToExtensionMessage =
   | { type: 'checkWorkerStatus'; force?: boolean }
 
   | { type: 'clearAllTasks' }
+
+  // UI 错误上报
+  | { type: 'uiError'; component: string; detail: string; stack?: string }
+  // 工具授权响应
+  | { type: 'toolAuthorizationResponse'; requestId?: string; allowed: boolean }
+  // 交互响应（动态审批等）
+  | { type: 'interactionResponse'; requestId: string; response: string }
+  // Mermaid 图表面板
+  | { type: 'openMermaidPanel'; code: string; title?: string }
 
   | { type: 'getPromptEnhanceConfig' }
   | { type: 'updatePromptEnhance'; config: { baseUrl: string; apiKey: string }; source?: 'auto' | 'manual' }

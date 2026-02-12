@@ -19,26 +19,20 @@ import {
   WorkerStatus,
   WorkerSlot,
 } from '../types';
-import { AgentType } from '../types/agent-types';
 import {
   StandardMessage,
-  StreamUpdate,
   MessageLifecycle,
   MessageType,
   MessageCategory,
   ContentBlock,
-  MessageMetadata,
   DataMessageType,
   NotifyLevel,
   ControlMessageType,
-  InteractionType,
   createStandardMessage,
   createUserInputMessage,
   createStreamingMessage,
   createErrorMessage,
-  createInteractionMessage,
 } from '../protocol/message-protocol';
-import { ADAPTER_EVENTS, PROCESSING_EVENTS, WEBVIEW_MESSAGE_TYPES } from '../protocol/event-names';
 import { UnifiedSessionManager } from '../session';
 import { TaskView } from '../task/task-view-adapter';
 import { SnapshotManager } from '../snapshot-manager';
@@ -55,17 +49,13 @@ import { MermaidPanel } from './mermaid-panel';
 import type { CommandHandler, CommandHandlerContext } from './handlers/types';
 import { ConfigCommandHandler, McpCommandHandler, SkillsCommandHandler, KnowledgeCommandHandler } from './handlers';
 import { isAbortError } from '../errors';
+import { EventBindingService } from './event-binding-service';
+import { WorkerStatusService } from './worker-status-service';
 import { PromptEnhancerService } from '../services/prompt-enhancer-service';
 import { DirectExecutionService } from '../services/direct-execution-service';
-// Mission-Driven Architecture 类型 - 直接从子模块导入
 import {
   MissionOrchestrator,
-  MissionSummary,
-  MissionVerificationResult,
 } from '../orchestrator/core';
-import { Mission, Assignment } from '../orchestrator/mission';
-import { normalizeAssignments, normalizeTodos, generateEntityId } from '../orchestrator/mission/data-normalizer';
-import type { UnifiedTodo } from '../todo/types';
 
 type WebviewMessagePriority = 'high' | 'normal';
 
@@ -144,7 +134,7 @@ class WebviewMessageBus {
           await view.webview.postMessage(next);
         } catch (postError) {
           logger.warn('界面.消息.发送失败', {
-            messageId: (next as any).message?.id,
+            messageId: 'message' in next ? (next.message as StandardMessage)?.id : undefined,
             error: String(postError),
           }, LogCategory.UI);
         }
@@ -195,51 +185,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private promptEnhancer: PromptEnhancerService;
   private directExecutor: DirectExecutionService;
 
-  // Hard Stop 确认机制
-  private pendingConfirmation: {
-    resolve: (confirmed: boolean) => void;
-    reject: (error: Error) => void;
-  } | null = null;
-  private pendingQuestion: {
-    resolve: (answer: string | null) => void;
-    reject: (error: Error) => void;
-  } | null = null;
-  // 需求澄清机制
-  private pendingClarification: {
-    resolve: (result: { answers: Record<string, string>; additionalInfo?: string } | null) => void;
-    reject: (error: Error) => void;
-  } | null = null;
-  // Worker 问题机制
-  private pendingWorkerQuestion: {
-    resolve: (answer: string | null) => void;
-    reject: (error: Error) => void;
-  } | null = null;
-  // 工具授权回调（按请求 ID 管理，避免并发覆盖）
-  private toolAuthorizationCallbacks = new Map<string, (allowed: boolean) => void>();
-  private toolAuthorizationQueue: Array<{ requestId: string; toolName: string; toolArgs: any }> = [];
-  private activeToolAuthorizationRequestId: string | null = null;
-  private activeToolAuthorizationTimer: NodeJS.Timeout | null = null;
-  private readonly toolAuthorizationTimeoutMs = 60000;
+  // 事件绑定服务（从 WVP 提取）
+  private eventBindingService: EventBindingService;
 
   // 当前选择的 Worker（null 表示自动选择/智能编排）
   private selectedWorker: WorkerSlot | null = null;
   private recentRequestIds: Map<string, number> = new Map();
 
-  // 模型连接状态缓存（避免频繁真实请求）
-  private workerStatusCache: Record<string, { status: string; model?: string; error?: string }> | null = null;
-  private workerStatusCacheAt = 0;
+  // Worker 状态检查服务
+  private workerStatusService: WorkerStatusService;
   private interactionModeUpdatedAt = 0;
-  private workerStatusInFlight: Promise<void> | null = null;
-  private readonly workerStatusCacheTtlMs = 30000;
-  private readonly workerStatusSoftTtlMs = 120000;
-  private readonly workerStatusTimeoutMs = 4000;
-  private readonly workerStatusHardTimeoutMs = 10000;
 
-  private streamingContextCache: Map<string, { content: string; lastFlushAt: number }> = new Map();
-  private messageMetaCache: Map<string, { type?: MessageType; metadata?: Record<string, unknown> | MessageMetadata }> = new Map();
-  private lastRecordedContextBySession: Map<string, { content: string; at: number }> = new Map();
-  private readonly streamingContextFlushMs = 1200;
-  private readonly contextDedupeWindowMs = 10000;
 
   private activeSessionId: string | null = null;
   private logs: LogEntry[] = [];
@@ -287,9 +243,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 初始化 LLM 适配器工厂
     this.adapterFactory = new LLMAdapterFactory({ cwd: workspaceRoot });
 
-    // 设置错误事件处理（消息由 Adapter 直接发送到 MessageHub，不再通过事件转发）
-    this.setupAdapterEvents();
-
     // 初始化编排引擎
     this.orchestratorEngine = new MissionDrivenEngine(
       this.adapterFactory,
@@ -320,11 +273,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     this.interactionModeUpdatedAt = Date.now();
 
-    this.setupMessageHubListeners();
     this.orchestratorEngine.setExtensionContext(this.context);
-    // 设置 Hard Stop 确认回调
-    this.setupOrchestratorConfirmation();
-    this.setupOrchestratorQuestions();
 
     // 初始化项目知识库
     this.initializeProjectKnowledgeBase();
@@ -333,7 +282,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.promptEnhancer = new PromptEnhancerService({
       workspaceRoot: this.workspaceRoot,
       getToolManager: () => this.adapterFactory.getToolManager?.(),
-      getKnowledgeBase: () => this.projectKnowledgeBase,
       getConversationHistory: (maxRounds) => this.sessionManager.formatConversationHistory(maxRounds),
     });
 
@@ -380,8 +328,34 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       new KnowledgeCommandHandler(),
     ];
 
-    // 绑定事件
-    this.bindEvents();
+    // 初始化 Worker 状态检查服务
+    this.workerStatusService = new WorkerStatusService({
+      sendData: (dataType, payload) => this.sendData(dataType, payload),
+      getAdapterFactory: () => this.adapterFactory,
+    });
+
+    // 初始化事件绑定服务（统一管理 globalEventBus / MessageHub / Adapter / MO 事件）
+    this.eventBindingService = new EventBindingService({
+      getActiveSessionId: () => this.activeSessionId,
+      getMessageHub: () => this.messageHub,
+      getOrchestratorEngine: () => this.orchestratorEngine,
+      getAdapterFactory: () => this.adapterFactory,
+      getMissionOrchestrator: () => this.missionOrchestrator,
+      getMessageIdToRequestId: () => this.messageIdToRequestId,
+      sendStateUpdate: () => this.sendStateUpdate(),
+      sendData: (dataType, payload) => this.sendData(dataType, payload),
+      sendToast: (msg, level, duration) => this.sendToast(msg, level, duration),
+      sendExecutionStats: () => this.sendExecutionStats(),
+      sendOrchestratorMessage: (params) => this.sendOrchestratorMessage(params),
+      appendLog: (entry) => this.appendLog(entry),
+      postMessage: (message) => this.postMessage(message),
+      logMessageFlow: (eventType, payload) => this.logMessageFlow(eventType, payload),
+      resolveRequestTimeoutFromMessage: (message) => this.resolveRequestTimeoutFromMessage(message),
+      clearRequestTimeout: (requestId) => this.clearRequestTimeout(requestId),
+      interruptCurrentTask: (options) => this.interruptCurrentTask(options),
+      tryResumePendingRecovery: () => { void this.tryResumePendingRecovery(); },
+    });
+    this.eventBindingService.bindAll();
   }
 
   private logMessageFlow(eventType: string, payload: unknown): void {
@@ -453,8 +427,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 设置文件监听器，支持搜索引擎增量更新
       this.setupFileSystemWatcher();
 
-      // 注入本地搜索回退到 AceExecutor（ACE 不可用时自动降级）
-      this.injectLocalSearchFallback();
+      // 注入本地搜索服务到 AceExecutor（ACE 不可用时自动降级）
+      this.injectLocalSearchService();
 
       const codeIndex = this.projectKnowledgeBase.getCodeIndex();
       logger.info('项目知识库.已初始化', {
@@ -563,71 +537,24 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * 注入本地搜索回退到 AceExecutor
-   * 当 ACE 不可用时，codebase_retrieval 工具自动降级到 LocalSearchEngine
+   * 注入 LocalCodeSearchService 到 AceExecutor
+   * 使用惰性引用，解决 PKB 初始化时序问题
    */
-  private injectLocalSearchFallback(): void {
-    if (!this.projectKnowledgeBase) return;
-
+  private injectLocalSearchService(): void {
     const toolManager = this.adapterFactory.getToolManager?.();
     if (!toolManager) return;
 
-    const aceExecutor = toolManager.getAceExecutor();
-    const pkb = this.projectKnowledgeBase;
-
-    aceExecutor.setLocalSearchFallback(async (query: string, maxResults?: number) => {
-      const parts: string[] = [];
-      const limit = maxResults || 10;
-      const maxContextLength = 6000;
-      let currentLength = 0;
-      const keywords = this.promptEnhancer.extractKeywords(query);
-
-      // Level 1: 知识库索引搜索（TF-IDF + 符号 + 依赖图）
-      const results = await pkb.search(query, {
-        maxResults: limit,
-        maxContextLength: Math.floor(maxContextLength * 0.6),
-      });
-
-      if (results.length > 0) {
-        const formatted = results
-          .map(r => {
-            const snippetText = r.snippets
-              .map(s => `\`\`\`\n${s.content}\n\`\`\``)
-              .join('\n');
-            return `### ${r.filePath} (score: ${r.score.toFixed(2)})\n${snippetText}`;
-          })
-          .join('\n\n');
-        parts.push(formatted);
-        currentLength += formatted.length;
-      }
-
-      // Level 2: Grep 精确匹配搜索
-      if (currentLength < maxContextLength * 0.8) {
-        const grepResult = await this.promptEnhancer.grepSearchForContext(
-          toolManager, keywords, maxContextLength - currentLength
-        );
-        if (grepResult) {
-          parts.push(`## 关键词匹配\n${grepResult}`);
-          currentLength += grepResult.length;
-        }
-      }
-
-      // Level 3: LSP 符号搜索
-      if (currentLength < maxContextLength * 0.9) {
-        const symbolResult = await this.promptEnhancer.lspSymbolSearchForContext(
-          toolManager, keywords, maxContextLength - currentLength
-        );
-        if (symbolResult) {
-          parts.push(`## 符号定义\n${symbolResult}`);
-        }
-      }
-
-      if (parts.length === 0) return null;
-
-      return `Query: "${query}"\nSearched via local index (TF-IDF + Symbol + Grep + LSP)\n\n${parts.join('\n\n')}`;
+    const { LocalCodeSearchService } = require('../services/local-code-search-service');
+    const localSearch = new LocalCodeSearchService({
+      getKnowledgeBase: () => this.projectKnowledgeBase,
+      getSearchExecutor: () => toolManager.getSearchExecutor(),
+      getLspExecutor: () => toolManager.getLspExecutor(),
+      extractKeywords: (query: string) => this.promptEnhancer.extractKeywords(query),
+      workspaceRoot: this.workspaceRoot,
     });
 
-    logger.info('AceExecutor.本地搜索回退.已注入（三级搜索）', undefined, LogCategory.SESSION);
+    toolManager.getAceExecutor().setLocalSearchService(localSearch);
+    logger.info('AceExecutor.本地搜索服务.已注入', undefined, LogCategory.SESSION);
   }
 
   /**
@@ -719,72 +646,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         error: error.message
       }, LogCategory.SESSION);
     }
-  }
-
-  /**
-   * 设置 LLM 适配器错误事件监听
-   *
-   * 消息流已简化为 4 层架构：
-   * Layer 1: Normalizer.emit('message')
-   * Layer 2: Adapter → messageBus.sendMessage() [直接调用]
-   * Layer 3: MessageBus → emit('message')
-   * Layer 4: WebviewProvider.setupMessageBusListeners() → postMessage()
-   *
-   * 此方法只处理错误事件，消息由 Adapter 直接发送到 MessageBus
-   */
-  private setupAdapterEvents(): void {
-    // 只监听错误事件
-    this.adapterFactory.on(ADAPTER_EVENTS.ERROR, (error: Error) => {
-      logger.error('适配器错误', { error: error.message }, LogCategory.LLM);
-    });
-  }
-
-  /** 设置 MessageHub 事件监听，统一转发到前端 */
-  private setupMessageHubListeners(): void {
-    // 标准流式消息（LLM / 编排 / Worker 等统一通道）
-    this.messageHub.on('unified:message', (message) => {
-      this.postMessage({
-        type: WEBVIEW_MESSAGE_TYPES.UNIFIED_MESSAGE,
-        message,
-        sessionId: this.activeSessionId
-      } as any);
-      this.logMessageFlow('messageHub.standardMessage [SENT]', message);
-      this.resolveRequestTimeoutFromMessage(message);
-    });
-
-    this.messageHub.on('unified:update', (update) => {
-      this.postMessage({
-        type: WEBVIEW_MESSAGE_TYPES.UNIFIED_UPDATE,
-        update,
-        sessionId: this.activeSessionId
-      } as any);
-      this.logMessageFlow('messageHub.standardUpdate [SENT]', update);
-      // 收到流式更新即表明 LLM 已响应，清除首 token 超时
-      const reqId = this.messageIdToRequestId.get(update.messageId);
-      if (reqId) {
-        this.clearRequestTimeout(reqId);
-      }
-    });
-
-    this.messageHub.on('unified:complete', (message) => {
-      this.postMessage({
-        type: WEBVIEW_MESSAGE_TYPES.UNIFIED_COMPLETE,
-        message,
-        sessionId: this.activeSessionId
-      } as any);
-      this.logMessageFlow('messageHub.standardComplete [SENT]', message);
-      this.resolveRequestTimeoutFromMessage(message);
-    });
-
-    // ProcessingState 权威来源（同步 UI loading 状态）
-    this.messageHub.on(PROCESSING_EVENTS.STATE_CHANGED, (state) => {
-      this.sendData('processingStateChanged', {
-        isProcessing: state.isProcessing,
-        source: state.source,
-        agent: state.agent,
-        startedAt: state.startedAt,
-      });
-    });
   }
 
   private emitUserAndPlaceholder(requestId: string, prompt: string, imageCount: number, images?: Array<{ dataUrl: string }>, targetWorker?: string): {
@@ -891,476 +752,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.clearRequestTimeout(requestId);
   }
 
-  private cacheMessageMeta(message: StandardMessage): void {
-    if (!message?.id) {
-      return;
-    }
-    this.messageMetaCache.set(message.id, {
-      type: message.type,
-      metadata: message.metadata || undefined,
-    });
-  }
-
-  private isRecordableMessage(type?: MessageType, metadata?: Record<string, unknown> | MessageMetadata): boolean {
-    if (metadata && (metadata as any).isStatusMessage) {
-      return false;
-    }
-    if (!type) {
-      return true;
-    }
-    return [
-      MessageType.TEXT,
-      MessageType.RESULT,
-      MessageType.ERROR,
-      MessageType.THINKING,
-      MessageType.INTERACTION,
-    ].includes(type);
-  }
-
-  private extractTextFromBlocks(blocks: ContentBlock[] | undefined): string {
-    if (!blocks || blocks.length === 0) {
-      return '';
-    }
-    return blocks
-      .filter((block) => block.type === 'text' || block.type === 'thinking')
-      .map((block) => (block as any).content || '')
-      .filter(Boolean)
-      .join('\n');
-  }
-
-  private updateStreamingBuffer(messageId: string, nextContent: string, updateType: 'append' | 'replace'): void {
-    if (!messageId || !nextContent) {
-      return;
-    }
-    const entry = this.streamingContextCache.get(messageId);
-    const content = updateType === 'append' && entry ? entry.content + nextContent : nextContent;
-    this.streamingContextCache.set(messageId, {
-      content,
-      lastFlushAt: entry?.lastFlushAt || 0,
-    });
-  }
-
-  private recordStreamingContext(message: StandardMessage): void {
-    if (!message?.id) {
-      return;
-    }
-    if (!this.isRecordableMessage(message.type, message.metadata)) {
-      return;
-    }
-    const content = this.extractTextFromBlocks(message.blocks);
-    if (!content) {
-      return;
-    }
-    this.updateStreamingBuffer(message.id, content, 'replace');
-    this.flushStreamingContext(message.id);
-  }
-
-  private recordStreamingUpdate(update: StreamUpdate): void {
-    if (!update?.messageId) {
-      return;
-    }
-    const meta = this.messageMetaCache.get(update.messageId);
-    if (!this.isRecordableMessage(meta?.type, meta?.metadata)) {
-      return;
-    }
-
-    let content = '';
-    let updateType: 'append' | 'replace' = 'replace';
-    if (update.updateType === 'append' && update.appendText) {
-      content = update.appendText;
-      updateType = 'append';
-    } else if (update.blocks) {
-      content = this.extractTextFromBlocks(update.blocks);
-      updateType = 'replace';
-    }
-
-    if (!content) {
-      return;
-    }
-
-    this.updateStreamingBuffer(update.messageId, content, updateType);
-    this.flushStreamingContext(update.messageId);
-  }
-
-  private flushStreamingContext(messageId: string): void {
-    const entry = this.streamingContextCache.get(messageId);
-    if (!entry) {
-      return;
-    }
-    const now = Date.now();
-    if (now - entry.lastFlushAt < this.streamingContextFlushMs) {
-      return;
-    }
-    entry.lastFlushAt = now;
-    const sessionId = this.activeSessionId || undefined;
-    void this.orchestratorEngine.recordStreamingMessage(
-      messageId,
-      'assistant',
-      entry.content,
-      sessionId
-    );
-  }
-
-  private recordFinalContext(message: StandardMessage): void {
-    if (!message?.id) {
-      return;
-    }
-    this.streamingContextCache.delete(message.id);
-    this.orchestratorEngine.clearStreamingMessage(message.id);
-
-    if (!this.isRecordableMessage(message.type, message.metadata)) {
-      return;
-    }
-    const content = this.extractTextFromBlocks(message.blocks);
-    if (!content) {
-      return;
-    }
-
-    const sessionId = this.activeSessionId || 'default';
-    const lastRecord = this.lastRecordedContextBySession.get(sessionId);
-    const now = Date.now();
-    if (lastRecord && lastRecord.content === content && now - lastRecord.at < this.contextDedupeWindowMs) {
-      return;
-    }
-    this.lastRecordedContextBySession.set(sessionId, { content, at: now });
-    void this.orchestratorEngine.recordContextMessage('assistant', content, sessionId);
-  }
-
-  private recordToolOutputsIfAny(message: StandardMessage): void {
-    if (!message?.blocks || message.blocks.length === 0) {
-      return;
-    }
-    const toolBlocks = message.blocks.filter((block) => block.type === 'tool_call') as Array<{
-      toolName?: string;
-      status?: string;
-      output?: string;
-      error?: string;
-    }>;
-    if (toolBlocks.length === 0) {
-      return;
-    }
-    const sessionId = this.activeSessionId || undefined;
-    for (const tool of toolBlocks) {
-      const toolName = tool.toolName || 'tool';
-      if (tool.status === 'completed' && tool.output) {
-        void this.orchestratorEngine.recordToolOutput(toolName, tool.output, sessionId);
-      } else if (tool.status === 'failed' && tool.error) {
-        void this.orchestratorEngine.recordToolOutput(toolName, `Error: ${tool.error}`, sessionId);
-      }
-    }
-  }
-
-  /** 设置智能编排器的 Hard Stop 确认回调 */
-  private setupOrchestratorConfirmation(): void {
-    // 设置 Hard Stop 确认回调
-    this.orchestratorEngine.setConfirmationCallback(async (plan, formattedPlan) => {
-      const mode = this.orchestratorEngine.getInteractionMode();
-      if (mode === 'auto') {
-        logger.info('界面.编排器.确认.自动_跳过', { mode }, LogCategory.UI);
-        return true;
-      }
-      return new Promise<boolean>((resolve, reject) => {
-        // 保存 resolve/reject 以便后续处理用户响应
-        this.pendingConfirmation = { resolve, reject };
-
-        // 🔧 P3: 发送交互消息到主对话区
-        const traceId = this.messageHub.getTraceId();
-        const interactionMsg = createInteractionMessage(
-          {
-            type: InteractionType.PLAN_CONFIRMATION,
-            requestId: `confirm-${Date.now()}`,
-            prompt: '请确认执行计划',
-            required: true
-          },
-          'orchestrator',
-          'orchestrator',
-          traceId,
-          {
-            blocks: [{ type: 'text', content: formattedPlan, isMarkdown: true }]
-          }
-        );
-        this.messageHub.sendMessage(interactionMsg);
-
-        // 发送确认请求消息 (触发 UI 状态/弹窗)
-        this.sendData('confirmationRequest', {
-          plan: plan,
-          formattedPlan: formattedPlan,
-        });
-
-        logger.info('界面.编排器.确认.等待', { mode }, LogCategory.UI);
-      });
-    });
-
-    // 设置恢复确认回调
-    this.orchestratorEngine.setRecoveryConfirmationCallback(async (failedTask, error, options) => {
-      return new Promise<'retry' | 'rollback' | 'continue'>((resolve) => {
-        // 保存 resolver
-        this.recoveryConfirmationResolver = resolve;
-
-        // 🔧 P3: 发送交互消息到主对话区
-        const traceId = this.messageHub.getTraceId();
-        const interactionMsg = createInteractionMessage(
-          {
-            type: InteractionType.QUESTION, // 复用 QUESTION 类型或新增 RECOVERY 类型
-            requestId: `recovery-${Date.now()}`,
-            prompt: `任务执行出错: ${error}\n\n请选择恢复策略：`,
-            options: [
-              options.retry ? { value: 'retry', label: '重试' } : null,
-              options.rollback ? { value: 'rollback', label: '回滚' } : null,
-              { value: 'continue', label: '继续(跳过)' }
-            ].filter(Boolean) as any,
-            required: true
-          },
-          'orchestrator',
-          'orchestrator',
-          traceId
-        );
-        this.messageHub.sendMessage(interactionMsg);
-
-        // 发送恢复请求到 Webview
-        this.sendData('recoveryRequest', {
-          taskId: failedTask.id,
-          error: error,
-          canRetry: options.retry,
-          canRollback: options.rollback,
-        });
-
-        logger.info('界面.编排器.恢复.等待', { taskId: failedTask.id }, LogCategory.UI);
-      });
-    });
-  }
-
-  /** 设置编排者补充问题回调 */
-  private setupOrchestratorQuestions(): void {
-    this.orchestratorEngine.setQuestionCallback(async (questions, plan) => {
-      return new Promise<string | null>((resolve, reject) => {
-        this.pendingQuestion = { resolve, reject };
-
-        // 🔧 P3: 发送交互消息
-        const traceId = this.messageHub.getTraceId();
-        const interactionMsg = createInteractionMessage(
-          {
-            type: InteractionType.QUESTION,
-            requestId: `question-${Date.now()}`,
-            prompt: '需要补充以下信息：\n' + questions.join('\n'),
-            required: true
-          },
-          'orchestrator',
-          'orchestrator',
-          traceId
-        );
-        this.messageHub.sendMessage(interactionMsg);
-
-        this.sendData('questionRequest', {
-          questions,
-          plan
-        });
-        logger.info('界面.编排器.提问.等待', undefined, LogCategory.UI);
-      });
-    });
-
-    // 设置需求澄清回调
-    this.orchestratorEngine.setClarificationCallback(async (questions, context, ambiguityScore, originalPrompt) => {
-      return new Promise((resolve, reject) => {
-        this.pendingClarification = { resolve, reject };
-
-        // 🔧 P3: 发送交互消息
-        const traceId = this.messageHub.getTraceId();
-        const interactionMsg = createInteractionMessage(
-          {
-            type: InteractionType.CLARIFICATION,
-            requestId: `clarify-${Date.now()}`,
-            prompt: '需求存在歧义，请澄清：\n' + questions.join('\n'),
-            required: true
-          },
-          'orchestrator',
-          'orchestrator',
-          traceId
-        );
-        this.messageHub.sendMessage(interactionMsg);
-
-        this.sendData('clarificationRequest', {
-          questions,
-          context,
-          ambiguityScore,
-          originalPrompt,
-          sessionId: this.activeSessionId
-        });
-        logger.info('界面.编排器.澄清.等待', { ambiguityScore }, LogCategory.UI);
-      });
-    });
-
-    // 设置 Worker 问题回调
-    this.orchestratorEngine.setWorkerQuestionCallback(async (workerId, question, context, options) => {
-      return new Promise((resolve, reject) => {
-        this.pendingWorkerQuestion = { resolve, reject };
-
-        // 🔧 P3: 发送交互消息
-        const traceId = this.messageHub.getTraceId();
-        const optionItems = options?.map(o => ({ value: o, label: o })) || [];
-        const interactionMsg = createInteractionMessage(
-          {
-            type: InteractionType.QUESTION,
-            requestId: `worker-q-${Date.now()}`,
-            prompt: `**${workerId}** 需要确认：\n${question}`,
-            options: optionItems.length > 0 ? optionItems : undefined,
-            required: true
-          },
-          'orchestrator',
-          'orchestrator',
-          traceId
-        );
-        this.messageHub.sendMessage(interactionMsg);
-
-        this.sendData('workerQuestionRequest', {
-          workerId,
-          question,
-          context,
-          options,
-          sessionId: this.activeSessionId
-        });
-        logger.info('界面.子代理.提问.等待', { workerId }, LogCategory.UI);
-      });
-    });
-  }
-
-  /** 处理用户对执行计划的确认响应 */
-  private handlePlanConfirmation(confirmed: boolean): void {
-    if (this.pendingConfirmation) {
-      logger.info('界面.编排器.确认.结果', { confirmed }, LogCategory.UI);
-      this.pendingConfirmation.resolve(confirmed);
-      this.pendingConfirmation = null;
-
-      // 通知 Webview 确认已处理
-      this.sendToast(
-        confirmed ? '执行计划已确认，开始执行...' : '执行计划已取消',
-        confirmed ? 'success' : 'info'
-      );
-    }
-  }
-
-  /** 处理用户补充问题的回答 */
-  private handleQuestionAnswer(answer: string | null): void {
-    if (this.pendingQuestion) {
-      const normalized = answer && answer.trim().length > 0 ? answer.trim() : null;
-      this.pendingQuestion.resolve(normalized);
-      this.pendingQuestion = null;
-      this.sendToast(
-        normalized ? '已提交问题回答，继续分析...' : '已取消问题补充',
-        normalized ? 'success' : 'info'
-      );
-    }
-  }
-
-  /** 处理用户澄清回答 */
-  private handleClarificationAnswer(answers: Record<string, string> | null, additionalInfo?: string, autoSkipped = false): void {
-    if (this.pendingClarification) {
-      if (answers && Object.keys(answers).length > 0) {
-        this.pendingClarification.resolve({ answers, additionalInfo });
-        this.sendToast('已提交澄清信息，继续分析...', 'success');
-      } else {
-        this.pendingClarification.resolve(null);
-        // auto 模式下静默跳过，不显示 toast
-        if (!autoSkipped) {
-          this.sendToast('已跳过澄清，使用原始需求...', 'info');
-        }
-      }
-      this.pendingClarification = null;
-    }
-  }
-
-  /** 处理 Worker 问题回答 */
-  private handleWorkerQuestionAnswer(answer: string | null): void {
-    if (this.pendingWorkerQuestion) {
-      this.pendingWorkerQuestion.resolve(answer);
-      this.pendingWorkerQuestion = null;
-      this.sendToast(
-        answer ? '已回答 Worker 问题，继续执行...' : '已跳过 Worker 问题...',
-        answer ? 'success' : 'info'
-      );
-    }
-  }
-
-  private clearActiveToolAuthorizationTimer(): void {
-    if (this.activeToolAuthorizationTimer) {
-      clearTimeout(this.activeToolAuthorizationTimer);
-      this.activeToolAuthorizationTimer = null;
-    }
-  }
-
-  private pumpToolAuthorizationQueue(): void {
-    if (this.activeToolAuthorizationRequestId) {
-      return;
-    }
-    const next = this.toolAuthorizationQueue.shift();
-    if (!next) {
-      return;
-    }
-
-    this.activeToolAuthorizationRequestId = next.requestId;
-
-    // 发送留痕消息：与 confirmationRequest/questionRequest 一致
-    const interactionMsg = createInteractionMessage(
-      {
-        type: InteractionType.PERMISSION,
-        requestId: next.requestId,
-        prompt: `工具授权请求: ${next.toolName}`,
-        required: true,
-      },
-      'orchestrator',
-      'orchestrator',
-      next.requestId,
-    );
-    this.messageHub.sendMessage(interactionMsg);
-
-    this.sendData('toolAuthorizationRequest', {
-      requestId: next.requestId,
-      toolName: next.toolName,
-      toolArgs: next.toolArgs,
-    });
-
-    this.clearActiveToolAuthorizationTimer();
-    this.activeToolAuthorizationTimer = setTimeout(() => {
-      const requestId = this.activeToolAuthorizationRequestId;
-      if (!requestId) {
-        return;
-      }
-      const callback = this.toolAuthorizationCallbacks.get(requestId);
-      if (callback) {
-        logger.warn('界面.工具授权.响应超时', { requestId }, LogCategory.UI);
-        this.toolAuthorizationCallbacks.delete(requestId);
-        callback(false);
-      }
-      this.activeToolAuthorizationRequestId = null;
-      this.activeToolAuthorizationTimer = null;
-      this.pumpToolAuthorizationQueue();
-    }, this.toolAuthorizationTimeoutMs);
-  }
-
-  /** 处理工具授权响应 */
-  private handleToolAuthorizationResponse(requestId: string | undefined, allowed: boolean): void {
-    if (!requestId) {
-      logger.warn('界面.工具授权.响应缺少请求ID', undefined, LogCategory.UI);
-      this.sendToast('工具授权响应缺少请求标识，已忽略', 'warning');
-      return;
-    }
-
-    const callback = this.toolAuthorizationCallbacks.get(requestId);
-    if (!callback) {
-      logger.warn('界面.工具授权.回调不存在', { requestId }, LogCategory.UI);
-      return;
-    }
-
-    this.toolAuthorizationCallbacks.delete(requestId);
-    if (this.activeToolAuthorizationRequestId === requestId) {
-      this.activeToolAuthorizationRequestId = null;
-      this.clearActiveToolAuthorizationTimer();
-    }
-
-    callback(allowed);
-    this.pumpToolAuthorizationQueue();
-  }
-
   /** 处理交互响应 */
   private async handleInteractionResponse(requestId: string, response: any): Promise<void> {
     if (!requestId) return;
@@ -1378,17 +769,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           if (orchestrator) {
             await orchestrator.approveTodo(todoId);
             this.sendToast('任务已批准', 'success');
-
-            // 尝试恢复当前 Mission
-            const currentMission = this.orchestratorEngine.context.mission;
-            if (currentMission && (currentMission.status === 'paused' || currentMission.status === 'pending_approval')) {
-              this.sendOrchestratorMessage({
-                content: '审批通过，继续执行任务...',
-                messageType: 'text',
-              });
-              // 异步恢复，避免阻塞
-              void orchestrator.resumeMission(currentMission.id);
-            }
           }
         } catch (error) {
           logger.error('界面.交互.审批_失败', error, LogCategory.UI);
@@ -1411,162 +791,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** 绑定全局事件 */
-  private bindEvents(): void {
-    // 任务相关事件
-    globalEventBus.on('task:created', () => this.sendStateUpdate());
-    globalEventBus.on('task:state_changed', () => this.sendStateUpdate());
-    globalEventBus.on('task:started', (event) => {
-      this.sendStateUpdate();
-    });
-    globalEventBus.on('task:completed', (event) => {
-      this.sendStateUpdate();
-    });
-    globalEventBus.on('task:failed', (event) => {
-      this.sendStateUpdate();
-      const data = event.data as { error?: string | object; stack?: string };
-      let errorMsg = '任务执行失败';
-      if (data?.error) {
-        if (typeof data.error === 'string') {
-          errorMsg = data.error;
-        } else if (typeof data.error === 'object') {
-          const errObj = data.error as { message?: string; error?: string };
-          errorMsg = errObj.message || errObj.error || JSON.stringify(data.error);
-        }
-      }
-
-      // 中断导致的 abort 错误不向前端发送错误消息
-      if (isAbortError(errorMsg)) {
-        return;
-      }
-
-      this.sendOrchestratorMessage({
-        content: errorMsg,
-        messageType: 'error',
-        taskId: event.taskId,
-        metadata: {
-          error: errorMsg,
-          stack: data?.stack,
-        },
-      });
-
-    });
-    // task:cancelled 事件：同时更新状态和中断任务
-    globalEventBus.on('task:cancelled', () => {
-      this.sendStateUpdate();
-      this.interruptCurrentTask();
-    });
-    globalEventBus.on('execution:stats_updated', () => {
-      this.sendExecutionStats();
-    });
-
-    // orchestrator:ui_message 已废弃：所有 UI 消息统一走 MessageHub
-
-    globalEventBus.on('orchestrator:phase_changed', (event) => {
-      const data = event.data as { phase: string; isRunning?: boolean; timestamp?: number };
-      if (data?.phase) {
-        // 🔧 统一消息通道：phaseChanged 走 MessageHub
-        // UI 不再展示阶段步骤，仅用于同步运行态与日志
-        this.messageHub.phaseChange(
-          data.phase,
-          data.isRunning ?? this.orchestratorEngine.running,
-          event.taskId || ''
-        );
-        // 移除 sendStateUpdate() 调用，避免频繁 DOM 重建导致页面跳动
-      }
-    });
-
-    globalEventBus.on('orchestrator:dependency_analysis', (event) => {
-      const data = event.data as { message?: string };
-
-      // 记录简要信息到日志
-      if (data?.message) {
-        this.appendLog({
-          level: 'info',
-          message: data.message,
-          source: 'orchestrator',
-          timestamp: Date.now(),
-        });
-      }
-
-      // 依赖分析目前不向前端分发，避免产生未消费的数据事件
-    });
-
-    globalEventBus.on('snapshot:created', () => this.sendStateUpdate());
-    globalEventBus.on('snapshot:reverted', () => this.sendStateUpdate());
-
-    // Worker 状态相关事件
-    globalEventBus.on('worker:statusChanged', (event) => {
-      const data = event.data as { worker: string; available: boolean; model?: string };
-      this.sendStateUpdate();
-      // 通知 UI Worker 状态变化
-      this.messageHub.workerStatus(data.worker, data.available, data.model);
-    });
-
-    globalEventBus.on('worker:healthCheck', () => {
-      this.sendStateUpdate();
-    });
-
-    globalEventBus.on('worker:error', (event) => {
-      const data = event.data as { worker: string; error: string };
-      this.sendOrchestratorMessage({
-        content: `${data.worker || 'Worker'}: ${data.error || '发生错误'}`,
-        messageType: 'error',
-        metadata: { worker: data.worker },
-      });
-    });
-
-    globalEventBus.on('worker:session_event', (event) => {
-      const data = event.data as {
-        type?: string;
-        worker?: WorkerSlot;
-        role?: string;
-        requestId?: string;
-        reason?: string;
-        error?: string;
-      };
-      const pieces = [
-        data?.type || 'session',
-        data?.worker ? `worker=${data.worker}` : '',
-        data?.role ? `role=${data.role}` : '',
-        data?.requestId ? `req=${data.requestId}` : '',
-        data?.reason ? `reason=${data.reason}` : '',
-        data?.error ? `error=${data.error}` : '',
-      ].filter(Boolean);
-      const level = data?.type?.includes('failed') ? 'error' : 'info';
-      this.appendLog({
-        level,
-        message: pieces.join(' '),
-        source: data?.worker ?? 'system',
-        timestamp: Date.now(),
-      });
-      // session_event 仅写入日志，不推送到 Worker 面板，避免干扰用户对话
-    });
-
-    // 工具授权请求事件
-    globalEventBus.on('tool:authorization_request', (event) => {
-      const data = event.data as {
-        toolName: string;
-        toolArgs: any;
-        callback: (allowed: boolean) => void;
-      };
-      const requestId = `tool-auth-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-      // 存储回调并入队，按序发送授权请求（避免并发覆盖）
-      this.toolAuthorizationCallbacks.set(requestId, data.callback);
-      this.toolAuthorizationQueue.push({
-        requestId,
-        toolName: data.toolName,
-        toolArgs: data.toolArgs,
-      });
-      this.pumpToolAuthorizationQueue();
-    });
-
-    // ============= Mission-Driven 架构事件 =============
-    // 这些事件来自 MissionOrchestrator（MissionExecutor 已合并）
-    this.bindMissionEvents();
-  }
-
   private shouldProcessRequest(requestId?: string | null): boolean {
     if (!requestId) return true;
     const now = Date.now();
@@ -1586,205 +810,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * 绑定 Mission-Driven 架构事件
-   * 将 MissionOrchestrator 的事件转发到 Webview（MissionExecutor 已合并）
-   */
-  private bindMissionEvents(): void {
-    // 如果 MissionOrchestrator 未初始化，跳过
-    if (!this.missionOrchestrator) return;
-
-    // Mission 生命周期事件
-    this.missionOrchestrator.on('missionCreated', () => {
-      this.sendStateUpdate();
-    });
-
-    this.missionOrchestrator.on('missionPlanned', (data: { mission: Mission; contracts: any[]; assignments: Assignment[] }) => {
-      const assignments = normalizeAssignments(data.assignments);
-      this.sendData('missionPlanned', {
-        missionId: data.mission.id,
-        contracts: data.contracts,
-        assignments,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-    this.missionOrchestrator.on('missionCompleted', (data: { mission: Mission }) => {
-      this.sendStateUpdate();
-      void this.tryResumePendingRecovery();
-    });
-
-    this.missionOrchestrator.on('missionFailed', (data: { mission: Mission; error: string }) => {
-      this.sendData('missionFailed', {
-        missionId: data.mission.id,
-        error: data.error,
-        sessionId: this.activeSessionId,
-      });
-      this.sendOrchestratorMessage({
-        content: data.error || '任务失败',
-        messageType: 'error',
-        metadata: { missionId: data.mission.id },
-      });
-      this.sendStateUpdate();
-      void this.tryResumePendingRecovery();
-    });
-
-    this.missionOrchestrator.on('missionCancelled', () => {
-      this.sendStateUpdate();
-      void this.tryResumePendingRecovery();
-    });
-
-    this.missionOrchestrator.on('executionCompleted', (data: any) => {
-      this.sendStateUpdate();
-    });
-
-    this.missionOrchestrator.on('executionFailed', (data: { missionId: string; error: string }) => {
-      this.sendData('missionExecutionFailed', {
-        missionId: data.missionId,
-        error: data.error,
-        sessionId: this.activeSessionId,
-      });
-      this.sendOrchestratorMessage({
-        content: data.error || '任务执行失败',
-        messageType: 'error',
-        metadata: { missionId: data.missionId },
-      });
-      this.sendStateUpdate();
-    });
-
-    // Assignment 事件
-    this.missionOrchestrator.on('assignmentStarted', (data: { missionId: string; assignmentId: string; workerId: WorkerSlot }) => {
-      this.sendData('assignmentStarted', {
-        missionId: data.missionId,
-        assignmentId: data.assignmentId,
-        workerId: data.workerId,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-    this.missionOrchestrator.on('assignmentPlanned', (data: { missionId: string; assignmentId: string; todos: UnifiedTodo[]; warnings?: string[] }) => {
-      const assignmentId = data.assignmentId || generateEntityId('assignment');
-      const todos = normalizeTodos(data.todos, assignmentId);
-      this.sendData('assignmentPlanned', {
-        missionId: data.missionId,
-        assignmentId,
-        todos,
-        warnings: data.warnings,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-    this.missionOrchestrator.on('assignmentCompleted', (data: { missionId: string; assignmentId: string; success: boolean }) => {
-      this.sendData('assignmentCompleted', {
-        missionId: data.missionId,
-        assignmentId: data.assignmentId,
-        success: data.success,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-    // Worker Session 事件
-    this.missionOrchestrator.on('workerSessionCreated', (data: { sessionId: string; assignmentId: string; workerId: WorkerSlot }) => {
-      this.sendData('workerSessionCreated', {
-        sessionId: data.sessionId,
-        assignmentId: data.assignmentId,
-        workerId: data.workerId,
-      });
-    });
-
-    this.missionOrchestrator.on('workerSessionResumed', (data: { sessionId: string; assignmentId: string; workerId: WorkerSlot; completedTodos: number }) => {
-      this.sendData('workerSessionResumed', {
-        sessionId: data.sessionId,
-        assignmentId: data.assignmentId,
-        workerId: data.workerId,
-        completedTodos: data.completedTodos,
-      });
-      this.messageHub.systemNotice(`Session 已恢复，继续执行 ${data.completedTodos} 个已完成的 Todo`, {
-        sessionId: data.sessionId,
-        worker: data.workerId,
-      });
-    });
-
-    // Todo 事件
-    this.missionOrchestrator.on('todoStarted', (data: { missionId: string; assignmentId: string; todoId: string }) => {
-      this.sendData('todoStarted', {
-        missionId: data.missionId,
-        assignmentId: data.assignmentId,
-        todoId: data.todoId,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-    this.missionOrchestrator.on('todoCompleted', (data: { missionId: string; assignmentId: string; todoId: string; output: any }) => {
-      this.sendData('todoCompleted', {
-        missionId: data.missionId,
-        assignmentId: data.assignmentId,
-        todoId: data.todoId,
-        output: data.output,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-    this.missionOrchestrator.on('todoFailed', (data: { missionId: string; assignmentId: string; todoId: string; error: string }) => {
-      this.sendData('todoFailed', {
-        missionId: data.missionId,
-        assignmentId: data.assignmentId,
-        todoId: data.todoId,
-        error: data.error,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-    // 动态 Todo 事件
-    this.missionOrchestrator.on('dynamicTodoAdded', (data: { missionId: string; assignmentId: string; todo: UnifiedTodo }) => {
-      const assignmentId = data.assignmentId || generateEntityId('assignment');
-      const normalizedTodo = normalizeTodos([data.todo], assignmentId)[0];
-      if (!normalizedTodo) {
-        logger.warn('动态 Todo 无效，已跳过发送', { assignmentId, missionId: data.missionId }, LogCategory.ORCHESTRATOR);
-        return;
-      }
-      this.sendData('dynamicTodoAdded', {
-        missionId: data.missionId,
-        assignmentId,
-        todo: normalizedTodo,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-    // 审批请求事件
-    this.missionOrchestrator.on('approvalRequested', (data: { missionId: string; assignmentId: string; todoId: string; reason: string }) => {
-      // 🔧 P3: 发送交互消息
-      const traceId = this.messageHub.getTraceId();
-      const interactionMsg = createInteractionMessage(
-        {
-          type: InteractionType.PERMISSION,
-          requestId: `approval-${data.todoId}`,
-          prompt: `**动态任务审批**\n\n原因: ${data.reason}\n\n请决定是否批准。`,
-          required: true
-        },
-        'orchestrator',
-        'orchestrator',
-        traceId
-      );
-      this.messageHub.sendMessage(interactionMsg);
-
-      this.sendData('todoApprovalRequested', {
-        missionId: data.missionId,
-        assignmentId: data.assignmentId,
-        todoId: data.todoId,
-        reason: data.reason,
-        sessionId: this.activeSessionId,
-      });
-    });
-
-  }
-
-  /**
    * 设置 MissionOrchestrator
    * 用于 Mission-Driven 架构
    */
   setMissionOrchestrator(orchestrator: MissionOrchestrator): void {
     this.missionOrchestrator = orchestrator;
-    this.bindMissionEvents();
+    this.eventBindingService.bindMissionEvents();
   }
 
   /**
@@ -1839,7 +870,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
                 id: subTask.assignmentId || subTask.id, // 优先使用 assignmentId 以匹配 Mission 体系
                 title: subTask.title || subTask.description || '子任务',
                 status: 'stopped',
-                worker: subTask.assignedWorker as any, // 类型兼容性转换
+                worker: subTask.assignedWorker,
                 summary: '用户终止',
               });
             }
@@ -1967,7 +998,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 🔧 启动时进行真正的 LLM 连接测试（替代浅层检查）
     // 使用 sendWorkerStatus(true) 强制检测所有模型连接状态
     // 这会发送 workerStatusUpdate 消息，前端能正确处理并更新 BottomTabs 状态
-    void this.sendWorkerStatus(true).catch((error) => {
+    void this.workerStatusService.sendWorkerStatus(true).catch((error) => {
       logger.warn('界面.启动.模型状态检测_失败', { error: String(error) }, LogCategory.UI);
     });
 
@@ -2020,21 +1051,20 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'uiError': {
-        const uiError = message as any;
         logger.error('界面.UI_错误', {
-          component: uiError.component,
-          detail: uiError.detail,
-          stack: uiError.stack,
+          component: message.component,
+          detail: message.detail,
+          stack: message.stack,
         }, LogCategory.UI);
         break;
       }
 
       case 'executeTask':
-        logger.info('界面.任务.执行.请求', { promptLength: String((message as any).prompt || '').length, imageCount: (message as any).images?.length || 0, agent: (message as any).agent || 'orchestrator' }, LogCategory.UI);
-        const execImages = (message as any).images || [];
-        const execAgent = (message as any).agent as WorkerSlot | undefined;
-        const execRequestId = (message as any).requestId as string | undefined;
-        const requestedModeRaw = (message as any).mode;
+        logger.info('界面.任务.执行.请求', { promptLength: String(message.prompt || '').length, imageCount: message.images?.length || 0, agent: message.agent || 'orchestrator' }, LogCategory.UI);
+        const execImages = message.images || [];
+        const execAgent = message.agent as WorkerSlot | undefined;
+        const execRequestId = message.requestId;
+        const requestedModeRaw = message.mode;
         const requestedMode = requestedModeRaw === 'ask' || requestedModeRaw === 'auto' ? requestedModeRaw : undefined;
         if (typeof requestedModeRaw === 'string' && !requestedMode) {
           logger.warn('界面.任务.执行.模式_非法', { requestedModeRaw, requestId: execRequestId }, LogCategory.UI);
@@ -2059,7 +1089,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           if (requestedMode) {
             this.handleSetInteractionMode(requestedMode);
           }
-          await this.executeTask((message as any).prompt, execAgent || undefined, execImages, execRequestId);
+          await this.executeTask(message.prompt, execAgent || undefined, execImages, execRequestId);
         } catch (error: any) {
           const errorMsg = error instanceof Error ? error.message : String(error);
           if (execRequestId) {
@@ -2072,33 +1102,33 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'interruptTask':
 
         logger.info('界面.任务.中断.消息', { taskId: message.taskId }, LogCategory.UI);
-        await this.interruptCurrentTask({ silent: Boolean((message as any).silent) });
+        await this.interruptCurrentTask({ silent: Boolean(message.silent) });
         break;
 
       case 'startTask':
-        await this.handleStartTask((message as any).taskId);
+        await this.handleStartTask(message.taskId);
         break;
 
       case 'deleteTask':
-        await this.handleDeleteTask((message as any).taskId);
+        await this.handleDeleteTask(message.taskId);
         break;
 
       case 'pauseTask':
 
-        logger.info('界面.任务.暂停.消息', { taskId: (message as any).taskId }, LogCategory.UI);
+        logger.info('界面.任务.暂停.消息', { taskId: message.taskId }, LogCategory.UI);
         this.sendToast('暂停功能开发中', 'info');
         break;
 
       case 'resumeTask':
 
-        logger.info('界面.任务.恢复.消息', { taskId: (message as any).taskId }, LogCategory.UI);
+        logger.info('界面.任务.恢复.消息', { taskId: message.taskId }, LogCategory.UI);
         await this.resumeInterruptedTask();
         break;
 
       case 'appendMessage':
 
         logger.info('界面.消息.补充.请求', undefined, LogCategory.UI);
-        await this.handleAppendMessage((message as any).taskId, (message as any).content);
+        await this.handleAppendMessage(message.taskId, message.content);
         break;
 
       case 'approveChange':
@@ -2177,7 +1207,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           // 恢复 Worker sessionIds
           this.sendData('sessionSwitched', {
             sessionId: message.sessionId,
-            session: switchedSession as any,
+            session: switchedSession,
           });
         }
         this.sendStateUpdate();
@@ -2186,7 +1216,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'renameSession':
         // 重命名会话
         if (this.sessionManager.renameSession(message.sessionId, message.name)) {
-          this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() as any[] });
+          this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() });
           this.sendToast('会话已重命名', 'success');
         }
         break;
@@ -2219,41 +1249,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       case 'selectWorker':
         // 用户手动选择 Worker（null 表示自动选择）
-        this.selectedWorker = (message as any).worker || null;
+        this.selectedWorker = message.worker || null;
         logger.info('界面.Worker.选择.变更', { worker: this.selectedWorker || 'auto' }, LogCategory.UI);
-        break;
-
-      case 'confirmPlan':
-        // 用户确认执行计划（Hard Stop 响应）
-        this.handlePlanConfirmation((message as any).confirmed);
-        break;
-
-      case 'answerQuestions':
-        this.handleQuestionAnswer((message as any).answer ?? null);
-        break;
-
-      case 'answerClarification':
-        // 用户回答澄清问题
-        this.handleClarificationAnswer(
-          (message as any).answers ?? null,
-          (message as any).additionalInfo,
-          (message as any).autoSkipped ?? false
-        );
-        break;
-
-      case 'answerWorkerQuestion':
-        // 用户回答 Worker 问题
-        this.handleWorkerQuestionAnswer((message as any).answer ?? null);
         break;
 
       case 'toolAuthorizationResponse':
         // 用户响应工具授权请求
-        this.handleToolAuthorizationResponse((message as any).requestId as string | undefined, (message as any).allowed ?? false);
+        this.eventBindingService.handleToolAuthorizationResponse(message.requestId, message.allowed);
         break;
 
       case 'interactionResponse':
         // 🔧 P3: 处理交互响应 (如动态审批)
-        await this.handleInteractionResponse((message as any).requestId, (message as any).response);
+        await this.handleInteractionResponse(message.requestId, message.response);
         break;
 
       case 'updateSetting':
@@ -2263,12 +1270,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       case 'setInteractionMode':
         // 设置交互模式
-        this.handleSetInteractionMode((message as any).mode);
+        this.handleSetInteractionMode(message.mode);
         break;
 
       case 'confirmRecovery':
         // 用户确认恢复策略
-        await this.handleRecoveryConfirmation((message as any).decision);
+        await this.handleRecoveryConfirmation(message.decision);
         break;
 
       case 'requestExecutionStats':
@@ -2280,7 +1287,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'checkWorkerStatus':
-        this.sendWorkerStatus(Boolean((message as any).force));
+        this.workerStatusService.sendWorkerStatus(Boolean(message.force));
         break;
 
 
@@ -2291,7 +1298,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       case 'openMermaidPanel':
         // 在新标签页打开 Mermaid 图表
-        this.handleOpenMermaidPanel((message as any).code, (message as any).title);
+        this.handleOpenMermaidPanel(message.code, message.title);
         break;
     }
   }
@@ -2406,231 +1413,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.error('Mermaid.新标签页.失败', { error: error.message }, LogCategory.UI);
       this.sendToast(`打开图表失败: ${error.message}`, 'error');
     }
-  }
-
-  /** 发送适配器连接状态到前端 */
-  private async sendWorkerStatus(force: boolean = false): Promise<void> {
-    try {
-      const now = Date.now();
-      if (!force && this.workerStatusCache && (now - this.workerStatusCacheAt) < this.workerStatusCacheTtlMs) {
-        this.sendData('workerStatusUpdate', { statuses: this.workerStatusCache });
-        return;
-      }
-
-      if (this.workerStatusInFlight) {
-        if (!force) {
-          return;
-        }
-        await this.workerStatusInFlight;
-      }
-
-      const runCheck = this.performWorkerStatusCheck(force);
-      this.workerStatusInFlight = runCheck;
-      await runCheck;
-    } catch (error: any) {
-      logger.error('界面.模型状态.检查_失败', { error: error.message }, LogCategory.UI);
-    } finally {
-      this.workerStatusInFlight = null;
-    }
-  }
-
-  private async performWorkerStatusCheck(force: boolean): Promise<void> {
-    const { LLMConfigLoader } = await import('../llm/config');
-    const { getOrCreateLLMClient } = await import('../llm/clients/client-factory');
-
-    const config = LLMConfigLoader.loadFullConfig();
-    const statuses: Record<string, { status: string; model?: string; error?: string }> = {};
-    const now = Date.now();
-    const priorityModels: Array<'orchestrator' | 'compressor'> = ['orchestrator', 'compressor'];
-    const workerModels: WorkerSlot[] = ['claude', 'codex', 'gemini'];
-    const modelIds = [...priorityModels, ...workerModels];
-    const formatModelLabel = (modelConfig: any): string | undefined => {
-      if (!modelConfig?.provider || !modelConfig?.model) return undefined;
-      return `${modelConfig.provider} - ${modelConfig.model}`;
-    };
-    const orchestratorLabel = formatModelLabel(config.orchestrator);
-    const compressorFallbackLabel = orchestratorLabel ? `编排模型: ${orchestratorLabel}` : '编排模型';
-    const setCompressorFallback = (reason: string) => {
-      statuses.compressor = { status: 'fallback', model: compressorFallbackLabel, error: reason };
-    };
-
-    const getCachedStatus = (name: string) => {
-      if (!this.workerStatusCache) return null;
-      if ((now - this.workerStatusCacheAt) > this.workerStatusSoftTtlMs) return null;
-      return this.workerStatusCache[name] || null;
-    };
-
-    const applyQuickStatus = (name: string, modelLabel?: string) => {
-      const cached = getCachedStatus(name);
-      if (cached) {
-        statuses[name] = {
-          status: cached.status,
-          model: cached.model || modelLabel,
-          error: cached.error
-        };
-        return true;
-      }
-      return false;
-    };
-
-    // 测试模型的通用函数（使用快速 Models API）
-    const testModel = async (name: string, modelConfig: any, isRequired: boolean = false) => {
-      const isCompressor = name === 'compressor';
-      if (!modelConfig.enabled || !modelConfig.apiKey || !modelConfig.model) {
-        if (isCompressor) {
-          setCompressorFallback(!modelConfig.enabled ? '压缩模型未启用' : '压缩模型未配置');
-          return;
-        }
-        if (!modelConfig.enabled) {
-          statuses[name] = {
-            status: 'disabled',
-            model: '已禁用'
-          };
-          return;
-        }
-        statuses[name] = {
-          status: 'not_configured',
-          model: isRequired ? '未配置（必需）' : '未配置'
-        };
-        return;
-      }
-
-      const modelLabel = formatModelLabel(modelConfig) || '未配置';
-      if (!force) {
-        const isConnected = name !== 'compressor'
-          && this.adapterFactory.isConnected(name as AgentType);
-        if (isConnected) {
-          statuses[name] = { status: 'available', model: modelLabel };
-          return;
-        }
-        if (applyQuickStatus(name, modelLabel)) {
-          return;
-        }
-      }
-
-      try {
-        statuses[name] = {
-          status: 'checking',
-          model: modelLabel
-        };
-
-        // 使用快速连接测试（Models API）
-        const client = getOrCreateLLMClient(modelConfig);
-        const result = await client.testConnectionFast();
-
-        if (result.success) {
-          // 检查模型是否存在（如果 API 支持）
-          if (result.modelExists === false) {
-            if (isCompressor) {
-              setCompressorFallback(`模型不存在: ${modelConfig.model}`);
-              return;
-            }
-            statuses[name] = { status: 'invalid_model', model: modelLabel, error: `模型不存在: ${modelConfig.model}` };
-          } else {
-            statuses[name] = {
-              status: 'available',
-              model: modelLabel
-            };
-          }
-        } else {
-          if (isCompressor) {
-            setCompressorFallback(result.error || '压缩模型连接失败');
-            return;
-          }
-          // 根据错误类型设置状态
-          let status = 'error';
-          if (result.error?.includes('API Key')) {
-            status = 'auth_failed';
-          } else if (result.error?.includes('网络') || result.error?.includes('连接')) {
-            status = 'network_error';
-          } else if (result.error?.includes('超时')) {
-            status = 'timeout';
-          }
-
-          statuses[name] = {
-            status,
-            model: modelLabel,
-            error: result.error
-          };
-        }
-
-        logger.info(`Model connection test (fast): ${name}`, {
-          provider: modelConfig.provider,
-          model: modelConfig.model,
-          success: result.success,
-          modelExists: result.modelExists,
-        }, LogCategory.LLM);
-      } catch (error: any) {
-        if (isCompressor) {
-          setCompressorFallback(error.message || '压缩模型连接失败');
-          return;
-        }
-        statuses[name] = { status: 'error', model: modelLabel, error: error.message };
-
-        logger.warn(`Model connection test failed: ${name}`, {
-          error: error.message
-        }, LogCategory.LLM);
-      }
-    };
-
-    // 初始化占位状态，确保 UI 先显示检测中/缓存结果
-    modelIds.forEach(name => {
-      const modelConfig = name === 'orchestrator'
-        ? config.orchestrator
-        : name === 'compressor'
-          ? config.compressor
-          : config.workers[name as WorkerSlot];
-
-      if (name === 'compressor' && (!modelConfig?.enabled || !modelConfig?.apiKey || !modelConfig?.model)) {
-        setCompressorFallback(!modelConfig?.enabled ? '压缩模型未启用' : '压缩模型未配置');
-        return;
-      }
-
-      if (!modelConfig?.enabled) {
-        statuses[name] = { status: 'disabled', model: '已禁用' };
-        return;
-      }
-      if (!modelConfig?.apiKey || !modelConfig?.model) {
-        statuses[name] = {
-          status: 'not_configured',
-          model: name === 'orchestrator' || name === 'compressor' ? '未配置（必需）' : '未配置'
-        };
-        return;
-      }
-
-      const modelLabel = formatModelLabel(modelConfig) || '未配置';
-      if (!force) {
-        const isConnected = name !== 'compressor'
-          && this.adapterFactory.isConnected(name as AgentType);
-        if (isConnected) {
-          statuses[name] = { status: 'available', model: modelLabel };
-          return;
-        }
-        if (applyQuickStatus(name, modelLabel)) {
-          return;
-        }
-      }
-      statuses[name] = { status: 'checking', model: modelLabel };
-    });
-
-    this.sendData('workerStatusUpdate', { statuses });
-
-    // 所有模型并行检测（不再串行）
-    await Promise.all([
-      testModel('orchestrator', config.orchestrator, true),
-      testModel('compressor', config.compressor, true),
-      ...workerModels.map(worker => testModel(worker, config.workers[worker]))
-    ]);
-
-    this.workerStatusCache = statuses;
-    this.workerStatusCacheAt = Date.now();
-
-    this.sendData('workerStatusUpdate', { statuses });
-
-    logger.info('Model connection status check completed', {
-      results: Object.entries(statuses).map(([name, s]) => `${name}: ${s.status}`),
-      mode: force ? 'hard' : 'soft'
-    }, LogCategory.LLM);
   }
 
   /** 发送执行统计数据到前端 */
@@ -2890,16 +1672,19 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const title = `${fileName} (原始 ↔ 修改后)`;
       await vscode.commands.executeCommand('vscode.diff', originalUri, modifiedUri, title);
 
-      // 清理临时文件（延迟删除，确保 diff 视图已加载）
-      setTimeout(() => {
-        try {
-          if (fs.existsSync(tempFile)) {
-            fs.unlinkSync(tempFile);
+      // 监听 diff 标签页关闭后再清理临时文件
+      const disposable = vscode.workspace.onDidCloseTextDocument(doc => {
+        if (doc.uri.fsPath === tempFile) {
+          disposable.dispose();
+          try {
+            if (fs.existsSync(tempFile)) {
+              fs.unlinkSync(tempFile);
+            }
+          } catch (e) {
+            // 忽略清理错误
           }
-        } catch (e) {
-          // 忽略清理错误
         }
-      }, 5000);
+      });
 
     } catch (error) {
       logger.error('界面.差异.打开_失败', error, LogCategory.UI);
@@ -3353,57 +2138,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private formatDuration(durationMs?: number): string {
-    if (!durationMs || durationMs < 0) return '未知';
-    const totalSeconds = Math.max(1, Math.round(durationMs / 1000));
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
-    if (minutes <= 0) return `${seconds}s`;
-    return `${minutes}m ${seconds}s`;
-  }
-
-  private buildSubTaskChangeList(subTaskId: string, modifiedFiles?: string[]): string[] {
-    if (subTaskId) {
-      const changes = this.snapshotManager.getPendingChanges().filter(c => c.todoId === subTaskId);
-      if (changes.length > 0) {
-        return changes.map(change => `${change.filePath} (+${change.additions}, -${change.deletions})`);
-      }
-    }
-    if (modifiedFiles && modifiedFiles.length > 0) {
-      return modifiedFiles;
-    }
-    return [];
-  }
-
-  private buildVerificationReminderList(): string[] {
-    return [
-      '运行相关测试/构建，确认无报错',
-      '关键流程手动验证（尤其是 UI/交互路径）',
-      '确认变更文件已进入快照列表',
-    ];
-  }
-
-  private buildSubTaskSummaryCard(data: { description?: string; agent?: string; duration?: number; modifiedFiles?: string[]; subTaskId?: string; error?: string }, status: 'completed' | 'failed') {
-    const title = status === 'completed' ? '子任务完成' : '子任务失败';
-    const description = data.description || data.subTaskId || '未知子任务';
-    // 优化 executor fallback：使用中文，并提供更友好的默认值
-    // 当 agent 为空时，显示 "编排者" 而不是 "未知"，因为这通常是编排者协调的任务
-    const executor = data.agent || '编排者';
-    const duration = this.formatDuration(data.duration);
-    const changes = this.buildSubTaskChangeList(data.subTaskId || '', data.modifiedFiles);
-    const verification = this.buildVerificationReminderList();
-    return {
-      title,
-      status,
-      description,
-      executor,
-      duration,
-      changes,
-      verification,
-      error: status === 'failed' ? (data.error || '未知错误') : undefined,
-    };
-  }
-
   /** 编排模式执行 */
   private async executeWithOrchestrator(prompt: string, imagePaths: string[]): Promise<OrchestratorExecutionResult> {
     logger.info('界面.执行.模式.编排', undefined, LogCategory.UI);
@@ -3420,10 +2154,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const taskContext = await this.orchestratorEngine.executeWithTaskContext(prompt, this.activeSessionId || undefined, imagePaths);
       const result = taskContext.result;
 
-      // 获取执行计划，判断是否需要 Worker
-      const plan = this.orchestratorEngine.plan;
-      const needsWorker = plan?.needsWorker !== false && (plan?.subTasks?.length ?? 0) > 0;
-      logger.info('界面.任务.完成', { needsWorker, subTaskCount: plan?.subTasks?.length || 0, hasResult: !!result?.trim(), resultLength: result?.length || 0 }, LogCategory.UI);
+      logger.info('界面.任务.完成', { hasResult: !!result?.trim(), resultLength: result?.length || 0 }, LogCategory.UI);
 
       // 保存消息历史
       this.saveMessageToSession(prompt, result, undefined, 'orchestrator');
@@ -3478,9 +2209,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       if (this.sessionManager.getSessionMetas().length === 0) {
         const newSession = this.sessionManager.createSession();
         this.activeSessionId = newSession.id;
-        this.sendData('sessionCreated', { session: newSession as any });
+        this.sendData('sessionCreated', { session: newSession });
       }
-      this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() as any[] });
+      this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() });
       this.sendToast('会话已删除', 'info');
     }
     this.sendStateUpdate();
@@ -3491,7 +2222,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     if (!session) {
       return;
     }
-    this.sendData('sessionLoaded', { session: session as any });
+    this.sendData('sessionLoaded', { session: session });
   }
 
   /** 创建并切换到新会话（对齐任务/对话会话） */
@@ -3510,8 +2241,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.activeSessionId = newSession.id;
     logger.info('界面.会话.已创建', { sessionId: this.activeSessionId }, LogCategory.UI);
     // 通知 webview 新会话已创建
-    this.sendData('sessionCreated', { session: newSession as any });
-    this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() as any[] });
+    this.sendData('sessionCreated', { session: newSession });
+    this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() });
     this.sendStateUpdate();
   }
 
@@ -3716,7 +2447,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     return {
       currentSessionId: this.activeSessionId ?? currentSession?.id,
-      sessions: sessionMetas as any[],
+      sessions: sessionMetas,
       currentTask,
       tasks,
       workerStatuses,
@@ -3814,9 +2545,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       vscode.Uri.file(path.join(this.extensionUri.fsPath, 'dist', 'webview', 'assets'))
     );
 
-    // 替换资源路径（Vite 构建输出使用 /assets/ 前缀）
-    html = html.replace(/src="\/assets\//g, `src="${webviewAssetsUri}/`);
-    html = html.replace(/href="\/assets\//g, `href="${webviewAssetsUri}/`);
+    // 替换资源路径（Vite 构建使用 ./assets/ 相对路径前缀）
+    html = html.replace(/src="\.\/assets\//g, `src="${webviewAssetsUri}/`);
+    html = html.replace(/href="\.\/assets\//g, `href="${webviewAssetsUri}/`);
 
     // 添加缓存破坏参数
     html = html.replace(/\.js"/g, `.js?v=${cacheBuster}"`);
@@ -3849,6 +2580,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       if (this.orchestratorEngine) {
         logger.info('界面.销毁.编排器.中断', undefined, LogCategory.UI);
         this.orchestratorEngine.interrupt();
+        this.orchestratorEngine.dispose();
       }
 
       // 2. 清理适配器（关闭所有连接）
@@ -3858,28 +2590,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
 
       // 3. 主动拒绝所有待处理工具授权，避免悬挂
-      this.clearActiveToolAuthorizationTimer();
-      this.activeToolAuthorizationRequestId = null;
-      this.toolAuthorizationQueue = [];
-      for (const callback of this.toolAuthorizationCallbacks.values()) {
-        callback(false);
-      }
-      this.toolAuthorizationCallbacks.clear();
+      this.eventBindingService.disposeToolAuthorization();
 
       // 4. 移除事件监听器
       globalEventBus.clear();
       logger.info('界面.销毁.事件.已清理', undefined, LogCategory.UI);
 
-      // 5. 清理待确认的 Promise
-      if (this.pendingConfirmation) {
-        this.pendingConfirmation.reject(new Error('扩展已停用'));
-        this.pendingConfirmation = null;
-      }
-      if (this.pendingQuestion) {
-        this.pendingQuestion.reject(new Error('扩展已停用'));
-        this.pendingQuestion = null;
-      }
-      // 6. 清理 Webview
+      // 5. 清理 Webview
       this._view = undefined;
 
       logger.info('界面.销毁.完成', undefined, LogCategory.UI);

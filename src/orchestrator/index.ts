@@ -30,11 +30,6 @@ export * from './recovery';
 export {
   MissionDrivenEngine,
   type MissionDrivenEngineConfig,
-  type MissionDrivenContext,
-  type MissionConfirmationCallback as ConfirmationCallback,
-  type MissionRecoveryConfirmationCallback as RecoveryConfirmationCallback,
-  type MissionClarificationCallback as ClarificationCallback,
-  type MissionWorkerQuestionCallback as WorkerQuestionCallback,
 } from './core';
 
 // 协议类型

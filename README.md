@@ -161,16 +161,19 @@ Magi 基于现代化的技术栈构建，确保高性能与可扩展性：
 Magi 的诞生离不开早期支持者的帮助。
 
 <p align="left">
-  <a href="https://github.com/Poonwai">
-    <img src="https://images.weserv.nl/?url=https://github.com/Poonwai.png&mask=circle&w=80" alt="Poonwai">
+  <a href="https://github.com/Poonwai" title="Poonwai">
+    <img src="https://images.weserv.nl/?url=https://github.com/Poonwai.png&mask=circle&w=80" alt="Poonwai"><br>
+    <sub><b>Poonwai</b></sub>
   </a>
-  &nbsp;&nbsp;
-  <a href="https://github.com/agassiz">
-    <img src="https://images.weserv.nl/?url=https://github.com/agassiz.png&mask=circle&w=80" alt="agassiz">
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://github.com/agassiz" title="agassiz">
+    <img src="https://images.weserv.nl/?url=https://github.com/agassiz.png&mask=circle&w=80" alt="agassiz"><br>
+    <sub><b>agassiz</b></sub>
   </a>
-  &nbsp;&nbsp;
-  <a href="https://github.com/StoneFancyX">
-    <img src="https://images.weserv.nl/?url=https://github.com/StoneFancyX.png&mask=circle&w=80" alt="StoneFancyX">
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://github.com/StoneFancyX" title="StoneFancyX">
+    <img src="https://images.weserv.nl/?url=https://github.com/StoneFancyX.png&mask=circle&w=80" alt="StoneFancyX"><br>
+    <sub><b>StoneFancyX</b></sub>
   </a>
 </p>
 

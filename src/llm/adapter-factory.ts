@@ -18,7 +18,7 @@
 import { EventEmitter } from 'events';
 import { AgentType, WorkerSlot, TokenUsage } from '../types/agent-types';
 import { BaseLLMAdapter } from './adapters/base-adapter';
-import { WorkerLLMAdapter, WorkerAdapterConfig } from './adapters/worker-adapter';
+import { WorkerLLMAdapter, WorkerAdapterConfig, getStallDetectionPreset } from './adapters/worker-adapter';
 import { OrchestratorLLMAdapter, OrchestratorAdapterConfig } from './adapters/orchestrator-adapter';
 import { LLMConfigLoader } from './config';
 import { createLLMClient } from './clients/client-factory';
@@ -250,6 +250,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       messageHub: this.getMessageHub(),  // 🔧 统一消息通道：使用 messageHub
       workerSlot,
       profileLoader: this.profileLoader,
+      stallConfig: getStallDetectionPreset(workerSlot),
     };
 
     const adapter = new WorkerLLMAdapter(adapterConfig);

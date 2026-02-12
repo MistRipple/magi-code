@@ -10,6 +10,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { CodeTokenizer, FileTokenResult, TokenContext } from './code-tokenizer';
+import { MinHeap } from '../utils/min-heap';
 import { logger, LogCategory } from '../../logging';
 
 // ============================================================================
@@ -211,6 +212,8 @@ export class InvertedIndex {
 
     // 优化 #2: 查询词覆盖率加分
     // 优化 #5: 邻近性加分
+    // 优化 #18: 遍历中追踪 maxScore，避免额外 Map 展开
+    let maxScore = 0.001;
     for (const [, entry] of fileScores) {
       // 覆盖率加分：匹配的查询词越多，额外奖励越大
       if (uniqueQueryTokens.length > 1) {
@@ -224,23 +227,24 @@ export class InvertedIndex {
         const proximityBoost = this.calculateProximityBoost(entry.tokenLineMap);
         entry.totalScore *= (1 + proximityBoost);
       }
+
+      if (entry.totalScore > maxScore) maxScore = entry.totalScore;
     }
 
-    // 归一化并排序
-    const maxScore = Math.max(...Array.from(fileScores.values()).map(e => e.totalScore), 0.001);
+    // 优化 #17: MinHeap Top-K 替换全量 sort+slice
+    const heap = new MinHeap<IndexSearchHit>(maxResults, (a, b) => a.score - b.score);
 
-    const results: IndexSearchHit[] = Array.from(fileScores.entries())
-      .map(([filePath, entry]) => ({
+    for (const [filePath, entry] of fileScores.entries()) {
+      heap.push({
         filePath,
         score: entry.totalScore / maxScore,
         bestContext: entry.bestContext,
         matchedTokens: Array.from(entry.matchedTokens),
         hitLines: Array.from(entry.hitLines).sort((a, b) => a - b).slice(0, 10),
-      }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, maxResults);
+      });
+    }
 
-    return results;
+    return heap.toSortedDescArray();
   }
 
   // ==========================================================================
@@ -434,17 +438,24 @@ export class InvertedIndex {
    * 计算邻近性加分（优化 #5）
    * 多个查询词出现在相邻行（距离 ≤ 3）→ 最高 +30%
    */
+  /**
+   * 优化 #19: 预排序 tokenLineMap，避免循环内重复 Array.from().sort()
+   */
   private calculateProximityBoost(tokenLineMap: Map<string, Set<number>>): number {
-    const tokenLineSets = Array.from(tokenLineMap.values());
-    if (tokenLineSets.length < 2) return 0;
+    // 预排序：每个 Set → sorted number[]（仅排序一次）
+    const sortedLineSets: number[][] = [];
+    for (const lineSet of tokenLineMap.values()) {
+      sortedLineSets.push(Array.from(lineSet).sort((a, b) => a - b));
+    }
+    if (sortedLineSets.length < 2) return 0;
 
     let bestProximity = Infinity;
 
     // 对每对 token 计算最小行距
-    for (let i = 0; i < tokenLineSets.length; i++) {
-      for (let j = i + 1; j < tokenLineSets.length; j++) {
-        const linesA = Array.from(tokenLineSets[i]).sort((a, b) => a - b);
-        const linesB = Array.from(tokenLineSets[j]).sort((a, b) => a - b);
+    for (let i = 0; i < sortedLineSets.length; i++) {
+      for (let j = i + 1; j < sortedLineSets.length; j++) {
+        const linesA = sortedLineSets[i];
+        const linesB = sortedLineSets[j];
 
         // 双指针求最小距离
         let ai = 0, bi = 0;

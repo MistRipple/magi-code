@@ -8,21 +8,12 @@
 
 export {
   MissionOrchestrator,
-  MissionCreationResult,
-  PlanningOptions,
-  MissionVerificationResult,
-  MissionSummary,
 } from './mission-orchestrator';
 
 // 编排引擎
 export {
   MissionDrivenEngine,
   MissionDrivenEngineConfig,
-  MissionDrivenContext,
-  ConfirmationCallback as MissionConfirmationCallback,
-  RecoveryConfirmationCallback as MissionRecoveryConfirmationCallback,
-  ClarificationCallback as MissionClarificationCallback,
-  WorkerQuestionCallback as MissionWorkerQuestionCallback,
 } from './mission-driven-engine';
 
 // 统一消息出口

@@ -13,7 +13,7 @@
  *
  * 降级策略：
  * - ACE 可用时：优先使用远程语义搜索
- * - ACE 不可用时：自动回退到 LocalSearchEngine（TF-IDF + 符号 + 依赖图）
+ * - ACE 不可用时：通过 LocalCodeSearchService 回退到本地三级搜索（PKB + Grep + LSP）
  *
  * 配置来源：由 ToolManager 通过 configureAce() 方法统一管理
  * 配置存储：~/.magi/config.json 的 promptEnhance 字段
@@ -23,19 +23,14 @@ import { ToolExecutor, ExtendedToolDefinition } from './types';
 import { ToolCall, ToolResult } from '../llm/types';
 import { AceIndexManager, IndexResult, SearchResult } from '../ace/index-manager';
 import { logger, LogCategory } from '../logging';
-
-/**
- * 本地搜索回退函数签名
- * 由外部（webview-provider）注入 LocalSearchEngine 的搜索能力
- */
-export type LocalSearchFallback = (query: string, maxResults?: number) => Promise<string | null>;
+import type { LocalCodeSearchService } from '../services/local-code-search-service';
 
 /**
  * ACE 执行器
  * 提供代码库语义搜索功能
  *
  * 注意：配置由 ToolManager 统一管理，不直接读取配置文件
- * 降级：当 ACE 不可用时，通过 localSearchFallback 回退到本地索引搜索
+ * 降级：当 ACE 不可用时，通过 LocalCodeSearchService 回退到本地三级搜索
  */
 export class AceExecutor implements ToolExecutor {
   private workspaceRoot: string;
@@ -44,7 +39,7 @@ export class AceExecutor implements ToolExecutor {
   private indexManager: AceIndexManager | null = null;
   private isIndexing = false;
   private lastIndexResult: IndexResult | null = null;
-  private localSearchFallback: LocalSearchFallback | null = null;
+  private localSearchService: LocalCodeSearchService | null = null;
   /** ACE 搜索超时（毫秒），超时后自动降级到本地搜索 */
   private static readonly ACE_SEARCH_TIMEOUT = 8000;
 
@@ -123,18 +118,20 @@ Bad query examples (use grep_search instead):
 
   /**
    * 检查工具是否可用
+   * ACE 已配置或本地搜索服务可用时均返回 true
    */
   async isAvailable(toolName: string): Promise<boolean> {
-    return toolName === 'codebase_retrieval';
+    if (toolName !== 'codebase_retrieval') return false;
+    return !!this.indexManager || !!this.localSearchService?.isAvailable;
   }
 
   /**
-   * 注入本地搜索回退
-   * 由 webview-provider 在 PKB 初始化后调用
+   * 注入本地搜索服务
+   * 由 WebviewProvider 在初始化时调用（替代原闭包注入）
    */
-  setLocalSearchFallback(fallback: LocalSearchFallback): void {
-    this.localSearchFallback = fallback;
-    logger.info('AceExecutor.本地搜索回退已注入', undefined, LogCategory.TOOLS);
+  setLocalSearchService(service: LocalCodeSearchService): void {
+    this.localSearchService = service;
+    logger.info('AceExecutor.本地搜索服务已注入', undefined, LogCategory.TOOLS);
   }
 
   /**
@@ -170,7 +167,7 @@ Bad query examples (use grep_search instead):
       query: args.query,
       ensureIndexed,
       hasAce: !!this.indexManager,
-      hasFallback: !!this.localSearchFallback,
+      hasFallback: !!this.localSearchService,
     }, LogCategory.TOOLS);
 
     try {
@@ -229,17 +226,17 @@ Bad query examples (use grep_search instead):
 
   /**
    * 本地搜索回退
-   * 使用 LocalSearchEngine（TF-IDF + 符号索引 + 依赖图）作为 ACE 替代
+   * 使用 LocalCodeSearchService（三级搜索）作为 ACE 替代
    */
   private async executeLocalFallback(
     toolCallId: string,
     query: string,
     aceError?: string
   ): Promise<ToolResult> {
-    if (!this.localSearchFallback) {
+    if (!this.localSearchService?.isAvailable) {
       return {
         toolCallId,
-        content: `Error: ACE API not configured and local search fallback not available.
+        content: `Error: ACE API not configured and local search service not available.
 
 To enable semantic code search, configure ACE:
 - ACE_API_URL: The ACE server URL
@@ -251,12 +248,12 @@ Without ACE, use grep_search for pattern-based code search.`,
     }
 
     try {
-      const localResult = await this.localSearchFallback(query, 10);
+      const localResult = await this.localSearchService.search(query, 10);
 
       if (localResult) {
         const header = aceError
-          ? `[ACE 不可用 (${aceError})，已回退到本地索引搜索]\n\n`
-          : `[本地索引搜索 — ACE 未配置]\n\n`;
+          ? `[ACE 不可用 (${aceError})，已回退到本地三级搜索]\n\n`
+          : `[本地三级搜索 — ACE 未配置]\n\n`;
 
         logger.info('AceExecutor.本地回退搜索成功', {
           query: query.substring(0, 50),
@@ -272,7 +269,7 @@ Without ACE, use grep_search for pattern-based code search.`,
 
       return {
         toolCallId,
-        content: '未找到相关代码（本地索引搜索无结果）',
+        content: '未找到相关代码（本地三级搜索无结果）',
         isError: false
       };
     } catch (fallbackError: any) {
@@ -282,7 +279,7 @@ Without ACE, use grep_search for pattern-based code search.`,
 
       return {
         toolCallId,
-        content: `Search unavailable: ACE not configured, local fallback error: ${fallbackError.message}`,
+        content: `Search unavailable: ACE not configured, local search error: ${fallbackError.message}`,
         isError: true
       };
     }

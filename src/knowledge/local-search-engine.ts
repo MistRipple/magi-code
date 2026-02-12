@@ -245,8 +245,8 @@ export class LocalSearchEngine {
     //    追加关联文件（以 0.5× 衰减分加入）
     const expandedRanked = this.expandWithDependencies(ranked, maxResults * 2);
 
-    // 6. 组装搜索结果 + 提取代码片段
-    const results = this.assembleRankedResults(expandedRanked, indexHits, symbolHits, maxResults, maxContextLength);
+    // 6. 组装搜索结果 + 提取代码片段（异步并行预加载文件内容）
+    const results = await this.assembleRankedResults(expandedRanked, indexHits, symbolHits, maxResults, maxContextLength);
 
     // 7. 写入缓存
     this.searchCache.set(query, results);
@@ -359,14 +359,31 @@ export class LocalSearchEngine {
   /**
    * 将融合排序后的结果组装为完整搜索结果（含代码片段提取）
    * Fix 2: 同时接收 symbolHits，当文件仅被符号索引命中时使用符号行号提取 snippets
+   * 优化 #16: 批量异步并行预加载文件内容，消除搜索路径上的 readFileSync
    */
-  private assembleRankedResults(
+  private async assembleRankedResults(
     ranked: RankedResult[],
     indexHits: IndexSearchHit[],
     symbolHits: SymbolSearchHit[],
     maxResults: number,
     maxContextLength: number
-  ): SearchResult[] {
+  ): Promise<SearchResult[]> {
+    // 批量异步预加载：收集候选文件路径 → Promise.all 并行读取
+    const candidateFiles = new Set(ranked.slice(0, maxResults).map(r => r.filePath));
+    const fileContents = new Map<string, string[]>();
+
+    await Promise.all(
+      Array.from(candidateFiles).map(async (filePath) => {
+        try {
+          const fullPath = path.join(this.projectRoot, filePath);
+          const content = await fs.promises.readFile(fullPath, 'utf-8');
+          fileContents.set(filePath, content.split('\n'));
+        } catch {
+          // 文件不存在或无法读取，跳过
+        }
+      })
+    );
+
     const results: SearchResult[] = [];
     let totalContentLength = 0;
 
@@ -388,19 +405,22 @@ export class LocalSearchEngine {
       if (results.length >= maxResults) break;
       if (totalContentLength >= maxContextLength) break;
 
+      const lines = fileContents.get(rankedItem.filePath);
+      if (!lines) continue; // 文件预加载失败，跳过
+
       let snippets: CodeSnippet[] = [];
 
       // 策略 1: 优先使用 indexHit 的行号信息
       const indexHit = indexHitMap.get(rankedItem.filePath);
       if (indexHit) {
-        snippets = this.extractSnippets(rankedItem.filePath, indexHit.hitLines, indexHit.matchedTokens, maxContextLength - totalContentLength);
+        snippets = this.extractSnippets(rankedItem.filePath, lines, indexHit.hitLines, indexHit.matchedTokens, maxContextLength - totalContentLength);
       }
 
       // 策略 2: 无 indexHit 时，使用符号定义行号
       if (snippets.length === 0) {
         const symbolLines = symbolLineMap.get(rankedItem.filePath);
         if (symbolLines && symbolLines.length > 0) {
-          snippets = this.extractSnippets(rankedItem.filePath, symbolLines, [], maxContextLength - totalContentLength);
+          snippets = this.extractSnippets(rankedItem.filePath, lines, symbolLines, [], maxContextLength - totalContentLength);
         }
       }
 
@@ -467,19 +487,15 @@ export class LocalSearchEngine {
   }
 
   /**
-   * 从文件中按行号列表提取代码片段
+   * 从预加载的文件内容中按行号列表提取代码片段
    * 利用 SymbolIndex 的符号边界提取完整代码块（函数/类/方法），
    * 非符号区域（import/全局代码）使用上下文窗口
+   * 优化 #16: 接收预加载的 lines，不再自行读取文件
    */
-  private extractSnippets(filePath: string, hitLines: number[], matchedTokens: string[], maxLength: number): CodeSnippet[] {
+  private extractSnippets(filePath: string, lines: string[], hitLines: number[], matchedTokens: string[], maxLength: number): CodeSnippet[] {
     const snippets: CodeSnippet[] = [];
 
     try {
-      const fullPath = path.join(this.projectRoot, filePath);
-      if (!fs.existsSync(fullPath)) return snippets;
-
-      const content = fs.readFileSync(fullPath, 'utf-8');
-      const lines = content.split('\n');
       let totalLength = 0;
 
       // 1. 将每个 hitLine 映射到代码块范围

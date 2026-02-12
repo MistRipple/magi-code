@@ -4,6 +4,8 @@ import { resolve } from 'path';
 
 // https://vitejs.dev/config/
 export default defineConfig({
+  // 使用相对路径，确保 VS Code webview 中动态 import 正确解析
+  base: './',
   plugins: [
     svelte({
       compilerOptions: {

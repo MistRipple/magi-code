@@ -4,4 +4,4 @@
  * 仅保留 PlanningExecutor（一级 Todo 创建入口）
  */
 
-export { PlanningExecutor, PlanningOptions, PlanningResult } from './planning-executor';
+export { PlanningExecutor } from './planning-executor';

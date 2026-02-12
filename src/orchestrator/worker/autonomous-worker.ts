@@ -13,6 +13,7 @@ import { EventEmitter } from 'events';
 import * as fs from 'fs/promises';
 import * as crypto from 'crypto';
 import * as path from 'path';
+import { execSync } from 'child_process';
 import { WorkerSlot, SubTask } from '../../types';
 import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import { AdapterOutputScope } from '../../adapters/adapter-factory-interface';
@@ -148,6 +149,8 @@ export interface AutonomousExecutionResult {
   totalDuration: number;
   errors: string[];
   recoveryAttempts: number;
+  /** 结构化执行总结（成功/失败均有），由 buildStructuredSummary 生成 */
+  summary: string;
   /** Token 使用统计 */
   tokenUsage?: TokenUsage;
   /** Session ID（用于后续恢复） - 提案 4.1 */
@@ -475,11 +478,13 @@ export class AutonomousWorker extends EventEmitter {
       totalDuration: Date.now() - startTime,
       errors: aborted ? [...errors, abortReason || '被编排者终止'] : errors,
       recoveryAttempts: session?.stateSnapshot.retryCount || 0,
+      summary: '', // 占位，qualityGate 后由 buildStructuredSummary 填充
       tokenUsage: totalTokenUsage,
       sessionId: session?.id,
       hasPendingApprovals, // 返回 pendingApproval 状态
     };
     const qualityCheckedResult = this.applyQualityGate(assignment, result, sharedContext, startTime);
+    qualityCheckedResult.summary = this.buildStructuredSummary(qualityCheckedResult);
 
     // 清理当前 Session 引用
     this.currentSession = null;
@@ -502,9 +507,12 @@ export class AutonomousWorker extends EventEmitter {
     if (options.onReport) {
       const finalResult: WorkerResult = {
         success: qualityCheckedResult.success,
-        modifiedFiles: completedTodos.flatMap(t => t.output?.modifiedFiles || []),
+        modifiedFiles: [...new Set([
+          ...completedTodos.flatMap(t => t.output?.modifiedFiles || []),
+          ...failedTodos.flatMap(t => t.output?.modifiedFiles || []),
+        ])],
         createdFiles: [],
-        summary: qualityCheckedResult.success ? `完成 ${completedTodos.length} 个任务` : `失败 ${failedTodos.length} 个任务`,
+        summary: qualityCheckedResult.summary,
         totalDuration: qualityCheckedResult.totalDuration,
         tokenUsage: totalTokenUsage.inputTokens > 0 ? {
           inputTokens: totalTokenUsage.inputTokens,
@@ -532,6 +540,59 @@ export class AutonomousWorker extends EventEmitter {
     }, LogCategory.ORCHESTRATOR);
 
     return qualityCheckedResult;
+  }
+
+  /**
+   * 生成结构化 Worker 总结
+   *
+   * 从 AutonomousExecutionResult 中提取关键信息，无论成功或失败都输出有意义的总结。
+   * 用于 WorkerResult.summary → Orchestrator Phase C 汇总。
+   */
+  private buildStructuredSummary(result: AutonomousExecutionResult): string {
+    const sections: string[] = [];
+
+    // 1. 完成的工作
+    if (result.completedTodos.length > 0) {
+      const completedLines = result.completedTodos.map(t => {
+        const action = t.output?.summary
+          ? (t.output.summary.length > 120 ? t.output.summary.substring(0, 120) + '...' : t.output.summary)
+          : t.content;
+        return `- ${action}`;
+      });
+      sections.push(`完成 ${result.completedTodos.length} 步:\n${completedLines.join('\n')}`);
+    }
+
+    // 2. 失败的工作
+    if (result.failedTodos.length > 0) {
+      const failedLines = result.failedTodos.map(t => {
+        const reason = t.output?.summary || t.blockedReason || '未知原因';
+        const shortReason = reason.length > 80 ? reason.substring(0, 80) + '...' : reason;
+        return `- ${t.content}: ${shortReason}`;
+      });
+      sections.push(`失败 ${result.failedTodos.length} 步:\n${failedLines.join('\n')}`);
+    }
+
+    // 3. 错误信息（如果有且不在 failedTodos 中已体现的）
+    if (result.errors.length > 0 && result.failedTodos.length === 0) {
+      sections.push(`错误: ${result.errors[0]}`);
+    }
+
+    // 4. 修改的文件
+    const allFiles = [
+      ...result.completedTodos.flatMap(t => t.output?.modifiedFiles || []),
+      ...result.failedTodos.flatMap(t => t.output?.modifiedFiles || []),
+    ];
+    const uniqueFiles = [...new Set(allFiles)];
+    if (uniqueFiles.length > 0) {
+      sections.push(`修改文件: ${uniqueFiles.join(', ')}`);
+    }
+
+    // 5. 跳过的工作
+    if (result.skippedTodos.length > 0) {
+      sections.push(`跳过 ${result.skippedTodos.length} 步`);
+    }
+
+    return sections.length > 0 ? sections.join('\n') : (result.success ? '任务完成' : '任务失败');
   }
 
   /**
@@ -728,6 +789,16 @@ export class AutonomousWorker extends EventEmitter {
       const extraTargets = this.extractTargetFiles(
         `${todo.content}\n${todo.reasoning || ''}\n${todo.expectedOutput || ''}`
       );
+
+      // L2: 上下文预注入 — 编排者未提供足够目标文件时，自动搜索相关代码
+      // 减少 Worker（尤其 Codex）因缺乏上下文而产生的大范围探索轮次
+      const allKnownTargets = [...(assignment.scope.targetPaths || []), ...extraTargets];
+      if (allKnownTargets.length < 3) {
+        const taskText = `${todo.content} ${assignment.delegationBriefing || assignment.responsibility}`;
+        const discovered = this.discoverRelevantFiles(taskText, options.workingDirectory, allKnownTargets);
+        extraTargets.push(...discovered);
+      }
+
       const targetFileContext = await this.buildTargetFileContext(
         assignment,
         options.workingDirectory,
@@ -982,6 +1053,86 @@ export class AutonomousWorker extends EventEmitter {
     const filePattern = /[\w\-./]+\.(ts|js|tsx|jsx|py|java|go|rs|cpp|c|css|scss|html|json|md|yaml|yml|txt)/gi;
     const matches = text.match(filePattern);
     return matches ? [...new Set(matches)] : [];
+  }
+
+  /**
+   * 发现与任务相关的文件（语义搜索预注入）
+   *
+   * 从任务描述中提取关键词，在工作目录中搜索包含这些关键词的源文件。
+   * 用于弥补编排者未提供 targetPaths 时的上下文缺口，减少 Worker 的探索轮次。
+   */
+  private discoverRelevantFiles(
+    taskDescription: string,
+    workingDirectory: string,
+    existingTargets: string[]
+  ): string[] {
+    const keywords = this.extractSearchKeywords(taskDescription);
+    if (keywords.length === 0) return [];
+
+    const discovered = new Map<string, number>();
+    const existingSet = new Set(existingTargets);
+
+    for (const keyword of keywords) {
+      try {
+        // Shell-safe: 转义特殊字符防止注入
+        const safeKeyword = keyword.replace(/[\\'"$`!#&|;(){}[\]<>?*~]/g, '\\$&');
+        const srcDir = path.join(workingDirectory, 'src');
+        const result = execSync(
+          `grep -rl --include="*.ts" --include="*.tsx" --include="*.js" --include="*.svelte" -m 1 "${safeKeyword}" "${srcDir}" 2>/dev/null | head -15`,
+          { encoding: 'utf-8', timeout: 3000 }
+        );
+        for (const filePath of result.trim().split('\n').filter(Boolean)) {
+          const relativePath = path.relative(workingDirectory, filePath);
+          if (!existingSet.has(relativePath) && !existingSet.has(filePath)) {
+            discovered.set(relativePath, (discovered.get(relativePath) || 0) + 1);
+          }
+        }
+      } catch {
+        // grep exit code 1 (no match) or timeout — skip
+      }
+    }
+
+    // 按关键词命中数排序（最相关的在前），返回前 5 个
+    const results = [...discovered.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([filePath]) => filePath);
+
+    if (results.length > 0) {
+      logger.info('Worker.文件发现.预注入', {
+        workerId: this.workerType,
+        keywords: keywords.join(', '),
+        discoveredFiles: results.length,
+        files: results,
+      }, LogCategory.ORCHESTRATOR);
+    }
+
+    return results;
+  }
+
+  /**
+   * 从任务描述中提取搜索关键词
+   *
+   * 优先提取：CamelCase 标识符、函数/类名、有意义的英文单词
+   */
+  private extractSearchKeywords(text: string): string[] {
+    const stopWords = new Set([
+      '的', '在', '是', '了', '和', '与', '对', '将', '把', '被', '让', '使', '需要', '可以', '应该',
+      'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'to', 'of', 'in', 'for', 'on',
+      'with', 'and', 'or', 'but', 'not', 'this', 'that', 'it', 'as', 'by', 'from', 'at',
+      'should', 'can', 'will', 'function', 'method', 'class', 'file', 'code',
+      'implement', 'add', 'fix', 'update', 'modify', 'todo', 'task', 'step',
+    ]);
+
+    // 1. CamelCase 标识符（最高优先级，如 WorkerAdapter, DispatchManager）
+    const camelCase = text.match(/[A-Z][a-z]+(?:[A-Z][a-z]+)+/g) || [];
+    // 2. 有意义的标识符（snake_case、普通英文词等）
+    const identifiers = text.match(/[a-zA-Z_][a-zA-Z0-9_]{3,}/g) || [];
+
+    const allTokens = [...new Set([...camelCase, ...identifiers])];
+    return allTokens
+      .filter(w => !stopWords.has(w.toLowerCase()) && w.length > 3)
+      .slice(0, 8);
   }
 
   private mapTodoKind(todoType: string): SubTask['kind'] {
@@ -1632,6 +1783,7 @@ export class AutonomousWorker extends EventEmitter {
       totalDuration: Date.now() - startTime,
       errors,
       recoveryAttempts,
+      summary: '', // 占位，qualityGate 后由 buildStructuredSummary 填充
       tokenUsage: totalTokenUsage,
     };
     const qualityCheckedResult = this.applyQualityGate(
@@ -1640,6 +1792,7 @@ export class AutonomousWorker extends EventEmitter {
       sharedContextForRecovery,
       startTime
     );
+    qualityCheckedResult.summary = this.buildStructuredSummary(qualityCheckedResult);
 
     this.currentMissionId = undefined;
     this.resetCacheReadStats();

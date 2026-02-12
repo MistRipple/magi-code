@@ -14,6 +14,8 @@
  * 意图判定完全由 AI 决策。
  */
 
+import { extractEmbeddedJson } from '../utils/content-parser';
+
 /** AI 意图决策 */
 export interface IntentDecision {
   /** 意图类型（用于分析/记录） */
@@ -146,4 +148,104 @@ export class IntentGate {
     return `意图类型: ${classification.intent}, 置信度: ${(classification.confidence * 100).toFixed(0)}%, ` +
            `建议: ${modeDescriptions[mode]}`;
   }
+
+  // ==========================================================================
+  // 静态解析方法 — LLM 响应 → IntentDecision
+  // ==========================================================================
+
+  /**
+   * 从 LLM 原始响应中解析出 IntentDecision
+   * 支持 fenced JSON、嵌入 JSON、纯 JSON 三种格式
+   */
+  static parseClassificationResponse(content: string): IntentDecision | null {
+    const raw = IntentGate.extractPayload(content);
+    if (!raw) return null;
+
+    return {
+      intent: IntentGate.normalizeIntent(raw.intent),
+      recommendedMode: IntentGate.mapToHandlerMode(raw.recommendedMode),
+      confidence: raw.confidence || 0.8,
+      needsClarification: Boolean(raw.needsClarification),
+      clarificationQuestions: raw.clarificationQuestions || [],
+      reason: raw.reason || '',
+    };
+  }
+
+  private static extractPayload(content: string): IntentClassificationRaw | null {
+    const fencedJsonRegex = /```json\s*([\s\S]*?)```/gi;
+    let fencedMatch: RegExpExecArray | null = fencedJsonRegex.exec(content);
+    while (fencedMatch) {
+      const parsed = IntentGate.tryParsePayload(fencedMatch[1]);
+      if (parsed) return parsed;
+      fencedMatch = fencedJsonRegex.exec(content);
+    }
+
+    const embeddedJsons = extractEmbeddedJson(content);
+    for (const embedded of embeddedJsons) {
+      const parsed = IntentGate.tryParsePayload(embedded.jsonText);
+      if (parsed) return parsed;
+    }
+
+    return IntentGate.tryParsePayload(content);
+  }
+
+  private static tryParsePayload(candidate: string): IntentClassificationRaw | null {
+    try {
+      const parsed = JSON.parse(candidate.trim()) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+
+      const payload = parsed as Record<string, unknown>;
+      if (typeof payload.intent !== 'string' && typeof payload.recommendedMode !== 'string') return null;
+
+      return {
+        intent: typeof payload.intent === 'string' ? payload.intent : undefined,
+        recommendedMode: typeof payload.recommendedMode === 'string' ? payload.recommendedMode : undefined,
+        confidence: typeof payload.confidence === 'number' ? payload.confidence : undefined,
+        needsClarification: typeof payload.needsClarification === 'boolean' ? payload.needsClarification : undefined,
+        clarificationQuestions: Array.isArray(payload.clarificationQuestions)
+          ? payload.clarificationQuestions.filter((q): q is string => typeof q === 'string')
+          : undefined,
+        reason: typeof payload.reason === 'string' ? payload.reason : undefined,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  static mapToHandlerMode(mode?: string): IntentHandlerMode {
+    const modeMap: Record<string, IntentHandlerMode> = {
+      ask: IntentHandlerMode.ASK,
+      direct: IntentHandlerMode.DIRECT,
+      explore: IntentHandlerMode.EXPLORE,
+      task: IntentHandlerMode.TASK,
+      demo: IntentHandlerMode.DEMO,
+      clarify: IntentHandlerMode.CLARIFY,
+    };
+    return modeMap[mode ?? 'task'] || IntentHandlerMode.TASK;
+  }
+
+  static normalizeIntent(intent?: string): IntentDecision['intent'] {
+    switch (intent) {
+      case 'question':
+      case 'trivial':
+      case 'exploratory':
+      case 'task':
+      case 'demo':
+      case 'ambiguous':
+      case 'open_ended':
+        return intent;
+      default:
+        return 'task';
+    }
+  }
+}
+
+/** LLM 响应中的原始意图分类字段 */
+interface IntentClassificationRaw {
+  intent?: string;
+  recommendedMode?: string;
+  confidence?: number;
+  needsClarification?: boolean;
+  clarificationQuestions?: string[];
+  reason?: string;
 }

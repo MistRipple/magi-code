@@ -24,7 +24,7 @@ import { createAdjustResponse } from '../protocols/worker-report';
 import { DispatchBatch, CancellationError, type DispatchEntry, type DispatchResult, type DispatchStatus } from './dispatch-batch';
 import { LLMConfigLoader } from '../../llm/config';
 import { buildDispatchSummaryPrompt } from '../prompts/orchestrator-prompts';
-import type { PlanningExecutor } from './executors/planning-executor';
+import { PlanningExecutor } from './executors/planning-executor';
 import { WorkerPipeline } from './worker-pipeline';
 import type { SnapshotManager } from '../../snapshot-manager';
 
@@ -36,11 +36,8 @@ export interface DispatchManagerDeps {
   profileLoader: ProfileLoader;
   messageHub: MessageHub;
   missionOrchestrator: MissionOrchestrator;
-  planningExecutor: () => PlanningExecutor;
   workspaceRoot: string;
   // 动态状态访问
-  getActiveBatch: () => DispatchBatch | null;
-  setActiveBatch: (batch: DispatchBatch | null) => void;
   getActiveUserPrompt: () => string;
   getActiveImagePaths: () => string[] | undefined;
   getCurrentSessionId: () => string | undefined;
@@ -64,8 +61,78 @@ export class DispatchManager {
   private static readonly PHASE_B_PLUS_MIN_INTERVAL = 30_000;
 
   private pipeline = new WorkerPipeline();
+  private activeBatch: DispatchBatch | null = null;
+  private _planningExecutor: PlanningExecutor | null = null;
 
-  constructor(private deps: DispatchManagerDeps) {}
+  constructor(private deps: DispatchManagerDeps) {
+    this.setupMissionEventListeners();
+  }
+
+  /**
+   * 订阅 MissionOrchestrator 的 Todo/Insight 事件，
+   * 将进度信息直接通过 MessageHub 发送到前端 SubTaskCard
+   */
+  private setupMissionEventListeners(): void {
+    const mo = this.deps.missionOrchestrator;
+
+    mo.on('todoStarted', ({ assignmentId, content }: { assignmentId: string; content: string }) => {
+      this.reportTodoProgress(assignmentId, `正在执行: ${content}`);
+    });
+
+    mo.on('todoCompleted', ({ assignmentId, content }: { assignmentId: string; content: string }) => {
+      this.reportTodoProgress(assignmentId, `完成: ${content}`);
+    });
+
+    mo.on('todoFailed', ({ assignmentId, content, error }: { assignmentId: string; content: string; error?: string }) => {
+      this.reportTodoProgress(assignmentId, `失败: ${content} - ${error || '未知错误'}`);
+    });
+
+    mo.on('insightGenerated', ({ workerId, type, content, importance }: { workerId: string; type: string; content: string; importance: string }) => {
+      const typeLabels: Record<string, string> = {
+        decision: '决策', contract: '契约', risk: '风险', constraint: '约束',
+      };
+      const label = typeLabels[type] || type;
+      const level = importance === 'critical' ? 'warning' : 'info';
+      this.deps.messageHub.notify(`[${workerId}] ${label}: ${content}`, level);
+    });
+  }
+
+  /**
+   * 报告 Todo 进度：从 activeBatch 查找 entry 并更新 subTaskCard
+   */
+  private reportTodoProgress(assignmentId: string, summary: string): void {
+    const entry = this.activeBatch?.getEntry(assignmentId);
+    if (entry) {
+      this.deps.messageHub.subTaskCard({
+        id: assignmentId,
+        title: entry.task,
+        status: 'running',
+        worker: entry.worker,
+        summary,
+      });
+    }
+  }
+
+  /**
+   * 获取 PlanningExecutor 单例（延迟初始化）
+   */
+  private getPlanningExecutor(): PlanningExecutor {
+    if (!this._planningExecutor) {
+      const todoManager = this.deps.getTodoManager();
+      if (!todoManager) {
+        throw new Error('TodoManager 未初始化');
+      }
+      this._planningExecutor = new PlanningExecutor(todoManager);
+    }
+    return this._planningExecutor;
+  }
+
+  /**
+   * 获取当前活跃的 DispatchBatch
+   */
+  getActiveBatch(): DispatchBatch | null {
+    return this.activeBatch;
+  }
 
   /**
    * 注入编排工具（dispatch_task / send_worker_message）的回调处理器
@@ -100,40 +167,38 @@ export class DispatchManager {
         const taskId = `dispatch-${Date.now()}-${worker}-${Math.random().toString(36).substring(2, 5)}`;
 
         // 确保 DispatchBatch 存在（一次 orchestrator LLM 调用共享一个 Batch）
-        let activeBatch = this.deps.getActiveBatch();
-        if (!activeBatch || activeBatch.status !== 'active') {
+        if (!this.activeBatch || this.activeBatch.status !== 'active') {
           // 使用 Mission ID 作为 Batch ID，确保 Todo 关联到正确的 Mission
           const missionId = this.deps.getLastMissionId();
-          activeBatch = new DispatchBatch(missionId);
-          activeBatch.userPrompt = this.deps.getActiveUserPrompt();
-          this.deps.setActiveBatch(activeBatch);
-          this.setupBatchEventHandlers(activeBatch);
+          this.activeBatch = new DispatchBatch(missionId);
+          this.activeBatch.userPrompt = this.deps.getActiveUserPrompt();
+          this.setupBatchEventHandlers(this.activeBatch);
         }
 
         // 注册到 DispatchBatch
         try {
-          activeBatch.register({ taskId, worker, task, files, dependsOn });
+          this.activeBatch.register({ taskId, worker, task, files, dependsOn });
 
           // C-12: 环检测 + 深度上限校验
-          activeBatch.topologicalSort();
-          activeBatch.validateDepthLimit();
+          this.activeBatch.topologicalSort();
+          this.activeBatch.validateDepthLimit();
 
           // C-13: 文件冲突解决 — 冲突的并行任务自动添加依赖转串行
-          const serialized = activeBatch.resolveFileConflicts();
+          const serialized = this.activeBatch.resolveFileConflicts();
           if (serialized > 0) {
             logger.info('DispatchBatch.文件冲突.已自动串行化', {
               addedDeps: serialized, taskId,
             }, LogCategory.ORCHESTRATOR);
             // 串行化后重新验证拓扑和深度
-            activeBatch.topologicalSort();
-            activeBatch.validateDepthLimit();
+            this.activeBatch.topologicalSort();
+            this.activeBatch.validateDepthLimit();
           }
         } catch (regError: any) {
           return { task_id: taskId, status: 'failed' as const, worker, error: regError.message };
         }
 
         // 发送 subTaskCard（状态取决于注册后是否有依赖）
-        const entry = activeBatch.getEntry(taskId);
+        const entry = this.activeBatch.getEntry(taskId);
         const hasDeps = entry ? entry.status === 'waiting_deps' : (dependsOn && dependsOn.length > 0);
         this.deps.messageHub.subTaskCard({
           id: taskId,
@@ -144,7 +209,7 @@ export class DispatchManager {
 
         // 通过隔离策略决定是否立即启动（约束 5）
         if (!hasDeps) {
-          this.dispatchReadyTasksWithIsolation(activeBatch);
+          this.dispatchReadyTasksWithIsolation(this.activeBatch);
         }
         // 有依赖的任务由 DispatchBatch 的 task:ready 事件触发
 
@@ -174,7 +239,7 @@ export class DispatchManager {
    * - governance = 'full'：强制启用所有治理步骤
    */
   launchDispatchWorker(taskId: string, worker: WorkerSlot, task: string, files?: string[]): void {
-    const batch = this.deps.getActiveBatch();
+    const batch = this.activeBatch;
 
     // 标记开始运行
     batch?.markRunning(taskId);
@@ -233,11 +298,11 @@ export class DispatchManager {
         : undefined;
 
       // 一级 Todo 由 PlanningExecutor 统一创建（编排层唯一入口）
-      await this.deps.planningExecutor().createMacroTodo(missionId, assignment);
+      await this.getPlanningExecutor().createMacroTodo(missionId, assignment);
 
-      // 发射 assignmentPlanned 事件（通道2：MissionOrchestrator 编排业务事件）
+      // 通知 assignmentPlanned 事件（通道2：MissionOrchestrator 编排业务事件）
       // WebviewProvider.bindMissionEvents() 监听此事件驱动前端 Todo 面板更新
-      this.deps.missionOrchestrator.emit('assignmentPlanned', {
+      this.deps.missionOrchestrator.notifyAssignmentPlanned({
         missionId,
         assignmentId: taskId,
         todos: assignment.todos || [],
@@ -271,14 +336,12 @@ export class DispatchManager {
 
       const result = pipelineResult.executionResult;
 
-      // 收集每个完成 Todo 的实际工作说明，为 Phase C 汇总提供有效信息
-      const todoSummaries = result.completedTodos
-        .map(t => t.output?.summary)
-        .filter((s): s is string => !!s && s.length > 0);
-      const summary = todoSummaries.length > 0
-        ? todoSummaries.map(s => s.length > 200 ? s.substring(0, 200) + '...' : s).join('; ')
-        : (result.success ? '任务完成' : '任务失败');
-      const modifiedFiles = result.completedTodos.flatMap(t => t.output?.modifiedFiles || []);
+      // 直接使用 Worker 生成的结构化总结（唯一生产者：AutonomousWorker.buildStructuredSummary）
+      const summary = result.summary;
+      const modifiedFiles = [...new Set([
+        ...result.completedTodos.flatMap(t => t.output?.modifiedFiles || []),
+        ...result.failedTodos.flatMap(t => t.output?.modifiedFiles || []),
+      ])];
 
       // 更新 subTaskCard 最终状态
       this.deps.messageHub.subTaskCard({
@@ -462,6 +525,7 @@ export class DispatchManager {
       const status = e.status === 'completed' ? '✅' : e.status === 'failed' ? '❌' : '⏭️';
       return `${status} **[${e.worker}]** ${e.result?.summary || '无输出'}`;
     });
+    this.deps.messageHub.notify('汇总模型调用失败，以下为各 Worker 原始执行结果', 'warning');
     this.deps.messageHub.result(lines.join('\n'));
   }
 
@@ -551,5 +615,10 @@ ${this.deps.getActiveUserPrompt()}
     }
 
     return defaultResponse;
+  }
+
+  dispose(): void {
+    this.activeBatch = null;
+    this._planningExecutor = null;
   }
 }

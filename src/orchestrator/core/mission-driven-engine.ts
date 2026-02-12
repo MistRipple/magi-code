@@ -15,67 +15,31 @@ import { UnifiedSessionManager } from '../../session/unified-session-manager';
 import { SnapshotManager } from '../../snapshot-manager';
 import { ContextManager } from '../../context/context-manager';
 import { logger, LogCategory } from '../../logging';
-import { PermissionMatrix, StrategyConfig, SubTask, WorkerSlot, InteractionMode, INTERACTION_MODE_CONFIGS, InteractionModeConfig } from '../../types';
+import { PermissionMatrix, StrategyConfig, WorkerSlot, InteractionMode, INTERACTION_MODE_CONFIGS, InteractionModeConfig } from '../../types';
 import { TokenUsage } from '../../types/agent-types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
 import { CategoryResolver } from '../profile/category-resolver';
-import { ExecutionPlan, OrchestratorState, QuestionCallback, RequirementAnalysis } from '../protocols/types';
-import { IntentDecision, IntentGate, IntentHandlerMode } from '../intent-gate';
+import { OrchestratorState, RequirementAnalysis } from '../protocols/types';
+import { IntentGate, IntentHandlerMode } from '../intent-gate';
 import { VerificationRunner, VerificationConfig } from '../verification-runner';
 import { MissionOrchestrator } from './mission-orchestrator';
 import {
   Mission,
-  Assignment,
   MissionStorageManager,
   FileBasedMissionStorage,
-  MissionStateMapper,
 } from '../mission';
 import { ExecutionStats } from '../execution-stats';
 import { LLMConfigLoader } from '../../llm/config';
-import { MessageHub, type SubTaskCardPayload } from './message-hub';
-import {
-  MessageType,
-  createStandardMessage,
-  MessageCategory,
-  MessageLifecycle,
-  type ContentBlock
-} from '../../protocol/message-protocol';
-import type { WorkerReport, WorkerEvidence, FileChangeRecord } from '../protocols/worker-report';
+import { MessageHub } from './message-hub';
 import { WisdomManager, type WisdomStorage } from '../wisdom';
 import { buildIntentClassificationPrompt } from '../prompts/intent-classification';
 import { buildUnifiedSystemPrompt } from '../prompts/orchestrator-prompts';
-import { extractEmbeddedJson } from '../../utils/content-parser';
 import { isAbortError } from '../../errors';
-// AutonomousWorker 和 TodoExecuteOptions 通过 MissionOrchestrator 间接使用，不直接引用
-import { DispatchBatch } from './dispatch-batch';
-import { createSharedContextEntry } from '../../context/shared-context-pool';
-import { globalEventBus } from '../../events';
 import { SupplementaryInstructionQueue } from './supplementary-instruction-queue';
 import { DispatchManager } from './dispatch-manager';
-import { PlanningExecutor } from './executors/planning-executor';
-
-/**
- * 用户确认回调类型
- */
-export type ConfirmationCallback = (plan: ExecutionPlan, formattedPlan: string) => Promise<boolean>;
-export type RecoveryConfirmationCallback = (
-  failedTask: SubTask,
-  error: string,
-  options: { retry: boolean; rollback: boolean }
-) => Promise<'retry' | 'rollback' | 'continue'>;
-export type ClarificationCallback = (
-  questions: string[],
-  context: string,
-  ambiguityScore: number,
-  originalPrompt: string
-) => Promise<{ answers: Record<string, string>; additionalInfo?: string } | null>;
-export type WorkerQuestionCallback = (
-  workerId: string,
-  question: string,
-  context: string,
-  options?: string[]
-) => Promise<string | null>;
+import { configureResilientCompressor } from './resilient-compressor-adapter';
+import { TaskViewService } from '../../services/task-view-service';
 
 /**
  * 引擎配置
@@ -105,14 +69,6 @@ export interface MissionDrivenEngineConfig {
 }
 
 /**
- * 执行上下文
- */
-export interface MissionDrivenContext {
-  plan: ExecutionPlan | null;
-  mission: Mission | null;
-}
-
-/**
  * MissionDrivenEngine - 基于 Mission-Driven Architecture 的编排引擎
  */
 export class MissionDrivenEngine extends EventEmitter {
@@ -127,13 +83,13 @@ export class MissionDrivenEngine extends EventEmitter {
   private missionOrchestrator: MissionOrchestrator;
   // MissionExecutor 已合并到 MissionOrchestrator
   private missionStorage: MissionStorageManager;
+  private taskViewService: TaskViewService;
   private profileLoader: ProfileLoader;
   private guidanceInjector: GuidanceInjector;
   private categoryResolver = new CategoryResolver();
 
   private intentGate?: IntentGate;
   private verificationRunner?: VerificationRunner;
-  private missionStateMapper = new MissionStateMapper();
 
   // 项目知识库
   private projectKnowledgeBase?: import('../../knowledge/project-knowledge-base').ProjectKnowledgeBase;
@@ -141,7 +97,6 @@ export class MissionDrivenEngine extends EventEmitter {
 
   // 状态
   private _state: OrchestratorState = 'idle';
-  private _context: MissionDrivenContext = { plan: null, mission: null };
   private lastTaskAnalysis: {
     suggestedMode?: 'sequential' | 'parallel';
     explicitWorkers?: WorkerSlot[];
@@ -161,14 +116,6 @@ export class MissionDrivenEngine extends EventEmitter {
     reason?: string;
   } | null = null;
 
-  // 回调
-  private confirmationCallback?: ConfirmationCallback;
-  private questionCallback?: QuestionCallback;
-  private clarificationCallback?: ClarificationCallback;
-  private workerQuestionCallback?: WorkerQuestionCallback;
-  private recoveryConfirmationCallback?: RecoveryConfirmationCallback;
-  private planConfirmationPolicy?: (risk: string) => boolean;
-
   // Token 统计
   private orchestratorTokens = { inputTokens: 0, outputTokens: 0 };
 
@@ -186,8 +133,6 @@ export class MissionDrivenEngine extends EventEmitter {
   private currentSessionId?: string;
   private contextSessionId: string | null = null;
 
-  // DispatchBatch 追踪（当前活跃的 Batch）
-  private activeBatch: DispatchBatch | null = null;
   // 当前执行的用户原始请求（Phase C 汇总引用）
   private activeUserPrompt: string = '';
   // 当前执行的用户原始图片路径（Worker dispatch 传递）
@@ -199,6 +144,7 @@ export class MissionDrivenEngine extends EventEmitter {
   // 运行状态
   private isRunning = false;
   private executionQueue: Promise<void> = Promise.resolve();
+  private pendingCount = 0;
 
   // P0-3: 补充指令队列（独立状态机）
   private supplementaryQueue: SupplementaryInstructionQueue;
@@ -232,6 +178,7 @@ export class MissionDrivenEngine extends EventEmitter {
     const sessionsDir = path.join(workspaceRoot, '.magi', 'sessions');
     const fileStorage = new FileBasedMissionStorage(sessionsDir);
     this.missionStorage = new MissionStorageManager(fileStorage);
+    this.taskViewService = new TaskViewService(this.missionStorage, this.workspaceRoot);
 
     // 初始化 Mission 编排器
     this.missionOrchestrator = new MissionOrchestrator(
@@ -257,16 +204,7 @@ export class MissionDrivenEngine extends EventEmitter {
       profileLoader: this.profileLoader,
       messageHub: this.messageHub,
       missionOrchestrator: this.missionOrchestrator,
-      planningExecutor: () => {
-        const todoManager = this.missionOrchestrator.getTodoManager();
-        if (!todoManager) {
-          throw new Error('TodoManager 未初始化');
-        }
-        return new PlanningExecutor(todoManager);
-      },
       workspaceRoot: this.workspaceRoot,
-      getActiveBatch: () => this.activeBatch,
-      setActiveBatch: (batch) => { this.activeBatch = batch; },
       getActiveUserPrompt: () => this.activeUserPrompt,
       getActiveImagePaths: () => this.activeImagePaths,
       getCurrentSessionId: () => this.currentSessionId,
@@ -278,8 +216,6 @@ export class MissionDrivenEngine extends EventEmitter {
       getContextManager: () => this.contextManager ?? null,
       getTodoManager: () => this.missionOrchestrator.getTodoManager() ?? null,
     });
-
-    this.setupEventForwarding();
   }
 
   /**
@@ -307,120 +243,6 @@ export class MissionDrivenEngine extends EventEmitter {
     };
 
     this.wisdomManager.setStorage(storage);
-  }
-
-  /**
-   * 将 MissionOrchestrator 的编排事件适配为 MessageHub UI 消息
-   *
-   * 事件通道职责分工（P0-1 修复后的 3 通道架构）：
-   *
-   * 通道1 - MessageHub（UI 消息统一出口）：
-   *   MDE 监听 MO 事件 → 转换为 subTaskCard/notify/sendMessage → 前端渲染
-   *   这是本方法的核心职责
-   *
-   * 通道2 - MissionOrchestrator（编排业务事件）：
-   *   WebviewProvider.bindMissionEvents() 直接监听 MO 事件
-   *   负责数据状态同步（todoStarted/todoCompleted → sendData → 前端 store）
-   *
-   * 通道3 - globalEventBus（跨模块生命周期事件）：
-   *   task:completed/failed 等由 MDE.execute() 触发
-   *   WebviewProvider 监听并更新全局 UI 状态
-   */
-  private setupEventForwarding(): void {
-    // Worker 输出：路由到 MessageHub，前端通过 Worker Tab 显示
-    this.missionOrchestrator.on('workerOutput', ({ workerId, output }) => {
-      this.messageHub.workerOutput(workerId, output);
-    });
-
-    // 分析结果：转换为 PLAN 类型消息
-    this.missionOrchestrator.on('analysisComplete', ({ strategy }) => {
-      if (strategy && strategy.analysisSummary) {
-        this.messageHub.orchestratorMessage(strategy.analysisSummary, {
-          type: MessageType.PLAN, // 使用 PLAN 类型，前端会渲染为规划卡片
-          metadata: {
-            phase: 'planning',
-            extra: {
-              strategy: strategy
-            }
-          }
-        });
-      }
-    });
-
-    // 执行计划卡片：构建 Plan Card 消息
-    this.missionOrchestrator.on('missionPlanned', ({ mission }) => {
-      const planBlock: ContentBlock = {
-        type: 'plan',
-        goal: mission.goal,
-        analysis: mission.analysis,
-        constraints: mission.constraints.map((c: any) => c.description),
-        acceptanceCriteria: mission.acceptanceCriteria.map((c: any) => c.description),
-        riskLevel: mission.riskLevel,
-        riskFactors: mission.riskFactors
-      };
-
-      const message = createStandardMessage({
-        traceId: this.messageHub.getTraceId(),
-        category: MessageCategory.CONTENT,
-        type: MessageType.PLAN,
-        source: 'orchestrator',
-        agent: 'orchestrator',
-        lifecycle: MessageLifecycle.COMPLETED,
-        blocks: [planBlock],
-        metadata: {
-          missionId: mission.id,
-          phase: 'planning_complete'
-        }
-      });
-      
-      this.messageHub.sendMessage(message);
-    });
-
-    // 任务开始：发送 Running 状态子任务卡片
-    this.missionOrchestrator.on('assignmentStarted', ({ assignmentId }) => {
-      const mission = this._context.mission;
-      const assignment = mission?.assignments.find(a => a.id === assignmentId);
-      if (assignment && mission) {
-        const mapped = this.missionStateMapper.mapAssignmentToAssignmentView(assignment);
-        
-        // 依赖链序号
-        const assignmentIndex = mission.assignments.findIndex(a => a.id === assignment.id);
-        const totalAssignments = mission.assignments.length;
-        const prefix = totalAssignments > 1 ? `[${assignmentIndex + 1}/${totalAssignments}] ` : '';
-
-        this.messageHub.subTaskCard({
-          id: mapped.id,
-          title: prefix + mapped.title,
-          status: 'running',
-          worker: mapped.worker,
-          summary: '执行中...'
-        });
-      }
-    });
-
-    // Todo 进度：统一用于所有模式（dispatch / Mission）的进度追踪
-    this.missionOrchestrator.on('todoStarted', ({ assignmentId, content }) => {
-      this.reportTodoProgress(assignmentId, `正在执行: ${content}`);
-    });
-
-    this.missionOrchestrator.on('todoCompleted', ({ assignmentId, content }) => {
-      this.reportTodoProgress(assignmentId, `完成: ${content}`, true);
-    });
-
-    this.missionOrchestrator.on('todoFailed', ({ assignmentId, content, error }) => {
-      this.reportTodoProgress(assignmentId, `失败: ${content} - ${error || '未知错误'}`);
-    });
-
-    // Worker 洞察：高优先级洞察推送给用户
-    this.missionOrchestrator.on('insightGenerated', ({ workerId, type, content, importance }) => {
-      const typeLabels: Record<string, string> = {
-        decision: '决策', contract: '契约', risk: '风险', constraint: '约束',
-      };
-      const label = typeLabels[type] || type;
-      const level = importance === 'critical' ? 'warning' : 'info';
-      this.messageHub.notify(`[${workerId}] ${label}: ${content}`, level);
-    });
-
   }
 
   /**
@@ -461,10 +283,14 @@ export class MissionDrivenEngine extends EventEmitter {
   }
 
   private enqueueExecution<T>(runner: () => Promise<T>): Promise<T> {
+    const queueDepth = this.pendingCount++;
+    if (queueDepth > 0) {
+      this.messageHub.notify(`当前有 ${queueDepth} 个任务排队中，请稍候...`);
+    }
     const next = this.executionQueue.then(runner, runner);
     this.executionQueue = next.then(
-      () => undefined,
-      () => undefined
+      () => { this.pendingCount--; },
+      () => { this.pendingCount--; }
     );
     return next;
   }
@@ -480,24 +306,10 @@ export class MissionDrivenEngine extends EventEmitter {
   }
 
   /**
-   * 获取当前上下文
-   */
-  get context(): MissionDrivenContext {
-    return this._context;
-  }
-
-  /**
    * 获取当前阶段（state 的别名）
    */
   get phase(): OrchestratorState {
     return this._state;
-  }
-
-  /**
-   * 获取当前执行计划
-   */
-  get plan(): ExecutionPlan | null {
-    return this._context?.plan || null;
   }
 
   /**
@@ -528,268 +340,6 @@ export class MissionDrivenEngine extends EventEmitter {
 
   getPendingInstructionCount(): number {
     return this.supplementaryQueue.getPendingCount();
-  }
-
-  /**
-   * 发送任务分配说明到对应 Worker Tab
-   *
-   * 使用 delegationBriefing 作为详细任务说明
-   * 如果没有，则使用用户原始需求作为任务描述
-   */
-  private sendWorkerDispatchMessage(mission: Mission, assignment: Assignment): void {
-    // 使用 delegationBriefing 作为详细任务说明
-    const content = assignment.delegationBriefing || mission.userPrompt || mission.goal;
-
-    // 使用新的 workerInstruction API 发送到 Worker Tab
-    this.messageHub.workerInstruction(assignment.workerId, content, {
-      assignmentId: assignment.id,
-      missionId: mission.id,
-    });
-  }
-
-  /**
-   * 发送最终总结消息到主对话区
-   */
-  private sendSummaryMessage(content: string, metadata?: Record<string, unknown>): void {
-    // 使用 MessageHub 发送（统一消息出口）
-    this.messageHub.result(content, {
-      success: true,
-      metadata: {
-        phase: 'summary',
-        extra: {
-          isSummary: true,
-          ...metadata,
-        },
-      },
-    });
-  }
-
-  /**
-   * 构建子任务卡片标题前缀（依赖链序号）
-   */
-  private buildSubTaskTitlePrefix(mission: Mission, assignmentId: string): string {
-    const assignmentIndex = mission.assignments.findIndex(a => a.id === assignmentId);
-    const totalAssignments = mission.assignments.length;
-    if (assignmentIndex < 0 || totalAssignments <= 1) {
-      return '';
-    }
-    return `[${assignmentIndex + 1}/${totalAssignments}] `;
-  }
-
-  /**
-   * 统一报告 Todo 进度（消除 todoStarted/todoCompleted/todoFailed 的重复代码）
-   *
-   * 同时支持 Mission 模式和 dispatch 模式：
-   * - Mission 模式：从 _context.mission 查找 assignment，使用 MissionStateMapper 映射
-   * - dispatch 模式：从 activeBatch 查找 entry
-   *
-   * @param assignmentId 任务分配 ID
-   * @param summary 进度摘要文本
-   * @param includeFileChanges 是否包含文件变更信息（仅 todoCompleted 需要）
-   */
-  private reportTodoProgress(assignmentId: string, summary: string, includeFileChanges = false): void {
-    // Mission 模式
-    const mission = this._context.mission;
-    const assignment = mission?.assignments.find(a => a.id === assignmentId);
-    if (assignment && mission) {
-      const mapped = this.missionStateMapper.mapAssignmentToAssignmentView(assignment);
-      const prefix = this.buildSubTaskTitlePrefix(mission, assignment.id);
-      this.messageHub.subTaskCard({
-        id: mapped.id,
-        title: prefix + mapped.title,
-        status: 'running',
-        worker: mapped.worker,
-        summary,
-        ...(includeFileChanges && {
-          modifiedFiles: mapped.modifiedFiles,
-          createdFiles: mapped.createdFiles,
-        }),
-      });
-      return;
-    }
-    // dispatch 模式：从 activeBatch 查找
-    const entry = this.activeBatch?.getEntry(assignmentId);
-    if (entry) {
-      this.messageHub.subTaskCard({
-        id: assignmentId,
-        title: entry.task,
-        status: 'running',
-        worker: entry.worker,
-        summary,
-      });
-    }
-  }
-
-  /**
-   * 发送子任务状态更新卡片（主对话区）
-   */
-  private emitSubTaskStatusCard(
-    report: Pick<WorkerReport, 'assignmentId' | 'workerId'>,
-    status: SubTaskCardPayload['status'],
-    summary?: string
-  ): boolean {
-    const mission = this._context.mission;
-    if (!mission) {
-      logger.error('编排器.Worker汇报.状态卡更新失败', {
-        reason: 'mission_missing',
-        workerId: report.workerId,
-        assignmentId: report.assignmentId,
-        status,
-      }, LogCategory.ORCHESTRATOR);
-      this.messageHub.systemNotice('任务状态同步失败：任务上下文缺失', {
-        phase: 'subtask_status_sync',
-        reason: 'mission_missing',
-        worker: report.workerId,
-        assignmentId: report.assignmentId,
-        extra: { status },
-      });
-      return false;
-    }
-
-    if (!report.assignmentId) {
-      logger.error('编排器.Worker汇报.状态卡更新失败', {
-        reason: 'assignment_id_missing',
-        workerId: report.workerId,
-        status,
-      }, LogCategory.ORCHESTRATOR);
-      this.messageHub.systemNotice('任务状态同步失败：缺少任务分配标识', {
-        phase: 'subtask_status_sync',
-        reason: 'assignment_id_missing',
-        worker: report.workerId,
-        extra: { status },
-      });
-      return false;
-    }
-
-    const assignment = mission.assignments.find(a => a.id === report.assignmentId);
-    if (!assignment) {
-      logger.error('编排器.Worker汇报.状态卡更新失败', {
-        reason: 'assignment_not_found',
-        missionId: mission.id,
-        assignmentId: report.assignmentId,
-        workerId: report.workerId,
-        status,
-      }, LogCategory.ORCHESTRATOR);
-      this.messageHub.systemNotice('任务状态同步失败：未找到对应任务分配', {
-        phase: 'subtask_status_sync',
-        reason: 'assignment_not_found',
-        missionId: mission.id,
-        assignmentId: report.assignmentId,
-        worker: report.workerId,
-        extra: { status },
-      });
-      return false;
-    }
-
-    const mapped = this.missionStateMapper.mapAssignmentToAssignmentView(assignment);
-    const subTask: SubTaskCardPayload = {
-      id: mapped.id,
-      title: this.buildSubTaskTitlePrefix(mission, assignment.id) + mapped.title,
-      worker: mapped.worker,
-      status,
-      summary: summary || mapped.summary,
-      ...(status === 'failed' && { error: summary || '执行失败' }),
-      modifiedFiles: mapped.modifiedFiles,
-      createdFiles: mapped.createdFiles,
-      duration: mapped.duration,
-    };
-
-    this.messageHub.subTaskCard(subTask);
-    return true;
-  }
-
-
-  private buildWorkerEvidence(report: WorkerReport): WorkerEvidence | undefined {
-    if (!this.snapshotManager) {
-      return undefined;
-    }
-
-    const assignmentId = report.assignmentId;
-    if (!assignmentId) {
-      return undefined;
-    }
-
-    const pendingChanges = this.snapshotManager.getPendingChanges();
-    const matchedChanges = pendingChanges.filter(change => change.assignmentId === assignmentId);
-
-    const fileChanges: FileChangeRecord[] = [];
-    for (const change of matchedChanges) {
-      const action = change.additions > 0 || change.deletions > 0 ? 'modify' : 'modify';
-      fileChanges.push({
-        path: change.filePath,
-        action,
-        linesAdded: change.additions,
-        linesRemoved: change.deletions,
-      });
-    }
-
-    if (report.result?.createdFiles?.length) {
-      for (const createdFile of report.result.createdFiles) {
-        if (!fileChanges.find(change => change.path === createdFile)) {
-          fileChanges.push({
-            path: createdFile,
-            action: 'create',
-          });
-        }
-      }
-    }
-
-    if (report.result?.modifiedFiles?.length) {
-      for (const modifiedFile of report.result.modifiedFiles) {
-        if (!fileChanges.find(change => change.path === modifiedFile)) {
-          fileChanges.push({
-            path: modifiedFile,
-            action: 'modify',
-          });
-        }
-      }
-    }
-
-    if (fileChanges.length === 0) {
-      return undefined;
-    }
-
-    return {
-      fileChanges,
-      verifiedAt: Date.now(),
-      verificationStatus: 'pending',
-    };
-  }
-
-  /**
-   * 发送子任务卡片（主对话区）
-   */
-  private emitSubTaskCard(report: WorkerReport, statusOverride: 'completed' | 'failed'): void {
-    const mission = this._context.mission;
-    if (!mission || !report.assignmentId) {
-      return;
-    }
-
-    const assignment = mission.assignments.find(a => a.id === report.assignmentId);
-    if (!assignment) {
-      return;
-    }
-
-    const mapped = this.missionStateMapper.mapAssignmentToAssignmentView(assignment);
-    
-    // 🔧 P2: 依赖链序号显示 [1/3]
-    const assignmentIndex = mission.assignments.findIndex(a => a.id === assignment.id);
-    const totalAssignments = mission.assignments.length;
-    const prefix = totalAssignments > 1 ? `[${assignmentIndex + 1}/${totalAssignments}] ` : '';
-
-    const subTask: SubTaskCardPayload = {
-      id: mapped.id,
-      title: prefix + mapped.title,
-      worker: mapped.worker,
-      status: statusOverride === 'completed' ? 'completed' : 'failed',
-      summary: report.result?.summary || report.error || mapped.summary,
-      ...(statusOverride === 'failed' && { error: report.error || report.result?.summary || '执行失败' }),
-      modifiedFiles: report.result?.modifiedFiles || mapped.modifiedFiles,
-      createdFiles: report.result?.createdFiles || mapped.createdFiles,
-      duration: mapped.duration,
-    };
-
-    this.messageHub.subTaskCard(subTask);
   }
 
   /**
@@ -829,26 +379,8 @@ export class MissionDrivenEngine extends EventEmitter {
         }, LogCategory.ORCHESTRATOR);
 
         try {
-          const parsed = this.extractIntentClassificationPayload(response.content ?? '');
-          if (parsed) {
-
-            // 详细日志：捕获解析结果
-            logger.info('编排器.意图分类.解析结果', {
-              prompt: prompt.substring(0, 30),
-              parsedIntent: parsed.intent,
-              parsedMode: parsed.recommendedMode,
-              parsedConfidence: parsed.confidence,
-              parsedReason: parsed.reason,
-            }, LogCategory.ORCHESTRATOR);
-
-            const result: IntentDecision = {
-              intent: this.normalizeIntent(parsed.intent),
-              recommendedMode: this.mapToHandlerMode(parsed.recommendedMode),
-              confidence: parsed.confidence || 0.8,
-              needsClarification: Boolean(parsed.needsClarification),
-              clarificationQuestions: parsed.clarificationQuestions || [],
-              reason: parsed.reason || '',
-            };
+          const result = IntentGate.parseClassificationResponse(response.content ?? '');
+          if (result) {
 
             // 详细日志：最终结果
             logger.info('编排器.意图分类.最终结果', {
@@ -868,7 +400,6 @@ export class MissionDrivenEngine extends EventEmitter {
       throw new Error('意图分类解析失败');
     };
     this.intentGate = new IntentGate(decider);
-    this.missionOrchestrator.setIntentGate(decider);
 
     // 初始化 VerificationRunner
     if (this.config.verification && this.config.strategy?.enableVerification) {
@@ -878,7 +409,7 @@ export class MissionDrivenEngine extends EventEmitter {
       );
     }
 
-    await this.configureContextCompression();
+    await configureResilientCompressor(this.contextManager, this.executionStats);
 
     // 注入编排工具的回调处理器
     this.dispatchManager.setupOrchestrationToolHandlers();
@@ -901,105 +432,6 @@ export class MissionDrivenEngine extends EventEmitter {
   }
 
   /**
-   * 映射到 IntentHandlerMode
-   */
-  private mapToHandlerMode(mode?: string): IntentHandlerMode {
-    const modeMap: Record<string, IntentHandlerMode> = {
-      ask: IntentHandlerMode.ASK,
-      direct: IntentHandlerMode.DIRECT,
-      explore: IntentHandlerMode.EXPLORE,
-      task: IntentHandlerMode.TASK,
-      demo: IntentHandlerMode.DEMO,
-      clarify: IntentHandlerMode.CLARIFY,
-    };
-    return modeMap[mode ?? 'task'] || IntentHandlerMode.TASK;
-  }
-
-  private normalizeIntent(intent?: string): IntentDecision['intent'] {
-    switch (intent) {
-      case 'question':
-      case 'trivial':
-      case 'exploratory':
-      case 'task':
-      case 'demo':
-      case 'ambiguous':
-      case 'open_ended':
-        return intent;
-      default:
-        return 'task';
-    }
-  }
-
-  /**
-   * 从 LLM 响应中提取意图分类 JSON（优先 fenced json，其次嵌入 JSON）
-   */
-  private extractIntentClassificationPayload(content: string): {
-    intent?: string;
-    recommendedMode?: string;
-    confidence?: number;
-    needsClarification?: boolean;
-    clarificationQuestions?: string[];
-    reason?: string;
-  } | null {
-    const fencedJsonRegex = /```json\s*([\s\S]*?)```/gi;
-    let fencedMatch: RegExpExecArray | null = fencedJsonRegex.exec(content);
-    while (fencedMatch) {
-      const parsed = this.tryParseIntentClassificationPayload(fencedMatch[1]);
-      if (parsed) {
-        return parsed;
-      }
-      fencedMatch = fencedJsonRegex.exec(content);
-    }
-
-    const embeddedJsons = extractEmbeddedJson(content);
-    for (const embedded of embeddedJsons) {
-      const parsed = this.tryParseIntentClassificationPayload(embedded.jsonText);
-      if (parsed) {
-        return parsed;
-      }
-    }
-
-    return this.tryParseIntentClassificationPayload(content);
-  }
-
-  private tryParseIntentClassificationPayload(candidate: string): {
-    intent?: string;
-    recommendedMode?: string;
-    confidence?: number;
-    needsClarification?: boolean;
-    clarificationQuestions?: string[];
-    reason?: string;
-  } | null {
-    try {
-      const parsed = JSON.parse(candidate.trim()) as unknown;
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        return null;
-      }
-
-      const payload = parsed as Record<string, unknown>;
-      const hasKey =
-        typeof payload.intent === 'string' ||
-        typeof payload.recommendedMode === 'string';
-      if (!hasKey) {
-        return null;
-      }
-
-      return {
-        intent: typeof payload.intent === 'string' ? payload.intent : undefined,
-        recommendedMode: typeof payload.recommendedMode === 'string' ? payload.recommendedMode : undefined,
-        confidence: typeof payload.confidence === 'number' ? payload.confidence : undefined,
-        needsClarification: typeof payload.needsClarification === 'boolean' ? payload.needsClarification : undefined,
-        clarificationQuestions: Array.isArray(payload.clarificationQuestions)
-          ? payload.clarificationQuestions.filter((q): q is string => typeof q === 'string')
-          : undefined,
-        reason: typeof payload.reason === 'string' ? payload.reason : undefined,
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  /**
    * 重新加载画像
    */
   async reloadProfiles(): Promise<void> {
@@ -1012,54 +444,10 @@ export class MissionDrivenEngine extends EventEmitter {
    */
   setKnowledgeBase(knowledgeBase: import('../../knowledge/project-knowledge-base').ProjectKnowledgeBase): void {
     this.projectKnowledgeBase = knowledgeBase;
-    // 同时注入到 MissionOrchestrator
-    this.missionOrchestrator.setKnowledgeBase(knowledgeBase);
     // 注入到 ContextManager（确保 Worker 上下文包含项目知识）
     this.contextManager.setProjectKnowledgeBase(knowledgeBase);
     this.configureWisdomStorage();
     logger.info('任务引擎.知识库.已设置', undefined, LogCategory.ORCHESTRATOR);
-  }
-
-  /**
-   * 设置确认回调
-   */
-  setConfirmationCallback(callback: ConfirmationCallback): void {
-    this.confirmationCallback = callback;
-  }
-
-  /**
-   * 设置问题回调
-   */
-  setQuestionCallback(callback: QuestionCallback): void {
-    this.questionCallback = callback;
-  }
-
-  /**
-   * 设置澄清回调
-   */
-  setClarificationCallback(callback: ClarificationCallback): void {
-    this.clarificationCallback = callback;
-  }
-
-  /**
-   * 设置 Worker 问题回调
-   */
-  setWorkerQuestionCallback(callback: WorkerQuestionCallback): void {
-    this.workerQuestionCallback = callback;
-  }
-
-  /**
-   * 设置计划确认策略
-   */
-  setPlanConfirmationPolicy(policy: (risk: string) => boolean): void {
-    this.planConfirmationPolicy = policy;
-  }
-
-  /**
-   * 设置恢复确认回调
-   */
-  setRecoveryConfirmationCallback(callback: RecoveryConfirmationCallback): void {
-    this.recoveryConfirmationCallback = callback;
   }
 
   /**
@@ -1179,8 +567,9 @@ export class MissionDrivenEngine extends EventEmitter {
         // dispatch_task 是非阻塞的，sendMessage 返回时 Worker 可能还在后台执行。
         // 必须等待 activeBatch 归档后再返回，确保 executeTask 的 finally 块
         // 在所有工作完成后才发出 TASK_COMPLETED 信号。
-        if (this.activeBatch && this.activeBatch.status !== 'archived') {
-          await this.activeBatch.waitForArchive();
+        const currentBatch = this.dispatchManager.getActiveBatch();
+        if (currentBatch && currentBatch.status !== 'archived') {
+          await currentBatch.waitForArchive();
         }
 
         if (response.error) {
@@ -1216,16 +605,35 @@ export class MissionDrivenEngine extends EventEmitter {
         this.adapterFactory.getToolManager().clearSnapshotContext('orchestrator');
         // 清除 MissionOrchestrator 的 Mission ID 关联
         this.missionOrchestrator.setCurrentMissionId(null);
-        // 更新 Mission 状态（统一 Todo 系统：确保编排模式的 Mission 生命周期完整）
+        // 更新 Mission 生命周期
+        // 核心原则：只有编排者通过 dispatch_task 主动创建的任务才保留在 Tasks 面板
+        // 无 dispatch（纯对话 / 层级2直接操作 / LLM 出错 / 中断）→ 删除空 Mission
         if (this.lastMissionId) {
           try {
-            if (this.lastExecutionSuccess) {
-              await this.completeTaskById(this.lastMissionId);
-            } else if (this.lastExecutionErrors.length > 0) {
-              await this.failTaskById(this.lastMissionId, this.lastExecutionErrors[0]);
+            const batch = this.dispatchManager.getActiveBatch();
+            const hadDispatch = batch !== null;
+
+            if (!hadDispatch) {
+              // 未调用 dispatch_task → 不属于任务维度，删除空 Mission
+              await this.missionStorage.delete(this.lastMissionId);
             } else {
-              // 中断场景：标记为 cancelled
-              await this.cancelTaskById(this.lastMissionId);
+              // 有 dispatch：用 batch entries 填充 Mission.goal（替代用户消息原文）
+              const mission = await this.missionStorage.load(this.lastMissionId);
+              if (mission && !mission.goal) {
+                const entries = batch.getEntries();
+                mission.goal = entries.length === 1
+                  ? entries[0].task.substring(0, 80)
+                  : entries.map(e => e.task.substring(0, 40)).join('；');
+                await this.missionStorage.update(mission);
+              }
+              // 更新 Mission 终态
+              if (this.lastExecutionSuccess) {
+                await this.taskViewService.completeTaskById(this.lastMissionId);
+              } else if (this.lastExecutionErrors.length > 0) {
+                await this.taskViewService.failTaskById(this.lastMissionId, this.lastExecutionErrors[0]);
+              } else {
+                await this.taskViewService.cancelTaskById(this.lastMissionId);
+              }
             }
           } catch {
             // Mission 状态更新失败不影响主流程
@@ -1270,7 +678,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
     await this.ensureContextReady(sessionId);
 
-    const missionId = this._context.mission?.id || this.lastMissionId || `session:${sessionId}`;
+    const missionId = this.lastMissionId || `session:${sessionId}`;
     const options = this.contextManager.buildAssemblyOptions(missionId, 'orchestrator', 2400);
     options.localTurns = { min: 1, max: 8 };
 
@@ -1302,7 +710,7 @@ export class MissionDrivenEngine extends EventEmitter {
       await this.ensureContextReady(sessionId);
     }
 
-    const missionId = this._context.mission?.id || this.lastMissionId;
+    const missionId = this.lastMissionId;
     if (missionId) {
       return this.contextManager.getAssembledContextText(
         this.contextManager.buildAssemblyOptions(missionId, 'orchestrator', 8000)
@@ -1362,14 +770,6 @@ export class MissionDrivenEngine extends EventEmitter {
         phase,
       });
     }
-  }
-
-  /**
-   * 记录助手消息
-   */
-  async recordAssistantMessage(content: string): Promise<void> {
-    // 可以在这里记录对话历史
-    logger.debug('编排器.任务引擎.消息.已记录', { length: content.length }, LogCategory.ORCHESTRATOR);
   }
 
   async recordContextMessage(
@@ -1474,17 +874,14 @@ export class MissionDrivenEngine extends EventEmitter {
    * 取消执行
    */
   async cancel(): Promise<void> {
-    if (this._context.mission) {
-      await this.missionOrchestrator.cancelMission(this._context.mission.id, '用户取消');
-    }
-
     // C-09: 取消活跃的 DispatchBatch，信号链传递到所有 Worker
-    if (this.activeBatch && this.activeBatch.status === 'active') {
-      const runningWorkers = this.activeBatch.getEntries()
+    const activeBatch = this.dispatchManager.getActiveBatch();
+    if (activeBatch && activeBatch.status === 'active') {
+      const runningWorkers = activeBatch.getEntries()
         .filter(e => e.status === 'running')
         .map(e => e.worker);
 
-      this.activeBatch.cancelAll('用户取消');
+      activeBatch.cancelAll('用户取消');
 
       // 中断所有正在执行的 Worker LLM 请求
       for (const worker of runningWorkers) {
@@ -1529,7 +926,7 @@ export class MissionDrivenEngine extends EventEmitter {
   }
 
   async reloadCompressionAdapter(): Promise<void> {
-    await this.configureContextCompression();
+    await configureResilientCompressor(this.contextManager, this.executionStats);
   }
 
   /**
@@ -1557,120 +954,18 @@ export class MissionDrivenEngine extends EventEmitter {
   // 任务视图方法（统一 Todo 系统 - 替代 UnifiedTaskManager）
   // ============================================================================
 
-  /**
-   * 获取会话的所有任务视图
-   * 替代 UnifiedTaskManager.getAllTasks()
-   */
-  async listTaskViews(sessionId: string): Promise<import('../../task/task-view-adapter').TaskView[]> {
-    const { missionToTaskView } = await import('../../task/task-view-adapter');
-    const { TodoManager } = await import('../../todo');
-
-    const missions = await this.missionStorage.listBySession(sessionId);
-    const taskViews = [];
-
-    // 性能优化：只创建一个 TodoManager 实例，批量获取所有 mission 的 todos
-    const todosByMission = new Map<string, import('../../todo').UnifiedTodo[]>();
-
-    try {
-      const todoManager = new TodoManager(this.workspaceRoot);
-      await todoManager.initialize();
-
-      // 批量获取所有 mission 的 todos
-      for (const mission of missions) {
-        const todos = await todoManager.getByMission(mission.id);
-        todosByMission.set(mission.id, todos);
-      }
-    } catch {
-      // TodoManager 不可用时，使用空映射
-    }
-
-    for (const mission of missions) {
-      const todos = todosByMission.get(mission.id) || [];
-      taskViews.push(missionToTaskView(mission, todos));
-    }
-
-    return taskViews;
+  getTaskViewService(): TaskViewService {
+    return this.taskViewService;
   }
 
-  /**
-   * 创建任务（Mission）
-   * 替代 UnifiedTaskManager.createTask()
-   */
-  async createTaskFromPrompt(sessionId: string, prompt: string): Promise<import('../../task/task-view-adapter').TaskView> {
-    const { missionToTaskView } = await import('../../task/task-view-adapter');
-
-    const mission = await this.missionStorage.createMission({
-      sessionId,
-      userPrompt: prompt,
-      context: '',
-    });
-
-    return missionToTaskView(mission, []);
-  }
-
-  /**
-   * 取消任务
-   * 替代 UnifiedTaskManager.cancelTask()
-   */
-  async cancelTaskById(taskId: string): Promise<void> {
-    const mission = await this.missionStorage.load(taskId);
-    if (mission) {
-      mission.status = 'cancelled';
-      mission.updatedAt = Date.now();
-      await this.missionStorage.update(mission);
-    }
-  }
-
-  /**
-   * 删除任务
-   * 替代 UnifiedTaskManager.deleteTask()
-   */
-  async deleteTaskById(taskId: string): Promise<void> {
-    await this.missionStorage.delete(taskId);
-  }
-
-  /**
-   * 标记任务失败
-   * 替代 UnifiedTaskManager.failTask()
-   */
-  async failTaskById(taskId: string, _error: string): Promise<void> {
-    const mission = await this.missionStorage.load(taskId);
-    if (mission) {
-      mission.status = 'failed';
-      mission.updatedAt = Date.now();
-      await this.missionStorage.update(mission);
-    }
-    globalEventBus.emitEvent('task:failed', { data: { taskId, error: _error } });
-  }
-
-  /**
-   * 标记任务完成
-   * 替代 UnifiedTaskManager.completeTask()
-   */
-  async completeTaskById(taskId: string): Promise<void> {
-    const mission = await this.missionStorage.load(taskId);
-    if (mission) {
-      mission.status = 'completed';
-      mission.completedAt = Date.now();
-      mission.updatedAt = Date.now();
-      await this.missionStorage.update(mission);
-    }
-    globalEventBus.emitEvent('task:completed', { data: { taskId } });
-  }
-
-  /**
-   * 标记任务为执行中（仅修改状态，不触发执行链路）
-   * 用于外部已自行管理执行流程的场景（如 Direct Worker 模式）
-   */
-  async markTaskExecuting(taskId: string): Promise<void> {
-    const mission = await this.missionStorage.load(taskId);
-    if (mission) {
-      mission.status = 'executing';
-      mission.startedAt = Date.now();
-      mission.updatedAt = Date.now();
-      await this.missionStorage.update(mission);
-    }
-  }
+  // 委托方法 — 保持公共 API 兼容，调用方逐步迁移到 TaskViewService
+  async listTaskViews(sessionId: string) { return this.taskViewService.listTaskViews(sessionId); }
+  async createTaskFromPrompt(sessionId: string, prompt: string) { return this.taskViewService.createTaskFromPrompt(sessionId, prompt); }
+  async cancelTaskById(taskId: string) { return this.taskViewService.cancelTaskById(taskId); }
+  async deleteTaskById(taskId: string) { return this.taskViewService.deleteTaskById(taskId); }
+  async failTaskById(taskId: string, error: string) { return this.taskViewService.failTaskById(taskId, error); }
+  async completeTaskById(taskId: string) { return this.taskViewService.completeTaskById(taskId); }
+  async markTaskExecuting(taskId: string) { return this.taskViewService.markTaskExecuting(taskId); }
 
   /**
    * 启动任务：加载已有 draft mission 并触发统一执行链路
@@ -1694,6 +989,7 @@ export class MissionDrivenEngine extends EventEmitter {
    * 销毁引擎
    */
   dispose(): void {
+    this.dispatchManager.dispose();
     this.messageHub.dispose();
     this.missionOrchestrator.dispose();
     this.removeAllListeners();
@@ -1703,215 +999,6 @@ export class MissionDrivenEngine extends EventEmitter {
   // ============================================================================
   // 私有方法
   // ============================================================================
-
-  /**
-   * 将 Phase A 规划决策持久化到 SharedContextPool
-   *
-   * 让 Worker 在执行时能通过上下文组装器获取编排者的全局决策，
-   * 包括：任务目标、参与者分工、契约约束、风险评估。
-   */
-  private persistPhaseADecisions(
-    mission: Mission,
-    participants: WorkerSlot[],
-    categories: string[]
-  ): void {
-    try {
-      const pool = this.contextManager.getSharedContextPool();
-
-      // 1. 任务目标与分析决策
-      const goalContent = [
-        `目标: ${mission.goal}`,
-        `分析: ${mission.analysis}`,
-        `风险等级: ${mission.riskLevel}`,
-        mission.riskFactors?.length ? `风险因素: ${mission.riskFactors.join('; ')}` : '',
-        `参与者: ${participants.join(', ')}`,
-        `任务分类: ${categories.join(', ')}`,
-      ].filter(Boolean).join('\n');
-
-      pool.add(createSharedContextEntry({
-        missionId: mission.id,
-        source: 'orchestrator',
-        type: 'decision',
-        content: goalContent,
-        tags: ['phase-a', 'goal', 'analysis'],
-        importance: 'high',
-      }));
-
-      // 2. 职责分配决策
-      if (mission.assignments.length > 0) {
-        const assignmentContent = mission.assignments.map(a =>
-          `${a.workerId}: ${a.shortTitle || a.responsibility}`
-        ).join('\n');
-
-        pool.add(createSharedContextEntry({
-          missionId: mission.id,
-          source: 'orchestrator',
-          type: 'decision',
-          content: `职责分配:\n${assignmentContent}`,
-          tags: ['phase-a', 'assignment'],
-          importance: 'high',
-        }));
-      }
-
-      // 3. 契约约束
-      if (mission.contracts.length > 0) {
-        const contractContent = mission.contracts.map(c =>
-          `[${c.type}] ${c.description}`
-        ).join('\n');
-
-        pool.add(createSharedContextEntry({
-          missionId: mission.id,
-          source: 'orchestrator',
-          type: 'contract',
-          content: contractContent,
-          tags: ['phase-a', 'contract'],
-          importance: 'critical',
-        }));
-      }
-
-      logger.info('Phase A 决策已持久化到 SharedContextPool', {
-        missionId: mission.id,
-        participants,
-      }, LogCategory.ORCHESTRATOR);
-    } catch (error) {
-      // 持久化失败不阻断执行
-      logger.warn('Phase A 决策持久化失败', {
-        missionId: mission.id,
-        error: error instanceof Error ? error.message : String(error),
-      }, LogCategory.ORCHESTRATOR);
-    }
-  }
-
-  private async configureContextCompression(): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../../llm/config');
-      const { createLLMClient } = await import('../../llm/clients/client-factory');
-      const compressorConfig = LLMConfigLoader.loadCompressorConfig();
-      const orchestratorConfig = LLMConfigLoader.loadOrchestratorConfig();
-
-      const compressorReady = compressorConfig.enabled
-        && Boolean(compressorConfig.baseUrl && compressorConfig.model)
-        && LLMConfigLoader.validateConfig(compressorConfig, 'compressor');
-
-      if (!compressorReady) {
-        logger.warn('编排器.上下文.压缩模型.不可用_切换编排模型', {
-          enabled: compressorConfig.enabled,
-          hasBaseUrl: Boolean(compressorConfig.baseUrl),
-          hasModel: Boolean(compressorConfig.model),
-        }, LogCategory.ORCHESTRATOR);
-      }
-
-      const retryDelays = [10000, 20000, 30000];
-      const recordCompression = (
-        success: boolean,
-        duration: number,
-        usage?: { inputTokens?: number; outputTokens?: number },
-        error?: string
-      ) => {
-        this.executionStats.recordExecution({
-          worker: 'compressor',
-          taskId: 'memory',
-          subTaskId: 'compress',
-          success,
-          duration,
-          error,
-          inputTokens: usage?.inputTokens,
-          outputTokens: usage?.outputTokens,
-          phase: 'integration',
-        });
-      };
-
-      const sendWithClient = async (client: any, label: string, payload: string): Promise<string> => {
-        const startAt = Date.now();
-        try {
-          const response = await client.sendMessage({
-            messages: [{ role: 'user', content: payload }],
-            maxTokens: 2000,
-            temperature: 0.3,
-          });
-          const duration = Date.now() - startAt;
-          recordCompression(true, duration, {
-            inputTokens: response.usage?.inputTokens,
-            outputTokens: response.usage?.outputTokens,
-          });
-          return response.content || '';
-        } catch (error: any) {
-          const duration = Date.now() - startAt;
-          recordCompression(false, duration, undefined, error?.message);
-          logger.warn('编排器.上下文.压缩模型.调用失败', {
-            model: label,
-            error: this.normalizeErrorMessage(error),
-          }, LogCategory.ORCHESTRATOR);
-          throw error;
-        }
-      };
-
-      const sendWithRetry = async (client: any, label: string, payload: string): Promise<string> => {
-        for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
-          try {
-            return await sendWithClient(client, label, payload);
-          } catch (error: any) {
-            if (this.isAuthOrQuotaError(error)) {
-              throw error;
-            }
-            if (!this.isConnectionError(error) || attempt === retryDelays.length) {
-              throw error;
-            }
-            const delay = retryDelays[attempt];
-            logger.warn('编排器.上下文.压缩模型.连接失败_重试', {
-              attempt: attempt + 1,
-              delayMs: delay,
-              error: this.normalizeErrorMessage(error),
-              model: label,
-            }, LogCategory.ORCHESTRATOR);
-            await this.sleep(delay);
-          }
-        }
-        throw new Error('Compression retry failed.');
-      };
-
-      const adapter = {
-        sendMessage: async (message: string) => {
-          try {
-            if (!compressorReady) {
-              throw new Error('compressor_unavailable');
-            }
-            const client = createLLMClient(compressorConfig);
-            return await sendWithRetry(client, 'compressor', message);
-          } catch (error: any) {
-            const shouldSwitchToOrchestrator = !compressorReady
-              || this.isAuthOrQuotaError(error)
-              || this.isConnectionError(error)
-              || this.isModelError(error)
-              || this.isConfigError(error);
-            if (!shouldSwitchToOrchestrator) {
-              throw error;
-            }
-            logger.warn('编排器.上下文.压缩模型.切换_使用编排模型', {
-              reason: !compressorReady ? 'not_available'
-                : this.isAuthOrQuotaError(error) ? 'auth_or_quota'
-                : this.isConnectionError(error) ? 'connection'
-                : this.isModelError(error) ? 'model'
-                : 'config',
-              error: this.normalizeErrorMessage(error),
-            }, LogCategory.ORCHESTRATOR);
-            const orchestratorClient = createLLMClient(orchestratorConfig);
-            return await sendWithRetry(orchestratorClient, 'orchestrator', message);
-          }
-        },
-      };
-
-      this.contextManager.setCompressorAdapter(adapter);
-      const activeConfig = compressorReady ? compressorConfig : orchestratorConfig;
-      logger.info('编排器.上下文.压缩模型.已设置', {
-        model: activeConfig.model,
-        provider: activeConfig.provider,
-        useOrchestratorModel: !compressorReady,
-      }, LogCategory.ORCHESTRATOR);
-    } catch (error) {
-      logger.error('编排器.上下文.压缩模型.设置失败', error, LogCategory.ORCHESTRATOR);
-    }
-  }
 
   private async ensureContextReady(sessionId: string): Promise<void> {
     if (!sessionId) {
@@ -1928,94 +1015,4 @@ export class MissionDrivenEngine extends EventEmitter {
     }
   }
 
-  /**
-   * 格式化总结
-  /**
-   * 格式化总结
-   */
-  private formatSummary(
-    summary: import('./mission-orchestrator').MissionSummary,
-    passed: boolean,
-    errors: string[] = []
-  ): string {
-    const totalTodos = summary.completedTodos + summary.failedTodos + summary.skippedTodos;
-
-    // 使用自然语言格式的总结
-    let output = `任务已完成。\n\n`;
-    output += `目标：${summary.goal}\n\n`;
-
-    if (passed) {
-      output += `完成了 ${summary.completedTodos} 个子任务（共 ${totalTodos} 个）`;
-    } else {
-      output += `执行了 ${summary.completedTodos}/${totalTodos} 个子任务，部分需要检查`;
-    }
-    output += `\n\n`;
-
-    if (summary.modifiedFiles.length > 0) {
-      output += `涉及的文件：\n`;
-      summary.modifiedFiles.forEach((file) => {
-        output += `- ${file}\n`;
-      });
-    }
-
-    if (!passed && errors.length > 0) {
-      output += `\n需要关注的问题：\n`;
-      errors.forEach((err) => {
-        output += `- ${err}\n`;
-      });
-    }
-
-    return output;
-  }
-
-  private isAuthOrQuotaError(error: any): boolean {
-    const status = error?.status || error?.response?.status;
-    if (status === 401 || status === 403 || status === 429) return true;
-    const message = this.normalizeErrorMessage(error).toLowerCase();
-    return /unauthorized|forbidden|invalid api key|api key|auth|permission|quota|insufficient|billing|payment|exceeded|rate limit|limit|blocked|suspended|disabled|account/i.test(message);
-  }
-
-  private isConnectionError(error: any): boolean {
-    const status = error?.status || error?.response?.status;
-    if (status === 408 || status === 502 || status === 503 || status === 504) return true;
-    const code = typeof error?.code === 'string' ? error.code : '';
-    if (['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'].includes(code)) {
-      return true;
-    }
-    const message = this.normalizeErrorMessage(error).toLowerCase();
-    return /timeout|timed out|network|connection|fetch failed|socket hang up|tls|certificate|econnreset|econnrefused|enotfound|eai_again/.test(message);
-  }
-
-  private isModelError(error: any): boolean {
-    const message = this.normalizeErrorMessage(error).toLowerCase();
-    return /model|not found|unknown model|invalid model|unsupported model|no such model/.test(message);
-  }
-
-  private isConfigError(error: any): boolean {
-    const message = this.normalizeErrorMessage(error).toLowerCase();
-    return /disabled in config|invalid configuration|missing|not configured|config/.test(message);
-  }
-
-  private normalizeErrorMessage(error: any): string {
-    if (!error) return 'Unknown error';
-    if (typeof error === 'string') return error;
-    if (error instanceof Error && error.message) return error.message;
-    if (error?.message) return String(error.message);
-    return String(error);
-  }
-
-  private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  /**
-   * 任务完成后清理 Worker 适配器历史
-   * 以控制 token 消耗，避免历史无限增长
-   */
-  private clearWorkerHistoriesAfterMission(): void {
-    if (this.adapterFactory.clearAllAdapterHistories) {
-      this.adapterFactory.clearAllAdapterHistories();
-      logger.debug('引擎.历史清理.完成', undefined, LogCategory.ORCHESTRATOR);
-    }
-  }
 }

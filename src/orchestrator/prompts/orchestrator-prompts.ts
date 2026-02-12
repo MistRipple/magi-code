@@ -131,6 +131,7 @@ ${toolsListSection}
 - 示例格式："在 src/utils/validator.ts 中，给 validateEmail 函数添加对空字符串的处理。当输入为空字符串时返回 false。"
 - 禁止给出模糊任务如"优化代码"、"改进性能"——必须指明具体要改什么
 - files 参数帮助 Worker 定位关键文件，尽量提供
+- **Worker 行为差异**：Codex 是执行者而非探索者——分配给 Codex 时，必须提供 files 参数和精确的修改指令，不要给 Codex 分配需要大范围探索的任务；Claude 适合处理需要深度分析和探索的任务
 - Worker 执行是异步的，执行完成后结果会自动返回
 - 多个独立的 dispatch_task 可以依次发起，Worker 会并行执行`);
 
