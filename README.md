@@ -163,20 +163,18 @@ Magi 的诞生离不开开源社区和早期支持者的帮助。
   <table>
     <tr>
       <td align="center">
-        <a href="https://github.com/andyhome163">
-          <img src="https://github.com/andyhome163.png" width="80" height="80" alt="andyhome163" style="border-radius: 50%">
-        </a>
-        <br/>
-        <b>赞助者: andyhome163</b>
-        <br/>
-        (Augment 悟空版作者)
-      </td>
-      <td align="center">
         <a href="https://github.com/Poonwai">
           <img src="https://github.com/Poonwai.png" width="80" height="80" alt="Poonwai" style="border-radius: 50%">
         </a>
         <br/>
         <b>赞助者: Poonwai</b>
+      </td>
+      <td align="center">
+        <a href="https://github.com/agassiz">
+          <img src="https://github.com/agassiz.png" width="80" height="80" alt="agassiz" style="border-radius: 50%">
+        </a>
+        <br/>
+        <b>赞助者: agassiz</b>
       </td>
     </tr>
   </table>
