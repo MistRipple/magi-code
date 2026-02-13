@@ -56,6 +56,8 @@ const MAX_SYMBOLS = 12;
 export class LspEnforcer {
   private lspExecutor: LspExecutor;
   private workspaceRoot: string;
+  /** applyIfNeeded 中 runPreflight 产生的 diagnostics 缓存，供 captureDiagnostics 直接复用 */
+  private cachedPreflightDiagnostics: string[] | null = null;
 
   constructor(workspaceRoot: string) {
     this.workspaceRoot = workspaceRoot;
@@ -63,6 +65,9 @@ export class LspEnforcer {
   }
 
   async applyIfNeeded(assignment: Assignment): Promise<boolean> {
+    // 每次调用前清除上一轮缓存
+    this.cachedPreflightDiagnostics = null;
+
     if (this.hasLspInjected(assignment)) {
       return false;
     }
@@ -84,6 +89,9 @@ export class LspEnforcer {
       return false;
     }
 
+    // 缓存 runPreflight 中已查询到的 diagnostics，供后续 captureDiagnostics 复用
+    this.cachedPreflightDiagnostics = summary.diagnostics;
+
     assignment.guidancePrompt = this.injectGuidance(assignment.guidancePrompt, summary);
     logger.info('LSP 预检已注入', {
       assignmentId: assignment.id,
@@ -95,8 +103,15 @@ export class LspEnforcer {
 
   /**
    * 获取目标文件的当前诊断快照（供 postCheck 对比用）
+   * 优先复用 applyIfNeeded → runPreflight 中已缓存的结果，避免重复 LSP 查询
    */
   async captureDiagnostics(assignment: Assignment): Promise<string[]> {
+    if (this.cachedPreflightDiagnostics !== null) {
+      const cached = this.cachedPreflightDiagnostics;
+      this.cachedPreflightDiagnostics = null; // 一次性消费
+      return cached;
+    }
+
     const targetFiles = this.collectTargetFiles(assignment);
     const supportedTargets = targetFiles.filter((file) => this.isSupportedFile(file)).slice(0, MAX_FILES);
     const diagnostics: string[] = [];

@@ -22,11 +22,14 @@ import type { Assignment } from '../mission';
 import type { WorkerReport, OrchestratorResponse } from '../protocols/worker-report';
 import { createAdjustResponse } from '../protocols/worker-report';
 import { DispatchBatch, CancellationError, type DispatchEntry, type DispatchResult, type DispatchStatus } from './dispatch-batch';
+import type { WorkerCompletionResult } from '../../tools/orchestration-executor';
 import { LLMConfigLoader } from '../../llm/config';
 import { buildDispatchSummaryPrompt } from '../prompts/orchestrator-prompts';
+import { MessageType } from '../../protocol/message-protocol';
 import { PlanningExecutor } from './executors/planning-executor';
 import { WorkerPipeline } from './worker-pipeline';
 import type { SnapshotManager } from '../../snapshot-manager';
+import type { SupplementaryInstructionQueue } from './supplementary-instruction-queue';
 
 /**
  * DispatchManager 依赖接口
@@ -50,6 +53,8 @@ export interface DispatchManagerDeps {
   // Token 统计
   recordOrchestratorTokens: (usage?: TokenUsage, phase?: 'planning' | 'verification') => void;
   recordWorkerTokenUsage: (results: Map<string, import('../worker').AutonomousExecutionResult>) => void;
+  // 补充指令队列（反应式编排：运行时注入 Worker 指令）
+  getSupplementaryQueue: () => SupplementaryInstructionQueue | null;
 }
 
 /**
@@ -63,6 +68,12 @@ export class DispatchManager {
   private pipeline = new WorkerPipeline();
   private activeBatch: DispatchBatch | null = null;
   private _planningExecutor: PlanningExecutor | null = null;
+
+  // 反应式编排：Worker 完成结果队列 + 等待唤醒机制
+  private completionQueue: WorkerCompletionResult[] = [];
+  private completionResolvers: Array<() => void> = [];
+  /** 标记编排者是否调用了 wait_for_workers（决定是否跳过自动 Phase C） */
+  private reactiveMode = false;
 
   constructor(private deps: DispatchManagerDeps) {
     this.setupMissionEventListeners();
@@ -173,6 +184,10 @@ export class DispatchManager {
           this.activeBatch = new DispatchBatch(missionId);
           this.activeBatch.userPrompt = this.deps.getActiveUserPrompt();
           this.setupBatchEventHandlers(this.activeBatch);
+          // 新 Batch 重置反应式编排状态
+          this.reactiveMode = false;
+          this.completionQueue = [];
+          this.completionResolvers = [];
         }
 
         // 注册到 DispatchBatch
@@ -225,6 +240,14 @@ export class DispatchManager {
 
         this.deps.messageHub.workerInstruction(worker, message);
         return { delivered: true };
+      },
+
+      waitForWorkers: async (params) => {
+        logger.info('编排工具.wait_for_workers.开始', {
+          taskIds: params.task_ids || 'all',
+        }, LogCategory.ORCHESTRATOR);
+
+        return this.waitForWorkers(params.task_ids);
       },
     });
 
@@ -324,6 +347,11 @@ export class DispatchManager {
         onReport: (report) => this.handleDispatchWorkerReport(report, batch),
         cancellationToken: batch?.cancellationToken,
         imagePaths: this.deps.getActiveImagePaths(),
+        // 反应式编排：补充指令回调（Worker 决策点消费队列中的用户追加指令）
+        getSupplementaryInstructions: () => {
+          const queue = this.deps.getSupplementaryQueue();
+          return queue ? queue.consume(worker) : [];
+        },
         // 治理开关（auto 模式：有 files 时自动启用）
         enableSnapshot: hasFiles && snapshotManager != null,
         enableLSP: hasFiles,
@@ -435,14 +463,28 @@ export class DispatchManager {
     batch.on('task:statusChanged', (_taskId: string, status: DispatchStatus) => {
       if (status === 'completed' || status === 'failed' || status === 'skipped' || status === 'cancelled') {
         setImmediate(() => this.dispatchReadyTasksWithIsolation(batch));
+
+        // 反应式编排：将完成结果推入队列，唤醒 waitForWorkers
+        const entry = batch.getEntry(_taskId);
+        if (entry) {
+          this.pushCompletionResult(entry);
+        }
       }
     });
 
-    // 全部完成 → Phase C 汇总
+    // 全部完成 → 根据编排模式决定后续行为
     batch.on('batch:allCompleted', (batchId: string, entries: DispatchEntry[]) => {
       const summary = batch.getSummary();
-      logger.info('DispatchBatch.全部完成', { batchId, ...summary }, LogCategory.ORCHESTRATOR);
-      void this.triggerPhaseCSummary(batch, entries);
+      logger.info('DispatchBatch.全部完成', { batchId, ...summary, reactiveMode: this.reactiveMode }, LogCategory.ORCHESTRATOR);
+
+      if (this.reactiveMode) {
+        // 反应式模式：编排者通过 wait_for_workers 接收结果并自行汇总
+        // 直接归档，不触发 Phase C
+        batch.archive();
+      } else {
+        // 传统模式：自动触发 Phase C 汇总
+        void this.triggerPhaseCSummary(batch, entries);
+      }
     });
 
     // Batch 被取消 → 不触发 Phase C，直接通知用户
@@ -507,7 +549,7 @@ export class DispatchManager {
         logger.error('Phase C 汇总 LLM 失败', { error: response.error }, LogCategory.ORCHESTRATOR);
         this.phaseCFallback(entries);
       } else {
-        this.deps.messageHub.result(response.content || '');
+        this.deps.messageHub.orchestratorMessage(response.content || '', { type: MessageType.RESULT });
       }
     } catch (error: any) {
       logger.error('Phase C 汇总异常', { error: error.message }, LogCategory.ORCHESTRATOR);
@@ -526,7 +568,7 @@ export class DispatchManager {
       return `${status} **[${e.worker}]** ${e.result?.summary || '无输出'}`;
     });
     this.deps.messageHub.notify('汇总模型调用失败，以下为各 Worker 原始执行结果', 'warning');
-    this.deps.messageHub.result(lines.join('\n'));
+    this.deps.messageHub.orchestratorMessage(lines.join('\n'), { type: MessageType.RESULT });
   }
 
   /**
@@ -617,8 +659,120 @@ ${this.deps.getActiveUserPrompt()}
     return defaultResponse;
   }
 
+  // ===========================================================================
+  // 反应式编排：完成结果队列 + waitForWorkers 阻塞机制
+  // ===========================================================================
+
+  /**
+   * 将 Worker 完成结果推入队列，唤醒所有等待中的 waitForWorkers
+   */
+  private pushCompletionResult(entry: DispatchEntry): void {
+    const result: WorkerCompletionResult = {
+      task_id: entry.taskId,
+      worker: entry.worker,
+      status: entry.status as WorkerCompletionResult['status'],
+      summary: entry.result?.summary || '',
+      modified_files: entry.result?.modifiedFiles || [],
+      errors: entry.result?.errors,
+    };
+
+    this.completionQueue.push(result);
+
+    // 唤醒所有等待中的 resolver
+    const resolvers = this.completionResolvers.splice(0);
+    for (const resolve of resolvers) {
+      resolve();
+    }
+  }
+
+  /**
+   * 等待 Worker 完成（阻塞直到指定任务或全部任务完成）
+   *
+   * 反应式编排的核心阻塞点：编排者 LLM 在工具循环中调用此方法，
+   * 挂起直到 Worker 完成结果到达，然后基于结果决策下一步。
+   */
+  async waitForWorkers(taskIds?: string[]): Promise<{ results: WorkerCompletionResult[] }> {
+    this.reactiveMode = true;
+
+    const batch = this.activeBatch;
+    if (!batch) {
+      return { results: [] };
+    }
+
+    // 确定等待目标
+    const targetIds = taskIds && taskIds.length > 0
+      ? new Set(taskIds)
+      : null; // null 表示等待全部
+
+    // 轮询检查：目标任务是否都已完成
+    const isTargetSatisfied = (): boolean => {
+      if (!targetIds) {
+        // 等待全部：检查 batch 内是否还有 pending/running 任务
+        return batch.isAllCompleted();
+      }
+      // 等待指定任务：检查这些任务是否都已出现在 completionQueue 中
+      const completedIds = new Set(this.completionQueue.map(r => r.task_id));
+      return Array.from(targetIds).every(id => completedIds.has(id));
+    };
+
+    // 如果已满足，直接返回
+    if (isTargetSatisfied()) {
+      return { results: this.drainCompletionResults(targetIds) };
+    }
+
+    // 等待唤醒
+    const WAIT_TIMEOUT = 10 * 60 * 1000; // 10 分钟总超时
+    const startTime = Date.now();
+
+    while (!isTargetSatisfied()) {
+      if (Date.now() - startTime > WAIT_TIMEOUT) {
+        logger.warn('waitForWorkers.超时', {
+          elapsed: Date.now() - startTime,
+          targetIds: targetIds ? Array.from(targetIds) : 'all',
+        }, LogCategory.ORCHESTRATOR);
+        break;
+      }
+
+      // 注册 resolver 并等待唤醒
+      await new Promise<void>(resolve => {
+        this.completionResolvers.push(resolve);
+        // 安全超时：防止 resolver 永远不被触发
+        setTimeout(resolve, 30_000);
+      });
+    }
+
+    return { results: this.drainCompletionResults(targetIds) };
+  }
+
+  /**
+   * 从完成队列中提取匹配的结果
+   */
+  private drainCompletionResults(targetIds: Set<string> | null): WorkerCompletionResult[] {
+    if (!targetIds) {
+      // 全部提取
+      const results = this.completionQueue.splice(0);
+      return results;
+    }
+
+    // 提取指定 taskId 的结果，保留其余
+    const matched: WorkerCompletionResult[] = [];
+    const remaining: WorkerCompletionResult[] = [];
+    for (const result of this.completionQueue) {
+      if (targetIds.has(result.task_id)) {
+        matched.push(result);
+      } else {
+        remaining.push(result);
+      }
+    }
+    this.completionQueue = remaining;
+    return matched;
+  }
+
   dispose(): void {
     this.activeBatch = null;
     this._planningExecutor = null;
+    this.completionQueue = [];
+    this.completionResolvers = [];
+    this.reactiveMode = false;
   }
 }

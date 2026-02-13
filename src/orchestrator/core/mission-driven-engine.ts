@@ -215,6 +215,7 @@ export class MissionDrivenEngine extends EventEmitter {
       getSnapshotManager: () => this.snapshotManager ?? null,
       getContextManager: () => this.contextManager ?? null,
       getTodoManager: () => this.missionOrchestrator.getTodoManager() ?? null,
+      getSupplementaryQueue: () => this.supplementaryQueue,
     });
   }
 

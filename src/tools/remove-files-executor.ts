@@ -2,7 +2,7 @@
  * 文件删除执行器
  * 提供安全的文件删除功能
  *
- * 工具: remove_files
+ * 工具: file_remove
  */
 
 import * as fs from 'fs/promises';
@@ -37,7 +37,7 @@ export class RemoveFilesExecutor implements ToolExecutor {
    */
   getToolDefinition(): ExtendedToolDefinition {
     return {
-      name: 'remove_files',
+      name: 'file_remove',
       description: `Delete files from workspace safely.
 
 * Supports batch deletion
@@ -78,7 +78,7 @@ IMPORTANT:
    * 检查工具是否可用
    */
   async isAvailable(toolName: string): Promise<boolean> {
-    return toolName === 'remove_files';
+    return toolName === 'file_remove';
   }
 
   /**

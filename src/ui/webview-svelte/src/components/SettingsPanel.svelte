@@ -162,8 +162,10 @@
   let profileSaveStatus = $state<'idle' | 'saving' | 'saved' | 'error'>('idle');
   let profileResetStatus = $state<'idle' | 'saving' | 'saved' | 'error'>('idle');
 
-  // Skill 安装状态
+  // Skill 安装/更新状态
   let installingSkills = $state<Set<string>>(new Set());
+  let updatingSkills = $state<Set<string>>(new Set());
+  let updatingAllSkills = $state(false);
 
   // 模型配置表单
   let orchConfig = $state({ baseUrl: '', apiKey: '', model: '', provider: 'anthropic', thinking: false, reasoningEffort: 'medium' });
@@ -840,6 +842,20 @@
     }
   }
 
+  // 更新单个 Skill
+  function updateSkill(skillName: string) {
+    updatingSkills.add(skillName);
+    updatingSkills = new Set(updatingSkills);
+    vscode.postMessage({ type: 'updateSkill', skillName });
+  }
+
+  // 更新所有 Skill
+  function updateAllSkills() {
+    if (skills.length === 0) return;
+    updatingAllSkills = true;
+    vscode.postMessage({ type: 'updateAllSkills' });
+  }
+
   // Skill 搜索过滤
   let filteredLibrarySkills = $derived(
     librarySkills.filter(skill => {
@@ -1268,6 +1284,19 @@
       }
       // Instruction Skill 删除成功
       else if (dataType === 'instructionSkillRemoved') {
+        vscode.postMessage({ type: 'loadSkillsConfig' });
+      }
+      // Skill 更新成功
+      else if (dataType === 'skillUpdated') {
+        if (payload?.skillName) {
+          updatingSkills.delete(payload.skillName);
+          updatingSkills = new Set(updatingSkills);
+        }
+        vscode.postMessage({ type: 'loadSkillsConfig' });
+      }
+      // 所有 Skill 更新完成
+      else if (dataType === 'allSkillsUpdated') {
+        updatingAllSkills = false;
         vscode.postMessage({ type: 'loadSkillsConfig' });
       }
     });
@@ -2053,6 +2082,12 @@
                 <Icon name="plus" size={14} />
                 <span>安装 Skill</span>
               </button>
+              {#if skills.length > 0}
+                <button class="settings-btn secondary" onclick={() => updateAllSkills()} disabled={updatingAllSkills}>
+                  <Icon name="refresh" size={14} />
+                  <span>{updatingAllSkills ? '更新中...' : '全部更新'}</span>
+                </button>
+              {/if}
               <button class="settings-btn secondary" onclick={() => openRepoDialog()}>
                 <Icon name="grid" size={14} />
                 <span>管理技能仓库</span>
@@ -2078,6 +2113,18 @@
                     <span class="skill-source-badge" class:custom={skill.source === 'custom'} class:instruction={skill.source === 'instruction'}>
                       {skill.source === 'custom' ? '自定义' : 'Instruction'}
                     </span>
+                    <button
+                      class="btn-icon btn-icon--sm"
+                      title="更新"
+                      disabled={updatingSkills.has(skill.name) || updatingAllSkills}
+                      onclick={() => updateSkill(skill.name)}
+                    >
+                      {#if updatingSkills.has(skill.name)}
+                        <Icon name="refresh" size={14} />
+                      {:else}
+                        <Icon name="refresh" size={14} />
+                      {/if}
+                    </button>
                     <button class="btn-icon btn-icon--sm btn-icon--danger" title="删除" onclick={() => deleteSkill(skill)}>
                       <Icon name="trash" size={14} />
                     </button>
@@ -3216,6 +3263,22 @@
     background: var(--error-muted);
     border-color: var(--error);
     color: var(--error);
+  }
+
+  /* Skill 更新按钮 */
+  .skill-actions .btn-icon:not(.btn-icon--danger) {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--foreground-muted);
+  }
+  .skill-actions .btn-icon:not(.btn-icon--danger):hover:not(:disabled) {
+    background: var(--primary-muted);
+    border-color: var(--primary);
+    color: var(--primary);
+  }
+  .skill-actions .btn-icon:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   /* 内置工具列表 */

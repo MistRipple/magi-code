@@ -68,9 +68,12 @@
       'write-process': 'terminal',
       'kill-process': 'terminal',
       'list-processes': 'terminal',
-      'text_editor': 'file-edit',
+      'file_view': 'eye',
+      'file_create': 'file-plus',
+      'file_edit': 'pencil',
+      'file_insert': 'plus',
       'grep_search': 'search',
-      'remove_files': 'file-minus',
+      'file_remove': 'trash',
       'web_search': 'search',
       'web_fetch': 'globe',
       'mermaid_diagram': 'git-branch',
@@ -134,21 +137,19 @@
   function getToolDisplayName(toolName: string, toolInput?: unknown): string {
     if (!toolName || typeof toolName !== 'string') return 'tool';
 
-    // text_editor 根据子命令动态显示
-    if (toolName === 'text_editor' && toolInput && typeof toolInput === 'object') {
-      const cmd = (toolInput as Record<string, unknown>).command;
-      if (typeof cmd === 'string') return cmd;
-    }
-
+    // 文件操作工具直接使用语义化显示名
     const displayNameMap: Record<string, string> = {
       'launch-process': 'execute',
       'read-process': 'read process',
       'write-process': 'write process',
       'kill-process': 'kill process',
       'list-processes': 'list processes',
-      'text_editor': 'edit',
+      'file_view': 'view',
+      'file_create': 'create',
+      'file_edit': 'edit',
+      'file_insert': 'insert',
       'grep_search': 'search',
-      'remove_files': 'remove',
+      'file_remove': 'remove',
       'web_search': 'web search',
       'web_fetch': 'web fetch',
       'mermaid_diagram': 'diagram',
@@ -167,7 +168,10 @@
     switch (toolName) {
       case 'execute_shell':
         return typeof args.command === 'string' ? args.command : '';
-      case 'text_editor': {
+      case 'file_view':
+      case 'file_create':
+      case 'file_edit':
+      case 'file_insert': {
         const p = typeof args.path === 'string' ? args.path : '';
         return p;
       }
@@ -178,7 +182,7 @@
       case 'edit_file':
       case 'delete_file':
         return typeof args.path === 'string' ? args.path : '';
-      case 'remove_files': {
+      case 'file_remove': {
         const paths = args.paths;
         if (Array.isArray(paths) && paths.length > 0) {
           return paths.length === 1 ? String(paths[0]) : `${paths[0]} 等 ${paths.length} 个文件`;

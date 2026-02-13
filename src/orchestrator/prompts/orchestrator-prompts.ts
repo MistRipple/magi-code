@@ -95,8 +95,8 @@ ${toolsListSection}
 **工具选择优先级**（当有多个工具可完成同一任务时，选择更专用的工具）：
 - 理解项目/分析代码 → codebase_retrieval（语义搜索），而非逐个读取文件
 - 搜索代码内容 → grep_search（精确匹配）或 codebase_retrieval（语义搜索），而非 launch-process grep/rg
-- 读取特定文件内容 → text_editor(view)，而非 launch-process cat
-- 浏览目录结构 → text_editor(view + 目录路径)，而非 launch-process ls/find
+- 读取特定文件内容 → file_view，而非 launch-process cat
+- 浏览目录结构 → file_view（目录路径），而非 launch-process ls/find
 - 搜索互联网 → web_search，而非 launch-process curl
 - 获取网页内容 → web_fetch，而非 launch-process curl/wget
 - launch-process 仅用于需要真正运行进程的场景：构建(npm build)、测试(npm test)、git 操作、启动服务等
@@ -105,11 +105,11 @@ ${toolsListSection}
 
 分析/理解项目时（禁止逐个读取所有文件）：
 1. codebase_retrieval — 语义搜索，快速找到相关代码区域
-2. text_editor(view) — 仅读取真正需要细看的关键文件
+2. file_view — 仅读取真正需要细看的关键文件
 
 简单文件修改（改名、typo、改配置等 1-3 个文件内的小改动）：
-1. text_editor(view) — 先查看要修改的文件
-2. text_editor(str_replace) — 精确修改
+1. file_view — 先查看要修改的文件
+2. file_edit — 精确修改
 
 **编排者直改规则**：你可以直接修改最多 3 个文件。超过 3 个文件的修改必须通过 dispatch_task 委派给 Worker。
 涉及代码逻辑的复杂修改（新功能、重构、多文件联动），即使不超过 3 个文件也应优先委派 Worker。
@@ -134,6 +134,48 @@ ${toolsListSection}
 - **Worker 行为差异**：Codex 是执行者而非探索者——分配给 Codex 时，必须提供 files 参数和精确的修改指令，不要给 Codex 分配需要大范围探索的任务；Claude 适合处理需要深度分析和探索的任务
 - Worker 执行是异步的，执行完成后结果会自动返回
 - 多个独立的 dispatch_task 可以依次发起，Worker 会并行执行`);
+
+  // 反应式编排模式（wait_for_workers）
+  sections.push(`## 反应式编排模式
+当任务需要多阶段协调时，使用 dispatch_task + wait_for_workers 组合实现反应式编排循环：
+
+**基本流程**：
+1. 使用 dispatch_task 分配一个或多个子任务
+2. 调用 wait_for_workers 阻塞等待结果
+3. 分析 Worker 返回的结果，决定下一步行动：
+   - 如果所有任务成功完成 → 向用户汇总结果
+   - 如果部分失败 → dispatch_task 追加修复任务，再次 wait_for_workers
+   - 如果发现新的需求 → dispatch_task 追加新任务
+
+**使用 wait_for_workers**：
+- 不传 task_ids → 等待当前批次中所有任务完成
+- 传 task_ids → 只等待指定任务完成（用于分阶段协调）
+- 返回结构化结果：{ results: [{ task_id, worker, status, summary, modified_files, errors }] }
+
+**示例**：
+\`\`\`
+// 阶段 1：并行分配两个独立任务
+dispatch_task({ worker: "claude", task: "实现用户认证模块...", files: [...] })  → task_id_1
+dispatch_task({ worker: "gemini", task: "实现数据库迁移...", files: [...] })   → task_id_2
+
+// 等待阶段 1 完成
+wait_for_workers()  → 获取两个任务的结果
+
+// 分析结果后追加阶段 2
+dispatch_task({ worker: "claude", task: "集成认证模块和数据库...", files: [...], depends_on: [] })
+
+// 等待阶段 2
+wait_for_workers()  → 最终结果，向用户汇总
+\`\`\`
+
+**何时使用反应式模式**：
+- 任务有多个阶段，后续阶段依赖前序结果
+- 需要根据 Worker 的实际产出动态调整后续计划
+- 复杂任务需要在中途检查进度并做出决策
+
+**何时不需要**：
+- 单个 dispatch_task 即可完成的简单任务
+- 多个完全独立的 dispatch_task，不需要根据结果做后续决策`);
 
   // 项目上下文
   if (projectContext) {

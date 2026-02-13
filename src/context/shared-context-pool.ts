@@ -450,6 +450,43 @@ export class SharedContextPool {
   }
 
   // --------------------------------------------------------------------------
+  // 序列化 / 反序列化（支持崩溃恢复时还原 L1 共享记忆）
+  // --------------------------------------------------------------------------
+
+  /**
+   * 将当前所有条目序列化为 JSON 可存储的数组
+   *
+   * 用于 Mission 生命周期管理器在进程崩溃前持久化 L1 记忆。
+   */
+  toSerializable(): SharedContextEntry[] {
+    return Array.from(this.entries.values());
+  }
+
+  /**
+   * 从序列化数据恢复条目（合并模式：不清空现有数据）
+   *
+   * 用于 Mission 恢复时重建 L1 共享记忆。
+   * 采用合并策略：已存在的 id 跳过，新 id 直接插入（跳过去重校验以保证速度）。
+   *
+   * @param entries - 序列化的条目数组
+   * @returns 恢复的条目数量
+   */
+  fromSerializable(entries: SharedContextEntry[]): number {
+    let restored = 0;
+    for (const entry of entries) {
+      if (!entry.id || this.entries.has(entry.id)) {
+        continue;
+      }
+      this.entries.set(entry.id, entry);
+      restored++;
+    }
+    if (restored > 0) {
+      logger.info('共享上下文.反序列化.完成', { restored, total: this.entries.size }, LogCategory.SESSION);
+    }
+    return restored;
+  }
+
+  // --------------------------------------------------------------------------
   // 私有方法
   // --------------------------------------------------------------------------
 

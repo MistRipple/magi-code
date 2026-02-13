@@ -1,9 +1,12 @@
 /**
  * 文件执行器
- * 提供文件查看、创建、编辑功能
+ * 提供文件查看、创建、编辑、插入功能，拆分为四个独立工具
  *
- * 工具: text_editor
- * 命令: view, create, str_replace, insert, undo_edit
+ * 工具:
+ * - file_view: 查看文件内容或目录结构
+ * - file_create: 创建或写入完整文件内容
+ * - file_edit: 精确文本替换 / 撤销
+ * - file_insert: 在指定行插入文本
  */
 
 import * as fs from 'fs/promises';
@@ -28,28 +31,36 @@ export class FileExecutor implements ToolExecutor {
 
   /**
    * 设置文件写入前回调
-   * 每次 create/str_replace/insert 写入文件前会调用此回调
+   * 每次 file_create/file_edit/file_insert 写入文件前会调用此回调
    */
   setBeforeWriteCallback(callback: (filePath: string) => void): void {
     this.onBeforeWrite = callback;
   }
 
   /**
-   * 获取工具定义
+   * 获取所有工具定义
    */
-  getToolDefinition(): ExtendedToolDefinition {
+  getToolDefinitions(): ExtendedToolDefinition[] {
+    return [
+      this.getFileViewDefinition(),
+      this.getFileCreateDefinition(),
+      this.getFileEditDefinition(),
+      this.getFileInsertDefinition(),
+    ];
+  }
+
+  /**
+   * file_view 工具定义
+   */
+  private getFileViewDefinition(): ExtendedToolDefinition {
     return {
-      name: 'text_editor',
-      description: `A versatile file tool for viewing, creating, and editing files.
+      name: 'file_view',
+      description: `View file content with line numbers, or list directory structure (up to 2 levels deep).
 
-Commands:
-* view - View file content with line numbers, or list directory structure (up to 2 levels deep). When path is a directory, returns a tree listing of its contents. Supports regex search within files.
-* create - Create a new file (cannot overwrite existing files)
-* str_replace - Replace text in file (old_str must match EXACTLY)
-* insert - Insert text at a specific line number
-* undo_edit - Undo the last edit to a file
+When path is a directory, returns a tree listing of its contents.
+When path is a file, returns the file content with line numbers.
 
-View command options:
+Options:
 * view_range: [start, end] - Show specific line range (1-based, inclusive)
 * search_query_regex: Search for patterns using regex
 * case_sensitive: Control case sensitivity for search (default: false)
@@ -57,65 +68,18 @@ View command options:
 When using regex search, only matching lines and their context are shown.
 Strongly prefer search_query_regex over view_range when looking for specific symbols.
 
-Notes for str_replace:
-* ALWAYS use view command to read the file before editing
-* old_str must match EXACTLY including whitespace
-* new_str can be empty to delete content
-* Use old_str_start_line and old_str_end_line to disambiguate multiple occurrences
-* Try to fit as many edits in one tool call as possible
-
-Notes for insert:
-* insert_line is 1-based line number
-* Text is inserted AFTER the specified line
-* Use insert_line: 0 to insert at the beginning
-
 IMPORTANT:
-* This is the primary tool for all file operations - reading, browsing, creating, and editing
-* Use view command on a directory path to explore project structure (e.g. path: "." or path: "src")
-* Use view command on a file path to read file contents
+* This is the primary tool for reading files and browsing directories
+* Use on a directory path to explore project structure (e.g. path: "." or path: "src")
+* Use on a file path to read file contents
 * DO NOT use launch-process with ls/find/cat to explore files - use this tool instead
-* DO NOT use sed/awk/shell commands for editing
-* DO NOT fall back to removing and recreating files
-* Use view command with search_query_regex before editing`,
+* Always use this tool to read a file before editing it`,
       input_schema: {
         type: 'object',
         properties: {
-          command: {
-            type: 'string',
-            enum: ['view', 'create', 'str_replace', 'insert', 'undo_edit'],
-            description: 'The editing command to execute'
-          },
           path: {
             type: 'string',
-            description: 'File path relative to workspace root (e.g. "src/index.ts"). Absolute paths and paths outside the workspace are rejected.'
-          },
-          file_text: {
-            type: 'string',
-            description: 'Content for create command'
-          },
-          old_str: {
-            type: 'string',
-            description: 'String to replace (for str_replace)'
-          },
-          new_str: {
-            type: 'string',
-            description: 'Replacement string (for str_replace)'
-          },
-          old_str_start_line: {
-            type: 'number',
-            description: 'Start line number of old_str to disambiguate (1-based, inclusive)'
-          },
-          old_str_end_line: {
-            type: 'number',
-            description: 'End line number of old_str to disambiguate (1-based, inclusive)'
-          },
-          insert_line: {
-            type: 'number',
-            description: 'Line number to insert at (for insert)'
-          },
-          insert_text: {
-            type: 'string',
-            description: 'Text to insert (for insert)'
+            description: 'File or directory path relative to workspace root'
           },
           view_range: {
             type: 'array',
@@ -124,7 +88,7 @@ IMPORTANT:
           },
           search_query_regex: {
             type: 'string',
-            description: 'Regex pattern to search within file (for view command)'
+            description: 'Regex pattern to search within file'
           },
           case_sensitive: {
             type: 'boolean',
@@ -135,7 +99,104 @@ IMPORTANT:
             description: 'Context lines around matches (default: 5)'
           }
         },
-        required: ['command', 'path']
+        required: ['path']
+      },
+      metadata: {
+        source: 'builtin',
+        category: 'file',
+        tags: ['file', 'view', 'read']
+      }
+    };
+  }
+
+  /**
+   * file_create 工具定义
+   */
+  private getFileCreateDefinition(): ExtendedToolDefinition {
+    return {
+      name: 'file_create',
+      description: `Create a new file or overwrite an existing file with complete content.
+
+* Creates parent directories automatically if they don't exist
+* If the file already exists, it will be overwritten (snapshot system preserves the original)
+
+IMPORTANT:
+* Use this tool to create new files or completely rewrite existing files
+* For partial modifications, use file_edit instead`,
+      input_schema: {
+        type: 'object',
+        properties: {
+          path: {
+            type: 'string',
+            description: 'File path relative to workspace root'
+          },
+          file_text: {
+            type: 'string',
+            description: 'Complete file content to write'
+          }
+        },
+        required: ['path', 'file_text']
+      },
+      metadata: {
+        source: 'builtin',
+        category: 'file',
+        tags: ['file', 'create', 'write']
+      }
+    };
+  }
+
+  /**
+   * file_edit 工具定义
+   */
+  private getFileEditDefinition(): ExtendedToolDefinition {
+    return {
+      name: 'file_edit',
+      description: `Edit a file by replacing text or undoing the last edit.
+
+Modes:
+1. Text replacement (old_str + new_str): Replace exact text in file
+2. Undo (undo: true): Revert the last edit to the file
+
+Notes for text replacement:
+* ALWAYS use file_view to read the file before editing
+* old_str must match EXACTLY including whitespace
+* new_str can be empty to delete content
+* Use old_str_start_line and old_str_end_line to disambiguate multiple occurrences
+* Try to fit as many edits in one tool call as possible
+
+IMPORTANT:
+* For creating new files or full rewrites, use file_create instead
+* DO NOT use sed/awk/shell commands for editing
+* DO NOT fall back to removing and recreating files`,
+      input_schema: {
+        type: 'object',
+        properties: {
+          path: {
+            type: 'string',
+            description: 'File path relative to workspace root'
+          },
+          old_str: {
+            type: 'string',
+            description: 'String to replace (for text replacement mode)'
+          },
+          new_str: {
+            type: 'string',
+            description: 'Replacement string (for text replacement mode)'
+          },
+          old_str_start_line: {
+            type: 'number',
+            description: 'Start line number of old_str to disambiguate (1-based, inclusive)'
+          },
+          old_str_end_line: {
+            type: 'number',
+            description: 'End line number of old_str to disambiguate (1-based, inclusive)'
+          },
+          undo: {
+            type: 'boolean',
+            description: 'Set to true to undo the last edit to this file'
+          }
+        },
+        required: ['path']
       },
       metadata: {
         source: 'builtin',
@@ -146,10 +207,41 @@ IMPORTANT:
   }
 
   /**
-   * 获取工具定义列表（多工具执行器接口）
+   * file_insert 工具定义
    */
-  getToolDefinitions(): ExtendedToolDefinition[] {
-    return [this.getToolDefinition()];
+  private getFileInsertDefinition(): ExtendedToolDefinition {
+    return {
+      name: 'file_insert',
+      description: `Insert text at a specific line number in a file.
+
+* insert_line is 1-based line number
+* Text is inserted AFTER the specified line
+* Use insert_line: 0 to insert at the beginning of the file
+* If the file does not exist, it will be created`,
+      input_schema: {
+        type: 'object',
+        properties: {
+          path: {
+            type: 'string',
+            description: 'File path relative to workspace root'
+          },
+          insert_line: {
+            type: 'number',
+            description: 'Line number to insert after (1-based, use 0 for beginning)'
+          },
+          new_str: {
+            type: 'string',
+            description: 'Text to insert'
+          }
+        },
+        required: ['path', 'insert_line', 'new_str']
+      },
+      metadata: {
+        source: 'builtin',
+        category: 'file',
+        tags: ['file', 'insert', 'development']
+      }
+    };
   }
 
   /**
@@ -163,22 +255,19 @@ IMPORTANT:
    * 检查工具是否可用
    */
   async isAvailable(toolName: string): Promise<boolean> {
-    return toolName === 'text_editor';
+    return toolName === 'file_view' || toolName === 'file_create' || toolName === 'file_edit' || toolName === 'file_insert';
   }
 
   /**
    * 执行工具调用
    */
   async execute(toolCall: ToolCall): Promise<ToolResult> {
-    const { command, path: filePath } = toolCall.arguments as {
-      command: string;
-      path: string;
-    };
+    const filePath = (toolCall.arguments as any)?.path as string;
 
-    if (!command || !filePath) {
+    if (!filePath) {
       return {
         toolCallId: toolCall.id,
-        content: 'Error: command and path are required',
+        content: 'Error: path is required',
         isError: true
       };
     }
@@ -192,29 +281,27 @@ IMPORTANT:
       };
     }
 
-    logger.debug('FileExecutor executing', { command, path: filePath }, LogCategory.TOOLS);
+    logger.debug('FileExecutor executing', { tool: toolCall.name, path: filePath }, LogCategory.TOOLS);
 
     try {
-      switch (command) {
-        case 'view':
+      switch (toolCall.name) {
+        case 'file_view':
           return await this.executeView(toolCall.id, resolved, toolCall.arguments);
-        case 'create':
+        case 'file_create':
           return await this.executeCreate(toolCall.id, resolved, toolCall.arguments);
-        case 'str_replace':
-          return await this.executeStrReplace(toolCall.id, resolved, toolCall.arguments);
-        case 'insert':
+        case 'file_edit':
+          return await this.executeEdit(toolCall.id, resolved, toolCall.arguments);
+        case 'file_insert':
           return await this.executeInsert(toolCall.id, resolved, toolCall.arguments);
-        case 'undo_edit':
-          return await this.executeUndo(toolCall.id, resolved);
         default:
           return {
             toolCallId: toolCall.id,
-            content: `Error: unsupported command ${command}`,
+            content: `Error: unsupported tool ${toolCall.name}`,
             isError: true
           };
       }
     } catch (error: any) {
-      logger.error('FileExecutor error', { command, error: error.message }, LogCategory.TOOLS);
+      logger.error('FileExecutor error', { tool: toolCall.name, error: error.message }, LogCategory.TOOLS);
       return {
         toolCallId: toolCall.id,
         content: `Error: ${error.message}`,
@@ -466,7 +553,7 @@ IMPORTANT:
   }
 
   /**
-   * 创建新文件
+   * 创建/写入完整文件内容
    */
   private async executeCreate(
     toolCallId: string,
@@ -476,33 +563,56 @@ IMPORTANT:
     const fileText = args.file_text ?? '';
 
     // 检查文件是否已存在
+    let fileExists = false;
     try {
       await fs.access(filePath);
-      return {
-        toolCallId,
-        content: 'Error: file already exists. Use str_replace to edit existing files.',
-        isError: true
-      };
+      fileExists = true;
     } catch {
-      // 文件不存在，可以创建
+      // 文件不存在
     }
 
     // 创建目录
     await fs.mkdir(path.dirname(filePath), { recursive: true });
 
-    // 快照回调（新文件不存在原始内容，但仍通知快照系统记录"文件创建"事件）
+    // 快照回调（覆写时保护原始内容）
     this.onBeforeWrite?.(filePath);
 
     // 写入文件
     await fs.writeFile(filePath, fileText, 'utf-8');
 
-    logger.info('File created', { path: filePath }, LogCategory.TOOLS);
+    if (fileExists) {
+      logger.info('File overwritten via file_create', { path: filePath }, LogCategory.TOOLS);
+      return {
+        toolCallId,
+        content: 'OK: file overwritten (file already existed)',
+        isError: false
+      };
+    }
+
+    logger.info('File created via file_create', { path: filePath }, LogCategory.TOOLS);
 
     return {
       toolCallId,
       content: 'OK: file created',
       isError: false
     };
+  }
+
+  /**
+   * 编辑文件（文本替换 / 撤销）
+   */
+  private async executeEdit(
+    toolCallId: string,
+    filePath: string,
+    args: Record<string, any>
+  ): Promise<ToolResult> {
+    // 模式 1：撤销
+    if (args.undo === true) {
+      return await this.executeUndo(toolCallId, filePath);
+    }
+
+    // 模式 2：文本替换
+    return await this.executeStrReplace(toolCallId, filePath, args);
   }
 
   /**
@@ -521,7 +631,7 @@ IMPORTANT:
     if (typeof oldStr !== 'string') {
       return {
         toolCallId,
-        content: 'Error: old_str is required',
+        content: 'Error: old_str is required for text replacement mode',
         isError: true
       };
     }
@@ -602,16 +712,16 @@ IMPORTANT:
       const updated = beforeRange + updatedRange + afterRange;
       await fs.writeFile(filePath, updated, 'utf-8');
 
-      logger.info('File edited (str_replace with line range)', { path: filePath, startLine, endLine }, LogCategory.TOOLS);
+      logger.info('File edited (file_edit with line range)', { path: filePath, startLine, endLine }, LogCategory.TOOLS);
 
       return {
         toolCallId,
-        content: `OK: str_replace applied in lines ${startLine}-${endLine}`,
+        content: `OK: edit applied in lines ${startLine}-${endLine}`,
         isError: false
       };
     }
 
-    // 没有行号范围，使用原来的全文搜索逻辑
+    // 没有行号范围，使用全文搜索逻辑
     const index = content.indexOf(oldStr);
     if (index === -1) {
       return {
@@ -652,11 +762,11 @@ IMPORTANT:
     const updated = content.replace(oldStr, newStr);
     await fs.writeFile(filePath, updated, 'utf-8');
 
-    logger.info('File edited (str_replace)', { path: filePath }, LogCategory.TOOLS);
+    logger.info('File edited (file_edit)', { path: filePath }, LogCategory.TOOLS);
 
     return {
       toolCallId,
-      content: 'OK: str_replace applied',
+      content: 'OK: edit applied',
       isError: false
     };
   }
@@ -670,7 +780,7 @@ IMPORTANT:
     args: Record<string, any>
   ): Promise<ToolResult> {
     const insertLine = Number(args.insert_line);
-    const insertText = args.insert_text ?? '';
+    const insertText = args.new_str ?? '';
 
     if (!Number.isFinite(insertLine) || insertLine < 0) {
       return {
@@ -717,7 +827,7 @@ IMPORTANT:
     await fs.mkdir(path.dirname(filePath), { recursive: true });
     await fs.writeFile(filePath, lines.join('\n'), 'utf-8');
 
-    logger.info('File edited (insert)', { path: filePath, line: insertLine }, LogCategory.TOOLS);
+    logger.info('File edited (file_insert)', { path: filePath, line: insertLine }, LogCategory.TOOLS);
 
     return {
       toolCallId,

@@ -1,7 +1,7 @@
 /**
  * Skill 安装与指令构建
  *
- * 注意：内置工具（launch-process/read-process/write-process/kill-process/list-processes, text_editor, grep_search 等）由 ToolManager 直接管理
+ * 注意：内置工具（launch-process 等终端工具, file_view/file_create/file_edit/file_insert/file_remove, grep_search 等）由 ToolManager 直接管理
  * 此模块仅处理指令型 Skills 和自定义工具的安装
  */
 
@@ -32,6 +32,7 @@ export function applySkillInstall(config: SkillsConfigFile, skill: SkillInfo): S
       name: skill.fullName,
       description: skill.description || '',
       content: instruction,
+      version: skill.version,
       allowedTools: skill.allowedTools,
       disableModelInvocation: skill.disableModelInvocation,
       userInvocable: skill.userInvocable,
@@ -62,6 +63,7 @@ export function applySkillInstall(config: SkillsConfigFile, skill: SkillInfo): S
     ...skill.toolDefinition,
     name: skill.fullName,
     description: skill.description || skill.toolDefinition.description,
+    version: skill.version,
     executor: skill.executor,
     repositoryId: skill.repositoryId,
     repositoryName: skill.repositoryName,

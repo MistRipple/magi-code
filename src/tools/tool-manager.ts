@@ -4,15 +4,16 @@
  *
  * 内置工具 (source: 'builtin'):
  * - launch-process/read-process/write-process/kill-process/list-processes: 终端运行时
- * - text_editor: 文件编辑
+ * - file_view/file_create/file_edit/file_insert: 文件操作
  * - grep_search: 代码搜索
- * - remove_files: 文件删除
+ * - file_remove: 文件删除
  * - web_search: 网络搜索
  * - web_fetch: URL 内容获取
  * - mermaid_diagram: Mermaid 图表渲染
  * - codebase_retrieval: 代码库语义搜索 (ACE)
  * - dispatch_task: 将子任务分配给专业 Worker
  * - send_worker_message: 向 Worker 面板发送消息
+ * - wait_for_workers: 等待 Worker 完成并获取结果（反应式编排）
  *
  * ACE 配置来源：~/.magi/config.json 的 promptEnhance 字段（唯一）
  */
@@ -341,15 +342,19 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     'write-process',
     'kill-process',
     'list-processes',
-    'text_editor',
+    'file_view',
+    'file_create',
+    'file_edit',
+    'file_insert',
+    'file_remove',
     'grep_search',
-    'remove_files',
     'web_search',
     'web_fetch',
     'mermaid_diagram',
     'codebase_retrieval',
     'dispatch_task',
     'send_worker_message',
+    'wait_for_workers',
   ];
 
   /**
@@ -459,13 +464,16 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       case 'list-processes':
         return await this.executeListProcessesTool(toolCall);
 
-      case 'text_editor':
+      case 'file_view':
+      case 'file_create':
+      case 'file_edit':
+      case 'file_insert':
         return await this.fileExecutor.execute(toolCall);
 
       case 'grep_search':
         return await this.searchExecutor.execute(toolCall);
 
-      case 'remove_files':
+      case 'file_remove':
         return await this.removeFilesExecutor.execute(toolCall);
 
       case 'web_search':
@@ -480,6 +488,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
       case 'dispatch_task':
       case 'send_worker_message':
+      case 'wait_for_workers':
         return await this.orchestrationExecutor.execute(toolCall);
 
       default:
@@ -537,7 +546,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     }
 
     // Edit/Write 工具需要 allowEdit 权限
-    if (toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit' || toolName === 'text_editor' || toolName === 'remove_files') {
+    if (toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit' || toolName === 'file_create' || toolName === 'file_edit' || toolName === 'file_insert' || toolName === 'file_remove') {
       if (!this.permissions.allowEdit) {
         return { allowed: false, reason: 'File editing is disabled' };
       }
@@ -553,7 +562,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     }
 
     // 编排工具默认允许（内部调度不需要额外权限）
-    if (toolName === 'dispatch_task' || toolName === 'send_worker_message') {
+    if (toolName === 'dispatch_task' || toolName === 'send_worker_message' || toolName === 'wait_for_workers') {
       return { allowed: true };
     }
 
@@ -635,13 +644,16 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       return '';
     }
 
-    const orchestrationToolNames = ['dispatch_task', 'send_worker_message'];
+    const orchestrationToolNames = ['dispatch_task', 'send_worker_message', 'wait_for_workers'];
 
     // 内置工具描述映射（中文用途说明）
     const builtinToolDescriptions: Record<string, { category: string; desc: string }> = {
-      'text_editor': { category: '文件操作', desc: '查看目录结构、读取/编辑/创建文件' },
+      'file_view': { category: '文件操作', desc: '查看文件内容或浏览目录结构' },
+      'file_create': { category: '文件操作', desc: '创建新文件或写入完整文件内容' },
+      'file_edit': { category: '文件操作', desc: '精确替换文件中的文本' },
+      'file_insert': { category: '文件操作', desc: '在指定行插入文本' },
+      'file_remove': { category: '文件操作', desc: '删除文件' },
       'grep_search': { category: '文件操作', desc: '正则搜索代码内容' },
-      'remove_files': { category: '文件操作', desc: '删除文件' },
       'launch-process': { category: '终端命令', desc: '执行构建/测试/启动服务等进程（不要用于读文件或浏览目录）' },
       'read-process': { category: '终端命令', desc: '读取终端进程输出' },
       'write-process': { category: '终端命令', desc: '向运行中的终端写入输入' },
@@ -655,8 +667,10 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
     // 编排者专用的附加说明
     const orchestratorNotes: Record<string, string> = {
-      'text_editor': '（编排者限改 3 个文件内的简单修改，复杂修改委派 Worker）',
-      'remove_files': '（编排者限 3 个文件内）',
+      'file_edit': '（编排者限改 3 个文件内的简单修改，复杂修改委派 Worker）',
+      'file_create': '（编排者限 3 个文件内）',
+      'file_insert': '（编排者限 3 个文件内）',
+      'file_remove': '（编排者限 3 个文件内）',
     };
 
     const lines: string[] = [];
@@ -722,12 +736,12 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     const terminalTools: ToolDefinition[] = [
       {
         name: 'launch-process',
-        description: `Launch a shell command in an agent-dedicated terminal. name is required (orchestrator, worker-claude, worker-gemini, worker-codex).
+        description: `Launch a shell command in an agent-dedicated terminal. Terminal identity is auto-injected by the system.
 
 Use wait=true for short commands (build, test, git), wait=false for long-running processes (dev server).
 
 IMPORTANT: If a more specific tool can perform the task, use that tool instead:
-- To read files or browse directories: use text_editor (view command), NOT cat/ls/find
+- To read files or browse directories: use file_view, NOT cat/ls/find
 - To search code content: use grep_search, NOT grep/rg
 - To search the web: use web_search, NOT curl
 - To fetch a URL: use web_fetch, NOT curl/wget
@@ -739,11 +753,9 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
             cwd: { type: 'string', description: '命令执行目录，相对于工作区根目录（可选，默认为工作区根目录）' },
             wait: { type: 'boolean', description: '是否等待进程完成（默认 true）' },
             max_wait_seconds: { type: 'number', description: '最大等待秒数（默认 30）' },
-
-            name: { type: 'string', description: 'agent 终端名称（必填：orchestrator、worker-claude、worker-gemini、worker-codex）' },
             showTerminal: { type: 'boolean', description: '是否显示终端窗口（默认 true）' },
           },
-          required: ['command', 'name'],
+          required: ['command'],
         },
       },
       {
@@ -803,13 +815,13 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
       });
     }
 
-    // 6. text_editor (文件编辑)
-    tools.push(this.fileExecutor.getToolDefinition());
+    // 6. 文件操作工具 (file_view, file_create, file_edit, file_insert)
+    tools.push(...this.fileExecutor.getToolDefinitions());
 
     // 7. grep_search (代码搜索)
     tools.push(this.searchExecutor.getToolDefinition());
 
-    // 8. remove_files (文件删除)
+    // 8. file_remove (文件删除)
     tools.push(this.removeFilesExecutor.getToolDefinition());
 
     // 9-10. web_search, web_fetch (网络搜索/获取)
@@ -821,7 +833,7 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
     // 12. codebase_retrieval (ACE 语义搜索)
     tools.push(this.aceExecutor.getToolDefinition());
 
-    // 13-14. 编排工具 (dispatch_task, send_worker_message)
+    // 13-15. 编排工具 (dispatch_task, send_worker_message, wait_for_workers)
     tools.push(...this.orchestrationExecutor.getToolDefinitions());
 
     return tools;
@@ -857,7 +869,13 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
 
   private async executeLaunchProcessTool(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     const args = toolCall.arguments as any;
-    const { command, cwd, wait = true, max_wait_seconds = 30, name, showTerminal = true } = args;
+    const { command, cwd, wait = true, max_wait_seconds = 30, showTerminal = true } = args;
+
+    // 终端名称由系统根据执行上下文自动推导，不再依赖 LLM 传入
+    const activeContext = this.getActiveSnapshotContext();
+    const terminalName = activeContext?.workerId
+      ? `worker-${activeContext.workerId}`
+      : 'orchestrator';
 
     const validation = this.terminalExecutor.validateCommand(command);
     if (!validation.valid) {
@@ -873,7 +891,7 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
       cwd,
       wait,
       maxWaitSeconds: max_wait_seconds,
-      name,
+      name: terminalName,
       showTerminal,
     }, signal);
 

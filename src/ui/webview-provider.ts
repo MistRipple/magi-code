@@ -415,7 +415,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
       await this.projectKnowledgeBase.initialize();
 
-      // 设置压缩模型客户端（用于自动知识提取）
+      // 设置压缩模型客户端（用于知识提取 + ACE 降级时的 LLM 辅助搜索扩展）
       await this.setupKnowledgeExtractionClient();
 
       // 注入知识库到编排器
@@ -449,7 +449,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * 设置知识提取客户端（使用压缩模型）
+   * 设置知识提取客户端（使用压缩模型，同时为 ACE 降级搜索提供 LLM 查询扩展）
    */
   private async setupKnowledgeExtractionClient(): Promise<void> {
     try {

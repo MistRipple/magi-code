@@ -25,6 +25,7 @@ import type { ReportCallback } from '../protocols/worker-report';
 import type { CancellationToken } from './dispatch-batch';
 import { LspEnforcer } from '../lsp/lsp-enforcer';
 import { logger, LogCategory } from '../../logging';
+import type { AssembledContext } from '../../context/context-assembler';
 
 // ============================================================================
 // 配置与结果类型
@@ -54,6 +55,9 @@ export interface PipelineConfig {
   snapshotManager?: SnapshotManager | null;
   contextManager?: import('../../context/context-manager').ContextManager | null;
   todoManager?: import('../../todo').TodoManager | null;
+
+  // 反应式编排：补充指令回调（由 DispatchManager 从 SupplementaryInstructionQueue 注入）
+  getSupplementaryInstructions?: () => string[];
 }
 
 export interface PipelineResult {
@@ -75,6 +79,7 @@ export class WorkerPipeline {
       projectContext, onReport, cancellationToken, imagePaths,
       enableSnapshot, enableLSP, enableTargetEnforce, enableContextUpdate,
       snapshotManager, contextManager, todoManager,
+      getSupplementaryInstructions,
     } = config;
     const missionId = config.missionId || 'dispatch';
 
@@ -102,12 +107,8 @@ export class WorkerPipeline {
       workerId: assignment.workerId,
     });
 
-    // ========== 3. 获取上下文快照 ==========
-    const contextSnapshot = enableContextUpdate && contextManager
-      ? await this.generateContextSnapshot(missionId, assignment.workerId, contextManager)
-      : undefined;
-
-    // ========== 4. 收集目标文件 + 预快照 ==========
+    // ========== 3/4/5. 上下文快照 + 目标文件收集 + LSP 预检（并行执行） ==========
+    // 这三个步骤无互依赖，并行执行减少总耗时
     const targetFiles = this.collectTargetFiles(assignment);
     const normalizedTargets = this.normalizeTargetFiles(targetFiles, workspaceRoot);
     let preExecutionContents: Map<string, string> | null = null;
@@ -115,21 +116,33 @@ export class WorkerPipeline {
       preExecutionContents = this.captureTargetContents(normalizedTargets, workspaceRoot);
     }
 
-    // ========== 5. [可选] LSP 预检 ==========
+    const assembledContextPromise = enableContextUpdate && contextManager
+      ? this.generateAssembledContext(missionId, assignment.workerId, contextManager)
+      : Promise.resolve(undefined);
+
     let preflightDiagnostics: string[] = [];
-    if (enableLSP) {
-      if (!this.lspEnforcer) {
-        this.lspEnforcer = new LspEnforcer(workspaceRoot);
-      }
-      try {
-        await this.lspEnforcer.applyIfNeeded(assignment);
-        preflightDiagnostics = await this.lspEnforcer.captureDiagnostics(assignment);
-      } catch (error: any) {
-        logger.warn('WorkerPipeline.LSP预检失败', {
-          assignmentId: assignment.id, error: error?.message,
-        }, LogCategory.ORCHESTRATOR);
-      }
-    }
+    const lspPromise = enableLSP
+      ? (async () => {
+          if (!this.lspEnforcer) {
+            this.lspEnforcer = new LspEnforcer(workspaceRoot);
+          }
+          try {
+            await this.lspEnforcer.applyIfNeeded(assignment);
+            preflightDiagnostics = await this.lspEnforcer.captureDiagnostics(assignment);
+          } catch (error: any) {
+            logger.warn('WorkerPipeline.LSP预检失败', {
+              assignmentId: assignment.id, error: error?.message,
+            }, LogCategory.ORCHESTRATOR);
+          }
+        })()
+      : Promise.resolve();
+
+    const [assembledContext] = await Promise.all([assembledContextPromise, lspPromise]);
+
+    // 将结构化 AssembledContext 格式化为文本（供 adapterScope）
+    const contextSnapshotText = assembledContext && contextManager
+      ? contextManager.formatAssembledContext(assembledContext)
+      : undefined;
 
     // ========== 6. Worker 执行 ==========
     let result: AutonomousExecutionResult;
@@ -144,9 +157,11 @@ export class WorkerPipeline {
         onReport,
         cancellationToken,
         imagePaths,
-        adapterScope: contextSnapshot ? {
+        getSupplementaryInstructions,
+        preAssembledContext: assembledContext,
+        adapterScope: contextSnapshotText ? {
           messageMeta: {
-            contextSnapshot,
+            contextSnapshot: contextSnapshotText,
             taskContext: { goal: assignment.responsibility, targetFiles },
           },
         } : undefined,
@@ -179,9 +194,10 @@ export class WorkerPipeline {
             onReport,
             cancellationToken,
             imagePaths,
-            adapterScope: contextSnapshot ? {
+            getSupplementaryInstructions,
+            adapterScope: contextSnapshotText ? {
               messageMeta: {
-                contextSnapshot,
+                contextSnapshot: contextSnapshotText,
                 taskContext: { goal: assignment.responsibility, targetFiles },
               },
             } : undefined,
@@ -275,14 +291,14 @@ export class WorkerPipeline {
     }
   }
 
-  private async generateContextSnapshot(
+  private async generateAssembledContext(
     missionId: string,
     workerId: WorkerSlot,
     contextManager: import('../../context/context-manager').ContextManager,
-  ): Promise<string | undefined> {
-    return contextManager.getAssembledContextText(
-      contextManager.buildAssemblyOptions(missionId, workerId, 6000)
-    );
+  ): Promise<AssembledContext | undefined> {
+    const options = contextManager.buildAssemblyOptions(missionId, workerId, 8000);
+    const assembled = await contextManager.getAssembledContext(options);
+    return (assembled.parts && assembled.parts.length > 0) ? assembled : undefined;
   }
 
   private collectTargetFiles(assignment: Assignment): string[] {

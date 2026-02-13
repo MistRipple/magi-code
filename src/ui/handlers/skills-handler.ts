@@ -15,6 +15,7 @@ type Msg<T extends string> = Extract<WebviewToExtensionMessage, { type: T }>;
 const SUPPORTED = new Set([
   'loadSkillsConfig', 'saveSkillsConfig',
   'addCustomTool', 'removeCustomTool', 'removeInstructionSkill', 'installSkill',
+  'updateSkill', 'updateAllSkills',
   'loadRepositories', 'addRepository', 'updateRepository', 'deleteRepository',
   'refreshRepository', 'loadSkillLibrary',
 ]);
@@ -41,6 +42,12 @@ export class SkillsCommandHandler implements CommandHandler {
         break;
       case 'installSkill':
         await this.handleInstallSkill(message as Msg<'installSkill'>, ctx);
+        break;
+      case 'updateSkill':
+        await this.handleUpdateSkill(message as Msg<'updateSkill'>, ctx);
+        break;
+      case 'updateAllSkills':
+        await this.handleUpdateAllSkills(ctx);
         break;
       case 'loadRepositories':
         await this.handleLoadRepositories(ctx);
@@ -173,6 +180,84 @@ export class SkillsCommandHandler implements CommandHandler {
     } catch (error: any) {
       logger.error('安装 Skill 失败', { skillId: message.skillId, error: error.message }, LogCategory.TOOLS);
       ctx.sendToast(`安装 Skill 失败: ${error.message}`, 'error');
+    }
+  }
+
+  private async handleUpdateSkill(message: Msg<'updateSkill'>, ctx: CommandHandlerContext): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../../llm/config');
+      const { SkillRepositoryManager } = await import('../../tools/skill-repository-manager');
+
+      const repositories = LLMConfigLoader.loadRepositories();
+      const manager = new SkillRepositoryManager();
+      // 清除所有仓库缓存，确保拉取到最新版本
+      for (const repo of repositories) {
+        manager.clearCache(repo.id);
+      }
+
+      const skills = await manager.getAllSkills(repositories);
+      const latestSkill = skills.find((item: any) => item.fullName === message.skillName || item.name === message.skillName);
+      if (!latestSkill) throw new Error(`远程仓库中未找到 Skill: ${message.skillName}`);
+
+      const config = LLMConfigLoader.loadSkillsConfig() || { customTools: [], instructionSkills: [], repositories };
+      const updatedConfig = applySkillInstall(config, latestSkill);
+      Object.assign(config, updatedConfig);
+      LLMConfigLoader.saveSkillsConfig(config);
+
+      ctx.sendData('skillUpdated', { skillName: message.skillName, version: latestSkill.version });
+      ctx.sendToast(`Skill "${latestSkill.name}" 已更新${latestSkill.version ? ` (v${latestSkill.version})` : ''}`, 'success');
+      await this.handleLoadSkillsConfig(ctx);
+      await this.reloadSkills(ctx, 'updateSkill');
+      logger.info('Skill 已更新', { name: message.skillName, version: latestSkill.version }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('更新 Skill 失败', { skillName: message.skillName, error: error.message }, LogCategory.TOOLS);
+      ctx.sendToast(`更新 Skill 失败: ${error.message}`, 'error');
+      ctx.sendData('skillUpdated', { skillName: message.skillName, error: error.message });
+    }
+  }
+
+  private async handleUpdateAllSkills(ctx: CommandHandlerContext): Promise<void> {
+    try {
+      const { LLMConfigLoader } = await import('../../llm/config');
+      const { SkillRepositoryManager } = await import('../../tools/skill-repository-manager');
+
+      let config = LLMConfigLoader.loadSkillsConfig() || { customTools: [], instructionSkills: [], repositories: [] };
+      const installedNames = new Set<string>();
+      (config.instructionSkills || []).forEach((s: any) => { if (s?.name) installedNames.add(s.name); });
+      (config.customTools || []).forEach((t: any) => { if (t?.name) installedNames.add(t.name); });
+
+      if (installedNames.size === 0) {
+        ctx.sendData('allSkillsUpdated', { updatedCount: 0 });
+        ctx.sendToast('没有已安装的 Skill 需要更新', 'info');
+        return;
+      }
+
+      const repositories = LLMConfigLoader.loadRepositories();
+      const manager = new SkillRepositoryManager();
+      for (const repo of repositories) {
+        manager.clearCache(repo.id);
+      }
+
+      const remoteSkills = await manager.getAllSkills(repositories);
+      let updatedCount = 0;
+
+      for (const remoteSkill of remoteSkills) {
+        if (installedNames.has(remoteSkill.fullName) || installedNames.has(remoteSkill.name)) {
+          config = applySkillInstall(config, remoteSkill);
+          updatedCount++;
+        }
+      }
+
+      LLMConfigLoader.saveSkillsConfig(config);
+
+      ctx.sendData('allSkillsUpdated', { updatedCount });
+      ctx.sendToast(`已更新 ${updatedCount} 个 Skill`, 'success');
+      await this.handleLoadSkillsConfig(ctx);
+      await this.reloadSkills(ctx, 'updateAllSkills');
+      logger.info('所有 Skill 已更新', { updatedCount }, LogCategory.TOOLS);
+    } catch (error: any) {
+      logger.error('批量更新 Skill 失败', { error: error.message }, LogCategory.TOOLS);
+      ctx.sendToast(`批量更新 Skill 失败: ${error.message}`, 'error');
     }
   }
 

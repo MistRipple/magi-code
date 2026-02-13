@@ -151,6 +151,7 @@ export class LocalCodeSearchService {
       const results = await kb.search(query, {
         maxResults,
         maxContextLength: Math.floor(maxContextLength * 0.6),
+        enableLLMExpansion: true,
       });
       if (results.length === 0) return null;
 

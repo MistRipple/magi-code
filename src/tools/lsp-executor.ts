@@ -485,7 +485,7 @@ Actions:
       newName: args.newName.trim(),
       applied: false,
       preview: { fileCount, editCount, changes },
-      note: 'Rename preview generated. Use text_editor(str_replace) to apply changes.',
+      note: 'Rename preview generated. Use file_edit to apply changes.',
     });
   }
 

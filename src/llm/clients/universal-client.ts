@@ -996,23 +996,32 @@ export class UniversalLLMClient extends BaseLLMClient {
 
       if (delta?.tool_calls) {
         for (const toolCall of delta.tool_calls) {
-          const toolId = toolCall.id || toolCall.index?.toString() || '';
-          if (!toolCallBuffers.has(toolId)) {
-            toolCallBuffers.set(toolId, {
-              id: toolId,
+          // 使用 index 作为 buffer key（所有 chunk 一致携带 index）
+          // id 仅在首个 chunk 出现，用 index 保证后续 chunk 能命中同一 buffer
+          const bufferKey = toolCall.index?.toString() ?? (toolCall.id || '');
+          if (!toolCallBuffers.has(bufferKey)) {
+            toolCallBuffers.set(bufferKey, {
+              id: toolCall.id || '',
               name: toolCall.function?.name,
               argumentsText: '',
             });
           }
-          const buffer = toolCallBuffers.get(toolId);
-          if (buffer && toolCall.function?.arguments) {
+          const buffer = toolCallBuffers.get(bufferKey)!;
+          // 首个 chunk 携带 id，更新到 buffer
+          if (toolCall.id && !buffer.id) {
+            buffer.id = toolCall.id;
+          }
+          if (toolCall.function?.name) {
+            buffer.name = toolCall.function.name;
+          }
+          if (toolCall.function?.arguments) {
             buffer.argumentsText += toolCall.function.arguments;
           }
           if (toolCall.function?.name) {
             onChunk({
               type: 'tool_call_delta',
               toolCall: {
-                id: toolId,
+                id: buffer.id || bufferKey,
                 name: toolCall.function.name,
                 arguments: {},
               },
@@ -1064,8 +1073,9 @@ export class UniversalLLMClient extends BaseLLMClient {
     }
 
     const toolCalls: ToolCall[] = [];
-    for (const tool of toolCallBuffers.values()) {
-      if (!tool.id) continue;
+    for (const [bufferKey, tool] of toolCallBuffers.entries()) {
+      const toolId = tool.id || bufferKey;
+      if (!toolId) continue;
       let parsedArgs: Record<string, any> = {};
       if (tool.argumentsText) {
         try {
@@ -1075,7 +1085,7 @@ export class UniversalLLMClient extends BaseLLMClient {
         }
       }
       toolCalls.push({
-        id: tool.id,
+        id: toolId,
         name: tool.name || '',
         arguments: parsedArgs,
       });

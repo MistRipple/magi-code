@@ -47,6 +47,8 @@ export interface FileEntry {
   type: 'source' | 'config' | 'doc' | 'test';
   language?: string;
   size: number;
+  /** 文件行数 */
+  lines: number;
   exports?: string[];  // 导出的函数/类（未来实现）
 }
 
@@ -284,11 +286,24 @@ export class ProjectKnowledgeBase {
             // 检查文件扩展名是否匹配
             if (this.shouldIndex(relativePath)) {
               const stats = fs.statSync(fullPath);
+              // 统计文件行数：读取 Buffer 直接计数换行符，避免全量 split
+              let lineCount = 0;
+              try {
+                const buf = fs.readFileSync(fullPath);
+                for (let i = 0; i < buf.length; i++) {
+                  if (buf[i] === 0x0A) lineCount++;
+                }
+                // 文件非空且末尾无换行 → 最后一行也计入
+                if (buf.length > 0 && buf[buf.length - 1] !== 0x0A) lineCount++;
+              } catch {
+                // 读取失败（二进制/权限）→ 行数保持 0
+              }
               files.push({
                 path: relativePath,
                 type: this.classifyFileType(relativePath),
                 language: this.detectLanguage(relativePath),
-                size: stats.size
+                size: stats.size,
+                lines: lineCount,
               });
             }
           }

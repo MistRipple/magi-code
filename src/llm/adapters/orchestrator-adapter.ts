@@ -647,18 +647,15 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   private checkOrchestratorToolRestriction(toolCall: ToolCall): string | null {
     const { name, arguments: args } = toolCall;
 
-    if (name === 'text_editor') {
-      const command = args?.command as string | undefined;
-      if (command && command !== 'view') {
-        const filePath = (args?.path || args?.file_path || '') as string;
-        this.editedFiles.add(filePath);
-        if (this.editedFiles.size > OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES) {
-          return `编排者已修改 ${this.editedFiles.size} 个文件（超过 ${OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES} 个），多文件修改应通过 dispatch_task 委派给 Worker。`;
-        }
+    if (name === 'file_edit' || name === 'file_create' || name === 'file_insert') {
+      const filePath = (args?.path || args?.file_path || '') as string;
+      this.editedFiles.add(filePath);
+      if (this.editedFiles.size > OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES) {
+        return `编排者已修改 ${this.editedFiles.size} 个文件（超过 ${OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES} 个），多文件修改应通过 dispatch_task 委派给 Worker。`;
       }
     }
 
-    if (name === 'remove_files') {
+    if (name === 'file_remove') {
       const filePath = (args?.path || args?.file_path || '') as string;
       this.editedFiles.add(filePath);
       if (this.editedFiles.size > OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES) {
