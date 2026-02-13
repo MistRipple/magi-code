@@ -86,7 +86,7 @@ Good query examples:
 Bad query examples (use grep_search instead):
 - "Find definition of class Foo" (use grep_search)
 - "Find all references to function bar" (use grep_search)
-- "Show how class X is used in file Y" (use text_editor view)`,
+- "Show how class X is used in file Y" (use file_view)`,
       input_schema: {
         type: 'object',
         properties: {

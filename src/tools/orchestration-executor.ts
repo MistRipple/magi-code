@@ -1,10 +1,13 @@
 /**
  * 编排工具执行器
- * 提供 dispatch_task、send_worker_message 两个元工具
+ * 提供 dispatch_task、send_worker_message、wait_for_workers 三个元工具
  *
  * 这些工具使 orchestrator LLM 能够：
- * - dispatch_task: 将子任务分配给专业 Worker 执行
+ * - dispatch_task: 将子任务分配给专业 Worker 执行（非阻塞）
+ * - wait_for_workers: 等待已分配的 Worker 完成并获取结果（阻塞）
  * - send_worker_message: 向 Worker 面板发送消息
+ *
+ * 反应式编排循环：dispatch → wait → analyze results → dispatch more / finalize
  */
 
 import { ExtendedToolDefinition } from './types';
@@ -39,15 +42,37 @@ export type SendWorkerMessageHandler = (params: {
 }>;
 
 /**
+ * wait_for_workers 单个 Worker 完成结果
+ */
+export interface WorkerCompletionResult {
+  task_id: string;
+  worker: WorkerSlot;
+  status: 'completed' | 'failed' | 'skipped' | 'cancelled';
+  summary: string;
+  modified_files: string[];
+  errors?: string[];
+}
+
+/**
+ * wait_for_workers 回调：阻塞直到指定（或全部）Worker 完成
+ */
+export type WaitForWorkersHandler = (params: {
+  task_ids?: string[];
+}) => Promise<{
+  results: WorkerCompletionResult[];
+}>;
+
+/**
  * 编排工具执行器
  */
 export class OrchestrationExecutor {
   private dispatchHandler?: DispatchTaskHandler;
   private sendMessageHandler?: SendWorkerMessageHandler;
+  private waitForWorkersHandler?: WaitForWorkersHandler;
   /** 动态 Worker 列表（必须由 MissionDrivenEngine 从 ProfileLoader 注入） */
   private availableWorkers: { slot: WorkerSlot; description: string }[] = [];
 
-  private static readonly TOOL_NAMES = ['dispatch_task', 'send_worker_message'] as const;
+  private static readonly TOOL_NAMES = ['dispatch_task', 'send_worker_message', 'wait_for_workers'] as const;
 
   /**
    * 设置可用 Worker 列表（由 MissionDrivenEngine 从 ProfileLoader 注入）
@@ -75,9 +100,11 @@ export class OrchestrationExecutor {
   setHandlers(handlers: {
     dispatch?: DispatchTaskHandler;
     sendMessage?: SendWorkerMessageHandler;
+    waitForWorkers?: WaitForWorkersHandler;
   }): void {
     this.dispatchHandler = handlers.dispatch;
     this.sendMessageHandler = handlers.sendMessage;
+    this.waitForWorkersHandler = handlers.waitForWorkers;
   }
 
   /**
@@ -93,6 +120,7 @@ export class OrchestrationExecutor {
   getToolDefinitions(): ExtendedToolDefinition[] {
     return [
       this.getDispatchTaskDefinition(),
+      this.getWaitForWorkersDefinition(),
       this.getSendWorkerMessageDefinition(),
     ];
   }
@@ -109,6 +137,8 @@ export class OrchestrationExecutor {
     switch (toolCall.name) {
       case 'dispatch_task':
         return this.executeDispatchTask(toolCall);
+      case 'wait_for_workers':
+        return this.executeWaitForWorkers(toolCall);
       case 'send_worker_message':
         return this.executeSendWorkerMessage(toolCall);
       default:
@@ -214,6 +244,74 @@ export class OrchestrationExecutor {
       return {
         toolCallId: toolCall.id,
         content: `dispatch_task failed: ${error.message}`,
+        isError: true,
+      };
+    }
+  }
+
+  // ===========================================================================
+  // wait_for_workers
+  // ===========================================================================
+
+  private getWaitForWorkersDefinition(): ExtendedToolDefinition {
+    return {
+      name: 'wait_for_workers',
+      description: '等待已分配的 Worker 完成执行并返回结果。这是反应式编排的核心工具：dispatch_task 发送任务后，调用此工具阻塞等待结果，然后根据结果决定是否追加新任务或结束。不传 task_ids 则等待当前批次全部完成。',
+      input_schema: {
+        type: 'object',
+        properties: {
+          task_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '等待的 task_id 列表（由 dispatch_task 返回）。不传则等待当前批次中所有任务完成',
+          },
+        },
+        required: [],
+      },
+      metadata: {
+        source: 'builtin',
+        category: 'orchestration',
+        tags: ['orchestration', 'worker', 'coordination', 'reactive'],
+      },
+    };
+  }
+
+  private async executeWaitForWorkers(toolCall: ToolCall): Promise<ToolResult> {
+    if (!this.waitForWorkersHandler) {
+      return {
+        toolCallId: toolCall.id,
+        content: 'wait_for_workers handler not configured',
+        isError: true,
+      };
+    }
+
+    const args = toolCall.arguments as { task_ids?: string[] };
+
+    logger.info('wait_for_workers 开始等待', {
+      taskIds: args.task_ids || 'all',
+    }, LogCategory.TOOLS);
+
+    try {
+      const result = await this.waitForWorkersHandler({
+        task_ids: args.task_ids,
+      });
+
+      logger.info('wait_for_workers 完成', {
+        resultCount: result.results.length,
+        successes: result.results.filter(r => r.status === 'completed').length,
+        failures: result.results.filter(r => r.status === 'failed').length,
+      }, LogCategory.TOOLS);
+
+      return {
+        toolCallId: toolCall.id,
+        content: JSON.stringify(result),
+        isError: false,
+      };
+    } catch (error: any) {
+      logger.error('wait_for_workers 失败', { error: error.message }, LogCategory.TOOLS);
+      return {
+        toolCallId: toolCall.id,
+        content: `wait_for_workers failed: ${error.message}`,
         isError: true,
       };
     }

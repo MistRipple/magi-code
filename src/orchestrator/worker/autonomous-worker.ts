@@ -13,7 +13,10 @@ import { EventEmitter } from 'events';
 import * as fs from 'fs/promises';
 import * as crypto from 'crypto';
 import * as path from 'path';
-import { execSync } from 'child_process';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
 import { WorkerSlot, SubTask } from '../../types';
 import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import { AdapterOutputScope } from '../../adapters/adapter-factory-interface';
@@ -133,6 +136,8 @@ export interface TodoExecuteOptions {
   cancellationToken?: CancellationToken;
   /** 用户原始图片路径（仅首轮 LLM 调用时传递） */
   imagePaths?: string[];
+  /** Pipeline 预组装的共享上下文（避免 Worker 重复调用 contextAssembler.assemble） */
+  preAssembledContext?: AssembledContext;
 }
 
 /**
@@ -262,11 +267,10 @@ export class AutonomousWorker extends EventEmitter {
     this.resetCacheReadStats();
 
     // 组装共享上下文 - 提案 9.2（强制依赖已保证可用）
-    // 从 scope.includes 提取标签，如果没有则使用空数组
-    const tags = assignment.scope.includes || [];
-    const sharedContext = await this.assembleSharedContext(
+    // 优先使用 Pipeline 预组装的结果，避免重复调用 contextAssembler.assemble()
+    const sharedContext = options.preAssembledContext ?? await this.assembleSharedContext(
       assignment.missionId,
-      tags
+      assignment.scope.includes || []
     );
 
     // Session 管理 - 提案 4.1
@@ -795,7 +799,7 @@ export class AutonomousWorker extends EventEmitter {
       const allKnownTargets = [...(assignment.scope.targetPaths || []), ...extraTargets];
       if (allKnownTargets.length < 3) {
         const taskText = `${todo.content} ${assignment.delegationBriefing || assignment.responsibility}`;
-        const discovered = this.discoverRelevantFiles(taskText, options.workingDirectory, allKnownTargets);
+        const discovered = await this.discoverRelevantFiles(taskText, options.workingDirectory, allKnownTargets);
         extraTargets.push(...discovered);
       }
 
@@ -1061,34 +1065,37 @@ export class AutonomousWorker extends EventEmitter {
    * 从任务描述中提取关键词，在工作目录中搜索包含这些关键词的源文件。
    * 用于弥补编排者未提供 targetPaths 时的上下文缺口，减少 Worker 的探索轮次。
    */
-  private discoverRelevantFiles(
+  private async discoverRelevantFiles(
     taskDescription: string,
     workingDirectory: string,
     existingTargets: string[]
-  ): string[] {
+  ): Promise<string[]> {
     const keywords = this.extractSearchKeywords(taskDescription);
     if (keywords.length === 0) return [];
 
     const discovered = new Map<string, number>();
     const existingSet = new Set(existingTargets);
+    const srcDir = path.join(workingDirectory, 'src');
 
-    for (const keyword of keywords) {
-      try {
-        // Shell-safe: 转义特殊字符防止注入
-        const safeKeyword = keyword.replace(/[\\'"$`!#&|;(){}[\]<>?*~]/g, '\\$&');
-        const srcDir = path.join(workingDirectory, 'src');
-        const result = execSync(
+    // 所有关键词并行执行 grep（非阻塞），单个超时 3s
+    const shellEscape = (s: string) => s.replace(/[\\'"$`!#&|;(){}[\]<>?*~]/g, '\\$&');
+    const grepResults = await Promise.allSettled(
+      keywords.map(keyword => {
+        const safeKeyword = shellEscape(keyword);
+        return execAsync(
           `grep -rl --include="*.ts" --include="*.tsx" --include="*.js" --include="*.svelte" -m 1 "${safeKeyword}" "${srcDir}" 2>/dev/null | head -15`,
           { encoding: 'utf-8', timeout: 3000 }
-        );
-        for (const filePath of result.trim().split('\n').filter(Boolean)) {
-          const relativePath = path.relative(workingDirectory, filePath);
-          if (!existingSet.has(relativePath) && !existingSet.has(filePath)) {
-            discovered.set(relativePath, (discovered.get(relativePath) || 0) + 1);
-          }
+        ).then(r => r.stdout);
+      })
+    );
+
+    for (const result of grepResults) {
+      if (result.status !== 'fulfilled') continue;
+      for (const filePath of result.value.trim().split('\n').filter(Boolean)) {
+        const relativePath = path.relative(workingDirectory, filePath);
+        if (!existingSet.has(relativePath) && !existingSet.has(filePath)) {
+          discovered.set(relativePath, (discovered.get(relativePath) || 0) + 1);
         }
-      } catch {
-        // grep exit code 1 (no match) or timeout — skip
       }
     }
 

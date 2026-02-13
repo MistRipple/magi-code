@@ -79,9 +79,9 @@ const STALL_DETECTION_PRESETS: Record<WorkerSlot, StallDetectionConfig> = {
     stallWarnLevel3: 10,
     stallAbortThreshold: 15,
     maxTotalRounds: 25,
-    noOutputWarn: 3,
-    noOutputForce: 5,
-    noOutputAbort: 8,
+    noOutputWarn: 5,
+    noOutputForce: 8,
+    noOutputAbort: 12,
   },
   gemini: {
     consecutiveFailThreshold: 5,
@@ -134,6 +134,27 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   private decisionHookAppliedForThinking = false;
   /** 工具摘要是否已注入到 systemPrompt（lazy init，仅执行一次） */
   private toolsSummaryInjected = false;
+  /** 检索结果缓存：防止模型换措辞重复搜索相同内容 */
+  private searchResultCache = new Map<string, string>();
+  /** 已读取过的文件路径（文件级去重：同一文件只需读取一次） */
+  private viewedFiles = new Set<string>();
+  /**
+   * 滚动上下文摘要：截断时从被丢弃消息中提取的关键信息
+   *
+   * 每次 truncateHistoryIfNeeded 触发截断时，被丢弃消息的精华会合并到此摘要中。
+   * 此摘要以 user 角色消息注入到对话历史开头，确保 LLM 不丢失前期关键发现。
+   */
+  private rollingContextSummary: string | null = null;
+  /** 滚动摘要最大字符数（约 500 tokens） */
+  private static readonly MAX_ROLLING_SUMMARY_CHARS = 2000;
+  /** L1+: 按文件路径记录已读取的 view_range 集合（分段精确去重 + 碎片化预警） */
+  private viewedRanges = new Map<string, Set<string>>();
+  /** 当前任务内的去重命中总次数（递增惩罚用） */
+  private totalDedupHits = 0;
+  /** 当前轮次的去重命中次数（空转分数加权用） */
+  private roundDedupHits = 0;
+  /** 失败写操作缓存：防止模型反复重试相同的失败写操作 */
+  private failedWriteCache = new Map<string, { count: number; error: string }>();
 
   constructor(adapterConfig: WorkerAdapterConfig) {
     super(
@@ -193,6 +214,9 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
     this.setState(AdapterState.BUSY);
     this.currentTraceId = this.generateTraceId();
+    // 去重状态不在此处清空 — 需跨多次 sendMessage 调用持久化
+    // （autonomous-worker 每个 Todo 触发一次 sendMessage，清空会导致去重完全失效）
+    // 去重状态在 clearHistory() 中随对话历史一起重置
 
     // 首次调用时异步注入动态工具摘要到 systemPrompt
     if (!this.toolsSummaryInjected) {
@@ -264,9 +288,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       let readOnlyConsecutiveRounds = 0;      // 连续只读轮次（用于日志和提示）
       const visitedPaths = new Set<string>(); // 累计已访问的唯一文件路径
       let lastStallWarnLevel = 0;             // 上次发出的警告级别（避免重复警告）
+      // 连续同工具重复检测（捕获"同一工具不同 query"的无效循环）
+      let lastPrimaryToolName = '';
+      let consecutiveSameToolRounds = 0;
       // 无实质文本输出检测状态
       let noSubstantiveOutputRounds = 0;      // 连续无实质输出轮次
       let lastNoOutputWarnLevel = 0;          // 上次警告级别
+      // 强制总结模式：达到终止阈值时，撤掉工具给模型一轮纯文本输出机会
+      let forceNoToolsNextRound = false;
 
       // 创建 AbortController，供 interrupt() 中断 LLM 请求
       this.abortController = new AbortController();
@@ -280,8 +309,17 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
         // 总轮次安全网：防止任何场景下的无限循环
         if (round >= sc.maxTotalRounds) {
+          if (!forceNoToolsNextRound) {
+            forceNoToolsNextRound = true;
+            logger.warn(`${this.agent} 达到总轮次上限，触发强制总结`, { round }, LogCategory.LLM);
+            this.conversationHistory.push({
+              role: 'user',
+              content: `[System] 你已执行 ${round} 轮工具调用，达到系统上限。工具调用能力已被收回。请立即总结当前进展和执行结果。`,
+            });
+            continue; // 进入下一轮（无工具），让模型产出总结
+          }
           logger.warn(`${this.agent} 达到总轮次上限`, { round }, LogCategory.LLM);
-          finalText = finalText || `已执行 ${round} 轮工具调用，达到安全上限，任务终止。请检查任务是否需要拆分。`;
+          finalText = finalText || `已执行 ${round} 轮工具调用，达到安全上限，任务终止。`;
           break;
         }
         if (round === MAX_ROUNDS_FINAL_WARN) {
@@ -303,7 +341,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         const params: LLMMessageParams = {
           messages: this.conversationHistory,
           systemPrompt: this.systemPrompt,
-          tools: toolDefinitions.length > 0 ? toolDefinitions : undefined,
+          tools: forceNoToolsNextRound ? undefined : (toolDefinitions.length > 0 ? toolDefinitions : undefined),
           stream: true,
           maxTokens: 4096,
           temperature: 0.7,
@@ -377,6 +415,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           }
           this.conversationHistory.push({ role: 'assistant', content: assistantContent });
 
+          this.roundDedupHits = 0;
           const toolResults = await this.executeToolCalls(toolCalls);
 
           // 中断检查：工具执行完成后立即检测 abort，跳过后续处理直接退出循环
@@ -440,40 +479,73 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
               const newPaths = roundPaths.filter(p => !visitedPaths.has(p));
               for (const p of roundPaths) visitedPaths.add(p);
 
-              // 根据探索度计算空转增量
-              // 查看新文件 = 有目的探索（低增量），反复查看旧文件 = 空转（高增量）
-              const newRatio = roundPaths.length > 0 ? newPaths.length / roundPaths.length : 0;
-              const stallIncrement = newRatio >= 0.5 ? 0.5 : 1.5;
-              readOnlyStallScore += stallIncrement;
-
-              // 多级渐进式警告
-              if (readOnlyStallScore >= sc.stallAbortThreshold) {
-                finalText = assistantText || `连续 ${readOnlyConsecutiveRounds} 轮仅调用只读工具（空转分数 ${readOnlyStallScore.toFixed(1)}），已查看 ${visitedPaths.size} 个文件，判定为搜索空转终止。`;
-                logger.warn(`${this.agent} 空转终止`, { rounds: readOnlyConsecutiveRounds, score: readOnlyStallScore, uniquePaths: visitedPaths.size }, LogCategory.LLM);
-                this.normalizer.endStream(streamId);
-                break;
+              // 连续同工具重复检测：同一工具连续调用 3+ 轮 → 高置信度空转
+              const primaryTool = toolCalls[0]?.name || '';
+              if (primaryTool === lastPrimaryToolName) {
+                consecutiveSameToolRounds++;
+              } else {
+                lastPrimaryToolName = primaryTool;
+                consecutiveSameToolRounds = 1;
               }
 
-              if (readOnlyStallScore >= sc.stallWarnLevel3 && lastStallWarnLevel < 3) {
+              // 根据探索度 + 同工具重复度计算空转增量
+              const newRatio = roundPaths.length > 0 ? newPaths.length / roundPaths.length : 0;
+              let stallIncrement: number;
+              if (consecutiveSameToolRounds >= 3) {
+                // 同一工具连续 3+ 轮：即使 query 不同，大概率是无效循环
+                stallIncrement = 2.0;
+              } else if (newRatio >= 0.5) {
+                stallIncrement = 0.5;
+              } else {
+                stallIncrement = 1.5;
+              }
+              readOnlyStallScore += stallIncrement;
+
+              // 去重命中 = 确定性重复行为 → 额外惩罚，加速触发警告
+              if (this.roundDedupHits > 0) {
+                readOnlyStallScore += this.roundDedupHits * 2.0;
+                logger.info(`${this.agent} 去重命中 ${this.roundDedupHits} 次，额外空转惩罚`, { totalDedupHits: this.totalDedupHits, stallScore: readOnlyStallScore }, LogCategory.LLM);
+              }
+
+              // 多级渐进式引导（只注入提示，不收回工具权限）
+              // 构建已访问文件列表（供警告消息使用，帮助模型感知已有状态）
+              const filePaths = [...visitedPaths].filter(p => !p.startsWith('__query:'));
+              const queryPaths = [...visitedPaths].filter(p => p.startsWith('__query:'));
+              const fileListStr = filePaths.length > 0
+                ? `\n已查看文件：${filePaths.slice(-8).map(p => `\n  - ${p}`).join('')}${filePaths.length > 8 ? `\n  - ...及其他 ${filePaths.length - 8} 个文件` : ''}`
+                : '';
+              const queryListStr = queryPaths.length > 0
+                ? `\n已执行搜索：${queryPaths.slice(-5).map(p => `\n  - ${p.replace('__query:', '')}`).join('')}${queryPaths.length > 5 ? `\n  - ...及其他 ${queryPaths.length - 5} 个查询` : ''}`
+                : '';
+              const visitedSummary = fileListStr + queryListStr;
+
+              if (readOnlyStallScore >= sc.stallAbortThreshold && lastStallWarnLevel < 4) {
+                lastStallWarnLevel = 4;
+                logger.warn(`${this.agent} 空转达到最终引导阈值`, { rounds: readOnlyConsecutiveRounds, score: readOnlyStallScore, uniquePaths: visitedPaths.size }, LogCategory.LLM);
+                this.conversationHistory.push({
+                  role: 'user',
+                  content: `[System] 你已连续 ${readOnlyConsecutiveRounds} 轮仅使用搜索/查看工具。你收集的信息已经完全足够。请立即开始修改代码或输出最终结论——不要再搜索。${visitedSummary}`,
+                });
+              } else if (readOnlyStallScore >= sc.stallWarnLevel3 && lastStallWarnLevel < 3) {
                 lastStallWarnLevel = 3;
                 logger.warn(`${this.agent} 空转最终警告`, { rounds: readOnlyConsecutiveRounds, score: readOnlyStallScore, uniquePaths: visitedPaths.size }, LogCategory.LLM);
                 this.conversationHistory.push({
                   role: 'user',
-                  content: `[System] ⚠️ 最终警告：你已连续 ${readOnlyConsecutiveRounds} 轮仅使用只读工具（已查看 ${visitedPaths.size} 个不同文件）。如果下一轮仍不使用 text_editor 的 write 命令修改代码，任务将被强制终止。请立即动手修改。`,
+                  content: `[System] ⚠️ 最终警告：你已连续 ${readOnlyConsecutiveRounds} 轮仅使用只读工具。下一轮你必须输出具体的分析结论或开始修改代码，否则工具调用将被收回。${visitedSummary}`,
                 });
               } else if (readOnlyStallScore >= sc.stallWarnLevel2 && lastStallWarnLevel < 2) {
                 lastStallWarnLevel = 2;
                 logger.warn(`${this.agent} 空转二级警告`, { rounds: readOnlyConsecutiveRounds, score: readOnlyStallScore, uniquePaths: visitedPaths.size }, LogCategory.LLM);
                 this.conversationHistory.push({
                   role: 'user',
-                  content: `[System] 你已连续 ${readOnlyConsecutiveRounds} 轮仅使用搜索/查看类工具，已查看 ${visitedPaths.size} 个不同文件。你收集的信息已经足够，请立即使用 text_editor 的 write 命令开始修改代码。不要再查看文件。`,
+                  content: `[System] 你已连续 ${readOnlyConsecutiveRounds} 轮仅使用搜索/查看类工具。你收集的信息已经足够，请立即输出分析结论或开始修改代码。不要再查看文件。${visitedSummary}`,
                 });
               } else if (readOnlyStallScore >= sc.stallWarnLevel1 && lastStallWarnLevel < 1) {
                 lastStallWarnLevel = 1;
                 logger.info(`${this.agent} 空转一级提醒`, { rounds: readOnlyConsecutiveRounds, score: readOnlyStallScore, uniquePaths: visitedPaths.size }, LogCategory.LLM);
                 this.conversationHistory.push({
                   role: 'user',
-                  content: `[System] 你已连续 ${readOnlyConsecutiveRounds} 轮仅使用只读工具查看代码（已查看 ${visitedPaths.size} 个文件）。请考虑开始使用 text_editor 修改代码来推进任务。`,
+                  content: `[System] 你已连续 ${readOnlyConsecutiveRounds} 轮仅使用只读工具（已查看 ${visitedPaths.size} 个文件）。请考虑输出你的分析结论，或开始修改代码来推进任务。`,
                 });
               }
             } else {
@@ -481,6 +553,11 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
               readOnlyStallScore = 0;
               readOnlyConsecutiveRounds = 0;
               lastStallWarnLevel = 0;
+              lastPrimaryToolName = '';
+              consecutiveSameToolRounds = 0;
+              // 写入操作也重置无输出计数——模型在修改代码即为有效产出
+              noSubstantiveOutputRounds = 0;
+              lastNoOutputWarnLevel = 0;
               // 注意：visitedPaths 不重置，保持全局去重
             }
           }
@@ -491,14 +568,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           if (accumulatedText.trim().length < SUBSTANTIVE_TEXT_THRESHOLD) {
             noSubstantiveOutputRounds++;
 
-            if (noSubstantiveOutputRounds >= sc.noOutputAbort) {
-              finalText = accumulatedText || `连续 ${noSubstantiveOutputRounds} 轮未产出实质性文本内容，仅调用工具。任务终止，请检查任务描述是否足够明确。`;
-              logger.warn(`${this.agent} 无实质输出终止`, { rounds: noSubstantiveOutputRounds, totalRound: round }, LogCategory.LLM);
-              this.normalizer.endStream(streamId);
-              break;
-            }
-
-            if (noSubstantiveOutputRounds >= sc.noOutputForce && lastNoOutputWarnLevel < 2) {
+            if (noSubstantiveOutputRounds >= sc.noOutputAbort && lastNoOutputWarnLevel < 3) {
+              lastNoOutputWarnLevel = 3;
+              logger.warn(`${this.agent} 无实质输出达到最终引导`, { rounds: noSubstantiveOutputRounds, totalRound: round }, LogCategory.LLM);
+              this.conversationHistory.push({
+                role: 'user',
+                content: `[System] 你已连续 ${noSubstantiveOutputRounds} 轮未产出面向用户的文本内容。请在完成当前操作后，输出你的执行进展和结果摘要。`,
+              });
+            } else if (noSubstantiveOutputRounds >= sc.noOutputForce && lastNoOutputWarnLevel < 2) {
               lastNoOutputWarnLevel = 2;
               logger.warn(`${this.agent} 无实质输出二级警告`, { rounds: noSubstantiveOutputRounds }, LogCategory.LLM);
               this.conversationHistory.push({
@@ -571,6 +648,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    */
   clearHistory(): void {
     this.conversationHistory = [];
+    this.rollingContextSummary = null;
+    // 对话历史清空 → 模型失去已查看文件的上下文 → 去重状态同步重置
+    this.searchResultCache.clear();
+    this.viewedFiles.clear();
+    this.viewedRanges.clear();
+    this.totalDedupHits = 0;
     logger.debug(`${this.agent} conversation history cleared`, undefined, LogCategory.LLM);
   }
 
@@ -622,6 +705,45 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         continue;
       }
 
+      // 文件级去重：同一文件只需读取一次，阻断"对同一文件反复发起不同查询"的模式
+      const fileDedup = this.checkFileAccessDuplicate(toolCall);
+      if (fileDedup) {
+        logger.info(`${this.agent} 文件级去重命中`, { tool: toolCall.name, path: toolCall.arguments?.path }, LogCategory.TOOLS);
+        results.push({
+          toolCallId: toolCall.id,
+          content: fileDedup,
+          isError: false,
+        });
+        this.emit('toolResult', toolCall.name, fileDedup);
+        continue;
+      }
+
+      // 检索去重：只读工具的相似查询直接返回缓存结果，阻断无效循环
+      const dedupResult = this.checkSearchDuplicate(toolCall);
+      if (dedupResult) {
+        logger.info(`${this.agent} 检索去重命中`, { tool: toolCall.name }, LogCategory.TOOLS);
+        results.push({
+          toolCallId: toolCall.id,
+          content: dedupResult,
+          isError: false,
+        });
+        this.emit('toolResult', toolCall.name, dedupResult);
+        continue;
+      }
+
+      // 失败写操作去重：相同参数的写操作重复失败时短路拦截
+      const failedWriteDedup = this.checkFailedWriteDuplicate(toolCall);
+      if (failedWriteDedup) {
+        logger.info(`${this.agent} 失败写操作去重命中`, { tool: toolCall.name, path: toolCall.arguments?.path }, LogCategory.TOOLS);
+        results.push({
+          toolCallId: toolCall.id,
+          content: failedWriteDedup,
+          isError: true,
+        });
+        this.emit('toolResult', toolCall.name, failedWriteDedup);
+        continue;
+      }
+
       try {
         logger.debug(`Executing tool: ${toolCall.name}`, { args: toolCall.arguments }, LogCategory.TOOLS);
 
@@ -631,6 +753,22 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           result.content = `${truncated}\n...[truncated ${result.content.length - maxToolResultChars} chars]`;
         }
         results.push(result);
+
+        // 缓存只读工具的成功结果
+        if (!result.isError && this.isReadOnlyToolCall(toolCall)) {
+          this.cacheSearchResult(toolCall, result.content);
+          // 记录文件访问（用于文件级去重）
+          this.recordFileAccess(toolCall);
+        }
+
+        // 写操作结果追踪：成功则清除失败缓存，失败则记录
+        if (!this.isReadOnlyToolCall(toolCall)) {
+          if (result.isError) {
+            this.recordFailedWrite(toolCall, typeof result.content === 'string' ? result.content : 'Unknown error');
+          } else {
+            this.clearFailedWriteForPath(toolCall);
+          }
+        }
 
         this.emit('toolResult', toolCall.name, result.content);
 
@@ -642,9 +780,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           error: error.message,
         }, LogCategory.TOOLS);
 
+        const errorContent = `Error: ${error.message}`;
+        this.recordFailedWrite(toolCall, errorContent);
+
         results.push({
           toolCallId: toolCall.id,
-          content: `Error: ${error.message}`,
+          content: errorContent,
           isError: true,
         });
       }
@@ -723,7 +864,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
   /**
    * 截断历史（如果超过限制）
-   * 保留最近的 N 轮对话
+   * 保留最近的 N 轮对话，被丢弃的消息提取关键信息生成滚动摘要
    */
   private truncateHistoryIfNeeded(): void {
     const { maxMessages, maxChars, preserveRecentRounds } = this.historyConfig;
@@ -742,13 +883,104 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     // 截断旧消息，保留最近的
     const truncatedCount = currentLength - preserveCount;
     if (truncatedCount > 0) {
+      const droppedMessages = this.conversationHistory.slice(0, truncatedCount);
       this.conversationHistory = this.conversationHistory.slice(-preserveCount);
+
+      // 从被丢弃的消息中提取关键信息，合并到滚动摘要
+      this.updateRollingSummary(droppedMessages);
+
+      // 将滚动摘要注入对话历史开头，确保 LLM 不丢失前期发现
+      // 注意：必须避免连续两条 user role（Claude API 要求 role 交替）
+      if (this.rollingContextSummary) {
+        const firstMsg = this.conversationHistory[0];
+        if (firstMsg && firstMsg.role === 'user') {
+          // 保留消息的首条已是 user → 合并摘要到该条消息，避免连续 user role
+          if (typeof firstMsg.content === 'string') {
+            firstMsg.content = `${this.rollingContextSummary}\n\n---\n\n${firstMsg.content}`;
+          } else if (Array.isArray(firstMsg.content)) {
+            (firstMsg.content as any[]).unshift({ type: 'text', text: this.rollingContextSummary });
+          }
+        } else {
+          // 首条是 assistant 或对话为空 → 正常 unshift user 消息
+          this.conversationHistory.unshift({
+            role: 'user',
+            content: this.rollingContextSummary,
+          });
+        }
+      }
+
       logger.debug(`${this.agent} history truncated`, {
         removedMessages: truncatedCount,
         remainingMessages: this.conversationHistory.length,
         previousChars: currentChars,
         currentChars: this.getHistoryChars(),
+        hasRollingSummary: !!this.rollingContextSummary,
       }, LogCategory.LLM);
+    }
+  }
+
+  /**
+   * 从被丢弃的消息中提取关键信息，合并到滚动上下文摘要
+   *
+   * 提取规则（规则式，不依赖 LLM）：
+   * 1. assistant 消息的结论性语句（首段或末段）
+   * 2. 工具调用中的文件路径和操作类型
+   * 3. 错误诊断信息
+   */
+  private updateRollingSummary(droppedMessages: LLMMessage[]): void {
+    const keyPoints: string[] = [];
+
+    for (const msg of droppedMessages) {
+      const content = typeof msg.content === 'string'
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content
+              .filter((block: any) => block?.type === 'text')
+              .map((block: any) => block.text || '')
+              .join(' ')
+          : '';
+
+      // 提取 assistant 回复中的关键结论（文本长度 >= 10 字符才有提取价值）
+      if (msg.role === 'assistant' && content && content.length >= 10) {
+        const trimmed = content.trim();
+        if (trimmed.length <= 400) {
+          keyPoints.push(`[结论] ${trimmed}`);
+        } else {
+          const head = trimmed.substring(0, 200).trim();
+          const tail = trimmed.substring(trimmed.length - 200).trim();
+          keyPoints.push(`[结论] ${head}...${tail}`);
+        }
+      }
+
+      // 提取工具调用中的文件路径（独立于文本内容长度判断）
+      if (Array.isArray(msg.content)) {
+        for (const block of msg.content as any[]) {
+          if (block?.type === 'tool_use') {
+            const toolName = block.name || '';
+            const input = block.input || {};
+            const filePath = input.path || input.file_path || input.filePath || '';
+            if (filePath) {
+              keyPoints.push(`[工具] ${toolName}: ${filePath}`);
+            }
+          }
+        }
+      }
+    }
+
+    if (keyPoints.length === 0) return;
+
+    // 将新提取的关键信息合并到已有摘要
+    const newContent = keyPoints.join('\n');
+    const prevSummary = this.rollingContextSummary || '';
+    const merged = prevSummary
+      ? `${prevSummary}\n---\n${newContent}`
+      : newContent;
+
+    // 超长时裁剪：保留最新的内容（尾部优先）
+    if (merged.length > WorkerLLMAdapter.MAX_ROLLING_SUMMARY_CHARS) {
+      this.rollingContextSummary = `[System 上下文回顾] 以下是之前工作中的关键发现和操作记录（已自动精简）：\n\n${merged.substring(merged.length - WorkerLLMAdapter.MAX_ROLLING_SUMMARY_CHARS + 100)}`;
+    } else {
+      this.rollingContextSummary = `[System 上下文回顾] 以下是之前工作中的关键发现和操作记录：\n\n${merged}`;
     }
   }
 
@@ -833,10 +1065,9 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       return true;
     }
 
-    // text_editor：view/list 命令是只读，write/create/undo_edit 是写入
-    if (name === 'text_editor') {
-      const command = toolCall.arguments?.command;
-      return command === 'view' || command === 'list';
+    // file_view 是只读工具
+    if (name === 'file_view') {
+      return true;
     }
 
     // MCP 工具：通过名称模式判断（搜索/检索/读取/查看类）
@@ -853,7 +1084,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    * 从一批工具调用中提取访问的文件路径（用于空转探索度判定）
    *
    * 提取逻辑：
-   * - text_editor view → arguments.path
+   * - file_view → arguments.path
    * - grep_search → arguments.path（搜索路径）
    * - codebase_retrieval → arguments.query（搜索关键词作为伪路径）
    * - MCP 工具 → 尝试从 arguments 中提取 path/file/filepath 等字段
@@ -875,5 +1106,258 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       }
     }
     return paths;
+  }
+
+  /**
+   * 检索去重：检查工具调用是否与之前的查询高度相似
+   *
+   * 通过提取查询中的关键标识符（英文单词、文件路径、数字），
+   * 计算与缓存查询的 Jaccard 相似度。相似度 > 50% 视为重复。
+   *
+   * 返回去重提示（命中时）或 null（未命中时）。
+   */
+  private checkSearchDuplicate(toolCall: ToolCall): string | null {
+    if (!this.isReadOnlyToolCall(toolCall)) return null;
+
+    // file_view 是文件读取操作（无论是否带 view_range），
+    // 由 L1/L1+ 文件级去重处理，不参与 Jaccard 检索去重
+    if (toolCall.name === 'file_view') {
+      return null;
+    }
+
+    const newIdentifiers = this.extractQueryIdentifiers(toolCall);
+    if (newIdentifiers.length === 0) return null;
+
+    const newSet = new Set(newIdentifiers);
+
+    for (const [cachedKey, cachedResult] of this.searchResultCache) {
+      const cachedTokens = cachedKey.split('\x00');
+      const cachedSet = new Set(cachedTokens);
+
+      // Jaccard 相似度
+      const intersection = [...newSet].filter(t => cachedSet.has(t)).length;
+      const union = new Set([...newSet, ...cachedSet]).size;
+      const similarity = intersection / union;
+
+      if (similarity >= 0.4) {
+        this.totalDedupHits++;
+        this.roundDedupHits++;
+
+        if (this.totalDedupHits >= 3) {
+          // 第3次及以后：不再提供缓存内容，直接拒绝——迫使模型使用已有信息
+          return `[系统拒绝] 重复检索已被拦截（第 ${this.totalDedupHits} 次）。你之前已获取过此信息，系统不再重复提供。请立即使用已有信息完成任务，不要继续搜索或查看。`;
+        }
+
+        // 前2次：返回缓存结果 + 去重提示
+        return `[系统提示] 你之前已执行过相同或高度相似的检索，以下是之前的检索结果（无需再次搜索，请直接使用这些信息继续任务）：\n\n${cachedResult}`;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * 文件级去重：检查工具调用是否正在访问已完整读取过的文件
+   *
+   * 解决的核心问题：模型把工具当"数据库查询"用，对同一文件反复发起不同的
+   * search/view 请求，而不是一次读取完整文件后从上下文中提取信息。
+   * Jaccard 去重无法捕捉这种"不同查询、同一目标文件"的模式。
+   *
+   * 仅在文件已被完整读取（无 view_range）后才拦截，避免阻止合理的分段读取。
+   */
+  private checkFileAccessDuplicate(toolCall: ToolCall): string | null {
+    if (!this.isReadOnlyToolCall(toolCall)) return null;
+
+    const filePath = this.extractTargetFilePath(toolCall);
+    if (!filePath) return null;
+
+    if (this.viewedFiles.has(filePath)) {
+      this.totalDedupHits++;
+      this.roundDedupHits++;
+      const basename = filePath.split('/').pop() || filePath;
+      return `[系统提示] 文件 ${basename} 已被完整读取过，全部内容已在你的对话上下文中。请直接从上下文中查找所需信息，不要重复访问同一文件。`;
+    }
+
+    // L1+: 分段读取追踪（仅 file_view + view_range）
+    if (toolCall.name === 'file_view'
+      && toolCall.arguments?.view_range) {
+      const range = toolCall.arguments.view_range;
+      const rangeKey = Array.isArray(range) ? `${range[0]}-${range[1]}` : String(range);
+      const fileRanges = this.viewedRanges.get(filePath);
+
+      if (fileRanges) {
+        // 精确去重：同一 range 已读取过
+        if (fileRanges.has(rangeKey)) {
+          this.totalDedupHits++;
+          this.roundDedupHits++;
+          const basename = filePath.split('/').pop() || filePath;
+          return `[系统提示] 文件 ${basename} 的 ${rangeKey} 行已被读取过，请使用已有内容。`;
+        }
+        // 碎片化预警：同一文件 ≥3 段分段读取 → 建议全量读取
+        if (fileRanges.size >= 3) {
+          this.totalDedupHits++;
+          this.roundDedupHits++;
+          const basename = filePath.split('/').pop() || filePath;
+          return `[系统提示] 你已对 ${basename} 进行了 ${fileRanges.size} 次分段读取。请直接使用 file_view（不带 view_range）完整读取该文件，而不是反复分段读取。`;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * 失败写操作去重：检查工具调用是否与之前已失败的写操作完全相同
+   *
+   * 解决的核心问题：模型（尤其 Codex/o3-mini）对工具错误缺乏适应性，
+   * 会反复重试完全相同的失败操作（如 create 一个已存在的文件）。
+   * 相同参数的写操作连续失败 2+ 次时短路拦截，避免浪费 API 轮次。
+   *
+   * 返回拦截提示（命中时）或 null（未命中时）。
+   */
+  private checkFailedWriteDuplicate(toolCall: ToolCall): string | null {
+    if (this.isReadOnlyToolCall(toolCall)) return null;
+
+    const key = this.buildWriteOperationKey(toolCall);
+    const cached = this.failedWriteCache.get(key);
+    if (!cached) return null;
+
+    // 相同写操作已失败过 → 短路拦截
+    cached.count++;
+    this.totalDedupHits++;
+    this.roundDedupHits++;
+
+    return `[系统拦截] 此操作已失败 ${cached.count} 次，错误：${cached.error}。请勿重复相同操作，改用其他方式完成任务。`;
+  }
+
+  /**
+   * 记录失败的写操作（工具执行失败后调用）
+   */
+  private recordFailedWrite(toolCall: ToolCall, error: string): void {
+    if (this.isReadOnlyToolCall(toolCall)) return;
+
+    const key = this.buildWriteOperationKey(toolCall);
+    const existing = this.failedWriteCache.get(key);
+    if (existing) {
+      existing.count++;
+      existing.error = error;
+    } else {
+      this.failedWriteCache.set(key, { count: 1, error });
+    }
+  }
+
+  /**
+   * 清除写操作失败缓存（写操作成功时调用，表明状态已变化）
+   */
+  private clearFailedWriteForPath(toolCall: ToolCall): void {
+    // 任何写操作成功后，清除同文件的失败缓存（文件状态已变化，之前的失败可能不再适用）
+    const filePath = (toolCall.arguments?.path || toolCall.arguments?.file_path || '') as string;
+    if (!filePath) return;
+    for (const key of this.failedWriteCache.keys()) {
+      if (key.includes(filePath)) {
+        this.failedWriteCache.delete(key);
+      }
+    }
+  }
+
+  /**
+   * 构建写操作的去重 key（工具名 + 关键参数）
+   */
+  private buildWriteOperationKey(toolCall: ToolCall): string {
+    const args = toolCall.arguments || {};
+    // file_edit/file_create/file_insert: path 足以标识
+    if (toolCall.name === 'file_edit' || toolCall.name === 'file_create' || toolCall.name === 'file_insert') {
+      return `${toolCall.name}:${args.path || ''}`;
+    }
+    // 其他写操作工具：name + path
+    const filePath = args.path || args.file_path || args.filepath || '';
+    return `${toolCall.name}:${filePath}`;
+  }
+
+  /**
+   * 记录文件访问（工具执行成功后调用）
+   * 仅在完整读取（无 view_range）时标记为已读，分段读取不标记
+   */
+  private recordFileAccess(toolCall: ToolCall): void {
+    const filePath = this.extractTargetFilePath(toolCall);
+    if (!filePath) return;
+
+    if (toolCall.name === 'file_view') {
+      if (toolCall.arguments?.view_range) {
+        // 分段读取 → 记录 range（用于 L1+ 精确去重和碎片化预警）
+        const range = toolCall.arguments.view_range;
+        const rangeKey = Array.isArray(range) ? `${range[0]}-${range[1]}` : String(range);
+        if (!this.viewedRanges.has(filePath)) {
+          this.viewedRanges.set(filePath, new Set());
+        }
+        this.viewedRanges.get(filePath)!.add(rangeKey);
+      } else {
+        // 完整读取 → 标记文件
+        this.viewedFiles.add(filePath);
+      }
+    }
+    // grep_search、search_context 返回的是片段，不标记为完整读取
+  }
+
+  /**
+   * 从工具调用中提取目标文件路径（仅返回具体文件，不返回目录）
+   */
+  private extractTargetFilePath(toolCall: ToolCall): string | null {
+    const args = toolCall.arguments || {};
+
+    // file_view → path 字段
+    if (toolCall.name === 'file_view') {
+      return typeof args.path === 'string' ? args.path : null;
+    }
+
+    // grep_search → path 字段（仅当指向具体文件而非目录时）
+    if (toolCall.name === 'grep_search' && typeof args.path === 'string') {
+      const p = args.path;
+      // 有文件扩展名 → 具体文件；无扩展名或以 / 结尾 → 目录，不拦截
+      if (/\.\w+$/.test(p)) return p;
+    }
+
+    return null;
+  }
+
+  /**
+   * 缓存只读工具的查询结果
+   */
+  private cacheSearchResult(toolCall: ToolCall, result: string): void {
+    // file_view 是文件读取，不缓存到检索结果中（避免污染 Jaccard 缓存）
+    if (toolCall.name === 'file_view') return;
+
+    const identifiers = this.extractQueryIdentifiers(toolCall);
+    if (identifiers.length === 0) return;
+
+    // 用 \x00 分隔标识符作为缓存 key
+    const key = identifiers.join('\x00');
+    this.searchResultCache.set(key, result);
+  }
+
+  /**
+   * 从工具调用参数中提取关键标识符（英文单词、文件路径片段、数字）
+   *
+   * 例如查询 "请详细列出与 isWeekend 测试相关的符号：tests/date-utils.test.ts"
+   * → ["isWeekend", "tests", "date-utils.test.ts"]
+   *
+   * 这些标识符用于相似度比较，忽略中文措辞差异，聚焦于实际搜索的代码实体。
+   */
+  private extractQueryIdentifiers(toolCall: ToolCall): string[] {
+    const args = toolCall.arguments || {};
+    // 收集所有可能包含搜索意图的字段
+    const texts: string[] = [];
+    for (const val of Object.values(args)) {
+      if (typeof val === 'string') texts.push(val);
+    }
+    if (texts.length === 0) return [];
+
+    const combined = texts.join(' ');
+    // 提取英文标识符（含点号/连字符，捕获文件路径如 date-utils.test.ts）
+    // 过滤单字符噪声（如 "d", "s"），避免降低 Jaccard 相似度
+    const matches = combined.match(/[a-zA-Z_][\w.-]*/g) || [];
+    const filtered = matches.filter(m => m.length >= 2);
+    // 去重 + 排序，确保相同标识符集合产生相同 key
+    return [...new Set(filtered)].sort();
   }
 }
