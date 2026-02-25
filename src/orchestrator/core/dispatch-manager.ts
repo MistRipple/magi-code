@@ -22,7 +22,7 @@ import type { Assignment } from '../mission';
 import type { WorkerReport, OrchestratorResponse } from '../protocols/worker-report';
 import { createAdjustResponse } from '../protocols/worker-report';
 import { DispatchBatch, CancellationError, type DispatchEntry, type DispatchResult, type DispatchStatus } from './dispatch-batch';
-import type { WorkerCompletionResult } from '../../tools/orchestration-executor';
+import type { WorkerCompletionResult, WaitForWorkersResult } from '../../tools/orchestration-executor';
 import { buildDispatchSummaryPrompt } from '../prompts/orchestrator-prompts';
 import { MessageType } from '../../protocol/message-protocol';
 import { PlanningExecutor } from './executors/planning-executor';
@@ -73,6 +73,8 @@ export class DispatchManager {
   private completionResolvers: Array<() => void> = [];
   /** 标记编排者是否调用了 wait_for_workers（决定是否跳过自动 Phase C） */
   private reactiveMode = false;
+  /** 反应式 Batch 是否仍等待主对话区最终汇总 */
+  private reactiveBatchAwaitingSummary = new Set<string>();
 
   constructor(private deps: DispatchManagerDeps) {
     this.setupMissionEventListeners();
@@ -173,6 +175,9 @@ export class DispatchManager {
 
         // 确保 DispatchBatch 存在（一次 orchestrator LLM 调用共享一个 Batch）
         if (!this.activeBatch || this.activeBatch.status !== 'active') {
+          if (this.activeBatch?.status === 'archived') {
+            this.reactiveBatchAwaitingSummary.delete(this.activeBatch.id);
+          }
           // 使用 Mission ID 作为 Batch ID，确保 Todo 关联到正确的 Mission
           const missionId = this.deps.getLastMissionId();
           this.activeBatch = new DispatchBatch(missionId);
@@ -473,9 +478,11 @@ export class DispatchManager {
 
       if (this.reactiveMode) {
         // 反应式模式：编排者通过 wait_for_workers 接收结果并自行汇总
-        // 直接归档，不触发 Phase C
+        // 标记等待主对话区最终汇总，直接归档，不触发 Phase C
+        this.reactiveBatchAwaitingSummary.add(batchId);
         batch.archive();
       } else {
+        this.reactiveBatchAwaitingSummary.delete(batchId);
         // 传统模式：自动触发 Phase C 汇总
         void this.triggerPhaseCSummary(batch, entries);
       }
@@ -483,6 +490,7 @@ export class DispatchManager {
 
     // Batch 被取消 → 不触发 Phase C，直接通知用户
     batch.on('batch:cancelled', (batchId: string, reason: string) => {
+      this.reactiveBatchAwaitingSummary.delete(batchId);
       logger.info('DispatchBatch.已取消', { batchId, reason }, LogCategory.ORCHESTRATOR);
       this.deps.messageHub.orchestratorMessage(`任务已取消: ${reason}`);
     });
@@ -563,6 +571,60 @@ export class DispatchManager {
     });
     this.deps.messageHub.notify('汇总模型调用失败，以下为各 Worker 原始执行结果', 'warning');
     this.deps.messageHub.orchestratorMessage(lines.join('\n'), { type: MessageType.RESULT });
+  }
+
+  /**
+   * 判断指定 Batch 是否处于“反应式模式且等待最终汇总”状态
+   */
+  isReactiveBatchAwaitingSummary(batchId: string): boolean {
+    return this.reactiveBatchAwaitingSummary.has(batchId);
+  }
+
+  /**
+   * 标记反应式 Batch 已完成最终汇总
+   */
+  markReactiveBatchSummarized(batchId: string): void {
+    this.reactiveBatchAwaitingSummary.delete(batchId);
+  }
+
+  /**
+   * 构建反应式编排的确定性兜底汇总
+   *
+   * 用于编排者未输出最终结论时，保证主对话区仍有可读结论。
+   */
+  buildReactiveBatchFallbackSummary(batch: DispatchBatch): string {
+    const entries = batch.getEntries();
+    const summary = batch.getSummary();
+    const modifiedFiles = Array.from(new Set(entries.flatMap(e => e.result?.modifiedFiles || [])));
+
+    const statusLabel = (status: DispatchStatus): string => {
+      switch (status) {
+        case 'completed': return '已完成';
+        case 'failed': return '失败';
+        case 'skipped': return '跳过';
+        case 'cancelled': return '已取消';
+        case 'running': return '执行中';
+        case 'pending':
+        case 'waiting_deps':
+          return '等待中';
+        default:
+          return status;
+      }
+    };
+
+    const taskLines = entries.map((entry, index) =>
+      `${index + 1}. [${entry.worker}] ${entry.task} -> ${statusLabel(entry.status)}；${entry.result?.summary || '无结果摘要'}`
+    );
+
+    const lines = [
+      `Worker 阶段执行完成（自动汇总）：共 ${summary.total} 项，成功 ${summary.completed} 项，失败 ${summary.failed} 项，跳过 ${summary.skipped} 项，取消 ${summary.cancelled} 项。`,
+      ...taskLines,
+      modifiedFiles.length > 0
+        ? `涉及修改文件：${modifiedFiles.join('，')}`
+        : '涉及修改文件：无',
+    ];
+
+    return lines.join('\n');
   }
 
   /**
@@ -685,12 +747,19 @@ ${this.deps.getActiveUserPrompt()}
    * 反应式编排的核心阻塞点：编排者 LLM 在工具循环中调用此方法，
    * 挂起直到 Worker 完成结果到达，然后基于结果决策下一步。
    */
-  async waitForWorkers(taskIds?: string[]): Promise<{ results: WorkerCompletionResult[] }> {
+  async waitForWorkers(taskIds?: string[]): Promise<WaitForWorkersResult> {
     this.reactiveMode = true;
+    const waitStartedAt = Date.now();
 
     const batch = this.activeBatch;
     if (!batch) {
-      return { results: [] };
+      return {
+        results: [],
+        wait_status: 'completed',
+        timed_out: false,
+        pending_task_ids: [],
+        waited_ms: 0,
+      };
     }
 
     // 确定等待目标
@@ -704,26 +773,41 @@ ${this.deps.getActiveUserPrompt()}
         // 等待全部：检查 batch 内是否还有 pending/running 任务
         return batch.isAllCompleted();
       }
-      // 等待指定任务：检查这些任务是否都已出现在 completionQueue 中
-      const completedIds = new Set(this.completionQueue.map(r => r.task_id));
-      return Array.from(targetIds).every(id => completedIds.has(id));
+      // 等待指定任务：检查这些任务是否都已进入终态
+      return Array.from(targetIds).every(id => {
+        const entry = batch.getEntry(id);
+        return !!entry && this.isTerminalStatus(entry.status);
+      });
     };
 
     // 如果已满足，直接返回
     if (isTargetSatisfied()) {
-      return { results: this.drainCompletionResults(targetIds) };
+      return {
+        results: this.drainCompletionResults(targetIds, batch),
+        wait_status: 'completed',
+        timed_out: false,
+        pending_task_ids: [],
+        waited_ms: Date.now() - waitStartedAt,
+      };
     }
 
     // 等待唤醒
     const WAIT_TIMEOUT = 10 * 60 * 1000; // 10 分钟总超时
-    const startTime = Date.now();
+    let timedOut = false;
 
     while (!isTargetSatisfied()) {
-      if (Date.now() - startTime > WAIT_TIMEOUT) {
+      const elapsed = Date.now() - waitStartedAt;
+      if (elapsed > WAIT_TIMEOUT) {
+        timedOut = true;
         logger.warn('waitForWorkers.超时', {
-          elapsed: Date.now() - startTime,
+          elapsed,
           targetIds: targetIds ? Array.from(targetIds) : 'all',
         }, LogCategory.ORCHESTRATOR);
+        const pendingTaskIds = this.getPendingTargetTaskIds(batch, targetIds);
+        this.deps.messageHub.notify(
+          `wait_for_workers 超时（${Math.round(elapsed / 1000)}s），仍有 ${pendingTaskIds.length} 个任务未完成`,
+          'warning',
+        );
         break;
       }
 
@@ -735,13 +819,47 @@ ${this.deps.getActiveUserPrompt()}
       });
     }
 
-    return { results: this.drainCompletionResults(targetIds) };
+    const pendingTaskIds = this.getPendingTargetTaskIds(batch, targetIds);
+    return {
+      results: this.drainCompletionResults(targetIds, batch),
+      wait_status: timedOut ? 'timeout' : 'completed',
+      timed_out: timedOut,
+      pending_task_ids: pendingTaskIds,
+      waited_ms: Date.now() - waitStartedAt,
+    };
+  }
+
+  /**
+   * 判断任务状态是否为终态
+   */
+  private isTerminalStatus(status: DispatchStatus): boolean {
+    return status === 'completed' || status === 'failed' || status === 'skipped' || status === 'cancelled';
+  }
+
+  /**
+   * 获取当前等待目标中仍未完成的 task_id 列表
+   */
+  private getPendingTargetTaskIds(batch: DispatchBatch, targetIds: Set<string> | null): string[] {
+    if (!targetIds) {
+      return batch.getEntries()
+        .filter(entry => !this.isTerminalStatus(entry.status))
+        .map(entry => entry.taskId);
+    }
+
+    const pending: string[] = [];
+    for (const taskId of targetIds) {
+      const entry = batch.getEntry(taskId);
+      if (!entry || !this.isTerminalStatus(entry.status)) {
+        pending.push(taskId);
+      }
+    }
+    return pending;
   }
 
   /**
    * 从完成队列中提取匹配的结果
    */
-  private drainCompletionResults(targetIds: Set<string> | null): WorkerCompletionResult[] {
+  private drainCompletionResults(targetIds: Set<string> | null, batch?: DispatchBatch): WorkerCompletionResult[] {
     if (!targetIds) {
       // 全部提取
       const results = this.completionQueue.splice(0);
@@ -758,6 +876,25 @@ ${this.deps.getActiveUserPrompt()}
         remaining.push(result);
       }
     }
+
+    // 若结果已被此前 wait 调用消费，则从 Batch 终态回填，避免返回空结果
+    if (batch) {
+      const matchedIds = new Set(matched.map(item => item.task_id));
+      for (const taskId of targetIds) {
+        if (matchedIds.has(taskId)) continue;
+        const entry = batch.getEntry(taskId);
+        if (!entry || !this.isTerminalStatus(entry.status)) continue;
+        matched.push({
+          task_id: entry.taskId,
+          worker: entry.worker,
+          status: entry.status as WorkerCompletionResult['status'],
+          summary: entry.result?.summary || '',
+          modified_files: entry.result?.modifiedFiles || [],
+          errors: entry.result?.errors,
+        });
+      }
+    }
+
     this.completionQueue = remaining;
     return matched;
   }
@@ -768,5 +905,6 @@ ${this.deps.getActiveUserPrompt()}
     this.completionQueue = [];
     this.completionResolvers = [];
     this.reactiveMode = false;
+    this.reactiveBatchAwaitingSummary.clear();
   }
 }

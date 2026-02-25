@@ -54,13 +54,25 @@ export interface WorkerCompletionResult {
 }
 
 /**
+ * wait_for_workers 返回结构
+ */
+export interface WaitForWorkersResult {
+  results: WorkerCompletionResult[];
+  /** completed: 已满足等待条件；timeout: 到达超时阈值仍未满足 */
+  wait_status: 'completed' | 'timeout';
+  timed_out: boolean;
+  /** 本次等待目标中仍未完成的任务 ID */
+  pending_task_ids: string[];
+  /** 阻塞耗时（毫秒） */
+  waited_ms: number;
+}
+
+/**
  * wait_for_workers 回调：阻塞直到指定（或全部）Worker 完成
  */
 export type WaitForWorkersHandler = (params: {
   task_ids?: string[];
-}) => Promise<{
-  results: WorkerCompletionResult[];
-}>;
+}) => Promise<WaitForWorkersResult>;
 
 /**
  * 编排工具执行器
@@ -255,7 +267,7 @@ export class OrchestrationExecutor {
   private getWaitForWorkersDefinition(): ExtendedToolDefinition {
     return {
       name: 'wait_for_workers',
-      description: '等待已分配的 Worker 完成执行并返回结果。这是反应式编排的核心工具：dispatch_task 发送任务后，调用此工具阻塞等待结果，然后根据结果决定是否追加新任务或结束。不传 task_ids 则等待当前批次全部完成。',
+      description: '等待已分配的 Worker 完成执行并返回结果。这是反应式编排的核心工具：dispatch_task 发送任务后，调用此工具阻塞等待结果，然后根据结果决定是否追加新任务或结束。不传 task_ids 则等待当前批次全部完成。返回包含 wait_status（completed/timeout）和 pending_task_ids，timeout 时必须继续决策，不可当作全部完成。',
       input_schema: {
         type: 'object',
         properties: {
@@ -296,6 +308,10 @@ export class OrchestrationExecutor {
       });
 
       logger.info('wait_for_workers 完成', {
+        waitStatus: result.wait_status,
+        timedOut: result.timed_out,
+        pendingTaskIds: result.pending_task_ids,
+        waitedMs: result.waited_ms,
         resultCount: result.results.length,
         successes: result.results.filter(r => r.status === 'completed').length,
         failures: result.results.filter(r => r.status === 'failed').length,

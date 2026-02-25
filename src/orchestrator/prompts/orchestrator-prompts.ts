@@ -150,7 +150,15 @@ ${toolsListSection}
 **使用 wait_for_workers**：
 - 不传 task_ids → 等待当前批次中所有任务完成
 - 传 task_ids → 只等待指定任务完成（用于分阶段协调）
-- 返回结构化结果：{ results: [{ task_id, worker, status, summary, modified_files, errors }] }
+- 返回结构化结果：
+  {
+    results: [{ task_id, worker, status, summary, modified_files, errors }],
+    wait_status: "completed" | "timeout",
+    timed_out: boolean,
+    pending_task_ids: string[],
+    waited_ms: number
+  }
+- 当 wait_status = "timeout" 时，表示未全部完成，必须基于 pending_task_ids 决策“继续等待”或“调整任务”，禁止直接当作完成
 
 **示例**：
 \`\`\`

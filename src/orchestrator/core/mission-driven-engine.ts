@@ -537,10 +537,11 @@ export class MissionDrivenEngine extends EventEmitter {
 
         // 4. 设置编排者快照上下文（确保编排者直接工具调用也能记录快照）
         const orchestratorToolManager = this.adapterFactory.getToolManager();
+        const orchestratorAssignmentId = `orchestrator-${mission.id}`;
         orchestratorToolManager.setSnapshotContext({
-          missionId: taskId,
-          assignmentId: `orchestrator-${taskId}`,
-          todoId: `orchestrator-${taskId}`,
+          missionId: mission.id,
+          assignmentId: orchestratorAssignmentId,
+          todoId: orchestratorAssignmentId,
           workerId: 'orchestrator',
         });
 
@@ -573,11 +574,31 @@ export class MissionDrivenEngine extends EventEmitter {
           throw new Error(response.error);
         }
 
+        // 反应式编排兜底：若 Batch 处于“等待最终汇总”且编排者未输出正文，
+        // 则由系统生成确定性总结并发送到主对话区，避免用户只看到子任务卡片没有结论。
+        let finalContent = response.content || '';
+        if (currentBatch && this.dispatchManager.isReactiveBatchAwaitingSummary(currentBatch.id)) {
+          if (finalContent.trim()) {
+            this.dispatchManager.markReactiveBatchSummarized(currentBatch.id);
+          } else {
+            finalContent = this.dispatchManager.buildReactiveBatchFallbackSummary(currentBatch);
+            this.messageHub.result(finalContent, {
+              metadata: {
+                phase: 'reactive_fallback_summary',
+                extra: {
+                  batchId: currentBatch.id,
+                },
+              },
+            });
+            this.dispatchManager.markReactiveBatchSummarized(currentBatch.id);
+          }
+        }
+
         this.lastExecutionSuccess = true;
         this.lastExecutionErrors = [];
         this.setState('idle');
         this.currentTaskId = null;
-        return response.content || '';
+        return finalContent;
 
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -608,6 +629,9 @@ export class MissionDrivenEngine extends EventEmitter {
         if (this.lastMissionId) {
           try {
             const batch = this.dispatchManager.getActiveBatch();
+            if (batch?.status === 'archived') {
+              this.dispatchManager.markReactiveBatchSummarized(batch.id);
+            }
             const hadDispatch = batch !== null;
 
             if (!hadDispatch) {
