@@ -23,7 +23,9 @@
   const modelStatuses = $derived(appState.modelStatus);
 
   let isRefreshing = $state(false);
-  let totalTokens = $state(0);
+  let totalInputTokens = $state(0);
+  let totalOutputTokens = $state(0);
+  let totalTokens = $derived(totalInputTokens + totalOutputTokens);
   let userInfo = $state('');
   let showResetConfirm = $state(false);
 
@@ -337,6 +339,11 @@
     return stats || null;
   }
 
+  function recomputeTokenStatsSummary() {
+    totalInputTokens = executionStats.reduce((sum, s) => sum + (s.totalInputTokens || 0), 0);
+    totalOutputTokens = executionStats.reduce((sum, s) => sum + (s.totalOutputTokens || 0), 0);
+  }
+
   // 格式化 Token 数量
   function formatTokens(tokens: number | undefined): string {
     if (tokens === undefined || tokens === null) return '--';
@@ -368,7 +375,8 @@
   function confirmResetStats() {
     vscode.postMessage({ type: 'resetExecutionStats' });
     showResetConfirm = false;
-    totalTokens = 0;
+    totalInputTokens = 0;
+    totalOutputTokens = 0;
   }
 
   function cancelResetStats() {
@@ -936,29 +944,37 @@
             // 更新列表中的统计
             const statsIndex = executionStats.findIndex(s => s.worker === worker);
             if (statsIndex >= 0) {
-              const current = executionStats[statsIndex];
-              // 注意：这里的 usage 是该 worker 的累计值，直接替换即可
-              const oldTotal = (current.totalInputTokens || 0) + (current.totalOutputTokens || 0);
-              const newTotal = (usage.inputTokens || 0) + (usage.outputTokens || 0);
-              const delta = newTotal - oldTotal;
-
               executionStats[statsIndex] = {
-                ...current,
+                ...executionStats[statsIndex],
                 totalInputTokens: usage.inputTokens || 0,
                 totalOutputTokens: usage.outputTokens || 0
               };
-              
-              // 更新总数
-              totalTokens += delta;
+              executionStats = [...executionStats];
+            } else {
+              executionStats = [
+                ...executionStats,
+                {
+                  worker,
+                  totalExecutions: 0,
+                  successCount: 0,
+                  failureCount: 0,
+                  successRate: 0,
+                  avgDuration: 0,
+                  totalInputTokens: usage.inputTokens || 0,
+                  totalOutputTokens: usage.outputTokens || 0,
+                }
+              ];
             }
+            recomputeTokenStatsSummary();
           }
         } else {
           // 全量更新
-          if (payload?.stats) {
+          if (Array.isArray(payload?.stats)) {
             executionStats = payload.stats;
-          }
-          if (payload?.orchestratorStats) {
-            totalTokens = (payload.orchestratorStats.totalInputTokens || 0) + (payload.orchestratorStats.totalOutputTokens || 0);
+            recomputeTokenStatsSummary();
+          } else if (payload?.orchestratorStats) {
+            totalInputTokens = payload.orchestratorStats.totalInputTokens || 0;
+            totalOutputTokens = payload.orchestratorStats.totalOutputTokens || 0;
           }
         }
       }
@@ -1383,6 +1399,8 @@
           <div class="settings-section-header">
             <div class="settings-section-title">模型状态与统计</div>
             <div class="settings-section-actions">
+              <div class="settings-summary-chip">输入 Token: {formatTokens(totalInputTokens)}</div>
+              <div class="settings-summary-chip">输出 Token: {formatTokens(totalOutputTokens)}</div>
               <div class="settings-summary-chip">总 Token: {formatTokens(totalTokens)}</div>
               <button class="model-refresh-btn" class:loading={isRefreshing} onclick={refreshConnections} disabled={isRefreshing}>
                 <Icon name="refresh" size={14} />
@@ -1426,7 +1444,11 @@
                     <span class="stats-divider">|</span>
                     <span>成功率: {workerStats?.successRate != null ? `${Math.round(workerStats.successRate * 100)}%` : '--'}</span>
                     <span class="stats-divider">|</span>
-                    <span>Token: {formatTokens((workerStats?.totalInputTokens ?? 0) + (workerStats?.totalOutputTokens ?? 0))}</span>
+                    <span>输入: {formatTokens(workerStats?.totalInputTokens ?? 0)}</span>
+                    <span class="stats-divider">|</span>
+                    <span>输出: {formatTokens(workerStats?.totalOutputTokens ?? 0)}</span>
+                    <span class="stats-divider">|</span>
+                    <span>总计: {formatTokens((workerStats?.totalInputTokens ?? 0) + (workerStats?.totalOutputTokens ?? 0))}</span>
                   </div>
                 </div>
               </div>

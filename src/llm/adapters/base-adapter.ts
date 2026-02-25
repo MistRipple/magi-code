@@ -145,9 +145,13 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     this.messageHub.data('executionStatsUpdate', {
       realtimeUpdate: true,
       worker: this.agent,
+      provider: this.config.provider,
+      model: this.config.model,
       usage: {
         inputTokens: this.totalTokenUsage.inputTokens,
-        outputTokens: this.totalTokenUsage.outputTokens
+        outputTokens: this.totalTokenUsage.outputTokens,
+        cacheReadTokens: this.totalTokenUsage.cacheReadTokens,
+        cacheWriteTokens: this.totalTokenUsage.cacheWriteTokens,
       }
     });
   }
@@ -278,7 +282,7 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     const cacheWriteTokens = usage.cacheWriteTokens || 0;
 
     // 跳过全零的 usage（无意义更新）
-    if (inputTokens === 0 && outputTokens === 0) return;
+    if (inputTokens === 0 && outputTokens === 0 && cacheReadTokens === 0 && cacheWriteTokens === 0) return;
 
     this.lastTokenUsage = {
       inputTokens,

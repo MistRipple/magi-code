@@ -1441,9 +1441,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
 
     const modelCatalog = this.buildModelCatalog();
+    const catalogMap = new Map(modelCatalog.map(entry => [entry.id, entry]));
     const modelIds = modelCatalog.map(entry => entry.id);
+    const normalizeProvider = (provider?: string): 'openai' | 'anthropic' | 'unknown' => {
+      if (provider === 'openai' || provider === 'anthropic') {
+        return provider;
+      }
+      return 'unknown';
+    };
+
     const stats = executionStats.getAllStats(modelIds).map(workerStats => ({
       worker: workerStats.worker,
+      provider: normalizeProvider(catalogMap.get(workerStats.worker)?.provider),
       totalExecutions: workerStats.totalExecutions,
       successCount: workerStats.successCount,
       failureCount: workerStats.failureCount,
@@ -1463,6 +1472,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       totalFailed: stats.reduce((sum, s) => sum + s.failureCount, 0),
       totalInputTokens: stats.reduce((sum, s) => sum + (s.totalInputTokens || 0), 0),
       totalOutputTokens: stats.reduce((sum, s) => sum + (s.totalOutputTokens || 0), 0),
+      totalTokens: stats.reduce((sum, s) => sum + (s.totalInputTokens || 0) + (s.totalOutputTokens || 0), 0),
     };
 
     this.sendData('executionStatsUpdate', { stats, orchestratorStats, modelCatalog });

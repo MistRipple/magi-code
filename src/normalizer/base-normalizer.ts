@@ -187,7 +187,13 @@ export abstract class BaseNormalizer extends EventEmitter {
   /**
    * 处理 Token 使用统计
    */
-  processUsage(messageId: string, usage: { inputTokens?: number; outputTokens?: number }): void {
+  processUsage(messageId: string, usage: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    estimated?: boolean;
+  }): void {
     const context = this.activeContexts.get(messageId);
     if (!context) {
       this.debug(`[${this.agent}] 未找到消息上下文: ${messageId}`);

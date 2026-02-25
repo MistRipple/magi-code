@@ -528,6 +528,90 @@ export class UniversalLLMClient extends BaseLLMClient {
     return this.config.enableThinking === true;
   }
 
+  /**
+   * 将各类 token 字段安全转换为非负整数
+   */
+  private toSafeTokenNumber(value: unknown): number {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return Math.max(0, Math.trunc(value));
+    }
+    if (typeof value === 'string') {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) {
+        return Math.max(0, Math.trunc(parsed));
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * 取第一个有效 token 数值
+   */
+  private pickFirstTokenNumber(...values: unknown[]): number {
+    for (const value of values) {
+      const tokenNumber = this.toSafeTokenNumber(value);
+      if (tokenNumber > 0) {
+        return tokenNumber;
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * 统一解析 Anthropic usage（含 cache 字段）
+   */
+  private normalizeAnthropicUsage(rawUsage: any): {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+  } {
+    const inputTokens = this.pickFirstTokenNumber(rawUsage?.input_tokens, rawUsage?.inputTokens);
+    const outputTokens = this.pickFirstTokenNumber(rawUsage?.output_tokens, rawUsage?.outputTokens);
+    const cacheReadTokens = this.pickFirstTokenNumber(
+      rawUsage?.cache_read_input_tokens,
+      rawUsage?.cacheReadInputTokens,
+      rawUsage?.cache_read_tokens,
+      rawUsage?.cacheReadTokens,
+    );
+    const cacheWriteTokens = this.pickFirstTokenNumber(
+      rawUsage?.cache_creation_input_tokens,
+      rawUsage?.cacheCreationInputTokens,
+      rawUsage?.cache_creation_tokens,
+      rawUsage?.cacheWriteTokens,
+    );
+
+    return {
+      inputTokens,
+      outputTokens,
+      cacheReadTokens: cacheReadTokens || undefined,
+      cacheWriteTokens: cacheWriteTokens || undefined,
+    };
+  }
+
+  /**
+   * 统一解析 OpenAI 兼容 usage（兼容 prompt/completion 与 input/output 两套命名）
+   */
+  private normalizeOpenAIUsage(rawUsage: any): {
+    inputTokens: number;
+    outputTokens: number;
+  } {
+    return {
+      inputTokens: this.pickFirstTokenNumber(
+        rawUsage?.prompt_tokens,
+        rawUsage?.promptTokens,
+        rawUsage?.input_tokens,
+        rawUsage?.inputTokens,
+      ),
+      outputTokens: this.pickFirstTokenNumber(
+        rawUsage?.completion_tokens,
+        rawUsage?.completionTokens,
+        rawUsage?.output_tokens,
+        rawUsage?.outputTokens,
+      ),
+    };
+  }
+
   private async sendAnthropicMessage(params: LLMMessageParams): Promise<LLMResponse> {
     if (!this.anthropicClient) {
       throw new Error('Anthropic client not initialized');
@@ -621,7 +705,12 @@ export class UniversalLLMClient extends BaseLLMClient {
 
     let fullContent = '';
     const toolCallBuffers = new Map<string, { id: string; name?: string; argumentsText: string }>();
-    let usage = { inputTokens: 0, outputTokens: 0 };
+    let usage: {
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+    } = { inputTokens: 0, outputTokens: 0 };
     let stopReason: LLMResponse['stopReason'] = 'end_turn';
 
     for await (const event of stream) {
@@ -681,10 +770,17 @@ export class UniversalLLMClient extends BaseLLMClient {
         onChunk({ type: 'content_end' });
       } else if (event.type === 'message_delta') {
         if (event.usage) {
-          usage.outputTokens = event.usage.output_tokens;
+          const normalizedUsage = this.normalizeAnthropicUsage(event.usage);
+          usage.outputTokens = normalizedUsage.outputTokens;
+          usage.cacheReadTokens = normalizedUsage.cacheReadTokens;
+          usage.cacheWriteTokens = normalizedUsage.cacheWriteTokens;
           onChunk({
             type: 'usage',
-            usage: { outputTokens: event.usage.output_tokens }
+            usage: {
+              outputTokens: normalizedUsage.outputTokens,
+              cacheReadTokens: normalizedUsage.cacheReadTokens,
+              cacheWriteTokens: normalizedUsage.cacheWriteTokens,
+            }
           });
         }
         if (event.delta.stop_reason) {
@@ -692,10 +788,17 @@ export class UniversalLLMClient extends BaseLLMClient {
         }
       } else if (event.type === 'message_start') {
         if (event.message.usage) {
-          usage.inputTokens = event.message.usage.input_tokens;
+          const normalizedUsage = this.normalizeAnthropicUsage(event.message.usage);
+          usage.inputTokens = normalizedUsage.inputTokens;
+          usage.cacheReadTokens = normalizedUsage.cacheReadTokens;
+          usage.cacheWriteTokens = normalizedUsage.cacheWriteTokens;
           onChunk({
             type: 'usage',
-            usage: { inputTokens: event.message.usage.input_tokens }
+            usage: {
+              inputTokens: normalizedUsage.inputTokens,
+              cacheReadTokens: normalizedUsage.cacheReadTokens,
+              cacheWriteTokens: normalizedUsage.cacheWriteTokens,
+            }
           });
         }
       }
@@ -773,13 +876,12 @@ export class UniversalLLMClient extends BaseLLMClient {
       }
     }
 
+    const normalizedUsage = this.normalizeAnthropicUsage(response.usage);
+
     return {
       content,
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-      usage: {
-        inputTokens: response.usage.input_tokens,
-        outputTokens: response.usage.output_tokens,
-      },
+      usage: normalizedUsage,
       stopReason: this.mapAnthropicStopReason(response.stop_reason),
     };
   }
@@ -931,7 +1033,11 @@ export class UniversalLLMClient extends BaseLLMClient {
     const toolCallFallbackPrefix = `magi_call_${Date.now().toString(36)}`;
     let toolCallFallbackSeq = 0;
     const createFallbackToolCallId = () => `${toolCallFallbackPrefix}_${toolCallFallbackSeq++}`;
-    let usage = { inputTokens: 0, outputTokens: 0 };
+    let usage: {
+      inputTokens: number;
+      outputTokens: number;
+      estimated?: boolean;
+    } = { inputTokens: 0, outputTokens: 0 };
     let stopReason: LLMResponse['stopReason'] = 'end_turn';
 
     for await (const chunk of stream) {
@@ -1009,14 +1115,13 @@ export class UniversalLLMClient extends BaseLLMClient {
       }
 
       if (chunk.usage) {
-        usage.inputTokens = chunk.usage.prompt_tokens || 0;
-        usage.outputTokens = chunk.usage.completion_tokens || 0;
+        const normalizedUsage = this.normalizeOpenAIUsage(chunk.usage);
+        usage.inputTokens = normalizedUsage.inputTokens;
+        usage.outputTokens = normalizedUsage.outputTokens;
+        usage.estimated = false;
         onChunk({
           type: 'usage',
-          usage: {
-            inputTokens: chunk.usage.prompt_tokens || 0,
-            outputTokens: chunk.usage.completion_tokens || 0,
-          },
+          usage: normalizedUsage,
         });
       }
     }
@@ -1032,6 +1137,7 @@ export class UniversalLLMClient extends BaseLLMClient {
       // 估算：约 4 字符 ≈ 1 token（通用近似）
       usage.inputTokens = Math.ceil(inputText.length / 4);
       usage.outputTokens = Math.ceil(outputText.length / 4);
+      usage.estimated = true;
       logger.debug('OpenAI 流式未返回 usage，使用本地估算', {
         estimatedInput: usage.inputTokens,
         estimatedOutput: usage.outputTokens,
@@ -1042,6 +1148,7 @@ export class UniversalLLMClient extends BaseLLMClient {
         usage: {
           inputTokens: usage.inputTokens,
           outputTokens: usage.outputTokens,
+          estimated: true,
         },
       });
     }
@@ -1288,13 +1395,12 @@ export class UniversalLLMClient extends BaseLLMClient {
       }
     }
 
+    const normalizedUsage = this.normalizeOpenAIUsage(response.usage);
+
     return {
       content: message.content || '',
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-      usage: {
-        inputTokens: response.usage?.prompt_tokens || 0,
-        outputTokens: response.usage?.completion_tokens || 0,
-      },
+      usage: normalizedUsage,
       stopReason: this.mapOpenAIStopReason(choice.finish_reason),
     };
   }

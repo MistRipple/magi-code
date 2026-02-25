@@ -592,6 +592,9 @@ export interface StreamUpdate {
   tokenUsage?: {
     inputTokens?: number;
     outputTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    estimated?: boolean;
   };
 
   /** 时间戳 */

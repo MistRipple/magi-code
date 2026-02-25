@@ -583,6 +583,8 @@ export type ExtensionToWebviewMessage =
 export interface WorkerExecutionStats {
   /** 模型标识 */
   worker: string;
+  /** Provider（openai/anthropic/unknown） */
+  provider?: 'openai' | 'anthropic' | 'unknown';
   /** 总执行次数 */
   totalExecutions: number;
   /** 成功次数 */
