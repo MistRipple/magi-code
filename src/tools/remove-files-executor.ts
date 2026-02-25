@@ -10,19 +10,20 @@ import * as path from 'path';
 import { ToolExecutor, ExtendedToolDefinition } from './types';
 import { ToolCall, ToolResult } from '../llm/types';
 import { logger, LogCategory } from '../logging';
+import { WorkspaceRoots } from '../workspace/workspace-roots';
 
 /**
  * 文件删除执行器
  */
 export class RemoveFilesExecutor implements ToolExecutor {
-  private workspaceRoot: string;
+  private workspaceRoots: WorkspaceRoots;
   private deletedFiles: Map<string, string> = new Map(); // 用于恢复
 
   /** 文件删除前回调（用于快照系统在删除前保存原始内容） */
   private onBeforeWrite?: (filePath: string) => void;
 
-  constructor(workspaceRoot: string) {
-    this.workspaceRoot = workspaceRoot;
+  constructor(workspaceRoots: WorkspaceRoots) {
+    this.workspaceRoots = workspaceRoots;
   }
 
   /**
@@ -47,7 +48,7 @@ export class RemoveFilesExecutor implements ToolExecutor {
 IMPORTANT:
 * Do NOT use shell commands (rm) to delete files
 * This is the only safe way to delete files
-* Paths must be relative to workspace root`,
+* 多工作区写入必须使用 "<工作区名>/相对路径"`,
       input_schema: {
         type: 'object',
         properties: {
@@ -102,10 +103,11 @@ IMPORTANT:
     let errorCount = 0;
 
     for (const filePath of args.paths) {
-      const resolved = this.resolveWorkspacePath(filePath);
+      const resolvedResult = this.resolveWorkspacePath(filePath);
+      const resolved = resolvedResult.absolutePath;
 
       if (!resolved) {
-        results.push(`✗ ${filePath}: path is outside workspace`);
+        results.push(`✗ ${filePath}: ${resolvedResult.error || 'path is outside workspace'}`);
         errorCount++;
         continue;
       }
@@ -158,7 +160,7 @@ IMPORTANT:
    * 恢复已删除的文件
    */
   async restoreFile(filePath: string): Promise<boolean> {
-    const resolved = this.resolveWorkspacePath(filePath);
+    const resolved = this.resolveWorkspacePath(filePath).absolutePath;
     if (!resolved) return false;
 
     const content = this.deletedFiles.get(resolved);
@@ -181,7 +183,7 @@ IMPORTANT:
    */
   getRecoverableFiles(): string[] {
     return Array.from(this.deletedFiles.keys()).map(p =>
-      path.relative(this.workspaceRoot, p)
+      this.workspaceRoots.toDisplayPath(p)
     );
   }
 
@@ -195,15 +197,12 @@ IMPORTANT:
   /**
    * 解析工作区相对路径
    */
-  private resolveWorkspacePath(inputPath: string): string | null {
-    const resolved = path.resolve(this.workspaceRoot, inputPath);
-    const normalizedRoot = path.resolve(this.workspaceRoot) + path.sep;
-
-    // 检查路径是否在工作区内
-    if (!resolved.startsWith(normalizedRoot) && resolved !== path.resolve(this.workspaceRoot)) {
-      return null;
+  private resolveWorkspacePath(inputPath: string): { absolutePath: string | null; error?: string } {
+    try {
+      const resolved = this.workspaceRoots.resolvePath(inputPath, { mustExist: false });
+      return { absolutePath: resolved?.absolutePath || null };
+    } catch (error: any) {
+      return { absolutePath: null, error: error.message };
     }
-
-    return resolved;
   }
 }

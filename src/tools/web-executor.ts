@@ -8,7 +8,6 @@
 import { ToolExecutor, ExtendedToolDefinition } from './types';
 import { ToolCall, ToolResult } from '../llm/types';
 import { logger, LogCategory } from '../logging';
-import TurndownService from 'turndown';
 
 const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
@@ -16,18 +15,7 @@ const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/
  * Web 执行器
  */
 export class WebExecutor implements ToolExecutor {
-  private turndown: TurndownService;
-
-  constructor() {
-    this.turndown = new TurndownService({
-      headingStyle: 'atx',
-      codeBlockStyle: 'fenced',
-      bulletListMarker: '-',
-    });
-
-    // 移除 script、style、nav、footer 等非内容元素
-    this.turndown.remove(['script', 'style', 'noscript', 'nav', 'footer', 'header', 'aside', 'iframe']);
-  }
+  constructor() {}
 
   /**
    * 获取所有工具定义
@@ -339,7 +327,7 @@ Tips:
       } else if (contentType.includes('text/plain')) {
         content = await response.text();
       } else {
-        // HTML → Markdown（使用 Turndown）
+        // HTML → Markdown（轻量转换）
         const html = await response.text();
         content = this.htmlToMarkdown(html);
       }
@@ -377,17 +365,39 @@ Tips:
 
   /**
    * 将 HTML 转换为 Markdown
-   * 使用 Turndown 库保留文档结构（标题、代码块、链接、列表、表格）
+   * 采用轻量规则，优先保留标题、代码、链接、列表和段落。
    */
   private htmlToMarkdown(html: string): string {
-    // 提取 <main> 或 <article> 或 <body> 中的内容（优先主体内容）
     const mainContent = this.extractMainContent(html);
-    const markdown = this.turndown.turndown(mainContent);
+    const withoutNoise = mainContent
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+      .replace(/<(nav|footer|header|aside|iframe)[^>]*>[\s\S]*?<\/\1>/gi, '');
 
-    // 清理过多的空行
-    return markdown
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
+    const markdown = withoutNoise
+      .replace(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi, (_m, level, text) => {
+        const hashes = '#'.repeat(Number(level));
+        return `\n${hashes} ${this.stripHtmlTags(this.decodeHtml(text)).trim()}\n`;
+      })
+      .replace(/<pre[^>]*>\s*<code[^>]*>([\s\S]*?)<\/code>\s*<\/pre>/gi, (_m, code) => {
+        return `\n\`\`\`\n${this.decodeHtml(code).trim()}\n\`\`\`\n`;
+      })
+      .replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, (_m, code) => `\`${this.decodeHtml(code).trim()}\``)
+      .replace(/<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi, (_m, href, text) => {
+        const title = this.stripHtmlTags(this.decodeHtml(text)).trim() || href;
+        return `[${title}](${href})`;
+      })
+      .replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (_m, text) => `\n- ${this.stripHtmlTags(this.decodeHtml(text)).trim()}`)
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/p>/gi, '\n\n')
+      .replace(/<p[^>]*>/gi, '')
+      .replace(/<\/div>/gi, '\n')
+      .replace(/<div[^>]*>/gi, '')
+      .replace(/<[^>]+>/g, '')
+      .replace(/\n{3,}/g, '\n\n');
+
+    return this.decodeHtml(markdown).trim();
   }
 
   /**

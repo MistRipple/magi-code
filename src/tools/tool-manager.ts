@@ -19,6 +19,7 @@
  */
 
 import { EventEmitter } from 'events';
+import { AsyncLocalStorage } from 'async_hooks';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -43,6 +44,7 @@ import type { SnapshotManager } from '../snapshot-manager';
 import type { SkillsManager, InstructionSkillDefinition } from './skills-manager';
 import type { MCPToolExecutor } from './mcp-executor';
 import type { MCPPromptInfo } from './mcp-manager';
+import { WorkspaceFolderInfo, WorkspaceRoots } from '../workspace/workspace-roots';
 
 /**
  * 快照执行上下文（标识当前正在执行的 mission/assignment/worker）
@@ -52,6 +54,15 @@ export interface SnapshotContext {
   assignmentId: string;
   todoId: string;
   workerId: string;
+}
+
+/**
+ * 工具执行上下文（按每次工具调用隔离）
+ * 用于并行 Worker 下精确绑定 workerId，避免上下文串扰。
+ */
+export interface ToolExecutionContext {
+  workerId?: string;
+  role?: 'orchestrator' | 'worker';
 }
 
 /**
@@ -73,6 +84,12 @@ export interface UnifiedPromptInfo {
   disableModelInvocation?: boolean;
   userInvocable?: boolean;
   argumentHint?: string;
+}
+
+export interface ToolManagerOptions {
+  workspaceRoot?: string;
+  workspaceFolders?: WorkspaceFolderInfo[];
+  permissions?: PermissionMatrix;
 }
 
 /**
@@ -103,8 +120,9 @@ export function loadAceConfigFromFile(): { baseUrl: string; apiKey: string } {
  * 工具管理器
  */
 export class ToolManager extends EventEmitter implements ToolExecutor {
-  // 工作区根目录
+  // 工作区根目录（主目录）+ 多根解析器
   private workspaceRoot: string;
+  private workspaceRoots: WorkspaceRoots;
 
   // 内置工具执行器
   private terminalExecutor: VSCodeTerminalExecutor;
@@ -129,26 +147,33 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   // 快照系统
   private snapshotManager?: SnapshotManager;
   private snapshotContextMap: Map<string, SnapshotContext> = new Map();
+  private executionContextStorage = new AsyncLocalStorage<ToolExecutionContext>();
 
-  constructor(workspaceRoot?: string, permissions?: PermissionMatrix) {
+  constructor(options: ToolManagerOptions = {}) {
     super();
-    this.workspaceRoot = workspaceRoot || process.cwd();
+    const root = options.workspaceRoot || process.cwd();
+    const folders = options.workspaceFolders && options.workspaceFolders.length > 0
+      ? options.workspaceFolders
+      : [{ name: path.basename(root), path: root }];
+
+    this.workspaceRoots = new WorkspaceRoots(folders);
+    this.workspaceRoot = this.workspaceRoots.getPrimaryFolder().path;
 
     // 读取 ACE 配置（统一入口）
     const aceConfig = loadAceConfigFromFile();
 
     // 初始化所有内置执行器
     this.terminalExecutor = new VSCodeTerminalExecutor();
-    this.fileExecutor = new FileExecutor(this.workspaceRoot);
-    this.searchExecutor = new SearchExecutor(this.workspaceRoot);
-    this.removeFilesExecutor = new RemoveFilesExecutor(this.workspaceRoot);
+    this.fileExecutor = new FileExecutor(this.workspaceRoots);
+    this.searchExecutor = new SearchExecutor(this.workspaceRoots);
+    this.removeFilesExecutor = new RemoveFilesExecutor(this.workspaceRoots);
     this.webExecutor = new WebExecutor();
     this.mermaidExecutor = new MermaidExecutor();
     this.aceExecutor = new AceExecutor(this.workspaceRoot, aceConfig.baseUrl, aceConfig.apiKey);
     this.lspExecutor = new LspExecutor(this.workspaceRoot);
     this.orchestrationExecutor = new OrchestrationExecutor();
 
-    this.permissions = permissions || {
+    this.permissions = options.permissions || {
       allowEdit: true,
       allowBash: true,
       allowWeb: true,
@@ -163,21 +188,32 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    * 更新工作区路径（重新初始化依赖工作区的执行器）
    */
   setWorkspaceRoot(workspaceRoot: string): void {
-    this.workspaceRoot = workspaceRoot;
-    this.fileExecutor = new FileExecutor(workspaceRoot);
-    this.searchExecutor = new SearchExecutor(workspaceRoot);
-    this.removeFilesExecutor = new RemoveFilesExecutor(workspaceRoot);
+    this.setWorkspaceFolders([{ name: path.basename(workspaceRoot), path: workspaceRoot }]);
+  }
+
+  /**
+   * 更新工作区目录（重新初始化依赖工作区的执行器）
+   */
+  setWorkspaceFolders(workspaceFolders: WorkspaceFolderInfo[]): void {
+    this.workspaceRoots = new WorkspaceRoots(workspaceFolders);
+    this.workspaceRoot = this.workspaceRoots.getPrimaryFolder().path;
+    this.fileExecutor = new FileExecutor(this.workspaceRoots);
+    this.searchExecutor = new SearchExecutor(this.workspaceRoots);
+    this.removeFilesExecutor = new RemoveFilesExecutor(this.workspaceRoots);
 
     // 重新注入快照回调（因为执行器被重建了）
     this.injectSnapshotCallbacks();
 
     // 重新读取 ACE 配置并更新
     const aceConfig = loadAceConfigFromFile();
-    this.aceExecutor.updateConfig(workspaceRoot, aceConfig.baseUrl, aceConfig.apiKey);
+    this.aceExecutor.updateConfig(this.workspaceRoot, aceConfig.baseUrl, aceConfig.apiKey);
 
-    this.lspExecutor = new LspExecutor(workspaceRoot);
+    this.lspExecutor = new LspExecutor(this.workspaceRoot);
     this.invalidateCache();
-    logger.info('ToolManager workspace root updated', { workspaceRoot }, LogCategory.TOOLS);
+    logger.info('ToolManager workspace roots updated', {
+      rootCount: workspaceFolders.length,
+      primaryRoot: this.workspaceRoot,
+    }, LogCategory.TOOLS);
   }
 
   /**
@@ -219,17 +255,38 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   }
 
   /**
+   * 获取当前调用链的执行上下文 workerId
+   */
+  private getExecutionWorkerId(): string | undefined {
+    const workerId = this.executionContextStorage.getStore()?.workerId;
+    if (typeof workerId !== 'string') return undefined;
+    const normalized = workerId.trim();
+    return normalized || undefined;
+  }
+
+  /**
    * 获取当前活跃的快照上下文
-   * 多 Worker 并行时，返回最近设置的上下文
+   * 优先按当前工具执行上下文（workerId）精确定位。
    */
   private getActiveSnapshotContext(): SnapshotContext | undefined {
     if (this.snapshotContextMap.size === 0) return undefined;
-    // 返回 Map 中最后一个值（最近设置的上下文）
-    let last: SnapshotContext | undefined;
-    for (const ctx of this.snapshotContextMap.values()) {
-      last = ctx;
+
+    const executionWorkerId = this.getExecutionWorkerId();
+    if (executionWorkerId) {
+      const scoped = this.snapshotContextMap.get(executionWorkerId);
+      if (!scoped) {
+        logger.debug('ToolManager: 执行上下文未命中快照上下文', {
+          executionWorkerId,
+          contextWorkers: Array.from(this.snapshotContextMap.keys()),
+        }, LogCategory.TOOLS);
+      }
+      return scoped;
     }
-    return last;
+
+    logger.debug('ToolManager: 缺少执行上下文，拒绝猜测活跃 worker', {
+      contextWorkers: Array.from(this.snapshotContextMap.keys()),
+    }, LogCategory.TOOLS);
+    return undefined;
   }
 
   /**
@@ -358,88 +415,136 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   ];
 
   /**
+   * 内置工具别名映射（兼容不同命名风格，统一到规范名）
+   */
+  private readonly builtinToolAliases = new Map<string, string>([
+    ['launch_process', 'launch-process'],
+    ['read_process', 'read-process'],
+    ['write_process', 'write-process'],
+    ['kill_process', 'kill-process'],
+    ['list_processes', 'list-processes'],
+    ['file-view', 'file_view'],
+    ['file-create', 'file_create'],
+    ['file-edit', 'file_edit'],
+    ['file-insert', 'file_insert'],
+    ['file-remove', 'file_remove'],
+    ['grep-search', 'grep_search'],
+    ['web-search', 'web_search'],
+    ['web-fetch', 'web_fetch'],
+    ['mermaid-diagram', 'mermaid_diagram'],
+    ['codebase-retrieval', 'codebase_retrieval'],
+    ['dispatch-task', 'dispatch_task'],
+    ['send-worker-message', 'send_worker_message'],
+    ['wait-for-workers', 'wait_for_workers'],
+  ]);
+
+  private normalizeToolName(name: string): string {
+    return this.builtinToolAliases.get(name) || name;
+  }
+
+  /**
    * 执行工具调用
    */
-  async execute(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
-    logger.debug('Executing tool call', {
-      toolName: toolCall.name,
-      toolCallId: toolCall.id,
-    }, LogCategory.TOOLS);
+  async execute(toolCall: ToolCall, signal?: AbortSignal, executionContext?: ToolExecutionContext): Promise<ToolResult> {
+    const run = async (): Promise<ToolResult> => {
+      const normalizedName = this.normalizeToolName(toolCall.name);
+      const normalizedToolCall = normalizedName === toolCall.name
+        ? toolCall
+        : { ...toolCall, name: normalizedName };
 
-    try {
-      // 中断检查：执行前检测 abort 信号
-      if (signal?.aborted) {
-        return {
+      if (normalizedToolCall !== toolCall) {
+        logger.debug('Tool name normalized', {
+          originalName: toolCall.name,
+          normalizedName: normalizedToolCall.name,
           toolCallId: toolCall.id,
-          content: '任务已中断',
-          isError: true,
-        };
-      }
-
-      // 检查授权（包括权限和用户授权）
-      const authCheck = await this.checkAuthorization(toolCall);
-      if (!authCheck.allowed) {
-        logger.warn('Tool execution blocked', {
-          toolName: toolCall.name,
-          reason: authCheck.reason,
         }, LogCategory.TOOLS);
-        return {
-          toolCallId: toolCall.id,
-          content: `Tool blocked: ${authCheck.reason}`,
-          isError: true,
-        };
       }
 
-      // 检查是否是内置工具
-      if (this.builtinToolNames.includes(toolCall.name)) {
-        return await this.executeBuiltinTool(toolCall, signal);
-      }
+      logger.debug('Executing tool call', {
+        toolName: normalizedToolCall.name,
+        toolCallId: toolCall.id,
+      }, LogCategory.TOOLS);
 
-      // 查找 MCP 工具
-      const toolDef = await this.findTool(toolCall.name);
-      if (!toolDef) {
-        const available = this.builtinToolNames.join(', ');
-        return {
-          toolCallId: toolCall.id,
-          content: `工具 '${toolCall.name}' 不存在。只能使用以下工具: ${available}。请直接使用已有工具完成任务。`,
-          isError: true,
-        };
-      }
-
-      // 执行 MCP 工具
-      if (toolDef.metadata.source === 'mcp') {
-        return await this.executeMCPTool(toolCall, toolDef, signal);
-      }
-
-      // 执行 Skill 工具
-      if (toolDef.metadata.source === 'skill') {
-        if (!this.skillExecutor) {
+      try {
+        // 中断检查：执行前检测 abort 信号
+        if (signal?.aborted) {
           return {
             toolCallId: toolCall.id,
-            content: 'Skill executor not registered',
+            content: '任务已中断',
             isError: true,
           };
         }
-        return await this.skillExecutor.execute(toolCall, signal);
+
+        // 检查授权（包括权限和用户授权）
+        const authCheck = await this.checkAuthorization(normalizedToolCall);
+        if (!authCheck.allowed) {
+          logger.warn('Tool execution blocked', {
+            toolName: normalizedToolCall.name,
+            reason: authCheck.reason,
+          }, LogCategory.TOOLS);
+          return {
+            toolCallId: toolCall.id,
+            content: `Tool blocked: ${authCheck.reason}`,
+            isError: true,
+          };
+        }
+
+        // 检查是否是内置工具
+        if (this.builtinToolNames.includes(normalizedToolCall.name)) {
+          return await this.executeBuiltinTool(normalizedToolCall, signal);
+        }
+
+        // 查找 MCP 工具
+        const toolDef = await this.findTool(normalizedToolCall.name);
+        if (!toolDef) {
+          const available = this.builtinToolNames.join(', ');
+          return {
+            toolCallId: toolCall.id,
+            content: `工具 '${toolCall.name}' 不存在。只能使用以下工具: ${available}。请直接使用已有工具完成任务。`,
+            isError: true,
+          };
+        }
+
+        // 执行 MCP 工具
+        if (toolDef.metadata.source === 'mcp') {
+          return await this.executeMCPTool(normalizedToolCall, toolDef, signal);
+        }
+
+        // 执行 Skill 工具
+        if (toolDef.metadata.source === 'skill') {
+          if (!this.skillExecutor) {
+            return {
+              toolCallId: toolCall.id,
+              content: 'Skill executor not registered',
+              isError: true,
+            };
+          }
+          return await this.skillExecutor.execute(normalizedToolCall, signal);
+        }
+
+        return {
+          toolCallId: toolCall.id,
+          content: `Unknown tool source: ${toolDef.metadata.source}`,
+          isError: true,
+        };
+      } catch (error: any) {
+        logger.error('Tool execution failed', {
+          toolName: normalizedToolCall.name,
+          error: error.message,
+        }, LogCategory.TOOLS);
+
+        return {
+          toolCallId: toolCall.id,
+          content: `Tool execution failed: ${error.message}`,
+          isError: true,
+        };
       }
+    };
 
-      return {
-        toolCallId: toolCall.id,
-        content: `Unknown tool source: ${toolDef.metadata.source}`,
-        isError: true,
-      };
-    } catch (error: any) {
-      logger.error('Tool execution failed', {
-        toolName: toolCall.name,
-        error: error.message,
-      }, LogCategory.TOOLS);
-
-      return {
-        toolCallId: toolCall.id,
-        content: `Tool execution failed: ${error.message}`,
-        isError: true,
-      };
+    if (executionContext) {
+      return this.executionContextStorage.run(executionContext, run);
     }
+    return run();
   }
 
   /**
@@ -749,8 +854,8 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
         input_schema: {
           type: 'object',
           properties: {
-            command: { type: 'string', description: '要执行的 shell 命令' },
-            cwd: { type: 'string', description: '命令执行目录，相对于工作区根目录（可选，默认为工作区根目录）' },
+            command: { type: 'string', description: '要执行的 shell 命令（不要在 command 中写 cd，目录请通过 cwd 传递）' },
+            cwd: { type: 'string', description: '命令执行目录。单工作区可省略（自动使用工作区根目录）；多工作区必须显式指定 "<工作区名>" 或 "<工作区名>/相对路径"' },
             wait: { type: 'boolean', description: '是否等待进程完成（默认 true）' },
             max_wait_seconds: { type: 'number', description: '最大等待秒数（默认 30）' },
             showTerminal: { type: 'boolean', description: '是否显示终端窗口（默认 true）' },
@@ -867,17 +972,208 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
     return tools.find((t) => t.name === toolName);
   }
 
+  private normalizeLaunchProcessCommand(rawCommand: unknown, rawCwd: unknown): {
+    command: string | null;
+    cwd: string;
+    error?: string;
+  } {
+    if (typeof rawCommand !== 'string' || !rawCommand.trim()) {
+      return {
+        command: null,
+        cwd: '',
+        error: 'command 参数必须是非空字符串',
+      };
+    }
+
+    let command = rawCommand.trim();
+    let cwd = typeof rawCwd === 'string' ? rawCwd.trim() : '';
+
+    const inlineCdPattern = /^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^;&|]+?))\s*(?:&&|;)\s*(.+)$/s;
+    const inlineCdMatch = command.match(inlineCdPattern);
+    if (inlineCdMatch) {
+      const inlineCwd = (inlineCdMatch[1] || inlineCdMatch[2] || inlineCdMatch[3] || '').trim();
+      const nextCommand = (inlineCdMatch[4] || '').trim();
+
+      if (!nextCommand) {
+        return {
+          command: null,
+          cwd: '',
+          error: 'command 中的 cd 后缺少实际可执行命令',
+        };
+      }
+
+      if (cwd && cwd !== inlineCwd) {
+        return {
+          command: null,
+          cwd: '',
+          error: `cwd 参数与 command 内联 cd 冲突（cwd="${cwd}" vs cd "${inlineCwd}"）`,
+        };
+      }
+
+      cwd = inlineCwd;
+      command = nextCommand;
+    } else if (/^\s*cd\s+/.test(command)) {
+      return {
+        command: null,
+        cwd: '',
+        error: '不要在 command 中单独执行 cd；请把目录写入 cwd，command 仅保留实际命令',
+      };
+    }
+
+    return { command, cwd };
+  }
+
+  private resolveLaunchProcessWorkspacePath(
+    inputPath: string,
+    preferWorkspacePath?: string
+  ): { absolutePath: string | null; error?: string } {
+    try {
+      const resolved = this.workspaceRoots.resolvePath(inputPath, {
+        mustExist: true,
+        preferWorkspacePath,
+      });
+      if (!resolved?.absolutePath) {
+        return {
+          absolutePath: null,
+          error: `cwd "${inputPath}" 不存在，或不在当前工作区内`,
+        };
+      }
+      return { absolutePath: resolved.absolutePath };
+    } catch (error: any) {
+      return {
+        absolutePath: null,
+        error: `cwd "${inputPath}" 解析失败: ${error?.message || String(error)}`,
+      };
+    }
+  }
+
+  private resolveLaunchProcessCwd(rawCwd: unknown): { absolutePath: string | null; error?: string } {
+    if (rawCwd !== undefined && rawCwd !== null && typeof rawCwd !== 'string') {
+      return {
+        absolutePath: null,
+        error: 'cwd 参数类型错误，必须是字符串',
+      };
+    }
+
+    const hasMultipleRoots = this.workspaceRoots.hasMultipleRoots();
+    const workspaceFolders = this.workspaceRoots.getFolders();
+    const workspaceNames = workspaceFolders.map(folder => folder.name);
+    const requestedCwd = typeof rawCwd === 'string' ? rawCwd.trim() : '';
+    const workspaceHint = hasMultipleRoots
+      ? `可用工作区: ${workspaceNames.join('、')}。请使用 "<工作区名>" 或 "<工作区名>/相对路径"，不要使用固定系统路径（如 /home/user）。`
+      : '请使用当前工作区内路径。';
+
+    if (!requestedCwd) {
+      if (hasMultipleRoots) {
+        return {
+          absolutePath: null,
+          error: `多工作区必须显式指定 cwd。${workspaceHint}`,
+        };
+      }
+      return this.resolveLaunchProcessWorkspacePath('.', this.workspaceRoot);
+    }
+
+    if (path.isAbsolute(requestedCwd)) {
+      const absolute = this.resolveLaunchProcessWorkspacePath(requestedCwd);
+      if (absolute.absolutePath) {
+        return absolute;
+      }
+      return {
+        absolutePath: null,
+        error: `cwd "${requestedCwd}" 不在当前工作区内，或目录不存在。${workspaceHint}`,
+      };
+    }
+
+    const matchedWorkspace = workspaceFolders.find(folder => folder.name === requestedCwd);
+    if (matchedWorkspace) {
+      return { absolutePath: matchedWorkspace.path };
+    }
+
+    if (hasMultipleRoots) {
+      const slash = requestedCwd.indexOf('/');
+      const prefix = slash > 0 ? requestedCwd.substring(0, slash) : '';
+      const hasWorkspacePrefix = workspaceNames.includes(prefix);
+
+      if (!hasWorkspacePrefix) {
+        return {
+          absolutePath: null,
+          error: `多工作区 cwd 必须显式包含工作区名。${workspaceHint}`,
+        };
+      }
+    }
+
+    return this.resolveLaunchProcessWorkspacePath(requestedCwd, this.workspaceRoot);
+  }
+
+  private resolveLaunchProcessTerminalName(context?: SnapshotContext): { terminalName: string | null; error?: string } {
+    const workerId = context?.workerId || this.getExecutionWorkerId() || 'orchestrator';
+
+    if (workerId === 'orchestrator') {
+      return { terminalName: 'orchestrator' };
+    }
+
+    const workerSlotSet = new Set(['claude', 'gemini', 'codex']);
+    if (workerSlotSet.has(workerId)) {
+      return { terminalName: `worker-${workerId}` };
+    }
+
+    const agentTerminalSet = new Set(['worker-claude', 'worker-gemini', 'worker-codex']);
+    if (agentTerminalSet.has(workerId)) {
+      return { terminalName: workerId };
+    }
+
+    return {
+      terminalName: null,
+      error: `未知 workerId "${workerId}"，仅支持 orchestrator、claude、gemini、codex`,
+    };
+  }
+
   private async executeLaunchProcessTool(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     const args = toolCall.arguments as any;
-    const { command, cwd, wait = true, max_wait_seconds = 30, showTerminal = true } = args;
+    const { command: rawCommand, cwd: rawCwd, wait = true, max_wait_seconds = 30, showTerminal = true } = args;
+    const normalized = this.normalizeLaunchProcessCommand(rawCommand, rawCwd);
+    if (!normalized.command) {
+      return {
+        toolCallId: toolCall.id,
+        content: `Command rejected: ${normalized.error || 'command 参数错误'}`,
+        isError: true,
+      };
+    }
+    if (args.wait !== undefined && typeof args.wait !== 'boolean') {
+      return {
+        toolCallId: toolCall.id,
+        content: 'Command rejected: wait 参数类型错误，必须是 boolean',
+        isError: true,
+      };
+    }
+    if (args.max_wait_seconds !== undefined && (typeof args.max_wait_seconds !== 'number' || !Number.isFinite(args.max_wait_seconds))) {
+      return {
+        toolCallId: toolCall.id,
+        content: 'Command rejected: max_wait_seconds 参数类型错误，必须是 number',
+        isError: true,
+      };
+    }
+    if (args.showTerminal !== undefined && typeof args.showTerminal !== 'boolean') {
+      return {
+        toolCallId: toolCall.id,
+        content: 'Command rejected: showTerminal 参数类型错误，必须是 boolean',
+        isError: true,
+      };
+    }
 
     // 终端名称由系统根据执行上下文自动推导，不再依赖 LLM 传入
     const activeContext = this.getActiveSnapshotContext();
-    const terminalName = activeContext?.workerId
-      ? `worker-${activeContext.workerId}`
-      : 'orchestrator';
+    const terminalResolution = this.resolveLaunchProcessTerminalName(activeContext);
+    if (!terminalResolution.terminalName) {
+      return {
+        toolCallId: toolCall.id,
+        content: `Command rejected: ${terminalResolution.error}`,
+        isError: true,
+      };
+    }
+    const terminalName = terminalResolution.terminalName;
 
-    const validation = this.terminalExecutor.validateCommand(command);
+    const validation = this.terminalExecutor.validateCommand(normalized.command);
     if (!validation.valid) {
       return {
         toolCallId: toolCall.id,
@@ -886,19 +1182,41 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
       };
     }
 
+    const cwdResolution = this.resolveLaunchProcessCwd(normalized.cwd);
+    if (!cwdResolution.absolutePath) {
+      return {
+        toolCallId: toolCall.id,
+        content: `Command rejected: ${cwdResolution.error}`,
+        isError: true,
+      };
+    }
+
+    const resolvedCwd = cwdResolution.absolutePath;
+    logger.debug('launch-process cwd resolved', {
+      rawCwd,
+      normalizedCwd: normalized.cwd,
+      resolvedCwd,
+      normalizedCommand: normalized.command,
+      terminalName,
+    }, LogCategory.TOOLS);
+
     const result = await this.terminalExecutor.launchProcess({
-      command,
-      cwd,
+      command: normalized.command,
+      cwd: resolvedCwd,
       wait,
       maxWaitSeconds: max_wait_seconds,
       name: terminalName,
       showTerminal,
     }, signal);
 
+    const hasFailureStatus = result.status === 'failed' || result.status === 'killed' || result.status === 'timeout';
+    const hasNonZeroExit = result.return_code !== null && result.return_code !== 0;
+    const isError = hasFailureStatus || hasNonZeroExit;
+
     return {
       toolCallId: toolCall.id,
       content: JSON.stringify(result),
-      isError: false,
+      isError,
     };
   }
 
@@ -907,10 +1225,13 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
     const { terminal_id, wait = false, max_wait_seconds = 30 } = args;
 
     const result = await this.terminalExecutor.readProcess(terminal_id, wait, max_wait_seconds);
+    const hasFailureStatus = result.status === 'failed' || result.status === 'killed' || result.status === 'timeout';
+    const hasNonZeroExit = result.return_code !== null && result.return_code !== 0;
+    const isError = hasFailureStatus || hasNonZeroExit;
     return {
       toolCallId: toolCall.id,
       content: JSON.stringify(result),
-      isError: false,
+      isError,
     };
   }
 
@@ -922,7 +1243,7 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
     return {
       toolCallId: toolCall.id,
       content: JSON.stringify(result),
-      isError: false,
+      isError: !result.accepted,
     };
   }
 
@@ -934,7 +1255,7 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
     return {
       toolCallId: toolCall.id,
       content: JSON.stringify(result),
-      isError: false,
+      isError: !result.killed,
     };
   }
 
@@ -1006,6 +1327,26 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
    */
   getWorkspaceRoot(): string {
     return this.workspaceRoot;
+  }
+
+  /**
+   * 获取工作区目录列表
+   */
+  getWorkspaceFolders(): WorkspaceFolderInfo[] {
+    return this.workspaceRoots.getFolders();
+  }
+
+  /**
+   * 获取工作区展示文本（用于系统提示）
+   */
+  getWorkspacePromptDisplay(): string {
+    const folders = this.workspaceRoots.getFolders();
+    if (folders.length === 1) {
+      return folders[0].path;
+    }
+
+    const lines = folders.map(folder => `  - ${folder.name}: ${folder.path}`);
+    return `多工作区:\n${lines.join('\n')}`;
   }
 
   /**

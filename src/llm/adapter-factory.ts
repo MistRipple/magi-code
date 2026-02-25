@@ -32,6 +32,7 @@ import { IAdapterFactory, AdapterOutputScope, AdapterResponse } from '../adapter
 import { ProfileLoader } from '../orchestrator/profile/profile-loader';
 import { ADAPTER_EVENTS } from '../protocol/event-names';
 import { EnvironmentContextProvider } from '../context/environment-context-provider';
+import { WorkspaceFolderInfo } from '../workspace/workspace-roots';
 
 /**
  * LLM 适配器工厂
@@ -58,14 +59,17 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
    */
   private messageHub: MessageHub | null = null;
 
-  constructor(options: { cwd: string }) {
+  constructor(options: { cwd: string; workspaceFolders?: WorkspaceFolderInfo[] }) {
     super();
-    this.toolManager = new ToolManager(options.cwd);
+    this.toolManager = new ToolManager({
+      workspaceRoot: options.cwd,
+      workspaceFolders: options.workspaceFolders,
+    });
     this.profileLoader = ProfileLoader.getInstance();
 
     // 创建环境上下文提供者并注入 ToolManager
     this.environmentContextProvider = new EnvironmentContextProvider({
-      workspace: options.cwd,
+      workspace: this.toolManager.getWorkspacePromptDisplay(),
     });
     this.environmentContextProvider.setToolManager(this.toolManager);
 

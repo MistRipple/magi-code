@@ -131,7 +131,7 @@ export class IndexPersistence {
         path: this.cacheFilePath,
       }, LogCategory.SESSION);
     } catch (error) {
-      logger.warn('索引持久化.保存失败', { error }, LogCategory.SESSION);
+      logger.warn('索引持久化.保存失败', { error, path: this.cacheFilePath }, LogCategory.SESSION);
     }
   }
 

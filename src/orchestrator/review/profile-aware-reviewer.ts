@@ -141,10 +141,10 @@ export class ProfileAwareReviewer {
    */
   selectPeerReviewer(assignment: Assignment, executor: WorkerSlot): WorkerSlot {
     const category = this.getAssignmentCategory(assignment);
-    const allProfiles = this.profileLoader.getAllProfiles();
+    const enabledProfiles = this.profileLoader.getEnabledProfiles();
 
     const categoryDef = this.profileLoader.getCategory(category);
-    const candidates = Array.from(allProfiles.entries())
+    const candidates = Array.from(enabledProfiles.entries())
       .filter(([worker]) => worker !== executor)
       .sort((a, b) => {
         if (!categoryDef) return 0;
@@ -157,7 +157,7 @@ export class ProfileAwareReviewer {
       return candidates[0][0] as WorkerSlot;
     }
 
-    const otherWorkers = Array.from(allProfiles.keys()).filter(w => w !== executor);
+    const otherWorkers = Array.from(enabledProfiles.keys()).filter(w => w !== executor);
     if (otherWorkers.length === 0) {
       throw new Error(`无法选择评审者，当前仅有执行者 ${executor}`);
     }

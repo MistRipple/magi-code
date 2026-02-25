@@ -15,6 +15,7 @@ import {
   ToolCall,
   ToolDefinition,
   ContentBlock,
+  sanitizeToolOrder,
 } from '../types';
 import { logger, LogCategory } from '../../logging';
 
@@ -239,12 +240,17 @@ export class UniversalLLMClient extends BaseLLMClient {
    * 检测是否为 400 工具 schema 不兼容错误
    * Gemini OpenAI 兼容 API 对 JSON Schema 严格校验，
    * MCP 工具的 schema 可能包含不支持的属性导致 400。
+   *
+   * 注意：不匹配 `invalid.argument` — 该模式过于宽泛，
+   * 会误匹配 Google API 通用 400（如模型名错误、参数格式不合法），
+   * 导致非工具问题触发 retryWithToolElimination 二分法递归，
+   * 产生 ~2N 次无效 API 调用和大量 warn 日志。
    */
   private is400ToolSchemaError(error: any): boolean {
     const status = error?.status || error?.response?.status;
     if (status !== 400) return false;
     const msg = String(error?.message || error?.error?.message || '');
-    return /invalid.argument|invalid.*schema|invalid.*tool|invalid.*function/i.test(msg);
+    return /invalid.*schema|invalid.*tool|invalid.*function/i.test(msg);
   }
 
   /**
@@ -731,58 +737,6 @@ export class UniversalLLMClient extends BaseLLMClient {
     let systemPrompt: string | undefined;
     const messages: Anthropic.MessageParam[] = [];
 
-    const hasToolUse = (message: LLMMessage): boolean => {
-      if (!Array.isArray(message.content)) {
-        return false;
-      }
-      return message.content.some((block: any) => block?.type === 'tool_use');
-    };
-
-    const isToolResultUser = (message: LLMMessage): boolean => {
-      if (message.role !== 'user' || !Array.isArray(message.content)) {
-        return false;
-      }
-      return message.content.some((block: any) => block?.type === 'tool_result');
-    };
-
-    const isUserOrToolResult = (message?: LLMMessage): boolean => {
-      if (!message) {
-        return false;
-      }
-      if (message.role === 'user') {
-        return true;
-      }
-      return isToolResultUser(message);
-    };
-
-    const sanitizeToolOrder = (inputMessages: LLMMessage[]): LLMMessage[] => {
-      const cleaned: LLMMessage[] = [];
-      for (let i = 0; i < inputMessages.length; i++) {
-        const msg = inputMessages[i];
-        if (msg.role === 'assistant' && hasToolUse(msg)) {
-          const next = inputMessages[i + 1];
-          const prev = cleaned[cleaned.length - 1];
-          if (!next || !isToolResultUser(next) || !isUserOrToolResult(prev)) {
-            continue;
-          }
-          cleaned.push(msg);
-          cleaned.push(next);
-          i += 1;
-          continue;
-        }
-
-        if (isToolResultUser(msg)) {
-          const prev = cleaned[cleaned.length - 1];
-          if (!prev || !hasToolUse(prev)) {
-            continue;
-          }
-        }
-
-        cleaned.push(msg);
-      }
-      return cleaned;
-    };
-
     const sanitizedMessages = sanitizeToolOrder(params.messages);
 
     for (const msg of sanitizedMessages) {
@@ -871,8 +825,9 @@ export class UniversalLLMClient extends BaseLLMClient {
       requestParams.tool_choice = openAiToolChoice;
     }
 
-    // 仅在启用 thinking 且配置了 reasoningEffort 时才添加（该参数仅部分模型支持，盲目添加会导致 400）
-    if (this.shouldEnableThinking() && this.config.reasoningEffort) {
+    // 用户显式配置了 reasoningEffort 即传递（该参数是 OpenAI API 的独立顶层参数，无需前置条件）
+    // 推理模型不支持 temperature，设置 reasoning_effort 时需移除
+    if (this.config.reasoningEffort) {
       requestParams.reasoning_effort = this.config.reasoningEffort;
       delete requestParams.temperature;
     }
@@ -931,8 +886,9 @@ export class UniversalLLMClient extends BaseLLMClient {
       requestParams.tool_choice = openAiToolChoice;
     }
 
-    // 仅在启用 thinking 且配置了 reasoningEffort 时才添加（该参数仅部分模型支持，盲目添加会导致 400）
-    if (this.shouldEnableThinking() && this.config.reasoningEffort) {
+    // 用户显式配置了 reasoningEffort 即传递（该参数是 OpenAI API 的独立顶层参数，无需前置条件）
+    // 推理模型不支持 temperature，设置 reasoning_effort 时需移除
+    if (this.config.reasoningEffort) {
       requestParams.reasoning_effort = this.config.reasoningEffort;
       delete requestParams.temperature;
     }
@@ -972,6 +928,9 @@ export class UniversalLLMClient extends BaseLLMClient {
 
     let fullContent = '';
     const toolCallBuffers = new Map<string, { id: string; name?: string; argumentsText: string }>();
+    const toolCallFallbackPrefix = `magi_call_${Date.now().toString(36)}`;
+    let toolCallFallbackSeq = 0;
+    const createFallbackToolCallId = () => `${toolCallFallbackPrefix}_${toolCallFallbackSeq++}`;
     let usage = { inputTokens: 0, outputTokens: 0 };
     let stopReason: LLMResponse['stopReason'] = 'end_turn';
 
@@ -995,33 +954,48 @@ export class UniversalLLMClient extends BaseLLMClient {
       }
 
       if (delta?.tool_calls) {
-        for (const toolCall of delta.tool_calls) {
-          // 使用 index 作为 buffer key（所有 chunk 一致携带 index）
-          // id 仅在首个 chunk 出现，用 index 保证后续 chunk 能命中同一 buffer
-          const bufferKey = toolCall.index?.toString() ?? (toolCall.id || '');
+        for (const [toolPosition, toolCall] of delta.tool_calls.entries()) {
+          // 以 index 为主键聚合同一次 tool call 的多段 delta；
+          // 缺失 index/id 时使用当前位置作为弱主键，确保同轮多工具不串扰。
+          let bufferKey = '';
+          if (typeof toolCall.index === 'number') {
+            bufferKey = `idx_${toolCall.index}`;
+          } else if (toolCall.id) {
+            bufferKey = `id_${toolCall.id}`;
+          } else {
+            bufferKey = `anon_pos_${toolPosition}`;
+          }
+
           if (!toolCallBuffers.has(bufferKey)) {
+            const stableToolCallId = toolCall.id || createFallbackToolCallId();
+            if (!toolCall.id) {
+              logger.warn('OpenAI stream 返回的 tool_call 缺少 id，已生成后备 id', {
+                model: this.config.model,
+                bufferKey,
+                stableToolCallId,
+              }, LogCategory.LLM);
+            }
             toolCallBuffers.set(bufferKey, {
-              id: toolCall.id || '',
+              id: stableToolCallId,
               name: toolCall.function?.name,
               argumentsText: '',
             });
           }
           const buffer = toolCallBuffers.get(bufferKey)!;
-          // 首个 chunk 携带 id，更新到 buffer
-          if (toolCall.id && !buffer.id) {
-            buffer.id = toolCall.id;
-          }
           if (toolCall.function?.name) {
             buffer.name = toolCall.function.name;
           }
-          if (toolCall.function?.arguments) {
-            buffer.argumentsText += toolCall.function.arguments;
+          const deltaArgs = (toolCall.function as any)?.arguments;
+          if (typeof deltaArgs === 'string') {
+            buffer.argumentsText += deltaArgs;
+          } else if (deltaArgs !== undefined && deltaArgs !== null) {
+            buffer.argumentsText += JSON.stringify(deltaArgs);
           }
           if (toolCall.function?.name) {
             onChunk({
-              type: 'tool_call_delta',
+              type: 'tool_call_start',
               toolCall: {
-                id: buffer.id || bufferKey,
+                id: buffer.id,
                 name: toolCall.function.name,
                 arguments: {},
               },
@@ -1076,18 +1050,13 @@ export class UniversalLLMClient extends BaseLLMClient {
     for (const [bufferKey, tool] of toolCallBuffers.entries()) {
       const toolId = tool.id || bufferKey;
       if (!toolId) continue;
-      let parsedArgs: Record<string, any> = {};
-      if (tool.argumentsText) {
-        try {
-          parsedArgs = JSON.parse(tool.argumentsText);
-        } catch {
-          parsedArgs = {};
-        }
-      }
+      const parsedArgs = this.parseToolArguments(tool.argumentsText, `stream:${tool.name || toolId}`);
       toolCalls.push({
         id: toolId,
         name: tool.name || '',
-        arguments: parsedArgs,
+        arguments: parsedArgs.value,
+        argumentParseError: parsedArgs.error,
+        rawArguments: parsedArgs.rawText,
       });
     }
 
@@ -1103,35 +1072,104 @@ export class UniversalLLMClient extends BaseLLMClient {
   }
 
   private convertToOpenAIFormat(params: LLMMessageParams): OpenAI.ChatCompletionMessageParam[] {
+    // 先清理悬空的 tool_use/tool_result 对（与 Anthropic 路径共享逻辑）
+    const sanitizedMessages = sanitizeToolOrder(params.messages);
     const messages: OpenAI.ChatCompletionMessageParam[] = [];
 
-    for (const msg of params.messages) {
+    for (const msg of sanitizedMessages) {
       if (typeof msg.content === 'string') {
         messages.push({
           role: msg.role,
           content: msg.content,
         } as OpenAI.ChatCompletionMessageParam);
-      } else {
-        // 处理复杂内容块
+        continue;
+      }
+
+      // 按类型分拣内容块
+      const textParts: string[] = [];
+      const imageParts: OpenAI.ChatCompletionContentPartImage[] = [];
+      const toolUseBlocks: Array<{ id: string; name: string; input: Record<string, any> }> = [];
+      const toolResultBlocks: Array<{ tool_use_id: string; content: string; is_error: boolean }> = [];
+
+      for (const block of msg.content) {
+        const b = block as any;
+        switch (b.type) {
+          case 'text':
+            textParts.push(b.text);
+            break;
+          case 'image':
+            imageParts.push({
+              type: 'image_url',
+              image_url: {
+                url: `data:${b.source?.media_type || 'image/png'};base64,${b.source?.data || ''}`,
+              },
+            });
+            break;
+          case 'tool_use':
+            toolUseBlocks.push({ id: b.id, name: b.name, input: b.input });
+            break;
+          case 'tool_result': {
+            // 防御性字符串化：确保 content 始终为 string（兼容 MCP/Skill 等外部工具结果）
+            const rawContent = b.content;
+            const contentStr = typeof rawContent === 'string'
+              ? rawContent
+              : (rawContent != null ? JSON.stringify(rawContent) : '');
+            toolResultBlocks.push({
+              tool_use_id: b.tool_use_id,
+              content: contentStr,
+              is_error: !!b.is_error,
+            });
+            break;
+          }
+        }
+      }
+
+      // assistant 消息：tool_use → OpenAI tool_calls 顶层属性
+      if (msg.role === 'assistant') {
+        const assistantText = textParts.join('\n');
+        const assistantMsg: OpenAI.ChatCompletionAssistantMessageParam = {
+          role: 'assistant',
+          content: assistantText,
+        };
+        if (toolUseBlocks.length > 0) {
+          assistantMsg.tool_calls = toolUseBlocks.map(tc => ({
+            id: tc.id,
+            type: 'function' as const,
+            function: {
+              name: tc.name,
+              arguments: typeof tc.input === 'string' ? tc.input : JSON.stringify(tc.input),
+            },
+          }));
+        }
+        messages.push(assistantMsg);
+        continue;
+      }
+
+      // tool_result → 独立的 role:'tool' 消息
+      for (const result of toolResultBlocks) {
+        // OpenAI 格式无 is_error 字段，通过 content 传递错误状态
+        const content = result.is_error && result.content && !result.content.startsWith('Error')
+          ? `[Error] ${result.content}`
+          : (result.content || '[empty result]');
         messages.push({
-          role: msg.role,
-          content: msg.content.map((block) => {
-            if (block.type === 'text') {
-              return { type: 'text', text: block.text };
-            }
-            if (block.type === 'image') {
-              const mediaType = block.source?.media_type || 'image/png';
-              const base64Data = block.source?.data || '';
-              return {
-                type: 'image_url',
-                image_url: {
-                  url: `data:${mediaType};base64,${base64Data}`,
-                },
-              };
-            }
-            return block;
-          }) as any,
-        } as OpenAI.ChatCompletionMessageParam);
+          role: 'tool',
+          tool_call_id: result.tool_use_id,
+          content,
+        } as OpenAI.ChatCompletionToolMessageParam);
+      }
+
+      // 剩余的文本/图片块保持原始 role
+      if (textParts.length > 0 || imageParts.length > 0) {
+        const role = msg.role === 'system' ? 'system' : 'user';
+        if (imageParts.length === 0) {
+          messages.push({ role, content: textParts.join('\n') } as OpenAI.ChatCompletionMessageParam);
+        } else {
+          const parts: OpenAI.ChatCompletionContentPart[] = [
+            ...textParts.map(t => ({ type: 'text' as const, text: t })),
+            ...imageParts,
+          ];
+          messages.push({ role: 'user', content: parts });
+        }
       }
     }
 
@@ -1141,6 +1179,64 @@ export class UniversalLLMClient extends BaseLLMClient {
         content: params.systemPrompt,
       });
     }
+
+    // 格式校验：检查 tool_call_id 数量与顺序是否匹配（按 occurrence 计数）
+    const declaredIds: string[] = [];
+    const resultIds: string[] = [];
+    for (const m of messages) {
+      if (m.role === 'assistant' && (m as any).tool_calls) {
+        for (const tc of (m as any).tool_calls) {
+          declaredIds.push(String(tc.id || ''));
+        }
+      }
+      if (m.role === 'tool') {
+        resultIds.push(String((m as any).tool_call_id || ''));
+      }
+    }
+    const countBy = (ids: string[]): Map<string, number> => {
+      const counter = new Map<string, number>();
+      for (const id of ids) {
+        counter.set(id, (counter.get(id) || 0) + 1);
+      }
+      return counter;
+    };
+    const declaredCounter = countBy(declaredIds);
+    const resultCounter = countBy(resultIds);
+
+    const missingResults: string[] = [];
+    const orphanResults: string[] = [];
+
+    for (const [id, declaredCount] of declaredCounter.entries()) {
+      const resultCount = resultCounter.get(id) || 0;
+      const gap = declaredCount - resultCount;
+      for (let i = 0; i < gap; i++) {
+        missingResults.push(id);
+      }
+    }
+    for (const [id, resultCount] of resultCounter.entries()) {
+      const declaredCount = declaredCounter.get(id) || 0;
+      const gap = resultCount - declaredCount;
+      for (let i = 0; i < gap; i++) {
+        orphanResults.push(id);
+      }
+    }
+    if (missingResults.length > 0 || orphanResults.length > 0) {
+      logger.warn('convertToOpenAIFormat: tool_call_id 匹配异常', {
+        missingResults,
+        orphanResults,
+        declaredCount: declaredIds.length,
+        resultCount: resultIds.length,
+      }, LogCategory.LLM);
+    }
+
+    logger.debug('convertToOpenAIFormat 转换完成', {
+      inputCount: params.messages.length,
+      outputCount: messages.length,
+      roles: messages.map(m => m.role),
+      toolCallIds: declaredIds,
+      toolResultIds: resultIds,
+      matched: missingResults.length === 0 && orphanResults.length === 0,
+    }, LogCategory.LLM);
 
     return messages;
   }
@@ -1164,13 +1260,29 @@ export class UniversalLLMClient extends BaseLLMClient {
     const message = choice.message;
 
     const toolCalls: ToolCall[] = [];
+    const fallbackPrefix = `magi_call_sync_${Date.now().toString(36)}`;
+    let fallbackSeq = 0;
     if (message.tool_calls) {
       for (const toolCall of message.tool_calls) {
         if (toolCall.type === 'function') {
+          const toolCallId = toolCall.id || `${fallbackPrefix}_${fallbackSeq++}`;
+          if (!toolCall.id) {
+            logger.warn('OpenAI 非流式响应的 tool_call 缺少 id，已生成后备 id', {
+              model: this.config.model,
+              toolName: toolCall.function.name,
+              toolCallId,
+            }, LogCategory.LLM);
+          }
+          const parsedArgs = this.parseToolArguments(
+            toolCall.function.arguments,
+            `sync:${toolCall.function.name}`
+          );
           toolCalls.push({
-            id: toolCall.id,
+            id: toolCallId,
             name: toolCall.function.name,
-            arguments: JSON.parse(toolCall.function.arguments),
+            arguments: parsedArgs.value,
+            argumentParseError: parsedArgs.error,
+            rawArguments: parsedArgs.rawText,
           });
         }
       }
@@ -1198,5 +1310,143 @@ export class UniversalLLMClient extends BaseLLMClient {
       default:
         return 'end_turn';
     }
+  }
+
+  private parseToolArguments(
+    raw: unknown,
+    context: string
+  ): { value: Record<string, any>; error?: string; rawText?: string } {
+    if (raw === undefined || raw === null || raw === '') {
+      return { value: {} };
+    }
+
+    if (typeof raw === 'object') {
+      if (Array.isArray(raw)) {
+        return {
+          value: {},
+          error: '参数解析后为数组，工具参数必须是对象',
+          rawText: JSON.stringify(raw),
+        };
+      }
+      return { value: raw as Record<string, any> };
+    }
+
+    if (typeof raw !== 'string') {
+      logger.warn('OpenAI tool arguments 类型异常，已回退为空对象', {
+        model: this.config.model,
+        context,
+        argType: typeof raw,
+      }, LogCategory.LLM);
+      return {
+        value: {},
+        error: `参数类型异常: ${typeof raw}`,
+        rawText: String(raw),
+      };
+    }
+
+    const text = raw.trim();
+    if (!text) {
+      return { value: {} };
+    }
+
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return { value: parsed as Record<string, any>, rawText: text };
+      }
+      logger.warn('OpenAI tool arguments 解析结果非对象，已回退为空对象', {
+        model: this.config.model,
+        context,
+        parsedType: typeof parsed,
+      }, LogCategory.LLM);
+      return {
+        value: {},
+        error: `参数 JSON 解析后不是对象: ${typeof parsed}`,
+        rawText: text,
+      };
+    } catch (error: any) {
+      // 兜底恢复：使用字符串状态机提取首个完整 JSON 对象，避免被字符串内大括号干扰。
+      const extracted = this.extractFirstJSONObject(text);
+      if (extracted && extracted !== text) {
+        try {
+          const recovered = JSON.parse(extracted);
+          if (recovered && typeof recovered === 'object' && !Array.isArray(recovered)) {
+            logger.warn('OpenAI tool arguments 解析失败后已成功恢复 JSON', {
+              model: this.config.model,
+              context,
+            }, LogCategory.LLM);
+            return { value: recovered as Record<string, any>, rawText: text };
+          }
+        } catch {
+          // 继续走统一失败日志
+        }
+      }
+      logger.warn('OpenAI tool arguments JSON 解析失败，已回退为空对象', {
+        model: this.config.model,
+        context,
+        error: error?.message || String(error),
+        rawSnippet: text.substring(0, 300),
+      }, LogCategory.LLM);
+      return {
+        value: {},
+        error: `参数 JSON 解析失败: ${error?.message || String(error)}`,
+        rawText: text,
+      };
+    }
+  }
+
+  /**
+   * 从文本中提取首个完整 JSON 对象。
+   * 使用引号/转义感知状态机，避免误把字符串中的 { } 当成结构边界。
+   */
+  private extractFirstJSONObject(text: string): string | null {
+    let depth = 0;
+    let start = -1;
+    let inString = false;
+    let escaped = false;
+
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        if (ch === '\\') {
+          escaped = true;
+          continue;
+        }
+        if (ch === '"') {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (ch === '"') {
+        inString = true;
+        continue;
+      }
+
+      if (ch === '{') {
+        if (depth === 0) {
+          start = i;
+        }
+        depth++;
+        continue;
+      }
+
+      if (ch === '}') {
+        if (depth === 0) {
+          continue;
+        }
+        depth--;
+        if (depth === 0 && start >= 0) {
+          return text.slice(start, i + 1).trim();
+        }
+      }
+    }
+
+    return null;
   }
 }

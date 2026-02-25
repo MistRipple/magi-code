@@ -339,7 +339,11 @@ export class WorkerPipeline {
       const absolute = this.getAbsolutePath(filePath, workspaceRoot);
       let content = '';
       if (fs.existsSync(absolute)) {
-        content = fs.readFileSync(absolute, 'utf-8');
+        const stat = fs.statSync(absolute);
+        // 目录路径不参与内容捕获，避免 EISDIR 错误
+        if (!stat.isDirectory()) {
+          content = fs.readFileSync(absolute, 'utf-8');
+        }
       }
       contents.set(filePath, content);
     }
@@ -355,6 +359,9 @@ export class WorkerPipeline {
         if (previous !== '') return true;
         continue;
       }
+      const stat = fs.statSync(absolute);
+      // 目录路径不参与内容变更检测，避免 EISDIR 错误
+      if (stat.isDirectory()) continue;
       const current = fs.readFileSync(absolute, 'utf-8');
       if (current !== previous) return true;
     }

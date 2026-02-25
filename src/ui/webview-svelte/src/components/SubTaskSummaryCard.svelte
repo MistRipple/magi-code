@@ -41,7 +41,7 @@
   }
 
   const statusBadgeMap: Record<WorkerStatus, StatusBadgeConfig> = {
-    pending: { colorVar: '--warning', icon: 'hourglass', label: '等待确认' },
+    pending: { colorVar: '--warning', icon: 'hourglass', label: '排队中' },
     running: { colorVar: '--info', icon: 'loader', label: '执行中', spinning: true },
     completed: { colorVar: '--success', icon: 'check', label: '完成' },
     failed: { colorVar: '--error', icon: 'x', label: '失败' },

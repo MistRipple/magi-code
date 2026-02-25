@@ -84,10 +84,11 @@
     expandedTasks = next;
   }
 
-  // 自动展开 running 任务
+  // 自动展开 running 任务（仅在有新增 running task 需要展开时才写入，避免高频 stateUpdate 触发无效渲染）
   $effect(() => {
     const runningIds = tasks.filter(t => t.status === 'running').map(t => t.id);
-    if (runningIds.length > 0) {
+    const needsExpand = runningIds.some(id => !expandedTasks.has(id));
+    if (needsExpand) {
       const next = new Set(expandedTasks);
       for (const id of runningIds) next.add(id);
       expandedTasks = next;

@@ -10,6 +10,7 @@ import * as path from 'path';
 import { ToolExecutor, ExtendedToolDefinition } from './types';
 import { ToolCall, ToolResult } from '../llm/types';
 import { logger, LogCategory } from '../logging';
+import { WorkspaceRoots } from '../workspace/workspace-roots';
 
 interface SearchMatch {
   file: string;
@@ -23,12 +24,12 @@ interface SearchMatch {
  * 搜索执行器
  */
 export class SearchExecutor implements ToolExecutor {
-  private workspaceRoot: string;
+  private workspaceRoots: WorkspaceRoots;
   private defaultContextLines = 5;
   private maxResults = 100;
 
-  constructor(workspaceRoot: string) {
-    this.workspaceRoot = workspaceRoot;
+  constructor(workspaceRoots: WorkspaceRoots) {
+    this.workspaceRoots = workspaceRoots;
   }
 
   /**
@@ -47,7 +48,7 @@ export class SearchExecutor implements ToolExecutor {
           },
           path: {
             type: 'string',
-            description: 'Directory to search in, relative to workspace root (e.g. "src/tools"). Defaults to workspace root.'
+            description: 'Directory to search in. 单工作区可用相对路径；多工作区可用 "<工作区名>/路径"。不传则搜索全部工作区。'
           },
           include: {
             type: 'string',
@@ -111,22 +112,27 @@ export class SearchExecutor implements ToolExecutor {
       };
     }
 
-    const searchPath = args.path
-      ? path.resolve(this.workspaceRoot, args.path)
-      : this.workspaceRoot;
+    const searchPaths = this.resolveSearchPaths(args.path);
+    if (searchPaths.length === 0) {
+      return {
+        toolCallId: toolCall.id,
+        content: `Error: invalid search path: ${args.path || ''}`,
+        isError: true
+      };
+    }
 
     const contextLines = args.context_lines ?? this.defaultContextLines;
     const caseSensitive = args.case_sensitive ?? false;
 
     logger.debug('SearchExecutor executing', {
       pattern: args.pattern,
-      path: searchPath
+      path: searchPaths
     }, LogCategory.TOOLS);
 
     try {
       const regex = new RegExp(args.pattern, caseSensitive ? 'g' : 'gi');
       const matches = await this.searchFiles(
-        searchPath,
+        searchPaths,
         regex,
         contextLines,
         args.include,
@@ -162,14 +168,14 @@ export class SearchExecutor implements ToolExecutor {
    * 搜索文件
    */
   private async searchFiles(
-    searchPath: string,
+    searchPaths: string[],
     regex: RegExp,
     contextLines: number,
     includePattern?: string,
     excludePattern?: string
   ): Promise<SearchMatch[]> {
     const matches: SearchMatch[] = [];
-    const files = await this.collectFiles(searchPath, includePattern, excludePattern);
+    const files = await this.collectFiles(searchPaths, includePattern, excludePattern);
 
     for (const file of files) {
       if (matches.length >= this.maxResults) break;
@@ -195,7 +201,7 @@ export class SearchExecutor implements ToolExecutor {
             );
 
             matches.push({
-              file: path.relative(this.workspaceRoot, file),
+              file: this.workspaceRoots.toDisplayPath(file),
               line: i + 1, // 1-based
               content: lines[i],
               contextBefore,
@@ -215,11 +221,12 @@ export class SearchExecutor implements ToolExecutor {
    * 收集文件列表
    */
   private async collectFiles(
-    dir: string,
+    dirs: string[],
     includePattern?: string,
     excludePattern?: string
   ): Promise<string[]> {
     const files: string[] = [];
+    const visitedDirs = new Set<string>();
     const excludeDirs = ['node_modules', '.git', 'dist', 'out', 'build', '.next', 'coverage'];
 
     const walk = async (currentPath: string): Promise<void> => {
@@ -247,8 +254,29 @@ export class SearchExecutor implements ToolExecutor {
       }
     };
 
-    await walk(dir);
+    for (const dir of dirs) {
+      if (!visitedDirs.has(dir)) {
+        visitedDirs.add(dir);
+        await walk(dir);
+      }
+    }
     return files;
+  }
+
+  private resolveSearchPaths(inputPath?: string): string[] {
+    if (!inputPath || inputPath.trim() === '') {
+      return this.workspaceRoots.getRootPaths();
+    }
+
+    try {
+      const resolved = this.workspaceRoots.resolvePath(inputPath, { mustExist: true });
+      if (!resolved) {
+        return [];
+      }
+      return [resolved.absolutePath];
+    } catch {
+      return [];
+    }
   }
 
   /**

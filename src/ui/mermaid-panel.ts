@@ -167,9 +167,14 @@ export class MermaidPanel {
    * 导出图表
    */
   private async _exportDiagram(format: 'svg' | 'png', data: string): Promise<void> {
+    const activeDoc = vscode.window.activeTextEditor?.document.uri;
+    const activeFolder = activeDoc ? vscode.workspace.getWorkspaceFolder(activeDoc) : undefined;
+    const fallbackFolder = vscode.workspace.workspaceFolders?.[0];
+    const baseDir = activeFolder?.uri.fsPath || fallbackFolder?.uri.fsPath || '';
+
     const defaultUri = vscode.Uri.file(
       path.join(
-        vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '',
+        baseDir,
         `diagram.${format}`
       )
     );

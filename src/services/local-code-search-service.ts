@@ -17,6 +17,7 @@
 import * as crypto from 'crypto';
 import { logger, LogCategory } from '../logging';
 import type { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
+import { WorkspaceFolderInfo, WorkspaceRoots } from '../workspace/workspace-roots';
 
 /** 最小执行器接口（仅需 execute 方法） */
 interface Executor {
@@ -36,8 +37,8 @@ export interface LocalCodeSearchDeps {
   getLspExecutor: () => Executor | undefined;
   /** 关键词提取 */
   extractKeywords: (query: string) => string[];
-  /** 工作区根路径 */
-  workspaceRoot: string;
+  /** 工作区目录列表 */
+  workspaceFolders: WorkspaceFolderInfo[];
 }
 
 /** 结果缓存条目 */
@@ -52,8 +53,11 @@ export class LocalCodeSearchService {
 
   /** LRU 结果缓存 */
   private cache = new Map<string, CacheEntry>();
+  private workspaceRoots: WorkspaceRoots;
 
-  constructor(private deps: LocalCodeSearchDeps) {}
+  constructor(private deps: LocalCodeSearchDeps) {
+    this.workspaceRoots = new WorkspaceRoots(deps.workspaceFolders);
+  }
 
   /** 本地搜索是否可用（PKB / Grep / LSP 任一就绪即可） */
   get isAvailable(): boolean {
@@ -253,7 +257,8 @@ export class LocalCodeSearchService {
         const formatted = symbols.slice(0, 10).map((sym: any) => {
           const loc = sym.location;
           const uri = loc?.uri || '';
-          const filePath = uri.replace(/^file:\/\//, '').replace(this.deps.workspaceRoot + '/', '');
+          const rawPath = uri.replace(/^file:\/\//, '');
+          const filePath = this.toWorkspaceDisplayPath(rawPath);
           const line = loc?.range?.start?.line ?? '?';
           return `  - ${sym.kindName || 'symbol'} **${sym.name}** → ${filePath}:${line}`;
         }).join('\n');
@@ -288,5 +293,9 @@ export class LocalCodeSearchService {
       if (firstKey !== undefined) this.cache.delete(firstKey);
     }
     this.cache.set(key, { result, timestamp: Date.now() });
+  }
+
+  private toWorkspaceDisplayPath(absolutePath: string): string {
+    return this.workspaceRoots.toDisplayPath(absolutePath);
   }
 }

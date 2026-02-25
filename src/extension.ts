@@ -17,9 +17,12 @@ let statusBarItem: vscode.StatusBarItem | undefined;
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   logger.info('扩展.激活.开始', undefined, LogCategory.SYSTEM);
 
-  // 获取工作区根目录
-  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (!workspaceRoot) {
+  // 获取工作区目录列表
+  const workspaceFolders = vscode.workspace.workspaceFolders?.map(folder => ({
+    name: folder.name,
+    path: folder.uri.fsPath,
+  })) || [];
+  if (workspaceFolders.length === 0) {
     vscode.window.showWarningMessage('Magi: 请先打开一个工作区');
     return;
   }
@@ -28,7 +31,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   webviewProvider = new WebviewProvider(
     context.extensionUri,
     context,
-    workspaceRoot
+    workspaceFolders
   );
 
   // 注册 Webview Provider

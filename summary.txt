@@ -1,0 +1,7 @@
+我在 `src/llm/clients/universal-client.ts` 文件中发现了 MCP 工具执行陷入死循环的根本原因：
+
+1. **表象分析**: MCP 工具调用（如 `web-executor` 或其他 MCP tool）可能会陷入无限重试死循环，不断返回 "Invalid arguments"。
+2. **机理溯源**: 在调用模型时，MCP 工具的 JSON Schema 被 `universal-client.ts` 中的 `sanitizeSchema` 和 `sanitizeProperty` 过滤。
+3. **差距诊断**: `sanitizeProperty` 仅仅保留了 `type`, `description`, `enum`，并且处理了嵌套的 `items` (数组) 和 `properties` (对象)。
+4. **根本原因分析**: 许多高级且严格的验证规则被丢弃了，包括 `format`, `pattern`, `minimum`, `maximum`, `anyOf`, `allOf`, `oneOf`, `default`, `additionalProperties`。LLM 在不知情的情况下生成自认为正确的 JSON，却无法通过真实的底层验证。由于它拿不到这些隐藏的验证约束，每次重试都会重复错误。
+5. **修复建议**: 不能直接丢掉这些参数。如果要兼容 LLM 的 API，需要将 `format`, `pattern`, `minimum`/`maximum` 等验证规则，以**纯文本的形式**动态拼接到 `description` 字段上。例如 `Must match pattern: ^...$` 或者 `Minimum: 0`，让 LLM 通过阅读理解这些强制规则，从而生成出合法的工具参数，一次性通过验证，彻底阻断死循环。

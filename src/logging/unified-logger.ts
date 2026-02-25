@@ -659,6 +659,12 @@ export class UnifiedLogger extends EventEmitter {
         message: record.error.message,
         stack: record.error.stack,
       } : undefined,
+    }, (_key, value) => {
+      // Error 对象的 message/stack 不可枚举，JSON.stringify 默认序列化为 {}
+      if (value instanceof Error) {
+        return { name: value.name, message: value.message, stack: value.stack };
+      }
+      return value;
     }) + '\n';
 
     this.logBuffer.push(line);

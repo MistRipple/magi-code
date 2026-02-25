@@ -56,6 +56,7 @@ import { DirectExecutionService } from '../services/direct-execution-service';
 import {
   MissionOrchestrator,
 } from '../orchestrator/core';
+import { WorkspaceFolderInfo, WorkspaceRoots } from '../workspace/workspace-roots';
 
 type WebviewMessagePriority = 'high' | 'normal';
 
@@ -154,6 +155,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'magi.mainView';
 
   private readonly MAX_REASONABLE_ARRAY_LENGTH = 1_000_000;
+  private readonly workspaceRoot: string;
+  private readonly workspaceFolders: WorkspaceFolderInfo[];
+  private readonly workspaceRoots: WorkspaceRoots;
 
   private _view?: vscode.WebviewView;
   private sessionManager: UnifiedSessionManager;
@@ -213,8 +217,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   constructor(
     private readonly extensionUri: vscode.Uri,
     private readonly context: vscode.ExtensionContext,
-    private readonly workspaceRoot: string
+    workspaceFolders: WorkspaceFolderInfo[]
   ) {
+    const normalizedFolders = workspaceFolders
+      .filter(folder => folder && folder.path)
+      .map(folder => ({ name: folder.name, path: folder.path }));
+    if (normalizedFolders.length === 0) {
+      throw new Error('未检测到可用工作区目录');
+    }
+
+    this.workspaceFolders = normalizedFolders;
+    this.workspaceRoots = new WorkspaceRoots(normalizedFolders);
+    this.workspaceRoot = this.workspaceRoots.getPrimaryFolder().path;
     this.messageFlowLogPath = path.join(this.workspaceRoot, '.magi', 'logs', 'message-flow.jsonl');
     this.webviewMessageBus = new WebviewMessageBus(
       () => this._view,
@@ -225,10 +239,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // MessageHub 由 MissionDrivenEngine 创建，初始化后再绑定监听
 
     // 初始化统一会话管理器
-    this.sessionManager = new UnifiedSessionManager(workspaceRoot);
+    this.sessionManager = new UnifiedSessionManager(this.workspaceRoot);
     // 统一任务管理器（按会话初始化）
-    this.snapshotManager = new SnapshotManager(this.sessionManager, workspaceRoot);
-    this.diffGenerator = new DiffGenerator(this.sessionManager, workspaceRoot);
+    this.snapshotManager = new SnapshotManager(this.sessionManager, this.workspaceRoot);
+    this.diffGenerator = new DiffGenerator(this.sessionManager, this.workspaceRoot);
 
     // 确保有当前会话
     this.ensureSessionAlignment();
@@ -241,7 +255,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const strategy = this.normalizeStrategy(config.get<Partial<StrategyConfig>>('strategy'));
 
     // 初始化 LLM 适配器工厂
-    this.adapterFactory = new LLMAdapterFactory({ cwd: workspaceRoot });
+    this.adapterFactory = new LLMAdapterFactory({
+      cwd: this.workspaceRoot,
+      workspaceFolders: this.workspaceFolders,
+    });
 
     // 初始化编排引擎
     this.orchestratorEngine = new MissionDrivenEngine(
@@ -512,26 +529,27 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private setupFileSystemWatcher(): void {
     if (!this.projectKnowledgeBase) return;
 
-    const watcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(this.workspaceRoot, '**/*.{ts,js,tsx,jsx,json,md,yml,yaml}')
-    );
-
     const pkb = this.projectKnowledgeBase;
+    for (const folder of this.workspaceFolders) {
+      const watcher = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(folder.path, '**/*.{ts,js,tsx,jsx,json,md,yml,yaml}')
+      );
 
-    watcher.onDidChange((uri) => {
-      pkb.onFileEvent(uri.fsPath, 'changed');
-    });
+      watcher.onDidChange((uri) => {
+        pkb.onFileEvent(uri.fsPath, 'changed');
+      });
 
-    watcher.onDidCreate((uri) => {
-      pkb.onFileEvent(uri.fsPath, 'created');
-    });
+      watcher.onDidCreate((uri) => {
+        pkb.onFileEvent(uri.fsPath, 'created');
+      });
 
-    watcher.onDidDelete((uri) => {
-      pkb.onFileEvent(uri.fsPath, 'deleted');
-    });
+      watcher.onDidDelete((uri) => {
+        pkb.onFileEvent(uri.fsPath, 'deleted');
+      });
 
-    // 注册到扩展上下文，确保扩展停用时自动释放
-    this.context.subscriptions.push(watcher);
+      // 注册到扩展上下文，确保扩展停用时自动释放
+      this.context.subscriptions.push(watcher);
+    }
 
     logger.info('项目知识库.文件监听器.已启用', undefined, LogCategory.SESSION);
   }
@@ -550,7 +568,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       getSearchExecutor: () => toolManager.getSearchExecutor(),
       getLspExecutor: () => toolManager.getLspExecutor(),
       extractKeywords: (query: string) => this.promptEnhancer.extractKeywords(query),
-      workspaceRoot: this.workspaceRoot,
+      workspaceFolders: this.workspaceFolders,
     });
 
     toolManager.getAceExecutor().setLocalSearchService(localSearch);
@@ -837,22 +855,21 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const hasRunningTask = runningTasks.length > 0 || this.orchestratorEngine.running;
 
 
-    // 1. 先中断所有适配器，第一时间触发 AbortController，避免等待引擎状态切换导致中断滞后
-    let adapterInterruptCompleted = false;
-    logger.info('界面.任务.中断.适配器.开始', undefined, LogCategory.UI);
-    try {
-      await this.adapterFactory.interruptAll();
-      adapterInterruptCompleted = true;
-      logger.info('界面.任务.中断.适配器.完成', undefined, LogCategory.UI);
-    } catch (error) {
-      logger.error('界面.任务.中断.适配器.错误', error, LogCategory.UI);
-      adapterInterruptCompleted = false;
-    }
-
-    // 2. 再同步编排引擎状态（Mission/Batch 状态收敛）
+    // 1. 先取消编排引擎（设置 CancellationToken + 中断 Worker 适配器）
+    //    确保 Worker 在 abort 错误恢复后通过 cancellationToken.isCancelled 立即退出循环，
+    //    避免竞态：先 abort 适配器 → Worker 恢复 → 获取下一个 todo → 此时 token 尚未 cancel
     if (this.orchestratorEngine.running) {
       logger.info('界面.任务.中断.编排器', undefined, LogCategory.UI);
       await this.orchestratorEngine.interrupt();
+    }
+
+    // 2. 兜底中断所有适配器（覆盖引擎未跟踪的适配器，如 orchestrator 自身）
+    logger.info('界面.任务.中断.适配器.开始', undefined, LogCategory.UI);
+    try {
+      await this.adapterFactory.interruptAll();
+      logger.info('界面.任务.中断.适配器.完成', undefined, LogCategory.UI);
+    } catch (error) {
+      logger.error('界面.任务.中断.适配器.错误', error, LogCategory.UI);
     }
 
     // 3. 更新任务状态
@@ -1700,9 +1717,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     try {
       // 处理相对路径和绝对路径
-      const absolutePath = path.isAbsolute(filepath)
-        ? filepath
-        : path.join(this.workspaceRoot, filepath);
+      const resolved = this.workspaceRoots.resolvePath(filepath, { mustExist: true });
+      const absolutePath = resolved?.absolutePath || '';
 
       // 检查文件是否存在
       if (!fs.existsSync(absolutePath)) {

@@ -1897,6 +1897,12 @@ export class AutonomousWorker extends EventEmitter {
     try {
       this.cacheReadStats.lookups++;
 
+      // 检查路径是否为目录，避免 EISDIR 错误
+      const stat = await fs.stat(filePath);
+      if (stat.isDirectory()) {
+        throw new Error(`路径是目录而非文件: ${filePath}`);
+      }
+
       // 1. 读取文件并计算当前 hash（避免重复 I/O）
       const content = await fs.readFile(filePath, 'utf-8');
       const currentHash = this.computeContentHash(content);

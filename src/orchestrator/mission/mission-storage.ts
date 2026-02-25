@@ -76,18 +76,18 @@ export class InMemoryMissionStorage implements IMissionStorage {
     return Array.from(missionIds)
       .map(id => this.missions.get(id)!)
       .filter(Boolean)
-      .sort((a, b) => b.createdAt - a.createdAt);
+      .sort((a, b) => a.createdAt - b.createdAt);
   }
 
   async findByStatus(status: MissionStatus): Promise<Mission[]> {
     return Array.from(this.missions.values())
       .filter(m => m.status === status)
-      .sort((a, b) => b.createdAt - a.createdAt);
+      .sort((a, b) => a.createdAt - b.createdAt);
   }
 
   async getLatestBySession(sessionId: string): Promise<Mission | null> {
     const missions = await this.listBySession(sessionId);
-    return missions[0] || null;
+    return missions[missions.length - 1] || null;
   }
 
   // 辅助方法：清空所有数据（用于测试）
@@ -436,19 +436,19 @@ export class FileBasedMissionStorage implements IMissionStorage {
     return Array.from(missionIds)
       .map(id => this.missions.get(id)!)
       .filter(Boolean)
-      .sort((a, b) => b.createdAt - a.createdAt);
+      .sort((a, b) => a.createdAt - b.createdAt);
   }
 
   async findByStatus(status: MissionStatus): Promise<Mission[]> {
     this.loadFromDisk();
     return Array.from(this.missions.values())
       .filter(m => m.status === status)
-      .sort((a, b) => b.createdAt - a.createdAt);
+      .sort((a, b) => a.createdAt - b.createdAt);
   }
 
   async getLatestBySession(sessionId: string): Promise<Mission | null> {
     const missions = await this.listBySession(sessionId);
-    return missions[0] || null;
+    return missions[missions.length - 1] || null;
   }
 }
 

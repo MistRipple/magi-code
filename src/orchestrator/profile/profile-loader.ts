@@ -9,6 +9,7 @@
 
 import { WorkerSlot } from '../../types/agent-types';
 import { logger, LogCategory } from '../../logging';
+import { LLMConfigLoader } from '../../llm/config';
 import { WorkerProfile, CategoryDefinition, CategoryRules } from './types';
 import { CATEGORY_DEFINITIONS } from './builtin/category-definitions';
 import { CATEGORY_RULES } from './builtin/category-rules';
@@ -122,6 +123,24 @@ export class ProfileLoader {
 
   getAllProfiles(): Map<WorkerSlot, WorkerProfile> {
     return this.profiles;
+  }
+
+  /**
+   * 获取已启用的 Worker 画像（Single Source of Truth）
+   *
+   * 组合画像系统（角色定义）和 LLM 配置（可用性），
+   * 仅返回 LLM 配置中 enabled !== false 的 Worker 画像。
+   * 所有需要"可用 Worker 列表"的消费者都应使用此方法，避免各自重复过滤逻辑。
+   */
+  getEnabledProfiles(): Map<WorkerSlot, WorkerProfile> {
+    const fullConfig = LLMConfigLoader.loadFullConfig();
+    const enabled = new Map<WorkerSlot, WorkerProfile>();
+    for (const [worker, profile] of this.profiles) {
+      if (fullConfig.workers[worker]?.enabled !== false) {
+        enabled.set(worker, profile);
+      }
+    }
+    return enabled;
   }
 
   getCategory(categoryName: string): CategoryDefinition | undefined {

@@ -78,9 +78,8 @@ export class OrchestrationExecutor {
    * 设置可用 Worker 列表（由 MissionDrivenEngine 从 ProfileLoader 注入）
    */
   setAvailableWorkers(workers: { slot: WorkerSlot; description: string }[]): void {
-    if (workers.length > 0) {
-      this.availableWorkers = workers;
-    }
+    // 必须无条件覆盖，避免“全禁用后仍保留旧枚举”的陈旧状态
+    this.availableWorkers = workers;
   }
 
   private getWorkerEnum(): string[] {

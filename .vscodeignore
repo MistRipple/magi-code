@@ -10,8 +10,8 @@ docs/**
 scripts/**
 augment-extension/**
 websocket-system/**
-node_modules/**
 out/**
+node_modules/**
 esbuild.mjs
 **/*.map
 **/*.svelte

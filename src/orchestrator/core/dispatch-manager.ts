@@ -23,7 +23,6 @@ import type { WorkerReport, OrchestratorResponse } from '../protocols/worker-rep
 import { createAdjustResponse } from '../protocols/worker-report';
 import { DispatchBatch, CancellationError, type DispatchEntry, type DispatchResult, type DispatchStatus } from './dispatch-batch';
 import type { WorkerCompletionResult } from '../../tools/orchestration-executor';
-import { LLMConfigLoader } from '../../llm/config';
 import { buildDispatchSummaryPrompt } from '../prompts/orchestrator-prompts';
 import { MessageType } from '../../protocol/message-protocol';
 import { PlanningExecutor } from './executors/planning-executor';
@@ -152,10 +151,11 @@ export class DispatchManager {
     const toolManager = this.deps.adapterFactory.getToolManager();
     const orchestrationExecutor = toolManager.getOrchestrationExecutor();
 
-    // 从 ProfileLoader 动态注入 Worker 列表到工具定义
-    const allProfiles = this.deps.profileLoader.getAllProfiles();
+    // 从 ProfileLoader 注入已启用的 Worker 列表到工具定义，
+    // 确保编排 LLM 从工具 schema（enum）和系统提示词两个通道获取的信息一致
+    const enabledProfiles = this.deps.profileLoader.getEnabledProfiles();
     orchestrationExecutor.setAvailableWorkers(
-      Array.from(allProfiles.values()).map(p => ({
+      Array.from(enabledProfiles.values()).map(p => ({
         slot: p.worker,
         description: p.persona.strengths.slice(0, 2).join('/'),
       }))
@@ -167,12 +167,6 @@ export class DispatchManager {
         logger.info('编排工具.dispatch_task.开始', {
           worker, taskPreview: task.substring(0, 80), dependsOn,
         }, LogCategory.ORCHESTRATOR);
-
-        // 校验 Worker 是否已启用
-        const workerFullConfig = LLMConfigLoader.loadFullConfig();
-        if (workerFullConfig.workers[worker as WorkerSlot]?.enabled === false) {
-          return { task_id: '', status: 'failed' as const, worker, error: `Worker "${worker}" 未启用，请检查 LLM 配置` };
-        }
 
         // 生成唯一 task_id
         const taskId = `dispatch-${Date.now()}-${worker}-${Math.random().toString(36).substring(2, 5)}`;

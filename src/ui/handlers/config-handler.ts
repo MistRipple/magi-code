@@ -335,6 +335,13 @@ export class ConfigCommandHandler implements CommandHandler {
       const { LLMConfigLoader } = await import('../../llm/config');
       LLMConfigLoader.updateWorkerConfig(message.worker, message.config);
       await ctx.getAdapterFactory().clearAdapter(message.worker);
+      try {
+        // #7 根修复：Worker enabled 变化后，立即重建 dispatch_task/send_worker_message 的 worker enum
+        await ctx.getOrchestratorEngine().reloadProfiles();
+      } catch (reloadError) {
+        const reloadMsg = reloadError instanceof Error ? reloadError.message : String(reloadError);
+        ctx.sendToast(`Worker 可用列表刷新失败: ${reloadMsg}`, 'warning');
+      }
       ctx.sendToast(`${message.worker} 配置已保存`, 'success');
       logger.info('Worker 配置已保存', { worker: message.worker }, LogCategory.LLM);
     } catch (error: any) {

@@ -8,6 +8,7 @@
 import { logger, LogCategory } from '../logging';
 import { EventEmitter } from 'events';
 import type { AgentType } from '../types/agent-types';  // ✅ 使用 AgentType
+import type { FileChangeMetadata } from '../llm/types';
 import {
   StandardMessage,
   StreamUpdate,
@@ -355,26 +356,72 @@ export abstract class BaseNormalizer extends EventEmitter {
   /**
    * 完成工具调用（public 接口）
    * 用于外部模块在工具执行完成后更新状态
+   * 当 fileChange 存在且无错误时，自动生成 file_change block 供前端差异化面板
    */
-  public finishToolCall(messageId: string, toolId: string, output?: string, error?: string): void {
+  public finishToolCall(messageId: string, toolId: string, output?: string, error?: string, fileChange?: FileChangeMetadata): void {
     const context = this.activeContexts.get(messageId);
     if (!context) {
       this.debug(`[${this.agent}] finishToolCall: 未找到消息上下文: ${messageId}`);
       return;
     }
+
+    // 在 completeToolCall 将工具从 activeToolCalls 移到 blocks 之前，获取原始信息
+    const originalTool = context.activeToolCalls.get(toolId);
+    const toolName = originalTool?.toolName || '';
+    const input = originalTool?.input;
+
     this.completeToolCall(context, toolId, output, error);
 
-    // 发送 UPDATE 事件，通知前端工具执行完成状态
+    // 发送 UPDATE 事件，通知前端工具执行完成状态（保留原始 toolName 和 input，避免 mergeBlocks 覆盖）
     const update = this.createUpdate(messageId, 'block_update', {
       blocks: [{
         type: 'tool_call',
-        toolName: '',
+        toolName,
         toolId,
         status: error ? 'failed' : 'completed',
+        input,
         output,
         error,
       }],
     });
+    this.emit(MESSAGE_EVENTS.UPDATE, update);
+
+    // 文件变更工具执行成功后，自动附加 file_change block 供前端展示差异化面板
+    if (!error && fileChange) {
+      this.addFileChangeBlock(messageId, fileChange.filePath, fileChange.changeType, fileChange.additions, fileChange.deletions, fileChange.diff);
+    }
+  }
+
+  /**
+   * 附加文件变更块（public 接口）
+   * 用于文件写工具（file_edit/file_insert/file_create）执行成功后，在对话流中展示差异化面板
+   */
+  public addFileChangeBlock(
+    messageId: string,
+    filePath: string,
+    changeType: 'create' | 'modify' | 'delete',
+    additions?: number,
+    deletions?: number,
+    diff?: string,
+  ): void {
+    const context = this.activeContexts.get(messageId);
+    if (!context) {
+      this.debug(`[${this.agent}] addFileChangeBlock: 未找到消息上下文: ${messageId}`);
+      return;
+    }
+
+    const block: ContentBlock = {
+      type: 'file_change',
+      filePath,
+      changeType,
+      additions,
+      deletions,
+      diff,
+    } as ContentBlock;
+
+    context.blocks.push(block);
+
+    const update = this.createUpdate(messageId, 'block_update', { blocks: [block] });
     this.emit(MESSAGE_EVENTS.UPDATE, update);
   }
 

@@ -30,7 +30,6 @@ import {
   FileBasedMissionStorage,
 } from '../mission';
 import { ExecutionStats } from '../execution-stats';
-import { LLMConfigLoader } from '../../llm/config';
 import { MessageHub } from './message-hub';
 import { WisdomManager, type WisdomStorage } from '../wisdom';
 import { buildIntentClassificationPrompt } from '../prompts/intent-classification';
@@ -437,6 +436,8 @@ export class MissionDrivenEngine extends EventEmitter {
    */
   async reloadProfiles(): Promise<void> {
     await this.profileLoader.reload();
+    // 画像/配置变化后，立即重建编排工具可用 Worker 枚举，避免 schema 与运行时配置不一致
+    this.dispatchManager.setupOrchestrationToolHandlers();
     logger.info('画像配置已重载', undefined, LogCategory.ORCHESTRATOR);
   }
 
@@ -509,14 +510,9 @@ export class MissionDrivenEngine extends EventEmitter {
           : undefined;
 
         // 3. 构建统一系统提示词（Worker 列表从 ProfileLoader 动态获取，工具列表从 ToolManager 动态加载）
-        const allProfiles = this.profileLoader.getAllProfiles();
-        // 仅保留 LLM 配置中已启用（enabled=true 且 apiKey 有效）的 Worker，
-        // 避免编排器将任务分配给未配置的 Worker 导致运行时错误
-        const fullConfig = LLMConfigLoader.loadFullConfig();
-        const availableWorkers = Array.from(allProfiles.keys())
-          .filter(w => fullConfig.workers[w]?.enabled !== false);
-        const workerProfiles = Array.from(allProfiles.values())
-          .filter(p => availableWorkers.includes(p.worker))
+        const enabledProfiles = this.profileLoader.getEnabledProfiles();
+        const availableWorkers = Array.from(enabledProfiles.keys());
+        const workerProfiles = Array.from(enabledProfiles.values())
           .map(p => ({
           worker: p.worker,
           displayName: p.persona.displayName,

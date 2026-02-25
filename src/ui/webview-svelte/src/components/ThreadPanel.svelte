@@ -36,16 +36,16 @@
   <!-- 每个 Worker 拥有独立的 MessageList 实例和计时器状态 -->
   <div class="main-content">
     <div class="tab-pane" class:active={activeBottomTab === 'thread'}>
-      <MessageList {messages} />
+      <MessageList {messages} isActive={activeBottomTab === 'thread'} />
     </div>
     <div class="tab-pane" class:active={activeBottomTab === 'claude'}>
-      <AgentTab messages={agentOutputs.claude} />
+      <AgentTab messages={agentOutputs.claude} isActive={activeBottomTab === 'claude'} />
     </div>
     <div class="tab-pane" class:active={activeBottomTab === 'codex'}>
-      <AgentTab messages={agentOutputs.codex} />
+      <AgentTab messages={agentOutputs.codex} isActive={activeBottomTab === 'codex'} />
     </div>
     <div class="tab-pane" class:active={activeBottomTab === 'gemini'}>
-      <AgentTab messages={agentOutputs.gemini} />
+      <AgentTab messages={agentOutputs.gemini} isActive={activeBottomTab === 'gemini'} />
     </div>
   </div>
 

@@ -536,7 +536,7 @@ export function setIsProcessing(value: boolean) {
 }
 
 export function setThinkingStartAt(value: number | null) {
-  thinkingStartAt = value;
+  messagesState.thinkingStartAt = value;
 }
 
 export function setProcessingActor(source: string, agent?: string) {
@@ -574,7 +574,17 @@ export function setWorkerExecutionStatus(
 }
 
 function updateProcessingState() {
-  messagesState.isProcessing = messagesState.backendProcessing || messagesState.activeMessageIds.size > 0 || messagesState.pendingRequests.size > 0;
+  const nextIsProcessing = messagesState.backendProcessing
+    || messagesState.activeMessageIds.size > 0
+    || messagesState.pendingRequests.size > 0;
+
+  if (nextIsProcessing && !messagesState.isProcessing) {
+    messagesState.thinkingStartAt = Date.now();
+  } else if (!nextIsProcessing && messagesState.isProcessing) {
+    messagesState.thinkingStartAt = null;
+  }
+
+  messagesState.isProcessing = nextIsProcessing;
 }
 
 export function markMessageActive(id: string) {

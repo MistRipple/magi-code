@@ -854,3 +854,48 @@ pre code {
   border-width: 0;
 }
 
+
+/* ============================================
+   hljs 语法高亮 token 颜色
+   适配 VS Code 暗色/亮色主题
+   ============================================ */
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-built_in,
+.hljs-type { color: var(--vscode-debugTokenExpression-name, #569cd6); }
+
+.hljs-string,
+.hljs-template-variable,
+.hljs-addition { color: var(--vscode-debugTokenExpression-string, #ce9178); }
+
+.hljs-comment,
+.hljs-quote { color: var(--vscode-descriptionForeground, #6a9955); font-style: italic; }
+
+.hljs-number,
+.hljs-literal,
+.hljs-variable.constant_ { color: var(--vscode-debugTokenExpression-number, #b5cea8); }
+
+.hljs-title,
+.hljs-title.class_,
+.hljs-title.function_ { color: var(--vscode-symbolIcon-functionForeground, #dcdcaa); }
+
+.hljs-attr,
+.hljs-attribute { color: var(--vscode-symbolIcon-propertyForeground, #9cdcfe); }
+
+.hljs-regexp,
+.hljs-link { color: #d16969; }
+
+.hljs-meta,
+.hljs-meta .hljs-keyword { color: #c586c0; }
+
+.hljs-tag,
+.hljs-name,
+.hljs-selector-class,
+.hljs-selector-id { color: #569cd6; }
+
+.hljs-params { color: var(--vscode-editor-foreground, #d4d4d4); }
+
+.hljs-deletion { color: var(--error, #ef4444); }
+
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: bold; }

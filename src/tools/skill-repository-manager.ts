@@ -7,9 +7,18 @@
  * - GitHub 仓库（GitHub 项目）
  */
 
-import axios from 'axios';
 import type { CustomToolExecutorConfig, ToolDefinition } from './skills-manager';
 import { logger, LogCategory } from '../logging';
+
+class HttpRequestError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+  ) {
+    super(message);
+    this.name = 'HttpRequestError';
+  }
+}
 
 /**
  * 仓库配置
@@ -55,6 +64,57 @@ export class SkillRepositoryManager {
   private readonly REQUEST_TIMEOUT = 5000; // 5 秒超时
   private readonly MAX_CONCURRENT = 3; // 最大并发仓库数
 
+  private async fetchJSON(url: string): Promise<any> {
+    const response = await this.fetchRaw(url, 'application/json');
+    const contentType = response.headers.get('content-type') || '';
+    const text = await response.text();
+    if (!response.ok) {
+      throw new HttpRequestError(`HTTP ${response.status}: ${url}`, response.status);
+    }
+    if (!text) {
+      return {};
+    }
+    if (contentType.includes('application/json')) {
+      return JSON.parse(text);
+    }
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`Invalid JSON response from ${url}`);
+    }
+  }
+
+  private async fetchText(url: string): Promise<string> {
+    const response = await this.fetchRaw(url);
+    const text = await response.text();
+    if (!response.ok) {
+      throw new HttpRequestError(`HTTP ${response.status}: ${url}`, response.status);
+    }
+    return text;
+  }
+
+  private async fetchRaw(url: string, accept: string = '*/*'): Promise<Response> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.REQUEST_TIMEOUT);
+    try {
+      return await fetch(url, {
+        method: 'GET',
+        headers: {
+          'Accept': accept,
+          'User-Agent': 'Magi-SkillManager/1.0',
+        },
+        signal: controller.signal,
+      });
+    } catch (error: any) {
+      if (error?.name === 'AbortError') {
+        throw new Error(`Request timeout: ${url}`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   /**
    * 从 JSON 仓库获取 Skills（同时获取仓库名称）
    */
@@ -62,15 +122,7 @@ export class SkillRepositoryManager {
     try {
       logger.info('Fetching JSON repository', { url, repositoryId }, LogCategory.TOOLS);
 
-      const response = await axios.get(url, {
-        timeout: this.REQUEST_TIMEOUT,
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'Magi-SkillManager/1.0'
-        }
-      });
-
-      const data = response.data;
+      const data = await this.fetchJSON(url);
 
       // 验证数据格式
       if (!data || typeof data !== 'object') {
@@ -147,15 +199,8 @@ export class SkillRepositoryManager {
 
       // 检查是否有 plugins 目录
       const pluginsUrl = `https://api.github.com/repos/${owner}/${repo}/contents/plugins`;
-      const pluginsResponse = await axios.get(pluginsUrl, {
-        timeout: this.REQUEST_TIMEOUT,
-        headers: {
-          'Accept': 'application/vnd.github.v3+json',
-          'User-Agent': 'Magi-SkillManager/1.0'
-        }
-      });
-
-      const plugins = pluginsResponse.data.filter((item: any) => item.type === 'dir');
+      const pluginsData = await this.fetchJSON(pluginsUrl);
+      const plugins = pluginsData.filter((item: any) => item.type === 'dir');
       if (plugins.length === 0) {
         return null;
       }
@@ -167,12 +212,7 @@ export class SkillRepositoryManager {
         const pluginName = plugin.name;
         try {
           const readmeUrl = `https://raw.githubusercontent.com/${owner}/${repo}/main/plugins/${pluginName}/README.md`;
-          const readmeResponse = await axios.get(readmeUrl, {
-            timeout: this.REQUEST_TIMEOUT,
-            headers: { 'User-Agent': 'Magi-SkillManager/1.0' }
-          });
-
-          const readme = readmeResponse.data;
+          const readme = await this.fetchText(readmeUrl);
           const lines = readme.split('\n').filter((line: string) => line.trim());
           const title = lines[0]?.replace(/^#\s*/, '') || pluginName;
           const description = lines[1] || `Claude Code plugin: ${pluginName}`;
@@ -239,18 +279,9 @@ export class SkillRepositoryManager {
   private async fetchRawFile(owner: string, repo: string, branch: string, filePath: string): Promise<string | null> {
     const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${filePath}`;
     try {
-      const response = await axios.get(rawUrl, {
-        timeout: this.REQUEST_TIMEOUT,
-        headers: {
-          'User-Agent': 'Magi-SkillManager/1.0'
-        }
-      });
-      if (typeof response.data === 'string') {
-        return response.data;
-      }
-      return JSON.stringify(response.data);
+      return await this.fetchText(rawUrl);
     } catch (error: any) {
-      if (error.response?.status === 404 || error.response?.status === 403 || error.response?.status === 429) {
+      if (error instanceof HttpRequestError && (error.status === 404 || error.status === 403 || error.status === 429)) {
         return null;
       }
       throw error;
@@ -260,16 +291,10 @@ export class SkillRepositoryManager {
   private async listRepoDir(owner: string, repo: string, dirPath: string): Promise<any[] | null> {
     const url = `https://api.github.com/repos/${owner}/${repo}/contents/${dirPath}`;
     try {
-      const response = await axios.get(url, {
-        timeout: this.REQUEST_TIMEOUT,
-        headers: {
-          'Accept': 'application/vnd.github.v3+json',
-          'User-Agent': 'Magi-SkillManager/1.0'
-        }
-      });
-      return Array.isArray(response.data) ? response.data : null;
+      const data = await this.fetchJSON(url);
+      return Array.isArray(data) ? data : null;
     } catch (error: any) {
-      if (error.response?.status === 404 || error.response?.status === 403 || error.response?.status === 429) {
+      if (error instanceof HttpRequestError && (error.status === 404 || error.status === 403 || error.status === 429)) {
         return null;
       }
       throw error;
@@ -603,14 +628,7 @@ export class SkillRepositoryManager {
       let repoName = repo;
 
       try {
-        const response = await axios.get(skillsJsonUrl, {
-          timeout: this.REQUEST_TIMEOUT,
-          headers: {
-            'Accept': 'application/json',
-            'User-Agent': 'Magi-SkillManager/1.0'
-          }
-        });
-        skillsData = response.data;
+        skillsData = await this.fetchJSON(skillsJsonUrl);
         logger.debug('Found skills.json', { owner, repo }, LogCategory.TOOLS);
       } catch {
         // skills.json 不存在，尝试其他格式
@@ -809,11 +827,7 @@ export class SkillRepositoryManager {
         // 快速检查：尝试获取 skills.json
         const skillsJsonUrl = `https://raw.githubusercontent.com/${owner}/${repo}/HEAD/skills.json`;
         try {
-          const response = await axios.get(skillsJsonUrl, {
-            timeout: this.REQUEST_TIMEOUT,
-            headers: { 'Accept': 'application/json', 'User-Agent': 'Magi-SkillManager/1.0' }
-          });
-          const data = response.data;
+          const data = await this.fetchJSON(skillsJsonUrl);
           return {
             name: data.name || repo,
             skillCount: Array.isArray(data.skills) ? data.skills.length : 0,
@@ -867,11 +881,7 @@ export class SkillRepositoryManager {
         }
       } else {
         // JSON 仓库
-        const response = await axios.get(url, {
-          timeout: this.REQUEST_TIMEOUT,
-          headers: { 'Accept': 'application/json', 'User-Agent': 'Magi-SkillManager/1.0' }
-        });
-        const data = response.data;
+        const data = await this.fetchJSON(url);
         return {
           name: data.name || 'Unknown',
           skillCount: Array.isArray(data.skills) ? data.skills.length : 0,

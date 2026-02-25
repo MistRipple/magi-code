@@ -6,7 +6,7 @@
  */
 
 import { AgentType, AgentRole, LLMConfig, WorkerSlot } from '../../types/agent-types';
-import { LLMClient, LLMMessageParams, LLMMessage, ToolCall } from '../types';
+import { LLMClient, LLMMessageParams, LLMMessage, ToolCall, sanitizeToolOrder } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager } from '../../tools/tool-manager';
 import { MessageHub } from '../../orchestrator/core/message-hub';
@@ -155,6 +155,10 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   private roundDedupHits = 0;
   /** 失败写操作缓存：防止模型反复重试相同的失败写操作 */
   private failedWriteCache = new Map<string, { count: number; error: string }>();
+  /** 成功写操作缓存：防止模型反复执行完全相同的已成功写操作 */
+  private successWriteCache = new Set<string>();
+  /** 当前轮次被去重拦截的写操作计数（用于空转检测判断是否有实际写入） */
+  private roundWriteInterceptCount = 0;
 
   constructor(adapterConfig: WorkerAdapterConfig) {
     super(
@@ -296,6 +300,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       let lastNoOutputWarnLevel = 0;          // 上次警告级别
       // 强制总结模式：达到终止阈值时，撤掉工具给模型一轮纯文本输出机会
       let forceNoToolsNextRound = false;
+      // 重复无效 launch-process 拦截计数（避免同一错误参数反复刷屏）
+      let repeatedLaunchProcessInterceptRounds = 0;
 
       // 创建 AbortController，供 interrupt() 中断 LLM 请求
       this.abortController = new AbortController();
@@ -416,6 +422,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           this.conversationHistory.push({ role: 'assistant', content: assistantContent });
 
           this.roundDedupHits = 0;
+          this.roundWriteInterceptCount = 0;
           const toolResults = await this.executeToolCalls(toolCalls);
 
           // 中断检查：工具执行完成后立即检测 abort，跳过后续处理直接退出循环
@@ -430,6 +437,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
               result.toolCallId,
               result.isError ? undefined : result.content,
               result.isError ? result.content : undefined,
+              result.fileChange,
             );
           }
 
@@ -442,6 +450,26 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
               is_error: result.isError,
             })),
           });
+
+          const isLaunchProcessInterceptRound = toolCalls.length > 0
+            && toolCalls.length === toolResults.length
+            && toolCalls.every(tc => tc.name === 'launch-process')
+            && toolResults.every(result => result.isError
+              && typeof result.content === 'string'
+              && result.content.includes('[系统拦截]'));
+
+          if (isLaunchProcessInterceptRound) {
+            repeatedLaunchProcessInterceptRounds++;
+            if (repeatedLaunchProcessInterceptRounds >= 2 && !forceNoToolsNextRound) {
+              forceNoToolsNextRound = true;
+              this.conversationHistory.push({
+                role: 'user',
+                content: '[System] 你正在重复调用同一失败的 launch-process。下一轮禁止调用工具。请仅输出修正后的命令参数方案：cwd 必须使用工作区名或 "<工作区名>/相对路径"，不要使用 /home/user 这类固定系统路径。',
+              });
+            }
+          } else {
+            repeatedLaunchProcessInterceptRounds = 0;
+          }
 
           // 连续失败检测
           const allFailed = toolResults.every(r => r.isError);
@@ -549,15 +577,29 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
                 });
               }
             } else {
-              // 包含写入操作 → 重置空转状态
-              readOnlyStallScore = 0;
-              readOnlyConsecutiveRounds = 0;
-              lastStallWarnLevel = 0;
-              lastPrimaryToolName = '';
-              consecutiveSameToolRounds = 0;
-              // 写入操作也重置无输出计数——模型在修改代码即为有效产出
-              noSubstantiveOutputRounds = 0;
-              lastNoOutputWarnLevel = 0;
+              // 包含写入操作：区分"实际执行"和"全部被去重拦截"
+              const writeToolCalls = toolCalls.filter(tc => !this.isReadOnlyToolCall(tc));
+              const allWritesIntercepted = writeToolCalls.length > 0 && this.roundWriteInterceptCount >= writeToolCalls.length;
+
+              if (allWritesIntercepted) {
+                // 所有写操作均被去重拦截 → 不重置空转状态（拦截≠有效产出）
+                // 同时追加去重惩罚，加速触发警告
+                readOnlyStallScore += this.roundDedupHits * 2.0;
+                logger.info(`${this.agent} 写操作全部被去重拦截，空转分数惩罚`, {
+                  intercepted: this.roundWriteInterceptCount,
+                  stallScore: readOnlyStallScore,
+                }, LogCategory.LLM);
+              } else {
+                // 有实际执行的写操作 → 重置空转状态
+                readOnlyStallScore = 0;
+                readOnlyConsecutiveRounds = 0;
+                lastStallWarnLevel = 0;
+                lastPrimaryToolName = '';
+                consecutiveSameToolRounds = 0;
+                // 写入操作也重置无输出计数——模型在修改代码即为有效产出
+                noSubstantiveOutputRounds = 0;
+                lastNoOutputWarnLevel = 0;
+              }
               // 注意：visitedPaths 不重置，保持全局去重
             }
           }
@@ -615,7 +657,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
       // abort 中断时不要求必须有内容
       if (!finalText.trim() && !this.abortController?.signal.aborted) {
-        throw new Error('LLM 响应为空：流式传输完成但未收到有效内容');
+        throw new Error(`LLM 响应为空：流式传输完成但未收到有效内容 [${this.agent}/${this.config.model}/${this.config.provider}]`);
       }
 
       return finalText || '任务已中断';
@@ -637,7 +679,9 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   async interrupt(): Promise<void> {
     if (this.abortController) {
       this.abortController.abort();
-      this.abortController = undefined;
+      // 不清除 abortController 引用 — 循环内的 abort 状态检查（L306/L422）
+      // 依赖 abortController.signal.aborted 判断中断状态。
+      // 下次 sendMessage 调用时会创建新的 AbortController 覆盖。
     }
     this.setState(AdapterState.CONNECTED);
     logger.info(`${this.agent} adapter interrupted`, undefined, LogCategory.LLM);
@@ -705,6 +749,22 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         continue;
       }
 
+      // 参数解析失败：不执行工具，直接把结构化错误回传给模型，避免错误命令被实际执行
+      if (toolCall.argumentParseError) {
+        const raw = typeof toolCall.rawArguments === 'string'
+          ? toolCall.rawArguments.substring(0, 500)
+          : '';
+        const errorContent = `工具参数解析失败（${toolCall.name}）：${toolCall.argumentParseError}${raw ? `\n原始参数: ${raw}` : ''}`;
+        results.push({
+          toolCallId: toolCall.id,
+          content: errorContent,
+          isError: true,
+        });
+        this.recordFailedWrite(toolCall, errorContent);
+        this.emit('toolResult', toolCall.name, errorContent);
+        continue;
+      }
+
       // 文件级去重：同一文件只需读取一次，阻断"对同一文件反复发起不同查询"的模式
       const fileDedup = this.checkFileAccessDuplicate(toolCall);
       if (fileDedup) {
@@ -744,10 +804,27 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         continue;
       }
 
+      // 成功写操作去重：完全相同参数的已成功写操作直接拦截，阻断无意义重复
+      const successWriteDedup = this.checkSuccessWriteDuplicate(toolCall);
+      if (successWriteDedup) {
+        logger.info(`${this.agent} 成功写操作去重命中`, { tool: toolCall.name, path: toolCall.arguments?.path }, LogCategory.TOOLS);
+        results.push({
+          toolCallId: toolCall.id,
+          content: successWriteDedup,
+          isError: false,
+        });
+        this.emit('toolResult', toolCall.name, successWriteDedup);
+        continue;
+      }
+
       try {
         logger.debug(`Executing tool: ${toolCall.name}`, { args: toolCall.arguments }, LogCategory.TOOLS);
 
-        const result = await this.toolManager.execute(toolCall, this.abortController?.signal);
+        const result = await this.toolManager.execute(
+          toolCall,
+          this.abortController?.signal,
+          { workerId: this.workerSlot, role: 'worker' },
+        );
         if (typeof result.content === 'string' && result.content.length > maxToolResultChars) {
           const truncated = result.content.slice(0, maxToolResultChars);
           result.content = `${truncated}\n...[truncated ${result.content.length - maxToolResultChars} chars]`;
@@ -761,12 +838,13 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           this.recordFileAccess(toolCall);
         }
 
-        // 写操作结果追踪：成功则清除失败缓存，失败则记录
+        // 写操作结果追踪：成功则记录到成功缓存并清除失败缓存，失败则记录
         if (!this.isReadOnlyToolCall(toolCall)) {
           if (result.isError) {
             this.recordFailedWrite(toolCall, typeof result.content === 'string' ? result.content : 'Unknown error');
           } else {
             this.clearFailedWriteForPath(toolCall);
+            this.recordSuccessWrite(toolCall);
           }
         }
 
@@ -988,58 +1066,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     if (this.conversationHistory.length === 0) {
       return;
     }
-
-    const cleaned: LLMMessage[] = [];
-    for (let i = 0; i < this.conversationHistory.length; i++) {
-      const msg = this.conversationHistory[i];
-
-      if (this.hasToolUse(msg)) {
-        const next = this.conversationHistory[i + 1];
-        const prev = cleaned[cleaned.length - 1];
-        if (!this.isToolResultUser(next) || !this.isUserOrToolResult(prev)) {
-          continue;
-        }
-        cleaned.push(msg);
-        cleaned.push(next);
-        i += 1;
-        continue;
-      }
-
-      if (this.isToolResultUser(msg)) {
-        const prev = this.conversationHistory[i - 1];
-        if (!this.hasToolUse(prev)) {
-          continue;
-        }
-      }
-
-      cleaned.push(msg);
-    }
-
-    this.conversationHistory = cleaned;
-  }
-
-  private isUserOrToolResult(message?: LLMMessage): boolean {
-    if (!message) {
-      return false;
-    }
-    if (message.role === 'user') {
-      return true;
-    }
-    return this.isToolResultUser(message);
-  }
-
-  private hasToolUse(message?: LLMMessage): boolean {
-    if (!message || !Array.isArray(message.content)) {
-      return false;
-    }
-    return message.content.some((block: any) => block?.type === 'tool_use');
-  }
-
-  private isToolResultUser(message?: LLMMessage): boolean {
-    if (!message || message.role !== 'user' || !Array.isArray(message.content)) {
-      return false;
-    }
-    return message.content.some((block: any) => block?.type === 'tool_result');
+    this.conversationHistory = sanitizeToolOrder(this.conversationHistory);
   }
 
   /**
@@ -1231,6 +1258,46 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   }
 
   /**
+   * 成功写操作去重：检查工具调用是否与之前已成功的写操作完全相同
+   *
+   * 解决的核心问题：模型对成功的工具结果缺乏感知，
+   * 会反复执行完全相同的写操作（如对同一文件重复 file_edit 7 次）。
+   * 使用内容感知 key（包含完整参数指纹）精确匹配，避免误拦截不同内容的操作。
+   */
+  private checkSuccessWriteDuplicate(toolCall: ToolCall): string | null {
+    if (this.isReadOnlyToolCall(toolCall)) return null;
+
+    const key = this.buildContentAwareWriteKey(toolCall);
+    if (!this.successWriteCache.has(key)) return null;
+
+    this.totalDedupHits++;
+    this.roundDedupHits++;
+    this.roundWriteInterceptCount++;
+
+    return `[系统拦截] 此写操作已成功执行，结果已在上下文中。请勿重复相同操作，继续推进任务的下一步。`;
+  }
+
+  /**
+   * 记录成功的写操作（工具执行成功后调用）
+   */
+  private recordSuccessWrite(toolCall: ToolCall): void {
+    if (this.isReadOnlyToolCall(toolCall)) return;
+    const key = this.buildContentAwareWriteKey(toolCall);
+    this.successWriteCache.add(key);
+  }
+
+  /**
+   * 构建写操作的内容感知去重 key（工具名 + 完整参数指纹）
+   * 比 buildWriteOperationKey（仅路径）更精确，用于成功写操作去重
+   */
+  private buildContentAwareWriteKey(toolCall: ToolCall): string {
+    const args = toolCall.arguments || {};
+    const argKeys = Object.keys(args).sort();
+    const argFingerprint = argKeys.map(k => `${k}=${JSON.stringify(args[k])}`).join('|');
+    return `${toolCall.name}::${argFingerprint}`;
+  }
+
+  /**
    * 记录失败的写操作（工具执行失败后调用）
    */
   private recordFailedWrite(toolCall: ToolCall, error: string): void {
@@ -1250,6 +1317,16 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    * 清除写操作失败缓存（写操作成功时调用，表明状态已变化）
    */
   private clearFailedWriteForPath(toolCall: ToolCall): void {
+    // 代码文件发生成功写入后，清空终端命令失败缓存，
+    // 避免“修复后重新执行同一构建命令”被历史失败误拦截。
+    if (this.isFileMutationTool(toolCall.name)) {
+      for (const key of this.failedWriteCache.keys()) {
+        if (key.startsWith('launch-process:')) {
+          this.failedWriteCache.delete(key);
+        }
+      }
+    }
+
     // 任何写操作成功后，清除同文件的失败缓存（文件状态已变化，之前的失败可能不再适用）
     const filePath = (toolCall.arguments?.path || toolCall.arguments?.file_path || '') as string;
     if (!filePath) return;
@@ -1265,6 +1342,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    */
   private buildWriteOperationKey(toolCall: ToolCall): string {
     const args = toolCall.arguments || {};
+    if (toolCall.name === 'launch-process') {
+      return `launch-process:${String(args.command || '').trim()}:${String(args.cwd || '').trim()}`;
+    }
+    if (toolCall.name === 'read-process' || toolCall.name === 'write-process' || toolCall.name === 'kill-process') {
+      return `${toolCall.name}:${String(args.terminal_id || '')}`;
+    }
     // file_edit/file_create/file_insert: path 足以标识
     if (toolCall.name === 'file_edit' || toolCall.name === 'file_create' || toolCall.name === 'file_insert') {
       return `${toolCall.name}:${args.path || ''}`;
@@ -1272,6 +1355,13 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     // 其他写操作工具：name + path
     const filePath = args.path || args.file_path || args.filepath || '';
     return `${toolCall.name}:${filePath}`;
+  }
+
+  private isFileMutationTool(toolName: string): boolean {
+    return toolName === 'file_edit'
+      || toolName === 'file_create'
+      || toolName === 'file_insert'
+      || toolName === 'file_remove';
   }
 
   /**

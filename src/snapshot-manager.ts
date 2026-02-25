@@ -700,8 +700,8 @@ export class SnapshotManager {
     }
 
     return Array.from(changesMap.values())
-      .map(({ timestamp, ...change }) => change)
-      .sort((a, b) => a.filePath.localeCompare(b.filePath));
+      .sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0) || a.filePath.localeCompare(b.filePath))
+      .map(({ timestamp, ...change }) => change);
   }
 
   /** 获取指定 Todo 的实际变更文件 */

@@ -118,17 +118,20 @@
   <!-- 顶部 Tab 栏：对话/任务/变更/知识 -->
   <TopTabs activeTopTab={currentTopTab} onTabChange={handleTabChange} />
 
-  <!-- Tab 内容区域 -->
+  <!-- Tab 内容区域：所有面板同时存在，CSS 控制显隐，避免切换 Tab 时组件销毁导致状态丢失 -->
   <div class="tab-content-wrapper">
-    {#if currentTopTab === 'thread'}
+    <div class="top-tab-pane" class:active={currentTopTab === 'thread'}>
       <ThreadPanel />
-    {:else if currentTopTab === 'tasks'}
+    </div>
+    <div class="top-tab-pane" class:active={currentTopTab === 'tasks'}>
       <TasksPanel />
-    {:else if currentTopTab === 'edits'}
+    </div>
+    <div class="top-tab-pane" class:active={currentTopTab === 'edits'}>
       <EditsPanel />
-    {:else if currentTopTab === 'knowledge'}
+    </div>
+    <div class="top-tab-pane" class:active={currentTopTab === 'knowledge'}>
       <KnowledgePanel />
-    {/if}
+    </div>
   </div>
 
   <!-- 设置面板（覆盖层） -->
@@ -279,6 +282,18 @@
     flex: 1;
     min-height: 0; /* flex 布局防溢出：防止子元素撑破容器产生页面级滚动条 */
     overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* 顶部 Tab 面板：默认隐藏，激活时显示（与 ThreadPanel 底部 Tab 同一模式） */
+  .top-tab-pane {
+    display: none;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .top-tab-pane.active {
     display: flex;
     flex-direction: column;
   }

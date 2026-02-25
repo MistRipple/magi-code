@@ -108,6 +108,14 @@
     return map[status] || { class: 'success' };
   });
 
+  // 文件变更工具：diff 面板由 FileChangeCard 展示，ToolCall 仅渲染紧凑 header
+  const isFileMutationTool = $derived(
+    name === 'file_edit' || name === 'file_create' || name === 'file_insert' || name === 'file_remove'
+  );
+
+  // 文件查看工具：只读操作，只需紧凑 header
+  const isFileViewTool = $derived(name === 'file_view');
+
   // 检查是否有内容
   const hasInput = $derived(!!input && !!formatContent(input));
   const hasOutput = $derived(!!output && !!formatContent(output));
@@ -246,95 +254,111 @@
   }
 </script>
 
-{#if hasContent}
-  <div
-    class="tool-call"
-    class:collapsed
-    class:has-error={hasError}
-    data-status={statusInfo.class}
-  >
-    <button class="tool-header" onclick={toggle}>
-      <span class="chevron">
-        <Icon name="chevron-right" size={12} />
-      </span>
+{#snippet headerContent()}
+  <span class="tool-icon">
+    <Icon name={toolIcon} size={14} />
+  </span>
 
-      <span class="tool-icon">
-        <Icon name={toolIcon} size={14} />
-      </span>
-
-      <span class="tool-title">
-        <span class="tool-name">{toolDisplayName}</span>
-        {#if filepath}
-          <FileSpan {filepath} showIcon={false} clickable={!!onOpenFile} onClick={handleOpenFile} />
-        {:else if toolSummary}
-          <span class="tool-summary" title={toolSummary}>{toolSummary}</span>
-        {/if}
-      </span>
-
-      <span class="tool-status status-{statusInfo.class}">
-        {#if status === 'running'}
-          <span class="status-dot pulsing"></span>
-        {:else}
-          <span class="status-dot"></span>
-        {/if}
-      </span>
-    </button>
-
-    {#if !collapsed}
-      <div class="tool-content">
-        {#if hasInput && !isMermaidTool}
-          <div class="tool-section">
-            <div class="section-header">
-              <span class="section-label">输入</span>
-            </div>
-            <pre class="section-content">{formatContent(input)}</pre>
-          </div>
-        {/if}
-
-        {#if hasOutput}
-          <div class="tool-section">
-            {#if isMermaidTool && mermaidData}
-              <MermaidRenderer
-                code={mermaidData?.code || ''}
-                title={mermaidData?.title}
-                diagramType={mermaidData?.diagramType}
-              />
-            {:else}
-              <div class="section-header">
-                <span class="section-label">输出</span>
-                <button class="copy-btn" onclick={copyOutput} title={copySuccess ? '已复制' : '复制输出'}>
-                  <Icon name={copySuccess ? 'check' : 'copy'} size={12} />
-                </button>
-              </div>
-              {#if isMarkdownOutput}
-                <div class="markdown-output">
-                  <MarkdownContent content={outputText} />
-                </div>
-              {:else}
-                <pre class="section-content">{formatContent(output)}</pre>
-              {/if}
-            {/if}
-          </div>
-        {/if}
-
-        {#if hasError}
-          <div class="tool-section error">
-            <div class="section-header">
-              <span class="section-label">错误</span>
-            </div>
-            <pre class="section-content error-content">{error}</pre>
-          </div>
-        {/if}
-
-        {#if duration}
-          <div class="tool-meta">
-            <Icon name="clock" size={12} />
-            耗时: <strong>{(duration / 1000).toFixed(2)}s</strong>
-          </div>
-        {/if}
-      </div>
+  <span class="tool-title">
+    <span class="tool-name">{toolDisplayName}</span>
+    {#if filepath}
+      <FileSpan {filepath} showIcon={false} clickable={!!onOpenFile} onClick={handleOpenFile} />
+    {:else if toolSummary}
+      <span class="tool-summary" title={toolSummary}>{toolSummary}</span>
     {/if}
-  </div>
+  </span>
+
+  <span class="tool-status status-{statusInfo.class}">
+    {#if status === 'running' || status === 'pending'}
+      <span class="status-dot pulsing"></span>
+    {:else}
+      <span class="status-dot"></span>
+    {/if}
+  </span>
+{/snippet}
+
+{#if isFileMutationTool && status === 'success'}
+  <!-- 文件变更工具完成：由 FileChangeCard 全权展示 -->
+{:else}
+  {@const isCompactMutation = isFileMutationTool && (status === 'running' || status === 'pending')}
+  {@const isExpandable = hasContent && !isFileViewTool && !isCompactMutation}
+  {#if isExpandable || isFileViewTool || isCompactMutation}
+    <div
+      class="tool-call"
+      class:collapsed={isExpandable && collapsed}
+      class:has-error={isExpandable && hasError}
+      class:file-mutation={isCompactMutation}
+      data-status={statusInfo.class}
+    >
+      {#if isExpandable}
+        <button class="tool-header" onclick={toggle}>
+          <span class="chevron">
+            <Icon name="chevron-right" size={12} />
+          </span>
+          {@render headerContent()}
+        </button>
+      {:else}
+        <div class="tool-header" class:file-mutation-header={isCompactMutation}>
+          {@render headerContent()}
+        </div>
+      {/if}
+
+      {#if isExpandable && !collapsed}
+        <div class="tool-content">
+          {#if hasInput && !isMermaidTool}
+            <div class="tool-section">
+              <div class="section-header">
+                <span class="section-label">输入</span>
+              </div>
+              <pre class="section-content">{formatContent(input)}</pre>
+            </div>
+          {/if}
+
+          {#if hasOutput}
+            <div class="tool-section">
+              {#if isMermaidTool && mermaidData}
+                <MermaidRenderer
+                  code={mermaidData?.code || ''}
+                  title={mermaidData?.title}
+                  diagramType={mermaidData?.diagramType}
+                />
+              {:else}
+                <div class="section-header">
+                  <span class="section-label">输出</span>
+                  <button class="copy-btn" onclick={copyOutput} title={copySuccess ? '已复制' : '复制输出'}>
+                    <Icon name={copySuccess ? 'check' : 'copy'} size={12} />
+                  </button>
+                </div>
+                {#if isMarkdownOutput}
+                  <div class="markdown-output">
+                    <MarkdownContent content={outputText} />
+                  </div>
+                {:else}
+                  <pre class="section-content">{formatContent(output)}</pre>
+                {/if}
+              {/if}
+            </div>
+          {/if}
+
+          {#if hasError}
+            <div class="tool-section error">
+              <div class="section-header">
+                <span class="section-label">错误</span>
+              </div>
+              <pre class="section-content error-content">{error}</pre>
+            </div>
+          {/if}
+
+          {#if duration}
+            <div class="tool-meta">
+              <Icon name="clock" size={12} />
+              耗时: <strong>{(duration / 1000).toFixed(2)}s</strong>
+            </div>
+          {/if}
+        </div>
+      {/if}
+    </div>
+  {/if}
 {/if}
 
 <style>
@@ -348,6 +372,24 @@
 
   .tool-call.has-error {
     border-color: var(--error);
+  }
+
+  /* 文件变更工具：紧凑 header-only 卡片，不可展开 */
+  .tool-call.file-mutation {
+    border: none;
+    background: transparent;
+    margin: var(--space-1, 4px) 0;
+  }
+
+  .file-mutation-header {
+    cursor: default;
+    padding: var(--space-1, 4px) 0;
+    opacity: 0.75;
+  }
+
+  .file-mutation-header:hover {
+    background: transparent;
+    opacity: 1;
   }
 
   .tool-header {

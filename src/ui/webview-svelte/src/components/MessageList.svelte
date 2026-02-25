@@ -18,8 +18,10 @@
     readOnly?: boolean;
     /** 显示上下文：thread=主对话区, worker=Worker面板 */
     displayContext?: 'thread' | 'worker';
+    /** 当前面板是否处于可见激活状态（用于 display:none -> visible 场景下的滚动恢复） */
+    isActive?: boolean;
   }
-  let { messages, emptyState, readOnly = false, displayContext = 'thread' }: Props = $props();
+  let { messages, emptyState, readOnly = false, displayContext = 'thread', isActive = true }: Props = $props();
 
   // 🛡️ 防御性编程：过滤无效的消息
   const safeMessages = $derived(
@@ -81,24 +83,31 @@
     return streamingMsgs.map(m => `${m.id}:${(m.content || '').length}:${(m.blocks || []).length}`).join('|');
   });
 
+  // Worker 面板是否已参与当前请求：
+  // 只要当前请求中该 Worker 产生过消息，就保持处理指示与计时连续，直到请求结束。
+  const workerHasCurrentRequestActivity = $derived.by(() => {
+    if (displayContext !== 'worker') return false;
+    const requestStartAt = messagesState.thinkingStartAt;
+    if (!messagesState.isProcessing || !requestStartAt || requestStartAt <= 0) return false;
+    return safeMessages.some((m) => m.isStreaming || m.timestamp >= requestStartAt);
+  });
+
   // 对话级处理指示器
   // - thread: 全局 isProcessing 驱动，表示「对话仍在进行」
-  // - worker: 只看当前 tab 内消息的流式状态，Worker 完成后立即消失
+  // - worker: 当前请求级别（同一次请求内跨多轮不重置）
   const showProcessingIndicator = $derived(
     displayContext === 'worker'
-      ? safeMessages.some(m => m.isStreaming)
+      ? workerHasCurrentRequestActivity
       : messagesState.isProcessing && safeMessages.length > 0
   );
 
-  // 本轮计时起点：
+  // 计时起点：
   // - thread: 从最后一条用户消息的时间戳开始
-  // - worker: 从本轮第一条消息的时间戳开始（Worker 对话开始的时间）
+  // - worker: 从当前请求启动时间开始（同一次请求内跨多轮保持连续）
   const timerStartTime = $derived.by(() => {
     if (displayContext === 'worker') {
-      // Worker 面板：使用第一条消息的时间戳作为计时起点
-      // 不依赖 isStreaming 状态，避免新消息到来时计时器被重置
-      if (safeMessages.length > 0) {
-        return safeMessages[0].timestamp;
+      if (workerHasCurrentRequestActivity && messagesState.thinkingStartAt) {
+        return messagesState.thinkingStartAt;
       }
       return 0;
     }
@@ -172,6 +181,17 @@
         }
       });
     }
+  });
+
+  // 面板从隐藏切到可见时，补一次定位到底部（首次切换 Worker 面板场景）
+  $effect(() => {
+    const active = isActive;
+    if (!active || !containerRef || !shouldAutoScroll) return;
+    tick().then(() => {
+      if (containerRef && isActive && shouldAutoScroll) {
+        containerRef.scrollTop = containerRef.scrollHeight;
+      }
+    });
   });
 
   // 检测用户是否手动滚动

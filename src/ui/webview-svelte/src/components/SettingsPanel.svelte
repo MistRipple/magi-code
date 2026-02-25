@@ -180,13 +180,16 @@
   // API Key 明文可见状态
   let keyVisible = $state<Record<string, boolean>>({ orch: false, comp: false, ace: false, worker: false });
 
-  // Tools Tab 状态 - MCP 服务器完整结构
+  // Tools Tab 状态 - MCP 服务器完整结构（与后端 MCPServerConfig 对齐）
   interface MCPServer {
     id: string;
     name: string;
+    type: 'stdio' | 'sse' | 'streamable-http';
     command?: string;
     args?: string[];
     env?: Record<string, string>;
+    url?: string;
+    headers?: Record<string, string>;
     enabled: boolean;
     connected?: boolean;
     error?: string;
@@ -554,18 +557,32 @@
   function openMCPDialog(server: MCPServer | null = null) {
     currentEditingMCPServer = server;
     mcpDialogIsEdit = server !== null;
-    const defaultJSON = `{
+
+    let defaultJSON: string;
+    if (server) {
+      // 编辑模式：从实际数据序列化，去掉内部状态字段
+      const cfg: Record<string, any> = {};
+      if (server.command) cfg.command = server.command;
+      if (server.args && server.args.length > 0) cfg.args = server.args;
+      if (server.env && Object.keys(server.env).length > 0) cfg.env = server.env;
+      if (server.url) cfg.url = server.url;
+      if (server.headers && Object.keys(server.headers).length > 0) cfg.headers = server.headers;
+      defaultJSON = JSON.stringify({ mcpServers: { [server.name]: cfg } }, null, 2);
+    } else {
+      // 新增模式：默认 stdio 示例模板
+      defaultJSON = `{
   "mcpServers": {
-    "${server?.name || "mcp-server"}": {
-      "command": "${server?.command || "npx"}",
-      "args": ${server?.args ? JSON.stringify(server.args, null, 2) : `[
+    "mcp-server": {
+      "command": "npx",
+      "args": [
         "@modelcontextprotocol/server-filesystem",
         "/path/to/allowed/files"
-      ]`},
-      "env": ${server?.env ? JSON.stringify(server.env, null, 2) : `{}`}
+      ],
+      "env": {}
     }
   }
 }`;
+    }
     mcpDialogJson = defaultJSON;
     showMCPDialogState = true;
   }
@@ -1153,9 +1170,12 @@
           return {
             id,
             name,
+            type: s.type || 'stdio',
             command: s.command || '',
             args: s.args || [],
             env: s.env || {},
+            url: s.url || '',
+            headers: s.headers || {},
             enabled: s.enabled !== false,
             connected: s.connected || false,
             error: s.error
@@ -2003,7 +2023,7 @@
                   <div class="mcp-server-header" onclick={() => toggleMCPExpand(server.id)}>
                     <div class="mcp-server-info">
                       <div class="mcp-server-name">{server.name}</div>
-                      <div class="mcp-server-command">{server.command || ''}</div>
+                      <div class="mcp-server-command">{server.type === 'stdio' ? (server.command || '') : (server.url || '')}</div>
                     </div>
                     <div class="mcp-server-actions">
                       <span class="mcp-server-badge" class:enabled={server.enabled} class:disabled={!server.enabled}>

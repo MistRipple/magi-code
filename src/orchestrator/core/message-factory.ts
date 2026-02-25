@@ -101,7 +101,7 @@ export class MessageFactory {
     const statusContentMap: Record<SubTaskCardPayload['status'], string> = {
       completed: subTask.summary ? `${w} 已完成：${subTask.summary}` : `${w} 完成了任务`,
       failed: `${w} 执行遇到问题：${subTask.summary || '执行失败'}`,
-      pending: `${w} 等待确认：${subTask.title}`,
+      pending: `${w} 排队中（等待前置任务）：${subTask.title}`,
       stopped: `${w} 已停止：${subTask.title}`,
       skipped: `${w} 已跳过：${subTask.title}`,
       running: `${w} 正在处理：${subTask.title}`,

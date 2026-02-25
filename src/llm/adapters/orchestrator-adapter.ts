@@ -259,7 +259,9 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   async interrupt(): Promise<void> {
     if (this.abortController) {
       this.abortController.abort();
-      this.abortController = undefined;
+      // 不清除 abortController 引用 — 循环内的 abort 状态检查（L436/L518）
+      // 依赖 abortController.signal.aborted 判断中断状态。
+      // 下次 sendMessage 调用时会创建新的 AbortController 覆盖。
     }
     this.setState(AdapterState.CONNECTED);
     logger.info('Orchestrator adapter interrupted', undefined, LogCategory.LLM);
@@ -417,15 +419,34 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     // 当轮 stream 内包含 thinking + text + tool_call + tool_result，
     // endStream 后工具副作用产生的新消息（如 subTaskCard）自然排在后面，
     // 下一轮 stream 再开启新卡片，时间顺序天然正确。
-    // 无轮次上限 — 编排者可执行任意多轮工具调用，
-    // 异常终止完全依赖连续失败检测机制：连续 5 次失败 → 提示换方式，累计 25 轮失败 → 终止
+    // 异常终止依赖三层止损机制：
+    // 1. 连续失败检测：连续 5 次失败 → 提示换方式，累计 25 轮失败 → 终止
+    // 2. 总轮次安全网：80 轮硬上限 → 强制总结 → 终止
+    // 3. 空转检测：连续同工具重复 / 连续无编排动作 → 渐进式引导 → 强制总结
     const CONSECUTIVE_FAIL_THRESHOLD = 5;
     const TOTAL_FAIL_LIMIT = 25;
+    const MAX_TOTAL_ROUNDS = 80;
+    const FINAL_WARN_ROUND = MAX_TOTAL_ROUNDS - 10;
+    // 连续同工具重复检测阈值
+    // L1 场景下 Orchestrator 连续调用 file_view 读取不同文件是正常的分析行为，
+    // 阈值需高于 Worker adapter（Worker 有 visitedPaths 等精细去重，Orchestrator 靠轮次粗检测）
+    const SAME_TOOL_WARN = 6;
+    const SAME_TOOL_FORCE = 10;
+    // 编排者空转检测：连续多轮只用只读工具不做编排动作（dispatch_task / 写入操作）
+    const STALL_WARN = 10;
+    const STALL_FORCE = 15;
 
     try {
       let finalText = '';
       let consecutiveFailures = 0;
       let totalFailures = 0;
+      // 总轮次强制总结模式
+      let forceNoToolsNextRound = false;
+      // 连续同工具重复检测状态
+      let lastPrimaryToolName = '';
+      let consecutiveSameToolRounds = 0;
+      // 编排者空转检测状态：连续多轮无编排动作
+      let consecutiveStallRounds = 0;
 
       // 创建 AbortController，供 interrupt() 中断 LLM 请求
       this.abortController = new AbortController();
@@ -435,6 +456,29 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         // 中断检查：每轮迭代入口检测 abort 信号
         if (this.abortController.signal.aborted) {
           break;
+        }
+
+        // 总轮次安全网：防止任何场景下的无限循环
+        // round == MAX_TOTAL_ROUNDS → 注入提示 + 撤掉工具，给 LLM 一轮纯文本总结机会
+        // round >  MAX_TOTAL_ROUNDS → LLM 仍调用工具或未收敛，强制终止
+        if (round > MAX_TOTAL_ROUNDS) {
+          logger.warn('Orchestrator 超过总轮次上限，强制终止', { round }, LogCategory.LLM);
+          finalText = finalText || `已执行 ${round} 轮工具调用，达到安全上限，编排终止。`;
+          break;
+        }
+        if (round === MAX_TOTAL_ROUNDS) {
+          forceNoToolsNextRound = true;
+          logger.warn('Orchestrator 达到总轮次上限，触发强制总结', { round }, LogCategory.LLM);
+          history.push({
+            role: 'user',
+            content: `[System] 你已执行 ${round} 轮工具调用，达到系统上限。工具调用能力已被收回。请立即总结当前编排进展和执行结果。`,
+          });
+        }
+        if (round === FINAL_WARN_ROUND) {
+          history.push({
+            role: 'user',
+            content: `[System] 你已执行 ${round} 轮工具调用，即将达到上限（${MAX_TOTAL_ROUNDS} 轮）。请尽快完成剩余编排工作并输出最终结论。`,
+          });
         }
 
         // 只有首轮使用 startStreamWithContext 绑定 placeholder messageId，
@@ -448,7 +492,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         const params: LLMMessageParams = {
           messages: history,
           systemPrompt,
-          tools: toolDefinitions.length > 0 ? toolDefinitions : undefined,
+          tools: forceNoToolsNextRound ? undefined : (toolDefinitions.length > 0 ? toolDefinitions : undefined),
           stream: true,
           maxTokens: 8192,
           temperature: 0.3,
@@ -525,7 +569,8 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               streamId,
               result.toolCallId,
               result.isError ? undefined : result.content,
-              result.isError ? result.content : undefined
+              result.isError ? result.content : undefined,
+              result.fileChange,
             );
           }
 
@@ -560,6 +605,63 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             }
           } else {
             consecutiveFailures = 0;
+          }
+
+          // 空转检测（仅在工具调用未全部失败时检测）
+          if (!allFailed) {
+            // 编排动作 = 委派任务 / 写入文件（编排者的核心职责）
+            const ORCHESTRATION_ACTIONS = ['dispatch_task', 'send_worker_message', 'wait_for_workers', 'file_edit', 'file_create', 'file_insert', 'file_remove'];
+            const hasAction = toolCalls.some(tc => ORCHESTRATION_ACTIONS.includes(tc.name));
+
+            if (hasAction) {
+              // 有编排动作 → 重置空转状态
+              consecutiveStallRounds = 0;
+              lastPrimaryToolName = '';
+              consecutiveSameToolRounds = 0;
+            } else {
+              consecutiveStallRounds++;
+
+              // 连续同工具重复检测
+              const primaryTool = toolCalls[0]?.name || '';
+              if (primaryTool === lastPrimaryToolName) {
+                consecutiveSameToolRounds++;
+              } else {
+                lastPrimaryToolName = primaryTool;
+                consecutiveSameToolRounds = 1;
+              }
+
+              // 连续同工具重复提示
+              if (consecutiveSameToolRounds >= SAME_TOOL_FORCE) {
+                logger.warn('Orchestrator 同工具重复调用达到强制阈值', { tool: primaryTool, rounds: consecutiveSameToolRounds }, LogCategory.LLM);
+                forceNoToolsNextRound = true;
+                history.push({
+                  role: 'user',
+                  content: `[System] 你已连续 ${consecutiveSameToolRounds} 轮调用 ${primaryTool} 工具，这是无效的重复行为。工具调用能力已被收回，请立即总结当前进展。`,
+                });
+              } else if (consecutiveSameToolRounds >= SAME_TOOL_WARN) {
+                logger.warn('Orchestrator 同工具重复调用', { tool: primaryTool, rounds: consecutiveSameToolRounds }, LogCategory.LLM);
+                history.push({
+                  role: 'user',
+                  content: `[System] 你已连续 ${consecutiveSameToolRounds} 轮调用 ${primaryTool} 工具。如果已获取到所需信息，请通过 dispatch_task 委派任务给 Worker 执行，或直接输出结论。不要反复调用同一工具。`,
+                });
+              }
+
+              // 编排者空转检测（连续无编排动作）
+              if (consecutiveStallRounds >= STALL_FORCE && !forceNoToolsNextRound) {
+                logger.warn('Orchestrator 空转达到强制阈值', { rounds: consecutiveStallRounds }, LogCategory.LLM);
+                forceNoToolsNextRound = true;
+                history.push({
+                  role: 'user',
+                  content: `[System] 你已连续 ${consecutiveStallRounds} 轮仅使用查看/搜索类工具，未执行任何编排动作（dispatch_task）。工具调用能力已被收回，请立即总结当前进展并输出结论。`,
+                });
+              } else if (consecutiveStallRounds === STALL_WARN) {
+                logger.warn('Orchestrator 空转警告', { rounds: consecutiveStallRounds }, LogCategory.LLM);
+                history.push({
+                  role: 'user',
+                  content: `[System] 你已连续 ${consecutiveStallRounds} 轮仅使用查看/搜索类工具，未执行编排动作。请通过 dispatch_task 委派任务给 Worker 执行，或直接输出最终结论。不要继续查看文件。`,
+                });
+              }
+            }
           }
 
           // 当轮 stream 结束，工具副作用（subTaskCard 等）已自然排在后面
@@ -607,6 +709,21 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         continue;
       }
 
+      // 参数解析失败：不执行工具，直接回传给模型修正参数
+      if (toolCall.argumentParseError) {
+        const raw = typeof toolCall.rawArguments === 'string'
+          ? toolCall.rawArguments.substring(0, 500)
+          : '';
+        const errorContent = `工具参数解析失败（${toolCall.name}）：${toolCall.argumentParseError}${raw ? `\n原始参数: ${raw}` : ''}`;
+        results.push({
+          toolCallId: toolCall.id,
+          content: errorContent,
+          isError: true,
+        });
+        this.emit('toolResult', toolCall.name, errorContent);
+        continue;
+      }
+
       // 编排者角色约束：禁止文件写入操作
       const blocked = this.checkOrchestratorToolRestriction(toolCall);
       if (blocked) {
@@ -619,7 +736,12 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       }
 
       try {
-        const result = await this.toolManager.execute(toolCall, this.abortController?.signal);        if (typeof result.content === 'string' && result.content.length > maxToolResultChars) {
+        const result = await this.toolManager.execute(
+          toolCall,
+          this.abortController?.signal,
+          { workerId: 'orchestrator', role: 'orchestrator' },
+        );
+        if (typeof result.content === 'string' && result.content.length > maxToolResultChars) {
           const truncated = result.content.slice(0, maxToolResultChars);
           result.content = `${truncated}\n...[truncated ${result.content.length - maxToolResultChars} chars]`;
         }
