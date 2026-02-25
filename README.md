@@ -1,4 +1,4 @@
-<div align="center">
+![1771992564561](image/README/1771992564561.png)![1771992566130](image/README/1771992566130.png)<div align="center">
 
 # 🔮 Magi
 
@@ -7,7 +7,7 @@
 *意图洞察 · 深度拆解 · 异构协作*
 
 [![VSCode Extension](https://img.shields.io/badge/VSCode-Extension-007ACC?style=flat-square&logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
-[![Version](https://img.shields.io/badge/version-0.1.1-blue?style=flat-square)]()
+[![Version](https://img.shields.io/badge/version-0.1.2-blue?style=flat-square)]()
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later-red?style=flat-square)](LICENSE)
 
 <br/>
@@ -160,19 +160,31 @@ Magi 基于现代化的技术栈构建，确保高性能与可扩展性：
 
 Magi 的诞生离不开早期支持者的帮助。
 
-<p align="left">
-  <a href="https://github.com/Poonwai">
-    <img src="https://images.weserv.nl/?url=https://github.com/Poonwai.png&mask=circle&w=80" alt="Poonwai">
-  </a>
-  &nbsp;&nbsp;
-  <a href="https://github.com/agassiz">
-    <img src="https://images.weserv.nl/?url=https://github.com/agassiz.png&mask=circle&w=80" alt="agassiz">
-  </a>
-  &nbsp;&nbsp;
-  <a href="https://github.com/StoneFancyX">
-    <img src="https://images.weserv.nl/?url=https://github.com/StoneFancyX.png&mask=circle&w=80" alt="StoneFancyX">
-  </a>
-</p>
+<table align="left">
+  <tr>
+    <td align="center">
+      <a href="https://github.com/Poonwai">
+        <img src="https://images.weserv.nl/?url=https://github.com/Poonwai.png&mask=circle&w=80" width="80" alt="Poonwai"><br>
+        <sub><b>Poonwai</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/agassiz">
+        <img src="https://images.weserv.nl/?url=https://github.com/agassiz.png&mask=circle&w=80" width="80" alt="agassiz"><br>
+        <sub><b>agassiz</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/StoneFancyX">
+        <img src="https://images.weserv.nl/?url=https://github.com/StoneFancyX.png&mask=circle&w=80" width="80" alt="StoneFancyX"><br>
+        <sub><b>StoneFancyX</b></sub>
+      </a>
+    </td>
+  </tr>
+</table>
+
+<br clear="left"/>
+<br/>
 
 *   **Token支持**: [BinCode 中转站](https://newapi.stonefancyx.com/)
 
