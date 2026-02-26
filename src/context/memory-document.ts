@@ -17,6 +17,7 @@ import {
   UserMessage,
   createEmptyMemoryContent
 } from './types';
+import { estimateTokenCount } from '../utils/token-estimator';
 
 export class MemoryDocument {
   private filePath: string;
@@ -56,8 +57,12 @@ export class MemoryDocument {
    * 保存 Memory 文档
    */
   async save(): Promise<void> {
+    const dir = path.dirname(this.filePath);
+    const tmpPath = path.join(
+      dir,
+      `.memory-${this.sessionId}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`
+    );
     try {
-      const dir = path.dirname(this.filePath);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
@@ -65,11 +70,21 @@ export class MemoryDocument {
       this.content = this.normalizeContent(this.content);
       this.content.lastUpdated = new Date().toISOString();
       this.content.tokenEstimate = this.estimateTokens();
-      
-      fs.writeFileSync(this.filePath, JSON.stringify(this.content, null, 2));
+
+      const payload = JSON.stringify(this.content, null, 2);
+      fs.writeFileSync(tmpPath, payload, 'utf-8');
+      fs.renameSync(tmpPath, this.filePath);
+
       this.dirty = false;
       logger.info('上下文记忆.保存.完成', { sessionId: this.sessionId }, LogCategory.SESSION);
     } catch (error) {
+      if (fs.existsSync(tmpPath)) {
+        try {
+          fs.unlinkSync(tmpPath);
+        } catch {
+          // 临时文件清理失败不影响主流程
+        }
+      }
       logger.error('上下文记忆.保存.失败', error, LogCategory.SESSION);
       throw error;
     }
@@ -543,7 +558,7 @@ export class MemoryDocument {
    */
   estimateTokens(): number {
     const jsonStr = JSON.stringify(this.content);
-    return Math.ceil(jsonStr.length / 4);
+    return estimateTokenCount(jsonStr);
   }
 
   /**

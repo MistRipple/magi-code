@@ -24,6 +24,9 @@ export interface ExecutionRecord {
   /** Token 使用统计 */
   inputTokens?: number;
   outputTokens?: number;
+  /** 估算 token 使用（仅在真实 usage 缺失时记录） */
+  estimatedInputTokens?: number;
+  estimatedOutputTokens?: number;
   /** 执行阶段 */
   phase?: ExecutionPhase;
 }
@@ -49,6 +52,10 @@ export interface WorkerStats {
   totalInputTokens: number;
   /** 总输出 token */
   totalOutputTokens: number;
+  /** 总估算输入 token */
+  totalEstimatedInputTokens: number;
+  /** 总估算输出 token */
+  totalEstimatedOutputTokens: number;
 }
 
 
@@ -152,6 +159,8 @@ export class ExecutionStats {
 
     const totalInputTokens = workerRecords.reduce((sum, r) => sum + (r.inputTokens || 0), 0);
     const totalOutputTokens = workerRecords.reduce((sum, r) => sum + (r.outputTokens || 0), 0);
+    const totalEstimatedInputTokens = workerRecords.reduce((sum, r) => sum + (r.estimatedInputTokens || 0), 0);
+    const totalEstimatedOutputTokens = workerRecords.reduce((sum, r) => sum + (r.estimatedOutputTokens || 0), 0);
 
     const recentFailureRate = recentRecords.length > 0 ? recentFailures / recentRecords.length : 0;
     const healthScore = Math.max(0, Math.min(1, successRate - recentFailureRate * 0.5));
@@ -175,6 +184,8 @@ export class ExecutionStats {
       lastExecutionTime: lastRecord?.timestamp,
       totalInputTokens,
       totalOutputTokens,
+      totalEstimatedInputTokens,
+      totalEstimatedOutputTokens,
     };
   }
 
@@ -214,10 +225,17 @@ export class ExecutionStats {
   }
 
   /** 获取总 Token 统计 */
-  getTotalTokens(): { inputTokens: number; outputTokens: number } {
+  getTotalTokens(): {
+    inputTokens: number;
+    outputTokens: number;
+    estimatedInputTokens: number;
+    estimatedOutputTokens: number;
+  } {
     return {
       inputTokens: this.records.reduce((sum, r) => sum + (r.inputTokens || 0), 0),
       outputTokens: this.records.reduce((sum, r) => sum + (r.outputTokens || 0), 0),
+      estimatedInputTokens: this.records.reduce((sum, r) => sum + (r.estimatedInputTokens || 0), 0),
+      estimatedOutputTokens: this.records.reduce((sum, r) => sum + (r.estimatedOutputTokens || 0), 0),
     };
   }
 

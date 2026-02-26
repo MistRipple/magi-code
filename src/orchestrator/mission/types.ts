@@ -497,8 +497,9 @@ export { CreateTodoParams } from '../../todo/types';
  */
 export interface MissionEvents {
   missionCreated: { mission: Mission };
-  missionStatusChanged: { missionId: string; oldStatus: MissionStatus; newStatus: MissionStatus };
-  missionPhaseChanged: { missionId: string; oldPhase: MissionPhase; newPhase: MissionPhase };
+  missionDeleted: { missionId: string };
+  missionStatusChanged: { mission: Mission; missionId: string; oldStatus: MissionStatus; newStatus: MissionStatus };
+  missionPhaseChanged: { mission: Mission; missionId: string; oldPhase: MissionPhase; newPhase: MissionPhase };
   collaborationPlanned: { mission: Mission };
   workersPlanned: { mission: Mission };
   missionCompleted: { mission: Mission };

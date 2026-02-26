@@ -7,7 +7,6 @@
  * - Worker 调度与进度管理
  * - 验证与总结
  */
-
 import { EventEmitter } from 'events';
 import path from 'path';
 import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
@@ -31,14 +30,22 @@ import {
 } from '../mission';
 import { ExecutionStats } from '../execution-stats';
 import { MessageHub } from './message-hub';
-import { WisdomManager, type WisdomStorage } from '../wisdom';
+import { WisdomManager } from '../wisdom';
 import { buildIntentClassificationPrompt } from '../prompts/intent-classification';
 import { buildUnifiedSystemPrompt } from '../prompts/orchestrator-prompts';
 import { isAbortError } from '../../errors';
 import { SupplementaryInstructionQueue } from './supplementary-instruction-queue';
 import { DispatchManager } from './dispatch-manager';
+import { runPostDispatchVerification } from './post-dispatch-verifier';
 import { configureResilientCompressor } from './resilient-compressor-adapter';
 import { TaskViewService } from '../../services/task-view-service';
+import {
+  createWisdomStorage,
+  extractPrimaryIntent,
+  extractUserConstraints,
+  isKeyInstruction,
+  resolveOrchestratorContextPolicy,
+} from './mission-driven-engine-helpers';
 
 /**
  * 引擎配置
@@ -116,7 +123,12 @@ export class MissionDrivenEngine extends EventEmitter {
   } | null = null;
 
   // Token 统计
-  private orchestratorTokens = { inputTokens: 0, outputTokens: 0 };
+  private orchestratorTokens = {
+    inputTokens: 0,
+    outputTokens: 0,
+    estimatedInputTokens: 0,
+    estimatedOutputTokens: 0,
+  };
 
   private lastExecutionErrors: string[] = [];
   private lastExecutionSuccess = true;
@@ -207,7 +219,7 @@ export class MissionDrivenEngine extends EventEmitter {
       getActiveUserPrompt: () => this.activeUserPrompt,
       getActiveImagePaths: () => this.activeImagePaths,
       getCurrentSessionId: () => this.currentSessionId,
-      getLastMissionId: () => this.lastMissionId || undefined,
+      ensureMissionForDispatch: async () => this.ensureMissionForDispatch(),
       getProjectKnowledgeBase: () => this.projectKnowledgeBase,
       recordOrchestratorTokens: (usage, phase) => this.recordOrchestratorTokens(usage, phase),
       recordWorkerTokenUsage: (results) => this.recordWorkerTokenUsage(results),
@@ -222,27 +234,9 @@ export class MissionDrivenEngine extends EventEmitter {
    * 配置 Wisdom 存储
    */
   private configureWisdomStorage(): void {
-    const storage: WisdomStorage = {
-      storeLearning: (learning: string, sourceAssignmentId: string) => {
-        this.contextManager?.addImportantContext(`[Learning:${sourceAssignmentId}] ${learning}`);
-      },
-      storeDecision: (decision: string, sourceAssignmentId: string) => {
-        const decisionId = `decision-${sourceAssignmentId}-${Date.now().toString(36)}`;
-        this.contextManager?.addDecision(decisionId, decision, `来源 Assignment ${sourceAssignmentId}`);
-      },
-      storeWarning: (warning: string, sourceAssignmentId: string) => {
-        this.contextManager?.addPendingIssue(`[${sourceAssignmentId}] ${warning}`);
-      },
-      storeSignificantLearning: (learning: string, context: string) => {
-        if (this.projectKnowledgeBase && typeof (this.projectKnowledgeBase as any).addLearning === 'function') {
-          (this.projectKnowledgeBase as any).addLearning(learning, context);
-          return;
-        }
-        this.contextManager?.addImportantContext(`[Knowledge] ${learning} (${context})`);
-      },
-    };
-
-    this.wisdomManager.setStorage(storage);
+    this.wisdomManager.setStorage(
+      createWisdomStorage(this.contextManager, () => this.projectKnowledgeBase),
+    );
   }
 
   /**
@@ -342,6 +336,14 @@ export class MissionDrivenEngine extends EventEmitter {
     return this.supplementaryQueue.getPendingCount();
   }
 
+  activateWorkerSessionResume(sourceMissionId: string, resumePrompt?: string): boolean {
+    return this.dispatchManager.activateResumeContext(sourceMissionId, resumePrompt);
+  }
+
+  clearWorkerSessionResume(): void {
+    this.dispatchManager.clearResumeContext();
+  }
+
   /**
    * 初始化引擎
    */
@@ -352,7 +354,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
     // 初始化 IntentGate（使用适配器进行意图决策）
     const decider = async (prompt: string) => {
-      const sessionContext = await this.prepareDecisionContext();
+      const sessionContext = await this.prepareDecisionContext(prompt);
       const attempts = [
         buildIntentClassificationPrompt(prompt, sessionContext),
         `${buildIntentClassificationPrompt(prompt, sessionContext)}\n\n请严格只输出 JSON，不要包含多余文字。`
@@ -402,7 +404,7 @@ export class MissionDrivenEngine extends EventEmitter {
     this.intentGate = new IntentGate(decider);
 
     // 初始化 VerificationRunner
-    if (this.config.verification && this.config.strategy?.enableVerification) {
+    if (this.config.strategy?.enableVerification) {
       this.verificationRunner = new VerificationRunner(
         this.workspaceRoot,
         this.config.verification
@@ -480,20 +482,8 @@ export class MissionDrivenEngine extends EventEmitter {
       try {
         const resolvedSessionId = sessionId || this.sessionManager.getCurrentSession()?.id || taskId;
         this.currentSessionId = resolvedSessionId;
+        this.dispatchManager.resetForNewExecutionCycle();
         await this.ensureContextReady(resolvedSessionId);
-
-        // 创建 Mission 记录（统一 Todo 系统：编排模式也需要 Mission 作为 Todo 的宿主）
-        const mission = await this.missionStorage.createMission({
-          sessionId: resolvedSessionId,
-          userPrompt: trimmedPrompt,
-          context: '',
-        });
-        this.lastMissionId = mission.id;
-        mission.status = 'executing';
-        mission.startedAt = Date.now();
-        await this.missionStorage.update(mission);
-        // 同步到 MissionOrchestrator，确保 Worker 转发的 Todo 事件能关联到正确的 Mission
-        this.missionOrchestrator.setCurrentMissionId(mission.id);
 
         // 1. 组装上下文
         const context = await this.prepareContext(resolvedSessionId, trimmedPrompt);
@@ -511,15 +501,26 @@ export class MissionDrivenEngine extends EventEmitter {
 
         // 3. 构建统一系统提示词（Worker 列表从 ProfileLoader 动态获取，工具列表从 ToolManager 动态加载）
         const enabledProfiles = this.profileLoader.getEnabledProfiles();
-        const availableWorkers = Array.from(enabledProfiles.keys());
-        const workerProfiles = Array.from(enabledProfiles.values())
+        const availability = this.dispatchManager.getWorkerAvailability();
+        const availableWorkers = availability.availableWorkers;
+        const workerProfiles = availableWorkers
+          .map(worker => enabledProfiles.get(worker))
+          .filter((profile): profile is NonNullable<typeof profile> => Boolean(profile))
           .map(p => ({
-          worker: p.worker,
-          displayName: p.persona.displayName,
-          strengths: p.persona.strengths,
-          assignedCategories: p.assignedCategories,
-        }));
+            worker: p.worker,
+            displayName: p.persona.displayName,
+            strengths: p.persona.strengths,
+            assignedCategories: p.assignedCategories,
+          }));
         const availableToolsSummary = await this.getAvailableToolsSummary();
+
+        // 获取分类定义（用于系统提示词的分工映射表）
+        const allCategories = this.profileLoader.getAllCategories();
+        const categoryDefinitions = new Map<string, { displayName: string; description: string }>();
+        for (const [name, def] of allCategories) {
+          categoryDefinitions.set(name, { displayName: def.displayName, description: def.description });
+        }
+
         let systemPrompt = buildUnifiedSystemPrompt({
           availableWorkers,
           workerProfiles,
@@ -527,6 +528,7 @@ export class MissionDrivenEngine extends EventEmitter {
           sessionSummary: context || undefined,
           relevantADRs,
           availableToolsSummary,
+          categoryDefinitions,
         });
 
         // 追加用户规则（buildUnifiedSystemPrompt 不含用户规则，需显式注入）
@@ -535,15 +537,21 @@ export class MissionDrivenEngine extends EventEmitter {
           systemPrompt = `${systemPrompt}\n\n${userRulesPrompt}`;
         }
 
-        // 4. 设置编排者快照上下文（确保编排者直接工具调用也能记录快照）
+        // 4. 设置编排者快照上下文
+        // 任务改为懒创建：dispatch 前仅绑定 session 级上下文，避免“每轮对话都先建任务”。
+        // 若后续进入 dispatch 流，会在 ensureMissionForDispatch 中覆盖为 mission 级上下文。
         const orchestratorToolManager = this.adapterFactory.getToolManager();
-        const orchestratorAssignmentId = `orchestrator-${mission.id}`;
+        const orchestratorContextMissionId = `session:${resolvedSessionId || 'default'}`;
+        const orchestratorAssignmentId = `orchestrator-session-${resolvedSessionId || 'default'}`;
         orchestratorToolManager.setSnapshotContext({
-          missionId: mission.id,
+          missionId: orchestratorContextMissionId,
           assignmentId: orchestratorAssignmentId,
           todoId: orchestratorAssignmentId,
           workerId: 'orchestrator',
         });
+
+        // 编排者跨轮会话记忆保留在 adapter history 中，不再每轮清空。
+        // SystemPrompt 侧通过 prepareContext 动态裁剪 recent_turns，避免双重注入和 token 膨胀。
 
         // 5. 单次 LLM 调用（自动包含工具循环）
         const response = await this.adapterFactory.sendMessage(
@@ -555,7 +563,6 @@ export class MissionDrivenEngine extends EventEmitter {
             adapterRole: 'orchestrator',
             systemPrompt,
             includeToolCalls: true,
-            messageMeta: { taskId, sessionId: resolvedSessionId, mode: 'unified' },
           }
         );
 
@@ -572,6 +579,10 @@ export class MissionDrivenEngine extends EventEmitter {
 
         if (response.error) {
           throw new Error(response.error);
+        }
+
+        if (currentBatch) {
+          await runPostDispatchVerification(currentBatch, this.verificationRunner, this.messageHub);
         }
 
         // 反应式编排兜底：若 Batch 处于“等待最终汇总”且编排者未输出正文，
@@ -624,15 +635,15 @@ export class MissionDrivenEngine extends EventEmitter {
         // 清除 MissionOrchestrator 的 Mission ID 关联
         this.missionOrchestrator.setCurrentMissionId(null);
         // 更新 Mission 生命周期
-        // 核心原则：只有编排者通过 dispatch_task 主动创建的任务才保留在 Tasks 面板
-        // 无 dispatch（纯对话 / 层级2直接操作 / LLM 出错 / 中断）→ 删除空 Mission
+        // 任务采用懒创建：只有进入 dispatch 流才会创建 Mission。
+        // 因此 this.lastMissionId 存在即代表当前轮属于任务执行流。
         if (this.lastMissionId) {
           try {
             const batch = this.dispatchManager.getActiveBatch();
             if (batch?.status === 'archived') {
               this.dispatchManager.markReactiveBatchSummarized(batch.id);
             }
-            const hadDispatch = batch !== null;
+            const hadDispatch = !!batch && batch.getEntries().length > 0;
 
             if (!hadDispatch) {
               // 未调用 dispatch_task → 不属于任务维度，删除空 Mission
@@ -660,8 +671,51 @@ export class MissionDrivenEngine extends EventEmitter {
             // Mission 状态更新失败不影响主流程
           }
         }
+        try {
+          await this.contextManager.flushMemorySave();
+        } catch (memoryError) {
+          logger.warn('编排器.上下文.保存失败', { error: memoryError }, LogCategory.ORCHESTRATOR);
+        }
       }
     });
+  }
+
+  private async ensureMissionForDispatch(): Promise<string> {
+    if (this.lastMissionId) {
+      return this.lastMissionId;
+    }
+
+    const sessionId = this.currentSessionId || this.sessionManager.getCurrentSession()?.id || '';
+    if (!sessionId) {
+      throw new Error('缺少会话 ID');
+    }
+    const prompt = this.activeUserPrompt?.trim() || '';
+    if (!prompt) {
+      throw new Error('缺少用户请求');
+    }
+
+    const mission = await this.missionStorage.createMission({
+      sessionId,
+      userPrompt: prompt,
+      context: '',
+    });
+    mission.status = 'executing';
+    mission.startedAt = Date.now();
+    await this.missionStorage.update(mission);
+
+    this.lastMissionId = mission.id;
+    this.missionOrchestrator.setCurrentMissionId(mission.id);
+
+    const orchestratorToolManager = this.adapterFactory.getToolManager();
+    const orchestratorAssignmentId = `orchestrator-${mission.id}`;
+    orchestratorToolManager.setSnapshotContext({
+      missionId: mission.id,
+      assignmentId: orchestratorAssignmentId,
+      todoId: orchestratorAssignmentId,
+      workerId: 'orchestrator',
+    });
+
+    return mission.id;
   }
 
   getLastExecutionStatus(): { success: boolean; errors: string[] } {
@@ -685,13 +739,11 @@ export class MissionDrivenEngine extends EventEmitter {
 
   /**
    * 准备决策上下文（用于意图分类/需求分析）
-  /**
-   * 准备决策上下文（用于意图分类/需求分析）
    *
    * 只注入“最近对话 + 长期记忆”，避免把项目知识和共享上下文带入决策阶段导致噪声。
    * 该上下文用于解析“继续/然后/接着”等省略指令。
    */
-  private async prepareDecisionContext(): Promise<string> {
+  private async prepareDecisionContext(currentUserPrompt?: string): Promise<string> {
     const sessionId = this.currentSessionId || this.contextSessionId || this.sessionManager.getCurrentSession()?.id || '';
     if (!sessionId) {
       return '';
@@ -700,7 +752,14 @@ export class MissionDrivenEngine extends EventEmitter {
     await this.ensureContextReady(sessionId);
 
     const missionId = this.lastMissionId || `session:${sessionId}`;
-    const options = this.contextManager.buildAssemblyOptions(missionId, 'orchestrator', 2400);
+    const options = this.contextManager.buildAssemblyOptions(
+      missionId,
+      'orchestrator',
+      2400,
+      [],
+      'medium',
+      currentUserPrompt
+    );
     options.localTurns = { min: 1, max: 8 };
 
     return this.contextManager.getAssembledContextText(options, {
@@ -721,7 +780,6 @@ export class MissionDrivenEngine extends EventEmitter {
       return '';
     }
   }
-
   /**
    * 准备上下文
    */
@@ -731,17 +789,27 @@ export class MissionDrivenEngine extends EventEmitter {
       await this.ensureContextReady(sessionId);
     }
 
-    const missionId = this.lastMissionId;
-    if (missionId) {
-      return this.contextManager.getAssembledContextText(
-        this.contextManager.buildAssemblyOptions(missionId, 'orchestrator', 8000)
-      );
+    const policy = resolveOrchestratorContextPolicy(
+      this.adapterFactory.getAdapterHistoryInfo?.('orchestrator') ?? undefined,
+    );
+    const missionId = this.lastMissionId || (sessionId ? `session:${sessionId}` : 'session:default');
+    const assembledOptions = this.contextManager.buildAssemblyOptions(
+      missionId,
+      'orchestrator',
+      policy.totalTokens,
+      [],
+      'medium',
+      _userPrompt
+    );
+    assembledOptions.localTurns = policy.localTurns;
+
+    if (policy.includeRecentTurns) {
+      return this.contextManager.getAssembledContextText(assembledOptions);
     }
 
-    const defaultMissionId = sessionId ? `session:${sessionId}` : 'session:default';
-    return this.contextManager.getAssembledContextText(
-      this.contextManager.buildAssemblyOptions(defaultMissionId, 'orchestrator', 8000)
-    );
+    return this.contextManager.getAssembledContextText(assembledOptions, {
+      excludePartTypes: ['recent_turns'],
+    });
   }
 
   /**
@@ -766,6 +834,8 @@ export class MissionDrivenEngine extends EventEmitter {
         duration: assignmentResult.totalDuration,
         inputTokens: tokenUsage.inputTokens,
         outputTokens: tokenUsage.outputTokens,
+        estimatedInputTokens: tokenUsage.estimatedInputTokens,
+        estimatedOutputTokens: tokenUsage.estimatedOutputTokens,
         phase: 'execution',
       });
     }
@@ -778,6 +848,8 @@ export class MissionDrivenEngine extends EventEmitter {
     if (usage) {
       this.orchestratorTokens.inputTokens += usage.inputTokens || 0;
       this.orchestratorTokens.outputTokens += usage.outputTokens || 0;
+      this.orchestratorTokens.estimatedInputTokens += usage.estimatedInputTokens || 0;
+      this.orchestratorTokens.estimatedOutputTokens += usage.estimatedOutputTokens || 0;
 
       // 同时记录到 ExecutionStats（编排器使用 claude）
       this.executionStats.recordExecution({
@@ -788,6 +860,8 @@ export class MissionDrivenEngine extends EventEmitter {
         duration: 0,
         inputTokens: usage.inputTokens,
         outputTokens: usage.outputTokens,
+        estimatedInputTokens: usage.estimatedInputTokens,
+        estimatedOutputTokens: usage.estimatedOutputTokens,
         phase,
       });
     }
@@ -811,48 +885,23 @@ export class MissionDrivenEngine extends EventEmitter {
     // 【新增】用户消息时，记录到 Memory 的 userMessages 字段
     if (role === 'user') {
       // 检测是否为关键指令（包含决策性关键词）
-      const isKeyInstruction = this.isKeyInstruction(content);
-      this.contextManager.addUserMessage(content, isKeyInstruction);
+      const keyInstruction = isKeyInstruction(content);
+      this.contextManager.addUserMessage(content, keyInstruction);
+      for (const constraint of extractUserConstraints(content)) {
+        this.contextManager.addUserConstraint(constraint);
+      }
 
       // 如果是首条用户消息，尝试提取核心意图
       const memory = this.contextManager.getMemoryDocument();
       if (memory && !memory.getContent().primaryIntent) {
-        const intent = this.extractPrimaryIntent(content);
+        const intent = extractPrimaryIntent(content);
         if (intent) {
           this.contextManager.setPrimaryIntent(intent);
         }
       }
     }
-  }
 
-  /**
-   * 检测消息是否为关键指令
-   */
-  private isKeyInstruction(content: string): boolean {
-    const keyPatterns = [
-      /不要|不能|必须|一定要|禁止|严禁/,      // 约束性指令
-      /确认|同意|拒绝|取消|放弃/,              // 决策性指令
-      /使用|采用|选择|决定/,                   // 选择性指令
-      /优先|首先|最重要/,                      // 优先级指令
-    ];
-    return keyPatterns.some(pattern => pattern.test(content));
-  }
-
-  /**
-   * 从用户消息中提取核心意图
-   */
-  private extractPrimaryIntent(content: string): string {
-    // 简单策略：取前 100 个字符作为意图摘要
-    const trimmed = content.trim();
-    if (trimmed.length <= 100) {
-      return trimmed;
-    }
-    // 尝试在句号或换行处截断
-    const breakPoint = trimmed.substring(0, 100).lastIndexOf('。');
-    if (breakPoint > 30) {
-      return trimmed.substring(0, breakPoint + 1);
-    }
-    return trimmed.substring(0, 100) + '...';
+    this.contextManager.scheduleMemorySave();
   }
 
   async recordStreamingMessage(
@@ -889,6 +938,7 @@ export class MissionDrivenEngine extends EventEmitter {
     }
     await this.ensureContextReady(resolvedSessionId);
     this.contextManager.addToolOutput(toolName, output);
+    this.contextManager.scheduleMemorySave();
   }
 
   /**
@@ -928,14 +978,22 @@ export class MissionDrivenEngine extends EventEmitter {
    * 获取统计摘要
    */
   getStatsSummary(): string {
-    const { inputTokens, outputTokens } = this.orchestratorTokens;
-    return `编排器 Token 使用: 输入 ${inputTokens}, 输出 ${outputTokens}`;
+    const { inputTokens, outputTokens, estimatedInputTokens, estimatedOutputTokens } = this.orchestratorTokens;
+    const estimatedTotal = (estimatedInputTokens || 0) + (estimatedOutputTokens || 0);
+    return estimatedTotal > 0
+      ? `编排器 Token 使用: 输入 ${inputTokens}（估算 ${estimatedInputTokens}）, 输出 ${outputTokens}（估算 ${estimatedOutputTokens}）`
+      : `编排器 Token 使用: 输入 ${inputTokens}, 输出 ${outputTokens}`;
   }
 
   /**
    * 获取编排器 Token 使用
    */
-  getOrchestratorTokenUsage(): { inputTokens: number; outputTokens: number } {
+  getOrchestratorTokenUsage(): {
+    inputTokens: number;
+    outputTokens: number;
+    estimatedInputTokens: number;
+    estimatedOutputTokens: number;
+  } {
     return { ...this.orchestratorTokens };
   }
 
@@ -943,7 +1001,12 @@ export class MissionDrivenEngine extends EventEmitter {
    * 重置编排器 Token 使用
    */
   resetOrchestratorTokenUsage(): void {
-    this.orchestratorTokens = { inputTokens: 0, outputTokens: 0 };
+    this.orchestratorTokens = {
+      inputTokens: 0,
+      outputTokens: 0,
+      estimatedInputTokens: 0,
+      estimatedOutputTokens: 0,
+    };
   }
 
   async reloadCompressionAdapter(): Promise<void> {
@@ -957,9 +1020,6 @@ export class MissionDrivenEngine extends EventEmitter {
     this.executionStats.setContext(_context);
   }
 
-  /**
-   * 获取执行统计
-   */
   /**
    * 获取 MissionOrchestrator
    */
@@ -1020,7 +1080,6 @@ export class MissionDrivenEngine extends EventEmitter {
   // ============================================================================
   // 私有方法
   // ============================================================================
-
   private async ensureContextReady(sessionId: string): Promise<void> {
     if (!sessionId) {
       return;

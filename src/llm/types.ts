@@ -112,6 +112,8 @@ export interface LLMResponse {
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
     estimated?: boolean;
+    estimatedInputTokens?: number;
+    estimatedOutputTokens?: number;
   };
   stopReason: 'end_turn' | 'max_tokens' | 'tool_use' | 'stop_sequence';
 }
@@ -130,6 +132,8 @@ export interface LLMStreamChunk {
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
     estimated?: boolean;
+    estimatedInputTokens?: number;
+    estimatedOutputTokens?: number;
   };
 }
 

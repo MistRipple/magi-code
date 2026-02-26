@@ -7,6 +7,8 @@ import { logger, LogCategory } from '../logging';
 import { spawn } from 'child_process';
 import * as vscode from 'vscode';
 import { globalEventBus } from '../events';
+import * as fs from 'fs';
+import * as path from 'path';
 
 /** 验证配置 */
 export interface VerificationConfig {
@@ -94,6 +96,8 @@ export class VerificationRunner {
     logger.info('编排器.验证.开始', { taskId }, LogCategory.ORCHESTRATOR);
     globalEventBus.emitEvent('verification:started', { taskId });
 
+    const verificationRoots = this.resolveVerificationRoots(modifiedFiles);
+
     const result: VerificationResult = {
       success: true,
       summary: '',
@@ -104,12 +108,12 @@ export class VerificationRunner {
     // 1. 编译检查
     if (this.config.compileCheck) {
       logger.info('编排器.验证.编译.开始', { taskId }, LogCategory.ORCHESTRATOR);
-      result.compileResult = await this.runCommand(this.config.compileCommand, '编译');
+      result.compileResult = await this.runCompileChecks(verificationRoots);
       if (!result.compileResult.success) {
         result.success = false;
         summaryParts.push(`编译失败: ${result.compileResult.error || '未知错误'}`);
       } else {
-        summaryParts.push('编译通过');
+        summaryParts.push(verificationRoots.length > 1 ? `编译通过（${verificationRoots.length} 个项目）` : '编译通过');
       }
     }
 
@@ -131,24 +135,24 @@ export class VerificationRunner {
     // 3. Lint 检查
     if (this.config.lintCheck) {
       logger.info('编排器.验证.Lint.开始', { taskId }, LogCategory.ORCHESTRATOR);
-      result.lintResult = await this.runCommand(this.config.lintCommand, 'Lint');
+      result.lintResult = await this.runLintChecks(verificationRoots);
       if (!result.lintResult.success) {
         result.success = false;
         summaryParts.push(`Lint 失败: ${result.lintResult.error || '未知错误'}`);
       } else {
-        summaryParts.push('Lint 通过');
+        summaryParts.push(verificationRoots.length > 1 ? `Lint 通过（${verificationRoots.length} 个项目）` : 'Lint 通过');
       }
     }
 
     // 4. 测试检查
     if (this.config.testCheck) {
       logger.info('编排器.验证.测试.开始', { taskId }, LogCategory.ORCHESTRATOR);
-      result.testResult = await this.runCommand(this.config.testCommand, '测试');
+      result.testResult = await this.runTestChecks(verificationRoots);
       if (!result.testResult.success) {
         result.success = false;
         summaryParts.push(`测试失败: ${result.testResult.error || '未知错误'}`);
       } else {
-        summaryParts.push('测试通过');
+        summaryParts.push(verificationRoots.length > 1 ? `测试通过（${verificationRoots.length} 个项目）` : '测试通过');
       }
     }
 
@@ -166,13 +170,13 @@ export class VerificationRunner {
   /**
    * 执行命令并返回结果
    */
-  private async runCommand(command: string, name: string): Promise<CommandResult> {
+  private async runCommand(command: string, name: string, cwd?: string): Promise<CommandResult> {
     const startTime = Date.now();
+    const executionCwd = cwd || this.workspaceRoot;
 
     return new Promise((resolve) => {
-      const [cmd, ...args] = command.split(' ');
-      const process = spawn(cmd, args, {
-        cwd: this.workspaceRoot,
+      const process = spawn(command, {
+        cwd: executionCwd,
         shell: true,
         timeout: this.config.timeout,
       });
@@ -270,7 +274,9 @@ export class VerificationRunner {
    */
   async quickCompileCheck(): Promise<boolean> {
     if (!this.config.compileCheck) return true;
-    const result = await this.runCommand(this.config.compileCommand, '编译');
+    const compileCommand = this.resolveCompileCommand(this.workspaceRoot);
+    if (!compileCommand) return false;
+    const result = await this.runCommand(compileCommand, '编译', this.workspaceRoot);
     return result.success;
   }
 
@@ -301,5 +307,213 @@ export class VerificationRunner {
     }
 
     return details.join('\n\n');
+  }
+
+  private resolveVerificationRoots(modifiedFiles?: string[]): string[] {
+    const hitCount = new Map<string, number>();
+    if (Array.isArray(modifiedFiles)) {
+      for (const file of modifiedFiles) {
+        const normalized = this.normalizeModifiedPath(file);
+        if (!normalized) continue;
+        const projectRoot = this.findNearestProjectRoot(normalized) || this.workspaceRoot;
+        hitCount.set(projectRoot, (hitCount.get(projectRoot) || 0) + 1);
+      }
+    }
+
+    if (hitCount.size === 0) {
+      return [this.workspaceRoot];
+    }
+
+    return Array.from(hitCount.entries())
+      .sort((a, b) => {
+        if (b[1] !== a[1]) return b[1] - a[1];
+        return b[0].length - a[0].length;
+      })
+      .map(([root]) => root);
+  }
+
+  private async runCompileChecks(projectRoots: string[]): Promise<CommandResult> {
+    return this.runProjectChecks({
+      projectRoots,
+      name: '编译',
+      resolveCommand: (root) => this.resolveCompileCommand(root),
+      missingCommandMessage: '未找到可用编译命令（缺少 scripts.compile/scripts.typecheck 与 tsconfig.json）',
+    });
+  }
+
+  private async runLintChecks(projectRoots: string[]): Promise<CommandResult> {
+    return this.runProjectChecks({
+      projectRoots,
+      name: 'Lint',
+      resolveCommand: (root) => this.resolveLintCommand(root),
+      missingCommandMessage: '未找到可用 Lint 命令（缺少 scripts.lint）',
+    });
+  }
+
+  private async runTestChecks(projectRoots: string[]): Promise<CommandResult> {
+    return this.runProjectChecks({
+      projectRoots,
+      name: '测试',
+      resolveCommand: (root) => this.resolveTestCommand(root),
+      missingCommandMessage: '未找到可用测试命令（缺少 scripts.test）',
+    });
+  }
+
+  private async runProjectChecks(params: {
+    projectRoots: string[];
+    name: string;
+    resolveCommand: (root: string) => string | null;
+    missingCommandMessage: string;
+  }): Promise<CommandResult> {
+    const { projectRoots, name, resolveCommand, missingCommandMessage } = params;
+    const roots = projectRoots.length > 0 ? projectRoots : [this.workspaceRoot];
+    const outputs: string[] = [];
+    const errors: string[] = [];
+    let duration = 0;
+    let success = true;
+
+    for (const root of roots) {
+      const command = resolveCommand(root);
+      if (!command) {
+        success = false;
+        errors.push(`[${root}] ${missingCommandMessage}`);
+        continue;
+      }
+
+      const commandResult = await this.runCommand(command, name, root);
+      duration += commandResult.duration;
+
+      if (commandResult.output?.trim()) {
+        outputs.push(`[${root}]\n${commandResult.output.trim()}`);
+      }
+
+      if (!commandResult.success) {
+        success = false;
+        const errorText = commandResult.error?.trim() || '未知错误';
+        errors.push(`[${root}] ${errorText}`);
+      }
+    }
+
+    return {
+      success,
+      output: outputs.join('\n\n'),
+      error: errors.length > 0 ? errors.join('\n\n') : undefined,
+      duration,
+    };
+  }
+
+  private normalizeModifiedPath(file: string): string | null {
+    if (!file || typeof file !== 'string') {
+      return null;
+    }
+    const trimmed = file.trim();
+    if (!trimmed) {
+      return null;
+    }
+    if (path.isAbsolute(trimmed)) {
+      return path.resolve(trimmed);
+    }
+
+    const workspaceFolders = vscode.workspace.workspaceFolders || [];
+    const separatorIndex = trimmed.indexOf('/');
+    if (separatorIndex > 0) {
+      const workspaceName = trimmed.slice(0, separatorIndex);
+      const relativePath = trimmed.slice(separatorIndex + 1);
+      const matchedFolder = workspaceFolders.find(folder => folder.name === workspaceName);
+      if (matchedFolder) {
+        return path.resolve(matchedFolder.uri.fsPath, relativePath);
+      }
+    }
+
+    for (const folder of workspaceFolders) {
+      const candidate = path.resolve(folder.uri.fsPath, trimmed);
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+
+    return path.resolve(this.workspaceRoot, trimmed);
+  }
+
+  private findNearestProjectRoot(filePath: string): string | null {
+    let current = filePath;
+    try {
+      if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+        current = path.dirname(filePath);
+      }
+    } catch {
+      current = path.dirname(filePath);
+    }
+
+    const workspaceRootResolved = path.resolve(this.workspaceRoot);
+    while (true) {
+      const packageJsonPath = path.join(current, 'package.json');
+      const tsconfigPath = path.join(current, 'tsconfig.json');
+      if (fs.existsSync(packageJsonPath) || fs.existsSync(tsconfigPath)) {
+        return current;
+      }
+      if (current === workspaceRootResolved) {
+        break;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) {
+        break;
+      }
+      current = parent;
+    }
+
+    return null;
+  }
+
+  private resolveCompileCommand(cwd: string): string | null {
+    const configuredCommand = this.config.compileCommand?.trim();
+    if (configuredCommand && configuredCommand !== DEFAULT_CONFIG.compileCommand) {
+      return configuredCommand;
+    }
+
+    const scripts = this.readPackageScripts(cwd);
+    if (scripts.compile) return 'npm run compile';
+    if (scripts.typecheck) return 'npm run typecheck';
+
+    const tsconfigPath = path.join(cwd, 'tsconfig.json');
+    if (fs.existsSync(tsconfigPath)) {
+      return `npx tsc --noEmit -p \"${tsconfigPath}\"`;
+    }
+
+    return null;
+  }
+
+  private resolveLintCommand(cwd: string): string | null {
+    const configuredCommand = this.config.lintCommand?.trim();
+    if (configuredCommand && configuredCommand !== DEFAULT_CONFIG.lintCommand) {
+      return configuredCommand;
+    }
+
+    const scripts = this.readPackageScripts(cwd);
+    return scripts.lint ? 'npm run lint' : null;
+  }
+
+  private resolveTestCommand(cwd: string): string | null {
+    const configuredCommand = this.config.testCommand?.trim();
+    if (configuredCommand && configuredCommand !== DEFAULT_CONFIG.testCommand) {
+      return configuredCommand;
+    }
+
+    const scripts = this.readPackageScripts(cwd);
+    return scripts.test ? 'npm test' : null;
+  }
+
+  private readPackageScripts(cwd: string): Record<string, string> {
+    try {
+      const packageJsonPath = path.join(cwd, 'package.json');
+      if (!fs.existsSync(packageJsonPath)) {
+        return {};
+      }
+      const content = fs.readFileSync(packageJsonPath, 'utf-8');
+      const parsed = JSON.parse(content) as { scripts?: Record<string, string> };
+      return parsed.scripts && typeof parsed.scripts === 'object' ? parsed.scripts : {};
+    } catch {
+      return {};
+    }
   }
 }

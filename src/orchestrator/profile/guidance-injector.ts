@@ -62,7 +62,27 @@ export class GuidanceInjector {
     const guidancePrompt = this.buildWorkerPrompt(profile, context);
     sections.push(guidancePrompt);
 
-    // 2. 任务结构化信息
+    // 2. 任务级执行约束（仅任务信息，不含角色定义）
+    const assignmentGuidance = this.buildAssignmentGuidance(context, additionalContext, taskInfo);
+    if (assignmentGuidance) {
+      sections.push(assignmentGuidance);
+    }
+
+    return sections.join('\n\n---\n\n');
+  }
+
+  /**
+   * 构建 Assignment 级别引导（不包含 Worker 角色定义）
+   *
+   * 用于避免与 Worker systemPrompt 的角色/工具规范重复注入。
+   */
+  buildAssignmentGuidance(
+    context: InjectionContext,
+    additionalContext?: string,
+    taskInfo?: TaskStructuredInfo
+  ): string {
+    const sections: string[] = [];
+
     if (taskInfo) {
       const structuredSection = this.buildTaskStructuredSection(taskInfo);
       if (structuredSection) {
@@ -70,27 +90,23 @@ export class GuidanceInjector {
       }
     }
 
-    // 3. 项目上下文（如果有）
     if (additionalContext) {
       sections.push(`## 项目上下文\n${additionalContext}`);
     }
 
-    // 4. 当前任务
     sections.push(`## 当前任务\n${context.taskDescription}`);
 
-    // 5. 目标文件（如果有）
     if (context.targetFiles && context.targetFiles.length > 0) {
       const files = context.targetFiles.map(f => `- ${f}`).join('\n');
       sections.push(`## 目标文件\n${files}`);
     }
 
-    // 6. 依赖任务（如果有）
     if (context.dependencies && context.dependencies.length > 0) {
       const deps = context.dependencies.map(d => `- ${d}`).join('\n');
       sections.push(`## 依赖任务\n${deps}`);
     }
 
-    return sections.join('\n\n---\n\n');
+    return sections.join('\n\n');
   }
 
   /**

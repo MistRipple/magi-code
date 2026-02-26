@@ -18,6 +18,7 @@ import {
   sanitizeToolOrder,
 } from '../types';
 import { logger, LogCategory } from '../../logging';
+import { estimateTokenCount } from '../../utils/token-estimator';
 
 class NonRetryableError extends Error {
   constructor(message: string, public originalError?: unknown) {
@@ -612,6 +613,27 @@ export class UniversalLLMClient extends BaseLLMClient {
     };
   }
 
+  /**
+   * 当上游未返回 usage 时的本地估算（真实优先，缺失兜底）
+   */
+  private estimateUsageFallback(inputText: string, outputText: string): {
+    inputTokens: number;
+    outputTokens: number;
+    estimated: true;
+    estimatedInputTokens: number;
+    estimatedOutputTokens: number;
+  } {
+    const inputTokens = estimateTokenCount(inputText || '');
+    const outputTokens = estimateTokenCount(outputText || '');
+    return {
+      inputTokens,
+      outputTokens,
+      estimated: true,
+      estimatedInputTokens: inputTokens,
+      estimatedOutputTokens: outputTokens,
+    };
+  }
+
   private async sendAnthropicMessage(params: LLMMessageParams): Promise<LLMResponse> {
     if (!this.anthropicClient) {
       throw new Error('Anthropic client not initialized');
@@ -651,6 +673,21 @@ export class UniversalLLMClient extends BaseLLMClient {
     const response = await this.anthropicClient.messages.create(requestParams);
 
     const result = this.parseAnthropicResponse(response);
+    if (result.usage.inputTokens === 0 && result.usage.outputTokens === 0) {
+      const inputText = messages.map((m: any) =>
+        typeof m?.content === 'string'
+          ? m.content
+          : Array.isArray(m?.content)
+            ? m.content.map((b: any) => b?.text || b?.content || '').join('')
+            : ''
+      ).join('');
+      result.usage = this.estimateUsageFallback(inputText, result.content || '');
+      logger.debug('Anthropic 未返回 usage，使用本地估算', {
+        estimatedInput: result.usage.inputTokens,
+        estimatedOutput: result.usage.outputTokens,
+        model: this.config.model,
+      }, LogCategory.LLM);
+    }
     this.logResponse(result);
     return result;
   }
@@ -957,6 +994,19 @@ export class UniversalLLMClient extends BaseLLMClient {
     }, LogCategory.LLM);
 
     const result = this.parseOpenAIResponse(response);
+    if (result.usage.inputTokens === 0 && result.usage.outputTokens === 0) {
+      const inputText = messages.map((m: any) => {
+        if (typeof m?.content === 'string') return m.content;
+        if (Array.isArray(m?.content)) return m.content.map((b: any) => b?.text || b?.content || '').join('');
+        return '';
+      }).join('');
+      result.usage = this.estimateUsageFallback(inputText, result.content || '');
+      logger.debug('OpenAI 非流式未返回 usage，使用本地估算', {
+        estimatedInput: result.usage.inputTokens,
+        estimatedOutput: result.usage.outputTokens,
+        model: this.config.model,
+      }, LogCategory.LLM);
+    }
     this.logResponse(result);
     return result;
   }
@@ -1134,10 +1184,10 @@ export class UniversalLLMClient extends BaseLLMClient {
         return '';
       }).join('');
       const outputText = fullContent;
-      // 估算：约 4 字符 ≈ 1 token（通用近似）
-      usage.inputTokens = Math.ceil(inputText.length / 4);
-      usage.outputTokens = Math.ceil(outputText.length / 4);
-      usage.estimated = true;
+      const estimatedUsage = this.estimateUsageFallback(inputText, outputText);
+      usage.inputTokens = estimatedUsage.inputTokens;
+      usage.outputTokens = estimatedUsage.outputTokens;
+      usage.estimated = estimatedUsage.estimated;
       logger.debug('OpenAI 流式未返回 usage，使用本地估算', {
         estimatedInput: usage.inputTokens,
         estimatedOutput: usage.outputTokens,
@@ -1149,6 +1199,8 @@ export class UniversalLLMClient extends BaseLLMClient {
           inputTokens: usage.inputTokens,
           outputTokens: usage.outputTokens,
           estimated: true,
+          estimatedInputTokens: usage.inputTokens,
+          estimatedOutputTokens: usage.outputTokens,
         },
       });
     }

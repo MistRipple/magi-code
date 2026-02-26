@@ -18,6 +18,7 @@
 // 导入 ContextSource 类型，避免重复定义
 import { ContextSource } from './file-summary-cache';
 import { logger, LogCategory } from '../logging';
+import { estimateMixedLanguageTokenCount } from '../utils/token-estimator';
 
 // 重新导出 ContextSource，方便使用者从此模块导入
 export { ContextSource };
@@ -671,12 +672,7 @@ export class SharedContextPool {
    * 采用混合估算策略，对中文字符加权
    */
   private estimateTokens(text: string): number {
-    // 统计中文字符数量
-    const chineseChars = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
-    const otherChars = text.length - chineseChars;
-
-    // 中文约 2 字符/token，其他约 4 字符/token
-    return Math.ceil(chineseChars / 2 + otherChars / 4);
+    return estimateMixedLanguageTokenCount(text);
   }
 
   /**

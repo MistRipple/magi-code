@@ -11,6 +11,7 @@
 
 import { logger, LogCategory } from '../logging';
 import * as path from 'path';
+import { estimateTokenCount } from '../utils/token-estimator';
 import { MemoryDocument } from './memory-document';
 import { ContextCompressor, type CompressorAdapter } from './context-compressor';
 import { TruncationUtils } from './truncation-utils';
@@ -60,6 +61,8 @@ export class ContextManager {
   private compressorAdapter: CompressorAdapter | null = null;
   private compressor: ContextCompressor | null = null;
   private streamingContext: Map<string, ContextMessage> = new Map();
+  private pendingMemorySaveTimer: NodeJS.Timeout | null = null;
+  private pendingMemorySavePromise: Promise<void> | null = null;
 
   // ============================================================================
   // 统一上下文系统组件 (L1 层级)
@@ -117,19 +120,29 @@ export class ContextManager {
    */
   private async getRecentTurnsForAssembler(
     agentId: string,
-    options: { maxTokens: number; minTurns: number; maxTurns: number; prioritizeDecisionPoints: boolean }
+    options: {
+      maxTokens: number;
+      minTurns: number;
+      maxTurns: number;
+      prioritizeDecisionPoints: boolean;
+      excludeCurrentUserPrompt?: string;
+    }
   ): Promise<string | null> {
     const agentScopedTurns = this.getAgentScopedTurnsFromSession(
       agentId,
       options.maxTokens,
       options.minTurns,
-      options.maxTurns
+      options.maxTurns,
+      options.excludeCurrentUserPrompt
     );
     if (agentScopedTurns) {
       return agentScopedTurns;
     }
 
-    const recentMessages = this.getRecentMessages(options.maxTokens);
+    const recentMessages = this.excludeLatestPromptMatch(
+      this.getRecentMessages(options.maxTokens),
+      options.excludeCurrentUserPrompt
+    );
 
     if (recentMessages.length === 0) {
       return null;
@@ -150,7 +163,8 @@ export class ContextManager {
     agentId: string,
     maxTokens: number,
     minTurns: number,
-    maxTurns: number
+    maxTurns: number,
+    excludeCurrentUserPrompt?: string
   ): string | null {
     if (!this.sessionManager || !this.currentSessionId) {
       return null;
@@ -165,8 +179,13 @@ export class ContextManager {
     let usedTokens = 0;
     const maxMessages = Math.max(2, maxTurns * 2);
 
-    for (let i = session.messages.length - 1; i >= 0; i--) {
-      const message = session.messages[i];
+    const filteredMessages = this.excludeLatestPromptMatch(
+      session.messages,
+      excludeCurrentUserPrompt
+    );
+
+    for (let i = filteredMessages.length - 1; i >= 0; i--) {
+      const message = filteredMessages[i];
       if (!this.shouldIncludeSessionMessageForAgent(message, agentId)) {
         continue;
       }
@@ -204,6 +223,10 @@ export class ContextManager {
       return true;
     }
 
+    if (message.source === 'orchestrator') {
+      return true;
+    }
+
     if (message.agent === agentId) {
       return true;
     }
@@ -226,6 +249,46 @@ export class ContextManager {
       return message.agent;
     }
     return message.role;
+  }
+
+  /**
+   * 过滤“当前轮用户输入”在最近消息中的重复注入
+   *
+   * 仅移除从尾部开始遇到的首个匹配 user 消息，避免误删历史中相同文本的有效轮次。
+   */
+  private excludeLatestPromptMatch<T extends { role: string; content: string }>(
+    messages: T[],
+    prompt?: string
+  ): T[] {
+    const normalizedPrompt = this.normalizePromptForComparison(prompt);
+    if (!normalizedPrompt || messages.length === 0) {
+      return messages;
+    }
+
+    let matchedIndex = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message.role !== 'user') {
+        continue;
+      }
+      if (this.normalizePromptForComparison(message.content) === normalizedPrompt) {
+        matchedIndex = i;
+        break;
+      }
+    }
+
+    if (matchedIndex < 0) {
+      return messages;
+    }
+
+    return [
+      ...messages.slice(0, matchedIndex),
+      ...messages.slice(matchedIndex + 1),
+    ];
+  }
+
+  private normalizePromptForComparison(text?: string): string {
+    return (text || '').trim().replace(/\s+/g, ' ');
   }
 
   /**
@@ -454,7 +517,7 @@ export class ContextManager {
    * 估算 token 数量
    */
   private estimateTokens(text: string): number {
-    return Math.ceil(text.length / 4);
+    return estimateTokenCount(text);
   }
 
   // ========== Memory 操作代理方法 ==========
@@ -603,6 +666,41 @@ export class ContextManager {
       }
       await this.sessionMemory.save();
     }
+  }
+
+  /**
+   * 防抖触发 Memory 持久化
+   */
+  scheduleMemorySave(delayMs: number = 300): void {
+    if (this.pendingMemorySaveTimer) {
+      clearTimeout(this.pendingMemorySaveTimer);
+      this.pendingMemorySaveTimer = null;
+    }
+
+    this.pendingMemorySaveTimer = setTimeout(() => {
+      this.pendingMemorySaveTimer = null;
+      void this.flushMemorySave();
+    }, Math.max(0, delayMs));
+  }
+
+  /**
+   * 立即刷盘 Memory（会等待已在进行中的保存）
+   */
+  async flushMemorySave(): Promise<void> {
+    if (this.pendingMemorySaveTimer) {
+      clearTimeout(this.pendingMemorySaveTimer);
+      this.pendingMemorySaveTimer = null;
+    }
+
+    if (this.pendingMemorySavePromise) {
+      await this.pendingMemorySavePromise;
+      return;
+    }
+
+    this.pendingMemorySavePromise = this.saveMemory().finally(() => {
+      this.pendingMemorySavePromise = null;
+    });
+    await this.pendingMemorySavePromise;
   }
 
   private getCompressor(): ContextCompressor {
@@ -847,7 +945,8 @@ export class ContextManager {
     agentId: string,
     totalTokens: number,
     subscribedTags: string[] = [],
-    minImportance: ImportanceLevel = 'medium'
+    minImportance: ImportanceLevel = 'medium',
+    excludeCurrentUserPrompt?: string
   ): ContextAssemblyOptions {
     return {
       missionId,
@@ -861,6 +960,7 @@ export class ContextManager {
       },
       minImportance,
       localTurns: DEFAULT_LOCAL_TURNS,
+      excludeCurrentUserPrompt,
     };
   }
 

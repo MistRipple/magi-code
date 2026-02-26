@@ -5,6 +5,7 @@
 .npm/**
 .ace-tool/**
 .claude/**
+.magi/**
 src/**
 docs/**
 scripts/**

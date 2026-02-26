@@ -38,6 +38,7 @@ import type { UnifiedTodo } from '../../todo/types';
 export interface MissionOrchestratorEventMap {
   // ---- Mission 生命周期 (storage 转发) ----
   missionCreated: (data: { mission: Mission }) => void;
+  missionDeleted: (data: { missionId: string }) => void;
   missionStatusChanged: (data: { mission: Mission; oldStatus: string; newStatus: string }) => void;
   missionPhaseChanged: (data: { mission: Mission; oldPhase: string; newPhase: string }) => void;
   // ---- Worker Session ----
@@ -107,6 +108,10 @@ export class MissionOrchestrator extends EventEmitter {
   private setupStorageListeners(): void {
     this.storage.on('missionCreated', (data) => {
       this.emit('missionCreated', data);
+    });
+
+    this.storage.on('missionDeleted', (data) => {
+      this.emit('missionDeleted', data);
     });
 
     this.storage.on('missionStatusChanged', (data) => {

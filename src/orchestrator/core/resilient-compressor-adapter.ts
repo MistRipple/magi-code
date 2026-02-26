@@ -96,7 +96,12 @@ export async function configureResilientCompressor(
     const recordCompression = (
       success: boolean,
       duration: number,
-      usage?: { inputTokens?: number; outputTokens?: number },
+      usage?: {
+        inputTokens?: number;
+        outputTokens?: number;
+        estimatedInputTokens?: number;
+        estimatedOutputTokens?: number;
+      },
       error?: string
     ) => {
       executionStats.recordExecution({
@@ -108,6 +113,8 @@ export async function configureResilientCompressor(
         error,
         inputTokens: usage?.inputTokens,
         outputTokens: usage?.outputTokens,
+        estimatedInputTokens: usage?.estimatedInputTokens,
+        estimatedOutputTokens: usage?.estimatedOutputTokens,
         phase: 'integration',
       });
     };
@@ -124,6 +131,8 @@ export async function configureResilientCompressor(
         recordCompression(true, duration, {
           inputTokens: response.usage?.inputTokens,
           outputTokens: response.usage?.outputTokens,
+          estimatedInputTokens: response.usage?.estimatedInputTokens,
+          estimatedOutputTokens: response.usage?.estimatedOutputTokens,
         });
         return response.content || '';
       } catch (error: any) {

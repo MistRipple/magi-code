@@ -44,6 +44,8 @@ export interface PipelineConfig {
   cancellationToken?: CancellationToken;
   imagePaths?: string[];
   missionId?: string;
+  resumeSessionId?: string;
+  resumePrompt?: string;
 
   // 治理开关（由 DispatchManager 根据 governance 参数计算）
   enableSnapshot: boolean;
@@ -77,6 +79,7 @@ export class WorkerPipeline {
     const {
       assignment, workerInstance, adapterFactory, workspaceRoot,
       projectContext, onReport, cancellationToken, imagePaths,
+      resumeSessionId, resumePrompt,
       enableSnapshot, enableLSP, enableTargetEnforce, enableContextUpdate,
       snapshotManager, contextManager, todoManager,
       getSupplementaryInstructions,
@@ -139,11 +142,6 @@ export class WorkerPipeline {
 
     const [assembledContext] = await Promise.all([assembledContextPromise, lspPromise]);
 
-    // 将结构化 AssembledContext 格式化为文本（供 adapterScope）
-    const contextSnapshotText = assembledContext && contextManager
-      ? contextManager.formatAssembledContext(assembledContext)
-      : undefined;
-
     // ========== 6. Worker 执行 ==========
     let result: AutonomousExecutionResult;
     const lspNewErrors: string[] = [];
@@ -158,13 +156,9 @@ export class WorkerPipeline {
         cancellationToken,
         imagePaths,
         getSupplementaryInstructions,
+        sessionId: resumeSessionId,
+        resumePrompt,
         preAssembledContext: assembledContext,
-        adapterScope: contextSnapshotText ? {
-          messageMeta: {
-            contextSnapshot: contextSnapshotText,
-            taskContext: { goal: assignment.responsibility, targetFiles },
-          },
-        } : undefined,
       });
 
       // ========== 7. [可选] 目标变更检测 + 强制重试 ==========
@@ -195,12 +189,8 @@ export class WorkerPipeline {
             cancellationToken,
             imagePaths,
             getSupplementaryInstructions,
-            adapterScope: contextSnapshotText ? {
-              messageMeta: {
-                contextSnapshot: contextSnapshotText,
-                taskContext: { goal: assignment.responsibility, targetFiles },
-              },
-            } : undefined,
+            sessionId: resumeSessionId,
+            resumePrompt,
           });
 
           assignment.guidancePrompt = originalGuidance;

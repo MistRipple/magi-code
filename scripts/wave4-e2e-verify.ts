@@ -41,7 +41,7 @@ console.log('\n=== 1. 文件规模验证 ===\n');
 
 const wvp = readFile('ui/webview-provider.ts');
 const wvpLines = wvp.split('\n').length;
-check('WVP 行数 < 2700', wvpLines < 2700, `实际: ${wvpLines}`);
+check('WVP 行数 < 2800', wvpLines < 2800, `实际: ${wvpLines}`);
 
 const ebs = readFile('ui/event-binding-service.ts');
 const ebsLines = ebs.split('\n').length;

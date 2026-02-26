@@ -16,18 +16,37 @@ import { logger, LogCategory } from '../logging';
 import type { WorkerSlot } from '../types';
 
 /**
+ * Category → Worker 映射条目（由 DispatchManager 从 ProfileLoader 注入）
+ */
+export interface CategoryWorkerEntry {
+  category: string;
+  displayName: string;
+  worker: WorkerSlot;
+}
+
+/**
  * dispatch_task 回调：由 MissionDrivenEngine 注入，实际执行 Worker 委派
  * 返回 task_id 后立即结束（非阻塞），Worker 在后台异步执行
  */
 export type DispatchTaskHandler = (params: {
-  worker: WorkerSlot;
+  worker: 'auto';
+  category: string;
+  /** 是否要求子任务对目标文件产生实际修改 */
+  requiresModification: boolean;
   task: string;
   files?: string[];
   dependsOn?: string[];
 }) => Promise<{
   task_id: string;
   status: 'dispatched' | 'failed';
-  worker: WorkerSlot;
+  /** 实际执行的 Worker（可能与请求值不同） */
+  worker?: WorkerSlot;
+  /** 路由分类（用于审计与可解释性） */
+  category?: string;
+  /** 路由解释（含降级原因） */
+  routing_reason?: string;
+  /** 是否触发了降级改派 */
+  degraded?: boolean;
   error?: string;
 }>;
 
@@ -83,6 +102,8 @@ export class OrchestrationExecutor {
   private waitForWorkersHandler?: WaitForWorkersHandler;
   /** 动态 Worker 列表（必须由 MissionDrivenEngine 从 ProfileLoader 注入） */
   private availableWorkers: { slot: WorkerSlot; description: string }[] = [];
+  /** Category → Worker 映射（必须由 DispatchManager 从 ProfileLoader 注入） */
+  private categoryWorkerMap: CategoryWorkerEntry[] = [];
 
   private static readonly TOOL_NAMES = ['dispatch_task', 'send_worker_message', 'wait_for_workers'] as const;
 
@@ -90,8 +111,16 @@ export class OrchestrationExecutor {
    * 设置可用 Worker 列表（由 MissionDrivenEngine 从 ProfileLoader 注入）
    */
   setAvailableWorkers(workers: { slot: WorkerSlot; description: string }[]): void {
-    // 必须无条件覆盖，避免“全禁用后仍保留旧枚举”的陈旧状态
+    // 必须无条件覆盖，避免”全禁用后仍保留旧枚举”的陈旧状态
     this.availableWorkers = workers;
+  }
+
+  /**
+   * 设置 Category → Worker 映射（由 DispatchManager 从 ProfileLoader 注入）
+   * 用于 dispatch_task 工具 schema 的 category enum 和描述
+   */
+  setCategoryWorkerMap(map: CategoryWorkerEntry[]): void {
+    this.categoryWorkerMap = map;
   }
 
   private getWorkerEnum(): string[] {
@@ -101,8 +130,27 @@ export class OrchestrationExecutor {
     return this.availableWorkers.map(w => w.slot);
   }
 
-  private getWorkerDescription(): string {
-    return this.availableWorkers.map(w => `${w.slot}: ${w.description}`).join('；');
+  private getCategoryEnum(): string[] {
+    return this.categoryWorkerMap.map(e => e.category);
+  }
+
+  /**
+   * 构建 category 参数的分工映射描述
+   * 按 Worker 分组，格式：worker: category1(显示名)/category2(显示名)
+   */
+  private getCategoryMappingDescription(): string {
+    const byWorker = new Map<string, CategoryWorkerEntry[]>();
+    for (const entry of this.categoryWorkerMap) {
+      const list = byWorker.get(entry.worker) || [];
+      list.push(entry);
+      byWorker.set(entry.worker, list);
+    }
+    return Array.from(byWorker.entries())
+      .map(([worker, entries]) => {
+        const categories = entries.map(e => `${e.category}(${e.displayName})`).join('/');
+        return `${categories} → ${worker}`;
+      })
+      .join('；');
   }
 
   /**
@@ -166,20 +214,27 @@ export class OrchestrationExecutor {
   // ===========================================================================
 
   private getDispatchTaskDefinition(): ExtendedToolDefinition {
+    const categoryEnum = this.getCategoryEnum();
+    const mappingDesc = this.getCategoryMappingDescription();
+
     return {
       name: 'dispatch_task',
-      description: '将子任务分配给专业 AI Worker 执行。适用于需要多步代码操作、多文件修改或专业领域知识的任务。Worker 将自主完成任务并在主对话区回传执行进度和结果。',
+      description: '将子任务分配给专业 AI Worker 执行。通过 category 参数指定任务分类，系统自动路由到对应 Worker。Worker 将自主完成任务并在主对话区回传执行进度和结果。',
       input_schema: {
         type: 'object',
         properties: {
-          worker: {
+          category: {
             type: 'string',
-            enum: this.getWorkerEnum(),
-            description: `目标 Worker。${this.getWorkerDescription()}`,
+            ...(categoryEnum.length > 0 ? { enum: categoryEnum } : {}),
+            description: `任务分类（决定执行 Worker 的唯一依据）。分工映射：${mappingDesc || '未配置'}`,
           },
           task: {
             type: 'string',
             description: '清晰、完整的任务描述，包含目标、约束和验收标准',
+          },
+          requires_modification: {
+            type: 'boolean',
+            description: '是否要求该任务对目标文件产生实际修改。只读分析/统计/总结任务必须传 false；功能开发/修复/重构任务传 true。',
           },
           files: {
             type: 'array',
@@ -192,7 +247,7 @@ export class OrchestrationExecutor {
             description: '依赖的前序任务 task_id 列表。被依赖的任务完成后本任务才会执行，可通过 SharedContextPool 获取前序任务的输出上下文',
           },
         },
-        required: ['worker', 'task'],
+        required: ['category', 'task', 'requires_modification'],
       },
       metadata: {
         source: 'builtin',
@@ -211,27 +266,53 @@ export class OrchestrationExecutor {
       };
     }
 
-    const args = toolCall.arguments as { worker: string; task: string; files?: string[]; depends_on?: string[] };
+    const args = toolCall.arguments as {
+      category?: string;
+      task?: string;
+      requires_modification?: boolean;
+      files?: string[];
+      depends_on?: string[];
+    };
 
-    if (!args.worker || !args.task) {
+    // category 和 task 是必填参数
+    if (!args.category || typeof args.category !== 'string' || !args.category.trim()) {
+      const validCategories = this.getCategoryEnum();
       return {
         toolCallId: toolCall.id,
-        content: 'Error: worker and task are required',
+        content: `Error: category 是必填参数。可选值: ${validCategories.join(', ')}`,
+        isError: true,
+      };
+    }
+    if (!args.task || typeof args.task !== 'string' || !args.task.trim()) {
+      return {
+        toolCallId: toolCall.id,
+        content: 'Error: task 是必填参数，需包含明确的目标、文件路径和验收标准',
+        isError: true,
+      };
+    }
+    if (typeof args.requires_modification !== 'boolean') {
+      return {
+        toolCallId: toolCall.id,
+        content: 'Error: requires_modification 是必填布尔参数（true/false）',
         isError: true,
       };
     }
 
-    const validWorkers = this.getWorkerEnum();
-    if (!validWorkers.includes(args.worker)) {
+    const category = args.category.trim();
+
+    // 验证 category 在已知枚举内
+    const validCategories = this.getCategoryEnum();
+    if (validCategories.length > 0 && !validCategories.includes(category)) {
       return {
         toolCallId: toolCall.id,
-        content: `Error: invalid worker "${args.worker}". Must be one of: ${validWorkers.join(', ')}`,
+        content: `Error: 未知分类 "${category}"。可选值: ${validCategories.join(', ')}`,
         isError: true,
       };
     }
 
     logger.info('dispatch_task 开始', {
-      worker: args.worker,
+      category,
+      requiresModification: args.requires_modification,
       taskPreview: args.task.substring(0, 80),
       files: args.files,
       dependsOn: args.depends_on,
@@ -239,7 +320,9 @@ export class OrchestrationExecutor {
 
     try {
       const result = await this.dispatchHandler({
-        worker: args.worker as WorkerSlot,
+        worker: 'auto',
+        category,
+        requiresModification: args.requires_modification,
         task: args.task,
         files: args.files,
         dependsOn: args.depends_on,

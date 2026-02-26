@@ -33,9 +33,6 @@ export interface AdapterOutputScope {
   /** 适配器角色 */
   adapterRole?: 'orchestrator' | 'worker';
 
-  /** 附加元数据，会传递到消息中 */
-  messageMeta?: Record<string, any>;
-
   /**
    * 决策点回调（工具调用前/后/思考阶段）
    * 返回需要注入的补充指令列表
@@ -64,6 +61,9 @@ export interface AdapterResponse {
   tokenUsage?: {
     inputTokens: number;
     outputTokens: number;
+    estimated?: boolean;
+    estimatedInputTokens?: number;
+    estimatedOutputTokens?: number;
   };
 }
 

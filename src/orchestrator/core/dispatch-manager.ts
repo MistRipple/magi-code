@@ -16,19 +16,48 @@ import type { WorkerSlot } from '../../types';
 import type { TokenUsage } from '../../types/agent-types';
 import type { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import type { ProfileLoader } from '../profile/profile-loader';
+import { CategoryResolver } from '../profile/category-resolver';
+import { LLMConfigLoader } from '../../llm/config';
 import type { MessageHub } from './message-hub';
 import type { MissionOrchestrator } from './mission-orchestrator';
 import type { Assignment } from '../mission';
 import type { WorkerReport, OrchestratorResponse } from '../protocols/worker-report';
 import { createAdjustResponse } from '../protocols/worker-report';
 import { DispatchBatch, CancellationError, type DispatchEntry, type DispatchResult, type DispatchStatus } from './dispatch-batch';
-import type { WorkerCompletionResult, WaitForWorkersResult } from '../../tools/orchestration-executor';
+import type { WaitForWorkersResult } from '../../tools/orchestration-executor';
 import { buildDispatchSummaryPrompt } from '../prompts/orchestrator-prompts';
 import { MessageType } from '../../protocol/message-protocol';
 import { PlanningExecutor } from './executors/planning-executor';
 import { WorkerPipeline } from './worker-pipeline';
 import type { SnapshotManager } from '../../snapshot-manager';
 import type { SupplementaryInstructionQueue } from './supplementary-instruction-queue';
+import { DispatchCompletionQueue } from './dispatch-completion-queue';
+
+interface ResumeExecutionContext {
+  sessionId: string;
+  sourceMissionId: string;
+  resumePrompt?: string;
+  workerSessionBySlot: Map<WorkerSlot, string>;
+  createdAt: number;
+}
+
+interface DispatchRoutingDecision {
+  selectedWorker: WorkerSlot;
+  category: string;
+  categorySource: 'explicit_param' | 'task_hint' | 'inferred';
+  degraded: boolean;
+  routingReason: string;
+}
+
+interface WorkerAvailabilitySnapshot {
+  availableWorkers: Set<WorkerSlot>;
+  unavailableReasons: Map<WorkerSlot, string>;
+}
+
+interface DispatchCategoryResolution {
+  category: string;
+  source: 'explicit_param' | 'task_hint' | 'inferred';
+}
 
 /**
  * DispatchManager 依赖接口
@@ -43,7 +72,7 @@ export interface DispatchManagerDeps {
   getActiveUserPrompt: () => string;
   getActiveImagePaths: () => string[] | undefined;
   getCurrentSessionId: () => string | undefined;
-  getLastMissionId: () => string | undefined;
+  ensureMissionForDispatch: () => Promise<string>;
   getProjectKnowledgeBase: () => import('../../knowledge/project-knowledge-base').ProjectKnowledgeBase | undefined;
   // 治理依赖（WorkerPipeline 使用）
   getSnapshotManager: () => SnapshotManager | null;
@@ -60,21 +89,39 @@ export interface DispatchManagerDeps {
  * DispatchManager - L3 统一调度管理器
  */
 export class DispatchManager {
+  private static readonly WORKER_SLOTS: WorkerSlot[] = ['claude', 'codex', 'gemini'];
+  private static readonly WORKER_FALLBACK_PRIORITY: Record<WorkerSlot, WorkerSlot[]> = {
+    claude: ['codex', 'gemini'],
+    codex: ['claude', 'gemini'],
+    gemini: ['claude', 'codex'],
+  };
+  private static readonly RUNTIME_UNAVAILABLE_COOLDOWN_MS = 60_000;
+
   // Phase B+ 中间调用频率限制：同一 batch 内最小间隔 30 秒
   private lastPhaseBPlusTimestamp = 0;
   private static readonly PHASE_B_PLUS_MIN_INTERVAL = 30_000;
 
   private pipeline = new WorkerPipeline();
+  private categoryResolver = new CategoryResolver();
   private activeBatch: DispatchBatch | null = null;
   private _planningExecutor: PlanningExecutor | null = null;
 
   // 反应式编排：Worker 完成结果队列 + 等待唤醒机制
-  private completionQueue: WorkerCompletionResult[] = [];
-  private completionResolvers: Array<() => void> = [];
+  private completionQueue = new DispatchCompletionQueue();
   /** 标记编排者是否调用了 wait_for_workers（决定是否跳过自动 Phase C） */
   private reactiveMode = false;
   /** 反应式 Batch 是否仍等待主对话区最终汇总 */
   private reactiveBatchAwaitingSummary = new Set<string>();
+  /** 记录每个 Mission 的 Worker Session（用于后续断点续跑） */
+  private missionWorkerSessions = new Map<string, Map<WorkerSlot, string>>();
+  /** 当前会话的待恢复上下文（只在下一轮执行中生效） */
+  private activeResumeContexts = new Map<string, ResumeExecutionContext>();
+  /** 记录 dispatch task 的分类（用于可解释性与后续诊断） */
+  private dispatchTaskCategories = new Map<string, string>();
+  /** Worker 运行时暂时不可用状态（短期冷却） */
+  private runtimeUnavailableWorkers = new Map<WorkerSlot, { until: number; reason: string }>();
+  private static readonly MAX_MISSION_SESSION_RECORDS = 100;
+  private static readonly CATEGORY_HINT_REGEX = /^\s*category\s*:\s*([a-zA-Z][a-zA-Z0-9_\-\s]*)\s*$/im;
 
   constructor(private deps: DispatchManagerDeps) {
     this.setupMissionEventListeners();
@@ -147,6 +194,400 @@ export class DispatchManager {
   }
 
   /**
+   * 获取当前可路由 Worker 快照（供系统提示词和 UI 统一展示）
+   */
+  getWorkerAvailability(): { availableWorkers: WorkerSlot[]; unavailableReasons: Record<string, string> } {
+    const snapshot = this.getWorkerAvailabilitySnapshot();
+    return {
+      availableWorkers: Array.from(snapshot.availableWorkers),
+      unavailableReasons: Object.fromEntries(snapshot.unavailableReasons.entries()),
+    };
+  }
+
+  /**
+   * 新一轮执行前重置调度状态
+   *
+   * 目的：彻底切断上一轮归档 batch、完成队列与反应式标记，
+   * 避免“无 dispatch 的新一轮”被误判为存在历史 dispatch。
+   */
+  resetForNewExecutionCycle(): void {
+    if (this.activeBatch?.status === 'active') {
+      this.activeBatch.cancelAll('开始新一轮执行，清理上一轮残留任务');
+    }
+
+    if (this.activeBatch) {
+      this.reactiveBatchAwaitingSummary.delete(this.activeBatch.id);
+      this.clearBatchTaskCategories(this.activeBatch);
+    }
+
+    this.activeBatch = null;
+    this.reactiveMode = false;
+    this.completionQueue.reset();
+    this.clearResumeContext();
+  }
+
+  private normalizeCategoryName(raw: string): string {
+    return raw.trim().toLowerCase().replace(/[\s-]+/g, '_');
+  }
+
+  private getKnownCategoryNames(): string[] {
+    return Array.from(this.deps.profileLoader.getAllCategories().keys()).sort();
+  }
+
+  private assertCategoryExists(category: string): { ok: true } | { ok: false; error: string } {
+    if (this.deps.profileLoader.getCategory(category)) {
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      error: `未知任务分类 "${category}"。可选分类: ${this.getKnownCategoryNames().join(', ')}`,
+    };
+  }
+
+  private extractCategoryHintFromTask(task: string): string | undefined {
+    const match = task.match(DispatchManager.CATEGORY_HINT_REGEX);
+    if (!match?.[1]) {
+      return undefined;
+    }
+    return this.normalizeCategoryName(match[1]);
+  }
+
+  private resolveDispatchCategory(task: string): string {
+    const text = task.trim().toLowerCase();
+    if (!text) {
+      return 'general';
+    }
+    return this.categoryResolver.resolveFromText(text);
+  }
+
+  private resolveDispatchCategoryWithSource(
+    task: string,
+    explicitCategory?: string,
+  ): { ok: true; value: DispatchCategoryResolution } | { ok: false; error: string } {
+    const explicit = explicitCategory?.trim();
+    if (explicit) {
+      const normalized = this.normalizeCategoryName(explicit);
+      const check = this.assertCategoryExists(normalized);
+      if (!check.ok) {
+        return { ok: false, error: check.error };
+      }
+      return {
+        ok: true,
+        value: {
+          category: normalized,
+          source: 'explicit_param',
+        },
+      };
+    }
+
+    const taskHint = this.extractCategoryHintFromTask(task);
+    if (taskHint) {
+      const check = this.assertCategoryExists(taskHint);
+      if (!check.ok) {
+        return { ok: false, error: check.error };
+      }
+      return {
+        ok: true,
+        value: {
+          category: taskHint,
+          source: 'task_hint',
+        },
+      };
+    }
+
+    // 兜底：关键词推断（category 已设为必填，此路径仅在极端情况下触发）
+    logger.warn('dispatch_task 未收到 category 参数，降级为关键词推断', {
+      taskPreview: task.substring(0, 80),
+    }, LogCategory.ORCHESTRATOR);
+
+    const inferred = this.resolveDispatchCategory(task);
+    const check = this.assertCategoryExists(inferred);
+    if (!check.ok) {
+      return { ok: false, error: check.error };
+    }
+
+    return {
+      ok: true,
+      value: {
+        category: inferred,
+        source: 'inferred',
+      },
+    };
+  }
+
+  private getRuntimeUnavailableReason(worker: WorkerSlot): string | null {
+    const status = this.runtimeUnavailableWorkers.get(worker);
+    if (!status) {
+      return null;
+    }
+    const now = Date.now();
+    if (now >= status.until) {
+      this.runtimeUnavailableWorkers.delete(worker);
+      return null;
+    }
+    const remainSeconds = Math.ceil((status.until - now) / 1000);
+    return `${status.reason}（冷却 ${remainSeconds}s）`;
+  }
+
+  private markWorkerRuntimeUnavailable(worker: WorkerSlot, reason: string): void {
+    this.runtimeUnavailableWorkers.set(worker, {
+      until: Date.now() + DispatchManager.RUNTIME_UNAVAILABLE_COOLDOWN_MS,
+      reason,
+    });
+  }
+
+  private clearWorkerRuntimeUnavailable(worker: WorkerSlot): void {
+    this.runtimeUnavailableWorkers.delete(worker);
+  }
+
+  /**
+   * 是否应将 Worker 标记为“运行时不可用”
+   *
+   * 只对“基础设施/连通性”错误做短期冷却：
+   * - 鉴权/配额/限流
+   * - 网络/连接/超时
+   * - 模型端服务不可用
+   *
+   * 业务任务失败（如代码错误、断言失败）不应触发 Worker 不可用。
+   */
+  private shouldMarkRuntimeUnavailable(errorMessage: string): boolean {
+    const normalized = (errorMessage || '').toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+
+    const infraErrorPattern =
+      /unauthorized|forbidden|invalid api key|api key|auth|permission|quota|billing|payment|rate limit|limit|insufficient|suspended|disabled|timeout|timed out|network|connection|fetch failed|socket|econnreset|econnrefused|enotfound|eai_again|tls|certificate|overloaded|service unavailable|502|503|504/;
+
+    return infraErrorPattern.test(normalized);
+  }
+
+  private getWorkerAvailabilitySnapshot(): WorkerAvailabilitySnapshot {
+    const availableWorkers = new Set<WorkerSlot>();
+    const unavailableReasons = new Map<WorkerSlot, string>();
+    const enabledProfiles = this.deps.profileLoader.getEnabledProfiles();
+    const fullConfig = LLMConfigLoader.loadFullConfig();
+
+    for (const worker of DispatchManager.WORKER_SLOTS) {
+      const workerConfig = fullConfig.workers[worker];
+      if (!enabledProfiles.has(worker)) {
+        unavailableReasons.set(worker, '未启用');
+        continue;
+      }
+      if (!workerConfig) {
+        unavailableReasons.set(worker, '缺少模型配置');
+        continue;
+      }
+      if (!workerConfig.apiKey?.trim()) {
+        unavailableReasons.set(worker, 'API Key 未配置');
+        continue;
+      }
+      if (!workerConfig.baseUrl?.trim()) {
+        unavailableReasons.set(worker, 'Base URL 未配置');
+        continue;
+      }
+      if (!workerConfig.model?.trim()) {
+        unavailableReasons.set(worker, '模型未配置');
+        continue;
+      }
+      if (workerConfig.provider !== 'openai' && workerConfig.provider !== 'anthropic') {
+        unavailableReasons.set(worker, `Provider 无效: ${workerConfig.provider}`);
+        continue;
+      }
+      const runtimeReason = this.getRuntimeUnavailableReason(worker);
+      if (runtimeReason) {
+        unavailableReasons.set(worker, runtimeReason);
+        continue;
+      }
+      availableWorkers.add(worker);
+    }
+
+    return { availableWorkers, unavailableReasons };
+  }
+
+  private pickFallbackWorker(
+    preferredWorker: WorkerSlot,
+    availableWorkers: Set<WorkerSlot>,
+  ): WorkerSlot | undefined {
+    return DispatchManager.WORKER_FALLBACK_PRIORITY[preferredWorker]
+      .find(worker => availableWorkers.has(worker));
+  }
+
+  private resolveDispatchRouting(
+    task: string,
+    explicitCategory?: string,
+  ): { ok: true; decision: DispatchRoutingDecision } | { ok: false; error: string } {
+    try {
+      // 每次 dispatch 前刷新分工配置，确保外部改动立即生效
+      this.deps.profileLoader.getAssignmentLoader().reload();
+    } catch (error: any) {
+      return {
+        ok: false,
+        error: `读取分工配置失败: ${error?.message || String(error)}`,
+      };
+    }
+    const categoryResolution = this.resolveDispatchCategoryWithSource(task, explicitCategory);
+    if (!categoryResolution.ok) {
+      return {
+        ok: false,
+        error: categoryResolution.error,
+      };
+    }
+    const { category, source } = categoryResolution.value;
+    let ownerWorker: WorkerSlot;
+    try {
+      ownerWorker = this.deps.profileLoader.getWorkerForCategory(category);
+    } catch (error: any) {
+      return {
+        ok: false,
+        error: `任务分类 ${category} 未找到有效归属 Worker: ${error?.message || String(error)}`,
+      };
+    }
+    const availability = this.getWorkerAvailabilitySnapshot();
+
+    if (availability.availableWorkers.has(ownerWorker)) {
+      return {
+        ok: true,
+        decision: {
+          selectedWorker: ownerWorker,
+          category,
+          categorySource: source,
+          degraded: false,
+          routingReason: `自动路由命中分类 ${category}，归属 Worker ${ownerWorker}`,
+        },
+      };
+    }
+
+    const ownerUnavailableReason = availability.unavailableReasons.get(ownerWorker) || '当前不可用';
+    const fallbackWorker = this.pickFallbackWorker(ownerWorker, availability.availableWorkers);
+    if (!fallbackWorker) {
+      const reasonText = DispatchManager.WORKER_SLOTS
+        .map(worker => `${worker}:${availability.unavailableReasons.get(worker) || '不可用'}`)
+        .join('；');
+      return {
+        ok: false,
+        error: `分类 ${category} 的归属 Worker ${ownerWorker} 不可用（${ownerUnavailableReason}），且无可用降级 Worker。当前状态：${reasonText}`,
+      };
+    }
+
+    return {
+      ok: true,
+      decision: {
+        selectedWorker: fallbackWorker,
+        category,
+        categorySource: source,
+        degraded: true,
+        routingReason: `分类 ${category} 归属 ${ownerWorker}，但其不可用（${ownerUnavailableReason}），已降级到 ${fallbackWorker}`,
+      },
+    };
+  }
+
+  private resolveExecutionWorker(
+    preferredWorker: WorkerSlot,
+  ): { ok: true; selectedWorker: WorkerSlot; degraded: boolean; routingReason: string } | { ok: false; error: string } {
+    const availability = this.getWorkerAvailabilitySnapshot();
+    if (availability.availableWorkers.has(preferredWorker)) {
+      return {
+        ok: true,
+        selectedWorker: preferredWorker,
+        degraded: false,
+        routingReason: `执行前校验通过，继续由 ${preferredWorker} 执行`,
+      };
+    }
+
+    const preferredUnavailableReason = availability.unavailableReasons.get(preferredWorker) || '当前不可用';
+    const fallbackWorker = DispatchManager.WORKER_FALLBACK_PRIORITY[preferredWorker]
+      .find(worker => availability.availableWorkers.has(worker));
+    if (!fallbackWorker) {
+      return {
+        ok: false,
+        error: `任务目标 Worker ${preferredWorker} 不可用（${preferredUnavailableReason}），且无可用降级 Worker`,
+      };
+    }
+
+    return {
+      ok: true,
+      selectedWorker: fallbackWorker,
+      degraded: true,
+      routingReason: `目标 Worker ${preferredWorker} 不可用（${preferredUnavailableReason}），执行时降级到 ${fallbackWorker}`,
+    };
+  }
+
+  activateResumeContext(sourceMissionId: string, resumePrompt?: string): boolean {
+    const currentSessionId = this.deps.getCurrentSessionId();
+    if (!currentSessionId) {
+      return false;
+    }
+    const workerSessions = this.missionWorkerSessions.get(sourceMissionId);
+    if (!workerSessions || workerSessions.size === 0) {
+      return false;
+    }
+
+    this.activeResumeContexts.set(currentSessionId, {
+      sessionId: currentSessionId,
+      sourceMissionId,
+      resumePrompt,
+      workerSessionBySlot: new Map(workerSessions),
+      createdAt: Date.now(),
+    });
+
+    logger.info('Dispatch.ResumeContext.已激活', {
+      sessionId: currentSessionId,
+      sourceMissionId,
+      workers: Array.from(workerSessions.keys()),
+    }, LogCategory.ORCHESTRATOR);
+
+    return true;
+  }
+
+  clearResumeContext(): void {
+    const currentSessionId = this.deps.getCurrentSessionId();
+    if (!currentSessionId) {
+      return;
+    }
+    this.activeResumeContexts.delete(currentSessionId);
+  }
+
+  private getResumeContextForWorker(worker: WorkerSlot): { resumeSessionId?: string; resumePrompt?: string } {
+    const currentSessionId = this.deps.getCurrentSessionId();
+    if (!currentSessionId) {
+      return {};
+    }
+    const context = this.activeResumeContexts.get(currentSessionId);
+    if (!context) {
+      return {};
+    }
+    const resumeSessionId = context.workerSessionBySlot.get(worker);
+    if (!resumeSessionId) {
+      return {};
+    }
+    return {
+      resumeSessionId,
+      resumePrompt: context.resumePrompt,
+    };
+  }
+
+  private recordMissionWorkerSession(
+    missionId: string,
+    worker: WorkerSlot,
+    workerSessionId: string,
+  ): void {
+    if (!missionId || !workerSessionId) {
+      return;
+    }
+    const existing = this.missionWorkerSessions.get(missionId) || new Map<WorkerSlot, string>();
+    existing.set(worker, workerSessionId);
+    this.missionWorkerSessions.set(missionId, existing);
+
+    if (this.missionWorkerSessions.size > DispatchManager.MAX_MISSION_SESSION_RECORDS) {
+      const oldestMissionId = this.missionWorkerSessions.keys().next().value as string | undefined;
+      if (oldestMissionId) {
+        this.missionWorkerSessions.delete(oldestMissionId);
+      }
+    }
+  }
+
+  /**
    * 注入编排工具（dispatch_task / send_worker_message）的回调处理器
    */
   setupOrchestrationToolHandlers(): void {
@@ -163,15 +604,76 @@ export class DispatchManager {
       }))
     );
 
+    // 注入 Category → Worker 映射到工具定义，
+    // 使 dispatch_task 的 category 参数拥有精确的 enum 枚举和分工描述
+    const categoryMap = this.deps.profileLoader.getAssignmentLoader().getCategoryMap();
+    const allCategories = this.deps.profileLoader.getAllCategories();
+    orchestrationExecutor.setCategoryWorkerMap(
+      Object.entries(categoryMap).map(([category, worker]) => ({
+        category,
+        displayName: allCategories.get(category)?.displayName || category,
+        worker,
+      }))
+    );
+
+    // Worker 可用列表变化后立即失效工具缓存，确保 schema 与运行时一致
+    toolManager.refreshToolSchemas();
+
     orchestrationExecutor.setHandlers({
       dispatch: async (params) => {
-        const { worker, task, files, dependsOn } = params;
+        const { task, files, dependsOn, category, requiresModification } = params;
+        if (typeof requiresModification !== 'boolean') {
+          return {
+            task_id: '',
+            status: 'failed' as const,
+            error: 'requires_modification 必须为布尔值',
+          };
+        }
         logger.info('编排工具.dispatch_task.开始', {
-          worker, taskPreview: task.substring(0, 80), dependsOn,
+          category,
+          requiresModification,
+          taskPreview: task.substring(0, 80),
+          dependsOn,
         }, LogCategory.ORCHESTRATOR);
 
+        const routingResult = this.resolveDispatchRouting(task, category);
+        if (!routingResult.ok) {
+          return {
+            task_id: '',
+            status: 'failed' as const,
+            error: routingResult.error,
+          };
+        }
+        const { decision } = routingResult;
+        logger.info('编排工具.dispatch_task.路由决策', {
+          selectedWorker: decision.selectedWorker,
+          category: decision.category,
+          categorySource: decision.categorySource,
+          degraded: decision.degraded,
+          requiresModification,
+          reason: decision.routingReason,
+        }, LogCategory.ORCHESTRATOR);
+        if (decision.degraded) {
+          this.deps.messageHub.notify(
+            `任务改派：请求分类 ${decision.category}，实际执行 Worker 为 ${decision.selectedWorker}（${decision.routingReason}）`,
+            'warning'
+          );
+        }
+
+        let missionId: string;
+        try {
+          missionId = await this.deps.ensureMissionForDispatch();
+        } catch (error: any) {
+          return {
+            task_id: '',
+            status: 'failed' as const,
+            error: `创建任务失败: ${error?.message || String(error)}`,
+          };
+        }
+
         // 生成唯一 task_id
-        const taskId = `dispatch-${Date.now()}-${worker}-${Math.random().toString(36).substring(2, 5)}`;
+        const taskId = `dispatch-${Date.now()}-${decision.selectedWorker}-${Math.random().toString(36).substring(2, 5)}`;
+        this.dispatchTaskCategories.set(taskId, decision.category);
 
         // 确保 DispatchBatch 存在（一次 orchestrator LLM 调用共享一个 Batch）
         if (!this.activeBatch || this.activeBatch.status !== 'active') {
@@ -179,19 +681,24 @@ export class DispatchManager {
             this.reactiveBatchAwaitingSummary.delete(this.activeBatch.id);
           }
           // 使用 Mission ID 作为 Batch ID，确保 Todo 关联到正确的 Mission
-          const missionId = this.deps.getLastMissionId();
           this.activeBatch = new DispatchBatch(missionId);
           this.activeBatch.userPrompt = this.deps.getActiveUserPrompt();
           this.setupBatchEventHandlers(this.activeBatch);
           // 新 Batch 重置反应式编排状态
           this.reactiveMode = false;
-          this.completionQueue = [];
-          this.completionResolvers = [];
+          this.completionQueue.reset();
         }
 
         // 注册到 DispatchBatch
         try {
-          this.activeBatch.register({ taskId, worker, task, files, dependsOn });
+          this.activeBatch.register({
+            taskId,
+            worker: decision.selectedWorker,
+            task,
+            files,
+            requiresModification,
+            dependsOn,
+          });
 
           // C-12: 环检测 + 深度上限校验
           this.activeBatch.topologicalSort();
@@ -208,7 +715,16 @@ export class DispatchManager {
             this.activeBatch.validateDepthLimit();
           }
         } catch (regError: any) {
-          return { task_id: taskId, status: 'failed' as const, worker, error: regError.message };
+          this.dispatchTaskCategories.delete(taskId);
+          return {
+            task_id: taskId,
+            status: 'failed' as const,
+            worker: decision.selectedWorker,
+            category: decision.category,
+            routing_reason: decision.routingReason,
+            degraded: decision.degraded,
+            error: regError.message,
+          };
         }
 
         // 发送 subTaskCard（状态取决于注册后是否有依赖）
@@ -218,7 +734,7 @@ export class DispatchManager {
           id: taskId,
           title: task,
           status: hasDeps ? 'pending' : 'running',
-          worker: worker,
+          worker: decision.selectedWorker,
         });
 
         // 通过隔离策略决定是否立即启动（约束 5）
@@ -228,7 +744,14 @@ export class DispatchManager {
         // 有依赖的任务由 DispatchBatch 的 task:ready 事件触发
 
         // 立即返回 task_id（非阻塞）
-        return { task_id: taskId, status: 'dispatched' as const, worker };
+        return {
+          task_id: taskId,
+          status: 'dispatched' as const,
+          worker: decision.selectedWorker,
+          category: decision.category,
+          routing_reason: decision.routingReason,
+          degraded: decision.degraded,
+        };
       },
 
       sendMessage: async (params) => {
@@ -260,8 +783,49 @@ export class DispatchManager {
    * - governance = 'auto'（默认）：有 files 时自动启用 LSP/Snapshot/TargetEnforce
    * - governance = 'full'：强制启用所有治理步骤
    */
-  launchDispatchWorker(taskId: string, worker: WorkerSlot, task: string, files?: string[]): void {
+  launchDispatchWorker(
+    taskId: string,
+    worker: WorkerSlot,
+    task: string,
+    files?: string[],
+    requiresModification: boolean = true,
+  ): void {
     const batch = this.activeBatch;
+    const category = this.dispatchTaskCategories.get(taskId) || this.resolveDispatchCategory(task);
+    const executionRouting = this.resolveExecutionWorker(worker);
+    if (!executionRouting.ok) {
+      const errorMsg = executionRouting.error;
+      this.deps.messageHub.subTaskCard({
+        id: taskId,
+        title: task,
+        status: 'failed',
+        worker,
+        summary: errorMsg,
+        error: errorMsg,
+      });
+      batch?.markFailed(taskId, { success: false, summary: errorMsg, errors: [errorMsg] });
+      return;
+    }
+
+    const effectiveWorker = executionRouting.selectedWorker;
+    if (effectiveWorker !== worker) {
+      const entry = batch?.getEntry(taskId);
+      if (entry) {
+        entry.worker = effectiveWorker;
+      }
+      this.deps.messageHub.notify(
+        `任务 ${taskId} 执行前改派：${worker} -> ${effectiveWorker}（${executionRouting.routingReason}）`,
+        'warning',
+      );
+      logger.warn('Dispatch.Worker.执行前改派', {
+        taskId,
+        from: worker,
+        to: effectiveWorker,
+        reason: executionRouting.routingReason,
+      }, LogCategory.ORCHESTRATOR);
+    }
+
+    const { resumeSessionId, resumePrompt } = this.getResumeContextForWorker(effectiveWorker);
 
     // 标记开始运行
     batch?.markRunning(taskId);
@@ -269,39 +833,39 @@ export class DispatchManager {
       id: taskId,
       title: task,
       status: 'running',
-      worker,
+      worker: effectiveWorker,
     });
 
     // 发送任务指令到 Worker Tab，让用户看到 orchestrator 对 worker 的要求
-    this.deps.messageHub.workerInstruction(worker, task, {
+    this.deps.messageHub.workerInstruction(effectiveWorker, task, {
       assignmentId: taskId,
       missionId: batch?.id,
     });
 
     (async () => {
       // 确保 Worker 存在
-      const workerInstance = await this.deps.missionOrchestrator.ensureWorkerForDispatch(worker);
+      const workerInstance = await this.deps.missionOrchestrator.ensureWorkerForDispatch(effectiveWorker);
 
       // 构建轻量 Assignment
       const missionId = batch?.id || 'dispatch';
       const assignment: Assignment = {
         id: taskId,
         missionId,
-        workerId: worker,
+        workerId: effectiveWorker,
         shortTitle: task,
         responsibility: task,
         delegationBriefing: task,
         assignmentReason: {
-          profileMatch: { category: 'dispatch', score: 1, matchedKeywords: [] },
+          profileMatch: { category, score: 100, matchedKeywords: [] },
           contractRole: 'none' as const,
-          explanation: 'dispatch_task 工具直接分配',
+          explanation: executionRouting.routingReason,
           alternatives: [],
         },
         scope: {
           includes: [task],
           excludes: [],
           targetPaths: files || [],
-          requiresModification: true,
+          requiresModification,
         },
         guidancePrompt: '',
         producerContracts: [],
@@ -332,6 +896,7 @@ export class DispatchManager {
 
       // 计算治理开关（governance = 'auto'）
       const hasFiles = (files && files.length > 0) || false;
+      const enableWriteGovernance = hasFiles && requiresModification;
       const snapshotManager = this.deps.getSnapshotManager();
       const contextManager = this.deps.getContextManager();
 
@@ -349,12 +914,14 @@ export class DispatchManager {
         // 反应式编排：补充指令回调（Worker 决策点消费队列中的用户追加指令）
         getSupplementaryInstructions: () => {
           const queue = this.deps.getSupplementaryQueue();
-          return queue ? queue.consume(worker) : [];
+          return queue ? queue.consume(effectiveWorker) : [];
         },
-        // 治理开关（auto 模式：有 files 时自动启用）
-        enableSnapshot: hasFiles && snapshotManager != null,
-        enableLSP: hasFiles,
-        enableTargetEnforce: hasFiles,
+        resumeSessionId,
+        resumePrompt,
+        // 治理开关（仅写任务启用强制写入相关治理）
+        enableSnapshot: enableWriteGovernance && snapshotManager != null,
+        enableLSP: enableWriteGovernance,
+        enableTargetEnforce: enableWriteGovernance,
         enableContextUpdate: contextManager != null,
         snapshotManager,
         contextManager,
@@ -362,6 +929,10 @@ export class DispatchManager {
       });
 
       const result = pipelineResult.executionResult;
+      if (result.sessionId) {
+        this.recordMissionWorkerSession(missionId, effectiveWorker, result.sessionId);
+      }
+      this.clearWorkerRuntimeUnavailable(effectiveWorker);
 
       // 直接使用 Worker 生成的结构化总结（唯一生产者：AutonomousWorker.buildStructuredSummary）
       const summary = result.summary;
@@ -375,7 +946,7 @@ export class DispatchManager {
         id: taskId,
         title: task,
         status: result.success ? 'completed' : 'failed',
-        worker,
+        worker: effectiveWorker,
         summary,
         modifiedFiles,
         ...(!result.success && { error: result.errors?.[0] || summary }),
@@ -387,6 +958,8 @@ export class DispatchManager {
         tokenUsage: result.tokenUsage ? {
           inputTokens: result.tokenUsage.inputTokens || 0,
           outputTokens: result.tokenUsage.outputTokens || 0,
+          estimatedInputTokens: result.tokenUsage.estimatedInputTokens,
+          estimatedOutputTokens: result.tokenUsage.estimatedOutputTokens,
         } : undefined,
       };
       if (result.success) {
@@ -401,7 +974,7 @@ export class DispatchManager {
       this.deps.recordWorkerTokenUsage(singleResult);
 
       logger.info('编排工具.dispatch_task.Worker完成', {
-        worker, taskId, success: result.success, summary,
+        worker: effectiveWorker, taskId, success: result.success, summary,
       }, LogCategory.ORCHESTRATOR);
     })().catch(async (error: any) => {
       // C-09: 取消异常不按失败处理，cancelAll 已标记 cancelled 状态
@@ -410,28 +983,42 @@ export class DispatchManager {
           id: taskId,
           title: task,
           status: 'stopped',
-          worker,
+          worker: effectiveWorker,
           summary: error.message,
         });
         logger.info('编排工具.dispatch_task.Worker取消', {
-          worker, taskId, reason: error.message,
+          worker: effectiveWorker, taskId, reason: error.message,
         }, LogCategory.ORCHESTRATOR);
         return;
       }
 
       const errorMsg = error?.message || String(error);
+      if (this.shouldMarkRuntimeUnavailable(errorMsg)) {
+        this.markWorkerRuntimeUnavailable(effectiveWorker, errorMsg);
+        logger.warn('Dispatch.Worker.运行时不可用.已标记冷却', {
+          worker: effectiveWorker,
+          taskId,
+          reason: errorMsg,
+        }, LogCategory.ORCHESTRATOR);
+      } else {
+        logger.warn('Dispatch.Worker.业务失败.不标记冷却', {
+          worker: effectiveWorker,
+          taskId,
+          reason: errorMsg,
+        }, LogCategory.ORCHESTRATOR);
+      }
 
       this.deps.messageHub.subTaskCard({
         id: taskId,
         title: task,
         status: 'failed',
-        worker,
+        worker: effectiveWorker,
         summary: errorMsg,
         error: errorMsg,
       });
 
       this.deps.messageHub.workerError(
-        worker,
+        effectiveWorker,
         `任务执行失败: ${errorMsg}`,
       );
 
@@ -439,12 +1026,12 @@ export class DispatchManager {
 
       // C-15: Worker 崩溃后状态清理
       try {
-        const workerInstance = this.deps.missionOrchestrator.getWorker(worker);
+        const workerInstance = this.deps.missionOrchestrator.getWorker(effectiveWorker);
         workerInstance?.clearAllSessions();
       } catch { /* 清理失败不阻塞 */ }
 
       logger.error('编排工具.dispatch_task.Worker失败', {
-        worker, taskId, error: errorMsg,
+        worker: effectiveWorker, taskId, error: errorMsg,
       }, LogCategory.ORCHESTRATOR);
     });
   }
@@ -466,7 +1053,7 @@ export class DispatchManager {
         // 反应式编排：将完成结果推入队列，唤醒 waitForWorkers
         const entry = batch.getEntry(_taskId);
         if (entry) {
-          this.pushCompletionResult(entry);
+          this.completionQueue.push(entry);
         }
       }
     });
@@ -491,8 +1078,16 @@ export class DispatchManager {
     // Batch 被取消 → 不触发 Phase C，直接通知用户
     batch.on('batch:cancelled', (batchId: string, reason: string) => {
       this.reactiveBatchAwaitingSummary.delete(batchId);
+      this.clearBatchTaskCategories(batch);
       logger.info('DispatchBatch.已取消', { batchId, reason }, LogCategory.ORCHESTRATOR);
       this.deps.messageHub.orchestratorMessage(`任务已取消: ${reason}`);
+    });
+
+    batch.on('phase:changed', (_batchId: string, phase) => {
+      if (phase === 'archived') {
+        this.clearBatchTaskCategories(batch);
+        this.clearResumeContext();
+      }
     });
   }
 
@@ -507,7 +1102,13 @@ export class DispatchManager {
       logger.info('DispatchBatch.隔离调度.启动', {
         taskId: entry.taskId, worker: entry.worker,
       }, LogCategory.ORCHESTRATOR);
-      this.launchDispatchWorker(entry.taskId, entry.worker, entry.task, entry.files);
+      this.launchDispatchWorker(
+        entry.taskId,
+        entry.worker,
+        entry.task,
+        entry.files,
+        entry.requiresModification,
+      );
     }
   }
 
@@ -537,7 +1138,6 @@ export class DispatchManager {
             source: 'orchestrator',
             adapterRole: 'orchestrator',
             visibility: 'system',
-            messageMeta: { intent: 'phase_c_summary', batchId: batch.id },
           }
         ),
         new Promise<never>((_, reject) =>
@@ -694,7 +1294,6 @@ ${this.deps.getActiveUserPrompt()}
             adapterRole: 'orchestrator',
             includeToolCalls: true,
             visibility: 'system',
-            messageMeta: { intent: 'phase_b_plus', batchId: batch?.id },
           }
         );
 
@@ -720,28 +1319,6 @@ ${this.deps.getActiveUserPrompt()}
   // ===========================================================================
 
   /**
-   * 将 Worker 完成结果推入队列，唤醒所有等待中的 waitForWorkers
-   */
-  private pushCompletionResult(entry: DispatchEntry): void {
-    const result: WorkerCompletionResult = {
-      task_id: entry.taskId,
-      worker: entry.worker,
-      status: entry.status as WorkerCompletionResult['status'],
-      summary: entry.result?.summary || '',
-      modified_files: entry.result?.modifiedFiles || [],
-      errors: entry.result?.errors,
-    };
-
-    this.completionQueue.push(result);
-
-    // 唤醒所有等待中的 resolver
-    const resolvers = this.completionResolvers.splice(0);
-    for (const resolve of resolvers) {
-      resolve();
-    }
-  }
-
-  /**
    * 等待 Worker 完成（阻塞直到指定任务或全部任务完成）
    *
    * 反应式编排的核心阻塞点：编排者 LLM 在工具循环中调用此方法，
@@ -749,8 +1326,6 @@ ${this.deps.getActiveUserPrompt()}
    */
   async waitForWorkers(taskIds?: string[]): Promise<WaitForWorkersResult> {
     this.reactiveMode = true;
-    const waitStartedAt = Date.now();
-
     const batch = this.activeBatch;
     if (!batch) {
       return {
@@ -762,149 +1337,33 @@ ${this.deps.getActiveUserPrompt()}
       };
     }
 
-    // 确定等待目标
-    const targetIds = taskIds && taskIds.length > 0
-      ? new Set(taskIds)
-      : null; // null 表示等待全部
-
-    // 轮询检查：目标任务是否都已完成
-    const isTargetSatisfied = (): boolean => {
-      if (!targetIds) {
-        // 等待全部：检查 batch 内是否还有 pending/running 任务
-        return batch.isAllCompleted();
-      }
-      // 等待指定任务：检查这些任务是否都已进入终态
-      return Array.from(targetIds).every(id => {
-        const entry = batch.getEntry(id);
-        return !!entry && this.isTerminalStatus(entry.status);
-      });
-    };
-
-    // 如果已满足，直接返回
-    if (isTargetSatisfied()) {
-      return {
-        results: this.drainCompletionResults(targetIds, batch),
-        wait_status: 'completed',
-        timed_out: false,
-        pending_task_ids: [],
-        waited_ms: Date.now() - waitStartedAt,
-      };
-    }
-
-    // 等待唤醒
-    const WAIT_TIMEOUT = 10 * 60 * 1000; // 10 分钟总超时
-    let timedOut = false;
-
-    while (!isTargetSatisfied()) {
-      const elapsed = Date.now() - waitStartedAt;
-      if (elapsed > WAIT_TIMEOUT) {
-        timedOut = true;
-        logger.warn('waitForWorkers.超时', {
-          elapsed,
-          targetIds: targetIds ? Array.from(targetIds) : 'all',
-        }, LogCategory.ORCHESTRATOR);
-        const pendingTaskIds = this.getPendingTargetTaskIds(batch, targetIds);
+    return this.completionQueue.waitFor(batch, taskIds, {
+      waitTimeoutMs: 10 * 60 * 1000,
+      wakeupTimeoutMs: 30_000,
+      onTimeout: (pendingTaskIds, elapsedMs) => {
         this.deps.messageHub.notify(
-          `wait_for_workers 超时（${Math.round(elapsed / 1000)}s），仍有 ${pendingTaskIds.length} 个任务未完成`,
+          `wait_for_workers 超时（${Math.round(elapsedMs / 1000)}s），仍有 ${pendingTaskIds.length} 个任务未完成`,
           'warning',
         );
-        break;
-      }
-
-      // 注册 resolver 并等待唤醒
-      await new Promise<void>(resolve => {
-        this.completionResolvers.push(resolve);
-        // 安全超时：防止 resolver 永远不被触发
-        setTimeout(resolve, 30_000);
-      });
-    }
-
-    const pendingTaskIds = this.getPendingTargetTaskIds(batch, targetIds);
-    return {
-      results: this.drainCompletionResults(targetIds, batch),
-      wait_status: timedOut ? 'timeout' : 'completed',
-      timed_out: timedOut,
-      pending_task_ids: pendingTaskIds,
-      waited_ms: Date.now() - waitStartedAt,
-    };
+      },
+    });
   }
 
-  /**
-   * 判断任务状态是否为终态
-   */
-  private isTerminalStatus(status: DispatchStatus): boolean {
-    return status === 'completed' || status === 'failed' || status === 'skipped' || status === 'cancelled';
-  }
-
-  /**
-   * 获取当前等待目标中仍未完成的 task_id 列表
-   */
-  private getPendingTargetTaskIds(batch: DispatchBatch, targetIds: Set<string> | null): string[] {
-    if (!targetIds) {
-      return batch.getEntries()
-        .filter(entry => !this.isTerminalStatus(entry.status))
-        .map(entry => entry.taskId);
+  private clearBatchTaskCategories(batch: DispatchBatch): void {
+    for (const entry of batch.getEntries()) {
+      this.dispatchTaskCategories.delete(entry.taskId);
     }
-
-    const pending: string[] = [];
-    for (const taskId of targetIds) {
-      const entry = batch.getEntry(taskId);
-      if (!entry || !this.isTerminalStatus(entry.status)) {
-        pending.push(taskId);
-      }
-    }
-    return pending;
-  }
-
-  /**
-   * 从完成队列中提取匹配的结果
-   */
-  private drainCompletionResults(targetIds: Set<string> | null, batch?: DispatchBatch): WorkerCompletionResult[] {
-    if (!targetIds) {
-      // 全部提取
-      const results = this.completionQueue.splice(0);
-      return results;
-    }
-
-    // 提取指定 taskId 的结果，保留其余
-    const matched: WorkerCompletionResult[] = [];
-    const remaining: WorkerCompletionResult[] = [];
-    for (const result of this.completionQueue) {
-      if (targetIds.has(result.task_id)) {
-        matched.push(result);
-      } else {
-        remaining.push(result);
-      }
-    }
-
-    // 若结果已被此前 wait 调用消费，则从 Batch 终态回填，避免返回空结果
-    if (batch) {
-      const matchedIds = new Set(matched.map(item => item.task_id));
-      for (const taskId of targetIds) {
-        if (matchedIds.has(taskId)) continue;
-        const entry = batch.getEntry(taskId);
-        if (!entry || !this.isTerminalStatus(entry.status)) continue;
-        matched.push({
-          task_id: entry.taskId,
-          worker: entry.worker,
-          status: entry.status as WorkerCompletionResult['status'],
-          summary: entry.result?.summary || '',
-          modified_files: entry.result?.modifiedFiles || [],
-          errors: entry.result?.errors,
-        });
-      }
-    }
-
-    this.completionQueue = remaining;
-    return matched;
   }
 
   dispose(): void {
     this.activeBatch = null;
     this._planningExecutor = null;
-    this.completionQueue = [];
-    this.completionResolvers = [];
+    this.completionQueue.reset();
     this.reactiveMode = false;
     this.reactiveBatchAwaitingSummary.clear();
+    this.missionWorkerSessions.clear();
+    this.activeResumeContexts.clear();
+    this.dispatchTaskCategories.clear();
+    this.runtimeUnavailableWorkers.clear();
   }
 }

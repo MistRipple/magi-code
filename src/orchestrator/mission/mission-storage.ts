@@ -162,6 +162,7 @@ export class MissionStorageManager extends EventEmitter {
 
     if (oldMission && oldMission.status !== mission.status) {
       this.emit('missionStatusChanged', {
+        mission,
         missionId: mission.id,
         oldStatus: oldMission.status,
         newStatus: mission.status,
@@ -170,6 +171,7 @@ export class MissionStorageManager extends EventEmitter {
 
     if (oldMission && oldMission.phase !== mission.phase) {
       this.emit('missionPhaseChanged', {
+        mission,
         missionId: mission.id,
         oldPhase: oldMission.phase,
         newPhase: mission.phase,

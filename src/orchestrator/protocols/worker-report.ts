@@ -101,6 +101,9 @@ export interface WorkerResult {
   tokenUsage?: {
     inputTokens: number;
     outputTokens: number;
+    estimatedInputTokens?: number;
+    estimatedOutputTokens?: number;
+    estimated?: boolean;
   };
 
   /** 验证证据 - 提案 4.2 */
