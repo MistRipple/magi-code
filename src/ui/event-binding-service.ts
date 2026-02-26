@@ -30,7 +30,6 @@ import type { MissionDrivenEngine } from '../orchestrator/core';
 import type { MessageHub } from '../orchestrator/core/message-hub';
 import type { MissionOrchestrator } from '../orchestrator/core';
 import { normalizeTodos, generateEntityId } from '../orchestrator/mission/data-normalizer';
-import { isAbortError } from '../errors';
 
 // ============================================================================
 // 上下文接口 - EventBindingService 对 WVP 的依赖声明
@@ -97,6 +96,10 @@ export class EventBindingService {
 
     // Mission 生命周期
     mo.on('missionCreated', () => {
+      this.ctx.sendStateUpdate();
+    });
+
+    mo.on('missionDeleted', () => {
       this.ctx.sendStateUpdate();
     });
 
@@ -243,6 +246,19 @@ export class EventBindingService {
   // 工具授权（从 WVP 迁移的完整状态管理）
   // ============================================================================
 
+  requestToolAuthorization(toolName: string, toolArgs: unknown): Promise<boolean> {
+    const requestId = `tool-auth-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    return new Promise<boolean>((resolve) => {
+      this.toolAuthorizationCallbacks.set(requestId, resolve);
+      this.toolAuthorizationQueue.push({
+        requestId,
+        toolName,
+        toolArgs,
+      });
+      this.pumpToolAuthorizationQueue();
+    });
+  }
+
   handleToolAuthorizationResponse(requestId: string | undefined, allowed: boolean): void {
     if (!requestId) {
       logger.warn('界面.工具授权.响应缺少请求ID', undefined, LogCategory.UI);
@@ -342,25 +358,8 @@ export class EventBindingService {
     globalEventBus.on('task:state_changed', () => this.ctx.sendStateUpdate());
     globalEventBus.on('task:started', () => this.ctx.sendStateUpdate());
     globalEventBus.on('task:completed', () => this.ctx.sendStateUpdate());
-    globalEventBus.on('task:failed', (event) => {
+    globalEventBus.on('task:failed', () => {
       this.ctx.sendStateUpdate();
-      const data = event.data as { error?: string | object; stack?: string };
-      let errorMsg = '任务执行失败';
-      if (data?.error) {
-        if (typeof data.error === 'string') {
-          errorMsg = data.error;
-        } else if (typeof data.error === 'object') {
-          const errObj = data.error as { message?: string; error?: string };
-          errorMsg = errObj.message || errObj.error || JSON.stringify(data.error);
-        }
-      }
-      if (isAbortError(errorMsg)) return;
-      this.ctx.sendOrchestratorMessage({
-        content: errorMsg,
-        messageType: 'error',
-        taskId: event.taskId,
-        metadata: { error: errorMsg, stack: data?.stack },
-      });
     });
 
     globalEventBus.on('task:cancelled', () => {
@@ -438,23 +437,6 @@ export class EventBindingService {
         source: data?.worker ?? 'system',
         timestamp: Date.now(),
       });
-    });
-
-    // 工具授权请求
-    globalEventBus.on('tool:authorization_request', (event) => {
-      const data = event.data as {
-        toolName: string;
-        toolArgs: any;
-        callback: (allowed: boolean) => void;
-      };
-      const requestId = `tool-auth-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      this.toolAuthorizationCallbacks.set(requestId, data.callback);
-      this.toolAuthorizationQueue.push({
-        requestId,
-        toolName: data.toolName,
-        toolArgs: data.toolArgs,
-      });
-      this.pumpToolAuthorizationQueue();
     });
 
     // Mission 事件（延迟绑定）

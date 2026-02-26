@@ -243,7 +243,8 @@
     "watch:extension": "node esbuild.mjs --watch",
     "build:webview": "cd src/ui/webview-svelte && npm run build",
     "watch:webview": "cd src/ui/webview-svelte && npm run dev",
-    "lint": "eslint src --ext ts"
+    "lint": "eslint src --ext ts",
+    "verify:e2e:real-dispatch": "node scripts/e2e-real-dispatch-regression.cjs"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
@@ -264,7 +265,6 @@
     "marked": "^17.0.1",
     "morphdom": "^2.7.8",
     "openai": "^6.16.0",
-    "tiktoken": "^1.0.22",
     "uuid": "^13.0.0"
   }
 }

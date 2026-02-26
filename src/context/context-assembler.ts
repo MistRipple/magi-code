@@ -12,6 +12,7 @@
  */
 
 import { logger, LogCategory } from '../logging';
+import { estimateTokenCount } from '../utils/token-estimator';
 import { MemoryDocument } from './memory-document';
 import { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
 import { ContextSource, FileSummary } from './file-summary-cache';
@@ -94,6 +95,9 @@ export interface ContextAssemblyOptions {
     min: number;
     max: number;
   };
+
+  /** 排除当前轮用户输入，避免同轮重复注入 */
+  excludeCurrentUserPrompt?: string;
 }
 
 /**
@@ -189,6 +193,8 @@ interface LocalTurnsOptions {
   minTurns: number;
   maxTurns: number;
   prioritizeDecisionPoints: boolean;
+  /** 排除当前轮用户输入，避免同轮重复注入 */
+  excludeCurrentUserPrompt?: string;
 }
 
 // ============================================================================
@@ -289,6 +295,7 @@ export class ContextAssembler {
         minTurns: localTurnsConfig.min,
         maxTurns: localTurnsConfig.max,
         prioritizeDecisionPoints: true,
+        excludeCurrentUserPrompt: options.excludeCurrentUserPrompt,
       }
     );
     if (localPart) {
@@ -556,7 +563,7 @@ export class ContextAssembler {
    * @returns 估算的 Token 数量
    */
   estimateTokens(text: string): number {
-    return Math.ceil(text.length / 4);
+    return estimateTokenCount(text);
   }
 }
 
@@ -628,7 +635,7 @@ export class OverflowTrimmer {
         } else {
           // 按比例裁剪内容
           part.content = this.truncateContent(part.content, trimRatio);
-          const newTokens = Math.ceil(part.content.length / 4);
+          const newTokens = estimateTokenCount(part.content);
           const actualTrimmed = part.tokens - newTokens;
           part.tokens = newTokens;
           remaining -= actualTrimmed;
@@ -658,7 +665,7 @@ export class OverflowTrimmer {
             trimmedParts.splice(recentIndex, 1);
           } else {
             part.content = this.truncateContent(part.content, trimRatio);
-            part.tokens = Math.ceil(part.content.length / 4);
+            part.tokens = estimateTokenCount(part.content);
           }
         }
       }

@@ -30,6 +30,8 @@ export interface UnifiedPromptContext {
   relevantADRs?: string;
   /** 动态可用工具摘要（内置 + MCP + Skill，由 ToolManager 生成） */
   availableToolsSummary?: string;
+  /** 分类定义（displayName + description，用于构建分工映射表） */
+  categoryDefinitions?: Map<string, { displayName: string; description: string }>;
 }
 
 /**
@@ -40,7 +42,7 @@ export interface UnifiedPromptContext {
  * LLM 在此提示词下通过工具循环自主决策：直接回答 / 工具操作 / 分配 Worker。
  */
 export function buildUnifiedSystemPrompt(context: UnifiedPromptContext): string {
-  const { availableWorkers, workerProfiles, projectContext, sessionSummary, relevantADRs, availableToolsSummary } = context;
+  const { availableWorkers, workerProfiles, projectContext, sessionSummary, relevantADRs, availableToolsSummary, categoryDefinitions } = context;
 
   // Worker 能力描述表（从 ProfileLoader 动态获取）
   const workerTable = availableWorkers.map(w => {
@@ -51,11 +53,14 @@ export function buildUnifiedSystemPrompt(context: UnifiedPromptContext): string 
     return `| ${w} | ${profile.displayName} | ${profile.strengths.join('、')} |`;
   }).join('\n');
 
-  // Worker 分工映射（从 assignedCategories 动态生成）
-  const workerSpecialtyHints = (workerProfiles ?? [])
+  // 分工映射表：Category → Worker（从 workerProfiles 和 categoryDefinitions 动态生成）
+  const categoryMappingTable = (workerProfiles ?? [])
     .filter(p => p.assignedCategories.length > 0)
-    .map(p => `${p.assignedCategories.join('/')} → ${p.worker}`)
-    .join('，');
+    .flatMap(p => p.assignedCategories.map(cat => {
+      const def = categoryDefinitions?.get(cat);
+      return `| ${cat} | ${def?.displayName || cat} | ${def?.description || '-'} | ${p.worker} |`;
+    }))
+    .join('\n');
 
   const sections: string[] = [];
 
@@ -67,15 +72,29 @@ export function buildUnifiedSystemPrompt(context: UnifiedPromptContext): string 
 - 你可以直接回答问题、使用工具操作代码、或将复杂任务分配给专业 Worker
 - 你的回答应当简洁、专业、直接`);
 
-  // Worker 能力
-  sections.push(`## 可用 Worker
-当任务涉及多步代码操作或需要专业领域知识时，使用 dispatch_task 分配给 Worker：
+  // Worker 能力与分工映射
+  if (availableWorkers.length === 0) {
+    sections.push(`## 可用 Worker
+当前无可用 Worker。不要调用 dispatch_task 或 send_worker_message，请改为直接回答或使用本地工具完成任务。`);
+  } else {
+    sections.push(`## 可用 Worker
+当任务涉及多步代码操作或需要专业领域知识时，使用 dispatch_task 分配给 Worker。
 
+### Worker 概览
 | Worker | 模型 | 擅长领域 |
 |--------|------|----------|
 ${workerTable}
 
+### 分工映射表
+dispatch_task 通过 \`category\` 参数路由到对应 Worker，**必须**显式指定 category；
+同时 **必须**显式指定 \`requires_modification\`（读任务=false，写任务=true）：
+
+| category | 名称 | 说明 | 执行 Worker |
+|----------|------|------|-------------|
+${categoryMappingTable}
+
 对于超复杂的多 Worker 协作任务，拆分为多个 dispatch_task 分阶段执行。`);
+  }
 
   // 决策原则（三层执行模型）— 工具列表由 ToolManager.buildToolsSummary() 动态注入
   const toolsListSection = availableToolsSummary?.trim()
@@ -116,7 +135,7 @@ ${toolsListSection}
 
 **层级 3 - 分配 Worker**：使用 dispatch_task 委托
 - 涉及代码逻辑的复杂修改（新功能开发、重构、多文件联动）
-- 需要专业领域知识的任务${workerSpecialtyHints ? `（${workerSpecialtyHints}）` : ''}
+- 需要专业领域知识的任务（参考上方分工映射表选择正确的 category）
 - 大规模重构或新功能开发
 - 需要多个 Worker 协作时，拆分为多个 dispatch_task 分阶段执行
 
@@ -124,6 +143,11 @@ ${toolsListSection}
 
   // dispatch_task 使用指南
   sections.push(`## dispatch_task 使用指南
+- **category 是必填参数**：根据任务性质从分工映射表中选择最匹配的 category，系统据此自动路由到对应 Worker
+- **requires_modification 是必填参数**：
+  - 只读分析/统计/总结任务传 \`false\`
+  - 功能开发/修复/重构/生成代码任务传 \`true\`
+  - 必须与 task 语义一致，禁止矛盾
 - task 参数必须包含：
   1. 明确的目标（要做什么）
   2. 具体的文件路径或代码位置（在哪做）
@@ -163,14 +187,14 @@ ${toolsListSection}
 **示例**：
 \`\`\`
 // 阶段 1：并行分配两个独立任务
-dispatch_task({ worker: "claude", task: "实现用户认证模块...", files: [...] })  → task_id_1
-dispatch_task({ worker: "gemini", task: "实现数据库迁移...", files: [...] })   → task_id_2
+dispatch_task({ category: "backend", requires_modification: true, task: "实现用户认证模块...", files: [...] })  → task_id_1
+dispatch_task({ category: "data_analysis", requires_modification: false, task: "统计并分析数据库现状...", files: [...] })   → task_id_2
 
 // 等待阶段 1 完成
 wait_for_workers()  → 获取两个任务的结果
 
 // 分析结果后追加阶段 2
-dispatch_task({ worker: "claude", task: "集成认证模块和数据库...", files: [...], depends_on: [] })
+dispatch_task({ category: "integration", requires_modification: true, task: "集成认证模块和数据库...", files: [...], depends_on: [] })
 
 // 等待阶段 2
 wait_for_workers()  → 最终结果，向用户汇总

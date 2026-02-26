@@ -314,11 +314,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       cancelTaskById: (id) => this.orchestratorEngine.cancelTaskById(id),
       getExecutionStats: () => this.orchestratorEngine.getExecutionStats(),
       sendStateUpdate: () => this.sendStateUpdate(),
-      sendErrorMessage: (content, worker) => this.sendOrchestratorMessage({
-        content,
-        messageType: 'error',
-        metadata: { worker },
-      }),
       sendResultMessage: (content, worker) => {
         const requestId = this.messageHub.getRequestContext();
         this.messageHub.result(content, { metadata: { requestId, worker } });
@@ -373,6 +368,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       tryResumePendingRecovery: () => { void this.tryResumePendingRecovery(); },
     });
     this.eventBindingService.bindAll();
+    this.configureToolAuthorizationBridge();
+  }
+
+  private configureToolAuthorizationBridge(): void {
+    const toolManager = this.adapterFactory.getToolManager();
+    toolManager.setAuthorizationCallback(async (toolName, toolArgs) => {
+      const modeConfig = this.orchestratorEngine.getModeConfig();
+      if (!modeConfig.requireToolAuthorization) {
+        return true;
+      }
+      return this.eventBindingService.requestToolAuthorization(toolName, toolArgs);
+    });
   }
 
   private logMessageFlow(eventType: string, payload: unknown): void {
@@ -909,6 +916,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.messageHub.forceProcessingState(false);
 
     if (hasRunningTask && !options?.silent) {
+      const interruptionSummary = this.buildInterruptionSummary(runningTasks);
+      this.saveMessageToSession('', interruptionSummary, undefined, 'orchestrator');
+
       // 4. 通知 UI
       this.sendToast('任务已打断', 'info');
 
@@ -1464,6 +1474,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       lastExecutionTime: workerStats.lastExecutionTime,
       totalInputTokens: workerStats.totalInputTokens,
       totalOutputTokens: workerStats.totalOutputTokens,
+      totalEstimatedInputTokens: workerStats.totalEstimatedInputTokens,
+      totalEstimatedOutputTokens: workerStats.totalEstimatedOutputTokens,
     }));
 
     const orchestratorStats = {
@@ -1472,6 +1484,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       totalFailed: stats.reduce((sum, s) => sum + s.failureCount, 0),
       totalInputTokens: stats.reduce((sum, s) => sum + (s.totalInputTokens || 0), 0),
       totalOutputTokens: stats.reduce((sum, s) => sum + (s.totalOutputTokens || 0), 0),
+      totalEstimatedInputTokens: stats.reduce((sum, s) => sum + (s.totalEstimatedInputTokens || 0), 0),
+      totalEstimatedOutputTokens: stats.reduce((sum, s) => sum + (s.totalEstimatedOutputTokens || 0), 0),
       totalTokens: stats.reduce((sum, s) => sum + (s.totalInputTokens || 0) + (s.totalOutputTokens || 0), 0),
     };
 
@@ -1838,6 +1852,40 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     ].join('\n\n');
   }
 
+  /**
+   * 构建中断摘要（写回会话，供下一轮上下文注入）
+   */
+  private buildInterruptionSummary(tasks: TaskView[]): string {
+    const lines: string[] = ['上轮任务被用户中断。'];
+
+    for (const task of tasks) {
+      const subTasks = task.subTasks || [];
+      const completed = subTasks.filter(st => st.status === 'completed').length;
+      const failed = subTasks.filter(st => st.status === 'failed').length;
+      const running = subTasks.filter(st => st.status === 'running').length;
+      const pending = subTasks.filter(st => st.status === 'pending' || st.status === 'blocked').length;
+      const taskName = task.goal || task.prompt || task.id;
+      lines.push(`- 任务：${taskName}`);
+      lines.push(`  子任务状态：完成 ${completed}，失败 ${failed}，执行中 ${running}，待处理 ${pending}`);
+    }
+
+    const pendingChanges = this.snapshotManager.getPendingChanges();
+    if (pendingChanges.length > 0) {
+      lines.push('- 未确认代码变更：');
+      for (const change of pendingChanges.slice(0, 20)) {
+        lines.push(`  - ${change.filePath} (+${change.additions}/-${change.deletions})`);
+      }
+      if (pendingChanges.length > 20) {
+        lines.push(`  - ... 其余 ${pendingChanges.length - 20} 个变更`);
+      }
+    } else {
+      lines.push('- 未确认代码变更：无');
+    }
+
+    lines.push('请基于以上进展继续执行，避免重复已完成工作。');
+    return lines.join('\n');
+  }
+
   /** 恢复被打断的任务 */
   private async resumeInterruptedTask(extraInstruction?: string): Promise<void> {
     if (this.orchestratorEngine.running) {
@@ -1857,7 +1905,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       messageType: 'progress',
       metadata: { phase: 'resuming' },
     });
-    await this.executeTask(prompt, undefined, []);
+    await this.executeTask(prompt, undefined, [], undefined, undefined, {
+      resumeMissionId: lastTask.id,
+      resumeInstruction: prompt,
+    });
   }
 
   /** 处理执行中追加输入：默认语义为“补充指令（下一决策点生效）” */
@@ -1932,7 +1983,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     forceWorker?: WorkerSlot,
     images?: Array<{ dataUrl: string }>,
     requestId?: string,
-    displayPrompt?: string
+    displayPrompt?: string,
+    options?: {
+      resumeMissionId?: string;
+      resumeInstruction?: string;
+    }
   ): Promise<void> {
     logger.info('界面.任务.执行.开始', { promptLength: prompt.length, imageCount: images?.length || 0, forceWorker: forceWorker || undefined }, LogCategory.UI);
     const maxPromptLength = 10000;
@@ -1962,6 +2017,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     try {
       this.messageHub.setRequestContext(requestKey);
+      if (options?.resumeMissionId) {
+        const activated = this.orchestratorEngine.activateWorkerSessionResume(
+          options.resumeMissionId,
+          options.resumeInstruction
+        );
+        logger.info('界面.任务.恢复上下文.激活', {
+          missionId: options.resumeMissionId,
+          activated,
+        }, LogCategory.UI);
+      } else {
+        this.orchestratorEngine.clearWorkerSessionResume();
+      }
 
       // 📝 长度验证逻辑：
       // - 普通用户输入：验证 prompt 长度（防止粘贴过长内容）
@@ -2128,6 +2195,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.messageHub.finalizeRequestContext(requestKey);
       this.messageHub.setRequestContext(undefined);
       this.clearRequestTimeout(requestKey);
+      this.orchestratorEngine.clearWorkerSessionResume();
       // 任务执行链路结束，强制重置 processing 状态
       // 避免因流式消息缺少 COMPLETED lifecycle 导致 processing 动画卡住
       this.messageHub.forceProcessingState(false);
@@ -2203,10 +2271,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       } else {
         logger.error('界面.执行.智能.失败', error, LogCategory.UI);
         errorMsg = error instanceof Error ? error.message : String(error);
-        this.sendOrchestratorMessage({
-          content: errorMsg,
-          messageType: 'error',
-        });
         success = false;
       }
     }
@@ -2374,7 +2438,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
     if (assistantResponse) {
-      this.sessionManager.addMessage('assistant', assistantResponse, agent, source);
+      const resolvedAgent = agent || (source === 'orchestrator' ? 'orchestrator' : undefined);
+      this.sessionManager.addMessage('assistant', assistantResponse, resolvedAgent, source);
       void this.orchestratorEngine.recordContextMessage('assistant', assistantResponse, this.activeSessionId || undefined);
     }
     this.sendStateUpdate();

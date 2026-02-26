@@ -36,7 +36,12 @@ lerna-debug.log*
 .multicli/
 .ace-tool/
 .npm/
-
+.magi/logs/
+.magi/sessions/
+.magi/todos/
+.magi/cache/
+.magi/knowledge/
+.magi/
 # Temporary files
 .tmp/
 *.tmp

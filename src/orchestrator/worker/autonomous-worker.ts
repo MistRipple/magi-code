@@ -290,13 +290,27 @@ export class AutonomousWorker extends EventEmitter {
           completedTodos: session.completedTodos.length,
         }, LogCategory.ORCHESTRATOR);
 
-        // 恢复已完成的 Todo 状态
-        for (const todoId of session.completedTodos) {
-          const todo = assignment.todos.find(t => t.id === todoId);
-          if (todo && todo.status === 'pending') {
+        // 恢复已完成 Todo 状态（优先 ID 命中，次级内容指纹命中）
+        const completedTodoIds = new Set(session.completedTodos);
+        const remainingTodoFingerprints = new Set(session.completedTodoFingerprints);
+        for (const todo of assignment.todos) {
+          const fingerprint = this.buildTodoFingerprint(todo.content);
+          const fingerprintMatched = remainingTodoFingerprints.has(fingerprint);
+          if (fingerprintMatched) {
+            remainingTodoFingerprints.delete(fingerprint);
+          }
+          const matched = completedTodoIds.has(todo.id) || fingerprintMatched;
+          if (matched && todo.status === 'pending') {
             todo.status = 'completed';
             completedTodos.push(todo);
           }
+        }
+
+        const resumeInstruction = options.resumePrompt || session.resumePrompt;
+        if (resumeInstruction) {
+          this.appendSupplementaryInstructions(assignment, [
+            `继续执行被中断任务时，请继承并落实以下恢复指令：${resumeInstruction}`,
+          ]);
         }
 
         this.emit('sessionResumed', {
@@ -363,14 +377,7 @@ export class AutonomousWorker extends EventEmitter {
 
         // 聚合 Token 统计
         if (result.tokenUsage) {
-          totalTokenUsage.inputTokens += result.tokenUsage.inputTokens || 0;
-          totalTokenUsage.outputTokens += result.tokenUsage.outputTokens || 0;
-          if (result.tokenUsage.cacheReadTokens) {
-            totalTokenUsage.cacheReadTokens = (totalTokenUsage.cacheReadTokens || 0) + result.tokenUsage.cacheReadTokens;
-          }
-          if (result.tokenUsage.cacheWriteTokens) {
-            totalTokenUsage.cacheWriteTokens = (totalTokenUsage.cacheWriteTokens || 0) + result.tokenUsage.cacheWriteTokens;
-          }
+          this.mergeTokenUsage(totalTokenUsage, result.tokenUsage);
         }
 
         if (result.success) {
@@ -379,7 +386,10 @@ export class AutonomousWorker extends EventEmitter {
           // 更新 Session - 提案 4.1
           if (session) {
             sessionMgr.update(session.id, {
-              completeTodo: result.todo.id,
+              completeTodo: {
+                id: result.todo.id,
+                content: result.todo.content,
+              },
               stateSnapshot: {
                 currentTodoIndex: completedTodos.length,
                 lastExecutionAt: Date.now(),
@@ -521,6 +531,9 @@ export class AutonomousWorker extends EventEmitter {
         tokenUsage: totalTokenUsage.inputTokens > 0 ? {
           inputTokens: totalTokenUsage.inputTokens,
           outputTokens: totalTokenUsage.outputTokens,
+          estimatedInputTokens: totalTokenUsage.estimatedInputTokens,
+          estimatedOutputTokens: totalTokenUsage.estimatedOutputTokens,
+          estimated: totalTokenUsage.estimated === true,
         } : undefined,
       };
 
@@ -746,6 +759,10 @@ export class AutonomousWorker extends EventEmitter {
       : content;
   }
 
+  private buildTodoFingerprint(content: string): string {
+    return content.trim().replace(/\s+/g, ' ').toLowerCase();
+  }
+
   /**
    * 执行单个 Todo
    */
@@ -811,7 +828,6 @@ export class AutonomousWorker extends EventEmitter {
       const executionPrompt = this.buildExecutionPrompt(
         todo,
         assignment,
-        options.projectContext,
         sharedContext,
         targetFileContext
       );
@@ -895,7 +911,6 @@ export class AutonomousWorker extends EventEmitter {
   private buildExecutionPrompt(
     todo: UnifiedTodo,
     assignment: Assignment,
-    projectContext?: string,
     sharedContext?: AssembledContext | null,
     targetFileContext?: string | null
   ): string {
@@ -943,14 +958,9 @@ export class AutonomousWorker extends EventEmitter {
       sections.push(`## 依赖的契约\n${todo.requiredContracts.map(c => `- ${c}`).join('\n')}`);
     }
 
-    // 5. 引导 Prompt
+    // 5. Assignment 级执行约束（角色定义在 Worker systemPrompt）
     if (assignment.guidancePrompt) {
-      sections.push(`## 角色引导\n${assignment.guidancePrompt}`);
-    }
-
-    // 6. 项目上下文
-    if (projectContext) {
-      sections.push(`## 项目上下文\n${projectContext}`);
+      sections.push(`## 执行约束\n${assignment.guidancePrompt}`);
     }
 
     return sections.join('\n\n');
@@ -1179,6 +1189,9 @@ export class AutonomousWorker extends EventEmitter {
           break;
         case 'contracts':
           sharedSections.push(`### 任务契约\n${part.content}`);
+          break;
+        case 'recent_turns':
+          sharedSections.push(`### 最近对话\n${part.content}`);
           break;
         case 'long_term_memory':
           sharedSections.push(`### 历史记忆\n${part.content}`);
@@ -1721,8 +1734,7 @@ export class AutonomousWorker extends EventEmitter {
 
       // 聚合 Token 统计
       if (result.tokenUsage) {
-        totalTokenUsage.inputTokens += result.tokenUsage.inputTokens || 0;
-        totalTokenUsage.outputTokens += result.tokenUsage.outputTokens || 0;
+        this.mergeTokenUsage(totalTokenUsage, result.tokenUsage);
       }
 
       if (result.success) {
@@ -1806,6 +1818,26 @@ export class AutonomousWorker extends EventEmitter {
     this.emit('assignmentCompleted', qualityCheckedResult);
 
     return qualityCheckedResult;
+  }
+
+  private mergeTokenUsage(target: TokenUsage, usage: TokenUsage): void {
+    target.inputTokens += usage.inputTokens || 0;
+    target.outputTokens += usage.outputTokens || 0;
+    if (usage.cacheReadTokens) {
+      target.cacheReadTokens = (target.cacheReadTokens || 0) + usage.cacheReadTokens;
+    }
+    if (usage.cacheWriteTokens) {
+      target.cacheWriteTokens = (target.cacheWriteTokens || 0) + usage.cacheWriteTokens;
+    }
+    if (usage.estimatedInputTokens) {
+      target.estimatedInputTokens = (target.estimatedInputTokens || 0) + usage.estimatedInputTokens;
+    }
+    if (usage.estimatedOutputTokens) {
+      target.estimatedOutputTokens = (target.estimatedOutputTokens || 0) + usage.estimatedOutputTokens;
+    }
+    if (usage.estimated) {
+      target.estimated = true;
+    }
   }
 
   /**

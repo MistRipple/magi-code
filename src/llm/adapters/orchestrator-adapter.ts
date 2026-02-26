@@ -17,11 +17,11 @@ import { logger, LogCategory } from '../../logging';
  * 历史管理配置
  */
 export interface OrchestratorHistoryConfig {
-  /** 最大历史消息数量（默认 30） */
+  /** 最大历史消息数量（默认 40） */
   maxMessages?: number;
-  /** 最大历史字符数（默认 80000） */
+  /** 最大历史字符数（默认 100000） */
   maxChars?: number;
-  /** 保留最近 N 轮对话（默认 3） */
+  /** 保留最近 N 轮对话（默认 6） */
   preserveRecentRounds?: number;
 }
 
@@ -44,11 +44,14 @@ export interface OrchestratorAdapterConfig {
 export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   /** 编排者单次会话中允许直接修改的最大文件数 */
   private static readonly MAX_ORCHESTRATOR_EDIT_FILES = 3;
+  /** 滚动摘要最大长度（字符） */
+  private static readonly MAX_ROLLING_SUMMARY_CHARS = 2000;
 
   private systemPrompt: string;
   private conversationHistory: LLMMessage[] = [];
   private abortController?: AbortController;
   private historyConfig: Required<OrchestratorHistoryConfig>;
+  private rollingContextSummary: string | null = null;
 
   /** 当前会话中编排者已修改的文件路径集合（用于规模限制） */
   private editedFiles = new Set<string>();
@@ -70,9 +73,9 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     );
     this.systemPrompt = adapterConfig.systemPrompt ?? '';
     this.historyConfig = {
-      maxMessages: adapterConfig.historyConfig?.maxMessages ?? 30,
-      maxChars: adapterConfig.historyConfig?.maxChars ?? 80000,
-      preserveRecentRounds: adapterConfig.historyConfig?.preserveRecentRounds ?? 3,
+      maxMessages: adapterConfig.historyConfig?.maxMessages ?? 40,
+      maxChars: adapterConfig.historyConfig?.maxChars ?? 100000,
+      preserveRecentRounds: adapterConfig.historyConfig?.preserveRecentRounds ?? 6,
     };
   }
 
@@ -122,13 +125,19 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         return content;
       }
 
-      // 准备消息历史（自动截断以控制 token 消耗）
-      this.truncateHistoryIfNeeded();
+      let messagesToSend: LLMMessage[];
+      if (silent) {
+        // system 可见性调用仅用于内部决策，不污染编排对话历史
+        messagesToSend = [this.buildUserMessage(message, images)];
+      } else {
+        // 准备消息历史（自动截断以控制 token 消耗）
+        this.truncateHistoryIfNeeded();
 
-      // 添加用户消息
-      const userMessage = this.buildUserMessage(message, images);
-      this.conversationHistory.push(userMessage);
-      const messagesToSend = this.conversationHistory;
+        // 添加用户消息
+        const userMessage = this.buildUserMessage(message, images);
+        this.conversationHistory.push(userMessage);
+        messagesToSend = this.conversationHistory;
+      }
 
       // 创建 AbortController，供 interrupt() 中断 LLM 请求
       this.abortController = new AbortController();
@@ -169,11 +178,13 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       });
       this.recordTokenUsage(response.usage);
 
-      // 将助手响应添加到历史
-      this.conversationHistory.push({
-        role: 'assistant',
-        content: fullResponse,
-      });
+      // 用户可见请求才会写入编排历史，内部 system 请求不写入
+      if (!silent) {
+        this.conversationHistory.push({
+          role: 'assistant',
+          content: fullResponse,
+        });
+      }
 
       this.normalizer.endStream(streamId);
       this.setState(AdapterState.CONNECTED);
@@ -272,6 +283,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
    */
   clearHistory(): void {
     this.conversationHistory = [];
+    this.rollingContextSummary = null;
     this.editedFiles.clear();
     logger.debug('Orchestrator conversation history cleared', undefined, LogCategory.LLM);
   }
@@ -359,14 +371,96 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     // 截断旧消息，保留最近的
     const truncatedCount = currentLength - preserveCount;
     if (truncatedCount > 0) {
+      const droppedMessages = this.conversationHistory.slice(0, truncatedCount);
       this.conversationHistory = this.conversationHistory.slice(-preserveCount);
+
+      this.updateRollingSummary(droppedMessages);
+
+      if (this.rollingContextSummary) {
+        const firstMsg = this.conversationHistory[0];
+        if (firstMsg && firstMsg.role === 'user') {
+          if (typeof firstMsg.content === 'string') {
+            firstMsg.content = `${this.rollingContextSummary}\n\n---\n\n${firstMsg.content}`;
+          } else if (Array.isArray(firstMsg.content)) {
+            (firstMsg.content as any[]).unshift({ type: 'text', text: this.rollingContextSummary });
+          }
+        } else {
+          this.conversationHistory.unshift({
+            role: 'user',
+            content: this.rollingContextSummary,
+          });
+        }
+      }
+
       logger.debug('Orchestrator history truncated', {
         removedMessages: truncatedCount,
         remainingMessages: this.conversationHistory.length,
         previousChars: currentChars,
         currentChars: this.getHistoryChars(),
+        hasRollingSummary: !!this.rollingContextSummary,
       }, LogCategory.LLM);
     }
+  }
+
+  private updateRollingSummary(droppedMessages: LLMMessage[]): void {
+    const highlights: string[] = [];
+
+    for (const message of droppedMessages) {
+      const text = this.extractMessageText(message);
+      if (!text) {
+        continue;
+      }
+
+      if (message.role === 'user') {
+        if (/(不要|不能|禁止|必须|务必|严禁|优先|确认)/.test(text)) {
+          highlights.push(`- 用户约束: ${text.substring(0, 140)}`);
+        }
+        continue;
+      }
+
+      if (message.role === 'assistant') {
+        highlights.push(`- 编排进展: ${text.substring(0, 180)}`);
+      }
+    }
+
+    if (highlights.length === 0) {
+      return;
+    }
+
+    const previousLines = (this.rollingContextSummary || '')
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.startsWith('- '));
+    const mergedLines = Array.from(new Set([...previousLines, ...highlights]));
+    const mergedText = mergedLines.join('\n');
+    const cropped = mergedText.length > OrchestratorLLMAdapter.MAX_ROLLING_SUMMARY_CHARS
+      ? mergedText.substring(mergedText.length - OrchestratorLLMAdapter.MAX_ROLLING_SUMMARY_CHARS)
+      : mergedText;
+
+    this.rollingContextSummary = `[System 上下文回顾] 以下为之前轮次的关键上下文（自动精简）：\n${cropped}`;
+  }
+
+  private extractMessageText(message: LLMMessage): string {
+    if (typeof message.content === 'string') {
+      return message.content.trim().replace(/\s+/g, ' ');
+    }
+
+    if (!Array.isArray(message.content)) {
+      return '';
+    }
+
+    const parts: string[] = [];
+    for (const block of message.content as any[]) {
+      if (!block || typeof block !== 'object') {
+        continue;
+      }
+      if (block.type === 'text' && typeof block.text === 'string') {
+        parts.push(block.text);
+      } else if (block.type === 'tool_use' && typeof block.name === 'string') {
+        parts.push(`调用工具 ${block.name}`);
+      }
+    }
+    return parts.join(' ').trim().replace(/\s+/g, ' ');
   }
 
   /**
@@ -401,11 +495,19 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     systemPrompt: string,
     visibility?: 'user' | 'system' | 'debug'
   ): Promise<string> {
-    // 自动截断历史以控制 token 消耗
-    this.truncateHistoryIfNeeded();
+    const isTransientSystemCall = visibility === 'system';
+
+    // 自动截断历史以控制 token 消耗（仅用户可见调用）
+    if (!isTransientSystemCall) {
+      this.truncateHistoryIfNeeded();
+    }
+
+    // system 可见性调用使用临时历史，避免污染编排上下文
+    const history = isTransientSystemCall
+      ? [...this.conversationHistory]
+      : this.conversationHistory;
 
     // 添加用户消息到历史
-    const history = this.conversationHistory;
     history.push(this.buildUserMessage(message, images));
 
     const tools = await this.toolManager.getTools();
@@ -531,8 +633,14 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             break;
           }
 
-          // 有工具调用 → 同步到当轮 stream
+          // 有工具调用 → 只对无需授权的工具即时渲染卡片
+          // 需要授权的高风险工具延后到授权完成后再渲染，避免“先出现 edit 卡片后弹授权”。
+          const preAnnouncedToolCallIds = new Set<string>();
           for (const toolCall of toolCalls) {
+            if (this.toolManager.requiresUserAuthorization(toolCall.name)) {
+              continue;
+            }
+            preAnnouncedToolCallIds.add(toolCall.id);
             this.normalizer.addToolCall(streamId, {
               type: 'tool_call',
               toolName: toolCall.name,
@@ -564,14 +672,46 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             break;
           }
 
+          const toolCallMap = new Map(toolCalls.map((toolCall) => [toolCall.id, toolCall] as const));
           for (const result of toolResults) {
-            this.normalizer.finishToolCall(
-              streamId,
-              result.toolCallId,
-              result.isError ? undefined : result.content,
-              result.isError ? result.content : undefined,
-              result.fileChange,
-            );
+            const toolCall = toolCallMap.get(result.toolCallId);
+            if (!toolCall) {
+              continue;
+            }
+            if (preAnnouncedToolCallIds.has(result.toolCallId)) {
+              this.normalizer.finishToolCall(
+                streamId,
+                result.toolCallId,
+                result.isError ? undefined : result.content,
+                result.isError ? result.content : undefined,
+                result.fileChange,
+              );
+              continue;
+            }
+
+            // 高风险工具：单独产出一张工具卡片，确保其时序晚于授权卡片
+            const deferredToolStreamId = this.normalizer.startStream(this.currentTraceId!);
+            this.normalizer.addToolCall(deferredToolStreamId, {
+              type: 'tool_call',
+              toolName: toolCall.name,
+              toolId: toolCall.id,
+              status: result.isError ? 'failed' : 'completed',
+              input: JSON.stringify(toolCall.arguments, null, 2),
+              output: result.isError ? undefined : result.content,
+              error: result.isError ? result.content : undefined,
+            });
+
+            if (!result.isError && result.fileChange) {
+              this.normalizer.addFileChangeBlock(
+                deferredToolStreamId,
+                result.fileChange.filePath,
+                result.fileChange.changeType,
+                result.fileChange.additions,
+                result.fileChange.deletions,
+                result.fileChange.diff,
+              );
+            }
+            this.normalizer.endStream(deferredToolStreamId);
           }
 
           history.push({

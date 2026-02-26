@@ -111,9 +111,8 @@ export class AssignmentManager {
       .filter(c => c.consumers.includes(workerId))
       .map(c => c.id);
 
-    // 生成引导 Prompt
-    const guidancePrompt = this.guidanceInjector.buildFullTaskPrompt(
-      profile,
+    // 生成 Assignment 级执行约束（不重复注入角色定义，角色定义已在 Worker systemPrompt 固定提供）
+    const guidancePrompt = this.guidanceInjector.buildAssignmentGuidance(
       {
         taskDescription: scope.includes.join('; '),
         category: assignmentReason.profileMatch.category,

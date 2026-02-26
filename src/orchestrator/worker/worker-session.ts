@@ -72,6 +72,9 @@ export interface WorkerSession {
   /** 已完成的 Todo IDs */
   completedTodos: string[];
 
+  /** 已完成 Todo 的内容指纹（跨 Assignment 恢复匹配） */
+  completedTodoFingerprints: string[];
+
   /** 执行状态快照 */
   stateSnapshot: SessionStateSnapshot;
 
@@ -106,7 +109,7 @@ export interface SessionUpdateOptions {
   /** 更新文件缓存 */
   updateFile?: { path: string; entry: FileCacheEntry };
   /** 标记 Todo 完成 */
-  completeTodo?: string;
+  completeTodo?: { id: string; content: string };
   /** 更新状态快照 */
   stateSnapshot?: Partial<SessionStateSnapshot>;
   /** 恢复提示 */
@@ -125,6 +128,10 @@ export class WorkerSessionManager {
   private readonly SESSION_TTL_MS: number;
   private readonly CLEANUP_INTERVAL_MS: number;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+
+  private buildTodoFingerprint(content: string): string {
+    return content.trim().replace(/\s+/g, ' ').toLowerCase();
+  }
 
   constructor(options?: { sessionTtlMs?: number; cleanupIntervalMs?: number; autoCleanup?: boolean }) {
     this.SESSION_TTL_MS = options?.sessionTtlMs ?? 30 * 60 * 1000; // 默认 30 分钟
@@ -159,6 +166,7 @@ export class WorkerSessionManager {
       conversationHistory: [],
       readFiles: new Map(),
       completedTodos: [],
+      completedTodoFingerprints: [],
       stateSnapshot: {
         currentTodoIndex: 0,
         retryCount: 0,
@@ -240,8 +248,14 @@ export class WorkerSessionManager {
     }
 
     // 标记 Todo 完成
-    if (updates.completeTodo && !session.completedTodos.includes(updates.completeTodo)) {
-      session.completedTodos.push(updates.completeTodo);
+    if (updates.completeTodo) {
+      if (!session.completedTodos.includes(updates.completeTodo.id)) {
+        session.completedTodos.push(updates.completeTodo.id);
+      }
+      const fingerprint = this.buildTodoFingerprint(updates.completeTodo.content);
+      if (!session.completedTodoFingerprints.includes(fingerprint)) {
+        session.completedTodoFingerprints.push(fingerprint);
+      }
     }
 
     // 更新状态快照

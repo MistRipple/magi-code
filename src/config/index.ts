@@ -66,18 +66,6 @@ export interface OrchestratorConfig {
 }
 
 /**
- * 性能配置
- */
-export interface PerformanceConfig {
-  /** 是否启用精确 Token 计算 */
-  enablePreciseTokenCounting: boolean;
-  /** 是否启用分布式锁 */
-  enableDistributedLock: boolean;
-  /** 是否启用性能监控 */
-  enablePerformanceMonitoring: boolean;
-}
-
-/**
  * 完整配置接口
  */
 export interface MagiConfig {
@@ -85,7 +73,6 @@ export interface MagiConfig {
   task: TaskConfig;
   snapshot: SnapshotConfig;
   orchestrator: OrchestratorConfig;
-  performance: PerformanceConfig;
 }
 
 /**
@@ -114,11 +101,6 @@ export const DEFAULT_CONFIG: MagiConfig = {
     planConfirmationThreshold: 'medium',
     maxRetries: 3,
     defaultTimeout: 300000,
-  },
-  performance: {
-    enablePreciseTokenCounting: true,
-    enableDistributedLock: false,
-    enablePerformanceMonitoring: true,
   },
 };
 
@@ -198,11 +180,6 @@ export class ConfigManager {
       result.snapshot.maxCacheSize = parseInt(process.env.MAGI_SNAPSHOT_CACHE_SIZE, 10);
     }
 
-    // Performance
-    if (process.env.MAGI_PRECISE_TOKENS) {
-      result.performance.enablePreciseTokenCounting = process.env.MAGI_PRECISE_TOKENS === 'true';
-    }
-
     return result;
   }
 
@@ -215,7 +192,6 @@ export class ConfigManager {
       task: { ...base.task, ...override.task },
       snapshot: { ...base.snapshot, ...override.snapshot },
       orchestrator: { ...base.orchestrator, ...override.orchestrator },
-      performance: { ...base.performance, ...override.performance },
     };
   }
 

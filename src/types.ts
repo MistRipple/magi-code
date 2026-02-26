@@ -384,7 +384,6 @@ export type EventType =
   | 'orchestrator:plan_ready'
   | 'orchestrator:dependency_analysis'
   | 'orchestrator:ui_message'
-  | 'tool:authorization_request'
   | 'verification:started'
   | 'verification:completed'
   | 'recovery:started'

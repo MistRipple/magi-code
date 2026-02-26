@@ -77,6 +77,21 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   }
 
   /**
+   * 按段落安全拼接提示词，避免重复注入
+   */
+  private appendPromptSection(base: string, section?: string): string {
+    const normalizedBase = (base || '').trim();
+    const normalizedSection = (section || '').trim();
+    if (!normalizedSection) {
+      return normalizedBase;
+    }
+    if (normalizedBase.includes(normalizedSection)) {
+      return normalizedBase;
+    }
+    return normalizedBase ? `${normalizedBase}\n\n${normalizedSection}` : normalizedSection;
+  }
+
+  /**
    * 设置 MessageHub（由 WebviewProvider 在初始化时调用）
    * 🔧 统一消息通道：替代 setMessageBus
    * 必须在创建任何 Adapter 之前调用
@@ -259,12 +274,19 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
 
     const adapter = new WorkerLLMAdapter(adapterConfig);
 
-    // 🔧 使用 EnvironmentContextProvider 统一注入环境上下文
+    // 运行时系统提示词采用精简注入：
+    // - Worker 的工具规范由 WorkerAdapter.buildSystemPrompt + ToolManager.buildToolsSummary 提供
+    // - Skills/MCP Prompts 说明不在此处重复注入，避免 token 膨胀
+    // - 用户规则仅在 Worker 侧注入一次，确保执行阶段遵循统一规范
     let systemPrompt = adapter.getSystemPrompt();
-    const environmentPrompt = this.environmentContextProvider.getEnvironmentPrompt();
-    if (environmentPrompt) {
-      systemPrompt = `${systemPrompt}\n\n${environmentPrompt}`;
-    }
+    const runtimeEnvironmentPrompt = this.environmentContextProvider.getEnvironmentPrompt({
+      includeIDEState: true,
+      includeTools: false,
+      includePrompts: false,
+      includeUserRules: false,
+    });
+    systemPrompt = this.appendPromptSection(systemPrompt, runtimeEnvironmentPrompt);
+    systemPrompt = this.appendPromptSection(systemPrompt, this.environmentContextProvider.getUserRulesPrompt());
     adapter.setSystemPrompt(systemPrompt);
 
     // 只设置错误事件处理（消息由 Adapter 直接发送到 MessageHub）
@@ -323,13 +345,21 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
 
     const adapter = new OrchestratorLLMAdapter(adapterConfig);
 
-    // 🔧 使用 EnvironmentContextProvider 统一注入环境上下文
-    // 工具、MCP、Skills 统一由 ToolManager 管理，EnvironmentContextProvider 统一格式化
+    // Orchestrator 默认系统提示词保持轻量，供内部系统调用（如 Phase C 汇总）使用；
+    // 主执行链路会由 MissionDrivenEngine 传入统一临时 systemPrompt 覆盖。
     let systemPrompt = adapter.getSystemPrompt();
-    const environmentPrompt = this.environmentContextProvider.getEnvironmentPrompt();
-    if (environmentPrompt) {
-      systemPrompt = `${systemPrompt}\n\n${environmentPrompt}`;
-    }
+    const orchestratorBaseline = `你是 Magi 的任务编排者。
+- 目标：协调任务执行并输出清晰结果
+- 风格：简洁、准确、面向执行
+- 原则：优先完成用户目标，避免无关扩展`;
+    const runtimeEnvironmentPrompt = this.environmentContextProvider.getEnvironmentPrompt({
+      includeIDEState: true,
+      includeTools: false,
+      includePrompts: false,
+      includeUserRules: false,
+    });
+    systemPrompt = this.appendPromptSection(systemPrompt, orchestratorBaseline);
+    systemPrompt = this.appendPromptSection(systemPrompt, runtimeEnvironmentPrompt);
     adapter.setSystemPrompt(systemPrompt);
 
     // 只设置错误事件处理（消息由 Adapter 直接发送到 MessageHub）
@@ -434,18 +464,36 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
 
       const beforeTotals = 'getTotalTokenUsage' in adapter && typeof (adapter as any).getTotalTokenUsage === 'function'
         ? (adapter as any).getTotalTokenUsage()
-        : { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+        : {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          estimatedInputTokens: 0,
+          estimatedOutputTokens: 0,
+        };
       try {
         const content = await adapter.sendMessage(message, images);
         const afterTotals = 'getTotalTokenUsage' in adapter && typeof (adapter as any).getTotalTokenUsage === 'function'
           ? (adapter as any).getTotalTokenUsage()
-          : { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+          : {
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            estimatedInputTokens: 0,
+            estimatedOutputTokens: 0,
+          };
 
       const tokenUsage = {
         inputTokens: Math.max(0, (afterTotals.inputTokens || 0) - (beforeTotals.inputTokens || 0)),
         outputTokens: Math.max(0, (afterTotals.outputTokens || 0) - (beforeTotals.outputTokens || 0)),
         cacheReadTokens: (afterTotals.cacheReadTokens || 0) - (beforeTotals.cacheReadTokens || 0) || undefined,
         cacheWriteTokens: (afterTotals.cacheWriteTokens || 0) - (beforeTotals.cacheWriteTokens || 0) || undefined,
+        estimatedInputTokens: Math.max(0, (afterTotals.estimatedInputTokens || 0) - (beforeTotals.estimatedInputTokens || 0)) || undefined,
+        estimatedOutputTokens: Math.max(0, (afterTotals.estimatedOutputTokens || 0) - (beforeTotals.estimatedOutputTokens || 0)) || undefined,
+        estimated: Math.max(0, (afterTotals.estimatedInputTokens || 0) - (beforeTotals.estimatedInputTokens || 0))
+          + Math.max(0, (afterTotals.estimatedOutputTokens || 0) - (beforeTotals.estimatedOutputTokens || 0)) > 0 || undefined,
       };
 
       return { content, tokenUsage };

@@ -26,7 +26,13 @@ export interface DirectExecutionDeps {
   sendMessage: (worker: WorkerSlot, prompt: string, imagePaths: string[]) => Promise<{
     content?: string;
     error?: string;
-    tokenUsage?: { inputTokens?: number; outputTokens?: number };
+    tokenUsage?: {
+      inputTokens?: number;
+      outputTokens?: number;
+      estimatedInputTokens?: number;
+      estimatedOutputTokens?: number;
+      estimated?: boolean;
+    };
   }>;
   // 任务生命周期
   createTaskFromPrompt: (sessionId: string, prompt: string) => Promise<{ id: string }>;
@@ -37,7 +43,6 @@ export interface DirectExecutionDeps {
   getExecutionStats: () => { recordExecution: (record: Omit<ExecutionRecord, 'timestamp'>) => void } | null;
   // UI 通知
   sendStateUpdate: () => void;
-  sendErrorMessage: (content: string, worker: WorkerSlot) => void;
   sendResultMessage: (content: string, worker: WorkerSlot) => void;
   saveMessageToSession: (prompt: string, content: string, worker: WorkerSlot) => void;
 }
@@ -89,16 +94,14 @@ export class DirectExecutionService {
           error: response.error,
           inputTokens: response.tokenUsage?.inputTokens,
           outputTokens: response.tokenUsage?.outputTokens,
+          estimatedInputTokens: response.tokenUsage?.estimatedInputTokens,
+          estimatedOutputTokens: response.tokenUsage?.estimatedOutputTokens,
         });
       }
 
       if (response.error) {
-        errorMsg = response.error;
-        await this.deps.failTaskById(task.id, response.error);
-        this.deps.sendErrorMessage(
-          `${targetWorker.toUpperCase()}: ${response.error}`,
-          targetWorker,
-        );
+        errorMsg = `${targetWorker.toUpperCase()}: ${response.error}`;
+        await this.deps.failTaskById(task.id, errorMsg);
       } else {
         await this.deps.completeTaskById(task.id);
         this.deps.saveMessageToSession(prompt, response.content || '', targetWorker);
@@ -115,7 +118,8 @@ export class DirectExecutionService {
         await this.deps.cancelTaskById(task.id);
       } else {
         logger.error('界面.执行.直接.失败', error, LogCategory.UI);
-        errorMsg = error instanceof Error ? error.message : String(error);
+        const rawError = error instanceof Error ? error.message : String(error);
+        errorMsg = `${targetWorker.toUpperCase()}: ${rawError}`;
         await this.deps.failTaskById(task.id, errorMsg);
         const executionStats = this.deps.getExecutionStats();
         if (executionStats) {
@@ -128,10 +132,6 @@ export class DirectExecutionService {
             error: errorMsg,
           });
         }
-        this.deps.sendErrorMessage(
-          `${targetWorker.toUpperCase()}: ${errorMsg}`,
-          targetWorker,
-        );
       }
     } finally {
       toolManager.clearSnapshotContext(targetWorker);

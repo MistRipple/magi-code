@@ -39,6 +39,26 @@ export interface EnvironmentContextConfig {
 }
 
 /**
+ * 环境提示词组装选项
+ *
+ * 用于区分：
+ * - 运行时注入（尽量精简，降低 token）
+ * - 调试展示（信息完整）
+ */
+export interface EnvironmentPromptOptions {
+  /** 是否注入 IDE 状态 */
+  includeIDEState?: boolean;
+  /** 是否注入工具清单 */
+  includeTools?: boolean;
+  /** 是否注入 Prompts/Skills 清单 */
+  includePrompts?: boolean;
+  /** Prompts 中是否展开 Skill 指令正文（默认 true，仅调试/特殊场景建议开启） */
+  includeSkillInstructionContent?: boolean;
+  /** 是否注入用户规则 */
+  includeUserRules?: boolean;
+}
+
+/**
  * 环境上下文提供者
  *
  * 使用方式：
@@ -109,28 +129,46 @@ export class EnvironmentContextProvider {
   /**
    * 获取完整的环境提示（用于注入到系统提示）
    */
-  getEnvironmentPrompt(): string {
+  getEnvironmentPrompt(options?: EnvironmentPromptOptions): string {
+    const resolved = {
+      includeIDEState: options?.includeIDEState ?? true,
+      includeTools: options?.includeTools ?? true,
+      includePrompts: options?.includePrompts ?? true,
+      includeSkillInstructionContent: options?.includeSkillInstructionContent ?? true,
+      includeUserRules: options?.includeUserRules ?? true,
+    };
+
     const sections: string[] = [];
 
     // 1. IDE 状态
-    sections.push(this.getIDEStatePrompt());
+    if (resolved.includeIDEState) {
+      sections.push(this.getIDEStatePrompt());
+    }
 
     // 2. 可用工具
-    const toolsPrompt = this.getToolsPrompt();
-    if (toolsPrompt) {
-      sections.push(toolsPrompt);
+    if (resolved.includeTools) {
+      const toolsPrompt = this.getToolsPrompt();
+      if (toolsPrompt) {
+        sections.push(toolsPrompt);
+      }
     }
 
     // 3. 提示词/指令（MCP Prompts + Instruction Skills）
-    const promptsSection = this.getPromptsPrompt();
-    if (promptsSection) {
-      sections.push(promptsSection);
+    if (resolved.includePrompts) {
+      const promptsSection = this.getPromptsPrompt({
+        includeSkillInstructionContent: resolved.includeSkillInstructionContent,
+      });
+      if (promptsSection) {
+        sections.push(promptsSection);
+      }
     }
 
     // 4. 用户规则
-    const rulesPrompt = this.getUserRulesPrompt();
-    if (rulesPrompt) {
-      sections.push(rulesPrompt);
+    if (resolved.includeUserRules) {
+      const rulesPrompt = this.getUserRulesPrompt();
+      if (rulesPrompt) {
+        sections.push(rulesPrompt);
+      }
     }
 
     return sections.filter(Boolean).join('\n\n');
@@ -210,11 +248,12 @@ export class EnvironmentContextProvider {
    * 获取提示词/指令提示（从缓存）
    * 统一展示 MCP Prompts 和 Instruction Skills
    */
-  getPromptsPrompt(): string {
+  getPromptsPrompt(options?: { includeSkillInstructionContent?: boolean }): string {
     if (this.cachedPrompts.length === 0) {
       return '';
     }
 
+    const includeSkillInstructionContent = options?.includeSkillInstructionContent ?? true;
     const mcpPrompts = this.cachedPrompts.filter(p => p.source === 'mcp');
     const skillPrompts = this.cachedPrompts.filter(p => p.source === 'skill');
 
@@ -251,7 +290,7 @@ export class EnvironmentContextProvider {
       blocks.push('');
 
       // 自动调用 Skill 的详细指令
-      if (autoSkills.length > 0) {
+      if (autoSkills.length > 0 && includeSkillInstructionContent) {
         blocks.push('### Skill 指令（可自动调用）');
         const maxChars = 6000;
         let usedChars = 0;
@@ -265,6 +304,10 @@ export class EnvironmentContextProvider {
           blocks.push(contentBlock);
           usedChars += contentBlock.length;
         }
+        blocks.push('');
+      } else if (autoSkills.length > 0) {
+        blocks.push('### Skill 指令（可自动调用）');
+        blocks.push('- 当前为精简模式，未展开 Skill 指令正文；需要时请用 `/skill-name` 显式触发。');
         blocks.push('');
       }
 
@@ -323,4 +366,3 @@ ${rules.content.trim()}
     }
   }
 }
-

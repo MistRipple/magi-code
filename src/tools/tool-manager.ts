@@ -438,8 +438,30 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     ['wait-for-workers', 'wait_for_workers'],
   ]);
 
+  /**
+   * 仅对高风险（会产生副作用）的工具进行用户授权。
+   * 只读查询类工具默认不弹授权，减少 Ask 模式噪音。
+   */
+  private readonly authorizationRequiredToolNames = new Set<string>([
+    'launch-process',
+    'write-process',
+    'kill-process',
+    'file_create',
+    'file_edit',
+    'file_insert',
+    'file_remove',
+  ]);
+
   private normalizeToolName(name: string): string {
     return this.builtinToolAliases.get(name) || name;
+  }
+
+  /**
+   * 判断工具是否属于高风险副作用操作（需要用户授权）
+   */
+  requiresUserAuthorization(toolName: string): boolean {
+    const normalized = this.normalizeToolName(toolName);
+    return this.authorizationRequiredToolNames.has(normalized);
   }
 
   /**
@@ -615,12 +637,18 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       return permissionCheck;
     }
 
-    // 2. 如果没有授权回调，默认允许（Auto 模式）
-    if (!this.authorizationCallback) {
+    // 2. 仅高风险工具需要用户授权（只读工具不需要）
+    const requiresAuthorization = this.requiresUserAuthorization(toolCall.name);
+    if (!requiresAuthorization) {
       return { allowed: true };
     }
 
-    // 3. 请求用户授权（Ask 模式）
+    // 3. 高风险工具必须有授权回调
+    if (!this.authorizationCallback) {
+      return { allowed: false, reason: 'Tool authorization handler not configured' };
+    }
+
+    // 4. 请求用户授权（Ask 模式下会弹窗，Auto 模式由回调直接放行）
     try {
       const allowed = await this.authorizationCallback(toolCall.name, toolCall.arguments);
       if (!allowed) {
@@ -1309,6 +1337,16 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
    */
   private invalidateCache(): void {
     this.toolCache.clear();
+  }
+
+  /**
+   * 主动刷新工具 schema 缓存
+   *
+   * 用于运行时配置变更（如 Worker 分工/启用状态变化）后，
+   * 确保下一次工具拉取使用最新定义，避免 enum 陈旧。
+   */
+  refreshToolSchemas(): void {
+    this.invalidateCache();
   }
 
   /**

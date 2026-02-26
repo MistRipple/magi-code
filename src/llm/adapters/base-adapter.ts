@@ -152,6 +152,9 @@ export abstract class BaseLLMAdapter extends EventEmitter {
         outputTokens: this.totalTokenUsage.outputTokens,
         cacheReadTokens: this.totalTokenUsage.cacheReadTokens,
         cacheWriteTokens: this.totalTokenUsage.cacheWriteTokens,
+        estimatedInputTokens: this.totalTokenUsage.estimatedInputTokens,
+        estimatedOutputTokens: this.totalTokenUsage.estimatedOutputTokens,
+        estimated: (this.totalTokenUsage.estimatedInputTokens || 0) > 0 || (this.totalTokenUsage.estimatedOutputTokens || 0) > 0,
       }
     });
   }
@@ -280,15 +283,30 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     const outputTokens = usage.outputTokens || 0;
     const cacheReadTokens = usage.cacheReadTokens || 0;
     const cacheWriteTokens = usage.cacheWriteTokens || 0;
+    const estimated = usage.estimated === true;
+    const estimatedInputTokens = usage.estimatedInputTokens || (estimated ? inputTokens : 0);
+    const estimatedOutputTokens = usage.estimatedOutputTokens || (estimated ? outputTokens : 0);
 
     // 跳过全零的 usage（无意义更新）
-    if (inputTokens === 0 && outputTokens === 0 && cacheReadTokens === 0 && cacheWriteTokens === 0) return;
+    if (
+      inputTokens === 0
+      && outputTokens === 0
+      && cacheReadTokens === 0
+      && cacheWriteTokens === 0
+      && estimatedInputTokens === 0
+      && estimatedOutputTokens === 0
+    ) {
+      return;
+    }
 
     this.lastTokenUsage = {
       inputTokens,
       outputTokens,
       cacheReadTokens: cacheReadTokens || undefined,
       cacheWriteTokens: cacheWriteTokens || undefined,
+      estimated: estimated || undefined,
+      estimatedInputTokens: estimatedInputTokens || undefined,
+      estimatedOutputTokens: estimatedOutputTokens || undefined,
     };
 
     this.totalTokenUsage.inputTokens += inputTokens;
@@ -300,6 +318,14 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     if (cacheWriteTokens) {
       this.totalTokenUsage.cacheWriteTokens =
         (this.totalTokenUsage.cacheWriteTokens || 0) + cacheWriteTokens;
+    }
+    if (estimatedInputTokens) {
+      this.totalTokenUsage.estimatedInputTokens =
+        (this.totalTokenUsage.estimatedInputTokens || 0) + estimatedInputTokens;
+    }
+    if (estimatedOutputTokens) {
+      this.totalTokenUsage.estimatedOutputTokens =
+        (this.totalTokenUsage.estimatedOutputTokens || 0) + estimatedOutputTokens;
     }
 
     // 主动推送实时 Token 更新到前端

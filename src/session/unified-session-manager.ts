@@ -17,6 +17,7 @@ import * as path from 'path';
 import { FileSnapshot } from '../types';
 import { AgentType } from '../types/agent-types';
 import { globalEventBus } from '../events';
+import { estimateTokenCount } from '../utils/token-estimator';
 
 /** 会话消息 */
 export interface SessionMessage {
@@ -356,11 +357,9 @@ export class UnifiedSessionManager {
     return session.messages.slice(-count);
   }
 
-  /** 估算消息的 token 数量（粗略估算：1 token ≈ 4 字符） */
+  /** 估算消息的 token 数量（统一口径：1 token ≈ 4 字符） */
   private estimateTokenCount(text: string): number {
-    // 简单估算：英文约 4 字符/token，中文约 1.5 字符/token
-    // 使用保守估算：平均 3 字符/token
-    return Math.ceil(text.length / 3);
+    return estimateTokenCount(text);
   }
 
   /** 获取消息的总 token 数 */

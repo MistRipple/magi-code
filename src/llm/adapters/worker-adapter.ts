@@ -396,8 +396,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
             break;
           }
 
-          // 有工具调用 → 同步到当轮 stream，执行工具，endStream 后进入下一轮
+          // 有工具调用 → 只对无需授权的工具即时渲染卡片。
+          // 高风险工具（需授权）延后渲染，确保授权提示先出现。
+          const preAnnouncedToolCallIds = new Set<string>();
           for (const toolCall of toolCalls) {
+            if (this.toolManager.requiresUserAuthorization(toolCall.name)) {
+              continue;
+            }
+            preAnnouncedToolCallIds.add(toolCall.id);
             this.normalizer.addToolCall(streamId, {
               type: 'tool_call',
               toolName: toolCall.name,
@@ -431,14 +437,46 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
             break;
           }
 
+          const toolCallMap = new Map(toolCalls.map((toolCall) => [toolCall.id, toolCall] as const));
           for (const result of toolResults) {
-            this.normalizer.finishToolCall(
-              streamId,
-              result.toolCallId,
-              result.isError ? undefined : result.content,
-              result.isError ? result.content : undefined,
-              result.fileChange,
-            );
+            const toolCall = toolCallMap.get(result.toolCallId);
+            if (!toolCall) {
+              continue;
+            }
+            if (preAnnouncedToolCallIds.has(result.toolCallId)) {
+              this.normalizer.finishToolCall(
+                streamId,
+                result.toolCallId,
+                result.isError ? undefined : result.content,
+                result.isError ? result.content : undefined,
+                result.fileChange,
+              );
+              continue;
+            }
+
+            // 高风险工具：单独产出一张工具卡片，确保其时序晚于授权卡片
+            const deferredToolStreamId = this.normalizer.startStream(this.currentTraceId!);
+            this.normalizer.addToolCall(deferredToolStreamId, {
+              type: 'tool_call',
+              toolName: toolCall.name,
+              toolId: toolCall.id,
+              status: result.isError ? 'failed' : 'completed',
+              input: JSON.stringify(toolCall.arguments, null, 2),
+              output: result.isError ? undefined : result.content,
+              error: result.isError ? result.content : undefined,
+            });
+
+            if (!result.isError && result.fileChange) {
+              this.normalizer.addFileChangeBlock(
+                deferredToolStreamId,
+                result.fileChange.filePath,
+                result.fileChange.changeType,
+                result.fileChange.additions,
+                result.fileChange.deletions,
+                result.fileChange.diff,
+              );
+            }
+            this.normalizer.endStream(deferredToolStreamId);
           }
 
           this.conversationHistory.push({

@@ -86,6 +86,8 @@ export interface DispatchEntry {
   worker: WorkerSlot;
   task: string;
   files: string[];
+  /** 是否要求该任务对目标文件产生实际修改（读任务为 false） */
+  requiresModification: boolean;
   dependsOn: string[];
   status: DispatchStatus;
   result?: DispatchResult;
@@ -101,7 +103,12 @@ export interface DispatchResult {
   modifiedFiles?: string[];
   errors?: string[];
   /** 任务消耗的 token 统计 */
-  tokenUsage?: { inputTokens: number; outputTokens: number };
+  tokenUsage?: {
+    inputTokens: number;
+    outputTokens: number;
+    estimatedInputTokens?: number;
+    estimatedOutputTokens?: number;
+  };
 }
 
 /** Token 消耗统计 */
@@ -205,6 +212,7 @@ export class DispatchBatch extends EventEmitter {
     worker: WorkerSlot;
     task: string;
     files?: string[];
+    requiresModification?: boolean;
     dependsOn?: string[];
   }): DispatchEntry {
     if (this._phase === 'archived') {
@@ -228,6 +236,7 @@ export class DispatchBatch extends EventEmitter {
       worker: params.worker,
       task: params.task,
       files: params.files || [],
+      requiresModification: params.requiresModification ?? true,
       dependsOn,
       status: dependsOn.length > 0 ? 'waiting_deps' : 'pending',
       createdAt: Date.now(),
@@ -358,6 +367,9 @@ export class DispatchBatch extends EventEmitter {
     const fileToTasks = new Map<string, string[]>();
 
     for (const entry of this.entries.values()) {
+      if (!entry.requiresModification) {
+        continue;
+      }
       // 只检测可能并行的任务（无依赖关系的）
       for (const file of entry.files) {
         const tasks = fileToTasks.get(file) || [];

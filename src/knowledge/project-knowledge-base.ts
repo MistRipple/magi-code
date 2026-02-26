@@ -16,6 +16,7 @@ import { logger, LogCategory } from '../logging';
 import { LLMConfigLoader } from '../llm/config';
 import { LLMClient, LLMMessageParams } from '../llm/types';
 import { LocalSearchEngine, SearchOptions, SearchResult } from './local-search-engine';
+import { estimateMaxCharsForTokens, estimateTokenCount } from '../utils/token-estimator';
 
 // ============================================================================
 // 类型定义
@@ -673,11 +674,11 @@ export class ProjectKnowledgeBase {
     const context = parts.join('\n');
 
     // 简单的 token 估算（1 token ≈ 4 字符）
-    const estimatedTokens = Math.ceil(context.length / 4);
+    const estimatedTokens = estimateTokenCount(context);
 
     if (estimatedTokens > maxTokens) {
       // 截断到最大 tokens
-      const maxChars = maxTokens * 4;
+      const maxChars = estimateMaxCharsForTokens(maxTokens);
       return context.substring(0, maxChars) + '...';
     }
 
