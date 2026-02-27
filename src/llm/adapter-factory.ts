@@ -451,7 +451,11 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       };
     }
 
-    const sendOnce = async (): Promise<{ content: string; tokenUsage?: TokenUsage }> => {
+    const sendOnce = async (): Promise<{
+      content: string;
+      tokenUsage?: TokenUsage;
+      orchestratorRuntime?: AdapterResponse['orchestratorRuntime'];
+    }> => {
       // requestContext 是全局状态，只有编排器的 LLM 输出才应绑定到 placeholder。
       // Worker 或 visibility:'system' 调用必须临时清除 requestContext，
       // 否则 Worker 的流式输出会复用编排器的 placeholder messageId，导致消息归属错误。
@@ -469,8 +473,6 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
           outputTokens: 0,
           cacheReadTokens: 0,
           cacheWriteTokens: 0,
-          estimatedInputTokens: 0,
-          estimatedOutputTokens: 0,
         };
       try {
         const content = await adapter.sendMessage(message, images);
@@ -481,8 +483,6 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
             outputTokens: 0,
             cacheReadTokens: 0,
             cacheWriteTokens: 0,
-            estimatedInputTokens: 0,
-            estimatedOutputTokens: 0,
           };
 
       const tokenUsage = {
@@ -490,13 +490,13 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
         outputTokens: Math.max(0, (afterTotals.outputTokens || 0) - (beforeTotals.outputTokens || 0)),
         cacheReadTokens: (afterTotals.cacheReadTokens || 0) - (beforeTotals.cacheReadTokens || 0) || undefined,
         cacheWriteTokens: (afterTotals.cacheWriteTokens || 0) - (beforeTotals.cacheWriteTokens || 0) || undefined,
-        estimatedInputTokens: Math.max(0, (afterTotals.estimatedInputTokens || 0) - (beforeTotals.estimatedInputTokens || 0)) || undefined,
-        estimatedOutputTokens: Math.max(0, (afterTotals.estimatedOutputTokens || 0) - (beforeTotals.estimatedOutputTokens || 0)) || undefined,
-        estimated: Math.max(0, (afterTotals.estimatedInputTokens || 0) - (beforeTotals.estimatedInputTokens || 0))
-          + Math.max(0, (afterTotals.estimatedOutputTokens || 0) - (beforeTotals.estimatedOutputTokens || 0)) > 0 || undefined,
       };
 
-      return { content, tokenUsage };
+      const orchestratorRuntime = agent === 'orchestrator' && adapter instanceof OrchestratorLLMAdapter
+        ? adapter.getLastRuntimeState()
+        : undefined;
+
+      return { content, tokenUsage, orchestratorRuntime };
       } finally {
         // 恢复 requestContext（无论成功或异常）
         if (shouldDetachRequest && this.messageHub && savedRequestContext !== undefined) {
@@ -511,11 +511,12 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     try {
       for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
         try {
-          const { content, tokenUsage } = await sendOnce();
+          const { content, tokenUsage, orchestratorRuntime } = await sendOnce();
           return {
             content,
             done: true,
             tokenUsage,
+            orchestratorRuntime,
           };
         } catch (error: any) {
           const errorMessage = this.normalizeErrorMessage(error);

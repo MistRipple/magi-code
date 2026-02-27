@@ -176,7 +176,7 @@ export class TodoManager extends EventEmitter {
   async create(params: CreateTodoParams): Promise<UnifiedTodo> {
     const now = Date.now();
     const todo: UnifiedTodo = {
-      id: `todo_${now}_${Math.random().toString(36).substr(2, 9)}`,
+      id: `todo_${now}_${Math.random().toString(36).substring(2, 11)}`,
       missionId: params.missionId,
       assignmentId: params.assignmentId,
       parentId: params.parentId,

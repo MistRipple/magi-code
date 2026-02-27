@@ -3,7 +3,7 @@
  * 真实 LLM 全链路回归脚本（编排器 + 3 Worker + dispatch/wait 汇总）
  *
  * 目标：
- * 1. 强制一轮 3 Worker 分发（claude/codex/gemini）
+ * 1. 按当前分工配置完成一轮多 Worker 分发（dispatch 3 个分类任务）
  * 2. 显式使用 requires_modification=false（只读任务）
  * 3. 验证最终任务视图与状态，防止回归到“读任务被按写任务治理”
  *
@@ -123,9 +123,13 @@ async function main() {
   const { MissionDrivenEngine } = require(path.join(OUT, 'orchestrator', 'core', 'mission-driven-engine.js'));
   const { UnifiedSessionManager } = require(path.join(OUT, 'session', 'unified-session-manager.js'));
   const { SnapshotManager } = require(path.join(OUT, 'snapshot-manager.js'));
+  const { WorkerAssignmentLoader } = require(path.join(OUT, 'orchestrator', 'profile', 'worker-assignments.js'));
 
   const sessionManager = new UnifiedSessionManager(ROOT);
   const snapshotManager = new SnapshotManager(sessionManager, ROOT);
+  const assignmentLoader = new WorkerAssignmentLoader();
+  const dispatchCategories = ['architecture', 'general', 'data_analysis'];
+  const expectedWorkers = [...new Set(dispatchCategories.map(category => assignmentLoader.getWorkerForCategory(category)))];
   const adapterFactory = new LLMAdapterFactory({
     cwd: ROOT,
     workspaceFolders: [{ name: path.basename(ROOT), path: ROOT }],
@@ -154,8 +158,8 @@ async function main() {
       '请严格执行以下流程，并且只执行一轮：',
       '1) 连续调用 3 次 dispatch_task，且每次都必须包含 requires_modification 参数：',
       '- category=architecture, requires_modification=false：分析 src/orchestrator 编排链路，输出 2 条风险。',
+      '- category=general, requires_modification=false：阅读 src/orchestrator/core/dispatch-manager.ts，输出 dispatch_task 路由链路的 3 点摘要。',
       '- category=data_analysis, requires_modification=false：统计 src/orchestrator 下 .ts 文件数量并给结论。',
-      '- category=document, requires_modification=false：输出面向产品经理的三行总结。',
       '2) 调用一次 wait_for_workers 等待上述任务完成。',
       '3) 最后输出汇总结论，不要再追加任何 dispatch_task。',
       '硬性约束：禁止修改文件、禁止执行命令、禁止联网。',
@@ -181,9 +185,7 @@ async function main() {
     const pass =
       Boolean(latest)
       && subTasks.length >= 3
-      && workers.includes('claude')
-      && workers.includes('codex')
-      && workers.includes('gemini')
+      && expectedWorkers.every(worker => workers.includes(worker))
       && failedSubTasks.length === 0
       && targetWriteGuardFailures.length === 0;
 
@@ -193,6 +195,7 @@ async function main() {
       taskViewCount: taskViews.length,
       latestTaskId: latest?.id || null,
       subTaskCount: subTasks.length,
+      expectedWorkers,
       workers,
       subTaskStatuses: subTasks.map(task => `${task.assignedWorker}:${task.status}`),
       failedSubTaskCount: failedSubTasks.length,

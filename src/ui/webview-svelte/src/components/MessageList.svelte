@@ -95,10 +95,28 @@
   // 对话级处理指示器
   // - thread: 全局 isProcessing 驱动，表示「对话仍在进行」
   // - worker: 当前请求级别（同一次请求内跨多轮不重置）
+  // 仅当「当前无流式消息卡片」时显示，避免与卡片内流式动画重复导致视觉留白
+  const hasStreamingMessage = $derived(safeMessages.some((m) => m.isStreaming));
+
+  // 防抖：hasStreamingMessage 变 false 后延迟 300ms 再显示底部指示器，
+  // 避免工具调用间隙短暂 isStreaming=false 导致指示器闪烁产生空白
+  let debouncedNoStreaming = $state(true);
+  let noStreamingTimer: ReturnType<typeof setTimeout> | null = null;
+  $effect(() => {
+    const noStreaming = !hasStreamingMessage;
+    if (noStreaming) {
+      noStreamingTimer = setTimeout(() => { debouncedNoStreaming = true; }, 300);
+    } else {
+      if (noStreamingTimer) { clearTimeout(noStreamingTimer); noStreamingTimer = null; }
+      debouncedNoStreaming = false;
+    }
+    return () => { if (noStreamingTimer) { clearTimeout(noStreamingTimer); noStreamingTimer = null; } };
+  });
+
   const showProcessingIndicator = $derived(
     displayContext === 'worker'
-      ? workerHasCurrentRequestActivity
-      : messagesState.isProcessing && safeMessages.length > 0
+      ? workerHasCurrentRequestActivity && debouncedNoStreaming
+      : messagesState.isProcessing && safeMessages.length > 0 && debouncedNoStreaming
   );
 
   // 计时起点：

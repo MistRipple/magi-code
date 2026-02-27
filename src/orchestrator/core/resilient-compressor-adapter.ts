@@ -11,30 +11,49 @@
 import { logger, LogCategory } from '../../logging';
 import type { ContextManager } from '../../context/context-manager';
 import type { ExecutionStats } from '../execution-stats';
+import type { LLMClient } from '../../llm/types';
 
 // ============================================================================
 // 错误分类工具
 // ============================================================================
 
-function normalizeErrorMessage(error: any): string {
+/** 从 unknown error 中安全提取 HTTP 状态码 */
+function getErrorStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const e = error as { status?: unknown; response?: { status?: unknown } };
+  if (typeof e.status === 'number') return e.status;
+  if (typeof e.response?.status === 'number') return e.response.status;
+  return undefined;
+}
+
+/** 从 unknown error 中安全提取错误码 */
+function getErrorCode(error: unknown): string {
+  if (!error || typeof error !== 'object') return '';
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string' ? code : '';
+}
+
+function normalizeErrorMessage(error: unknown): string {
   if (!error) return 'Unknown error';
   if (typeof error === 'string') return error;
   if (error instanceof Error && error.message) return error.message;
-  if (error?.message) return String(error.message);
+  if (typeof error === 'object' && 'message' in error && typeof (error as { message: unknown }).message === 'string') {
+    return (error as { message: string }).message;
+  }
   return String(error);
 }
 
-function isAuthOrQuotaError(error: any): boolean {
-  const status = error?.status || error?.response?.status;
+function isAuthOrQuotaError(error: unknown): boolean {
+  const status = getErrorStatus(error);
   if (status === 401 || status === 403 || status === 429) return true;
   const message = normalizeErrorMessage(error).toLowerCase();
   return /unauthorized|forbidden|invalid api key|api key|auth|permission|quota|insufficient|billing|payment|exceeded|rate limit|limit|blocked|suspended|disabled|account/i.test(message);
 }
 
-function isConnectionError(error: any): boolean {
-  const status = error?.status || error?.response?.status;
+function isConnectionError(error: unknown): boolean {
+  const status = getErrorStatus(error);
   if (status === 408 || status === 502 || status === 503 || status === 504) return true;
-  const code = typeof error?.code === 'string' ? error.code : '';
+  const code = getErrorCode(error);
   if (['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'].includes(code)) {
     return true;
   }
@@ -42,12 +61,12 @@ function isConnectionError(error: any): boolean {
   return /timeout|timed out|network|connection|fetch failed|socket hang up|tls|certificate|econnreset|econnrefused|enotfound|eai_again/.test(message);
 }
 
-function isModelError(error: any): boolean {
+function isModelError(error: unknown): boolean {
   const message = normalizeErrorMessage(error).toLowerCase();
   return /model|not found|unknown model|invalid model|unsupported model|no such model/.test(message);
 }
 
-function isConfigError(error: any): boolean {
+function isConfigError(error: unknown): boolean {
   const message = normalizeErrorMessage(error).toLowerCase();
   return /disabled in config|invalid configuration|missing|not configured|config/.test(message);
 }
@@ -99,8 +118,6 @@ export async function configureResilientCompressor(
       usage?: {
         inputTokens?: number;
         outputTokens?: number;
-        estimatedInputTokens?: number;
-        estimatedOutputTokens?: number;
       },
       error?: string
     ) => {
@@ -113,13 +130,11 @@ export async function configureResilientCompressor(
         error,
         inputTokens: usage?.inputTokens,
         outputTokens: usage?.outputTokens,
-        estimatedInputTokens: usage?.estimatedInputTokens,
-        estimatedOutputTokens: usage?.estimatedOutputTokens,
         phase: 'integration',
       });
     };
 
-    const sendWithClient = async (client: any, label: string, payload: string): Promise<string> => {
+    const sendWithClient = async (client: LLMClient, label: string, payload: string): Promise<string> => {
       const startAt = Date.now();
       try {
         const response = await client.sendMessage({
@@ -131,13 +146,11 @@ export async function configureResilientCompressor(
         recordCompression(true, duration, {
           inputTokens: response.usage?.inputTokens,
           outputTokens: response.usage?.outputTokens,
-          estimatedInputTokens: response.usage?.estimatedInputTokens,
-          estimatedOutputTokens: response.usage?.estimatedOutputTokens,
         });
         return response.content || '';
-      } catch (error: any) {
+      } catch (error: unknown) {
         const duration = Date.now() - startAt;
-        recordCompression(false, duration, undefined, error?.message);
+        recordCompression(false, duration, undefined, normalizeErrorMessage(error));
         logger.warn('编排器.上下文.压缩模型.调用失败', {
           model: label,
           error: normalizeErrorMessage(error),
@@ -146,11 +159,11 @@ export async function configureResilientCompressor(
       }
     };
 
-    const sendWithRetry = async (client: any, label: string, payload: string): Promise<string> => {
+    const sendWithRetry = async (client: LLMClient, label: string, payload: string): Promise<string> => {
       for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
         try {
           return await sendWithClient(client, label, payload);
-        } catch (error: any) {
+        } catch (error: unknown) {
           if (isAuthOrQuotaError(error)) {
             throw error;
           }
@@ -178,7 +191,7 @@ export async function configureResilientCompressor(
           }
           const client = createLLMClient(compressorConfig);
           return await sendWithRetry(client, 'compressor', message);
-        } catch (error: any) {
+        } catch (error: unknown) {
           const shouldSwitchToOrchestrator = !compressorReady
             || isAuthOrQuotaError(error)
             || isConnectionError(error)

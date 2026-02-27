@@ -1,78 +1,62 @@
 /**
  * Category resolver (single algorithm)
+ *
+ * 设计：
+ * - 启动时预编译所有关键词正则，编译失败则立即报错（不做运行时回退）
+ * - resolveFromText 是唯一的公开 API
  */
 
 import { CATEGORY_DEFINITIONS } from './builtin/category-definitions';
 import { CATEGORY_RULES } from './builtin/category-rules';
 
+/** 预编译的分类匹配器：按优先级排列 */
+interface CompiledCategoryMatcher {
+  category: string;
+  patterns: RegExp[];
+}
+
+/** 按 categoryPriority 顺序预编译所有关键词正则 */
+function compileMatchers(): CompiledCategoryMatcher[] {
+  const matchers: CompiledCategoryMatcher[] = [];
+
+  for (const category of CATEGORY_RULES.categoryPriority) {
+    const definition = CATEGORY_DEFINITIONS[category];
+    if (!definition) {
+      throw new Error(`分类规则引用不存在的分类: ${category}`);
+    }
+    if (!definition.keywords || definition.keywords.length === 0) {
+      throw new Error(`分类关键词为空: ${category}`);
+    }
+
+    const patterns = definition.keywords.map(pattern => {
+      try {
+        return new RegExp(pattern, 'i');
+      } catch (e) {
+        throw new Error(`分类 ${category} 的关键词正则编译失败: "${pattern}" — ${e instanceof Error ? e.message : String(e)}`);
+      }
+    });
+
+    matchers.push({ category, patterns });
+  }
+
+  return matchers;
+}
+
+// 模块加载时预编译，编译失败则阻止启动
+const COMPILED_MATCHERS = compileMatchers();
+
 export class CategoryResolver {
   resolveFromText(text: string): string {
     const normalized = text.toLowerCase();
 
-    for (const category of CATEGORY_RULES.categoryPriority) {
-      const definition = CATEGORY_DEFINITIONS[category];
-      if (!definition) {
-        throw new Error(`分类规则引用不存在的分类: ${category}`);
-      }
-
-      if (!definition.keywords || definition.keywords.length === 0) {
-        throw new Error(`分类关键词为空: ${category}`);
-      }
-
-      for (const pattern of definition.keywords) {
-        try {
-          const regex = new RegExp(pattern, 'i');
-          if (regex.test(normalized)) {
-            return category;
-          }
-        } catch {
-          if (normalized.includes(pattern.toLowerCase())) {
-            return category;
-          }
+    for (const { category, patterns } of COMPILED_MATCHERS) {
+      for (const regex of patterns) {
+        if (regex.test(normalized)) {
+          return category;
         }
       }
     }
 
     return CATEGORY_RULES.defaultCategory;
-  }
-
-  /**
-   * 解析所有匹配的分类（用于多 Worker 协作场景）
-   */
-  resolveAllFromText(text: string): string[] {
-    const normalized = text.toLowerCase();
-    const matchedCategories: string[] = [];
-
-    for (const category of CATEGORY_RULES.categoryPriority) {
-      const definition = CATEGORY_DEFINITIONS[category];
-      if (!definition || !definition.keywords || definition.keywords.length === 0) {
-        continue;
-      }
-
-      for (const pattern of definition.keywords) {
-        let matched = false;
-        try {
-          const regex = new RegExp(pattern, 'i');
-          if (regex.test(normalized)) {
-            matched = true;
-          }
-        } catch {
-          if (normalized.includes(pattern.toLowerCase())) {
-            matched = true;
-          }
-        }
-        if (matched && !matchedCategories.includes(category)) {
-          matchedCategories.push(category);
-          break; // 已匹配此分类，继续下一个分类
-        }
-      }
-    }
-
-    // 如果没有匹配任何分类，返回默认分类
-    if (matchedCategories.length === 0) {
-      return [CATEGORY_RULES.defaultCategory];
-    }
-
-    return matchedCategories;
   }
 }

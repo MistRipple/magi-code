@@ -20,7 +20,6 @@ import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
 import { CategoryResolver } from '../profile/category-resolver';
 import { OrchestratorState, RequirementAnalysis } from '../protocols/types';
-import { IntentGate, IntentHandlerMode } from '../intent-gate';
 import { VerificationRunner, VerificationConfig } from '../verification-runner';
 import { MissionOrchestrator } from './mission-orchestrator';
 import {
@@ -31,7 +30,6 @@ import {
 import { ExecutionStats } from '../execution-stats';
 import { MessageHub } from './message-hub';
 import { WisdomManager } from '../wisdom';
-import { buildIntentClassificationPrompt } from '../prompts/intent-classification';
 import { buildUnifiedSystemPrompt } from '../prompts/orchestrator-prompts';
 import { isAbortError } from '../../errors';
 import { SupplementaryInstructionQueue } from './supplementary-instruction-queue';
@@ -94,7 +92,6 @@ export class MissionDrivenEngine extends EventEmitter {
   private guidanceInjector: GuidanceInjector;
   private categoryResolver = new CategoryResolver();
 
-  private intentGate?: IntentGate;
   private verificationRunner?: VerificationRunner;
 
   // 项目知识库
@@ -126,15 +123,10 @@ export class MissionDrivenEngine extends EventEmitter {
   private orchestratorTokens = {
     inputTokens: 0,
     outputTokens: 0,
-    estimatedInputTokens: 0,
-    estimatedOutputTokens: 0,
   };
 
   private lastExecutionErrors: string[] = [];
   private lastExecutionSuccess = true;
-
-  // 缓存需求分析结果（避免 DIRECT -> TASK 转换时重复调用）
-  private _cachedRequirementAnalysis: RequirementAnalysis | null = null;
 
   // 执行统计
   private executionStats: ExecutionStats;
@@ -352,57 +344,6 @@ export class MissionDrivenEngine extends EventEmitter {
     await this.profileLoader.load();
     this.applyToolPermissions();
 
-    // 初始化 IntentGate（使用适配器进行意图决策）
-    const decider = async (prompt: string) => {
-      const sessionContext = await this.prepareDecisionContext(prompt);
-      const attempts = [
-        buildIntentClassificationPrompt(prompt, sessionContext),
-        `${buildIntentClassificationPrompt(prompt, sessionContext)}\n\n请严格只输出 JSON，不要包含多余文字。`
-      ];
-
-      for (const classificationPrompt of attempts) {
-        const response = await this.adapterFactory.sendMessage(
-          'orchestrator',
-          classificationPrompt,
-          undefined,
-          {
-            source: 'orchestrator',
-            adapterRole: 'orchestrator',
-            visibility: 'system',  // 🔧 意图分类是内部决策，不应输出到 UI
-            systemPrompt: '你是一个意图分析助手。请严格按照用户提供的指令格式输出 JSON。',
-          }
-        );
-        this.recordOrchestratorTokens(response.tokenUsage);
-
-        // 详细日志：捕获 LLM 原始响应
-        logger.info('编排器.意图分类.LLM原始响应', {
-          promptPreview: prompt.substring(0, 30),
-          responseContent: response.content?.substring(0, 200),
-        }, LogCategory.ORCHESTRATOR);
-
-        try {
-          const result = IntentGate.parseClassificationResponse(response.content ?? '');
-          if (result) {
-
-            // 详细日志：最终结果
-            logger.info('编排器.意图分类.最终结果', {
-              prompt: prompt.substring(0, 30),
-              intent: result.intent,
-              recommendedMode: result.recommendedMode,
-              confidence: result.confidence,
-            }, LogCategory.ORCHESTRATOR);
-
-            return result;
-          }
-        } catch (e) {
-          logger.warn('意图分类解析失败，准备重试', { error: e }, LogCategory.ORCHESTRATOR);
-        }
-      }
-
-      throw new Error('意图分类解析失败');
-    };
-    this.intentGate = new IntentGate(decider);
-
     // 初始化 VerificationRunner
     if (this.config.strategy?.enableVerification) {
       this.verificationRunner = new VerificationRunner(
@@ -473,7 +414,6 @@ export class MissionDrivenEngine extends EventEmitter {
       this.setState('running');
       this.lastTaskAnalysis = null;
       this.lastRoutingDecision = null;
-      this._cachedRequirementAnalysis = null;
       this.supplementaryQueue.reset();
       this.currentSessionId = sessionId;
       this.activeUserPrompt = trimmedPrompt;
@@ -553,7 +493,7 @@ export class MissionDrivenEngine extends EventEmitter {
         // 编排者跨轮会话记忆保留在 adapter history 中，不再每轮清空。
         // SystemPrompt 侧通过 prepareContext 动态裁剪 recent_turns，避免双重注入和 token 膨胀。
 
-        // 5. 单次 LLM 调用（自动包含工具循环）
+        // 5. 编排执行
         const response = await this.adapterFactory.sendMessage(
           'orchestrator',
           trimmedPrompt,
@@ -570,11 +510,15 @@ export class MissionDrivenEngine extends EventEmitter {
 
         // 等待 dispatch batch 归档（含 Worker 执行 + Phase C 汇总）
         // dispatch_task 是非阻塞的，sendMessage 返回时 Worker 可能还在后台执行。
-        // 必须等待 activeBatch 归档后再返回，确保 executeTask 的 finally 块
-        // 在所有工作完成后才发出 TASK_COMPLETED 信号。
+        // 必须等待 activeBatch 归档后再推进下一阶段，保证链路完整闭合。
         const currentBatch = this.dispatchManager.getActiveBatch();
         if (currentBatch && currentBatch.status !== 'archived') {
           await currentBatch.waitForArchive();
+        }
+
+        const auditOutcome = currentBatch?.getAuditOutcome();
+        if (auditOutcome?.level === 'intervention') {
+          throw new Error('Phase C 审计发现需干预项，自动交付已阻断，请按审计建议追加修复任务后重试');
         }
 
         if (response.error) {
@@ -585,7 +529,7 @@ export class MissionDrivenEngine extends EventEmitter {
           await runPostDispatchVerification(currentBatch, this.verificationRunner, this.messageHub);
         }
 
-        // 反应式编排兜底：若 Batch 处于“等待最终汇总”且编排者未输出正文，
+        // 反应式编排兜底：若 Batch 处于”等待最终汇总”且编排者未输出正文，
         // 则由系统生成确定性总结并发送到主对话区，避免用户只看到子任务卡片没有结论。
         let finalContent = response.content || '';
         if (currentBatch && this.dispatchManager.isReactiveBatchAwaitingSummary(currentBatch.id)) {
@@ -738,36 +682,6 @@ export class MissionDrivenEngine extends EventEmitter {
   }
 
   /**
-   * 准备决策上下文（用于意图分类/需求分析）
-   *
-   * 只注入“最近对话 + 长期记忆”，避免把项目知识和共享上下文带入决策阶段导致噪声。
-   * 该上下文用于解析“继续/然后/接着”等省略指令。
-   */
-  private async prepareDecisionContext(currentUserPrompt?: string): Promise<string> {
-    const sessionId = this.currentSessionId || this.contextSessionId || this.sessionManager.getCurrentSession()?.id || '';
-    if (!sessionId) {
-      return '';
-    }
-
-    await this.ensureContextReady(sessionId);
-
-    const missionId = this.lastMissionId || `session:${sessionId}`;
-    const options = this.contextManager.buildAssemblyOptions(
-      missionId,
-      'orchestrator',
-      2400,
-      [],
-      'medium',
-      currentUserPrompt
-    );
-    options.localTurns = { min: 1, max: 8 };
-
-    return this.contextManager.getAssembledContextText(options, {
-      excludePartTypes: ['project_knowledge', 'shared_context', 'contracts'],
-    });
-  }
-
-  /**
    * 获取可用工具摘要（供统一系统提示词使用）
    * 委托 ToolManager.buildToolsSummary() 生成，保持单一 source of truth
    */
@@ -834,8 +748,6 @@ export class MissionDrivenEngine extends EventEmitter {
         duration: assignmentResult.totalDuration,
         inputTokens: tokenUsage.inputTokens,
         outputTokens: tokenUsage.outputTokens,
-        estimatedInputTokens: tokenUsage.estimatedInputTokens,
-        estimatedOutputTokens: tokenUsage.estimatedOutputTokens,
         phase: 'execution',
       });
     }
@@ -848,8 +760,6 @@ export class MissionDrivenEngine extends EventEmitter {
     if (usage) {
       this.orchestratorTokens.inputTokens += usage.inputTokens || 0;
       this.orchestratorTokens.outputTokens += usage.outputTokens || 0;
-      this.orchestratorTokens.estimatedInputTokens += usage.estimatedInputTokens || 0;
-      this.orchestratorTokens.estimatedOutputTokens += usage.estimatedOutputTokens || 0;
 
       // 同时记录到 ExecutionStats（编排器使用 claude）
       this.executionStats.recordExecution({
@@ -860,8 +770,6 @@ export class MissionDrivenEngine extends EventEmitter {
         duration: 0,
         inputTokens: usage.inputTokens,
         outputTokens: usage.outputTokens,
-        estimatedInputTokens: usage.estimatedInputTokens,
-        estimatedOutputTokens: usage.estimatedOutputTokens,
         phase,
       });
     }
@@ -978,11 +886,8 @@ export class MissionDrivenEngine extends EventEmitter {
    * 获取统计摘要
    */
   getStatsSummary(): string {
-    const { inputTokens, outputTokens, estimatedInputTokens, estimatedOutputTokens } = this.orchestratorTokens;
-    const estimatedTotal = (estimatedInputTokens || 0) + (estimatedOutputTokens || 0);
-    return estimatedTotal > 0
-      ? `编排器 Token 使用: 输入 ${inputTokens}（估算 ${estimatedInputTokens}）, 输出 ${outputTokens}（估算 ${estimatedOutputTokens}）`
-      : `编排器 Token 使用: 输入 ${inputTokens}, 输出 ${outputTokens}`;
+    const { inputTokens, outputTokens } = this.orchestratorTokens;
+    return `编排器 Token 使用: 输入 ${inputTokens}, 输出 ${outputTokens}`;
   }
 
   /**
@@ -991,8 +896,6 @@ export class MissionDrivenEngine extends EventEmitter {
   getOrchestratorTokenUsage(): {
     inputTokens: number;
     outputTokens: number;
-    estimatedInputTokens: number;
-    estimatedOutputTokens: number;
   } {
     return { ...this.orchestratorTokens };
   }
@@ -1004,8 +907,6 @@ export class MissionDrivenEngine extends EventEmitter {
     this.orchestratorTokens = {
       inputTokens: 0,
       outputTokens: 0,
-      estimatedInputTokens: 0,
-      estimatedOutputTokens: 0,
     };
   }
 

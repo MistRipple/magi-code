@@ -23,7 +23,7 @@
   let lastRenderedCode = $state('');
 
   // 生成唯一 ID
-  const getUniqueId = () => `mermaid-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const getUniqueId = () => `mermaid-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
 
   // 全局初始化标志
   let mermaidInitialized = false;

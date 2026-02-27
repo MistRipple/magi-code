@@ -11,7 +11,7 @@ import { WorkerSlot } from '../../types';
 import type { UnifiedTodo } from '../../todo/types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { AssignmentResolver } from '../profile/assignment-resolver';
-import { WorkerProfile } from '../profile/types';
+import { WorkerProfile, findWeaknessMatches } from '../profile/types';
 import {
   Mission,
   Assignment,
@@ -61,7 +61,7 @@ export class ProfileAwareReviewer {
       }
 
       // 1. 检查任务是否涉及 Worker 的弱项
-      const weaknessHits = this.findWeaknessMatches(
+      const weaknessHits = findWeaknessMatches(
         assignment.responsibility,
         profile
       );
@@ -111,7 +111,7 @@ export class ProfileAwareReviewer {
     }
 
     // 检查是否涉及 Worker 弱项
-    const weaknessHits = this.findWeaknessMatches(todo.content, profile);
+    const weaknessHits = findWeaknessMatches(todo.content, profile);
     for (const weakness of weaknessHits) {
       issues.push({
         type: 'weakness_match',
@@ -239,7 +239,7 @@ export class ProfileAwareReviewer {
     // 基于评审级别检查
     if (reviewLevel === 'strict') {
       // 严格评审：检查是否涉及 Worker 弱项
-      const weaknessHits = this.findWeaknessMatches(
+      const weaknessHits = findWeaknessMatches(
         todo.output.summary,
         profile
       );
@@ -288,15 +288,5 @@ export class ProfileAwareReviewer {
       const normalized = item.toLowerCase();
       return strengths.some(s => normalized.includes(s) || s.includes(normalized)) ? score + 1 : score;
     }, 0);
-  }
-
-  /**
-   * 查找弱项匹配
-   */
-  private findWeaknessMatches(text: string, profile: WorkerProfile): string[] {
-    const textLower = text.toLowerCase();
-    return profile.persona.weaknesses.filter(w =>
-      textLower.includes(w.toLowerCase())
-    );
   }
 }

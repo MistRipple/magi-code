@@ -22,5 +22,4 @@ export const CATEGORY_RULES: CategoryRules = {
     'general',
   ],
   defaultCategory: 'general',
-  riskMapping: { high: 'fullPath', medium: 'standardPath', low: 'lightPath' },
 };

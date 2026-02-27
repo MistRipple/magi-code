@@ -594,7 +594,6 @@ export interface StreamUpdate {
     outputTokens?: number;
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
-    estimated?: boolean;
   };
 
   /** 时间戳 */

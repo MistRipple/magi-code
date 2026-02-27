@@ -17,7 +17,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 
 const execAsync = promisify(exec);
-import { WorkerSlot, SubTask } from '../../types';
+import { WorkerSlot } from '../../types';
 import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import { AdapterOutputScope } from '../../adapters/adapter-factory-interface';
 import { TokenUsage } from '../../types/agent-types';
@@ -381,51 +381,136 @@ export class AutonomousWorker extends EventEmitter {
         }
 
         if (result.success) {
-          completedTodos.push(result.todo);
+          // 检查 Todo 是否被拆分为子步骤（数据驱动）
+          const wasSplit = assignment.todos.some(t => t.parentId === result.todo.id);
 
-          // 更新 Session - 提案 4.1
-          if (session) {
-            sessionMgr.update(session.id, {
-              completeTodo: {
-                id: result.todo.id,
-                content: result.todo.content,
-              },
-              stateSnapshot: {
-                currentTodoIndex: completedTodos.length,
-                lastExecutionAt: Date.now(),
-              },
-            });
-          }
+          if (wasSplit) {
+            // 父 Todo 已拆分：不标记完成，子 Todo 由 getNextExecutableTodo 自然拾取
+            // 父 Todo 完成由 TodoManager.tryCompleteParent 自动处理
+          } else {
+            completedTodos.push(result.todo);
 
-          // **汇报机制**: 每完成一个 Todo 向编排者汇报
-          if (options.onReport) {
-            const orchestratorResponse = await this.reportProgress(
-              assignment,
-              currentTodo,
-              completedTodos,
-              options
-            );
+            // 更新 Session - 提案 4.1
+            if (session) {
+              sessionMgr.update(session.id, {
+                completeTodo: {
+                  id: result.todo.id,
+                  content: result.todo.content,
+                },
+                stateSnapshot: {
+                  currentTodoIndex: completedTodos.length,
+                  lastExecutionAt: Date.now(),
+                },
+              });
+            }
 
-            // 处理编排者响应
-            if (orchestratorResponse.action === 'abort') {
-              aborted = true;
-              abortReason = orchestratorResponse.abortReason || '编排者终止执行';
-              logger.info('Worker.Assignment.被编排者终止', { assignmentId: assignment.id, reason: abortReason }, LogCategory.ORCHESTRATOR);
-              break;
-            } else if (orchestratorResponse.action === 'adjust' && orchestratorResponse.adjustment) {
-              // 处理调整指令
-              await this.handleAdjustment(assignment, orchestratorResponse.adjustment);
+            // **汇报机制**: 每完成一个 Todo 向编排者汇报
+            if (options.onReport) {
+              const orchestratorResponse = await this.reportProgress(
+                assignment,
+                currentTodo,
+                completedTodos,
+                options
+              );
+
+              // 处理编排者响应
+              if (orchestratorResponse.action === 'abort') {
+                aborted = true;
+                abortReason = orchestratorResponse.abortReason || '编排者终止执行';
+                logger.info('Worker.Assignment.被编排者终止', { assignmentId: assignment.id, reason: abortReason }, LogCategory.ORCHESTRATOR);
+                break;
+              } else if (orchestratorResponse.action === 'adjust' && orchestratorResponse.adjustment) {
+                // 处理调整指令
+                await this.handleAdjustment(assignment, orchestratorResponse.adjustment);
+              }
             }
           }
         } else {
+          const failureReason = result.error || result.todo.output?.error || 'Unknown error';
+          const failureOutput: TodoOutput = result.todo.output || {
+            success: false,
+            summary: '',
+            modifiedFiles: [],
+            error: failureReason,
+            duration: 0,
+          };
+
+          // 失败恢复：先做策略决策，再执行恢复；恢复失败再上报编排者决策
+          const recoveryDecision = await this.planRecovery(currentTodo, assignment, failureOutput);
+          const recoveryExecution = await this.executeRecovery(recoveryDecision, currentTodo, assignment, options);
+
+          if (recoveryExecution.success && recoveryExecution.recoveredTodo) {
+            const recoveredTodo = recoveryExecution.recoveredTodo;
+            if (recoveredTodo.status === 'completed') {
+              completedTodos.push(recoveredTodo);
+              this.clearRetryCount(currentTodo.id);
+
+              if (session) {
+                sessionMgr.update(session.id, {
+                  completeTodo: {
+                    id: recoveredTodo.id,
+                    content: recoveredTodo.content,
+                  },
+                  stateSnapshot: {
+                    currentTodoIndex: completedTodos.length,
+                    lastExecutionAt: Date.now(),
+                  },
+                });
+              }
+
+              if (options.onReport) {
+                const orchestratorResponse = await this.reportProgress(
+                  assignment,
+                  recoveredTodo,
+                  completedTodos,
+                  options
+                );
+                if (orchestratorResponse.action === 'abort') {
+                  aborted = true;
+                  abortReason = orchestratorResponse.abortReason || '编排者终止执行';
+                  break;
+                } else if (orchestratorResponse.action === 'adjust' && orchestratorResponse.adjustment) {
+                  await this.handleAdjustment(assignment, orchestratorResponse.adjustment);
+                }
+              }
+
+              currentTodo = this.getNextExecutableTodo(assignment);
+              continue;
+            }
+
+            if (recoveredTodo.status === 'skipped') {
+              skippedTodos.push(recoveredTodo);
+              currentTodo = this.getNextExecutableTodo(assignment);
+              continue;
+            }
+          }
+
+          // 运行时向编排者上报阻塞问题（question），让编排者决定补充指令/改派/终止
+          const questionResponse = await this.reportQuestion(
+            assignment,
+            currentTodo,
+            failureReason,
+            recoveryDecision,
+            options
+          );
+          if (questionResponse.action === 'abort') {
+            aborted = true;
+            abortReason = questionResponse.abortReason || '编排者终止执行';
+            logger.info('Worker.Assignment.被编排者终止', { assignmentId: assignment.id, reason: abortReason }, LogCategory.ORCHESTRATOR);
+            break;
+          }
+          if (questionResponse.action === 'adjust' && questionResponse.adjustment) {
+            await this.handleAdjustment(assignment, questionResponse.adjustment);
+          }
+
           failedTodos.push(result.todo);
-          errors.push(result.error || 'Unknown error');
+          errors.push(failureReason);
 
           // 更新 Session 失败状态 - 提案 4.1
           if (session) {
             sessionMgr.update(session.id, {
               stateSnapshot: {
-                lastError: result.error,
+                lastError: failureReason,
                 lastExecutionAt: Date.now(),
               },
             });
@@ -442,6 +527,9 @@ export class AutonomousWorker extends EventEmitter {
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         errors.push(errorMessage);
+        if (!currentTodo) {
+          break;
+        }
         currentTodo.status = 'failed';
         currentTodo.output = {
           success: false,
@@ -456,6 +544,19 @@ export class AutonomousWorker extends EventEmitter {
 
       // 获取下一个可执行的 Todo
       currentTodo = this.getNextExecutableTodo(assignment);
+    }
+
+    // 同步拆分父 Todo 的最终状态（由 TodoManager.tryCompleteParent 自动完成）
+    for (const todo of assignment.todos) {
+      if (todo.status === 'running' && assignment.todos.some(t => t.parentId === todo.id)) {
+        const fresh = await this.todoManager.get(todo.id);
+        if (fresh && fresh.status === 'completed') {
+          todo.status = 'completed';
+          todo.completedAt = fresh.completedAt;
+          todo.output = fresh.output;
+          completedTodos.push(todo);
+        }
+      }
     }
 
     // 收集被跳过的 Todo
@@ -531,9 +632,6 @@ export class AutonomousWorker extends EventEmitter {
         tokenUsage: totalTokenUsage.inputTokens > 0 ? {
           inputTokens: totalTokenUsage.inputTokens,
           outputTokens: totalTokenUsage.outputTokens,
-          estimatedInputTokens: totalTokenUsage.estimatedInputTokens,
-          estimatedOutputTokens: totalTokenUsage.estimatedOutputTokens,
-          estimated: totalTokenUsage.estimated === true,
         } : undefined,
       };
 
@@ -662,6 +760,58 @@ export class AutonomousWorker extends EventEmitter {
         error: error instanceof Error ? error.message : String(error),
       }, LogCategory.ORCHESTRATOR);
       // 汇报失败时默认继续执行
+      return { action: 'continue', timestamp: Date.now() };
+    }
+  }
+
+  /**
+   * 向编排者上报阻塞问题（question）
+   */
+  private async reportQuestion(
+    assignment: Assignment,
+    todo: UnifiedTodo,
+    errorMessage: string,
+    decision: RecoveryDecision,
+    options: TodoExecuteOptions
+  ): Promise<OrchestratorResponse> {
+    if (!options.onReport) {
+      return { action: 'continue', timestamp: Date.now() };
+    }
+
+    const question = createQuestionReport(
+      this.workerType,
+      assignment.id,
+      {
+        content: [
+          `Todo 执行失败：${todo.content}`,
+          `失败原因：${errorMessage}`,
+          `恢复策略建议：${decision.strategy}（${decision.reason}）`,
+          '请决定是否补充指令、调整约束或改派任务。',
+        ].join('\n'),
+        options: [
+          '继续并补充指令',
+          '保持当前约束继续执行',
+          '终止当前任务',
+        ],
+        blocking: true,
+        questionType: 'decision',
+        todoId: todo.id,
+      }
+    );
+
+    try {
+      return await Promise.race([
+        options.onReport(question),
+        new Promise<OrchestratorResponse>((_, reject) =>
+          setTimeout(() => reject(new Error('问题上报超时')), options.reportTimeout || 5000)
+        ),
+      ]);
+    } catch (error) {
+      logger.warn('Worker.question上报失败，按继续执行处理', {
+        assignmentId: assignment.id,
+        todoId: todo.id,
+        error: error instanceof Error ? error.message : String(error),
+      }, LogCategory.ORCHESTRATOR);
       return { action: 'continue', timestamp: Date.now() };
     }
   }
@@ -847,6 +997,30 @@ export class AutonomousWorker extends EventEmitter {
         options
       );
 
+      // 检查执行过程中是否调用了 split_todo（数据驱动，无模式标志）
+      const hasChildren = assignment.todos.some(t => t.parentId === todo.id);
+      if (hasChildren) {
+        // 父 Todo 保持 running 状态，由 tryCompleteParent 在所有子 Todo 完成后自动标记完成
+        todo.output = {
+          success: true,
+          summary: `已拆分为 ${assignment.todos.filter(t => t.parentId === todo.id).length} 个子步骤`,
+          modifiedFiles: [],
+          duration: Date.now() - startTime,
+        };
+
+        this.emit('todoSplit', {
+          assignmentId: assignment.id,
+          parentTodoId: todo.id,
+          childCount: assignment.todos.filter(t => t.parentId === todo.id).length,
+        });
+
+        return {
+          success: true,
+          todo,
+          tokenUsage: output.tokenUsage,
+        };
+      }
+
       // 更新 Todo 状态 - 使用 TodoManager
       const todoOutput: TodoOutput = {
         success: true,
@@ -940,12 +1114,17 @@ export class AutonomousWorker extends EventEmitter {
       sections.push(`## 注意：以下内容不在你的职责范围内\n${assignment.scope.excludes.map(e => `- ${e}`).join('\n')}`);
     }
 
+    // 3.1 范围线索（非硬约束）
+    if (assignment.scope.scopeHints && assignment.scope.scopeHints.length > 0) {
+      sections.push(`## 范围线索（非硬约束）\n${assignment.scope.scopeHints.map(p => `- ${p}`).join('\n')}\n\n先从以上线索定位，再根据实际情况自然扩展。`);
+    }
+
     // 3.1 目标文件（若有）
     if (assignment.scope.targetPaths && assignment.scope.targetPaths.length > 0) {
       const requirement = assignment.scope.requiresModification
-        ? '任务性质：需要对上述文件进行实际修改并保存。'
+        ? '任务性质：需要对上述严格目标文件产生实际修改并保存。'
         : '任务性质：仅需读取/分析，无需修改文件。';
-      sections.push(`## 目标文件\n${assignment.scope.targetPaths.map(p => `- ${p}`).join('\n')}\n\n${requirement}`);
+      sections.push(`## 严格目标文件\n${assignment.scope.targetPaths.map(p => `- ${p}`).join('\n')}\n\n${requirement}`);
     }
 
     // 3.2 目标文件摘要（强制缓存前置读取）
@@ -961,6 +1140,23 @@ export class AutonomousWorker extends EventEmitter {
     // 5. Assignment 级执行约束（角色定义在 Worker systemPrompt）
     if (assignment.guidancePrompt) {
       sections.push(`## 执行约束\n${assignment.guidancePrompt}`);
+    }
+
+    // 6. 任务拆分指引（L1/L2 可拆分，L3 不可）
+    const hasGrandparent = todo.parentId && assignment.todos.find(t => t.id === todo.parentId)?.parentId;
+    if (!hasGrandparent) {
+      sections.push(`## 任务拆分
+如果当前任务涉及多个可独立完成和验证的子目标，可使用 split_todo 将其拆分为子步骤。
+拆分适用：任务包含多个独立子目标，拆分后每个子步骤可单独完成和验证。
+不适用：任务本身是单一目标，直接执行即可。`);
+    }
+
+    // 7. 子 Todo 上下文（L2/L3 展示父级关系，聚焦当前子步骤）
+    if (todo.parentId) {
+      const parentTodo = assignment.todos.find(t => t.id === todo.parentId);
+      if (parentTodo) {
+        sections.push(`## 父级任务\n当前步骤是以下任务的子步骤：${parentTodo.content}\n请聚焦完成当前子步骤的目标，不要重复处理兄弟步骤的内容。`);
+      }
     }
 
     return sections.join('\n\n');
@@ -1150,23 +1346,6 @@ export class AutonomousWorker extends EventEmitter {
     return allTokens
       .filter(w => !stopWords.has(w.toLowerCase()) && w.length > 3)
       .slice(0, 8);
-  }
-
-  private mapTodoKind(todoType: string): SubTask['kind'] {
-    switch (todoType) {
-      case 'integration':
-        return 'integration';
-      case 'repair':
-        return 'repair';
-      case 'architecture':
-        return 'architecture';
-      case 'batch':
-        return 'batch';
-      case 'background':
-        return 'background';
-      default:
-        return 'implementation';
-    }
   }
 
   /**
@@ -1456,26 +1635,34 @@ export class AutonomousWorker extends EventEmitter {
    * 获取下一个可执行的 Todo
    */
   private getNextExecutableTodo(assignment: Assignment): UnifiedTodo | null {
-    for (const todo of assignment.todos) {
-      // pending 或 ready 状态的 Todo 都可以执行
-      // (TodoManager.create 会根据依赖自动将 pending 转为 ready)
-      if (todo.status !== 'pending' && todo.status !== 'ready') continue;
-
-      // 检查超范围审批
-      if (todo.outOfScope && todo.approvalStatus !== 'approved') continue;
-
-      // 检查依赖
-      const dependenciesMet = todo.dependsOn.every(depId => {
+    const isExecutable = (todo: UnifiedTodo): boolean => {
+      if (todo.status !== 'pending' && todo.status !== 'ready') return false;
+      if (todo.outOfScope && todo.approvalStatus !== 'approved') return false;
+      return todo.dependsOn.every(depId => {
         const depTodo = assignment.todos.find(t => t.id === depId);
         return depTodo && depTodo.status === 'completed';
       });
+    };
 
-      if (dependenciesMet) {
-        return todo;
+    // 深度优先：优先完成已拆分任务的最深层子步骤
+    let candidate: UnifiedTodo | null = null;
+    let candidateDepth = -1;
+
+    for (const todo of assignment.todos) {
+      if (!isExecutable(todo)) continue;
+      let depth = 0;
+      let cur: UnifiedTodo | undefined = todo;
+      while (cur?.parentId) {
+        depth++;
+        cur = assignment.todos.find(t => t.id === cur!.parentId);
+      }
+      if (depth > candidateDepth) {
+        candidate = todo;
+        candidateDepth = depth;
       }
     }
 
-    return null;
+    return candidate;
   }
 
   /**
@@ -1691,135 +1878,6 @@ export class AutonomousWorker extends EventEmitter {
     }
   }
 
-  /**
-   * 执行带恢复的 Assignment
-   *
-   * 与 executeAssignment 类似，但会自动尝试恢复失败的 Todo
-   */
-  async executeAssignmentWithRecovery(
-    assignment: Assignment,
-    options: TodoExecuteOptions,
-    maxRecoveryAttempts: number = 3
-  ): Promise<AutonomousExecutionResult> {
-    const startTime = Date.now();
-    const completedTodos: UnifiedTodo[] = [];
-    const failedTodos: UnifiedTodo[] = [];
-    const skippedTodos: UnifiedTodo[] = [];
-    const dynamicTodos: UnifiedTodo[] = [];
-    const recoveredTodos: UnifiedTodo[] = [];
-    const errors: string[] = [];
-    let recoveryAttempts = 0;
-    // 聚合 Token 使用统计
-    let totalTokenUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
-
-    // 设置当前 Mission ID - 提案 9.2
-    this.currentMissionId = assignment.missionId;
-    this.resetCacheReadStats();
-
-    // 组装共享上下文（强制依赖已保证可用）
-    // 从 scope.includes 提取标签，如果没有则使用空数组
-    const tags = assignment.scope.includes || [];
-    const sharedContextForRecovery = await this.assembleSharedContext(
-      assignment.missionId,
-      tags
-    );
-
-    this.emit('assignmentStarted', { assignmentId: assignment.id });
-
-    let currentTodo = this.getNextExecutableTodo(assignment);
-
-    while (currentTodo) {
-      // 传递共享上下文 - 提案 9.2
-      const result = await this.executeTodo(currentTodo, assignment, options, sharedContextForRecovery);
-
-      // 聚合 Token 统计
-      if (result.tokenUsage) {
-        this.mergeTokenUsage(totalTokenUsage, result.tokenUsage);
-      }
-
-      if (result.success) {
-        completedTodos.push(result.todo);
-      } else {
-        // 尝试恢复
-        const todoRetryCount = this.retryCountMap.get(currentTodo.id) || 0;
-
-        if (todoRetryCount < maxRecoveryAttempts && result.todo.output) {
-          const decision = await this.planRecovery(
-            result.todo,
-            assignment,
-            result.todo.output
-          );
-
-          if (decision.strategy !== 'skip_task' && decision.strategy !== 'request_human_help') {
-            recoveryAttempts++;
-            const recoveryResult = await this.executeRecovery(
-              decision,
-              currentTodo,
-              assignment,
-              options
-            );
-
-            if (recoveryResult.success && recoveryResult.recoveredTodo) {
-              recoveredTodos.push(recoveryResult.recoveredTodo);
-              completedTodos.push(recoveryResult.recoveredTodo);
-              currentTodo = this.getNextExecutableTodo(assignment);
-              continue;
-            }
-          }
-        }
-
-        // 恢复失败或达到最大重试次数
-        failedTodos.push(result.todo);
-        errors.push(result.error || 'Unknown error');
-
-        // 跳过依赖的 Todo
-        const dependentTodos = this.getDependentTodos(currentTodo, assignment);
-        for (const depTodo of dependentTodos) {
-          depTodo.status = 'skipped';
-          depTodo.blockedReason = `依赖的 Todo "${currentTodo.content}" 失败`;
-          skippedTodos.push(depTodo);
-        }
-      }
-
-      currentTodo = this.getNextExecutableTodo(assignment);
-    }
-
-    // 收集被跳过的 Todo
-    for (const todo of assignment.todos) {
-      if (todo.status === 'skipped' && !skippedTodos.includes(todo)) {
-        skippedTodos.push(todo);
-      }
-    }
-
-    const finalResult: AutonomousExecutionResult = {
-      assignment,
-      success: completedTodos.length > 0 && failedTodos.length === 0,
-      completedTodos,
-      failedTodos,
-      skippedTodos,
-      dynamicTodos,
-      recoveredTodos,
-      totalDuration: Date.now() - startTime,
-      errors,
-      recoveryAttempts,
-      summary: '', // 占位，qualityGate 后由 buildStructuredSummary 填充
-      tokenUsage: totalTokenUsage,
-    };
-    const qualityCheckedResult = this.applyQualityGate(
-      assignment,
-      finalResult,
-      sharedContextForRecovery,
-      startTime
-    );
-    qualityCheckedResult.summary = this.buildStructuredSummary(qualityCheckedResult);
-
-    this.currentMissionId = undefined;
-    this.resetCacheReadStats();
-    this.emit('assignmentCompleted', qualityCheckedResult);
-
-    return qualityCheckedResult;
-  }
-
   private mergeTokenUsage(target: TokenUsage, usage: TokenUsage): void {
     target.inputTokens += usage.inputTokens || 0;
     target.outputTokens += usage.outputTokens || 0;
@@ -1828,15 +1886,6 @@ export class AutonomousWorker extends EventEmitter {
     }
     if (usage.cacheWriteTokens) {
       target.cacheWriteTokens = (target.cacheWriteTokens || 0) + usage.cacheWriteTokens;
-    }
-    if (usage.estimatedInputTokens) {
-      target.estimatedInputTokens = (target.estimatedInputTokens || 0) + usage.estimatedInputTokens;
-    }
-    if (usage.estimatedOutputTokens) {
-      target.estimatedOutputTokens = (target.estimatedOutputTokens || 0) + usage.estimatedOutputTokens;
-    }
-    if (usage.estimated) {
-      target.estimated = true;
     }
   }
 

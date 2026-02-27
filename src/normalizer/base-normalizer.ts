@@ -192,7 +192,6 @@ export abstract class BaseNormalizer extends EventEmitter {
     outputTokens?: number;
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
-    estimated?: boolean;
   }): void {
     const context = this.activeContexts.get(messageId);
     if (!context) {

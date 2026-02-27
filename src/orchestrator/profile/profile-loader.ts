@@ -121,10 +121,6 @@ export class ProfileLoader {
     return profile;
   }
 
-  getAllProfiles(): Map<WorkerSlot, WorkerProfile> {
-    return this.profiles;
-  }
-
   /**
    * 获取已启用的 Worker 画像（Single Source of Truth）
    *
@@ -147,7 +143,7 @@ export class ProfileLoader {
     return this.categories.get(categoryName);
   }
 
-  getAllCategories(): Map<string, CategoryDefinition> {
+  getAllCategories(): ReadonlyMap<string, CategoryDefinition> {
     return this.categories;
   }
 

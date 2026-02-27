@@ -12,20 +12,8 @@ import { WorkerSlot, SubTask, PermissionMatrix, StrategyConfig } from '../../typ
 export { SubTask, WorkerSlot };
 
 // ============================================================================
-// Worker 相关类型
+// 执行相关类型
 // ============================================================================
-
-/** Worker 状态 */
-export type WorkerState = 'idle' | 'executing' | 'completed' | 'failed' | 'cancelled';
-
-/** Worker 信息 */
-export interface WorkerInfo {
-  id: string;
-  type: WorkerSlot;
-  state: WorkerState;
-  currentTaskId?: string;
-  lastActivity?: number;
-}
 
 /** 执行计划 */
 export interface ExecutionPlan {
@@ -69,167 +57,6 @@ export interface ExecutionResult {
   inputTokens?: number;
   outputTokens?: number;
 }
-
-// ============================================================================
-// 消息总线类型
-// ============================================================================
-
-/** 消息类型 */
-export type MessageType =
-  | 'task_dispatch'           // 编排者 -> Worker：分配任务
-  | 'task_cancel'             // 编排者 -> Worker：取消任务
-  | 'progress_report'         // Worker -> 编排者：进度汇报
-  | 'task_completed'          // Worker -> 编排者：任务完成
-  | 'task_failed'             // Worker -> 编排者：任务失败
-  | 'worker_ready'            // Worker -> 编排者：Worker 就绪
-  | 'orchestrator_command'    // 编排者广播命令
-  | 'clarification_request'   // 编排者 -> 用户：请求澄清需求
-  | 'clarification_response'  // 用户 -> 编排者：回答澄清问题
-  | 'worker_question'         // Worker -> 编排者：子代理提问
-  | 'worker_answer';          // 编排者 -> Worker：回答子代理问题
-
-/** 基础消息结构 */
-export interface BaseMessage {
-  id: string;
-  type: MessageType;
-  timestamp: number;
-  source: string;  // 发送者 ID
-  target?: string; // 接收者 ID（可选，用于定向消息）
-}
-
-/** 任务分发消息 */
-export interface TaskDispatchMessage extends BaseMessage {
-  type: 'task_dispatch';
-  payload: {
-    taskId: string;
-    subTask: SubTask;
-    context?: string;
-    dispatchId?: string;
-  };
-}
-
-/** 任务取消消息 */
-export interface TaskCancelMessage extends BaseMessage {
-  type: 'task_cancel';
-  payload: {
-    taskId: string;
-    subTaskId?: string;
-    reason?: string;
-  };
-}
-
-/** 进度汇报消息 */
-export interface ProgressReportMessage extends BaseMessage {
-  type: 'progress_report';
-  payload: {
-    taskId: string;
-    subTaskId: string;
-    dispatchId?: string;
-    status: 'started' | 'in_progress' | 'completed' | 'failed';
-    progress?: number; // 0-100
-    message?: string;
-    output?: string;   // 流式输出内容
-  };
-}
-
-/** 任务完成消息 */
-export interface TaskCompletedMessage extends BaseMessage {
-  type: 'task_completed';
-  payload: {
-    result: ExecutionResult;
-  };
-}
-
-/** 任务失败消息 */
-export interface TaskFailedMessage extends BaseMessage {
-  type: 'task_failed';
-  payload: {
-    taskId: string;
-    subTaskId: string;
-    error: string;
-    canRetry: boolean;
-    dispatchId?: string;
-  };
-}
-
-/** Worker 就绪消息 */
-export interface WorkerReadyMessage extends BaseMessage {
-  type: 'worker_ready';
-  payload: {
-    workerInfo: WorkerInfo;
-  };
-}
-
-/** 编排者命令消息 */
-export interface OrchestratorCommandMessage extends BaseMessage {
-  type: 'orchestrator_command';
-  payload: {
-    command: 'pause_all' | 'resume_all' | 'cancel_all' | 'status_check';
-  };
-}
-
-/** 需求澄清请求消息（编排者 -> 用户） */
-export interface ClarificationRequestMessage extends BaseMessage {
-  type: 'clarification_request';
-  payload: {
-    taskId: string;
-    questions: string[];           // 需要用户回答的问题列表
-    context: string;               // 问题上下文
-    ambiguityScore: number;        // 模糊度评分 (0-100)
-    originalPrompt: string;        // 原始用户输入
-  };
-}
-
-/** 需求澄清响应消息（用户 -> 编排者） */
-export interface ClarificationResponseMessage extends BaseMessage {
-  type: 'clarification_response';
-  payload: {
-    taskId: string;
-    answers: Record<string, string>;  // 问题-答案映射
-    additionalInfo?: string;          // 用户补充的额外信息
-  };
-}
-
-/** Worker 提问消息（Worker -> 编排者） */
-export interface WorkerQuestionMessage extends BaseMessage {
-  type: 'worker_question';
-  payload: {
-    taskId: string;
-    subTaskId: string;
-    workerId: string;
-    question: string;              // 问题内容
-    context: string;               // 问题上下文
-    options?: string[];            // 可选的选项
-    timeout?: number;              // 等待超时（毫秒）
-    questionId: string;            // 问题唯一ID
-  };
-}
-
-/** Worker 回答消息（编排者 -> Worker） */
-export interface WorkerAnswerMessage extends BaseMessage {
-  type: 'worker_answer';
-  payload: {
-    taskId: string;
-    subTaskId: string;
-    questionId: string;            // 对应的问题ID
-    answer: string;                // 回答内容
-    answeredBy: 'user' | 'orchestrator';  // 回答来源
-  };
-}
-
-/** 所有消息类型联合 */
-export type BusMessage =
-  | TaskDispatchMessage
-  | TaskCancelMessage
-  | ProgressReportMessage
-  | TaskCompletedMessage
-  | TaskFailedMessage
-  | WorkerReadyMessage
-  | OrchestratorCommandMessage
-  | ClarificationRequestMessage
-  | ClarificationResponseMessage
-  | WorkerQuestionMessage
-  | WorkerAnswerMessage;
 
 // ============================================================================
 // 编排者相关类型
@@ -369,35 +196,6 @@ export interface OrchestratorUIMessage {
     canRetry?: boolean;
     questions?: string[];
   };
-}
-
-// ============================================================================
-// 事件类型
-// ============================================================================
-
-/** 消息总线事件 */
-export interface MessageBusEvents {
-  message: (message: BusMessage) => void;
-  error: (error: Error) => void;
-}
-
-/** Worker 事件 */
-export interface WorkerEvents {
-  stateChange: (state: WorkerState) => void;
-  output: (chunk: string) => void;
-  progress: (progress: number, message?: string) => void;
-  completed: (result: ExecutionResult) => void;
-  failed: (error: string) => void;
-}
-
-/** 编排者事件 */
-export interface OrchestratorEvents {
-  stateChange: (state: OrchestratorState) => void;
-  planReady: (plan: ExecutionPlan) => void;
-  workerProgress: (workerId: string, progress: ProgressReportMessage['payload']) => void;
-  taskCompleted: (result: ExecutionResult) => void;
-  allCompleted: (results: ExecutionResult[]) => void;
-  error: (error: Error) => void;
 }
 
 // ============================================================================

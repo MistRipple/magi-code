@@ -46,7 +46,7 @@
   .message-item {
     animation: none;
   }
-  .message-item.assistant.streaming::after {
+  .message-item.assistant.streaming {
     animation: none;
   }
 }
@@ -82,25 +82,18 @@
 /* 流式输出时的轻量动效 */
 .message-item.assistant.streaming {
   position: relative;
+  animation: streamingBorderPulse 1.6s ease-in-out infinite;
 }
 
-.message-item.assistant.streaming::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  /* 🔧 手动应用圆角以防止动画溢出 */
-  border-radius: var(--radius-lg);
-  background: linear-gradient(90deg, transparent, var(--stream-accent, var(--color-orchestrator)), transparent);
-  opacity: 0.08;
-  transform: translateX(-100%);
-  animation: streamSweep 1.6s ease-in-out infinite;
-  pointer-events: none;
-}
-
-@keyframes streamSweep {
-  0% { transform: translateX(-100%); }
-  60% { transform: translateX(100%); }
-  100% { transform: translateX(100%); }
+@keyframes streamingBorderPulse {
+  0%, 100% {
+    border-color: var(--border);
+    box-shadow: none;
+  }
+  50% {
+    border-color: color-mix(in srgb, var(--stream-accent, var(--info)) 55%, var(--border));
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--stream-accent, var(--info)) 25%, transparent);
+  }
 }
 
 /* 用户消息：透明背景，无外层边框 */
@@ -163,23 +156,12 @@
   }
 }
 
-/* 完成时移除流式扫描效果 */
-.message-item.assistant.just-completed::after {
-  animation: streamSweepFadeOut 0.3s ease-out forwards;
-}
-
-@keyframes streamSweepFadeOut {
-  from { opacity: 0.08; }
-  to { opacity: 0; }
-}
-
 /* ========== 减少动画偏好 ========== */
 
 @media (prefers-reduced-motion: reduce) {
   .message-item.user.sending .user-content,
   .message-item.assistant.was-placeholder,
-  .message-item.assistant.just-completed,
-  .message-item.assistant.just-completed::after {
+  .message-item.assistant.just-completed {
     animation: none;
   }
 }

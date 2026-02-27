@@ -61,9 +61,17 @@ export interface AdapterResponse {
   tokenUsage?: {
     inputTokens: number;
     outputTokens: number;
-    estimated?: boolean;
-    estimatedInputTokens?: number;
-    estimatedOutputTokens?: number;
+  };
+  /**
+   * 编排器本轮运行态（仅 orchestrator 返回）
+   */
+  orchestratorRuntime?: {
+    reason:
+      | 'completed'
+      | 'failure_limit'
+      | 'interrupted'
+      | 'unknown';
+    rounds: number;
   };
 }
 

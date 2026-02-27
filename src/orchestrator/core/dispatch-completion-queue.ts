@@ -1,6 +1,7 @@
 import { logger, LogCategory } from '../../logging';
 import type { WorkerCompletionResult, WaitForWorkersResult } from '../../tools/orchestration-executor';
 import type { DispatchBatch, DispatchEntry, DispatchStatus } from './dispatch-batch';
+import { isTerminalStatus } from './dispatch-batch';
 
 interface WaitForWorkersOptions {
   waitTimeoutMs: number;
@@ -94,25 +95,21 @@ export class DispatchCompletionQueue {
 
     return Array.from(targetIds).every(id => {
       const entry = batch.getEntry(id);
-      return !!entry && this.isTerminalStatus(entry.status);
+      return !!entry && isTerminalStatus(entry.status);
     });
-  }
-
-  private isTerminalStatus(status: DispatchStatus): boolean {
-    return status === 'completed' || status === 'failed' || status === 'skipped' || status === 'cancelled';
   }
 
   private getPendingTargetTaskIds(batch: DispatchBatch, targetIds: Set<string> | null): string[] {
     if (!targetIds) {
       return batch.getEntries()
-        .filter(entry => !this.isTerminalStatus(entry.status))
+        .filter(entry => !isTerminalStatus(entry.status))
         .map(entry => entry.taskId);
     }
 
     const pending: string[] = [];
     for (const taskId of targetIds) {
       const entry = batch.getEntry(taskId);
-      if (!entry || !this.isTerminalStatus(entry.status)) {
+      if (!entry || !isTerminalStatus(entry.status)) {
         pending.push(taskId);
       }
     }
@@ -143,7 +140,7 @@ export class DispatchCompletionQueue {
         }
 
         const entry = batch.getEntry(taskId);
-        if (!entry || !this.isTerminalStatus(entry.status)) {
+        if (!entry || !isTerminalStatus(entry.status)) {
           continue;
         }
 

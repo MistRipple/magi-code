@@ -36,6 +36,10 @@ const SEND_TEXT_WAIT_MS = 500;
 
 /** 轮询起始延迟 (ms) */
 const POLL_START_DELAY_MS = 100;
+/** 进程状态轮询间隔 (ms) */
+const PROCESS_WAIT_POLL_MS = 100;
+/** 兜底总时长硬上限 (ms) */
+const PROCESS_HARD_TIMEOUT_MS = 6 * 60 * 60 * 1000; // 6 小时
 
 /**
  * 检测 Shell 类型
@@ -73,7 +77,7 @@ export class VSCodeTerminalExecutor {
   private processes: Map<number, TerminalProcess> = new Map();
   private nextId: number = 1;
   private readonly defaultTimeout: number = 30000; // 30 秒
-  private readonly maxTimeout: number = 300000; // 5 分钟
+  private readonly maxTimeout: number = 3600000; // 1 小时（用于空闲超时参数上限）
 
   // 终端复用
   private mainTerminal: vscode.Terminal | null = null;
@@ -83,6 +87,7 @@ export class VSCodeTerminalExecutor {
   private agentTerminals: Map<string, vscode.Terminal> = new Map();
   private terminalAgentNames: Map<vscode.Terminal, string> = new Map();
   private terminalCloseListener: vscode.Disposable | null = null;
+  private stopProcessTasks: Map<number, Promise<void>> = new Map();
 
   // 双策略
   private vscodeEventsStrategy: VSCodeEventsStrategy;
@@ -128,11 +133,12 @@ export class VSCodeTerminalExecutor {
     this.terminalAgentNames.clear();
     this.terminalInitialized.clear();
     this.terminalShellType.clear();
+    this.stopProcessTasks.clear();
   }
 
 
   async launchProcess(options: LaunchProcessOptions, signal?: AbortSignal): Promise<LaunchProcessResult> {
-    const timeout = Math.min(Math.max(options.maxWaitSeconds, 1) * 1000, this.maxTimeout);
+    const idleTimeoutMs = this.normalizeIdleTimeoutMs(options.maxWaitSeconds);
     const agentName = (options.name || '').trim();
     if (!agentName) {
       throw new Error('launch-process 必须提供 agent 终端名称（orchestrator、worker-claude、worker-gemini、worker-codex）');
@@ -152,23 +158,24 @@ export class VSCodeTerminalExecutor {
     }
 
     const processId = this.nextId++;
-    const shellType = this.terminalShellType.get(terminal) || detectShellType(terminal);
+    const now = Date.now();
     const process: TerminalProcess = {
       id: processId,
       terminal,
       command: options.command,
       actualCommand: options.command,
       lastCommand: '',
-      startTime: Date.now(),
+      startTime: now,
       output: '',
       exitCode: null,
       state: 'starting',
+      updatedAt: now,
     };
     this.processes.set(processId, process);
     this.terminalBusy.set(terminal, true);
 
     process.state = 'running';
-    void this.executeCommand(process, options.command, timeout, shellType)
+    void this.executeCommand(process, options.command)
       .then(() => {
         if (process.state === 'running') {
           process.state = process.exitCode === 0 ? 'completed' : 'failed';
@@ -183,11 +190,15 @@ export class VSCodeTerminalExecutor {
       })
       .finally(() => {
         process.endTime = Date.now();
-        this.terminalBusy.set(terminal, false);
+        if (this.managedTerminals.has(terminal)) {
+          this.terminalBusy.set(terminal, false);
+        } else {
+          this.terminalBusy.delete(terminal);
+        }
       });
 
     if (options.wait) {
-      await this.waitForProcessState(processId, timeout, signal);
+      await this.waitForProcessState(processId, idleTimeoutMs, signal);
     }
 
     return {
@@ -205,8 +216,8 @@ export class VSCodeTerminalExecutor {
     }
 
     if (wait && (process.state === 'running' || process.state === 'starting')) {
-      const timeout = Math.min(Math.max(maxWaitSeconds, 1) * 1000, this.maxTimeout);
-      await this.waitForProcessState(terminalId, timeout);
+      const idleTimeoutMs = this.normalizeIdleTimeoutMs(maxWaitSeconds);
+      await this.waitForProcessState(terminalId, idleTimeoutMs);
     }
 
     const cwd = this.terminalCwds.get(process.terminal) || this.getCwd(process.terminal);
@@ -248,13 +259,7 @@ export class VSCodeTerminalExecutor {
       };
     }
 
-    process.state = 'killed';
-    process.exitCode = process.exitCode ?? -1;
-    process.terminal.sendText('\x03');
-    await this.delay(100);
-
-    process.endTime = Date.now();
-    this.terminalBusy.set(process.terminal, false);
+    await this.forceStopProcess(process, 'killed', 'kill-process');
 
     return {
       killed: true,
@@ -288,19 +293,13 @@ export class VSCodeTerminalExecutor {
     return result;
   }
 
-  private async waitForProcessState(processId: number, timeoutMs: number, signal?: AbortSignal): Promise<void> {
-    const startedAt = Date.now();
-
-    while (Date.now() - startedAt < timeoutMs) {
+  private async waitForProcessState(processId: number, idleTimeoutMs: number, signal?: AbortSignal): Promise<void> {
+    while (true) {
       // 中断检查：收到 abort 信号时 kill 进程并退出等待
       if (signal?.aborted) {
         const process = this.processes.get(processId);
         if (process && (process.state === 'running' || process.state === 'starting')) {
-          process.state = 'killed';
-          process.exitCode = process.exitCode ?? -1;
-          process.terminal.sendText('\x03');
-          process.endTime = Date.now();
-          this.terminalBusy.set(process.terminal, false);
+          await this.forceStopProcess(process, 'killed', 'abort-signal');
         }
         return;
       }
@@ -314,15 +313,19 @@ export class VSCodeTerminalExecutor {
         return;
       }
 
-      await this.delay(100);
-    }
+      const now = Date.now();
+      const lastActivityAt = process.updatedAt ?? process.startTime;
+      if (now - lastActivityAt >= idleTimeoutMs) {
+        await this.forceStopProcess(process, 'timeout', `idle-timeout:${idleTimeoutMs}ms`);
+        return;
+      }
 
-    const process = this.processes.get(processId);
-    if (process && (process.state === 'running' || process.state === 'starting')) {
-      process.state = 'timeout';
-      process.exitCode = process.exitCode ?? null;
-      process.endTime = Date.now();
-      this.terminalBusy.set(process.terminal, false);
+      if (now - process.startTime >= PROCESS_HARD_TIMEOUT_MS) {
+        await this.forceStopProcess(process, 'timeout', `hard-timeout:${PROCESS_HARD_TIMEOUT_MS}ms`);
+        return;
+      }
+
+      await this.delay(PROCESS_WAIT_POLL_MS);
     }
   }
 
@@ -497,9 +500,7 @@ export class VSCodeTerminalExecutor {
    */
   private async executeCommand(
     process: TerminalProcess,
-    command: string,
-    timeout: number,
-    shellType: ShellType
+    command: string
   ): Promise<void> {
     const terminal = process.terminal;
 
@@ -507,20 +508,20 @@ export class VSCodeTerminalExecutor {
     // ScriptCapture 已就绪时，即使 Shell Integration 后来变为可用，也继续使用 ScriptCapture
     if (this.scriptCaptureStrategy.isReady(terminal)) {
       logger.debug('使用 ScriptCapture 策略执行命令', undefined, LogCategory.SHELL);
-      await this.executeWithScriptCapture(process, command, timeout, shellType);
+      await this.executeWithScriptCapture(process, command);
       return;
     }
 
     // 使用 Shell Integration（仅在 ScriptCapture 未初始化时）
     if (terminal.shellIntegration) {
       logger.debug('使用 Shell Integration 执行命令', undefined, LogCategory.SHELL);
-      await this.executeWithShellIntegration(process, command, timeout);
+      await this.executeWithShellIntegration(process, command);
       return;
     }
 
     // 基础模式：只发送命令，无法获取输出
     logger.debug('使用基础模式执行命令（无法获取输出）', undefined, LogCategory.SHELL);
-    await this.executeWithSendText(process, command, timeout);
+    await this.executeWithSendText(process, command);
   }
 
   /**
@@ -531,8 +532,7 @@ export class VSCodeTerminalExecutor {
    */
   private async executeWithShellIntegration(
     process: TerminalProcess,
-    command: string,
-    timeout: number
+    command: string
   ): Promise<void> {
     const terminal = process.terminal;
     const shellIntegration = terminal.shellIntegration!;
@@ -544,10 +544,20 @@ export class VSCodeTerminalExecutor {
 
     return new Promise((resolve, reject) => {
       let settled = false;
+      const stateWatcher = setInterval(() => {
+        if (settled) {
+          return;
+        }
+        if (process.state !== 'running' && process.state !== 'starting') {
+          process.output = output || process.output;
+          settle('resolve');
+        }
+      }, PROCESS_WAIT_POLL_MS);
+
       const settle = (action: 'resolve' | 'reject', error?: Error) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timeoutId);
+        clearInterval(stateWatcher);
         endListener?.dispose();
         if (action === 'resolve') {
           resolve();
@@ -555,12 +565,6 @@ export class VSCodeTerminalExecutor {
           reject(error);
         }
       };
-
-      const timeoutId = setTimeout(() => {
-        process.state = 'timeout';
-        process.exitCode = -1;
-        settle('reject', new Error(`命令执行超时 (${timeout}ms)`));
-      }, timeout);
 
       let output = '';
 
@@ -570,6 +574,7 @@ export class VSCodeTerminalExecutor {
           process.exitCode = e.exitCode ?? 0;
           process.state = process.exitCode === 0 ? 'completed' : 'failed';
           process.output = output;
+          this.markProcessActivity(process);
           settle('resolve');
         }
       });
@@ -581,15 +586,21 @@ export class VSCodeTerminalExecutor {
             if (settled) break;
             output += data;
             process.output = output;
+            this.markProcessActivity(process);
           }
           // 流结束 — 如果事件还没触发，以流结束为准
           if (!settled) {
             process.state = 'completed';
             process.exitCode = process.exitCode ?? 0;
             process.output = output;
+            this.markProcessActivity(process);
             settle('resolve');
           }
         } catch (error: any) {
+          if (process.state === 'killed' || process.state === 'timeout') {
+            settle('resolve');
+            return;
+          }
           process.exitCode = 1;
           process.output = output;
           settle('reject', error);
@@ -603,9 +614,7 @@ export class VSCodeTerminalExecutor {
    */
   private async executeWithScriptCapture(
     process: TerminalProcess,
-    command: string,
-    timeout: number,
-    shellType: ShellType
+    command: string
   ): Promise<void> {
     const terminal = process.terminal;
 
@@ -622,17 +631,22 @@ export class VSCodeTerminalExecutor {
     terminal.sendText(wrappedCommand, true);
 
     // 轮询检测完成状态
-    return new Promise((resolve, reject) => {
-      const startTime = Date.now();
+    return new Promise((resolve) => {
       const pollInterval = 150; // 150ms 轮询间隔
 
       const poll = () => {
-        // 检查超时
-        if (Date.now() - startTime > timeout) {
-          process.state = 'killed';
-          process.exitCode = -1;
-          reject(new Error(`命令执行超时 (${timeout}ms)`));
+        if (process.state === 'killed' || process.state === 'timeout') {
+          resolve();
           return;
+        }
+
+        if (process.state === 'completed' || process.state === 'failed') {
+          resolve();
+          return;
+        }
+
+        if (this.scriptCaptureStrategy.hasOutputActivity(terminal)) {
+          this.markProcessActivity(process);
         }
 
         // 检查完成状态
@@ -656,6 +670,7 @@ export class VSCodeTerminalExecutor {
           }
 
           process.state = 'completed';
+          this.markProcessActivity(process);
           resolve();
           return;
         }
@@ -674,8 +689,7 @@ export class VSCodeTerminalExecutor {
    */
   private async executeWithSendText(
     process: TerminalProcess,
-    command: string,
-    timeout: number
+    command: string
   ): Promise<void> {
     const terminal = process.terminal;
 
@@ -686,6 +700,7 @@ export class VSCodeTerminalExecutor {
         process.state = 'completed';
         process.exitCode = 0;
         process.output = '(命令已发送到终端，请查看终端窗口获取输出)';
+        this.markProcessActivity(process);
         logger.info('命令已发送到终端 (基础模式)', {
           command,
           note: '无法捕获输出，请查看终端窗口',
@@ -727,18 +742,7 @@ export class VSCodeTerminalExecutor {
       return;
     }
 
-    logger.debug('终止终端进程', { processId }, LogCategory.SHELL);
-
-    process.state = 'killed';
-    process.exitCode = -1;
-
-    // 发送 Ctrl+C
-    process.terminal.sendText('\x03');
-
-    await this.delay(100);
-
-    // 关闭终端
-    process.terminal.dispose();
+    await this.forceStopProcess(process, 'killed', 'legacy-kill');
 
     this.processes.delete(processId);
   }
@@ -787,6 +791,62 @@ export class VSCodeTerminalExecutor {
     }
 
     this.processes.clear();
+    this.stopProcessTasks.clear();
+  }
+
+  private async forceStopProcess(
+    process: TerminalProcess,
+    targetState: 'killed' | 'timeout',
+    reason: string
+  ): Promise<void> {
+    const existing = this.stopProcessTasks.get(process.id);
+    if (existing) {
+      await existing;
+      return;
+    }
+
+    const stopTask = (async () => {
+      if (process.state === 'completed' || process.state === 'failed') {
+        return;
+      }
+      if (process.state === 'killed' || process.state === 'timeout') {
+        return;
+      }
+
+      const terminal = process.terminal;
+      logger.warn('强制停止终端进程', {
+        processId: process.id,
+        reason,
+        targetState,
+        command: process.command,
+      }, LogCategory.SHELL);
+
+      try {
+        terminal.sendText('\x03', false);
+      } catch (error) {
+        logger.debug('发送 Ctrl+C 失败', { processId: process.id, error }, LogCategory.SHELL);
+      }
+
+      await this.delay(100);
+
+      try {
+        await this.scriptCaptureStrategy.interruptActiveCommand(terminal);
+      } catch (error) {
+        logger.debug('终止子进程树失败', { processId: process.id, error }, LogCategory.SHELL);
+      }
+
+      this.cleanupTerminal(terminal);
+      terminal.dispose();
+
+      process.state = targetState;
+      process.exitCode = -1;
+      process.endTime = Date.now();
+    })().finally(() => {
+      this.stopProcessTasks.delete(process.id);
+    });
+
+    this.stopProcessTasks.set(process.id, stopTask);
+    await stopTask;
   }
 
   /**
@@ -809,6 +869,15 @@ export class VSCodeTerminalExecutor {
     }
 
     return { valid: true };
+  }
+
+  private normalizeIdleTimeoutMs(maxWaitSeconds: number): number {
+    const seconds = Number.isFinite(maxWaitSeconds) ? maxWaitSeconds : this.defaultTimeout / 1000;
+    return Math.min(Math.max(seconds, 1) * 1000, this.maxTimeout);
+  }
+
+  private markProcessActivity(process: TerminalProcess): void {
+    process.updatedAt = Date.now();
   }
 
 

@@ -130,6 +130,7 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
       scriptPid,
       shellPid,
       lastFileEndPosition: 0,
+      lastActivityProbePosition: 0,
       cwdTrackingFile: cwdFile,
       lastChildProcesses: new Set(),
       noChildStableCount: 0,
@@ -195,6 +196,7 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
         if (fs.existsSync(session.scriptFile)) {
           const stats = fs.statSync(session.scriptFile);
           session.lastFileEndPosition = stats.size;
+          session.lastActivityProbePosition = stats.size;
           logger.debug(
             `${ScriptCaptureStrategy.LOG_PREFIX}: 更新文件位置`,
             { position: stats.size, processId },
@@ -361,6 +363,67 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
         { scriptPid: session.scriptPid, error },
         LogCategory.SHELL
       );
+      return false;
+    }
+  }
+
+  /**
+   * 中断当前活跃命令（不销毁 shell 会话）
+   *
+   * 根修复：launch-process 超时后仅发 Ctrl+C 可能无法终止子进程树（如测试 runner / watcher），
+   * 这里基于 shellPid 定位并终止其子进程，避免残留进程污染后续命令。
+   */
+  async interruptActiveCommand(terminal: vscode.Terminal): Promise<void> {
+    const session = this.terminalSessions.get(terminal);
+    if (!session?.shellPid) {
+      return;
+    }
+
+    const descendantPids = this.collectDescendantPids(session.shellPid);
+    if (descendantPids.length === 0) {
+      session.lastChildProcesses.clear();
+      session.noChildStableCount = 0;
+      return;
+    }
+
+    this.signalProcesses(descendantPids, 'SIGTERM');
+    await this.delay(250);
+
+    const alive = descendantPids.filter(pid => this.isProcessAlive(pid));
+    if (alive.length > 0) {
+      this.signalProcesses(alive, 'SIGKILL');
+    }
+
+    session.lastChildProcesses.clear();
+    session.noChildStableCount = 0;
+  }
+
+  hasOutputActivity(terminal: vscode.Terminal): boolean {
+    const session = this.terminalSessions.get(terminal);
+    if (!session?.scriptFile) {
+      return false;
+    }
+
+    try {
+      if (!fs.existsSync(session.scriptFile)) {
+        return false;
+      }
+
+      const fileSize = fs.statSync(session.scriptFile).size;
+      const previous = session.lastActivityProbePosition ?? session.lastFileEndPosition ?? fileSize;
+
+      if (fileSize > previous) {
+        session.lastActivityProbePosition = fileSize;
+        return true;
+      }
+
+      if (fileSize < previous) {
+        // 文件被重置时同步探测游标，避免误判
+        session.lastActivityProbePosition = fileSize;
+      }
+
+      return false;
+    } catch {
       return false;
     }
   }
@@ -556,6 +619,63 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
       );
     }
     return null;
+  }
+
+  private collectDescendantPids(rootPid: number): number[] {
+    const visited = new Set<number>();
+    const queue: number[] = [rootPid];
+
+    while (queue.length > 0) {
+      const currentPid = queue.shift()!;
+      const children = this.listDirectChildren(currentPid);
+      for (const childPid of children) {
+        if (visited.has(childPid)) {
+          continue;
+        }
+        visited.add(childPid);
+        queue.push(childPid);
+      }
+    }
+
+    return Array.from(visited);
+  }
+
+  private listDirectChildren(parentPid: number): number[] {
+    try {
+      const result = spawnSync('pgrep', ['-P', String(parentPid)], {
+        encoding: 'utf8',
+        timeout: 5000,
+      });
+      if (result.status !== 0 || !result.stdout) {
+        return [];
+      }
+      return result.stdout
+        .trim()
+        .split('\n')
+        .map(line => Number.parseInt(line, 10))
+        .filter(pid => Number.isFinite(pid) && pid > 0);
+    } catch {
+      return [];
+    }
+  }
+
+  private signalProcesses(pids: number[], signal: NodeJS.Signals): void {
+    for (const pid of pids) {
+      try {
+        process.kill(pid, signal);
+      } catch {
+        // 进程可能已退出，忽略
+      }
+    }
+  }
+
+  private isProcessAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private killScriptProcess(pid: number): void {

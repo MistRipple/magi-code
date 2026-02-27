@@ -131,7 +131,7 @@ export class AssignmentManager {
       assignmentReason.profileMatch.category
     );
     return {
-      id: `assignment_${now}_${Math.random().toString(36).substr(2, 9)}`,
+      id: `assignment_${now}_${Math.random().toString(36).substring(2, 11)}`,
       missionId: mission.id,
       workerId,
       assignmentReason,
@@ -466,29 +466,5 @@ export class AssignmentManager {
     return assignment.todos.every(
       t => t.status === 'completed' || t.status === 'skipped'
     );
-  }
-
-  /**
-   * 获取下一个可执行的 Todo
-   */
-  getNextExecutableTodo(assignment: Assignment): UnifiedTodo | null {
-    for (const todo of assignment.todos) {
-      if (todo.status !== 'pending') continue;
-
-      // 检查超范围审批
-      if (todo.outOfScope && todo.approvalStatus !== 'approved') continue;
-
-      // 检查依赖
-      const dependenciesMet = todo.dependsOn.every(depId => {
-        const depTodo = assignment.todos.find(t => t.id === depId);
-        return depTodo && depTodo.status === 'completed';
-      });
-
-      if (dependenciesMet) {
-        return todo;
-      }
-    }
-
-    return null;
   }
 }

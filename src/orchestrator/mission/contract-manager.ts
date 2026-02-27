@@ -59,7 +59,7 @@ export class ContractManager {
   createContract(params: CreateContractParams): Contract {
     const now = Date.now();
     return {
-      id: `contract_${now}_${Math.random().toString(36).substr(2, 9)}`,
+      id: `contract_${now}_${Math.random().toString(36).substring(2, 11)}`,
       missionId: params.missionId,
       type: params.type,
       name: params.name,

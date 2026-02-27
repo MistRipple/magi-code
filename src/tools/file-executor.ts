@@ -474,13 +474,27 @@ IMPORTANT:
         );
       }
 
-      // 应用行范围
+      // 应用行范围（对越界范围做显式归一化，避免返回空结果导致后续行号漂移）
       let startLine = 1;
       let endLine = lines.length;
 
       if (viewRange && viewRange.length === 2) {
-        startLine = Math.max(1, viewRange[0]);
-        endLine = viewRange[1] === -1 ? lines.length : Math.min(lines.length, viewRange[1]);
+        const requestedStart = viewRange[0];
+        const requestedEnd = viewRange[1];
+        const totalLines = lines.length;
+
+        startLine = Math.max(1, Math.min(totalLines, requestedStart));
+        endLine = requestedEnd === -1
+          ? totalLines
+          : Math.max(1, Math.min(totalLines, requestedEnd));
+
+        if (startLine > endLine) {
+          return {
+            toolCallId,
+            content: `Error: Invalid view_range [${requestedStart}, ${requestedEnd}]. File has ${totalLines} lines.`,
+            isError: true
+          };
+        }
       }
 
       // 格式化输出（带行号）
@@ -551,8 +565,21 @@ IMPORTANT:
       let searchStart = 0;
       let searchEnd = lines.length - 1;
       if (viewRange && viewRange.length === 2) {
-        searchStart = Math.max(0, viewRange[0] - 1);
-        searchEnd = viewRange[1] === -1 ? lines.length - 1 : Math.min(lines.length - 1, viewRange[1] - 1);
+        const requestedStart = viewRange[0];
+        const requestedEnd = viewRange[1];
+        const maxIndex = lines.length - 1;
+        searchStart = Math.max(0, Math.min(maxIndex, requestedStart - 1));
+        searchEnd = requestedEnd === -1
+          ? maxIndex
+          : Math.max(0, Math.min(maxIndex, requestedEnd - 1));
+
+        if (searchStart > searchEnd) {
+          return {
+            toolCallId,
+            content: `Error: Invalid view_range [${requestedStart}, ${requestedEnd}] for regex search. File has ${lines.length} lines.`,
+            isError: true
+          };
+        }
       }
 
       // 查找匹配行
@@ -1142,7 +1169,7 @@ IMPORTANT:
         results.push({
           index: entry.index,
           isError: true,
-          message: `Invalid insert_line: ${entry.insertLine}. Must be in range [0, ${lines.length}]`
+          message: `Invalid insert_line: ${entry.insertLine}. File currently has ${lines.length} lines, valid range is [0, ${lines.length}]`
         });
         continue;
       }

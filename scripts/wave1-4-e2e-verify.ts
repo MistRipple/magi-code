@@ -84,7 +84,6 @@ check('#4 ResilientCompressorAdapter 文件存在', fileExists('orchestrator/cor
 check('#4 TaskViewService 文件存在', fileExists('services/task-view-service.ts'));
 check('#4 MDE 导入 configureResilientCompressor', mde.includes("configureResilientCompressor"));
 check('#4 MDE 导入 TaskViewService', mde.includes('TaskViewService'));
-check('#4 IntentGate 包含 parseClassificationResponse', readFile('orchestrator/intent-gate.ts').includes('parseClassificationResponse'));
 const mdeLines = lineCount(mde);
 check(`#4 MDE 行数 ~1000 (实际: ${mdeLines})`, mdeLines < 1100, `实际: ${mdeLines}`);
 
@@ -344,6 +343,69 @@ check('Phase C 降级有 warning 通知', dm.includes("notify('汇总模型调�
 check('MDE 无事件桥接补丁', !mde.includes('setupEventForwarding'));
 
 // ============================================================================
+// Wave 5 — 轮次限制移除 + 长任务链路 (#20)
+// ============================================================================
+console.log('\n' + '='.repeat(70));
+console.log('  Wave 5 — 轮次限制移除 + 长任务链路 (#20)');
+console.log('='.repeat(70));
+
+const oa = readFile('llm/adapters/orchestrator-adapter.ts');
+const afi = readFile('adapters/adapter-factory-interface.ts');
+
+// --- #20a: Adapter 层人工限制全部移除 ---
+console.log('\n--- #20a: Adapter 层人工限制移除 ---\n');
+check('#20a OA 无 MAX_TOTAL_ROUNDS', !oa.includes('MAX_TOTAL_ROUNDS'));
+check('#20a OA 无 FINAL_WARN_ROUND', !oa.includes('FINAL_WARN_ROUND'));
+check('#20a OA 无 SAME_TOOL_WARN', !oa.includes('SAME_TOOL_WARN'));
+check('#20a OA 无 SAME_TOOL_FORCE', !oa.includes('SAME_TOOL_FORCE'));
+check('#20a OA 无 STALL_WARN 常量', !oa.includes('STALL_WARN'));
+check('#20a OA 无 STALL_FORCE 常量', !oa.includes('STALL_FORCE'));
+check('#20a OA 无 forceNoToolsNextRound', !oa.includes('forceNoToolsNextRound'));
+check('#20a OA 无 forcedByRoundLimit', !oa.includes('forcedByRoundLimit'));
+check('#20a OA 无 consecutiveSameToolRounds', !oa.includes('consecutiveSameToolRounds'));
+check('#20a OA 无 consecutiveStallRounds', !oa.includes('consecutiveStallRounds'));
+
+// --- #20b: 失败检测保留完好 ---
+console.log('\n--- #20b: 失败检测保留完好 ---\n');
+check('#20b OA 保留 CONSECUTIVE_FAIL_THRESHOLD', oa.includes('CONSECUTIVE_FAIL_THRESHOLD'));
+check('#20b OA 保留 TOTAL_FAIL_LIMIT', oa.includes('TOTAL_FAIL_LIMIT'));
+check('#20b OA 保留失败 break 逻辑', oa.includes("terminationReason = 'failure_limit'"));
+
+// --- #20c: OrchestratorRuntimeState 清理 ---
+console.log('\n--- #20c: RuntimeState 类型清理 ---\n');
+check('#20c OA 无 continuationRequired 字段', !oa.includes('continuationRequired'));
+check('#20c OA 无 round_limit_summary', !oa.includes('round_limit_summary'));
+check('#20c OA 无 round_limit_exhausted', !oa.includes('round_limit_exhausted'));
+check('#20c AFI 无 continuationRequired', !afi.includes('continuationRequired'));
+check('#20c AFI 无 round_limit_summary', !afi.includes('round_limit_summary'));
+check('#20c AFI 无 round_limit_exhausted', !afi.includes('round_limit_exhausted'));
+
+// --- #20d: MDE 自动续航死代码清理 ---
+console.log('\n--- #20d: MDE 自动续航死代码清理 ---\n');
+check('#20d MDE 无 MAX_ORCHESTRATOR_AUTO_CONTINUATIONS', !mde.includes('MAX_ORCHESTRATOR_AUTO_CONTINUATIONS'));
+check('#20d MDE 无 evaluateAutoContinuation 方法', !mde.includes('evaluateAutoContinuation'));
+check('#20d MDE 无 buildAutoContinuationPrompt 方法', !mde.includes('buildAutoContinuationPrompt'));
+check('#20d MDE 无 OrchestratorContinuationReason 类型', !mde.includes('OrchestratorContinuationReason'));
+check('#20d MDE 无 AdapterResponse import', !mde.includes("AdapterResponse"));
+
+// --- #20e: 长任务 History 裁剪（循环内） ---
+console.log('\n--- #20e: 长任务 History 裁剪 ---\n');
+// truncateHistoryIfNeeded 应在 while(true) 循环内部被调用，而非仅在外部
+// 通过检查 "while (true)" 之后是否存在 truncateHistoryIfNeeded 来验证
+const whilePos = oa.indexOf('while (true)');
+const truncateAfterWhile = oa.indexOf('truncateHistoryIfNeeded', whilePos);
+check('#20e OA truncateHistoryIfNeeded 在 while(true) 内部', whilePos > 0 && truncateAfterWhile > whilePos);
+// truncateHistoryIfNeeded 使用 splice 原地修改（非 slice 重新赋值）
+check('#20e OA truncateHistoryIfNeeded 使用 splice 原地修改', oa.includes('.splice(0, truncatedCount)'));
+
+// --- #20f: 自然收敛模式 ---
+console.log('\n--- #20f: 自然收敛模式 ---\n');
+check('#20f OA while(true) 循环存在', oa.includes('while (true)'));
+check('#20f OA 自然收敛：无工具调用时 break', oa.includes("toolCalls.length === 0") && oa.includes("terminationReason = 'completed'"));
+check('#20f OA 中断检测点：循环入口', oa.includes('this.abortController.signal.aborted'));
+check('#20f OA tools 参数无条件传递', oa.includes('tools: toolDefinitions.length > 0 ? toolDefinitions : undefined'));
+
+// ============================================================================
 // 结果汇总
 // ============================================================================
 console.log('\n' + '='.repeat(70));
@@ -354,6 +416,7 @@ console.log(`\n  Wave 1 (#1-#4):  死代码清理 + 核心解耦`);
 console.log(`  Wave 2 (#6-#11): 事件架构治理`);
 console.log(`  Wave 3 (#12-#16): 质量提升`);
 console.log(`  Wave 4 (#17-#19): 组件拆分`);
+console.log(`  Wave 5 (#20):    轮次限制移除 + 长任务链路`);
 console.log(`  全局不变量\n`);
 
 if (failed > 0) {

@@ -36,12 +36,6 @@ export interface TokenUsage {
   cacheReadTokens?: number;
   /** 缓存写入 token 数 */
   cacheWriteTokens?: number;
-  /** 当前统计是否由本地估算得到（真实 usage 缺失时） */
-  estimated?: boolean;
-  /** 估算输入 token 累计（用于与真实值区分展示） */
-  estimatedInputTokens?: number;
-  /** 估算输出 token 累计（用于与真实值区分展示） */
-  estimatedOutputTokens?: number;
 }
 
 /**
