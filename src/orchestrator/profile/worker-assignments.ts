@@ -52,7 +52,12 @@ export class WorkerAssignmentStorage {
     }
 
     const content = fs.readFileSync(this.ASSIGNMENTS_FILE, 'utf-8');
-    const parsed = JSON.parse(content) as WorkerAssignments;
+    let parsed: WorkerAssignments;
+    try {
+      parsed = JSON.parse(content) as WorkerAssignments;
+    } catch (e) {
+      throw new Error(`worker-assignments.json 解析失败 (${this.ASSIGNMENTS_FILE}): ${e instanceof Error ? e.message : String(e)}`);
+    }
     this.validate(parsed);
     return parsed;
   }

@@ -283,7 +283,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.error('Failed to initialize LLM adapter factory', { error: err.message }, LogCategory.LLM);
     });
 
-    // 初始化编排引擎（设置 IntentGate 等关键组件）
+    // 初始化编排引擎
     void this.orchestratorEngine.initialize().catch(err => {
       logger.error('Failed to initialize orchestrator engine', { error: err.message }, LogCategory.ORCHESTRATOR);
     });
@@ -1474,8 +1474,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       lastExecutionTime: workerStats.lastExecutionTime,
       totalInputTokens: workerStats.totalInputTokens,
       totalOutputTokens: workerStats.totalOutputTokens,
-      totalEstimatedInputTokens: workerStats.totalEstimatedInputTokens,
-      totalEstimatedOutputTokens: workerStats.totalEstimatedOutputTokens,
     }));
 
     const orchestratorStats = {
@@ -1484,8 +1482,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       totalFailed: stats.reduce((sum, s) => sum + s.failureCount, 0),
       totalInputTokens: stats.reduce((sum, s) => sum + (s.totalInputTokens || 0), 0),
       totalOutputTokens: stats.reduce((sum, s) => sum + (s.totalOutputTokens || 0), 0),
-      totalEstimatedInputTokens: stats.reduce((sum, s) => sum + (s.totalEstimatedInputTokens || 0), 0),
-      totalEstimatedOutputTokens: stats.reduce((sum, s) => sum + (s.totalEstimatedOutputTokens || 0), 0),
       totalTokens: stats.reduce((sum, s) => sum + (s.totalInputTokens || 0) + (s.totalOutputTokens || 0), 0),
     };
 

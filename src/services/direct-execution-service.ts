@@ -29,9 +29,6 @@ export interface DirectExecutionDeps {
     tokenUsage?: {
       inputTokens?: number;
       outputTokens?: number;
-      estimatedInputTokens?: number;
-      estimatedOutputTokens?: number;
-      estimated?: boolean;
     };
   }>;
   // 任务生命周期
@@ -94,8 +91,6 @@ export class DirectExecutionService {
           error: response.error,
           inputTokens: response.tokenUsage?.inputTokens,
           outputTokens: response.tokenUsage?.outputTokens,
-          estimatedInputTokens: response.tokenUsage?.estimatedInputTokens,
-          estimatedOutputTokens: response.tokenUsage?.estimatedOutputTokens,
         });
       }
 

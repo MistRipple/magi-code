@@ -38,6 +38,15 @@ export interface OrchestratorAdapterConfig {
   historyConfig?: OrchestratorHistoryConfig;
 }
 
+export interface OrchestratorRuntimeState {
+  reason:
+    | 'completed'
+    | 'failure_limit'
+    | 'interrupted'
+    | 'unknown';
+  rounds: number;
+}
+
 /**
  * Orchestrator LLM 适配器
  */
@@ -62,6 +71,10 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   private tempSystemPrompt?: string;
   private tempEnableToolCalls?: boolean;
   private tempVisibility?: 'user' | 'system' | 'debug';
+  private lastRuntimeState: OrchestratorRuntimeState = {
+    reason: 'unknown',
+    rounds: 0,
+  };
 
   constructor(adapterConfig: OrchestratorAdapterConfig) {
     super(
@@ -112,6 +125,10 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     this.tempSystemPrompt = undefined;
     this.tempEnableToolCalls = undefined;
     this.tempVisibility = undefined;
+    this.lastRuntimeState = {
+      reason: 'unknown',
+      rounds: 0,
+    };
 
     try {
       if (enableToolCalls) {
@@ -122,6 +139,10 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           silent ? 'system' : undefined
         );
         this.setState(AdapterState.CONNECTED);
+        this.lastRuntimeState = {
+          reason: 'completed',
+          rounds: 1,
+        };
         return content;
       }
 
@@ -188,6 +209,10 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
 
       this.normalizer.endStream(streamId);
       this.setState(AdapterState.CONNECTED);
+      this.lastRuntimeState = {
+        reason: 'completed',
+        rounds: 1,
+      };
 
       // 🔧 如果流式传输完成但没有内容，抛出明确错误而非静默返回空
       if (!fullResponse.trim()) {
@@ -202,6 +227,10 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           this.normalizer.endStream(messageId);
         }
         this.setState(AdapterState.CONNECTED);
+        this.lastRuntimeState = {
+          reason: 'interrupted',
+          rounds: 0,
+        };
         return '任务已中断';
       }
       if (messageId) {
@@ -320,7 +349,12 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     this.tempVisibility = visibility;
   }
 
-
+  /**
+   * 获取最近一次运行态
+   */
+  getLastRuntimeState(): OrchestratorRuntimeState {
+    return { ...this.lastRuntimeState };
+  }
 
   /**
    * 获取对话历史
@@ -368,24 +402,25 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     // 计算需要保留的消息数量（每轮对话约 2 条消息：user + assistant）
     const preserveCount = Math.min(preserveRecentRounds * 2, currentLength);
 
-    // 截断旧消息，保留最近的
-    const truncatedCount = currentLength - preserveCount;
+    // 钉住 index 0（用户原始请求）：截断从 index 1 开始，保留迭代锚点
+    const pinnedCount = 1;
+    const truncatedCount = currentLength - preserveCount - pinnedCount;
     if (truncatedCount > 0) {
-      const droppedMessages = this.conversationHistory.slice(0, truncatedCount);
-      this.conversationHistory = this.conversationHistory.slice(-preserveCount);
+      const droppedMessages = this.conversationHistory.splice(pinnedCount, truncatedCount);
 
       this.updateRollingSummary(droppedMessages);
 
+      // rolling summary 注入到 index 1（钉住消息之后、保留消息之前）
       if (this.rollingContextSummary) {
-        const firstMsg = this.conversationHistory[0];
-        if (firstMsg && firstMsg.role === 'user') {
-          if (typeof firstMsg.content === 'string') {
-            firstMsg.content = `${this.rollingContextSummary}\n\n---\n\n${firstMsg.content}`;
-          } else if (Array.isArray(firstMsg.content)) {
-            (firstMsg.content as any[]).unshift({ type: 'text', text: this.rollingContextSummary });
+        const bridgeMsg = this.conversationHistory[pinnedCount];
+        if (bridgeMsg && bridgeMsg.role === 'user') {
+          if (typeof bridgeMsg.content === 'string') {
+            bridgeMsg.content = `${this.rollingContextSummary}\n\n---\n\n${bridgeMsg.content}`;
+          } else if (Array.isArray(bridgeMsg.content)) {
+            (bridgeMsg.content as any[]).unshift({ type: 'text', text: this.rollingContextSummary });
           }
         } else {
-          this.conversationHistory.unshift({
+          this.conversationHistory.splice(pinnedCount, 0, {
             role: 'user',
             content: this.rollingContextSummary,
           });
@@ -497,11 +532,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   ): Promise<string> {
     const isTransientSystemCall = visibility === 'system';
 
-    // 自动截断历史以控制 token 消耗（仅用户可见调用）
-    if (!isTransientSystemCall) {
-      this.truncateHistoryIfNeeded();
-    }
-
     // system 可见性调用使用临时历史，避免污染编排上下文
     const history = isTransientSystemCall
       ? [...this.conversationHistory]
@@ -521,34 +551,16 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     // 当轮 stream 内包含 thinking + text + tool_call + tool_result，
     // endStream 后工具副作用产生的新消息（如 subTaskCard）自然排在后面，
     // 下一轮 stream 再开启新卡片，时间顺序天然正确。
-    // 异常终止依赖三层止损机制：
-    // 1. 连续失败检测：连续 5 次失败 → 提示换方式，累计 25 轮失败 → 终止
-    // 2. 总轮次安全网：80 轮硬上限 → 强制总结 → 终止
-    // 3. 空转检测：连续同工具重复 / 连续无编排动作 → 渐进式引导 → 强制总结
+    // 异常终止依赖失败检测止损：连续 5 次失败 → 提示换方式，累计 25 轮失败 → 终止
     const CONSECUTIVE_FAIL_THRESHOLD = 5;
     const TOTAL_FAIL_LIMIT = 25;
-    const MAX_TOTAL_ROUNDS = 80;
-    const FINAL_WARN_ROUND = MAX_TOTAL_ROUNDS - 10;
-    // 连续同工具重复检测阈值
-    // L1 场景下 Orchestrator 连续调用 file_view 读取不同文件是正常的分析行为，
-    // 阈值需高于 Worker adapter（Worker 有 visitedPaths 等精细去重，Orchestrator 靠轮次粗检测）
-    const SAME_TOOL_WARN = 6;
-    const SAME_TOOL_FORCE = 10;
-    // 编排者空转检测：连续多轮只用只读工具不做编排动作（dispatch_task / 写入操作）
-    const STALL_WARN = 10;
-    const STALL_FORCE = 15;
 
     try {
       let finalText = '';
       let consecutiveFailures = 0;
       let totalFailures = 0;
-      // 总轮次强制总结模式
-      let forceNoToolsNextRound = false;
-      // 连续同工具重复检测状态
-      let lastPrimaryToolName = '';
-      let consecutiveSameToolRounds = 0;
-      // 编排者空转检测状态：连续多轮无编排动作
-      let consecutiveStallRounds = 0;
+      let loopRounds = 0;
+      let terminationReason: Exclude<OrchestratorRuntimeState['reason'], 'unknown'> = 'completed';
 
       // 创建 AbortController，供 interrupt() 中断 LLM 请求
       this.abortController = new AbortController();
@@ -557,30 +569,14 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       while (true) {
         // 中断检查：每轮迭代入口检测 abort 信号
         if (this.abortController.signal.aborted) {
+          terminationReason = 'interrupted';
           break;
         }
+        loopRounds++;
 
-        // 总轮次安全网：防止任何场景下的无限循环
-        // round == MAX_TOTAL_ROUNDS → 注入提示 + 撤掉工具，给 LLM 一轮纯文本总结机会
-        // round >  MAX_TOTAL_ROUNDS → LLM 仍调用工具或未收敛，强制终止
-        if (round > MAX_TOTAL_ROUNDS) {
-          logger.warn('Orchestrator 超过总轮次上限，强制终止', { round }, LogCategory.LLM);
-          finalText = finalText || `已执行 ${round} 轮工具调用，达到安全上限，编排终止。`;
-          break;
-        }
-        if (round === MAX_TOTAL_ROUNDS) {
-          forceNoToolsNextRound = true;
-          logger.warn('Orchestrator 达到总轮次上限，触发强制总结', { round }, LogCategory.LLM);
-          history.push({
-            role: 'user',
-            content: `[System] 你已执行 ${round} 轮工具调用，达到系统上限。工具调用能力已被收回。请立即总结当前编排进展和执行结果。`,
-          });
-        }
-        if (round === FINAL_WARN_ROUND) {
-          history.push({
-            role: 'user',
-            content: `[System] 你已执行 ${round} 轮工具调用，即将达到上限（${MAX_TOTAL_ROUNDS} 轮）。请尽快完成剩余编排工作并输出最终结论。`,
-          });
+        // 长任务 history 裁剪：每轮 LLM 调用前检查并截断，防止 context window 溢出
+        if (!isTransientSystemCall) {
+          this.truncateHistoryIfNeeded();
         }
 
         // 只有首轮使用 startStreamWithContext 绑定 placeholder messageId，
@@ -594,7 +590,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         const params: LLMMessageParams = {
           messages: history,
           systemPrompt,
-          tools: forceNoToolsNextRound ? undefined : (toolDefinitions.length > 0 ? toolDefinitions : undefined),
+          tools: toolDefinitions.length > 0 ? toolDefinitions : undefined,
           stream: true,
           maxTokens: 8192,
           temperature: 0.3,
@@ -630,6 +626,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             history.push({ role: 'assistant', content: assistantText });
             finalText = assistantText;
             this.normalizer.endStream(streamId);
+            terminationReason = 'completed';
             break;
           }
 
@@ -669,6 +666,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           // 中断检查：工具执行完成后立即检测 abort，跳过后续处理直接退出循环
           if (this.abortController?.signal.aborted) {
             this.normalizer.endStream(streamId);
+            terminationReason = 'interrupted';
             break;
           }
 
@@ -733,6 +731,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             if (totalFailures >= TOTAL_FAIL_LIMIT) {
               finalText = assistantText || `工具调用累计失败 ${TOTAL_FAIL_LIMIT} 轮，判定为异常终止。`;
               this.normalizer.endStream(streamId);
+              terminationReason = 'failure_limit';
               break;
             }
 
@@ -747,63 +746,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             consecutiveFailures = 0;
           }
 
-          // 空转检测（仅在工具调用未全部失败时检测）
-          if (!allFailed) {
-            // 编排动作 = 委派任务 / 写入文件（编排者的核心职责）
-            const ORCHESTRATION_ACTIONS = ['dispatch_task', 'send_worker_message', 'wait_for_workers', 'file_edit', 'file_create', 'file_insert', 'file_remove'];
-            const hasAction = toolCalls.some(tc => ORCHESTRATION_ACTIONS.includes(tc.name));
-
-            if (hasAction) {
-              // 有编排动作 → 重置空转状态
-              consecutiveStallRounds = 0;
-              lastPrimaryToolName = '';
-              consecutiveSameToolRounds = 0;
-            } else {
-              consecutiveStallRounds++;
-
-              // 连续同工具重复检测
-              const primaryTool = toolCalls[0]?.name || '';
-              if (primaryTool === lastPrimaryToolName) {
-                consecutiveSameToolRounds++;
-              } else {
-                lastPrimaryToolName = primaryTool;
-                consecutiveSameToolRounds = 1;
-              }
-
-              // 连续同工具重复提示
-              if (consecutiveSameToolRounds >= SAME_TOOL_FORCE) {
-                logger.warn('Orchestrator 同工具重复调用达到强制阈值', { tool: primaryTool, rounds: consecutiveSameToolRounds }, LogCategory.LLM);
-                forceNoToolsNextRound = true;
-                history.push({
-                  role: 'user',
-                  content: `[System] 你已连续 ${consecutiveSameToolRounds} 轮调用 ${primaryTool} 工具，这是无效的重复行为。工具调用能力已被收回，请立即总结当前进展。`,
-                });
-              } else if (consecutiveSameToolRounds >= SAME_TOOL_WARN) {
-                logger.warn('Orchestrator 同工具重复调用', { tool: primaryTool, rounds: consecutiveSameToolRounds }, LogCategory.LLM);
-                history.push({
-                  role: 'user',
-                  content: `[System] 你已连续 ${consecutiveSameToolRounds} 轮调用 ${primaryTool} 工具。如果已获取到所需信息，请通过 dispatch_task 委派任务给 Worker 执行，或直接输出结论。不要反复调用同一工具。`,
-                });
-              }
-
-              // 编排者空转检测（连续无编排动作）
-              if (consecutiveStallRounds >= STALL_FORCE && !forceNoToolsNextRound) {
-                logger.warn('Orchestrator 空转达到强制阈值', { rounds: consecutiveStallRounds }, LogCategory.LLM);
-                forceNoToolsNextRound = true;
-                history.push({
-                  role: 'user',
-                  content: `[System] 你已连续 ${consecutiveStallRounds} 轮仅使用查看/搜索类工具，未执行任何编排动作（dispatch_task）。工具调用能力已被收回，请立即总结当前进展并输出结论。`,
-                });
-              } else if (consecutiveStallRounds === STALL_WARN) {
-                logger.warn('Orchestrator 空转警告', { rounds: consecutiveStallRounds }, LogCategory.LLM);
-                history.push({
-                  role: 'user',
-                  content: `[System] 你已连续 ${consecutiveStallRounds} 轮仅使用查看/搜索类工具，未执行编排动作。请通过 dispatch_task 委派任务给 Worker 执行，或直接输出最终结论。不要继续查看文件。`,
-                });
-              }
-            }
-          }
-
           // 当轮 stream 结束，工具副作用（subTaskCard 等）已自然排在后面
           this.normalizer.endStream(streamId);
           round++;
@@ -811,6 +753,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           this.normalizer.endStream(streamId, error?.message || 'Request failed');
           // abort 中断不视为异常，优雅退出循环
           if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
+            terminationReason = 'interrupted';
             break;
           }
           throw error;
@@ -821,10 +764,18 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       if (!finalText.trim() && !this.abortController?.signal.aborted) {
         throw new Error('LLM 响应为空：流式传输完成但未收到有效内容');
       }
+      this.lastRuntimeState = {
+        reason: terminationReason,
+        rounds: loopRounds,
+      };
       return finalText || '任务已中断';
     } catch (error: any) {
       // abort 中断不视为错误
       if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
+        this.lastRuntimeState = {
+          reason: 'interrupted',
+          rounds: 0,
+        };
         return '任务已中断';
       }
       throw error;

@@ -25,8 +25,9 @@ export class PlanningExecutor {
    */
   async createMacroTodo(missionId: string, assignment: Assignment): Promise<void> {
     logger.info(
-      LogCategory.ORCHESTRATOR,
-      `为 ${assignment.workerId} 创建一级 Todo: ${assignment.responsibility}`
+      `为 ${assignment.workerId} 创建一级 Todo: ${assignment.responsibility}`,
+      undefined,
+      LogCategory.ORCHESTRATOR
     );
 
     const content = this.buildTodoContent(assignment);
@@ -47,17 +48,21 @@ export class PlanningExecutor {
     }
 
     logger.info(
-      LogCategory.ORCHESTRATOR,
-      `${assignment.workerId} 一级 Todo 已创建: ${todo.id}`
+      `${assignment.workerId} 一级 Todo 已创建: ${todo.id}`,
+      undefined,
+      LogCategory.ORCHESTRATOR
     );
   }
 
   private buildTodoContent(assignment: Assignment): string {
+    const scopeHints = assignment.scope?.scopeHints?.length
+      ? `\n范围线索（非硬约束）: ${assignment.scope.scopeHints.join(', ')}。可按需扩展到相关文件/模块。`
+      : '';
     const targetPaths = assignment.scope?.targetPaths?.length
       ? assignment.scope.requiresModification
-        ? `\n目标文件: ${assignment.scope.targetPaths.join(', ')}。必须使用工具直接编辑并保存。`
+        ? `\n严格目标文件: ${assignment.scope.targetPaths.join(', ')}。需要对这些目标文件产出实际改动。`
         : `\n目标文件: ${assignment.scope.targetPaths.join(', ')}。只需读取/分析，不要修改文件。`
       : '';
-    return `${assignment.responsibility}${targetPaths}`;
+    return `${assignment.responsibility}${scopeHints}${targetPaths}`;
   }
 }

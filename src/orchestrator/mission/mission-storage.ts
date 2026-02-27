@@ -4,6 +4,8 @@
  * 负责 Mission 及其关联数据的存储和加载
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
 import { EventEmitter } from 'events';
 import type { UnifiedTodo } from '../../todo/types';
 import {
@@ -115,7 +117,7 @@ export class MissionStorageManager extends EventEmitter {
   async createMission(params: CreateMissionParams): Promise<Mission> {
     const now = Date.now();
     const mission: Mission = {
-      id: `mission_${now}_${Math.random().toString(36).substr(2, 9)}`,
+      id: `mission_${now}_${Math.random().toString(36).substring(2, 11)}`,
       sessionId: params.sessionId,
       userPrompt: params.userPrompt,
       goal: '',
@@ -311,56 +313,51 @@ export class FileBasedMissionStorage implements IMissionStorage {
   }
 
   private getSessionMissionsDir(sessionId: string): string {
-    const path = require('path');
     return path.join(this.sessionsDir, sessionId, 'missions');
   }
 
-  private ensureSessionMissionsDir(sessionId: string): void {
-    const fs = require('fs');
+  private async ensureSessionMissionsDir(sessionId: string): Promise<void> {
     const dir = this.getSessionMissionsDir(sessionId);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
+    await fs.promises.mkdir(dir, { recursive: true });
   }
 
   private getMissionFilePath(mission: Mission): string;
   private getMissionFilePath(missionId: string, sessionId: string): string;
   private getMissionFilePath(missionOrId: Mission | string, sessionId?: string): string {
-    const path = require('path');
     if (typeof missionOrId === 'string') {
       return path.join(this.getSessionMissionsDir(sessionId!), `${missionOrId}.json`);
     }
     return path.join(this.getSessionMissionsDir(missionOrId.sessionId), `${missionOrId.id}.json`);
   }
 
-  private loadFromDisk(): void {
+  private async ensureLoaded(): Promise<void> {
     if (this.loaded) return;
 
-    const fs = require('fs');
-    const path = require('path');
-
-    if (!fs.existsSync(this.sessionsDir)) {
+    try {
+      await fs.promises.access(this.sessionsDir);
+    } catch {
       this.loaded = true;
       return;
     }
 
-    // 扫描所有 session 目录
-    const sessionDirs = fs.readdirSync(this.sessionsDir);
-    for (const sessionId of sessionDirs) {
-      const sessionPath = path.join(this.sessionsDir, sessionId);
-      const stat = fs.statSync(sessionPath);
-      if (!stat.isDirectory()) continue;
+    const sessionEntries = await fs.promises.readdir(this.sessionsDir, { withFileTypes: true });
+    for (const entry of sessionEntries) {
+      if (!entry.isDirectory()) continue;
 
-      const missionsDir = path.join(sessionPath, 'missions');
-      if (!fs.existsSync(missionsDir)) continue;
+      const missionsDir = path.join(this.sessionsDir, entry.name, 'missions');
+      try {
+        await fs.promises.access(missionsDir);
+      } catch {
+        continue;
+      }
 
-      const files = fs.readdirSync(missionsDir);
+      const files = await fs.promises.readdir(missionsDir);
       for (const file of files) {
         if (!file.endsWith('.json')) continue;
 
         const filePath = path.join(missionsDir, file);
         try {
-          const content = fs.readFileSync(filePath, 'utf-8');
+          const content = await fs.promises.readFile(filePath, 'utf-8');
           const mission: Mission = JSON.parse(content);
           this.missions.set(mission.id, mission);
 
@@ -377,23 +374,25 @@ export class FileBasedMissionStorage implements IMissionStorage {
     this.loaded = true;
   }
 
-  private saveToDisk(mission: Mission): void {
-    const fs = require('fs');
-    this.ensureSessionMissionsDir(mission.sessionId);
+  private async saveToDisk(mission: Mission): Promise<void> {
+    await this.ensureSessionMissionsDir(mission.sessionId);
     const filePath = this.getMissionFilePath(mission);
-    fs.writeFileSync(filePath, JSON.stringify(mission, null, 2), 'utf-8');
+    await fs.promises.writeFile(filePath, JSON.stringify(mission, null, 2), 'utf-8');
   }
 
-  private deleteFromDisk(mission: Mission): void {
-    const fs = require('fs');
+  private async deleteFromDisk(mission: Mission): Promise<void> {
     const filePath = this.getMissionFilePath(mission);
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
+    try {
+      await fs.promises.unlink(filePath);
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw err;
+      }
     }
   }
 
   async save(mission: Mission): Promise<void> {
-    this.loadFromDisk();
+    await this.ensureLoaded();
     this.missions.set(mission.id, { ...mission });
 
     if (!this.sessionIndex.has(mission.sessionId)) {
@@ -401,37 +400,37 @@ export class FileBasedMissionStorage implements IMissionStorage {
     }
     this.sessionIndex.get(mission.sessionId)!.add(mission.id);
 
-    this.saveToDisk(mission);
+    await this.saveToDisk(mission);
   }
 
   async load(id: string): Promise<Mission | null> {
-    this.loadFromDisk();
+    await this.ensureLoaded();
     const mission = this.missions.get(id);
     return mission ? { ...mission } : null;
   }
 
   async update(mission: Mission): Promise<void> {
-    this.loadFromDisk();
+    await this.ensureLoaded();
     if (!this.missions.has(mission.id)) {
       throw new Error(`Mission not found: ${mission.id}`);
     }
     mission.updatedAt = Date.now();
     this.missions.set(mission.id, { ...mission });
-    this.saveToDisk(mission);
+    await this.saveToDisk(mission);
   }
 
   async delete(id: string): Promise<void> {
-    this.loadFromDisk();
+    await this.ensureLoaded();
     const mission = this.missions.get(id);
     if (mission) {
       this.missions.delete(id);
       this.sessionIndex.get(mission.sessionId)?.delete(id);
-      this.deleteFromDisk(mission);
+      await this.deleteFromDisk(mission);
     }
   }
 
   async listBySession(sessionId: string): Promise<Mission[]> {
-    this.loadFromDisk();
+    await this.ensureLoaded();
     const missionIds = this.sessionIndex.get(sessionId);
     if (!missionIds) return [];
 
@@ -442,7 +441,7 @@ export class FileBasedMissionStorage implements IMissionStorage {
   }
 
   async findByStatus(status: MissionStatus): Promise<Mission[]> {
-    this.loadFromDisk();
+    await this.ensureLoaded();
     return Array.from(this.missions.values())
       .filter(m => m.status === status)
       .sort((a, b) => a.createdAt - b.createdAt);

@@ -80,14 +80,31 @@ export class CancellationError extends Error {
 /** dispatch_task 状态 */
 export type DispatchStatus = 'pending' | 'waiting_deps' | 'running' | 'completed' | 'failed' | 'skipped' | 'cancelled';
 
+/** 终端状态判断（completed/failed/skipped/cancelled） */
+export function isTerminalStatus(status: DispatchStatus): boolean {
+  return status === 'completed' || status === 'failed' || status === 'skipped' || status === 'cancelled';
+}
+
 /** 单个 dispatch 条目 */
 export interface DispatchEntry {
   taskId: string;
   worker: WorkerSlot;
+  /** 任务目标（结构化合同字段） */
+  goal: string;
+  /** 验收标准（结构化合同字段） */
+  acceptance: string[];
+  /** 约束条件（结构化合同字段） */
+  constraints: string[];
+  /** 任务上下文（结构化合同字段） */
+  context: string[];
   task: string;
+  /** 范围线索（非硬约束） */
+  scopeHint: string[];
   files: string[];
   /** 是否要求该任务对目标文件产生实际修改（读任务为 false） */
   requiresModification: boolean;
+  /** L3 协作契约 */
+  collaborationContracts: DispatchCollaborationContracts;
   dependsOn: string[];
   status: DispatchStatus;
   result?: DispatchResult;
@@ -106,8 +123,36 @@ export interface DispatchResult {
   tokenUsage?: {
     inputTokens: number;
     outputTokens: number;
-    estimatedInputTokens?: number;
-    estimatedOutputTokens?: number;
+  };
+}
+
+/**
+ * 协作契约数据（dispatch_task -> Worker Assignment 贯通）
+ */
+export interface DispatchCollaborationContracts {
+  producerContracts: string[];
+  consumerContracts: string[];
+  interfaceContracts: string[];
+  freezeFiles: string[];
+}
+
+export type DispatchAuditLevel = 'normal' | 'watch' | 'intervention';
+
+export interface DispatchAuditIssue {
+  taskId: string;
+  level: DispatchAuditLevel;
+  dimension: 'scope' | 'cross_task' | 'contract';
+  detail: string;
+}
+
+export interface DispatchAuditOutcome {
+  level: DispatchAuditLevel;
+  issues: DispatchAuditIssue[];
+  taskLevels: Record<string, DispatchAuditLevel>;
+  summary: {
+    normal: number;
+    watch: number;
+    intervention: number;
   };
 }
 
@@ -164,6 +209,8 @@ export class DispatchBatch extends EventEmitter {
   private archiveResolvers: Array<() => void> = [];
   /** 最后活动时间戳：任何 Worker 状态变化都会刷新 */
   private _lastActivityAt: number;
+  /** Phase C 程序化审计结果 */
+  private _auditOutcome?: DispatchAuditOutcome;
 
   constructor(batchId?: string) {
     super();
@@ -178,6 +225,14 @@ export class DispatchBatch extends EventEmitter {
 
   get phase(): BatchPhase {
     return this._phase;
+  }
+
+  getAuditOutcome(): DispatchAuditOutcome | undefined {
+    return this._auditOutcome;
+  }
+
+  setAuditOutcome(outcome: DispatchAuditOutcome): void {
+    this._auditOutcome = outcome;
   }
 
   get size(): number {
@@ -210,10 +265,16 @@ export class DispatchBatch extends EventEmitter {
   register(params: {
     taskId: string;
     worker: WorkerSlot;
+    goal: string;
+    acceptance: string[];
+    constraints: string[];
+    context: string[];
     task: string;
+    scopeHint?: string[];
     files?: string[];
     requiresModification?: boolean;
     dependsOn?: string[];
+    collaborationContracts?: Partial<DispatchCollaborationContracts>;
   }): DispatchEntry {
     if (this._phase === 'archived') {
       throw new Error(`DispatchBatch ${this.id} 已归档，无法注册新任务`);
@@ -223,20 +284,34 @@ export class DispatchBatch extends EventEmitter {
       throw new Error(`任务 ${params.taskId} 已存在于 Batch ${this.id}`);
     }
 
-    // 验证 dependsOn 引用的 taskId 是否已注册（允许后续注册的任务引用先注册的）
-    const dependsOn = params.dependsOn || [];
+    // depends_on 只能引用已存在的前序任务，避免任务永久卡在 waiting_deps
+    const dependsOn = (params.dependsOn || []).map(id => id.trim()).filter(Boolean);
     for (const depId of dependsOn) {
       if (depId === params.taskId) {
         throw new Error(`任务 ${params.taskId} 不能依赖自身`);
+      }
+      if (!this.entries.has(depId)) {
+        throw new Error(`任务 ${params.taskId} 依赖不存在的前序任务 ${depId}`);
       }
     }
 
     const entry: DispatchEntry = {
       taskId: params.taskId,
       worker: params.worker,
+      goal: params.goal,
+      acceptance: params.acceptance,
+      constraints: params.constraints,
+      context: params.context,
       task: params.task,
+      scopeHint: params.scopeHint || [],
       files: params.files || [],
       requiresModification: params.requiresModification ?? true,
+      collaborationContracts: {
+        producerContracts: params.collaborationContracts?.producerContracts || [],
+        consumerContracts: params.collaborationContracts?.consumerContracts || [],
+        interfaceContracts: params.collaborationContracts?.interfaceContracts || [],
+        freezeFiles: params.collaborationContracts?.freezeFiles || [],
+      },
       dependsOn,
       status: dependsOn.length > 0 ? 'waiting_deps' : 'pending',
       createdAt: Date.now(),
@@ -280,7 +355,7 @@ export class DispatchBatch extends EventEmitter {
     if (status === 'running' && !entry.startedAt) {
       entry.startedAt = Date.now();
     }
-    if (status === 'completed' || status === 'failed' || status === 'skipped' || status === 'cancelled') {
+    if (isTerminalStatus(status)) {
       entry.completedAt = Date.now();
       if (result) {
         entry.result = result;
@@ -295,7 +370,7 @@ export class DispatchBatch extends EventEmitter {
     this.emit('task:statusChanged', taskId, status, result);
 
     // 任务完成后检查是否有依赖它的后续任务可以执行
-    if (status === 'completed' || status === 'failed' || status === 'skipped' || status === 'cancelled') {
+    if (isTerminalStatus(status)) {
       this.checkDependents(taskId);
       this.checkAllCompleted();
     }
@@ -355,7 +430,7 @@ export class DispatchBatch extends EventEmitter {
   isAllCompleted(): boolean {
     if (this.entries.size === 0) return false;
     return Array.from(this.entries.values()).every(
-      e => e.status === 'completed' || e.status === 'failed' || e.status === 'skipped' || e.status === 'cancelled'
+      e => isTerminalStatus(e.status)
     );
   }
 
@@ -416,7 +491,7 @@ export class DispatchBatch extends EventEmitter {
     // 收集所有存在冲突的 taskId 对（去重）
     const processedPairs = new Set<string>();
 
-    for (const [_file, conflictIds] of conflicts) {
+    for (const [file, conflictIds] of conflicts) {
       // 按注册顺序排列（createdAt 时间戳）
       const sorted = conflictIds
         .map(id => this.entries.get(id)!)
@@ -443,7 +518,7 @@ export class DispatchBatch extends EventEmitter {
 
         logger.info('DispatchBatch.文件冲突.自动串行化', {
           batchId: this.id,
-          file: _file,
+          file: file,
           predecessor: prev.taskId,
           dependent: curr.taskId,
         }, LogCategory.ORCHESTRATOR);
@@ -524,12 +599,37 @@ export class DispatchBatch extends EventEmitter {
   }
 
   /**
-   * 获取就绪可执行的任务列表
+   * 获取就绪可执行的任务列表（依赖拓扑优先排序）
+   *
+   * 排序策略：被更多下游任务依赖的任务优先执行（关键路径优化），
+   * 同依赖数的任务按注册顺序（FIFO）。
    */
   getReadyTasks(): DispatchEntry[] {
-    return this.getEntries().filter(e =>
+    const ready = this.getEntries().filter(e =>
       (e.status === 'pending' || e.status === 'waiting_deps') && this.canExecute(e.taskId)
     );
+
+    // 计算每个 ready 任务被多少未启动的下游任务依赖
+    const dependentCount = new Map<string, number>();
+    for (const entry of ready) {
+      let count = 0;
+      for (const other of this.entries.values()) {
+        if (
+          (other.status === 'pending' || other.status === 'waiting_deps') &&
+          other.dependsOn.includes(entry.taskId)
+        ) {
+          count++;
+        }
+      }
+      dependentCount.set(entry.taskId, count);
+    }
+
+    // 被依赖数降序 → 同依赖数按注册顺序（createdAt）
+    return ready.sort((a, b) => {
+      const depDiff = (dependentCount.get(b.taskId) || 0) - (dependentCount.get(a.taskId) || 0);
+      if (depDiff !== 0) return depDiff;
+      return a.createdAt - b.createdAt;
+    });
   }
 
   /**
@@ -634,6 +734,7 @@ export class DispatchBatch extends EventEmitter {
       batchId: this.id,
       summary: this.getSummary(),
       tokenConsumption: this.getTokenConsumption(),
+      auditOutcome: this._auditOutcome,
     }, LogCategory.ORCHESTRATOR);
   }
 
@@ -709,7 +810,7 @@ export class DispatchBatch extends EventEmitter {
       if (entry.status !== 'waiting_deps') continue;
 
       // 前序任务失败 → 级联跳过
-      if (completedEntry && (completedEntry.status === 'failed' || completedEntry.status === 'skipped' || completedEntry.status === 'cancelled')) {
+      if (completedEntry && completedEntry.status !== 'completed') {
         this.updateStatus(taskId, 'skipped', {
           success: false,
           summary: `前序任务 ${completedTaskId} 失败/跳过，级联跳过`,

@@ -412,6 +412,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     'dispatch_task',
     'send_worker_message',
     'wait_for_workers',
+    'split_todo',
   ];
 
   /**
@@ -618,6 +619,15 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       case 'wait_for_workers':
         return await this.orchestrationExecutor.execute(toolCall);
 
+      case 'split_todo': {
+        // split_todo 需要调用方上下文（标识当前 worker/assignment/todo）
+        const execCtx = this.executionContextStorage.getStore();
+        const callerContext = execCtx?.workerId
+          ? this.snapshotContextMap.get(execCtx.workerId)
+          : undefined;
+        return await this.orchestrationExecutor.execute(toolCall, callerContext);
+      }
+
       default:
         return {
           toolCallId: toolCall.id,
@@ -778,6 +788,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     }
 
     const orchestrationToolNames = ['dispatch_task', 'send_worker_message', 'wait_for_workers'];
+    const workerOnlyToolNames = ['split_todo'];
 
     // 内置工具描述映射（中文用途说明）
     const builtinToolDescriptions: Record<string, { category: string; desc: string }> = {
@@ -796,6 +807,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       'web_fetch': { category: '网络工具', desc: '获取 URL 页面内容' },
       'codebase_retrieval': { category: '代码智能', desc: '语义搜索代码库' },
       'mermaid_diagram': { category: '可视化', desc: '生成 Mermaid 图表' },
+      'split_todo': { category: '任务管理', desc: '将当前任务拆分为多个子步骤' },
     };
 
     // 编排者专用的附加说明
@@ -810,7 +822,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
     // 内置工具：按类别分组
     lines.push('内置工具:');
-    const categoryOrder = ['文件操作', '终端命令', '网络工具', '代码智能', '可视化'];
+    const categoryOrder = ['文件操作', '终端命令', '网络工具', '代码智能', '可视化', '任务管理'];
     for (const category of categoryOrder) {
       const categoryTools = Object.entries(builtinToolDescriptions)
         .filter(([, v]) => v.category === category);
@@ -826,7 +838,8 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     // 动态发现新增的未映射内置工具
     const builtinTools = tools.filter(t =>
       t.metadata?.source === 'builtin' &&
-      (!excludeOrch || !orchestrationToolNames.includes(t.name))
+      (!excludeOrch || !orchestrationToolNames.includes(t.name)) &&
+      (excludeOrch || !workerOnlyToolNames.includes(t.name))
     );
     const unmappedTools = builtinTools.filter(t => !builtinToolDescriptions[t.name]);
     for (const tool of unmappedTools) {
@@ -885,7 +898,7 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
             command: { type: 'string', description: '要执行的 shell 命令（不要在 command 中写 cd，目录请通过 cwd 传递）' },
             cwd: { type: 'string', description: '命令执行目录。单工作区可省略（自动使用工作区根目录）；多工作区必须显式指定 "<工作区名>" 或 "<工作区名>/相对路径"' },
             wait: { type: 'boolean', description: '是否等待进程完成（默认 true）' },
-            max_wait_seconds: { type: 'number', description: '最大等待秒数（默认 30）' },
+            max_wait_seconds: { type: 'number', description: '空闲超时秒数（距最近一次输出超过该值则判定超时，默认 30）' },
             showTerminal: { type: 'boolean', description: '是否显示终端窗口（默认 true）' },
           },
           required: ['command'],
@@ -899,7 +912,7 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
           properties: {
             terminal_id: { type: 'number', description: 'terminal_id（来自 launch-process）' },
             wait: { type: 'boolean', description: '是否等待状态变化（默认 false）' },
-            max_wait_seconds: { type: 'number', description: '最大等待秒数（默认 30）' },
+            max_wait_seconds: { type: 'number', description: '空闲超时秒数（距最近一次输出超过该值则判定超时，默认 30）' },
           },
           required: ['terminal_id'],
         },

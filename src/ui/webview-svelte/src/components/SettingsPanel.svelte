@@ -25,11 +25,7 @@
   let isRefreshing = $state(false);
   let totalInputTokens = $state(0);
   let totalOutputTokens = $state(0);
-  let totalEstimatedInputTokens = $state(0);
-  let totalEstimatedOutputTokens = $state(0);
   let totalTokens = $derived(totalInputTokens + totalOutputTokens);
-  let totalRealInputTokens = $derived(Math.max(0, totalInputTokens - totalEstimatedInputTokens));
-  let totalRealOutputTokens = $derived(Math.max(0, totalOutputTokens - totalEstimatedOutputTokens));
   let userInfo = $state('');
   let showResetConfirm = $state(false);
 
@@ -346,8 +342,6 @@
   function recomputeTokenStatsSummary() {
     totalInputTokens = executionStats.reduce((sum, s) => sum + (s.totalInputTokens || 0), 0);
     totalOutputTokens = executionStats.reduce((sum, s) => sum + (s.totalOutputTokens || 0), 0);
-    totalEstimatedInputTokens = executionStats.reduce((sum, s) => sum + (s.totalEstimatedInputTokens || 0), 0);
-    totalEstimatedOutputTokens = executionStats.reduce((sum, s) => sum + (s.totalEstimatedOutputTokens || 0), 0);
   }
 
   // 格式化 Token 数量
@@ -383,8 +377,6 @@
     showResetConfirm = false;
     totalInputTokens = 0;
     totalOutputTokens = 0;
-    totalEstimatedInputTokens = 0;
-    totalEstimatedOutputTokens = 0;
   }
 
   function cancelResetStats() {
@@ -926,8 +918,6 @@
     avgDuration: number;
     totalInputTokens: number;
     totalOutputTokens: number;
-    totalEstimatedInputTokens: number;
-    totalEstimatedOutputTokens: number;
   }>>([]);
 
   // 监听来自扩展的状态更新
@@ -958,8 +948,6 @@
                 ...executionStats[statsIndex],
                 totalInputTokens: usage.inputTokens || 0,
                 totalOutputTokens: usage.outputTokens || 0,
-                totalEstimatedInputTokens: usage.estimatedInputTokens || 0,
-                totalEstimatedOutputTokens: usage.estimatedOutputTokens || 0,
               };
               executionStats = [...executionStats];
             } else {
@@ -974,8 +962,6 @@
                   avgDuration: 0,
                   totalInputTokens: usage.inputTokens || 0,
                   totalOutputTokens: usage.outputTokens || 0,
-                  totalEstimatedInputTokens: usage.estimatedInputTokens || 0,
-                  totalEstimatedOutputTokens: usage.estimatedOutputTokens || 0,
                 }
               ];
             }
@@ -989,8 +975,6 @@
           } else if (payload?.orchestratorStats) {
             totalInputTokens = payload.orchestratorStats.totalInputTokens || 0;
             totalOutputTokens = payload.orchestratorStats.totalOutputTokens || 0;
-            totalEstimatedInputTokens = payload.orchestratorStats.totalEstimatedInputTokens || 0;
-            totalEstimatedOutputTokens = payload.orchestratorStats.totalEstimatedOutputTokens || 0;
           }
         }
       }
@@ -1415,8 +1399,8 @@
           <div class="settings-section-header">
             <div class="settings-section-title">模型状态与统计</div>
             <div class="settings-section-actions">
-              <div class="settings-summary-chip">输入 Token: {formatTokens(totalRealInputTokens)} + 估算 {formatTokens(totalEstimatedInputTokens)}</div>
-              <div class="settings-summary-chip">输出 Token: {formatTokens(totalRealOutputTokens)} + 估算 {formatTokens(totalEstimatedOutputTokens)}</div>
+              <div class="settings-summary-chip">输入 Token: {formatTokens(totalInputTokens)}</div>
+              <div class="settings-summary-chip">输出 Token: {formatTokens(totalOutputTokens)}</div>
               <div class="settings-summary-chip">总 Token: {formatTokens(totalTokens)}</div>
               <button class="model-refresh-btn" class:loading={isRefreshing} onclick={refreshConnections} disabled={isRefreshing}>
                 <Icon name="refresh" size={14} />
@@ -1460,9 +1444,9 @@
                     <span class="stats-divider">|</span>
                     <span>成功率: {workerStats?.successRate != null ? `${Math.round(workerStats.successRate * 100)}%` : '--'}</span>
                     <span class="stats-divider">|</span>
-                    <span>输入: {formatTokens(Math.max(0, (workerStats?.totalInputTokens ?? 0) - (workerStats?.totalEstimatedInputTokens ?? 0)))} + 估算 {formatTokens(workerStats?.totalEstimatedInputTokens ?? 0)}</span>
+                    <span>输入: {formatTokens(workerStats?.totalInputTokens ?? 0)}</span>
                     <span class="stats-divider">|</span>
-                    <span>输出: {formatTokens(Math.max(0, (workerStats?.totalOutputTokens ?? 0) - (workerStats?.totalEstimatedOutputTokens ?? 0)))} + 估算 {formatTokens(workerStats?.totalEstimatedOutputTokens ?? 0)}</span>
+                    <span>输出: {formatTokens(workerStats?.totalOutputTokens ?? 0)}</span>
                     <span class="stats-divider">|</span>
                     <span>总计: {formatTokens((workerStats?.totalInputTokens ?? 0) + (workerStats?.totalOutputTokens ?? 0))}</span>
                   </div>

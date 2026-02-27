@@ -16,15 +16,28 @@ import type { WorkerSlot } from '../../types';
 import type { TokenUsage } from '../../types/agent-types';
 import type { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import type { ProfileLoader } from '../profile/profile-loader';
-import { CategoryResolver } from '../profile/category-resolver';
 import { LLMConfigLoader } from '../../llm/config';
 import type { MessageHub } from './message-hub';
 import type { MissionOrchestrator } from './mission-orchestrator';
 import type { Assignment } from '../mission';
 import type { WorkerReport, OrchestratorResponse } from '../protocols/worker-report';
 import { createAdjustResponse } from '../protocols/worker-report';
-import { DispatchBatch, CancellationError, type DispatchEntry, type DispatchResult, type DispatchStatus } from './dispatch-batch';
-import type { WaitForWorkersResult } from '../../tools/orchestration-executor';
+import {
+  DispatchBatch,
+  CancellationError,
+  isTerminalStatus,
+  type DispatchEntry,
+  type DispatchResult,
+  type DispatchStatus,
+  type DispatchCollaborationContracts,
+  type DispatchAuditOutcome,
+  type DispatchAuditIssue,
+  type DispatchAuditLevel,
+} from './dispatch-batch';
+import type {
+  WaitForWorkersResult,
+  DispatchTaskCollaborationContracts,
+} from '../../tools/orchestration-executor';
 import { buildDispatchSummaryPrompt } from '../prompts/orchestrator-prompts';
 import { MessageType } from '../../protocol/message-protocol';
 import { PlanningExecutor } from './executors/planning-executor';
@@ -44,7 +57,7 @@ interface ResumeExecutionContext {
 interface DispatchRoutingDecision {
   selectedWorker: WorkerSlot;
   category: string;
-  categorySource: 'explicit_param' | 'task_hint' | 'inferred';
+  categorySource: 'explicit_param';
   degraded: boolean;
   routingReason: string;
 }
@@ -56,7 +69,7 @@ interface WorkerAvailabilitySnapshot {
 
 interface DispatchCategoryResolution {
   category: string;
-  source: 'explicit_param' | 'task_hint' | 'inferred';
+  source: 'explicit_param';
 }
 
 /**
@@ -102,7 +115,6 @@ export class DispatchManager {
   private static readonly PHASE_B_PLUS_MIN_INTERVAL = 30_000;
 
   private pipeline = new WorkerPipeline();
-  private categoryResolver = new CategoryResolver();
   private activeBatch: DispatchBatch | null = null;
   private _planningExecutor: PlanningExecutor | null = null;
 
@@ -120,8 +132,9 @@ export class DispatchManager {
   private dispatchTaskCategories = new Map<string, string>();
   /** Worker 运行时暂时不可用状态（短期冷却） */
   private runtimeUnavailableWorkers = new Map<WorkerSlot, { until: number; reason: string }>();
+  /** 活跃的 Assignment 映射（Worker 执行期间可查，供 split_todo handler 使用） */
+  private activeAssignments = new Map<string, Assignment>();
   private static readonly MAX_MISSION_SESSION_RECORDS = 100;
-  private static readonly CATEGORY_HINT_REGEX = /^\s*category\s*:\s*([a-zA-Z][a-zA-Z0-9_\-\s]*)\s*$/im;
 
   constructor(private deps: DispatchManagerDeps) {
     this.setupMissionEventListeners();
@@ -244,24 +257,8 @@ export class DispatchManager {
     };
   }
 
-  private extractCategoryHintFromTask(task: string): string | undefined {
-    const match = task.match(DispatchManager.CATEGORY_HINT_REGEX);
-    if (!match?.[1]) {
-      return undefined;
-    }
-    return this.normalizeCategoryName(match[1]);
-  }
-
-  private resolveDispatchCategory(task: string): string {
-    const text = task.trim().toLowerCase();
-    if (!text) {
-      return 'general';
-    }
-    return this.categoryResolver.resolveFromText(text);
-  }
-
   private resolveDispatchCategoryWithSource(
-    task: string,
+    _goal: string,
     explicitCategory?: string,
   ): { ok: true; value: DispatchCategoryResolution } | { ok: false; error: string } {
     const explicit = explicitCategory?.trim();
@@ -279,39 +276,9 @@ export class DispatchManager {
         },
       };
     }
-
-    const taskHint = this.extractCategoryHintFromTask(task);
-    if (taskHint) {
-      const check = this.assertCategoryExists(taskHint);
-      if (!check.ok) {
-        return { ok: false, error: check.error };
-      }
-      return {
-        ok: true,
-        value: {
-          category: taskHint,
-          source: 'task_hint',
-        },
-      };
-    }
-
-    // 兜底：关键词推断（category 已设为必填，此路径仅在极端情况下触发）
-    logger.warn('dispatch_task 未收到 category 参数，降级为关键词推断', {
-      taskPreview: task.substring(0, 80),
-    }, LogCategory.ORCHESTRATOR);
-
-    const inferred = this.resolveDispatchCategory(task);
-    const check = this.assertCategoryExists(inferred);
-    if (!check.ok) {
-      return { ok: false, error: check.error };
-    }
-
     return {
-      ok: true,
-      value: {
-        category: inferred,
-        source: 'inferred',
-      },
+      ok: false,
+      error: `dispatch_task 缺少 category 参数。可选分类: ${this.getKnownCategoryNames().join(', ')}`,
     };
   }
 
@@ -414,7 +381,7 @@ export class DispatchManager {
   }
 
   private resolveDispatchRouting(
-    task: string,
+    goal: string,
     explicitCategory?: string,
   ): { ok: true; decision: DispatchRoutingDecision } | { ok: false; error: string } {
     try {
@@ -426,7 +393,7 @@ export class DispatchManager {
         error: `读取分工配置失败: ${error?.message || String(error)}`,
       };
     }
-    const categoryResolution = this.resolveDispatchCategoryWithSource(task, explicitCategory);
+    const categoryResolution = this.resolveDispatchCategoryWithSource(goal, explicitCategory);
     if (!categoryResolution.ok) {
       return {
         ok: false,
@@ -496,8 +463,7 @@ export class DispatchManager {
     }
 
     const preferredUnavailableReason = availability.unavailableReasons.get(preferredWorker) || '当前不可用';
-    const fallbackWorker = DispatchManager.WORKER_FALLBACK_PRIORITY[preferredWorker]
-      .find(worker => availability.availableWorkers.has(worker));
+    const fallbackWorker = this.pickFallbackWorker(preferredWorker, availability.availableWorkers);
     if (!fallbackWorker) {
       return {
         ok: false,
@@ -621,7 +587,7 @@ export class DispatchManager {
 
     orchestrationExecutor.setHandlers({
       dispatch: async (params) => {
-        const { task, files, dependsOn, category, requiresModification } = params;
+        const { goal, acceptance, constraints, context, files, scopeHint, dependsOn, category, requiresModification, contracts } = params;
         if (typeof requiresModification !== 'boolean') {
           return {
             task_id: '',
@@ -629,14 +595,20 @@ export class DispatchManager {
             error: 'requires_modification 必须为布尔值',
           };
         }
+        const taskTitle = goal.trim();
+        const collaborationContracts = this.normalizeCollaborationContracts(contracts);
         logger.info('编排工具.dispatch_task.开始', {
           category,
           requiresModification,
-          taskPreview: task.substring(0, 80),
+          scopeHintCount: scopeHint?.length || 0,
+          goalPreview: taskTitle.substring(0, 80),
+          acceptanceCount: acceptance.length,
+          constraintCount: constraints.length,
+          contextCount: context.length,
           dependsOn,
         }, LogCategory.ORCHESTRATOR);
 
-        const routingResult = this.resolveDispatchRouting(task, category);
+        const routingResult = this.resolveDispatchRouting(taskTitle, category);
         if (!routingResult.ok) {
           return {
             task_id: '',
@@ -684,20 +656,29 @@ export class DispatchManager {
           this.activeBatch = new DispatchBatch(missionId);
           this.activeBatch.userPrompt = this.deps.getActiveUserPrompt();
           this.setupBatchEventHandlers(this.activeBatch);
-          // 新 Batch 重置反应式编排状态
-          this.reactiveMode = false;
+          // reactiveMode 是执行级状态，仅由 resetForNewExecutionCycle() 重置
           this.completionQueue.reset();
         }
 
         // 注册到 DispatchBatch
         try {
+          if ((!scopeHint || scopeHint.length === 0) && this.shouldWarnMissingScopeHintForParallelTask(this.activeBatch, dependsOn)) {
+            throw new Error('并行任务必须显式提供 scope_hint，以满足文件级分区要求');
+          }
+
           this.activeBatch.register({
             taskId,
             worker: decision.selectedWorker,
-            task,
+            goal: taskTitle,
+            acceptance,
+            constraints,
+            context,
+            task: taskTitle,
+            scopeHint,
             files,
             requiresModification,
             dependsOn,
+            collaborationContracts,
           });
 
           // C-12: 环检测 + 深度上限校验
@@ -732,7 +713,7 @@ export class DispatchManager {
         const hasDeps = entry ? entry.status === 'waiting_deps' : (dependsOn && dependsOn.length > 0);
         this.deps.messageHub.subTaskCard({
           id: taskId,
-          title: task,
+          title: taskTitle,
           status: hasDeps ? 'pending' : 'running',
           worker: decision.selectedWorker,
         });
@@ -771,6 +752,63 @@ export class DispatchManager {
 
         return this.waitForWorkers(params.task_ids);
       },
+
+      splitTodo: async (params) => {
+        const { subtasks, callerContext } = params;
+        const assignment = this.activeAssignments.get(callerContext.assignmentId);
+        if (!assignment) {
+          return {
+            success: false,
+            childTodoIds: [],
+            error: `Assignment ${callerContext.assignmentId} 不在活跃执行中`,
+          };
+        }
+
+        // 3 级约束：L1/L2 可拆分，L3（parent 的 parent 存在）不可再拆分
+        const currentTodo = assignment.todos.find(t => t.id === callerContext.todoId);
+        if (currentTodo?.parentId) {
+          const parentTodo = assignment.todos.find(t => t.id === currentTodo.parentId);
+          if (parentTodo?.parentId) {
+            return {
+              success: false,
+              childTodoIds: [],
+              error: '已达最大拆分深度（3 级），不可再次拆分',
+            };
+          }
+        }
+
+        const todoManager = this.deps.getTodoManager();
+        if (!todoManager) {
+          return {
+            success: false,
+            childTodoIds: [],
+            error: 'TodoManager 未初始化',
+          };
+        }
+
+        const childTodoIds: string[] = [];
+        for (const subtask of subtasks) {
+          const child = await todoManager.create({
+            missionId: callerContext.missionId,
+            assignmentId: callerContext.assignmentId,
+            parentId: callerContext.todoId,
+            content: subtask.content,
+            reasoning: subtask.reasoning,
+            type: subtask.type,
+            workerId: callerContext.workerId as WorkerSlot,
+          });
+          assignment.todos.push(child);
+          childTodoIds.push(child.id);
+        }
+
+        logger.info('编排工具.split_todo.完成', {
+          parentTodoId: callerContext.todoId,
+          childCount: childTodoIds.length,
+          workerId: callerContext.workerId,
+        }, LogCategory.ORCHESTRATOR);
+
+        return { success: true, childTodoIds };
+      },
     });
 
     logger.info('编排器.编排工具回调.已注入', undefined, LogCategory.ORCHESTRATOR);
@@ -783,15 +821,25 @@ export class DispatchManager {
    * - governance = 'auto'（默认）：有 files 时自动启用 LSP/Snapshot/TargetEnforce
    * - governance = 'full'：强制启用所有治理步骤
    */
-  launchDispatchWorker(
-    taskId: string,
-    worker: WorkerSlot,
-    task: string,
-    files?: string[],
-    requiresModification: boolean = true,
-  ): void {
+  launchDispatchWorker(entry: DispatchEntry): void {
+    const {
+      taskId,
+      worker,
+      task,
+      goal,
+      acceptance,
+      constraints,
+      context,
+      scopeHint,
+      files,
+      requiresModification,
+      collaborationContracts,
+    } = entry;
     const batch = this.activeBatch;
-    const category = this.dispatchTaskCategories.get(taskId) || this.resolveDispatchCategory(task);
+    const category = this.dispatchTaskCategories.get(taskId);
+    if (!category) {
+      throw new Error(`dispatchTaskCategories 中未找到 taskId=${taskId}，dispatch 注册流程存在数据不一致`);
+    }
     const executionRouting = this.resolveExecutionWorker(worker);
     if (!executionRouting.ok) {
       const errorMsg = executionRouting.error;
@@ -854,7 +902,16 @@ export class DispatchManager {
         workerId: effectiveWorker,
         shortTitle: task,
         responsibility: task,
-        delegationBriefing: task,
+        delegationBriefing: this.buildDelegationBriefing({
+          goal,
+          acceptance,
+          constraints,
+          context,
+          scopeHint,
+          files,
+          predecessorContext: this.buildPredecessorContext(taskId),
+          collaborationContracts,
+        }),
         assignmentReason: {
           profileMatch: { category, score: 100, matchedKeywords: [] },
           contractRole: 'none' as const,
@@ -864,12 +921,13 @@ export class DispatchManager {
         scope: {
           includes: [task],
           excludes: [],
+          scopeHints: scopeHint || [],
           targetPaths: files || [],
           requiresModification,
         },
-        guidancePrompt: '',
-        producerContracts: [],
-        consumerContracts: [],
+        guidancePrompt: this.buildScopeHintGuidance(scopeHint),
+        producerContracts: collaborationContracts.producerContracts,
+        consumerContracts: collaborationContracts.consumerContracts,
         todos: [],
         planningStatus: 'pending' as const,
         status: 'pending' as const,
@@ -901,7 +959,10 @@ export class DispatchManager {
       const contextManager = this.deps.getContextManager();
 
       // 通过 WorkerPipeline 统一执行
-      const pipelineResult = await this.pipeline.execute({
+      this.activeAssignments.set(taskId, assignment);
+      let pipelineResult;
+      try {
+        pipelineResult = await this.pipeline.execute({
         assignment,
         workerInstance,
         adapterFactory: this.deps.adapterFactory,
@@ -927,6 +988,9 @@ export class DispatchManager {
         contextManager,
         todoManager: this.deps.getTodoManager(),
       });
+      } finally {
+        this.activeAssignments.delete(taskId);
+      }
 
       const result = pipelineResult.executionResult;
       if (result.sessionId) {
@@ -958,8 +1022,6 @@ export class DispatchManager {
         tokenUsage: result.tokenUsage ? {
           inputTokens: result.tokenUsage.inputTokens || 0,
           outputTokens: result.tokenUsage.outputTokens || 0,
-          estimatedInputTokens: result.tokenUsage.estimatedInputTokens,
-          estimatedOutputTokens: result.tokenUsage.estimatedOutputTokens,
         } : undefined,
       };
       if (result.success) {
@@ -1047,7 +1109,7 @@ export class DispatchManager {
 
     // Worker 完成后重新检查是否有同类型排队任务可启动
     batch.on('task:statusChanged', (_taskId: string, status: DispatchStatus) => {
-      if (status === 'completed' || status === 'failed' || status === 'skipped' || status === 'cancelled') {
+      if (isTerminalStatus(status)) {
         setImmediate(() => this.dispatchReadyTasksWithIsolation(batch));
 
         // 反应式编排：将完成结果推入队列，唤醒 waitForWorkers
@@ -1062,16 +1124,26 @@ export class DispatchManager {
     batch.on('batch:allCompleted', (batchId: string, entries: DispatchEntry[]) => {
       const summary = batch.getSummary();
       logger.info('DispatchBatch.全部完成', { batchId, ...summary, reactiveMode: this.reactiveMode }, LogCategory.ORCHESTRATOR);
+      const auditOutcome = this.ensureBatchAuditOutcome(batch, entries);
 
       if (this.reactiveMode) {
         // 反应式模式：编排者通过 wait_for_workers 接收结果并自行汇总
-        // 标记等待主对话区最终汇总，直接归档，不触发 Phase C
+        // 标记等待主对话区最终汇总，直接归档，不触发 Phase C 汇总 LLM
         this.reactiveBatchAwaitingSummary.add(batchId);
+        if (auditOutcome.level === 'intervention') {
+          const blockedReport = this.buildInterventionReport(auditOutcome, entries);
+          this.deps.messageHub.notify('反应式编排审计发现需干预项，已阻断自动交付', 'error');
+          this.deps.messageHub.orchestratorMessage(blockedReport, { type: MessageType.RESULT });
+          logger.warn('Reactive Phase 审计阻断交付', {
+            batchId,
+            auditOutcome,
+          }, LogCategory.ORCHESTRATOR);
+        }
         batch.archive();
       } else {
         this.reactiveBatchAwaitingSummary.delete(batchId);
         // 传统模式：自动触发 Phase C 汇总
-        void this.triggerPhaseCSummary(batch, entries);
+        void this.triggerPhaseCSummary(batch, entries, auditOutcome);
       }
     });
 
@@ -1102,20 +1174,18 @@ export class DispatchManager {
       logger.info('DispatchBatch.隔离调度.启动', {
         taskId: entry.taskId, worker: entry.worker,
       }, LogCategory.ORCHESTRATOR);
-      this.launchDispatchWorker(
-        entry.taskId,
-        entry.worker,
-        entry.task,
-        entry.files,
-        entry.requiresModification,
-      );
+      this.launchDispatchWorker(entry);
     }
   }
 
   /**
    * Phase C 汇总 — 所有 Worker 完成后触发 orchestrator 汇总 LLM 调用
    */
-  private async triggerPhaseCSummary(batch: DispatchBatch, entries: DispatchEntry[]): Promise<void> {
+  private async triggerPhaseCSummary(
+    batch: DispatchBatch,
+    entries: DispatchEntry[],
+    auditOutcome?: DispatchAuditOutcome,
+  ): Promise<void> {
     const userPrompt = batch.userPrompt || this.deps.getActiveUserPrompt();
     if (!userPrompt) {
       logger.warn('Phase C 汇总: 无用户原始请求，跳过', undefined, LogCategory.ORCHESTRATOR);
@@ -1126,7 +1196,20 @@ export class DispatchManager {
     try {
       this.deps.messageHub.progress('Summarizing', '正在汇总所有 Worker 的执行结果...');
 
-      const summaryPrompt = buildDispatchSummaryPrompt(userPrompt, entries);
+      const finalAuditOutcome = auditOutcome || this.ensureBatchAuditOutcome(batch, entries);
+
+      if (finalAuditOutcome.level === 'intervention') {
+        const blockedReport = this.buildInterventionReport(finalAuditOutcome, entries);
+        this.deps.messageHub.notify('Phase C 审计发现需干预项，已阻断自动交付', 'error');
+        this.deps.messageHub.orchestratorMessage(blockedReport, { type: MessageType.RESULT });
+        logger.warn('Phase C 审计阻断交付', {
+          batchId: batch.id,
+          auditOutcome: finalAuditOutcome,
+        }, LogCategory.ORCHESTRATOR);
+        return;
+      }
+
+      const summaryPrompt = `${buildDispatchSummaryPrompt(userPrompt, entries)}\n\n${this.buildAuditPromptAppendix(finalAuditOutcome)}`;
 
       const PHASE_C_TIMEOUT = 2 * 60 * 1000; // 2 分钟
       const response = await Promise.race([
@@ -1337,7 +1420,7 @@ ${this.deps.getActiveUserPrompt()}
       };
     }
 
-    return this.completionQueue.waitFor(batch, taskIds, {
+    const waitResult = await this.completionQueue.waitFor(batch, taskIds, {
       waitTimeoutMs: 10 * 60 * 1000,
       wakeupTimeoutMs: 30_000,
       onTimeout: (pendingTaskIds, elapsedMs) => {
@@ -1347,12 +1430,366 @@ ${this.deps.getActiveUserPrompt()}
         );
       },
     });
+
+    // 全量完成时回传程序化审计结果，供编排者在反应式模式下据此决策
+    if (!waitResult.timed_out && waitResult.pending_task_ids.length === 0) {
+      const auditOutcome = batch.getAuditOutcome();
+      if (auditOutcome) {
+        return {
+          ...waitResult,
+          audit: {
+            level: auditOutcome.level,
+            summary: auditOutcome.summary,
+            issues: auditOutcome.issues.map(issue => ({
+              task_id: issue.taskId,
+              level: issue.level,
+              dimension: issue.dimension,
+              detail: issue.detail,
+            })),
+          },
+        };
+      }
+    }
+
+    return waitResult;
   }
 
   private clearBatchTaskCategories(batch: DispatchBatch): void {
     for (const entry of batch.getEntries()) {
       this.dispatchTaskCategories.delete(entry.taskId);
     }
+  }
+
+  private buildDelegationBriefing(input: {
+    goal: string;
+    acceptance: string[];
+    constraints: string[];
+    context: string[];
+    scopeHint?: string[];
+    files?: string[];
+    predecessorContext?: string;
+    collaborationContracts: DispatchCollaborationContracts;
+  }): string {
+    const lines: string[] = [
+      `## 任务目标\n${input.goal}`,
+      `## 验收标准\n${input.acceptance.map(item => `- ${item}`).join('\n')}`,
+      `## 约束条件\n${input.constraints.map(item => `- ${item}`).join('\n')}`,
+      `## 已知上下文\n${input.context.map(item => `- ${item}`).join('\n')}`,
+    ];
+
+    if (input.predecessorContext) {
+      lines.push(input.predecessorContext);
+    }
+
+    if (input.scopeHint && input.scopeHint.length > 0) {
+      lines.push(`## 范围线索（非硬约束）\n${input.scopeHint.map(item => `- ${item}`).join('\n')}`);
+    }
+
+    if (input.files && input.files.length > 0) {
+      lines.push(`## 严格目标文件\n${input.files.map(item => `- ${item}`).join('\n')}`);
+    }
+
+    const contracts = input.collaborationContracts;
+    if (contracts.producerContracts.length > 0 || contracts.consumerContracts.length > 0 || contracts.interfaceContracts.length > 0 || contracts.freezeFiles.length > 0) {
+      lines.push('## 协作契约');
+      if (contracts.producerContracts.length > 0) {
+        lines.push(`- 生产契约: ${contracts.producerContracts.join('、')}`);
+      }
+      if (contracts.consumerContracts.length > 0) {
+        lines.push(`- 消费契约: ${contracts.consumerContracts.join('、')}`);
+      }
+      if (contracts.interfaceContracts.length > 0) {
+        lines.push(`- 接口约定: ${contracts.interfaceContracts.join('；')}`);
+      }
+      if (contracts.freezeFiles.length > 0) {
+        lines.push(`- 冻结文件（禁止修改）: ${contracts.freezeFiles.join('、')}`);
+      }
+    }
+
+    lines.push('## 执行要求\n先完成分析与方案判断，再执行实现与验证；禁止机械照搬步骤脚本。');
+    return lines.join('\n\n');
+  }
+
+  /**
+   * 收集前序任务结果并裁剪为精要上下文
+   *
+   * 信息裁剪原则：只传递摘要、关键决策和产出路径，
+   * 不传递完整执行日志，控制下游 Worker 的上下文规模。
+   */
+  private buildPredecessorContext(taskId: string): string | undefined {
+    const batch = this.activeBatch;
+    if (!batch) return undefined;
+
+    const entry = batch.getEntry(taskId);
+    if (!entry || entry.dependsOn.length === 0) return undefined;
+
+    const sections: string[] = [];
+    for (const depId of entry.dependsOn) {
+      const depEntry = batch.getEntry(depId);
+      if (!depEntry?.result) continue;
+
+      const depSummary = depEntry.result.summary || '无摘要';
+      const depFiles = depEntry.result.modifiedFiles?.join('、') || '无';
+      sections.push(`- **${depId}**（${depEntry.worker}）：${depSummary}；修改文件：${depFiles}`);
+    }
+
+    if (sections.length === 0) return undefined;
+    return `## 前序任务结果\n以下是你依赖的前序任务的执行结果：\n${sections.join('\n')}`;
+  }
+
+  private buildScopeHintGuidance(scopeHint?: string[]): string {
+    if (!scopeHint || scopeHint.length === 0) {
+      return '';
+    }
+    return [
+      '## 范围线索（非硬约束）',
+      ...scopeHint.map(item => `- ${item}`),
+      '',
+      '你应优先从以上线索定位，但可根据任务需要自然扩展范围。',
+    ].join('\n');
+  }
+
+  private shouldWarnMissingScopeHintForParallelTask(batch: DispatchBatch, dependsOn?: string[]): boolean {
+    const dependencySet = new Set((dependsOn || []).map(id => id.trim()).filter(Boolean));
+    return batch.getEntries().some(entry =>
+      !isTerminalStatus(entry.status) && !dependencySet.has(entry.taskId)
+    );
+  }
+
+  private normalizeCollaborationContracts(
+    raw?: DispatchTaskCollaborationContracts,
+  ): DispatchCollaborationContracts {
+    const producerContracts = (raw?.producer_contracts || []).map(item => item.trim()).filter(Boolean);
+    const consumerContracts = (raw?.consumer_contracts || []).map(item => item.trim()).filter(Boolean);
+    const interfaceContracts = (raw?.interface_contracts || []).map(item => item.trim()).filter(Boolean);
+    const freezeFiles = (raw?.freeze_files || []).map(item => item.trim()).filter(Boolean);
+    return {
+      producerContracts,
+      consumerContracts,
+      interfaceContracts,
+      freezeFiles,
+    };
+  }
+
+  private ensureBatchAuditOutcome(
+    batch: DispatchBatch,
+    entries: DispatchEntry[],
+  ): DispatchAuditOutcome {
+    const existing = batch.getAuditOutcome();
+    if (existing) {
+      return existing;
+    }
+    const computed = this.runStructuredAudit(entries);
+    batch.setAuditOutcome(computed);
+    return computed;
+  }
+
+  private runStructuredAudit(entries: DispatchEntry[]): DispatchAuditOutcome {
+    const severityRank: Record<DispatchAuditLevel, number> = {
+      normal: 0,
+      watch: 1,
+      intervention: 2,
+    };
+
+    const taskLevels = new Map<string, DispatchAuditLevel>();
+    const issues: DispatchAuditIssue[] = [];
+    const entryById = new Map(entries.map(entry => [entry.taskId, entry]));
+
+    for (const entry of entries) {
+      taskLevels.set(entry.taskId, 'normal');
+    }
+
+    const escalate = (
+      taskId: string,
+      level: DispatchAuditLevel,
+      dimension: DispatchAuditIssue['dimension'],
+      detail: string,
+    ): void => {
+      issues.push({ taskId, level, dimension, detail });
+      const current = taskLevels.get(taskId) || 'normal';
+      if (severityRank[level] > severityRank[current]) {
+        taskLevels.set(taskId, level);
+      }
+    };
+
+    for (const entry of entries) {
+      const modifiedFiles = [...new Set((entry.result?.modifiedFiles || []).map(file => this.normalizePath(file)).filter(Boolean))];
+      if (modifiedFiles.length === 0) {
+        continue;
+      }
+
+      const strictFiles = new Set((entry.files || []).map(file => this.normalizePath(file)).filter(Boolean));
+      if (strictFiles.size > 0) {
+        const outOfStrictFiles = modifiedFiles.filter(file => !strictFiles.has(file));
+        if (outOfStrictFiles.length > 0) {
+          escalate(
+            entry.taskId,
+            'intervention',
+            'scope',
+            `改动超出严格目标文件：${outOfStrictFiles.join('、')}`,
+          );
+        }
+      }
+
+      if (entry.scopeHint.length > 0) {
+        const outOfHintFiles = modifiedFiles.filter(file =>
+          !entry.scopeHint.some(hint => this.pathMatchesHint(file, hint))
+        );
+        if (outOfHintFiles.length > 0) {
+          escalate(
+            entry.taskId,
+            'watch',
+            'scope',
+            `改动超出 scope_hint 引导范围：${outOfHintFiles.join('、')}`,
+          );
+        }
+      }
+
+      const freezeFiles = new Set(entry.collaborationContracts.freezeFiles.map(file => this.normalizePath(file)).filter(Boolean));
+      if (freezeFiles.size > 0) {
+        const touchedFreezeFiles = modifiedFiles.filter(file => freezeFiles.has(file));
+        if (touchedFreezeFiles.length > 0) {
+          escalate(
+            entry.taskId,
+            'intervention',
+            'contract',
+            `触碰冻结文件：${touchedFreezeFiles.join('、')}`,
+          );
+        }
+      }
+    }
+
+    const fileOwners = new Map<string, Set<string>>();
+    for (const entry of entries) {
+      for (const file of entry.result?.modifiedFiles || []) {
+        const normalized = this.normalizePath(file);
+        if (!normalized) continue;
+        const owners = fileOwners.get(normalized) || new Set<string>();
+        owners.add(entry.taskId);
+        fileOwners.set(normalized, owners);
+      }
+    }
+
+    for (const [file, ownerSet] of fileOwners) {
+      const owners = Array.from(ownerSet);
+      if (owners.length < 2) continue;
+      for (let i = 0; i < owners.length; i++) {
+        for (let j = i + 1; j < owners.length; j++) {
+          const a = owners[i];
+          const b = owners[j];
+          const hasAtoB = this.hasDependencyChain(a, b, entryById, new Set());
+          const hasBtoA = this.hasDependencyChain(b, a, entryById, new Set());
+          if (!hasAtoB && !hasBtoA) {
+            escalate(a, 'intervention', 'cross_task', `与任务 ${b} 在文件 ${file} 产生并行冲突（无依赖串行化）`);
+            escalate(b, 'intervention', 'cross_task', `与任务 ${a} 在文件 ${file} 产生并行冲突（无依赖串行化）`);
+          }
+        }
+      }
+    }
+
+    const summary = { normal: 0, watch: 0, intervention: 0 };
+    for (const level of taskLevels.values()) {
+      summary[level] += 1;
+    }
+
+    const level: DispatchAuditLevel =
+      summary.intervention > 0 ? 'intervention'
+        : summary.watch > 0 ? 'watch'
+          : 'normal';
+
+    return {
+      level,
+      issues,
+      taskLevels: Object.fromEntries(taskLevels.entries()),
+      summary,
+    };
+  }
+
+  private buildAuditPromptAppendix(auditOutcome: DispatchAuditOutcome): string {
+    const issueLines = auditOutcome.issues
+      .map(issue => `- [${issue.level}] ${issue.taskId} (${issue.dimension}): ${issue.detail}`)
+      .join('\n') || '- 无';
+
+    return [
+      '## 程序化审计结果（系统判定）',
+      `总体级别: ${auditOutcome.level}`,
+      `任务分布: 正常 ${auditOutcome.summary.normal}，需关注 ${auditOutcome.summary.watch}，需干预 ${auditOutcome.summary.intervention}`,
+      '问题列表:',
+      issueLines,
+      '请在总结中严格遵循以上审计结果，不要降级“需干预”项。',
+    ].join('\n');
+  }
+
+  private buildInterventionReport(
+    auditOutcome: DispatchAuditOutcome,
+    entries: DispatchEntry[],
+  ): string {
+    const titleByTaskId = new Map(entries.map(entry => [entry.taskId, entry.task]));
+    const interventionIssues = auditOutcome.issues.filter(issue => issue.level === 'intervention');
+    const watchIssues = auditOutcome.issues.filter(issue => issue.level === 'watch');
+
+    const interventionLines = interventionIssues.length > 0
+      ? interventionIssues.map((issue, index) =>
+        `${index + 1}. ${issue.taskId}（${titleByTaskId.get(issue.taskId) || '未知任务'}）- ${issue.detail}`
+      ).join('\n')
+      : '无';
+
+    const watchLines = watchIssues.length > 0
+      ? watchIssues.map((issue, index) =>
+        `${index + 1}. ${issue.taskId}（${titleByTaskId.get(issue.taskId) || '未知任务'}）- ${issue.detail}`
+      ).join('\n')
+      : '无';
+
+    return [
+      '## Phase C 审计结论',
+      '结果：检测到“需干预”问题，已阻断自动交付。',
+      '',
+      '### 需干预',
+      interventionLines,
+      '',
+      '### 需关注',
+      watchLines,
+      '',
+      '### 建议动作',
+      '1. 对需干预任务追加修复任务（建议串行化并补充 contracts.freeze_files / depends_on）',
+      '2. 重新执行后再进入 Phase C 汇总',
+    ].join('\n');
+  }
+
+  private hasDependencyChain(
+    taskId: string,
+    targetTaskId: string,
+    entryById: Map<string, DispatchEntry>,
+    visited: Set<string>,
+  ): boolean {
+    if (visited.has(taskId)) {
+      return false;
+    }
+    visited.add(taskId);
+    const entry = entryById.get(taskId);
+    if (!entry) {
+      return false;
+    }
+    if (entry.dependsOn.includes(targetTaskId)) {
+      return true;
+    }
+    return entry.dependsOn.some(depId => this.hasDependencyChain(depId, targetTaskId, entryById, visited));
+  }
+
+  private normalizePath(input: string): string {
+    return input.replace(/\\/g, '/').trim().replace(/^\.\//, '').replace(/\/+$/, '');
+  }
+
+  private pathMatchesHint(filePath: string, hintPath: string): boolean {
+    const file = this.normalizePath(filePath);
+    const hint = this.normalizePath(hintPath);
+    if (!file || !hint) {
+      return false;
+    }
+    if (file === hint || file.endsWith(`/${hint}`)) {
+      return true;
+    }
+    return file.startsWith(`${hint}/`) || file.includes(`/${hint}/`);
   }
 
   dispose(): void {

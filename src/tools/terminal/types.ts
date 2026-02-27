@@ -89,6 +89,8 @@ export interface TerminalSessionData {
   shellPid?: number;
   /** 上次文件读取位置 */
   lastFileEndPosition: number;
+  /** 输出活动探测位置（用于空闲超时判断） */
+  lastActivityProbePosition?: number;
   /** CWD 追踪文件路径 */
   cwdTrackingFile?: string;
   /** 上次捕获的子进程集合 */

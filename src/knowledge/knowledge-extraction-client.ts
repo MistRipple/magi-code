@@ -56,8 +56,6 @@ export async function createKnowledgeExtractionClient(
             duration,
             inputTokens: response.usage?.inputTokens,
             outputTokens: response.usage?.outputTokens,
-            estimatedInputTokens: response.usage?.estimatedInputTokens,
-            estimatedOutputTokens: response.usage?.estimatedOutputTokens,
             phase: 'integration',
           });
         }
@@ -92,8 +90,6 @@ export async function createKnowledgeExtractionClient(
             duration,
             inputTokens: response.usage?.inputTokens,
             outputTokens: response.usage?.outputTokens,
-            estimatedInputTokens: response.usage?.estimatedInputTokens,
-            estimatedOutputTokens: response.usage?.estimatedOutputTokens,
             phase: 'integration',
           });
         }

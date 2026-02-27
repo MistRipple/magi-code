@@ -10,7 +10,7 @@
 import { WorkerSlot } from '../../types';
 import type { UnifiedTodo } from '../../todo/types';
 import { ProfileLoader } from '../profile/profile-loader';
-import { WorkerProfile } from '../profile/types';
+import { WorkerProfile, findWeaknessMatches } from '../profile/types';
 import {
   Assignment,
   TodoOutput,
@@ -69,7 +69,7 @@ export class ProfileAwareRecoveryHandler {
     const taskContent = todo.content.toLowerCase();
 
     // 检查是否与弱项相关
-    const matchedWeaknesses = this.findWeaknessMatches(
+    const matchedWeaknesses = findWeaknessMatches(
       `${errorMessage} ${taskContent}`,
       profile
     );
@@ -149,16 +149,6 @@ export class ProfileAwareRecoveryHandler {
       reason: `多次重试失败 (${retryCount + 1} 次)，需要人工介入`,
       confidence: 0.9,
     };
-  }
-
-  /**
-   * 查找弱项匹配
-   */
-  private findWeaknessMatches(text: string, profile: WorkerProfile): string[] {
-    const textLower = text.toLowerCase();
-    return profile.persona.weaknesses.filter(w =>
-      textLower.includes(w.toLowerCase())
-    );
   }
 
   /**

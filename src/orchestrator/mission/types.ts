@@ -391,6 +391,8 @@ export interface AssignmentScope {
   includes: string[];
   /** 职责范围外（不应该做的） */
   excludes: string[];
+  /** 范围线索（非硬约束），用于引导优先关注区域 */
+  scopeHints?: string[];
   /** 目标文件/目录 */
   targetPaths?: string[];
   /** 是否需要对目标文件产生实际修改 */

@@ -44,6 +44,14 @@ export interface WorkerProfile {
   assignedCategories: string[];
 }
 
+/** 查找文本中匹配 Worker 弱项的条目 */
+export function findWeaknessMatches(text: string, profile: WorkerProfile): string[] {
+  const textLower = text.toLowerCase();
+  return profile.persona.weaknesses.filter(w =>
+    textLower.includes(w.toLowerCase())
+  );
+}
+
 // ============================================================================
 // Category types
 // ============================================================================
@@ -74,7 +82,6 @@ export interface CategoryDefinition {
 export interface CategoryRules {
   categoryPriority: string[];
   defaultCategory: string;
-  riskMapping: Record<RiskLevel, 'fullPath' | 'standardPath' | 'lightPath'>;
 }
 
 // ============================================================================

@@ -139,7 +139,41 @@ ${toolsListSection}
 - 大规模重构或新功能开发
 - 需要多个 Worker 协作时，拆分为多个 dispatch_task 分阶段执行
 
-**原则**：能层级 1 解决的不用层级 2，能层级 2 解决的不用层级 3。`);
+**原则**：能层级 1 解决的不用层级 2，能层级 2 解决的不用层级 3。
+
+**任务分级判定**：
+根据用户需求的**结构特征**判定任务级别（不是根据实现复杂度——实现复杂度是 Worker 分析后才能确定的）：
+
+| 级别 | 特征 | 编排策略 |
+|------|------|----------|
+| L1 轻量 | 范围明确、改动局部、单关注点、用户已指明改动范围 | 简洁合同，Worker 直接执行 |
+| L2 标准 | 需方案选择、可能跨模块、单 Worker | 完整合同（目标/验收/约束/上下文），Worker 自主决策 |
+| L3 复杂 | 多关注点、多领域、需多 Worker 协作 | 完整合同 + 协作契约（接口定义/冻结区域/时序关系），编排者主动协调 |
+
+**分级原则**：不确定时向下兼容——拿不准 L1/L2 时按 L2 处理，拿不准 L2/L3 时按 L3 处理。宁可多给上下文和契约，不可给出模糊的半成品合同。`);
+
+  // 共享工作空间
+  sections.push(`## 共享工作空间
+所有 Worker 共享同一个工作空间（同一 git 仓库工作目录），不做文件系统级隔离。
+串行 Worker 天然继承前序改动，并行 Worker 对共享代码的修改冲突在 Phase C 被集中发现。
+
+**冲突预防**（按优先级）：
+1. **分区**：并行任务应提供 \`scope_hint\` 且尽量不重叠（前端任务聚焦前端文件，后端任务聚焦后端文件）
+2. **串行化**：有文件交叉的并行任务应通过 \`depends_on\` 串行化，让后序任务基于前序结果继续工作
+3. **冻结声明**：不可避免的共享修改，在任务合同约束中声明冻结区域，约束 Worker 不修改对方正在操作的共享文件`);
+
+  // 决策权分配
+  sections.push(`## 决策权分配
+
+| 决策类型 | 编排者自主 | 需征询用户 |
+|----------|-----------|-----------|
+| 任务拆分方式 | 是（用户可在交付后反馈） | 当需求严重模糊时 |
+| Worker 路由选择 | 是（基于分类自动路由） | — |
+| 任务改派（降级） | 是（自动降级 + 通知用户） | — |
+| 需求歧义澄清 | — | 是（无法合理推断时） |
+| 超出预期的大范围改动 | — | 是（在执行前确认） |
+| 不可逆外部操作 | — | 是（如发布、数据库变更） |
+| 失败恢复策略 | 首次自动恢复 | 连续失败时升级 |`);
 
   // dispatch_task 使用指南
   sections.push(`## dispatch_task 使用指南
@@ -147,15 +181,27 @@ ${toolsListSection}
 - **requires_modification 是必填参数**：
   - 只读分析/统计/总结任务传 \`false\`
   - 功能开发/修复/重构/生成代码任务传 \`true\`
-  - 必须与 task 语义一致，禁止矛盾
-- task 参数必须包含：
-  1. 明确的目标（要做什么）
-  2. 具体的文件路径或代码位置（在哪做）
-  3. 验收标准（怎样算完成）
-- 示例格式："在 src/utils/validator.ts 中，给 validateEmail 函数添加对空字符串的处理。当输入为空字符串时返回 false。"
-- 禁止给出模糊任务如"优化代码"、"改进性能"——必须指明具体要改什么
-- files 参数帮助 Worker 定位关键文件，尽量提供
-- **Worker 行为差异**：Codex 是执行者而非探索者——分配给 Codex 时，必须提供 files 参数和精确的修改指令，不要给 Codex 分配需要大范围探索的任务；Claude 适合处理需要深度分析和探索的任务
+  - 必须与任务合同语义一致，禁止矛盾
+- **必须使用结构化任务合同字段**：
+  1. \`goal\`：任务目标（Goal）
+  2. \`acceptance\`：验收标准数组（Acceptance）
+  3. \`constraints\`：约束数组（Constraints）
+  4. \`context\`：上下文数组（Context）
+- scope_hint 参数（推荐）：给出优先关注的文件/目录线索；它是**非硬约束**，Worker 可按需扩展
+  - 并行任务的 scope_hint 应尽量不重叠，以实现文件级分区
+  - 如无法预判范围可省略，Worker 自行确定
+- contracts 参数（L3 协作推荐）：
+  - \`producer_contracts\` / \`consumer_contracts\`：声明生产/消费契约
+  - \`interface_contracts\`：声明接口约定文本
+  - \`freeze_files\`：冻结文件（本任务禁止修改）
+- files 参数（可选）：仅当确需限定“严格目标文件”时提供；不要把 files 当作常规微操手段
+- 示例结构：
+  - goal: "修复 validateEmail 对空字符串的误判"
+  - acceptance: ["空字符串返回 false", "现有邮箱样例保持通过"]
+  - constraints: ["不改变函数签名"]
+  - context: ["问题集中在 src/utils/validator.ts 附近"]
+  - scope_hint: ["src/utils/validator.ts", "tests/validator.test.ts"]
+- 禁止给出模糊任务如"优化代码"、"改进性能"，也禁止写成逐步实现脚本（例如“先改A再改B再改C”）
 - Worker 执行是异步的，执行完成后结果会自动返回
 - 多个独立的 dispatch_task 可以依次发起，Worker 会并行执行`);
 
@@ -164,12 +210,16 @@ ${toolsListSection}
 当任务需要多阶段协调时，使用 dispatch_task + wait_for_workers 组合实现反应式编排循环：
 
 **基本流程**：
-1. 使用 dispatch_task 分配一个或多个子任务
-2. 调用 wait_for_workers 阻塞等待结果
-3. 分析 Worker 返回的结果，决定下一步行动：
-   - 如果所有任务成功完成 → 向用户汇总结果
-   - 如果部分失败 → dispatch_task 追加修复任务，再次 wait_for_workers
-   - 如果发现新的需求 → dispatch_task 追加新任务
+1. 分析用户需求，拆解为可执行的子目标
+2. 使用 dispatch_task 分配子任务
+3. 调用 wait_for_workers 阻塞等待结果
+4. 审查 Worker 返回的结果，对照用户原始需求逐项判断：
+   - 全部子目标达成且产出质量达标 → 输出最终汇总
+   - 部分失败 → dispatch_task 追加修复任务 → 回到步骤 3
+   - 产出不完整、遗漏关键点或偏离目标 → dispatch_task 追加补充任务 → 回到步骤 3
+   - 前序结果揭示了新的必要工作 → dispatch_task 追加新任务 → 回到步骤 3
+   - "成功执行"≠"目标达成"：status=completed 仅代表 Worker 没报错，必须检查实际产出是否满足验收标准
+   - audit.level = "intervention" 时必须追加修复任务，禁止直接交付
 
 **使用 wait_for_workers**：
 - 不传 task_ids → 等待当前批次中所有任务完成
@@ -180,21 +230,23 @@ ${toolsListSection}
     wait_status: "completed" | "timeout",
     timed_out: boolean,
     pending_task_ids: string[],
-    waited_ms: number
+    waited_ms: number,
+    audit?: { level, summary, issues } // 全量完成时提供
   }
+- 当返回 \`audit\` 且 \`audit.level = "intervention"\` 时，表示系统判定本轮结果不可直接交付，必须先追加修复任务
 - 当 wait_status = "timeout" 时，表示未全部完成，必须基于 pending_task_ids 决策“继续等待”或“调整任务”，禁止直接当作完成
 
 **示例**：
 \`\`\`
 // 阶段 1：并行分配两个独立任务
-dispatch_task({ category: "backend", requires_modification: true, task: "实现用户认证模块...", files: [...] })  → task_id_1
-dispatch_task({ category: "data_analysis", requires_modification: false, task: "统计并分析数据库现状...", files: [...] })   → task_id_2
+dispatch_task({ category: "backend", requires_modification: true, goal: "...", acceptance: ["..."], constraints: ["..."], context: ["..."], scope_hint: [...] })  → task_id_1
+dispatch_task({ category: "data_analysis", requires_modification: false, goal: "...", acceptance: ["..."], constraints: ["..."], context: ["..."], scope_hint: [...] })   → task_id_2
 
 // 等待阶段 1 完成
 wait_for_workers()  → 获取两个任务的结果
 
 // 分析结果后追加阶段 2
-dispatch_task({ category: "integration", requires_modification: true, task: "集成认证模块和数据库...", files: [...], depends_on: [] })
+dispatch_task({ category: "integration", requires_modification: true, goal: "...", acceptance: ["..."], constraints: ["..."], context: ["..."], scope_hint: [...], depends_on: [] })
 
 // 等待阶段 2
 wait_for_workers()  → 最终结果，向用户汇总
@@ -252,7 +304,7 @@ export function buildDispatchSummaryPrompt(
     })
     .join('\n\n');
 
-  return `请根据以下 Worker 执行结果，为用户生成简洁的任务完成总结。
+  return `请根据以下 Worker 执行结果，完成审计和交付摘要。
 
 ## 用户原始需求
 ${userPrompt}
@@ -260,11 +312,21 @@ ${userPrompt}
 ## Worker 执行结果
 ${resultsText}
 
-## 要求
+## 审计要求
+
+对每个 Worker 的执行结果，按以下三个维度评估：
+
+| 审计维度 | 正常 | 需关注 | 需干预 |
+|----------|------|--------|--------|
+| 改动范围 | 集中在任务相关模块 | 涉及相邻模块但有合理原因 | 大面积改动与任务目标无关的代码 |
+| 改动性质 | 目标导向的增改 | 附带的小幅重构 | 未经授权的架构变更 |
+| 跨任务影响 | 不影响其他任务的工作区域 | 修改了共享代码但不破坏契约 | 破坏了其他任务依赖的接口 |
+
+## 输出格式
 1. 用 1-3 句话概括完成情况
 2. 列出关键修改内容和涉及的文件
-3. 如有失败的 Worker，说明原因和建议
-4. 不要输出代码块或 diff
-5. 保持简洁，控制在 10 行以内
+3. 如有审计"需关注"项，在摘要中标注供用户知晓
+4. 如有失败的 Worker，说明原因和建议
+5. 不要输出代码块或 diff
 6. 用中文回复，Markdown 格式`;
 }

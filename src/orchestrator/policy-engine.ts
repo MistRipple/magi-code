@@ -416,22 +416,6 @@ export class PolicyEngine extends EventEmitter {
   }
 
 
-  // ========== Hard Stop 决策 ==========
-
-  /**
-   * 决定是否需要 Hard Stop（用户确认）
-   */
-  shouldHardStop(riskAssessment: RiskAssessment, mode: 'ask' | 'auto'): boolean {
-    // Auto 模式跳过 Hard Stop
-    if (mode === 'auto') return false;
-
-    // Ask 模式不执行任务，无需 Hard Stop
-    if (mode === 'ask') return false;
-
-    // 默认不需要 Hard Stop
-    return false;
-  }
-
   // ========== 替代策略 ==========
 
   /**

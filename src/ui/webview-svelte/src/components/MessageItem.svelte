@@ -195,6 +195,12 @@
             {/each}
           {:else if message.content}
             <MarkdownContent content={message.content} {isStreaming} />
+          {:else if isStreaming}
+            <div class="streaming-indicator-bottom fallback">
+              <span class="streaming-dot"></span>
+              <span class="streaming-dot"></span>
+              <span class="streaming-dot"></span>
+            </div>
           {/if}
 
       {/if}
@@ -263,6 +269,12 @@
             {/each}
           {:else if message.content}
             <MarkdownContent content={message.content} {isStreaming} />
+          {:else if isStreaming}
+            <div class="streaming-indicator-bottom fallback">
+              <span class="streaming-dot"></span>
+              <span class="streaming-dot"></span>
+              <span class="streaming-dot"></span>
+            </div>
           {/if}
       {/if}
     </div>
@@ -399,7 +411,7 @@
 
   /* 流式消息卡片：高度完全由内容与动画驱动，避免占位感 */
   .message-item.assistant.streaming {
-    min-height: 48px; /* 保持与 placeholder 高度一致，防止切换时塌陷 */
+    min-height: 0;
   }
 
   .interaction-inline {
@@ -467,6 +479,10 @@
     min-height: 0;
     height: auto;
   }
+  /* 消除流式渲染时首个 block（thinking/tool_call）的顶部 margin 产生的空白 */
+  .message-content > :global(:first-child) {
+    margin-top: 0;
+  }
   /* 移除流式消息的渐变遮罩，避免干扰视觉 */
 
   /* 占位→真实消息过渡动画 */
@@ -504,6 +520,11 @@
     gap: 4px;
     padding: var(--space-2) 0;
     margin-top: var(--space-2);
+  }
+
+  .streaming-indicator-bottom.fallback {
+    margin-top: 0;
+    padding: var(--space-1) 0;
   }
 
   .streaming-dot {
@@ -546,10 +567,9 @@
   }
 
   .placeholder-content {
-    min-height: 48px;
     display: flex;
     align-items: center;
-    padding: var(--space-3) 0;
+    padding: var(--space-1) 0;
   }
 
   /* 占位消息的加载指示器：居左显示，无上边距 */
