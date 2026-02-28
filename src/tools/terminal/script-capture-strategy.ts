@@ -46,11 +46,11 @@ function getOutputStartMarkerSetup(shellName: ShellType): string {
 function getOutputEndMarkerSetup(shellName: ShellType): string {
   switch (shellName.toLowerCase()) {
     case 'zsh':
-      return `{ __magi_output_end_marker() { printf $'\\x1b]8889;magi-output-end\\x07'; }; precmd_functions+=(__magi_output_end_marker); }`;
+      return `{ __magi_output_end_marker() { local __magi_exit=$?; printf $'\\x1b]8890;magi-exit-code:'"$__magi_exit"$'\\x07'; printf $'\\x1b]8889;magi-output-end\\x07'; }; precmd_functions+=(__magi_output_end_marker); }`;
     case 'bash':
-      return `{ __magi_output_end_marker() { printf $'\\x1b]8889;magi-output-end\\x07'; }; if [ -n "$PROMPT_COMMAND" ]; then export PROMPT_COMMAND="$PROMPT_COMMAND"$'\\n'"__magi_output_end_marker"; else export PROMPT_COMMAND="__magi_output_end_marker"; fi; }`;
+      return `{ __magi_output_end_marker() { local __magi_exit=$?; printf $'\\x1b]8890;magi-exit-code:'"$__magi_exit"$'\\x07'; printf $'\\x1b]8889;magi-output-end\\x07'; }; if [ -n "$PROMPT_COMMAND" ]; then export PROMPT_COMMAND="$PROMPT_COMMAND"$'\\n'"__magi_output_end_marker"; else export PROMPT_COMMAND="__magi_output_end_marker"; fi; }`;
     case 'fish':
-      return `{ function __magi_postexec --on-event fish_postexec; printf '\\x1b]8889;magi-output-end\\x07'; end; }`;
+      return `{ function __magi_postexec --on-event fish_postexec; set -l __magi_exit $status; printf '\\x1b]8890;magi-exit-code:%s\\x07' $__magi_exit; printf '\\x1b]8889;magi-output-end\\x07'; end; }`;
     default:
       return '';
   }
@@ -69,6 +69,7 @@ function stripAnsiCodes(text: string): string {
  */
 export class ScriptCaptureStrategy implements CompletionStrategy {
   private static readonly LOG_PREFIX = 'ScriptCaptureStrategy';
+  private static readonly EXIT_CODE_MARKER_REGEX = /\x1B\]8890;magi-exit-code:(\d+)\x07/g;
 
   private terminalSessions: Map<vscode.Terminal, TerminalSessionData> = new Map();
 
@@ -269,11 +270,11 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
       }
 
       const content = fs.readFileSync(session.scriptFile, 'utf8');
-      const output = this.extractOutputFromScriptLog(content, actualCommand, session.shellName);
+      const extracted = this.extractOutputFromScriptLog(content, actualCommand, session.shellName);
 
       return {
-        output: stripAnsiCodes(output).trim(),
-        returnCode: isCompleted ? 0 : null,
+        output: stripAnsiCodes(extracted.output).trim(),
+        returnCode: isCompleted ? extracted.returnCode : null,
       };
     } catch (error) {
       logger.debug(
@@ -865,19 +866,43 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
     }
   }
 
-  private extractOutputFromScriptLog(content: string, command: string, shellName: ShellType): string {
+  private extractOutputFromScriptLog(
+    content: string,
+    command: string,
+    shellName: ShellType
+  ): { output: string; returnCode: number | null } {
     // 查找输出开始和结束标记之间的内容
     const startMarkerIndex = content.lastIndexOf(OUTPUT_START_MARKER);
     const endMarkerIndex = content.lastIndexOf(OUTPUT_END_MARKER);
 
     if (startMarkerIndex !== -1 && endMarkerIndex !== -1 && endMarkerIndex > startMarkerIndex) {
-      return content.substring(startMarkerIndex + OUTPUT_START_MARKER.length, endMarkerIndex);
+      const segment = content.substring(startMarkerIndex + OUTPUT_START_MARKER.length, endMarkerIndex);
+      return this.extractExitCodeAndCleanOutput(segment);
     }
 
     // 备用：返回文件尾部内容
     const lines = content.split('\n');
     const lastLines = lines.slice(-50);
-    return lastLines.join('\n');
+    const fallbackOutput = lastLines.join('\n');
+    const fallbackCode = this.extractExitCodeAndCleanOutput(fallbackOutput);
+    return fallbackCode;
+  }
+
+  private extractExitCodeAndCleanOutput(segment: string): { output: string; returnCode: number | null } {
+    let returnCode: number | null = null;
+    let cleaned = segment;
+
+    ScriptCaptureStrategy.EXIT_CODE_MARKER_REGEX.lastIndex = 0;
+    let match: RegExpExecArray | null = null;
+    while ((match = ScriptCaptureStrategy.EXIT_CODE_MARKER_REGEX.exec(segment)) !== null) {
+      const code = Number.parseInt(match[1], 10);
+      if (Number.isFinite(code)) {
+        returnCode = code;
+      }
+    }
+
+    cleaned = cleaned.replace(ScriptCaptureStrategy.EXIT_CODE_MARKER_REGEX, '');
+    return { output: cleaned, returnCode };
   }
 
   private delay(ms: number): Promise<void> {

@@ -663,6 +663,18 @@ function createRecoveryStreamingCard(update: StreamUpdate): ResolvedTarget {
 }
 
 function shouldIgnoreSealedUpdate(existing: Message, update: StreamUpdate): boolean {
+  // 1. 如果消息本身已经被标记为完成（例如收到过 task_completed 或 unifiedComplete）
+  //    并且不是处于流式转为完成的临时动画期，我们应该拒绝所有会改变流式状态的更新
+  //    这能防止 Worker 消息在完成后被迟到的 delta 重新开启 streaming
+  if (existing.isComplete && update.updateType === 'lifecycle_change' && update.lifecycle !== 'completed') {
+    console.warn('[MessageHandler] 已完成卡片收到非 completed 的 lifecycle_change，忽略', {
+      messageId: existing.id,
+      lifecycle: update.lifecycle,
+    });
+    return true;
+  }
+
+  // 2. 现有的 finalStreamSeq 检查机制
   const finalStreamSeq = typeof existing.metadata?.finalStreamSeq === 'number'
     ? existing.metadata.finalStreamSeq
     : undefined;
@@ -1242,6 +1254,21 @@ function handleStandardComplete(message: WebviewMessage) {
 
   // 补齐可能提前到达的流式更新
   flushPendingStreamUpdates(actualMessageId);
+
+  // 强制再次锁定完成状态！
+  // 因为 flushPendingStreamUpdates 会重放之前的 stream event，
+  // 某些残留的 stream 事件可能会包含 lifecycle: 'streaming'，从而将 isStreaming 重新置为 true。
+  // 我们必须在 flush 之后再次确保消息是被封口的。
+  const lockCompleteState = (msgId: string) => {
+    const override = { isStreaming: false, isComplete: true };
+    if (location.location === 'thread' || location.location === 'both') {
+      updateThreadMessage(msgId, override);
+    }
+    if (location.location === 'worker' || location.location === 'both') {
+      updateAgentMessage(location.worker, msgId, override);
+    }
+  };
+  lockCompleteState(actualMessageId);
 
   // 清理请求绑定
   if (requestId) {
@@ -2230,13 +2257,24 @@ function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[] {
         };
       }
       case 'tool_call': {
+        const toolStatus = mapToolStatus(
+          block.status,
+          block.standardized?.status,
+          block.output,
+          block.error
+        );
+        const standardizedError = block.standardized
+          && block.standardized.status !== 'success'
+          ? (block.standardized.message || undefined)
+          : undefined;
         const toolCall: ToolCall = {
           id: block.toolId,
           name: block.toolName,
           arguments: safeParseJson(block.input) || {},
-          status: mapToolStatus(block.status),
+          status: toolStatus,
           result: block.output,
-          error: block.error,
+          error: block.error || standardizedError,
+          standardized: block.standardized,
         };
         return {
           type: 'tool_call',
@@ -2401,7 +2439,12 @@ function blocksToContent(blocks: ContentBlock[]): string {
   return textParts.join('\n\n');
 }
 
-function mapToolStatus(status: string | undefined): ToolCall['status'] {
+function mapToolStatus(
+  status: string | undefined,
+  standardizedStatus?: string,
+  output?: string,
+  error?: string,
+): ToolCall['status'] {
   switch (status) {
     case 'pending':
       return 'pending';
@@ -2411,9 +2454,27 @@ function mapToolStatus(status: string | undefined): ToolCall['status'] {
       return 'success';
     case 'failed':
       return 'error';
-    default:
-      return 'success';
   }
+
+  if (standardizedStatus) {
+    switch (standardizedStatus) {
+      case 'success':
+        return 'success';
+      case 'error':
+      case 'timeout':
+      case 'killed':
+      case 'blocked':
+      case 'rejected':
+      case 'aborted':
+        return 'error';
+      default:
+        break;
+    }
+  }
+
+  if (error) return 'error';
+  if (output) return 'success';
+  return 'running';
 }
 
 function safeParseJson(value?: string): Record<string, unknown> | null {

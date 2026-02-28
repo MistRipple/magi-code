@@ -47,12 +47,36 @@ export interface FileChangeMetadata {
 }
 
 /**
+ * 工具结果标准化结构（统一三类工具：builtin/mcp/skill）
+ *
+ * 说明：
+ * - `content` 保持给模型的自然语言结果，不改动现有语义；
+ * - `standardized` 提供统一的机器可读结构，供编排/统计/诊断使用。
+ */
+export interface StandardizedToolResult {
+  schemaVersion: 'tool-result.v1';
+  source: 'builtin' | 'mcp' | 'skill';
+  toolName: string;
+  toolCallId: string;
+  status: 'success' | 'error' | 'timeout' | 'killed' | 'blocked' | 'rejected' | 'aborted';
+  message: string;
+  data?: unknown;
+  errorCode?: string;
+  sourceId?: string;
+}
+
+/**
  * 工具调用结果
  */
 export interface ToolResult {
   toolCallId: string;
   content: string;
   isError?: boolean;
+  /**
+   * 统一标准化结果（机器可读）
+   * - 所有工具调用返回均由 ToolManager 在统一出口注入
+   */
+  standardized?: StandardizedToolResult;
   /** 文件变更工具专用：携带 diff 数据供前端差异化面板展示 */
   fileChange?: FileChangeMetadata;
 }
@@ -69,6 +93,22 @@ export type ContentBlock =
   | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
   | { type: 'tool_use'; id: string; name: string; input: Record<string, any> }
   | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean };
+
+/**
+ * 内部专用的内容块，在与 UI/统计链路通信时可附带额外元数据。
+ * 在发给大模型 API 前会被防腐层过滤剥离。
+ */
+export type InternalContentBlock =
+  | Exclude<ContentBlock, { type: 'tool_result' }>
+  | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean; standardized?: StandardizedToolResult };
+
+/**
+ * 内部专用的 LLM 消息格式
+ */
+export interface InternalLLMMessage {
+  role: 'user' | 'assistant' | 'system';
+  content: string | InternalContentBlock[];
+}
 
 /**
  * LLM 消息

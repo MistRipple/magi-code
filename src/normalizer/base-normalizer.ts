@@ -21,6 +21,7 @@ import {
   TextBlock,
   ThinkingBlock,
   ToolCallBlock,
+  StandardizedToolResultPayload,
   createStandardMessage,
   createStreamingMessage,
   generateMessageId,
@@ -363,7 +364,14 @@ export abstract class BaseNormalizer extends EventEmitter {
    * 用于外部模块在工具执行完成后更新状态
    * 当 fileChange 存在且无错误时，自动生成 file_change block 供前端差异化面板
    */
-  public finishToolCall(messageId: string, toolId: string, output?: string, error?: string, fileChange?: FileChangeMetadata): void {
+  public finishToolCall(
+    messageId: string,
+    toolId: string,
+    output?: string,
+    error?: string,
+    fileChange?: FileChangeMetadata,
+    standardized?: StandardizedToolResultPayload,
+  ): void {
     const context = this.activeContexts.get(messageId);
     if (!context) {
       this.debug(`[${this.agent}] finishToolCall: 未找到消息上下文: ${messageId}`);
@@ -375,7 +383,8 @@ export abstract class BaseNormalizer extends EventEmitter {
     const toolName = originalTool?.toolName || '';
     const input = originalTool?.input;
 
-    this.completeToolCall(context, toolId, output, error);
+    const normalizedOutcome = this.normalizeToolCompletionOutcome(output, error, standardized);
+    this.completeToolCall(context, toolId, normalizedOutcome.output, normalizedOutcome.error, standardized);
 
     // 发送 UPDATE 事件，通知前端工具执行完成状态（保留原始 toolName 和 input，避免 mergeBlocks 覆盖）
     const update = this.createUpdate(messageId, 'block_update', {
@@ -383,10 +392,11 @@ export abstract class BaseNormalizer extends EventEmitter {
         type: 'tool_call',
         toolName,
         toolId,
-        status: error ? 'failed' : 'completed',
+        status: normalizedOutcome.status,
         input,
-        output,
-        error,
+        output: normalizedOutcome.output,
+        error: normalizedOutcome.error,
+        standardized,
       }],
     });
     this.emit(MESSAGE_EVENTS.UPDATE, update);
@@ -430,15 +440,43 @@ export abstract class BaseNormalizer extends EventEmitter {
     this.emit(MESSAGE_EVENTS.UPDATE, update);
   }
 
-  protected completeToolCall(context: ParseContext, toolId: string, output?: string, error?: string): void {
+  protected completeToolCall(
+    context: ParseContext,
+    toolId: string,
+    output?: string,
+    error?: string,
+    standardized?: StandardizedToolResultPayload,
+  ): void {
     const toolCall = context.activeToolCalls.get(toolId);
     if (toolCall) {
-      toolCall.status = error ? 'failed' : 'completed';
-      toolCall.output = output;
-      toolCall.error = error;
+      const normalizedOutcome = this.normalizeToolCompletionOutcome(output, error, standardized);
+      toolCall.status = normalizedOutcome.status;
+      toolCall.output = normalizedOutcome.output;
+      toolCall.error = normalizedOutcome.error;
+      toolCall.standardized = standardized;
       context.blocks.push(toolCall);
       context.activeToolCalls.delete(toolId);
     }
+  }
+
+  private normalizeToolCompletionOutcome(
+    output?: string,
+    error?: string,
+    standardized?: StandardizedToolResultPayload,
+  ): { status: 'completed' | 'failed'; output?: string; error?: string } {
+    if (standardized && standardized.status !== 'success') {
+      return {
+        status: 'failed',
+        output: undefined,
+        error: standardized.message || error || output || 'Tool execution failed',
+      };
+    }
+
+    if (error) {
+      return { status: 'failed', output: undefined, error };
+    }
+
+    return { status: 'completed', output, error: undefined };
   }
 
   protected debug(message: string, ...args: unknown[]): void {

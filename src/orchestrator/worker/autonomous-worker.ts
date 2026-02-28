@@ -360,6 +360,8 @@ export class AutonomousWorker extends EventEmitter {
 
     // ========== 统一 Todo 循环模式 ==========
     // 执行每个 Todo
+    const MAX_REVIEW_ROUNDS = 2;
+    let reviewRound = 0;
     let currentTodo = this.getNextExecutableTodo(assignment);
 
     while (currentTodo && !aborted) {
@@ -544,6 +546,28 @@ export class AutonomousWorker extends EventEmitter {
 
       // 获取下一个可执行的 Todo
       currentTodo = this.getNextExecutableTodo(assignment);
+
+      // 验收检查：当所有 todo 执行完毕，对照验收标准检查已完成工作
+      if (!currentTodo && !aborted && reviewRound < MAX_REVIEW_ROUNDS
+          && completedTodos.length > 0 && failedTodos.length === 0
+          && options.adapterFactory) {
+        try {
+          const fixTodos = await this.verifyAcceptanceCriteria(
+            assignment, completedTodos, options, reviewRound
+          );
+          if (fixTodos.length > 0) {
+            reviewRound++;
+            currentTodo = this.getNextExecutableTodo(assignment);
+          }
+        } catch (verifyError: any) {
+          // 验收检查是非关键操作，不应因 LLM 调用失败推翻已完成的工作
+          logger.warn('Worker.验收检查.异常，视为通过', {
+            assignmentId: assignment.id,
+            round: reviewRound + 1,
+            error: verifyError?.message || String(verifyError),
+          }, LogCategory.ORCHESTRATOR);
+        }
+      }
     }
 
     // 同步拆分父 Todo 的最终状态（由 TodoManager.tryCompleteParent 自动完成）
@@ -708,6 +732,134 @@ export class AutonomousWorker extends EventEmitter {
     }
 
     return sections.length > 0 ? sections.join('\n') : (result.success ? '任务完成' : '任务失败');
+  }
+
+  /**
+   * 验收检查：对照任务合同的验收标准，检查已完成工作是否满足要求
+   * 如有缺口，创建补充 fix todo 并返回
+   */
+  private async verifyAcceptanceCriteria(
+    assignment: Assignment,
+    completedTodos: UnifiedTodo[],
+    options: TodoExecuteOptions,
+    round: number,
+  ): Promise<UnifiedTodo[]> {
+    // 1. 从 delegationBriefing 提取验收标准
+    const briefing = assignment.delegationBriefing;
+    if (!briefing) return [];
+
+    const sectionMatch = briefing.match(/## 验收标准\n([\s\S]*?)(?=\n## |$)/);
+    if (!sectionMatch) return [];
+
+    const acceptance = sectionMatch[1]
+      .split('\n')
+      .map(line => line.replace(/^-\s*/, '').trim())
+      .filter(line => line.length > 0);
+    if (acceptance.length === 0) return [];
+
+    // 2. 构建验收 prompt
+    const completedWork = completedTodos
+      .filter(t => !assignment.todos.some(c => c.parentId === t.id))
+      .map(t => `- ${t.content}: ${t.output?.summary || '完成'}`)
+      .join('\n');
+
+    const criteriaList = acceptance
+      .map((c, i) => `${i + 1}. ${c}`)
+      .join('\n');
+
+    const prompt = `## 验收检查（第 ${round + 1} 轮）
+
+你刚完成了所有计划中的任务步骤。现在请对照验收标准，逐条检查已完成的工作是否真正满足要求。
+
+### 验收标准
+${criteriaList}
+
+### 已完成工作
+${completedWork}
+
+### 指令
+请逐条检查验收标准。注意："步骤已执行" ≠ "标准已满足"，请检查实际产出质量。
+如有必要，可使用 file_view 等工具查看实际文件内容来验证。
+
+检查完成后，请以如下 JSON 格式回复：
+\`\`\`json
+{
+  "allSatisfied": true,
+  "gaps": []
+}
+\`\`\`
+如有未满足的标准：
+\`\`\`json
+{
+  "allSatisfied": false,
+  "gaps": [
+    {
+      "criterion": "未满足的验收标准原文",
+      "reason": "为什么未满足",
+      "fix": "需要做什么来满足此标准"
+    }
+  ]
+}
+\`\`\``;
+
+    // 3. 使用 Worker LLM session 执行验收检查（复用已有上下文）
+    const response = await options.adapterFactory!.sendMessage(
+      this.workerType,
+      prompt,
+      undefined,
+      {
+        source: 'worker',
+        adapterRole: 'worker',
+        ...options.adapterScope,
+      }
+    );
+
+    // 4. 解析验收结果
+    const content = response.content || '';
+    let gaps: Array<{ criterion: string; reason: string; fix: string }> = [];
+    try {
+      const jsonMatch = content.match(/```json\s*([\s\S]*?)```/) || content.match(/(\{[\s\S]*\})/);
+      if (jsonMatch) {
+        const result = JSON.parse(jsonMatch[1]);
+        if (!result.allSatisfied && Array.isArray(result.gaps)) {
+          gaps = result.gaps.filter((g: { criterion?: string; fix?: string }) => g.criterion && g.fix);
+        }
+      }
+    } catch {
+      // JSON 解析失败，视为验收通过
+    }
+
+    if (gaps.length === 0) {
+      logger.info('Worker.验收检查.通过', {
+        assignmentId: assignment.id,
+        round: round + 1,
+      }, LogCategory.ORCHESTRATOR);
+      return [];
+    }
+
+    // 5. 为每个缺口创建 fix todo
+    const fixTodos: UnifiedTodo[] = [];
+    for (const gap of gaps) {
+      const todo = await this.todoManager.create({
+        missionId: assignment.missionId,
+        assignmentId: assignment.id,
+        content: gap.fix,
+        type: 'fix',
+        reasoning: `验收检查第 ${round + 1} 轮: ${gap.criterion} — ${gap.reason}`,
+        workerId: assignment.workerId,
+      });
+      assignment.todos.push(todo);
+      fixTodos.push(todo);
+    }
+
+    logger.info('Worker.验收检查.发现缺口', {
+      assignmentId: assignment.id,
+      round: round + 1,
+      gapCount: gaps.length,
+      gaps: gaps.map(g => g.criterion),
+    }, LogCategory.ORCHESTRATOR);
+
+    return fixTodos;
   }
 
   /**

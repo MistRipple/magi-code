@@ -5,9 +5,9 @@
 
 import * as path from 'path';
 import { Assignment } from '../mission';
-import { LspExecutor } from '../../tools/lsp-executor';
 import { ToolCall } from '../../llm/types';
 import { logger, LogCategory } from '../../logging';
+import type { ToolManager } from '../../tools/tool-manager';
 
 interface LspPreflightSummary {
   enforced: boolean;
@@ -54,14 +54,14 @@ const MAX_DIAGNOSTICS = 8;
 const MAX_SYMBOLS = 12;
 
 export class LspEnforcer {
-  private lspExecutor: LspExecutor;
   private workspaceRoot: string;
+  private toolManager: ToolManager;
   /** applyIfNeeded 中 runPreflight 产生的 diagnostics 缓存，供 captureDiagnostics 直接复用 */
   private cachedPreflightDiagnostics: string[] | null = null;
 
-  constructor(workspaceRoot: string) {
+  constructor(workspaceRoot: string, toolManager: ToolManager) {
     this.workspaceRoot = workspaceRoot;
-    this.lspExecutor = new LspExecutor(workspaceRoot);
+    this.toolManager = toolManager;
   }
 
   async applyIfNeeded(assignment: Assignment): Promise<boolean> {
@@ -255,7 +255,11 @@ export class LspEnforcer {
       }
     };
 
-    const result = await this.lspExecutor.execute(toolCall);
+    const result = await this.toolManager.execute(
+      toolCall,
+      undefined,
+      { workerId: 'orchestrator', role: 'orchestrator' }
+    );
     if (result.isError) {
       return { ok: false, error: String(result.content || 'LSP error') };
     }

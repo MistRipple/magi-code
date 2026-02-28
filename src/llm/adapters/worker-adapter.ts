@@ -365,8 +365,6 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
                 this.applyDecisionHook({ type: 'thinking' });
               }
               accumulatedText += chunk.content;
-              this.normalizer.processTextDelta(streamId, chunk.content);
-              this.emit('message', chunk.content);
             } else if (chunk.type === 'thinking' && chunk.thinking) {
               this.normalizer.processThinking(streamId, chunk.thinking);
               this.emit('thinking', chunk.thinking);
@@ -390,6 +388,10 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
           // 无工具调用 → 收敛
           if (toolCalls.length === 0) {
+            if (assistantText) {
+              this.normalizer.processTextDelta(streamId, assistantText);
+              this.emit('message', assistantText);
+            }
             this.conversationHistory.push({ role: 'assistant', content: assistantText });
             finalText = assistantText;
             this.normalizer.endStream(streamId);
@@ -414,9 +416,6 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           }
 
           const assistantContent: any[] = [];
-          if (assistantText) {
-            assistantContent.push({ type: 'text', text: assistantText });
-          }
           for (const toolCall of toolCalls) {
             assistantContent.push({
               type: 'tool_use',
@@ -450,6 +449,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
                 result.isError ? undefined : result.content,
                 result.isError ? result.content : undefined,
                 result.fileChange,
+                result.standardized,
               );
               continue;
             }
@@ -464,6 +464,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
               input: JSON.stringify(toolCall.arguments, null, 2),
               output: result.isError ? undefined : result.content,
               error: result.isError ? result.content : undefined,
+              standardized: result.standardized,
             });
 
             if (!result.isError && result.fileChange) {
@@ -486,6 +487,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
               tool_use_id: result.toolCallId,
               content: result.content,
               is_error: result.isError,
+              standardized: result.standardized,
             })),
           });
 

@@ -28,7 +28,7 @@ import {
   ExtendedToolDefinition,
   ToolMetadata,
 } from './types';
-import { ToolCall, ToolResult, ToolDefinition } from '../llm/types';
+import { ToolCall, ToolResult, ToolDefinition, StandardizedToolResult } from '../llm/types';
 import { VSCodeTerminalExecutor } from './vscode-terminal-executor';
 import { FileExecutor } from './file-executor';
 import { SearchExecutor } from './search-executor';
@@ -474,6 +474,10 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       const normalizedToolCall = normalizedName === toolCall.name
         ? toolCall
         : { ...toolCall, name: normalizedName };
+      let resolvedSource: StandardizedToolResult['source'] = 'builtin';
+      let resolvedSourceId: string | undefined;
+      const finalize = (raw: ToolResult): ToolResult =>
+        this.standardizeToolResult(normalizedToolCall, raw, resolvedSource, resolvedSourceId);
 
       if (normalizedToolCall !== toolCall) {
         logger.debug('Tool name normalized', {
@@ -491,11 +495,11 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       try {
         // 中断检查：执行前检测 abort 信号
         if (signal?.aborted) {
-          return {
+          return finalize({
             toolCallId: toolCall.id,
             content: '任务已中断',
             isError: true,
-          };
+          });
         }
 
         // 检查授权（包括权限和用户授权）
@@ -505,62 +509,65 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
             toolName: normalizedToolCall.name,
             reason: authCheck.reason,
           }, LogCategory.TOOLS);
-          return {
+          return finalize({
             toolCallId: toolCall.id,
             content: `Tool blocked: ${authCheck.reason}`,
             isError: true,
-          };
+          });
         }
 
         // 检查是否是内置工具
         if (this.builtinToolNames.includes(normalizedToolCall.name)) {
-          return await this.executeBuiltinTool(normalizedToolCall, signal);
+          resolvedSource = 'builtin';
+          return finalize(await this.executeBuiltinTool(normalizedToolCall, signal));
         }
 
         // 查找 MCP 工具
         const toolDef = await this.findTool(normalizedToolCall.name);
         if (!toolDef) {
           const available = this.builtinToolNames.join(', ');
-          return {
+          return finalize({
             toolCallId: toolCall.id,
             content: `工具 '${toolCall.name}' 不存在。只能使用以下工具: ${available}。请直接使用已有工具完成任务。`,
             isError: true,
-          };
+          });
         }
+        resolvedSource = toolDef.metadata.source;
+        resolvedSourceId = toolDef.metadata.sourceId;
 
         // 执行 MCP 工具
         if (toolDef.metadata.source === 'mcp') {
-          return await this.executeMCPTool(normalizedToolCall, toolDef, signal);
+          return finalize(await this.executeMCPTool(normalizedToolCall, toolDef, signal));
         }
 
         // 执行 Skill 工具
         if (toolDef.metadata.source === 'skill') {
           if (!this.skillExecutor) {
-            return {
+            return finalize({
               toolCallId: toolCall.id,
               content: 'Skill executor not registered',
               isError: true,
-            };
+            });
           }
-          return await this.skillExecutor.execute(normalizedToolCall, signal);
+          return finalize(await this.skillExecutor.execute(normalizedToolCall, signal));
         }
 
-        return {
+        return finalize({
           toolCallId: toolCall.id,
           content: `Unknown tool source: ${toolDef.metadata.source}`,
           isError: true,
-        };
+        });
       } catch (error: any) {
         logger.error('Tool execution failed', {
           toolName: normalizedToolCall.name,
           error: error.message,
         }, LogCategory.TOOLS);
 
-        return {
+        return finalize({
           toolCallId: toolCall.id,
           content: `Tool execution failed: ${error.message}`,
           isError: true,
-        };
+        });
       }
     };
 
@@ -568,6 +575,152 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       return this.executionContextStorage.run(executionContext, run);
     }
     return run();
+  }
+
+  /**
+   * 统一标准化工具结果（builtin/mcp/skill 单一出口）
+   */
+  private standardizeToolResult(
+    toolCall: ToolCall,
+    raw: ToolResult,
+    source: StandardizedToolResult['source'],
+    sourceId?: string,
+  ): ToolResult {
+    const message = typeof raw.content === 'string' ? raw.content : String(raw.content ?? '');
+    const parsedData = this.tryParseToolResultData(message);
+    const status = this.inferToolResultStatus(raw, message, parsedData);
+    const isError = status !== 'success';
+    const standardized: StandardizedToolResult = {
+      schemaVersion: 'tool-result.v1',
+      source,
+      sourceId,
+      toolName: toolCall.name,
+      toolCallId: raw.toolCallId || toolCall.id,
+      status,
+      message,
+      data: parsedData,
+      errorCode: status === 'success' ? undefined : this.inferToolErrorCode(status, message, parsedData),
+    };
+
+    return {
+      ...raw,
+      toolCallId: raw.toolCallId || toolCall.id,
+      content: message,
+      isError,
+      standardized,
+    };
+  }
+
+  private tryParseToolResultData(content: string): unknown | undefined {
+    const trimmed = content.trim();
+    if (!trimmed || (trimmed[0] !== '{' && trimmed[0] !== '[')) {
+      return undefined;
+    }
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private inferToolResultStatus(
+    raw: ToolResult,
+    content: string,
+    parsedData: unknown,
+  ): StandardizedToolResult['status'] {
+    const lower = content.toLowerCase();
+    const parsed = parsedData && typeof parsedData === 'object'
+      ? parsedData as Record<string, unknown>
+      : undefined;
+    const parsedStatus = typeof parsed?.status === 'string' ? parsed.status.toLowerCase() : '';
+
+    if (content.startsWith('Tool blocked:')) {
+      return 'blocked';
+    }
+    if (content.startsWith('Command rejected:')) {
+      return 'rejected';
+    }
+    if (parsedStatus === 'timeout' || lower.includes(' timed out') || lower.includes('timeout') || lower.includes('超时')) {
+      return 'timeout';
+    }
+    if (parsedStatus === 'killed' || lower.includes('"status":"killed"') || lower.includes('"killed":true')) {
+      return 'killed';
+    }
+    if (lower.includes('aborterror') || lower.includes('aborted') || lower.includes('任务已中断')) {
+      return 'aborted';
+    }
+
+    if (parsedStatus === 'error' || parsedStatus === 'failed' || parsedStatus === 'failure') {
+      return 'error';
+    }
+    if (parsedStatus === 'blocked') {
+      return 'blocked';
+    }
+    if (parsedStatus === 'rejected') {
+      return 'rejected';
+    }
+    if (typeof parsed?.success === 'boolean' && parsed.success === false) {
+      return 'error';
+    }
+    if (typeof parsed?.ok === 'boolean' && parsed.ok === false) {
+      return 'error';
+    }
+    if (typeof parsed?.error === 'string' && parsed.error.trim()) {
+      return 'error';
+    }
+    if (typeof parsed?.error_message === 'string' && parsed.error_message.trim()) {
+      return 'error';
+    }
+    if (lower.startsWith('error:') || lower.startsWith('[error]')) {
+      return 'error';
+    }
+    if (lower.startsWith('mcp tool execution failed:') || lower.startsWith('tool execution failed:')) {
+      return 'error';
+    }
+    if (raw.isError) {
+      return 'error';
+    }
+    if (parsedStatus === 'success' || parsedStatus === 'completed' || parsedStatus === 'ok') {
+      return 'success';
+    }
+    return 'success';
+  }
+
+  private inferToolErrorCode(
+    status: StandardizedToolResult['status'],
+    content: string,
+    parsedData: unknown,
+  ): string {
+    const parsed = parsedData && typeof parsedData === 'object'
+      ? parsedData as Record<string, unknown>
+      : undefined;
+    const parsedStatus = typeof parsed?.status === 'string' ? parsed.status.toLowerCase() : '';
+
+    if (parsedStatus) {
+      return `tool_${parsedStatus}`;
+    }
+    if (status === 'rejected') {
+      return 'tool_rejected';
+    }
+    if (status === 'blocked') {
+      return 'tool_blocked';
+    }
+    if (status === 'timeout') {
+      return 'tool_timeout';
+    }
+    if (status === 'killed') {
+      return 'tool_killed';
+    }
+    if (status === 'aborted') {
+      return 'tool_aborted';
+    }
+    if (content.startsWith('MCP tool execution failed:')) {
+      return 'mcp_execution_failed';
+    }
+    if (content.startsWith('Tool execution failed:')) {
+      return 'tool_execution_failed';
+    }
+    return 'tool_error';
   }
 
   /**
@@ -1029,6 +1182,16 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
     let command = rawCommand.trim();
     let cwd = typeof rawCwd === 'string' ? rawCwd.trim() : '';
 
+    // 允许 heredoc（<<EOF），但必须在命令字符串中闭合终止符，避免终端进入持续等待输入状态。
+    const heredocCheck = this.validateHeredocCommand(command);
+    if (!heredocCheck.valid) {
+      return {
+        command: null,
+        cwd: '',
+        error: heredocCheck.error || 'heredoc 语法校验失败',
+      };
+    }
+
     const inlineCdPattern = /^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^;&|]+?))\s*(?:&&|;)\s*(.+)$/s;
     const inlineCdMatch = command.match(inlineCdPattern);
     if (inlineCdMatch) {
@@ -1062,6 +1225,44 @@ IMPORTANT: If a more specific tool can perform the task, use that tool instead:
     }
 
     return { command, cwd };
+  }
+
+  private validateHeredocCommand(command: string): { valid: true } | { valid: false; error: string } {
+    // 匹配 heredoc 起始（支持 <<EOF / <<'EOF' / <<"EOF" / <<-EOF）
+    const heredocRegex = /<<(-)?\s*(?:(['"])([^'"\s]+)\2|([^\s<>&|;]+))/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = heredocRegex.exec(command)) !== null) {
+      const allowTabIndent = match[1] === '-';
+      const delimiter = (match[3] || match[4] || '').trim();
+      if (!delimiter) {
+        continue;
+      }
+
+      const startIndex = match.index + match[0].length;
+      const firstNewlineIndex = command.indexOf('\n', startIndex);
+      if (firstNewlineIndex < 0) {
+        return {
+          valid: false,
+          error: `heredoc 缺少结束标记（${delimiter}）。请确保命令包含独立一行的结束符`,
+        };
+      }
+
+      const payload = command.slice(firstNewlineIndex + 1);
+      const escapedDelimiter = delimiter.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const terminatorRegex = allowTabIndent
+        ? new RegExp(`^(?:\\t*)${escapedDelimiter}[ \\t]*$`, 'm')
+        : new RegExp(`^${escapedDelimiter}[ \\t]*$`, 'm');
+
+      if (!terminatorRegex.test(payload)) {
+        return {
+          valid: false,
+          error: `heredoc 未闭合（结束标记 ${delimiter} 未找到）。请补全结束符，或改用 file_create/file_edit/file_insert`,
+        };
+      }
+    }
+
+    return { valid: true };
   }
 
   private resolveLaunchProcessWorkspacePath(

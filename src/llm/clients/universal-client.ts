@@ -229,6 +229,59 @@ export class UniversalLLMClient extends BaseLLMClient {
   }
 
   /**
+   * 计算 text 尾部与 incoming 头部的最大重叠长度
+   * 用于 OpenAI 兼容流在 cumulative 模式下提取“新增后缀”
+   */
+  private computeSuffixPrefixOverlap(text: string, incoming: string): number {
+    const max = Math.min(text.length, incoming.length, 4096);
+    for (let len = max; len > 0; len--) {
+      if (text.slice(-len) === incoming.slice(0, len)) {
+        return len;
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * 统一流式文本增量归一化：
+   * - 默认按 delta 模式处理
+   * - 当检测到 provider 返回 cumulative 内容时，自动切换为“提取新增后缀”
+   */
+  private normalizeStreamDelta(
+    incoming: string,
+    emittedText: string,
+    mode: 'unknown' | 'delta' | 'cumulative'
+  ): { delta: string; mode: 'unknown' | 'delta' | 'cumulative' } {
+    if (!incoming) {
+      return { delta: '', mode };
+    }
+    if (!emittedText) {
+      return { delta: incoming, mode };
+    }
+
+    let resolvedMode = mode;
+    if (resolvedMode === 'unknown') {
+      resolvedMode = incoming.length > emittedText.length && incoming.startsWith(emittedText)
+        ? 'cumulative'
+        : 'delta';
+    }
+
+    if (resolvedMode !== 'cumulative') {
+      return { delta: incoming, mode: resolvedMode };
+    }
+
+    if (incoming.length <= emittedText.length && emittedText.endsWith(incoming)) {
+      return { delta: '', mode: resolvedMode };
+    }
+    if (incoming.startsWith(emittedText)) {
+      return { delta: incoming.slice(emittedText.length), mode: resolvedMode };
+    }
+
+    const overlap = this.computeSuffixPrefixOverlap(emittedText, incoming);
+    return { delta: incoming.slice(overlap), mode: resolvedMode };
+  }
+
+  /**
    * 检测是否为 400 状态码错误
    */
   private is400Error(error: any): boolean {
@@ -612,6 +665,57 @@ export class UniversalLLMClient extends BaseLLMClient {
     };
   }
 
+  /**
+   * 统一规整 tool_result 内容块，作为 OpenAI/Anthropic 转换前的单一入口。
+   */
+  private normalizeToolResultBlock(
+    block: any,
+    context: string,
+  ): { toolUseId: string; content: string; isError: boolean } | null {
+    const toolUseId = typeof block?.tool_use_id === 'string' ? block.tool_use_id.trim() : '';
+    if (!toolUseId) {
+      logger.warn('忽略缺少 tool_use_id 的 tool_result', {
+        provider: this.config.provider,
+        model: this.config.model,
+        context,
+      }, LogCategory.LLM);
+      return null;
+    }
+
+    const standardizedStatus = typeof block?.standardized?.status === 'string'
+      ? block.standardized.status
+      : '';
+    const standardizedMessage = typeof block?.standardized?.message === 'string'
+      ? block.standardized.message.trim()
+      : '';
+
+    const isError = block?.is_error === true || (standardizedStatus !== '' && standardizedStatus !== 'success');
+    const rawContent = block?.content;
+    const stringContent = typeof rawContent === 'string'
+      ? rawContent
+      : (rawContent == null ? '' : JSON.stringify(rawContent));
+    const content = stringContent.trim()
+      ? stringContent
+      : (isError ? (standardizedMessage || 'Tool execution failed') : '[empty result]');
+
+    return {
+      toolUseId,
+      content,
+      isError,
+    };
+  }
+
+  private toOpenAIToolMessageContent(normalized: { content: string; isError: boolean }): string {
+    const content = normalized.content || '[empty result]';
+    if (!normalized.isError) {
+      return content;
+    }
+    if (/^\s*(\[error\]|error[:\]])/i.test(content)) {
+      return content;
+    }
+    return `[Error] ${content}`;
+  }
+
   private async sendAnthropicMessage(params: LLMMessageParams): Promise<LLMResponse> {
     if (!this.anthropicClient) {
       throw new Error('Anthropic client not initialized');
@@ -753,17 +857,17 @@ export class UniversalLLMClient extends BaseLLMClient {
           if (lastTool) {
             lastTool.argumentsText += event.delta.partial_json || '';
           }
-          let safeArgs: Record<string, any> = {};
-          if (event.delta.partial_json) {
+          let partialParsedArgs: Record<string, any> | undefined = undefined;
+          if (lastTool?.argumentsText) {
             try {
-              safeArgs = JSON.parse(event.delta.partial_json);
+              partialParsedArgs = JSON.parse(lastTool.argumentsText);
             } catch {
-              safeArgs = {};
+              // 增量解析失败是正常的，传递 undefined 让上层自己判断
             }
           }
           onChunk({
             type: 'tool_call_delta',
-            toolCall: { arguments: safeArgs },
+            toolCall: { arguments: partialParsedArgs },
           });
         }
       } else if (event.type === 'content_block_stop') {
@@ -807,18 +911,18 @@ export class UniversalLLMClient extends BaseLLMClient {
     const toolCalls: ToolCall[] = [];
     for (const tool of toolCallBuffers.values()) {
       if (!tool.id) continue;
-      let parsedArgs: Record<string, any> = {};
-      if (tool.argumentsText) {
-        try {
-          parsedArgs = JSON.parse(tool.argumentsText);
-        } catch {
-          parsedArgs = {};
-        }
-      }
+
+      const parsedArgs = this.parseToolArguments(
+        tool.argumentsText || '',
+        `stream:${tool.name || tool.id}`
+      );
+
       toolCalls.push({
         id: tool.id,
         name: tool.name || '',
-        arguments: parsedArgs,
+        arguments: parsedArgs.value,
+        argumentParseError: parsedArgs.error,
+        rawArguments: parsedArgs.rawText,
       });
     }
 
@@ -846,9 +950,31 @@ export class UniversalLLMClient extends BaseLLMClient {
       if (msg.role === 'system') {
         systemPrompt = typeof msg.content === 'string' ? msg.content : '';
       } else {
+        const content = typeof msg.content === 'string'
+          ? msg.content
+          : msg.content
+            .map((block) => {
+              if (block.type !== 'tool_result') {
+                return block as any;
+              }
+              const normalized = this.normalizeToolResultBlock(
+                block as any,
+                `anthropic:${msg.role}`
+              );
+              if (!normalized) {
+                return null;
+              }
+              return {
+                type: 'tool_result',
+                tool_use_id: normalized.toolUseId,
+                content: normalized.content,
+                is_error: normalized.isError,
+              } as any;
+            })
+            .filter((block): block is any => block !== null) as any;
         messages.push({
           role: msg.role,
-          content: typeof msg.content === 'string' ? msg.content : msg.content as any,
+          content,
         });
       }
     }
@@ -1029,6 +1155,7 @@ export class UniversalLLMClient extends BaseLLMClient {
     }
 
     let fullContent = '';
+    let contentDeltaMode: 'unknown' | 'delta' | 'cumulative' = 'unknown';
     const toolCallBuffers = new Map<string, { id: string; name?: string; argumentsText: string }>();
     const toolCallFallbackPrefix = `magi_call_${Date.now().toString(36)}`;
     let toolCallFallbackSeq = 0;
@@ -1054,8 +1181,12 @@ export class UniversalLLMClient extends BaseLLMClient {
       }
 
       if (delta?.content) {
-        fullContent += delta.content;
-        onChunk({ type: 'content_delta', content: delta.content });
+        const normalized = this.normalizeStreamDelta(delta.content, fullContent, contentDeltaMode);
+        contentDeltaMode = normalized.mode;
+        if (normalized.delta) {
+          fullContent += normalized.delta;
+          onChunk({ type: 'content_delta', content: normalized.delta });
+        }
       }
 
       if (delta?.tool_calls) {
@@ -1187,15 +1318,17 @@ export class UniversalLLMClient extends BaseLLMClient {
             toolUseBlocks.push({ id: b.id, name: b.name, input: b.input });
             break;
           case 'tool_result': {
-            // 防御性字符串化：确保 content 始终为 string（兼容 MCP/Skill 等外部工具结果）
-            const rawContent = b.content;
-            const contentStr = typeof rawContent === 'string'
-              ? rawContent
-              : (rawContent != null ? JSON.stringify(rawContent) : '');
+            const normalized = this.normalizeToolResultBlock(
+              b,
+              `openai:${msg.role}`
+            );
+            if (!normalized) {
+              break;
+            }
             toolResultBlocks.push({
-              tool_use_id: b.tool_use_id,
-              content: contentStr,
-              is_error: !!b.is_error,
+              tool_use_id: normalized.toolUseId,
+              content: normalized.content,
+              is_error: normalized.isError,
             });
             break;
           }
@@ -1207,7 +1340,7 @@ export class UniversalLLMClient extends BaseLLMClient {
         const assistantText = textParts.join('\n');
         const assistantMsg: OpenAI.ChatCompletionAssistantMessageParam = {
           role: 'assistant',
-          content: assistantText,
+          content: assistantText || (toolUseBlocks.length > 0 ? null : ''),
         };
         if (toolUseBlocks.length > 0) {
           assistantMsg.tool_calls = toolUseBlocks.map(tc => ({
@@ -1225,10 +1358,10 @@ export class UniversalLLMClient extends BaseLLMClient {
 
       // tool_result → 独立的 role:'tool' 消息
       for (const result of toolResultBlocks) {
-        // OpenAI 格式无 is_error 字段，通过 content 传递错误状态
-        const content = result.is_error && result.content && !result.content.startsWith('Error')
-          ? `[Error] ${result.content}`
-          : (result.content || '[empty result]');
+        const content = this.toOpenAIToolMessageContent({
+          content: result.content,
+          isError: result.is_error,
+        });
         messages.push({
           role: 'tool',
           tool_call_id: result.tool_use_id,
@@ -1409,13 +1542,14 @@ export class UniversalLLMClient extends BaseLLMClient {
     }
 
     if (typeof raw !== 'string') {
-      logger.warn('OpenAI tool arguments 类型异常，已回退为空对象', {
+      logger.error('Tool arguments 类型异常', {
+        provider: this.config.provider,
         model: this.config.model,
         context,
         argType: typeof raw,
       }, LogCategory.LLM);
       return {
-        value: {},
+        value: null as any,
         error: `参数类型异常: ${typeof raw}`,
         rawText: String(raw),
       };
@@ -1431,13 +1565,14 @@ export class UniversalLLMClient extends BaseLLMClient {
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
         return { value: parsed as Record<string, any>, rawText: text };
       }
-      logger.warn('OpenAI tool arguments 解析结果非对象，已回退为空对象', {
+      logger.error('Tool arguments 解析结果非对象', {
+        provider: this.config.provider,
         model: this.config.model,
         context,
         parsedType: typeof parsed,
       }, LogCategory.LLM);
       return {
-        value: {},
+        value: null as any,
         error: `参数 JSON 解析后不是对象: ${typeof parsed}`,
         rawText: text,
       };
@@ -1448,24 +1583,29 @@ export class UniversalLLMClient extends BaseLLMClient {
         try {
           const recovered = JSON.parse(extracted);
           if (recovered && typeof recovered === 'object' && !Array.isArray(recovered)) {
-            logger.warn('OpenAI tool arguments 解析失败后已成功恢复 JSON', {
+            logger.info('Tool arguments 解析失败后已成功恢复 JSON', {
+              provider: this.config.provider,
               model: this.config.model,
               context,
             }, LogCategory.LLM);
             return { value: recovered as Record<string, any>, rawText: text };
           }
-        } catch {
-          // 继续走统一失败日志
+        } catch (recoveryError: any) {
+          logger.info('工具参数尝试恢复解析失败', {
+            error: recoveryError?.message,
+            extractedText: extracted
+          }, LogCategory.LLM);
         }
       }
-      logger.warn('OpenAI tool arguments JSON 解析失败，已回退为空对象', {
+      logger.error('Tool arguments JSON 解析彻底失败', {
+        provider: this.config.provider,
         model: this.config.model,
         context,
         error: error?.message || String(error),
         rawSnippet: text.substring(0, 300),
       }, LogCategory.LLM);
       return {
-        value: {},
+        value: null as any,
         error: `参数 JSON 解析失败: ${error?.message || String(error)}`,
         rawText: text,
       };

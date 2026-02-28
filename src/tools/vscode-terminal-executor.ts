@@ -669,7 +669,9 @@ export class VSCodeTerminalExecutor {
             process.exitCode = 0;
           }
 
-          process.state = 'completed';
+          process.state = process.exitCode !== null && process.exitCode !== 0
+            ? 'failed'
+            : 'completed';
           this.markProcessActivity(process);
           resolve();
           return;

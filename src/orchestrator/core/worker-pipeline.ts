@@ -127,7 +127,7 @@ export class WorkerPipeline {
     const lspPromise = enableLSP
       ? (async () => {
           if (!this.lspEnforcer) {
-            this.lspEnforcer = new LspEnforcer(workspaceRoot);
+            this.lspEnforcer = new LspEnforcer(workspaceRoot, toolManager);
           }
           try {
             await this.lspEnforcer.applyIfNeeded(assignment);

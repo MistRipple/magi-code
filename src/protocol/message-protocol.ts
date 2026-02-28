@@ -236,6 +236,34 @@ export interface ThinkingBlock {
 }
 
 /**
+ * 工具结果标准化状态
+ * 统一三类工具（builtin/mcp/skill）的机器可读状态语义
+ */
+export type StandardizedToolStatus =
+  | 'success'
+  | 'error'
+  | 'timeout'
+  | 'killed'
+  | 'blocked'
+  | 'rejected'
+  | 'aborted';
+
+/**
+ * 工具结果标准化数据（供前端/统计/诊断使用）
+ */
+export interface StandardizedToolResultPayload {
+  schemaVersion: 'tool-result.v1';
+  source: 'builtin' | 'mcp' | 'skill';
+  toolName: string;
+  toolCallId: string;
+  status: StandardizedToolStatus;
+  message: string;
+  data?: unknown;
+  errorCode?: string;
+  sourceId?: string;
+}
+
+/**
  * 工具调用块
  */
 export interface ToolCallBlock {
@@ -250,6 +278,8 @@ export interface ToolCallBlock {
   output?: string;
   /** 错误信息 */
   error?: string;
+  /** 统一工具结果元数据（可选） */
+  standardized?: StandardizedToolResultPayload;
   /** 是否可恢复（用于错误/切换判断） */
   recoverable?: boolean;
   /** 持续时间（毫秒） */

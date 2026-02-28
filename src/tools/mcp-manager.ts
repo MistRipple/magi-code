@@ -61,9 +61,18 @@ export class MCPManager {
   private static readonly DEFAULT_LIST_TOOLS_TIMEOUT_MS = Number(
     process.env.MCP_LIST_TOOLS_TIMEOUT_MS || 15000,
   );
-  private static readonly DEFAULT_CALL_TOOL_TIMEOUT_MS = Number(
-    process.env.MCP_CALL_TOOL_TIMEOUT_MS || 60000,
-  );
+  /**
+   * MCP 工具调用超时策略（底层统一策略）
+   *
+   * - idleTimeout: 距离最近一次进度通知超过该值，判定为“无响应超时”
+   * - maxTotalTimeout: 总时长硬上限，防止工具无限占用
+   *
+   * 说明：
+   * 1) 不再使用固定 wall-clock 60s 的外层 Promise.race，避免长任务被误杀；
+   * 2) 依赖 SDK RequestOptions 的 timeout + resetTimeoutOnProgress + maxTotalTimeout 实现。
+   */
+  private static readonly CALL_TOOL_IDLE_TIMEOUT_MS = 2 * 60 * 1000;
+  private static readonly CALL_TOOL_MAX_TOTAL_TIMEOUT_MS = 30 * 60 * 1000;
 
   private async withTimeout<T>(
     promise: Promise<T>,
@@ -401,52 +410,54 @@ export class MCPManager {
       throw new Error(`MCP server not connected: ${serverId}`);
     }
 
+    const startedAt = Date.now();
+    let lastProgressAt = startedAt;
     try {
       logger.info('Calling MCP tool', {
         serverId,
         toolName,
         args,
+        idleTimeoutMs: MCPManager.CALL_TOOL_IDLE_TIMEOUT_MS,
+        maxTotalTimeoutMs: MCPManager.CALL_TOOL_MAX_TOTAL_TIMEOUT_MS,
       }, LogCategory.TOOLS);
-
-      const callPromise = client.callTool({
-        name: toolName,
-        arguments: args,
-      });
-
-      // 将外部中断信号与超时合并：任一触发即终止等待
-      const races: Promise<any>[] = [
-        this.withTimeout(
-          callPromise,
-          MCPManager.DEFAULT_CALL_TOOL_TIMEOUT_MS,
-          `MCP callTool timed out after ${MCPManager.DEFAULT_CALL_TOOL_TIMEOUT_MS}ms`,
-        ),
-      ];
-
-      if (signal) {
-        races.push(new Promise((_, reject) => {
-          if (signal.aborted) {
-            reject(new DOMException('任务已中断', 'AbortError'));
-            return;
-          }
-          signal.addEventListener('abort', () => {
-            reject(new DOMException('任务已中断', 'AbortError'));
-          }, { once: true });
-        }));
-      }
-
-      const result = await Promise.race(races);
+      const result = await client.callTool(
+        {
+          name: toolName,
+          arguments: args,
+        },
+        undefined,
+        {
+          signal,
+          timeout: MCPManager.CALL_TOOL_IDLE_TIMEOUT_MS,
+          resetTimeoutOnProgress: true,
+          maxTotalTimeout: MCPManager.CALL_TOOL_MAX_TOTAL_TIMEOUT_MS,
+          onprogress: (progress) => {
+            lastProgressAt = Date.now();
+            logger.debug('MCP tool progress', {
+              serverId,
+              toolName,
+              progress,
+            }, LogCategory.TOOLS);
+          },
+        },
+      );
 
       logger.info('MCP tool call completed', {
         serverId,
         toolName,
+        elapsedMs: Date.now() - startedAt,
       }, LogCategory.TOOLS);
 
       return result;
     } catch (error: any) {
+      const now = Date.now();
       logger.error('MCP tool call failed', {
         serverId,
         toolName,
         error: error.message,
+        elapsedMs: now - startedAt,
+        idleForMs: now - lastProgressAt,
+        errorCode: error?.code,
       }, LogCategory.TOOLS);
       throw error;
     }

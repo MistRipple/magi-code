@@ -54,6 +54,29 @@ export type NoticeType = 'info' | 'success' | 'warning' | 'error';
 // 工具调用状态
 export type ToolCallStatus = 'pending' | 'running' | 'success' | 'error';
 
+// 工具结果标准化状态（与协议层保持一致）
+export type StandardizedToolStatus =
+  | 'success'
+  | 'error'
+  | 'timeout'
+  | 'killed'
+  | 'blocked'
+  | 'rejected'
+  | 'aborted';
+
+// 工具结果标准化结构（机器可读）
+export interface StandardizedToolResult {
+  schemaVersion: 'tool-result.v1';
+  source: 'builtin' | 'mcp' | 'skill';
+  toolName: string;
+  toolCallId: string;
+  status: StandardizedToolStatus;
+  message: string;
+  data?: unknown;
+  errorCode?: string;
+  sourceId?: string;
+}
+
 // 工具调用
 export interface ToolCall {
   id: string;
@@ -62,6 +85,7 @@ export interface ToolCall {
   status: ToolCallStatus;
   result?: string;
   error?: string;
+  standardized?: StandardizedToolResult;
   startTime?: number;
   endTime?: number;
 }

@@ -47,6 +47,21 @@
     )
   );
 
+  // 检查是否真的有可见内容（防止虽然有 blocks 但全是空字符串导致 UI 假死）
+  const hasVisibleContent = $derived.by(() => {
+    if (message.content && message.content.trim().length > 0) return true;
+    if (safeBlocks.length === 0) return false;
+
+    // 遍历 blocks，只要有一个包含实质内容就认为有可见内容
+    for (const block of safeBlocks) {
+      if (block.type === 'tool_call') return true;
+      if (block.type === 'tool_result') return true;
+      if (block.type === 'thinking' && block.thinking?.content && block.thinking.content.trim().length > 0) return true;
+      if (block.type === 'text' && block.content && block.content.trim().length > 0) return true;
+    }
+    return false;
+  });
+
   // 格式化时间戳
   function formatTime(timestamp: number): string {
     const date = new Date(timestamp);
@@ -195,8 +210,11 @@
             {/each}
           {:else if message.content}
             <MarkdownContent content={message.content} {isStreaming} />
-          {:else if isStreaming}
-            <div class="streaming-indicator-bottom fallback">
+          {/if}
+
+          <!-- 只要处于流式接收状态，就应该在最底部渲染跳动的加载点，不论是否有内容 -->
+          {#if isStreaming}
+            <div class="streaming-indicator-bottom fallback" class:has-content={hasVisibleContent}>
               <span class="streaming-dot"></span>
               <span class="streaming-dot"></span>
               <span class="streaming-dot"></span>
@@ -214,37 +232,41 @@
     class:placeholder={isPlaceholder}
     class:was-placeholder={wasPlaceholder}
     class:just-completed={justCompleted}
+    class:no-visible-content={!hasVisibleContent}
     data-message-id={message.id}
     data-source={message.source}
     data-interaction={isInteraction ? 'true' : 'false'}
     data-placeholder-state={isPlaceholder ? placeholderState : undefined}
   >
-    <div class="message-header">
-      <div class="message-source">
-        <WorkerBadge worker={badgeWorker} size="sm" />
-        {#if isPlaceholder}
-          <span class="placeholder-status">
-            {#if placeholderState === 'pending'}
-              正在准备...
-            {:else if placeholderState === 'received'}
-              已接收...
-            {:else if placeholderState === 'thinking'}
-              正在思考...
-            {:else}
-              处理中...
-            {/if}
-          </span>
-        {/if}
+    <!-- 当真正有内容时才展开 header，或者不处于 streaming 状态 -->
+    {#if hasVisibleContent || !isStreaming || isPlaceholder}
+      <div class="message-header" class:fade-in={hasVisibleContent && isStreaming}>
+        <div class="message-source">
+          <WorkerBadge worker={badgeWorker} size="sm" />
+          {#if isPlaceholder}
+            <span class="placeholder-status">
+              {#if placeholderState === 'pending'}
+                正在准备...
+              {:else if placeholderState === 'received'}
+                已接收...
+              {:else if placeholderState === 'thinking'}
+                正在思考...
+              {:else}
+                处理中...
+              {/if}
+            </span>
+          {/if}
+        </div>
+        <div class="message-meta">
+          <span class="message-time">{formatTime(message.timestamp)}</span>
+          {#if !isStreaming && !isPlaceholder}
+            <button class="copy-btn" onclick={handleCopy} title="复制内容">
+              <Icon name="copy" size={12} />
+            </button>
+          {/if}
+        </div>
       </div>
-      <div class="message-meta">
-        <span class="message-time">{formatTime(message.timestamp)}</span>
-        {#if !isStreaming && !isPlaceholder}
-          <button class="copy-btn" onclick={handleCopy} title="复制内容">
-            <Icon name="copy" size={12} />
-          </button>
-        {/if}
-      </div>
-    </div>
+    {/if}
 
     <div class="message-content">
       {#if isPlaceholder}
@@ -412,6 +434,26 @@
   /* 流式消息卡片：高度完全由内容与动画驱动，避免占位感 */
   .message-item.assistant.streaming {
     min-height: 0;
+  }
+
+  /* 移除无可见内容时的多余包装感（针对客角色卡片） */
+  .message-item.assistant.streaming.no-visible-content:not(.placeholder) {
+    border-color: transparent;
+    background: transparent;
+    box-shadow: none;
+    padding-top: var(--space-2);
+    padding-bottom: var(--space-2);
+  }
+
+  /* 当有内容时的加载指示器，增加上边距，和内容拉开距离 */
+  .streaming-indicator-bottom.fallback.has-content {
+    margin-top: var(--space-2);
+    padding-top: var(--space-2);
+  }
+
+  /* 渐入动画，用于内容首次出现时平滑展开 Header */
+  .message-header.fade-in {
+    animation: contentFadeIn 0.3s ease-out;
   }
 
   .interaction-inline {

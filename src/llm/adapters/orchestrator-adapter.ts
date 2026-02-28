@@ -604,8 +604,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           const response = await this.client.streamMessage(params, (chunk) => {
             if (chunk.type === 'content_delta' && chunk.content) {
               accumulatedText += chunk.content;
-              this.normalizer.processTextDelta(streamId, chunk.content);
-              this.emit('message', chunk.content);
             } else if (chunk.type === 'thinking' && chunk.thinking) {
               this.normalizer.processThinking(streamId, chunk.thinking);
               this.emit('thinking', chunk.thinking);
@@ -623,6 +621,10 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
 
           // 无工具调用 → 收敛
           if (toolCalls.length === 0) {
+            if (assistantText) {
+              this.normalizer.processTextDelta(streamId, assistantText);
+              this.emit('message', assistantText);
+            }
             history.push({ role: 'assistant', content: assistantText });
             finalText = assistantText;
             this.normalizer.endStream(streamId);
@@ -648,9 +650,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           }
 
           const assistantContent: any[] = [];
-          if (assistantText) {
-            assistantContent.push({ type: 'text', text: assistantText });
-          }
           for (const toolCall of toolCalls) {
             assistantContent.push({
               type: 'tool_use',
@@ -683,6 +682,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                 result.isError ? undefined : result.content,
                 result.isError ? result.content : undefined,
                 result.fileChange,
+                result.standardized,
               );
               continue;
             }
@@ -697,6 +697,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               input: JSON.stringify(toolCall.arguments, null, 2),
               output: result.isError ? undefined : result.content,
               error: result.isError ? result.content : undefined,
+              standardized: result.standardized,
             });
 
             if (!result.isError && result.fileChange) {
@@ -719,6 +720,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               tool_use_id: result.toolCallId,
               content: result.content,
               is_error: result.isError,
+              standardized: result.standardized,
             })),
           });
 

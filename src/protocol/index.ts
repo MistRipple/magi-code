@@ -18,6 +18,8 @@ export {
   type TextBlock,
   type CodeBlock,
   type ThinkingBlock,
+  type StandardizedToolStatus,
+  type StandardizedToolResultPayload,
   type ToolCallBlock,
   type FileChangeBlock,
   type ContentBlock,
@@ -41,4 +43,3 @@ export {
   createNotifyMessage,
   createDataMessage,
 } from './message-protocol';
-

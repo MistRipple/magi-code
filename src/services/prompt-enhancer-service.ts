@@ -121,7 +121,6 @@ export class PromptEnhancerService {
       // 1. 通过 AceExecutor 统一获取代码上下文（自动降级）
       const toolManager = this.deps.getToolManager();
       if (toolManager) {
-        const aceExecutor = toolManager.getAceExecutor();
         const toolCall = {
           id: `enhance-ace-${Date.now()}`,
           name: 'codebase_retrieval',
@@ -131,7 +130,11 @@ export class PromptEnhancerService {
           },
         };
 
-        const result = await aceExecutor.execute(toolCall);
+        const result = await toolManager.execute(
+          toolCall,
+          undefined,
+          { workerId: 'orchestrator', role: 'orchestrator' }
+        );
         if (!result.isError && result.content && result.content !== '未找到相关代码（本地三级搜索无结果）') {
           contextParts.push(`## 相关代码\n${result.content}`);
           currentLength += result.content.length;
