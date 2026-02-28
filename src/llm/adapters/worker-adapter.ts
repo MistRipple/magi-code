@@ -777,15 +777,17 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   private async executeToolCalls(toolCalls: ToolCall[]) {
     const results = [];
     const maxToolResultChars = 20000;
+    const toolSourceMap = await this.buildToolSourceMap();
 
     for (const toolCall of toolCalls) {
       // 中断检查：工具调用之间检测 abort 信号，避免中断后继续执行后续工具
       if (this.abortController?.signal.aborted) {
-        results.push({
-          toolCallId: toolCall.id,
-          content: '任务已中断',
-          isError: true,
-        });
+        results.push(this.createSyntheticToolResult(
+          toolCall,
+          '任务已中断',
+          'aborted',
+          toolSourceMap,
+        ));
         continue;
       }
 
@@ -795,11 +797,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           ? toolCall.rawArguments.substring(0, 500)
           : '';
         const errorContent = `工具参数解析失败（${toolCall.name}）：${toolCall.argumentParseError}${raw ? `\n原始参数: ${raw}` : ''}`;
-        results.push({
-          toolCallId: toolCall.id,
-          content: errorContent,
-          isError: true,
-        });
+        results.push(this.createSyntheticToolResult(
+          toolCall,
+          errorContent,
+          'error',
+          toolSourceMap,
+        ));
         this.recordFailedWrite(toolCall, errorContent);
         this.emit('toolResult', toolCall.name, errorContent);
         continue;
@@ -809,11 +812,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       const fileDedup = this.checkFileAccessDuplicate(toolCall);
       if (fileDedup) {
         logger.info(`${this.agent} 文件级去重命中`, { tool: toolCall.name, path: toolCall.arguments?.path }, LogCategory.TOOLS);
-        results.push({
-          toolCallId: toolCall.id,
-          content: fileDedup,
-          isError: false,
-        });
+        results.push(this.createSyntheticToolResult(
+          toolCall,
+          fileDedup,
+          'success',
+          toolSourceMap,
+        ));
         this.emit('toolResult', toolCall.name, fileDedup);
         continue;
       }
@@ -822,11 +826,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       const dedupResult = this.checkSearchDuplicate(toolCall);
       if (dedupResult) {
         logger.info(`${this.agent} 检索去重命中`, { tool: toolCall.name }, LogCategory.TOOLS);
-        results.push({
-          toolCallId: toolCall.id,
-          content: dedupResult,
-          isError: false,
-        });
+        results.push(this.createSyntheticToolResult(
+          toolCall,
+          dedupResult,
+          'success',
+          toolSourceMap,
+        ));
         this.emit('toolResult', toolCall.name, dedupResult);
         continue;
       }
@@ -835,11 +840,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       const failedWriteDedup = this.checkFailedWriteDuplicate(toolCall);
       if (failedWriteDedup) {
         logger.info(`${this.agent} 失败写操作去重命中`, { tool: toolCall.name, path: toolCall.arguments?.path }, LogCategory.TOOLS);
-        results.push({
-          toolCallId: toolCall.id,
-          content: failedWriteDedup,
-          isError: true,
-        });
+        results.push(this.createSyntheticToolResult(
+          toolCall,
+          failedWriteDedup,
+          'error',
+          toolSourceMap,
+        ));
         this.emit('toolResult', toolCall.name, failedWriteDedup);
         continue;
       }
@@ -848,11 +854,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       const successWriteDedup = this.checkSuccessWriteDuplicate(toolCall);
       if (successWriteDedup) {
         logger.info(`${this.agent} 成功写操作去重命中`, { tool: toolCall.name, path: toolCall.arguments?.path }, LogCategory.TOOLS);
-        results.push({
-          toolCallId: toolCall.id,
-          content: successWriteDedup,
-          isError: false,
-        });
+        results.push(this.createSyntheticToolResult(
+          toolCall,
+          successWriteDedup,
+          'success',
+          toolSourceMap,
+        ));
         this.emit('toolResult', toolCall.name, successWriteDedup);
         continue;
       }
@@ -860,15 +867,16 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       try {
         logger.debug(`Executing tool: ${toolCall.name}`, { args: toolCall.arguments }, LogCategory.TOOLS);
 
-        const result = await this.toolManager.execute(
+        const rawResult = await this.toolManager.execute(
           toolCall,
           this.abortController?.signal,
           { workerId: this.workerSlot, role: 'worker' },
         );
-        if (typeof result.content === 'string' && result.content.length > maxToolResultChars) {
-          const truncated = result.content.slice(0, maxToolResultChars);
-          result.content = `${truncated}\n...[truncated ${result.content.length - maxToolResultChars} chars]`;
+        if (typeof rawResult.content === 'string' && rawResult.content.length > maxToolResultChars) {
+          const truncated = rawResult.content.slice(0, maxToolResultChars);
+          rawResult.content = `${truncated}\n...[truncated ${rawResult.content.length - maxToolResultChars} chars]`;
         }
+        const result = this.ensureStandardizedToolResult(toolCall, rawResult, toolSourceMap);
         results.push(result);
 
         // 缓存只读工具的成功结果
@@ -901,11 +909,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         const errorContent = `Error: ${error.message}`;
         this.recordFailedWrite(toolCall, errorContent);
 
-        results.push({
-          toolCallId: toolCall.id,
-          content: errorContent,
-          isError: true,
-        });
+        results.push(this.createSyntheticToolResult(
+          toolCall,
+          errorContent,
+          'error',
+          toolSourceMap,
+        ));
       }
     }
 

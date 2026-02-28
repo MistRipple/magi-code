@@ -853,6 +853,9 @@ export class VSCodeTerminalExecutor {
 
   /**
    * 验证命令是否安全
+   *
+   * 仅拦截系统安全级威胁（rm -rf /、fork bomb 等）。
+   * 文件操作不再拦截 — 大模型已通过系统提示词引导至 file_bulk_edit 黄金路径。
    */
   validateCommand(command: string): { valid: boolean; reason?: string } {
     const dangerousPatterns = [

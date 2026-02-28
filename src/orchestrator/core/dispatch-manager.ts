@@ -587,7 +587,7 @@ export class DispatchManager {
 
     orchestrationExecutor.setHandlers({
       dispatch: async (params) => {
-        const { goal, acceptance, constraints, context, files, scopeHint, dependsOn, category, requiresModification, contracts } = params;
+        const { task_name, goal, acceptance, constraints, context, files, scopeHint, dependsOn, category, requiresModification, contracts } = params;
         if (typeof requiresModification !== 'boolean') {
           return {
             task_id: '',
@@ -595,7 +595,7 @@ export class DispatchManager {
             error: 'requires_modification 必须为布尔值',
           };
         }
-        const taskTitle = goal.trim();
+        const taskTitle = task_name || goal.trim();
         const collaborationContracts = this.normalizeCollaborationContracts(contracts);
         logger.info('编排工具.dispatch_task.开始', {
           category,
@@ -755,7 +755,7 @@ export class DispatchManager {
 
       splitTodo: async (params) => {
         const { subtasks, callerContext } = params;
-        const assignment = this.activeAssignments.get(callerContext.assignmentId);
+        const assignment = this.activeAssignments?.get(callerContext.assignmentId);
         if (!assignment) {
           return {
             success: false,
@@ -808,6 +808,49 @@ export class DispatchManager {
         }, LogCategory.ORCHESTRATOR);
 
         return { success: true, childTodoIds };
+      },
+
+      getTodos: async (params) => {
+        const todoManager = this.deps.getTodoManager();
+        if (!todoManager) {
+          throw new Error('TodoManager 未初始化，无法获取 Todos');
+        }
+
+        // Orchestrator 允许不传 callerContext（查看全盘或指定 missionId），Worker 必须传
+        const missionId = params.callerContext?.missionId || params.missionId;
+        const assignmentId = params.callerContext?.assignmentId;
+
+        if (!missionId) {
+          throw new Error('必须提供 missionId 或有效的 callerContext');
+        }
+
+        return await todoManager.query({
+          missionId,
+          assignmentId,
+          status: params.status as any
+        });
+      },
+
+      updateTodo: async (params) => {
+        const todoManager = this.deps.getTodoManager();
+        if (!todoManager) {
+          return { success: false, error: 'TodoManager 未初始化，无法更新 Todo' };
+        }
+
+        try {
+          // 参数基础校验
+          if (!params.todoId) {
+            return { success: false, error: '缺少必须参数: todoId' };
+          }
+          if (!params.updates || Object.keys(params.updates).length === 0) {
+            return { success: false, error: '缺少有效的更新内容(updates)' };
+          }
+
+          await todoManager.update(params.todoId, params.updates);
+          return { success: true };
+        } catch (error: any) {
+          return { success: false, error: error.message };
+        }
       },
     });
 

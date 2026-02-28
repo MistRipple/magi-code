@@ -170,7 +170,22 @@ function normalizePersistedMessages(messages: Message[] | undefined): Message[] 
     }
     seen.add(id);
     const blocks = sanitizeMessageBlocks(msg.blocks);
-    normalized.push({ ...msg, id, blocks: blocks.length > 0 ? blocks : undefined });
+    const metadata = msg.metadata && typeof msg.metadata === 'object'
+      ? {
+        ...msg.metadata,
+        isPlaceholder: false,
+        placeholderState: undefined,
+      }
+      : undefined;
+    normalized.push({
+      ...msg,
+      id,
+      blocks: blocks.length > 0 ? blocks : undefined,
+      // Webview 重新进入时，持久化消息一律视为历史完成态，防止残留流式动画。
+      isStreaming: false,
+      isComplete: true,
+      metadata,
+    });
   }
   return normalized;
 }
@@ -978,6 +993,16 @@ export function initializeState() {
     messagesState.currentSessionId = persisted.currentSessionId || null;
     messagesState.scrollPositions = persisted.scrollPositions || { thread: 0, claude: 0, codex: 0, gemini: 0 };
     messagesState.autoScrollEnabled = persisted.autoScrollEnabled || { thread: true, claude: true, codex: true, gemini: true };
+
+    // 启动恢复：持久化状态只保留历史展示，不继承运行态。
+    clearPendingInteractions();
+    clearProcessingState();
+    workerExecutionStatus = {
+      claude: 'idle',
+      codex: 'idle',
+      gemini: 'idle',
+    };
+    saveWebviewState();
   }
 }
 

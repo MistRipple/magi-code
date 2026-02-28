@@ -11,7 +11,7 @@
 
 import { EventEmitter } from 'events';
 import { AgentType, AgentRole, LLMConfig, TokenUsage } from '../../types/agent-types';
-import { LLMClient } from '../types';
+import { LLMClient, ToolCall, ToolResult, StandardizedToolResult } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager } from '../../tools/tool-manager';
 import { MessageHub } from '../../orchestrator/core/message-hub';
@@ -69,6 +69,117 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     toolArgs?: any;
     toolResult?: string;
   }) => string[];
+
+  protected async buildToolSourceMap(): Promise<Map<string, StandardizedToolResult['source']>> {
+    const sourceMap = new Map<string, StandardizedToolResult['source']>();
+    try {
+      const tools = await this.toolManager.getTools();
+      for (const tool of tools) {
+        if (!tool?.name || !tool?.metadata?.source) {
+          continue;
+        }
+        sourceMap.set(tool.name, tool.metadata.source);
+      }
+    } catch (error: any) {
+      logger.warn('构建工具来源映射失败，将在单链路内使用 builtin 兜底来源', {
+        agent: this.agent,
+        error: error?.message || String(error),
+      }, LogCategory.LLM);
+    }
+    return sourceMap;
+  }
+
+  protected resolveToolSource(
+    toolName: string,
+    sourceMap?: Map<string, StandardizedToolResult['source']>,
+    existing?: StandardizedToolResult['source'],
+  ): StandardizedToolResult['source'] {
+    if (existing === 'builtin' || existing === 'mcp' || existing === 'skill') {
+      return existing;
+    }
+    const mapped = sourceMap?.get(toolName);
+    if (mapped) {
+      return mapped;
+    }
+    // 单链路兜底：来源映射不可用时统一归类 builtin，避免分叉逻辑。
+    logger.warn('工具来源未命中映射，使用 builtin 兜底', {
+      agent: this.agent,
+      toolName,
+    }, LogCategory.LLM);
+    return 'builtin';
+  }
+
+  protected createSyntheticToolResult(
+    toolCall: ToolCall,
+    content: string,
+    status: StandardizedToolResult['status'],
+    sourceMap?: Map<string, StandardizedToolResult['source']>
+  ): ToolResult {
+    const normalizedContent = typeof content === 'string' ? content : String(content ?? '');
+    const source = this.resolveToolSource(toolCall.name, sourceMap);
+    const isError = status !== 'success';
+    return {
+      toolCallId: toolCall.id,
+      content: normalizedContent,
+      isError,
+      standardized: {
+        schemaVersion: 'tool-result.v1',
+        source,
+        toolName: toolCall.name,
+        toolCallId: toolCall.id,
+        status,
+        message: normalizedContent,
+      },
+    };
+  }
+
+  protected ensureStandardizedToolResult(
+    toolCall: ToolCall,
+    result: ToolResult,
+    sourceMap?: Map<string, StandardizedToolResult['source']>,
+  ): ToolResult {
+    const toolCallId = result.toolCallId || toolCall.id;
+    const content = typeof result.content === 'string' ? result.content : String(result.content ?? '');
+    const existing = result.standardized;
+
+    if (existing) {
+      const status = existing.status;
+      return {
+        ...result,
+        toolCallId,
+        content,
+        isError: status !== 'success',
+        standardized: {
+          ...existing,
+          source: this.resolveToolSource(toolCall.name, sourceMap, existing.source),
+          toolName: existing.toolName || toolCall.name,
+          toolCallId,
+          message: content,
+        },
+      };
+    }
+
+    const status: StandardizedToolResult['status'] = result.isError ? 'error' : 'success';
+    logger.warn('工具结果缺少 standardized，已在适配器层补齐', {
+      agent: this.agent,
+      toolName: toolCall.name,
+      status,
+    }, LogCategory.LLM);
+    return {
+      ...result,
+      toolCallId,
+      content,
+      isError: status !== 'success',
+      standardized: {
+        schemaVersion: 'tool-result.v1',
+        source: this.resolveToolSource(toolCall.name, sourceMap),
+        toolName: toolCall.name,
+        toolCallId,
+        status,
+        message: content,
+      },
+    };
+  }
 
   constructor(
     client: LLMClient,

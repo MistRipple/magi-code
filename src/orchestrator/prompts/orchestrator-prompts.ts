@@ -26,6 +26,8 @@ export interface UnifiedPromptContext {
   projectContext?: string;
   /** 会话历史摘要 */
   sessionSummary?: string;
+  /** 当前系统的 Todo 清单概要 */
+  activeTodosSummary?: string;
   /** 知识库 ADR */
   relevantADRs?: string;
   /** 动态可用工具摘要（内置 + MCP + Skill，由 ToolManager 生成） */
@@ -181,13 +183,14 @@ ${toolsListSection}
 
   // dispatch_task 使用指南
   sections.push(`## dispatch_task 使用指南
+- **task_name 是必填参数**：生成一个简短、标准的工程化任务名称（如“[Frontend] 实现密码可见性切换”），不要照抄用户原始对话
 - **category 是必填参数**：根据任务性质从分工映射表中选择最匹配的 category，系统据此自动路由到对应 Worker
 - **requires_modification 是必填参数**：
   - 只读分析/统计/总结任务传 \`false\`
   - 功能开发/修复/重构/生成代码任务传 \`true\`
   - 必须与任务合同语义一致，禁止矛盾
 - **必须使用结构化任务合同字段**：
-  1. \`goal\`：任务目标（Goal）
+  1. \`goal\`：任务目标（Goal），详细描述要达成的业务结果
   2. \`acceptance\`：验收标准数组（Acceptance）
   3. \`constraints\`：约束数组（Constraints）
   4. \`context\`：上下文数组（Context）
@@ -200,7 +203,8 @@ ${toolsListSection}
   - \`freeze_files\`：冻结文件（本任务禁止修改）
 - files 参数（可选）：仅当确需限定“严格目标文件”时提供；不要把 files 当作常规微操手段
 - 示例结构：
-  - goal: "修复 validateEmail 对空字符串的误判"
+  - task_name: "[Bugfix] 修复邮箱验证对空字符串的误判"
+  - goal: "修复 validator.ts 中 validateEmail 函数对空字符串的误判，当前空字符串会引发异常，应该返回 false"
   - acceptance: ["空字符串返回 false", "现有邮箱样例保持通过"]
   - constraints: ["不改变函数签名"]
   - context: ["问题集中在 src/utils/validator.ts 附近"]
@@ -218,11 +222,12 @@ ${toolsListSection}
 2. 使用 dispatch_task 分配子任务
 3. 调用 wait_for_workers 阻塞等待结果
 4. 审查 Worker 返回的结果，对照用户原始需求逐项判断：
-   - 全部子目标达成且产出质量达标 → 输出最终汇总
+   - ⚠️ 绝对禁令：当 Worker 返回的 status="completed" 且 modified_files 有内容时，说明代码已经被 Worker 真实、永久地修改！绝对禁止你再去调用编辑文件/创建文件等工具重复实现一次！如果需要审查，请只读代码，不要再写！
+   - 全部子目标达成且产出质量达标 → 停止使用工具，直接用自然语言输出最终汇总
    - 部分失败 → dispatch_task 追加修复任务 → 回到步骤 3
    - 产出不完整、遗漏关键点或偏离目标 → dispatch_task 追加补充任务 → 回到步骤 3
    - 前序结果揭示了新的必要工作 → dispatch_task 追加新任务 → 回到步骤 3
-   - "成功执行"≠"目标达成"：status=completed 仅代表 Worker 没报错，必须检查实际产出是否满足验收标准
+   - "成功执行"≠"目标达成"：status=completed 仅代表 Worker 没报错，你可以通过读取文件（只读！）来确认它改得对不对。如果不满足，必须通过再次 dispatch_task 派发新任务来修复，严禁你自己修改。
    - audit.level = "intervention" 时必须追加修复任务，禁止直接交付
 
 **使用 wait_for_workers**：
@@ -278,6 +283,15 @@ wait_for_workers()  → 最终结果，向用户汇总
   // 会话上下文
   if (sessionSummary) {
     sections.push(`## 当前会话\n${sessionSummary}`);
+  }
+
+  // 活动任务清单
+  if (context.activeTodosSummary) {
+    // 截断过长的 Todos 摘要，避免耗尽上下文（限制到约 1000 个字符）
+    const truncatedTodos = context.activeTodosSummary.length > 1000
+      ? context.activeTodosSummary.substring(0, 1000) + '\n... (部分任务已截断)'
+      : context.activeTodosSummary;
+    sections.push(`## 当前任务清单 (Todos)\n系统当前处于活动状态或未完成的任务清单：\n\n${truncatedTodos}`);
   }
 
   return sections.join('\n\n');

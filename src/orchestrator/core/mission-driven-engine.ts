@@ -461,11 +461,35 @@ export class MissionDrivenEngine extends EventEmitter {
           categoryDefinitions.set(name, { displayName: def.displayName, description: def.description });
         }
 
+        // 获取系统当前的活动 Todo 列表并转为字符串以注入到上下文
+        let activeTodosSummary = '';
+        try {
+          const todoManager = this.missionOrchestrator.getTodoManager();
+          if (todoManager) {
+            // 获取所有相关的 Todo，包括已完成的，以告知编排者真实进度
+            const allTodos = await todoManager.query({});
+            if (allTodos.length > 0) {
+              const fullSummary = allTodos.map(t => {
+                const isDone = t.status === 'completed';
+                const statusFlag = isDone ? 'COMPLETED (代码已被真实修改，请勿重复执行)' : t.status.toUpperCase();
+                return `- [${statusFlag}] ID: ${t.id} | Worker: ${t.workerId || 'unassigned'} | 任务: ${t.content}`;
+              }).join('\n');
+              // Token 截断机制：限制最大长度约 1000 字符，防止上下文超载
+              activeTodosSummary = fullSummary.length > 1000
+                ? fullSummary.substring(0, 1000) + '\n... (部分任务已截断)'
+                : fullSummary;
+            }
+          }
+        } catch (e) {
+          logger.warn('获取 active Todos 失败', { error: String(e) }, LogCategory.ORCHESTRATOR);
+        }
+
         let systemPrompt = buildUnifiedSystemPrompt({
           availableWorkers,
           workerProfiles,
           projectContext,
           sessionSummary: context || undefined,
+          activeTodosSummary,
           relevantADRs,
           availableToolsSummary,
           categoryDefinitions,
