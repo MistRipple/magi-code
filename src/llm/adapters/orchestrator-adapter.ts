@@ -790,15 +790,17 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   private async executeToolCalls(toolCalls: ToolCall[]) {
     const results = [];
     const maxToolResultChars = 20000;
+    const toolSourceMap = await this.buildToolSourceMap();
 
     for (const toolCall of toolCalls) {
       // 中断检查：工具调用之间检测 abort 信号，避免中断后继续执行后续工具
       if (this.abortController?.signal.aborted) {
-        results.push({
-          toolCallId: toolCall.id,
-          content: '任务已中断',
-          isError: true,
-        });
+        results.push(this.createSyntheticToolResult(
+          toolCall,
+          '任务已中断',
+          'aborted',
+          toolSourceMap,
+        ));
         continue;
       }
 
@@ -808,11 +810,12 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           ? toolCall.rawArguments.substring(0, 500)
           : '';
         const errorContent = `工具参数解析失败（${toolCall.name}）：${toolCall.argumentParseError}${raw ? `\n原始参数: ${raw}` : ''}`;
-        results.push({
-          toolCallId: toolCall.id,
-          content: errorContent,
-          isError: true,
-        });
+        results.push(this.createSyntheticToolResult(
+          toolCall,
+          errorContent,
+          'error',
+          toolSourceMap,
+        ));
         this.emit('toolResult', toolCall.name, errorContent);
         continue;
       }
@@ -820,32 +823,35 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       // 编排者角色约束：禁止文件写入操作
       const blocked = this.checkOrchestratorToolRestriction(toolCall);
       if (blocked) {
-        results.push({
-          toolCallId: toolCall.id,
-          content: blocked,
-          isError: true,
-        });
+        results.push(this.createSyntheticToolResult(
+          toolCall,
+          blocked,
+          'blocked',
+          toolSourceMap,
+        ));
         continue;
       }
 
       try {
-        const result = await this.toolManager.execute(
+        const rawResult = await this.toolManager.execute(
           toolCall,
           this.abortController?.signal,
           { workerId: 'orchestrator', role: 'orchestrator' },
         );
-        if (typeof result.content === 'string' && result.content.length > maxToolResultChars) {
-          const truncated = result.content.slice(0, maxToolResultChars);
-          result.content = `${truncated}\n...[truncated ${result.content.length - maxToolResultChars} chars]`;
+        if (typeof rawResult.content === 'string' && rawResult.content.length > maxToolResultChars) {
+          const truncated = rawResult.content.slice(0, maxToolResultChars);
+          rawResult.content = `${truncated}\n...[truncated ${rawResult.content.length - maxToolResultChars} chars]`;
         }
+        const result = this.ensureStandardizedToolResult(toolCall, rawResult, toolSourceMap);
         results.push(result);
         this.emit('toolResult', toolCall.name, result.content);
       } catch (error: any) {
-        results.push({
-          toolCallId: toolCall.id,
-          content: `Error: ${error?.message || String(error)}`,
-          isError: true,
-        });
+        results.push(this.createSyntheticToolResult(
+          toolCall,
+          `Error: ${error?.message || String(error)}`,
+          'error',
+          toolSourceMap,
+        ));
       }
     }
 

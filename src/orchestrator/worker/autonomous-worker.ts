@@ -1243,7 +1243,7 @@ ${completedWork}
     const sections: string[] = [];
 
     // 0. 共享上下文注入（如果可用） - 提案 9.2
-    const sharedKnowledge = this.buildSharedKnowledgeSection(sharedContext);
+    const sharedKnowledge = this.buildSharedKnowledgeSection(sharedContext, assignment);
     if (sharedKnowledge) {
       sections.push(sharedKnowledge);
     }
@@ -1503,32 +1503,36 @@ ${completedWork}
   /**
    * 构建共享知识片段
    */
-  private buildSharedKnowledgeSection(sharedContext?: AssembledContext | null): string | null {
-    if (!sharedContext || sharedContext.parts.length === 0) {
-      return null;
-    }
-
+  private buildSharedKnowledgeSection(sharedContext?: AssembledContext | null, assignment?: Assignment): string | null {
     const sharedSections: string[] = [];
 
-    for (const part of sharedContext.parts) {
-      switch (part.type) {
-        case 'project_knowledge':
-          sharedSections.push(`### 项目知识\n${part.content}`);
-          break;
-        case 'shared_context':
-          sharedSections.push(`### 共享上下文\n${part.content}`);
-          break;
-        case 'contracts':
-          sharedSections.push(`### 任务契约\n${part.content}`);
-          break;
-        case 'recent_turns':
-          sharedSections.push(`### 最近对话\n${part.content}`);
-          break;
-        case 'long_term_memory':
-          sharedSections.push(`### 历史记忆\n${part.content}`);
-          break;
-        default:
-          break;
+    // 注入当前指派的任务 (Todos)
+    if (assignment && assignment.todos && assignment.todos.length > 0) {
+      const todosSummary = assignment.todos.map(t => `- [${t.status}] ID: ${t.id} - ${t.content}`).join('\n');
+      sharedSections.push(`### 当前指派的任务 (Todos)\n${todosSummary}`);
+    }
+
+    if (sharedContext && sharedContext.parts.length > 0) {
+      for (const part of sharedContext.parts) {
+        switch (part.type) {
+          case 'project_knowledge':
+            sharedSections.push(`### 项目知识\n${part.content}`);
+            break;
+          case 'shared_context':
+            sharedSections.push(`### 共享上下文\n${part.content}`);
+            break;
+          case 'contracts':
+            sharedSections.push(`### 任务契约\n${part.content}`);
+            break;
+          case 'recent_turns':
+            sharedSections.push(`### 最近对话\n${part.content}`);
+            break;
+          case 'long_term_memory':
+            sharedSections.push(`### 历史记忆\n${part.content}`);
+            break;
+          default:
+            break;
+        }
       }
     }
 

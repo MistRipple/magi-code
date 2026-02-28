@@ -28,6 +28,8 @@ export interface CategoryWorkerEntry {
  * dispatch_task 任务合同（结构化）
  */
 export interface DispatchTaskContractInput {
+  /** 简短任务名称 */
+  task_name: string;
   /** 任务目标（业务结果） */
   goal: string;
   /** 验收标准 */
@@ -62,6 +64,7 @@ export type DispatchTaskHandler = (params: {
   /** 是否要求子任务对目标文件产生实际修改 */
   requiresModification: boolean;
   /** 结构化合同字段 */
+  task_name: string;
   goal: string;
   acceptance: string[];
   constraints: string[];
@@ -86,6 +89,8 @@ export type DispatchTaskHandler = (params: {
   worker?: WorkerSlot;
   /** 路由分类（用于审计与可解释性） */
   category?: string;
+  /** 任务简短名称 */
+  task_name?: string;
   /** 路由解释（含降级原因） */
   routing_reason?: string;
   /** 是否触发了降级改派 */
@@ -180,17 +185,34 @@ export type SplitTodoHandler = (params: {
 /**
  * 编排工具执行器
  */
+export type GetTodosHandler = (params: {
+  missionId?: string;
+  status?: string[];
+  callerContext?: Pick<SplitTodoCallerContext, 'missionId' | 'assignmentId'>;
+}) => Promise<any[]>;
+
+export type UpdateTodoHandler = (params: {
+  todoId: string;
+  updates: {
+    status?: string;
+    content?: string;
+  };
+}) => Promise<{ success: boolean; error?: string }>;
+
 export class OrchestrationExecutor {
   private dispatchHandler?: DispatchTaskHandler;
   private sendMessageHandler?: SendWorkerMessageHandler;
   private waitForWorkersHandler?: WaitForWorkersHandler;
   private splitTodoHandler?: SplitTodoHandler;
+  private getTodosHandler?: GetTodosHandler;
+  private updateTodoHandler?: UpdateTodoHandler;
+
   /** 动态 Worker 列表（必须由 MissionDrivenEngine 从 ProfileLoader 注入） */
   private availableWorkers: { slot: WorkerSlot; description: string }[] = [];
   /** Category → Worker 映射（必须由 DispatchManager 从 ProfileLoader 注入） */
   private categoryWorkerMap: CategoryWorkerEntry[] = [];
 
-  private static readonly TOOL_NAMES = ['dispatch_task', 'send_worker_message', 'wait_for_workers', 'split_todo'] as const;
+  private static readonly TOOL_NAMES = ['dispatch_task', 'send_worker_message', 'wait_for_workers', 'split_todo', 'get_todos', 'update_todo'] as const;
 
   /**
    * 设置可用 Worker 列表（由 MissionDrivenEngine 从 ProfileLoader 注入）
@@ -246,11 +268,15 @@ export class OrchestrationExecutor {
     sendMessage?: SendWorkerMessageHandler;
     waitForWorkers?: WaitForWorkersHandler;
     splitTodo?: SplitTodoHandler;
+    getTodos?: GetTodosHandler;
+    updateTodo?: UpdateTodoHandler;
   }): void {
     this.dispatchHandler = handlers.dispatch;
     this.sendMessageHandler = handlers.sendMessage;
     this.waitForWorkersHandler = handlers.waitForWorkers;
     this.splitTodoHandler = handlers.splitTodo;
+    this.getTodosHandler = handlers.getTodos;
+    this.updateTodoHandler = handlers.updateTodo;
   }
 
   /**
@@ -269,6 +295,8 @@ export class OrchestrationExecutor {
       this.getWaitForWorkersDefinition(),
       this.getSendWorkerMessageDefinition(),
       this.getSplitTodoDefinition(),
+      this.getGetTodosDefinition(),
+      this.getUpdateTodoDefinition(),
     ];
   }
 
@@ -290,6 +318,10 @@ export class OrchestrationExecutor {
         return this.executeSendWorkerMessage(toolCall);
       case 'split_todo':
         return this.executeSplitTodo(toolCall, callerContext);
+      case 'get_todos':
+        return this.executeGetTodos(toolCall, callerContext);
+      case 'update_todo':
+        return this.executeUpdateTodo(toolCall);
       default:
         return {
           toolCallId: toolCall.id,
@@ -313,6 +345,10 @@ export class OrchestrationExecutor {
       input_schema: {
         type: 'object',
         properties: {
+          task_name: {
+            type: 'string',
+            description: '标准的工程化任务名称，简短概括任务内容（例如：重构用户登录模块，修复导航栏溢出 Bug 等），不要照抄用户原始对话。'
+          },
           category: {
             type: 'string',
             ...(categoryEnum.length > 0 ? { enum: categoryEnum } : {}),
@@ -383,7 +419,7 @@ export class OrchestrationExecutor {
             },
           },
         },
-        required: ['category', 'goal', 'acceptance', 'constraints', 'context', 'requires_modification'],
+        required: ['task_name', 'category', 'goal', 'acceptance', 'constraints', 'context', 'requires_modification'],
       },
       metadata: {
         source: 'builtin',
@@ -403,6 +439,7 @@ export class OrchestrationExecutor {
     }
 
     const args = toolCall.arguments as {
+      task_name?: string;
       category?: string;
       goal?: string;
       acceptance?: string[];
@@ -416,6 +453,13 @@ export class OrchestrationExecutor {
     };
 
     // 结构化合同字段必填
+    if (!args.task_name || typeof args.task_name !== 'string' || !args.task_name.trim()) {
+      return {
+        toolCallId: toolCall.id,
+        content: 'Error: task_name 是必填参数，表示简短的工程化任务名称',
+        isError: true,
+      };
+    }
     if (!args.category || typeof args.category !== 'string' || !args.category.trim()) {
       const validCategories = this.getCategoryEnum();
       return {
@@ -529,6 +573,7 @@ export class OrchestrationExecutor {
         worker: 'auto',
         category,
         requiresModification: args.requires_modification,
+        task_name: args.task_name.trim(),
         goal: args.goal.trim(),
         acceptance: acceptanceValidation.value,
         constraints: constraintsValidation.value,
@@ -912,6 +957,130 @@ export class OrchestrationExecutor {
       return {
         toolCallId: toolCall.id,
         content: `split_todo failed: ${error.message}`,
+        isError: true,
+      };
+    }
+  }
+
+  // ===========================================================================
+  // get_todos
+  // ===========================================================================
+
+  private getGetTodosDefinition(): ExtendedToolDefinition {
+    return {
+      name: 'get_todos',
+      description: '获取当前任务(Mission)的所有 Todo 列表。用于查看当前任务进度和状态。',
+      input_schema: {
+        type: 'object',
+        properties: {
+          mission_id: {
+            type: 'string',
+            description: '可选：指定 mission_id（编排者查询时使用）'
+          },
+          status: {
+            type: 'array',
+            items: { type: 'string', enum: ['pending', 'blocked', 'ready', 'running', 'completed', 'failed', 'skipped'] },
+            description: '可选：按状态过滤'
+          }
+        }
+      },
+      metadata: {
+        source: 'builtin',
+        category: 'orchestration',
+        tags: ['orchestration', 'todo', 'query'],
+      },
+    };
+  }
+
+  private async executeGetTodos(
+    toolCall: ToolCall,
+    callerContext?: SplitTodoCallerContext
+  ): Promise<ToolResult> {
+    if (!this.getTodosHandler) {
+      return {
+        toolCallId: toolCall.id,
+        content: 'get_todos handler not configured',
+        isError: true,
+      };
+    }
+    const args = toolCall.arguments as { status?: string[]; mission_id?: string };
+    try {
+      const todos = await this.getTodosHandler({
+        status: args.status,
+        missionId: args.mission_id,
+        callerContext: callerContext
+          ? { missionId: callerContext.missionId, assignmentId: callerContext.assignmentId }
+          : undefined,
+      });
+      // 提炼核心字段，避免返回过多无关信息导致 token 爆炸
+      const summary = todos.map(t => ({
+        id: t.id,
+        content: t.content,
+        status: t.status,
+        worker: t.workerId
+      }));
+      return {
+        toolCallId: toolCall.id,
+        content: JSON.stringify(summary),
+        isError: false,
+      };
+    } catch (err: any) {
+      return {
+        toolCallId: toolCall.id,
+        content: `Error: ${err.message}`,
+        isError: true,
+      };
+    }
+  }
+
+  // ===========================================================================
+  // update_todo
+  // ===========================================================================
+
+  private getUpdateTodoDefinition(): ExtendedToolDefinition {
+    return {
+      name: 'update_todo',
+      description: '更新一个现有的 Todo 的状态或内容（如手动标记为跳过）。',
+      input_schema: {
+        type: 'object',
+        properties: {
+          todo_id: { type: 'string', description: '待更新的 Todo ID' },
+          status: { type: 'string', enum: ['pending', 'skipped', 'completed'], description: '更改状态（如强制跳过则设为 skipped）' },
+          content: { type: 'string', description: '更新任务描述' }
+        },
+        required: ['todo_id']
+      },
+      metadata: {
+        source: 'builtin',
+        category: 'orchestration',
+        tags: ['orchestration', 'todo', 'update'],
+      },
+    };
+  }
+
+  private async executeUpdateTodo(toolCall: ToolCall): Promise<ToolResult> {
+    if (!this.updateTodoHandler) {
+      return {
+        toolCallId: toolCall.id,
+        content: 'update_todo handler not configured',
+        isError: true,
+      };
+    }
+    const args = toolCall.arguments as { todo_id: string; status?: string; content?: string };
+    try {
+      const result = await this.updateTodoHandler({
+        todoId: args.todo_id,
+        updates: { status: args.status, content: args.content }
+      });
+      return {
+        toolCallId: toolCall.id,
+        content: JSON.stringify(result),
+        isError: !result.success,
+      };
+    } catch (err: any) {
+      return {
+        toolCallId: toolCall.id,
+        content: `Error: ${err.message}`,
         isError: true,
       };
     }

@@ -19,11 +19,6 @@ import { logger, LogCategory } from '../logging';
 import type { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
 import { WorkspaceFolderInfo, WorkspaceRoots } from '../workspace/workspace-roots';
 
-/** 最小执行器接口（仅需 execute 方法） */
-interface Executor {
-  execute(toolCall: { id: string; name: string; arguments: Record<string, any> }): Promise<{ content: string; isError?: boolean }>;
-}
-
 /**
  * 依赖注入接口
  * 通过 getter 惰性引用避免初始化时序问题和循环依赖
@@ -31,10 +26,8 @@ interface Executor {
 export interface LocalCodeSearchDeps {
   /** 惰性获取知识库（PKB 可能尚未初始化） */
   getKnowledgeBase: () => ProjectKnowledgeBase | undefined;
-  /** 惰性获取 grep 搜索执行器 */
-  getSearchExecutor: () => Executor | undefined;
-  /** 惰性获取 LSP 执行器 */
-  getLspExecutor: () => Executor | undefined;
+  /** 统一工具执行入口（必须走 ToolManager 标准通道） */
+  executeTool: (toolCall: { id: string; name: string; arguments: Record<string, any> }) => Promise<{ content: string; isError?: boolean }>;
   /** 关键词提取 */
   extractKeywords: (query: string) => string[];
   /** 工作区目录列表 */
@@ -63,7 +56,7 @@ export class LocalCodeSearchService {
   get isAvailable(): boolean {
     const kb = this.deps.getKnowledgeBase();
     const kbReady = !!(kb?.getSearchEngine?.()?.isReady);
-    return kbReady || !!this.deps.getSearchExecutor() || !!this.deps.getLspExecutor();
+    return kbReady || typeof this.deps.executeTool === 'function';
   }
 
   /** 文件变更时失效缓存（由外部 FileWatcher 调用） */
@@ -178,9 +171,6 @@ export class LocalCodeSearchService {
   // ============================================================================
 
   private async grepSearch(keywords: string[], maxLength: number): Promise<string | null> {
-    const searchExecutor = this.deps.getSearchExecutor();
-    if (!searchExecutor) return null;
-
     const searchKeywords = keywords.filter(kw => kw.length >= 3).slice(0, 3);
     if (searchKeywords.length === 0) return null;
 
@@ -190,7 +180,7 @@ export class LocalCodeSearchService {
     const settled = await Promise.allSettled(
       searchKeywords.map(keyword => {
         const escapedKeyword = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        return searchExecutor.execute({
+        return this.deps.executeTool({
           id: `local-grep-${Date.now()}-${keyword}`,
           name: 'grep_search',
           arguments: {
@@ -221,9 +211,6 @@ export class LocalCodeSearchService {
   // ============================================================================
 
   private async lspSearch(keywords: string[], maxLength: number): Promise<string | null> {
-    const lspExecutor = this.deps.getLspExecutor();
-    if (!lspExecutor) return null;
-
     const symbolKeywords = keywords
       .filter(kw => /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(kw) && kw.length >= 3)
       .slice(0, 3);
@@ -232,7 +219,7 @@ export class LocalCodeSearchService {
     // 所有符号关键词并行查询
     const settled = await Promise.allSettled(
       symbolKeywords.map(keyword =>
-        lspExecutor.execute({
+        this.deps.executeTool({
           id: `local-lsp-${Date.now()}-${keyword}`,
           name: 'lsp_query',
           arguments: { action: 'workspaceSymbols', query: keyword },

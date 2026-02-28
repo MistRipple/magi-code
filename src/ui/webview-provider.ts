@@ -209,6 +209,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private readonly authSecretKey = 'magi.apiKey';
   private readonly authStatusKey = 'magi.loggedIn';
   private loginInFlight = false;
+  private startupRecoveryPromise: Promise<void> | null = null;
 
   // CommandHandler 委派
   private readonly commandHandlers: CommandHandler[];
@@ -572,8 +573,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const { LocalCodeSearchService } = require('../services/local-code-search-service');
     const localSearch = new LocalCodeSearchService({
       getKnowledgeBase: () => this.projectKnowledgeBase,
-      getSearchExecutor: () => toolManager.getSearchExecutor(),
-      getLspExecutor: () => toolManager.getLspExecutor(),
+      executeTool: (toolCall: { id: string; name: string; arguments: Record<string, any> }) =>
+        toolManager.execute(toolCall),
       extractKeywords: (query: string) => this.promptEnhancer.extractKeywords(query),
       workspaceFolders: this.workspaceFolders,
     });
@@ -1019,8 +1020,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.context.subscriptions
     );
 
-    // Webview 初始化时强制中断可能残留的任务，避免重启后状态错乱
-    void this.interruptCurrentTask({ silent: true });
+    // Webview 初始化时强制中断可能残留的任务，避免重启后状态错乱。
+    // 使用启动恢复栅栏，确保 getState/requestState 不会读到残留 running 状态。
+    this.startupRecoveryPromise = this.interruptCurrentTask({ silent: true })
+      .catch((error) => {
+        logger.warn('界面.启动.残留任务清理_失败', { error: String(error) }, LogCategory.UI);
+      })
+      .finally(() => {
+        this.startupRecoveryPromise = null;
+      });
 
     // 🔧 启动时进行真正的 LLM 连接测试（替代浅层检查）
     // 使用 sendWorkerStatus(true) 强制检测所有模型连接状态
@@ -1037,6 +1045,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 处理 Webview 消息 */
   private async handleMessage(message: WebviewToExtensionMessage): Promise<void> {
     logger.info('界面.Webview.消息.收到', { type: message.type }, LogCategory.UI);
+
+    // 启动恢复栅栏：优先完成残留运行态清理，再处理任意前端请求。
+    if (this.startupRecoveryPromise) {
+      await this.startupRecoveryPromise;
+    }
 
     // Handler 委派：Config / MCP / Skills / Knowledge
     for (const handler of this.commandHandlers) {
@@ -2511,8 +2524,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }));
     }
 
-    this.assertValidArray<any>(tasks, 'uiState.tasks');
-    const currentTask = tasks.find(t => t?.status === 'running') ?? tasks[tasks.length - 1];
+    const engineRunning = this.orchestratorEngine.running;
+    const displayTasks = engineRunning
+      ? tasks
+      : tasks.map((task) => task?.status === 'running' ? { ...task, status: 'cancelled' as const } : task);
+
+    this.assertValidArray<any>(displayTasks, 'uiState.tasks');
+    const currentTask = engineRunning
+      ? (displayTasks.find(t => t?.status === 'running') ?? displayTasks[displayTasks.length - 1])
+      : displayTasks[displayTasks.length - 1];
 
     // 使用轻量级的会话元数据（而不是完整会话数据）
     const sessionMetas = this.sessionManager.getSessionMetas();
@@ -2526,7 +2546,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       enabled: true,
     }));
 
-    const isRunning = currentTask?.status === 'running' || this.orchestratorEngine.running;
+    const isRunning = engineRunning;
     const pendingChanges = this.snapshotManager.getPendingChanges();
     this.assertValidArray<any>(pendingChanges, 'uiState.pendingChanges');
     const logs = this.logs;
@@ -2536,7 +2556,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       currentSessionId: this.activeSessionId ?? currentSession?.id,
       sessions: sessionMetas,
       currentTask,
-      tasks,
+      tasks: displayTasks,
       workerStatuses,
       pendingChanges,
       isRunning,
