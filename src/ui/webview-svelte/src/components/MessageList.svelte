@@ -97,6 +97,14 @@
   // - worker: 当前请求级别（同一次请求内跨多轮不重置）
   // 仅当「当前无流式消息卡片」时显示，避免与卡片内流式动画重复导致视觉留白
   const hasStreamingMessage = $derived(safeMessages.some((m) => m.isStreaming));
+  const latestStreamingMessageId = $derived.by(() => {
+    for (let i = safeMessages.length - 1; i >= 0; i--) {
+      if (safeMessages[i]?.isStreaming) {
+        return safeMessages[i].id;
+      }
+    }
+    return null;
+  });
 
   // 防抖：hasStreamingMessage 变 false 后延迟 300ms 再显示底部指示器，
   // 避免工具调用间隙短暂 isStreaming=false 导致指示器闪烁产生空白
@@ -258,7 +266,12 @@
       </div>
     {:else}
       {#each safeMessages as message (getMessageKey(message))}
-        <MessageItem {message} {readOnly} {displayContext} />
+        <MessageItem
+          {message}
+          {readOnly}
+          {displayContext}
+          showStreamingIndicator={message.id === latestStreamingMessageId}
+        />
       {/each}
       <!-- 对话级处理指示器：无流式消息但仍在处理中时显示 -->
       {#if showProcessingIndicator}

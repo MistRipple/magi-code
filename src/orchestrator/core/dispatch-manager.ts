@@ -85,6 +85,7 @@ export interface DispatchManagerDeps {
   getActiveUserPrompt: () => string;
   getActiveImagePaths: () => string[] | undefined;
   getCurrentSessionId: () => string | undefined;
+  getMissionIdsBySession: (sessionId: string) => Promise<string[]>;
   ensureMissionForDispatch: () => Promise<string>;
   getProjectKnowledgeBase: () => import('../../knowledge/project-knowledge-base').ProjectKnowledgeBase | undefined;
   // 治理依赖（WorkerPipeline 使用）
@@ -777,7 +778,11 @@ export class DispatchManager {
           }
         }
 
-        const todoManager = this.deps.getTodoManager();
+        let todoManager = this.deps.getTodoManager();
+        if (!todoManager) {
+          await this.deps.missionOrchestrator.ensureTodoManagerInitialized();
+          todoManager = this.deps.getTodoManager();
+        }
         if (!todoManager) {
           return {
             success: false,
@@ -811,42 +816,110 @@ export class DispatchManager {
       },
 
       getTodos: async (params) => {
-        const todoManager = this.deps.getTodoManager();
+        let todoManager = this.deps.getTodoManager();
+        if (!todoManager) {
+          await this.deps.missionOrchestrator.ensureTodoManagerInitialized();
+          todoManager = this.deps.getTodoManager();
+        }
         if (!todoManager) {
           throw new Error('TodoManager 未初始化，无法获取 Todos');
         }
 
-        // Orchestrator 允许不传 callerContext（查看全盘或指定 missionId），Worker 必须传
-        const missionId = params.callerContext?.missionId || params.missionId;
-        const assignmentId = params.callerContext?.assignmentId;
+        const explicitMissionId = params.missionId?.trim();
+        const explicitSessionId = params.sessionId?.trim();
+        const callerMissionId = params.callerContext?.missionId?.trim();
+        const callerWorkerId = params.callerContext?.workerId?.trim();
+        const isOrchestratorCaller = !callerWorkerId || callerWorkerId === 'orchestrator';
+        const statusFilter = params.status as any;
 
-        if (!missionId) {
-          throw new Error('必须提供 missionId 或有效的 callerContext');
+        const extractSessionId = (scopedMissionId?: string): string | undefined => {
+          if (!scopedMissionId || !scopedMissionId.startsWith('session:')) {
+            return undefined;
+          }
+          const sessionId = scopedMissionId.slice('session:'.length).trim();
+          return sessionId || undefined;
+        };
+
+        const resolveConcreteMissionId = (missionLikeId?: string): string | undefined => {
+          if (!missionLikeId || missionLikeId.startsWith('session:')) {
+            return undefined;
+          }
+          return missionLikeId;
+        };
+
+        const concreteMissionId = resolveConcreteMissionId(explicitMissionId)
+          || resolveConcreteMissionId(callerMissionId);
+        if (concreteMissionId) {
+          const assignmentId = isOrchestratorCaller ? undefined : params.callerContext?.assignmentId;
+          return await todoManager.query({
+            missionId: concreteMissionId,
+            assignmentId,
+            status: statusFilter,
+          });
         }
 
-        return await todoManager.query({
-          missionId,
-          assignmentId,
-          status: params.status as any
-        });
+        if (!isOrchestratorCaller) {
+          throw new Error('Worker 缺少有效 mission 上下文，无法查询 Todos');
+        }
+
+        const sessionId = explicitSessionId
+          || extractSessionId(explicitMissionId)
+          || extractSessionId(callerMissionId)
+          || this.deps.getCurrentSessionId();
+        if (!sessionId) {
+          throw new Error('未找到可查询的 session，请显式传入 mission_id 或 session_id');
+        }
+
+        const missionIds = (await this.deps.getMissionIdsBySession(sessionId))
+          .map(id => id?.trim())
+          .filter((id): id is string => Boolean(id));
+        if (missionIds.length === 0) {
+          return [];
+        }
+
+        const uniqueMissionIds = Array.from(new Set(missionIds));
+        const todosByMission = await Promise.all(
+          uniqueMissionIds.map(async (missionId, missionOrder) => {
+            const todos = await todoManager.query({ missionId, status: statusFilter });
+            return todos.map(todo => ({ missionOrder, todo }));
+          })
+        );
+
+        return todosByMission
+          .flat()
+          .sort((a, b) => {
+            if (a.missionOrder !== b.missionOrder) {
+              return a.missionOrder - b.missionOrder;
+            }
+            const aCreatedAt = typeof a.todo.createdAt === 'number' ? a.todo.createdAt : 0;
+            const bCreatedAt = typeof b.todo.createdAt === 'number' ? b.todo.createdAt : 0;
+            return aCreatedAt - bCreatedAt;
+          })
+          .map(item => item.todo);
       },
 
       updateTodo: async (params) => {
-        const todoManager = this.deps.getTodoManager();
+        let todoManager = this.deps.getTodoManager();
+        if (!todoManager) {
+          await this.deps.missionOrchestrator.ensureTodoManagerInitialized();
+          todoManager = this.deps.getTodoManager();
+        }
         if (!todoManager) {
           return { success: false, error: 'TodoManager 未初始化，无法更新 Todo' };
         }
 
         try {
-          // 参数基础校验
-          if (!params.todoId) {
-            return { success: false, error: '缺少必须参数: todoId' };
-          }
-          if (!params.updates || Object.keys(params.updates).length === 0) {
+          if (!params.updates || params.updates.length === 0) {
             return { success: false, error: '缺少有效的更新内容(updates)' };
           }
 
-          await todoManager.update(params.todoId, params.updates);
+          for (const update of params.updates) {
+            if (!update.todoId) continue;
+            const updatesPayload: any = {};
+            if (update.status !== undefined) updatesPayload.status = update.status;
+            if (update.content !== undefined) updatesPayload.content = update.content;
+            await todoManager.update(update.todoId, updatesPayload);
+          }
           return { success: true };
         } catch (error: any) {
           return { success: false, error: error.message };

@@ -187,16 +187,17 @@ export type SplitTodoHandler = (params: {
  */
 export type GetTodosHandler = (params: {
   missionId?: string;
+  sessionId?: string;
   status?: string[];
-  callerContext?: Pick<SplitTodoCallerContext, 'missionId' | 'assignmentId'>;
+  callerContext?: Pick<SplitTodoCallerContext, 'missionId' | 'assignmentId' | 'workerId'>;
 }) => Promise<any[]>;
 
 export type UpdateTodoHandler = (params: {
-  todoId: string;
-  updates: {
+  updates: Array<{
+    todoId: string;
     status?: string;
     content?: string;
-  };
+  }>;
 }) => Promise<{ success: boolean; error?: string }>;
 
 export class OrchestrationExecutor {
@@ -339,92 +340,174 @@ export class OrchestrationExecutor {
     const categoryEnum = this.getCategoryEnum();
     const mappingDesc = this.getCategoryMappingDescription();
 
+    const taskItemProperties: Record<string, any> = {
+      task_name: {
+        type: 'string',
+        description: '标准的工程化任务名称，简短概括任务内容（例如：重构用户登录模块，修复导航栏溢出 Bug 等），不要照抄用户原始对话。'
+      },
+      category: {
+        type: 'string',
+        ...(categoryEnum.length > 0 ? { enum: categoryEnum } : {}),
+        description: `任务分类（决定执行 Worker 的唯一依据）。分工映射：${mappingDesc || '未配置'}`,
+      },
+      goal: {
+        type: 'string',
+        description: '任务目标（Goal）：要达成的业务结果',
+      },
+      acceptance: {
+        type: 'array',
+        items: { type: 'string' },
+        description: '验收标准（Acceptance）：明确完成判定条件，至少 1 条',
+      },
+      constraints: {
+        type: 'array',
+        items: { type: 'string' },
+        description: '约束条件（Constraints）：必须遵守的规则，至少 1 条',
+      },
+      context: {
+        type: 'array',
+        items: { type: 'string' },
+        description: '任务上下文（Context）：已知事实、线索、关联信息，至少 1 条',
+      },
+      requires_modification: {
+        type: 'boolean',
+        description: '是否要求该任务对目标文件产生实际修改。只读分析/统计/总结任务必须传 false；功能开发/修复/重构任务传 true。',
+      },
+      scope_hint: {
+        type: 'array',
+        items: { type: 'string' },
+        description: '范围线索（非硬约束）。建议提供优先关注的文件/目录，Worker 可在执行中自然扩展。',
+      },
+      files: {
+        type: 'array',
+        items: { type: 'string' },
+        description: '严格目标文件（可选）。仅在确需限定目标文件时提供；否则建议使用 scope_hint。',
+      },
+      depends_on: {
+        type: 'array',
+        items: { type: 'string' },
+        description: '依赖的前序任务 task_id 列表。被依赖的任务完成后本任务才会执行，可通过 SharedContextPool 获取前序任务的输出上下文',
+      },
+      contracts: {
+        type: 'object',
+        description: '协作契约（L3 任务可选）：接口约定、冻结区域、生产/消费契约标识',
+        properties: {
+          producer_contracts: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '当前任务产出的契约标识',
+          },
+          consumer_contracts: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '当前任务依赖的契约标识',
+          },
+          interface_contracts: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '接口约定文本（签名、字段、路径等）',
+          },
+          freeze_files: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '冻结文件列表：本任务不得修改这些文件',
+          },
+        },
+      },
+    };
+
     return {
       name: 'dispatch_task',
-      description: '将子任务分配给专业 AI Worker 执行。通过 category 参数指定任务分类，系统自动路由到对应 Worker。Worker 将自主完成任务并在主对话区回传执行进度和结果。',
+      description: '向一个或多个专业 AI Worker 派发任务。支持一次性派发多个任务以实现并行处理。通过 category 参数指定任务分类，系统自动路由到对应 Worker。',
       input_schema: {
         type: 'object',
         properties: {
-          task_name: {
-            type: 'string',
-            description: '标准的工程化任务名称，简短概括任务内容（例如：重构用户登录模块，修复导航栏溢出 Bug 等），不要照抄用户原始对话。'
-          },
-          category: {
-            type: 'string',
-            ...(categoryEnum.length > 0 ? { enum: categoryEnum } : {}),
-            description: `任务分类（决定执行 Worker 的唯一依据）。分工映射：${mappingDesc || '未配置'}`,
-          },
-          goal: {
-            type: 'string',
-            description: '任务目标（Goal）：要达成的业务结果',
-          },
-          acceptance: {
+          tasks: {
             type: 'array',
-            items: { type: 'string' },
-            description: '验收标准（Acceptance）：明确完成判定条件，至少 1 条',
-          },
-          constraints: {
-            type: 'array',
-            items: { type: 'string' },
-            description: '约束条件（Constraints）：必须遵守的规则，至少 1 条',
-          },
-          context: {
-            type: 'array',
-            items: { type: 'string' },
-            description: '任务上下文（Context）：已知事实、线索、关联信息，至少 1 条',
-          },
-          requires_modification: {
-            type: 'boolean',
-            description: '是否要求该任务对目标文件产生实际修改。只读分析/统计/总结任务必须传 false；功能开发/修复/重构任务传 true。',
-          },
-          scope_hint: {
-            type: 'array',
-            items: { type: 'string' },
-            description: '范围线索（非硬约束）。建议提供优先关注的文件/目录，Worker 可在执行中自然扩展。',
-          },
-          files: {
-            type: 'array',
-            items: { type: 'string' },
-            description: '严格目标文件（可选）。仅在确需限定目标文件时提供；否则建议使用 scope_hint。',
-          },
-          depends_on: {
-            type: 'array',
-            items: { type: 'string' },
-            description: '依赖的前序任务 task_id 列表。被依赖的任务完成后本任务才会执行，可通过 SharedContextPool 获取前序任务的输出上下文',
-          },
-          contracts: {
-            type: 'object',
-            description: '协作契约（L3 任务可选）：接口约定、冻结区域、生产/消费契约标识',
-            properties: {
-              producer_contracts: {
-                type: 'array',
-                items: { type: 'string' },
-                description: '当前任务产出的契约标识',
-              },
-              consumer_contracts: {
-                type: 'array',
-                items: { type: 'string' },
-                description: '当前任务依赖的契约标识',
-              },
-              interface_contracts: {
-                type: 'array',
-                items: { type: 'string' },
-                description: '接口约定文本（签名、字段、路径等）',
-              },
-              freeze_files: {
-                type: 'array',
-                items: { type: 'string' },
-                description: '冻结文件列表：本任务不得修改这些文件',
-              },
+            description: '待派发的任务列表（至少 1 个）。每个任务将独立路由到对应 Worker 并行执行。',
+            items: {
+              type: 'object',
+              properties: taskItemProperties,
+              required: ['task_name', 'category', 'goal', 'acceptance', 'constraints', 'context', 'requires_modification'],
             },
           },
         },
-        required: ['task_name', 'category', 'goal', 'acceptance', 'constraints', 'context', 'requires_modification'],
+        required: ['tasks'],
       },
       metadata: {
         source: 'builtin',
         category: 'orchestration',
         tags: ['orchestration', 'worker', 'dispatch'],
+      },
+    };
+  }
+
+  /**
+   * 验证单个任务参数，返回规范化后的 handler 入参或错误描述
+   */
+  private validateSingleTaskArgs(
+    task: Record<string, any>,
+    index: number,
+  ): { ok: true; params: Parameters<DispatchTaskHandler>[0] } | { ok: false; error: string } {
+    const prefix = `tasks[${index}]`;
+
+    if (!task.task_name || typeof task.task_name !== 'string' || !task.task_name.trim()) {
+      return { ok: false, error: `${prefix}: task_name 是必填参数` };
+    }
+    if (!task.category || typeof task.category !== 'string' || !task.category.trim()) {
+      const validCategories = this.getCategoryEnum();
+      return { ok: false, error: `${prefix}: category 是必填参数。可选值: ${validCategories.join(', ')}` };
+    }
+    if (!task.goal || typeof task.goal !== 'string' || !task.goal.trim()) {
+      return { ok: false, error: `${prefix}: goal 是必填参数` };
+    }
+
+    const acceptanceValidation = this.normalizeStringArray(task.acceptance, `${prefix}.acceptance`, true);
+    if (!acceptanceValidation.ok) return acceptanceValidation;
+
+    const constraintsValidation = this.normalizeStringArray(task.constraints, `${prefix}.constraints`, true);
+    if (!constraintsValidation.ok) return constraintsValidation;
+
+    const contextValidation = this.normalizeStringArray(task.context, `${prefix}.context`, true);
+    if (!contextValidation.ok) return contextValidation;
+
+    if (typeof task.requires_modification !== 'boolean') {
+      return { ok: false, error: `${prefix}: requires_modification 是必填布尔参数（true/false）` };
+    }
+
+    const scopeHintValidation = this.normalizeStringArray(task.scope_hint, `${prefix}.scope_hint`, false);
+    if (!scopeHintValidation.ok) return scopeHintValidation;
+
+    const filesValidation = this.normalizeStringArray(task.files, `${prefix}.files`, false);
+    if (!filesValidation.ok) return filesValidation;
+
+    const dependsOnValidation = this.normalizeStringArray(task.depends_on, `${prefix}.depends_on`, false);
+    if (!dependsOnValidation.ok) return dependsOnValidation;
+
+    const contractsValidation = this.normalizeContracts(task.contracts);
+    if (!contractsValidation.ok) return contractsValidation;
+
+    const category = task.category.trim();
+    const validCategories = this.getCategoryEnum();
+    if (validCategories.length > 0 && !validCategories.includes(category)) {
+      return { ok: false, error: `${prefix}: 未知分类 "${category}"。可选值: ${validCategories.join(', ')}` };
+    }
+
+    return {
+      ok: true,
+      params: {
+        worker: 'auto',
+        category,
+        requiresModification: task.requires_modification,
+        task_name: task.task_name.trim(),
+        goal: task.goal.trim(),
+        acceptance: acceptanceValidation.value,
+        constraints: constraintsValidation.value,
+        context: contextValidation.value,
+        scopeHint: scopeHintValidation.value.length > 0 ? scopeHintValidation.value : undefined,
+        files: filesValidation.value.length > 0 ? filesValidation.value : undefined,
+        dependsOn: dependsOnValidation.value.length > 0 ? dependsOnValidation.value : undefined,
+        contracts: contractsValidation.value,
       },
     };
   }
@@ -438,159 +521,50 @@ export class OrchestrationExecutor {
       };
     }
 
-    const args = toolCall.arguments as {
-      task_name?: string;
-      category?: string;
-      goal?: string;
-      acceptance?: string[];
-      constraints?: string[];
-      context?: string[];
-      requires_modification?: boolean;
-      scope_hint?: string[];
-      files?: string[];
-      depends_on?: string[];
-      contracts?: DispatchTaskCollaborationContracts;
-    };
+    const args = toolCall.arguments as { tasks?: Record<string, any>[] };
 
-    // 结构化合同字段必填
-    if (!args.task_name || typeof args.task_name !== 'string' || !args.task_name.trim()) {
+    if (!Array.isArray(args.tasks) || args.tasks.length === 0) {
       return {
         toolCallId: toolCall.id,
-        content: 'Error: task_name 是必填参数，表示简短的工程化任务名称',
-        isError: true,
-      };
-    }
-    if (!args.category || typeof args.category !== 'string' || !args.category.trim()) {
-      const validCategories = this.getCategoryEnum();
-      return {
-        toolCallId: toolCall.id,
-        content: `Error: category 是必填参数。可选值: ${validCategories.join(', ')}`,
-        isError: true,
-      };
-    }
-    if (!args.goal || typeof args.goal !== 'string' || !args.goal.trim()) {
-      return {
-        toolCallId: toolCall.id,
-        content: 'Error: goal 是必填参数，表示任务目标',
+        content: 'Error: tasks 必须是至少包含 1 个元素的数组',
         isError: true,
       };
     }
 
-    const acceptanceValidation = this.normalizeStringArray(args.acceptance, 'acceptance', true);
-    if (!acceptanceValidation.ok) {
-      return {
-        toolCallId: toolCall.id,
-        content: `Error: ${acceptanceValidation.error}`,
-        isError: true,
-      };
+    // 阶段 1：全量验证（任一任务校验失败则整批拒绝，避免部分派发）
+    const validatedParams: Parameters<DispatchTaskHandler>[0][] = [];
+    for (let i = 0; i < args.tasks.length; i++) {
+      const validation = this.validateSingleTaskArgs(args.tasks[i], i);
+      if (!validation.ok) {
+        return {
+          toolCallId: toolCall.id,
+          content: `Error: ${validation.error}`,
+          isError: true,
+        };
+      }
+      validatedParams.push(validation.params);
     }
 
-    const constraintsValidation = this.normalizeStringArray(args.constraints, 'constraints', true);
-    if (!constraintsValidation.ok) {
-      return {
-        toolCallId: toolCall.id,
-        content: `Error: ${constraintsValidation.error}`,
-        isError: true,
-      };
-    }
-
-    const contextValidation = this.normalizeStringArray(args.context, 'context', true);
-    if (!contextValidation.ok) {
-      return {
-        toolCallId: toolCall.id,
-        content: `Error: ${contextValidation.error}`,
-        isError: true,
-      };
-    }
-
-    if (typeof args.requires_modification !== 'boolean') {
-      return {
-        toolCallId: toolCall.id,
-        content: 'Error: requires_modification 是必填布尔参数（true/false）',
-        isError: true,
-      };
-    }
-
-    const scopeHintValidation = this.normalizeStringArray(args.scope_hint, 'scope_hint', false);
-    if (!scopeHintValidation.ok) {
-      return {
-        toolCallId: toolCall.id,
-        content: `Error: ${scopeHintValidation.error}`,
-        isError: true,
-      };
-    }
-
-    const filesValidation = this.normalizeStringArray(args.files, 'files', false);
-    if (!filesValidation.ok) {
-      return {
-        toolCallId: toolCall.id,
-        content: `Error: ${filesValidation.error}`,
-        isError: true,
-      };
-    }
-
-    const dependsOnValidation = this.normalizeStringArray(args.depends_on, 'depends_on', false);
-    if (!dependsOnValidation.ok) {
-      return {
-        toolCallId: toolCall.id,
-        content: `Error: ${dependsOnValidation.error}`,
-        isError: true,
-      };
-    }
-
-    const contractsValidation = this.normalizeContracts(args.contracts);
-    if (!contractsValidation.ok) {
-      return {
-        toolCallId: toolCall.id,
-        content: `Error: ${contractsValidation.error}`,
-        isError: true,
-      };
-    }
-
-    const category = args.category.trim();
-
-    // 验证 category 在已知枚举内
-    const validCategories = this.getCategoryEnum();
-    if (validCategories.length > 0 && !validCategories.includes(category)) {
-      return {
-        toolCallId: toolCall.id,
-        content: `Error: 未知分类 "${category}"。可选值: ${validCategories.join(', ')}`,
-        isError: true,
-      };
-    }
-
-    logger.info('dispatch_task 开始', {
-      category,
-      requiresModification: args.requires_modification,
-      scopeHintCount: scopeHintValidation.value.length,
-      goalPreview: args.goal.substring(0, 80),
-      files: filesValidation.value,
-      dependsOn: dependsOnValidation.value,
+    logger.info('dispatch_task 开始批量派发', {
+      taskCount: validatedParams.length,
+      categories: validatedParams.map(p => p.category),
+      taskNames: validatedParams.map(p => p.task_name),
     }, LogCategory.TOOLS);
 
+    // 阶段 2：并行派发所有任务
     try {
-      const result = await this.dispatchHandler({
-        worker: 'auto',
-        category,
-        requiresModification: args.requires_modification,
-        task_name: args.task_name.trim(),
-        goal: args.goal.trim(),
-        acceptance: acceptanceValidation.value,
-        constraints: constraintsValidation.value,
-        context: contextValidation.value,
-        scopeHint: scopeHintValidation.value.length > 0 ? scopeHintValidation.value : undefined,
-        files: filesValidation.value.length > 0 ? filesValidation.value : undefined,
-        dependsOn: dependsOnValidation.value.length > 0 ? dependsOnValidation.value : undefined,
-        contracts: contractsValidation.value,
-      });
+      const results = await Promise.all(
+        validatedParams.map(params => this.dispatchHandler!(params))
+      );
 
+      const hasFailure = results.some(r => r.status === 'failed');
       return {
         toolCallId: toolCall.id,
-        content: JSON.stringify(result),
-        isError: result.status === 'failed',
+        content: JSON.stringify({ results }),
+        isError: hasFailure,
       };
     } catch (error: any) {
-      logger.error('dispatch_task 执行失败', { error: error.message }, LogCategory.TOOLS);
+      logger.error('dispatch_task 批量执行失败', { error: error.message }, LogCategory.TOOLS);
       return {
         toolCallId: toolCall.id,
         content: `dispatch_task failed: ${error.message}`,
@@ -969,13 +943,17 @@ export class OrchestrationExecutor {
   private getGetTodosDefinition(): ExtendedToolDefinition {
     return {
       name: 'get_todos',
-      description: '获取当前任务(Mission)的所有 Todo 列表。用于查看当前任务进度和状态。',
+      description: '获取 Todo 列表。支持按 mission 查询；未指定 mission_id 时，编排者默认查询当前会话全部任务的 Todos。',
       input_schema: {
         type: 'object',
         properties: {
           mission_id: {
             type: 'string',
-            description: '可选：指定 mission_id（编排者查询时使用）'
+            description: '可选：按 mission_id 精确查询'
+          },
+          session_id: {
+            type: 'string',
+            description: '可选：按 session_id 聚合查询该会话下所有 mission 的 Todos（编排者场景）'
           },
           status: {
             type: 'array',
@@ -1003,18 +981,25 @@ export class OrchestrationExecutor {
         isError: true,
       };
     }
-    const args = toolCall.arguments as { status?: string[]; mission_id?: string };
+    const args = toolCall.arguments as { status?: string[]; mission_id?: string; session_id?: string };
     try {
       const todos = await this.getTodosHandler({
         status: args.status,
         missionId: args.mission_id,
+        sessionId: args.session_id,
         callerContext: callerContext
-          ? { missionId: callerContext.missionId, assignmentId: callerContext.assignmentId }
+          ? {
+            missionId: callerContext.missionId,
+            assignmentId: callerContext.assignmentId,
+            workerId: callerContext.workerId,
+          }
           : undefined,
       });
       // 提炼核心字段，避免返回过多无关信息导致 token 爆炸
       const summary = todos.map(t => ({
         id: t.id,
+        missionId: t.missionId,
+        assignmentId: t.assignmentId,
         content: t.content,
         status: t.status,
         worker: t.workerId
@@ -1040,15 +1025,25 @@ export class OrchestrationExecutor {
   private getUpdateTodoDefinition(): ExtendedToolDefinition {
     return {
       name: 'update_todo',
-      description: '更新一个现有的 Todo 的状态或内容（如手动标记为跳过）。',
+      description: '批量更新现有 Todo 的状态或内容（如手动标记为跳过）。',
       input_schema: {
         type: 'object',
         properties: {
-          todo_id: { type: 'string', description: '待更新的 Todo ID' },
-          status: { type: 'string', enum: ['pending', 'skipped', 'completed'], description: '更改状态（如强制跳过则设为 skipped）' },
-          content: { type: 'string', description: '更新任务描述' }
+          updates: {
+            type: 'array',
+            description: '包含要更新的 Todo 列表',
+            items: {
+              type: 'object',
+              properties: {
+                todo_id: { type: 'string', description: '待更新的 Todo ID' },
+                status: { type: 'string', enum: ['pending', 'skipped', 'completed'], description: '更改状态（如强制跳过则设为 skipped）' },
+                content: { type: 'string', description: '更新任务描述' }
+              },
+              required: ['todo_id']
+            }
+          }
         },
-        required: ['todo_id']
+        required: ['updates']
       },
       metadata: {
         source: 'builtin',
@@ -1066,11 +1061,22 @@ export class OrchestrationExecutor {
         isError: true,
       };
     }
-    const args = toolCall.arguments as { todo_id: string; status?: string; content?: string };
+    const args = toolCall.arguments as { updates: Array<{ todo_id: string; status?: string; content?: string }> };
     try {
+      if (!args.updates || !Array.isArray(args.updates)) {
+        return {
+          toolCallId: toolCall.id,
+          content: 'Error: updates 必须是数组',
+          isError: true,
+        };
+      }
+      const formattedUpdates = args.updates.map(u => ({
+        todoId: u.todo_id,
+        status: u.status,
+        content: u.content
+      }));
       const result = await this.updateTodoHandler({
-        todoId: args.todo_id,
-        updates: { status: args.status, content: args.content }
+        updates: formattedUpdates
       });
       return {
         toolCallId: toolCall.id,

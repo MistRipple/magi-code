@@ -33,6 +33,12 @@ const FUZZY_SEARCH_WINDOW = 30;
 /** 探针回退上下文行数（目标行号上下各 20 行） */
 const PROBE_CONTEXT_LINES = 20;
 
+/** 写入后等待最终内容稳定的最大轮次 */
+const POST_WRITE_SETTLE_MAX_ATTEMPTS = 6;
+
+/** 写入后每轮重读间隔（ms） */
+const POST_WRITE_SETTLE_DELAY_MS = 120;
+
 /** 单条替换条目 */
 interface EditEntry {
   index: number;
@@ -68,6 +74,16 @@ interface ReplaceResult {
   error?: string;
   newStrStartLine?: number;  // 0-based
   newStrEndLine?: number;    // 0-based
+  numLinesDiff?: number;
+}
+
+/** 成功替换条目的结构化结果（用于写入后统一重算） */
+interface SuccessfulReplaceEntry {
+  index: number;
+  message: string;
+  newStrStartLine: number;
+  newStrEndLine: number;
+  numLinesDiff: number;
 }
 
 /** 批量编辑 JSON 文件中的单个文件条目 */
@@ -1033,6 +1049,7 @@ IMPORTANT:
     // 逐条执行替换，累积内容变更
     const originalContent = content;
     const results: string[] = [];
+    const successfulEntries: SuccessfulReplaceEntry[] = [];
     let hasError = false;
 
     for (const entry of sorted) {
@@ -1044,24 +1061,20 @@ IMPORTANT:
       }
       content = result.newContent!;
 
-      // 生成包含代码片段的成功消息
-      let successMsg = result.message || 'OK';
-      if (result.newStrStartLine !== undefined && result.newStrEndLine !== undefined) {
-        const snippetLines = content.split('\n');
-        const snippetStart = Math.max(0, result.newStrStartLine);
-        const snippetEnd = Math.min(snippetLines.length, result.newStrEndLine + 1);
-        const snippet = snippetLines.slice(snippetStart, snippetEnd);
-        const maxSnippetLines = 20;
-        const truncated = snippet.length > maxSnippetLines;
-        const displaySnippet = truncated ? snippet.slice(0, maxSnippetLines) : snippet;
-        const numberedSnippet = displaySnippet
-          .map((line, i) => `${snippetStart + i + 1}\t${line}`)
-          .join('\n');
-
-        successMsg += `\nnew_str starts at line ${result.newStrStartLine + 1} and ends at line ${result.newStrEndLine + 1}.`;
-        successMsg += `\n\nSnippet of edited section:\n${numberedSnippet}`;
-        if (truncated) successMsg += `\n... (${snippet.length - maxSnippetLines} more lines)`;
-      }
+      const successEntry: SuccessfulReplaceEntry = {
+        index: entry.index,
+        message: result.message || 'OK',
+        newStrStartLine: result.newStrStartLine!,
+        newStrEndLine: result.newStrEndLine!,
+        numLinesDiff: result.numLinesDiff ?? 0,
+      };
+      successfulEntries.push(successEntry);
+      const successMsg = this.buildEditSuccessMessage(
+        successEntry.message,
+        content,
+        successEntry.newStrStartLine,
+        successEntry.newStrEndLine
+      );
       results.push(`Entry #${entry.index}: ${successMsg}`);
     }
 
@@ -1077,19 +1090,30 @@ IMPORTANT:
 
     // 通过 WorkspaceEdit 写入（进入 VSCode 原生撤销栈）
     await this.writeFileViaWorkspaceEdit(filePath, content);
+    const finalContent = await this.readSettledFileContent(filePath, content);
+    this.rebaseSuccessfulEntries(successfulEntries, content, finalContent);
 
     logger.info('File edited (file_edit)', {
       path: filePath,
       entryCount: entries.length,
+      changedAfterWrite: finalContent !== content,
     }, LogCategory.TOOLS);
 
-    const fileChange = this.buildFileChangeMetadata(originalContent, content, filePath, 'modify');
+    const fileChange = this.buildFileChangeMetadata(originalContent, finalContent, filePath, 'modify');
+    const finalResultMessages = successfulEntries.map(entry =>
+      `Entry #${entry.index}: ${this.buildEditSuccessMessage(
+        entry.message,
+        finalContent,
+        entry.newStrStartLine,
+        entry.newStrEndLine
+      )}`
+    );
 
     // 单条时简化输出
     if (entries.length === 1) {
       return {
         toolCallId,
-        content: results[0].replace(/^Entry #\d+: /, ''),
+        content: finalResultMessages[0].replace(/^Entry #\d+: /, ''),
         isError: false,
         fileChange,
       };
@@ -1097,10 +1121,211 @@ IMPORTANT:
 
     return {
       toolCallId,
-      content: `OK: ${entries.length} replacements applied.\n${results.join('\n')}`,
+      content: `OK: ${entries.length} replacements applied.\n${finalResultMessages.join('\n')}`,
       isError: false,
       fileChange,
     };
+  }
+
+  /**
+   * 构建替换成功消息（基于最终内容输出准确行号与片段）
+   */
+  private buildEditSuccessMessage(
+    baseMessage: string,
+    content: string,
+    startLine: number,
+    endLine: number
+  ): string {
+    const lines = content.split('\n');
+    if (lines.length === 0) {
+      return baseMessage;
+    }
+
+    const safeStart = Math.max(0, Math.min(startLine, lines.length - 1));
+    const safeEnd = Math.max(safeStart, Math.min(endLine, lines.length - 1));
+    const snippet = lines.slice(safeStart, safeEnd + 1);
+    const maxSnippetLines = 20;
+    const truncated = snippet.length > maxSnippetLines;
+    const displaySnippet = truncated ? snippet.slice(0, maxSnippetLines) : snippet;
+    const numberedSnippet = displaySnippet
+      .map((line, i) => `${safeStart + i + 1}\t${line}`)
+      .join('\n');
+
+    let message = baseMessage;
+    message += `\nnew_str starts at line ${safeStart + 1} and ends at line ${safeEnd + 1}.`;
+    message += `\n\nSnippet of edited section:\n${numberedSnippet}`;
+    if (truncated) {
+      message += `\n... (${snippet.length - maxSnippetLines} more lines)`;
+    }
+    return message;
+  }
+
+  /**
+   * 写入后等待文件内容稳定，获取最终状态（覆盖 format-on-save 异步改写）
+   */
+  private async readSettledFileContent(filePath: string, writtenContent: string): Promise<string> {
+    let lastContent = writtenContent;
+    let stableRounds = 0;
+
+    for (let i = 0; i < POST_WRITE_SETTLE_MAX_ATTEMPTS; i++) {
+      await this.delay(POST_WRITE_SETTLE_DELAY_MS);
+      let current: string;
+      try {
+        current = await this.readFileContent(filePath);
+      } catch {
+        return lastContent;
+      }
+      if (current === lastContent) {
+        stableRounds += 1;
+        if (stableRounds >= 2) {
+          return current;
+        }
+      } else {
+        lastContent = current;
+        stableRounds = 0;
+      }
+    }
+
+    return lastContent;
+  }
+
+  private async delay(ms: number): Promise<void> {
+    await new Promise<void>(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * 将成功替换条目重映射到最终文件状态：
+   * 1) 先按行号升序做多条编辑 line-shift 对齐
+   * 2) 再基于最终内容做行号映射（处理格式化导致的偏移）
+   */
+  private rebaseSuccessfulEntries(
+    entries: SuccessfulReplaceEntry[],
+    beforeExternalChanges: string,
+    finalContent: string
+  ): void {
+    if (entries.length === 0) {
+      return;
+    }
+
+    const sortedByLine = [...entries].sort((a, b) => a.newStrStartLine - b.newStrStartLine);
+    let lineShift = 0;
+    for (const entry of sortedByLine) {
+      entry.newStrStartLine += lineShift;
+      entry.newStrEndLine += lineShift;
+      lineShift += entry.numLinesDiff;
+    }
+
+    if (beforeExternalChanges === finalContent) {
+      return;
+    }
+
+    const beforeLines = beforeExternalChanges.split('\n');
+    const afterLines = finalContent.split('\n');
+    const lineMap = this.buildLooseLineMap(beforeLines, afterLines);
+
+    for (const entry of entries) {
+      const mappedStart = this.remapLineNumber(entry.newStrStartLine, lineMap, beforeLines, afterLines);
+      const mappedEnd = this.remapLineNumber(entry.newStrEndLine, lineMap, beforeLines, afterLines);
+      entry.newStrStartLine = Math.min(mappedStart, mappedEnd);
+      entry.newStrEndLine = Math.max(mappedStart, mappedEnd);
+    }
+  }
+
+  /**
+   * 构建宽松行映射（忽略前后空白，保持单调递增）
+   */
+  private buildLooseLineMap(beforeLines: string[], afterLines: string[]): number[] {
+    const normalize = (line: string) => line.trim();
+    const linePositions = new Map<string, number[]>();
+
+    for (let i = 0; i < afterLines.length; i++) {
+      const key = normalize(afterLines[i]);
+      const positions = linePositions.get(key);
+      if (positions) {
+        positions.push(i);
+      } else {
+        linePositions.set(key, [i]);
+      }
+    }
+
+    const map = new Array<number>(beforeLines.length).fill(-1);
+    const keyCursor = new Map<string, number>();
+    let lastMatched = -1;
+
+    for (let i = 0; i < beforeLines.length; i++) {
+      const key = normalize(beforeLines[i]);
+      const positions = linePositions.get(key);
+      if (!positions || positions.length === 0) {
+        continue;
+      }
+
+      let cursor = keyCursor.get(key) ?? 0;
+      while (cursor < positions.length && positions[cursor] <= lastMatched) {
+        cursor++;
+      }
+      if (cursor >= positions.length) {
+        continue;
+      }
+
+      const matched = positions[cursor];
+      map[i] = matched;
+      keyCursor.set(key, cursor + 1);
+      lastMatched = matched;
+    }
+
+    return map;
+  }
+
+  /**
+   * 将单行号映射到最终内容，未命中时使用邻近锚点 + 相似度窗口兜底
+   */
+  private remapLineNumber(
+    targetLine: number,
+    lineMap: number[],
+    beforeLines: string[],
+    afterLines: string[]
+  ): number {
+    if (afterLines.length === 0) {
+      return 0;
+    }
+    if (beforeLines.length === 0) {
+      return Math.max(0, Math.min(targetLine, afterLines.length - 1));
+    }
+
+    const clamped = Math.max(0, Math.min(targetLine, beforeLines.length - 1));
+    if (lineMap[clamped] !== -1) {
+      return lineMap[clamped];
+    }
+
+    for (let offset = 1; offset < beforeLines.length; offset++) {
+      const upper = clamped - offset;
+      if (upper >= 0 && lineMap[upper] !== -1) {
+        return Math.max(0, Math.min(lineMap[upper] + offset, afterLines.length - 1));
+      }
+      const lower = clamped + offset;
+      if (lower < beforeLines.length && lineMap[lower] !== -1) {
+        return Math.max(0, Math.min(lineMap[lower] - offset, afterLines.length - 1));
+      }
+    }
+
+    const approximate = Math.max(0, Math.min(clamped, afterLines.length - 1));
+    const sourceLine = beforeLines[clamped];
+    let bestLine = approximate;
+    let bestScore = this.computeLineSimilarity(sourceLine, afterLines[approximate]);
+
+    const window = 20;
+    const start = Math.max(0, approximate - window);
+    const end = Math.min(afterLines.length - 1, approximate + window);
+
+    for (let i = start; i <= end; i++) {
+      const score = this.computeLineSimilarity(sourceLine, afterLines[i]);
+      if (score > bestScore) {
+        bestScore = score;
+        bestLine = i;
+      }
+    }
+
+    return bestLine;
   }
 
   /**
@@ -1147,7 +1372,8 @@ IMPORTANT:
           newContent: newStr,
           message: 'OK (empty file replaced)',
           newStrStartLine: 0,
-          newStrEndLine: Math.max(0, newStrLines.length - 1)
+          newStrEndLine: Math.max(0, newStrLines.length - 1),
+          numLinesDiff: Math.max(0, newStrLines.length - 1),
         };
       }
       return { error: 'old_str is empty, which is only allowed when the file is empty or contains only whitespace.' };
@@ -1271,12 +1497,15 @@ IMPORTANT:
 
     const newStrStartLine = replaceStartLine;
     const newStrEndLine = replaceStartLine + newStrLines.length - 1;
+    const replacedLineCount = replaceEndLine - replaceStartLine + 1;
+    const numLinesDiff = newStrLines.length - replacedLineCount;
 
     return {
       newContent,
       message,
       newStrStartLine,
-      newStrEndLine
+      newStrEndLine,
+      numLinesDiff,
     };
   }
 
@@ -1409,15 +1638,17 @@ IMPORTANT:
     } else {
       await this.writeFileViaWorkspaceEdit(filePath, currentContent);
     }
+    const finalContent = await this.readSettledFileContent(filePath, currentContent);
 
     logger.info('File edited (file_insert)', {
       path: filePath,
       entries: entries.length,
-      errors: errors.length
+      errors: errors.length,
+      changedAfterWrite: finalContent !== currentContent,
     }, LogCategory.TOOLS);
 
     // 10. 构建响应（包含代码片段）
-    const finalLines = currentContent.split('\n');
+    const finalLines = finalContent.split('\n');
     const successResults = results.filter(r => !r.isError);
     let responseMsg = successResults.map(r => r.message).join('\n');
 
@@ -1448,7 +1679,7 @@ IMPORTANT:
       toolCallId,
       content: responseMsg,
       isError: false,
-      fileChange: this.buildFileChangeMetadata(normalized, currentContent, filePath, 'modify'),
+      fileChange: this.buildFileChangeMetadata(normalized, finalContent, filePath, 'modify'),
     };
   }
 

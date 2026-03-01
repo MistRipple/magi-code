@@ -210,6 +210,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private readonly authStatusKey = 'magi.loggedIn';
   private loginInFlight = false;
   private startupRecoveryPromise: Promise<void> | null = null;
+  private runtimeInitializationPromise: Promise<void>;
+  private runtimeInitializationError: string | null = null;
 
   // CommandHandler 委派
   private readonly commandHandlers: CommandHandler[];
@@ -279,15 +281,22 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 注入 SnapshotManager 到 ToolManager（确保工具级文件写入自动创建快照）
     (this.adapterFactory as LLMAdapterFactory).getToolManager().setSnapshotManager(this.snapshotManager);
 
-    // 异步初始化 profile loader（在 MessageHub 注入之后）
-    void (this.adapterFactory as LLMAdapterFactory).initialize().catch(err => {
+    // 异步初始化运行时（AdapterFactory + OrchestratorEngine）并建立统一门闩
+    const adapterFactoryInit = (this.adapterFactory as LLMAdapterFactory).initialize().catch(err => {
       logger.error('Failed to initialize LLM adapter factory', { error: err.message }, LogCategory.LLM);
+      throw err;
     });
-
-    // 初始化编排引擎
-    void this.orchestratorEngine.initialize().catch(err => {
+    const orchestratorEngineInit = this.orchestratorEngine.initialize().catch(err => {
       logger.error('Failed to initialize orchestrator engine', { error: err.message }, LogCategory.ORCHESTRATOR);
+      throw err;
     });
+    this.runtimeInitializationPromise = Promise.all([adapterFactoryInit, orchestratorEngineInit])
+      .then(() => {
+        this.runtimeInitializationError = null;
+      })
+      .catch((error) => {
+        this.runtimeInitializationError = error instanceof Error ? error.message : String(error);
+      });
 
     this.interactionModeUpdatedAt = Date.now();
 
@@ -1051,6 +1060,24 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       await this.startupRecoveryPromise;
     }
 
+    // 运行时初始化门闩：执行型请求必须等待 Adapter/Engine 初始化完成。
+    if (this.shouldAwaitRuntimeInitialization(message.type)) {
+      try {
+        await this.ensureRuntimeInitialized();
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        logger.error('界面.运行时.初始化门闩_失败', {
+          type: message.type,
+          error: errorMsg,
+        }, LogCategory.UI);
+        if (message.type === 'executeTask' && message.requestId) {
+          this.messageHub.taskRejected(message.requestId, errorMsg);
+        }
+        this.sendToast(`系统初始化失败：${errorMsg}`, 'error');
+        return;
+      }
+    }
+
     // Handler 委派：Config / MCP / Skills / Knowledge
     for (const handler of this.commandHandlers) {
       if (handler.supportedTypes.has(message.type)) {
@@ -1340,6 +1367,31 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         // 在新标签页打开 Mermaid 图表
         this.handleOpenMermaidPanel(message.code, message.title);
         break;
+    }
+  }
+
+  private shouldAwaitRuntimeInitialization(messageType: WebviewToExtensionMessage['type']): boolean {
+    switch (messageType) {
+      case 'getState':
+      case 'requestState':
+      case 'webviewReady':
+      case 'login':
+      case 'logout':
+      case 'getStatus':
+      case 'uiError':
+      case 'openFile':
+      case 'openLink':
+      case 'saveCurrentSession':
+        return false;
+      default:
+        return true;
+    }
+  }
+
+  private async ensureRuntimeInitialized(): Promise<void> {
+    await this.runtimeInitializationPromise;
+    if (this.runtimeInitializationError) {
+      throw new Error(this.runtimeInitializationError);
     }
   }
 
