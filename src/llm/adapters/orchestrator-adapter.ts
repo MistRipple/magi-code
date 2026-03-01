@@ -540,12 +540,13 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     // 添加用户消息到历史
     history.push(this.buildUserMessage(message, images));
 
+    const ORCHESTRATOR_HIDDEN_TOOLS = ['split_todo'];
     const tools = await this.toolManager.getTools();
     const toolDefinitions = tools.map((tool) => ({
       name: tool.name,
       description: tool.description,
       input_schema: tool.input_schema,
-    }));
+    })).filter(tool => !ORCHESTRATOR_HIDDEN_TOOLS.includes(tool.name));
 
     // 每轮 LLM 调用独立一个 stream，确保时间轴正确：
     // 当轮 stream 内包含 thinking + text + tool_call + tool_result，
@@ -598,11 +599,14 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         };
 
         let accumulatedText = '';
+        let hasStreamedTextDelta = false;
         let toolCalls: ToolCall[] = [];
 
         try {
           const response = await this.client.streamMessage(params, (chunk) => {
             if (chunk.type === 'content_delta' && chunk.content) {
+              this.normalizer.processTextDelta(streamId, chunk.content);
+              hasStreamedTextDelta = true;
               accumulatedText += chunk.content;
             } else if (chunk.type === 'thinking' && chunk.thinking) {
               this.normalizer.processThinking(streamId, chunk.thinking);
@@ -618,11 +622,14 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           }
 
           const assistantText = accumulatedText || response.content || '';
+          if (assistantText && !hasStreamedTextDelta) {
+            // 兜底：部分 provider 可能仅在最终响应体返回文本，未逐块回调 content_delta。
+            this.normalizer.processTextDelta(streamId, assistantText);
+          }
 
           // 无工具调用 → 收敛
           if (toolCalls.length === 0) {
-            if (assistantText) {
-              this.normalizer.processTextDelta(streamId, assistantText);
+            if (assistantText && !hasStreamedTextDelta) {
               this.emit('message', assistantText);
             }
             history.push({ role: 'assistant', content: assistantText });

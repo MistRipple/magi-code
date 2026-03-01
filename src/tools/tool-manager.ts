@@ -405,6 +405,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     'file_create',
     'file_edit',
     'file_insert',
+    'file_bulk_edit',
     'file_remove',
     'grep_search',
     'web_search',
@@ -432,6 +433,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     ['file-create', 'file_create'],
     ['file-edit', 'file_edit'],
     ['file-insert', 'file_insert'],
+    ['file-bulk-edit', 'file_bulk_edit'],
     ['file-remove', 'file_remove'],
     ['grep-search', 'grep_search'],
     ['web-search', 'web_search'],
@@ -441,6 +443,9 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     ['dispatch-task', 'dispatch_task'],
     ['send-worker-message', 'send_worker_message'],
     ['wait-for-workers', 'wait_for_workers'],
+    ['split-todo', 'split_todo'],
+    ['get-todos', 'get_todos'],
+    ['update-todo', 'update_todo'],
   ]);
 
   /**
@@ -454,6 +459,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     'file_create',
     'file_edit',
     'file_insert',
+    'file_bulk_edit',
     'file_remove',
   ]);
 
@@ -542,6 +548,14 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         // 执行 MCP 工具
         if (toolDef.metadata.source === 'mcp') {
           return finalize(await this.executeMCPTool(normalizedToolCall, toolDef, signal));
+        }
+
+        // 执行内置工具（按定义来源兜底分发，避免白名单漂移导致误判）
+        if (toolDef.metadata.source === 'builtin') {
+          const builtinCall = toolDef.name === normalizedToolCall.name
+            ? normalizedToolCall
+            : { ...normalizedToolCall, name: toolDef.name };
+          return finalize(await this.executeBuiltinTool(builtinCall, signal));
         }
 
         // 执行 Skill 工具
@@ -753,6 +767,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       case 'file_create':
       case 'file_edit':
       case 'file_insert':
+      case 'file_bulk_edit':
         return await this.fileExecutor.execute(toolCall);
 
       case 'grep_search':
@@ -848,7 +863,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     }
 
     // Edit/Write 工具需要 allowEdit 权限
-    if (toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit' || toolName === 'file_create' || toolName === 'file_edit' || toolName === 'file_insert' || toolName === 'file_remove') {
+    if (toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit' || toolName === 'file_create' || toolName === 'file_edit' || toolName === 'file_insert' || toolName === 'file_bulk_edit' || toolName === 'file_remove') {
       if (!this.permissions.allowEdit) {
         return { allowed: false, reason: 'File editing is disabled' };
       }
@@ -948,6 +963,14 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
     const orchestrationToolNames = ['dispatch_task', 'send_worker_message', 'wait_for_workers'];
     const workerOnlyToolNames = ['split_todo'];
+    const hideOrchestrationTools = role === 'worker' && excludeOrch;
+    const hideWorkerOnlyTools = role === 'orchestrator';
+    const builtinTools = tools.filter(t =>
+      t.metadata?.source === 'builtin' &&
+      (!hideOrchestrationTools || !orchestrationToolNames.includes(t.name)) &&
+      (!hideWorkerOnlyTools || !workerOnlyToolNames.includes(t.name))
+    );
+    const visibleBuiltinToolNames = new Set(builtinTools.map(t => t.name));
 
     // 内置工具描述映射（中文用途说明）
     const builtinToolDescriptions: Record<string, { category: string; desc: string }> = {
@@ -967,6 +990,8 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       'codebase_retrieval': { category: '代码智能', desc: '语义搜索代码库' },
       'mermaid_diagram': { category: '可视化', desc: '生成 Mermaid 图表' },
       'split_todo': { category: '任务管理', desc: '将当前任务拆分为多个子步骤' },
+      'get_todos': { category: '任务管理', desc: '查看当前任务的 Todo 列表' },
+      'update_todo': { category: '任务管理', desc: '更新 Todo 状态或内容' },
     };
 
     // 编排者专用的附加说明
@@ -984,7 +1009,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     const categoryOrder = ['文件操作', '终端命令', '网络工具', '代码智能', '可视化', '任务管理'];
     for (const category of categoryOrder) {
       const categoryTools = Object.entries(builtinToolDescriptions)
-        .filter(([, v]) => v.category === category);
+        .filter(([name, v]) => v.category === category && visibleBuiltinToolNames.has(name));
       if (categoryTools.length > 0) {
         const toolList = categoryTools.map(([name, v]) => {
           const note = role === 'orchestrator' ? (orchestratorNotes[name] || '') : '';
@@ -995,11 +1020,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     }
 
     // 动态发现新增的未映射内置工具
-    const builtinTools = tools.filter(t =>
-      t.metadata?.source === 'builtin' &&
-      (!excludeOrch || !orchestrationToolNames.includes(t.name)) &&
-      (excludeOrch || !workerOnlyToolNames.includes(t.name))
-    );
     const unmappedTools = builtinTools.filter(t => !builtinToolDescriptions[t.name]);
     for (const tool of unmappedTools) {
       const desc = tool.description ? tool.description.split(/[。\n]/)[0].substring(0, 60) : '';

@@ -211,6 +211,10 @@ export class MissionDrivenEngine extends EventEmitter {
       getActiveUserPrompt: () => this.activeUserPrompt,
       getActiveImagePaths: () => this.activeImagePaths,
       getCurrentSessionId: () => this.currentSessionId,
+      getMissionIdsBySession: async (sessionId: string) => {
+        const missions = await this.missionStorage.listBySession(sessionId);
+        return missions.map(mission => mission.id);
+      },
       ensureMissionForDispatch: async () => this.ensureMissionForDispatch(),
       getProjectKnowledgeBase: () => this.projectKnowledgeBase,
       recordOrchestratorTokens: (usage, phase) => this.recordOrchestratorTokens(usage, phase),
@@ -353,6 +357,9 @@ export class MissionDrivenEngine extends EventEmitter {
     }
 
     await configureResilientCompressor(this.contextManager, this.executionStats);
+
+    // 提前初始化 TodoManager，避免首次调用 get_todos/update_todo 时命中“未初始化”
+    await this.missionOrchestrator.ensureTodoManagerInitialized();
 
     // 注入编排工具的回调处理器
     this.dispatchManager.setupOrchestrationToolHandlers();

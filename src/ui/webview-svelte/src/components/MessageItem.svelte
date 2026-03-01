@@ -14,8 +14,15 @@
     readOnly?: boolean;
     /** 显示上下文：thread=主对话区, worker=Worker面板 */
     displayContext?: 'thread' | 'worker';
+    /** 是否允许渲染底部流式三点（仅最后一条流式消息启用） */
+    showStreamingIndicator?: boolean;
   }
-  let { message, readOnly = false, displayContext = 'thread' }: Props = $props();
+  let {
+    message,
+    readOnly = false,
+    displayContext = 'thread',
+    showStreamingIndicator = true,
+  }: Props = $props();
 
   // 派生状态
   const isUser = $derived(message.type === 'user_input');
@@ -190,11 +197,13 @@
     <div class="message-content">
       {#if isPlaceholder}
         <div class="placeholder-content">
-          <div class="streaming-indicator-bottom">
-            <span class="streaming-dot"></span>
-            <span class="streaming-dot"></span>
-            <span class="streaming-dot"></span>
-          </div>
+          {#if showStreamingIndicator}
+            <div class="streaming-indicator-bottom">
+              <span class="streaming-dot"></span>
+              <span class="streaming-dot"></span>
+              <span class="streaming-dot"></span>
+            </div>
+          {/if}
         </div>
       {:else}
         {#if isInteraction && interactionMeta?.prompt}
@@ -213,7 +222,7 @@
           {/if}
 
           <!-- 只要处于流式接收状态，就应该在最底部渲染跳动的加载点，不论是否有内容 -->
-          {#if isStreaming}
+          {#if isStreaming && showStreamingIndicator}
             <div class="streaming-indicator-bottom fallback" class:has-content={hasVisibleContent}>
               <span class="streaming-dot"></span>
               <span class="streaming-dot"></span>
@@ -271,11 +280,13 @@
     <div class="message-content">
       {#if isPlaceholder}
         <div class="placeholder-content">
-          <div class="streaming-indicator-bottom">
-            <span class="streaming-dot"></span>
-            <span class="streaming-dot"></span>
-            <span class="streaming-dot"></span>
-          </div>
+          {#if showStreamingIndicator}
+            <div class="streaming-indicator-bottom">
+              <span class="streaming-dot"></span>
+              <span class="streaming-dot"></span>
+              <span class="streaming-dot"></span>
+            </div>
+          {/if}
         </div>
       {:else}
         {#if isInteraction && interactionMeta?.prompt}
@@ -291,7 +302,7 @@
             {/each}
           {:else if message.content}
             <MarkdownContent content={message.content} {isStreaming} />
-          {:else if isStreaming}
+          {:else if isStreaming && showStreamingIndicator}
             <div class="streaming-indicator-bottom fallback">
               <span class="streaming-dot"></span>
               <span class="streaming-dot"></span>

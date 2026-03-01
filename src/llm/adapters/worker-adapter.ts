@@ -262,8 +262,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       }
     }
 
-    // 获取工具定义（Worker 过滤掉编排工具，编排权限仅属于 Orchestrator）
-    const ORCHESTRATION_TOOLS = ['dispatch_task', 'send_worker_message'];
+    // 获取工具定义（Worker 过滤掉编排者专用调度工具）
+    const ORCHESTRATION_TOOLS = ['dispatch_task', 'send_worker_message', 'wait_for_workers'];
     const tools = await this.toolManager.getTools();
     const toolDefinitions = tools
       .filter((tool) => !ORCHESTRATION_TOOLS.includes(tool.name))
@@ -355,11 +355,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         };
 
         let accumulatedText = '';
+        let hasStreamedTextDelta = false;
         let toolCalls: ToolCall[] = [];
 
         try {
           const response = await this.client.streamMessage(params, (chunk) => {
             if (chunk.type === 'content_delta' && chunk.content) {
+              this.normalizer.processTextDelta(streamId, chunk.content);
+              hasStreamedTextDelta = true;
               if (this.seenThinking && !this.decisionHookAppliedForThinking) {
                 this.decisionHookAppliedForThinking = true;
                 this.applyDecisionHook({ type: 'thinking' });
@@ -385,11 +388,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           }
 
           const assistantText = accumulatedText || response.content || '';
+          if (assistantText && !hasStreamedTextDelta) {
+            // 兜底：部分 provider 可能仅在最终响应体返回文本，未逐块回调 content_delta。
+            this.normalizer.processTextDelta(streamId, assistantText);
+          }
 
           // 无工具调用 → 收敛
           if (toolCalls.length === 0) {
-            if (assistantText) {
-              this.normalizer.processTextDelta(streamId, assistantText);
+            if (assistantText && !hasStreamedTextDelta) {
               this.emit('message', assistantText);
             }
             this.conversationHistory.push({ role: 'assistant', content: assistantText });

@@ -75,6 +75,7 @@ export class MissionOrchestrator extends EventEmitter {
   // Worker 管理
   private workers: Map<WorkerSlot, AutonomousWorker> = new Map();
   private todoManager?: TodoManager;
+  private todoManagerInitPromise?: Promise<TodoManager>;
   private currentMissionId: string | null = null;
 
   constructor(
@@ -128,32 +129,58 @@ export class MissionOrchestrator extends EventEmitter {
   // ============================================================================
 
   /**
+   * 确保 TodoManager 已初始化（独立于 Worker 生命周期）
+   */
+  async ensureTodoManagerInitialized(): Promise<TodoManager> {
+    if (this.todoManager) {
+      return this.todoManager;
+    }
+    if (this.todoManagerInitPromise) {
+      return this.todoManagerInitPromise;
+    }
+    if (!this.workspaceRoot) {
+      throw new Error('未配置 workspaceRoot，无法初始化 TodoManager');
+    }
+
+    this.todoManagerInitPromise = (async () => {
+      const manager = new TodoManager(this.workspaceRoot!);
+      await manager.initialize();
+      this.todoManager = manager;
+      logger.info('编排器.TodoManager.已初始化', {
+        workspaceRoot: this.workspaceRoot,
+      }, LogCategory.ORCHESTRATOR);
+      return manager;
+    })();
+
+    try {
+      return await this.todoManagerInitPromise;
+    } catch (error) {
+      this.todoManagerInitPromise = undefined;
+      this.todoManager = undefined;
+      throw error;
+    }
+  }
+
+  /**
    * 确保 Worker 存在（懒加载创建）
    */
   private async ensureWorker(workerSlot: WorkerSlot): Promise<AutonomousWorker> {
     let worker = this.workers.get(workerSlot);
     if (!worker) {
       // 确保 TodoManager 存在
-      if (!this.todoManager && this.workspaceRoot) {
-        try {
-          this.todoManager = new TodoManager(this.workspaceRoot);
-          await this.todoManager.initialize();
-          logger.info('编排器.TodoManager.已初始化', {
-            workspaceRoot: this.workspaceRoot,
-            forWorker: workerSlot,
-          }, LogCategory.ORCHESTRATOR);
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          logger.error('编排器.TodoManager.初始化失败', {
-            error: errorMessage,
-            workspaceRoot: this.workspaceRoot,
-            workerSlot,
-          }, LogCategory.ORCHESTRATOR);
-          throw new Error(`初始化 TodoManager 失败 (workspace: ${this.workspaceRoot}, worker: ${workerSlot}): ${errorMessage}`);
-        }
+      try {
+        await this.ensureTodoManagerInitialized();
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger.error('编排器.TodoManager.初始化失败', {
+          error: errorMessage,
+          workspaceRoot: this.workspaceRoot,
+          workerSlot,
+        }, LogCategory.ORCHESTRATOR);
+        throw new Error(`初始化 TodoManager 失败 (workspace: ${this.workspaceRoot}, worker: ${workerSlot}): ${errorMessage}`);
       }
       if (!this.todoManager) {
-        throw new Error('未配置 TodoManager，无法创建 Worker');
+        throw new Error('TodoManager 初始化后仍不可用');
       }
       // 确保 ContextManager 存在以获取共享上下文依赖
       const sharedContextDeps = {
