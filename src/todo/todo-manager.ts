@@ -244,7 +244,11 @@ export class TodoManager extends EventEmitter {
     const todo = await this.get(todoId);
     if (!todo) throw new Error(`Todo not found: ${todoId}`);
 
-    Object.assign(todo, updates);
+    // 过滤 undefined 字段，防止 Object.assign 用 undefined 覆写已有数据
+    const cleanUpdates = Object.fromEntries(
+      Object.entries(updates).filter(([_, v]) => v !== undefined)
+    );
+    Object.assign(todo, cleanUpdates);
     await this.repository.save(todo);
   }
 

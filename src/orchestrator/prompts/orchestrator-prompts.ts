@@ -18,6 +18,8 @@ import type { DispatchEntry } from '../core/dispatch-batch';
  * 统一系统提示词上下文
  */
 export interface UnifiedPromptContext {
+  /** 当前工作区根目录绝对路径（注入到系统提示词，防止大模型猜测路径） */
+  workspaceRoot?: string;
   /** 可用 Worker 列表 */
   availableWorkers: WorkerSlot[];
   /** Worker 画像（动态来源于 ProfileLoader） */
@@ -69,8 +71,10 @@ export function buildUnifiedSystemPrompt(context: UnifiedPromptContext): string 
   // 角色定义
   sections.push(`你是 Magi，一个能协调多个专业 AI 协作完成复杂开发任务的编程助手。
 
-## 身份
+## 身份与环境
 - 你运行在 VSCode 插件中，拥有完整的文件系统和终端访问能力
+- **当前工作区根目录 (Workspace Root) 绝对路径：${context.workspaceRoot || '未知'}**
+- 🔴 极重要警告：当使用任何需要 \`project_root_path\` 或绝对路径的 MCP 工具（如 \`mcp__mcp_router__search_context\`）时，**必须且只能**使用上述的工作区绝对路径！绝对禁止猜想、捏造或使用其他路径！
 - 你可以直接回答问题、使用工具操作代码、或将复杂任务分配给专业 Worker
 - 你的回答应当简洁、专业、直接`);
 

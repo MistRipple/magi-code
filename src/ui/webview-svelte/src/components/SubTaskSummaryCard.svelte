@@ -471,6 +471,7 @@
     font-size: var(--text-sm);
     color: var(--foreground);
     line-height: 1.5;
+    line-clamp: 2;
     display: -webkit-box;
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
@@ -587,6 +588,7 @@
 
   /* 错误信息 */
   .card-error {
+    line-clamp: 3;
     display: -webkit-box;
     -webkit-line-clamp: 3;
     -webkit-box-orient: vertical;

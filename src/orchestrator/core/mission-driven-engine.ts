@@ -492,6 +492,7 @@ export class MissionDrivenEngine extends EventEmitter {
         }
 
         let systemPrompt = buildUnifiedSystemPrompt({
+          workspaceRoot: this.workspaceRoot,
           availableWorkers,
           workerProfiles,
           projectContext,

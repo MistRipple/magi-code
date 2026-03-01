@@ -142,7 +142,7 @@
   });
 
   // 获取工具显示名
-  function getToolDisplayName(toolName: string, toolInput?: unknown): string {
+  function getToolDisplayName(toolName: string): string {
     if (!toolName || typeof toolName !== 'string') return 'tool';
 
     // 文件操作工具直接使用语义化显示名
@@ -220,7 +220,7 @@
   }
 
   const toolIcon = $derived(getToolIcon(name));
-  const toolDisplayName = $derived(getToolDisplayName(name, input));
+  const toolDisplayName = $derived(getToolDisplayName(name));
   const toolSummary = $derived(getToolSummary(name, input));
 
   // 判断输出内容是否包含 markdown 格式（标题、表格、列表等）

@@ -139,9 +139,11 @@ export class VSCodeTerminalExecutor {
 
   async launchProcess(options: LaunchProcessOptions, signal?: AbortSignal): Promise<LaunchProcessResult> {
     // 强制将 VSCode 内存中的脏文档落盘，防止终端进程读到磁盘上的旧快照
-    // 仅保存 file:// scheme 文档，跳过 untitled:/git:/output: 等虚拟文档
+    // 仅保存当前工作区内的 file:// scheme 文档，跳过虚拟文档及非工作区文件
     const dirtyDocs = vscode.workspace.textDocuments.filter(
-      doc => doc.isDirty && doc.uri.scheme === 'file'
+      doc => doc.isDirty
+        && doc.uri.scheme === 'file'
+        && vscode.workspace.getWorkspaceFolder(doc.uri) !== undefined
     );
     if (dirtyDocs.length > 0) {
       const results = await Promise.allSettled(dirtyDocs.map(doc => doc.save()));
@@ -877,21 +879,27 @@ export class VSCodeTerminalExecutor {
    * 验证命令是否安全
    *
    * 仅拦截系统安全级威胁（rm -rf /、fork bomb 等）。
-   * 文件操作不再拦截 — 大模型已通过系统提示词引导至 file_bulk_edit 黄金路径。
+   * 文件编辑场景允许通过脚本/命令执行，由上层流程自行约束与审计。
    */
   validateCommand(command: string): { valid: boolean; reason?: string } {
-    const dangerousPatterns = [
-      /rm\s+-rf\s+\//, // 删除根目录
-      /:\(\)\{.*\}/, // Fork bomb
-      />\s*\/dev\/sda/, // 写入磁盘设备
+    const dangerousRules: Array<{ pattern: RegExp; reason: string }> = [
+      {
+        pattern: /rm\s+-rf\s+\//,
+        reason: '命令包含系统级危险操作：删除根目录',
+      },
+      {
+        pattern: /:\(\)\{.*\}/,
+        reason: '命令包含系统级危险操作：fork bomb',
+      },
+      {
+        pattern: />\s*\/dev\/sda/,
+        reason: '命令包含系统级危险操作：写入磁盘设备',
+      },
     ];
 
-    for (const pattern of dangerousPatterns) {
-      if (pattern.test(command)) {
-        return {
-          valid: false,
-          reason: `命令包含危险模式: ${pattern}`,
-        };
+    for (const rule of dangerousRules) {
+      if (rule.pattern.test(command)) {
+        return { valid: false, reason: rule.reason };
       }
     }
 

@@ -79,23 +79,6 @@ export const messagesState = $state({
   } as AutoScrollConfig,
 });
 
-// 🔧 状态入口保留：沿用原有独立变量引用（Svelte 5 迁移中）
-// 这些变量现在指向 messagesState 的属性
-let currentTopTab = $derived(messagesState.currentTopTab);
-let currentBottomTab = $derived(messagesState.currentBottomTab);
-let threadMessages = $derived(messagesState.threadMessages);
-let agentOutputs = $derived(messagesState.agentOutputs);
-let sessions = $derived(messagesState.sessions);
-let currentSessionId = $derived(messagesState.currentSessionId);
-let isProcessing = $derived(messagesState.isProcessing);
-let backendProcessing = $derived(messagesState.backendProcessing);
-let activeMessageIds = $derived(messagesState.activeMessageIds);
-let pendingRequests = $derived(messagesState.pendingRequests);
-let thinkingStartAt = $derived(messagesState.thinkingStartAt);
-let processingActor = $derived(messagesState.processingActor);
-let scrollPositions = $derived(messagesState.scrollPositions);
-let autoScrollEnabled = $derived(messagesState.autoScrollEnabled);
-
 // 消息列表限制
 const MAX_THREAD_MESSAGES = 500;
 const MAX_AGENT_MESSAGES = 200;
@@ -555,7 +538,7 @@ export function setThinkingStartAt(value: number | null) {
 }
 
 export function setProcessingActor(source: string, agent?: string) {
-  processingActor = {
+  messagesState.processingActor = {
     source: source as ProcessingActor['source'],
     agent: (agent || 'claude') as ProcessingActor['agent'],
   };
@@ -746,7 +729,7 @@ export function sealAllStreamingMessages() {
 
 /** 获取后端处理状态（用于时序判断） */
 export function getBackendProcessing(): boolean {
-  return backendProcessing;
+  return messagesState.backendProcessing;
 }
 
 export function clearPendingInteractions() {
