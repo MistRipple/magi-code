@@ -307,6 +307,19 @@ export class UniversalLLMClient extends BaseLLMClient {
   }
 
   /**
+   * 判断是否为流式 chunk 的 JSON 解析错误。
+   *
+   * 兼容网关（国产模型伪装 OpenAI/Anthropic 格式）可能在 SSE data 中
+   * 返回尾部带多余字符的 JSON，导致 SDK 内部 JSON.parse 抛出
+   * "Unexpected non-whitespace character after JSON at position XX" 等异常。
+   * 此类错误属于单个 chunk 损坏，可安全跳过而非终止整个流。
+   */
+  private isChunkParseError(error: any): boolean {
+    const msg = String(error?.message || '');
+    return /unexpected.*after json|unexpected.*json|json.*position/i.test(msg);
+  }
+
+  /**
    * 400 工具不兼容容错（非流式）
    *
    * 渐进式降级策略：
@@ -803,12 +816,26 @@ export class UniversalLLMClient extends BaseLLMClient {
       }, LogCategory.LLM);
     }
 
-    const stream = this.anthropicClient.messages.stream(requestParams, {
-      signal: params.signal,
-    });
+    // 使用 messages.create(stream=true) 直接消费原始 SSE 事件。
+    // 不使用 messages.stream helper，避免其内部对 input_json_delta 的
+    // partial-json-parser 强制增量假设（某些兼容网关会发送 cumulative 片段，导致解析异常）。
+    const stream = await this.anthropicClient.messages.create(
+      {
+        ...requestParams,
+        stream: true,
+      } as any,
+      {
+        signal: params.signal,
+      }
+    ) as unknown as AsyncIterable<any>;
 
     let fullContent = '';
-    const toolCallBuffers = new Map<string, { id: string; name?: string; argumentsText: string }>();
+    const toolCallBuffers = new Map<string, {
+      id: string;
+      name?: string;
+      argumentsText: string;
+      argumentsDeltaMode: 'unknown' | 'delta' | 'cumulative';
+    }>();
     let usage: {
       inputTokens: number;
       outputTokens: number;
@@ -817,12 +844,32 @@ export class UniversalLLMClient extends BaseLLMClient {
     } = { inputTokens: 0, outputTokens: 0 };
     let stopReason: LLMResponse['stopReason'] = 'end_turn';
 
-    for await (const event of stream) {
+    // 手动控制 AsyncIterator 迭代，将 .next() 包裹在 try...catch 中。
+    // SDK 内部在迭代阶段（调用 .next() 解析 SSE 报文时）可能抛出 JSON 解析异常，
+    // for-await 的 try...catch 只能捕获循环体内的错误，无法拦截迭代阶段的异常。
+    const iterator = (stream as any)[Symbol.asyncIterator]();
+    while (true) {
+      let event: any;
+      try {
+        const result = await iterator.next();
+        if (result.done) break;
+        event = result.value;
+      } catch (iterError: any) {
+        if (this.isChunkParseError(iterError)) {
+          logger.warn('Anthropic stream chunk 底层解析失败，跳过此残片', {
+            model: this.config.model,
+            provider: this.config.provider,
+            error: iterError?.message?.substring(0, 200),
+          }, LogCategory.LLM);
+          continue;
+        }
+        throw iterError;
+      }
+
       if (event.type === 'content_block_start') {
         if (event.content_block.type === 'text') {
           onChunk({ type: 'content_start' });
         } else if (event.content_block.type === 'thinking') {
-          // Thinking block 开始
           onChunk({ type: 'thinking', thinking: '' });
         } else if (event.content_block.type === 'tool_use') {
           const toolId = event.content_block.id || '';
@@ -831,6 +878,7 @@ export class UniversalLLMClient extends BaseLLMClient {
               id: toolId,
               name: event.content_block.name,
               argumentsText: '',
+              argumentsDeltaMode: 'unknown',
             });
           }
           onChunk({
@@ -847,7 +895,6 @@ export class UniversalLLMClient extends BaseLLMClient {
           fullContent += event.delta.text;
           onChunk({ type: 'content_delta', content: event.delta.text });
         } else if (event.delta.type === 'thinking_delta') {
-          // Thinking delta - 发送 thinking 内容
           const thinkingContent = (event.delta as any).thinking || '';
           if (thinkingContent) {
             onChunk({ type: 'thinking', thinking: thinkingContent });
@@ -855,7 +902,14 @@ export class UniversalLLMClient extends BaseLLMClient {
         } else if (event.delta.type === 'input_json_delta') {
           const lastTool = [...toolCallBuffers.values()].slice(-1)[0];
           if (lastTool) {
-            lastTool.argumentsText += event.delta.partial_json || '';
+            const incomingArgs = event.delta.partial_json || '';
+            const normalizedArgs = this.normalizeStreamDelta(
+              incomingArgs,
+              lastTool.argumentsText,
+              lastTool.argumentsDeltaMode,
+            );
+            lastTool.argumentsDeltaMode = normalizedArgs.mode;
+            lastTool.argumentsText += normalizedArgs.delta;
           }
           let partialParsedArgs: Record<string, any> | undefined = undefined;
           if (lastTool?.argumentsText) {
@@ -1156,7 +1210,12 @@ export class UniversalLLMClient extends BaseLLMClient {
 
     let fullContent = '';
     let contentDeltaMode: 'unknown' | 'delta' | 'cumulative' = 'unknown';
-    const toolCallBuffers = new Map<string, { id: string; name?: string; argumentsText: string }>();
+    const toolCallBuffers = new Map<string, {
+      id: string;
+      name?: string;
+      argumentsText: string;
+      argumentsDeltaMode: 'unknown' | 'delta' | 'cumulative';
+    }>();
     const toolCallFallbackPrefix = `magi_call_${Date.now().toString(36)}`;
     let toolCallFallbackSeq = 0;
     const createFallbackToolCallId = () => `${toolCallFallbackPrefix}_${toolCallFallbackSeq++}`;
@@ -1166,7 +1225,28 @@ export class UniversalLLMClient extends BaseLLMClient {
     } = { inputTokens: 0, outputTokens: 0 };
     let stopReason: LLMResponse['stopReason'] = 'end_turn';
 
-    for await (const chunk of stream) {
+    // 手动控制 AsyncIterator 迭代，将 .next() 包裹在 try...catch 中。
+    // SDK 内部在迭代阶段（调用 .next() 解析 SSE 报文时）可能抛出 JSON 解析异常，
+    // for-await 的 try...catch 只能捕获循环体内的错误，无法拦截迭代阶段的异常。
+    const iterator = (stream as any)[Symbol.asyncIterator]();
+    while (true) {
+      let chunk: any;
+      try {
+        const result = await iterator.next();
+        if (result.done) break;
+        chunk = result.value;
+      } catch (iterError: any) {
+        if (this.isChunkParseError(iterError)) {
+          logger.warn('OpenAI stream chunk 底层解析失败，跳过此残片', {
+            model: this.config.model,
+            provider: this.config.provider,
+            error: iterError?.message?.substring(0, 200),
+          }, LogCategory.LLM);
+          continue;
+        }
+        throw iterError;
+      }
+
       const delta = chunk.choices[0]?.delta;
 
       // 处理推理模型的思考内容
@@ -1215,6 +1295,7 @@ export class UniversalLLMClient extends BaseLLMClient {
               id: stableToolCallId,
               name: toolCall.function?.name,
               argumentsText: '',
+              argumentsDeltaMode: 'unknown',
             });
           }
           const buffer = toolCallBuffers.get(bufferKey)!;
@@ -1223,9 +1304,22 @@ export class UniversalLLMClient extends BaseLLMClient {
           }
           const deltaArgs = (toolCall.function as any)?.arguments;
           if (typeof deltaArgs === 'string') {
-            buffer.argumentsText += deltaArgs;
+            const normalizedArgs = this.normalizeStreamDelta(
+              deltaArgs,
+              buffer.argumentsText,
+              buffer.argumentsDeltaMode,
+            );
+            buffer.argumentsDeltaMode = normalizedArgs.mode;
+            buffer.argumentsText += normalizedArgs.delta;
           } else if (deltaArgs !== undefined && deltaArgs !== null) {
-            buffer.argumentsText += JSON.stringify(deltaArgs);
+            const incomingArgs = JSON.stringify(deltaArgs);
+            const normalizedArgs = this.normalizeStreamDelta(
+              incomingArgs,
+              buffer.argumentsText,
+              buffer.argumentsDeltaMode,
+            );
+            buffer.argumentsDeltaMode = normalizedArgs.mode;
+            buffer.argumentsText += normalizedArgs.delta;
           }
           if (toolCall.function?.name) {
             onChunk({

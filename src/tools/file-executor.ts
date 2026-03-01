@@ -1,14 +1,19 @@
 /**
  * 文件执行器
- * 提供文件查看、创建、编辑、插入功能，拆分为四个独立工具
+ * 提供文件查看、创建、编辑、插入、批量编辑功能
+ *
+ * 读写层：优先使用 VSCode Document API，保证与编辑器状态同步
+ * 匹配层：精确匹配 → 缩进转换 → 空白规范化 → 模糊匹配 → 探针回退
  *
  * 工具:
  * - file_view: 查看文件内容或目录结构
  * - file_create: 创建或写入完整文件内容
- * - file_edit: 精确文本替换 / 撤销
+ * - file_edit: 文本替换（精确 + 模糊容错） / 撤销
  * - file_insert: 在指定行插入文本
+ * - file_bulk_edit: 批量跨文件替换（读取 JSON patch 文件，逐文件复用 executeStrReplace）
  */
 
+import * as vscode from 'vscode';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { ToolExecutor, ExtendedToolDefinition } from './types';
@@ -18,6 +23,15 @@ import { WorkspaceRoots } from '../workspace/workspace-roots';
 
 /** 行号误差容忍度（20%，对齐 Augment _lineNumberErrorTolerance） */
 const LINE_NUMBER_ERROR_TOLERANCE = 0.2;
+
+/** 模糊匹配相似度阈值（85%） */
+const FUZZY_MATCH_THRESHOLD = 0.85;
+
+/** 模糊匹配锚点搜索窗口（锚点上下各 30 行） */
+const FUZZY_SEARCH_WINDOW = 30;
+
+/** 探针回退上下文行数（目标行号上下各 20 行） */
+const PROBE_CONTEXT_LINES = 20;
 
 /** 单条替换条目 */
 interface EditEntry {
@@ -56,6 +70,17 @@ interface ReplaceResult {
   newStrEndLine?: number;    // 0-based
 }
 
+/** 批量编辑 JSON 文件中的单个文件条目 */
+interface BulkEditFileEntry {
+  path: string;
+  edits: Array<{
+    old_str: string;
+    new_str: string;
+    old_str_start_line?: number;
+    old_str_end_line?: number;
+  }>;
+}
+
 /**
  * 文件执行器
  */
@@ -87,6 +112,7 @@ export class FileExecutor implements ToolExecutor {
       this.getFileCreateDefinition(),
       this.getFileEditDefinition(),
       this.getFileInsertDefinition(),
+      this.getFileBulkEditDefinition(),
     ];
   }
 
@@ -320,6 +346,58 @@ IMPORTANT:
   }
 
   /**
+   * file_bulk_edit 工具定义
+   * 读取 JSON patch 文件，逐文件复用 executeStrReplace 执行批量跨文件替换
+   */
+  private getFileBulkEditDefinition(): ExtendedToolDefinition {
+    return {
+      name: 'file_bulk_edit',
+      description: `Apply bulk edits across multiple files from a JSON patch file.
+
+This tool reads a JSON file containing edit instructions for multiple files and applies them atomically per file using the same fuzzy-matching engine as file_edit.
+
+The JSON file must be an array of file entries:
+\`\`\`json
+[
+  {
+    "path": "/absolute/path/to/file.ts",
+    "edits": [
+      { "old_str": "original text", "new_str": "replacement text", "old_str_start_line": 10, "old_str_end_line": 12 }
+    ]
+  }
+]
+\`\`\`
+
+Each entry's edits follow the same rules as file_edit: old_str must match exactly, old_str_start_line/old_str_end_line are 1-based and optional but recommended for disambiguation.
+
+Usage:
+1. Use launch-process to run a script (Python/Bash) that computes the edits
+2. The script outputs the JSON patch file (e.g. /tmp/bulk_edits.json)
+3. Call file_bulk_edit with the path to that JSON file
+
+IMPORTANT:
+* The script must NOT modify source files directly
+* All file paths in the JSON must be absolute
+* Each file's edits are applied independently; a failure in one file does not block others`,
+      input_schema: {
+        type: 'object',
+        properties: {
+          edits_file: {
+            type: 'string',
+            description: 'Absolute path to the JSON patch file containing bulk edit instructions'
+          }
+        },
+        required: ['edits_file']
+      },
+      metadata: {
+        source: 'builtin',
+        category: 'file',
+        tags: ['file', 'edit', 'bulk', 'development']
+      }
+    };
+  }
+
+  /**
    * 获取所有工具（实现 ToolExecutor 接口）
    */
   async getTools(): Promise<ExtendedToolDefinition[]> {
@@ -330,13 +408,27 @@ IMPORTANT:
    * 检查工具是否可用
    */
   async isAvailable(toolName: string): Promise<boolean> {
-    return toolName === 'file_view' || toolName === 'file_create' || toolName === 'file_edit' || toolName === 'file_insert';
+    return toolName === 'file_view' || toolName === 'file_create' || toolName === 'file_edit' || toolName === 'file_insert' || toolName === 'file_bulk_edit';
   }
 
   /**
    * 执行工具调用
    */
   async execute(toolCall: ToolCall): Promise<ToolResult> {
+    // file_bulk_edit 使用 edits_file 而非 path，独立处理
+    if (toolCall.name === 'file_bulk_edit') {
+      const editsFile = (toolCall.arguments as any)?.edits_file as string;
+      if (!editsFile) {
+        return { toolCallId: toolCall.id, content: 'Error: edits_file is required', isError: true };
+      }
+      try {
+        return await this.executeBulkEdit(toolCall.id, editsFile);
+      } catch (error: any) {
+        logger.error('FileExecutor error', { tool: toolCall.name, error: error.message }, LogCategory.TOOLS);
+        return { toolCallId: toolCall.id, content: `Error: ${error.message}`, isError: true };
+      }
+    }
+
     const filePath = (toolCall.arguments as any)?.path as string;
 
     if (!filePath) {
@@ -456,8 +548,8 @@ IMPORTANT:
         };
       }
 
-      // 读取文件内容
-      const content = await fs.readFile(filePath, 'utf-8');
+      // 读取文件内容（通过 VSCode Document API 获取编辑器最新状态）
+      const content = await this.readFileContent(filePath);
       const lines = content.split('\n');
 
       // 如果有正则搜索，优先使用搜索模式
@@ -727,7 +819,8 @@ IMPORTANT:
   }
 
   /**
-   * 创建/写入文件内容（对齐 Augment save-file）
+   * 创建/写入文件内容
+   * 通过 WorkspaceEdit 创建，进入 VSCode 原生撤销栈
    */
   private async executeCreate(
     toolCallId: string,
@@ -741,17 +834,14 @@ IMPORTANT:
     // 读取原始内容（覆写场景用于 diff）
     let originalContent = '';
     try {
-      originalContent = await fs.readFile(filePath, 'utf-8');
+      originalContent = await this.readFileContent(filePath);
     } catch { /* 新建文件，原始内容为空 */ }
-
-    // 创建目录
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
 
     // 快照回调（覆写时保护原始内容）
     this.onBeforeWrite?.(filePath);
 
-    // 写入文件
-    await fs.writeFile(filePath, finalContent, 'utf-8');
+    // 通过 WorkspaceEdit 创建/覆写文件
+    await this.createFileViaWorkspaceEdit(filePath, finalContent);
 
     logger.info('File created via file_create', { path: filePath }, LogCategory.TOOLS);
 
@@ -822,20 +912,95 @@ IMPORTANT:
   }
 
   /**
+   * 执行批量跨文件编辑
+   * 读取 JSON patch 文件 → 逐文件解析 edits → 复用 executeStrReplace 执行替换
+   */
+  private async executeBulkEdit(toolCallId: string, editsFilePath: string): Promise<ToolResult> {
+    // 1. 读取并解析 JSON patch 文件
+    let rawContent: string;
+    try {
+      rawContent = await fs.readFile(editsFilePath, 'utf-8');
+    } catch (error: any) {
+      return { toolCallId, content: `Error: cannot read edits file: ${error.message}`, isError: true };
+    }
+
+    let fileEntries: BulkEditFileEntry[];
+    try {
+      fileEntries = JSON.parse(rawContent);
+    } catch (error: any) {
+      return { toolCallId, content: `Error: invalid JSON in edits file: ${error.message}`, isError: true };
+    }
+
+    if (!Array.isArray(fileEntries) || fileEntries.length === 0) {
+      return { toolCallId, content: 'Error: edits file must be a non-empty JSON array', isError: true };
+    }
+
+    // 2. 逐文件执行替换
+    const allResults: string[] = [];
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const fileEntry of fileEntries) {
+      if (!fileEntry.path || !Array.isArray(fileEntry.edits) || fileEntry.edits.length === 0) {
+        allResults.push(`[SKIP] Invalid entry (missing path or edits)`);
+        failCount++;
+        continue;
+      }
+
+      // 路径解析
+      const pathResolution = this.resolveWorkspacePath(fileEntry.path, true);
+      if (!pathResolution.absolutePath) {
+        allResults.push(`[FAIL] ${fileEntry.path}: ${pathResolution.error || 'path outside workspace'}`);
+        failCount++;
+        continue;
+      }
+      const resolvedPath = pathResolution.absolutePath;
+
+      // 将 BulkEditFileEntry.edits 转换为 EditEntry[]
+      const entries: EditEntry[] = fileEntry.edits.map((edit, idx) => ({
+        index: idx,
+        oldStr: edit.old_str,
+        newStr: edit.new_str,
+        startLine: edit.old_str_start_line,
+        endLine: edit.old_str_end_line,
+      }));
+
+      // 复用 executeStrReplace 执行替换
+      const result = await this.executeStrReplace(toolCallId, resolvedPath, entries);
+      const displayPath = this.workspaceRoots.toDisplayPath(resolvedPath);
+
+      if (result.isError) {
+        allResults.push(`[FAIL] ${displayPath}: ${result.content}`);
+        failCount++;
+      } else {
+        allResults.push(`[OK] ${displayPath}: ${entries.length} edit(s) applied`);
+        successCount++;
+      }
+    }
+
+    // 3. 汇总结果
+    const summary = `Bulk edit complete: ${successCount} file(s) succeeded, ${failCount} file(s) failed.`;
+    const content = summary + '\n\n' + allResults.join('\n');
+    const isError = successCount === 0 && failCount > 0;
+
+    return { toolCallId, content, isError };
+  }
+
+  /**
    * 执行多条替换（核心方法）
-   * 读文件一次 → 按 startLine 降序逐条替换 → 写文件一次
+   * 读文件一次 → 按 startLine 降序逐条替换 → 通过 WorkspaceEdit 写入
    */
   private async executeStrReplace(
     toolCallId: string,
     filePath: string,
     entries: EditEntry[]
   ): Promise<ToolResult> {
-    // 读文件
+    // 通过 VSCode Document API 读取（获取编辑器中最新状态）
     let content: string;
     try {
-      content = await fs.readFile(filePath, 'utf-8');
+      content = await this.readFileContent(filePath);
     } catch (error: any) {
-      if (error.code === 'ENOENT') {
+      if (error.code === 'ENOENT' || error.message?.includes('cannot open')) {
         const suggestions = await this.findSimilarFiles(filePath);
         let errorMsg = `Error: File not found: ${this.workspaceRoots.toDisplayPath(filePath)}`;
         if (suggestions.length > 0) {
@@ -866,7 +1031,7 @@ IMPORTANT:
     }
 
     // 逐条执行替换，累积内容变更
-    const originalContent = content; // 保留原始内容用于 diff 计算
+    const originalContent = content;
     const results: string[] = [];
     let hasError = false;
 
@@ -875,18 +1040,17 @@ IMPORTANT:
       if (result.error) {
         results.push(`Entry #${entry.index}: ${result.error}`);
         hasError = true;
-        break; // 遇到错误立即停止，不写入部分结果
+        break;
       }
       content = result.newContent!;
 
-      // 生成包含代码片段的成功消息（对齐 Augment 响应格式）
+      // 生成包含代码片段的成功消息
       let successMsg = result.message || 'OK';
       if (result.newStrStartLine !== undefined && result.newStrEndLine !== undefined) {
         const snippetLines = content.split('\n');
         const snippetStart = Math.max(0, result.newStrStartLine);
         const snippetEnd = Math.min(snippetLines.length, result.newStrEndLine + 1);
         const snippet = snippetLines.slice(snippetStart, snippetEnd);
-        // 限制代码片段行数，避免过长响应
         const maxSnippetLines = 20;
         const truncated = snippet.length > maxSnippetLines;
         const displaySnippet = truncated ? snippet.slice(0, maxSnippetLines) : snippet;
@@ -905,14 +1069,14 @@ IMPORTANT:
       return { toolCallId, content: results.join('\n'), isError: true };
     }
 
-    // 保存撤销信息
-    this.undoStack.set(filePath, await fs.readFile(filePath, 'utf-8'));
+    // 保存撤销信息（记录写入前的状态）
+    this.undoStack.set(filePath, originalContent);
 
     // 快照回调
     this.onBeforeWrite?.(filePath);
 
-    // 一次写入
-    await fs.writeFile(filePath, content, 'utf-8');
+    // 通过 WorkspaceEdit 写入（进入 VSCode 原生撤销栈）
+    await this.writeFileViaWorkspaceEdit(filePath, content);
 
     logger.info('File edited (file_edit)', {
       path: filePath,
@@ -958,14 +1122,13 @@ IMPORTANT:
 
   /**
    * 单条条目的匹配与替换（纯计算，不读写文件）
-   * 对齐 Augment singleStrReplace() 完整管线：
-   * 换行符规范化 → 空文件处理 → 精确匹配 → 缩进互转 → 空白规范化 → 行号容忍
+   * 完整管线：换行符规范化 → 空文件处理 → 精确匹配 → 缩进互转 → 空白规范化 → 模糊匹配 → 探针回退
    */
   private matchAndReplace(
     content: string,
     entry: EditEntry
   ): ReplaceResult {
-    // 换行符规范化（对齐 Augment nY()）
+    // 换行符规范化
     let oldStr = this.normalizeLineEndings(entry.oldStr);
     let newStr = this.normalizeLineEndings(entry.newStr);
     const normalizedContent = this.normalizeLineEndings(content);
@@ -976,7 +1139,7 @@ IMPORTANT:
       return { error: 'old_str and new_str are identical. No replacement needed.' };
     }
 
-    // 空文件特殊处理（对齐 Augment: old_str 为空仅当文件也为空时允许）
+    // 空文件特殊处理
     if (oldStr.trim() === '') {
       if (normalizedContent.trim() === '') {
         const newStrLines = newStr.split('\n');
@@ -990,10 +1153,10 @@ IMPORTANT:
       return { error: 'old_str is empty, which is only allowed when the file is empty or contains only whitespace.' };
     }
 
-    // 查找所有精确匹配（对齐 Augment XD()）
+    // ── 阶段 1：精确匹配 ──
     let matches = this.findAllMatches(normalizedContent, oldStr);
 
-    // 无精确匹配 → 尝试缩进互转（对齐 Augment tryTabIndentFix()）
+    // ── 阶段 2：缩进互转 ──
     if (matches.length === 0) {
       const indentFix = this.tryTabIndentFix(normalizedContent, oldStr, newStr);
       if (indentFix.matches.length > 0) {
@@ -1003,7 +1166,7 @@ IMPORTANT:
       }
     }
 
-    // 无匹配 → 尝试行尾空白规范化
+    // ── 阶段 3：行尾空白规范化 ──
     if (matches.length === 0) {
       const trimmed = this.tryTrimmedMatch(normalizedContent, oldStr);
       if (trimmed) {
@@ -1015,23 +1178,35 @@ IMPORTANT:
       }
     }
 
-    // 全部匹配策略失败
+    // ── 阶段 4：模糊匹配（精确和规范化均失败时启用） ──
     if (matches.length === 0) {
-      const nearMatches = this.findFirstLineMatches(normalizedContent, oldStr);
-      let msg = 'Error: old_str not found in file.';
-      if (startLine !== undefined && endLine !== undefined) {
-        const rangeLines = normalizedContent.split('\n');
-        const effectiveEnd = Math.min(endLine, rangeLines.length);
-        const rangeContent = rangeLines.slice(startLine - 1, effectiveEnd).join('\n');
-        msg = `Error: old_str not found in lines ${startLine}-${effectiveEnd}.`;
-        msg += `\n\nContent in that range:\n${rangeContent.substring(0, 500)}${rangeContent.length > 500 ? '...' : ''}`;
+      const contentLines = normalizedContent.split('\n');
+      const oldStrLines = oldStr.split('\n');
+
+      const fuzzyResult = this.fuzzyMatchBlock(contentLines, oldStrLines, startLine, endLine);
+      if (fuzzyResult) {
+        logger.info('Fuzzy match succeeded', {
+          similarity: fuzzyResult.similarity.toFixed(3),
+          matchedLines: `${fuzzyResult.startLine + 1}-${fuzzyResult.endLine + 1}`,
+          anchorLines: startLine !== undefined ? `${startLine}-${endLine}` : 'none',
+        }, LogCategory.TOOLS);
+
+        // 模糊匹配成功：用文件中实际匹配到的代码块替代 oldStr 进行替换
+        return this.applyReplacementAtLines(
+          contentLines,
+          fuzzyResult.startLine,
+          fuzzyResult.endLine,
+          newStr,
+          `OK (fuzzy match, similarity: ${(fuzzyResult.similarity * 100).toFixed(1)}%)`
+        );
       }
-      if (nearMatches.length > 0) {
-        msg += `\n\nHint: old_str first line appears near line(s): ${nearMatches.join(', ')}. Use file_view to verify.`;
-      } else {
-        msg += '\n\nHint: old_str not found anywhere in the file. Use file_view to re-read.';
-      }
-      return { error: msg };
+    }
+
+    // ── 阶段 5：探针回退（所有匹配策略均失败） ──
+    if (matches.length === 0) {
+      const contentLines = normalizedContent.split('\n');
+      const errorMsg = this.buildProbeErrorMessage(contentLines, oldStr, startLine, endLine);
+      return { error: errorMsg };
     }
 
     // 确定使用哪个匹配
@@ -1040,7 +1215,7 @@ IMPORTANT:
     if (matches.length === 1) {
       matchIdx = 0;
     } else {
-      // 多匹配：需要行号来消歧（对齐 Augment FLt()）
+      // 多匹配：需要行号来消歧
       if (startLine === undefined || endLine === undefined) {
         const lineNums = matches.map(m => m.startLine + 1);
         return {
@@ -1058,23 +1233,48 @@ IMPORTANT:
     const match = matches[matchIdx];
     const contentLines = normalizedContent.split('\n');
     const oldStrLineCount = oldStr.split('\n').length;
+
+    return this.applyReplacementAtLines(
+      contentLines,
+      match.startLine,
+      match.startLine + oldStrLineCount - 1,
+      newStr,
+      'OK'
+    );
+  }
+
+  /**
+   * 在指定行范围执行替换（matchAndReplace 和 fuzzyMatch 的共用逻辑）
+   */
+  private applyReplacementAtLines(
+    contentLines: string[],
+    replaceStartLine: number,
+    replaceEndLine: number,
+    newStr: string,
+    message: string
+  ): ReplaceResult {
     const newStrLines = newStr.split('\n');
 
-    const before = contentLines.slice(0, match.startLine).join('\n');
-    const after = contentLines.slice(match.startLine + oldStrLineCount).join('\n');
+    const before = contentLines.slice(0, replaceStartLine).join('\n');
+    const after = contentLines.slice(replaceEndLine + 1).join('\n');
 
     let newContent: string;
-    if (before && after) newContent = before + '\n' + newStr + '\n' + after;
-    else if (before) newContent = before + '\n' + newStr;
-    else if (after) newContent = newStr + '\n' + after;
-    else newContent = newStr;
+    if (before && after) {
+      newContent = before + '\n' + newStr + '\n' + after;
+    } else if (before) {
+      newContent = before + '\n' + newStr;
+    } else if (after) {
+      newContent = newStr + '\n' + after;
+    } else {
+      newContent = newStr;
+    }
 
-    const newStrStartLine = match.startLine;
-    const newStrEndLine = match.startLine + newStrLines.length - 1;
+    const newStrStartLine = replaceStartLine;
+    const newStrEndLine = replaceStartLine + newStrLines.length - 1;
 
     return {
       newContent,
-      message: `OK`,
+      message,
       newStrStartLine,
       newStrEndLine
     };
@@ -1126,8 +1326,8 @@ IMPORTANT:
   }
 
   /**
-   * 插入文本（对齐 Augment handleInsert）
-   * 支持多条插入，底部优先处理，单次读写
+   * 插入文本
+   * 支持多条插入，底部优先处理，通过 WorkspaceEdit 一次写入
    */
   private async executeInsert(
     toolCallId: string,
@@ -1141,15 +1341,14 @@ IMPORTANT:
       return { toolCallId, content: `Error: ${validationError}`, isError: true };
     }
 
-    // 2. 读取文件内容
+    // 2. 通过 VSCode Document API 读取文件内容
     let content = '';
+    let isNewFile = false;
     try {
-      content = await fs.readFile(filePath, 'utf-8');
-    } catch (error: any) {
-      if (error?.code !== 'ENOENT') {
-        return { toolCallId, content: `Error: ${error.message}`, isError: true };
-      }
-      // 文件不存在，从空内容开始
+      content = await this.readFileContent(filePath);
+    } catch {
+      // 文件不存在，从空内容开始（file_insert 允许自动创建）
+      isNewFile = true;
     }
 
     // 3. 规范化换行符
@@ -1191,7 +1390,6 @@ IMPORTANT:
     // 6. 检查是否有任何错误条目
     const errors = results.filter(r => r.isError);
     if (errors.length === entries.length) {
-      // 全部失败，不写入
       return {
         toolCallId,
         content: errors.map(e => `Error (index ${e.index}): ${e.message}`).join('\n'),
@@ -1205,9 +1403,12 @@ IMPORTANT:
     // 8. 快照回调
     this.onBeforeWrite?.(filePath);
 
-    // 9. 写入文件
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.writeFile(filePath, currentContent, 'utf-8');
+    // 9. 通过 WorkspaceEdit 写入
+    if (isNewFile) {
+      await this.createFileViaWorkspaceEdit(filePath, currentContent);
+    } else {
+      await this.writeFileViaWorkspaceEdit(filePath, currentContent);
+    }
 
     logger.info('File edited (file_insert)', {
       path: filePath,
@@ -1253,6 +1454,7 @@ IMPORTANT:
 
   /**
    * 撤销编辑
+   * 通过 WorkspaceEdit 恢复到上一个状态
    */
   private async executeUndo(toolCallId: string, filePath: string): Promise<ToolResult> {
     if (!this.undoStack.has(filePath)) {
@@ -1268,7 +1470,7 @@ IMPORTANT:
     // 快照回调（undo 也是文件变更，需要在写入前记录原始状态）
     this.onBeforeWrite?.(filePath);
 
-    await fs.writeFile(filePath, previous, 'utf-8');
+    await this.writeFileViaWorkspaceEdit(filePath, previous);
     this.undoStack.delete(filePath);
 
     logger.info('File undo applied', { path: filePath }, LogCategory.TOOLS);
@@ -1653,5 +1855,297 @@ IMPORTANT:
       deletions,
       diff,
     };
+  }
+
+  // ============================================================================
+  // VSCode Document I/O 层
+  // 优先读取编辑器已打开文档（保证拿到未保存的最新状态），
+  // 写入通过 WorkspaceEdit 应用，进入 VSCode 原生撤销栈
+  // ============================================================================
+
+  /**
+   * 读取文件内容（优先从 VSCode 已打开文档获取）
+   * 保证拿到编辑器中可能未保存的最新状态
+   */
+  private async readFileContent(filePath: string): Promise<string> {
+    const uri = vscode.Uri.file(filePath);
+
+    // 优先从已打开的文档中读取（可能包含未保存的修改）
+    const openDoc = vscode.workspace.textDocuments.find(
+      doc => doc.uri.fsPath === uri.fsPath
+    );
+    if (openDoc) {
+      return openDoc.getText();
+    }
+
+    // 文档未在编辑器中打开，通过 openTextDocument 读取磁盘内容
+    const doc = await vscode.workspace.openTextDocument(uri);
+    return doc.getText();
+  }
+
+  /**
+   * 通过 WorkspaceEdit 写入文件内容（替换整个文档）
+   * 修改进入 VSCode 原生撤销栈，解决"脏文件"状态不同步问题
+   */
+  private async writeFileViaWorkspaceEdit(filePath: string, newContent: string): Promise<void> {
+    const uri = vscode.Uri.file(filePath);
+    const doc = await vscode.workspace.openTextDocument(uri);
+
+    const edit = new vscode.WorkspaceEdit();
+    const fullRange = new vscode.Range(
+      doc.lineAt(0).range.start,
+      doc.lineAt(doc.lineCount - 1).range.end
+    );
+    edit.replace(uri, fullRange, newContent);
+
+    const success = await vscode.workspace.applyEdit(edit);
+    if (!success) {
+      throw new Error('VSCode WorkspaceEdit 应用失败');
+    }
+
+    // 持久化到磁盘
+    await doc.save();
+  }
+
+  /**
+   * 通过 WorkspaceEdit 创建新文件
+   * 如果文件已存在则覆写（与原始 file_create 行为一致）
+   */
+  private async createFileViaWorkspaceEdit(filePath: string, content: string): Promise<void> {
+    const uri = vscode.Uri.file(filePath);
+
+    // 确保目录存在（WorkspaceEdit.createFile 不会自动创建父目录）
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+
+    const edit = new vscode.WorkspaceEdit();
+
+    // 检查文件是否已存在
+    let fileExists = false;
+    try {
+      await fs.access(filePath);
+      fileExists = true;
+    } catch {
+      // 文件不存在
+    }
+
+    if (fileExists) {
+      // 已有文件：打开文档并替换全部内容
+      const doc = await vscode.workspace.openTextDocument(uri);
+      const fullRange = new vscode.Range(
+        doc.lineAt(0).range.start,
+        doc.lineAt(doc.lineCount - 1).range.end
+      );
+      edit.replace(uri, fullRange, content);
+    } else {
+      // 新文件：先创建再插入内容
+      edit.createFile(uri, { overwrite: false, ignoreIfExists: false });
+      edit.insert(uri, new vscode.Position(0, 0), content);
+    }
+
+    const success = await vscode.workspace.applyEdit(edit);
+    if (!success) {
+      throw new Error('VSCode WorkspaceEdit 创建文件失败');
+    }
+
+    // 持久化到磁盘
+    const doc = await vscode.workspace.openTextDocument(uri);
+    await doc.save();
+  }
+
+  // ============================================================================
+  // 模糊匹配引擎
+  // 当精确匹配和缩进/空白规范化均失败时启用
+  // 基于行级相似度评分 + 锚点滑动窗口搜索
+  // ============================================================================
+
+  /**
+   * 计算两个字符串的行级相似度（0.0 ~ 1.0）
+   * 使用 token 化的 Jaccard 系数，兼顾效率和准确度
+   */
+  private computeLineSimilarity(lineA: string, lineB: string): number {
+    const a = lineA.trim();
+    const b = lineB.trim();
+
+    // 完全相同
+    if (a === b) return 1.0;
+
+    // 其中一个为空行
+    if (a === '' && b === '') return 1.0;
+    if (a === '' || b === '') return 0.0;
+
+    // 提取 token（按非字母数字字符分割）
+    const tokensA = new Set(a.split(/[^a-zA-Z0-9_$]+/).filter(Boolean));
+    const tokensB = new Set(b.split(/[^a-zA-Z0-9_$]+/).filter(Boolean));
+
+    if (tokensA.size === 0 && tokensB.size === 0) {
+      // 纯符号行：直接字符比较
+      return this.computeCharSimilarity(a, b);
+    }
+
+    // Jaccard 系数
+    let intersection = 0;
+    for (const token of tokensA) {
+      if (tokensB.has(token)) intersection++;
+    }
+    const union = tokensA.size + tokensB.size - intersection;
+    return union === 0 ? 1.0 : intersection / union;
+  }
+
+  /**
+   * 字符级相似度（用于纯符号行的 fallback）
+   * 使用双向最长公共子序列长度比率
+   */
+  private computeCharSimilarity(a: string, b: string): number {
+    if (a === b) return 1.0;
+    const maxLen = Math.max(a.length, b.length);
+    if (maxLen === 0) return 1.0;
+
+    // 使用简化的 LCS 长度计算（空间优化为 O(min(m,n))）
+    const short = a.length <= b.length ? a : b;
+    const long = a.length <= b.length ? b : a;
+    const prev = new Array(short.length + 1).fill(0);
+    const curr = new Array(short.length + 1).fill(0);
+
+    for (let i = 1; i <= long.length; i++) {
+      for (let j = 1; j <= short.length; j++) {
+        if (long[i - 1] === short[j - 1]) {
+          curr[j] = prev[j - 1] + 1;
+        } else {
+          curr[j] = Math.max(prev[j], curr[j - 1]);
+        }
+      }
+      // 交换 prev 和 curr
+      for (let j = 0; j <= short.length; j++) {
+        prev[j] = curr[j];
+        curr[j] = 0;
+      }
+    }
+
+    const lcsLength = prev[short.length];
+    return lcsLength / maxLen;
+  }
+
+  /**
+   * 计算代码块的整体相似度（各行相似度的加权平均）
+   * 非空行权重高于空行，避免空行稀释匹配质量
+   */
+  private computeBlockSimilarity(linesA: string[], linesB: string[]): number {
+    if (linesA.length !== linesB.length) return 0.0;
+    if (linesA.length === 0) return 1.0;
+
+    let totalWeight = 0;
+    let weightedSum = 0;
+
+    for (let i = 0; i < linesA.length; i++) {
+      const weight = linesA[i].trim() === '' && linesB[i].trim() === '' ? 0.3 : 1.0;
+      const sim = this.computeLineSimilarity(linesA[i], linesB[i]);
+      weightedSum += sim * weight;
+      totalWeight += weight;
+    }
+
+    return totalWeight === 0 ? 1.0 : weightedSum / totalWeight;
+  }
+
+  /**
+   * 模糊匹配核心：在锚点附近搜索与 oldStr 最相似的代码块
+   *
+   * 搜索策略：
+   * 1. 以 startLine/endLine 为锚点确定搜索窗口
+   * 2. 在窗口内滑动等长块，逐一计算相似度
+   * 3. 取最高相似度且超过阈值的位置
+   *
+   * 返回 null 表示未找到足够相似的匹配
+   */
+  private fuzzyMatchBlock(
+    contentLines: string[],
+    oldStrLines: string[],
+    anchorStartLine?: number,
+    anchorEndLine?: number
+  ): { startLine: number; endLine: number; similarity: number } | null {
+    const blockLen = oldStrLines.length;
+    if (blockLen === 0 || blockLen > contentLines.length) return null;
+
+    // 确定搜索范围
+    let searchStart: number;
+    let searchEnd: number;
+
+    if (anchorStartLine !== undefined && anchorEndLine !== undefined) {
+      // 锚点模式：在锚点附近搜索（0-based）
+      const anchor0 = anchorStartLine - 1; // 转 0-based
+      searchStart = Math.max(0, anchor0 - FUZZY_SEARCH_WINDOW);
+      searchEnd = Math.min(contentLines.length - blockLen, anchor0 + FUZZY_SEARCH_WINDOW);
+    } else {
+      // 无锚点：全文搜索
+      searchStart = 0;
+      searchEnd = contentLines.length - blockLen;
+    }
+
+    // 安全边界
+    searchStart = Math.max(0, searchStart);
+    searchEnd = Math.min(contentLines.length - blockLen, searchEnd);
+
+    let bestMatch: { startLine: number; endLine: number; similarity: number } | null = null;
+
+    for (let pos = searchStart; pos <= searchEnd; pos++) {
+      const candidateLines = contentLines.slice(pos, pos + blockLen);
+      const similarity = this.computeBlockSimilarity(oldStrLines, candidateLines);
+
+      if (similarity >= FUZZY_MATCH_THRESHOLD) {
+        if (!bestMatch || similarity > bestMatch.similarity) {
+          bestMatch = {
+            startLine: pos,
+            endLine: pos + blockLen - 1,
+            similarity,
+          };
+        }
+      }
+    }
+
+    return bestMatch;
+  }
+
+  // ============================================================================
+  // 探针回退（Probe Fallback）
+  // 当精确匹配和模糊匹配均失败时，提取目标区域附近的真实代码上下文，
+  // 帮助 LLM 基于最新代码重新生成正确的编辑指令
+  // ============================================================================
+
+  /**
+   * 生成探针回退错误信息
+   * 包含锚点附近的实际代码，引导 LLM 重新生成编辑
+   */
+  private buildProbeErrorMessage(
+    contentLines: string[],
+    oldStr: string,
+    anchorStartLine?: number,
+    anchorEndLine?: number
+  ): string {
+    const nearMatches = this.findFirstLineMatches(contentLines.join('\n'), oldStr);
+    let msg = 'Error: old_str not found in file. Exact match and fuzzy match both failed.';
+
+    // 如果有锚点行号，提取附近上下文
+    if (anchorStartLine !== undefined) {
+      const anchor0 = anchorStartLine - 1; // 0-based
+      const probeStart = Math.max(0, anchor0 - PROBE_CONTEXT_LINES);
+      const probeEnd = Math.min(
+        contentLines.length,
+        (anchorEndLine ?? anchorStartLine) - 1 + PROBE_CONTEXT_LINES + 1
+      );
+
+      const contextSnippet = contentLines
+        .slice(probeStart, probeEnd)
+        .map((line, i) => `${String(probeStart + i + 1).padStart(6)}\t${line}`)
+        .join('\n');
+
+      msg += `\n\nActual code near lines ${probeStart + 1}-${probeEnd} (use this to regenerate your edit):\n${contextSnippet}`;
+    }
+
+    if (nearMatches.length > 0) {
+      msg += `\n\nHint: old_str first line appears near line(s): ${nearMatches.join(', ')}. Use file_view to verify.`;
+    } else {
+      msg += '\n\nHint: old_str first line not found anywhere in the file. Use file_view to re-read.';
+    }
+
+    return msg;
   }
 }

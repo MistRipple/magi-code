@@ -951,7 +951,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       'file_insert': { category: '文件操作', desc: '在指定行插入文本' },
       'file_remove': { category: '文件操作', desc: '删除文件' },
       'grep_search': { category: '文件操作', desc: '正则搜索代码内容' },
-      'launch-process': { category: '终端命令', desc: '执行构建/测试/启动服务等进程（不要用于读文件或浏览目录）' },
+      'launch-process': { category: '终端命令', desc: '执行构建/测试/启动服务等进程（禁止用于读写文件，必须使用 file_view/file_edit）' },
       'read-process': { category: '终端命令', desc: '读取终端进程输出' },
       'write-process': { category: '终端命令', desc: '向运行中的终端写入输入' },
       'kill-process': { category: '终端命令', desc: '终止终端进程' },
@@ -1040,11 +1040,17 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 Use wait=true for short commands (build, test, git), wait=false for long-running processes (dev server).
 
 IMPORTANT: If a more specific tool can perform the task, use that tool instead:
-- To read files or browse directories: use file_view, NOT cat/ls/find
+- To read files or browse directories: use file_view, NOT cat/head/tail/less/python
+- To edit or modify files: use file_edit, NOT sed/awk/perl/python
+- To create or write files: use file_create, NOT echo/tee/cat/python with redirects
+- To insert content into files: use file_insert, NOT sed/awk/python
 - To search code content: use grep_search, NOT grep/rg
 - To search the web: use web_search, NOT curl
 - To fetch a URL: use web_fetch, NOT curl/wget
-- Only use launch-process for commands that truly need a shell (build, test, git, start server, etc.)`,
+
+BANNED: Using shell commands (sed -i, awk, perl -i, python -c, echo >, tee, cat >) to read, write, or modify files is FORBIDDEN and will be blocked. The file_view/file_edit/file_create/file_insert tools have built-in fuzzy matching, AST-aware patching, and error recovery that shell commands lack. Bypassing them causes file corruption.
+
+Only use launch-process for commands that truly need a shell: build, test, lint, git, package manager, start server, database migration, etc.`,
         input_schema: {
           type: 'object',
           properties: {
