@@ -160,11 +160,13 @@ export function mapTodoStatusToSubTaskViewStatus(status: TodoStatus): SubTaskVie
  * 将 UnifiedTodo 转换为 TodoItemView
  */
 export function todoToTodoItemView(todo: UnifiedTodo, missionId: string): TodoItemView {
+  // 防御性回退：content 可能因 JSON 反序列化缺失字段而为 undefined
+  const content = todo.content || '';
   return {
     id: todo.id,
     taskId: missionId,
-    description: todo.content,
-    title: todo.content.length > 50 ? todo.content.substring(0, 50) + '...' : todo.content,
+    description: content,
+    title: content.length > 50 ? content.substring(0, 50) + '...' : content || '未命名任务',
     assignedWorker: todo.workerId,
     assignmentId: todo.assignmentId,
     status: mapTodoStatusToSubTaskViewStatus(todo.status),
