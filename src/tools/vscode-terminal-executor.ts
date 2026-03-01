@@ -138,6 +138,17 @@ export class VSCodeTerminalExecutor {
 
 
   async launchProcess(options: LaunchProcessOptions, signal?: AbortSignal): Promise<LaunchProcessResult> {
+    // 强制将 VSCode 内存中的脏文档落盘，防止终端进程读到磁盘上的旧快照
+    const dirtyDocs = vscode.workspace.textDocuments.filter(doc => doc.isDirty);
+    if (dirtyDocs.length > 0) {
+      await Promise.all(dirtyDocs.map(doc => doc.save()));
+      logger.info(
+        `终端命令执行前，强制保存了 ${dirtyDocs.length} 个未落盘文件，以保证底层进程读取状态最新。`,
+        undefined,
+        LogCategory.SHELL
+      );
+    }
+
     const idleTimeoutMs = this.normalizeIdleTimeoutMs(options.maxWaitSeconds);
     const agentName = (options.name || '').trim();
     if (!agentName) {
