@@ -16,12 +16,15 @@
     displayContext?: 'thread' | 'worker';
     /** 是否允许渲染底部流式三点（仅最后一条流式消息启用） */
     showStreamingIndicator?: boolean;
+    /** 当前面板流式计时（秒） */
+    streamingElapsedSeconds?: number;
   }
   let {
     message,
     readOnly = false,
     displayContext = 'thread',
     showStreamingIndicator = true,
+    streamingElapsedSeconds = 0,
   }: Props = $props();
 
   // 派生状态
@@ -76,6 +79,13 @@
       hour: '2-digit',
       minute: '2-digit'
     });
+  }
+
+  function formatElapsed(seconds: number): string {
+    if (seconds < 60) return `${seconds}s`;
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m}m ${s}s`;
   }
 
   // 获取 worker 信息（如果有）
@@ -202,6 +212,7 @@
               <span class="streaming-dot"></span>
               <span class="streaming-dot"></span>
               <span class="streaming-dot"></span>
+              <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
             </div>
           {/if}
         </div>
@@ -227,6 +238,7 @@
               <span class="streaming-dot"></span>
               <span class="streaming-dot"></span>
               <span class="streaming-dot"></span>
+              <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
             </div>
           {/if}
 
@@ -285,6 +297,7 @@
               <span class="streaming-dot"></span>
               <span class="streaming-dot"></span>
               <span class="streaming-dot"></span>
+              <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
             </div>
           {/if}
         </div>
@@ -307,6 +320,7 @@
               <span class="streaming-dot"></span>
               <span class="streaming-dot"></span>
               <span class="streaming-dot"></span>
+              <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
             </div>
           {/if}
       {/if}
@@ -595,6 +609,13 @@
 
   .streaming-dot:nth-child(3) {
     animation-delay: 0.4s;
+  }
+
+  .streaming-elapsed-time {
+    margin-left: 4px;
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    font-variant-numeric: tabular-nums;
   }
 
   @keyframes streamingPulse {

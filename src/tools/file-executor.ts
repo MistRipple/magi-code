@@ -163,7 +163,7 @@ IMPORTANT:
 * Use on a directory path to explore project structure (e.g. path: "." or path: "src")
 * Use on a file path to read file contents
 * DO NOT use launch-process with ls/find/cat to explore files - use this tool instead
-* Always use this tool to read a file before editing it`,
+* Read a file before editing it; if the same file has already been fully read in current context, do not repeatedly read it again`,
       input_schema: {
         type: 'object',
         properties: {
@@ -256,7 +256,7 @@ Use the file_edit tool to edit existing files instead.`,
       description: `Edit a file by replacing text. Supports multiple replacements in one call.
 
 Notes for text replacement:
-* ALWAYS use file_view to read the file before editing
+* Use file_view to read the file before editing. If the same file is already fresh in current context, do not repeat file_view.
 * Specify old_str_1, new_str_1, old_str_start_line_1 and old_str_end_line_1 for the first replacement, old_str_2, new_str_2, old_str_start_line_2 and old_str_end_line_2 for the second replacement, and so on
 * old_str_start_line and old_str_end_line are 1-based line numbers (both inclusive)
 * old_str must match EXACTLY one or more consecutive lines from the original file. Be mindful of whitespace!
@@ -329,7 +329,7 @@ Notes for using this tool:
 * To make multiple insertions in one tool call add multiple sets of insertion parameters. For example, \`insert_line_1\` and \`new_str_1\` properties for the first insertion, \`insert_line_2\` and \`new_str_2\` for the second insertion, etc.
 
 IMPORTANT:
-* Use the file_view tool to read a file before inserting into it
+* Use file_view before inserting into an existing file. If this is a new file path, file_insert can create it directly.
 * If the file does not exist, it will be created`,
       input_schema: {
         type: 'object',
@@ -1051,15 +1051,17 @@ IMPORTANT:
     const results: string[] = [];
     const successfulEntries: SuccessfulReplaceEntry[] = [];
     let hasError = false;
+    let hasSuccess = false;
 
     for (const entry of sorted) {
       const result = this.matchAndReplace(content, entry);
       if (result.error) {
-        results.push(`Entry #${entry.index}: ${result.error}`);
+        results.push(`[FAILED] Entry #${entry.index}: ${result.error}`);
         hasError = true;
-        break;
+        continue;
       }
       content = result.newContent!;
+      hasSuccess = true;
 
       const successEntry: SuccessfulReplaceEntry = {
         index: entry.index,
@@ -1075,10 +1077,11 @@ IMPORTANT:
         successEntry.newStrStartLine,
         successEntry.newStrEndLine
       );
-      results.push(`Entry #${entry.index}: ${successMsg}`);
+      results.push(`[OK] Entry #${entry.index}: ${successMsg}`);
     }
 
-    if (hasError) {
+    // 全部失败：不写入，直接返回错误
+    if (!hasSuccess) {
       return { toolCallId, content: results.join('\n'), isError: true };
     }
 
@@ -1096,12 +1099,16 @@ IMPORTANT:
     logger.info('File edited (file_edit)', {
       path: filePath,
       entryCount: entries.length,
+      successCount: successfulEntries.length,
+      failedCount: entries.length - successfulEntries.length,
       changedAfterWrite: finalContent !== content,
     }, LogCategory.TOOLS);
 
     const fileChange = this.buildFileChangeMetadata(originalContent, finalContent, filePath, 'modify');
-    const finalResultMessages = successfulEntries.map(entry =>
-      `Entry #${entry.index}: ${this.buildEditSuccessMessage(
+
+    // 用最终内容重建成功条目的消息（行号可能因 format-on-save 变动）
+    const finalSuccessMessages = successfulEntries.map(entry =>
+      `[OK] Entry #${entry.index}: ${this.buildEditSuccessMessage(
         entry.message,
         finalContent,
         entry.newStrStartLine,
@@ -1109,20 +1116,29 @@ IMPORTANT:
       )}`
     );
 
-    // 单条时简化输出
-    if (entries.length === 1) {
+    // 收集失败条目的消息（已在循环中以 [FAILED] 前缀记录）
+    const failedMessages = results.filter(r => r.startsWith('[FAILED]'));
+
+    // 单条且无错误时简化输出
+    if (entries.length === 1 && !hasError) {
       return {
         toolCallId,
-        content: finalResultMessages[0].replace(/^Entry #\d+: /, ''),
+        content: finalSuccessMessages[0].replace(/^\[OK\] Entry #\d+: /, ''),
         isError: false,
         fileChange,
       };
     }
 
+    // 组合最终消息：成功条目 + 失败条目
+    const allMessages = [...finalSuccessMessages, ...failedMessages];
+    const summary = hasError
+      ? `Partial: ${successfulEntries.length}/${entries.length} replacements applied (${failedMessages.length} failed).`
+      : `OK: ${entries.length} replacements applied.`;
+
     return {
       toolCallId,
-      content: `OK: ${entries.length} replacements applied.\n${finalResultMessages.join('\n')}`,
-      isError: false,
+      content: `${summary}\n${allMessages.join('\n')}`,
+      isError: hasError,
       fileChange,
     };
   }
@@ -1409,9 +1425,21 @@ IMPORTANT:
       const contentLines = normalizedContent.split('\n');
       const oldStrLines = oldStr.split('\n');
 
-      const fuzzyResult = this.fuzzyMatchBlock(contentLines, oldStrLines, startLine, endLine);
+      // 先尝试带锚点的局部模糊匹配；若失败且给了锚点，再做一次全局模糊回退，
+      // 处理“前序编辑/格式化导致块整体位移，超出锚点窗口”的场景。
+      let fuzzyResult = this.fuzzyMatchBlock(contentLines, oldStrLines, startLine, endLine);
+      let fuzzyMode: 'anchored' | 'global' = 'anchored';
+
+      if (!fuzzyResult && (startLine !== undefined || endLine !== undefined)) {
+        fuzzyResult = this.fuzzyMatchBlock(contentLines, oldStrLines);
+        if (fuzzyResult) {
+          fuzzyMode = 'global';
+        }
+      }
+
       if (fuzzyResult) {
         logger.info('Fuzzy match succeeded', {
+          mode: fuzzyMode,
           similarity: fuzzyResult.similarity.toFixed(3),
           matchedLines: `${fuzzyResult.startLine + 1}-${fuzzyResult.endLine + 1}`,
           anchorLines: startLine !== undefined ? `${startLine}-${endLine}` : 'none',
@@ -1423,7 +1451,9 @@ IMPORTANT:
           fuzzyResult.startLine,
           fuzzyResult.endLine,
           newStr,
-          `OK (fuzzy match, similarity: ${(fuzzyResult.similarity * 100).toFixed(1)}%)`
+          fuzzyMode === 'anchored'
+            ? `OK (fuzzy match, similarity: ${(fuzzyResult.similarity * 100).toFixed(1)}%)`
+            : `OK (fuzzy global fallback, similarity: ${(fuzzyResult.similarity * 100).toFixed(1)}%)`
         );
       }
     }

@@ -60,6 +60,23 @@
   // 全局用户规则
   let userRules = $state('');
 
+  const categoryLabels: Record<string, string> = {
+    architecture: '架构设计(architecture)',
+    implement: '功能实现(implement)',
+    refactor: '代码重构(refactor)',
+    bugfix: '缺陷修复(bugfix)',
+    debug: '问题排查(debug)',
+    data_analysis: '数据分析(data/analysis)',
+    frontend: '前端开发(frontend)',
+    backend: '后端开发(backend)',
+    test: '测试编写(test)',
+    document: '文档编写(document)',
+    review: '代码审查(review)',
+    integration: '集成联调(integration)',
+    simple: '简单任务(simple)',
+    general: '通用任务(general)'
+  };
+
   // 分类显示顺序
   let categoryOrder = $derived(
     categoryPriority.length > 0 ? categoryPriority : Object.keys(categoryLabels)
@@ -303,23 +320,6 @@
     network_error: '网络错误',
     timeout: '连接超时',
     orchestrator: '使用编排者模型'
-  };
-
-  const categoryLabels: Record<string, string> = {
-    architecture: '架构设计(architecture)',
-    implement: '功能实现(implement)',
-    refactor: '代码重构(refactor)',
-    bugfix: '缺陷修复(bugfix)',
-    debug: '问题排查(debug)',
-    data_analysis: '数据分析(data/analysis)',
-    frontend: '前端开发(frontend)',
-    backend: '后端开发(backend)',
-    test: '测试编写(test)',
-    document: '文档编写(document)',
-    review: '代码审查(review)',
-    integration: '集成联调(integration)',
-    simple: '简单任务(simple)',
-    general: '通用任务(general)'
   };
 
   function getStatusClass(status: string): string {

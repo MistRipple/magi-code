@@ -347,6 +347,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
 
     // Orchestrator 默认系统提示词保持轻量，供内部系统调用（如 Phase C 汇总）使用；
     // 主执行链路会由 MissionDrivenEngine 传入统一临时 systemPrompt 覆盖。
+    // 注意：内部系统调用同样需要遵循全局用户规则，因此默认提示词也要拼接 user rules。
     let systemPrompt = adapter.getSystemPrompt();
     const orchestratorBaseline = `你是 Magi 的任务编排者。
 - 目标：协调任务执行并输出清晰结果
@@ -360,6 +361,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     });
     systemPrompt = this.appendPromptSection(systemPrompt, orchestratorBaseline);
     systemPrompt = this.appendPromptSection(systemPrompt, runtimeEnvironmentPrompt);
+    systemPrompt = this.appendPromptSection(systemPrompt, this.environmentContextProvider.getUserRulesPrompt());
     adapter.setSystemPrompt(systemPrompt);
 
     // 只设置错误事件处理（消息由 Adapter 直接发送到 MessageHub）

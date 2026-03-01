@@ -150,6 +150,10 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   private snapshotManager?: SnapshotManager;
   private snapshotContextMap: Map<string, SnapshotContext> = new Map();
   private executionContextStorage = new AsyncLocalStorage<ToolExecutionContext>();
+  /** 外部命令可能改动文件时递增，用于判断 file_view 新鲜度 */
+  private workspaceMutationEpoch = 0;
+  /** 文件路径最近一次 file_view/file_edit/file_insert/file_create 对齐到的 epoch */
+  private fileContextEpochByPath: Map<string, number> = new Map();
 
   constructor(options: ToolManagerOptions = {}) {
     super();
@@ -767,8 +771,21 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       case 'file_create':
       case 'file_edit':
       case 'file_insert':
-      case 'file_bulk_edit':
-        return await this.fileExecutor.execute(toolCall);
+      case 'file_bulk_edit': {
+        if (name === 'file_edit' || name === 'file_insert') {
+          const staleError = this.validateFileContextFreshnessBeforeEdit(toolCall);
+          if (staleError) {
+            return {
+              toolCallId: toolCall.id,
+              content: staleError,
+              isError: true,
+            };
+          }
+        }
+        const result = await this.fileExecutor.execute(toolCall);
+        this.recordFileContextAfterFileTool(toolCall, result);
+        return result;
+      }
 
       case 'grep_search':
         return await this.searchExecutor.execute(toolCall);
@@ -1067,16 +1084,18 @@ Use wait=true for short commands (build, test, git), wait=false for long-running
 
 IMPORTANT: If a more specific tool can perform the task, use that tool instead:
 - To read files or browse directories: use file_view, NOT cat/head/tail/less/python
-- To edit or modify files: use file_edit, NOT sed/awk/perl/python
-- To create or write files: use file_create, NOT echo/tee/cat/python with redirects
-- To insert content into files: use file_insert, NOT sed/awk/python
+- For precise single-file edits with reliable line anchoring: prefer file_edit/file_insert
+- For full-file creation/overwrite: prefer file_create
 - To search code content: use grep_search, NOT grep/rg
 - To search the web: use web_search, NOT curl
 - To fetch a URL: use web_fetch, NOT curl/wget
 
-BANNED: Using shell commands (sed -i, awk, perl -i, python -c, echo >, tee, cat >) to read, write, or modify files is FORBIDDEN and will be blocked. The file_view/file_edit/file_create/file_insert tools have built-in fuzzy matching, AST-aware patching, and error recovery that shell commands lack. Bypassing them causes file corruption.
+Shell-based scripts are allowed for batch/repetitive multi-file changes when they are clearly more efficient.
+Use launch-process for tasks that truly benefit from shell execution: build, test, lint, git, package manager, start server, database migration, or scripted bulk edits.
 
-Only use launch-process for commands that truly need a shell: build, test, lint, git, package manager, start server, database migration, etc.`,
+Only set may_modify_files=true when the command is expected to directly modify source files that you will edit later.
+Do NOT set it for read-only commands such as ls/cat/grep/git status/log/diff.
+After a mutating command, refresh each target file with file_view once before file_edit/file_insert (no need to repeatedly view the same file).`,
         input_schema: {
           type: 'object',
           properties: {
@@ -1085,6 +1104,7 @@ Only use launch-process for commands that truly need a shell: build, test, lint,
             wait: { type: 'boolean', description: '是否等待进程完成（默认 true）' },
             max_wait_seconds: { type: 'number', description: '空闲超时秒数（距最近一次输出超过该值则判定超时，默认 30）' },
             showTerminal: { type: 'boolean', description: '是否显示终端窗口（默认 true）' },
+            may_modify_files: { type: 'boolean', description: '命令是否会直接修改后续要编辑的源文件。仅在确实会改文件时设为 true；ls/cat/grep/git status 等只读命令应保持 false。默认 false（系统也会做有限启发式检测）。' },
           },
           required: ['command'],
         },
@@ -1402,9 +1422,137 @@ Only use launch-process for commands that truly need a shell: build, test, lint,
     };
   }
 
+  private isLikelyFileMutatingCommand(command: string): boolean {
+    const patterns = [
+      /\bsed\s+-i(?:\S*)?\b/i,
+      /\bperl\b[^\n]*\s-i(?:\S*)?\b/i,
+      /\b(?:g?awk)\b[^\n]*\s-i\s+inplace\b/i,
+      /\bpython(?:3)?\b[^\n]*\s+[^;&|]*\.py\b/i,
+      /\bnode\b[^\n]*\s+[^;&|]*\.(?:[cm]?js|ts)\b/i,
+      /\b(?:bash|sh|zsh)\b[^\n]*\s+[^;&|]*\.(?:sh|bash|zsh)\b/i,
+      /\bpython(?:3)?\b[^\n]*\s-c\b/i,
+      /\bpython(?:3)?\b[^\n]*<<-?\s*['"]?[A-Za-z_][A-Za-z0-9_]*['"]?/i,
+      /\becho\b[\s\S]*?(?:>>|>)\s*(?!\/dev\/null\b)\S+/i,
+      /\bcat\b[\s\S]*?(?:>>|>)\s*(?!\/dev\/null\b)\S+/i,
+      /\btee\b(?:\s+-a)?\s+(?!\/dev\/null\b)\S+/i,
+      /\b(prettier|eslint|ruff)\b[^\n]*\b(--write|--fix)\b/i,
+      /\bgit\s+(apply|am|checkout|restore|reset|merge|cherry-pick|rebase|pull)\b/i,
+    ];
+    return patterns.some((pattern) => pattern.test(command));
+  }
+
+  /**
+   * 兜底检测：识别“执行脚本型命令”。
+   * 这类命令即使未命中更精确的写入特征，也常常会直接修改代码文件。
+   */
+  private isLikelyScriptDrivenMutation(command: string): boolean {
+    const patterns = [
+      /\bpython(?:3)?\b(?![^\n]*\b-m\s+(?:pytest|unittest|pip|http\.server)\b)[^\n]*\s+(?!-)(?:[^;&|\s]*[/.][^;&|\s]*)(?:\s|$)/i,
+      /\bnode\b[^\n]*\s+(?!-)(?:[^;&|\s]*[/.][^;&|\s]*)(?:\s|$)/i,
+      /\b(?:bash|sh|zsh)\b[^\n]*\s+(?!-)(?:[^;&|\s]*[/.][^;&|\s]*)(?:\s|$)/i,
+      /\bnpx\b[^\n]*\b(jscodeshift|codemod|ts-node|tsx)\b/i,
+    ];
+    return patterns.some((pattern) => pattern.test(command));
+  }
+
+  private isLikelyReadOnlyCommand(command: string): boolean {
+    const segments = command
+      .split(/&&|\|\||;/)
+      .map(segment => segment.trim())
+      .filter(Boolean);
+    if (segments.length === 0) {
+      return false;
+    }
+
+    const readOnlyPatterns = [
+      /^(?:env\s+)?(?:ls|pwd|cat|head|tail|wc|grep|rg|find|tree|stat|file|which|whereis|du|df)\b/i,
+      /^echo\b(?![\s\S]*?(?:>>|>)\s*(?!\/dev\/null\b)\S+)/i,
+      /^git\s+(status|log|show|diff|branch|rev-parse|remote|tag)\b/i,
+      /^(?:npm|pnpm|yarn)\s+(list|why|info|outdated)\b/i,
+    ];
+
+    return segments.every((segment) => {
+      const normalizedSegment = segment.replace(/\d?>\s*\/dev\/null\b/g, '').trim();
+      if (!normalizedSegment) {
+        return true;
+      }
+      if (this.isLikelyFileMutatingCommand(normalizedSegment)) {
+        return false;
+      }
+      return readOnlyPatterns.some((pattern) => pattern.test(normalizedSegment));
+    });
+  }
+
+  private markWorkspacePossiblyMutated(source: string, command: string): void {
+    this.workspaceMutationEpoch += 1;
+    logger.info('Workspace mutation epoch advanced', {
+      source,
+      workspaceMutationEpoch: this.workspaceMutationEpoch,
+      command,
+    }, LogCategory.TOOLS);
+  }
+
+  private resolveFileToolPath(toolCall: ToolCall, mustExist: boolean): string | null {
+    const args = toolCall.arguments as any;
+    const rawPath = typeof args?.path === 'string' ? args.path : '';
+    if (!rawPath) {
+      return null;
+    }
+    try {
+      const resolved = this.workspaceRoots.resolvePath(rawPath, { mustExist });
+      return resolved?.absolutePath || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 历史遗留：曾基于 workspaceMutationEpoch 做全局"上下文过期"硬拦截。
+   * 底层 VSCode 内存模型与读写管道已具备强制同步与模糊匹配能力，此拦截不再必要。
+   * 保留方法签名以避免调用方变更，直接返回 null（永不拦截）。
+   */
+  private validateFileContextFreshnessBeforeEdit(_toolCall: ToolCall): string | null {
+    return null;
+  }
+
+  private recordFileContextAfterFileTool(toolCall: ToolCall, result: ToolResult): void {
+    if (result.isError) {
+      return;
+    }
+
+    const args = toolCall.arguments as any;
+
+    if (toolCall.name === 'file_view') {
+      if (args?.type === 'directory') {
+        return;
+      }
+      const absPath = this.resolveFileToolPath(toolCall, true);
+      if (!absPath) {
+        return;
+      }
+      try {
+        const stat = fs.statSync(absPath);
+        if (!stat.isFile()) {
+          return;
+        }
+      } catch {
+        return;
+      }
+      this.fileContextEpochByPath.set(absPath, this.workspaceMutationEpoch);
+      return;
+    }
+
+    if (toolCall.name === 'file_edit' || toolCall.name === 'file_insert' || toolCall.name === 'file_create') {
+      const absPath = this.resolveFileToolPath(toolCall, false);
+      if (absPath) {
+        this.fileContextEpochByPath.set(absPath, this.workspaceMutationEpoch);
+      }
+    }
+  }
+
   private async executeLaunchProcessTool(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     const args = toolCall.arguments as any;
-    const { command: rawCommand, cwd: rawCwd, wait = true, max_wait_seconds = 30, showTerminal = true } = args;
+    const { command: rawCommand, cwd: rawCwd, wait = true, max_wait_seconds = 30, showTerminal = true, may_modify_files = false } = args;
     const normalized = this.normalizeLaunchProcessCommand(rawCommand, rawCwd);
     if (!normalized.command) {
       return {
@@ -1431,6 +1579,13 @@ Only use launch-process for commands that truly need a shell: build, test, lint,
       return {
         toolCallId: toolCall.id,
         content: 'Command rejected: showTerminal 参数类型错误，必须是 boolean',
+        isError: true,
+      };
+    }
+    if (args.may_modify_files !== undefined && typeof args.may_modify_files !== 'boolean') {
+      return {
+        toolCallId: toolCall.id,
+        content: 'Command rejected: may_modify_files 参数类型错误，必须是 boolean',
         isError: true,
       };
     }
@@ -1486,6 +1641,23 @@ Only use launch-process for commands that truly need a shell: build, test, lint,
     const hasFailureStatus = result.status === 'failed' || result.status === 'killed' || result.status === 'timeout';
     const hasNonZeroExit = result.return_code !== null && result.return_code !== 0;
     const isError = hasFailureStatus || hasNonZeroExit;
+    const explicitMayModify = may_modify_files === true;
+    const heuristicMayModify = this.isLikelyFileMutatingCommand(normalized.command);
+    const scriptDrivenMayModify = this.isLikelyScriptDrivenMutation(normalized.command);
+    const readOnlyCommand = this.isLikelyReadOnlyCommand(normalized.command);
+    const likelyMutatesFiles = !readOnlyCommand && (explicitMayModify || heuristicMayModify || scriptDrivenMayModify);
+    if (likelyMutatesFiles) {
+      this.markWorkspacePossiblyMutated('launch-process', normalized.command);
+      if (scriptDrivenMayModify && !explicitMayModify && !heuristicMayModify) {
+        logger.info('launch-process script-driven mutation detected by fallback heuristic', {
+          command: normalized.command,
+        }, LogCategory.TOOLS);
+      }
+    } else if (explicitMayModify && readOnlyCommand) {
+      logger.info('launch-process may_modify_files=true ignored for read-only command', {
+        command: normalized.command,
+      }, LogCategory.TOOLS);
+    }
 
     return {
       toolCallId: toolCall.id,

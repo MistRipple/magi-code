@@ -2,7 +2,7 @@
   import type { Message } from '../types/message';
   import MessageItem from './MessageItem.svelte';
   import Icon from './Icon.svelte';
-  import { onMount, onDestroy, tick } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { messagesState } from '../stores/messages.svelte';
 
   // Props - Svelte 5 语法
@@ -132,7 +132,7 @@
   // - worker: 从当前请求启动时间开始（同一次请求内跨多轮保持连续）
   const timerStartTime = $derived.by(() => {
     if (displayContext === 'worker') {
-      if (workerHasCurrentRequestActivity && messagesState.thinkingStartAt) {
+      if (messagesState.thinkingStartAt) {
         return messagesState.thinkingStartAt;
       }
       return 0;
@@ -143,14 +143,28 @@
         return safeMessages[i].timestamp;
       }
     }
+    // 兜底：没有用户消息时，使用处理开始时间
+    if (messagesState.thinkingStartAt) {
+      return messagesState.thinkingStartAt;
+    }
     return 0;
+  });
+
+  // 计时器运行条件与底部三点展示解耦：
+  // 有流式消息时计时也要持续更新，避免只显示三点不显示耗时。
+  const shouldRunTimer = $derived.by(() => {
+    if (timerStartTime <= 0) return false;
+    if (displayContext === 'worker') {
+      return workerHasCurrentRequestActivity || hasStreamingMessage;
+    }
+    return messagesState.isProcessing || hasStreamingMessage;
   });
 
   let elapsedSeconds = $state(0);
   let timerInterval: ReturnType<typeof setInterval> | null = null;
 
   $effect(() => {
-    const shouldRun = showProcessingIndicator && timerStartTime > 0;
+    const shouldRun = shouldRunTimer;
     if (shouldRun) {
       // 立即计算一次
       elapsedSeconds = Math.floor((Date.now() - timerStartTime) / 1000);
@@ -271,6 +285,7 @@
           {readOnly}
           {displayContext}
           showStreamingIndicator={message.id === latestStreamingMessageId}
+          streamingElapsedSeconds={message.id === latestStreamingMessageId && shouldRunTimer ? elapsedSeconds : 0}
         />
       {/each}
       <!-- 对话级处理指示器：无流式消息但仍在处理中时显示 -->
@@ -279,7 +294,7 @@
           <span class="streaming-dot"></span>
           <span class="streaming-dot"></span>
           <span class="streaming-dot"></span>
-          {#if elapsedSeconds > 0}
+          {#if timerStartTime > 0}
             <span class="elapsed-time">{formatElapsed(elapsedSeconds)}</span>
           {/if}
         </div>
