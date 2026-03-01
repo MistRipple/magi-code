@@ -14,6 +14,8 @@
  * - dispatch_task: 将子任务分配给专业 Worker
  * - send_worker_message: 向 Worker 面板发送消息
  * - wait_for_workers: 等待 Worker 完成并获取结果（反应式编排）
+ * - get_todos: 获取当前任务的 todo 列表
+ * - update_todo: 更新 todo 状态
  *
  * ACE 配置来源：~/.magi/config.json 的 promptEnhance 字段（唯一）
  */
@@ -413,6 +415,8 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     'send_worker_message',
     'wait_for_workers',
     'split_todo',
+    'get_todos',
+    'update_todo',
   ];
 
   /**
@@ -772,8 +776,10 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       case 'wait_for_workers':
         return await this.orchestrationExecutor.execute(toolCall);
 
+      case 'get_todos':
+      case 'update_todo':
       case 'split_todo': {
-        // split_todo 需要调用方上下文（标识当前 worker/assignment/todo）
+        // 编排层 todo 工具需要调用方上下文（标识当前 worker/assignment/todo）
         const execCtx = this.executionContextStorage.getStore();
         const callerContext = execCtx?.workerId
           ? this.snapshotContextMap.get(execCtx.workerId)
