@@ -778,8 +778,7 @@ ${criteriaList}
 ${completedWork}
 
 ### 指令
-请逐条检查验收标准。注意："步骤已执行" ≠ "标准已满足"，请检查实际产出质量。
-如有必要，可使用 file_view 等工具查看实际文件内容来验证。
+请逐条检查验收标准。注意："步骤已执行" ≠ "标准已满足"，请基于已完成工作检查实际产出质量。
 
 检查完成后，请以如下 JSON 格式回复：
 \`\`\`json
@@ -803,16 +802,19 @@ ${completedWork}
 \`\`\``;
 
     // 3. 使用 Worker LLM session 执行验收检查（复用已有上下文）
-    const response = await options.adapterFactory!.sendMessage(
-      this.workerType,
-      prompt,
-      undefined,
-      {
-        source: 'worker',
-        adapterRole: 'worker',
-        ...options.adapterScope,
-      }
-    );
+    // 使用静默调用，不推送自检过程和结果到 UI
+    const response = options.adapterFactory!.sendSilentMessage
+      ? await options.adapterFactory!.sendSilentMessage(this.workerType, prompt)
+      : await options.adapterFactory!.sendMessage(
+          this.workerType,
+          prompt,
+          undefined,
+          {
+            source: 'worker',
+            adapterRole: 'worker',
+            ...options.adapterScope,
+          }
+        );
 
     // 4. 解析验收结果
     const content = response.content || '';

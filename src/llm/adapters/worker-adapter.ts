@@ -257,6 +257,29 @@ ${fileContent}
   }
 
   /**
+   * 静默发送消息：直接用底层 client 非流式调用，不触发 normalizer/emit/UI 推送。
+   * 适用于内部自检等不需要展示给用户的场景。
+   * 对话历史会正常更新，确保后续调用的上下文连贯。
+   */
+  async sendSilentMessage(message: string): Promise<string> {
+    this.conversationHistory.push({ role: 'user', content: message });
+
+    const response = await this.client.sendMessage({
+      messages: this.conversationHistory,
+      systemPrompt: this.systemPrompt,
+      maxTokens: 4096,
+      temperature: 0.7,
+      stream: false,
+    });
+
+    const content = response.content || '';
+    this.conversationHistory.push({ role: 'assistant', content });
+    this.recordTokenUsage(response.usage);
+
+    return content;
+  }
+
+  /**
    * 迭代式工具调用模式
    *
    * 每轮 LLM 调用使用独立 streamId，首轮绑定 placeholder，后续轮次生成新 messageId。

@@ -92,6 +92,15 @@ export interface IAdapterFactory extends EventEmitter {
   ): Promise<AdapterResponse>;
 
   /**
+   * 静默发送消息（不推送到 UI），用于内部自检等场景。
+   * 直接用底层 client 非流式调用，对话历史正常更新。
+   */
+  sendSilentMessage?(
+    agent: AgentType,
+    message: string,
+  ): Promise<AdapterResponse>;
+
+  /**
    * 中断指定代理的当前操作
    */
   interrupt(agent: AgentType): Promise<void>;

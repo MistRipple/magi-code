@@ -642,6 +642,43 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   }
 
   /**
+   * 静默发送消息（不推送到 UI），用于内部自检等场景。
+   * 直接用底层 client 非流式调用，对话历史正常更新。
+   */
+  async sendSilentMessage(
+    agent: AgentType,
+    message: string,
+  ): Promise<AdapterResponse> {
+    const adapter = this.getOrCreateAdapter(agent);
+
+    try {
+      await this.ensureConnected(agent, adapter);
+    } catch (error: any) {
+      return {
+        content: '',
+        done: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+
+    if (adapter instanceof WorkerLLMAdapter) {
+      try {
+        const content = await adapter.sendSilentMessage(message);
+        return { content, done: true };
+      } catch (error: any) {
+        return {
+          content: '',
+          done: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
+
+    // 降级：非 Worker 适配器使用常规 sendMessage
+    return this.sendMessage(agent, message);
+  }
+
+  /**
    * 中断（实现 IAdapterFactory 接口）
    */
   async interrupt(agent: AgentType): Promise<void> {
