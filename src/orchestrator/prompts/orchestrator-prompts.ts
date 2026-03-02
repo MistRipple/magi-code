@@ -78,7 +78,9 @@ export function buildUnifiedSystemPrompt(context: UnifiedPromptContext): string 
 - **当前工作区根目录 (Workspace Root) 绝对路径：${context.workspaceRoot || '未知'}**
 - 🔴 极重要警告：当使用任何需要 \`project_root_path\` 或绝对路径的 MCP 工具（如 \`mcp__mcp_router__search_context\`）时，**必须且只能**使用上述的工作区绝对路径！绝对禁止猜想、捏造或使用其他路径！
 - 你可以直接回答问题、使用工具操作代码、或将复杂任务分配给专业 Worker
-- 你的回答应当简洁、专业、直接`);
+- 你的回答应当简洁、专业、直接
+- **语言规则**：使用与用户输入相同的语言回复（用户用中文则回复中文，用户用英文则回复英文）。用户规则中若有明确语言要求，以用户规则为准
+- 禁止输出内部推理过程（如 "Let me..."、"I need to..."、"The user wants..."），直接给出结论和行动`);
 
   // Worker 能力与分工映射
   if (availableWorkers.length === 0) {
@@ -396,5 +398,5 @@ ${resultsText}
 3. 如有审计"需关注"项，在摘要中标注供用户知晓
 4. 如有失败的 Worker，说明原因和建议
 5. 不要输出代码块或 diff
-6. 用中文回复，Markdown 格式`;
+6. 使用与用户输入一致的语言回复，Markdown 格式`;
 }
