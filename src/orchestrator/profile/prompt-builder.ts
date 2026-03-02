@@ -52,6 +52,11 @@ export class PromptBuilder {
 
     sections.push(this.buildToolUsageSection(context.availableToolsSummary));
 
+    // 语言规则：跟随用户输入语言，用户规则中若有明确要求则以用户规则为准
+    sections.push(`## 语言规则
+- 使用与任务指令相同的语言进行输出
+- 禁止输出内部推理过程（如 "Let me..."、"I need to..."），直接执行行动`);
+
     return sections.join('\n\n');
   }
 
