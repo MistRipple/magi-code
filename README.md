@@ -1,5 +1,3 @@
-![1771992564561](image/README/1771992564561.png)![1771992566130](image/README/1771992566130.png)<div align="center">
-
 # 🔮 Magi
 
 **新一代多智能体工程编排系统**
