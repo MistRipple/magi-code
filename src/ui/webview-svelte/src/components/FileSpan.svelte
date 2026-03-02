@@ -57,16 +57,18 @@
 
   const fileIcon = $derived(getFileIcon(filepath));
 
-  function handleClick() {
+  function handleClick(e: MouseEvent) {
     if (clickable && onClick) {
+      e.stopPropagation();
       onClick(filepath);
     }
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Enter' || e.key === ' ') {
+    if (clickable && onClick && (e.key === 'Enter' || e.key === ' ')) {
       e.preventDefault();
-      handleClick();
+      e.stopPropagation();
+      onClick(filepath);
     }
   }
 </script>

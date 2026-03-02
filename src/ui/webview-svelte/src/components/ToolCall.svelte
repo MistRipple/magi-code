@@ -6,6 +6,14 @@
   import MarkdownContent from './MarkdownContent.svelte';
   import { vscode } from '../lib/vscode-bridge';
   import type { IconName } from '../lib/icons';
+  import type { StandardizedToolResult } from '../types/message';
+
+  interface ErrorDiagnosis {
+    category: 'model_input' | 'context_stale' | 'permission' | 'runtime';
+    categoryLabel: string;
+    ownerLabel: string;
+    hint: string;
+  }
 
   // Props
   interface Props {
@@ -14,6 +22,7 @@
     input?: unknown;
     output?: unknown;
     error?: string;
+    standardized?: StandardizedToolResult;
     status?: 'pending' | 'running' | 'success' | 'error';
     duration?: number;
     initialExpanded?: boolean;
@@ -27,6 +36,7 @@
     input,
     output,
     error,
+    standardized,
     status = 'success',
     duration,
     initialExpanded = false,
@@ -113,8 +123,8 @@
     name === 'file_edit' || name === 'file_create' || name === 'file_insert' || name === 'file_remove'
   );
 
-  // 文件查看工具：只读操作，只需紧凑 header
-  const isFileViewTool = $derived(name === 'file_view');
+  // 目录/文件只读工具：只需紧凑 header
+  const isCompactReadOnlyTool = $derived(name === 'file_view' || name === 'list_files');
 
   // 检查是否有内容
   const hasInput = $derived(!!input && !!formatContent(input));
@@ -164,6 +174,7 @@
       'codebase_retrieval': 'retrieval',
       'dispatch_task': 'dispatch',
       'send_worker_message': 'message',
+      'list_files': 'list files',
     };
 
     return displayNameMap[toolName] ?? toolName;
@@ -179,7 +190,8 @@
       case 'file_view':
       case 'file_create':
       case 'file_edit':
-      case 'file_insert': {
+      case 'file_insert':
+      case 'list_files': {
         const p = typeof args.path === 'string' ? args.path : '';
         return p;
       }
@@ -231,6 +243,71 @@
     return /^#{1,4}\s|^\|.+\|$|^\s*[-*]\s|^\s*\d+\.\s|^>\s|^---$|```|\*\*[^*]+\*\*/m.test(outputText);
   });
 
+  function detectErrorDiagnosis(errorText?: string, toolResult?: StandardizedToolResult): ErrorDiagnosis | null {
+    const rawMessage = `${toolResult?.message || ''}\n${errorText || ''}`.trim();
+    if (!rawMessage) return null;
+
+    const message = rawMessage.toLowerCase();
+    const errorCode = (toolResult?.errorCode || '').toLowerCase();
+    const matches = (...patterns: string[]): boolean =>
+      patterns.some((pattern) => errorCode.includes(pattern) || message.includes(pattern));
+
+    if (matches('file_context_stale', '[file_context_stale]')) {
+      return {
+        category: 'context_stale',
+        categoryLabel: '上下文过期',
+        ownerLabel: '归因：流程上下文',
+        hint: '先对目标文件执行一次 file_view，再基于最新内容重新生成 old_str 与行锚点。',
+      };
+    }
+
+    if (matches('file_edit_no_effective_change', '[file_edit_no_effective_change]')) {
+      return {
+        category: 'model_input',
+        categoryLabel: '参数无效',
+        ownerLabel: '归因：LLM 参数',
+        hint: '本次 edit 没有有效文本增量，请重新生成可产生差异的 old_str/new_str。',
+      };
+    }
+
+    if (matches(
+      'tool_rejected',
+      'command rejected',
+      '参数解析失败',
+      'path is required',
+      'old_str_1 is required',
+      'old_str and new_str are identical',
+      'old_str appears multiple times',
+      'old_str not found',
+      'no match found close',
+    )) {
+      return {
+        category: 'model_input',
+        categoryLabel: '参数不匹配',
+        ownerLabel: '归因：LLM 参数',
+        hint: '工具参数或锚点与当前文件不匹配，需要重新读取文件并生成新的编辑参数。',
+      };
+    }
+
+    if (matches('tool_blocked', 'authorization', 'user denied tool authorization')) {
+      return {
+        category: 'permission',
+        categoryLabel: '权限拦截',
+        ownerLabel: '归因：权限策略',
+        hint: '当前操作被授权策略拦截，需要授权放行后再执行。',
+      };
+    }
+
+    return {
+      category: 'runtime',
+      categoryLabel: '执行异常',
+      ownerLabel: '归因：工具执行链',
+      hint: '工具进入执行阶段后失败，请检查执行器日志或外部环境（保存、格式化、进程改写）。',
+    };
+  }
+
+  const errorDiagnosis = $derived.by(() => detectErrorDiagnosis(error, standardized));
+
   function toggle() {
     collapsed = !collapsed;
   }
@@ -247,9 +324,33 @@
     }
   }
 
+  // 从工具参数中提取文件路径
+  const toolFilepath = $derived.by(() => {
+    if (filepath) return filepath;
+    if (!input || typeof input !== 'object') return undefined;
+    const args = input as Record<string, unknown>;
+
+    // 支持各种含有 path 的工具，排除 list_files 因为它通常是目录
+    if (name !== 'list_files' && typeof args.path === 'string' && args.path.trim().length > 0) {
+      return args.path;
+    }
+
+    return undefined;
+  });
+
+  // 处理文件点击
   function handleOpenFile() {
-    if (filepath && onOpenFile) {
-      onOpenFile(filepath);
+    if (toolFilepath) {
+      // 优先使用传入的回调
+      if (onOpenFile) {
+        onOpenFile(toolFilepath);
+      } else {
+        // 后备：直接发消息给 VSCode 桥
+        vscode.postMessage({
+          type: 'openFile',
+          filePath: toolFilepath
+        });
+      }
     }
   }
 </script>
@@ -261,8 +362,13 @@
 
   <span class="tool-title">
     <span class="tool-name">{toolDisplayName}</span>
-    {#if filepath}
-      <FileSpan {filepath} showIcon={false} clickable={!!onOpenFile} onClick={handleOpenFile} />
+    {#if status === 'error' && errorDiagnosis}
+      <span class="error-tag error-{errorDiagnosis.category}" title={errorDiagnosis.ownerLabel}>
+        {errorDiagnosis.categoryLabel}
+      </span>
+    {/if}
+    {#if toolFilepath}
+      <FileSpan filepath={toolFilepath} showIcon={false} clickable={true} onClick={handleOpenFile} />
     {:else if toolSummary}
       <span class="tool-summary" title={toolSummary}>{toolSummary}</span>
     {/if}
@@ -281,13 +387,13 @@
   <!-- 文件变更工具完成：由 FileChangeCard 全权展示 -->
 {:else}
   {@const isCompactMutation = isFileMutationTool && (status === 'running' || status === 'pending')}
-  {@const isExpandable = hasContent && !isFileViewTool && !isCompactMutation}
-  {#if isExpandable || isFileViewTool || isCompactMutation}
+  {@const isExpandable = hasContent && !isCompactReadOnlyTool && !isCompactMutation}
+  {#if isExpandable || isCompactReadOnlyTool || isCompactMutation}
     <div
       class="tool-call"
       class:collapsed={isExpandable && collapsed}
       class:has-error={isExpandable && hasError}
-      class:file-mutation={isCompactMutation}
+      class:file-mutation={isCompactMutation || isCompactReadOnlyTool}
       data-status={statusInfo.class}
     >
       {#if isExpandable}
@@ -298,7 +404,21 @@
           {@render headerContent()}
         </button>
       {:else}
-        <div class="tool-header" class:file-mutation-header={isCompactMutation}>
+        <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+        <div
+          class="tool-header"
+          class:file-mutation-header={isCompactMutation || isCompactReadOnlyTool}
+          class:clickable={isCompactReadOnlyTool && !!toolFilepath}
+          onclick={isCompactReadOnlyTool && toolFilepath ? handleOpenFile : undefined}
+          onkeydown={(e) => {
+            if (isCompactReadOnlyTool && toolFilepath && (e.key === 'Enter' || e.key === ' ')) {
+              e.preventDefault();
+              handleOpenFile();
+            }
+          }}
+          role={isCompactReadOnlyTool && toolFilepath ? "button" : undefined}
+          tabindex={isCompactReadOnlyTool && toolFilepath ? 0 : undefined}
+        >
           {@render headerContent()}
         </div>
       {/if}
@@ -344,8 +464,14 @@
             <div class="tool-section error">
               <div class="section-header">
                 <span class="section-label">错误</span>
+                {#if errorDiagnosis}
+                  <span class="diagnosis-owner">{errorDiagnosis.ownerLabel}</span>
+                {/if}
               </div>
               <pre class="section-content error-content">{error}</pre>
+              {#if errorDiagnosis}
+                <div class="error-hint">{errorDiagnosis.hint}</div>
+              {/if}
             </div>
           {/if}
 
@@ -384,12 +510,16 @@
   .file-mutation-header {
     cursor: default;
     padding: var(--space-1, 4px) 0;
-    opacity: 0.75;
+    opacity: 0.85;
   }
 
   .file-mutation-header:hover {
     background: transparent;
     opacity: 1;
+  }
+
+  .file-mutation-header.clickable {
+    cursor: pointer;
   }
 
   .tool-header {
@@ -436,6 +566,7 @@
     font-weight: 500;
     font-size: var(--text-sm, 13px);
     white-space: nowrap;
+    flex-shrink: 0;
   }
 
   .tool-summary {
@@ -447,6 +578,43 @@
     text-overflow: ellipsis;
     min-width: 0;
     flex: 1;
+  }
+
+  .error-tag {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 6px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    font-size: 10px;
+    line-height: 1.4;
+    font-weight: 500;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .error-model_input {
+    color: var(--warning);
+    border-color: rgba(245, 158, 11, 0.45);
+    background: rgba(245, 158, 11, 0.12);
+  }
+
+  .error-context_stale {
+    color: var(--info);
+    border-color: rgba(59, 130, 246, 0.45);
+    background: rgba(59, 130, 246, 0.12);
+  }
+
+  .error-permission {
+    color: var(--warning);
+    border-color: rgba(234, 179, 8, 0.45);
+    background: rgba(234, 179, 8, 0.12);
+  }
+
+  .error-runtime {
+    color: var(--error);
+    border-color: rgba(239, 68, 68, 0.45);
+    background: rgba(239, 68, 68, 0.12);
   }
 
   .tool-status {
@@ -540,6 +708,22 @@
   .error-content {
     color: var(--error);
     background: rgba(239, 68, 68, 0.1);
+  }
+
+  .diagnosis-owner {
+    font-size: var(--text-xs, 11px);
+    color: var(--foreground-muted);
+  }
+
+  .error-hint {
+    margin-top: var(--space-2, 8px);
+    padding: var(--space-2, 8px);
+    border-radius: var(--radius-sm);
+    border: 1px dashed var(--border);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs, 11px);
+    line-height: 1.5;
+    background: var(--surface-1, rgba(255,255,255,0.02));
   }
 
   .markdown-output {
