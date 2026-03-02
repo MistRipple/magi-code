@@ -1118,6 +1118,41 @@ IMPORTANT:
 
     // 收集失败条目的消息（已在循环中以 [FAILED] 前缀记录）
     const failedMessages = results.filter(r => r.startsWith('[FAILED]'));
+    const hasNoEffectiveChange = (fileChange.additions ?? 0) === 0 && (fileChange.deletions ?? 0) === 0;
+    const inMemoryChanged = originalContent !== content;
+    const settledChanged = originalContent !== finalContent;
+    const postWriteRewritten = content !== finalContent;
+
+    if (hasNoEffectiveChange) {
+      const allMessages = [...finalSuccessMessages, ...failedMessages];
+      const diagnostics: string[] = [];
+      if (!inMemoryChanged) {
+        diagnostics.push('- 内存态无增量：替换结果在同次调用内相互抵消，或归一化后等价。');
+      }
+      if (inMemoryChanged && !settledChanged) {
+        diagnostics.push('- 写入后回到原文：可能被 format-on-save 或外部进程重写。');
+      }
+      if (postWriteRewritten) {
+        diagnostics.push('- 写入缓冲与最终落盘不同：检测到保存后有二次改写。');
+      }
+      if (diagnostics.length === 0) {
+        diagnostics.push('- 未检测到最终文本差异：请重新 file_view 并基于最新内容生成 old_str。');
+      }
+
+      logger.warn('file_edit produced no effective changes', {
+        path: filePath,
+        entryCount: entries.length,
+        inMemoryChanged,
+        settledChanged,
+        postWriteRewritten,
+      }, LogCategory.TOOLS);
+
+      return {
+        toolCallId,
+        content: `Error: file_edit produced no effective text changes after write/save settle.\n原因诊断:\n${diagnostics.join('\n')}\n${allMessages.join('\n')}\n\nHint: run file_view for the latest content and regenerate old_str/line anchors.`,
+        isError: true,
+      };
+    }
 
     // 单条且无错误时简化输出
     if (entries.length === 1 && !hasError) {

@@ -203,6 +203,8 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   setWorkspaceFolders(workspaceFolders: WorkspaceFolderInfo[]): void {
     this.workspaceRoots = new WorkspaceRoots(workspaceFolders);
     this.workspaceRoot = this.workspaceRoots.getPrimaryFolder().path;
+    this.workspaceMutationEpoch = 0;
+    this.fileContextEpochByPath.clear();
     this.fileExecutor = new FileExecutor(this.workspaceRoots);
     this.searchExecutor = new SearchExecutor(this.workspaceRoots);
     this.removeFilesExecutor = new RemoveFilesExecutor(this.workspaceRoots);
@@ -736,6 +738,12 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     if (status === 'aborted') {
       return 'tool_aborted';
     }
+    if (content.includes('[FILE_CONTEXT_STALE]')) {
+      return 'file_context_stale';
+    }
+    if (content.includes('[FILE_EDIT_NO_EFFECTIVE_CHANGE]')) {
+      return 'file_edit_no_effective_change';
+    }
     if (content.startsWith('MCP tool execution failed:')) {
       return 'mcp_execution_failed';
     }
@@ -772,6 +780,16 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       case 'file_edit':
       case 'file_insert':
       case 'file_bulk_edit': {
+        if (name === 'file_edit') {
+          const noEffectError = this.validateFileEditHasEffectiveChange(toolCall);
+          if (noEffectError) {
+            return {
+              toolCallId: toolCall.id,
+              content: noEffectError,
+              isError: true,
+            };
+          }
+        }
         if (name === 'file_edit' || name === 'file_insert') {
           const staleError = this.validateFileContextFreshnessBeforeEdit(toolCall);
           if (staleError) {
@@ -1507,12 +1525,75 @@ After a mutating command, refresh each target file with file_view once before fi
   }
 
   /**
-   * 历史遗留：曾基于 workspaceMutationEpoch 做全局"上下文过期"硬拦截。
-   * 底层 VSCode 内存模型与读写管道已具备强制同步与模糊匹配能力，此拦截不再必要。
-   * 保留方法签名以避免调用方变更，直接返回 null（永不拦截）。
+   * 预检 file_edit 是否有有效文本增量。
+   * 对于 old_str 与 new_str 完全相同的调用，直接拦截，避免无效工具执行。
    */
-  private validateFileContextFreshnessBeforeEdit(_toolCall: ToolCall): string | null {
-    return null;
+  private validateFileEditHasEffectiveChange(toolCall: ToolCall): string | null {
+    if (toolCall.name !== 'file_edit') {
+      return null;
+    }
+
+    const args = (toolCall.arguments || {}) as Record<string, unknown>;
+    const oldStrKeys = Object.keys(args)
+      .filter(k => /^old_str_\d+$/.test(k))
+      .sort((a, b) => Number(a.replace('old_str_', '')) - Number(b.replace('old_str_', '')));
+
+    if (oldStrKeys.length === 0) {
+      return null;
+    }
+
+    const noEffectEntries: number[] = [];
+
+    for (const oldKey of oldStrKeys) {
+      const index = Number(oldKey.replace('old_str_', ''));
+      const oldStr = args[oldKey];
+      if (typeof oldStr !== 'string') {
+        continue;
+      }
+      const newStrRaw = args[`new_str_${index}`];
+      const newStr = typeof newStrRaw === 'string' ? newStrRaw : '';
+
+      if (this.normalizeLineEndings(oldStr) !== this.normalizeLineEndings(newStr)) {
+        return null;
+      }
+
+      noEffectEntries.push(index);
+    }
+
+    if (noEffectEntries.length === 0) {
+      return null;
+    }
+
+    return `Error [FILE_EDIT_NO_EFFECTIVE_CHANGE]: entries ${noEffectEntries.join(', ')} have identical old_str/new_str, no effective change to apply. Regenerate edit content before calling file_edit.`;
+  }
+
+  /**
+   * 上下文新鲜度校验：
+   * 当工作区可能被外部命令改写后，file_edit/file_insert 必须先对目标文件执行一次 file_view。
+   * 这样可保证后续行锚点与 old_str 基于最新文件状态，避免“调用成功但无改动”。
+   */
+  private validateFileContextFreshnessBeforeEdit(toolCall: ToolCall): string | null {
+    // file_insert 允许创建新文件；新文件不存在时无需 freshness 校验。
+    const absPath = this.resolveFileToolPath(toolCall, true);
+    if (!absPath) {
+      return null;
+    }
+
+    if (this.workspaceMutationEpoch === 0) {
+      return null;
+    }
+
+    const fileEpoch = this.fileContextEpochByPath.get(absPath);
+    if (fileEpoch !== undefined && fileEpoch >= this.workspaceMutationEpoch) {
+      return null;
+    }
+
+    const displayPath = this.workspaceRoots.toDisplayPath(absPath);
+    return `Error [FILE_CONTEXT_STALE]: ${displayPath} may have changed after external mutations. Run file_view on this file once, then retry file_edit/file_insert with refreshed anchors.`;
+  }
+
+  private normalizeLineEndings(input: string): string {
+    return input.replace(/\r\n/g, '\n');
   }
 
   private recordFileContextAfterFileTool(toolCall: ToolCall, result: ToolResult): void {

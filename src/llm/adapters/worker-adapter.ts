@@ -455,7 +455,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
                 result.isError ? undefined : result.content,
                 result.isError ? result.content : undefined,
                 result.fileChange,
-                result.standardized,
+                result.standardized
               );
               continue;
             }
@@ -473,16 +473,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
               standardized: result.standardized,
             });
 
-            if (!result.isError && result.fileChange) {
-              this.normalizer.addFileChangeBlock(
-                deferredToolStreamId,
-                result.fileChange.filePath,
-                result.fileChange.changeType,
-                result.fileChange.additions,
-                result.fileChange.deletions,
-                result.fileChange.diff,
-              );
-            }
+            this.normalizer.finishToolCall(
+              deferredToolStreamId,
+              toolCall.id,
+              result.isError ? undefined : result.content,
+              result.isError ? result.content : undefined,
+              result.fileChange,
+              result.standardized
+            );
             this.normalizer.endStream(deferredToolStreamId);
           }
 
@@ -744,6 +742,10 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     this.viewedFiles.clear();
     this.viewedRanges.clear();
     this.totalDedupHits = 0;
+    this.roundDedupHits = 0;
+    this.failedWriteCache.clear();
+    this.successWriteCache.clear();
+    this.roundWriteInterceptCount = 0;
     logger.debug(`${this.agent} conversation history cleared`, undefined, LogCategory.LLM);
   }
 
@@ -1308,6 +1310,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     cached.count++;
     this.totalDedupHits++;
     this.roundDedupHits++;
+    this.roundWriteInterceptCount++;
 
     return `[系统拦截] 此操作已失败 ${cached.count} 次，错误：${cached.error}。请勿重复相同操作，改用其他方式完成任务。`;
   }
@@ -1357,6 +1360,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    */
   private recordFailedWrite(toolCall: ToolCall, error: string): void {
     if (this.isReadOnlyToolCall(toolCall)) return;
+    if (this.shouldSkipFailedWriteCache(error)) return;
 
     const key = this.buildWriteOperationKey(toolCall);
     const existing = this.failedWriteCache.get(key);
@@ -1366,6 +1370,10 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     } else {
       this.failedWriteCache.set(key, { count: 1, error });
     }
+  }
+
+  private shouldSkipFailedWriteCache(error: string): boolean {
+    return error.includes('[FILE_CONTEXT_STALE]');
   }
 
   /**
@@ -1403,13 +1411,16 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     if (toolCall.name === 'read-process' || toolCall.name === 'write-process' || toolCall.name === 'kill-process') {
       return `${toolCall.name}:${String(args.terminal_id || '')}`;
     }
-    // file_edit/file_create/file_insert: path 足以标识
-    if (toolCall.name === 'file_edit' || toolCall.name === 'file_create' || toolCall.name === 'file_insert') {
-      return `${toolCall.name}:${args.path || ''}`;
+    // 文件写工具必须使用内容感知 key，避免“一次失败拦截同文件后续所有不同编辑”。
+    if (toolCall.name === 'file_edit'
+      || toolCall.name === 'file_create'
+      || toolCall.name === 'file_insert'
+      || toolCall.name === 'file_bulk_edit'
+      || toolCall.name === 'file_remove') {
+      return this.buildContentAwareWriteKey(toolCall);
     }
-    // 其他写操作工具：name + path
-    const filePath = args.path || args.file_path || args.filepath || '';
-    return `${toolCall.name}:${filePath}`;
+    // 其他写工具默认走内容感知 key，保持失败去重精确性
+    return this.buildContentAwareWriteKey(toolCall);
   }
 
   private isFileMutationTool(toolName: string): boolean {

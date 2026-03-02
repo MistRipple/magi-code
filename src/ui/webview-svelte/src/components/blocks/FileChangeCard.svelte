@@ -136,16 +136,22 @@
       </span>
     </button>
 
-    {#if !collapsed && hasDiff}
+    {#if !collapsed}
       <div class="tool-content">
-        <div class="diff-container">
-          {#each diffLines as line, i}
-            <div class="diff-line {line.type}">
-              <span class="diff-prefix">{line.type === 'add' ? '+' : line.type === 'delete' ? '-' : ' '}</span>
-              <span class="diff-content">{@html highlightedLines[i] ?? ''}</span>
-            </div>
-          {/each}
-        </div>
+        {#if hasDiff}
+          <div class="diff-container">
+            {#each diffLines as line, i}
+              <div class="diff-line {line.type}">
+                <span class="diff-prefix">{line.type === 'add' ? '+' : line.type === 'delete' ? '-' : ' '}</span>
+                <span class="diff-content">{@html highlightedLines[i] ?? ''}</span>
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <div class="empty-diff-note">
+            没有可展示的 diff（本次操作最终未产生文本变更，或变更在保存时被回滚）。
+          </div>
+        {/if}
       </div>
     {/if}
   </div>
@@ -239,6 +245,17 @@
     background: var(--surface-2, rgba(0,0,0,0.1));
     animation: slideDown 0.2s ease-out;
     transform-origin: top;
+  }
+
+  .empty-diff-note {
+    margin: var(--space-3, 12px);
+    padding: var(--space-3, 12px);
+    border: 1px dashed var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--foreground-muted);
+    font-size: var(--text-sm, 13px);
+    line-height: 1.5;
+    background: var(--surface-1, rgba(255,255,255,0.02));
   }
 
   @keyframes slideDown {

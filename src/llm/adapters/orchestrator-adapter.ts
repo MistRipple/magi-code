@@ -689,7 +689,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                 result.isError ? undefined : result.content,
                 result.isError ? result.content : undefined,
                 result.fileChange,
-                result.standardized,
+                result.standardized
               );
               continue;
             }
@@ -707,16 +707,14 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               standardized: result.standardized,
             });
 
-            if (!result.isError && result.fileChange) {
-              this.normalizer.addFileChangeBlock(
-                deferredToolStreamId,
-                result.fileChange.filePath,
-                result.fileChange.changeType,
-                result.fileChange.additions,
-                result.fileChange.deletions,
-                result.fileChange.diff,
-              );
-            }
+            this.normalizer.finishToolCall(
+              deferredToolStreamId,
+              toolCall.id,
+              result.isError ? undefined : result.content,
+              result.isError ? result.content : undefined,
+              result.fileChange,
+              result.standardized
+            );
             this.normalizer.endStream(deferredToolStreamId);
           }
 
