@@ -16,6 +16,7 @@
  */
 
 import { EventEmitter } from 'events';
+import * as vscode from 'vscode';
 import { AgentType, WorkerSlot, TokenUsage } from '../types/agent-types';
 import { BaseLLMAdapter } from './adapters/base-adapter';
 import { WorkerLLMAdapter, WorkerAdapterConfig, getStallDetectionPreset } from './adapters/worker-adapter';
@@ -261,6 +262,12 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     const normalizer = createNormalizer(workerSlot, 'worker', false);
 
     // 创建适配器（注入 MessageHub）
+    const deepTask = this.isDeepTask();
+    const stallConfig = getStallDetectionPreset(workerSlot);
+    if (deepTask) {
+      // 深度任务模式：解除总轮次硬上限，仅保留空转检测等智能安全网
+      stallConfig.maxTotalRounds = Infinity;
+    }
     const adapterConfig: WorkerAdapterConfig = {
       client,
       normalizer,
@@ -269,7 +276,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       messageHub: this.getMessageHub(),  // 🔧 统一消息通道：使用 messageHub
       workerSlot,
       profileLoader: this.profileLoader,
-      stallConfig: getStallDetectionPreset(workerSlot),
+      stallConfig,
     };
 
     const adapter = new WorkerLLMAdapter(adapterConfig);
@@ -335,12 +342,14 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     const normalizer = createNormalizer('claude', 'orchestrator', false, 'orchestrator');
 
     // 创建适配器（注入 MessageHub）
+    const deepTask = this.isDeepTask();
     const adapterConfig: OrchestratorAdapterConfig = {
       client,
       normalizer,
       toolManager: this.toolManager,
       config: orchestratorConfig,
       messageHub: this.getMessageHub(),  // 🔧 统一消息通道：使用 messageHub
+      deepTask,
     };
 
     const adapter = new OrchestratorLLMAdapter(adapterConfig);
@@ -756,6 +765,13 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   }
 
   /**
+   * 查询当前是否处于深度任务模式
+   */
+  isDeepTask(): boolean {
+    return vscode.workspace.getConfiguration('magi').get<boolean>('deepTask', false);
+  }
+
+  /**
    * 清除特定适配器
    */
   async clearAdapter(agent: AgentType): Promise<void> {
@@ -820,6 +836,16 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     this.adapters.clear();
 
     logger.info('Environment context refreshed', undefined, LogCategory.LLM);
+  }
+
+  /**
+   * 重置所有适配器的 Token 累计
+   */
+  resetAllTokenUsage(): void {
+    for (const [agent, adapter] of this.adapters) {
+      adapter.resetTokenUsage();
+      logger.info('适配器.Token.已重置', { agent }, LogCategory.LLM);
+    }
   }
 
   /**

@@ -15,7 +15,8 @@ import { logger, LogCategory } from '../logging';
 import * as fs from 'fs';
 import * as path from 'path';
 import { FileSnapshot } from '../types';
-import { AgentType } from '../types/agent-types';
+import { AgentType, WorkerSlot } from '../types/agent-types';
+import type { ContentBlock as StandardContentBlock } from '../protocol/message-protocol';
 import { globalEventBus } from '../events';
 import { estimateTokenCount } from '../utils/token-estimator';
 
@@ -25,11 +26,22 @@ export interface SessionMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
   agent?: AgentType;
-  source?: 'orchestrator' | 'worker' | 'system';
+  source?: 'orchestrator' | 'worker' | 'system' | WorkerSlot;
   timestamp: number;
   attachments?: { name: string; path: string; mimeType?: string }[];
   /** 用户上传的图片（base64 Data URL 格式） */
   images?: Array<{ dataUrl: string }>;
+  /** 结构化内容块（tool_call/file_change/thinking 等） */
+  blocks?: StandardContentBlock[];
+  /** UI 消息类型（text/tool_call/...） */
+  type?: string;
+  /** 系统通知级别 */
+  noticeType?: string;
+  /** 消息流式状态（恢复时会在前端归一为历史完成态） */
+  isStreaming?: boolean;
+  isComplete?: boolean;
+  /** 扩展元数据（cardId/eventSeq/standardized 等） */
+  metadata?: Record<string, unknown>;
 }
 
 /** 文件快照元数据 */
@@ -318,6 +330,23 @@ export class UnifiedSessionManager {
         if (typeof msg.timestamp !== 'number') {
           throw new Error('Session message timestamp invalid');
         }
+        if (msg.blocks !== undefined) {
+          if (!Array.isArray(msg.blocks)) {
+            throw new Error('Session message blocks invalid');
+          }
+          const hasInvalidBlock = msg.blocks.some((block) => {
+            if (!block || typeof block !== 'object' || Array.isArray(block)) {
+              return true;
+            }
+            return typeof (block as { type?: unknown }).type !== 'string';
+          });
+          if (hasInvalidBlock) {
+            throw new Error('Session message block item invalid');
+          }
+        }
+        if (msg.metadata !== undefined && (!msg.metadata || typeof msg.metadata !== 'object' || Array.isArray(msg.metadata))) {
+          throw new Error('Session message metadata invalid');
+        }
       }
       session.messages = messages;
       // ✅ 移除 cliOutputs 更新逻辑
@@ -602,6 +631,22 @@ export class UnifiedSessionManager {
       if (typeof msg.timestamp !== 'number') {
         logger.error('会话.验证.消息_非法_timestamp', { message: msg }, LogCategory.SESSION);
         return false;
+      }
+      if (msg.blocks !== undefined) {
+        if (!Array.isArray(msg.blocks)) {
+          logger.error('会话.验证.消息_blocks_非数组', { message: msg }, LogCategory.SESSION);
+          return false;
+        }
+        const invalidBlock = msg.blocks.some((block: any) => {
+          if (!block || typeof block !== 'object' || Array.isArray(block)) {
+            return true;
+          }
+          return typeof block.type !== 'string';
+        });
+        if (invalidBlock) {
+          logger.error('会话.验证.消息_blocks_非法', { message: msg }, LogCategory.SESSION);
+          return false;
+        }
       }
     }
 

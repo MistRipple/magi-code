@@ -462,6 +462,11 @@ export class TodoManager extends EventEmitter {
     const todo = await this.get(todoId);
     if (!todo) throw new Error(`Todo not found: ${todoId}`);
 
+    // 幂等保证：重复完成请求不应打断执行流程
+    if (todo.status === 'completed') {
+      return;
+    }
+
     if (todo.status !== 'running') {
       throw new Error(`Cannot complete todo in status: ${todo.status}`);
     }
@@ -500,6 +505,24 @@ export class TodoManager extends EventEmitter {
     const todo = await this.get(todoId);
     if (!todo) throw new Error(`Todo not found: ${todoId}`);
 
+    if (todo.status === 'failed') {
+      return;
+    }
+
+    // completed / skipped 视为终态，不允许被失败回写覆盖
+    if (todo.status === 'completed' || todo.status === 'skipped') {
+      logger.warn('Todo.状态机.fail.忽略终态回写', {
+        todoId,
+        currentStatus: todo.status,
+        error,
+      }, LogCategory.TASK);
+      return;
+    }
+
+    if (todo.status !== 'running') {
+      throw new Error(`Cannot fail todo in status: ${todo.status}`);
+    }
+
     todo.status = 'failed';
     todo.completedAt = Date.now();
     todo.error = error;
@@ -515,6 +538,10 @@ export class TodoManager extends EventEmitter {
   async skip(todoId: string): Promise<void> {
     const todo = await this.get(todoId);
     if (!todo) throw new Error(`Todo not found: ${todoId}`);
+
+    if (todo.status === 'skipped') {
+      return;
+    }
 
     if (!VALID_TRANSITIONS[todo.status].includes('skipped')) {
       throw new Error(`Cannot skip todo in status: ${todo.status}`);
@@ -568,15 +595,21 @@ export class TodoManager extends EventEmitter {
   /**
    * 重置 Todo 为 pending 状态（用于 WorkerPipeline 强制重试）
    *
-   * 与 retry() 不同，此方法接受 completed 和 failed 两种状态，
+   * 与 retry() 不同，此方法接受 completed / failed / skipped 三种状态，
    * 且不增加 retryCount（因为这是外部治理层发起的重试，不是 Todo 自身的错误恢复）。
    */
   async resetToPending(todoId: string): Promise<void> {
     const todo = await this.get(todoId);
-    if (!todo) return;
+    if (!todo) {
+      throw new Error(`Todo not found: ${todoId}`);
+    }
 
-    if (todo.status !== 'completed' && todo.status !== 'failed') {
-      return; // 仅重置已完成或已失败的 Todo
+    if (todo.status === 'pending') {
+      return;
+    }
+
+    if (todo.status !== 'completed' && todo.status !== 'failed' && todo.status !== 'skipped') {
+      throw new Error(`Cannot reset todo to pending from status: ${todo.status}`);
     }
 
     todo.status = 'pending';

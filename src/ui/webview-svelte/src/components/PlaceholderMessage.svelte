@@ -122,16 +122,7 @@
 
   .placeholder-message[data-state="thinking"] {
     border-left-color: var(--primary);
-    animation: fadeSlideIn 0.2s ease-out, thinkingPulse 2s ease-in-out infinite;
-  }
-
-  @keyframes thinkingPulse {
-    0%, 100% {
-      box-shadow: 0 0 0 0 rgba(59, 130, 246, 0);
-    }
-    50% {
-      box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.1);
-    }
+    animation: fadeSlideIn 0.2s ease-out;
   }
 
   /* Reduced motion preference */

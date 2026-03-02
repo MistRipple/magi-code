@@ -75,6 +75,16 @@
 
   const hasDiff = $derived(diffLines.length > 0);
 
+  const emptyDiffNote = $derived.by(() => {
+    if (!change) return '没有可展示的 diff。';
+    const additions = typeof change.additions === 'number' ? change.additions : 0;
+    const deletions = typeof change.deletions === 'number' ? change.deletions : 0;
+    if (additions > 0 || deletions > 0) {
+      return '本次有文本变更，但后端未返回 diff 详情。';
+    }
+    return '本次操作最终未产生文本变更。';
+  });
+
   /** 对代码行做 hljs 语法高亮，返回 HTML 字符串数组（与 diffLines 一一对应） */
   const highlightedLines = $derived.by((): string[] => {
     if (!diffLines.length) return [];
@@ -149,7 +159,7 @@
           </div>
         {:else}
           <div class="empty-diff-note">
-            没有可展示的 diff（本次操作最终未产生文本变更，或变更在保存时被回滚）。
+            {emptyDiffNote}
           </div>
         {/if}
       </div>

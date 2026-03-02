@@ -7,6 +7,7 @@
 
   // Props - Svelte 5 语法
   interface Props {
+    workerName?: 'claude' | 'codex' | 'gemini';
     messages: Message[];
     /** 空状态配置（可选） */
     emptyState?: {
@@ -21,12 +22,19 @@
     /** 当前面板是否处于可见激活状态（用于 display:none -> visible 场景下的滚动恢复） */
     isActive?: boolean;
   }
-  let { messages, emptyState, readOnly = false, displayContext = 'thread', isActive = true }: Props = $props();
+  let { workerName, messages, emptyState, readOnly = false, displayContext = 'thread', isActive = true }: Props = $props();
 
   // 🛡️ 防御性编程：过滤无效的消息
   const safeMessages = $derived(
     (messages || []).filter(m => !!m && !!m.id)
   );
+
+  function getMessageRequestId(message: Message | undefined): string | null {
+    const requestId = message?.metadata?.requestId;
+    if (typeof requestId !== 'string') return null;
+    const normalized = requestId.trim();
+    return normalized.length > 0 ? normalized : null;
+  }
 
   /**
    * 生成消息的稳定 Svelte key
@@ -83,20 +91,49 @@
     return streamingMsgs.map(m => `${m.id}:${(m.content || '').length}:${(m.blocks || []).length}`).join('|');
   });
 
-  // Worker 面板是否已参与当前请求：
-  // 只要当前请求中该 Worker 产生过消息，就保持处理指示与计时连续，直到请求结束。
-  const workerHasCurrentRequestActivity = $derived.by(() => {
-    if (displayContext !== 'worker') return false;
-    const requestStartAt = messagesState.thinkingStartAt;
-    if (!messagesState.isProcessing || !requestStartAt || requestStartAt <= 0) return false;
-    return safeMessages.some((m) => m.isStreaming || m.timestamp >= requestStartAt);
-  });
-
   // 对话级处理指示器
   // - thread: 全局 isProcessing 驱动，表示「对话仍在进行」
   // - worker: 当前请求级别（同一次请求内跨多轮不重置）
   // 仅当「当前无流式消息卡片」时显示，避免与卡片内流式动画重复导致视觉留白
   const hasStreamingMessage = $derived(safeMessages.some((m) => m.isStreaming));
+  const pendingRequestIds = $derived.by(() => Array.from(messagesState.pendingRequests));
+  const pendingRequestIdSet = $derived.by(() => new Set(pendingRequestIds));
+
+  const latestRoundAnchorMessage = $derived.by(() => {
+    for (let i = safeMessages.length - 1; i >= 0; i -= 1) {
+      const message = safeMessages[i];
+      if (displayContext === 'worker') {
+        if (message.type === 'instruction' || message.type === 'user_input') {
+          return message;
+        }
+      } else if (message.type === 'user_input') {
+        return message;
+      }
+    }
+    return null;
+  });
+
+  const latestRoundRequestId = $derived.by(() => getMessageRequestId(latestRoundAnchorMessage || undefined));
+  const panelHasPendingRequest = $derived.by(() => {
+    if (!latestRoundRequestId) return false;
+    return pendingRequestIdSet.has(latestRoundRequestId);
+  });
+
+  // Worker 面板是否在处理中：
+  // 仅当当前面板对应的 Worker 正在被激活处理、或本面板仍有当前请求挂起时，才显示处理指示器并计时。
+  // 关键修复：禁止仅凭“最后一条是 instruction”就判定活跃，避免旧轮次导致多面板同步计时。
+  const workerHasCurrentRequestActivity = $derived.by(() => {
+    if (displayContext !== 'worker') return false;
+
+    if (hasStreamingMessage) return true;
+    if (!messagesState.isProcessing) return false;
+
+    if (workerName && messagesState.processingActor?.agent === workerName) {
+      return true;
+    }
+
+    return panelHasPendingRequest;
+  });
   const latestStreamingMessageId = $derived.by(() => {
     for (let i = safeMessages.length - 1; i >= 0; i--) {
       if (safeMessages[i]?.isStreaming) {
@@ -129,21 +166,28 @@
 
   // 计时起点：
   // - thread: 从最后一条用户消息的时间戳开始
-  // - worker: 从当前请求启动时间开始（同一次请求内跨多轮保持连续）
+  // - worker: 从当前面板的最后一条指令或用户消息开始，实现独立计时
   const timerStartTime = $derived.by(() => {
     if (displayContext === 'worker') {
-      if (messagesState.thinkingStartAt) {
-        return messagesState.thinkingStartAt;
+      if (panelHasPendingRequest && latestRoundAnchorMessage) {
+        return latestRoundAnchorMessage.timestamp;
+      }
+
+      if (latestStreamingMessageId) {
+        const latestStreamingMessage = safeMessages.find((message) => message.id === latestStreamingMessageId);
+        if (latestStreamingMessage) {
+          return latestStreamingMessage.timestamp;
+        }
       }
       return 0;
     }
-    // 主对话区：从最后一条用户消息开始计时
-    for (let i = safeMessages.length - 1; i >= 0; i--) {
-      if (safeMessages[i].type === 'user_input') {
-        return safeMessages[i].timestamp;
-      }
+
+    // 主对话区：优先按当前请求的最后一条用户消息计时，确保按轮次重置
+    if (panelHasPendingRequest && latestRoundAnchorMessage) {
+      return latestRoundAnchorMessage.timestamp;
     }
-    // 兜底：没有用户消息时，使用处理开始时间
+
+    // 兜底：没有可匹配请求时，使用处理开始时间
     if (messagesState.thinkingStartAt) {
       return messagesState.thinkingStartAt;
     }

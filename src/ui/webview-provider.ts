@@ -25,6 +25,7 @@ import {
   MessageType,
   MessageCategory,
   ContentBlock,
+  StandardizedToolResultPayload,
   DataMessageType,
   NotifyLevel,
   ControlMessageType,
@@ -33,7 +34,7 @@ import {
   createStreamingMessage,
   createErrorMessage,
 } from '../protocol/message-protocol';
-import { UnifiedSessionManager } from '../session';
+import { UnifiedSessionManager, type SessionMessage } from '../session';
 import { TaskView } from '../task/task-view-adapter';
 import { SnapshotManager } from '../snapshot-manager';
 import { DiffGenerator } from '../diff-generator';
@@ -1243,7 +1244,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       case 'openFile':
         // 在编辑器中打开文件（从代码块点击文件路径）
-        await this.openFileInEditor(message.filepath);
+        {
+          const targetPath = this.resolveOpenFilePath(message);
+          if (!targetPath) {
+            this.sendToast('打开文件失败: 缺少文件路径', 'warning');
+            break;
+          }
+          await this.openFileInEditor(targetPath);
+        }
         break;
 
       case 'openLink':
@@ -1254,6 +1262,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'newSession':
+        if (Array.isArray(message.currentMessages)) {
+          this.saveCurrentSessionData(message.currentMessages);
+        }
         await this.handleNewSession();
         break;
 
@@ -1263,6 +1274,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'switchSession':
+        if (Array.isArray(message.currentMessages)) {
+          this.saveCurrentSessionData(message.currentMessages);
+        }
 
         if (this.activeSessionId !== message.sessionId) {
           await this.interruptCurrentTask({ silent: true });
@@ -1363,6 +1377,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         this.handleClearAllTasks();
         break;
 
+      case 'getDeepTaskState': {
+        // 推送当前深度任务模式状态到前端
+        const deepTaskValue = vscode.workspace.getConfiguration('magi').get<boolean>('deepTask', false);
+        this.sendData('deepTaskChanged', { enabled: deepTaskValue });
+        break;
+      }
+
       case 'openMermaidPanel':
         // 在新标签页打开 Mermaid 图表
         this.handleOpenMermaidPanel(message.code, message.title);
@@ -1382,6 +1403,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'openFile':
       case 'openLink':
       case 'saveCurrentSession':
+      case 'getDeepTaskState':
         return false;
       default:
         return true;
@@ -1599,6 +1621,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
     await executionStats.clearStats();
     this.orchestratorEngine.resetOrchestratorTokenUsage();
+    this.adapterFactory.resetAllTokenUsage();
     this.sendExecutionStats();
     this.sendToast('执行统计已重置', 'info');
   }
@@ -1811,8 +1834,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      // 打开文件
       const uri = vscode.Uri.file(absolutePath);
+      const stat = fs.statSync(absolutePath);
+      if (stat.isDirectory()) {
+        await vscode.commands.executeCommand('revealInExplorer', uri);
+        return;
+      }
+
+      // 打开文件
       const document = await vscode.workspace.openTextDocument(uri);
       await vscode.window.showTextDocument(document, {
         preview: false,
@@ -1822,6 +1851,16 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       logger.error('界面.文件.打开_失败', error, LogCategory.UI);
       this.sendToast(`打开文件失败: ${filepath}`, 'error');
     }
+  }
+
+  private resolveOpenFilePath(message: Extract<WebviewToExtensionMessage, { type: 'openFile' }>): string | null {
+    const candidates = [message.filepath, message.filePath];
+    for (const candidate of candidates) {
+      if (typeof candidate === 'string' && candidate.trim().length > 0) {
+        return candidate.trim();
+      }
+    }
+    return null;
   }
 
   /** 清理所有任务（统一使用 Mission 系统） */
@@ -2033,6 +2072,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
     else if (key === 'timeout') {
       config.update('timeout', parseInt(value as string, 10), vscode.ConfigurationTarget.Global);
+    }
+    else if (key === 'deepTask') {
+      const enabled = Boolean(value);
+      config.update('deepTask', enabled, vscode.ConfigurationTarget.Global);
+      // 回推确认状态给前端
+      this.sendData('deepTaskChanged', { enabled });
+      logger.info('界面.设置.深度任务', { enabled }, LogCategory.UI);
+      return; // deepTask 切换不需要通用 toast（前端已有 toast）
     }
 
     this.sendToast('设置已保存', 'success');
@@ -2427,18 +2474,30 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         if (typeof m.timestamp !== 'number') {
           throw new Error('Session message timestamp invalid');
         }
+        const normalizedSource = this.normalizeSessionMessageSource(m.source, m.agent, m.metadata);
         const formatted = {
           id: m.id,
           role: m.role,
           content: m.content,
-          source: m.source || 'orchestrator',
+          source: normalizedSource.source === 'worker'
+            ? (normalizedSource.agent || 'worker')
+            : normalizedSource.source,
           timestamp: m.timestamp,
-          agent: m.agent,
+          agent: normalizedSource.agent || m.agent,
+          images: Array.isArray(m.images) ? this.cloneSerializable(m.images) : undefined,
+          blocks: Array.isArray(m.blocks) ? this.cloneSerializable(m.blocks) : undefined,
+          type: typeof m.type === 'string' ? m.type : undefined,
+          noticeType: typeof m.noticeType === 'string' ? m.noticeType : undefined,
+          isStreaming: typeof m.isStreaming === 'boolean' ? m.isStreaming : undefined,
+          isComplete: typeof m.isComplete === 'boolean' ? m.isComplete : undefined,
+          metadata: m.metadata && typeof m.metadata === 'object' && !Array.isArray(m.metadata)
+            ? this.cloneSerializable(m.metadata)
+            : undefined,
         };
 
         // 根据 source 和 agent 分类
-        if (m.source === 'worker' && m.agent) {
-          const agentKey = m.agent as 'claude' | 'codex' | 'gemini';
+        if (normalizedSource.source === 'worker' && normalizedSource.agent) {
+          const agentKey = normalizedSource.agent;
           if (workerMessages[agentKey]) {
             workerMessages[agentKey].push(formatted);
           }
@@ -2514,8 +2573,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    const incomingMessages = Array.isArray(messages) ? messages : [];
     const seen = new Set<string>();
-    const sessionMessages = messages.map((m) => {
+    const sessionMessages: SessionMessage[] = incomingMessages.map((m) => {
       const id = typeof m?.id === 'string' && m.id.trim() ? m.id.trim() : '';
       if (!id) {
         throw new Error('[WebviewProvider] Session message 缺少 id');
@@ -2534,20 +2594,280 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       if (typeof m?.timestamp !== 'number') {
         throw new Error('[WebviewProvider] Session message timestamp 无效');
       }
+      const normalizedSource = this.normalizeSessionMessageSource(m.source, m.agent, m.metadata);
       return {
         id,
         role,
         content: m.content,
-        agent: m.agent,
+        agent: normalizedSource.agent || (typeof m?.agent === 'string' ? m.agent : undefined),
         timestamp: m.timestamp,
-        images: m.images,
-        source: m.source,
+        images: Array.isArray(m?.images) ? this.cloneSerializable(m.images) : undefined,
+        source: normalizedSource.source,
+        blocks: this.normalizeSessionBlocks(m?.blocks),
+        type: typeof m?.type === 'string' ? m.type : undefined,
+        noticeType: typeof m?.noticeType === 'string' ? m.noticeType : undefined,
+        isStreaming: typeof m?.isStreaming === 'boolean' ? m.isStreaming : undefined,
+        isComplete: typeof m?.isComplete === 'boolean' ? m.isComplete : undefined,
+        metadata: m?.metadata && typeof m.metadata === 'object' && !Array.isArray(m.metadata)
+          ? this.cloneSerializable(m.metadata)
+          : undefined,
       };
     });
 
     // 使用新的 API 保存会话数据
     this.sessionManager.updateSessionData(currentSession.id, sessionMessages);  // ✅ 移除 cliOutputs 参数
     logger.info('界面.会话.保存.完成', { messageCount: sessionMessages.length }, LogCategory.UI);
+  }
+
+  private normalizeSessionBlocks(rawBlocks: unknown): ContentBlock[] | undefined {
+    if (rawBlocks === undefined) {
+      return undefined;
+    }
+    if (!Array.isArray(rawBlocks)) {
+      throw new Error('[WebviewProvider] Session message blocks 非数组');
+    }
+    if (rawBlocks.length === 0) {
+      return undefined;
+    }
+    return rawBlocks.map((rawBlock, index) => this.normalizeSessionBlock(rawBlock, index));
+  }
+
+  private normalizeSessionBlock(rawBlock: unknown, index: number): ContentBlock {
+    if (!rawBlock || typeof rawBlock !== 'object' || Array.isArray(rawBlock)) {
+      throw new Error(`[WebviewProvider] Session block 无效: index=${index}`);
+    }
+    const block = rawBlock as Record<string, unknown>;
+    const blockType = block.type;
+    if (typeof blockType !== 'string' || blockType.length === 0) {
+      throw new Error(`[WebviewProvider] Session block 缺少 type: index=${index}`);
+    }
+
+    switch (blockType) {
+      case 'text':
+        return {
+          type: 'text',
+          content: typeof block.content === 'string' ? block.content : '',
+        };
+      case 'code':
+        return {
+          type: 'code',
+          content: typeof block.content === 'string' ? block.content : '',
+          language: typeof block.language === 'string' && block.language.trim().length > 0
+            ? block.language
+            : 'text',
+        };
+      case 'thinking': {
+        const thinking = block.thinking;
+        const thinkingObj = thinking && typeof thinking === 'object' && !Array.isArray(thinking)
+          ? thinking as Record<string, unknown>
+          : undefined;
+        const content = typeof thinkingObj?.content === 'string'
+          ? thinkingObj.content
+          : (typeof block.content === 'string' ? block.content : '');
+        const summary = typeof thinkingObj?.summary === 'string'
+          ? thinkingObj.summary
+          : undefined;
+        return {
+          type: 'thinking',
+          content,
+          ...(summary ? { summary } : {}),
+        };
+      }
+      case 'tool_call': {
+        const toolCallRaw = block.toolCall;
+        if (!toolCallRaw || typeof toolCallRaw !== 'object' || Array.isArray(toolCallRaw)) {
+          throw new Error(`[WebviewProvider] tool_call 缺少 toolCall 对象: index=${index}`);
+        }
+        const toolCall = toolCallRaw as Record<string, unknown>;
+        const toolId = typeof toolCall.id === 'string' ? toolCall.id.trim() : '';
+        const toolName = typeof toolCall.name === 'string' ? toolCall.name.trim() : '';
+        if (!toolId || !toolName) {
+          throw new Error(`[WebviewProvider] tool_call 缺少 id/name: index=${index}`);
+        }
+        const standardized = this.normalizeStandardizedToolResult(toolCall.standardized, index);
+        return {
+          type: 'tool_call',
+          toolId,
+          toolName,
+          status: this.normalizeToolCallStatus(toolCall.status, index),
+          input: this.serializeToolArguments(toolCall.arguments, index),
+          output: typeof toolCall.result === 'string' ? toolCall.result : undefined,
+          error: typeof toolCall.error === 'string' ? toolCall.error : undefined,
+          standardized,
+        };
+      }
+      case 'file_change': {
+        const fileChangeRaw = block.fileChange;
+        if (!fileChangeRaw || typeof fileChangeRaw !== 'object' || Array.isArray(fileChangeRaw)) {
+          throw new Error(`[WebviewProvider] file_change 缺少 fileChange 对象: index=${index}`);
+        }
+        const fileChange = fileChangeRaw as Record<string, unknown>;
+        const filePath = typeof fileChange.filePath === 'string' ? fileChange.filePath : '';
+        const changeType = fileChange.changeType;
+        if (typeof filePath !== 'string' || filePath.trim().length === 0) {
+          throw new Error(`[WebviewProvider] file_change 缺少 filePath: index=${index}`);
+        }
+        if (changeType !== 'create' && changeType !== 'modify' && changeType !== 'delete') {
+          throw new Error(`[WebviewProvider] file_change changeType 无效: index=${index}`);
+        }
+        return {
+          type: 'file_change',
+          filePath,
+          changeType,
+          additions: typeof fileChange.additions === 'number' ? fileChange.additions : undefined,
+          deletions: typeof fileChange.deletions === 'number' ? fileChange.deletions : undefined,
+          diff: typeof fileChange.diff === 'string' ? fileChange.diff : undefined,
+        };
+      }
+      case 'plan': {
+        const planRaw = block.plan;
+        if (!planRaw || typeof planRaw !== 'object' || Array.isArray(planRaw)) {
+          throw new Error(`[WebviewProvider] plan 缺少 plan 对象: index=${index}`);
+        }
+        const plan = planRaw as Record<string, unknown>;
+        const goal = typeof plan.goal === 'string' ? plan.goal : '';
+        if (goal.trim().length === 0) {
+          throw new Error(`[WebviewProvider] plan 缺少 goal: index=${index}`);
+        }
+        return {
+          type: 'plan',
+          goal,
+          analysis: typeof plan.analysis === 'string' ? plan.analysis : undefined,
+          constraints: this.normalizeStringArray(plan.constraints),
+          acceptanceCriteria: this.normalizeStringArray(plan.acceptanceCriteria),
+          riskLevel: plan.riskLevel === 'low' || plan.riskLevel === 'medium' || plan.riskLevel === 'high'
+            ? plan.riskLevel
+            : undefined,
+          riskFactors: this.normalizeStringArray(plan.riskFactors),
+          rawJson: typeof plan.rawJson === 'string' ? plan.rawJson : undefined,
+        };
+      }
+      default:
+        throw new Error(`[WebviewProvider] Session block type 不支持: ${blockType}`);
+    }
+  }
+
+  private normalizeToolCallStatus(status: unknown, index: number): 'pending' | 'running' | 'completed' | 'failed' {
+    if (status === 'pending' || status === 'running' || status === 'completed' || status === 'failed') {
+      return status;
+    }
+    if (status === 'success') {
+      return 'completed';
+    }
+    if (status === 'error') {
+      return 'failed';
+    }
+    throw new Error(`[WebviewProvider] tool_call status 无效: index=${index}`);
+  }
+
+  private serializeToolArguments(argumentsValue: unknown, index: number): string | undefined {
+    if (argumentsValue === undefined) {
+      return undefined;
+    }
+    try {
+      return JSON.stringify(argumentsValue);
+    } catch {
+      throw new Error(`[WebviewProvider] tool_call arguments 无法序列化: index=${index}`);
+    }
+  }
+
+  private normalizeStringArray(value: unknown): string[] | undefined {
+    if (!Array.isArray(value)) {
+      return undefined;
+    }
+    const normalized = value.filter((item): item is string => typeof item === 'string');
+    return normalized.length > 0 ? normalized : undefined;
+  }
+
+  private normalizeStandardizedToolResult(value: unknown, index: number): StandardizedToolResultPayload | undefined {
+    if (value === undefined) {
+      return undefined;
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`[WebviewProvider] standardized 非法: index=${index}`);
+    }
+    const payload = value as Record<string, unknown>;
+    if (payload.schemaVersion !== 'tool-result.v1') {
+      throw new Error(`[WebviewProvider] standardized schemaVersion 无效: index=${index}`);
+    }
+    const source = payload.source;
+    if (source !== 'builtin' && source !== 'mcp' && source !== 'skill') {
+      throw new Error(`[WebviewProvider] standardized source 无效: index=${index}`);
+    }
+    const toolName = payload.toolName;
+    if (typeof toolName !== 'string' || toolName.trim().length === 0) {
+      throw new Error(`[WebviewProvider] standardized toolName 无效: index=${index}`);
+    }
+    const toolCallId = payload.toolCallId;
+    if (typeof toolCallId !== 'string' || toolCallId.trim().length === 0) {
+      throw new Error(`[WebviewProvider] standardized toolCallId 无效: index=${index}`);
+    }
+    const status = payload.status;
+    if (
+      status !== 'success'
+      && status !== 'error'
+      && status !== 'timeout'
+      && status !== 'killed'
+      && status !== 'blocked'
+      && status !== 'rejected'
+      && status !== 'aborted'
+    ) {
+      throw new Error(`[WebviewProvider] standardized status 无效: index=${index}`);
+    }
+    const message = payload.message;
+    if (typeof message !== 'string') {
+      throw new Error(`[WebviewProvider] standardized message 无效: index=${index}`);
+    }
+
+    const normalized: StandardizedToolResultPayload = {
+      schemaVersion: 'tool-result.v1',
+      source,
+      toolName,
+      toolCallId,
+      status,
+      message,
+      ...(payload.data !== undefined ? { data: this.cloneSerializable(payload.data) } : {}),
+      ...(typeof payload.errorCode === 'string' ? { errorCode: payload.errorCode } : {}),
+      ...(typeof payload.sourceId === 'string' ? { sourceId: payload.sourceId } : {}),
+    };
+    return normalized;
+  }
+
+  private isWorkerSlot(value: unknown): value is WorkerSlot {
+    return value === 'claude' || value === 'codex' || value === 'gemini';
+  }
+
+  private normalizeSessionMessageSource(
+    source: unknown,
+    agent: unknown,
+    metadata: unknown
+  ): { source: 'orchestrator' | 'worker' | 'system'; agent?: WorkerSlot } {
+    const explicitAgent = this.isWorkerSlot(agent) ? agent : undefined;
+    const sourceAgent = this.isWorkerSlot(source) ? source : undefined;
+    const metadataWorker = metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+      ? (metadata as Record<string, unknown>).worker
+      : undefined;
+    const metadataAgent = this.isWorkerSlot(metadataWorker) ? metadataWorker : undefined;
+    const resolvedAgent = explicitAgent || sourceAgent || metadataAgent;
+
+    if (resolvedAgent) {
+      return { source: 'worker', agent: resolvedAgent };
+    }
+    if (source === 'system') {
+      return { source: 'system' };
+    }
+    if (source === 'worker') {
+      return { source: 'worker' };
+    }
+    return { source: 'orchestrator' };
+  }
+
+  private cloneSerializable<T>(value: T): T {
+    try {
+      return structuredClone(value);
+    } catch {
+      return JSON.parse(JSON.stringify(value)) as T;
+    }
   }
 
   /** 构建 UI 状态（统一使用 Mission + TaskView） */

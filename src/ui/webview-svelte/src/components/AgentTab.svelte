@@ -4,11 +4,12 @@
 
   // Props
   interface Props {
+    workerName?: 'claude' | 'codex' | 'gemini';
     messages: Message[];
     isActive?: boolean;
   }
 
-  let { messages, isActive = false }: Props = $props();
+  let { workerName, messages, isActive = false }: Props = $props();
 
   // Worker Tab 专用的空状态配置
   const emptyState = {
@@ -19,4 +20,4 @@
 </script>
 
 <!-- 复用 MessageList 组件，displayContext='worker' 标识 Worker 面板 -->
-<MessageList {messages} {emptyState} displayContext="worker" {isActive} />
+<MessageList {workerName} {messages} {emptyState} displayContext="worker" {isActive} />

@@ -178,6 +178,61 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       maxChars: adapterConfig.historyConfig?.maxChars ?? 100000,
       preserveRecentRounds: adapterConfig.historyConfig?.preserveRecentRounds ?? 5,
     };
+
+    // 注册基于意图的大模型编辑回调给工具管理器
+    this.toolManager.setLlmEditHandler(async (filePath, fileContent, summary, detailedDesc) => {
+      return this.handleFileEditWithLLM(filePath, fileContent, summary, detailedDesc);
+    });
+  }
+
+  /**
+   * 使用大模型处理文件编辑意图，返回修改后的完整代码
+   */
+  private async handleFileEditWithLLM(filePath: string, fileContent: string, summary: string, detailedDesc: string): Promise<string> {
+    const prompt = `你是一个专业的代码编辑 Agent。
+你的任务是将用户的修改意图准确地应用到以下文件中。
+
+目标文件路径: ${filePath}
+
+当前文件内容:
+\`\`\`
+${fileContent}
+\`\`\`
+
+修改摘要 (Summary): ${summary}
+详细描述 (Detailed Intent): ${detailedDesc}
+
+请输出修改后的完整文件内容，必须包裹在 \`\`\` 代码块中。不要添加任何多余的解释说明、不要在代码块外部添加 markdown。
+如果你认为没有必要修改，或者意图无法应用，请直接输出原内容。`;
+
+    const messages: LLMMessage[] = [{ role: 'user', content: prompt }];
+
+    // 不带工具、低温度，专注于单次代码编辑
+    const response = await this.client.sendMessage({
+      messages,
+      systemPrompt: '你是一个严格的编辑器程序，你的唯一职责是输出被编辑后的文件内容，严格遵守用户的意图。',
+      temperature: 0.1,
+      stream: false
+    });
+
+    const output = response.content;
+
+    // 提取代码块内的内容（标准闭合情况）
+    // 兼容 \r\n 换行以及代码块结尾无空行的情况
+    const codeBlockMatch = output.match(/```[a-zA-Z]*\r?\n([\s\S]*?)\r?\n```/);
+    if (codeBlockMatch) {
+      return codeBlockMatch[1];
+    }
+
+    // 容错：处理模型由于长度限制等原因未输出结尾 ``` 的截断情况
+    const unclosedMatch = output.match(/```[a-zA-Z]*\r?\n([\s\S]*)$/);
+    if (unclosedMatch) {
+      // 如果截断内容尾部恰好有不完整的 ``` 标记，清理掉
+      return unclosedMatch[1].replace(/\r?\n```\s*$/, '');
+    }
+
+    // 最后兜底：若没有任何 markdown 代码块标记，直接返回原始输出
+    return output.trim();
   }
 
   /**

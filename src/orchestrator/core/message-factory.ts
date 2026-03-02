@@ -21,6 +21,25 @@ export interface SubTaskCardPayload {
   duration?: number;
 }
 
+/** Worker 指令卡片元数据（用于 lane 聚合与可追踪性） */
+export interface WorkerInstructionMetadata {
+  laneCurrentTaskId?: string;
+  laneTasks?: Array<{
+    taskId: string;
+    title: string;
+    status: 'pending' | 'waiting_deps' | 'running' | 'completed' | 'failed' | 'skipped' | 'cancelled';
+    dependsOn?: string[];
+    isCurrent?: boolean;
+  }>;
+  assignmentId?: string;
+  missionId?: string;
+  laneId?: string;
+  laneCardId?: string;
+  laneIndex?: number;
+  laneTotal?: number;
+  laneTaskIds?: string[];
+}
+
 /** MessagePipeline 接口（协议层） */
 export interface IMessagePipeline {
   process(message: StandardMessage): boolean;
@@ -171,15 +190,28 @@ export class MessageFactory {
   }
 
   /** 发送任务说明到 Worker Tab */
-  workerInstruction(worker: WorkerSlot, content: string, metadata?: { assignmentId?: string; missionId?: string }): void {
+  workerInstruction(worker: WorkerSlot, content: string, metadata?: WorkerInstructionMetadata): void {
     if (!content?.trim()) return;
-    this.pipeline.process(this.createMessage({
+    const laneCardId = metadata?.laneCardId?.trim();
+    const stableMessageId = laneCardId || undefined;
+    if (stableMessageId) {
+      this.pipeline.clearMessageState?.(stableMessageId);
+    }
+    this.pipeline.process(createStandardMessage({
+      id: stableMessageId,
+      traceId: this.traceId,
+      category: MessageCategory.CONTENT,
       type: MessageType.INSTRUCTION,
       source: 'orchestrator',
       agent: worker as AgentType,
       lifecycle: MessageLifecycle.COMPLETED,
       blocks: [{ type: 'text', content, isMarkdown: true }],
-      metadata: { ...metadata, dispatchToWorker: true, worker },
+      metadata: this.enrichMetadata({
+        ...metadata,
+        dispatchToWorker: true,
+        worker,
+        ...(laneCardId ? { cardId: laneCardId } : {}),
+      }),
     }));
   }
 

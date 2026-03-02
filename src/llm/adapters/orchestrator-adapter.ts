@@ -9,6 +9,7 @@ import { AgentType, AgentRole, LLMConfig } from '../../types/agent-types';
 import { LLMClient, LLMMessageParams, LLMMessage, ToolCall } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager } from '../../tools/tool-manager';
+import { BUILTIN_TOOL_NAMES } from '../../tools/types';
 import { MessageHub } from '../../orchestrator/core/message-hub';
 import { BaseLLMAdapter, AdapterState } from './base-adapter';
 import { logger, LogCategory } from '../../logging';
@@ -36,12 +37,15 @@ export interface OrchestratorAdapterConfig {
   messageHub: MessageHub;  // 🔧 统一消息通道：替代 messageBus
   systemPrompt?: string;
   historyConfig?: OrchestratorHistoryConfig;
+  /** 深度任务模式：解除总轮次硬上限 */
+  deepTask?: boolean;
 }
 
 export interface OrchestratorRuntimeState {
   reason:
     | 'completed'
     | 'failure_limit'
+    | 'round_limit'
     | 'interrupted'
     | 'unknown';
   rounds: number;
@@ -51,16 +55,43 @@ export interface OrchestratorRuntimeState {
  * Orchestrator LLM 适配器
  */
 export class OrchestratorLLMAdapter extends BaseLLMAdapter {
-  /** 编排者单次会话中允许直接修改的最大文件数 */
+  /** 编排者单次会话中允许直接修改的最大文件数（常规模式） */
   private static readonly MAX_ORCHESTRATOR_EDIT_FILES = 3;
   /** 滚动摘要最大长度（字符） */
   private static readonly MAX_ROLLING_SUMMARY_CHARS = 2000;
+
+  /**
+   * 深度模式下编排者可用工具白名单（强制约束）
+   *
+   * 设计原则：编排者专职"分析、规划、监控、汇总"，所有代码变更必须通过 Worker 执行。
+   * 白名单仅包含只读/分析/编排/任务管理类工具，写入类工具全部排除。
+   * MCP 工具不在白名单中但单独放行（无法自动判断读写性，且多数为只读查询）。
+   */
+  private static readonly DEEP_MODE_ALLOWED_TOOLS = new Set([
+    // 编排工具（核心）
+    'dispatch_task',
+    'send_worker_message',
+    'wait_for_workers',
+    // 只读分析工具（辅助规划）
+    'file_view',
+    'grep_search',
+    'codebase_retrieval',
+    'web_search',
+    'web_fetch',
+    'list-processes',
+    'read-process',
+    // 任务管理工具
+    'get_todos',
+    'update_todo',
+  ]);
 
   private systemPrompt: string;
   private conversationHistory: LLMMessage[] = [];
   private abortController?: AbortController;
   private historyConfig: Required<OrchestratorHistoryConfig>;
   private rollingContextSummary: string | null = null;
+  /** 深度任务模式：解除总轮次硬上限 */
+  private readonly deepTask: boolean;
 
   /** 当前会话中编排者已修改的文件路径集合（用于规模限制） */
   private editedFiles = new Set<string>();
@@ -85,6 +116,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       adapterConfig.messageHub  // 🔧 统一消息通道：使用 messageHub
     );
     this.systemPrompt = adapterConfig.systemPrompt ?? '';
+    this.deepTask = adapterConfig.deepTask ?? false;
     this.historyConfig = {
       maxMessages: adapterConfig.historyConfig?.maxMessages ?? 40,
       maxChars: adapterConfig.historyConfig?.maxChars ?? 100000,
@@ -541,12 +573,20 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     history.push(this.buildUserMessage(message, images));
 
     const ORCHESTRATOR_HIDDEN_TOOLS = ['split_todo'];
-    const tools = await this.toolManager.getTools();
-    const toolDefinitions = tools.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      input_schema: tool.input_schema,
-    })).filter(tool => !ORCHESTRATOR_HIDDEN_TOOLS.includes(tool.name));
+    const allTools = await this.toolManager.getTools();
+    const toolDefinitions = allTools
+      .filter(tool => {
+        if (ORCHESTRATOR_HIDDEN_TOOLS.includes(tool.name)) return false;
+        if (!this.deepTask) return true;
+        // 深度模式：非内置工具（MCP/Skill）放行，内置工具仅白名单可见
+        if (tool.metadata?.source !== 'builtin') return true;
+        return OrchestratorLLMAdapter.DEEP_MODE_ALLOWED_TOOLS.has(tool.name);
+      })
+      .map(tool => ({
+        name: tool.name,
+        description: tool.description,
+        input_schema: tool.input_schema,
+      }));
 
     // 每轮 LLM 调用独立一个 stream，确保时间轴正确：
     // 当轮 stream 内包含 thinking + text + tool_call + tool_result，
@@ -555,6 +595,9 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     // 异常终止依赖失败检测止损：连续 5 次失败 → 提示换方式，累计 25 轮失败 → 终止
     const CONSECUTIVE_FAIL_THRESHOLD = 5;
     const TOTAL_FAIL_LIMIT = 25;
+    // 总轮次安全网：deepTask 模式下解除硬上限，仅保留空转/失败等智能安全网
+    const MAX_ORCHESTRATOR_ROUNDS = this.deepTask ? Infinity : 50;
+    const WARN_BEFORE_LIMIT = 5;
 
     try {
       let finalText = '';
@@ -574,6 +617,20 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           break;
         }
         loopRounds++;
+
+        // 总轮次安全网：防止编排者陷入"dispatch → wait → 不满意 → dispatch"无限循环
+        if (loopRounds > MAX_ORCHESTRATOR_ROUNDS) {
+          logger.warn('Orchestrator 达到总轮次上限', { loopRounds }, LogCategory.LLM);
+          finalText = finalText || `编排已执行 ${loopRounds} 轮，达到安全上限，任务终止。请检查已完成的工作。`;
+          terminationReason = 'round_limit';
+          break;
+        }
+        if (loopRounds === MAX_ORCHESTRATOR_ROUNDS - WARN_BEFORE_LIMIT) {
+          history.push({
+            role: 'user',
+            content: `[System] 你已执行 ${loopRounds} 轮编排循环，即将达到上限（${MAX_ORCHESTRATOR_ROUNDS} 轮）。请立即完成当前阶段的工作，输出最终汇总结果。`,
+          });
+        }
 
         // 长任务 history 裁剪：每轮 LLM 调用前检查并截断，防止 context window 溢出
         if (!isTransientSystemCall) {
@@ -864,28 +921,29 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   }
 
   /**
-   * 编排者工具调用限制检查
-   * 编排者可执行简单的单文件操作（改名、typo、改配置），
-   * 但多文件/复杂修改应委派给 Worker。
-   * 通过累计写入文件数追踪，超过阈值时拒绝并引导使用 dispatch_task。
+   * 编排者工具调用限制检查（第二道防线）
+   *
+   * 深度模式：内置工具必须在白名单内，否则拒绝（用 BUILTIN_TOOL_NAMES 明确判断来源）。
+   * 常规模式：文件写入超限时拒绝并引导 dispatch_task。
+   *
    * 返回 null 表示允许，返回字符串表示拒绝原因。
    */
   private checkOrchestratorToolRestriction(toolCall: ToolCall): string | null {
     const { name, arguments: args } = toolCall;
 
-    if (name === 'file_edit' || name === 'file_create' || name === 'file_insert') {
-      const filePath = (args?.path || args?.file_path || '') as string;
-      this.editedFiles.add(filePath);
-      if (this.editedFiles.size > OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES) {
-        return `编排者已修改 ${this.editedFiles.size} 个文件（超过 ${OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES} 个），多文件修改应通过 dispatch_task 委派给 Worker。`;
-      }
+    // 深度模式兜底：内置工具必须在白名单内（MCP/Skill 不在 BUILTIN_TOOL_NAMES 中，自动放行）
+    if (this.deepTask
+      && (BUILTIN_TOOL_NAMES as readonly string[]).includes(name)
+      && !OrchestratorLLMAdapter.DEEP_MODE_ALLOWED_TOOLS.has(name)) {
+      return `深度模式下编排者不可直接执行 ${name}，请通过 dispatch_task 委派给 Worker。`;
     }
 
-    if (name === 'file_remove') {
+    // 常规模式：文件写入数量限制
+    if (name === 'file_edit' || name === 'file_create' || name === 'file_insert' || name === 'file_remove') {
       const filePath = (args?.path || args?.file_path || '') as string;
       this.editedFiles.add(filePath);
       if (this.editedFiles.size > OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES) {
-        return `编排者已修改 ${this.editedFiles.size} 个文件（超过 ${OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES} 个），多文件操作应通过 dispatch_task 委派给 Worker。`;
+        return `编排者已修改 ${this.editedFiles.size} 个文件（超过 ${OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES} 个），请通过 dispatch_task 委派给 Worker。`;
       }
     }
 

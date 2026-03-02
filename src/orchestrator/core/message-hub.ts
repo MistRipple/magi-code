@@ -90,7 +90,7 @@ import { MessageType, ControlMessageType } from '../../protocol/message-protocol
 // 导入三层组件
 import { MessageBus, type ProcessingState, type BroadcastData } from './message-bus';
 import { MessagePipeline, type PipelineConfig, type RequestMessageSummary } from './message-pipeline';
-import { MessageFactory, type SubTaskCardPayload } from './message-factory';
+import { MessageFactory, type SubTaskCardPayload, type WorkerInstructionMetadata } from './message-factory';
 
 // 重新导出类型，保持向后兼容
 export type { SubTaskCardPayload } from './message-factory';
@@ -236,7 +236,7 @@ export class MessageHub {
     this.factory.workerSummary(worker, content, options);
   }
 
-  workerInstruction(worker: WorkerSlot, content: string, metadata?: { assignmentId?: string; missionId?: string }): void {
+  workerInstruction(worker: WorkerSlot, content: string, metadata?: WorkerInstructionMetadata): void {
     this.factory.workerInstruction(worker, content, metadata);
   }
 

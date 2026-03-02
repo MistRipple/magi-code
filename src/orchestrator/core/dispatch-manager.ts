@@ -37,6 +37,7 @@ import {
 import type {
   WaitForWorkersResult,
   DispatchTaskCollaborationContracts,
+  UpdateTodoStatus,
 } from '../../tools/orchestration-executor';
 import { buildDispatchSummaryPrompt } from '../prompts/orchestrator-prompts';
 import { MessageType } from '../../protocol/message-protocol';
@@ -114,6 +115,8 @@ export class DispatchManager {
   // Phase B+ 中间调用频率限制：同一 batch 内最小间隔 30 秒
   private lastPhaseBPlusTimestamp = 0;
   private static readonly PHASE_B_PLUS_MIN_INTERVAL = 30_000;
+  /** 同轮 dispatch 的短窗口合并调度，减少 Worker 指令卡片抖动 */
+  private static readonly DISPATCH_COALESCE_MS = 120;
 
   private pipeline = new WorkerPipeline();
   private activeBatch: DispatchBatch | null = null;
@@ -135,6 +138,10 @@ export class DispatchManager {
   private runtimeUnavailableWorkers = new Map<WorkerSlot, { until: number; reason: string }>();
   /** 活跃的 Assignment 映射（Worker 执行期间可查，供 split_todo handler 使用） */
   private activeAssignments = new Map<string, Assignment>();
+  /** Worker Lane 运行态：同一 Worker 同一时刻仅允许一个执行链 */
+  private activeWorkerLanes = new Set<WorkerSlot>();
+  /** Batch 级调度合并定时器 */
+  private dispatchScheduleTimers = new Map<string, NodeJS.Timeout>();
   private static readonly MAX_MISSION_SESSION_RECORDS = 100;
 
   constructor(private deps: DispatchManagerDeps) {
@@ -237,6 +244,8 @@ export class DispatchManager {
     this.activeBatch = null;
     this.reactiveMode = false;
     this.completionQueue.reset();
+    this.activeWorkerLanes.clear();
+    this.clearDispatchScheduleTimers();
     this.clearResumeContext();
   }
 
@@ -721,7 +730,7 @@ export class DispatchManager {
 
         // 通过隔离策略决定是否立即启动（约束 5）
         if (!hasDeps) {
-          this.dispatchReadyTasksWithIsolation(this.activeBatch);
+          this.scheduleDispatchReadyTasks(this.activeBatch, { reason: 'dispatch-registered' });
         }
         // 有依赖的任务由 DispatchBatch 的 task:ready 事件触发
 
@@ -913,12 +922,64 @@ export class DispatchManager {
             return { success: false, error: '缺少有效的更新内容(updates)' };
           }
 
+          const allowedStatus = new Set<UpdateTodoStatus>(['pending', 'skipped']);
+          const pendingAllowedSource = new Set(['pending', 'completed', 'failed', 'skipped']);
+          const skippedAllowedSource = new Set(['pending', 'blocked', 'ready', 'running', 'skipped']);
+
+          type UpdatePlan = {
+            todoId: string;
+            status?: UpdateTodoStatus;
+            content?: string;
+          };
+
+          const plans: UpdatePlan[] = [];
+
           for (const update of params.updates) {
-            if (!update.todoId) continue;
-            const updatesPayload: any = {};
-            if (update.status !== undefined) updatesPayload.status = update.status;
-            if (update.content !== undefined) updatesPayload.content = update.content;
-            await todoManager.update(update.todoId, updatesPayload);
+            if (!update.todoId) {
+              throw new Error('update_todo 存在缺少 todo_id 的条目');
+            }
+
+            const hasStatus = update.status !== undefined;
+            const hasContent = update.content !== undefined;
+            if (!hasStatus && !hasContent) {
+              throw new Error(`Todo ${update.todoId} 缺少可执行更新字段（status/content）`);
+            }
+
+            if (update.status !== undefined && !allowedStatus.has(update.status as UpdateTodoStatus)) {
+              throw new Error(`Todo ${update.todoId} status=${update.status} 非法，仅支持 pending/skipped`);
+            }
+
+            const todo = await todoManager.get(update.todoId);
+            if (!todo) {
+              throw new Error(`Todo not found: ${update.todoId}`);
+            }
+
+            const targetStatus = update.status as UpdateTodoStatus | undefined;
+            if (targetStatus === 'pending' && !pendingAllowedSource.has(todo.status)) {
+              throw new Error(`Todo ${update.todoId} 当前状态=${todo.status}，不允许重置为 pending`);
+            }
+
+            if (targetStatus === 'skipped' && !skippedAllowedSource.has(todo.status)) {
+              throw new Error(`Todo ${update.todoId} 当前状态=${todo.status}，不允许更新为 skipped`);
+            }
+
+            plans.push({
+              todoId: update.todoId,
+              status: targetStatus,
+              content: update.content,
+            });
+          }
+
+          for (const plan of plans) {
+            if (plan.content !== undefined) {
+              await todoManager.update(plan.todoId, { content: plan.content });
+            }
+
+            if (plan.status === 'pending') {
+              await todoManager.resetToPending(plan.todoId);
+            } else if (plan.status === 'skipped') {
+              await todoManager.skip(plan.todoId);
+            }
           }
           return { success: true };
         } catch (error: any) {
@@ -938,6 +999,14 @@ export class DispatchManager {
    * - governance = 'full'：强制启用所有治理步骤
    */
   launchDispatchWorker(entry: DispatchEntry): void {
+    void this.executeDispatchEntry(entry);
+  }
+
+  private async executeDispatchEntry(
+    entry: DispatchEntry,
+    options?: { emitWorkerInstruction?: boolean },
+  ): Promise<void> {
+    const emitWorkerInstruction = options?.emitWorkerInstruction ?? true;
     const {
       taskId,
       worker,
@@ -954,7 +1023,18 @@ export class DispatchManager {
     const batch = this.activeBatch;
     const category = this.dispatchTaskCategories.get(taskId);
     if (!category) {
-      throw new Error(`dispatchTaskCategories 中未找到 taskId=${taskId}，dispatch 注册流程存在数据不一致`);
+      const errorMsg = `dispatchTaskCategories 中未找到 taskId=${taskId}，dispatch 注册流程存在数据不一致`;
+      this.deps.messageHub.subTaskCard({
+        id: taskId,
+        title: task,
+        status: 'failed',
+        worker,
+        summary: errorMsg,
+        error: errorMsg,
+      });
+      batch?.markFailed(taskId, { success: false, summary: errorMsg, errors: [errorMsg] });
+      logger.error('编排工具.dispatch_task.任务分类丢失', { taskId, worker }, LogCategory.ORCHESTRATOR);
+      return;
     }
     const executionRouting = this.resolveExecutionWorker(worker);
     if (!executionRouting.ok) {
@@ -1000,13 +1080,12 @@ export class DispatchManager {
       worker: effectiveWorker,
     });
 
-    // 发送任务指令到 Worker Tab，让用户看到 orchestrator 对 worker 的要求
-    this.deps.messageHub.workerInstruction(effectiveWorker, task, {
-      assignmentId: taskId,
-      missionId: batch?.id,
-    });
+    if (emitWorkerInstruction) {
+      // 同一 worker 的多个任务通过 lane 级稳定卡片聚合，避免重复派发多张指令卡。
+      this.emitWorkerLaneInstructionCard(entry, effectiveWorker, batch);
+    }
 
-    (async () => {
+    try {
       // 确保 Worker 存在
       const workerInstance = await this.deps.missionOrchestrator.ensureWorkerForDispatch(effectiveWorker);
 
@@ -1154,7 +1233,7 @@ export class DispatchManager {
       logger.info('编排工具.dispatch_task.Worker完成', {
         worker: effectiveWorker, taskId, success: result.success, summary,
       }, LogCategory.ORCHESTRATOR);
-    })().catch(async (error: any) => {
+    } catch (error: any) {
       // C-09: 取消异常不按失败处理，cancelAll 已标记 cancelled 状态
       if (error instanceof CancellationError || error?.isCancellation) {
         this.deps.messageHub.subTaskCard({
@@ -1211,7 +1290,207 @@ export class DispatchManager {
       logger.error('编排工具.dispatch_task.Worker失败', {
         worker: effectiveWorker, taskId, error: errorMsg,
       }, LogCategory.ORCHESTRATOR);
-    });
+    }
+  }
+
+  private getNextReadyTaskForWorker(batch: DispatchBatch, worker: WorkerSlot): DispatchEntry | null {
+    const ready = batch.getReadyTasks();
+    for (const entry of ready) {
+      if (entry.worker === worker) {
+        return entry;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 合并同一 Batch 的连续调度触发，减少 Worker 指令卡片短时间抖动。
+   */
+  private scheduleDispatchReadyTasks(
+    batch: DispatchBatch,
+    options?: { immediate?: boolean; reason?: string },
+  ): void {
+    if (batch.status !== 'active') {
+      return;
+    }
+
+    const existing = this.dispatchScheduleTimers.get(batch.id);
+    if (existing) {
+      clearTimeout(existing);
+      this.dispatchScheduleTimers.delete(batch.id);
+    }
+
+    const delay = options?.immediate ? 0 : DispatchManager.DISPATCH_COALESCE_MS;
+    const timer = setTimeout(() => {
+      this.dispatchScheduleTimers.delete(batch.id);
+      if (batch.status !== 'active') {
+        return;
+      }
+      this.dispatchReadyTasksWithIsolation(batch);
+    }, delay);
+
+    this.dispatchScheduleTimers.set(batch.id, timer);
+  }
+
+  private clearDispatchScheduleTimers(batchId?: string): void {
+    if (batchId) {
+      const timer = this.dispatchScheduleTimers.get(batchId);
+      if (timer) {
+        clearTimeout(timer);
+        this.dispatchScheduleTimers.delete(batchId);
+      }
+      return;
+    }
+
+    for (const timer of this.dispatchScheduleTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.dispatchScheduleTimers.clear();
+  }
+
+  private emitWorkerLaneInstructionCard(
+    entry: DispatchEntry,
+    worker: WorkerSlot,
+    batch: DispatchBatch | null,
+  ): void {
+    if (!batch) {
+      this.deps.messageHub.workerInstruction(worker, entry.task, {
+        assignmentId: entry.taskId,
+      });
+      return;
+    }
+
+    const laneEntries = this.getWorkerLaneEntries(batch, worker);
+    const laneTaskIds = laneEntries.map(item => item.taskId);
+    const currentLaneIndex = laneTaskIds.indexOf(entry.taskId);
+    const laneIndex = currentLaneIndex >= 0 ? currentLaneIndex + 1 : 1;
+    const laneTotal = Math.max(1, laneEntries.length);
+    const laneCardId = this.getWorkerLaneInstructionCardId(batch.id, worker);
+    const laneId = `${batch.id}:${worker}`;
+
+    this.deps.messageHub.workerInstruction(
+      worker,
+      this.buildWorkerLaneInstructionContent(laneEntries, entry.taskId),
+      {
+        assignmentId: entry.taskId,
+        missionId: batch.id,
+        laneId,
+        laneCardId,
+        laneIndex,
+        laneTotal,
+        laneTaskIds,
+        laneCurrentTaskId: entry.taskId,
+        laneTasks: laneEntries.map(item => ({
+          taskId: item.taskId,
+          title: item.task,
+          status: item.status,
+          dependsOn: item.dependsOn,
+          isCurrent: item.taskId === entry.taskId,
+        })),
+      },
+    );
+  }
+
+  private getWorkerLaneEntries(batch: DispatchBatch, worker: WorkerSlot): DispatchEntry[] {
+    return batch
+      .getEntries()
+      .filter(entry => entry.worker === worker)
+      .sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  private getWorkerLaneInstructionCardId(batchId: string, worker: WorkerSlot): string {
+    return `worker-lane-instruction-${batchId}-${worker}`;
+  }
+
+  private buildWorkerLaneInstructionContent(entries: DispatchEntry[], currentTaskId: string): string {
+    const current = entries.find(entry => entry.taskId === currentTaskId);
+    const currentIndex = entries.findIndex(entry => entry.taskId === currentTaskId);
+    const laneIndex = currentIndex >= 0 ? currentIndex + 1 : 1;
+    const laneTotal = Math.max(entries.length, 1);
+    const list = entries.length > 0 ? entries : [{
+      taskId: currentTaskId,
+      task: current?.task || '未知任务',
+      status: 'running' as const,
+      dependsOn: [] as string[],
+    }];
+
+    const lines = [
+      '## Worker 任务队列',
+      `当前执行：${current?.task || '未知任务'}`,
+      `进度：${laneIndex}/${laneTotal}`,
+      '说明：队列为实时快照，后续同 Worker 派发将自动并入此卡片。',
+      '',
+      '任务列表：',
+      ...list.map((item, index) => {
+        const dependsText = item.dependsOn.length > 0
+          ? `（依赖: ${item.dependsOn.join(', ')}）`
+          : '';
+        return `${index + 1}. [${this.getWorkerLaneTaskStatusLabel(item.status, item.taskId === currentTaskId)}] ${item.task}${dependsText}`;
+      }),
+    ];
+
+    return lines.join('\n');
+  }
+
+  private getWorkerLaneTaskStatusLabel(status: DispatchStatus, isCurrent: boolean): string {
+    if (isCurrent) {
+      return '进行中';
+    }
+    switch (status) {
+      case 'completed':
+        return '已完成';
+      case 'failed':
+        return '失败';
+      case 'skipped':
+        return '已跳过';
+      case 'cancelled':
+        return '已取消';
+      case 'waiting_deps':
+        return '等待依赖';
+      case 'running':
+        return '进行中';
+      case 'pending':
+      default:
+        return '待执行';
+    }
+  }
+
+  private launchWorkerLane(batch: DispatchBatch, worker: WorkerSlot): void {
+    if (this.activeWorkerLanes.has(worker)) {
+      return;
+    }
+
+    this.activeWorkerLanes.add(worker);
+    logger.info('DispatchBatch.WorkerLane.启动', {
+      batchId: batch.id,
+      worker,
+    }, LogCategory.ORCHESTRATOR);
+
+    void (async () => {
+      let executedCount = 0;
+      try {
+        while (batch.status === 'active') {
+          const nextEntry = this.getNextReadyTaskForWorker(batch, worker);
+          if (!nextEntry) {
+            break;
+          }
+          executedCount += 1;
+          await this.executeDispatchEntry(nextEntry, { emitWorkerInstruction: true });
+        }
+      } finally {
+        this.activeWorkerLanes.delete(worker);
+        logger.info('DispatchBatch.WorkerLane.结束', {
+          batchId: batch.id,
+          worker,
+          executedCount,
+          batchStatus: batch.status,
+        }, LogCategory.ORCHESTRATOR);
+
+        if (batch.status === 'active') {
+          this.scheduleDispatchReadyTasks(batch, { immediate: true, reason: 'lane-finished' });
+        }
+      }
+    })();
   }
 
   /**
@@ -1220,13 +1499,13 @@ export class DispatchManager {
   private setupBatchEventHandlers(batch: DispatchBatch): void {
     // 依赖就绪 → 通过隔离策略筛选后启动 Worker
     batch.on('task:ready', (_taskId: string, _entry: DispatchEntry) => {
-      this.dispatchReadyTasksWithIsolation(batch);
+      this.scheduleDispatchReadyTasks(batch, { reason: 'task-ready' });
     });
 
     // Worker 完成后重新检查是否有同类型排队任务可启动
     batch.on('task:statusChanged', (_taskId: string, status: DispatchStatus) => {
       if (isTerminalStatus(status)) {
-        setImmediate(() => this.dispatchReadyTasksWithIsolation(batch));
+        this.scheduleDispatchReadyTasks(batch, { reason: 'task-terminal' });
 
         // 反应式编排：将完成结果推入队列，唤醒 waitForWorkers
         const entry = batch.getEntry(_taskId);
@@ -1267,6 +1546,8 @@ export class DispatchManager {
     batch.on('batch:cancelled', (batchId: string, reason: string) => {
       this.reactiveBatchAwaitingSummary.delete(batchId);
       this.clearBatchTaskCategories(batch);
+      this.activeWorkerLanes.clear();
+      this.clearDispatchScheduleTimers(batchId);
       logger.info('DispatchBatch.已取消', { batchId, reason }, LogCategory.ORCHESTRATOR);
       this.deps.messageHub.orchestratorMessage(`任务已取消: ${reason}`);
     });
@@ -1274,6 +1555,8 @@ export class DispatchManager {
     batch.on('phase:changed', (_batchId: string, phase) => {
       if (phase === 'archived') {
         this.clearBatchTaskCategories(batch);
+        this.activeWorkerLanes.clear();
+        this.clearDispatchScheduleTimers(batch.id);
         this.clearResumeContext();
       }
     });
@@ -1286,11 +1569,16 @@ export class DispatchManager {
     if (batch.status !== 'active') return;
 
     const readyTasks = batch.getReadyTasksIsolated();
+    const candidateWorkers = new Set<WorkerSlot>();
     for (const entry of readyTasks) {
-      logger.info('DispatchBatch.隔离调度.启动', {
-        taskId: entry.taskId, worker: entry.worker,
-      }, LogCategory.ORCHESTRATOR);
-      this.launchDispatchWorker(entry);
+      if (this.activeWorkerLanes.has(entry.worker)) {
+        continue;
+      }
+      candidateWorkers.add(entry.worker);
+    }
+
+    for (const worker of candidateWorkers) {
+      this.launchWorkerLane(batch, worker);
     }
   }
 
@@ -1918,5 +2206,7 @@ ${this.deps.getActiveUserPrompt()}
     this.activeResumeContexts.clear();
     this.dispatchTaskCategories.clear();
     this.runtimeUnavailableWorkers.clear();
+    this.activeWorkerLanes.clear();
+    this.clearDispatchScheduleTimers();
   }
 }

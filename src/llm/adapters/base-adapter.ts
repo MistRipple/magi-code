@@ -253,8 +253,7 @@ export abstract class BaseLLMAdapter extends EventEmitter {
   private emitTokenUpdate(): void {
     if (!this.messageHub) return;
     
-    this.messageHub.data('executionStatsUpdate', {
-      realtimeUpdate: true,
+    this.messageHub.data('executionTokenRuntime', {
       worker: this.agent,
       provider: this.config.provider,
       model: this.config.model,
@@ -380,6 +379,22 @@ export abstract class BaseLLMAdapter extends EventEmitter {
    */
   getTotalTokenUsage(): TokenUsage {
     return { ...this.totalTokenUsage };
+  }
+
+  /**
+   * 重置 Token 统计（用于“重置统计”全链路）
+   */
+  resetTokenUsage(): void {
+    this.lastTokenUsage = { inputTokens: 0, outputTokens: 0 };
+    this.totalTokenUsage = { inputTokens: 0, outputTokens: 0 };
+
+    if (this.tokenUpdateTimer) {
+      clearTimeout(this.tokenUpdateTimer);
+      this.tokenUpdateTimer = null;
+    }
+    this.pendingTokenUpdate = false;
+
+    this.emitTokenUpdate();
   }
 
   /**

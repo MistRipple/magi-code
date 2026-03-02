@@ -662,6 +662,61 @@ function createRecoveryStreamingCard(update: StreamUpdate): ResolvedTarget {
   return fallbackTarget;
 }
 
+function tryUpsertInstructionByCardId(location: ResolvedTarget, uiMessage: Message): boolean {
+  if (uiMessage.type !== 'instruction') {
+    return false;
+  }
+  const cardId = typeof uiMessage.metadata?.cardId === 'string'
+    ? uiMessage.metadata.cardId.trim()
+    : '';
+  if (!cardId) {
+    return false;
+  }
+
+  if (location.location === 'worker') {
+    const existing = findLastMessageByCardId(getState().agentOutputs[location.worker], cardId);
+    if (!existing) {
+      return false;
+    }
+    updateAgentMessage(location.worker, existing.id, { ...uiMessage, id: existing.id });
+    if (uiMessage.id !== existing.id) {
+      setMessageTarget(uiMessage.id, location);
+    }
+    return true;
+  }
+
+  if (location.location === 'thread') {
+    const existing = findLastMessageByCardId(getState().threadMessages, cardId);
+    if (!existing) {
+      return false;
+    }
+    updateThreadMessage(existing.id, { ...uiMessage, id: existing.id });
+    if (uiMessage.id !== existing.id) {
+      setMessageTarget(uiMessage.id, location);
+    }
+    return true;
+  }
+
+  if (location.location === 'both') {
+    const existingThread = findLastMessageByCardId(getState().threadMessages, cardId);
+    if (existingThread) {
+      updateThreadMessage(existingThread.id, { ...uiMessage, id: existingThread.id });
+    }
+    const existingWorker = findLastMessageByCardId(getState().agentOutputs[location.worker], cardId);
+    if (existingWorker) {
+      updateAgentMessage(location.worker, existingWorker.id, { ...uiMessage, id: existingWorker.id });
+    }
+    if (existingThread || existingWorker) {
+      if (uiMessage.id !== (existingThread?.id || existingWorker?.id)) {
+        setMessageTarget(uiMessage.id, location);
+      }
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function shouldIgnoreSealedUpdate(existing: Message, update: StreamUpdate): boolean {
   // 1. 如果消息本身已经被标记为完成（例如收到过 task_completed 或 unifiedComplete）
   //    并且不是处于流式转为完成的临时动画期，我们应该拒绝所有会改变流式状态的更新
@@ -1018,6 +1073,11 @@ function handleContentMessage(standard: StandardMessage) {
   // 流式消息标记为活跃，驱动 isProcessing 状态
   if (uiMessage.isStreaming) {
     markMessageActive(uiMessage.id);
+  }
+
+  if (tryUpsertInstructionByCardId(target, uiMessage)) {
+    flushPendingStreamUpdates(standard.id);
+    return;
   }
 
     if (target.location === 'thread') {
@@ -2238,21 +2298,26 @@ function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[] {
   }
   return list.map((block) => {
     switch (block.type) {
+      case 'text':
+        return {
+          type: 'text',
+          content: typeof block.content === 'string' ? block.content : '',
+        };
       case 'code':
         return {
           type: 'code',
-          content: block.content,
-          language: block.language,
+          content: typeof block.content === 'string' ? block.content : '',
+          language: typeof block.language === 'string' ? block.language : undefined,
         };
       case 'thinking': {
         const thinking: ThinkingBlock = {
-          content: block.content || '',
+          content: typeof block.content === 'string' ? block.content : '',
           isComplete: true,
-          summary: (block as any).summary,
+          summary: typeof block.summary === 'string' ? block.summary : undefined,
         };
         return {
           type: 'thinking',
-          content: block.content || '',
+          content: typeof block.content === 'string' ? block.content : '',
           thinking,
         };
       }
@@ -2282,7 +2347,7 @@ function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[] {
           toolCall,
         };
       }
-      case 'file_change': {
+      case 'file_change':
         return {
           type: 'file_change',
           content: '',
@@ -2294,8 +2359,7 @@ function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[] {
             diff: block.diff,
           },
         };
-      }
-      case 'plan': {
+      case 'plan':
         return {
           type: 'plan',
           content: '',
@@ -2309,9 +2373,8 @@ function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[] {
             rawJson: block.rawJson,
           },
         };
-      }
       default:
-        return { type: 'text', content: block.content || '' };
+        throw new Error(`[MessageHandler] 未支持的标准消息块类型: ${(block as { type: string }).type}`);
     }
   });
 }
@@ -2450,6 +2513,10 @@ function mapToolStatus(
       return 'pending';
     case 'running':
       return 'running';
+    case 'success':
+      return 'success';
+    case 'error':
+      return 'error';
     case 'completed':
       return 'success';
     case 'failed':

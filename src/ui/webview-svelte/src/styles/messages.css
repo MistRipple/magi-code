@@ -46,9 +46,6 @@
   .message-item {
     animation: none;
   }
-  .message-item.assistant.streaming {
-    animation: none;
-  }
 }
 
 /* SubTaskCard 容器：透明背景，无边框，让内部卡片自己渲染样式 */
@@ -79,21 +76,9 @@
   --stream-accent: var(--color-gemini);
 }
 
-/* 流式输出时的轻量动效 */
+/* 流式输出时，移除外层卡片的呼吸动画，仅保留三点跳动动画 */
 .message-item.assistant.streaming {
   position: relative;
-  animation: streamingBorderPulse 1.6s ease-in-out infinite;
-}
-
-@keyframes streamingBorderPulse {
-  0%, 100% {
-    border-color: var(--border);
-    box-shadow: none;
-  }
-  50% {
-    border-color: color-mix(in srgb, var(--stream-accent, var(--info)) 55%, var(--border));
-    box-shadow: 0 0 0 1px color-mix(in srgb, var(--stream-accent, var(--info)) 25%, transparent);
-  }
 }
 
 /* 用户消息：透明背景，无外层边框 */
@@ -138,30 +123,11 @@
   }
 }
 
-/* ========== 消息完成过渡 ========== */
-
-.message-item.assistant.just-completed {
-  animation: messageComplete 0.4s ease-out;
-}
-
-@keyframes messageComplete {
-  0% {
-    border-color: var(--info);
-  }
-  50% {
-    border-color: var(--success);
-  }
-  100% {
-    border-color: var(--border);
-  }
-}
-
 /* ========== 减少动画偏好 ========== */
 
 @media (prefers-reduced-motion: reduce) {
   .message-item.user.sending .user-content,
-  .message-item.assistant.was-placeholder,
-  .message-item.assistant.just-completed {
+  .message-item.assistant.was-placeholder {
     animation: none;
   }
 }

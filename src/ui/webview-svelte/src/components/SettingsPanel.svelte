@@ -334,14 +334,160 @@
   }
 
   // 获取 worker 的执行统计数据
+  interface RuntimeTokenCounter {
+    rawInputTokens: number;
+    rawOutputTokens: number;
+    carryInputTokens: number;
+    carryOutputTokens: number;
+    effectiveInputTokens: number;
+    effectiveOutputTokens: number;
+    updatedAt: number;
+  }
+  let runtimeTokenCounters = $state<Record<string, RuntimeTokenCounter>>({});
+
+  function toSafeTokenCount(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      return 0;
+    }
+    return Math.floor(value);
+  }
+
+  function getSnapshotWorkerTokens(worker: string): { inputTokens: number; outputTokens: number } {
+    const stats = executionStats.find(s => s.worker === worker);
+    return {
+      inputTokens: toSafeTokenCount(stats?.totalInputTokens),
+      outputTokens: toSafeTokenCount(stats?.totalOutputTokens),
+    };
+  }
+
+  function upsertRuntimeTokenCounter(worker: string, usage: unknown): void {
+    const usageObj = usage && typeof usage === 'object'
+      ? usage as Record<string, unknown>
+      : {};
+    const rawInputTokens = toSafeTokenCount(usageObj.inputTokens);
+    const rawOutputTokens = toSafeTokenCount(usageObj.outputTokens);
+
+    const snapshot = getSnapshotWorkerTokens(worker);
+    const previous = runtimeTokenCounters[worker];
+    let carryInputTokens = previous?.carryInputTokens ?? Math.max(0, snapshot.inputTokens - rawInputTokens);
+    let carryOutputTokens = previous?.carryOutputTokens ?? Math.max(0, snapshot.outputTokens - rawOutputTokens);
+
+    if (previous) {
+      // 适配器重建/重连后 raw 计数可能回退，需要把旧 raw 折算进累计值。
+      if (rawInputTokens < previous.rawInputTokens) {
+        carryInputTokens += previous.rawInputTokens;
+      }
+      if (rawOutputTokens < previous.rawOutputTokens) {
+        carryOutputTokens += previous.rawOutputTokens;
+      }
+    }
+
+    const requiredInputFloor = Math.max(snapshot.inputTokens, previous?.effectiveInputTokens ?? 0);
+    const requiredOutputFloor = Math.max(snapshot.outputTokens, previous?.effectiveOutputTokens ?? 0);
+    const currentInputTotal = carryInputTokens + rawInputTokens;
+    const currentOutputTotal = carryOutputTokens + rawOutputTokens;
+
+    if (currentInputTotal < requiredInputFloor) {
+      carryInputTokens += (requiredInputFloor - currentInputTotal);
+    }
+    if (currentOutputTotal < requiredOutputFloor) {
+      carryOutputTokens += (requiredOutputFloor - currentOutputTotal);
+    }
+
+    const effectiveInputTokens = carryInputTokens + rawInputTokens;
+    const effectiveOutputTokens = carryOutputTokens + rawOutputTokens;
+
+    runtimeTokenCounters = {
+      ...runtimeTokenCounters,
+      [worker]: {
+        rawInputTokens,
+        rawOutputTokens,
+        carryInputTokens,
+        carryOutputTokens,
+        effectiveInputTokens,
+        effectiveOutputTokens,
+        updatedAt: Date.now(),
+      },
+    };
+  }
+
+  function recalibrateRuntimeTokenCounters(): void {
+    if (Object.keys(runtimeTokenCounters).length === 0) {
+      return;
+    }
+    const nextCounters: Record<string, RuntimeTokenCounter> = {};
+    for (const [worker, counter] of Object.entries(runtimeTokenCounters)) {
+      const snapshot = getSnapshotWorkerTokens(worker);
+      let carryInputTokens = counter.carryInputTokens;
+      let carryOutputTokens = counter.carryOutputTokens;
+
+      const requiredInputFloor = Math.max(snapshot.inputTokens, counter.effectiveInputTokens);
+      const requiredOutputFloor = Math.max(snapshot.outputTokens, counter.effectiveOutputTokens);
+      const currentInputTotal = carryInputTokens + counter.rawInputTokens;
+      const currentOutputTotal = carryOutputTokens + counter.rawOutputTokens;
+
+      if (currentInputTotal < requiredInputFloor) {
+        carryInputTokens += (requiredInputFloor - currentInputTotal);
+      }
+      if (currentOutputTotal < requiredOutputFloor) {
+        carryOutputTokens += (requiredOutputFloor - currentOutputTotal);
+      }
+
+      nextCounters[worker] = {
+        ...counter,
+        carryInputTokens,
+        carryOutputTokens,
+        effectiveInputTokens: carryInputTokens + counter.rawInputTokens,
+        effectiveOutputTokens: carryOutputTokens + counter.rawOutputTokens,
+      };
+    }
+    runtimeTokenCounters = nextCounters;
+  }
+
   function getWorkerStats(worker: string) {
     const stats = executionStats.find(s => s.worker === worker);
-    return stats || null;
+    const runtime = runtimeTokenCounters[worker];
+    if (!stats && !runtime) {
+      return null;
+    }
+    const snapshotInput = toSafeTokenCount(stats?.totalInputTokens);
+    const snapshotOutput = toSafeTokenCount(stats?.totalOutputTokens);
+    return {
+      worker,
+      totalExecutions: stats?.totalExecutions ?? 0,
+      successCount: stats?.successCount ?? 0,
+      failureCount: stats?.failureCount ?? 0,
+      successRate: stats?.successRate ?? 1,
+      avgDuration: stats?.avgDuration ?? 0,
+      totalInputTokens: runtime ? Math.max(snapshotInput, runtime.effectiveInputTokens) : snapshotInput,
+      totalOutputTokens: runtime ? Math.max(snapshotOutput, runtime.effectiveOutputTokens) : snapshotOutput,
+    };
   }
 
   function recomputeTokenStatsSummary() {
-    totalInputTokens = executionStats.reduce((sum, s) => sum + (s.totalInputTokens || 0), 0);
-    totalOutputTokens = executionStats.reduce((sum, s) => sum + (s.totalOutputTokens || 0), 0);
+    let inputSum = 0;
+    let outputSum = 0;
+    const seenWorkers = new Set<string>();
+
+    for (const stats of executionStats) {
+      const runtime = runtimeTokenCounters[stats.worker];
+      const snapshotInput = toSafeTokenCount(stats.totalInputTokens);
+      const snapshotOutput = toSafeTokenCount(stats.totalOutputTokens);
+      inputSum += runtime ? Math.max(snapshotInput, runtime.effectiveInputTokens) : snapshotInput;
+      outputSum += runtime ? Math.max(snapshotOutput, runtime.effectiveOutputTokens) : snapshotOutput;
+      seenWorkers.add(stats.worker);
+    }
+
+    for (const [worker, runtime] of Object.entries(runtimeTokenCounters)) {
+      if (seenWorkers.has(worker)) {
+        continue;
+      }
+      inputSum += runtime.effectiveInputTokens;
+      outputSum += runtime.effectiveOutputTokens;
+    }
+
+    totalInputTokens = inputSum;
+    totalOutputTokens = outputSum;
   }
 
   // 格式化 Token 数量
@@ -375,6 +521,7 @@
   function confirmResetStats() {
     vscode.postMessage({ type: 'resetExecutionStats' });
     showResetConfirm = false;
+    runtimeTokenCounters = {};
     totalInputTokens = 0;
     totalOutputTokens = 0;
   }
@@ -936,47 +1083,27 @@
       }
       // 执行统计更新
       else if (dataType === 'executionStatsUpdate') {
-        if (payload?.realtimeUpdate) {
-          // 实时增量更新
-          const worker = payload.worker;
-          const usage = payload.usage;
-          if (worker && usage) {
-            // 更新列表中的统计
-            const statsIndex = executionStats.findIndex(s => s.worker === worker);
-            if (statsIndex >= 0) {
-              executionStats[statsIndex] = {
-                ...executionStats[statsIndex],
-                totalInputTokens: usage.inputTokens || 0,
-                totalOutputTokens: usage.outputTokens || 0,
-              };
-              executionStats = [...executionStats];
-            } else {
-              executionStats = [
-                ...executionStats,
-                {
-                  worker,
-                  totalExecutions: 0,
-                  successCount: 0,
-                  failureCount: 0,
-                  successRate: 0,
-                  avgDuration: 0,
-                  totalInputTokens: usage.inputTokens || 0,
-                  totalOutputTokens: usage.outputTokens || 0,
-                }
-              ];
-            }
-            recomputeTokenStatsSummary();
-          }
-        } else {
-          // 全量更新
-          if (Array.isArray(payload?.stats)) {
-            executionStats = payload.stats;
-            recomputeTokenStatsSummary();
-          } else if (payload?.orchestratorStats) {
-            totalInputTokens = payload.orchestratorStats.totalInputTokens || 0;
-            totalOutputTokens = payload.orchestratorStats.totalOutputTokens || 0;
-          }
+        if (Array.isArray(payload?.stats)) {
+          executionStats = payload.stats.map((item: any) => ({
+            ...item,
+            totalInputTokens: toSafeTokenCount(item?.totalInputTokens),
+            totalOutputTokens: toSafeTokenCount(item?.totalOutputTokens),
+          }));
+          recalibrateRuntimeTokenCounters();
+          recomputeTokenStatsSummary();
+        } else if (payload?.orchestratorStats) {
+          totalInputTokens = toSafeTokenCount(payload.orchestratorStats.totalInputTokens);
+          totalOutputTokens = toSafeTokenCount(payload.orchestratorStats.totalOutputTokens);
         }
+      }
+      // 实时 token 运行态：按 worker 合并到统计面板，实现运行中动态更新
+      else if (dataType === 'executionTokenRuntime') {
+        const worker = typeof payload?.worker === 'string' ? payload.worker.trim() : '';
+        if (!worker) {
+          return;
+        }
+        upsertRuntimeTokenCounter(worker, payload?.usage);
+        recomputeTokenStatsSummary();
       }
       // 画像配置加载
       else if (dataType === 'profileConfig') {

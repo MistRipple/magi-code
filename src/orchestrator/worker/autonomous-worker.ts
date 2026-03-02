@@ -1185,14 +1185,30 @@ ${completedWork}
       todo.status = 'completed';
       todo.completedAt = Date.now();
       todo.output = todoOutput;
-      await this.writeInsights(this.buildSuccessInsights(assignment, output.summary, output.modifiedFiles || [], todo));
+      try {
+        await this.writeInsights(this.buildSuccessInsights(assignment, output.summary, output.modifiedFiles || [], todo));
+      } catch (insightError) {
+        logger.warn('Worker.Todo.完成后Insight写入失败（忽略）', {
+          assignmentId: assignment.id,
+          todoId: todo.id,
+          error: insightError instanceof Error ? insightError.message : String(insightError),
+        }, LogCategory.ORCHESTRATOR);
+      }
 
-      this.emit('todoCompleted', {
-        assignmentId: assignment.id,
-        todoId: todo.id,
-        content: todo.content,
-        output: todo.output,
-      });
+      try {
+        this.emit('todoCompleted', {
+          assignmentId: assignment.id,
+          todoId: todo.id,
+          content: todo.content,
+          output: todo.output,
+        });
+      } catch (emitError) {
+        logger.warn('Worker.Todo.完成事件发送失败（忽略）', {
+          assignmentId: assignment.id,
+          todoId: todo.id,
+          error: emitError instanceof Error ? emitError.message : String(emitError),
+        }, LogCategory.ORCHESTRATOR);
+      }
 
       return {
         success: true,
@@ -1214,14 +1230,30 @@ ${completedWork}
         error: errorMessage,
         duration: Date.now() - startTime,
       };
-      await this.writeInsights(this.buildFailureInsights(assignment, errorMessage, todo));
+      try {
+        await this.writeInsights(this.buildFailureInsights(assignment, errorMessage, todo));
+      } catch (insightError) {
+        logger.warn('Worker.Todo.失败后Insight写入失败（忽略）', {
+          assignmentId: assignment.id,
+          todoId: todo.id,
+          error: insightError instanceof Error ? insightError.message : String(insightError),
+        }, LogCategory.ORCHESTRATOR);
+      }
 
-      this.emit('todoFailed', {
-        assignmentId: assignment.id,
-        todoId: todo.id,
-        content: todo.content,
-        error: errorMessage,
-      });
+      try {
+        this.emit('todoFailed', {
+          assignmentId: assignment.id,
+          todoId: todo.id,
+          content: todo.content,
+          error: errorMessage,
+        });
+      } catch (emitError) {
+        logger.warn('Worker.Todo.失败事件发送失败（忽略）', {
+          assignmentId: assignment.id,
+          todoId: todo.id,
+          error: emitError instanceof Error ? emitError.message : String(emitError),
+        }, LogCategory.ORCHESTRATOR);
+      }
 
       return {
         success: false,

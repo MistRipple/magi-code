@@ -192,10 +192,12 @@ export type GetTodosHandler = (params: {
   callerContext?: Pick<SplitTodoCallerContext, 'missionId' | 'assignmentId' | 'workerId'>;
 }) => Promise<any[]>;
 
+export type UpdateTodoStatus = 'pending' | 'skipped';
+
 export type UpdateTodoHandler = (params: {
   updates: Array<{
     todoId: string;
-    status?: string;
+    status?: UpdateTodoStatus;
     content?: string;
   }>;
 }) => Promise<{ success: boolean; error?: string }>;
@@ -214,6 +216,7 @@ export class OrchestrationExecutor {
   private categoryWorkerMap: CategoryWorkerEntry[] = [];
 
   private static readonly TOOL_NAMES = ['dispatch_task', 'send_worker_message', 'wait_for_workers', 'split_todo', 'get_todos', 'update_todo'] as const;
+  private static readonly UPDATE_TODO_STATUS_ENUM: UpdateTodoStatus[] = ['pending', 'skipped'];
 
   /**
    * 设置可用 Worker 列表（由 MissionDrivenEngine 从 ProfileLoader 注入）
@@ -1036,7 +1039,11 @@ export class OrchestrationExecutor {
               type: 'object',
               properties: {
                 todo_id: { type: 'string', description: '待更新的 Todo ID' },
-                status: { type: 'string', enum: ['pending', 'skipped', 'completed'], description: '更改状态（如强制跳过则设为 skipped）' },
+                status: {
+                  type: 'string',
+                  enum: OrchestrationExecutor.UPDATE_TODO_STATUS_ENUM,
+                  description: '更改状态：pending 表示重置为待执行，skipped 表示跳过。completed 仅允许执行链自动推进。',
+                },
                 content: { type: 'string', description: '更新任务描述' }
               },
               required: ['todo_id']
@@ -1061,7 +1068,7 @@ export class OrchestrationExecutor {
         isError: true,
       };
     }
-    const args = toolCall.arguments as { updates: Array<{ todo_id: string; status?: string; content?: string }> };
+    const args = toolCall.arguments as { updates: Array<{ todo_id: string; status?: UpdateTodoStatus | string; content?: string }> };
     try {
       if (!args.updates || !Array.isArray(args.updates)) {
         return {
@@ -1070,9 +1077,21 @@ export class OrchestrationExecutor {
           isError: true,
         };
       }
+
+      const allowedStatus = new Set(OrchestrationExecutor.UPDATE_TODO_STATUS_ENUM);
+      for (const update of args.updates) {
+        if (update.status !== undefined && !allowedStatus.has(update.status as UpdateTodoStatus)) {
+          return {
+            toolCallId: toolCall.id,
+            content: `Error: status 仅支持 ${OrchestrationExecutor.UPDATE_TODO_STATUS_ENUM.join(', ')}，不允许 ${update.status}`,
+            isError: true,
+          };
+        }
+      }
+
       const formattedUpdates = args.updates.map(u => ({
         todoId: u.todo_id,
-        status: u.status,
+        status: u.status as UpdateTodoStatus | undefined,
         content: u.content
       }));
       const result = await this.updateTodoHandler({

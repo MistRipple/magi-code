@@ -39,13 +39,13 @@
       <MessageList {messages} isActive={activeBottomTab === 'thread'} />
     </div>
     <div class="tab-pane" class:active={activeBottomTab === 'claude'}>
-      <AgentTab messages={agentOutputs.claude} isActive={activeBottomTab === 'claude'} />
+      <AgentTab workerName="claude" messages={agentOutputs.claude} isActive={activeBottomTab === 'claude'} />
     </div>
     <div class="tab-pane" class:active={activeBottomTab === 'codex'}>
-      <AgentTab messages={agentOutputs.codex} isActive={activeBottomTab === 'codex'} />
+      <AgentTab workerName="codex" messages={agentOutputs.codex} isActive={activeBottomTab === 'codex'} />
     </div>
     <div class="tab-pane" class:active={activeBottomTab === 'gemini'}>
-      <AgentTab messages={agentOutputs.gemini} isActive={activeBottomTab === 'gemini'} />
+      <AgentTab workerName="gemini" messages={agentOutputs.gemini} isActive={activeBottomTab === 'gemini'} />
     </div>
   </div>
 

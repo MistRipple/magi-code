@@ -253,6 +253,15 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
     return processResult;
   }
 
+  /**
+   * 仅基于输出结束标记判断是否完成（不使用子进程探测）。
+   * 用于 service 模式，避免 pgrep 偶发失准导致误判结束。
+   */
+  checkCompletedByMarker(processId: number, terminal: vscode.Terminal): CompletionCheckResult {
+    const session = this.terminalSessions.get(terminal);
+    return this.checkCompletedMarkerBased(processId, session);
+  }
+
   getOutputAndReturnCode(
     _processId: number,
     terminal: vscode.Terminal,

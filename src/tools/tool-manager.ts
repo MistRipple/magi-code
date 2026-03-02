@@ -29,6 +29,8 @@ import {
   ToolExecutor,
   ExtendedToolDefinition,
   ToolMetadata,
+  ProcessRunMode,
+  BUILTIN_TOOL_NAMES,
 } from './types';
 import { ToolCall, ToolResult, ToolDefinition, StandardizedToolResult } from '../llm/types';
 import { VSCodeTerminalExecutor } from './vscode-terminal-executor';
@@ -47,6 +49,7 @@ import type { SkillsManager, InstructionSkillDefinition } from './skills-manager
 import type { MCPToolExecutor } from './mcp-executor';
 import type { MCPPromptInfo } from './mcp-manager';
 import { WorkspaceFolderInfo, WorkspaceRoots } from '../workspace/workspace-roots';
+import { FileMutex } from '../utils/file-mutex';
 
 /**
  * 快照执行上下文（标识当前正在执行的 mission/assignment/worker）
@@ -126,6 +129,9 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   private workspaceRoot: string;
   private workspaceRoots: WorkspaceRoots;
 
+  // 跨执行器共享的文件级互斥锁
+  private fileMutex = new FileMutex();
+
   // 内置工具执行器
   private terminalExecutor: VSCodeTerminalExecutor;
   private fileExecutor: FileExecutor;
@@ -168,9 +174,9 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     // 读取 ACE 配置（统一入口）
     const aceConfig = loadAceConfigFromFile();
 
-    // 初始化所有内置执行器
-    this.terminalExecutor = new VSCodeTerminalExecutor();
-    this.fileExecutor = new FileExecutor(this.workspaceRoots);
+    // 初始化所有内置执行器（共享 fileMutex 保证文件读写与终端命令的并发安全）
+    this.terminalExecutor = new VSCodeTerminalExecutor(this.fileMutex);
+    this.fileExecutor = new FileExecutor(this.workspaceRoots, this.fileMutex);
     this.searchExecutor = new SearchExecutor(this.workspaceRoots);
     this.removeFilesExecutor = new RemoveFilesExecutor(this.workspaceRoots);
     this.webExecutor = new WebExecutor();
@@ -205,11 +211,13 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     this.workspaceRoot = this.workspaceRoots.getPrimaryFolder().path;
     this.workspaceMutationEpoch = 0;
     this.fileContextEpochByPath.clear();
-    this.fileExecutor = new FileExecutor(this.workspaceRoots);
+
+    // 原地更新，不重建实例（保留 llmEditHandler、onBeforeWrite 等已注册回调）
+    this.fileExecutor.updateWorkspaceRoots(this.workspaceRoots);
     this.searchExecutor = new SearchExecutor(this.workspaceRoots);
     this.removeFilesExecutor = new RemoveFilesExecutor(this.workspaceRoots);
 
-    // 重新注入快照回调（因为执行器被重建了）
+    // 重新注入快照回调（SearchExecutor/RemoveFilesExecutor 被重建了）
     this.injectSnapshotCallbacks();
 
     // 重新读取 ACE 配置并更新
@@ -346,6 +354,14 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   }
 
   /**
+   * 注册由外部提供的大模型文件编辑回调
+   * 透传给 FileExecutor（FileExecutor 实例不再重建，回调持久有效）
+   */
+  setLlmEditHandler(handler: (filePath: string, fileContent: string, summary: string, detailedDesc: string) => Promise<string>): void {
+    this.fileExecutor.setLlmEditHandler(handler);
+  }
+
+  /**
    * 设置权限矩阵
    */
   setPermissions(permissions: PermissionMatrix): void {
@@ -399,32 +415,9 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   }
 
   /**
-   * 内置工具名称列表
+   * 内置工具名称列表（引用公共常量 BUILTIN_TOOL_NAMES）
    */
-  private readonly builtinToolNames = [
-    'launch-process',
-    'read-process',
-    'write-process',
-    'kill-process',
-    'list-processes',
-    'file_view',
-    'file_create',
-    'file_edit',
-    'file_insert',
-    'file_bulk_edit',
-    'file_remove',
-    'grep_search',
-    'web_search',
-    'web_fetch',
-    'mermaid_diagram',
-    'codebase_retrieval',
-    'dispatch_task',
-    'send_worker_message',
-    'wait_for_workers',
-    'split_todo',
-    'get_todos',
-    'update_todo',
-  ];
+  private readonly builtinToolNames: readonly string[] = BUILTIN_TOOL_NAMES;
 
   /**
    * 内置工具别名映射（兼容不同命名风格，统一到规范名）
@@ -664,44 +657,49 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     if (content.startsWith('Command rejected:')) {
       return 'rejected';
     }
-    if (parsedStatus === 'timeout' || lower.includes(' timed out') || lower.includes('timeout') || lower.includes('超时')) {
-      return 'timeout';
-    }
-    if (parsedStatus === 'killed' || lower.includes('"status":"killed"') || lower.includes('"killed":true')) {
-      return 'killed';
-    }
-    if (lower.includes('aborterror') || lower.includes('aborted') || lower.includes('任务已中断')) {
-      return 'aborted';
-    }
-
-    if (parsedStatus === 'error' || parsedStatus === 'failed' || parsedStatus === 'failure') {
-      return 'error';
-    }
     if (parsedStatus === 'blocked') {
       return 'blocked';
     }
     if (parsedStatus === 'rejected') {
       return 'rejected';
     }
-    if (typeof parsed?.success === 'boolean' && parsed.success === false) {
-      return 'error';
+
+    const hasFailurePrefix = lower.startsWith('error:')
+      || lower.startsWith('[error]')
+      || lower.startsWith('mcp tool execution failed:')
+      || lower.startsWith('tool execution failed:');
+    const hasFailurePayload = parsedStatus === 'error'
+      || parsedStatus === 'failed'
+      || parsedStatus === 'failure'
+      || (typeof parsed?.success === 'boolean' && parsed.success === false)
+      || (typeof parsed?.ok === 'boolean' && parsed.ok === false)
+      || (typeof parsed?.error === 'string' && parsed.error.trim().length > 0)
+      || (typeof parsed?.error_message === 'string' && parsed.error_message.trim().length > 0);
+    const hasFailureSignal = Boolean(raw.isError) || hasFailurePrefix || hasFailurePayload;
+
+    if (parsedStatus === 'timeout') {
+      return 'timeout';
     }
-    if (typeof parsed?.ok === 'boolean' && parsed.ok === false) {
-      return 'error';
+    if (parsedStatus === 'killed') {
+      return 'killed';
     }
-    if (typeof parsed?.error === 'string' && parsed.error.trim()) {
-      return 'error';
+    if (parsedStatus === 'aborted') {
+      return 'aborted';
     }
-    if (typeof parsed?.error_message === 'string' && parsed.error_message.trim()) {
-      return 'error';
+
+    // 仅在已存在失败信号时，才允许关键字将结果细分为 timeout/killed/aborted。
+    // 防止 file_view 等“正文包含 timeout/aborted 单词”的正常输出被误判。
+    if (hasFailureSignal && (lower.includes(' timed out') || /\btimeout\b/.test(lower) || lower.includes('超时'))) {
+      return 'timeout';
     }
-    if (lower.startsWith('error:') || lower.startsWith('[error]')) {
-      return 'error';
+    if (hasFailureSignal && (lower.includes('"status":"killed"') || lower.includes('"killed":true') || /\bkilled\b/.test(lower))) {
+      return 'killed';
     }
-    if (lower.startsWith('mcp tool execution failed:') || lower.startsWith('tool execution failed:')) {
-      return 'error';
+    if (hasFailureSignal && (lower.includes('aborterror') || /\baborted\b/.test(lower) || lower.includes('任务已中断'))) {
+      return 'aborted';
     }
-    if (raw.isError) {
+
+    if (hasFailureSignal) {
       return 'error';
     }
     if (parsedStatus === 'success' || parsedStatus === 'completed' || parsedStatus === 'ok') {
@@ -741,9 +739,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     if (content.includes('[FILE_CONTEXT_STALE]')) {
       return 'file_context_stale';
     }
-    if (content.includes('[FILE_EDIT_NO_EFFECTIVE_CHANGE]')) {
-      return 'file_edit_no_effective_change';
-    }
+
     if (content.startsWith('MCP tool execution failed:')) {
       return 'mcp_execution_failed';
     }
@@ -764,7 +760,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         return await this.executeLaunchProcessTool(toolCall, signal);
 
       case 'read-process':
-        return await this.executeReadProcessTool(toolCall);
+        return await this.executeReadProcessTool(toolCall, signal);
 
       case 'write-process':
         return await this.executeWriteProcessTool(toolCall);
@@ -780,16 +776,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       case 'file_edit':
       case 'file_insert':
       case 'file_bulk_edit': {
-        if (name === 'file_edit') {
-          const noEffectError = this.validateFileEditHasEffectiveChange(toolCall);
-          if (noEffectError) {
-            return {
-              toolCallId: toolCall.id,
-              content: noEffectError,
-              isError: true,
-            };
-          }
-        }
         if (name === 'file_edit' || name === 'file_insert') {
           const staleError = this.validateFileContextFreshnessBeforeEdit(toolCall);
           if (staleError) {
@@ -883,13 +869,12 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    * 检查工具权限
    */
   private checkPermission(toolName: string): { allowed: boolean; reason?: string } {
-    // 终端命令工具需要 allowBash 权限（通过 VSCode Terminal 执行）
+    // 有副作用的终端工具需要 allowBash 权限
+    // 注意：read-process / list-processes 是只读操作，不需要 allowBash
     if (
       toolName === 'launch-process'
-      || toolName === 'read-process'
       || toolName === 'write-process'
       || toolName === 'kill-process'
-      || toolName === 'list-processes'
     ) {
       if (!this.permissions.allowBash) {
         return { allowed: false, reason: 'Terminal command execution is disabled' };
@@ -897,28 +882,29 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       return { allowed: true };
     }
 
-    // Edit/Write 工具需要 allowEdit 权限
-    if (toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit' || toolName === 'file_create' || toolName === 'file_edit' || toolName === 'file_insert' || toolName === 'file_bulk_edit' || toolName === 'file_remove') {
+    // 文件写入工具需要 allowEdit 权限
+    if (
+      toolName === 'file_create'
+      || toolName === 'file_edit'
+      || toolName === 'file_insert'
+      || toolName === 'file_bulk_edit'
+      || toolName === 'file_remove'
+    ) {
       if (!this.permissions.allowEdit) {
         return { allowed: false, reason: 'File editing is disabled' };
       }
       return { allowed: true };
     }
 
-    // Web 相关工具需要 allowWeb 权限
-    if (toolName === 'WebFetch' || toolName === 'WebSearch' || toolName.toLowerCase().includes('web')) {
+    // Web 工具需要 allowWeb 权限（精确匹配，避免误拦名字含 'web' 的 MCP 工具）
+    if (toolName === 'web_search' || toolName === 'web_fetch') {
       if (!this.permissions.allowWeb) {
         return { allowed: false, reason: 'Web access is disabled' };
       }
       return { allowed: true };
     }
 
-    // 编排工具默认允许（内部调度不需要额外权限）
-    if (toolName === 'dispatch_task' || toolName === 'send_worker_message' || toolName === 'wait_for_workers') {
-      return { allowed: true };
-    }
-
-    // 其他工具默认允许（Read, Grep, Glob 等只读工具）
+    // 其他工具默认允许（只读工具、编排工具、MCP 工具等）
     return { allowed: true };
   }
 
@@ -1015,7 +1001,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       'file_insert': { category: '文件操作', desc: '在指定行插入文本' },
       'file_remove': { category: '文件操作', desc: '删除文件' },
       'grep_search': { category: '文件操作', desc: '正则搜索代码内容' },
-      'launch-process': { category: '终端命令', desc: '执行构建/测试/启动服务等进程（禁止用于读写文件，必须使用 file_view/file_edit）' },
+      'launch-process': { category: '终端命令', desc: '执行构建/测试/启动服务等进程，也可用于 sed/python/node 脚本批量编辑文件（单文件精确编辑优先用 file_edit）' },
       'read-process': { category: '终端命令', desc: '读取终端进程输出' },
       'write-process': { category: '终端命令', desc: '向运行中的终端写入输入' },
       'kill-process': { category: '终端命令', desc: '终止终端进程' },
@@ -1098,20 +1084,29 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         name: 'launch-process',
         description: `Launch a shell command in an agent-dedicated terminal. Terminal identity is auto-injected by the system.
 
-Use wait=true for short commands (build, test, git), wait=false for long-running processes (dev server).
+Process modes:
+- run_mode="task": one-shot command, terminal becomes reusable after completion.
+- run_mode="service": long-running background service, terminal is locked until kill-process.
+- run_mode="service" + wait=true: wait only for startup handshake (not process exit), then return running/ready state.
+- wait timeout or user interrupt only stops waiting; process keeps running unless kill-process is called.
 
-IMPORTANT: If a more specific tool can perform the task, use that tool instead:
-- To read files or browse directories: use file_view, NOT cat/head/tail/less/python
-- For precise single-file edits with reliable line anchoring: prefer file_edit/file_insert
-- For full-file creation/overwrite: prefer file_create
-- To search code content: use grep_search, NOT grep/rg
-- To search the web: use web_search, NOT curl
-- To fetch a URL: use web_fetch, NOT curl/wget
+If run_mode is omitted, system defaults to:
+- wait=true => task
+- wait=false => service
+Additionally, long-running commands like dev/start/serve/watch may be auto-inferred as service to avoid accidental timeout-kill.
 
-Shell-based scripts are allowed for batch/repetitive multi-file changes when they are clearly more efficient.
+Tool selection guidance:
+- Single-file precise edits: prefer file_edit/file_insert (structured, reliable line anchoring)
+- Batch/repetitive multi-file changes: use launch-process with sed/python/node scripts (more efficient)
+- Full-file creation/overwrite: prefer file_create
+- Read files or browse directories: use file_view, NOT cat/head/tail
+- Search code content: use grep_search, NOT grep/rg
+- Search the web: use web_search, NOT curl
+- Fetch a URL: use web_fetch, NOT curl/wget
+
 Use launch-process for tasks that truly benefit from shell execution: build, test, lint, git, package manager, start server, database migration, or scripted bulk edits.
 
-Only set may_modify_files=true when the command is expected to directly modify source files that you will edit later.
+Only set may_modify_files=true when the command directly modifies source files (sed -i, python scripts writing files, echo > file, etc.).
 Do NOT set it for read-only commands such as ls/cat/grep/git status/log/diff.
 After a mutating command, refresh each target file with file_view once before file_edit/file_insert (no need to repeatedly view the same file).`,
         input_schema: {
@@ -1120,7 +1115,14 @@ After a mutating command, refresh each target file with file_view once before fi
             command: { type: 'string', description: '要执行的 shell 命令（不要在 command 中写 cd，目录请通过 cwd 传递）' },
             cwd: { type: 'string', description: '命令执行目录。单工作区可省略（自动使用工作区根目录）；多工作区必须显式指定 "<工作区名>" 或 "<工作区名>/相对路径"' },
             wait: { type: 'boolean', description: '是否等待进程完成（默认 true）' },
+            run_mode: { type: 'string', description: '运行模式：task（一次性命令）或 service（长驻服务）。默认规则：wait=true -> task，wait=false -> service；对 dev/start/serve/watch 等长驻命令会自动推断为 service。', enum: ['task', 'service'] },
             max_wait_seconds: { type: 'number', description: '空闲超时秒数（距最近一次输出超过该值则判定超时，默认 30）' },
+            startup_wait_seconds: { type: 'number', description: '仅 service 模式生效。wait=true 时用于启动握手等待秒数（默认 5）。' },
+            ready_patterns: {
+              type: 'array',
+              description: '仅 service 模式生效。可选的就绪日志正则字符串数组，命中后 phase 进入 ready。',
+              items: { type: 'string' },
+            },
             showTerminal: { type: 'boolean', description: '是否显示终端窗口（默认 true）' },
             may_modify_files: { type: 'boolean', description: '命令是否会直接修改后续要编辑的源文件。仅在确实会改文件时设为 true；ls/cat/grep/git status 等只读命令应保持 false。默认 false（系统也会做有限启发式检测）。' },
           },
@@ -1129,20 +1131,32 @@ After a mutating command, refresh each target file with file_view once before fi
       },
       {
         name: 'read-process',
-        description: '读取终端进程输出与状态，可选择等待。',
+        description: `Read terminal process output and status. Safe for long-running services — timeout only stops waiting, never kills the process.
+
+Usage patterns:
+- wait=false (default): return current output immediately, no blocking.
+- wait=true: block until process completes or idle timeout is reached. If the process is still running when timeout fires, returns status="running" with current output — the process keeps running.
+- from_cursor: optional incremental read cursor. Use previous next_cursor to fetch only newly appended output.
+
+Typical workflow for background services:
+  1. launch-process("npm run dev", run_mode="service", wait=false) → terminal_id=1
+  2. read-process(terminal_id=1, wait=true, max_wait_seconds=5) → check startup logs
+  3. read-process(terminal_id=1, from_cursor=<next_cursor>) → read incremental logs.`,
         input_schema: {
           type: 'object',
           properties: {
             terminal_id: { type: 'number', description: 'terminal_id（来自 launch-process）' },
             wait: { type: 'boolean', description: '是否等待状态变化（默认 false）' },
             max_wait_seconds: { type: 'number', description: '空闲超时秒数（距最近一次输出超过该值则判定超时，默认 30）' },
+            from_cursor: { type: 'number', description: '增量读取起始游标。传上一次返回的 next_cursor 只读取新增输出。' },
           },
           required: ['terminal_id'],
         },
       },
       {
         name: 'write-process',
-        description: '向运行中的终端进程写入 stdin。',
+        description: `Write text to a running terminal process stdin. After writing, use read-process to see the response.
+Only works when the process is in "running" state; returns accepted=false otherwise.`,
         input_schema: {
           type: 'object',
           properties: {
@@ -1154,7 +1168,7 @@ After a mutating command, refresh each target file with file_view once before fi
       },
       {
         name: 'kill-process',
-        description: '终止指定终端进程。',
+        description: 'Terminate a terminal process by sending SIGINT and disposing the terminal. For service mode this also releases terminal lock.',
         input_schema: {
           type: 'object',
           properties: {
@@ -1165,7 +1179,7 @@ After a mutating command, refresh each target file with file_view once before fi
       },
       {
         name: 'list-processes',
-        description: '列出当前所有终端进程记录。',
+        description: 'List all terminal process records with their current status, command, working directory, and elapsed time. Use this to check which processes are still running.',
         input_schema: {
           type: 'object',
           properties: {},
@@ -1440,6 +1454,32 @@ After a mutating command, refresh each target file with file_view once before fi
     };
   }
 
+  /**
+   * 自动识别常见长驻命令，避免在未显式指定 run_mode 时误判为 task 后被超时终止。
+   */
+  private isLikelyLongRunningServiceCommand(command: string): boolean {
+    if (!command || typeof command !== 'string') {
+      return false;
+    }
+    const normalized = command.trim().toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+
+    const servicePatterns: RegExp[] = [
+      /\b(npm|pnpm|yarn|bun)\s+(run\s+)?(dev|start|serve|preview|watch)\b/i,
+      /\b(vite|webpack|next|nuxt|astro)\b[^\n]*\b(dev|start|serve|watch)\b/i,
+      /\b(node|tsx|ts-node|nodemon)\b[^\n]*\b(server|dev|watch)\b/i,
+      /\bpython(?:3)?\s+-m\s+http\.server\b/i,
+      /\b(uvicorn|gunicorn)\b/i,
+      /\bdocker\s+compose\s+up\b/i,
+      /\bkubectl\s+port-forward\b/i,
+      /\btail\s+-f\b/i,
+    ];
+
+    return servicePatterns.some((pattern) => pattern.test(normalized));
+  }
+
   private isLikelyFileMutatingCommand(command: string): boolean {
     const patterns = [
       /\bsed\s+-i(?:\S*)?\b/i,
@@ -1525,49 +1565,6 @@ After a mutating command, refresh each target file with file_view once before fi
   }
 
   /**
-   * 预检 file_edit 是否有有效文本增量。
-   * 对于 old_str 与 new_str 完全相同的调用，直接拦截，避免无效工具执行。
-   */
-  private validateFileEditHasEffectiveChange(toolCall: ToolCall): string | null {
-    if (toolCall.name !== 'file_edit') {
-      return null;
-    }
-
-    const args = (toolCall.arguments || {}) as Record<string, unknown>;
-    const oldStrKeys = Object.keys(args)
-      .filter(k => /^old_str_\d+$/.test(k))
-      .sort((a, b) => Number(a.replace('old_str_', '')) - Number(b.replace('old_str_', '')));
-
-    if (oldStrKeys.length === 0) {
-      return null;
-    }
-
-    const noEffectEntries: number[] = [];
-
-    for (const oldKey of oldStrKeys) {
-      const index = Number(oldKey.replace('old_str_', ''));
-      const oldStr = args[oldKey];
-      if (typeof oldStr !== 'string') {
-        continue;
-      }
-      const newStrRaw = args[`new_str_${index}`];
-      const newStr = typeof newStrRaw === 'string' ? newStrRaw : '';
-
-      if (this.normalizeLineEndings(oldStr) !== this.normalizeLineEndings(newStr)) {
-        return null;
-      }
-
-      noEffectEntries.push(index);
-    }
-
-    if (noEffectEntries.length === 0) {
-      return null;
-    }
-
-    return `Error [FILE_EDIT_NO_EFFECTIVE_CHANGE]: entries ${noEffectEntries.join(', ')} have identical old_str/new_str, no effective change to apply. Regenerate edit content before calling file_edit.`;
-  }
-
-  /**
    * 上下文新鲜度校验：
    * 当工作区可能被外部命令改写后，file_edit/file_insert 必须先对目标文件执行一次 file_view。
    * 这样可保证后续行锚点与 old_str 基于最新文件状态，避免“调用成功但无改动”。
@@ -1590,10 +1587,6 @@ After a mutating command, refresh each target file with file_view once before fi
 
     const displayPath = this.workspaceRoots.toDisplayPath(absPath);
     return `Error [FILE_CONTEXT_STALE]: ${displayPath} may have changed after external mutations. Run file_view on this file once, then retry file_edit/file_insert with refreshed anchors.`;
-  }
-
-  private normalizeLineEndings(input: string): string {
-    return input.replace(/\r\n/g, '\n');
   }
 
   private recordFileContextAfterFileTool(toolCall: ToolCall, result: ToolResult): void {
@@ -1633,7 +1626,17 @@ After a mutating command, refresh each target file with file_view once before fi
 
   private async executeLaunchProcessTool(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     const args = toolCall.arguments as any;
-    const { command: rawCommand, cwd: rawCwd, wait = true, max_wait_seconds = 30, showTerminal = true, may_modify_files = false } = args;
+    const {
+      command: rawCommand,
+      cwd: rawCwd,
+      wait = true,
+      run_mode: rawRunMode,
+      max_wait_seconds = 30,
+      startup_wait_seconds,
+      ready_patterns,
+      showTerminal = true,
+      may_modify_files = false,
+    } = args;
     const normalized = this.normalizeLaunchProcessCommand(rawCommand, rawCwd);
     if (!normalized.command) {
       return {
@@ -1649,10 +1652,34 @@ After a mutating command, refresh each target file with file_view once before fi
         isError: true,
       };
     }
+    if (rawRunMode !== undefined && rawRunMode !== 'task' && rawRunMode !== 'service') {
+      return {
+        toolCallId: toolCall.id,
+        content: 'Command rejected: run_mode 参数错误，只能是 "task" 或 "service"',
+        isError: true,
+      };
+    }
     if (args.max_wait_seconds !== undefined && (typeof args.max_wait_seconds !== 'number' || !Number.isFinite(args.max_wait_seconds))) {
       return {
         toolCallId: toolCall.id,
         content: 'Command rejected: max_wait_seconds 参数类型错误，必须是 number',
+        isError: true,
+      };
+    }
+    if (startup_wait_seconds !== undefined && (typeof startup_wait_seconds !== 'number' || !Number.isFinite(startup_wait_seconds) || startup_wait_seconds < 0)) {
+      return {
+        toolCallId: toolCall.id,
+        content: 'Command rejected: startup_wait_seconds 参数类型错误，必须是 >= 0 的 number',
+        isError: true,
+      };
+    }
+    if (
+      ready_patterns !== undefined
+      && (!Array.isArray(ready_patterns) || ready_patterns.some((item: unknown) => typeof item !== 'string'))
+    ) {
+      return {
+        toolCallId: toolCall.id,
+        content: 'Command rejected: ready_patterns 参数类型错误，必须是 string[]',
         isError: true,
       };
     }
@@ -1710,13 +1737,28 @@ After a mutating command, refresh each target file with file_view once before fi
       terminalName,
     }, LogCategory.TOOLS);
 
+    const inferredServiceMode = rawRunMode === undefined
+      && wait === true
+      && this.isLikelyLongRunningServiceCommand(normalized.command);
+    const runMode: ProcessRunMode = rawRunMode === 'task' || rawRunMode === 'service'
+      ? rawRunMode
+      : (wait && !inferredServiceMode ? 'task' : 'service');
+    if (inferredServiceMode) {
+      logger.info('launch-process 自动推断为 service 模式（长驻命令）', {
+        command: normalized.command,
+      }, LogCategory.TOOLS);
+    }
+    const effectiveWait = wait;
     const result = await this.terminalExecutor.launchProcess({
       command: normalized.command,
       cwd: resolvedCwd,
-      wait,
+      wait: effectiveWait,
       maxWaitSeconds: max_wait_seconds,
       name: terminalName,
       showTerminal,
+      runMode,
+      startupWaitSeconds: startup_wait_seconds,
+      readyPatterns: ready_patterns,
     }, signal);
 
     const hasFailureStatus = result.status === 'failed' || result.status === 'killed' || result.status === 'timeout';
@@ -1747,11 +1789,43 @@ After a mutating command, refresh each target file with file_view once before fi
     };
   }
 
-  private async executeReadProcessTool(toolCall: ToolCall): Promise<ToolResult> {
+  private async executeReadProcessTool(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     const args = toolCall.arguments as any;
-    const { terminal_id, wait = false, max_wait_seconds = 30 } = args;
+    const { terminal_id, wait = false, max_wait_seconds = 30, from_cursor } = args;
 
-    const result = await this.terminalExecutor.readProcess(terminal_id, wait, max_wait_seconds);
+    if (terminal_id === undefined || typeof terminal_id !== 'number') {
+      return {
+        toolCallId: toolCall.id,
+        content: 'read-process rejected: terminal_id 参数缺失或类型错误，必须是 number',
+        isError: true,
+      };
+    }
+    if (args.wait !== undefined && typeof args.wait !== 'boolean') {
+      return {
+        toolCallId: toolCall.id,
+        content: 'read-process rejected: wait 参数类型错误，必须是 boolean',
+        isError: true,
+      };
+    }
+    if (
+      args.max_wait_seconds !== undefined
+      && (typeof args.max_wait_seconds !== 'number' || !Number.isFinite(args.max_wait_seconds))
+    ) {
+      return {
+        toolCallId: toolCall.id,
+        content: 'read-process rejected: max_wait_seconds 参数类型错误，必须是 number',
+        isError: true,
+      };
+    }
+    if (from_cursor !== undefined && (!Number.isInteger(from_cursor) || from_cursor < 0)) {
+      return {
+        toolCallId: toolCall.id,
+        content: 'read-process rejected: from_cursor 参数类型错误，必须是 >= 0 的整数',
+        isError: true,
+      };
+    }
+
+    const result = await this.terminalExecutor.readProcess(terminal_id, wait, max_wait_seconds, from_cursor, signal);
     const hasFailureStatus = result.status === 'failed' || result.status === 'killed' || result.status === 'timeout';
     const hasNonZeroExit = result.return_code !== null && result.return_code !== 0;
     const isError = hasFailureStatus || hasNonZeroExit;
@@ -1766,6 +1840,21 @@ After a mutating command, refresh each target file with file_view once before fi
     const args = toolCall.arguments as any;
     const { terminal_id, input_text } = args;
 
+    if (terminal_id === undefined || typeof terminal_id !== 'number') {
+      return {
+        toolCallId: toolCall.id,
+        content: 'write-process rejected: terminal_id 参数缺失或类型错误，必须是 number',
+        isError: true,
+      };
+    }
+    if (input_text === undefined || typeof input_text !== 'string') {
+      return {
+        toolCallId: toolCall.id,
+        content: 'write-process rejected: input_text 参数缺失或类型错误，必须是 string',
+        isError: true,
+      };
+    }
+
     const result = await this.terminalExecutor.writeProcess(terminal_id, input_text);
     return {
       toolCallId: toolCall.id,
@@ -1777,6 +1866,14 @@ After a mutating command, refresh each target file with file_view once before fi
   private async executeKillProcessTool(toolCall: ToolCall): Promise<ToolResult> {
     const args = toolCall.arguments as any;
     const { terminal_id } = args;
+
+    if (terminal_id === undefined || typeof terminal_id !== 'number') {
+      return {
+        toolCallId: toolCall.id,
+        content: 'kill-process rejected: terminal_id 参数缺失或类型错误，必须是 number',
+        isError: true,
+      };
+    }
 
     const result = await this.terminalExecutor.killProcess(terminal_id);
     return {

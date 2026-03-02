@@ -56,7 +56,8 @@
   // 确认切换会话
   function confirmSwitch() {
     if (pendingSwitchSessionId) {
-      vscode.postMessage({ type: 'switchSession', sessionId: pendingSwitchSessionId });
+      const currentMessages = collectCurrentSessionSnapshot();
+      vscode.postMessage({ type: 'switchSession', sessionId: pendingSwitchSessionId, currentMessages });
     }
     closeSwitchConfirm();
     dropdownOpen = false;
@@ -71,7 +72,8 @@
 
   // 新建会话
   function newSession() {
-    vscode.postMessage({ type: 'newSession' });
+    const currentMessages = collectCurrentSessionSnapshot();
+    vscode.postMessage({ type: 'newSession', currentMessages });
     dropdownOpen = false;
   }
 
@@ -113,6 +115,47 @@
       hour: '2-digit',
       minute: '2-digit'
     });
+  }
+
+  type PersistableMessage = Record<string, unknown> & {
+    id?: string;
+    timestamp?: number;
+  };
+
+  function collectCurrentSessionSnapshot(): PersistableMessage[] {
+    if (!messagesState.currentSessionId) return [];
+
+    const merged: PersistableMessage[] = [];
+    const seen = new Set<string>();
+
+    for (const message of ensureArray<PersistableMessage>(messagesState.threadMessages as unknown as PersistableMessage[])) {
+      const id = typeof message?.id === 'string' ? message.id.trim() : '';
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      merged.push(message);
+    }
+
+    const workers = ['claude', 'codex', 'gemini'] as const;
+    for (const worker of workers) {
+      for (const message of ensureArray<PersistableMessage>(messagesState.agentOutputs[worker] as unknown as PersistableMessage[])) {
+        const id = typeof message?.id === 'string' ? message.id.trim() : '';
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        merged.push({
+          ...message,
+          agent: worker,
+          source: worker,
+        });
+      }
+    }
+
+    merged.sort((a, b) => {
+      const ta = typeof a?.timestamp === 'number' ? a.timestamp : 0;
+      const tb = typeof b?.timestamp === 'number' ? b.timestamp : 0;
+      return ta - tb;
+    });
+
+    return merged;
   }
 </script>
 

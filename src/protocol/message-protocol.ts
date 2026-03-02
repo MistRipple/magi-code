@@ -112,7 +112,9 @@ export type DataMessageType =
   | 'confirmationRequest'
   | 'customToolAdded'
   | 'customToolRemoved'
+  | 'deepTaskChanged'
   | 'dynamicTodoAdded'
+  | 'executionTokenRuntime'
   | 'executionStatsUpdate'
   | 'instructionSkillRemoved'
   | 'interactionModeChanged'
@@ -534,6 +536,26 @@ export interface MessageMetadata {
   worker?: string;
   /** 是否派发给 Worker 的指令消息 */
   dispatchToWorker?: boolean;
+  /** Worker lane 标识（同一 batch+worker 执行链） */
+  laneId?: string;
+  /** Worker lane 指令卡片 ID（用于卡片聚合更新） */
+  laneCardId?: string;
+  /** Worker lane 当前任务序号（从 1 开始） */
+  laneIndex?: number;
+  /** Worker lane 任务总数 */
+  laneTotal?: number;
+  /** Worker lane 全部任务 ID 列表 */
+  laneTaskIds?: string[];
+  /** Worker lane 当前执行任务 ID */
+  laneCurrentTaskId?: string;
+  /** Worker lane 结构化任务列表（前端可直接渲染） */
+  laneTasks?: Array<{
+    taskId: string;
+    title: string;
+    status: 'pending' | 'waiting_deps' | 'running' | 'completed' | 'failed' | 'skipped' | 'cancelled';
+    dependsOn?: string[];
+    isCurrent?: boolean;
+  }>;
   /** 子任务数据（主对话区 TASK_CARD 消息携带的完整数据） */
   subTaskCard?: unknown;
   /** 扩展数据 */

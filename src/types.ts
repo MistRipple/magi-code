@@ -465,16 +465,16 @@ export type WebviewToExtensionMessage =
   | { type: 'revertChange'; filePath: string }
   | { type: 'approveAllChanges' }
   | { type: 'revertAllChanges' }
-  | { type: 'newSession' }
+  | { type: 'newSession'; currentMessages?: any[] }
   | { type: 'saveCurrentSession'; messages: any[] }
-  | { type: 'switchSession'; sessionId: string }
+  | { type: 'switchSession'; sessionId: string; currentMessages?: any[] }
   | { type: 'renameSession'; sessionId: string; name: string }
   | { type: 'closeSession'; sessionId: string }
   | { type: 'deleteSession'; sessionId: string; requireConfirm?: boolean }
   | { type: 'selectWorker'; worker: WorkerSlot | null }
   | { type: 'updateSetting'; key: string; value: unknown }
   | { type: 'viewDiff'; filePath: string }
-  | { type: 'openFile'; filepath: string }
+  | { type: 'openFile'; filepath?: string; filePath?: string }
   | { type: 'openLink'; url: string }
   | { type: 'confirmPlan'; confirmed: boolean }
   | { type: 'answerQuestions'; answer: string | null }
@@ -491,6 +491,9 @@ export type WebviewToExtensionMessage =
   | { type: 'checkWorkerStatus'; force?: boolean }
 
   | { type: 'clearAllTasks' }
+
+  // 深度任务模式状态请求
+  | { type: 'getDeepTaskState' }
 
   // UI 错误上报
   | { type: 'uiError'; component: string; detail: string; stack?: string }

@@ -3,13 +3,14 @@
   import Icon from './Icon.svelte';
   import FileSpan from './FileSpan.svelte';
   import MermaidRenderer from './MermaidRenderer.svelte';
+  import WaitResultCard from './WaitResultCard.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
   import { vscode } from '../lib/vscode-bridge';
   import type { IconName } from '../lib/icons';
   import type { StandardizedToolResult } from '../types/message';
 
   interface ErrorDiagnosis {
-    category: 'model_input' | 'context_stale' | 'permission' | 'runtime';
+    category: 'model_input' | 'context_stale' | 'permission' | 'role_constraint' | 'runtime';
     categoryLabel: string;
     ownerLabel: string;
     hint: string;
@@ -44,8 +45,8 @@
     onOpenFile
   }: Props = $props();
 
-  // 折叠状态 - Mermaid 卡片默认展开，其他由 initialExpanded 控制
-  let collapsed = $state(untrack(() => !initialExpanded && name !== 'mermaid_diagram'));
+  // 折叠状态 - Mermaid / wait_for_workers 卡片默认展开，其他由 initialExpanded 控制
+  let collapsed = $state(untrack(() => !initialExpanded && name !== 'mermaid_diagram' && name !== 'wait_for_workers'));
   let copySuccess = $state(false);
 
   // 格式化内容
@@ -90,6 +91,7 @@
       'codebase_retrieval': 'search',
       'dispatch_task': 'tools',
       'send_worker_message': 'send',
+      'wait_for_workers': 'hourglass',
     };
 
     if (iconMap[toolName]) {
@@ -125,6 +127,8 @@
 
   // 目录/文件只读工具：只需紧凑 header
   const isCompactReadOnlyTool = $derived(name === 'file_view' || name === 'list_files');
+  // 仅 view 类工具支持点击整行 header 打开文件
+  const isHeaderOpenableTool = $derived(name === 'file_view' || name === 'view');
 
   // 检查是否有内容
   const hasInput = $derived(!!input && !!formatContent(input));
@@ -147,6 +151,28 @@
       }
     } catch {
       // 忽略解析错误
+    }
+    return null;
+  });
+
+  // 检查是否为 wait_for_workers 工具输出
+  const isWaitForWorkersTool = $derived(name === 'wait_for_workers');
+  const waitResultData = $derived.by(() => {
+    if (!isWaitForWorkersTool || !output) return null;
+    try {
+      const data = typeof output === 'string' ? JSON.parse(output) : output;
+      if (data && Array.isArray(data.results) && typeof data.wait_status === 'string') {
+        return data as {
+          results: Array<{ task_id: string; worker: string; status: 'completed' | 'failed' | 'skipped' | 'cancelled'; summary: string; modified_files: string[]; errors?: string[] }>;
+          wait_status: 'completed' | 'timeout';
+          timed_out: boolean;
+          pending_task_ids: string[];
+          waited_ms: number;
+          audit?: any;
+        };
+      }
+    } catch {
+      // 解析失败时回退到原始展示
     }
     return null;
   });
@@ -174,6 +200,7 @@
       'codebase_retrieval': 'retrieval',
       'dispatch_task': 'dispatch',
       'send_worker_message': 'message',
+      'wait_for_workers': 'wait results',
       'list_files': 'list files',
     };
 
@@ -247,10 +274,16 @@
     const rawMessage = `${toolResult?.message || ''}\n${errorText || ''}`.trim();
     if (!rawMessage) return null;
 
-    const message = rawMessage.toLowerCase();
     const errorCode = (toolResult?.errorCode || '').toLowerCase();
+    // 只取消息前 300 字符做关键词匹配，避免工具输出正文中的常见词（如 authorization、timeout）
+    // 导致误分类。后端结构化错误前缀（如 "Tool blocked:", "Command rejected:"）都在开头。
+    const messageHead = rawMessage.slice(0, 300).toLowerCase();
+    /** 匹配 errorCode 或消息头部 */
     const matches = (...patterns: string[]): boolean =>
-      patterns.some((pattern) => errorCode.includes(pattern) || message.includes(pattern));
+      patterns.some((pattern) => errorCode.includes(pattern) || messageHead.includes(pattern));
+    /** 仅匹配 errorCode（不匹配消息内容，用于宽泛关键词如 authorization） */
+    const codeMatches = (...patterns: string[]): boolean =>
+      patterns.some((pattern) => errorCode.includes(pattern));
 
     if (matches('file_context_stale', '[file_context_stale]')) {
       return {
@@ -258,15 +291,6 @@
         categoryLabel: '上下文过期',
         ownerLabel: '归因：流程上下文',
         hint: '先对目标文件执行一次 file_view，再基于最新内容重新生成 old_str 与行锚点。',
-      };
-    }
-
-    if (matches('file_edit_no_effective_change', '[file_edit_no_effective_change]')) {
-      return {
-        category: 'model_input',
-        categoryLabel: '参数无效',
-        ownerLabel: '归因：LLM 参数',
-        hint: '本次 edit 没有有效文本增量，请重新生成可产生差异的 old_str/new_str。',
       };
     }
 
@@ -289,7 +313,19 @@
       };
     }
 
-    if (matches('tool_blocked', 'authorization', 'user denied tool authorization')) {
+    // 编排者角色约束（dispatch_task 引导）— 与用户权限无关，是系统架构层面的职责划分
+    if (matches('编排者', 'dispatch_task 委派', '深度模式下编排者')) {
+      return {
+        category: 'role_constraint',
+        categoryLabel: '角色约束',
+        ownerLabel: '归因：编排者职责边界',
+        hint: '编排者不执行此操作，应通过 dispatch_task 委派给 Worker。',
+      };
+    }
+
+    // 用户权限拦截（Ask 模式弹窗拒绝 / 权限开关关闭）
+    // 仅匹配 errorCode，不对 message 做子串匹配 — 'authorization' 在代码中过于常见，易误判
+    if (codeMatches('tool_blocked') || messageHead.includes('user denied tool authorization')) {
       return {
         category: 'permission',
         categoryLabel: '权限拦截',
@@ -330,9 +366,11 @@
     if (!input || typeof input !== 'object') return undefined;
     const args = input as Record<string, unknown>;
 
-    // 支持各种含有 path 的工具，排除 list_files 因为它通常是目录
-    if (name !== 'list_files' && typeof args.path === 'string' && args.path.trim().length > 0) {
-      return args.path;
+    const pathCandidates = [args.path, args.filepath, args.filePath];
+    for (const candidate of pathCandidates) {
+      if (typeof candidate === 'string' && candidate.trim().length > 0) {
+        return candidate.trim();
+      }
     }
 
     return undefined;
@@ -348,7 +386,7 @@
         // 后备：直接发消息给 VSCode 桥
         vscode.postMessage({
           type: 'openFile',
-          filePath: toolFilepath
+          filepath: toolFilepath
         });
       }
     }
@@ -408,16 +446,16 @@
         <div
           class="tool-header"
           class:file-mutation-header={isCompactMutation || isCompactReadOnlyTool}
-          class:clickable={isCompactReadOnlyTool && !!toolFilepath}
-          onclick={isCompactReadOnlyTool && toolFilepath ? handleOpenFile : undefined}
+          class:clickable={isHeaderOpenableTool && !!toolFilepath}
+          onclick={isHeaderOpenableTool && toolFilepath ? handleOpenFile : undefined}
           onkeydown={(e) => {
-            if (isCompactReadOnlyTool && toolFilepath && (e.key === 'Enter' || e.key === ' ')) {
+            if (isHeaderOpenableTool && toolFilepath && (e.key === 'Enter' || e.key === ' ')) {
               e.preventDefault();
               handleOpenFile();
             }
           }}
-          role={isCompactReadOnlyTool && toolFilepath ? "button" : undefined}
-          tabindex={isCompactReadOnlyTool && toolFilepath ? 0 : undefined}
+          role={isHeaderOpenableTool && toolFilepath ? "button" : undefined}
+          tabindex={isHeaderOpenableTool && toolFilepath ? 0 : undefined}
         >
           {@render headerContent()}
         </div>
@@ -425,7 +463,7 @@
 
       {#if isExpandable && !collapsed}
         <div class="tool-content">
-          {#if hasInput && !isMermaidTool}
+          {#if hasInput && !isMermaidTool && !isWaitForWorkersTool}
             <div class="tool-section">
               <div class="section-header">
                 <span class="section-label">输入</span>
@@ -442,6 +480,8 @@
                   title={mermaidData?.title}
                   diagramType={mermaidData?.diagramType}
                 />
+              {:else if isWaitForWorkersTool && waitResultData}
+                <WaitResultCard data={waitResultData} />
               {:else}
                 <div class="section-header">
                   <span class="section-label">输出</span>
@@ -609,6 +649,12 @@
     color: var(--warning);
     border-color: rgba(234, 179, 8, 0.45);
     background: rgba(234, 179, 8, 0.12);
+  }
+
+  .error-role_constraint {
+    color: var(--info);
+    border-color: rgba(139, 92, 246, 0.45);
+    background: rgba(139, 92, 246, 0.12);
   }
 
   .error-runtime {

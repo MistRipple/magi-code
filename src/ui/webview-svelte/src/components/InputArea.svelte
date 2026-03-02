@@ -74,6 +74,9 @@
   const minHeight = 80;
   const maxHeight = 400;
 
+  // 深度任务模式
+  let deepTaskEnabled = $state(false);
+
   // 增强按钮状态
   let isEnhancing = $state(false);
 
@@ -199,6 +202,13 @@
     }
     requestInteractionMode(mode);
     vscode.postMessage({ type: 'setInteractionMode', mode });
+  }
+
+  // 切换深度任务模式
+  function toggleDeepTask() {
+    deepTaskEnabled = !deepTaskEnabled;
+    vscode.postMessage({ type: 'updateSetting', key: 'deepTask', value: deepTaskEnabled });
+    addToast('info', deepTaskEnabled ? '已开启深度模式（新会话生效）' : '已关闭深度模式');
   }
 
   // 拖动调整大小
@@ -336,7 +346,17 @@
         const payload = standard.data.payload as { config?: any };
         skillsConfig = payload?.config || null;
       }
+
+      // 深度任务状态同步
+      if (standard.data.dataType === 'deepTaskChanged') {
+        const payload = standard.data.payload as { enabled?: boolean };
+        if (typeof payload?.enabled === 'boolean') {
+          deepTaskEnabled = payload.enabled;
+        }
+      }
     });
+    // 初始化时请求 deepTask 状态
+    vscode.postMessage({ type: 'getDeepTaskState' });
     return () => unsubscribe();
   });
 </script>
@@ -472,6 +492,18 @@
           <span class="ia-toggle-label auto" class:active={interactionMode === 'auto'}>Auto</span>
           <span class="ia-toggle-thumb" class:syncing={isModeSyncing}></span>
         </div>
+
+        <!-- 深度任务模式开关 -->
+        <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+        <button
+          class="ia-deep-btn"
+          class:active={deepTaskEnabled}
+          onclick={toggleDeepTask}
+          title={deepTaskEnabled ? '深度模式：无限 loop + review 直到完成' : '常规模式：单轮对话完成一件事'}
+        >
+          <Icon name="infinity" size={12} />
+          <span class="ia-deep-label">深度</span>
+        </button>
       </div>
 
       <div class="ia-right">
@@ -894,6 +926,36 @@
     0%, 100% { opacity: 1; }
     50% { opacity: 0.5; }
   }
+
+  /* 深度任务模式按钮 */
+  .ia-deep-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    height: 24px;
+    padding: 0 8px;
+    font-size: 10px;
+    font-weight: var(--font-semibold);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
+    color: var(--foreground-muted);
+    cursor: pointer;
+    user-select: none;
+    flex-shrink: 0;
+    transition: all var(--transition-fast);
+    white-space: nowrap;
+  }
+  .ia-deep-btn:hover { border-color: var(--foreground-muted); color: var(--foreground); }
+  .ia-deep-btn.active {
+    background: color-mix(in srgb, var(--primary) 15%, transparent);
+    border-color: var(--primary);
+    color: var(--primary);
+  }
+  .ia-deep-btn.active:hover {
+    background: color-mix(in srgb, var(--primary) 22%, transparent);
+  }
+  .ia-deep-label { pointer-events: none; }
 
   /* 发送按钮：圆形 */
   .ia-send {

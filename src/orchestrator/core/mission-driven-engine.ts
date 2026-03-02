@@ -501,6 +501,7 @@ export class MissionDrivenEngine extends EventEmitter {
           relevantADRs,
           availableToolsSummary,
           categoryDefinitions,
+          deepTask: this.adapterFactory.isDeepTask(),
         });
 
         // 追加用户规则（buildUnifiedSystemPrompt 不含用户规则，需显式注入）

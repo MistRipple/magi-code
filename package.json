@@ -2,7 +2,7 @@
   "name": "magi",
   "displayName": "Magi",
   "description": "多智能体工程编排 system — 意图分析、任务拆解、异构专家协作",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "license": "GPL-3.0-or-later",
   "author": "MistRipple",
   "publisher": "MistRipple",
@@ -195,6 +195,11 @@
               "default": false
             }
           }
+        },
+        "magi.deepTask": {
+          "type": "boolean",
+          "default": false,
+          "description": "深度任务模式：解除编排者和 Worker 的轮次硬上限，适用于从 0 到 1 的完整项目实现。开启后仍保留空转检测、失败计数等智能安全网。新开会话后生效。"
         },
         "magi.cliSelection": {
           "type": "object",

@@ -36,6 +36,8 @@ export interface UnifiedPromptContext {
   availableToolsSummary?: string;
   /** 分类定义（displayName + description，用于构建分工映射表） */
   categoryDefinitions?: Map<string, { displayName: string; description: string }>;
+  /** 深度任务模式：编排者专职编排，禁止直接修改代码 */
+  deepTask?: boolean;
 }
 
 /**
@@ -46,7 +48,7 @@ export interface UnifiedPromptContext {
  * LLM 在此提示词下通过工具循环自主决策：直接回答 / 工具操作 / 分配 Worker。
  */
 export function buildUnifiedSystemPrompt(context: UnifiedPromptContext): string {
-  const { availableWorkers, workerProfiles, projectContext, sessionSummary, relevantADRs, availableToolsSummary, categoryDefinitions } = context;
+  const { availableWorkers, workerProfiles, projectContext, sessionSummary, relevantADRs, availableToolsSummary, categoryDefinitions, deepTask } = context;
 
   // Worker 能力描述表（从 ProfileLoader 动态获取）
   const workerTable = availableWorkers.map(w => {
@@ -107,7 +109,50 @@ ${categoryMappingTable}
     ? `\n${availableToolsSummary}`
     : '';
 
-  sections.push(`## 决策原则
+  if (deepTask) {
+    // ==================== 深度模式：编排者专职编排 ====================
+    sections.push(`## 决策原则（深度模式）
+
+**核心约束：你是纯编排者，绝对禁止自己执行任何代码修改、文件写入或进程操作。所有实现工作必须通过 dispatch_task 委派给 Worker。**
+
+你仅拥有以下工具：
+- **只读分析**：file_view、grep_search、codebase_retrieval、web_search、web_fetch、read-process、list-processes
+- **编排控制**：dispatch_task、send_worker_message、wait_for_workers
+- **任务管理**：get_todos、update_todo
+
+**你的工作流程**：
+1. 分析用户需求，使用只读工具理解项目现状
+2. 制定实现计划，拆解为可执行的子任务
+3. 通过 dispatch_task 将每个子任务委派给合适的 Worker
+4. 通过 wait_for_workers 等待结果
+5. 审查 Worker 产出（只读检查），判断是否达标
+6. 不达标则 dispatch_task 追加修复/补充任务，回到步骤 4
+7. 全部达标后输出最终汇总
+
+**绝对禁止的行为**：
+- 调用 file_edit、file_create、file_insert、file_remove 修改文件
+- 调用 launch-process 执行构建/测试/安装命令
+- 调用 write-process、kill-process 操作终端
+- 看到 Worker 的结果不满意后自己动手修改代码
+- 因为"只是小改动"就跳过 dispatch_task 自己修改
+
+**工具回合输出约束**：
+- 只要本轮要调用工具，直接发起工具调用，不要输出自然语言过渡句
+- 自然语言总结只在"无工具调用轮"输出，避免重复语义和刷屏
+
+**任务分级判定**：
+根据用户需求的**结构特征**判定任务级别：
+
+| 级别 | 特征 | 编排策略 |
+|------|------|----------|
+| L1 轻量 | 范围明确、改动局部、单关注点 | 简洁合同，单 Worker 直接执行 |
+| L2 标准 | 需方案选择、可能跨模块 | 完整合同（目标/验收/约束/上下文），Worker 自主决策 |
+| L3 复杂 | 多关注点、多领域、需多 Worker 协作 | 完整合同 + 协作契约，分阶段执行 |
+
+**分级原则**：不确定时向下兼容。宁可多给上下文和契约，不可给出模糊的半成品合同。`);
+  } else {
+    // ==================== 常规模式：三层执行模型 ====================
+    sections.push(`## 决策原则
 根据任务复杂度，选择最经济的执行方式：
 
 **层级 1 - 直接响应**：不调用任何工具
@@ -129,8 +174,8 @@ ${toolsListSection}
 **工具协作链**：
 
 **工具回合输出约束**：
-- 只要本轮要调用工具，就不要输出自然语言过渡句（例如“我将先…”、“现在开始…”），直接发起工具调用
-- 自然语言总结只在“无工具调用轮”输出，避免重复语义和刷屏
+- 只要本轮要调用工具，直接发起工具调用，不要输出自然语言过渡句
+- 自然语言总结只在"无工具调用轮"输出，避免重复语义和刷屏
 
 分析/理解项目时（禁止逐个读取所有文件）：
 1. codebase_retrieval — 语义搜索，快速找到相关代码区域
@@ -161,6 +206,7 @@ ${toolsListSection}
 | L3 复杂 | 多关注点、多领域、需多 Worker 协作 | 完整合同 + 协作契约（接口定义/冻结区域/时序关系），编排者主动协调 |
 
 **分级原则**：不确定时向下兼容——拿不准 L1/L2 时按 L2 处理，拿不准 L2/L3 时按 L3 处理。宁可多给上下文和契约，不可给出模糊的半成品合同。`);
+  }
 
   // 共享工作空间
   sections.push(`## 共享工作空间

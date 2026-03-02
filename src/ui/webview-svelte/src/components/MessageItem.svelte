@@ -46,7 +46,6 @@
   const isPlaceholder = $derived(Boolean(message.metadata?.isPlaceholder));
   const placeholderState = $derived((message.metadata?.placeholderState || 'pending') as PlaceholderState);
   const wasPlaceholder = $derived(Boolean(message.metadata?.wasPlaceholder));
-  const justCompleted = $derived(Boolean(message.metadata?.justCompleted));
   const sendingAnimation = $derived(Boolean(message.metadata?.sendingAnimation));
   const isSupplementary = $derived(Boolean(message.metadata?.isSupplementary));
 
@@ -99,6 +98,11 @@
   const isInstruction = $derived(message.type === 'instruction');
   const instructionTargetWorker = $derived(
     (message.metadata?.worker || message.metadata?.agent) as string | undefined
+  );
+  const instructionMetadata = $derived(
+    (message.metadata && typeof message.metadata === 'object')
+      ? (message.metadata as Record<string, unknown>)
+      : undefined
   );
 
   // 通知类型和对应的图标/颜色（使用 Message 类型中的 noticeType）
@@ -189,6 +193,7 @@
       content={message.content}
       targetWorker={instructionTargetWorker}
       isStreaming={isStreaming}
+      metadata={instructionMetadata}
     />
   </div>
 <!-- 助手消息：根据 displayContext 区分主角色（inline）和客角色（card） -->
@@ -252,7 +257,6 @@
     class:streaming={isStreaming}
     class:placeholder={isPlaceholder}
     class:was-placeholder={wasPlaceholder}
-    class:just-completed={justCompleted}
     class:no-visible-content={!hasVisibleContent}
     data-message-id={message.id}
     data-source={message.source}
@@ -493,7 +497,7 @@
     font-size: var(--text-sm);
     color: var(--foreground);
   }
-  .message-item.streaming { border-color: var(--info); }
+  /* 流式时不再变更边框颜色，避免 streaming 状态快速切换导致边框线闪烁 */
 
   .message-header {
     display: flex;
@@ -566,19 +570,7 @@
     }
   }
 
-  /* 完成动画：边框颜色过渡 */
-  .message-item.assistant.just-completed {
-    animation: completeBorderFade 0.3s ease-out;
-  }
 
-  @keyframes completeBorderFade {
-    from {
-      border-color: var(--info);
-    }
-    to {
-      border-color: var(--border);
-    }
-  }
 
   /* 流式消息底部加载指示器：统一的三个点动画 */
   .streaming-indicator-bottom {

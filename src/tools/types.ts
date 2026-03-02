@@ -14,6 +14,40 @@ import { ToolDefinition, ToolCall, ToolResult } from '../llm/types';
 export type ToolSource = 'mcp' | 'skill' | 'builtin';
 
 /**
+ * 系统内置工具名称（单一真相来源）
+ *
+ * 所有需要判断"工具是否为内置"的模块（ToolManager、Adapter 等）
+ * 必须引用此常量，禁止各自硬编码。
+ */
+export const BUILTIN_TOOL_NAMES = [
+  'launch-process',
+  'read-process',
+  'write-process',
+  'kill-process',
+  'list-processes',
+  'file_view',
+  'file_create',
+  'file_edit',
+  'file_insert',
+  'file_bulk_edit',
+  'file_remove',
+  'grep_search',
+  'web_search',
+  'web_fetch',
+  'mermaid_diagram',
+  'codebase_retrieval',
+  'dispatch_task',
+  'send_worker_message',
+  'wait_for_workers',
+  'split_todo',
+  'get_todos',
+  'update_todo',
+] as const;
+
+/** 内置工具名称的联合类型 */
+export type BuiltinToolName = typeof BUILTIN_TOOL_NAMES[number];
+
+/**
  * 工具元数据
  */
 export interface ToolMetadata {
@@ -145,7 +179,29 @@ export interface LaunchProcessOptions {
   maxWaitSeconds: number;
   name: string;
   showTerminal?: boolean;
+  runMode?: ProcessRunMode;
+  startupWaitSeconds?: number;
+  readyPatterns?: string[];
 }
+
+/**
+ * process 运行模式
+ * - task: 一次性命令，结束后可复用终端
+ * - service: 长驻服务，终端会被锁定直至显式 kill
+ */
+export type ProcessRunMode = 'task' | 'service';
+
+/**
+ * process 运行阶段
+ */
+export type ProcessPhase =
+  | 'starting'
+  | 'running'
+  | 'ready'
+  | 'completed'
+  | 'failed'
+  | 'killed'
+  | 'timeout';
 
 /**
  * launch-process 结果
@@ -155,6 +211,17 @@ export interface LaunchProcessResult {
   status: 'queued' | 'starting' | 'running' | 'completed' | 'failed' | 'killed' | 'timeout';
   output: string;
   return_code: number | null;
+  run_mode: ProcessRunMode;
+  phase: ProcessPhase;
+  locked: boolean;
+  terminal_name: string;
+  cwd?: string;
+  output_cursor: number;
+  output_start_cursor: number;
+  message?: string;
+  startup_status?: 'pending' | 'confirmed' | 'timeout' | 'failed' | 'skipped';
+  startup_confirmed?: boolean;
+  startup_message?: string;
 }
 
 /**
@@ -164,7 +231,17 @@ export interface ReadProcessResult {
   status: 'queued' | 'starting' | 'running' | 'completed' | 'failed' | 'killed' | 'timeout';
   output: string;
   return_code: number | null;
+  run_mode: ProcessRunMode;
+  phase: ProcessPhase;
+  locked: boolean;
+  terminal_name: string;
   cwd?: string;
+  from_cursor: number;
+  output_start_cursor: number;
+  next_cursor: number;
+  delta: boolean;
+  truncated: boolean;
+  output_cursor: number;
 }
 
 /**
@@ -173,6 +250,9 @@ export interface ReadProcessResult {
 export interface WriteProcessResult {
   accepted: boolean;
   status: 'queued' | 'starting' | 'running' | 'completed' | 'failed' | 'killed' | 'timeout';
+  run_mode: ProcessRunMode;
+  terminal_name: string;
+  message?: string;
 }
 
 /**
@@ -182,4 +262,7 @@ export interface KillProcessResult {
   killed: boolean;
   final_output: string;
   return_code: number | null;
+  run_mode?: ProcessRunMode;
+  terminal_name?: string;
+  released_lock?: boolean;
 }

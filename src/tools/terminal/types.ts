@@ -3,6 +3,7 @@
  */
 
 import * as vscode from 'vscode';
+import { ProcessRunMode } from '../types';
 
 // ============================================================================
 // 终端进程状态
@@ -59,6 +60,18 @@ export interface TerminalProcess {
   toolUseId?: string;
   /** 会话 ID */
   conversationId?: string;
+  /** 运行模式（task/service） */
+  runMode: ProcessRunMode;
+  /** 归属 agent 名称 */
+  agentName: string;
+  /** 终端显示名称 */
+  terminalName: string;
+  /** service 模式下是否持有终端锁 */
+  serviceLocked: boolean;
+  /** 当前累计输出字符游标 */
+  outputCursor: number;
+  /** 输出缓冲区起始游标（用于增量读取与截断） */
+  outputStartCursor: number;
 }
 
 // ============================================================================
