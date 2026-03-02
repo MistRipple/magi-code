@@ -166,18 +166,13 @@
 
   // 计时起点：
   // - thread: 从最后一条用户消息的时间戳开始
-  // - worker: 从当前面板的最后一条指令或用户消息开始，实现独立计时
+  // - worker: 从当前面板的最后一条任务指令开始，实现按轮次独立计时
+  //   只在新任务分配（新 instruction）时重置，不受工具调用轮次影响
   const timerStartTime = $derived.by(() => {
     if (displayContext === 'worker') {
-      if (panelHasPendingRequest && latestRoundAnchorMessage) {
+      // Worker 面板：始终以最后一条任务指令为计时起点
+      if (latestRoundAnchorMessage) {
         return latestRoundAnchorMessage.timestamp;
-      }
-
-      if (latestStreamingMessageId) {
-        const latestStreamingMessage = safeMessages.find((message) => message.id === latestStreamingMessageId);
-        if (latestStreamingMessage) {
-          return latestStreamingMessage.timestamp;
-        }
       }
       return 0;
     }
@@ -449,6 +444,8 @@
     align-items: center;
     gap: 4px;
     padding: var(--space-2) var(--space-4);
+    /* 防御性：确保在 flex 容器中始终排列在所有消息卡片之后 */
+    order: 9999;
   }
 
   .conversation-processing-indicator .streaming-dot {
