@@ -221,7 +221,7 @@ export class UniversalLLMClient extends BaseLLMClient {
       return ['ETIMEDOUT', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED'].includes(code);
     }
     const message = String(error?.message || '');
-    return /timeout|timed out|ECONNRESET|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|request ended without sending|stream ended|overloaded/i.test(message);
+    return /timeout|timed out|connection|network|fetch failed|socket hang up|ECONNRESET|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|request ended without sending|stream ended|overloaded/i.test(message);
   }
 
   private sleep(ms: number): Promise<void> {
