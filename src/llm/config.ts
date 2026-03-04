@@ -2,7 +2,7 @@
  * LLM 配置加载器
  *
  * 配置存储位置：~/.magi/
- * - llm.json              - 所有 LLM 配置（augment, orchestrator, workers, compressor）
+ * - llm.json              - 所有 LLM 配置（augment, orchestrator, workers, auxiliary）
  * - claude.json           - Claude Worker 画像
  * - codex.json            - Codex Worker 画像
  * - gemini.json           - Gemini Worker 画像
@@ -35,7 +35,7 @@ export class LLMConfigLoader {
     return {
       orchestrator: this.extractOrchestratorConfig(config),
       workers: this.extractWorkersConfig(config),
-      compressor: this.loadCompressorConfig(),
+      auxiliary: this.loadAuxiliaryConfig(),
       userRules: this.loadUserRules(),
     };
   }
@@ -125,7 +125,7 @@ export class LLMConfigLoader {
           enableThinking: false,
         },
       },
-      compressor: {
+      auxiliary: {
         enabled: false,
         baseUrl: 'https://api.anthropic.com',
         apiKey: process.env.ANTHROPIC_API_KEY || '',
@@ -347,12 +347,12 @@ export class LLMConfigLoader {
   }
 
   /**
-   * 更新压缩模型配置
+   * 更新辅助模型配置
    */
-  static updateCompressorConfig(config: any): void {
+  static updateAuxiliaryConfig(config: any): void {
     const fullConfig = this.loadLLMConfigFile();
 
-    fullConfig.compressor = {
+    fullConfig.auxiliary = {
       enabled: Boolean(config.apiKey) || config.enabled === true,
       baseUrl: config.baseUrl,
       apiKey: config.apiKey,
@@ -361,23 +361,24 @@ export class LLMConfigLoader {
     };
 
     this.saveFullConfig(fullConfig);
-    logger.info('Compressor config updated', undefined, LogCategory.LLM);
+    logger.info('Auxiliary config updated', undefined, LogCategory.LLM);
   }
 
   /**
-   * 加载压缩模型配置
+   * 加载辅助模型配置
    */
-  static loadCompressorConfig(): any {
+  static loadAuxiliaryConfig(): any {
     const config = this.loadLLMConfigFile();
-    const compressorConfig = config.compressor || {};
-    const defaults = this.getDefaultLLMConfig().compressor;
+    // 向后兼容：优先读取 auxiliary，回退到旧版 compressor 键
+    const auxiliaryConfig = config.auxiliary || config.compressor || {};
+    const defaults = this.getDefaultLLMConfig().auxiliary;
 
     return {
-      enabled: Boolean(compressorConfig.apiKey) || compressorConfig.enabled === true,
-      baseUrl: compressorConfig.baseUrl || defaults.baseUrl,
-      apiKey: compressorConfig.apiKey || defaults.apiKey,
-      model: compressorConfig.model || defaults.model,
-      provider: compressorConfig.provider || defaults.provider,
+      enabled: Boolean(auxiliaryConfig.apiKey) || auxiliaryConfig.enabled === true,
+      baseUrl: auxiliaryConfig.baseUrl || defaults.baseUrl,
+      apiKey: auxiliaryConfig.apiKey || defaults.apiKey,
+      model: auxiliaryConfig.model || defaults.model,
+      provider: auxiliaryConfig.provider || defaults.provider,
     };
   }
 

@@ -17,7 +17,7 @@ type Msg<T extends string> = Extract<WebviewToExtensionMessage, { type: T }>;
 const SUPPORTED = new Set([
   'getProjectKnowledge', 'clearProjectKnowledge',
   'getADRs', 'getFAQs', 'searchFAQs',
-  'deleteADR', 'deleteFAQ',
+  'deleteADR', 'deleteFAQ', 'deleteLearning',
   'addADR', 'updateADR', 'addFAQ', 'updateFAQ',
 ]);
 
@@ -47,6 +47,9 @@ export class KnowledgeCommandHandler implements CommandHandler {
       case 'deleteFAQ':
         await this.handleDeleteFAQ(message as Msg<'deleteFAQ'>, ctx);
         break;
+      case 'deleteLearning':
+        await this.handleDeleteLearning(message as Msg<'deleteLearning'>, ctx);
+        break;
       case 'addADR':
         await this.handleAddADR(message as Msg<'addADR'>, ctx);
         break;
@@ -73,12 +76,14 @@ export class KnowledgeCommandHandler implements CommandHandler {
       const codeIndex = kb.getCodeIndex();
       const adrs = kb.getADRs();
       const faqs = kb.getFAQs();
+      const learnings = kb.getLearnings();
 
-      ctx.sendData('projectKnowledgeLoaded', { codeIndex, adrs, faqs });
+      ctx.sendData('projectKnowledgeLoaded', { codeIndex, adrs, faqs, learnings });
       logger.info('项目知识.已加载', {
         files: codeIndex ? codeIndex.files.length : 0,
         adrs: adrs.length,
         faqs: faqs.length,
+        learnings: learnings.length,
       }, LogCategory.SESSION);
     } catch (error: any) {
       logger.error('项目知识.加载失败', { error: error.message }, LogCategory.SESSION);
@@ -176,6 +181,24 @@ export class KnowledgeCommandHandler implements CommandHandler {
       }
     } catch (error: any) {
       logger.error('FAQ.删除失败', { error: error.message }, LogCategory.SESSION);
+      ctx.sendToast(`删除失败: ${error.message}`, 'error');
+    }
+  }
+
+  private async handleDeleteLearning(message: Msg<'deleteLearning'>, ctx: CommandHandlerContext): Promise<void> {
+    try {
+      const kb = ctx.getProjectKnowledgeBase();
+      if (!kb) { ctx.sendToast('项目知识库未初始化', 'warning'); return; }
+      const success = kb.deleteLearning(message.id);
+      if (success) {
+        ctx.sendToast('经验记录已删除', 'success');
+        logger.info('Learning.删除成功', { id: message.id }, LogCategory.SESSION);
+        await this.handleGetProjectKnowledge(ctx);
+      } else {
+        ctx.sendToast('经验记录删除失败', 'error');
+      }
+    } catch (error: any) {
+      logger.error('Learning.删除失败', { error: error.message }, LogCategory.SESSION);
       ctx.sendToast(`删除失败: ${error.message}`, 'error');
     }
   }

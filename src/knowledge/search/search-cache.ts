@@ -24,6 +24,8 @@ interface CacheEntry<T> {
   timestamp: number;
   /** 原始查询（用于调试） */
   query: string;
+  /** 结果涉及的文件路径集合（用于精细化失效） */
+  filePaths: Set<string>;
 }
 
 /** 缓存配置 */
@@ -82,8 +84,9 @@ export class SearchCache<T = any> {
 
   /**
    * 写入缓存
+   * @param filePaths 结果涉及的文件路径集合（用于精细化失效）
    */
-  set(query: string, value: T): void {
+  set(query: string, value: T, filePaths: Set<string> = new Set()): void {
     const key = this.normalizeKey(query);
 
     // 如果已存在，先删除（刷新位置）
@@ -103,6 +106,7 @@ export class SearchCache<T = any> {
       value,
       timestamp: Date.now(),
       query,
+      filePaths,
     });
   }
 
@@ -111,6 +115,17 @@ export class SearchCache<T = any> {
    */
   invalidateAll(): void {
     this.cache.clear();
+  }
+
+  /**
+   * 精细化失效：仅清除结果涉及指定文件的缓存条目
+   */
+  invalidateByFile(filePath: string): void {
+    for (const [key, entry] of this.cache.entries()) {
+      if (entry.filePaths.has(filePath)) {
+        this.cache.delete(key);
+      }
+    }
   }
 
   /**

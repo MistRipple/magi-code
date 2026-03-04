@@ -179,11 +179,71 @@ function shouldProcessByEventSeq(message: WebviewMessage): boolean {
   return true;
 }
 
+const SESSION_LIFECYCLE_DATA_TYPES = new Set<string>([
+  'sessionCreated',
+  'sessionLoaded',
+  'sessionSwitched',
+  'sessionMessagesLoaded',
+  'sessionsUpdated',
+]);
+
+function shouldBypassCrossSessionFilter(message: WebviewMessage): boolean {
+  if (message.type !== 'unifiedMessage' && message.type !== 'unifiedComplete') {
+    return false;
+  }
+  const standard = message.message as StandardMessage | undefined;
+  if (standard?.category !== MessageCategory.DATA) {
+    return false;
+  }
+
+  const dataType = standard.data?.dataType;
+  if (typeof dataType === 'string' && SESSION_LIFECYCLE_DATA_TYPES.has(dataType)) {
+    return true;
+  }
+
+  return false;
+}
+
+function shouldIgnoreCrossSessionUnifiedMessage(message: WebviewMessage): boolean {
+  if (
+    message.type !== 'unifiedMessage'
+    && message.type !== 'unifiedUpdate'
+    && message.type !== 'unifiedComplete'
+  ) {
+    return false;
+  }
+
+  if (shouldBypassCrossSessionFilter(message)) {
+    return false;
+  }
+
+  const incomingSessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
+  if (!incomingSessionId) {
+    return false;
+  }
+
+  const currentSessionId = getState().currentSessionId;
+  if (!currentSessionId || incomingSessionId === currentSessionId) {
+    return false;
+  }
+
+  console.warn('[MessageHandler] 忽略跨会话消息', {
+    type: message.type,
+    incomingSessionId,
+    currentSessionId,
+  });
+  return true;
+}
+
 /**
  * 处理来自扩展的消息
  */
 function handleMessage(message: WebviewMessage) {
   const { type } = message;
+
+  if (shouldIgnoreCrossSessionUnifiedMessage(message)) {
+    return;
+  }
 
   if (!shouldProcessByEventSeq(message)) {
     return;

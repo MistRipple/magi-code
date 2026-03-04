@@ -16,7 +16,6 @@ import type { WorkerSlot } from '../../types';
 import type { TokenUsage } from '../../types/agent-types';
 import type { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import type { ProfileLoader } from '../profile/profile-loader';
-import { LLMConfigLoader } from '../../llm/config';
 import type { MessageHub } from './message-hub';
 import type { MissionOrchestrator } from './mission-orchestrator';
 import type { Assignment } from '../mission';
@@ -46,32 +45,8 @@ import { WorkerPipeline } from './worker-pipeline';
 import type { SnapshotManager } from '../../snapshot-manager';
 import type { SupplementaryInstructionQueue } from './supplementary-instruction-queue';
 import { DispatchCompletionQueue } from './dispatch-completion-queue';
-
-interface ResumeExecutionContext {
-  sessionId: string;
-  sourceMissionId: string;
-  resumePrompt?: string;
-  workerSessionBySlot: Map<WorkerSlot, string>;
-  createdAt: number;
-}
-
-interface DispatchRoutingDecision {
-  selectedWorker: WorkerSlot;
-  category: string;
-  categorySource: 'explicit_param';
-  degraded: boolean;
-  routingReason: string;
-}
-
-interface WorkerAvailabilitySnapshot {
-  availableWorkers: Set<WorkerSlot>;
-  unavailableReasons: Map<WorkerSlot, string>;
-}
-
-interface DispatchCategoryResolution {
-  category: string;
-  source: 'explicit_param';
-}
+import { DispatchRoutingService, type DispatchRoutingDecision } from './dispatch-routing-service';
+import { DispatchResumeContextStore } from './dispatch-resume-context-store';
 
 /**
  * DispatchManager 依赖接口
@@ -111,6 +86,7 @@ export class DispatchManager {
     gemini: ['claude', 'codex'],
   };
   private static readonly RUNTIME_UNAVAILABLE_COOLDOWN_MS = 60_000;
+  private static readonly MAX_MISSION_SESSION_RECORDS = 100;
 
   // Phase B+ 中间调用频率限制：同一 batch 内最小间隔 30 秒
   private lastPhaseBPlusTimestamp = 0;
@@ -128,23 +104,29 @@ export class DispatchManager {
   private reactiveMode = false;
   /** 反应式 Batch 是否仍等待主对话区最终汇总 */
   private reactiveBatchAwaitingSummary = new Set<string>();
-  /** 记录每个 Mission 的 Worker Session（用于后续断点续跑） */
-  private missionWorkerSessions = new Map<string, Map<WorkerSlot, string>>();
-  /** 当前会话的待恢复上下文（只在下一轮执行中生效） */
-  private activeResumeContexts = new Map<string, ResumeExecutionContext>();
+  /** Worker 路由与可用性判定服务 */
+  private readonly routingService: DispatchRoutingService;
+  /** Resume 上下文存储 */
+  private readonly resumeContextStore: DispatchResumeContextStore;
   /** 记录 dispatch task 的分类（用于可解释性与后续诊断） */
   private dispatchTaskCategories = new Map<string, string>();
-  /** Worker 运行时暂时不可用状态（短期冷却） */
-  private runtimeUnavailableWorkers = new Map<WorkerSlot, { until: number; reason: string }>();
   /** 活跃的 Assignment 映射（Worker 执行期间可查，供 split_todo handler 使用） */
   private activeAssignments = new Map<string, Assignment>();
   /** Worker Lane 运行态：同一 Worker 同一时刻仅允许一个执行链 */
   private activeWorkerLanes = new Set<WorkerSlot>();
   /** Batch 级调度合并定时器 */
   private dispatchScheduleTimers = new Map<string, NodeJS.Timeout>();
-  private static readonly MAX_MISSION_SESSION_RECORDS = 100;
 
   constructor(private deps: DispatchManagerDeps) {
+    this.routingService = new DispatchRoutingService(
+      this.deps.profileLoader,
+      DispatchManager.WORKER_SLOTS,
+      DispatchManager.WORKER_FALLBACK_PRIORITY,
+      DispatchManager.RUNTIME_UNAVAILABLE_COOLDOWN_MS,
+    );
+    this.resumeContextStore = new DispatchResumeContextStore(
+      DispatchManager.MAX_MISSION_SESSION_RECORDS,
+    );
     this.setupMissionEventListeners();
   }
 
@@ -218,11 +200,7 @@ export class DispatchManager {
    * 获取当前可路由 Worker 快照（供系统提示词和 UI 统一展示）
    */
   getWorkerAvailability(): { availableWorkers: WorkerSlot[]; unavailableReasons: Record<string, string> } {
-    const snapshot = this.getWorkerAvailabilitySnapshot();
-    return {
-      availableWorkers: Array.from(snapshot.availableWorkers),
-      unavailableReasons: Object.fromEntries(snapshot.unavailableReasons.entries()),
-    };
+    return this.routingService.getWorkerAvailability();
   }
 
   /**
@@ -249,244 +227,22 @@ export class DispatchManager {
     this.clearResumeContext();
   }
 
-  private normalizeCategoryName(raw: string): string {
-    return raw.trim().toLowerCase().replace(/[\s-]+/g, '_');
-  }
-
-  private getKnownCategoryNames(): string[] {
-    return Array.from(this.deps.profileLoader.getAllCategories().keys()).sort();
-  }
-
-  private assertCategoryExists(category: string): { ok: true } | { ok: false; error: string } {
-    if (this.deps.profileLoader.getCategory(category)) {
-      return { ok: true };
-    }
-    return {
-      ok: false,
-      error: `未知任务分类 "${category}"。可选分类: ${this.getKnownCategoryNames().join(', ')}`,
-    };
-  }
-
-  private resolveDispatchCategoryWithSource(
-    _goal: string,
-    explicitCategory?: string,
-  ): { ok: true; value: DispatchCategoryResolution } | { ok: false; error: string } {
-    const explicit = explicitCategory?.trim();
-    if (explicit) {
-      const normalized = this.normalizeCategoryName(explicit);
-      const check = this.assertCategoryExists(normalized);
-      if (!check.ok) {
-        return { ok: false, error: check.error };
-      }
-      return {
-        ok: true,
-        value: {
-          category: normalized,
-          source: 'explicit_param',
-        },
-      };
-    }
-    return {
-      ok: false,
-      error: `dispatch_task 缺少 category 参数。可选分类: ${this.getKnownCategoryNames().join(', ')}`,
-    };
-  }
-
-  private getRuntimeUnavailableReason(worker: WorkerSlot): string | null {
-    const status = this.runtimeUnavailableWorkers.get(worker);
-    if (!status) {
-      return null;
-    }
-    const now = Date.now();
-    if (now >= status.until) {
-      this.runtimeUnavailableWorkers.delete(worker);
-      return null;
-    }
-    const remainSeconds = Math.ceil((status.until - now) / 1000);
-    return `${status.reason}（冷却 ${remainSeconds}s）`;
-  }
-
-  private markWorkerRuntimeUnavailable(worker: WorkerSlot, reason: string): void {
-    this.runtimeUnavailableWorkers.set(worker, {
-      until: Date.now() + DispatchManager.RUNTIME_UNAVAILABLE_COOLDOWN_MS,
-      reason,
-    });
-  }
-
-  private clearWorkerRuntimeUnavailable(worker: WorkerSlot): void {
-    this.runtimeUnavailableWorkers.delete(worker);
-  }
-
-  /**
-   * 是否应将 Worker 标记为“运行时不可用”
-   *
-   * 只对“基础设施/连通性”错误做短期冷却：
-   * - 鉴权/配额/限流
-   * - 网络/连接/超时
-   * - 模型端服务不可用
-   *
-   * 业务任务失败（如代码错误、断言失败）不应触发 Worker 不可用。
-   */
-  private shouldMarkRuntimeUnavailable(errorMessage: string): boolean {
-    const normalized = (errorMessage || '').toLowerCase();
-    if (!normalized) {
-      return false;
-    }
-
-    const infraErrorPattern =
-      /unauthorized|forbidden|invalid api key|api key|auth|permission|quota|billing|payment|rate limit|limit|insufficient|suspended|disabled|timeout|timed out|network|connection|fetch failed|socket|econnreset|econnrefused|enotfound|eai_again|tls|certificate|overloaded|service unavailable|502|503|504/;
-
-    return infraErrorPattern.test(normalized);
-  }
-
-  private getWorkerAvailabilitySnapshot(): WorkerAvailabilitySnapshot {
-    const availableWorkers = new Set<WorkerSlot>();
-    const unavailableReasons = new Map<WorkerSlot, string>();
-    const enabledProfiles = this.deps.profileLoader.getEnabledProfiles();
-    const fullConfig = LLMConfigLoader.loadFullConfig();
-
-    for (const worker of DispatchManager.WORKER_SLOTS) {
-      const workerConfig = fullConfig.workers[worker];
-      if (!enabledProfiles.has(worker)) {
-        unavailableReasons.set(worker, '未启用');
-        continue;
-      }
-      if (!workerConfig) {
-        unavailableReasons.set(worker, '缺少模型配置');
-        continue;
-      }
-      if (!workerConfig.apiKey?.trim()) {
-        unavailableReasons.set(worker, 'API Key 未配置');
-        continue;
-      }
-      if (!workerConfig.baseUrl?.trim()) {
-        unavailableReasons.set(worker, 'Base URL 未配置');
-        continue;
-      }
-      if (!workerConfig.model?.trim()) {
-        unavailableReasons.set(worker, '模型未配置');
-        continue;
-      }
-      if (workerConfig.provider !== 'openai' && workerConfig.provider !== 'anthropic') {
-        unavailableReasons.set(worker, `Provider 无效: ${workerConfig.provider}`);
-        continue;
-      }
-      const runtimeReason = this.getRuntimeUnavailableReason(worker);
-      if (runtimeReason) {
-        unavailableReasons.set(worker, runtimeReason);
-        continue;
-      }
-      availableWorkers.add(worker);
-    }
-
-    return { availableWorkers, unavailableReasons };
-  }
-
-  private pickFallbackWorker(
-    preferredWorker: WorkerSlot,
-    availableWorkers: Set<WorkerSlot>,
-  ): WorkerSlot | undefined {
-    return DispatchManager.WORKER_FALLBACK_PRIORITY[preferredWorker]
-      .find(worker => availableWorkers.has(worker));
-  }
-
   private resolveDispatchRouting(
     goal: string,
     explicitCategory?: string,
   ): { ok: true; decision: DispatchRoutingDecision } | { ok: false; error: string } {
-    try {
-      // 每次 dispatch 前刷新分工配置，确保外部改动立即生效
-      this.deps.profileLoader.getAssignmentLoader().reload();
-    } catch (error: any) {
-      return {
-        ok: false,
-        error: `读取分工配置失败: ${error?.message || String(error)}`,
-      };
-    }
-    const categoryResolution = this.resolveDispatchCategoryWithSource(goal, explicitCategory);
-    if (!categoryResolution.ok) {
-      return {
-        ok: false,
-        error: categoryResolution.error,
-      };
-    }
-    const { category, source } = categoryResolution.value;
-    let ownerWorker: WorkerSlot;
-    try {
-      ownerWorker = this.deps.profileLoader.getWorkerForCategory(category);
-    } catch (error: any) {
-      return {
-        ok: false,
-        error: `任务分类 ${category} 未找到有效归属 Worker: ${error?.message || String(error)}`,
-      };
-    }
-    const availability = this.getWorkerAvailabilitySnapshot();
-
-    if (availability.availableWorkers.has(ownerWorker)) {
-      return {
-        ok: true,
-        decision: {
-          selectedWorker: ownerWorker,
-          category,
-          categorySource: source,
-          degraded: false,
-          routingReason: `自动路由命中分类 ${category}，归属 Worker ${ownerWorker}`,
-        },
-      };
-    }
-
-    const ownerUnavailableReason = availability.unavailableReasons.get(ownerWorker) || '当前不可用';
-    const fallbackWorker = this.pickFallbackWorker(ownerWorker, availability.availableWorkers);
-    if (!fallbackWorker) {
-      const reasonText = DispatchManager.WORKER_SLOTS
-        .map(worker => `${worker}:${availability.unavailableReasons.get(worker) || '不可用'}`)
-        .join('；');
-      return {
-        ok: false,
-        error: `分类 ${category} 的归属 Worker ${ownerWorker} 不可用（${ownerUnavailableReason}），且无可用降级 Worker。当前状态：${reasonText}`,
-      };
-    }
-
-    return {
-      ok: true,
-      decision: {
-        selectedWorker: fallbackWorker,
-        category,
-        categorySource: source,
-        degraded: true,
-        routingReason: `分类 ${category} 归属 ${ownerWorker}，但其不可用（${ownerUnavailableReason}），已降级到 ${fallbackWorker}`,
-      },
-    };
+    return this.routingService.resolveDispatchRouting(goal, explicitCategory);
   }
 
   private resolveExecutionWorker(
     preferredWorker: WorkerSlot,
+    options?: {
+      busyWorkers?: Set<WorkerSlot>;
+      excludedWorkers?: Set<WorkerSlot>;
+      allowBusyFallback?: boolean;
+    },
   ): { ok: true; selectedWorker: WorkerSlot; degraded: boolean; routingReason: string } | { ok: false; error: string } {
-    const availability = this.getWorkerAvailabilitySnapshot();
-    if (availability.availableWorkers.has(preferredWorker)) {
-      return {
-        ok: true,
-        selectedWorker: preferredWorker,
-        degraded: false,
-        routingReason: `执行前校验通过，继续由 ${preferredWorker} 执行`,
-      };
-    }
-
-    const preferredUnavailableReason = availability.unavailableReasons.get(preferredWorker) || '当前不可用';
-    const fallbackWorker = this.pickFallbackWorker(preferredWorker, availability.availableWorkers);
-    if (!fallbackWorker) {
-      return {
-        ok: false,
-        error: `任务目标 Worker ${preferredWorker} 不可用（${preferredUnavailableReason}），且无可用降级 Worker`,
-      };
-    }
-
-    return {
-      ok: true,
-      selectedWorker: fallbackWorker,
-      degraded: true,
-      routingReason: `目标 Worker ${preferredWorker} 不可用（${preferredUnavailableReason}），执行时降级到 ${fallbackWorker}`,
-    };
+    return this.routingService.resolveExecutionWorker(preferredWorker, options);
   }
 
   activateResumeContext(sourceMissionId: string, resumePrompt?: string): boolean {
@@ -494,34 +250,22 @@ export class DispatchManager {
     if (!currentSessionId) {
       return false;
     }
-    const workerSessions = this.missionWorkerSessions.get(sourceMissionId);
-    if (!workerSessions || workerSessions.size === 0) {
+    const result = this.resumeContextStore.activate(currentSessionId, sourceMissionId, resumePrompt);
+    if (!result.ok) {
       return false;
     }
-
-    this.activeResumeContexts.set(currentSessionId, {
-      sessionId: currentSessionId,
-      sourceMissionId,
-      resumePrompt,
-      workerSessionBySlot: new Map(workerSessions),
-      createdAt: Date.now(),
-    });
 
     logger.info('Dispatch.ResumeContext.已激活', {
       sessionId: currentSessionId,
       sourceMissionId,
-      workers: Array.from(workerSessions.keys()),
+      workerCount: result.workerCount,
     }, LogCategory.ORCHESTRATOR);
 
     return true;
   }
 
   clearResumeContext(): void {
-    const currentSessionId = this.deps.getCurrentSessionId();
-    if (!currentSessionId) {
-      return;
-    }
-    this.activeResumeContexts.delete(currentSessionId);
+    this.resumeContextStore.clear(this.deps.getCurrentSessionId());
   }
 
   private getResumeContextForWorker(worker: WorkerSlot): { resumeSessionId?: string; resumePrompt?: string } {
@@ -529,18 +273,7 @@ export class DispatchManager {
     if (!currentSessionId) {
       return {};
     }
-    const context = this.activeResumeContexts.get(currentSessionId);
-    if (!context) {
-      return {};
-    }
-    const resumeSessionId = context.workerSessionBySlot.get(worker);
-    if (!resumeSessionId) {
-      return {};
-    }
-    return {
-      resumeSessionId,
-      resumePrompt: context.resumePrompt,
-    };
+    return this.resumeContextStore.getForWorker(currentSessionId, worker);
   }
 
   private recordMissionWorkerSession(
@@ -548,19 +281,7 @@ export class DispatchManager {
     worker: WorkerSlot,
     workerSessionId: string,
   ): void {
-    if (!missionId || !workerSessionId) {
-      return;
-    }
-    const existing = this.missionWorkerSessions.get(missionId) || new Map<WorkerSlot, string>();
-    existing.set(worker, workerSessionId);
-    this.missionWorkerSessions.set(missionId, existing);
-
-    if (this.missionWorkerSessions.size > DispatchManager.MAX_MISSION_SESSION_RECORDS) {
-      const oldestMissionId = this.missionWorkerSessions.keys().next().value as string | undefined;
-      if (oldestMissionId) {
-        this.missionWorkerSessions.delete(oldestMissionId);
-      }
-    }
+    this.resumeContextStore.recordWorkerSession(missionId, worker, workerSessionId);
   }
 
   /**
@@ -1191,14 +912,24 @@ export class DispatchManager {
       if (result.sessionId) {
         this.recordMissionWorkerSession(missionId, effectiveWorker, result.sessionId);
       }
-      this.clearWorkerRuntimeUnavailable(effectiveWorker);
+      this.routingService.clearWorkerRuntimeUnavailable(effectiveWorker);
 
       // 直接使用 Worker 生成的结构化总结（唯一生产者：AutonomousWorker.buildStructuredSummary）
+      const verificationWarnings = result.verification.degraded
+        ? (result.verification.warnings.length > 0 ? result.verification.warnings : ['验收检查执行异常'])
+        : [];
       const summary = result.summary;
       const modifiedFiles = [...new Set([
         ...result.completedTodos.flatMap(t => t.output?.modifiedFiles || []),
         ...result.failedTodos.flatMap(t => t.output?.modifiedFiles || []),
       ])];
+
+      if (verificationWarnings.length > 0) {
+        this.deps.messageHub.notify(
+          `任务 ${taskId} 验收检查降级：${verificationWarnings[0]}`,
+          'warning',
+        );
+      }
 
       // 更新 subTaskCard 最终状态
       this.deps.messageHub.subTaskCard({
@@ -1214,6 +945,10 @@ export class DispatchManager {
       // 更新 DispatchBatch 状态（含 tokenUsage 传递，供 archive 日志统计）
       const dispatchResult: DispatchResult = {
         success: result.success, summary, modifiedFiles,
+        quality: {
+          verificationDegraded: result.verification.degraded,
+          warnings: verificationWarnings,
+        },
         tokenUsage: result.tokenUsage ? {
           inputTokens: result.tokenUsage.inputTokens || 0,
           outputTokens: result.tokenUsage.outputTokens || 0,
@@ -1250,8 +985,8 @@ export class DispatchManager {
       }
 
       const errorMsg = error?.message || String(error);
-      if (this.shouldMarkRuntimeUnavailable(errorMsg)) {
-        this.markWorkerRuntimeUnavailable(effectiveWorker, errorMsg);
+      if (this.routingService.shouldMarkRuntimeUnavailable(errorMsg)) {
+        this.routingService.markWorkerRuntimeUnavailable(effectiveWorker, errorMsg);
         logger.warn('Dispatch.Worker.运行时不可用.已标记冷却', {
           worker: effectiveWorker,
           taskId,
@@ -1566,18 +1301,60 @@ export class DispatchManager {
    * 通过 Worker 隔离策略调度就绪任务
    */
   private dispatchReadyTasksWithIsolation(batch: DispatchBatch): void {
-    if (batch.status !== 'active') return;
-
-    const readyTasks = batch.getReadyTasksIsolated();
-    const candidateWorkers = new Set<WorkerSlot>();
-    for (const entry of readyTasks) {
-      if (this.activeWorkerLanes.has(entry.worker)) {
-        continue;
-      }
-      candidateWorkers.add(entry.worker);
+    if (batch.status !== 'active') {
+      return;
     }
 
-    for (const worker of candidateWorkers) {
+    const readyTasks = batch.getReadyTasks();
+    if (readyTasks.length === 0) {
+      return;
+    }
+
+    const busyWorkers = new Set<WorkerSlot>(this.activeWorkerLanes);
+    const selectedWorkers = new Set<WorkerSlot>();
+
+    for (const entry of readyTasks) {
+      const routing = this.resolveExecutionWorker(entry.worker, {
+        busyWorkers,
+        excludedWorkers: selectedWorkers,
+        allowBusyFallback: true,
+      });
+      if (!routing.ok) {
+        logger.debug('Dispatch.WorkerLane.就绪任务暂不可执行', {
+          batchId: batch.id,
+          taskId: entry.taskId,
+          worker: entry.worker,
+          reason: routing.error,
+        }, LogCategory.ORCHESTRATOR);
+        continue;
+      }
+
+      const selectedWorker = routing.selectedWorker;
+      if (busyWorkers.has(selectedWorker) || selectedWorkers.has(selectedWorker)) {
+        continue;
+      }
+
+      if (selectedWorker !== entry.worker) {
+        const previousWorker = entry.worker;
+        entry.worker = selectedWorker;
+        this.deps.messageHub.notify(
+          `任务 ${entry.taskId} 调度改派：${previousWorker} -> ${selectedWorker}（${routing.routingReason}）`,
+          'warning',
+        );
+        logger.warn('Dispatch.WorkerLane.忙碌改派', {
+          batchId: batch.id,
+          taskId: entry.taskId,
+          from: previousWorker,
+          to: selectedWorker,
+          reason: routing.routingReason,
+        }, LogCategory.ORCHESTRATOR);
+      }
+
+      selectedWorkers.add(selectedWorker);
+      busyWorkers.add(selectedWorker);
+    }
+
+    for (const worker of selectedWorkers) {
       this.launchWorkerLane(batch, worker);
     }
   }
@@ -2017,6 +1794,16 @@ ${this.deps.getActiveUserPrompt()}
     };
 
     for (const entry of entries) {
+      if (entry.result?.quality?.verificationDegraded) {
+        const warning = entry.result.quality.warnings?.[0] || '验收检查执行异常';
+        escalate(
+          entry.taskId,
+          'watch',
+          'verification',
+          `验收检查降级：${warning}`,
+        );
+      }
+
       const modifiedFiles = [...new Set((entry.result?.modifiedFiles || []).map(file => this.normalizePath(file)).filter(Boolean))];
       if (modifiedFiles.length === 0) {
         continue;
@@ -2202,10 +1989,9 @@ ${this.deps.getActiveUserPrompt()}
     this.completionQueue.reset();
     this.reactiveMode = false;
     this.reactiveBatchAwaitingSummary.clear();
-    this.missionWorkerSessions.clear();
-    this.activeResumeContexts.clear();
+    this.resumeContextStore.dispose();
     this.dispatchTaskCategories.clear();
-    this.runtimeUnavailableWorkers.clear();
+    this.routingService.clearAllRuntimeUnavailable();
     this.activeWorkerLanes.clear();
     this.clearDispatchScheduleTimers();
   }

@@ -95,7 +95,7 @@ export interface IAdapterFactory extends EventEmitter {
    * 静默发送消息（不推送到 UI），用于内部自检等场景。
    * 直接用底层 client 非流式调用，对话历史正常更新。
    */
-  sendSilentMessage?(
+  sendSilentMessage(
     agent: AgentType,
     message: string,
   ): Promise<AdapterResponse>;

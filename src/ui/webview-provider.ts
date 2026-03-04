@@ -53,7 +53,6 @@ import { isAbortError } from '../errors';
 import { EventBindingService } from './event-binding-service';
 import { WorkerStatusService } from './worker-status-service';
 import { PromptEnhancerService } from '../services/prompt-enhancer-service';
-import { DirectExecutionService } from '../services/direct-execution-service';
 import {
   MissionOrchestrator,
 } from '../orchestrator/core';
@@ -65,6 +64,7 @@ type OrchestratorExecutionResult = { success: boolean; error?: string };
 type OrchestratorQueueItem = {
   prompt: string;
   imagePaths: string[];
+  sessionId: string;
   resolve: (result: OrchestratorExecutionResult) => void;
 };
 
@@ -188,13 +188,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   // 提示词增强服务
   private promptEnhancer: PromptEnhancerService;
-  private directExecutor: DirectExecutionService;
 
   // 事件绑定服务（从 WVP 提取）
   private eventBindingService: EventBindingService;
 
-  // 当前选择的 Worker（null 表示自动选择/智能编排）
-  private selectedWorker: WorkerSlot | null = null;
   private recentRequestIds: Map<string, number> = new Map();
 
   // Worker 状态检查服务
@@ -278,6 +275,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // MessageHub 从 orchestratorEngine 获取后，立即注入给 AdapterFactory
     // 这样 Adapter 可以直接通过 MessageHub 发送消息
     (this.adapterFactory as LLMAdapterFactory).setMessageHub(this.messageHub);
+    this.syncMessageHubTrace(this.activeSessionId);
 
     // 注入 SnapshotManager 到 ToolManager（确保工具级文件写入自动创建快照）
     (this.adapterFactory as LLMAdapterFactory).getToolManager().setSnapshotManager(this.snapshotManager);
@@ -311,25 +309,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       workspaceRoot: this.workspaceRoot,
       getToolManager: () => this.adapterFactory.getToolManager?.(),
       getConversationHistory: (maxRounds) => this.sessionManager.formatConversationHistory(maxRounds),
-    });
-
-    // 初始化直接执行服务
-    this.directExecutor = new DirectExecutionService({
-      getSessionId: () => this.activeSessionId || this.sessionManager.getCurrentSession()?.id || 'default',
-      getToolManager: () => (this.adapterFactory as LLMAdapterFactory).getToolManager(),
-      sendMessage: (worker, prompt, images) => this.adapterFactory.sendMessage(worker, prompt, images),
-      createTaskFromPrompt: (sid, p) => this.orchestratorEngine.createTaskFromPrompt(sid, p),
-      markTaskExecuting: (id) => this.orchestratorEngine.markTaskExecuting(id),
-      completeTaskById: (id) => this.orchestratorEngine.completeTaskById(id),
-      failTaskById: (id, err) => this.orchestratorEngine.failTaskById(id, err),
-      cancelTaskById: (id) => this.orchestratorEngine.cancelTaskById(id),
-      getExecutionStats: () => this.orchestratorEngine.getExecutionStats(),
-      sendStateUpdate: () => this.sendStateUpdate(),
-      sendResultMessage: (content, worker) => {
-        const requestId = this.messageHub.getRequestContext();
-        this.messageHub.result(content, { metadata: { requestId, worker } });
-      },
-      saveMessageToSession: (prompt, content, worker) => this.saveMessageToSession(prompt, content, worker, 'worker'),
     });
 
     // 初始化 CommandHandler 委派
@@ -450,7 +429,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       });
       await this.projectKnowledgeBase.initialize();
 
-      // 设置压缩模型客户端（用于知识提取 + ACE 降级时的 LLM 辅助搜索扩展）
+      // 设置辅助模型客户端（用于知识提取 + 查询扩展）
       await this.setupKnowledgeExtractionClient();
 
       // 注入知识库到编排器
@@ -462,8 +441,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 设置文件监听器，支持搜索引擎增量更新
       this.setupFileSystemWatcher();
 
-      // 注入本地搜索服务到 AceExecutor（ACE 不可用时自动降级）
-      this.injectLocalSearchService();
+      // 注入代码库检索基础设施（codebase_retrieval 的唯一实现）
+      this.injectCodebaseRetrievalService();
 
       const codeIndex = this.projectKnowledgeBase.getCodeIndex();
       logger.info('项目知识库.已初始化', {
@@ -480,11 +459,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const codeIndex = this.projectKnowledgeBase.getCodeIndex();
     const adrs = this.projectKnowledgeBase.getADRs();
     const faqs = this.projectKnowledgeBase.getFAQs();
-    this.sendData('projectKnowledgeLoaded', { codeIndex, adrs, faqs });
+    const learnings = this.projectKnowledgeBase.getLearnings();
+    this.sendData('projectKnowledgeLoaded', { codeIndex, adrs, faqs, learnings });
   }
 
   /**
-   * 设置知识提取客户端（使用压缩模型，同时为 ACE 降级搜索提供 LLM 查询扩展）
+   * 设置知识提取客户端（使用辅助模型，同时为本地检索提供查询扩展）
    */
   private async setupKnowledgeExtractionClient(): Promise<void> {
     try {
@@ -494,13 +474,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       const knowledgeBase = this.projectKnowledgeBase;
       if (!knowledgeBase) {
-        logger.warn('项目知识库.压缩模型客户端.未设置_知识库未初始化', undefined, LogCategory.SESSION);
+        logger.warn('项目知识库.辅助模型客户端.未设置_知识库未初始化', undefined, LogCategory.SESSION);
         return;
       }
 
       knowledgeBase.setLLMClient(client);
     } catch (error: any) {
-      logger.error('项目知识库.压缩模型客户端.设置失败', { error: error.message }, LogCategory.SESSION);
+      logger.error('项目知识库.辅助模型客户端.设置失败', { error: error.message }, LogCategory.SESSION);
     }
   }
 
@@ -513,6 +493,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     let completedTaskCount = 0;
     const EXTRACTION_THRESHOLD = 3; // 每完成 3 个任务提取一次
 
+    // 已提取过的会话 ID，防止 task:completed 和 session:ended 对同一会话重复提取
+    const extractedSessionIds = new Set<string>();
+
     // 监听任务完成事件
     globalEventBus.on('task:completed', async (event: any) => {
       completedTaskCount++;
@@ -523,14 +506,19 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 达到阈值时提取知识
       if (completedTaskCount >= EXTRACTION_THRESHOLD) {
         completedTaskCount = 0; // 重置计数器
-        await this.extractKnowledgeFromCurrentSession();
+        const session = this.sessionManager.getCurrentSession();
+        if (session && !extractedSessionIds.has(session.id)) {
+          extractedSessionIds.add(session.id);
+          await this.extractKnowledgeFromSession(session.id);
+        }
       }
     });
 
     // 监听会话结束事件
     globalEventBus.on('session:ended', async (event: any) => {
       const sessionId = event.sessionId;
-      if (sessionId) {
+      if (sessionId && !extractedSessionIds.has(sessionId)) {
+        extractedSessionIds.add(sessionId);
         await this.extractKnowledgeFromSession(sessionId);
       }
     });
@@ -548,19 +536,22 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     if (!this.projectKnowledgeBase) return;
 
     const pkb = this.projectKnowledgeBase;
+    const watchedExtensions = pkb.getIndexedExtensions();
+
     for (const folder of this.workspaceFolders) {
+      if (watchedExtensions.length === 0) continue;
+
+      const extensionPattern = `**/*.{${watchedExtensions.join(',')}}`;
       const watcher = vscode.workspace.createFileSystemWatcher(
-        new vscode.RelativePattern(folder.path, '**/*.{ts,js,tsx,jsx,json,md,yml,yaml}')
+        new vscode.RelativePattern(folder.path, extensionPattern)
       );
 
       watcher.onDidChange((uri) => {
         pkb.onFileEvent(uri.fsPath, 'changed');
       });
-
       watcher.onDidCreate((uri) => {
         pkb.onFileEvent(uri.fsPath, 'created');
       });
-
       watcher.onDidDelete((uri) => {
         pkb.onFileEvent(uri.fsPath, 'deleted');
       });
@@ -569,40 +560,36 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.context.subscriptions.push(watcher);
     }
 
-    logger.info('项目知识库.文件监听器.已启用', undefined, LogCategory.SESSION);
+    logger.info('项目知识库.文件监听器.已启用', {
+      watchedExtensionCount: watchedExtensions.length,
+      watchedExtensions: watchedExtensions.slice(0, 30),
+    }, LogCategory.SESSION);
   }
 
   /**
-   * 注入 LocalCodeSearchService 到 AceExecutor
+   * 注入 CodebaseRetrievalService 到 codebase_retrieval 执行器
    * 使用惰性引用，解决 PKB 初始化时序问题
    */
-  private injectLocalSearchService(): void {
+  private injectCodebaseRetrievalService(): void {
     const toolManager = this.adapterFactory.getToolManager?.();
     if (!toolManager) return;
 
-    const { LocalCodeSearchService } = require('../services/local-code-search-service');
-    const localSearch = new LocalCodeSearchService({
+    const { CodebaseRetrievalService } = require('../services/codebase-retrieval-service');
+    const retrievalService = new CodebaseRetrievalService({
       getKnowledgeBase: () => this.projectKnowledgeBase,
-      executeTool: (toolCall: { id: string; name: string; arguments: Record<string, any> }) =>
-        toolManager.execute(toolCall),
+      executeTool: async (toolCall: { id: string; name: string; arguments: Record<string, any> }) => {
+        if (toolCall.name === 'lsp_query') {
+          return toolManager.getLspExecutor().execute(toolCall);
+        }
+        return toolManager.execute(toolCall);
+      },
       extractKeywords: (query: string) => this.promptEnhancer.extractKeywords(query),
       workspaceFolders: this.workspaceFolders,
     });
 
-    toolManager.getAceExecutor().setLocalSearchService(localSearch);
-    logger.info('AceExecutor.本地搜索服务.已注入', undefined, LogCategory.SESSION);
-  }
+    toolManager.getCodebaseRetrievalExecutor().setCodebaseRetrievalService(retrievalService);
 
-  /**
-   * 从当前会话提取知识
-   */
-  private async extractKnowledgeFromCurrentSession(): Promise<void> {
-    const session = this.sessionManager.getCurrentSession();
-    if (!session) {
-      return;
-    }
-
-    await this.extractKnowledgeFromSession(session.id);
+    logger.info('CodebaseRetrieval.服务已注入', undefined, LogCategory.SESSION);
   }
 
   /**
@@ -1128,9 +1115,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
 
       case 'executeTask':
-        logger.info('界面.任务.执行.请求', { promptLength: String(message.prompt || '').length, imageCount: message.images?.length || 0, agent: message.agent || 'orchestrator' }, LogCategory.UI);
+        logger.info('界面.任务.执行.请求', { promptLength: String(message.prompt || '').length, imageCount: message.images?.length || 0 }, LogCategory.UI);
         const execImages = message.images || [];
-        const execAgent = message.agent as WorkerSlot | undefined;
         const execRequestId = message.requestId;
         const requestedModeRaw = message.mode;
         const requestedMode = requestedModeRaw === 'ask' || requestedModeRaw === 'auto' ? requestedModeRaw : undefined;
@@ -1157,7 +1143,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           if (requestedMode) {
             this.handleSetInteractionMode(requestedMode);
           }
-          await this.executeTask(message.prompt, execAgent || undefined, execImages, execRequestId);
+          await this.executeTask(message.prompt, undefined, execImages, execRequestId);
         } catch (error: any) {
           const errorMsg = error instanceof Error ? error.message : String(error);
           if (execRequestId) {
@@ -1283,14 +1269,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         }
         // 切换会话
         await this.switchToSession(message.sessionId);
-        const switchedSession = this.sessionManager.getCurrentSession();
-        if (switchedSession) {
-          // 恢复 Worker sessionIds
-          this.sendData('sessionSwitched', {
-            sessionId: message.sessionId,
-            session: switchedSession,
-          });
-        }
         this.sendStateUpdate();
         break;
 
@@ -1327,12 +1305,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         }
         break;
       }
-
-      case 'selectWorker':
-        // 用户手动选择 Worker（null 表示自动选择）
-        this.selectedWorker = message.worker || null;
-        logger.info('界面.Worker.选择.变更', { worker: this.selectedWorker || 'auto' }, LogCategory.UI);
-        break;
 
       case 'toolAuthorizationResponse':
         // 用户响应工具授权请求
@@ -1575,14 +1547,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.sendData('executionStatsUpdate', { stats, orchestratorStats, modelCatalog });
   }
 
-  private buildModelCatalog(): { id: string; label: string; model?: string; provider?: string; enabled?: boolean; role?: 'worker' | 'orchestrator' | 'compressor' | 'unknown' }[] {
+  private buildModelCatalog(): { id: string; label: string; model?: string; provider?: string; enabled?: boolean; role?: 'worker' | 'orchestrator' | 'auxiliary' | 'unknown' }[] {
     try {
       const { LLMConfigLoader } = require('../llm/config');
       const fullConfig = LLMConfigLoader.loadFullConfig();
-      const entries: { id: string; label: string; model?: string; provider?: string; enabled?: boolean; role?: 'worker' | 'orchestrator' | 'compressor' | 'unknown' }[] = [];
+      const entries: { id: string; label: string; model?: string; provider?: string; enabled?: boolean; role?: 'worker' | 'orchestrator' | 'auxiliary' | 'unknown' }[] = [];
 
       const toLabel = (id: string) => id.charAt(0).toUpperCase() + id.slice(1);
-      const addEntry = (id: string, label: string, config: any, role: 'worker' | 'orchestrator' | 'compressor') => {
+      const addEntry = (id: string, label: string, config: any, role: 'worker' | 'orchestrator' | 'auxiliary') => {
         entries.push({
           id,
           label,
@@ -1603,8 +1575,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         addEntry('orchestrator', 'Orchestrator', fullConfig.orchestrator, 'orchestrator');
       }
 
-      if (fullConfig?.compressor) {
-        addEntry('compressor', 'Compressor', fullConfig.compressor, 'compressor');
+      if (fullConfig?.auxiliary) {
+        addEntry('auxiliary', 'Auxiliary', fullConfig.auxiliary, 'auxiliary');
       }
 
       return entries;
@@ -1717,9 +1689,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     await this.resumeInterruptedTask(prompt);
   }
 
-  private enqueueOrchestratorExecution(prompt: string, imagePaths: string[]): Promise<OrchestratorExecutionResult> {
+  private enqueueOrchestratorExecution(prompt: string, imagePaths: string[], sessionId: string): Promise<OrchestratorExecutionResult> {
     return new Promise((resolve) => {
-      this.pendingExecutionQueue.push({ prompt, imagePaths, resolve });
+      this.pendingExecutionQueue.push({ prompt, imagePaths, sessionId, resolve });
       if (this.orchestratorQueueRunning) {
         return;
       }
@@ -1740,7 +1712,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         }
         logger.info('界面.编排器.排队执行_触发', { queueRemaining: this.pendingExecutionQueue.length }, LogCategory.UI);
         try {
-          const result = await this.executeWithOrchestrator(next.prompt, next.imagePaths);
+          const result = await this.executeWithOrchestrator(next.prompt, next.imagePaths, next.sessionId);
           next.resolve(result);
         } catch (error) {
           const errorMsg = error instanceof Error ? error.message : String(error);
@@ -1750,6 +1722,21 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     } finally {
       this.orchestratorQueueRunning = false;
     }
+  }
+
+  private cancelPendingOrchestratorQueue(reason: string): void {
+    if (this.pendingExecutionQueue.length === 0) {
+      return;
+    }
+    const pending = [...this.pendingExecutionQueue];
+    this.pendingExecutionQueue = [];
+    for (const item of pending) {
+      item.resolve({ success: false, error: reason });
+    }
+    logger.warn('界面.编排器.排队任务.已清理', {
+      reason,
+      count: pending.length,
+    }, LogCategory.UI);
   }
 
   /** 在 VS Code 原生 diff 视图中打开文件变更（类似 Augment） */
@@ -2085,10 +2072,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.sendToast('设置已保存', 'success');
   }
 
-  /** 执行任务 */
+  /** 执行任务（统一走智能编排） */
   private async executeTask(
     prompt: string,
-    forceWorker?: WorkerSlot,
+    _reserved?: unknown,
     images?: Array<{ dataUrl: string }>,
     requestId?: string,
     displayPrompt?: string,
@@ -2097,7 +2084,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       resumeInstruction?: string;
     }
   ): Promise<void> {
-    logger.info('界面.任务.执行.开始', { promptLength: prompt.length, imageCount: images?.length || 0, forceWorker: forceWorker || undefined }, LogCategory.UI);
+    logger.info('界面.任务.执行.开始', { promptLength: prompt.length, imageCount: images?.length || 0 }, LogCategory.UI);
     const maxPromptLength = 10000;
     const requestKey = requestId || `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     let started = false;
@@ -2157,11 +2144,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         this.activeSessionId = currentSession?.id || null;
         logger.info('界面.会话.当前.设置', { sessionId: this.activeSessionId }, LogCategory.UI);
       }
+      const executionSessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id || '';
+      if (!executionSessionId) {
+        rejectRequest('未找到有效会话，请重试');
+        return;
+      }
+      this.activeSessionId = executionSessionId;
+      this.syncMessageHubTrace(executionSessionId);
 
       // 统一消息通道：由后端发送用户消息与占位消息
       const promptForDisplay = displayPrompt?.trim() || prompt;
-      const resolvedTargetWorker = forceWorker || this.selectedWorker || undefined;
-      this.emitUserAndPlaceholder(requestKey, promptForDisplay, images?.length || 0, images, resolvedTargetWorker);
+      this.emitUserAndPlaceholder(requestKey, promptForDisplay, images?.length || 0, images);
       this.scheduleRequestTimeout(requestKey);
 
       // 🔧 性能优化：强制让出事件循环 (Yield Event Loop)
@@ -2201,27 +2194,22 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         timestamp: Date.now(),
       });
 
-      // 判断执行模式：智能编排 vs 直接执行
-      const useIntelligentMode = !forceWorker && !this.selectedWorker;
-
       const resolvedSkill = this.resolveInstructionSkillPrompt(prompt);
       const effectivePrompt = resolvedSkill.prompt;
 
-      this.sessionManager.addMessage('user', prompt, undefined, undefined, images);
-      void this.orchestratorEngine.recordContextMessage('user', prompt, this.activeSessionId || undefined);
+      try {
+        this.sessionManager.addMessageToSession(executionSessionId, 'user', prompt, undefined, undefined, images);
+      } catch (error: any) {
+        rejectRequest(`会话写入失败: ${error?.message || String(error)}`);
+        return;
+      }
+      void this.orchestratorEngine.recordContextMessage('user', prompt, executionSessionId);
       this.sendStateUpdate();
 
-      if (useIntelligentMode) {
-        // 智能编排模式：统一串行化，避免引擎并发
-        const result = await this.enqueueOrchestratorExecution(effectivePrompt, imagePaths);
-        success = result.success;
-        failureReason = result.error;
-      } else {
-        // 直接执行模式：指定 Worker 直接执行
-        const result = await this.directExecutor.execute(effectivePrompt, forceWorker || this.selectedWorker!, imagePaths);
-        success = result.success;
-        failureReason = result.error;
-      }
+      // 统一走智能编排模式
+      const result = await this.enqueueOrchestratorExecution(effectivePrompt, imagePaths, executionSessionId);
+      success = result.success;
+      failureReason = result.error;
     } catch (error) {
       failureReason = error instanceof Error ? error.message : String(error);
       success = false;
@@ -2341,7 +2329,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /** 编排模式执行 */
-  private async executeWithOrchestrator(prompt: string, imagePaths: string[]): Promise<OrchestratorExecutionResult> {
+  private async executeWithOrchestrator(prompt: string, imagePaths: string[], sessionId: string): Promise<OrchestratorExecutionResult> {
     logger.info('界面.执行.模式.编排', undefined, LogCategory.UI);
 
     // 🔧 初始分析消息已由 MissionDrivenEngine.sendPhaseMessage 统一发送
@@ -2353,13 +2341,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 调用智能编排器
       // 注意：executeWithTaskContext 内部已将 LLM 响应流式发送到前端
       // 因此不需要再手动调用 sendOrchestratorMessage 发送结果，否则会导致重复消息
-      const taskContext = await this.orchestratorEngine.executeWithTaskContext(prompt, this.activeSessionId || undefined, imagePaths);
+      const taskContext = await this.orchestratorEngine.executeWithTaskContext(prompt, sessionId, imagePaths);
       const result = taskContext.result;
 
       logger.info('界面.任务.完成', { hasResult: !!result?.trim(), resultLength: result?.length || 0 }, LogCategory.UI);
 
       // 保存消息历史
-      this.saveMessageToSession(prompt, result, undefined, 'orchestrator');
+      this.saveMessageToSession(prompt, result, undefined, 'orchestrator', sessionId);
 
       // 🔧 移除误判的安全检查
       // 原因：LLM 流式输出通过 Normalizer -> MessageHub 直接发送到前端
@@ -2407,7 +2395,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       if (this.sessionManager.getSessionMetas().length === 0) {
         const newSession = this.sessionManager.createSession();
         this.activeSessionId = newSession.id;
-        this.sendData('sessionCreated', { session: newSession });
+        this.syncMessageHubTrace(this.activeSessionId);
+        this.sendData('sessionCreated', { sessionId: newSession.id, session: newSession });
       }
       this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() });
       this.sendToast('会话已删除', 'info');
@@ -2420,7 +2409,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     if (!session) {
       return;
     }
-    this.sendData('sessionLoaded', { session: session });
+    this.sendData('sessionLoaded', { sessionId: session.id, session: session });
   }
 
   /** 创建并切换到新会话（对齐任务/对话会话） */
@@ -2432,27 +2421,41 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private async handleNewSession(): Promise<void> {
     // 创建新会话前，先中断当前任务
     await this.interruptCurrentTask({ silent: true });
+    this.cancelPendingOrchestratorQueue('会话已切换，已取消旧会话排队任务');
     // 创建新会话时，重置所有适配器
     await this.adapterFactory.shutdown();
+    this.messageHub.setRequestContext(undefined);
+    this.messageHub.forceProcessingState(false);
     const newSession = this.sessionManager.createSession();
     // 更新活跃会话ID
     this.activeSessionId = newSession.id;
+    this.syncMessageHubTrace(this.activeSessionId);
     logger.info('界面.会话.已创建', { sessionId: this.activeSessionId }, LogCategory.UI);
     // 通知 webview 新会话已创建
-    this.sendData('sessionCreated', { session: newSession });
+    this.sendData('sessionCreated', { sessionId: newSession.id, session: newSession });
     this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() });
     this.sendStateUpdate();
   }
 
   /** 切换到指定会话 */
   private async switchToSession(sessionId: string): Promise<void> {
+    this.cancelPendingOrchestratorQueue('会话已切换，已取消旧会话排队任务');
     await this.adapterFactory.shutdown();
+    this.messageHub.setRequestContext(undefined);
+    this.messageHub.forceProcessingState(false);
     this.activeSessionId = sessionId;
     this.ensureSessionExists(sessionId);
+    this.syncMessageHubTrace(sessionId);
 
     // 获取会话完整数据
     const session = this.sessionManager.getSession(sessionId);
     if (session) {
+      // 先广播会话已切换，再下发消息历史，避免前端跨会话过滤误拦截历史数据
+      this.sendData('sessionSwitched', {
+        sessionId,
+        session,
+      });
+
       // 分类消息：主对话 vs Worker 消息
       const threadMessages: any[] = [];
       const workerMessages: { claude: any[]; codex: any[]; gemini: any[] } = {
@@ -2546,21 +2549,50 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.activeSessionId = newSession.id;
   }
 
+  /** 将 MessageHub trace 与当前会话对齐，确保消息不会跨会话串流 */
+  private syncMessageHubTrace(sessionId?: string | null): void {
+    const resolvedSessionId = (sessionId && sessionId.trim())
+      || this.activeSessionId
+      || this.sessionManager.getCurrentSession()?.id
+      || '';
+    if (!resolvedSessionId) {
+      return;
+    }
+    if (this.messageHub.getTraceId() === resolvedSessionId) {
+      return;
+    }
+    this.messageHub.setTraceId(resolvedSessionId);
+    logger.debug('界面.消息.Trace.同步', { traceId: resolvedSessionId }, LogCategory.UI);
+  }
+
   /** 保存消息到当前会话 */
   private saveMessageToSession(
     userPrompt: string,
     assistantResponse: string,
     agent?: WorkerSlot,
-    source?: MessageSource
+    source?: MessageSource,
+    sessionId?: string
   ): void {
-    const session = this.sessionManager.getCurrentSession();
-    if (!session) {
+    const resolvedSessionId = sessionId
+      || this.activeSessionId
+      || this.sessionManager.getCurrentSession()?.id
+      || '';
+    if (!resolvedSessionId) {
       return;
     }
     if (assistantResponse) {
       const resolvedAgent = agent || (source === 'orchestrator' ? 'orchestrator' : undefined);
-      this.sessionManager.addMessage('assistant', assistantResponse, resolvedAgent, source);
-      void this.orchestratorEngine.recordContextMessage('assistant', assistantResponse, this.activeSessionId || undefined);
+      try {
+        this.sessionManager.addMessageToSession(resolvedSessionId, 'assistant', assistantResponse, resolvedAgent, source);
+      } catch (error: any) {
+        logger.warn('界面.会话.助手消息写入失败', {
+          sessionId: resolvedSessionId,
+          error: error?.message || String(error),
+        }, LogCategory.UI);
+        this.sendStateUpdate();
+        return;
+      }
+      void this.orchestratorEngine.recordContextMessage('assistant', assistantResponse, resolvedSessionId);
     }
     this.sendStateUpdate();
   }

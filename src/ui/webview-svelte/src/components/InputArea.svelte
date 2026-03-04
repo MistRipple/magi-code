@@ -25,28 +25,10 @@
   // 输入内容
   let inputValue = $state('');
 
-  // 模式和模型选择
-  let selectedModel = $state('');
+  // 模式选择
   const interactionMode = $derived.by(() => getInteractionMode());
   const requestedInteractionMode = $derived.by(() => getRequestedInteractionMode());
   const isModeSyncing = $derived.by(() => isInteractionModeSyncing());
-
-  // 模型下拉状态
-  let modelDropdownOpen = $state(false);
-  const modelOptions = [
-    { value: '', label: '自动' },
-    { value: 'claude', label: 'Claude' },
-    { value: 'codex', label: 'Codex' },
-    { value: 'gemini', label: 'Gemini' },
-  ] as const;
-  const selectedModelLabel = $derived(
-    modelOptions.find(o => o.value === selectedModel)?.label || '自动'
-  );
-
-  function selectModel(value: string) {
-    selectedModel = value;
-    modelDropdownOpen = false;
-  }
 
   // 技能下拉列表状态
   let skillDropdownOpen = $state(false);
@@ -157,7 +139,6 @@
         type: 'executeTask',
         prompt: finalPrompt || '请分析这些图片',
         mode: interactionMode,
-        agent: selectedModel || undefined,
         requestId,
         images: selectedImages.map(img => ({ dataUrl: img.dataUrl })),
       });
@@ -208,7 +189,9 @@
   function toggleDeepTask() {
     deepTaskEnabled = !deepTaskEnabled;
     vscode.postMessage({ type: 'updateSetting', key: 'deepTask', value: deepTaskEnabled });
-    addToast('info', deepTaskEnabled ? '已开启深度模式（新会话生效）' : '已关闭深度模式');
+    addToast('info', deepTaskEnabled
+      ? '已开启深度模式（项目级治理，新会话生效）'
+      : '已切换为常规模式（功能级治理）');
   }
 
   // 拖动调整大小
@@ -454,27 +437,6 @@
           {/if}
         </div>
 
-        <!-- 模型选择器（自定义下拉） -->
-        <div class="ia-model-wrap">
-          <button class="ia-model-btn" onclick={() => modelDropdownOpen = !modelDropdownOpen} title="选择模型">
-            <span class="ia-model-label">{selectedModelLabel}</span>
-            <Icon name="chevron-down" size={10} />
-          </button>
-          {#if modelDropdownOpen}
-            <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
-            <div class="ia-model-backdrop" role="presentation" onclick={() => modelDropdownOpen = false}></div>
-            <div class="ia-model-menu">
-              {#each modelOptions as opt}
-                <button
-                  class="ia-model-item"
-                  class:selected={selectedModel === opt.value}
-                  onclick={() => selectModel(opt.value)}
-                >{opt.label}</button>
-              {/each}
-            </div>
-          {/if}
-        </div>
-
         <!-- 模式开关（滑块 Toggle） -->
         <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
         <div
@@ -499,7 +461,9 @@
           class="ia-deep-btn"
           class:active={deepTaskEnabled}
           onclick={toggleDeepTask}
-          title={deepTaskEnabled ? '深度模式：无限 loop + review 直到完成' : '常规模式：单轮对话完成一件事'}
+          title={deepTaskEnabled
+            ? '深度模式（项目级）：高强度循环 + 多轮复审'
+            : '常规模式（功能级）：有界循环 + 轻量复审'}
         >
           <Icon name="infinity" size={12} />
           <span class="ia-deep-label">深度</span>
@@ -807,69 +771,6 @@
     color: var(--foreground-muted);
     font-size: 11px;
   }
-
-  /* 模型选择器（自定义下拉） */
-  .ia-model-wrap {
-    position: relative;
-  }
-
-  .ia-model-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 3px;
-    height: 26px;
-    padding: 0 6px;
-    font-size: 11px;
-    font-weight: var(--font-medium);
-    background: transparent;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-full);
-    color: var(--foreground);
-    cursor: pointer;
-    transition: border-color var(--transition-fast);
-    white-space: nowrap;
-  }
-  .ia-model-btn:hover { border-color: var(--primary); }
-
-  .ia-model-label { pointer-events: none; }
-
-  .ia-model-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 50;
-  }
-
-  .ia-model-menu {
-    position: absolute;
-    bottom: calc(100% + 4px);
-    left: 0;
-    min-width: 90px;
-    background: var(--vscode-input-background, var(--surface-1));
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-lg);
-    z-index: 51;
-    padding: 3px;
-    display: flex;
-    flex-direction: column;
-  }
-
-  .ia-model-item {
-    display: flex;
-    align-items: center;
-    height: 28px;
-    padding: 0 var(--space-2);
-    font-size: 11px;
-    background: transparent;
-    border: none;
-    border-radius: var(--radius-sm);
-    color: var(--foreground);
-    cursor: pointer;
-    transition: background var(--transition-fast);
-    white-space: nowrap;
-  }
-  .ia-model-item:hover { background: var(--surface-hover); }
-  .ia-model-item.selected { color: var(--primary); font-weight: var(--font-semibold); }
 
   /* 模式开关（滑块 Toggle） */
   .ia-toggle {

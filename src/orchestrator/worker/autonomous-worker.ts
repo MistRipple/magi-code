@@ -162,6 +162,13 @@ export interface AutonomousExecutionResult {
   sessionId?: string;
   /** 是否有等待审批的 Todo */
   hasPendingApprovals?: boolean;
+  /** 验收检查状态 */
+  verification: {
+    attempted: boolean;
+    degraded: boolean;
+    warnings: string[];
+    rounds: number;
+  };
 }
 
 /**
@@ -244,6 +251,29 @@ export class AutonomousWorker extends EventEmitter {
   }
 
   /**
+   * 解析验收复审策略
+   *
+   * - 常规模式（功能级）：轻量复审，默认 2 轮
+   * - 深度模式（项目级）：多轮复审，默认 8 轮
+   */
+  private resolveReviewPolicy(options: TodoExecuteOptions): {
+    mode: 'feature' | 'project';
+    maxReviewRounds: number;
+  } {
+    const deepTaskEnabled = options.adapterFactory?.isDeepTask() ?? false;
+    if (deepTaskEnabled) {
+      return {
+        mode: 'project',
+        maxReviewRounds: 8,
+      };
+    }
+    return {
+      mode: 'feature',
+      maxReviewRounds: 2,
+    };
+  }
+
+  /**
    * 执行整个 Assignment
    */
   async executeAssignment(
@@ -256,6 +286,9 @@ export class AutonomousWorker extends EventEmitter {
     const skippedTodos: UnifiedTodo[] = [];
     const dynamicTodos: UnifiedTodo[] = [];
     const errors: string[] = [];
+    const verificationWarnings: string[] = [];
+    let verificationAttempted = false;
+    let verificationDegraded = false;
     // 聚合 Token 使用统计
     let totalTokenUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
     // 是否被编排者中止
@@ -295,7 +328,7 @@ export class AutonomousWorker extends EventEmitter {
         const remainingTodoFingerprints = new Set(session.completedTodoFingerprints);
         for (const todo of assignment.todos) {
           const fingerprint = this.buildTodoFingerprint(todo.content);
-          const fingerprintMatched = remainingTodoFingerprints.has(fingerprint);
+          const fingerprintMatched = Boolean(fingerprint) && remainingTodoFingerprints.has(fingerprint);
           if (fingerprintMatched) {
             remainingTodoFingerprints.delete(fingerprint);
           }
@@ -360,9 +393,16 @@ export class AutonomousWorker extends EventEmitter {
 
     // ========== 统一 Todo 循环模式 ==========
     // 执行每个 Todo
-    const MAX_REVIEW_ROUNDS = 2;
+    const reviewPolicy = this.resolveReviewPolicy(options);
+    const maxReviewRounds = reviewPolicy.maxReviewRounds;
     let reviewRound = 0;
     let currentTodo = this.getNextExecutableTodo(assignment);
+
+    logger.info('Worker.验收策略.已应用', {
+      assignmentId: assignment.id,
+      mode: reviewPolicy.mode,
+      maxReviewRounds,
+    }, LogCategory.ORCHESTRATOR);
 
     while (currentTodo && !aborted) {
       // 取消信号检查（每次迭代入口）
@@ -521,9 +561,32 @@ export class AutonomousWorker extends EventEmitter {
           // 检查是否应该跳过依赖的 Todo
           const dependentTodos = this.getDependentTodos(currentTodo, assignment);
           for (const depTodo of dependentTodos) {
-            depTodo.status = 'skipped';
-            depTodo.blockedReason = `依赖的 Todo "${currentTodo.content}" 失败`;
-            skippedTodos.push(depTodo);
+            const blockedReason = `依赖的 Todo "${currentTodo.content}" 失败`;
+            let skippedTodo: UnifiedTodo = {
+              ...depTodo,
+              status: 'skipped',
+              blockedReason,
+            };
+            try {
+              await this.todoManager.skip(depTodo.id);
+              const persisted = await this.todoManager.get(depTodo.id);
+              if (persisted) {
+                skippedTodo = {
+                  ...persisted,
+                  blockedReason,
+                };
+              }
+            } catch (skipError: any) {
+              logger.warn('Worker.Todo.依赖跳过落盘失败', {
+                todoId: depTodo.id,
+                error: skipError?.message || String(skipError),
+              }, LogCategory.ORCHESTRATOR);
+            }
+            const todoIndex = assignment.todos.findIndex(t => t.id === skippedTodo.id);
+            if (todoIndex >= 0) {
+              assignment.todos[todoIndex] = skippedTodo;
+            }
+            skippedTodos.push(skippedTodo);
           }
         }
       } catch (error) {
@@ -532,15 +595,38 @@ export class AutonomousWorker extends EventEmitter {
         if (!currentTodo) {
           break;
         }
-        currentTodo.status = 'failed';
-        currentTodo.output = {
-          success: false,
-          summary: '',
-          modifiedFiles: [],
-          error: errorMessage,
-          duration: 0,
+        let failedTodo: UnifiedTodo = {
+          ...currentTodo,
+          status: 'failed',
+          output: {
+            success: false,
+            summary: '',
+            modifiedFiles: [],
+            error: errorMessage,
+            duration: 0,
+          },
         };
-        failedTodos.push(currentTodo);
+        try {
+          await this.todoManager.fail(currentTodo.id, errorMessage);
+          const persisted = await this.todoManager.get(currentTodo.id);
+          if (persisted) {
+            failedTodo = persisted;
+            const todoIndex = assignment.todos.findIndex(t => t.id === persisted.id);
+            if (todoIndex >= 0) {
+              assignment.todos[todoIndex] = persisted;
+            }
+          }
+        } catch (markError: any) {
+          logger.warn('Worker.Todo.异常路径状态落盘失败', {
+            todoId: currentTodo.id,
+            error: markError?.message || String(markError),
+          }, LogCategory.ORCHESTRATOR);
+        }
+        const todoIndex = assignment.todos.findIndex(t => t.id === failedTodo.id);
+        if (todoIndex >= 0) {
+          assignment.todos[todoIndex] = failedTodo;
+        }
+        failedTodos.push(failedTodo);
         logger.error('Worker.Todo.执行异常', { todoId: currentTodo.id, error: errorMessage }, LogCategory.ORCHESTRATOR);
       }
 
@@ -548,9 +634,10 @@ export class AutonomousWorker extends EventEmitter {
       currentTodo = this.getNextExecutableTodo(assignment);
 
       // 验收检查：当所有 todo 执行完毕，对照验收标准检查已完成工作
-      if (!currentTodo && !aborted && reviewRound < MAX_REVIEW_ROUNDS
+      if (!currentTodo && !aborted && reviewRound < maxReviewRounds
           && completedTodos.length > 0 && failedTodos.length === 0
           && options.adapterFactory) {
+        verificationAttempted = true;
         try {
           const fixTodos = await this.verifyAcceptanceCriteria(
             assignment, completedTodos, options, reviewRound
@@ -560,12 +647,19 @@ export class AutonomousWorker extends EventEmitter {
             currentTodo = this.getNextExecutableTodo(assignment);
           }
         } catch (verifyError: any) {
-          // 验收检查是非关键操作，不应因 LLM 调用失败推翻已完成的工作
-          logger.warn('Worker.验收检查.异常，视为通过', {
+          const warning = `验收检查第 ${reviewRound + 1} 轮异常：${verifyError?.message || String(verifyError)}`;
+          verificationDegraded = true;
+          verificationWarnings.push(warning);
+          logger.warn('Worker.验收检查.降级', {
             assignmentId: assignment.id,
             round: reviewRound + 1,
-            error: verifyError?.message || String(verifyError),
+            warning,
           }, LogCategory.ORCHESTRATOR);
+          this.emit('verificationDegraded', {
+            assignmentId: assignment.id,
+            warning,
+            round: reviewRound + 1,
+          });
         }
       }
     }
@@ -621,6 +715,12 @@ export class AutonomousWorker extends EventEmitter {
       tokenUsage: totalTokenUsage,
       sessionId: session?.id,
       hasPendingApprovals, // 返回 pendingApproval 状态
+      verification: {
+        attempted: verificationAttempted,
+        degraded: verificationDegraded,
+        warnings: verificationWarnings,
+        rounds: reviewRound,
+      },
     };
     const qualityCheckedResult = this.applyQualityGate(assignment, result, sharedContext, startTime);
     qualityCheckedResult.summary = this.buildStructuredSummary(qualityCheckedResult);
@@ -731,6 +831,16 @@ export class AutonomousWorker extends EventEmitter {
       sections.push(`跳过 ${result.skippedTodos.length} 步`);
     }
 
+    // 6. 验收检查状态（避免“检查异常=完全通过”的误导）
+    if (result.verification.attempted) {
+      if (result.verification.degraded) {
+        const warning = result.verification.warnings[0] || '验收检查执行异常';
+        sections.push(`验收检查: 降级（${warning}）`);
+      } else {
+        sections.push(`验收检查: 通过（轮次 ${result.verification.rounds + 1}）`);
+      }
+    }
+
     return sections.length > 0 ? sections.join('\n') : (result.success ? '任务完成' : '任务失败');
   }
 
@@ -802,19 +912,11 @@ ${completedWork}
 \`\`\``;
 
     // 3. 使用 Worker LLM session 执行验收检查（复用已有上下文）
-    // 使用静默调用，不推送自检过程和结果到 UI
-    const response = options.adapterFactory!.sendSilentMessage
-      ? await options.adapterFactory!.sendSilentMessage(this.workerType, prompt)
-      : await options.adapterFactory!.sendMessage(
-          this.workerType,
-          prompt,
-          undefined,
-          {
-            source: 'worker',
-            adapterRole: 'worker',
-            ...options.adapterScope,
-          }
-        );
+    // 必须走静默调用，禁止将结构化验收结果暴露到 UI
+    const response = await options.adapterFactory!.sendSilentMessage(this.workerType, prompt);
+    if (response.error) {
+      throw new Error(`验收检查静默调用失败: ${response.error}`);
+    }
 
     // 4. 解析验收结果
     const content = response.content || '';
@@ -1063,7 +1165,10 @@ ${completedWork}
       : content;
   }
 
-  private buildTodoFingerprint(content: string): string {
+  private buildTodoFingerprint(content?: string): string {
+    if (typeof content !== 'string') {
+      return '';
+    }
     return content.trim().replace(/\s+/g, ' ').toLowerCase();
   }
 

@@ -65,7 +65,39 @@ export class McpCommandHandler implements CommandHandler {
         if (!server.id || typeof server.id !== 'string' || !server.id.trim()) throw new Error('MCP server missing id');
         if (!server.name || typeof server.name !== 'string' || !server.name.trim()) throw new Error(`MCP server ${server.id || '<unknown>'} missing name`);
       }
-      ctx.sendData('mcpServersLoaded', { servers });
+
+      let manager: any = null;
+      try {
+        manager = await this.getMCPManager(ctx);
+      } catch {
+        // MCP 执行器可能尚未初始化，降级回仅配置态
+      }
+
+      const statusMap = new Map<string, any>();
+      if (manager && typeof manager.getAllServerStatuses === 'function') {
+        for (const status of manager.getAllServerStatuses()) {
+          if (status?.id) {
+            statusMap.set(status.id, status);
+          }
+        }
+      }
+
+      const mergedServers = servers.map((server: any) => {
+        const status = statusMap.get(server.id);
+        return {
+          ...server,
+          connected: status?.connected === true,
+          health: status?.health || (status?.connected ? 'connected' : 'disconnected'),
+          error: typeof status?.error === 'string' ? status.error : undefined,
+          toolCount: Number.isFinite(status?.toolCount) ? status.toolCount : 0,
+          reconnectAttempts: Number.isFinite(status?.reconnectAttempts) ? status.reconnectAttempts : 0,
+          lastCheckedAt: Number.isFinite(status?.lastCheckedAt) ? status.lastCheckedAt : undefined,
+          lastReconnectAt: Number.isFinite(status?.lastReconnectAt) ? status.lastReconnectAt : undefined,
+          lastReconnectSuccessfulAt: Number.isFinite(status?.lastReconnectSuccessfulAt) ? status.lastReconnectSuccessfulAt : undefined,
+        };
+      });
+
+      ctx.sendData('mcpServersLoaded', { servers: mergedServers });
     } catch (error: any) {
       logger.error('加载 MCP 服务器列表失败', { error: error.message }, LogCategory.TOOLS);
       ctx.sendToast(`加载 MCP 服务器失败: ${error.message}`, 'error');
@@ -135,6 +167,7 @@ export class McpCommandHandler implements CommandHandler {
       await manager.connectServer(server);
       const tools = manager.getServerTools(message.serverId);
       ctx.sendToast(`MCP 服务器 "${server.name}" 已连接，发现 ${tools.length} 个工具`, 'success');
+      await this.handleLoadMCPServers(ctx);
       logger.info('MCP 服务器已连接', { id: message.serverId, toolCount: tools.length }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('连接 MCP 服务器失败', { serverId: message.serverId, error: error.message }, LogCategory.TOOLS);
@@ -147,6 +180,7 @@ export class McpCommandHandler implements CommandHandler {
       const manager = await this.getMCPManager(ctx);
       await manager.disconnectServer(message.serverId);
       ctx.sendToast('MCP 服务器已断开连接', 'success');
+      await this.handleLoadMCPServers(ctx);
       logger.info('MCP 服务器已断开', { id: message.serverId }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('断开 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
@@ -157,18 +191,9 @@ export class McpCommandHandler implements CommandHandler {
   private async handleRefreshMCPTools(message: Msg<'refreshMCPTools'>, ctx: CommandHandlerContext): Promise<void> {
     try {
       const manager = await this.getMCPManager(ctx);
-
-      if (!manager.getServerStatus(message.serverId)) {
-        const { LLMConfigLoader } = await import('../../llm/config');
-        const servers = LLMConfigLoader.loadMCPConfig();
-        const server = servers.find((s: any) => s.id === message.serverId);
-        if (!server) throw new Error(`MCP 服务器不存在: ${message.serverId}`);
-        if (!server.enabled) throw new Error('MCP 服务器未启用');
-        await manager.connectServer(server);
-      }
-
       const tools = await manager.refreshServerTools(message.serverId);
       ctx.sendData('mcpToolsRefreshed', { serverId: message.serverId, tools });
+      await this.handleLoadMCPServers(ctx);
       ctx.sendToast(`工具列表已刷新，发现 ${tools.length} 个工具`, 'success');
       logger.info('MCP 工具列表已刷新', { serverId: message.serverId, toolCount: tools.length }, LogCategory.TOOLS);
     } catch (error: any) {

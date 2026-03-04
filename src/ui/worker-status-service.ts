@@ -3,7 +3,7 @@
  *
  * 从 WebviewProvider 提取的独立模块（#18 WVP 瘦身）。
  * 职责：
- * - 检查所有 Worker / Orchestrator / Compressor 模型连接状态
+ * - 检查所有 Worker / Orchestrator / Auxiliary 模型连接状态
  * - 维护状态缓存（TTL + soft TTL）
  * - 向前端推送 workerStatusUpdate 数据事件
  */
@@ -68,7 +68,7 @@ export class WorkerStatusService {
     const config = LLMConfigLoader.loadFullConfig();
     const statuses: Record<string, { status: string; model?: string; error?: string }> = {};
     const now = Date.now();
-    const priorityModels: Array<'orchestrator' | 'compressor'> = ['orchestrator', 'compressor'];
+    const priorityModels: Array<'orchestrator' | 'auxiliary'> = ['orchestrator', 'auxiliary'];
     const workerModels: WorkerSlot[] = ['claude', 'codex', 'gemini'];
     const modelIds = [...priorityModels, ...workerModels];
     const formatModelLabel = (modelConfig: any): string | undefined => {
@@ -76,9 +76,9 @@ export class WorkerStatusService {
       return `${modelConfig.provider} - ${modelConfig.model}`;
     };
     const orchestratorLabel = formatModelLabel(config.orchestrator);
-    const compressorFallbackLabel = orchestratorLabel ? `编排模型: ${orchestratorLabel}` : '编排模型';
-    const setCompressorFallback = (reason: string) => {
-      statuses.compressor = { status: 'fallback', model: compressorFallbackLabel, error: reason };
+    const auxiliaryFallbackLabel = orchestratorLabel ? `编排模型: ${orchestratorLabel}` : '编排模型';
+    const setAuxiliaryFallback = (reason: string) => {
+      statuses.auxiliary = { status: 'fallback', model: auxiliaryFallbackLabel, error: reason };
     };
 
     const getCachedStatus = (name: string) => {
@@ -104,10 +104,10 @@ export class WorkerStatusService {
 
     // 测试模型的通用函数（使用快速 Models API）
     const testModel = async (name: string, modelConfig: any, isRequired: boolean = false) => {
-      const isCompressor = name === 'compressor';
+      const isAuxiliary = name === 'auxiliary';
       if (!modelConfig.enabled || !modelConfig.apiKey || !modelConfig.model) {
-        if (isCompressor) {
-          setCompressorFallback(!modelConfig.enabled ? '压缩模型未启用' : '压缩模型未配置');
+        if (isAuxiliary) {
+          setAuxiliaryFallback(!modelConfig.enabled ? '辅助模型未启用' : '辅助模型未配置');
           return;
         }
         if (!modelConfig.enabled) {
@@ -126,7 +126,7 @@ export class WorkerStatusService {
 
       const modelLabel = formatModelLabel(modelConfig) || '未配置';
       if (!force) {
-        const isConnected = name !== 'compressor'
+        const isConnected = name !== 'auxiliary'
           && adapterFactory.isConnected(name as AgentType);
         if (isConnected) {
           statuses[name] = { status: 'available', model: modelLabel };
@@ -150,8 +150,8 @@ export class WorkerStatusService {
         if (result.success) {
           // 检查模型是否存在（如果 API 支持）
           if (result.modelExists === false) {
-            if (isCompressor) {
-              setCompressorFallback(`模型不存在: ${modelConfig.model}`);
+            if (isAuxiliary) {
+              setAuxiliaryFallback(`模型不存在: ${modelConfig.model}`);
               return;
             }
             statuses[name] = { status: 'invalid_model', model: modelLabel, error: `模型不存在: ${modelConfig.model}` };
@@ -162,8 +162,8 @@ export class WorkerStatusService {
             };
           }
         } else {
-          if (isCompressor) {
-            setCompressorFallback(result.error || '压缩模型连接失败');
+          if (isAuxiliary) {
+            setAuxiliaryFallback(result.error || '辅助模型连接失败');
             return;
           }
           // 根据错误类型设置状态
@@ -190,8 +190,8 @@ export class WorkerStatusService {
           modelExists: result.modelExists,
         }, LogCategory.LLM);
       } catch (error: any) {
-        if (isCompressor) {
-          setCompressorFallback(error.message || '压缩模型连接失败');
+        if (isAuxiliary) {
+          setAuxiliaryFallback(error.message || '辅助模型连接失败');
           return;
         }
         statuses[name] = { status: 'error', model: modelLabel, error: error.message };
@@ -206,12 +206,12 @@ export class WorkerStatusService {
     modelIds.forEach(name => {
       const modelConfig = name === 'orchestrator'
         ? config.orchestrator
-        : name === 'compressor'
-          ? config.compressor
+        : name === 'auxiliary'
+          ? config.auxiliary
           : config.workers[name as WorkerSlot];
 
-      if (name === 'compressor' && (!modelConfig?.enabled || !modelConfig?.apiKey || !modelConfig?.model)) {
-        setCompressorFallback(!modelConfig?.enabled ? '压缩模型未启用' : '压缩模型未配置');
+      if (name === 'auxiliary' && (!modelConfig?.enabled || !modelConfig?.apiKey || !modelConfig?.model)) {
+        setAuxiliaryFallback(!modelConfig?.enabled ? '辅助模型未启用' : '辅助模型未配置');
         return;
       }
 
@@ -222,14 +222,14 @@ export class WorkerStatusService {
       if (!modelConfig?.apiKey || !modelConfig?.model) {
         statuses[name] = {
           status: 'not_configured',
-          model: name === 'orchestrator' || name === 'compressor' ? '未配置（必需）' : '未配置'
+          model: name === 'orchestrator' || name === 'auxiliary' ? '未配置（必需）' : '未配置'
         };
         return;
       }
 
       const modelLabel = formatModelLabel(modelConfig) || '未配置';
       if (!force) {
-        const isConnected = name !== 'compressor'
+        const isConnected = name !== 'auxiliary'
           && adapterFactory.isConnected(name as AgentType);
         if (isConnected) {
           statuses[name] = { status: 'available', model: modelLabel };
@@ -247,7 +247,7 @@ export class WorkerStatusService {
     // 所有模型并行检测（不再串行）
     await Promise.all([
       testModel('orchestrator', config.orchestrator, true),
-      testModel('compressor', config.compressor, true),
+      testModel('auxiliary', config.auxiliary, true),
       ...workerModels.map(worker => testModel(worker, config.workers[worker]))
     ]);
 

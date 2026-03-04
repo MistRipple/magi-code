@@ -10,10 +10,12 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as zlib from 'zlib';
 import { logger, LogCategory } from '../../logging';
 import { InvertedIndex, InvertedIndexSnapshot } from '../indexing/inverted-index';
 import { SymbolIndex, SymbolIndexSnapshot } from '../indexing/symbol-index';
 import { DependencyGraph, DependencyGraphSnapshot } from '../indexing/dependency-graph';
+import { ExpansionCacheSnapshot } from '../search/query-expander';
 
 // ============================================================================
 // 类型定义
@@ -47,6 +49,8 @@ interface PersistenceSnapshot {
   symbolIndex: SymbolIndexSnapshot;
   /** 依赖图快照 */
   dependencyGraph: DependencyGraphSnapshot;
+  /** 查询扩展缓存快照（可选，向后兼容） */
+  expansionCache?: ExpansionCacheSnapshot;
 }
 
 /** 新鲜度验证结果 */
@@ -73,11 +77,14 @@ const DEFAULT_DEBOUNCE_MS = 5000;
 
 export class IndexPersistence {
   private cacheFilePath: string;
+  /** 旧版未压缩路径（用于迁移清理） */
+  private legacyCacheFilePath: string;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private debounceMs: number;
 
   constructor(projectRoot: string, debounceMs = DEFAULT_DEBOUNCE_MS) {
-    this.cacheFilePath = path.join(projectRoot, '.magi', 'cache', 'search-index.json');
+    this.cacheFilePath = path.join(projectRoot, '.magi', 'cache', 'search-index.json.gz');
+    this.legacyCacheFilePath = path.join(projectRoot, '.magi', 'cache', 'search-index.json');
     this.debounceMs = debounceMs;
   }
 
@@ -89,7 +96,8 @@ export class IndexPersistence {
     invertedIndex: InvertedIndex,
     symbolIndex: SymbolIndex,
     dependencyGraph: DependencyGraph,
-    files: Array<{ path: string; type: 'source' | 'config' | 'doc' | 'test' }>
+    files: Array<{ path: string; type: 'source' | 'config' | 'doc' | 'test' }>,
+    expansionCache?: ExpansionCacheSnapshot
   ): void {
     try {
       const dir = path.dirname(this.cacheFilePath);
@@ -122,12 +130,22 @@ export class IndexPersistence {
         invertedIndex: invertedIndex.toJSON(),
         symbolIndex: symbolIndex.toJSON(),
         dependencyGraph: dependencyGraph.toJSON(),
+        expansionCache,
       };
 
-      fs.writeFileSync(this.cacheFilePath, JSON.stringify(snapshot), 'utf-8');
+      const jsonStr = JSON.stringify(snapshot);
+      const compressed = zlib.gzipSync(jsonStr);
+      fs.writeFileSync(this.cacheFilePath, compressed);
+
+      // 清理旧版未压缩文件
+      if (fs.existsSync(this.legacyCacheFilePath)) {
+        try { fs.unlinkSync(this.legacyCacheFilePath); } catch { /* 忽略 */ }
+      }
 
       logger.info('索引持久化.保存成功', {
         files: fileManifest.length,
+        rawSize: `${(jsonStr.length / 1024).toFixed(0)}KB`,
+        compressedSize: `${(compressed.length / 1024).toFixed(0)}KB`,
         path: this.cacheFilePath,
       }, LogCategory.SESSION);
     } catch (error) {
@@ -143,14 +161,15 @@ export class IndexPersistence {
     invertedIndex: InvertedIndex,
     symbolIndex: SymbolIndex,
     dependencyGraph: DependencyGraph,
-    files: Array<{ path: string; type: 'source' | 'config' | 'doc' | 'test' }>
+    files: Array<{ path: string; type: 'source' | 'config' | 'doc' | 'test' }>,
+    expansionCache?: ExpansionCacheSnapshot
   ): void {
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
     }
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
-      this.save(projectRoot, invertedIndex, symbolIndex, dependencyGraph, files);
+      this.save(projectRoot, invertedIndex, symbolIndex, dependencyGraph, files, expansionCache);
     }, this.debounceMs);
   }
 
@@ -160,9 +179,19 @@ export class IndexPersistence {
    */
   load(): PersistenceSnapshot | null {
     try {
-      if (!fs.existsSync(this.cacheFilePath)) return null;
+      let raw: string;
 
-      const raw = fs.readFileSync(this.cacheFilePath, 'utf-8');
+      if (fs.existsSync(this.cacheFilePath)) {
+        // 优先读取压缩格式
+        const compressed = fs.readFileSync(this.cacheFilePath);
+        raw = zlib.gunzipSync(compressed).toString('utf-8');
+      } else if (fs.existsSync(this.legacyCacheFilePath)) {
+        // 向后兼容：读取旧版未压缩格式
+        raw = fs.readFileSync(this.legacyCacheFilePath, 'utf-8');
+      } else {
+        return null;
+      }
+
       const snapshot = JSON.parse(raw) as PersistenceSnapshot;
 
       // 版本校验
@@ -241,7 +270,7 @@ export class IndexPersistence {
 
   /**
    * 恢复索引并执行增量同步
-   * 返回 true 表示成功从缓存恢复（可能包含增量更新），false 表示需要全量重建
+   * 返回 { restored: true, expansionCache } 表示成功恢复，{ restored: false } 表示需要全量重建
    */
   restoreAndSync(
     projectRoot: string,
@@ -249,9 +278,9 @@ export class IndexPersistence {
     symbolIndex: SymbolIndex,
     dependencyGraph: DependencyGraph,
     currentFiles: Array<{ path: string; type: 'source' | 'config' | 'doc' | 'test' }>
-  ): boolean {
+  ): { restored: boolean; expansionCache?: ExpansionCacheSnapshot } {
     const snapshot = this.load();
-    if (!snapshot) return false;
+    if (!snapshot) return { restored: false };
 
     // 验证新鲜度
     const freshness = this.validateFreshness(projectRoot, snapshot, currentFiles);
@@ -266,7 +295,7 @@ export class IndexPersistence {
         totalFiles,
         ratio: `${Math.round(changeCount / totalFiles * 100)}%`,
       }, LogCategory.SESSION);
-      return false;
+      return { restored: false };
     }
 
     // 从快照恢复索引
@@ -279,7 +308,7 @@ export class IndexPersistence {
       dependencyGraph.fromJSON(snapshot.dependencyGraph, projectRoot, fileSet);
     } catch (error) {
       logger.warn('索引持久化.恢复失败，需全量重建', { error }, LogCategory.SESSION);
-      return false;
+      return { restored: false };
     }
 
     // 执行增量同步
@@ -311,7 +340,7 @@ export class IndexPersistence {
       added: freshness.added.length,
     }, LogCategory.SESSION);
 
-    return true;
+    return { restored: true, expansionCache: snapshot.expansionCache };
   }
 
   /**
@@ -319,10 +348,12 @@ export class IndexPersistence {
    */
   invalidate(): void {
     try {
-      if (fs.existsSync(this.cacheFilePath)) {
-        fs.unlinkSync(this.cacheFilePath);
-        logger.info('索引持久化.缓存已删除', undefined, LogCategory.SESSION);
+      for (const filePath of [this.cacheFilePath, this.legacyCacheFilePath]) {
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+        }
       }
+      logger.info('索引持久化.缓存已删除', undefined, LogCategory.SESSION);
     } catch {
       // 忽略删除失败
     }

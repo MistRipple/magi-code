@@ -406,7 +406,14 @@ export class AssignmentManager {
       failed: ['pending'],
     };
 
-    if (!validTransitions[assignment.status].includes(newStatus)) {
+    const currentTransitions = validTransitions[assignment.status];
+    if (!currentTransitions) {
+      throw new Error(
+        `Invalid assignment status value: ${String(assignment.status)}`
+      );
+    }
+
+    if (!currentTransitions.includes(newStatus)) {
       throw new Error(
         `Invalid assignment status transition: ${assignment.status} -> ${newStatus}`
       );

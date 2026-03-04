@@ -37,7 +37,7 @@ export interface OrchestratorAdapterConfig {
   messageHub: MessageHub;  // 🔧 统一消息通道：替代 messageBus
   systemPrompt?: string;
   historyConfig?: OrchestratorHistoryConfig;
-  /** 深度任务模式：解除总轮次硬上限 */
+  /** 深度任务模式（项目级）：提高总轮次预算 */
   deepTask?: boolean;
 }
 
@@ -90,7 +90,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   private abortController?: AbortController;
   private historyConfig: Required<OrchestratorHistoryConfig>;
   private rollingContextSummary: string | null = null;
-  /** 深度任务模式：解除总轮次硬上限 */
+  /** 深度任务模式（项目级）：提高总轮次预算 */
   private readonly deepTask: boolean;
 
   /** 当前会话中编排者已修改的文件路径集合（用于规模限制） */
@@ -147,7 +147,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     }
 
     this.setState(AdapterState.BUSY);
-    this.currentTraceId = this.generateTraceId();
+    this.syncTraceFromMessageHub();
     let messageId: string | null = null;
 
     // 获取临时配置（使用后清除）
@@ -208,10 +208,8 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       // visibility: 'system' 时不绑定 placeholder，使用独立 messageId，且标记 visibility 让前端拦截
       let streamId: string;
       if (silent) {
-        if (!this.currentTraceId) {
-          this.currentTraceId = this.generateTraceId();
-        }
-        streamId = this.normalizer.startStream(this.currentTraceId, undefined, undefined, 'system');
+        const traceId = this.syncTraceFromMessageHub();
+        streamId = this.normalizer.startStream(traceId, undefined, undefined, 'system');
       } else {
         streamId = this.startStreamWithContext();
       }
@@ -562,6 +560,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     systemPrompt: string,
     visibility?: 'user' | 'system' | 'debug'
   ): Promise<string> {
+    this.syncTraceFromMessageHub();
     const isTransientSystemCall = visibility === 'system';
 
     // system 可见性调用使用临时历史，避免污染编排上下文
@@ -595,8 +594,8 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     // 异常终止依赖失败检测止损：连续 5 次失败 → 提示换方式，累计 25 轮失败 → 终止
     const CONSECUTIVE_FAIL_THRESHOLD = 5;
     const TOTAL_FAIL_LIMIT = 25;
-    // 总轮次安全网：deepTask 模式下解除硬上限，仅保留空转/失败等智能安全网
-    const MAX_ORCHESTRATOR_ROUNDS = this.deepTask ? Infinity : 50;
+    // 总轮次安全网：深度模式（项目级）提高预算但保留硬上限，避免失控循环
+    const MAX_ORCHESTRATOR_ROUNDS = this.deepTask ? 150 : 50;
     const WARN_BEFORE_LIMIT = 5;
 
     try {

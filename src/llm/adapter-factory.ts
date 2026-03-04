@@ -265,8 +265,11 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     const deepTask = this.isDeepTask();
     const stallConfig = getStallDetectionPreset(workerSlot);
     if (deepTask) {
-      // 深度任务模式：解除总轮次硬上限，仅保留空转检测等智能安全网
-      stallConfig.maxTotalRounds = Infinity;
+      // 深度任务模式（项目级）：提高轮次预算（约 3 倍），但仍保持硬上限避免失控循环
+      stallConfig.maxTotalRounds = Math.max(
+        stallConfig.maxTotalRounds + 20,
+        Math.ceil(stallConfig.maxTotalRounds * 3)
+      );
     }
     const adapterConfig: WorkerAdapterConfig = {
       client,

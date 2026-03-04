@@ -21,14 +21,14 @@ export async function createKnowledgeExtractionClient(
   const { LLMConfigLoader } = await import('../llm/config');
   const { UniversalLLMClient } = await import('../llm/clients/universal-client');
 
-  // 加载配置：优先 compressor，回退 orchestrator
-  const compressorConfig = LLMConfigLoader.loadCompressorConfig();
+  // 加载配置：优先 auxiliary，回退 orchestrator
+  const auxiliaryConfig = LLMConfigLoader.loadAuxiliaryConfig();
   const orchestratorConfig = LLMConfigLoader.loadOrchestratorConfig();
 
-  const useCompressor = compressorConfig.enabled
-    && Boolean(compressorConfig.baseUrl && compressorConfig.model);
-  const activeConfig = useCompressor ? compressorConfig : orchestratorConfig;
-  const activeLabel = useCompressor ? 'compressor' : 'orchestrator';
+  const useAuxiliary = auxiliaryConfig.enabled
+    && Boolean(auxiliaryConfig.baseUrl && auxiliaryConfig.model);
+  const activeConfig = useAuxiliary ? auxiliaryConfig : orchestratorConfig;
+  const activeLabel = useAuxiliary ? 'auxiliary' : 'orchestrator';
 
   // 创建基础客户端
   const baseClient = new UniversalLLMClient({
@@ -117,7 +117,7 @@ export async function createKnowledgeExtractionClient(
   logger.info('知识提取客户端.已创建', {
     model: activeConfig.model,
     provider: activeConfig.provider,
-    fallbackToOrchestrator: !useCompressor,
+    fallbackToOrchestrator: !useAuxiliary,
   }, LogCategory.SESSION);
 
   return client;

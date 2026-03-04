@@ -199,7 +199,7 @@
         "magi.deepTask": {
           "type": "boolean",
           "default": false,
-          "description": "深度任务模式：解除编排者和 Worker 的轮次硬上限，适用于从 0 到 1 的完整项目实现。开启后仍保留空转检测、失败计数等智能安全网。新开会话后生效。"
+          "description": "深度任务模式（项目级治理）：提高编排/执行循环上限并启用多轮复审，适用于跨模块、多阶段、从 0 到 1 的复杂任务；关闭时为常规模式（功能级治理）。开启后仍保留空转检测、失败计数等安全网。新开会话后生效。"
         },
         "magi.cliSelection": {
           "type": "object",
@@ -249,7 +249,14 @@
     "build:webview": "cd src/ui/webview-svelte && npm run build",
     "watch:webview": "cd src/ui/webview-svelte && npm run dev",
     "lint": "eslint src --ext ts",
-    "verify:e2e:real-dispatch": "node scripts/e2e-real-dispatch-regression.cjs"
+    "verify:e2e:real-dispatch": "node scripts/e2e-real-dispatch-regression.cjs",
+    "verify:e2e:real-dispatch:feature": "MAGI_E2E_DEEP_TASK=0 node scripts/e2e-real-dispatch-regression.cjs",
+    "verify:e2e:real-dispatch:project": "MAGI_E2E_DEEP_TASK=1 node scripts/e2e-real-dispatch-regression.cjs",
+    "verify:e2e:real-dispatch:compare": "npm run -s verify:e2e:real-dispatch:feature && npm run -s verify:e2e:real-dispatch:project",
+    "verify:e2e:codebase-retrieval": "node scripts/e2e-codebase-retrieval-regression.cjs",
+    "verify:e2e:index-stability": "node scripts/e2e-index-stability-regression.cjs",
+    "verify:e2e:session-isolation": "node scripts/e2e-session-isolation-regression.cjs",
+    "verify:e2e:mode-governance": "node scripts/e2e-mode-governance-regression.cjs"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",

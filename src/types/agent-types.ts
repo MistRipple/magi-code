@@ -97,9 +97,9 @@ export interface OrchestratorConfig {
 }
 
 /**
- * 压缩模型配置
+ * 辅助模型配置
  */
-export interface CompressorConfig {
+export interface AuxiliaryConfig {
   /** LLM 配置 */
   llm: LLMConfig;
 }

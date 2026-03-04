@@ -35,7 +35,7 @@ import { isAbortError } from '../../errors';
 import { SupplementaryInstructionQueue } from './supplementary-instruction-queue';
 import { DispatchManager } from './dispatch-manager';
 import { runPostDispatchVerification } from './post-dispatch-verifier';
-import { configureResilientCompressor } from './resilient-compressor-adapter';
+import { configureResilientAuxiliary } from './resilient-auxiliary-adapter';
 import { TaskViewService } from '../../services/task-view-service';
 import {
   createWisdomStorage,
@@ -356,7 +356,7 @@ export class MissionDrivenEngine extends EventEmitter {
       );
     }
 
-    await configureResilientCompressor(this.contextManager, this.executionStats);
+    await configureResilientAuxiliary(this.contextManager, this.executionStats);
 
     // 提前初始化 TodoManager，避免首次调用 get_todos/update_todo 时命中“未初始化”
     await this.missionOrchestrator.ensureTodoManagerInitialized();
@@ -944,7 +944,7 @@ export class MissionDrivenEngine extends EventEmitter {
   }
 
   async reloadCompressionAdapter(): Promise<void> {
-    await configureResilientCompressor(this.contextManager, this.executionStats);
+    await configureResilientAuxiliary(this.contextManager, this.executionStats);
   }
 
   /**

@@ -462,6 +462,41 @@ export class SymbolIndex {
   }
 
   /**
+   * 导出项目词表（用于 QueryExpander 的项目词汇增强）
+   * 返回统一小写、去重后的标识符集合
+   */
+  getVocabulary(maxSize = 6000): Set<string> {
+    const vocabulary = new Set<string>();
+
+    const addWord = (raw: string): void => {
+      const word = raw.trim().toLowerCase();
+      if (word.length < 3 || word.length > 64) return;
+      if (!/^[a-z0-9_]+$/.test(word)) return;
+      vocabulary.add(word);
+    };
+
+    for (const [name, entries] of this.symbols.entries()) {
+      addWord(name);
+      for (const entry of entries) {
+        if (entry.container) {
+          addWord(entry.container);
+        }
+        if (entry.signature) {
+          const sigTokens = entry.signature
+            .split(/[^a-zA-Z0-9_]+/)
+            .filter(Boolean);
+          for (const token of sigTokens) {
+            addWord(token);
+          }
+        }
+      }
+      if (vocabulary.size >= maxSize) break;
+    }
+
+    return vocabulary;
+  }
+
+  /**
    * 代码块级索引: 查找包含指定行号的最小代码块符号
    * 当多个符号嵌套时（如类内方法），返回范围最小（最精确）的那个
    * @param filePath 文件相对路径
@@ -613,14 +648,44 @@ export class SymbolIndex {
     const pendingBlocks: Array<{ entry: SymbolEntry; startDepth: number }> = [];
     // 待匹配花括号的符号声明（处理多行参数列表场景）
     let pendingDeclaration: { entry: SymbolEntry; maxLine: number } | null = null;
+    // 多行字符串状态追踪（避免字符串内花括号干扰深度计算）
+    let inMultiLineString: '`' | "'" | '"' | null = null;
+    // 多行注释状态追踪
+    let inBlockComment = false;
 
     for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
       const line = lines[lineIdx];
 
+      // 多行注释状态追踪
+      if (inBlockComment) {
+        if (line.includes('*/')) {
+          inBlockComment = false;
+        }
+        continue;
+      }
+
+      // 多行字符串状态追踪：当前行在多行字符串内部
+      if (inMultiLineString) {
+        // 检查是否在本行结束（未转义的结束引号）
+        const quoteChar = inMultiLineString;
+        const unescaped = line.replace(/\\./g, '__');
+        if (unescaped.includes(quoteChar)) {
+          inMultiLineString = null;
+        }
+        // 多行字符串内的行不参与符号提取和花括号追踪
+        continue;
+      }
+
       // 跳过纯注释行
       const trimmed = line.trimStart();
-      if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')
+      if (trimmed.startsWith('//') || trimmed.startsWith('*')
           || trimmed.startsWith('#') /* Python 注释 / Rust 属性 */) {
+        continue;
+      }
+      if (trimmed.startsWith('/*')) {
+        if (!trimmed.includes('*/')) {
+          inBlockComment = true;
+        }
         continue;
       }
 
@@ -648,7 +713,10 @@ export class SymbolIndex {
       }
 
       // 追踪花括号深度（排除字符串内的花括号）
-      const strippedLine = this.stripStrings(line);
+      const { stripped: strippedLine, opensMultiLine } = this.stripStrings(line);
+      if (opensMultiLine) {
+        inMultiLineString = opensMultiLine;
+      }
       const openBraces = (strippedLine.match(/\{/g) || []).length;
       const closeBraces = (strippedLine.match(/\}/g) || []).length;
 
@@ -828,12 +896,30 @@ export class SymbolIndex {
   }
 
   /**
-   * 优化 #13: 去除行中字符串内容，避免字符串内的花括号干扰深度追踪
+   * 去除行中字符串内容，避免字符串内的花括号干扰深度追踪
+   * 同时检测多行字符串的开始（返回 quote 字符），由调用方维护跨行状态
    */
-  private stripStrings(line: string): string {
-    return line
-      .replace(/'(?:[^'\\]|\\.)*'/g, '""')
-      .replace(/"(?:[^"\\]|\\.)*"/g, '""')
-      .replace(/`(?:[^`\\]|\\.)*`/g, '""');
+  private stripStrings(line: string): { stripped: string; opensMultiLine: '`' | "'" | '"' | null } {
+    let result = line;
+    // 先处理完整的单行字符串（成对引号）
+    result = result.replace(/'(?:[^'\\]|\\.)*'/g, '""');
+    result = result.replace(/"(?:[^"\\]|\\.)*"/g, '""');
+    result = result.replace(/`(?:[^`\\]|\\.)*`/g, '""');
+
+    // 检查是否有未闭合的引号（多行字符串开始）
+    const unescaped = result.replace(/\\./g, '__');
+    let opensMultiLine: '`' | "'" | '"' | null = null;
+    for (const quote of ['`', "'", '"'] as const) {
+      const count = (unescaped.match(new RegExp(quote === '`' ? '`' : (quote === "'" ? "'" : '"'), 'g')) || []).length;
+      if (count % 2 !== 0) {
+        opensMultiLine = quote;
+        // 移除从未闭合引号开始到行尾的内容
+        const idx = unescaped.lastIndexOf(quote);
+        result = result.substring(0, idx) + '""';
+        break;
+      }
+    }
+
+    return { stripped: result, opensMultiLine };
   }
 }

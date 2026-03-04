@@ -46,6 +46,10 @@ export interface ScoreDimensions {
   recency: number;
   /** 文件类型权重 */
   typeWeight: number;
+  /** 最近编辑加权（0-1） */
+  recentEditBoost: number;
+  /** 当前 scope 加权（0-1） */
+  scopeBoost: number;
 }
 
 /** 排序权重配置 */
@@ -64,6 +68,14 @@ export interface FileTimestamps {
   get(filePath: string): number | undefined;
 }
 
+/** 额外排序信号（与基础 rank 权重解耦） */
+export interface RankBoostSignals {
+  /** 当前任务聚焦目录/文件 */
+  preferredScopes?: string[];
+  /** 最近编辑的文件集合 */
+  recentEditedFiles?: Set<string>;
+}
+
 /** 聚合条目（消除 any 类型） */
 interface FileScoreEntry {
   sources: Set<string>;
@@ -73,6 +85,8 @@ interface FileScoreEntry {
   centrality: number;
   recency: number;
   typeWeight: number;
+  recentEditBoost: number;
+  scopeBoost: number;
 }
 
 /** 默认权重 */
@@ -106,14 +120,29 @@ export class ResultRanker {
   /**
    * 融合多源搜索结果并排序
    * @param fileTimestamps 文件最后修改时间映射（用于 recency 计算）
+   * @param weightOverrides 可选权重覆盖（用于查询意图感知）
    */
   rank(
     indexHits: IndexSearchHit[],
     symbolHits: SymbolSearchHit[],
     dependencyGraph: DependencyGraph | null,
     maxResults = 20,
-    fileTimestamps?: FileTimestamps
+    fileTimestamps?: FileTimestamps,
+    weightOverrides?: Partial<RankWeights>,
+    boostSignals?: RankBoostSignals
   ): RankedResult[] {
+    // 按需合并权重覆盖并归一化
+    let effectiveWeights = this.weights;
+    if (weightOverrides) {
+      const merged = { ...this.weights, ...weightOverrides };
+      const total = Object.values(merged).reduce((sum, w) => sum + w, 0);
+      if (total > 0) {
+        effectiveWeights = { ...merged };
+        for (const key of Object.keys(effectiveWeights) as Array<keyof RankWeights>) {
+          effectiveWeights[key] /= total;
+        }
+      }
+    }
     // 按文件聚合所有来源的分数
     const fileMap = new Map<string, FileScoreEntry>();
 
@@ -157,6 +186,21 @@ export class ResultRanker {
       }
     }
 
+    // 5. 额外信号加权：最近编辑 + 当前 scope
+    if (boostSignals?.recentEditedFiles && boostSignals.recentEditedFiles.size > 0) {
+      for (const [filePath, entry] of fileMap.entries()) {
+        if (boostSignals.recentEditedFiles.has(filePath)) {
+          entry.recentEditBoost = 1;
+        }
+      }
+    }
+    const preferredScopes = boostSignals?.preferredScopes || [];
+    if (preferredScopes.length > 0) {
+      for (const [filePath, entry] of fileMap.entries()) {
+        entry.scopeBoost = this.calculateScopeBoost(filePath, preferredScopes);
+      }
+    }
+
     // 优化 #17: MinHeap Top-K 替换全量 sort+slice
     const heap = new MinHeap<RankedResult>(maxResults, (a, b) => a.finalScore - b.finalScore);
 
@@ -168,15 +212,21 @@ export class ResultRanker {
         centrality: entry.centrality,
         recency: entry.recency,
         typeWeight: entry.typeWeight,
+        recentEditBoost: entry.recentEditBoost,
+        scopeBoost: entry.scopeBoost,
       };
 
       let finalScore =
-        breakdown.tfidf * this.weights.tfidf +
-        breakdown.symbolMatch * this.weights.symbolMatch +
-        breakdown.positionWeight * this.weights.positionWeight +
-        breakdown.centrality * this.weights.centrality +
-        breakdown.recency * this.weights.recency +
-        breakdown.typeWeight * this.weights.typeWeight;
+        breakdown.tfidf * effectiveWeights.tfidf +
+        breakdown.symbolMatch * effectiveWeights.symbolMatch +
+        breakdown.positionWeight * effectiveWeights.positionWeight +
+        breakdown.centrality * effectiveWeights.centrality +
+        breakdown.recency * effectiveWeights.recency +
+        breakdown.typeWeight * effectiveWeights.typeWeight;
+
+      const scopedBonus = breakdown.scopeBoost * 0.15;
+      const recentEditBonus = breakdown.recentEditBoost * 0.10;
+      finalScore *= (1 + scopedBonus + recentEditBonus);
 
       // 优化 #7: 多来源交叉加分
       // 同时被 2 个来源命中 → +10%，3 个来源 → +20%
@@ -215,10 +265,42 @@ export class ResultRanker {
         centrality: 0,
         recency: 0,
         typeWeight: 0,
+        recentEditBoost: 0,
+        scopeBoost: 0,
       };
       map.set(filePath, entry);
     }
     return entry;
+  }
+
+  /**
+   * scope 加权：
+   * - 文件精确命中 scope 路径：1.0
+   * - 文件位于 scope 子路径：0.8
+   * - 文件路径包含 scope 片段：0.4
+   */
+  private calculateScopeBoost(filePath: string, preferredScopes: string[]): number {
+    const normalizedFilePath = filePath.replace(/\\/g, '/').toLowerCase();
+    let best = 0;
+
+    for (const scope of preferredScopes) {
+      const normalizedScope = scope.replace(/\\/g, '/').replace(/^\.\/+/, '').toLowerCase();
+      if (!normalizedScope) continue;
+
+      if (normalizedFilePath === normalizedScope) {
+        best = Math.max(best, 1.0);
+        continue;
+      }
+      if (normalizedFilePath.startsWith(`${normalizedScope}/`)) {
+        best = Math.max(best, 0.8);
+        continue;
+      }
+      if (normalizedFilePath.includes(`/${normalizedScope}/`) || normalizedFilePath.endsWith(`/${normalizedScope}`)) {
+        best = Math.max(best, 0.4);
+      }
+    }
+
+    return best;
   }
 
   /**

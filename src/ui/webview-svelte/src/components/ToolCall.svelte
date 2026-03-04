@@ -197,7 +197,7 @@
       'web_search': 'web search',
       'web_fetch': 'web fetch',
       'mermaid_diagram': 'diagram',
-      'codebase_retrieval': 'retrieval',
+      'codebase_retrieval': 'local retrieval',
       'dispatch_task': 'dispatch',
       'send_worker_message': 'message',
       'wait_for_workers': 'wait results',

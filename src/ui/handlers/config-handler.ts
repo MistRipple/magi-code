@@ -2,25 +2,21 @@
  * ConfigHandler - 配置管理消息处理器（P1-3 修复）
  *
  * 从 WebviewProvider 提取的独立 Handler。
- * 职责：Profile / PromptEnhance / Worker / Orchestrator / Compressor 配置 CRUD + 模型列表获取。
+ * 职责：Profile / Worker / Orchestrator / Auxiliary 配置 CRUD + 模型列表获取 + 提示词增强触发。
  */
 
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import { logger, LogCategory } from '../../logging';
 import type { WebviewToExtensionMessage, WorkerSlot } from '../../types';
-import { loadAceConfigFromFile } from '../../tools/tool-manager';
 import type { CommandHandler, CommandHandlerContext } from './types';
 
 type Msg<T extends string> = Extract<WebviewToExtensionMessage, { type: T }>;
 
 const SUPPORTED = new Set([
   'getProfileConfig', 'saveProfileConfig', 'resetProfileConfig',
-  'getPromptEnhanceConfig', 'updatePromptEnhance', 'testPromptEnhance', 'enhancePrompt',
+  'enhancePrompt',
   'loadAllWorkerConfigs', 'saveWorkerConfig', 'testWorkerConnection',
   'loadOrchestratorConfig', 'saveOrchestratorConfig', 'testOrchestratorConnection',
-  'loadCompressorConfig', 'saveCompressorConfig', 'testCompressorConnection',
+  'loadAuxiliaryConfig', 'saveAuxiliaryConfig', 'testAuxiliaryConnection',
   'fetchModelList',
 ]);
 
@@ -37,15 +33,6 @@ export class ConfigCommandHandler implements CommandHandler {
         break;
       case 'resetProfileConfig':
         await this.handleResetProfileConfig(ctx);
-        break;
-      case 'getPromptEnhanceConfig':
-        await this.sendPromptEnhanceConfig(ctx);
-        break;
-      case 'updatePromptEnhance':
-        await this.handleUpdatePromptEnhance(message as Msg<'updatePromptEnhance'>, ctx);
-        break;
-      case 'testPromptEnhance':
-        await this.handleTestPromptEnhance(message as Msg<'testPromptEnhance'>, ctx);
         break;
       case 'enhancePrompt': {
         const result = await ctx.getPromptEnhancer().enhance((message as Msg<'enhancePrompt'>).prompt);
@@ -70,14 +57,14 @@ export class ConfigCommandHandler implements CommandHandler {
       case 'testOrchestratorConnection':
         await this.handleTestOrchestratorConnection(message as Msg<'testOrchestratorConnection'>, ctx);
         break;
-      case 'loadCompressorConfig':
-        await this.handleLoadCompressorConfig(ctx);
+      case 'loadAuxiliaryConfig':
+        await this.handleLoadAuxiliaryConfig(ctx);
         break;
-      case 'saveCompressorConfig':
-        await this.handleSaveCompressorConfig(message as Msg<'saveCompressorConfig'>, ctx);
+      case 'saveAuxiliaryConfig':
+        await this.handleSaveAuxiliaryConfig(message as Msg<'saveAuxiliaryConfig'>, ctx);
         break;
-      case 'testCompressorConnection':
-        await this.handleTestCompressorConnection(message as Msg<'testCompressorConnection'>, ctx);
+      case 'testAuxiliaryConnection':
+        await this.handleTestAuxiliaryConnection(message as Msg<'testAuxiliaryConnection'>, ctx);
         break;
       case 'fetchModelList':
         await this.handleFetchModelList(message as Msg<'fetchModelList'>, ctx);
@@ -220,102 +207,6 @@ export class ConfigCommandHandler implements CommandHandler {
   }
 
   // ============================================================================
-  // Prompt Enhance 配置
-  // ============================================================================
-
-  private async sendPromptEnhanceConfig(ctx: CommandHandlerContext): Promise<void> {
-    const config = loadAceConfigFromFile();
-    ctx.sendData('promptEnhanceConfigLoaded', {
-      config: { baseUrl: config.baseUrl, apiKey: config.apiKey },
-    });
-  }
-
-  private async handleUpdatePromptEnhance(message: Msg<'updatePromptEnhance'>, ctx: CommandHandlerContext): Promise<void> {
-    const config = message.config;
-    const source = message.source ?? 'auto';
-    try {
-      const configPath = path.join(os.homedir(), '.magi', 'config.json');
-      const configDir = path.dirname(configPath);
-
-      if (!fs.existsSync(configDir)) {
-        fs.mkdirSync(configDir, { recursive: true });
-      }
-
-      let existingConfig: any = {};
-      if (fs.existsSync(configPath)) {
-        try {
-          existingConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-        } catch { existingConfig = {}; }
-      }
-
-      existingConfig.promptEnhance = { baseUrl: config.baseUrl, apiKey: config.apiKey };
-      fs.writeFileSync(configPath, JSON.stringify(existingConfig, null, 2), 'utf-8');
-      logger.info('界面.提示词_增强.配置.已保存', { path: configPath }, LogCategory.UI);
-
-      const toolManager = ctx.getAdapterFactory().getToolManager?.();
-      if (toolManager && config.baseUrl && config.apiKey) {
-        toolManager.configureAce(config.baseUrl, config.apiKey);
-        logger.info('界面.提示词_增强.配置.已同步到ToolManager', undefined, LogCategory.UI);
-      }
-
-      if (source === 'manual') {
-        ctx.sendToast('ACE 配置已保存', 'success');
-      }
-    } catch (error) {
-      logger.error('界面.提示词_增强.配置.保存_失败', error, LogCategory.UI);
-      if (source === 'manual') {
-        const errorMsg = error instanceof Error ? error.message : String(error);
-        ctx.sendToast(`ACE 配置保存失败: ${errorMsg}`, 'error');
-      }
-    }
-  }
-
-  private async handleTestPromptEnhance(message: Msg<'testPromptEnhance'>, ctx: CommandHandlerContext): Promise<void> {
-    if (!message.baseUrl || !message.apiKey) {
-      ctx.sendData('promptEnhanceResult', { success: false, message: '请填写 API 地址和密钥' });
-      return;
-    }
-
-    try {
-      const testUrl = message.baseUrl.replace(/\/$/, '') + '/prompt-enhancer';
-      const response = await fetch(testUrl, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${message.apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          nodes: [{ id: 1, type: 0, text_node: { content: 'test' } }],
-          chat_history: [],
-          blobs: { checkpoint_id: null, added_blobs: [], deleted_blobs: [] },
-          conversation_id: null,
-          model: 'claude-sonnet-4-5',
-          mode: 'CHAT',
-          user_guided_blobs: [],
-          external_source_ids: [],
-          user_guidelines: '',
-          workspace_guidelines: '',
-          rules: [],
-        }),
-        signal: AbortSignal.timeout(15000),
-      });
-
-      if (response.ok) {
-        ctx.sendData('promptEnhanceResult', { success: true, message: '连接成功' });
-      } else if (response.status === 401) {
-        ctx.sendData('promptEnhanceResult', { success: false, message: 'Token 无效或已过期' });
-      } else if (response.status === 403) {
-        ctx.sendData('promptEnhanceResult', { success: false, message: '访问被拒绝' });
-      } else {
-        ctx.sendData('promptEnhanceResult', { success: false, message: `连接失败: ${response.status}` });
-      }
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      ctx.sendData('promptEnhanceResult', { success: false, message: `连接错误: ${errorMsg}` });
-    }
-  }
-
-  // ============================================================================
   // LLM 配置管理
   // ============================================================================
 
@@ -432,31 +323,31 @@ export class ConfigCommandHandler implements CommandHandler {
     }
   }
 
-  private async handleLoadCompressorConfig(ctx: CommandHandlerContext): Promise<void> {
+  private async handleLoadAuxiliaryConfig(ctx: CommandHandlerContext): Promise<void> {
     try {
       const { LLMConfigLoader } = await import('../../llm/config');
-      const config = LLMConfigLoader.loadCompressorConfig();
-      ctx.sendData('compressorConfigLoaded', { config });
+      const config = LLMConfigLoader.loadAuxiliaryConfig();
+      ctx.sendData('auxiliaryConfigLoaded', { config });
     } catch (error: any) {
-      logger.error('加载压缩模型配置失败', { error: error.message }, LogCategory.LLM);
+      logger.error('加载辅助模型配置失败', { error: error.message }, LogCategory.LLM);
       ctx.sendToast(`加载配置失败: ${error.message}`, 'error');
     }
   }
 
-  private async handleSaveCompressorConfig(message: Msg<'saveCompressorConfig'>, ctx: CommandHandlerContext): Promise<void> {
+  private async handleSaveAuxiliaryConfig(message: Msg<'saveAuxiliaryConfig'>, ctx: CommandHandlerContext): Promise<void> {
     try {
       const { LLMConfigLoader } = await import('../../llm/config');
-      LLMConfigLoader.updateCompressorConfig(message.config);
+      LLMConfigLoader.updateAuxiliaryConfig(message.config);
       await ctx.getOrchestratorEngine().reloadCompressionAdapter();
-      ctx.sendToast('压缩模型配置已保存', 'success');
-      logger.info('压缩模型配置已保存', undefined, LogCategory.LLM);
+      ctx.sendToast('辅助模型配置已保存', 'success');
+      logger.info('辅助模型配置已保存', undefined, LogCategory.LLM);
     } catch (error: any) {
-      logger.error('保存压缩模型配置失败', { error: error.message }, LogCategory.LLM);
+      logger.error('保存辅助模型配置失败', { error: error.message }, LogCategory.LLM);
       ctx.sendToast(`保存配置失败: ${error.message}`, 'error');
     }
   }
 
-  private async handleTestCompressorConnection(message: Msg<'testCompressorConnection'>, ctx: CommandHandlerContext): Promise<void> {
+  private async handleTestAuxiliaryConnection(message: Msg<'testAuxiliaryConnection'>, ctx: CommandHandlerContext): Promise<void> {
     let fallbackModel: string | undefined;
     try {
       const normalizedConfig = { ...message.config, enabled: Boolean(message.config?.apiKey) || message.config?.enabled === true };
@@ -467,10 +358,10 @@ export class ConfigCommandHandler implements CommandHandler {
         : undefined;
 
       if (!normalizedConfig.enabled || !normalizedConfig.apiKey || !normalizedConfig.model) {
-        ctx.sendData('compressorConnectionTestResult', {
-          success: false, error: '压缩模型未配置或不可用', fallbackModel,
+        ctx.sendData('auxiliaryConnectionTestResult', {
+          success: false, error: '辅助模型未配置或不可用', fallbackModel,
         });
-        ctx.sendToast('压缩模型不可用，已降级使用编排者模型', 'warning');
+        ctx.sendToast('辅助模型不可用，已降级使用编排者模型', 'warning');
         return;
       }
       const { createLLMClient } = await import('../../llm/clients/client-factory');
@@ -483,17 +374,17 @@ export class ConfigCommandHandler implements CommandHandler {
       });
 
       if (response && response.content) {
-        ctx.sendData('compressorConnectionTestResult', { success: true });
-        ctx.sendToast('压缩模型连接成功', 'success');
+        ctx.sendData('auxiliaryConnectionTestResult', { success: true });
+        ctx.sendToast('辅助模型连接成功', 'success');
       } else {
         throw new Error('No response from LLM');
       }
     } catch (error: any) {
-      logger.error('压缩模型连接测试失败', { error: error.message }, LogCategory.LLM);
-      ctx.sendData('compressorConnectionTestResult', {
+      logger.error('辅助模型连接测试失败', { error: error.message }, LogCategory.LLM);
+      ctx.sendData('auxiliaryConnectionTestResult', {
         success: false, error: error.message, fallbackModel,
       });
-      ctx.sendToast('压缩模型连接失败，已降级使用编排者模型', 'warning');
+      ctx.sendToast('辅助模型连接失败，已降级使用编排者模型', 'warning');
     }
   }
 

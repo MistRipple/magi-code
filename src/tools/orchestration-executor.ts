@@ -143,7 +143,7 @@ export interface WaitForWorkersResult {
     issues: Array<{
       task_id: string;
       level: 'normal' | 'watch' | 'intervention';
-      dimension: 'scope' | 'cross_task' | 'contract';
+      dimension: 'scope' | 'cross_task' | 'contract' | 'verification';
       detail: string;
     }>;
   };

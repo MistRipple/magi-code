@@ -504,9 +504,6 @@ export type WebviewToExtensionMessage =
   // Mermaid 图表面板
   | { type: 'openMermaidPanel'; code: string; title?: string }
 
-  | { type: 'getPromptEnhanceConfig' }
-  | { type: 'updatePromptEnhance'; config: { baseUrl: string; apiKey: string }; source?: 'auto' | 'manual' }
-  | { type: 'testPromptEnhance'; baseUrl: string; apiKey: string }
   | { type: 'enhancePrompt'; prompt: string }
   // 新增：需求澄清回答
   | { type: 'answerClarification'; answers: Record<string, string> | null; additionalInfo?: string }
@@ -523,9 +520,9 @@ export type WebviewToExtensionMessage =
   | { type: 'loadOrchestratorConfig' }
   | { type: 'saveOrchestratorConfig'; config: any }
   | { type: 'testOrchestratorConnection'; config: any }
-  | { type: 'loadCompressorConfig' }
-  | { type: 'saveCompressorConfig'; config: any }
-  | { type: 'testCompressorConnection'; config: any }
+  | { type: 'loadAuxiliaryConfig' }
+  | { type: 'saveAuxiliaryConfig'; config: any }
+  | { type: 'testAuxiliaryConnection'; config: any }
   | { type: 'fetchModelList'; config: any; target: string }
   // 新增：MCP 配置相关
   | { type: 'loadMCPServers' }
@@ -564,6 +561,7 @@ export type WebviewToExtensionMessage =
   | { type: 'addFAQ'; faq: any }
   | { type: 'updateFAQ'; id: string; updates: any }
   | { type: 'deleteFAQ'; id: string }
+  | { type: 'deleteLearning'; id: string }
   | { type: 'clearProjectKnowledge' }
   // 新增：前端错误上报
   | { type: 'uiError'; component: string; detail?: unknown; stack?: string }
@@ -618,5 +616,5 @@ export interface ModelCatalogEntry {
   model?: string;
   provider?: string;
   enabled?: boolean;
-  role?: 'worker' | 'orchestrator' | 'compressor' | 'unknown';
+  role?: 'worker' | 'orchestrator' | 'auxiliary' | 'unknown';
 }

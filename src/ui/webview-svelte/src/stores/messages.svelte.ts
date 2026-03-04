@@ -111,7 +111,7 @@ let modelStatus = $state<ModelStatusMap>({
   codex: { status: 'checking' },
   gemini: { status: 'checking' },
   orchestrator: { status: 'checking' },
-  compressor: { status: 'checking' },
+  auxiliary: { status: 'checking' },
 });
 let interactionMode = $state<'ask' | 'auto'>('auto');
 let requestedInteractionMode = $state<'ask' | 'auto' | null>(null);

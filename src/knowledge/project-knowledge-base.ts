@@ -15,7 +15,7 @@ import * as path from 'path';
 import { logger, LogCategory } from '../logging';
 import { LLMConfigLoader } from '../llm/config';
 import { LLMClient, LLMMessageParams } from '../llm/types';
-import { LocalSearchEngine, SearchOptions, SearchResult } from './local-search-engine';
+import { LocalSearchEngine, SearchOptions, SearchResult, SearchEngineConfig } from './local-search-engine';
 import { estimateMaxCharsForTokens, estimateTokenCount } from '../utils/token-estimator';
 
 // ============================================================================
@@ -128,6 +128,7 @@ export interface ProjectKnowledgeConfig {
   storageDir?: string;  // 默认 .magi/knowledge
   indexPatterns?: string[];  // 要索引的文件模式
   ignorePatterns?: string[]; // 要忽略的文件模式
+  searchEngineConfig?: SearchEngineConfig; // 搜索引擎配置（排序权重等）
 }
 
 // ============================================================================
@@ -146,26 +147,41 @@ export class ProjectKnowledgeBase {
 
   private indexPatterns: string[];
   private ignorePatterns: string[];
+  private searchEngineConfig?: SearchEngineConfig;
+  /** 从 indexPatterns 预编译得到的可索引扩展名集合（含点号，小写） */
+  private indexedExtensions = new Set<string>();
 
   private llmClient: LLMClient | null = null;
   private localSearchEngine: LocalSearchEngine | null = null;
+
+  // 容量限制：超出时淘汰最旧的记录
+  private static readonly MAX_ADRS = 100;
+  private static readonly MAX_FAQS = 200;
+  private static readonly MAX_LEARNINGS = 200;
 
   constructor(config: ProjectKnowledgeConfig) {
     this.projectRoot = config.projectRoot;
     this.projectName = path.basename(this.projectRoot);
     this.storageDir = config.storageDir || path.join(this.projectRoot, '.magi', 'knowledge');
 
-    // 默认索引模式
+    // 默认索引模式（与 SymbolIndex LANG_PATTERNS 支持的语言对齐）
     this.indexPatterns = config.indexPatterns || [
-      '**/*.ts',
-      '**/*.js',
-      '**/*.tsx',
-      '**/*.jsx',
-      '**/*.json',
-      '**/*.md',
-      '**/*.yml',
-      '**/*.yaml'
+      // JS/TS 系
+      '**/*.ts', '**/*.tsx', '**/*.js', '**/*.jsx', '**/*.mjs', '**/*.cjs',
+      // Python / Go / Java / Rust
+      '**/*.py', '**/*.go', '**/*.java', '**/*.rs',
+      // C / C++
+      '**/*.c', '**/*.h', '**/*.cpp', '**/*.cc', '**/*.cxx', '**/*.hpp', '**/*.hh',
+      // C# / PHP / Ruby / Swift / Kotlin
+      '**/*.cs', '**/*.php', '**/*.rb', '**/*.swift', '**/*.kt', '**/*.kts',
+      // Objective-C
+      '**/*.m', '**/*.mm',
+      // 前端框架
+      '**/*.vue', '**/*.svelte',
+      // 配置 / 文档
+      '**/*.json', '**/*.md', '**/*.yml', '**/*.yaml',
     ];
+    this.rebuildIndexedExtensions();
 
     // 默认忽略模式
     this.ignorePatterns = config.ignorePatterns || [
@@ -179,6 +195,22 @@ export class ProjectKnowledgeBase {
       '**/*.min.js',
       '**/*.map'
     ];
+
+    this.searchEngineConfig = config.searchEngineConfig;
+  }
+
+  /**
+   * 从 indexPatterns 提取并重建可索引扩展名集合
+   */
+  private rebuildIndexedExtensions(): void {
+    this.indexedExtensions.clear();
+    for (const pattern of this.indexPatterns) {
+      // 仅提取形如 **/*.ts 或 *.ts 的扩展名
+      const match = pattern.match(/\.([a-zA-Z0-9]+)$/);
+      if (match && match[1]) {
+        this.indexedExtensions.add(`.${match[1].toLowerCase()}`);
+      }
+    }
   }
 
   /**
@@ -189,7 +221,7 @@ export class ProjectKnowledgeBase {
     logger.info('项目知识库.初始化.开始', { projectRoot: this.projectRoot }, LogCategory.SESSION);
 
     // 确保存储目录存在
-    this.ensureStorageDir();
+    await this.ensureStorageDir();
 
     // 加载已有数据
     await this.loadCodeIndex();
@@ -262,15 +294,14 @@ export class ProjectKnowledgeBase {
   }
 
   /**
-   * 扫描文件
+   * 扫描文件（异步，不阻塞事件循环）
    */
   private async scanFiles(): Promise<FileEntry[]> {
     const files: FileEntry[] = [];
 
-    // 递归扫描目录
-    const scanDirectory = (dir: string) => {
+    const scanDirectory = async (dir: string) => {
       try {
-        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        const entries = await fs.promises.readdir(dir, { withFileTypes: true });
 
         for (const entry of entries) {
           const fullPath = path.join(dir, entry.name);
@@ -282,15 +313,15 @@ export class ProjectKnowledgeBase {
           }
 
           if (entry.isDirectory()) {
-            scanDirectory(fullPath);
+            await scanDirectory(fullPath);
           } else if (entry.isFile()) {
             // 检查文件扩展名是否匹配
             if (this.shouldIndex(relativePath)) {
-              const stats = fs.statSync(fullPath);
+              const stats = await fs.promises.stat(fullPath);
               // 统计文件行数：读取 Buffer 直接计数换行符，避免全量 split
               let lineCount = 0;
               try {
-                const buf = fs.readFileSync(fullPath);
+                const buf = await fs.promises.readFile(fullPath);
                 for (let i = 0; i < buf.length; i++) {
                   if (buf[i] === 0x0A) lineCount++;
                 }
@@ -314,51 +345,56 @@ export class ProjectKnowledgeBase {
       }
     };
 
-    scanDirectory(this.projectRoot);
+    await scanDirectory(this.projectRoot);
     return files;
   }
 
   /**
    * 检查文件是否应该被索引
+   * 仅按预编译扩展名集合判断（避免重复 regex 计算）
    */
   private shouldIndex(filePath: string): boolean {
-    const ext = path.extname(filePath);
-    const validExts = ['.ts', '.js', '.tsx', '.jsx', '.json', '.md', '.yml', '.yaml'];
-    return validExts.includes(ext);
+    const ext = path.extname(filePath).toLowerCase();
+    if (!ext) return false;
+    return this.indexedExtensions.has(ext);
+  }
+
+  /**
+   * 获取可索引扩展名（不含点号），用于外部文件监听与索引规则保持一致
+   */
+  getIndexedExtensions(): string[] {
+    return Array.from(this.indexedExtensions)
+      .map(ext => ext.replace(/^\./, ''))
+      .filter(Boolean)
+      .sort();
   }
 
   /**
    * 检查路径是否应该被忽略
+   * 从 ignorePatterns（glob）中提取关键词进行包含匹配
    */
   private shouldIgnore(filePath: string): boolean {
-    const ignorePatterns = [
-      'node_modules',
-      'dist',
-      'out',
-      'build',
-      '.git',
-      '.vscode',
-      'coverage',
-      '.min.js',
-      '.map'
-    ];
+    // 从 glob 模式中提取核心路径片段，例如 '**/node_modules/**' → 'node_modules'
+    const keywords = this.ignorePatterns.map(pattern =>
+      pattern.replace(/^\*\*\//, '').replace(/\/\*\*$/, '').replace(/^\*/, ''),
+    );
 
-    return ignorePatterns.some(pattern => filePath.includes(pattern));
+    return keywords.some(keyword => keyword && filePath.includes(keyword));
   }
 
   /**
-   * 扫描目录
+   * 扫描目录（异步，不阻塞事件循环）
    */
   private async scanDirectories(): Promise<DirectoryEntry[]> {
     const directories: DirectoryEntry[] = [];
 
-    const scanDirectory = (dir: string) => {
+    const scanDirectory = async (dir: string) => {
       try {
         const relativePath = path.relative(this.projectRoot, dir);
 
         // 跳过根目录和忽略的目录
         if (relativePath && !this.shouldIgnore(relativePath)) {
-          const entries = fs.readdirSync(dir, { withFileTypes: true });
+          const entries = await fs.promises.readdir(dir, { withFileTypes: true });
 
           let fileCount = 0;
           let subdirCount = 0;
@@ -379,13 +415,13 @@ export class ProjectKnowledgeBase {
         }
 
         // 递归扫描子目录
-        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        const entries = await fs.promises.readdir(dir, { withFileTypes: true });
         for (const entry of entries) {
           if (entry.isDirectory()) {
             const fullPath = path.join(dir, entry.name);
-            const relativePath = path.relative(this.projectRoot, fullPath);
-            if (!this.shouldIgnore(relativePath)) {
-              scanDirectory(fullPath);
+            const subRelativePath = path.relative(this.projectRoot, fullPath);
+            if (!this.shouldIgnore(subRelativePath)) {
+              await scanDirectory(fullPath);
             }
           }
         }
@@ -394,12 +430,12 @@ export class ProjectKnowledgeBase {
       }
     };
 
-    scanDirectory(this.projectRoot);
+    await scanDirectory(this.projectRoot);
     return directories;
   }
 
   /**
-   * 检测技术栈
+   * 检测技术栈（数据驱动，异步 IO）
    */
   private async detectTechStack(): Promise<TechStack> {
     const techStack: TechStack = {
@@ -409,74 +445,84 @@ export class ProjectKnowledgeBase {
       testFrameworks: []
     };
 
-    // 检测语言
-    const packageJsonPath = path.join(this.projectRoot, 'package.json');
-    const tsconfigPath = path.join(this.projectRoot, 'tsconfig.json');
+    // 检测语言（通过配置文件存在性）
+    const langDetectors: Array<[string, string]> = [
+      ['tsconfig.json', 'TypeScript'],
+      ['package.json', 'JavaScript'],
+      ['pyproject.toml', 'Python'],
+      ['go.mod', 'Go'],
+      ['Cargo.toml', 'Rust'],
+      ['pom.xml', 'Java'],
+      ['build.gradle', 'Java/Kotlin'],
+    ];
 
-    if (fs.existsSync(tsconfigPath)) {
-      techStack.languages.push('TypeScript');
-    }
-    if (fs.existsSync(packageJsonPath)) {
-      techStack.languages.push('JavaScript');
+    for (const [file, lang] of langDetectors) {
+      try {
+        await fs.promises.access(path.join(this.projectRoot, file));
+        techStack.languages.push(lang);
+      } catch { /* 文件不存在 */ }
     }
 
     // 读取 package.json 检测框架和工具
-    if (fs.existsSync(packageJsonPath)) {
-      try {
-        const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
-        const allDeps = {
-          ...packageJson.dependencies,
-          ...packageJson.devDependencies
-        };
+    const packageJsonPath = path.join(this.projectRoot, 'package.json');
+    try {
+      const content = await fs.promises.readFile(packageJsonPath, 'utf-8');
+      const packageJson = JSON.parse(content);
+      const allDeps = {
+        ...packageJson.dependencies,
+        ...packageJson.devDependencies
+      };
 
-        // 检测框架
-        if (allDeps['react']) techStack.frameworks.push('React');
-        if (allDeps['vue']) techStack.frameworks.push('Vue');
-        if (allDeps['@angular/core']) techStack.frameworks.push('Angular');
-        if (allDeps['express']) techStack.frameworks.push('Express');
-        if (allDeps['vscode']) techStack.frameworks.push('VSCode Extension');
+      // 数据驱动的框架/工具/测试检测表
+      const frameworkMap: Record<string, string> = {
+        'react': 'React', 'vue': 'Vue', '@angular/core': 'Angular',
+        'express': 'Express', 'fastify': 'Fastify', 'koa': 'Koa',
+        'next': 'Next.js', 'nuxt': 'Nuxt', 'svelte': 'Svelte',
+        'vscode': 'VSCode Extension', 'electron': 'Electron',
+        'nestjs': 'NestJS', '@nestjs/core': 'NestJS',
+      };
+      const buildToolMap: Record<string, string> = {
+        'webpack': 'Webpack', 'vite': 'Vite', 'rollup': 'Rollup',
+        'esbuild': 'esbuild', 'turbo': 'Turborepo', 'tsup': 'tsup',
+        'parcel': 'Parcel', 'swc': 'SWC', '@swc/core': 'SWC',
+      };
+      const testMap: Record<string, string> = {
+        'jest': 'Jest', 'mocha': 'Mocha', 'vitest': 'Vitest',
+        '@playwright/test': 'Playwright', 'cypress': 'Cypress',
+        'ava': 'AVA', 'tap': 'Tap', '@testing-library/react': 'Testing Library',
+      };
 
-        // 检测构建工具
-        if (allDeps['webpack']) techStack.buildTools.push('Webpack');
-        if (allDeps['vite']) techStack.buildTools.push('Vite');
-        if (allDeps['rollup']) techStack.buildTools.push('Rollup');
-        if (allDeps['esbuild']) techStack.buildTools.push('esbuild');
-        if (packageJson.scripts?.build) techStack.buildTools.push('npm scripts');
-
-        // 检测测试框架
-        if (allDeps['jest']) techStack.testFrameworks.push('Jest');
-        if (allDeps['mocha']) techStack.testFrameworks.push('Mocha');
-        if (allDeps['vitest']) techStack.testFrameworks.push('Vitest');
-        if (allDeps['@playwright/test']) techStack.testFrameworks.push('Playwright');
-      } catch (error) {
-        logger.warn('项目知识库.技术栈检测.失败', { error }, LogCategory.SESSION);
+      for (const [dep, name] of Object.entries(frameworkMap)) {
+        if (allDeps[dep]) techStack.frameworks.push(name);
       }
+      for (const [dep, name] of Object.entries(buildToolMap)) {
+        if (allDeps[dep]) techStack.buildTools.push(name);
+      }
+      if (packageJson.scripts?.build) techStack.buildTools.push('npm scripts');
+      for (const [dep, name] of Object.entries(testMap)) {
+        if (allDeps[dep]) techStack.testFrameworks.push(name);
+      }
+    } catch {
+      // package.json 不存在或解析失败
     }
 
     return techStack;
   }
 
   /**
-   * 读取依赖信息
+   * 读取依赖信息（异步 IO）
    */
   private async readDependencies(): Promise<DependencyInfo> {
     const packageJsonPath = path.join(this.projectRoot, 'package.json');
 
-    if (!fs.existsSync(packageJsonPath)) {
-      return {
-        dependencies: {},
-        devDependencies: {}
-      };
-    }
-
     try {
-      const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
+      const content = await fs.promises.readFile(packageJsonPath, 'utf-8');
+      const packageJson = JSON.parse(content);
       return {
         dependencies: packageJson.dependencies || {},
         devDependencies: packageJson.devDependencies || {}
       };
-    } catch (error) {
-      logger.warn('项目知识库.依赖读取.失败', { error }, LogCategory.SESSION);
+    } catch {
       return {
         dependencies: {},
         devDependencies: {}
@@ -574,6 +620,10 @@ export class ProjectKnowledgeBase {
   // 防抖定时器：避免短时间内频繁重新索引
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly REFRESH_DEBOUNCE_MS = 30_000; // 30 秒防抖
+  // 文件事件缓冲：合并高频 watcher 事件，降低乱序/抖动
+  private pendingFileEvents = new Map<string, 'changed' | 'created' | 'deleted'>();
+  private fileEventFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly FILE_EVENT_FLUSH_MS = 120;
 
   /**
    * 延迟刷新代码索引（防抖）
@@ -588,6 +638,7 @@ export class ProjectKnowledgeBase {
       try {
         logger.info('项目知识库.索引.刷新开始', undefined, LogCategory.SESSION);
         await this.indexProject();
+        // 复用已有搜索引擎实例，仅重建索引数据
         await this.buildSearchEngineIndex();
         logger.info('项目知识库.索引.刷新完成', {
           files: this.codeIndex?.files.length || 0,
@@ -611,7 +662,7 @@ export class ProjectKnowledgeBase {
 
   /**
    * 本地搜索入口（LocalSearchEngine 代理）
-   * 当 ACE 不可用时，通过此方法进行本地代码上下文检索
+   * 通过此方法进行本地代码上下文检索
    */
   async search(query: string, options: SearchOptions = {}): Promise<SearchResult[]> {
     if (!this.localSearchEngine || !this.localSearchEngine.isReady) {
@@ -702,26 +753,83 @@ export class ProjectKnowledgeBase {
   /**
    * 文件变更事件入口（由外部 FileSystemWatcher 调用）
    * 将事件转发给搜索引擎进行增量更新
+   *
+   * 增量过滤：非 delete 事件会检查扩展名是否在索引范围内，
+   * 避免非索引文件触发无效的增量更新排队。
+   * delete 事件不过滤（文件已不存在，但索引中可能有残留需要清理）。
    */
   onFileEvent(filePath: string, type: 'changed' | 'created' | 'deleted'): void {
     if (!this.localSearchEngine) return;
 
-    switch (type) {
-      case 'changed':
-        this.localSearchEngine.onFileChanged(filePath);
-        break;
-      case 'created':
-        this.localSearchEngine.onFileCreated(filePath);
-        break;
-      case 'deleted':
-        this.localSearchEngine.onFileDeleted(filePath);
-        break;
+    // 增量过滤：非 delete 事件必须在索引范围内
+    if (type !== 'deleted') {
+      const relativePath = path.relative(this.projectRoot, filePath);
+      if (!this.shouldIndex(relativePath) || this.shouldIgnore(relativePath)) {
+        return;
+      }
+    }
+
+    const normalizedPath = path.normalize(filePath);
+    const prevType = this.pendingFileEvents.get(normalizedPath);
+    this.pendingFileEvents.set(
+      normalizedPath,
+      this.mergeFileEventType(prevType, type)
+    );
+
+    if (this.fileEventFlushTimer) {
+      clearTimeout(this.fileEventFlushTimer);
+    }
+    this.fileEventFlushTimer = setTimeout(() => {
+      this.fileEventFlushTimer = null;
+      this.flushPendingFileEvents();
+    }, ProjectKnowledgeBase.FILE_EVENT_FLUSH_MS);
+  }
+
+  /**
+   * 合并同一路径的高频事件，避免无意义重复更新
+   */
+  private mergeFileEventType(
+    previous: 'changed' | 'created' | 'deleted' | undefined,
+    next: 'changed' | 'created' | 'deleted'
+  ): 'changed' | 'created' | 'deleted' {
+    if (!previous) return next;
+    if (next === 'deleted') return 'deleted';
+    if (next === 'created') return previous === 'deleted' ? 'created' : previous;
+    // next === 'changed'
+    if (previous === 'created' || previous === 'deleted') return previous;
+    return 'changed';
+  }
+
+  /**
+   * 批量下发缓冲的文件事件
+   */
+  private flushPendingFileEvents(): void {
+    if (!this.localSearchEngine || this.pendingFileEvents.size === 0) {
+      this.pendingFileEvents.clear();
+      return;
+    }
+
+    const events = Array.from(this.pendingFileEvents.entries());
+    this.pendingFileEvents.clear();
+
+    for (const [filePath, type] of events) {
+      switch (type) {
+        case 'changed':
+          this.localSearchEngine.onFileChanged(filePath);
+          break;
+        case 'created':
+          this.localSearchEngine.onFileCreated(filePath);
+          break;
+        case 'deleted':
+          this.localSearchEngine.onFileDeleted(filePath);
+          break;
+      }
     }
   }
 
   /**
    * 从会话消息中提取 ADR
-   * 使用压缩模型进行智能提取
+   * 使用辅助模型进行智能提取
    */
   async extractADRFromSession(messages: Array<{ role: string; content: string }>): Promise<ADRRecord[]> {
     if (!this.llmClient) {
@@ -755,7 +863,7 @@ export class ProjectKnowledgeBase {
 
   /**
    * 从会话消息中提取 FAQ
-   * 使用压缩模型进行智能提取
+   * 使用辅助模型进行智能提取
    */
   async extractFAQFromSession(messages: Array<{ role: string; content: string }>): Promise<FAQRecord[]> {
     if (!this.llmClient) {
@@ -806,6 +914,13 @@ ${conversationText}
 3. 识别考虑过的替代方案
 4. 每个决策生成一个 ADR
 
+## 质量过滤（必须严格遵守）
+- 跳过基于错误前提或假设的讨论
+- 跳过被明确否定、废弃或推翻的方案
+- 跳过临时性的调试尝试（如"先试试…"）
+- 不要提取与之前已有决策语义重复的内容
+- 只提取最终确认采纳的决策，不提取中间讨论过程
+
 ## 输出格式
 请以 JSON 数组格式输出，每个 ADR 包含以下字段：
 \`\`\`json
@@ -842,6 +957,13 @@ ${conversationText}
 3. 问题应该具有通用性，可以帮助其他用户
 4. 每个问答对生成一个 FAQ
 
+## 质量过滤（必须严格遵守）
+- 跳过基于错误前提或假设的提问
+- 跳过被纠正过的错误回答
+- 跳过一次性的、与项目特定临时状态绑定的问题
+- 不要提取与之前已有问题语义重复的内容
+- 只提取有实际参考价值的问答，不提取闲聊或确认性对话
+
 ## 输出格式
 请以 JSON 数组格式输出，每个 FAQ 包含以下字段：
 \`\`\`json
@@ -859,30 +981,53 @@ ${conversationText}
   }
 
   /**
+   * 从 LLM 响应文本中健壮地提取 JSON 数组
+   * 多层降级：code fence → 裸 JSON 数组 → 整体尝试解析
+   */
+  private extractJsonArray(response: string, label: string): any[] | null {
+    // 尝试 1：```json ... ``` code fence
+    const fenceMatch = response.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (fenceMatch) {
+      try {
+        const parsed = JSON.parse(fenceMatch[1]);
+        if (Array.isArray(parsed)) return parsed;
+      } catch { /* 继续尝试 */ }
+    }
+
+    // 尝试 2：贪婪匹配最外层 [ ... ]
+    const bracketMatch = response.match(/\[[\s\S]*\]/);
+    if (bracketMatch) {
+      try {
+        const parsed = JSON.parse(bracketMatch[0]);
+        if (Array.isArray(parsed)) return parsed;
+      } catch { /* 继续尝试 */ }
+    }
+
+    // 尝试 3：整体 trim 后直接解析
+    try {
+      const parsed = JSON.parse(response.trim());
+      if (Array.isArray(parsed)) return parsed;
+    } catch { /* 放弃 */ }
+
+    logger.warn(`项目知识库.${label}解析.未找到有效JSON数组`, undefined, LogCategory.SESSION);
+    return null;
+  }
+
+  /**
    * 从 LLM 响应中解析 ADR
    */
   private parseADRsFromResponse(response: string): ADRRecord[] {
     try {
-      // 提取 JSON 内容
-      const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/) || response.match(/\[([\s\S]*?)\]/);
-      if (!jsonMatch) {
-        logger.warn('项目知识库.ADR解析.未找到JSON', undefined, LogCategory.SESSION);
-        return [];
-      }
-
-      const jsonText = jsonMatch[1] || jsonMatch[0];
-      const extractedADRs = JSON.parse(jsonText);
-
-      if (!Array.isArray(extractedADRs)) {
-        return [];
-      }
+      const extractedADRs = this.extractJsonArray(response, 'ADR');
+      if (!extractedADRs) return [];
 
       // 转换为 ADRRecord 格式
+      // 自动提取的 ADR 直接设为 accepted，已通过提取 prompt 的质量过滤
       return extractedADRs.map((adr, index) => ({
         id: `adr-${Date.now()}-${index}`,
         title: adr.title || '未命名决策',
         date: Date.now(),
-        status: 'proposed' as ADRStatus,
+        status: 'accepted' as ADRStatus,
         context: adr.context || '',
         decision: adr.decision || '',
         consequences: adr.consequences || '',
@@ -899,19 +1044,8 @@ ${conversationText}
    */
   private parseFAQsFromResponse(response: string): FAQRecord[] {
     try {
-      // 提取 JSON 内容
-      const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/) || response.match(/\[([\s\S]*?)\]/);
-      if (!jsonMatch) {
-        logger.warn('项目知识库.FAQ解析.未找到JSON', undefined, LogCategory.SESSION);
-        return [];
-      }
-
-      const jsonText = jsonMatch[1] || jsonMatch[0];
-      const extractedFAQs = JSON.parse(jsonText);
-
-      if (!Array.isArray(extractedFAQs)) {
-        return [];
-      }
+      const extractedFAQs = this.extractJsonArray(response, 'FAQ');
+      if (!extractedFAQs) return [];
 
       // 转换为 FAQRecord 格式
       return extractedFAQs.map((faq, index) => ({
@@ -935,10 +1069,26 @@ ${conversationText}
   // ============================================================================
 
   /**
-   * 添加 ADR
+   * 添加 ADR（自动去重：标题相似度 > 80% 时跳过）
    */
   addADR(adr: ADRRecord): void {
+    const duplicate = this.adrs.find(
+      existing => this.textSimilarity(existing.title, adr.title) > 0.8,
+    );
+    if (duplicate) {
+      logger.info('项目知识库.ADR.去重跳过', {
+        existingId: duplicate.id,
+        existingTitle: duplicate.title,
+        newTitle: adr.title,
+      }, LogCategory.SESSION);
+      return;
+    }
     this.adrs.push(adr);
+    // 超出容量限制时淘汰最旧的记录
+    if (this.adrs.length > ProjectKnowledgeBase.MAX_ADRS) {
+      const removed = this.adrs.shift();
+      logger.info('项目知识库.ADR.容量淘汰', { removedId: removed?.id }, LogCategory.SESSION);
+    }
     this.saveADRs();
     logger.info('项目知识库.ADR.已添加', { id: adr.id, title: adr.title }, LogCategory.SESSION);
   }
@@ -1007,10 +1157,28 @@ ${conversationText}
   // ============================================================================
 
   /**
-   * 添加 FAQ
+   * 添加 FAQ（自动去重：问题相似度 > 80% 时跳过）
    */
   addFAQ(faq: FAQRecord): void {
+    const duplicate = this.faqs.find(
+      existing => this.textSimilarity(existing.question, faq.question) > 0.8,
+    );
+    if (duplicate) {
+      logger.info('项目知识库.FAQ.去重跳过', {
+        existingId: duplicate.id,
+        existingQ: duplicate.question,
+        newQ: faq.question,
+      }, LogCategory.SESSION);
+      return;
+    }
     this.faqs.push(faq);
+    // 超出容量限制时淘汰使用次数最低的记录
+    if (this.faqs.length > ProjectKnowledgeBase.MAX_FAQS) {
+      // 按 useCount 升序排列，移除使用最少的
+      this.faqs.sort((a, b) => a.useCount - b.useCount);
+      const removed = this.faqs.shift();
+      logger.info('项目知识库.FAQ.容量淘汰', { removedId: removed?.id }, LogCategory.SESSION);
+    }
     this.saveFAQs();
     logger.info('项目知识库.FAQ.已添加', { id: faq.id, question: faq.question }, LogCategory.SESSION);
   }
@@ -1020,13 +1188,18 @@ ${conversationText}
    */
   searchFAQs(keyword: string): FAQRecord[] {
     const lowerKeyword = keyword.toLowerCase();
-    return this.faqs.filter(faq => {
+    const results = this.faqs.filter(faq => {
       return (
         faq.question.toLowerCase().includes(lowerKeyword) ||
         faq.answer.toLowerCase().includes(lowerKeyword) ||
         faq.tags.some(tag => tag.toLowerCase().includes(lowerKeyword))
       );
     });
+    // 命中的 FAQ 计入使用次数
+    for (const faq of results) {
+      this.incrementFAQUseCount(faq.id);
+    }
+    return results;
   }
 
   /**
@@ -1120,6 +1293,11 @@ ${conversationText}
       tags,
     };
     this.learnings.push(record);
+    // 超出容量限制时淘汰最旧的记录
+    if (this.learnings.length > ProjectKnowledgeBase.MAX_LEARNINGS) {
+      const removed = this.learnings.shift();
+      logger.info('项目知识库.Learning.容量淘汰', { removedId: removed?.id }, LogCategory.SESSION);
+    }
     this.saveLearnings();
     logger.info('项目知识库.Learning.已添加', { id: record.id }, LogCategory.SESSION);
     return record;
@@ -1136,6 +1314,21 @@ ${conversationText}
       logger.warn('项目知识库.Learning.已自动清理(访问时)', { count: this.learnings.length }, LogCategory.SESSION);
     }
     return this.learnings;
+  }
+
+  /**
+   * 删除经验记录
+   */
+  deleteLearning(id: string): boolean {
+    const index = this.learnings.findIndex(l => l.id === id);
+    if (index === -1) {
+      return false;
+    }
+
+    this.learnings.splice(index, 1);
+    this.saveLearnings();
+    logger.info('项目知识库.Learning.已删除', { id }, LogCategory.SESSION);
+    return true;
   }
 
   // ============================================================================
@@ -1170,12 +1363,16 @@ ${conversationText}
 
   /**
    * 构建本地搜索引擎索引（从 codeIndex 的文件列表复用）
+   * 首次调用创建实例，后续调用复用已有实例仅重建索引数据
    */
   private async buildSearchEngineIndex(): Promise<void> {
     if (!this.codeIndex || this.codeIndex.files.length === 0) return;
 
     try {
-      this.localSearchEngine = new LocalSearchEngine(this.projectRoot);
+      // 复用已有实例，避免丢失增量更新和外部引用
+      if (!this.localSearchEngine) {
+        this.localSearchEngine = new LocalSearchEngine(this.projectRoot, this.searchEngineConfig);
+      }
 
       // 传递 LLM 客户端用于查询扩展
       if (this.llmClient) {
@@ -1198,15 +1395,17 @@ ${conversationText}
   /**
    * 确保存储目录存在
    */
-  private ensureStorageDir(): void {
-    if (!fs.existsSync(this.storageDir)) {
-      fs.mkdirSync(this.storageDir, { recursive: true });
+  private async ensureStorageDir(): Promise<void> {
+    try {
+      await fs.promises.access(this.storageDir);
+    } catch {
+      await fs.promises.mkdir(this.storageDir, { recursive: true });
       logger.info('项目知识库.存储目录.已创建', { dir: this.storageDir }, LogCategory.SESSION);
     }
   }
 
   /**
-   * 保存代码索引
+   * 保存代码索引（异步）
    */
   private async saveCodeIndex(): Promise<void> {
     if (!this.codeIndex) {
@@ -1215,7 +1414,8 @@ ${conversationText}
 
     const filePath = path.join(this.storageDir, 'code-index.json');
     try {
-      fs.writeFileSync(filePath, JSON.stringify(this.codeIndex, null, 2), 'utf-8');
+      await this.ensureStorageDir();
+      await fs.promises.writeFile(filePath, JSON.stringify(this.codeIndex, null, 2), 'utf-8');
       logger.info('项目知识库.代码索引.已保存', { path: filePath }, LogCategory.SESSION);
     } catch (error) {
       logger.error('项目知识库.代码索引.保存失败', { error }, LogCategory.SESSION);
@@ -1223,49 +1423,42 @@ ${conversationText}
   }
 
   /**
-   * 加载代码索引
+   * 加载代码索引（异步）
    */
   private async loadCodeIndex(): Promise<void> {
     const filePath = path.join(this.storageDir, 'code-index.json');
-    if (!fs.existsSync(filePath)) {
-      return;
-    }
-
     try {
-      const content = fs.readFileSync(filePath, 'utf-8');
+      const content = await fs.promises.readFile(filePath, 'utf-8');
       this.codeIndex = JSON.parse(content);
       logger.info('项目知识库.代码索引.已加载', {
         files: this.codeIndex?.files.length || 0
       }, LogCategory.SESSION);
-    } catch (error) {
-      logger.error('项目知识库.代码索引.加载失败', { error }, LogCategory.SESSION);
+    } catch {
+      // 文件不存在或解析失败
     }
   }
 
   /**
-   * 保存 ADRs
+   * 保存 ADRs（异步，fire-and-forget）
    */
   private saveADRs(): void {
     const filePath = path.join(this.storageDir, 'adrs.json');
-    try {
-      fs.writeFileSync(filePath, JSON.stringify(this.adrs, null, 2), 'utf-8');
+    this.ensureStorageDir().then(() =>
+      fs.promises.writeFile(filePath, JSON.stringify(this.adrs, null, 2), 'utf-8')
+    ).then(() => {
       logger.info('项目知识库.ADR.已保存', { count: this.adrs.length }, LogCategory.SESSION);
-    } catch (error) {
+    }).catch(error => {
       logger.error('项目知识库.ADR.保存失败', { error }, LogCategory.SESSION);
-    }
+    });
   }
 
   /**
-   * 加载 ADRs
+   * 加载 ADRs（异步）
    */
   private async loadADRs(): Promise<void> {
     const filePath = path.join(this.storageDir, 'adrs.json');
-    if (!fs.existsSync(filePath)) {
-      return;
-    }
-
     try {
-      const content = fs.readFileSync(filePath, 'utf-8');
+      const content = await fs.promises.readFile(filePath, 'utf-8');
       const raw = JSON.parse(content);
       const { records, changed } = this.normalizeADRRecords(raw);
       this.adrs = records;
@@ -1275,48 +1468,46 @@ ${conversationText}
       } else {
         logger.info('项目知识库.ADR.已加载', { count: this.adrs.length }, LogCategory.SESSION);
       }
-    } catch (error) {
-      logger.error('项目知识库.ADR.加载失败', { error }, LogCategory.SESSION);
+    } catch {
+      // 文件不存在或解析失败
     }
   }
 
   /**
-   * 保存 FAQs
+   * 保存 FAQs（异步，fire-and-forget）
    */
   private saveFAQs(): void {
     const filePath = path.join(this.storageDir, 'faqs.json');
-    try {
-      fs.writeFileSync(filePath, JSON.stringify(this.faqs, null, 2), 'utf-8');
+    this.ensureStorageDir().then(() =>
+      fs.promises.writeFile(filePath, JSON.stringify(this.faqs, null, 2), 'utf-8')
+    ).then(() => {
       logger.info('项目知识库.FAQ.已保存', { count: this.faqs.length }, LogCategory.SESSION);
-    } catch (error) {
+    }).catch(error => {
       logger.error('项目知识库.FAQ.保存失败', { error }, LogCategory.SESSION);
-    }
+    });
   }
 
   /**
-   * 保存经验记录
+   * 保存经验记录（异步，fire-and-forget）
    */
   private saveLearnings(): void {
     const filePath = path.join(this.storageDir, 'learnings.json');
-    try {
-      fs.writeFileSync(filePath, JSON.stringify(this.learnings, null, 2), 'utf-8');
+    this.ensureStorageDir().then(() =>
+      fs.promises.writeFile(filePath, JSON.stringify(this.learnings, null, 2), 'utf-8')
+    ).then(() => {
       logger.info('项目知识库.Learning.已保存', { count: this.learnings.length }, LogCategory.SESSION);
-    } catch (error) {
+    }).catch(error => {
       logger.error('项目知识库.Learning.保存失败', { error }, LogCategory.SESSION);
-    }
+    });
   }
 
   /**
-   * 加载 FAQs
+   * 加载 FAQs（异步）
    */
   private async loadFAQs(): Promise<void> {
     const filePath = path.join(this.storageDir, 'faqs.json');
-    if (!fs.existsSync(filePath)) {
-      return;
-    }
-
     try {
-      const content = fs.readFileSync(filePath, 'utf-8');
+      const content = await fs.promises.readFile(filePath, 'utf-8');
       const raw = JSON.parse(content);
       const { records, changed } = this.normalizeFAQRecords(raw);
       this.faqs = records;
@@ -1326,22 +1517,18 @@ ${conversationText}
       } else {
         logger.info('项目知识库.FAQ.已加载', { count: this.faqs.length }, LogCategory.SESSION);
       }
-    } catch (error) {
-      logger.error('项目知识库.FAQ.加载失败', { error }, LogCategory.SESSION);
+    } catch {
+      // 文件不存在或解析失败
     }
   }
 
   /**
-   * 加载经验记录
+   * 加载经验记录（异步）
    */
   private async loadLearnings(): Promise<void> {
     const filePath = path.join(this.storageDir, 'learnings.json');
-    if (!fs.existsSync(filePath)) {
-      return;
-    }
-
     try {
-      const content = fs.readFileSync(filePath, 'utf-8');
+      const content = await fs.promises.readFile(filePath, 'utf-8');
       const raw = JSON.parse(content);
       const { records, changed } = this.normalizeLearningRecords(raw);
       this.learnings = records;
@@ -1351,8 +1538,8 @@ ${conversationText}
       } else {
         logger.info('项目知识库.Learning.已加载', { count: this.learnings.length }, LogCategory.SESSION);
       }
-    } catch (error) {
-      logger.error('项目知识库.Learning.加载失败', { error }, LogCategory.SESSION);
+    } catch {
+      // 文件不存在或解析失败
     }
   }
 
@@ -1514,5 +1701,33 @@ ${conversationText}
       if (!((item as any).id)) changed = true;
     });
     return { records, changed };
+  }
+
+  /**
+   * 文本相似度计算（基于 bigram 重叠率）
+   * 返回 0~1 之间的相似度值
+   */
+  private textSimilarity(a: string, b: string): number {
+    const normalize = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
+    const na = normalize(a);
+    const nb = normalize(b);
+    if (na === nb) return 1;
+    if (na.length < 2 || nb.length < 2) return 0;
+
+    const bigrams = (s: string): Set<string> => {
+      const set = new Set<string>();
+      for (let i = 0; i < s.length - 1; i++) {
+        set.add(s.substring(i, i + 2));
+      }
+      return set;
+    };
+
+    const setA = bigrams(na);
+    const setB = bigrams(nb);
+    let intersection = 0;
+    for (const bg of setA) {
+      if (setB.has(bg)) intersection++;
+    }
+    return (2 * intersection) / (setA.size + setB.size);
   }
 }

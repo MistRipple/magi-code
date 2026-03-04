@@ -105,14 +105,13 @@
   });
 
   // Model Tab 状态
-  let modelConfigTab = $state<'orch' | 'comp' | 'ace'>('orch');
+  let modelConfigTab = $state<'orch' | 'comp'>('orch');
   let workerModelTab = $state<'claude' | 'codex' | 'gemini'>('claude');
 
   // 测试连接状态: 'idle' | 'testing' | 'success' | 'error'
   let testStatus = $state<Record<string, 'idle' | 'testing' | 'success' | 'error'>>({
     orch: 'idle',
     comp: 'idle',
-    ace: 'idle',
     claude: 'idle',
     codex: 'idle',
     gemini: 'idle'
@@ -170,7 +169,6 @@
   let saveStatus = $state<Record<string, 'idle' | 'saving' | 'saved' | 'error'>>({
     orch: 'idle',
     comp: 'idle',
-    ace: 'idle',
     claude: 'idle',
     codex: 'idle',
     gemini: 'idle',
@@ -189,7 +187,6 @@
   // 模型配置表单
   let orchConfig = $state({ baseUrl: '', apiKey: '', model: '', provider: 'anthropic', thinking: false, reasoningEffort: 'medium' });
   let compConfig = $state({ baseUrl: '', apiKey: '', model: '', provider: 'anthropic' });
-  let aceConfig = $state({ url: '', key: '' });
   let workerConfigs = $state<Record<string, { baseUrl: string; apiKey: string; model: string; provider: string; enabled: boolean; thinking: boolean; reasoningEffort: string }>>({
     claude: { baseUrl: '', apiKey: '', model: '', provider: 'anthropic', enabled: true, thinking: false, reasoningEffort: 'medium' },
     codex: { baseUrl: '', apiKey: '', model: '', provider: 'openai', enabled: true, thinking: false, reasoningEffort: 'medium' },
@@ -197,7 +194,7 @@
   });
 
   // API Key 明文可见状态
-  let keyVisible = $state<Record<string, boolean>>({ orch: false, comp: false, ace: false, worker: false });
+  let keyVisible = $state<Record<string, boolean>>({ orch: false, comp: false, worker: false });
 
   // Tools Tab 状态 - MCP 服务器完整结构（与后端 MCPServerConfig 对齐）
   interface MCPServer {
@@ -211,7 +208,13 @@
     headers?: Record<string, string>;
     enabled: boolean;
     connected?: boolean;
+    health?: 'connected' | 'degraded' | 'disconnected';
     error?: string;
+    toolCount?: number;
+    reconnectAttempts?: number;
+    lastCheckedAt?: number;
+    lastReconnectAt?: number;
+    lastReconnectSuccessfulAt?: number;
   }
   let mcpServers = $state<MCPServer[]>([]);
   let mcpExpandedServer = $state<string | null>(null);
@@ -507,7 +510,7 @@
       codex: { status: 'checking' },
       gemini: { status: 'checking' },
       orchestrator: { status: 'checking' },
-      compressor: { status: 'checking' }
+      auxiliary: { status: 'checking' }
     };
     vscode.postMessage({ type: 'checkWorkerStatus', force: true });
     // 30秒超时保护，防止状态卡住
@@ -579,21 +582,19 @@
     vscode.postMessage({ type: 'resetProfileConfig' });
   }
 
-  function testModelConnection(target: 'orch' | 'comp' | 'ace' | 'worker') {
+  function testModelConnection(target: 'orch' | 'comp' | 'worker') {
     // 设置测试中状态
     const statusKey = target === 'worker' ? workerModelTab : target;
     testStatus[statusKey] = 'testing';
     testStatus = { ...testStatus };
 
-    // 后端使用 testWorkerConnection / testOrchestratorConnection / testCompressorConnection / testPromptEnhance
+    // 后端使用 testWorkerConnection / testOrchestratorConnection / testAuxiliaryConnection
     if (target === 'worker') {
       vscode.postMessage({ type: 'testWorkerConnection', worker: workerModelTab, config: workerConfigs[workerModelTab] });
     } else if (target === 'orch') {
       vscode.postMessage({ type: 'testOrchestratorConnection', config: orchConfig });
     } else if (target === 'comp') {
-      vscode.postMessage({ type: 'testCompressorConnection', config: compConfig });
-    } else if (target === 'ace') {
-      vscode.postMessage({ type: 'testPromptEnhance', baseUrl: aceConfig.url, apiKey: aceConfig.key });
+      vscode.postMessage({ type: 'testAuxiliaryConnection', config: compConfig });
     }
   }
 
@@ -653,7 +654,7 @@
   }
 
 
-  function saveModelConfig(target: 'orch' | 'comp' | 'ace' | 'worker') {
+  function saveModelConfig(target: 'orch' | 'comp' | 'worker') {
     const key = target === 'worker' ? workerModelTab : target;
 
     // 设置保存中状态
@@ -672,14 +673,7 @@
         enableThinking: orchConfig.thinking, reasoningEffort: orchConfig.reasoningEffort
       }});
     } else if (target === 'comp') {
-      vscode.postMessage({ type: 'saveCompressorConfig', config: compConfig });
-    } else if (target === 'ace') {
-      // 统一使用 updatePromptEnhance 消息类型，转换字段名
-      vscode.postMessage({
-        type: 'updatePromptEnhance',
-        config: { enabled: true, baseUrl: aceConfig.url, apiKey: aceConfig.key },
-        source: 'manual'
-      });
+      vscode.postMessage({ type: 'saveAuxiliaryConfig', config: compConfig });
     }
 
     // 模拟保存成功（实际应该通过消息回调）
@@ -936,6 +930,12 @@
     }
   }
 
+  function getMCPHealthLabel(server: MCPServer): string {
+    if (server.health === 'connected') return '已连接';
+    if (server.health === 'degraded') return '连接降级';
+    return '已断开';
+  }
+
   // ============================================
   // 仓库管理操作函数
   // ============================================
@@ -1172,23 +1172,14 @@
           };
         }
       }
-      // 压缩模型配置加载
-      else if (dataType === 'compressorConfigLoaded') {
+      // 辅助模型配置加载
+      else if (dataType === 'auxiliaryConfigLoaded') {
         if (payload?.config) {
           compConfig = {
             baseUrl: payload.config.baseUrl || '',
             apiKey: payload.config.apiKey || '',
             model: payload.config.model || '',
             provider: payload.config.provider || 'anthropic'
-          };
-        }
-      }
-      // ACE 配置加载
-      else if (dataType === 'promptEnhanceConfigLoaded') {
-        if (payload?.config) {
-          aceConfig = {
-            url: payload.config.baseUrl || '',
-            key: payload.config.apiKey || ''
           };
         }
       }
@@ -1245,14 +1236,14 @@
         testStatus = { ...testStatus };
         resetTestStatus('orch');
       }
-      // 压缩模型连接测试结果 - 更新统计 Tab 状态和测试按钮状态
-      else if (dataType === 'compressorConnectionTestResult') {
+      // 辅助模型连接测试结果 - 更新统计 Tab 状态和测试按钮状态
+      else if (dataType === 'auxiliaryConnectionTestResult') {
         if (payload?.success) {
           appState.modelStatus = {
             ...appState.modelStatus,
-            compressor: {
+            auxiliary: {
               status: 'available',
-              model: compConfig.model || modelStatuses.compressor?.model
+              model: compConfig.model || modelStatuses.auxiliary?.model
             }
           };
           testStatus.comp = 'success';
@@ -1260,9 +1251,9 @@
           const orchestratorModel = payload?.orchestratorModel || modelStatuses.orchestrator?.model;
           appState.modelStatus = {
             ...appState.modelStatus,
-            compressor: {
+            auxiliary: {
               status: 'orchestrator',
-              model: orchestratorModel ? `编排模型: ${orchestratorModel}` : modelStatuses.compressor?.model,
+              model: orchestratorModel ? `编排模型: ${orchestratorModel}` : modelStatuses.auxiliary?.model,
               error: payload?.error
             }
           };
@@ -1270,16 +1261,6 @@
         }
         testStatus = { ...testStatus };
         resetTestStatus('comp');
-      }
-      // ACE 连接测试结果
-      else if (dataType === 'promptEnhanceResult') {
-        if (payload?.success) {
-          testStatus.ace = 'success';
-        } else {
-          testStatus.ace = 'error';
-        }
-        testStatus = { ...testStatus };
-        resetTestStatus('ace');
       }
       // 模型列表获取结果
       else if (dataType === 'modelListFetched') {
@@ -1320,8 +1301,16 @@
             url: s.url || '',
             headers: s.headers || {},
             enabled: s.enabled !== false,
-            connected: s.connected || false,
-            error: s.error
+            connected: s.connected === true,
+            health: s.health === 'connected' || s.health === 'degraded' || s.health === 'disconnected'
+              ? s.health
+              : (s.connected === true ? 'connected' : 'disconnected'),
+            error: typeof s.error === 'string' ? s.error : undefined,
+            toolCount: Number.isFinite(s.toolCount) ? Number(s.toolCount) : 0,
+            reconnectAttempts: Number.isFinite(s.reconnectAttempts) ? Number(s.reconnectAttempts) : 0,
+            lastCheckedAt: Number.isFinite(s.lastCheckedAt) ? Number(s.lastCheckedAt) : undefined,
+            lastReconnectAt: Number.isFinite(s.lastReconnectAt) ? Number(s.lastReconnectAt) : undefined,
+            lastReconnectSuccessfulAt: Number.isFinite(s.lastReconnectSuccessfulAt) ? Number(s.lastReconnectSuccessfulAt) : undefined
           };
         });
       }
@@ -1470,8 +1459,7 @@
     vscode.postMessage({ type: 'getProfileConfig' });
     vscode.postMessage({ type: 'loadAllWorkerConfigs' });
     vscode.postMessage({ type: 'loadOrchestratorConfig' });
-    vscode.postMessage({ type: 'loadCompressorConfig' });
-    vscode.postMessage({ type: 'getPromptEnhanceConfig' }); // 加载 ACE 配置
+    vscode.postMessage({ type: 'loadAuxiliaryConfig' });
     vscode.postMessage({ type: 'loadMCPServers' });
     vscode.postMessage({ type: 'loadSkillsConfig' });
     vscode.postMessage({ type: 'loadRepositories' });
@@ -1529,16 +1517,18 @@
               <div class="settings-summary-chip">输入 Token: {formatTokens(totalInputTokens)}</div>
               <div class="settings-summary-chip">输出 Token: {formatTokens(totalOutputTokens)}</div>
               <div class="settings-summary-chip">总 Token: {formatTokens(totalTokens)}</div>
-              <button class="model-refresh-btn" class:loading={isRefreshing} onclick={refreshConnections} disabled={isRefreshing}>
-                <Icon name="refresh" size={14} />
-                {isRefreshing ? '检测中...' : '检测'}
-              </button>
-              <button class="settings-btn secondary" onclick={showResetConfirmDialog}>重置 Token</button>
+              <div class="stats-action-buttons">
+                <button class="model-refresh-btn" class:loading={isRefreshing} onclick={refreshConnections} disabled={isRefreshing}>
+                  <Icon name="refresh" size={14} />
+                  {isRefreshing ? '检测中...' : '检测'}
+                </button>
+                <button class="settings-btn secondary" onclick={showResetConfirmDialog}>重置 Token</button>
+              </div>
             </div>
           </div>
 
           <div class="model-connection-list">
-            {#each ['orchestrator', 'compressor', 'claude', 'codex', 'gemini'] as worker}
+            {#each ['orchestrator', 'auxiliary', 'claude', 'codex', 'gemini'] as worker}
               {@const status = modelStatuses[worker]}
               {@const workerStats = getWorkerStats(worker)}
               {@const statusClass = getStatusClass(status?.status || 'checking')}
@@ -1555,8 +1545,8 @@
                 <div class="model-connection-info">
                   <div class="model-connection-header">
                     <span class="model-connection-name">
-                      {worker === 'orchestrator' ? '编排模型' : worker === 'compressor' ? '压缩模型' : worker.charAt(0).toUpperCase() + worker.slice(1)}
-                      {#if worker === 'orchestrator' || worker === 'compressor'}
+                      {worker === 'orchestrator' ? '编排模型' : worker === 'auxiliary' ? '辅助模型' : worker.charAt(0).toUpperCase() + worker.slice(1)}
+                      {#if worker === 'orchestrator' || worker === 'auxiliary'}
                         <span class="required-badge">必需</span>
                       {/if}
                     </span>
@@ -1588,8 +1578,7 @@
           <div class="model-config-stack">
             <div class="model-config-tabs">
               <button class="model-config-tab" class:active={modelConfigTab === 'orch'} onclick={() => modelConfigTab = 'orch'}>编排模型</button>
-              <button class="model-config-tab" class:active={modelConfigTab === 'comp'} onclick={() => modelConfigTab = 'comp'}>压缩模型</button>
-              <button class="model-config-tab" class:active={modelConfigTab === 'ace'} onclick={() => modelConfigTab = 'ace'}>ACE配置</button>
+              <button class="model-config-tab" class:active={modelConfigTab === 'comp'} onclick={() => modelConfigTab = 'comp'}>辅助模型</button>
             </div>
 
             {#if modelConfigTab === 'orch'}
@@ -1708,8 +1697,8 @@
             {:else if modelConfigTab === 'comp'}
               <div class="model-config-card">
                 <div class="model-config-header">
-                  <div class="model-config-title">压缩模型</div>
-                  <div class="model-config-desc">用于上下文压缩与知识提取</div>
+                  <div class="model-config-title">辅助模型</div>
+                  <div class="model-config-desc">用于上下文压缩、知识提取与查询扩展</div>
                 </div>
                 <!-- svelte-ignore a11y_label_has_associated_control -->
                 <div class="llm-config-form">
@@ -1802,74 +1791,8 @@
                   </div>
                 </div>
               </div>
-            {:else if modelConfigTab === 'ace'}
-              <div class="model-config-card">
-                <div class="model-config-header">
-                  <div class="model-config-title">ACE 配置</div>
-                  <div class="model-config-desc">Augment 工具的接口与密钥配置</div>
-                </div>
-                <!-- svelte-ignore a11y_label_has_associated_control -->
-                <div class="llm-config-form">
-                  <div class="llm-config-field">
-                    <label class="llm-config-label">API 地址</label>
-                    <input type="text" class="llm-config-input" bind:value={aceConfig.url} placeholder="https://api.example.com/v1">
-                  </div>
-                  <div class="llm-config-field">
-                    <label class="llm-config-label">API 密钥</label>
-                    <div class="api-key-wrapper">
-                      <input type={keyVisible.ace ? 'text' : 'password'} class="llm-config-input api-key-input" bind:value={aceConfig.key} placeholder="sk-...">
-                      <button type="button" class="api-key-toggle" onclick={() => keyVisible.ace = !keyVisible.ace} title={keyVisible.ace ? '隐藏密钥' : '显示密钥'}>
-                        <Icon name={keyVisible.ace ? 'eye-slash' : 'eye'} size={14} />
-                      </button>
-                    </div>
-                  </div>
-                  <div class="llm-config-actions">
-                    <button
-                      class="llm-config-save-btn"
-                      class:saving={saveStatus.ace === 'saving'}
-                      class:saved={saveStatus.ace === 'saved'}
-                      onclick={() => saveModelConfig('ace')}
-                      disabled={saveStatus.ace === 'saving'}
-                    >
-                      {#if saveStatus.ace === 'saving'}
-                        <Icon name="refresh" size={14} />
-                        保存中...
-                      {:else if saveStatus.ace === 'saved'}
-                        <Icon name="check" size={14} />
-                        已保存
-                      {:else}
-                        保存配置
-                      {/if}
-                    </button>
-                    <button
-                      class="llm-config-test-btn"
-                      class:testing={testStatus.ace === 'testing'}
-                      class:success={testStatus.ace === 'success'}
-                      class:error={testStatus.ace === 'error'}
-                      onclick={() => testModelConnection('ace')}
-                      disabled={testStatus.ace === 'testing'}
-                    >
-                      {#if testStatus.ace === 'testing'}
-                        <Icon name="refresh" size={14} />
-                        测试中...
-                      {:else if testStatus.ace === 'success'}
-                        <Icon name="check" size={14} />
-                        连接成功
-                      {:else if testStatus.ace === 'error'}
-                        <Icon name="close" size={14} />
-                        连接失败
-                      {:else}
-                        <Icon name="check" size={14} />
-                        测试连接
-                      {/if}
-                    </button>
-                  </div>
-                </div>
-              </div>
             {/if}
           </div>
-
-          <!-- Worker 模型配置 -->
           <div class="model-config-card">
             <div class="model-config-header-row">
               <div class="model-config-title">Worker 模型</div>
@@ -2178,6 +2101,15 @@
                       <span class="mcp-server-badge" class:enabled={server.enabled} class:disabled={!server.enabled}>
                         {server.enabled ? '已启用' : '已禁用'}
                       </span>
+                      <span
+                        class="mcp-server-badge mcp-server-health-badge"
+                        class:connected={server.health === 'connected'}
+                        class:degraded={server.health === 'degraded'}
+                        class:disconnected={server.health === 'disconnected' || !server.health}
+                        title={server.error || getMCPHealthLabel(server)}
+                      >
+                        {getMCPHealthLabel(server)}
+                      </span>
                       <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
                       <span onclick={(e) => e.stopPropagation()}>
                         <Toggle
@@ -2201,6 +2133,13 @@
                   </div>
                   {#if mcpExpandedServer === server.id}
                     <div class="mcp-tools-panel">
+                      <div class="mcp-server-runtime">
+                        <span>状态: {getMCPHealthLabel(server)}</span>
+                        <span>重连次数: {server.reconnectAttempts || 0}</span>
+                        {#if server.error}
+                          <span class="mcp-server-runtime-error" title={server.error}>最近错误: {server.error}</span>
+                        {/if}
+                      </div>
                       <div class="mcp-tools-header">
                         <span>工具列表 {mcpServerTools[server.id]?.length ? `(${mcpServerTools[server.id].length})` : ''}</span>
                         <button class="btn-icon btn-icon--sm" class:refreshing={mcpRefreshingServers.has(server.id)} title="刷新工具"
@@ -2781,6 +2720,14 @@
   /* 统计 Tab 专用样式 */
   .stats-section { padding: var(--space-4); }
   .stats-section .settings-section-header { margin-bottom: var(--space-3); }
+  .stats-section .settings-section-actions { width: 100%; }
+
+  .stats-action-buttons {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-left: auto;
+  }
 
   .settings-summary-chip {
     height: var(--btn-height-sm);
@@ -2847,7 +2794,7 @@
   .model-connection-icon.codex { background: var(--color-codex-muted); color: var(--color-codex); }
   .model-connection-icon.gemini { background: var(--color-gemini-muted); color: var(--color-gemini); }
   .model-connection-icon.orchestrator { background: var(--color-orchestrator-muted); color: var(--color-orchestrator); }
-  .model-connection-icon.compressor { background: var(--color-compressor-muted); color: var(--color-compressor); }
+  .model-connection-icon.auxiliary { background: var(--color-auxiliary-muted); color: var(--color-auxiliary); }
 
   .model-connection-info { min-width: 0; overflow: hidden; flex: 1; }
 
@@ -3330,10 +3277,28 @@
   .mcp-server-badge { padding: 2px 8px; font-size: var(--text-xs); border-radius: var(--radius-full); white-space: nowrap; }
   .mcp-server-badge.enabled { background: var(--success-muted); color: var(--success); }
   .mcp-server-badge.disabled { background: var(--surface-3); color: var(--foreground-muted); }
+  .mcp-server-health-badge.connected { background: var(--success-muted); color: var(--success); }
+  .mcp-server-health-badge.degraded { background: var(--warning-muted); color: var(--warning); }
+  .mcp-server-health-badge.disconnected { background: var(--error-muted); color: var(--error); }
   .mcp-expand-icon { transition: transform var(--transition-fast); display: flex; color: var(--foreground-muted); margin-left: var(--space-1); }
   .mcp-expand-icon.expanded { transform: rotate(180deg); }
 
   .mcp-tools-panel { border-top: 1px solid var(--border); padding: var(--space-3) var(--space-4); background: var(--surface-1); max-height: 280px; overflow-y: auto; }
+  .mcp-server-runtime {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    margin-bottom: var(--space-2);
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  .mcp-server-runtime-error {
+    color: var(--error);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .mcp-tools-header { display: flex; justify-content: space-between; align-items: center; font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground-muted); margin-bottom: var(--space-2); }
   .mcp-tools-list { display: flex; flex-direction: column; gap: var(--space-2); }
 
