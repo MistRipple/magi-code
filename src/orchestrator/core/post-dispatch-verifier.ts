@@ -53,6 +53,9 @@ export async function runPostDispatchVerification(
   messageHub.progress('Verification', `正在执行验收检查（${modifiedFiles.length} 个修改文件）...`);
   const verificationResult = await verificationRunner.runVerification(batch.id, modifiedFiles);
   if (verificationResult.success) {
+    if (verificationResult.warnings && verificationResult.warnings.length > 0) {
+      messageHub.notify(`验收告警：${verificationResult.warnings.join('；')}`, 'warning');
+    }
     messageHub.orchestratorMessage(`验收通过：${verificationResult.summary}`);
     return;
   }

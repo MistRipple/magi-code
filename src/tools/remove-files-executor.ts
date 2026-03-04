@@ -21,6 +21,8 @@ export class RemoveFilesExecutor implements ToolExecutor {
 
   /** 文件删除前回调（用于快照系统在删除前保存原始内容） */
   private onBeforeWrite?: (filePath: string) => void;
+  /** 文件删除后回调（用于 UI 实时刷新待处理变更） */
+  private onAfterWrite?: (filePath: string) => void;
 
   constructor(workspaceRoots: WorkspaceRoots) {
     this.workspaceRoots = workspaceRoots;
@@ -31,6 +33,13 @@ export class RemoveFilesExecutor implements ToolExecutor {
    */
   setBeforeWriteCallback(callback: (filePath: string) => void): void {
     this.onBeforeWrite = callback;
+  }
+
+  /**
+   * 设置文件删除后回调
+   */
+  setAfterWriteCallback(callback: (filePath: string) => void): void {
+    this.onAfterWrite = callback;
   }
 
   /**
@@ -131,6 +140,7 @@ IMPORTANT:
 
         // 删除文件
         await fs.unlink(resolved);
+        this.onAfterWrite?.(resolved);
 
         results.push(`✓ ${filePath}: deleted`);
         successCount++;

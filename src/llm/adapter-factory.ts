@@ -17,7 +17,7 @@
 
 import { EventEmitter } from 'events';
 import * as vscode from 'vscode';
-import { AgentType, WorkerSlot, TokenUsage } from '../types/agent-types';
+import { AgentType, LLMConfig, WorkerSlot, TokenUsage } from '../types/agent-types';
 import { BaseLLMAdapter } from './adapters/base-adapter';
 import { WorkerLLMAdapter, WorkerAdapterConfig, getStallDetectionPreset } from './adapters/worker-adapter';
 import { OrchestratorLLMAdapter, OrchestratorAdapterConfig } from './adapters/orchestrator-adapter';
@@ -34,6 +34,7 @@ import { ProfileLoader } from '../orchestrator/profile/profile-loader';
 import { ADAPTER_EVENTS } from '../protocol/event-names';
 import { EnvironmentContextProvider } from '../context/environment-context-provider';
 import { WorkspaceFolderInfo } from '../workspace/workspace-roots';
+import { runIntentDrivenFileEdit } from './utils/intent-file-editor';
 
 /**
  * LLM 适配器工厂
@@ -59,6 +60,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
    * 必须在创建 Adapter 之前通过 setMessageHub() 设置
    */
   private messageHub: MessageHub | null = null;
+  private static readonly FILE_EDIT_WORKER_ORDER: WorkerSlot[] = ['claude', 'codex', 'gemini'];
 
   constructor(options: { cwd: string; workspaceFolders?: WorkspaceFolderInfo[] }) {
     super();
@@ -67,6 +69,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       workspaceFolders: options.workspaceFolders,
     });
     this.profileLoader = ProfileLoader.getInstance();
+    this.registerIntentDrivenFileEditHandler();
 
     // 创建环境上下文提供者并注入 ToolManager
     this.environmentContextProvider = new EnvironmentContextProvider({
@@ -75,6 +78,65 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     this.environmentContextProvider.setToolManager(this.toolManager);
 
     logger.info('LLM Adapter Factory initialized', { cwd: options.cwd }, LogCategory.LLM);
+  }
+
+  /**
+   * 在工厂初始化阶段注册 file_edit 的意图编辑回调。
+   * 不再依赖 WorkerAdapter 创建时机，确保编排阶段也可直接使用 file_edit。
+   */
+  private registerIntentDrivenFileEditHandler(): void {
+    this.toolManager.setLlmEditHandler(async (filePath, fileContent, summary, detailedDesc) => {
+      const selection = this.resolveIntentDrivenFileEditModel();
+      if (!selection) {
+        throw new Error('No available LLM configuration for file_edit. Please enable at least one model (auxiliary/worker/orchestrator) with valid apiKey/baseUrl/model.');
+      }
+
+      logger.debug('file_edit.intent.model.selected', {
+        source: selection.source,
+        provider: selection.config.provider,
+        model: selection.config.model,
+      }, LogCategory.LLM);
+
+      const client = createLLMClient(selection.config);
+      return runIntentDrivenFileEdit(client, {
+        filePath,
+        fileContent,
+        summary,
+        detailedDescription: detailedDesc,
+      });
+    });
+  }
+
+  private resolveIntentDrivenFileEditModel(): { source: string; config: LLMConfig } | null {
+    const fullConfig = LLMConfigLoader.loadFullConfig();
+
+    if (this.isEditableModelConfig(fullConfig.auxiliary)) {
+      return { source: 'auxiliary', config: fullConfig.auxiliary };
+    }
+
+    for (const worker of LLMAdapterFactory.FILE_EDIT_WORKER_ORDER) {
+      const workerConfig = fullConfig.workers?.[worker];
+      if (this.isEditableModelConfig(workerConfig)) {
+        return { source: `worker:${worker}`, config: workerConfig };
+      }
+    }
+
+    if (this.isEditableModelConfig(fullConfig.orchestrator)) {
+      return { source: 'orchestrator', config: fullConfig.orchestrator };
+    }
+
+    return null;
+  }
+
+  private isEditableModelConfig(config: LLMConfig | null | undefined): config is LLMConfig {
+    if (!config || config.enabled === false) {
+      return false;
+    }
+    const apiKey = typeof config.apiKey === 'string' ? config.apiKey.trim() : '';
+    const model = typeof config.model === 'string' ? config.model.trim() : '';
+    const baseUrl = typeof config.baseUrl === 'string' ? config.baseUrl.trim() : '';
+    const providerValid = config.provider === 'openai' || config.provider === 'anthropic';
+    return Boolean(apiKey && model && baseUrl && providerValid);
   }
 
   /**

@@ -169,6 +169,9 @@
               {#if task.todoTotal > 0}
                 <span class="task-count">{task.todoCompleted}/{task.todoTotal}</span>
               {/if}
+              {#if task.status === 'failed' && task.failureReason}
+                <span class="task-error" title={task.failureReason}>{task.failureReason}</span>
+              {/if}
             </div>
             <!-- 操作按钮（hover 显示） -->
             <div class="task-actions">
@@ -464,6 +467,15 @@
     background: var(--surface-3);
     border-radius: var(--radius-full);
     flex-shrink: 0;
+  }
+
+  .task-error {
+    font-size: var(--text-2xs);
+    color: var(--error);
+    max-width: 60%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   /* ========== 操作按钮 ========== */

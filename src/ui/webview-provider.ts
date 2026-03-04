@@ -1223,6 +1223,24 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         this.sendStateUpdate();
         break;
 
+      case 'revertMission':
+        // 撤销指定轮次（Mission）的所有变更
+        {
+          const targetMissionId = message.missionId;
+          if (!targetMissionId) {
+            this.sendToast('缺少 missionId', 'warning');
+            break;
+          }
+          const result = this.snapshotManager.revertMission(targetMissionId);
+          if (result.reverted > 0) {
+            this.sendToast(`已撤销本轮 ${result.reverted} 个文件变更`, 'info');
+          } else {
+            this.sendToast('没有可撤销的变更', 'info');
+          }
+        }
+        this.sendStateUpdate();
+        break;
+
       case 'viewDiff':
         // 在 VS Code 原生 diff 视图中查看变更（类似 Augment）
         await this.openVscodeDiff(message.filePath);
@@ -2925,18 +2943,53 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         completedAt: tv.completedAt,
         progress: tv.progress,
         missionId: tv.missionId,
+        failureReason: tv.failureReason,
       }));
     }
 
     const engineRunning = this.orchestratorEngine.running;
-    const displayTasks = engineRunning
-      ? tasks
-      : tasks.map((task) => task?.status === 'running' ? { ...task, status: 'cancelled' as const } : task);
+    const sortedTasks = [...tasks].sort((a, b) => {
+      const aTs = Number(a?.startedAt || a?.createdAt || 0);
+      const bTs = Number(b?.startedAt || b?.createdAt || 0);
+      return bTs - aTs;
+    });
+    const runningCandidates = sortedTasks.filter(task => task?.status === 'running');
+    const activeRunningTaskId = engineRunning && runningCandidates.length > 0
+      ? [...runningCandidates].sort((a, b) => {
+          const aTs = Number(a?.startedAt || a?.createdAt || 0);
+          const bTs = Number(b?.startedAt || b?.createdAt || 0);
+          return bTs - aTs;
+        })[0]?.id
+      : undefined;
+    const displayTasks = sortedTasks.map((task) => {
+      if (!task || task.status !== 'running') {
+        return task;
+      }
+      if (!engineRunning) {
+        return { ...task, status: 'cancelled' as const };
+      }
+      if (activeRunningTaskId && task.id === activeRunningTaskId) {
+        return task;
+      }
+      const subTasks = Array.isArray(task.subTasks) ? task.subTasks : [];
+      if (subTasks.length === 0) {
+        return { ...task, status: 'pending' as const };
+      }
+      const allDone = subTasks.every((subTask: any) => subTask?.status === 'completed' || subTask?.status === 'skipped');
+      if (allDone) {
+        return { ...task, status: 'completed' as const };
+      }
+      const hasFailed = subTasks.some((subTask: any) => subTask?.status === 'failed');
+      if (hasFailed) {
+        return { ...task, status: 'failed' as const };
+      }
+      return { ...task, status: 'pending' as const };
+    });
 
     this.assertValidArray<any>(displayTasks, 'uiState.tasks');
     const currentTask = engineRunning
-      ? (displayTasks.find(t => t?.status === 'running') ?? displayTasks[displayTasks.length - 1])
-      : displayTasks[displayTasks.length - 1];
+      ? (displayTasks.find(t => t?.status === 'running') ?? displayTasks[0])
+      : displayTasks[0];
 
     // 使用轻量级的会话元数据（而不是完整会话数据）
     const sessionMetas = this.sessionManager.getSessionMetas();

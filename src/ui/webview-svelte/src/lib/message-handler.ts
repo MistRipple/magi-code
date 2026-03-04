@@ -435,18 +435,11 @@ function handleStateUpdate(message: WebviewMessage) {
         subTasks,
         progress: typeof raw.progress === 'number' ? raw.progress : 0,
         missionId: typeof raw.missionId === 'string' ? raw.missionId : id,
+        failureReason: typeof raw.failureReason === 'string' ? raw.failureReason : undefined,
       } satisfies Task;
     });
-  const editSeen = new Set<string>();
   store.edits = ensureArray(state.pendingChanges)
     .filter((change): change is Edit => !!change && typeof change === 'object' && typeof (change as Edit).filePath === 'string' && !!(change as Edit).filePath)
-    .filter((change) => {
-      if (editSeen.has(change.filePath)) {
-        return false;
-      }
-      editSeen.add(change.filePath);
-      return true;
-    })
     .map((change) => {
       // 推断变更类型：后端 PendingChange 不含 type，根据增删行数推断
       let inferredType = change.type;
@@ -459,11 +452,13 @@ function handleStateUpdate(message: WebviewMessage) {
       }
       return {
         filePath: change.filePath,
+        snapshotId: change.snapshotId,
         type: inferredType,
         additions: change.additions,
         deletions: change.deletions,
         contributors: change.contributors,
         workerId: change.workerId,
+        missionId: change.missionId,
       };
     });
   if (Array.isArray((state as any).workerStatuses)) {

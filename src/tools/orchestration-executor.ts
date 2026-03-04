@@ -524,20 +524,20 @@ export class OrchestrationExecutor {
       };
     }
 
-    const args = toolCall.arguments as { tasks?: Record<string, any>[] };
-
-    if (!Array.isArray(args.tasks) || args.tasks.length === 0) {
+    const normalizedTasks = this.normalizeDispatchTasks(toolCall.arguments);
+    if (!normalizedTasks.ok) {
       return {
         toolCallId: toolCall.id,
-        content: 'Error: tasks 必须是至少包含 1 个元素的数组',
+        content: `Error: ${normalizedTasks.error}`,
         isError: true,
       };
     }
+    const tasks = normalizedTasks.tasks;
 
     // 阶段 1：全量验证（任一任务校验失败则整批拒绝，避免部分派发）
     const validatedParams: Parameters<DispatchTaskHandler>[0][] = [];
-    for (let i = 0; i < args.tasks.length; i++) {
-      const validation = this.validateSingleTaskArgs(args.tasks[i], i);
+    for (let i = 0; i < tasks.length; i++) {
+      const validation = this.validateSingleTaskArgs(tasks[i], i);
       if (!validation.ok) {
         return {
           toolCallId: toolCall.id,
@@ -574,6 +574,51 @@ export class OrchestrationExecutor {
         isError: true,
       };
     }
+  }
+
+  private normalizeDispatchTasks(
+    rawArguments: unknown,
+  ): { ok: true; tasks: Record<string, any>[] } | { ok: false; error: string } {
+    if (!rawArguments || typeof rawArguments !== 'object' || Array.isArray(rawArguments)) {
+      return { ok: false, error: 'dispatch_task 参数必须是对象，且包含 tasks 字段' };
+    }
+
+    const args = rawArguments as { tasks?: unknown };
+    const rawTasks = args.tasks;
+
+    if (Array.isArray(rawTasks)) {
+      if (rawTasks.length === 0) {
+        return { ok: false, error: 'tasks 必须是至少包含 1 个元素的数组' };
+      }
+      return { ok: true, tasks: rawTasks as Record<string, any>[] };
+    }
+
+    if (typeof rawTasks === 'string') {
+      const trimmed = rawTasks.trim();
+      if (!trimmed) {
+        return { ok: false, error: 'tasks 不能为空字符串，必须是任务数组' };
+      }
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        if (Array.isArray(parsed)) {
+          if (parsed.length === 0) {
+            return { ok: false, error: 'tasks 必须是至少包含 1 个元素的数组' };
+          }
+          logger.warn('dispatch_task 参数归一化：tasks 从 JSON 字符串解析为数组', {
+            taskCount: parsed.length,
+          }, LogCategory.TOOLS);
+          return { ok: true, tasks: parsed as Record<string, any>[] };
+        }
+        return { ok: false, error: 'tasks 字符串解析后不是数组，请传递任务数组' };
+      } catch (error: any) {
+        return {
+          ok: false,
+          error: `tasks 不是有效 JSON 数组字符串: ${error?.message || String(error)}`,
+        };
+      }
+    }
+
+    return { ok: false, error: 'tasks 必须是至少包含 1 个元素的数组' };
   }
 
   private normalizeStringArray(

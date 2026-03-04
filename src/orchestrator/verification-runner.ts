@@ -16,6 +16,8 @@ export interface VerificationConfig {
   compileCheck: boolean;
   /** 编译命令（默认 npm run compile） */
   compileCommand: string;
+  /** 缺少编译命令时的策略（默认 warn） */
+  compileMissingCommandPolicy: 'warn' | 'fail';
   /** IDE 诊断检查（默认 true） */
   ideCheck: boolean;
   /** Lint 检查（默认 false） */
@@ -37,6 +39,7 @@ export interface VerificationResult {
   lintResult?: CommandResult;
   testResult?: CommandResult;
   ideResult?: IDEDiagnosticResult;
+  warnings?: string[];
   summary: string;
 }
 
@@ -45,6 +48,7 @@ export interface CommandResult {
   success: boolean;
   output: string;
   error?: string;
+  warnings?: string[];
   duration: number;
 }
 
@@ -64,6 +68,7 @@ export interface IDEDiagnosticResult {
 const DEFAULT_CONFIG: VerificationConfig = {
   compileCheck: true,
   compileCommand: 'npm run compile',
+  compileMissingCommandPolicy: 'warn',
   ideCheck: true,
   lintCheck: false,
   lintCommand: 'npm run lint',
@@ -101,6 +106,7 @@ export class VerificationRunner {
     const result: VerificationResult = {
       success: true,
       summary: '',
+      warnings: [],
     };
 
     const summaryParts: string[] = [];
@@ -114,6 +120,10 @@ export class VerificationRunner {
         summaryParts.push(`编译失败: ${result.compileResult.error || '未知错误'}`);
       } else {
         summaryParts.push(verificationRoots.length > 1 ? `编译通过（${verificationRoots.length} 个项目）` : '编译通过');
+      }
+      if (result.compileResult.warnings && result.compileResult.warnings.length > 0) {
+        result.warnings?.push(...result.compileResult.warnings);
+        summaryParts.push(`编译告警: ${result.compileResult.warnings.join('；')}`);
       }
     }
 
@@ -275,7 +285,9 @@ export class VerificationRunner {
   async quickCompileCheck(): Promise<boolean> {
     if (!this.config.compileCheck) return true;
     const compileCommand = this.resolveCompileCommand(this.workspaceRoot);
-    if (!compileCommand) return false;
+    if (!compileCommand) {
+      return this.config.compileMissingCommandPolicy === 'warn';
+    }
     const result = await this.runCommand(compileCommand, '编译', this.workspaceRoot);
     return result.success;
   }
@@ -338,6 +350,7 @@ export class VerificationRunner {
       name: '编译',
       resolveCommand: (root) => this.resolveCompileCommand(root),
       missingCommandMessage: '未找到可用编译命令（缺少 scripts.compile/scripts.typecheck 与 tsconfig.json）',
+      missingCommandPolicy: this.config.compileMissingCommandPolicy,
     });
   }
 
@@ -364,19 +377,26 @@ export class VerificationRunner {
     name: string;
     resolveCommand: (root: string) => string | null;
     missingCommandMessage: string;
+    missingCommandPolicy?: 'warn' | 'fail';
   }): Promise<CommandResult> {
-    const { projectRoots, name, resolveCommand, missingCommandMessage } = params;
+    const { projectRoots, name, resolveCommand, missingCommandMessage, missingCommandPolicy = 'fail' } = params;
     const roots = projectRoots.length > 0 ? projectRoots : [this.workspaceRoot];
     const outputs: string[] = [];
     const errors: string[] = [];
+    const warnings: string[] = [];
     let duration = 0;
     let success = true;
 
     for (const root of roots) {
       const command = resolveCommand(root);
       if (!command) {
-        success = false;
-        errors.push(`[${root}] ${missingCommandMessage}`);
+        const missingMessage = `[${root}] ${missingCommandMessage}`;
+        if (missingCommandPolicy === 'warn') {
+          warnings.push(missingMessage);
+        } else {
+          success = false;
+          errors.push(missingMessage);
+        }
         continue;
       }
 
@@ -398,6 +418,7 @@ export class VerificationRunner {
       success,
       output: outputs.join('\n\n'),
       error: errors.length > 0 ? errors.join('\n\n') : undefined,
+      warnings: warnings.length > 0 ? warnings : undefined,
       duration,
     };
   }

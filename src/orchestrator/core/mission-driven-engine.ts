@@ -107,6 +107,10 @@ export class MissionDrivenEngine extends EventEmitter {
   } | null = null;
   private currentTaskId: string | null = null;
   private lastMissionId: string | null = null;
+  /** 当前对话轮次唯一标识（每次 execute() 入口生成，贯穿整轮快照） */
+  private currentTurnId: string | null = null;
+  /** dispatch 并发场景下的 Mission 创建单飞锁，确保每轮最多创建一个 Mission */
+  private ensureMissionPromise: Promise<string> | null = null;
   private lastRoutingDecision: {
     needsWorker: boolean;
     category?: string;
@@ -216,6 +220,7 @@ export class MissionDrivenEngine extends EventEmitter {
         return missions.map(mission => mission.id);
       },
       ensureMissionForDispatch: async () => this.ensureMissionForDispatch(),
+      getCurrentTurnId: () => this.currentTurnId,
       getProjectKnowledgeBase: () => this.projectKnowledgeBase,
       recordOrchestratorTokens: (usage, phase) => this.recordOrchestratorTokens(usage, phase),
       recordWorkerTokenUsage: (results) => this.recordWorkerTokenUsage(results),
@@ -418,6 +423,9 @@ export class MissionDrivenEngine extends EventEmitter {
       this.isRunning = true;
       this.currentTaskId = taskId || null;
       this.lastMissionId = null;
+      this.ensureMissionPromise = null;
+      // 每轮对话生成唯一 turnId，作为本轮所有快照的 missionId
+      this.currentTurnId = `turn:${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
       this.setState('running');
       this.lastTaskAnalysis = null;
       this.lastRoutingDecision = null;
@@ -511,13 +519,12 @@ export class MissionDrivenEngine extends EventEmitter {
         }
 
         // 4. 设置编排者快照上下文
-        // 任务改为懒创建：dispatch 前仅绑定 session 级上下文，避免“每轮对话都先建任务”。
-        // 若后续进入 dispatch 流，会在 ensureMissionForDispatch 中覆盖为 mission 级上下文。
+        // 使用本轮唯一 turnId 作为 missionId，确保每轮对话的快照可独立分组。
+        // 若后续进入 dispatch 流，worker 的快照也将使用同一 turnId。
         const orchestratorToolManager = this.adapterFactory.getToolManager();
-        const orchestratorContextMissionId = `session:${resolvedSessionId || 'default'}`;
-        const orchestratorAssignmentId = `orchestrator-session-${resolvedSessionId || 'default'}`;
+        const orchestratorAssignmentId = `orchestrator-${this.currentTurnId}`;
         orchestratorToolManager.setSnapshotContext({
-          missionId: orchestratorContextMissionId,
+          missionId: this.currentTurnId!,
           assignmentId: orchestratorAssignmentId,
           todoId: orchestratorAssignmentId,
           workerId: 'orchestrator',
@@ -607,6 +614,7 @@ export class MissionDrivenEngine extends EventEmitter {
         throw error;
       } finally {
         this.isRunning = false;
+        this.ensureMissionPromise = null;
         // 清除编排者快照上下文
         this.adapterFactory.getToolManager().clearSnapshotContext('orchestrator');
         // 清除 MissionOrchestrator 的 Mission ID 关联
@@ -661,38 +669,70 @@ export class MissionDrivenEngine extends EventEmitter {
     if (this.lastMissionId) {
       return this.lastMissionId;
     }
-
-    const sessionId = this.currentSessionId || this.sessionManager.getCurrentSession()?.id || '';
-    if (!sessionId) {
-      throw new Error('缺少会话 ID');
+    if (this.ensureMissionPromise) {
+      return this.ensureMissionPromise;
     }
-    const prompt = this.activeUserPrompt?.trim() || '';
-    if (!prompt) {
-      throw new Error('缺少用户请求');
+    const turnIdAtCall = this.currentTurnId;
+    const pending = (async (): Promise<string> => {
+      // 双重检查：并发请求在等待期内可能已有 mission 产生
+      if (this.lastMissionId) {
+        return this.lastMissionId;
+      }
+
+      const sessionId = this.currentSessionId || this.sessionManager.getCurrentSession()?.id || '';
+      if (!sessionId) {
+        throw new Error('缺少会话 ID');
+      }
+      const prompt = this.activeUserPrompt?.trim() || '';
+      if (!prompt) {
+        throw new Error('缺少用户请求');
+      }
+
+      const mission = await this.missionStorage.createMission({
+        sessionId,
+        userPrompt: prompt,
+        context: '',
+      });
+
+      // 若 Mission 创建期间执行轮次已切换，回收该 Mission，避免生成孤儿任务
+      if (turnIdAtCall && this.currentTurnId !== turnIdAtCall) {
+        try {
+          await this.missionStorage.delete(mission.id);
+        } catch {
+          // 回收失败不阻塞主流程，后续由任务清理流程处理
+        }
+        throw new Error('执行轮次已切换，Mission 创建结果失效');
+      }
+
+      mission.status = 'executing';
+      mission.failureReason = undefined;
+      mission.startedAt = Date.now();
+      await this.missionStorage.update(mission);
+
+      this.lastMissionId = mission.id;
+      this.missionOrchestrator.setCurrentMissionId(mission.id);
+
+      const orchestratorToolManager = this.adapterFactory.getToolManager();
+      const orchestratorAssignmentId = `orchestrator-${mission.id}`;
+      orchestratorToolManager.setSnapshotContext({
+        missionId: this.currentTurnId || mission.id,
+        assignmentId: orchestratorAssignmentId,
+        todoId: orchestratorAssignmentId,
+        workerId: 'orchestrator',
+      });
+
+      return mission.id;
+    })();
+
+    this.ensureMissionPromise = pending;
+
+    try {
+      return await pending;
+    } finally {
+      if (this.ensureMissionPromise === pending) {
+        this.ensureMissionPromise = null;
+      }
     }
-
-    const mission = await this.missionStorage.createMission({
-      sessionId,
-      userPrompt: prompt,
-      context: '',
-    });
-    mission.status = 'executing';
-    mission.startedAt = Date.now();
-    await this.missionStorage.update(mission);
-
-    this.lastMissionId = mission.id;
-    this.missionOrchestrator.setCurrentMissionId(mission.id);
-
-    const orchestratorToolManager = this.adapterFactory.getToolManager();
-    const orchestratorAssignmentId = `orchestrator-${mission.id}`;
-    orchestratorToolManager.setSnapshotContext({
-      missionId: mission.id,
-      assignmentId: orchestratorAssignmentId,
-      todoId: orchestratorAssignmentId,
-      workerId: 'orchestrator',
-    });
-
-    return mission.id;
   }
 
   getLastExecutionStatus(): { success: boolean; errors: string[] } {

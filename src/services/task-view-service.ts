@@ -6,10 +6,13 @@
  */
 
 import { globalEventBus } from '../events';
-import type { MissionStorageManager } from '../orchestrator/mission';
+import type { Mission, MissionStorageManager } from '../orchestrator/mission';
 import type { TaskView } from '../task/task-view-adapter';
+import type { UnifiedTodo } from '../todo';
 
 export class TaskViewService {
+  private static readonly MISSION_CONCURRENCY_WINDOW_MS = 10;
+
   constructor(
     private missionStorage: MissionStorageManager,
     private workspaceRoot: string,
@@ -25,7 +28,7 @@ export class TaskViewService {
     const missions = await this.missionStorage.listBySession(sessionId);
     const taskViews: TaskView[] = [];
 
-    const todosByMission = new Map<string, import('../todo').UnifiedTodo[]>();
+    const todosByMission = new Map<string, UnifiedTodo[]>();
 
     try {
       const todoManager = new TodoManager(this.workspaceRoot);
@@ -39,12 +42,119 @@ export class TaskViewService {
       // TodoManager 不可用时，使用空映射
     }
 
+    const duplicateArtifactMissionIds = this.collectDuplicateArtifactMissionIds(missions, todosByMission);
+    if (duplicateArtifactMissionIds.size > 0) {
+      await Promise.all(
+        Array.from(duplicateArtifactMissionIds).map(async (missionId) => {
+          try {
+            await this.missionStorage.delete(missionId);
+          } catch {
+            // 自愈清理失败不阻塞主流程
+          }
+        })
+      );
+    }
+
     for (const mission of missions) {
+      if (duplicateArtifactMissionIds.has(mission.id)) {
+        continue;
+      }
       const todos = todosByMission.get(mission.id) || [];
       taskViews.push(missionToTaskView(mission, todos));
     }
 
     return taskViews;
+  }
+
+  private collectDuplicateArtifactMissionIds(
+    missions: Mission[],
+    todosByMission: Map<string, UnifiedTodo[]>,
+  ): Set<string> {
+    const artifacts = new Set<string>();
+    const byPrompt = new Map<string, Mission[]>();
+
+    for (const mission of missions) {
+      const promptKey = (mission.userPrompt || '').trim();
+      if (!promptKey) {
+        continue;
+      }
+      const group = byPrompt.get(promptKey);
+      if (group) {
+        group.push(mission);
+      } else {
+        byPrompt.set(promptKey, [mission]);
+      }
+    }
+
+    for (const promptMissions of byPrompt.values()) {
+      if (promptMissions.length < 2) {
+        continue;
+      }
+      const sorted = [...promptMissions].sort((a, b) => a.createdAt - b.createdAt);
+      let bucket: Mission[] = [];
+
+      const flushBucket = () => {
+        if (bucket.length > 1) {
+          const keeper = this.selectMissionKeeper(bucket, todosByMission);
+          for (const mission of bucket) {
+            if (mission.id === keeper.id) {
+              continue;
+            }
+            if (this.isDuplicateArtifactMission(mission, todosByMission)) {
+              artifacts.add(mission.id);
+            }
+          }
+        }
+        bucket = [];
+      };
+
+      for (const mission of sorted) {
+        if (bucket.length === 0) {
+          bucket.push(mission);
+          continue;
+        }
+        const last = bucket[bucket.length - 1];
+        if (mission.createdAt - last.createdAt <= TaskViewService.MISSION_CONCURRENCY_WINDOW_MS) {
+          bucket.push(mission);
+        } else {
+          flushBucket();
+          bucket.push(mission);
+        }
+      }
+      flushBucket();
+    }
+
+    return artifacts;
+  }
+
+  private isDuplicateArtifactMission(
+    mission: Mission,
+    todosByMission: Map<string, UnifiedTodo[]>,
+  ): boolean {
+    const todoCount = todosByMission.get(mission.id)?.length || 0;
+    const goal = (mission.goal || '').trim();
+    return mission.status === 'executing' && goal.length === 0 && todoCount === 0;
+  }
+
+  private selectMissionKeeper(
+    missions: Mission[],
+    todosByMission: Map<string, UnifiedTodo[]>,
+  ): Mission {
+    const scoreMission = (mission: Mission): number => {
+      const goalScore = (mission.goal || '').trim().length > 0 ? 3 : 0;
+      const todoScore = (todosByMission.get(mission.id)?.length || 0) > 0 ? 3 : 0;
+      const terminalScore = mission.status === 'completed' || mission.status === 'failed' || mission.status === 'cancelled' ? 2 : 0;
+      const startedScore = mission.startedAt ? 1 : 0;
+      return goalScore + todoScore + terminalScore + startedScore;
+    };
+
+    return [...missions].sort((a, b) => {
+      const scoreDiff = scoreMission(b) - scoreMission(a);
+      if (scoreDiff !== 0) {
+        return scoreDiff;
+      }
+      return a.createdAt - b.createdAt;
+    })[0];
   }
 
   /**
@@ -69,6 +179,7 @@ export class TaskViewService {
     const mission = await this.missionStorage.load(taskId);
     if (mission) {
       mission.status = 'cancelled';
+      mission.failureReason = undefined;
       mission.updatedAt = Date.now();
       await this.missionStorage.update(mission);
     }
@@ -88,6 +199,7 @@ export class TaskViewService {
     const mission = await this.missionStorage.load(taskId);
     if (mission) {
       mission.status = 'failed';
+      mission.failureReason = error;
       mission.updatedAt = Date.now();
       await this.missionStorage.update(mission);
     }
@@ -101,6 +213,7 @@ export class TaskViewService {
     const mission = await this.missionStorage.load(taskId);
     if (mission) {
       mission.status = 'completed';
+      mission.failureReason = undefined;
       mission.completedAt = Date.now();
       mission.updatedAt = Date.now();
       await this.missionStorage.update(mission);
@@ -115,6 +228,7 @@ export class TaskViewService {
     const mission = await this.missionStorage.load(taskId);
     if (mission) {
       mission.status = 'executing';
+      mission.failureReason = undefined;
       mission.startedAt = Date.now();
       mission.updatedAt = Date.now();
       await this.missionStorage.update(mission);
