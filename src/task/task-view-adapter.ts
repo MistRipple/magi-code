@@ -74,6 +74,7 @@ export interface TaskView {
 
   // 关联
   missionId: string;        // 原始 Mission ID
+  failureReason?: string;
 }
 
 /**
@@ -211,6 +212,7 @@ export function missionToTaskView(mission: Mission, todos: UnifiedTodo[]): TaskV
     cancelledAt: mission.status === 'cancelled' ? mission.updatedAt : undefined,
     progress,
     missionId: mission.id,
+    failureReason: mission.failureReason,
   };
 }
 

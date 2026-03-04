@@ -337,6 +337,7 @@ export interface Task {
   subTasks: SubTaskItem[];
   progress: number;
   missionId: string;
+  failureReason?: string;
 }
 
 // 编辑/变更记录
@@ -344,11 +345,13 @@ export type EditType = 'add' | 'modify' | 'delete';
 
 export interface Edit {
   filePath: string;
+  snapshotId?: string;
   type?: EditType;
   additions?: number;
   deletions?: number;
   contributors?: string[];
   workerId?: string;
+  missionId?: string;
 }
 
 // Toast 通知

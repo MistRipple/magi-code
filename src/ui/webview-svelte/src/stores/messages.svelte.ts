@@ -104,7 +104,7 @@ function hasInvalidMessageSource(messages: Message[]): boolean {
 
 // 新增状态：任务、变更、阶段、Toast、模型状态
 let tasks = $state<Task[]>([]);
-let edits = $state<Array<{ filePath: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string }>>([]);
+let edits = $state<Array<{ filePath: string; snapshotId?: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string; missionId?: string }>>([]);
 let toasts = $state<Array<{ id: string; type: string; title?: string; message: string }>>([]);
 let modelStatus = $state<ModelStatusMap>({
   claude: { status: 'checking' },

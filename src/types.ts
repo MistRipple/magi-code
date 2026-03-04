@@ -370,6 +370,7 @@ export type EventType =
   | 'subtask:completed'
   | 'subtask:failed'
   | 'snapshot:created'
+  | 'snapshot:changed'
   | 'snapshot:reverted'
   | 'snapshot:accepted'
   | 'change:approved'
@@ -465,6 +466,7 @@ export type WebviewToExtensionMessage =
   | { type: 'revertChange'; filePath: string }
   | { type: 'approveAllChanges' }
   | { type: 'revertAllChanges' }
+  | { type: 'revertMission'; missionId: string }
   | { type: 'newSession'; currentMessages?: any[] }
   | { type: 'saveCurrentSession'; messages: any[] }
   | { type: 'switchSession'; sessionId: string; currentMessages?: any[] }

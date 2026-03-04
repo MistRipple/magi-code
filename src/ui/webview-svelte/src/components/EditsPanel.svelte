@@ -17,6 +17,29 @@
   const modifiedCount = $derived(edits.filter(e => e.type === 'modify').length);
   const deletedCount = $derived(edits.filter(e => e.type === 'delete').length);
 
+  // ─── 按轮次（missionId）分组 ───
+  // 最新轮次 missionId：取 edits 列表中最后一个有 missionId 的值（后端已按 timestamp 排序）
+  const latestMissionId = $derived.by(() => {
+    if (edits.length === 0) return null;
+    for (let i = edits.length - 1; i >= 0; i--) {
+      if (edits[i].missionId) return edits[i].missionId!;
+    }
+    return null;
+  });
+
+  // 本轮变更
+  const currentRoundEdits = $derived(
+    latestMissionId ? edits.filter(e => e.missionId === latestMissionId) : []
+  );
+
+  // 统一暂存（非本轮）
+  const stagedEdits = $derived(
+    latestMissionId ? edits.filter(e => e.missionId !== latestMissionId) : edits
+  );
+
+  // 是否有两组分组（只有同时存在统一暂存和本轮变更才分组显示）
+  const hasGroups = $derived(stagedEdits.length > 0 && currentRoundEdits.length > 0);
+
   function getContributors(edit: Edit): string[] {
     if (Array.isArray(edit?.contributors) && edit.contributors.length > 0) return edit.contributors;
     if (edit?.workerId) return [edit.workerId];
@@ -31,8 +54,7 @@
   }
 
   // 文件类型图标名
-  function getFileIconName(filePath: string): 'file-plus' | 'file-minus' | 'file-edit' | 'file-text' {
-    const edit = edits.find(e => e.filePath === filePath);
+  function getFileIconName(edit: Edit): 'file-plus' | 'file-minus' | 'file-edit' | 'file-text' {
     if (edit?.type === 'add') return 'file-plus';
     if (edit?.type === 'delete') return 'file-minus';
     if (edit?.type === 'modify') return 'file-edit';
@@ -57,7 +79,58 @@
   function viewDiff(filePath: string) { vscode.postMessage({ type: 'viewDiff', filePath }); }
   function approveAllChanges() { vscode.postMessage({ type: 'approveAllChanges' }); }
   function revertAllChanges() { vscode.postMessage({ type: 'revertAllChanges' }); }
+  function revertMission() {
+    if (!latestMissionId) return;
+    vscode.postMessage({ type: 'revertMission', missionId: latestMissionId });
+  }
+
+  function getEditKey(edit: Edit): string {
+    return `${edit.filePath}::${edit.missionId ?? 'none'}::${edit.snapshotId ?? 'na'}`;
+  }
 </script>
+
+{#snippet fileRow(edit: Edit)}
+  {@const { dir, name } = splitPath(edit.filePath)}
+  {@const blocks = getChangeBlocks(edit.additions ?? 0, edit.deletions ?? 0)}
+  {@const contributors = getContributors(edit)}
+  <div class="file-row" role="button" tabindex="0" onclick={() => viewDiff(edit.filePath)} onkeydown={(e) => e.key === 'Enter' && viewDiff(edit.filePath)}>
+    <div class="type-indicator" class:add={edit.type === 'add'} class:modify={edit.type === 'modify'} class:del={edit.type === 'delete'}></div>
+    <div class="file-icon" class:add={edit.type === 'add'} class:modify={edit.type === 'modify'} class:del={edit.type === 'delete'}>
+      <Icon name={getFileIconName(edit)} size={14} />
+    </div>
+    <div class="file-info">
+      <span class="file-name">{name}</span>
+      {#if dir}<span class="file-dir">{dir}</span>{/if}
+    </div>
+    {#if contributors.length > 0}
+      <div class="file-workers">
+        {#each contributors as worker}
+          <WorkerBadge {worker} size="sm" />
+        {/each}
+      </div>
+    {/if}
+    <div class="file-stats">
+      {#if edit.additions}<span class="stat-add">+{edit.additions}</span>{/if}
+      {#if edit.deletions}<span class="stat-del">-{edit.deletions}</span>{/if}
+      <div class="change-blocks">
+        {#each blocks as block}
+          <span class="block" class:add={block === 'add'} class:del={block === 'del'} class:neutral={block === 'neutral'}></span>
+        {/each}
+      </div>
+    </div>
+    <div class="file-actions">
+      <button class="action-icon" title="打开文件" onclick={(e) => { e.stopPropagation(); openFile(edit.filePath); }}>
+        <Icon name="file-text" size={14} />
+      </button>
+      <button class="action-icon approve" title="批准变更" onclick={(e) => { e.stopPropagation(); approveChange(edit.filePath); }}>
+        <Icon name="check" size={14} />
+      </button>
+      <button class="action-icon revert" title="还原变更" onclick={(e) => { e.stopPropagation(); revertChange(edit.filePath); }}>
+        <Icon name="undo" size={14} />
+      </button>
+    </div>
+  </div>
+{/snippet}
 
 <div class="edits-panel">
   {#if edits.length === 0}
@@ -93,63 +166,50 @@
       </button>
     </div>
 
-    <!-- 文件列表 -->
-    <div class="file-list">
-      {#each edits as edit (edit.filePath)}
-        {@const { dir, name } = splitPath(edit.filePath)}
-        {@const blocks = getChangeBlocks(edit.additions ?? 0, edit.deletions ?? 0)}
-        {@const contributors = getContributors(edit)}
-        <div class="file-row" role="button" tabindex="0" onclick={() => viewDiff(edit.filePath)} onkeydown={(e) => e.key === 'Enter' && viewDiff(edit.filePath)}>
-          <!-- 变更类型指示器 -->
-          <div class="type-indicator" class:add={edit.type === 'add'} class:modify={edit.type === 'modify'} class:del={edit.type === 'delete'}></div>
-
-          <!-- 文件图标 -->
-          <div class="file-icon" class:add={edit.type === 'add'} class:modify={edit.type === 'modify'} class:del={edit.type === 'delete'}>
-            <Icon name={getFileIconName(edit.filePath)} size={14} />
-          </div>
-
-          <!-- 文件名与路径 -->
-          <div class="file-info">
-            <span class="file-name">{name}</span>
-            {#if dir}
-              <span class="file-dir">{dir}</span>
-            {/if}
-          </div>
-
-          <!-- Worker 贡献者 -->
-          {#if contributors.length > 0}
-            <div class="file-workers">
-              {#each contributors as worker}
-                <WorkerBadge {worker} size="sm" />
-              {/each}
-            </div>
-          {/if}
-
-          <!-- 增删统计 + 比例条 -->
-          <div class="file-stats">
-            {#if edit.additions}<span class="stat-add">+{edit.additions}</span>{/if}
-            {#if edit.deletions}<span class="stat-del">-{edit.deletions}</span>{/if}
-            <div class="change-blocks">
-              {#each blocks as block}
-                <span class="block" class:add={block === 'add'} class:del={block === 'del'} class:neutral={block === 'neutral'}></span>
-              {/each}
-            </div>
-          </div>
-
-          <!-- hover 操作按钮 -->
-          <div class="file-actions">
-            <button class="action-icon" title="打开文件" onclick={(e) => { e.stopPropagation(); openFile(edit.filePath); }}>
-              <Icon name="file-text" size={14} />
-            </button>
-            <button class="action-icon approve" title="批准变更" onclick={(e) => { e.stopPropagation(); approveChange(edit.filePath); }}>
-              <Icon name="check" size={14} />
-            </button>
-            <button class="action-icon revert" title="还原变更" onclick={(e) => { e.stopPropagation(); revertChange(edit.filePath); }}>
-              <Icon name="undo" size={14} />
-            </button>
-          </div>
+    {#if hasGroups}
+      <!-- 统一暂存（历史轮次） -->
+      <div class="group-section">
+        <div class="group-header">
+          <span class="group-label">统一暂存</span>
+          <span class="group-count">{stagedEdits.length} 个文件</span>
         </div>
-      {/each}
+        <div class="file-list">
+          {#each stagedEdits as edit (getEditKey(edit))}
+            {@render fileRow(edit)}
+          {/each}
+        </div>
+      </div>
+    {/if}
+
+    <!-- 本轮变更 / 全部变更 -->
+    <div class="group-section">
+      {#if hasGroups || currentRoundEdits.length > 0}
+        <div class="group-header current-round">
+          <span class="group-label">本轮变更</span>
+          <span class="group-count">{currentRoundEdits.length} 个文件</span>
+          <button
+            class="revert-round-btn"
+            onclick={revertMission}
+            disabled={appState.isProcessing}
+            title={appState.isProcessing ? '任务执行中，无法撤销' : '撤销本轮所有变更'}
+          >
+            <Icon name="undo" size={12} />
+            <span>撤销本轮</span>
+          </button>
+        </div>
+        <div class="file-list">
+          {#each currentRoundEdits as edit (getEditKey(edit))}
+            {@render fileRow(edit)}
+          {/each}
+        </div>
+      {:else}
+        <!-- 没有 missionId 的情况（兼容旧数据）：全部扁平显示 -->
+        <div class="file-list">
+          {#each edits as edit (getEditKey(edit))}
+            {@render fileRow(edit)}
+          {/each}
+        </div>
+      {/if}
     </div>
   {/if}
 </div>
@@ -415,4 +475,65 @@
 
   .action-icon.approve:hover { color: var(--success); }
   .action-icon.revert:hover { color: var(--error); }
+
+  /* ─── 轮次分组 ─── */
+  .group-section {
+    margin-bottom: var(--space-3);
+  }
+
+  .group-section:last-child {
+    margin-bottom: 0;
+  }
+
+  .group-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-2);
+    margin-bottom: var(--space-1);
+  }
+
+  .group-label {
+    font-size: var(--text-xs);
+    font-weight: var(--font-semibold);
+    color: var(--foreground-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .group-header.current-round .group-label {
+    color: var(--info);
+  }
+
+  .group-count {
+    font-size: var(--text-2xs);
+    color: var(--foreground-muted);
+    opacity: 0.7;
+  }
+
+  .revert-round-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    margin-left: auto;
+    padding: 2px 8px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--surface-1);
+    color: var(--foreground-muted);
+    cursor: pointer;
+    font-size: var(--text-2xs);
+    transition: all var(--transition-fast);
+  }
+
+  .revert-round-btn:hover:not(:disabled) {
+    color: var(--error);
+    border-color: var(--error);
+    background: var(--error-muted);
+  }
+
+  .revert-round-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
 </style>

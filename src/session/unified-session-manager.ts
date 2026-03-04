@@ -497,27 +497,19 @@ export class UnifiedSessionManager {
         logger.error('会话.快照.非法_元数据', { sessionId, snapshot }, LogCategory.SESSION);
         throw new Error('Invalid snapshot metadata');
       }
-      const existingIndex = session.snapshots.findIndex(s => s.filePath === snapshot.filePath);
+
+      // 以 snapshot.id 为唯一主键，避免按 filePath 覆盖导致跨轮快照丢失
+      const existingIndex = session.snapshots.findIndex(s => s.id === snapshot.id);
       if (existingIndex !== -1) {
         const previous = session.snapshots[existingIndex];
         const previousContributors = previous.contributors ?? [previous.workerId];
         const nextContributors = snapshot.contributors ?? [snapshot.workerId];
         snapshot.contributors = Array.from(new Set([...previousContributors, ...nextContributors]));
         session.snapshots[existingIndex] = snapshot;
-        if (previous.id !== snapshot.id) {
-          const oldFile = this.getSnapshotFilePath(sessionId, previous.id);
-          if (fs.existsSync(oldFile)) {
-            try {
-              fs.unlinkSync(oldFile);
-            } catch (error) {
-              logger.warn('会话.快照.清理_失败', { oldFile, error }, LogCategory.SESSION);
-              // 不抛出错误，继续执行
-            }
-          }
-        }
       } else {
         session.snapshots.push(snapshot);
       }
+      session.snapshots.sort((a, b) => (a.timestamp - b.timestamp) || a.id.localeCompare(b.id));
 
       try {
         this.saveSession(session);
@@ -530,25 +522,94 @@ export class UnifiedSessionManager {
 
   /** 获取快照元数据 */
   getSnapshot(sessionId: string, filePath: string): FileSnapshotMeta | null {
+    return this.getEarliestSnapshotByFile(sessionId, filePath);
+  }
+
+  /** 获取指定文件的最早快照元数据 */
+  getEarliestSnapshotByFile(sessionId: string, filePath: string): FileSnapshotMeta | null {
     const session = this.sessions.get(sessionId);
     if (session) {
-      return session.snapshots.find(s => s.filePath === filePath) ?? null;
+      const matched = session.snapshots.filter(s => s.filePath === filePath);
+      if (matched.length === 0) {
+        return null;
+      }
+      matched.sort((a, b) => (a.timestamp - b.timestamp) || a.id.localeCompare(b.id));
+      return matched[0];
     }
     return null;
   }
 
-  /** 移除快照元数据 */
-  removeSnapshot(sessionId: string, filePath: string): boolean {
+  /** 获取指定文件的最新快照元数据 */
+  getLatestSnapshotByFile(sessionId: string, filePath: string): FileSnapshotMeta | null {
     const session = this.sessions.get(sessionId);
     if (session) {
-      const index = session.snapshots.findIndex(s => s.filePath === filePath);
-      if (index !== -1) {
-        session.snapshots.splice(index, 1);
-        this.saveSession(session);
-        return true;
+      const matched = session.snapshots.filter(s => s.filePath === filePath);
+      if (matched.length === 0) {
+        return null;
       }
+      matched.sort((a, b) => (a.timestamp - b.timestamp) || a.id.localeCompare(b.id));
+      return matched[matched.length - 1];
     }
-    return false;
+    return null;
+  }
+
+  /** 获取指定文件的所有快照（按时间升序） */
+  getSnapshotsByFile(sessionId: string, filePath: string): FileSnapshotMeta[] {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return [];
+    }
+    return session.snapshots
+      .filter(s => s.filePath === filePath)
+      .sort((a, b) => (a.timestamp - b.timestamp) || a.id.localeCompare(b.id));
+  }
+
+  /** 通过快照 ID 获取快照元数据 */
+  getSnapshotById(sessionId: string, snapshotId: string): FileSnapshotMeta | null {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return null;
+    }
+    return session.snapshots.find(s => s.id === snapshotId) ?? null;
+  }
+
+  /** 按快照 ID 移除快照元数据 */
+  removeSnapshotById(sessionId: string, snapshotId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return false;
+    }
+    const index = session.snapshots.findIndex(s => s.id === snapshotId);
+    if (index === -1) {
+      return false;
+    }
+    session.snapshots.splice(index, 1);
+    this.saveSession(session);
+    return true;
+  }
+
+  /** 按文件移除所有快照元数据 */
+  removeSnapshotsByFile(sessionId: string, filePath: string): number {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return 0;
+    }
+    const before = session.snapshots.length;
+    session.snapshots = session.snapshots.filter(s => s.filePath !== filePath);
+    const removed = before - session.snapshots.length;
+    if (removed > 0) {
+      this.saveSession(session);
+    }
+    return removed;
+  }
+
+  /** 移除快照元数据 */
+  removeSnapshot(sessionId: string, filePath: string): boolean {
+    const earliest = this.getEarliestSnapshotByFile(sessionId, filePath);
+    if (!earliest) {
+      return false;
+    }
+    return this.removeSnapshotById(sessionId, earliest.id);
   }
 
   /** 获取快照文件存储路径 */

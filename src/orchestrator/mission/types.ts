@@ -164,6 +164,7 @@ export interface Mission {
   updatedAt: number;
   startedAt?: number;
   completedAt?: number;
+  failureReason?: string;
 }
 
 /**

@@ -426,6 +426,7 @@ export class EventBindingService {
     });
 
     globalEventBus.on('snapshot:created', () => this.ctx.sendStateUpdate());
+    globalEventBus.on('snapshot:changed', () => this.ctx.sendStateUpdate());
     globalEventBus.on('snapshot:reverted', () => this.ctx.sendStateUpdate());
 
     // Worker 状态事件

@@ -41,6 +41,7 @@ import { LspExecutor } from './lsp-executor';
 import { OrchestrationExecutor } from './orchestration-executor';
 import { logger, LogCategory } from '../logging';
 import { PermissionMatrix } from '../types';
+import { globalEventBus } from '../events';
 import type { SnapshotManager } from '../snapshot-manager';
 import type { SkillsManager, InstructionSkillDefinition } from './skills-manager';
 import type { MCPToolExecutor } from './mcp-executor';
@@ -301,8 +302,23 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       }
     };
 
+    const afterWriteCallback = (filePath: string) => {
+      const context = self.getActiveSnapshotContext();
+      globalEventBus.emitEvent('snapshot:changed', {
+        data: {
+          filePath,
+          missionId: context?.missionId,
+          assignmentId: context?.assignmentId,
+          todoId: context?.todoId,
+          workerId: context?.workerId,
+        },
+      });
+    };
+
     this.fileExecutor.setBeforeWriteCallback(beforeWriteCallback);
+    this.fileExecutor.setAfterWriteCallback(afterWriteCallback);
     this.removeFilesExecutor.setBeforeWriteCallback(beforeWriteCallback);
+    this.removeFilesExecutor.setAfterWriteCallback(afterWriteCallback);
   }
 
   /**

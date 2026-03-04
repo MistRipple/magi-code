@@ -63,6 +63,8 @@ export interface DispatchManagerDeps {
   getCurrentSessionId: () => string | undefined;
   getMissionIdsBySession: (sessionId: string) => Promise<string[]>;
   ensureMissionForDispatch: () => Promise<string>;
+  /** 获取当前对话轮次唯一标识（用于快照 missionId 分组） */
+  getCurrentTurnId: () => string | null;
   getProjectKnowledgeBase: () => import('../../knowledge/project-knowledge-base').ProjectKnowledgeBase | undefined;
   // 治理依赖（WorkerPipeline 使用）
   getSnapshotManager: () => SnapshotManager | null;
@@ -884,7 +886,7 @@ export class DispatchManager {
         adapterFactory: this.deps.adapterFactory,
         workspaceRoot: this.deps.workspaceRoot,
         projectContext,
-        missionId,
+        missionId: this.deps.getCurrentTurnId() || missionId,
         onReport: (report) => this.handleDispatchWorkerReport(report, batch),
         cancellationToken: batch?.cancellationToken,
         imagePaths: this.deps.getActiveImagePaths(),

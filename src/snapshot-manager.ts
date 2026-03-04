@@ -157,7 +157,7 @@ export class SnapshotManager {
 
       // 步骤 2: 移除元数据
       try {
-        this.sessionManager.removeSnapshot(sessionId, filePath);
+        this.sessionManager.removeSnapshotById(sessionId, snapshotId);
       } catch (metaError) {
         // 元数据删除失败，尝试恢复文件
         if (backupContent !== null) {
@@ -287,7 +287,7 @@ export class SnapshotManager {
           logger.error('快照.清理.文件.失败', { filePath: snapshot.filePath, error }, LogCategory.RECOVERY);
         }
       }
-      this.sessionManager.removeSnapshot(session.id, snapshot.filePath);
+      this.sessionManager.removeSnapshotById(session.id, snapshot.id);
       removed++;
     }
 
@@ -318,7 +318,7 @@ export class SnapshotManager {
           logger.error('快照.清理.失败', { snapshotId: snapshot.id, error }, LogCategory.RECOVERY);
         }
       }
-      this.sessionManager.removeSnapshot(session.id, snapshot.filePath);
+      this.sessionManager.removeSnapshotById(session.id, snapshot.id);
       removed++;
     }
 
@@ -349,7 +349,7 @@ export class SnapshotManager {
           logger.error('快照.清理.失败', { snapshotId: snapshot.id, error }, LogCategory.RECOVERY);
         }
       }
-      this.sessionManager.removeSnapshot(session.id, snapshot.filePath);
+      this.sessionManager.removeSnapshotById(session.id, snapshot.id);
       removed++;
     }
 
@@ -414,14 +414,14 @@ export class SnapshotManager {
     for (const snapshot of session.snapshots) {
       const snapshotFile = path.join(this.getSnapshotDir(sessionId), `${snapshot.id}.snapshot`);
       if (!fs.existsSync(snapshotFile)) {
-        toRemove.push(snapshot.filePath);
+        toRemove.push(snapshot.id);
         cleaned++;
       }
     }
 
     // 移除孤立的元数据
-    for (const filePath of toRemove) {
-      this.sessionManager.removeSnapshot(sessionId, filePath);
+    for (const snapshotId of toRemove) {
+      this.sessionManager.removeSnapshotById(sessionId, snapshotId);
     }
 
     if (cleaned > 0) {
@@ -585,48 +585,79 @@ export class SnapshotManager {
     };
   }
 
+  /** 归一化文件路径并做 workspace 越界校验 */
+  private normalizeRelativePath(filePath: string): { relativePath: string; absolutePath: string } | null {
+    const absolutePath = path.isAbsolute(filePath)
+      ? filePath
+      : path.join(this.workspaceRoot, filePath);
+    const normalizedPath = path.normalize(absolutePath);
+    const normalizedRoot = path.normalize(this.workspaceRoot);
+    if (!normalizedPath.startsWith(normalizedRoot)) {
+      return null;
+    }
+    return {
+      relativePath: path.relative(this.workspaceRoot, normalizedPath),
+      absolutePath: normalizedPath,
+    };
+  }
 
+  /** 按文件删除快照文件与元数据（精确按 snapshotId） */
+  private removeSnapshotsByIds(sessionId: string, snapshots: FileSnapshotMeta[]): void {
+    for (const snapshot of snapshots) {
+      const snapshotFile = path.join(this.getSnapshotDir(sessionId), `${snapshot.id}.snapshot`);
+      if (fs.existsSync(snapshotFile)) {
+        try {
+          fs.unlinkSync(snapshotFile);
+          this.invalidateSnapshotCache(snapshotFile);
+        } catch (error) {
+          logger.error('快照.删除.失败', { snapshotId: snapshot.id, error }, LogCategory.RECOVERY);
+        }
+      }
+      this.sessionManager.removeSnapshotById(sessionId, snapshot.id);
+    }
+  }
 
-  /** 还原文件到快照状态 */
+  /** 还原文件到快照状态（单文件：回退该文件全部未接受变更） */
   revertToSnapshot(filePath: string): boolean {
     const session = this.sessionManager.getCurrentSession();
     if (!session) return false;
 
-    const relativePath = path.isAbsolute(filePath)
-      ? path.relative(this.workspaceRoot, filePath)
-      : filePath;
-
-    const snapshot = this.sessionManager.getSnapshot(session.id, relativePath);
-    if (!snapshot) return false;
-
-    const absolutePath = path.join(this.workspaceRoot, relativePath);
-
-    // 安全检查：防止路径遍历攻击
-    const normalizedPath = path.normalize(absolutePath);
-    const normalizedRoot = path.normalize(this.workspaceRoot);
-    if (!normalizedPath.startsWith(normalizedRoot)) {
+    const normalized = this.normalizeRelativePath(filePath);
+    if (!normalized) {
       logger.error('快照.安全.路径穿越', { filePath }, LogCategory.RECOVERY);
       return false;
     }
+    const { relativePath, absolutePath } = normalized;
 
-    // 读取快照内容（使用缓存）
-    const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);
-    const content = this.readSnapshotWithCache(snapshotFile);
+    const snapshots = this.sessionManager.getSnapshotsByFile(session.id, relativePath);
+    if (snapshots.length === 0) return false;
 
-    // 还原文件
+    const currentContent = this.readFileFresh(absolutePath);
+    const differingSnapshots = snapshots.filter(snapshot => {
+      const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);
+      const originalContent = this.readSnapshotWithCache(snapshotFile);
+      return originalContent !== currentContent;
+    });
+    if (differingSnapshots.length === 0) return false;
+
+    // 取最早未对齐快照，回退该文件的全部未接受变更
+    const targetSnapshot = differingSnapshots[0];
+    const targetSnapshotFile = path.join(this.getSnapshotDir(session.id), `${targetSnapshot.id}.snapshot`);
+    const content = this.readSnapshotWithCache(targetSnapshotFile);
+
     if (content === '' && fs.existsSync(absolutePath)) {
-      // 原本不存在的文件，删除它
       fs.unlinkSync(absolutePath);
       this.invalidateFileCache(absolutePath);
-    } else {
-      // 确保目录存在
+    } else if (content !== '') {
       const dir = path.dirname(absolutePath);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
       fs.writeFileSync(absolutePath, content, 'utf-8');
-      this.invalidateFileCache(absolutePath); // 文件被修改，清除缓存
+      this.invalidateFileCache(absolutePath);
     }
+
+    this.removeSnapshotsByIds(session.id, snapshots);
 
     globalEventBus.emitEvent('snapshot:reverted', {
       sessionId: session.id,
@@ -636,71 +667,147 @@ export class SnapshotManager {
     return true;
   }
 
-  /** 获取待处理变更列表（去重 + 排序） */
+  /** 获取待处理变更列表（按文件聚合，missionId 取最新变更轮次） */
   getPendingChanges(): PendingChange[] {
     const session = this.sessionManager.getCurrentSession();
     if (!session) return [];
 
-    const changesMap = new Map<string, PendingChange & { timestamp?: number }>();
-
+    const snapshotsByFile = new Map<string, FileSnapshotMeta[]>();
     for (const snapshot of session.snapshots) {
-      const absolutePath = path.join(this.workspaceRoot, snapshot.filePath);
+      const group = snapshotsByFile.get(snapshot.filePath) ?? [];
+      group.push(snapshot);
+      snapshotsByFile.set(snapshot.filePath, group);
+    }
+
+    type FilePendingContext = {
+      filePath: string;
+      sortedSnapshots: FileSnapshotMeta[];
+      currentContent: string;
+      snapshotContentById: Map<string, string>;
+      differingSnapshots: FileSnapshotMeta[];
+      latestDiffering: FileSnapshotMeta;
+    };
+
+    const contexts: FilePendingContext[] = [];
+    for (const [filePath, snapshots] of snapshotsByFile.entries()) {
+      const sortedSnapshots = [...snapshots].sort(
+        (a, b) => (a.timestamp - b.timestamp) || a.id.localeCompare(b.id),
+      );
+      const absolutePath = path.join(this.workspaceRoot, filePath);
       const currentContent = this.readFileFresh(absolutePath);
+      const snapshotContentById = new Map<string, string>();
+      const differingSnapshots: FileSnapshotMeta[] = [];
 
-      // 读取原始内容（使用缓存）
-      const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);
-      const originalContent = this.readSnapshotWithCache(snapshotFile);
+      for (const snapshot of sortedSnapshots) {
+        const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);
+        const originalContent = this.readSnapshotWithCache(snapshotFile);
+        snapshotContentById.set(snapshot.id, originalContent);
+        if (originalContent !== currentContent) {
+          differingSnapshots.push(snapshot);
+        }
+      }
 
-      // 计算变更行数
-      const { additions, deletions } = this.countChanges(originalContent, currentContent);
+      if (differingSnapshots.length === 0) {
+        continue;
+      }
 
-      if (additions > 0 || deletions > 0) {
-        const existing = changesMap.get(snapshot.filePath);
-        const currentTimestamp = snapshot.timestamp ?? 0;
-        if (!existing) {
-          changesMap.set(snapshot.filePath, {
-            filePath: snapshot.filePath,
-            snapshotId: snapshot.id,
-            missionId: snapshot.missionId,
-            assignmentId: snapshot.assignmentId,
-            todoId: snapshot.todoId,
-            workerId: snapshot.workerId,
-            contributors: snapshot.contributors,
+      contexts.push({
+        filePath,
+        sortedSnapshots,
+        currentContent,
+        snapshotContentById,
+        differingSnapshots,
+        latestDiffering: differingSnapshots[differingSnapshots.length - 1],
+      });
+    }
+
+    if (contexts.length === 0) {
+      return [];
+    }
+
+    const latestMissionContext = [...contexts].sort(
+      (a, b) =>
+        (a.latestDiffering.timestamp - b.latestDiffering.timestamp)
+        || a.latestDiffering.id.localeCompare(b.latestDiffering.id),
+    )[contexts.length - 1];
+    const latestMissionId = latestMissionContext.latestDiffering.missionId;
+
+    const changes: Array<PendingChange & { timestamp: number }> = [];
+
+    for (const context of contexts) {
+      const { filePath, sortedSnapshots, currentContent, snapshotContentById } = context;
+      const latestMissionSnapshots = sortedSnapshots.filter(
+        snapshot => snapshot.missionId === latestMissionId
+          && snapshotContentById.get(snapshot.id) !== currentContent,
+      );
+
+      let baselineBeforeLatest = currentContent;
+      if (latestMissionSnapshots.length > 0) {
+        const latestRoundStart = latestMissionSnapshots[0];
+        const latestRoundEnd = latestMissionSnapshots[latestMissionSnapshots.length - 1];
+        baselineBeforeLatest = snapshotContentById.get(latestRoundStart.id) ?? currentContent;
+        const { additions, deletions } = this.countChanges(baselineBeforeLatest, currentContent);
+        const contributors = new Set<string>();
+        for (const snapshot of latestMissionSnapshots) {
+          for (const contributor of snapshot.contributors ?? [snapshot.workerId]) {
+            contributors.add(contributor);
+          }
+        }
+        if (additions > 0 || deletions > 0) {
+          changes.push({
+            filePath,
+            snapshotId: latestRoundStart.id,
+            missionId: latestMissionId,
+            assignmentId: latestRoundEnd.assignmentId,
+            todoId: latestRoundEnd.todoId,
+            workerId: latestRoundEnd.workerId,
+            contributors: Array.from(contributors),
             additions,
             deletions,
             status: 'pending',
-            timestamp: currentTimestamp,
+            timestamp: latestRoundEnd.timestamp ?? 0,
           });
-          continue;
         }
-
-        const merged = {
-          ...existing,
-          additions: Math.max(existing.additions, additions),
-          deletions: Math.max(existing.deletions, deletions),
-          contributors: Array.from(
-            new Set([
-              ...(existing.contributors ?? [existing.workerId]),
-              ...(snapshot.contributors ?? [snapshot.workerId]),
-            ])
-          ),
-        };
-
-        if (currentTimestamp >= (existing.timestamp ?? 0)) {
-          merged.snapshotId = snapshot.id;
-          merged.missionId = snapshot.missionId;
-          merged.assignmentId = snapshot.assignmentId;
-          merged.todoId = snapshot.todoId;
-          merged.workerId = snapshot.workerId;
-          merged.timestamp = currentTimestamp;
-        }
-
-        changesMap.set(snapshot.filePath, merged);
       }
+
+      const stagedSnapshots = sortedSnapshots.filter(
+        snapshot => snapshot.missionId !== latestMissionId
+          && snapshotContentById.get(snapshot.id) !== baselineBeforeLatest,
+      );
+      if (stagedSnapshots.length === 0) {
+        continue;
+      }
+
+      const stagedStart = stagedSnapshots[0];
+      const stagedEnd = stagedSnapshots[stagedSnapshots.length - 1];
+      const stagedBaseline = snapshotContentById.get(stagedStart.id) ?? '';
+      const { additions, deletions } = this.countChanges(stagedBaseline, baselineBeforeLatest);
+      if (additions === 0 && deletions === 0) {
+        continue;
+      }
+      const stagedContributors = new Set<string>();
+      for (const snapshot of stagedSnapshots) {
+        for (const contributor of snapshot.contributors ?? [snapshot.workerId]) {
+          stagedContributors.add(contributor);
+        }
+      }
+      changes.push({
+        filePath,
+        snapshotId: stagedStart.id,
+        missionId: stagedEnd.missionId,
+        assignmentId: stagedEnd.assignmentId,
+        todoId: stagedEnd.todoId,
+        workerId: stagedEnd.workerId,
+        contributors: Array.from(stagedContributors),
+        additions,
+        deletions,
+        status: 'pending',
+        timestamp: stagedEnd.timestamp ?? 0,
+      });
     }
 
-    return Array.from(changesMap.values())
-      .sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0) || a.filePath.localeCompare(b.filePath))
+    return changes
+      .sort((a, b) => (a.timestamp - b.timestamp) || a.filePath.localeCompare(b.filePath))
       .map(({ timestamp, ...change }) => change);
   }
 
@@ -709,7 +816,7 @@ export class SnapshotManager {
     const session = this.sessionManager.getCurrentSession();
     if (!session) return [];
 
-    const files: string[] = [];
+    const files = new Set<string>();
     for (const snapshot of session.snapshots) {
       if (snapshot.todoId !== todoId) {
         continue;
@@ -722,10 +829,10 @@ export class SnapshotManager {
       const originalContent = this.readSnapshotWithCache(snapshotFile);
 
       if (currentContent !== originalContent) {
-        files.push(snapshot.filePath);
+        files.add(snapshot.filePath);
       }
     }
-    return files;
+    return Array.from(files);
   }
 
   /** 计算变更行数 */
@@ -748,77 +855,62 @@ export class SnapshotManager {
     return { additions, deletions };
   }
 
-  /** 接受变更（删除历史快照，创建新基准快照） */
+  /** 接受变更（清理该文件历史快照，并创建确认后基准快照） */
   acceptChange(filePath: string): boolean {
     const session = this.sessionManager.getCurrentSession();
     if (!session) return false;
 
-    const relativePath = path.isAbsolute(filePath)
-      ? path.relative(this.workspaceRoot, filePath)
-      : filePath;
-
-    const snapshot = this.sessionManager.getSnapshot(session.id, relativePath);
-    if (!snapshot) return false;
-
-    // 1. 删除历史快照文件
-    const oldSnapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);
-    if (fs.existsSync(oldSnapshotFile)) {
-      fs.unlinkSync(oldSnapshotFile);
-    }
-
-    // 2. 从 session 中移除历史快照元数据
-    this.sessionManager.removeSnapshot(session.id, relativePath);
-
-    // ========================================
-    // 修复: 创建新基准快照
-    // ========================================
-    const absolutePath = path.join(this.workspaceRoot, relativePath);
-
-    // 安全检查: 防止路径遍历攻击
-    const normalizedPath = path.normalize(absolutePath);
-    const normalizedRoot = path.normalize(this.workspaceRoot);
-    if (!normalizedPath.startsWith(normalizedRoot)) {
+    const normalized = this.normalizeRelativePath(filePath);
+    if (!normalized) {
       logger.error('快照.安全.路径穿越', { filePath }, LogCategory.RECOVERY);
       return false;
     }
+    const { relativePath, absolutePath } = normalized;
 
-    // 读取当前文件内容 (确认后的状态，使用缓存)
+    const snapshots = this.sessionManager.getSnapshotsByFile(session.id, relativePath);
+    if (snapshots.length === 0) return false;
+
+    // 删除该文件所有历史快照（保留磁盘与元数据一致性）
+    const oldSnapshotIds = snapshots.map(snapshot => snapshot.id);
+    this.removeSnapshotsByIds(session.id, snapshots);
+
     const currentContent = this.readFileFresh(absolutePath);
+    const latestSnapshot = [...snapshots].sort(
+      (a, b) => (a.timestamp - b.timestamp) || a.id.localeCompare(b.id),
+    )[snapshots.length - 1];
 
-    // 创建新快照 ID
+    // 创建新基准快照，作为后续编辑回退基线
     const newSnapshotId = generateId();
     const newSnapshotMeta: FileSnapshotMeta = {
       id: newSnapshotId,
       filePath: relativePath,
       timestamp: Date.now(),
-      missionId: snapshot.missionId,
-      assignmentId: snapshot.assignmentId,
-      todoId: snapshot.todoId,
-      workerId: snapshot.workerId,
-      agentType: snapshot.agentType,
+      missionId: latestSnapshot.missionId,
+      assignmentId: latestSnapshot.assignmentId,
+      todoId: latestSnapshot.todoId,
+      workerId: latestSnapshot.workerId,
+      contributors: latestSnapshot.contributors ?? [latestSnapshot.workerId],
+      agentType: latestSnapshot.agentType,
       reason: 'Accepted change',
     };
-
-    // 保存新快照内容到文件
     this.ensureSnapshotDir(session.id);
     const newSnapshotFile = path.join(this.getSnapshotDir(session.id), `${newSnapshotId}.snapshot`);
     fs.writeFileSync(newSnapshotFile, currentContent, 'utf-8');
-
-    // 清除历史快照缓存，添加新快照到缓存
-    this.invalidateSnapshotCache(oldSnapshotFile);
-    this.snapshotContentCache.set(newSnapshotFile, currentContent);
-
-    // 添加新快照元数据到 Session
+    this.addToCache(this.snapshotContentCache, newSnapshotFile, currentContent);
     this.sessionManager.addSnapshot(session.id, newSnapshotMeta);
 
-    logger.info('快照.接受.完成', { filePath: relativePath, oldSnapshotId: snapshot.id, newSnapshotId }, LogCategory.RECOVERY);
+    logger.info('快照.接受.完成', {
+      filePath: relativePath,
+      removedSnapshots: oldSnapshotIds.length,
+      newSnapshotId,
+    }, LogCategory.RECOVERY);
 
     globalEventBus.emitEvent('snapshot:accepted', {
       sessionId: session.id,
       data: {
         filePath: relativePath,
-        oldSnapshotId: snapshot.id,
-        newSnapshotId: newSnapshotId,
+        oldSnapshotIds,
+        newSnapshotId,
       },
     });
 
@@ -830,11 +922,11 @@ export class SnapshotManager {
     const session = this.sessionManager.getCurrentSession();
     if (!session) return 0;
 
-    const snapshots = [...session.snapshots];
+    const pendingChanges = this.getPendingChanges();
     let count = 0;
 
-    for (const snapshot of snapshots) {
-      if (this.acceptChange(snapshot.filePath)) {
+    for (const change of pendingChanges) {
+      if (this.acceptChange(change.filePath)) {
         count++;
       }
     }
@@ -842,16 +934,103 @@ export class SnapshotManager {
     return count;
   }
 
+  /** 按 Mission（对话轮次）还原变更：精确找到该 Mission 创建的快照并逐文件还原 */
+  revertMission(missionId: string): { reverted: number; files: string[] } {
+    const session = this.sessionManager.getCurrentSession();
+    if (!session || !missionId) return { reverted: 0, files: [] };
+
+    // 1. 筛出属于该 Mission 的所有快照
+    const missionSnapshots = session.snapshots.filter(s => s.missionId === missionId);
+    if (missionSnapshots.length === 0) return { reverted: 0, files: [] };
+
+    // 2. 同一文件可能被同一 Mission 的多个 Todo 快照，取最早的（记录的是该 Mission 首次触碰前的状态）
+    const earliestByFile = new Map<string, typeof missionSnapshots[0]>();
+    for (const snapshot of missionSnapshots) {
+      const existing = earliestByFile.get(snapshot.filePath);
+      if (!existing || (snapshot.timestamp ?? 0) < (existing.timestamp ?? 0)) {
+        earliestByFile.set(snapshot.filePath, snapshot);
+      }
+    }
+
+    const revertedFiles: string[] = [];
+
+    // 3. 逐文件还原到该 Mission 修改前的状态
+    for (const [relativePath, snapshot] of earliestByFile) {
+      const absolutePath = path.join(this.workspaceRoot, relativePath);
+
+      // 安全检查
+      const normalizedPath = path.normalize(absolutePath);
+      const normalizedRoot = path.normalize(this.workspaceRoot);
+      if (!normalizedPath.startsWith(normalizedRoot)) {
+        logger.error('快照.Mission还原.路径穿越', { filePath: relativePath }, LogCategory.RECOVERY);
+        continue;
+      }
+
+      // 读取该 Mission 快照记录的原始内容（即该轮修改前的最新文件状态）
+      const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);
+      const content = this.readSnapshotWithCache(snapshotFile);
+
+      // 还原文件
+      if (content === '' && fs.existsSync(absolutePath)) {
+        // 该文件在本轮之前不存在 → 删除
+        fs.unlinkSync(absolutePath);
+        this.invalidateFileCache(absolutePath);
+      } else if (content !== '') {
+        const dir = path.dirname(absolutePath);
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+        fs.writeFileSync(absolutePath, content, 'utf-8');
+        this.invalidateFileCache(absolutePath);
+      }
+      revertedFiles.push(relativePath);
+    }
+
+    // 4. 批量删除该 Mission 的所有快照文件
+    const missionSnapshotIds = new Set(missionSnapshots.map(s => s.id));
+    for (const snapshot of missionSnapshots) {
+      const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshot.id}.snapshot`);
+      if (fs.existsSync(snapshotFile)) {
+        try {
+          fs.unlinkSync(snapshotFile);
+          this.invalidateSnapshotCache(snapshotFile);
+        } catch (error) {
+          logger.error('快照.Mission还原.删除失败', { snapshotId: snapshot.id, error }, LogCategory.RECOVERY);
+        }
+      }
+    }
+
+    // 5. 批量从 session.snapshots 中移除（按 id 精确匹配，避免误删其他 Mission 的同文件快照）
+    for (const snapshotId of missionSnapshotIds) {
+      this.sessionManager.removeSnapshotById(session.id, snapshotId);
+    }
+
+    if (revertedFiles.length > 0) {
+      logger.info('快照.Mission还原.完成', {
+        missionId,
+        count: revertedFiles.length,
+        files: revertedFiles.slice(0, 10).join(', '),
+      }, LogCategory.RECOVERY);
+
+      globalEventBus.emitEvent('snapshot:reverted', {
+        sessionId: session.id,
+        data: { missionId, files: revertedFiles },
+      });
+    }
+
+    return { reverted: revertedFiles.length, files: revertedFiles };
+  }
+
   /** 批量还原所有变更 */
   revertAllChanges(): number {
     const session = this.sessionManager.getCurrentSession();
     if (!session) return 0;
 
-    const snapshots = [...session.snapshots];
+    const pendingChanges = this.getPendingChanges();
     let count = 0;
 
-    for (const snapshot of snapshots) {
-      if (this.revertToSnapshot(snapshot.filePath)) {
+    for (const change of pendingChanges) {
+      if (this.revertToSnapshot(change.filePath)) {
         count++;
       }
     }

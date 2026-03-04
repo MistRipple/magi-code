@@ -52,6 +52,8 @@ export class FileExecutor implements ToolExecutor {
 
   /** 文件写入前回调（用于快照系统在写入前保存原始内容） */
   private onBeforeWrite?: (filePath: string) => void;
+  /** 文件写入后回调（用于 UI 实时刷新待处理变更） */
+  private onAfterWrite?: (filePath: string) => void;
 
   constructor(workspaceRoots: WorkspaceRoots, fileMutex: FileMutex) {
     this.workspaceRoots = workspaceRoots;
@@ -80,6 +82,13 @@ export class FileExecutor implements ToolExecutor {
    */
   setBeforeWriteCallback(callback: (filePath: string) => void): void {
     this.onBeforeWrite = callback;
+  }
+
+  /**
+   * 设置文件写入后回调
+   */
+  setAfterWriteCallback(callback: (filePath: string) => void): void {
+    this.onAfterWrite = callback;
   }
 
   /**
@@ -1203,6 +1212,7 @@ IMPORTANT:
 
     // 持久化到磁盘
     await doc.save();
+    this.onAfterWrite?.(filePath);
   }
 
   /**
@@ -1248,6 +1258,7 @@ IMPORTANT:
     // 持久化到磁盘
     const doc = await vscode.workspace.openTextDocument(uri);
     await doc.save();
+    this.onAfterWrite?.(filePath);
   }
 
   /**
