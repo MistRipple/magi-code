@@ -35,13 +35,13 @@ export class PromptEnhancerService {
   async enhance(prompt: string): Promise<EnhanceResult> {
     try {
       const { LLMConfigLoader } = await import('../llm/config');
-      const compressorConfig = LLMConfigLoader.loadCompressorConfig();
+      const auxiliaryConfig = LLMConfigLoader.loadAuxiliaryConfig();
       const orchestratorConfig = LLMConfigLoader.loadOrchestratorConfig();
 
-      const useCompressor = compressorConfig.enabled
-        && Boolean(compressorConfig.baseUrl && compressorConfig.model);
-      const activeConfig = useCompressor ? compressorConfig : orchestratorConfig;
-      const activeLabel = useCompressor ? 'compressor' : 'orchestrator';
+      const useAuxiliary = auxiliaryConfig.enabled
+        && Boolean(auxiliaryConfig.baseUrl && auxiliaryConfig.model);
+      const activeConfig = useAuxiliary ? auxiliaryConfig : orchestratorConfig;
+      const activeLabel = useAuxiliary ? 'auxiliary' : 'orchestrator';
 
       // 收集代码上下文
       let codeContext = '';
@@ -75,7 +75,7 @@ export class PromptEnhancerService {
       logger.info('提示词增强.开始', {
         model: activeConfig.model,
         used: activeLabel,
-        fallbackToOrchestrator: !useCompressor,
+        fallbackToOrchestrator: !useAuxiliary,
         hasCodeContext: codeContext.length > 0,
         hasConversation: conversationHistory.length > 0,
       }, LogCategory.UI);
@@ -110,7 +110,7 @@ export class PromptEnhancerService {
 
   /**
    * 收集代码上下文
-   * 统一通过 AceExecutor 获取（ACE 可用时语义搜索，不可用时自动降级到本地三级搜索）
+   * 统一通过 codebase_retrieval 获取（本地检索基础设施）
    */
   private async collectCodeContext(projectRoot: string, prompt: string): Promise<string> {
     const contextParts: string[] = [];
@@ -118,11 +118,11 @@ export class PromptEnhancerService {
     let currentLength = 0;
 
     try {
-      // 1. 通过 AceExecutor 统一获取代码上下文（自动降级）
+      // 1. 通过 codebase_retrieval 获取代码上下文
       const toolManager = this.deps.getToolManager();
       if (toolManager) {
         const toolCall = {
-          id: `enhance-ace-${Date.now()}`,
+          id: `enhance-retrieval-${Date.now()}`,
           name: 'codebase_retrieval',
           arguments: {
             query: prompt,

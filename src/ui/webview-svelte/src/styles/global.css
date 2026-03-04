@@ -45,8 +45,8 @@
   --color-codex-muted: rgba(16, 163, 127, 0.15);
   --color-gemini: #4285f4;
   --color-gemini-muted: rgba(66, 133, 244, 0.15);
-  --color-compressor: #6b7280;
-  --color-compressor-muted: rgba(107, 114, 128, 0.15);
+  --color-auxiliary: #6b7280;
+  --color-auxiliary-muted: rgba(107, 114, 128, 0.15);
 
   /* 遮罩 */
   --overlay: rgba(0, 0, 0, 0.5);

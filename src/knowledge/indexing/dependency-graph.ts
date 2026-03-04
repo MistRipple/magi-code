@@ -64,11 +64,27 @@ const IMPORT_PATTERNS = [
   /^import\s+['"]([^'"]+)['"]/gm,
 ];
 
+/** re-export 模式（export * from / export { x } from） */
+const REEXPORT_PATTERNS = [
+  // export * from './path'
+  /^export\s+\*\s+from\s+['"]([^'"]+)['"]/gm,
+  // export { x, y } from './path'
+  /^export\s+\{[^}]*\}\s+from\s+['"]([^'"]+)['"]/gm,
+];
+
 /** require 模式 */
 const REQUIRE_PATTERN = /require\s*\(\s*['"]([^'"]+)['"]\s*\)/gm;
 
 /** dynamic import 模式 */
 const DYNAMIC_IMPORT_PATTERN = /import\s*\(\s*['"]([^'"]+)['"]\s*\)/gm;
+
+/** Python import 模式 */
+const PY_IMPORT_PATTERNS = [
+  // from .module import x / from . import module
+  /^from\s+(\.+\w*)\s+import\s+/gm,
+  // from ..module import x
+  /^from\s+(\.{2,}\w*)\s+import\s+/gm,
+];
 
 // ============================================================================
 // DependencyGraph 类
@@ -89,6 +105,9 @@ export class DependencyGraph {
   private _projectRoot = '';
   /** 优化 #11: tsconfig paths 别名映射 */
   private pathAliases = new Map<string, string>();
+  /** 优化 #21: 中心度防抖重算定时器 */
+  private centralityDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly CENTRALITY_DEBOUNCE_MS = 2000;
   private _isReady = false;
 
   get isReady(): boolean {
@@ -234,6 +253,10 @@ export class DependencyGraph {
    * 清空图谱
    */
   clear(): void {
+    if (this.centralityDebounceTimer) {
+      clearTimeout(this.centralityDebounceTimer);
+      this.centralityDebounceTimer = null;
+    }
     this.forwardDeps.clear();
     this.reverseDeps.clear();
     this.edges = [];
@@ -326,8 +349,8 @@ export class DependencyGraph {
     // 5. 从文件集合中移除
     this.fileSet.delete(filePath);
 
-    // 6. 重新计算中心度（边变化后需要更新）
-    this.computeCentrality();
+    // 6. 防抖重算中心度（避免高频编辑时反复计算）
+    this.debouncedComputeCentrality();
   }
 
   /**
@@ -366,13 +389,27 @@ export class DependencyGraph {
       // 文件读取失败，跳过
     }
 
-    // 重新计算中心度
-    this.computeCentrality();
+    // 防抖重算中心度
+    this.debouncedComputeCentrality();
   }
 
   // ==========================================================================
   // 私有方法
   // ==========================================================================
+
+  /**
+   * 优化 #21: 防抖中心度重算
+   * 合并高频文件变更事件，避免每次文件保存都触发完整 PageRank 迭代
+   */
+  private debouncedComputeCentrality(): void {
+    if (this.centralityDebounceTimer) {
+      clearTimeout(this.centralityDebounceTimer);
+    }
+    this.centralityDebounceTimer = setTimeout(() => {
+      this.centralityDebounceTimer = null;
+      this.computeCentrality();
+    }, DependencyGraph.CENTRALITY_DEBOUNCE_MS);
+  }
 
   /**
    * 解析文件的 import/require 语句
@@ -384,11 +421,14 @@ export class DependencyGraph {
     fileSet: Set<string>
   ): void {
     const lines = content.split('\n');
+    const ext = path.extname(filePath);
+    const isPython = ext === '.py';
 
     for (const line of lines) {
       const trimmed = line.trimStart();
       // 跳过注释
       if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) continue;
+      if (isPython && trimmed.startsWith('#')) continue;
 
       // ES static imports
       for (const pattern of IMPORT_PATTERNS) {
@@ -397,6 +437,21 @@ export class DependencyGraph {
         if (match) {
           // 根据模式不同，模块路径在不同位置
           const modulePath = match[2] || match[1];
+          if (modulePath && this.isInternalPath(modulePath)) {
+            const resolved = this.resolveModulePath(filePath, modulePath, projectRoot, fileSet);
+            if (resolved) {
+              this.addEdge(filePath, resolved, 'static');
+            }
+          }
+        }
+      }
+
+      // re-export（export * from / export { x } from）
+      for (const pattern of REEXPORT_PATTERNS) {
+        pattern.lastIndex = 0;
+        const match = pattern.exec(line);
+        if (match) {
+          const modulePath = match[1];
           if (modulePath && this.isInternalPath(modulePath)) {
             const resolved = this.resolveModulePath(filePath, modulePath, projectRoot, fileSet);
             if (resolved) {
@@ -428,6 +483,21 @@ export class DependencyGraph {
           const resolved = this.resolveModulePath(filePath, modulePath, projectRoot, fileSet);
           if (resolved) {
             this.addEdge(filePath, resolved, 'dynamic');
+          }
+        }
+      }
+
+      // Python 相对导入（from .module import x）
+      if (isPython) {
+        for (const pattern of PY_IMPORT_PATTERNS) {
+          pattern.lastIndex = 0;
+          const match = pattern.exec(line);
+          if (match) {
+            const pyModulePath = match[1];
+            const resolved = this.resolvePythonImport(filePath, pyModulePath, fileSet);
+            if (resolved) {
+              this.addEdge(filePath, resolved, 'static');
+            }
           }
         }
       }
@@ -492,11 +562,57 @@ export class DependencyGraph {
       if (!matched) return null;
     }
 
-    // 尝试多种扩展名
-    const extensions = ['', '.ts', '.tsx', '.js', '.jsx', '/index.ts', '/index.js'];
+    // 尝试多种扩展名（支持多语言）
+    const extensions = [
+      '', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+      '/index.ts', '/index.js',
+      '.py', '__init__.py',
+      '.go', '.java', '.rs',
+      '.c', '.h', '.cpp', '.cc', '.hpp',
+      '.cs', '.php', '.rb', '.swift', '.kt',
+    ];
     for (const ext of extensions) {
       const candidate = resolvedBase + ext;
       if (fileSet.has(candidate)) return candidate;
+    }
+
+    return null;
+  }
+
+  /**
+   * 解析 Python 相对导入路径
+   * from .module → 同级目录的 module.py
+   * from ..module → 父级目录的 module.py
+   */
+  private resolvePythonImport(
+    fromFile: string,
+    pyModulePath: string,
+    fileSet: Set<string>
+  ): string | null {
+    const fromDir = path.dirname(fromFile);
+    // 计算相对层级：每个前导 '.' 表示上一级
+    let dotCount = 0;
+    while (dotCount < pyModulePath.length && pyModulePath[dotCount] === '.') {
+      dotCount++;
+    }
+    const moduleName = pyModulePath.substring(dotCount);
+
+    // 构建相对路径
+    let targetDir = fromDir;
+    for (let i = 1; i < dotCount; i++) {
+      targetDir = path.dirname(targetDir);
+    }
+
+    if (moduleName) {
+      // from .module import x → module.py 或 module/__init__.py
+      const asFile = path.normalize(path.join(targetDir, moduleName.replace(/\./g, '/') + '.py'));
+      if (fileSet.has(asFile)) return asFile;
+      const asPackage = path.normalize(path.join(targetDir, moduleName.replace(/\./g, '/'), '__init__.py'));
+      if (fileSet.has(asPackage)) return asPackage;
+    } else {
+      // from . import x → __init__.py
+      const initFile = path.normalize(path.join(targetDir, '__init__.py'));
+      if (fileSet.has(initFile)) return initFile;
     }
 
     return null;

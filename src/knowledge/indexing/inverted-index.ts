@@ -75,6 +75,8 @@ export class InvertedIndex {
   private documentFrequency = new Map<string, number>();
   /** 文件路径 → 元数据 */
   private documentMeta = new Map<string, DocumentMeta>();
+  /** 文件路径 → 该文件包含的 token 集合（用于 O(1) 级别删除） */
+  private fileToTokens = new Map<string, Set<string>>();
   /** 索引中的文件总数 */
   private totalDocuments = 0;
   /** 所有文档的平均 token 数（BM25 需要） */
@@ -279,20 +281,28 @@ export class InvertedIndex {
 
   /**
    * 从索引中删除文件
+   * 优化 #20: 通过 fileToTokens 反向映射，仅遍历该文件拥有的 token，
+   * 复杂度从 O(总唯一 token 数) 降为 O(文件内唯一 token 数)
    */
   removeFile(filePath: string): void {
     if (!this.documentMeta.has(filePath)) return;
 
-    // 遍历所有 token，删除该文件的 posting
-    for (const [token, postings] of this.index.entries()) {
-      const filtered = postings.filter(p => p.filePath !== filePath);
-      if (filtered.length === 0) {
-        this.index.delete(token);
-        this.documentFrequency.delete(token);
-      } else {
-        this.index.set(token, filtered);
-        this.documentFrequency.set(token, filtered.length);
+    // 通过反向映射获取该文件的 token 集合
+    const tokens = this.fileToTokens.get(filePath);
+    if (tokens) {
+      for (const token of tokens) {
+        const postings = this.index.get(token);
+        if (!postings) continue;
+        const filtered = postings.filter(p => p.filePath !== filePath);
+        if (filtered.length === 0) {
+          this.index.delete(token);
+          this.documentFrequency.delete(token);
+        } else {
+          this.index.set(token, filtered);
+          this.documentFrequency.set(token, filtered.length);
+        }
       }
+      this.fileToTokens.delete(filePath);
     }
 
     const removedMeta = this.documentMeta.get(filePath);
@@ -311,6 +321,7 @@ export class InvertedIndex {
     this.index.clear();
     this.documentFrequency.clear();
     this.documentMeta.clear();
+    this.fileToTokens.clear();
     this.totalDocuments = 0;
     this.avgDocLength = 0;
     this.totalTokenSum = 0;
@@ -368,6 +379,7 @@ export class InvertedIndex {
     this.documentMeta = new Map(snapshot.documentMeta);
     this.totalDocuments = snapshot.totalDocuments;
     this.recalcAvgDocLength();
+    this.rebuildFileToTokens();
     this._isReady = true;
   }
 
@@ -402,7 +414,8 @@ export class InvertedIndex {
       tokenPositions.set(tw.token, positions);
     }
 
-    // 更新倒排索引
+    // 更新倒排索引 + 维护 fileToTokens 反向映射
+    const tokenSet = new Set<string>();
     for (const [token, positions] of tokenPositions.entries()) {
       const postings = this.index.get(token) || [];
       postings.push({
@@ -412,7 +425,9 @@ export class InvertedIndex {
       });
       this.index.set(token, postings);
       this.documentFrequency.set(token, (this.documentFrequency.get(token) || 0) + 1);
+      tokenSet.add(token);
     }
+    this.fileToTokens.set(filePath, tokenSet);
   }
 
   /**
@@ -432,6 +447,23 @@ export class InvertedIndex {
       this.totalTokenSum += meta.totalTokens;
     }
     this.avgDocLength = this.totalDocuments > 0 ? this.totalTokenSum / this.totalDocuments : 0;
+  }
+
+  /**
+   * 从倒排索引重建 fileToTokens 反向映射（反序列化恢复时调用）
+   */
+  private rebuildFileToTokens(): void {
+    this.fileToTokens.clear();
+    for (const [token, postings] of this.index.entries()) {
+      for (const posting of postings) {
+        let tokenSet = this.fileToTokens.get(posting.filePath);
+        if (!tokenSet) {
+          tokenSet = new Set<string>();
+          this.fileToTokens.set(posting.filePath, tokenSet);
+        }
+        tokenSet.add(token);
+      }
+    }
   }
 
   /**

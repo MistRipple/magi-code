@@ -20,6 +20,16 @@ import { logger, LogCategory } from '../../logging';
 // 类型定义
 // ============================================================================
 
+/** LLM 意图分析返回的权重建议 */
+export interface WeightHints {
+  symbolMatch?: number;
+  tfidf?: number;
+  positionWeight?: number;
+  centrality?: number;
+  recency?: number;
+  typeWeight?: number;
+}
+
 /** 扩展结果 */
 export interface ExpandedQuery {
   /** 原始查询 */
@@ -27,7 +37,9 @@ export interface ExpandedQuery {
   /** 扩展后的搜索词列表 */
   expandedTokens: string[];
   /** 使用的扩展模式 */
-  mode: 'offline' | 'llm' | 'hybrid';
+  mode: 'offline' | 'hybrid';
+  /** LLM 意图分析建议的排序权重（可选） */
+  weightHints?: WeightHints;
 }
 
 // ============================================================================
@@ -144,6 +156,18 @@ const SYNONYM_MAP: Record<string, string[]> = {
   'promise': ['async', 'await', 'future', 'deferred', 'observable'],
 };
 
+/** LLM 意图分析缓存条目 */
+interface LLMExpandCacheEntry {
+  tokens: string[];
+  weightHints?: WeightHints;
+  timestamp: number;
+}
+
+/** 扩展缓存快照（用于持久化） */
+export interface ExpansionCacheSnapshot {
+  entries: Array<[string, { tokens: string[]; weightHints?: WeightHints; timestamp: number }]>;
+}
+
 // ============================================================================
 // QueryExpander 类
 // ============================================================================
@@ -153,10 +177,12 @@ export class QueryExpander {
   private enableLLM: boolean;
   /** 优化 #3: 反向同义词表（自动从 SYNONYM_MAP 构建） */
   private reverseSynonymMap = new Map<string, string[]>();
-  /** 优化 #4: LLM 查询扩展结果缓存 */
-  private llmCache = new Map<string, { tokens: string[]; timestamp: number }>();
+  /** 优化 #4: LLM 查询扩展结果缓存（含权重建议） */
+  private llmCache = new Map<string, LLMExpandCacheEntry>();
   private static readonly LLM_CACHE_MAX = 50;
   private static readonly LLM_CACHE_TTL = 300_000; // 5 分钟
+  /** LLM 请求超时（与 SemanticReranker 保持一致） */
+  private static readonly LLM_TIMEOUT = 5_000;
   /** 优化 #15: 项目词汇表（由外部注入） */
   private projectVocabulary: Set<string> | null = null;
 
@@ -191,15 +217,18 @@ export class QueryExpander {
     // 1. 离线同义词扩展（始终执行）
     this.offlineExpand(query, originalTokens, allTokens);
 
-    // 2. LLM 在线扩展（可选）
+    // 2. LLM 深度意图分析（可选）
     let mode: ExpandedQuery['mode'] = 'offline';
+    let weightHints: WeightHints | undefined;
     if (this.enableLLM && this.llmClient) {
       try {
-        const llmTokens = await this.llmExpand(query);
-        if (llmTokens.length > 0) {
-          for (const t of llmTokens) allTokens.add(t);
+        const llmResult = await this.llmExpand(query);
+        if (llmResult.tokens.length > 0) {
+          for (const t of llmResult.tokens) allTokens.add(t);
           mode = 'hybrid';
         }
+        // 权重建议与 token 扩展解耦：即使 tokens 为空也允许生效
+        weightHints = llmResult.weightHints;
       } catch (error) {
         logger.warn('查询扩展.LLM扩展失败，使用离线结果', { error }, LogCategory.SESSION);
       }
@@ -212,7 +241,30 @@ export class QueryExpander {
       original: query,
       expandedTokens,
       mode,
+      weightHints,
     };
+  }
+
+  /**
+   * 序列化 LLM 扩展缓存（用于持久化）
+   */
+  exportCache(): ExpansionCacheSnapshot {
+    return {
+      entries: Array.from(this.llmCache.entries()),
+    };
+  }
+
+  /**
+   * 从序列化数据恢复 LLM 扩展缓存
+   * 丢弃已过期的条目
+   */
+  importCache(snapshot: ExpansionCacheSnapshot): void {
+    const now = Date.now();
+    for (const [key, entry] of snapshot.entries) {
+      if (now - entry.timestamp < QueryExpander.LLM_CACHE_TTL) {
+        this.llmCache.set(key, entry);
+      }
+    }
   }
 
   // ==========================================================================
@@ -273,49 +325,136 @@ export class QueryExpander {
   }
 
   /**
-   * LLM 在线扩展（优化 #4: 带缓存）
+   * LLM 深度意图分析（带缓存）
+   * 升级自简单标识符生成：分析查询意图 → 输出多策略搜索词 + 权重建议
    */
-  private async llmExpand(query: string): Promise<string[]> {
-    if (!this.llmClient) return [];
+  private async llmExpand(query: string): Promise<{ tokens: string[]; weightHints?: WeightHints }> {
+    if (!this.llmClient) return { tokens: [] };
 
-    // 优化 #4: 检查 LLM 缓存
+    // 检查缓存
     const cacheKey = query.trim().toLowerCase();
     const cached = this.llmCache.get(cacheKey);
     if (cached && (Date.now() - cached.timestamp) < QueryExpander.LLM_CACHE_TTL) {
-      return cached.tokens;
+      return { tokens: cached.tokens, weightHints: cached.weightHints };
     }
 
-    const prompt = `你是一个代码搜索助手。用户想搜索代码库中的相关代码。
-请根据用户的查询意图，生成 5-10 个最可能出现在代码中的英文标识符（函数名、类名、变量名等）。
+    const prompt = `你是代码搜索引擎的查询分析器。分析用户查询意图，输出结构化 JSON。
 
 用户查询: "${query}"
 
-只输出标识符列表，每行一个，不要编号，不要解释：`;
+输出严格 JSON（无多余文字）:
+{
+  "identifiers": ["5-10个最可能出现在代码中的英文标识符"],
+  "filePatterns": ["0-3个可能的文件名片段，如 auth, middleware"],
+  "focus": "symbol|semantic"
+}
 
-    const response = await this.llmClient.sendMessage({
-      messages: [{ role: 'user', content: prompt }],
-      maxTokens: 200,
-      temperature: 0.3,
+规则:
+- identifiers: 函数名/类名/变量名/方法名，英文
+- filePatterns: 文件路径中可能包含的关键词
+- focus: symbol=查找特定符号定义, semantic=理解功能逻辑`;
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), QueryExpander.LLM_TIMEOUT);
+    let response;
+    try {
+      response = await this.llmClient.sendMessage({
+        messages: [{ role: 'user', content: prompt }],
+        maxTokens: 300,
+        temperature: 0.2,
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      if (e instanceof Error && e.name === 'AbortError') {
+        logger.debug('查询扩展.LLM超时', undefined, LogCategory.SESSION);
+      }
+      return { tokens: [] };
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!response?.content) return { tokens: [] };
+
+    // 解析结构化 JSON
+    const result = this.parseLLMIntentResponse(response.content);
+
+    // 写入缓存
+    this.llmCache.set(cacheKey, {
+      tokens: result.tokens,
+      weightHints: result.weightHints,
+      timestamp: Date.now(),
     });
-
-    if (!response?.content) return [];
-
-    // 解析 LLM 返回的标识符列表
-    const tokens = response.content
-      .split('\n')
-      .map((line: string) => line.trim())
-      .filter((line: string) => line.length >= 2 && line.length <= 60 && /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(line))
-      .map((line: string) => line.toLowerCase());
-
-    // 优化 #4: 写入 LLM 缓存
-    this.llmCache.set(cacheKey, { tokens, timestamp: Date.now() });
     // LRU 淘汰
     if (this.llmCache.size > QueryExpander.LLM_CACHE_MAX) {
       const firstKey = this.llmCache.keys().next().value;
       if (firstKey !== undefined) this.llmCache.delete(firstKey);
     }
 
-    return tokens;
+    return result;
+  }
+
+  /**
+   * 解析 LLM 意图分析的 JSON 响应
+   * 容错：JSON 解析失败时退回逐行标识符提取
+   */
+  private parseLLMIntentResponse(content: string): { tokens: string[]; weightHints?: WeightHints } {
+    try {
+      // 提取 JSON（兼容 markdown 代码块包裹）
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) return this.fallbackParseTokens(content);
+
+      const parsed = JSON.parse(jsonMatch[0]);
+      const tokens: string[] = [];
+
+      // 提取 identifiers
+      if (Array.isArray(parsed.identifiers)) {
+        for (const id of parsed.identifiers) {
+          if (typeof id === 'string' && id.length >= 2 && id.length <= 60) {
+            // 同时支持 camelCase 复合标识符和单词
+            tokens.push(id.toLowerCase());
+          }
+        }
+      }
+
+      // 提取 filePatterns（作为搜索词补充）
+      if (Array.isArray(parsed.filePatterns)) {
+        for (const fp of parsed.filePatterns) {
+          if (typeof fp === 'string' && fp.length >= 2 && fp.length <= 40) {
+            tokens.push(fp.toLowerCase());
+          }
+        }
+      }
+
+      // 根据 focus 生成权重建议
+      let weightHints: WeightHints | undefined;
+      if (parsed.focus === 'symbol') {
+        weightHints = {
+          symbolMatch: 0.45,
+          tfidf: 0.20,
+          positionWeight: 0.15,
+          centrality: 0.08,
+          recency: 0.05,
+          typeWeight: 0.07,
+        };
+      }
+      // semantic 不设 weightHints，使用默认权重
+
+      return { tokens, weightHints };
+    } catch {
+      return this.fallbackParseTokens(content);
+    }
+  }
+
+  /**
+   * 降级解析：LLM 返回非 JSON 时按逐行标识符提取
+   */
+  private fallbackParseTokens(content: string): { tokens: string[] } {
+    const tokens = content
+      .split('\n')
+      .map((line: string) => line.trim())
+      .filter((line: string) => line.length >= 2 && line.length <= 60 && /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(line))
+      .map((line: string) => line.toLowerCase());
+    return { tokens };
   }
 
   /**

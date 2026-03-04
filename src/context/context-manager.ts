@@ -13,7 +13,7 @@ import { logger, LogCategory } from '../logging';
 import * as path from 'path';
 import { estimateTokenCount } from '../utils/token-estimator';
 import { MemoryDocument } from './memory-document';
-import { ContextCompressor, type CompressorAdapter } from './context-compressor';
+import { ContextAuxiliary, type AuxiliaryAdapter } from './context-auxiliary';
 import { TruncationUtils } from './truncation-utils';
 import {
   ContextMessage,
@@ -58,8 +58,8 @@ export class ContextManager {
   private sessionManager: UnifiedSessionManager | null = null;
   private currentSessionId: string | null = null;
   private projectKnowledgeBase: ProjectKnowledgeBase | null = null;
-  private compressorAdapter: CompressorAdapter | null = null;
-  private compressor: ContextCompressor | null = null;
+  private auxiliaryAdapter: AuxiliaryAdapter | null = null;
+  private auxiliary: ContextAuxiliary | null = null;
   private streamingContext: Map<string, ContextMessage> = new Map();
   private pendingMemorySaveTimer: NodeJS.Timeout | null = null;
   private pendingMemorySavePromise: Promise<void> | null = null;
@@ -336,12 +336,12 @@ export class ContextManager {
   }
 
   /**
-   * 设置压缩模型适配器
+   * 设置辅助模型适配器
    */
-  setCompressorAdapter(adapter: CompressorAdapter | null): void {
-    this.compressorAdapter = adapter;
-    if (this.compressor && adapter) {
-      this.compressor.setAdapter(adapter);
+  setAuxiliaryAdapter(adapter: AuxiliaryAdapter | null): void {
+    this.auxiliaryAdapter = adapter;
+    if (this.auxiliary && adapter) {
+      this.auxiliary.setAdapter(adapter);
     }
   }
 
@@ -703,11 +703,11 @@ export class ContextManager {
     await this.pendingMemorySavePromise;
   }
 
-  private getCompressor(): ContextCompressor {
-    if (!this.compressor) {
-      this.compressor = new ContextCompressor(this.compressorAdapter, this.config.compression);
+  private getAuxiliary(): ContextAuxiliary {
+    if (!this.auxiliary) {
+      this.auxiliary = new ContextAuxiliary(this.auxiliaryAdapter, this.config.compression);
     }
-    return this.compressor;
+    return this.auxiliary;
   }
 
   private async compressMemoryIfNeeded(): Promise<void> {
@@ -715,11 +715,11 @@ export class ContextManager {
       return;
     }
 
-    const compressor = this.getCompressor();
+    const auxiliary = this.getAuxiliary();
     try {
-      const success = await compressor.compress(this.sessionMemory);
+      const success = await auxiliary.compress(this.sessionMemory);
       if (success) {
-        const stats = compressor.getLastStats();
+        const stats = auxiliary.getLastStats();
         logger.info('上下文.压缩.完成', stats, LogCategory.SESSION);
       }
     } catch (error) {

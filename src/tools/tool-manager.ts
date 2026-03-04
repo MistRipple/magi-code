@@ -10,21 +10,18 @@
  * - web_search: 网络搜索
  * - web_fetch: URL 内容获取
  * - mermaid_diagram: Mermaid 图表渲染
- * - codebase_retrieval: 代码库语义搜索 (ACE)
+ * - codebase_retrieval: 代码库语义检索（本地基础设施）
  * - dispatch_task: 将子任务分配给专业 Worker
  * - send_worker_message: 向 Worker 面板发送消息
  * - wait_for_workers: 等待 Worker 完成并获取结果（反应式编排）
  * - get_todos: 获取当前任务的 todo 列表
  * - update_todo: 更新 todo 状态
- *
- * ACE 配置来源：~/.magi/config.json 的 promptEnhance 字段（唯一）
  */
 
 import { EventEmitter } from 'events';
 import { AsyncLocalStorage } from 'async_hooks';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import {
   ToolExecutor,
   ExtendedToolDefinition,
@@ -39,7 +36,7 @@ import { SearchExecutor } from './search-executor';
 import { RemoveFilesExecutor } from './remove-files-executor';
 import { WebExecutor } from './web-executor';
 import { MermaidExecutor } from './mermaid-executor';
-import { AceExecutor } from './ace-executor';
+import { CodebaseRetrievalExecutor } from './codebase-retrieval-executor';
 import { LspExecutor } from './lsp-executor';
 import { OrchestrationExecutor } from './orchestration-executor';
 import { logger, LogCategory } from '../logging';
@@ -98,30 +95,6 @@ export interface ToolManagerOptions {
 }
 
 /**
- * 读取 ACE 配置（唯一配置读取入口）
- * 配置存储在 ~/.magi/config.json 的 promptEnhance 字段
- *
- * 导出供其他模块使用，确保配置读取逻辑唯一
- */
-export function loadAceConfigFromFile(): { baseUrl: string; apiKey: string } {
-  try {
-    const configPath = path.join(os.homedir(), '.magi', 'config.json');
-    if (fs.existsSync(configPath)) {
-      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-      if (config.promptEnhance) {
-        return {
-          baseUrl: config.promptEnhance.baseUrl || '',
-          apiKey: config.promptEnhance.apiKey || ''
-        };
-      }
-    }
-  } catch (error) {
-    logger.warn('ToolManager: 读取 ACE 配置失败', { error }, LogCategory.TOOLS);
-  }
-  return { baseUrl: '', apiKey: '' };
-}
-
-/**
  * 工具管理器
  */
 export class ToolManager extends EventEmitter implements ToolExecutor {
@@ -139,7 +112,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   private removeFilesExecutor: RemoveFilesExecutor;
   private webExecutor: WebExecutor;
   private mermaidExecutor: MermaidExecutor;
-  private aceExecutor: AceExecutor;
+  private codebaseRetrievalExecutor: CodebaseRetrievalExecutor;
   private lspExecutor: LspExecutor;
   private orchestrationExecutor: OrchestrationExecutor;
 
@@ -171,9 +144,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     this.workspaceRoots = new WorkspaceRoots(folders);
     this.workspaceRoot = this.workspaceRoots.getPrimaryFolder().path;
 
-    // 读取 ACE 配置（统一入口）
-    const aceConfig = loadAceConfigFromFile();
-
     // 初始化所有内置执行器（共享 fileMutex 保证文件读写与终端命令的并发安全）
     this.terminalExecutor = new VSCodeTerminalExecutor(this.fileMutex);
     this.fileExecutor = new FileExecutor(this.workspaceRoots, this.fileMutex);
@@ -181,7 +151,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     this.removeFilesExecutor = new RemoveFilesExecutor(this.workspaceRoots);
     this.webExecutor = new WebExecutor();
     this.mermaidExecutor = new MermaidExecutor();
-    this.aceExecutor = new AceExecutor(this.workspaceRoot, aceConfig.baseUrl, aceConfig.apiKey);
+    this.codebaseRetrievalExecutor = new CodebaseRetrievalExecutor();
     this.lspExecutor = new LspExecutor(this.workspaceRoot);
     this.orchestrationExecutor = new OrchestrationExecutor();
 
@@ -190,10 +160,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       allowBash: true,
       allowWeb: true,
     };
-
-    if (aceConfig.baseUrl && aceConfig.apiKey) {
-      logger.info('ToolManager: ACE 已配置', { baseUrl: aceConfig.baseUrl }, LogCategory.TOOLS);
-    }
   }
 
   /**
@@ -219,10 +185,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
     // 重新注入快照回调（SearchExecutor/RemoveFilesExecutor 被重建了）
     this.injectSnapshotCallbacks();
-
-    // 重新读取 ACE 配置并更新
-    const aceConfig = loadAceConfigFromFile();
-    this.aceExecutor.updateConfig(this.workspaceRoot, aceConfig.baseUrl, aceConfig.apiKey);
 
     this.lspExecutor = new LspExecutor(this.workspaceRoot);
     this.invalidateCache();
@@ -805,7 +767,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         return await this.mermaidExecutor.execute(toolCall);
 
       case 'codebase_retrieval':
-        return await this.aceExecutor.execute(toolCall, signal);
+        return await this.codebaseRetrievalExecutor.execute(toolCall, signal);
 
       case 'dispatch_task':
       case 'send_worker_message':
@@ -1008,7 +970,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       'list-processes': { category: '终端命令', desc: '列出所有终端进程' },
       'web_search': { category: '网络工具', desc: '搜索互联网信息' },
       'web_fetch': { category: '网络工具', desc: '获取 URL 页面内容' },
-      'codebase_retrieval': { category: '代码智能', desc: '语义搜索代码库' },
+      'codebase_retrieval': { category: '代码智能', desc: '本地语义检索代码库' },
       'mermaid_diagram': { category: '可视化', desc: '生成 Mermaid 图表' },
       'split_todo': { category: '任务管理', desc: '将当前任务拆分为多个子步骤' },
       'get_todos': { category: '任务管理', desc: '查看当前任务的 Todo 列表' },
@@ -1213,8 +1175,8 @@ Only works when the process is in "running" state; returns accepted=false otherw
     // 11. mermaid_diagram (Mermaid 图表)
     tools.push(this.mermaidExecutor.getToolDefinition());
 
-    // 12. codebase_retrieval (ACE 语义搜索)
-    tools.push(this.aceExecutor.getToolDefinition());
+    // 12. codebase_retrieval (本地代码检索基础设施)
+    tools.push(this.codebaseRetrievalExecutor.getToolDefinition());
 
     // 13-15. 编排工具 (dispatch_task, send_worker_message, wait_for_workers)
     tools.push(...this.orchestrationExecutor.getToolDefinitions());
@@ -2054,19 +2016,10 @@ Only works when the process is in "running" state; returns accepted=false otherw
   }
 
   /**
-   * 配置 ACE 语义搜索
+   * 获取代码库检索执行器（用于注入本地检索基础设施）
    */
-  configureAce(baseUrl: string, token: string): void {
-    this.aceExecutor.updateConfig(this.workspaceRoot, baseUrl, token);
-    this.invalidateCache();
-    logger.info('ACE configured', { baseUrl }, LogCategory.TOOLS);
-  }
-
-  /**
-   * 获取 ACE 执行器（用于手动触发索引等操作）
-   */
-  getAceExecutor(): AceExecutor {
-    return this.aceExecutor;
+  getCodebaseRetrievalExecutor(): CodebaseRetrievalExecutor {
+    return this.codebaseRetrievalExecutor;
   }
 
   /**
@@ -2090,10 +2043,4 @@ Only works when the process is in "running" state; returns accepted=false otherw
     return this.lspExecutor;
   }
 
-  /**
-   * 检查 ACE 是否已配置
-   */
-  isAceConfigured(): boolean {
-    return this.aceExecutor.isConfigured();
-  }
 }

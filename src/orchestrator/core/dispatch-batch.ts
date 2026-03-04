@@ -25,6 +25,7 @@ export class CancellationToken {
   private readonly controller = new AbortController();
   private _reason?: string;
   private readonly callbacks: Array<(reason: string) => void> = [];
+  private _callbackErrorCount = 0;
 
   get isCancelled(): boolean {
     return this.controller.signal.aborted;
@@ -44,7 +45,16 @@ export class CancellationToken {
     this._reason = reason;
     this.controller.abort(reason);
     for (const cb of this.callbacks) {
-      try { cb(reason); } catch { /* 回调异常不阻塞取消链 */ }
+      try {
+        cb(reason);
+      } catch (error: any) {
+        this._callbackErrorCount++;
+        logger.warn('DispatchBatch.CancellationToken.回调异常', {
+          reason,
+          callbackErrorCount: this._callbackErrorCount,
+          error: error?.message || String(error),
+        }, LogCategory.ORCHESTRATOR);
+      }
     }
   }
 
@@ -55,6 +65,10 @@ export class CancellationToken {
       return;
     }
     this.callbacks.push(callback);
+  }
+
+  get callbackErrorCount(): number {
+    return this._callbackErrorCount;
   }
 
   /** 如果已取消则抛异常，用于循环入口快速退出 */
@@ -119,6 +133,10 @@ export interface DispatchResult {
   summary: string;
   modifiedFiles?: string[];
   errors?: string[];
+  quality?: {
+    verificationDegraded?: boolean;
+    warnings?: string[];
+  };
   /** 任务消耗的 token 统计 */
   tokenUsage?: {
     inputTokens: number;
@@ -141,7 +159,7 @@ export type DispatchAuditLevel = 'normal' | 'watch' | 'intervention';
 export interface DispatchAuditIssue {
   taskId: string;
   level: DispatchAuditLevel;
-  dimension: 'scope' | 'cross_task' | 'contract';
+  dimension: 'scope' | 'cross_task' | 'contract' | 'verification';
   detail: string;
 }
 
@@ -164,6 +182,10 @@ export interface TokenConsumption {
   outputTokens: number;
   /** 总消耗 */
   totalTokens: number;
+}
+
+export interface DispatchBatchMetrics {
+  cancellationCallbackErrors: number;
 }
 
 /** DispatchBatch 阶段（显式状态机） */
@@ -719,6 +741,7 @@ export class DispatchBatch extends EventEmitter {
       batchId: this.id,
       reason,
       summary: this.getSummary(),
+      metrics: this.getMetrics(),
     }, LogCategory.ORCHESTRATOR);
   }
 
@@ -735,6 +758,7 @@ export class DispatchBatch extends EventEmitter {
       summary: this.getSummary(),
       tokenConsumption: this.getTokenConsumption(),
       auditOutcome: this._auditOutcome,
+      metrics: this.getMetrics(),
     }, LogCategory.ORCHESTRATOR);
   }
 
@@ -792,6 +816,12 @@ export class DispatchBatch extends EventEmitter {
       inputTokens: this._tokenConsumption.inputTokens,
       outputTokens: this._tokenConsumption.outputTokens,
       totalTokens: total,
+    };
+  }
+
+  getMetrics(): DispatchBatchMetrics {
+    return {
+      cancellationCallbackErrors: this.cancellationToken.callbackErrorCount,
     };
   }
 

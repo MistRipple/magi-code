@@ -5,7 +5,7 @@
 
 export { MemoryDocument } from './memory-document';
 export { ContextManager } from './context-manager';
-export { ContextCompressor, CompressorAdapter, CompressionStats } from './context-compressor';
+export { ContextAuxiliary, AuxiliaryAdapter, CompressionStats } from './context-auxiliary';
 export { TruncationUtils, TruncationResult, truncationUtils } from './truncation-utils';
 
 // 文件摘要缓存

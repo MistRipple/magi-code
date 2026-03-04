@@ -216,13 +216,28 @@ export abstract class BaseLLMAdapter extends EventEmitter {
    * 优先复用占位消息 ID，确保 UI 端流式更新命中同一条消息
    */
   protected startStreamWithContext(visibility?: 'user' | 'system' | 'debug'): string {
-    if (!this.currentTraceId) {
-      this.currentTraceId = this.messageHub.getTraceId();
-    }
+    const traceId = this.syncTraceFromMessageHub();
     const requestId = this.messageHub.getRequestContext();
     const boundMessageId = requestId ? this.messageHub.getRequestMessageId(requestId) : undefined;
 
-    return this.normalizer.startStream(this.currentTraceId, undefined, boundMessageId, visibility);
+    return this.normalizer.startStream(traceId, undefined, boundMessageId, visibility);
+  }
+
+  /**
+   * 将适配器当前 trace 与 MessageHub 保持一致。
+   * MessageHub trace 已与会话绑定，消息 trace 必须沿用它，避免跨会话误过滤。
+   */
+  protected syncTraceFromMessageHub(): string {
+    const hubTraceId = this.messageHub.getTraceId();
+    if (typeof hubTraceId === 'string' && hubTraceId.trim()) {
+      this.currentTraceId = hubTraceId.trim();
+      return this.currentTraceId;
+    }
+
+    if (!this.currentTraceId) {
+      this.currentTraceId = this.generateTraceId();
+    }
+    return this.currentTraceId;
   }
 
   // 节流定时器

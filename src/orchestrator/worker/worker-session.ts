@@ -109,7 +109,7 @@ export interface SessionUpdateOptions {
   /** 更新文件缓存 */
   updateFile?: { path: string; entry: FileCacheEntry };
   /** 标记 Todo 完成 */
-  completeTodo?: { id: string; content: string };
+  completeTodo?: { id: string; content?: string };
   /** 更新状态快照 */
   stateSnapshot?: Partial<SessionStateSnapshot>;
   /** 恢复提示 */
@@ -129,7 +129,10 @@ export class WorkerSessionManager {
   private readonly CLEANUP_INTERVAL_MS: number;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
-  private buildTodoFingerprint(content: string): string {
+  private buildTodoFingerprint(content?: string): string {
+    if (typeof content !== 'string') {
+      return '';
+    }
     return content.trim().replace(/\s+/g, ' ').toLowerCase();
   }
 
@@ -253,7 +256,7 @@ export class WorkerSessionManager {
         session.completedTodos.push(updates.completeTodo.id);
       }
       const fingerprint = this.buildTodoFingerprint(updates.completeTodo.content);
-      if (!session.completedTodoFingerprints.includes(fingerprint)) {
+      if (fingerprint && !session.completedTodoFingerprints.includes(fingerprint)) {
         session.completedTodoFingerprints.push(fingerprint);
       }
     }

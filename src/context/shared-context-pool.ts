@@ -150,6 +150,13 @@ const MAX_CONTENT_LENGTH = 2000;
 /** 相似度阈值（超过此值视为重复） */
 const SIMILARITY_THRESHOLD = 0.9;
 
+/** 去重索引：前缀采样长度 */
+const DEDUP_PREFIX_SAMPLE_SIZE = 96;
+/** 去重索引：token 采样数量 */
+const DEDUP_TOKEN_SAMPLE_COUNT = 12;
+/** 去重索引：内容长度分桶大小 */
+const DEDUP_LENGTH_BUCKET_SIZE = 160;
+
 /** 重要性评分映射 */
 const IMPORTANCE_SCORES: Record<ImportanceLevel, number> = {
   critical: 4,
@@ -185,6 +192,10 @@ const VALID_TYPES: SharedContextEntryType[] = [
 export class SharedContextPool {
   /** 条目存储（id -> entry） */
   private entries: Map<string, SharedContextEntry> = new Map();
+  /** 一级索引：missionId + type -> entryId 集合 */
+  private missionTypeIndex: Map<string, Set<string>> = new Map();
+  /** 二级索引：missionId + type + 内容签名 -> entryId 集合 */
+  private dedupSignatureIndex: Map<string, Set<string>> = new Map();
 
   // --------------------------------------------------------------------------
   // 公共方法
@@ -226,6 +237,7 @@ export class SharedContextPool {
 
     // 3. 新增条目
     this.entries.set(entry.id, entry);
+    this.indexEntry(entry);
     return { action: 'added', id: entry.id };
   }
 
@@ -287,16 +299,19 @@ export class SharedContextPool {
     maxTokens?: number
   ): SharedContextEntry[] {
     const results: SharedContextEntry[] = [];
+    const missionTypeKey = this.buildMissionTypeKey(missionId, type);
+    const bucket = this.missionTypeIndex.get(missionTypeKey);
+    if (!bucket || bucket.size === 0) {
+      return [];
+    }
 
-    for (const entry of this.entries.values()) {
-      // 任务隔离
-      if (entry.missionId !== missionId) continue;
-
-      // 类型筛选
-      if (entry.type !== type) continue;
+    const now = Date.now();
+    for (const id of bucket) {
+      const entry = this.entries.get(id);
+      if (!entry) continue;
 
       // 过期检查
-      if (entry.expiresAt && entry.expiresAt < Date.now()) continue;
+      if (entry.expiresAt && entry.expiresAt < now) continue;
 
       results.push(entry);
     }
@@ -321,16 +336,35 @@ export class SharedContextPool {
    * @returns 重复的条目（如果存在）
    */
   findDuplicate(entry: SharedContextEntry): SharedContextEntry | null {
-    for (const existing of this.entries.values()) {
-      // 同一 Mission + 同一类型 + 内容相似度 > 90%
-      if (
-        existing.missionId === entry.missionId &&
-        existing.type === entry.type &&
-        this.similarity(existing.content, entry.content) > SIMILARITY_THRESHOLD
-      ) {
+    const now = Date.now();
+    const candidateIds = this.collectDuplicateCandidateIds(entry);
+    if (candidateIds.size === 0) {
+      return null;
+    }
+    const targetLength = entry.content.length;
+    const maxLengthDelta = Math.max(40, Math.floor(targetLength * 0.25));
+
+    for (const candidateId of candidateIds) {
+      const existing = this.entries.get(candidateId);
+      if (!existing) continue;
+
+      // 同一条目不参与比较
+      if (existing.id === entry.id) continue;
+
+      // mission/type 双重隔离（防御性检查）
+      if (existing.missionId !== entry.missionId || existing.type !== entry.type) continue;
+
+      // 过期条目不参与去重
+      if (existing.expiresAt && existing.expiresAt < now) continue;
+
+      // 长度差过大时无需进入高成本相似度计算
+      if (Math.abs(existing.content.length - targetLength) > maxLengthDelta) continue;
+
+      if (this.similarity(existing.content, entry.content) > SIMILARITY_THRESHOLD) {
         return existing;
       }
     }
+
     return null;
   }
 
@@ -397,8 +431,9 @@ export class SharedContextPool {
     let cleared = 0;
     for (const [id, entry] of this.entries.entries()) {
       if (entry.missionId === missionId) {
-        this.entries.delete(id);
-        cleared++;
+        if (this.removeEntryByIdInternal(id, entry)) {
+          cleared++;
+        }
       }
     }
     return cleared;
@@ -414,8 +449,9 @@ export class SharedContextPool {
     let cleared = 0;
     for (const [id, entry] of this.entries.entries()) {
       if (entry.expiresAt && entry.expiresAt < now) {
-        this.entries.delete(id);
-        cleared++;
+        if (this.removeEntryByIdInternal(id, entry)) {
+          cleared++;
+        }
       }
     }
     return cleared;
@@ -438,7 +474,7 @@ export class SharedContextPool {
    * @returns 是否成功删除
    */
   deleteById(id: string): boolean {
-    return this.entries.delete(id);
+    return this.removeEntryByIdInternal(id);
   }
 
   /**
@@ -479,6 +515,7 @@ export class SharedContextPool {
         continue;
       }
       this.entries.set(entry.id, entry);
+      this.indexEntry(entry);
       restored++;
     }
     if (restored > 0) {
@@ -490,6 +527,169 @@ export class SharedContextPool {
   // --------------------------------------------------------------------------
   // 私有方法
   // --------------------------------------------------------------------------
+
+  /**
+   * 构建 mission + type 组合键
+   */
+  private buildMissionTypeKey(missionId: string, type: SharedContextEntryType): string {
+    return `${missionId}::${type}`;
+  }
+
+  /**
+   * 去重归一化（统一大小写与空白，降低无意义差异）
+   */
+  private normalizeDedupContent(content: string): string {
+    return content.toLowerCase().replace(/\s+/g, ' ').trim();
+  }
+
+  /**
+   * FNV-1a 32-bit 哈希，生成稳定短签名
+   */
+  private hashString(value: string): string {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < value.length; i++) {
+      hash ^= value.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return (hash >>> 0).toString(36);
+  }
+
+  /**
+   * 内容长度分桶
+   */
+  private dedupLengthBucket(contentLength: number): number {
+    return Math.max(0, Math.floor(contentLength / DEDUP_LENGTH_BUCKET_SIZE));
+  }
+
+  /**
+   * 构建内容签名键集合
+   *
+   * includeAdjacentLengthBuckets=true 时，会包含长度桶的相邻桶（-1/+1），
+   * 用于“长度轻微变化”的重复检测召回。
+   */
+  private buildDedupSignatureKeys(
+    missionTypeKey: string,
+    normalizedContent: string,
+    includeAdjacentLengthBuckets: boolean,
+  ): string[] {
+    const prefixSample = normalizedContent.slice(0, DEDUP_PREFIX_SAMPLE_SIZE);
+    const tokenSample = normalizedContent
+      .split(' ')
+      .filter(Boolean)
+      .slice(0, DEDUP_TOKEN_SAMPLE_COUNT)
+      .join('|');
+    const lengthBucket = this.dedupLengthBucket(normalizedContent.length);
+
+    const keys = new Set<string>([
+      `${missionTypeKey}|h|${this.hashString(normalizedContent)}`,
+      `${missionTypeKey}|p|${this.hashString(prefixSample)}`,
+      `${missionTypeKey}|t|${this.hashString(tokenSample || normalizedContent)}`,
+      `${missionTypeKey}|l|${lengthBucket}`,
+    ]);
+
+    if (includeAdjacentLengthBuckets) {
+      keys.add(`${missionTypeKey}|l|${Math.max(0, lengthBucket - 1)}`);
+      keys.add(`${missionTypeKey}|l|${lengthBucket + 1}`);
+    }
+
+    return Array.from(keys);
+  }
+
+  /**
+   * 从一级/二级索引中收集重复候选
+   */
+  private collectDuplicateCandidateIds(entry: SharedContextEntry): Set<string> {
+    const missionTypeKey = this.buildMissionTypeKey(entry.missionId, entry.type);
+    const normalizedContent = this.normalizeDedupContent(entry.content);
+    const signatureKeys = this.buildDedupSignatureKeys(missionTypeKey, normalizedContent, true);
+    const candidateIds = new Set<string>();
+
+    for (const signatureKey of signatureKeys) {
+      const bucket = this.dedupSignatureIndex.get(signatureKey);
+      if (!bucket) continue;
+      for (const id of bucket) {
+        candidateIds.add(id);
+      }
+    }
+
+    // 兜底：若二级索引暂无候选，则退回一级索引保障召回率
+    if (candidateIds.size === 0) {
+      const missionTypeBucket = this.missionTypeIndex.get(missionTypeKey);
+      if (missionTypeBucket) {
+        for (const id of missionTypeBucket) {
+          candidateIds.add(id);
+        }
+      }
+    }
+
+    return candidateIds;
+  }
+
+  /**
+   * 将条目写入索引
+   */
+  private indexEntry(entry: SharedContextEntry): void {
+    const missionTypeKey = this.buildMissionTypeKey(entry.missionId, entry.type);
+    this.addToIndex(this.missionTypeIndex, missionTypeKey, entry.id);
+
+    const normalizedContent = this.normalizeDedupContent(entry.content);
+    const signatureKeys = this.buildDedupSignatureKeys(missionTypeKey, normalizedContent, false);
+    for (const signatureKey of signatureKeys) {
+      this.addToIndex(this.dedupSignatureIndex, signatureKey, entry.id);
+    }
+  }
+
+  /**
+   * 将条目从索引移除
+   */
+  private deindexEntry(entry: SharedContextEntry): void {
+    const missionTypeKey = this.buildMissionTypeKey(entry.missionId, entry.type);
+    this.removeFromIndex(this.missionTypeIndex, missionTypeKey, entry.id);
+
+    const normalizedContent = this.normalizeDedupContent(entry.content);
+    const signatureKeys = this.buildDedupSignatureKeys(missionTypeKey, normalizedContent, false);
+    for (const signatureKey of signatureKeys) {
+      this.removeFromIndex(this.dedupSignatureIndex, signatureKey, entry.id);
+    }
+  }
+
+  /**
+   * 索引通用添加
+   */
+  private addToIndex(index: Map<string, Set<string>>, key: string, entryId: string): void {
+    let bucket = index.get(key);
+    if (!bucket) {
+      bucket = new Set<string>();
+      index.set(key, bucket);
+    }
+    bucket.add(entryId);
+  }
+
+  /**
+   * 索引通用移除（自动清理空桶）
+   */
+  private removeFromIndex(index: Map<string, Set<string>>, key: string, entryId: string): void {
+    const bucket = index.get(key);
+    if (!bucket) return;
+
+    bucket.delete(entryId);
+    if (bucket.size === 0) {
+      index.delete(key);
+    }
+  }
+
+  /**
+   * 删除条目（含索引清理）
+   */
+  private removeEntryByIdInternal(id: string, knownEntry?: SharedContextEntry): boolean {
+    const entry = knownEntry || this.entries.get(id);
+    if (!entry) {
+      return false;
+    }
+
+    this.deindexEntry(entry);
+    return this.entries.delete(id);
+  }
 
   /**
    * 验证条目是否合法

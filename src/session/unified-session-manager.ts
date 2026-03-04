@@ -273,6 +273,33 @@ export class UnifiedSessionManager {
     images?: Array<{ dataUrl: string }>  // 🔧 新增：用户上传的图片
   ): SessionMessage {
     const session = this.getOrCreateCurrentSession();
+    return this.appendMessageToSession(session, role, content, agent, source, images);
+  }
+
+  /** 添加消息到指定会话（强一致会话写入，避免跨会话污染） */
+  addMessageToSession(
+    sessionId: string,
+    role: 'user' | 'assistant',
+    content: string,
+    agent?: AgentType,
+    source?: 'orchestrator' | 'worker' | 'system',
+    images?: Array<{ dataUrl: string }>
+  ): SessionMessage {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+    return this.appendMessageToSession(session, role, content, agent, source, images);
+  }
+
+  private appendMessageToSession(
+    session: UnifiedSession,
+    role: 'user' | 'assistant',
+    content: string,
+    agent?: AgentType,
+    source?: 'orchestrator' | 'worker' | 'system',
+    images?: Array<{ dataUrl: string }>
+  ): SessionMessage {
     const message: SessionMessage = {
       id: generateMessageId(),
       role,

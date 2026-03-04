@@ -18,9 +18,11 @@ import type {
 } from '../types';
 import {
   StandardMessage,
+  StreamUpdate,
   DataMessageType,
   NotifyLevel,
   InteractionType,
+  MessageCategory,
   createInteractionMessage,
 } from '../protocol/message-protocol';
 import { ADAPTER_EVENTS, PROCESSING_EVENTS, WEBVIEW_MESSAGE_TYPES } from '../protocol/event-names';
@@ -77,6 +79,12 @@ export class EventBindingService {
   private activeToolAuthorizationRequestId: string | null = null;
   private activeToolAuthorizationTimer: NodeJS.Timeout | null = null;
   private readonly toolAuthorizationTimeoutMs = 60000;
+  private readonly messageSessionByMessageId = new Map<string, string>();
+  private readonly MAX_MESSAGE_SESSION_ENTRIES = 10000;
+  private readonly pendingUpdatesByMessageId = new Map<string, StreamUpdate[]>();
+  private readonly pendingUpdateTimers = new Map<string, NodeJS.Timeout>();
+  private readonly MAX_PENDING_UPDATES_PER_MESSAGE = 200;
+  private readonly PENDING_UPDATE_TIMEOUT_MS = 30000;
 
   constructor(private readonly ctx: EventBindingContext) {}
 
@@ -291,6 +299,12 @@ export class EventBindingService {
       callback(false);
     }
     this.toolAuthorizationCallbacks.clear();
+    for (const timer of this.pendingUpdateTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingUpdateTimers.clear();
+    this.pendingUpdatesByMessageId.clear();
+    this.messageSessionByMessageId.clear();
   }
 
   // ============================================================================
@@ -307,20 +321,32 @@ export class EventBindingService {
     const messageHub = this.ctx.getMessageHub();
 
     messageHub.on('unified:message', (message) => {
+      const messageSessionId = this.resolveMessageSessionId(message);
+      if (!messageSessionId) {
+        logger.warn('界面.消息.丢弃_缺少会话标识', { messageId: message.id }, LogCategory.UI);
+        return;
+      }
+      this.rememberMessageSession(message.id, messageSessionId);
+      this.flushPendingUpdatesForMessage(message.id, messageSessionId);
       this.ctx.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.UNIFIED_MESSAGE,
         message,
-        sessionId: this.ctx.getActiveSessionId()
+        sessionId: messageSessionId
       });
       this.ctx.logMessageFlow('messageHub.standardMessage [SENT]', message);
       this.ctx.resolveRequestTimeoutFromMessage(message);
     });
 
     messageHub.on('unified:update', (update) => {
+      const updateSessionId = this.messageSessionByMessageId.get(update.messageId);
+      if (!updateSessionId) {
+        this.bufferPendingUpdate(update);
+        return;
+      }
       this.ctx.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.UNIFIED_UPDATE,
         update,
-        sessionId: this.ctx.getActiveSessionId()
+        sessionId: updateSessionId
       });
       this.ctx.logMessageFlow('messageHub.standardUpdate [SENT]', update);
       const reqId = this.ctx.getMessageIdToRequestId().get(update.messageId);
@@ -330,10 +356,17 @@ export class EventBindingService {
     });
 
     messageHub.on('unified:complete', (message) => {
+      const completeSessionId = this.resolveMessageSessionId(message) || this.messageSessionByMessageId.get(message.id);
+      if (!completeSessionId) {
+        logger.warn('界面.消息.完成丢弃_缺少会话标识', { messageId: message.id }, LogCategory.UI);
+        return;
+      }
+      this.rememberMessageSession(message.id, completeSessionId);
+      this.flushPendingUpdatesForMessage(message.id, completeSessionId);
       this.ctx.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.UNIFIED_COMPLETE,
         message,
-        sessionId: this.ctx.getActiveSessionId()
+        sessionId: completeSessionId
       });
       this.ctx.logMessageFlow('messageHub.standardComplete [SENT]', message);
       this.ctx.resolveRequestTimeoutFromMessage(message);
@@ -447,6 +480,108 @@ export class EventBindingService {
     if (this.activeToolAuthorizationTimer) {
       clearTimeout(this.activeToolAuthorizationTimer);
       this.activeToolAuthorizationTimer = null;
+    }
+  }
+
+  private resolveMessageSessionId(message: StandardMessage): string | null {
+    const metadataSessionId = typeof message.metadata?.sessionId === 'string'
+      ? message.metadata.sessionId.trim()
+      : '';
+    if (metadataSessionId) {
+      return metadataSessionId;
+    }
+    const dataPayloadSessionId = this.resolveDataPayloadSessionId(message);
+    if (dataPayloadSessionId) {
+      return dataPayloadSessionId;
+    }
+    const traceId = typeof message.traceId === 'string' ? message.traceId.trim() : '';
+    return traceId || null;
+  }
+
+  private resolveDataPayloadSessionId(message: StandardMessage): string | null {
+    if (message.category !== MessageCategory.DATA || !message.data?.payload) {
+      return null;
+    }
+    const payload = message.data.payload as Record<string, unknown>;
+    const payloadSessionId = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : '';
+    if (payloadSessionId) {
+      return payloadSessionId;
+    }
+    const state = payload.state as Record<string, unknown> | undefined;
+    const stateSessionId = typeof state?.currentSessionId === 'string' ? state.currentSessionId.trim() : '';
+    if (stateSessionId) {
+      return stateSessionId;
+    }
+    const payloadSession = payload.session as Record<string, unknown> | undefined;
+    const nestedSessionId = typeof payloadSession?.id === 'string' ? payloadSession.id.trim() : '';
+    if (nestedSessionId) {
+      return nestedSessionId;
+    }
+    return null;
+  }
+
+  private rememberMessageSession(messageId: string, sessionId: string): void {
+    if (!messageId || !sessionId) {
+      return;
+    }
+    this.messageSessionByMessageId.set(messageId, sessionId);
+    if (this.messageSessionByMessageId.size <= this.MAX_MESSAGE_SESSION_ENTRIES) {
+      return;
+    }
+    const oldestKey = this.messageSessionByMessageId.keys().next().value as string | undefined;
+    if (oldestKey) {
+      this.messageSessionByMessageId.delete(oldestKey);
+    }
+  }
+
+  private bufferPendingUpdate(update: StreamUpdate): void {
+    const messageId = update.messageId;
+    if (!messageId) {
+      return;
+    }
+    const list = this.pendingUpdatesByMessageId.get(messageId) || [];
+    if (list.length >= this.MAX_PENDING_UPDATES_PER_MESSAGE) {
+      list.shift();
+    }
+    list.push(update);
+    this.pendingUpdatesByMessageId.set(messageId, list);
+
+    if (!this.pendingUpdateTimers.has(messageId)) {
+      const timer = setTimeout(() => {
+        const dropped = this.pendingUpdatesByMessageId.get(messageId)?.length || 0;
+        this.pendingUpdatesByMessageId.delete(messageId);
+        this.pendingUpdateTimers.delete(messageId);
+        logger.warn('界面.消息.流式更新超时清理', {
+          messageId,
+          dropped,
+        }, LogCategory.UI);
+      }, this.PENDING_UPDATE_TIMEOUT_MS);
+      this.pendingUpdateTimers.set(messageId, timer);
+    }
+  }
+
+  private flushPendingUpdatesForMessage(messageId: string, sessionId: string): void {
+    const updates = this.pendingUpdatesByMessageId.get(messageId);
+    if (!updates || updates.length === 0) {
+      return;
+    }
+    this.pendingUpdatesByMessageId.delete(messageId);
+    const timer = this.pendingUpdateTimers.get(messageId);
+    if (timer) {
+      clearTimeout(timer);
+      this.pendingUpdateTimers.delete(messageId);
+    }
+    for (const update of updates) {
+      this.ctx.postMessage({
+        type: WEBVIEW_MESSAGE_TYPES.UNIFIED_UPDATE,
+        update,
+        sessionId,
+      });
+      this.ctx.logMessageFlow('messageHub.standardUpdate [FLUSHED]', update);
+      const reqId = this.ctx.getMessageIdToRequestId().get(update.messageId);
+      if (reqId) {
+        this.ctx.clearRequestTimeout(reqId);
+      }
     }
   }
 

@@ -1,9 +1,9 @@
 /**
- * ResilientCompressorAdapter - 弹性上下文压缩适配器
+ * ResilientAuxiliaryAdapter - 弹性辅助模型适配器
  *
  * 职责：
- * - 配置 ContextManager 的压缩适配器
- * - 压缩模型不可用时自动切换到编排模型
+ * - 配置 ContextManager 的辅助模型适配器
+ * - 辅助模型不可用时自动切换到编排模型
  * - 连接失败时重试（瞬态故障容错）
  * - 认证/配额错误时立即失败（不重试）
  */
@@ -83,30 +83,30 @@ function sleep(ms: number): Promise<void> {
  * 为 ContextManager 配置弹性压缩适配器
  *
  * 策略：
- * 1. 优先使用专用压缩模型
- * 2. 压缩模型不可用/失败时，自动切换编排模型
+ * 1. 优先使用专用辅助模型
+ * 2. 辅助模型不可用/失败时，自动切换编排模型
  * 3. 连接失败时最多重试 3 次（10s/20s/30s 间隔）
  * 4. 认证/配额错误立即抛出（不重试）
  */
-export async function configureResilientCompressor(
+export async function configureResilientAuxiliary(
   contextManager: ContextManager,
   executionStats: ExecutionStats,
 ): Promise<void> {
   try {
     const { LLMConfigLoader } = await import('../../llm/config');
     const { createLLMClient } = await import('../../llm/clients/client-factory');
-    const compressorConfig = LLMConfigLoader.loadCompressorConfig();
+    const auxiliaryConfig = LLMConfigLoader.loadAuxiliaryConfig();
     const orchestratorConfig = LLMConfigLoader.loadOrchestratorConfig();
 
-    const compressorReady = compressorConfig.enabled
-      && Boolean(compressorConfig.baseUrl && compressorConfig.model)
-      && LLMConfigLoader.validateConfig(compressorConfig, 'compressor');
+    const auxiliaryReady = auxiliaryConfig.enabled
+      && Boolean(auxiliaryConfig.baseUrl && auxiliaryConfig.model)
+      && LLMConfigLoader.validateConfig(auxiliaryConfig, 'auxiliary');
 
-    if (!compressorReady) {
-      logger.warn('编排器.上下文.压缩模型.不可用_切换编排模型', {
-        enabled: compressorConfig.enabled,
-        hasBaseUrl: Boolean(compressorConfig.baseUrl),
-        hasModel: Boolean(compressorConfig.model),
+    if (!auxiliaryReady) {
+      logger.warn('编排器.上下文.辅助模型.不可用_切换编排模型', {
+        enabled: auxiliaryConfig.enabled,
+        hasBaseUrl: Boolean(auxiliaryConfig.baseUrl),
+        hasModel: Boolean(auxiliaryConfig.model),
       }, LogCategory.ORCHESTRATOR);
     }
 
@@ -122,7 +122,7 @@ export async function configureResilientCompressor(
       error?: string
     ) => {
       executionStats.recordExecution({
-        worker: 'compressor',
+        worker: 'auxiliary',
         taskId: 'memory',
         subTaskId: 'compress',
         success,
@@ -151,7 +151,7 @@ export async function configureResilientCompressor(
       } catch (error: unknown) {
         const duration = Date.now() - startAt;
         recordCompression(false, duration, undefined, normalizeErrorMessage(error));
-        logger.warn('编排器.上下文.压缩模型.调用失败', {
+        logger.warn('编排器.上下文.辅助模型.调用失败', {
           model: label,
           error: normalizeErrorMessage(error),
         }, LogCategory.ORCHESTRATOR);
@@ -171,7 +171,7 @@ export async function configureResilientCompressor(
             throw error;
           }
           const delay = retryDelays[attempt];
-          logger.warn('编排器.上下文.压缩模型.连接失败_重试', {
+          logger.warn('编排器.上下文.辅助模型.连接失败_重试', {
             attempt: attempt + 1,
             delayMs: delay,
             error: normalizeErrorMessage(error),
@@ -186,13 +186,13 @@ export async function configureResilientCompressor(
     const adapter = {
       sendMessage: async (message: string) => {
         try {
-          if (!compressorReady) {
-            throw new Error('compressor_unavailable');
+          if (!auxiliaryReady) {
+            throw new Error('auxiliary_unavailable');
           }
-          const client = createLLMClient(compressorConfig);
-          return await sendWithRetry(client, 'compressor', message);
+          const client = createLLMClient(auxiliaryConfig);
+          return await sendWithRetry(client, 'auxiliary', message);
         } catch (error: unknown) {
-          const shouldSwitchToOrchestrator = !compressorReady
+          const shouldSwitchToOrchestrator = !auxiliaryReady
             || isAuthOrQuotaError(error)
             || isConnectionError(error)
             || isModelError(error)
@@ -200,8 +200,8 @@ export async function configureResilientCompressor(
           if (!shouldSwitchToOrchestrator) {
             throw error;
           }
-          logger.warn('编排器.上下文.压缩模型.切换_使用编排模型', {
-            reason: !compressorReady ? 'not_available'
+          logger.warn('编排器.上下文.辅助模型.切换_使用编排模型', {
+            reason: !auxiliaryReady ? 'not_available'
               : isAuthOrQuotaError(error) ? 'auth_or_quota'
               : isConnectionError(error) ? 'connection'
               : isModelError(error) ? 'model'
@@ -214,14 +214,14 @@ export async function configureResilientCompressor(
       },
     };
 
-    contextManager.setCompressorAdapter(adapter);
-    const activeConfig = compressorReady ? compressorConfig : orchestratorConfig;
-    logger.info('编排器.上下文.压缩模型.已设置', {
+    contextManager.setAuxiliaryAdapter(adapter);
+    const activeConfig = auxiliaryReady ? auxiliaryConfig : orchestratorConfig;
+    logger.info('编排器.上下文.辅助模型.已设置', {
       model: activeConfig.model,
       provider: activeConfig.provider,
-      useOrchestratorModel: !compressorReady,
+      useOrchestratorModel: !auxiliaryReady,
     }, LogCategory.ORCHESTRATOR);
   } catch (error) {
-    logger.error('编排器.上下文.压缩模型.设置失败', error, LogCategory.ORCHESTRATOR);
+    logger.error('编排器.上下文.辅助模型.设置失败', error, LogCategory.ORCHESTRATOR);
   }
 }

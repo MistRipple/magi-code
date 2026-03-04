@@ -31,16 +31,26 @@
     tags?: string[];
   }
 
+  interface Learning {
+    id: string;
+    content: string;
+    context?: string;
+    createdAt?: string;
+    tags?: string[];
+  }
+
   // 状态
-  let currentTab = $state<'overview' | 'adr' | 'faq'>('overview');
+  let currentTab = $state<'overview' | 'adr' | 'faq' | 'learning'>('overview');
   let isLoading = $state(true);
   let codeIndex = $state<CodeIndex | null>(null);
   let adrs = $state<ADR[]>([]);
   let faqs = $state<FAQ[]>([]);
+  let learnings = $state<Learning[]>([]);
   let searchQuery = $state('');
   let adrFilter = $state<'all' | 'proposed' | 'accepted' | 'archived' | 'superseded'>('all');
   let expandedAdrId = $state<string | null>(null);
   let expandedFaqId = $state<string | null>(null);
+  let expandedLearningId = $state<string | null>(null);
   let showClearConfirm = $state(false);
 
   // 统计信息
@@ -78,10 +88,23 @@
     );
   });
 
+  // 过滤后的 Learning 列表
+  const filteredLearnings = $derived.by(() => {
+    let result = learnings.filter(l => l.content && typeof l.content === 'string');
+    if (!searchQuery.trim()) return result;
+    const query = searchQuery.toLowerCase();
+    return result.filter(l =>
+      l.content.toLowerCase().includes(query) ||
+      l.context?.toLowerCase().includes(query) ||
+      l.tags?.some(t => t.toLowerCase().includes(query))
+    );
+  });
+
   function switchTab(tabId: typeof currentTab) {
     currentTab = tabId;
     expandedAdrId = null;
     expandedFaqId = null;
+    expandedLearningId = null;
   }
 
   function refresh() {
@@ -105,6 +128,15 @@
   function deleteFaq(id: string, e: Event) {
     e.stopPropagation();
     vscode.postMessage({ type: 'deleteFAQ', id });
+  }
+
+  function toggleLearning(learning: Learning) {
+    expandedLearningId = expandedLearningId === learning.id ? null : learning.id;
+  }
+
+  function deleteLearning(id: string, e: Event) {
+    e.stopPropagation();
+    vscode.postMessage({ type: 'deleteLearning', id });
   }
 
   function confirmClear() {
@@ -140,7 +172,7 @@
       if (!standard || standard.category !== MessageCategory.DATA || !standard.data) return;
       if (standard.data.dataType !== 'projectKnowledgeLoaded') return;
 
-      const payload = standard.data.payload as { codeIndex?: any; adrs?: any[]; faqs?: any[] };
+      const payload = standard.data.payload as { codeIndex?: any; adrs?: any[]; faqs?: any[]; learnings?: any[] };
       codeIndex = payload?.codeIndex
         ? {
             ...payload.codeIndex,
@@ -151,6 +183,7 @@
         : null;
       adrs = ensureArray(payload?.adrs);
       faqs = ensureArray(payload?.faqs);
+      learnings = ensureArray(payload?.learnings);
       isLoading = false;
     });
 
@@ -182,6 +215,13 @@
         <span class="kp-tab-count">{faqs.length}</span>
       {/if}
     </button>
+    <button class="kp-tab" class:active={currentTab === 'learning'} onclick={() => switchTab('learning')}>
+      <Icon name="lightbulb" size={13} />
+      <span>经验</span>
+      {#if learnings.length > 0}
+        <span class="kp-tab-count">{learnings.length}</span>
+      {/if}
+    </button>
     <div class="kp-tab-actions">
       <button class="kp-icon-btn" onclick={refresh} disabled={isLoading} title="刷新">
         <Icon name="refresh" size={14} class={isLoading ? 'spinning' : ''} />
@@ -189,7 +229,7 @@
       <button
         class="kp-icon-btn kp-icon-btn--danger"
         onclick={confirmClear}
-        disabled={isLoading || (adrs.length === 0 && faqs.length === 0)}
+        disabled={isLoading || (adrs.length === 0 && faqs.length === 0 && learnings.length === 0)}
         title="清空知识库"
       >
         <Icon name="delete" size={14} />
@@ -204,7 +244,7 @@
       <input
         type="text"
         class="kp-search-input"
-        placeholder={currentTab === 'adr' ? '搜索架构决策...' : '搜索常见问题...'}
+        placeholder={currentTab === 'adr' ? '搜索架构决策...' : currentTab === 'faq' ? '搜索常见问题...' : '搜索经验记录...'}
         bind:value={searchQuery}
       />
       {#if searchQuery}
@@ -264,6 +304,11 @@
           <div class="kp-stat">
             <span class="kp-stat-value">{faqs.length}</span>
             <span class="kp-stat-label">FAQ</span>
+          </div>
+          <div class="kp-stat-divider"></div>
+          <div class="kp-stat">
+            <span class="kp-stat-value">{learnings.length}</span>
+            <span class="kp-stat-label">经验</span>
           </div>
         </div>
 
@@ -436,6 +481,62 @@
                   {#if faq.tags && faq.tags.length > 0}
                     <div class="kp-tag-list">
                       {#each faq.tags as tag}
+                        <span class="kp-tag">{tag}</span>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+          {/each}
+        {/if}
+      </div>
+
+    {:else if currentTab === 'learning'}
+      <!-- Learning Tab -->
+      <div class="kp-list">
+        {#if filteredLearnings.length === 0}
+          <div class="kp-empty">
+            <Icon name="lightbulb" size={28} />
+            <div class="kp-empty-title">暂无经验记录</div>
+            <div class="kp-empty-hint">Agent 完成任务后会自动提取并归档</div>
+          </div>
+        {:else}
+          {#each filteredLearnings as learning (learning.id)}
+            {@const isExpanded = expandedLearningId === learning.id}
+            <div class="kp-card" class:expanded={isExpanded}>
+              <div class="kp-card-header" role="button" tabindex="0" onclick={() => toggleLearning(learning)} onkeydown={(e) => e.key === 'Enter' && toggleLearning(learning)}>
+                <span class="kp-card-indicator learning"></span>
+                <div class="kp-card-main">
+                  <span class="kp-card-title">{learning.content.length > 80 ? learning.content.slice(0, 80) + '...' : learning.content}</span>
+                  {#if !isExpanded && learning.context}
+                    <p class="kp-card-preview">{learning.context}</p>
+                  {/if}
+                </div>
+                <div class="kp-card-meta">
+                  {#if learning.createdAt}
+                    <span class="kp-category-badge">{new Date(learning.createdAt).toLocaleDateString()}</span>
+                  {/if}
+                  <button class="kp-card-delete" title="删除" onclick={(e) => deleteLearning(learning.id, e)}>
+                    <Icon name="trash" size={12} />
+                  </button>
+                  <Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={12} />
+                </div>
+              </div>
+              {#if isExpanded}
+                <div class="kp-card-body">
+                  <div class="kp-detail-block">
+                    <p>{learning.content}</p>
+                  </div>
+                  {#if learning.context}
+                    <div class="kp-detail-block">
+                      <h5>上下文</h5>
+                      <p>{learning.context}</p>
+                    </div>
+                  {/if}
+                  {#if learning.tags && learning.tags.length > 0}
+                    <div class="kp-tag-list">
+                      {#each learning.tags as tag}
                         <span class="kp-tag">{tag}</span>
                       {/each}
                     </div>
@@ -890,6 +991,7 @@
   .kp-card-indicator.superseded { background: var(--warning); }
   .kp-card-indicator.default { background: var(--border); }
   .kp-card-indicator.faq { background: var(--color-gemini); }
+  .kp-card-indicator.learning { background: var(--warning); }
 
   .kp-card-main {
     flex: 1;

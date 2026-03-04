@@ -297,7 +297,14 @@ export class ContractManager {
       violated: ['draft', 'implemented'],
     };
 
-    if (!validTransitions[contract.status].includes(newStatus)) {
+    const currentTransitions = validTransitions[contract.status];
+    if (!currentTransitions) {
+      throw new Error(
+        `Invalid contract status value: ${String(contract.status)}`
+      );
+    }
+
+    if (!currentTransitions.includes(newStatus)) {
       throw new Error(
         `Invalid contract status transition: ${contract.status} -> ${newStatus}`
       );

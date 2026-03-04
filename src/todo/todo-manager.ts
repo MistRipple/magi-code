@@ -153,6 +153,15 @@ export class TodoManager extends EventEmitter {
     return todo;
   }
 
+  /**
+   * 持久化 Todo 并在成功后刷新缓存。
+   * 保证 save 失败时不会污染内存缓存状态。
+   */
+  private async persistTodo(todo: UnifiedTodo): Promise<void> {
+    await this.repository.save(todo);
+    this.cacheTodo(todo);
+  }
+
   // ============================================================================
   // 队列管理
   // ============================================================================
@@ -201,8 +210,7 @@ export class TodoManager extends EventEmitter {
       createdAt: now,
     };
 
-    await this.repository.save(todo);
-    this.cacheTodo(todo);
+    await this.persistTodo(todo);
 
     // 检查依赖，决定初始状态
     await this.checkAndUpdateStatus(todo);
@@ -247,9 +255,12 @@ export class TodoManager extends EventEmitter {
     // 过滤 undefined 字段，防止 Object.assign 用 undefined 覆写已有数据
     const cleanUpdates = Object.fromEntries(
       Object.entries(updates).filter(([_, v]) => v !== undefined)
-    );
-    Object.assign(todo, cleanUpdates);
-    await this.repository.save(todo);
+    ) as Partial<UnifiedTodo>;
+    const nextTodo: UnifiedTodo = {
+      ...todo,
+      ...cleanUpdates,
+    };
+    await this.persistTodo(nextTodo);
   }
 
   /**
@@ -390,10 +401,13 @@ export class TodoManager extends EventEmitter {
       return;
     }
 
-    todo.status = 'blocked';
-    todo.blockedReason = reason;
-    await this.repository.save(todo);
-    this.emit('todo:blocked', todo, reason);
+    const nextTodo: UnifiedTodo = {
+      ...todo,
+      status: 'blocked',
+      blockedReason: reason,
+    };
+    await this.persistTodo(nextTodo);
+    this.emit('todo:blocked', nextTodo, reason);
   }
 
   /**
@@ -408,13 +422,16 @@ export class TodoManager extends EventEmitter {
       return;
     }
 
-    todo.status = 'ready';
-    todo.blockedReason = undefined;
-    await this.repository.save(todo);
+    const nextTodo: UnifiedTodo = {
+      ...todo,
+      status: 'ready',
+      blockedReason: undefined,
+    };
+    await this.persistTodo(nextTodo);
 
-    this.enqueue(todo);
-    this.emit('todo:ready', todo);
-    this.emit('todo:unblocked', todo);
+    this.enqueue(nextTodo);
+    this.emit('todo:ready', nextTodo);
+    this.emit('todo:unblocked', nextTodo);
   }
 
   /**
@@ -428,19 +445,23 @@ export class TodoManager extends EventEmitter {
       throw new Error(`Cannot start todo in status: ${todo.status}`);
     }
 
-    todo.status = 'running';
-    todo.startedAt = Date.now();
+    const nextTodo: UnifiedTodo = {
+      ...todo,
+      status: 'running',
+      startedAt: Date.now(),
+    };
+
+    await this.persistTodo(nextTodo);
     this.queue.remove(todoId);
 
     // 设置超时监控
-    if (todo.timeoutAt) {
-      this.timeoutChecker.add(todoId, todo.timeoutAt, () => {
+    if (nextTodo.timeoutAt) {
+      this.timeoutChecker.add(todoId, nextTodo.timeoutAt, () => {
         this.handleTimeout(todoId);
       });
     }
 
-    await this.repository.save(todo);
-    this.emit('todo:started', todo);
+    this.emit('todo:started', nextTodo);
   }
 
   /**
@@ -450,9 +471,12 @@ export class TodoManager extends EventEmitter {
     const todo = await this.get(todoId);
     if (!todo) throw new Error(`Todo not found: ${todoId}`);
 
-    todo.progress = Math.max(0, Math.min(100, progress));
-    await this.repository.save(todo);
-    this.emit('todo:progress', todo, progress);
+    const nextTodo: UnifiedTodo = {
+      ...todo,
+      progress: Math.max(0, Math.min(100, progress)),
+    };
+    await this.persistTodo(nextTodo);
+    this.emit('todo:progress', nextTodo, progress);
   }
 
   /**
@@ -471,30 +495,30 @@ export class TodoManager extends EventEmitter {
       throw new Error(`Cannot complete todo in status: ${todo.status}`);
     }
 
-    todo.status = 'completed';
-    todo.progress = 100;
-    todo.completedAt = Date.now();
-    todo.output = output;
-    if (output?.modifiedFiles) {
-      todo.modifiedFiles = output.modifiedFiles;
-    }
-
+    const nextTodo: UnifiedTodo = {
+      ...todo,
+      status: 'completed',
+      progress: 100,
+      completedAt: Date.now(),
+      output,
+      ...(output?.modifiedFiles ? { modifiedFiles: output.modifiedFiles } : {}),
+    };
+    await this.persistTodo(nextTodo);
     this.timeoutChecker.remove(todoId);
 
-    // 注册此 Todo 产生的契约
-    for (const contract of todo.producesContracts) {
+    // 注册此 Todo 产生的契约（仅在状态成功落盘后）
+    for (const contract of nextTodo.producesContracts) {
       this.registerContract(contract);
     }
 
-    await this.repository.save(todo);
-    this.emit('todo:completed', todo);
+    this.emit('todo:completed', nextTodo);
 
     // 触发依赖此 Todo 的其他 Todos 检查
     await this.triggerDependentTodos(todoId);
 
     // 如果是二级 Todo 完成，检查是否可以自动 complete 一级 Todo
-    if (todo.parentId) {
-      await this.tryCompleteParent(todo.parentId);
+    if (nextTodo.parentId) {
+      await this.tryCompleteParent(nextTodo.parentId);
     }
   }
 
@@ -523,13 +547,15 @@ export class TodoManager extends EventEmitter {
       throw new Error(`Cannot fail todo in status: ${todo.status}`);
     }
 
-    todo.status = 'failed';
-    todo.completedAt = Date.now();
-    todo.error = error;
-
+    const nextTodo: UnifiedTodo = {
+      ...todo,
+      status: 'failed',
+      completedAt: Date.now(),
+      error,
+    };
+    await this.persistTodo(nextTodo);
     this.timeoutChecker.remove(todoId);
-    await this.repository.save(todo);
-    this.emit('todo:failed', todo, error);
+    this.emit('todo:failed', nextTodo, error);
   }
 
   /**
@@ -547,20 +573,22 @@ export class TodoManager extends EventEmitter {
       throw new Error(`Cannot skip todo in status: ${todo.status}`);
     }
 
-    todo.status = 'skipped';
-    todo.completedAt = Date.now();
-
+    const nextTodo: UnifiedTodo = {
+      ...todo,
+      status: 'skipped',
+      completedAt: Date.now(),
+    };
+    await this.persistTodo(nextTodo);
     this.timeoutChecker.remove(todoId);
     this.queue.remove(todoId);
-    await this.repository.save(todo);
-    this.emit('todo:skipped', todo);
+    this.emit('todo:skipped', nextTodo);
 
     // 触发依赖此 Todo 的其他 Todos 检查
     await this.triggerDependentTodos(todoId);
 
     // 如果是二级 Todo 被跳过，检查是否可以自动 complete 一级 Todo
-    if (todo.parentId) {
-      await this.tryCompleteParent(todo.parentId);
+    if (nextTodo.parentId) {
+      await this.tryCompleteParent(nextTodo.parentId);
     }
   }
 
@@ -579,17 +607,20 @@ export class TodoManager extends EventEmitter {
       throw new Error(`Todo has reached max retries: ${todo.maxRetries}`);
     }
 
-    todo.status = 'pending';
-    todo.retryCount++;
-    todo.error = undefined;
-    todo.progress = 0;
-    todo.completedAt = undefined;
+    const nextTodo: UnifiedTodo = {
+      ...todo,
+      status: 'pending',
+      retryCount: todo.retryCount + 1,
+      error: undefined,
+      progress: 0,
+      completedAt: undefined,
+    };
 
-    await this.repository.save(todo);
-    this.emit('todo:retrying', todo);
+    await this.persistTodo(nextTodo);
+    this.emit('todo:retrying', nextTodo);
 
     // 重新检查状态
-    await this.checkAndUpdateStatus(todo);
+    await this.checkAndUpdateStatus(nextTodo);
   }
 
   /**
@@ -612,14 +643,17 @@ export class TodoManager extends EventEmitter {
       throw new Error(`Cannot reset todo to pending from status: ${todo.status}`);
     }
 
-    todo.status = 'pending';
-    todo.completedAt = undefined;
-    todo.output = undefined;
-    todo.error = undefined;
-    todo.progress = 0;
+    const nextTodo: UnifiedTodo = {
+      ...todo,
+      status: 'pending',
+      completedAt: undefined,
+      output: undefined,
+      error: undefined,
+      progress: 0,
+    };
 
-    await this.repository.save(todo);
-    await this.checkAndUpdateStatus(todo);
+    await this.persistTodo(nextTodo);
+    await this.checkAndUpdateStatus(nextTodo);
   }
 
   /**
@@ -639,7 +673,7 @@ export class TodoManager extends EventEmitter {
    * 如果是，自动将父 Todo 标记为 completed
    */
   private async tryCompleteParent(parentId: string): Promise<void> {
-    const parent = await this.get(parentId);
+    let parent = await this.get(parentId);
     if (!parent || parent.status === 'completed') return;
 
     // 查找所有子 Todo（同一 assignmentId + parentId 匹配）
@@ -655,8 +689,11 @@ export class TodoManager extends EventEmitter {
     // 所有子 Todo 完成，自动 complete 父 Todo
     // 先确保父 Todo 处于 running 状态（满足 complete() 的前置条件）
     if (parent.status !== 'running') {
-      parent.status = 'running';
-      await this.repository.save(parent);
+      parent = {
+        ...parent,
+        status: 'running',
+      };
+      await this.persistTodo(parent);
     }
 
     await this.complete(parentId, {
@@ -772,13 +809,16 @@ export class TodoManager extends EventEmitter {
     const todo = await this.get(todoId);
     if (!todo) throw new Error(`Todo not found: ${todoId}`);
 
-    todo.outOfScope = true;
-    todo.approvalStatus = 'pending';
-    todo.approvalNote = note;
+    const nextTodo: UnifiedTodo = {
+      ...todo,
+      outOfScope: true,
+      approvalStatus: 'pending',
+      approvalNote: note,
+    };
 
-    await this.repository.save(todo);
-    await this.checkAndUpdateStatus(todo);
-    this.emit('todo:approval-requested', todo);
+    await this.persistTodo(nextTodo);
+    await this.checkAndUpdateStatus(nextTodo);
+    this.emit('todo:approval-requested', nextTodo);
   }
 
   /**
@@ -788,12 +828,15 @@ export class TodoManager extends EventEmitter {
     const todo = await this.get(todoId);
     if (!todo) throw new Error(`Todo not found: ${todoId}`);
 
-    todo.approvalStatus = 'approved';
-    if (note) todo.approvalNote = note;
+    const nextTodo: UnifiedTodo = {
+      ...todo,
+      approvalStatus: 'approved',
+      ...(note ? { approvalNote: note } : {}),
+    };
 
-    await this.repository.save(todo);
-    await this.checkAndUpdateStatus(todo);
-    this.emit('todo:approved', todo);
+    await this.persistTodo(nextTodo);
+    await this.checkAndUpdateStatus(nextTodo);
+    this.emit('todo:approved', nextTodo);
   }
 
   /**
@@ -803,12 +846,16 @@ export class TodoManager extends EventEmitter {
     const todo = await this.get(todoId);
     if (!todo) throw new Error(`Todo not found: ${todoId}`);
 
-    todo.approvalStatus = 'rejected';
-    todo.approvalNote = reason;
+    const nextTodo: UnifiedTodo = {
+      ...todo,
+      approvalStatus: 'rejected',
+      approvalNote: reason,
+    };
 
-    await this.repository.save(todo);
+    await this.persistTodo(nextTodo);
     await this.skip(todoId);
-    this.emit('todo:rejected', todo);
+    const latest = await this.get(todoId);
+    this.emit('todo:rejected', latest || nextTodo);
   }
 
   /**

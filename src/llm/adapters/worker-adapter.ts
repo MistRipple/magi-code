@@ -295,7 +295,7 @@ ${fileContent}
     }
 
     this.setState(AdapterState.BUSY);
-    this.currentTraceId = this.generateTraceId();
+    this.syncTraceFromMessageHub();
     // 去重状态不在此处清空 — 需跨多次 sendMessage 调用持久化
     // （autonomous-worker 每个 Todo 触发一次 sendMessage，清空会导致去重完全失效）
     // 去重状态在 clearHistory() 中随对话历史一起重置
