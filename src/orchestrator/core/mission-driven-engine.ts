@@ -229,6 +229,9 @@ export class MissionDrivenEngine extends EventEmitter {
       getTodoManager: () => this.missionOrchestrator.getTodoManager() ?? null,
       getSupplementaryQueue: () => this.supplementaryQueue,
     });
+
+    // 构造阶段先注入一次编排工具 handler，避免初始化空窗触发 "handler not configured"
+    this.dispatchManager.setupOrchestrationToolHandlers();
   }
 
   /**
@@ -1034,10 +1037,22 @@ export class MissionDrivenEngine extends EventEmitter {
       throw new Error(`任务缺少执行内容: ${taskId}`);
     }
     const { userPrompt, sessionId } = mission;
-    // 删除原 draft mission，execute() 会创建完整的新 mission
-    await this.missionStorage.delete(taskId);
-    // 触发统一执行链路
+    // 触发统一执行链路（执行成功后再迁移原 draft 状态，避免先删后跑导致任务丢失）
     await this.execute(userPrompt, taskId, sessionId);
+    try {
+      // 状态迁移：将 draft 标记为已取消（被执行链路替代），保留审计记录
+      const draftMission = await this.missionStorage.load(taskId);
+      if (draftMission) {
+        draftMission.status = 'cancelled';
+        draftMission.updatedAt = Date.now();
+        await this.missionStorage.update(draftMission);
+      }
+    } catch (error) {
+      logger.warn('编排器.任务.草稿状态迁移失败', {
+        taskId,
+        error: error instanceof Error ? error.message : String(error),
+      }, LogCategory.ORCHESTRATOR);
+    }
   }
 
   /**

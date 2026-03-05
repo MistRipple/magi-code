@@ -255,11 +255,7 @@ export class LspEnforcer {
       }
     };
 
-    const result = await this.toolManager.execute(
-      toolCall,
-      undefined,
-      { workerId: 'orchestrator', role: 'orchestrator' }
-    );
+    const result = await this.toolManager.executeInternalTool(toolCall);
     if (result.isError) {
       return { ok: false, error: String(result.content || 'LSP error') };
     }

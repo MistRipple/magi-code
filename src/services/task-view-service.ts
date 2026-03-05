@@ -6,6 +6,7 @@
  */
 
 import { globalEventBus } from '../events';
+import { logger, LogCategory } from '../logging';
 import type { Mission, MissionStorageManager } from '../orchestrator/mission';
 import type { TaskView } from '../task/task-view-adapter';
 import type { UnifiedTodo } from '../todo';
@@ -38,22 +39,13 @@ export class TaskViewService {
         const todos = await todoManager.getByMission(mission.id);
         todosByMission.set(mission.id, todos);
       }
-    } catch {
-      // TodoManager 不可用时，使用空映射
+    } catch (error) {
+      logger.warn('任务视图.TodoManager.初始化失败', {
+        error: error instanceof Error ? error.message : String(error),
+      }, LogCategory.ORCHESTRATOR);
     }
 
     const duplicateArtifactMissionIds = this.collectDuplicateArtifactMissionIds(missions, todosByMission);
-    if (duplicateArtifactMissionIds.size > 0) {
-      await Promise.all(
-        Array.from(duplicateArtifactMissionIds).map(async (missionId) => {
-          try {
-            await this.missionStorage.delete(missionId);
-          } catch {
-            // 自愈清理失败不阻塞主流程
-          }
-        })
-      );
-    }
 
     for (const mission of missions) {
       if (duplicateArtifactMissionIds.has(mission.id)) {
@@ -133,7 +125,9 @@ export class TaskViewService {
   ): boolean {
     const todoCount = todosByMission.get(mission.id)?.length || 0;
     const goal = (mission.goal || '').trim();
-    return mission.status === 'executing' && goal.length === 0 && todoCount === 0;
+    // 空壳 mission：无 goal、无 todo，且处于无实质内容的状态（并发产物或被替代的 draft）
+    const isEmptyShell = goal.length === 0 && todoCount === 0;
+    return isEmptyShell && (mission.status === 'executing' || mission.status === 'cancelled');
   }
 
   private selectMissionKeeper(
