@@ -41,6 +41,7 @@ import { LspExecutor } from './lsp-executor';
 import { OrchestrationExecutor } from './orchestration-executor';
 import { logger, LogCategory } from '../logging';
 import { PermissionMatrix } from '../types';
+import { LLMConfig, WorkerSlot } from '../types/agent-types';
 import { globalEventBus } from '../events';
 import type { SnapshotManager } from '../snapshot-manager';
 import type { SkillsManager, InstructionSkillDefinition } from './skills-manager';
@@ -48,6 +49,9 @@ import type { MCPToolExecutor } from './mcp-executor';
 import type { MCPPromptInfo } from './mcp-manager';
 import { WorkspaceFolderInfo, WorkspaceRoots } from '../workspace/workspace-roots';
 import { FileMutex } from '../utils/file-mutex';
+import { LLMConfigLoader } from '../llm/config';
+import { createLLMClient } from '../llm/clients/client-factory';
+import { runIntentDrivenFileEdit } from '../llm/utils/intent-file-editor';
 
 /**
  * 快照执行上下文（标识当前正在执行的 mission/assignment/worker）
@@ -99,6 +103,8 @@ export interface ToolManagerOptions {
  * 工具管理器
  */
 export class ToolManager extends EventEmitter implements ToolExecutor {
+  private static readonly FILE_EDIT_WORKER_ORDER: WorkerSlot[] = ['claude', 'codex', 'gemini'];
+
   // 工作区根目录（主目录）+ 多根解析器
   private workspaceRoot: string;
   private workspaceRoots: WorkspaceRoots;
@@ -124,7 +130,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   // 缓存和权限
   private toolCache: Map<string, ExtendedToolDefinition> = new Map();
   private permissions: PermissionMatrix;
-  private authorizationCallback?: (toolName: string, toolArgs: any) => Promise<boolean>;
+  private authorizationCallback: (toolName: string, toolArgs: any) => Promise<boolean>;
 
   // 快照系统
   private snapshotManager?: SnapshotManager;
@@ -161,6 +167,9 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       allowBash: true,
       allowWeb: true,
     };
+    this.authorizationCallback = this.createDefaultAuthorizationCallback();
+
+    this.registerDefaultLlmEditHandler();
   }
 
   /**
@@ -325,10 +334,18 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    * 设置工具授权回调
    */
   setAuthorizationCallback(callback?: (toolName: string, toolArgs: any) => Promise<boolean>): void {
-    this.authorizationCallback = callback;
+    this.authorizationCallback = callback ?? this.createDefaultAuthorizationCallback();
     logger.info('Tool authorization callback updated', {
-      hasCallback: !!callback
+      hasExternalCallback: !!callback
     }, LogCategory.TOOLS);
+  }
+
+  /**
+   * 默认授权回调：
+   * 在 UI 授权桥接未注入前显式拒绝高风险工具，避免初始化空窗报错。
+   */
+  private createDefaultAuthorizationCallback(): (toolName: string, toolArgs: any) => Promise<boolean> {
+    return async () => false;
   }
 
   /**
@@ -337,6 +354,68 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    */
   setLlmEditHandler(handler: (filePath: string, fileContent: string, summary: string, detailedDesc: string) => Promise<string>): void {
     this.fileExecutor.setLlmEditHandler(handler);
+    logger.info('ToolManager: file_edit handler updated', undefined, LogCategory.TOOLS);
+  }
+
+  /**
+   * 注册默认的 file_edit 意图编辑处理器。
+   * 该处理器在 ToolManager 构造时即生效，避免依赖外部初始化时序。
+   */
+  private registerDefaultLlmEditHandler(): void {
+    this.fileExecutor.setLlmEditHandler(async (filePath, fileContent, summary, detailedDesc) => {
+      const selection = this.resolveIntentDrivenFileEditModel();
+      if (!selection) {
+        throw new Error('No available LLM configuration for file_edit. Please enable at least one model (auxiliary/worker/orchestrator) with valid apiKey/baseUrl/model.');
+      }
+
+      logger.debug('file_edit.intent.model.selected', {
+        source: selection.source,
+        provider: selection.config.provider,
+        model: selection.config.model,
+      }, LogCategory.LLM);
+
+      const client = createLLMClient(selection.config);
+      return runIntentDrivenFileEdit(client, {
+        filePath,
+        fileContent,
+        summary,
+        detailedDescription: detailedDesc,
+      });
+    });
+
+    logger.info('ToolManager: default file_edit handler registered', undefined, LogCategory.TOOLS);
+  }
+
+  private resolveIntentDrivenFileEditModel(): { source: string; config: LLMConfig } | null {
+    const fullConfig = LLMConfigLoader.loadFullConfig();
+
+    if (this.isEditableModelConfig(fullConfig.auxiliary)) {
+      return { source: 'auxiliary', config: fullConfig.auxiliary };
+    }
+
+    for (const worker of ToolManager.FILE_EDIT_WORKER_ORDER) {
+      const workerConfig = fullConfig.workers?.[worker];
+      if (this.isEditableModelConfig(workerConfig)) {
+        return { source: `worker:${worker}`, config: workerConfig };
+      }
+    }
+
+    if (this.isEditableModelConfig(fullConfig.orchestrator)) {
+      return { source: 'orchestrator', config: fullConfig.orchestrator };
+    }
+
+    return null;
+  }
+
+  private isEditableModelConfig(config: LLMConfig | null | undefined): config is LLMConfig {
+    if (!config || config.enabled === false) {
+      return false;
+    }
+    const apiKey = typeof config.apiKey === 'string' ? config.apiKey.trim() : '';
+    const model = typeof config.model === 'string' ? config.model.trim() : '';
+    const baseUrl = typeof config.baseUrl === 'string' ? config.baseUrl.trim() : '';
+    const providerValid = config.provider === 'openai' || config.provider === 'anthropic';
+    return Boolean(apiKey && model && baseUrl && providerValid);
   }
 
   /**
@@ -538,9 +617,12 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         // 执行 Skill 工具
         if (toolDef.metadata.source === 'skill') {
           if (!this.skillExecutor) {
+            logger.warn('Skill 工具不可用：Skill 运行时未启用', {
+              toolName: normalizedToolCall.name,
+            }, LogCategory.TOOLS);
             return finalize({
               toolCallId: toolCall.id,
-              content: 'Skill executor not registered',
+              content: `工具不可用：Skill 运行时未启用或加载失败（${normalizedToolCall.name}）。请在设置中启用并安装对应 Skill 后重试。`,
               isError: true,
             });
           }
@@ -570,6 +652,24 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       return this.executionContextStorage.run(executionContext, run);
     }
     return run();
+  }
+
+  /**
+   * 执行内部工具调用（系统级调用入口）
+   * - 统一通过 ToolManager 入口，避免外部直接操作具体 executor
+   * - 支持内部专用工具（如 lsp_query）在不暴露给模型的前提下复用
+   */
+  async executeInternalTool(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
+    const normalizedName = this.normalizeToolName(toolCall.name);
+    const normalizedToolCall = normalizedName === toolCall.name
+      ? toolCall
+      : { ...toolCall, name: normalizedName };
+
+    if (normalizedToolCall.name === 'lsp_query') {
+      return this.lspExecutor.execute(normalizedToolCall);
+    }
+
+    return this.execute(normalizedToolCall, signal);
   }
 
   /**
@@ -826,12 +926,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       return { allowed: true };
     }
 
-    // 3. 高风险工具必须有授权回调
-    if (!this.authorizationCallback) {
-      return { allowed: false, reason: 'Tool authorization handler not configured' };
-    }
-
-    // 4. 请求用户授权（Ask 模式下会弹窗，Auto 模式由回调直接放行）
+    // 3. 请求用户授权（Ask 模式下会弹窗，Auto 模式由回调直接放行）
     try {
       const allowed = await this.authorizationCallback(toolCall.name, toolCall.arguments);
       if (!allowed) {

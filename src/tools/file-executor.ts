@@ -58,6 +58,9 @@ export class FileExecutor implements ToolExecutor {
   constructor(workspaceRoots: WorkspaceRoots, fileMutex: FileMutex) {
     this.workspaceRoots = workspaceRoots;
     this.fileMutex = fileMutex;
+    this.llmEditHandler = async () => {
+      throw new Error('No available LLM configuration for file_edit. Please enable at least one model (auxiliary/worker/orchestrator) with valid apiKey/baseUrl/model.');
+    };
   }
 
   /**
@@ -782,14 +785,6 @@ IMPORTANT:
       return {
         toolCallId,
         content: 'Error: edit_summary and detailed_edit_description are required for file editing.',
-        isError: true
-      };
-    }
-
-    if (!this.llmEditHandler) {
-      return {
-        toolCallId,
-        content: 'Error: LLM edit handler is not registered. Cannot perform intent-driven file edit.',
         isError: true
       };
     }

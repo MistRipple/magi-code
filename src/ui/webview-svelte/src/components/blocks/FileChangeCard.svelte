@@ -111,14 +111,13 @@
       .replace(/'/g, '&#039;');
   }
 
-  /** 统计徽标文本 */
-  const statsBadge = $derived.by(() => {
-    if (!change) return '';
-    const parts: string[] = [];
-    if (typeof change.additions === 'number' && change.additions > 0) parts.push(`+${change.additions}`);
-    if (typeof change.deletions === 'number' && change.deletions > 0) parts.push(`-${change.deletions}`);
-    return parts.join(' ');
-  });
+  const additionsCount = $derived.by(() =>
+    change && typeof change.additions === 'number' && change.additions > 0 ? change.additions : 0
+  );
+  const deletionsCount = $derived.by(() =>
+    change && typeof change.deletions === 'number' && change.deletions > 0 ? change.deletions : 0
+  );
+  const hasStatsBadge = $derived(additionsCount > 0 || deletionsCount > 0);
 </script>
 
 {#if change}
@@ -137,8 +136,15 @@
         <FileSpan filepath={change.filePath} showIcon={false} clickable={false} />
       </span>
 
-      {#if statsBadge}
-        <span class="stats-badge">{statsBadge}</span>
+      {#if hasStatsBadge}
+        <span class="stats-badge">
+          {#if additionsCount > 0}
+            <span class="stats-value stat-add">+{additionsCount}</span>
+          {/if}
+          {#if deletionsCount > 0}
+            <span class="stats-value stat-del">-{deletionsCount}</span>
+          {/if}
+        </span>
       {/if}
 
       <span class="tool-status status-success">
@@ -224,15 +230,29 @@
   }
 
   .stats-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     font-size: var(--text-xs, 11px);
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
     padding: 1px 6px;
     border-radius: 4px;
     background: var(--surface-2, rgba(0,0,0,0.15));
-    color: var(--foreground-muted);
     white-space: nowrap;
     flex-shrink: 0;
+  }
+
+  .stats-value {
+    font-weight: 600;
+  }
+
+  .stat-add {
+    color: var(--success);
+  }
+
+  .stat-del {
+    color: var(--error);
   }
 
   .tool-status {

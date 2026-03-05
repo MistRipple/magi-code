@@ -203,12 +203,12 @@ export type UpdateTodoHandler = (params: {
 }) => Promise<{ success: boolean; error?: string }>;
 
 export class OrchestrationExecutor {
-  private dispatchHandler?: DispatchTaskHandler;
-  private sendMessageHandler?: SendWorkerMessageHandler;
-  private waitForWorkersHandler?: WaitForWorkersHandler;
-  private splitTodoHandler?: SplitTodoHandler;
-  private getTodosHandler?: GetTodosHandler;
-  private updateTodoHandler?: UpdateTodoHandler;
+  private dispatchHandler: DispatchTaskHandler;
+  private sendMessageHandler: SendWorkerMessageHandler;
+  private waitForWorkersHandler: WaitForWorkersHandler;
+  private splitTodoHandler: SplitTodoHandler;
+  private getTodosHandler: GetTodosHandler;
+  private updateTodoHandler: UpdateTodoHandler;
 
   /** 动态 Worker 列表（必须由 MissionDrivenEngine 从 ProfileLoader 注入） */
   private availableWorkers: { slot: WorkerSlot; description: string }[] = [];
@@ -217,6 +217,41 @@ export class OrchestrationExecutor {
 
   private static readonly TOOL_NAMES = ['dispatch_task', 'send_worker_message', 'wait_for_workers', 'split_todo', 'get_todos', 'update_todo'] as const;
   private static readonly UPDATE_TODO_STATUS_ENUM: UpdateTodoStatus[] = ['pending', 'skipped'];
+
+  constructor() {
+    const runtimeUnavailable = 'orchestration runtime unavailable';
+
+    this.dispatchHandler = async () => ({
+      task_id: '',
+      status: 'failed',
+      error: runtimeUnavailable,
+    });
+
+    this.sendMessageHandler = async () => ({
+      delivered: false,
+    });
+
+    this.waitForWorkersHandler = async () => ({
+      results: [],
+      wait_status: 'completed',
+      timed_out: false,
+      pending_task_ids: [],
+      waited_ms: 0,
+    });
+
+    this.splitTodoHandler = async () => ({
+      success: false,
+      childTodoIds: [],
+      error: runtimeUnavailable,
+    });
+
+    this.getTodosHandler = async () => [];
+
+    this.updateTodoHandler = async () => ({
+      success: false,
+      error: runtimeUnavailable,
+    });
+  }
 
   /**
    * 设置可用 Worker 列表（由 MissionDrivenEngine 从 ProfileLoader 注入）
@@ -275,12 +310,12 @@ export class OrchestrationExecutor {
     getTodos?: GetTodosHandler;
     updateTodo?: UpdateTodoHandler;
   }): void {
-    this.dispatchHandler = handlers.dispatch;
-    this.sendMessageHandler = handlers.sendMessage;
-    this.waitForWorkersHandler = handlers.waitForWorkers;
-    this.splitTodoHandler = handlers.splitTodo;
-    this.getTodosHandler = handlers.getTodos;
-    this.updateTodoHandler = handlers.updateTodo;
+    if (handlers.dispatch) this.dispatchHandler = handlers.dispatch;
+    if (handlers.sendMessage) this.sendMessageHandler = handlers.sendMessage;
+    if (handlers.waitForWorkers) this.waitForWorkersHandler = handlers.waitForWorkers;
+    if (handlers.splitTodo) this.splitTodoHandler = handlers.splitTodo;
+    if (handlers.getTodos) this.getTodosHandler = handlers.getTodos;
+    if (handlers.updateTodo) this.updateTodoHandler = handlers.updateTodo;
   }
 
   /**
@@ -516,14 +551,6 @@ export class OrchestrationExecutor {
   }
 
   private async executeDispatchTask(toolCall: ToolCall): Promise<ToolResult> {
-    if (!this.dispatchHandler) {
-      return {
-        toolCallId: toolCall.id,
-        content: 'dispatch_task handler not configured',
-        isError: true,
-      };
-    }
-
     const normalizedTasks = this.normalizeDispatchTasks(toolCall.arguments);
     if (!normalizedTasks.ok) {
       return {
@@ -721,14 +748,6 @@ export class OrchestrationExecutor {
   }
 
   private async executeWaitForWorkers(toolCall: ToolCall): Promise<ToolResult> {
-    if (!this.waitForWorkersHandler) {
-      return {
-        toolCallId: toolCall.id,
-        content: 'wait_for_workers handler not configured',
-        isError: true,
-      };
-    }
-
     const args = toolCall.arguments as { task_ids?: string[] };
 
     logger.info('wait_for_workers 开始等待', {
@@ -797,14 +816,6 @@ export class OrchestrationExecutor {
   }
 
   private async executeSendWorkerMessage(toolCall: ToolCall): Promise<ToolResult> {
-    if (!this.sendMessageHandler) {
-      return {
-        toolCallId: toolCall.id,
-        content: 'send_worker_message handler not configured',
-        isError: true,
-      };
-    }
-
     const args = toolCall.arguments as { worker: string; message: string };
 
     if (!args.worker || !args.message) {
@@ -896,14 +907,6 @@ export class OrchestrationExecutor {
   }
 
   private async executeSplitTodo(toolCall: ToolCall, callerContext?: SplitTodoCallerContext): Promise<ToolResult> {
-    if (!this.splitTodoHandler) {
-      return {
-        toolCallId: toolCall.id,
-        content: 'split_todo handler not configured',
-        isError: true,
-      };
-    }
-
     if (!callerContext) {
       return {
         toolCallId: toolCall.id,
@@ -1022,13 +1025,6 @@ export class OrchestrationExecutor {
     toolCall: ToolCall,
     callerContext?: SplitTodoCallerContext
   ): Promise<ToolResult> {
-    if (!this.getTodosHandler) {
-      return {
-        toolCallId: toolCall.id,
-        content: 'get_todos handler not configured',
-        isError: true,
-      };
-    }
     const args = toolCall.arguments as { status?: string[]; mission_id?: string; session_id?: string };
     try {
       const todos = await this.getTodosHandler({
@@ -1106,13 +1102,6 @@ export class OrchestrationExecutor {
   }
 
   private async executeUpdateTodo(toolCall: ToolCall): Promise<ToolResult> {
-    if (!this.updateTodoHandler) {
-      return {
-        toolCallId: toolCall.id,
-        content: 'update_todo handler not configured',
-        isError: true,
-      };
-    }
     const args = toolCall.arguments as { updates: Array<{ todo_id: string; status?: UpdateTodoStatus | string; content?: string }> };
     try {
       if (!args.updates || !Array.isArray(args.updates)) {

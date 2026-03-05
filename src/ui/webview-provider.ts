@@ -311,6 +311,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       getConversationHistory: (maxRounds) => this.sessionManager.formatConversationHistory(maxRounds),
     });
 
+    // 先注入 codebase_retrieval 基础服务，消除启动空窗：
+    // 即使 PKB 还在初始化，也可先走本地回退检索（grep/lsp）。
+    this.injectCodebaseRetrievalService();
+
     // 初始化 CommandHandler 委派
     this.handlerCtx = {
       sendData: (dataType, payload) => this.sendData(dataType, payload),
@@ -577,12 +581,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const { CodebaseRetrievalService } = require('../services/codebase-retrieval-service');
     const retrievalService = new CodebaseRetrievalService({
       getKnowledgeBase: () => this.projectKnowledgeBase,
-      executeTool: async (toolCall: { id: string; name: string; arguments: Record<string, any> }) => {
-        if (toolCall.name === 'lsp_query') {
-          return toolManager.getLspExecutor().execute(toolCall);
-        }
-        return toolManager.execute(toolCall);
-      },
+      executeTool: async (toolCall: { id: string; name: string; arguments: Record<string, any> }) =>
+        toolManager.executeInternalTool(toolCall),
       extractKeywords: (query: string) => this.promptEnhancer.extractKeywords(query),
       workspaceFolders: this.workspaceFolders,
     });
@@ -727,21 +727,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       if (!this.requestTimeouts.has(requestId)) {
         return;
       }
-      const traceId = this.messageHub.getTraceId();
-      const timeoutMessage = createErrorMessage(
-        '等待响应超时，请重试',
-        'orchestrator',
-        'orchestrator',
-        traceId,
-        {
-          metadata: {
-            requestId,
-          },
-        }
-      );
-      this.messageHub.sendMessage(timeoutMessage);
+      // 首 token 超时由前端 message-handler 统一处理（60s 触发 toast）
+      // 后端仅做静默清理，不发送错误消息，避免与前端超时重复提示
+      logger.warn('请求超时.后端兜底清理', { requestId }, LogCategory.UI);
       this.clearRequestTimeout(requestId);
-    }, 8000);
+    }, 65000);
     this.requestTimeouts.set(requestId, timeout);
   }
 
