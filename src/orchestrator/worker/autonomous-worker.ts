@@ -784,7 +784,12 @@ export class AutonomousWorker extends EventEmitter {
       }
     }
 
-    this.emit('assignmentCompleted', qualityCheckedResult);
+    this.emit('assignmentCompleted', {
+      assignmentId: assignment.id,
+      success: qualityCheckedResult.success,
+      summary: qualityCheckedResult.summary,
+      result: qualityCheckedResult,
+    });
     logger.info('Worker.Assignment.完成', {
       assignmentId: assignment.id,
       success: qualityCheckedResult.success,

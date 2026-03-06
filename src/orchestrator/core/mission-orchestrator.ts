@@ -225,7 +225,23 @@ export class MissionOrchestrator extends EventEmitter {
 
       // 转发 Assignment 生命周期 + 审批事件
       worker.on('assignmentStarted', (data) => this.emit('assignmentStarted', { ...data, missionId: this.currentMissionId, workerId: workerSlot }));
-      worker.on('assignmentCompleted', (data) => this.emit('assignmentCompleted', { ...data, missionId: this.currentMissionId }));
+      worker.on('assignmentCompleted', (data: any) => {
+        const assignmentId = typeof data?.assignmentId === 'string'
+          ? data.assignmentId.trim()
+          : (typeof data?.assignment?.id === 'string' ? data.assignment.id.trim() : '');
+        if (!assignmentId) {
+          logger.warn('编排器.Worker.assignmentCompleted.缺少assignmentId', {
+            workerSlot,
+            dataKeys: data && typeof data === 'object' ? Object.keys(data) : typeof data,
+          }, LogCategory.ORCHESTRATOR);
+          return;
+        }
+        this.emit('assignmentCompleted', {
+          ...data,
+          assignmentId,
+          missionId: this.currentMissionId,
+        });
+      });
       worker.on('approvalRequested', (data) => this.emit('approvalRequested', { ...data, missionId: this.currentMissionId }));
 
       logger.info('编排器.Worker.创建', { workerSlot }, LogCategory.ORCHESTRATOR);

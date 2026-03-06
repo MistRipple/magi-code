@@ -261,7 +261,7 @@ export class PlanLedgerService extends EventEmitter {
         return null;
       }
 
-      const normalizedAssignmentId = assignmentId.trim();
+      const normalizedAssignmentId = this.normalizeIdentifier(assignmentId);
       if (!normalizedAssignmentId) {
         return record;
       }
@@ -301,7 +301,12 @@ export class PlanLedgerService extends EventEmitter {
         return null;
       }
 
-      const item = this.findItemByAssignment(record, assignmentId);
+      const normalizedAssignmentId = this.normalizeIdentifier(assignmentId);
+      if (!normalizedAssignmentId) {
+        return record;
+      }
+
+      const item = this.findItemByAssignment(record, normalizedAssignmentId);
       if (!item) {
         return record;
       }
@@ -339,7 +344,12 @@ export class PlanLedgerService extends EventEmitter {
         return record;
       }
 
-      const item = this.findItemByAssignment(record, assignmentId);
+      const normalizedAssignmentId = this.normalizeIdentifier(assignmentId);
+      if (!normalizedAssignmentId) {
+        return record;
+      }
+
+      const item = this.findItemByAssignment(record, normalizedAssignmentId);
       if (!item) {
         return record;
       }
@@ -688,8 +698,8 @@ export class PlanLedgerService extends EventEmitter {
     }
   }
 
-  private findItemByAssignment(record: PlanRecord, assignmentId: string): PlanItem | null {
-    const normalized = assignmentId.trim();
+  private findItemByAssignment(record: PlanRecord, assignmentId: unknown): PlanItem | null {
+    const normalized = this.normalizeIdentifier(assignmentId);
     if (!normalized) {
       return null;
     }
@@ -697,27 +707,35 @@ export class PlanLedgerService extends EventEmitter {
   }
 
   private findOrCreateItemByAssignment(record: PlanRecord, assignmentId: string): PlanItem {
-    const existing = this.findItemByAssignment(record, assignmentId);
+    const normalizedAssignmentId = this.normalizeIdentifier(assignmentId);
+    const existing = this.findItemByAssignment(record, normalizedAssignmentId);
     if (existing) {
       return existing;
     }
+    if (!normalizedAssignmentId) {
+      throw new Error('findOrCreateItemByAssignment requires non-empty assignmentId');
+    }
     const now = Date.now();
     const item: PlanItem = {
-      itemId: assignmentId,
-      title: assignmentId,
+      itemId: normalizedAssignmentId,
+      title: normalizedAssignmentId,
       owner: 'orchestrator',
       dependsOn: [],
       status: 'pending',
       progress: 0,
-      assignmentId,
+      assignmentId: normalizedAssignmentId,
       todoIds: [],
       todoStatuses: {},
       createdAt: now,
       updatedAt: now,
     };
     record.items.push(item);
-    this.addUnique(record.links.assignmentIds, assignmentId);
+    this.addUnique(record.links.assignmentIds, normalizedAssignmentId);
     return item;
+  }
+
+  private normalizeIdentifier(value: unknown): string {
+    return typeof value === 'string' ? value.trim() : '';
   }
 
   private emitUpdated(record: PlanRecord, reason: string): void {

@@ -20,7 +20,7 @@ import type { MessageHub } from './message-hub';
 import type { MissionOrchestrator } from './mission-orchestrator';
 import type { Assignment } from '../mission';
 import type { WorkerReport, OrchestratorResponse } from '../protocols/worker-report';
-import { createAdjustResponse } from '../protocols/worker-report';
+import { createAbortResponse, createAdjustResponse } from '../protocols/worker-report';
 import {
   DispatchBatch,
   CancellationError,
@@ -107,8 +107,8 @@ export class DispatchManager {
   private static readonly RUNTIME_UNAVAILABLE_COOLDOWN_MS = 60_000;
   private static readonly MAX_MISSION_SESSION_RECORDS = 100;
 
-  // Phase B+ 中间调用频率限制：同一 batch 内最小间隔 30 秒
-  private lastPhaseBPlusTimestamp = 0;
+  // Phase B+ 中间调用频率限制：按 batch 隔离，避免跨批次互相污染
+  private phaseBPlusTimestamps = new Map<string, number>();
   private static readonly PHASE_B_PLUS_MIN_INTERVAL = 30_000;
   /** 同轮 dispatch 的短窗口合并调度，减少 Worker 指令卡片抖动 */
   private static readonly DISPATCH_COALESCE_MS = 120;
@@ -240,6 +240,7 @@ export class DispatchManager {
 
     this.activeBatch = null;
     this.reactiveMode = false;
+    this.phaseBPlusTimestamps.clear();
     this.completionQueue.reset();
     this.activeWorkerLanes.clear();
     this.clearDispatchScheduleTimers();
@@ -495,11 +496,12 @@ export class DispatchManager {
           };
         }
 
-        // 发送 subTaskCard（状态取决于注册后是否有依赖）
+        // 发送 subTaskCard（状态基于注册后的真实 DispatchStatus）
         const entry = this.activeBatch.getEntry(taskId);
-        const hasDeps = entry
-          ? entry.status === 'waiting_deps'
-          : Boolean(normalizedDependsOn && normalizedDependsOn.length > 0);
+        const entryStatus = entry
+          ? entry.status
+          : (normalizedDependsOn && normalizedDependsOn.length > 0 ? 'waiting_deps' : 'pending');
+        const cardStatus = this.mapDispatchStatusToInitialCardStatus(entryStatus);
 
         const currentSessionId = this.deps.getCurrentSessionId()?.trim();
         if (currentSessionId && this.deps.onDispatchTaskRegistered) {
@@ -528,12 +530,15 @@ export class DispatchManager {
         this.deps.messageHub.subTaskCard({
           id: taskId,
           title: taskTitle,
-          status: hasDeps ? 'pending' : 'running',
+          status: cardStatus,
           worker: decision.selectedWorker,
+          ...(entryStatus === 'skipped' && entry?.result?.summary
+            ? { summary: entry.result.summary }
+            : {}),
         });
 
         // 通过隔离策略决定是否立即启动（约束 5）
-        if (!hasDeps) {
+        if (entryStatus === 'pending') {
           this.scheduleDispatchReadyTasks(this.activeBatch, { reason: 'dispatch-registered' });
         }
         // 有依赖的任务由 DispatchBatch 的 task:ready 事件触发
@@ -555,8 +560,16 @@ export class DispatchManager {
           worker, messagePreview: message.substring(0, 80),
         }, LogCategory.ORCHESTRATOR);
 
+        const queue = this.deps.getSupplementaryQueue();
+        const delivered = queue ? queue.inject(message, true, worker) : false;
+        if (!delivered) {
+          logger.warn('编排工具.send_worker_message.运行时注入失败', {
+            worker,
+            messagePreview: message.substring(0, 80),
+          }, LogCategory.ORCHESTRATOR);
+        }
         this.deps.messageHub.workerInstruction(worker, message);
-        return { delivered: true };
+        return { delivered };
       },
 
       waitForWorkers: async (params) => {
@@ -1258,6 +1271,25 @@ export class DispatchManager {
     return `worker-lane-instruction-${batchId}-${worker}`;
   }
 
+  private mapDispatchStatusToInitialCardStatus(status: DispatchStatus): 'pending' | 'running' | 'completed' | 'failed' | 'stopped' | 'skipped' {
+    switch (status) {
+      case 'waiting_deps':
+        return 'pending';
+      case 'completed':
+        return 'completed';
+      case 'failed':
+        return 'failed';
+      case 'skipped':
+        return 'skipped';
+      case 'cancelled':
+        return 'stopped';
+      case 'running':
+      case 'pending':
+      default:
+        return 'running';
+    }
+  }
+
   private buildWorkerLaneInstructionContent(entries: DispatchEntry[], currentTaskId: string): string {
     const current = entries.find(entry => entry.taskId === currentTaskId);
     const currentIndex = entries.findIndex(entry => entry.taskId === currentTaskId);
@@ -1401,6 +1433,7 @@ export class DispatchManager {
     // Batch 被取消 → 不触发 Phase C，直接通知用户
     batch.on('batch:cancelled', (batchId: string, reason: string) => {
       this.reactiveBatchAwaitingSummary.delete(batchId);
+      this.phaseBPlusTimestamps.delete(batchId);
       this.clearBatchTaskCategories(batch);
       this.activeWorkerLanes.clear();
       this.clearDispatchScheduleTimers(batchId);
@@ -1410,6 +1443,7 @@ export class DispatchManager {
 
     batch.on('phase:changed', (_batchId: string, phase) => {
       if (phase === 'archived') {
+        this.phaseBPlusTimestamps.delete(batch.id);
         this.clearBatchTaskCategories(batch);
         this.activeWorkerLanes.clear();
         this.clearDispatchScheduleTimers(batch.id);
@@ -1641,16 +1675,21 @@ export class DispatchManager {
 
     // question 类型：触发 Phase B+ 中间 LLM 调用
     if (report.type === 'question' && report.question) {
+      const isBlocking = report.question.blocking === true;
       const now = Date.now();
-      if (now - this.lastPhaseBPlusTimestamp < DispatchManager.PHASE_B_PLUS_MIN_INTERVAL) {
+      const throttleKey = batch?.id || `assignment:${report.assignmentId}`;
+      const lastTs = this.phaseBPlusTimestamps.get(throttleKey) || 0;
+      if (!isBlocking && now - lastTs < DispatchManager.PHASE_B_PLUS_MIN_INTERVAL) {
         logger.info('Phase B+ 频率限制，跳过中间调用', {
           worker: report.workerId,
-          interval: now - this.lastPhaseBPlusTimestamp,
+          interval: now - lastTs,
+          throttleKey,
         }, LogCategory.ORCHESTRATOR);
         return defaultResponse;
       }
-
-      this.lastPhaseBPlusTimestamp = now;
+      if (!isBlocking) {
+        this.phaseBPlusTimestamps.set(throttleKey, now);
+      }
 
       try {
         const batchStatus = batch ? batch.getSummary() : { total: 0 };
@@ -1689,8 +1728,18 @@ ${this.deps.getActiveUserPrompt()}
             newInstructions: response.content,
           });
         }
+        if (isBlocking) {
+          const reason = `阻塞问题未获得有效决策：${report.question.content.substring(0, 120)}`;
+          this.deps.messageHub.notify(reason, 'warning');
+          return createAbortResponse(reason);
+        }
       } catch (error: any) {
         logger.error('Phase B+ 中间调用失败', { error: error.message }, LogCategory.ORCHESTRATOR);
+        if (isBlocking) {
+          const reason = `阻塞问题决策失败，已终止当前任务：${error.message}`;
+          this.deps.messageHub.notify(reason, 'warning');
+          return createAbortResponse(reason);
+        }
       }
 
       return defaultResponse;

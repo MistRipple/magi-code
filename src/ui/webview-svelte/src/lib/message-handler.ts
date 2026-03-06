@@ -2069,7 +2069,8 @@ function handleAssignmentPlanned(message: WebviewMessage) {
 function handleAssignmentStarted(message: WebviewMessage) {
   const assignmentId = message.assignmentId as string;
   if (!assignmentId || !assignmentId.trim()) {
-    throw new Error('[MessageHandler] AssignmentStarted 缺少 assignmentId');
+    console.warn('[MessageHandler] AssignmentStarted 缺少 assignmentId，已忽略', message);
+    return;
   }
   updateAssignmentPlan(assignmentId, (assignment) => ({
     ...assignment,
@@ -2080,7 +2081,8 @@ function handleAssignmentStarted(message: WebviewMessage) {
 function handleAssignmentCompleted(message: WebviewMessage) {
   const assignmentId = message.assignmentId as string;
   if (!assignmentId || !assignmentId.trim()) {
-    throw new Error('[MessageHandler] AssignmentCompleted 缺少 assignmentId');
+    console.warn('[MessageHandler] AssignmentCompleted 缺少 assignmentId，已忽略', message);
+    return;
   }
   const success = Boolean(message.success);
   updateAssignmentPlan(assignmentId, (assignment) => ({

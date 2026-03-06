@@ -26,6 +26,7 @@ interface SupplementaryInstruction {
   content: string;
   timestamp: number;
   source: 'user';
+  targetWorker?: WorkerSlot;
 }
 
 /**
@@ -53,7 +54,7 @@ export class SupplementaryInstructionQueue {
    * @param isRunning 引擎是否正在执行
    * @returns 是否成功注入
    */
-  inject(content: string, isRunning: boolean): boolean {
+  inject(content: string, isRunning: boolean, targetWorker?: WorkerSlot): boolean {
     if (!isRunning) {
       logger.warn('引擎.补充指令.拒绝', { reason: '没有正在执行的任务' }, LogCategory.ORCHESTRATOR);
       return false;
@@ -65,6 +66,7 @@ export class SupplementaryInstructionQueue {
       content: content.trim(),
       timestamp: Date.now(),
       source: 'user',
+      targetWorker,
     };
 
     this.instructions.push(instruction);
@@ -73,12 +75,14 @@ export class SupplementaryInstructionQueue {
       id: instruction.id,
       preview: content.substring(0, 50),
       queueSize: this.instructions.length,
+      targetWorker: targetWorker || 'broadcast',
     }, LogCategory.ORCHESTRATOR);
 
     // 触发事件通知 UI 指令已接收
     this.emitter.emit('supplementaryInstructionReceived', {
       id: instruction.id,
       count: this.instructions.length,
+      targetWorker,
     });
 
     return true;
@@ -107,7 +111,9 @@ export class SupplementaryInstructionQueue {
     }
 
     const lastIndex = this.cursors.get(workerId) || 0;
-    const pending = this.instructions.filter(i => i.index > lastIndex);
+    const pending = this.instructions.filter(i =>
+      i.index > lastIndex && (!i.targetWorker || i.targetWorker === workerId)
+    );
     if (pending.length === 0) {
       return [];
     }
@@ -181,13 +187,18 @@ export class SupplementaryInstructionQueue {
    * 清理已被所有已知 Worker 消费的补充指令
    */
   private prune(): void {
-    if (this.cursors.size === 0) {
-      return;
-    }
-    const minIndex = Math.min(...this.cursors.values());
-    if (!Number.isFinite(minIndex)) {
-      return;
-    }
-    this.instructions = this.instructions.filter(i => i.index > minIndex);
+    if (this.instructions.length === 0) return;
+    if (this.cursors.size === 0) return;
+
+    const minBroadcastCursor = Math.min(...this.cursors.values());
+    if (!Number.isFinite(minBroadcastCursor)) return;
+
+    this.instructions = this.instructions.filter(instruction => {
+      if (instruction.targetWorker) {
+        const cursor = this.cursors.get(instruction.targetWorker) || 0;
+        return cursor < instruction.index;
+      }
+      return minBroadcastCursor < instruction.index;
+    });
   }
 }

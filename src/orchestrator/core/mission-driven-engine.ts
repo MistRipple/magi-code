@@ -476,8 +476,15 @@ export class MissionDrivenEngine extends EventEmitter {
       if (!this.currentPlanId || !this.currentSessionId) {
         return;
       }
+      const assignmentId = typeof data.assignmentId === 'string' ? data.assignmentId.trim() : '';
+      if (!assignmentId) {
+        logger.warn('编排器.计划账本.assignmentStarted.缺少assignmentId', {
+          dataKeys: data && typeof data === 'object' ? Object.keys(data as Record<string, unknown>) : typeof data,
+        }, LogCategory.ORCHESTRATOR);
+        return;
+      }
       void this.planLedger
-        .updateAssignmentStatus(this.currentSessionId, this.currentPlanId, data.assignmentId, 'running')
+        .updateAssignmentStatus(this.currentSessionId, this.currentPlanId, assignmentId, 'running')
         .catch((error) => this.reportPlanLedgerAsyncError('assignmentStarted', error));
     });
 
@@ -485,11 +492,18 @@ export class MissionDrivenEngine extends EventEmitter {
       if (!this.currentPlanId || !this.currentSessionId) {
         return;
       }
+      const assignmentId = typeof data.assignmentId === 'string' ? data.assignmentId.trim() : '';
+      if (!assignmentId) {
+        logger.warn('编排器.计划账本.assignmentCompleted.缺少assignmentId', {
+          dataKeys: data && typeof data === 'object' ? Object.keys(data as Record<string, unknown>) : typeof data,
+        }, LogCategory.ORCHESTRATOR);
+        return;
+      }
       void this.planLedger
         .updateAssignmentStatus(
           this.currentSessionId,
           this.currentPlanId,
-          data.assignmentId,
+          assignmentId,
           data.success ? 'completed' : 'failed',
         )
         .catch((error) => this.reportPlanLedgerAsyncError('assignmentCompleted', error));

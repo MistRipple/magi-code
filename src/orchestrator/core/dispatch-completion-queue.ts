@@ -12,13 +12,20 @@ interface WaitForWorkersOptions {
 export class DispatchCompletionQueue {
   private completionQueue: WorkerCompletionResult[] = [];
   private completionResolvers: Array<() => void> = [];
+  private pushedTaskIds: Set<string> = new Set();
 
   reset(): void {
     this.completionQueue = [];
     this.completionResolvers = [];
+    this.pushedTaskIds.clear();
   }
 
   push(entry: DispatchEntry): void {
+    if (this.pushedTaskIds.has(entry.taskId)) {
+      return;
+    }
+    this.pushedTaskIds.add(entry.taskId);
+
     const result: WorkerCompletionResult = {
       task_id: entry.taskId,
       worker: entry.worker,

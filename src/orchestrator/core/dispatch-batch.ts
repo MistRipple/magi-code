@@ -317,6 +317,8 @@ export class DispatchBatch extends EventEmitter {
       }
     }
 
+    const dependencyState = this.evaluateDependencyState(dependsOn);
+
     const entry: DispatchEntry = {
       taskId: params.taskId,
       worker: params.worker,
@@ -335,11 +337,19 @@ export class DispatchBatch extends EventEmitter {
         freezeFiles: params.collaborationContracts?.freezeFiles || [],
       },
       dependsOn,
-      status: dependsOn.length > 0 ? 'waiting_deps' : 'pending',
+      status: dependencyState.status,
       createdAt: Date.now(),
     };
 
     this.entries.set(params.taskId, entry);
+
+    // 注册时即判定依赖终态，避免“依赖早已完成却永久 waiting_deps”导致 Batch 卡死。
+    if (dependencyState.status === 'skipped') {
+      this.updateStatus(params.taskId, 'skipped', {
+        success: false,
+        summary: dependencyState.reason || '前序任务未满足，级联跳过',
+      });
+    }
 
     logger.debug('DispatchBatch.注册', {
       batchId: this.id,
@@ -347,6 +357,7 @@ export class DispatchBatch extends EventEmitter {
       worker: params.worker,
       dependsOn,
       status: entry.status,
+      dependencyReason: dependencyState.reason,
     }, LogCategory.ORCHESTRATOR);
 
     return entry;
@@ -369,6 +380,25 @@ export class DispatchBatch extends EventEmitter {
     const entry = this.entries.get(taskId);
     if (!entry) {
       logger.warn('DispatchBatch.更新状态.任务不存在', { batchId: this.id, taskId }, LogCategory.ORCHESTRATOR);
+      return;
+    }
+
+    const previousStatus = entry.status;
+    if (isTerminalStatus(previousStatus)) {
+      if (previousStatus === status) {
+        logger.debug('DispatchBatch.更新状态.重复终态忽略', {
+          batchId: this.id,
+          taskId,
+          status,
+        }, LogCategory.ORCHESTRATOR);
+      } else {
+        logger.warn('DispatchBatch.更新状态.终态冲突忽略', {
+          batchId: this.id,
+          taskId,
+          previousStatus,
+          nextStatus: status,
+        }, LogCategory.ORCHESTRATOR);
+      }
       return;
     }
 
@@ -854,6 +884,54 @@ export class DispatchBatch extends EventEmitter {
         this.emit('task:ready', taskId, entry);
       }
     }
+  }
+
+  /**
+   * 计算注册时的依赖初始状态
+   *
+   * 场景说明：
+   * - 追加任务依赖“已完成前序”时，必须立即进入 pending；
+   * - 追加任务依赖“已失败/跳过/取消前序”时，必须立即级联 skipped；
+   * - 仅在依赖尚未完成时保持 waiting_deps。
+   */
+  private evaluateDependencyState(dependsOn: string[]): {
+    status: 'pending' | 'waiting_deps' | 'skipped';
+    reason?: string;
+  } {
+    if (dependsOn.length === 0) {
+      return { status: 'pending' };
+    }
+
+    let hasUnfinishedDependency = false;
+    for (const depId of dependsOn) {
+      const depEntry = this.entries.get(depId);
+      if (!depEntry) {
+        continue;
+      }
+      if (depEntry.status === 'failed' || depEntry.status === 'skipped' || depEntry.status === 'cancelled') {
+        const statusLabel = depEntry.status === 'failed'
+          ? '失败'
+          : depEntry.status === 'skipped'
+            ? '跳过'
+            : '取消';
+        return {
+          status: 'skipped',
+          reason: `前序任务 ${depId} 已${statusLabel}，级联跳过`,
+        };
+      }
+      if (depEntry.status !== 'completed') {
+        hasUnfinishedDependency = true;
+      }
+    }
+
+    if (hasUnfinishedDependency) {
+      return { status: 'waiting_deps' };
+    }
+
+    return {
+      status: 'pending',
+      reason: '依赖任务已完成，注册后可直接执行',
+    };
   }
 
   /**

@@ -99,7 +99,7 @@ export type DispatchTaskHandler = (params: {
 }>;
 
 /**
- * send_worker_message 回调：由 MissionDrivenEngine 注入，向 Worker 面板发送消息
+ * send_worker_message 回调：由 MissionDrivenEngine 注入，向 Worker 运行时与面板发送消息
  */
 export type SendWorkerMessageHandler = (params: {
   worker: WorkerSlot;
@@ -789,7 +789,7 @@ export class OrchestrationExecutor {
   private getSendWorkerMessageDefinition(): ExtendedToolDefinition {
     return {
       name: 'send_worker_message',
-      description: '向指定 Worker 的面板发送消息。用于传递补充上下文、调整指令或协作信息。',
+      description: '向指定 Worker 发送运行时指令，并同步展示在 Worker 面板。用于传递补充上下文、调整指令或协作信息。',
       input_schema: {
         type: 'object',
         properties: {

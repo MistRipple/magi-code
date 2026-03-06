@@ -23,6 +23,8 @@
 
 [核心特性](#核心特性) • [工作原理](#工作原理) • [快速开始](#快速开始) • [联系](#联系)
 
+[English](README_EN.md)
+
 </div>
 
 ---
@@ -188,11 +190,17 @@
 
 ---
 
+## ![](https://img.shields.io/badge/STARS-Star_History-F59E0B?style=for-the-badge)
+
+[![Star History Chart](https://api.star-history.com/svg?repos=MistRipple/magi&type=Date)](https://star-history.com/#MistRipple/magi&Date)
+
+---
+
 ## ![](https://img.shields.io/badge/SPONSORS-赞助-E91E63?style=for-the-badge)
 
 **Magi 的诞生离不开早期支持者的帮助。**
 ##### 赞助用户
-<table align="left">
+<table>
   <tr>
     <td align="center">
       <a href="https://github.com/Poonwai">
