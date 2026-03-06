@@ -191,7 +191,7 @@
 ## ![](https://img.shields.io/badge/SPONSORS-赞助-E91E63?style=for-the-badge)
 
 **Magi 的诞生离不开早期支持者的帮助。**
-
+##### 赞助用户
 <table align="left">
   <tr>
     <td align="center">
@@ -216,6 +216,8 @@
 </table>
 
 ---
+
+##### 赞助站
 
 **Token 支持**: [BinCode 中转站](https://newapi.stonefancyx.com/)
 
