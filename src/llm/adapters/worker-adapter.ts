@@ -780,6 +780,32 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     logger.debug(`${this.agent} system prompt updated`, undefined, LogCategory.LLM);
   }
 
+  /**
+   * 添加系统消息（用于模型异常自恢复约束注入）
+   */
+  addSystemMessage(content: string): void {
+    if (!content?.trim()) {
+      return;
+    }
+    this.conversationHistory.push({
+      role: 'system',
+      content,
+    });
+  }
+
+  /**
+   * 添加助手消息（用于恢复链路上下文补偿）
+   */
+  addAssistantMessage(content: string): void {
+    if (!content?.trim()) {
+      return;
+    }
+    this.conversationHistory.push({
+      role: 'assistant',
+      content,
+    });
+  }
+
   getSystemPrompt(): string {
     return this.systemPrompt;
   }

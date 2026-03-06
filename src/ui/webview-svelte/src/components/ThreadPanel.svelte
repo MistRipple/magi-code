@@ -10,6 +10,11 @@
   import AgentTab from './AgentTab.svelte';
   import { ensureArray } from '../lib/utils';
 
+  interface Props {
+    isTopActive?: boolean;
+  }
+  let { isTopActive = true }: Props = $props();
+
   // 直接使用 messagesState 对象，确保 Svelte 5 响应式追踪正常
 
   // 底部 Tab: 使用 store 中的状态，支持从其他组件跳转
@@ -36,16 +41,16 @@
   <!-- 每个 Worker 拥有独立的 MessageList 实例和计时器状态 -->
   <div class="main-content">
     <div class="tab-pane" class:active={activeBottomTab === 'thread'}>
-      <MessageList {messages} isActive={activeBottomTab === 'thread'} />
+      <MessageList {messages} isActive={isTopActive && activeBottomTab === 'thread'} />
     </div>
     <div class="tab-pane" class:active={activeBottomTab === 'claude'}>
-      <AgentTab workerName="claude" messages={agentOutputs.claude} isActive={activeBottomTab === 'claude'} />
+      <AgentTab workerName="claude" messages={agentOutputs.claude} isActive={isTopActive && activeBottomTab === 'claude'} />
     </div>
     <div class="tab-pane" class:active={activeBottomTab === 'codex'}>
-      <AgentTab workerName="codex" messages={agentOutputs.codex} isActive={activeBottomTab === 'codex'} />
+      <AgentTab workerName="codex" messages={agentOutputs.codex} isActive={isTopActive && activeBottomTab === 'codex'} />
     </div>
     <div class="tab-pane" class:active={activeBottomTab === 'gemini'}>
-      <AgentTab workerName="gemini" messages={agentOutputs.gemini} isActive={activeBottomTab === 'gemini'} />
+      <AgentTab workerName="gemini" messages={agentOutputs.gemini} isActive={isTopActive && activeBottomTab === 'gemini'} />
     </div>
   </div>
 

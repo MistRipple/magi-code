@@ -65,69 +65,155 @@ export interface TodoRepository {
 
 /**
  * 基于文件系统的 TodoRepository 实现
+ * 存储结构：.magi/sessions/{sessionId}/todos.json
  */
 export class FileTodoRepository implements TodoRepository {
   private workspaceRoot: string;
-  private storageDir: string;
-  private todosFile: string;
+  private sessionsDir: string;
   private cache: Map<string, UnifiedTodo> = new Map();
-  private dirty: boolean = false;
+  private dirtySessions: Set<string> = new Set();
 
   constructor(workspaceRoot: string) {
     this.workspaceRoot = workspaceRoot;
-    this.storageDir = path.join(workspaceRoot, '.magi', 'todos');
-    this.todosFile = path.join(this.storageDir, 'todos.json');
-    this.ensureStorageDir();
+    this.sessionsDir = path.join(workspaceRoot, '.magi', 'sessions');
+    this.ensureSessionsDir();
     this.loadCache();
   }
 
-  private ensureStorageDir(): void {
-    if (!fs.existsSync(this.storageDir)) {
-      fs.mkdirSync(this.storageDir, { recursive: true });
+  private ensureSessionsDir(): void {
+    if (!fs.existsSync(this.sessionsDir)) {
+      fs.mkdirSync(this.sessionsDir, { recursive: true });
     }
   }
 
+  private getSessionTodosFile(sessionId: string): string {
+    return path.join(this.sessionsDir, sessionId, 'todos.json');
+  }
+
+  private ensureSessionDir(sessionId: string): void {
+    const sessionDir = path.join(this.sessionsDir, sessionId);
+    if (!fs.existsSync(sessionDir)) {
+      fs.mkdirSync(sessionDir, { recursive: true });
+    }
+  }
+
+  private normalizeSessionId(sessionId: string): string {
+    const normalized = typeof sessionId === 'string' ? sessionId.trim() : '';
+    if (!normalized) {
+      throw new Error('Todo.sessionId 不能为空');
+    }
+    return normalized;
+  }
+
+  private markSessionDirty(sessionId: string | undefined): void {
+    if (!sessionId || typeof sessionId !== 'string') {
+      return;
+    }
+    const normalized = sessionId.trim();
+    if (!normalized) {
+      return;
+    }
+    this.dirtySessions.add(normalized);
+  }
+
   private loadCache(): void {
-    if (fs.existsSync(this.todosFile)) {
-      try {
-        const data = fs.readFileSync(this.todosFile, 'utf-8');
-        const todos: UnifiedTodo[] = JSON.parse(data);
-        for (const todo of todos) {
-          this.cache.set(todo.id, todo);
+    if (!fs.existsSync(this.sessionsDir)) {
+      return;
+    }
+
+    try {
+      const entries = fs.readdirSync(this.sessionsDir, { withFileTypes: true });
+      let loadedCount = 0;
+
+      for (const entry of entries) {
+        if (!entry.isDirectory()) {
+          continue;
         }
-        logger.debug(
-          'Todo.仓库.缓存_加载',
-          { count: todos.length },
-          LogCategory.TASK
-        );
-      } catch (error) {
-        logger.error('Todo.仓库.缓存_加载_失败', error, LogCategory.TASK);
+
+        const sessionId = entry.name;
+        const todosFile = this.getSessionTodosFile(sessionId);
+        if (!fs.existsSync(todosFile)) {
+          continue;
+        }
+
+        try {
+          const data = fs.readFileSync(todosFile, 'utf-8');
+          const todos = JSON.parse(data);
+          if (!Array.isArray(todos)) {
+            continue;
+          }
+          for (const rawTodo of todos) {
+            if (!rawTodo || typeof rawTodo !== 'object') {
+              continue;
+            }
+            const todo = {
+              ...(rawTodo as Omit<UnifiedTodo, 'sessionId'>),
+              sessionId: typeof (rawTodo as { sessionId?: unknown }).sessionId === 'string'
+                ? (rawTodo as { sessionId: string }).sessionId.trim() || sessionId
+                : sessionId,
+            } as UnifiedTodo;
+            this.cache.set(todo.id, todo);
+            loadedCount++;
+          }
+        } catch (error) {
+          logger.error('Todo.仓库.缓存_加载_失败', {
+            sessionId,
+            error,
+          }, LogCategory.TASK);
+        }
       }
+
+      logger.debug(
+        'Todo.仓库.缓存_加载',
+        { count: loadedCount },
+        LogCategory.TASK
+      );
+    } catch (error) {
+      logger.error('Todo.仓库.缓存_加载_失败', error, LogCategory.TASK);
     }
   }
 
   private async persist(): Promise<void> {
-    if (!this.dirty) return;
+    if (this.dirtySessions.size === 0) {
+      return;
+    }
 
-    const todos = Array.from(this.cache.values());
-    const data = JSON.stringify(todos, null, 2);
-    fs.writeFileSync(this.todosFile, data, 'utf-8');
-    this.dirty = false;
+    const sessionsToPersist = Array.from(this.dirtySessions);
+    this.dirtySessions.clear();
+
+    for (const sessionId of sessionsToPersist) {
+      this.ensureSessionDir(sessionId);
+      const todos = Array.from(this.cache.values()).filter(
+        (todo) => todo.sessionId === sessionId
+      );
+      const data = JSON.stringify(todos, null, 2);
+      fs.writeFileSync(this.getSessionTodosFile(sessionId), data, 'utf-8');
+    }
   }
 
   // ===== CRUD =====
 
   async save(todo: UnifiedTodo): Promise<void> {
-    this.cache.set(todo.id, todo);
-    this.dirty = true;
+    const sessionId = this.normalizeSessionId(todo.sessionId);
+    const normalizedTodo: UnifiedTodo = {
+      ...todo,
+      sessionId,
+    };
+    this.cache.set(normalizedTodo.id, normalizedTodo);
+    this.markSessionDirty(sessionId);
     await this.persist();
   }
 
   async saveBatch(todos: UnifiedTodo[]): Promise<void> {
     for (const todo of todos) {
-      this.cache.set(todo.id, todo);
+      const sessionId = this.normalizeSessionId(todo.sessionId);
+      const normalizedTodo: UnifiedTodo = {
+        ...todo,
+        sessionId,
+      };
+      this.cache.set(normalizedTodo.id, normalizedTodo);
+      this.markSessionDirty(sessionId);
     }
-    this.dirty = true;
     await this.persist();
   }
 
@@ -136,16 +222,18 @@ export class FileTodoRepository implements TodoRepository {
   }
 
   async delete(todoId: string): Promise<void> {
+    const existing = this.cache.get(todoId);
     this.cache.delete(todoId);
-    this.dirty = true;
+    this.markSessionDirty(existing?.sessionId);
     await this.persist();
   }
 
   async deleteBatch(todoIds: string[]): Promise<void> {
     for (const id of todoIds) {
+      const existing = this.cache.get(id);
       this.cache.delete(id);
+      this.markSessionDirty(existing?.sessionId);
     }
-    this.dirty = true;
     await this.persist();
   }
 
@@ -178,6 +266,11 @@ export class FileTodoRepository implements TodoRepository {
 
   async query(query: TodoQuery): Promise<UnifiedTodo[]> {
     let todos = Array.from(this.cache.values());
+
+    const sessionFilter = typeof query.sessionId === 'string' ? query.sessionId.trim() : '';
+    if (sessionFilter) {
+      todos = todos.filter((t) => t.sessionId === sessionFilter);
+    }
 
     if (query.missionId) {
       todos = todos.filter((t) => t.missionId === query.missionId);
@@ -226,7 +319,7 @@ export class FileTodoRepository implements TodoRepository {
 
   async rollbackTransaction(tx: TodoTransaction): Promise<void> {
     this.cache = new Map(tx.snapshot);
-    this.dirty = false;
+    this.dirtySessions.clear();
   }
 
   // ===== 维护 =====
@@ -243,12 +336,10 @@ export class FileTodoRepository implements TodoRepository {
 
     for (const todo of toDelete) {
       this.cache.delete(todo.id);
+      this.markSessionDirty(todo.sessionId);
     }
 
-    if (toDelete.length > 0) {
-      this.dirty = true;
-      await this.persist();
-    }
+    if (toDelete.length > 0) await this.persist();
 
     return toDelete.length;
   }

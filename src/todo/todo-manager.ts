@@ -67,6 +67,9 @@ export class TodoManager extends EventEmitter {
   private queue: PriorityQueue<TodoPriorityItem>;
   private timeoutChecker: TimeoutChecker;
   private cache: Map<string, UnifiedTodo> = new Map();
+  private readonly resolveSessionIdByMissionId?: (
+    missionId: string
+  ) => Promise<string | null | undefined> | string | null | undefined;
 
   /** 可用契约集合（已实现的契约） */
   private availableContracts: Set<string> = new Set();
@@ -78,12 +81,16 @@ export class TodoManager extends EventEmitter {
     workspaceRoot: string,
     options?: {
       timeoutCheckInterval?: number;
+      resolveSessionIdByMissionId?: (
+        missionId: string
+      ) => Promise<string | null | undefined> | string | null | undefined;
     }
   ) {
     super();
     this.repository = new FileTodoRepository(workspaceRoot);
     this.queue = new PriorityQueue<TodoPriorityItem>();
     this.timeoutChecker = new TimeoutChecker(options?.timeoutCheckInterval);
+    this.resolveSessionIdByMissionId = options?.resolveSessionIdByMissionId;
   }
 
   /**
@@ -184,8 +191,10 @@ export class TodoManager extends EventEmitter {
    */
   async create(params: CreateTodoParams): Promise<UnifiedTodo> {
     const now = Date.now();
+    const sessionId = await this.resolveSessionIdForCreate(params);
     const todo: UnifiedTodo = {
       id: `todo_${now}_${Math.random().toString(36).substring(2, 11)}`,
+      sessionId,
       missionId: params.missionId,
       assignmentId: params.assignmentId,
       parentId: params.parentId,
@@ -217,6 +226,39 @@ export class TodoManager extends EventEmitter {
 
     this.emit('todo:created', todo);
     return todo;
+  }
+
+  private async resolveSessionIdForCreate(params: CreateTodoParams): Promise<string> {
+    const explicitSessionId = typeof params.sessionId === 'string'
+      ? params.sessionId.trim()
+      : '';
+    if (explicitSessionId) {
+      return explicitSessionId;
+    }
+
+    const missionId = typeof params.missionId === 'string'
+      ? params.missionId.trim()
+      : '';
+    if (!missionId) {
+      throw new Error('Todo 创建失败：missionId 不能为空');
+    }
+
+    if (missionId.startsWith('session:')) {
+      const sessionId = missionId.slice('session:'.length).trim();
+      if (sessionId) {
+        return sessionId;
+      }
+    }
+
+    if (this.resolveSessionIdByMissionId) {
+      const resolved = await this.resolveSessionIdByMissionId(missionId);
+      const normalized = typeof resolved === 'string' ? resolved.trim() : '';
+      if (normalized) {
+        return normalized;
+      }
+    }
+
+    throw new Error(`Todo 创建失败：无法从 missionId=${missionId} 推导 sessionId`);
   }
 
   /**

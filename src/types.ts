@@ -79,32 +79,8 @@ export type {
 // Session 和 Task 管理
 // ============================================
 
-/**
- * Session - 插件窗口会话
- * 打开插件窗口时创建，关闭时结束
- *
- * 注意：任务管理已迁移到 Mission 系统
- * 使用 MissionDrivenEngine.listTaskViews() 获取任务列表
- */
-export interface Session {
-  id: string;
-  createdAt: number;
-  status: SessionStatus;
-  snapshots: FileSnapshot[];
-  /** 对话消息历史 */
-  messages?: SessionMessage[];
-}
-
-/** 会话消息 */
-export interface SessionMessage {
-  role: 'user' | 'assistant' | 'system';
-  content: string;
-  agent?: AgentType;  // ✅ 使用 AgentType
-  source?: MessageSource;
-  timestamp: number;
-}
-
-export type SessionStatus = 'active' | 'completed';
+// Session / SessionMessage / SessionStatus 已统一到 src/session/unified-session-manager.ts
+// 请使用 UnifiedSessionManager 导出的类型
 
 /**
  * FileSnapshot - 文件快照
@@ -416,6 +392,25 @@ export interface UIState {
   currentTask?: Task;
   tasks?: Task[];
   activePlan?: { planId: string; formattedPlan: string; updatedAt: number; review?: { status: 'approved' | 'rejected' | 'skipped'; summary: string } };
+  planHistory?: Array<{
+    planId: string;
+    sessionId: string;
+    missionId?: string;
+    turnId: string;
+    version: number;
+    mode: 'standard' | 'deep';
+    status: 'draft' | 'awaiting_confirmation' | 'approved' | 'rejected' | 'executing' | 'partially_completed' | 'completed' | 'failed' | 'cancelled' | 'superseded';
+    summary: string;
+    createdAt: number;
+    updatedAt: number;
+    items: Array<{
+      itemId: string;
+      title: string;
+      owner: string;
+      status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped' | 'cancelled';
+      progress: number;
+    }>;
+  }>;
   workerStatuses: WorkerStatus[];
   pendingChanges: PendingChange[];
   isRunning: boolean;
@@ -479,7 +474,6 @@ export type WebviewToExtensionMessage =
   | { type: 'openFile'; filepath?: string; filePath?: string }
   | { type: 'openLink'; url: string }
   | { type: 'confirmPlan'; confirmed: boolean }
-  | { type: 'answerQuestions'; answer: string | null }
   | { type: 'getState' }
   | { type: 'requestState' }
   | { type: 'webviewReady' }

@@ -120,6 +120,20 @@ export interface LearningRecord {
   tags?: string[];
 }
 
+export interface LearningAddResult {
+  status: 'inserted' | 'duplicate' | 'rejected';
+  record?: LearningRecord;
+}
+
+/**
+ * 学习经验提取候选项（会话提取中间态）
+ */
+interface LearningExtractionCandidate {
+  content: string;
+  context?: string;
+  tags?: string[];
+}
+
 /**
  * 项目知识库配置
  */
@@ -158,6 +172,21 @@ export class ProjectKnowledgeBase {
   private static readonly MAX_ADRS = 100;
   private static readonly MAX_FAQS = 200;
   private static readonly MAX_LEARNINGS = 200;
+  private static readonly MIN_LEARNING_CONTENT_LENGTH = 12;
+  private static readonly MAX_LEARNING_CONTENT_LENGTH = 600;
+  private static readonly SESSION_LEARNING_MAX_RESULTS = 6;
+  private static readonly LOW_VALUE_LEARNING_PATTERNS = [
+    /^todo$/i,
+    /^n\/a$/i,
+    /^none$/i,
+    /^无$/i,
+    /^暂无$/i,
+    /^待补充$/i,
+    /^待确认$/i,
+    /^unknown$/i,
+    /^待处理$/i,
+    /^继续观察$/i,
+  ];
 
   constructor(config: ProjectKnowledgeConfig) {
     this.projectRoot = config.projectRoot;
@@ -896,6 +925,45 @@ export class ProjectKnowledgeBase {
   }
 
   /**
+   * 从会话消息中提取 Learning 候选（优先 LLM，失败或未配置时回退到启发式规则）
+   */
+  async extractLearningsFromSession(
+    messages: Array<{ role: string; content: string }>
+  ): Promise<LearningExtractionCandidate[]> {
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return [];
+    }
+
+    if (this.llmClient) {
+      try {
+        const prompt = this.buildLearningExtractionPrompt(messages);
+        const response = await this.llmClient.sendMessage({
+          messages: [{ role: 'user', content: prompt }],
+          maxTokens: 1600,
+          temperature: 0.2,
+        });
+        const llmCandidates = this.parseLearningsFromResponse(response.content);
+        const normalized = this.normalizeLearningCandidates(llmCandidates);
+        if (normalized.length > 0) {
+          logger.info('项目知识库.Learning提取.LLM完成', { count: normalized.length }, LogCategory.SESSION);
+          return normalized.slice(0, ProjectKnowledgeBase.SESSION_LEARNING_MAX_RESULTS);
+        }
+      } catch (error) {
+        logger.warn('项目知识库.Learning提取.LLM失败_回退启发式', {
+          error: error instanceof Error ? error.message : String(error),
+        }, LogCategory.SESSION);
+      }
+    }
+
+    const heuristicCandidates = this.extractLearningsHeuristically(messages);
+    const normalized = this.normalizeLearningCandidates(heuristicCandidates);
+    if (normalized.length > 0) {
+      logger.info('项目知识库.Learning提取.启发式完成', { count: normalized.length }, LogCategory.SESSION);
+    }
+    return normalized.slice(0, ProjectKnowledgeBase.SESSION_LEARNING_MAX_RESULTS);
+  }
+
+  /**
    * 构建 ADR 提取提示词
    */
   private buildADRExtractionPrompt(messages: Array<{ role: string; content: string }>): string {
@@ -981,6 +1049,47 @@ ${conversationText}
   }
 
   /**
+   * 构建 Learning 提取提示词
+   */
+  private buildLearningExtractionPrompt(messages: Array<{ role: string; content: string }>): string {
+    const conversationText = messages
+      .map(m => `[${m.role}]: ${m.content}`)
+      .join('\n\n');
+
+    return `请从以下对话中提取“可复用经验（Learning）”。
+
+## 对话内容
+${conversationText}
+
+## 提取目标
+提取那些可以跨会话复用、可指导后续工程执行的经验，例如：
+- 调试结论
+- 避坑建议
+- 执行顺序约束
+- 工具使用准则
+- 风险与前置条件
+
+## 质量要求（必须遵守）
+- 经验必须具体、可执行，避免空话
+- 每条经验建议 1~2 句，内容完整
+- 跳过与已有经验重复或近似重复的表述
+- 跳过无意义短句（如“继续观察”“待处理”等）
+
+## 输出格式（JSON 数组）
+\`\`\`json
+[
+  {
+    "content": "经验内容",
+    "context": "来源上下文（可选）",
+    "tags": ["debug", "workflow"]
+  }
+]
+\`\`\`
+
+若无有效经验请返回 []。`;
+  }
+
+  /**
    * 从 LLM 响应文本中健壮地提取 JSON 数组
    * 多层降级：code fence → 裸 JSON 数组 → 整体尝试解析
    */
@@ -1062,6 +1171,113 @@ ${conversationText}
       logger.error('项目知识库.FAQ解析.失败', { error }, LogCategory.SESSION);
       return [];
     }
+  }
+
+  /**
+   * 从 LLM 响应中解析 Learning 候选
+   */
+  private parseLearningsFromResponse(response: string): LearningExtractionCandidate[] {
+    try {
+      const extracted = this.extractJsonArray(response, 'Learning');
+      if (!extracted) return [];
+      return extracted
+        .filter((item) => item && typeof item === 'object')
+        .map((item) => ({
+          content: typeof item.content === 'string' ? item.content : '',
+          context: typeof item.context === 'string' ? item.context : '',
+          tags: Array.isArray(item.tags)
+            ? item.tags.filter((tag: unknown) => typeof tag === 'string')
+            : undefined,
+        }));
+    } catch (error) {
+      logger.error('项目知识库.Learning解析.失败', { error }, LogCategory.SESSION);
+      return [];
+    }
+  }
+
+  /**
+   * 启发式 Learning 提取（无模型时兜底）
+   */
+  private extractLearningsHeuristically(
+    messages: Array<{ role: string; content: string }>
+  ): LearningExtractionCandidate[] {
+    const candidates: LearningExtractionCandidate[] = [];
+    const seen = new Set<string>();
+    const patterns = [
+      /(?:经验|教训|结论|注意|建议|最佳实践|踩坑|坑点|要点)[：:]\s*([^\n。！？!?]{6,220})/gi,
+      /(?:important|note|lesson|tip|best practice)[：:]\s*([^\n.?!]{6,220})/gi,
+    ];
+
+    for (const message of messages) {
+      if (!message || message.role === 'user') continue;
+      const content = typeof message.content === 'string' ? message.content : '';
+      if (!content) continue;
+
+      for (const pattern of patterns) {
+        pattern.lastIndex = 0;
+        let match: RegExpExecArray | null;
+        while ((match = pattern.exec(content)) !== null) {
+          const extracted = match[1]?.trim();
+          const normalized = this.normalizeLearningTextForDedup(extracted);
+          if (!normalized || seen.has(normalized)) continue;
+          seen.add(normalized);
+          candidates.push({
+            content: extracted,
+            context: `session:${message.role}`,
+          });
+        }
+      }
+    }
+
+    // 兜底：如果没有命中关键字，尝试从最后一条 assistant 消息末段提取 1 条可执行句
+    if (candidates.length === 0) {
+      const lastAssistant = [...messages].reverse().find((msg) => msg?.role !== 'user' && typeof msg.content === 'string' && msg.content.trim().length > 0);
+      if (lastAssistant) {
+        const sentences = lastAssistant.content
+          .split(/[\n。！？!?]+/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .filter((line) => line.length >= ProjectKnowledgeBase.MIN_LEARNING_CONTENT_LENGTH && line.length <= 220);
+        const fallback = sentences.find((line) => /(?:应|需要|必须|建议|避免|确保|先|后)/.test(line));
+        if (fallback) {
+          candidates.push({
+            content: fallback,
+            context: `session:${lastAssistant.role}`,
+          });
+        }
+      }
+    }
+
+    return candidates;
+  }
+
+  /**
+   * Learning 候选标准化（裁剪、去空、质量过滤）
+   */
+  private normalizeLearningCandidates(candidates: LearningExtractionCandidate[]): LearningExtractionCandidate[] {
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      return [];
+    }
+
+    const normalized: LearningExtractionCandidate[] = [];
+    for (const candidate of candidates) {
+      const content = this.sanitizeLearningContent(candidate.content || '');
+      const context = this.sanitizeLearningContext(candidate.context || '');
+      if (!this.isLearningContentQualified(content)) {
+        continue;
+      }
+      const duplicate = normalized.find((record) => this.isLearningDuplicate(content, context, record.content, record.context || ''));
+      if (duplicate) {
+        continue;
+      }
+      normalized.push({
+        content,
+        context,
+        tags: this.normalizeLearningTags(candidate.tags),
+      });
+    }
+
+    return normalized;
   }
 
   // ============================================================================
@@ -1283,14 +1499,32 @@ ${conversationText}
   /**
    * 添加经验记录
    */
-  addLearning(content: string, context: string, tags?: string[]): LearningRecord {
+  addLearning(content: string, context: string, tags?: string[]): LearningAddResult {
+    const normalizedContent = this.sanitizeLearningContent(content);
+    const normalizedContext = this.sanitizeLearningContext(context);
+    if (!this.isLearningContentQualified(normalizedContent)) {
+      logger.info('项目知识库.Learning.质量过滤跳过', {
+        contentPreview: normalizedContent.substring(0, 60),
+      }, LogCategory.SESSION);
+      return { status: 'rejected' };
+    }
+
+    const duplicate = this.findDuplicateLearning(normalizedContent, normalizedContext);
+    if (duplicate) {
+      logger.info('项目知识库.Learning.去重跳过', {
+        existingId: duplicate.id,
+        contentPreview: normalizedContent.substring(0, 60),
+      }, LogCategory.SESSION);
+      return { status: 'duplicate', record: duplicate };
+    }
+
     const now = Date.now();
     const record: LearningRecord = {
       id: `learning_${now}_${Math.random().toString(36).substring(2, 8)}`,
-      content,
-      context,
+      content: normalizedContent,
+      context: normalizedContext,
       createdAt: now,
-      tags,
+      tags: this.normalizeLearningTags(tags),
     };
     this.learnings.push(record);
     // 超出容量限制时淘汰最旧的记录
@@ -1300,7 +1534,7 @@ ${conversationText}
     }
     this.saveLearnings();
     logger.info('项目知识库.Learning.已添加', { id: record.id }, LogCategory.SESSION);
-    return record;
+    return { status: 'inserted', record };
   }
 
   /**
@@ -1672,16 +1906,20 @@ ${conversationText}
         changed = true;
         return;
       }
-      const content = typeof (item as any).content === 'string' ? (item as any).content.trim() : '';
-      if (!content) {
+      const content = this.sanitizeLearningContent(typeof (item as any).content === 'string' ? (item as any).content : '');
+      if (!this.isLearningContentQualified(content)) {
         changed = true;
         return;
       }
-      const context = typeof (item as any).context === 'string' ? (item as any).context : '';
+      const context = this.sanitizeLearningContext(typeof (item as any).context === 'string' ? (item as any).context : '');
       const createdAt = typeof (item as any).createdAt === 'number' ? (item as any).createdAt : now;
-      const tags = Array.isArray((item as any).tags)
-        ? (item as any).tags.filter((value: unknown) => typeof value === 'string')
-        : undefined;
+      const tags = this.normalizeLearningTags((item as any).tags);
+
+      const duplicate = records.find((record) => this.isLearningDuplicate(content, context, record.content, record.context));
+      if (duplicate) {
+        changed = true;
+        return;
+      }
 
       if (
         context !== (item as any).context ||
@@ -1701,6 +1939,87 @@ ${conversationText}
       if (!((item as any).id)) changed = true;
     });
     return { records, changed };
+  }
+
+  private sanitizeLearningContent(content: string): string {
+    if (typeof content !== 'string') return '';
+    return content
+      .replace(/^[\s\-*•\d.)]+/, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, ProjectKnowledgeBase.MAX_LEARNING_CONTENT_LENGTH);
+  }
+
+  private sanitizeLearningContext(context: string): string {
+    if (typeof context !== 'string') return '';
+    return context.replace(/\s+/g, ' ').trim().slice(0, 300);
+  }
+
+  private normalizeLearningTags(tags: unknown): string[] | undefined {
+    if (!Array.isArray(tags)) return undefined;
+    const normalized = Array.from(new Set(
+      tags
+        .filter((value): value is string => typeof value === 'string')
+        .map((tag) => tag.trim())
+        .filter((tag) => tag.length > 0)
+        .slice(0, 8)
+    ));
+    return normalized.length > 0 ? normalized : undefined;
+  }
+
+  private isLearningContentQualified(content: string): boolean {
+    if (!content) return false;
+    if (content.length < ProjectKnowledgeBase.MIN_LEARNING_CONTENT_LENGTH) return false;
+    if (ProjectKnowledgeBase.LOW_VALUE_LEARNING_PATTERNS.some((pattern) => pattern.test(content.toLowerCase()))) {
+      return false;
+    }
+    // 至少包含一个字母/数字/汉字，避免纯符号文本
+    if (!/[a-zA-Z0-9\u4e00-\u9fa5]/.test(content)) return false;
+    return true;
+  }
+
+  private normalizeLearningTextForDedup(text: string): string {
+    if (typeof text !== 'string') return '';
+    return text
+      .toLowerCase()
+      .replace(/[，。！？、；：,.!?;:()[\]{}"'`~@#$%^&*_+=<>|\\/]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private isLearningDuplicate(
+    contentA: string,
+    contextA: string,
+    contentB: string,
+    contextB: string
+  ): boolean {
+    const normalizedA = this.normalizeLearningTextForDedup(contentA);
+    const normalizedB = this.normalizeLearningTextForDedup(contentB);
+    if (!normalizedA || !normalizedB) return false;
+
+    if (normalizedA === normalizedB) return true;
+    if (
+      normalizedA.length >= 18
+      && normalizedB.length >= 18
+      && (normalizedA.includes(normalizedB) || normalizedB.includes(normalizedA))
+    ) {
+      return true;
+    }
+    if (this.textSimilarity(normalizedA, normalizedB) >= 0.85) return true;
+
+    // 同上下文下的高相似内容视为重复
+    const normalizedCtxA = this.normalizeLearningTextForDedup(contextA);
+    const normalizedCtxB = this.normalizeLearningTextForDedup(contextB);
+    if (normalizedCtxA && normalizedCtxA === normalizedCtxB && this.textSimilarity(normalizedA, normalizedB) >= 0.75) {
+      return true;
+    }
+    return false;
+  }
+
+  private findDuplicateLearning(content: string, context: string): LearningRecord | undefined {
+    return this.learnings.find((record) =>
+      this.isLearningDuplicate(content, context, record.content, record.context)
+    );
   }
 
   /**

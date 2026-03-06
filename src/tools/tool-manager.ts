@@ -57,6 +57,7 @@ import { runIntentDrivenFileEdit } from '../llm/utils/intent-file-editor';
  * 快照执行上下文（标识当前正在执行的 mission/assignment/worker）
  */
 export interface SnapshotContext {
+  sessionId: string;
   missionId: string;
   assignmentId: string;
   todoId: string;
@@ -220,7 +221,16 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    * 以 workerId 为 key 存储，支持多 Worker 并行执行
    */
   setSnapshotContext(context: SnapshotContext): void {
-    this.snapshotContextMap.set(context.workerId, context);
+    const sessionId = typeof context.sessionId === 'string' ? context.sessionId.trim() : '';
+    if (!sessionId) {
+      logger.warn('ToolManager: 快照上下文缺少 sessionId，已忽略', {
+        workerId: context.workerId,
+        missionId: context.missionId,
+      }, LogCategory.TOOLS);
+      this.snapshotContextMap.delete(context.workerId);
+      return;
+    }
+    this.snapshotContextMap.set(context.workerId, { ...context, sessionId });
   }
 
   /**
@@ -296,6 +306,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       try {
         snapshotManager.createSnapshotForMission(
           filePath,
+          context.sessionId,
           context.missionId,
           context.assignmentId,
           context.todoId,
@@ -367,20 +378,28 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       if (!selection) {
         throw new Error('No available LLM configuration for file_edit. Please enable at least one model (auxiliary/worker/orchestrator) with valid apiKey/baseUrl/model.');
       }
+      const executionContext = this.executionContextStorage.getStore();
 
       logger.debug('file_edit.intent.model.selected', {
         source: selection.source,
         provider: selection.config.provider,
         model: selection.config.model,
+        role: executionContext?.role,
+        workerId: this.getExecutionWorkerId(),
       }, LogCategory.LLM);
 
       const client = createLLMClient(selection.config);
-      return runIntentDrivenFileEdit(client, {
-        filePath,
-        fileContent,
-        summary,
-        detailedDescription: detailedDesc,
-      });
+      try {
+        return await runIntentDrivenFileEdit(client, {
+          filePath,
+          fileContent,
+          summary,
+          detailedDescription: detailedDesc,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`[file_edit model=${selection.source}] ${message}`);
+      }
     });
 
     logger.info('ToolManager: default file_edit handler registered', undefined, LogCategory.TOOLS);
@@ -388,23 +407,62 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
   private resolveIntentDrivenFileEditModel(): { source: string; config: LLMConfig } | null {
     const fullConfig = LLMConfigLoader.loadFullConfig();
+    const executionContext = this.executionContextStorage.getStore();
+    const executionWorkerSlot = this.resolveWorkerSlot(this.getExecutionWorkerId());
+    const role = executionContext?.role;
 
-    if (this.isEditableModelConfig(fullConfig.auxiliary)) {
-      return { source: 'auxiliary', config: fullConfig.auxiliary };
+    const candidates: Array<{ source: string; config: LLMConfig | null | undefined }> = [];
+    const seen = new Set<string>();
+    const pushCandidate = (source: string, config: LLMConfig | null | undefined) => {
+      if (seen.has(source)) {
+        return;
+      }
+      seen.add(source);
+      candidates.push({ source, config });
+    };
+
+    // 角色优先：Worker 优先使用自身模型；编排者优先使用 orchestrator 模型。
+    if (role === 'worker' && executionWorkerSlot) {
+      pushCandidate(`worker:${executionWorkerSlot}`, fullConfig.workers?.[executionWorkerSlot]);
+      pushCandidate('auxiliary', fullConfig.auxiliary);
+      pushCandidate('orchestrator', fullConfig.orchestrator);
+    } else if (role === 'orchestrator') {
+      pushCandidate('orchestrator', fullConfig.orchestrator);
+      pushCandidate('auxiliary', fullConfig.auxiliary);
+    } else {
+      // 未知调用方（极少数内部场景）使用通用优先级。
+      pushCandidate('auxiliary', fullConfig.auxiliary);
+      pushCandidate('orchestrator', fullConfig.orchestrator);
     }
 
     for (const worker of ToolManager.FILE_EDIT_WORKER_ORDER) {
-      const workerConfig = fullConfig.workers?.[worker];
-      if (this.isEditableModelConfig(workerConfig)) {
-        return { source: `worker:${worker}`, config: workerConfig };
+      pushCandidate(`worker:${worker}`, fullConfig.workers?.[worker]);
+    }
+
+    for (const candidate of candidates) {
+      if (this.isEditableModelConfig(candidate.config)) {
+        return { source: candidate.source, config: candidate.config };
       }
     }
 
-    if (this.isEditableModelConfig(fullConfig.orchestrator)) {
-      return { source: 'orchestrator', config: fullConfig.orchestrator };
-    }
-
     return null;
+  }
+
+  private resolveWorkerSlot(workerId: string | undefined): WorkerSlot | undefined {
+    if (!workerId) {
+      return undefined;
+    }
+    const normalized = workerId.trim().toLowerCase();
+    if (normalized === 'claude' || normalized === 'codex' || normalized === 'gemini') {
+      return normalized as WorkerSlot;
+    }
+    if (normalized.startsWith('worker-')) {
+      const slot = normalized.slice('worker-'.length);
+      if (slot === 'claude' || slot === 'codex' || slot === 'gemini') {
+        return slot as WorkerSlot;
+      }
+    }
+    return undefined;
   }
 
   private isEditableModelConfig(config: LLMConfig | null | undefined): config is LLMConfig {
@@ -857,11 +915,17 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         if (name === 'file_edit' || name === 'file_insert') {
           const staleError = this.validateFileContextFreshnessBeforeEdit(toolCall);
           if (staleError) {
-            return {
-              toolCallId: toolCall.id,
-              content: staleError,
-              isError: true,
-            };
+            // 自动刷新而非报错：并发 Worker 场景下，其他 Worker 的 launch-process
+            // 会递增全局 epoch 导致当前 Worker 的文件上下文被误判为过期。
+            // 此处自动执行一次内部 file_view 刷新 epoch，避免 LLM 处理底层并发竞态。
+            const absPath = this.resolveFileToolPath(toolCall, true);
+            if (absPath) {
+              this.fileContextEpochByPath.set(absPath, this.workspaceMutationEpoch);
+              logger.info('file_edit.上下文自动刷新', {
+                path: this.workspaceRoots.toDisplayPath(absPath),
+                epoch: this.workspaceMutationEpoch,
+              }, LogCategory.TOOLS);
+            }
           }
         }
         const result = await this.fileExecutor.execute(toolCall);
@@ -1596,21 +1660,28 @@ Only works when the process is in "running" state; returns accepted=false otherw
     }
 
     const readOnlyPatterns = [
-      /^(?:env\s+)?(?:ls|pwd|cat|head|tail|wc|grep|rg|find|tree|stat|file|which|whereis|du|df)\b/i,
+      /^(?:env\s+)?(?:ls|pwd|cat|head|tail|wc|grep|rg|find|tree|stat|file|which|whereis|du|df|sort|diff|md5sum|sha256sum|date|hostname|uname|printenv|id|whoami|test|true|false|type|command|readlink)(?:\s|$)/i,
+      /^cd(?:\s|$)/i,
       /^echo\b(?![\s\S]*?(?:>>|>)\s*(?!\/dev\/null\b)\S+)/i,
-      /^git\s+(status|log|show|diff|branch|rev-parse|remote|tag)\b/i,
-      /^(?:npm|pnpm|yarn)\s+(list|why|info|outdated)\b/i,
+      /^git\s+(status|log|show|diff|branch|rev-parse|remote|tag|describe|stash\s+list|config\s+--get)(?:\s|$)/i,
+      /^(?:npm|pnpm|yarn)\s+(list|why|info|outdated|view|show|audit|pack\s+--dry-run)(?:\s|$)/i,
+      /^npx\s+tsc\b[^\n]*--noEmit\b/i,
+      /^(?:cargo\s+check|cargo\s+clippy|cargo\s+test\s+--no-run)(?:\s|$)/i,
+      /^docker\s+(ps|images|logs|inspect|info|version|stats)(?:\s|$)/i,
+      /^\[(?:\s|$)/i,
     ];
 
     return segments.every((segment) => {
-      const normalizedSegment = segment.replace(/\d?>\s*\/dev\/null\b/g, '').trim();
-      if (!normalizedSegment) {
+      // 管道右侧的命令是数据消费者，不修改文件，只取管道最左侧命令判断
+      const pipeSegments = segment.split(/\|/);
+      const primaryCommand = pipeSegments[0].replace(/\d?>\s*\/dev\/null\b/g, '').trim();
+      if (!primaryCommand) {
         return true;
       }
-      if (this.isLikelyFileMutatingCommand(normalizedSegment)) {
+      if (this.isLikelyFileMutatingCommand(primaryCommand)) {
         return false;
       }
-      return readOnlyPatterns.some((pattern) => pattern.test(normalizedSegment));
+      return readOnlyPatterns.some((pattern) => pattern.test(primaryCommand));
     });
   }
 

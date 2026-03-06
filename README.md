@@ -7,7 +7,7 @@
 *意图洞察 · 深度拆解 · 异构协作*
 
 [![VSCode Extension](https://img.shields.io/badge/VSCode-Extension-007ACC?style=flat-square&logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
-[![Version](https://img.shields.io/badge/version-0.1.3-blue?style=flat-square)]()
+[![Version](https://img.shields.io/badge/version-0.2.2-blue?style=flat-square)]()
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later-red?style=flat-square)](LICENSE)
 
 <br/>
@@ -18,9 +18,10 @@
 
 **Magi 不是另一个 ChatBot，而是你的 AI 研发团队。**
 
-它运行在 VSCode 中，将复杂的工程任务自动拆解，指挥多个异构 AI 专家（Worker）并行协作，<br/>从需求分析到代码实现，交付完整的工程成果。
+它运行在 VSCode 中，将复杂工程任务转化为可执行的任务合同，调度多个异构 Worker 并行协作，
+从意图理解、任务拆解、执行修复到验收沉淀形成完整闭环。
 
-[核心特性](#核心特性) • [工作原理](#工作原理) • [快速开始](#快速开始) • [联系我们](#联系我们)
+[核心特性](#核心特性) • [工作原理](#工作原理) • [快速开始](#快速开始) • [联系](#联系)
 
 </div>
 
@@ -28,137 +29,168 @@
 
 ## ![](https://img.shields.io/badge/WHY-Magi-007ACC?style=for-the-badge)
 
-现有的 AI 编程助手（Copilot, Cursor, Cline 等）大多是 **单体智能（Single-Agent）**。当面对复杂的真实工程场景时，它们往往力不从心：
+现有 AI 编程助手大多是单体智能模式，在跨模块开发和长链路排障中容易出现稳定性与一致性问题。Magi 的核心目标是把“对话能力”升级为“工程交付能力”。
 
 | ![](https://img.shields.io/badge/PAIN_POINTS-痛点-red?style=flat-square) | ![](https://img.shields.io/badge/LIMITATIONS-局限-gray?style=flat-square) | ![](https://img.shields.io/badge/SOLUTIONS-Magi_方案-green?style=flat-square) |
 |:---|:---|:---|
-| **任务迷航** | 上下文窗口受限，长对话后容易"遗忘"初衷，输出质量衰减。 | **独立上下文**：自动拆解任务，每个 Worker 专注单一子任务，**上下文纯净隔离**。 |
-| **能力单一** | 强制使用单一模型，无法兼顾逻辑推理、代码生成和架构设计的不同需求。 | **异构模型槽位**：支持 Claude/GPT/Gemini 混合编排，让**最擅长的模型做最擅长的事**。 |
-| **效率瓶颈** | 线性串行执行：写代码 → 改 Bug → 写测试，一步步排队等待。 | **并行执行引擎**：无依赖任务**自动并行**，测试与开发同步进行，效率倍增。 |
-| **回滚困难** | 一旦改错，往往需要复杂的 Git 操作或手动撤销，容易弄丢代码。 | **快照系统**：内置**任务级文件快照**，每一步变更均可独立回溯，安全无忧。 |
-| **协作断层** | 对话结束后上下文即丢失，无法积累项目知识和历史经验。 | **知识沉淀**：跨 Worker 共享上下文 + **项目级知识库**，让 AI 越用越懂你的项目。 |
+| **任务迷航** | 长对话后目标漂移、上下文衰减，任务完成度不稳定。 | **Mission 合同驱动**：目标、验收、上下文三元组约束执行路径。 |
+| **并发冲突** | 多模型并发写文件易相互覆盖，修改不可控。 | **零冲突引擎**：File Mutex + 实时强读 + 意图驱动编辑。 |
+| **故障反复** | 失败后重复同路径重试，缺少根因沉淀。 | **闭环自修复**：动态 Todo + 多轮验证 + 补充指令注入。 |
+| **知识断层** | 对话结束即“失忆”，经验无法持续复用。 | **本地知识沉淀**：Rolling Summary + WisdomExtractor + PKB。 |
+| **治理失衡** | 所有任务用同一执行强度，效率与安全难兼得。 | **双模式治理**：常规模式提速，深度模式强约束保安全。 |
+
+### 典型使用场景
+
+- **跨模块功能开发**：前后端/配置/脚本联动变更，自动拆分并并行推进。
+- **复杂 Bug 排障**：支持“定位-修复-复验”闭环，减少反复重试。
+- **大规模重构**：深度模式下强制委派 + 快照回溯，降低改造风险。
+
+### 使用边界与预期
+
+- **深度模式更稳但更慢**：适合高复杂任务，不追求秒级响应。
+- **结果质量依赖任务描述**：Goal 与 Acceptance 越清晰，交付越稳定。
+- **外部能力依赖本地配置**：CLI/MCP 未正确配置会影响对应能力可用性。
+
+### 隐私与数据说明
+
+- **本地优先**：代码检索、任务状态、知识沉淀在本地工作区完成。
+- **模型调用可控**：仅使用你配置的模型通道（OpenAI/Anthropic/Gemini 等）执行推理。
 
 ---
 
 ## ![](https://img.shields.io/badge/VISION-定位-6B4E71?style=for-the-badge)
 
-> **Magi 的核心理念：** "用正确的模型，做正确的事。"
+> **Magi 的核心理念：** 用正确的模型，做正确的事。
 
-你只需要用自然语言描述目标（例如："帮我实现一个带 JWT 验证的登录接口"），Magi 将自动接管后续流程：
+你只需描述目标，Magi 自动完成：
 
 > [!TIP]
-> **意图理解 ➔ 复杂度评估 ➔ 任务规划 ➔ 专家分派 ➔ 并行执行 ➔ 结果验收 ➔ 成果汇报**
+> **意图理解 ➔ 复杂度评估 ➔ 任务规划 ➔ 专家分派 ➔ 并行执行 ➔ 验收闭环 ➔ 经验沉淀**
 
-![编排流程](image/orchestrator-1.png)
+![编排流程](image/orchestrator-2.png)
+![运行效果](image/orchestrator-1.png)
 
-你不再是 AI 的"提示词工程师"，而是 AI 团队的"技术总监"。
-
-```mermaid
-graph TD
-    User[用户指令] --> Orchestrator[编排中枢]
-    Orchestrator --> |意图分析| Planner{复杂度判断}
-    
-    Planner --> |L1 简单| Direct[直接回答]
-    Planner --> |L2 单步| Tools[工具执行]
-    Planner --> |L3 复杂| MultiAgent[多智能体协作]
-    
-    subgraph MultiAgent [Magi 协作空间]
-        direction TB
-        W1[Worker A: 架构师] 
-        W2[Worker B: 工程师]
-        W3[Worker C: 测试员]
-        Context[共享知识库]
-        
-        W1 <--> Context
-        W2 <--> Context
-        W3 <--> Context
-    end
-```
+你不再是提示词工程师，而是 AI 团队的技术负责人。
 
 ---
 
 ## ![](https://img.shields.io/badge/FEATURES-特性-31A8FF?style=for-the-badge)
 
-### 1. 三层自适应执行模型
-Magi 不会滥用算力。它根据任务复杂度智能选择执行路径，既保证效果又节省成本。
+### 核心特性
 
-- **L1 · 即时响应**：针对简单的代码解释，**秒级回复**，零等待。
-- **L2 · 工具直达**：针对测试运行、搜索等操作，直接调用**内置工具链**，一步到位。
-- **L3 · 全链路协作**：针对复杂需求，自动启动**多 Agent 协作流**，实现任务的深度解耦。
+### 1. 任务驱动编排（Mission-Driven）
+- 以 Goal / Acceptance / Context 组织任务，不再依赖发散式自由对话。
+- 支持 Assignment 级责任划分，Worker 结果可追踪、可验收。
+- 执行中允许动态追加 Todo，面向真实工程问题逐步收敛。
+![任务系统](image/todos.png)
+### 2. 动态双模式治理（Standard / Deep）
+- **常规模式**：低延迟交付，适合轻量修改与日常开发。
+- **深度模式**：编排者禁改代码，强制委派 Worker，适配跨模块与系统级改造。
+- 同一套引擎下按任务复杂度切换治理强度，平衡速度与稳定性。
 
-### 2. 异构 Worker 矩阵
-Magi 提供 3 个可高度定制的 Worker 槽位。你可以根据模型特长构建你的"梦之队"：
+### 3. 零冲突并发编辑引擎
+- **File-level Mutex**：同文件写入串行化，防并发覆盖。
+- **实时强读**：写入前读取磁盘最新状态，降低上下文陈旧风险。
+- **意图驱动编辑**：模型表达“改什么”，底层负责稳定落盘。
+- **上下文新鲜度治理**：执行中自动处理文件上下文陈旧，减少无效重试。
 
-<div align="center">
-<table>
-<tr>
-<td align="center" width="33%"><b>🧠 架构与规划</b><br/>(e.g., Claude 3.5 Sonnet)<br/><br/><i>擅长：系统设计、逻辑分析、方案评审</i></td>
-<td align="center" width="33%"><b>🎨 前端与文本</b><br/>(e.g., Gemini 2.0 Pro)<br/><br/><i>擅长：UI/UX 实现、文档撰写、创意生成</i></td>
-<td align="center" width="33%"><b>🛠 排查与修复</b><br/>(e.g., GPT-4o-mini)<br/><br/><i>擅长：Bug 修复、代码重构、测试补全</i></td>
-</tr>
-<tr>
-<td colspan="3" align="center">
-<img src="image/portrait.png" alt="画像配置" width="100%" />
-</td>
-</tr>
-</table>
-</div>
+### 4. 会话隔离与恢复能力
+- `UnifiedSessionManager` 按 trace/session 物理隔离状态，避免串会话污染。
+- 快照机制覆盖关键写操作，支持故障后恢复与回溯。
+- 补充指令队列支持执行中追加需求，在下一决策点生效，不打断主流程。
 
-### 3. 企业级协作流
-- **契约机制 (Contracts)**：Worker 之间自动约定接口规范，确保**前后端无缝对接**。
-- **任务书 (Assignments)**：每个 Worker 接收包含上下文、**文件快照**和验收标准的任务书。
-- **知识共享 (Knowledge Sharing)**：跨 Worker **自动同步**关键变量与变更，彻底消除信息孤岛。
-
-### 4. 强大的工具箱
-开箱即用 **15+ 生产力工具**，并支持无限扩展：
-- **基础能力**：终端可视化、文件读写、正则/语义搜索、Git 管理、提示词增强。
-- **网络能力**：联网搜索、网页抓取。
-- **无限扩展**：完整支持 **MCP (Model Context Protocol)** 协议；支持自定义 **Skills** 工作流。
+### 5. 本地知识提取与沉淀
+- `MemoryDocument` 负责滚动摘要，压缩噪声并保留关键上下文。
+- `WisdomExtractor` 从 Worker 报告提取 learnings / decisions / warnings。
+- 结果沉淀到项目知识库（PKB），提升后续同类任务命中率。
+![知识库](image/knowledge.png)
+### 6. 可扩展工具链
+- 内置文件读写、代码检索、任务调度、进程执行等工程工具。
+- 原生支持 MCP（Model Context Protocol）接入外部能力。
+- 支持 Skills 动态加载，按场景扩展专业能力。
 
 ![工具配置](image/setting-tool.png)
 
 ---
 
-## ![](https://img.shields.io/badge/GET_STARTED-开始-4CAF50?style=for-the-badge)
+## ![](https://img.shields.io/badge/HOW-工作原理-E85D04?style=for-the-badge)
 
-只需几步，即可在 VSCode 中拥有你的 AI 研发团队：
+### 工作原理
 
-1.  **安装扩展**
-    *   从 Release 页面下载最新的 `.vsix` 安装包。
-    *   在 VSCode 中运行命令：`Extensions: Install from VSIX...` 并选择文件。
+### 三级任务模型
+- **Mission**：面向用户目标的总体任务。
+- **Assignment**：分派给具体 Worker 的职责单元。
+- **Todo**：执行中的可演化步骤（可新增、可重排、可闭环修复）。
 
-2.  **配置大脑 (Orchestrator)**
-    *   打开 Magi 设置面板。
-    *   配置 **Orchestrator**：这是系统的"大脑"，负责统筹规划。建议使用能力最强的模型（如 Claude 3.5 Sonnet 或 GPT-4o）。
+### 执行闭环
+- **Phase A 规划**：意图分析、复杂度评估、任务拆解与上下文注入。
+- **Phase B 执行**：Worker 并行推进，依赖任务按拓扑顺序接力。
+- **Phase C 验收**：对照验收标准复核，未达标自动进入修复循环。
 
-3.  **组建团队 (Workers)**
-    *   配置至少一个 **Worker**。
-    *   你可以为不同的槽位设置不同的模型 API，利用不同模型的特长（和成本优势）。
+### 协作保障
+- **ContractManager**：管理接口契约与协作边界。
+- **FileMutex**：保障并发写安全。
+- **SnapshotManager**：关键步骤可回溯。
+- **TaskViewService**：任务态可视化，便于追踪执行链路。
 
-4.  **开始协作**
-    *   快捷键 `Ctrl+Shift+M` (Mac: `Cmd+Shift+M`) 唤起 Magi 面板。
-    *   输入你的需求，例如："帮我重构一下 `/src/utils` 下的日期处理函数，并补充单元测试"。
-    *   坐下来，看 Magi 表演。
+---
+
+## ![](https://img.shields.io/badge/QUICKSTART-快速开始-28A745?style=for-the-badge)
+
+### 快速开始
+
+### 环境要求
+
+- **VSCode**：`>= 1.93.0`
+- **Node.js**：建议 `>= 18`
+- **可用 CLI**：至少配置一个（Claude / Codex / Gemini）
+- **网络**：如需联网检索或外部模型调用，请确保网络可用
+
+### 1. 安装扩展
+在 VSCode 扩展市场搜索 **Magi** 并安装，或通过 `.vsix` 本地安装。
+
+### 2. 配置模型 CLI
+在 VSCode 设置中搜索 `magi`，配置编排与 Worker 使用的 CLI 路径：
+- `magi.claude.path`
+- `magi.codex.path`
+- `magi.gemini.path`
+
+### 3. 选择治理模式
+- `magi.deepTask = false`：常规模式（默认）
+- `magi.deepTask = true`：深度模式（项目级治理）
+
+### 4. 开始协作
+- 打开面板：`Ctrl+Shift+A`（Mac: `Cmd+Shift+A`）
+- 启动任务：`Ctrl+Shift+Enter`（Mac: `Cmd+Shift+Enter`）
+- 新建会话：`Ctrl+Alt+N`（Mac: `Cmd+Alt+N`）
+- 停止任务：`Ctrl+Shift+Backspace`（Mac: `Cmd+Shift+Backspace`）
+
+### 5. 最小可运行验证（1 分钟）
+
+- 在新会话输入：`请读取 README.md 并总结当前版本号`。
+- 观察是否成功触发任务、出现执行状态与最终回复。
+- 若失败，优先检查 CLI 路径与 API Key 配置。
 
 ![设置面板](image/setting-board.png)
 
 ---
 
-## ![](https://img.shields.io/badge/STACK-技术栈-FF9800?style=for-the-badge)
+## ![](https://img.shields.io/badge/TECH-技术栈-555555?style=for-the-badge)
 
-Magi 基于现代化的技术栈构建，确保高性能与可扩展性：
-
-*   **Core**: TypeScript, VSCode Extension API
-*   **UI**: Svelte, TailwindCSS (Concept)
-*   **Build**: esbuild
-*   **AI**: OpenAI API Standard, Anthropic API, Google Gemini API
-*   **Protocol**: Model Context Protocol (MCP)
+| 层次 | 技术 |
+|:---|:---|
+| 语言 | TypeScript |
+| 宿主 | VSCode Extension API |
+| 前端 UI | Svelte |
+| 构建 | esbuild |
+| AI 协议 | OpenAI API, Anthropic API, Gemini API（统一客户端） |
+| 扩展协议 | MCP (Model Context Protocol) |
 
 ---
 
 ## ![](https://img.shields.io/badge/SPONSORS-赞助-E91E63?style=for-the-badge)
 
-Magi 的诞生离不开早期支持者的帮助。
+**Magi 的诞生离不开早期支持者的帮助。**
 
 <table align="left">
   <tr>
@@ -183,14 +215,15 @@ Magi 的诞生离不开早期支持者的帮助。
   </tr>
 </table>
 
-<br clear="left"/>
-<br/>
+---
 
-*   **Token支持**: [BinCode 中转站](https://newapi.stonefancyx.com/)
+**Token 支持**: [BinCode 中转站](https://newapi.stonefancyx.com/)
 
 ---
 
 ## ![](https://img.shields.io/badge/CONTACT-联系-9C27B0?style=for-the-badge)
+
+### 联系
 
 无论是功能建议、Bug 反馈还是商务合作，欢迎随时交流。
 
@@ -201,7 +234,7 @@ Magi 的诞生离不开早期支持者的帮助。
 </p>
 
 > [!NOTE]
-> **左侧**：个人微信（商务合作/问题反馈） | **右侧**：Magi 交流群二维码
+> **左侧**：个人微信（商务合作/问题反馈） | **右侧**：Magi 测试群二维码
 
 ---
 
@@ -209,11 +242,10 @@ Magi 的诞生离不开早期支持者的帮助。
 
 本项目采用 **双重授权协议 (Dual Licensing)**：
 
-1.  **开源授权**：本项目核心代码采用 [GNU GPL v3](LICENSE) 协议。这意味着您可以免费使用、修改和分发代码，但如果您基于此项目开发新软件并分发，您的项目也必须保持开源并采用 GPL 协议。
-2.  **商业授权**：如果您不希望受到 GPL 协议的限制（例如：将代码集成到闭源的商业产品中，或不愿公开您的源代码），您可以购买商业授权。
+1. **开源授权**：本项目核心代码采用 [GNU GPL v3](LICENSE) 协议。你可以免费使用、修改和分发代码；如果你基于此项目开发新软件并分发，项目也必须保持开源并采用 GPL 协议。
+2. **商业授权**：如果你不希望受到 GPL 协议的限制（例如集成到闭源商业产品），可联系购买商业授权。
 
 **如有商业授权需求或任何疑问，请联系作者：**
 
-*   **WeChat**: MistRipple
-
-*   **GitHub**: [MistRipple](https://github.com/MistRipple)
+* **WeChat**: MistRipple
+* **GitHub**: [MistRipple](https://github.com/MistRipple)

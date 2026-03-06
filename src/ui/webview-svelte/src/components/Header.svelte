@@ -3,6 +3,7 @@
   import { ensureArray } from '../lib/utils';
   import { vscode } from '../lib/vscode-bridge';
   import Icon from './Icon.svelte';
+  import NotificationCenter from './NotificationCenter.svelte';
   import type { Session } from '../types/message';
 
   interface Props {
@@ -34,6 +35,11 @@
 
   // 🔧 修复响应式：会话列表
   const sessions = $derived(ensureArray(messagesState.sessions) as Session[]);
+
+  // 当前会话是否为空（无消息），为空时禁止创建新会话
+  const isCurrentSessionEmpty = $derived(
+    ensureArray(messagesState.threadMessages).length === 0
+  );
 
   // 切换下拉菜单
   function toggleDropdown() {
@@ -176,7 +182,7 @@
       <div class="session-dropdown">
         <div class="session-dropdown-header">
           <span class="session-dropdown-title">会话历史</span>
-          <button class="btn-icon btn-icon--sm" onclick={newSession} title="新建会话">
+          <button class="btn-icon btn-icon--sm" onclick={newSession} title={isCurrentSessionEmpty ? '当前会话为空' : '新建会话'} disabled={isCurrentSessionEmpty}>
             <Icon name="plus" size={14} />
           </button>
         </div>
@@ -220,9 +226,10 @@
 
   <!-- 右侧操作按钮 -->
   <div class="header-actions">
-    <button class="btn-icon btn-icon--sm" onclick={newSession} title="新建会话">
+    <button class="btn-icon btn-icon--sm" onclick={newSession} title={isCurrentSessionEmpty ? '当前会话为空' : '新建会话'} disabled={isCurrentSessionEmpty}>
       <Icon name="plus" size={14} />
     </button>
+    <NotificationCenter />
     <button class="btn-icon btn-icon--sm" onclick={openSettings} title="设置">
       <Icon name="settings" size={14} />
     </button>

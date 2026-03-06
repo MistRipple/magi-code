@@ -349,6 +349,9 @@ export class ContextManager {
    * 初始化上下文管理器
    */
   async initialize(sessionId: string, sessionName: string): Promise<void> {
+    // 会话切换时，清空旧会话的即时上下文残留，防止跨会话对话泄露
+    this.clearImmediateContext();
+
     const storagePath = path.join(this.workspacePath, this.config.storagePath);
     this.sessionMemory = new MemoryDocument(sessionId, sessionName, storagePath);
     await this.sessionMemory.load();

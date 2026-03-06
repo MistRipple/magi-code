@@ -68,6 +68,8 @@ export interface UnifiedTodo {
   // ===== 标识 =====
   /** 唯一 ID */
   id: string;
+  /** 所属 Session ID */
+  sessionId: string;
   /** 所属 Mission ID */
   missionId: string;
   /** 所属 Assignment ID */
@@ -177,6 +179,8 @@ export interface TodoOutput {
  * 创建 Todo 的参数
  */
 export interface CreateTodoParams {
+  /** 所属 Session ID（可选，不传则由 missionId 推导） */
+  sessionId?: string;
   missionId: string;
   assignmentId: string;
   parentId?: string;
@@ -265,6 +269,7 @@ export interface PlanReviewFeedback {
  * Todo 查询条件
  */
 export interface TodoQuery {
+  sessionId?: string;
   missionId?: string;
   assignmentId?: string;
   workerId?: WorkerSlot;

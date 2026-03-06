@@ -258,8 +258,22 @@
     }
   }
 
+  // 判断 file_view 是否为目录查看模式
+  const isDirectoryView = $derived.by(() => {
+    if (name !== 'file_view') return false;
+    if (!input || typeof input !== 'object') return false;
+    const args = input as Record<string, unknown>;
+    if (args.type === 'directory') return true;
+    const p = typeof args.path === 'string' ? args.path.trim() : '';
+    return p === '.' || p === '' || p.endsWith('/');
+  });
+
   const toolIcon = $derived(getToolIcon(name));
-  const toolDisplayName = $derived(getToolDisplayName(name));
+  const toolDisplayName = $derived(
+    name === 'file_view'
+      ? (isDirectoryView ? 'view directory' : 'view file')
+      : getToolDisplayName(name)
+  );
   const toolSummary = $derived(getToolSummary(name, input));
 
   // 判断输出内容是否包含 markdown 格式（标题、表格、列表等）
@@ -360,8 +374,9 @@
     }
   }
 
-  // 从工具参数中提取文件路径
+  // 从工具参数中提取文件路径（目录模式下返回 undefined，不支持点击跳转）
   const toolFilepath = $derived.by(() => {
+    if (isDirectoryView) return undefined;
     if (filepath) return filepath;
     if (!input || typeof input !== 'object') return undefined;
     const args = input as Record<string, unknown>;
@@ -431,7 +446,8 @@
       class="tool-call"
       class:collapsed={isExpandable && collapsed}
       class:has-error={isExpandable && hasError}
-      class:file-mutation={isCompactMutation || isCompactReadOnlyTool}
+      class:file-mutation={isCompactMutation}
+      class:compact-readonly={isCompactReadOnlyTool}
       data-status={statusInfo.class}
     >
       {#if isExpandable}
@@ -544,6 +560,11 @@
   .tool-call.file-mutation {
     border: none;
     background: transparent;
+    margin: var(--space-1, 4px) 0;
+  }
+
+  /* 只读查看工具（file_view / list_files）：紧凑但有卡片背景 */
+  .tool-call.compact-readonly {
     margin: var(--space-1, 4px) 0;
   }
 

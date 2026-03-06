@@ -319,8 +319,11 @@
             {/each}
           {:else if message.content}
             <MarkdownContent content={message.content} {isStreaming} />
-          {:else if isStreaming && showStreamingIndicator}
-            <div class="streaming-indicator-bottom fallback">
+          {/if}
+
+          <!-- 与主角色消息保持一致：处于流式接收时在底部展示统一三点动画 -->
+          {#if isStreaming && showStreamingIndicator}
+            <div class="streaming-indicator-bottom fallback" class:has-content={hasVisibleContent}>
               <span class="streaming-dot"></span>
               <span class="streaming-dot"></span>
               <span class="streaming-dot"></span>

@@ -47,6 +47,8 @@ import type { SupplementaryInstructionQueue } from './supplementary-instruction-
 import { DispatchCompletionQueue } from './dispatch-completion-queue';
 import { DispatchRoutingService, type DispatchRoutingDecision } from './dispatch-routing-service';
 import { DispatchResumeContextStore } from './dispatch-resume-context-store';
+import { isModelOriginIssue, toModelOriginUserMessage } from '../../errors/model-origin';
+import { trackModelOriginEvent } from '../../errors/model-origin-observability';
 
 /**
  * DispatchManager 依赖接口
@@ -66,6 +68,8 @@ export interface DispatchManagerDeps {
   /** 获取当前对话轮次唯一标识（用于快照 missionId 分组） */
   getCurrentTurnId: () => string | null;
   getProjectKnowledgeBase: () => import('../../knowledge/project-knowledge-base').ProjectKnowledgeBase | undefined;
+  /** Worker 终态报告的 Wisdom 提取与持久化入口（由 MissionDrivenEngine 注入） */
+  processWorkerWisdom: (report: WorkerReport) => void;
   // 治理依赖（WorkerPipeline 使用）
   getSnapshotManager: () => SnapshotManager | null;
   getContextManager: () => import('../../context/context-manager').ContextManager | null;
@@ -75,6 +79,19 @@ export interface DispatchManagerDeps {
   recordWorkerTokenUsage: (results: Map<string, import('../worker').AutonomousExecutionResult>) => void;
   // 补充指令队列（反应式编排：运行时注入 Worker 指令）
   getSupplementaryQueue: () => SupplementaryInstructionQueue | null;
+  // Plan Ledger 回写（dispatch 注册时落账）
+  onDispatchTaskRegistered?: (payload: {
+    sessionId: string;
+    missionId: string;
+    taskId: string;
+    worker: WorkerSlot;
+    title: string;
+    category: string;
+    dependsOn?: string[];
+    scopeHint?: string[];
+    files?: string[];
+    requiresModification: boolean;
+  }) => Promise<void> | void;
 }
 
 /**
@@ -328,17 +345,54 @@ export class DispatchManager {
             error: 'requires_modification 必须为布尔值',
           };
         }
-        const taskTitle = task_name || goal.trim();
+        const taskName = typeof task_name === 'string' ? task_name.trim() : '';
+        const goalText = typeof goal === 'string' ? goal.trim() : '';
+        if (!taskName && !goalText) {
+          return {
+            task_id: '',
+            status: 'failed' as const,
+            error: 'task_name 或 goal 至少需要一个非空字符串',
+          };
+        }
+        const taskTitle = taskName || goalText;
+        const normalizedAcceptance = Array.isArray(acceptance)
+          ? acceptance.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map(item => item.trim())
+          : [];
+        const normalizedConstraints = Array.isArray(constraints)
+          ? constraints.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map(item => item.trim())
+          : [];
+        const normalizedContext = Array.isArray(context)
+          ? context.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map(item => item.trim())
+          : [];
+        if (normalizedAcceptance.length === 0 || normalizedConstraints.length === 0 || normalizedContext.length === 0) {
+          return {
+            task_id: '',
+            status: 'failed' as const,
+            error: 'acceptance / constraints / context 必须是至少包含 1 个非空字符串的数组',
+          };
+        }
+        const scopeHintValues = Array.isArray(scopeHint)
+          ? scopeHint.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map(item => item.trim())
+          : undefined;
+        const filesValues = Array.isArray(files)
+          ? files.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map(item => item.trim())
+          : undefined;
+        const dependsOnValues = Array.isArray(dependsOn)
+          ? dependsOn.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map(item => item.trim())
+          : undefined;
+        const normalizedScopeHint = scopeHintValues && scopeHintValues.length > 0 ? scopeHintValues : undefined;
+        const normalizedFiles = filesValues && filesValues.length > 0 ? filesValues : undefined;
+        const normalizedDependsOn = dependsOnValues && dependsOnValues.length > 0 ? dependsOnValues : undefined;
         const collaborationContracts = this.normalizeCollaborationContracts(contracts);
         logger.info('编排工具.dispatch_task.开始', {
           category,
           requiresModification,
-          scopeHintCount: scopeHint?.length || 0,
+          scopeHintCount: normalizedScopeHint?.length || 0,
           goalPreview: taskTitle.substring(0, 80),
-          acceptanceCount: acceptance.length,
-          constraintCount: constraints.length,
-          contextCount: context.length,
-          dependsOn,
+          acceptanceCount: normalizedAcceptance.length,
+          constraintCount: normalizedConstraints.length,
+          contextCount: normalizedContext.length,
+          dependsOn: normalizedDependsOn,
         }, LogCategory.ORCHESTRATOR);
 
         const routingResult = this.resolveDispatchRouting(taskTitle, category);
@@ -395,7 +449,7 @@ export class DispatchManager {
 
         // 注册到 DispatchBatch
         try {
-          if ((!scopeHint || scopeHint.length === 0) && this.shouldWarnMissingScopeHintForParallelTask(this.activeBatch, dependsOn)) {
+          if ((!normalizedScopeHint || normalizedScopeHint.length === 0) && this.shouldWarnMissingScopeHintForParallelTask(this.activeBatch, normalizedDependsOn)) {
             throw new Error('并行任务必须显式提供 scope_hint，以满足文件级分区要求');
           }
 
@@ -403,14 +457,14 @@ export class DispatchManager {
             taskId,
             worker: decision.selectedWorker,
             goal: taskTitle,
-            acceptance,
-            constraints,
-            context,
+            acceptance: normalizedAcceptance,
+            constraints: normalizedConstraints,
+            context: normalizedContext,
             task: taskTitle,
-            scopeHint,
-            files,
+            scopeHint: normalizedScopeHint,
+            files: normalizedFiles,
             requiresModification,
-            dependsOn,
+            dependsOn: normalizedDependsOn,
             collaborationContracts,
           });
 
@@ -443,7 +497,34 @@ export class DispatchManager {
 
         // 发送 subTaskCard（状态取决于注册后是否有依赖）
         const entry = this.activeBatch.getEntry(taskId);
-        const hasDeps = entry ? entry.status === 'waiting_deps' : (dependsOn && dependsOn.length > 0);
+        const hasDeps = entry
+          ? entry.status === 'waiting_deps'
+          : Boolean(normalizedDependsOn && normalizedDependsOn.length > 0);
+
+        const currentSessionId = this.deps.getCurrentSessionId()?.trim();
+        if (currentSessionId && this.deps.onDispatchTaskRegistered) {
+          try {
+            await this.deps.onDispatchTaskRegistered({
+              sessionId: currentSessionId,
+              missionId,
+              taskId,
+              worker: decision.selectedWorker,
+              title: taskTitle,
+              category: decision.category,
+              dependsOn: normalizedDependsOn,
+              scopeHint: normalizedScopeHint,
+              files: normalizedFiles,
+              requiresModification,
+            });
+          } catch (ledgerError) {
+            logger.warn('编排工具.dispatch_task.计划账本回写失败', {
+              taskId,
+              missionId,
+              error: ledgerError instanceof Error ? ledgerError.message : String(ledgerError),
+            }, LogCategory.ORCHESTRATOR);
+          }
+        }
+
         this.deps.messageHub.subTaskCard({
           id: taskId,
           title: taskTitle,
@@ -524,8 +605,17 @@ export class DispatchManager {
         }
 
         const childTodoIds: string[] = [];
+        const currentSessionId = this.deps.getCurrentSessionId()?.trim();
+        if (!currentSessionId) {
+          return {
+            success: false,
+            childTodoIds: [],
+            error: 'split_todo 缺少当前会话上下文，无法创建子任务',
+          };
+        }
         for (const subtask of subtasks) {
           const child = await todoManager.create({
+            sessionId: currentSessionId,
             missionId: callerContext.missionId,
             assignmentId: callerContext.assignmentId,
             parentId: callerContext.todoId,
@@ -859,8 +949,23 @@ export class DispatchManager {
         ? knowledgeBase.getProjectContext(600)
         : undefined;
 
+      const currentSessionId = this.deps.getCurrentSessionId()?.trim();
+      if (!currentSessionId) {
+        const errorMsg = '当前会话上下文缺失，无法创建 Todo';
+        this.deps.messageHub.subTaskCard({
+          id: taskId,
+          title: task,
+          status: 'failed',
+          worker: effectiveWorker,
+          summary: errorMsg,
+          error: errorMsg,
+        });
+        batch?.markFailed(taskId, { success: false, summary: errorMsg, errors: [errorMsg] });
+        return;
+      }
+
       // 一级 Todo 由 PlanningExecutor 统一创建（编排层唯一入口）
-      await this.getPlanningExecutor().createMacroTodo(missionId, assignment);
+      await this.getPlanningExecutor().createMacroTodo(missionId, currentSessionId, assignment);
 
       // 通知 assignmentPlanned 事件（通道2：MissionOrchestrator 编排业务事件）
       // WebviewProvider.bindMissionEvents() 监听此事件驱动前端 Todo 面板更新
@@ -880,32 +985,34 @@ export class DispatchManager {
       this.activeAssignments.set(taskId, assignment);
       let pipelineResult;
       try {
+        const currentSessionId = this.deps.getCurrentSessionId();
         pipelineResult = await this.pipeline.execute({
-        assignment,
-        workerInstance,
-        adapterFactory: this.deps.adapterFactory,
-        workspaceRoot: this.deps.workspaceRoot,
-        projectContext,
-        missionId: this.deps.getCurrentTurnId() || missionId,
-        onReport: (report) => this.handleDispatchWorkerReport(report, batch),
-        cancellationToken: batch?.cancellationToken,
-        imagePaths: this.deps.getActiveImagePaths(),
-        // 反应式编排：补充指令回调（Worker 决策点消费队列中的用户追加指令）
-        getSupplementaryInstructions: () => {
-          const queue = this.deps.getSupplementaryQueue();
-          return queue ? queue.consume(effectiveWorker) : [];
-        },
-        resumeSessionId,
-        resumePrompt,
-        // 治理开关（仅写任务启用强制写入相关治理）
-        enableSnapshot: enableWriteGovernance && snapshotManager != null,
-        enableLSP: enableWriteGovernance,
-        enableTargetEnforce: enableWriteGovernance,
-        enableContextUpdate: contextManager != null,
-        snapshotManager,
-        contextManager,
-        todoManager: this.deps.getTodoManager(),
-      });
+          assignment,
+          workerInstance,
+          adapterFactory: this.deps.adapterFactory,
+          workspaceRoot: this.deps.workspaceRoot,
+          projectContext,
+          missionId: this.deps.getCurrentTurnId() || missionId,
+          sessionId: currentSessionId,
+          onReport: (report) => this.handleDispatchWorkerReport(report, batch),
+          cancellationToken: batch?.cancellationToken,
+          imagePaths: this.deps.getActiveImagePaths(),
+          // 反应式编排：补充指令回调（Worker 决策点消费队列中的用户追加指令）
+          getSupplementaryInstructions: () => {
+            const queue = this.deps.getSupplementaryQueue();
+            return queue ? queue.consume(effectiveWorker) : [];
+          },
+          resumeSessionId,
+          resumePrompt,
+          // 治理开关（仅写任务启用强制写入相关治理）
+          enableSnapshot: enableWriteGovernance && snapshotManager != null,
+          enableLSP: enableWriteGovernance,
+          enableTargetEnforce: enableWriteGovernance,
+          enableContextUpdate: contextManager != null,
+          snapshotManager,
+          contextManager,
+          todoManager: this.deps.getTodoManager(),
+        });
       } finally {
         this.activeAssignments.delete(taskId);
       }
@@ -986,19 +1093,28 @@ export class DispatchManager {
         return;
       }
 
-      const errorMsg = error?.message || String(error);
-      if (this.routingService.shouldMarkRuntimeUnavailable(errorMsg)) {
-        this.routingService.markWorkerRuntimeUnavailable(effectiveWorker, errorMsg);
+      const rawErrorMsg = error?.message || String(error);
+      const userErrorMsg = toModelOriginUserMessage(rawErrorMsg).trim() || rawErrorMsg;
+      if (isModelOriginIssue(rawErrorMsg) || isModelOriginIssue(userErrorMsg)) {
+        trackModelOriginEvent('surfaced', 'dispatch:worker-failed', rawErrorMsg, {
+          worker: effectiveWorker,
+          taskId,
+        });
+      }
+      if (this.routingService.shouldMarkRuntimeUnavailable(rawErrorMsg)) {
+        this.routingService.markWorkerRuntimeUnavailable(effectiveWorker, rawErrorMsg);
         logger.warn('Dispatch.Worker.运行时不可用.已标记冷却', {
           worker: effectiveWorker,
           taskId,
-          reason: errorMsg,
+          reason: rawErrorMsg,
+          surfacedReason: userErrorMsg,
         }, LogCategory.ORCHESTRATOR);
       } else {
         logger.warn('Dispatch.Worker.业务失败.不标记冷却', {
           worker: effectiveWorker,
           taskId,
-          reason: errorMsg,
+          reason: rawErrorMsg,
+          surfacedReason: userErrorMsg,
         }, LogCategory.ORCHESTRATOR);
       }
 
@@ -1007,16 +1123,16 @@ export class DispatchManager {
         title: task,
         status: 'failed',
         worker: effectiveWorker,
-        summary: errorMsg,
-        error: errorMsg,
+        summary: userErrorMsg,
+        error: userErrorMsg,
       });
 
       this.deps.messageHub.workerError(
         effectiveWorker,
-        `任务执行失败: ${errorMsg}`,
+        userErrorMsg,
       );
 
-      batch?.markFailed(taskId, { success: false, summary: errorMsg, errors: [errorMsg] });
+      batch?.markFailed(taskId, { success: false, summary: userErrorMsg, errors: [userErrorMsg] });
 
       // C-15: Worker 崩溃后状态清理
       try {
@@ -1025,7 +1141,10 @@ export class DispatchManager {
       } catch { /* 清理失败不阻塞 */ }
 
       logger.error('编排工具.dispatch_task.Worker失败', {
-        worker: effectiveWorker, taskId, error: errorMsg,
+        worker: effectiveWorker,
+        taskId,
+        error: rawErrorMsg,
+        surfacedError: userErrorMsg,
       }, LogCategory.ORCHESTRATOR);
     }
   }
@@ -1498,7 +1617,7 @@ export class DispatchManager {
    *
    * progress 类型：更新 subTaskCard，不触发 LLM
    * question 类型：触发 orchestrator 中间 LLM 调用
-   * completed/failed 类型：由 DispatchBatch 状态机处理
+   * completed/failed 类型：触发 Wisdom 提取（状态机由 DispatchBatch 主流程处理）
    */
   private async handleDispatchWorkerReport(
     report: WorkerReport,
@@ -1574,6 +1693,21 @@ ${this.deps.getActiveUserPrompt()}
         logger.error('Phase B+ 中间调用失败', { error: error.message }, LogCategory.ORCHESTRATOR);
       }
 
+      return defaultResponse;
+    }
+
+    // completed/failed 类型：提取并持久化 Worker 经验（不改变原有状态机）
+    if (report.type === 'completed' || report.type === 'failed') {
+      try {
+        this.deps.processWorkerWisdom(report);
+      } catch (error) {
+        logger.warn('Dispatch.Worker.Wisdom.处理失败', {
+          assignmentId: report.assignmentId,
+          worker: report.workerId,
+          type: report.type,
+          error: error instanceof Error ? error.message : String(error),
+        }, LogCategory.ORCHESTRATOR);
+      }
       return defaultResponse;
     }
 
@@ -1733,7 +1867,7 @@ ${this.deps.getActiveUserPrompt()}
   }
 
   private shouldWarnMissingScopeHintForParallelTask(batch: DispatchBatch, dependsOn?: string[]): boolean {
-    const dependencySet = new Set((dependsOn || []).map(id => id.trim()).filter(Boolean));
+    const dependencySet = new Set(dependsOn || []);
     return batch.getEntries().some(entry =>
       !isTerminalStatus(entry.status) && !dependencySet.has(entry.taskId)
     );
@@ -1742,15 +1876,13 @@ ${this.deps.getActiveUserPrompt()}
   private normalizeCollaborationContracts(
     raw?: DispatchTaskCollaborationContracts,
   ): DispatchCollaborationContracts {
-    const producerContracts = (raw?.producer_contracts || []).map(item => item.trim()).filter(Boolean);
-    const consumerContracts = (raw?.consumer_contracts || []).map(item => item.trim()).filter(Boolean);
-    const interfaceContracts = (raw?.interface_contracts || []).map(item => item.trim()).filter(Boolean);
-    const freezeFiles = (raw?.freeze_files || []).map(item => item.trim()).filter(Boolean);
+    // raw 已经过 orchestration-executor.normalizeContracts() 的边界验证和 trim，
+    // 此处只做类型转换：optional string[] → required string[]（空数组兜底）
     return {
-      producerContracts,
-      consumerContracts,
-      interfaceContracts,
-      freezeFiles,
+      producerContracts: raw?.producer_contracts || [],
+      consumerContracts: raw?.consumer_contracts || [],
+      interfaceContracts: raw?.interface_contracts || [],
+      freezeFiles: raw?.freeze_files || [],
     };
   }
 

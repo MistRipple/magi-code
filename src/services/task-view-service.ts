@@ -191,13 +191,18 @@ export class TaskViewService {
    */
   async failTaskById(taskId: string, error: string): Promise<void> {
     const mission = await this.missionStorage.load(taskId);
+    const sessionId = mission?.sessionId;
     if (mission) {
       mission.status = 'failed';
       mission.failureReason = error;
       mission.updatedAt = Date.now();
       await this.missionStorage.update(mission);
     }
-    globalEventBus.emitEvent('task:failed', { data: { taskId, error } });
+    globalEventBus.emitEvent('task:failed', {
+      taskId,
+      sessionId,
+      data: { taskId, sessionId, error },
+    });
   }
 
   /**
@@ -205,6 +210,7 @@ export class TaskViewService {
    */
   async completeTaskById(taskId: string): Promise<void> {
     const mission = await this.missionStorage.load(taskId);
+    const sessionId = mission?.sessionId;
     if (mission) {
       mission.status = 'completed';
       mission.failureReason = undefined;
@@ -212,7 +218,11 @@ export class TaskViewService {
       mission.updatedAt = Date.now();
       await this.missionStorage.update(mission);
     }
-    globalEventBus.emitEvent('task:completed', { data: { taskId } });
+    globalEventBus.emitEvent('task:completed', {
+      taskId,
+      sessionId,
+      data: { taskId, sessionId },
+    });
   }
 
   /**

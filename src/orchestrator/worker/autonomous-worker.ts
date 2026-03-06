@@ -62,6 +62,8 @@ import {
   SharedContextEntryType,
   createSharedContextEntry,
 } from '../../context';
+import { classifyModelOriginIssue, toModelOriginUserMessage } from '../../errors/model-origin';
+import { trackModelOriginEvent } from '../../errors/model-origin-observability';
 
 /**
  * 文件读取结果
@@ -590,8 +592,16 @@ export class AutonomousWorker extends EventEmitter {
           }
         }
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        errors.push(errorMessage);
+        const { rawMessage, userMessage } = this.resolveErrorMessages(error);
+        // 记录完整堆栈——executeAssignment 循环内的未预期异常需要定位到源码行
+        logger.error('Worker.Assignment.循环内异常', {
+          worker: this.workerType,
+          assignmentId: assignment.id,
+          todoId: currentTodo?.id,
+          message: rawMessage,
+          stack: error instanceof Error ? error.stack : undefined,
+        }, LogCategory.ORCHESTRATOR);
+        errors.push(userMessage);
         if (!currentTodo) {
           break;
         }
@@ -602,12 +612,12 @@ export class AutonomousWorker extends EventEmitter {
             success: false,
             summary: '',
             modifiedFiles: [],
-            error: errorMessage,
+            error: userMessage,
             duration: 0,
           },
         };
         try {
-          await this.todoManager.fail(currentTodo.id, errorMessage);
+          await this.todoManager.fail(currentTodo.id, userMessage);
           const persisted = await this.todoManager.get(currentTodo.id);
           if (persisted) {
             failedTodo = persisted;
@@ -627,7 +637,11 @@ export class AutonomousWorker extends EventEmitter {
           assignment.todos[todoIndex] = failedTodo;
         }
         failedTodos.push(failedTodo);
-        logger.error('Worker.Todo.执行异常', { todoId: currentTodo.id, error: errorMessage }, LogCategory.ORCHESTRATOR);
+        logger.error('Worker.Todo.执行异常', {
+          todoId: currentTodo.id,
+          error: rawMessage,
+          surfacedError: userMessage,
+        }, LogCategory.ORCHESTRATOR);
       }
 
       // 获取下一个可执行的 Todo
@@ -1154,6 +1168,7 @@ ${completedWork}
    */
   private appendSupplementaryInstructions(assignment: Assignment, instructions: string[]): void {
     const normalized = instructions
+      .filter((i): i is string => typeof i === 'string')
       .map(i => i.trim())
       .filter(Boolean);
     if (normalized.length === 0) {
@@ -1323,10 +1338,19 @@ ${completedWork}
         tokenUsage: output.tokenUsage,
       };
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
+      const { rawMessage, userMessage } = this.resolveErrorMessages(error);
+
+      // 记录完整堆栈用于诊断运行时 TypeError 等难以复现的崩溃
+      logger.error('Worker.executeTodo.异常', {
+        worker: this.workerType,
+        assignmentId: assignment.id,
+        todoId: todo.id,
+        message: rawMessage,
+        stack: error instanceof Error ? error.stack : undefined,
+      }, LogCategory.ORCHESTRATOR);
 
       // 使用 TodoManager 标记失败
-      await this.todoManager.fail(todo.id, errorMessage);
+      await this.todoManager.fail(todo.id, userMessage);
       // 同步本地对象状态
       todo.status = 'failed';
       todo.completedAt = Date.now();
@@ -1334,11 +1358,11 @@ ${completedWork}
         success: false,
         summary: '',
         modifiedFiles: [],
-        error: errorMessage,
+        error: userMessage,
         duration: Date.now() - startTime,
       };
       try {
-        await this.writeInsights(this.buildFailureInsights(assignment, errorMessage, todo));
+        await this.writeInsights(this.buildFailureInsights(assignment, userMessage, todo));
       } catch (insightError) {
         logger.warn('Worker.Todo.失败后Insight写入失败（忽略）', {
           assignmentId: assignment.id,
@@ -1352,7 +1376,7 @@ ${completedWork}
           assignmentId: assignment.id,
           todoId: todo.id,
           content: todo.content,
-          error: errorMessage,
+          error: userMessage,
         });
       } catch (emitError) {
         logger.warn('Worker.Todo.失败事件发送失败（忽略）', {
@@ -1365,7 +1389,7 @@ ${completedWork}
       return {
         success: false,
         todo,
-        error: errorMessage,
+        error: userMessage,
       };
     }
   }
@@ -1519,9 +1543,48 @@ ${completedWork}
         tokenUsage: response.tokenUsage,
       };
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      throw new Error(`LLM 执行失败: ${errorMessage}`);
+      const rawMessage = this.extractErrorMessage(error);
+      // 保留原始堆栈信息用于诊断（如 TypeError: Cannot read properties of undefined）
+      if (error instanceof Error && error.stack) {
+        logger.error('Worker.executeWithWorker.异常', {
+          worker: this.workerType,
+          assignmentId: assignment.id,
+          todoId: todo.id,
+          message: rawMessage,
+          stack: error.stack,
+        }, LogCategory.ORCHESTRATOR);
+      }
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error(rawMessage);
     }
+  }
+
+  private resolveErrorMessages(error: unknown): { rawMessage: string; userMessage: string } {
+    const rawMessage = this.extractErrorMessage(error);
+    const userMessage = toModelOriginUserMessage(rawMessage).trim() || rawMessage;
+    const classified = classifyModelOriginIssue(rawMessage);
+    if (classified.isModelCause) {
+      trackModelOriginEvent('surfaced', `worker:${this.workerType}`, rawMessage, {
+        surfacedReason: userMessage,
+      });
+    }
+    return { rawMessage, userMessage };
+  }
+
+  private extractErrorMessage(error: unknown): string {
+    const fallback = error instanceof Error ? error.message : String(error);
+    if (error instanceof Error && error.cause) {
+      if (error.cause instanceof Error && error.cause.message) {
+        return error.cause.message;
+      }
+      const causeLike = error.cause as { message?: unknown };
+      if (typeof causeLike.message === 'string' && causeLike.message.trim()) {
+        return causeLike.message;
+      }
+    }
+    return fallback;
   }
 
   /**
@@ -1588,7 +1651,7 @@ ${completedWork}
 
     for (const result of grepResults) {
       if (result.status !== 'fulfilled') continue;
-      for (const filePath of result.value.trim().split('\n').filter(Boolean)) {
+      for (const filePath of (result.value || '').trim().split('\n').filter(Boolean)) {
         const relativePath = path.relative(workingDirectory, filePath);
         if (!existingSet.has(relativePath) && !existingSet.has(filePath)) {
           discovered.set(relativePath, (discovered.get(relativePath) || 0) + 1);

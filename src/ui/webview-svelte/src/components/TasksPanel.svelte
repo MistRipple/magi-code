@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { getState } from '../stores/messages.svelte';
+  import { getState, requestMessageJump, setCurrentBottomTab, setCurrentTopTab } from '../stores/messages.svelte';
   import { ensureArray } from '../lib/utils';
-  import type { Task, SubTaskItem } from '../types/message';
+  import type { Task, SubTaskItem, ActivePlanState, PlanLedgerRecord, Message } from '../types/message';
   import { vscode } from '../lib/vscode-bridge';
   import Icon from './Icon.svelte';
 
@@ -11,9 +11,43 @@
   // missionPlanMap 按 missionId 存储 Worker 分组元信息（workerId、responsibility）
   const tasks = $derived(ensureArray(appState.tasks) as Task[]);
   const missionPlanMap = $derived(appState.missionPlan);
+  const appPayload = $derived((appState.appState || {}) as Record<string, unknown>);
+  const activePlanState = $derived((appPayload.activePlan || null) as ActivePlanState | null);
+  const planHistory = $derived(ensureArray(appPayload.planHistory) as PlanLedgerRecord[]);
+  const threadMessages = $derived(ensureArray(appState.threadMessages) as Message[]);
 
   // 折叠状态
   let expandedTasks = $state<Set<string>>(new Set());
+  let showPlanLedger = $state(true);
+
+  const activePlanRecord = $derived.by(() => {
+    const activePlanId = activePlanState?.planId;
+    if (!activePlanId) {
+      return null;
+    }
+    return planHistory.find((plan) => plan?.planId === activePlanId) || null;
+  });
+
+  const archivedPlans = $derived.by(() => {
+    const activePlanId = activePlanState?.planId;
+    return planHistory
+      .filter((plan) => !!plan && plan.planId !== activePlanId)
+      .slice(0, 6);
+  });
+
+  const activePlanProgress = $derived.by(() => {
+    const plan = activePlanRecord;
+    if (!plan || !Array.isArray(plan.items) || plan.items.length === 0) {
+      return { total: 0, completed: 0, percent: 0 };
+    }
+    const total = plan.items.length;
+    const completed = plan.items.filter((item) => item.status === 'completed' || item.status === 'skipped').length;
+    return {
+      total,
+      completed,
+      percent: Math.round((completed / total) * 100),
+    };
+  });
 
   // 概览统计
   const stats = $derived.by(() => {
@@ -102,9 +136,269 @@
   function deleteTask(taskId: string) {
     vscode.postMessage({ type: 'deleteTask', taskId });
   }
+
+  function getPlanStatusLabel(status: string): string {
+    switch (status) {
+      case 'draft':
+        return '草稿';
+      case 'awaiting_confirmation':
+        return '待确认';
+      case 'approved':
+        return '已批准';
+      case 'rejected':
+        return '已拒绝';
+      case 'executing':
+        return '执行中';
+      case 'partially_completed':
+        return '部分完成';
+      case 'completed':
+        return '已完成';
+      case 'failed':
+        return '失败';
+      case 'cancelled':
+        return '已取消';
+      case 'superseded':
+        return '已替换';
+      default:
+        return status || '未知';
+    }
+  }
+
+  function getPlanStatusClass(status: string): string {
+    if (status === 'completed') return 'is-completed';
+    if (status === 'failed' || status === 'rejected') return 'is-failed';
+    if (status === 'executing') return 'is-running';
+    if (status === 'partially_completed') return 'is-partial';
+    if (status === 'cancelled' || status === 'superseded') return 'is-cancelled';
+    return 'is-pending';
+  }
+
+  function formatTimestamp(timestamp?: number): string {
+    if (typeof timestamp !== 'number' || !Number.isFinite(timestamp) || timestamp <= 0) {
+      return '--';
+    }
+    const date = new Date(timestamp);
+    const hours = String(date.getHours()).padStart(2, '0');
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    return `${hours}:${minutes}`;
+  }
+
+  function normalizeAnchorText(raw: unknown): string {
+    if (typeof raw !== 'string') {
+      return '';
+    }
+    return raw.replace(/\s+/g, ' ').trim();
+  }
+
+  function extractUserInputText(message: Message): string {
+    const content = normalizeAnchorText(message.content);
+    if (content) {
+      return content;
+    }
+
+    const blocks = Array.isArray(message.blocks) ? message.blocks : [];
+    const text = blocks
+      .filter((block) => block?.type === 'text' || block?.type === 'thinking')
+      .map((block) => (typeof block?.content === 'string' ? block.content : ''))
+      .join(' ');
+    return normalizeAnchorText(text);
+  }
+
+  function isPrimaryUserInput(message: Message): boolean {
+    if (message.type !== 'user_input') {
+      return false;
+    }
+    return message?.metadata?.isSupplementary !== true;
+  }
+
+  function getTemporalAnchorScore(messageTimestamp: number, anchorTimestamp: number): number {
+    const delta = anchorTimestamp - messageTimestamp;
+    const isFuture = delta < -2000;
+    return Math.abs(delta) + (isFuture ? 200000 : 0);
+  }
+
+  function matchUserInputByPromptDigest(messages: Message[], plan: PlanLedgerRecord): Message | null {
+    const normalizedDigest = normalizeAnchorText(plan.promptDigest);
+    if (!normalizedDigest || normalizedDigest === 'empty') {
+      return null;
+    }
+
+    const hasEllipsis = normalizedDigest.endsWith('...');
+    const digestPrefix = hasEllipsis ? normalizeAnchorText(normalizedDigest.slice(0, -3)) : normalizedDigest;
+    if (!digestPrefix) {
+      return null;
+    }
+
+    const anchorTs = Number.isFinite(plan.createdAt) ? plan.createdAt : Date.now();
+    let bestMatch: Message | null = null;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (const message of messages) {
+      const text = extractUserInputText(message);
+      if (!text) {
+        continue;
+      }
+
+      const exact = text === digestPrefix;
+      const prefix = text.startsWith(digestPrefix);
+      const include = !hasEllipsis && text.includes(digestPrefix);
+      if (!exact && !prefix && !include) {
+        continue;
+      }
+
+      const textScore = exact ? 0 : prefix ? 1 : 2;
+      const score = textScore * 100000 + getTemporalAnchorScore(message.timestamp, anchorTs);
+      if (score < bestScore) {
+        bestScore = score;
+        bestMatch = message;
+      }
+    }
+
+    return bestMatch;
+  }
+
+  function matchUserInputByTimestamp(messages: Message[], anchorTimestamp: number): Message | null {
+    let bestMatch: Message | null = null;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (const message of messages) {
+      const score = getTemporalAnchorScore(message.timestamp, anchorTimestamp);
+      if (score < bestScore) {
+        bestScore = score;
+        bestMatch = message;
+      }
+    }
+
+    return bestMatch;
+  }
+
+  function resolvePlanAnchorMessageId(plan: PlanLedgerRecord): string | null {
+    const userInputs = threadMessages.filter((message) => isPrimaryUserInput(message) && Number.isFinite(message.timestamp));
+    if (userInputs.length === 0) {
+      return null;
+    }
+
+    const anchorTs = Number.isFinite(plan.createdAt) ? plan.createdAt : Date.now();
+    const normalizedTurnId = typeof plan.turnId === 'string' ? plan.turnId.trim() : '';
+    if (normalizedTurnId) {
+      const byTurn = userInputs.filter((message) => {
+        const metadataTurnId = typeof message?.metadata?.turnId === 'string'
+          ? message.metadata.turnId.trim()
+          : '';
+        return metadataTurnId === normalizedTurnId && message.type === 'user_input';
+      });
+      if (byTurn.length > 0) {
+        const digestMatch = matchUserInputByPromptDigest(byTurn, plan);
+        if (digestMatch?.id) {
+          return digestMatch.id;
+        }
+        const byTurnTime = matchUserInputByTimestamp(byTurn, anchorTs);
+        if (byTurnTime?.id) {
+          return byTurnTime.id;
+        }
+      }
+    }
+
+    const digestMatch = matchUserInputByPromptDigest(userInputs, plan);
+    if (digestMatch?.id) {
+      return digestMatch.id;
+    }
+
+    return matchUserInputByTimestamp(userInputs, anchorTs)?.id || null;
+  }
+
+  function jumpToPlanConversation(plan: PlanLedgerRecord): void {
+    setCurrentTopTab('thread');
+    setCurrentBottomTab('thread');
+    const anchorMessageId = resolvePlanAnchorMessageId(plan);
+    if (!anchorMessageId) {
+      return;
+    }
+    requestMessageJump(anchorMessageId);
+  }
 </script>
 
 <div class="tasks-panel">
+  {#if activePlanState || archivedPlans.length > 0}
+    <div class="plan-ledger-card">
+      <button
+        type="button"
+        class="plan-ledger-toggle"
+        aria-expanded={showPlanLedger}
+        onclick={() => showPlanLedger = !showPlanLedger}
+      >
+        <span class="plan-ledger-title-wrap">
+          <span class="plan-ledger-title">计划账本</span>
+          {#if activePlanState}
+            <span class="plan-ledger-badge">当前计划</span>
+          {:else}
+            <span class="plan-ledger-count">历史计划 {archivedPlans.length}</span>
+          {/if}
+        </span>
+        <span class="plan-ledger-chevron" class:expanded={showPlanLedger}>
+          <Icon name="chevron-right" size={12} />
+        </span>
+      </button>
+
+      {#if showPlanLedger}
+        {#if activePlanState}
+          <div class="plan-ledger-current">
+            <div class="plan-ledger-summary">
+              <span>{activePlanRecord?.summary || '计划执行中'}</span>
+              {#if activePlanRecord}
+                <span class="plan-status {getPlanStatusClass(activePlanRecord.status)}">
+                  {getPlanStatusLabel(activePlanRecord.status)}
+                </span>
+              {/if}
+            </div>
+            <div class="plan-ledger-meta">
+              {#if activePlanRecord}
+                <span>模式：{activePlanRecord.mode === 'deep' ? '项目级' : '功能级'}</span>
+                <span>版本：v{activePlanRecord.version}</span>
+                <span>更新：{formatTimestamp(activePlanRecord.updatedAt)}</span>
+              {:else}
+                <span>更新：{formatTimestamp(activePlanState.updatedAt)}</span>
+              {/if}
+            </div>
+            {#if activePlanProgress.total > 0}
+              <div class="plan-ledger-progress-wrap">
+                <span class="plan-ledger-progress-label">{activePlanProgress.completed}/{activePlanProgress.total}</span>
+                <div class="plan-ledger-progress">
+                  <div class="plan-ledger-progress-fill" style="width: {activePlanProgress.percent}%"></div>
+                </div>
+              </div>
+            {/if}
+          </div>
+        {/if}
+
+        {#if archivedPlans.length > 0}
+          <div class="plan-history-list">
+            {#each archivedPlans as plan (plan.planId)}
+              <button
+                type="button"
+                class="plan-history-item clickable"
+                title="定位到该版本对应的对话轮次"
+                onclick={() => jumpToPlanConversation(plan)}
+              >
+                <div class="plan-history-main">
+                  <span class="plan-history-summary">{plan.summary || '未命名计划'}</span>
+                  <span class="plan-status {getPlanStatusClass(plan.status)}">
+                    {getPlanStatusLabel(plan.status)}
+                  </span>
+                </div>
+                <div class="plan-history-meta">
+                  <span>{plan.mode === 'deep' ? '项目级' : '功能级'}</span>
+                  <span>v{plan.version}</span>
+                  <span>{formatTimestamp(plan.updatedAt)}</span>
+                </div>
+              </button>
+            {/each}
+          </div>
+        {/if}
+      {/if}
+    </div>
+  {/if}
+
   {#if enrichedTasks.length === 0}
     <!-- 空状态 -->
     <div class="empty-state">
@@ -112,7 +406,11 @@
         <Icon name="circleOutline" size={32} class="empty-icon" />
       </div>
       <div class="empty-text">暂无任务</div>
-      <div class="empty-hint">执行任务后会在此显示进度</div>
+      {#if activePlanState || archivedPlans.length > 0}
+        <div class="empty-hint">当前无活跃任务，可查看上方计划账本与历史执行记录</div>
+      {:else}
+        <div class="empty-hint">执行任务后会在此显示进度</div>
+      {/if}
     </div>
   {:else}
     <!-- 概览统计条 -->
@@ -249,6 +547,219 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-3);
+  }
+
+  .plan-ledger-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface-1);
+  }
+
+  .plan-ledger-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    width: 100%;
+    border: none;
+    background: transparent;
+    color: inherit;
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .plan-ledger-toggle:hover {
+    background: var(--surface-hover);
+  }
+
+  .plan-ledger-title-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+
+  .plan-ledger-title {
+    font-size: var(--text-sm);
+    font-weight: var(--font-medium);
+  }
+
+  .plan-ledger-badge {
+    font-size: var(--text-2xs);
+    color: var(--primary);
+    background: var(--primary-muted);
+    border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border));
+    border-radius: 999px;
+    padding: 2px 8px;
+  }
+
+  .plan-ledger-count {
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+  }
+
+  .plan-ledger-chevron {
+    display: inline-flex;
+    align-items: center;
+    color: var(--foreground-muted);
+    transition: transform var(--transition-fast);
+  }
+
+  .plan-ledger-chevron.expanded {
+    transform: rotate(90deg);
+  }
+
+  .plan-ledger-current {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-2) var(--space-2);
+  }
+
+  .plan-ledger-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    font-size: var(--text-sm);
+    color: var(--foreground);
+  }
+
+  .plan-ledger-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+  }
+
+  .plan-status {
+    font-size: var(--text-xs);
+    border-radius: 999px;
+    padding: 2px 8px;
+    border: 1px solid transparent;
+    white-space: nowrap;
+  }
+
+  .plan-status.is-running {
+    color: var(--primary);
+    background: var(--primary-muted);
+    border-color: color-mix(in srgb, var(--primary) 30%, var(--border));
+  }
+
+  .plan-status.is-completed {
+    color: var(--success);
+    background: var(--success-muted);
+    border-color: color-mix(in srgb, var(--success) 32%, var(--border));
+  }
+
+  .plan-status.is-failed {
+    color: var(--error);
+    background: var(--error-muted);
+    border-color: color-mix(in srgb, var(--error) 32%, var(--border));
+  }
+
+  .plan-status.is-partial {
+    color: var(--warning);
+    background: var(--warning-muted);
+    border-color: color-mix(in srgb, var(--warning) 30%, var(--border));
+  }
+
+  .plan-status.is-cancelled {
+    color: var(--foreground-muted);
+    background: var(--surface-2);
+    border-color: var(--border);
+  }
+
+  .plan-status.is-pending {
+    color: var(--foreground-muted);
+    background: var(--surface-2);
+    border-color: var(--border);
+  }
+
+  .plan-ledger-progress-wrap {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .plan-ledger-progress-label {
+    min-width: 50px;
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+  }
+
+  .plan-ledger-progress {
+    flex: 1;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    overflow: hidden;
+  }
+
+  .plan-ledger-progress-fill {
+    height: 100%;
+    border-radius: inherit;
+    background: var(--primary);
+    transition: width 200ms ease;
+  }
+
+  .plan-history-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    font-size: var(--text-xs);
+  }
+
+  .plan-history-item {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: var(--space-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+  }
+
+  .plan-history-item.clickable {
+    width: 100%;
+    text-align: left;
+    color: inherit;
+    cursor: pointer;
+    transition: background var(--transition-fast), border-color var(--transition-fast);
+  }
+
+  .plan-history-item.clickable:hover {
+    background: var(--surface-hover);
+    border-color: color-mix(in srgb, var(--primary) 28%, var(--border));
+  }
+
+  .plan-history-main {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+
+  .plan-history-summary {
+    font-size: var(--text-sm);
+    color: var(--foreground);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .plan-history-meta {
+    display: flex;
+    gap: var(--space-2);
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
   }
 
   /* ========== 空状态 ========== */
