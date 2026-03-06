@@ -255,8 +255,13 @@
     "verify:e2e:real-dispatch:compare": "npm run -s verify:e2e:real-dispatch:feature && npm run -s verify:e2e:real-dispatch:project",
     "verify:e2e:codebase-retrieval": "node scripts/e2e-codebase-retrieval-regression.cjs",
     "verify:e2e:index-stability": "node scripts/e2e-index-stability-regression.cjs",
+    "verify:e2e:knowledge-learning": "node scripts/e2e-knowledge-learning-regression.cjs",
     "verify:e2e:session-isolation": "node scripts/e2e-session-isolation-regression.cjs",
-    "verify:e2e:mode-governance": "node scripts/e2e-mode-governance-regression.cjs"
+    "verify:e2e:mode-governance": "node scripts/e2e-mode-governance-regression.cjs",
+    "verify:e2e:plan-ledger-lifecycle": "node scripts/e2e-plan-ledger-lifecycle.cjs",
+    "verify:e2e:plan-ledger-session-isolation": "node scripts/e2e-plan-ledger-session-isolation.cjs",
+    "verify:e2e:plan-ledger-reconcile": "node scripts/e2e-plan-ledger-reconcile.cjs",
+    "verify:e2e:plan-ledger-events-rotate": "node scripts/e2e-plan-ledger-events-rotate.cjs"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
