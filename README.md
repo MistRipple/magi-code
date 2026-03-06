@@ -7,7 +7,7 @@
 *意图洞察 · 深度拆解 · 异构协作*
 
 [![VSCode Extension](https://img.shields.io/badge/VSCode-Extension-007ACC?style=flat-square&logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
-[![Version](https://img.shields.io/badge/version-0.2.2-blue?style=flat-square)]()
+[![Version](https://img.shields.io/badge/version-1.X-blue?style=flat-square)]()
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later-red?style=flat-square)](LICENSE)
 
 <br/>
