@@ -135,8 +135,9 @@ export type DataMessageType =
   | 'profileConfigSaved'
   | 'projectKnowledgeLoaded'
   | 'processingStateChanged'
+  | 'planLedgerLoaded'
+  | 'planLedgerUpdated'
   | 'promptEnhanced'
-  | 'questionRequest'
   | 'recoveryRequest'
   | 'repositoriesLoaded'
   | 'repositoryAdded'
@@ -568,6 +569,8 @@ export interface MessageMetadata {
   reason?: string;
   /** 请求 ID（用于占位/响应绑定） */
   requestId?: string;
+  /** 对话轮次 ID（用于计划账本/快照/对话回溯的同轮对齐） */
+  turnId?: string;
   /** 卡片实体 ID（流式更新必须绑定同一 cardId） */
   cardId?: string;
   /** 父卡片 ID（补遗卡片或衍生卡片回溯来源） */

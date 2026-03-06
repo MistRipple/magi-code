@@ -20,6 +20,7 @@ import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
 import { CategoryResolver } from '../profile/category-resolver';
 import { OrchestratorState, RequirementAnalysis } from '../protocols/types';
+import type { WorkerReport } from '../protocols/worker-report';
 import { VerificationRunner, VerificationConfig } from '../verification-runner';
 import { MissionOrchestrator } from './mission-orchestrator';
 import {
@@ -37,6 +38,7 @@ import { DispatchManager } from './dispatch-manager';
 import { runPostDispatchVerification } from './post-dispatch-verifier';
 import { configureResilientAuxiliary } from './resilient-auxiliary-adapter';
 import { TaskViewService } from '../../services/task-view-service';
+import { PlanLedgerService, type PlanMode, type PlanRecord } from '../plan-ledger';
 import {
   createWisdomStorage,
   extractPrimaryIntent,
@@ -88,6 +90,7 @@ export class MissionDrivenEngine extends EventEmitter {
   // MissionExecutor 已合并到 MissionOrchestrator
   private missionStorage: MissionStorageManager;
   private taskViewService: TaskViewService;
+  private readonly planLedger: PlanLedgerService;
   private profileLoader: ProfileLoader;
   private guidanceInjector: GuidanceInjector;
   private categoryResolver = new CategoryResolver();
@@ -109,6 +112,14 @@ export class MissionDrivenEngine extends EventEmitter {
   private lastMissionId: string | null = null;
   /** 当前对话轮次唯一标识（每次 execute() 入口生成，贯穿整轮快照） */
   private currentTurnId: string | null = null;
+  /** 当前对话轮次对应计划 ID（Plan Ledger） */
+  private currentPlanId: string | null = null;
+  /** 等待确认中的计划请求 */
+  private pendingPlanConfirmation: {
+    sessionId: string;
+    planId: string;
+    resolve: (confirmed: boolean) => void;
+  } | null = null;
   /** dispatch 并发场景下的 Mission 创建单飞锁，确保每轮最多创建一个 Mission */
   private ensureMissionPromise: Promise<string> | null = null;
   private lastRoutingDecision: {
@@ -186,6 +197,7 @@ export class MissionDrivenEngine extends EventEmitter {
     const fileStorage = new FileBasedMissionStorage(sessionsDir);
     this.missionStorage = new MissionStorageManager(fileStorage);
     this.taskViewService = new TaskViewService(this.missionStorage, this.workspaceRoot);
+    this.planLedger = new PlanLedgerService(this.sessionManager);
 
     // 初始化 Mission 编排器
     this.missionOrchestrator = new MissionOrchestrator(
@@ -222,16 +234,19 @@ export class MissionDrivenEngine extends EventEmitter {
       ensureMissionForDispatch: async () => this.ensureMissionForDispatch(),
       getCurrentTurnId: () => this.currentTurnId,
       getProjectKnowledgeBase: () => this.projectKnowledgeBase,
+      processWorkerWisdom: (report) => this.processWorkerWisdom(report),
       recordOrchestratorTokens: (usage, phase) => this.recordOrchestratorTokens(usage, phase),
       recordWorkerTokenUsage: (results) => this.recordWorkerTokenUsage(results),
       getSnapshotManager: () => this.snapshotManager ?? null,
       getContextManager: () => this.contextManager ?? null,
       getTodoManager: () => this.missionOrchestrator.getTodoManager() ?? null,
       getSupplementaryQueue: () => this.supplementaryQueue,
+      onDispatchTaskRegistered: (payload) => this.handleDispatchTaskRegistered(payload),
     });
 
     // 构造阶段先注入一次编排工具 handler，避免初始化空窗触发 "handler not configured"
     this.dispatchManager.setupOrchestrationToolHandlers();
+    this.setupPlanLedgerEventBindings();
   }
 
   /**
@@ -241,6 +256,41 @@ export class MissionDrivenEngine extends EventEmitter {
     this.wisdomManager.setStorage(
       createWisdomStorage(this.contextManager, () => this.projectKnowledgeBase),
     );
+  }
+
+  /**
+   * 处理 Worker 终态报告中的 Wisdom，并持久化到上下文/知识库。
+   * 仅处理 completed/failed 且带 result 的报告，避免 progress/question 噪声。
+   */
+  private processWorkerWisdom(report: WorkerReport): void {
+    if ((report.type !== 'completed' && report.type !== 'failed') || !report.result) {
+      return;
+    }
+
+    try {
+      const extraction = this.wisdomManager.processReport(report, report.assignmentId);
+      if (
+        extraction.learnings.length > 0
+        || extraction.decisions.length > 0
+        || extraction.warnings.length > 0
+        || Boolean(extraction.significantLearning)
+      ) {
+        logger.info('任务引擎.Wisdom.已提取', {
+          assignmentId: report.assignmentId,
+          worker: report.workerId,
+          learnings: extraction.learnings.length,
+          decisions: extraction.decisions.length,
+          warnings: extraction.warnings.length,
+          hasSignificant: Boolean(extraction.significantLearning),
+        }, LogCategory.ORCHESTRATOR);
+      }
+    } catch (error) {
+      logger.warn('任务引擎.Wisdom.提取失败', {
+        assignmentId: report.assignmentId,
+        worker: report.workerId,
+        error: error instanceof Error ? error.message : String(error),
+      }, LogCategory.ORCHESTRATOR);
+    }
   }
 
   /**
@@ -278,6 +328,228 @@ export class MissionDrivenEngine extends EventEmitter {
    */
   getModeConfig(): InteractionModeConfig {
     return this.modeConfig;
+  }
+
+  getPlanLedgerSnapshot(sessionId: string) {
+    return this.planLedger.getSnapshot(sessionId);
+  }
+
+  getActivePlanState(sessionId: string) {
+    return this.planLedger.buildActivePlanState(sessionId);
+  }
+
+  async reconcilePlanLedgerForSession(sessionId: string): Promise<void> {
+    const normalizedSessionId = sessionId?.trim();
+    if (!normalizedSessionId) {
+      return;
+    }
+
+    try {
+      const missions = await this.missionStorage.listBySession(normalizedSessionId);
+      await this.planLedger.reconcileByMissions(
+        normalizedSessionId,
+        missions.map((mission) => ({
+          id: mission.id,
+          status: mission.status,
+        })),
+      );
+    } catch (error) {
+      logger.warn('编排器.计划账本.会话对账失败', {
+        sessionId: normalizedSessionId,
+        error: error instanceof Error ? error.message : String(error),
+      }, LogCategory.ORCHESTRATOR);
+    }
+  }
+
+  resolvePlanConfirmation(confirmed: boolean): boolean {
+    if (!this.pendingPlanConfirmation) {
+      return false;
+    }
+    const pending = this.pendingPlanConfirmation;
+    this.pendingPlanConfirmation = null;
+    pending.resolve(confirmed);
+    return true;
+  }
+
+  private async awaitPlanConfirmation(
+    sessionId: string,
+    plan: PlanRecord,
+    fallbackFormattedPlan: string,
+  ): Promise<boolean> {
+    const awaitingPlan = await this.planLedger.markAwaitingConfirmation(sessionId, plan.planId, fallbackFormattedPlan);
+    const displayPlan = awaitingPlan || plan;
+    const formattedPlan = displayPlan.formattedPlan || fallbackFormattedPlan;
+
+    this.messageHub.data('confirmationRequest', {
+      sessionId,
+      plan: {
+        planId: displayPlan.planId,
+        status: displayPlan.status,
+        summary: displayPlan.summary,
+        items: displayPlan.items.map(item => ({
+          itemId: item.itemId,
+          title: item.title,
+          owner: item.owner,
+          status: item.status,
+        })),
+      },
+      formattedPlan,
+    });
+
+    this.setState('waiting_confirmation');
+    return new Promise<boolean>((resolve) => {
+      this.pendingPlanConfirmation = {
+        sessionId,
+        planId: displayPlan.planId,
+        resolve,
+      };
+    });
+  }
+
+  private emitPlanLedgerUpdate(sessionId: string, reason: string): void {
+    const snapshot = this.planLedger.getSnapshot(sessionId);
+    const activePlan = snapshot.activePlan;
+    this.messageHub.data('planLedgerUpdated', {
+      sessionId,
+      reason,
+      activePlan,
+      plans: snapshot.plans,
+    });
+  }
+
+  private async handleDispatchTaskRegistered(payload: {
+    sessionId: string;
+    missionId: string;
+    taskId: string;
+    worker: WorkerSlot;
+    title: string;
+    category: string;
+    dependsOn?: string[];
+    scopeHint?: string[];
+    files?: string[];
+    requiresModification: boolean;
+  }): Promise<void> {
+    if (!this.currentPlanId) {
+      return;
+    }
+    await this.planLedger.upsertDispatchItem(payload.sessionId, this.currentPlanId, {
+      itemId: payload.taskId,
+      title: payload.title,
+      worker: payload.worker,
+      category: payload.category,
+      dependsOn: payload.dependsOn,
+      scopeHints: payload.scopeHint,
+      targetFiles: payload.files,
+      requiresModification: payload.requiresModification,
+    });
+  }
+
+  private mapMissionStatusToTerminalPlanStatus(status: string): 'completed' | 'failed' | 'cancelled' | null {
+    if (status === 'completed') return 'completed';
+    if (status === 'failed') return 'failed';
+    if (status === 'cancelled') return 'cancelled';
+    return null;
+  }
+
+  private reportPlanLedgerAsyncError(action: string, error: unknown): void {
+    logger.warn('编排器.计划账本.异步回写失败', {
+      action,
+      error: error instanceof Error ? error.message : String(error),
+    }, LogCategory.ORCHESTRATOR);
+  }
+
+  private setupPlanLedgerEventBindings(): void {
+    this.planLedger.on('updated', (event: { sessionId: string; reason: string }) => {
+      this.emitPlanLedgerUpdate(event.sessionId, event.reason);
+    });
+
+    this.missionOrchestrator.on('assignmentPlanned', (data) => {
+      if (!this.currentPlanId || !this.currentSessionId) {
+        return;
+      }
+      void this.planLedger
+        .bindAssignmentTodos(this.currentSessionId, this.currentPlanId, data.assignmentId, data.todos)
+        .catch((error) => this.reportPlanLedgerAsyncError('assignmentPlanned', error));
+    });
+
+    this.missionOrchestrator.on('assignmentStarted', (data) => {
+      if (!this.currentPlanId || !this.currentSessionId) {
+        return;
+      }
+      void this.planLedger
+        .updateAssignmentStatus(this.currentSessionId, this.currentPlanId, data.assignmentId, 'running')
+        .catch((error) => this.reportPlanLedgerAsyncError('assignmentStarted', error));
+    });
+
+    this.missionOrchestrator.on('assignmentCompleted', (data) => {
+      if (!this.currentPlanId || !this.currentSessionId) {
+        return;
+      }
+      void this.planLedger
+        .updateAssignmentStatus(
+          this.currentSessionId,
+          this.currentPlanId,
+          data.assignmentId,
+          data.success ? 'completed' : 'failed',
+        )
+        .catch((error) => this.reportPlanLedgerAsyncError('assignmentCompleted', error));
+    });
+
+    this.missionOrchestrator.on('todoStarted', (data) => {
+      if (!this.currentPlanId || !this.currentSessionId) {
+        return;
+      }
+      void this.planLedger
+        .updateTodoStatus(
+          this.currentSessionId,
+          this.currentPlanId,
+          data.assignmentId,
+          data.todoId,
+          'running',
+        )
+        .catch((error) => this.reportPlanLedgerAsyncError('todoStarted', error));
+    });
+
+    this.missionOrchestrator.on('todoCompleted', (data) => {
+      if (!this.currentPlanId || !this.currentSessionId) {
+        return;
+      }
+      void this.planLedger
+        .updateTodoStatus(
+          this.currentSessionId,
+          this.currentPlanId,
+          data.assignmentId,
+          data.todoId,
+          'completed',
+        )
+        .catch((error) => this.reportPlanLedgerAsyncError('todoCompleted', error));
+    });
+
+    this.missionOrchestrator.on('todoFailed', (data) => {
+      if (!this.currentPlanId || !this.currentSessionId) {
+        return;
+      }
+      void this.planLedger
+        .updateTodoStatus(
+          this.currentSessionId,
+          this.currentPlanId,
+          data.assignmentId,
+          data.todoId,
+          'failed',
+        )
+        .catch((error) => this.reportPlanLedgerAsyncError('todoFailed', error));
+    });
+
+    this.missionOrchestrator.on('missionStatusChanged', (data) => {
+      const terminalStatus = this.mapMissionStatusToTerminalPlanStatus(data.newStatus);
+      if (!terminalStatus) {
+        return;
+      }
+      const sessionId = data.mission.sessionId;
+      void this.planLedger
+        .finalizeByMissionStatus(sessionId, data.mission.id, terminalStatus)
+        .catch((error) => this.reportPlanLedgerAsyncError('missionStatusChanged', error));
+    });
   }
 
   private enqueueExecution<T>(runner: () => Promise<T>): Promise<T> {
@@ -416,7 +688,13 @@ export class MissionDrivenEngine extends EventEmitter {
    * 单次 LLM 调用 + 工具循环。
    * LLM 在统一系统提示词下自主决策：直接回答 / 工具操作 / 分配 Worker。
    */
-  async execute(userPrompt: string, taskId: string, sessionId?: string, imagePaths?: string[]): Promise<string> {
+  async execute(
+    userPrompt: string,
+    taskId: string,
+    sessionId?: string,
+    imagePaths?: string[],
+    turnIdHint?: string
+  ): Promise<string> {
     return this.enqueueExecution(async () => {
       const trimmedPrompt = userPrompt?.trim() || '';
       if (!trimmedPrompt) {
@@ -426,9 +704,13 @@ export class MissionDrivenEngine extends EventEmitter {
       this.isRunning = true;
       this.currentTaskId = taskId || null;
       this.lastMissionId = null;
+      this.currentPlanId = null;
+      this.pendingPlanConfirmation = null;
       this.ensureMissionPromise = null;
-      // 每轮对话生成唯一 turnId，作为本轮所有快照的 missionId
-      this.currentTurnId = `turn:${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+      // 每轮对话生成唯一 turnId，作为本轮所有快照的 missionId。
+      // 若上游已生成（用于 UI 点击历史计划精确回溯），则复用同一 turnId。
+      const normalizedTurnIdHint = typeof turnIdHint === 'string' ? turnIdHint.trim() : '';
+      this.currentTurnId = normalizedTurnIdHint || `turn:${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
       this.setState('running');
       this.lastTaskAnalysis = null;
       this.lastRoutingDecision = null;
@@ -436,12 +718,43 @@ export class MissionDrivenEngine extends EventEmitter {
       this.currentSessionId = sessionId;
       this.activeUserPrompt = trimmedPrompt;
       this.activeImagePaths = imagePaths;
+      let planFinalStatus: 'completed' | 'failed' | 'cancelled' | null = null;
 
       try {
         const resolvedSessionId = sessionId || this.sessionManager.getCurrentSession()?.id || taskId;
         this.currentSessionId = resolvedSessionId;
         this.dispatchManager.resetForNewExecutionCycle();
         await this.ensureContextReady(resolvedSessionId);
+
+        const planMode: PlanMode = this.adapterFactory.isDeepTask() ? 'deep' : 'standard';
+        const draftPlan = await this.planLedger.createDraft({
+          sessionId: resolvedSessionId,
+          turnId: this.currentTurnId || `turn:${Date.now()}`,
+          missionId: this.currentTurnId || undefined,
+          mode: planMode,
+          prompt: trimmedPrompt,
+          summary: trimmedPrompt,
+        });
+        this.currentPlanId = draftPlan.planId;
+
+        const fallbackFormattedPlan = draftPlan.formattedPlan || this.planLedger.formatPlanForDisplay(draftPlan);
+        if (this.interactionMode === 'ask') {
+          const confirmed = await this.awaitPlanConfirmation(resolvedSessionId, draftPlan, fallbackFormattedPlan);
+          if (!confirmed) {
+            await this.planLedger.reject(resolvedSessionId, draftPlan.planId, 'user', '用户取消执行计划');
+            this.lastExecutionSuccess = false;
+            this.lastExecutionErrors = ['用户取消执行计划'];
+            planFinalStatus = 'cancelled';
+            this.setState('idle');
+            this.currentTaskId = null;
+            return '已取消执行计划。';
+          }
+          await this.planLedger.approve(resolvedSessionId, draftPlan.planId, 'user');
+          this.setState('running');
+        } else {
+          await this.planLedger.approve(resolvedSessionId, draftPlan.planId, 'system:auto');
+        }
+        await this.planLedger.markExecuting(resolvedSessionId, draftPlan.planId);
 
         // 1. 组装上下文
         const context = await this.prepareContext(resolvedSessionId, trimmedPrompt);
@@ -485,7 +798,7 @@ export class MissionDrivenEngine extends EventEmitter {
           const todoManager = this.missionOrchestrator.getTodoManager();
           if (todoManager) {
             // 获取所有相关的 Todo，包括已完成的，以告知编排者真实进度
-            const allTodos = await todoManager.query({});
+            const allTodos = await todoManager.query({ sessionId: resolvedSessionId });
             if (allTodos.length > 0) {
               const fullSummary = allTodos.map(t => {
                 const isDone = t.status === 'completed';
@@ -526,7 +839,9 @@ export class MissionDrivenEngine extends EventEmitter {
         // 若后续进入 dispatch 流，worker 的快照也将使用同一 turnId。
         const orchestratorToolManager = this.adapterFactory.getToolManager();
         const orchestratorAssignmentId = `orchestrator-${this.currentTurnId}`;
+        const normalizedSessionId = resolvedSessionId.trim();
         orchestratorToolManager.setSnapshotContext({
+          sessionId: normalizedSessionId,
           missionId: this.currentTurnId!,
           assignmentId: orchestratorAssignmentId,
           todoId: orchestratorAssignmentId,
@@ -594,6 +909,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
         this.lastExecutionSuccess = true;
         this.lastExecutionErrors = [];
+        planFinalStatus = 'completed';
         this.setState('idle');
         this.currentTaskId = null;
         return finalContent;
@@ -605,17 +921,41 @@ export class MissionDrivenEngine extends EventEmitter {
           logger.info('编排器.统一执行.中断', { error: errorMessage }, LogCategory.ORCHESTRATOR);
           this.lastExecutionSuccess = false;
           this.lastExecutionErrors = [];
+          planFinalStatus = 'cancelled';
           this.setState('idle');
           this.currentTaskId = null;
           return '';
         }
         this.lastExecutionSuccess = false;
         this.lastExecutionErrors = [errorMessage];
+        planFinalStatus = 'failed';
         logger.error('编排器.统一执行.失败', { error: errorMessage }, LogCategory.ORCHESTRATOR);
         this.setState('idle');
         this.currentTaskId = null;
         throw error;
       } finally {
+        const finalSessionId = this.currentSessionId;
+        const finalPlanId = this.currentPlanId;
+        if (finalSessionId && finalPlanId && planFinalStatus) {
+          try {
+            await this.planLedger.finalize(finalSessionId, finalPlanId, planFinalStatus);
+          } catch (planError) {
+            logger.warn('编排器.计划账本.终态更新失败', {
+              sessionId: finalSessionId,
+              planId: finalPlanId,
+              error: planError instanceof Error ? planError.message : String(planError),
+            }, LogCategory.ORCHESTRATOR);
+          }
+        }
+        const pendingConfirmation = this.pendingPlanConfirmation as {
+          sessionId: string;
+          planId: string;
+          resolve: (confirmed: boolean) => void;
+        } | null;
+        if (pendingConfirmation) {
+          pendingConfirmation.resolve(false);
+          this.pendingPlanConfirmation = null;
+        }
         this.isRunning = false;
         this.ensureMissionPromise = null;
         // 清除编排者快照上下文
@@ -664,6 +1004,7 @@ export class MissionDrivenEngine extends EventEmitter {
         } catch (memoryError) {
           logger.warn('编排器.上下文.保存失败', { error: memoryError }, LogCategory.ORCHESTRATOR);
         }
+        this.currentPlanId = null;
       }
     });
   }
@@ -715,9 +1056,15 @@ export class MissionDrivenEngine extends EventEmitter {
       this.lastMissionId = mission.id;
       this.missionOrchestrator.setCurrentMissionId(mission.id);
 
+      if (this.currentPlanId) {
+        await this.planLedger.bindMission(sessionId, this.currentPlanId, mission.id);
+      }
+
       const orchestratorToolManager = this.adapterFactory.getToolManager();
       const orchestratorAssignmentId = `orchestrator-${mission.id}`;
+      const normalizedSessionId = sessionId.trim();
       orchestratorToolManager.setSnapshotContext({
+        sessionId: normalizedSessionId,
         missionId: this.currentTurnId || mission.id,
         assignmentId: orchestratorAssignmentId,
         todoId: orchestratorAssignmentId,
@@ -751,9 +1098,10 @@ export class MissionDrivenEngine extends EventEmitter {
   async executeWithTaskContext(
     userPrompt: string,
     sessionId?: string,
-    imagePaths?: string[]
+    imagePaths?: string[],
+    turnIdHint?: string
   ): Promise<{ taskId: string; result: string }> {
-    const result = await this.execute(userPrompt, '', sessionId, imagePaths);
+    const result = await this.execute(userPrompt, '', sessionId, imagePaths, turnIdHint);
     return { taskId: this.lastMissionId || '', result };
   }
 
@@ -929,6 +1277,16 @@ export class MissionDrivenEngine extends EventEmitter {
    * 取消执行
    */
   async cancel(): Promise<void> {
+    const pendingConfirmation = this.pendingPlanConfirmation as {
+      sessionId: string;
+      planId: string;
+      resolve: (confirmed: boolean) => void;
+    } | null;
+    if (pendingConfirmation) {
+      pendingConfirmation.resolve(false);
+      this.pendingPlanConfirmation = null;
+    }
+
     // C-09: 取消活跃的 DispatchBatch，信号链传递到所有 Worker
     const activeBatch = this.dispatchManager.getActiveBatch();
     if (activeBatch && activeBatch.status === 'active') {

@@ -44,6 +44,7 @@ export interface PipelineConfig {
   cancellationToken?: CancellationToken;
   imagePaths?: string[];
   missionId?: string;
+  sessionId?: string;
   resumeSessionId?: string;
   resumePrompt?: string;
 
@@ -79,7 +80,7 @@ export class WorkerPipeline {
     const {
       assignment, workerInstance, adapterFactory, workspaceRoot,
       projectContext, onReport, cancellationToken, imagePaths,
-      resumeSessionId, resumePrompt,
+      sessionId, resumeSessionId, resumePrompt,
       enableSnapshot, enableLSP, enableTargetEnforce, enableContextUpdate,
       snapshotManager, contextManager, todoManager,
       getSupplementaryInstructions,
@@ -97,18 +98,27 @@ export class WorkerPipeline {
     );
 
     // ========== 1. [可选] 快照创建 ==========
+    const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
     if (enableSnapshot && snapshotManager) {
-      this.createSnapshots(snapshotManager, missionId, assignment);
+      this.createSnapshots(snapshotManager, missionId, assignment, normalizedSessionId);
     }
 
     // ========== 2. 设置工具级快照上下文 ==========
     const toolManager = adapterFactory.getToolManager();
-    toolManager.setSnapshotContext({
-      missionId,
-      assignmentId: assignment.id,
-      todoId: assignment.id,
-      workerId: assignment.workerId,
-    });
+    if (normalizedSessionId) {
+      toolManager.setSnapshotContext({
+        sessionId: normalizedSessionId,
+        missionId,
+        assignmentId: assignment.id,
+        todoId: assignment.id,
+        workerId: assignment.workerId,
+      });
+    } else {
+      logger.warn('WorkerPipeline.快照上下文.跳过_缺少会话', {
+        assignmentId: assignment.id,
+        missionId,
+      }, LogCategory.ORCHESTRATOR);
+    }
 
     // ========== 3/4/5. 上下文快照 + 目标文件收集 + LSP 预检（并行执行） ==========
     // 这三个步骤无互依赖，并行执行减少总耗时
@@ -259,14 +269,22 @@ export class WorkerPipeline {
     snapshotManager: SnapshotManager,
     missionId: string,
     assignment: Assignment,
+    sessionId?: string,
   ): void {
+    if (!sessionId || !sessionId.trim()) {
+      logger.warn('WorkerPipeline.快照创建.跳过_缺少会话', {
+        assignmentId: assignment.id,
+        missionId,
+      }, LogCategory.ORCHESTRATOR);
+      return;
+    }
     const targetFiles = this.collectTargetFiles(assignment);
     if (targetFiles.length === 0) return;
 
     try {
       for (const filePath of targetFiles) {
         snapshotManager.createSnapshotForMission(
-          filePath, missionId, assignment.id,
+          filePath, sessionId, missionId, assignment.id,
           'assignment-init', assignment.workerId,
           `Assignment 执行前快照: ${assignment.responsibility}`,
         );

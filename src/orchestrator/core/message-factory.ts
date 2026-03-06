@@ -7,6 +7,8 @@ import { logger, LogCategory } from '../../logging';
 import type { WorkerSlot, AgentType } from '../../types/agent-types';
 import type { StandardMessage, MessageMetadata, ContentBlock, MessageSource, NotifyLevel, DataMessageType } from '../../protocol/message-protocol';
 import { MessageType, MessageLifecycle, MessageCategory, ControlMessageType, createStandardMessage, createControlMessage, createNotifyMessage, createDataMessage } from '../../protocol/message-protocol';
+import { classifyModelOriginIssue, toModelOriginUserMessage } from '../../errors/model-origin';
+import { trackModelOriginEvent } from '../../errors/model-origin-observability';
 
 /** 子任务卡片载荷 - 用于 SubTaskCard 消息 */
 export interface SubTaskCardPayload {
@@ -116,17 +118,28 @@ export class MessageFactory {
 
   /** 发送子任务卡片 - 显示在主对话区 */
   subTaskCard(subTask: SubTaskCardPayload): void {
-    const w = subTask.worker;
+    const normalizedFailure = subTask.status === 'failed'
+      ? this.normalizeFailureReason(subTask.error || subTask.summary || '执行失败')
+      : null;
+    const normalizedSubTask: SubTaskCardPayload = normalizedFailure
+      ? {
+        ...subTask,
+        summary: normalizedFailure.userReason,
+        error: normalizedFailure.userReason,
+      }
+      : subTask;
+
+    const w = normalizedSubTask.worker;
     const statusContentMap: Record<SubTaskCardPayload['status'], string> = {
-      completed: subTask.summary ? `${w} 已完成：${subTask.summary}` : `${w} 完成了任务`,
-      failed: `${w} 执行遇到问题：${subTask.summary || '执行失败'}`,
-      pending: `${w} 排队中（等待前置任务）：${subTask.title}`,
-      stopped: `${w} 已停止：${subTask.title}`,
-      skipped: `${w} 已跳过：${subTask.title}`,
-      running: `${w} 正在处理：${subTask.title}`,
+      completed: normalizedSubTask.summary ? `${w} 已完成：${normalizedSubTask.summary}` : `${w} 完成了任务`,
+      failed: `${w} 执行遇到问题：${normalizedSubTask.summary || '执行失败'}`,
+      pending: `${w} 排队中（等待前置任务）：${normalizedSubTask.title}`,
+      stopped: `${w} 已停止：${normalizedSubTask.title}`,
+      skipped: `${w} 已跳过：${normalizedSubTask.title}`,
+      running: `${w} 正在处理：${normalizedSubTask.title}`,
     };
-    const content = statusContentMap[subTask.status] || statusContentMap.running;
-    const stableMessageId = `subtask-card-${subTask.id}`;
+    const content = statusContentMap[normalizedSubTask.status] || statusContentMap.running;
+    const stableMessageId = `subtask-card-${normalizedSubTask.id}`;
     this.pipeline.clearMessageState?.(stableMessageId);
     this.pipeline.process(createStandardMessage({
       id: stableMessageId,
@@ -135,7 +148,19 @@ export class MessageFactory {
       agent: 'orchestrator',
       lifecycle: MessageLifecycle.COMPLETED,
       blocks: [{ type: 'text', content, isMarkdown: true }],
-      metadata: { subTaskId: subTask.id, assignedWorker: subTask.worker, isStatusMessage: true, subTaskCard: subTask },
+      metadata: {
+        subTaskId: normalizedSubTask.id,
+        assignedWorker: normalizedSubTask.worker,
+        isStatusMessage: true,
+        subTaskCard: normalizedSubTask,
+        ...(normalizedFailure?.isModelOrigin ? {
+          recoverable: true,
+          extra: {
+            modelOriginIssue: true,
+            rawReason: normalizedFailure.rawReason,
+          },
+        } : {}),
+      },
       traceId: this.traceId,
       category: MessageCategory.CONTENT,
     }));
@@ -166,13 +191,15 @@ export class MessageFactory {
 
   /** 发送 Worker 错误 - 强制路由到主对话区 */
   workerError(worker: WorkerSlot, content: string, options?: { metadata?: MessageMetadata }): void {
+    const normalized = this.normalizeFailureReason(content || '执行失败');
+    const metadata = this.buildFailureMetadata(normalized, options?.metadata || {});
     this.pipeline.process(this.createMessage({
       type: MessageType.ERROR,
       source: 'worker',
       agent: worker as AgentType,
       lifecycle: MessageLifecycle.FAILED,
-      blocks: [{ type: 'text', content: content || '执行失败' }],
-      metadata: options?.metadata || {},
+      blocks: [{ type: 'text', content: normalized.userReason || '执行失败' }],
+      metadata,
     }));
   }
 
@@ -230,14 +257,21 @@ export class MessageFactory {
 
   /** 发送错误消息 */
   error(errorMsg: string, options?: { details?: Record<string, unknown>; recoverable?: boolean }): void {
-    const content = errorMsg || '发生未知错误';
+    const normalized = this.normalizeFailureReason(errorMsg || '发生未知错误');
+    const content = normalized.userReason || '发生未知错误';
+    const metadata: MessageMetadata = {
+      error: content,
+      extra: options?.details,
+      recoverable: options?.recoverable,
+    };
+    const mergedMetadata = this.buildFailureMetadata(normalized, metadata);
     this.pipeline.process(this.createMessage({
       type: MessageType.ERROR,
       source: 'orchestrator',
       agent: 'orchestrator',
       lifecycle: MessageLifecycle.FAILED,
       blocks: [{ type: 'text', content }],
-      metadata: { error: content, extra: options?.details, recoverable: options?.recoverable },
+      metadata: mergedMetadata,
     }));
   }
 
@@ -281,7 +315,16 @@ export class MessageFactory {
   }
 
   taskRejected(requestId: string, reason: string): void {
-    this.sendControl(ControlMessageType.TASK_REJECTED, { requestId, reason, timestamp: Date.now() });
+    const normalized = this.normalizeFailureReason(reason || '任务被拒绝');
+    this.sendControl(ControlMessageType.TASK_REJECTED, {
+      requestId,
+      reason: normalized.userReason,
+      timestamp: Date.now(),
+      ...(normalized.isModelOrigin ? {
+        modelOriginIssue: true,
+        rawReason: normalized.rawReason,
+      } : {}),
+    });
   }
 
   workerStatus(worker: string, available: boolean, model?: string): void {
@@ -311,6 +354,40 @@ export class MessageFactory {
       return { ...metadata, requestId: this.requestId };
     }
     return metadata;
+  }
+
+  private normalizeFailureReason(reason: string): { rawReason: string; userReason: string; isModelOrigin: boolean } {
+    const rawReason = (reason || '').trim();
+    const userReason = toModelOriginUserMessage(rawReason).trim() || rawReason || '执行失败';
+    const classified = classifyModelOriginIssue(rawReason);
+    if (classified.isModelCause) {
+      trackModelOriginEvent('surfaced', 'message-factory', rawReason, {
+        surfacedReason: userReason,
+      });
+    }
+    return {
+      rawReason,
+      userReason,
+      isModelOrigin: classified.isModelCause,
+    };
+  }
+
+  private buildFailureMetadata(
+    normalized: { rawReason: string; userReason: string; isModelOrigin: boolean },
+    metadata: MessageMetadata,
+  ): MessageMetadata {
+    if (!normalized.isModelOrigin) {
+      return metadata;
+    }
+    return {
+      ...metadata,
+      recoverable: metadata.recoverable ?? true,
+      extra: {
+        ...(metadata.extra || {}),
+        modelOriginIssue: true,
+        rawReason: normalized.rawReason,
+      },
+    };
   }
 
   private generateTraceId(): string {

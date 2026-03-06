@@ -20,6 +20,8 @@ import { ToolCall, ToolResult, FileChangeMetadata } from '../llm/types';
 import { logger, LogCategory } from '../logging';
 import { WorkspaceRoots } from '../workspace/workspace-roots';
 import { FileMutex } from '../utils/file-mutex';
+import { toModelOriginUserMessage } from '../errors/model-origin';
+import { trackModelOriginEvent } from '../errors/model-origin-observability';
 
 
 
@@ -347,6 +349,14 @@ IMPORTANT:
       };
     }
 
+    // file_view + 多工作区 + 通用路径（如 "."）：列出所有工作区目录结构
+    if (toolCall.name === 'file_view' && this.workspaceRoots.hasMultipleRoots()) {
+      const normalizedPath = filePath.trim();
+      if (normalizedPath === '.' || normalizedPath === '') {
+        return await this.executeViewMultiRoot(toolCall.id);
+      }
+    }
+
     const pathResolution = this.resolveWorkspacePath(
       filePath,
       this.shouldRequireExistingPath(toolCall.name, toolCall.arguments)
@@ -397,6 +407,31 @@ IMPORTANT:
       return args?.undo !== true;
     }
     return false;
+  }
+
+  /**
+   * 多工作区查看根目录：列出所有工作区的目录结构
+   */
+  private async executeViewMultiRoot(toolCallId: string): Promise<ToolResult> {
+    try {
+      const folders = this.workspaceRoots.getFolders();
+      const sections: string[] = [];
+      for (const folder of folders) {
+        const content = await this.listDirectory(folder.path, 2);
+        sections.push(`[${folder.name}]\n${content}`);
+      }
+      return {
+        toolCallId,
+        content: sections.join('\n\n'),
+        isError: false
+      };
+    } catch (error: any) {
+      return {
+        toolCallId,
+        content: `Error: Failed to list workspace directories: ${error.message}`,
+        isError: true
+      };
+    }
   }
 
   /**
@@ -805,11 +840,27 @@ IMPORTANT:
 
       let newContent: string;
       try {
-        newContent = await this.llmEditHandler!(filePath, originalContent, editSummary, detailedEditDesc);
+        const generated = await this.llmEditHandler!(filePath, originalContent, editSummary, detailedEditDesc);
+        if (typeof generated !== 'string') {
+          const rawReason = 'Error during LLM edit generation: model returned non-string content';
+          const userReason = toModelOriginUserMessage(rawReason);
+          trackModelOriginEvent('surfaced', 'tool:file_edit', rawReason, { filePath: this.workspaceRoots.toDisplayPath(filePath) });
+          return {
+            toolCallId,
+            content: userReason || '模型输出异常：未返回可写入文本。',
+            isError: true
+          };
+        }
+        newContent = generated;
       } catch (error: any) {
+        const rawReason = `Error during LLM edit generation: ${error?.message || String(error)}`;
+        const userReason = toModelOriginUserMessage(rawReason);
+        trackModelOriginEvent('surfaced', 'tool:file_edit', rawReason, {
+          filePath: this.workspaceRoots.toDisplayPath(filePath),
+        });
         return {
           toolCallId,
-          content: `Error during LLM edit generation: ${error.message}`,
+          content: userReason || `Error during LLM edit generation: ${error.message}`,
           isError: true
         };
       }
@@ -1167,20 +1218,31 @@ IMPORTANT:
 
   /**
    * 读取文件内容（优先从 VSCode 已打开文档获取）
-   * 保证拿到编辑器中可能未保存的最新状态
+   * 策略：
+   * - 若文档在编辑器中且为 dirty，优先返回未保存内容（避免丢失用户本地改动）
+   * - 其他情况优先读取磁盘最新内容（避免使用到滞后的内存文档）
    */
   private async readFileContent(filePath: string): Promise<string> {
     const uri = vscode.Uri.file(filePath);
 
-    // 优先从已打开的文档中读取（可能包含未保存的修改）
+    // 仅 dirty 文档优先读取，确保保留未保存编辑
     const openDoc = vscode.workspace.textDocuments.find(
       doc => doc.uri.fsPath === uri.fsPath
     );
-    if (openDoc) {
+    if (openDoc?.isDirty) {
       return openDoc.getText();
     }
 
-    // 文档未在编辑器中打开，通过 openTextDocument 读取磁盘内容
+    // 优先读取磁盘最新内容；失败时回退到已打开文档
+    try {
+      return await fs.readFile(filePath, 'utf-8');
+    } catch {
+      if (openDoc) {
+        return openDoc.getText();
+      }
+    }
+
+    // 最后兜底：通过 VSCode 文档 API 读取
     const doc = await vscode.workspace.openTextDocument(uri);
     return doc.getText();
   }
@@ -1194,10 +1256,7 @@ IMPORTANT:
     const doc = await vscode.workspace.openTextDocument(uri);
 
     const edit = new vscode.WorkspaceEdit();
-    const fullRange = new vscode.Range(
-      doc.lineAt(0).range.start,
-      doc.lineAt(doc.lineCount - 1).range.end
-    );
+    const fullRange = new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length));
     edit.replace(uri, fullRange, newContent);
 
     const success = await vscode.workspace.applyEdit(edit);
@@ -1205,8 +1264,11 @@ IMPORTANT:
       throw new Error('VSCode WorkspaceEdit 应用失败');
     }
 
-    // 持久化到磁盘
-    await doc.save();
+    // 持久化到磁盘（必须成功）
+    const saved = await doc.save();
+    if (!saved) {
+      throw new Error('VSCode 文档保存失败（writeFileViaWorkspaceEdit）');
+    }
     this.onAfterWrite?.(filePath);
   }
 
@@ -1234,10 +1296,7 @@ IMPORTANT:
     if (fileExists) {
       // 已有文件：打开文档并替换全部内容
       const doc = await vscode.workspace.openTextDocument(uri);
-      const fullRange = new vscode.Range(
-        doc.lineAt(0).range.start,
-        doc.lineAt(doc.lineCount - 1).range.end
-      );
+      const fullRange = new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length));
       edit.replace(uri, fullRange, content);
     } else {
       // 新文件：先创建再插入内容
@@ -1250,9 +1309,12 @@ IMPORTANT:
       throw new Error('VSCode WorkspaceEdit 创建文件失败');
     }
 
-    // 持久化到磁盘
+    // 持久化到磁盘（必须成功）
     const doc = await vscode.workspace.openTextDocument(uri);
-    await doc.save();
+    const saved = await doc.save();
+    if (!saved) {
+      throw new Error('VSCode 文档保存失败（createFileViaWorkspaceEdit）');
+    }
     this.onAfterWrite?.(filePath);
   }
 

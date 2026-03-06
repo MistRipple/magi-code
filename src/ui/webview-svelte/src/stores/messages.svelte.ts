@@ -37,6 +37,10 @@ export const messagesState = $state({
   // Tab 状态
   currentTopTab: 'thread' as TabType,
   currentBottomTab: 'thread' as TabType,
+  messageJump: {
+    messageId: null as string | null,
+    nonce: 0,
+  },
 
   // 消息状态
   threadMessages: [] as Message[],
@@ -106,6 +110,19 @@ function hasInvalidMessageSource(messages: Message[]): boolean {
 let tasks = $state<Task[]>([]);
 let edits = $state<Array<{ filePath: string; snapshotId?: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string; missionId?: string }>>([]);
 let toasts = $state<Array<{ id: string; type: string; title?: string; message: string }>>([]);
+
+// 通知历史（持久化在会话内，不自动消失）
+export interface Notification {
+  id: string;
+  type: string;
+  title?: string;
+  message: string;
+  timestamp: number;
+  read: boolean;
+}
+let notifications = $state<Notification[]>([]);
+let unreadNotificationCount = $state(0);
+
 let modelStatus = $state<ModelStatusMap>({
   claude: { status: 'checking' },
   codex: { status: 'checking' },
@@ -221,7 +238,6 @@ function normalizeMissionPlan(plan: MissionPlan | null): MissionPlan | null {
 // 交互请求状态
 let pendingConfirmation = $state<{ plan: unknown; formattedPlan?: string } | null>(null);
 let pendingRecovery = $state<{ taskId: string; error: unknown; canRetry: boolean; canRollback: boolean } | null>(null);
-let pendingQuestion = $state<{ questions: string[]; plan?: unknown } | null>(null);
 let pendingClarification = $state<{ questions: string[]; context?: string; ambiguityScore?: number; originalPrompt?: string } | null>(null);
 let pendingWorkerQuestion = $state<{ workerId: string; question: string; context?: string; options?: unknown } | null>(null);
 let pendingToolAuthorization = $state<{ requestId: string; toolName: string; toolArgs: unknown } | null>(null);
@@ -379,10 +395,6 @@ export function getPendingRecovery() {
   return pendingRecovery;
 }
 
-export function getPendingQuestion() {
-  return pendingQuestion;
-}
-
 export function getPendingClarification() {
   return pendingClarification;
 }
@@ -415,6 +427,7 @@ export function getState() {
   return {
     get currentTopTab() { return messagesState.currentTopTab; },
     get currentBottomTab() { return messagesState.currentBottomTab; },
+    get messageJump() { return messagesState.messageJump; },
     get threadMessages() { return messagesState.threadMessages; },
     get agentOutputs() { return messagesState.agentOutputs; },
     get sessions() { return messagesState.sessions; },
@@ -432,6 +445,8 @@ export function getState() {
     set edits(v) { edits = v; },
     get toasts() { return toasts; },
     set toasts(v) { toasts = v; },
+    get notifications() { return notifications; },
+    get unreadNotificationCount() { return unreadNotificationCount; },
     get modelStatus() { return modelStatus; },
     set modelStatus(v) { modelStatus = v; },
     get interactionMode() { return interactionMode; },
@@ -446,8 +461,6 @@ export function getState() {
     set pendingConfirmation(v) { pendingConfirmation = v; },
     get pendingRecovery() { return pendingRecovery; },
     set pendingRecovery(v) { pendingRecovery = v; },
-    get pendingQuestion() { return pendingQuestion; },
-    set pendingQuestion(v) { pendingQuestion = v; },
     get pendingClarification() { return pendingClarification; },
     set pendingClarification(v) { pendingClarification = v; },
     get pendingWorkerQuestion() { return pendingWorkerQuestion; },
@@ -507,6 +520,23 @@ export function setCurrentTopTab(tab: TabType) {
 export function setCurrentBottomTab(tab: TabType) {
   messagesState.currentBottomTab = tab;
   saveWebviewState();
+}
+
+export function requestMessageJump(messageId: string): void {
+  const normalized = typeof messageId === 'string' ? messageId.trim() : '';
+  if (!normalized) return;
+  messagesState.messageJump = {
+    messageId: normalized,
+    nonce: messagesState.messageJump.nonce + 1,
+  };
+}
+
+export function clearMessageJump(): void {
+  if (!messagesState.messageJump.messageId) return;
+  messagesState.messageJump = {
+    messageId: null,
+    nonce: messagesState.messageJump.nonce,
+  };
 }
 
 // 会话操作
@@ -735,20 +765,50 @@ export function getBackendProcessing(): boolean {
 export function clearPendingInteractions() {
   pendingConfirmation = null;
   pendingRecovery = null;
-  pendingQuestion = null;
   pendingClarification = null;
   pendingWorkerQuestion = null;
   pendingToolAuthorization = null;
 }
 
 export function addToast(type: string, message: string, title?: string) {
-  const toast = {
-    id: `toast_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+  const id = `toast_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const toast = { id, type, title, message };
+  toasts = [...toasts, toast];
+
+  // 同步归档到通知历史
+  const notification: Notification = {
+    id,
     type,
     title,
     message,
+    timestamp: Date.now(),
+    read: false,
   };
-  toasts = [...toasts, toast];
+  notifications = [notification, ...notifications];
+  unreadNotificationCount = notifications.filter(n => !n.read).length;
+}
+
+export function getNotifications() {
+  return notifications;
+}
+
+export function getUnreadNotificationCount() {
+  return unreadNotificationCount;
+}
+
+export function markAllNotificationsRead() {
+  notifications = notifications.map(n => ({ ...n, read: true }));
+  unreadNotificationCount = 0;
+}
+
+export function clearAllNotifications() {
+  notifications = [];
+  unreadNotificationCount = 0;
+}
+
+export function removeNotification(id: string) {
+  notifications = notifications.filter(n => n.id !== id);
+  unreadNotificationCount = notifications.filter(n => !n.read).length;
 }
 
 export function getActiveInteractionType(): string | null {
@@ -756,7 +816,6 @@ export function getActiveInteractionType(): string | null {
   if (pendingConfirmation) return 'confirmation';
   if (pendingToolAuthorization) return 'toolAuthorization';
   if (pendingClarification) return 'clarification';
-  if (pendingQuestion) return 'question';
   if (pendingWorkerQuestion) return 'workerQuestion';
   return null;
 }
@@ -914,6 +973,10 @@ export function clearAllMessages() {
     claude: [],
     codex: [],
     gemini: [],
+  };
+  messagesState.messageJump = {
+    messageId: null,
+    nonce: messagesState.messageJump.nonce,
   };
   clearPendingInteractions();
   clearProcessingState();

@@ -3,7 +3,7 @@
   import MessageItem from './MessageItem.svelte';
   import Icon from './Icon.svelte';
   import { onMount, tick } from 'svelte';
-  import { messagesState } from '../stores/messages.svelte';
+  import { clearMessageJump, messagesState } from '../stores/messages.svelte';
 
   // Props - Svelte 5 语法
   interface Props {
@@ -96,6 +96,8 @@
   // - worker: 当前请求级别（同一次请求内跨多轮不重置）
   // 仅当「当前无流式消息卡片」时显示，避免与卡片内流式动画重复导致视觉留白
   const hasStreamingMessage = $derived(safeMessages.some((m) => m.isStreaming));
+  const lastMessage = $derived.by(() => safeMessages.length > 0 ? safeMessages[safeMessages.length - 1] : null);
+  const hasBottomStreamingMessage = $derived(Boolean(lastMessage?.isStreaming));
   const pendingRequestIds = $derived.by(() => Array.from(messagesState.pendingRequests));
   const pendingRequestIdSet = $derived.by(() => new Set(pendingRequestIds));
 
@@ -125,7 +127,7 @@
   const workerHasCurrentRequestActivity = $derived.by(() => {
     if (displayContext !== 'worker') return false;
 
-    if (hasStreamingMessage) return true;
+    if (hasBottomStreamingMessage) return true;
     if (!messagesState.isProcessing) return false;
 
     if (workerName && messagesState.processingActor?.agent === workerName) {
@@ -134,34 +136,30 @@
 
     return panelHasPendingRequest;
   });
-  const latestStreamingMessageId = $derived.by(() => {
-    for (let i = safeMessages.length - 1; i >= 0; i--) {
-      if (safeMessages[i]?.isStreaming) {
-        return safeMessages[i].id;
-      }
-    }
-    return null;
+  const streamingIndicatorMessageId = $derived.by(() => {
+    if (!hasBottomStreamingMessage || !lastMessage) return null;
+    return lastMessage.id;
   });
 
-  // 防抖：hasStreamingMessage 变 false 后延迟 300ms 再显示底部指示器，
-  // 避免工具调用间隙短暂 isStreaming=false 导致指示器闪烁产生空白
-  let debouncedNoStreaming = $state(true);
+  // 防抖：底部消息的流式状态变 false 后延迟 300ms 再显示底部兜底指示器，
+  // 避免工具调用间隙短暂状态切换导致视觉闪烁。
+  let debouncedNoBottomStreaming = $state(true);
   let noStreamingTimer: ReturnType<typeof setTimeout> | null = null;
   $effect(() => {
-    const noStreaming = !hasStreamingMessage;
+    const noStreaming = !hasBottomStreamingMessage;
     if (noStreaming) {
-      noStreamingTimer = setTimeout(() => { debouncedNoStreaming = true; }, 300);
+      noStreamingTimer = setTimeout(() => { debouncedNoBottomStreaming = true; }, 300);
     } else {
       if (noStreamingTimer) { clearTimeout(noStreamingTimer); noStreamingTimer = null; }
-      debouncedNoStreaming = false;
+      debouncedNoBottomStreaming = false;
     }
     return () => { if (noStreamingTimer) { clearTimeout(noStreamingTimer); noStreamingTimer = null; } };
   });
 
   const showProcessingIndicator = $derived(
     displayContext === 'worker'
-      ? workerHasCurrentRequestActivity && debouncedNoStreaming
-      : messagesState.isProcessing && safeMessages.length > 0 && debouncedNoStreaming
+      ? workerHasCurrentRequestActivity && debouncedNoBottomStreaming
+      : messagesState.isProcessing && safeMessages.length > 0 && debouncedNoBottomStreaming
   );
 
   // 计时起点：
@@ -194,9 +192,9 @@
   const shouldRunTimer = $derived.by(() => {
     if (timerStartTime <= 0) return false;
     if (displayContext === 'worker') {
-      return workerHasCurrentRequestActivity || hasStreamingMessage;
+      return workerHasCurrentRequestActivity || hasBottomStreamingMessage;
     }
-    return messagesState.isProcessing || hasStreamingMessage;
+    return messagesState.isProcessing || hasBottomStreamingMessage;
   });
 
   let elapsedSeconds = $state(0);
@@ -273,6 +271,43 @@
     });
   });
 
+  // 外部触发的消息定位（例如：任务面板点击历史计划，穿透定位到对应对话轮次）
+  $effect(() => {
+    const jumpNonce = messagesState.messageJump.nonce;
+    void jumpNonce;
+    const targetMessageId = messagesState.messageJump.messageId;
+    if (!targetMessageId) return;
+    if (displayContext !== 'thread') return;
+    if (!isActive) return;
+    if (!containerRef) return;
+
+    const existsInCurrentList = safeMessages.some((message) => message.id === targetMessageId);
+    if (!existsInCurrentList) return;
+
+    tick().then(() => {
+      if (!containerRef) return;
+      const selectorSafeId = targetMessageId.replace(/"/g, '\\"');
+      const targetElement = containerRef.querySelector(`[data-message-id="${selectorSafeId}"]`) as HTMLElement | null;
+      if (!targetElement) return;
+
+      targetElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      try {
+        targetElement.animate(
+          [
+            { boxShadow: '0 0 0 0 rgba(14, 99, 156, 0.0)' },
+            { boxShadow: '0 0 0 2px rgba(14, 99, 156, 0.55)' },
+            { boxShadow: '0 0 0 0 rgba(14, 99, 156, 0.0)' },
+          ],
+          { duration: 900, easing: 'ease-out' }
+        );
+      } catch {
+        // ignore: animate API 在极少数环境可能不可用
+      }
+
+      clearMessageJump();
+    });
+  });
+
   // 检测用户是否手动滚动
   function handleScroll(event: Event) {
     const target = event.target as HTMLDivElement;
@@ -323,8 +358,8 @@
           {message}
           {readOnly}
           {displayContext}
-          showStreamingIndicator={message.id === latestStreamingMessageId}
-          streamingElapsedSeconds={message.id === latestStreamingMessageId && shouldRunTimer ? elapsedSeconds : 0}
+          showStreamingIndicator={message.id === streamingIndicatorMessageId}
+          streamingElapsedSeconds={message.id === streamingIndicatorMessageId && shouldRunTimer ? elapsedSeconds : 0}
         />
       {/each}
       <!-- 对话级处理指示器：无流式消息但仍在处理中时显示 -->

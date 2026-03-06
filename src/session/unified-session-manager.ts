@@ -105,6 +105,12 @@ export interface SessionMeta {
   preview: string;
 }
 
+interface SessionMessageAppendOptions {
+  id?: string;
+  type?: string;
+  metadata?: Record<string, unknown>;
+}
+
 /** 生成唯一 ID */
 function generateId(): string {
   return `session-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
@@ -235,12 +241,28 @@ export class UnifiedSessionManager {
       .sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
+  /** 统一 role/type 语义：type=user_input 必须是 user，type=system-notice 必须是 system */
+  private normalizeMessageRole(message: SessionMessage): SessionMessage {
+    if (message.type === 'user_input' && message.role !== 'user') {
+      return { ...message, role: 'user' };
+    }
+    if (message.type === 'system-notice' && message.role !== 'system') {
+      return { ...message, role: 'system' };
+    }
+    return message;
+  }
+
+  /** 判断是否为用户消息（统一以语义为准：role 或 type） */
+  private isUserMessage(message: SessionMessage): boolean {
+    return message.role === 'user' || message.type === 'user_input';
+  }
+
   /** 获取会话元数据列表 */
   getSessionMetas(): SessionMeta[] {
     return this.getAllSessions().map(s => ({
       id: s.id,
       name: s.name,
-      messageCount: s.messages.filter(m => m.role === 'user').length,
+      messageCount: s.messages.filter(m => this.isUserMessage(m)).length,
       createdAt: s.createdAt,
       updatedAt: s.updatedAt,
       preview: this.getSessionPreview(s),
@@ -249,7 +271,7 @@ export class UnifiedSessionManager {
 
   /** 获取会话预览 */
   private getSessionPreview(session: UnifiedSession): string {
-    const firstUserMsg = session.messages.find(m => m.role === 'user');
+    const firstUserMsg = session.messages.find(m => this.isUserMessage(m));
     if (!firstUserMsg) return '新对话';
     const content = firstUserMsg.content.trim();
     return content.length > 50 ? content.substring(0, 50) + '...' : content;
@@ -283,13 +305,14 @@ export class UnifiedSessionManager {
     content: string,
     agent?: AgentType,
     source?: 'orchestrator' | 'worker' | 'system',
-    images?: Array<{ dataUrl: string }>
+    images?: Array<{ dataUrl: string }>,
+    options?: SessionMessageAppendOptions
   ): SessionMessage {
     const session = this.sessions.get(sessionId);
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
     }
-    return this.appendMessageToSession(session, role, content, agent, source, images);
+    return this.appendMessageToSession(session, role, content, agent, source, images, options);
   }
 
   private appendMessageToSession(
@@ -298,23 +321,30 @@ export class UnifiedSessionManager {
     content: string,
     agent?: AgentType,
     source?: 'orchestrator' | 'worker' | 'system',
-    images?: Array<{ dataUrl: string }>
+    images?: Array<{ dataUrl: string }>,
+    options?: SessionMessageAppendOptions
   ): SessionMessage {
+    const metadata = options?.metadata && typeof options.metadata === 'object' && !Array.isArray(options.metadata)
+      ? { ...options.metadata }
+      : undefined;
+
     const message: SessionMessage = {
-      id: generateMessageId(),
+      id: options?.id || generateMessageId(),
       role,
       content,
-      agent,  // ✅ 使用 agent
+      agent,
       source,
       timestamp: Date.now(),
-      images: images && images.length > 0 ? images : undefined,  // 🔧 保存图片
+      images: images && images.length > 0 ? images : undefined,
+      type: options?.type,
+      metadata,
     };
 
     session.messages.push(message);
     session.updatedAt = Date.now();
 
     // 自动生成会话标题
-    if (!session.name && role === 'user' && session.messages.filter(m => m.role === 'user').length === 1) {
+    if (!session.name && this.isUserMessage(message) && session.messages.filter(m => this.isUserMessage(m)).length === 1) {
       session.name = this.generateSessionTitle(content);
     }
 
@@ -344,7 +374,33 @@ export class UnifiedSessionManager {
   updateSessionData(sessionId: string, messages: SessionMessage[]): boolean {  // ✅ 移除 cliOutputs 参数
     const session = this.sessions.get(sessionId);
     if (session) {
+      // 最后防线：禁止用空消息列表覆盖已有消息，防止因前端时序问题导致数据丢失
+      if (messages.length === 0 && session.messages.length > 0) {
+        logger.warn('会话.更新.拒绝_空覆写', {
+          sessionId,
+          existingCount: session.messages.length,
+        }, LogCategory.SESSION);
+        return false;
+      }
+
+      const normalizedMessages: SessionMessage[] = [];
+      let normalizedRoleCount = 0;
       for (const msg of messages) {
+        const normalized = this.normalizeMessageRole(msg);
+        if (normalized.role !== msg.role) {
+          normalizedRoleCount++;
+        }
+        normalizedMessages.push(normalized);
+      }
+
+      if (normalizedRoleCount > 0) {
+        logger.warn('会话.更新.role归一化', {
+          sessionId,
+          normalizedRoleCount,
+        }, LogCategory.SESSION);
+      }
+
+      for (const msg of normalizedMessages) {
         if (!msg.id || typeof msg.id !== 'string' || !msg.id.trim()) {
           throw new Error('Session message missing id');
         }
@@ -375,7 +431,8 @@ export class UnifiedSessionManager {
           throw new Error('Session message metadata invalid');
         }
       }
-      session.messages = messages;
+
+      session.messages = normalizedMessages;
       // ✅ 移除 cliOutputs 更新逻辑
       session.updatedAt = Date.now();
       this.saveSession(session);
@@ -648,7 +705,10 @@ export class UnifiedSessionManager {
       this.currentSessionId = sessions.length > 0 ? sessions[0].id : null;
     }
 
-    globalEventBus.emitEvent('session:ended', { sessionId });
+    globalEventBus.emitEvent('session:ended', {
+      sessionId,
+      data: { sessionId, reason: 'deleted' },
+    });
     return true;
   }
 
@@ -661,6 +721,10 @@ export class UnifiedSessionManager {
       if (this.currentSessionId === sessionId) {
         this.currentSessionId = null;
       }
+      globalEventBus.emitEvent('session:ended', {
+        sessionId,
+        data: { sessionId, reason: 'completed' },
+      });
     }
   }
 
@@ -860,6 +924,12 @@ export class UnifiedSessionManager {
           return null;
         }
 
+        // 数据迁移：修复 role 被前端覆写为 'assistant' 但 type 为 'user_input' 的用户消息
+        const migrated = this.migrateMessageRoles(session);
+        if (migrated) {
+          this.saveSession(session);
+        }
+
         this.sessions.set(session.id, session);
         return session;
       } catch (e) {
@@ -869,6 +939,32 @@ export class UnifiedSessionManager {
       }
     }
     return null;
+  }
+
+  /**
+   * 迁移消息 role：修复历史脏数据（type 与 role 不一致）
+   * 根因：前端历史版本在某些链路将用户消息 role 覆写为 assistant，随后回写磁盘。
+   * @returns 是否有消息被修正
+   */
+  private migrateMessageRoles(session: UnifiedSession): boolean {
+    const normalizedMessages: SessionMessage[] = [];
+    let fixed = 0;
+
+    for (const msg of session.messages) {
+      const normalized = this.normalizeMessageRole(msg);
+      if (normalized.role !== msg.role) {
+        fixed++;
+      }
+      normalizedMessages.push(normalized);
+    }
+
+    if (fixed > 0) {
+      session.messages = normalizedMessages;
+      logger.info('会话.迁移.role修正', { sessionId: session.id, fixed }, LogCategory.SESSION);
+      return true;
+    }
+
+    return false;
   }
 
   /** 加载所有会话 */
@@ -953,7 +1049,7 @@ export class UnifiedSessionManager {
       keyDecisions,
       codeChanges,
       pendingIssues,
-      messageCount: session.messages.filter(m => m.role === 'user').length,
+      messageCount: session.messages.filter(m => this.isUserMessage(m)).length,
       lastUpdated: session.updatedAt,
     };
   }
@@ -966,7 +1062,7 @@ export class UnifiedSessionManager {
     }
 
     // 否则使用第一条用户消息
-    const firstUserMsg = session.messages.find(m => m.role === 'user');
+    const firstUserMsg = session.messages.find(m => this.isUserMessage(m));
     if (firstUserMsg) {
       const content = firstUserMsg.content.trim();
       return content.length > 100 ? content.substring(0, 100) + '...' : content;
@@ -1074,7 +1170,7 @@ export class UnifiedSessionManager {
       return '';
     }
     return messages
-      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
+      .map(m => `${this.isUserMessage(m) ? 'User' : 'Assistant'}: ${m.content}`)
       .join('\n\n');
   }
 

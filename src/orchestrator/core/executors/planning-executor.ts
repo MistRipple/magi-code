@@ -23,7 +23,11 @@ export class PlanningExecutor {
    * 创建一级 Todo（1 个 Assignment = 1 个一级 Todo）
    * 编排层唯一的 Todo 创建入口
    */
-  async createMacroTodo(missionId: string, assignment: Assignment): Promise<void> {
+  async createMacroTodo(
+    missionId: string,
+    sessionId: string,
+    assignment: Assignment,
+  ): Promise<void> {
     logger.info(
       `为 ${assignment.workerId} 创建一级 Todo: ${assignment.responsibility}`,
       undefined,
@@ -32,6 +36,7 @@ export class PlanningExecutor {
 
     const content = this.buildTodoContent(assignment);
     const todo = await this.todoManager.create({
+      sessionId,
       missionId,
       assignmentId: assignment.id,
       content,

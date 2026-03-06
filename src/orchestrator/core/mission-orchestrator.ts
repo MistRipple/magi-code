@@ -143,7 +143,12 @@ export class MissionOrchestrator extends EventEmitter {
     }
 
     this.todoManagerInitPromise = (async () => {
-      const manager = new TodoManager(this.workspaceRoot!);
+      const manager = new TodoManager(this.workspaceRoot!, {
+        resolveSessionIdByMissionId: async (missionId: string) => {
+          const mission = await this.storage.load(missionId);
+          return mission?.sessionId;
+        },
+      });
       await manager.initialize();
       this.todoManager = manager;
       logger.info('编排器.TodoManager.已初始化', {

@@ -29,13 +29,11 @@
   let settingsOpen = $state(false);
 
   // 交互输入
-  let questionAnswer = $state('');
   let clarificationAnswer = $state('');
   let workerQuestionAnswer = $state('');
 
   const pendingConfirmation = $derived(appState.pendingConfirmation);
   const pendingRecovery = $derived(appState.pendingRecovery);
-  const pendingQuestion = $derived(appState.pendingQuestion);
   const pendingClarification = $derived(appState.pendingClarification);
   const pendingWorkerQuestion = $derived(appState.pendingWorkerQuestion);
   const pendingToolAuthorization = $derived(appState.pendingToolAuthorization);
@@ -63,14 +61,6 @@
     vscode.postMessage({ type: 'confirmRecovery', decision });
     appState.pendingRecovery = null;
     setIsProcessing(true);
-  }
-
-  function submitQuestion(cancelled = false) {
-    const answer = cancelled ? null : (questionAnswer.trim() || null);
-    vscode.postMessage({ type: 'answerQuestions', answer });
-    appState.pendingQuestion = null;
-    questionAnswer = '';
-    if (!cancelled) setIsProcessing(true);
   }
 
   function submitClarification(cancelled = false) {
@@ -121,7 +111,7 @@
   <!-- Tab 内容区域：所有面板同时存在，CSS 控制显隐，避免切换 Tab 时组件销毁导致状态丢失 -->
   <div class="tab-content-wrapper">
     <div class="top-tab-pane" class:active={currentTopTab === 'thread'}>
-      <ThreadPanel />
+      <ThreadPanel isTopActive={currentTopTab === 'thread'} />
     </div>
     <div class="top-tab-pane" class:active={currentTopTab === 'tasks'}>
       <TasksPanel />
@@ -176,28 +166,6 @@
           <button class="modal-btn secondary" onclick={() => confirmRecovery('continue')}>继续</button>
           <button class="modal-btn secondary" disabled={!pendingRecovery.canRollback} onclick={() => confirmRecovery('rollback')}>回滚</button>
           <button class="modal-btn primary" disabled={!pendingRecovery.canRetry} onclick={() => confirmRecovery('retry')}>重试</button>
-        </div>
-      </div>
-    </div>
-  {/if}
-
-  {#if pendingQuestion && interactionMode === 'ask'}
-    <div class="modal-overlay" role="presentation">
-      <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
-        <div class="modal-header">
-          <h3>需要补充信息</h3>
-        </div>
-        <div class="modal-body">
-          <ol class="question-list">
-            {#each pendingQuestion.questions as q}
-              <li>{q}</li>
-            {/each}
-          </ol>
-          <textarea class="modal-textarea" bind:value={questionAnswer} placeholder="请输入补充信息..."></textarea>
-        </div>
-        <div class="modal-footer">
-          <button class="modal-btn secondary" onclick={() => submitQuestion(true)}>取消</button>
-          <button class="modal-btn primary" onclick={() => submitQuestion(false)}>提交</button>
         </div>
       </div>
     </div>

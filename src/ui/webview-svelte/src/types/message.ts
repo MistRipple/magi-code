@@ -233,6 +233,7 @@ export interface Message {
     isPlaceholder?: boolean;          // 是否为占位消息
     placeholderState?: PlaceholderState; // 占位消息状态
     requestId?: string;               // 关联的请求 ID
+    turnId?: string;                  // 对话轮次 ID（用于计划账本回溯定位）
     wasPlaceholder?: boolean;         // 是否从占位消息转换而来（用于过渡动画）
     justCompleted?: boolean;          // 是否刚完成（用于完成动画）
     sendingAnimation?: boolean;       // 用户消息发送动画
@@ -340,6 +341,48 @@ export interface Task {
   failureReason?: string;
 }
 
+export interface PlanLedgerItem {
+  itemId: string;
+  title: string;
+  owner: string;
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped' | 'cancelled';
+  progress: number;
+}
+
+export interface PlanLedgerRecord {
+  planId: string;
+  sessionId: string;
+  missionId?: string;
+  turnId: string;
+  version: number;
+  promptDigest?: string;
+  mode: 'standard' | 'deep';
+  status:
+    | 'draft'
+    | 'awaiting_confirmation'
+    | 'approved'
+    | 'rejected'
+    | 'executing'
+    | 'partially_completed'
+    | 'completed'
+    | 'failed'
+    | 'cancelled'
+    | 'superseded';
+  summary: string;
+  analysis?: string;
+  formattedPlan?: string;
+  items: PlanLedgerItem[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ActivePlanState {
+  planId: string;
+  formattedPlan: string;
+  updatedAt: number;
+  review?: { status: 'approved' | 'rejected' | 'skipped'; summary: string };
+}
+
 // 编辑/变更记录
 export type EditType = 'add' | 'modify' | 'delete';
 
@@ -371,6 +414,8 @@ export interface AppState {
   isProcessing?: boolean;
   pendingChanges?: unknown[];
   tasks?: Task[];
+  activePlan?: ActivePlanState | null;
+  planHistory?: PlanLedgerRecord[];
   edits?: Edit[];
   toasts?: Toast[];
   interactionMode?: 'ask' | 'auto';

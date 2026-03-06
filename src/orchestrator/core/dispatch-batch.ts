@@ -306,8 +306,8 @@ export class DispatchBatch extends EventEmitter {
       throw new Error(`任务 ${params.taskId} 已存在于 Batch ${this.id}`);
     }
 
-    // depends_on 只能引用已存在的前序任务，避免任务永久卡在 waiting_deps
-    const dependsOn = (params.dependsOn || []).map(id => id.trim()).filter(Boolean);
+    // depends_on 已由 orchestration-executor.normalizeStringArray 完成边界验证和 trim
+    const dependsOn = params.dependsOn || [];
     for (const depId of dependsOn) {
       if (depId === params.taskId) {
         throw new Error(`任务 ${params.taskId} 不能依赖自身`);

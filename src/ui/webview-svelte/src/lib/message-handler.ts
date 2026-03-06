@@ -40,7 +40,7 @@ import {
   clearProcessingState,
   sealAllStreamingMessages,
 } from '../stores/messages.svelte';
-import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, SubTaskItem, Edit, ModelStatusMap } from '../types/message';
+import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, SubTaskItem, Edit, ModelStatusMap, ActivePlanState, PlanLedgerRecord } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
 import { MessageType, MessageCategory } from '../../../../protocol/message-protocol';
 import { routeStandardMessage, getMessageTarget, clearMessageTargets, clearMessageTarget, setMessageTarget } from './message-router';
@@ -184,6 +184,7 @@ const SESSION_LIFECYCLE_DATA_TYPES = new Set<string>([
   'sessionLoaded',
   'sessionSwitched',
   'sessionMessagesLoaded',
+  'planLedgerLoaded',
   'sessionsUpdated',
 ]);
 
@@ -287,7 +288,6 @@ function resolvePendingInteractionsOnAutoMode(): void {
     store.pendingToolAuthorization
     || store.pendingConfirmation
     || store.pendingRecovery
-    || store.pendingQuestion
     || store.pendingClarification
     || store.pendingWorkerQuestion
   );
@@ -305,14 +305,10 @@ function resolvePendingInteractionsOnAutoMode(): void {
   }
 
   if (store.pendingRecovery) {
-    const decision: 'retry' | 'rollback' | 'continue' = store.pendingRecovery.canRetry
+    const decision: 'retry' | 'continue' = store.pendingRecovery.canRetry
       ? 'retry'
-      : (store.pendingRecovery.canRollback ? 'rollback' : 'continue');
+      : 'continue';
     vscode.postMessage({ type: 'confirmRecovery', decision });
-  }
-
-  if (store.pendingQuestion) {
-    vscode.postMessage({ type: 'answerQuestions', answer: null });
   }
 
   if (store.pendingClarification) {
@@ -1600,16 +1596,17 @@ function handleUnifiedData(standard: StandardMessage) {
       }));
       break;
 
+    case 'planLedgerLoaded':
+    case 'planLedgerUpdated':
+      applyPlanLedgerSnapshot(payload);
+      break;
+
     case 'confirmationRequest':
       handleConfirmationRequest(asMessage(payload));
       break;
 
     case 'recoveryRequest':
       handleRecoveryRequest(asMessage(payload));
-      break;
-
-    case 'questionRequest':
-      handleQuestionRequest(asMessage(payload));
       break;
 
     case 'clarificationRequest':
@@ -1699,6 +1696,45 @@ function handleSessionsUpdated(message: WebviewMessage) {
   }
 }
 
+function applyPlanLedgerSnapshot(payload: Record<string, unknown>) {
+  const store = getState();
+  const incomingSessionId = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : '';
+  const currentSessionId = store.currentSessionId?.trim() || '';
+  if (incomingSessionId && currentSessionId && incomingSessionId !== currentSessionId) {
+    console.warn('[MessageHandler] 忽略非当前会话的计划账本快照', {
+      incomingSessionId,
+      currentSessionId,
+    });
+    return;
+  }
+
+  const rawActivePlan = payload.activePlan;
+  const normalizedActivePlan: ActivePlanState | null = (
+    rawActivePlan
+    && typeof rawActivePlan === 'object'
+    && typeof (rawActivePlan as ActivePlanState).planId === 'string'
+    && typeof (rawActivePlan as ActivePlanState).formattedPlan === 'string'
+    && typeof (rawActivePlan as ActivePlanState).updatedAt === 'number'
+  )
+    ? (rawActivePlan as ActivePlanState)
+    : null;
+
+  const normalizedPlanHistory = ensureArray(payload.plans)
+    .filter((plan): plan is PlanLedgerRecord => {
+      if (!plan || typeof plan !== 'object') return false;
+      const candidate = plan as PlanLedgerRecord;
+      return typeof candidate.planId === 'string' && typeof candidate.sessionId === 'string';
+    });
+
+  const currentState = (store.appState || {}) as AppState;
+  const nextState: AppState = {
+    ...currentState,
+    activePlan: normalizedActivePlan,
+    planHistory: normalizedPlanHistory,
+  };
+  setAppState(nextState);
+}
+
 function handleSessionChanged(message: WebviewMessage) {
   // 获取新的 sessionId
   const newSessionId = message.sessionId as string || (message.session as Session)?.id;
@@ -1714,6 +1750,13 @@ function handleSessionChanged(message: WebviewMessage) {
       clearAllRequestBindings();
       clearPendingStreamUpdateBuffer();
       resetEventSeqTracking();
+
+      const currentState = (store.appState || {}) as AppState;
+      setAppState({
+        ...currentState,
+        activePlan: null,
+        planHistory: [],
+      });
     }
 
     setCurrentSessionId(newSessionId);
@@ -1829,11 +1872,10 @@ function handleRecoveryRequest(message: WebviewMessage) {
   const store = getState();
   if (store.appState?.interactionMode === 'auto') {
     const canRetry = Boolean(message.canRetry);
-    const canRollback = Boolean(message.canRollback);
-    const decision: 'retry' | 'rollback' | 'continue' = canRetry
+    const decision: 'retry' | 'continue' = canRetry
       ? 'retry'
-      : (canRollback ? 'rollback' : 'continue');
-    addToast('info', `自动处理恢复请求：已选择${decision === 'retry' ? '重试' : decision === 'rollback' ? '回滚' : '继续'}`);
+      : 'continue';
+    addToast('info', `自动处理恢复请求：已选择${decision === 'retry' ? '重试' : '继续'}`);
     vscode.postMessage({ type: 'confirmRecovery', decision });
     setIsProcessing(true);
     return;
@@ -1843,21 +1885,6 @@ function handleRecoveryRequest(message: WebviewMessage) {
     error: message.error,
     canRetry: Boolean(message.canRetry),
     canRollback: Boolean(message.canRollback),
-  };
-  setIsProcessing(false);
-}
-
-function handleQuestionRequest(message: WebviewMessage) {
-  const store = getState();
-  if (store.appState?.interactionMode === 'auto') {
-    addToast('info', '自动处理提问：未提供答案，按默认策略继续');
-    vscode.postMessage({ type: 'answerQuestions', answer: null });
-    setIsProcessing(true);
-    return;
-  }
-  store.pendingQuestion = {
-    questions: ensureArray<string>(message.questions),
-    plan: message.plan,
   };
   setIsProcessing(false);
 }
@@ -2208,9 +2235,10 @@ function mapStandardMessage(standard: StandardMessage): Message {
 
   const dispatchToWorker = Boolean(baseMetadata.dispatchToWorker);
 
-  // role 字段仅用于系统消息，用户消息通过 type 判断
+  // 根据消息类型正确映射 role：用户输入消息 → 'user'，系统通知 → 'system'，其余 → 'assistant'
   const resolvedRole: 'user' | 'assistant' | 'system' =
-    isSystemNotice ? 'system' : 'assistant';
+    isSystemNotice ? 'system'
+    : (standard.type === MessageType.USER_INPUT ? 'user' : 'assistant');
 
   // 直接传递 MessageType，UI 层使用 type === 'user_input' 判断用户消息
   const resolvedType = standard.type as import('../types/message').MessageType;

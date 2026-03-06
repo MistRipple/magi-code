@@ -34,6 +34,8 @@ import { ProfileLoader } from '../orchestrator/profile/profile-loader';
 import { ADAPTER_EVENTS } from '../protocol/event-names';
 import { EnvironmentContextProvider } from '../context/environment-context-provider';
 import { WorkspaceFolderInfo } from '../workspace/workspace-roots';
+import { isModelOriginIssue, toSurfacedModelCauseError } from '../errors/model-origin';
+import { trackModelOriginEvent } from '../errors/model-origin-observability';
 
 /**
  * LLM 适配器工厂
@@ -47,6 +49,9 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   private mcpExecutorBindings = new Set<string>();
   private profileLoader: ProfileLoader;
   private connectionPromises = new Map<AgentType, Promise<void>>();
+  private modelAnomalyStreak = new Map<AgentType, number>();
+  private readonly modelRecoveryMaxAttempts = 2;
+  private readonly modelAnomalyEscalateThreshold = 3;
 
   /**
    * 🔧 环境上下文提供者（单一真相来源）
@@ -454,13 +459,15 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     try {
       await this.ensureConnected(agent, adapter);
     } catch (error: any) {
+      const normalized = this.normalizeErrorMessage(error);
+      const surfaced = this.toSurfacedModelError(normalized);
       if (typeof (adapter as any).setDecisionHook === 'function') {
         (adapter as any).setDecisionHook(undefined);
       }
       return {
         content: '',
         done: false,
-        error: error instanceof Error ? error.message : String(error),
+        error: surfaced,
       };
     }
 
@@ -520,11 +527,17 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
 
     const isWorker = agent !== 'orchestrator';
     const retryDelays = [10000, 20000, 30000];
+    let modelRecoveryAttempts = 0;
+    let lastModelRecoveryError = '';
 
     try {
       for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
         try {
           const { content, tokenUsage, orchestratorRuntime } = await sendOnce();
+          if (modelRecoveryAttempts > 0) {
+            trackModelOriginEvent('recovered', `adapter:${agent}`, lastModelRecoveryError || '模型异常自动恢复');
+          }
+          this.resetModelAnomalyStreak(agent);
           return {
             content,
             done: true,
@@ -533,27 +546,77 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
           };
         } catch (error: any) {
           const errorMessage = this.normalizeErrorMessage(error);
-          if (!isWorker) {
+          if (this.isRecoverableModelAnomaly(errorMessage)) {
+            lastModelRecoveryError = errorMessage;
+            trackModelOriginEvent('detected', `adapter:${agent}`, errorMessage, {
+              recoveryAttempt: modelRecoveryAttempts + 1,
+            });
+            const nextRecoveryAttempt = modelRecoveryAttempts + 1;
+            if (
+              nextRecoveryAttempt <= this.modelRecoveryMaxAttempts
+              && this.injectModelRecoveryHint(adapter, agent, errorMessage, nextRecoveryAttempt)
+            ) {
+              modelRecoveryAttempts = nextRecoveryAttempt;
+              logger.warn('模型异常自动恢复重试', {
+                agent,
+                recoveryAttempt: modelRecoveryAttempts,
+                maxRecoveryAttempts: this.modelRecoveryMaxAttempts,
+                error: this.summarizeModelError(errorMessage),
+              }, LogCategory.LLM);
+              continue;
+            }
+
+            const consecutive = this.bumpModelAnomalyStreak(agent);
+            const summarized = this.summarizeModelError(errorMessage);
+            const normalizedModelError = consecutive >= this.modelAnomalyEscalateThreshold
+              ? `模型连续异常 ${consecutive} 次，已停止自动重试。最后错误：${summarized}`
+              : `模型输出异常，已自动重试 ${modelRecoveryAttempts} 次仍未恢复。错误：${summarized}`;
             return {
               content: '',
               done: false,
-              error: errorMessage,
+              error: (() => {
+                const surfaced = this.toSurfacedModelError(normalizedModelError);
+                trackModelOriginEvent('escalated', `adapter:${agent}`, surfaced, {
+                  consecutive,
+                  recoveryAttempts: modelRecoveryAttempts,
+                });
+                return surfaced;
+              })(),
+            };
+          }
+
+          this.resetModelAnomalyStreak(agent);
+          const surfacedError = this.toSurfacedModelError(errorMessage);
+          if (!isWorker) {
+            if (isModelOriginIssue(surfacedError)) {
+              trackModelOriginEvent('surfaced', `adapter:${agent}`, surfacedError);
+            }
+            return {
+              content: '',
+              done: false,
+              error: surfacedError,
             };
           }
 
           if (this.isAuthOrQuotaError(error)) {
+            if (isModelOriginIssue(surfacedError)) {
+              trackModelOriginEvent('surfaced', `adapter:${agent}`, surfacedError);
+            }
             return {
               content: '',
               done: false,
-              error: errorMessage,
+              error: surfacedError,
             };
           }
 
           if (!this.isConnectionError(error) || attempt === retryDelays.length) {
+            if (isModelOriginIssue(surfacedError)) {
+              trackModelOriginEvent('surfaced', `adapter:${agent}`, surfacedError);
+            }
             return {
               content: '',
               done: false,
-              error: errorMessage,
+              error: surfacedError,
             };
           }
 
@@ -637,6 +700,84 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     if (error instanceof Error && error.message) return error.message;
     if (error?.message) return String(error.message);
     return String(error);
+  }
+
+  private toSurfacedModelError(errorMessage: string): string {
+    return toSurfacedModelCauseError(errorMessage);
+  }
+
+  private isRecoverableModelAnomaly(errorMessage: string): boolean {
+    if (!errorMessage) {
+      return false;
+    }
+    const normalized = errorMessage.trim();
+    const lower = normalized.toLowerCase();
+
+    if (normalized.includes('LLM 响应为空')) {
+      return true;
+    }
+    if (normalized.includes('Error during LLM edit generation')) {
+      return true;
+    }
+    if (normalized.includes('model returned non-string content')) {
+      return true;
+    }
+    if (lower.includes('tool parameter parse failed') || lower.includes('工具参数解析失败')) {
+      return true;
+    }
+
+    const hasAnalysisHeading = /\*\*\s*Analyzing\b/i.test(normalized);
+    const hasFirstPersonReasoning = /\bI need to\b|\bI should\b|\bI still need\b|\bI must\b/i.test(normalized);
+    if ((hasAnalysisHeading || hasFirstPersonReasoning) && normalized.length >= 120) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private summarizeModelError(errorMessage: string): string {
+    const firstLine = errorMessage
+      .split('\n')
+      .map(line => line.trim())
+      .find(Boolean) || errorMessage.trim();
+    return firstLine.length > 220 ? `${firstLine.slice(0, 220)}...` : firstLine;
+  }
+
+  private injectModelRecoveryHint(
+    adapter: BaseLLMAdapter,
+    agent: AgentType,
+    errorMessage: string,
+    recoveryAttempt: number,
+  ): boolean {
+    const summarized = this.summarizeModelError(errorMessage);
+    const hint = `[System] 上一轮输出异常（${summarized}）。请保持当前任务目标不变，并严格遵守：` +
+      `1) 不输出元分析/自我思考过程；2) 必须按工具协议返回可执行结果；3) 若需补充信息先明确提出。` +
+      `当前自动恢复重试：第 ${recoveryAttempt} 次。`;
+
+    if (adapter instanceof OrchestratorLLMAdapter) {
+      adapter.addSystemMessage(hint);
+      return true;
+    }
+    if (adapter instanceof WorkerLLMAdapter) {
+      adapter.addSystemMessage(hint);
+      return true;
+    }
+
+    logger.warn('模型异常自动恢复：适配器不支持注入恢复提示', {
+      agent,
+      adapterType: adapter.constructor?.name,
+    }, LogCategory.LLM);
+    return false;
+  }
+
+  private resetModelAnomalyStreak(agent: AgentType): void {
+    this.modelAnomalyStreak.set(agent, 0);
+  }
+
+  private bumpModelAnomalyStreak(agent: AgentType): number {
+    const next = (this.modelAnomalyStreak.get(agent) || 0) + 1;
+    this.modelAnomalyStreak.set(agent, next);
+    return next;
   }
 
   private sleep(ms: number): Promise<void> {

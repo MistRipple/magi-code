@@ -480,6 +480,7 @@ export class SnapshotManager {
   /** 创建文件快照（Mission 版本） */
   createSnapshotForMission(
     filePath: string,
+    sessionId: string,
     missionId: string,
     assignmentId: string,
     todoId: string,
@@ -489,7 +490,11 @@ export class SnapshotManager {
     if (!filePath || typeof filePath !== 'string' || filePath.trim().length === 0) {
       throw new Error('Snapshot filePath is required');
     }
-    const session = this.sessionManager.getCurrentSession();
+    if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+      throw new Error('Snapshot sessionId is required');
+    }
+    const normalizedSessionId = sessionId.trim();
+    const session = this.sessionManager.getSession(normalizedSessionId);
     if (!session) return null;
 
     const absolutePath = path.isAbsolute(filePath)

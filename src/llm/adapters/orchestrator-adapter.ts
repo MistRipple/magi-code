@@ -214,12 +214,12 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         streamId = this.startStreamWithContext();
       }
       messageId = streamId;
-      let fullResponse = '';
+      let streamedResponse = '';
 
       // 流式调用 LLM
       const response = await this.client.streamMessage(params, (chunk) => {
         if (chunk.type === 'content_delta' && chunk.content) {
-          fullResponse += chunk.content;
+          streamedResponse += chunk.content;
           this.normalizer.processTextDelta(streamId, chunk.content);
           this.emit('message', chunk.content);
         } else if (chunk.type === 'thinking' && chunk.thinking) {
@@ -228,12 +228,18 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         }
       });
       this.recordTokenUsage(response.usage);
+      const finalResponse = streamedResponse || response.content || '';
+      if (finalResponse && !streamedResponse) {
+        // 兜底：部分 provider 仅在最终响应体返回文本，未逐块回调 content_delta。
+        this.normalizer.processTextDelta(streamId, finalResponse);
+        this.emit('message', finalResponse);
+      }
 
       // 用户可见请求才会写入编排历史，内部 system 请求不写入
       if (!silent) {
         this.conversationHistory.push({
           role: 'assistant',
-          content: fullResponse,
+          content: finalResponse,
         });
       }
 
@@ -245,11 +251,11 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       };
 
       // 🔧 如果流式传输完成但没有内容，抛出明确错误而非静默返回空
-      if (!fullResponse.trim()) {
-        throw new Error('LLM 响应为空：流式传输完成但未收到有效内容');
+      if (!finalResponse.trim()) {
+        throw new Error(`LLM 响应为空：流式传输完成但未收到有效内容 [orchestrator/${this.config.model}/${this.config.provider}]`);
       }
 
-      return fullResponse;
+      return finalResponse;
     } catch (error: any) {
       // abort 中断不视为错误
       if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
@@ -600,6 +606,8 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
 
     try {
       let finalText = '';
+      let lastNonEmptyAssistantText = '';
+      let totalToolResultCount = 0;
       let consecutiveFailures = 0;
       let totalFailures = 0;
       let loopRounds = 0;
@@ -678,6 +686,9 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           }
 
           const assistantText = accumulatedText || response.content || '';
+          if (assistantText.trim()) {
+            lastNonEmptyAssistantText = assistantText;
+          }
           if (assistantText && !hasStreamedTextDelta) {
             // 兜底：部分 provider 可能仅在最终响应体返回文本，未逐块回调 content_delta。
             this.normalizer.processTextDelta(streamId, assistantText);
@@ -689,7 +700,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               this.emit('message', assistantText);
             }
             history.push({ role: 'assistant', content: assistantText });
-            finalText = assistantText;
+            finalText = assistantText.trim() ? assistantText : (finalText || lastNonEmptyAssistantText);
             this.normalizer.endStream(streamId);
             terminationReason = 'completed';
             break;
@@ -724,6 +735,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           history.push({ role: 'assistant', content: assistantContent });
 
           const toolResults = await this.executeToolCalls(toolCalls);
+          totalToolResultCount += toolResults.length;
 
           // 中断检查：工具执行完成后立即检测 abort，跳过后续处理直接退出循环
           if (this.abortController?.signal.aborted) {
@@ -825,7 +837,21 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
 
       // abort 中断时不要求必须有内容
       if (!finalText.trim() && !this.abortController?.signal.aborted) {
-        throw new Error('LLM 响应为空：流式传输完成但未收到有效内容');
+        if (lastNonEmptyAssistantText.trim()) {
+          finalText = lastNonEmptyAssistantText;
+          logger.warn('orchestrator 最终轮空文本，回退到最近有效输出', {
+            loopRounds,
+            totalToolResultCount,
+          }, LogCategory.LLM);
+        } else if (totalToolResultCount > 0) {
+          finalText = '工具执行已完成，但模型未返回最终文本总结。请查看上方工具执行结果。';
+          logger.warn('orchestrator 无最终文本，使用工具结果降级总结', {
+            loopRounds,
+            totalToolResultCount,
+          }, LogCategory.LLM);
+        } else {
+          throw new Error(`LLM 响应为空：流式传输完成但未收到有效内容 [orchestrator/${this.config.model}/${this.config.provider}]`);
+        }
       }
       this.lastRuntimeState = {
         reason: terminationReason,

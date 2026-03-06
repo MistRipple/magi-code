@@ -664,13 +664,11 @@ export class OrchestrationExecutor {
       return { ok: false, error: `${fieldName} 必须是字符串数组` };
     }
 
+    // 容错：过滤非字符串元素（LLM 可能混入 null/number），不因个别脏元素拒绝整批任务
     const normalized = raw
-      .map(item => typeof item === 'string' ? item.trim() : '')
+      .filter((item): item is string => typeof item === 'string')
+      .map(item => item.trim())
       .filter(Boolean);
-
-    if (normalized.length !== raw.length) {
-      return { ok: false, error: `${fieldName} 数组中存在空值或非字符串项` };
-    }
 
     if (required && normalized.length === 0) {
       return { ok: false, error: `${fieldName} 不能为空数组` };
