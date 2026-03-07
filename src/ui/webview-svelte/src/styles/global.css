@@ -10,7 +10,7 @@
      ========================================== */
 
   /* 基础颜色 - VS Code 主题适配 (自动适配浅色/深色) */
-  --background: var(--vscode-editor-background);
+  --background: var(--vscode-sideBar-secondaryBackground, var(--vscode-sideBar-background));
   --foreground: var(--vscode-editor-foreground);
   --foreground-muted: var(--vscode-descriptionForeground);
   --border: var(--vscode-panel-border, var(--vscode-widget-border));
@@ -70,13 +70,20 @@
      2. 间距系统 (Spacing System) - 4px 基础网格
      ========================================== */
   --space-0: 0;
-  --space-1: 2px;    /* 微小间距: 文字与图标 */
-  --space-2: 4px;    /* 紧凑间距: 相关元素 */
-  --space-3: 8px;    /* 小间距: 组件内部 */
-  --space-4: 12px;   /* 中等间距: 组件边距 */
-  --space-5: 16px;   /* 大间距: 区域边距 */
-  --space-6: 24px;   /* 特大间距: 区块间距 */
-  --space-8: 32px;   /* 版块间距 */
+  --space-1: 2px;
+  /* 微小间距: 文字与图标 */
+  --space-2: 4px;
+  /* 紧凑间距: 相关元素 */
+  --space-3: 8px;
+  /* 小间距: 组件内部 */
+  --space-4: 12px;
+  /* 中等间距: 组件边距 */
+  --space-5: 16px;
+  /* 大间距: 区域边距 */
+  --space-6: 24px;
+  /* 特大间距: 区块间距 */
+  --space-8: 32px;
+  /* 版块间距 */
 
   /* 语义化别名 */
   --spacing-xs: var(--space-2);
@@ -94,13 +101,20 @@
   --font-mono: var(--vscode-editor-font-family, 'Fira Code', Consolas, 'Courier New', monospace);
 
   /* 字体大小 */
-  --text-2xs: 10px;  /* 极小: 时间戳 */
-  --text-xs: 11px;   /* 辅助: 徽章、提示 */
-  --text-sm: 12px;   /* 次要: 描述文字 */
-  --text-base: 13px; /* 基础: 正文 */
-  --text-md: 14px;   /* 中等: 列表标题 */
-  --text-lg: 16px;   /* 标题: 区块标题 */
-  --text-xl: 18px;   /* 大标题: 面板标题 */
+  --text-2xs: 10px;
+  /* 极小: 时间戳 */
+  --text-xs: 11px;
+  /* 辅助: 徽章、提示 */
+  --text-sm: 12px;
+  /* 次要: 描述文字 */
+  --text-base: 13px;
+  /* 基础: 正文 */
+  --text-md: 14px;
+  /* 中等: 列表标题 */
+  --text-lg: 16px;
+  /* 标题: 区块标题 */
+  --text-xl: 18px;
+  /* 大标题: 面板标题 */
 
   /* 语义化别名 */
   --font-size: var(--text-base);
@@ -122,13 +136,20 @@
      4. 圆角系统 (Border Radius)
      ========================================== */
   --radius-none: 0;
-  --radius-xs: 2px;   /* 微小元素 */
-  --radius-sm: 4px;   /* 按钮、输入框 */
-  --radius-md: 6px;   /* 卡片、下拉框 */
-  --radius-lg: 8px;   /* 大卡片 */
-  --radius-xl: 12px;  /* 模态框 */
-  --radius-2xl: 16px; /* 特大卡片 */
-  --radius-full: 9999px; /* 圆形、胶囊 */
+  --radius-xs: 2px;
+  /* 微小元素 */
+  --radius-sm: 4px;
+  /* 按钮、输入框 */
+  --radius-md: 6px;
+  /* 卡片、下拉框 */
+  --radius-lg: 8px;
+  /* 大卡片 */
+  --radius-xl: 12px;
+  /* 模态框 */
+  --radius-2xl: 16px;
+  /* 特大卡片 */
+  --radius-full: 9999px;
+  /* 圆形、胶囊 */
 
   /* ==========================================
      5. 组件尺寸系统 (Component Sizing)
@@ -233,7 +254,8 @@ body {
   width: 100%;
   display: flex;
   flex-direction: column;
-  overflow: hidden; /* 页面级滚动防护：与 html/body 双重保险 */
+  overflow: hidden;
+  /* 页面级滚动防护：与 html/body 双重保险 */
 }
 
 /* 滚动条样式 — 精致细窄风格 */
@@ -535,9 +557,18 @@ pre code {
   line-height: 1;
 }
 
-.badge--success { background: var(--success); }
-.badge--warning { background: var(--warning); color: var(--vscode-button-foreground, white); }
-.badge--error { background: var(--error); }
+.badge--success {
+  background: var(--success);
+}
+
+.badge--warning {
+  background: var(--warning);
+  color: var(--vscode-button-foreground, white);
+}
+
+.badge--error {
+  background: var(--error);
+}
 
 .chip {
   display: inline-flex;
@@ -567,10 +598,21 @@ pre code {
   flex-shrink: 0;
 }
 
-.status-dot--success { background: var(--success); }
-.status-dot--warning { background: var(--warning); }
-.status-dot--error { background: var(--error); }
-.status-dot--info { background: var(--info); }
+.status-dot--success {
+  background: var(--success);
+}
+
+.status-dot--warning {
+  background: var(--warning);
+}
+
+.status-dot--error {
+  background: var(--error);
+}
+
+.status-dot--info {
+  background: var(--info);
+}
 
 /* ------------------------------------------
    空状态 (Empty State)
@@ -691,8 +733,13 @@ pre code {
 }
 
 @keyframes fadeIn {
-  from { opacity: 0; }
-  to { opacity: 1; }
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
 }
 
 .modal-dialog {
@@ -710,8 +757,15 @@ pre code {
 }
 
 @keyframes slideUp {
-  from { opacity: 0; transform: translateY(16px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .modal-header {
@@ -827,14 +881,37 @@ pre code {
 /* ------------------------------------------
    工具类 (Utility Classes)
    ------------------------------------------ */
-.text-muted { color: var(--foreground-muted); }
-.text-success { color: var(--success); }
-.text-warning { color: var(--warning); }
-.text-error { color: var(--error); }
-.text-sm { font-size: var(--text-sm); }
-.text-xs { font-size: var(--text-xs); }
-.font-medium { font-weight: var(--font-medium); }
-.font-semibold { font-weight: var(--font-semibold); }
+.text-muted {
+  color: var(--foreground-muted);
+}
+
+.text-success {
+  color: var(--success);
+}
+
+.text-warning {
+  color: var(--warning);
+}
+
+.text-error {
+  color: var(--error);
+}
+
+.text-sm {
+  font-size: var(--text-sm);
+}
+
+.text-xs {
+  font-size: var(--text-xs);
+}
+
+.font-medium {
+  font-weight: var(--font-medium);
+}
+
+.font-semibold {
+  font-weight: var(--font-semibold);
+}
 
 .truncate {
   overflow: hidden;
@@ -862,40 +939,68 @@ pre code {
 .hljs-keyword,
 .hljs-selector-tag,
 .hljs-built_in,
-.hljs-type { color: var(--vscode-debugTokenExpression-name, #569cd6); }
+.hljs-type {
+  color: var(--vscode-debugTokenExpression-name, #569cd6);
+}
 
 .hljs-string,
 .hljs-template-variable,
-.hljs-addition { color: var(--vscode-debugTokenExpression-string, #ce9178); }
+.hljs-addition {
+  color: var(--vscode-debugTokenExpression-string, #ce9178);
+}
 
 .hljs-comment,
-.hljs-quote { color: var(--vscode-descriptionForeground, #6a9955); font-style: italic; }
+.hljs-quote {
+  color: var(--vscode-descriptionForeground, #6a9955);
+  font-style: italic;
+}
 
 .hljs-number,
 .hljs-literal,
-.hljs-variable.constant_ { color: var(--vscode-debugTokenExpression-number, #b5cea8); }
+.hljs-variable.constant_ {
+  color: var(--vscode-debugTokenExpression-number, #b5cea8);
+}
 
 .hljs-title,
 .hljs-title.class_,
-.hljs-title.function_ { color: var(--vscode-symbolIcon-functionForeground, #dcdcaa); }
+.hljs-title.function_ {
+  color: var(--vscode-symbolIcon-functionForeground, #dcdcaa);
+}
 
 .hljs-attr,
-.hljs-attribute { color: var(--vscode-symbolIcon-propertyForeground, #9cdcfe); }
+.hljs-attribute {
+  color: var(--vscode-symbolIcon-propertyForeground, #9cdcfe);
+}
 
 .hljs-regexp,
-.hljs-link { color: #d16969; }
+.hljs-link {
+  color: #d16969;
+}
 
 .hljs-meta,
-.hljs-meta .hljs-keyword { color: #c586c0; }
+.hljs-meta .hljs-keyword {
+  color: #c586c0;
+}
 
 .hljs-tag,
 .hljs-name,
 .hljs-selector-class,
-.hljs-selector-id { color: #569cd6; }
+.hljs-selector-id {
+  color: #569cd6;
+}
 
-.hljs-params { color: var(--vscode-editor-foreground, #d4d4d4); }
+.hljs-params {
+  color: var(--vscode-editor-foreground, #d4d4d4);
+}
 
-.hljs-deletion { color: var(--error, #ef4444); }
+.hljs-deletion {
+  color: var(--error, #ef4444);
+}
 
-.hljs-emphasis { font-style: italic; }
-.hljs-strong { font-weight: bold; }
+.hljs-emphasis {
+  font-style: italic;
+}
+
+.hljs-strong {
+  font-weight: bold;
+}
