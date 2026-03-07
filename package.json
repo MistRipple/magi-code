@@ -259,6 +259,7 @@
     "verify:e2e:knowledge-learning": "node scripts/e2e-knowledge-learning-regression.cjs",
     "verify:e2e:model-error-governance": "node scripts/e2e-model-error-governance.cjs",
     "verify:e2e:model-error-matrix": "node scripts/e2e-model-error-scenario-matrix.cjs",
+    "verify:e2e:network-resilience": "node scripts/e2e-network-resilience-regression.cjs",
     "verify:e2e:session-isolation": "node scripts/e2e-session-isolation-regression.cjs",
     "verify:e2e:mode-governance": "node scripts/e2e-mode-governance-regression.cjs",
     "verify:e2e:plan-ledger-lifecycle": "node scripts/e2e-plan-ledger-lifecycle.cjs",
