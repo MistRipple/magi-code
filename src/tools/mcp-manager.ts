@@ -9,6 +9,7 @@ import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { logger, LogCategory } from '../logging';
 import { MCPServerConfig } from './types';
+import { fetchWithRetry } from './network-utils';
 
 /**
  * MCP 工具信息
@@ -220,6 +221,20 @@ export class MCPManager {
     );
   }
 
+  private mergeHeaders(
+    baseHeaders?: HeadersInit,
+    extraHeaders?: Record<string, string>,
+  ): Headers | undefined {
+    if (!baseHeaders && !extraHeaders) {
+      return undefined;
+    }
+    const merged = new Headers(baseHeaders);
+    for (const [key, value] of Object.entries(extraHeaders || {})) {
+      merged.set(key, value);
+    }
+    return merged;
+  }
+
   private getServerName(serverId: string): string {
     return this.serverStates.get(serverId)?.name
       || this.serverConfigs.get(serverId)?.name
@@ -250,16 +265,31 @@ export class MCPManager {
     if (!config.url) {
       throw new Error('MCP server url is required for sse type');
     }
+    const connectTimeoutMs = Number(process.env.MCP_SSE_CONNECT_TIMEOUT_MS || 15000);
+    const connectRetryAttempts = Math.max(1, Number(process.env.MCP_SSE_CONNECT_RETRIES || 2));
     const sseOpts: any = {};
     if (config.headers) {
       sseOpts.requestInit = { headers: config.headers };
-      sseOpts.eventSourceInit = {
-        fetch: (url: string | URL, init?: RequestInit) => fetch(url, {
-          ...init,
-          headers: { ...(init?.headers as Record<string, string>), ...config.headers },
-        }),
-      };
     }
+    sseOpts.eventSourceInit = {
+      fetch: async (url: string | URL, init?: RequestInit) => {
+        const mergedHeaders = this.mergeHeaders(init?.headers, config.headers);
+        try {
+          return await fetchWithRetry(url, {
+            ...init,
+            headers: mergedHeaders,
+          }, {
+            timeoutMs: connectTimeoutMs,
+            attempts: connectRetryAttempts,
+            signal: init?.signal ?? undefined,
+          });
+        } catch (error) {
+          const endpoint = typeof url === 'string' ? url : url.toString();
+          const errorMessage = this.toErrorMessage(error);
+          throw new Error(`[MCP_SSE_FETCH] ${errorMessage}; url=${endpoint}`);
+        }
+      },
+    };
     return new SSEClientTransport(new URL(config.url), sseOpts);
   }
 
@@ -267,10 +297,32 @@ export class MCPManager {
     if (!config.url) {
       throw new Error('MCP server url is required for streamable-http type');
     }
+    const requestTimeoutMs = Number(process.env.MCP_STREAMABLE_HTTP_TIMEOUT_MS || 15000);
+    const idempotentRetryAttempts = Math.max(1, Number(process.env.MCP_STREAMABLE_HTTP_RETRIES || 2));
     const httpOpts: any = {};
     if (config.headers) {
       httpOpts.requestInit = { headers: config.headers };
     }
+    httpOpts.fetch = async (url: string | URL, init?: RequestInit) => {
+      const method = (init?.method || 'GET').toUpperCase();
+      const isIdempotentMethod = method === 'GET' || method === 'HEAD' || method === 'OPTIONS';
+      const attempts = isIdempotentMethod ? idempotentRetryAttempts : 1;
+      const mergedHeaders = this.mergeHeaders(init?.headers, config.headers);
+      try {
+        return await fetchWithRetry(url, {
+          ...init,
+          headers: mergedHeaders,
+        }, {
+          timeoutMs: requestTimeoutMs,
+          attempts,
+          signal: init?.signal ?? undefined,
+        });
+      } catch (error) {
+        const endpoint = typeof url === 'string' ? url : url.toString();
+        const errorMessage = this.toErrorMessage(error);
+        throw new Error(`[MCP_STREAMABLE_FETCH] ${errorMessage}; method=${method}; url=${endpoint}`);
+      }
+    };
     return new StreamableHTTPClientTransport(new URL(config.url), httpOpts);
   }
 

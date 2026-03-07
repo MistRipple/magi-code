@@ -9,6 +9,7 @@
 
 import type { CustomToolExecutorConfig, ToolDefinition } from './skills-manager';
 import { logger, LogCategory } from '../logging';
+import { fetchWithRetry, isRetryableNetworkError, toErrorMessage } from './network-utils';
 
 class HttpRequestError extends Error {
   constructor(
@@ -61,7 +62,8 @@ export class SkillRepositoryManager {
   private cache: Map<string, SkillInfo[]> = new Map();
   private cacheExpiry: Map<string, number> = new Map();
   private readonly CACHE_TTL = 5 * 60 * 1000; // 5 分钟
-  private readonly REQUEST_TIMEOUT = 5000; // 5 秒超时
+  private readonly REQUEST_TIMEOUT = 8000; // 8 秒超时
+  private readonly REQUEST_RETRIES = 3;
   private readonly MAX_CONCURRENT = 3; // 最大并发仓库数
 
   private async fetchJSON(url: string): Promise<any> {
@@ -94,24 +96,28 @@ export class SkillRepositoryManager {
   }
 
   private async fetchRaw(url: string, accept: string = '*/*'): Promise<Response> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.REQUEST_TIMEOUT);
     try {
-      return await fetch(url, {
+      return await fetchWithRetry(url, {
         method: 'GET',
         headers: {
           'Accept': accept,
           'User-Agent': 'Magi-SkillManager/1.0',
         },
-        signal: controller.signal,
+      }, {
+        timeoutMs: this.REQUEST_TIMEOUT,
+        attempts: this.REQUEST_RETRIES,
+        retryOnStatuses: [429, 500, 502, 503, 504],
       });
     } catch (error: any) {
-      if (error?.name === 'AbortError') {
+      const message = toErrorMessage(error);
+      const lower = message.toLowerCase();
+      if (error?.name === 'AbortError' || lower.includes('timeout') || lower.includes('timed out')) {
         throw new Error(`Request timeout: ${url}`);
       }
+      if (isRetryableNetworkError(message)) {
+        throw new Error(`Network request failed: ${url}; ${message}`);
+      }
       throw error;
-    } finally {
-      clearTimeout(timeout);
     }
   }
 

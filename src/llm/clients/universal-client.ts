@@ -18,6 +18,7 @@ import {
   sanitizeToolOrder,
 } from '../types';
 import { logger, LogCategory } from '../../logging';
+import { fetchWithRetry, isRetryableNetworkError, toErrorMessage } from '../../tools/network-utils';
 
 class NonRetryableError extends Error {
   constructor(message: string, public originalError?: unknown) {
@@ -90,13 +91,16 @@ export class UniversalLLMClient extends BaseLLMClient {
       }
       modelsUrl += '/models';
 
-      const response = await fetch(modelsUrl, {
+      const response = await fetchWithRetry(modelsUrl, {
         method: 'GET',
         headers: {
           'Authorization': `Bearer ${this.config.apiKey}`,
           'Content-Type': 'application/json',
         },
-        signal: AbortSignal.timeout(5000), // 5 秒超时
+      }, {
+        timeoutMs: 5000,
+        attempts: 2,
+        retryOnStatuses: [429, 500, 502, 503, 504],
       });
 
       if (!response.ok) {
@@ -124,11 +128,12 @@ export class UniversalLLMClient extends BaseLLMClient {
 
       return { success: true, modelExists };
     } catch (error: any) {
-      const message = error.message || String(error);
-      if (message.includes('timeout') || message.includes('TimeoutError')) {
+      const message = toErrorMessage(error);
+      const lowerMessage = message.toLowerCase();
+      if (lowerMessage.includes('timeout') || lowerMessage.includes('timed out')) {
         return { success: false, error: '连接超时' };
       }
-      if (message.includes('ECONNREFUSED') || message.includes('ENOTFOUND')) {
+      if (isRetryableNetworkError(message)) {
         return { success: false, error: '网络连接失败' };
       }
       logger.error('Fast connection test failed', { error: message }, LogCategory.LLM);

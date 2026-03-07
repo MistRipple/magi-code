@@ -8,8 +8,34 @@
 import { ToolExecutor, ExtendedToolDefinition } from './types';
 import { ToolCall, ToolResult } from '../llm/types';
 import { logger, LogCategory } from '../logging';
+import {
+  fetchWithRetry,
+  isRetryableNetworkError,
+  toErrorMessage,
+} from './network-utils';
 
 const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const WEB_SEARCH_TIMEOUT_MS = 15000;
+const WEB_FETCH_TIMEOUT_MS = 30000;
+const WEB_SEARCH_MAX_RETRIES = 2;
+const WEB_FETCH_MAX_RETRIES = 2;
+const WEB_DIRECT_FALLBACK_MAX_RETRIES = 2;
+const WEB_SEARCH_PROVIDERS = [
+  {
+    name: 'duckduckgo-html',
+    buildUrl: (query: string) => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+  },
+  {
+    name: 'duckduckgo-main-html',
+    buildUrl: (query: string) => `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+  },
+] as const;
+
+type SearchAttemptDiagnostic = {
+  provider: string;
+  status?: number;
+  error?: string;
+};
 
 /**
  * Web 执行器
@@ -165,61 +191,193 @@ Tips:
 
     logger.info('Web search', { query }, LogCategory.TOOLS);
 
+    const diagnostics: SearchAttemptDiagnostic[] = [];
+    for (const provider of WEB_SEARCH_PROVIDERS) {
+      const results = await this.trySearchWithProvider(provider.name, provider.buildUrl(query), signal, diagnostics);
+      if (results && results.length > 0) {
+        const formatted = results
+          .slice(0, 10)
+          .map((r, i) => `${i + 1}. **${r.title}**\n   ${r.url}\n   ${r.snippet}`)
+          .join('\n\n');
+
+        return {
+          toolCallId: toolCall.id,
+          content: `Search results for "${query}":\n\n${formatted}`,
+          isError: false
+        };
+      }
+    }
+
+    const directFallback = await this.tryDirectDomainFallback(query, signal);
+    if (directFallback) {
+      return {
+        toolCallId: toolCall.id,
+        content: `Search results for "${query}" (direct fallback):\n\n1. **${directFallback.title}**\n   ${directFallback.url}\n   ${directFallback.snippet}`,
+        isError: false
+      };
+    }
+
+    if (diagnostics.length === 0) {
+      return {
+        toolCallId: toolCall.id,
+        content: `No search results found for "${query}"`,
+        isError: false
+      };
+    }
+
+    const hasNetworkLikeFailure = diagnostics.some(item => item.error ? isRetryableNetworkError(item.error) : false);
+    const detail = diagnostics
+      .map(item => {
+        if (item.status !== undefined) {
+          return `${item.provider}: HTTP ${item.status}`;
+        }
+        return `${item.provider}: ${item.error || 'unknown error'}`;
+      })
+      .join('; ');
+
+    if (hasNetworkLikeFailure) {
+      return {
+        toolCallId: toolCall.id,
+        content: `Search temporarily unavailable due upstream connectivity issues (${detail}). If you already know the target URL, use web_fetch directly.`,
+        isError: true
+      };
+    }
+
+    return {
+      toolCallId: toolCall.id,
+      content: `Search failed: ${detail}`,
+      isError: true
+    };
+  }
+
+  private async trySearchWithProvider(
+    provider: string,
+    searchUrl: string,
+    signal: AbortSignal | undefined,
+    diagnostics: SearchAttemptDiagnostic[],
+  ): Promise<Array<{ title: string; url: string; snippet: string }> | null> {
     try {
-      const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-      const response = await fetch(searchUrl, {
+      const response = await fetchWithRetry(searchUrl, {
         headers: {
           'User-Agent': BROWSER_UA,
           'Accept': 'text/html,application/xhtml+xml',
           'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
         },
         redirect: 'follow',
-        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
+      }, {
+        timeoutMs: WEB_SEARCH_TIMEOUT_MS,
+        attempts: WEB_SEARCH_MAX_RETRIES,
+        signal,
       });
 
       if (!response.ok) {
-        return {
-          toolCallId: toolCall.id,
-          content: `Search failed: HTTP ${response.status}`,
-          isError: true
-        };
+        diagnostics.push({ provider, status: response.status });
+        return null;
       }
 
       const html = await response.text();
       const results = this.parseSearchResults(html);
-
       if (results.length === 0) {
-        return {
-          toolCallId: toolCall.id,
-          content: `No search results found for "${query}"`,
-          isError: false
-        };
+        return [];
       }
-
-      const formatted = results
-        .slice(0, 10)
-        .map((r, i) => `${i + 1}. **${r.title}**\n   ${r.url}\n   ${r.snippet}`)
-        .join('\n\n');
-
-      return {
-        toolCallId: toolCall.id,
-        content: `Search results for "${query}":\n\n${formatted}`,
-        isError: false
-      };
+      return results;
     } catch (error: any) {
-      if (error.name === 'TimeoutError') {
-        return {
-          toolCallId: toolCall.id,
-          content: 'Search timed out (15s). Try a simpler query.',
-          isError: true
-        };
-      }
-      return {
-        toolCallId: toolCall.id,
-        content: `Search error: ${error.message}`,
-        isError: true
-      };
+      diagnostics.push({ provider, error: toErrorMessage(error) });
+      return null;
     }
+  }
+
+  private async tryDirectDomainFallback(
+    query: string,
+    signal: AbortSignal | undefined,
+  ): Promise<{ title: string; url: string; snippet: string } | null> {
+    const urlCandidates = this.extractUrlCandidates(query);
+    for (const candidate of urlCandidates.slice(0, 3)) {
+      try {
+        const response = await fetchWithRetry(candidate, {
+          headers: {
+            'User-Agent': BROWSER_UA,
+            'Accept': 'text/html,application/xhtml+xml,application/json;q=0.8,*/*;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
+          },
+          redirect: 'follow',
+        }, {
+          timeoutMs: 12000,
+          attempts: WEB_DIRECT_FALLBACK_MAX_RETRIES,
+          signal,
+        });
+
+        if (!response.ok) {
+          continue;
+        }
+
+        const contentType = (response.headers.get('content-type') || '').toLowerCase();
+        if (!contentType.includes('text/html') && !contentType.includes('text/plain') && !contentType.includes('application/json')) {
+          continue;
+        }
+
+        const body = await response.text();
+        const title = this.extractTitle(body) || new URL(response.url || candidate).hostname;
+        return {
+          title,
+          url: response.url || candidate,
+          snippet: 'Direct site access succeeded. Search provider may be temporarily unavailable.',
+        };
+      } catch {
+        // direct fallback best-effort
+      }
+    }
+    return null;
+  }
+
+  private extractUrlCandidates(query: string): string[] {
+    const normalized = query.trim();
+    if (!normalized) {
+      return [];
+    }
+
+    const candidates = new Set<string>();
+    const explicitUrlMatches = normalized.match(/https?:\/\/[^\s)]+/gi) || [];
+    for (const match of explicitUrlMatches) {
+      try {
+        const url = new URL(match);
+        candidates.add(url.toString());
+      } catch {
+        // ignore invalid URL fragments
+      }
+    }
+
+    const domainMatches = normalized.match(/\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,24}(?:\/[^\s)]*)?\b/g) || [];
+    for (const domain of domainMatches) {
+      const cleaned = domain.replace(/[.,;:!?]+$/, '');
+      if (!cleaned) {
+        continue;
+      }
+      try {
+        candidates.add(new URL(`https://${cleaned}`).toString());
+      } catch {
+        // ignore invalid domain fragments
+      }
+    }
+
+    return Array.from(candidates);
+  }
+
+  private extractTitle(content: string): string {
+    if (!content) {
+      return '';
+    }
+    const titleMatch = content.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    if (titleMatch && titleMatch[1]) {
+      return this.stripHtmlTags(this.decodeHtml(titleMatch[1])).trim();
+    }
+
+    const h1Match = content.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+    if (h1Match && h1Match[1]) {
+      return this.stripHtmlTags(this.decodeHtml(h1Match[1])).trim();
+    }
+
+    return '';
   }
 
   /**
@@ -300,14 +458,17 @@ Tips:
     logger.info('Web fetch', { url }, LogCategory.TOOLS);
 
     try {
-      const response = await fetch(url, {
+      const response = await fetchWithRetry(url, {
         headers: {
           'User-Agent': BROWSER_UA,
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7',
           'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
         },
         redirect: 'follow',
-        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30000)]) : AbortSignal.timeout(30000),
+      }, {
+        timeoutMs: WEB_FETCH_TIMEOUT_MS,
+        attempts: WEB_FETCH_MAX_RETRIES,
+        signal,
       });
 
       if (!response.ok) {
@@ -348,7 +509,8 @@ Tips:
         isError: false
       };
     } catch (error: any) {
-      if (error.name === 'TimeoutError') {
+      const errorMessage = toErrorMessage(error);
+      if (error?.name === 'TimeoutError' || /timeout|timed out/i.test(errorMessage)) {
         return {
           toolCallId: toolCall.id,
           content: `Fetch timed out (30s) for ${url}`,
@@ -357,7 +519,7 @@ Tips:
       }
       return {
         toolCallId: toolCall.id,
-        content: `Fetch error: ${error.message}`,
+        content: `Fetch error: ${errorMessage}`,
         isError: true
       };
     }

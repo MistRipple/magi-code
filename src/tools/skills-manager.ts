@@ -8,6 +8,7 @@
 import { logger, LogCategory } from '../logging/unified-logger';
 import { ToolExecutor, ExtendedToolDefinition } from './types';
 import { ToolCall, ToolResult as LLMToolResult } from '../llm/types';
+import { fetchWithRetry, isRetryableNetworkError, toErrorMessage } from './network-utils';
 
 /**
  * 工具定义接口
@@ -269,8 +270,8 @@ export class SkillsManager implements ToolExecutor {
     const method = (executor.method || 'POST').toUpperCase();
     const headers = executor.headers ? { ...executor.headers } : {};
     const timeoutMs = executor.timeoutMs ?? 15000;
-    const controller = new AbortController();
-    const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+    const isIdempotentMethod = method === 'GET' || method === 'HEAD' || method === 'OPTIONS';
+    const attempts = isIdempotentMethod ? 2 : 1;
 
     try {
       let url = executor.url;
@@ -296,11 +297,13 @@ export class SkillsManager implements ToolExecutor {
         }
       }
 
-      const response = await fetch(url, {
+      const response = await fetchWithRetry(url, {
         method,
         headers,
         body,
-        signal: controller.signal,
+      }, {
+        timeoutMs,
+        attempts,
       });
 
       const contentType = response.headers.get('content-type') || '';
@@ -315,9 +318,9 @@ export class SkillsManager implements ToolExecutor {
 
       return { content, is_error: !response.ok };
     } catch (error: any) {
-      return { content: `Error: ${error.message}`, is_error: true };
-    } finally {
-      clearTimeout(timeoutHandle);
+      const message = toErrorMessage(error);
+      const suffix = isRetryableNetworkError(message) ? ' (network upstream unstable)' : '';
+      return { content: `Error: ${message}${suffix}`, is_error: true };
     }
   }
 

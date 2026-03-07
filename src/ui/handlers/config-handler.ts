@@ -6,6 +6,7 @@
  */
 
 import { logger, LogCategory } from '../../logging';
+import { fetchWithRetry, isRetryableNetworkError, toErrorMessage } from '../../tools/network-utils';
 import type { WebviewToExtensionMessage, WorkerSlot } from '../../types';
 import type { CommandHandler, CommandHandlerContext } from './types';
 
@@ -402,13 +403,16 @@ export class ConfigCommandHandler implements CommandHandler {
       }
       modelsUrl += '/models';
 
-      const response = await fetch(modelsUrl, {
+      const response = await fetchWithRetry(modelsUrl, {
         method: 'GET',
         headers: {
           'Authorization': `Bearer ${config.apiKey}`,
           'Content-Type': 'application/json',
         },
-        signal: AbortSignal.timeout(10000),
+      }, {
+        timeoutMs: 10000,
+        attempts: 2,
+        retryOnStatuses: [429, 500, 502, 503, 504],
       });
 
       if (!response.ok) {
@@ -430,10 +434,11 @@ export class ConfigCommandHandler implements CommandHandler {
       ctx.sendData('modelListFetched', { target, success: true, models });
       ctx.sendToast(`获取到 ${models.length} 个模型`, 'success');
     } catch (error: any) {
-      const errorMessage = error.message || String(error);
+      const errorMessage = toErrorMessage(error);
       let displayError = errorMessage;
-      if (errorMessage.includes('timeout') || errorMessage.includes('TimeoutError')) displayError = '连接超时';
-      else if (errorMessage.includes('ECONNREFUSED') || errorMessage.includes('ENOTFOUND')) displayError = '网络连接失败';
+      const lower = errorMessage.toLowerCase();
+      if (lower.includes('timeout') || lower.includes('timed out')) displayError = '连接超时';
+      else if (isRetryableNetworkError(errorMessage)) displayError = '网络连接失败';
 
       logger.error('获取模型列表失败', { target, error: errorMessage }, LogCategory.LLM);
       ctx.sendData('modelListFetched', { target, success: false, models: [], error: displayError });
