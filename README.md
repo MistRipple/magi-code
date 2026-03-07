@@ -1,5 +1,7 @@
 <div align="center">
 
+[English](README_EN.md) | 中文文档
+
 # 🔮 Magi
 
 **新一代多智能体工程编排系统**

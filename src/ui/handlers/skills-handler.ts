@@ -5,6 +5,9 @@
  * 职责：Skills 配置 CRUD + 自定义工具管理 + 仓库管理 + Skill 安装。
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
+import * as vscode from 'vscode';
 import { logger, LogCategory } from '../../logging';
 import type { WebviewToExtensionMessage } from '../../types';
 import { applySkillInstall } from '../../tools/skill-installation';
@@ -15,6 +18,7 @@ type Msg<T extends string> = Extract<WebviewToExtensionMessage, { type: T }>;
 const SUPPORTED = new Set([
   'loadSkillsConfig', 'saveSkillsConfig',
   'addCustomTool', 'removeCustomTool', 'removeInstructionSkill', 'installSkill',
+  'installLocalSkill',
   'updateSkill', 'updateAllSkills',
   'loadRepositories', 'addRepository', 'updateRepository', 'deleteRepository',
   'refreshRepository', 'loadSkillLibrary',
@@ -42,6 +46,9 @@ export class SkillsCommandHandler implements CommandHandler {
         break;
       case 'installSkill':
         await this.handleInstallSkill(message as Msg<'installSkill'>, ctx);
+        break;
+      case 'installLocalSkill':
+        await this.handleInstallLocalSkill(ctx);
         break;
       case 'updateSkill':
         await this.handleUpdateSkill(message as Msg<'updateSkill'>, ctx);
@@ -179,7 +186,210 @@ export class SkillsCommandHandler implements CommandHandler {
       logger.info('Skill 已安装', { skillId: message.skillId, name: skill.name }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('安装 Skill 失败', { skillId: message.skillId, error: error.message }, LogCategory.TOOLS);
+      ctx.sendData('skillInstallFailed', { skillId: message.skillId, error: error.message, source: 'repository' });
       ctx.sendToast(`安装 Skill 失败: ${error.message}`, 'error');
+    }
+  }
+
+  private parseSkillMarkdown(content: string): { meta: Record<string, any>; body: string } {
+    const trimmed = content.trim();
+    if (!trimmed.startsWith('---')) {
+      return { meta: {}, body: content.trim() };
+    }
+
+    const lines = trimmed.split('\n');
+    const metaLines: string[] = [];
+    let i = 1;
+    for (; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (line === '---') {
+        i++;
+        break;
+      }
+      metaLines.push(lines[i]);
+    }
+
+    const meta: Record<string, any> = {};
+    let currentKey: string | null = null;
+
+    for (const line of metaLines) {
+      const trimmedLine = line.trim();
+      if (!trimmedLine) continue;
+
+      if (trimmedLine.startsWith('- ') && currentKey) {
+        if (!Array.isArray(meta[currentKey])) {
+          meta[currentKey] = [];
+        }
+        const listValue = trimmedLine.slice(2).trim().replace(/^['"]|['"]$/g, '');
+        meta[currentKey].push(listValue);
+        continue;
+      }
+
+      const match = trimmedLine.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
+      if (!match) continue;
+
+      const key = match[1];
+      let value: any = match[2].trim();
+      if (value === '') {
+        meta[key] = [];
+      } else if (value === 'true' || value === 'false') {
+        meta[key] = value === 'true';
+      } else {
+        value = value.replace(/^['"]|['"]$/g, '');
+        meta[key] = value;
+      }
+      currentKey = key;
+    }
+
+    const body = lines.slice(i).join('\n').trim();
+    return { meta, body };
+  }
+
+  private toBoolean(value: unknown, defaultValue: boolean): boolean {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      const lower = value.trim().toLowerCase();
+      if (lower === 'true') return true;
+      if (lower === 'false') return false;
+    }
+    return defaultValue;
+  }
+
+  private toStringArray(value: unknown): string[] | undefined {
+    const normalizeItem = (item: string): string => item.trim().replace(/^['"]|['"]$/g, '').trim();
+
+    if (Array.isArray(value)) {
+      const items = value.map((item) => normalizeItem(String(item))).filter(Boolean);
+      return items.length > 0 ? items : undefined;
+    }
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      const rawItems = trimmed.startsWith('[') && trimmed.endsWith(']')
+        ? trimmed.slice(1, -1).split(',')
+        : trimmed.split(',');
+      const items = rawItems.map((item) => normalizeItem(item)).filter(Boolean);
+      return items.length > 0 ? items : undefined;
+    }
+    return undefined;
+  }
+
+  private normalizeSkillSlug(rawName: string): string {
+    const trimmed = rawName.trim().toLowerCase();
+    const replaced = trimmed.replace(/\s+/g, '-').replace(/[^a-z0-9._-]/g, '-');
+    return replaced.replace(/-+/g, '-').replace(/^[-_.]+|[-_.]+$/g, '');
+  }
+
+  private shortHash(input: string): string {
+    let hash = 2166136261;
+    for (let i = 0; i < input.length; i++) {
+      hash ^= input.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16).padStart(8, '0').slice(0, 8);
+  }
+
+  private buildLocalSkillName(rawName: string, filePath: string): string {
+    const slug = this.normalizeSkillSlug(rawName);
+    const safe = slug || `skill-${this.shortHash(`${rawName}|${filePath}`)}`;
+    return `local/${safe}`;
+  }
+
+  private extractDescription(body: string): string {
+    const lines = body.split('\n').map((line) => line.trim()).filter(Boolean);
+    for (const line of lines) {
+      if (line.startsWith('#')) {
+        const title = line.replace(/^#+\s*/, '').trim();
+        if (title) return title;
+        continue;
+      }
+      return line.length > 120 ? `${line.slice(0, 120)}...` : line;
+    }
+    return 'Local instruction skill';
+  }
+
+  private async handleInstallLocalSkill(ctx: CommandHandlerContext): Promise<void> {
+    const selection = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectFolders: false,
+      canSelectMany: false,
+      openLabel: '导入 Skill',
+      filters: {
+        Markdown: ['md'],
+      },
+    });
+
+    if (!selection || selection.length === 0) {
+      ctx.sendData('skillInstallFailed', { source: 'local', canceled: true });
+      return;
+    }
+
+    const fileUri = selection[0];
+
+    try {
+      const content = fs.readFileSync(fileUri.fsPath, 'utf-8');
+      const { meta, body } = this.parseSkillMarkdown(content);
+      const instruction = body.trim();
+      if (!instruction) {
+        throw new Error('SKILL.md 内容为空');
+      }
+
+      const fileBaseName = path.basename(fileUri.fsPath, path.extname(fileUri.fsPath));
+      const rawName = String(meta.name || fileBaseName || 'local-skill');
+      const normalizedName = this.buildLocalSkillName(rawName, fileUri.fsPath);
+      const description = String(meta.description || this.extractDescription(instruction));
+      const version = meta.version ? String(meta.version) : undefined;
+      const allowedTools = this.toStringArray(meta['allowed-tools'] ?? meta.allowedTools ?? meta.allowed_tools);
+      const disableModelInvocation = this.toBoolean(
+        meta['disable-model-invocation'] ?? meta.disableModelInvocation ?? meta.disable_model_invocation,
+        false,
+      );
+      const userInvocable = this.toBoolean(
+        meta['user-invocable'] ?? meta.userInvocable ?? meta.user_invocable,
+        true,
+      );
+      const argumentHint = meta['argument-hint'] || meta.argumentHint || meta.argument_hint
+        ? String(meta['argument-hint'] || meta.argumentHint || meta.argument_hint)
+        : undefined;
+
+      const localSkill = {
+        id: normalizedName,
+        name: normalizedName,
+        fullName: normalizedName,
+        description,
+        version,
+        repositoryId: 'local',
+        repositoryName: 'Local Skills',
+        skillType: 'instruction' as const,
+        instruction,
+        allowedTools,
+        disableModelInvocation,
+        userInvocable,
+        argumentHint,
+      };
+
+      const { LLMConfigLoader } = await import('../../llm/config');
+      const repositories = LLMConfigLoader.loadRepositories();
+      const config = LLMConfigLoader.loadSkillsConfig() || { customTools: [], instructionSkills: [], repositories };
+      const updatedConfig = applySkillInstall(config, localSkill as any);
+      Object.assign(config, updatedConfig);
+      LLMConfigLoader.saveSkillsConfig(config);
+
+      ctx.sendData('skillInstalled', { skillId: normalizedName, skill: localSkill, source: 'local' });
+      ctx.sendToast(`本地 Skill "${normalizedName}" 已安装`, 'success');
+      await this.handleLoadSkillsConfig(ctx);
+      await this.reloadSkills(ctx, 'installLocalSkill');
+      logger.info('本地 Skill 已安装', {
+        filePath: fileUri.fsPath,
+        skillName: normalizedName,
+      }, LogCategory.TOOLS);
+    } catch (error: any) {
+      const message = error?.message || String(error);
+      logger.error('本地 Skill 安装失败', {
+        filePath: fileUri.fsPath,
+        error: message,
+      }, LogCategory.TOOLS);
+      ctx.sendData('skillInstallFailed', { source: 'local', filePath: fileUri.fsPath, error: message });
+      ctx.sendToast(`本地 Skill 安装失败: ${message}`, 'error');
     }
   }
 
@@ -344,7 +554,7 @@ export class SkillsCommandHandler implements CommandHandler {
 
       const repositories = LLMConfigLoader.loadRepositories();
       const manager = new SkillRepositoryManager();
-      const skills = await manager.getAllSkills(repositories);
+      const { skills, failedRepositories } = await manager.getAllSkillsWithReport(repositories);
 
       const skillsConfig = LLMConfigLoader.loadSkillsConfig();
       const installedSkills = new Set<string>();
@@ -356,10 +566,28 @@ export class SkillsCommandHandler implements CommandHandler {
       }
 
       const skillsWithStatus = skills.map(skill => ({ ...skill, installed: installedSkills.has(skill.fullName) }));
-      ctx.sendData('skillLibraryLoaded', { skills: skillsWithStatus });
+      ctx.sendData('skillLibraryLoaded', {
+        skills: skillsWithStatus,
+        failedRepositories,
+        totalRepositories: repositories.length,
+      });
+
+      if (failedRepositories.length > 0) {
+        const preview = failedRepositories
+          .slice(0, 2)
+          .map((repo) => repo.repositoryId)
+          .join(', ');
+        const suffix = failedRepositories.length > 2 ? '...' : '';
+        ctx.sendToast(
+          `有 ${failedRepositories.length} 个仓库加载失败：${preview}${suffix}`,
+          'warning',
+        );
+      }
+
       logger.info('Skill library loaded', {
         totalSkills: skillsWithStatus.length,
         installedCount: skillsWithStatus.filter(s => s.installed).length,
+        failedRepositories: failedRepositories.length,
       }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('Failed to load skill library', { error: error.message, stack: error.stack }, LogCategory.TOOLS);

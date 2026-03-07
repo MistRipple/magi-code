@@ -30,6 +30,12 @@ export interface RepositoryConfig {
   type?: 'json' | 'github';  // 仓库类型：json（直接 JSON 文件）或 github（GitHub 仓库）
 }
 
+export interface RepositoryFetchFailure {
+  repositoryId: string;
+  url: string;
+  error: string;
+}
+
 /**
  * Skill 信息
  */
@@ -300,10 +306,74 @@ export class SkillRepositoryManager {
       const data = await this.fetchJSON(url);
       return Array.isArray(data) ? data : null;
     } catch (error: any) {
-      if (error instanceof HttpRequestError && (error.status === 404 || error.status === 403 || error.status === 429)) {
-        return null;
+      if (error instanceof HttpRequestError) {
+        if (error.status === 404) {
+          return null;
+        }
+        // GitHub API 限流时降级到网页目录解析，避免仓库被静默丢失
+        if (error.status === 403 || error.status === 429) {
+          return await this.listRepoDirViaHtml(owner, repo, dirPath);
+        }
       }
       throw error;
+    }
+  }
+
+  private async listRepoDirViaHtml(owner: string, repo: string, dirPath: string): Promise<any[] | null> {
+    const normalizedDirPath = dirPath.replace(/^\/+|\/+$/g, '');
+    if (!normalizedDirPath) {
+      return null;
+    }
+    const encodedDirPath = normalizedDirPath
+      .split('/')
+      .filter(Boolean)
+      .map((segment) => encodeURIComponent(segment))
+      .join('/');
+    const treeUrl = `https://github.com/${owner}/${repo}/tree/HEAD/${encodedDirPath}`;
+
+    try {
+      const html = await this.fetchText(treeUrl);
+      const entries = new Map<string, { name: string; type: 'dir' | 'file' }>();
+      const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const entryPattern = new RegExp(
+        `^/${escapeRegex(owner)}/${escapeRegex(repo)}/(tree|blob)/[^/]+/${escapeRegex(encodedDirPath)}/([^/?#]+)$`
+      );
+
+      const hrefRegex = /href="([^"]+)"/g;
+      let match: RegExpExecArray | null;
+      while ((match = hrefRegex.exec(html)) !== null) {
+        const href = match[1];
+        const entryMatch = href.match(entryPattern);
+        if (!entryMatch) {
+          continue;
+        }
+        const type = entryMatch[1] === 'tree' ? 'dir' : 'file';
+        const remainder = entryMatch[2];
+        if (!remainder) {
+          continue;
+        }
+
+        const cleanName = decodeURIComponent(remainder).trim();
+        if (!cleanName) {
+          continue;
+        }
+        if (!entries.has(cleanName)) {
+          entries.set(cleanName, { name: cleanName, type });
+        }
+      }
+
+      return entries.size > 0 ? Array.from(entries.values()) : null;
+    } catch (error: any) {
+      if (error instanceof HttpRequestError && error.status === 404) {
+        return null;
+      }
+      logger.warn('Failed to list repo directory via HTML fallback', {
+        owner,
+        repo,
+        dirPath,
+        error: error?.message || String(error),
+      }, LogCategory.TOOLS);
+      return null;
     }
   }
 
@@ -603,9 +673,37 @@ export class SkillRepositoryManager {
       )
     );
 
-    const skills = skillResults.filter((s): s is SkillInfo => s !== null);
-    if (skills.length > 0) {
-      return { name: repo, skills };
+    const topLevelSkills = skillResults.filter((s): s is SkillInfo => s !== null);
+    if (topLevelSkills.length > 0) {
+      return { name: repo, skills: topLevelSkills };
+    }
+
+    // 兼容 anthropics/skills 这类嵌套目录结构：skills/.curated/<skill>/SKILL.md
+    const nestedSkillPaths: string[] = [];
+    for (const topLevelDir of skillDirs) {
+      const nestedDirPath = `skills/${topLevelDir.name}`;
+      const nestedEntries = await this.listRepoDir(owner, repo, nestedDirPath);
+      if (!nestedEntries || nestedEntries.length === 0) {
+        continue;
+      }
+      nestedEntries
+        .filter((entry: any) => entry.type === 'dir')
+        .forEach((entry: any) => nestedSkillPaths.push(`${nestedDirPath}/${entry.name}`));
+    }
+
+    if (nestedSkillPaths.length === 0) {
+      return null;
+    }
+
+    const nestedSkillResults = await Promise.all(
+      nestedSkillPaths.map((skillPath) =>
+        this.fetchSkillFromDirectory(owner, repo, repositoryId, repo, skillPath)
+      )
+    );
+
+    const nestedSkills = nestedSkillResults.filter((s): s is SkillInfo => s !== null);
+    if (nestedSkills.length > 0) {
+      return { name: repo, skills: nestedSkills };
     }
 
     return null;
@@ -776,11 +874,19 @@ export class SkillRepositoryManager {
    * 获取所有仓库的 Skills（受控并发，避免过多请求）
    */
   async getAllSkills(repositories: RepositoryConfig[]): Promise<SkillInfo[]> {
+    const { skills } = await this.getAllSkillsWithReport(repositories);
+    return skills;
+  }
+
+  async getAllSkillsWithReport(
+    repositories: RepositoryConfig[]
+  ): Promise<{ skills: SkillInfo[]; failedRepositories: RepositoryFetchFailure[] }> {
     logger.info('Fetching skills from repositories', {
       totalRepos: repositories.length
     }, LogCategory.TOOLS);
 
-    const allSkills: SkillInfo[] = [];
+    const skills: SkillInfo[] = [];
+    const failedRepositories: RepositoryFetchFailure[] = [];
 
     // 分批处理，每批最多 MAX_CONCURRENT 个
     for (let i = 0; i < repositories.length; i += this.MAX_CONCURRENT) {
@@ -792,23 +898,33 @@ export class SkillRepositoryManager {
       results.forEach((result, index) => {
         const repoIndex = i + index;
         if (result.status === 'fulfilled') {
-          allSkills.push(...result.value);
+          skills.push(...result.value);
           logger.debug('Repository fetched successfully', {
             repositoryId: repositories[repoIndex].id,
             skillCount: result.value.length
           }, LogCategory.TOOLS);
         } else {
+          const failedRepo = repositories[repoIndex];
+          const errorMessage = result.reason?.message || String(result.reason);
+          failedRepositories.push({
+            repositoryId: failedRepo.id,
+            url: failedRepo.url,
+            error: errorMessage,
+          });
           logger.warn('Failed to fetch repository', {
             repositoryId: repositories[repoIndex].id,
-            error: result.reason?.message || result.reason
+            error: errorMessage
           }, LogCategory.TOOLS);
         }
       });
     }
 
-    logger.info('All skills fetched', { totalSkills: allSkills.length }, LogCategory.TOOLS);
+    logger.info('All skills fetched', {
+      totalSkills: skills.length,
+      failedRepos: failedRepositories.length,
+    }, LogCategory.TOOLS);
 
-    return allSkills;
+    return { skills, failedRepositories };
   }
 
   /**

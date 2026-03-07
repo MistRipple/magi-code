@@ -150,6 +150,7 @@ export type DataMessageType =
   | 'sessionSwitched'
   | 'sessionsUpdated'
   | 'skillInstalled'
+  | 'skillInstallFailed'
   | 'skillUpdated'
   | 'allSkillsUpdated'
   | 'skillLibraryLoaded'

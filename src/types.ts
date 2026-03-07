@@ -537,6 +537,7 @@ export type WebviewToExtensionMessage =
   | { type: 'removeCustomTool'; toolName: string }
   | { type: 'removeInstructionSkill'; skillName: string }
   | { type: 'installSkill'; skillId: string }
+  | { type: 'installLocalSkill' }
   | { type: 'updateSkill'; skillName: string }
   | { type: 'updateAllSkills' }
   // Skills 仓库相关

@@ -1,5 +1,7 @@
 <div align="center">
 
+[中文文档](README.md) | English
+
 # 🔮 Magi
 
 **Next-Gen Multi-Agent Engineering Orchestration System**

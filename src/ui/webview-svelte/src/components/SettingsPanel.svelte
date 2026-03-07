@@ -279,6 +279,8 @@
   // Skill 库对话框
   let showSkillLibraryDialogState = $state(false);
   let skillLibraryLoading = $state(false); // Skill 库加载状态
+  let localSkillInstalling = $state(false);
+  let skillLibraryFailedRepositories = $state<Array<{ repositoryId: string; url?: string; error?: string }>>([]);
 
   // 通用确认对话框状态
   let showConfirmDialog = $state(false);
@@ -981,6 +983,7 @@
     showSkillLibraryDialogState = true;
     skillSearchQuery = '';
     skillLibraryLoading = true; // 设置加载状态
+    skillLibraryFailedRepositories = [];
     vscode.postMessage({ type: 'loadSkillLibrary' });
   }
 
@@ -988,6 +991,8 @@
     showSkillLibraryDialogState = false;
     skillSearchQuery = '';
     skillLibraryLoading = false;
+    localSkillInstalling = false;
+    skillLibraryFailedRepositories = [];
   }
 
   function installSkill(skillFullName: string) {
@@ -997,6 +1002,14 @@
 
     vscode.postMessage({ type: 'installSkill', skillId: skillFullName });
     // 状态清除由 skillInstalled 消息回调处理
+  }
+
+  function installLocalSkill() {
+    if (localSkillInstalling) {
+      return;
+    }
+    localSkillInstalling = true;
+    vscode.postMessage({ type: 'installLocalSkill' });
   }
 
   // 删除 Skill
@@ -1400,6 +1413,7 @@
       // Skill 库加载
       else if (dataType === 'skillLibraryLoaded') {
         const skillsList = ensureArray<any>(payload?.skills);
+        const failedRepos = ensureArray<any>(payload?.failedRepositories);
         librarySkills = skillsList.map((s: any) => ({
           name: s.name,
           fullName: s.fullName || s.name,
@@ -1413,6 +1427,11 @@
           installed: s.installed || false,
           icon: s.icon
         }));
+        skillLibraryFailedRepositories = failedRepos.map((repo: any) => ({
+          repositoryId: String(repo.repositoryId || ''),
+          url: repo.url ? String(repo.url) : undefined,
+          error: repo.error ? String(repo.error) : undefined,
+        })).filter((repo: any) => repo.repositoryId);
         skillLibraryLoading = false; // 清除加载状态
       }
       // Skill 安装成功
@@ -1422,9 +1441,18 @@
           installingSkills.delete(payload.skillId);
           installingSkills = new Set(installingSkills);
         }
+        localSkillInstalling = false;
         vscode.postMessage({ type: 'loadSkillsConfig' });
         vscode.postMessage({ type: 'loadSkillLibrary' });
         showSkillLibraryDialogState = false;
+      }
+      // Skill 安装失败
+      else if (dataType === 'skillInstallFailed') {
+        if (payload?.skillId) {
+          installingSkills.delete(payload.skillId);
+          installingSkills = new Set(installingSkills);
+        }
+        localSkillInstalling = false;
       }
       // 自定义工具添加成功
       else if (dataType === 'customToolAdded') {
@@ -2408,9 +2436,37 @@
       </div>
       <div class="modal-body">
         <div class="skill-library-search">
-          <input type="text" placeholder="搜索 Skill..." bind:value={skillSearchQuery}>
+          <div class="skill-library-search-row">
+            <input type="text" placeholder="搜索 Skill..." bind:value={skillSearchQuery}>
+            <button class="settings-btn secondary skill-library-import-btn" onclick={installLocalSkill} disabled={localSkillInstalling}>
+              {#if localSkillInstalling}
+                <Icon name="refresh" size={14} />
+                导入中...
+              {:else}
+                <Icon name="plus" size={14} />
+                本地导入
+              {/if}
+            </button>
+          </div>
         </div>
         <div class="skill-library-list">
+          {#if skillLibraryFailedRepositories.length > 0}
+            <div class="skill-library-warning">
+              <div class="skill-library-warning-title">
+                有 {skillLibraryFailedRepositories.length} 个仓库加载失败
+              </div>
+              <div class="skill-library-warning-list">
+                {#each skillLibraryFailedRepositories as repo}
+                  <div class="skill-library-warning-item">
+                    <strong>{repo.repositoryId}</strong>
+                    {#if repo.error}
+                      <span>：{repo.error}</span>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
           {#if skillLibraryLoading}
             <div class="loading-state">
               <Icon name="refresh" size={32} />
@@ -3606,6 +3662,18 @@
 
   /* Skill 库 */
   .skill-library-search { margin-bottom: var(--space-4); flex-shrink: 0; }
+  .skill-library-search-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: var(--space-3);
+    align-items: center;
+  }
+  .skill-library-import-btn {
+    height: var(--btn-height-lg);
+    min-width: 112px;
+    padding: 0 var(--space-3);
+    white-space: nowrap;
+  }
   .skill-library-search input {
     width: 100%;
     height: var(--btn-height-lg);
@@ -3624,6 +3692,29 @@
   .skill-library-search input:focus {
     border-color: var(--primary);
     box-shadow: 0 0 0 3px rgba(var(--primary-rgb, 99, 102, 241), 0.15);
+  }
+  .skill-library-warning {
+    margin-bottom: var(--space-3);
+    padding: var(--space-3);
+    border: 1px solid var(--warning);
+    background: color-mix(in srgb, var(--warning) 10%, var(--surface-1));
+    border-radius: var(--radius-md);
+  }
+  .skill-library-warning-title {
+    font-size: var(--text-sm);
+    font-weight: var(--font-semibold);
+    color: var(--warning);
+    margin-bottom: var(--space-2);
+  }
+  .skill-library-warning-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+  .skill-library-warning-item {
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    word-break: break-all;
   }
   .skill-library-list { flex: 1; min-height: 0; overflow-y: auto; }
   .skill-library-list::-webkit-scrollbar { width: 6px; }

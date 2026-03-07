@@ -13,6 +13,11 @@
     },
     {
       "type": "npm",
+      "script": "vscode:prepublish",
+      "label": "npm: build extension+webview"
+    },
+    {
+      "type": "npm",
       "script": "watch",
       "problemMatcher": "$tsc-watch",
       "label": "npm: watch",
@@ -20,4 +25,3 @@
     }
   ]
 }
-
