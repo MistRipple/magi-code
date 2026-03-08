@@ -34,6 +34,41 @@ export type PlanTodoStatus =
   | 'blocked'
   | 'cancelled';
 
+export type PlanAttemptScope = 'orchestrator' | 'assignment' | 'todo';
+
+export type PlanAttemptStatus =
+  | 'created'
+  | 'inflight'
+  | 'succeeded'
+  | 'failed'
+  | 'timeout'
+  | 'cancelled';
+
+export type PlanAttemptTerminalStatus = Extract<
+  PlanAttemptStatus,
+  'succeeded' | 'failed' | 'timeout' | 'cancelled'
+>;
+
+export type PlanAttemptMetadataValue = string | number | boolean | null;
+
+export interface PlanAttemptRecord {
+  attemptId: string;
+  scope: PlanAttemptScope;
+  targetId: string;
+  assignmentId?: string;
+  todoId?: string;
+  sequence: number;
+  status: PlanAttemptStatus;
+  reason?: string;
+  error?: string;
+  evidenceIds: string[];
+  metadata?: Record<string, PlanAttemptMetadataValue>;
+  createdAt: number;
+  startedAt?: number;
+  endedAt?: number;
+  updatedAt: number;
+}
+
 export interface PlanReview {
   status: 'approved' | 'rejected' | 'skipped';
   reviewer?: string;
@@ -83,6 +118,7 @@ export interface PlanRecord {
   review?: PlanReview;
   formattedPlan?: string;
   items: PlanItem[];
+  attempts: PlanAttemptRecord[];
   links: PlanLinks;
   createdAt: number;
   updatedAt: number;
@@ -126,8 +162,22 @@ export interface DispatchPlanItemInput {
   requiresModification?: boolean;
 }
 
+export interface PlanAttemptStartInput {
+  scope: PlanAttemptScope;
+  targetId?: string;
+  assignmentId?: string;
+  todoId?: string;
+  reason?: string;
+  metadata?: Record<string, PlanAttemptMetadataValue>;
+}
+
+export interface PlanAttemptCompleteInput extends PlanAttemptStartInput {
+  status: PlanAttemptTerminalStatus;
+  error?: string;
+  evidenceIds?: string[];
+}
+
 export interface PlanLedgerSnapshot {
   activePlan: PlanRecord | null;
   plans: PlanRecord[];
 }
-

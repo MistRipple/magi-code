@@ -140,6 +140,8 @@ export interface TodoExecuteOptions {
   imagePaths?: string[];
   /** Pipeline 预组装的共享上下文（避免 Worker 重复调用 contextAssembler.assemble） */
   preAssembledContext?: AssembledContext;
+  /** 心跳间隔（毫秒），默认 10000 */
+  heartbeatIntervalMs?: number;
 }
 
 /**
@@ -402,14 +404,26 @@ export class AutonomousWorker extends EventEmitter {
     const maxReviewRounds = reviewPolicy.maxReviewRounds;
     let reviewRound = 0;
     let currentTodo = this.getNextExecutableTodo(assignment);
+    let heartbeatTodoId = currentTodo?.id;
+    const heartbeatIntervalMs = Math.max(1000, options.heartbeatIntervalMs || 10_000);
+    const emitHeartbeat = () => {
+      this.emit('assignmentHeartbeat', {
+        assignmentId: assignment.id,
+        sessionId: session.id,
+        timestamp: Date.now(),
+        todoId: heartbeatTodoId,
+      });
+    };
+    const heartbeatTimer = setInterval(emitHeartbeat, heartbeatIntervalMs);
+    emitHeartbeat();
 
     logger.info('Worker.验收策略.已应用', {
       assignmentId: assignment.id,
       mode: reviewPolicy.mode,
       maxReviewRounds,
     }, LogCategory.ORCHESTRATOR);
-
-    while (currentTodo && !aborted) {
+    try {
+      while (currentTodo && !aborted) {
       // 取消信号检查（每次迭代入口）
       if (options.cancellationToken?.isCancelled) {
         aborted = true;
@@ -679,171 +693,174 @@ export class AutonomousWorker extends EventEmitter {
         }, LogCategory.ORCHESTRATOR);
       }
 
-      // 获取下一个可执行的 Todo
-      currentTodo = this.getNextExecutableTodo(assignment);
+        // 获取下一个可执行的 Todo
+        currentTodo = this.getNextExecutableTodo(assignment);
+        heartbeatTodoId = currentTodo?.id;
 
-      // 验收检查：当所有 todo 执行完毕，对照验收标准检查已完成工作
-      if (!currentTodo && !aborted && reviewRound < maxReviewRounds
+        // 验收检查：当所有 todo 执行完毕，对照验收标准检查已完成工作
+        if (!currentTodo && !aborted && reviewRound < maxReviewRounds
           && completedTodos.length > 0 && failedTodos.length === 0
           && options.adapterFactory) {
-        verificationAttempted = true;
-        try {
-          const fixTodos = await this.verifyAcceptanceCriteria(
-            assignment, completedTodos, options, reviewRound
-          );
-          if (fixTodos.length > 0) {
-            reviewRound++;
-            currentTodo = this.getNextExecutableTodo(assignment);
+          verificationAttempted = true;
+          try {
+            const fixTodos = await this.verifyAcceptanceCriteria(
+              assignment, completedTodos, options, reviewRound
+            );
+            if (fixTodos.length > 0) {
+              reviewRound++;
+              currentTodo = this.getNextExecutableTodo(assignment);
+              heartbeatTodoId = currentTodo?.id;
+            }
+          } catch (verifyError: any) {
+            const warning = `Acceptance verification round ${reviewRound + 1} error: ${verifyError?.message || String(verifyError)}`;
+            verificationDegraded = true;
+            verificationWarnings.push(warning);
+            logger.warn('Worker.验收检查.降级', {
+              assignmentId: assignment.id,
+              round: reviewRound + 1,
+              warning,
+            }, LogCategory.ORCHESTRATOR);
+            this.emit('verificationDegraded', {
+              assignmentId: assignment.id,
+              warning,
+              round: reviewRound + 1,
+            });
           }
-        } catch (verifyError: any) {
-          const warning = `Acceptance verification round ${reviewRound + 1} error: ${verifyError?.message || String(verifyError)}`;
-          verificationDegraded = true;
-          verificationWarnings.push(warning);
-          logger.warn('Worker.验收检查.降级', {
-            assignmentId: assignment.id,
-            round: reviewRound + 1,
-            warning,
-          }, LogCategory.ORCHESTRATOR);
-          this.emit('verificationDegraded', {
-            assignmentId: assignment.id,
-            warning,
-            round: reviewRound + 1,
-          });
         }
       }
-    }
-
-    // 同步拆分父 Todo 的最终状态（由 TodoManager.tryCompleteParent 自动完成）
-    for (const todo of assignment.todos) {
-      if (todo.status === 'running' && assignment.todos.some(t => t.parentId === todo.id)) {
-        const fresh = await this.todoManager.get(todo.id);
-        if (fresh && fresh.status === 'completed') {
-          todo.status = 'completed';
-          todo.completedAt = fresh.completedAt;
-          todo.output = fresh.output;
-          completedTodos.push(todo);
-        }
-      }
-    }
-
-    // 收集被跳过的 Todo
-    for (const todo of assignment.todos) {
-      if (todo.status === 'skipped' && !skippedTodos.includes(todo)) {
-        skippedTodos.push(todo);
-      }
-    }
-
-    // 检查是否有等待审批的 Todo
-    const hasPendingApprovals = assignment.todos.some(t => t.status === 'pending' && t.approvalStatus === 'pending');
-
-    // 如果被中止，将剩余的 pending Todo 标记为 skipped
-    if (aborted) {
+      // 同步拆分父 Todo 的最终状态（由 TodoManager.tryCompleteParent 自动完成）
       for (const todo of assignment.todos) {
-        if (todo.status === 'pending' && !skippedTodos.includes(todo)) {
-          await this.todoManager.skip(todo.id);
-          todo.status = 'skipped';
-          todo.blockedReason = abortReason || 'Aborted by orchestrator';
+        if (todo.status === 'running' && assignment.todos.some(t => t.parentId === todo.id)) {
+          const fresh = await this.todoManager.get(todo.id);
+          if (fresh && fresh.status === 'completed') {
+            todo.status = 'completed';
+            todo.completedAt = fresh.completedAt;
+            todo.output = fresh.output;
+            completedTodos.push(todo);
+          }
+        }
+      }
+
+      // 收集被跳过的 Todo
+      for (const todo of assignment.todos) {
+        if (todo.status === 'skipped' && !skippedTodos.includes(todo)) {
           skippedTodos.push(todo);
         }
       }
-    }
 
-    const success = completedTodos.length > 0 && failedTodos.length === 0 && !aborted;
-    const resultErrors = aborted && abortSource === 'external'
-      ? [...errors, abortReason || 'Aborted by orchestrator']
-      : errors;
-    const result: AutonomousExecutionResult = {
-      assignment,
-      success,
-      completedTodos,
-      failedTodos,
-      skippedTodos,
-      dynamicTodos,
-      recoveredTodos: [],
-      totalDuration: Date.now() - startTime,
-      errors: resultErrors,
-      recoveryAttempts: session?.stateSnapshot.retryCount || 0,
-      summary: '', // 占位，qualityGate 后由 buildStructuredSummary 填充
-      tokenUsage: totalTokenUsage,
-      sessionId: session?.id,
-      hasPendingApprovals, // 返回 pendingApproval 状态
-      verification: {
-        attempted: verificationAttempted,
-        degraded: verificationDegraded,
-        warnings: verificationWarnings,
-        rounds: reviewRound,
-      },
-    };
-    const qualityCheckedResult = this.applyQualityGate(assignment, result, sharedContext, startTime);
-    qualityCheckedResult.summary = this.buildStructuredSummary(qualityCheckedResult);
+      // 检查是否有等待审批的 Todo
+      const hasPendingApprovals = assignment.todos.some(t => t.status === 'pending' && t.approvalStatus === 'pending');
 
-    // 清理当前 Session 引用
-    this.currentSession = null;
-    this.currentMissionId = undefined;
-    this.resetCacheReadStats();
-
-    // 如果成功，可选择删除 Session；如果失败，保留以便恢复
-    if (qualityCheckedResult.success && session) {
-      // 成功时可以选择保留 Session 一段时间，或者立即删除
-      // 这里保留 Session，让它自然过期
-      logger.debug('Worker.Session.保留', { sessionId: session.id }, LogCategory.ORCHESTRATOR);
-    } else if (!qualityCheckedResult.success && session) {
-      logger.info('Worker.Session.失败保留', {
-        sessionId: session.id,
-        lastError: qualityCheckedResult.errors[0],
-      }, LogCategory.ORCHESTRATOR);
-    }
-
-    // **最终汇报**: 向编排者汇报最终结果
-    if (options.onReport) {
-      const finalResult: WorkerResult = {
-        success: qualityCheckedResult.success,
-        modifiedFiles: [...new Set([
-          ...completedTodos.flatMap(t => t.output?.modifiedFiles || []),
-          ...failedTodos.flatMap(t => t.output?.modifiedFiles || []),
-        ])],
-        createdFiles: [],
-        summary: qualityCheckedResult.summary,
-        totalDuration: qualityCheckedResult.totalDuration,
-        tokenUsage: totalTokenUsage.inputTokens > 0 ? {
-          inputTokens: totalTokenUsage.inputTokens,
-          outputTokens: totalTokenUsage.outputTokens,
-        } : undefined,
-      };
-
-      const finalReport = qualityCheckedResult.success
-        ? createCompletedReport(this.workerType, assignment.id, finalResult)
-        : createFailedReport(this.workerType, assignment.id, qualityCheckedResult.errors[0] || 'Execution failed', finalResult);
-
-      try {
-        await Promise.race([
-          options.onReport(finalReport),
-          new Promise<void>((_, reject) =>
-            setTimeout(
-              () => reject(new Error('Final report timed out')),
-              options.reportTimeout || 5000,
-            ),
-          ),
-        ]);
-      } catch (reportError) {
-        logger.error('Worker.最终汇报失败', { error: reportError instanceof Error ? reportError.message : String(reportError) }, LogCategory.ORCHESTRATOR);
+      // 如果被中止，将剩余的 pending Todo 标记为 skipped
+      if (aborted) {
+        for (const todo of assignment.todos) {
+          if (todo.status === 'pending' && !skippedTodos.includes(todo)) {
+            await this.todoManager.skip(todo.id);
+            todo.status = 'skipped';
+            todo.blockedReason = abortReason || 'Aborted by orchestrator';
+            skippedTodos.push(todo);
+          }
+        }
       }
+
+      const success = completedTodos.length > 0 && failedTodos.length === 0 && !aborted;
+      const resultErrors = aborted && abortSource === 'external'
+        ? [...errors, abortReason || 'Aborted by orchestrator']
+        : errors;
+      const result: AutonomousExecutionResult = {
+        assignment,
+        success,
+        completedTodos,
+        failedTodos,
+        skippedTodos,
+        dynamicTodos,
+        recoveredTodos: [],
+        totalDuration: Date.now() - startTime,
+        errors: resultErrors,
+        recoveryAttempts: session?.stateSnapshot.retryCount || 0,
+        summary: '', // 占位，qualityGate 后由 buildStructuredSummary 填充
+        tokenUsage: totalTokenUsage,
+        sessionId: session?.id,
+        hasPendingApprovals, // 返回 pendingApproval 状态
+        verification: {
+          attempted: verificationAttempted,
+          degraded: verificationDegraded,
+          warnings: verificationWarnings,
+          rounds: reviewRound,
+        },
+      };
+      const qualityCheckedResult = this.applyQualityGate(assignment, result, sharedContext, startTime);
+      qualityCheckedResult.summary = this.buildStructuredSummary(qualityCheckedResult);
+
+      // 清理当前 Session 引用
+      this.currentSession = null;
+      this.currentMissionId = undefined;
+      this.resetCacheReadStats();
+
+      // 如果成功，可选择删除 Session；如果失败，保留以便恢复
+      if (qualityCheckedResult.success && session) {
+        // 成功时可以选择保留 Session 一段时间，或者立即删除
+        // 这里保留 Session，让它自然过期
+        logger.debug('Worker.Session.保留', { sessionId: session.id }, LogCategory.ORCHESTRATOR);
+      } else if (!qualityCheckedResult.success && session) {
+        logger.info('Worker.Session.失败保留', {
+          sessionId: session.id,
+          lastError: qualityCheckedResult.errors[0],
+        }, LogCategory.ORCHESTRATOR);
+      }
+
+      // **最终汇报**: 向编排者汇报最终结果
+      if (options.onReport) {
+        const finalResult: WorkerResult = {
+          success: qualityCheckedResult.success,
+          modifiedFiles: [...new Set([
+            ...completedTodos.flatMap(t => t.output?.modifiedFiles || []),
+            ...failedTodos.flatMap(t => t.output?.modifiedFiles || []),
+          ])],
+          createdFiles: [],
+          summary: qualityCheckedResult.summary,
+          totalDuration: qualityCheckedResult.totalDuration,
+          tokenUsage: totalTokenUsage.inputTokens > 0 ? {
+            inputTokens: totalTokenUsage.inputTokens,
+            outputTokens: totalTokenUsage.outputTokens,
+          } : undefined,
+        };
+
+        const finalReport = qualityCheckedResult.success
+          ? createCompletedReport(this.workerType, assignment.id, finalResult)
+          : createFailedReport(this.workerType, assignment.id, qualityCheckedResult.errors[0] || 'Execution failed', finalResult);
+
+        try {
+          await Promise.race([
+            options.onReport(finalReport),
+            new Promise<void>((_, reject) =>
+              setTimeout(
+                () => reject(new Error('Final report timed out')),
+                options.reportTimeout || 5000,
+              ),
+            ),
+          ]);
+        } catch (reportError) {
+          logger.error('Worker.最终汇报失败', { error: reportError instanceof Error ? reportError.message : String(reportError) }, LogCategory.ORCHESTRATOR);
+        }
+      }
+      this.emit('assignmentCompleted', {
+        assignmentId: assignment.id,
+        success: qualityCheckedResult.success,
+        summary: qualityCheckedResult.summary,
+        result: qualityCheckedResult,
+      });
+      logger.info('Worker.Assignment.完成', {
+        assignmentId: assignment.id,
+        success: qualityCheckedResult.success,
+        completedCount: completedTodos.length,
+        failedCount: failedTodos.length,
+      }, LogCategory.ORCHESTRATOR);
+
+      return qualityCheckedResult;
+    } finally {
+      clearInterval(heartbeatTimer);
     }
-
-    this.emit('assignmentCompleted', {
-      assignmentId: assignment.id,
-      success: qualityCheckedResult.success,
-      summary: qualityCheckedResult.summary,
-      result: qualityCheckedResult,
-    });
-    logger.info('Worker.Assignment.完成', {
-      assignmentId: assignment.id,
-      success: qualityCheckedResult.success,
-      completedCount: completedTodos.length,
-      failedCount: failedTodos.length,
-    }, LogCategory.ORCHESTRATOR);
-
-    return qualityCheckedResult;
   }
 
   /**
@@ -1815,9 +1832,8 @@ Not applicable: The task itself is a single goal — execute it directly.`);
     const sections: string[] = [];
 
     for (const targetPath of selectedPaths) {
-      const absolutePath = path.isAbsolute(targetPath)
-        ? targetPath
-        : path.resolve(workingDirectory, targetPath);
+      const resolvedTarget = await this.resolveTargetPathForContext(targetPath, workingDirectory);
+      const absolutePath = resolvedTarget.absolutePath;
 
       try {
         const fileResult = await this.readFileWithCache(absolutePath);
@@ -1825,13 +1841,17 @@ Not applicable: The task itself is a single goal — execute it directly.`);
           ? fileResult.content
           : this.formatSummary(this.generateFileSummaryFromContent(fileResult.content, absolutePath));
         const sourceLabel = fileResult.fromCache ? 'Cached summary' : 'Live summary';
-        sections.push(`### ${targetPath}\nSource: ${sourceLabel}\n${content}`);
+        const resolveNote = resolvedTarget.matchedByFallback
+          ? `\nResolved from: ${path.relative(workingDirectory, absolutePath)}`
+          : '';
+        sections.push(`### ${targetPath}\nSource: ${sourceLabel}${resolveNote}\n${content}`);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         logger.warn('Worker.目标文件.读取失败', {
           assignmentId: assignment.id,
           workerId: this.workerType,
           targetPath,
+          resolvedPath: absolutePath,
           error: errorMessage,
         }, LogCategory.ORCHESTRATOR);
         sections.push(`### ${targetPath}\nSource: Read failed\n${errorMessage}`);
@@ -1843,6 +1863,83 @@ Not applicable: The task itself is a single goal — execute it directly.`);
     }
 
     return sections.join('\n\n');
+  }
+
+  private async resolveTargetPathForContext(
+    targetPath: string,
+    workingDirectory: string
+  ): Promise<{ absolutePath: string; matchedByFallback: boolean }> {
+    const directPath = path.isAbsolute(targetPath)
+      ? targetPath
+      : path.resolve(workingDirectory, targetPath);
+
+    if (await this.fileExists(directPath)) {
+      return { absolutePath: directPath, matchedByFallback: false };
+    }
+
+    if (!path.isAbsolute(targetPath) && !targetPath.startsWith('src/')) {
+      const fromSrcPath = path.resolve(workingDirectory, 'src', targetPath);
+      if (await this.fileExists(fromSrcPath)) {
+        return { absolutePath: fromSrcPath, matchedByFallback: true };
+      }
+    }
+
+    const basename = path.basename(targetPath);
+    if (!basename || basename !== targetPath) {
+      return { absolutePath: directPath, matchedByFallback: false };
+    }
+
+    const candidates = await this.findSourceCandidatesByBasename(basename, workingDirectory);
+    if (candidates.length === 0) {
+      return { absolutePath: directPath, matchedByFallback: false };
+    }
+
+    const ranked = candidates.sort((a, b) => this.rankContextTargetPath(a) - this.rankContextTargetPath(b));
+    return {
+      absolutePath: ranked[0],
+      matchedByFallback: true,
+    };
+  }
+
+  private rankContextTargetPath(candidatePath: string): number {
+    const normalized = candidatePath.replace(/\\/g, '/');
+    if (normalized.includes('/src/orchestrator/core/')) return 0;
+    if (normalized.includes('/src/orchestrator/')) return 1;
+    if (normalized.includes('/src/')) return 2;
+    return 3;
+  }
+
+  private async findSourceCandidatesByBasename(
+    basename: string,
+    workingDirectory: string
+  ): Promise<string[]> {
+    const srcDir = path.join(workingDirectory, 'src');
+    const shellEscape = (s: string) => s.replace(/[\\'"$`!#&|;(){}\[\]<>?*~]/g, '\\$&');
+    const safeBasename = shellEscape(basename);
+    const safeSrcDir = shellEscape(srcDir);
+
+    try {
+      const result = await execAsync(
+        `find "${safeSrcDir}" -type f -name "${safeBasename}" 2>/dev/null | head -20`,
+        { encoding: 'utf-8', timeout: 3000 }
+      );
+      return result.stdout
+        .trim()
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  private async fileExists(filePath: string): Promise<boolean> {
+    try {
+      await fs.access(filePath);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**

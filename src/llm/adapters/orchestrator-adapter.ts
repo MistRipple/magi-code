@@ -13,6 +13,15 @@ import { BUILTIN_TOOL_NAMES } from '../../tools/types';
 import { MessageHub } from '../../orchestrator/core/message-hub';
 import { BaseLLMAdapter, AdapterState } from './base-adapter';
 import { logger, LogCategory } from '../../logging';
+import { isModelOriginIssue } from '../../errors/model-origin';
+import {
+  type OrchestratorTerminationReason,
+  type ProgressVector,
+  type TerminationSnapshot,
+  type TerminationCandidate,
+  evaluateProgress,
+  resolveTerminationReason,
+} from './orchestrator-termination';
 
 /**
  * 历史管理配置
@@ -42,13 +51,40 @@ export interface OrchestratorAdapterConfig {
 }
 
 export interface OrchestratorRuntimeState {
-  reason:
-    | 'completed'
-    | 'failure_limit'
-    | 'round_limit'
-    | 'interrupted'
-    | 'unknown';
+  reason: OrchestratorTerminationReason;
   rounds: number;
+  snapshot?: TerminationSnapshot;
+  shadow?: {
+    enabled: boolean;
+    reason: Exclude<OrchestratorTerminationReason, 'unknown'>;
+    consistent: boolean;
+    note?: string;
+  };
+}
+
+interface OrchestratorTodoSummary {
+  id: string;
+  missionId?: string;
+  assignmentId?: string;
+  parentId?: string;
+  content?: string;
+  status: string;
+  worker?: string;
+  blockedReason?: string;
+  approvalStatus?: string;
+  dependsOn?: string[];
+  required?: boolean;
+  effortWeight?: number;
+  waiverApproved?: boolean;
+  createdAt?: number;
+}
+
+interface CriticalPathBaseline {
+  version: number;
+  nodeIds: Set<string>;
+  nodeWeights: Map<string, number>;
+  totalWeight: number;
+  pathWeight: number;
 }
 
 /**
@@ -59,6 +95,26 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   private static readonly MAX_ORCHESTRATOR_EDIT_FILES = 3;
   /** 滚动摘要最大长度（字符） */
   private static readonly MAX_ROLLING_SUMMARY_CHARS = 2000;
+  /** 终止治理：无进展窗口 */
+  private static readonly STALLED_WINDOW_SIZE = 5;
+  /** 终止治理：外部等待超时（毫秒） */
+  private static readonly EXTERNAL_WAIT_SLA_MS = 180_000;
+  /** 终止治理：关键路径重基线阈值 */
+  private static readonly CP_REBASE_THRESHOLD = 0.10;
+  /** 终止治理：上游模型连续错误阈值 */
+  private static readonly UPSTREAM_MODEL_ERROR_STREAK = 3;
+  /** 终止治理：标准模式预算 */
+  private static readonly STANDARD_BUDGET = {
+    maxDurationMs: 420_000,
+    maxTokenUsage: 120_000,
+    maxErrorRate: 0.7,
+  };
+  /** 终止治理：深度模式预算 */
+  private static readonly DEEP_BUDGET = {
+    maxDurationMs: 900_000,
+    maxTokenUsage: 280_000,
+    maxErrorRate: 0.8,
+  };
 
   /**
    * 深度模式下编排者可用工具白名单（强制约束）
@@ -171,10 +227,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           silent ? 'system' : undefined
         );
         this.setState(AdapterState.CONNECTED);
-        this.lastRuntimeState = {
-          reason: 'completed',
-          rounds: 1,
-        };
         return content;
       }
 
@@ -593,42 +645,24 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         input_schema: tool.input_schema,
       }));
 
-    // 每轮 LLM 调用独立一个 stream，确保时间轴正确：
-    // 当轮 stream 内包含 thinking + text + tool_call + tool_result，
-    // endStream 后工具副作用产生的新消息（如 subTaskCard）自然排在后面，
-    // 下一轮 stream 再开启新卡片，时间顺序天然正确。
-    // 异常终止依赖失败检测止损：连续 5 次失败 → 提示换方式，累计 25 轮失败 → 终止
-    const CONSECUTIVE_FAIL_THRESHOLD = 5;
-    const TOTAL_FAIL_LIMIT = 25;
-    // 总轮次安全网：深度模式（项目级）提高预算但保留硬上限，避免失控循环
-    const MAX_ORCHESTRATOR_ROUNDS = this.deepTask ? 150 : 50;
-    const WARN_BEFORE_LIMIT = 5;
+    const budget = this.deepTask
+      ? OrchestratorLLMAdapter.DEEP_BUDGET
+      : OrchestratorLLMAdapter.STANDARD_BUDGET;
 
     try {
       let finalText = '';
       let lastNonEmptyAssistantText = '';
       let totalToolResultCount = 0;
-      let consecutiveFailures = 0;
-      let totalFailures = 0;
       let loopRounds = 0;
-      let readOnlyExplorationRounds = 0;
-      let terminationReason: Exclude<OrchestratorRuntimeState['reason'], 'unknown'> = 'completed';
-
-      const READ_ONLY_EXPLORATION_THRESHOLD = 8;
-      const READ_ONLY_TOOL_NAMES = new Set([
-        'codebase_retrieval',
-        'grep_search',
-        'file_view',
-        'list-processes',
-        'read-process',
-        'web_search',
-        'web_fetch',
-      ]);
-      const READ_ONLY_MCP_PATTERN = /retrieval|search|\bread\b|fetch|view|get[_-]|list[_-]|query|deepwiki|resolve/i;
-      const isReadOnlyToolName = (name: string): boolean => {
-        if (READ_ONLY_TOOL_NAMES.has(name)) return true;
-        return READ_ONLY_MCP_PATTERN.test(name);
-      };
+      let toolFailureRounds = 0;
+      let noProgressStreak = 0;
+      let consecutiveUpstreamModelErrors = 0;
+      let baseline: CriticalPathBaseline | null = null;
+      let latestSnapshot: TerminationSnapshot | undefined;
+      let lastSnapshot: TerminationSnapshot | null = null;
+      let terminationReason: Exclude<OrchestratorTerminationReason, 'unknown'> = 'completed';
+      let runtimeShadow: OrchestratorRuntimeState['shadow'];
+      const loopStartAt = Date.now();
 
       // 创建 AbortController，供 interrupt() 中断 LLM 请求
       this.abortController = new AbortController();
@@ -637,24 +671,10 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       while (true) {
         // 中断检查：每轮迭代入口检测 abort 信号
         if (this.abortController.signal.aborted) {
-          terminationReason = 'interrupted';
+          terminationReason = 'external_abort';
           break;
         }
         loopRounds++;
-
-        // 总轮次安全网：防止编排者陷入"dispatch → wait → 不满意 → dispatch"无限循环
-        if (loopRounds > MAX_ORCHESTRATOR_ROUNDS) {
-          logger.warn('Orchestrator 达到总轮次上限', { loopRounds }, LogCategory.LLM);
-          finalText = finalText || `编排已执行 ${loopRounds} 轮，达到安全上限，任务终止。请检查已完成的工作。`;
-          terminationReason = 'round_limit';
-          break;
-        }
-        if (loopRounds === MAX_ORCHESTRATOR_ROUNDS - WARN_BEFORE_LIMIT) {
-          history.push({
-            role: 'user',
-            content: `[System] 你已执行 ${loopRounds} 轮编排循环，即将达到上限（${MAX_ORCHESTRATOR_ROUNDS} 轮）。请立即完成当前阶段的工作，输出最终汇总结果。`,
-          });
-        }
 
         // 长任务 history 裁剪：每轮 LLM 调用前检查并截断，防止 context window 溢出
         if (!isTransientSystemCall) {
@@ -717,10 +737,68 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               this.emit('message', assistantText);
             }
             history.push({ role: 'assistant', content: assistantText });
-            finalText = assistantText.trim() ? assistantText : (finalText || lastNonEmptyAssistantText);
+
+            const progressState = await this.buildTerminationSnapshot({
+              round: loopRounds,
+              loopStartAt,
+              toolFailureRounds,
+              baseline,
+              previousSnapshot: lastSnapshot,
+            });
+            baseline = progressState.baseline;
+            latestSnapshot = progressState.snapshot;
+            if (progressState.cpRebased || progressState.progressed) {
+              noProgressStreak = 0;
+            } else {
+              noProgressStreak += 1;
+            }
+            lastSnapshot = progressState.snapshot;
+
+            const candidates: TerminationCandidate[] = [];
+            if (progressState.snapshot.requiredTotal === 0 && assistantText.trim()) {
+              candidates.push(this.createTerminationCandidate('completed', 'no_required_todos'));
+            } else if (progressState.snapshot.requiredTotal > 0
+              && progressState.snapshot.progressVector.terminalRequiredTodos >= progressState.snapshot.requiredTotal
+              && progressState.snapshot.runningOrPendingRequired === 0) {
+              if (progressState.snapshot.failedRequired > 0) {
+                candidates.push(this.createTerminationCandidate('failed', 'required_todos_failed'));
+              } else {
+                candidates.push(this.createTerminationCandidate('completed', 'required_todos_resolved'));
+              }
+            }
+
+            this.collectBudgetCandidates(
+              candidates,
+              progressState.snapshot,
+              budget,
+              noProgressStreak,
+              consecutiveUpstreamModelErrors,
+            );
+
+            if (candidates.length > 0) {
+              const resolved = resolveTerminationReason(candidates);
+              terminationReason = resolved.reason;
+              progressState.snapshot.sourceEventIds = resolved.evidenceIds;
+              runtimeShadow = this.buildShadowTerminationResult({
+                snapshot: progressState.snapshot,
+                budget,
+                noProgressStreak,
+                consecutiveUpstreamModelErrors,
+                primaryReason: terminationReason,
+                assistantText,
+              });
+              finalText = assistantText.trim() ? assistantText : (finalText || lastNonEmptyAssistantText);
+              this.normalizer.endStream(streamId);
+              break;
+            }
+
+            history.push({
+              role: 'user',
+              content: this.buildContinuePrompt(progressState.snapshot),
+            });
             this.normalizer.endStream(streamId);
-            terminationReason = 'completed';
-            break;
+            round++;
+            continue;
           }
 
           // 有工具调用 → 只对无需授权的工具即时渲染卡片
@@ -757,7 +835,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           // 中断检查：工具执行完成后立即检测 abort，跳过后续处理直接退出循环
           if (this.abortController?.signal.aborted) {
             this.normalizer.endStream(streamId);
-            terminationReason = 'interrupted';
+            terminationReason = 'external_abort';
             break;
           }
 
@@ -813,46 +891,64 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               standardized: result.standardized,
             })),
           });
+          const allFailed = toolResults.length > 0 && toolResults.every(r => r.isError);
+          if (allFailed) {
+            toolFailureRounds += 1;
+          }
+          const hasUpstreamModelError = toolResults.some(result => result.isError && isModelOriginIssue(result.content || ''));
+          consecutiveUpstreamModelErrors = hasUpstreamModelError
+            ? consecutiveUpstreamModelErrors + 1
+            : 0;
 
-          const hasDispatchTask = toolCalls.some(tc => tc.name === 'dispatch_task');
-          const hasNonReadOnlyTool = toolCalls.some(tc => !isReadOnlyToolName(tc.name));
-          const allReadOnlyTools = toolCalls.length > 0 && toolCalls.every(tc => isReadOnlyToolName(tc.name));
+          const progressState = await this.buildTerminationSnapshot({
+            round: loopRounds,
+            loopStartAt,
+            toolFailureRounds,
+            baseline,
+            previousSnapshot: lastSnapshot,
+          });
+          baseline = progressState.baseline;
+          latestSnapshot = progressState.snapshot;
+          if (progressState.cpRebased || progressState.progressed) {
+            noProgressStreak = 0;
+          } else {
+            noProgressStreak += 1;
+          }
+          lastSnapshot = progressState.snapshot;
 
-          if (hasDispatchTask || hasNonReadOnlyTool) {
-            readOnlyExplorationRounds = 0;
-          } else if (allReadOnlyTools) {
-            readOnlyExplorationRounds++;
-            if (readOnlyExplorationRounds >= READ_ONLY_EXPLORATION_THRESHOLD) {
-              readOnlyExplorationRounds = 0;
-              history.push({
-                role: 'user',
-                content: `[System] 你已连续多轮仅进行只读检索/查看，当前策略未有效收敛。请停止继续大范围搜索，基于已有信息立即使用 dispatch_task 拆分并派发任务。`,
-              });
+          const candidates: TerminationCandidate[] = [];
+          if (progressState.snapshot.requiredTotal > 0
+            && progressState.snapshot.progressVector.terminalRequiredTodos >= progressState.snapshot.requiredTotal
+            && progressState.snapshot.runningOrPendingRequired === 0) {
+            if (progressState.snapshot.failedRequired > 0) {
+              candidates.push(this.createTerminationCandidate('failed', 'required_todos_failed'));
+            } else {
+              candidates.push(this.createTerminationCandidate('completed', 'required_todos_resolved'));
             }
           }
+          this.collectBudgetCandidates(
+            candidates,
+            progressState.snapshot,
+            budget,
+            noProgressStreak,
+            consecutiveUpstreamModelErrors,
+          );
 
-          // 连续失败检测
-          const allFailed = toolResults.every(r => r.isError);
-          if (allFailed) {
-            consecutiveFailures++;
-            totalFailures++;
-
-            if (totalFailures >= TOTAL_FAIL_LIMIT) {
-              finalText = assistantText || `工具调用累计失败 ${TOTAL_FAIL_LIMIT} 轮，判定为异常终止。`;
-              this.normalizer.endStream(streamId);
-              terminationReason = 'failure_limit';
-              break;
-            }
-
-            if (consecutiveFailures >= CONSECUTIVE_FAIL_THRESHOLD) {
-              consecutiveFailures = 0;
-              history.push({
-                role: 'user',
-                content: `[System] 工具调用已连续失败 ${CONSECUTIVE_FAIL_THRESHOLD} 次。若当前为代码检索/搜索任务，请停止继续大范围只读探索，基于已有信息立即使用 dispatch_task 派发给合适的 Worker 执行。`,
-              });
-            }
-          } else {
-            consecutiveFailures = 0;
+          if (candidates.length > 0) {
+            const resolved = resolveTerminationReason(candidates);
+            terminationReason = resolved.reason;
+            progressState.snapshot.sourceEventIds = resolved.evidenceIds;
+            runtimeShadow = this.buildShadowTerminationResult({
+              snapshot: progressState.snapshot,
+              budget,
+              noProgressStreak,
+              consecutiveUpstreamModelErrors,
+              primaryReason: terminationReason,
+              assistantText,
+            });
+            finalText = assistantText.trim() ? assistantText : (finalText || lastNonEmptyAssistantText);
+            this.normalizer.endStream(streamId);
+            break;
           }
 
           // 当轮 stream 结束，工具副作用（subTaskCard 等）已自然排在后面
@@ -862,7 +958,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           this.normalizer.endStream(streamId, error?.message || 'Request failed');
           // abort 中断不视为异常，优雅退出循环
           if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
-            terminationReason = 'interrupted';
+            terminationReason = 'external_abort';
             break;
           }
           throw error;
@@ -887,22 +983,516 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           throw new Error(`LLM 响应为空：流式传输完成但未收到有效内容 [orchestrator/${this.config.model}/${this.config.provider}]`);
         }
       }
+      if (!runtimeShadow && this.isTerminationShadowEnabled()) {
+        runtimeShadow = {
+          enabled: true,
+          reason: terminationReason,
+          consistent: true,
+          note: 'shadow-fallback',
+        };
+      }
       this.lastRuntimeState = {
         reason: terminationReason,
         rounds: loopRounds,
+        snapshot: latestSnapshot,
+        shadow: runtimeShadow,
       };
       return finalText || '任务已中断';
     } catch (error: any) {
       // abort 中断不视为错误
       if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
         this.lastRuntimeState = {
-          reason: 'interrupted',
+          reason: 'external_abort',
           rounds: 0,
+          shadow: this.isTerminationShadowEnabled()
+            ? {
+                enabled: true,
+                reason: 'external_abort',
+                consistent: true,
+                note: 'shadow-abort',
+              }
+            : undefined,
         };
         return '任务已中断';
       }
       throw error;
     }
+  }
+
+  private createTerminationCandidate(
+    reason: Exclude<OrchestratorTerminationReason, 'unknown'>,
+    label: string
+  ): TerminationCandidate {
+    return {
+      reason,
+      eventId: `${label}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      triggeredAt: Date.now(),
+    };
+  }
+
+  private isTerminationShadowEnabled(): boolean {
+    const flag = (process.env.MAGI_TERMINATION_SHADOW || '').trim().toLowerCase();
+    return flag === '1' || flag === 'true' || flag === 'on';
+  }
+
+  private buildShadowTerminationResult(params: {
+    snapshot: TerminationSnapshot;
+    budget: { maxDurationMs: number; maxTokenUsage: number; maxErrorRate: number };
+    noProgressStreak: number;
+    consecutiveUpstreamModelErrors: number;
+    primaryReason: Exclude<OrchestratorTerminationReason, 'unknown'>;
+    assistantText: string;
+  }): {
+    enabled: boolean;
+    reason: Exclude<OrchestratorTerminationReason, 'unknown'>;
+    consistent: boolean;
+    note?: string;
+  } | undefined {
+    if (!this.isTerminationShadowEnabled()) {
+      return undefined;
+    }
+
+    const { snapshot, budget, noProgressStreak, consecutiveUpstreamModelErrors, primaryReason, assistantText } = params;
+    let shadowReason: Exclude<OrchestratorTerminationReason, 'unknown'> = 'completed';
+
+    if (snapshot.requiredTotal > 0
+      && snapshot.progressVector.terminalRequiredTodos >= snapshot.requiredTotal
+      && snapshot.runningOrPendingRequired === 0) {
+      shadowReason = snapshot.failedRequired > 0 ? 'failed' : 'completed';
+    } else if (snapshot.budgetState.elapsedMs >= budget.maxDurationMs
+      || snapshot.budgetState.tokenUsed >= budget.maxTokenUsage
+      || snapshot.budgetState.errorRate >= budget.maxErrorRate) {
+      shadowReason = 'budget_exceeded';
+    } else if (snapshot.blockerState.maxExternalWaitAgeMs >= OrchestratorLLMAdapter.EXTERNAL_WAIT_SLA_MS) {
+      shadowReason = 'external_wait_timeout';
+    } else if (consecutiveUpstreamModelErrors >= OrchestratorLLMAdapter.UPSTREAM_MODEL_ERROR_STREAK) {
+      shadowReason = 'upstream_model_error';
+    } else if (noProgressStreak >= OrchestratorLLMAdapter.STALLED_WINDOW_SIZE && snapshot.blockerState.externalWaitOpen === 0) {
+      shadowReason = 'stalled';
+    } else if (!assistantText.trim()) {
+      shadowReason = 'failed';
+    }
+
+    const consistent = shadowReason === primaryReason;
+    if (!consistent) {
+      logger.warn('Orchestrator.Termination.Shadow.不一致', {
+        primaryReason,
+        shadowReason,
+        snapshotId: snapshot.snapshotId,
+        attemptSeq: snapshot.attemptSeq,
+      }, LogCategory.LLM);
+    } else {
+      logger.debug('Orchestrator.Termination.Shadow.一致', {
+        reason: primaryReason,
+        snapshotId: snapshot.snapshotId,
+        attemptSeq: snapshot.attemptSeq,
+      }, LogCategory.LLM);
+    }
+
+    return {
+      enabled: true,
+      reason: shadowReason,
+      consistent,
+      note: consistent ? undefined : `primary=${primaryReason}; shadow=${shadowReason}`,
+    };
+  }
+
+  private collectBudgetCandidates(
+    candidates: TerminationCandidate[],
+    snapshot: TerminationSnapshot,
+    budget: { maxDurationMs: number; maxTokenUsage: number; maxErrorRate: number },
+    noProgressStreak: number,
+    consecutiveUpstreamModelErrors: number,
+  ): void {
+    if (snapshot.budgetState.elapsedMs >= budget.maxDurationMs
+      || snapshot.budgetState.tokenUsed >= budget.maxTokenUsage
+      || snapshot.budgetState.errorRate >= budget.maxErrorRate) {
+      candidates.push(this.createTerminationCandidate('budget_exceeded', 'budget'));
+    }
+
+    if (snapshot.blockerState.maxExternalWaitAgeMs >= OrchestratorLLMAdapter.EXTERNAL_WAIT_SLA_MS) {
+      candidates.push(this.createTerminationCandidate('external_wait_timeout', 'external_wait'));
+    }
+
+    if (consecutiveUpstreamModelErrors >= OrchestratorLLMAdapter.UPSTREAM_MODEL_ERROR_STREAK) {
+      candidates.push(this.createTerminationCandidate('upstream_model_error', 'upstream_model'));
+    }
+
+    if (noProgressStreak >= OrchestratorLLMAdapter.STALLED_WINDOW_SIZE && snapshot.blockerState.externalWaitOpen === 0) {
+      candidates.push(this.createTerminationCandidate('stalled', 'stalled'));
+    }
+  }
+
+  private buildContinuePrompt(snapshot: TerminationSnapshot): string {
+    const p = snapshot.progressVector;
+    const remain = Math.max(0, snapshot.requiredTotal - p.terminalRequiredTodos);
+    return [
+      '[System] 当前任务未满足终止条件，请继续推进。',
+      `- 必需 Todo 总数: ${snapshot.requiredTotal}`,
+      `- 已终态必需 Todo: ${p.terminalRequiredTodos}`,
+      `- 剩余必需 Todo: ${remain}`,
+      `- 未解决阻塞: ${p.unresolvedBlockers}`,
+      '- 请优先处理关键路径上的未完成项，避免重复只读探索。',
+    ].join('\n');
+  }
+
+  private async buildTerminationSnapshot(params: {
+    round: number;
+    loopStartAt: number;
+    toolFailureRounds: number;
+    baseline: CriticalPathBaseline | null;
+    previousSnapshot: TerminationSnapshot | null;
+  }): Promise<{
+    snapshot: TerminationSnapshot;
+    baseline: CriticalPathBaseline | null;
+    cpRebased: boolean;
+    progressed: boolean;
+    regressed: boolean;
+  }> {
+    const todos = await this.fetchTodosForTermination();
+    const requiredTodos = todos.filter(todo => this.isRequiredTodo(todo));
+    const terminalStatuses = new Set(['completed', 'failed', 'skipped']);
+
+    const pathResult = this.computeCriticalPathBaseline(requiredTodos, params.baseline);
+    const currentBaseline = pathResult.baseline;
+    const cpResolvedWeight = currentBaseline
+      ? Array.from(currentBaseline.nodeIds).reduce((sum, todoId) => {
+        const todo = requiredTodos.find(item => item.id === todoId);
+        if (!todo) {
+          return sum;
+        }
+        const resolved = todo.status === 'completed' || (todo.status === 'skipped' && todo.waiverApproved === true);
+        if (!resolved) {
+          return sum;
+        }
+        return sum + (currentBaseline.nodeWeights.get(todoId) || 1);
+      }, 0)
+      : 0;
+
+    let unresolvedBlockers = 0;
+    let blockerScore = 0;
+    let externalWaitOpen = 0;
+    let maxExternalWaitAgeMs = 0;
+    const now = Date.now();
+    for (const todo of requiredTodos) {
+      if (todo.status !== 'blocked') {
+        continue;
+      }
+      const externalWait = this.isExternalWaitTodo(todo);
+      const ageMs = todo.createdAt ? Math.max(0, now - todo.createdAt) : 0;
+      if (externalWait) {
+        externalWaitOpen += 1;
+        if (ageMs > maxExternalWaitAgeMs) {
+          maxExternalWaitAgeMs = ageMs;
+        }
+        continue;
+      }
+      unresolvedBlockers += 1;
+      blockerScore += this.computeBlockerScore(todo, ageMs);
+    }
+
+    const terminalRequiredTodos = requiredTodos.filter(todo => terminalStatuses.has(todo.status)).length;
+    const acceptedCriteria = requiredTodos.filter(todo => todo.status === 'completed').length;
+    const failedRequired = requiredTodos.filter(todo => todo.status === 'failed').length;
+    const runningOrPendingRequired = requiredTodos.filter(todo => !terminalStatuses.has(todo.status)).length;
+    const totalTokens = this.getTotalTokenUsage();
+    const tokenUsed = (totalTokens.inputTokens || 0) + (totalTokens.outputTokens || 0);
+
+    const progressVector: ProgressVector = {
+      terminalRequiredTodos,
+      acceptedCriteria,
+      criticalPathResolved: currentBaseline && currentBaseline.totalWeight > 0
+        ? cpResolvedWeight / currentBaseline.totalWeight
+        : 0,
+      unresolvedBlockers,
+    };
+
+    const snapshot: TerminationSnapshot = {
+      snapshotId: `snap_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      planId: this.currentTraceId || 'unknown-plan',
+      attemptSeq: params.round,
+      progressVector,
+      reviewState: {
+        accepted: acceptedCriteria,
+        total: requiredTodos.length,
+      },
+      blockerState: {
+        open: unresolvedBlockers,
+        score: blockerScore,
+        externalWaitOpen,
+        maxExternalWaitAgeMs,
+      },
+      budgetState: {
+        elapsedMs: now - params.loopStartAt,
+        tokenUsed,
+        errorRate: params.round > 0 ? params.toolFailureRounds / params.round : 0,
+      },
+      cpVersion: currentBaseline?.version || 1,
+      requiredTotal: requiredTodos.length,
+      failedRequired,
+      runningOrPendingRequired,
+      sourceEventIds: [],
+      computedAt: now,
+    };
+
+    const progressEval = evaluateProgress(params.previousSnapshot, snapshot);
+    const regressed = progressEval.regressed;
+    const progressed = progressEval.progressed;
+
+    // 当 required todo 缺失时，保守降级为全部 todo 口径，防止误判“已完成”
+    if (requiredTodos.length === 0 && todos.length > 0) {
+      const fallbackTerminal = todos.filter(todo => terminalStatuses.has(todo.status)).length;
+      snapshot.requiredTotal = todos.length;
+      snapshot.progressVector.terminalRequiredTodos = fallbackTerminal;
+      snapshot.reviewState.total = todos.length;
+      snapshot.runningOrPendingRequired = Math.max(0, todos.length - fallbackTerminal);
+      snapshot.failedRequired = todos.filter(todo => todo.status === 'failed').length;
+      snapshot.progressVector.acceptedCriteria = todos.filter(todo => todo.status === 'completed').length;
+    }
+
+    return {
+      snapshot,
+      baseline: currentBaseline,
+      cpRebased: pathResult.rebased,
+      progressed,
+      regressed,
+    };
+  }
+
+  private async fetchTodosForTermination(): Promise<OrchestratorTodoSummary[]> {
+    try {
+      const toolCall: ToolCall = {
+        id: `internal_get_todos_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        name: 'get_todos',
+        arguments: {},
+      };
+      const result = await this.toolManager.execute(
+        toolCall,
+        this.abortController?.signal,
+        { workerId: 'orchestrator', role: 'orchestrator' }
+      );
+      if (result.isError) {
+        return [];
+      }
+      const parsed = JSON.parse(result.content || '[]');
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+      return this.toTodoSummaries(parsed);
+    } catch (error: any) {
+      logger.warn('Orchestrator.终止快照.获取Todos失败', {
+        error: error?.message || String(error),
+      }, LogCategory.LLM);
+      return [];
+    }
+  }
+
+  private toTodoSummaries(raw: any[]): OrchestratorTodoSummary[] {
+    const summaries: OrchestratorTodoSummary[] = [];
+    for (const item of raw) {
+      if (!item || typeof item !== 'object' || typeof item.id !== 'string') {
+        continue;
+      }
+      summaries.push({
+        id: item.id,
+        missionId: typeof item.missionId === 'string' ? item.missionId : undefined,
+        assignmentId: typeof item.assignmentId === 'string' ? item.assignmentId : undefined,
+        parentId: typeof item.parentId === 'string' ? item.parentId : undefined,
+        content: typeof item.content === 'string' ? item.content : undefined,
+        status: typeof item.status === 'string' ? item.status : 'pending',
+        worker: typeof item.worker === 'string' ? item.worker : undefined,
+        blockedReason: typeof item.blockedReason === 'string' ? item.blockedReason : undefined,
+        approvalStatus: typeof item.approvalStatus === 'string' ? item.approvalStatus : undefined,
+        dependsOn: Array.isArray(item.dependsOn) ? item.dependsOn.filter((dep: any) => typeof dep === 'string') : [],
+        required: typeof item.required === 'boolean' ? item.required : true,
+        effortWeight: typeof item.effortWeight === 'number' ? item.effortWeight : 1,
+        waiverApproved: item.waiverApproved === true,
+        createdAt: typeof item.createdAt === 'number' ? item.createdAt : undefined,
+      });
+    }
+    return summaries;
+  }
+
+  private isRequiredTodo(todo: OrchestratorTodoSummary): boolean {
+    return todo.required !== false;
+  }
+
+  private isExternalWaitTodo(todo: OrchestratorTodoSummary): boolean {
+    if (todo.approvalStatus === 'pending') {
+      return true;
+    }
+    const reason = (todo.blockedReason || '').toLowerCase();
+    if (!reason) {
+      return false;
+    }
+    return reason.includes('审批')
+      || reason.includes('approval')
+      || reason.includes('等待用户')
+      || reason.includes('external')
+      || reason.includes('等待外部');
+  }
+
+  private computeBlockerScore(todo: OrchestratorTodoSummary, ageMs: number): number {
+    const reason = (todo.blockedReason || '').toLowerCase();
+    let severityWeight = 2;
+    if (reason.includes('critical') || reason.includes('致命') || reason.includes('不可恢复')) {
+      severityWeight = 8;
+    } else if (reason.includes('contract') || reason.includes('契约') || reason.includes('依赖')) {
+      severityWeight = 4;
+    } else if (reason.includes('warning') || reason.includes('提示')) {
+      severityWeight = 1;
+    }
+    const ageMinutes = ageMs / 60000;
+    return severityWeight * Math.log1p(Math.max(0, ageMinutes));
+  }
+
+  private computeCriticalPathBaseline(
+    todos: OrchestratorTodoSummary[],
+    previous: CriticalPathBaseline | null
+  ): { baseline: CriticalPathBaseline | null; rebased: boolean } {
+    if (!todos.length) {
+      return { baseline: previous, rebased: false };
+    }
+
+    const current = this.buildCriticalPathFromTodos(todos);
+    if (!current) {
+      return { baseline: previous, rebased: false };
+    }
+
+    if (!previous || previous.totalWeight <= 0) {
+      return {
+        baseline: {
+          ...current,
+          version: 1,
+        },
+        rebased: true,
+      };
+    }
+
+    const missingNodes = Array.from(previous.nodeIds).filter((id) => !todos.some((todo) => todo.id === id));
+    const hasSplitSignal = missingNodes.some((missingId) => todos.some(todo => todo.parentId === missingId));
+    const growthRatio = previous.pathWeight > 0
+      ? (current.pathWeight - previous.pathWeight) / previous.pathWeight
+      : 0;
+    const shouldRebase = hasSplitSignal || growthRatio > OrchestratorLLMAdapter.CP_REBASE_THRESHOLD;
+
+    if (!shouldRebase) {
+      return { baseline: previous, rebased: false };
+    }
+
+    return {
+      baseline: {
+        ...current,
+        version: previous.version + 1,
+      },
+      rebased: true,
+    };
+  }
+
+  private buildCriticalPathFromTodos(todos: OrchestratorTodoSummary[]): Omit<CriticalPathBaseline, 'version'> | null {
+    if (!todos.length) {
+      return null;
+    }
+
+    const todoMap = new Map<string, OrchestratorTodoSummary>();
+    const nodeWeights = new Map<string, number>();
+    const indegree = new Map<string, number>();
+    const children = new Map<string, string[]>();
+
+    for (const todo of todos) {
+      todoMap.set(todo.id, todo);
+      const weight = typeof todo.effortWeight === 'number' && todo.effortWeight > 0
+        ? todo.effortWeight
+        : 1;
+      nodeWeights.set(todo.id, weight);
+      indegree.set(todo.id, 0);
+      children.set(todo.id, []);
+    }
+
+    for (const todo of todos) {
+      const deps = Array.isArray(todo.dependsOn) ? todo.dependsOn : [];
+      for (const depId of deps) {
+        if (!todoMap.has(depId)) {
+          continue;
+        }
+        children.get(depId)!.push(todo.id);
+        indegree.set(todo.id, (indegree.get(todo.id) || 0) + 1);
+      }
+    }
+
+    const queue: string[] = [];
+    for (const [id, degree] of indegree.entries()) {
+      if (degree === 0) {
+        queue.push(id);
+      }
+    }
+
+    const topo: string[] = [];
+    while (queue.length > 0) {
+      const currentId = queue.shift()!;
+      topo.push(currentId);
+      for (const childId of children.get(currentId) || []) {
+        const nextDegree = (indegree.get(childId) || 0) - 1;
+        indegree.set(childId, nextDegree);
+        if (nextDegree === 0) {
+          queue.push(childId);
+        }
+      }
+    }
+
+    if (topo.length !== todos.length) {
+      const allNodeIds = new Set(todos.map(todo => todo.id));
+      const totalWeight = Array.from(nodeWeights.values()).reduce((sum, value) => sum + value, 0);
+      return {
+        nodeIds: allNodeIds,
+        nodeWeights,
+        totalWeight,
+        pathWeight: totalWeight,
+      };
+    }
+
+    const dist = new Map<string, number>();
+    const prev = new Map<string, string | undefined>();
+    for (const id of topo) {
+      dist.set(id, nodeWeights.get(id) || 1);
+      prev.set(id, undefined);
+    }
+
+    for (const id of topo) {
+      const base = dist.get(id) || 0;
+      for (const childId of children.get(id) || []) {
+        const candidate = base + (nodeWeights.get(childId) || 1);
+        if (candidate > (dist.get(childId) || 0)) {
+          dist.set(childId, candidate);
+          prev.set(childId, id);
+        }
+      }
+    }
+
+    let targetId = topo[0];
+    let maxDist = dist.get(targetId) || 0;
+    for (const id of topo) {
+      const value = dist.get(id) || 0;
+      if (value > maxDist) {
+        maxDist = value;
+        targetId = id;
+      }
+    }
+
+    const nodeIds = new Set<string>();
+    let cursor: string | undefined = targetId;
+    while (cursor) {
+      nodeIds.add(cursor);
+      cursor = prev.get(cursor);
+    }
+
+    const totalWeight = Array.from(nodeIds).reduce((sum, id) => sum + (nodeWeights.get(id) || 1), 0);
+    return {
+      nodeIds,
+      nodeWeights,
+      totalWeight,
+      pathWeight: maxDist,
+    };
   }
 
   /**

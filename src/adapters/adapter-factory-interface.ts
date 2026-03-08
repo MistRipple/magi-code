@@ -68,11 +68,49 @@ export interface AdapterResponse {
   orchestratorRuntime?: {
     reason:
       | 'completed'
-      | 'failure_limit'
-      | 'round_limit'
+      | 'failed'
+      | 'cancelled'
+      | 'stalled'
+      | 'budget_exceeded'
+      | 'external_wait_timeout'
+      | 'external_abort'
+      | 'upstream_model_error'
       | 'interrupted'
       | 'unknown';
     rounds: number;
+    snapshot?: {
+      progressVector?: {
+        terminalRequiredTodos?: number;
+        acceptedCriteria?: number;
+        criticalPathResolved?: number;
+        unresolvedBlockers?: number;
+      };
+      reviewState?: {
+        accepted?: number;
+        total?: number;
+      };
+      blockerState?: {
+        open?: number;
+        score?: number;
+        externalWaitOpen?: number;
+        maxExternalWaitAgeMs?: number;
+      };
+      budgetState?: {
+        elapsedMs?: number;
+        tokenUsed?: number;
+        errorRate?: number;
+      };
+      requiredTotal?: number;
+      failedRequired?: number;
+      runningOrPendingRequired?: number;
+      sourceEventIds?: string[];
+    };
+    shadow?: {
+      enabled: boolean;
+      reason: string;
+      consistent: boolean;
+      note?: string;
+    };
   };
 }
 

@@ -40,7 +40,7 @@ import {
   clearProcessingState,
   sealAllStreamingMessages,
 } from '../stores/messages.svelte';
-import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, SubTaskItem, Edit, ModelStatusMap, ActivePlanState, PlanLedgerRecord } from '../types/message';
+import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, SubTaskItem, Edit, ModelStatusMap, ActivePlanState, PlanLedgerRecord, PlanLedgerAttempt } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
 import { MessageType, MessageCategory } from '../../../../protocol/message-protocol';
 import { routeStandardMessage, getMessageTarget, clearMessageTargets, clearMessageTarget, setMessageTarget } from './message-router';
@@ -1770,11 +1770,8 @@ function applyPlanLedgerSnapshot(payload: Record<string, unknown>) {
     : null;
 
   const normalizedPlanHistory = ensureArray(payload.plans)
-    .filter((plan): plan is PlanLedgerRecord => {
-      if (!plan || typeof plan !== 'object') return false;
-      const candidate = plan as PlanLedgerRecord;
-      return typeof candidate.planId === 'string' && typeof candidate.sessionId === 'string';
-    });
+    .map((plan) => normalizePlanLedgerRecord(plan))
+    .filter((plan): plan is PlanLedgerRecord => Boolean(plan));
 
   const currentState = (store.appState || {}) as AppState;
   const nextState: AppState = {
@@ -1783,6 +1780,30 @@ function applyPlanLedgerSnapshot(payload: Record<string, unknown>) {
     planHistory: normalizedPlanHistory,
   };
   setAppState(nextState);
+}
+
+function normalizePlanLedgerRecord(plan: unknown): PlanLedgerRecord | null {
+  if (!plan || typeof plan !== 'object') {
+    return null;
+  }
+  const candidate = plan as PlanLedgerRecord;
+  if (typeof candidate.planId !== 'string' || typeof candidate.sessionId !== 'string') {
+    return null;
+  }
+  const normalizedAttempts = ensureArray((candidate as { attempts?: unknown[] }).attempts)
+    .filter((attempt): attempt is PlanLedgerAttempt => {
+      if (!attempt || typeof attempt !== 'object') return false;
+      const a = attempt as PlanLedgerAttempt;
+      return typeof a.attemptId === 'string'
+        && typeof a.scope === 'string'
+        && typeof a.targetId === 'string'
+        && typeof a.sequence === 'number'
+        && typeof a.status === 'string';
+    });
+  return {
+    ...candidate,
+    attempts: normalizedAttempts,
+  };
 }
 
 function handleSessionChanged(message: WebviewMessage) {
@@ -1904,7 +1925,8 @@ function handleSessionMessagesLoaded(message: WebviewMessage) {
 
 function handleConfirmationRequest(message: WebviewMessage) {
   const store = getState();
-  if (store.appState?.interactionMode === 'auto') {
+  const forceManual = message.forceManual === true;
+  if (store.appState?.interactionMode === 'auto' && !forceManual) {
     addToast('info', i18n.t('messageHandler.autoConfirmPlan'));
     vscode.postMessage({ type: 'confirmPlan', confirmed: true });
     clearRequestedInteractionMode();

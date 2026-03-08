@@ -116,8 +116,14 @@ async function main() {
     path.join(ROOT, 'src', 'llm', 'adapters', 'orchestrator-adapter.ts'),
     'utf8'
   );
-  assert(orchestratorAdapterSource.includes('const MAX_ORCHESTRATOR_ROUNDS = this.deepTask ? 150 : 50;'),
-    '编排者轮次阈值未命中预期（应为深度 150 / 常规 50）');
+  const hasLegacyRoundLimit = /MAX_ORCHESTRATOR_ROUNDS|failure_limit|round_limit/.test(orchestratorAdapterSource);
+  assert(!hasLegacyRoundLimit, '编排者仍残留旧轮次/失败次数终止口径');
+
+  const hasBudgetGovernance = orchestratorAdapterSource.includes('private static readonly STANDARD_BUDGET')
+    && orchestratorAdapterSource.includes('private static readonly DEEP_BUDGET')
+    && orchestratorAdapterSource.includes('collectBudgetCandidates(')
+    && orchestratorAdapterSource.includes("createTerminationCandidate('budget_exceeded', 'budget')");
+  assert(hasBudgetGovernance, '编排者预算治理口径缺失（STANDARD/DEEP_BUDGET + budget_exceeded）');
 
   const workerSource = fs.readFileSync(
     path.join(ROOT, 'src', 'orchestrator', 'worker', 'autonomous-worker.ts'),

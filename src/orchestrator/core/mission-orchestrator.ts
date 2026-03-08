@@ -44,6 +44,14 @@ export interface MissionOrchestratorEventMap {
   // ---- Worker Session ----
   workerSessionCreated: (data: { sessionId: string; assignmentId: string; workerId: WorkerSlot }) => void;
   workerSessionResumed: (data: { sessionId: string; assignmentId: string; workerId: WorkerSlot; completedTodos: number }) => void;
+  workerHeartbeat: (data: {
+    assignmentId: string;
+    workerId: WorkerSlot;
+    missionId: string | null;
+    timestamp: number;
+    todoId?: string;
+    sessionId?: string;
+  }) => void;
   // ---- Todo 进度 (Worker 转发) ----
   todoStarted: (data: { assignmentId: string; todoId: string; content: string; missionId: string | null }) => void;
   todoCompleted: (data: { assignmentId: string; todoId: string; content: string; output: any; missionId: string | null }) => void;
@@ -212,6 +220,19 @@ export class MissionOrchestrator extends EventEmitter {
       worker.on('sessionResumed', (data: { sessionId: string; assignmentId: string; completedTodos: number }) => {
         this.emit('workerSessionResumed', {
           ...data,
+          workerId: workerSlot,
+        });
+      });
+
+      worker.on('assignmentHeartbeat', (data: {
+        assignmentId: string;
+        timestamp: number;
+        todoId?: string;
+        sessionId?: string;
+      }) => {
+        this.emit('workerHeartbeat', {
+          ...data,
+          missionId: this.currentMissionId,
           workerId: workerSlot,
         });
       });

@@ -8,6 +8,7 @@
  * - 验证与总结
  */
 import { EventEmitter } from 'events';
+import fs from 'fs';
 import path from 'path';
 import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import { t } from '../../i18n';
@@ -34,10 +35,16 @@ import { MessageHub } from './message-hub';
 import { WisdomManager } from '../wisdom';
 import { buildUnifiedSystemPrompt } from '../prompts/orchestrator-prompts';
 import { isAbortError } from '../../errors';
+import { ConfigManager, type OrchestratorGovernanceThresholdsConfig } from '../../config';
 import { SupplementaryInstructionQueue } from './supplementary-instruction-queue';
 import { DispatchManager } from './dispatch-manager';
 import { runPostDispatchVerification } from './post-dispatch-verifier';
 import { configureResilientAuxiliary } from './resilient-auxiliary-adapter';
+import {
+  FileTerminationMetricsRepository,
+  type TerminationMetricsRecord,
+  type TerminationMetricsRepository,
+} from './termination-metrics-repository';
 import { TaskViewService } from '../../services/task-view-service';
 import { PlanLedgerService, type PlanMode, type PlanRecord } from '../plan-ledger';
 import {
@@ -75,10 +82,72 @@ export interface MissionDrivenEngineConfig {
   strategy?: StrategyConfig;
 }
 
+interface GovernanceSignalEstimate {
+  files: Set<string>;
+  modules: Set<string>;
+  available: boolean;
+}
+
+interface PlanGovernanceAssessment {
+  riskScore: number;
+  confidence: number;
+  affectedFiles: number;
+  crossModules: number;
+  writeToolRatio: number;
+  historicalFailureRate: number;
+  sourceCoverage: number;
+  signalAgreement: number;
+  historicalCalibration: number;
+  decision: 'ask' | 'auto';
+  reasons: string[];
+}
+
+interface RuntimeTerminationSnapshot {
+  progressVector?: {
+    terminalRequiredTodos?: number;
+    acceptedCriteria?: number;
+    criticalPathResolved?: number;
+    unresolvedBlockers?: number;
+  };
+  reviewState?: {
+    accepted?: number;
+    total?: number;
+  };
+  blockerState?: {
+    open?: number;
+    score?: number;
+    externalWaitOpen?: number;
+    maxExternalWaitAgeMs?: number;
+  };
+  budgetState?: {
+    elapsedMs?: number;
+    tokenUsed?: number;
+    errorRate?: number;
+  };
+  requiredTotal?: number;
+  failedRequired?: number;
+  runningOrPendingRequired?: number;
+  sourceEventIds?: string[];
+}
+
+interface RuntimeTerminationShadow {
+  enabled: boolean;
+  reason: string;
+  consistent: boolean;
+  note?: string;
+}
+
 /**
  * MissionDrivenEngine - 基于 Mission-Driven Architecture 的编排引擎
  */
 export class MissionDrivenEngine extends EventEmitter {
+  private static readonly GOVERNANCE_THRESHOLDS_DEFAULT: OrchestratorGovernanceThresholdsConfig = {
+    C_min: 0.55,
+    C_ok: 0.75,
+    R_low: 0.35,
+    R_high: 0.70,
+  };
+
   private adapterFactory: IAdapterFactory;
   private sessionManager: UnifiedSessionManager;
   private snapshotManager: SnapshotManager;
@@ -95,6 +164,7 @@ export class MissionDrivenEngine extends EventEmitter {
   private profileLoader: ProfileLoader;
   private guidanceInjector: GuidanceInjector;
   private categoryResolver = new CategoryResolver();
+  private readonly terminationMetricsRepository: TerminationMetricsRepository;
 
   private verificationRunner?: VerificationRunner;
 
@@ -160,6 +230,7 @@ export class MissionDrivenEngine extends EventEmitter {
   // 交互模式
   private interactionMode: InteractionMode = 'auto';
   private modeConfig: InteractionModeConfig = INTERACTION_MODE_CONFIGS.auto;
+  private workspaceFileIndexCache?: { builtAt: number; files: string[]; modules: string[] };
   // 运行状态
   private isRunning = false;
   private executionQueue: Promise<void> = Promise.resolve();
@@ -170,6 +241,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
   // P1-4: Dispatch 调度管理器（独立子系统）
   private dispatchManager: DispatchManager;
+  private readonly configManager: ConfigManager;
 
   constructor(
     adapterFactory: IAdapterFactory,
@@ -184,6 +256,7 @@ export class MissionDrivenEngine extends EventEmitter {
     this.workspaceRoot = workspaceRoot;
     this.snapshotManager = snapshotManager;
     this.sessionManager = sessionManager;
+    this.configManager = ConfigManager.getInstance();
 
     // 初始化基础组件
     this.profileLoader = ProfileLoader.getInstance();
@@ -192,6 +265,7 @@ export class MissionDrivenEngine extends EventEmitter {
     this.executionStats = new ExecutionStats();
     this.supplementaryQueue = new SupplementaryInstructionQueue(this);
     this.wisdomManager = new WisdomManager();
+    this.terminationMetricsRepository = new FileTerminationMetricsRepository(this.workspaceRoot);
 
     // 初始化 Mission 存储（使用 .magi/sessions 目录，按 session 分组存储）
     const sessionsDir = path.join(workspaceRoot, '.magi', 'sessions');
@@ -362,6 +436,465 @@ export class MissionDrivenEngine extends EventEmitter {
     }
   }
 
+  private async evaluatePlanGovernance(sessionId: string, plan: PlanRecord, userPrompt: string): Promise<PlanGovernanceAssessment> {
+    const analysisSignal = this.estimateAnalysisSignal(plan, userPrompt);
+    const staticSignal = this.estimateStaticSignal(userPrompt);
+    const historical = this.estimateHistoricalSignal(sessionId, plan.planId);
+
+    const mergedFiles = new Set<string>([
+      ...analysisSignal.files,
+      ...staticSignal.files,
+      ...historical.files,
+    ]);
+    const mergedModules = new Set<string>([
+      ...analysisSignal.modules,
+      ...staticSignal.modules,
+      ...historical.modules,
+    ]);
+
+    const affectedFiles = Math.max(1, mergedFiles.size);
+    const crossModules = Math.max(1, mergedModules.size);
+    const writeToolRatio = this.estimateWriteToolRatio(userPrompt, plan.mode);
+    const historicalFailureRate = historical.failureRate;
+
+    const normalizeFiles = Math.min(affectedFiles / 40, 1);
+    const normalizeModules = Math.min(crossModules / 8, 1);
+    const riskScore = Math.min(
+      1,
+      0.35 * normalizeFiles
+        + 0.25 * normalizeModules
+        + 0.20 * writeToolRatio
+        + 0.20 * historicalFailureRate,
+    );
+
+    const sourceCoverage = [analysisSignal.available, staticSignal.available, historical.available]
+      .filter(Boolean).length / 3;
+    const agreementPairs: number[] = [];
+    if (analysisSignal.available && staticSignal.available) {
+      agreementPairs.push(this.computeJaccard(analysisSignal.files, staticSignal.files));
+    }
+    if (analysisSignal.available && historical.available) {
+      agreementPairs.push(this.computeJaccard(analysisSignal.modules, historical.modules));
+    }
+    if (staticSignal.available && historical.available) {
+      agreementPairs.push(this.computeJaccard(staticSignal.modules, historical.modules));
+    }
+    const signalAgreement = agreementPairs.length > 0
+      ? agreementPairs.reduce((sum, item) => sum + item, 0) / agreementPairs.length
+      : 0;
+    const historicalCalibration = historical.calibration;
+    const confidence = Math.min(
+      1,
+      0.4 * sourceCoverage + 0.4 * signalAgreement + 0.2 * historicalCalibration,
+    );
+
+    const thresholds = this.getGovernanceThresholds();
+    const reasons: string[] = [];
+    let decision: 'ask' | 'auto' = 'ask';
+    if (sourceCoverage < 2 / 3) {
+      reasons.push(`coverage<2/3(${sourceCoverage.toFixed(2)})`);
+    }
+    if (confidence < thresholds.C_min) {
+      reasons.push(`confidence<C_min(${confidence.toFixed(2)}<${thresholds.C_min})`);
+    }
+    if (riskScore >= thresholds.R_high) {
+      reasons.push(`risk>=R_high(${riskScore.toFixed(2)}>=${thresholds.R_high})`);
+    }
+    if (
+      reasons.length === 0
+      && riskScore <= thresholds.R_low
+      && confidence >= thresholds.C_ok
+    ) {
+      decision = 'auto';
+    } else if (reasons.length === 0) {
+      reasons.push(`gray_zone(risk=${riskScore.toFixed(2)},confidence=${confidence.toFixed(2)})`);
+    }
+
+    return {
+      riskScore,
+      confidence,
+      affectedFiles,
+      crossModules,
+      writeToolRatio,
+      historicalFailureRate,
+      sourceCoverage,
+      signalAgreement,
+      historicalCalibration,
+      decision,
+      reasons,
+    };
+  }
+
+  private getGovernanceThresholds(): OrchestratorGovernanceThresholdsConfig {
+    const defaults = MissionDrivenEngine.GOVERNANCE_THRESHOLDS_DEFAULT;
+    const manager = this.configManager ?? ConfigManager.getInstance();
+    const configured = manager.get('orchestrator')?.governanceThresholds;
+    const thresholds: OrchestratorGovernanceThresholdsConfig = {
+      C_min: this.normalizeThresholdValue(configured?.C_min, defaults.C_min),
+      C_ok: this.normalizeThresholdValue(configured?.C_ok, defaults.C_ok),
+      R_low: this.normalizeThresholdValue(configured?.R_low, defaults.R_low),
+      R_high: this.normalizeThresholdValue(configured?.R_high, defaults.R_high),
+    };
+
+    if (thresholds.C_min > thresholds.C_ok) {
+      logger.warn('治理阈值无效，已回退默认值（C_min > C_ok）', {
+        configured: thresholds,
+        defaults,
+      }, LogCategory.ORCHESTRATOR);
+      thresholds.C_min = defaults.C_min;
+      thresholds.C_ok = defaults.C_ok;
+    }
+
+    if (thresholds.R_low > thresholds.R_high) {
+      logger.warn('治理阈值无效，已回退默认值（R_low > R_high）', {
+        configured: thresholds,
+        defaults,
+      }, LogCategory.ORCHESTRATOR);
+      thresholds.R_low = defaults.R_low;
+      thresholds.R_high = defaults.R_high;
+    }
+
+    return thresholds;
+  }
+
+  private normalizeThresholdValue(raw: unknown, fallback: number): number {
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value < 0 || value > 1) {
+      return fallback;
+    }
+    return value;
+  }
+
+  private buildGovernanceSummary(assessment: PlanGovernanceAssessment): string {
+    return [
+      '### 治理评估',
+      `- risk_score: ${assessment.riskScore.toFixed(3)}`,
+      `- confidence: ${assessment.confidence.toFixed(3)}`,
+      `- affected_files: ${assessment.affectedFiles}`,
+      `- cross_modules: ${assessment.crossModules}`,
+      `- write_tool_ratio: ${assessment.writeToolRatio.toFixed(3)}`,
+      `- historical_failure_rate: ${assessment.historicalFailureRate.toFixed(3)}`,
+      `- source_coverage: ${assessment.sourceCoverage.toFixed(3)}`,
+      `- signal_agreement: ${assessment.signalAgreement.toFixed(3)}`,
+      `- historical_calibration: ${assessment.historicalCalibration.toFixed(3)}`,
+      `- approval_decision: ${assessment.decision}`,
+      `- gate_reasons: ${assessment.reasons.join('; ') || 'none'}`,
+    ].join('\n');
+  }
+
+  private buildFallbackGovernanceAssessment(error: unknown): PlanGovernanceAssessment {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const clipped = errorMessage.replace(/\s+/g, ' ').trim().slice(0, 160);
+    return {
+      riskScore: 1,
+      confidence: 0,
+      affectedFiles: 1,
+      crossModules: 1,
+      writeToolRatio: 1,
+      historicalFailureRate: 0.5,
+      sourceCoverage: 0,
+      signalAgreement: 0,
+      historicalCalibration: 0,
+      decision: 'ask',
+      reasons: [`assessment_error(${clipped || 'unknown'})`],
+    };
+  }
+
+  private estimateWriteToolRatio(prompt: string, mode: PlanMode): number {
+    if (mode === 'deep') {
+      return 0.9;
+    }
+    const text = (prompt || '').toLowerCase();
+    const readOnlyKeywords = ['总结', '分析', '读取', '解释', 'review', 'summarize', 'read only', 'diagnose'];
+    if (readOnlyKeywords.some((keyword) => text.includes(keyword))) {
+      return 0.2;
+    }
+    return 0.7;
+  }
+
+  private estimateAnalysisSignal(plan: PlanRecord, prompt: string): GovernanceSignalEstimate {
+    const files = new Set<string>();
+    const modules = new Set<string>();
+    for (const item of plan.items) {
+      for (const file of item.targetFiles || []) {
+        const normalized = this.normalizeRelativePath(file);
+        if (!normalized) {
+          continue;
+        }
+        files.add(normalized);
+        modules.add(this.inferModuleFromPath(normalized));
+      }
+    }
+    for (const candidate of this.extractPathLikeCandidates(prompt)) {
+      const normalized = this.normalizeRelativePath(candidate);
+      if (!normalized) {
+        continue;
+      }
+      files.add(normalized);
+      modules.add(this.inferModuleFromPath(normalized));
+    }
+    return {
+      files,
+      modules,
+      available: files.size > 0 || modules.size > 0,
+    };
+  }
+
+  private estimateStaticSignal(prompt: string): GovernanceSignalEstimate {
+    const index = this.getWorkspaceFileIndex();
+    const files = new Set<string>();
+    const modules = new Set<string>();
+    const tokens = this.extractPromptTokens(prompt);
+    if (tokens.length === 0) {
+      return { files, modules, available: false };
+    }
+
+    for (const file of index.files) {
+      const lower = file.toLowerCase();
+      if (tokens.some((token) => lower.includes(token))) {
+        files.add(file);
+        modules.add(this.inferModuleFromPath(file));
+        if (files.size >= 60) {
+          break;
+        }
+      }
+    }
+
+    if (files.size === 0) {
+      for (const moduleName of index.modules) {
+        const lower = moduleName.toLowerCase();
+        if (tokens.some((token) => lower.includes(token) || token.includes(lower))) {
+          modules.add(moduleName);
+        }
+      }
+    }
+
+    return {
+      files,
+      modules,
+      available: files.size > 0 || modules.size > 0,
+    };
+  }
+
+  private estimateHistoricalSignal(sessionId: string, currentPlanId: string): {
+    files: Set<string>;
+    modules: Set<string>;
+    failureRate: number;
+    calibration: number;
+    available: boolean;
+  } {
+    const files = new Set<string>();
+    const modules = new Set<string>();
+    const history = this.planLedger
+      .listPlans(sessionId, 30)
+      .filter((item) => item.planId !== currentPlanId);
+    if (history.length === 0) {
+      return {
+        files,
+        modules,
+        failureRate: 0.15,
+        calibration: 0.2,
+        available: false,
+      };
+    }
+
+    let failedCount = 0;
+    for (const plan of history) {
+      if (plan.status === 'failed' || plan.status === 'cancelled' || plan.status === 'partially_completed') {
+        failedCount += 1;
+      }
+      for (const item of plan.items) {
+        for (const file of item.targetFiles || []) {
+          const normalized = this.normalizeRelativePath(file);
+          if (!normalized) {
+            continue;
+          }
+          files.add(normalized);
+          modules.add(this.inferModuleFromPath(normalized));
+          if (files.size >= 60) {
+            break;
+          }
+        }
+      }
+    }
+
+    const sampleCount = history.length;
+    const failureRate = sampleCount > 0 ? Math.min(1, failedCount / sampleCount) : 0.15;
+    const calibration = sampleCount >= 12
+      ? 0.9
+      : sampleCount >= 8
+        ? 0.75
+        : sampleCount >= 4
+          ? 0.55
+          : 0.35;
+
+    return {
+      files,
+      modules,
+      failureRate,
+      calibration,
+      available: sampleCount >= 3,
+    };
+  }
+
+  private computeJaccard(left: Set<string>, right: Set<string>): number {
+    if (left.size === 0 && right.size === 0) {
+      return 1;
+    }
+    if (left.size === 0 || right.size === 0) {
+      return 0;
+    }
+    let intersection = 0;
+    for (const item of left) {
+      if (right.has(item)) {
+        intersection += 1;
+      }
+    }
+    const union = left.size + right.size - intersection;
+    if (union <= 0) {
+      return 0;
+    }
+    return intersection / union;
+  }
+
+  private extractPathLikeCandidates(prompt: string): string[] {
+    if (!prompt.trim()) {
+      return [];
+    }
+    const matches = prompt.match(/[A-Za-z0-9._/-]+\.[A-Za-z0-9]+/g) || [];
+    return Array.from(new Set(matches.map((item) => item.trim()).filter(Boolean)));
+  }
+
+  private extractPromptTokens(prompt: string): string[] {
+    const normalized = (prompt || '').toLowerCase();
+    const tokens = normalized.match(/[a-z0-9_]{3,}/g) || [];
+    return Array.from(new Set(tokens)).slice(0, 24);
+  }
+
+  private getWorkspaceFileIndex(): { files: string[]; modules: string[] } {
+    const now = Date.now();
+    if (this.workspaceFileIndexCache && now - this.workspaceFileIndexCache.builtAt < 60_000) {
+      return {
+        files: this.workspaceFileIndexCache.files,
+        modules: this.workspaceFileIndexCache.modules,
+      };
+    }
+
+    const files: string[] = [];
+    const modules = new Set<string>();
+    const excluded = new Set(['.git', 'node_modules', '.magi', 'out', 'dist', 'build', 'coverage']);
+    const collect = (currentDir: string, depth: number): void => {
+      if (files.length >= 5000 || depth > 12) {
+        return;
+      }
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(currentDir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (files.length >= 5000) {
+          break;
+        }
+        if (entry.name.startsWith('.') && entry.name !== '.env.example') {
+          if (entry.name !== '.github' && entry.name !== '.vscode') {
+            continue;
+          }
+        }
+        if (excluded.has(entry.name)) {
+          continue;
+        }
+        const absolutePath = path.join(currentDir, entry.name);
+        if (entry.isDirectory()) {
+          collect(absolutePath, depth + 1);
+          continue;
+        }
+        const relative = this.normalizeRelativePath(path.relative(this.workspaceRoot, absolutePath));
+        if (!relative) {
+          continue;
+        }
+        files.push(relative);
+        modules.add(this.inferModuleFromPath(relative));
+      }
+    };
+
+    collect(this.workspaceRoot, 0);
+    const moduleList = Array.from(modules).filter(Boolean);
+    this.workspaceFileIndexCache = {
+      builtAt: now,
+      files,
+      modules: moduleList,
+    };
+    return { files, modules: moduleList };
+  }
+
+  private normalizeRelativePath(input: string): string {
+    const normalized = input.replace(/\\/g, '/').replace(/^\.\//, '').trim();
+    return normalized;
+  }
+
+  private inferModuleFromPath(file: string): string {
+    const normalized = this.normalizeRelativePath(file);
+    if (!normalized) {
+      return '';
+    }
+    const first = normalized.split('/')[0] || '';
+    return first || normalized;
+  }
+
+  private persistTerminationMetrics(input: {
+    sessionId?: string;
+    planId?: string | null;
+    turnId?: string | null;
+    mode: PlanMode;
+    finalPlanStatus: 'completed' | 'failed' | 'cancelled' | null;
+    runtimeReason?: string;
+    runtimeRounds?: number;
+    runtimeSnapshot?: RuntimeTerminationSnapshot;
+    runtimeShadow?: RuntimeTerminationShadow;
+    tokenUsage?: TokenUsage;
+    startedAt: number;
+  }): void {
+    const sessionId = input.sessionId?.trim();
+    if (!sessionId) {
+      return;
+    }
+
+    const snapshot = input.runtimeSnapshot;
+    const durationMsFromBudget = snapshot?.budgetState?.elapsedMs;
+    const tokenUsedFromBudget = snapshot?.budgetState?.tokenUsed;
+    const durationMs = Number.isFinite(durationMsFromBudget)
+      ? Number(durationMsFromBudget)
+      : Math.max(0, Date.now() - input.startedAt);
+    const tokenUsed = Number.isFinite(tokenUsedFromBudget)
+      ? Number(tokenUsedFromBudget)
+      : (input.tokenUsage?.inputTokens || 0) + (input.tokenUsage?.outputTokens || 0);
+
+    const record: TerminationMetricsRecord = {
+      timestamp: new Date().toISOString(),
+      session_id: sessionId,
+      plan_id: input.planId || null,
+      turn_id: input.turnId || null,
+      mode: input.mode,
+      final_status: input.finalPlanStatus || 'unknown',
+      reason: input.runtimeReason || 'unknown',
+      rounds: Math.max(0, input.runtimeRounds || 0),
+      duration_ms: durationMs,
+      token_used: tokenUsed,
+      evidence_ids: Array.isArray(snapshot?.sourceEventIds) ? snapshot?.sourceEventIds : [],
+      progress_vector: snapshot?.progressVector || null,
+      review_state: snapshot?.reviewState || null,
+      blocker_state: snapshot?.blockerState || null,
+      budget_state: snapshot?.budgetState || null,
+      required_total: snapshot?.requiredTotal ?? null,
+      failed_required: snapshot?.failedRequired ?? null,
+      running_or_pending_required: snapshot?.runningOrPendingRequired ?? null,
+      shadow: input.runtimeShadow || null,
+    };
+    this.terminationMetricsRepository.append(record);
+  }
+
   resolvePlanConfirmation(confirmed: boolean): boolean {
     if (!this.pendingPlanConfirmation) {
       return false;
@@ -376,10 +909,20 @@ export class MissionDrivenEngine extends EventEmitter {
     sessionId: string,
     plan: PlanRecord,
     fallbackFormattedPlan: string,
+    options?: {
+      forceManual?: boolean;
+      governanceSummary?: string;
+    },
   ): Promise<boolean> {
     const awaitingPlan = await this.planLedger.markAwaitingConfirmation(sessionId, plan.planId, fallbackFormattedPlan);
     const displayPlan = awaitingPlan || plan;
-    const formattedPlan = displayPlan.formattedPlan || fallbackFormattedPlan;
+    const governanceSummary = typeof options?.governanceSummary === 'string'
+      ? options.governanceSummary.trim()
+      : '';
+    const baseFormattedPlan = displayPlan.formattedPlan || fallbackFormattedPlan;
+    const formattedPlan = governanceSummary
+      ? `${baseFormattedPlan}\n\n${governanceSummary}`
+      : baseFormattedPlan;
 
     this.messageHub.data('confirmationRequest', {
       sessionId,
@@ -395,6 +938,7 @@ export class MissionDrivenEngine extends EventEmitter {
         })),
       },
       formattedPlan,
+      forceManual: options?.forceManual === true,
     });
 
     this.setState('waiting_confirmation');
@@ -452,6 +996,89 @@ export class MissionDrivenEngine extends EventEmitter {
     return null;
   }
 
+  private classifyAttemptTerminalStatus(success: boolean, message?: string): 'succeeded' | 'failed' | 'timeout' | 'cancelled' {
+    if (success) {
+      return 'succeeded';
+    }
+
+    const normalized = (message || '').toLowerCase();
+    if (/timeout|timed out|deadline|超时|budget_exceeded|external_wait_timeout|stalled/.test(normalized)) {
+      return 'timeout';
+    }
+    if (/cancel|cancelled|canceled|abort|aborted|interrupted|用户中断|外部中断/.test(normalized)) {
+      return 'cancelled';
+    }
+    return 'failed';
+  }
+
+  private mapAttemptToAssignmentStatus(
+    status: 'succeeded' | 'failed' | 'timeout' | 'cancelled',
+  ): 'completed' | 'failed' | 'cancelled' {
+    if (status === 'succeeded') {
+      return 'completed';
+    }
+    if (status === 'cancelled') {
+      return 'cancelled';
+    }
+    return 'failed';
+  }
+
+  private mapAttemptToTodoStatus(
+    status: 'succeeded' | 'failed' | 'timeout' | 'cancelled',
+  ): 'completed' | 'failed' | 'cancelled' {
+    if (status === 'succeeded') {
+      return 'completed';
+    }
+    if (status === 'cancelled') {
+      return 'cancelled';
+    }
+    return 'failed';
+  }
+
+  private extractAssignmentFailureMessage(data: unknown): string | undefined {
+    const payload = data as {
+      error?: unknown;
+      summary?: unknown;
+      result?: { errors?: unknown };
+    };
+
+    if (typeof payload?.error === 'string' && payload.error.trim()) {
+      return payload.error.trim();
+    }
+    if (Array.isArray(payload?.result?.errors)) {
+      const merged = payload.result.errors
+        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        .map((item) => item.trim())
+        .join(' | ');
+      if (merged) {
+        return merged;
+      }
+    }
+    if (typeof payload?.summary === 'string' && payload.summary.trim()) {
+      return payload.summary.trim();
+    }
+    return undefined;
+  }
+
+  private mapOrchestratorRuntimeReasonToAttemptStatus(
+    runtimeReason?: string,
+  ): 'succeeded' | 'failed' | 'timeout' | 'cancelled' {
+    switch (runtimeReason) {
+      case 'completed':
+        return 'succeeded';
+      case 'cancelled':
+      case 'external_abort':
+      case 'interrupted':
+        return 'cancelled';
+      case 'budget_exceeded':
+      case 'external_wait_timeout':
+      case 'stalled':
+        return 'timeout';
+      default:
+        return 'failed';
+    }
+  }
+
   private reportPlanLedgerAsyncError(action: string, error: unknown): void {
     logger.warn('编排器.计划账本.异步回写失败', {
       action,
@@ -484,9 +1111,15 @@ export class MissionDrivenEngine extends EventEmitter {
         }, LogCategory.ORCHESTRATOR);
         return;
       }
-      void this.planLedger
-        .updateAssignmentStatus(this.currentSessionId, this.currentPlanId, assignmentId, 'running')
-        .catch((error) => this.reportPlanLedgerAsyncError('assignmentStarted', error));
+      void (async () => {
+        await this.planLedger.startAttempt(this.currentSessionId!, this.currentPlanId!, {
+          scope: 'assignment',
+          targetId: assignmentId,
+          assignmentId,
+          reason: 'assignment-started',
+        });
+        await this.planLedger.updateAssignmentStatus(this.currentSessionId!, this.currentPlanId!, assignmentId, 'running');
+      })().catch((error) => this.reportPlanLedgerAsyncError('assignmentStarted', error));
     });
 
     this.missionOrchestrator.on('assignmentCompleted', (data) => {
@@ -500,59 +1133,125 @@ export class MissionDrivenEngine extends EventEmitter {
         }, LogCategory.ORCHESTRATOR);
         return;
       }
-      void this.planLedger
-        .updateAssignmentStatus(
-          this.currentSessionId,
-          this.currentPlanId,
+      const success = Boolean((data as { success?: unknown }).success);
+      const failureMessage = success ? undefined : this.extractAssignmentFailureMessage(data);
+      const attemptStatus = this.classifyAttemptTerminalStatus(success, failureMessage);
+      const assignmentStatus = this.mapAttemptToAssignmentStatus(attemptStatus);
+      void (async () => {
+        await this.planLedger.completeLatestAttempt(this.currentSessionId!, this.currentPlanId!, {
+          scope: 'assignment',
+          targetId: assignmentId,
           assignmentId,
-          data.success ? 'completed' : 'failed',
-        )
-        .catch((error) => this.reportPlanLedgerAsyncError('assignmentCompleted', error));
+          status: attemptStatus,
+          reason: success ? 'assignment-completed' : 'assignment-failed',
+          error: failureMessage,
+        });
+        await this.planLedger.updateAssignmentStatus(
+          this.currentSessionId!,
+          this.currentPlanId!,
+          assignmentId,
+          assignmentStatus,
+        );
+      })().catch((error) => this.reportPlanLedgerAsyncError('assignmentCompleted', error));
     });
 
     this.missionOrchestrator.on('todoStarted', (data) => {
       if (!this.currentPlanId || !this.currentSessionId) {
         return;
       }
-      void this.planLedger
-        .updateTodoStatus(
-          this.currentSessionId,
-          this.currentPlanId,
-          data.assignmentId,
-          data.todoId,
+      const assignmentId = typeof data.assignmentId === 'string' ? data.assignmentId.trim() : '';
+      const todoId = typeof data.todoId === 'string' ? data.todoId.trim() : '';
+      if (!assignmentId || !todoId) {
+        logger.warn('编排器.计划账本.todoStarted.缺少关键字段', {
+          assignmentId: data.assignmentId,
+          todoId: data.todoId,
+        }, LogCategory.ORCHESTRATOR);
+        return;
+      }
+      void (async () => {
+        await this.planLedger.startAttempt(this.currentSessionId!, this.currentPlanId!, {
+          scope: 'todo',
+          targetId: todoId,
+          assignmentId,
+          todoId,
+          reason: 'todo-started',
+        });
+        await this.planLedger.updateTodoStatus(
+          this.currentSessionId!,
+          this.currentPlanId!,
+          assignmentId,
+          todoId,
           'running',
-        )
-        .catch((error) => this.reportPlanLedgerAsyncError('todoStarted', error));
+        );
+      })().catch((error) => this.reportPlanLedgerAsyncError('todoStarted', error));
     });
 
     this.missionOrchestrator.on('todoCompleted', (data) => {
       if (!this.currentPlanId || !this.currentSessionId) {
         return;
       }
-      void this.planLedger
-        .updateTodoStatus(
-          this.currentSessionId,
-          this.currentPlanId,
-          data.assignmentId,
-          data.todoId,
+      const assignmentId = typeof data.assignmentId === 'string' ? data.assignmentId.trim() : '';
+      const todoId = typeof data.todoId === 'string' ? data.todoId.trim() : '';
+      if (!assignmentId || !todoId) {
+        logger.warn('编排器.计划账本.todoCompleted.缺少关键字段', {
+          assignmentId: data.assignmentId,
+          todoId: data.todoId,
+        }, LogCategory.ORCHESTRATOR);
+        return;
+      }
+      void (async () => {
+        await this.planLedger.completeLatestAttempt(this.currentSessionId!, this.currentPlanId!, {
+          scope: 'todo',
+          targetId: todoId,
+          assignmentId,
+          todoId,
+          status: 'succeeded',
+          reason: 'todo-completed',
+        });
+        await this.planLedger.updateTodoStatus(
+          this.currentSessionId!,
+          this.currentPlanId!,
+          assignmentId,
+          todoId,
           'completed',
-        )
-        .catch((error) => this.reportPlanLedgerAsyncError('todoCompleted', error));
+        );
+      })().catch((error) => this.reportPlanLedgerAsyncError('todoCompleted', error));
     });
 
     this.missionOrchestrator.on('todoFailed', (data) => {
       if (!this.currentPlanId || !this.currentSessionId) {
         return;
       }
-      void this.planLedger
-        .updateTodoStatus(
-          this.currentSessionId,
-          this.currentPlanId,
-          data.assignmentId,
-          data.todoId,
-          'failed',
-        )
-        .catch((error) => this.reportPlanLedgerAsyncError('todoFailed', error));
+      const assignmentId = typeof data.assignmentId === 'string' ? data.assignmentId.trim() : '';
+      const todoId = typeof data.todoId === 'string' ? data.todoId.trim() : '';
+      const errorMessage = typeof data.error === 'string' ? data.error.trim() : '';
+      if (!assignmentId || !todoId) {
+        logger.warn('编排器.计划账本.todoFailed.缺少关键字段', {
+          assignmentId: data.assignmentId,
+          todoId: data.todoId,
+        }, LogCategory.ORCHESTRATOR);
+        return;
+      }
+      const attemptStatus = this.classifyAttemptTerminalStatus(false, errorMessage || undefined);
+      const todoStatus = this.mapAttemptToTodoStatus(attemptStatus);
+      void (async () => {
+        await this.planLedger.completeLatestAttempt(this.currentSessionId!, this.currentPlanId!, {
+          scope: 'todo',
+          targetId: todoId,
+          assignmentId,
+          todoId,
+          status: attemptStatus,
+          reason: 'todo-failed',
+          error: errorMessage || undefined,
+        });
+        await this.planLedger.updateTodoStatus(
+          this.currentSessionId!,
+          this.currentPlanId!,
+          assignmentId,
+          todoId,
+          todoStatus,
+        );
+      })().catch((error) => this.reportPlanLedgerAsyncError('todoFailed', error));
     });
 
     this.missionOrchestrator.on('missionStatusChanged', (data) => {
@@ -733,7 +1432,16 @@ export class MissionDrivenEngine extends EventEmitter {
       this.currentSessionId = sessionId;
       this.activeUserPrompt = trimmedPrompt;
       this.activeImagePaths = imagePaths;
+      const executeStartedAt = Date.now();
       let planFinalStatus: 'completed' | 'failed' | 'cancelled' | null = null;
+      let orchestratorAttemptStarted = false;
+      let orchestratorAttemptTargetId: string | null = null;
+      let orchestratorRuntimeReason: string | undefined;
+      let orchestratorRuntimeRounds = 0;
+      let orchestratorRuntimeSnapshot: RuntimeTerminationSnapshot | undefined;
+      let orchestratorRuntimeShadow: RuntimeTerminationShadow | undefined;
+      let runtimeTokenUsage: TokenUsage | undefined;
+      let currentPlanMode: PlanMode = this.adapterFactory.isDeepTask() ? 'deep' : 'standard';
 
       try {
         const resolvedSessionId = sessionId || this.sessionManager.getCurrentSession()?.id || taskId;
@@ -742,6 +1450,7 @@ export class MissionDrivenEngine extends EventEmitter {
         await this.ensureContextReady(resolvedSessionId);
 
         const planMode: PlanMode = this.adapterFactory.isDeepTask() ? 'deep' : 'standard';
+        currentPlanMode = planMode;
         const draftPlan = await this.planLedger.createDraft({
           sessionId: resolvedSessionId,
           turnId: this.currentTurnId || `turn:${Date.now()}`,
@@ -753,10 +1462,36 @@ export class MissionDrivenEngine extends EventEmitter {
         this.currentPlanId = draftPlan.planId;
 
         const fallbackFormattedPlan = draftPlan.formattedPlan || this.planLedger.formatPlanForDisplay(draftPlan);
-        if (this.interactionMode === 'ask') {
-          const confirmed = await this.awaitPlanConfirmation(resolvedSessionId, draftPlan, fallbackFormattedPlan);
+        let governanceAssessment: PlanGovernanceAssessment;
+        try {
+          governanceAssessment = await this.evaluatePlanGovernance(resolvedSessionId, draftPlan, trimmedPrompt);
+        } catch (error) {
+          logger.warn('编排器.治理评估.降级到人工确认', {
+            sessionId: resolvedSessionId,
+            planId: draftPlan.planId,
+            error: error instanceof Error ? error.message : String(error),
+          }, LogCategory.ORCHESTRATOR);
+          governanceAssessment = this.buildFallbackGovernanceAssessment(error);
+        }
+        const governanceSummary = this.buildGovernanceSummary(governanceAssessment);
+
+        const shouldAskConfirmation = this.interactionMode === 'ask' || governanceAssessment.decision === 'ask';
+        const forceManual = this.interactionMode === 'auto' && governanceAssessment.decision === 'ask';
+
+        if (shouldAskConfirmation) {
+          const confirmed = await this.awaitPlanConfirmation(
+            resolvedSessionId,
+            draftPlan,
+            fallbackFormattedPlan,
+            {
+              forceManual,
+              governanceSummary,
+            },
+          );
           if (!confirmed) {
-            const rejectReason = t('engine.plan.userCancelledReason');
+            const rejectReason = `${t('engine.plan.userCancelledReason')}${forceManual
+              ? `; governance_gate=${governanceAssessment.reasons.join('|') || 'manual_required'}`
+              : ''}`;
             await this.planLedger.reject(resolvedSessionId, draftPlan.planId, 'user', rejectReason);
             this.lastExecutionSuccess = false;
             this.lastExecutionErrors = [rejectReason];
@@ -765,12 +1500,29 @@ export class MissionDrivenEngine extends EventEmitter {
             this.currentTaskId = null;
             return t('engine.plan.userCancelledResult');
           }
-          await this.planLedger.approve(resolvedSessionId, draftPlan.planId, 'user');
+          await this.planLedger.approve(
+            resolvedSessionId,
+            draftPlan.planId,
+            'user',
+            `governance:manual;risk=${governanceAssessment.riskScore.toFixed(3)};confidence=${governanceAssessment.confidence.toFixed(3)};reasons=${governanceAssessment.reasons.join('|') || 'none'}`,
+          );
           this.setState('running');
         } else {
-          await this.planLedger.approve(resolvedSessionId, draftPlan.planId, 'system:auto');
+          await this.planLedger.approve(
+            resolvedSessionId,
+            draftPlan.planId,
+            'system:auto',
+            `governance:auto;risk=${governanceAssessment.riskScore.toFixed(3)};confidence=${governanceAssessment.confidence.toFixed(3)};reasons=none`,
+          );
         }
         await this.planLedger.markExecuting(resolvedSessionId, draftPlan.planId);
+        orchestratorAttemptTargetId = this.currentTurnId || `orchestrator-${Date.now()}`;
+        await this.planLedger.startAttempt(resolvedSessionId, draftPlan.planId, {
+          scope: 'orchestrator',
+          targetId: orchestratorAttemptTargetId,
+          reason: 'orchestrator-execution-started',
+        });
+        orchestratorAttemptStarted = true;
 
         // 1. 组装上下文
         const context = await this.prepareContext(resolvedSessionId, trimmedPrompt);
@@ -886,6 +1638,11 @@ export class MissionDrivenEngine extends EventEmitter {
             includeToolCalls: true,
           }
         );
+        orchestratorRuntimeReason = response.orchestratorRuntime?.reason;
+        orchestratorRuntimeRounds = response.orchestratorRuntime?.rounds || 0;
+        orchestratorRuntimeSnapshot = response.orchestratorRuntime?.snapshot as RuntimeTerminationSnapshot | undefined;
+        orchestratorRuntimeShadow = response.orchestratorRuntime?.shadow as RuntimeTerminationShadow | undefined;
+        runtimeTokenUsage = response.tokenUsage;
 
         this.recordOrchestratorTokens(response.tokenUsage);
 
@@ -941,6 +1698,7 @@ export class MissionDrivenEngine extends EventEmitter {
         const errorMessage = error instanceof Error ? error.message : String(error);
         // 中断导致的 abort 不视为执行失败，静默处理
         if (isAbortError(error)) {
+          orchestratorRuntimeReason = orchestratorRuntimeReason || 'interrupted';
           logger.info('编排器.统一执行.中断', { error: errorMessage }, LogCategory.ORCHESTRATOR);
           this.lastExecutionSuccess = false;
           this.lastExecutionErrors = [];
@@ -949,6 +1707,7 @@ export class MissionDrivenEngine extends EventEmitter {
           this.currentTaskId = null;
           return '';
         }
+        orchestratorRuntimeReason = orchestratorRuntimeReason || 'failed';
         this.lastExecutionSuccess = false;
         this.lastExecutionErrors = [errorMessage];
         planFinalStatus = 'failed';
@@ -959,6 +1718,29 @@ export class MissionDrivenEngine extends EventEmitter {
       } finally {
         const finalSessionId = this.currentSessionId;
         const finalPlanId = this.currentPlanId;
+        if (finalSessionId && finalPlanId && orchestratorAttemptStarted && orchestratorAttemptTargetId && planFinalStatus) {
+          const attemptStatus = planFinalStatus === 'completed'
+            ? 'succeeded'
+            : planFinalStatus === 'cancelled'
+              ? 'cancelled'
+              : this.mapOrchestratorRuntimeReasonToAttemptStatus(orchestratorRuntimeReason);
+          try {
+            await this.planLedger.completeLatestAttempt(finalSessionId, finalPlanId, {
+              scope: 'orchestrator',
+              targetId: orchestratorAttemptTargetId,
+              status: attemptStatus,
+              reason: orchestratorRuntimeReason || `orchestrator-finalized:${planFinalStatus}`,
+              error: attemptStatus === 'succeeded' ? undefined : this.lastExecutionErrors[0],
+            });
+          } catch (attemptError) {
+            logger.warn('编排器.计划账本.Attempt.终态更新失败', {
+              sessionId: finalSessionId,
+              planId: finalPlanId,
+              targetId: orchestratorAttemptTargetId,
+              error: attemptError instanceof Error ? attemptError.message : String(attemptError),
+            }, LogCategory.ORCHESTRATOR);
+          }
+        }
         if (finalSessionId && finalPlanId && planFinalStatus) {
           try {
             await this.planLedger.finalize(finalSessionId, finalPlanId, planFinalStatus);
@@ -970,6 +1752,19 @@ export class MissionDrivenEngine extends EventEmitter {
             }, LogCategory.ORCHESTRATOR);
           }
         }
+        this.persistTerminationMetrics({
+          sessionId: finalSessionId,
+          planId: finalPlanId,
+          turnId: this.currentTurnId,
+          mode: currentPlanMode,
+          finalPlanStatus: planFinalStatus,
+          runtimeReason: orchestratorRuntimeReason,
+          runtimeRounds: orchestratorRuntimeRounds,
+          runtimeSnapshot: orchestratorRuntimeSnapshot,
+          runtimeShadow: orchestratorRuntimeShadow,
+          tokenUsage: runtimeTokenUsage,
+          startedAt: executeStartedAt,
+        });
         const pendingConfirmation = this.pendingPlanConfirmation as {
           sessionId: string;
           planId: string;

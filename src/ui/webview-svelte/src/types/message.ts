@@ -351,6 +351,23 @@ export interface PlanLedgerItem {
   progress: number;
 }
 
+export interface PlanLedgerAttempt {
+  attemptId: string;
+  scope: 'orchestrator' | 'assignment' | 'todo';
+  targetId: string;
+  assignmentId?: string;
+  todoId?: string;
+  sequence: number;
+  status: 'created' | 'inflight' | 'succeeded' | 'failed' | 'timeout' | 'cancelled';
+  reason?: string;
+  error?: string;
+  evidenceIds: string[];
+  createdAt: number;
+  startedAt?: number;
+  endedAt?: number;
+  updatedAt: number;
+}
+
 export interface PlanLedgerRecord {
   planId: string;
   sessionId: string;
@@ -374,6 +391,7 @@ export interface PlanLedgerRecord {
   analysis?: string;
   formattedPlan?: string;
   items: PlanLedgerItem[];
+  attempts?: PlanLedgerAttempt[];
   createdAt: number;
   updatedAt: number;
 }

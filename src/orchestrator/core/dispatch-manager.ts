@@ -48,8 +48,28 @@ import type { SupplementaryInstructionQueue } from './supplementary-instruction-
 import { DispatchCompletionQueue } from './dispatch-completion-queue';
 import { DispatchRoutingService, type DispatchRoutingDecision } from './dispatch-routing-service';
 import { DispatchResumeContextStore } from './dispatch-resume-context-store';
+import { DispatchIdempotencyStore } from './dispatch-idempotency-store';
 import { isModelOriginIssue, toModelOriginUserMessage } from '../../errors/model-origin';
 import { trackModelOriginEvent } from '../../errors/model-origin-observability';
+import { createHash } from 'crypto';
+
+type DispatchAckState = 'pending' | 'acked' | 'nacked';
+
+interface DispatchExecutionProtocolState {
+  taskId: string;
+  batchId: string;
+  worker: WorkerSlot;
+  dispatchAttemptId: string;
+  idempotencyKey: string;
+  leaseId: string;
+  leaseExpireAt: number;
+  heartbeatAt: number;
+  ackState: DispatchAckState;
+  createdAt: number;
+  ackAt?: number;
+  nackReason?: string;
+  timeoutTriggered: boolean;
+}
 
 /**
  * DispatchManager 依赖接口
@@ -107,6 +127,11 @@ export class DispatchManager {
   };
   private static readonly RUNTIME_UNAVAILABLE_COOLDOWN_MS = 60_000;
   private static readonly MAX_MISSION_SESSION_RECORDS = 100;
+  private static readonly ACK_TIMEOUT_MS = 20_000;
+  private static readonly HEARTBEAT_INTERVAL_MS = 10_000;
+  private static readonly LEASE_TTL_MS = 60_000;
+  private static readonly LEASE_WATCH_INTERVAL_MS = 2_000;
+  private static readonly EXECUTION_TIMEOUT_MS = 20 * 60 * 1000;
 
   // Phase B+ 中间调用频率限制：按 batch 隔离，避免跨批次互相污染
   private phaseBPlusTimestamps = new Map<string, number>();
@@ -130,12 +155,17 @@ export class DispatchManager {
   private readonly resumeContextStore: DispatchResumeContextStore;
   /** 记录 dispatch task 的分类（用于可解释性与后续诊断） */
   private dispatchTaskCategories = new Map<string, string>();
+  /** dispatch 幂等账本（跨进程重放去重） */
+  private readonly dispatchIdempotencyStore: DispatchIdempotencyStore;
   /** 活跃的 Assignment 映射（Worker 执行期间可查，供 split_todo handler 使用） */
   private activeAssignments = new Map<string, Assignment>();
   /** Worker Lane 运行态：同一 Worker 同一时刻仅允许一个执行链 */
   private activeWorkerLanes = new Set<WorkerSlot>();
   /** Batch 级调度合并定时器 */
   private dispatchScheduleTimers = new Map<string, NodeJS.Timeout>();
+  /** 执行协议状态（ack/nack + lease + heartbeat） */
+  private executionProtocolStates = new Map<string, DispatchExecutionProtocolState>();
+  private leaseWatcherTimer?: NodeJS.Timeout;
 
   constructor(private deps: DispatchManagerDeps) {
     this.routingService = new DispatchRoutingService(
@@ -147,7 +177,9 @@ export class DispatchManager {
     this.resumeContextStore = new DispatchResumeContextStore(
       DispatchManager.MAX_MISSION_SESSION_RECORDS,
     );
+    this.dispatchIdempotencyStore = new DispatchIdempotencyStore(this.deps.workspaceRoot);
     this.setupMissionEventListeners();
+    this.startLeaseWatcher();
   }
 
   /**
@@ -170,6 +202,24 @@ export class DispatchManager {
         content,
         error: error || t('dispatch.common.unknownError'),
       }));
+    });
+
+    mo.on('assignmentStarted', ({ assignmentId, workerId }: { assignmentId: string; workerId?: WorkerSlot }) => {
+      this.markProtocolAck(assignmentId, workerId);
+    });
+
+    mo.on('workerHeartbeat', ({
+      assignmentId,
+      workerId,
+      timestamp,
+    }: {
+      assignmentId: string;
+      workerId: WorkerSlot;
+      timestamp: number;
+      todoId?: string;
+      sessionId?: string;
+    }) => {
+      this.updateProtocolHeartbeat(assignmentId, workerId, timestamp);
     });
 
     mo.on('insightGenerated', ({ workerId, type, content, importance }: { workerId: string; type: string; content: string; importance: string }) => {
@@ -250,6 +300,7 @@ export class DispatchManager {
     this.phaseBPlusTimestamps.clear();
     this.completionQueue.reset();
     this.activeWorkerLanes.clear();
+    this.clearAllProtocolStates();
     this.clearDispatchScheduleTimers();
     this.clearResumeContext();
   }
@@ -345,7 +396,7 @@ export class DispatchManager {
 
     orchestrationExecutor.setHandlers({
       dispatch: async (params) => {
-        const { task_name, goal, acceptance, constraints, context, files, scopeHint, dependsOn, category, requiresModification, contracts } = params;
+        const { task_name, goal, acceptance, constraints, context, files, scopeHint, dependsOn, category, requiresModification, contracts, idempotencyKey } = params;
         if (typeof requiresModification !== 'boolean') {
           return {
             task_id: '',
@@ -442,8 +493,90 @@ export class DispatchManager {
           };
         }
 
-        // 生成唯一 task_id
+        const resolvedSessionId = this.deps.getCurrentSessionId()?.trim() || '';
+        const sessionScopeForIdempotency = resolvedSessionId || 'unknown-session';
+        const effectiveIdempotencyKey = this.buildDispatchIdempotencyKey({
+          sessionId: sessionScopeForIdempotency,
+          missionId,
+          providedKey: idempotencyKey,
+          category: decision.category,
+          taskName: taskTitle,
+          goal: goalText || taskTitle,
+          acceptance: normalizedAcceptance,
+          constraints: normalizedConstraints,
+          context: normalizedContext,
+          scopeHint: normalizedScopeHint,
+          files: normalizedFiles,
+          dependsOn: normalizedDependsOn,
+        });
+        // 先生成候选 taskId，再通过 claimOrGet 做原子幂等占位，避免跨实例 TOCTOU 竞争。
         const taskId = `dispatch-${Date.now()}-${decision.selectedWorker}-${Math.random().toString(36).substring(2, 5)}`;
+        let idempotencyClaim: ReturnType<DispatchIdempotencyStore['claimOrGet']>;
+        try {
+          idempotencyClaim = this.dispatchIdempotencyStore.claimOrGet({
+            key: effectiveIdempotencyKey,
+            sessionId: sessionScopeForIdempotency,
+            missionId,
+            taskId,
+            worker: decision.selectedWorker,
+            category: decision.category,
+            taskName: taskTitle,
+            routingReason: decision.routingReason,
+            degraded: decision.degraded,
+            status: 'dispatched',
+          });
+        } catch (idempotencyError: any) {
+          logger.warn('编排工具.dispatch_task.幂等占位失败', {
+            idempotencyKey: effectiveIdempotencyKey,
+            sessionId: sessionScopeForIdempotency,
+            missionId,
+            error: idempotencyError?.message || String(idempotencyError),
+          }, LogCategory.ORCHESTRATOR);
+          return {
+            task_id: '',
+            status: 'failed' as const,
+            error: `dispatch 幂等占位失败：${idempotencyError?.message || String(idempotencyError)}`,
+          };
+        }
+        if (!idempotencyClaim.claimed) {
+          const existingIdempotent = idempotencyClaim.record;
+          const inCurrentBatch = this.activeBatch?.getEntry(existingIdempotent.taskId);
+          if (!inCurrentBatch) {
+            const blockedReason = `idempotency_key 命中历史派发(${existingIdempotent.taskId})，但当前批次不可恢复该任务，已阻止重复派发`;
+            logger.warn('编排工具.dispatch_task.幂等重放阻断', {
+              idempotencyKey: effectiveIdempotencyKey,
+              existingTaskId: existingIdempotent.taskId,
+              existingStatus: existingIdempotent.status,
+              sessionId: sessionScopeForIdempotency,
+              missionId,
+            }, LogCategory.ORCHESTRATOR);
+            return {
+              task_id: existingIdempotent.taskId,
+              status: 'failed' as const,
+              worker: existingIdempotent.worker,
+              category: existingIdempotent.category,
+              routing_reason: existingIdempotent.routingReason,
+              degraded: existingIdempotent.degraded,
+              error: blockedReason,
+            };
+          }
+
+          logger.info('编排工具.dispatch_task.幂等复用', {
+            idempotencyKey: effectiveIdempotencyKey,
+            taskId: existingIdempotent.taskId,
+            status: existingIdempotent.status,
+            sessionId: sessionScopeForIdempotency,
+            missionId,
+          }, LogCategory.ORCHESTRATOR);
+          return {
+            task_id: existingIdempotent.taskId,
+            status: 'dispatched' as const,
+            worker: existingIdempotent.worker,
+            category: existingIdempotent.category,
+            routing_reason: `${existingIdempotent.routingReason} [idempotency_reused]`,
+            degraded: existingIdempotent.degraded,
+          };
+        }
         this.dispatchTaskCategories.set(taskId, decision.category);
 
         // 确保 DispatchBatch 存在（一次 orchestrator LLM 调用共享一个 Batch）
@@ -496,6 +629,7 @@ export class DispatchManager {
           }
         } catch (regError: any) {
           this.dispatchTaskCategories.delete(taskId);
+          this.dispatchIdempotencyStore.removeByTaskId(taskId);
           return {
             task_id: taskId,
             status: 'failed' as const,
@@ -514,11 +648,10 @@ export class DispatchManager {
           : (normalizedDependsOn && normalizedDependsOn.length > 0 ? 'waiting_deps' : 'pending');
         const cardStatus = this.mapDispatchStatusToInitialCardStatus(entryStatus);
 
-        const currentSessionId = this.deps.getCurrentSessionId()?.trim();
-        if (currentSessionId && this.deps.onDispatchTaskRegistered) {
+        if (resolvedSessionId && this.deps.onDispatchTaskRegistered) {
           try {
             await this.deps.onDispatchTaskRegistered({
-              sessionId: currentSessionId,
+              sessionId: resolvedSessionId,
               missionId,
               taskId,
               worker: decision.selectedWorker,
@@ -536,6 +669,9 @@ export class DispatchManager {
               error: ledgerError instanceof Error ? ledgerError.message : String(ledgerError),
             }, LogCategory.ORCHESTRATOR);
           }
+        }
+        if (entryStatus === 'skipped') {
+          this.dispatchIdempotencyStore.updateStatusByTaskId(taskId, 'cancelled');
         }
 
         this.deps.messageHub.subTaskCard({
@@ -921,6 +1057,7 @@ export class DispatchManager {
     }
 
     const { resumeSessionId, resumePrompt } = this.getResumeContextForWorker(effectiveWorker);
+    const protocolState = this.registerProtocolState(taskId, batch?.id, effectiveWorker);
 
     // 标记开始运行
     batch?.markRunning(taskId);
@@ -989,6 +1126,7 @@ export class DispatchManager {
 
       const currentSessionId = this.deps.getCurrentSessionId()?.trim();
       if (!currentSessionId) {
+        this.markProtocolNack(taskId, 'missing-session-context');
         const errorMsg = t('dispatch.errors.currentSessionMissingCannotCreateTodo');
         this.deps.messageHub.subTaskCard({
           id: taskId,
@@ -1034,6 +1172,7 @@ export class DispatchManager {
           sessionId: currentSessionId,
           onReport: (report) => this.handleDispatchWorkerReport(report, batch),
           cancellationToken: batch?.cancellationToken,
+          heartbeatIntervalMs: DispatchManager.HEARTBEAT_INTERVAL_MS,
           imagePaths: this.deps.getActiveImagePaths(),
           // 反应式编排：补充指令回调（Worker 决策点消费队列中的用户追加指令）
           getSupplementaryInstructions: () => {
@@ -1118,6 +1257,7 @@ export class DispatchManager {
     } catch (error: any) {
       // C-09: 取消异常不按失败处理，cancelAll 已标记 cancelled 状态
       if (error instanceof CancellationError || error?.isCancellation) {
+        this.markProtocolNack(taskId, error.message || 'cancelled');
         this.deps.messageHub.subTaskCard({
           id: taskId,
           title: task,
@@ -1133,6 +1273,7 @@ export class DispatchManager {
 
       const rawErrorMsg = error?.message || String(error);
       const userErrorMsg = toModelOriginUserMessage(rawErrorMsg).trim() || rawErrorMsg;
+      this.markProtocolNack(taskId, userErrorMsg);
       if (isModelOriginIssue(rawErrorMsg) || isModelOriginIssue(userErrorMsg)) {
         trackModelOriginEvent('surfaced', 'dispatch:worker-failed', rawErrorMsg, {
           worker: effectiveWorker,
@@ -1183,7 +1324,10 @@ export class DispatchManager {
         taskId,
         error: rawErrorMsg,
         surfacedError: userErrorMsg,
+        dispatchAttemptId: protocolState.dispatchAttemptId,
       }, LogCategory.ORCHESTRATOR);
+    } finally {
+      this.clearProtocolState(taskId);
     }
   }
 
@@ -1418,6 +1562,13 @@ export class DispatchManager {
     // Worker 完成后重新检查是否有同类型排队任务可启动
     batch.on('task:statusChanged', (_taskId: string, status: DispatchStatus) => {
       if (isTerminalStatus(status)) {
+        this.clearProtocolState(_taskId);
+        const mappedStatus = status === 'completed'
+          ? 'completed'
+          : status === 'failed'
+            ? 'failed'
+            : 'cancelled';
+        this.dispatchIdempotencyStore.updateStatusByTaskId(_taskId, mappedStatus);
         this.scheduleDispatchReadyTasks(batch, { reason: 'task-terminal' });
 
         // 反应式编排：将完成结果推入队列，唤醒 waitForWorkers
@@ -1460,6 +1611,7 @@ export class DispatchManager {
       this.reactiveBatchAwaitingSummary.delete(batchId);
       this.phaseBPlusTimestamps.delete(batchId);
       this.clearBatchTaskCategories(batch);
+      this.clearProtocolStatesByBatch(batchId);
       this.activeWorkerLanes.clear();
       this.clearDispatchScheduleTimers(batchId);
       logger.info('DispatchBatch.已取消', { batchId, reason }, LogCategory.ORCHESTRATOR);
@@ -1470,6 +1622,7 @@ export class DispatchManager {
       if (phase === 'archived') {
         this.phaseBPlusTimestamps.delete(batch.id);
         this.clearBatchTaskCategories(batch);
+        this.clearProtocolStatesByBatch(batch.id);
         this.activeWorkerLanes.clear();
         this.clearDispatchScheduleTimers(batch.id);
         this.clearResumeContext();
@@ -1858,6 +2011,209 @@ export class DispatchManager {
     return waitResult;
   }
 
+  private startLeaseWatcher(): void {
+    if (this.leaseWatcherTimer) {
+      return;
+    }
+    this.leaseWatcherTimer = setInterval(() => {
+      this.checkProtocolLeases();
+    }, DispatchManager.LEASE_WATCH_INTERVAL_MS);
+  }
+
+  private stopLeaseWatcher(): void {
+    if (!this.leaseWatcherTimer) {
+      return;
+    }
+    clearInterval(this.leaseWatcherTimer);
+    this.leaseWatcherTimer = undefined;
+  }
+
+  private registerProtocolState(
+    taskId: string,
+    batchId: string | undefined,
+    worker: WorkerSlot,
+  ): DispatchExecutionProtocolState {
+    const now = Date.now();
+    const dispatchAttemptId = `dispatch-attempt-${taskId}-${now}-${Math.random().toString(36).slice(2, 8)}`;
+    const state: DispatchExecutionProtocolState = {
+      taskId,
+      batchId: batchId || 'unknown-batch',
+      worker,
+      dispatchAttemptId,
+      idempotencyKey: dispatchAttemptId,
+      leaseId: `lease-${taskId}-${now}-${Math.random().toString(36).slice(2, 8)}`,
+      leaseExpireAt: now + DispatchManager.LEASE_TTL_MS,
+      heartbeatAt: now,
+      ackState: 'pending',
+      createdAt: now,
+      timeoutTriggered: false,
+    };
+    this.executionProtocolStates.set(taskId, state);
+    return state;
+  }
+
+  private markProtocolAck(taskId: string, workerId?: WorkerSlot): void {
+    const normalizedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
+    if (!normalizedTaskId) {
+      return;
+    }
+    const state = this.executionProtocolStates.get(normalizedTaskId);
+    if (!state) {
+      return;
+    }
+    if (workerId && state.worker !== workerId) {
+      logger.warn('Dispatch.Protocol.ACK.Worker不一致', {
+        taskId: normalizedTaskId,
+        expectedWorker: state.worker,
+        actualWorker: workerId,
+      }, LogCategory.ORCHESTRATOR);
+    }
+    const now = Date.now();
+    state.ackState = 'acked';
+    state.ackAt = now;
+    state.heartbeatAt = now;
+    state.leaseExpireAt = now + DispatchManager.LEASE_TTL_MS;
+  }
+
+  private markProtocolNack(taskId: string, reason: string): void {
+    const normalizedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
+    if (!normalizedTaskId) {
+      return;
+    }
+    const state = this.executionProtocolStates.get(normalizedTaskId);
+    if (!state) {
+      return;
+    }
+    state.ackState = 'nacked';
+    state.nackReason = reason;
+    state.leaseExpireAt = Date.now();
+  }
+
+  private updateProtocolHeartbeat(taskId: string, workerId: WorkerSlot, timestamp: number): void {
+    const normalizedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
+    if (!normalizedTaskId) {
+      return;
+    }
+    const state = this.executionProtocolStates.get(normalizedTaskId);
+    if (!state) {
+      return;
+    }
+    const hbAt = Number.isFinite(timestamp) ? Math.floor(timestamp) : Date.now();
+    if (state.worker !== workerId) {
+      logger.warn('Dispatch.Protocol.Heartbeat.Worker不一致', {
+        taskId: normalizedTaskId,
+        expectedWorker: state.worker,
+        actualWorker: workerId,
+      }, LogCategory.ORCHESTRATOR);
+      return;
+    }
+    if (state.ackState === 'pending') {
+      state.ackState = 'acked';
+      state.ackAt = hbAt;
+    }
+    state.heartbeatAt = hbAt;
+    state.leaseExpireAt = hbAt + DispatchManager.LEASE_TTL_MS;
+    if (this.activeBatch?.id === state.batchId) {
+      this.activeBatch.touchActivity();
+    }
+  }
+
+  private checkProtocolLeases(): void {
+    if (this.executionProtocolStates.size === 0) {
+      return;
+    }
+    const now = Date.now();
+    for (const state of this.executionProtocolStates.values()) {
+      if (state.timeoutTriggered) {
+        continue;
+      }
+      if (now - state.createdAt > DispatchManager.EXECUTION_TIMEOUT_MS) {
+        this.failByProtocolTimeout(state, 'execution-timeout');
+        continue;
+      }
+      if (state.ackState === 'pending' && now - state.createdAt > DispatchManager.ACK_TIMEOUT_MS) {
+        this.failByProtocolTimeout(state, 'ack-timeout');
+        continue;
+      }
+      if (state.ackState === 'nacked') {
+        this.failByProtocolTimeout(state, `nack:${state.nackReason || 'unknown'}`);
+        continue;
+      }
+      if (state.ackState !== 'acked') {
+        continue;
+      }
+      if (state.leaseExpireAt <= now) {
+        this.failByProtocolTimeout(state, 'lease-expired');
+      }
+    }
+  }
+
+  private failByProtocolTimeout(state: DispatchExecutionProtocolState, reasonCode: string): void {
+    if (state.timeoutTriggered) {
+      return;
+    }
+    state.timeoutTriggered = true;
+
+    const batch = this.activeBatch?.id === state.batchId ? this.activeBatch : null;
+    const entry = batch?.getEntry(state.taskId);
+    if (!batch || !entry || isTerminalStatus(entry.status)) {
+      this.clearProtocolState(state.taskId);
+      return;
+    }
+
+    const timeoutMessage = `Worker ${state.worker} 执行异常终止（${reasonCode}），已结束本轮任务并回传编排者。`;
+    this.deps.messageHub.subTaskCard({
+      id: state.taskId,
+      title: entry.task,
+      status: 'failed',
+      worker: state.worker,
+      summary: timeoutMessage,
+      error: timeoutMessage,
+    });
+    this.deps.messageHub.workerError(state.worker, timeoutMessage);
+    batch.markFailed(state.taskId, {
+      success: false,
+      summary: timeoutMessage,
+      errors: [timeoutMessage],
+    });
+    void this.deps.adapterFactory.interrupt(state.worker).catch((error: any) => {
+      logger.warn('Dispatch.Protocol.Timeout.中断Worker失败', {
+        taskId: state.taskId,
+        worker: state.worker,
+        reasonCode,
+        error: error?.message || String(error),
+      }, LogCategory.ORCHESTRATOR);
+    });
+    logger.warn('Dispatch.Protocol.Timeout.已触发', {
+      taskId: state.taskId,
+      worker: state.worker,
+      reasonCode,
+      dispatchAttemptId: state.dispatchAttemptId,
+      leaseId: state.leaseId,
+    }, LogCategory.ORCHESTRATOR);
+    this.clearProtocolState(state.taskId);
+  }
+
+  private clearProtocolState(taskId: string): void {
+    const normalizedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
+    if (!normalizedTaskId) {
+      return;
+    }
+    this.executionProtocolStates.delete(normalizedTaskId);
+  }
+
+  private clearProtocolStatesByBatch(batchId: string): void {
+    for (const [taskId, state] of this.executionProtocolStates.entries()) {
+      if (state.batchId === batchId) {
+        this.executionProtocolStates.delete(taskId);
+      }
+    }
+  }
+
+  private clearAllProtocolStates(): void {
+    this.executionProtocolStates.clear();
+  }
+
   private clearBatchTaskCategories(batch: DispatchBatch): void {
     for (const entry of batch.getEntries()) {
       this.dispatchTaskCategories.delete(entry.taskId);
@@ -2211,6 +2567,47 @@ export class DispatchManager {
     return input.replace(/\\/g, '/').trim().replace(/^\.\//, '').replace(/\/+$/, '');
   }
 
+  private buildDispatchIdempotencyKey(input: {
+    sessionId: string;
+    missionId: string;
+    providedKey?: string;
+    category: string;
+    taskName: string;
+    goal: string;
+    acceptance: string[];
+    constraints: string[];
+    context: string[];
+    scopeHint?: string[];
+    files?: string[];
+    dependsOn?: string[];
+  }): string {
+    const scopePrefix = `${input.sessionId}::${input.missionId}::`;
+    const provided = typeof input.providedKey === 'string' ? input.providedKey.trim() : '';
+    if (provided) {
+      const digest = createHash('sha1').update(provided).digest('hex');
+      return `${scopePrefix}provided:${digest}`;
+    }
+
+    const normalizeArray = (items?: string[]): string[] =>
+      Array.isArray(items)
+        ? items.map(item => item.trim()).filter(Boolean).sort()
+        : [];
+
+    const payload = {
+      category: input.category,
+      taskName: input.taskName.trim(),
+      goal: input.goal.trim(),
+      acceptance: normalizeArray(input.acceptance),
+      constraints: normalizeArray(input.constraints),
+      context: normalizeArray(input.context),
+      scopeHint: normalizeArray(input.scopeHint),
+      files: normalizeArray(input.files),
+      dependsOn: normalizeArray(input.dependsOn),
+    };
+    const digest = createHash('sha1').update(JSON.stringify(payload)).digest('hex');
+    return `${scopePrefix}auto:${digest}`;
+  }
+
   private pathMatchesHint(filePath: string, hintPath: string): boolean {
     const file = this.normalizePath(filePath);
     const hint = this.normalizePath(hintPath);
@@ -2233,6 +2630,8 @@ export class DispatchManager {
     this.dispatchTaskCategories.clear();
     this.routingService.clearAllRuntimeUnavailable();
     this.activeWorkerLanes.clear();
+    this.stopLeaseWatcher();
+    this.clearAllProtocolStates();
     this.clearDispatchScheduleTimers();
   }
 }

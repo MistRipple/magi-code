@@ -204,6 +204,11 @@ export class TodoManager extends EventEmitter {
       prompt: params.prompt,
       type: params.type,
       workerId: params.workerId,
+      required: params.required ?? true,
+      effortWeight: typeof params.effortWeight === 'number' && params.effortWeight > 0
+        ? params.effortWeight
+        : 1,
+      waiverApproved: false,
       priority: params.priority ?? 3,
       dependsOn: params.dependsOn ?? [],
       requiredContracts: params.requiredContracts ?? [],

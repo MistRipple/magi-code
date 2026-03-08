@@ -1,0 +1,59 @@
+name: termination-governance-gate
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  governance-e2e-and-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Compile
+        run: npm run -s compile
+
+      - name: Run Core Governance E2E
+        run: |
+          npm run -s verify:e2e:dispatch-idempotency
+          npm run -s verify:e2e:dispatch-protocol
+          npm run -s verify:e2e:plan-governance-gate
+          npm run -s verify:e2e:orchestrator-termination
+          npm run -s verify:e2e:mode-governance
+          npm run -s verify:e2e:plan-ledger-attempt-lifecycle
+          npm run -s verify:e2e:worker-fail-fast
+          npm run -s verify:e2e:termination-ab-gate
+          npm run -s verify:e2e:termination-shadow-gate
+
+      - name: Run Release Gate Chain (CI)
+        run: npm run -s verify:ci:termination-gate
+
+      - name: Upload Termination Metrics Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: termination-governance-metrics
+          path: |
+            .magi/metrics/termination.jsonl
+            .magi/metrics/termination-baseline.jsonl
+            .magi/metrics/termination-baseline.meta.json
+            .magi/metrics/termination-dashboard.json
+            .magi/metrics/termination-dashboard.md
+            .magi/metrics/termination-ab-diff.json
+            .magi/metrics/termination-ab-diff.md
+          if-no-files-found: ignore

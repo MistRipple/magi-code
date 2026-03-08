@@ -61,6 +61,8 @@ export interface DispatchTaskCollaborationContracts {
 export type DispatchTaskHandler = (params: {
   worker: 'auto';
   category: string;
+  /** 幂等键：用于跨重试/重放去重，建议由调用方稳定提供 */
+  idempotencyKey?: string;
   /** 是否要求子任务对目标文件产生实际修改 */
   requiresModification: boolean;
   /** 结构化合同字段 */
@@ -452,6 +454,10 @@ export class OrchestrationExecutor {
           },
         },
       },
+      idempotency_key: {
+        type: 'string',
+        description: '可选幂等键。相同键在同一会话/任务上下文下会被判定为同一次派发，避免重复执行。',
+      },
     };
 
     return {
@@ -486,6 +492,7 @@ export class OrchestrationExecutor {
   private validateSingleTaskArgs(
     task: Record<string, any>,
     index: number,
+    fallbackIdempotencyKey: string,
   ): { ok: true; params: Parameters<DispatchTaskHandler>[0] } | { ok: false; error: string } {
     const prefix = `tasks[${index}]`;
 
@@ -524,6 +531,8 @@ export class OrchestrationExecutor {
 
     const contractsValidation = this.normalizeContracts(task.contracts);
     if (!contractsValidation.ok) return contractsValidation;
+    const rawIdempotencyKey = typeof task.idempotency_key === 'string' ? task.idempotency_key.trim() : '';
+    const idempotencyKey = rawIdempotencyKey || fallbackIdempotencyKey;
 
     const category = task.category.trim();
     const validCategories = this.getCategoryEnum();
@@ -536,6 +545,7 @@ export class OrchestrationExecutor {
       params: {
         worker: 'auto',
         category,
+        idempotencyKey,
         requiresModification: task.requires_modification,
         task_name: task.task_name.trim(),
         goal: task.goal.trim(),
@@ -564,7 +574,8 @@ export class OrchestrationExecutor {
     // 阶段 1：全量验证（任一任务校验失败则整批拒绝，避免部分派发）
     const validatedParams: Parameters<DispatchTaskHandler>[0][] = [];
     for (let i = 0; i < tasks.length; i++) {
-      const validation = this.validateSingleTaskArgs(tasks[i], i);
+      const fallbackIdempotencyKey = `${toolCall.id}:${i}`;
+      const validation = this.validateSingleTaskArgs(tasks[i], i, fallbackIdempotencyKey);
       if (!validation.ok) {
         return {
           toolCallId: toolCall.id,
@@ -1042,9 +1053,17 @@ export class OrchestrationExecutor {
         id: t.id,
         missionId: t.missionId,
         assignmentId: t.assignmentId,
+        parentId: t.parentId,
         content: t.content,
         status: t.status,
-        worker: t.workerId
+        worker: t.workerId,
+        blockedReason: t.blockedReason,
+        approvalStatus: t.approvalStatus,
+        dependsOn: t.dependsOn,
+        required: (t as any).required ?? true,
+        effortWeight: (t as any).effortWeight ?? 1,
+        waiverApproved: (t as any).waiverApproved ?? false,
+        createdAt: t.createdAt,
       }));
       return {
         toolCallId: toolCall.id,

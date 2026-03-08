@@ -57,6 +57,17 @@ export interface SnapshotConfig {
 /**
  * 编排器配置
  */
+export interface OrchestratorGovernanceThresholdsConfig {
+  /** 低置信度阈值：confidence < C_min => 强制人工 */
+  C_min: number;
+  /** 自动放行最低置信度：confidence >= C_ok */
+  C_ok: number;
+  /** 自动放行最高风险：risk <= R_low */
+  R_low: number;
+  /** 高风险强制人工阈值：risk >= R_high */
+  R_high: number;
+}
+
 export interface OrchestratorConfig {
   /** 计划确认阈值 */
   planConfirmationThreshold: 'low' | 'medium' | 'high';
@@ -64,6 +75,8 @@ export interface OrchestratorConfig {
   maxRetries: number;
   /** 默认超时 (ms) */
   defaultTimeout: number;
+  /** 治理门控阈值 */
+  governanceThresholds: OrchestratorGovernanceThresholdsConfig;
 }
 
 /**
@@ -105,6 +118,12 @@ export const DEFAULT_CONFIG: MagiConfig = {
     planConfirmationThreshold: 'medium',
     maxRetries: 3,
     defaultTimeout: 300000,
+    governanceThresholds: {
+      C_min: 0.55,
+      C_ok: 0.75,
+      R_low: 0.35,
+      R_high: 0.70,
+    },
   },
 };
 
@@ -184,6 +203,27 @@ export class ConfigManager {
       result.snapshot.maxCacheSize = parseInt(process.env.MAGI_SNAPSHOT_CACHE_SIZE, 10);
     }
 
+    // Orchestrator governance thresholds
+    const overrideThreshold = (
+      key: keyof OrchestratorGovernanceThresholdsConfig,
+      envKey: string,
+    ): void => {
+      const raw = process.env[envKey];
+      if (!raw) {
+        return;
+      }
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed)) {
+        console.warn(`Invalid governance threshold env ${envKey}: ${raw}`);
+        return;
+      }
+      result.orchestrator.governanceThresholds[key] = parsed;
+    };
+    overrideThreshold('C_min', 'MAGI_GOV_C_MIN');
+    overrideThreshold('C_ok', 'MAGI_GOV_C_OK');
+    overrideThreshold('R_low', 'MAGI_GOV_R_LOW');
+    overrideThreshold('R_high', 'MAGI_GOV_R_HIGH');
+
     return result;
   }
 
@@ -191,12 +231,24 @@ export class ConfigManager {
    * 合并配置
    */
   private mergeConfig(base: MagiConfig, override: Partial<MagiConfig>): MagiConfig {
+    const overrideOrchestrator = override.orchestrator;
+    const overrideGovernanceThresholds = overrideOrchestrator
+      ? (overrideOrchestrator as Partial<OrchestratorConfig>).governanceThresholds
+      : undefined;
+
     return {
       locale: override.locale ?? base.locale,
       context: { ...base.context, ...override.context },
       task: { ...base.task, ...override.task },
       snapshot: { ...base.snapshot, ...override.snapshot },
-      orchestrator: { ...base.orchestrator, ...override.orchestrator },
+      orchestrator: {
+        ...base.orchestrator,
+        ...overrideOrchestrator,
+        governanceThresholds: {
+          ...base.orchestrator.governanceThresholds,
+          ...(overrideGovernanceThresholds || {}),
+        },
+      },
     };
   }
 

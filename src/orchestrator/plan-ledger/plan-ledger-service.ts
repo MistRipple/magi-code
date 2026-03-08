@@ -7,6 +7,12 @@ import type { UnifiedTodo } from '../../todo/types';
 import type {
   CreatePlanDraftInput,
   DispatchPlanItemInput,
+  PlanAttemptCompleteInput,
+  PlanAttemptRecord,
+  PlanAttemptScope,
+  PlanAttemptStartInput,
+  PlanAttemptStatus,
+  PlanAttemptTerminalStatus,
   PlanIndexEntry,
   PlanItem,
   PlanItemStatus,
@@ -17,6 +23,20 @@ import type {
 } from './types';
 
 type MissionTerminalStatus = 'completed' | 'failed' | 'cancelled';
+
+interface NormalizedAttemptSelector {
+  scope: PlanAttemptScope;
+  targetId: string;
+  assignmentId?: string;
+  todoId?: string;
+}
+
+interface AttemptTransitionOptions {
+  reason?: string;
+  error?: string;
+  evidenceIds?: string[];
+  metadata?: Record<string, string | number | boolean | null>;
+}
 
 interface PlanLedgerEventRecord {
   timestamp: number;
@@ -29,6 +49,10 @@ interface PlanLedgerEventRecord {
   itemTotal: number;
   completedItems: number;
   failedItems: number;
+  attemptTotal: number;
+  inflightAttempts: number;
+  failedAttempts: number;
+  timeoutAttempts: number;
 }
 
 export interface PlanLedgerUpdateEvent {
@@ -45,6 +69,22 @@ const TERMINAL_PLAN_STATUSES = new Set<PlanStatus>([
   'rejected',
   'superseded',
 ]);
+
+const PLAN_ATTEMPT_TERMINAL_STATUSES = new Set<PlanAttemptStatus>([
+  'succeeded',
+  'failed',
+  'timeout',
+  'cancelled',
+]);
+
+const ATTEMPT_TRANSITIONS: Record<PlanAttemptStatus, PlanAttemptStatus[]> = {
+  created: ['inflight'],
+  inflight: ['succeeded', 'failed', 'timeout', 'cancelled'],
+  succeeded: [],
+  failed: [],
+  timeout: [],
+  cancelled: [],
+};
 
 export class PlanLedgerService extends EventEmitter {
   private readonly writeQueues = new Map<string, Promise<void>>();
@@ -92,6 +132,7 @@ export class PlanLedgerService extends EventEmitter {
         riskLevel: input.riskLevel,
         formattedPlan: input.formattedPlan?.trim() || undefined,
         items: [],
+        attempts: [],
         links: {
           assignmentIds: [],
           todoIds: [],
@@ -191,6 +232,161 @@ export class PlanLedgerService extends EventEmitter {
       record.updatedAt = Date.now();
       this.persistPlan(record);
       this.emitUpdated(record, 'mission-bound');
+      return record;
+    });
+  }
+
+  async startAttempt(sessionId: string, planId: string, input: PlanAttemptStartInput): Promise<PlanRecord | null> {
+    return this.runWithSessionQueue(sessionId, async () => {
+      const record = this.loadPlan(sessionId, planId);
+      if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
+        return null;
+      }
+
+      const normalized = this.normalizeAttemptInput(input);
+      const now = Date.now();
+      let updated = false;
+
+      let attempt = this.findLatestAttempt(record, normalized, ['created', 'inflight']);
+      if (attempt) {
+        if (attempt.status === 'created') {
+          updated = this.applyAttemptTransition(attempt, 'inflight', {
+            reason: normalized.reason,
+            metadata: normalized.metadata,
+          }) || updated;
+        } else {
+          updated = this.mergeAttemptAnnotations(attempt, {
+            reason: normalized.reason,
+            metadata: normalized.metadata,
+            updatedAt: now,
+          }) || updated;
+        }
+      } else {
+        const sequence = this.nextAttemptSequence(record, normalized);
+        attempt = {
+          attemptId: this.generateAttemptId(normalized.scope, normalized.targetId, sequence),
+          scope: normalized.scope,
+          targetId: normalized.targetId,
+          assignmentId: normalized.assignmentId,
+          todoId: normalized.todoId,
+          sequence,
+          status: 'created',
+          reason: normalized.reason,
+          evidenceIds: [],
+          metadata: normalized.metadata,
+          createdAt: now,
+          updatedAt: now,
+        };
+        updated = this.applyAttemptTransition(attempt, 'inflight', {
+          reason: normalized.reason,
+          metadata: normalized.metadata,
+        }) || updated;
+        record.attempts.push(attempt);
+        updated = true;
+      }
+
+      if (!updated) {
+        return record;
+      }
+
+      record.updatedAt = now;
+      this.persistPlan(record);
+      this.emitUpdated(record, 'attempt-started');
+      return record;
+    });
+  }
+
+  async completeLatestAttempt(sessionId: string, planId: string, input: PlanAttemptCompleteInput): Promise<PlanRecord | null> {
+    return this.runWithSessionQueue(sessionId, async () => {
+      const record = this.loadPlan(sessionId, planId);
+      if (!record) {
+        return null;
+      }
+
+      const normalized = this.normalizeAttemptInput(input);
+      const now = Date.now();
+      let attempt = this.findLatestAttempt(record, normalized, ['created', 'inflight']);
+      let updated = false;
+
+      if (!attempt) {
+        const latestAny = this.findLatestAttempt(record, normalized);
+        if (latestAny && PLAN_ATTEMPT_TERMINAL_STATUSES.has(latestAny.status)) {
+          const merged = this.mergeAttemptAnnotations(latestAny, {
+            reason: normalized.reason,
+            error: input.error,
+            evidenceIds: input.evidenceIds,
+            metadata: normalized.metadata,
+            updatedAt: now,
+          });
+          if (latestAny.status !== input.status) {
+            logger.warn('计划账本.Attempt.忽略无inflight的终态跳转', {
+              attemptId: latestAny.attemptId,
+              currentStatus: latestAny.status,
+              incomingStatus: input.status,
+              scope: normalized.scope,
+              targetId: normalized.targetId,
+            }, LogCategory.ORCHESTRATOR);
+          }
+          if (merged) {
+            record.updatedAt = now;
+            this.persistPlan(record);
+            this.emitUpdated(record, 'attempt-terminal-duplicate-merged');
+          }
+          return record;
+        }
+
+        if (!latestAny) {
+          const sequence = this.nextAttemptSequence(record, normalized);
+          attempt = {
+            attemptId: this.generateAttemptId(normalized.scope, normalized.targetId, sequence),
+            scope: normalized.scope,
+            targetId: normalized.targetId,
+            assignmentId: normalized.assignmentId,
+            todoId: normalized.todoId,
+            sequence,
+            status: 'created',
+            reason: normalized.reason || 'late-terminal-event:auto-started',
+            evidenceIds: [],
+            metadata: {
+              ...(normalized.metadata || {}),
+              autoStarted: true,
+            },
+            createdAt: now,
+            updatedAt: now,
+          };
+          updated = this.applyAttemptTransition(attempt, 'inflight', {
+            reason: attempt.reason,
+            metadata: attempt.metadata,
+          }) || updated;
+          record.attempts.push(attempt);
+          updated = true;
+        } else {
+          attempt = latestAny;
+        }
+      }
+
+      if (attempt.status === 'created') {
+        updated = this.applyAttemptTransition(attempt, 'inflight', {
+          reason: normalized.reason,
+          metadata: normalized.metadata,
+        }) || updated;
+      }
+
+      const transitioned = this.applyAttemptTransition(attempt, input.status, {
+        reason: normalized.reason,
+        error: input.error,
+        evidenceIds: input.evidenceIds,
+        metadata: normalized.metadata,
+      });
+      updated = transitioned || updated;
+
+      if (!updated) {
+        return record;
+      }
+
+      record.updatedAt = now;
+      this.persistPlan(record);
+      this.emitUpdated(record, `attempt-${input.status}`);
       return record;
     });
   }
@@ -390,7 +586,15 @@ export class PlanLedgerService extends EventEmitter {
         return record;
       }
 
+      const attemptTerminated = this.finalizeInflightAttemptsInRecord(
+        record,
+        this.mapMissionStatusToAttemptTerminalStatus(missionStatus),
+        `mission-finalized:${missionStatus}`,
+      );
       const inferredStatus = this.mapMissionStatusToPlanStatus(missionStatus, record);
+      if (!attemptTerminated && inferredStatus === record.status) {
+        return record;
+      }
       record.status = inferredStatus;
       record.updatedAt = Date.now();
       this.persistPlan(record);
@@ -405,7 +609,16 @@ export class PlanLedgerService extends EventEmitter {
       if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
         return record;
       }
-      record.status = this.mapMissionStatusToPlanStatus(status, record);
+      const attemptTerminated = this.finalizeInflightAttemptsInRecord(
+        record,
+        this.mapMissionStatusToAttemptTerminalStatus(status),
+        `plan-finalized:${status}`,
+      );
+      const nextStatus = this.mapMissionStatusToPlanStatus(status, record);
+      if (!attemptTerminated && nextStatus === record.status) {
+        return record;
+      }
+      record.status = nextStatus;
       record.updatedAt = Date.now();
       this.persistPlan(record);
       this.emitUpdated(record, 'finalized');
@@ -461,7 +674,12 @@ export class PlanLedgerService extends EventEmitter {
         }
 
         const nextStatus = this.mapMissionStatusToPlanStatus(missionTerminalStatus, record);
-        if (nextStatus === record.status) {
+        const attemptsTerminated = this.finalizeInflightAttemptsInRecord(
+          record,
+          this.mapMissionStatusToAttemptTerminalStatus(missionTerminalStatus),
+          `reconciled:${missionTerminalStatus}`,
+        );
+        if (nextStatus === record.status && !attemptsTerminated) {
           continue;
         }
 
@@ -594,6 +812,16 @@ export class PlanLedgerService extends EventEmitter {
     return completedItems > 0 ? 'partially_completed' : 'failed';
   }
 
+  private mapMissionStatusToAttemptTerminalStatus(status: MissionTerminalStatus): PlanAttemptTerminalStatus {
+    if (status === 'completed') {
+      return 'cancelled';
+    }
+    if (status === 'cancelled') {
+      return 'cancelled';
+    }
+    return 'failed';
+  }
+
   private computePlanStatus(record: PlanRecord, fallback?: PlanStatus): PlanStatus {
     const total = record.items.length;
     if (total === 0) {
@@ -698,6 +926,21 @@ export class PlanLedgerService extends EventEmitter {
     }
   }
 
+  private normalizeAttemptStatus(status: unknown): PlanAttemptStatus {
+    if (status === 'created' || status === 'inflight' || status === 'succeeded'
+      || status === 'failed' || status === 'timeout' || status === 'cancelled') {
+      return status;
+    }
+    return 'created';
+  }
+
+  private normalizeAttemptScope(scope: unknown): PlanAttemptScope {
+    if (scope === 'assignment' || scope === 'todo') {
+      return scope;
+    }
+    return 'orchestrator';
+  }
+
   private findItemByAssignment(record: PlanRecord, assignmentId: unknown): PlanItem | null {
     const normalized = this.normalizeIdentifier(assignmentId);
     if (!normalized) {
@@ -736,6 +979,230 @@ export class PlanLedgerService extends EventEmitter {
 
   private normalizeIdentifier(value: unknown): string {
     return typeof value === 'string' ? value.trim() : '';
+  }
+
+  private normalizeAttemptInput(input: PlanAttemptStartInput): NormalizedAttemptSelector & {
+    reason?: string;
+    metadata?: Record<string, string | number | boolean | null>;
+  } {
+    const scope: PlanAttemptScope = input.scope;
+    const assignmentId = this.normalizeIdentifier(input.assignmentId);
+    const todoId = this.normalizeIdentifier(input.todoId);
+    const explicitTargetId = this.normalizeIdentifier(input.targetId);
+
+    const targetId = explicitTargetId
+      || (scope === 'todo' ? todoId : '')
+      || (scope === 'assignment' ? assignmentId : '')
+      || 'orchestrator';
+
+    const normalized: NormalizedAttemptSelector & {
+      reason?: string;
+      metadata?: Record<string, string | number | boolean | null>;
+    } = {
+      scope,
+      targetId,
+      assignmentId: assignmentId || undefined,
+      todoId: todoId || undefined,
+      reason: typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : undefined,
+      metadata: this.normalizeAttemptMetadata(input.metadata),
+    };
+
+    return normalized;
+  }
+
+  private normalizeAttemptMetadata(
+    metadata?: Record<string, string | number | boolean | null>,
+  ): Record<string, string | number | boolean | null> | undefined {
+    if (!metadata || typeof metadata !== 'object') {
+      return undefined;
+    }
+    const normalizedEntries = Object.entries(metadata)
+      .filter(([key]) => typeof key === 'string' && key.trim().length > 0)
+      .map(([key, value]) => [key.trim(), value] as const)
+      .filter(([, value]) => (
+        typeof value === 'string'
+        || typeof value === 'number'
+        || typeof value === 'boolean'
+        || value === null
+      ));
+    if (normalizedEntries.length === 0) {
+      return undefined;
+    }
+    return Object.fromEntries(normalizedEntries);
+  }
+
+  private normalizeAttemptEvidenceIds(evidenceIds?: string[]): string[] {
+    return this.normalizeStringArray(evidenceIds);
+  }
+
+  private findLatestAttempt(
+    record: PlanRecord,
+    selector: NormalizedAttemptSelector,
+    statuses?: PlanAttemptStatus[],
+  ): PlanAttemptRecord | null {
+    const statusSet = statuses ? new Set(statuses) : null;
+    let latest: PlanAttemptRecord | null = null;
+
+    for (const attempt of record.attempts) {
+      if (attempt.scope !== selector.scope) {
+        continue;
+      }
+      if (attempt.targetId !== selector.targetId) {
+        continue;
+      }
+      if (selector.assignmentId && attempt.assignmentId !== selector.assignmentId) {
+        continue;
+      }
+      if (selector.todoId && attempt.todoId !== selector.todoId) {
+        continue;
+      }
+      if (statusSet && !statusSet.has(attempt.status)) {
+        continue;
+      }
+      if (!latest || attempt.sequence > latest.sequence || attempt.updatedAt > latest.updatedAt) {
+        latest = attempt;
+      }
+    }
+
+    return latest;
+  }
+
+  private nextAttemptSequence(record: PlanRecord, selector: NormalizedAttemptSelector): number {
+    let maxSequence = 0;
+    for (const attempt of record.attempts) {
+      if (attempt.scope !== selector.scope || attempt.targetId !== selector.targetId) {
+        continue;
+      }
+      if (selector.assignmentId && attempt.assignmentId !== selector.assignmentId) {
+        continue;
+      }
+      if (selector.todoId && attempt.todoId !== selector.todoId) {
+        continue;
+      }
+      if (attempt.sequence > maxSequence) {
+        maxSequence = attempt.sequence;
+      }
+    }
+    return maxSequence + 1;
+  }
+
+  private generateAttemptId(scope: PlanAttemptScope, targetId: string, sequence: number): string {
+    const safeTarget = targetId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48) || 'target';
+    return `attempt-${scope}-${safeTarget}-${sequence}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  private mergeAttemptAnnotations(
+    attempt: PlanAttemptRecord,
+    options: {
+      reason?: string;
+      error?: string;
+      evidenceIds?: string[];
+      metadata?: Record<string, string | number | boolean | null>;
+      updatedAt?: number;
+    },
+  ): boolean {
+    let updated = false;
+    const now = options.updatedAt || Date.now();
+
+    if (options.reason && options.reason !== attempt.reason) {
+      attempt.reason = options.reason;
+      updated = true;
+    }
+    if (options.error && options.error !== attempt.error) {
+      attempt.error = options.error;
+      updated = true;
+    }
+    if (options.evidenceIds && options.evidenceIds.length > 0) {
+      const mergedEvidenceIds = this.normalizeAttemptEvidenceIds([
+        ...attempt.evidenceIds,
+        ...options.evidenceIds,
+      ]);
+      if (mergedEvidenceIds.join('|') !== attempt.evidenceIds.join('|')) {
+        attempt.evidenceIds = mergedEvidenceIds;
+        updated = true;
+      }
+    }
+    if (options.metadata && Object.keys(options.metadata).length > 0) {
+      const nextMetadata = {
+        ...(attempt.metadata || {}),
+        ...options.metadata,
+      };
+      const oldKey = JSON.stringify(attempt.metadata || {});
+      const nextKey = JSON.stringify(nextMetadata);
+      if (oldKey !== nextKey) {
+        attempt.metadata = nextMetadata;
+        updated = true;
+      }
+    }
+    if (updated) {
+      attempt.updatedAt = now;
+    }
+    return updated;
+  }
+
+  private applyAttemptTransition(
+    attempt: PlanAttemptRecord,
+    nextStatus: PlanAttemptStatus,
+    options: AttemptTransitionOptions = {},
+  ): boolean {
+    if (attempt.status === nextStatus) {
+      return this.mergeAttemptAnnotations(attempt, {
+        reason: options.reason,
+        error: options.error,
+        evidenceIds: options.evidenceIds,
+        metadata: options.metadata,
+      });
+    }
+
+    const legalNext = ATTEMPT_TRANSITIONS[attempt.status] || [];
+    if (!legalNext.includes(nextStatus)) {
+      logger.warn('计划账本.Attempt.非法状态转移', {
+        attemptId: attempt.attemptId,
+        from: attempt.status,
+        to: nextStatus,
+      }, LogCategory.ORCHESTRATOR);
+      return false;
+    }
+
+    const now = Date.now();
+    attempt.status = nextStatus;
+    if (nextStatus === 'inflight') {
+      attempt.startedAt = attempt.startedAt || now;
+    }
+    if (PLAN_ATTEMPT_TERMINAL_STATUSES.has(nextStatus)) {
+      attempt.endedAt = now;
+    }
+    attempt.updatedAt = now;
+    this.mergeAttemptAnnotations(attempt, {
+      reason: options.reason,
+      error: options.error,
+      evidenceIds: options.evidenceIds,
+      metadata: options.metadata,
+      updatedAt: now,
+    });
+    return true;
+  }
+
+  private finalizeInflightAttemptsInRecord(
+    record: PlanRecord,
+    status: PlanAttemptTerminalStatus,
+    reason: string,
+  ): boolean {
+    let changed = false;
+    for (const attempt of record.attempts) {
+      if (attempt.status !== 'inflight' && attempt.status !== 'created') {
+        continue;
+      }
+      if (attempt.status === 'created') {
+        changed = this.applyAttemptTransition(attempt, 'inflight', {
+          reason,
+        }) || changed;
+      }
+      changed = this.applyAttemptTransition(attempt, status, {
+        reason,
+      }) || changed;
+    }
+    return changed;
   }
 
   private emitUpdated(record: PlanRecord, reason: string): void {
@@ -825,11 +1292,37 @@ export class PlanLedgerService extends EventEmitter {
         : {},
     }));
 
+    const normalizedAttempts = (Array.isArray(record.attempts) ? record.attempts : [])
+      .filter((attempt): attempt is PlanAttemptRecord => Boolean(attempt) && typeof attempt === 'object')
+      .map((attempt): PlanAttemptRecord => {
+        const scope = this.normalizeAttemptScope(attempt.scope);
+        const targetId = this.normalizeIdentifier(attempt.targetId) || 'orchestrator';
+        return {
+          attemptId: this.normalizeIdentifier(attempt.attemptId)
+            || `attempt-legacy-${scope}-${targetId}-${Number.isFinite(attempt.sequence) ? attempt.sequence : 1}`,
+          scope,
+          targetId,
+          assignmentId: this.normalizeIdentifier(attempt.assignmentId) || undefined,
+          todoId: this.normalizeIdentifier(attempt.todoId) || undefined,
+          sequence: Number.isFinite(attempt.sequence) && attempt.sequence > 0 ? Math.floor(attempt.sequence) : 1,
+          status: this.normalizeAttemptStatus(attempt.status),
+          reason: typeof attempt.reason === 'string' && attempt.reason.trim() ? attempt.reason.trim() : undefined,
+          error: typeof attempt.error === 'string' && attempt.error.trim() ? attempt.error.trim() : undefined,
+          evidenceIds: this.normalizeAttemptEvidenceIds(attempt.evidenceIds),
+          metadata: this.normalizeAttemptMetadata(attempt.metadata),
+          createdAt: Number.isFinite(attempt.createdAt) ? attempt.createdAt : Date.now(),
+          startedAt: Number.isFinite(attempt.startedAt) ? attempt.startedAt : undefined,
+          endedAt: Number.isFinite(attempt.endedAt) ? attempt.endedAt : undefined,
+          updatedAt: Number.isFinite(attempt.updatedAt) ? attempt.updatedAt : Date.now(),
+        };
+      });
+
     return {
       ...record,
       acceptanceCriteria: this.normalizeStringArray(record.acceptanceCriteria),
       constraints: this.normalizeStringArray(record.constraints),
       items: normalizedItems,
+      attempts: normalizedAttempts,
       links: {
         assignmentIds: this.normalizeStringArray(record.links?.assignmentIds),
         todoIds: this.normalizeStringArray(record.links?.todoIds),
@@ -951,6 +1444,10 @@ export class PlanLedgerService extends EventEmitter {
         itemTotal: record.items.length,
         completedItems: record.items.filter((item) => item.status === 'completed' || item.status === 'skipped').length,
         failedItems: record.items.filter((item) => item.status === 'failed' || item.status === 'cancelled').length,
+        attemptTotal: record.attempts.length,
+        inflightAttempts: record.attempts.filter((attempt) => attempt.status === 'created' || attempt.status === 'inflight').length,
+        failedAttempts: record.attempts.filter((attempt) => attempt.status === 'failed' || attempt.status === 'cancelled').length,
+        timeoutAttempts: record.attempts.filter((attempt) => attempt.status === 'timeout').length,
       };
       fs.appendFileSync(this.getEventsFilePath(record.sessionId, record.planId), `${JSON.stringify(event)}\n`, 'utf-8');
     } catch (error) {
@@ -1001,6 +1498,11 @@ export class PlanLedgerService extends EventEmitter {
         targetFiles: item.targetFiles ? [...item.targetFiles] : undefined,
         todoIds: [...item.todoIds],
         todoStatuses: { ...item.todoStatuses },
+      })),
+      attempts: record.attempts.map((attempt) => ({
+        ...attempt,
+        evidenceIds: [...attempt.evidenceIds],
+        metadata: attempt.metadata ? { ...attempt.metadata } : undefined,
       })),
     };
   }

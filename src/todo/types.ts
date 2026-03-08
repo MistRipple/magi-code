@@ -92,6 +92,12 @@ export interface UnifiedTodo {
   type: TodoType;
   /** 分配的 Worker */
   workerId: WorkerSlot;
+  /** 是否必需项（用于终止判定） */
+  required?: boolean;
+  /** 关键路径权重（默认 1） */
+  effortWeight?: number;
+  /** 跳过时是否经过豁免批准 */
+  waiverApproved?: boolean;
   /** 优先级 1-5，1 最高 */
   priority: number;
 
@@ -195,6 +201,8 @@ export interface CreateTodoParams {
   requiredContracts?: string[];
   producesContracts?: string[];
   targetFiles?: string[];
+  required?: boolean;
+  effortWeight?: number;
   timeout?: number;
   maxRetries?: number;
 }
@@ -210,6 +218,9 @@ export interface UpdateTodoParams {
   dependsOn?: string[];
   requiredContracts?: string[];
   producesContracts?: string[];
+  required?: boolean;
+  effortWeight?: number;
+  waiverApproved?: boolean;
 }
 
 // ============================================================================

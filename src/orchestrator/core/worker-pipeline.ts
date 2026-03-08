@@ -42,6 +42,7 @@ export interface PipelineConfig {
   // 执行选项
   projectContext?: string;
   onReport?: ReportCallback;
+  heartbeatIntervalMs?: number;
   cancellationToken?: CancellationToken;
   imagePaths?: string[];
   missionId?: string;
@@ -80,7 +81,7 @@ export class WorkerPipeline {
   async execute(config: PipelineConfig): Promise<PipelineResult> {
     const {
       assignment, workerInstance, adapterFactory, workspaceRoot,
-      projectContext, onReport, cancellationToken, imagePaths,
+      projectContext, onReport, heartbeatIntervalMs, cancellationToken, imagePaths,
       sessionId, resumeSessionId, resumePrompt,
       enableSnapshot, enableLSP, enableTargetEnforce, enableContextUpdate,
       snapshotManager, contextManager, todoManager,
@@ -177,6 +178,7 @@ export class WorkerPipeline {
         adapterFactory,
         projectContext,
         onReport,
+        heartbeatIntervalMs,
         cancellationToken,
         imagePaths,
         getSupplementaryInstructions,
