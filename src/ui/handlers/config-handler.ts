@@ -74,6 +74,32 @@ export class ConfigCommandHandler implements CommandHandler {
     }
   }
 
+  /**
+   * 规范化 OpenAI 基础 URL，确保以 /v1 结尾且不重复拼接
+   */
+  private normalizeOpenAIBaseUrl(baseUrl: string): string {
+    const trimmed = (baseUrl || '').trim();
+    if (!trimmed) return trimmed;
+    const noTrailingSlash = trimmed.replace(/\/+$/, '');
+    if (/\/v1$/i.test(noTrailingSlash)) {
+      return noTrailingSlash;
+    }
+    return `${noTrailingSlash}/v1`;
+  }
+
+  /**
+   * Anthropic Models API 路径规范化（以 /v1 结尾）
+   */
+  private normalizeAnthropicModelsBaseUrl(baseUrl: string): string {
+    const trimmed = (baseUrl || '').trim();
+    if (!trimmed) return trimmed;
+    const noTrailingSlash = trimmed.replace(/\/+$/, '');
+    if (/\/v1$/i.test(noTrailingSlash)) {
+      return noTrailingSlash;
+    }
+    return `${noTrailingSlash}/v1`;
+  }
+
   // ============================================================================
   // Profile 配置
   // ============================================================================
@@ -398,18 +424,25 @@ export class ConfigCommandHandler implements CommandHandler {
         return;
       }
 
-      let modelsUrl = config.baseUrl;
-      if (!modelsUrl.endsWith('/v1')) {
-        modelsUrl = modelsUrl.replace(/\/$/, '') + '/v1';
-      }
+      const provider = config.provider === 'anthropic' ? 'anthropic' : 'openai';
+      let modelsUrl = provider === 'anthropic'
+        ? this.normalizeAnthropicModelsBaseUrl(config.baseUrl)
+        : this.normalizeOpenAIBaseUrl(config.baseUrl);
       modelsUrl += '/models';
+
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (provider === 'anthropic') {
+        headers['x-api-key'] = config.apiKey;
+        headers['anthropic-version'] = '2023-06-01';
+      } else {
+        headers['Authorization'] = `Bearer ${config.apiKey}`;
+      }
 
       const response = await fetchWithRetry(modelsUrl, {
         method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${config.apiKey}`,
-          'Content-Type': 'application/json',
-        },
+        headers,
       }, {
         timeoutMs: 10000,
         attempts: 2,

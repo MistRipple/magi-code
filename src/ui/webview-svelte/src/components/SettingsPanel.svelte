@@ -1048,8 +1048,9 @@
       if (!skillSearchQuery) return true;
       const query = skillSearchQuery.toLowerCase();
       const name = (skill.name || '').toLowerCase();
+      const fullName = (skill.fullName || '').toLowerCase();
       const desc = (skill.description || '').toLowerCase();
-      return name.includes(query) || desc.includes(query);
+      return name.includes(query) || fullName.includes(query) || desc.includes(query);
     })
   );
 

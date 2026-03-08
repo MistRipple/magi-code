@@ -558,15 +558,38 @@ export class SkillsCommandHandler implements CommandHandler {
       const { skills, failedRepositories } = await manager.getAllSkillsWithReport(repositories);
 
       const skillsConfig = LLMConfigLoader.loadSkillsConfig();
-      const installedSkills = new Set<string>();
+      const installedSkillIds = new Set<string>();
+      const toSkillId = (item: any): string => {
+        if (!item) return '';
+        if (typeof item.fullName === 'string' && item.fullName.trim()) {
+          return item.fullName.trim();
+        }
+        if (typeof item.name === 'string' && item.name.trim()) {
+          return item.name.trim();
+        }
+        return '';
+      };
+
       if (skillsConfig && Array.isArray(skillsConfig.customTools)) {
-        skillsConfig.customTools.forEach((tool: any) => { if (tool?.name) installedSkills.add(tool.name); });
+        skillsConfig.customTools.forEach((tool: any) => {
+          const skillId = toSkillId(tool);
+          if (skillId) installedSkillIds.add(skillId);
+        });
       }
       if (skillsConfig && Array.isArray(skillsConfig.instructionSkills)) {
-        skillsConfig.instructionSkills.forEach((skill: any) => { if (skill?.name) installedSkills.add(skill.name); });
+        skillsConfig.instructionSkills.forEach((skill: any) => {
+          const skillId = toSkillId(skill);
+          if (skillId) installedSkillIds.add(skillId);
+        });
       }
 
-      const skillsWithStatus = skills.map(skill => ({ ...skill, installed: installedSkills.has(skill.fullName) }));
+      const skillsWithStatus = skills.map(skill => {
+        const skillId = toSkillId(skill);
+        return {
+          ...skill,
+          installed: skillId ? installedSkillIds.has(skillId) : false,
+        };
+      });
       ctx.sendData('skillLibraryLoaded', {
         skills: skillsWithStatus,
         failedRepositories,

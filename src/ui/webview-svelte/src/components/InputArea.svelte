@@ -19,6 +19,7 @@
   // 技能类型
   interface InstructionSkill {
     name: string;
+    fullName?: string;
     description?: string;
     userInvocable?: boolean;
   }
@@ -48,6 +49,7 @@
     const q = skillSearchQuery.toLowerCase();
     return instructionSkills.filter(s =>
       (s.name || '').toLowerCase().includes(q) ||
+      (s.fullName || '').toLowerCase().includes(q) ||
       (s.description || '').toLowerCase().includes(q)
     );
   });

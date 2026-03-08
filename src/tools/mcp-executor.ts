@@ -16,6 +16,7 @@ import { LLMConfigLoader } from '../llm/config';
 export class MCPToolExecutor implements ToolExecutor {
   private mcpManager: MCPManager;
   private initialized: boolean = false;
+  private initPromise: Promise<void> | null = null;
 
   constructor() {
     this.mcpManager = new MCPManager();
@@ -29,33 +30,43 @@ export class MCPToolExecutor implements ToolExecutor {
       return;
     }
 
-    try {
-      const servers = LLMConfigLoader.loadMCPConfig();
+    if (this.initPromise) {
+      return this.initPromise;
+    }
 
-      for (const server of servers) {
-        if (server.enabled) {
-          try {
-            await this.mcpManager.connectServer(server);
-            logger.info('MCP 服务器已连接', { id: server.id, name: server.name }, LogCategory.TOOLS);
-          } catch (error: any) {
-            logger.error('MCP 服务器连接失败', {
-              id: server.id,
-              name: server.name,
-              error: error.message
-            }, LogCategory.TOOLS);
-            // 继续连接其他服务器
+    this.initPromise = (async () => {
+      try {
+        const servers = LLMConfigLoader.loadMCPConfig();
+
+        for (const server of servers) {
+          if (server.enabled) {
+            try {
+              await this.mcpManager.connectServer(server);
+              logger.info('MCP 服务器已连接', { id: server.id, name: server.name }, LogCategory.TOOLS);
+            } catch (error: any) {
+              logger.error('MCP 服务器连接失败', {
+                id: server.id,
+                name: server.name,
+                error: error.message
+              }, LogCategory.TOOLS);
+              // 继续连接其他服务器
+            }
           }
         }
-      }
 
-      this.initialized = true;
-      logger.info('MCP 执行器初始化完成', {
-        serverCount: servers.length,
-        connectedTools: this.mcpManager.getAllTools().length
-      }, LogCategory.TOOLS);
-    } catch (error: any) {
-      logger.error('MCP 执行器初始化失败', { error: error.message }, LogCategory.TOOLS);
-    }
+        this.initialized = true;
+        logger.info('MCP 执行器初始化完成', {
+          serverCount: servers.length,
+          connectedTools: this.mcpManager.getAllTools().length
+        }, LogCategory.TOOLS);
+      } catch (error: any) {
+        logger.error('MCP 执行器初始化失败', { error: error.message }, LogCategory.TOOLS);
+      } finally {
+        this.initPromise = null;
+      }
+    })();
+
+    return this.initPromise;
   }
 
   /**
@@ -241,5 +252,6 @@ export class MCPToolExecutor implements ToolExecutor {
       }
     }
     this.initialized = false;
+    this.initPromise = null;
   }
 }

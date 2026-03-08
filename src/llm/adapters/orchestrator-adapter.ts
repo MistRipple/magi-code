@@ -611,7 +611,24 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       let consecutiveFailures = 0;
       let totalFailures = 0;
       let loopRounds = 0;
+      let readOnlyExplorationRounds = 0;
       let terminationReason: Exclude<OrchestratorRuntimeState['reason'], 'unknown'> = 'completed';
+
+      const READ_ONLY_EXPLORATION_THRESHOLD = 8;
+      const READ_ONLY_TOOL_NAMES = new Set([
+        'codebase_retrieval',
+        'grep_search',
+        'file_view',
+        'list-processes',
+        'read-process',
+        'web_search',
+        'web_fetch',
+      ]);
+      const READ_ONLY_MCP_PATTERN = /retrieval|search|\bread\b|fetch|view|get[_-]|list[_-]|query|deepwiki|resolve/i;
+      const isReadOnlyToolName = (name: string): boolean => {
+        if (READ_ONLY_TOOL_NAMES.has(name)) return true;
+        return READ_ONLY_MCP_PATTERN.test(name);
+      };
 
       // 创建 AbortController，供 interrupt() 中断 LLM 请求
       this.abortController = new AbortController();
@@ -797,6 +814,23 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             })),
           });
 
+          const hasDispatchTask = toolCalls.some(tc => tc.name === 'dispatch_task');
+          const hasNonReadOnlyTool = toolCalls.some(tc => !isReadOnlyToolName(tc.name));
+          const allReadOnlyTools = toolCalls.length > 0 && toolCalls.every(tc => isReadOnlyToolName(tc.name));
+
+          if (hasDispatchTask || hasNonReadOnlyTool) {
+            readOnlyExplorationRounds = 0;
+          } else if (allReadOnlyTools) {
+            readOnlyExplorationRounds++;
+            if (readOnlyExplorationRounds >= READ_ONLY_EXPLORATION_THRESHOLD) {
+              readOnlyExplorationRounds = 0;
+              history.push({
+                role: 'user',
+                content: `[System] 你已连续多轮仅进行只读检索/查看，当前策略未有效收敛。请停止继续大范围搜索，基于已有信息立即使用 dispatch_task 拆分并派发任务。`,
+              });
+            }
+          }
+
           // 连续失败检测
           const allFailed = toolResults.every(r => r.isError);
           if (allFailed) {
@@ -814,7 +848,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               consecutiveFailures = 0;
               history.push({
                 role: 'user',
-                content: `[System] 工具调用已连续失败 ${CONSECUTIVE_FAIL_THRESHOLD} 次，请换一种方式或策略继续处理任务。`,
+                content: `[System] 工具调用已连续失败 ${CONSECUTIVE_FAIL_THRESHOLD} 次。若当前为代码检索/搜索任务，请停止继续大范围只读探索，基于已有信息立即使用 dispatch_task 派发给合适的 Worker 执行。`,
               });
             }
           } else {
