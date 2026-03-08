@@ -61,7 +61,9 @@ export class AnthropicMessagesProtocolAdapter implements ProviderProtocolAdapter
       delete requestParams.temperature;
     }
 
-    const response = await this.anthropicClient.messages.create(requestParams);
+    const response = await this.anthropicClient.messages.create(requestParams, {
+      signal: request.signal,
+    } as any);
     return this.parseAnthropicResponse(response as Anthropic.Message);
   }
 

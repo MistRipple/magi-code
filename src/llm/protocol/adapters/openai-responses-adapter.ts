@@ -61,10 +61,10 @@ export class OpenAIResponsesProtocolAdapter implements ProviderProtocolAdapter {
 
     let response;
     try {
-      response = await this.openaiClient.responses.create(requestParams);
+      response = await this.openaiClient.responses.create(requestParams, { signal: request.signal });
     } catch (error: any) {
       if (is400ToolSchemaError(error) && requestParams.tools?.length > 0) {
-        response = await this.retryWithToolElimination(requestParams, error);
+        response = await this.retryWithToolElimination(requestParams, request.signal, error);
       } else {
         throw error;
       }
@@ -491,7 +491,7 @@ export class OpenAIResponsesProtocolAdapter implements ProviderProtocolAdapter {
     return undefined;
   }
 
-  private async retryWithToolElimination(requestParams: any, originalError: any): Promise<any> {
+  private async retryWithToolElimination(requestParams: any, signal: AbortSignal | undefined, originalError: any): Promise<any> {
     const allTools: any[] = requestParams.tools;
     logger.warn('400 工具不兼容，启动渐进式排除', {
       model: this.config.model,
@@ -504,13 +504,13 @@ export class OpenAIResponsesProtocolAdapter implements ProviderProtocolAdapter {
       (tools) => {
         requestParams.tools = tools.length > 0 ? tools : undefined;
         if (!requestParams.tools) delete requestParams.tool_choice;
-        return this.openaiClient.responses.create(requestParams);
+        return this.openaiClient.responses.create(requestParams, { signal });
       },
     );
 
     requestParams.tools = compatibleTools.length > 0 ? compatibleTools : undefined;
     if (!requestParams.tools) delete requestParams.tool_choice;
-    return this.openaiClient.responses.create(requestParams);
+    return this.openaiClient.responses.create(requestParams, { signal });
   }
 
   private async retryStreamWithToolElimination(requestParams: any, signal?: AbortSignal, originalError?: any): Promise<any> {

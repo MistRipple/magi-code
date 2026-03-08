@@ -173,6 +173,8 @@ export interface AutonomousExecutionResult {
   };
 }
 
+type AssignmentAbortSource = 'external' | 'model_fail_fast';
+
 /**
  * AutonomousWorker - 自主 Worker
  */
@@ -296,6 +298,7 @@ export class AutonomousWorker extends EventEmitter {
     // 是否被编排者中止
     let aborted = false;
     let abortReason: string | undefined;
+    let abortSource: AssignmentAbortSource | undefined;
 
     // 设置当前 Mission ID（用于共享上下文写入） - 提案 9.2
     this.currentMissionId = assignment.missionId;
@@ -411,6 +414,7 @@ export class AutonomousWorker extends EventEmitter {
       if (options.cancellationToken?.isCancelled) {
         aborted = true;
         abortReason = options.cancellationToken.reason || 'Task cancelled';
+        abortSource = 'external';
         logger.info('Worker.Assignment.取消信号', { assignmentId: assignment.id, reason: abortReason }, LogCategory.ORCHESTRATOR);
         break;
       }
@@ -461,6 +465,7 @@ export class AutonomousWorker extends EventEmitter {
               if (orchestratorResponse.action === 'abort') {
                 aborted = true;
                 abortReason = orchestratorResponse.abortReason || 'Aborted by orchestrator';
+                abortSource = 'external';
                 logger.info('Worker.Assignment.被编排者终止', { assignmentId: assignment.id, reason: abortReason }, LogCategory.ORCHESTRATOR);
                 break;
               } else if (orchestratorResponse.action === 'adjust' && orchestratorResponse.adjustment) {
@@ -478,6 +483,34 @@ export class AutonomousWorker extends EventEmitter {
             error: failureReason,
             duration: 0,
           };
+
+          const modelIssue = classifyModelOriginIssue(failureReason);
+          if (modelIssue.isModelCause) {
+            const surfacedReason = toModelOriginUserMessage(failureReason).trim() || failureReason;
+            logger.warn('Worker.Todo.模型侧失败.快速终止当前任务', {
+              assignmentId: assignment.id,
+              todoId: currentTodo.id,
+              worker: this.workerType,
+              issueKind: modelIssue.kind,
+              reason: surfacedReason,
+            }, LogCategory.ORCHESTRATOR);
+
+            failedTodos.push(result.todo);
+            errors.push(surfacedReason);
+            aborted = true;
+            abortReason = surfacedReason;
+            abortSource = 'model_fail_fast';
+
+            if (session) {
+              sessionMgr.update(session.id, {
+                stateSnapshot: {
+                  lastError: surfacedReason,
+                  lastExecutionAt: Date.now(),
+                },
+              });
+            }
+            break;
+          }
 
           // 失败恢复：先做策略决策，再执行恢复；恢复失败再上报编排者决策
           const recoveryDecision = await this.planRecovery(currentTodo, assignment, failureOutput);
@@ -512,6 +545,7 @@ export class AutonomousWorker extends EventEmitter {
                 if (orchestratorResponse.action === 'abort') {
                   aborted = true;
                   abortReason = orchestratorResponse.abortReason || 'Aborted by orchestrator';
+                  abortSource = 'external';
                   break;
                 } else if (orchestratorResponse.action === 'adjust' && orchestratorResponse.adjustment) {
                   await this.handleAdjustment(assignment, orchestratorResponse.adjustment);
@@ -540,6 +574,7 @@ export class AutonomousWorker extends EventEmitter {
           if (questionResponse.action === 'abort') {
             aborted = true;
             abortReason = questionResponse.abortReason || 'Aborted by orchestrator';
+            abortSource = 'external';
             logger.info('Worker.Assignment.被编排者终止', { assignmentId: assignment.id, reason: abortReason }, LogCategory.ORCHESTRATOR);
             break;
           }
@@ -714,6 +749,9 @@ export class AutonomousWorker extends EventEmitter {
     }
 
     const success = completedTodos.length > 0 && failedTodos.length === 0 && !aborted;
+    const resultErrors = aborted && abortSource === 'external'
+      ? [...errors, abortReason || 'Aborted by orchestrator']
+      : errors;
     const result: AutonomousExecutionResult = {
       assignment,
       success,
@@ -723,7 +761,7 @@ export class AutonomousWorker extends EventEmitter {
       dynamicTodos,
       recoveredTodos: [],
       totalDuration: Date.now() - startTime,
-      errors: aborted ? [...errors, abortReason || 'Aborted by orchestrator'] : errors,
+      errors: resultErrors,
       recoveryAttempts: session?.stateSnapshot.retryCount || 0,
       summary: '', // 占位，qualityGate 后由 buildStructuredSummary 填充
       tokenUsage: totalTokenUsage,
@@ -778,7 +816,15 @@ export class AutonomousWorker extends EventEmitter {
         : createFailedReport(this.workerType, assignment.id, qualityCheckedResult.errors[0] || 'Execution failed', finalResult);
 
       try {
-        await options.onReport(finalReport);
+        await Promise.race([
+          options.onReport(finalReport),
+          new Promise<void>((_, reject) =>
+            setTimeout(
+              () => reject(new Error('Final report timed out')),
+              options.reportTimeout || 5000,
+            ),
+          ),
+        ]);
       } catch (reportError) {
         logger.error('Worker.最终汇报失败', { error: reportError instanceof Error ? reportError.message : String(reportError) }, LogCategory.ORCHESTRATOR);
       }
@@ -1082,12 +1128,13 @@ If any criterion is not satisfied:
         ),
       ]);
     } catch (error) {
-      logger.warn('Worker.question上报失败，按继续执行处理', {
+      const reason = `Question report failed: ${error instanceof Error ? error.message : String(error)}`;
+      logger.warn('Worker.question上报失败，按终止处理', {
         assignmentId: assignment.id,
         todoId: todo.id,
         error: error instanceof Error ? error.message : String(error),
       }, LogCategory.ORCHESTRATOR);
-      return { action: 'continue', timestamp: Date.now() };
+      return { action: 'abort', abortReason: reason, timestamp: Date.now() };
     }
   }
 

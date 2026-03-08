@@ -33,6 +33,7 @@ import type { MissionDrivenEngine } from '../orchestrator/core';
 import type { MessageHub } from '../orchestrator/core/message-hub';
 import type { MissionOrchestrator } from '../orchestrator/core';
 import { normalizeTodos, generateEntityId } from '../orchestrator/mission/data-normalizer';
+import { isModelOriginIssue, toModelOriginUserMessage } from '../errors/model-origin';
 
 // ============================================================================
 // 上下文接口 - EventBindingService 对 WVP 的依赖声明
@@ -86,6 +87,9 @@ export class EventBindingService {
   private readonly pendingUpdateTimers = new Map<string, NodeJS.Timeout>();
   private readonly MAX_PENDING_UPDATES_PER_MESSAGE = 200;
   private readonly PENDING_UPDATE_TIMEOUT_MS = 30000;
+  private lastAdapterErrorSignature = '';
+  private lastAdapterErrorAt = 0;
+  private readonly adapterErrorDedupWindowMs = 5000;
 
   constructor(private readonly ctx: EventBindingContext) {}
 
@@ -314,7 +318,29 @@ export class EventBindingService {
 
   private setupAdapterEvents(): void {
     this.ctx.getAdapterFactory().on(ADAPTER_EVENTS.ERROR, (error: Error) => {
-      logger.error('适配器错误', { error: error.message }, LogCategory.LLM);
+      const rawError = error instanceof Error ? error.message : String(error ?? '');
+      const normalized = toModelOriginUserMessage(rawError).trim() || t('eventBinding.adapterUnknownError');
+      const modelOriginIssue = isModelOriginIssue(rawError);
+      const level: NotifyLevel = modelOriginIssue ? 'warning' : 'error';
+      const signature = `${level}:${normalized}`;
+      const now = Date.now();
+
+      if (
+        this.lastAdapterErrorSignature === signature
+        && now - this.lastAdapterErrorAt < this.adapterErrorDedupWindowMs
+      ) {
+        logger.debug('适配器错误.重复抑制', { signature }, LogCategory.LLM);
+        return;
+      }
+      this.lastAdapterErrorSignature = signature;
+      this.lastAdapterErrorAt = now;
+
+      logger.error('适配器错误', {
+        error: rawError,
+        surfaced: normalized,
+        modelOriginIssue,
+      }, LogCategory.LLM);
+      this.ctx.sendToast(t('eventBinding.adapterError', { error: normalized }), level);
     });
   }
 

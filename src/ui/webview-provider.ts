@@ -2242,12 +2242,16 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       if (requestKey) {
         this.messageHub.taskRejected(requestKey, reason);
         const traceId = this.messageHub.getTraceId();
+        const boundMessageId = this.messageHub.getRequestMessageId(requestKey);
         const errorMessage = createErrorMessage(
           reason,
           'orchestrator',
           'orchestrator',
           traceId,
-          { metadata: { requestId: requestKey } }
+          {
+            id: boundMessageId,
+            metadata: { requestId: requestKey },
+          }
         );
         this.messageHub.sendMessage(errorMessage);
       }
@@ -2479,6 +2483,22 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           ? this.buildModelOriginIssueMessage(normalizedFailureReason)
           : normalizedFailureReason;
         this.messageHub.taskRejected(requestKey, userFacingFailureReason);
+        const traceId = this.messageHub.getTraceId();
+        const boundMessageId = this.messageHub.getRequestMessageId(requestKey);
+        const errorMessage = createErrorMessage(
+          userFacingFailureReason,
+          'orchestrator',
+          'orchestrator',
+          traceId,
+          {
+            id: boundMessageId,
+            metadata: {
+              requestId: requestKey,
+              ...(modelOriginIssue ? { phase: 'model_origin_issue', recoverable: true } : {}),
+            },
+          }
+        );
+        this.messageHub.sendMessage(errorMessage);
         if (modelOriginIssue) {
           trackModelOriginEvent('surfaced', 'ui:taskRejected', normalizedFailureReason, {
             requestId: requestKey,
@@ -2487,6 +2507,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
             requestId: requestKey,
             reason: normalizedFailureReason,
           }, LogCategory.UI);
+          this.messageHub.notify(t('provider.modelAnomalyDetected'), 'warning');
         }
       }
       this.messageHub.finalizeRequestContext(requestKey);

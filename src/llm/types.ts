@@ -131,6 +131,18 @@ export interface LLMMessageParams {
   toolChoice?: ToolChoice;
   /** 取消信号，用于中断正在进行的 LLM 请求 */
   signal?: AbortSignal;
+  /** 单次请求硬超时（毫秒），超时后会中断请求并抛出超时错误 */
+  timeoutMs?: number;
+  /**
+   * 请求重试策略（单一策略入口）
+   * - maxRetries: 总尝试次数（含首轮，最小 1）
+   * - baseDelayMs: 指数退避的基础等待时间
+   */
+  retryPolicy?: {
+    maxRetries?: number;
+    baseDelayMs?: number;
+    retryOnTimeout?: boolean;
+  };
 }
 
 export type ToolChoice =

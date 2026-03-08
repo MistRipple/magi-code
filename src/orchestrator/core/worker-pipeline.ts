@@ -158,6 +158,19 @@ export class WorkerPipeline {
     const lspNewErrors: string[] = [];
     let targetChangeDetected = true;
 
+    if (cancellationToken) {
+      cancellationToken.onCancel((reason) => {
+        void adapterFactory.interrupt(assignment.workerId as WorkerSlot).catch((error: any) => {
+          logger.warn('WorkerPipeline.取消中断失败', {
+            assignmentId: assignment.id,
+            worker: assignment.workerId,
+            reason,
+            error: error?.message || String(error),
+          }, LogCategory.ORCHESTRATOR);
+        });
+      });
+    }
+
     try {
       result = await workerInstance.executeAssignment(assignment, {
         workingDirectory: workspaceRoot,

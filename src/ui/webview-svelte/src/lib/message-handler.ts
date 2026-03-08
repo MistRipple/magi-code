@@ -1479,9 +1479,55 @@ function handleUnifiedControlMessage(standard: StandardMessage) {
 
     case 'task_rejected': {
       const requestId = payload?.requestId as string | undefined;
+      const reasonRaw = payload?.reason;
+      const reason = typeof reasonRaw === 'string' ? reasonRaw.trim() : '';
+      const modelOriginIssue = payload?.modelOriginIssue === true;
+      const toastLevel = modelOriginIssue ? 'warning' : 'error';
+      const finalReason = reason || i18n.t('messageHandler.requestRejected');
+
       if (requestId) {
         clearPendingRequest(requestId);
+
+        const binding = getRequestBinding(requestId);
+        if (binding?.timeoutId) {
+          clearTimeout(binding.timeoutId);
+        }
+
+        if (binding) {
+          const placeholderId = binding.placeholderMessageId;
+          const placeholder = getState().threadMessages.find((m) => m.id === placeholderId);
+
+          if (placeholder) {
+            const baseMetadata = (placeholder.metadata && typeof placeholder.metadata === 'object')
+              ? placeholder.metadata
+              : {};
+            updateThreadMessage(placeholderId, {
+              ...placeholder,
+              role: 'system',
+              source: 'orchestrator',
+              content: finalReason,
+              blocks: [{ type: 'text', content: finalReason }],
+              type: 'error',
+              noticeType: toastLevel,
+              isStreaming: false,
+              isComplete: true,
+              metadata: {
+                ...baseMetadata,
+                isPlaceholder: false,
+                wasPlaceholder: true,
+                placeholderState: undefined,
+                requestId,
+                ...(modelOriginIssue ? { modelOriginIssue: true } : {}),
+              },
+            });
+            markMessageComplete(placeholderId);
+          }
+
+          clearRequestBinding(requestId);
+        }
       }
+
+      addToast(toastLevel, finalReason);
       break;
     }
 

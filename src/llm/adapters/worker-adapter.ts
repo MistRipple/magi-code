@@ -116,12 +116,26 @@ export interface WorkerAdapterConfig {
   profileLoader: ProfileLoader;
   historyConfig?: HistoryManagementConfig;
   stallConfig?: StallDetectionConfig;
+  executionPolicy?: {
+    requestTimeoutMs?: number;
+    retryPolicy?: {
+      maxRetries?: number;
+      baseDelayMs?: number;
+      retryOnTimeout?: boolean;
+    };
+  };
 }
 
 /**
  * Worker LLM 适配器
  */
 export class WorkerLLMAdapter extends BaseLLMAdapter {
+  private static readonly DEFAULT_REQUEST_TIMEOUT_MS = 45_000;
+  private static readonly DEFAULT_RETRY_POLICY = {
+    maxRetries: 2,
+    baseDelayMs: 350,
+    retryOnTimeout: false,
+  } as const;
   private workerSlot: WorkerSlot;
   private systemPrompt: string;
   private conversationHistory: LLMMessage[] = [];
@@ -130,6 +144,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   private guidanceInjector: GuidanceInjector;
   private historyConfig: Required<HistoryManagementConfig>;
   private stallConfig: StallDetectionConfig;
+  private readonly requestTimeoutMs: number;
+  private readonly requestRetryPolicy: {
+    maxRetries: number;
+    baseDelayMs: number;
+    retryOnTimeout: boolean;
+  };
   private seenThinking = false;
   private decisionHookAppliedForThinking = false;
   /** 工具摘要是否已注入到 systemPrompt（lazy init，仅执行一次） */
@@ -173,6 +193,16 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     this.guidanceInjector = new GuidanceInjector();
     this.stallConfig = adapterConfig.stallConfig ?? getStallDetectionPreset(adapterConfig.workerSlot);
     this.systemPrompt = adapterConfig.systemPrompt || this.buildSystemPrompt();
+    this.requestTimeoutMs = adapterConfig.executionPolicy?.requestTimeoutMs
+      ?? WorkerLLMAdapter.DEFAULT_REQUEST_TIMEOUT_MS;
+    this.requestRetryPolicy = {
+      maxRetries: adapterConfig.executionPolicy?.retryPolicy?.maxRetries
+        ?? WorkerLLMAdapter.DEFAULT_RETRY_POLICY.maxRetries,
+      baseDelayMs: adapterConfig.executionPolicy?.retryPolicy?.baseDelayMs
+        ?? WorkerLLMAdapter.DEFAULT_RETRY_POLICY.baseDelayMs,
+      retryOnTimeout: adapterConfig.executionPolicy?.retryPolicy?.retryOnTimeout
+        ?? WorkerLLMAdapter.DEFAULT_RETRY_POLICY.retryOnTimeout,
+    };
     this.historyConfig = {
       maxMessages: adapterConfig.historyConfig?.maxMessages ?? 50,
       maxChars: adapterConfig.historyConfig?.maxChars ?? 100000,
@@ -375,6 +405,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           maxTokens: 4096,
           temperature: 0.7,
           signal: this.abortController.signal,
+          timeoutMs: this.requestTimeoutMs,
+          retryPolicy: this.requestRetryPolicy,
         };
 
         let accumulatedText = '';

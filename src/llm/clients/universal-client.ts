@@ -212,7 +212,7 @@ export class UniversalLLMClient extends BaseLLMClient {
     return this.withRetry(async () => {
       try {
         const adapter = this.getProtocolAdapter();
-        const response = await adapter.send(params);
+        const response = await this.withRequestTimeout(params, (effectiveParams) => adapter.send(effectiveParams));
         this.conformanceValidator.validateResponse(response, adapter.protocol);
         this.logResponse(response);
         return response;
@@ -220,7 +220,7 @@ export class UniversalLLMClient extends BaseLLMClient {
         this.logError(error, 'sendMessage');
         throw error;
       }
-    }, 'sendMessage');
+    }, 'sendMessage', params.retryPolicy);
   }
 
   async streamMessage(
@@ -239,7 +239,10 @@ export class UniversalLLMClient extends BaseLLMClient {
 
     return this.withRetry(async () => {
       try {
-        const response = await adapter.stream(params, wrappedOnChunk);
+        const response = await this.withRequestTimeout(
+          params,
+          (effectiveParams) => adapter.stream(effectiveParams, wrappedOnChunk),
+        );
         this.conformanceValidator.validateResponse(response, adapter.protocol);
         this.logResponse(response);
         return response;
@@ -250,12 +253,16 @@ export class UniversalLLMClient extends BaseLLMClient {
         this.logError(error, 'streamMessage');
         throw error;
       }
-    }, 'streamMessage');
+    }, 'streamMessage', params.retryPolicy);
   }
 
-  private async withRetry<T>(fn: () => Promise<T>, context: string): Promise<T> {
-    const maxRetries = 3;
-    const baseDelayMs = 500;
+  private async withRetry<T>(
+    fn: () => Promise<T>,
+    context: string,
+    retryPolicy?: LLMMessageParams['retryPolicy'],
+  ): Promise<T> {
+    const maxRetries = Math.max(1, retryPolicy?.maxRetries ?? 3);
+    const baseDelayMs = Math.max(0, retryPolicy?.baseDelayMs ?? 500);
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
@@ -264,17 +271,68 @@ export class UniversalLLMClient extends BaseLLMClient {
         if (error instanceof NonRetryableError) {
           throw error.originalError || error;
         }
-        if (!this.isRetryableError(error) || attempt === maxRetries - 1) {
+        if (!this.shouldRetryError(error, retryPolicy) || attempt === maxRetries - 1) {
           throw error;
         }
 
-        const delay = baseDelayMs * Math.pow(2, attempt) + Math.floor(Math.random() * 200);
-        this.logError(error, `${context}.retry_${attempt + 1}`);
-        await this.sleep(delay);
+        if (baseDelayMs > 0) {
+          const delay = baseDelayMs * Math.pow(2, attempt) + Math.floor(Math.random() * 200);
+          this.logError(error, `${context}.retry_${attempt + 1}`);
+          await this.sleep(delay);
+        } else {
+          this.logError(error, `${context}.retry_${attempt + 1}`);
+        }
       }
     }
 
     throw new Error(`Retry failed: ${context}`);
+  }
+
+  private async withRequestTimeout<T>(
+    params: LLMMessageParams,
+    run: (effectiveParams: LLMMessageParams) => Promise<T>,
+  ): Promise<T> {
+    const timeoutMs = params.timeoutMs;
+    if (!timeoutMs || timeoutMs <= 0) {
+      return run(params);
+    }
+
+    const controller = new AbortController();
+    const abortFromParent = () => {
+      const reason = (params.signal as any)?.reason;
+      controller.abort(reason || new Error('Request aborted'));
+    };
+
+    if (params.signal?.aborted) {
+      abortFromParent();
+    } else if (params.signal) {
+      params.signal.addEventListener('abort', abortFromParent, { once: true });
+    }
+
+    const timer = setTimeout(() => {
+      const timeoutError = new Error(`Request timed out after ${timeoutMs}ms`);
+      (timeoutError as any).code = 'ETIMEDOUT';
+      controller.abort(timeoutError);
+    }, timeoutMs);
+
+    try {
+      return await run({
+        ...params,
+        signal: controller.signal,
+      });
+    } catch (error: any) {
+      if (controller.signal.aborted && !params.signal?.aborted) {
+        const timeoutError = new Error(`Request timed out after ${timeoutMs}ms`);
+        (timeoutError as any).code = 'ETIMEDOUT';
+        throw timeoutError;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      if (params.signal) {
+        params.signal.removeEventListener('abort', abortFromParent);
+      }
+    }
   }
 
   private isRetryableError(error: any): boolean {
@@ -291,6 +349,25 @@ export class UniversalLLMClient extends BaseLLMClient {
 
     const message = String(error?.message || '');
     return /timeout|timed out|connection|network|fetch failed|socket hang up|ECONNRESET|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|request ended without sending|stream ended|overloaded/i.test(message);
+  }
+
+  private isTimeoutError(error: any): boolean {
+    const code = error?.code;
+    if (typeof code === 'string' && code.toUpperCase() === 'ETIMEDOUT') {
+      return true;
+    }
+    const message = String(error?.message || '').toLowerCase();
+    return message.includes('timeout') || message.includes('timed out');
+  }
+
+  private shouldRetryError(error: any, retryPolicy?: LLMMessageParams['retryPolicy']): boolean {
+    if (!this.isRetryableError(error)) {
+      return false;
+    }
+    if (retryPolicy?.retryOnTimeout === false && this.isTimeoutError(error)) {
+      return false;
+    }
+    return true;
   }
 
   private sleep(ms: number): Promise<void> {

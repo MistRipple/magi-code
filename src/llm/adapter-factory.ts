@@ -52,6 +52,14 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   private modelAnomalyStreak = new Map<AgentType, number>();
   private readonly modelRecoveryMaxAttempts = 2;
   private readonly modelAnomalyEscalateThreshold = 3;
+  private readonly workerExecutionPolicy = {
+    requestTimeoutMs: 45_000,
+    retryPolicy: {
+      maxRetries: 2,
+      baseDelayMs: 350,
+      retryOnTimeout: false,
+    },
+  } as const;
 
   /**
    * 🔧 环境上下文提供者（单一真相来源）
@@ -284,6 +292,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       workerSlot,
       profileLoader: this.profileLoader,
       stallConfig,
+      executionPolicy: this.workerExecutionPolicy,
     };
 
     const adapter = new WorkerLLMAdapter(adapterConfig);
@@ -526,7 +535,9 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     };
 
     const isWorker = agent !== 'orchestrator';
-    const retryDelays = [10000, 20000, 30000];
+    // Worker 请求链路采用 fail-fast：不在 AdapterFactory 层进行长延时重试，
+    // 避免与底层客户端重试叠加导致“失败回传被拖慢”。
+    const retryDelays: number[] = [];
     let modelRecoveryAttempts = 0;
     let lastModelRecoveryError = '';
 
