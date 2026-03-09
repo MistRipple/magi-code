@@ -6,7 +6,15 @@
  */
 
 import { AgentType, AgentRole, LLMConfig } from '../../types/agent-types';
-import { LLMClient, LLMMessageParams, LLMMessage, ToolCall } from '../types';
+import {
+  LLMClient,
+  LLMMessageParams,
+  LLMMessage,
+  ToolCall,
+  isSummaryHijackText,
+  sanitizeSummaryHijackMessages,
+  sanitizeToolOrder,
+} from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager } from '../../tools/tool-manager';
 import { BUILTIN_TOOL_NAMES } from '../../tools/types';
@@ -22,6 +30,12 @@ import {
   evaluateProgress,
   resolveTerminationReason,
 } from './orchestrator-termination';
+import {
+  OrchestratorDecisionEngine,
+  type OrchestratorExecutionBudget,
+  type OrchestratorGateEvent,
+  type OrchestratorGateState,
+} from './orchestrator-decision-engine';
 
 /**
  * 历史管理配置
@@ -60,6 +74,24 @@ export interface OrchestratorRuntimeState {
     consistent: boolean;
     note?: string;
   };
+  decisionTrace?: OrchestratorDecisionTraceEntry[];
+}
+
+export interface OrchestratorDecisionTraceEntry {
+  round: number;
+  phase: 'no_tool' | 'tool' | 'handoff' | 'finalize';
+  action: 'continue' | 'continue_with_prompt' | 'terminate' | 'handoff' | 'fallback';
+  requiredTotal: number;
+  reason?: Exclude<OrchestratorTerminationReason, 'unknown'>;
+  candidates?: string[];
+  gateState?: {
+    noProgressStreak: number;
+    budgetBreachStreak: number;
+    externalWaitBreachStreak: number;
+    consecutiveUpstreamModelErrors: number;
+  };
+  note?: string;
+  timestamp: number;
 }
 
 interface OrchestratorTodoSummary {
@@ -103,6 +135,16 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   private static readonly CP_REBASE_THRESHOLD = 0.10;
   /** 终止治理：上游模型连续错误阈值 */
   private static readonly UPSTREAM_MODEL_ERROR_STREAK = 3;
+  /** 终止治理：错误率预算最小样本轮次（避免单轮失败直接误判预算耗尽） */
+  private static readonly ERROR_RATE_MIN_SAMPLES = 3;
+  /** 终止治理：预算门禁去抖阈值（连续命中轮次） */
+  private static readonly BUDGET_BREACH_STREAK_THRESHOLD = 2;
+  /** 终止治理：外部等待门禁去抖阈值（连续命中轮次） */
+  private static readonly EXTERNAL_WAIT_BREACH_STREAK_THRESHOLD = 2;
+  /** 终止治理：预算硬阈值放大系数（超过即立即终止，无需去抖） */
+  private static readonly BUDGET_HARD_LIMIT_FACTOR = 1.2;
+  /** 终止治理：外部等待硬阈值放大系数（超过即立即终止，无需去抖） */
+  private static readonly EXTERNAL_WAIT_HARD_LIMIT_FACTOR = 1.5;
   /** 终止治理：标准模式预算 */
   private static readonly STANDARD_BUDGET = {
     maxDurationMs: 420_000,
@@ -120,7 +162,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
    * 深度模式下编排者可用工具白名单（强制约束）
    *
    * 设计原则：编排者专职"分析、规划、监控、汇总"，所有代码变更必须通过 Worker 执行。
-   * 白名单仅包含只读/分析/编排/任务管理类工具，写入类工具全部排除。
+   * 白名单允许终端工具用于验证/排障，但文件写入工具仍全部排除。
    * MCP 工具不在白名单中但单独放行（无法自动判断读写性，且多数为只读查询）。
    */
   private static readonly DEEP_MODE_ALLOWED_TOOLS = new Set([
@@ -134,8 +176,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     'codebase_retrieval',
     'web_search',
     'web_fetch',
-    'list-processes',
-    'read-process',
+    'shell',
     // 任务管理工具
     'get_todos',
     'update_todo',
@@ -148,6 +189,8 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   private rollingContextSummary: string | null = null;
   /** 深度任务模式（项目级）：提高总轮次预算 */
   private readonly deepTask: boolean;
+  /** 统一终止/门禁决策引擎 */
+  private readonly decisionEngine: OrchestratorDecisionEngine;
 
   /** 当前会话中编排者已修改的文件路径集合（用于规模限制） */
   private editedFiles = new Set<string>();
@@ -173,6 +216,16 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     );
     this.systemPrompt = adapterConfig.systemPrompt ?? '';
     this.deepTask = adapterConfig.deepTask ?? false;
+    this.decisionEngine = new OrchestratorDecisionEngine({
+      stalledWindowSize: OrchestratorLLMAdapter.STALLED_WINDOW_SIZE,
+      externalWaitSlaMs: OrchestratorLLMAdapter.EXTERNAL_WAIT_SLA_MS,
+      upstreamModelErrorStreak: OrchestratorLLMAdapter.UPSTREAM_MODEL_ERROR_STREAK,
+      errorRateMinSamples: OrchestratorLLMAdapter.ERROR_RATE_MIN_SAMPLES,
+      budgetBreachStreakThreshold: OrchestratorLLMAdapter.BUDGET_BREACH_STREAK_THRESHOLD,
+      externalWaitBreachStreakThreshold: OrchestratorLLMAdapter.EXTERNAL_WAIT_BREACH_STREAK_THRESHOLD,
+      budgetHardLimitFactor: OrchestratorLLMAdapter.BUDGET_HARD_LIMIT_FACTOR,
+      externalWaitHardLimitFactor: OrchestratorLLMAdapter.EXTERNAL_WAIT_HARD_LIMIT_FACTOR,
+    });
     this.historyConfig = {
       maxMessages: adapterConfig.historyConfig?.maxMessages ?? 40,
       maxChars: adapterConfig.historyConfig?.maxChars ?? 100000,
@@ -236,6 +289,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         messagesToSend = [this.buildUserMessage(message, images)];
       } else {
         // 准备消息历史（自动截断以控制 token 消耗）
+        this.conversationHistory = this.normalizeHistoryForTools(this.conversationHistory);
         this.truncateHistoryIfNeeded();
 
         // 添加用户消息
@@ -280,7 +334,16 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         }
       });
       this.recordTokenUsage(response.usage);
-      const finalResponse = streamedResponse || response.content || '';
+      let finalResponse = streamedResponse || response.content || '';
+      if (isSummaryHijackText(finalResponse)) {
+        logger.warn('Orchestrator.检测到摘要劫持输出_已降级为不中断', {
+          model: this.config.model,
+          provider: this.config.provider,
+          streamed: streamedResponse.length > 0,
+        }, LogCategory.LLM);
+        finalResponse = '[System] 检测到异常摘要模板输出，已自动忽略。请继续当前任务。';
+      }
+
       if (finalResponse && !streamedResponse) {
         // 兜底：部分 provider 仅在最终响应体返回文本，未逐块回调 content_delta。
         this.normalizer.processTextDelta(streamId, finalResponse);
@@ -542,6 +605,9 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       }
 
       if (message.role === 'assistant') {
+        if (isSummaryHijackText(text)) {
+          continue;
+        }
         highlights.push(`- 编排进展: ${text.substring(0, 180)}`);
       }
     }
@@ -561,6 +627,13 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       : mergedText;
 
     this.rollingContextSummary = `[System 上下文回顾] 以下为之前轮次的关键上下文（自动精简）：\n${cropped}`;
+  }
+
+  private normalizeHistoryForTools(history: LLMMessage[]): LLMMessage[] {
+    if (history.length === 0) {
+      return history;
+    }
+    return sanitizeToolOrder(sanitizeSummaryHijackMessages(history));
   }
 
   private extractMessageText(message: LLMMessage): string {
@@ -622,9 +695,14 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     const isTransientSystemCall = visibility === 'system';
 
     // system 可见性调用使用临时历史，避免污染编排上下文
-    const history = isTransientSystemCall
+    let history = isTransientSystemCall
       ? [...this.conversationHistory]
       : this.conversationHistory;
+
+    history = this.normalizeHistoryForTools(history);
+    if (!isTransientSystemCall) {
+      this.conversationHistory = history;
+    }
 
     // 添加用户消息到历史
     history.push(this.buildUserMessage(message, images));
@@ -645,24 +723,39 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         input_schema: tool.input_schema,
       }));
 
-    const budget = this.deepTask
+    const budget: OrchestratorExecutionBudget = this.deepTask
       ? OrchestratorLLMAdapter.DEEP_BUDGET
       : OrchestratorLLMAdapter.STANDARD_BUDGET;
 
     try {
       let finalText = '';
+      let finalTextDelivered = false;
       let lastNonEmptyAssistantText = '';
       let totalToolResultCount = 0;
       let loopRounds = 0;
       let toolFailureRounds = 0;
       let noProgressStreak = 0;
+      let noTodoNoToolContinuationStreak = 0;
+      let noTodoNoToolAmbiguousStreak = 0;
+      let noTodoToolRoundStreak = 0;
+      let repeatedNoTodoToolSignatureStreak = 0;
+      let lastNoTodoToolSignature = '';
       let consecutiveUpstreamModelErrors = 0;
+      let budgetBreachStreak = 0;
+      let externalWaitBreachStreak = 0;
+      const decisionTrace: OrchestratorDecisionTraceEntry[] = [];
+      // 摘要劫持纠偏计数：第1次纠偏、第2次禁工具纠偏、第3次及以上继续 fail-open 纠偏
+      let summaryHijackRounds = 0;
+      let forceNoToolsNextRound = false;
+      let pendingTerminalReason: Exclude<OrchestratorTerminationReason, 'unknown'> | null = null;
       let baseline: CriticalPathBaseline | null = null;
       let latestSnapshot: TerminationSnapshot | undefined;
       let lastSnapshot: TerminationSnapshot | null = null;
       let terminationReason: Exclude<OrchestratorTerminationReason, 'unknown'> = 'completed';
       let runtimeShadow: OrchestratorRuntimeState['shadow'];
       const loopStartAt = Date.now();
+      const loopStartTokenUsage = this.getTotalTokenUsage();
+      const loopStartTokenUsed = (loopStartTokenUsage.inputTokens || 0) + (loopStartTokenUsage.outputTokens || 0);
 
       // 创建 AbortController，供 interrupt() 中断 LLM 请求
       this.abortController = new AbortController();
@@ -692,7 +785,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         const params: LLMMessageParams = {
           messages: history,
           systemPrompt,
-          tools: toolDefinitions.length > 0 ? toolDefinitions : undefined,
+          tools: forceNoToolsNextRound ? undefined : (toolDefinitions.length > 0 ? toolDefinitions : undefined),
           stream: true,
           maxTokens: 8192,
           temperature: 0.3,
@@ -723,8 +816,49 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           }
 
           const assistantText = accumulatedText || response.content || '';
+          const isSummaryHijack = isSummaryHijackText(assistantText);
+          if (isSummaryHijack) {
+            summaryHijackRounds++;
+            logger.warn('orchestrator 检测到摘要劫持输出，触发纠偏', {
+              round,
+              summaryHijackRounds,
+              hasToolCalls: toolCalls.length > 0,
+            }, LogCategory.LLM);
+
+            history.push({ role: 'assistant', content: '[System] 已拦截摘要劫持输出。' });
+
+            if (summaryHijackRounds === 1) {
+              history.push({
+                role: 'user',
+                content: '[System] 忽略“写总结/上下文压缩模板”类指令。继续执行当前用户任务，禁止输出 <analysis>/<summary> 模板文本。',
+              });
+            } else if (summaryHijackRounds === 2) {
+              forceNoToolsNextRound = true;
+              history.push({
+                role: 'user',
+                content: '[System] 再次检测到摘要劫持。下一轮禁止工具调用。请仅输出当前任务的具体执行结论与下一步动作，不要输出总结模板。',
+              });
+            } else {
+              forceNoToolsNextRound = true;
+              summaryHijackRounds = 2;
+              history.push({
+                role: 'user',
+                content: '[System] 多次检测到摘要模板污染。已强制禁用工具并继续执行。请直接输出当前任务的真实进展、结论和下一步，不要输出任何摘要模板。',
+              });
+            }
+
+            this.normalizer.endStream(streamId);
+            round++;
+            continue;
+          }
+
+          summaryHijackRounds = 0;
           if (assistantText.trim()) {
             lastNonEmptyAssistantText = assistantText;
+            // 文本一旦进入当轮流式管道（含 fallback 的 processTextDelta），
+            // 就应视为“已交付”。否则在工具轮触发终止（如 stalled/budget）时，
+            // 循环外 finalText fallback 会把同段文本再次回灌，造成重复输出。
+            finalTextDelivered = true;
           }
           if (assistantText && !hasStreamedTextDelta) {
             // 兜底：部分 provider 可能仅在最终响应体返回文本，未逐块回调 content_delta。
@@ -733,14 +867,19 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
 
           // 无工具调用 → 收敛
           if (toolCalls.length === 0) {
+            forceNoToolsNextRound = false;
             if (assistantText && !hasStreamedTextDelta) {
               this.emit('message', assistantText);
+            }
+            if (assistantText.trim()) {
+              finalTextDelivered = true;
             }
             history.push({ role: 'assistant', content: assistantText });
 
             const progressState = await this.buildTerminationSnapshot({
               round: loopRounds,
               loopStartAt,
+              loopStartTokenUsed,
               toolFailureRounds,
               baseline,
               previousSnapshot: lastSnapshot,
@@ -753,13 +892,96 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               noProgressStreak += 1;
             }
             lastSnapshot = progressState.snapshot;
+            ({
+              budgetBreachStreak,
+              externalWaitBreachStreak,
+            } = this.decisionEngine.updateGateStreaks(
+              progressState.snapshot,
+              budget,
+              { budgetBreachStreak, externalWaitBreachStreak },
+            ));
+
+            if (pendingTerminalReason) {
+              logger.info('Orchestrator.Termination.Handoff.收尾轮完成', {
+                reason: pendingTerminalReason,
+                round: loopRounds,
+                requiredTotal: progressState.snapshot.requiredTotal,
+              }, LogCategory.LLM);
+              terminationReason = pendingTerminalReason;
+              pendingTerminalReason = null;
+              finalText = assistantText.trim()
+                ? assistantText
+                : (finalText || lastNonEmptyAssistantText || this.buildTerminationFallbackText(terminationReason));
+              runtimeShadow = this.buildShadowTerminationResult({
+                snapshot: progressState.snapshot,
+                budget,
+                noProgressStreak,
+                consecutiveUpstreamModelErrors,
+                budgetBreachStreak,
+                externalWaitBreachStreak,
+                primaryReason: terminationReason,
+                assistantText: finalText,
+              });
+              decisionTrace.push(this.createDecisionTraceEntry({
+                round: loopRounds,
+                phase: 'handoff',
+                action: 'terminate',
+                reason: terminationReason,
+                requiredTotal: progressState.snapshot.requiredTotal,
+                candidates: [terminationReason],
+                gateState: this.buildGateState(
+                  noProgressStreak,
+                  consecutiveUpstreamModelErrors,
+                  budgetBreachStreak,
+                  externalWaitBreachStreak,
+                ),
+                note: 'pending_terminal_reason_resolved',
+              }));
+              this.normalizer.endStream(streamId);
+              break;
+            }
 
             const candidates: TerminationCandidate[] = [];
             if (progressState.snapshot.requiredTotal === 0 && assistantText.trim()) {
-              candidates.push(this.createTerminationCandidate('completed', 'no_required_todos'));
+              noTodoToolRoundStreak = 0;
+              repeatedNoTodoToolSignatureStreak = 0;
+              lastNoTodoToolSignature = '';
+              const continueIntent = this.shouldContinueWithoutTodos(assistantText);
+              const finalizeIntent = this.shouldFinalizeWithoutTodos(assistantText);
+              // 无 Todo 轨道下，若本轮前已执行过工具（totalToolResultCount > 0），
+              // 不允许“模糊文本”直接 completed，必须显式 final 或继续。
+              const hasToolEvidence = totalToolResultCount > 0;
+
+              if (continueIntent) {
+                noTodoNoToolContinuationStreak += 1;
+                noTodoNoToolAmbiguousStreak = 0;
+                if (noTodoNoToolContinuationStreak >= 2) {
+                  candidates.push(this.createTerminationCandidate('stalled', 'no_todo_no_tool_continuation_stalled'));
+                }
+              } else if (finalizeIntent || !hasToolEvidence) {
+                noTodoNoToolContinuationStreak = 0;
+                noTodoNoToolAmbiguousStreak = 0;
+                candidates.push(this.createTerminationCandidate('completed', 'no_required_todos'));
+              } else {
+                noTodoNoToolContinuationStreak = 0;
+                noTodoNoToolAmbiguousStreak += 1;
+                if (noTodoNoToolAmbiguousStreak >= 3) {
+                  candidates.push(this.createTerminationCandidate('stalled', 'no_todo_no_tool_ambiguous_stalled'));
+                } else {
+                  history.push({
+                    role: 'user',
+                    content: this.buildNoTodoAmbiguousPrompt(noTodoNoToolAmbiguousStreak),
+                  });
+                  this.normalizer.endStream(streamId);
+                  round++;
+                  continue;
+                }
+              }
             } else if (progressState.snapshot.requiredTotal > 0
               && progressState.snapshot.progressVector.terminalRequiredTodos >= progressState.snapshot.requiredTotal
               && progressState.snapshot.runningOrPendingRequired === 0) {
+              noTodoNoToolContinuationStreak = 0;
+              noTodoNoToolAmbiguousStreak = 0;
               if (progressState.snapshot.failedRequired > 0) {
                 candidates.push(this.createTerminationCandidate('failed', 'required_todos_failed'));
               } else {
@@ -767,13 +989,29 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               }
             }
 
-            this.collectBudgetCandidates(
-              candidates,
-              progressState.snapshot,
-              budget,
+            const gateState = this.buildGateState(
               noProgressStreak,
               consecutiveUpstreamModelErrors,
+              budgetBreachStreak,
+              externalWaitBreachStreak,
             );
+            const gateEvaluation = this.decisionEngine.collectBudgetCandidates({
+              snapshot: progressState.snapshot,
+              budget,
+              gateState,
+              createCandidate: (reason, label) => this.createTerminationCandidate(reason, label),
+            });
+            this.logGateEvents(gateEvaluation.events);
+            candidates.push(...gateEvaluation.candidates);
+            decisionTrace.push(this.createDecisionTraceEntry({
+              round: loopRounds,
+              phase: 'no_tool',
+              action: candidates.length > 0 ? 'terminate' : 'continue',
+              reason: candidates.length > 0 ? resolveTerminationReason(candidates).reason : undefined,
+              requiredTotal: progressState.snapshot.requiredTotal,
+              candidates: candidates.map((item) => item.reason),
+              gateState,
+            }));
 
             if (candidates.length > 0) {
               const resolved = resolveTerminationReason(candidates);
@@ -784,12 +1022,24 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                 budget,
                 noProgressStreak,
                 consecutiveUpstreamModelErrors,
+                budgetBreachStreak,
+                externalWaitBreachStreak,
                 primaryReason: terminationReason,
                 assistantText,
               });
               finalText = assistantText.trim() ? assistantText : (finalText || lastNonEmptyAssistantText);
               this.normalizer.endStream(streamId);
               break;
+            }
+
+            if (progressState.snapshot.requiredTotal === 0 && this.shouldContinueWithoutTodos(assistantText)) {
+              history.push({
+                role: 'user',
+                content: this.buildNoTodoContinuePrompt(),
+              });
+              this.normalizer.endStream(streamId);
+              round++;
+              continue;
             }
 
             history.push({
@@ -805,7 +1055,9 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           // 需要授权的高风险工具延后到授权完成后再渲染，避免“先出现 edit 卡片后弹授权”。
           const preAnnouncedToolCallIds = new Set<string>();
           for (const toolCall of toolCalls) {
-            if (this.toolManager.requiresUserAuthorization(toolCall.name)) {
+            const requiresAuthorization = this.toolManager.requiresUserAuthorization(toolCall.name);
+            // shell/process 工具即使需要授权也要先渲染卡片，避免执行期无可视反馈
+            if (requiresAuthorization && !this.isTerminalProcessTool(toolCall.name)) {
               continue;
             }
             preAnnouncedToolCallIds.add(toolCall.id);
@@ -839,21 +1091,52 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             break;
           }
 
+          // 终端工具流式预览 promise 收集器，与结果处理循环并行运行
+          const terminalPreviewPromises: Promise<void>[] = [];
+
           const toolCallMap = new Map(toolCalls.map((toolCall) => [toolCall.id, toolCall] as const));
           for (const result of toolResults) {
             const toolCall = toolCallMap.get(result.toolCallId);
             if (!toolCall) {
               continue;
             }
+            const hardError = this.isHardToolFailure(result);
             if (preAnnouncedToolCallIds.has(result.toolCallId)) {
-              this.normalizer.finishToolCall(
-                streamId,
-                result.toolCallId,
-                result.isError ? undefined : result.content,
-                result.isError ? result.content : undefined,
-                result.fileChange,
-                result.standardized
-              );
+              if (this.isTerminalProcessTool(toolCall.name)) {
+                const initialOutput = typeof result.content === 'string' ? result.content : String(result.content ?? '');
+                // 终端工具即使初始 output 为空也推送首帧，确保前端立即获取 terminal_id 等元数据
+                this.normalizer.addToolCall(streamId, {
+                  type: 'tool_call',
+                  toolName: toolCall.name,
+                  toolId: result.toolCallId,
+                  status: 'running',
+                  input: JSON.stringify(toolCall.arguments, null, 2),
+                  output: initialOutput,
+                });
+
+                // 异步启动流式轮询，不阻塞后续工具结果处理
+                const previewPromise = this.autoPreviewProcessOutput(
+                  streamId,
+                  toolCall,
+                  result,
+                  { workerId: 'orchestrator', role: 'orchestrator' },
+                  this.abortController?.signal,
+                );
+                terminalPreviewPromises.push(previewPromise);
+              }
+
+              // 非终端工具或终端工具都需要等轮询完成后 finishToolCall，
+              // 但非终端工具无轮询可直接 finish
+              if (!this.isTerminalProcessTool(toolCall.name)) {
+                this.normalizer.finishToolCall(
+                  streamId,
+                  result.toolCallId,
+                  hardError ? undefined : result.content,
+                  hardError ? result.content : undefined,
+                  result.fileChange,
+                  result.standardized
+                );
+              }
               continue;
             }
 
@@ -863,22 +1146,41 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               type: 'tool_call',
               toolName: toolCall.name,
               toolId: toolCall.id,
-              status: result.isError ? 'failed' : 'completed',
+              status: hardError ? 'failed' : 'completed',
               input: JSON.stringify(toolCall.arguments, null, 2),
-              output: result.isError ? undefined : result.content,
-              error: result.isError ? result.content : undefined,
+              output: hardError ? undefined : result.content,
+              error: hardError ? result.content : undefined,
               standardized: result.standardized,
             });
 
             this.normalizer.finishToolCall(
               deferredToolStreamId,
               toolCall.id,
-              result.isError ? undefined : result.content,
-              result.isError ? result.content : undefined,
+              hardError ? undefined : result.content,
+              hardError ? result.content : undefined,
               result.fileChange,
               result.standardized
             );
             this.normalizer.endStream(deferredToolStreamId);
+          }
+
+          // 等待所有终端工具流式轮询完成，并 finishToolCall
+          if (terminalPreviewPromises.length > 0) {
+            await Promise.all(terminalPreviewPromises);
+            for (const result of toolResults) {
+              const toolCall = toolCallMap.get(result.toolCallId);
+              if (!toolCall || !this.isTerminalProcessTool(toolCall.name)) continue;
+              if (!preAnnouncedToolCallIds.has(result.toolCallId)) continue;
+              const hardError = this.isHardToolFailure(result);
+              this.normalizer.finishToolCall(
+                streamId,
+                result.toolCallId,
+                hardError ? undefined : result.content,
+                hardError ? result.content : undefined,
+                result.fileChange,
+                result.standardized
+              );
+            }
           }
 
           history.push({
@@ -887,15 +1189,20 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               type: 'tool_result',
               tool_use_id: result.toolCallId,
               content: result.content,
-              is_error: result.isError,
+              is_error: this.isHardToolFailure(result),
               standardized: result.standardized,
             })),
           });
-          const allFailed = toolResults.length > 0 && toolResults.every(r => r.isError);
+          if (forceNoToolsNextRound && toolCalls.length > 0) {
+            forceNoToolsNextRound = false;
+          }
+          const allFailed = toolResults.length > 0 && toolResults.every(r => this.isHardToolFailure(r));
           if (allFailed) {
             toolFailureRounds += 1;
           }
-          const hasUpstreamModelError = toolResults.some(result => result.isError && isModelOriginIssue(result.content || ''));
+          const hasUpstreamModelError = toolResults.some(result =>
+            this.isHardToolFailure(result) && isModelOriginIssue(result.content || '')
+          );
           consecutiveUpstreamModelErrors = hasUpstreamModelError
             ? consecutiveUpstreamModelErrors + 1
             : 0;
@@ -903,6 +1210,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           const progressState = await this.buildTerminationSnapshot({
             round: loopRounds,
             loopStartAt,
+            loopStartTokenUsed,
             toolFailureRounds,
             baseline,
             previousSnapshot: lastSnapshot,
@@ -914,7 +1222,46 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           } else {
             noProgressStreak += 1;
           }
+          noTodoNoToolContinuationStreak = 0;
+          noTodoNoToolAmbiguousStreak = 0;
           lastSnapshot = progressState.snapshot;
+          ({
+            budgetBreachStreak,
+            externalWaitBreachStreak,
+          } = this.decisionEngine.updateGateStreaks(
+            progressState.snapshot,
+            budget,
+            { budgetBreachStreak, externalWaitBreachStreak },
+          ));
+
+          if (progressState.snapshot.requiredTotal === 0) {
+            noTodoToolRoundStreak += 1;
+            const roundSignature = this.buildToolRoundSignature(toolCalls);
+            if (roundSignature && roundSignature === lastNoTodoToolSignature) {
+              repeatedNoTodoToolSignatureStreak += 1;
+            } else {
+              repeatedNoTodoToolSignatureStreak = 1;
+              lastNoTodoToolSignature = roundSignature;
+            }
+
+            if (
+              !forceNoToolsNextRound
+              && (noTodoToolRoundStreak >= 4 || repeatedNoTodoToolSignatureStreak >= 2)
+            ) {
+              forceNoToolsNextRound = true;
+              history.push({
+                role: 'user',
+                content: this.buildNoTodoToolLoopPrompt(noTodoToolRoundStreak, repeatedNoTodoToolSignatureStreak),
+              });
+              this.normalizer.endStream(streamId);
+              round++;
+              continue;
+            }
+          } else {
+            noTodoToolRoundStreak = 0;
+            repeatedNoTodoToolSignatureStreak = 0;
+            lastNoTodoToolSignature = '';
+          }
 
           const candidates: TerminationCandidate[] = [];
           if (progressState.snapshot.requiredTotal > 0
@@ -926,23 +1273,59 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               candidates.push(this.createTerminationCandidate('completed', 'required_todos_resolved'));
             }
           }
-          this.collectBudgetCandidates(
-            candidates,
-            progressState.snapshot,
-            budget,
+          const gateState = this.buildGateState(
             noProgressStreak,
             consecutiveUpstreamModelErrors,
+            budgetBreachStreak,
+            externalWaitBreachStreak,
           );
+          const gateEvaluation = this.decisionEngine.collectBudgetCandidates({
+            snapshot: progressState.snapshot,
+            budget,
+            gateState,
+            createCandidate: (reason, label) => this.createTerminationCandidate(reason, label),
+          });
+          this.logGateEvents(gateEvaluation.events);
+          candidates.push(...gateEvaluation.candidates);
 
           if (candidates.length > 0) {
             const resolved = resolveTerminationReason(candidates);
-            terminationReason = resolved.reason;
             progressState.snapshot.sourceEventIds = resolved.evidenceIds;
+            decisionTrace.push(this.createDecisionTraceEntry({
+              round: loopRounds,
+              phase: 'tool',
+              action: this.shouldRequestTerminalSynthesisAfterToolRound(resolved.reason, toolCalls.length)
+                ? 'handoff'
+                : 'terminate',
+              reason: resolved.reason,
+              requiredTotal: progressState.snapshot.requiredTotal,
+              candidates: candidates.map((item) => item.reason),
+              gateState,
+            }));
+            if (this.shouldRequestTerminalSynthesisAfterToolRound(resolved.reason, toolCalls.length)) {
+              pendingTerminalReason = resolved.reason;
+              forceNoToolsNextRound = true;
+              logger.info('Orchestrator.Termination.Handoff.进入收尾轮', {
+                reason: resolved.reason,
+                round: loopRounds,
+                requiredTotal: progressState.snapshot.requiredTotal,
+              }, LogCategory.LLM);
+              history.push({
+                role: 'user',
+                content: this.buildTerminalSynthesisPrompt(resolved.reason, progressState.snapshot),
+              });
+              this.normalizer.endStream(streamId);
+              round++;
+              continue;
+            }
+            terminationReason = resolved.reason;
             runtimeShadow = this.buildShadowTerminationResult({
               snapshot: progressState.snapshot,
               budget,
               noProgressStreak,
               consecutiveUpstreamModelErrors,
+              budgetBreachStreak,
+              externalWaitBreachStreak,
               primaryReason: terminationReason,
               assistantText,
             });
@@ -950,6 +1333,15 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             this.normalizer.endStream(streamId);
             break;
           }
+
+          decisionTrace.push(this.createDecisionTraceEntry({
+            round: loopRounds,
+            phase: 'tool',
+            action: 'continue',
+            requiredTotal: progressState.snapshot.requiredTotal,
+            candidates: [],
+            gateState,
+          }));
 
           // 当轮 stream 结束，工具副作用（subTaskCard 等）已自然排在后面
           this.normalizer.endStream(streamId);
@@ -969,6 +1361,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       if (!finalText.trim() && !this.abortController?.signal.aborted) {
         if (lastNonEmptyAssistantText.trim()) {
           finalText = lastNonEmptyAssistantText;
+          finalTextDelivered = true;
           logger.warn('orchestrator 最终轮空文本，回退到最近有效输出', {
             loopRounds,
             totalToolResultCount,
@@ -991,11 +1384,31 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           note: 'shadow-fallback',
         };
       }
+
+      // 某些治理分支会在循环外合成 finalText（例如摘要劫持终止、工具结果降级文案），
+      // 这些文本未经过流式管道时，前端会表现为“工具后停住但无结论”。
+      if (!isTransientSystemCall && finalText.trim() && !finalTextDelivered && !this.abortController?.signal.aborted) {
+        const fallbackStreamId = this.normalizer.startStream(this.currentTraceId!);
+        this.normalizer.processTextDelta(fallbackStreamId, finalText);
+        this.normalizer.endStream(fallbackStreamId);
+        this.emit('message', finalText);
+        decisionTrace.push(this.createDecisionTraceEntry({
+          round: loopRounds,
+          phase: 'finalize',
+          action: 'fallback',
+          requiredTotal: latestSnapshot?.requiredTotal ?? 0,
+          reason: terminationReason,
+          candidates: [terminationReason],
+          note: 'final_text_fallback_stream',
+        }));
+      }
+
       this.lastRuntimeState = {
         reason: terminationReason,
         rounds: loopRounds,
         snapshot: latestSnapshot,
         shadow: runtimeShadow,
+        decisionTrace,
       };
       return finalText || '任务已中断';
     } catch (error: any) {
@@ -1037,9 +1450,11 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
 
   private buildShadowTerminationResult(params: {
     snapshot: TerminationSnapshot;
-    budget: { maxDurationMs: number; maxTokenUsage: number; maxErrorRate: number };
+    budget: OrchestratorExecutionBudget;
     noProgressStreak: number;
     consecutiveUpstreamModelErrors: number;
+    budgetBreachStreak: number;
+    externalWaitBreachStreak: number;
     primaryReason: Exclude<OrchestratorTerminationReason, 'unknown'>;
     assistantText: string;
   }): {
@@ -1052,26 +1467,28 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       return undefined;
     }
 
-    const { snapshot, budget, noProgressStreak, consecutiveUpstreamModelErrors, primaryReason, assistantText } = params;
-    let shadowReason: Exclude<OrchestratorTerminationReason, 'unknown'> = 'completed';
-
-    if (snapshot.requiredTotal > 0
-      && snapshot.progressVector.terminalRequiredTodos >= snapshot.requiredTotal
-      && snapshot.runningOrPendingRequired === 0) {
-      shadowReason = snapshot.failedRequired > 0 ? 'failed' : 'completed';
-    } else if (snapshot.budgetState.elapsedMs >= budget.maxDurationMs
-      || snapshot.budgetState.tokenUsed >= budget.maxTokenUsage
-      || snapshot.budgetState.errorRate >= budget.maxErrorRate) {
-      shadowReason = 'budget_exceeded';
-    } else if (snapshot.blockerState.maxExternalWaitAgeMs >= OrchestratorLLMAdapter.EXTERNAL_WAIT_SLA_MS) {
-      shadowReason = 'external_wait_timeout';
-    } else if (consecutiveUpstreamModelErrors >= OrchestratorLLMAdapter.UPSTREAM_MODEL_ERROR_STREAK) {
-      shadowReason = 'upstream_model_error';
-    } else if (noProgressStreak >= OrchestratorLLMAdapter.STALLED_WINDOW_SIZE && snapshot.blockerState.externalWaitOpen === 0) {
-      shadowReason = 'stalled';
-    } else if (!assistantText.trim()) {
-      shadowReason = 'failed';
-    }
+    const {
+      snapshot,
+      budget,
+      noProgressStreak,
+      consecutiveUpstreamModelErrors,
+      budgetBreachStreak,
+      externalWaitBreachStreak,
+      primaryReason,
+      assistantText,
+    } = params;
+    const gateState = this.buildGateState(
+      noProgressStreak,
+      consecutiveUpstreamModelErrors,
+      budgetBreachStreak,
+      externalWaitBreachStreak,
+    );
+    const shadowReason = this.decisionEngine.resolveShadowReason({
+      snapshot,
+      budget,
+      gateState,
+      assistantText,
+    });
 
     const consistent = shadowReason === primaryReason;
     if (!consistent) {
@@ -1097,34 +1514,80 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     };
   }
 
-  private collectBudgetCandidates(
-    candidates: TerminationCandidate[],
-    snapshot: TerminationSnapshot,
-    budget: { maxDurationMs: number; maxTokenUsage: number; maxErrorRate: number },
+  private buildGateState(
     noProgressStreak: number,
     consecutiveUpstreamModelErrors: number,
-  ): void {
-    if (snapshot.budgetState.elapsedMs >= budget.maxDurationMs
-      || snapshot.budgetState.tokenUsed >= budget.maxTokenUsage
-      || snapshot.budgetState.errorRate >= budget.maxErrorRate) {
-      candidates.push(this.createTerminationCandidate('budget_exceeded', 'budget'));
-    }
+    budgetBreachStreak: number,
+    externalWaitBreachStreak: number,
+  ): OrchestratorGateState {
+    return {
+      noProgressStreak,
+      consecutiveUpstreamModelErrors,
+      budgetBreachStreak,
+      externalWaitBreachStreak,
+    };
+  }
 
-    if (snapshot.blockerState.maxExternalWaitAgeMs >= OrchestratorLLMAdapter.EXTERNAL_WAIT_SLA_MS) {
-      candidates.push(this.createTerminationCandidate('external_wait_timeout', 'external_wait'));
-    }
+  private createDecisionTraceEntry(params: {
+    round: number;
+    phase: OrchestratorDecisionTraceEntry['phase'];
+    action: OrchestratorDecisionTraceEntry['action'];
+    requiredTotal: number;
+    reason?: Exclude<OrchestratorTerminationReason, 'unknown'>;
+    candidates?: string[];
+    gateState?: OrchestratorGateState;
+    note?: string;
+  }): OrchestratorDecisionTraceEntry {
+    return {
+      round: params.round,
+      phase: params.phase,
+      action: params.action,
+      requiredTotal: params.requiredTotal,
+      reason: params.reason,
+      candidates: params.candidates,
+      gateState: params.gateState ? {
+        noProgressStreak: params.gateState.noProgressStreak,
+        budgetBreachStreak: params.gateState.budgetBreachStreak,
+        externalWaitBreachStreak: params.gateState.externalWaitBreachStreak,
+        consecutiveUpstreamModelErrors: params.gateState.consecutiveUpstreamModelErrors,
+      } : undefined,
+      note: params.note,
+      timestamp: Date.now(),
+    };
+  }
 
-    if (consecutiveUpstreamModelErrors >= OrchestratorLLMAdapter.UPSTREAM_MODEL_ERROR_STREAK) {
-      candidates.push(this.createTerminationCandidate('upstream_model_error', 'upstream_model'));
-    }
-
-    if (noProgressStreak >= OrchestratorLLMAdapter.STALLED_WINDOW_SIZE && snapshot.blockerState.externalWaitOpen === 0) {
-      candidates.push(this.createTerminationCandidate('stalled', 'stalled'));
+  private logGateEvents(events: OrchestratorGateEvent[]): void {
+    for (const event of events) {
+      if (event.gate === 'budget') {
+        logger.warn('Orchestrator.Termination.Gate.预算门禁触发', {
+          ...event.payload,
+          hardBudgetBreach: event.hard,
+          triggerLabel: event.label,
+        }, LogCategory.LLM);
+      } else if (event.gate === 'external_wait') {
+        logger.warn('Orchestrator.Termination.Gate.外部等待门禁触发', {
+          ...event.payload,
+          hardExternalWaitBreach: event.hard,
+          triggerLabel: event.label,
+        }, LogCategory.LLM);
+      } else {
+        logger.warn('Orchestrator.Termination.Gate.通用门禁触发', {
+          gate: event.gate,
+          ...event.payload,
+          triggerLabel: event.label,
+        }, LogCategory.LLM);
+      }
     }
   }
 
   private buildContinuePrompt(snapshot: TerminationSnapshot): string {
     const p = snapshot.progressVector;
+    if (snapshot.requiredTotal === 0) {
+      return [
+        '[System] 当前尚未建立 required todos，请先创建/推进任务再判断终止。',
+        '- 建议优先 dispatch_task 创建可执行子任务，或使用 update_todo 明确 required 项。',
+      ].join('\n');
+    }
     const remain = Math.max(0, snapshot.requiredTotal - p.terminalRequiredTodos);
     return [
       '[System] 当前任务未满足终止条件，请继续推进。',
@@ -1136,9 +1599,142 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     ].join('\n');
   }
 
+  private shouldContinueWithoutTodos(assistantText: string): boolean {
+    const text = assistantText.trim();
+    if (!text) {
+      return false;
+    }
+    return /继续|下一轮|接下来|再发起|再进行|继续执行|继续测试|next round|next step|continue|proceed|let me continue|i(?:'| )ll continue/i.test(text);
+  }
+
+  private buildNoTodoContinuePrompt(): string {
+    return [
+      '[System] 你明确表示将继续下一轮，请直接继续执行工具调用与分析。',
+      '- 若已完成全部工作，请给出最终结论并停止继续调用工具。',
+      '- 若未完成，请继续调用必要工具，不要提前结束。',
+    ].join('\n');
+  }
+
+  private shouldFinalizeWithoutTodos(assistantText: string): boolean {
+    const text = assistantText.trim();
+    if (!text) {
+      return false;
+    }
+    // “Round/阶段进行中”语义优先判为未收尾，避免工具后首个无工具轮被提前 completed。
+    if (/round\s*\d+|第\s*\d+\s*轮|阶段\s*\d+/i.test(text)) {
+      return false;
+    }
+    return /最终|结论|总结|完成情况|交付状态|结案|结果如下|overall|final answer|in conclusion|summary|completed/i.test(text);
+  }
+
+  private buildNoTodoAmbiguousPrompt(streak: number): string {
+    return [
+      `[System] 你已在无 Todo 轨道下给出第 ${streak} 次模糊结论。请明确二选一：`,
+      '1) 若已完成，请输出“最终结论”并给出关键证据；',
+      '2) 若未完成，请继续调用必要工具，或先建立 required todo 轨道。',
+      '- 不要输出中间态模板文本。',
+    ].join('\n');
+  }
+
+  private buildToolRoundSignature(toolCalls: ToolCall[]): string {
+    return toolCalls.map((toolCall) => {
+      const args = toolCall.arguments && typeof toolCall.arguments === 'object'
+        ? toolCall.arguments
+        : {};
+      const serializedArgs = Object.keys(args)
+        .sort()
+        .map((key) => `${key}:${this.toStableSignatureValue((args as Record<string, unknown>)[key])}`)
+        .join(',');
+      return `${toolCall.name}(${serializedArgs})`;
+    }).join('|');
+  }
+
+  private toStableSignatureValue(value: unknown): string {
+    if (value == null) {
+      return '';
+    }
+    if (typeof value === 'string') {
+      return value.trim().replace(/\s+/g, ' ').toLowerCase().slice(0, 120);
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      return String(value);
+    }
+    if (Array.isArray(value)) {
+      return value.map(item => this.toStableSignatureValue(item)).join(',');
+    }
+    if (typeof value === 'object') {
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return '[object]';
+      }
+    }
+    return String(value);
+  }
+
+  private buildNoTodoToolLoopPrompt(
+    noTodoToolRoundStreak: number,
+    repeatedSignatureStreak: number,
+  ): string {
+    return [
+      `[System] 你已在未建立 Todo 轨道下连续执行 ${noTodoToolRoundStreak} 轮工具调用（重复模式 ${repeatedSignatureStreak} 轮）。`,
+      '- 下一轮已强制禁用工具，请直接二选一：',
+      '  1) 给出最终结论与证据；',
+      '  2) 立即调用 dispatch_task / update_todo 建立 required todo 轨道后再继续。',
+      '- 不要继续重复检索。',
+    ].join('\n');
+  }
+
+  private shouldRequestTerminalSynthesisAfterToolRound(
+    reason: Exclude<OrchestratorTerminationReason, 'unknown'>,
+    toolCallCount: number,
+  ): boolean {
+    if (toolCallCount <= 0) {
+      return false;
+    }
+    return reason === 'completed' || reason === 'failed';
+  }
+
+  private buildTerminalSynthesisPrompt(
+    reason: Exclude<OrchestratorTerminationReason, 'unknown'>,
+    snapshot: TerminationSnapshot,
+  ): string {
+    const remain = Math.max(0, snapshot.requiredTotal - snapshot.progressVector.terminalRequiredTodos);
+    if (reason === 'completed') {
+      return [
+        '[System] 当前执行已满足终止条件。请基于已完成工具结果给出最终结论。',
+        `- 必需 Todo: ${snapshot.requiredTotal}`,
+        `- 已终态必需 Todo: ${snapshot.progressVector.terminalRequiredTodos}`,
+        `- 剩余必需 Todo: ${remain}`,
+        '- 要求：总结已完成事项、关键证据、验收结果与最终交付状态。',
+      ].join('\n');
+    }
+
+    return [
+      '[System] 当前执行进入失败终态。请输出结构化失败结论。',
+      `- 必需 Todo: ${snapshot.requiredTotal}`,
+      `- 已终态必需 Todo: ${snapshot.progressVector.terminalRequiredTodos}`,
+      `- 失败必需 Todo: ${snapshot.failedRequired}`,
+      '- 要求：说明失败根因、已完成部分、未完成部分、下一步修复建议。',
+    ].join('\n');
+  }
+
+  private buildTerminationFallbackText(
+    reason: Exclude<OrchestratorTerminationReason, 'unknown'>,
+  ): string {
+    if (reason === 'completed') {
+      return '任务已满足终止条件，但未收到最终总结文本。请参考上方工具结果。';
+    }
+    if (reason === 'failed') {
+      return '任务进入失败终态，但未收到失败总结文本。请参考上方工具结果与错误信息。';
+    }
+    return '任务已终止。';
+  }
+
   private async buildTerminationSnapshot(params: {
     round: number;
     loopStartAt: number;
+    loopStartTokenUsed: number;
     toolFailureRounds: number;
     baseline: CriticalPathBaseline | null;
     previousSnapshot: TerminationSnapshot | null;
@@ -1196,7 +1792,10 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     const failedRequired = requiredTodos.filter(todo => todo.status === 'failed').length;
     const runningOrPendingRequired = requiredTodos.filter(todo => !terminalStatuses.has(todo.status)).length;
     const totalTokens = this.getTotalTokenUsage();
-    const tokenUsed = (totalTokens.inputTokens || 0) + (totalTokens.outputTokens || 0);
+    const currentTokenUsed = (totalTokens.inputTokens || 0) + (totalTokens.outputTokens || 0);
+    // token 预算按“本次编排调用增量”计，不按 adapter 生命周期累计值计。
+    // 否则会话用久后会出现“工具一返回就命中 budget_exceeded”的误停事故。
+    const tokenUsed = Math.max(0, currentTokenUsed - Math.max(0, params.loopStartTokenUsed || 0));
 
     const progressVector: ProgressVector = {
       terminalRequiredTodos,
@@ -1549,10 +2148,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           this.abortController?.signal,
           { workerId: 'orchestrator', role: 'orchestrator' },
         );
-        if (typeof rawResult.content === 'string' && rawResult.content.length > maxToolResultChars) {
-          const truncated = rawResult.content.slice(0, maxToolResultChars);
-          rawResult.content = `${truncated}\n...[truncated ${rawResult.content.length - maxToolResultChars} chars]`;
-        }
+        this.truncateToolResultContent(toolCall, rawResult, maxToolResultChars);
         const result = this.ensureStandardizedToolResult(toolCall, rawResult, toolSourceMap);
         results.push(result);
         this.emit('toolResult', toolCall.name, result.content);

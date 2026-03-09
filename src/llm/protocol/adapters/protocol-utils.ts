@@ -148,7 +148,18 @@ export function normalizeToolResultBlock(
     ? block.standardized.message.trim()
     : '';
 
-  const isError = block?.is_error === true || (standardizedStatus !== '' && standardizedStatus !== 'success');
+  // 只将“硬失败”状态透传为模型可见的 tool_result error。
+  // blocked/rejected/aborted 属于软失败（策略/权限/中断语义），不应被包装成 hard error。
+  const normalizedStatus = standardizedStatus.trim().toLowerCase();
+  const isHardFailureStatus = normalizedStatus === 'error'
+    || normalizedStatus === 'timeout'
+    || normalizedStatus === 'killed';
+  const isSoftFailureStatus = normalizedStatus === 'blocked'
+    || normalizedStatus === 'rejected'
+    || normalizedStatus === 'aborted';
+  const isError = normalizedStatus
+    ? (isHardFailureStatus ? true : (isSoftFailureStatus ? false : block?.is_error === true))
+    : block?.is_error === true;
   const rawContent = block?.content;
   const stringContent = typeof rawContent === 'string'
     ? rawContent

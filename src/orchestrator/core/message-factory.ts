@@ -18,6 +18,8 @@ export interface SubTaskCardPayload {
   worker: WorkerSlot;
   summary?: string;
   error?: string;
+  failureCode?: string;
+  recoverable?: boolean;
   modifiedFiles?: string[];
   createdFiles?: string[];
   duration?: number;
@@ -140,6 +142,19 @@ export class MessageFactory {
     };
     const content = statusContentMap[normalizedSubTask.status] || statusContentMap.running;
     const stableMessageId = `subtask-card-${normalizedSubTask.id}`;
+    const isFailed = normalizedSubTask.status === 'failed';
+    const failureCode = typeof normalizedSubTask.failureCode === 'string' ? normalizedSubTask.failureCode.trim() : '';
+    const modelOriginExtra = normalizedFailure?.isModelOrigin ? {
+      modelOriginIssue: true,
+      rawReason: normalizedFailure.rawReason,
+      modelOriginKind: classifyModelOriginIssue(normalizedFailure.rawReason).kind || 'unknown',
+      failureCode: failureCode || 'upstream_model_error',
+    } : {};
+    const dispatchFailureExtra = failureCode ? {
+      failureCode,
+      dispatchProtocolFailure: failureCode.startsWith('dispatch_'),
+    } : {};
+
     this.pipeline.clearMessageState?.(stableMessageId);
     this.pipeline.process(createStandardMessage({
       id: stableMessageId,
@@ -153,11 +168,12 @@ export class MessageFactory {
         assignedWorker: normalizedSubTask.worker,
         isStatusMessage: true,
         subTaskCard: normalizedSubTask,
-        ...(normalizedFailure?.isModelOrigin ? {
-          recoverable: true,
+        ...(isFailed && failureCode ? { reason: failureCode } : {}),
+        ...(isFailed ? { recoverable: normalizedSubTask.recoverable ?? true } : {}),
+        ...((normalizedFailure?.isModelOrigin || failureCode) ? {
           extra: {
-            modelOriginIssue: true,
-            rawReason: normalizedFailure.rawReason,
+            ...modelOriginExtra,
+            ...dispatchFailureExtra,
           },
         } : {}),
       },
@@ -356,7 +372,12 @@ export class MessageFactory {
     return metadata;
   }
 
-  private normalizeFailureReason(reason: string): { rawReason: string; userReason: string; isModelOrigin: boolean } {
+  private normalizeFailureReason(reason: string): {
+    rawReason: string;
+    userReason: string;
+    isModelOrigin: boolean;
+    modelOriginKind?: string;
+  } {
     const rawReason = (reason || '').trim();
     const userReason = toModelOriginUserMessage(rawReason).trim() || rawReason || '执行失败';
     const classified = classifyModelOriginIssue(rawReason);
@@ -369,11 +390,12 @@ export class MessageFactory {
       rawReason,
       userReason,
       isModelOrigin: classified.isModelCause,
+      modelOriginKind: classified.kind,
     };
   }
 
   private buildFailureMetadata(
-    normalized: { rawReason: string; userReason: string; isModelOrigin: boolean },
+    normalized: { rawReason: string; userReason: string; isModelOrigin: boolean; modelOriginKind?: string },
     metadata: MessageMetadata,
   ): MessageMetadata {
     if (!normalized.isModelOrigin) {
@@ -381,10 +403,17 @@ export class MessageFactory {
     }
     return {
       ...metadata,
+      reason: typeof metadata.reason === 'string' && metadata.reason.trim()
+        ? metadata.reason
+        : 'upstream_model_error',
       recoverable: metadata.recoverable ?? true,
       extra: {
         ...(metadata.extra || {}),
+        failureCode: (metadata.extra && typeof metadata.extra.failureCode === 'string')
+          ? metadata.extra.failureCode
+          : 'upstream_model_error',
         modelOriginIssue: true,
+        modelOriginKind: normalized.modelOriginKind || 'unknown',
         rawReason: normalized.rawReason,
       },
     };

@@ -71,6 +71,13 @@ interface DispatchExecutionProtocolState {
   timeoutTriggered: boolean;
 }
 
+interface DispatchFailureSemantic {
+  failureCode: string;
+  userMessage: string;
+  recoverable: boolean;
+  notifyLevel: 'warning' | 'error';
+}
+
 /**
  * DispatchManager 依赖接口
  */
@@ -178,6 +185,7 @@ export class DispatchManager {
       DispatchManager.MAX_MISSION_SESSION_RECORDS,
     );
     this.dispatchIdempotencyStore = new DispatchIdempotencyStore(this.deps.workspaceRoot);
+    this.reportIdempotencyDeploymentDiagnostic();
     this.setupMissionEventListeners();
     this.startLeaseWatcher();
   }
@@ -526,16 +534,24 @@ export class DispatchManager {
             status: 'dispatched',
           });
         } catch (idempotencyError: any) {
+          const rawError = idempotencyError?.message || String(idempotencyError);
+          const lockTimeout = rawError.includes('幂等账本锁获取超时');
+          const failureCode = lockTimeout ? 'dispatch_idempotency_lock_timeout' : 'dispatch_idempotency_claim_failed';
+          const userError = lockTimeout
+            ? 'dispatch 幂等账本锁竞争超时，当前任务已拒绝派发。请稍后重试。'
+            : `dispatch 幂等占位失败：${rawError}`;
           logger.warn('编排工具.dispatch_task.幂等占位失败', {
             idempotencyKey: effectiveIdempotencyKey,
             sessionId: sessionScopeForIdempotency,
             missionId,
-            error: idempotencyError?.message || String(idempotencyError),
+            failureCode,
+            error: rawError,
           }, LogCategory.ORCHESTRATOR);
+          this.deps.messageHub.notify(`${userError}（${failureCode}）`, lockTimeout ? 'warning' : 'error');
           return {
             task_id: '',
             status: 'failed' as const,
-            error: `dispatch 幂等占位失败：${idempotencyError?.message || String(idempotencyError)}`,
+            error: `[${failureCode}] ${userError}`,
           };
         }
         if (!idempotencyClaim.claimed) {
@@ -1168,7 +1184,8 @@ export class DispatchManager {
           adapterFactory: this.deps.adapterFactory,
           workspaceRoot: this.deps.workspaceRoot,
           projectContext,
-          missionId: this.deps.getCurrentTurnId() || missionId,
+          // 与 Todo/Assignment 使用同一真实 missionId，避免终止快照作用域错位。
+          missionId,
           sessionId: currentSessionId,
           onReport: (report) => this.handleDispatchWorkerReport(report, batch),
           cancellationToken: batch?.cancellationToken,
@@ -2161,7 +2178,8 @@ export class DispatchManager {
       return;
     }
 
-    const timeoutMessage = `Worker ${state.worker} 执行异常终止（${reasonCode}），已结束本轮任务并回传编排者。`;
+    const semantic = this.resolveDispatchFailureSemantic(state.worker, reasonCode);
+    const timeoutMessage = semantic.userMessage;
     this.deps.messageHub.subTaskCard({
       id: state.taskId,
       title: entry.task,
@@ -2169,12 +2187,25 @@ export class DispatchManager {
       worker: state.worker,
       summary: timeoutMessage,
       error: timeoutMessage,
+      failureCode: semantic.failureCode,
+      recoverable: semantic.recoverable,
     });
-    this.deps.messageHub.workerError(state.worker, timeoutMessage);
+    this.deps.messageHub.workerError(state.worker, timeoutMessage, {
+      metadata: {
+        reason: semantic.failureCode,
+        recoverable: semantic.recoverable,
+        extra: {
+          dispatchFailureCode: semantic.failureCode,
+          dispatchReasonCode: reasonCode,
+          dispatchProtocolFailure: true,
+        },
+      },
+    });
+    this.deps.messageHub.notify(`${timeoutMessage}（${semantic.failureCode}）`, semantic.notifyLevel);
     batch.markFailed(state.taskId, {
       success: false,
       summary: timeoutMessage,
-      errors: [timeoutMessage],
+      errors: [`[${semantic.failureCode}] ${timeoutMessage}`],
     });
     void this.deps.adapterFactory.interrupt(state.worker).catch((error: any) => {
       logger.warn('Dispatch.Protocol.Timeout.中断Worker失败', {
@@ -2218,6 +2249,60 @@ export class DispatchManager {
     for (const entry of batch.getEntries()) {
       this.dispatchTaskCategories.delete(entry.taskId);
     }
+  }
+
+  private reportIdempotencyDeploymentDiagnostic(): void {
+    const diagnostic = this.dispatchIdempotencyStore.getDeploymentDiagnostic();
+    if (diagnostic.level === 'info') {
+      logger.info('Dispatch.IdempotencyStore.部署诊断', diagnostic, LogCategory.ORCHESTRATOR);
+      return;
+    }
+
+    const notifyLevel = diagnostic.level === 'error' ? 'error' : 'warning';
+    const logMethod = diagnostic.level === 'error' ? logger.error : logger.warn;
+    logMethod('Dispatch.IdempotencyStore.部署风险', diagnostic, LogCategory.ORCHESTRATOR);
+    this.deps.messageHub.notify(diagnostic.message, notifyLevel);
+  }
+
+  private resolveDispatchFailureSemantic(worker: WorkerSlot, reasonCode: string): DispatchFailureSemantic {
+    if (reasonCode === 'ack-timeout') {
+      return {
+        failureCode: 'dispatch_ack_timeout',
+        userMessage: `Worker ${worker} 接单超时（ack-timeout, ACK 未收到），本轮已终止并回传编排者。`,
+        recoverable: true,
+        notifyLevel: 'warning',
+      };
+    }
+    if (reasonCode === 'lease-expired') {
+      return {
+        failureCode: 'dispatch_lease_expired',
+        userMessage: `Worker ${worker} 心跳租约已过期（lease-expired），本轮已终止并回传编排者。`,
+        recoverable: true,
+        notifyLevel: 'warning',
+      };
+    }
+    if (reasonCode === 'execution-timeout') {
+      return {
+        failureCode: 'dispatch_execution_timeout',
+        userMessage: `Worker ${worker} 执行超时（execution-timeout），本轮已终止并回传编排者。`,
+        recoverable: true,
+        notifyLevel: 'warning',
+      };
+    }
+    if (reasonCode.startsWith('nack:')) {
+      return {
+        failureCode: 'dispatch_nack',
+        userMessage: `Worker ${worker} 拒绝接单（${reasonCode}），本轮已终止并回传编排者。`,
+        recoverable: true,
+        notifyLevel: 'warning',
+      };
+    }
+    return {
+      failureCode: 'dispatch_protocol_failure',
+      userMessage: `Worker ${worker} 协议异常终止（${reasonCode}），本轮已终止并回传编排者。`,
+      recoverable: true,
+      notifyLevel: 'warning',
+    };
   }
 
   private buildDelegationBriefing(input: {

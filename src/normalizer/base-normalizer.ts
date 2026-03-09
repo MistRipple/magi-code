@@ -464,11 +464,13 @@ export abstract class BaseNormalizer extends EventEmitter {
     error?: string,
     standardized?: StandardizedToolResultPayload,
   ): { status: 'completed' | 'failed'; output?: string; error?: string } {
-    if (standardized && standardized.status !== 'success') {
+    const status = (standardized?.status || '').toLowerCase();
+    const hardFailure = status === 'error' || status === 'timeout' || status === 'killed';
+    if (hardFailure) {
       return {
         status: 'failed',
         output: undefined,
-        error: standardized.message || error || output || 'Tool execution failed',
+        error: standardized?.message || error || output || 'Tool execution failed',
       };
     }
 

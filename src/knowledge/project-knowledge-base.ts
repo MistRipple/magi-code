@@ -12,6 +12,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import ignore, { Ignore } from 'ignore';
 import { logger, LogCategory } from '../logging';
 import { LLMConfigLoader } from '../llm/config';
 import { LLMClient, LLMMessageParams } from '../llm/types';
@@ -161,6 +162,8 @@ export class ProjectKnowledgeBase {
 
   private indexPatterns: string[];
   private ignorePatterns: string[];
+  /** 基于 gitignore 规范的路径忽略过滤器（合并 .gitignore + 内置规则 + 自定义规则） */
+  private ignoreFilter: Ignore;
   private searchEngineConfig?: SearchEngineConfig;
   /** 从 indexPatterns 预编译得到的可索引扩展名集合（含点号，小写） */
   private indexedExtensions = new Set<string>();
@@ -212,18 +215,21 @@ export class ProjectKnowledgeBase {
     ];
     this.rebuildIndexedExtensions();
 
-    // 默认忽略模式
+    // 默认忽略模式（保留字段供外部引用）
     this.ignorePatterns = config.ignorePatterns || [
-      '**/node_modules/**',
-      '**/dist/**',
-      '**/out/**',
-      '**/build/**',
-      '**/.git/**',
-      '**/.vscode/**',
-      '**/coverage/**',
-      '**/*.min.js',
-      '**/*.map'
+      'node_modules/',
+      'dist/',
+      'out/',
+      'build/',
+      '.git/',
+      '.vscode/',
+      'coverage/',
+      '*.min.js',
+      '*.map',
     ];
+
+    // 构建基于 gitignore 规范的路径忽略过滤器
+    this.ignoreFilter = this.buildIgnoreFilter(config.ignorePatterns);
 
     this.searchEngineConfig = config.searchEngineConfig;
   }
@@ -336,8 +342,8 @@ export class ProjectKnowledgeBase {
           const fullPath = path.join(dir, entry.name);
           const relativePath = path.relative(this.projectRoot, fullPath);
 
-          // 检查是否应该忽略
-          if (this.shouldIgnore(relativePath)) {
+          // 检查是否应该忽略（传入 isDirectory 以正确匹配 `xxx/` 规则）
+          if (this.shouldIgnore(relativePath, entry.isDirectory())) {
             continue;
           }
 
@@ -399,16 +405,99 @@ export class ProjectKnowledgeBase {
   }
 
   /**
-   * 检查路径是否应该被忽略
-   * 从 ignorePatterns（glob）中提取关键词进行包含匹配
+   * 构建基于 gitignore 规范的路径忽略过滤器
+   * 优先级：.gitignore 规则 > 内置默认规则 > 外部自定义规则
    */
-  private shouldIgnore(filePath: string): boolean {
-    // 从 glob 模式中提取核心路径片段，例如 '**/node_modules/**' → 'node_modules'
-    const keywords = this.ignorePatterns.map(pattern =>
-      pattern.replace(/^\*\*\//, '').replace(/\/\*\*$/, '').replace(/^\*/, ''),
-    );
+  private buildIgnoreFilter(customPatterns?: string[]): Ignore {
+    const ig = ignore();
 
-    return keywords.some(keyword => keyword && filePath.includes(keyword));
+    // 1. 内置默认忽略：编译产物、依赖、缓存等
+    ig.add([
+      // 依赖
+      'node_modules/',
+      'bower_components/',
+      // 编译/构建产物
+      'dist/',
+      'out/',
+      'build/',
+      '.next/',
+      '.nuxt/',
+      '.output/',
+      'target/',
+      '__pycache__/',
+      // 版本控制
+      '.git/',
+      '.svn/',
+      '.hg/',
+      // IDE / 编辑器
+      '.vscode/',
+      '.idea/',
+      '.history/',
+      '.vscode-test/',
+      // 系统文件
+      '.DS_Store',
+      'Thumbs.db',
+      // 测试覆盖率
+      'coverage/',
+      '.nyc_output/',
+      // 缓存 / 临时文件
+      '*.min.js',
+      '*.map',
+      '*.log',
+      '*.tmp',
+      '*.bak',
+      '*.cache',
+      '*.vsix',
+      // 以 . 开头的目录通用屏蔽（隐藏资源目录）
+      '.*/',
+    ]);
+
+    // 2. 读取项目 .gitignore（追加，支持否定规则覆盖）
+    const gitignorePath = path.join(this.projectRoot, '.gitignore');
+    try {
+      if (fs.existsSync(gitignorePath)) {
+        const content = fs.readFileSync(gitignorePath, 'utf-8');
+        ig.add(content);
+        logger.info('项目知识库.忽略规则.已加载.gitignore', {
+          path: gitignorePath,
+        }, LogCategory.SESSION);
+      }
+    } catch (error) {
+      logger.warn('项目知识库.忽略规则.读取.gitignore失败', {
+        path: gitignorePath,
+        error,
+      }, LogCategory.SESSION);
+    }
+
+    // 3. 追加外部自定义规则
+    if (customPatterns && customPatterns.length > 0) {
+      // 将旧式 glob 模式（**/xxx/**）转换为 gitignore 规范格式
+      const normalized = customPatterns.map(p =>
+        p.replace(/^\*\*\//, '').replace(/\/\*\*$/, '')
+      );
+      ig.add(normalized);
+    }
+
+    return ig;
+  }
+
+  /**
+   * 检查路径是否应该被忽略
+   * 使用 gitignore 规范引擎进行标准匹配（支持通配符、否定规则等）
+   *
+   * @param isDirectory 当已知路径为目录时传 true，
+   *   使 ignore 包能正确匹配 `xxx/` 形式的纯目录规则
+   */
+  private shouldIgnore(filePath: string, isDirectory?: boolean): boolean {
+    // ignore 包要求正斜杠分隔的相对路径，不含前导 /
+    const normalized = filePath.replace(/\\/g, '/').replace(/^\//, '');
+    if (!normalized) return false;
+    // gitignore 规范：规则 `xxx/` 仅匹配目录；
+    // ignore 包需要路径带尾斜杠才能命中此类规则
+    if (isDirectory && !normalized.endsWith('/')) {
+      return this.ignoreFilter.ignores(normalized + '/');
+    }
+    return this.ignoreFilter.ignores(normalized);
   }
 
   /**
@@ -422,7 +511,7 @@ export class ProjectKnowledgeBase {
         const relativePath = path.relative(this.projectRoot, dir);
 
         // 跳过根目录和忽略的目录
-        if (relativePath && !this.shouldIgnore(relativePath)) {
+        if (relativePath && !this.shouldIgnore(relativePath, true)) {
           const entries = await fs.promises.readdir(dir, { withFileTypes: true });
 
           let fileCount = 0;
@@ -449,7 +538,7 @@ export class ProjectKnowledgeBase {
           if (entry.isDirectory()) {
             const fullPath = path.join(dir, entry.name);
             const subRelativePath = path.relative(this.projectRoot, fullPath);
-            if (!this.shouldIgnore(subRelativePath)) {
+            if (!this.shouldIgnore(subRelativePath, true)) {
               await scanDirectory(fullPath);
             }
           }

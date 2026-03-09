@@ -25,6 +25,25 @@ interface DispatchIdempotencyStoreFile {
   records: DispatchIdempotencyRecord[];
 }
 
+export type DispatchIdempotencyDiagnosticLevel = 'info' | 'warning' | 'error';
+
+export interface DispatchIdempotencyDeploymentDiagnostic {
+  level: DispatchIdempotencyDiagnosticLevel;
+  code:
+    | 'single_instance_runtime'
+    | 'multi_instance_runtime_not_shared'
+    | 'multi_instance_runtime_unverified'
+    | 'multi_instance_runtime_shared'
+    | 'shared_runtime_without_multi_mode';
+  message: string;
+  details: {
+    deploymentMode: 'single' | 'multi';
+    runtimeRoot: string;
+    workspaceRoot: string;
+    sharedHint: boolean;
+  };
+}
+
 export interface DispatchIdempotencyClaimInput {
   key: string;
   sessionId: string;
@@ -53,6 +72,8 @@ export interface DispatchIdempotencyClaimResult {
  * - 保留 taskId/status，支持恢复阶段做重复判定
  */
 export class DispatchIdempotencyStore {
+  private readonly workspaceRoot: string;
+  private readonly runtimeRoot: string;
   private readonly filePath: string;
   private readonly lockPath: string;
   private readonly ttlMs: number;
@@ -60,6 +81,7 @@ export class DispatchIdempotencyStore {
   private readonly lockAcquireTimeoutMs: number;
   private readonly lockStaleMs: number;
   private readonly lockRetryMs: number;
+  private readonly deploymentDiagnostic: DispatchIdempotencyDeploymentDiagnostic;
   private readonly byKey = new Map<string, DispatchIdempotencyRecord>();
   private readonly keyByTaskId = new Map<string, string>();
 
@@ -73,13 +95,20 @@ export class DispatchIdempotencyStore {
       lockRetryMs?: number;
     },
   ) {
-    this.filePath = path.join(workspaceRoot, '.magi', 'runtime', 'dispatch-idempotency.json');
+    this.workspaceRoot = path.resolve(workspaceRoot);
+    this.runtimeRoot = this.resolveRuntimeRoot(this.workspaceRoot);
+    this.filePath = path.join(this.runtimeRoot, 'dispatch-idempotency.json');
     this.lockPath = `${this.filePath}.lock`;
     this.ttlMs = Math.max(60_000, options?.ttlMs ?? 24 * 60 * 60 * 1000);
     this.maxRecords = Math.max(100, options?.maxRecords ?? 5000);
     this.lockAcquireTimeoutMs = Math.max(500, options?.lockAcquireTimeoutMs ?? 5000);
     this.lockStaleMs = Math.max(1000, options?.lockStaleMs ?? 15_000);
     this.lockRetryMs = Math.max(5, options?.lockRetryMs ?? 25);
+    this.deploymentDiagnostic = this.buildDeploymentDiagnostic();
+  }
+
+  getDeploymentDiagnostic(): DispatchIdempotencyDeploymentDiagnostic {
+    return this.deploymentDiagnostic;
   }
 
   resolveByKey(key: string): DispatchIdempotencyRecord | null {
@@ -331,6 +360,7 @@ export class DispatchIdempotencyStore {
 
   private acquireLock(): number {
     const startedAt = Date.now();
+    let retryCount = 0;
     fs.mkdirSync(path.dirname(this.lockPath), { recursive: true });
     while (true) {
       try {
@@ -351,7 +381,9 @@ export class DispatchIdempotencyStore {
         if (Date.now() - startedAt >= this.lockAcquireTimeoutMs) {
           throw new Error(`幂等账本锁获取超时: ${this.lockPath}`);
         }
-        this.spinWait(this.lockRetryMs);
+        const delayMs = this.computeBackoffDelayMs(retryCount);
+        retryCount += 1;
+        this.sleep(delayMs);
       }
     }
   }
@@ -385,10 +417,99 @@ export class DispatchIdempotencyStore {
     }
   }
 
-  private spinWait(ms: number): void {
-    const start = Date.now();
-    while (Date.now() - start < ms) {
-      // busy wait for short lock retry window
+  private resolveRuntimeRoot(workspaceRoot: string): string {
+    const envRuntimeRoot = process.env.MAGI_IDEMPOTENCY_RUNTIME_DIR?.trim();
+    if (envRuntimeRoot) {
+      return path.resolve(envRuntimeRoot);
+    }
+    return path.resolve(workspaceRoot, '.magi', 'runtime');
+  }
+
+  private buildDeploymentDiagnostic(): DispatchIdempotencyDeploymentDiagnostic {
+    const deploymentModeRaw = (process.env.MAGI_DEPLOYMENT_MODE || 'single').trim().toLowerCase();
+    const deploymentMode: 'single' | 'multi' = deploymentModeRaw === 'multi' ? 'multi' : 'single';
+    const sharedHint = process.env.MAGI_IDEMPOTENCY_RUNTIME_SHARED === '1';
+    const details = {
+      deploymentMode,
+      runtimeRoot: this.runtimeRoot,
+      workspaceRoot: this.workspaceRoot,
+      sharedHint,
+    };
+
+    const workspaceRuntimeRoot = path.resolve(this.workspaceRoot, '.magi', 'runtime');
+    const runtimeInsideWorkspace = this.isSubPath(this.runtimeRoot, workspaceRuntimeRoot);
+
+    if (deploymentMode === 'multi') {
+      if (runtimeInsideWorkspace && !sharedHint) {
+        return {
+          level: 'error',
+          code: 'multi_instance_runtime_not_shared',
+          message: '当前为多实例模式，但 Dispatch 幂等账本仍使用工作区本地路径，无法保证跨实例幂等一致性。请配置共享运行目录并设置 MAGI_IDEMPOTENCY_RUNTIME_SHARED=1。',
+          details,
+        };
+      }
+      if (!sharedHint) {
+        return {
+          level: 'warning',
+          code: 'multi_instance_runtime_unverified',
+          message: '当前为多实例模式，但未声明共享运行目录（MAGI_IDEMPOTENCY_RUNTIME_SHARED=1）。幂等一致性无法被严格验证。',
+          details,
+        };
+      }
+      return {
+        level: 'info',
+        code: 'multi_instance_runtime_shared',
+        message: 'Dispatch 幂等账本已按多实例共享模式配置。',
+        details,
+      };
+    }
+
+    if (sharedHint) {
+      return {
+        level: 'warning',
+        code: 'shared_runtime_without_multi_mode',
+        message: '已声明共享运行目录，但部署模式仍为 single。请确认部署参数是否一致。',
+        details,
+      };
+    }
+
+    return {
+      level: 'info',
+      code: 'single_instance_runtime',
+      message: 'Dispatch 幂等账本运行于单实例模式。',
+      details,
+    };
+  }
+
+  private isSubPath(candidate: string, parent: string): boolean {
+    const normalizedCandidate = path.resolve(candidate);
+    const normalizedParent = path.resolve(parent);
+    if (normalizedCandidate === normalizedParent) {
+      return true;
+    }
+    return normalizedCandidate.startsWith(`${normalizedParent}${path.sep}`);
+  }
+
+  private computeBackoffDelayMs(retryCount: number): number {
+    const exp = Math.min(Math.max(0, retryCount), 6);
+    const base = Math.min(this.lockRetryMs * (2 ** exp), 250);
+    const jitter = Math.floor(Math.random() * Math.max(2, Math.floor(base * 0.3)));
+    return base + jitter;
+  }
+
+  private sleep(ms: number): void {
+    const duration = Math.max(0, Math.floor(ms));
+    if (duration <= 0) {
+      return;
+    }
+    try {
+      const arr = new Int32Array(new SharedArrayBuffer(4));
+      Atomics.wait(arr, 0, 0, duration);
+    } catch {
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < duration) {
+        // fallback for runtimes without Atomics.wait
+      }
     }
   }
 }

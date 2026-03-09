@@ -25,6 +25,7 @@ import { logger, LogCategory } from '../logging';
 export class LLMConfigLoader {
   private static readonly CONFIG_DIR = path.join(os.homedir(), '.magi');
   private static readonly LLM_CONFIG_FILE = path.join(this.CONFIG_DIR, 'llm.json');
+  private static readonly VALID_REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh']);
 
   /**
    * 加载完整配置
@@ -145,6 +146,7 @@ export class LLMConfigLoader {
   private static extractOrchestratorConfig(config: any): LLMConfig {
     const orchestratorConfig = config.orchestrator || {};
     const defaults = this.getDefaultLLMConfig().orchestrator;
+    const defaultReasoningEffort = this.normalizeReasoningEffort(defaults.reasoningEffort, 'medium');
 
     return {
       baseUrl: this.normalizeString(orchestratorConfig.baseUrl, defaults.baseUrl),
@@ -153,7 +155,7 @@ export class LLMConfigLoader {
       provider: this.normalizeString(orchestratorConfig.provider, defaults.provider) as LLMProvider,
       enabled: true,
       enableThinking: orchestratorConfig.enableThinking ?? defaults.enableThinking,
-      reasoningEffort: orchestratorConfig.reasoningEffort ?? defaults.reasoningEffort,
+      reasoningEffort: this.normalizeReasoningEffort(orchestratorConfig.reasoningEffort, defaultReasoningEffort),
     };
   }
 
@@ -178,6 +180,7 @@ export class LLMConfigLoader {
     if (!workerConfig) {
       return defaults;
     }
+    const defaultReasoningEffort = this.normalizeReasoningEffort(defaults.reasoningEffort, 'medium');
 
     return {
       baseUrl: this.normalizeString(workerConfig.baseUrl, defaults.baseUrl),
@@ -186,7 +189,7 @@ export class LLMConfigLoader {
       provider: this.normalizeString(workerConfig.provider, defaults.provider) as LLMProvider,
       enabled: workerConfig.enabled !== false,
       enableThinking: workerConfig.enableThinking ?? defaults.enableThinking,
-      reasoningEffort: workerConfig.reasoningEffort ?? defaults.reasoningEffort,
+      reasoningEffort: this.normalizeReasoningEffort(workerConfig.reasoningEffort, defaultReasoningEffort),
     };
   }
 
@@ -196,6 +199,20 @@ export class LLMConfigLoader {
     }
     const trimmed = value.trim();
     return trimmed.length > 0 ? trimmed : defaultValue;
+  }
+
+  private static normalizeReasoningEffort(
+    value: unknown,
+    fallback: 'low' | 'medium' | 'high' | 'xhigh' = 'medium',
+  ): 'low' | 'medium' | 'high' | 'xhigh' {
+    if (typeof value !== 'string') {
+      return fallback;
+    }
+    const normalized = value.trim().toLowerCase();
+    if (this.VALID_REASONING_EFFORTS.has(normalized)) {
+      return normalized as 'low' | 'medium' | 'high' | 'xhigh';
+    }
+    return fallback;
   }
 
   /**
@@ -319,7 +336,7 @@ export class LLMConfigLoader {
       provider: config.provider,
       enabled: config.enabled !== false,
       enableThinking: config.enableThinking === true,
-      ...(config.reasoningEffort ? { reasoningEffort: config.reasoningEffort } : {}),
+      ...(config.reasoningEffort ? { reasoningEffort: this.normalizeReasoningEffort(config.reasoningEffort, 'medium') } : {}),
     };
 
     this.saveFullConfig(fullConfig);
@@ -339,7 +356,7 @@ export class LLMConfigLoader {
       provider: config.provider,
       enabled: true,
       enableThinking: config.enableThinking === true,
-      ...(config.reasoningEffort ? { reasoningEffort: config.reasoningEffort } : {}),
+      ...(config.reasoningEffort ? { reasoningEffort: this.normalizeReasoningEffort(config.reasoningEffort, 'medium') } : {}),
     };
 
     this.saveFullConfig(fullConfig);

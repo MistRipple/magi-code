@@ -22,6 +22,7 @@ export interface TerminationMetricsRecord {
   failed_required: number | null;
   running_or_pending_required: number | null;
   shadow: unknown;
+  decision_trace: unknown;
 }
 
 export interface TerminationMetricsRepository {

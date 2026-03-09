@@ -148,7 +148,7 @@ sequenceDiagram
 
 ## 7. 已知边界（使用时注意）
 
-1. `shouldIgnore` 为关键词包含匹配，不是严格 glob 引擎语义
+1. ~~`shouldIgnore` 为关键词包含匹配，不是严格 glob 引擎语义~~ → 已替换为 `ignore` 包（标准 gitignore 规范引擎），自动加载项目 `.gitignore` + 内置规则 + `.` 开头目录通用屏蔽
 2. L2/L3 去重是按段落含路径的启发式，极端文本可能去重不完全
 3. RetrievalService 缓存键不含索引版本号，依赖 TTL 控制短时陈旧
 

@@ -112,17 +112,43 @@ async function main() {
   });
   assert(deepDispatchRestriction === null, `深度模式 dispatch_task 不应被拦截: ${deepDispatchRestriction}`);
 
+  const deepTerminalTools = [
+    'shell',
+  ];
+  const deepTerminalChecks = deepTerminalTools.map((toolName) => ({
+    tool: toolName,
+    restriction: checkRestrictionDeep.call(deepAdapter, {
+      id: `deep-terminal-${toolName}`,
+      name: toolName,
+      arguments: {},
+    }),
+  }));
+  assert(
+    deepTerminalChecks.every((item) => item.restriction === null),
+    `深度模式终端工具不应被拦截: ${JSON.stringify(deepTerminalChecks)}`
+  );
+
   const orchestratorAdapterSource = fs.readFileSync(
     path.join(ROOT, 'src', 'llm', 'adapters', 'orchestrator-adapter.ts'),
+    'utf8'
+  );
+  const decisionEngineSource = fs.readFileSync(
+    path.join(ROOT, 'src', 'llm', 'adapters', 'orchestrator-decision-engine.ts'),
     'utf8'
   );
   const hasLegacyRoundLimit = /MAX_ORCHESTRATOR_ROUNDS|failure_limit|round_limit/.test(orchestratorAdapterSource);
   assert(!hasLegacyRoundLimit, '编排者仍残留旧轮次/失败次数终止口径');
 
-  const hasBudgetGovernance = orchestratorAdapterSource.includes('private static readonly STANDARD_BUDGET')
-    && orchestratorAdapterSource.includes('private static readonly DEEP_BUDGET')
-    && orchestratorAdapterSource.includes('collectBudgetCandidates(')
-    && orchestratorAdapterSource.includes("createTerminationCandidate('budget_exceeded', 'budget')");
+  const hasBudgetBudgetConstants = orchestratorAdapterSource.includes('private static readonly STANDARD_BUDGET')
+    && orchestratorAdapterSource.includes('private static readonly DEEP_BUDGET');
+  const hasLegacyBudgetCollector = orchestratorAdapterSource.includes('collectBudgetCandidates(')
+    && /createTerminationCandidate\(\s*'budget_exceeded'/.test(orchestratorAdapterSource);
+  const hasDecisionEngineBudgetCollector = orchestratorAdapterSource.includes('OrchestratorDecisionEngine')
+    && orchestratorAdapterSource.includes('decisionEngine.collectBudgetCandidates(')
+    && decisionEngineSource.includes("createCandidate('budget_exceeded'")
+    && decisionEngineSource.includes("createCandidate('external_wait_timeout'");
+  const hasBudgetGovernance = hasBudgetBudgetConstants
+    && (hasLegacyBudgetCollector || hasDecisionEngineBudgetCollector);
   assert(hasBudgetGovernance, '编排者预算治理口径缺失（STANDARD/DEEP_BUDGET + budget_exceeded）');
 
   const workerSource = fs.readFileSync(
@@ -139,6 +165,7 @@ async function main() {
     regularFileEditChecks: regularResults,
     deepEditRestriction,
     deepDispatchRestriction,
+    deepTerminalChecks,
     pass: true,
   }, null, 2));
 

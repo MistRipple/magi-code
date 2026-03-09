@@ -750,11 +750,84 @@ sequenceDiagram
    - `C_min/C_ok/R_low/R_high` 固定为代码常量，无法通过配置中心或环境变量做发布期调优。
    - 已修复为：阈值支持 `~/.magi/config.json`（`orchestrator.governanceThresholds`）和环境变量（`MAGI_GOV_C_MIN/MAGI_GOV_C_OK/MAGI_GOV_R_LOW/MAGI_GOV_R_HIGH`）；非法值自动回退默认阈值并告警日志。
 
+11. B 阶段工具后“首轮失败即终止”根因：
+   - 预算门禁中的 `errorRate` 直接参与判定，首轮工具全失败时 `errorRate=1`，会在一次工具失败后立刻命中 `budget_exceeded`。
+   - 已修复为：新增错误率门禁最小样本轮次（`ERROR_RATE_MIN_SAMPLES=3`），错误率预算仅在样本足够后生效，避免“一轮失败即停”。
+
+12. D 阶段工具链路“有结果但无结论文本”根因：
+   - 编排器工具循环中，部分合成结论（如摘要劫持终止、工具结果降级总结）只作为返回值，未进入流式消息通道，前端表现为“工具返回后对话停住”。
+   - 已修复为：为未流式下发的 `finalText` 增加兜底流式回灌；同时 WebviewProvider 对引擎 fail-open 的 out-of-band 结果进行主对话区补发，确保用户可见。
+
+13. B 阶段 `intervention` 门禁中断风险根因：
+   - Phase C 审计命中 `intervention` 时仍抛异常进入失败分支，虽然有 fail-open 返回，但主链路语义上仍属于“异常退出”。
+   - 已修复为：改为门禁降级告警（写入 `executionWarnings`），不再直接抛错中断执行链路。
+
+14. D 阶段工具判错语义偏差根因：
+   - `read-process` 作为“读取终端状态/输出”的观测工具，却沿用了“被观测进程失败=工具失败”的判定，导致“工具返回了有效结果但 UI 显示 failed”，并放大终止门禁噪声。
+   - 已修复为：`read-process` 成功读取即返回 `isError=false`；标准化层按工具类型判定，`read-process` 在读取成功时强制归类为 `success`（参数错误仍为 `rejected`）。
+
+15. B 阶段“多工具通用提前收口”根因：
+   - 编排终止策略在 `requiredTotal=0`（未进入 Todo 任务流）时，采用“只要 assistant 有文本就 completed”规则；该规则会覆盖 MCP 工具、内置检索工具等所有非 Todo 场景，表现为“工具一用就停”。
+   - 已修复为：`requiredTotal=0` 下引入“继续意图”判别（如“继续下一轮/next round/continue/proceed”）；命中继续意图时不判 completed，而是注入继续执行提示并推进下一轮；仅在连续两轮“无 Todo + 无工具 + 继续话术”时判 `stalled` 防止无限循环。
+
+16. D 阶段“软失败被当硬错误”根因：
+   - 工具结果标准化后，`blocked/rejected/aborted` 在协议层、流式展示层、前端状态映射层均被与 `error/timeout/killed` 同等当作错误，导致“工具有响应但模型/界面认为失败”，并放大“工具后停止”的误判概率。
+   - 已修复为：统一硬失败语义（仅 `error/timeout/killed`）；`tool_result.is_error`、Normalizer 完成态、前端工具卡状态同步改造为硬失败判定；软失败保留结构化状态与诊断信息，但不再作为硬错误传递给模型终止链路。
+
+17. B 阶段“工具轮命中终止后直接断流”根因：
+   - 编排器在“工具执行轮”命中 `completed/failed` 后会直接 `break`，模型尚未消费 tool_result 并生成最终结论，前端表现为“工具一返回就停、输出突然截断”。
+   - 已修复为：新增终止收尾轮（Terminal Handoff Round）：工具轮命中 `completed/failed` 时，先强制进入一轮 `no-tools` 结论生成，再执行终止裁决，确保链路可见结果完整闭环。
+
+18. D 阶段“摘要劫持门禁误停”根因：
+   - `isSummaryHijackText` 曾以主模式单点命中直接判劫持，且连续命中后硬终止，会将部分正常输出误判为门禁事件并中断会话。
+   - 已修复为：收紧劫持识别为“组合高置信度命中”（主模板 + 约束/成对标签）；门禁策略改为 fail-open（连续命中时强制禁工具并继续），不再直接硬终止会话。
+
+19. B 阶段“无 Todo 工具循环不收敛”根因：
+   - 在 `requiredTotal=0` 且每轮都有工具调用时，原逻辑仅依赖时长/token预算，不会触发 `stalled`，导致“重复检索—继续—再检索”的生产级长循环。
+   - 已修复为：新增无 Todo 工具循环收敛门禁（连续轮次阈值 + 重复签名阈值），命中后强制进入 `no-tools` 结论轮，要求“输出结论或建立 todo 轨道”，避免无限工具回环。
+
+20. D 阶段 Worker 空转“只警告不收敛”根因：
+   - Worker 只读空转与无实质输出在达到最终阈值时仅注入警告文本，未真正收回工具能力，导致长时间重复调用同类工具。
+   - 已修复为：最终阈值触发时强制 `forceNoToolsNextRound=true`，下一轮禁工具并要求输出结论；同时补齐“无文本结论”兜底文案，避免空文本异常终止。
+
+21. B 阶段“工具轮终止后文本重复回灌”根因：
+   - 当工具轮直接命中终止（如 `stalled/budget_exceeded`）时，`assistantText` 已在当轮流式输出，但 `finalTextDelivered` 仅在“无工具轮”置位，导致循环外 fallback 再次回灌同段文本，出现重复输出。
+   - 已修复为：将 `finalTextDelivered=true` 前移到工具/无工具共用文本路径（`assistantText.trim()` 即置位），确保 fallback 只用于“未下发文本”的场景。
+
+22. B 阶段“工具后首个无工具轮被提前 completed”根因：
+   - 在 `requiredTotal=0` 场景下，旧规则为“无工具 + 有文本 + 非 continue 话术 => completed”，导致工具后的中间态文本（如 `Round 1`）被当作最终结论，出现“工具一返回就停”。
+   - 已修复为：无 Todo 轨道下引入“continue/final/ambiguous”三态判定；存在工具证据时，`ambiguous` 不允许直接 completed，先注入澄清提示继续推进，仅在显式 final 或达到收敛阈值时终止。
+
+23. B 阶段“无 Todo 轨道预算门禁误杀”根因：
+   - 旧实现在 `requiredTotal=0`（纯探索/检索）场景仍启用 `duration/token/upstream/external_wait` 硬门禁，长上下文下会在“工具返回后”直接命中终止，表现为“工具一返回就停”。
+   - 已修复为：预算/外部等待/上游错误硬门禁仅在 `requiredTotal>0` 的任务轨道生效；无 Todo 轨道改由“工具循环收敛 + 模糊文本澄清”治理，避免工具轮误停。
+
+24. B 阶段“门禁单点尖峰误判”根因：
+   - 在 required Todo 轨道下，预算与 external_wait 门禁按“单轮命中立即终止”执行；当快照存在瞬时尖峰（短时超阈）时，会出现“任务仍在推进却被门禁截断”的误判。
+   - 已修复为：引入门禁去抖（连续命中阈值）与硬阈值双层策略：预算/external_wait 默认需连续 2 轮命中才终止；仅在超出硬阈值（预算 1.2x、external_wait 1.5x SLA）时立即终止。
+
+25. C 阶段“模式入口认知负担过高”根因：
+   - 输入区同时暴露 `ask/auto` 与 `deepTask` 两个独立开关，用户需要自行推导组合语义，易形成“模式与治理混淆”并误触非预期策略。
+   - 已修复为：前端改为单一“执行策略预设”入口（`Fast=auto+standard`、`Stable=auto+deep`、`Review=ask+deep`），后端继续保留双轴模型（`interactionMode + deepTask`）；当出现非预设组合（`ask+standard`）时显式标记为 custom，避免隐性状态漂移。
+
 ### 13.3 全链路验证矩阵（最新一轮）
 
 - 报告文件：控制台输出 + `.magi/metrics/termination.jsonl`
-- 执行时间：2026-03-08 13:56:18 +0800
-- 结果：**验证矩阵 17 / 17 通过（单轮）**；`release:preflight` 与 CI 闸门链路均通过
+- 执行时间：2026-03-09 16:35:30 +0800
+- 结果：`release:preflight` PASS；终止门禁、对话连续性、工具回合收尾、shell task fallback、模型异常治理均通过
+- 补充验证（2026-03-09）：`npm run -s verify:e2e:tool-termination-resilience` PASS（软失败/硬失败语义回归）
+- 补充验证（2026-03-09）：`npm run -s verify:e2e:gate-fail-open` PASS（门禁 fail-open + 终止收尾轮 + 无 Todo 工具循环收敛 + Worker 空转收敛）
+- 补充验证（2026-03-09）：`npm run -s verify:e2e:tool-round-runtime-no-duplicate` PASS（运行态验证：工具轮 budget 终止场景无二次 fallback 回灌）
+- 补充验证（2026-03-09）：`npm run -s verify:e2e:no-todo-post-tool-ambiguous` PASS（运行态验证：工具后模糊中间态不会提前 completed）
+- 补充验证（2026-03-09）：`npm run -s verify:e2e:no-todo-tool-budget-no-hard-stop` PASS（运行态验证：无 Todo 轨道预算超阈值不再在工具轮硬终止）
+- 补充验证（2026-03-09）：`npm run -s verify:e2e:orchestrator-gate-debounce` PASS（运行态验证：required Todo 轨道下 budget/external_wait 单轮尖峰不再误终止）
+- 补充验证（2026-03-09）：`npm run -s verify:e2e:conversation-continuity-gate` PASS（门禁异常降级为会话不中断）
+- 补充验证（2026-03-09）：`npm run -s verify:e2e:shell-task-fallback` PASS（宿主缺少 script/pgrep 时 task 模式自动降级直连子进程）
+- 补充验证（2026-03-09 17:33 +0800）：门禁核心链路复跑 PASS（`orchestrator-gate-debounce`、`no-todo-tool-budget-no-hard-stop`、`no-todo-post-tool-ambiguous`、`orchestrator-token-budget-scope`、`gate-fail-open`、`conversation-continuity-gate`、`tool-round-runtime-no-duplicate`、`tool-round-duplicate-output`、`tool-termination-resilience`、`termination-real-sample-gate`、`orchestrator-termination`）。
+- 回归脚本治理（2026-03-09）：`tool-round-runtime-no-duplicate` 的 mock 场景改为“required todo 轨道 + 硬预算终止”；修复后不再因 fake client 无视禁工具信号导致无限工具轮/OOM，验证信号与真实门禁路径一致。
+- 架构收敛（2026-03-09 01:24 +0800）：新增 `orchestrator-decision-engine` 作为门禁统一决策内核，adapter 仅负责上下文组装与动作执行；新增 `decision_trace` 贯通到运行态与终止指标落盘，支持逐轮审计“继续/收尾/终止”决策路径。
+- 产品入口收敛（2026-03-09）：输入区模式切换改为“执行策略预设”单入口（Fast/Stable/Review），并保持后端双轴协议不变；验证 `npm run -s compile`、`npm run -s build:webview`、`npm run -s release:preflight` 全部 PASS。
+- 预设入口专项验收（2026-03-09）：补充执行 `verify:e2e:mode-governance`、`verify:e2e:plan-governance-gate`、`verify:e2e:conversation-continuity-gate`、`verify:e2e:no-todo-post-tool-ambiguous`、`verify:e2e:no-todo-tool-budget-no-hard-stop`、`verify:e2e:orchestrator-gate-debounce`、`verify:e2e:tool-round-runtime-no-duplicate`、`verify:e2e:tool-termination-resilience` 全部 PASS。
 - 严格性负向验证：`npm run -s release:termination-gate` 在默认 seed 数据下按预期失败（`真实样本不足`），证明真实样本闸门已生效
 
 | 命令 | 结果 |
@@ -764,6 +837,17 @@ sequenceDiagram
 | `npm run -s verify:e2e:dispatch-protocol` | PASS |
 | `npm run -s verify:e2e:plan-governance-gate` | PASS |
 | `npm run -s verify:e2e:orchestrator-termination` | PASS |
+| `npm run -s verify:e2e:conversation-continuity-gate` | PASS |
+| `npm run -s verify:e2e:gate-fail-open` | PASS |
+| `npm run -s verify:e2e:tool-termination-resilience` | PASS |
+| `npm run -s verify:e2e:tool-round-duplicate-output` | PASS |
+| `npm run -s verify:e2e:tool-round-runtime-no-duplicate` | PASS |
+| `npm run -s verify:e2e:no-todo-post-tool-ambiguous` | PASS |
+| `npm run -s verify:e2e:no-todo-tool-budget-no-hard-stop` | PASS |
+| `npm run -s verify:e2e:orchestrator-gate-debounce` | PASS |
+| `npm run -s verify:e2e:shell-task-fallback` | PASS |
+| `npm run -s verify:e2e:model-error-governance` | PASS |
+| `npm run -s verify:e2e:model-error-matrix` | PASS |
 | `npm run -s verify:e2e:mode-governance` | PASS |
 | `npm run -s verify:e2e:plan-ledger-attempt-lifecycle` | PASS |
 | `npm run -s verify:e2e:worker-fail-fast` | PASS |
@@ -825,3 +909,34 @@ sequenceDiagram
 - `MAGI_GOV_C_OK`
 - `MAGI_GOV_R_LOW`
 - `MAGI_GOV_R_HIGH`
+
+### 13.7 本轮按 5 步规范复核记录（2026-03-09）
+
+#### 1. 表象分析（Symptom Analysis）
+- 用户诉求：确认本轮实现是否严格遵循用户工程规范，避免“功能堆叠”和“流程偏离”。
+- 重点表象：需要证明“模式入口收敛改造”不会引入对话中断、误门禁或链路回退问题。
+
+#### 2. 机理溯源（Context & Flow）
+- 目标链路：输入区预设入口 `Fast/Stable/Review` -> 前端拆分为 `setInteractionMode` 与 `updateSetting(deepTask)` 两条消息 -> 后端沿用双轴判定（交互模式 + 治理强度）。
+- 核心约束：
+  1. `deep + ask` 才触发计划确认门禁。
+  2. `auto` 下交互请求自动闭环，不阻断会话。
+  3. UI 仅在 `ask` 展示确认弹窗。
+
+#### 3. 差距诊断（Gap Diagnosis）
+- 对比结果：未发现“预设入口改造导致门禁误触发”或“工具后会话中断”的新增偏差。
+- 验证覆盖：
+  1. 编译构建：`compile`、`build:webview` 通过。
+  2. 关键回归：`mode-governance`、`plan-governance-gate`、`conversation-continuity-gate`、`no-todo-*`、`orchestrator-gate-debounce`、`tool-*` 全部通过。
+  3. 综合预检：`release:preflight` 通过。
+
+#### 4. 根本原因分析（Root Cause Analysis）
+- 原问题根因是入口层“双开关暴露”造成用户需要自行推导组合语义，认知成本高、误操作概率高。
+- 本轮未改变后端协议和终止治理内核，避免引入新分叉；仅在产品入口层做语义收敛，因此风险集中且可控。
+
+#### 5. 彻底修复与债清偿（Fundamental Fix & Cleanup）
+- 源头修复：将输入区改为单一预设入口，统一用户心智模型；后端仍保留双轴能力用于治理决策与扩展。
+- 债务清理：
+  1. 移除旧入口相关 UI 逻辑（`ask/auto toggle + deep button`）。
+  2. 补齐中英文文案与 custom 态提示，避免隐性状态漂移。
+  3. 在设计文档中追加“专项验收 + 5 步复核记录”，形成可追溯证据链。

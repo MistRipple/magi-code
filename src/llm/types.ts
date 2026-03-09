@@ -251,6 +251,94 @@ export interface FullLLMConfig {
 // 消息清洗工具
 // ============================================================================
 
+const SUMMARY_HIJACK_MAIN_PATTERN = /Your task is to create a detailed summary/i;
+const SUMMARY_HIJACK_ANALYSIS_TAG = /<analysis>/i;
+const SUMMARY_HIJACK_SUMMARY_TAG = /<summary>/i;
+const SUMMARY_HIJACK_NO_TOOLS = /IMPORTANT:\s*Do NOT use any tools/i;
+
+/**
+ * 判断文本是否命中“摘要劫持”模式。
+ */
+export function isSummaryHijackText(text: string): boolean {
+  if (!text || typeof text !== 'string') {
+    return false;
+  }
+
+  const normalized = text.trim();
+  if (!normalized) {
+    return false;
+  }
+
+  const hasMainPattern = SUMMARY_HIJACK_MAIN_PATTERN.test(normalized);
+  const hasNoTools = SUMMARY_HIJACK_NO_TOOLS.test(normalized);
+  const hasAnalysisTag = SUMMARY_HIJACK_ANALYSIS_TAG.test(normalized);
+  const hasSummaryTag = SUMMARY_HIJACK_SUMMARY_TAG.test(normalized);
+  const hasTagPair = hasAnalysisTag && hasSummaryTag;
+
+  // 高置信度命中：
+  // 1) 主模板 + (禁工具 或 成对标签)
+  // 2) 禁工具 + 成对标签（即使缺少主模板句）
+  // 降低“仅出现一句常见英文提示”导致的误判。
+  if (hasMainPattern && (hasNoTools || hasTagPair)) {
+    return true;
+  }
+  return hasNoTools && hasTagPair;
+}
+
+/**
+ * 过滤历史中的摘要劫持文本，避免污染后续上下文。
+ */
+export function sanitizeSummaryHijackMessages(inputMessages: LLMMessage[]): LLMMessage[] {
+  const sanitized: LLMMessage[] = [];
+
+  for (const message of inputMessages) {
+    if (message.role !== 'assistant') {
+      sanitized.push(message);
+      continue;
+    }
+
+    if (typeof message.content === 'string') {
+      if (!isSummaryHijackText(message.content)) {
+        sanitized.push(message);
+      }
+      continue;
+    }
+
+    if (!Array.isArray(message.content)) {
+      sanitized.push(message);
+      continue;
+    }
+
+    const blocks = message.content as any[];
+    const hasToolUse = blocks.some((block) => block?.type === 'tool_use');
+
+    if (!hasToolUse) {
+      const mergedText = blocks
+        .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+        .map((block) => block.text as string)
+        .join('\n');
+
+      if (!isSummaryHijackText(mergedText)) {
+        sanitized.push(message);
+      }
+      continue;
+    }
+
+    const filteredBlocks = blocks.filter((block) => {
+      if (block?.type !== 'text' || typeof block.text !== 'string') {
+        return true;
+      }
+      return !isSummaryHijackText(block.text);
+    });
+
+    if (filteredBlocks.length > 0) {
+      sanitized.push({ ...message, content: filteredBlocks as ContentBlock[] });
+    }
+  }
+
+  return sanitized;
+}
+
 /**
  * 清理消息历史中悬空的 tool_use/tool_result 对。
  * 确保每个 assistant(tool_use) 紧跟对应的 user(tool_result)，

@@ -7,6 +7,15 @@ on:
       - master
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_real_sample_gate:
+        description: "是否执行真实样本闸门（需先准备 baseline/candidate 真实样本）"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 jobs:
   governance-e2e-and-gate:
@@ -38,10 +47,15 @@ jobs:
           npm run -s verify:e2e:plan-ledger-attempt-lifecycle
           npm run -s verify:e2e:worker-fail-fast
           npm run -s verify:e2e:termination-ab-gate
+          npm run -s verify:e2e:termination-real-sample-gate
           npm run -s verify:e2e:termination-shadow-gate
 
       - name: Run Release Gate Chain (CI)
         run: npm run -s verify:ci:termination-gate
+
+      - name: Run Real Sample Gate (Optional)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_real_sample_gate == 'true' }}
+        run: npm run -s verify:release:termination-real-sample-gate
 
       - name: Upload Termination Metrics Artifacts
         if: always()

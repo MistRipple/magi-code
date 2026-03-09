@@ -137,6 +137,23 @@ interface RuntimeTerminationShadow {
   note?: string;
 }
 
+interface RuntimeTerminationDecisionTraceEntry {
+  round?: number;
+  phase?: 'no_tool' | 'tool' | 'handoff' | 'finalize';
+  action?: 'continue' | 'continue_with_prompt' | 'terminate' | 'handoff' | 'fallback';
+  requiredTotal?: number;
+  reason?: string;
+  candidates?: string[];
+  gateState?: {
+    noProgressStreak?: number;
+    budgetBreachStreak?: number;
+    externalWaitBreachStreak?: number;
+    consecutiveUpstreamModelErrors?: number;
+  };
+  note?: string;
+  timestamp?: number;
+}
+
 /**
  * MissionDrivenEngine - 基于 Mission-Driven Architecture 的编排引擎
  */
@@ -853,6 +870,7 @@ export class MissionDrivenEngine extends EventEmitter {
     runtimeRounds?: number;
     runtimeSnapshot?: RuntimeTerminationSnapshot;
     runtimeShadow?: RuntimeTerminationShadow;
+    runtimeDecisionTrace?: RuntimeTerminationDecisionTraceEntry[];
     tokenUsage?: TokenUsage;
     startedAt: number;
   }): void {
@@ -891,6 +909,7 @@ export class MissionDrivenEngine extends EventEmitter {
       failed_required: snapshot?.failedRequired ?? null,
       running_or_pending_required: snapshot?.runningOrPendingRequired ?? null,
       shadow: input.runtimeShadow || null,
+      decision_trace: Array.isArray(input.runtimeDecisionTrace) ? input.runtimeDecisionTrace : null,
     };
     this.terminationMetricsRepository.append(record);
   }
@@ -1440,6 +1459,7 @@ export class MissionDrivenEngine extends EventEmitter {
       let orchestratorRuntimeRounds = 0;
       let orchestratorRuntimeSnapshot: RuntimeTerminationSnapshot | undefined;
       let orchestratorRuntimeShadow: RuntimeTerminationShadow | undefined;
+      let orchestratorRuntimeDecisionTrace: RuntimeTerminationDecisionTraceEntry[] | undefined;
       let runtimeTokenUsage: TokenUsage | undefined;
       let currentPlanMode: PlanMode = this.adapterFactory.isDeepTask() ? 'deep' : 'standard';
 
@@ -1475,8 +1495,10 @@ export class MissionDrivenEngine extends EventEmitter {
         }
         const governanceSummary = this.buildGovernanceSummary(governanceAssessment);
 
-        const shouldAskConfirmation = this.interactionMode === 'ask' || governanceAssessment.decision === 'ask';
-        const forceManual = this.interactionMode === 'auto' && governanceAssessment.decision === 'ask';
+        // 产品约束：计划确认门禁只在 deep + ask 组合下触发。
+        // standard 模式下不弹计划确认，避免轻量任务被重型交互打断。
+        const shouldAskConfirmation = this.interactionMode === 'ask' && planMode === 'deep';
+        const forceManual = false;
 
         if (shouldAskConfirmation) {
           const confirmed = await this.awaitPlanConfirmation(
@@ -1489,9 +1511,7 @@ export class MissionDrivenEngine extends EventEmitter {
             },
           );
           if (!confirmed) {
-            const rejectReason = `${t('engine.plan.userCancelledReason')}${forceManual
-              ? `; governance_gate=${governanceAssessment.reasons.join('|') || 'manual_required'}`
-              : ''}`;
+            const rejectReason = t('engine.plan.userCancelledReason');
             await this.planLedger.reject(resolvedSessionId, draftPlan.planId, 'user', rejectReason);
             this.lastExecutionSuccess = false;
             this.lastExecutionErrors = [rejectReason];
@@ -1512,7 +1532,7 @@ export class MissionDrivenEngine extends EventEmitter {
             resolvedSessionId,
             draftPlan.planId,
             'system:auto',
-            `governance:auto;risk=${governanceAssessment.riskScore.toFixed(3)};confidence=${governanceAssessment.confidence.toFixed(3)};reasons=none`,
+            `governance:auto;decision=${governanceAssessment.decision};risk=${governanceAssessment.riskScore.toFixed(3)};confidence=${governanceAssessment.confidence.toFixed(3)};reasons=${governanceAssessment.reasons.join('|') || 'none'}`,
           );
         }
         await this.planLedger.markExecuting(resolvedSessionId, draftPlan.planId);
@@ -1610,14 +1630,14 @@ export class MissionDrivenEngine extends EventEmitter {
         }
 
         // 4. 设置编排者快照上下文
-        // 使用本轮唯一 turnId 作为 missionId，确保每轮对话的快照可独立分组。
-        // 若后续进入 dispatch 流，worker 的快照也将使用同一 turnId。
+        // Mission 尚未创建前，临时使用 turnId 作为 mission 作用域占位；
+        // 一旦进入 dispatch 流并拿到真实 mission.id，会在 ensureMissionForDispatch 中覆盖。
         const orchestratorToolManager = this.adapterFactory.getToolManager();
         const orchestratorAssignmentId = `orchestrator-${this.currentTurnId}`;
         const normalizedSessionId = resolvedSessionId.trim();
         orchestratorToolManager.setSnapshotContext({
           sessionId: normalizedSessionId,
-          missionId: this.currentTurnId!,
+          missionId: this.lastMissionId || this.currentTurnId!,
           assignmentId: orchestratorAssignmentId,
           todoId: orchestratorAssignmentId,
           workerId: 'orchestrator',
@@ -1642,6 +1662,8 @@ export class MissionDrivenEngine extends EventEmitter {
         orchestratorRuntimeRounds = response.orchestratorRuntime?.rounds || 0;
         orchestratorRuntimeSnapshot = response.orchestratorRuntime?.snapshot as RuntimeTerminationSnapshot | undefined;
         orchestratorRuntimeShadow = response.orchestratorRuntime?.shadow as RuntimeTerminationShadow | undefined;
+        orchestratorRuntimeDecisionTrace =
+          response.orchestratorRuntime?.decisionTrace as RuntimeTerminationDecisionTraceEntry[] | undefined;
         runtimeTokenUsage = response.tokenUsage;
 
         this.recordOrchestratorTokens(response.tokenUsage);
@@ -1654,17 +1676,41 @@ export class MissionDrivenEngine extends EventEmitter {
           await currentBatch.waitForArchive();
         }
 
+        const executionWarnings: string[] = [];
         const auditOutcome = currentBatch?.getAuditOutcome();
         if (auditOutcome?.level === 'intervention') {
-          throw new Error(t('engine.phaseC.interventionBlocked'));
+          executionWarnings.push(t('engine.phaseC.interventionBlocked'));
+          logger.warn('编排器.PhaseC.审计阻断_已降级', {
+            batchId: currentBatch?.id,
+            level: auditOutcome.level,
+          }, LogCategory.ORCHESTRATOR);
         }
 
         if (response.error) {
-          throw new Error(response.error);
+          const modelError = response.error.trim();
+          if (modelError) {
+            executionWarnings.push(`上游模型异常：${modelError}`);
+          } else {
+            executionWarnings.push('上游模型异常：未知错误');
+          }
+          logger.warn('编排器.统一执行.上游模型异常_已降级', {
+            error: response.error,
+          }, LogCategory.ORCHESTRATOR);
         }
 
         if (currentBatch) {
-          await runPostDispatchVerification(currentBatch, this.verificationRunner, this.messageHub);
+          try {
+            await runPostDispatchVerification(currentBatch, this.verificationRunner, this.messageHub);
+          } catch (verificationError) {
+            const verificationMessage = verificationError instanceof Error
+              ? verificationError.message
+              : String(verificationError);
+            executionWarnings.push(`Phase C 校验异常：${verificationMessage}`);
+            logger.warn('编排器.PhaseC.校验异常_已降级', {
+              batchId: currentBatch.id,
+              error: verificationMessage,
+            }, LogCategory.ORCHESTRATOR);
+          }
         }
 
         // 反应式编排兜底：若 Batch 处于”等待最终汇总”且编排者未输出正文，
@@ -1687,9 +1733,22 @@ export class MissionDrivenEngine extends EventEmitter {
           }
         }
 
-        this.lastExecutionSuccess = true;
-        this.lastExecutionErrors = [];
-        planFinalStatus = 'completed';
+        if (executionWarnings.length > 0) {
+          const warningSection = [
+            '[System] 本轮触发门禁降级（会话不中断）：',
+            ...executionWarnings.map(item => `- ${item}`),
+          ].join('\n');
+          finalContent = finalContent.trim()
+            ? `${finalContent}\n\n${warningSection}`
+            : warningSection;
+          this.lastExecutionSuccess = false;
+          this.lastExecutionErrors = executionWarnings;
+          planFinalStatus = 'failed';
+        } else {
+          this.lastExecutionSuccess = true;
+          this.lastExecutionErrors = [];
+          planFinalStatus = 'completed';
+        }
         this.setState('idle');
         this.currentTaskId = null;
         return finalContent;
@@ -1714,7 +1773,9 @@ export class MissionDrivenEngine extends EventEmitter {
         logger.error('编排器.统一执行.失败', { error: errorMessage }, LogCategory.ORCHESTRATOR);
         this.setState('idle');
         this.currentTaskId = null;
-        throw error;
+        // fail-open：执行异常也返回可读结论，避免打断会话链路
+        const degradedMessage = `[System] 本轮执行出现异常，已自动降级为不中断返回：${errorMessage}`;
+        return degradedMessage;
       } finally {
         const finalSessionId = this.currentSessionId;
         const finalPlanId = this.currentPlanId;
@@ -1762,6 +1823,7 @@ export class MissionDrivenEngine extends EventEmitter {
           runtimeRounds: orchestratorRuntimeRounds,
           runtimeSnapshot: orchestratorRuntimeSnapshot,
           runtimeShadow: orchestratorRuntimeShadow,
+          runtimeDecisionTrace: orchestratorRuntimeDecisionTrace,
           tokenUsage: runtimeTokenUsage,
           startedAt: executeStartedAt,
         });
@@ -1883,7 +1945,8 @@ export class MissionDrivenEngine extends EventEmitter {
       const normalizedSessionId = sessionId.trim();
       orchestratorToolManager.setSnapshotContext({
         sessionId: normalizedSessionId,
-        missionId: this.currentTurnId || mission.id,
+        // 终止快照/get_todos 必须与 Todo 的真实 missionId 对齐，避免误读历史或空作用域。
+        missionId: mission.id,
         assignmentId: orchestratorAssignmentId,
         todoId: orchestratorAssignmentId,
         workerId: 'orchestrator',

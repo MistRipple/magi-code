@@ -111,6 +111,22 @@ export interface AdapterResponse {
       consistent: boolean;
       note?: string;
     };
+    decisionTrace?: Array<{
+      round: number;
+      phase: 'no_tool' | 'tool' | 'handoff' | 'finalize';
+      action: 'continue' | 'continue_with_prompt' | 'terminate' | 'handoff' | 'fallback';
+      requiredTotal: number;
+      reason?: string;
+      candidates?: string[];
+      gateState?: {
+        noProgressStreak: number;
+        budgetBreachStreak: number;
+        externalWaitBreachStreak: number;
+        consecutiveUpstreamModelErrors: number;
+      };
+      note?: string;
+      timestamp: number;
+    }>;
   };
 }
 

@@ -24,6 +24,31 @@ function assert(condition, message) {
   }
 }
 
+function withEnv(overrides, fn) {
+  const snapshot = {};
+  for (const key of Object.keys(overrides)) {
+    snapshot[key] = Object.prototype.hasOwnProperty.call(process.env, key) ? process.env[key] : undefined;
+    const value = overrides[key];
+    if (value === null || value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = String(value);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    for (const key of Object.keys(overrides)) {
+      const prev = snapshot[key];
+      if (prev === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = prev;
+      }
+    }
+  }
+}
+
 function loadCompiledModule(relPath) {
   const abs = path.join(OUT, relPath);
   if (!fs.existsSync(abs)) {
@@ -217,6 +242,46 @@ function testLockTimeout(DispatchIdempotencyStore, workspaceRoot) {
   assert(String(timeoutError.message || timeoutError).includes('锁获取超时'), `锁超时报错异常: ${timeoutError?.message || timeoutError}`);
 }
 
+function testDeploymentDiagnostics(DispatchIdempotencyStore, workspaceRoot) {
+  withEnv({
+    MAGI_DEPLOYMENT_MODE: 'single',
+    MAGI_IDEMPOTENCY_RUNTIME_SHARED: null,
+    MAGI_IDEMPOTENCY_RUNTIME_DIR: null,
+  }, () => {
+    const store = new DispatchIdempotencyStore(workspaceRoot);
+    const diagnostic = store.getDeploymentDiagnostic();
+    assert(diagnostic.level === 'info', `single 模式应为 info，实际: ${diagnostic.level}`);
+    assert(diagnostic.code === 'single_instance_runtime', `single 模式 code 异常: ${diagnostic.code}`);
+  });
+
+  withEnv({
+    MAGI_DEPLOYMENT_MODE: 'multi',
+    MAGI_IDEMPOTENCY_RUNTIME_SHARED: null,
+    MAGI_IDEMPOTENCY_RUNTIME_DIR: null,
+  }, () => {
+    const store = new DispatchIdempotencyStore(workspaceRoot);
+    const diagnostic = store.getDeploymentDiagnostic();
+    assert(diagnostic.level === 'error', `multi+本地路径应为 error，实际: ${diagnostic.level}`);
+    assert(diagnostic.code === 'multi_instance_runtime_not_shared', `multi+本地路径 code 异常: ${diagnostic.code}`);
+  });
+
+  const sharedRuntime = fs.mkdtempSync(path.join(os.tmpdir(), 'magi-idempotency-shared-'));
+  try {
+    withEnv({
+      MAGI_DEPLOYMENT_MODE: 'multi',
+      MAGI_IDEMPOTENCY_RUNTIME_SHARED: '1',
+      MAGI_IDEMPOTENCY_RUNTIME_DIR: sharedRuntime,
+    }, () => {
+      const store = new DispatchIdempotencyStore(workspaceRoot);
+      const diagnostic = store.getDeploymentDiagnostic();
+      assert(diagnostic.level === 'info', `multi+共享路径应为 info，实际: ${diagnostic.level}`);
+      assert(diagnostic.code === 'multi_instance_runtime_shared', `multi+共享路径 code 异常: ${diagnostic.code}`);
+    });
+  } finally {
+    fs.rmSync(sharedRuntime, { recursive: true, force: true });
+  }
+}
+
 function spawnConcurrentClaim({
   modulePath,
   workspaceRoot,
@@ -304,6 +369,7 @@ async function main() {
     testAtomicClaim(DispatchIdempotencyStore, workspaceRoot);
     testStaleLockRecovery(DispatchIdempotencyStore, workspaceRoot);
     testLockTimeout(DispatchIdempotencyStore, workspaceRoot);
+    testDeploymentDiagnostics(DispatchIdempotencyStore, workspaceRoot);
     await testCrossProcessConcurrency(workspaceRoot);
   } finally {
     fs.rmSync(workspaceRoot, { recursive: true, force: true });
@@ -320,6 +386,7 @@ async function main() {
       'store-atomic-claim',
       'store-stale-lock-recovery',
       'store-lock-timeout',
+      'deployment-diagnostics',
       'store-cross-process-concurrency',
     ],
   }, null, 2));

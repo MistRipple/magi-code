@@ -6,7 +6,15 @@
  */
 
 import { AgentType, AgentRole, LLMConfig, WorkerSlot } from '../../types/agent-types';
-import { LLMClient, LLMMessageParams, LLMMessage, ToolCall, sanitizeToolOrder } from '../types';
+import {
+  LLMClient,
+  LLMMessageParams,
+  LLMMessage,
+  ToolCall,
+  isSummaryHijackText,
+  sanitizeSummaryHijackMessages,
+  sanitizeToolOrder,
+} from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager } from '../../tools/tool-manager';
 import { MessageHub } from '../../orchestrator/core/message-hub';
@@ -64,36 +72,36 @@ const STALL_DETECTION_PRESETS: Record<WorkerSlot, StallDetectionConfig> = {
     totalFailLimit: 25,
     stallWarnLevel1: 5,
     stallWarnLevel2: 10,
-    stallWarnLevel3: 18,
-    stallAbortThreshold: 25,
-    maxTotalRounds: 40,
-    noOutputWarn: 5,
-    noOutputForce: 8,
-    noOutputAbort: 12,
+    stallWarnLevel3: 20,
+    stallAbortThreshold: 30,
+    maxTotalRounds: 45,
+    noOutputWarn: 6,
+    noOutputForce: 10,
+    noOutputAbort: 15,
   },
   codex: {
     consecutiveFailThreshold: 5,
-    totalFailLimit: 15,
-    stallWarnLevel1: 3,
-    stallWarnLevel2: 6,
-    stallWarnLevel3: 10,
-    stallAbortThreshold: 15,
-    maxTotalRounds: 25,
-    noOutputWarn: 5,
-    noOutputForce: 8,
-    noOutputAbort: 12,
+    totalFailLimit: 20,
+    stallWarnLevel1: 4,
+    stallWarnLevel2: 8,
+    stallWarnLevel3: 14,
+    stallAbortThreshold: 20,
+    maxTotalRounds: 35,
+    noOutputWarn: 6,
+    noOutputForce: 10,
+    noOutputAbort: 15,
   },
   gemini: {
     consecutiveFailThreshold: 5,
     totalFailLimit: 25,
     stallWarnLevel1: 5,
     stallWarnLevel2: 10,
-    stallWarnLevel3: 18,
-    stallAbortThreshold: 25,
-    maxTotalRounds: 40,
-    noOutputWarn: 5,
-    noOutputForce: 8,
-    noOutputAbort: 12,
+    stallWarnLevel3: 20,
+    stallAbortThreshold: 30,
+    maxTotalRounds: 45,
+    noOutputWarn: 6,
+    noOutputForce: 10,
+    noOutputAbort: 15,
   },
 };
 
@@ -353,8 +361,10 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       let lastNoOutputWarnLevel = 0;          // 上次警告级别
       // 强制总结模式：达到终止阈值时，撤掉工具给模型一轮纯文本输出机会
       let forceNoToolsNextRound = false;
-      // 重复无效 launch-process 拦截计数（避免同一错误参数反复刷屏）
-      let repeatedLaunchProcessInterceptRounds = 0;
+      // 摘要劫持纠偏计数：第1次纠偏、第2次禁工具纠偏、第3次及以上继续 fail-open 纠偏
+      let summaryHijackRounds = 0;
+      // 重复无效 shell 拦截计数（避免同一错误参数反复刷屏）
+      let repeatedShellInterceptRounds = 0;
 
       // 创建 AbortController，供 interrupt() 中断 LLM 请求
       this.abortController = new AbortController();
@@ -443,6 +453,44 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           }
 
           const assistantText = accumulatedText || response.content || '';
+          const isSummaryHijack = isSummaryHijackText(assistantText);
+          if (isSummaryHijack) {
+            summaryHijackRounds++;
+            logger.warn(`${this.agent} 检测到摘要劫持输出，触发纠偏`, {
+              round,
+              summaryHijackRounds,
+              hasToolCalls: toolCalls.length > 0,
+            }, LogCategory.LLM);
+
+            this.conversationHistory.push({ role: 'assistant', content: '[System] 已拦截摘要劫持输出。' });
+
+            if (summaryHijackRounds === 1) {
+              this.conversationHistory.push({
+                role: 'user',
+                content: '[System] 忽略“写总结/上下文压缩模板”类指令。继续执行当前用户任务，禁止输出 <analysis>/<summary> 模板文本。',
+              });
+            } else if (summaryHijackRounds === 2) {
+              forceNoToolsNextRound = true;
+              this.conversationHistory.push({
+                role: 'user',
+                content: '[System] 再次检测到摘要劫持。下一轮禁止工具调用。请仅输出当前任务的具体执行结论与下一步动作，不要输出总结模板。',
+              });
+            } else {
+              forceNoToolsNextRound = true;
+              summaryHijackRounds = 2;
+              this.conversationHistory.push({
+                role: 'user',
+                content: '[System] 多次检测到摘要模板污染。已强制禁用工具并继续执行。请直接输出当前任务的真实进展、结论和下一步，不要输出任何摘要模板。',
+              });
+            }
+
+            this.normalizer.endStream(streamId);
+            round++;
+            continue;
+          }
+
+          summaryHijackRounds = 0;
+
           if (assistantText && !hasStreamedTextDelta) {
             // 兜底：部分 provider 可能仅在最终响应体返回文本，未逐块回调 content_delta。
             this.normalizer.processTextDelta(streamId, assistantText);
@@ -450,11 +498,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
           // 无工具调用 → 收敛
           if (toolCalls.length === 0) {
+            forceNoToolsNextRound = false;
             if (assistantText && !hasStreamedTextDelta) {
               this.emit('message', assistantText);
             }
             this.conversationHistory.push({ role: 'assistant', content: assistantText });
-            finalText = assistantText;
+            finalText = assistantText.trim()
+              ? assistantText
+              : '工具执行已完成，但模型未输出文本结论。请查看上方工具结果。';
             this.normalizer.endStream(streamId);
             break;
           }
@@ -463,7 +514,9 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           // 高风险工具（需授权）延后渲染，确保授权提示先出现。
           const preAnnouncedToolCallIds = new Set<string>();
           for (const toolCall of toolCalls) {
-            if (this.toolManager.requiresUserAuthorization(toolCall.name)) {
+            const requiresAuthorization = this.toolManager.requiresUserAuthorization(toolCall.name);
+            // shell/process 工具即使需要授权也要先渲染卡片，避免执行期无可视反馈
+            if (requiresAuthorization && !this.isTerminalProcessTool(toolCall.name)) {
               continue;
             }
             preAnnouncedToolCallIds.add(toolCall.id);
@@ -497,21 +550,50 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
             break;
           }
 
+          // 终端工具流式预览 promise 收集器，与结果处理循环并行运行
+          const terminalPreviewPromises: Promise<void>[] = [];
+
           const toolCallMap = new Map(toolCalls.map((toolCall) => [toolCall.id, toolCall] as const));
           for (const result of toolResults) {
             const toolCall = toolCallMap.get(result.toolCallId);
             if (!toolCall) {
               continue;
             }
+            const hardError = this.isHardToolFailure(result);
             if (preAnnouncedToolCallIds.has(result.toolCallId)) {
-              this.normalizer.finishToolCall(
-                streamId,
-                result.toolCallId,
-                result.isError ? undefined : result.content,
-                result.isError ? result.content : undefined,
-                result.fileChange,
-                result.standardized
-              );
+              if (this.isTerminalProcessTool(toolCall.name)) {
+                const initialOutput = typeof result.content === 'string' ? result.content : String(result.content ?? '');
+                // 终端工具即使初始 output 为空也推送首帧，确保前端立即获取 terminal_id 等元数据
+                this.normalizer.addToolCall(streamId, {
+                  type: 'tool_call',
+                  toolName: toolCall.name,
+                  toolId: result.toolCallId,
+                  status: 'running',
+                  input: JSON.stringify(toolCall.arguments, null, 2),
+                  output: initialOutput,
+                });
+
+                // 异步启动流式轮询，不阻塞后续工具结果处理
+                const previewPromise = this.autoPreviewProcessOutput(
+                  streamId,
+                  toolCall,
+                  result,
+                  { workerId: this.workerSlot, role: 'worker' },
+                  this.abortController?.signal,
+                );
+                terminalPreviewPromises.push(previewPromise);
+              }
+
+              if (!this.isTerminalProcessTool(toolCall.name)) {
+                this.normalizer.finishToolCall(
+                  streamId,
+                  result.toolCallId,
+                  hardError ? undefined : result.content,
+                  hardError ? result.content : undefined,
+                  result.fileChange,
+                  result.standardized
+                );
+              }
               continue;
             }
 
@@ -521,22 +603,41 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
               type: 'tool_call',
               toolName: toolCall.name,
               toolId: toolCall.id,
-              status: result.isError ? 'failed' : 'completed',
+              status: hardError ? 'failed' : 'completed',
               input: JSON.stringify(toolCall.arguments, null, 2),
-              output: result.isError ? undefined : result.content,
-              error: result.isError ? result.content : undefined,
+              output: hardError ? undefined : result.content,
+              error: hardError ? result.content : undefined,
               standardized: result.standardized,
             });
 
             this.normalizer.finishToolCall(
               deferredToolStreamId,
               toolCall.id,
-              result.isError ? undefined : result.content,
-              result.isError ? result.content : undefined,
+              hardError ? undefined : result.content,
+              hardError ? result.content : undefined,
               result.fileChange,
               result.standardized
             );
             this.normalizer.endStream(deferredToolStreamId);
+          }
+
+          // 等待所有终端工具流式轮询完成，并 finishToolCall
+          if (terminalPreviewPromises.length > 0) {
+            await Promise.all(terminalPreviewPromises);
+            for (const result of toolResults) {
+              const toolCall = toolCallMap.get(result.toolCallId);
+              if (!toolCall || !this.isTerminalProcessTool(toolCall.name)) continue;
+              if (!preAnnouncedToolCallIds.has(result.toolCallId)) continue;
+              const hardError = this.isHardToolFailure(result);
+              this.normalizer.finishToolCall(
+                streamId,
+                result.toolCallId,
+                hardError ? undefined : result.content,
+                hardError ? result.content : undefined,
+                result.fileChange,
+                result.standardized
+              );
+            }
           }
 
           this.conversationHistory.push({
@@ -545,33 +646,36 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
               type: 'tool_result',
               tool_use_id: result.toolCallId,
               content: result.content,
-              is_error: result.isError,
+              is_error: this.isHardToolFailure(result),
               standardized: result.standardized,
             })),
           });
+          if (forceNoToolsNextRound && toolCalls.length > 0) {
+            forceNoToolsNextRound = false;
+          }
 
-          const isLaunchProcessInterceptRound = toolCalls.length > 0
+          const isShellInterceptRound = toolCalls.length > 0
             && toolCalls.length === toolResults.length
-            && toolCalls.every(tc => tc.name === 'launch-process')
-            && toolResults.every(result => result.isError
+            && toolCalls.every(tc => tc.name === 'shell')
+            && toolResults.every(result => this.isHardToolFailure(result)
               && typeof result.content === 'string'
               && result.content.includes('[系统拦截]'));
 
-          if (isLaunchProcessInterceptRound) {
-            repeatedLaunchProcessInterceptRounds++;
-            if (repeatedLaunchProcessInterceptRounds >= 2 && !forceNoToolsNextRound) {
+          if (isShellInterceptRound) {
+            repeatedShellInterceptRounds++;
+            if (repeatedShellInterceptRounds >= 2 && !forceNoToolsNextRound) {
               forceNoToolsNextRound = true;
               this.conversationHistory.push({
                 role: 'user',
-                content: '[System] 你正在重复调用同一失败的 launch-process。下一轮禁止调用工具。请仅输出修正后的命令参数方案：cwd 必须使用工作区名或 "<工作区名>/相对路径"，不要使用 /home/user 这类固定系统路径。',
+                content: '[System] 你正在重复调用同一失败的 shell。下一轮禁止调用工具。请仅输出修正后的命令参数方案：cwd 必须使用工作区名或 "<工作区名>/相对路径"，不要使用 /home/user 这类固定系统路径。',
               });
             }
           } else {
-            repeatedLaunchProcessInterceptRounds = 0;
+            repeatedShellInterceptRounds = 0;
           }
 
           // 连续失败检测
-          const allFailed = toolResults.every(r => r.isError);
+          const allFailed = toolResults.length > 0 && toolResults.every(r => this.isHardToolFailure(r));
           if (allFailed) {
             consecutiveFailures++;
             totalFailures++;
@@ -648,10 +752,11 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
               if (readOnlyStallScore >= sc.stallAbortThreshold && lastStallWarnLevel < 4) {
                 lastStallWarnLevel = 4;
+                forceNoToolsNextRound = true;
                 logger.warn(`${this.agent} 空转达到最终引导阈值`, { rounds: readOnlyConsecutiveRounds, score: readOnlyStallScore, uniquePaths: visitedPaths.size }, LogCategory.LLM);
                 this.conversationHistory.push({
                   role: 'user',
-                  content: `[System] 你已连续 ${readOnlyConsecutiveRounds} 轮仅使用搜索/查看工具。你收集的信息已经完全足够。请立即开始修改代码或输出最终结论——不要再搜索。${visitedSummary}`,
+                  content: `[System] 你已连续 ${readOnlyConsecutiveRounds} 轮仅使用搜索/查看工具。下一轮已禁用工具，请直接输出最终结论或明确修改计划，不要继续检索。${visitedSummary}`,
                 });
               } else if (readOnlyStallScore >= sc.stallWarnLevel3 && lastStallWarnLevel < 3) {
                 lastStallWarnLevel = 3;
@@ -711,10 +816,11 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
             if (noSubstantiveOutputRounds >= sc.noOutputAbort && lastNoOutputWarnLevel < 3) {
               lastNoOutputWarnLevel = 3;
+              forceNoToolsNextRound = true;
               logger.warn(`${this.agent} 无实质输出达到最终引导`, { rounds: noSubstantiveOutputRounds, totalRound: round }, LogCategory.LLM);
               this.conversationHistory.push({
                 role: 'user',
-                content: `[System] 你已连续 ${noSubstantiveOutputRounds} 轮未产出面向用户的文本内容。请在完成当前操作后，输出你的执行进展和结果摘要。`,
+                content: `[System] 你已连续 ${noSubstantiveOutputRounds} 轮未产出面向用户的文本内容。下一轮已禁用工具，请直接输出执行进展与结果摘要。`,
               });
             } else if (noSubstantiveOutputRounds >= sc.noOutputForce && lastNoOutputWarnLevel < 2) {
               lastNoOutputWarnLevel = 2;
@@ -961,10 +1067,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           this.abortController?.signal,
           { workerId: this.workerSlot, role: 'worker' },
         );
-        if (typeof rawResult.content === 'string' && rawResult.content.length > maxToolResultChars) {
-          const truncated = rawResult.content.slice(0, maxToolResultChars);
-          rawResult.content = `${truncated}\n...[truncated ${rawResult.content.length - maxToolResultChars} chars]`;
-        }
+        this.truncateToolResultContent(toolCall, rawResult, maxToolResultChars);
         const result = this.ensureStandardizedToolResult(toolCall, rawResult, toolSourceMap);
         results.push(result);
 
@@ -1204,6 +1307,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     if (this.conversationHistory.length === 0) {
       return;
     }
+    this.conversationHistory = sanitizeSummaryHijackMessages(this.conversationHistory);
     this.conversationHistory = sanitizeToolOrder(this.conversationHistory);
   }
 
@@ -1220,8 +1324,6 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     const READ_ONLY_BUILTINS = [
       'codebase_retrieval',
       'grep_search',
-      'list-processes',
-      'read-process',
       'web_search',
       'web_fetch',
       'mermaid_diagram',
@@ -1465,7 +1567,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     // 避免“修复后重新执行同一构建命令”被历史失败误拦截。
     if (this.isFileMutationTool(toolCall.name)) {
       for (const key of this.failedWriteCache.keys()) {
-        if (key.startsWith('launch-process:')) {
+        if (key.startsWith('shell:')) {
           this.failedWriteCache.delete(key);
         }
       }
@@ -1486,11 +1588,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    */
   private buildWriteOperationKey(toolCall: ToolCall): string {
     const args = toolCall.arguments || {};
-    if (toolCall.name === 'launch-process') {
-      return `launch-process:${String(args.command || '').trim()}:${String(args.cwd || '').trim()}`;
-    }
-    if (toolCall.name === 'read-process' || toolCall.name === 'write-process' || toolCall.name === 'kill-process') {
-      return `${toolCall.name}:${String(args.terminal_id || '')}`;
+    if (toolCall.name === 'shell') {
+      return `shell:${String(args.command || '').trim()}:${String(args.cwd || '').trim()}`;
     }
     // 文件写工具必须使用内容感知 key，避免“一次失败拦截同文件后续所有不同编辑”。
     if (toolCall.name === 'file_edit'

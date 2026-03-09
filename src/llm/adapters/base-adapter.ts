@@ -13,7 +13,7 @@ import { EventEmitter } from 'events';
 import { AgentType, AgentRole, LLMConfig, TokenUsage } from '../../types/agent-types';
 import { LLMClient, ToolCall, ToolResult, StandardizedToolResult } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
-import { ToolManager } from '../../tools/tool-manager';
+import { ToolManager, type ToolExecutionContext } from '../../tools/tool-manager';
 import { MessageHub } from '../../orchestrator/core/message-hub';
 import { logger, LogCategory } from '../../logging';
 import { MESSAGE_EVENTS, ADAPTER_EVENTS } from '../../protocol/event-names';
@@ -179,6 +179,223 @@ export abstract class BaseLLMAdapter extends EventEmitter {
         message: content,
       },
     };
+  }
+
+  protected parseToolResultJson(result: ToolResult): Record<string, unknown> | undefined {
+    const content = typeof result.content === 'string' ? result.content : String(result.content ?? '');
+    if (!content.trim()) {
+      return undefined;
+    }
+
+    // 使用提取逻辑以防首尾有额外文本干扰
+    const trimmed = content.trim();
+    let jsonText = trimmed;
+
+    if (trimmed[0] === '{' || trimmed[0] === '[') {
+      let depth = 0;
+      let inString = false;
+      let escaping = false;
+      const openChar = trimmed[0];
+      const closeChar = openChar === '{' ? '}' : ']';
+
+      for (let i = 0; i < trimmed.length; i += 1) {
+        const ch = trimmed[i];
+        if (inString) {
+          if (escaping) { escaping = false; continue; }
+          if (ch === '\\') { escaping = true; continue; }
+          if (ch === '"') { inString = false; }
+          continue;
+        }
+        if (ch === '"') { inString = true; continue; }
+        if (ch === openChar) { depth += 1; continue; }
+        if (ch === closeChar) {
+          depth -= 1;
+          if (depth === 0) {
+            jsonText = trimmed.slice(0, i + 1);
+            break;
+          }
+        }
+      }
+    }
+
+    try {
+      const parsed = JSON.parse(jsonText);
+      if (!parsed || typeof parsed !== 'object') {
+        return undefined;
+      }
+      return parsed as Record<string, unknown>;
+    } catch {
+      return undefined;
+    }
+  }
+
+  protected isTerminalProcessTool(toolName: string): boolean {
+    return toolName === 'shell'
+      || toolName === 'launch-process'
+      || toolName === 'read-process'
+      || toolName === 'write-process'
+      || toolName === 'kill-process'
+      || toolName === 'list-processes';
+  }
+
+  protected isHardToolFailure(result: { isError?: boolean; standardized?: { status?: string } }): boolean {
+    const status = result.standardized?.status;
+    if (status === 'success') {
+      return false;
+    }
+    if (status === 'error' || status === 'timeout' || status === 'killed') {
+      return true;
+    }
+    return Boolean(result.isError);
+  }
+
+  protected truncateToolResultContent(toolCall: ToolCall, rawResult: ToolResult, maxChars: number): void {
+    if (typeof rawResult.content !== 'string' || rawResult.content.length <= maxChars) {
+      return;
+    }
+
+    // 终端工具结果要求保持 JSON 可解析，且已通过增量预览持续输出，不在此处做破坏性截断
+    if (this.isTerminalProcessTool(toolCall.name)) {
+      return;
+    }
+
+    const truncated = rawResult.content.slice(0, maxChars);
+    rawResult.content = `${truncated}\n...[truncated ${rawResult.content.length - maxChars} chars]`;
+  }
+
+  protected async autoPreviewProcessOutput(
+    streamId: string,
+    toolCall: ToolCall,
+    result: ToolResult,
+    executionContext: ToolExecutionContext,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (result.isError || (toolCall.name !== 'launch-process' && toolCall.name !== 'shell')) {
+      return;
+    }
+
+    const launchResult = this.parseToolResultJson(result);
+    const terminalId = typeof launchResult?.terminal_id === 'number' ? launchResult.terminal_id : undefined;
+    const status = typeof launchResult?.status === 'string' ? launchResult.status : '';
+    const runMode = launchResult?.run_mode;
+    const nextCursor = typeof launchResult?.output_cursor === 'number' ? launchResult.output_cursor : 0;
+    const shouldPoll = Boolean(
+      terminalId
+      && (runMode === 'service' || runMode === 'task')
+      && status !== 'completed'
+      && status !== 'failed'
+      && status !== 'killed'
+      && status !== 'timeout'
+    );
+    if (!shouldPoll || !terminalId) {
+      return;
+    }
+
+    try {
+      let cursor = nextCursor;
+      let noProgressRounds = 0;
+      const isTaskMode = runMode === 'task';
+      const maxRounds = isTaskMode ? 600 : 6;
+      // 放大 task 模式的无进展退出阈值，允许 shell 有足够的沉默/睡眠时间 (约 300 轮 * 0.5s = 150s)
+      const maxTaskNoProgressRounds = 300;
+      const taskPreviewStartAt = Date.now();
+      const maxTaskPreviewMs = 600_000; // 最大 10 分钟预览
+      // 跟踪最后一轮 read-process 的完整 JSON 结果，用于在终态时替换 launch 快返内容
+      let lastReadContent: string | undefined;
+
+      for (let round = 0; round < maxRounds; round += 1) {
+        if (signal?.aborted) {
+          return;
+        }
+
+        const autoRead = await this.toolManager.executeInternalTool({
+          id: `${toolCall.id}::auto-read::${round}`,
+          name: 'read-process',
+          arguments: {
+            terminal_id: terminalId,
+            // task 模式走非阻塞增量拉取，避免 wait 卡到进程结束才返回
+            wait: !isTaskMode,
+            max_wait_seconds: 1,
+            from_cursor: cursor,
+          },
+        }, signal);
+
+        const parsedRead = this.parseToolResultJson(autoRead);
+        const readStatus = typeof parsedRead?.status === 'string' ? parsedRead.status : '';
+        const readOutput = typeof parsedRead?.output === 'string' ? parsedRead.output : '';
+        const readNextCursor = typeof parsedRead?.next_cursor === 'number'
+          ? parsedRead.next_cursor
+          : (typeof parsedRead?.output_cursor === 'number' ? parsedRead.output_cursor : cursor);
+        const cursorAdvanced = readNextCursor > cursor;
+        const hasProgress = cursorAdvanced || readOutput.trim().length > 0;
+
+        // 记录完整 read 结果用于终态替换
+        if (typeof autoRead.content === 'string' && autoRead.content.trim()) {
+          lastReadContent = autoRead.content;
+        }
+
+        const autoReadContent = typeof autoRead.content === 'string' ? autoRead.content : String(autoRead.content ?? '');
+        if (autoReadContent.trim()) {
+          this.normalizer.addToolCall(streamId, {
+            type: 'tool_call',
+            toolName: toolCall.name,
+            toolId: result.toolCallId,
+            status: 'running',
+            input: JSON.stringify(toolCall.arguments, null, 2),
+            output: autoReadContent,
+          });
+        }
+
+        cursor = readNextCursor;
+
+        if (hasProgress) {
+          noProgressRounds = 0;
+        } else {
+          noProgressRounds += 1;
+        }
+
+        const isTerminal = readStatus === 'completed'
+          || readStatus === 'failed'
+          || readStatus === 'killed'
+          || readStatus === 'timeout';
+
+        if (isTerminal) {
+          // task 终态：用最后一轮完整 read 结果替换 launch 快返内容，
+          // 让模型看到最终状态（completed/failed），避免不必要的额外 read-process 调用。
+          if (isTaskMode && lastReadContent) {
+            result.content = lastReadContent;
+            result.isError = readStatus === 'failed' || readStatus === 'killed' || readStatus === 'timeout';
+          }
+          break;
+        }
+
+        if (isTaskMode) {
+          // task：无进展超过阈值时让控制权回到模型，避免单个工具长时间阻塞
+          if (noProgressRounds >= maxTaskNoProgressRounds) {
+            break;
+          }
+          // task：即便持续有输出，也限制自动预览总时长，避免占满编排预算
+          if (Date.now() - taskPreviewStartAt >= maxTaskPreviewMs) {
+            break;
+          }
+          // 轮询间隔：有进展时快速刷新，无进展时退避等待
+          await new Promise(r => setTimeout(r, hasProgress ? 200 : 500));
+        } else {
+          // service：短轮询预览，避免长时间占用链路
+          if (noProgressRounds >= 2) {
+            break;
+          }
+          await new Promise(r => setTimeout(r, 1000));
+        }
+      }
+    } catch (error: any) {
+      logger.warn('process 自动读流预览失败，忽略本次刷新', {
+        agent: this.agent,
+        toolCallId: result.toolCallId,
+        terminalId,
+        error: error?.message || String(error),
+      }, LogCategory.TOOLS);
+    }
   }
 
   constructor(
