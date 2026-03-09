@@ -6,6 +6,7 @@
   import WaitResultCard from './WaitResultCard.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
   import { vscode } from '../lib/vscode-bridge';
+  import { extractLeadingJson } from '../lib/terminal-utils';
   import type { IconName } from '../lib/icons';
   import type { StandardizedToolResult } from '../types/message';
   import { i18n } from '../stores/i18n.svelte';
@@ -52,8 +53,26 @@
 
   // 格式化内容
   function formatContent(content: unknown): string {
-    if (!content) return '';
-    if (typeof content === 'string') return content.trim();
+    if (content === null || content === undefined) return '';
+
+    if (typeof content === 'string') {
+      const trimmed = content.trim();
+      if (!trimmed) return '';
+
+      // 工具输出若以 JSON 开头，优先美化 JSON，同时保留尾随文本
+      const leadingJson = extractLeadingJson(trimmed);
+      if (leadingJson) {
+        try {
+          const formattedJson = JSON.stringify(JSON.parse(leadingJson.jsonText), null, 2);
+          return leadingJson.tailText ? `${formattedJson}\n\n${leadingJson.tailText}` : formattedJson;
+        } catch {
+          // 非法 JSON 字符串保持原样
+        }
+      }
+
+      return trimmed;
+    }
+
     try {
       return JSON.stringify(content, null, 2);
     } catch {
@@ -75,11 +94,7 @@
 
     const iconMap: Record<string, IconName> = {
       // ToolManager 内置工具
-      'launch-process': 'terminal',
-      'read-process': 'terminal',
-      'write-process': 'terminal',
-      'kill-process': 'terminal',
-      'list-processes': 'terminal',
+      'shell': 'terminal',
       'file_view': 'eye',
       'file_create': 'file-plus',
       'file_edit': 'pencil',
@@ -180,29 +195,25 @@
 
   // 获取工具显示名
   function getToolDisplayName(toolName: string): string {
-    if (!toolName || typeof toolName !== 'string') return 'tool';
+    if (!toolName || typeof toolName !== 'string') return i18n.t('toolCall.displayName.default');
 
     // 文件操作工具直接使用语义化显示名
     const displayNameMap: Record<string, string> = {
-      'launch-process': 'execute',
-      'read-process': 'read process',
-      'write-process': 'write process',
-      'kill-process': 'kill process',
-      'list-processes': 'list processes',
-      'file_view': 'view',
-      'file_create': 'create',
-      'file_edit': 'edit',
-      'file_insert': 'insert',
-      'grep_search': 'search',
-      'file_remove': 'remove',
-      'web_search': 'web search',
-      'web_fetch': 'web fetch',
-      'mermaid_diagram': 'diagram',
-      'codebase_retrieval': 'local retrieval',
-      'dispatch_task': 'dispatch',
-      'send_worker_message': 'message',
-      'wait_for_workers': 'wait results',
-      'list_files': 'list files',
+      'shell': i18n.t('toolCall.displayName.shell'),
+      'file_view': i18n.t('toolCall.displayName.fileView'),
+      'file_create': i18n.t('toolCall.displayName.fileCreate'),
+      'file_edit': i18n.t('toolCall.displayName.fileEdit'),
+      'file_insert': i18n.t('toolCall.displayName.fileInsert'),
+      'grep_search': i18n.t('toolCall.displayName.grepSearch'),
+      'file_remove': i18n.t('toolCall.displayName.fileRemove'),
+      'web_search': i18n.t('toolCall.displayName.webSearch'),
+      'web_fetch': i18n.t('toolCall.displayName.webFetch'),
+      'mermaid_diagram': i18n.t('toolCall.displayName.mermaidDiagram'),
+      'codebase_retrieval': i18n.t('toolCall.displayName.codebaseRetrieval'),
+      'dispatch_task': i18n.t('toolCall.displayName.dispatchTask'),
+      'send_worker_message': i18n.t('toolCall.displayName.sendWorkerMessage'),
+      'wait_for_workers': i18n.t('toolCall.displayName.waitForWorkers'),
+      'list_files': i18n.t('toolCall.displayName.listFiles'),
     };
 
     return displayNameMap[toolName] ?? toolName;
@@ -213,7 +224,7 @@
     if (!toolInput || typeof toolInput !== 'object') return '';
     const args = toolInput as Record<string, unknown>;
     switch (toolName) {
-      case 'execute_shell':
+      case 'shell':
         return typeof args.command === 'string' ? args.command : '';
       case 'file_view':
       case 'file_create':
@@ -248,8 +259,6 @@
         const fp = typeof args.filePath === 'string' ? args.filePath : '';
         return action && fp ? `${action} ${fp}` : action || fp;
       }
-      case 'list_files':
-        return typeof args.path === 'string' ? args.path : '';
       default:
         // MCP 或其他未知工具：尝试提取常见字段
         return (typeof args.command === 'string' ? args.command : '')
@@ -272,7 +281,7 @@
   const toolIcon = $derived(getToolIcon(name));
   const toolDisplayName = $derived(
     name === 'file_view'
-      ? (isDirectoryView ? 'view directory' : 'view file')
+      ? (isDirectoryView ? i18n.t('toolCall.displayName.viewDirectory') : i18n.t('toolCall.displayName.viewFile'))
       : getToolDisplayName(name)
   );
   const toolSummary = $derived(getToolSummary(name, input));
@@ -281,6 +290,8 @@
   const outputText = $derived(formatContent(output));
   const isMarkdownOutput = $derived.by(() => {
     if (!outputText || outputText.length < 20) return false;
+    // JSON 输出不走 Markdown 渲染，避免负数/列表结构被误判
+    if (outputText.startsWith('{') || outputText.startsWith('[')) return false;
     // 检测常见 markdown 标记：标题、表格、列表、引用、加粗、分隔线、代码块
     return /^#{1,4}\s|^\|.+\|$|^\s*[-*]\s|^\s*\d+\.\s|^>\s|^---$|```|\*\*[^*]+\*\*/m.test(outputText);
   });
@@ -329,7 +340,13 @@
     }
 
     // 编排者角色约束（dispatch_task 引导）— 与用户权限无关，是系统架构层面的职责划分
-    if (matches('orchestrator', 'dispatch_task delegation', 'orchestrator cannot execute tools in deep mode')) {
+    if (matches(
+      'orchestrator',
+      'dispatch_task delegation',
+      'orchestrator cannot execute tools in deep mode',
+      '深度模式下编排者不可直接执行',
+      '请通过 dispatch_task 委派给 worker',
+    )) {
       return {
         category: 'role_constraint',
         categoryLabel: i18n.t('toolCall.errorDiagnosis.roleConstraint.categoryLabel'),
@@ -511,7 +528,7 @@
                     <MarkdownContent content={outputText} />
                   </div>
                 {:else}
-                  <pre class="section-content">{formatContent(output)}</pre>
+                  <pre class="section-content">{outputText}</pre>
                 {/if}
               {/if}
             </div>

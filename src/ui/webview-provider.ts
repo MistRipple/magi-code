@@ -72,6 +72,11 @@ type OrchestratorQueueItem = {
   turnId: string;
   resolve: (result: OrchestratorExecutionResult) => void;
 };
+type QueuedUserTurn = {
+  id: string;
+  content: string;
+  createdAt: number;
+};
 
 const HIGH_PRIORITY_MESSAGE_TYPES = new Set<ExtensionToWebviewMessage['type']>([
   'unifiedMessage',
@@ -1269,6 +1274,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         logger.info('界面.消息.补充.请求', undefined, LogCategory.UI);
         await this.handleAppendMessage(message.taskId, message.content);
         break;
+      case 'updateQueuedMessage':
+        this.handleUpdateQueuedMessage(message.queueId, message.content);
+        break;
+      case 'deleteQueuedMessage':
+        this.handleDeleteQueuedMessage(message.queueId);
+        break;
 
       case 'approveChange':
         // 批准单个变更
@@ -1754,6 +1765,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private pendingRecoveryPrompt: string | null = null;
   private pendingExecutionQueue: OrchestratorQueueItem[] = [];
   private orchestratorQueueRunning = false;
+  private queuedMessagesBySession: Map<string, QueuedUserTurn[]> = new Map();
+  private queuedMessagesDrainRunning = false;
 
   /** 处理恢复确认 */
   private async handleRecoveryConfirmation(decision: 'retry' | 'rollback' | 'continue'): Promise<void> {
@@ -1864,6 +1877,151 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       reason,
       count: pending.length,
     }, LogCategory.UI);
+  }
+
+  private resolveActiveSessionId(): string {
+    return this.activeSessionId || this.sessionManager.getCurrentSession()?.id || '';
+  }
+
+  private getQueuedMessages(sessionId: string, createIfMissing = false): QueuedUserTurn[] {
+    let queue = this.queuedMessagesBySession.get(sessionId);
+    if (!queue && createIfMissing) {
+      queue = [];
+      this.queuedMessagesBySession.set(sessionId, queue);
+    }
+    return queue || [];
+  }
+
+  private sendQueuedMessagesUpdate(sessionId?: string): void {
+    const resolvedSessionId = (sessionId || this.resolveActiveSessionId()).trim();
+    if (!resolvedSessionId) {
+      return;
+    }
+    const queuedMessages = this.getQueuedMessages(resolvedSessionId, false).map((item) => ({
+      id: item.id,
+      content: item.content,
+      createdAt: item.createdAt,
+    }));
+    this.sendData('queuedMessagesUpdated', {
+      sessionId: resolvedSessionId,
+      queuedMessages,
+    });
+  }
+
+  private enqueueQueuedMessage(sessionId: string, content: string): QueuedUserTurn {
+    const queue = this.getQueuedMessages(sessionId, true);
+    const item: QueuedUserTurn = {
+      id: `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      content,
+      createdAt: Date.now(),
+    };
+    queue.push(item);
+    return item;
+  }
+
+  private handleUpdateQueuedMessage(queueId: string, content: string): void {
+    const id = queueId.trim();
+    const trimmedContent = content.trim();
+    if (!id) {
+      return;
+    }
+    if (!trimmedContent) {
+      this.sendToast(t('toast.supplementEmpty'), 'warning');
+      return;
+    }
+    const sessionId = this.resolveActiveSessionId();
+    if (!sessionId) {
+      return;
+    }
+    const queue = this.getQueuedMessages(sessionId, false);
+    const target = queue.find((item) => item.id === id);
+    if (!target) {
+      return;
+    }
+    target.content = trimmedContent;
+    this.sendQueuedMessagesUpdate(sessionId);
+    void this.drainQueuedMessagesIfIdle();
+  }
+
+  private handleDeleteQueuedMessage(queueId: string): void {
+    const id = queueId.trim();
+    if (!id) {
+      return;
+    }
+    const sessionId = this.resolveActiveSessionId();
+    if (!sessionId) {
+      return;
+    }
+    const queue = this.getQueuedMessages(sessionId, false);
+    if (queue.length === 0) {
+      return;
+    }
+    const nextQueue = queue.filter((item) => item.id !== id);
+    if (nextQueue.length === queue.length) {
+      return;
+    }
+    if (nextQueue.length === 0) {
+      this.queuedMessagesBySession.delete(sessionId);
+    } else {
+      this.queuedMessagesBySession.set(sessionId, nextQueue);
+    }
+    this.sendQueuedMessagesUpdate(sessionId);
+    void this.drainQueuedMessagesIfIdle();
+  }
+
+  private async drainQueuedMessagesIfIdle(): Promise<void> {
+    const sessionId = this.resolveActiveSessionId();
+    if (!sessionId) {
+      return;
+    }
+    if (this.queuedMessagesDrainRunning || this.orchestratorEngine.running) {
+      return;
+    }
+    const initialQueue = this.getQueuedMessages(sessionId, false);
+    if (initialQueue.length === 0) {
+      return;
+    }
+
+    this.queuedMessagesDrainRunning = true;
+    logger.info('界面.消息.暂存队列.开始出队', {
+      sessionId,
+      pending: initialQueue.length,
+    }, LogCategory.UI);
+
+    try {
+      while (true) {
+        if (this.orchestratorEngine.running) {
+          break;
+        }
+        if (this.resolveActiveSessionId() !== sessionId) {
+          break;
+        }
+        const queue = this.getQueuedMessages(sessionId, false);
+        const next = queue.shift();
+        if (!next) {
+          this.queuedMessagesBySession.delete(sessionId);
+          this.sendQueuedMessagesUpdate(sessionId);
+          break;
+        }
+        if (queue.length === 0) {
+          this.queuedMessagesBySession.delete(sessionId);
+        }
+        this.sendQueuedMessagesUpdate(sessionId);
+        const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        logger.info('界面.消息.暂存队列.执行', {
+          sessionId,
+          queueId: next.id,
+          remaining: this.getQueuedMessages(sessionId, false).length,
+        }, LogCategory.UI);
+        await this.executeTask(next.content, undefined, [], requestId);
+      }
+    } finally {
+      this.queuedMessagesDrainRunning = false;
+      const remaining = this.getQueuedMessages(sessionId, false).length;
+      if (remaining > 0 && !this.orchestratorEngine.running && this.resolveActiveSessionId() === sessionId) {
+        void this.drainQueuedMessagesIfIdle();
+      }
+    }
   }
 
   /** 在 VS Code 原生 diff 视图中打开文件变更（类似 Augment） */
@@ -2127,7 +2285,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  /** 处理执行中追加输入：默认语义为“补充指令（下一决策点生效）” */
+  /** 处理执行中追加输入：运行中进入暂存队列，轮次结束后按 FIFO 自动续跑 */
   private async handleAppendMessage(taskId: string, content: string): Promise<void> {
     logger.info('界面.消息.补充.请求', { taskId, preview: content.substring(0, 50) }, LogCategory.UI);
 
@@ -2138,40 +2296,33 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
 
     try {
-      const wasRunning = this.orchestratorEngine.running;
-
-      if (wasRunning) {
-        // 1. 在对话区显示用户追加的消息气泡（解决追加消息不可见的问题）
-        const traceId = this.messageHub.getTraceId();
-        const userMessage = createUserInputMessage(trimmedContent, traceId, {
-          metadata: {
-            isSupplementary: true,
-          },
-        });
-        this.messageHub.sendMessage(userMessage);
-
-        // 2. 注入补充指令队列，在下一决策点生效
-        const accepted = this.orchestratorEngine.injectSupplementaryInstruction(trimmedContent);
-        if (!accepted) {
-          this.sendToast(t('toast.supplementNotReady'), 'warning');
-          return;
-        }
-        const pendingCount = this.orchestratorEngine.getPendingInstructionCount();
-        this.messageHub.systemNotice(t('provider.supplementaryInstruction'), {
-          phase: 'supplementary_instruction',
-          isStatusMessage: true,
-          extra: {
-            pendingInstructionCount: pendingCount,
-          },
-        });
-        logger.info('界面.消息.补充.已入队', { taskId, pendingCount }, LogCategory.UI);
+      const sessionId = this.resolveActiveSessionId();
+      if (!sessionId) {
+        this.sendToast(t('toast.noActiveSession'), 'warning');
         return;
       }
 
-      // 竞态保护：前端认为执行中但后端已完成，作为新任务执行
+      const shouldQueue = this.orchestratorEngine.running
+        || this.orchestratorQueueRunning
+        || this.pendingExecutionQueue.length > 0
+        || this.queuedMessagesDrainRunning;
+
+      if (shouldQueue) {
+        const queued = this.enqueueQueuedMessage(sessionId, trimmedContent);
+        this.sendQueuedMessagesUpdate(sessionId);
+        logger.info('界面.消息.暂存队列.入队', {
+          taskId,
+          sessionId,
+          queueId: queued.id,
+          pending: this.getQueuedMessages(sessionId, false).length,
+        }, LogCategory.UI);
+        return;
+      }
+
+      // 空闲状态下直接作为新轮次执行
       const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       await this.executeTask(trimmedContent, undefined, [], requestId);
-      logger.info('界面.消息.补充.空闲直执_成功', { taskId, wasRunning }, LogCategory.UI);
+      logger.info('界面.消息.补充.空闲直执_成功', { taskId, sessionId }, LogCategory.UI);
     } catch (error) {
       logger.error('界面.消息.补充.失败', error, LogCategory.UI);
       this.sendToast(t('toast.supplementFailed'), 'error');
@@ -2517,6 +2668,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 任务执行链路结束，强制重置 processing 状态
       // 避免因流式消息缺少 COMPLETED lifecycle 导致 processing 动画卡住
       this.messageHub.forceProcessingState(false);
+      void this.drainQueuedMessagesIfIdle();
     }
   }
 
@@ -2580,6 +2732,19 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const taskContext = await this.orchestratorEngine.executeWithTaskContext(prompt, sessionId, imagePaths, turnId);
       const result = taskContext.result;
 
+      // 引擎 fail-open/门禁降级返回属于“非流式合成文本”，需要显式回灌到主对话区，
+      // 否则用户会看到“工具调用后结束但没有结论”。
+      if (this.shouldEmitOutOfBandResult(result)) {
+        this.sendOrchestratorMessage({
+          content: result,
+          messageType: 'result',
+          metadata: {
+            phase: 'out_of_band_result',
+            source: 'mission_engine_fail_open',
+          },
+        });
+      }
+
       logger.info('界面.任务.完成', { hasResult: !!result?.trim(), resultLength: result?.length || 0 }, LogCategory.UI);
 
       // 保存消息历史
@@ -2627,6 +2792,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   /** 执行会话删除逻辑（供 deleteSession 消息使用） */
   private async performSessionDelete(sessionId: string): Promise<void> {
     const isDeletingCurrentSession = sessionId === this.activeSessionId;
+    this.queuedMessagesBySession.delete(sessionId);
 
     if (!this.sessionManager.deleteSession(sessionId)) {
       this.sendStateUpdate();
@@ -2641,6 +2807,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.activeSessionId = newSession.id;
       this.syncMessageHubTrace(this.activeSessionId);
       this.sendData('sessionCreated', { sessionId: newSession.id, session: newSession });
+      this.sendQueuedMessagesUpdate(newSession.id);
     } else if (isDeletingCurrentSession) {
       // 删除的是当前活跃会话，切换到 sessionManager 自动选择的下一个会话
       const nextSessionId = this.sessionManager.getCurrentSession()?.id ?? remainingSessions[0].id;
@@ -2665,6 +2832,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       activePlan: planSnapshot.activePlan,
       plans: planSnapshot.plans,
     });
+    this.sendQueuedMessagesUpdate(session.id);
+    void this.drainQueuedMessagesIfIdle();
   }
 
   /** 创建并切换到新会话（对齐任务/对话会话） */
@@ -2689,6 +2858,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 通知 webview 新会话已创建
     this.sendData('sessionCreated', { sessionId: newSession.id, session: newSession });
     this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() });
+    this.sendQueuedMessagesUpdate(newSession.id);
     this.sendStateUpdate();
   }
 
@@ -2779,6 +2949,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         activePlan: planSnapshot.activePlan,
         plans: planSnapshot.plans,
       });
+      this.sendQueuedMessagesUpdate(sessionId);
 
       logger.info('界面.会话.消息.已加载', {
         sessionId,
@@ -2826,6 +2997,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
     this.messageHub.setTraceId(resolvedSessionId);
     logger.debug('界面.消息.Trace.同步', { traceId: resolvedSessionId }, LogCategory.UI);
+  }
+
+  private shouldEmitOutOfBandResult(result: string): boolean {
+    const text = (result || '').trim();
+    if (!text) {
+      return false;
+    }
+    return text.startsWith('[System] 本轮触发门禁降级（会话不中断）：')
+      || text.startsWith('[System] 本轮执行出现异常，已自动降级为不中断返回：');
   }
 
   /** 保存消息到当前会话 */

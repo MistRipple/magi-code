@@ -92,6 +92,35 @@ export interface ToolCall {
   endTime?: number;
 }
 
+export type TerminalOperation = 'shell';
+
+export interface TerminalSessionBlock {
+  terminalId: number;
+  operation: TerminalOperation;
+  status: string;
+  phase?: string;
+  runMode?: 'task' | 'service';
+  terminalName?: string;
+  cwd?: string;
+  command?: string;
+  output: string;
+  outputCursor?: number;
+  outputStartCursor?: number;
+  fromCursor?: number;
+  nextCursor?: number;
+  delta?: boolean;
+  truncated?: boolean;
+  startupStatus?: 'pending' | 'confirmed' | 'timeout' | 'failed' | 'skipped';
+  startupMessage?: string;
+  locked?: boolean;
+  returnCode?: number | null;
+  accepted?: boolean;
+  killed?: boolean;
+  releasedLock?: boolean;
+  error?: string;
+  updatedAt: number;
+}
+
 // 思考块
 export interface ThinkingBlock {
   content: string;
@@ -102,10 +131,11 @@ export interface ThinkingBlock {
 // 消息内容块
 export interface ContentBlock {
   id?: string;                // 唯一标识符，用于 #each 循环的 key
-  type: 'text' | 'code' | 'thinking' | 'tool_call' | 'tool_result' | 'file_change' | 'plan';
+  type: 'text' | 'code' | 'thinking' | 'tool_call' | 'tool_result' | 'file_change' | 'plan' | 'terminal_session';
   content: string;
   language?: string;        // 代码块语言
   toolCall?: ToolCall;      // 工具调用信息
+  terminalSession?: TerminalSessionBlock;
   thinking?: ThinkingBlock; // 思考块信息
   fileChange?: {
     filePath: string;
@@ -271,6 +301,12 @@ export interface Session {
   messageCount?: number;
   preview?: string;  // 会话预览
   messages?: { id: string; role: string; content: string }[];
+}
+
+export interface QueuedMessage {
+  id: string;
+  content: string;
+  createdAt: number;
 }
 
 // 处理中的 Actor

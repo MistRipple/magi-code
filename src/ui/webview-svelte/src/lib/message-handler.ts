@@ -14,9 +14,11 @@ import {
   setIsProcessing,
   setCurrentSessionId,
   updateSessions,
+  setQueuedMessages,
   setAppState,
   setMissionPlan,
   setInteractionMode,
+  getRequestedInteractionMode,
   clearRequestedInteractionMode,
   clearPendingInteractions,
   clearAllMessages,
@@ -40,13 +42,14 @@ import {
   clearProcessingState,
   sealAllStreamingMessages,
 } from '../stores/messages.svelte';
-import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, SubTaskItem, Edit, ModelStatusMap, ActivePlanState, PlanLedgerRecord, PlanLedgerAttempt } from '../types/message';
+import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, SubTaskItem, Edit, ModelStatusMap, ActivePlanState, PlanLedgerRecord, PlanLedgerAttempt, QueuedMessage } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
 import { MessageType, MessageCategory } from '../../../../protocol/message-protocol';
 import { routeStandardMessage, getMessageTarget, clearMessageTargets, clearMessageTarget, setMessageTarget } from './message-router';
 import { normalizeWorkerSlot } from './message-classifier';
 import { ensureArray } from './utils';
 import { i18n } from '../stores/i18n.svelte';
+import { terminalSessions } from '../stores/terminal-sessions.svelte';
 
 function normalizeRestoredMessages(messages: Message[]): Message[] {
   const seen = new Set<string>();
@@ -283,16 +286,31 @@ function resolveInteractionMode(raw: unknown): 'ask' | 'auto' | null {
   return null;
 }
 
-function resolvePendingInteractionsOnAutoMode(): void {
+function isEffectiveAutoMode(): boolean {
   const store = getState();
-  const hasPending = Boolean(
+  const requestedMode = resolveInteractionMode(getRequestedInteractionMode());
+  if (requestedMode === 'auto') {
+    return true;
+  }
+  const backendMode = resolveInteractionMode(store.appState?.interactionMode);
+  if (backendMode === 'auto') {
+    return true;
+  }
+  const localMode = resolveInteractionMode(store.interactionMode);
+  return backendMode === null && localMode === 'auto';
+}
+
+function resolvePendingInteractionsOnAutoMode(options?: { showToast?: boolean }): void {
+  const store = getState();
+  const showToast = options?.showToast === true;
+  const hasAutoResolvablePending = Boolean(
     store.pendingToolAuthorization
     || store.pendingConfirmation
     || store.pendingRecovery
     || store.pendingClarification
     || store.pendingWorkerQuestion
   );
-  if (!hasPending) {
+  if (!hasAutoResolvablePending) {
     return;
   }
 
@@ -325,23 +343,51 @@ function resolvePendingInteractionsOnAutoMode(): void {
     vscode.postMessage({ type: 'answerWorkerQuestion', answer: null });
   }
 
-  clearPendingInteractions();
+  // auto 模式下所有交互请求都可自动闭环。
+  store.pendingToolAuthorization = null;
+  store.pendingConfirmation = null;
+  store.pendingRecovery = null;
+  store.pendingClarification = null;
+  store.pendingWorkerQuestion = null;
   clearRequestedInteractionMode();
   setIsProcessing(true);
-  addToast('info', i18n.t('messageHandler.autoModePendingResolved'));
+  if (showToast) {
+    addToast('info', i18n.t('messageHandler.autoModePendingResolved'), undefined, {
+      category: 'audit',
+      source: 'interaction-mode',
+      countUnread: false,
+    });
+  }
 }
 
-function applyInteractionModeFromPayload(rawMode: unknown, source: string, rawUpdatedAt?: unknown): void {
+function applyInteractionModeFromPayload(
+  rawMode: unknown,
+  source: string,
+  rawUpdatedAt?: unknown,
+  previousModeRaw?: unknown,
+): void {
   const resolved = resolveInteractionMode(rawMode);
   if (!resolved) {
     console.error(`[MessageHandler] ${source} 收到非法 interactionMode:`, rawMode);
-    addToast('error', i18n.t('messageHandler.invalidInteractionMode'));
+    addToast('error', i18n.t('messageHandler.invalidInteractionMode'), undefined, {
+      category: 'incident',
+      source: 'interaction-mode',
+      actionRequired: true,
+    });
     return;
   }
+  const previousMode = resolveInteractionMode(previousModeRaw)
+    || resolveInteractionMode(getState().appState?.interactionMode)
+    || 'auto';
+  const requestedModeBeforeApply = getRequestedInteractionMode();
   const updatedAt = typeof rawUpdatedAt === 'number' ? rawUpdatedAt : undefined;
   setInteractionMode(resolved, updatedAt);
-  if (resolved === 'auto') {
-    resolvePendingInteractionsOnAutoMode();
+  const switchedToAuto = resolved === 'auto' && previousMode !== 'auto';
+  const userRequestedAuto = requestedModeBeforeApply === 'auto';
+  if (resolved === 'auto' && (switchedToAuto || userRequestedAuto)) {
+    resolvePendingInteractionsOnAutoMode({
+      showToast: switchedToAuto,
+    });
   }
 }
 
@@ -368,6 +414,7 @@ function isStaleInteractionModeUpdate(payload: Record<string, unknown>, source: 
 function handleStateUpdate(message: WebviewMessage) {
   const state = message.state as AppState;
   if (!state) return;
+  const previousModeRaw = getState().appState?.interactionMode;
 
   const nextUpdatedAt = typeof state.interactionModeUpdatedAt === 'number' ? state.interactionModeUpdatedAt : undefined;
   const currentUpdatedAt = typeof getState().appState?.interactionModeUpdatedAt === 'number'
@@ -486,7 +533,12 @@ function handleStateUpdate(message: WebviewMessage) {
   // 处理状态只由控制消息（task_started/task_completed）和消息生命周期驱动，不再接受 stateUpdate 的冗余信号。
 
   if (typeof state.interactionMode === 'string') {
-    applyInteractionModeFromPayload(state.interactionMode, 'stateUpdate', state.interactionModeUpdatedAt);
+    applyInteractionModeFromPayload(
+      state.interactionMode,
+      'stateUpdate',
+      state.interactionModeUpdatedAt,
+      previousModeRaw,
+    );
   }
 }
 
@@ -960,7 +1012,11 @@ function handleContentMessage(standard: StandardMessage) {
         clearPendingRequest(requestId);
         markMessageComplete(currentBinding.placeholderMessageId);
         // 显示超时错误提示
-        addToast('error', i18n.t('messageHandler.responseTimeout'));
+        addToast('error', i18n.t('messageHandler.responseTimeout'), undefined, {
+          category: 'incident',
+          source: 'model-runtime',
+          actionRequired: true,
+        });
       }
     }, 60000); // 60 秒超时
 
@@ -1527,7 +1583,11 @@ function handleUnifiedControlMessage(standard: StandardMessage) {
         }
       }
 
-      addToast(toastLevel, finalReason);
+      addToast(toastLevel, finalReason, undefined, {
+        category: 'incident',
+        source: modelOriginIssue ? 'model-runtime' : 'task-runtime',
+        actionRequired: true,
+      });
       break;
     }
 
@@ -1593,6 +1653,22 @@ function handleUnifiedNotify(standard: StandardMessage) {
     console.warn('[MessageHandler] 通知消息缺少内容，跳过:', standard);
     return;
   }
+  if (level === 'error') {
+    addToast(level, content, undefined, {
+      category: 'incident',
+      source: 'model-runtime',
+      actionRequired: true,
+    });
+    return;
+  }
+  if (level === 'warning') {
+    addToast(level, content, undefined, {
+      category: 'audit',
+      source: 'model-runtime',
+      countUnread: false,
+    });
+    return;
+  }
   addToast(level, content);
 }
 
@@ -1622,6 +1698,16 @@ function handleUnifiedData(standard: StandardMessage) {
       if (source) {
         setProcessingActor(source, agent);
       }
+      break;
+    }
+
+    case 'queuedMessagesUpdated': {
+      const currentSessionId = getState().currentSessionId || '';
+      const incomingSessionId = typeof payload.sessionId === 'string' ? payload.sessionId : '';
+      if (incomingSessionId && currentSessionId && incomingSessionId !== currentSessionId) {
+        break;
+      }
+      setQueuedMessages(ensureArray<QueuedMessage>(payload.queuedMessages));
       break;
     }
 
@@ -1723,7 +1809,12 @@ function handleUnifiedData(standard: StandardMessage) {
       if (isStaleInteractionModeUpdate(payload, 'interactionModeChanged')) {
         break;
       }
-      applyInteractionModeFromPayload(payload.mode, 'interactionModeChanged', payload.updatedAt);
+      applyInteractionModeFromPayload(
+        payload.mode,
+        'interactionModeChanged',
+        payload.updatedAt,
+        getState().appState?.interactionMode,
+      );
       break;
 
     case 'missionExecutionFailed':
@@ -1926,8 +2017,12 @@ function handleSessionMessagesLoaded(message: WebviewMessage) {
 function handleConfirmationRequest(message: WebviewMessage) {
   const store = getState();
   const forceManual = message.forceManual === true;
-  if (store.appState?.interactionMode === 'auto' && !forceManual) {
-    addToast('info', i18n.t('messageHandler.autoConfirmPlan'));
+  if (isEffectiveAutoMode()) {
+    addToast('info', i18n.t('messageHandler.autoConfirmPlan'), undefined, {
+      category: 'audit',
+      source: 'interaction-mode',
+      countUnread: false,
+    });
     vscode.postMessage({ type: 'confirmPlan', confirmed: true });
     clearRequestedInteractionMode();
     setIsProcessing(true);
@@ -1936,6 +2031,7 @@ function handleConfirmationRequest(message: WebviewMessage) {
   store.pendingConfirmation = {
     plan: message.plan,
     formattedPlan: message.formattedPlan as string | undefined,
+    forceManual,
   };
   setIsProcessing(false);
 }
@@ -1947,7 +2043,11 @@ function handleRecoveryRequest(message: WebviewMessage) {
     const decision: 'retry' | 'continue' = canRetry
       ? 'retry'
       : 'continue';
-    addToast('info', i18n.t('messageHandler.autoRecovery', { decision: i18n.t(decision === 'retry' ? 'messageHandler.autoRecoveryRetry' : 'messageHandler.autoRecoveryContinue') }));
+    addToast('info', i18n.t('messageHandler.autoRecovery', { decision: i18n.t(decision === 'retry' ? 'messageHandler.autoRecoveryRetry' : 'messageHandler.autoRecoveryContinue') }), undefined, {
+      category: 'audit',
+      source: 'recovery',
+      countUnread: false,
+    });
     vscode.postMessage({ type: 'confirmRecovery', decision });
     setIsProcessing(true);
     return;
@@ -2007,7 +2107,11 @@ function handleToolAuthorizationRequest(message: WebviewMessage) {
     : '';
   if (!requestId) {
     console.error('[MessageHandler] toolAuthorizationRequest 缺少 requestId:', message);
-    addToast('error', i18n.t('messageHandler.toolAuthMissingRequestId'));
+    addToast('error', i18n.t('messageHandler.toolAuthMissingRequestId'), undefined, {
+      category: 'incident',
+      source: 'tool-auth',
+      actionRequired: true,
+    });
     return;
   }
 
@@ -2026,7 +2130,11 @@ function handleToolAuthorizationRequest(message: WebviewMessage) {
       activeInteraction: getActiveInteractionType(),
     });
     vscode.postMessage({ type: 'toolAuthorizationResponse', requestId, allowed: false });
-    addToast('warning', i18n.t('messageHandler.toolAuthConflict'));
+    addToast('warning', i18n.t('messageHandler.toolAuthConflict'), undefined, {
+      category: 'incident',
+      source: 'tool-auth',
+      actionRequired: true,
+    });
     return;
   }
 
@@ -2485,8 +2593,12 @@ function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[] {
           block.output,
           block.error
         );
+        const standardizedStatus = (block.standardized?.status || '').toLowerCase();
+        const standardizedHardError = standardizedStatus === 'error'
+          || standardizedStatus === 'timeout'
+          || standardizedStatus === 'killed';
         const standardizedError = block.standardized
-          && block.standardized.status !== 'success'
+          && standardizedHardError
           ? (block.standardized.message || undefined)
           : undefined;
         const toolCall: ToolCall = {
@@ -2498,6 +2610,7 @@ function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[] {
           error: block.error || standardizedError,
           standardized: block.standardized,
         };
+        terminalSessions.ingestToolCall(toolCall);
         return {
           type: 'tool_call',
           content: '',
@@ -2597,10 +2710,21 @@ function mergeBlocks(existing: ContentBlock[], incoming: ContentBlock[]): Conten
       const idx = next.findIndex((b) => b.type === 'tool_call' && b.toolCall?.id === block.toolCall?.id);
       if (idx >= 0) {
         const prev = next[idx];
+        const prevToolCall = prev.toolCall;
+        const incomingToolCall = block.toolCall;
         next[idx] = {
           ...prev,
           ...block,
-          toolCall: { ...prev.toolCall, ...block.toolCall },
+          toolCall: {
+            ...prevToolCall,
+            ...incomingToolCall,
+            // block_update 允许只传增量字段，缺失字段必须保留已有值，
+            // 否则会把 result/arguments 覆盖成 undefined，导致 terminalId 丢失（UI 显示 #-）
+            arguments: incomingToolCall?.arguments ?? prevToolCall?.arguments,
+            result: incomingToolCall?.result ?? prevToolCall?.result,
+            error: incomingToolCall?.error ?? prevToolCall?.error,
+            standardized: incomingToolCall?.standardized ?? prevToolCall?.standardized,
+          },
         };
       } else {
         next.push(block);
@@ -2681,16 +2805,17 @@ function mapToolStatus(
   }
 
   if (standardizedStatus) {
-    switch (standardizedStatus) {
+    switch (standardizedStatus.toLowerCase()) {
       case 'success':
         return 'success';
       case 'error':
       case 'timeout':
       case 'killed':
+        return 'error';
       case 'blocked':
       case 'rejected':
       case 'aborted':
-        return 'error';
+        return 'success';
       default:
         break;
     }

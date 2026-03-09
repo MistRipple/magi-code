@@ -135,6 +135,7 @@ export type DataMessageType =
   | 'profileConfigSaved'
   | 'projectKnowledgeLoaded'
   | 'processingStateChanged'
+  | 'queuedMessagesUpdated'
   | 'planLedgerLoaded'
   | 'planLedgerUpdated'
   | 'promptEnhanced'

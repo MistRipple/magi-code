@@ -20,11 +20,7 @@ export type ToolSource = 'mcp' | 'skill' | 'builtin';
  * 必须引用此常量，禁止各自硬编码。
  */
 export const BUILTIN_TOOL_NAMES = [
-  'launch-process',
-  'read-process',
-  'write-process',
-  'kill-process',
-  'list-processes',
+  'shell',
   'file_view',
   'file_create',
   'file_edit',

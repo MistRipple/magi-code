@@ -5,7 +5,7 @@
  * 通过 ANSI 标记检测命令边界和完成状态
  */
 
-import * as vscode from 'vscode';
+import type { IShellSession } from '../shell/types';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -71,14 +71,14 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
   private static readonly LOG_PREFIX = 'ScriptCaptureStrategy';
   private static readonly EXIT_CODE_MARKER_REGEX = /\x1B\]8890;magi-exit-code:(\d+)\x07/g;
 
-  private terminalSessions: Map<vscode.Terminal, TerminalSessionData> = new Map();
+  private terminalSessions: Map<string, TerminalSessionData> = new Map();
 
   name(): string {
     return 'script_capture';
   }
 
   async setupTerminal(
-    terminal: vscode.Terminal,
+    session: IShellSession,
     shellName: ShellType,
     startupScript?: string
   ): Promise<boolean> {
@@ -96,13 +96,13 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
 
     // 生成并执行 script 启动命令
     const scriptStartCmd = this.generateScriptStartCommand(shellName, scriptFile);
-    terminal.sendText(scriptStartCmd, true);
+    session.sendText(scriptStartCmd, true);
 
     // 等待 script 进程就绪
     const scriptReady = await this.waitForScriptReady(scriptStartCmd, scriptFile, shellName);
 
     // script 就绪后立即清屏，清除 script 启动命令的回显
-    terminal.sendText(getClearCommand(shellName), true);
+    session.sendText(getClearCommand(shellName), true);
     await this.delay(200);
 
     let scriptPid: number | undefined;
@@ -125,7 +125,7 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
     }
 
     // 保存会话数据
-    this.terminalSessions.set(terminal, {
+    this.terminalSessions.set(session.id, {
       scriptFile,
       shellName,
       scriptPid,
@@ -139,42 +139,42 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
 
     // 执行启动脚本
     if (startupScript) {
-      await this.runCommandUntilCompletion(terminal, startupScript, 'startup script', undefined, shellName);
+      await this.runCommandUntilCompletion(session, startupScript, 'startup script', undefined, shellName);
     }
 
     // 禁用历史展开
     const disableHistCmd = getDisableHistExpansionCommand(shellName);
     if (disableHistCmd) {
-      await this.runCommandUntilCompletion(terminal, disableHistCmd, 'disable history expansion', undefined, shellName, 500);
+      await this.runCommandUntilCompletion(session, disableHistCmd, 'disable history expansion', undefined, shellName, 500);
     }
 
     if (scriptPid === undefined || shellPid === undefined) {
       const clearCmd = getClearCommand(shellName);
-      await this.runCommandUntilCompletion(terminal, clearCmd, 'clear command', undefined, shellName);
+      await this.runCommandUntilCompletion(session, clearCmd, 'clear command', undefined, shellName);
       return false;
     }
 
     // 设置输出结束标记 hook
     const endMarkerSetup = getOutputEndMarkerSetup(shellName);
     if (endMarkerSetup) {
-      await this.runCommandUntilCompletion(terminal, endMarkerSetup, 'output end marker setup', undefined, shellName);
+      await this.runCommandUntilCompletion(session, endMarkerSetup, 'output end marker setup', undefined, shellName);
     }
 
     // 设置 CWD 追踪
     const cwdSetup = CwdTracker.generateCwdTrackingSetup(shellName, cwdFile);
     if (cwdSetup) {
-      await this.runCommandUntilCompletion(terminal, cwdSetup, 'CWD tracking setup', undefined, shellName);
+      await this.runCommandUntilCompletion(session, cwdSetup, 'CWD tracking setup', undefined, shellName);
     }
 
     // 设置输出开始标记 hook
     const startMarkerSetup = getOutputStartMarkerSetup(shellName);
     if (startMarkerSetup) {
-      await this.runCommandUntilCompletion(terminal, startMarkerSetup, 'output start marker setup', undefined, shellName);
+      await this.runCommandUntilCompletion(session, startMarkerSetup, 'output start marker setup', undefined, shellName);
     }
 
     // 清屏
     const clearCmd = getClearCommand(shellName);
-    await this.runCommandUntilCompletion(terminal, clearCmd, 'clear command', undefined, shellName);
+    await this.runCommandUntilCompletion(session, clearCmd, 'clear command', undefined, shellName);
 
     return scriptPid !== undefined && shellPid !== undefined;
   }
@@ -182,22 +182,22 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
   wrapCommand(
     command: string,
     processId: number,
-    terminal: vscode.Terminal,
+    session: IShellSession,
     captureOutput: boolean
   ): string {
-    const session = this.terminalSessions.get(terminal);
-    if (!session) {
+    const sessionData = this.terminalSessions.get(session.id);
+    if (!sessionData) {
       logger.warn(`${ScriptCaptureStrategy.LOG_PREFIX}: 未找到终端会话`, undefined, LogCategory.SHELL);
       return command;
     }
 
     // 更新文件位置
-    if (session.scriptFile && captureOutput) {
+    if (sessionData.scriptFile && captureOutput) {
       try {
-        if (fs.existsSync(session.scriptFile)) {
-          const stats = fs.statSync(session.scriptFile);
-          session.lastFileEndPosition = stats.size;
-          session.lastActivityProbePosition = stats.size;
+        if (fs.existsSync(sessionData.scriptFile)) {
+          const stats = fs.statSync(sessionData.scriptFile);
+          sessionData.lastFileEndPosition = stats.size;
+          sessionData.lastActivityProbePosition = stats.size;
           logger.debug(
             `${ScriptCaptureStrategy.LOG_PREFIX}: 更新文件位置`,
             { position: stats.size, processId },
@@ -214,9 +214,9 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
     }
 
     // 捕获子进程快照
-    if (session.shellPid && captureOutput) {
-      this.captureChildProcessesSnapshot(session.shellPid, session);
-      session.noChildStableCount = 0;
+    if (sessionData.shellPid && captureOutput) {
+      this.captureChildProcessesSnapshot(sessionData.shellPid, sessionData);
+      sessionData.noChildStableCount = 0;
     }
 
     // ScriptCapture 策略不需要包装命令，依赖 hook 注入标记
@@ -225,12 +225,12 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
 
   checkCompleted(
     processId: number,
-    terminal: vscode.Terminal
+    session: IShellSession
   ): CompletionCheckResult {
-    const session = this.terminalSessions.get(terminal);
+    const sessionData = this.terminalSessions.get(session.id);
 
     // 先尝试基于标记的检测
-    const markerResult = this.checkCompletedMarkerBased(processId, session);
+    const markerResult = this.checkCompletedMarkerBased(processId, sessionData);
     if (markerResult.isCompleted) {
       logger.debug(
         `${ScriptCaptureStrategy.LOG_PREFIX}: 标记检测发现完成`,
@@ -241,7 +241,7 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
     }
 
     // 再尝试基于进程的检测
-    const processResult = this.checkCompletedProcessBased(processId, session);
+    const processResult = this.checkCompletedProcessBased(processId, sessionData);
     if (processResult.isCompleted) {
       logger.debug(
         `${ScriptCaptureStrategy.LOG_PREFIX}: 进程检测发现完成`,
@@ -257,29 +257,30 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
    * 仅基于输出结束标记判断是否完成（不使用子进程探测）。
    * 用于 service 模式，避免 pgrep 偶发失准导致误判结束。
    */
-  checkCompletedByMarker(processId: number, terminal: vscode.Terminal): CompletionCheckResult {
-    const session = this.terminalSessions.get(terminal);
-    return this.checkCompletedMarkerBased(processId, session);
+  checkCompletedByMarker(processId: number, session: IShellSession): CompletionCheckResult {
+    const sessionData = this.terminalSessions.get(session.id);
+    return this.checkCompletedMarkerBased(processId, sessionData);
   }
 
   getOutputAndReturnCode(
     _processId: number,
-    terminal: vscode.Terminal,
-    actualCommand: string,
+    session: IShellSession,
+    _actualCommand: string,
     isCompleted: boolean
   ): { output: string; returnCode: number | null } | string {
-    const session = this.terminalSessions.get(terminal);
-    if (!session?.scriptFile) {
+    const sessionData = this.terminalSessions.get(session.id);
+    if (!sessionData?.scriptFile) {
       return { output: '', returnCode: null };
     }
 
     try {
-      if (!fs.existsSync(session.scriptFile)) {
+      if (!fs.existsSync(sessionData.scriptFile)) {
         return 'Script 日志文件不存在';
       }
 
-      const content = fs.readFileSync(session.scriptFile, 'utf8');
-      const extracted = this.extractOutputFromScriptLog(content, actualCommand, session.shellName);
+      const content = fs.readFileSync(sessionData.scriptFile, 'utf8');
+      const commandSegment = content.slice(Math.max(0, sessionData.lastFileEndPosition || 0));
+      const extracted = this.extractOutputFromCommandSegment(commandSegment);
 
       return {
         output: stripAnsiCodes(extracted.output).trim(),
@@ -295,63 +296,63 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
     }
   }
 
-  getCurrentCwd(terminal: vscode.Terminal): string | undefined {
-    const session = this.terminalSessions.get(terminal);
-    if (session?.cwdTrackingFile) {
-      return CwdTracker.readCurrentCwd(session.cwdTrackingFile);
+  getCurrentCwd(session: IShellSession): string | undefined {
+    const sessionData = this.terminalSessions.get(session.id);
+    if (sessionData?.cwdTrackingFile) {
+      return CwdTracker.readCurrentCwd(sessionData.cwdTrackingFile);
     }
     return undefined;
   }
 
-  cleanupTerminal(terminal: vscode.Terminal): void {
+  cleanupTerminal(session: IShellSession): void {
     logger.debug(
       `${ScriptCaptureStrategy.LOG_PREFIX}: 清理终端`,
-      { name: terminal.name },
+      { name: session.name },
       LogCategory.SHELL
     );
 
-    const session = this.terminalSessions.get(terminal);
-    if (!session) {
+    const sessionData = this.terminalSessions.get(session.id);
+    if (!sessionData) {
       return;
     }
 
     // 终止 script 进程
-    if (session.scriptPid) {
-      this.killScriptProcess(session.scriptPid);
+    if (sessionData.scriptPid) {
+      this.killScriptProcess(sessionData.scriptPid);
     }
 
     // 清理日志文件
-    if (session.scriptFile) {
+    if (sessionData.scriptFile) {
       try {
-        if (fs.existsSync(session.scriptFile)) {
-          fs.unlinkSync(session.scriptFile);
+        if (fs.existsSync(sessionData.scriptFile)) {
+          fs.unlinkSync(sessionData.scriptFile);
         }
       } catch (error) {
         logger.warn(
           `${ScriptCaptureStrategy.LOG_PREFIX}: 清理日志文件失败，可能导致临时文件累积`,
-          { scriptFile: session.scriptFile, error },
+          { scriptFile: sessionData.scriptFile, error },
           LogCategory.SHELL
         );
       }
     }
 
     // 清理 CWD 追踪文件
-    if (session.cwdTrackingFile) {
-      CwdTracker.cleanupCwdTracking(session.cwdTrackingFile);
+    if (sessionData.cwdTrackingFile) {
+      CwdTracker.cleanupCwdTracking(sessionData.cwdTrackingFile);
     }
 
-    this.terminalSessions.delete(terminal);
+    this.terminalSessions.delete(session.id);
   }
 
-  isReady(terminal: vscode.Terminal): boolean {
-    const session = this.terminalSessions.get(terminal);
-    if (!session?.scriptPid) {
+  isReady(session: IShellSession): boolean {
+    const sessionData = this.terminalSessions.get(session.id);
+    if (!sessionData?.scriptPid) {
       return false;
     }
 
     // 检查 script 进程是否存活
     try {
-      process.kill(session.scriptPid, 0);
+      process.kill(sessionData.scriptPid, 0);
       return true;
     } catch (error: any) {
       // ESRCH 表示进程不存在
@@ -362,7 +363,7 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
       if (error.code === 'EPERM') {
         logger.debug(
           `${ScriptCaptureStrategy.LOG_PREFIX}: 无权限检查进程，假设仍在运行`,
-          { scriptPid: session.scriptPid },
+          { scriptPid: sessionData.scriptPid },
           LogCategory.SHELL
         );
         return true;
@@ -370,7 +371,7 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
       // 其他错误记录日志
       logger.debug(
         `${ScriptCaptureStrategy.LOG_PREFIX}: 检查进程状态失败`,
-        { scriptPid: session.scriptPid, error },
+        { scriptPid: sessionData.scriptPid, error },
         LogCategory.SHELL
       );
       return false;
@@ -383,16 +384,16 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
    * 根修复：launch-process 超时后仅发 Ctrl+C 可能无法终止子进程树（如测试 runner / watcher），
    * 这里基于 shellPid 定位并终止其子进程，避免残留进程污染后续命令。
    */
-  async interruptActiveCommand(terminal: vscode.Terminal): Promise<void> {
-    const session = this.terminalSessions.get(terminal);
-    if (!session?.shellPid) {
+  async interruptActiveCommand(session: IShellSession): Promise<void> {
+    const sessionData = this.terminalSessions.get(session.id);
+    if (!sessionData?.shellPid) {
       return;
     }
 
-    const descendantPids = this.collectDescendantPids(session.shellPid);
+    const descendantPids = this.collectDescendantPids(sessionData.shellPid);
     if (descendantPids.length === 0) {
-      session.lastChildProcesses.clear();
-      session.noChildStableCount = 0;
+      sessionData.lastChildProcesses.clear();
+      sessionData.noChildStableCount = 0;
       return;
     }
 
@@ -404,32 +405,32 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
       this.signalProcesses(alive, 'SIGKILL');
     }
 
-    session.lastChildProcesses.clear();
-    session.noChildStableCount = 0;
+    sessionData.lastChildProcesses.clear();
+    sessionData.noChildStableCount = 0;
   }
 
-  hasOutputActivity(terminal: vscode.Terminal): boolean {
-    const session = this.terminalSessions.get(terminal);
-    if (!session?.scriptFile) {
+  hasOutputActivity(session: IShellSession): boolean {
+    const sessionData = this.terminalSessions.get(session.id);
+    if (!sessionData?.scriptFile) {
       return false;
     }
 
     try {
-      if (!fs.existsSync(session.scriptFile)) {
+      if (!fs.existsSync(sessionData.scriptFile)) {
         return false;
       }
 
-      const fileSize = fs.statSync(session.scriptFile).size;
-      const previous = session.lastActivityProbePosition ?? session.lastFileEndPosition ?? fileSize;
+      const fileSize = fs.statSync(sessionData.scriptFile).size;
+      const previous = sessionData.lastActivityProbePosition ?? sessionData.lastFileEndPosition ?? fileSize;
 
       if (fileSize > previous) {
-        session.lastActivityProbePosition = fileSize;
+        sessionData.lastActivityProbePosition = fileSize;
         return true;
       }
 
       if (fileSize < previous) {
         // 文件被重置时同步探测游标，避免误判
-        session.lastActivityProbePosition = fileSize;
+        sessionData.lastActivityProbePosition = fileSize;
       }
 
       return false;
@@ -439,10 +440,10 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
   }
 
   async ensureTerminalSessionActive(
-    terminal: vscode.Terminal,
+    session: IShellSession,
     shellName?: ShellType
   ): Promise<boolean> {
-    if (this.isReady(terminal)) {
+    if (this.isReady(session)) {
       return true;
     }
 
@@ -452,15 +453,15 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
       LogCategory.SHELL
     );
 
-    const session = this.terminalSessions.get(terminal);
-    const shell = shellName || session?.shellName || 'bash';
+    const sessionData = this.terminalSessions.get(session.id);
+    const shell = shellName || sessionData?.shellName || 'bash';
 
-    terminal.sendText('reset');
-    return this.setupTerminal(terminal, shell);
+    session.sendText('reset');
+    return this.setupTerminal(session, shell);
   }
 
   async runCommandUntilCompletion(
-    terminal: vscode.Terminal,
+    session: IShellSession,
     command: string,
     description: string,
     _eventName?: string,
@@ -468,17 +469,17 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
     timeout: number = 1000
   ): Promise<boolean> {
     const startTime = Date.now();
-    const wrappedCmd = this.wrapCommand(command, startTime, terminal, true);
+    const wrappedCmd = this.wrapCommand(command, startTime, session, true);
 
-    terminal.sendText(wrappedCmd, false);
-    terminal.sendText('');
+    session.sendText(wrappedCmd, false);
+    session.sendText('');
 
     await this.delay(200);
 
     return new Promise(resolve => {
       const interval = setInterval(() => {
         try {
-          const result = this.checkCompleted(startTime, terminal);
+          const result = this.checkCompleted(startTime, session);
           if (result.isCompleted) {
             clearInterval(interval);
             resolve(true);
@@ -513,9 +514,9 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
   /**
    * 检查进程检测是否进行中
    */
-  isProcessCheckInProgress(terminal: vscode.Terminal): boolean {
-    const session = this.terminalSessions.get(terminal);
-    return session?.processCheckInProgress === true;
+  isProcessCheckInProgress(session: IShellSession): boolean {
+    const sessionData = this.terminalSessions.get(session.id);
+    return sessionData?.processCheckInProgress === true;
   }
 
   // ============================================================================
@@ -875,12 +876,8 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
     }
   }
 
-  private extractOutputFromScriptLog(
-    content: string,
-    command: string,
-    shellName: ShellType
-  ): { output: string; returnCode: number | null } {
-    // 查找输出开始和结束标记之间的内容
+  private extractOutputFromCommandSegment(content: string): { output: string; returnCode: number | null } {
+    // 优先提取“本次命令段”内最后一对 start/end 标记
     const startMarkerIndex = content.lastIndexOf(OUTPUT_START_MARKER);
     const endMarkerIndex = content.lastIndexOf(OUTPUT_END_MARKER);
 
@@ -889,12 +886,17 @@ export class ScriptCaptureStrategy implements CompletionStrategy {
       return this.extractExitCodeAndCleanOutput(segment);
     }
 
-    // 备用：返回文件尾部内容
+    // 执行中尚未出现 end 标记：从最后一个 start 标记截取到文件末尾，保证流式可见
+    if (startMarkerIndex !== -1) {
+      const segment = content.substring(startMarkerIndex + OUTPUT_START_MARKER.length);
+      return this.extractExitCodeAndCleanOutput(segment);
+    }
+
+    // 极端兜底：返回本次命令段尾部内容
     const lines = content.split('\n');
     const lastLines = lines.slice(-50);
     const fallbackOutput = lastLines.join('\n');
-    const fallbackCode = this.extractExitCodeAndCleanOutput(fallbackOutput);
-    return fallbackCode;
+    return this.extractExitCodeAndCleanOutput(fallbackOutput);
   }
 
   private extractExitCodeAndCleanOutput(segment: string): { output: string; returnCode: number | null } {

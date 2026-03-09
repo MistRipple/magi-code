@@ -14,5 +14,4 @@ export { CwdTracker } from './cwd-tracker';
 export { ProcessPollingManager } from './process-polling-manager';
 
 // 完成检测策略
-export { VSCodeEventsStrategy } from './vscode-events-strategy';
 export { ScriptCaptureStrategy } from './script-capture-strategy';

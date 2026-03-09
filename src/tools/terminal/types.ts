@@ -2,7 +2,7 @@
  * 终端系统类型定义
  */
 
-import * as vscode from 'vscode';
+import type { IShellSession } from '../shell/types';
 import { ProcessRunMode } from '../types';
 
 // ============================================================================
@@ -32,8 +32,8 @@ export type ShellType = 'bash' | 'zsh' | 'fish' | 'powershell' | 'cmd' | 'other'
 export interface TerminalProcess {
   /** 进程 ID（内部标识） */
   id: number;
-  /** VSCode 终端实例 */
-  terminal: vscode.Terminal;
+  /** Shell 会话实例 */
+  session: IShellSession;
   /** 原始命令 */
   command: string;
   /** 实际执行的命令（可能被包装） */
@@ -52,10 +52,6 @@ export interface TerminalProcess {
   endTime?: number;
   /** 最后更新时间 */
   updatedAt?: number;
-  /** Shell Integration 执行对象 */
-  execution?: vscode.TerminalShellExecution;
-  /** 输出流 */
-  readStream?: AsyncIterable<string>;
   /** 工具调用 ID */
   toolUseId?: string;
   /** 会话 ID */
@@ -126,7 +122,7 @@ export interface CompletionStrategy {
    * @returns 是否成功初始化
    */
   setupTerminal(
-    terminal: vscode.Terminal,
+    session: IShellSession,
     shellName: ShellType,
     startupScript?: string
   ): Promise<boolean>;
@@ -137,7 +133,7 @@ export interface CompletionStrategy {
   wrapCommand(
     command: string,
     processId: number,
-    terminal: vscode.Terminal,
+    session: IShellSession,
     captureOutput: boolean
   ): string;
 
@@ -146,7 +142,7 @@ export interface CompletionStrategy {
    */
   checkCompleted(
     processId: number,
-    terminal: vscode.Terminal
+    session: IShellSession
   ): CompletionCheckResult;
 
   /**
@@ -154,7 +150,7 @@ export interface CompletionStrategy {
    */
   getOutputAndReturnCode?(
     processId: number,
-    terminal: vscode.Terminal,
+    session: IShellSession,
     actualCommand: string,
     isCompleted: boolean
   ): { output: string; returnCode: number | null } | string;
@@ -162,23 +158,23 @@ export interface CompletionStrategy {
   /**
    * 获取当前工作目录
    */
-  getCurrentCwd?(terminal: vscode.Terminal): string | undefined;
+  getCurrentCwd?(session: IShellSession): string | undefined;
 
   /**
    * 清理终端资源
    */
-  cleanupTerminal(terminal: vscode.Terminal): void;
+  cleanupTerminal(session: IShellSession): void;
 
   /**
    * 检测终端会话是否存活
    */
-  isReady(terminal: vscode.Terminal): boolean;
+  isReady(session: IShellSession): boolean;
 
   /**
    * 确保终端会话存活
    */
   ensureTerminalSessionActive?(
-    terminal: vscode.Terminal,
+    session: IShellSession,
     shellName?: ShellType
   ): Promise<boolean>;
 
@@ -186,7 +182,7 @@ export interface CompletionStrategy {
    * 运行命令直到完成（用于初始化命令）
    */
   runCommandUntilCompletion(
-    terminal: vscode.Terminal,
+    session: IShellSession,
     command: string,
     description: string,
     eventName?: string,
@@ -205,8 +201,8 @@ export interface CompletionStrategy {
 export interface LongRunningTerminalInfo {
   /** 进程 ID */
   processId: number;
-  /** 终端实例 */
-  terminal: vscode.Terminal;
+  /** Shell 会话实例 */
+  session: IShellSession;
   /** 当前工作目录 */
   current_working_directory?: string;
 }

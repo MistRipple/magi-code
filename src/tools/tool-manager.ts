@@ -3,7 +3,7 @@
  * 管理所有工具源：MCP、内置工具
  *
  * 内置工具 (source: 'builtin'):
- * - launch-process/read-process/write-process/kill-process/list-processes: 终端运行时
+ * - shell: 终端命令执行（统一外显入口）
  * - file_view/file_create/file_edit/file_insert: 文件操作
  * - grep_search: 代码搜索
  * - file_remove: 文件删除
@@ -30,7 +30,8 @@ import {
   BUILTIN_TOOL_NAMES,
 } from './types';
 import { ToolCall, ToolResult, ToolDefinition, StandardizedToolResult } from '../llm/types';
-import { VSCodeTerminalExecutor } from './vscode-terminal-executor';
+import type { IShellExecutor } from './shell/types';
+import { NodeShellExecutor } from './shell';
 import { FileExecutor } from './file-executor';
 import { SearchExecutor } from './search-executor';
 import { RemoveFilesExecutor } from './remove-files-executor';
@@ -114,7 +115,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   private fileMutex = new FileMutex();
 
   // 内置工具执行器
-  private terminalExecutor: VSCodeTerminalExecutor;
+  private terminalExecutor: IShellExecutor;
   private fileExecutor: FileExecutor;
   private searchExecutor: SearchExecutor;
   private removeFilesExecutor: RemoveFilesExecutor;
@@ -153,7 +154,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     this.workspaceRoot = this.workspaceRoots.getPrimaryFolder().path;
 
     // 初始化所有内置执行器（共享 fileMutex 保证文件读写与终端命令的并发安全）
-    this.terminalExecutor = new VSCodeTerminalExecutor(this.fileMutex);
+    this.terminalExecutor = new NodeShellExecutor();
     this.fileExecutor = new FileExecutor(this.workspaceRoots, this.fileMutex);
     this.searchExecutor = new SearchExecutor(this.workspaceRoots);
     this.removeFilesExecutor = new RemoveFilesExecutor(this.workspaceRoots);
@@ -538,11 +539,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    * 内置工具别名映射（兼容不同命名风格，统一到规范名）
    */
   private readonly builtinToolAliases = new Map<string, string>([
-    ['launch_process', 'launch-process'],
-    ['read_process', 'read-process'],
-    ['write_process', 'write-process'],
-    ['kill_process', 'kill-process'],
-    ['list_processes', 'list-processes'],
     ['file-view', 'file_view'],
     ['file-create', 'file_create'],
     ['file-edit', 'file_edit'],
@@ -567,9 +563,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    * 只读查询类工具默认不弹授权，减少 Ask 模式噪音。
    */
   private readonly authorizationRequiredToolNames = new Set<string>([
-    'launch-process',
-    'write-process',
-    'kill-process',
+    'shell',
     'file_create',
     'file_edit',
     'file_insert',
@@ -727,6 +721,40 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       return this.lspExecutor.execute(normalizedToolCall);
     }
 
+    // process 原语仅在内部调用路径可达，不暴露为模型工具
+    switch (normalizedToolCall.name) {
+      case 'launch-process':
+        return this.standardizeToolResult(
+          normalizedToolCall,
+          await this.executeLaunchProcessTool(normalizedToolCall, signal),
+          'builtin'
+        );
+      case 'read-process':
+        return this.standardizeToolResult(
+          normalizedToolCall,
+          await this.executeReadProcessTool(normalizedToolCall, signal),
+          'builtin'
+        );
+      case 'write-process':
+        return this.standardizeToolResult(
+          normalizedToolCall,
+          await this.executeWriteProcessTool(normalizedToolCall),
+          'builtin'
+        );
+      case 'kill-process':
+        return this.standardizeToolResult(
+          normalizedToolCall,
+          await this.executeKillProcessTool(normalizedToolCall),
+          'builtin'
+        );
+      case 'list-processes':
+        return this.standardizeToolResult(
+          normalizedToolCall,
+          await this.executeListProcessesTool(normalizedToolCall),
+          'builtin'
+        );
+    }
+
     return this.execute(normalizedToolCall, signal);
   }
 
@@ -741,7 +769,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   ): ToolResult {
     const message = typeof raw.content === 'string' ? raw.content : String(raw.content ?? '');
     const parsedData = this.tryParseToolResultData(message);
-    const status = this.inferToolResultStatus(raw, message, parsedData);
+    const status = this.inferToolResultStatus(toolCall, raw, message, parsedData);
     const isError = status !== 'success';
     const standardized: StandardizedToolResult = {
       schemaVersion: 'tool-result.v1',
@@ -777,6 +805,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   }
 
   private inferToolResultStatus(
+    toolCall: ToolCall,
     raw: ToolResult,
     content: string,
     parsedData: unknown,
@@ -787,10 +816,21 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       : undefined;
     const parsedStatus = typeof parsed?.status === 'string' ? parsed.status.toLowerCase() : '';
 
+    // read-process 的职责是“读取终端状态/输出”，不是执行业务命令。
+    // 只要读取动作本身成功，就不应因被观察进程的失败状态而将工具结果标记为 error。
+    if (toolCall.name === 'read-process' && !raw.isError) {
+      return 'success';
+    }
+
     if (content.startsWith('Tool blocked:')) {
       return 'blocked';
     }
     if (content.startsWith('Command rejected:')) {
+      return 'rejected';
+    }
+    if (content.startsWith('read-process rejected:')
+      || content.startsWith('write-process rejected:')
+      || content.startsWith('kill-process rejected:')) {
       return 'rejected';
     }
     if (parsedStatus === 'blocked') {
@@ -892,20 +932,8 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     const { name } = toolCall;
 
     switch (name) {
-      case 'launch-process':
-        return await this.executeLaunchProcessTool(toolCall, signal);
-
-      case 'read-process':
-        return await this.executeReadProcessTool(toolCall, signal);
-
-      case 'write-process':
-        return await this.executeWriteProcessTool(toolCall);
-
-      case 'kill-process':
-        return await this.executeKillProcessTool(toolCall);
-
-      case 'list-processes':
-        return await this.executeListProcessesTool(toolCall);
+      case 'shell':
+        return await this.executeShellTool(toolCall, signal);
 
       case 'file_view':
       case 'file_create':
@@ -1006,13 +1034,8 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    * 检查工具权限
    */
   private checkPermission(toolName: string): { allowed: boolean; reason?: string } {
-    // 有副作用的终端工具需要 allowBash 权限
-    // 注意：read-process / list-processes 是只读操作，不需要 allowBash
-    if (
-      toolName === 'launch-process'
-      || toolName === 'write-process'
-      || toolName === 'kill-process'
-    ) {
+    // 终端命令工具需要 allowBash 权限
+    if (toolName === 'shell') {
       if (!this.permissions.allowBash) {
         return { allowed: false, reason: 'Terminal command execution is disabled' };
       }
@@ -1138,11 +1161,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       'file_insert': { category: 'File Operations', desc: 'Insert text at a specific line' },
       'file_remove': { category: 'File Operations', desc: 'Delete a file' },
       'grep_search': { category: 'File Operations', desc: 'Regex search through code content' },
-      'launch-process': { category: 'Terminal Commands', desc: 'Run build/test/server processes; also usable for batch file edits via sed/python/node scripts (prefer file_edit for single-file precise edits)' },
-      'read-process': { category: 'Terminal Commands', desc: 'Read terminal process output' },
-      'write-process': { category: 'Terminal Commands', desc: 'Write input to a running terminal' },
-      'kill-process': { category: 'Terminal Commands', desc: 'Terminate a terminal process' },
-      'list-processes': { category: 'Terminal Commands', desc: 'List all terminal processes' },
+      'shell': { category: 'Terminal Commands', desc: 'Run a shell command with live output streaming in a single tool call' },
       'web_search': { category: 'Web Tools', desc: 'Search the internet for information' },
       'web_fetch': { category: 'Web Tools', desc: 'Fetch URL page content' },
       'codebase_retrieval': { category: 'Code Intelligence', desc: 'Local semantic search across the codebase' },
@@ -1215,111 +1234,47 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   private getBuiltinTools(): ExtendedToolDefinition[] {
     const tools: ExtendedToolDefinition[] = [];
 
-    // 1-5. 终端运行时工具
+    // 1. 终端工具（单工具语义）
     const terminalTools: ToolDefinition[] = [
       {
-        name: 'launch-process',
-        description: `Launch a shell command in an agent-dedicated terminal. Terminal identity is auto-injected by the system.
+        name: 'shell',
+        description: `Run a shell command with live output streaming in a single tool call.
+
+Single-tool semantics:
+- You call shell once with command/cwd/wait/run_mode.
+- The system internally manages process lifecycle and incremental reads.
+- During execution, the same tool card streams output continuously.
 
 Process modes:
 - run_mode="task": one-shot command, terminal becomes reusable after completion.
-- run_mode="service": long-running background service, terminal is locked until kill-process.
-- run_mode="service" + wait=true: wait only for startup handshake (not process exit), then return running/ready state.
-- wait timeout or user interrupt only stops waiting; process keeps running unless kill-process is called.
-
-If run_mode is omitted, system defaults to:
-- wait=true => task
-- wait=false => service
-Additionally, long-running commands like dev/start/serve/watch may be auto-inferred as service to avoid accidental timeout-kill.
+- run_mode="service": long-running background service, terminal is locked until killed.
+- run_mode omitted: wait=true => task, wait=false => service.
 
 Tool selection guidance:
-- Single-file precise edits: prefer file_edit/file_insert (structured, reliable line anchoring)
-- Batch/repetitive multi-file changes: use launch-process with sed/python/node scripts (more efficient)
-- Full-file creation/overwrite: prefer file_create
-- Read files or browse directories: use file_view, NOT cat/head/tail
-- Search code content: use grep_search, NOT grep/rg
-- Search the web: use web_search, NOT curl
-- Fetch a URL: use web_fetch, NOT curl/wget
+- Single-file precise edits: prefer file_edit/file_insert.
+- Batch/repetitive multi-file edits: shell is allowed.
+- Read files/directories: use file_view, not cat/ls/find.
+- Search code: use grep_search or codebase_retrieval.
 
-Use launch-process for tasks that truly benefit from shell execution: build, test, lint, git, package manager, start server, database migration, or scripted bulk edits.
-
-Only set may_modify_files=true when the command directly modifies source files (sed -i, python scripts writing files, echo > file, etc.).
-Do NOT set it for read-only commands such as ls/cat/grep/git status/log/diff.
-After a mutating command, refresh each target file with file_view once before file_edit/file_insert (no need to repeatedly view the same file).`,
+Only set may_modify_files=true when the command directly writes source files.`,
         input_schema: {
           type: 'object',
           properties: {
-            command: { type: 'string', description: 'Shell command to execute (do not use cd in the command; pass the directory via the cwd parameter instead)' },
-            cwd: { type: 'string', description: 'Working directory for the command. Can be omitted in single-workspace setups (defaults to workspace root); must be explicitly specified as "<workspace-name>" or "<workspace-name>/relative-path" in multi-workspace setups' },
-            wait: { type: 'boolean', description: 'Whether to wait for the process to complete (default: true)' },
-            run_mode: { type: 'string', description: 'Execution mode: "task" (one-shot command) or "service" (long-running daemon). Default rules: wait=true -> task, wait=false -> service; long-running commands like dev/start/serve/watch are auto-inferred as service.', enum: ['task', 'service'] },
-            max_wait_seconds: { type: 'number', description: 'Idle timeout in seconds — if no output is produced within this duration, the wait is considered timed out (default: 30)' },
-            startup_wait_seconds: { type: 'number', description: 'Service mode only. When wait=true, the number of seconds to wait for the startup handshake (default: 5).' },
+            command: { type: 'string', description: 'Shell command to execute (do not use cd; pass directory with cwd)' },
+            cwd: { type: 'string', description: 'Working directory. In multi-workspace setups, use "<workspace-name>" or "<workspace-name>/relative-path"' },
+            wait: { type: 'boolean', description: 'Whether to wait for completion or startup window (default: true)' },
+            run_mode: { type: 'string', description: 'Execution mode: "task" or "service"', enum: ['task', 'service'] },
+            max_wait_seconds: { type: 'number', description: 'Idle timeout in seconds while waiting (default: 30)' },
+            startup_wait_seconds: { type: 'number', description: 'Service mode only: startup handshake wait seconds (default: 5)' },
             ready_patterns: {
               type: 'array',
-              description: 'Service mode only. Optional array of regex strings for ready-log detection; when matched, the phase transitions to ready.',
+              description: 'Service mode only: optional regex strings for ready detection',
               items: { type: 'string' },
             },
-            showTerminal: { type: 'boolean', description: 'Whether to show the terminal window (default: true)' },
-            may_modify_files: { type: 'boolean', description: 'Whether this command directly modifies source files that may be edited later. Set to true only when the command actually writes files; keep false for read-only commands like ls/cat/grep/git status. Default: false (the system also applies limited heuristic detection).' },
+            showTerminal: { type: 'boolean', description: 'Whether to show terminal window (default: true)' },
+            may_modify_files: { type: 'boolean', description: 'Set true only if command actually writes files (default: false)' },
           },
           required: ['command'],
-        },
-      },
-      {
-        name: 'read-process',
-        description: `Read terminal process output and status. Safe for long-running services — timeout only stops waiting, never kills the process.
-
-Usage patterns:
-- wait=false (default): return current output immediately, no blocking.
-- wait=true: block until process completes or idle timeout is reached. If the process is still running when timeout fires, returns status="running" with current output — the process keeps running.
-- from_cursor: optional incremental read cursor. Use previous next_cursor to fetch only newly appended output.
-
-Typical workflow for background services:
-  1. launch-process("npm run dev", run_mode="service", wait=false) → terminal_id=1
-  2. read-process(terminal_id=1, wait=true, max_wait_seconds=5) → check startup logs
-  3. read-process(terminal_id=1, from_cursor=<next_cursor>) → read incremental logs.`,
-        input_schema: {
-          type: 'object',
-          properties: {
-            terminal_id: { type: 'number', description: 'terminal_id (from launch-process)' },
-            wait: { type: 'boolean', description: 'Whether to wait for status change (default: false)' },
-            max_wait_seconds: { type: 'number', description: 'Idle timeout in seconds — if no output is produced within this duration, the wait is considered timed out (default: 30)' },
-            from_cursor: { type: 'number', description: 'Incremental read cursor. Pass the previous next_cursor value to read only newly appended output.' },
-          },
-          required: ['terminal_id'],
-        },
-      },
-      {
-        name: 'write-process',
-        description: `Write text to a running terminal process stdin. After writing, use read-process to see the response.
-Only works when the process is in "running" state; returns accepted=false otherwise.`,
-        input_schema: {
-          type: 'object',
-          properties: {
-            terminal_id: { type: 'number', description: 'terminal_id (from launch-process)' },
-            input_text: { type: 'string', description: 'Text to write to the terminal' },
-          },
-          required: ['terminal_id', 'input_text'],
-        },
-      },
-      {
-        name: 'kill-process',
-        description: 'Terminate a terminal process by sending SIGINT and disposing the terminal. For service mode this also releases terminal lock.',
-        input_schema: {
-          type: 'object',
-          properties: {
-            terminal_id: { type: 'number', description: 'terminal_id (from launch-process)' },
-          },
-          required: ['terminal_id'],
-        },
-      },
-      {
-        name: 'list-processes',
-        description: 'List all terminal process records with their current status, command, working directory, and elapsed time. Use this to check which processes are still running.',
-        input_schema: {
-          type: 'object',
-          properties: {},
         },
       },
     ];
@@ -1768,6 +1723,14 @@ Only works when the process is in "running" state; returns accepted=false otherw
     }
   }
 
+  private async executeShellTool(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
+    const launchCall: ToolCall = {
+      ...toolCall,
+      name: 'launch-process',
+    };
+    return this.executeLaunchProcessTool(launchCall, signal);
+  }
+
   private async executeLaunchProcessTool(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     const args = toolCall.arguments as any;
     const {
@@ -1892,7 +1855,11 @@ Only works when the process is in "running" state; returns accepted=false otherw
         command: normalized.command,
       }, LogCategory.TOOLS);
     }
-    const effectiveWait = wait;
+    // 终端命令执行前等待文件写锁释放，避免读到未落盘的改动
+    await this.fileMutex.waitForAll();
+
+    // task 模式统一快返，由适配器通过 read-process 自动轮询推送增量输出
+    const effectiveWait = runMode === 'service' ? wait : false;
     const result = await this.terminalExecutor.launchProcess({
       command: normalized.command,
       cwd: resolvedCwd,
@@ -1970,13 +1937,11 @@ Only works when the process is in "running" state; returns accepted=false otherw
     }
 
     const result = await this.terminalExecutor.readProcess(terminal_id, wait, max_wait_seconds, from_cursor, signal);
-    const hasFailureStatus = result.status === 'failed' || result.status === 'killed' || result.status === 'timeout';
-    const hasNonZeroExit = result.return_code !== null && result.return_code !== 0;
-    const isError = hasFailureStatus || hasNonZeroExit;
     return {
       toolCallId: toolCall.id,
       content: JSON.stringify(result),
-      isError,
+      // read-process 成功返回了读取结果，不因被观察进程状态而将本次工具调用判错。
+      isError: false,
     };
   }
 

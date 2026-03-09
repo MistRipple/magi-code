@@ -459,6 +459,8 @@ export type WebviewToExtensionMessage =
   | { type: 'pauseTask'; taskId: string }
   | { type: 'resumeTask'; taskId: string }
   | { type: 'appendMessage'; taskId: string; content: string }
+  | { type: 'updateQueuedMessage'; queueId: string; content: string }
+  | { type: 'deleteQueuedMessage'; queueId: string }
   | { type: 'approveChange'; filePath: string }
   | { type: 'revertChange'; filePath: string }
   | { type: 'approveAllChanges' }

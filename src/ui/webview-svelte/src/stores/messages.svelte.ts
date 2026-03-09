@@ -21,10 +21,12 @@ import type {
   RequestResponseBinding,
   ModelStatusMap,
   Task,
+  QueuedMessage,
 } from '../types/message';
 import { vscode } from '../lib/vscode-bridge';
 import { ensureArray } from '../lib/utils';
 import { i18n } from './i18n.svelte';
+import { terminalSessions } from './terminal-sessions.svelte';
 
 // ============ 状态定义 ============
 // 🔧 修复：使用对象属性模式确保跨模块响应式正常工作
@@ -54,6 +56,7 @@ export const messagesState = $state({
   // 会话状态
   sessions: [] as Session[],
   currentSessionId: null as string | null,
+  queuedMessages: [] as QueuedMessage[],
 
   // 处理状态
   isProcessing: false,
@@ -110,7 +113,29 @@ function hasInvalidMessageSource(messages: Message[]): boolean {
 // 新增状态：任务、变更、阶段、Toast、模型状态
 let tasks = $state<Task[]>([]);
 let edits = $state<Array<{ filePath: string; snapshotId?: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string; missionId?: string }>>([]);
-let toasts = $state<Array<{ id: string; type: string; title?: string; message: string }>>([]);
+
+export type ToastCategory = 'incident' | 'audit' | 'feedback';
+export type NotificationCategory = 'incident' | 'audit';
+
+export interface ToastOptions {
+  category?: ToastCategory;
+  source?: string;
+  actionRequired?: boolean;
+  persistToCenter?: boolean;
+  countUnread?: boolean;
+}
+
+interface ToastRecord {
+  id: string;
+  type: string;
+  title?: string;
+  message: string;
+  category: ToastCategory;
+  source?: string;
+  actionRequired?: boolean;
+}
+
+let toasts = $state<ToastRecord[]>([]);
 
 // 通知历史（持久化在会话内，不自动消失）
 export interface Notification {
@@ -118,6 +143,9 @@ export interface Notification {
   type: string;
   title?: string;
   message: string;
+  category: NotificationCategory;
+  source?: string;
+  actionRequired?: boolean;
   timestamp: number;
   read: boolean;
 }
@@ -237,7 +265,7 @@ function normalizeMissionPlan(plan: MissionPlan | null): MissionPlan | null {
 }
 
 // 交互请求状态
-let pendingConfirmation = $state<{ plan: unknown; formattedPlan?: string } | null>(null);
+let pendingConfirmation = $state<{ plan: unknown; formattedPlan?: string; forceManual?: boolean } | null>(null);
 let pendingRecovery = $state<{ taskId: string; error: unknown; canRetry: boolean; canRollback: boolean } | null>(null);
 let pendingClarification = $state<{ questions: string[]; context?: string; ambiguityScore?: number; originalPrompt?: string } | null>(null);
 let pendingWorkerQuestion = $state<{ workerId: string; question: string; context?: string; options?: unknown } | null>(null);
@@ -293,6 +321,10 @@ export function getSessions() {
 
 export function getCurrentSessionId() {
   return messagesState.currentSessionId;
+}
+
+export function getQueuedMessages() {
+  return messagesState.queuedMessages;
 }
 
 export function getAppState() {
@@ -351,7 +383,11 @@ function scheduleInteractionModeSyncTimeout(expectedMode: 'ask' | 'auto') {
   interactionModeSyncTimer = setTimeout(() => {
     if (requestedInteractionMode === expectedMode) {
       requestedInteractionMode = null;
-      addToast('warning', i18n.t('messageHandler.interactionModeSyncTimeout'));
+      addToast('warning', i18n.t('messageHandler.interactionModeSyncTimeout'), undefined, {
+        category: 'audit',
+        source: 'interaction-mode',
+        countUnread: false,
+      });
     }
     interactionModeSyncTimer = null;
   }, INTERACTION_MODE_SYNC_TIMEOUT_MS);
@@ -433,6 +469,8 @@ export function getState() {
     get agentOutputs() { return messagesState.agentOutputs; },
     get sessions() { return messagesState.sessions; },
     get currentSessionId() { return messagesState.currentSessionId; },
+    get queuedMessages() { return messagesState.queuedMessages; },
+    set queuedMessages(v) { messagesState.queuedMessages = ensureArray<QueuedMessage>(v) as QueuedMessage[]; },
     get isProcessing() { return messagesState.isProcessing; },
     get thinkingStartAt() { return messagesState.thinkingStartAt; },
     get processingActor() { return messagesState.processingActor; },
@@ -556,6 +594,30 @@ export function updateSessions(newSessions: Session[]) {
       return true;
     });
   saveWebviewState();
+}
+
+export function setQueuedMessages(newQueuedMessages: QueuedMessage[]) {
+  const seen = new Set<string>();
+  messagesState.queuedMessages = ensureArray<QueuedMessage>(newQueuedMessages)
+    .filter((item): item is QueuedMessage => (
+      !!item
+      && typeof item === 'object'
+      && typeof item.id === 'string'
+      && item.id.trim().length > 0
+      && typeof item.content === 'string'
+      && typeof item.createdAt === 'number'
+      && Number.isFinite(item.createdAt)
+    ))
+    .filter((item) => {
+      if (seen.has(item.id)) return false;
+      seen.add(item.id);
+      return true;
+    })
+    .map((item) => ({
+      id: item.id,
+      content: item.content,
+      createdAt: item.createdAt,
+    }));
 }
 
 // 处理状态操作
@@ -771,22 +833,64 @@ export function clearPendingInteractions() {
   pendingToolAuthorization = null;
 }
 
-export function addToast(type: string, message: string, title?: string) {
+function recomputeUnreadNotificationCount() {
+  unreadNotificationCount = notifications.filter((n) => !n.read).length;
+}
+
+function resolveToastPolicy(options?: ToastOptions): {
+  category: ToastCategory;
+  persistToCenter: boolean;
+  countUnread: boolean;
+  source?: string;
+  actionRequired?: boolean;
+} {
+  const category = options?.category ?? 'feedback';
+  const defaultPersistToCenter = category !== 'feedback';
+  const persistToCenter = options?.persistToCenter ?? defaultPersistToCenter;
+  const defaultCountUnread = category === 'incident';
+  const countUnread = persistToCenter ? (options?.countUnread ?? defaultCountUnread) : false;
+  const actionRequired = options?.actionRequired ?? (category === 'incident');
+  return {
+    category,
+    persistToCenter,
+    countUnread,
+    source: options?.source,
+    actionRequired,
+  };
+}
+
+export function addToast(type: string, message: string, title?: string, options?: ToastOptions) {
+  const policy = resolveToastPolicy(options);
   const id = `toast_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-  const toast = { id, type, title, message };
+  const toast: ToastRecord = {
+    id,
+    type,
+    title,
+    message,
+    category: policy.category,
+    source: policy.source,
+    actionRequired: policy.actionRequired,
+  };
   toasts = [...toasts, toast];
 
-  // 同步归档到通知历史
+  if (!policy.persistToCenter || policy.category === 'feedback') {
+    return;
+  }
+
+  // 仅归档高价值通知到通知历史
   const notification: Notification = {
     id,
     type,
     title,
     message,
+    category: policy.category,
+    source: policy.source,
+    actionRequired: policy.actionRequired,
     timestamp: Date.now(),
-    read: false,
+    read: !policy.countUnread,
   };
   notifications = [notification, ...notifications];
-  unreadNotificationCount = notifications.filter(n => !n.read).length;
+  recomputeUnreadNotificationCount();
 }
 
 export function getNotifications() {
@@ -809,7 +913,7 @@ export function clearAllNotifications() {
 
 export function removeNotification(id: string) {
   notifications = notifications.filter(n => n.id !== id);
-  unreadNotificationCount = notifications.filter(n => !n.read).length;
+  recomputeUnreadNotificationCount();
 }
 
 export function getActiveInteractionType(): string | null {
@@ -975,18 +1079,21 @@ export function clearAllMessages() {
     codex: [],
     gemini: [],
   };
+  messagesState.queuedMessages = [];
   messagesState.messageJump = {
     messageId: null,
     nonce: messagesState.messageJump.nonce,
   };
   clearPendingInteractions();
   clearProcessingState();
+  terminalSessions.clear();
   saveWebviewState();
 }
 
 // 设置完整的消息列表（用于会话切换时加载历史）
 export function setThreadMessages(messages: Message[]) {
   messagesState.threadMessages = normalizePersistedMessages(messages).map(m => JSON.parse(JSON.stringify(m)) as Message);
+  terminalSessions.clear();
   saveWebviewState();
 }
 

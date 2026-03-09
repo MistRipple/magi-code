@@ -64,8 +64,9 @@ export interface LLMConfig {
    * - 'low': 低推理强度，速度快
    * - 'medium': 中等推理强度（默认）
    * - 'high': 高推理强度，质量高
+   * - 'xhigh': 超高推理强度（适用于支持扩展档位的 OpenAI 兼容端点）
    */
-  reasoningEffort?: 'low' | 'medium' | 'high';
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
 }
 
 /**
