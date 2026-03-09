@@ -12,9 +12,15 @@
   const appState = getState();
 
   let panelOpen = $state(false);
+  let activeFilter = $state<'all' | 'incident' | 'audit'>('all');
 
   const notifications = $derived(appState.notifications as Notification[]);
   const unreadCount = $derived(appState.unreadNotificationCount as number);
+  const filteredNotifications = $derived(
+    activeFilter === 'all'
+      ? notifications
+      : notifications.filter((notif) => notif.category === activeFilter)
+  );
 
   function togglePanel() {
     panelOpen = !panelOpen;
@@ -38,6 +44,11 @@
   function formatTime(timestamp: number): string {
     const d = new Date(timestamp);
     return d.toLocaleTimeString(i18n.locale, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+
+  function getCategoryLabel(category: 'incident' | 'audit'): string {
+    if (category === 'incident') return i18n.t('notification.categoryIncident');
+    return i18n.t('notification.categoryAudit');
   }
 
   function getTypeIcon(type: string): 'check' | 'close' | 'warning' | 'info' {
@@ -73,14 +84,27 @@
           </button>
         </div>
       </div>
+      {#if notifications.length > 0}
+        <div class="panel-filter">
+          <button class="filter-btn" class:active={activeFilter === 'all'} onclick={() => activeFilter = 'all'}>
+            {i18n.t('notification.filterAll')}
+          </button>
+          <button class="filter-btn" class:active={activeFilter === 'incident'} onclick={() => activeFilter = 'incident'}>
+            {i18n.t('notification.filterIncident')}
+          </button>
+          <button class="filter-btn" class:active={activeFilter === 'audit'} onclick={() => activeFilter = 'audit'}>
+            {i18n.t('notification.filterAudit')}
+          </button>
+        </div>
+      {/if}
       <div class="notification-list">
-        {#if notifications.length === 0}
+        {#if filteredNotifications.length === 0}
           <div class="empty-state">
             <Icon name="bell" size={24} />
-            <span>{i18n.t('notification.empty')}</span>
+            <span>{activeFilter === 'all' ? i18n.t('notification.empty') : i18n.t('notification.emptyFiltered')}</span>
           </div>
         {:else}
-          {#each notifications as notif (notif.id)}
+          {#each filteredNotifications as notif (notif.id)}
             <div class="notification-item type-{notif.type}">
               <div class="notif-icon">
                 <Icon name={getTypeIcon(notif.type)} size={14} />
@@ -90,7 +114,10 @@
                   <div class="notif-title">{notif.title}</div>
                 {/if}
                 <div class="notif-message">{notif.message}</div>
-                <div class="notif-time">{formatTime(notif.timestamp)}</div>
+                <div class="notif-meta">
+                  <span class="notif-category">{getCategoryLabel(notif.category)}</span>
+                  <span class="notif-time">{formatTime(notif.timestamp)}</span>
+                </div>
               </div>
               <button class="notif-remove" onclick={() => handleRemove(notif.id)} title={i18n.t('notification.removeTitle')}>
                 <Icon name="close" size={10} />
@@ -176,6 +203,37 @@
     gap: var(--space-2, 4px);
   }
 
+  .panel-filter {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2, 4px);
+    padding: var(--space-2, 6px) var(--space-3, 8px);
+    border-bottom: 1px solid var(--border, #454545);
+    flex-shrink: 0;
+  }
+
+  .filter-btn {
+    border: 1px solid var(--border, #454545);
+    background: var(--surface, rgba(255,255,255,0.03));
+    color: var(--foreground-muted, #999);
+    border-radius: 999px;
+    font-size: var(--text-xs, 11px);
+    padding: 3px 8px;
+    cursor: pointer;
+    transition: all var(--transition-fast, 0.15s);
+  }
+
+  .filter-btn:hover {
+    color: var(--foreground, #ccc);
+    border-color: var(--foreground-muted, #999);
+  }
+
+  .filter-btn.active {
+    color: var(--foreground, #ddd);
+    background: var(--surface-hover, rgba(255,255,255,0.08));
+    border-color: var(--foreground-muted, #999);
+  }
+
   .btn-text {
     background: transparent;
     border: none;
@@ -256,10 +314,26 @@
     word-break: break-word;
   }
 
+  .notif-meta {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2, 4px);
+    margin-top: 4px;
+  }
+
+  .notif-category {
+    font-size: 10px;
+    color: var(--foreground-muted, #999);
+    border: 1px solid var(--border, #454545);
+    border-radius: 999px;
+    padding: 1px 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
   .notif-time {
     font-size: var(--text-xs, 11px);
     color: var(--foreground-muted, #777);
-    margin-top: 4px;
   }
 
   .notif-remove {
@@ -288,4 +362,3 @@
     color: var(--foreground, #ccc);
   }
 </style>
-

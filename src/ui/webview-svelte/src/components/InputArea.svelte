@@ -5,7 +5,7 @@
     addToast,
     getActiveInteractionType,
     getInteractionMode,
-    getRequestedInteractionMode,
+    getQueuedMessages,
     isInteractionModeSyncing,
     requestInteractionMode,
     messagesState,
@@ -24,13 +24,57 @@
     userInvocable?: boolean;
   }
 
+  interface SelectedImage {
+    id: string;
+    dataUrl: string;
+    name: string;
+  }
+
   // 输入内容
   let inputValue = $state('');
 
   // 模式选择
   const interactionMode = $derived.by(() => getInteractionMode());
-  const requestedInteractionMode = $derived.by(() => getRequestedInteractionMode());
   const isModeSyncing = $derived.by(() => isInteractionModeSyncing());
+
+  type InteractionPreset = 'fast' | 'stable' | 'review' | 'custom';
+  type BuiltinPreset = Exclude<InteractionPreset, 'custom'>;
+  interface PresetConfig {
+    mode: 'ask' | 'auto';
+    deepTask: boolean;
+    labelKey: string;
+    descriptionKey: string;
+    icon: 'zap' | 'shield' | 'check';
+  }
+
+  const PRESET_CONFIGS: Record<BuiltinPreset, PresetConfig> = {
+    fast: {
+      mode: 'auto',
+      deepTask: false,
+      labelKey: 'input.preset.fast.name',
+      descriptionKey: 'input.preset.fast.desc',
+      icon: 'zap',
+    },
+    stable: {
+      mode: 'auto',
+      deepTask: true,
+      labelKey: 'input.preset.stable.name',
+      descriptionKey: 'input.preset.stable.desc',
+      icon: 'shield',
+    },
+    review: {
+      mode: 'ask',
+      deepTask: true,
+      labelKey: 'input.preset.review.name',
+      descriptionKey: 'input.preset.review.desc',
+      icon: 'check',
+    },
+  };
+  const PRESET_OPTIONS: Array<{ key: BuiltinPreset; config: PresetConfig }> = [
+    { key: 'fast', config: PRESET_CONFIGS.fast },
+    { key: 'stable', config: PRESET_CONFIGS.stable },
+    { key: 'review', config: PRESET_CONFIGS.review },
+  ];
 
   // 技能下拉列表状态
   let skillDropdownOpen = $state(false);
@@ -61,12 +105,13 @@
 
   // 深度任务模式
   let deepTaskEnabled = $state(false);
+  const currentPreset = $derived.by(() => resolvePreset(interactionMode, deepTaskEnabled));
 
   // 增强按钮状态
   let isEnhancing = $state(false);
 
   // 🔧 图片上传相关状态
-  let selectedImages = $state<Array<{ id: string; dataUrl: string; name: string }>>([]);
+  let selectedImages = $state<SelectedImage[]>([]);
   const MAX_IMAGES = 5;  // 最多支持 5 张图片
   const MAX_IMAGE_SIZE = 10 * 1024 * 1024;  // 单张图片最大 10MB
 
@@ -74,7 +119,14 @@
   const isSending = $derived(messagesState.isProcessing);
   const activeInteraction = $derived.by(() => getActiveInteractionType());
   const isInteractionBlocking = $derived.by(() => Boolean(activeInteraction));
+  const queuedMessages = $derived.by(() => getQueuedMessages());
   const MAX_INPUT_CHARS = 10000;
+  let activeQueueMenu = $state<{ queueId: string; left: number; top: number } | null>(null);
+  let inputTextareaEl = $state<HTMLTextAreaElement | null>(null);
+  const activeQueueMenuTarget = $derived.by(() => {
+    if (!activeQueueMenu) return null;
+    return queuedMessages.find((item) => item.id === activeQueueMenu.queueId) || null;
+  });
 
   // 按钮双态状态 - 使用 $derived 计算
   const hasContent = $derived.by(() => {
@@ -91,7 +143,7 @@
   const RATE_LIMIT_PROCESSING = 1000;  // 执行中：1 秒
 
   // 发送消息（支持图片附件）
-  // 执行中发送输入 = 补充指令（默认在下一决策点生效）
+  // 执行中发送输入 = 暂存队列（当前轮结束后 FIFO 自动续跑）
   function sendMessage() {
     if (isModeSyncing) {
       addToast('warning', i18n.t('input.modeSyncNotReady'));
@@ -122,9 +174,9 @@
       return;
     }
 
-    // 根据是否正在执行，区分发送新任务还是追加补充指令
+    // 根据是否正在执行，区分发送新任务还是加入暂存队列
     if (isSending) {
-      // 执行中：发送补充指令（后端在下一决策点注入）
+      // 执行中：加入暂存队列（后端在当前轮结束后自动续跑）
       // 注意：执行中暂不支持图片
       if (selectedImages.length > 0) {
         addToast('warning', i18n.t('input.noImageDuringExecution'));
@@ -171,6 +223,62 @@
     vscode.postMessage({ type: 'interruptTask' });
   }
 
+  function closeQueueMenu() {
+    activeQueueMenu = null;
+  }
+
+  function focusInputTextareaToEnd() {
+    requestAnimationFrame(() => {
+      inputTextareaEl?.focus();
+      const length = inputTextareaEl?.value.length || 0;
+      inputTextareaEl?.setSelectionRange(length, length);
+    });
+  }
+
+  function toggleQueueMenu(queueId: string, event: MouseEvent) {
+    if (activeQueueMenu?.queueId === queueId) {
+      closeQueueMenu();
+      return;
+    }
+    const trigger = event.currentTarget as HTMLElement | null;
+    if (!trigger) return;
+    const rect = trigger.getBoundingClientRect();
+    const menuWidth = 132;
+    const menuHeight = 72;
+    let left = rect.right + 8;
+    if (left + menuWidth > window.innerWidth - 8) {
+      left = Math.max(8, rect.left - menuWidth - 8);
+    }
+    let top = rect.top;
+    if (top + menuHeight > window.innerHeight - 8) {
+      top = Math.max(8, window.innerHeight - menuHeight - 8);
+    }
+    activeQueueMenu = { queueId, left, top };
+  }
+
+  function startEditQueuedMessage(queueId: string) {
+    const target = queuedMessages.find((item) => item.id === queueId);
+    if (!target) return;
+    inputValue = target.content;
+    selectedSkill = null;
+    selectedImages = [];
+    closeSkillDropdown();
+    vscode.postMessage({
+      type: 'deleteQueuedMessage',
+      queueId,
+    });
+    closeQueueMenu();
+    focusInputTextareaToEnd();
+  }
+
+  function deleteQueuedMessage(queueId: string) {
+    vscode.postMessage({
+      type: 'deleteQueuedMessage',
+      queueId,
+    });
+    closeQueueMenu();
+  }
+
   // 增强提示词 - 直接替换输入框内容
   function enhancePrompt() {
     const content = inputValue.trim();
@@ -179,22 +287,37 @@
     vscode.postMessage({ type: 'enhancePrompt', prompt: content });
   }
 
-  // 切换模式
-  function setMode(mode: 'ask' | 'auto') {
-    if (isModeSyncing && requestedInteractionMode === mode) {
-      return;
-    }
-    requestInteractionMode(mode);
-    vscode.postMessage({ type: 'setInteractionMode', mode });
+  function resolvePreset(mode: 'ask' | 'auto', deepTask: boolean): InteractionPreset {
+    if (mode === 'auto' && !deepTask) return 'fast';
+    if (mode === 'auto' && deepTask) return 'stable';
+    if (mode === 'ask' && deepTask) return 'review';
+    return 'custom';
   }
 
-  // 切换深度任务模式
-  function toggleDeepTask() {
-    deepTaskEnabled = !deepTaskEnabled;
-    vscode.postMessage({ type: 'updateSetting', key: 'deepTask', value: deepTaskEnabled });
-    addToast('info', deepTaskEnabled
-      ? i18n.t('input.deepModeEnabled')
-      : i18n.t('input.deepModeDisabled'));
+  function applyPreset(preset: BuiltinPreset) {
+    if (isModeSyncing) {
+      addToast('warning', i18n.t('input.modeSyncNotReady'));
+      return;
+    }
+
+    const target = PRESET_CONFIGS[preset];
+    const needModeChange = interactionMode !== target.mode;
+    const needDeepTaskChange = deepTaskEnabled !== target.deepTask;
+    if (!needModeChange && !needDeepTaskChange) {
+      return;
+    }
+
+    if (needModeChange) {
+      requestInteractionMode(target.mode);
+      vscode.postMessage({ type: 'setInteractionMode', mode: target.mode });
+    }
+
+    if (needDeepTaskChange) {
+      deepTaskEnabled = target.deepTask;
+      vscode.postMessage({ type: 'updateSetting', key: 'deepTask', value: target.deepTask });
+    }
+
+    addToast('info', i18n.t('input.presetApplied', { preset: i18n.t(target.labelKey) }));
   }
 
   // 拖动调整大小
@@ -240,12 +363,7 @@
     selectedSkill = skill;
     closeSkillDropdown();
     // 聚焦输入框
-    requestAnimationFrame(() => {
-      const textarea = document.querySelector('.ia-textarea') as HTMLTextAreaElement;
-      if (textarea) {
-        textarea.focus();
-      }
-    });
+    focusInputTextareaToEnd();
   }
 
   // 清除技能徽章
@@ -307,6 +425,11 @@
   }
 
   onMount(() => {
+    const handleViewportChanged = () => {
+      closeQueueMenu();
+    };
+    window.addEventListener('resize', handleViewportChanged);
+    window.addEventListener('scroll', handleViewportChanged, true);
     const unsubscribe = vscode.onMessage((msg) => {
       if (msg.type !== 'unifiedMessage') return;
       const standard = msg.message as StandardMessage;
@@ -343,11 +466,45 @@
     });
     // 初始化时请求 deepTask 状态
     vscode.postMessage({ type: 'getDeepTaskState' });
-    return () => unsubscribe();
+    return () => {
+      unsubscribe();
+      window.removeEventListener('resize', handleViewportChanged);
+      window.removeEventListener('scroll', handleViewportChanged, true);
+    };
   });
 </script>
 
 <div class="ia-container">
+  {#if queuedMessages.length > 0}
+    <div class="ia-queue-panel">
+      <div class="ia-queue-header">
+        <span class="ia-queue-header-title">
+          <Icon name="clock" size={12} />
+          <span>{i18n.t('input.queue.banner')}</span>
+        </span>
+        <span class="ia-queue-header-count">{queuedMessages.length}</span>
+      </div>
+      <div class="ia-queue-list">
+        {#each queuedMessages as queued, index (queued.id)}
+          <div class="ia-queue-item">
+            <span class="ia-queue-index">{index + 1}</span>
+            <div class="ia-queue-content" title={queued.content}>{queued.content}</div>
+            <div class="ia-queue-ops">
+              <button
+                class="ia-queue-menu-trigger"
+                onclick={(event) => toggleQueueMenu(queued.id, event)}
+                title={i18n.t('input.queue.more')}
+                aria-label={i18n.t('input.queue.more')}
+              >
+                <Icon name="more-horizontal" size={12} />
+              </button>
+            </div>
+          </div>
+        {/each}
+      </div>
+    </div>
+  {/if}
+
   <div class="ia-wrapper" style="min-height: {inputHeight}px">
     <!-- 拖动调整大小 -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -369,6 +526,7 @@
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <textarea
       bind:value={inputValue}
+      bind:this={inputTextareaEl}
       class="ia-textarea"
       class:has-images={selectedImages.length > 0}
       class:has-badge={!!selectedSkill}
@@ -403,7 +561,11 @@
       <div class="ia-left">
         <!-- 技能下拉选择器 -->
         <div class="ia-skill-wrap">
-          <button class="ia-icon-btn" onclick={toggleSkillDropdown} title={i18n.t('input.useSkill')}>
+          <button
+            class="ia-icon-btn"
+            onclick={toggleSkillDropdown}
+            title={i18n.t('input.useSkill')}
+          >
             <Icon name="skill" size={14} />
           </button>
           {#if skillDropdownOpen}
@@ -440,37 +602,25 @@
           {/if}
         </div>
 
-        <!-- 模式开关（滑块 Toggle） -->
-        <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-        <div
-          class="ia-toggle"
-          class:auto={interactionMode === 'auto'}
-          class:syncing={isModeSyncing}
-          role="switch"
-          aria-checked={interactionMode === 'auto'}
-          tabindex="0"
-          onclick={() => setMode(interactionMode === 'ask' ? 'auto' : 'ask')}
-          onkeydown={(e) => e.key === 'Enter' && setMode(interactionMode === 'ask' ? 'auto' : 'ask')}
-          title={isModeSyncing ? i18n.t('input.modeSwitching') : (interactionMode === 'ask' ? i18n.t('input.currentAskMode') : i18n.t('input.currentAutoMode'))}
-        >
-          <span class="ia-toggle-label ask" class:active={interactionMode === 'ask'}>{i18n.t('input.mode.ask')}</span>
-          <span class="ia-toggle-label auto" class:active={interactionMode === 'auto'}>{i18n.t('input.mode.auto')}</span>
-          <span class="ia-toggle-thumb" class:syncing={isModeSyncing}></span>
+        <div class="ia-preset-wrap">
+          <div class="ia-preset" role="group" aria-label={i18n.t('input.preset.groupLabel')}>
+            {#each PRESET_OPTIONS as option (option.key)}
+              <button
+                class="ia-preset-btn"
+                class:active={currentPreset === option.key}
+                onclick={() => applyPreset(option.key)}
+                title={i18n.t(option.config.descriptionKey)}
+                disabled={isModeSyncing}
+              >
+                <Icon name={option.config.icon} size={10} />
+                <span>{i18n.t(option.config.labelKey)}</span>
+              </button>
+            {/each}
+          </div>
+          {#if currentPreset === 'custom'}
+            <span class="ia-preset-meta">{i18n.t('input.preset.custom.desc')}</span>
+          {/if}
         </div>
-
-        <!-- 深度任务模式开关 -->
-        <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-        <button
-          class="ia-deep-btn"
-          class:active={deepTaskEnabled}
-          onclick={toggleDeepTask}
-          title={deepTaskEnabled
-            ? i18n.t('input.deepModeActive')
-            : i18n.t('input.deepModeInactive')}
-        >
-          <Icon name="infinity" size={12} />
-          <span class="ia-deep-label">{i18n.t('input.deepLabel')}</span>
-        </button>
       </div>
 
       <div class="ia-right">
@@ -487,7 +637,6 @@
           </span>
         </button>
 
-        <!-- 发送 / 停止（互斥，同一位置） -->
         {#if hasContent}
           <!-- 有内容：显示发送按钮 -->
           <button
@@ -516,6 +665,24 @@
       </div>
     </div>
   </div>
+
+  {#if activeQueueMenu && activeQueueMenuTarget}
+    <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
+    <div class="ia-queue-menu-backdrop" role="presentation" onclick={closeQueueMenu}></div>
+    <div
+      class="ia-queue-floating-menu"
+      style="left: {activeQueueMenu.left}px; top: {activeQueueMenu.top}px;"
+    >
+      <button class="ia-queue-menu-item" onclick={() => startEditQueuedMessage(activeQueueMenu.queueId)}>
+        <Icon name="edit" size={10} />
+        <span>{i18n.t('input.queue.edit')}</span>
+      </button>
+      <button class="ia-queue-menu-item danger" onclick={() => deleteQueuedMessage(activeQueueMenu.queueId)}>
+        <Icon name="trash" size={10} />
+        <span>{i18n.t('input.queue.delete')}</span>
+      </button>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -525,9 +692,13 @@
      前缀: ia-
      ============================================ */
   .ia-container {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
     flex-shrink: 0;
     padding: var(--space-2) var(--space-3);
     background: var(--background);
+    position: relative;
   }
 
   .ia-wrapper {
@@ -775,64 +946,23 @@
     font-size: 11px;
   }
 
-  /* 模式开关（滑块 Toggle） */
-  .ia-toggle {
-    position: relative;
+  /* 执行预设（Fast / Stable / Review） */
+  .ia-preset-wrap {
+    display: inline-flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .ia-preset {
     display: inline-flex;
     align-items: center;
-    width: 72px;
-    height: 24px;
-    background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: var(--radius-full);
-    cursor: pointer;
-    user-select: none;
-    flex-shrink: 0;
-    transition: border-color var(--transition-fast);
-  }
-  .ia-toggle:hover { border-color: var(--foreground-muted); }
-  .ia-toggle.syncing { border-color: var(--warning); }
-
-  .ia-toggle-label {
-    position: relative;
-    z-index: 1;
-    flex: 1;
-    text-align: center;
-    font-size: 10px;
-    font-weight: var(--font-semibold);
-    letter-spacing: 0.02em;
-    color: var(--foreground-muted);
-    transition: color var(--transition-fast);
-    pointer-events: none;
-    line-height: 22px;
-  }
-  .ia-toggle-label.active { color: white; }
-
-  .ia-toggle-thumb {
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    width: calc(50% - 3px);
-    height: calc(100% - 4px);
-    background: var(--primary);
-    border-radius: var(--radius-full);
-    transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-    pointer-events: none;
-  }
-  .ia-toggle.auto .ia-toggle-thumb {
-    transform: translateX(calc(100% + 2px));
-  }
-  .ia-toggle-thumb.syncing {
-    background: var(--warning);
-    animation: ia-thumb-pulse 0.8s ease-in-out infinite;
-  }
-  @keyframes ia-thumb-pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
+    overflow: hidden;
+    background: var(--surface-2);
   }
 
-  /* 深度任务模式按钮 */
-  .ia-deep-btn {
+  .ia-preset-btn {
     display: inline-flex;
     align-items: center;
     gap: 3px;
@@ -840,26 +970,39 @@
     padding: 0 8px;
     font-size: 10px;
     font-weight: var(--font-semibold);
+    border: none;
     background: transparent;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-full);
     color: var(--foreground-muted);
     cursor: pointer;
-    user-select: none;
-    flex-shrink: 0;
-    transition: all var(--transition-fast);
+    transition: background var(--transition-fast), color var(--transition-fast);
     white-space: nowrap;
   }
-  .ia-deep-btn:hover { border-color: var(--foreground-muted); color: var(--foreground); }
-  .ia-deep-btn.active {
-    background: color-mix(in srgb, var(--primary) 15%, transparent);
-    border-color: var(--primary);
+
+  .ia-preset-btn + .ia-preset-btn {
+    border-left: 1px solid var(--border-subtle);
+  }
+
+  .ia-preset-btn:hover {
+    background: var(--surface-hover);
+    color: var(--foreground);
+  }
+
+  .ia-preset-btn.active {
+    background: color-mix(in srgb, var(--primary) 18%, transparent);
     color: var(--primary);
   }
-  .ia-deep-btn.active:hover {
-    background: color-mix(in srgb, var(--primary) 22%, transparent);
+
+  .ia-preset-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
   }
-  .ia-deep-label { pointer-events: none; }
+
+  .ia-preset-meta {
+    font-size: 10px;
+    line-height: 1.2;
+    color: var(--warning);
+    padding-left: 2px;
+  }
 
   /* 发送按钮：圆形 */
   .ia-send {
@@ -944,4 +1087,163 @@
   }
 
   .ia-img-clear:hover { border-color: var(--destructive); color: var(--destructive); }
+
+  .ia-queue-panel {
+    border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+    border-radius: var(--radius-lg);
+    background: color-mix(in srgb, var(--surface-1) 96%, transparent);
+    padding: 7px 9px;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--foreground-muted) 6%, transparent);
+  }
+
+  .ia-queue-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .ia-queue-header-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: color-mix(in srgb, var(--foreground) 84%, transparent);
+    font-size: 12px;
+    font-weight: var(--font-medium);
+    line-height: 1.2;
+  }
+
+  .ia-queue-header-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 20px;
+    height: 20px;
+    padding: 0 6px;
+    border-radius: var(--radius-full);
+    background: color-mix(in srgb, var(--surface-hover) 72%, transparent);
+    border: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
+    color: var(--foreground-muted);
+    font-size: 11px;
+    font-weight: var(--font-semibold);
+  }
+
+  .ia-queue-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 124px;
+    overflow-y: auto;
+  }
+
+  .ia-queue-item {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: start;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: var(--radius-sm);
+    border: 1px solid color-mix(in srgb, var(--border-subtle) 70%, transparent);
+    background: color-mix(in srgb, var(--surface-2) 40%, var(--surface-1));
+    min-height: 32px;
+  }
+
+  .ia-queue-index {
+    width: 16px;
+    height: 16px;
+    border-radius: 999px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 1px;
+    font-size: 10px;
+    line-height: 1;
+    color: var(--foreground-muted);
+    background: color-mix(in srgb, var(--surface-hover) 75%, transparent);
+    border: 1px solid color-mix(in srgb, var(--border) 68%, transparent);
+  }
+
+  .ia-queue-content {
+    font-size: 12px;
+    line-height: 1.3;
+    color: var(--foreground);
+    white-space: normal;
+    overflow: hidden;
+    word-break: break-word;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+
+  .ia-queue-ops {
+    flex-shrink: 0;
+  }
+
+  .ia-queue-menu-trigger {
+    width: 22px;
+    height: 22px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-xs);
+    background: transparent;
+    color: var(--foreground-muted);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: -1px;
+  }
+
+  .ia-queue-menu-trigger:hover {
+    background: var(--surface-hover);
+    border-color: color-mix(in srgb, var(--border) 80%, transparent);
+    color: var(--foreground);
+  }
+
+  .ia-queue-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 58;
+    background: transparent;
+  }
+
+  .ia-queue-floating-menu {
+    position: fixed;
+    min-width: 132px;
+    padding: 4px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--vscode-input-background, var(--surface-1));
+    box-shadow: var(--shadow-md);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    z-index: 59;
+  }
+
+  .ia-queue-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    border: none;
+    border-radius: var(--radius-xs);
+    background: transparent;
+    color: var(--foreground);
+    cursor: pointer;
+    padding: 4px 6px;
+    font-size: 12px;
+    text-align: left;
+  }
+
+  .ia-queue-menu-item:hover {
+    background: var(--surface-hover);
+  }
+
+  .ia-queue-menu-item.danger {
+    color: var(--error);
+  }
+
 </style>

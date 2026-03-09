@@ -1688,6 +1688,7 @@
                         <option value="low">{i18n.t('settings.model.reasoning.low')}</option>
                         <option value="medium">{i18n.t('settings.model.reasoning.medium')}</option>
                         <option value="high">{i18n.t('settings.model.reasoning.high')}</option>
+                        <option value="xhigh">{i18n.t('settings.model.reasoning.xhigh')}</option>
                       </select>
                     </div>
                     {/if}
@@ -1921,6 +1922,7 @@
                     <option value="low">{i18n.t('settings.model.reasoning.low')}</option>
                     <option value="medium">{i18n.t('settings.model.reasoning.medium')}</option>
                     <option value="high">{i18n.t('settings.model.reasoning.high')}</option>
+                    <option value="xhigh">{i18n.t('settings.model.reasoning.xhigh')}</option>
                   </select>
                 </div>
                 {/if}

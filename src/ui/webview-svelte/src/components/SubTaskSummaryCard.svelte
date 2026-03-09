@@ -18,6 +18,8 @@
     changes?: string[];
     verification?: string[];
     error?: string;
+    failureCode?: string;
+    recoverable?: boolean;
     toolCount?: number;
     // 新增：Session 相关（提案 4.1）
     sessionId?: string;
@@ -287,6 +289,9 @@
     <div class="card-error">
       <Icon name="x-circle" size={14} />
       {card.error}
+      {#if card.failureCode}
+        <span class="error-code">[{card.failureCode}]</span>
+      {/if}
     </div>
   {/if}
 </button>
@@ -601,6 +606,13 @@
     color: var(--error);
     font-size: var(--text-sm);
     line-height: 1.4;
+  }
+
+  .error-code {
+    margin-left: var(--space-2);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
+    opacity: 0.85;
   }
 
   /* Wave 和 Session 徽章 */
