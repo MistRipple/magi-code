@@ -313,9 +313,9 @@ export abstract class BaseLLMAdapter extends EventEmitter {
           name: 'read-process',
           arguments: {
             terminal_id: terminalId,
-            // task 模式走非阻塞增量拉取，避免 wait 卡到进程结束才返回
-            wait: !isTaskMode,
-            max_wait_seconds: 1,
+            // 统一使用阻塞等待拉取增量，提升实时性并降低轮询频率
+            wait: true,
+            max_wait_seconds: isTaskMode ? 2 : 1,
             from_cursor: cursor,
           },
         }, signal);
