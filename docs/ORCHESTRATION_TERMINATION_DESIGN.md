@@ -806,9 +806,9 @@ sequenceDiagram
    - 在 required Todo 轨道下，预算与 external_wait 门禁按“单轮命中立即终止”执行；当快照存在瞬时尖峰（短时超阈）时，会出现“任务仍在推进却被门禁截断”的误判。
    - 已修复为：引入门禁去抖（连续命中阈值）与硬阈值双层策略：预算/external_wait 默认需连续 2 轮命中才终止；仅在超出硬阈值（预算 1.2x、external_wait 1.5x SLA）时立即终止。
 
-25. C 阶段“模式入口认知负担过高”根因：
-   - 输入区同时暴露 `ask/auto` 与 `deepTask` 两个独立开关，用户需要自行推导组合语义，易形成“模式与治理混淆”并误触非预期策略。
-   - 已修复为：前端改为单一“执行策略预设”入口（`Fast=auto+standard`、`Stable=auto+deep`、`Review=ask+deep`），后端继续保留双轴模型（`interactionMode + deepTask`）；当出现非预设组合（`ask+standard`）时显式标记为 custom，避免隐性状态漂移。
+25. C 阶段“模式语义理解成本高”根因：
+   - `ask/auto`（交互策略）与 `deepTask`（治理强度）属于不同维度，但入口表达不清晰时，用户容易将二者误当作同一层模式。
+   - 已修复为：保留双轴模型与双控件入口（`Ask/Auto` + `Deep`），并通过控件分组与文案提示明确语义分工；后端继续统一按 `interactionMode + deepTask` 决策，避免入口样式变化影响治理链路。
 
 ### 13.3 全链路验证矩阵（最新一轮）
 
@@ -826,8 +826,8 @@ sequenceDiagram
 - 补充验证（2026-03-09 17:33 +0800）：门禁核心链路复跑 PASS（`orchestrator-gate-debounce`、`no-todo-tool-budget-no-hard-stop`、`no-todo-post-tool-ambiguous`、`orchestrator-token-budget-scope`、`gate-fail-open`、`conversation-continuity-gate`、`tool-round-runtime-no-duplicate`、`tool-round-duplicate-output`、`tool-termination-resilience`、`termination-real-sample-gate`、`orchestrator-termination`）。
 - 回归脚本治理（2026-03-09）：`tool-round-runtime-no-duplicate` 的 mock 场景改为“required todo 轨道 + 硬预算终止”；修复后不再因 fake client 无视禁工具信号导致无限工具轮/OOM，验证信号与真实门禁路径一致。
 - 架构收敛（2026-03-09 01:24 +0800）：新增 `orchestrator-decision-engine` 作为门禁统一决策内核，adapter 仅负责上下文组装与动作执行；新增 `decision_trace` 贯通到运行态与终止指标落盘，支持逐轮审计“继续/收尾/终止”决策路径。
-- 产品入口收敛（2026-03-09）：输入区模式切换改为“执行策略预设”单入口（Fast/Stable/Review），并保持后端双轴协议不变；验证 `npm run -s compile`、`npm run -s build:webview`、`npm run -s release:preflight` 全部 PASS。
-- 预设入口专项验收（2026-03-09）：补充执行 `verify:e2e:mode-governance`、`verify:e2e:plan-governance-gate`、`verify:e2e:conversation-continuity-gate`、`verify:e2e:no-todo-post-tool-ambiguous`、`verify:e2e:no-todo-tool-budget-no-hard-stop`、`verify:e2e:orchestrator-gate-debounce`、`verify:e2e:tool-round-runtime-no-duplicate`、`verify:e2e:tool-termination-resilience` 全部 PASS。
+- 产品入口收敛（2026-03-09）：输入区保持 `Ask/Auto` + `Deep` 双轴入口，并强化语义边界（交互策略 vs 治理强度）；后端双轴协议保持不变。验证 `npm run -s compile`、`npm run -s build:webview`、`npm run -s release:preflight` 全部 PASS。
+- 模式入口专项验收（2026-03-09）：补充执行 `verify:e2e:mode-governance`、`verify:e2e:plan-governance-gate`、`verify:e2e:conversation-continuity-gate`、`verify:e2e:no-todo-post-tool-ambiguous`、`verify:e2e:no-todo-tool-budget-no-hard-stop`、`verify:e2e:orchestrator-gate-debounce`、`verify:e2e:tool-round-runtime-no-duplicate`、`verify:e2e:tool-termination-resilience` 全部 PASS。
 - 严格性负向验证：`npm run -s release:termination-gate` 在默认 seed 数据下按预期失败（`真实样本不足`），证明真实样本闸门已生效
 
 | 命令 | 结果 |
@@ -914,29 +914,29 @@ sequenceDiagram
 
 #### 1. 表象分析（Symptom Analysis）
 - 用户诉求：确认本轮实现是否严格遵循用户工程规范，避免“功能堆叠”和“流程偏离”。
-- 重点表象：需要证明“模式入口收敛改造”不会引入对话中断、误门禁或链路回退问题。
+- 重点表象：需要证明“模式入口语义修复”不会引入对话中断、误门禁或链路回退问题。
 
 #### 2. 机理溯源（Context & Flow）
-- 目标链路：输入区预设入口 `Fast/Stable/Review` -> 前端拆分为 `setInteractionMode` 与 `updateSetting(deepTask)` 两条消息 -> 后端沿用双轴判定（交互模式 + 治理强度）。
+- 目标链路：输入区 `Ask/Auto` + `Deep` 双轴入口 -> 前端分别发送 `setInteractionMode` 与 `updateSetting(deepTask)` -> 后端沿用双轴判定（交互模式 + 治理强度）。
 - 核心约束：
   1. `deep + ask` 才触发计划确认门禁。
   2. `auto` 下交互请求自动闭环，不阻断会话。
   3. UI 仅在 `ask` 展示确认弹窗。
 
 #### 3. 差距诊断（Gap Diagnosis）
-- 对比结果：未发现“预设入口改造导致门禁误触发”或“工具后会话中断”的新增偏差。
+- 对比结果：未发现“模式入口语义修复导致门禁误触发”或“工具后会话中断”的新增偏差。
 - 验证覆盖：
   1. 编译构建：`compile`、`build:webview` 通过。
   2. 关键回归：`mode-governance`、`plan-governance-gate`、`conversation-continuity-gate`、`no-todo-*`、`orchestrator-gate-debounce`、`tool-*` 全部通过。
   3. 综合预检：`release:preflight` 通过。
 
 #### 4. 根本原因分析（Root Cause Analysis）
-- 原问题根因是入口层“双开关暴露”造成用户需要自行推导组合语义，认知成本高、误操作概率高。
+- 原问题根因是入口层未明确区分“交互策略”和“治理强度”的产品语义，导致用户心智混淆与误操作。
 - 本轮未改变后端协议和终止治理内核，避免引入新分叉；仅在产品入口层做语义收敛，因此风险集中且可控。
 
 #### 5. 彻底修复与债清偿（Fundamental Fix & Cleanup）
-- 源头修复：将输入区改为单一预设入口，统一用户心智模型；后端仍保留双轴能力用于治理决策与扩展。
+- 源头修复：输入区保持双轴入口但明确语义边界（`Ask/Auto` 控制交互确认，`Deep` 控制治理强度）；后端继续统一决策，避免分叉实现。
 - 债务清理：
-  1. 移除旧入口相关 UI 逻辑（`ask/auto toggle + deep button`）。
-  2. 补齐中英文文案与 custom 态提示，避免隐性状态漂移。
+  1. 移除预设模式 UI 逻辑，回归双轴入口实现（`ask/auto toggle + deep button`）。
+  2. 保持中英文文案与门禁策略文案一致，避免模式语义漂移。
   3. 在设计文档中追加“专项验收 + 5 步复核记录”，形成可追溯证据链。
