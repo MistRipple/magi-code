@@ -1,8 +1,7 @@
 /**
  * Shell 执行器抽象层类型定义
  *
- * 将 Shell 执行能力从 VSCode Terminal API 中解耦，
- * 支持 VSCode / IDEA / CLI 等不同宿主环境的实现。
+ * 纯命令执行模型，不依赖任何 IDE/编辑器 API。
  */
 
 import {
@@ -17,24 +16,33 @@ import {
 import { ProcessState } from '../terminal/types';
 
 // ============================================================================
-// Shell 会话抽象
+// 进程事件
 // ============================================================================
 
 /**
- * Shell 会话接口
- *
- * 对底层终端通道的最小抽象：
- * - VSCode 实现：包装 vscode.Terminal
- * - Node 实现：包装 child_process.spawn 创建的 shell 进程
+ * Shell 执行器进程事件类型
  */
-export interface IShellSession {
-  /** 会话唯一标识 */
-  readonly id: string;
-  /** 显示名称 */
-  readonly name: string;
-  /** 向 shell 发送文本 */
-  sendText(text: string, addNewLine?: boolean): void;
+export interface ShellProcessEvents {
+  /** 进程有新输出 */
+  processOutput: {
+    processId: number;
+    output: string;
+    fromCursor: number;
+    cursor: number;
+  };
+  /** 进程进入终态 */
+  processCompleted: {
+    processId: number;
+    state: ProcessState;
+    exitCode: number | null;
+    output: string;
+    cursor: number;
+  };
 }
+
+/** Shell 事件监听器类型 */
+export type ShellEventListener<K extends keyof ShellProcessEvents> =
+  (event: ShellProcessEvents[K]) => void;
 
 // ============================================================================
 // 进程记录
@@ -66,7 +74,7 @@ export interface ProcessRecord {
  * Shell 执行器接口
  *
  * ToolManager 对终端能力的唯一依赖契约。
- * 所有宿主环境的实现（VSCode / Node / IDEA）必须实现此接口。
+ * 纯命令执行模型：spawn 子进程 + stdout/stderr pipe。
  */
 export interface IShellExecutor {
   /**
@@ -111,6 +119,22 @@ export interface IShellExecutor {
    * 获取所有进程记录
    */
   listProcessRecords(): ProcessRecord[];
+
+  /**
+   * 注册进程事件监听器
+   */
+  on<K extends keyof ShellProcessEvents>(
+    event: K,
+    listener: ShellEventListener<K>
+  ): void;
+
+  /**
+   * 移除进程事件监听器
+   */
+  off<K extends keyof ShellProcessEvents>(
+    event: K,
+    listener: ShellEventListener<K>
+  ): void;
 
   /**
    * 释放资源

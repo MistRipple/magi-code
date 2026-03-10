@@ -22,10 +22,15 @@ import {
   sanitizeSchema,
   toOpenAIToolMessageContent,
 } from './protocol-utils';
+import { isRetryableNetworkError, toErrorMessage } from '../../../tools/network-utils';
 
 const PROFILE = resolveProviderProtocolProfile('openai');
 
 export class OpenAIResponsesProtocolAdapter implements ProviderProtocolAdapter {
+  private static readonly STREAM_RECOVERY_MAX_ATTEMPTS = 3;
+  private static readonly STREAM_RECOVERY_POLL_MS = 600;
+  private static readonly STREAM_RECOVERY_MAX_WAIT_MS = 10_000;
+
   readonly provider = PROFILE.provider;
   readonly protocol = PROFILE.protocol;
   readonly capabilities = PROFILE.capabilities;
@@ -168,6 +173,8 @@ export class OpenAIResponsesProtocolAdapter implements ProviderProtocolAdapter {
     let stopReason: LLMResponse['stopReason'] = 'end_turn';
     let emittedContentStart = false;
     let finalResponsePayload: any | undefined;
+    let responseId: string | undefined;
+    let streamRecovered = false;
 
     const iterator = (stream as any)[Symbol.asyncIterator]();
     while (true) {
@@ -185,10 +192,31 @@ export class OpenAIResponsesProtocolAdapter implements ProviderProtocolAdapter {
           }, LogCategory.LLM);
           continue;
         }
+        const recovered = await this.tryRecoverInterruptedStream({
+          responseId,
+          error: iterError,
+          signal: request.signal,
+        });
+        if (recovered) {
+          finalResponsePayload = recovered;
+          streamRecovered = true;
+          break;
+        }
         throw iterError;
       }
 
       switch (chunk.type) {
+        case 'response.created':
+        case 'response.in_progress':
+        case 'response.queued': {
+          const rid = typeof chunk?.response?.id === 'string'
+            ? chunk.response.id
+            : undefined;
+          if (rid) {
+            responseId = rid;
+          }
+          break;
+        }
         case 'response.output_text.delta': {
           const incoming = typeof chunk.delta === 'string' ? chunk.delta : '';
           const normalized = normalizeStreamDelta(incoming, fullContent, contentDeltaMode);
@@ -375,6 +403,12 @@ export class OpenAIResponsesProtocolAdapter implements ProviderProtocolAdapter {
         case 'response.completed':
         case 'response.incomplete': {
           finalResponsePayload = chunk.response;
+          const rid = typeof chunk?.response?.id === 'string'
+            ? chunk.response.id
+            : undefined;
+          if (rid) {
+            responseId = rid;
+          }
           const normalizedUsage = normalizeOpenAIUsage(finalResponsePayload?.usage);
           if (normalizedUsage.inputTokens > 0 || normalizedUsage.outputTokens > 0) {
             usage = {
@@ -402,8 +436,24 @@ export class OpenAIResponsesProtocolAdapter implements ProviderProtocolAdapter {
       }
     }
 
-    if (!fullContent && finalResponsePayload) {
-      fullContent = this.extractOpenAIResponseText(finalResponsePayload);
+    if (finalResponsePayload) {
+      const responseText = this.extractOpenAIResponseText(finalResponsePayload);
+      if (!fullContent) {
+        fullContent = responseText;
+      } else if (responseText && responseText.startsWith(fullContent) && responseText.length > fullContent.length) {
+        const delta = responseText.slice(fullContent.length);
+        if (delta) {
+          if (!emittedContentStart) {
+            emittedContentStart = true;
+            onEvent({ type: 'content_start' });
+          }
+          fullContent += delta;
+          onEvent({ type: 'content_delta', content: delta });
+        }
+      }
+      if (streamRecovered && emittedContentStart) {
+        onEvent({ type: 'content_end' });
+      }
     }
 
     const toolCalls: ToolCall[] = [];
@@ -456,6 +506,84 @@ export class OpenAIResponsesProtocolAdapter implements ProviderProtocolAdapter {
       usage,
       stopReason,
     };
+  }
+
+  private async tryRecoverInterruptedStream(input: {
+    responseId?: string;
+    error: any;
+    signal?: AbortSignal;
+  }): Promise<any | undefined> {
+    const message = toErrorMessage(input.error);
+    const canRecover = Boolean(input.responseId)
+      && isRetryableNetworkError(message)
+      && !(input.signal?.aborted);
+    if (!canRecover) {
+      return undefined;
+    }
+
+    const startedAt = Date.now();
+    for (let attempt = 1; attempt <= OpenAIResponsesProtocolAdapter.STREAM_RECOVERY_MAX_ATTEMPTS; attempt++) {
+      try {
+        const response = await this.openaiClient.responses.retrieve(input.responseId!, {}, { signal: input.signal });
+        const status = String((response as any)?.status || '').toLowerCase();
+        if (status === 'completed' || status === 'incomplete' || status === 'failed') {
+          logger.warn('OpenAI Responses stream 中断后已恢复', {
+            model: this.config.model,
+            responseId: input.responseId,
+            attempt,
+            status,
+          }, LogCategory.LLM);
+          return response;
+        }
+      } catch (recoverError: any) {
+        const recoverMessage = toErrorMessage(recoverError);
+        if (!isRetryableNetworkError(recoverMessage) || attempt >= OpenAIResponsesProtocolAdapter.STREAM_RECOVERY_MAX_ATTEMPTS) {
+          logger.warn('OpenAI Responses stream 中断恢复失败', {
+            model: this.config.model,
+            responseId: input.responseId,
+            attempt,
+            error: recoverMessage.substring(0, 300),
+          }, LogCategory.LLM);
+          return undefined;
+        }
+      }
+
+      const elapsed = Date.now() - startedAt;
+      if (elapsed >= OpenAIResponsesProtocolAdapter.STREAM_RECOVERY_MAX_WAIT_MS) {
+        break;
+      }
+      await this.sleep(OpenAIResponsesProtocolAdapter.STREAM_RECOVERY_POLL_MS, input.signal);
+    }
+
+    logger.warn('OpenAI Responses stream 中断恢复超时', {
+      model: this.config.model,
+      responseId: input.responseId,
+      maxWaitMs: OpenAIResponsesProtocolAdapter.STREAM_RECOVERY_MAX_WAIT_MS,
+    }, LogCategory.LLM);
+    return undefined;
+  }
+
+  private async sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    if (ms <= 0) {
+      return;
+    }
+    if (signal?.aborted) {
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        if (signal) {
+          signal.removeEventListener('abort', onAbort);
+        }
+        resolve();
+      }, ms);
+      const onAbort = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
   }
 
   private shouldEnableReasoning(): boolean {

@@ -366,7 +366,7 @@ export function buildDispatchSummaryPrompt(
       const summary = e.result?.summary || 'No output';
       const errors = e.result?.errors?.join('; ') || '';
       return `### Worker ${e.worker} [${statusLabel}]
-**Task**: ${e.task.length > 120 ? e.task.substring(0, 120) + '...' : e.task}
+**Task**: ${e.taskContract.taskTitle.length > 120 ? e.taskContract.taskTitle.substring(0, 120) + '...' : e.taskContract.taskTitle}
 **Modified Files**: ${files}
 **Summary**: ${summary}${errors ? `\n**Errors**: ${errors}` : ''}`;
     })

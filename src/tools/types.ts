@@ -38,6 +38,7 @@ export const BUILTIN_TOOL_NAMES = [
   'split_todo',
   'get_todos',
   'update_todo',
+  'apply_skill',
 ] as const;
 
 /** 内置工具名称的联合类型 */
@@ -136,35 +137,6 @@ export interface SkillDefinition {
   handler: (args: Record<string, any>) => Promise<string>;
 }
 
-// ============================================================================
-// Shell 执行器类型
-// ============================================================================
-
-/**
- * Shell 执行选项
- */
-export interface ShellExecuteOptions {
-  command: string;
-  cwd?: string;
-  timeout?: number;
-  env?: Record<string, string>;
-  name?: string; // 终端名称（用于VSCode终端）
-  showTerminal?: boolean; // 是否显示终端窗口
-  keepTerminalOpen?: boolean; // 是否保持终端打开
-  useVSCodeTerminal?: boolean; // 是否使用VSCode终端（默认false，使用child_process）
-
-}
-
-/**
- * Shell 执行结果
- */
-export interface ShellExecuteResult {
-  stdout: string;
-  stderr: string;
-  exitCode: number | null;
-  duration: number;
-}
-
 /**
  * launch-process 选项
  */
@@ -174,7 +146,6 @@ export interface LaunchProcessOptions {
   wait: boolean;
   maxWaitSeconds: number;
   name: string;
-  showTerminal?: boolean;
   runMode?: ProcessRunMode;
   startupWaitSeconds?: number;
   readyPatterns?: string[];
@@ -182,7 +153,7 @@ export interface LaunchProcessOptions {
 
 /**
  * process 运行模式
- * - task: 一次性命令，结束后可复用终端
+ * - task: 一次性命令，每次调用使用独立终端进程
  * - service: 长驻服务，终端会被锁定直至显式 kill
  */
 export type ProcessRunMode = 'task' | 'service';
@@ -224,6 +195,7 @@ export interface LaunchProcessResult {
  * read-process 结果
  */
 export interface ReadProcessResult {
+  terminal_id: number;
   status: 'queued' | 'starting' | 'running' | 'completed' | 'failed' | 'killed' | 'timeout';
   output: string;
   return_code: number | null;

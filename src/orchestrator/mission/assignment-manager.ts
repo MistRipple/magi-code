@@ -122,6 +122,9 @@ export class AssignmentManager {
       options?.additionalContext || mission.context,
       options?.taskInfo
     );
+    const assignmentContextNotes = this.buildAssignmentContextNotes(
+      options?.additionalContext || mission.context
+    );
 
     const now = Date.now();
     const responsibility = this.generateResponsibility(
@@ -138,6 +141,14 @@ export class AssignmentManager {
       shortTitle: (mission.goal || mission.userPrompt || responsibility).substring(0, 20),
       responsibility,
       delegationBriefing: options?.delegationBriefing,
+      contextNotes: assignmentContextNotes,
+      constraints: mission.constraints.map(constraint => ({ ...constraint })),
+      acceptanceCriteria: mission.acceptanceCriteria.map(criterion => ({
+        ...criterion,
+        verificationSpec: criterion.verificationSpec
+          ? { ...criterion.verificationSpec }
+          : undefined,
+      })),
       scope,
       guidancePrompt,
       producerContracts,
@@ -148,6 +159,13 @@ export class AssignmentManager {
       progress: 0,
       createdAt: now,
     };
+  }
+
+  private buildAssignmentContextNotes(context: string): string[] {
+    return context
+      .split('\n')
+      .map(item => item.trim())
+      .filter(Boolean);
   }
 
   /**

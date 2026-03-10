@@ -312,7 +312,7 @@ export interface ReportOptions {
   /** 汇报回调 */
   onReport: ReportCallback;
 
-  /** 汇报超时(ms)，默认 5000 */
+  /** 汇报超时(ms)。未配置时由 Worker 侧按汇报类型使用内置默认值。 */
   reportTimeout?: number;
 
   /** 是否在每个 Todo 完成后汇报，默认 true */

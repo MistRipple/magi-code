@@ -518,12 +518,24 @@ export class EventBindingService {
     if (metadataSessionId) {
       return metadataSessionId;
     }
+    const traceId = typeof message.traceId === 'string' ? message.traceId.trim() : '';
+    if (traceId) {
+      const dataPayloadSessionId = this.resolveDataPayloadSessionId(message);
+      if (dataPayloadSessionId && dataPayloadSessionId !== traceId) {
+        logger.warn('界面.消息.会话标识冲突_已回退traceId', {
+          messageId: message.id,
+          traceId,
+          payloadSessionId: dataPayloadSessionId,
+          dataType: message.data?.dataType,
+        }, LogCategory.UI);
+      }
+      return traceId;
+    }
     const dataPayloadSessionId = this.resolveDataPayloadSessionId(message);
     if (dataPayloadSessionId) {
       return dataPayloadSessionId;
     }
-    const traceId = typeof message.traceId === 'string' ? message.traceId.trim() : '';
-    return traceId || null;
+    return null;
   }
 
   private resolveDataPayloadSessionId(message: StandardMessage): string | null {

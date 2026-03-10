@@ -11,7 +11,7 @@
 
 import { EventEmitter } from 'events';
 import { AgentType, AgentRole, LLMConfig, TokenUsage } from '../../types/agent-types';
-import { LLMClient, ToolCall, ToolResult, StandardizedToolResult } from '../types';
+import { LLMClient, LLMMessageParams, LLMRetryRuntimeEvent, ToolCall, ToolResult, StandardizedToolResult } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager, type ToolExecutionContext } from '../../tools/tool-manager';
 import { MessageHub } from '../../orchestrator/core/message-hub';
@@ -39,6 +39,21 @@ export interface AdapterEvents {
   toolCall: (toolName: string, args: any) => void;
   toolResult: (toolName: string, result: string) => void;
   thinking: (content: string) => void;
+}
+
+interface ToolResultRenderParams {
+  streamId: string;
+  toolCalls: ToolCall[];
+  toolResults: ToolResult[];
+  preAnnouncedToolCallIds: Set<string>;
+  executionContext: ToolExecutionContext;
+  signal?: AbortSignal;
+}
+
+interface TerminalPreviewEntry {
+  streamId: string;
+  ownStream: boolean;
+  result: ToolResult;
 }
 
 /**
@@ -263,6 +278,153 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     rawResult.content = `${truncated}\n...[truncated ${rawResult.content.length - maxChars} chars]`;
   }
 
+  protected preAnnounceToolCalls(streamId: string, toolCalls: ToolCall[]): Set<string> {
+    const preAnnouncedToolCallIds = new Set<string>();
+    for (const toolCall of toolCalls) {
+      const requiresAuthorization = this.toolManager.requiresUserAuthorization(toolCall.name);
+      // shell/process 工具即使需要授权也要先渲染卡片，避免执行期无可视反馈
+      if (requiresAuthorization && !this.isTerminalProcessTool(toolCall.name)) {
+        continue;
+      }
+      preAnnouncedToolCallIds.add(toolCall.id);
+      this.normalizer.addToolCall(streamId, {
+        type: 'tool_call',
+        toolName: toolCall.name,
+        toolId: toolCall.id,
+        status: 'running',
+        input: JSON.stringify(toolCall.arguments, null, 2),
+      });
+    }
+    return preAnnouncedToolCallIds;
+  }
+
+  protected buildAssistantToolUseBlocks(toolCalls: ToolCall[]): Array<{
+    type: 'tool_use';
+    id: string;
+    name: string;
+    input: Record<string, any>;
+  }> {
+    return toolCalls.map((toolCall) => ({
+      type: 'tool_use',
+      id: toolCall.id,
+      name: toolCall.name,
+      input: toolCall.arguments,
+    }));
+  }
+
+  private startDetachedToolStream(): string {
+    const traceId = this.currentTraceId || this.syncTraceFromMessageHub();
+    return this.normalizer.startStream(traceId);
+  }
+
+  protected async renderToolResultsWithTerminalStreaming({
+    streamId,
+    toolCalls,
+    toolResults,
+    preAnnouncedToolCallIds,
+    executionContext,
+    signal,
+  }: ToolResultRenderParams): Promise<void> {
+    const terminalPreviewPromises: Promise<void>[] = [];
+    const terminalPreviewEntries: TerminalPreviewEntry[] = [];
+    const toolCallMap = new Map(toolCalls.map((toolCall) => [toolCall.id, toolCall] as const));
+
+    for (const result of toolResults) {
+      const toolCall = toolCallMap.get(result.toolCallId);
+      if (!toolCall) {
+        continue;
+      }
+      const hardError = this.isHardToolFailure(result);
+      const isTerminalTool = this.isTerminalProcessTool(toolCall.name);
+      const isPreAnnounced = preAnnouncedToolCallIds.has(result.toolCallId);
+
+      if (isTerminalTool) {
+        const targetStreamId = isPreAnnounced ? streamId : this.startDetachedToolStream();
+        const initialOutput = typeof result.content === 'string' ? result.content : String(result.content ?? '');
+
+        // 终端工具统一进入“running + 自动预览”路径，避免因预告缺失退化成完成态一次性渲染
+        this.normalizer.addToolCall(targetStreamId, {
+          type: 'tool_call',
+          toolName: toolCall.name,
+          toolId: result.toolCallId,
+          status: 'running',
+          input: JSON.stringify(toolCall.arguments, null, 2),
+          output: initialOutput,
+        });
+
+        terminalPreviewEntries.push({
+          streamId: targetStreamId,
+          ownStream: !isPreAnnounced,
+          result,
+        });
+
+        const previewPromise = this.autoPreviewProcessOutput(
+          targetStreamId,
+          toolCall,
+          result,
+          executionContext,
+          signal,
+        );
+        terminalPreviewPromises.push(previewPromise);
+        continue;
+      }
+
+      if (isPreAnnounced) {
+        this.normalizer.finishToolCall(
+          streamId,
+          result.toolCallId,
+          hardError ? undefined : result.content,
+          hardError ? result.content : undefined,
+          result.fileChange,
+          result.standardized
+        );
+        continue;
+      }
+
+      const deferredToolStreamId = this.startDetachedToolStream();
+      this.normalizer.addToolCall(deferredToolStreamId, {
+        type: 'tool_call',
+        toolName: toolCall.name,
+        toolId: result.toolCallId,
+        status: hardError ? 'failed' : 'completed',
+        input: JSON.stringify(toolCall.arguments, null, 2),
+        output: hardError ? undefined : result.content,
+        error: hardError ? result.content : undefined,
+        standardized: result.standardized,
+      });
+
+      this.normalizer.finishToolCall(
+        deferredToolStreamId,
+        result.toolCallId,
+        hardError ? undefined : result.content,
+        hardError ? result.content : undefined,
+        result.fileChange,
+        result.standardized
+      );
+      this.normalizer.endStream(deferredToolStreamId);
+    }
+
+    if (terminalPreviewPromises.length === 0) {
+      return;
+    }
+
+    await Promise.all(terminalPreviewPromises);
+    for (const entry of terminalPreviewEntries) {
+      const hardError = this.isHardToolFailure(entry.result);
+      this.normalizer.finishToolCall(
+        entry.streamId,
+        entry.result.toolCallId,
+        hardError ? undefined : entry.result.content,
+        hardError ? entry.result.content : undefined,
+        entry.result.fileChange,
+        entry.result.standardized
+      );
+      if (entry.ownStream) {
+        this.normalizer.endStream(entry.streamId);
+      }
+    }
+  }
+
   protected async autoPreviewProcessOutput(
     streamId: string,
     toolCall: ToolCall,
@@ -278,8 +440,8 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     const terminalId = typeof launchResult?.terminal_id === 'number' ? launchResult.terminal_id : undefined;
     const status = typeof launchResult?.status === 'string' ? launchResult.status : '';
     const runMode = launchResult?.run_mode;
-    const nextCursor = typeof launchResult?.output_cursor === 'number' ? launchResult.output_cursor : 0;
-    const shouldPoll = Boolean(
+    const isTaskMode = runMode === 'task';
+    const shouldStream = Boolean(
       terminalId
       && (runMode === 'service' || runMode === 'task')
       && status !== 'completed'
@@ -287,115 +449,222 @@ export abstract class BaseLLMAdapter extends EventEmitter {
       && status !== 'killed'
       && status !== 'timeout'
     );
-    if (!shouldPoll || !terminalId) {
+    if (!shouldStream || !terminalId) {
       return;
     }
 
-    try {
-      let cursor = nextCursor;
-      let noProgressRounds = 0;
-      const isTaskMode = runMode === 'task';
-      const maxRounds = isTaskMode ? 600 : 6;
-      // 放大 task 模式的无进展退出阈值，允许 shell 有足够的沉默/睡眠时间 (约 300 轮 * 0.5s = 150s)
-      const maxTaskNoProgressRounds = 300;
-      const taskPreviewStartAt = Date.now();
-      const maxTaskPreviewMs = 600_000; // 最大 10 分钟预览
-      // 跟踪最后一轮 read-process 的完整 JSON 结果，用于在终态时替换 launch 快返内容
-      let lastReadContent: string | undefined;
+    const maxPreviewMs = isTaskMode ? 600_000 : 10_000; // task 最大 10 分钟，service 最大 10 秒
+    const sessionId = this.syncTraceFromMessageHub();
+    let frameSeq = 0;
 
-      for (let round = 0; round < maxRounds; round += 1) {
-        if (signal?.aborted) {
+    // 发送 terminalStreamStarted
+    this.messageHub.data('terminalStreamStarted', {
+      sessionId,
+      traceId: sessionId,
+      toolCallId: result.toolCallId,
+      toolName: toolCall.name,
+      workerId: executionContext.workerId,
+      workerRole: executionContext.role,
+      terminalId,
+      frameSeq,
+      status,
+      runMode,
+      phase: typeof launchResult?.phase === 'string' ? launchResult.phase : undefined,
+      cwd: typeof launchResult?.cwd === 'string' ? launchResult.cwd : undefined,
+      command: typeof toolCall.arguments?.command === 'string' ? toolCall.arguments.command : undefined,
+      terminalName: typeof launchResult?.terminal_name === 'string' ? launchResult.terminal_name : undefined,
+      output: typeof launchResult?.output === 'string' ? launchResult.output : '',
+      outputCursor: typeof launchResult?.output_cursor === 'number' ? launchResult.output_cursor : 0,
+      outputStartCursor: typeof launchResult?.output_start_cursor === 'number' ? launchResult.output_start_cursor : 0,
+      nextCursor: typeof launchResult?.output_cursor === 'number' ? launchResult.output_cursor : 0,
+      delta: false,
+      timestamp: Date.now(),
+    });
+
+    // 事件驱动流式推送
+    const executor = this.toolManager.getShellExecutor();
+    const startAt = Date.now();
+    const launchCursor = typeof launchResult?.output_cursor === 'number' ? launchResult.output_cursor : 0;
+
+    return new Promise<void>((resolve) => {
+      let resolved = false;
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      let abortHandler: (() => void) | undefined;
+
+      const finalizeTaskResult = async (state: string): Promise<void> => {
+        if (!isTaskMode) {
+          return;
+        }
+        try {
+          const readResult = await this.toolManager.executeInternalTool({
+            id: `${toolCall.id}::final-read`,
+            name: 'read-process',
+            arguments: { terminal_id: terminalId, wait: false, max_wait_seconds: 1 },
+          }, undefined, executionContext);
+          if (typeof readResult.content === 'string' && readResult.content.trim()) {
+            result.content = readResult.content;
+            result.isError = state === 'failed' || state === 'killed' || state === 'timeout';
+          }
+        } catch {
+          // 最终读取失败不影响主流程
+        }
+      };
+
+      const cleanup = () => {
+        if (resolved) return;
+        resolved = true;
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+        if (signal && abortHandler) {
+          signal.removeEventListener('abort', abortHandler);
+        }
+        executor.off('processOutput', onOutput);
+        executor.off('processCompleted', onCompleted);
+        resolve();
+      };
+
+      const onOutput = (event: { processId: number; output: string; fromCursor: number; cursor: number }) => {
+        if (event.processId !== terminalId) return;
+        if (signal?.aborted) { cleanup(); return; }
+        if (Date.now() - startAt >= maxPreviewMs) { cleanup(); return; }
+
+        frameSeq += 1;
+        this.messageHub.data('terminalStreamFrame', {
+          sessionId,
+          traceId: sessionId,
+          toolCallId: result.toolCallId,
+          toolName: toolCall.name,
+          workerId: executionContext.workerId,
+          workerRole: executionContext.role,
+          terminalId,
+          frameSeq,
+          status: 'running',
+          runMode,
+          command: typeof toolCall.arguments?.command === 'string' ? toolCall.arguments.command : undefined,
+          output: event.output,
+          fromCursor: event.fromCursor,
+          outputCursor: event.cursor,
+          nextCursor: event.cursor,
+          delta: true,
+          timestamp: Date.now(),
+        });
+      };
+
+      const onCompleted = (event: {
+        processId: number;
+        state: string;
+        exitCode: number | null;
+        output: string;
+        cursor: number;
+      }) => {
+        if (event.processId !== terminalId) return;
+
+        frameSeq += 1;
+        this.messageHub.data('terminalStreamCompleted', {
+          sessionId,
+          traceId: sessionId,
+          toolCallId: result.toolCallId,
+          toolName: toolCall.name,
+          workerId: executionContext.workerId,
+          workerRole: executionContext.role,
+          terminalId,
+          frameSeq,
+          status: event.state,
+          runMode,
+          command: typeof toolCall.arguments?.command === 'string' ? toolCall.arguments.command : undefined,
+          returnCode: event.exitCode,
+          output: event.output,
+          outputCursor: event.cursor,
+          nextCursor: event.cursor,
+          delta: false,
+          timestamp: Date.now(),
+        });
+
+        // task 终态：用最终输出替换 launch 快返内容
+        if (isTaskMode) {
+          void finalizeTaskResult(event.state).finally(cleanup);
           return;
         }
 
-        const autoRead = await this.toolManager.executeInternalTool({
-          id: `${toolCall.id}::auto-read::${round}`,
-          name: 'read-process',
-          arguments: {
-            terminal_id: terminalId,
-            // 统一使用阻塞等待拉取增量，提升实时性并降低轮询频率
-            wait: true,
-            max_wait_seconds: isTaskMode ? 2 : 1,
-            from_cursor: cursor,
-          },
-        }, signal);
+        cleanup();
+      };
 
-        const parsedRead = this.parseToolResultJson(autoRead);
-        const readStatus = typeof parsedRead?.status === 'string' ? parsedRead.status : '';
-        const readOutput = typeof parsedRead?.output === 'string' ? parsedRead.output : '';
-        const readNextCursor = typeof parsedRead?.next_cursor === 'number'
-          ? parsedRead.next_cursor
-          : (typeof parsedRead?.output_cursor === 'number' ? parsedRead.output_cursor : cursor);
-        const cursorAdvanced = readNextCursor > cursor;
-        const hasProgress = cursorAdvanced || readOutput.trim().length > 0;
+      executor.on('processOutput', onOutput);
+      executor.on('processCompleted', onCompleted);
 
-        // 记录完整 read 结果用于终态替换
-        if (typeof autoRead.content === 'string' && autoRead.content.trim()) {
-          lastReadContent = autoRead.content;
-        }
+      void executor.readProcess(terminalId, false, 1, launchCursor, signal).then(async (snapshot) => {
+        if (resolved) return;
+        if (signal?.aborted) { cleanup(); return; }
 
-        const autoReadContent = typeof autoRead.content === 'string' ? autoRead.content : String(autoRead.content ?? '');
-        if (autoReadContent.trim()) {
-          this.normalizer.addToolCall(streamId, {
-            type: 'tool_call',
+        if (typeof snapshot.output === 'string' && snapshot.output.length > 0) {
+          frameSeq += 1;
+          this.messageHub.data('terminalStreamFrame', {
+            sessionId,
+            traceId: sessionId,
+            toolCallId: result.toolCallId,
             toolName: toolCall.name,
-            toolId: result.toolCallId,
-            status: 'running',
-            input: JSON.stringify(toolCall.arguments, null, 2),
-            output: autoReadContent,
+            workerId: executionContext.workerId,
+            workerRole: executionContext.role,
+            terminalId,
+            frameSeq,
+            status: snapshot.status,
+            runMode,
+            command: typeof toolCall.arguments?.command === 'string' ? toolCall.arguments.command : undefined,
+            output: snapshot.output,
+            fromCursor: snapshot.from_cursor,
+            outputCursor: snapshot.output_cursor,
+            outputStartCursor: snapshot.output_start_cursor,
+            nextCursor: snapshot.next_cursor,
+            delta: true,
+            truncated: snapshot.truncated,
+            timestamp: Date.now(),
           });
         }
 
-        cursor = readNextCursor;
-
-        if (hasProgress) {
-          noProgressRounds = 0;
-        } else {
-          noProgressRounds += 1;
+        if (snapshot.status === 'completed' || snapshot.status === 'failed' || snapshot.status === 'killed' || snapshot.status === 'timeout') {
+          frameSeq += 1;
+          this.messageHub.data('terminalStreamCompleted', {
+            sessionId,
+            traceId: sessionId,
+            toolCallId: result.toolCallId,
+            toolName: toolCall.name,
+            workerId: executionContext.workerId,
+            workerRole: executionContext.role,
+            terminalId,
+            frameSeq,
+            status: snapshot.status,
+            runMode,
+            command: typeof toolCall.arguments?.command === 'string' ? toolCall.arguments.command : undefined,
+            returnCode: snapshot.return_code,
+            output: snapshot.output,
+            outputCursor: snapshot.output_cursor,
+            outputStartCursor: snapshot.output_start_cursor,
+            nextCursor: snapshot.next_cursor,
+            delta: false,
+            truncated: snapshot.truncated,
+            timestamp: Date.now(),
+          });
+          await finalizeTaskResult(snapshot.status);
+          cleanup();
         }
+      }).catch(() => {
+        // 初始同步失败不影响后续实时事件
+      });
 
-        const isTerminal = readStatus === 'completed'
-          || readStatus === 'failed'
-          || readStatus === 'killed'
-          || readStatus === 'timeout';
+      // 超时兜底
+      timeoutId = setTimeout(() => {
+        if (!resolved) cleanup();
+      }, maxPreviewMs + 1000);
 
-        if (isTerminal) {
-          // task 终态：用最后一轮完整 read 结果替换 launch 快返内容，
-          // 让模型看到最终状态（completed/failed），避免不必要的额外 read-process 调用。
-          if (isTaskMode && lastReadContent) {
-            result.content = lastReadContent;
-            result.isError = readStatus === 'failed' || readStatus === 'killed' || readStatus === 'timeout';
-          }
-          break;
-        }
-
-        if (isTaskMode) {
-          // task：无进展超过阈值时让控制权回到模型，避免单个工具长时间阻塞
-          if (noProgressRounds >= maxTaskNoProgressRounds) {
-            break;
-          }
-          // task：即便持续有输出，也限制自动预览总时长，避免占满编排预算
-          if (Date.now() - taskPreviewStartAt >= maxTaskPreviewMs) {
-            break;
-          }
-          // 轮询间隔：有进展时快速刷新，无进展时退避等待
-          await new Promise(r => setTimeout(r, hasProgress ? 200 : 500));
-        } else {
-          // service：短轮询预览，避免长时间占用链路
-          if (noProgressRounds >= 2) {
-            break;
-          }
-          await new Promise(r => setTimeout(r, 1000));
-        }
+      // abort 信号监听
+      if (signal) {
+        abortHandler = () => {
+          cleanup();
+        };
+        signal.addEventListener('abort', abortHandler, { once: true });
       }
-    } catch (error: any) {
-      logger.warn('process 自动读流预览失败，忽略本次刷新', {
-        agent: this.agent,
-        toolCallId: result.toolCallId,
-        terminalId,
-        error: error?.message || String(error),
-      }, LogCategory.TOOLS);
-    }
+    });
   }
 
   constructor(
@@ -438,6 +707,33 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     const boundMessageId = requestId ? this.messageHub.getRequestMessageId(requestId) : undefined;
 
     return this.normalizer.startStream(traceId, undefined, boundMessageId, visibility);
+  }
+
+  protected createRetryRuntimeHook(messageId?: string): LLMMessageParams['retryRuntimeHook'] | undefined {
+    if (!messageId) {
+      return undefined;
+    }
+
+    return (event) => {
+      this.emitRetryRuntime(messageId, event);
+    };
+  }
+
+  protected emitRetryRuntime(messageId: string, event: LLMRetryRuntimeEvent): void {
+    if (!messageId) {
+      return;
+    }
+
+    const traceId = this.syncTraceFromMessageHub();
+    this.messageHub.data('llmRetryRuntime', {
+      traceId,
+      messageId,
+      agent: this.agent,
+      role: this.role,
+      provider: this.config.provider,
+      model: this.config.model,
+      ...event,
+    });
   }
 
   /**

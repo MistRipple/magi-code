@@ -86,6 +86,9 @@ export function classifyModelOriginIssue(reason: string): ModelOriginIssueClassi
   if (lower.includes('fetch failed') || lower.includes('network') || lower.includes('socket hang up') || lower.includes('econnreset') || lower.includes('econnrefused') || lower.includes('enotfound') || lower.includes('tls') || lower.includes('certificate')) {
     return pick(normalized, '模型服务网络连接异常，请检查网络环境后重试。', 'network');
   }
+  if (lower.includes('error occurred while processing your request') || lower.includes('help.openai.com')) {
+    return pick(normalized, '模型服务暂时不可用（上游处理中断），系统已自动重试；若持续失败请稍后再试。', 'model_unavailable');
+  }
   if (normalized.includes('LLM 响应为空') || normalized.includes('Error during LLM edit generation') || normalized.includes('model returned non-string content')) {
     return pick(normalized, '模型本轮未返回可执行内容，已自动结束本轮。请重试，或补充更明确的输入与约束。', 'empty_response');
   }

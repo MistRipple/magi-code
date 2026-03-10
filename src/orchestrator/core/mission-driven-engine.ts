@@ -45,6 +45,11 @@ import {
   type TerminationMetricsRecord,
   type TerminationMetricsRepository,
 } from './termination-metrics-repository';
+import {
+  resolveTerminationReason,
+  type OrchestratorTerminationReason,
+  type TerminationCandidate,
+} from '../../llm/adapters/orchestrator-termination';
 import { TaskViewService } from '../../services/task-view-service';
 import { PlanLedgerService, type PlanMode, type PlanRecord } from '../plan-ledger';
 import {
@@ -154,6 +159,8 @@ interface RuntimeTerminationDecisionTraceEntry {
   timestamp?: number;
 }
 
+type ResolvedOrchestratorTerminationReason = Exclude<OrchestratorTerminationReason, 'unknown'>;
+
 /**
  * MissionDrivenEngine - 基于 Mission-Driven Architecture 的编排引擎
  */
@@ -210,6 +217,8 @@ export class MissionDrivenEngine extends EventEmitter {
   } | null = null;
   /** dispatch 并发场景下的 Mission 创建单飞锁，确保每轮最多创建一个 Mission */
   private ensureMissionPromise: Promise<string> | null = null;
+  /** 当前轮次 draft 前唯一结构化需求合同 */
+  private currentRequirementAnalysis: RequirementAnalysis | null = null;
   private lastRoutingDecision: {
     needsWorker: boolean;
     category?: string;
@@ -924,6 +933,24 @@ export class MissionDrivenEngine extends EventEmitter {
     return true;
   }
 
+  /**
+   * 核心层会话锚点同步：
+   * 不依赖 UI/宿主适配层，确保 MessageHub trace 与真实 sessionId 对齐。
+   */
+  private alignMessageHubTrace(sessionId?: string): void {
+    const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+    if (!normalizedSessionId) {
+      return;
+    }
+    if (this.messageHub.getTraceId() === normalizedSessionId) {
+      return;
+    }
+    this.messageHub.setTraceId(normalizedSessionId);
+    logger.debug('编排器.消息.Trace.同步', {
+      traceId: normalizedSessionId,
+    }, LogCategory.ORCHESTRATOR);
+  }
+
   private async awaitPlanConfirmation(
     sessionId: string,
     plan: PlanRecord,
@@ -933,6 +960,7 @@ export class MissionDrivenEngine extends EventEmitter {
       governanceSummary?: string;
     },
   ): Promise<boolean> {
+    this.alignMessageHubTrace(sessionId);
     const awaitingPlan = await this.planLedger.markAwaitingConfirmation(sessionId, plan.planId, fallbackFormattedPlan);
     const displayPlan = awaitingPlan || plan;
     const governanceSummary = typeof options?.governanceSummary === 'string'
@@ -971,6 +999,7 @@ export class MissionDrivenEngine extends EventEmitter {
   }
 
   private emitPlanLedgerUpdate(sessionId: string, reason: string): void {
+    this.alignMessageHubTrace(sessionId);
     const snapshot = this.planLedger.getSnapshot(sessionId);
     const activePlan = snapshot.activePlan;
     this.messageHub.data('planLedgerUpdated', {
@@ -1006,13 +1035,6 @@ export class MissionDrivenEngine extends EventEmitter {
       targetFiles: payload.files,
       requiresModification: payload.requiresModification,
     });
-  }
-
-  private mapMissionStatusToTerminalPlanStatus(status: string): 'completed' | 'failed' | 'cancelled' | null {
-    if (status === 'completed') return 'completed';
-    if (status === 'failed') return 'failed';
-    if (status === 'cancelled') return 'cancelled';
-    return null;
   }
 
   private classifyAttemptTerminalStatus(success: boolean, message?: string): 'succeeded' | 'failed' | 'timeout' | 'cancelled' {
@@ -1093,6 +1115,93 @@ export class MissionDrivenEngine extends EventEmitter {
       case 'external_wait_timeout':
       case 'stalled':
         return 'timeout';
+      default:
+        return 'failed';
+    }
+  }
+
+  private normalizeOrchestratorRuntimeReason(
+    runtimeReason?: string,
+  ): ResolvedOrchestratorTerminationReason | undefined {
+    switch (runtimeReason) {
+      case 'completed':
+      case 'failed':
+      case 'cancelled':
+      case 'stalled':
+      case 'budget_exceeded':
+      case 'external_wait_timeout':
+      case 'external_abort':
+      case 'upstream_model_error':
+      case 'interrupted':
+        return runtimeReason;
+      default:
+        return undefined;
+    }
+  }
+
+  private resolveOrchestratorRuntimeReason(input: {
+    runtimeReason?: string;
+    runtimeSnapshot?: RuntimeTerminationSnapshot;
+    additionalCandidates?: TerminationCandidate[];
+    fallback?: ResolvedOrchestratorTerminationReason;
+  }): {
+    reason: ResolvedOrchestratorTerminationReason;
+    runtimeSnapshot?: RuntimeTerminationSnapshot;
+  } {
+    const normalizedRuntimeReason = this.normalizeOrchestratorRuntimeReason(input.runtimeReason);
+    const snapshotEvidenceIds = Array.isArray(input.runtimeSnapshot?.sourceEventIds)
+      ? input.runtimeSnapshot.sourceEventIds.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : [];
+    const candidates: TerminationCandidate[] = [];
+
+    if (normalizedRuntimeReason) {
+      if (snapshotEvidenceIds.length > 0) {
+        candidates.push(...snapshotEvidenceIds.map((eventId, index) => ({
+          reason: normalizedRuntimeReason,
+          eventId,
+          triggeredAt: index,
+        })));
+      } else {
+        candidates.push({
+          reason: normalizedRuntimeReason,
+          eventId: `runtime:${normalizedRuntimeReason}`,
+          triggeredAt: 0,
+        });
+      }
+    }
+
+    if (Array.isArray(input.additionalCandidates) && input.additionalCandidates.length > 0) {
+      candidates.push(...input.additionalCandidates);
+    }
+
+    const resolved = resolveTerminationReason(
+      candidates,
+      input.fallback || normalizedRuntimeReason || 'failed',
+    );
+
+    return {
+      reason: resolved.reason,
+      runtimeSnapshot: input.runtimeSnapshot
+        ? {
+          ...input.runtimeSnapshot,
+          sourceEventIds: resolved.evidenceIds,
+        }
+        : resolved.evidenceIds.length > 0
+          ? { sourceEventIds: resolved.evidenceIds }
+          : undefined,
+    };
+  }
+
+  private mapOrchestratorRuntimeReasonToPlanFinalStatus(
+    runtimeReason?: string,
+  ): 'completed' | 'failed' | 'cancelled' {
+    switch (this.normalizeOrchestratorRuntimeReason(runtimeReason)) {
+      case 'completed':
+        return 'completed';
+      case 'cancelled':
+      case 'external_abort':
+      case 'interrupted':
+        return 'cancelled';
       default:
         return 'failed';
     }
@@ -1273,16 +1382,6 @@ export class MissionDrivenEngine extends EventEmitter {
       })().catch((error) => this.reportPlanLedgerAsyncError('todoFailed', error));
     });
 
-    this.missionOrchestrator.on('missionStatusChanged', (data) => {
-      const terminalStatus = this.mapMissionStatusToTerminalPlanStatus(data.newStatus);
-      if (!terminalStatus) {
-        return;
-      }
-      const sessionId = data.mission.sessionId;
-      void this.planLedger
-        .finalizeByMissionStatus(sessionId, data.mission.id, terminalStatus)
-        .catch((error) => this.reportPlanLedgerAsyncError('missionStatusChanged', error));
-    });
   }
 
   private enqueueExecution<T>(runner: () => Promise<T>): Promise<T> {
@@ -1438,6 +1537,7 @@ export class MissionDrivenEngine extends EventEmitter {
       this.currentTaskId = taskId || null;
       this.lastMissionId = null;
       this.currentPlanId = null;
+      this.currentRequirementAnalysis = null;
       this.pendingPlanConfirmation = null;
       this.ensureMissionPromise = null;
       // 每轮对话生成唯一 turnId，作为本轮所有快照的 missionId。
@@ -1452,10 +1552,9 @@ export class MissionDrivenEngine extends EventEmitter {
       this.activeUserPrompt = trimmedPrompt;
       this.activeImagePaths = imagePaths;
       const executeStartedAt = Date.now();
-      let planFinalStatus: 'completed' | 'failed' | 'cancelled' | null = null;
       let orchestratorAttemptStarted = false;
       let orchestratorAttemptTargetId: string | null = null;
-      let orchestratorRuntimeReason: string | undefined;
+      let orchestratorRuntimeReason: ResolvedOrchestratorTerminationReason | undefined;
       let orchestratorRuntimeRounds = 0;
       let orchestratorRuntimeSnapshot: RuntimeTerminationSnapshot | undefined;
       let orchestratorRuntimeShadow: RuntimeTerminationShadow | undefined;
@@ -1466,18 +1565,25 @@ export class MissionDrivenEngine extends EventEmitter {
       try {
         const resolvedSessionId = sessionId || this.sessionManager.getCurrentSession()?.id || taskId;
         this.currentSessionId = resolvedSessionId;
+        this.alignMessageHubTrace(resolvedSessionId);
         this.dispatchManager.resetForNewExecutionCycle();
         await this.ensureContextReady(resolvedSessionId);
 
         const planMode: PlanMode = this.adapterFactory.isDeepTask() ? 'deep' : 'standard';
         currentPlanMode = planMode;
+        const requirementAnalysis = this.buildRequirementAnalysis(trimmedPrompt, planMode);
+        this.currentRequirementAnalysis = requirementAnalysis;
         const draftPlan = await this.planLedger.createDraft({
           sessionId: resolvedSessionId,
           turnId: this.currentTurnId || `turn:${Date.now()}`,
           missionId: this.currentTurnId || undefined,
           mode: planMode,
           prompt: trimmedPrompt,
-          summary: trimmedPrompt,
+          summary: requirementAnalysis.goal,
+          analysis: requirementAnalysis.analysis,
+          constraints: requirementAnalysis.constraints,
+          acceptanceCriteria: requirementAnalysis.acceptanceCriteria,
+          riskLevel: requirementAnalysis.riskLevel,
         });
         this.currentPlanId = draftPlan.planId;
 
@@ -1515,7 +1621,7 @@ export class MissionDrivenEngine extends EventEmitter {
             await this.planLedger.reject(resolvedSessionId, draftPlan.planId, 'user', rejectReason);
             this.lastExecutionSuccess = false;
             this.lastExecutionErrors = [rejectReason];
-            planFinalStatus = 'cancelled';
+            orchestratorRuntimeReason = 'cancelled';
             this.setState('idle');
             this.currentTaskId = null;
             return t('engine.plan.userCancelledResult');
@@ -1658,7 +1764,7 @@ export class MissionDrivenEngine extends EventEmitter {
             includeToolCalls: true,
           }
         );
-        orchestratorRuntimeReason = response.orchestratorRuntime?.reason;
+        orchestratorRuntimeReason = this.normalizeOrchestratorRuntimeReason(response.orchestratorRuntime?.reason);
         orchestratorRuntimeRounds = response.orchestratorRuntime?.rounds || 0;
         orchestratorRuntimeSnapshot = response.orchestratorRuntime?.snapshot as RuntimeTerminationSnapshot | undefined;
         orchestratorRuntimeShadow = response.orchestratorRuntime?.shadow as RuntimeTerminationShadow | undefined;
@@ -1677,9 +1783,15 @@ export class MissionDrivenEngine extends EventEmitter {
         }
 
         const executionWarnings: string[] = [];
+        const terminationCandidates: TerminationCandidate[] = [];
         const auditOutcome = currentBatch?.getAuditOutcome();
         if (auditOutcome?.level === 'intervention') {
           executionWarnings.push(t('engine.phaseC.interventionBlocked'));
+          terminationCandidates.push({
+            reason: 'failed',
+            eventId: 'engine:audit-intervention',
+            triggeredAt: Date.now(),
+          });
           logger.warn('编排器.PhaseC.审计阻断_已降级', {
             batchId: currentBatch?.id,
             level: auditOutcome.level,
@@ -1693,6 +1805,11 @@ export class MissionDrivenEngine extends EventEmitter {
           } else {
             executionWarnings.push('上游模型异常：未知错误');
           }
+          terminationCandidates.push({
+            reason: 'upstream_model_error',
+            eventId: 'engine:upstream-model-error',
+            triggeredAt: Date.now(),
+          });
           logger.warn('编排器.统一执行.上游模型异常_已降级', {
             error: response.error,
           }, LogCategory.ORCHESTRATOR);
@@ -1706,6 +1823,11 @@ export class MissionDrivenEngine extends EventEmitter {
               ? verificationError.message
               : String(verificationError);
             executionWarnings.push(`Phase C 校验异常：${verificationMessage}`);
+            terminationCandidates.push({
+              reason: 'failed',
+              eventId: 'engine:phasec-verification-failed',
+              triggeredAt: Date.now(),
+            });
             logger.warn('编排器.PhaseC.校验异常_已降级', {
               batchId: currentBatch.id,
               error: verificationMessage,
@@ -1733,6 +1855,16 @@ export class MissionDrivenEngine extends EventEmitter {
           }
         }
 
+        const resolvedRuntimeTermination = this.resolveOrchestratorRuntimeReason({
+          runtimeReason: orchestratorRuntimeReason,
+          runtimeSnapshot: orchestratorRuntimeSnapshot,
+          additionalCandidates: terminationCandidates,
+          fallback: terminationCandidates.length > 0 ? 'failed' : 'completed',
+        });
+        orchestratorRuntimeReason = resolvedRuntimeTermination.reason;
+        orchestratorRuntimeSnapshot = resolvedRuntimeTermination.runtimeSnapshot;
+        const finalPlanStatus = this.mapOrchestratorRuntimeReasonToPlanFinalStatus(orchestratorRuntimeReason);
+
         if (executionWarnings.length > 0) {
           const warningSection = [
             '[System] 本轮触发门禁降级（会话不中断）：',
@@ -1741,14 +1873,9 @@ export class MissionDrivenEngine extends EventEmitter {
           finalContent = finalContent.trim()
             ? `${finalContent}\n\n${warningSection}`
             : warningSection;
-          this.lastExecutionSuccess = false;
-          this.lastExecutionErrors = executionWarnings;
-          planFinalStatus = 'failed';
-        } else {
-          this.lastExecutionSuccess = true;
-          this.lastExecutionErrors = [];
-          planFinalStatus = 'completed';
         }
+        this.lastExecutionSuccess = finalPlanStatus === 'completed';
+        this.lastExecutionErrors = finalPlanStatus === 'completed' ? [] : executionWarnings;
         this.setState('idle');
         this.currentTaskId = null;
         return finalContent;
@@ -1757,19 +1884,37 @@ export class MissionDrivenEngine extends EventEmitter {
         const errorMessage = error instanceof Error ? error.message : String(error);
         // 中断导致的 abort 不视为执行失败，静默处理
         if (isAbortError(error)) {
-          orchestratorRuntimeReason = orchestratorRuntimeReason || 'interrupted';
+          const resolvedRuntimeTermination = this.resolveOrchestratorRuntimeReason({
+            runtimeReason: orchestratorRuntimeReason,
+            runtimeSnapshot: orchestratorRuntimeSnapshot,
+            additionalCandidates: [{
+              reason: 'interrupted',
+              eventId: 'engine:execute-aborted',
+              triggeredAt: Date.now(),
+            }],
+          });
+          orchestratorRuntimeReason = resolvedRuntimeTermination.reason;
+          orchestratorRuntimeSnapshot = resolvedRuntimeTermination.runtimeSnapshot;
           logger.info('编排器.统一执行.中断', { error: errorMessage }, LogCategory.ORCHESTRATOR);
           this.lastExecutionSuccess = false;
           this.lastExecutionErrors = [];
-          planFinalStatus = 'cancelled';
           this.setState('idle');
           this.currentTaskId = null;
           return '';
         }
-        orchestratorRuntimeReason = orchestratorRuntimeReason || 'failed';
+        const resolvedRuntimeTermination = this.resolveOrchestratorRuntimeReason({
+          runtimeReason: orchestratorRuntimeReason,
+          runtimeSnapshot: orchestratorRuntimeSnapshot,
+          additionalCandidates: [{
+            reason: 'failed',
+            eventId: 'engine:execute-error',
+            triggeredAt: Date.now(),
+          }],
+        });
+        orchestratorRuntimeReason = resolvedRuntimeTermination.reason;
+        orchestratorRuntimeSnapshot = resolvedRuntimeTermination.runtimeSnapshot;
         this.lastExecutionSuccess = false;
         this.lastExecutionErrors = [errorMessage];
-        planFinalStatus = 'failed';
         logger.error('编排器.统一执行.失败', { error: errorMessage }, LogCategory.ORCHESTRATOR);
         this.setState('idle');
         this.currentTaskId = null;
@@ -1779,18 +1924,25 @@ export class MissionDrivenEngine extends EventEmitter {
       } finally {
         const finalSessionId = this.currentSessionId;
         const finalPlanId = this.currentPlanId;
-        if (finalSessionId && finalPlanId && orchestratorAttemptStarted && orchestratorAttemptTargetId && planFinalStatus) {
-          const attemptStatus = planFinalStatus === 'completed'
-            ? 'succeeded'
-            : planFinalStatus === 'cancelled'
-              ? 'cancelled'
-              : this.mapOrchestratorRuntimeReasonToAttemptStatus(orchestratorRuntimeReason);
+        const finalRuntimeTermination = finalPlanId
+          ? this.resolveOrchestratorRuntimeReason({
+            runtimeReason: orchestratorRuntimeReason,
+            runtimeSnapshot: orchestratorRuntimeSnapshot,
+          })
+          : null;
+        const finalRuntimeReason = finalRuntimeTermination?.reason;
+        const finalRuntimeSnapshot = finalRuntimeTermination?.runtimeSnapshot || orchestratorRuntimeSnapshot;
+        const finalPlanStatus = finalRuntimeReason
+          ? this.mapOrchestratorRuntimeReasonToPlanFinalStatus(finalRuntimeReason)
+          : null;
+        if (finalSessionId && finalPlanId && orchestratorAttemptStarted && orchestratorAttemptTargetId && finalRuntimeReason) {
+          const attemptStatus = this.mapOrchestratorRuntimeReasonToAttemptStatus(finalRuntimeReason);
           try {
             await this.planLedger.completeLatestAttempt(finalSessionId, finalPlanId, {
               scope: 'orchestrator',
               targetId: orchestratorAttemptTargetId,
               status: attemptStatus,
-              reason: orchestratorRuntimeReason || `orchestrator-finalized:${planFinalStatus}`,
+              reason: finalRuntimeReason,
               error: attemptStatus === 'succeeded' ? undefined : this.lastExecutionErrors[0],
             });
           } catch (attemptError) {
@@ -1802,9 +1954,9 @@ export class MissionDrivenEngine extends EventEmitter {
             }, LogCategory.ORCHESTRATOR);
           }
         }
-        if (finalSessionId && finalPlanId && planFinalStatus) {
+        if (finalSessionId && finalPlanId && finalPlanStatus) {
           try {
-            await this.planLedger.finalize(finalSessionId, finalPlanId, planFinalStatus);
+            await this.planLedger.finalize(finalSessionId, finalPlanId, finalPlanStatus);
           } catch (planError) {
             logger.warn('编排器.计划账本.终态更新失败', {
               sessionId: finalSessionId,
@@ -1818,10 +1970,10 @@ export class MissionDrivenEngine extends EventEmitter {
           planId: finalPlanId,
           turnId: this.currentTurnId,
           mode: currentPlanMode,
-          finalPlanStatus: planFinalStatus,
-          runtimeReason: orchestratorRuntimeReason,
+          finalPlanStatus: finalPlanStatus,
+          runtimeReason: finalRuntimeReason,
           runtimeRounds: orchestratorRuntimeRounds,
-          runtimeSnapshot: orchestratorRuntimeSnapshot,
+          runtimeSnapshot: finalRuntimeSnapshot,
           runtimeShadow: orchestratorRuntimeShadow,
           runtimeDecisionTrace: orchestratorRuntimeDecisionTrace,
           tokenUsage: runtimeTokenUsage,
@@ -1857,15 +2009,6 @@ export class MissionDrivenEngine extends EventEmitter {
               // 未调用 dispatch_task → 不属于任务维度，删除空 Mission
               await this.missionStorage.delete(this.lastMissionId);
             } else {
-              // 有 dispatch：用 batch entries 填充 Mission.goal（替代用户消息原文）
-              const mission = await this.missionStorage.load(this.lastMissionId);
-              if (mission && !mission.goal) {
-                const entries = batch.getEntries();
-                mission.goal = entries.length === 1
-                  ? entries[0].task.substring(0, 80)
-                  : entries.map(e => e.task.substring(0, 40)).join('；');
-                await this.missionStorage.update(mission);
-              }
               // 更新 Mission 终态
               if (this.lastExecutionSuccess) {
                 await this.taskViewService.completeTaskById(this.lastMissionId);
@@ -1885,6 +2028,7 @@ export class MissionDrivenEngine extends EventEmitter {
           logger.warn('编排器.上下文.保存失败', { error: memoryError }, LogCategory.ORCHESTRATOR);
         }
         this.currentPlanId = null;
+        this.currentRequirementAnalysis = null;
       }
     });
   }
@@ -1912,10 +2056,26 @@ export class MissionDrivenEngine extends EventEmitter {
         throw new Error(t('engine.errors.missingUserPrompt'));
       }
 
+      const requirementAnalysis = this.currentRequirementAnalysis;
+      if (!requirementAnalysis) {
+        throw new Error('requirement analysis missing before mission creation');
+      }
+      const riskLevel = requirementAnalysis.riskLevel;
+      if (!riskLevel) {
+        throw new Error('requirement analysis riskLevel missing before mission creation');
+      }
+
       const mission = await this.missionStorage.createMission({
         sessionId,
         userPrompt: prompt,
         context: '',
+        goal: requirementAnalysis.goal,
+        analysis: requirementAnalysis.analysis,
+        constraints: requirementAnalysis.constraints,
+        acceptanceCriteria: requirementAnalysis.acceptanceCriteria,
+        riskLevel,
+        riskFactors: requirementAnalysis.riskFactors,
+        executionPath: this.mapRiskLevelToExecutionPath(riskLevel),
       });
 
       // 若 Mission 创建期间执行轮次已切换，回收该 Mission，避免生成孤儿任务
@@ -1928,10 +2088,7 @@ export class MissionDrivenEngine extends EventEmitter {
         throw new Error(t('engine.errors.turnSwitchedMissionInvalid'));
       }
 
-      mission.status = 'executing';
-      mission.failureReason = undefined;
-      mission.startedAt = Date.now();
-      await this.missionStorage.update(mission);
+      await this.missionStorage.transitionStatus(mission.id, 'executing');
 
       this.lastMissionId = mission.id;
       this.missionOrchestrator.setCurrentMissionId(mission.id);
@@ -2029,6 +2186,167 @@ export class MissionDrivenEngine extends EventEmitter {
     return this.contextManager.getAssembledContextText(assembledOptions, {
       excludePartTypes: ['recent_turns'],
     });
+  }
+
+  private buildRequirementAnalysis(
+    prompt: string,
+    mode: PlanMode,
+  ): RequirementAnalysis {
+    const goal = extractPrimaryIntent(prompt) || prompt.trim();
+    const constraints = extractUserConstraints(prompt);
+    const acceptanceCriteria = this.extractPreDraftAcceptanceCriteria(prompt, goal, constraints);
+    const riskAssessment = this.assessPreDraftRisk(prompt, mode, constraints, acceptanceCriteria);
+    const executionIntent = this.analyzeRequirementExecutionIntent(prompt, mode);
+    const analysisParts = [
+      `围绕“${goal}”建立执行计划`,
+      constraints.length > 0 ? `需遵守 ${constraints.length} 条用户约束` : '当前未识别出额外用户约束',
+      acceptanceCriteria.length > 0 ? `验收以 ${acceptanceCriteria.length} 条标准为准` : '验收标准待后续调度补充',
+      `风险等级为 ${riskAssessment.riskLevel}`,
+    ];
+
+    return {
+      goal,
+      analysis: analysisParts.join('；'),
+      constraints,
+      acceptanceCriteria,
+      riskLevel: riskAssessment.riskLevel,
+      riskFactors: riskAssessment.riskFactors,
+      needsWorker: executionIntent.needsWorker,
+      needsTooling: executionIntent.needsTooling,
+      requiresModification: executionIntent.requiresModification,
+      reason: executionIntent.reason,
+    };
+  }
+
+  private extractPreDraftAcceptanceCriteria(
+    prompt: string,
+    goal: string,
+    constraints: string[],
+  ): string[] {
+    const constraintSet = new Set(constraints);
+    const segments = prompt
+      .split(/\n+/)
+      .flatMap(line => line.split(/[。！？；;]+/))
+      .map(segment => segment.trim())
+      .filter(segment => segment.length > 0);
+    const matched = Array.from(new Set(
+      segments
+        .filter(segment => /(?:验收|完成标准|成功标准|acceptance|验证|确保|通过|输出|结果)/i.test(segment))
+        .filter(segment => !constraintSet.has(segment))
+        .map(segment => (segment.length > 120 ? `${segment.substring(0, 120)}...` : segment))
+    )).slice(0, 5);
+
+    if (matched.length > 0) {
+      return matched;
+    }
+
+    return goal ? [`完成目标：${goal}`] : [];
+  }
+
+  private analyzeRequirementExecutionIntent(
+    prompt: string,
+    mode: PlanMode,
+  ): {
+    hasReadOnlyIntent: boolean;
+    hasWriteIntent: boolean;
+    hasHighImpactIntent: boolean;
+    needsWorker: boolean;
+    needsTooling: boolean;
+    requiresModification: boolean;
+    reason: string;
+  } {
+    const normalizedPrompt = prompt.toLowerCase();
+    const readOnlyKeywords = ['分析', '解释', '总结', '查看', '审查', 'review', 'summarize', 'read only'];
+    const writeKeywords = ['修改', '实现', '修复', '新增', '重构', '删除', '更新', '编写', 'patch'];
+    const highImpactKeywords = [
+      '架构',
+      '迁移',
+      '并发',
+      'schema',
+      'ledger',
+      '状态机',
+      '依赖',
+      '数据库',
+      '权限',
+      '认证',
+      '安全',
+      'deploy',
+      '生产',
+    ];
+    const hasReadOnlyIntent = readOnlyKeywords.some(keyword => normalizedPrompt.includes(keyword));
+    const hasWriteIntent = writeKeywords.some(keyword => normalizedPrompt.includes(keyword));
+    const hasHighImpactIntent = highImpactKeywords.some(keyword => normalizedPrompt.includes(keyword));
+    const requiresModification = hasWriteIntent || hasHighImpactIntent;
+    const needsWorker = mode === 'deep' || requiresModification || !hasReadOnlyIntent;
+    const needsTooling = mode === 'deep' || requiresModification;
+
+    return {
+      hasReadOnlyIntent,
+      hasWriteIntent,
+      hasHighImpactIntent,
+      needsWorker,
+      needsTooling,
+      requiresModification,
+      reason: needsWorker
+        ? '需求已进入结构化编排主链，需要继续完成计划生成与后续调度决策'
+        : '需求以只读分析为主，当前可优先保留编排器直接响应路径',
+    };
+  }
+
+  private assessPreDraftRisk(
+    prompt: string,
+    mode: PlanMode,
+    constraints: string[],
+    acceptanceCriteria: string[],
+  ): { riskLevel: 'low' | 'medium' | 'high'; riskFactors: string[] } {
+    const executionIntent = this.analyzeRequirementExecutionIntent(prompt, mode);
+    const riskFactors: string[] = [];
+    let score = 0;
+
+    if (mode === 'deep') {
+      score += 2;
+      riskFactors.push('任务运行在 deep 模式');
+    }
+    if (executionIntent.hasHighImpactIntent) {
+      score += 2;
+      riskFactors.push('需求涉及高影响改动');
+    } else if (executionIntent.hasWriteIntent) {
+      score += 1;
+      riskFactors.push('需求包含代码修改');
+    }
+    if (prompt.length >= 280) {
+      score += 1;
+      riskFactors.push('需求描述较长');
+    }
+    if (constraints.length >= 3) {
+      score += 1;
+      riskFactors.push('用户约束较多');
+    }
+    if (acceptanceCriteria.length >= 3) {
+      score += 1;
+      riskFactors.push('验收标准较多');
+    }
+    if (executionIntent.hasReadOnlyIntent && !executionIntent.hasWriteIntent && !executionIntent.hasHighImpactIntent) {
+      score = Math.max(0, score - 2);
+    }
+
+    const riskLevel = score >= 4 ? 'high' : score >= 2 ? 'medium' : 'low';
+    return {
+      riskLevel,
+      riskFactors: Array.from(new Set(riskFactors)),
+    };
+  }
+
+  private mapRiskLevelToExecutionPath(
+    riskLevel: 'low' | 'medium' | 'high',
+  ): 'light' | 'standard' | 'full' {
+    if (riskLevel === 'low') {
+      return 'light';
+    }
+    if (riskLevel === 'high') {
+      return 'full';
+    }
+    return 'standard';
   }
 
   /**
@@ -2282,9 +2600,7 @@ export class MissionDrivenEngine extends EventEmitter {
       // 状态迁移：将 draft 标记为已取消（被执行链路替代），保留审计记录
       const draftMission = await this.missionStorage.load(taskId);
       if (draftMission) {
-        draftMission.status = 'cancelled';
-        draftMission.updatedAt = Date.now();
-        await this.missionStorage.update(draftMission);
+        await this.missionStorage.transitionStatus(taskId, 'cancelled');
       }
     } catch (error) {
       logger.warn('编排器.任务.草稿状态迁移失败', {

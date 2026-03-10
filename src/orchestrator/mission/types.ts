@@ -150,7 +150,7 @@ export interface Mission {
 
   // ===== 状态管理 =====
   status: MissionStatus;
-  /** 当前阶段 */
+  /** 当前阶段（由 status 派生，不独立推进） */
   phase: MissionPhase;
 
   // ===== 外部关联 =====
@@ -351,6 +351,12 @@ export interface Assignment {
    * 比 responsibility 更丰富，包含上下文理解、重点关注点、期望产出等
    */
   delegationBriefing?: string;
+  /** Assignment 级结构化上下文说明，作为执行与验收的事实合同 */
+  contextNotes: string[];
+  /** Assignment 级结构化约束快照，禁止再从自然语言说明反推 */
+  constraints: Constraint[];
+  /** Assignment 级结构化验收快照，Worker 验收只消费该字段 */
+  acceptanceCriteria: AcceptanceCriterion[];
   /** 职责范围 */
   scope: AssignmentScope;
   /** 引导 Prompt（从画像生成） */
@@ -458,6 +464,13 @@ export interface CreateMissionParams {
   userPrompt: string;
   sessionId: string;
   context?: string;
+  goal?: string;
+  analysis?: string;
+  constraints?: string[];
+  acceptanceCriteria?: string[];
+  riskLevel?: RiskLevel;
+  riskFactors?: string[];
+  executionPath?: ExecutionPath;
 }
 
 /**

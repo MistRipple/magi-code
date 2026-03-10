@@ -11,7 +11,7 @@
  */
 
 import { Assignment } from '../../mission';
-import { TodoManager } from '../../../todo';
+import { TodoManager, TodoType } from '../../../todo';
 import { logger, LogCategory } from '../../../logging';
 
 export class PlanningExecutor {
@@ -35,13 +35,14 @@ export class PlanningExecutor {
     );
 
     const content = this.buildTodoContent(assignment);
+    const macroTodoType = this.resolveMacroTodoType(assignment);
     const todo = await this.todoManager.create({
       sessionId,
       missionId,
       assignmentId: assignment.id,
       content,
       reasoning: assignment.delegationBriefing || assignment.responsibility,
-      type: 'implementation',
+      type: macroTodoType,
       workerId: assignment.workerId,
       targetFiles: assignment.scope?.targetPaths,
     });
@@ -69,5 +70,11 @@ export class PlanningExecutor {
         : `\n目标文件: ${assignment.scope.targetPaths.join(', ')}。只需读取/分析，不要修改文件。`
       : '';
     return `${assignment.responsibility}${scopeHints}${targetPaths}`;
+  }
+
+  private resolveMacroTodoType(assignment: Assignment): TodoType {
+    return assignment.scope?.requiresModification === true
+      ? 'implementation'
+      : 'discovery';
   }
 }

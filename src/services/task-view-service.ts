@@ -172,10 +172,7 @@ export class TaskViewService {
   async cancelTaskById(taskId: string): Promise<void> {
     const mission = await this.missionStorage.load(taskId);
     if (mission) {
-      mission.status = 'cancelled';
-      mission.failureReason = undefined;
-      mission.updatedAt = Date.now();
-      await this.missionStorage.update(mission);
+      await this.missionStorage.transitionStatus(taskId, 'cancelled');
     }
   }
 
@@ -193,10 +190,7 @@ export class TaskViewService {
     const mission = await this.missionStorage.load(taskId);
     const sessionId = mission?.sessionId;
     if (mission) {
-      mission.status = 'failed';
-      mission.failureReason = error;
-      mission.updatedAt = Date.now();
-      await this.missionStorage.update(mission);
+      await this.missionStorage.transitionStatus(taskId, 'failed', { failureReason: error });
     }
     globalEventBus.emitEvent('task:failed', {
       taskId,
@@ -212,11 +206,7 @@ export class TaskViewService {
     const mission = await this.missionStorage.load(taskId);
     const sessionId = mission?.sessionId;
     if (mission) {
-      mission.status = 'completed';
-      mission.failureReason = undefined;
-      mission.completedAt = Date.now();
-      mission.updatedAt = Date.now();
-      await this.missionStorage.update(mission);
+      await this.missionStorage.transitionStatus(taskId, 'completed');
     }
     globalEventBus.emitEvent('task:completed', {
       taskId,
@@ -231,11 +221,7 @@ export class TaskViewService {
   async markTaskExecuting(taskId: string): Promise<void> {
     const mission = await this.missionStorage.load(taskId);
     if (mission) {
-      mission.status = 'executing';
-      mission.failureReason = undefined;
-      mission.startedAt = Date.now();
-      mission.updatedAt = Date.now();
-      await this.missionStorage.update(mission);
+      await this.missionStorage.transitionStatus(taskId, 'executing');
     }
   }
 }

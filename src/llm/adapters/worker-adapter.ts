@@ -20,8 +20,10 @@ import { ToolManager } from '../../tools/tool-manager';
 import { MessageHub } from '../../orchestrator/core/message-hub';
 import { BaseLLMAdapter, AdapterState } from './base-adapter';
 import { logger, LogCategory } from '../../logging';
+import { t } from '../../i18n';
 import { ProfileLoader } from '../../orchestrator/profile/profile-loader';
 import { GuidanceInjector } from '../../orchestrator/profile/guidance-injector';
+import { isRetryableNetworkError, toErrorMessage, deduplicateResumption } from '../../tools/network-utils';
 
 /**
  * 历史管理配置
@@ -129,7 +131,11 @@ export interface WorkerAdapterConfig {
     retryPolicy?: {
       maxRetries?: number;
       baseDelayMs?: number;
+      retryDelaysMs?: readonly number[];
       retryOnTimeout?: boolean;
+      retryOnAllErrors?: boolean;
+      maxRetryDurationMs?: number;
+      deterministicErrorStreakLimit?: number;
     };
   };
 }
@@ -138,12 +144,18 @@ export interface WorkerAdapterConfig {
  * Worker LLM 适配器
  */
 export class WorkerLLMAdapter extends BaseLLMAdapter {
-  private static readonly DEFAULT_REQUEST_TIMEOUT_MS = 45_000;
+  private static readonly DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
   private static readonly DEFAULT_RETRY_POLICY = {
-    maxRetries: 2,
-    baseDelayMs: 350,
-    retryOnTimeout: false,
+    maxRetries: 6, // 首次 + 5 次重试
+    baseDelayMs: 500,
+    retryDelaysMs: [10_000, 20_000, 30_000, 40_000, 50_000],
+    retryOnTimeout: true,
+    retryOnAllErrors: true,
+    maxRetryDurationMs: 240_000,
+    deterministicErrorStreakLimit: 3,
   } as const;
+  /** 流式中断自动续跑预算（按一次 sendMessageInternal 计） */
+  private static readonly STREAM_INTERRUPTION_RECOVERY_MAX = 2;
   private workerSlot: WorkerSlot;
   private systemPrompt: string;
   private conversationHistory: LLMMessage[] = [];
@@ -156,7 +168,11 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   private readonly requestRetryPolicy: {
     maxRetries: number;
     baseDelayMs: number;
+    retryDelaysMs?: readonly number[];
     retryOnTimeout: boolean;
+    retryOnAllErrors?: boolean;
+    maxRetryDurationMs?: number;
+    deterministicErrorStreakLimit?: number;
   };
   private seenThinking = false;
   private decisionHookAppliedForThinking = false;
@@ -208,8 +224,16 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         ?? WorkerLLMAdapter.DEFAULT_RETRY_POLICY.maxRetries,
       baseDelayMs: adapterConfig.executionPolicy?.retryPolicy?.baseDelayMs
         ?? WorkerLLMAdapter.DEFAULT_RETRY_POLICY.baseDelayMs,
+      retryDelaysMs: adapterConfig.executionPolicy?.retryPolicy?.retryDelaysMs
+        ?? WorkerLLMAdapter.DEFAULT_RETRY_POLICY.retryDelaysMs,
       retryOnTimeout: adapterConfig.executionPolicy?.retryPolicy?.retryOnTimeout
         ?? WorkerLLMAdapter.DEFAULT_RETRY_POLICY.retryOnTimeout,
+      retryOnAllErrors: adapterConfig.executionPolicy?.retryPolicy?.retryOnAllErrors
+        ?? WorkerLLMAdapter.DEFAULT_RETRY_POLICY.retryOnAllErrors,
+      maxRetryDurationMs: adapterConfig.executionPolicy?.retryPolicy?.maxRetryDurationMs
+        ?? WorkerLLMAdapter.DEFAULT_RETRY_POLICY.maxRetryDurationMs,
+      deterministicErrorStreakLimit: adapterConfig.executionPolicy?.retryPolicy?.deterministicErrorStreakLimit
+        ?? WorkerLLMAdapter.DEFAULT_RETRY_POLICY.deterministicErrorStreakLimit,
     };
     this.historyConfig = {
       maxMessages: adapterConfig.historyConfig?.maxMessages ?? 50,
@@ -365,6 +389,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       let summaryHijackRounds = 0;
       // 重复无效 shell 拦截计数（避免同一错误参数反复刷屏）
       let repeatedShellInterceptRounds = 0;
+      let streamInterruptionRecoveryCount = 0;
+      let preRecoveryText = '';
 
       // 创建 AbortController，供 interrupt() 中断 LLM 请求
       this.abortController = new AbortController();
@@ -416,28 +442,45 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           temperature: 0.7,
           signal: this.abortController.signal,
           timeoutMs: this.requestTimeoutMs,
+          streamIdleTimeoutMs: this.requestTimeoutMs,
           retryPolicy: this.requestRetryPolicy,
+          retryRuntimeHook: this.createRetryRuntimeHook(streamId),
         };
 
         let accumulatedText = '';
         let hasStreamedTextDelta = false;
         let toolCalls: ToolCall[] = [];
+        let sawToolCallSignal = false;
 
         try {
           const response = await this.client.streamMessage(params, (chunk) => {
             if (chunk.type === 'content_delta' && chunk.content) {
-              this.normalizer.processTextDelta(streamId, chunk.content);
+              let delta = chunk.content;
+              accumulatedText += delta;
+              // 续跑去重：缓冲前 200 字符后做一次性重叠裁剪
+              if (preRecoveryText && accumulatedText.length <= 200) {
+                return; // 继续缓冲，暂不输出
+              }
+              if (preRecoveryText) {
+                const deduped = deduplicateResumption(preRecoveryText, accumulatedText);
+                preRecoveryText = '';
+                if (deduped) {
+                  this.normalizer.processTextDelta(streamId, deduped);
+                }
+                return;
+              }
+              this.normalizer.processTextDelta(streamId, delta);
               hasStreamedTextDelta = true;
               if (this.seenThinking && !this.decisionHookAppliedForThinking) {
                 this.decisionHookAppliedForThinking = true;
                 this.applyDecisionHook({ type: 'thinking' });
               }
-              accumulatedText += chunk.content;
             } else if (chunk.type === 'thinking' && chunk.thinking) {
               this.normalizer.processThinking(streamId, chunk.thinking);
               this.emit('thinking', chunk.thinking);
               this.seenThinking = true;
             } else if (chunk.type === 'tool_call_start' && chunk.toolCall) {
+              sawToolCallSignal = true;
               this.emit('toolCall', chunk.toolCall.name || '', chunk.toolCall.arguments || {});
               this.applyDecisionHook({
                 type: 'tool_call',
@@ -512,33 +555,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
           // 有工具调用 → 只对无需授权的工具即时渲染卡片。
           // 高风险工具（需授权）延后渲染，确保授权提示先出现。
-          const preAnnouncedToolCallIds = new Set<string>();
-          for (const toolCall of toolCalls) {
-            const requiresAuthorization = this.toolManager.requiresUserAuthorization(toolCall.name);
-            // shell/process 工具即使需要授权也要先渲染卡片，避免执行期无可视反馈
-            if (requiresAuthorization && !this.isTerminalProcessTool(toolCall.name)) {
-              continue;
-            }
-            preAnnouncedToolCallIds.add(toolCall.id);
-            this.normalizer.addToolCall(streamId, {
-              type: 'tool_call',
-              toolName: toolCall.name,
-              toolId: toolCall.id,
-              status: 'running',
-              input: JSON.stringify(toolCall.arguments, null, 2),
-            });
-          }
-
-          const assistantContent: any[] = [];
-          for (const toolCall of toolCalls) {
-            assistantContent.push({
-              type: 'tool_use',
-              id: toolCall.id,
-              name: toolCall.name,
-              input: toolCall.arguments,
-            });
-          }
-          this.conversationHistory.push({ role: 'assistant', content: assistantContent });
+          const preAnnouncedToolCallIds = this.preAnnounceToolCalls(streamId, toolCalls);
+          this.conversationHistory.push({ role: 'assistant', content: this.buildAssistantToolUseBlocks(toolCalls) });
 
           this.roundDedupHits = 0;
           this.roundWriteInterceptCount = 0;
@@ -550,95 +568,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
             break;
           }
 
-          // 终端工具流式预览 promise 收集器，与结果处理循环并行运行
-          const terminalPreviewPromises: Promise<void>[] = [];
-
-          const toolCallMap = new Map(toolCalls.map((toolCall) => [toolCall.id, toolCall] as const));
-          for (const result of toolResults) {
-            const toolCall = toolCallMap.get(result.toolCallId);
-            if (!toolCall) {
-              continue;
-            }
-            const hardError = this.isHardToolFailure(result);
-            if (preAnnouncedToolCallIds.has(result.toolCallId)) {
-              if (this.isTerminalProcessTool(toolCall.name)) {
-                const initialOutput = typeof result.content === 'string' ? result.content : String(result.content ?? '');
-                // 终端工具即使初始 output 为空也推送首帧，确保前端立即获取 terminal_id 等元数据
-                this.normalizer.addToolCall(streamId, {
-                  type: 'tool_call',
-                  toolName: toolCall.name,
-                  toolId: result.toolCallId,
-                  status: 'running',
-                  input: JSON.stringify(toolCall.arguments, null, 2),
-                  output: initialOutput,
-                });
-
-                // 异步启动流式轮询，不阻塞后续工具结果处理
-                const previewPromise = this.autoPreviewProcessOutput(
-                  streamId,
-                  toolCall,
-                  result,
-                  { workerId: this.workerSlot, role: 'worker' },
-                  this.abortController?.signal,
-                );
-                terminalPreviewPromises.push(previewPromise);
-              }
-
-              if (!this.isTerminalProcessTool(toolCall.name)) {
-                this.normalizer.finishToolCall(
-                  streamId,
-                  result.toolCallId,
-                  hardError ? undefined : result.content,
-                  hardError ? result.content : undefined,
-                  result.fileChange,
-                  result.standardized
-                );
-              }
-              continue;
-            }
-
-            // 高风险工具：单独产出一张工具卡片，确保其时序晚于授权卡片
-            const deferredToolStreamId = this.normalizer.startStream(this.currentTraceId!);
-            this.normalizer.addToolCall(deferredToolStreamId, {
-              type: 'tool_call',
-              toolName: toolCall.name,
-              toolId: toolCall.id,
-              status: hardError ? 'failed' : 'completed',
-              input: JSON.stringify(toolCall.arguments, null, 2),
-              output: hardError ? undefined : result.content,
-              error: hardError ? result.content : undefined,
-              standardized: result.standardized,
-            });
-
-            this.normalizer.finishToolCall(
-              deferredToolStreamId,
-              toolCall.id,
-              hardError ? undefined : result.content,
-              hardError ? result.content : undefined,
-              result.fileChange,
-              result.standardized
-            );
-            this.normalizer.endStream(deferredToolStreamId);
-          }
-
-          // 等待所有终端工具流式轮询完成，并 finishToolCall
-          if (terminalPreviewPromises.length > 0) {
-            await Promise.all(terminalPreviewPromises);
-            for (const result of toolResults) {
-              const toolCall = toolCallMap.get(result.toolCallId);
-              if (!toolCall || !this.isTerminalProcessTool(toolCall.name)) continue;
-              if (!preAnnouncedToolCallIds.has(result.toolCallId)) continue;
-              const hardError = this.isHardToolFailure(result);
-              this.normalizer.finishToolCall(
-                streamId,
-                result.toolCallId,
-                hardError ? undefined : result.content,
-                hardError ? result.content : undefined,
-                result.fileChange,
-                result.standardized
-              );
-            }
-          }
+          await this.renderToolResultsWithTerminalStreaming({
+            streamId,
+            toolCalls,
+            toolResults,
+            preAnnouncedToolCallIds,
+            executionContext: { workerId: this.workerSlot, role: 'worker' },
+            signal: this.abortController?.signal,
+          });
 
           this.conversationHistory.push({
             role: 'user',
@@ -849,7 +786,42 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           this.normalizer.endStream(streamId);
           round++;
         } catch (error: any) {
-          this.normalizer.endStream(streamId, error?.message || 'Request failed');
+          const errorMessage = toErrorMessage(error);
+          const hasAccumulatedText = accumulatedText.trim().length > 0;
+          const interruptedAfterToolSignal = sawToolCallSignal && toolCalls.length === 0;
+          const canAutoRecoverInterruptedRound = !this.abortController?.signal.aborted
+            && streamInterruptionRecoveryCount < WorkerLLMAdapter.STREAM_INTERRUPTION_RECOVERY_MAX
+            && isRetryableNetworkError(errorMessage)
+            && (hasAccumulatedText || interruptedAfterToolSignal);
+          if (canAutoRecoverInterruptedRound) {
+            streamInterruptionRecoveryCount += 1;
+            preRecoveryText = hasAccumulatedText ? accumulatedText : '';
+            if (hasAccumulatedText) {
+              this.conversationHistory.push({ role: 'assistant', content: accumulatedText });
+              finalText = accumulatedText;
+            }
+            this.conversationHistory.push({
+              role: 'user',
+              content: this.buildRoundStreamRecoveryPrompt({
+                hasAccumulatedText,
+                interruptedAfterToolSignal,
+                recoveryAttempt: streamInterruptionRecoveryCount,
+                maxRecoveryAttempts: WorkerLLMAdapter.STREAM_INTERRUPTION_RECOVERY_MAX,
+              }),
+            });
+            logger.warn(`${this.agent} 流式中断自动续跑`, {
+              round,
+              recoveryAttempt: streamInterruptionRecoveryCount,
+              hasAccumulatedText,
+              interruptedAfterToolSignal,
+              error: errorMessage.substring(0, 300),
+            }, LogCategory.LLM);
+            this.normalizer.endStream(streamId);
+            round++;
+            continue;
+          }
+
+          this.normalizer.endStream(streamId, errorMessage || 'Request failed');
           // abort 中断不视为异常，优雅退出循环
           if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
             break;
@@ -916,6 +888,22 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   setSystemPrompt(prompt: string): void {
     this.systemPrompt = prompt;
     logger.debug(`${this.agent} system prompt updated`, undefined, LogCategory.LLM);
+  }
+
+  private buildRoundStreamRecoveryPrompt(input: {
+    hasAccumulatedText: boolean;
+    interruptedAfterToolSignal: boolean;
+    recoveryAttempt: number;
+    maxRecoveryAttempts: number;
+  }): string {
+    const { hasAccumulatedText, interruptedAfterToolSignal, recoveryAttempt, maxRecoveryAttempts } = input;
+    if (interruptedAfterToolSignal && hasAccumulatedText) {
+      return `[System] 上一轮在工具调用阶段因网络波动中断，已自动续跑（${recoveryAttempt}/${maxRecoveryAttempts}）。请从已输出内容继续；如需工具，请重新输出完整可执行的 tool_call（含完整参数），不要重复前文。`;
+    }
+    if (interruptedAfterToolSignal) {
+      return `[System] 上一轮在工具调用阶段因网络波动中断，已自动续跑（${recoveryAttempt}/${maxRecoveryAttempts}）。请继续当前任务；如仍需工具，请重新输出完整可执行的 tool_call（含完整参数）。`;
+    }
+    return `[System] 上一轮输出在传输过程中中断（网络波动），已自动续跑（${recoveryAttempt}/${maxRecoveryAttempts}）。请从已输出内容继续，不要重复前文。`;
   }
 
   /**

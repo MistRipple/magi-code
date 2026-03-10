@@ -19,14 +19,15 @@ import type { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import type { ProfileLoader } from '../profile/profile-loader';
 import type { MessageHub } from './message-hub';
 import type { MissionOrchestrator } from './mission-orchestrator';
-import type { Assignment } from '../mission';
+import type { Assignment, AcceptanceCriterion, Constraint } from '../mission';
 import type { WorkerReport, OrchestratorResponse } from '../protocols/worker-report';
-import { createAbortResponse, createAdjustResponse } from '../protocols/worker-report';
+import { createAdjustResponse } from '../protocols/worker-report';
 import {
   DispatchBatch,
   CancellationError,
   isTerminalStatus,
   type DispatchEntry,
+  type DispatchTaskContract,
   type DispatchResult,
   type DispatchStatus,
   type DispatchCollaborationContracts,
@@ -34,6 +35,7 @@ import {
   type DispatchAuditIssue,
   type DispatchAuditLevel,
 } from './dispatch-batch';
+import type { RequirementAnalysis } from '../protocols/types';
 import type {
   WaitForWorkersResult,
   DispatchTaskCollaborationContracts,
@@ -48,7 +50,10 @@ import type { SupplementaryInstructionQueue } from './supplementary-instruction-
 import { DispatchCompletionQueue } from './dispatch-completion-queue';
 import { DispatchRoutingService, type DispatchRoutingDecision } from './dispatch-routing-service';
 import { DispatchResumeContextStore } from './dispatch-resume-context-store';
-import { DispatchIdempotencyStore } from './dispatch-idempotency-store';
+import {
+  DispatchIdempotencyStore,
+  type DispatchIdempotencyStatus,
+} from './dispatch-idempotency-store';
 import { isModelOriginIssue, toModelOriginUserMessage } from '../../errors/model-origin';
 import { trackModelOriginEvent } from '../../errors/model-origin-observability';
 import { createHash } from 'crypto';
@@ -76,6 +81,16 @@ interface DispatchFailureSemantic {
   userMessage: string;
   recoverable: boolean;
   notifyLevel: 'warning' | 'error';
+}
+
+interface DispatchDependencyResolution {
+  dependsOn?: string[];
+  resolvedHistoricalCompleted: string[];
+  droppedUnknown: string[];
+  droppedCrossSession: string[];
+  droppedHistoricalUnfinished: Array<{ taskId: string; status: DispatchIdempotencyStatus }>;
+  degraded: boolean;
+  routingReasonPatches: string[];
 }
 
 /**
@@ -160,8 +175,6 @@ export class DispatchManager {
   private readonly routingService: DispatchRoutingService;
   /** Resume 上下文存储 */
   private readonly resumeContextStore: DispatchResumeContextStore;
-  /** 记录 dispatch task 的分类（用于可解释性与后续诊断） */
-  private dispatchTaskCategories = new Map<string, string>();
   /** dispatch 幂等账本（跨进程重放去重） */
   private readonly dispatchIdempotencyStore: DispatchIdempotencyStore;
   /** 活跃的 Assignment 映射（Worker 执行期间可查，供 split_todo handler 使用） */
@@ -251,7 +264,7 @@ export class DispatchManager {
     if (entry) {
       this.deps.messageHub.subTaskCard({
         id: assignmentId,
-        title: entry.task,
+        title: entry.taskContract.taskTitle,
         status: 'running',
         worker: entry.worker,
         summary,
@@ -300,7 +313,6 @@ export class DispatchManager {
 
     if (this.activeBatch) {
       this.reactiveBatchAwaitingSummary.delete(this.activeBatch.id);
-      this.clearBatchTaskCategories(this.activeBatch);
     }
 
     this.activeBatch = null;
@@ -501,21 +513,58 @@ export class DispatchManager {
           };
         }
 
+        // 确保 DispatchBatch 存在（一次 orchestrator LLM 调用共享一个 Batch）
+        if (!this.activeBatch || this.activeBatch.status !== 'active') {
+          if (this.activeBatch?.status === 'archived') {
+            this.reactiveBatchAwaitingSummary.delete(this.activeBatch.id);
+          }
+          // 使用 Mission ID 作为 Batch ID，确保 Todo 关联到正确的 Mission
+          this.activeBatch = new DispatchBatch(missionId);
+          this.activeBatch.userPrompt = this.deps.getActiveUserPrompt();
+          this.setupBatchEventHandlers(this.activeBatch);
+          // reactiveMode 是执行级状态，仅由 resetForNewExecutionCycle() 重置
+          this.completionQueue.reset();
+        }
         const resolvedSessionId = this.deps.getCurrentSessionId()?.trim() || '';
         const sessionScopeForIdempotency = resolvedSessionId || 'unknown-session';
-        const effectiveIdempotencyKey = this.buildDispatchIdempotencyKey({
+
+        const dependencyResolution = this.resolveDispatchDependencies({
+          batch: this.activeBatch,
+          dependsOn: normalizedDependsOn,
           sessionId: sessionScopeForIdempotency,
-          missionId,
-          providedKey: idempotencyKey,
+        });
+        const scopeHintPlan = this.resolveParallelScopeHintPolicy({
+          batch: this.activeBatch,
+          scopeHint: normalizedScopeHint,
+          dependsOn: dependencyResolution.dependsOn,
+          routingReason: decision.routingReason,
+          degraded: decision.degraded,
+        });
+        const effectiveDependsOn = scopeHintPlan.dependsOn;
+        const effectiveRoutingReason = [
+          scopeHintPlan.routingReason,
+          ...dependencyResolution.routingReasonPatches,
+        ].filter(Boolean).join('; ');
+        const effectiveDegraded = scopeHintPlan.degraded || dependencyResolution.degraded;
+        const taskContract = this.buildDispatchTaskContract({
+          taskTitle,
           category: decision.category,
-          taskName: taskTitle,
           goal: goalText || taskTitle,
           acceptance: normalizedAcceptance,
           constraints: normalizedConstraints,
           context: normalizedContext,
           scopeHint: normalizedScopeHint,
           files: normalizedFiles,
-          dependsOn: normalizedDependsOn,
+          dependsOn: effectiveDependsOn,
+          requiresModification,
+          collaborationContracts,
+          routingReason: effectiveRoutingReason,
+        });
+        const effectiveIdempotencyKey = this.buildDispatchIdempotencyKey({
+          sessionId: sessionScopeForIdempotency,
+          missionId,
+          providedKey: idempotencyKey,
+          taskContract,
         });
         // 先生成候选 taskId，再通过 claimOrGet 做原子幂等占位，避免跨实例 TOCTOU 竞争。
         const taskId = `dispatch-${Date.now()}-${decision.selectedWorker}-${Math.random().toString(36).substring(2, 5)}`;
@@ -529,8 +578,8 @@ export class DispatchManager {
             worker: decision.selectedWorker,
             category: decision.category,
             taskName: taskTitle,
-            routingReason: decision.routingReason,
-            degraded: decision.degraded,
+            routingReason: effectiveRoutingReason,
+            degraded: effectiveDegraded,
             status: 'dispatched',
           });
         } catch (idempotencyError: any) {
@@ -593,40 +642,27 @@ export class DispatchManager {
             degraded: existingIdempotent.degraded,
           };
         }
-        this.dispatchTaskCategories.set(taskId, decision.category);
+        this.notifyDispatchDependencyResolution(taskId, dependencyResolution);
 
-        // 确保 DispatchBatch 存在（一次 orchestrator LLM 调用共享一个 Batch）
-        if (!this.activeBatch || this.activeBatch.status !== 'active') {
-          if (this.activeBatch?.status === 'archived') {
-            this.reactiveBatchAwaitingSummary.delete(this.activeBatch.id);
-          }
-          // 使用 Mission ID 作为 Batch ID，确保 Todo 关联到正确的 Mission
-          this.activeBatch = new DispatchBatch(missionId);
-          this.activeBatch.userPrompt = this.deps.getActiveUserPrompt();
-          this.setupBatchEventHandlers(this.activeBatch);
-          // reactiveMode 是执行级状态，仅由 resetForNewExecutionCycle() 重置
-          this.completionQueue.reset();
+        if (scopeHintPlan.addedDependencies.length > 0) {
+          this.deps.messageHub.notify(t('dispatch.notify.parallelScopeHintMissingSerialized', {
+            taskId,
+            count: scopeHintPlan.addedDependencies.length,
+          }), 'warning');
+          logger.info('编排工具.dispatch_task.scope_hint缺失自动串行', {
+            taskId,
+            worker: decision.selectedWorker,
+            addedDependencies: scopeHintPlan.addedDependencies,
+            existingDependsOn: normalizedDependsOn || [],
+          }, LogCategory.ORCHESTRATOR);
         }
 
         // 注册到 DispatchBatch
         try {
-          if ((!normalizedScopeHint || normalizedScopeHint.length === 0) && this.shouldWarnMissingScopeHintForParallelTask(this.activeBatch, normalizedDependsOn)) {
-            throw new Error(t('dispatch.errors.parallelScopeHintRequired'));
-          }
-
           this.activeBatch.register({
             taskId,
             worker: decision.selectedWorker,
-            goal: taskTitle,
-            acceptance: normalizedAcceptance,
-            constraints: normalizedConstraints,
-            context: normalizedContext,
-            task: taskTitle,
-            scopeHint: normalizedScopeHint,
-            files: normalizedFiles,
-            requiresModification,
-            dependsOn: normalizedDependsOn,
-            collaborationContracts,
+            taskContract,
           });
 
           // C-12: 环检测 + 深度上限校验
@@ -644,15 +680,14 @@ export class DispatchManager {
             this.activeBatch.validateDepthLimit();
           }
         } catch (regError: any) {
-          this.dispatchTaskCategories.delete(taskId);
           this.dispatchIdempotencyStore.removeByTaskId(taskId);
           return {
             task_id: taskId,
             status: 'failed' as const,
             worker: decision.selectedWorker,
             category: decision.category,
-            routing_reason: decision.routingReason,
-            degraded: decision.degraded,
+            routing_reason: effectiveRoutingReason,
+            degraded: effectiveDegraded,
             error: regError.message,
           };
         }
@@ -661,7 +696,7 @@ export class DispatchManager {
         const entry = this.activeBatch.getEntry(taskId);
         const entryStatus = entry
           ? entry.status
-          : (normalizedDependsOn && normalizedDependsOn.length > 0 ? 'waiting_deps' : 'pending');
+          : (effectiveDependsOn && effectiveDependsOn.length > 0 ? 'waiting_deps' : 'pending');
         const cardStatus = this.mapDispatchStatusToInitialCardStatus(entryStatus);
 
         if (resolvedSessionId && this.deps.onDispatchTaskRegistered) {
@@ -671,12 +706,12 @@ export class DispatchManager {
               missionId,
               taskId,
               worker: decision.selectedWorker,
-              title: taskTitle,
-              category: decision.category,
-              dependsOn: normalizedDependsOn,
-              scopeHint: normalizedScopeHint,
-              files: normalizedFiles,
-              requiresModification,
+              title: taskContract.taskTitle,
+              category: taskContract.category,
+              dependsOn: taskContract.dependsOn.length > 0 ? taskContract.dependsOn : undefined,
+              scopeHint: taskContract.scopeHint.length > 0 ? taskContract.scopeHint : undefined,
+              files: taskContract.files.length > 0 ? taskContract.files : undefined,
+              requiresModification: taskContract.requirementAnalysis.requiresModification === true,
             });
           } catch (ledgerError) {
             logger.warn('编排工具.dispatch_task.计划账本回写失败', {
@@ -712,8 +747,8 @@ export class DispatchManager {
           status: 'dispatched' as const,
           worker: decision.selectedWorker,
           category: decision.category,
-          routing_reason: decision.routingReason,
-          degraded: decision.degraded,
+          routing_reason: effectiveRoutingReason,
+          degraded: effectiveDegraded,
         };
       },
 
@@ -1005,41 +1040,27 @@ export class DispatchManager {
     options?: { emitWorkerInstruction?: boolean },
   ): Promise<void> {
     const emitWorkerInstruction = options?.emitWorkerInstruction ?? true;
+    const { taskId, worker, taskContract } = entry;
     const {
-      taskId,
-      worker,
-      task,
-      goal,
-      acceptance,
-      constraints,
+      taskTitle,
+      category,
+      requirementAnalysis,
       context,
       scopeHint,
       files,
-      requiresModification,
       collaborationContracts,
-    } = entry;
+    } = taskContract;
+    const goal = requirementAnalysis.goal;
+    const acceptance = requirementAnalysis.acceptanceCriteria || [];
+    const constraints = requirementAnalysis.constraints || [];
+    const requiresModification = requirementAnalysis.requiresModification === true;
     const batch = this.activeBatch;
-    const category = this.dispatchTaskCategories.get(taskId);
-    if (!category) {
-      const errorMsg = t('dispatch.errors.dispatchCategoryMissing', { taskId });
-      this.deps.messageHub.subTaskCard({
-        id: taskId,
-        title: task,
-        status: 'failed',
-        worker,
-        summary: errorMsg,
-        error: errorMsg,
-      });
-      batch?.markFailed(taskId, { success: false, summary: errorMsg, errors: [errorMsg] });
-      logger.error('编排工具.dispatch_task.任务分类丢失', { taskId, worker }, LogCategory.ORCHESTRATOR);
-      return;
-    }
     const executionRouting = this.resolveExecutionWorker(worker);
     if (!executionRouting.ok) {
       const errorMsg = executionRouting.error;
       this.deps.messageHub.subTaskCard({
         id: taskId,
-        title: task,
+        title: taskTitle,
         status: 'failed',
         worker,
         summary: errorMsg,
@@ -1079,7 +1100,7 @@ export class DispatchManager {
     batch?.markRunning(taskId);
     this.deps.messageHub.subTaskCard({
       id: taskId,
-      title: task,
+      title: taskTitle,
       status: 'running',
       worker: effectiveWorker,
     });
@@ -1095,22 +1116,21 @@ export class DispatchManager {
 
       // 构建轻量 Assignment
       const missionId = batch?.id || 'dispatch';
+      const assignmentAcceptanceCriteria = this.buildAssignmentAcceptanceCriteria(acceptance);
+      const assignmentConstraints = this.buildAssignmentConstraints(constraints);
       const assignment: Assignment = {
         id: taskId,
         missionId,
         workerId: effectiveWorker,
-        shortTitle: task,
-        responsibility: task,
+        shortTitle: taskTitle,
+        responsibility: taskTitle,
         delegationBriefing: this.buildDelegationBriefing({
-          goal,
-          acceptance,
-          constraints,
-          context,
-          scopeHint,
-          files,
+          taskContract,
           predecessorContext: this.buildPredecessorContext(taskId),
-          collaborationContracts,
         }),
+        contextNotes: [...context],
+        constraints: assignmentConstraints,
+        acceptanceCriteria: assignmentAcceptanceCriteria,
         assignmentReason: {
           profileMatch: { category, score: 100, matchedKeywords: [] },
           contractRole: 'none' as const,
@@ -1118,10 +1138,10 @@ export class DispatchManager {
           alternatives: [],
         },
         scope: {
-          includes: [task],
+          includes: [taskTitle],
           excludes: [],
-          scopeHints: scopeHint || [],
-          targetPaths: files || [],
+          scopeHints: [...scopeHint],
+          targetPaths: [...files],
           requiresModification,
         },
         guidancePrompt: this.buildScopeHintGuidance(scopeHint),
@@ -1146,7 +1166,7 @@ export class DispatchManager {
         const errorMsg = t('dispatch.errors.currentSessionMissingCannotCreateTodo');
         this.deps.messageHub.subTaskCard({
           id: taskId,
-          title: task,
+          title: taskTitle,
           status: 'failed',
           worker: effectiveWorker,
           summary: errorMsg,
@@ -1237,7 +1257,7 @@ export class DispatchManager {
       // 更新 subTaskCard 最终状态
       this.deps.messageHub.subTaskCard({
         id: taskId,
-        title: task,
+        title: taskTitle,
         status: result.success ? 'completed' : 'failed',
         worker: effectiveWorker,
         summary,
@@ -1277,7 +1297,7 @@ export class DispatchManager {
         this.markProtocolNack(taskId, error.message || 'cancelled');
         this.deps.messageHub.subTaskCard({
           id: taskId,
-          title: task,
+          title: taskTitle,
           status: 'stopped',
           worker: effectiveWorker,
           summary: error.message,
@@ -1316,7 +1336,7 @@ export class DispatchManager {
 
       this.deps.messageHub.subTaskCard({
         id: taskId,
-        title: task,
+        title: taskTitle,
         status: 'failed',
         worker: effectiveWorker,
         summary: userErrorMsg,
@@ -1409,7 +1429,7 @@ export class DispatchManager {
     batch: DispatchBatch | null,
   ): void {
     if (!batch) {
-      this.deps.messageHub.workerInstruction(worker, entry.task, {
+      this.deps.messageHub.workerInstruction(worker, entry.taskContract.taskTitle, {
         assignmentId: entry.taskId,
       });
       return;
@@ -1437,9 +1457,9 @@ export class DispatchManager {
         laneCurrentTaskId: entry.taskId,
         laneTasks: laneEntries.map(item => ({
           taskId: item.taskId,
-          title: item.task,
+          title: item.taskContract.taskTitle,
           status: item.status,
-          dependsOn: item.dependsOn,
+          dependsOn: item.taskContract.dependsOn,
           isCurrent: item.taskId === entry.taskId,
         })),
       },
@@ -1481,16 +1501,21 @@ export class DispatchManager {
     const currentIndex = entries.findIndex(entry => entry.taskId === currentTaskId);
     const laneIndex = currentIndex >= 0 ? currentIndex + 1 : 1;
     const laneTotal = Math.max(entries.length, 1);
-    const list = entries.length > 0 ? entries : [{
+    const list = entries.length > 0 ? entries.map(item => ({
+      taskId: item.taskId,
+      taskTitle: item.taskContract.taskTitle,
+      status: item.status,
+      dependsOn: item.taskContract.dependsOn,
+    })) : [{
       taskId: currentTaskId,
-      task: current?.task || t('dispatch.lane.unknownTask'),
+      taskTitle: current?.taskContract.taskTitle || t('dispatch.lane.unknownTask'),
       status: 'running' as const,
       dependsOn: [] as string[],
     }];
 
     const lines = [
       t('dispatch.lane.header'),
-      t('dispatch.lane.currentTask', { task: current?.task || t('dispatch.lane.unknownTask') }),
+      t('dispatch.lane.currentTask', { task: current?.taskContract.taskTitle || t('dispatch.lane.unknownTask') }),
       t('dispatch.lane.progress', { laneIndex, laneTotal }),
       t('dispatch.lane.description'),
       '',
@@ -1499,7 +1524,7 @@ export class DispatchManager {
         const dependsText = item.dependsOn.length > 0
           ? t('dispatch.lane.dependsOn', { dependsOn: item.dependsOn.join(', ') })
           : '';
-        return `${index + 1}. [${this.getWorkerLaneTaskStatusLabel(item.status, item.taskId === currentTaskId)}] ${item.task}${dependsText}`;
+        return `${index + 1}. [${this.getWorkerLaneTaskStatusLabel(item.status, item.taskId === currentTaskId)}] ${item.taskTitle}${dependsText}`;
       }),
     ];
 
@@ -1627,7 +1652,6 @@ export class DispatchManager {
     batch.on('batch:cancelled', (batchId: string, reason: string) => {
       this.reactiveBatchAwaitingSummary.delete(batchId);
       this.phaseBPlusTimestamps.delete(batchId);
-      this.clearBatchTaskCategories(batch);
       this.clearProtocolStatesByBatch(batchId);
       this.activeWorkerLanes.clear();
       this.clearDispatchScheduleTimers(batchId);
@@ -1638,7 +1662,6 @@ export class DispatchManager {
     batch.on('phase:changed', (_batchId: string, phase) => {
       if (phase === 'archived') {
         this.phaseBPlusTimestamps.delete(batch.id);
-        this.clearBatchTaskCategories(batch);
         this.clearProtocolStatesByBatch(batch.id);
         this.activeWorkerLanes.clear();
         this.clearDispatchScheduleTimers(batch.id);
@@ -1835,7 +1858,7 @@ export class DispatchManager {
       t('dispatch.reactiveSummary.taskLine', {
         index: index + 1,
         worker: entry.worker,
-        task: entry.task,
+        task: entry.taskContract.taskTitle,
         status: statusLabel(entry.status),
         summary: entry.result?.summary || t('dispatch.reactiveSummary.noResultSummary'),
       })
@@ -1936,14 +1959,25 @@ export class DispatchManager {
             question: report.question.content.substring(0, 120),
           });
           this.deps.messageHub.notify(reason, 'warning');
-          return createAbortResponse(reason);
+          logger.warn('Phase B+ 阻塞问题未获得有效决策，降级继续', {
+            assignmentId: report.assignmentId,
+            worker: report.workerId,
+            question: report.question.content.substring(0, 200),
+          }, LogCategory.ORCHESTRATOR);
+          return defaultResponse;
         }
       } catch (error: any) {
         logger.error('Phase B+ 中间调用失败', { error: error.message }, LogCategory.ORCHESTRATOR);
         if (isBlocking) {
           const reason = t('dispatch.phaseBPlus.blockingDecisionFailed', { error: error.message });
           this.deps.messageHub.notify(reason, 'warning');
-          return createAbortResponse(reason);
+          logger.warn('Phase B+ 阻塞问题决策失败，降级继续', {
+            assignmentId: report.assignmentId,
+            worker: report.workerId,
+            question: report.question.content.substring(0, 200),
+            error: error?.message || String(error),
+          }, LogCategory.ORCHESTRATOR);
+          return defaultResponse;
         }
       }
 
@@ -2182,7 +2216,7 @@ export class DispatchManager {
     const timeoutMessage = semantic.userMessage;
     this.deps.messageHub.subTaskCard({
       id: state.taskId,
-      title: entry.task,
+      title: entry.taskContract.taskTitle,
       status: 'failed',
       worker: state.worker,
       summary: timeoutMessage,
@@ -2245,12 +2279,6 @@ export class DispatchManager {
     this.executionProtocolStates.clear();
   }
 
-  private clearBatchTaskCategories(batch: DispatchBatch): void {
-    for (const entry of batch.getEntries()) {
-      this.dispatchTaskCategories.delete(entry.taskId);
-    }
-  }
-
   private reportIdempotencyDeploymentDiagnostic(): void {
     const diagnostic = this.dispatchIdempotencyStore.getDeploymentDiagnostic();
     if (diagnostic.level === 'info') {
@@ -2306,35 +2334,32 @@ export class DispatchManager {
   }
 
   private buildDelegationBriefing(input: {
-    goal: string;
-    acceptance: string[];
-    constraints: string[];
-    context: string[];
-    scopeHint?: string[];
-    files?: string[];
+    taskContract: DispatchTaskContract;
     predecessorContext?: string;
-    collaborationContracts: DispatchCollaborationContracts;
   }): string {
+    const { taskContract, predecessorContext } = input;
+    const acceptance = taskContract.requirementAnalysis.acceptanceCriteria || [];
+    const constraints = taskContract.requirementAnalysis.constraints || [];
     const lines: string[] = [
-      t('dispatch.delegation.goal', { goal: input.goal }),
-      t('dispatch.delegation.acceptance', { acceptance: input.acceptance.map(item => `- ${item}`).join('\n') }),
-      t('dispatch.delegation.constraints', { constraints: input.constraints.map(item => `- ${item}`).join('\n') }),
-      t('dispatch.delegation.context', { context: input.context.map(item => `- ${item}`).join('\n') }),
+      t('dispatch.delegation.goal', { goal: taskContract.requirementAnalysis.goal }),
+      t('dispatch.delegation.acceptance', { acceptance: acceptance.map(item => `- ${item}`).join('\n') }),
+      t('dispatch.delegation.constraints', { constraints: constraints.map(item => `- ${item}`).join('\n') }),
+      t('dispatch.delegation.context', { context: taskContract.context.map(item => `- ${item}`).join('\n') }),
     ];
 
-    if (input.predecessorContext) {
-      lines.push(input.predecessorContext);
+    if (predecessorContext) {
+      lines.push(predecessorContext);
     }
 
-    if (input.scopeHint && input.scopeHint.length > 0) {
-      lines.push(t('dispatch.delegation.scopeHint', { scopeHint: input.scopeHint.map(item => `- ${item}`).join('\n') }));
+    if (taskContract.scopeHint.length > 0) {
+      lines.push(t('dispatch.delegation.scopeHint', { scopeHint: taskContract.scopeHint.map(item => `- ${item}`).join('\n') }));
     }
 
-    if (input.files && input.files.length > 0) {
-      lines.push(t('dispatch.delegation.strictFiles', { files: input.files.map(item => `- ${item}`).join('\n') }));
+    if (taskContract.files.length > 0) {
+      lines.push(t('dispatch.delegation.strictFiles', { files: taskContract.files.map(item => `- ${item}`).join('\n') }));
     }
 
-    const contracts = input.collaborationContracts;
+    const contracts = taskContract.collaborationContracts;
     if (contracts.producerContracts.length > 0 || contracts.consumerContracts.length > 0 || contracts.interfaceContracts.length > 0 || contracts.freezeFiles.length > 0) {
       lines.push(t('dispatch.delegation.contractsHeader'));
       if (contracts.producerContracts.length > 0) {
@@ -2366,10 +2391,10 @@ export class DispatchManager {
     if (!batch) return undefined;
 
     const entry = batch.getEntry(taskId);
-    if (!entry || entry.dependsOn.length === 0) return undefined;
+    if (!entry || entry.taskContract.dependsOn.length === 0) return undefined;
 
     const sections: string[] = [];
-    for (const depId of entry.dependsOn) {
+    for (const depId of entry.taskContract.dependsOn) {
       const depEntry = batch.getEntry(depId);
       if (!depEntry?.result) continue;
 
@@ -2399,11 +2424,214 @@ export class DispatchManager {
     ].join('\n');
   }
 
+  private resolveDispatchDependencies(input: {
+    batch: DispatchBatch;
+    dependsOn?: string[];
+    sessionId: string;
+  }): DispatchDependencyResolution {
+    const normalizedDependsOn = input.dependsOn && input.dependsOn.length > 0
+      ? [...new Set(input.dependsOn.map(item => item.trim()).filter(Boolean))]
+      : [];
+    if (normalizedDependsOn.length === 0) {
+      return {
+        dependsOn: undefined,
+        resolvedHistoricalCompleted: [],
+        droppedUnknown: [],
+        droppedCrossSession: [],
+        droppedHistoricalUnfinished: [],
+        degraded: false,
+        routingReasonPatches: [],
+      };
+    }
+
+    const inBatchDependsOn: string[] = [];
+    const resolvedHistoricalCompleted: string[] = [];
+    const droppedUnknown: string[] = [];
+    const droppedCrossSession: string[] = [];
+    const droppedHistoricalUnfinished: Array<{ taskId: string; status: DispatchIdempotencyStatus }> = [];
+
+    for (const depId of normalizedDependsOn) {
+      if (input.batch.getEntry(depId)) {
+        inBatchDependsOn.push(depId);
+        continue;
+      }
+      const historical = this.dispatchIdempotencyStore.resolveByTaskId(depId);
+      if (!historical) {
+        droppedUnknown.push(depId);
+        continue;
+      }
+      if (historical.sessionId !== input.sessionId) {
+        droppedCrossSession.push(depId);
+        continue;
+      }
+      if (historical.status === 'completed') {
+        resolvedHistoricalCompleted.push(depId);
+        continue;
+      }
+      droppedHistoricalUnfinished.push({ taskId: depId, status: historical.status });
+    }
+
+    const routingReasonPatches: string[] = [];
+    if (resolvedHistoricalCompleted.length > 0) {
+      routingReasonPatches.push(t('dispatch.notify.dependsOnResolvedHistoryReason', {
+        count: resolvedHistoricalCompleted.length,
+      }));
+    }
+    if (droppedUnknown.length > 0) {
+      routingReasonPatches.push(t('dispatch.notify.dependsOnDroppedUnknownReason', {
+        count: droppedUnknown.length,
+      }));
+    }
+    if (droppedCrossSession.length > 0) {
+      routingReasonPatches.push(t('dispatch.notify.dependsOnDroppedCrossSessionReason', {
+        count: droppedCrossSession.length,
+      }));
+    }
+    if (droppedHistoricalUnfinished.length > 0) {
+      routingReasonPatches.push(t('dispatch.notify.dependsOnDroppedUnfinishedReason', {
+        count: droppedHistoricalUnfinished.length,
+      }));
+    }
+
+    return {
+      dependsOn: inBatchDependsOn.length > 0 ? inBatchDependsOn : undefined,
+      resolvedHistoricalCompleted,
+      droppedUnknown,
+      droppedCrossSession,
+      droppedHistoricalUnfinished,
+      degraded: droppedUnknown.length > 0 || droppedCrossSession.length > 0 || droppedHistoricalUnfinished.length > 0,
+      routingReasonPatches,
+    };
+  }
+
+  private notifyDispatchDependencyResolution(taskId: string, resolution: DispatchDependencyResolution): void {
+    if (resolution.resolvedHistoricalCompleted.length > 0) {
+      this.deps.messageHub.notify(t('dispatch.notify.dependsOnResolvedHistory', {
+        taskId,
+        count: resolution.resolvedHistoricalCompleted.length,
+        dependencies: this.formatDependencyPreview(resolution.resolvedHistoricalCompleted),
+      }), 'info');
+    }
+
+    if (resolution.droppedUnknown.length > 0) {
+      this.deps.messageHub.notify(t('dispatch.notify.dependsOnDroppedUnknown', {
+        taskId,
+        count: resolution.droppedUnknown.length,
+        dependencies: this.formatDependencyPreview(resolution.droppedUnknown),
+      }), 'warning');
+    }
+
+    if (resolution.droppedCrossSession.length > 0) {
+      this.deps.messageHub.notify(t('dispatch.notify.dependsOnDroppedCrossSession', {
+        taskId,
+        count: resolution.droppedCrossSession.length,
+        dependencies: this.formatDependencyPreview(resolution.droppedCrossSession),
+      }), 'warning');
+    }
+
+    if (resolution.droppedHistoricalUnfinished.length > 0) {
+      const preview = resolution.droppedHistoricalUnfinished
+        .slice(0, 3)
+        .map(item => `${item.taskId}(${item.status})`);
+      const extra = resolution.droppedHistoricalUnfinished.length - preview.length;
+      const dependencies = extra > 0 ? `${preview.join(', ')} +${extra}` : preview.join(', ');
+      this.deps.messageHub.notify(t('dispatch.notify.dependsOnDroppedUnfinished', {
+        taskId,
+        count: resolution.droppedHistoricalUnfinished.length,
+        dependencies,
+      }), 'warning');
+    }
+  }
+
+  private formatDependencyPreview(taskIds: string[]): string {
+    const preview = taskIds.slice(0, 3);
+    const extra = taskIds.length - preview.length;
+    if (extra > 0) {
+      return `${preview.join(', ')} +${extra}`;
+    }
+    return preview.join(', ');
+  }
+
   private shouldWarnMissingScopeHintForParallelTask(batch: DispatchBatch, dependsOn?: string[]): boolean {
     const dependencySet = new Set(dependsOn || []);
     return batch.getEntries().some(entry =>
       !isTerminalStatus(entry.status) && !dependencySet.has(entry.taskId)
     );
+  }
+
+  private buildAutoSerializationDependenciesForMissingScopeHint(
+    batch: DispatchBatch,
+    dependsOn?: string[],
+  ): string[] {
+    const dependencySet = new Set(dependsOn || []);
+    const merged = [...dependencySet];
+    for (const entry of batch.getEntries()) {
+      if (isTerminalStatus(entry.status)) continue;
+      if (dependencySet.has(entry.taskId)) continue;
+      dependencySet.add(entry.taskId);
+      merged.push(entry.taskId);
+    }
+    return merged;
+  }
+
+  /**
+   * 并行分区策略统一入口：
+   * - scope_hint 存在：按调用方输入执行，不做额外降级。
+   * - scope_hint 缺失且当前批次仍存在并行风险：自动补全 depends_on 转串行，
+   *   并同步升级 routing_reason / degraded，确保幂等账本与实际执行口径一致。
+   */
+  private resolveParallelScopeHintPolicy(input: {
+    batch: DispatchBatch;
+    scopeHint?: string[];
+    dependsOn?: string[];
+    routingReason: string;
+    degraded: boolean;
+  }): {
+    dependsOn?: string[];
+    routingReason: string;
+    degraded: boolean;
+    addedDependencies: string[];
+  } {
+    const normalizedDependsOn = input.dependsOn && input.dependsOn.length > 0
+      ? [...new Set(input.dependsOn)]
+      : undefined;
+
+    if (input.scopeHint && input.scopeHint.length > 0) {
+      return {
+        dependsOn: normalizedDependsOn,
+        routingReason: input.routingReason,
+        degraded: input.degraded,
+        addedDependencies: [],
+      };
+    }
+
+    if (!this.shouldWarnMissingScopeHintForParallelTask(input.batch, normalizedDependsOn)) {
+      return {
+        dependsOn: normalizedDependsOn,
+        routingReason: input.routingReason,
+        degraded: input.degraded,
+        addedDependencies: [],
+      };
+    }
+
+    const serializedDependsOn = this.buildAutoSerializationDependenciesForMissingScopeHint(
+      input.batch,
+      normalizedDependsOn,
+    );
+    const addedDependencies = serializedDependsOn.filter(taskId =>
+      !(normalizedDependsOn || []).includes(taskId)
+    );
+    const baseReason = input.routingReason?.trim() || 'routing';
+    const downgradeReason = t('dispatch.notify.parallelScopeHintMissingSerializedReason', {
+      count: addedDependencies.length,
+    });
+
+    return {
+      dependsOn: serializedDependsOn.length > 0 ? serializedDependsOn : undefined,
+      routingReason: `${baseReason}; ${downgradeReason}`,
+      degraded: true,
+      addedDependencies,
+    };
   }
 
   private normalizeCollaborationContracts(
@@ -2416,6 +2644,49 @@ export class DispatchManager {
       consumerContracts: raw?.consumer_contracts || [],
       interfaceContracts: raw?.interface_contracts || [],
       freezeFiles: raw?.freeze_files || [],
+    };
+  }
+
+  private buildDispatchTaskContract(input: {
+    taskTitle: string;
+    category: string;
+    goal: string;
+    acceptance: string[];
+    constraints: string[];
+    context: string[];
+    scopeHint?: string[];
+    files?: string[];
+    dependsOn?: string[];
+    requiresModification: boolean;
+    collaborationContracts: DispatchCollaborationContracts;
+    routingReason: string;
+  }): DispatchTaskContract {
+    const requirementAnalysis: RequirementAnalysis = {
+      goal: input.goal,
+      analysis: input.taskTitle,
+      constraints: input.constraints.length > 0 ? [...input.constraints] : undefined,
+      acceptanceCriteria: input.acceptance.length > 0 ? [...input.acceptance] : undefined,
+      needsWorker: true,
+      categories: [input.category],
+      needsTooling: true,
+      requiresModification: input.requiresModification,
+      reason: input.routingReason.trim() || `dispatch_task 分类为 ${input.category}`,
+    };
+
+    return {
+      taskTitle: input.taskTitle,
+      category: input.category,
+      requirementAnalysis,
+      context: [...input.context],
+      scopeHint: input.scopeHint ? [...input.scopeHint] : [],
+      files: input.files ? [...input.files] : [],
+      dependsOn: input.dependsOn ? [...input.dependsOn] : [],
+      collaborationContracts: {
+        producerContracts: [...input.collaborationContracts.producerContracts],
+        consumerContracts: [...input.collaborationContracts.consumerContracts],
+        interfaceContracts: [...input.collaborationContracts.interfaceContracts],
+        freezeFiles: [...input.collaborationContracts.freezeFiles],
+      },
     };
   }
 
@@ -2476,7 +2747,7 @@ export class DispatchManager {
         continue;
       }
 
-      const strictFiles = new Set((entry.files || []).map(file => this.normalizePath(file)).filter(Boolean));
+      const strictFiles = new Set(entry.taskContract.files.map(file => this.normalizePath(file)).filter(Boolean));
       if (strictFiles.size > 0) {
         const outOfStrictFiles = modifiedFiles.filter(file => !strictFiles.has(file));
         if (outOfStrictFiles.length > 0) {
@@ -2489,9 +2760,9 @@ export class DispatchManager {
         }
       }
 
-      if (entry.scopeHint.length > 0) {
+      if (entry.taskContract.scopeHint.length > 0) {
         const outOfHintFiles = modifiedFiles.filter(file =>
-          !entry.scopeHint.some(hint => this.pathMatchesHint(file, hint))
+          !entry.taskContract.scopeHint.some(hint => this.pathMatchesHint(file, hint))
         );
         if (outOfHintFiles.length > 0) {
           escalate(
@@ -2503,7 +2774,7 @@ export class DispatchManager {
         }
       }
 
-      const freezeFiles = new Set(entry.collaborationContracts.freezeFiles.map(file => this.normalizePath(file)).filter(Boolean));
+      const freezeFiles = new Set(entry.taskContract.collaborationContracts.freezeFiles.map(file => this.normalizePath(file)).filter(Boolean));
       if (freezeFiles.size > 0) {
         const touchedFreezeFiles = modifiedFiles.filter(file => freezeFiles.has(file));
         if (touchedFreezeFiles.length > 0) {
@@ -2586,7 +2857,7 @@ export class DispatchManager {
     auditOutcome: DispatchAuditOutcome,
     entries: DispatchEntry[],
   ): string {
-    const titleByTaskId = new Map(entries.map(entry => [entry.taskId, entry.task]));
+    const titleByTaskId = new Map(entries.map(entry => [entry.taskId, entry.taskContract.taskTitle]));
     const interventionIssues = auditOutcome.issues.filter(issue => issue.level === 'intervention');
     const watchIssues = auditOutcome.issues.filter(issue => issue.level === 'watch');
 
@@ -2642,10 +2913,10 @@ export class DispatchManager {
     if (!entry) {
       return false;
     }
-    if (entry.dependsOn.includes(targetTaskId)) {
+    if (entry.taskContract.dependsOn.includes(targetTaskId)) {
       return true;
     }
-    return entry.dependsOn.some(depId => this.hasDependencyChain(depId, targetTaskId, entryById, visited));
+    return entry.taskContract.dependsOn.some(depId => this.hasDependencyChain(depId, targetTaskId, entryById, visited));
   }
 
   private normalizePath(input: string): string {
@@ -2656,15 +2927,7 @@ export class DispatchManager {
     sessionId: string;
     missionId: string;
     providedKey?: string;
-    category: string;
-    taskName: string;
-    goal: string;
-    acceptance: string[];
-    constraints: string[];
-    context: string[];
-    scopeHint?: string[];
-    files?: string[];
-    dependsOn?: string[];
+    taskContract: DispatchTaskContract;
   }): string {
     const scopePrefix = `${input.sessionId}::${input.missionId}::`;
     const provided = typeof input.providedKey === 'string' ? input.providedKey.trim() : '';
@@ -2678,19 +2941,51 @@ export class DispatchManager {
         ? items.map(item => item.trim()).filter(Boolean).sort()
         : [];
 
+    const normalizeContracts = (contracts: DispatchCollaborationContracts): DispatchCollaborationContracts => ({
+      producerContracts: normalizeArray(contracts.producerContracts),
+      consumerContracts: normalizeArray(contracts.consumerContracts),
+      interfaceContracts: normalizeArray(contracts.interfaceContracts),
+      freezeFiles: normalizeArray(contracts.freezeFiles),
+    });
+
+    const { taskContract } = input;
+    const { requirementAnalysis } = taskContract;
+
     const payload = {
-      category: input.category,
-      taskName: input.taskName.trim(),
-      goal: input.goal.trim(),
-      acceptance: normalizeArray(input.acceptance),
-      constraints: normalizeArray(input.constraints),
-      context: normalizeArray(input.context),
-      scopeHint: normalizeArray(input.scopeHint),
-      files: normalizeArray(input.files),
-      dependsOn: normalizeArray(input.dependsOn),
+      category: taskContract.category,
+      taskTitle: taskContract.taskTitle.trim(),
+      goal: requirementAnalysis.goal.trim(),
+      analysis: requirementAnalysis.analysis.trim(),
+      acceptance: normalizeArray(requirementAnalysis.acceptanceCriteria),
+      constraints: normalizeArray(requirementAnalysis.constraints),
+      context: normalizeArray(taskContract.context),
+      scopeHint: normalizeArray(taskContract.scopeHint),
+      files: normalizeArray(taskContract.files),
+      dependsOn: normalizeArray(taskContract.dependsOn),
+      requiresModification: requirementAnalysis.requiresModification === true,
+      collaborationContracts: normalizeContracts(taskContract.collaborationContracts),
     };
     const digest = createHash('sha1').update(JSON.stringify(payload)).digest('hex');
     return `${scopePrefix}auto:${digest}`;
+  }
+
+  private buildAssignmentAcceptanceCriteria(acceptance: string[]): AcceptanceCriterion[] {
+    return acceptance.map((description, index) => ({
+      id: `assignment_acceptance_${index + 1}`,
+      description,
+      verifiable: true,
+      verificationMethod: 'auto' as const,
+      status: 'pending' as const,
+    }));
+  }
+
+  private buildAssignmentConstraints(constraints: string[]): Constraint[] {
+    return constraints.map((description, index) => ({
+      id: `assignment_constraint_${index + 1}`,
+      type: 'must' as const,
+      description,
+      source: 'system' as const,
+    }));
   }
 
   private pathMatchesHint(filePath: string, hintPath: string): boolean {
@@ -2712,7 +3007,6 @@ export class DispatchManager {
     this.reactiveMode = false;
     this.reactiveBatchAwaitingSummary.clear();
     this.resumeContextStore.dispose();
-    this.dispatchTaskCategories.clear();
     this.routingService.clearAllRuntimeUnavailable();
     this.activeWorkerLanes.clear();
     this.stopLeaseWatcher();

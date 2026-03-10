@@ -11,6 +11,7 @@ import { EventEmitter } from 'events';
 import type { WorkerSlot } from '../../types';
 import { logger, LogCategory } from '../../logging';
 import { t } from '../../i18n';
+import type { RequirementAnalysis } from '../protocols/types';
 
 // ============================================================================
 // CancellationToken
@@ -100,34 +101,6 @@ export function isTerminalStatus(status: DispatchStatus): boolean {
   return status === 'completed' || status === 'failed' || status === 'skipped' || status === 'cancelled';
 }
 
-/** 单个 dispatch 条目 */
-export interface DispatchEntry {
-  taskId: string;
-  worker: WorkerSlot;
-  /** 任务目标（结构化合同字段） */
-  goal: string;
-  /** 验收标准（结构化合同字段） */
-  acceptance: string[];
-  /** 约束条件（结构化合同字段） */
-  constraints: string[];
-  /** 任务上下文（结构化合同字段） */
-  context: string[];
-  task: string;
-  /** 范围线索（非硬约束） */
-  scopeHint: string[];
-  files: string[];
-  /** 是否要求该任务对目标文件产生实际修改（读任务为 false） */
-  requiresModification: boolean;
-  /** L3 协作契约 */
-  collaborationContracts: DispatchCollaborationContracts;
-  dependsOn: string[];
-  status: DispatchStatus;
-  result?: DispatchResult;
-  createdAt: number;
-  startedAt?: number;
-  completedAt?: number;
-}
-
 /** dispatch 执行结果 */
 export interface DispatchResult {
   success: boolean;
@@ -153,6 +126,29 @@ export interface DispatchCollaborationContracts {
   consumerContracts: string[];
   interfaceContracts: string[];
   freezeFiles: string[];
+}
+
+export interface DispatchTaskContract {
+  taskTitle: string;
+  category: string;
+  requirementAnalysis: RequirementAnalysis;
+  context: string[];
+  scopeHint: string[];
+  files: string[];
+  dependsOn: string[];
+  collaborationContracts: DispatchCollaborationContracts;
+}
+
+/** 单个 dispatch 条目 */
+export interface DispatchEntry {
+  taskId: string;
+  worker: WorkerSlot;
+  taskContract: DispatchTaskContract;
+  status: DispatchStatus;
+  result?: DispatchResult;
+  createdAt: number;
+  startedAt?: number;
+  completedAt?: number;
 }
 
 export type DispatchAuditLevel = 'normal' | 'watch' | 'intervention';
@@ -292,16 +288,7 @@ export class DispatchBatch extends EventEmitter {
   register(params: {
     taskId: string;
     worker: WorkerSlot;
-    goal: string;
-    acceptance: string[];
-    constraints: string[];
-    context: string[];
-    task: string;
-    scopeHint?: string[];
-    files?: string[];
-    requiresModification?: boolean;
-    dependsOn?: string[];
-    collaborationContracts?: Partial<DispatchCollaborationContracts>;
+    taskContract: DispatchTaskContract;
   }): DispatchEntry {
     if (this._phase === 'archived') {
       throw new Error(t('dispatchBatch.errors.archivedCannotRegister', { batchId: this.id }));
@@ -312,7 +299,7 @@ export class DispatchBatch extends EventEmitter {
     }
 
     // depends_on 已由 orchestration-executor.normalizeStringArray 完成边界验证和 trim
-    const dependsOn = params.dependsOn || [];
+    const dependsOn = [...params.taskContract.dependsOn];
     for (const depId of dependsOn) {
       if (depId === params.taskId) {
         throw new Error(t('dispatchBatch.errors.taskCannotDependOnSelf', { taskId: params.taskId }));
@@ -323,25 +310,42 @@ export class DispatchBatch extends EventEmitter {
     }
 
     const dependencyState = this.evaluateDependencyState(dependsOn);
+    const taskContract: DispatchTaskContract = {
+      ...params.taskContract,
+      context: [...params.taskContract.context],
+      scopeHint: [...params.taskContract.scopeHint],
+      files: [...params.taskContract.files],
+      dependsOn,
+      collaborationContracts: {
+        producerContracts: [...params.taskContract.collaborationContracts.producerContracts],
+        consumerContracts: [...params.taskContract.collaborationContracts.consumerContracts],
+        interfaceContracts: [...params.taskContract.collaborationContracts.interfaceContracts],
+        freezeFiles: [...params.taskContract.collaborationContracts.freezeFiles],
+      },
+      requirementAnalysis: {
+        ...params.taskContract.requirementAnalysis,
+        constraints: params.taskContract.requirementAnalysis.constraints
+          ? [...params.taskContract.requirementAnalysis.constraints]
+          : undefined,
+        acceptanceCriteria: params.taskContract.requirementAnalysis.acceptanceCriteria
+          ? [...params.taskContract.requirementAnalysis.acceptanceCriteria]
+          : undefined,
+        riskFactors: params.taskContract.requirementAnalysis.riskFactors
+          ? [...params.taskContract.requirementAnalysis.riskFactors]
+          : undefined,
+        categories: params.taskContract.requirementAnalysis.categories
+          ? [...params.taskContract.requirementAnalysis.categories]
+          : undefined,
+        delegationBriefings: params.taskContract.requirementAnalysis.delegationBriefings
+          ? [...params.taskContract.requirementAnalysis.delegationBriefings]
+          : undefined,
+      },
+    };
 
     const entry: DispatchEntry = {
       taskId: params.taskId,
       worker: params.worker,
-      goal: params.goal,
-      acceptance: params.acceptance,
-      constraints: params.constraints,
-      context: params.context,
-      task: params.task,
-      scopeHint: params.scopeHint || [],
-      files: params.files || [],
-      requiresModification: params.requiresModification ?? true,
-      collaborationContracts: {
-        producerContracts: params.collaborationContracts?.producerContracts || [],
-        consumerContracts: params.collaborationContracts?.consumerContracts || [],
-        interfaceContracts: params.collaborationContracts?.interfaceContracts || [],
-        freezeFiles: params.collaborationContracts?.freezeFiles || [],
-      },
-      dependsOn,
+      taskContract,
       status: dependencyState.status,
       createdAt: Date.now(),
     };
@@ -460,9 +464,9 @@ export class DispatchBatch extends EventEmitter {
   canExecute(taskId: string): boolean {
     const entry = this.entries.get(taskId);
     if (!entry) return false;
-    if (entry.dependsOn.length === 0) return true;
+    if (entry.taskContract.dependsOn.length === 0) return true;
 
-    return entry.dependsOn.every(depId => {
+    return entry.taskContract.dependsOn.every(depId => {
       const dep = this.entries.get(depId);
       return dep && dep.status === 'completed';
     });
@@ -475,7 +479,7 @@ export class DispatchBatch extends EventEmitter {
     const entry = this.entries.get(taskId);
     if (!entry) return false;
 
-    return entry.dependsOn.some(depId => {
+    return entry.taskContract.dependsOn.some(depId => {
       const dep = this.entries.get(depId);
       return dep && (dep.status === 'failed' || dep.status === 'skipped' || dep.status === 'cancelled');
     });
@@ -499,11 +503,11 @@ export class DispatchBatch extends EventEmitter {
     const fileToTasks = new Map<string, string[]>();
 
     for (const entry of this.entries.values()) {
-      if (!entry.requiresModification) {
+      if (!entry.taskContract.requirementAnalysis.requiresModification) {
         continue;
       }
       // 只检测可能并行的任务（无依赖关系的）
-      for (const file of entry.files) {
+      for (const file of entry.taskContract.files) {
         const tasks = fileToTasks.get(file) || [];
         tasks.push(entry.taskId);
         fileToTasks.set(file, tasks);
@@ -519,7 +523,7 @@ export class DispatchBatch extends EventEmitter {
       const independentTasks = taskIds.filter(taskId => {
         const entry = this.entries.get(taskId)!;
         return !taskIds.some(otherId =>
-          otherId !== taskId && entry.dependsOn.includes(otherId)
+          otherId !== taskId && entry.taskContract.dependsOn.includes(otherId)
         );
       });
 
@@ -564,9 +568,9 @@ export class DispatchBatch extends EventEmitter {
         processedPairs.add(pairKey);
 
         // 如果已有依赖关系则跳过
-        if (curr.dependsOn.includes(prev.taskId)) continue;
+        if (curr.taskContract.dependsOn.includes(prev.taskId)) continue;
 
-        curr.dependsOn.push(prev.taskId);
+        curr.taskContract.dependsOn.push(prev.taskId);
         // 如果当前任务原本是 pending，改为 waiting_deps
         if (curr.status === 'pending') {
           curr.status = 'waiting_deps';
@@ -595,8 +599,8 @@ export class DispatchBatch extends EventEmitter {
 
     // 初始化
     for (const [taskId, entry] of this.entries) {
-      inDegree.set(taskId, entry.dependsOn.length);
-      for (const depId of entry.dependsOn) {
+      inDegree.set(taskId, entry.taskContract.dependsOn.length);
+      for (const depId of entry.taskContract.dependsOn) {
         const dependents = adjList.get(depId) || [];
         dependents.push(taskId);
         adjList.set(depId, dependents);
@@ -673,7 +677,7 @@ export class DispatchBatch extends EventEmitter {
       for (const other of this.entries.values()) {
         if (
           (other.status === 'pending' || other.status === 'waiting_deps') &&
-          other.dependsOn.includes(entry.taskId)
+          other.taskContract.dependsOn.includes(entry.taskId)
         ) {
           count++;
         }
@@ -871,7 +875,7 @@ export class DispatchBatch extends EventEmitter {
     const completedEntry = this.entries.get(completedTaskId);
 
     for (const [taskId, entry] of this.entries) {
-      if (!entry.dependsOn.includes(completedTaskId)) continue;
+      if (!entry.taskContract.dependsOn.includes(completedTaskId)) continue;
       if (entry.status !== 'waiting_deps') continue;
 
       // 前序任务失败 → 级联跳过
@@ -957,10 +961,10 @@ export class DispatchBatch extends EventEmitter {
     visited.add(taskId);
 
     const entry = this.entries.get(taskId);
-    if (!entry || entry.dependsOn.length === 0) return 0;
+    if (!entry || entry.taskContract.dependsOn.length === 0) return 0;
 
     let maxDepth = 0;
-    for (const depId of entry.dependsOn) {
+    for (const depId of entry.taskContract.dependsOn) {
       maxDepth = Math.max(maxDepth, this.calculateDepth(depId, visited) + 1);
     }
     return maxDepth;

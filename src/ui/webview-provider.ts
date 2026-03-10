@@ -998,6 +998,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       timestamp: Date.now(),
     });
     // 同步清理后端管道的处理态
+    this.cancelProcessingResetFallback();
     this.messageHub.forceProcessingState(false);
 
     if (hasRunningTask && !options?.silent) {
@@ -1767,6 +1768,36 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private orchestratorQueueRunning = false;
   private queuedMessagesBySession: Map<string, QueuedUserTurn[]> = new Map();
   private queuedMessagesDrainRunning = false;
+  private processingResetFallbackTimer: NodeJS.Timeout | null = null;
+
+  private cancelProcessingResetFallback(): void {
+    if (this.processingResetFallbackTimer) {
+      clearTimeout(this.processingResetFallbackTimer);
+      this.processingResetFallbackTimer = null;
+    }
+  }
+
+  private scheduleProcessingResetFallback(reason: string): void {
+    this.cancelProcessingResetFallback();
+    // 避免在任务完成瞬间强制封口：给迟到的 streaming/update 一个收敛窗口，
+    // 仅在处理态异常残留时才执行兜底清理。
+    this.processingResetFallbackTimer = setTimeout(() => {
+      this.processingResetFallbackTimer = null;
+      const processing = this.messageHub.getProcessingState();
+      if (!processing.isProcessing) {
+        return;
+      }
+      if (this.orchestratorEngine.running || this.orchestratorQueueRunning || this.pendingExecutionQueue.length > 0) {
+        return;
+      }
+      logger.warn('界面.消息.处理态_延迟兜底清理', {
+        reason,
+        source: processing.source,
+        agent: processing.agent,
+      }, LogCategory.UI);
+      this.messageHub.forceProcessingState(false);
+    }, 1500);
+  }
 
   /** 处理恢复确认 */
   private async handleRecoveryConfirmation(decision: 'retry' | 'rollback' | 'continue'): Promise<void> {
@@ -2410,6 +2441,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     };
 
     try {
+      this.cancelProcessingResetFallback();
       this.messageHub.setRequestContext(requestKey);
       if (options?.resumeMissionId) {
         const activated = this.orchestratorEngine.activateWorkerSessionResume(
@@ -2665,9 +2697,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.messageHub.setRequestContext(undefined);
       this.clearRequestTimeout(requestKey);
       this.orchestratorEngine.clearWorkerSessionResume();
-      // 任务执行链路结束，强制重置 processing 状态
-      // 避免因流式消息缺少 COMPLETED lifecycle 导致 processing 动画卡住
-      this.messageHub.forceProcessingState(false);
+      this.scheduleProcessingResetFallback(`executeTask:${requestKey}`);
       void this.drainQueuedMessagesIfIdle();
     }
   }
@@ -2849,6 +2879,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 创建新会话时，重置所有适配器
     await this.adapterFactory.shutdown();
     this.messageHub.setRequestContext(undefined);
+    this.cancelProcessingResetFallback();
     this.messageHub.forceProcessingState(false);
     const newSession = this.sessionManager.createSession();
     // 更新活跃会话ID
@@ -2867,6 +2898,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.cancelPendingOrchestratorQueue(t('provider.sessionSwitchedQueueCancelled'));
     await this.adapterFactory.shutdown();
     this.messageHub.setRequestContext(undefined);
+    this.cancelProcessingResetFallback();
     this.messageHub.forceProcessingState(false);
     this.activeSessionId = sessionId;
     this.ensureSessionExists(sessionId);

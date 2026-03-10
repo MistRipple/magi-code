@@ -4,8 +4,9 @@
 
 export type {
   IShellExecutor,
-  IShellSession,
   ProcessRecord,
+  ShellProcessEvents,
+  ShellEventListener,
 } from './types';
 
 export { NodeShellExecutor } from './node-shell-executor';

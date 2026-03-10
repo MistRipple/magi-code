@@ -21,7 +21,9 @@ import { BUILTIN_TOOL_NAMES } from '../../tools/types';
 import { MessageHub } from '../../orchestrator/core/message-hub';
 import { BaseLLMAdapter, AdapterState } from './base-adapter';
 import { logger, LogCategory } from '../../logging';
+import { t } from '../../i18n';
 import { isModelOriginIssue } from '../../errors/model-origin';
+import { isRetryableNetworkError, toErrorMessage, buildStreamRecoveryPrompt, deduplicateResumption } from '../../tools/network-utils';
 import {
   type OrchestratorTerminationReason,
   type ProgressVector,
@@ -157,6 +159,20 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     maxTokenUsage: 280_000,
     maxErrorRate: 0.8,
   };
+  /** 网络韧性：编排者单次请求超时 */
+  private static readonly REQUEST_TIMEOUT_MS = 90_000;
+  /** 网络韧性：编排者请求重试策略 */
+  private static readonly REQUEST_RETRY_POLICY = {
+    maxRetries: 6, // 首次 + 5 次重试
+    baseDelayMs: 500,
+    retryDelaysMs: [10_000, 20_000, 30_000, 40_000, 50_000],
+    retryOnTimeout: true,
+    retryOnAllErrors: true,
+    maxRetryDurationMs: 240_000,
+    deterministicErrorStreakLimit: 3,
+  } as const;
+  /** 流式中断自动续跑预算（按一次 sendMessageWithTools 计） */
+  private static readonly STREAM_INTERRUPTION_RECOVERY_MAX = 2;
 
   /**
    * 深度模式下编排者可用工具白名单（强制约束）
@@ -309,45 +325,95 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         maxTokens: 8192, // Orchestrator 可能需要更多 tokens
         temperature: 0.3, // 更低的温度以获得更确定的规划
         signal: this.abortController.signal,
+        timeoutMs: OrchestratorLLMAdapter.REQUEST_TIMEOUT_MS,
+        streamIdleTimeoutMs: OrchestratorLLMAdapter.REQUEST_TIMEOUT_MS,
+        retryPolicy: OrchestratorLLMAdapter.REQUEST_RETRY_POLICY,
       };
+      let finalResponse = '';
+      let streamInterruptionRecoveryCount = 0;
+      let preRecoveryText = '';
+      let round = 0;
+      while (true) {
+        // visibility: 'system' 时不绑定 placeholder，使用独立 messageId，且标记 visibility 让前端拦截
+        const streamId = silent
+          ? this.normalizer.startStream(this.syncTraceFromMessageHub(), undefined, undefined, 'system')
+          : round === 0
+            ? this.startStreamWithContext()
+            : this.normalizer.startStream(this.currentTraceId!);
+        messageId = streamId;
+        params.retryRuntimeHook = silent ? undefined : this.createRetryRuntimeHook(streamId);
+        let streamedResponse = '';
 
-      // visibility: 'system' 时不绑定 placeholder，使用独立 messageId，且标记 visibility 让前端拦截
-      let streamId: string;
-      if (silent) {
-        const traceId = this.syncTraceFromMessageHub();
-        streamId = this.normalizer.startStream(traceId, undefined, undefined, 'system');
-      } else {
-        streamId = this.startStreamWithContext();
-      }
-      messageId = streamId;
-      let streamedResponse = '';
+        try {
+          // 流式调用 LLM
+          const response = await this.client.streamMessage(params, (chunk) => {
+            if (chunk.type === 'content_delta' && chunk.content) {
+              let delta = chunk.content;
+              streamedResponse += delta;
+              if (preRecoveryText && streamedResponse.length <= 200) {
+                return;
+              }
+              if (preRecoveryText) {
+                const deduped = deduplicateResumption(preRecoveryText, streamedResponse);
+                preRecoveryText = '';
+                if (deduped) {
+                  this.normalizer.processTextDelta(streamId, deduped);
+                  this.emit('message', deduped);
+                }
+                return;
+              }
+              this.normalizer.processTextDelta(streamId, delta);
+              this.emit('message', delta);
+            } else if (chunk.type === 'thinking' && chunk.thinking) {
+              this.normalizer.processThinking(streamId, chunk.thinking);
+              this.emit('thinking', chunk.thinking);
+            }
+          });
+          this.recordTokenUsage(response.usage);
+          finalResponse = streamedResponse || response.content || '';
+          if (isSummaryHijackText(finalResponse)) {
+            logger.warn('Orchestrator.检测到摘要劫持输出_已降级为不中断', {
+              model: this.config.model,
+              provider: this.config.provider,
+              streamed: streamedResponse.length > 0,
+            }, LogCategory.LLM);
+            finalResponse = '[System] 检测到异常摘要模板输出，已自动忽略。请继续当前任务。';
+          }
 
-      // 流式调用 LLM
-      const response = await this.client.streamMessage(params, (chunk) => {
-        if (chunk.type === 'content_delta' && chunk.content) {
-          streamedResponse += chunk.content;
-          this.normalizer.processTextDelta(streamId, chunk.content);
-          this.emit('message', chunk.content);
-        } else if (chunk.type === 'thinking' && chunk.thinking) {
-          this.normalizer.processThinking(streamId, chunk.thinking);
-          this.emit('thinking', chunk.thinking);
+          if (finalResponse && !streamedResponse) {
+            // 兜底：部分 provider 仅在最终响应体返回文本，未逐块回调 content_delta。
+            this.normalizer.processTextDelta(streamId, finalResponse);
+            this.emit('message', finalResponse);
+          }
+          this.normalizer.endStream(streamId);
+          break;
+        } catch (error: any) {
+          const errorMessage = toErrorMessage(error);
+          const canAutoRecoverInterruptedRound = !this.abortController?.signal.aborted
+            && streamInterruptionRecoveryCount < OrchestratorLLMAdapter.STREAM_INTERRUPTION_RECOVERY_MAX
+            && isRetryableNetworkError(errorMessage)
+            && streamedResponse.trim().length > 0;
+          if (canAutoRecoverInterruptedRound) {
+            streamInterruptionRecoveryCount += 1;
+            preRecoveryText = streamedResponse;
+            messagesToSend.push({ role: 'assistant', content: streamedResponse });
+            messagesToSend.push({
+              role: 'user',
+              content: buildStreamRecoveryPrompt(t, streamedResponse, streamInterruptionRecoveryCount, OrchestratorLLMAdapter.STREAM_INTERRUPTION_RECOVERY_MAX),
+            });
+            logger.warn('Orchestrator.单轮流式中断.自动续跑', {
+              recoveryAttempt: streamInterruptionRecoveryCount,
+              hasAccumulatedText: streamedResponse.trim().length > 0,
+              error: errorMessage.substring(0, 300),
+            }, LogCategory.LLM);
+            this.normalizer.endStream(streamId);
+            round++;
+            continue;
+          }
+          this.normalizer.endStream(streamId, errorMessage || 'Request failed');
+          messageId = null;
+          throw error;
         }
-      });
-      this.recordTokenUsage(response.usage);
-      let finalResponse = streamedResponse || response.content || '';
-      if (isSummaryHijackText(finalResponse)) {
-        logger.warn('Orchestrator.检测到摘要劫持输出_已降级为不中断', {
-          model: this.config.model,
-          provider: this.config.provider,
-          streamed: streamedResponse.length > 0,
-        }, LogCategory.LLM);
-        finalResponse = '[System] 检测到异常摘要模板输出，已自动忽略。请继续当前任务。';
-      }
-
-      if (finalResponse && !streamedResponse) {
-        // 兜底：部分 provider 仅在最终响应体返回文本，未逐块回调 content_delta。
-        this.normalizer.processTextDelta(streamId, finalResponse);
-        this.emit('message', finalResponse);
       }
 
       // 用户可见请求才会写入编排历史，内部 system 请求不写入
@@ -357,8 +423,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           content: finalResponse,
         });
       }
-
-      this.normalizer.endStream(streamId);
       this.setState(AdapterState.CONNECTED);
       this.lastRuntimeState = {
         reason: 'completed',
@@ -743,6 +807,8 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       let consecutiveUpstreamModelErrors = 0;
       let budgetBreachStreak = 0;
       let externalWaitBreachStreak = 0;
+      let streamInterruptionRecoveryCount = 0;
+      let preRecoveryTextLoop = '';
       const decisionTrace: OrchestratorDecisionTraceEntry[] = [];
       // 摘要劫持纠偏计数：第1次纠偏、第2次禁工具纠偏、第3次及以上继续 fail-open 纠偏
       let summaryHijackRounds = 0;
@@ -790,22 +856,42 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           maxTokens: 8192,
           temperature: 0.3,
           signal: this.abortController.signal,
+          timeoutMs: OrchestratorLLMAdapter.REQUEST_TIMEOUT_MS,
+          streamIdleTimeoutMs: OrchestratorLLMAdapter.REQUEST_TIMEOUT_MS,
+          retryPolicy: OrchestratorLLMAdapter.REQUEST_RETRY_POLICY,
+          retryRuntimeHook: visibility === 'system' ? undefined : this.createRetryRuntimeHook(streamId),
         };
 
         let accumulatedText = '';
         let hasStreamedTextDelta = false;
         let toolCalls: ToolCall[] = [];
+        let sawToolCallSignal = false;
 
         try {
           const response = await this.client.streamMessage(params, (chunk) => {
             if (chunk.type === 'content_delta' && chunk.content) {
-              this.normalizer.processTextDelta(streamId, chunk.content);
+              const delta = chunk.content;
+              accumulatedText += delta;
+              // 续跑去重：缓冲前 200 字符后一次性裁剪重叠
+              if (preRecoveryTextLoop && accumulatedText.length <= 200) {
+                return;
+              }
+              if (preRecoveryTextLoop) {
+                const deduped = deduplicateResumption(preRecoveryTextLoop, accumulatedText);
+                preRecoveryTextLoop = '';
+                if (deduped) {
+                  this.normalizer.processTextDelta(streamId, deduped);
+                }
+                hasStreamedTextDelta = true;
+                return;
+              }
+              this.normalizer.processTextDelta(streamId, delta);
               hasStreamedTextDelta = true;
-              accumulatedText += chunk.content;
             } else if (chunk.type === 'thinking' && chunk.thinking) {
               this.normalizer.processThinking(streamId, chunk.thinking);
               this.emit('thinking', chunk.thinking);
             } else if (chunk.type === 'tool_call_start' && chunk.toolCall) {
+              sawToolCallSignal = true;
               this.emit('toolCall', chunk.toolCall.name || '', chunk.toolCall.arguments || {});
             }
           });
@@ -1053,33 +1139,8 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
 
           // 有工具调用 → 只对无需授权的工具即时渲染卡片
           // 需要授权的高风险工具延后到授权完成后再渲染，避免“先出现 edit 卡片后弹授权”。
-          const preAnnouncedToolCallIds = new Set<string>();
-          for (const toolCall of toolCalls) {
-            const requiresAuthorization = this.toolManager.requiresUserAuthorization(toolCall.name);
-            // shell/process 工具即使需要授权也要先渲染卡片，避免执行期无可视反馈
-            if (requiresAuthorization && !this.isTerminalProcessTool(toolCall.name)) {
-              continue;
-            }
-            preAnnouncedToolCallIds.add(toolCall.id);
-            this.normalizer.addToolCall(streamId, {
-              type: 'tool_call',
-              toolName: toolCall.name,
-              toolId: toolCall.id,
-              status: 'running',
-              input: JSON.stringify(toolCall.arguments, null, 2),
-            });
-          }
-
-          const assistantContent: any[] = [];
-          for (const toolCall of toolCalls) {
-            assistantContent.push({
-              type: 'tool_use',
-              id: toolCall.id,
-              name: toolCall.name,
-              input: toolCall.arguments,
-            });
-          }
-          history.push({ role: 'assistant', content: assistantContent });
+          const preAnnouncedToolCallIds = this.preAnnounceToolCalls(streamId, toolCalls);
+          history.push({ role: 'assistant', content: this.buildAssistantToolUseBlocks(toolCalls) });
 
           const toolResults = await this.executeToolCalls(toolCalls);
           totalToolResultCount += toolResults.length;
@@ -1091,97 +1152,14 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             break;
           }
 
-          // 终端工具流式预览 promise 收集器，与结果处理循环并行运行
-          const terminalPreviewPromises: Promise<void>[] = [];
-
-          const toolCallMap = new Map(toolCalls.map((toolCall) => [toolCall.id, toolCall] as const));
-          for (const result of toolResults) {
-            const toolCall = toolCallMap.get(result.toolCallId);
-            if (!toolCall) {
-              continue;
-            }
-            const hardError = this.isHardToolFailure(result);
-            if (preAnnouncedToolCallIds.has(result.toolCallId)) {
-              if (this.isTerminalProcessTool(toolCall.name)) {
-                const initialOutput = typeof result.content === 'string' ? result.content : String(result.content ?? '');
-                // 终端工具即使初始 output 为空也推送首帧，确保前端立即获取 terminal_id 等元数据
-                this.normalizer.addToolCall(streamId, {
-                  type: 'tool_call',
-                  toolName: toolCall.name,
-                  toolId: result.toolCallId,
-                  status: 'running',
-                  input: JSON.stringify(toolCall.arguments, null, 2),
-                  output: initialOutput,
-                });
-
-                // 异步启动流式轮询，不阻塞后续工具结果处理
-                const previewPromise = this.autoPreviewProcessOutput(
-                  streamId,
-                  toolCall,
-                  result,
-                  { workerId: 'orchestrator', role: 'orchestrator' },
-                  this.abortController?.signal,
-                );
-                terminalPreviewPromises.push(previewPromise);
-              }
-
-              // 非终端工具或终端工具都需要等轮询完成后 finishToolCall，
-              // 但非终端工具无轮询可直接 finish
-              if (!this.isTerminalProcessTool(toolCall.name)) {
-                this.normalizer.finishToolCall(
-                  streamId,
-                  result.toolCallId,
-                  hardError ? undefined : result.content,
-                  hardError ? result.content : undefined,
-                  result.fileChange,
-                  result.standardized
-                );
-              }
-              continue;
-            }
-
-            // 高风险工具：单独产出一张工具卡片，确保其时序晚于授权卡片
-            const deferredToolStreamId = this.normalizer.startStream(this.currentTraceId!);
-            this.normalizer.addToolCall(deferredToolStreamId, {
-              type: 'tool_call',
-              toolName: toolCall.name,
-              toolId: toolCall.id,
-              status: hardError ? 'failed' : 'completed',
-              input: JSON.stringify(toolCall.arguments, null, 2),
-              output: hardError ? undefined : result.content,
-              error: hardError ? result.content : undefined,
-              standardized: result.standardized,
-            });
-
-            this.normalizer.finishToolCall(
-              deferredToolStreamId,
-              toolCall.id,
-              hardError ? undefined : result.content,
-              hardError ? result.content : undefined,
-              result.fileChange,
-              result.standardized
-            );
-            this.normalizer.endStream(deferredToolStreamId);
-          }
-
-          // 等待所有终端工具流式轮询完成，并 finishToolCall
-          if (terminalPreviewPromises.length > 0) {
-            await Promise.all(terminalPreviewPromises);
-            for (const result of toolResults) {
-              const toolCall = toolCallMap.get(result.toolCallId);
-              if (!toolCall || !this.isTerminalProcessTool(toolCall.name)) continue;
-              if (!preAnnouncedToolCallIds.has(result.toolCallId)) continue;
-              const hardError = this.isHardToolFailure(result);
-              this.normalizer.finishToolCall(
-                streamId,
-                result.toolCallId,
-                hardError ? undefined : result.content,
-                hardError ? result.content : undefined,
-                result.fileChange,
-                result.standardized
-              );
-            }
-          }
+          await this.renderToolResultsWithTerminalStreaming({
+            streamId,
+            toolCalls,
+            toolResults,
+            preAnnouncedToolCallIds,
+            executionContext: { workerId: 'orchestrator', role: 'orchestrator' },
+            signal: this.abortController?.signal,
+          });
 
           history.push({
             role: 'user',
@@ -1347,7 +1325,44 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           this.normalizer.endStream(streamId);
           round++;
         } catch (error: any) {
-          this.normalizer.endStream(streamId, error?.message || 'Request failed');
+          const errorMessage = toErrorMessage(error);
+          const hasAccumulatedText = accumulatedText.trim().length > 0;
+          const interruptedAfterToolSignal = sawToolCallSignal && toolCalls.length === 0;
+          const canAutoRecoverInterruptedRound = !this.abortController?.signal.aborted
+            && streamInterruptionRecoveryCount < OrchestratorLLMAdapter.STREAM_INTERRUPTION_RECOVERY_MAX
+            && isRetryableNetworkError(errorMessage)
+            && (hasAccumulatedText || interruptedAfterToolSignal);
+          if (canAutoRecoverInterruptedRound) {
+            streamInterruptionRecoveryCount += 1;
+            preRecoveryTextLoop = accumulatedText;
+            if (hasAccumulatedText) {
+              history.push({ role: 'assistant', content: accumulatedText });
+              lastNonEmptyAssistantText = accumulatedText;
+              finalText = accumulatedText;
+            }
+            history.push({
+              role: 'user',
+              content: this.buildRoundStreamRecoveryPrompt({
+                hasAccumulatedText,
+                interruptedAfterToolSignal,
+                recoveryAttempt: streamInterruptionRecoveryCount,
+                maxRecoveryAttempts: OrchestratorLLMAdapter.STREAM_INTERRUPTION_RECOVERY_MAX,
+                accumulatedText,
+              }),
+            });
+            logger.warn('Orchestrator.流式中断.自动续跑', {
+              round: loopRounds,
+              recoveryAttempt: streamInterruptionRecoveryCount,
+              hasAccumulatedText,
+              interruptedAfterToolSignal,
+              error: errorMessage.substring(0, 300),
+            }, LogCategory.LLM);
+            this.normalizer.endStream(streamId);
+            round++;
+            continue;
+          }
+
+          this.normalizer.endStream(streamId, errorMessage || 'Request failed');
           // abort 中断不视为异常，优雅退出循环
           if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
             terminationReason = 'external_abort';
@@ -1615,6 +1630,24 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     ].join('\n');
   }
 
+  private buildRoundStreamRecoveryPrompt(input: {
+    hasAccumulatedText: boolean;
+    interruptedAfterToolSignal: boolean;
+    recoveryAttempt: number;
+    maxRecoveryAttempts: number;
+    accumulatedText: string;
+  }): string {
+    const { hasAccumulatedText, interruptedAfterToolSignal, recoveryAttempt, maxRecoveryAttempts, accumulatedText } = input;
+    if (interruptedAfterToolSignal && hasAccumulatedText) {
+      return t('stream.recovery.toolCallWithText', { attempt: recoveryAttempt, max: maxRecoveryAttempts });
+    }
+    if (interruptedAfterToolSignal) {
+      return t('stream.recovery.toolCallOnly', { attempt: recoveryAttempt, max: maxRecoveryAttempts });
+    }
+    // 纯文本中断：使用尾部锚定提示词
+    return buildStreamRecoveryPrompt(t, accumulatedText, recoveryAttempt, maxRecoveryAttempts);
+  }
+
   private shouldFinalizeWithoutTodos(assistantText: string): boolean {
     const text = assistantText.trim();
     if (!text) {
@@ -1860,10 +1893,19 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
 
   private async fetchTodosForTermination(): Promise<OrchestratorTodoSummary[]> {
     try {
+      const orchestratorContext = this.toolManager.getSnapshotContext('orchestrator');
+      const scopedMissionId = typeof orchestratorContext?.missionId === 'string'
+        ? orchestratorContext.missionId.trim()
+        : '';
+      // 终止快照必须强制 mission 级作用域，禁止退化为 session 全量查询。
+      // 否则历史任务会污染本轮判定，出现“工具返回后被误判 completed”。
+      if (!scopedMissionId || scopedMissionId.startsWith('session:')) {
+        return [];
+      }
       const toolCall: ToolCall = {
         id: `internal_get_todos_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
         name: 'get_todos',
-        arguments: {},
+        arguments: { mission_id: scopedMissionId },
       };
       const result = await this.toolManager.execute(
         toolCall,

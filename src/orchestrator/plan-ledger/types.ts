@@ -1,4 +1,5 @@
 import type { WorkerSlot } from '../../types';
+import type { AcceptanceCriterion } from '../mission/types';
 
 export type PlanMode = 'standard' | 'deep';
 
@@ -76,6 +77,48 @@ export interface PlanReview {
   reviewedAt: number;
 }
 
+export type PlanRuntimeVersion = 'classic' | 'deep_v1';
+
+export type PlanAcceptanceSummary = 'pending' | 'partial' | 'passed' | 'failed';
+
+export interface PlanRuntimeAcceptance {
+  criteria: AcceptanceCriterion[];
+  summary: PlanAcceptanceSummary;
+  updatedAt: number;
+}
+
+export interface PlanRuntimeReviewState {
+  round: number;
+  state: 'idle' | 'running' | 'accepted' | 'rejected';
+  lastReviewedAt?: number;
+}
+
+export interface PlanRuntimeReplanState {
+  state: 'none' | 'required' | 'awaiting_confirmation' | 'applied';
+  reason?: string;
+  updatedAt?: number;
+}
+
+export interface PlanRuntimeWaitState {
+  state: 'none' | 'external_waiting';
+  reasonCode?: string;
+  updatedAt?: number;
+}
+
+export interface PlanRuntimeTerminationState {
+  snapshotId?: string;
+  reason?: string;
+  updatedAt?: number;
+}
+
+export interface PlanRuntimeState {
+  acceptance: PlanRuntimeAcceptance;
+  review: PlanRuntimeReviewState;
+  replan: PlanRuntimeReplanState;
+  wait: PlanRuntimeWaitState;
+  termination: PlanRuntimeTerminationState;
+}
+
 export interface PlanLinks {
   assignmentIds: string[];
   todoIds: string[];
@@ -104,6 +147,9 @@ export interface PlanRecord {
   sessionId: string;
   missionId?: string;
   turnId: string;
+  schemaVersion: number;
+  runtimeVersion: PlanRuntimeVersion;
+  revision: number;
   version: number;
   parentPlanId?: string;
   mode: PlanMode;
@@ -112,10 +158,10 @@ export interface PlanRecord {
   promptDigest: string;
   summary: string;
   analysis?: string;
-  acceptanceCriteria: string[];
   constraints: string[];
   riskLevel?: 'low' | 'medium' | 'high' | 'critical';
   review?: PlanReview;
+  runtime: PlanRuntimeState;
   formattedPlan?: string;
   items: PlanItem[];
   attempts: PlanAttemptRecord[];
@@ -129,6 +175,9 @@ export interface PlanIndexEntry {
   sessionId: string;
   missionId?: string;
   turnId: string;
+  schemaVersion: number;
+  runtimeVersion: PlanRuntimeVersion;
+  revision: number;
   version: number;
   status: PlanStatus;
   mode: PlanMode;

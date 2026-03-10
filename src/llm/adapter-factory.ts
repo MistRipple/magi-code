@@ -53,11 +53,15 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
   private readonly modelRecoveryMaxAttempts = 2;
   private readonly modelAnomalyEscalateThreshold = 3;
   private readonly workerExecutionPolicy = {
-    requestTimeoutMs: 45_000,
+    requestTimeoutMs: 60_000,
     retryPolicy: {
-      maxRetries: 2,
-      baseDelayMs: 350,
-      retryOnTimeout: false,
+      maxRetries: 6, // 首次 + 5 次重试
+      baseDelayMs: 500,
+      retryDelaysMs: [10_000, 20_000, 30_000, 40_000, 50_000],
+      retryOnTimeout: true,
+      retryOnAllErrors: true,
+      maxRetryDurationMs: 240_000,
+      deterministicErrorStreakLimit: 3,
     },
   } as const;
 
@@ -535,9 +539,10 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     };
 
     const isWorker = agent !== 'orchestrator';
-    // Worker 请求链路采用 fail-fast：不在 AdapterFactory 层进行长延时重试，
-    // 避免与底层客户端重试叠加导致“失败回传被拖慢”。
-    const retryDelays: number[] = [];
+    // Worker 请求链路保留“一次短重连”：
+    // - 底层客户端负责主要重试；
+    // - 工厂层仅在连接类错误时做一次快速重连，避免长时间静默失败。
+    const retryDelays: number[] = isWorker ? [300] : [];
     let modelRecoveryAttempts = 0;
     let lastModelRecoveryError = '';
 
@@ -702,7 +707,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       return true;
     }
     const message = this.normalizeErrorMessage(error).toLowerCase();
-    return /timeout|timed out|network|connection|fetch failed|socket hang up|tls|certificate|econnreset|econnrefused|enotfound|eai_again|request ended without sending|stream ended|overloaded/.test(message);
+    return /timeout|timed out|network|connection|fetch failed|socket hang up|tls|certificate|econnreset|econnrefused|enotfound|eai_again|request ended without sending|stream ended|overloaded|error occurred while processing your request|help\.openai\.com/.test(message);
   }
 
   private normalizeErrorMessage(error: any): string {

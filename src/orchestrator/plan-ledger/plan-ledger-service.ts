@@ -4,7 +4,9 @@ import { EventEmitter } from 'events';
 import { logger, LogCategory } from '../../logging';
 import type { UnifiedSessionManager } from '../../session/unified-session-manager';
 import type { UnifiedTodo } from '../../todo/types';
+import type { AcceptanceCriterion } from '../mission/types';
 import type {
+  PlanAcceptanceSummary,
   CreatePlanDraftInput,
   DispatchPlanItemInput,
   PlanAttemptCompleteInput,
@@ -18,6 +20,8 @@ import type {
   PlanItemStatus,
   PlanLedgerSnapshot,
   PlanRecord,
+  PlanRuntimeState,
+  PlanRuntimeVersion,
   PlanStatus,
   PlanTodoStatus,
 } from './types';
@@ -44,6 +48,9 @@ interface PlanLedgerEventRecord {
   sessionId: string;
   planId: string;
   missionId?: string;
+  schemaVersion: number;
+  runtimeVersion: PlanRuntimeVersion;
+  revision: number;
   status: PlanStatus;
   version: number;
   itemTotal: number;
@@ -87,6 +94,7 @@ const ATTEMPT_TRANSITIONS: Record<PlanAttemptStatus, PlanAttemptStatus[]> = {
 };
 
 export class PlanLedgerService extends EventEmitter {
+  private static readonly CURRENT_SCHEMA_VERSION = 2;
   private readonly writeQueues = new Map<string, Promise<void>>();
   private readonly indexCache = new Map<string, PlanIndexEntry[]>();
   private readonly planCache = new Map<string, Map<string, PlanRecord>>();
@@ -114,11 +122,16 @@ export class PlanLedgerService extends EventEmitter {
       const now = Date.now();
       const planId = this.generatePlanId();
       const summary = (input.summary || input.prompt).trim() || '未命名计划';
+      const runtimeVersion = this.resolveRuntimeVersion(input.mode);
+      const acceptanceCriteria = this.normalizeAcceptanceCriteria(input.acceptanceCriteria);
       const record: PlanRecord = {
         planId,
         sessionId: input.sessionId,
         missionId: input.missionId,
         turnId: input.turnId,
+        schemaVersion: PlanLedgerService.CURRENT_SCHEMA_VERSION,
+        runtimeVersion,
+        revision: 1,
         version: latestForTurn ? latestForTurn.version + 1 : 1,
         parentPlanId: latestForTurn?.planId,
         mode: input.mode,
@@ -127,9 +140,9 @@ export class PlanLedgerService extends EventEmitter {
         promptDigest: this.buildPromptDigest(input.prompt),
         summary,
         analysis: input.analysis?.trim() || undefined,
-        acceptanceCriteria: this.normalizeStringArray(input.acceptanceCriteria),
         constraints: this.normalizeStringArray(input.constraints),
         riskLevel: input.riskLevel,
+        runtime: this.createInitialRuntimeState(acceptanceCriteria, runtimeVersion, now),
         formattedPlan: input.formattedPlan?.trim() || undefined,
         items: [],
         attempts: [],
@@ -145,7 +158,7 @@ export class PlanLedgerService extends EventEmitter {
         this.markSuperseded(input.sessionId, latestForTurn.planId);
       }
 
-      this.persistPlan(record);
+      this.persistPlan(record, { preserveRevision: true });
       this.emitUpdated(record, 'draft-created');
       return record;
     });
@@ -568,60 +581,13 @@ export class PlanLedgerService extends EventEmitter {
     });
   }
 
-  async finalizeByMissionStatus(sessionId: string, missionId: string, missionStatus: MissionTerminalStatus): Promise<PlanRecord | null> {
-    return this.runWithSessionQueue(sessionId, async () => {
-      const index = this.loadIndex(sessionId);
-      const matched = index
-        .filter((entry) => entry.missionId === missionId)
-        .sort((a, b) => b.updatedAt - a.updatedAt)[0];
-      if (!matched) {
-        return null;
-      }
-
-      const record = this.loadPlan(sessionId, matched.planId);
-      if (!record) {
-        return null;
-      }
-      if (TERMINAL_PLAN_STATUSES.has(record.status)) {
-        return record;
-      }
-
-      const attemptTerminated = this.finalizeInflightAttemptsInRecord(
-        record,
-        this.mapMissionStatusToAttemptTerminalStatus(missionStatus),
-        `mission-finalized:${missionStatus}`,
-      );
-      const inferredStatus = this.mapMissionStatusToPlanStatus(missionStatus, record);
-      if (!attemptTerminated && inferredStatus === record.status) {
-        return record;
-      }
-      record.status = inferredStatus;
-      record.updatedAt = Date.now();
-      this.persistPlan(record);
-      this.emitUpdated(record, 'mission-finalized');
-      return record;
-    });
-  }
-
   async finalize(sessionId: string, planId: string, status: 'completed' | 'failed' | 'cancelled'): Promise<PlanRecord | null> {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);
       if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
         return record;
       }
-      const attemptTerminated = this.finalizeInflightAttemptsInRecord(
-        record,
-        this.mapMissionStatusToAttemptTerminalStatus(status),
-        `plan-finalized:${status}`,
-      );
-      const nextStatus = this.mapMissionStatusToPlanStatus(status, record);
-      if (!attemptTerminated && nextStatus === record.status) {
-        return record;
-      }
-      record.status = nextStatus;
-      record.updatedAt = Date.now();
-      this.persistPlan(record);
-      this.emitUpdated(record, 'finalized');
+      this.applyMissionTerminalStatus(record, status, `plan-finalized:${status}`, 'finalized');
       return record;
     });
   }
@@ -673,20 +639,15 @@ export class PlanLedgerService extends EventEmitter {
           continue;
         }
 
-        const nextStatus = this.mapMissionStatusToPlanStatus(missionTerminalStatus, record);
-        const attemptsTerminated = this.finalizeInflightAttemptsInRecord(
+        const updated = this.applyMissionTerminalStatus(
           record,
-          this.mapMissionStatusToAttemptTerminalStatus(missionTerminalStatus),
+          missionTerminalStatus,
           `reconciled:${missionTerminalStatus}`,
+          'reconciled-with-mission',
         );
-        if (nextStatus === record.status && !attemptsTerminated) {
+        if (!updated) {
           continue;
         }
-
-        record.status = nextStatus;
-        record.updatedAt = Date.now();
-        this.persistPlan(record);
-        this.emitUpdated(record, 'reconciled-with-mission');
         reconciled += 1;
       }
 
@@ -760,6 +721,7 @@ export class PlanLedgerService extends EventEmitter {
 
   formatPlanForDisplay(plan: PlanRecord): string {
     const lines: string[] = [];
+    const acceptanceDescriptions = this.getAcceptanceDescriptions(plan.runtime.acceptance.criteria);
     lines.push(`## 计划摘要`);
     lines.push(plan.summary || '未命名计划');
     if (plan.analysis) {
@@ -774,10 +736,10 @@ export class PlanLedgerService extends EventEmitter {
         lines.push(`- ${item}`);
       }
     }
-    if (plan.acceptanceCriteria.length > 0) {
+    if (acceptanceDescriptions.length > 0) {
       lines.push('');
       lines.push('### 验收');
-      for (const item of plan.acceptanceCriteria) {
+      for (const item of acceptanceDescriptions) {
         lines.push(`- ${item}`);
       }
     }
@@ -820,6 +782,28 @@ export class PlanLedgerService extends EventEmitter {
       return 'cancelled';
     }
     return 'failed';
+  }
+
+  private applyMissionTerminalStatus(
+    record: PlanRecord,
+    status: MissionTerminalStatus,
+    attemptReason: string,
+    updateReason: string,
+  ): boolean {
+    const attemptTerminated = this.finalizeInflightAttemptsInRecord(
+      record,
+      this.mapMissionStatusToAttemptTerminalStatus(status),
+      attemptReason,
+    );
+    const nextStatus = this.mapMissionStatusToPlanStatus(status, record);
+    if (!attemptTerminated && nextStatus === record.status) {
+      return false;
+    }
+    record.status = nextStatus;
+    record.updatedAt = Date.now();
+    this.persistPlan(record);
+    this.emitUpdated(record, updateReason);
+    return true;
   }
 
   private computePlanStatus(record: PlanRecord, fallback?: PlanStatus): PlanStatus {
@@ -1216,7 +1200,13 @@ export class PlanLedgerService extends EventEmitter {
     this.emit('updated', event);
   }
 
-  private persistPlan(record: PlanRecord): void {
+  private persistPlan(record: PlanRecord, options?: { preserveRevision?: boolean }): void {
+    const preserveRevision = options?.preserveRevision === true;
+    if (preserveRevision) {
+      record.revision = this.normalizeRevision(record.revision);
+    } else {
+      record.revision = this.normalizeRevision(record.revision) + 1;
+    }
     this.ensurePlansDir(record.sessionId);
     const planFile = this.getPlanFilePath(record.sessionId, record.planId);
     fs.writeFileSync(planFile, JSON.stringify(record, null, 2), 'utf-8');
@@ -1253,8 +1243,11 @@ export class PlanLedgerService extends EventEmitter {
     }
     try {
       const raw = fs.readFileSync(filePath, 'utf-8');
-      const parsed = JSON.parse(raw) as PlanRecord;
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
       const normalized = this.normalizePlanRecord(parsed);
+      if (JSON.stringify(parsed) !== JSON.stringify(normalized)) {
+        this.persistPlan(normalized, { preserveRevision: true });
+      }
       this.touchSessionCache(sessionId);
       this.setPlanCacheRecord(sessionPlanCache, planId, this.clonePlanRecord(normalized));
       this.prunePlanCacheForSession(sessionPlanCache);
@@ -1280,7 +1273,37 @@ export class PlanLedgerService extends EventEmitter {
     this.emitUpdated(existing, 'superseded');
   }
 
-  private normalizePlanRecord(record: PlanRecord): PlanRecord {
+  private normalizePlanRecord(record: Record<string, unknown>): PlanRecord {
+    const sourceRecord = record as Partial<PlanRecord> & {
+      acceptanceCriteria?: unknown;
+      runtime?: Partial<PlanRuntimeState> & {
+        acceptance?: {
+          criteria?: unknown;
+          summary?: unknown;
+          updatedAt?: unknown;
+        };
+        review?: {
+          round?: unknown;
+          state?: unknown;
+          lastReviewedAt?: unknown;
+        };
+        replan?: {
+          state?: unknown;
+          reason?: unknown;
+          updatedAt?: unknown;
+        };
+        wait?: {
+          state?: unknown;
+          reasonCode?: unknown;
+          updatedAt?: unknown;
+        };
+        termination?: {
+          snapshotId?: unknown;
+          reason?: unknown;
+          updatedAt?: unknown;
+        };
+      };
+    };
     const normalizedItems = (Array.isArray(record.items) ? record.items : []).map((item) => ({
       ...item,
       dependsOn: this.normalizeStringArray(item.dependsOn),
@@ -1317,16 +1340,92 @@ export class PlanLedgerService extends EventEmitter {
         };
       });
 
+    const runtimeVersion = this.normalizeRuntimeVersion(sourceRecord.runtimeVersion, sourceRecord.mode);
+    const legacyAcceptance = this.normalizeStringArray(sourceRecord.acceptanceCriteria as string[] | undefined);
+    const normalizedAcceptanceCriteria = this.normalizeAcceptanceCriteria(
+      sourceRecord.runtime?.acceptance?.criteria ?? legacyAcceptance,
+    );
+    const acceptanceSummary = this.normalizeAcceptanceSummary(
+      sourceRecord.runtime?.acceptance?.summary,
+      normalizedAcceptanceCriteria,
+    );
+    const reviewState = this.normalizeRuntimeReviewState(sourceRecord.runtime?.review?.state, sourceRecord.review?.status);
+    const reviewRound = this.normalizePositiveInteger(sourceRecord.runtime?.review?.round)
+      ?? (sourceRecord.review ? 1 : 0);
+    const reviewUpdatedAt = this.normalizeTimestamp(sourceRecord.runtime?.review?.lastReviewedAt)
+      ?? this.normalizeTimestamp(sourceRecord.review?.reviewedAt);
+    const now = Date.now();
+
     return {
-      ...record,
-      acceptanceCriteria: this.normalizeStringArray(record.acceptanceCriteria),
-      constraints: this.normalizeStringArray(record.constraints),
+      ...sourceRecord,
+      planId: this.normalizeIdentifier(sourceRecord.planId) || this.generatePlanId(),
+      sessionId: this.normalizeIdentifier(sourceRecord.sessionId) || 'unknown-session',
+      missionId: this.normalizeIdentifier(sourceRecord.missionId) || undefined,
+      turnId: this.normalizeIdentifier(sourceRecord.turnId) || 'unknown-turn',
+      schemaVersion: this.normalizePositiveInteger(sourceRecord.schemaVersion) || PlanLedgerService.CURRENT_SCHEMA_VERSION,
+      runtimeVersion,
+      revision: this.normalizeRevision(sourceRecord.revision),
+      version: this.normalizePositiveInteger(sourceRecord.version) || 1,
+      parentPlanId: this.normalizeIdentifier(sourceRecord.parentPlanId) || undefined,
+      mode: sourceRecord.mode === 'deep' ? 'deep' : 'standard',
+      status: this.normalizePlanStatus(sourceRecord.status),
+      source: 'orchestrator',
+      promptDigest: typeof sourceRecord.promptDigest === 'string' && sourceRecord.promptDigest.trim()
+        ? sourceRecord.promptDigest.trim()
+        : 'empty',
+      summary: typeof sourceRecord.summary === 'string' && sourceRecord.summary.trim()
+        ? sourceRecord.summary.trim()
+        : '未命名计划',
+      analysis: typeof sourceRecord.analysis === 'string' && sourceRecord.analysis.trim()
+        ? sourceRecord.analysis.trim()
+        : undefined,
+      constraints: this.normalizeStringArray(sourceRecord.constraints),
+      riskLevel: this.normalizeRiskLevel(sourceRecord.riskLevel),
+      review: this.normalizePlanReview(sourceRecord.review),
+      runtime: {
+        acceptance: {
+          criteria: normalizedAcceptanceCriteria,
+          summary: acceptanceSummary,
+          updatedAt: this.normalizeTimestamp(sourceRecord.runtime?.acceptance?.updatedAt) || now,
+        },
+        review: {
+          round: reviewRound,
+          state: reviewState,
+          lastReviewedAt: reviewUpdatedAt,
+        },
+        replan: {
+          state: this.normalizeRuntimeReplanState(sourceRecord.runtime?.replan?.state),
+          reason: typeof sourceRecord.runtime?.replan?.reason === 'string' && sourceRecord.runtime.replan.reason.trim()
+            ? sourceRecord.runtime.replan.reason.trim()
+            : undefined,
+          updatedAt: this.normalizeTimestamp(sourceRecord.runtime?.replan?.updatedAt),
+        },
+        wait: {
+          state: this.normalizeRuntimeWaitState(sourceRecord.runtime?.wait?.state),
+          reasonCode: typeof sourceRecord.runtime?.wait?.reasonCode === 'string' && sourceRecord.runtime.wait.reasonCode.trim()
+            ? sourceRecord.runtime.wait.reasonCode.trim()
+            : undefined,
+          updatedAt: this.normalizeTimestamp(sourceRecord.runtime?.wait?.updatedAt),
+        },
+        termination: {
+          snapshotId: this.normalizeIdentifier(sourceRecord.runtime?.termination?.snapshotId) || undefined,
+          reason: typeof sourceRecord.runtime?.termination?.reason === 'string' && sourceRecord.runtime.termination.reason.trim()
+            ? sourceRecord.runtime.termination.reason.trim()
+            : undefined,
+          updatedAt: this.normalizeTimestamp(sourceRecord.runtime?.termination?.updatedAt),
+        },
+      },
+      formattedPlan: typeof sourceRecord.formattedPlan === 'string' && sourceRecord.formattedPlan.trim()
+        ? sourceRecord.formattedPlan.trim()
+        : undefined,
       items: normalizedItems,
       attempts: normalizedAttempts,
       links: {
-        assignmentIds: this.normalizeStringArray(record.links?.assignmentIds),
-        todoIds: this.normalizeStringArray(record.links?.todoIds),
+        assignmentIds: this.normalizeStringArray(sourceRecord.links?.assignmentIds),
+        todoIds: this.normalizeStringArray(sourceRecord.links?.todoIds),
       },
+      createdAt: this.normalizeTimestamp(sourceRecord.createdAt) || now,
+      updatedAt: this.normalizeTimestamp(sourceRecord.updatedAt) || now,
     };
   }
 
@@ -1336,6 +1435,9 @@ export class PlanLedgerService extends EventEmitter {
       sessionId: record.sessionId,
       missionId: record.missionId,
       turnId: record.turnId,
+      schemaVersion: record.schemaVersion,
+      runtimeVersion: record.runtimeVersion,
+      revision: record.revision,
       version: record.version,
       status: record.status,
       mode: record.mode,
@@ -1420,6 +1522,211 @@ export class PlanLedgerService extends EventEmitter {
     return Array.from(new Set(result));
   }
 
+  private normalizeAcceptanceCriteria(input: unknown): AcceptanceCriterion[] {
+    if (!Array.isArray(input)) {
+      return [];
+    }
+
+    const normalized = input
+      .map((entry, index) => this.normalizeAcceptanceCriterion(entry, index))
+      .filter((entry): entry is AcceptanceCriterion => Boolean(entry));
+
+    const seen = new Set<string>();
+    return normalized.filter((entry) => {
+      const key = entry.description.trim().toLowerCase();
+      if (!key || seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+  }
+
+  private normalizeAcceptanceCriterion(input: unknown, index: number): AcceptanceCriterion | null {
+    if (typeof input === 'string') {
+      return this.buildAcceptanceCriterion(input, index);
+    }
+    if (!input || typeof input !== 'object') {
+      return null;
+    }
+
+    const candidate = input as Partial<AcceptanceCriterion>;
+    const description = typeof candidate.description === 'string' ? candidate.description.trim() : '';
+    if (!description) {
+      return null;
+    }
+
+    return {
+      id: this.normalizeIdentifier(candidate.id) || `acceptance-${index + 1}`,
+      description,
+      verifiable: candidate.verifiable !== false,
+      verificationMethod: candidate.verificationMethod === 'manual' || candidate.verificationMethod === 'test'
+        ? candidate.verificationMethod
+        : 'auto',
+      status: candidate.status === 'passed' || candidate.status === 'failed' ? candidate.status : 'pending',
+      verificationSpec: candidate.verificationSpec,
+    };
+  }
+
+  private buildAcceptanceCriterion(description: string, index: number): AcceptanceCriterion | null {
+    const normalized = description.trim();
+    if (!normalized) {
+      return null;
+    }
+    return {
+      id: `acceptance-${index + 1}`,
+      description: normalized,
+      verifiable: true,
+      verificationMethod: 'auto',
+      status: 'pending',
+    };
+  }
+
+  private createInitialRuntimeState(
+    acceptanceCriteria: AcceptanceCriterion[],
+    runtimeVersion: PlanRuntimeVersion,
+    now: number,
+  ): PlanRuntimeState {
+    return {
+      acceptance: {
+        criteria: acceptanceCriteria,
+        summary: this.computeAcceptanceSummary(acceptanceCriteria),
+        updatedAt: now,
+      },
+      review: {
+        round: 0,
+        state: runtimeVersion === 'deep_v1' ? 'idle' : 'accepted',
+      },
+      replan: {
+        state: 'none',
+      },
+      wait: {
+        state: 'none',
+      },
+      termination: {},
+    };
+  }
+
+  private computeAcceptanceSummary(criteria: AcceptanceCriterion[]): PlanAcceptanceSummary {
+    if (criteria.length === 0) {
+      return 'pending';
+    }
+    const passedCount = criteria.filter((item) => item.status === 'passed').length;
+    const failedCount = criteria.filter((item) => item.status === 'failed').length;
+    if (failedCount > 0) {
+      return 'failed';
+    }
+    if (passedCount === criteria.length) {
+      return 'passed';
+    }
+    if (passedCount > 0) {
+      return 'partial';
+    }
+    return 'pending';
+  }
+
+  private normalizeAcceptanceSummary(input: unknown, criteria: AcceptanceCriterion[]): PlanAcceptanceSummary {
+    if (input === 'pending' || input === 'partial' || input === 'passed' || input === 'failed') {
+      return input;
+    }
+    return this.computeAcceptanceSummary(criteria);
+  }
+
+  private getAcceptanceDescriptions(criteria: AcceptanceCriterion[]): string[] {
+    return criteria
+      .map((item) => item.description.trim())
+      .filter((item) => item.length > 0);
+  }
+
+  private resolveRuntimeVersion(mode: 'standard' | 'deep'): PlanRuntimeVersion {
+    return mode === 'deep' ? 'deep_v1' : 'classic';
+  }
+
+  private normalizeRuntimeVersion(input: unknown, mode: unknown): PlanRuntimeVersion {
+    if (input === 'classic' || input === 'deep_v1') {
+      return input;
+    }
+    return mode === 'deep' ? 'deep_v1' : 'classic';
+  }
+
+  private normalizeRevision(input: unknown): number {
+    return this.normalizePositiveInteger(input) || 1;
+  }
+
+  private normalizePositiveInteger(input: unknown): number | undefined {
+    return Number.isFinite(input) && Number(input) > 0 ? Math.floor(Number(input)) : undefined;
+  }
+
+  private normalizeTimestamp(input: unknown): number | undefined {
+    return Number.isFinite(input) && Number(input) > 0 ? Number(input) : undefined;
+  }
+
+  private normalizePlanStatus(input: unknown): PlanStatus {
+    const allowed: PlanStatus[] = [
+      'draft',
+      'awaiting_confirmation',
+      'approved',
+      'rejected',
+      'executing',
+      'partially_completed',
+      'completed',
+      'failed',
+      'cancelled',
+      'superseded',
+    ];
+    return allowed.includes(input as PlanStatus) ? input as PlanStatus : 'draft';
+  }
+
+  private normalizeRiskLevel(input: unknown): PlanRecord['riskLevel'] {
+    return input === 'low' || input === 'medium' || input === 'high' || input === 'critical'
+      ? input
+      : undefined;
+  }
+
+  private normalizePlanReview(input: unknown): PlanRecord['review'] {
+    if (!input || typeof input !== 'object') {
+      return undefined;
+    }
+    const candidate = input as Partial<NonNullable<PlanRecord['review']>>;
+    if (candidate.status !== 'approved' && candidate.status !== 'rejected' && candidate.status !== 'skipped') {
+      return undefined;
+    }
+    const reviewedAt = this.normalizeTimestamp(candidate.reviewedAt);
+    if (!reviewedAt) {
+      return undefined;
+    }
+    return {
+      status: candidate.status,
+      reviewer: typeof candidate.reviewer === 'string' && candidate.reviewer.trim() ? candidate.reviewer.trim() : undefined,
+      reason: typeof candidate.reason === 'string' && candidate.reason.trim() ? candidate.reason.trim() : undefined,
+      reviewedAt,
+    };
+  }
+
+  private normalizeRuntimeReviewState(
+    input: unknown,
+    reviewStatus?: NonNullable<PlanRecord['review']>['status'],
+  ): PlanRuntimeState['review']['state'] {
+    if (input === 'idle' || input === 'running' || input === 'accepted' || input === 'rejected') {
+      return input;
+    }
+    if (reviewStatus === 'approved') {
+      return 'accepted';
+    }
+    if (reviewStatus === 'rejected') {
+      return 'rejected';
+    }
+    return 'idle';
+  }
+
+  private normalizeRuntimeReplanState(input: unknown): PlanRuntimeState['replan']['state'] {
+    return input === 'required' || input === 'awaiting_confirmation' || input === 'applied' ? input : 'none';
+  }
+
+  private normalizeRuntimeWaitState(input: unknown): PlanRuntimeState['wait']['state'] {
+    return input === 'external_waiting' ? 'external_waiting' : 'none';
+  }
+
   private addUnique(target: string[], value: string): void {
     const normalized = value.trim();
     if (!normalized) {
@@ -1439,6 +1746,9 @@ export class PlanLedgerService extends EventEmitter {
         sessionId: record.sessionId,
         planId: record.planId,
         missionId: record.missionId,
+        schemaVersion: record.schemaVersion,
+        runtimeVersion: record.runtimeVersion,
+        revision: record.revision,
         status: record.status,
         version: record.version,
         itemTotal: record.items.length,
@@ -1484,13 +1794,25 @@ export class PlanLedgerService extends EventEmitter {
   private clonePlanRecord(record: PlanRecord): PlanRecord {
     return {
       ...record,
-      acceptanceCriteria: [...record.acceptanceCriteria],
       constraints: [...record.constraints],
       links: {
         assignmentIds: [...record.links.assignmentIds],
         todoIds: [...record.links.todoIds],
       },
       review: record.review ? { ...record.review } : undefined,
+      runtime: {
+        acceptance: {
+          ...record.runtime.acceptance,
+          criteria: record.runtime.acceptance.criteria.map((criterion) => ({
+            ...criterion,
+            verificationSpec: criterion.verificationSpec ? { ...criterion.verificationSpec } : undefined,
+          })),
+        },
+        review: { ...record.runtime.review },
+        replan: { ...record.runtime.replan },
+        wait: { ...record.runtime.wait },
+        termination: { ...record.runtime.termination },
+      },
       items: record.items.map((item) => ({
         ...item,
         dependsOn: [...item.dependsOn],

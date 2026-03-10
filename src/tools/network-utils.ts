@@ -86,8 +86,46 @@ export function isRetryableNetworkError(message: string): boolean {
     lower.includes('certificate') ||
     lower.includes('service unavailable') ||
     lower.includes('request aborted') ||
-    lower.includes('aborted')
+    lower.includes('aborted') ||
+    lower.includes('error occurred while processing your request') ||
+    lower.includes('help.openai.com') ||
+    /\b(408|429|500|502|503|504)\b/.test(lower)
   );
+}
+
+/**
+ * 构建流式续跑提示词（带尾部锚定）
+ */
+export function buildStreamRecoveryPrompt(
+  t: (key: string, vars?: Record<string, string | number>) => string,
+  accumulatedText: string,
+  attempt: number,
+  max: number,
+): string {
+  const tailLength = 200;
+  const trimmed = accumulatedText.trim();
+  if (!trimmed) {
+    return t('stream.recovery.continuationPromptNoTail', { attempt, max });
+  }
+  const tail = trimmed.length > tailLength
+    ? trimmed.slice(-tailLength)
+    : trimmed;
+  return t('stream.recovery.continuationPrompt', { attempt, max, tail });
+}
+
+/**
+ * 去重裁剪：检测续跑新文本与已有文本尾部的重叠，返回去重后的增量
+ */
+export function deduplicateResumption(existing: string, incoming: string): string {
+  if (!existing || !incoming) return incoming;
+  const tail = existing.slice(-200);
+  // 从长到短搜索重叠前缀
+  for (let i = Math.min(tail.length, incoming.length); i > 10; i--) {
+    if (incoming.startsWith(tail.slice(-i))) {
+      return incoming.slice(i);
+    }
+  }
+  return incoming;
 }
 
 export function combineSignalWithTimeout(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {

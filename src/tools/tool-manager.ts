@@ -116,6 +116,11 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
   // 内置工具执行器
   private terminalExecutor: IShellExecutor;
+
+  /** 获取 Shell 执行器实例（供 adapter 注册进程事件监听） */
+  getShellExecutor(): IShellExecutor {
+    return this.terminalExecutor;
+  }
   private fileExecutor: FileExecutor;
   private searchExecutor: SearchExecutor;
   private removeFilesExecutor: RemoveFilesExecutor;
@@ -137,11 +142,14 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   // 快照系统
   private snapshotManager?: SnapshotManager;
   private snapshotContextMap: Map<string, SnapshotContext> = new Map();
+  private todoModifiedFilesMap: Map<string, Set<string>> = new Map();
   private executionContextStorage = new AsyncLocalStorage<ToolExecutionContext>();
   /** 外部命令可能改动文件时递增，用于判断 file_view 新鲜度 */
   private workspaceMutationEpoch = 0;
   /** 文件路径最近一次 file_view/file_edit/file_insert/file_create 对齐到的 epoch */
   private fileContextEpochByPath: Map<string, number> = new Map();
+  /** terminal_id 所属执行主体（orchestrator / worker-*） */
+  private terminalOwnershipById: Map<number, string> = new Map();
 
   constructor(options: ToolManagerOptions = {}) {
     super();
@@ -229,9 +237,21 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         missionId: context.missionId,
       }, LogCategory.TOOLS);
       this.snapshotContextMap.delete(context.workerId);
+      this.clearWorkerTodoModifiedFiles(context.workerId);
       return;
     }
     this.snapshotContextMap.set(context.workerId, { ...context, sessionId });
+  }
+
+  /**
+   * 只读获取指定 worker 的快照上下文（用于调度/终止判定等控制平面）
+   */
+  getSnapshotContext(workerId: string): SnapshotContext | undefined {
+    const context = this.snapshotContextMap.get(workerId);
+    if (!context) {
+      return undefined;
+    }
+    return { ...context };
   }
 
   /**
@@ -245,12 +265,25 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     }
   }
 
+  resetTodoModifiedFiles(workerId: string, todoId: string): void {
+    this.todoModifiedFilesMap.set(this.buildTodoModifiedFilesKey(workerId, todoId), new Set());
+  }
+
+  getTodoModifiedFiles(workerId: string, todoId: string): string[] {
+    return Array.from(this.todoModifiedFilesMap.get(this.buildTodoModifiedFilesKey(workerId, todoId)) || []);
+  }
+
+  clearTodoModifiedFiles(workerId: string, todoId: string): void {
+    this.todoModifiedFilesMap.delete(this.buildTodoModifiedFilesKey(workerId, todoId));
+  }
+
   /**
    * 清除快照执行上下文
    * 在 Assignment 执行后调用，按 workerId 精确清除
    */
   clearSnapshotContext(workerId: string): void {
     this.snapshotContextMap.delete(workerId);
+    this.clearWorkerTodoModifiedFiles(workerId);
   }
 
   /**
@@ -286,6 +319,30 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       contextWorkers: Array.from(this.snapshotContextMap.keys()),
     }, LogCategory.TOOLS);
     return undefined;
+  }
+
+  private buildTodoModifiedFilesKey(workerId: string, todoId: string): string {
+    return `${workerId}::${todoId}`;
+  }
+
+  private clearWorkerTodoModifiedFiles(workerId: string): void {
+    const prefix = `${workerId}::`;
+    for (const key of this.todoModifiedFilesMap.keys()) {
+      if (key.startsWith(prefix)) {
+        this.todoModifiedFilesMap.delete(key);
+      }
+    }
+  }
+
+  private recordTodoModifiedFile(workerId: string, todoId: string, filePath: string): void {
+    const normalizedPath = this.workspaceRoots.toDisplayPath(filePath).trim();
+    if (!normalizedPath) {
+      return;
+    }
+    const key = this.buildTodoModifiedFilesKey(workerId, todoId);
+    const files = this.todoModifiedFilesMap.get(key) || new Set<string>();
+    files.add(normalizedPath);
+    this.todoModifiedFilesMap.set(key, files);
   }
 
   /**
@@ -325,6 +382,9 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
     const afterWriteCallback = (filePath: string) => {
       const context = self.getActiveSnapshotContext();
+      if (context?.workerId && context.todoId) {
+        self.recordTodoModifiedFile(context.workerId, context.todoId, filePath);
+      }
       globalEventBus.emitEvent('snapshot:changed', {
         data: {
           filePath,
@@ -556,6 +616,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     ['split-todo', 'split_todo'],
     ['get-todos', 'get_todos'],
     ['update-todo', 'update_todo'],
+    ['apply-skill', 'apply_skill'],
   ]);
 
   /**
@@ -711,51 +772,62 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    * - 统一通过 ToolManager 入口，避免外部直接操作具体 executor
    * - 支持内部专用工具（如 lsp_query）在不暴露给模型的前提下复用
    */
-  async executeInternalTool(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
-    const normalizedName = this.normalizeToolName(toolCall.name);
-    const normalizedToolCall = normalizedName === toolCall.name
-      ? toolCall
-      : { ...toolCall, name: normalizedName };
+  async executeInternalTool(
+    toolCall: ToolCall,
+    signal?: AbortSignal,
+    executionContext?: ToolExecutionContext
+  ): Promise<ToolResult> {
+    const run = async (): Promise<ToolResult> => {
+      const normalizedName = this.normalizeToolName(toolCall.name);
+      const normalizedToolCall = normalizedName === toolCall.name
+        ? toolCall
+        : { ...toolCall, name: normalizedName };
 
-    if (normalizedToolCall.name === 'lsp_query') {
-      return this.lspExecutor.execute(normalizedToolCall);
+      if (normalizedToolCall.name === 'lsp_query') {
+        return this.lspExecutor.execute(normalizedToolCall);
+      }
+
+      // process 原语仅在内部调用路径可达，不暴露为模型工具
+      switch (normalizedToolCall.name) {
+        case 'launch-process':
+          return this.standardizeToolResult(
+            normalizedToolCall,
+            await this.executeLaunchProcessTool(normalizedToolCall, signal),
+            'builtin'
+          );
+        case 'read-process':
+          return this.standardizeToolResult(
+            normalizedToolCall,
+            await this.executeReadProcessTool(normalizedToolCall, signal),
+            'builtin'
+          );
+        case 'write-process':
+          return this.standardizeToolResult(
+            normalizedToolCall,
+            await this.executeWriteProcessTool(normalizedToolCall),
+            'builtin'
+          );
+        case 'kill-process':
+          return this.standardizeToolResult(
+            normalizedToolCall,
+            await this.executeKillProcessTool(normalizedToolCall),
+            'builtin'
+          );
+        case 'list-processes':
+          return this.standardizeToolResult(
+            normalizedToolCall,
+            await this.executeListProcessesTool(normalizedToolCall),
+            'builtin'
+          );
+      }
+
+      return this.execute(normalizedToolCall, signal);
+    };
+
+    if (executionContext) {
+      return this.executionContextStorage.run(executionContext, run);
     }
-
-    // process 原语仅在内部调用路径可达，不暴露为模型工具
-    switch (normalizedToolCall.name) {
-      case 'launch-process':
-        return this.standardizeToolResult(
-          normalizedToolCall,
-          await this.executeLaunchProcessTool(normalizedToolCall, signal),
-          'builtin'
-        );
-      case 'read-process':
-        return this.standardizeToolResult(
-          normalizedToolCall,
-          await this.executeReadProcessTool(normalizedToolCall, signal),
-          'builtin'
-        );
-      case 'write-process':
-        return this.standardizeToolResult(
-          normalizedToolCall,
-          await this.executeWriteProcessTool(normalizedToolCall),
-          'builtin'
-        );
-      case 'kill-process':
-        return this.standardizeToolResult(
-          normalizedToolCall,
-          await this.executeKillProcessTool(normalizedToolCall),
-          'builtin'
-        );
-      case 'list-processes':
-        return this.standardizeToolResult(
-          normalizedToolCall,
-          await this.executeListProcessesTool(normalizedToolCall),
-          'builtin'
-        );
-    }
-
-    return this.execute(normalizedToolCall, signal);
+    return run();
   }
 
   /**
@@ -993,6 +1065,9 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         return await this.orchestrationExecutor.execute(toolCall, callerContext);
       }
 
+      case 'apply_skill':
+        return await this.executeApplySkillTool(toolCall);
+
       default:
         return {
           toolCallId: toolCall.id,
@@ -1000,6 +1075,59 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
           isError: true,
         };
     }
+  }
+
+  /**
+   * 执行 apply_skill 内置工具：按需加载 Instruction Skill 的完整指令内容
+   */
+  private async executeApplySkillTool(toolCall: ToolCall): Promise<ToolResult> {
+    const skillName = toolCall.arguments?.skill_name as string | undefined;
+    if (!skillName) {
+      return {
+        toolCallId: toolCall.id,
+        content: 'Missing required parameter: skill_name',
+        isError: true,
+      };
+    }
+
+    const skillsManager = this.getSkillExecutor();
+    if (!skillsManager) {
+      return {
+        toolCallId: toolCall.id,
+        content: 'Skill runtime is not enabled. Please enable Skills in settings.',
+        isError: true,
+      };
+    }
+
+    const skill = skillsManager.getInstructionSkill(skillName);
+    if (!skill) {
+      // 列出可用 Skill 帮助 LLM 修正
+      const available = skillsManager.getInstructionSkills().map(s => s.name);
+      return {
+        toolCallId: toolCall.id,
+        content: `Instruction Skill "${skillName}" not found. Available skills: ${available.join(', ') || 'none'}`,
+        isError: true,
+      };
+    }
+
+    if (!skill.content) {
+      return {
+        toolCallId: toolCall.id,
+        content: `Skill "${skillName}" has no instruction content.`,
+        isError: true,
+      };
+    }
+
+    logger.info('apply_skill: loaded instruction skill', {
+      skillName,
+      contentLength: skill.content.length,
+      disableModelInvocation: skill.disableModelInvocation,
+    }, LogCategory.TOOLS);
+
+    return {
+      toolCallId: toolCall.id,
+      content: `## Skill Instructions: ${skill.name}\n\n${skill.content}`,
+    };
   }
 
   /**
@@ -1169,6 +1297,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       'split_todo': { category: 'Task Management', desc: 'Split the current task into multiple sub-steps' },
       'get_todos': { category: 'Task Management', desc: 'View the todo list for the current task' },
       'update_todo': { category: 'Task Management', desc: 'Update todo status or content' },
+      'apply_skill': { category: 'Code Intelligence', desc: 'Load and apply an installed instruction skill by name' },
     };
 
     // 编排者专用的附加说明
@@ -1225,6 +1354,21 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       }
     }
 
+    // Instruction Skills 目录（让 LLM 知道有哪些增强能力可用）
+    const prompts = this.getPrompts();
+    const instructionSkills = prompts.filter(p => p.source === 'skill');
+    if (instructionSkills.length > 0) {
+      lines.push('');
+      lines.push('Installed Skill Instructions (user-installed capability enhancements):');
+      lines.push('When the user task scenario matches an [auto] skill, call apply_skill(skill_name) to load its instructions.');
+      lines.push('[manual] skills are only activated when the user explicitly triggers them via /skill-name.');
+      for (const skill of instructionSkills) {
+        const type = skill.disableModelInvocation ? 'manual' : 'auto';
+        const desc = skill.description ? ` - ${skill.description.substring(0, 100)}` : '';
+        lines.push(`- [${type}] ${skill.name}${desc}`);
+      }
+    }
+
     return lines.join('\n');
   }
 
@@ -1246,7 +1390,7 @@ Single-tool semantics:
 - During execution, the same tool card streams output continuously.
 
 Process modes:
-- run_mode="task": one-shot command, terminal becomes reusable after completion.
+- run_mode="task": one-shot command, each call runs in an isolated terminal process.
 - run_mode="service": long-running background service, terminal is locked until killed.
 - run_mode omitted: wait=true => task, wait=false => service.
 
@@ -1271,7 +1415,6 @@ Only set may_modify_files=true when the command directly writes source files.`,
               description: 'Service mode only: optional regex strings for ready detection',
               items: { type: 'string' },
             },
-            showTerminal: { type: 'boolean', description: 'Whether to show terminal window (default: true)' },
             may_modify_files: { type: 'boolean', description: 'Set true only if command actually writes files (default: false)' },
           },
           required: ['command'],
@@ -1310,6 +1453,27 @@ Only set may_modify_files=true when the command directly writes source files.`,
 
     // 13-15. 编排工具 (dispatch_task, send_worker_message, wait_for_workers)
     tools.push(...this.orchestrationExecutor.getToolDefinitions());
+
+    // 16. apply_skill（按需加载 Instruction Skill 指令）
+    tools.push({
+      name: 'apply_skill',
+      description: 'Load and apply an installed instruction skill. Call this when the user\'s task matches a skill scenario listed in Installed Skill Instructions.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          skill_name: {
+            type: 'string',
+            description: 'The name of the instruction skill to load',
+          },
+        },
+        required: ['skill_name'],
+      },
+      metadata: {
+        source: 'builtin',
+        category: 'intelligence',
+        tags: ['skill', 'instruction', 'enhancement'],
+      },
+    });
 
     return tools;
   }
@@ -1546,6 +1710,31 @@ Only set may_modify_files=true when the command directly writes source files.`,
     };
   }
 
+  private resolveActiveTerminalOwner(): string | null {
+    const context = this.getActiveSnapshotContext();
+    const resolved = this.resolveLaunchProcessTerminalName(context);
+    return resolved.terminalName;
+  }
+
+  private resolveTerminalOwnershipError(action: 'read-process' | 'write-process' | 'kill-process', terminalId: number): string | null {
+    const owner = this.terminalOwnershipById.get(terminalId);
+    if (!owner) {
+      return null;
+    }
+    const currentOwner = this.resolveActiveTerminalOwner();
+    if (!currentOwner) {
+      return `${action} rejected: current execution context has no terminal owner`;
+    }
+    if (currentOwner !== owner) {
+      return `${action} rejected: terminal_id ${terminalId} belongs to ${owner}, current context is ${currentOwner}`;
+    }
+    return null;
+  }
+
+  private isTerminalProcessState(status: unknown): boolean {
+    return status === 'completed' || status === 'failed' || status === 'killed' || status === 'timeout';
+  }
+
   /**
    * 自动识别常见长驻命令，避免在未显式指定 run_mode 时误判为 task 后被超时终止。
    */
@@ -1741,7 +1930,6 @@ Only set may_modify_files=true when the command directly writes source files.`,
       max_wait_seconds = 30,
       startup_wait_seconds,
       ready_patterns,
-      showTerminal = true,
       may_modify_files = false,
     } = args;
     const normalized = this.normalizeLaunchProcessCommand(rawCommand, rawCwd);
@@ -1787,13 +1975,6 @@ Only set may_modify_files=true when the command directly writes source files.`,
       return {
         toolCallId: toolCall.id,
         content: 'Command rejected: ready_patterns parameter type error, must be a string[]',
-        isError: true,
-      };
-    }
-    if (args.showTerminal !== undefined && typeof args.showTerminal !== 'boolean') {
-      return {
-        toolCallId: toolCall.id,
-        content: 'Command rejected: showTerminal parameter type error, must be a boolean',
         isError: true,
       };
     }
@@ -1866,11 +2047,14 @@ Only set may_modify_files=true when the command directly writes source files.`,
       wait: effectiveWait,
       maxWaitSeconds: max_wait_seconds,
       name: terminalName,
-      showTerminal,
       runMode,
       startupWaitSeconds: startup_wait_seconds,
       readyPatterns: ready_patterns,
     }, signal);
+    this.terminalOwnershipById.set(result.terminal_id, terminalName);
+    if (this.isTerminalProcessState(result.status)) {
+      this.terminalOwnershipById.delete(result.terminal_id);
+    }
 
     const hasFailureStatus = result.status === 'failed' || result.status === 'killed' || result.status === 'timeout';
     const hasNonZeroExit = result.return_code !== null && result.return_code !== 0;
@@ -1935,8 +2119,19 @@ Only set may_modify_files=true when the command directly writes source files.`,
         isError: true,
       };
     }
+    const ownershipError = this.resolveTerminalOwnershipError('read-process', terminal_id);
+    if (ownershipError) {
+      return {
+        toolCallId: toolCall.id,
+        content: ownershipError,
+        isError: true,
+      };
+    }
 
     const result = await this.terminalExecutor.readProcess(terminal_id, wait, max_wait_seconds, from_cursor, signal);
+    if (this.isTerminalProcessState(result.status)) {
+      this.terminalOwnershipById.delete(terminal_id);
+    }
     return {
       toolCallId: toolCall.id,
       content: JSON.stringify(result),
@@ -1963,6 +2158,14 @@ Only set may_modify_files=true when the command directly writes source files.`,
         isError: true,
       };
     }
+    const ownershipError = this.resolveTerminalOwnershipError('write-process', terminal_id);
+    if (ownershipError) {
+      return {
+        toolCallId: toolCall.id,
+        content: ownershipError,
+        isError: true,
+      };
+    }
 
     const result = await this.terminalExecutor.writeProcess(terminal_id, input_text);
     return {
@@ -1983,8 +2186,19 @@ Only set may_modify_files=true when the command directly writes source files.`,
         isError: true,
       };
     }
+    const ownershipError = this.resolveTerminalOwnershipError('kill-process', terminal_id);
+    if (ownershipError) {
+      return {
+        toolCallId: toolCall.id,
+        content: ownershipError,
+        isError: true,
+      };
+    }
 
     const result = await this.terminalExecutor.killProcess(terminal_id);
+    if (result.killed) {
+      this.terminalOwnershipById.delete(terminal_id);
+    }
     return {
       toolCallId: toolCall.id,
       content: JSON.stringify(result),

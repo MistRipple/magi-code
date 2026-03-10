@@ -81,6 +81,11 @@ export function normalizeAssignments(
     assignments.push({
       ...raw,
       id,
+      contextNotes: asArray(raw.contextNotes).filter(
+        (item): item is string => typeof item === 'string' && item.trim().length > 0
+      ),
+      constraints: asArray(raw.constraints),
+      acceptanceCriteria: asArray(raw.acceptanceCriteria),
       todos,
     });
   }

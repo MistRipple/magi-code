@@ -13,8 +13,143 @@ import {
   Contract,
   Assignment,
   MissionStatus,
+  MissionPhase,
   CreateMissionParams,
+  Constraint,
+  AcceptanceCriterion,
+  RiskLevel,
+  ExecutionPath,
 } from './types';
+import { normalizeAssignments, generateEntityId } from './data-normalizer';
+
+function normalizeMissionTextItems(items: string[] | undefined): string[] {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+  return Array.from(new Set(
+    items
+      .map(item => (typeof item === 'string' ? item.trim() : ''))
+      .filter(item => item.length > 0)
+  ));
+}
+
+function buildMissionConstraints(items: string[] | undefined): Constraint[] {
+  return normalizeMissionTextItems(items).map((description) => ({
+    id: generateEntityId('constraint'),
+    type: 'must',
+    description,
+    source: 'user',
+  }));
+}
+
+function buildMissionAcceptanceCriteria(items: string[] | undefined): AcceptanceCriterion[] {
+  return normalizeMissionTextItems(items).map((description) => ({
+    id: generateEntityId('acceptance'),
+    description,
+    verifiable: false,
+    status: 'pending',
+  }));
+}
+
+function normalizeMissionRiskLevel(level: RiskLevel | undefined): RiskLevel {
+  return level === 'low' || level === 'medium' || level === 'high'
+    ? level
+    : 'medium';
+}
+
+function normalizeMissionExecutionPath(pathValue: ExecutionPath | undefined): ExecutionPath {
+  return pathValue === 'light' || pathValue === 'standard' || pathValue === 'full'
+    ? pathValue
+    : 'standard';
+}
+
+const TERMINAL_MISSION_STATUSES = new Set<MissionStatus>(['completed', 'failed', 'cancelled']);
+
+const MISSION_STATUS_TO_PHASE: Record<MissionStatus, MissionPhase> = {
+  draft: 'goal_understanding',
+  planning: 'worker_planning',
+  pending_review: 'plan_review',
+  pending_approval: 'plan_review',
+  executing: 'execution',
+  paused: 'execution',
+  reviewing: 'verification',
+  completed: 'summary',
+  failed: 'summary',
+  cancelled: 'summary',
+};
+
+function deriveMissionPhase(status: MissionStatus): MissionPhase {
+  const phase = MISSION_STATUS_TO_PHASE[status];
+  if (!phase) {
+    throw new Error(`Invalid mission status for phase derivation: ${String(status)}`);
+  }
+  return phase;
+}
+
+function normalizeMissionPhase(mission: Mission): Mission {
+  const phase = deriveMissionPhase(mission.status);
+  return mission.phase === phase ? mission : { ...mission, phase };
+}
+
+const ALLOWED_MISSION_STATUS_TRANSITIONS: Record<MissionStatus, MissionStatus[]> = {
+  draft: ['planning', 'pending_review', 'pending_approval', 'executing', 'cancelled'],
+  planning: ['pending_review', 'pending_approval', 'executing', 'failed', 'cancelled'],
+  pending_review: ['planning', 'pending_approval', 'executing', 'failed', 'cancelled'],
+  pending_approval: ['planning', 'executing', 'cancelled'],
+  executing: ['paused', 'reviewing', 'completed', 'failed', 'cancelled'],
+  paused: ['executing', 'failed', 'cancelled'],
+  reviewing: ['executing', 'completed', 'failed', 'cancelled'],
+  completed: [],
+  failed: [],
+  cancelled: [],
+};
+
+interface TransitionMissionStatusOptions {
+  failureReason?: string;
+}
+
+function applyMissionStatusTransition(
+  mission: Mission,
+  nextStatus: MissionStatus,
+  options: TransitionMissionStatusOptions,
+  now: number,
+): Mission {
+  if (nextStatus === 'failed') {
+    const failureReason = options.failureReason?.trim();
+    if (!failureReason) {
+      throw new Error('Mission failureReason is required when transitioning to failed');
+    }
+    return normalizeMissionPhase({
+      ...mission,
+      status: nextStatus,
+      failureReason,
+    });
+  }
+
+  if (nextStatus === 'executing') {
+    return normalizeMissionPhase({
+      ...mission,
+      status: nextStatus,
+      failureReason: undefined,
+      startedAt: mission.startedAt ?? now,
+    });
+  }
+
+  if (nextStatus === 'completed') {
+    return normalizeMissionPhase({
+      ...mission,
+      status: nextStatus,
+      failureReason: undefined,
+      completedAt: now,
+    });
+  }
+
+  return normalizeMissionPhase({
+    ...mission,
+    status: nextStatus,
+    failureReason: undefined,
+  });
+}
 
 /**
  * Mission 存储接口
@@ -40,8 +175,15 @@ export class InMemoryMissionStorage implements IMissionStorage {
   private missions: Map<string, Mission> = new Map();
   private sessionIndex: Map<string, Set<string>> = new Map();
 
+  private normalizeMission(mission: Mission): Mission {
+    return normalizeMissionPhase({
+      ...mission,
+      assignments: normalizeAssignments(mission.assignments),
+    });
+  }
+
   async save(mission: Mission): Promise<void> {
-    this.missions.set(mission.id, { ...mission });
+    this.missions.set(mission.id, this.normalizeMission(mission));
 
     // 更新 session 索引
     if (!this.sessionIndex.has(mission.sessionId)) {
@@ -52,7 +194,7 @@ export class InMemoryMissionStorage implements IMissionStorage {
 
   async load(id: string): Promise<Mission | null> {
     const mission = this.missions.get(id);
-    return mission ? { ...mission } : null;
+    return mission ? this.normalizeMission(mission) : null;
   }
 
   async update(mission: Mission): Promise<void> {
@@ -60,7 +202,7 @@ export class InMemoryMissionStorage implements IMissionStorage {
       throw new Error(`Mission not found: ${mission.id}`);
     }
     mission.updatedAt = Date.now();
-    this.missions.set(mission.id, { ...mission });
+    this.missions.set(mission.id, this.normalizeMission(mission));
   }
 
   async delete(id: string): Promise<void> {
@@ -116,36 +258,42 @@ export class MissionStorageManager extends EventEmitter {
    */
   async createMission(params: CreateMissionParams): Promise<Mission> {
     const now = Date.now();
+    const constraints = buildMissionConstraints(params.constraints);
+    const acceptanceCriteria = buildMissionAcceptanceCriteria(params.acceptanceCriteria);
+    const riskLevel = normalizeMissionRiskLevel(params.riskLevel);
+    const executionPath = normalizeMissionExecutionPath(params.executionPath);
+    const riskFactors = normalizeMissionTextItems(params.riskFactors);
     const mission: Mission = {
       id: `mission_${now}_${Math.random().toString(36).substring(2, 11)}`,
       sessionId: params.sessionId,
       userPrompt: params.userPrompt,
-      goal: '',
-      analysis: '',
+      goal: params.goal?.trim() || '',
+      analysis: params.analysis?.trim() || '',
       context: params.context || '',
-      constraints: [],
-      acceptanceCriteria: [],
+      constraints,
+      acceptanceCriteria,
       contracts: [],
       assignments: [],
-      riskLevel: 'medium',
-      riskFactors: [],
-      executionPath: 'standard',
+      riskLevel,
+      riskFactors,
+      executionPath,
       status: 'draft',
-      phase: 'goal_understanding',
+      phase: deriveMissionPhase('draft'),
       createdAt: now,
       updatedAt: now,
     };
 
-    await this.storage.save(mission);
-    this.emit('missionCreated', { mission });
-    return mission;
+    const normalizedMission = normalizeMissionPhase(mission);
+    await this.storage.save(normalizedMission);
+    this.emit('missionCreated', { mission: normalizedMission });
+    return normalizedMission;
   }
 
   /**
    * 保存 Mission
    */
   async save(mission: Mission): Promise<void> {
-    await this.storage.save(mission);
+    await this.storage.save(normalizeMissionPhase(mission));
   }
 
   /**
@@ -155,28 +303,82 @@ export class MissionStorageManager extends EventEmitter {
     return this.storage.load(id);
   }
 
+  async transitionStatus(
+    missionId: string,
+    nextStatus: MissionStatus,
+    options: TransitionMissionStatusOptions = {},
+  ): Promise<Mission> {
+    const mission = await this.storage.load(missionId);
+    if (!mission) {
+      throw new Error(`Mission not found: ${missionId}`);
+    }
+
+    if (mission.status === nextStatus) {
+      const normalizedMission = normalizeMissionPhase(mission);
+      if (normalizedMission.phase !== mission.phase) {
+        await this.persistMission(normalizedMission, mission);
+      }
+      return normalizedMission;
+    }
+
+    if (TERMINAL_MISSION_STATUSES.has(mission.status)) {
+      throw new Error(`Mission terminal status is sticky: ${mission.status} -> ${nextStatus}`);
+    }
+
+    const allowedTransitions = ALLOWED_MISSION_STATUS_TRANSITIONS[mission.status];
+    if (!allowedTransitions) {
+      throw new Error(`Invalid mission status value: ${String(mission.status)}`);
+    }
+
+    if (!allowedTransitions.includes(nextStatus)) {
+      throw new Error(`Invalid mission status transition: ${mission.status} -> ${nextStatus}`);
+    }
+
+    const transitionedMission = applyMissionStatusTransition(mission, nextStatus, options, Date.now());
+    await this.persistMission(transitionedMission, mission);
+    return transitionedMission;
+  }
+
   /**
    * 更新 Mission
    */
   async update(mission: Mission): Promise<void> {
     const oldMission = await this.storage.load(mission.id);
-    await this.storage.update(mission);
-
     if (oldMission && oldMission.status !== mission.status) {
+      throw new Error(
+        `Mission status must transition via transitionStatus: ${oldMission.status} -> ${mission.status}`
+      );
+    }
+    if (oldMission && oldMission.phase !== mission.phase) {
+      throw new Error(
+        `Mission phase is derived from status and cannot be updated directly: ${oldMission.phase} -> ${mission.phase}`
+      );
+    }
+    await this.persistMission(mission, oldMission);
+  }
+
+  private async persistMission(mission: Mission, oldMission?: Mission | null): Promise<void> {
+    const normalizedMission = normalizeMissionPhase(mission);
+    const previousMission = typeof oldMission === 'undefined'
+      ? await this.storage.load(mission.id)
+      : oldMission;
+    await this.storage.update(normalizedMission);
+
+    if (previousMission && previousMission.status !== normalizedMission.status) {
       this.emit('missionStatusChanged', {
-        mission,
-        missionId: mission.id,
-        oldStatus: oldMission.status,
-        newStatus: mission.status,
+        mission: normalizedMission,
+        missionId: normalizedMission.id,
+        oldStatus: previousMission.status,
+        newStatus: normalizedMission.status,
       });
     }
 
-    if (oldMission && oldMission.phase !== mission.phase) {
+    if (previousMission && previousMission.phase !== normalizedMission.phase) {
       this.emit('missionPhaseChanged', {
-        mission,
-        missionId: mission.id,
-        oldPhase: oldMission.phase,
-        newPhase: mission.phase,
+        mission: normalizedMission,
+        missionId: normalizedMission.id,
+        oldPhase: previousMission.phase,
+        newPhase: normalizedMission.phase,
       });
     }
   }
@@ -308,6 +510,13 @@ export class FileBasedMissionStorage implements IMissionStorage {
   private sessionIndex: Map<string, Set<string>> = new Map();
   private loaded = false;
 
+  private normalizeMission(mission: Mission): Mission {
+    return normalizeMissionPhase({
+      ...mission,
+      assignments: normalizeAssignments(mission.assignments),
+    });
+  }
+
   constructor(sessionsDir: string) {
     this.sessionsDir = sessionsDir;
   }
@@ -358,7 +567,7 @@ export class FileBasedMissionStorage implements IMissionStorage {
         const filePath = path.join(missionsDir, file);
         try {
           const content = await fs.promises.readFile(filePath, 'utf-8');
-          const mission: Mission = JSON.parse(content);
+          const mission = this.normalizeMission(JSON.parse(content) as Mission);
           this.missions.set(mission.id, mission);
 
           if (!this.sessionIndex.has(mission.sessionId)) {
@@ -393,20 +602,21 @@ export class FileBasedMissionStorage implements IMissionStorage {
 
   async save(mission: Mission): Promise<void> {
     await this.ensureLoaded();
-    this.missions.set(mission.id, { ...mission });
+    const normalizedMission = this.normalizeMission(mission);
+    this.missions.set(mission.id, normalizedMission);
 
     if (!this.sessionIndex.has(mission.sessionId)) {
       this.sessionIndex.set(mission.sessionId, new Set());
     }
     this.sessionIndex.get(mission.sessionId)!.add(mission.id);
 
-    await this.saveToDisk(mission);
+    await this.saveToDisk(normalizedMission);
   }
 
   async load(id: string): Promise<Mission | null> {
     await this.ensureLoaded();
     const mission = this.missions.get(id);
-    return mission ? { ...mission } : null;
+    return mission ? this.normalizeMission(mission) : null;
   }
 
   async update(mission: Mission): Promise<void> {
@@ -415,8 +625,9 @@ export class FileBasedMissionStorage implements IMissionStorage {
       throw new Error(`Mission not found: ${mission.id}`);
     }
     mission.updatedAt = Date.now();
-    this.missions.set(mission.id, { ...mission });
-    await this.saveToDisk(mission);
+    const normalizedMission = this.normalizeMission(mission);
+    this.missions.set(mission.id, normalizedMission);
+    await this.saveToDisk(normalizedMission);
   }
 
   async delete(id: string): Promise<void> {

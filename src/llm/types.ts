@@ -121,6 +121,24 @@ export interface LLMMessage {
 /**
  * LLM 请求参数
  */
+export type LLMRetryRuntimeEvent =
+  | {
+      phase: 'attempt_started';
+      attempt: number;
+      maxAttempts: number;
+    }
+  | {
+      phase: 'scheduled';
+      attempt: number;
+      maxAttempts: number;
+      delayMs: number;
+      nextRetryAt: number;
+    }
+  | {
+      phase: 'settled';
+      outcome: 'success' | 'failed';
+    };
+
 export interface LLMMessageParams {
   messages: LLMMessage[];
   maxTokens?: number;
@@ -131,8 +149,12 @@ export interface LLMMessageParams {
   toolChoice?: ToolChoice;
   /** 取消信号，用于中断正在进行的 LLM 请求 */
   signal?: AbortSignal;
-  /** 单次请求硬超时（毫秒），超时后会中断请求并抛出超时错误 */
+  /** 单次请求硬超时（毫秒），主要用于非流式请求 */
   timeoutMs?: number;
+  /** 流式请求空闲超时（毫秒），超过该时长无任何 chunk 到达则中断 */
+  streamIdleTimeoutMs?: number;
+  /** 流式请求硬超时（毫秒，可选安全网）；不配置则不启用绝对超时 */
+  streamHardTimeoutMs?: number;
   /**
    * 请求重试策略（单一策略入口）
    * - maxRetries: 总尝试次数（含首轮，最小 1）
@@ -141,8 +163,32 @@ export interface LLMMessageParams {
   retryPolicy?: {
     maxRetries?: number;
     baseDelayMs?: number;
+    /** 指定重试等待序列（毫秒），例如 [10000, 20000, 30000, 40000, 50000] */
+    retryDelaysMs?: readonly number[];
     retryOnTimeout?: boolean;
+    /**
+     * 是否对“非超时”错误也进行重试。
+     * 默认 true：采用统一续航策略，所有上游模型错误先重试再失败。
+     */
+    retryOnAllErrors?: boolean;
+    /** 单次请求重试时间预算（毫秒，超过后停止继续重试） */
+    maxRetryDurationMs?: number;
+    /** 确定性错误连续命中阈值（同签名错误达到阈值后提前止损） */
+    deterministicErrorStreakLimit?: number;
+    /** 短窗熔断配置（用于防止上游连续失败时持续打满） */
+    circuitBreaker?: {
+      /** 是否启用熔断，默认 true */
+      enabled?: boolean;
+      /** 统计窗口（毫秒） */
+      windowMs?: number;
+      /** 窗口内失败阈值，达到后打开熔断 */
+      failureThreshold?: number;
+      /** 熔断冷却时间（毫秒） */
+      cooldownMs?: number;
+    };
   };
+  /** 请求级重试运行态回调，仅用于透出当前可见主请求的 retry 节奏 */
+  retryRuntimeHook?: (event: LLMRetryRuntimeEvent) => void;
 }
 
 export type ToolChoice =

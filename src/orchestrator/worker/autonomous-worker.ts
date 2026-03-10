@@ -124,7 +124,7 @@ export interface TodoExecuteOptions {
   adapterScope?: AdapterOutputScope;
   /** 汇报回调（Worker → Orchestrator） */
   onReport?: ReportCallback;
-  /** 汇报超时(ms)，默认 5000 */
+  /** 汇报超时(ms)。未配置时使用内置默认值（progress/final: 30s，blocking question: 180s） */
   reportTimeout?: number;
   /** 获取补充指令（在决策点注入） */
   getSupplementaryInstructions?: () => string[];
@@ -175,12 +175,30 @@ export interface AutonomousExecutionResult {
   };
 }
 
-type AssignmentAbortSource = 'external' | 'model_fail_fast';
+type AssignmentAbortSource = 'external';
 
 /**
  * AutonomousWorker - 自主 Worker
  */
 export class AutonomousWorker extends EventEmitter {
+  private static readonly WRITE_REQUIRED_TODO_TYPES = new Set<UnifiedTodo['type']>([
+    'implementation',
+    'integration',
+    'fix',
+    'refactor',
+  ]);
+
+  /**
+   * Worker -> Orchestrator 汇报超时（默认）
+   * 说明：progress/final report 是控制面信号，不应因为短暂抖动触发业务中止。
+   */
+  private static readonly DEFAULT_REPORT_TIMEOUT_MS = 30_000;
+  /**
+   * 阻塞 question 汇报超时（默认）
+   * 说明：blocking question 可能触发一次系统侧编排 LLM 调用，5s 在真实场景下过短。
+   */
+  private static readonly DEFAULT_BLOCKING_QUESTION_TIMEOUT_MS = 180_000;
+
   private todoManager: TodoManager;
   private recoveryHandler: ProfileAwareRecoveryHandler;
   private retryCountMap: Map<string, number> = new Map();
@@ -498,32 +516,22 @@ export class AutonomousWorker extends EventEmitter {
             duration: 0,
           };
 
+          let surfacedFailureReason = failureReason;
           const modelIssue = classifyModelOriginIssue(failureReason);
           if (modelIssue.isModelCause) {
-            const surfacedReason = toModelOriginUserMessage(failureReason).trim() || failureReason;
-            logger.warn('Worker.Todo.模型侧失败.快速终止当前任务', {
+            surfacedFailureReason = toModelOriginUserMessage(failureReason).trim() || failureReason;
+            logger.warn('Worker.Todo.模型侧失败.进入恢复链路', {
               assignmentId: assignment.id,
               todoId: currentTodo.id,
               worker: this.workerType,
               issueKind: modelIssue.kind,
-              reason: surfacedReason,
+              reason: surfacedFailureReason,
             }, LogCategory.ORCHESTRATOR);
-
-            failedTodos.push(result.todo);
-            errors.push(surfacedReason);
-            aborted = true;
-            abortReason = surfacedReason;
-            abortSource = 'model_fail_fast';
-
-            if (session) {
-              sessionMgr.update(session.id, {
-                stateSnapshot: {
-                  lastError: surfacedReason,
-                  lastExecutionAt: Date.now(),
-                },
-              });
-            }
-            break;
+            trackModelOriginEvent('detected', `worker:${this.workerType}`, failureReason, {
+              assignmentId: assignment.id,
+              todoId: currentTodo.id,
+              stage: 'todo_execution',
+            });
           }
 
           // 失败恢复：先做策略决策，再执行恢复；恢复失败再上报编排者决策
@@ -581,7 +589,7 @@ export class AutonomousWorker extends EventEmitter {
           const questionResponse = await this.reportQuestion(
             assignment,
             currentTodo,
-            failureReason,
+            surfacedFailureReason,
             recoveryDecision,
             options
           );
@@ -597,13 +605,13 @@ export class AutonomousWorker extends EventEmitter {
           }
 
           failedTodos.push(result.todo);
-          errors.push(failureReason);
+          errors.push(surfacedFailureReason);
 
           // 更新 Session 失败状态 - 提案 4.1
           if (session) {
             sessionMgr.update(session.id, {
               stateSnapshot: {
-                lastError: failureReason,
+                lastError: surfacedFailureReason,
                 lastExecutionAt: Date.now(),
               },
             });
@@ -826,20 +834,21 @@ export class AutonomousWorker extends EventEmitter {
           } : undefined,
         };
 
-        const finalReport = qualityCheckedResult.success
-          ? createCompletedReport(this.workerType, assignment.id, finalResult)
-          : createFailedReport(this.workerType, assignment.id, qualityCheckedResult.errors[0] || 'Execution failed', finalResult);
+          const finalReport = qualityCheckedResult.success
+            ? createCompletedReport(this.workerType, assignment.id, finalResult)
+            : createFailedReport(this.workerType, assignment.id, qualityCheckedResult.errors[0] || 'Execution failed', finalResult);
 
-        try {
-          await Promise.race([
-            options.onReport(finalReport),
-            new Promise<void>((_, reject) =>
-              setTimeout(
-                () => reject(new Error('Final report timed out')),
-                options.reportTimeout || 5000,
+          const finalReportTimeoutMs = this.resolveReportTimeoutMs(options, 'final');
+          try {
+            await Promise.race([
+              options.onReport(finalReport),
+              new Promise<void>((_, reject) =>
+                setTimeout(
+                  () => reject(new Error('Final report timed out')),
+                  finalReportTimeoutMs,
+                ),
               ),
-            ),
-          ]);
+            ]);
         } catch (reportError) {
           logger.error('Worker.最终汇报失败', { error: reportError instanceof Error ? reportError.message : String(reportError) }, LogCategory.ORCHESTRATOR);
         }
@@ -936,17 +945,9 @@ export class AutonomousWorker extends EventEmitter {
     options: TodoExecuteOptions,
     round: number,
   ): Promise<UnifiedTodo[]> {
-    // 1. 从 delegationBriefing 提取验收标准
-    const briefing = assignment.delegationBriefing;
-    if (!briefing) return [];
-
-    const sectionMatch = briefing.match(/## Acceptance Criteria\n([\s\S]*?)(?=\n## |$)/) || briefing.match(/## 验收标准\n([\s\S]*?)(?=\n## |$)/);
-    if (!sectionMatch) return [];
-
-    const acceptance = sectionMatch[1]
-      .split('\n')
-      .map(line => line.replace(/^-\s*/, '').trim())
-      .filter(line => line.length > 0);
+    const acceptance = assignment.acceptanceCriteria
+      .map(criterion => criterion.description.trim())
+      .filter(description => description.length > 0);
     if (acceptance.length === 0) return [];
 
     // 2. 构建验收 prompt
@@ -1084,11 +1085,12 @@ If any criterion is not satisfied:
       progress
     );
 
+    const reportTimeoutMs = this.resolveReportTimeoutMs(options, 'progress');
     try {
       const response = await Promise.race([
         options.onReport(report),
         new Promise<OrchestratorResponse>((_, reject) =>
-          setTimeout(() => reject(new Error('Report timed out')), options.reportTimeout || 5000)
+          setTimeout(() => reject(new Error('Report timed out')), reportTimeoutMs)
         ),
       ]);
       return response;
@@ -1116,6 +1118,7 @@ If any criterion is not satisfied:
       return { action: 'continue', timestamp: Date.now() };
     }
 
+    const questionReportTimeoutMs = this.resolveReportTimeoutMs(options, 'question');
     const question = createQuestionReport(
       this.workerType,
       assignment.id,
@@ -1141,18 +1144,34 @@ If any criterion is not satisfied:
       return await Promise.race([
         options.onReport(question),
         new Promise<OrchestratorResponse>((_, reject) =>
-          setTimeout(() => reject(new Error('Question report timed out')), options.reportTimeout || 5000)
+          setTimeout(() => reject(new Error('Question report timed out')), questionReportTimeoutMs)
         ),
       ]);
     } catch (error) {
-      const reason = `Question report failed: ${error instanceof Error ? error.message : String(error)}`;
-      logger.warn('Worker.question上报失败，按终止处理', {
+      logger.warn('Worker.question上报失败，按降级继续', {
         assignmentId: assignment.id,
         todoId: todo.id,
+        timeoutMs: questionReportTimeoutMs,
         error: error instanceof Error ? error.message : String(error),
       }, LogCategory.ORCHESTRATOR);
-      return { action: 'abort', abortReason: reason, timestamp: Date.now() };
+      return { action: 'continue', timestamp: Date.now() };
     }
+  }
+
+  private resolveReportTimeoutMs(
+    options: TodoExecuteOptions,
+    type: 'progress' | 'question' | 'final',
+  ): number {
+    const configured = Number(options.reportTimeout);
+    const fallback = type === 'question'
+      ? AutonomousWorker.DEFAULT_BLOCKING_QUESTION_TIMEOUT_MS
+      : AutonomousWorker.DEFAULT_REPORT_TIMEOUT_MS;
+    if (!Number.isFinite(configured) || configured <= 0) {
+      return fallback;
+    }
+    const bounded = Math.floor(configured);
+    const min = type === 'question' ? 10_000 : 5_000;
+    return Math.max(min, bounded);
   }
 
   /**
@@ -1288,8 +1307,10 @@ If any criterion is not satisfied:
     todo.status = 'running';
     todo.startedAt = Date.now();
 
+    const toolManager = options.adapterFactory?.getToolManager();
     // 更新快照上下文的 todoId（确保当前 Todo 的文件变更精确关联）
-    options.adapterFactory?.getToolManager().updateSnapshotTodoId(assignment.workerId, todo.id);
+    toolManager?.updateSnapshotTodoId(assignment.workerId, todo.id);
+    toolManager?.resetTodoModifiedFiles(assignment.workerId, todo.id);
 
     this.emit('todoStarted', {
       assignmentId: assignment.id,
@@ -1339,10 +1360,12 @@ If any criterion is not satisfied:
         selfCheckGuidance,
         options
       );
+      const modifiedFiles = toolManager?.getTodoModifiedFiles(assignment.workerId, todo.id) || [];
 
       // 检查执行过程中是否调用了 split_todo（数据驱动，无模式标志）
       const hasChildren = assignment.todos.some(t => t.parentId === todo.id);
       if (hasChildren) {
+        toolManager?.clearTodoModifiedFiles(assignment.workerId, todo.id);
         // 父 Todo 保持 running 状态，由 tryCompleteParent 在所有子 Todo 完成后自动标记完成
         todo.output = {
           success: true,
@@ -1368,16 +1391,17 @@ If any criterion is not satisfied:
       const todoOutput: TodoOutput = {
         success: true,
         summary: output.summary,
-        modifiedFiles: output.modifiedFiles || [],
+        modifiedFiles,
         duration: Date.now() - startTime,
       };
+      toolManager?.clearTodoModifiedFiles(assignment.workerId, todo.id);
       await this.todoManager.complete(todo.id, todoOutput);
       // 同步本地对象状态
       todo.status = 'completed';
       todo.completedAt = Date.now();
       todo.output = todoOutput;
       try {
-        await this.writeInsights(this.buildSuccessInsights(assignment, output.summary, output.modifiedFiles || [], todo));
+        await this.writeInsights(this.buildSuccessInsights(assignment, output.summary, modifiedFiles, todo));
       } catch (insightError) {
         logger.warn('Worker.Todo.完成后Insight写入失败（忽略）', {
           assignmentId: assignment.id,
@@ -1408,6 +1432,8 @@ If any criterion is not satisfied:
       };
     } catch (error) {
       const { rawMessage, userMessage } = this.resolveErrorMessages(error);
+      const modifiedFiles = toolManager?.getTodoModifiedFiles(assignment.workerId, todo.id) || [];
+      toolManager?.clearTodoModifiedFiles(assignment.workerId, todo.id);
 
       // 记录完整堆栈用于诊断运行时 TypeError 等难以复现的崩溃
       logger.error('Worker.executeTodo.异常', {
@@ -1426,7 +1452,7 @@ If any criterion is not satisfied:
       todo.output = {
         success: false,
         summary: '',
-        modifiedFiles: [],
+        modifiedFiles,
         error: userMessage,
         duration: Date.now() - startTime,
       };
@@ -1559,7 +1585,6 @@ Not applicable: The task itself is a single goal — execute it directly.`);
     options: TodoExecuteOptions
   ): Promise<{
     summary: string;
-    modifiedFiles?: string[];
     tokenUsage?: TokenUsage;
   }> {
     // 必须提供 adapterFactory
@@ -1599,7 +1624,6 @@ Not applicable: The task itself is a single goal — execute it directly.`);
 
       // 解析响应
       const summary = response.content || response.error || 'Execution completed';
-      const modifiedFiles = this.extractModifiedFiles(response.content || '');
 
       // 调用输出回调
       if (options.onOutput && response.content) {
@@ -1608,7 +1632,6 @@ Not applicable: The task itself is a single goal — execute it directly.`);
 
       return {
         summary,
-        modifiedFiles,
         tokenUsage: response.tokenUsage,
       };
     } catch (error) {
@@ -1654,32 +1677,6 @@ Not applicable: The task itself is a single goal — execute it directly.`);
       }
     }
     return fallback;
-  }
-
-  /**
-   * 从输出中提取修改的文件列表
-   */
-  private extractModifiedFiles(output: string): string[] {
-    const files: string[] = [];
-
-    // 匹配常见的文件修改模式
-    const patterns = [
-      /(?:Created|Modified|Updated|Wrote|Edited):\s*([^\n]+)/gi,
-      /(?:创建|修改|更新|写入|编辑)[了]?[：:]\s*([^\n]+)/gi,
-      /✓\s+([^\s]+\.[a-z]+)/gi,
-    ];
-
-    for (const pattern of patterns) {
-      let match;
-      while ((match = pattern.exec(output)) !== null) {
-        const file = match[1].trim();
-        if (file && !files.includes(file)) {
-          files.push(file);
-        }
-      }
-    }
-
-    return files;
   }
 
   private extractTargetFiles(text: string): string[] {
@@ -2057,6 +2054,7 @@ Not applicable: The task itself is a single goal — execute it directly.`);
     startedAt?: number
   ): AutonomousExecutionResult {
     const gateErrors: string[] = [];
+    const modifiedFiles = this.collectResultModifiedFiles(result);
 
     if (sharedContext && sharedContext.budgetUsage > 1) {
       gateErrors.push('Quality gate failed: Shared context budget exceeded.');
@@ -2080,6 +2078,19 @@ Not applicable: The task itself is a single goal — execute it directly.`);
       if (unknownRequiredContracts.length > 0) {
         gateErrors.push(`Quality gate failed: Undeclared contract dependencies found: ${unknownRequiredContracts.join(', ')}`);
       }
+
+      if (assignment.scope.requiresModification && modifiedFiles.length === 0) {
+        gateErrors.push('Quality gate failed: Assignment required real file modifications but none were recorded.');
+      }
+
+      const emptyWriteTodos = result.completedTodos.filter(todo =>
+        this.requiresRealModification(todo) && !this.hasRecordedTodoModifications(todo)
+      );
+      if (emptyWriteTodos.length > 0) {
+        gateErrors.push(
+          `Quality gate failed: Completed write-required todos recorded no real file modifications: ${emptyWriteTodos.map(todo => `${todo.id}(${todo.type})`).join(', ')}`
+        );
+      }
     }
 
     if (gateErrors.length === 0) {
@@ -2098,6 +2109,21 @@ Not applicable: The task itself is a single goal — execute it directly.`);
       success: false,
       errors: [...result.errors, ...gateErrors],
     };
+  }
+
+  private collectResultModifiedFiles(result: AutonomousExecutionResult): string[] {
+    return [...new Set([
+      ...result.completedTodos.flatMap(todo => todo.output?.modifiedFiles || []),
+      ...result.failedTodos.flatMap(todo => todo.output?.modifiedFiles || []),
+    ].map(file => file.trim()).filter(Boolean))];
+  }
+
+  private requiresRealModification(todo: UnifiedTodo): boolean {
+    return AutonomousWorker.WRITE_REQUIRED_TODO_TYPES.has(todo.type);
+  }
+
+  private hasRecordedTodoModifications(todo: UnifiedTodo): boolean {
+    return (todo.output?.modifiedFiles || []).some(file => file.trim().length > 0);
   }
 
   /**

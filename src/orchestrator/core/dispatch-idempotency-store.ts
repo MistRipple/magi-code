@@ -132,6 +132,33 @@ export class DispatchIdempotencyStore {
     });
   }
 
+  resolveByTaskId(taskId: string): DispatchIdempotencyRecord | null {
+    const normalizedTaskId = taskId.trim();
+    if (!normalizedTaskId) {
+      return null;
+    }
+    return this.withExclusiveLock(() => {
+      this.loadFromDiskUnsafe();
+      const key = this.keyByTaskId.get(normalizedTaskId);
+      if (!key) {
+        return null;
+      }
+      const record = this.byKey.get(key);
+      if (!record) {
+        this.keyByTaskId.delete(normalizedTaskId);
+        this.persistUnsafe();
+        return null;
+      }
+      if (this.isExpired(record, Date.now())) {
+        this.byKey.delete(key);
+        this.keyByTaskId.delete(normalizedTaskId);
+        this.persistUnsafe();
+        return null;
+      }
+      return { ...record };
+    });
+  }
+
   claimOrGet(input: DispatchIdempotencyClaimInput): DispatchIdempotencyClaimResult {
     return this.withExclusiveLock(() => {
       this.loadFromDiskUnsafe();
