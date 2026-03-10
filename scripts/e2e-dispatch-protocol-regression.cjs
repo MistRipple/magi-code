@@ -40,9 +40,28 @@ function createFakeBatch(batchId) {
     register(taskId, worker) {
       entries.set(taskId, {
         taskId,
-        task: `task-${taskId}`,
         status: 'running',
         worker,
+        taskContract: {
+          taskTitle: `task-${taskId}`,
+          category: 'general',
+          requirementAnalysis: {
+            goal: `goal-${taskId}`,
+            analysis: `analysis-${taskId}`,
+            needsWorker: true,
+            reason: 'dispatch protocol regression fixture',
+          },
+          context: [],
+          scopeHint: [],
+          files: [],
+          dependsOn: [],
+          collaborationContracts: {
+            producerContracts: [],
+            consumerContracts: [],
+            interfaceContracts: [],
+            freezeFiles: [],
+          },
+        },
       });
     },
     getEntry(taskId) {

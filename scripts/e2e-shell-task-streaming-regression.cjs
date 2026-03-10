@@ -33,7 +33,7 @@ async function main() {
   const { NodeShellExecutor } = require(executorPath);
   const executor = new NodeShellExecutor();
 
-  try {
+  async function runScenario(label, readWait) {
     // 约 3 秒持续输出，确保可观测到多轮增量
     const command = "for i in 1 2 3 4 5 6; do echo MAGI_STREAM_$i; sleep 0.5; done";
 
@@ -48,25 +48,30 @@ async function main() {
 
     assert(
       launch.status === 'running' || launch.status === 'starting' || launch.status === 'queued',
-      `task launch 应快返为运行态，实际=${launch.status}`,
+      `[${label}] task launch 应快返为运行态，实际=${launch.status}`,
     );
 
     const chunks = [];
     let cursor = Number.isInteger(launch.output_cursor) ? launch.output_cursor : 0;
     let finalStatus = launch.status;
+    let seenRunningRound = false;
 
     for (let round = 0; round < 40; round += 1) {
-      const read = await executor.readProcess(launch.terminal_id, false, 1, cursor);
+      const read = await executor.readProcess(launch.terminal_id, readWait, 2, cursor);
+      assert(
+        read.terminal_id === launch.terminal_id,
+        `[${label}] read-process terminal_id 不匹配，预期=${launch.terminal_id} 实际=${read.terminal_id}`,
+      );
 
       // task 模式不应携带 service 启动握手语义
       assert(
         read.run_mode === 'task',
-        `read-process run_mode 预期 task，实际=${read.run_mode}`,
+        `[${label}] read-process run_mode 预期 task，实际=${read.run_mode}`,
       );
 
       if (typeof read.startup_status !== 'undefined' || typeof read.startup_message !== 'undefined') {
         throw new Error(
-          `task read-process 不应包含 startup 字段, startup_status=${read.startup_status}, startup_message=${read.startup_message}`,
+          `[${label}] task read-process 不应包含 startup 字段, startup_status=${read.startup_status}, startup_message=${read.startup_message}`,
         );
       }
 
@@ -77,6 +82,10 @@ async function main() {
           output: read.output,
           delta: read.delta,
         });
+      }
+
+      if (read.status === 'running' || read.status === 'starting') {
+        seenRunningRound = true;
       }
 
       if (Number.isInteger(read.next_cursor)) {
@@ -90,26 +99,44 @@ async function main() {
         break;
       }
 
-      await sleep(120);
+      if (!readWait) {
+        await sleep(120);
+      }
     }
 
-    assert(finalStatus === 'completed', `task 最终状态应 completed，实际=${finalStatus}`);
+    assert(finalStatus === 'completed', `[${label}] task 最终状态应 completed，实际=${finalStatus}`);
 
     const allOutput = chunks.map((chunk) => chunk.output).join('');
     for (let i = 1; i <= 6; i += 1) {
-      assert(allOutput.includes(`MAGI_STREAM_${i}`), `缺少输出分片 MAGI_STREAM_${i}`);
+      assert(allOutput.includes(`MAGI_STREAM_${i}`), `[${label}] 缺少输出分片 MAGI_STREAM_${i}`);
     }
 
     // 至少两次增量，才算“执行期间有动态流式更新”
-    assert(chunks.length >= 2, `增量轮次不足，预期>=2，实际=${chunks.length}`);
+    assert(chunks.length >= 2, `[${label}] 增量轮次不足，预期>=2，实际=${chunks.length}`);
+    // wait=true 语义必须可在任务结束前返回 running 轮次，避免“结束后一次性渲染”
+    if (readWait) {
+      assert(seenRunningRound, `[${label}] wait=true 未观测到运行中轮次，可能仍存在阻塞到完成的问题`);
+    }
+
+    return {
+      label,
+      readWait,
+      terminalId: launch.terminal_id,
+      chunks: chunks.length,
+      finalStatus,
+      seenRunningRound,
+      sample: chunks.slice(0, 3),
+    };
+  }
+
+  try {
+    const nonBlocking = await runScenario('non-blocking-read', false);
+    const blocking = await runScenario('blocking-read', true);
 
     console.log('\n=== shell task streaming 回归结果 ===');
     console.log(JSON.stringify({
       pass: true,
-      terminal_id: launch.terminal_id,
-      chunks: chunks.length,
-      finalStatus,
-      sample: chunks.slice(0, 3),
+      scenarios: [nonBlocking, blocking],
     }, null, 2));
     process.exit(0);
   } finally {

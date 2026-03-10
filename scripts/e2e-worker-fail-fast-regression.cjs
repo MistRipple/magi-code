@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 /**
- * Worker 快速失败回归脚本
+ * Worker 韧性回归脚本
  *
  * 覆盖目标：
  * 1) 请求级硬超时触发后，超时不重试（快速失败）
  * 2) 网络瞬断仍保留轻量重试能力
- * 3) Worker 遇到模型侧错误时，不走恢复链路，直接结束本轮并回传失败
- * 4) Dispatch 取消信号可触发 in-flight worker 请求中断
+ * 3) 账号类确定性错误按统一策略重试后止损（非无限重试）
+ * 4) 短窗连续失败触发通道熔断，避免持续打满上游
+ * 5) Worker 遇到模型侧错误时，进入恢复/提问链路，不因控制面抖动直接中止
+ * 6) Dispatch 取消信号可触发 in-flight worker 请求中断
  */
 
 const fs = require('fs');
@@ -155,7 +157,138 @@ async function testUniversalClientNetworkRetry() {
   return { attempts, error: String(caught?.message || caught) };
 }
 
-async function testAutonomousWorkerModelFailFast() {
+async function testUniversalClientAuthDeterministicFastStop() {
+  const { UniversalLLMClient } = loadCompiledModule(path.join('llm', 'clients', 'universal-client.js'));
+  const client = new UniversalLLMClient(createOpenAIConfig());
+  let attempts = 0;
+
+  client.protocolAdapter = {
+    provider: 'openai',
+    protocol: 'responses',
+    capabilities: {
+      supportsStreaming: true,
+      supportsSystemPrompt: true,
+      supportsTools: true,
+      supportsThinking: true,
+    },
+    async send() {
+      attempts += 1;
+      const error = new Error('Unauthorized');
+      error.status = 401;
+      throw error;
+    },
+    async stream() {
+      throw new Error('stream not used');
+    },
+  };
+
+  let caught;
+  try {
+    await client.sendMessage({
+      messages: [{ role: 'user', content: 'auth retry regression' }],
+      retryPolicy: {
+        maxRetries: 6,
+        baseDelayMs: 1,
+        retryOnTimeout: true,
+        retryOnAllErrors: true,
+        deterministicErrorStreakLimit: 3,
+      },
+    });
+  } catch (error) {
+    caught = error;
+  }
+
+  assert(caught, '账号错误场景应抛出异常');
+  assert(attempts === 3, `账号类确定性错误应在 3 连击后止损，实际尝试: ${attempts}`);
+
+  return { attempts, error: String(caught?.message || caught) };
+}
+
+async function testUniversalClientCircuitBreakerWindow() {
+  const { UniversalLLMClient } = loadCompiledModule(path.join('llm', 'clients', 'universal-client.js'));
+  const client = new UniversalLLMClient(createOpenAIConfig());
+  let attempts = 0;
+
+  client.protocolAdapter = {
+    provider: 'openai',
+    protocol: 'responses',
+    capabilities: {
+      supportsStreaming: true,
+      supportsSystemPrompt: true,
+      supportsTools: true,
+      supportsThinking: true,
+    },
+    async send() {
+      attempts += 1;
+      const error = new Error('service unavailable');
+      error.status = 503;
+      throw error;
+    },
+    async stream() {
+      throw new Error('stream not used');
+    },
+  };
+
+  const retryPolicy = {
+    maxRetries: 1,
+    baseDelayMs: 0,
+    retryOnTimeout: true,
+    retryOnAllErrors: true,
+    circuitBreaker: {
+      enabled: true,
+      windowMs: 60_000,
+      failureThreshold: 2,
+      cooldownMs: 5_000,
+    },
+  };
+
+  let firstError;
+  let secondError;
+  let thirdError;
+  try {
+    await client.sendMessage({
+      messages: [{ role: 'user', content: 'cb-1' }],
+      retryPolicy,
+    });
+  } catch (error) {
+    firstError = error;
+  }
+  try {
+    await client.sendMessage({
+      messages: [{ role: 'user', content: 'cb-2' }],
+      retryPolicy,
+    });
+  } catch (error) {
+    secondError = error;
+  }
+  try {
+    await client.sendMessage({
+      messages: [{ role: 'user', content: 'cb-3' }],
+      retryPolicy,
+    });
+  } catch (error) {
+    thirdError = error;
+  }
+
+  assert(firstError, '首个失败请求应返回错误');
+  assert(secondError, '第二个失败请求应返回错误');
+  assert(thirdError, '熔断阶段请求应被拒绝');
+  assert(attempts === 2, `熔断打开后不应继续访问上游，实际上游调用次数: ${attempts}`);
+  assert(
+    String(thirdError?.code || '').toUpperCase() === 'EUPSTREAM_CIRCUIT_OPEN'
+      || String(thirdError?.message || '').includes('熔断'),
+    `熔断错误标识异常: ${String(thirdError?.message || thirdError)}`,
+  );
+
+  return {
+    attempts,
+    firstError: String(firstError?.message || firstError),
+    secondError: String(secondError?.message || secondError),
+    thirdError: String(thirdError?.message || thirdError),
+  };
+}
+
+async function testAutonomousWorkerModelResilience() {
   const { AutonomousWorker } = loadCompiledModule(path.join('orchestrator', 'worker', 'autonomous-worker.js'));
 
   const worker = new AutonomousWorker(
@@ -195,15 +328,20 @@ async function testAutonomousWorkerModelFailFast() {
   };
   worker.planRecovery = async () => {
     recoveryTouched = true;
-    throw new Error('planRecovery should not be called');
+    return {
+      strategy: 'retry_same_worker',
+      reason: 'regression-test',
+      confidence: 0.9,
+      maxRetries: 1,
+    };
   };
   worker.executeRecovery = async () => {
     recoveryTouched = true;
-    throw new Error('executeRecovery should not be called');
+    return { success: false };
   };
   worker.reportQuestion = async () => {
     questionTouched = true;
-    throw new Error('reportQuestion should not be called');
+    return { action: 'continue', timestamp: Date.now() };
   };
 
   const assignment = {
@@ -275,9 +413,9 @@ async function testAutonomousWorkerModelFailFast() {
     result.errors.some((item) => String(item).includes('未返回可执行内容')),
     `错误信息应为归一化模型文案: ${JSON.stringify(result.errors)}`,
   );
-  assert(result.errors.length === 1, `模型快速失败不应重复写入 errors: ${JSON.stringify(result.errors)}`);
-  assert(recoveryTouched === false, '模型侧错误不应进入恢复链路');
-  assert(questionTouched === false, '模型侧错误不应进入 question 上报链路');
+  assert(result.errors.length === 1, `模型失败结果不应重复写入 errors: ${JSON.stringify(result.errors)}`);
+  assert(recoveryTouched === true, '模型侧错误应进入恢复链路');
+  assert(questionTouched === true, '模型侧错误恢复失败后应进入 question 上报链路');
   assert(reports.includes('failed'), `最终应回传 failed 报告，实际: ${reports.join(',')}`);
 
   return {
@@ -391,12 +529,20 @@ function testSourceGuardrails() {
     'AdapterFactory 不应保留 10/20/30 秒长重试延迟',
   );
   assert(
-    workerSource.includes('Worker.Todo.模型侧失败.快速终止当前任务'),
-    'Worker 模型侧快速终止守卫缺失',
+    workerSource.includes('Worker.Todo.模型侧失败.进入恢复链路'),
+    'Worker 模型侧恢复链路守卫缺失',
   );
   assert(
-    workerSource.includes("return { action: 'abort', abortReason: reason, timestamp: Date.now() };"),
-    'question 上报失败后 abort 守卫缺失',
+    workerSource.includes('Worker.question上报失败，按降级继续'),
+    'question 上报降级继续守卫缺失',
+  );
+  assert(
+    !workerSource.includes('Worker.Todo.模型侧失败.快速终止当前任务'),
+    'Worker 仍保留模型侧快速终止旧逻辑',
+  );
+  assert(
+    !workerSource.includes("return { action: 'abort', abortReason: reason, timestamp: Date.now() };"),
+    'question 上报失败后仍存在 abort 旧逻辑',
   );
   assert(
     openAiSource.includes('responses.create(requestParams, { signal: request.signal })'),
@@ -413,7 +559,9 @@ async function main() {
 
   const timeoutResult = await testUniversalClientTimeoutFailFast();
   const networkResult = await testUniversalClientNetworkRetry();
-  const workerResult = await testAutonomousWorkerModelFailFast();
+  const authResult = await testUniversalClientAuthDeterministicFastStop();
+  const circuitResult = await testUniversalClientCircuitBreakerWindow();
+  const workerResult = await testAutonomousWorkerModelResilience();
   const pipelineResult = await testWorkerPipelineCancelInterrupt();
 
   console.log('\n=== Worker Fail-Fast 回归结果 ===');
@@ -423,11 +571,15 @@ async function main() {
       'source_guardrails',
       'timeout_fail_fast',
       'network_retry_budget',
-      'worker_model_error_short_circuit',
+      'auth_deterministic_fast_stop',
+      'circuit_breaker_window',
+      'worker_model_error_resilience',
       'pipeline_cancel_interrupt',
     ],
     timeoutResult,
     networkResult,
+    authResult,
+    circuitResult,
     workerResult,
     pipelineResult,
   }, null, 2));

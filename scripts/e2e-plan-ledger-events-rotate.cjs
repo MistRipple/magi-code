@@ -55,6 +55,9 @@ async function main() {
       acceptanceCriteria: ['触发轮转且保留上限有效'],
     });
 
+    assert(draft.runtime.acceptance.criteria[0]?.description === '触发轮转且保留上限有效', '轮转计划验收结构化失败');
+    assert(draft.revision === 1, `轮转计划初始 revision 异常: ${draft.revision}`);
+
     for (let i = 0; i < 80; i++) {
       await ledger.upsertDispatchItem(sessionId, draft.planId, {
         itemId: `task-${i % 3}`,

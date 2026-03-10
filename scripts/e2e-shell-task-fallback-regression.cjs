@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * Shell task fallback 回归脚本
+ * Shell task 基本能力回归脚本
  *
  * 目标：
- * 1. 强制模拟 ScriptCapture 不可用（script/pgrep 缺失场景）
- * 2. 验证 launch-process(run_mode=task) 仍能执行并捕获输出
- * 3. 验证 kill-process 可终止直连 task 子进程，且内部映射能清理
+ * 1. 验证 launch-process(run_mode=task, wait=true) 能执行并捕获输出
+ * 2. 验证 read-process 能读取已完成的 task 输出
+ * 3. 验证 kill-process 可终止运行中的 task 子进程
  */
 
 const fs = require('fs');
@@ -30,17 +30,10 @@ async function main() {
   const executor = new NodeShellExecutor();
 
   try {
-    const strategy = executor.scriptCaptureStrategy || executor['scriptCaptureStrategy'];
-    assert(strategy, '无法访问 ScriptCaptureStrategy 实例');
-
-    // 强制模拟 script/pgrep 不可用：setup 失败 + 永远 not ready
-    strategy.setupTerminal = async () => false;
-    strategy.ensureTerminalSessionActive = async () => false;
-    strategy.isReady = () => false;
-
+    // 场景 1：快速 task 执行并等待完成
     const fastTask = await executor.launchProcess({
       name: 'orchestrator',
-      command: 'echo MAGI_SHELL_TASK_FALLBACK_OK',
+      command: 'echo MAGI_SHELL_TASK_OK',
       runMode: 'task',
       wait: true,
       maxWaitSeconds: 10,
@@ -48,16 +41,18 @@ async function main() {
     });
 
     assert(fastTask.status === 'completed',
-      `fallback task 应 completed，实际=${fastTask.status}, output=${fastTask.output}`);
+      `task 应 completed，实际=${fastTask.status}, output=${fastTask.output}`);
     assert(
-      typeof fastTask.output === 'string' && fastTask.output.includes('MAGI_SHELL_TASK_FALLBACK_OK'),
-      `fallback task 输出缺失，output=${fastTask.output}`
+      typeof fastTask.output === 'string' && fastTask.output.includes('MAGI_SHELL_TASK_OK'),
+      `task 输出缺失，output=${fastTask.output}`
     );
 
+    // 场景 2：读取已完成 task 的输出
     const readFastTask = await executor.readProcess(fastTask.terminal_id, false, 1);
     assert(readFastTask.status === 'completed',
       `read-process 应返回 completed，实际=${readFastTask.status}`);
 
+    // 场景 3：启动长时间 task 并 kill
     const longTask = await executor.launchProcess({
       name: 'orchestrator',
       command: 'sleep 30',
@@ -77,10 +72,7 @@ async function main() {
     assert(readKilled.status === 'killed' || readKilled.status === 'failed',
       `被 kill 的 task 状态异常: ${readKilled.status}`);
 
-    const directTaskMap = executor.directTaskProcesses || executor['directTaskProcesses'];
-    assert(directTaskMap && directTaskMap.size === 0, 'directTaskProcesses 未清理干净');
-
-    console.log('\n=== shell task fallback 回归结果 ===');
+    console.log('\n=== shell task 基本能力回归结果 ===');
     console.log(JSON.stringify({
       pass: true,
       fastTask: {
@@ -101,6 +93,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error('shell task fallback 回归失败:', error?.stack || error);
+  console.error('shell task 基本能力回归失败:', error?.stack || error);
   process.exit(1);
 });

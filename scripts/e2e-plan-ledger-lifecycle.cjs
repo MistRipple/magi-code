@@ -49,6 +49,11 @@ async function main() {
     });
 
     assert(draft.status === 'draft', 'draft 状态异常');
+    assert(draft.schemaVersion === 2, `schemaVersion 异常: ${draft.schemaVersion}`);
+    assert(draft.runtimeVersion === 'classic', `runtimeVersion 异常: ${draft.runtimeVersion}`);
+    assert(draft.revision === 1, `初始 revision 异常: ${draft.revision}`);
+    assert(Array.isArray(draft.runtime.acceptance.criteria), '验收合同未结构化落盘');
+    assert(draft.runtime.acceptance.criteria[0]?.description === '状态可闭环', '结构化验收描述异常');
 
     await ledger.markAwaitingConfirmation(sessionId, draft.planId, '## 回归计划');
     await ledger.approve(sessionId, draft.planId, 'tester');
@@ -75,6 +80,7 @@ async function main() {
     const latest = ledger.getLatestPlan(sessionId);
     assert(latest, '未找到最新计划');
     assert(latest.status === 'completed', `计划终态异常: ${latest.status}`);
+    assert(latest.revision > 1, `revision 未随写回递增: ${latest.revision}`);
 
     const eventsFile = path.join(sessionManager.getPlansDir(sessionId), `${draft.planId}.events.jsonl`);
     assert(fs.existsSync(eventsFile), '缺少计划事件日志文件');
