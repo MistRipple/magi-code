@@ -19,6 +19,7 @@ import type {
   WaveState,
   WorkerSessionState,
   RequestResponseBinding,
+  RetryRuntimeState,
   ModelStatusMap,
   Task,
   QueuedMessage,
@@ -149,8 +150,13 @@ export interface Notification {
   timestamp: number;
   read: boolean;
 }
+const GLOBAL_NOTIFICATION_BUCKET = '__global__';
+const MAX_NOTIFICATIONS_PER_SESSION = 200;
+const NOTIFICATION_ARCHIVE_RUNTIME_SOURCES = new Set(['model-runtime', 'task-runtime', 'tool-runtime']);
+
 let notifications = $state<Notification[]>([]);
 let unreadNotificationCount = $state(0);
+let notificationBuckets = $state<Record<string, Notification[]>>({});
 
 let modelStatus = $state<ModelStatusMap>({
   claude: { status: 'checking' },
@@ -219,6 +225,68 @@ function normalizePersistedMessages(messages: Message[] | undefined): Message[] 
   return normalized;
 }
 
+function normalizePersistedNotification(raw: unknown): Notification | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const item = raw as Record<string, unknown>;
+  const id = typeof item.id === 'string' ? item.id.trim() : '';
+  if (!id) return null;
+  const type = typeof item.type === 'string' ? item.type : 'info';
+  const message = typeof item.message === 'string' ? item.message : '';
+  if (!message) return null;
+  const category = item.category === 'incident' ? 'incident' : item.category === 'audit' ? 'audit' : null;
+  if (!category) return null;
+  const timestamp = typeof item.timestamp === 'number' && Number.isFinite(item.timestamp)
+    ? item.timestamp
+    : Date.now();
+  const read = Boolean(item.read);
+  const title = typeof item.title === 'string' ? item.title : undefined;
+  const source = typeof item.source === 'string' ? item.source : undefined;
+  const actionRequired = typeof item.actionRequired === 'boolean' ? item.actionRequired : undefined;
+  return {
+    id,
+    type,
+    title,
+    message,
+    category,
+    source,
+    actionRequired,
+    timestamp,
+    read,
+  };
+}
+
+function normalizeNotificationBuckets(raw: unknown): Record<string, Notification[]> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {};
+  }
+  const result: Record<string, Notification[]> = {};
+  for (const [bucketId, list] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof bucketId !== 'string' || bucketId.length === 0) {
+      continue;
+    }
+    if (!isValidPersistedArray(list, MAX_PERSISTED_ARRAY_LENGTH)) {
+      continue;
+    }
+    const seen = new Set<string>();
+    const normalized: Notification[] = [];
+    for (const item of list) {
+      const next = normalizePersistedNotification(item);
+      if (!next || seen.has(next.id)) {
+        continue;
+      }
+      seen.add(next.id);
+      normalized.push(next);
+      if (normalized.length >= MAX_NOTIFICATIONS_PER_SESSION) {
+        break;
+      }
+    }
+    if (normalized.length > 0) {
+      result[bucketId] = normalized;
+    }
+  }
+  return result;
+}
+
 function normalizeIncomingMessage(message: Message): Message {
   if (!message || typeof message !== 'object') {
     throw new Error('[MessagesStore] 输入消息无效');
@@ -280,6 +348,11 @@ let workerSessions = $state<Map<string, WorkerSessionState>>(new Map());
 
 // 请求-响应绑定状态（消息响应流设计）
 let requestBindings = $state<Map<string, RequestResponseBinding>>(new Map());
+
+// LLM 重试运行态（非持久化，仅用于当前活跃消息展示）
+export const retryRuntimeState = $state({
+  byMessageId: new Map<string, RetryRuntimeState>(),
+});
 
 // 请求超时时间（30秒）
 
@@ -546,6 +619,7 @@ function saveWebviewState() {
     currentSessionId: messagesState.currentSessionId,
     scrollPositions: messagesState.scrollPositions,
     autoScrollEnabled: messagesState.autoScrollEnabled,
+    notificationBuckets,
   };
   vscode.setState(state);
 }
@@ -581,6 +655,7 @@ export function clearMessageJump(): void {
 // 会话操作
 export function setCurrentSessionId(id: string | null) {
   messagesState.currentSessionId = id;
+  syncNotificationsFromBucket(id);
   saveWebviewState();
 }
 
@@ -696,6 +771,7 @@ export function markMessageComplete(id: string) {
     messagesState.activeMessageIds = next;
     updateProcessingState();
   }
+  clearRetryRuntime(id);
 }
 
 export function addPendingRequest(id: string) {
@@ -722,6 +798,7 @@ export function clearProcessingState() {
   messagesState.backendProcessing = false;
   messagesState.activeMessageIds = new Set();
   messagesState.pendingRequests = new Set();
+  clearAllRetryRuntime();
   updateProcessingState();
 }
 
@@ -837,6 +914,53 @@ function recomputeUnreadNotificationCount() {
   unreadNotificationCount = notifications.filter((n) => !n.read).length;
 }
 
+function resolveNotificationBucketId(sessionId: string | null | undefined): string {
+  const normalized = typeof sessionId === 'string' ? sessionId.trim() : '';
+  return normalized || GLOBAL_NOTIFICATION_BUCKET;
+}
+
+function getCurrentNotificationBucketId(): string {
+  return resolveNotificationBucketId(messagesState.currentSessionId);
+}
+
+function applyNotificationList(nextList: Notification[]): Notification[] {
+  const trimmed = nextList.slice(0, MAX_NOTIFICATIONS_PER_SESSION);
+  notifications = trimmed;
+  recomputeUnreadNotificationCount();
+  return trimmed;
+}
+
+function syncNotificationsFromBucket(sessionId: string | null | undefined): void {
+  const bucketId = resolveNotificationBucketId(sessionId);
+  const list = ensureArray<Notification>(notificationBuckets[bucketId]);
+  applyNotificationList(list);
+}
+
+function updateCurrentBucketNotifications(updater: (current: Notification[]) => Notification[]): void {
+  const bucketId = getCurrentNotificationBucketId();
+  const current = ensureArray<Notification>(notificationBuckets[bucketId]);
+  const next = applyNotificationList(updater(current));
+  notificationBuckets = {
+    ...notificationBuckets,
+    [bucketId]: next,
+  };
+  saveWebviewState();
+}
+
+function shouldArchiveToastToNotificationCenter(policy: {
+  category: ToastCategory;
+  persistToCenter: boolean;
+  source?: string;
+}): boolean {
+  if (!policy.persistToCenter || policy.category === 'feedback') {
+    return false;
+  }
+  if (!policy.source || !NOTIFICATION_ARCHIVE_RUNTIME_SOURCES.has(policy.source)) {
+    return false;
+  }
+  return true;
+}
+
 function resolveToastPolicy(options?: ToastOptions): {
   category: ToastCategory;
   persistToCenter: boolean;
@@ -873,24 +997,24 @@ export function addToast(type: string, message: string, title?: string, options?
   };
   toasts = [...toasts, toast];
 
-  if (!policy.persistToCenter || policy.category === 'feedback') {
+  if (!shouldArchiveToastToNotificationCenter(policy)) {
     return;
   }
 
   // 仅归档高价值通知到通知历史
+  const notificationCategory: NotificationCategory = policy.category === 'incident' ? 'incident' : 'audit';
   const notification: Notification = {
     id,
     type,
     title,
     message,
-    category: policy.category,
+    category: notificationCategory,
     source: policy.source,
     actionRequired: policy.actionRequired,
     timestamp: Date.now(),
     read: !policy.countUnread,
   };
-  notifications = [notification, ...notifications];
-  recomputeUnreadNotificationCount();
+  updateCurrentBucketNotifications((current) => [notification, ...current]);
 }
 
 export function getNotifications() {
@@ -902,18 +1026,15 @@ export function getUnreadNotificationCount() {
 }
 
 export function markAllNotificationsRead() {
-  notifications = notifications.map(n => ({ ...n, read: true }));
-  unreadNotificationCount = 0;
+  updateCurrentBucketNotifications((current) => current.map((n) => ({ ...n, read: true })));
 }
 
 export function clearAllNotifications() {
-  notifications = [];
-  unreadNotificationCount = 0;
+  updateCurrentBucketNotifications(() => []);
 }
 
 export function removeNotification(id: string) {
-  notifications = notifications.filter(n => n.id !== id);
-  recomputeUnreadNotificationCount();
+  updateCurrentBucketNotifications((current) => current.filter((n) => n.id !== id));
 }
 
 export function getActiveInteractionType(): string | null {
@@ -1109,6 +1230,7 @@ export function setAgentOutputs(outputs: AgentOutputs) {
 
 // 导出状态初始化
 export function initializeState() {
+  clearAllRetryRuntime();
   const persisted = vscode.getState<WebviewPersistedState>();
   if (persisted) {
     const validThread = isValidPersistedArray(persisted.threadMessages, MAX_PERSISTED_ARRAY_LENGTH);
@@ -1147,6 +1269,8 @@ export function initializeState() {
     messagesState.currentSessionId = persisted.currentSessionId || null;
     messagesState.scrollPositions = persisted.scrollPositions || { thread: 0, claude: 0, codex: 0, gemini: 0 };
     messagesState.autoScrollEnabled = persisted.autoScrollEnabled || { thread: true, claude: true, codex: true, gemini: true };
+    notificationBuckets = normalizeNotificationBuckets(persisted.notificationBuckets);
+    syncNotificationsFromBucket(messagesState.currentSessionId);
 
     // 启动恢复：持久化状态只保留历史展示，不继承运行态。
     clearPendingInteractions();
@@ -1216,6 +1340,26 @@ export function createRequestBinding(binding: RequestResponseBinding): void {
   const next = new Map(requestBindings);
   next.set(binding.requestId, binding);
   requestBindings = next;
+}
+
+export function setRetryRuntime(messageId: string, runtime: RetryRuntimeState): void {
+  if (!messageId) return;
+  const next = new Map(retryRuntimeState.byMessageId);
+  next.set(messageId, runtime);
+  retryRuntimeState.byMessageId = next;
+}
+
+export function clearRetryRuntime(messageId: string): void {
+  if (!messageId || !retryRuntimeState.byMessageId.has(messageId)) {
+    return;
+  }
+  const next = new Map(retryRuntimeState.byMessageId);
+  next.delete(messageId);
+  retryRuntimeState.byMessageId = next;
+}
+
+export function clearAllRetryRuntime(): void {
+  retryRuntimeState.byMessageId = new Map();
 }
 
 /**

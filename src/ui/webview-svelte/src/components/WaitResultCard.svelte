@@ -178,7 +178,7 @@
   .wait-result-card {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
+    gap: var(--space-3);
   }
 
   /* 顶部状态横幅 */
@@ -186,7 +186,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: var(--space-2) var(--space-3);
+    padding: var(--space-2) var(--space-4);
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--success) 10%, var(--surface-2));
     font-size: var(--text-sm);
@@ -231,14 +231,14 @@
   .result-list {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--space-2);
   }
 
   .worker-result-item {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
-    padding: var(--space-2) var(--space-3);
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-4);
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--worker-color) 6%, var(--surface-2));
     border: 1px solid color-mix(in srgb, var(--worker-color) 20%, var(--border));
@@ -329,8 +329,8 @@
   .pending-section {
     display: flex;
     align-items: center;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
+    gap: var(--space-3);
+    padding: var(--space-2) var(--space-4);
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--warning) 10%, var(--surface-2));
     color: var(--warning);
@@ -340,7 +340,7 @@
 
   /* 审计结论 */
   .audit-section {
-    padding: var(--space-2) var(--space-3);
+    padding: var(--space-2) var(--space-4);
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--audit-color) 8%, var(--surface-2));
     border: 1px solid color-mix(in srgb, var(--audit-color) 25%, var(--border));

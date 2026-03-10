@@ -302,7 +302,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
-    padding: var(--space-3) var(--space-4);
+    padding: var(--space-2) var(--space-4);
     border-radius: var(--radius-md);
     /* 使用 worker 颜色 */
     background: color-mix(in srgb, var(--worker-color) 8%, var(--surface-1));
@@ -600,7 +600,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
+    padding: var(--space-2) var(--space-4);
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--error) 10%, transparent);
     color: var(--error);

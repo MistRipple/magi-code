@@ -30,6 +30,16 @@ export interface RequestResponseBinding {
   timeoutId?: ReturnType<typeof setTimeout>;
 }
 
+export type RetryRuntimePhase = 'attempt_started' | 'scheduled';
+
+export interface RetryRuntimeState {
+  phase: RetryRuntimePhase;
+  attempt: number;
+  maxAttempts: number;
+  delayMs?: number;
+  nextRetryAt?: number;
+}
+
 // 消息来源
 export type MessageSource = 'orchestrator' | 'claude' | 'codex' | 'gemini' | 'system';
 
@@ -463,6 +473,18 @@ export interface Toast {
   message: string;
 }
 
+export interface PersistedNotification {
+  id: string;
+  type: string;
+  title?: string;
+  message: string;
+  category: 'incident' | 'audit';
+  source?: string;
+  actionRequired?: boolean;
+  timestamp: number;
+  read: boolean;
+}
+
 // 应用状态（后端下发的完整状态）
 export interface AppState {
   sessions?: Session[];
@@ -490,4 +512,5 @@ export interface WebviewPersistedState {
   currentSessionId: string | null;
   scrollPositions: ScrollPositions;
   autoScrollEnabled: AutoScrollConfig;
+  notificationBuckets?: Record<string, PersistedNotification[]>;
 }

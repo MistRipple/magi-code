@@ -565,9 +565,9 @@
   .tool-call {
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    margin: var(--space-2, 8px) 0;
+    margin-top: var(--space-2);
     overflow: hidden;
-    background: var(--surface-1, rgba(255,255,255,0.02));
+    background: var(--surface-1);
   }
 
   .tool-call.has-error {
@@ -578,17 +578,17 @@
   .tool-call.file-mutation {
     border: none;
     background: transparent;
-    margin: var(--space-1, 4px) 0;
+    margin-top: var(--space-2);
   }
 
   /* 只读查看工具（file_view / list_files）：紧凑但有卡片背景 */
   .tool-call.compact-readonly {
-    margin: var(--space-1, 4px) 0;
+    margin-top: var(--space-2);
   }
 
   .file-mutation-header {
     cursor: default;
-    padding: var(--space-1, 4px) 0;
+    padding: var(--space-2) 0;
     opacity: 0.85;
   }
 
@@ -604,9 +604,9 @@
   .tool-header {
     display: flex;
     align-items: center;
-    gap: var(--space-2, 8px);
+    gap: var(--space-3);
     width: 100%;
-    padding: var(--space-2, 8px) var(--space-3, 12px);
+    padding: var(--space-2) var(--space-4);
     background: transparent;
     border: none;
     text-align: left;
@@ -615,7 +615,7 @@
   }
 
   .tool-header:hover {
-    background: var(--surface-hover, rgba(255,255,255,0.05));
+    background: var(--surface-hover);
   }
 
   .chevron {
@@ -636,20 +636,20 @@
     flex: 1;
     display: flex;
     align-items: center;
-    gap: var(--space-2, 8px);
+    gap: var(--space-3);
     min-width: 0;
     overflow: hidden;
   }
 
   .tool-name {
     font-weight: 500;
-    font-size: var(--text-sm, 13px);
+    font-size: var(--text-sm);
     white-space: nowrap;
     flex-shrink: 0;
   }
 
   .tool-summary {
-    font-size: var(--text-xs, 11px);
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
     opacity: 0.8;
     white-space: nowrap;
@@ -730,9 +730,9 @@
   }
 
   .tool-content {
-    padding: var(--space-3, 12px);
+    padding: var(--space-3);
     border-top: 1px solid var(--border);
-    background: var(--surface-2, rgba(0,0,0,0.1));
+    background: var(--surface-2);
     animation: slideDown 0.2s ease-out;
     transform-origin: top;
   }
@@ -742,18 +742,18 @@
     to { opacity: 1; max-height: 500px; transform: translateY(0); }
   }
 
-  .tool-section { margin-bottom: var(--space-3, 12px); }
-  .tool-section:last-child { margin-bottom: 0; }
+  .tool-section { margin-top: var(--space-3); }
+  .tool-section:first-child { margin-top: 0; }
 
   .section-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: var(--space-1, 4px);
+    margin-bottom: var(--space-2);
   }
 
   .section-label {
-    font-size: var(--text-xs, 11px);
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -778,9 +778,9 @@
 
   .section-content {
     font-family: var(--font-mono);
-    font-size: var(--text-xs, 11px);
-    background: var(--code-bg, rgba(0,0,0,0.2));
-    padding: var(--space-2, 8px);
+    font-size: var(--text-xs);
+    background: var(--code-bg);
+    padding: var(--space-3);
     border-radius: var(--radius-sm);
     overflow-x: auto;
     margin: 0;
@@ -796,25 +796,25 @@
   }
 
   .diagnosis-owner {
-    font-size: var(--text-xs, 11px);
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
   }
 
   .error-hint {
-    margin-top: var(--space-2, 8px);
-    padding: var(--space-2, 8px);
+    margin-top: var(--space-3);
+    padding: var(--space-3);
     border-radius: var(--radius-sm);
     border: 1px dashed var(--border);
     color: var(--foreground-muted);
-    font-size: var(--text-xs, 11px);
+    font-size: var(--text-xs);
     line-height: 1.5;
-    background: var(--surface-1, rgba(255,255,255,0.02));
+    background: var(--surface-1);
   }
 
   .markdown-output {
-    font-size: var(--text-sm, 13px);
-    background: var(--code-bg, rgba(0,0,0,0.2));
-    padding: var(--space-2, 8px) var(--space-3, 12px);
+    font-size: var(--text-sm);
+    background: var(--code-bg);
+    padding: var(--space-3) var(--space-4);
     border-radius: var(--radius-sm);
     max-height: 400px;
     overflow-y: auto;
@@ -823,11 +823,11 @@
   .tool-meta {
     display: flex;
     align-items: center;
-    gap: 4px;
-    font-size: var(--text-xs, 11px);
+    gap: var(--space-2);
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
-    margin-top: var(--space-2, 8px);
-    padding-top: var(--space-2, 8px);
+    margin-top: var(--space-3);
+    padding-top: var(--space-3);
     border-top: 1px dashed var(--border);
   }
 </style>

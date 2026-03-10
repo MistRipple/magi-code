@@ -40,16 +40,18 @@ import {
   clearRequestBinding,
   clearAllRequestBindings,
   clearProcessingState,
+  setRetryRuntime,
+  clearRetryRuntime,
   sealAllStreamingMessages,
 } from '../stores/messages.svelte';
-import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, SubTaskItem, Edit, ModelStatusMap, ActivePlanState, PlanLedgerRecord, PlanLedgerAttempt, QueuedMessage } from '../types/message';
+import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, SubTaskItem, Edit, ModelStatusMap, ActivePlanState, PlanLedgerRecord, PlanLedgerAttempt, QueuedMessage, RetryRuntimeState } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
 import { MessageType, MessageCategory } from '../../../../protocol/message-protocol';
 import { routeStandardMessage, getMessageTarget, clearMessageTargets, clearMessageTarget, setMessageTarget } from './message-router';
 import { normalizeWorkerSlot } from './message-classifier';
 import { ensureArray } from './utils';
 import { i18n } from '../stores/i18n.svelte';
-import { terminalSessions } from '../stores/terminal-sessions.svelte';
+import { terminalSessions, type TerminalStreamEventPayload } from '../stores/terminal-sessions.svelte';
 
 function normalizeRestoredMessages(messages: Message[]): Message[] {
   const seen = new Set<string>();
@@ -85,6 +87,58 @@ function extractTextFromStandardBlocks(blocks?: StandardContentBlock[]): string 
     .map((block) => (block as any).content || '')
     .filter(Boolean)
     .join('\n');
+}
+
+function handleRetryRuntimePayload(payload: Record<string, unknown>): void {
+  const messageId = typeof payload.messageId === 'string' ? payload.messageId.trim() : '';
+  if (!messageId) {
+    return;
+  }
+
+  const phase = payload.phase;
+  if (phase === 'settled') {
+    clearRetryRuntime(messageId);
+    return;
+  }
+
+  const attempt = typeof payload.attempt === 'number' && Number.isFinite(payload.attempt)
+    ? payload.attempt
+    : 0;
+  const maxAttempts = typeof payload.maxAttempts === 'number' && Number.isFinite(payload.maxAttempts)
+    ? payload.maxAttempts
+    : 0;
+  if (attempt <= 0 || maxAttempts <= 0) {
+    return;
+  }
+
+  if (phase === 'attempt_started') {
+    const runtime: RetryRuntimeState = {
+      phase,
+      attempt,
+      maxAttempts,
+    };
+    setRetryRuntime(messageId, runtime);
+    return;
+  }
+
+  if (phase !== 'scheduled') {
+    return;
+  }
+
+  const delayMs = typeof payload.delayMs === 'number' && Number.isFinite(payload.delayMs)
+    ? Math.max(0, payload.delayMs)
+    : 0;
+  const nextRetryAt = typeof payload.nextRetryAt === 'number' && Number.isFinite(payload.nextRetryAt)
+    ? payload.nextRetryAt
+    : Date.now() + delayMs;
+
+  setRetryRuntime(messageId, {
+    phase,
+    attempt,
+    maxAttempts,
+    delayMs,
+    nextRetryAt,
+  });
 }
 
 /**
@@ -1682,6 +1736,21 @@ function handleUnifiedData(standard: StandardMessage) {
   const asMessage = (extra: Record<string, unknown>) => ({ ...extra } as WebviewMessage);
 
   switch (dataType) {
+    case 'llmRetryRuntime':
+      if (payload && typeof payload === 'object') {
+        handleRetryRuntimePayload(payload as Record<string, unknown>);
+      }
+      break;
+
+    case 'terminalStreamStarted':
+    case 'terminalStreamFrame':
+    case 'terminalStreamCompleted':
+      terminalSessions.ingestStreamEvent({
+        ...(payload as TerminalStreamEventPayload),
+        eventType: dataType,
+      });
+      break;
+
     case 'stateUpdate':
       handleStateUpdate(asMessage({ state: payload.state }));
       break;

@@ -87,7 +87,7 @@
   .thinking-block {
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    margin: var(--space-2, 8px) 0;
+    margin-top: var(--space-2);
     background: rgba(139, 92, 246, 0.05);
     overflow: hidden;
   }
@@ -100,9 +100,9 @@
   .thinking-header {
     display: flex;
     align-items: center;
-    gap: var(--space-2, 8px);
+    gap: var(--space-3);
     width: 100%;
-    padding: var(--space-2, 8px) var(--space-3, 12px);
+    padding: var(--space-2) var(--space-4);
     background: transparent;
     border: none;
     text-align: left;
@@ -117,7 +117,7 @@
   .chevron {
     display: flex;
     transition: transform var(--transition-fast);
-    color: var(--foreground-muted, #888);
+    color: var(--foreground-muted);
   }
 
   .collapsed .chevron { transform: rotate(0deg); }
@@ -139,20 +139,20 @@
 
   .title-text {
     font-weight: 500;
-    font-size: var(--text-sm, 13px);
+    font-size: var(--text-sm);
     color: var(--foreground);
   }
 
   .thinking-summary {
-    font-size: var(--text-xs, 11px);
-    color: var(--foreground-muted, #888);
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
 
   .thinking-badge {
-    font-size: var(--text-xs, 11px);
+    font-size: var(--text-xs);
     padding: 2px 8px;
     background: rgba(139, 92, 246, 0.2);
     color: #a78bfa;
@@ -162,7 +162,7 @@
   }
 
   .thinking-content {
-    padding: var(--space-3, 12px);
+    padding: var(--space-3);
     border-top: 1px solid var(--border);
     background: rgba(139, 92, 246, 0.02);
     /* 🔧 移除固定高度限制，让内容自然撑开 */
@@ -177,9 +177,9 @@
   }
 
   .thinking-body {
-    font-size: var(--text-sm, 13px);
+    font-size: var(--text-sm);
     line-height: 1.6;
-    color: var(--foreground-muted, #aaa);
+    color: var(--foreground-muted);
   }
 
   /* 流式动画 */

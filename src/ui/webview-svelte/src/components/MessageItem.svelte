@@ -7,7 +7,9 @@
   import InstructionCard from './InstructionCard.svelte';
   import BlockRenderer from './BlockRenderer.svelte';
   import Icon from './Icon.svelte';
+  import RetryRuntimeIndicator from './RetryRuntimeIndicator.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { retryRuntimeState } from '../stores/messages.svelte';
 
   // Props
   interface Props {
@@ -34,6 +36,7 @@
   const interactionMeta = $derived(message.metadata?.interaction as { prompt?: string; type?: string } | undefined);
   const isInteraction = $derived(Boolean(interactionMeta));
   const isStreaming = $derived(message.isStreaming);
+  const retryRuntime = $derived(retryRuntimeState.byMessageId.get(message.id));
 
   // 主角色判断：主对话区的主角色是 orchestrator，Worker 面板的主角色是具体 Worker（claude/codex/gemini）
   // 主角色消息使用 inline 模式（无卡片包裹），客角色消息使用 card 模式
@@ -248,6 +251,10 @@
             </div>
           {/if}
 
+          {#if retryRuntime}
+            <RetryRuntimeIndicator runtime={retryRuntime} />
+          {/if}
+
       {/if}
     </div>
   </div>
@@ -330,6 +337,10 @@
               <span class="streaming-dot"></span>
               <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
             </div>
+          {/if}
+
+          {#if retryRuntime}
+            <RetryRuntimeIndicator runtime={retryRuntime} />
           {/if}
       {/if}
     </div>

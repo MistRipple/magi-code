@@ -89,10 +89,6 @@
 
   const normalizedStatus = $derived(String(displayStatus || '').toLowerCase());
 
-  const isStreaming = $derived(
-    normalizedStatus === 'running' || normalizedStatus === 'starting' || normalizedStatus === 'pending'
-  );
-
   const statusClass = $derived.by(() => {
     if (normalizedStatus === 'failed' || normalizedStatus === 'error' || normalizedStatus === 'timeout' || normalizedStatus === 'killed') return 'error';
     if (normalizedStatus === 'completed' || normalizedStatus === 'success' || normalizedStatus === 'ready') return 'success';
@@ -131,7 +127,7 @@
 
   $effect(() => {
     if (!outputElement || !showOutput || !isExpanded) return;
-    if (followTail || isStreaming) {
+    if (followTail || showStatusPulse) {
       queueMicrotask(() => {
         if (!outputElement) return;
         outputElement.scrollTop = outputElement.scrollHeight;
@@ -157,9 +153,6 @@
         {:else}
           <span class="status-dot"></span>
         {/if}
-      </span>
-      <span class="terminal-stream-indicator" data-active={isStreaming}>
-        {isStreaming ? 'LIVE' : 'DONE'}
       </span>
     </button>
 
@@ -238,9 +231,6 @@
           <span class="status-dot"></span>
         {/if}
       </span>
-      <span class="terminal-stream-indicator" data-active={isStreaming}>
-        {isStreaming ? 'LIVE' : 'DONE'}
-      </span>
     </div>
   </div>
 {/if}
@@ -249,17 +239,17 @@
   .tool-call {
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    margin: var(--space-2, 8px) 0;
+    margin-top: var(--space-2);
     overflow: hidden;
-    background: var(--surface-1, rgba(255, 255, 255, 0.02));
+    background: var(--surface-1);
   }
 
   .tool-header {
     display: flex;
     align-items: center;
-    gap: var(--space-2, 8px);
+    gap: var(--space-3);
     width: 100%;
-    padding: var(--space-2, 8px) var(--space-3, 12px);
+    padding: var(--space-2) var(--space-4);
     background: transparent;
     border: none;
     text-align: left;
@@ -268,7 +258,7 @@
   }
 
   .tool-header:hover {
-    background: var(--surface-hover, rgba(255, 255, 255, 0.05));
+    background: var(--surface-hover);
   }
 
   .terminal-header-flat {
@@ -302,20 +292,20 @@
     flex: 1;
     display: flex;
     align-items: center;
-    gap: var(--space-2, 8px);
+    gap: var(--space-3);
     min-width: 0;
     overflow: hidden;
   }
 
   .tool-name {
     font-weight: 500;
-    font-size: var(--text-sm, 13px);
+    font-size: var(--text-sm);
     white-space: nowrap;
     flex-shrink: 0;
   }
 
   .tool-summary {
-    font-size: var(--text-xs, 11px);
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
     opacity: 0.8;
     white-space: nowrap;
@@ -369,9 +359,9 @@
   }
 
   .tool-content {
-    padding: var(--space-3, 12px);
+    padding: var(--space-3);
     border-top: 1px solid var(--border);
-    background: var(--surface-2, rgba(0, 0, 0, 0.1));
+    background: var(--surface-2);
     animation: slideDown 0.2s ease-out;
     transform-origin: top;
   }
@@ -389,59 +379,38 @@
     }
   }
 
-  .terminal-stream-indicator {
-    font-size: 10px;
-    line-height: 1;
-    font-weight: 700;
-    letter-spacing: 0.4px;
-    border-radius: 999px;
-    padding: 2px 7px;
-    border: 1px solid rgba(16, 185, 129, 0.45);
-    color: #34d399;
-    background: rgba(16, 185, 129, 0.12);
-    flex-shrink: 0;
-  }
-
-  .terminal-stream-indicator[data-active='true'] {
-    color: #60a5fa;
-    border-color: rgba(96, 165, 250, 0.55);
-    background: rgba(59, 130, 246, 0.16);
-    box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.2) inset;
-  }
-
   .terminal-meta-grid {
     display: flex;
     flex-wrap: wrap;
-    gap: 12px;
-    margin-bottom: 6px;
+    gap: var(--space-4);
   }
 
   .terminal-meta-item {
-    font-size: var(--text-xs, 11px);
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
   }
 
   .terminal-meta {
-    padding: 6px 0 0 0;
-    font-size: var(--text-xs, 11px);
+    padding: var(--space-2) 0 0 0;
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
   }
 
   .terminal-section-label {
-    padding: 8px 0 4px 0;
-    font-size: var(--text-xs, 11px);
+    padding-top: var(--space-3);
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
     text-transform: uppercase;
     letter-spacing: 0.4px;
   }
 
   .terminal-output {
-    margin: 0 0 8px 0;
+    margin-top: var(--space-2);
     background: #0b0f14;
     color: #d7e3f4;
     border-radius: var(--radius-sm);
     border: 1px solid rgba(132, 156, 182, 0.2);
-    padding: 10px;
+    padding: var(--space-4);
     max-height: 320px;
     overflow: auto;
     white-space: pre-wrap;
@@ -456,14 +425,14 @@
   }
 
   .terminal-hint {
-    margin: 0 0 8px 0;
-    font-size: 11px;
+    margin-top: var(--space-3);
+    font-size: var(--text-xs);
     color: var(--warning);
   }
 
   .terminal-error {
-    margin: 0 0 8px 0;
-    font-size: 11px;
+    margin-top: var(--space-3);
+    font-size: var(--text-xs);
     color: var(--error);
     white-space: pre-wrap;
     word-break: break-word;
@@ -472,21 +441,13 @@
   .terminal-footer {
     display: flex;
     flex-wrap: wrap;
-    gap: 12px;
-    padding: 0 0 2px 0;
-    font-size: 11px;
+    gap: var(--space-4);
+    padding-top: var(--space-3);
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
   }
 
   .terminal-call[data-status='error'] {
     border-color: var(--error);
-  }
-
-  .terminal-call[data-status='success'] {
-    border-color: rgba(16, 185, 129, 0.45);
-  }
-
-  .terminal-call[data-status='running'] {
-    border-color: rgba(59, 130, 246, 0.45);
   }
 </style>

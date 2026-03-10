@@ -5,6 +5,7 @@
     addToast,
     getActiveInteractionType,
     getInteractionMode,
+    getRequestedInteractionMode,
     getQueuedMessages,
     isInteractionModeSyncing,
     requestInteractionMode,
@@ -35,46 +36,8 @@
 
   // 模式选择
   const interactionMode = $derived.by(() => getInteractionMode());
+  const requestedInteractionMode = $derived.by(() => getRequestedInteractionMode());
   const isModeSyncing = $derived.by(() => isInteractionModeSyncing());
-
-  type InteractionPreset = 'fast' | 'stable' | 'review' | 'custom';
-  type BuiltinPreset = Exclude<InteractionPreset, 'custom'>;
-  interface PresetConfig {
-    mode: 'ask' | 'auto';
-    deepTask: boolean;
-    labelKey: string;
-    descriptionKey: string;
-    icon: 'zap' | 'shield' | 'check';
-  }
-
-  const PRESET_CONFIGS: Record<BuiltinPreset, PresetConfig> = {
-    fast: {
-      mode: 'auto',
-      deepTask: false,
-      labelKey: 'input.preset.fast.name',
-      descriptionKey: 'input.preset.fast.desc',
-      icon: 'zap',
-    },
-    stable: {
-      mode: 'auto',
-      deepTask: true,
-      labelKey: 'input.preset.stable.name',
-      descriptionKey: 'input.preset.stable.desc',
-      icon: 'shield',
-    },
-    review: {
-      mode: 'ask',
-      deepTask: true,
-      labelKey: 'input.preset.review.name',
-      descriptionKey: 'input.preset.review.desc',
-      icon: 'check',
-    },
-  };
-  const PRESET_OPTIONS: Array<{ key: BuiltinPreset; config: PresetConfig }> = [
-    { key: 'fast', config: PRESET_CONFIGS.fast },
-    { key: 'stable', config: PRESET_CONFIGS.stable },
-    { key: 'review', config: PRESET_CONFIGS.review },
-  ];
 
   // 技能下拉列表状态
   let skillDropdownOpen = $state(false);
@@ -105,7 +68,6 @@
 
   // 深度任务模式
   let deepTaskEnabled = $state(false);
-  const currentPreset = $derived.by(() => resolvePreset(interactionMode, deepTaskEnabled));
 
   // 增强按钮状态
   let isEnhancing = $state(false);
@@ -287,37 +249,22 @@
     vscode.postMessage({ type: 'enhancePrompt', prompt: content });
   }
 
-  function resolvePreset(mode: 'ask' | 'auto', deepTask: boolean): InteractionPreset {
-    if (mode === 'auto' && !deepTask) return 'fast';
-    if (mode === 'auto' && deepTask) return 'stable';
-    if (mode === 'ask' && deepTask) return 'review';
-    return 'custom';
+  // 切换模式
+  function setMode(mode: 'ask' | 'auto') {
+    if (isModeSyncing && requestedInteractionMode === mode) {
+      return;
+    }
+    requestInteractionMode(mode);
+    vscode.postMessage({ type: 'setInteractionMode', mode });
   }
 
-  function applyPreset(preset: BuiltinPreset) {
-    if (isModeSyncing) {
-      addToast('warning', i18n.t('input.modeSyncNotReady'));
-      return;
-    }
-
-    const target = PRESET_CONFIGS[preset];
-    const needModeChange = interactionMode !== target.mode;
-    const needDeepTaskChange = deepTaskEnabled !== target.deepTask;
-    if (!needModeChange && !needDeepTaskChange) {
-      return;
-    }
-
-    if (needModeChange) {
-      requestInteractionMode(target.mode);
-      vscode.postMessage({ type: 'setInteractionMode', mode: target.mode });
-    }
-
-    if (needDeepTaskChange) {
-      deepTaskEnabled = target.deepTask;
-      vscode.postMessage({ type: 'updateSetting', key: 'deepTask', value: target.deepTask });
-    }
-
-    addToast('info', i18n.t('input.presetApplied', { preset: i18n.t(target.labelKey) }));
+  // 切换深度任务模式
+  function toggleDeepTask() {
+    deepTaskEnabled = !deepTaskEnabled;
+    vscode.postMessage({ type: 'updateSetting', key: 'deepTask', value: deepTaskEnabled });
+    addToast('info', deepTaskEnabled
+      ? i18n.t('input.deepModeEnabled')
+      : i18n.t('input.deepModeDisabled'));
   }
 
   // 拖动调整大小
@@ -602,25 +549,37 @@
           {/if}
         </div>
 
-        <div class="ia-preset-wrap">
-          <div class="ia-preset" role="group" aria-label={i18n.t('input.preset.groupLabel')}>
-            {#each PRESET_OPTIONS as option (option.key)}
-              <button
-                class="ia-preset-btn"
-                class:active={currentPreset === option.key}
-                onclick={() => applyPreset(option.key)}
-                title={i18n.t(option.config.descriptionKey)}
-                disabled={isModeSyncing}
-              >
-                <Icon name={option.config.icon} size={10} />
-                <span>{i18n.t(option.config.labelKey)}</span>
-              </button>
-            {/each}
-          </div>
-          {#if currentPreset === 'custom'}
-            <span class="ia-preset-meta">{i18n.t('input.preset.custom.desc')}</span>
-          {/if}
+        <!-- 模式开关（滑块 Toggle） -->
+        <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+        <div
+          class="ia-toggle"
+          class:auto={interactionMode === 'auto'}
+          class:syncing={isModeSyncing}
+          role="switch"
+          aria-checked={interactionMode === 'auto'}
+          tabindex="0"
+          onclick={() => setMode(interactionMode === 'ask' ? 'auto' : 'ask')}
+          onkeydown={(e) => e.key === 'Enter' && setMode(interactionMode === 'ask' ? 'auto' : 'ask')}
+          title={isModeSyncing ? i18n.t('input.modeSwitching') : (interactionMode === 'ask' ? i18n.t('input.currentAskMode') : i18n.t('input.currentAutoMode'))}
+        >
+          <span class="ia-toggle-label ask" class:active={interactionMode === 'ask'}>{i18n.t('input.mode.ask')}</span>
+          <span class="ia-toggle-label auto" class:active={interactionMode === 'auto'}>{i18n.t('input.mode.auto')}</span>
+          <span class="ia-toggle-thumb" class:syncing={isModeSyncing}></span>
         </div>
+
+        <!-- 深度任务模式开关 -->
+        <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+        <button
+          class="ia-deep-btn"
+          class:active={deepTaskEnabled}
+          onclick={toggleDeepTask}
+          title={deepTaskEnabled
+            ? i18n.t('input.deepModeActive')
+            : i18n.t('input.deepModeInactive')}
+        >
+          <Icon name="infinity" size={12} />
+          <span class="ia-deep-label">{i18n.t('input.deepLabel')}</span>
+        </button>
       </div>
 
       <div class="ia-right">
@@ -946,23 +905,69 @@
     font-size: 11px;
   }
 
-  /* 执行预设（Fast / Stable / Review） */
-  .ia-preset-wrap {
-    display: inline-flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-
-  .ia-preset {
+  /* 模式开关（滑块 Toggle） */
+  .ia-toggle {
+    position: relative;
     display: inline-flex;
     align-items: center;
+    width: 72px;
+    height: 24px;
+    background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: var(--radius-full);
-    overflow: hidden;
-    background: var(--surface-2);
+    cursor: pointer;
+    user-select: none;
+    flex-shrink: 0;
+    transition: border-color var(--transition-fast);
   }
 
-  .ia-preset-btn {
+  .ia-toggle:hover { border-color: var(--foreground-muted); }
+  .ia-toggle.syncing { border-color: var(--warning); }
+
+  .ia-toggle-label {
+    position: relative;
+    z-index: 1;
+    flex: 1;
+    text-align: center;
+    font-size: 10px;
+    font-weight: var(--font-semibold);
+    letter-spacing: 0.02em;
+    color: var(--foreground-muted);
+    transition: color var(--transition-fast);
+    pointer-events: none;
+    line-height: 22px;
+  }
+
+  .ia-toggle-label.active { color: white; }
+
+  .ia-toggle-thumb {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: calc(50% - 3px);
+    height: calc(100% - 4px);
+    background: var(--primary);
+    border-radius: var(--radius-full);
+    transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    pointer-events: none;
+  }
+
+  .ia-toggle.auto .ia-toggle-thumb {
+    transform: translateX(calc(100% + 2px));
+  }
+
+  .ia-toggle-thumb.syncing {
+    background: var(--warning);
+    animation: ia-thumb-pulse 0.8s ease-in-out infinite;
+  }
+
+  @keyframes ia-thumb-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  /* 深度任务模式按钮 */
+  .ia-deep-btn {
     display: inline-flex;
     align-items: center;
     gap: 3px;
@@ -970,39 +975,30 @@
     padding: 0 8px;
     font-size: 10px;
     font-weight: var(--font-semibold);
-    border: none;
     background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
     color: var(--foreground-muted);
     cursor: pointer;
-    transition: background var(--transition-fast), color var(--transition-fast);
+    user-select: none;
+    flex-shrink: 0;
+    transition: all var(--transition-fast);
     white-space: nowrap;
   }
 
-  .ia-preset-btn + .ia-preset-btn {
-    border-left: 1px solid var(--border-subtle);
-  }
+  .ia-deep-btn:hover { border-color: var(--foreground-muted); color: var(--foreground); }
 
-  .ia-preset-btn:hover {
-    background: var(--surface-hover);
-    color: var(--foreground);
-  }
-
-  .ia-preset-btn.active {
-    background: color-mix(in srgb, var(--primary) 18%, transparent);
+  .ia-deep-btn.active {
+    background: color-mix(in srgb, var(--primary) 15%, transparent);
+    border-color: var(--primary);
     color: var(--primary);
   }
 
-  .ia-preset-btn:disabled {
-    cursor: not-allowed;
-    opacity: 0.6;
+  .ia-deep-btn.active:hover {
+    background: color-mix(in srgb, var(--primary) 22%, transparent);
   }
 
-  .ia-preset-meta {
-    font-size: 10px;
-    line-height: 1.2;
-    color: var(--warning);
-    padding-left: 2px;
-  }
+  .ia-deep-label { pointer-events: none; }
 
   /* 发送按钮：圆形 */
   .ia-send {
