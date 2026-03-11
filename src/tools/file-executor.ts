@@ -53,9 +53,11 @@ export class FileExecutor implements ToolExecutor {
   private llmEditHandler?: (filePath: string, fileContent: string, summary: string, detailedDesc: string) => Promise<string>;
 
   /** 文件写入前回调（用于快照系统在写入前保存原始内容） */
-  private onBeforeWrite?: (filePath: string) => void;
+  private onBeforeWrite?: (filePath: string) => void | Promise<void>;
   /** 文件写入后回调（用于 UI 实时刷新待处理变更） */
   private onAfterWrite?: (filePath: string) => void;
+  /** 并行写入冲突检测回调（file_create/file_insert 覆写已有文件时检查是否被其他并行任务修改过） */
+  private onParallelWriteCheck?: (filePath: string) => { blocked: true; conflictTasks: string[] } | null;
 
   constructor(workspaceRoots: WorkspaceRoots, fileMutex: FileMutex) {
     this.workspaceRoots = workspaceRoots;
@@ -94,6 +96,15 @@ export class FileExecutor implements ToolExecutor {
    */
   setAfterWriteCallback(callback: (filePath: string) => void): void {
     this.onAfterWrite = callback;
+  }
+
+  /**
+   * 设置并行写入冲突检测回调
+   * 当 file_create/file_insert 覆写已有文件时，检查该文件是否被其他并行任务修改过。
+   * 若检测到冲突则拒绝盲写，引导 Worker 改用 file_edit（意图驱动，锁内强读安全）。
+   */
+  setParallelWriteCheckCallback(callback: (filePath: string) => { blocked: true; conflictTasks: string[] } | null): void {
+    this.onParallelWriteCheck = callback;
   }
 
   /**
@@ -781,8 +792,26 @@ IMPORTANT:
         originalContent = await this.readFileContent(filePath);
       } catch { /* 新建文件，原始内容为空 */ }
 
+      // 并行写入冲突检测：file_create 对已有文件执行全文覆写时，
+      // 如果该文件已被其他并行任务修改，盲写会覆盖前序任务的修改（lost update）。
+      // 此时拒绝操作并引导 Worker 改用 file_edit（意图驱动，锁内强读安全）。
+      if (originalContent && this.onParallelWriteCheck) {
+        const conflict = this.onParallelWriteCheck(filePath);
+        if (conflict) {
+          const displayPath = this.workspaceRoots.toDisplayPath(filePath);
+          return {
+            toolCallId,
+            content: `Error: ${displayPath} has been modified by parallel task(s) [${conflict.conflictTasks.join(', ')}]. ` +
+              `Using file_create would overwrite their changes. ` +
+              `Please use file_edit with edit_summary and detailed_edit_description instead — ` +
+              `it reads the latest file content inside a lock and applies your changes incrementally, preserving all parallel modifications.`,
+            isError: true,
+          };
+        }
+      }
+
       // 快照回调（覆写时保护原始内容）
-      this.onBeforeWrite?.(filePath);
+      await this.onBeforeWrite?.(filePath);
 
       // 通过 WorkspaceEdit 创建/覆写文件
       await this.createFileViaWorkspaceEdit(filePath, finalContent);
@@ -824,10 +853,25 @@ IMPORTANT:
       };
     }
 
-    return await this.fileMutex.runExclusive(filePath, async () => {
-      let originalContent = '';
+    return await this.fileMutex.runExclusive(filePath, () =>
+      this.applyIntentEditWithinLock(toolCallId, filePath, editSummary, detailedEditDesc)
+    );
+  }
+
+  /**
+   * 锁内执行意图编辑（供 file_edit / file_insert 冲突转换复用）
+   */
+  private async applyIntentEditWithinLock(
+    toolCallId: string,
+    filePath: string,
+    editSummary: string,
+    detailedEditDesc: string,
+    originalContent?: string
+  ): Promise<ToolResult> {
+    let baseContent = originalContent;
+    if (baseContent === undefined) {
       try {
-        originalContent = await this.readFileContent(filePath);
+        baseContent = await this.readFileContent(filePath);
       } catch (error: any) {
         return {
           toolCallId,
@@ -835,61 +879,101 @@ IMPORTANT:
           isError: true
         };
       }
+    }
 
-      logger.info('Delegating file edit to LLM handler', { path: filePath, summary: editSummary }, LogCategory.TOOLS);
+    logger.info('Delegating file edit to LLM handler', { path: filePath, summary: editSummary }, LogCategory.TOOLS);
 
-      let newContent: string;
-      try {
-        const generated = await this.llmEditHandler!(filePath, originalContent, editSummary, detailedEditDesc);
-        if (typeof generated !== 'string') {
-          const rawReason = 'Error during LLM edit generation: model returned non-string content';
-          const userReason = toModelOriginUserMessage(rawReason);
-          trackModelOriginEvent('surfaced', 'tool:file_edit', rawReason, { filePath: this.workspaceRoots.toDisplayPath(filePath) });
-          return {
-            toolCallId,
-            content: userReason || '模型输出异常：未返回可写入文本。',
-            isError: true
-          };
-        }
-        newContent = generated;
-      } catch (error: any) {
-        const rawReason = `Error during LLM edit generation: ${error?.message || String(error)}`;
+    let newContent: string;
+    try {
+      const generated = await this.llmEditHandler!(filePath, baseContent, editSummary, detailedEditDesc);
+      if (typeof generated !== 'string') {
+        const rawReason = 'Error during LLM edit generation: model returned non-string content';
         const userReason = toModelOriginUserMessage(rawReason);
-        trackModelOriginEvent('surfaced', 'tool:file_edit', rawReason, {
-          filePath: this.workspaceRoots.toDisplayPath(filePath),
-        });
+        trackModelOriginEvent('surfaced', 'tool:file_edit', rawReason, { filePath: this.workspaceRoots.toDisplayPath(filePath) });
         return {
           toolCallId,
-          content: userReason || `Error during LLM edit generation: ${error.message}`,
+          content: userReason || '模型输出异常：未返回可写入文本。',
           isError: true
         };
       }
-
-      if (newContent === originalContent) {
-        return {
-          toolCallId,
-          content: `No changes were made to ${this.workspaceRoots.toDisplayPath(filePath)}. The new content is identical to the original.`,
-          isError: false
-        };
-      }
-
-      // 保存旧版本用于撤销
-      this.undoStack.set(filePath, originalContent);
-
-      // 写前快照回调
-      this.onBeforeWrite?.(filePath);
-
-      // 写入文件
-      await this.createFileViaWorkspaceEdit(filePath, newContent);
-      const settledContent = await this.readSettledFileContent(filePath, newContent);
-
+      newContent = generated;
+    } catch (error: any) {
+      const rawReason = `Error during LLM edit generation: ${error?.message || String(error)}`;
+      const userReason = toModelOriginUserMessage(rawReason);
+      trackModelOriginEvent('surfaced', 'tool:file_edit', rawReason, {
+        filePath: this.workspaceRoots.toDisplayPath(filePath),
+      });
       return {
         toolCallId,
-        content: `Successfully edited ${this.workspaceRoots.toDisplayPath(filePath)} based on intent.\nSummary: ${editSummary}`,
-        isError: false,
-        fileChange: this.buildFileChangeMetadata(originalContent, settledContent, filePath, 'modify'),
+        content: userReason || `Error during LLM edit generation: ${error.message}`,
+        isError: true
       };
+    }
+
+    if (newContent === baseContent) {
+      return {
+        toolCallId,
+        content: `No changes were made to ${this.workspaceRoots.toDisplayPath(filePath)}. The new content is identical to the original.`,
+        isError: false
+      };
+    }
+
+    // 保存旧版本用于撤销
+    this.undoStack.set(filePath, baseContent);
+
+    // 写前快照回调
+    await this.onBeforeWrite?.(filePath);
+
+    // 写入文件
+    await this.createFileViaWorkspaceEdit(filePath, newContent);
+    const settledContent = await this.readSettledFileContent(filePath, newContent);
+
+    return {
+      toolCallId,
+      content: `Successfully edited ${this.workspaceRoots.toDisplayPath(filePath)} based on intent.\nSummary: ${editSummary}`,
+      isError: false,
+      fileChange: this.buildFileChangeMetadata(baseContent, settledContent, filePath, 'modify'),
+    };
+  }
+
+  /**
+   * 基于最新内容生成 file_insert 的意图描述
+   */
+  private buildInsertIntentDescription(lines: string[], entries: InsertEntry[]): { summary: string; description: string } {
+    const ordered = [...entries].sort((a, b) => a.insertLine - b.insertLine);
+    const summary = `并行冲突下按锚点插入 ${ordered.length} 处文本`;
+    const descriptionParts: string[] = [];
+
+    descriptionParts.push('目标：在不改变其他内容的前提下完成插入。');
+    descriptionParts.push('规则：insert_line 为 0-based 行号，仅作为参考，最终定位以锚点为准。');
+    descriptionParts.push('若存在多个插入位置，请基于原始内容分别定位，避免因前序插入影响后续锚点。');
+
+    ordered.forEach((entry, idx) => {
+      const beforeLine = entry.insertLine > 0 ? lines[entry.insertLine - 1] : '';
+      const afterLine = entry.insertLine < lines.length ? lines[entry.insertLine] : '';
+      const indexLabel = idx + 1;
+      const insertPayload = this.normalizeLineEndings(entry.newStr);
+
+      descriptionParts.push('');
+      descriptionParts.push(`插入项 ${indexLabel}:`);
+      descriptionParts.push(`- 目标位置：第 ${entry.insertLine} 行之前（0-based）`);
+      if (beforeLine) {
+        descriptionParts.push(`- 前一行锚点：<<<LINE_BEFORE_${indexLabel}\n${beforeLine}\nLINE_BEFORE_${indexLabel}>>>`);
+      } else {
+        descriptionParts.push('- 前一行锚点：文件开头');
+      }
+      if (afterLine) {
+        descriptionParts.push(`- 后一行锚点：<<<LINE_AFTER_${indexLabel}\n${afterLine}\nLINE_AFTER_${indexLabel}>>>`);
+      } else {
+        descriptionParts.push('- 后一行锚点：文件末尾');
+      }
+      descriptionParts.push(`- 插入内容：<<<INSERT_${indexLabel}\n${insertPayload}\nEND_INSERT_${indexLabel}>>>`);
     });
+
+    return {
+      summary,
+      description: descriptionParts.join('\n')
+    };
   }
 
   
@@ -965,6 +1049,36 @@ IMPORTANT:
         isNewFile = true;
       }
 
+      // 并行写入冲突检测：file_insert 使用的行号基于 Worker 之前的 file_view，
+      // 如果文件已被其他并行任务修改，行号可能已经偏移，盲插会导致内容错乱。
+      // 此时拒绝操作并引导 Worker 改用 file_edit（意图驱动，锁内强读安全）。
+      if (!isNewFile && this.onParallelWriteCheck) {
+        const conflict = this.onParallelWriteCheck(filePath);
+        if (conflict) {
+          const normalizedContent = this.normalizeLineEndings(content);
+          const lines = normalizedContent.split('\n');
+          const invalidEntries = entries.filter(entry => entry.insertLine < 0 || entry.insertLine > lines.length);
+          if (invalidEntries.length > 0) {
+            return {
+              toolCallId,
+              content: invalidEntries
+                .map(entry => `Error (index ${entry.index}): Invalid insert_line: ${entry.insertLine}. File currently has ${lines.length} lines, valid range is [0, ${lines.length}]`)
+                .join('\n'),
+              isError: true,
+            };
+          }
+
+          logger.info('file_insert conflict detected, switching to intent edit', {
+            path: filePath,
+            conflictTasks: conflict.conflictTasks,
+            entries: entries.length,
+          }, LogCategory.TOOLS);
+
+          const intent = this.buildInsertIntentDescription(lines, entries);
+          return await this.applyIntentEditWithinLock(toolCallId, filePath, intent.summary, intent.description, content);
+        }
+      }
+
       // 3. 规范化换行符
       const normalized = this.normalizeLineEndings(content);
       let currentContent = normalized;
@@ -1015,7 +1129,7 @@ IMPORTANT:
       this.undoStack.set(filePath, content);
 
       // 8. 快照回调
-      this.onBeforeWrite?.(filePath);
+      await this.onBeforeWrite?.(filePath);
 
       // 9. 通过 WorkspaceEdit 写入
       if (isNewFile) {
@@ -1085,7 +1199,7 @@ IMPORTANT:
     const previous = this.undoStack.get(filePath)!;
 
     // 快照回调（undo 也是文件变更，需要在写入前记录原始状态）
-    this.onBeforeWrite?.(filePath);
+    await this.onBeforeWrite?.(filePath);
 
     await this.writeFileViaWorkspaceEdit(filePath, previous);
     this.undoStack.delete(filePath);
