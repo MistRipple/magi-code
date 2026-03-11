@@ -120,10 +120,12 @@ export class OrchestratorDecisionEngine {
       });
     }
 
+    const runningRequired = snapshot.runningRequired ?? 0;
     if (
       snapshot.requiredTotal > 0
       && noProgressStreak >= this.policy.stalledWindowSize
       && snapshot.blockerState.externalWaitOpen === 0
+      && runningRequired === 0
     ) {
       const label = 'stalled';
       candidates.push(createCandidate('stalled', label));
@@ -182,10 +184,12 @@ export class OrchestratorDecisionEngine {
     ) {
       return 'upstream_model_error';
     }
+    const runningRequired = snapshot.runningRequired ?? 0;
     if (
       snapshot.requiredTotal > 0
       && noProgressStreak >= this.policy.stalledWindowSize
       && snapshot.blockerState.externalWaitOpen === 0
+      && runningRequired === 0
     ) {
       return 'stalled';
     }

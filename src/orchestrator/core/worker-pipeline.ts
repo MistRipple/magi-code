@@ -102,7 +102,7 @@ export class WorkerPipeline {
     // ========== 1. [可选] 快照创建 ==========
     const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
     if (enableSnapshot && snapshotManager) {
-      this.createSnapshots(snapshotManager, missionId, assignment, normalizedSessionId);
+      await this.createSnapshots(snapshotManager, missionId, assignment, normalizedSessionId);
     }
 
     // ========== 2. 设置工具级快照上下文 ==========
@@ -284,12 +284,12 @@ export class WorkerPipeline {
   // 私有方法（从 AssignmentExecutor 提取）
   // ===========================================================================
 
-  private createSnapshots(
+  private async createSnapshots(
     snapshotManager: SnapshotManager,
     missionId: string,
     assignment: Assignment,
     sessionId?: string,
-  ): void {
+  ): Promise<void> {
     if (!sessionId || !sessionId.trim()) {
       logger.warn('WorkerPipeline.快照创建.跳过_缺少会话', {
         assignmentId: assignment.id,
@@ -302,7 +302,7 @@ export class WorkerPipeline {
 
     try {
       for (const filePath of targetFiles) {
-        snapshotManager.createSnapshotForMission(
+        await snapshotManager.createSnapshotForMission(
           filePath, sessionId, missionId, assignment.id,
           'assignment-init', assignment.workerId,
           t('pipeline.snapshot.beforeAssignment', { responsibility: assignment.responsibility }),

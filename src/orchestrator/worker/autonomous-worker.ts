@@ -15,6 +15,7 @@ import * as crypto from 'crypto';
 import * as path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { raceWithTimeout } from '../../utils/race-with-timeout';
 
 const execAsync = promisify(exec);
 import { WorkerSlot } from '../../types';
@@ -22,6 +23,7 @@ import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import { AdapterOutputScope } from '../../adapters/adapter-factory-interface';
 import { TokenUsage } from '../../types/agent-types';
 import { ProfileLoader } from '../profile/profile-loader';
+import type { SnapshotManager } from '../../snapshot-manager';
 import { GuidanceInjector } from '../profile/guidance-injector';
 import { TodoManager, UnifiedTodo, TodoOutput } from '../../todo';
 import {
@@ -219,6 +221,8 @@ export class AutonomousWorker extends EventEmitter {
   private sharedContextPool: ISharedContextPool;
   /** 当前 Mission ID（用于写入共享上下文） */
   private currentMissionId?: string;
+  /** 快照管理器（用于质量门禁补充文件改动证据） */
+  private snapshotManager?: SnapshotManager;
   /** 当前 Assignment 的缓存读取统计（用于质量门禁） */
   private cacheReadStats: {
     lookups: number;
@@ -236,6 +240,7 @@ export class AutonomousWorker extends EventEmitter {
     private guidanceInjector: GuidanceInjector,
     todoManager: TodoManager,
     sharedContextDeps: SharedContextDependencies,
+    snapshotManager?: SnapshotManager,
     sessionManager?: WorkerSessionManager
   ) {
     super();
@@ -260,6 +265,7 @@ export class AutonomousWorker extends EventEmitter {
     this.todoManager = todoManager;
     this.recoveryHandler = new ProfileAwareRecoveryHandler(profileLoader);
     this.sessionManager = sessionManager || new WorkerSessionManager({ autoCleanup: true });
+    this.snapshotManager = snapshotManager;
 
     // 强制依赖：共享上下文组件（运行时已验证非空）
     this.contextAssembler = sharedContextDeps.contextAssembler;
@@ -348,22 +354,6 @@ export class AutonomousWorker extends EventEmitter {
           completedTodos: session.completedTodos.length,
         }, LogCategory.ORCHESTRATOR);
 
-        // 恢复已完成 Todo 状态（优先 ID 命中，次级内容指纹命中）
-        const completedTodoIds = new Set(session.completedTodos);
-        const remainingTodoFingerprints = new Set(session.completedTodoFingerprints);
-        for (const todo of assignment.todos) {
-          const fingerprint = this.buildTodoFingerprint(todo.content);
-          const fingerprintMatched = Boolean(fingerprint) && remainingTodoFingerprints.has(fingerprint);
-          if (fingerprintMatched) {
-            remainingTodoFingerprints.delete(fingerprint);
-          }
-          const matched = completedTodoIds.has(todo.id) || fingerprintMatched;
-          if (matched && todo.status === 'pending') {
-            todo.status = 'completed';
-            completedTodos.push(todo);
-          }
-        }
-
         const resumeInstruction = options.resumePrompt || session.resumePrompt;
         if (resumeInstruction) {
           this.appendSupplementaryInstructions(assignment, [
@@ -403,6 +393,8 @@ export class AutonomousWorker extends EventEmitter {
     }
 
     this.currentSession = session;
+    await this.refreshAssignmentTodos(assignment);
+    this.syncTodoCollections(assignment, completedTodos, failedTodos, skippedTodos);
 
     this.emit('assignmentStarted', {
       assignmentId: assignment.id,
@@ -421,6 +413,8 @@ export class AutonomousWorker extends EventEmitter {
     const reviewPolicy = this.resolveReviewPolicy(options);
     const maxReviewRounds = reviewPolicy.maxReviewRounds;
     let reviewRound = 0;
+    await this.refreshAssignmentTodos(assignment);
+    this.syncTodoCollections(assignment, completedTodos, failedTodos, skippedTodos);
     let currentTodo = this.getNextExecutableTodo(assignment);
     let heartbeatTodoId = currentTodo?.id;
     const heartbeatIntervalMs = Math.max(1000, options.heartbeatIntervalMs || 10_000);
@@ -468,7 +462,7 @@ export class AutonomousWorker extends EventEmitter {
             // 父 Todo 已拆分：不标记完成，子 Todo 由 getNextExecutableTodo 自然拾取
             // 父 Todo 完成由 TodoManager.tryCompleteParent 自动处理
           } else {
-            completedTodos.push(result.todo);
+            this.upsertTodo(completedTodos, result.todo);
 
             // 更新 Session - 提案 4.1
             if (session) {
@@ -541,7 +535,7 @@ export class AutonomousWorker extends EventEmitter {
           if (recoveryExecution.success && recoveryExecution.recoveredTodo) {
             const recoveredTodo = recoveryExecution.recoveredTodo;
             if (recoveredTodo.status === 'completed') {
-              completedTodos.push(recoveredTodo);
+              this.upsertTodo(completedTodos, recoveredTodo);
               this.clearRetryCount(currentTodo.id);
 
               if (session) {
@@ -574,12 +568,16 @@ export class AutonomousWorker extends EventEmitter {
                 }
               }
 
+              await this.refreshAssignmentTodos(assignment);
+              this.syncTodoCollections(assignment, completedTodos, failedTodos, skippedTodos);
               currentTodo = this.getNextExecutableTodo(assignment);
               continue;
             }
 
             if (recoveredTodo.status === 'skipped') {
-              skippedTodos.push(recoveredTodo);
+              this.upsertTodo(skippedTodos, recoveredTodo);
+              await this.refreshAssignmentTodos(assignment);
+              this.syncTodoCollections(assignment, completedTodos, failedTodos, skippedTodos);
               currentTodo = this.getNextExecutableTodo(assignment);
               continue;
             }
@@ -604,7 +602,7 @@ export class AutonomousWorker extends EventEmitter {
             await this.handleAdjustment(assignment, questionResponse.adjustment);
           }
 
-          failedTodos.push(result.todo);
+          this.upsertTodo(failedTodos, result.todo);
           errors.push(surfacedFailureReason);
 
           // 更新 Session 失败状态 - 提案 4.1
@@ -621,31 +619,21 @@ export class AutonomousWorker extends EventEmitter {
           const dependentTodos = this.getDependentTodos(currentTodo, assignment);
           for (const depTodo of dependentTodos) {
             const blockedReason = `Dependent todo "${currentTodo.content}" failed`;
-            let skippedTodo: UnifiedTodo = {
-              ...depTodo,
-              status: 'skipped',
-              blockedReason,
-            };
             try {
-              await this.todoManager.skip(depTodo.id);
-              const persisted = await this.todoManager.get(depTodo.id);
-              if (persisted) {
-                skippedTodo = {
-                  ...persisted,
-                  blockedReason,
-                };
-              }
+              await this.todoManager.skip(depTodo.id, blockedReason);
             } catch (skipError: any) {
               logger.warn('Worker.Todo.依赖跳过落盘失败', {
                 todoId: depTodo.id,
                 error: skipError?.message || String(skipError),
               }, LogCategory.ORCHESTRATOR);
             }
-            const todoIndex = assignment.todos.findIndex(t => t.id === skippedTodo.id);
-            if (todoIndex >= 0) {
-              assignment.todos[todoIndex] = skippedTodo;
+          }
+          if (dependentTodos.length > 0) {
+            await this.refreshAssignmentTodos(assignment);
+            this.syncTodoCollections(assignment, completedTodos, failedTodos, skippedTodos);
+            for (const depTodo of dependentTodos) {
+              this.upsertTodo(skippedTodos, this.getAssignmentTodoOrThrow(assignment, depTodo.id));
             }
-            skippedTodos.push(skippedTodo);
           }
         }
       } catch (error) {
@@ -662,38 +650,17 @@ export class AutonomousWorker extends EventEmitter {
         if (!currentTodo) {
           break;
         }
-        let failedTodo: UnifiedTodo = {
-          ...currentTodo,
-          status: 'failed',
-          output: {
-            success: false,
-            summary: '',
-            modifiedFiles: [],
-            error: userMessage,
-            duration: 0,
-          },
-        };
         try {
           await this.todoManager.fail(currentTodo.id, userMessage);
-          const persisted = await this.todoManager.get(currentTodo.id);
-          if (persisted) {
-            failedTodo = persisted;
-            const todoIndex = assignment.todos.findIndex(t => t.id === persisted.id);
-            if (todoIndex >= 0) {
-              assignment.todos[todoIndex] = persisted;
-            }
-          }
         } catch (markError: any) {
           logger.warn('Worker.Todo.异常路径状态落盘失败', {
             todoId: currentTodo.id,
             error: markError?.message || String(markError),
           }, LogCategory.ORCHESTRATOR);
         }
-        const todoIndex = assignment.todos.findIndex(t => t.id === failedTodo.id);
-        if (todoIndex >= 0) {
-          assignment.todos[todoIndex] = failedTodo;
-        }
-        failedTodos.push(failedTodo);
+        const failedTodo = await this.refreshAssignmentTodo(assignment, currentTodo.id);
+        this.syncTodoCollections(assignment, completedTodos, failedTodos, skippedTodos);
+        this.upsertTodo(failedTodos, failedTodo);
         logger.error('Worker.Todo.执行异常', {
           todoId: currentTodo.id,
           error: rawMessage,
@@ -702,6 +669,8 @@ export class AutonomousWorker extends EventEmitter {
       }
 
         // 获取下一个可执行的 Todo
+        await this.refreshAssignmentTodos(assignment);
+        this.syncTodoCollections(assignment, completedTodos, failedTodos, skippedTodos);
         currentTodo = this.getNextExecutableTodo(assignment);
         heartbeatTodoId = currentTodo?.id;
 
@@ -716,6 +685,8 @@ export class AutonomousWorker extends EventEmitter {
             );
             if (fixTodos.length > 0) {
               reviewRound++;
+              await this.refreshAssignmentTodos(assignment);
+              this.syncTodoCollections(assignment, completedTodos, failedTodos, skippedTodos);
               currentTodo = this.getNextExecutableTodo(assignment);
               heartbeatTodoId = currentTodo?.id;
             }
@@ -736,39 +707,21 @@ export class AutonomousWorker extends EventEmitter {
           }
         }
       }
-      // 同步拆分父 Todo 的最终状态（由 TodoManager.tryCompleteParent 自动完成）
-      for (const todo of assignment.todos) {
-        if (todo.status === 'running' && assignment.todos.some(t => t.parentId === todo.id)) {
-          const fresh = await this.todoManager.get(todo.id);
-          if (fresh && fresh.status === 'completed') {
-            todo.status = 'completed';
-            todo.completedAt = fresh.completedAt;
-            todo.output = fresh.output;
-            completedTodos.push(todo);
-          }
-        }
-      }
-
-      // 收集被跳过的 Todo
-      for (const todo of assignment.todos) {
-        if (todo.status === 'skipped' && !skippedTodos.includes(todo)) {
-          skippedTodos.push(todo);
-        }
-      }
+      await this.refreshAssignmentTodos(assignment);
+      this.syncTodoCollections(assignment, completedTodos, failedTodos, skippedTodos);
 
       // 检查是否有等待审批的 Todo
-      const hasPendingApprovals = assignment.todos.some(t => t.status === 'pending' && t.approvalStatus === 'pending');
+      const hasPendingApprovals = assignment.todos.some(todo => this.isTodoAwaitingApproval(todo));
 
-      // 如果被中止，将剩余的 pending Todo 标记为 skipped
+      // 如果被中止，将剩余的未终态 Todo 标记为 skipped
       if (aborted) {
         for (const todo of assignment.todos) {
-          if (todo.status === 'pending' && !skippedTodos.includes(todo)) {
-            await this.todoManager.skip(todo.id);
-            todo.status = 'skipped';
-            todo.blockedReason = abortReason || 'Aborted by orchestrator';
-            skippedTodos.push(todo);
+          if (this.isTodoSkippable(todo)) {
+            await this.todoManager.skip(todo.id, abortReason || 'Aborted by orchestrator');
           }
         }
+        await this.refreshAssignmentTodos(assignment);
+        this.syncTodoCollections(assignment, completedTodos, failedTodos, skippedTodos);
       }
 
       const success = completedTodos.length > 0 && failedTodos.length === 0 && !aborted;
@@ -840,15 +793,11 @@ export class AutonomousWorker extends EventEmitter {
 
           const finalReportTimeoutMs = this.resolveReportTimeoutMs(options, 'final');
           try {
-            await Promise.race([
+            await raceWithTimeout(
               options.onReport(finalReport),
-              new Promise<void>((_, reject) =>
-                setTimeout(
-                  () => reject(new Error('Final report timed out')),
-                  finalReportTimeoutMs,
-                ),
-              ),
-            ]);
+              finalReportTimeoutMs,
+              'Final report timed out',
+            );
         } catch (reportError) {
           logger.error('Worker.最终汇报失败', { error: reportError instanceof Error ? reportError.message : String(reportError) }, LogCategory.ORCHESTRATOR);
         }
@@ -1064,7 +1013,7 @@ If any criterion is not satisfied:
       return { action: 'continue', timestamp: Date.now() };
     }
 
-    const pendingTodos = assignment.todos.filter(t => t.status === 'pending');
+    const pendingTodos = assignment.todos.filter(t => !this.isTodoTerminal(t));
     const completedSteps = allCompletedTodos.map(t => t.content);
     const remainingSteps = pendingTodos.map(t => t.content);
     const totalSteps = assignment.todos.length;
@@ -1087,12 +1036,11 @@ If any criterion is not satisfied:
 
     const reportTimeoutMs = this.resolveReportTimeoutMs(options, 'progress');
     try {
-      const response = await Promise.race([
+      const response = await raceWithTimeout(
         options.onReport(report),
-        new Promise<OrchestratorResponse>((_, reject) =>
-          setTimeout(() => reject(new Error('Report timed out')), reportTimeoutMs)
-        ),
-      ]);
+        reportTimeoutMs,
+        'Report timed out',
+      );
       return response;
     } catch (error) {
       logger.warn('Worker.汇报异常，继续执行', {
@@ -1141,12 +1089,11 @@ If any criterion is not satisfied:
     );
 
     try {
-      return await Promise.race([
+      return await raceWithTimeout(
         options.onReport(question),
-        new Promise<OrchestratorResponse>((_, reject) =>
-          setTimeout(() => reject(new Error('Question report timed out')), questionReportTimeoutMs)
-        ),
-      ]);
+        questionReportTimeoutMs,
+        'Question report timed out',
+      );
     } catch (error) {
       logger.warn('Worker.question上报失败，按降级继续', {
         assignmentId: assignment.id,
@@ -1193,15 +1140,14 @@ If any criterion is not satisfied:
     if (adjustment.skipSteps && adjustment.skipSteps.length > 0) {
       for (const stepContent of adjustment.skipSteps) {
         const todo = assignment.todos.find(t =>
-          t.status === 'pending' && t.content.includes(stepContent)
+          this.isTodoSkippable(t) && t.content.includes(stepContent)
         );
         if (todo) {
-          await this.todoManager.skip(todo.id);
-          todo.status = 'skipped';
-          todo.blockedReason = 'Skipped by orchestrator';
+          await this.todoManager.skip(todo.id, 'Skipped by orchestrator');
           logger.debug('Worker.跳过步骤', { todoId: todo.id, content: stepContent }, LogCategory.ORCHESTRATOR);
         }
       }
+      await this.refreshAssignmentTodos(assignment);
     }
 
     // 处理新增步骤（统一走 addDynamicTodo → TodoManager，创建二级 Todo）
@@ -1275,6 +1221,107 @@ If any criterion is not satisfied:
     return content.trim().replace(/\s+/g, ' ').toLowerCase();
   }
 
+  private isTodoTerminal(todo: UnifiedTodo): boolean {
+    return todo.status === 'completed' || todo.status === 'failed' || todo.status === 'skipped';
+  }
+
+  private isTodoAwaitingApproval(todo: UnifiedTodo): boolean {
+    return todo.outOfScope === true
+      && todo.approvalStatus === 'pending'
+      && !this.isTodoTerminal(todo);
+  }
+
+  private isTodoSkippable(todo: UnifiedTodo): boolean {
+    return todo.status === 'pending' || todo.status === 'blocked' || todo.status === 'ready';
+  }
+
+  private upsertTodo(list: UnifiedTodo[], todo: UnifiedTodo): void {
+    const index = list.findIndex(item => item.id === todo.id);
+    if (index >= 0) {
+      list[index] = todo;
+      return;
+    }
+    list.push(todo);
+  }
+
+  private removeTodo(list: UnifiedTodo[], todoId: string): void {
+    const index = list.findIndex(item => item.id === todoId);
+    if (index >= 0) {
+      list.splice(index, 1);
+    }
+  }
+
+  private syncTodoCollections(
+    assignment: Assignment,
+    completedTodos: UnifiedTodo[],
+    failedTodos: UnifiedTodo[],
+    skippedTodos: UnifiedTodo[],
+  ): void {
+    for (const todo of assignment.todos) {
+      if (todo.status === 'completed') {
+        this.upsertTodo(completedTodos, todo);
+        this.removeTodo(failedTodos, todo.id);
+        this.removeTodo(skippedTodos, todo.id);
+        continue;
+      }
+      if (todo.status === 'failed') {
+        this.upsertTodo(failedTodos, todo);
+        this.removeTodo(completedTodos, todo.id);
+        this.removeTodo(skippedTodos, todo.id);
+        continue;
+      }
+      if (todo.status === 'skipped') {
+        this.upsertTodo(skippedTodos, todo);
+        this.removeTodo(completedTodos, todo.id);
+        this.removeTodo(failedTodos, todo.id);
+        continue;
+      }
+      this.removeTodo(completedTodos, todo.id);
+      this.removeTodo(failedTodos, todo.id);
+      this.removeTodo(skippedTodos, todo.id);
+    }
+  }
+
+  private getAssignmentTodoOrThrow(assignment: Assignment, todoId: string): UnifiedTodo {
+    const todo = assignment.todos.find(item => item.id === todoId);
+    if (!todo) {
+      throw new Error(`Assignment ${assignment.id} missing authoritative todo snapshot: ${todoId}`);
+    }
+    return todo;
+  }
+
+  private async refreshAssignmentTodos(assignment: Assignment): Promise<void> {
+    const authoritativeTodos = await this.todoManager.getByAssignment(assignment.id);
+    const authoritativeById = new Map(authoritativeTodos.map(todo => [todo.id, todo]));
+    const missingIds = assignment.todos
+      .filter(todo => !authoritativeById.has(todo.id))
+      .map(todo => todo.id);
+    if (missingIds.length > 0) {
+      throw new Error(`Assignment ${assignment.id} has stale todo references: ${missingIds.join(', ')}`);
+    }
+
+    const existingIds = new Set(assignment.todos.map(todo => todo.id));
+    assignment.todos = [
+      ...assignment.todos.map(todo => authoritativeById.get(todo.id)!),
+      ...authoritativeTodos.filter(todo => !existingIds.has(todo.id)),
+    ];
+  }
+
+  private async refreshAssignmentTodo(assignment: Assignment, todoId: string): Promise<UnifiedTodo> {
+    const authoritativeTodo = await this.todoManager.get(todoId);
+    if (!authoritativeTodo) {
+      throw new Error(`Todo authority missing snapshot for todo: ${todoId}`);
+    }
+
+    const index = assignment.todos.findIndex(todo => todo.id === todoId);
+    if (index >= 0) {
+      assignment.todos[index] = authoritativeTodo;
+    } else {
+      assignment.todos.push(authoritativeTodo);
+    }
+    return authoritativeTodo;
+  }
+
   /**
    * 执行单个 Todo
    */
@@ -1303,33 +1350,31 @@ If any criterion is not satisfied:
     // 更新状态 - 使用 TodoManager
     await this.todoManager.prepareForExecution(todo.id);
     await this.todoManager.start(todo.id);
-    // 同步本地对象状态
-    todo.status = 'running';
-    todo.startedAt = Date.now();
+    let currentTodo = await this.refreshAssignmentTodo(assignment, todo.id);
 
     const toolManager = options.adapterFactory?.getToolManager();
     // 更新快照上下文的 todoId（确保当前 Todo 的文件变更精确关联）
-    toolManager?.updateSnapshotTodoId(assignment.workerId, todo.id);
-    toolManager?.resetTodoModifiedFiles(assignment.workerId, todo.id);
+    toolManager?.updateSnapshotTodoId(assignment.workerId, currentTodo.id);
+    toolManager?.resetTodoModifiedFiles(assignment.workerId, currentTodo.id);
 
     this.emit('todoStarted', {
       assignmentId: assignment.id,
-      todoId: todo.id,
-      content: todo.content,
+      todoId: currentTodo.id,
+      content: currentTodo.content,
     });
 
     try {
       // 构建执行 prompt（注入共享上下文） - 提案 9.2
       const profile = this.profileLoader.getProfile(this.workerType);
       const extraTargets = this.extractTargetFiles(
-        `${todo.content}\n${todo.reasoning || ''}\n${todo.expectedOutput || ''}`
+        `${currentTodo.content}\n${currentTodo.reasoning || ''}\n${currentTodo.expectedOutput || ''}`
       );
 
       // L2: 上下文预注入 — 编排者未提供足够目标文件时，自动搜索相关代码
       // 减少 Worker（尤其 Codex）因缺乏上下文而产生的大范围探索轮次
       const allKnownTargets = [...(assignment.scope.targetPaths || []), ...extraTargets];
       if (allKnownTargets.length < 3) {
-        const taskText = `${todo.content} ${assignment.delegationBriefing || assignment.responsibility}`;
+        const taskText = `${currentTodo.content} ${assignment.delegationBriefing || assignment.responsibility}`;
         const discovered = await this.discoverRelevantFiles(taskText, options.workingDirectory, allKnownTargets);
         extraTargets.push(...discovered);
       }
@@ -1340,7 +1385,7 @@ If any criterion is not satisfied:
         extraTargets
       );
       const executionPrompt = this.buildExecutionPrompt(
-        todo,
+        currentTodo,
         assignment,
         sharedContext,
         targetFileContext
@@ -1349,40 +1394,35 @@ If any criterion is not satisfied:
       // 生成自检引导
       const selfCheckGuidance = this.guidanceInjector.buildSelfCheckGuidance(
         profile,
-        todo.content
+        currentTodo.content
       );
 
       // 执行（通过 executeWithWorker 调用 LLM 适配器）
       const output = await this.executeWithWorker(
-        todo,
+        currentTodo,
         assignment,
         executionPrompt,
         selfCheckGuidance,
         options
       );
-      const modifiedFiles = toolManager?.getTodoModifiedFiles(assignment.workerId, todo.id) || [];
+      const modifiedFiles = toolManager?.getTodoModifiedFiles(assignment.workerId, currentTodo.id) || [];
 
       // 检查执行过程中是否调用了 split_todo（数据驱动，无模式标志）
-      const hasChildren = assignment.todos.some(t => t.parentId === todo.id);
+      await this.refreshAssignmentTodos(assignment);
+      currentTodo = this.getAssignmentTodoOrThrow(assignment, currentTodo.id);
+      const hasChildren = assignment.todos.some(t => t.parentId === currentTodo.id);
       if (hasChildren) {
-        toolManager?.clearTodoModifiedFiles(assignment.workerId, todo.id);
-        // 父 Todo 保持 running 状态，由 tryCompleteParent 在所有子 Todo 完成后自动标记完成
-        todo.output = {
-          success: true,
-          summary: `Split into ${assignment.todos.filter(t => t.parentId === todo.id).length} sub-steps`,
-          modifiedFiles: [],
-          duration: Date.now() - startTime,
-        };
+        toolManager?.clearTodoModifiedFiles(assignment.workerId, currentTodo.id);
 
         this.emit('todoSplit', {
           assignmentId: assignment.id,
-          parentTodoId: todo.id,
-          childCount: assignment.todos.filter(t => t.parentId === todo.id).length,
+          parentTodoId: currentTodo.id,
+          childCount: assignment.todos.filter(t => t.parentId === currentTodo.id).length,
         });
 
         return {
           success: true,
-          todo,
+          todo: currentTodo,
           tokenUsage: output.tokenUsage,
         };
       }
@@ -1394,18 +1434,16 @@ If any criterion is not satisfied:
         modifiedFiles,
         duration: Date.now() - startTime,
       };
-      toolManager?.clearTodoModifiedFiles(assignment.workerId, todo.id);
-      await this.todoManager.complete(todo.id, todoOutput);
-      // 同步本地对象状态
-      todo.status = 'completed';
-      todo.completedAt = Date.now();
-      todo.output = todoOutput;
+      toolManager?.clearTodoModifiedFiles(assignment.workerId, currentTodo.id);
+      await this.todoManager.complete(currentTodo.id, todoOutput);
+      await this.refreshAssignmentTodos(assignment);
+      currentTodo = this.getAssignmentTodoOrThrow(assignment, currentTodo.id);
       try {
-        await this.writeInsights(this.buildSuccessInsights(assignment, output.summary, modifiedFiles, todo));
+        await this.writeInsights(this.buildSuccessInsights(assignment, output.summary, modifiedFiles, currentTodo));
       } catch (insightError) {
         logger.warn('Worker.Todo.完成后Insight写入失败（忽略）', {
           assignmentId: assignment.id,
-          todoId: todo.id,
+          todoId: currentTodo.id,
           error: insightError instanceof Error ? insightError.message : String(insightError),
         }, LogCategory.ORCHESTRATOR);
       }
@@ -1413,55 +1451,46 @@ If any criterion is not satisfied:
       try {
         this.emit('todoCompleted', {
           assignmentId: assignment.id,
-          todoId: todo.id,
-          content: todo.content,
-          output: todo.output,
+          todoId: currentTodo.id,
+          content: currentTodo.content,
+          output: currentTodo.output,
         });
       } catch (emitError) {
         logger.warn('Worker.Todo.完成事件发送失败（忽略）', {
           assignmentId: assignment.id,
-          todoId: todo.id,
+          todoId: currentTodo.id,
           error: emitError instanceof Error ? emitError.message : String(emitError),
         }, LogCategory.ORCHESTRATOR);
       }
 
       return {
         success: true,
-        todo,
+        todo: currentTodo,
         tokenUsage: output.tokenUsage,
       };
     } catch (error) {
       const { rawMessage, userMessage } = this.resolveErrorMessages(error);
-      const modifiedFiles = toolManager?.getTodoModifiedFiles(assignment.workerId, todo.id) || [];
-      toolManager?.clearTodoModifiedFiles(assignment.workerId, todo.id);
+      const modifiedFiles = toolManager?.getTodoModifiedFiles(assignment.workerId, currentTodo.id) || [];
+      toolManager?.clearTodoModifiedFiles(assignment.workerId, currentTodo.id);
 
       // 记录完整堆栈用于诊断运行时 TypeError 等难以复现的崩溃
       logger.error('Worker.executeTodo.异常', {
         worker: this.workerType,
         assignmentId: assignment.id,
-        todoId: todo.id,
+        todoId: currentTodo.id,
         message: rawMessage,
         stack: error instanceof Error ? error.stack : undefined,
       }, LogCategory.ORCHESTRATOR);
 
       // 使用 TodoManager 标记失败
-      await this.todoManager.fail(todo.id, userMessage);
-      // 同步本地对象状态
-      todo.status = 'failed';
-      todo.completedAt = Date.now();
-      todo.output = {
-        success: false,
-        summary: '',
-        modifiedFiles,
-        error: userMessage,
-        duration: Date.now() - startTime,
-      };
+      await this.todoManager.fail(currentTodo.id, userMessage);
+      currentTodo = await this.refreshAssignmentTodo(assignment, currentTodo.id);
       try {
-        await this.writeInsights(this.buildFailureInsights(assignment, userMessage, todo));
+        await this.writeInsights(this.buildFailureInsights(assignment, userMessage, currentTodo));
       } catch (insightError) {
         logger.warn('Worker.Todo.失败后Insight写入失败（忽略）', {
           assignmentId: assignment.id,
-          todoId: todo.id,
+          todoId: currentTodo.id,
           error: insightError instanceof Error ? insightError.message : String(insightError),
         }, LogCategory.ORCHESTRATOR);
       }
@@ -1469,21 +1498,21 @@ If any criterion is not satisfied:
       try {
         this.emit('todoFailed', {
           assignmentId: assignment.id,
-          todoId: todo.id,
-          content: todo.content,
+          todoId: currentTodo.id,
+          content: currentTodo.content,
           error: userMessage,
         });
       } catch (emitError) {
         logger.warn('Worker.Todo.失败事件发送失败（忽略）', {
           assignmentId: assignment.id,
-          todoId: todo.id,
+          todoId: currentTodo.id,
           error: emitError instanceof Error ? emitError.message : String(emitError),
         }, LogCategory.ORCHESTRATOR);
       }
 
       return {
         success: false,
-        todo,
+        todo: currentTodo,
         error: userMessage,
       };
     }
@@ -2054,7 +2083,11 @@ Not applicable: The task itself is a single goal — execute it directly.`);
     startedAt?: number
   ): AutonomousExecutionResult {
     const gateErrors: string[] = [];
+    const snapshotChanges = this.collectSnapshotChanges(assignment);
+    this.applySnapshotChangesToTodos(result, snapshotChanges.byTodo);
     const modifiedFiles = this.collectResultModifiedFiles(result);
+    const effectiveModifiedFiles = this.mergeModifiedFiles(modifiedFiles, snapshotChanges.allFiles);
+    const hasAnyRecordedChanges = effectiveModifiedFiles.length > 0;
 
     if (sharedContext && sharedContext.budgetUsage > 1) {
       gateErrors.push('Quality gate failed: Shared context budget exceeded.');
@@ -2079,7 +2112,7 @@ Not applicable: The task itself is a single goal — execute it directly.`);
         gateErrors.push(`Quality gate failed: Undeclared contract dependencies found: ${unknownRequiredContracts.join(', ')}`);
       }
 
-      if (assignment.scope.requiresModification && modifiedFiles.length === 0) {
+      if (assignment.scope.requiresModification && !hasAnyRecordedChanges) {
         gateErrors.push('Quality gate failed: Assignment required real file modifications but none were recorded.');
       }
 
@@ -2087,9 +2120,16 @@ Not applicable: The task itself is a single goal — execute it directly.`);
         this.requiresRealModification(todo) && !this.hasRecordedTodoModifications(todo)
       );
       if (emptyWriteTodos.length > 0) {
-        gateErrors.push(
-          `Quality gate failed: Completed write-required todos recorded no real file modifications: ${emptyWriteTodos.map(todo => `${todo.id}(${todo.type})`).join(', ')}`
-        );
+        if (!hasAnyRecordedChanges) {
+          gateErrors.push(
+            `Quality gate failed: Completed write-required todos recorded no real file modifications: ${emptyWriteTodos.map(todo => `${todo.id}(${todo.type})`).join(', ')}`
+          );
+        } else {
+          this.appendQualityWarning(
+            result,
+            `Quality gate warning: write-required todos missing per-todo file tracking: ${emptyWriteTodos.map(todo => `${todo.id}(${todo.type})`).join(', ')}`
+          );
+        }
       }
     }
 
@@ -2109,6 +2149,115 @@ Not applicable: The task itself is a single goal — execute it directly.`);
       success: false,
       errors: [...result.errors, ...gateErrors],
     };
+  }
+
+  private collectSnapshotChanges(assignment: Assignment): {
+    allFiles: string[];
+    byTodo: Map<string, string[]>;
+  } {
+    if (!this.snapshotManager) {
+      return { allFiles: [], byTodo: new Map() };
+    }
+    const pending = this.snapshotManager.getPendingChanges();
+    if (!pending || pending.length === 0) {
+      return { allFiles: [], byTodo: new Map() };
+    }
+
+    const allFiles: string[] = [];
+    const byTodo = new Map<string, Set<string>>();
+    const assignmentId = assignment.id;
+    const workerId = assignment.workerId;
+    const missionId = assignment.missionId;
+
+    for (const change of pending) {
+      if (change.assignmentId !== assignmentId) {
+        continue;
+      }
+      if (change.workerId && change.workerId !== workerId) {
+        continue;
+      }
+      if (missionId && change.missionId && change.missionId !== missionId) {
+        continue;
+      }
+      const filePath = typeof change.filePath === 'string' ? change.filePath.trim() : '';
+      if (!filePath) {
+        continue;
+      }
+      allFiles.push(filePath);
+      const todoId = typeof change.todoId === 'string' ? change.todoId.trim() : '';
+      if (!todoId) {
+        continue;
+      }
+      if (!byTodo.has(todoId)) {
+        byTodo.set(todoId, new Set());
+      }
+      byTodo.get(todoId)!.add(filePath);
+    }
+
+    const byTodoList = new Map<string, string[]>();
+    for (const [todoId, files] of byTodo.entries()) {
+      byTodoList.set(todoId, Array.from(files));
+    }
+
+    return {
+      allFiles: Array.from(new Set(allFiles)),
+      byTodo: byTodoList,
+    };
+  }
+
+  private applySnapshotChangesToTodos(
+    result: AutonomousExecutionResult,
+    byTodo: Map<string, string[]>,
+  ): void {
+    if (byTodo.size === 0) {
+      return;
+    }
+
+    const applyToTodo = (todo: UnifiedTodo) => {
+      const snapshotFiles = byTodo.get(todo.id);
+      if (!snapshotFiles || snapshotFiles.length === 0) {
+        return;
+      }
+      const output = todo.output;
+      if (!output) {
+        return;
+      }
+      const merged = new Set<string>([
+        ...snapshotFiles,
+        ...(output.modifiedFiles || []),
+      ]);
+      todo.output = {
+        ...output,
+        modifiedFiles: Array.from(merged),
+      };
+    };
+
+    for (const todo of result.completedTodos) {
+      applyToTodo(todo);
+    }
+    for (const todo of result.failedTodos) {
+      applyToTodo(todo);
+    }
+  }
+
+  private mergeModifiedFiles(primary: string[], secondary: string[]): string[] {
+    if (primary.length === 0 && secondary.length === 0) {
+      return [];
+    }
+    return Array.from(new Set([...primary, ...secondary].map(file => file.trim()).filter(Boolean)));
+  }
+
+  private appendQualityWarning(result: AutonomousExecutionResult, warning: string): void {
+    if (!warning.trim()) return;
+    if (!result.verification) {
+      return;
+    }
+    if (!result.verification.warnings) {
+      result.verification.warnings = [];
+    }
+    if (!result.verification.warnings.includes(warning)) {
+      result.verification.warnings.push(warning);
+    }
   }
 
   private collectResultModifiedFiles(result: AutonomousExecutionResult): string[] {
@@ -2203,7 +2352,7 @@ Not applicable: The task itself is a single goal — execute it directly.`);
    */
   private getDependentTodos(todo: UnifiedTodo, assignment: Assignment): UnifiedTodo[] {
     return assignment.todos.filter(t =>
-      t.dependsOn.includes(todo.id) && t.status === 'pending'
+      t.dependsOn.includes(todo.id) && this.isTodoSkippable(t)
     );
   }
 
@@ -2249,9 +2398,8 @@ Not applicable: The task itself is a single goal — execute it directly.`);
   /**
    * 批准超范围 Todo
    */
-  approveTodo(todo: UnifiedTodo, note?: string): void {
-    todo.approvalStatus = 'approved';
-    todo.approvalNote = note;
+  async approveTodo(todo: UnifiedTodo, note?: string): Promise<void> {
+    await this.todoManager.approve(todo.id, note);
 
     this.emit('todoApproved', {
       todoId: todo.id,
@@ -2263,10 +2411,7 @@ Not applicable: The task itself is a single goal — execute it directly.`);
    * 拒绝超范围 Todo
    */
   async rejectTodo(todo: UnifiedTodo, reason: string): Promise<void> {
-    todo.approvalStatus = 'rejected';
-    todo.approvalNote = reason;
-    await this.todoManager.skip(todo.id);
-    todo.status = 'skipped';
+    await this.todoManager.reject(todo.id, reason);
 
     this.emit('todoRejected', {
       todoId: todo.id,
@@ -2356,9 +2501,11 @@ Not applicable: The task itself is a single goal — execute it directly.`);
           targetTodo = recoveryResult.newTodo;
         }
 
-        // 重置 Todo 状态
-        targetTodo.status = 'pending';
-        targetTodo.output = undefined;
+        await this.todoManager.resetToPending(targetTodo.id);
+        if (targetAssignment.id === assignment.id) {
+          await this.refreshAssignmentTodos(assignment);
+          targetTodo = this.getAssignmentTodoOrThrow(assignment, targetTodo.id);
+        }
 
         // 如果策略是重新执行，尝试执行（恢复路径同样注入共享上下文）
         if (decision.strategy === 'retry_same_worker' || decision.strategy === 'simplify_task') {

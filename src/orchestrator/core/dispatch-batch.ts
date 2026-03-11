@@ -775,6 +775,8 @@ export class DispatchBatch extends EventEmitter {
     for (const resolve of this.archiveResolvers) resolve();
     this.archiveResolvers = [];
     this.emit('batch:cancelled', this.id, reason, this.getEntries());
+    // 清理所有 EventEmitter listeners 防止内存泄漏
+    this.removeAllListeners();
 
     logger.info('DispatchBatch.取消', {
       batchId: this.id,
@@ -792,6 +794,8 @@ export class DispatchBatch extends EventEmitter {
     // 释放所有等待归档的 Promise
     for (const resolve of this.archiveResolvers) resolve();
     this.archiveResolvers = [];
+    // 清理所有 EventEmitter listeners 防止内存泄漏
+    this.removeAllListeners();
     logger.info('DispatchBatch.归档', {
       batchId: this.id,
       summary: this.getSummary(),

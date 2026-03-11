@@ -19,6 +19,7 @@ import { AgentType, WorkerSlot } from '../types/agent-types';
 import type { ContentBlock as StandardContentBlock } from '../protocol/message-protocol';
 import { globalEventBus } from '../events';
 import { estimateTokenCount } from '../utils/token-estimator';
+import { atomicWriteFileSync } from '../utils/atomic-write';
 
 /** 会话消息 */
 export interface SessionMessage {
@@ -126,6 +127,7 @@ function generateMessageId(): string {
  */
 export class UnifiedSessionManager {
   private sessions: Map<string, UnifiedSession> = new Map();
+  private sessionMetas: Map<string, SessionMeta> = new Map();
   private currentSessionId: string | null = null;
   private workspaceRoot: string;
   private baseDir: string;
@@ -202,6 +204,7 @@ export class UnifiedSessionManager {
     this.sessions.set(id, session);
     this.currentSessionId = id;
     this.saveSession(session);
+    this.refreshSessionMeta(session);
 
     globalEventBus.emitEvent('session:created', { sessionId: id });
     return session;
@@ -222,7 +225,7 @@ export class UnifiedSessionManager {
 
   /** 切换会话 */
   switchSession(sessionId: string): UnifiedSession | null {
-    const session = this.sessions.get(sessionId);
+    const session = this.getSession(sessionId);
     if (session) {
       this.currentSessionId = sessionId;
       return session;
@@ -232,13 +235,33 @@ export class UnifiedSessionManager {
 
   /** 获取会话 */
   getSession(sessionId: string): UnifiedSession | null {
-    return this.sessions.get(sessionId) ?? null;
+    const existing = this.sessions.get(sessionId);
+    if (existing) return existing;
+    if (this.sessionMetas.has(sessionId)) {
+      return this.loadSession(sessionId);
+    }
+    return null;
   }
 
   /** 获取所有会话（按更新时间倒序） */
   getAllSessions(): UnifiedSession[] {
     return Array.from(this.sessions.values())
       .sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  private buildSessionMeta(session: UnifiedSession): SessionMeta {
+    return {
+      id: session.id,
+      name: session.name,
+      messageCount: session.messages.filter(m => this.isUserMessage(m)).length,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      preview: this.getSessionPreview(session),
+    };
+  }
+
+  private refreshSessionMeta(session: UnifiedSession): void {
+    this.sessionMetas.set(session.id, this.buildSessionMeta(session));
   }
 
   /** 统一 role/type 语义：type=user_input 必须是 user，type=system-notice 必须是 system */
@@ -259,14 +282,8 @@ export class UnifiedSessionManager {
 
   /** 获取会话元数据列表 */
   getSessionMetas(): SessionMeta[] {
-    return this.getAllSessions().map(s => ({
-      id: s.id,
-      name: s.name,
-      messageCount: s.messages.filter(m => this.isUserMessage(m)).length,
-      createdAt: s.createdAt,
-      updatedAt: s.updatedAt,
-      preview: this.getSessionPreview(s),
-    }));
+    return Array.from(this.sessionMetas.values())
+      .sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
   /** 获取会话预览 */
@@ -308,7 +325,7 @@ export class UnifiedSessionManager {
     images?: Array<{ dataUrl: string }>,
     options?: SessionMessageAppendOptions
   ): SessionMessage {
-    const session = this.sessions.get(sessionId);
+    const session = this.getSession(sessionId);
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
     }
@@ -443,11 +460,12 @@ export class UnifiedSessionManager {
 
   /** 重命名会话 */
   renameSession(sessionId: string, name: string): boolean {
-    const session = this.sessions.get(sessionId);
+    const session = this.getSession(sessionId);
     if (session) {
       session.name = name;
       session.updatedAt = Date.now();
       this.saveSession(session);
+      this.refreshSessionMeta(session);
       return true;
     }
     return false;
@@ -681,10 +699,14 @@ export class UnifiedSessionManager {
   /** 删除会话（删除整个会话目录） */
   deleteSession(sessionId: string): boolean {
     const session = this.sessions.get(sessionId);
-    if (!session) return false;
+    const hasMeta = this.sessionMetas.has(sessionId);
+    if (!session && !hasMeta) return false;
 
     // 从内存中移除
-    this.sessions.delete(sessionId);
+    if (session) {
+      this.sessions.delete(sessionId);
+    }
+    this.sessionMetas.delete(sessionId);
 
     // 删除整个会话目录
     const sessionDir = this.getSessionDir(sessionId);
@@ -701,8 +723,11 @@ export class UnifiedSessionManager {
 
     // 如果删除的是当前会话，切换到最新的会话
     if (this.currentSessionId === sessionId) {
-      const sessions = this.getAllSessions();
-      this.currentSessionId = sessions.length > 0 ? sessions[0].id : null;
+      const metas = this.getSessionMetas();
+      this.currentSessionId = metas.length > 0 ? metas[0].id : null;
+      if (this.currentSessionId) {
+        this.getSession(this.currentSessionId);
+      }
     }
 
     globalEventBus.emitEvent('session:ended', {
@@ -714,7 +739,7 @@ export class UnifiedSessionManager {
 
   /** 结束会话（标记为完成但不删除） */
   endSession(sessionId: string): void {
-    const session = this.sessions.get(sessionId);
+    const session = this.getSession(sessionId);
     if (session) {
       session.status = 'completed';
       this.saveSession(session);
@@ -894,7 +919,8 @@ export class UnifiedSessionManager {
     this.ensureSessionDir(session.id);
     const filePath = this.getSessionFilePath(session.id);
     try {
-      fs.writeFileSync(filePath, JSON.stringify(session, null, 2), 'utf-8');
+      atomicWriteFileSync(filePath, JSON.stringify(session, null, 2));
+      this.refreshSessionMeta(session);
     } catch (error) {
       logger.error('会话.保存.失败', { sessionId: session.id, error }, LogCategory.SESSION);
       throw new Error(`Failed to save session: ${error}`);
@@ -906,6 +932,30 @@ export class UnifiedSessionManager {
     const session = this.getCurrentSession();
     if (session) {
       this.saveSession(session);
+    }
+  }
+
+  /** 加载会话元数据（不进入内存会话缓存） */
+  private loadSessionMeta(sessionId: string): SessionMeta | null {
+    const filePath = this.getSessionFilePath(sessionId);
+    if (!fs.existsSync(filePath)) {
+      return null;
+    }
+    try {
+      const data = fs.readFileSync(filePath, 'utf-8');
+      const session = JSON.parse(data) as UnifiedSession;
+      if (!this.validateSessionData(session)) {
+        logger.error('会话.元数据加载.校验_失败', { sessionId }, LogCategory.SESSION);
+        this.backupCorruptedSession(sessionId, filePath);
+        return null;
+      }
+      const meta = this.buildSessionMeta(session);
+      this.sessionMetas.set(meta.id, meta);
+      return meta;
+    } catch (e) {
+      logger.error('会话.元数据加载.失败', { sessionId, error: e }, LogCategory.SESSION);
+      this.backupCorruptedSession(sessionId, filePath);
+      return null;
     }
   }
 
@@ -931,6 +981,7 @@ export class UnifiedSessionManager {
         }
 
         this.sessions.set(session.id, session);
+        this.refreshSessionMeta(session);
         return session;
       } catch (e) {
         logger.error('会话.加载.失败', { sessionId, error: e }, LogCategory.SESSION);
@@ -973,17 +1024,26 @@ export class UnifiedSessionManager {
 
     // 遍历 sessions 目录下的所有子目录
     const entries = fs.readdirSync(this.baseDir, { withFileTypes: true });
+    const metas: SessionMeta[] = [];
     for (const entry of entries) {
       if (entry.isDirectory()) {
         const sessionId = entry.name;
-        this.loadSession(sessionId);
+        const meta = this.loadSessionMeta(sessionId);
+        if (meta) {
+          metas.push(meta);
+        }
       }
     }
 
     // 设置当前会话为最新的会话
-    const sessions = this.getAllSessions();
-    if (sessions.length > 0) {
-      this.currentSessionId = sessions[0].id;
+    if (metas.length > 0) {
+      metas.sort((a, b) => b.updatedAt - a.updatedAt);
+      this.currentSessionId = metas[0].id;
+      // 预加载最近的会话，避免首次切换卡顿
+      const preloadCount = Math.min(this.MAX_SESSIONS_IN_MEMORY, metas.length);
+      for (let i = 0; i < preloadCount; i += 1) {
+        this.loadSession(metas[i].id);
+      }
     }
   }
 

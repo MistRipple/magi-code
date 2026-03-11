@@ -86,6 +86,7 @@ const DEFAULT_CONFIG: PipelineConfig = {
   retentionTime: 5 * 60 * 1000,
   debug: false,
 };
+const STREAM_STALE_TIMEOUT_MS = 30 * 60 * 1000;
 
 export class MessagePipeline {
   private bus: EventEmitter;
@@ -636,9 +637,50 @@ export class MessagePipeline {
       try {
         const now = Date.now();
         const expireTime = now - this.config.retentionTime;
-        const msgToDelete: string[] = [], bufToDelete: string[] = [], reqToDelete: string[] = [];
+        const msgToDelete: string[] = [], bufToDelete: string[] = [], reqToDelete: string[] = [], staleToFinalize: string[] = [];
         const cardToDelete = new Set<string>();
-        for (const [id, state] of this.messageStates) { if (state.completed && state.lastSentAt < expireTime) msgToDelete.push(id); }
+        for (const [id, state] of this.messageStates) {
+          if (state.completed && state.lastSentAt < expireTime) {
+            msgToDelete.push(id);
+            continue;
+          }
+          if (!state.completed) {
+            const lastActivity = Math.max(state.lastStreamAt, state.lastSentAt, state.createdAt);
+            if (now - lastActivity > STREAM_STALE_TIMEOUT_MS) {
+              staleToFinalize.push(id);
+            }
+          }
+        }
+        for (const id of staleToFinalize) {
+          const state = this.messageStates.get(id);
+          if (!state || state.completed) continue;
+          const message = state.message;
+          const finalSeq = state.lastCardStreamSeq || 0;
+          if (message) {
+            const completed = this.ensureContentBlocksFromBuffer({
+              ...message,
+              lifecycle: MessageLifecycle.CANCELLED,
+              updatedAt: now,
+            });
+            const completedMessage: StandardMessage = {
+              ...completed,
+              metadata: {
+                ...(completed.metadata || {}),
+                finalStreamSeq: completed.metadata?.cardStreamSeq || finalSeq,
+              },
+            };
+            this.markMessageComplete(id, completedMessage, now);
+            this.recordRequestMessage(completedMessage);
+            this.emitByCategory(completedMessage);
+            this.safeEmit('unified:complete', completedMessage);
+          } else {
+            state.completed = true;
+            state.lastSentAt = now;
+          }
+        }
+        if (staleToFinalize.length > 0) {
+          this.checkAndUpdateProcessingState();
+        }
         for (const id of msgToDelete) {
           const state = this.messageStates.get(id);
           if (state?.cardId) {

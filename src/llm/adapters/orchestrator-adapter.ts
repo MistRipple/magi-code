@@ -1821,6 +1821,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     }
 
     const terminalRequiredTodos = requiredTodos.filter(todo => terminalStatuses.has(todo.status)).length;
+    const runningRequired = requiredTodos.filter(todo => todo.status === 'running').length;
     const acceptedCriteria = requiredTodos.filter(todo => todo.status === 'completed').length;
     const failedRequired = requiredTodos.filter(todo => todo.status === 'failed').length;
     const runningOrPendingRequired = requiredTodos.filter(todo => !terminalStatuses.has(todo.status)).length;
@@ -1863,6 +1864,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       requiredTotal: requiredTodos.length,
       failedRequired,
       runningOrPendingRequired,
+      runningRequired,
       sourceEventIds: [],
       computedAt: now,
     };
@@ -1880,6 +1882,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       snapshot.runningOrPendingRequired = Math.max(0, todos.length - fallbackTerminal);
       snapshot.failedRequired = todos.filter(todo => todo.status === 'failed').length;
       snapshot.progressVector.acceptedCriteria = todos.filter(todo => todo.status === 'completed').length;
+      snapshot.runningRequired = todos.filter(todo => todo.status === 'running').length;
     }
 
     return {

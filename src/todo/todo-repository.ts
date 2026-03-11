@@ -19,6 +19,7 @@ import {
 import { WorkerSlot } from '../types';
 import * as fs from 'fs';
 import * as path from 'path';
+import { atomicWriteFileSync } from '../utils/atomic-write';
 
 // ============================================================================
 // 事务接口
@@ -187,7 +188,7 @@ export class FileTodoRepository implements TodoRepository {
         (todo) => todo.sessionId === sessionId
       );
       const data = JSON.stringify(todos, null, 2);
-      fs.writeFileSync(this.getSessionTodosFile(sessionId), data, 'utf-8');
+      atomicWriteFileSync(this.getSessionTodosFile(sessionId), data);
     }
   }
 
@@ -306,20 +307,35 @@ export class FileTodoRepository implements TodoRepository {
   // ===== 事务 =====
 
   async beginTransaction(): Promise<TodoTransaction> {
+    // 深拷贝 cache，避免事务期间共享引用导致快照被污染
+    const snapshot = new Map<string, UnifiedTodo>();
+    for (const [id, todo] of this.cache) {
+      snapshot.set(id, { ...todo });
+    }
     return {
       id: `tx-${Date.now()}`,
       startedAt: Date.now(),
-      snapshot: new Map(this.cache),
+      snapshot,
     };
   }
 
-  async commitTransaction(tx: TodoTransaction): Promise<void> {
+  async commitTransaction(_tx: TodoTransaction): Promise<void> {
     await this.persist();
   }
 
   async rollbackTransaction(tx: TodoTransaction): Promise<void> {
     this.cache = new Map(tx.snapshot);
-    this.dirtySessions.clear();
+    // 将回滚后的状态持久化到磁盘，保证内存与磁盘一致
+    const allSessionIds = new Set<string>();
+    for (const todo of this.cache.values()) {
+      if (todo.sessionId) {
+        allSessionIds.add(todo.sessionId);
+      }
+    }
+    for (const sessionId of allSessionIds) {
+      this.dirtySessions.add(sessionId);
+    }
+    await this.persist();
   }
 
   // ===== 维护 =====

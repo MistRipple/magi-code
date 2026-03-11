@@ -855,6 +855,7 @@
   "dispatch.errors.todoManagerNotInitializedGetTodos": "TodoManager 未初始化，无法获取 Todos",
   "dispatch.errors.todoManagerNotInitializedUpdateTodo": "TodoManager 未初始化，无法更新 Todo",
   "dispatch.errors.updateTodoCannotResetPending": "Todo {todoId} 当前状态={currentStatus}，不允许重置为 pending",
+  "dispatch.errors.updateTodoCannotResetPendingRunning": "Todo {todoId} 当前状态=running，需要显式 force_reset 才能重置为 pending",
   "dispatch.errors.updateTodoCannotSetSkipped": "Todo {todoId} 当前状态={currentStatus}，不允许更新为 skipped",
   "dispatch.errors.updateTodoInvalidStatus": "Todo {todoId} status={status} 非法，仅支持 pending/skipped",
   "dispatch.errors.updateTodoMissingFields": "Todo {todoId} 缺少可执行更新字段（status/content）",

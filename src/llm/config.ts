@@ -15,6 +15,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { atomicWriteFileSync } from '../utils/atomic-write';
 import { LLMConfig, LLMProvider, WorkerSlot } from '../types/agent-types';
 import { FullLLMConfig, WorkerLLMConfig } from './types';
 import { logger, LogCategory } from '../logging';
@@ -68,7 +69,7 @@ export class LLMConfigLoader {
     this.ensureConfigDir();
 
     try {
-      fs.writeFileSync(this.LLM_CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+      atomicWriteFileSync(this.LLM_CONFIG_FILE, JSON.stringify(config, null, 2));
       logger.info('LLM config saved', { path: this.LLM_CONFIG_FILE }, LogCategory.LLM);
     } catch (error) {
       logger.error('Failed to save LLM config', { error, path: this.LLM_CONFIG_FILE }, LogCategory.LLM);
@@ -482,7 +483,7 @@ export class LLMConfigLoader {
 
     try {
       const config = { servers };
-      fs.writeFileSync(this.MCP_CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+      atomicWriteFileSync(this.MCP_CONFIG_FILE, JSON.stringify(config, null, 2));
       logger.info('MCP config saved', { count: servers.length }, LogCategory.LLM);
     } catch (error) {
       logger.error('Failed to save MCP config', { error }, LogCategory.LLM);
@@ -550,7 +551,7 @@ export class LLMConfigLoader {
       const { normalized, changed } = this.normalizeSkillsConfig(config);
       if (changed) {
         try {
-          fs.writeFileSync(this.SKILLS_CONFIG_FILE, JSON.stringify(normalized, null, 2), 'utf-8');
+          atomicWriteFileSync(this.SKILLS_CONFIG_FILE, JSON.stringify(normalized, null, 2));
           logger.info('Skills config auto-cleaned', {}, LogCategory.LLM);
         } catch (error) {
           logger.error('Failed to auto-clean Skills config', { error }, LogCategory.LLM);
@@ -570,7 +571,7 @@ export class LLMConfigLoader {
     this.ensureConfigDir();
     try {
       const { normalized } = this.normalizeSkillsConfig(config);
-      fs.writeFileSync(this.SKILLS_CONFIG_FILE, JSON.stringify(normalized, null, 2), 'utf-8');
+      atomicWriteFileSync(this.SKILLS_CONFIG_FILE, JSON.stringify(normalized, null, 2));
       logger.info('Skills config saved', {}, LogCategory.LLM);
     } catch (error) {
       logger.error('Failed to save Skills config', { error }, LogCategory.LLM);

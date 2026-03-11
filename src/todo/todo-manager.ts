@@ -608,7 +608,7 @@ export class TodoManager extends EventEmitter {
   /**
    * 跳过 Todo
    */
-  async skip(todoId: string): Promise<void> {
+  async skip(todoId: string, reason?: string): Promise<void> {
     const todo = await this.get(todoId);
     if (!todo) throw new Error(`Todo not found: ${todoId}`);
 
@@ -624,6 +624,7 @@ export class TodoManager extends EventEmitter {
       ...todo,
       status: 'skipped',
       completedAt: Date.now(),
+      ...(reason !== undefined ? { blockedReason: reason } : {}),
     };
     await this.persistTodo(nextTodo);
     this.timeoutChecker.remove(todoId);
@@ -676,7 +677,7 @@ export class TodoManager extends EventEmitter {
    * 与 retry() 不同，此方法接受 completed / failed / skipped 三种状态，
    * 且不增加 retryCount（因为这是外部治理层发起的重试，不是 Todo 自身的错误恢复）。
    */
-  async resetToPending(todoId: string): Promise<void> {
+  async resetToPending(todoId: string, options?: { force?: boolean }): Promise<void> {
     const todo = await this.get(todoId);
     if (!todo) {
       throw new Error(`Todo not found: ${todoId}`);
@@ -686,8 +687,11 @@ export class TodoManager extends EventEmitter {
       return;
     }
 
+    const forceReset = options?.force === true;
     if (todo.status !== 'completed' && todo.status !== 'failed' && todo.status !== 'skipped') {
-      throw new Error(`Cannot reset todo to pending from status: ${todo.status}`);
+      if (!(forceReset && todo.status === 'running')) {
+        throw new Error(`Cannot reset todo to pending from status: ${todo.status}`);
+      }
     }
 
     const nextTodo: UnifiedTodo = {
@@ -696,6 +700,7 @@ export class TodoManager extends EventEmitter {
       completedAt: undefined,
       output: undefined,
       error: undefined,
+      blockedReason: undefined,
       progress: 0,
     };
 

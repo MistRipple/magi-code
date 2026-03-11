@@ -10,6 +10,7 @@ import { WorkerSlot } from '../../types/agent-types';
 import { WorkerAssignments } from './types';
 import { CATEGORY_DEFINITIONS } from './builtin/category-definitions';
 import { DEFAULT_ASSIGNMENTS, WORKER_ASSIGNMENTS_VERSION } from './builtin/default-assignments';
+import { atomicWriteFileSync } from '../../utils/atomic-write';
 
 const WORKERS: WorkerSlot[] = ['claude', 'codex', 'gemini'];
 
@@ -69,7 +70,7 @@ export class WorkerAssignmentStorage {
       fs.mkdirSync(this.CONFIG_DIR, { recursive: true });
     }
 
-    fs.writeFileSync(this.ASSIGNMENTS_FILE, JSON.stringify(assignments, null, 2), 'utf-8');
+    atomicWriteFileSync(this.ASSIGNMENTS_FILE, JSON.stringify(assignments, null, 2));
     logger.info('Worker assignments saved', { path: this.ASSIGNMENTS_FILE }, LogCategory.ORCHESTRATOR);
   }
 

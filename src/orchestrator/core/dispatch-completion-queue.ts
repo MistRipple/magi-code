@@ -90,8 +90,15 @@ export class DispatchCompletionQueue {
 
   private waitForSignal(timeoutMs: number): Promise<void> {
     return new Promise<void>(resolve => {
-      this.completionResolvers.push(resolve);
-      setTimeout(resolve, timeoutMs);
+      let settled = false;
+      const wrappedResolve = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      this.completionResolvers.push(wrappedResolve);
+      const timer = setTimeout(wrappedResolve, timeoutMs);
     });
   }
 

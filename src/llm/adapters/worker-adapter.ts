@@ -402,20 +402,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           break;
         }
 
-        // 总轮次安全网：防止任何场景下的无限循环
-        if (round >= sc.maxTotalRounds) {
-          if (!forceNoToolsNextRound) {
-            forceNoToolsNextRound = true;
-            logger.warn(`${this.agent} 达到总轮次上限，触发强制总结`, { round }, LogCategory.LLM);
-            this.conversationHistory.push({
-              role: 'user',
-              content: `[System] 你已执行 ${round} 轮工具调用，达到系统上限。工具调用能力已被收回。请立即总结当前进展和执行结果。`,
-            });
-            continue; // 进入下一轮（无工具），让模型产出总结
-          }
-          logger.warn(`${this.agent} 达到总轮次上限`, { round }, LogCategory.LLM);
-          finalText = finalText || `已执行 ${round} 轮工具调用，达到安全上限，任务终止。`;
-          break;
+        // 总轮次安全网：不做硬中断，仅强制进入“无工具总结”模式
+        if (round >= sc.maxTotalRounds && !forceNoToolsNextRound) {
+          forceNoToolsNextRound = true;
+          logger.warn(`${this.agent} 达到总轮次上限，触发强制总结`, { round }, LogCategory.LLM);
+          this.conversationHistory.push({
+            role: 'user',
+            content: `[System] 你已执行 ${round} 轮工具调用，达到系统上限。工具调用能力已被收回。请立即总结当前进展和执行结果。`,
+          });
         }
         if (round === MAX_ROUNDS_FINAL_WARN) {
           this.conversationHistory.push({

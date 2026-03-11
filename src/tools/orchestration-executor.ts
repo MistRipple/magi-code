@@ -201,6 +201,7 @@ export type UpdateTodoHandler = (params: {
     todoId: string;
     status?: UpdateTodoStatus;
     content?: string;
+    forceReset?: boolean;
   }>;
 }) => Promise<{ success: boolean; error?: string }>;
 
@@ -1102,7 +1103,8 @@ export class OrchestrationExecutor {
                   enum: OrchestrationExecutor.UPDATE_TODO_STATUS_ENUM,
                   description: '更改状态：pending 表示重置为待执行，skipped 表示跳过。completed 仅允许执行链自动推进。',
                 },
-                content: { type: 'string', description: '更新任务描述' }
+                content: { type: 'string', description: '更新任务描述' },
+                force_reset: { type: 'boolean', description: '当 status=pending 且 Todo 正在运行时，强制中断并重置为 pending。' }
               },
               required: ['todo_id']
             }
@@ -1119,7 +1121,9 @@ export class OrchestrationExecutor {
   }
 
   private async executeUpdateTodo(toolCall: ToolCall): Promise<ToolResult> {
-    const args = toolCall.arguments as { updates: Array<{ todo_id: string; status?: UpdateTodoStatus | string; content?: string }> };
+    const args = toolCall.arguments as {
+      updates: Array<{ todo_id: string; status?: UpdateTodoStatus | string; content?: string; force_reset?: boolean }>;
+    };
     try {
       if (!args.updates || !Array.isArray(args.updates)) {
         return {
@@ -1143,7 +1147,8 @@ export class OrchestrationExecutor {
       const formattedUpdates = args.updates.map(u => ({
         todoId: u.todo_id,
         status: u.status as UpdateTodoStatus | undefined,
-        content: u.content
+        content: u.content,
+        forceReset: u.force_reset === true,
       }));
       const result = await this.updateTodoHandler({
         updates: formattedUpdates

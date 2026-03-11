@@ -12,6 +12,7 @@ import { FileSnapshot, PendingChange } from './types';
 import { AgentType } from './types/agent-types';
 import { UnifiedSessionManager, FileSnapshotMeta } from './session';
 import { globalEventBus } from './events';
+import { atomicWriteFileSync } from './utils/atomic-write';
 
 /** 生成唯一 ID */
 function generateId(): string {
@@ -39,8 +40,8 @@ export class SnapshotManager {
   private snapshotContentCache: Map<string, string> = new Map();
   private readonly MAX_CACHE_SIZE = 100; // 最大缓存条目数
 
-  // 操作锁（防止并发写入冲突）
-  private operationLocks: Set<string> = new Set();
+  // 排队式操作锁：并发请求排队等待，不再静默丢弃
+  private operationLocks: Map<string, Promise<void>> = new Map();
 
   constructor(sessionManager: UnifiedSessionManager, workspaceRoot: string) {
     this.sessionManager = sessionManager;
@@ -48,49 +49,44 @@ export class SnapshotManager {
   }
 
   /**
-   * 获取操作锁
-   * @returns 是否成功获取锁
+   * 获取排队式操作锁
+   * 与 FileMutex 同理：后续请求排队等待前一个完成，不再静默跳过
    */
-  private acquireLock(key: string): boolean {
-    if (this.operationLocks.has(key)) {
-      return false;
-    }
-    this.operationLocks.add(key);
-    return true;
-  }
-
-  /**
-   * 释放操作锁
-   */
-  private releaseLock(key: string): void {
-    this.operationLocks.delete(key);
+  private async acquireLock(key: string): Promise<() => void> {
+    let unlockNext: () => void;
+    const nextLock = new Promise<void>((resolve) => {
+      unlockNext = resolve;
+    });
+    const currentLock = this.operationLocks.get(key) || Promise.resolve();
+    this.operationLocks.set(key, currentLock.then(() => nextLock));
+    await currentLock;
+    return () => {
+      unlockNext!();
+      // 如果队列后方没有等待者，清理 Map 条目防止内存泄漏
+      if (this.operationLocks.get(key) === nextLock) {
+        this.operationLocks.delete(key);
+      }
+    };
   }
 
   /**
    * 原子性写入快照（写文件 + 更新元数据）
    * 如果任何步骤失败，回滚所有更改
    */
-  private atomicWriteSnapshot(
+  private async atomicWriteSnapshot(
     sessionId: string,
     snapshotId: string,
     snapshotFile: string,
     content: string,
     meta: FileSnapshotMeta
-  ): SnapshotOperationResult {
+  ): Promise<SnapshotOperationResult> {
     const lockKey = `snapshot:${sessionId}:${meta.filePath}`;
-
-    // 尝试获取锁
-    if (!this.acquireLock(lockKey)) {
-      return {
-        success: false,
-        error: `Operation in progress for file: ${meta.filePath}`,
-      };
-    }
+    const releaseLock = await this.acquireLock(lockKey);
 
     try {
       // 步骤 1: 写入快照文件
       this.ensureSnapshotDir(sessionId);
-      fs.writeFileSync(snapshotFile, content, 'utf-8');
+      atomicWriteFileSync(snapshotFile, content);
 
       // 步骤 2: 更新元数据
       try {
@@ -117,27 +113,21 @@ export class SnapshotManager {
         error: error instanceof Error ? error.message : String(error),
       };
     } finally {
-      this.releaseLock(lockKey);
+      releaseLock();
     }
   }
 
   /**
    * 原子性删除快照（删除文件 + 更新元数据）
    */
-  private atomicDeleteSnapshot(
+  private async atomicDeleteSnapshot(
     sessionId: string,
     snapshotId: string,
     snapshotFile: string,
     filePath: string
-  ): SnapshotOperationResult {
+  ): Promise<SnapshotOperationResult> {
     const lockKey = `snapshot:${sessionId}:${filePath}`;
-
-    if (!this.acquireLock(lockKey)) {
-      return {
-        success: false,
-        error: `Operation in progress for file: ${filePath}`,
-      };
-    }
+    const releaseLock = await this.acquireLock(lockKey);
 
     // 备份内容以便回滚
     let backupContent: string | null = null;
@@ -162,7 +152,7 @@ export class SnapshotManager {
         // 元数据删除失败，尝试恢复文件
         if (backupContent !== null) {
           try {
-            fs.writeFileSync(snapshotFile, backupContent, 'utf-8');
+            atomicWriteFileSync(snapshotFile, backupContent);
           } catch {
             logger.error('快照.原子删除.回滚失败', { snapshotFile }, LogCategory.RECOVERY);
           }
@@ -181,7 +171,7 @@ export class SnapshotManager {
         error: error instanceof Error ? error.message : String(error),
       };
     } finally {
-      this.releaseLock(lockKey);
+      releaseLock();
     }
   }
 
@@ -478,7 +468,7 @@ export class SnapshotManager {
   }
 
   /** 创建文件快照（Mission 版本） */
-  createSnapshotForMission(
+  async createSnapshotForMission(
     filePath: string,
     sessionId: string,
     missionId: string,
@@ -486,7 +476,7 @@ export class SnapshotManager {
     todoId: string,
     workerId: string,
     reason?: string
-  ): FileSnapshot | null {
+  ): Promise<FileSnapshot | null> {
     if (!filePath || typeof filePath !== 'string' || filePath.trim().length === 0) {
       throw new Error('Snapshot filePath is required');
     }
@@ -557,7 +547,7 @@ export class SnapshotManager {
 
     // 使用原子操作保存快照
     const snapshotFile = path.join(this.getSnapshotDir(session.id), `${snapshotId}.snapshot`);
-    const result = this.atomicWriteSnapshot(
+    const result = await this.atomicWriteSnapshot(
       session.id,
       snapshotId,
       snapshotFile,
@@ -900,7 +890,7 @@ export class SnapshotManager {
     };
     this.ensureSnapshotDir(session.id);
     const newSnapshotFile = path.join(this.getSnapshotDir(session.id), `${newSnapshotId}.snapshot`);
-    fs.writeFileSync(newSnapshotFile, currentContent, 'utf-8');
+    atomicWriteFileSync(newSnapshotFile, currentContent);
     this.addToCache(this.snapshotContentCache, newSnapshotFile, currentContent);
     this.sessionManager.addSnapshot(session.id, newSnapshotMeta);
 

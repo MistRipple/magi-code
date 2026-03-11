@@ -144,6 +144,12 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   private snapshotContextMap: Map<string, SnapshotContext> = new Map();
   private todoModifiedFilesMap: Map<string, Set<string>> = new Map();
   private executionContextStorage = new AsyncLocalStorage<ToolExecutionContext>();
+  /**
+   * dispatch 级并行文件写入追踪表
+   * key: 归一化文件路径, value: 修改过该文件的 dispatch taskId 集合
+   * 用于 file_create/file_insert 的并行写入冲突检测
+   */
+  private dispatchFileWriteTracker = new Map<string, Set<string>>();
   /** 外部命令可能改动文件时递增，用于判断 file_view 新鲜度 */
   private workspaceMutationEpoch = 0;
   /** 文件路径最近一次 file_view/file_edit/file_insert/file_create 对齐到的 epoch */
@@ -178,6 +184,12 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       allowWeb: true,
     };
     this.authorizationCallback = this.createDefaultAuthorizationCallback();
+
+    // 注册并行写入冲突检测（不依赖 snapshotManager，始终生效）
+    this.fileExecutor.setParallelWriteCheckCallback((filePath) => this.checkParallelFileWriteConflict(filePath));
+    // 注册基础的写入后追踪回调（dispatch 文件修改追踪）
+    // 当 snapshotManager 注入后，injectSnapshotCallbacks 会覆盖 afterWriteCallback 并包含此逻辑
+    this.fileExecutor.setAfterWriteCallback((filePath) => this.recordDispatchFileWrite(filePath));
 
     this.registerDefaultLlmEditHandler();
   }
@@ -345,6 +357,56 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     this.todoModifiedFilesMap.set(key, files);
   }
 
+  // ============================================================================
+  // dispatch 级并行文件写入追踪
+  // ============================================================================
+
+  /**
+   * 记录 dispatch 任务写入的文件
+   * 在每次 file_create/file_edit/file_insert 成功写入后调用
+   */
+  private recordDispatchFileWrite(filePath: string): void {
+    const context = this.getActiveSnapshotContext();
+    // 仅追踪 Worker 执行上下文（编排者直接操作不参与冲突检测）
+    if (!context?.assignmentId) return;
+
+    const normalizedPath = this.workspaceRoots.toDisplayPath(filePath).trim();
+    if (!normalizedPath) return;
+
+    const writers = this.dispatchFileWriteTracker.get(normalizedPath) || new Set<string>();
+    writers.add(context.assignmentId);
+    this.dispatchFileWriteTracker.set(normalizedPath, writers);
+  }
+
+  /**
+   * 检测并行文件写入冲突
+   * 当 file_create/file_insert 尝试覆写已有文件时，
+   * 检查该文件是否已被同批次中其他 dispatch 任务修改过。
+   */
+  private checkParallelFileWriteConflict(filePath: string): { blocked: true; conflictTasks: string[] } | null {
+    const context = this.getActiveSnapshotContext();
+    if (!context?.assignmentId) return null;
+
+    const normalizedPath = this.workspaceRoots.toDisplayPath(filePath).trim();
+    if (!normalizedPath) return null;
+
+    const writers = this.dispatchFileWriteTracker.get(normalizedPath);
+    if (!writers || writers.size === 0) return null;
+
+    const otherTasks = Array.from(writers).filter(taskId => taskId !== context.assignmentId);
+    if (otherTasks.length === 0) return null;
+
+    return { blocked: true, conflictTasks: otherTasks };
+  }
+
+  /**
+   * 清空 dispatch 文件写入追踪表
+   * 在新执行周期开始时调用（resetForNewExecutionCycle）
+   */
+  clearDispatchFileWriteTracker(): void {
+    this.dispatchFileWriteTracker.clear();
+  }
+
   /**
    * 向 FileExecutor 和 RemoveFilesExecutor 注入快照回调
    */
@@ -354,7 +416,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     const snapshotManager = this.snapshotManager;
     const self = this;
 
-    const beforeWriteCallback = (filePath: string) => {
+    const beforeWriteCallback = async (filePath: string) => {
       // 从 Map 中获取活跃的快照上下文（多 Worker 并行安全）
       const context = self.getActiveSnapshotContext();
       if (!context) {
@@ -362,7 +424,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         return;
       }
       try {
-        snapshotManager.createSnapshotForMission(
+        await snapshotManager.createSnapshotForMission(
           filePath,
           context.sessionId,
           context.missionId,
@@ -385,6 +447,8 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       if (context?.workerId && context.todoId) {
         self.recordTodoModifiedFile(context.workerId, context.todoId, filePath);
       }
+      // dispatch 级文件写入追踪（并行冲突检测基础数据）
+      self.recordDispatchFileWrite(filePath);
       globalEventBus.emitEvent('snapshot:changed', {
         data: {
           filePath,
@@ -398,6 +462,8 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
     this.fileExecutor.setBeforeWriteCallback(beforeWriteCallback);
     this.fileExecutor.setAfterWriteCallback(afterWriteCallback);
+    // 注册并行写入冲突检测回调（file_create/file_insert 覆写已有文件时触发）
+    this.fileExecutor.setParallelWriteCheckCallback((filePath) => self.checkParallelFileWriteConflict(filePath));
     this.removeFilesExecutor.setBeforeWriteCallback(beforeWriteCallback);
     this.removeFilesExecutor.setAfterWriteCallback(afterWriteCallback);
   }

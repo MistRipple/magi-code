@@ -22,6 +22,7 @@ import type { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import { ContextManager } from '../../context/context-manager';
 import { logger, LogCategory } from '../../logging';
 import { TodoManager } from '../../todo';
+import type { SnapshotManager } from '../../snapshot-manager';
 import type { UnifiedTodo } from '../../todo/types';
 
 // ============================================================================
@@ -85,6 +86,7 @@ export class MissionOrchestrator extends EventEmitter {
   private todoManager?: TodoManager;
   private todoManagerInitPromise?: Promise<TodoManager>;
   private currentMissionId: string | null = null;
+  private snapshotManager?: SnapshotManager;
 
   constructor(
     private profileLoader: ProfileLoader,
@@ -93,11 +95,12 @@ export class MissionOrchestrator extends EventEmitter {
     contextManager: ContextManager,
     storage?: MissionStorageManager,
     private workspaceRoot?: string,
-    _snapshotManager?: unknown,
+    snapshotManager?: SnapshotManager,
   ) {
     super();
     this.contextManager = contextManager;
     this.storage = storage || new MissionStorageManager();
+    this.snapshotManager = snapshotManager;
     this.setupStorageListeners();
   }
 
@@ -206,7 +209,8 @@ export class MissionOrchestrator extends EventEmitter {
         this.profileLoader,
         this.guidanceInjector,
         this.todoManager,
-        sharedContextDeps
+        sharedContextDeps,
+        this.snapshotManager
       );
       this.workers.set(workerSlot, worker);
 

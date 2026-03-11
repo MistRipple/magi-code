@@ -10,6 +10,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { atomicWriteFileSync } from '../utils/atomic-write';
 import { LocaleCode, DEFAULT_LOCALE } from '../i18n/types';
 
 /**
@@ -282,7 +283,7 @@ export class ConfigManager {
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
-      fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), 'utf-8');
+      atomicWriteFileSync(this.configPath, JSON.stringify(this.config, null, 2));
     } catch (error) {
       console.error('Failed to save config:', error);
     }

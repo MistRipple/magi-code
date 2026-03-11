@@ -13,6 +13,7 @@
 
 import { logger, LogCategory } from '../../logging';
 import { t } from '../../i18n';
+import { raceWithTimeout } from '../../utils/race-with-timeout';
 import type { WorkerSlot } from '../../types';
 import type { TokenUsage } from '../../types/agent-types';
 import type { IAdapterFactory } from '../../adapters/adapter-factory-interface';
@@ -153,7 +154,6 @@ export class DispatchManager {
   private static readonly HEARTBEAT_INTERVAL_MS = 10_000;
   private static readonly LEASE_TTL_MS = 60_000;
   private static readonly LEASE_WATCH_INTERVAL_MS = 2_000;
-  private static readonly EXECUTION_TIMEOUT_MS = 20 * 60 * 1000;
 
   // Phase B+ 中间调用频率限制：按 batch 隔离，避免跨批次互相污染
   private phaseBPlusTimestamps = new Map<string, number>();
@@ -323,6 +323,8 @@ export class DispatchManager {
     this.clearAllProtocolStates();
     this.clearDispatchScheduleTimers();
     this.clearResumeContext();
+    // 清空 dispatch 文件写入追踪表，避免跨执行周期的误判
+    this.deps.adapterFactory.getToolManager().clearDispatchFileWriteTracker();
   }
 
   private resolveDispatchRouting(
@@ -947,16 +949,6 @@ export class DispatchManager {
           }
 
           const allowedStatus = new Set<UpdateTodoStatus>(['pending', 'skipped']);
-          const pendingAllowedSource = new Set(['pending', 'completed', 'failed', 'skipped']);
-          const skippedAllowedSource = new Set(['pending', 'blocked', 'ready', 'running', 'skipped']);
-
-          type UpdatePlan = {
-            todoId: string;
-            status?: UpdateTodoStatus;
-            content?: string;
-          };
-
-          const plans: UpdatePlan[] = [];
 
           for (const update of params.updates) {
             if (!update.todoId) {
@@ -968,50 +960,56 @@ export class DispatchManager {
             if (!hasStatus && !hasContent) {
               throw new Error(t('dispatch.errors.updateTodoMissingFields', { todoId: update.todoId }));
             }
-
             if (update.status !== undefined && !allowedStatus.has(update.status as UpdateTodoStatus)) {
               throw new Error(t('dispatch.errors.updateTodoInvalidStatus', {
                 todoId: update.todoId,
                 status: update.status,
               }));
             }
-
-            const todo = await todoManager.get(update.todoId);
-            if (!todo) {
-              throw new Error(`Todo not found: ${update.todoId}`);
-            }
-
-            const targetStatus = update.status as UpdateTodoStatus | undefined;
-            if (targetStatus === 'pending' && !pendingAllowedSource.has(todo.status)) {
-              throw new Error(t('dispatch.errors.updateTodoCannotResetPending', {
-                todoId: update.todoId,
-                currentStatus: todo.status,
-              }));
-            }
-
-            if (targetStatus === 'skipped' && !skippedAllowedSource.has(todo.status)) {
-              throw new Error(t('dispatch.errors.updateTodoCannotSetSkipped', {
-                todoId: update.todoId,
-                currentStatus: todo.status,
-              }));
-            }
-
-            plans.push({
-              todoId: update.todoId,
-              status: targetStatus,
-              content: update.content,
-            });
           }
 
-          for (const plan of plans) {
-            if (plan.content !== undefined) {
-              await todoManager.update(plan.todoId, { content: plan.content });
+          for (const update of params.updates) {
+            if (update.content !== undefined) {
+              await todoManager.update(update.todoId, { content: update.content });
             }
 
-            if (plan.status === 'pending') {
-              await todoManager.resetToPending(plan.todoId);
-            } else if (plan.status === 'skipped') {
-              await todoManager.skip(plan.todoId);
+            if (update.status === 'pending') {
+              const forceReset = update.forceReset === true;
+              if (forceReset) {
+                const todo = await todoManager.get(update.todoId);
+                if (!todo) {
+                  throw new Error(`Todo not found: ${update.todoId}`);
+                }
+                if (todo.status === 'running') {
+                  const activeAssignment = todo.assignmentId ? this.activeAssignments.get(todo.assignmentId) : undefined;
+                  if (!activeAssignment) {
+                    logger.warn('编排工具.update_todo.强制重置运行中Todo但Assignment未激活', {
+                      todoId: update.todoId,
+                      assignmentId: todo.assignmentId,
+                      workerId: todo.workerId,
+                    }, LogCategory.ORCHESTRATOR);
+                  } else if (activeAssignment.workerId !== todo.workerId) {
+                    logger.warn('编排工具.update_todo.强制重置Todo但Worker不匹配', {
+                      todoId: update.todoId,
+                      assignmentId: todo.assignmentId,
+                      workerId: todo.workerId,
+                      activeWorkerId: activeAssignment.workerId,
+                    }, LogCategory.ORCHESTRATOR);
+                  }
+                  if (todo.workerId) {
+                    await this.deps.adapterFactory.interrupt(todo.workerId).catch((error: any) => {
+                      logger.warn('编排工具.update_todo.强制中断Worker失败', {
+                        todoId: update.todoId,
+                        workerId: todo.workerId,
+                        error: error?.message || String(error),
+                      }, LogCategory.ORCHESTRATOR);
+                    });
+                  }
+                }
+              }
+              await todoManager.resetToPending(update.todoId, { force: forceReset });
+            } else if (update.status === 'skipped') {
+              await todoManager.skip(update.todoId);
             }
           }
           return { success: true };
@@ -1188,10 +1186,11 @@ export class DispatchManager {
       });
 
       // 计算治理开关（governance = 'auto'）
-      const hasFiles = (files && files.length > 0) || false;
-      const enableWriteGovernance = hasFiles && requiresModification;
       const snapshotManager = this.deps.getSnapshotManager();
       const contextManager = this.deps.getContextManager();
+      const hasFiles = (files && files.length > 0) || false;
+      const enableWriteGovernance = hasFiles && requiresModification;
+      const enableSnapshot = requiresModification && snapshotManager != null;
 
       // 通过 WorkerPipeline 统一执行
       this.activeAssignments.set(taskId, assignment);
@@ -1219,7 +1218,7 @@ export class DispatchManager {
           resumeSessionId,
           resumePrompt,
           // 治理开关（仅写任务启用强制写入相关治理）
-          enableSnapshot: enableWriteGovernance && snapshotManager != null,
+          enableSnapshot,
           enableLSP: enableWriteGovernance,
           enableTargetEnforce: enableWriteGovernance,
           enableContextUpdate: contextManager != null,
@@ -1771,7 +1770,7 @@ export class DispatchManager {
       const summaryPrompt = `${buildDispatchSummaryPrompt(userPrompt, entries)}\n\n${this.buildAuditPromptAppendix(finalAuditOutcome)}`;
 
       const PHASE_C_TIMEOUT = 2 * 60 * 1000; // 2 分钟
-      const response = await Promise.race([
+      const response = await raceWithTimeout(
         this.deps.adapterFactory.sendMessage(
           'orchestrator',
           summaryPrompt,
@@ -1782,10 +1781,9 @@ export class DispatchManager {
             visibility: 'system',
           }
         ),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(t('dispatch.phaseC.timeout', { seconds: PHASE_C_TIMEOUT / 1000 }))), PHASE_C_TIMEOUT)
-        ),
-      ]);
+        PHASE_C_TIMEOUT,
+        t('dispatch.phaseC.timeout', { seconds: PHASE_C_TIMEOUT / 1000 }),
+      );
 
       this.deps.recordOrchestratorTokens(response.tokenUsage);
 
@@ -2176,10 +2174,6 @@ export class DispatchManager {
     const now = Date.now();
     for (const state of this.executionProtocolStates.values()) {
       if (state.timeoutTriggered) {
-        continue;
-      }
-      if (now - state.createdAt > DispatchManager.EXECUTION_TIMEOUT_MS) {
-        this.failByProtocolTimeout(state, 'execution-timeout');
         continue;
       }
       if (state.ackState === 'pending' && now - state.createdAt > DispatchManager.ACK_TIMEOUT_MS) {
@@ -2809,8 +2803,11 @@ export class DispatchManager {
           const hasAtoB = this.hasDependencyChain(a, b, entryById, new Set());
           const hasBtoA = this.hasDependencyChain(b, a, entryById, new Set());
           if (!hasAtoB && !hasBtoA) {
-            escalate(a, 'intervention', 'cross_task', t('dispatch.audit.issue.parallelConflict', { taskId: b, file }));
-            escalate(b, 'intervention', 'cross_task', t('dispatch.audit.issue.parallelConflict', { taskId: a, file }));
+            // 并行文件修改降级为 watch：file_create/file_insert 已有运行时冲突保护
+            // （拒绝盲写并引导 Worker 改用 file_edit），file_edit 本身通过
+            // FileMutex + 意图驱动编辑（锁内强读最新内容）天然安全。
+            escalate(a, 'watch', 'cross_task', t('dispatch.audit.issue.parallelConflict', { taskId: b, file }));
+            escalate(b, 'watch', 'cross_task', t('dispatch.audit.issue.parallelConflict', { taskId: a, file }));
           }
         }
       }

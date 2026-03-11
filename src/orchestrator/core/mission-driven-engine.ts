@@ -132,6 +132,7 @@ interface RuntimeTerminationSnapshot {
   requiredTotal?: number;
   failedRequired?: number;
   runningOrPendingRequired?: number;
+  runningRequired?: number;
   sourceEventIds?: string[];
 }
 
@@ -238,7 +239,7 @@ export class MissionDrivenEngine extends EventEmitter {
   };
 
   private lastExecutionErrors: string[] = [];
-  private lastExecutionSuccess = true;
+  private lastExecutionRuntimeReason: ResolvedOrchestratorTerminationReason = 'completed';
 
   // 执行统计
   private executionStats: ExecutionStats;
@@ -1207,6 +1208,32 @@ export class MissionDrivenEngine extends EventEmitter {
     }
   }
 
+  private buildExecutionFailureMessages(
+    runtimeReason: ResolvedOrchestratorTerminationReason,
+    executionErrors: string[],
+  ): string[] {
+    const normalizedErrors = executionErrors
+      .map(item => item.trim())
+      .filter(item => item.length > 0);
+    if (normalizedErrors.length > 0) {
+      return normalizedErrors;
+    }
+
+    switch (runtimeReason) {
+      case 'budget_exceeded':
+        return ['执行达到预算上限'];
+      case 'external_wait_timeout':
+        return ['执行等待外部条件超时'];
+      case 'stalled':
+        return ['执行停滞，未取得有效进展'];
+      case 'upstream_model_error':
+        return ['执行遭遇上游模型错误'];
+      case 'failed':
+      default:
+        return [t('provider.executionFailed')];
+    }
+  }
+
   private reportPlanLedgerAsyncError(action: string, error: unknown): void {
     logger.warn('编排器.计划账本.异步回写失败', {
       action,
@@ -1619,9 +1646,9 @@ export class MissionDrivenEngine extends EventEmitter {
           if (!confirmed) {
             const rejectReason = t('engine.plan.userCancelledReason');
             await this.planLedger.reject(resolvedSessionId, draftPlan.planId, 'user', rejectReason);
-            this.lastExecutionSuccess = false;
-            this.lastExecutionErrors = [rejectReason];
             orchestratorRuntimeReason = 'cancelled';
+            this.lastExecutionRuntimeReason = orchestratorRuntimeReason;
+            this.lastExecutionErrors = [];
             this.setState('idle');
             this.currentTaskId = null;
             return t('engine.plan.userCancelledResult');
@@ -1874,8 +1901,10 @@ export class MissionDrivenEngine extends EventEmitter {
             ? `${finalContent}\n\n${warningSection}`
             : warningSection;
         }
-        this.lastExecutionSuccess = finalPlanStatus === 'completed';
-        this.lastExecutionErrors = finalPlanStatus === 'completed' ? [] : executionWarnings;
+        this.lastExecutionRuntimeReason = orchestratorRuntimeReason;
+        this.lastExecutionErrors = finalPlanStatus === 'failed'
+          ? this.buildExecutionFailureMessages(orchestratorRuntimeReason, executionWarnings)
+          : [];
         this.setState('idle');
         this.currentTaskId = null;
         return finalContent;
@@ -1896,7 +1925,7 @@ export class MissionDrivenEngine extends EventEmitter {
           orchestratorRuntimeReason = resolvedRuntimeTermination.reason;
           orchestratorRuntimeSnapshot = resolvedRuntimeTermination.runtimeSnapshot;
           logger.info('编排器.统一执行.中断', { error: errorMessage }, LogCategory.ORCHESTRATOR);
-          this.lastExecutionSuccess = false;
+          this.lastExecutionRuntimeReason = orchestratorRuntimeReason;
           this.lastExecutionErrors = [];
           this.setState('idle');
           this.currentTaskId = null;
@@ -1913,7 +1942,7 @@ export class MissionDrivenEngine extends EventEmitter {
         });
         orchestratorRuntimeReason = resolvedRuntimeTermination.reason;
         orchestratorRuntimeSnapshot = resolvedRuntimeTermination.runtimeSnapshot;
-        this.lastExecutionSuccess = false;
+        this.lastExecutionRuntimeReason = orchestratorRuntimeReason;
         this.lastExecutionErrors = [errorMessage];
         logger.error('编排器.统一执行.失败', { error: errorMessage }, LogCategory.ORCHESTRATOR);
         this.setState('idle');
@@ -1935,6 +1964,12 @@ export class MissionDrivenEngine extends EventEmitter {
         const finalPlanStatus = finalRuntimeReason
           ? this.mapOrchestratorRuntimeReasonToPlanFinalStatus(finalRuntimeReason)
           : null;
+        if (finalRuntimeReason) {
+          this.lastExecutionRuntimeReason = finalRuntimeReason;
+          if (finalPlanStatus === 'failed') {
+            this.lastExecutionErrors = this.buildExecutionFailureMessages(finalRuntimeReason, this.lastExecutionErrors);
+          }
+        }
         if (finalSessionId && finalPlanId && orchestratorAttemptStarted && orchestratorAttemptTargetId && finalRuntimeReason) {
           const attemptStatus = this.mapOrchestratorRuntimeReasonToAttemptStatus(finalRuntimeReason);
           try {
@@ -2010,11 +2045,11 @@ export class MissionDrivenEngine extends EventEmitter {
               await this.missionStorage.delete(this.lastMissionId);
             } else {
               // 更新 Mission 终态
-              if (this.lastExecutionSuccess) {
+              if (finalPlanStatus === 'completed') {
                 await this.taskViewService.completeTaskById(this.lastMissionId);
-              } else if (this.lastExecutionErrors.length > 0) {
+              } else if (finalPlanStatus === 'failed') {
                 await this.taskViewService.failTaskById(this.lastMissionId, this.lastExecutionErrors[0]);
-              } else {
+              } else if (finalPlanStatus === 'cancelled') {
                 await this.taskViewService.cancelTaskById(this.lastMissionId);
               }
             }
@@ -2123,10 +2158,11 @@ export class MissionDrivenEngine extends EventEmitter {
     }
   }
 
-  getLastExecutionStatus(): { success: boolean; errors: string[] } {
+  getLastExecutionStatus(): { success: boolean; errors: string[]; runtimeReason: ResolvedOrchestratorTerminationReason } {
     return {
-      success: this.lastExecutionSuccess,
+      success: this.lastExecutionRuntimeReason === 'completed',
       errors: [...this.lastExecutionErrors],
+      runtimeReason: this.lastExecutionRuntimeReason,
     };
   }
 

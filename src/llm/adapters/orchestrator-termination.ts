@@ -41,6 +41,7 @@ export interface TerminationSnapshot {
   requiredTotal: number;
   failedRequired: number;
   runningOrPendingRequired: number;
+  runningRequired?: number;
   sourceEventIds: string[];
   computedAt: number;
 }

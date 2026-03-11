@@ -12,6 +12,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as zlib from 'zlib';
 import { logger, LogCategory } from '../../logging';
+import { atomicWriteFileSync } from '../../utils/atomic-write';
 import { InvertedIndex, InvertedIndexSnapshot } from '../indexing/inverted-index';
 import { SymbolIndex, SymbolIndexSnapshot } from '../indexing/symbol-index';
 import { DependencyGraph, DependencyGraphSnapshot } from '../indexing/dependency-graph';
@@ -135,7 +136,7 @@ export class IndexPersistence {
 
       const jsonStr = JSON.stringify(snapshot);
       const compressed = zlib.gzipSync(jsonStr);
-      fs.writeFileSync(this.cacheFilePath, compressed);
+      atomicWriteFileSync(this.cacheFilePath, compressed);
 
       // 清理旧版未压缩文件
       if (fs.existsSync(this.legacyCacheFilePath)) {

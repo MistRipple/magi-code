@@ -855,6 +855,7 @@
   "dispatch.errors.todoManagerNotInitializedGetTodos": "TodoManager is not initialized, cannot get Todos",
   "dispatch.errors.todoManagerNotInitializedUpdateTodo": "TodoManager is not initialized, cannot update Todo",
   "dispatch.errors.updateTodoCannotResetPending": "Todo {todoId} current status={currentStatus}, cannot reset to pending",
+  "dispatch.errors.updateTodoCannotResetPendingRunning": "Todo {todoId} current status=running, requires force_reset to reset to pending",
   "dispatch.errors.updateTodoCannotSetSkipped": "Todo {todoId} current status={currentStatus}, cannot update to skipped",
   "dispatch.errors.updateTodoInvalidStatus": "Todo {todoId} status={status} is invalid, only pending/skipped are supported",
   "dispatch.errors.updateTodoMissingFields": "Todo {todoId} missing executable update fields (status/content)",

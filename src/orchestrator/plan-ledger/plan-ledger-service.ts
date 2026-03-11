@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { EventEmitter } from 'events';
 import { logger, LogCategory } from '../../logging';
+import { atomicWriteFileSync } from '../../utils/atomic-write';
 import type { UnifiedSessionManager } from '../../session/unified-session-manager';
 import type { UnifiedTodo } from '../../todo/types';
 import type { AcceptanceCriterion } from '../mission/types';
@@ -1209,7 +1210,7 @@ export class PlanLedgerService extends EventEmitter {
     }
     this.ensurePlansDir(record.sessionId);
     const planFile = this.getPlanFilePath(record.sessionId, record.planId);
-    fs.writeFileSync(planFile, JSON.stringify(record, null, 2), 'utf-8');
+    atomicWriteFileSync(planFile, JSON.stringify(record, null, 2));
 
     const index = this.loadIndex(record.sessionId);
     const entry = this.toIndexEntry(record);
@@ -1220,7 +1221,7 @@ export class PlanLedgerService extends EventEmitter {
       index.push(entry);
     }
     index.sort((a, b) => b.updatedAt - a.updatedAt);
-    fs.writeFileSync(this.getIndexPath(record.sessionId), JSON.stringify(index, null, 2), 'utf-8');
+    atomicWriteFileSync(this.getIndexPath(record.sessionId), JSON.stringify(index, null, 2));
     this.touchSessionCache(record.sessionId);
     this.indexCache.set(record.sessionId, this.cloneIndexEntries(index));
     const sessionPlanCache = this.getPlanCacheForSession(record.sessionId);
