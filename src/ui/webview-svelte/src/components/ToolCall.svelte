@@ -588,13 +588,11 @@
 
   .file-mutation-header {
     cursor: default;
-    padding: var(--space-2) 0;
-    opacity: 0.85;
+    padding: var(--space-2) var(--space-4);
   }
 
   .file-mutation-header:hover {
     background: transparent;
-    opacity: 1;
   }
 
   .file-mutation-header.clickable {
