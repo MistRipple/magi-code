@@ -371,7 +371,7 @@
   "settings.model.enable": "启用",
   "settings.model.saving": "保存中...",
   "settings.model.saved": "已保存",
-  "settings.model.saveConfig": "保存配置",
+  "settings.model.saveConfig": "保存并连接",
   "settings.model.testing": "测试中...",
   "settings.model.testSuccess": "连接成功",
   "settings.model.testFailed": "连接失败",

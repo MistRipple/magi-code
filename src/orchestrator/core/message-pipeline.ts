@@ -78,6 +78,7 @@ export interface ProcessingState {
   source: MessageSource | null;
   agent: string | null;
   startedAt: number | null;
+  transitionKind: 'derived' | 'forced';
 }
 
 const DEFAULT_CONFIG: PipelineConfig = {
@@ -96,7 +97,7 @@ export class MessagePipeline {
   private cardStreamSeqCounters: Map<string, number> = new Map();
   private deadLetters: DeadLetterEntry[] = [];
   private eventSeqCounter = 0;
-  private processingState: ProcessingState = { isProcessing: false, source: null, agent: null, startedAt: null };
+  private processingState: ProcessingState = { isProcessing: false, source: null, agent: null, startedAt: null, transitionKind: 'derived' };
   private processingMessageIds: Set<string> = new Set();
   private requestMessageStats: Map<string, RequestMessageStats> = new Map();
   private requestMessageIdMap: Map<string, string> = new Map();
@@ -378,7 +379,7 @@ export class MessagePipeline {
       for (const state of this.messageStates.values()) { if (!state.completed) { state.completed = true; state.lastSentAt = now; } }
       this.processingMessageIds.clear();
     }
-    this.updateProcessingState(isProcessing, null, null);
+    this.updateProcessingState(isProcessing, null, null, 'forced');
   }
 
   private doProcess(message: StandardMessage, requestId?: string): boolean {
@@ -624,9 +625,20 @@ export class MessagePipeline {
     return lifecycle === MessageLifecycle.COMPLETED || lifecycle === MessageLifecycle.FAILED || lifecycle === MessageLifecycle.CANCELLED;
   }
 
-  private updateProcessingState(isProcessing: boolean, source: MessageSource | null, agent: string | null): void {
+  private updateProcessingState(
+    isProcessing: boolean,
+    source: MessageSource | null,
+    agent: string | null,
+    transitionKind: 'derived' | 'forced' = 'derived'
+  ): void {
     const prev = this.processingState.isProcessing;
-    this.processingState = { isProcessing, source: isProcessing ? source : null, agent: isProcessing ? agent : null, startedAt: isProcessing ? (this.processingState.startedAt || Date.now()) : null };
+    this.processingState = {
+      isProcessing,
+      source: isProcessing ? source : null,
+      agent: isProcessing ? agent : null,
+      startedAt: isProcessing ? (this.processingState.startedAt || Date.now()) : null,
+      transitionKind,
+    };
     if (prev !== isProcessing) this.safeEmit('processingStateChanged', this.getProcessingState());
   }
 
@@ -760,6 +772,6 @@ export class MessagePipeline {
     this.requestMessageStats.clear();
     this.requestMessageIdMap.clear();
     this.streamBuffers.clear();
-    this.processingState = { isProcessing: false, source: null, agent: null, startedAt: null };
+    this.processingState = { isProcessing: false, source: null, agent: null, startedAt: null, transitionKind: 'derived' };
   }
 }

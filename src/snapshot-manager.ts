@@ -644,11 +644,7 @@ export class SnapshotManager {
       fs.unlinkSync(absolutePath);
       this.invalidateFileCache(absolutePath);
     } else if (content !== '') {
-      const dir = path.dirname(absolutePath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      fs.writeFileSync(absolutePath, content, 'utf-8');
+      atomicWriteFileSync(absolutePath, content, 'utf-8');
       this.invalidateFileCache(absolutePath);
     }
 
@@ -971,11 +967,7 @@ export class SnapshotManager {
         fs.unlinkSync(absolutePath);
         this.invalidateFileCache(absolutePath);
       } else if (content !== '') {
-        const dir = path.dirname(absolutePath);
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true });
-        }
-        fs.writeFileSync(absolutePath, content, 'utf-8');
+        atomicWriteFileSync(absolutePath, content, 'utf-8');
         this.invalidateFileCache(absolutePath);
       }
       revertedFiles.push(relativePath);

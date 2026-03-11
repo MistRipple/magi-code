@@ -64,7 +64,24 @@ import { WorkspaceFolderInfo, WorkspaceRoots } from '../workspace/workspace-root
 
 type WebviewMessagePriority = 'high' | 'normal';
 
-type OrchestratorExecutionResult = { success: boolean; error?: string };
+type OrchestratorRuntimeReason = ReturnType<MissionDrivenEngine['getLastExecutionStatus']>['runtimeReason'];
+type OrchestratorExecutionResult = {
+  success: boolean;
+  taskId: string;
+  runtimeReason: OrchestratorRuntimeReason;
+  errors: string[];
+  recoverable: boolean;
+  error?: string;
+};
+type PendingRecoveryContext = {
+  taskId: string;
+  prompt: string;
+  sessionId: string;
+  runtimeReason: OrchestratorRuntimeReason;
+  errors: string[];
+  canRetry: boolean;
+  canRollback: boolean;
+};
 type OrchestratorQueueItem = {
   prompt: string;
   imagePaths: string[];
@@ -1267,7 +1284,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'resumeTask':
 
         logger.info('界面.任务.恢复.消息', { taskId: message.taskId }, LogCategory.UI);
-        await this.resumeInterruptedTask();
+        await this.resumeInterruptedTask({ taskId: message.taskId });
         break;
 
       case 'appendMessage':
@@ -1764,6 +1781,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private recoveryConfirmationResolver: ((decision: 'retry' | 'rollback' | 'continue') => void) | null = null;
   private pendingRecoveryRetry = false;
   private pendingRecoveryPrompt: string | null = null;
+  private pendingRecoveryContext: PendingRecoveryContext | null = null;
   private pendingExecutionQueue: OrchestratorQueueItem[] = [];
   private orchestratorQueueRunning = false;
   private queuedMessagesBySession: Map<string, QueuedUserTurn[]> = new Map();
@@ -1827,6 +1845,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         messageType: 'result',
         metadata: { phase: 'recovery' },
       });
+      this.clearPendingRecoveryState();
       return;
     }
 
@@ -1838,10 +1857,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         this.sendToast(t('toast.taskStillRunning'), 'info');
         return;
       }
-      await this.resumeInterruptedTask(t('provider.resumePrompt.defaultRetry'));
+      await this.resumeInterruptedTask({ extraInstruction: t('provider.resumePrompt.defaultRetry') });
       return;
     }
 
+    this.clearPendingRecoveryState();
     this.sendToast(t('toast.continueWithoutRollback'), 'info');
   }
 
@@ -1852,7 +1872,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.pendingRecoveryRetry = false;
     this.pendingRecoveryPrompt = null;
     logger.info('界面.编排器.恢复.重试_触发', undefined, LogCategory.UI);
-    await this.resumeInterruptedTask(prompt);
+    await this.resumeInterruptedTask({ extraInstruction: prompt });
   }
 
   private enqueueOrchestratorExecution(
@@ -1887,7 +1907,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           next.resolve(result);
         } catch (error) {
           const errorMsg = error instanceof Error ? error.message : String(error);
-          next.resolve({ success: false, error: errorMsg });
+          next.resolve({
+            success: false,
+            taskId: '',
+            runtimeReason: 'failed',
+            errors: [errorMsg],
+            recoverable: false,
+            error: errorMsg,
+          });
         }
       }
     } finally {
@@ -1902,7 +1929,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const pending = [...this.pendingExecutionQueue];
     this.pendingExecutionQueue = [];
     for (const item of pending) {
-      item.resolve({ success: false, error: reason });
+      item.resolve({
+        success: false,
+        taskId: '',
+        runtimeReason: 'cancelled',
+        errors: [reason],
+        recoverable: false,
+        error: reason,
+      });
     }
     logger.warn('界面.编排器.排队任务.已清理', {
       reason,
@@ -2230,13 +2264,103 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** 获取最近被打断的任务 */
-  private async getLastInterruptedTask(): Promise<{ id: string; prompt: string } | null> {
-    // 统一 Todo 系统 - 使用 TaskView
-    const tasks = await this.getTaskViews();
-    const interrupted = [...tasks].reverse().find(t => t.status === 'cancelled');
-    if (!interrupted) return null;
-    return { id: interrupted.id, prompt: interrupted.prompt };
+  private clearPendingRecoveryState(): void {
+    this.pendingRecoveryRetry = false;
+    this.pendingRecoveryPrompt = null;
+    this.pendingRecoveryContext = null;
+  }
+
+  private isAbortLikeRuntimeReason(runtimeReason?: OrchestratorRuntimeReason): boolean {
+    return runtimeReason === 'interrupted'
+      || runtimeReason === 'cancelled'
+      || runtimeReason === 'external_abort';
+  }
+
+  private isRecoverableRuntimeReason(runtimeReason: OrchestratorRuntimeReason): boolean {
+    return runtimeReason === 'interrupted' || runtimeReason === 'upstream_model_error';
+  }
+
+  private buildExecutionFailureReason(input: {
+    runtimeReason: OrchestratorRuntimeReason;
+    errors: string[];
+    error?: string;
+  }): string {
+    const normalizedError = [input.error, ...input.errors]
+      .find((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      ?.trim();
+    switch (input.runtimeReason) {
+      case 'interrupted':
+        return t('provider.taskAborted');
+      case 'cancelled':
+      case 'external_abort':
+        return t('provider.userCancelled');
+      default:
+        return normalizedError || t('provider.executionFailed');
+    }
+  }
+
+  private buildRecoveryErrorMessage(context: PendingRecoveryContext): string {
+    const normalizedError = context.errors
+      .find((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      ?.trim();
+    if (context.runtimeReason === 'upstream_model_error') {
+      return this.buildModelOriginIssueMessage(normalizedError || t('provider.executionFailed'));
+    }
+    if (context.runtimeReason === 'interrupted') {
+      return t('provider.taskAborted');
+    }
+    return normalizedError || t('provider.executionFailed');
+  }
+
+  private setPendingRecoveryFromExecution(input: {
+    result: OrchestratorExecutionResult;
+    prompt: string;
+    sessionId: string;
+  }): void {
+    if (!input.result.recoverable) {
+      this.pendingRecoveryContext = null;
+      return;
+    }
+
+    const taskId = input.result.taskId.trim();
+    const prompt = input.prompt.trim();
+    if (!taskId || !prompt) {
+      this.pendingRecoveryContext = null;
+      logger.warn('界面.恢复.上下文_缺少关键字段', {
+        taskId,
+        sessionId: input.sessionId,
+        runtimeReason: input.result.runtimeReason,
+      }, LogCategory.UI);
+      return;
+    }
+
+    const context: PendingRecoveryContext = {
+      taskId,
+      prompt,
+      sessionId: input.sessionId,
+      runtimeReason: input.result.runtimeReason,
+      errors: [...input.result.errors],
+      canRetry: true,
+      canRollback: this.snapshotManager.getPendingChanges().length > 0,
+    };
+    this.pendingRecoveryContext = context;
+    this.sendData('recoveryRequest', {
+      taskId: context.taskId,
+      error: this.buildRecoveryErrorMessage(context),
+      canRetry: context.canRetry,
+      canRollback: context.canRollback,
+    });
+  }
+
+  private getPendingRecoveryContext(taskId?: string): PendingRecoveryContext | null {
+    const context = this.pendingRecoveryContext;
+    if (!context) {
+      return null;
+    }
+    if (!taskId) {
+      return context;
+    }
+    return context.taskId === taskId ? context : null;
   }
 
   /** 构建恢复提示词 */
@@ -2292,27 +2416,28 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /** 恢复被打断的任务 */
-  private async resumeInterruptedTask(extraInstruction?: string): Promise<void> {
+  private async resumeInterruptedTask(options?: { taskId?: string; extraInstruction?: string }): Promise<void> {
     if (this.orchestratorEngine.running) {
       this.sendToast(t('toast.taskStillExecuting'), 'warning');
       return;
     }
 
-    const lastTask = await this.getLastInterruptedTask();
-    if (!lastTask) {
+    const recoveryContext = this.getPendingRecoveryContext(options?.taskId);
+    if (!recoveryContext) {
       this.sendToast(t('toast.noRecoverableTasks'), 'info');
       return;
     }
 
-    const prompt = this.buildResumePrompt(lastTask.prompt, extraInstruction);
+    const prompt = this.buildResumePrompt(recoveryContext.prompt, options?.extraInstruction);
     this.sendOrchestratorMessage({
       content: t('provider.resumingTask'),
       messageType: 'progress',
       metadata: { phase: 'resuming' },
     });
     await this.executeTask(prompt, undefined, [], undefined, undefined, {
-      resumeMissionId: lastTask.id,
+      resumeMissionId: recoveryContext.taskId,
       resumeInstruction: prompt,
+      recoveryBasePrompt: recoveryContext.prompt,
     });
   }
 
@@ -2408,6 +2533,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     options?: {
       resumeMissionId?: string;
       resumeInstruction?: string;
+      recoveryBasePrompt?: string;
     }
   ): Promise<void> {
     logger.info('界面.任务.执行.开始', { promptLength: prompt.length, imageCount: images?.length || 0 }, LogCategory.UI);
@@ -2417,6 +2543,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     let rejected = false;
     let success = false;
     let failureReason: string | undefined;
+    let executionSessionId = '';
+    let promptForRecovery = displayPrompt?.trim() || prompt;
+    let executionResult: OrchestratorExecutionResult | null = null;
 
     const rejectRequest = (reason: string) => {
       rejected = true;
@@ -2475,7 +2604,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         this.activeSessionId = currentSession?.id || null;
         logger.info('界面.会话.当前.设置', { sessionId: this.activeSessionId }, LogCategory.UI);
       }
-      const executionSessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id || '';
+      executionSessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id || '';
       if (!executionSessionId) {
         rejectRequest(t('provider.sessionNotFound'));
         return;
@@ -2485,6 +2614,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       // 统一消息通道：由后端发送用户消息与占位消息
       const promptForDisplay = displayPrompt?.trim() || prompt;
+      promptForRecovery = options?.recoveryBasePrompt?.trim() || promptForDisplay;
       const executionTurnId = `turn:${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
       const { userMessageId } = this.emitUserAndPlaceholder(
         requestKey,
@@ -2532,6 +2662,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         requestId: requestKey,
         timestamp: Date.now(),
       });
+      this.clearPendingRecoveryState();
 
       const resolvedSkill = this.resolveInstructionSkillPrompt(prompt);
       const effectivePrompt = resolvedSkill.prompt;
@@ -2559,6 +2690,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         executionSessionId,
         executionTurnId
       );
+      executionResult = result;
       success = result.success;
       failureReason = result.error;
     } catch (error) {
@@ -2605,9 +2737,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
       if (started) {
         // 判断是否为中断导致的失败——中断场景不应发送错误消息
-        const isAbort = !success && failureReason && isAbortError(failureReason);
+        const runtimeReason = executionResult?.runtimeReason;
+        const isAbort = !success && (this.isAbortLikeRuntimeReason(runtimeReason) || (failureReason ? isAbortError(failureReason) : false));
         const normalizedFailureReason = (failureReason || t('provider.executionFailed')).trim();
-        const modelOriginIssue = this.isLikelyModelOriginIssue(normalizedFailureReason);
+        const modelOriginIssue = runtimeReason === 'upstream_model_error'
+          || this.isLikelyModelOriginIssue(normalizedFailureReason);
         const userFacingFailureReason = modelOriginIssue
           ? this.buildModelOriginIssueMessage(normalizedFailureReason)
           : normalizedFailureReason;
@@ -2658,6 +2792,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
               this.messageHub.sendMessage(errorMessage);
             }
           }
+        }
+        if (executionResult) {
+          this.setPendingRecoveryFromExecution({
+            result: executionResult,
+            prompt: promptForRecovery,
+            sessionId: executionSessionId,
+          });
         }
       } else if (!rejected && failureReason && requestKey) {
         const normalizedFailureReason = failureReason.trim();
@@ -2754,12 +2895,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 不再在这里重复发送，避免用户看到两条类似的"正在分析"消息
 
     let errorMsg: string | undefined;
-    let success = false;
+    let taskId = '';
+    let thrown = false;
     try {
       // 调用智能编排器
       // 注意：executeWithTaskContext 内部已将 LLM 响应流式发送到前端
       // 因此不需要再手动调用 sendOrchestratorMessage 发送结果，否则会导致重复消息
       const taskContext = await this.orchestratorEngine.executeWithTaskContext(prompt, sessionId, imagePaths, turnId);
+      taskId = taskContext.taskId.trim();
       const result = taskContext.result;
 
       // 引擎 fail-open/门禁降级返回属于“非流式合成文本”，需要显式回灌到主对话区，
@@ -2788,25 +2931,42 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 正确的行为：
       // - 如果 LLM 有输出（result 非空），消息已经通过流式通道发送
       // - 如果 LLM 无输出（result 为空），应该在 engine 层面处理，而非此处补发
-
-      success = true;
     } catch (error) {
+      thrown = true;
       // 中断导致的 abort 错误静默处理，不向前端发送错误消息
       if (isAbortError(error)) {
         logger.info('界面.执行.智能.中断', undefined, LogCategory.UI);
-        success = false;
       } else {
         logger.error('界面.执行.智能.失败', error, LogCategory.UI);
         errorMsg = error instanceof Error ? error.message : String(error);
-        success = false;
       }
     }
 
+    const executionStatus = this.orchestratorEngine.getLastExecutionStatus();
+    const runtimeReason = thrown && executionStatus.success
+      ? 'failed'
+      : executionStatus.runtimeReason;
+    const errors = runtimeReason === executionStatus.runtimeReason
+      ? [...executionStatus.errors]
+      : (errorMsg ? [errorMsg] : []);
+    const success = !thrown && runtimeReason === 'completed';
+    const failureReason = success
+      ? undefined
+      : this.buildExecutionFailureReason({
+        runtimeReason,
+        errors,
+        error: errorMsg,
+      });
+
     this.sendStateUpdate();
-    if (!success) {
-      return { success: false, error: errorMsg };
-    }
-    return { success: true };
+    return {
+      success,
+      error: failureReason,
+      taskId,
+      runtimeReason,
+      errors,
+      recoverable: this.isRecoverableRuntimeReason(runtimeReason),
+    };
   }
 
   /** 发送状态更新到 Webview */
@@ -3452,43 +3612,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       const bTs = Number(b?.startedAt || b?.createdAt || 0);
       return bTs - aTs;
     });
-    const runningCandidates = sortedTasks.filter(task => task?.status === 'running');
-    const activeRunningTaskId = engineRunning && runningCandidates.length > 0
-      ? [...runningCandidates].sort((a, b) => {
-          const aTs = Number(a?.startedAt || a?.createdAt || 0);
-          const bTs = Number(b?.startedAt || b?.createdAt || 0);
-          return bTs - aTs;
-        })[0]?.id
-      : undefined;
-    const displayTasks = sortedTasks.map((task) => {
-      if (!task || task.status !== 'running') {
-        return task;
-      }
-      if (!engineRunning) {
-        return { ...task, status: 'cancelled' as const };
-      }
-      if (activeRunningTaskId && task.id === activeRunningTaskId) {
-        return task;
-      }
-      const subTasks = Array.isArray(task.subTasks) ? task.subTasks : [];
-      if (subTasks.length === 0) {
-        return { ...task, status: 'pending' as const };
-      }
-      const allDone = subTasks.every((subTask: any) => subTask?.status === 'completed' || subTask?.status === 'skipped');
-      if (allDone) {
-        return { ...task, status: 'completed' as const };
-      }
-      const hasFailed = subTasks.some((subTask: any) => subTask?.status === 'failed');
-      if (hasFailed) {
-        return { ...task, status: 'failed' as const };
-      }
-      return { ...task, status: 'pending' as const };
-    });
+    const displayTasks = sortedTasks;
 
     this.assertValidArray<any>(displayTasks, 'uiState.tasks');
-    const currentTask = engineRunning
-      ? (displayTasks.find(t => t?.status === 'running') ?? displayTasks[0])
-      : displayTasks[0];
+    const currentTask = displayTasks.find(t => t?.status === 'running') ?? displayTasks[0];
 
     // 使用轻量级的会话元数据（而不是完整会话数据）
     const sessionMetas = this.sessionManager.getSessionMetas();

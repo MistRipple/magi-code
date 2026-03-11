@@ -802,6 +802,16 @@ export function clearProcessingState() {
   updateProcessingState();
 }
 
+export function settleProcessingForManualInteraction() {
+  for (const binding of requestBindings.values()) {
+    if (binding.timeoutId) {
+      clearTimeout(binding.timeoutId);
+    }
+  }
+  requestBindings = new Map();
+  clearProcessingState();
+}
+
 /**
  * 终结所有未完成的流式消息和残留占位消息
  *

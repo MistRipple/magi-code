@@ -40,6 +40,7 @@ import {
   clearRequestBinding,
   clearAllRequestBindings,
   clearProcessingState,
+  settleProcessingForManualInteraction,
   setRetryRuntime,
   clearRetryRuntime,
   sealAllStreamingMessages,
@@ -1672,10 +1673,9 @@ function handleUnifiedControlMessage(standard: StandardMessage) {
 
     case 'task_completed':
     case 'task_failed': {
-      // 任务生命周期终极信号：彻底清除所有处理态
-      // 清除 backendProcessing + activeMessageIds + pendingRequests 三重条件，
-      // 防止 Worker 多轮工具调用中间消息的 COMPLETE 事件延迟或丢失导致按钮状态残留
-      clearProcessingState();
+      // 请求级完成不等于系统级空闲。
+      // deep/恢复/队列续跑场景下，provider 仍可能马上进入下一轮；
+      // 真正的 idle 只能由 processingStateChanged(false, forced) 裁决。
       // 终结所有未完成的流式消息：保留已输出内容，移除空占位消息，停止 streaming 动画
       sealAllStreamingMessages();
       break;
@@ -1757,10 +1757,14 @@ function handleUnifiedData(standard: StandardMessage) {
 
     case 'processingStateChanged': {
       const isProcessing = payload.isProcessing as boolean | undefined;
-      // 仅将 true 作为兜底提升信号，禁止用该通道提前清空运行态
-      // 运行态结束必须由 task_completed/task_failed 决定
+      const transitionKind = payload.transitionKind as 'derived' | 'forced' | undefined;
+      // true 仍可作为兜底提升信号；
+      // false 只有在 provider 明确给出 forced idle 时才允许清空，
+      // 避免把“当前无活跃消息卡片”误判成“整个系统已经空闲”。
       if (isProcessing === true) {
         setIsProcessing(true);
+      } else if (isProcessing === false && transitionKind === 'forced') {
+        clearProcessingState();
       }
       const source = payload.source as string | undefined;
       const agent = payload.agent as string | undefined;
@@ -2102,7 +2106,8 @@ function handleConfirmationRequest(message: WebviewMessage) {
     formattedPlan: message.formattedPlan as string | undefined,
     forceManual,
   };
-  setIsProcessing(false);
+  settleProcessingForManualInteraction();
+  sealAllStreamingMessages();
 }
 
 function handleRecoveryRequest(message: WebviewMessage) {
@@ -2127,7 +2132,8 @@ function handleRecoveryRequest(message: WebviewMessage) {
     canRetry: Boolean(message.canRetry),
     canRollback: Boolean(message.canRollback),
   };
-  setIsProcessing(false);
+  settleProcessingForManualInteraction();
+  sealAllStreamingMessages();
 }
 
 function handleClarificationRequest(message: WebviewMessage) {
@@ -2149,7 +2155,8 @@ function handleClarificationRequest(message: WebviewMessage) {
     ambiguityScore: message.ambiguityScore as number | undefined,
     originalPrompt: message.originalPrompt as string | undefined,
   };
-  setIsProcessing(false);
+  settleProcessingForManualInteraction();
+  sealAllStreamingMessages();
 }
 
 function handleWorkerQuestionRequest(message: WebviewMessage) {
@@ -2166,7 +2173,8 @@ function handleWorkerQuestionRequest(message: WebviewMessage) {
     context: message.context as string | undefined,
     options: message.options,
   };
-  setIsProcessing(false);
+  settleProcessingForManualInteraction();
+  sealAllStreamingMessages();
 }
 
 function handleToolAuthorizationRequest(message: WebviewMessage) {
@@ -2213,7 +2221,8 @@ function handleToolAuthorizationRequest(message: WebviewMessage) {
     toolName: (message.toolName as string) || '',
     toolArgs: message.toolArgs,
   };
-  setIsProcessing(false);
+  settleProcessingForManualInteraction();
+  sealAllStreamingMessages();
 }
 
 function handleMissionPlanned(message: WebviewMessage) {

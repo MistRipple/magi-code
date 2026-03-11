@@ -371,7 +371,7 @@
   "settings.model.enable": "Enable",
   "settings.model.saving": "Saving...",
   "settings.model.saved": "Saved",
-  "settings.model.saveConfig": "Save Config",
+  "settings.model.saveConfig": "Save & Connect",
   "settings.model.testing": "Testing...",
   "settings.model.testSuccess": "Connected",
   "settings.model.testFailed": "Failed",

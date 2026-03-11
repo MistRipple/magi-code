@@ -679,6 +679,9 @@
       vscode.postMessage({ type: 'saveAuxiliaryConfig', config: compConfig });
     }
 
+    // 保存后自动进行一次连接测试
+    testModelConnection(target);
+
     // 模拟保存成功（实际应该通过消息回调）
     setTimeout(() => {
       saveStatus[key] = 'saved';

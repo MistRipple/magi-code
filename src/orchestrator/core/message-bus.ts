@@ -18,6 +18,7 @@ export interface ProcessingState {
   source: MessageSource | null;
   agent: string | null;
   startedAt: number | null;
+  transitionKind: 'derived' | 'forced';
 }
 
 /** 广播消息数据 */

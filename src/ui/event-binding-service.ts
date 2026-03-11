@@ -405,6 +405,7 @@ export class EventBindingService {
         source: state.source,
         agent: state.agent,
         startedAt: state.startedAt,
+        transitionKind: state.transitionKind,
       });
     });
   }
