@@ -925,7 +925,7 @@
   "dispatch.todo.failed": "失败: {content} - {error}",
   "dispatch.todo.started": "正在执行: {content}",
   "dispatch.verification.degradedFallbackWarning": "验收检查执行异常",
-  "dispatch.waitForWorkers.timeout": "wait_for_workers 超时（{seconds}s），仍有 {pendingCount} 个任务未完成",
+  "dispatch.waitForWorkers.timeout": "wait_for_workers 无响应超过 {seconds}s，仍有 {pendingCount} 个任务未完成",
   "dispatchBatch.cancel.cancelled": "已取消",
   "dispatchBatch.cancel.taskCancelled": "任务被取消",
   "dispatchBatch.cancel.userCancelled": "用户取消",

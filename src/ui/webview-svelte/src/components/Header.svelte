@@ -316,7 +316,7 @@
   .session-selector-name {
     font-size: var(--text-sm);
     font-weight: var(--font-medium);
-    max-width: 150px;
+    max-width: 180px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -328,6 +328,7 @@
     left: 0;
     margin-top: var(--space-2);
     min-width: 220px;
+    max-width: 320px;
     background: var(--vscode-dropdown-background, #3c3c3c);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);

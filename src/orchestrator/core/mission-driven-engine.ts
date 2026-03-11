@@ -1806,7 +1806,7 @@ export class MissionDrivenEngine extends EventEmitter {
         // 必须等待 activeBatch 归档后再推进下一阶段，保证链路完整闭合。
         const currentBatch = this.dispatchManager.getActiveBatch();
         if (currentBatch && currentBatch.status !== 'archived') {
-          await currentBatch.waitForArchive();
+          await currentBatch.waitForArchive(this.dispatchManager.getIdleTimeoutMs());
         }
 
         const executionWarnings: string[] = [];
@@ -2053,8 +2053,12 @@ export class MissionDrivenEngine extends EventEmitter {
                 await this.taskViewService.cancelTaskById(this.lastMissionId);
               }
             }
-          } catch {
-            // Mission 状态更新失败不影响主流程
+          } catch (missionUpdateError) {
+            logger.warn('编排器.Mission.终态更新失败', {
+              missionId: this.lastMissionId,
+              finalPlanStatus,
+              error: missionUpdateError instanceof Error ? missionUpdateError.message : String(missionUpdateError),
+            }, LogCategory.ORCHESTRATOR);
           }
         }
         try {

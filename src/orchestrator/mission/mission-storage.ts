@@ -21,6 +21,7 @@ import {
   ExecutionPath,
 } from './types';
 import { normalizeAssignments, generateEntityId } from './data-normalizer';
+import { logger, LogCategory } from '../../logging';
 
 function normalizeMissionTextItems(items: string[] | undefined): string[] {
   if (!Array.isArray(items)) {
@@ -574,8 +575,11 @@ export class FileBasedMissionStorage implements IMissionStorage {
             this.sessionIndex.set(mission.sessionId, new Set());
           }
           this.sessionIndex.get(mission.sessionId)!.add(mission.id);
-        } catch {
-          // 跳过无效文件
+        } catch (loadError) {
+          logger.warn('MissionStorage.加载文件失败', {
+            filePath,
+            error: loadError instanceof Error ? loadError.message : String(loadError),
+          }, LogCategory.ORCHESTRATOR);
         }
       }
     }

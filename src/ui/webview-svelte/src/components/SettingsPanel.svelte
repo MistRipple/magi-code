@@ -1095,9 +1095,15 @@
 
       // Worker 状态更新 (模型连接状态)
       // 注意：状态现在由 message-handler.ts 统一更新到全局 store
-      // SettingsPanel 只需要重置 isRefreshing 标志
+      // 当所有模型检测完成（无 checking 状态）时重置 isRefreshing
       if (dataType === 'workerStatusUpdate') {
-        isRefreshing = false;
+        const statuses = payload?.statuses as Record<string, { status: string }> | undefined;
+        if (statuses) {
+          const allSettled = Object.values(statuses).every(s => s.status !== 'checking');
+          if (allSettled) {
+            isRefreshing = false;
+          }
+        }
       }
       // 执行统计更新
       else if (dataType === 'executionStatsUpdate') {
@@ -1201,82 +1207,24 @@
           };
         }
       }
-      // Worker 连接测试结果 - 更新统计 Tab 状态和测试按钮状态
+      // Worker 连接测试结果 - modelStatus 已由全局 message-handler 更新，此处仅维护按钮状态
       else if (dataType === 'workerConnectionTestResult') {
         const worker = payload?.worker;
-        if (worker && modelStatuses[worker]) {
-          if (payload?.success) {
-            appState.modelStatus = {
-              ...appState.modelStatus,
-              [worker]: {
-                status: 'available',
-                model: workerConfigs[worker]?.model || modelStatuses[worker]?.model
-              }
-            };
-            testStatus[worker] = 'success';
-          } else {
-            appState.modelStatus = {
-              ...appState.modelStatus,
-              [worker]: {
-                status: 'error',
-                model: workerConfigs[worker]?.model || modelStatuses[worker]?.model,
-                error: payload?.error
-              }
-            };
-            testStatus[worker] = 'error';
-          }
+        if (worker) {
+          testStatus[worker] = payload?.success ? 'success' : 'error';
           testStatus = { ...testStatus };
           resetTestStatus(worker);
         }
       }
-      // 编排者连接测试结果 - 更新统计 Tab 状态和测试按钮状态
+      // 编排者连接测试结果 - modelStatus 已由全局 message-handler 更新，此处仅维护按钮状态
       else if (dataType === 'orchestratorConnectionTestResult') {
-        if (payload?.success) {
-          appState.modelStatus = {
-            ...appState.modelStatus,
-            orchestrator: {
-              status: 'available',
-              model: orchConfig.model || modelStatuses.orchestrator?.model
-            }
-          };
-          testStatus.orch = 'success';
-        } else {
-          appState.modelStatus = {
-            ...appState.modelStatus,
-            orchestrator: {
-              status: 'error',
-              model: orchConfig.model || modelStatuses.orchestrator?.model,
-              error: payload?.error
-            }
-          };
-          testStatus.orch = 'error';
-        }
+        testStatus.orch = payload?.success ? 'success' : 'error';
         testStatus = { ...testStatus };
         resetTestStatus('orch');
       }
-      // 辅助模型连接测试结果 - 更新统计 Tab 状态和测试按钮状态
+      // 辅助模型连接测试结果 - modelStatus 已由全局 message-handler 更新，此处仅维护按钮状态
       else if (dataType === 'auxiliaryConnectionTestResult') {
-        if (payload?.success) {
-          appState.modelStatus = {
-            ...appState.modelStatus,
-            auxiliary: {
-              status: 'available',
-              model: compConfig.model || modelStatuses.auxiliary?.model
-            }
-          };
-          testStatus.comp = 'success';
-        } else {
-          const orchestratorModel = payload?.orchestratorModel || modelStatuses.orchestrator?.model;
-          appState.modelStatus = {
-            ...appState.modelStatus,
-            auxiliary: {
-              status: 'orchestrator',
-              model: orchestratorModel ? i18n.t('settings.model.orchestratorModelLabel', { model: orchestratorModel }) : modelStatuses.auxiliary?.model,
-              error: payload?.error
-            }
-          };
-          testStatus.comp = 'error';
-        }
+        testStatus.comp = payload?.success ? 'success' : 'error';
         testStatus = { ...testStatus };
         resetTestStatus('comp');
       }

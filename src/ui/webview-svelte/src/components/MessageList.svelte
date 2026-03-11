@@ -5,6 +5,7 @@
   import { onMount, tick } from 'svelte';
   import { clearMessageJump, messagesState } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { deriveWorkerPanelState, getMessageRequestId } from '../lib/worker-panel-state';
 
   // Props - Svelte 5 语法
   interface Props {
@@ -29,13 +30,6 @@
   const safeMessages = $derived(
     (messages || []).filter(m => !!m && !!m.id)
   );
-
-  function getMessageRequestId(message: Message | undefined): string | null {
-    const requestId = message?.metadata?.requestId;
-    if (typeof requestId !== 'string') return null;
-    const normalized = requestId.trim();
-    return normalized.length > 0 ? normalized : null;
-  }
 
   /**
    * 生成消息的稳定 Svelte key
@@ -96,20 +90,25 @@
   // - thread: 全局 isProcessing 驱动，表示「对话仍在进行」
   // - worker: 当前请求级别（同一次请求内跨多轮不重置）
   // 仅当「当前无流式消息卡片」时显示，避免与卡片内流式动画重复导致视觉留白
-  const hasStreamingMessage = $derived(safeMessages.some((m) => m.isStreaming));
   const lastMessage = $derived.by(() => safeMessages.length > 0 ? safeMessages[safeMessages.length - 1] : null);
   const hasBottomStreamingMessage = $derived(Boolean(lastMessage?.isStreaming));
   const pendingRequestIds = $derived.by(() => Array.from(messagesState.pendingRequests));
   const pendingRequestIdSet = $derived.by(() => new Set(pendingRequestIds));
+  const workerPanelState = $derived.by(() => deriveWorkerPanelState({
+    messages: safeMessages,
+    workerName,
+    pendingRequestIds,
+    isProcessing: messagesState.isProcessing,
+    processingActorAgent: messagesState.processingActor?.agent,
+  }));
 
   const latestRoundAnchorMessage = $derived.by(() => {
+    if (displayContext === 'worker') {
+      return workerPanelState.latestRoundAnchorMessage;
+    }
     for (let i = safeMessages.length - 1; i >= 0; i -= 1) {
       const message = safeMessages[i];
-      if (displayContext === 'worker') {
-        if (message.type === 'instruction' || message.type === 'user_input') {
-          return message;
-        }
-      } else if (message.type === 'user_input') {
+      if (message.type === 'user_input') {
         return message;
       }
     }
@@ -118,6 +117,9 @@
 
   const latestRoundRequestId = $derived.by(() => getMessageRequestId(latestRoundAnchorMessage || undefined));
   const panelHasPendingRequest = $derived.by(() => {
+    if (displayContext === 'worker') {
+      return workerPanelState.panelHasPendingRequest;
+    }
     if (!latestRoundRequestId) return false;
     return pendingRequestIdSet.has(latestRoundRequestId);
   });
@@ -127,15 +129,7 @@
   // 关键修复：禁止仅凭“最后一条是 instruction”就判定活跃，避免旧轮次导致多面板同步计时。
   const workerHasCurrentRequestActivity = $derived.by(() => {
     if (displayContext !== 'worker') return false;
-
-    if (hasBottomStreamingMessage) return true;
-    if (!messagesState.isProcessing) return false;
-
-    if (workerName && messagesState.processingActor?.agent === workerName) {
-      return true;
-    }
-
-    return panelHasPendingRequest;
+    return workerPanelState.workerHasCurrentRequestActivity;
   });
   const streamingIndicatorMessageId = $derived.by(() => {
     if (!hasBottomStreamingMessage || !lastMessage) return null;

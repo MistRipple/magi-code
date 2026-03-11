@@ -26,7 +26,8 @@ const clientCache = new Map<string, LLMClient>();
  * 获取或创建 LLM 客户端（带缓存）
  */
 export function getOrCreateLLMClient(config: LLMConfig): LLMClient {
-  const cacheKey = `${config.provider}-${config.model}-${config.baseUrl}`;
+  const keySuffix = config.apiKey ? config.apiKey.slice(-8) : '';
+  const cacheKey = `${config.provider}-${config.model}-${config.baseUrl}-${keySuffix}`;
 
   let client = clientCache.get(cacheKey);
   if (!client) {

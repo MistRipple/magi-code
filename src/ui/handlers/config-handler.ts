@@ -254,6 +254,8 @@ export class ConfigCommandHandler implements CommandHandler {
       const { LLMConfigLoader } = await import('../../llm/config');
       LLMConfigLoader.updateWorkerConfig(message.worker, message.config);
       await ctx.getAdapterFactory().clearAdapter(message.worker);
+      const { clearClientCache } = await import('../../llm/clients/client-factory');
+      clearClientCache();
       try {
         // #7 根修复：Worker enabled 变化后，立即重建 dispatch_task/send_worker_message 的 worker enum
         await ctx.getOrchestratorEngine().reloadProfiles();
@@ -262,6 +264,7 @@ export class ConfigCommandHandler implements CommandHandler {
         ctx.sendToast(t('config.toast.workerRefreshFailed', { error: reloadMsg }), 'warning');
       }
       ctx.sendToast(t('config.toast.workerConfigSaved', { worker: message.worker }), 'success');
+      ctx.refreshWorkerStatus();
       logger.info('Worker 配置已保存', { worker: message.worker }, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存 Worker 配置失败', { worker: message.worker, error: error.message }, LogCategory.LLM);
@@ -314,7 +317,10 @@ export class ConfigCommandHandler implements CommandHandler {
       const { LLMConfigLoader } = await import('../../llm/config');
       LLMConfigLoader.updateOrchestratorConfig(message.config);
       await ctx.getAdapterFactory().clearAdapter('orchestrator');
+      const { clearClientCache } = await import('../../llm/clients/client-factory');
+      clearClientCache();
       ctx.sendToast(t('config.toast.orchestratorSaved'), 'success');
+      ctx.refreshWorkerStatus();
       logger.info('编排者配置已保存', undefined, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存编排者配置失败', { error: error.message }, LogCategory.LLM);
@@ -366,8 +372,11 @@ export class ConfigCommandHandler implements CommandHandler {
     try {
       const { LLMConfigLoader } = await import('../../llm/config');
       LLMConfigLoader.updateAuxiliaryConfig(message.config);
+      const { clearClientCache } = await import('../../llm/clients/client-factory');
+      clearClientCache();
       await ctx.getOrchestratorEngine().reloadCompressionAdapter();
       ctx.sendToast(t('config.toast.auxiliarySaved'), 'success');
+      ctx.refreshWorkerStatus();
       logger.info('辅助模型配置已保存', undefined, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存辅助模型配置失败', { error: error.message }, LogCategory.LLM);
@@ -376,18 +385,18 @@ export class ConfigCommandHandler implements CommandHandler {
   }
 
   private async handleTestAuxiliaryConnection(message: Msg<'testAuxiliaryConnection'>, ctx: CommandHandlerContext): Promise<void> {
-    let fallbackModel: string | undefined;
+    let orchestratorModel: string | undefined;
     try {
       const normalizedConfig = { ...message.config, enabled: Boolean(message.config?.apiKey) || message.config?.enabled === true };
       const { LLMConfigLoader } = await import('../../llm/config');
       const orchestratorConfig = LLMConfigLoader.loadOrchestratorConfig();
-      fallbackModel = orchestratorConfig?.provider && orchestratorConfig?.model
+      orchestratorModel = orchestratorConfig?.provider && orchestratorConfig?.model
         ? `${orchestratorConfig.provider} - ${orchestratorConfig.model}`
         : undefined;
 
       if (!normalizedConfig.enabled || !normalizedConfig.apiKey || !normalizedConfig.model) {
         ctx.sendData('auxiliaryConnectionTestResult', {
-          success: false, error: t('config.toast.auxiliaryNotAvailable'), fallbackModel,
+          success: false, error: t('config.toast.auxiliaryNotAvailable'), orchestratorModel,
         });
         ctx.sendToast(t('config.toast.auxiliaryUnavailable'), 'warning');
         return;
@@ -410,7 +419,7 @@ export class ConfigCommandHandler implements CommandHandler {
     } catch (error: any) {
       logger.error('辅助模型连接测试失败', { error: error.message }, LogCategory.LLM);
       ctx.sendData('auxiliaryConnectionTestResult', {
-        success: false, error: error.message, fallbackModel,
+        success: false, error: error.message, orchestratorModel,
       });
       ctx.sendToast(t('config.toast.auxiliaryConnectFailed'), 'warning');
     }

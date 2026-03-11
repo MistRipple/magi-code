@@ -48,7 +48,7 @@
   }: Props = $props();
 
   // 折叠状态 - Mermaid / wait_for_workers 卡片默认展开，其他由 initialExpanded 控制
-  let collapsed = $state(untrack(() => !initialExpanded && name !== 'mermaid_diagram' && name !== 'wait_for_workers'));
+  let collapsed = $state(untrack(() => !initialExpanded && status !== 'error' && name !== 'mermaid_diagram' && name !== 'wait_for_workers'));
   let copySuccess = $state(false);
 
   // 格式化内容

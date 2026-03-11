@@ -953,16 +953,33 @@ If any criterion is not satisfied:
     // 4. 解析验收结果
     const content = response.content || '';
     let gaps: Array<{ criterion: string; reason: string; fix: string }> = [];
+    let parseSucceeded = false;
     try {
       const jsonMatch = content.match(/```json\s*([\s\S]*?)```/) || content.match(/(\{[\s\S]*\})/);
       if (jsonMatch) {
         const result = JSON.parse(jsonMatch[1]);
+        parseSucceeded = true;
         if (!result.allSatisfied && Array.isArray(result.gaps)) {
           gaps = result.gaps.filter((g: { criterion?: string; fix?: string }) => g.criterion && g.fix);
         }
       }
-    } catch {
-      // JSON 解析失败，视为验收通过
+    } catch (parseError) {
+      logger.warn('Worker.验收检查.JSON解析失败', {
+        assignmentId: assignment.id,
+        round: round + 1,
+        error: parseError instanceof Error ? parseError.message : String(parseError),
+        contentLength: content.length,
+      }, LogCategory.ORCHESTRATOR);
+    }
+
+    // 解析失败 → 降级为"验收不通过"，生成一条通用修复 gap，
+    // 避免在模型输出异常时静默放行
+    if (!parseSucceeded && content.length > 0) {
+      gaps = [{
+        criterion: '验收结果解析',
+        reason: '模型返回的验收结果格式不合规，无法解析为有效 JSON',
+        fix: '重新执行验收检查，确保输出为合规的 JSON 格式',
+      }];
     }
 
     if (gaps.length === 0) {
@@ -2089,27 +2106,50 @@ Not applicable: The task itself is a single goal — execute it directly.`);
     const effectiveModifiedFiles = this.mergeModifiedFiles(modifiedFiles, snapshotChanges.allFiles);
     const hasAnyRecordedChanges = effectiveModifiedFiles.length > 0;
 
+    const enforceStrictGate = assignment.scope.requiresModification === true;
+    const appendGateWarning = (warning: string) => this.appendQualityWarning(result, warning);
+
     if (sharedContext && sharedContext.budgetUsage > 1) {
-      gateErrors.push('Quality gate failed: Shared context budget exceeded.');
+      if (enforceStrictGate) {
+        gateErrors.push('Quality gate failed: Shared context budget exceeded.');
+      } else {
+        appendGateWarning('Quality gate warning: Shared context budget exceeded.');
+      }
     }
 
     if (result.success) {
       if (!sharedContext) {
-        gateErrors.push('Quality gate failed: Shared context was not injected.');
+        if (enforceStrictGate) {
+          gateErrors.push('Quality gate failed: Shared context was not injected.');
+        } else {
+          appendGateWarning('Quality gate warning: Shared context was not injected.');
+        }
       }
 
       if (!this.hasWorkerSharedFacts(assignment.missionId, startedAt)) {
-        gateErrors.push('Quality gate failed: No reusable shared facts were written.');
+        if (enforceStrictGate) {
+          gateErrors.push('Quality gate failed: No reusable shared facts were written.');
+        } else {
+          appendGateWarning('Quality gate warning: No reusable shared facts were written.');
+        }
       }
 
       const hasTargetFiles = (assignment.scope.targetPaths?.length || 0) > 0;
       if (hasTargetFiles && this.cacheReadStats.lookups === 0) {
-        gateErrors.push('Quality gate failed: Target files were not pre-read through cache.');
+        if (enforceStrictGate) {
+          gateErrors.push('Quality gate failed: Target files were not pre-read through cache.');
+        } else {
+          appendGateWarning('Quality gate warning: Target files were not pre-read through cache.');
+        }
       }
 
       const unknownRequiredContracts = this.collectUnknownRequiredContracts(assignment);
       if (unknownRequiredContracts.length > 0) {
-        gateErrors.push(`Quality gate failed: Undeclared contract dependencies found: ${unknownRequiredContracts.join(', ')}`);
+        if (enforceStrictGate) {
+          gateErrors.push(`Quality gate failed: Undeclared contract dependencies found: ${unknownRequiredContracts.join(', ')}`);
+        } else {
+          appendGateWarning(`Quality gate warning: Undeclared contract dependencies found: ${unknownRequiredContracts.join(', ')}`);
+        }
       }
 
       if (assignment.scope.requiresModification && !hasAnyRecordedChanges) {
@@ -2120,15 +2160,17 @@ Not applicable: The task itself is a single goal — execute it directly.`);
         this.requiresRealModification(todo) && !this.hasRecordedTodoModifications(todo)
       );
       if (emptyWriteTodos.length > 0) {
-        if (!hasAnyRecordedChanges) {
-          gateErrors.push(
-            `Quality gate failed: Completed write-required todos recorded no real file modifications: ${emptyWriteTodos.map(todo => `${todo.id}(${todo.type})`).join(', ')}`
-          );
+        const emptyTodoMessage = `Quality gate warning: write-required todos missing per-todo file tracking: ${emptyWriteTodos.map(todo => `${todo.id}(${todo.type})`).join(', ')}`;
+        if (assignment.scope.requiresModification) {
+          if (!hasAnyRecordedChanges) {
+            gateErrors.push(
+              `Quality gate failed: Completed write-required todos recorded no real file modifications: ${emptyWriteTodos.map(todo => `${todo.id}(${todo.type})`).join(', ')}`
+            );
+          } else {
+            this.appendQualityWarning(result, emptyTodoMessage);
+          }
         } else {
-          this.appendQualityWarning(
-            result,
-            `Quality gate warning: write-required todos missing per-todo file tracking: ${emptyWriteTodos.map(todo => `${todo.id}(${todo.type})`).join(', ')}`
-          );
+          this.appendQualityWarning(result, emptyTodoMessage);
         }
       }
     }

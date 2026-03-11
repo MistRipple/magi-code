@@ -37,6 +37,15 @@ export class WorkerStatusService {
 
   constructor(private readonly ctx: WorkerStatusContext) {}
 
+  /**
+   * 清除状态缓存，下次查询将强制重新检测。
+   * 在模型配置变更后调用，避免返回旧模型名的过期缓存。
+   */
+  invalidateCache(): void {
+    this.workerStatusCache = null;
+    this.workerStatusCacheAt = 0;
+  }
+
   async sendWorkerStatus(force: boolean = false): Promise<void> {
     try {
       const now = Date.now();
@@ -79,7 +88,7 @@ export class WorkerStatusService {
     const orchestratorLabel = formatModelLabel(config.orchestrator);
     const auxiliaryFallbackLabel = orchestratorLabel ? t('workerStatus.orchestratorModelLabel', { label: orchestratorLabel }) : t('workerStatus.orchestratorModelFallback');
     const setAuxiliaryFallback = (reason: string) => {
-      statuses.auxiliary = { status: 'fallback', model: auxiliaryFallbackLabel, error: reason };
+      statuses.auxiliary = { status: 'orchestrator', model: auxiliaryFallbackLabel, error: reason };
     };
 
     const getCachedStatus = (name: string) => {

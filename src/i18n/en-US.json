@@ -925,7 +925,7 @@
   "dispatch.todo.failed": "Failed: {content} - {error}",
   "dispatch.todo.started": "Running: {content}",
   "dispatch.verification.degradedFallbackWarning": "Acceptance check execution anomaly",
-  "dispatch.waitForWorkers.timeout": "wait_for_workers timed out ({seconds}s), {pendingCount} tasks still pending",
+  "dispatch.waitForWorkers.timeout": "wait_for_workers idle timeout ({seconds}s), {pendingCount} tasks still pending",
   "dispatchBatch.cancel.cancelled": "Cancelled",
   "dispatchBatch.cancel.taskCancelled": "Task cancelled",
   "dispatchBatch.cancel.userCancelled": "Cancelled by user",

@@ -356,6 +356,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       getWorkspaceRoot: () => this.workspaceRoot,
       getPromptEnhancer: () => this.promptEnhancer,
       getExtensionUri: () => this.extensionUri,
+      refreshWorkerStatus: () => {
+        this.workerStatusService.invalidateCache();
+        void this.workerStatusService.sendWorkerStatus(true).catch((error) => {
+          logger.warn('界面.配置变更.模型状态刷新_失败', { error: String(error) }, LogCategory.UI);
+        });
+      },
     };
     this.commandHandlers = [
       new ConfigCommandHandler(),
@@ -1802,14 +1808,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.processingResetFallbackTimer = setTimeout(() => {
       this.processingResetFallbackTimer = null;
       const processing = this.messageHub.getProcessingState();
-      if (!processing.isProcessing) {
-        return;
-      }
-      if (this.orchestratorEngine.running || this.orchestratorQueueRunning || this.pendingExecutionQueue.length > 0) {
+      if (
+        this.orchestratorEngine.running
+        || this.orchestratorQueueRunning
+        || this.pendingExecutionQueue.length > 0
+        || this.queuedMessagesDrainRunning
+      ) {
         return;
       }
       logger.warn('界面.消息.处理态_延迟兜底清理', {
         reason,
+        backendProcessing: processing.isProcessing,
         source: processing.source,
         agent: processing.agent,
       }, LogCategory.UI);
@@ -3643,6 +3652,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       ? this.orchestratorEngine.getPlanLedgerSnapshot(planSessionId).plans
       : [];
 
+    const stateUpdatedAt = Date.now();
     return {
       currentSessionId: this.activeSessionId ?? currentSession?.id,
       sessions: sessionMetas,
@@ -3658,6 +3668,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       orchestratorPhase: this.orchestratorEngine.phase,
       activePlan,
       planHistory,
+      stateUpdatedAt,
     };
   }
 
@@ -3797,7 +3808,26 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       globalEventBus.clear();
       logger.info('界面.销毁.事件.已清理', undefined, LogCategory.UI);
 
-      // 5. 清理 Webview
+      // 5. 清理定时器与请求跟踪
+      for (const timer of this.requestTimeouts.values()) {
+        clearTimeout(timer);
+      }
+      this.requestTimeouts.clear();
+      this.messageIdToRequestId.clear();
+      this.recentRequestIds.clear();
+      this.streamMessageIds.clear();
+      if (this.logFlushTimer) {
+        clearTimeout(this.logFlushTimer);
+        this.logFlushTimer = null;
+      }
+      if (this.processingResetFallbackTimer) {
+        clearTimeout(this.processingResetFallbackTimer);
+        this.processingResetFallbackTimer = null;
+      }
+      this.clearPendingRecoveryState();
+      this.queuedMessagesBySession.clear();
+
+      // 6. 清理 Webview
       this._view = undefined;
 
       logger.info('界面.销毁.完成', undefined, LogCategory.UI);

@@ -87,7 +87,7 @@ const DEFAULT_CONFIG: PipelineConfig = {
   retentionTime: 5 * 60 * 1000,
   debug: false,
 };
-const STREAM_STALE_TIMEOUT_MS = 30 * 60 * 1000;
+const STREAM_STALE_TIMEOUT_MS = 5 * 60 * 60 * 1000;
 
 export class MessagePipeline {
   private bus: EventEmitter;
@@ -639,7 +639,9 @@ export class MessagePipeline {
       startedAt: isProcessing ? (this.processingState.startedAt || Date.now()) : null,
       transitionKind,
     };
-    if (prev !== isProcessing) this.safeEmit('processingStateChanged', this.getProcessingState());
+    if (prev !== isProcessing || transitionKind === 'forced') {
+      this.safeEmit('processingStateChanged', this.getProcessingState());
+    }
   }
 
   private checkAndUpdateProcessingState(): void { if (!this.hasActiveMessages()) this.updateProcessingState(false, null, null); }

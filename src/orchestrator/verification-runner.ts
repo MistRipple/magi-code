@@ -533,7 +533,11 @@ export class VerificationRunner {
       const content = fs.readFileSync(packageJsonPath, 'utf-8');
       const parsed = JSON.parse(content) as { scripts?: Record<string, string> };
       return parsed.scripts && typeof parsed.scripts === 'object' ? parsed.scripts : {};
-    } catch {
+    } catch (readError) {
+      logger.warn('验证器.package.json解析失败', {
+        cwd,
+        error: readError instanceof Error ? readError.message : String(readError),
+      }, LogCategory.ORCHESTRATOR);
       return {};
     }
   }

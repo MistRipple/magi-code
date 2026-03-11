@@ -150,10 +150,12 @@ export class DispatchManager {
   };
   private static readonly RUNTIME_UNAVAILABLE_COOLDOWN_MS = 60_000;
   private static readonly MAX_MISSION_SESSION_RECORDS = 100;
-  private static readonly ACK_TIMEOUT_MS = 20_000;
+  private static readonly ACK_TIMEOUT_MS = 60_000;
   private static readonly HEARTBEAT_INTERVAL_MS = 10_000;
-  private static readonly LEASE_TTL_MS = 60_000;
+  private static readonly LEASE_TTL_MS = 120_000;
   private static readonly LEASE_WATCH_INTERVAL_MS = 2_000;
+  private static readonly STANDARD_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+  private static readonly DEEP_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
   // Phase B+ 中间调用频率限制：按 batch 隔离，避免跨批次互相污染
   private phaseBPlusTimestamps = new Map<string, number>();
@@ -261,7 +263,7 @@ export class DispatchManager {
    */
   private reportTodoProgress(assignmentId: string, summary: string): void {
     const entry = this.activeBatch?.getEntry(assignmentId);
-    if (entry) {
+    if (entry && entry.status === 'running') {
       this.deps.messageHub.subTaskCard({
         id: assignmentId,
         title: entry.taskContract.taskTitle,
@@ -1253,16 +1255,28 @@ export class DispatchManager {
         );
       }
 
+      const entry = batch?.getEntry(taskId);
+      const shouldUpdateCard = !entry || !isTerminalStatus(entry.status);
+      if (!shouldUpdateCard && entry) {
+        logger.warn('Dispatch.Worker.终态已存在_跳过卡片更新', {
+          taskId,
+          worker: effectiveWorker,
+          status: entry.status,
+        }, LogCategory.ORCHESTRATOR);
+      }
+
       // 更新 subTaskCard 最终状态
-      this.deps.messageHub.subTaskCard({
-        id: taskId,
-        title: taskTitle,
-        status: result.success ? 'completed' : 'failed',
-        worker: effectiveWorker,
-        summary,
-        modifiedFiles,
-        ...(!result.success && { error: result.errors?.[0] || summary }),
-      });
+      if (shouldUpdateCard) {
+        this.deps.messageHub.subTaskCard({
+          id: taskId,
+          title: taskTitle,
+          status: result.success ? 'completed' : 'failed',
+          worker: effectiveWorker,
+          summary,
+          modifiedFiles,
+          ...(!result.success && { error: result.errors?.[0] || summary }),
+        });
+      }
 
       // 更新 DispatchBatch 状态（含 tokenUsage 传递，供 archive 日志统计）
       const dispatchResult: DispatchResult = {
@@ -1276,10 +1290,12 @@ export class DispatchManager {
           outputTokens: result.tokenUsage.outputTokens || 0,
         } : undefined,
       };
-      if (result.success) {
-        batch?.markCompleted(taskId, dispatchResult);
-      } else {
-        batch?.markFailed(taskId, dispatchResult);
+      if (shouldUpdateCard) {
+        if (result.success) {
+          batch?.markCompleted(taskId, dispatchResult);
+        } else {
+          batch?.markFailed(taskId, dispatchResult);
+        }
       }
 
       // 记录 Worker Token 使用到 executionStats
@@ -1294,13 +1310,24 @@ export class DispatchManager {
       // C-09: 取消异常不按失败处理，cancelAll 已标记 cancelled 状态
       if (error instanceof CancellationError || error?.isCancellation) {
         this.markProtocolNack(taskId, error.message || 'cancelled');
-        this.deps.messageHub.subTaskCard({
-          id: taskId,
-          title: taskTitle,
-          status: 'stopped',
-          worker: effectiveWorker,
-          summary: error.message,
-        });
+        const entry = batch?.getEntry(taskId);
+        const shouldUpdateCard = !entry || !isTerminalStatus(entry.status);
+        if (!shouldUpdateCard && entry) {
+          logger.warn('Dispatch.Worker.终态已存在_跳过取消卡片', {
+            taskId,
+            worker: effectiveWorker,
+            status: entry.status,
+          }, LogCategory.ORCHESTRATOR);
+        }
+        if (shouldUpdateCard) {
+          this.deps.messageHub.subTaskCard({
+            id: taskId,
+            title: taskTitle,
+            status: 'stopped',
+            worker: effectiveWorker,
+            summary: error.message,
+          });
+        }
         logger.info('编排工具.dispatch_task.Worker取消', {
           worker: effectiveWorker, taskId, reason: error.message,
         }, LogCategory.ORCHESTRATOR);
@@ -1333,21 +1360,32 @@ export class DispatchManager {
         }, LogCategory.ORCHESTRATOR);
       }
 
-      this.deps.messageHub.subTaskCard({
-        id: taskId,
-        title: taskTitle,
-        status: 'failed',
-        worker: effectiveWorker,
-        summary: userErrorMsg,
-        error: userErrorMsg,
-      });
+      const entry = batch?.getEntry(taskId);
+      const shouldUpdateCard = !entry || !isTerminalStatus(entry.status);
+      if (!shouldUpdateCard && entry) {
+        logger.warn('Dispatch.Worker.终态已存在_跳过失败卡片', {
+          taskId,
+          worker: effectiveWorker,
+          status: entry.status,
+        }, LogCategory.ORCHESTRATOR);
+      }
+      if (shouldUpdateCard) {
+        this.deps.messageHub.subTaskCard({
+          id: taskId,
+          title: taskTitle,
+          status: 'failed',
+          worker: effectiveWorker,
+          summary: userErrorMsg,
+          error: userErrorMsg,
+        });
 
-      this.deps.messageHub.workerError(
-        effectiveWorker,
-        userErrorMsg,
-      );
+        this.deps.messageHub.workerError(
+          effectiveWorker,
+          userErrorMsg,
+        );
 
-      batch?.markFailed(taskId, { success: false, summary: userErrorMsg, errors: [userErrorMsg] });
+        batch?.markFailed(taskId, { success: false, summary: userErrorMsg, errors: [userErrorMsg] });
+      }
 
       // C-15: Worker 崩溃后状态清理
       try {
@@ -1896,6 +1934,22 @@ export class DispatchManager {
     batch?.touchActivity();
     // progress 类型：更新 subTaskCard
     if (report.type === 'progress' && report.progress) {
+      const entry = batch?.getEntry(report.assignmentId);
+      if (!entry) {
+        logger.warn('Dispatch.Worker.Report.进度更新缺少任务条目', {
+          assignmentId: report.assignmentId,
+          worker: report.workerId,
+        }, LogCategory.ORCHESTRATOR);
+        return defaultResponse;
+      }
+      if (entry.status !== 'running') {
+        logger.info('Dispatch.Worker.Report.进度更新已忽略_非运行态', {
+          assignmentId: report.assignmentId,
+          worker: report.workerId,
+          status: entry.status,
+        }, LogCategory.ORCHESTRATOR);
+        return defaultResponse;
+      }
       this.deps.messageHub.subTaskCard({
         id: report.assignmentId,
         title: report.progress.currentStep || '',
@@ -2024,7 +2078,7 @@ export class DispatchManager {
     }
 
     const waitResult = await this.completionQueue.waitFor(batch, taskIds, {
-      waitTimeoutMs: 10 * 60 * 1000,
+      idleTimeoutMs: this.getIdleTimeoutMs(),
       wakeupTimeoutMs: 30_000,
       onTimeout: (pendingTaskIds, elapsedMs) => {
         this.deps.messageHub.notify(
@@ -2058,6 +2112,12 @@ export class DispatchManager {
     }
 
     return waitResult;
+  }
+
+  getIdleTimeoutMs(): number {
+    return this.deps.adapterFactory.isDeepTask()
+      ? DispatchManager.DEEP_IDLE_TIMEOUT_MS
+      : DispatchManager.STANDARD_IDLE_TIMEOUT_MS;
   }
 
   private startLeaseWatcher(): void {

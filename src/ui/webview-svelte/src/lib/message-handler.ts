@@ -470,6 +470,18 @@ function handleStateUpdate(message: WebviewMessage) {
   const state = message.state as AppState;
   if (!state) return;
   const previousModeRaw = getState().appState?.interactionMode;
+  const incomingStateUpdatedAt = typeof state.stateUpdatedAt === 'number' ? state.stateUpdatedAt : undefined;
+  const currentStateUpdatedAt = typeof getState().appState?.stateUpdatedAt === 'number'
+    ? (getState().appState?.stateUpdatedAt as number)
+    : undefined;
+
+  if (incomingStateUpdatedAt !== undefined && currentStateUpdatedAt !== undefined && incomingStateUpdatedAt < currentStateUpdatedAt) {
+    console.warn('[MessageHandler] 忽略过期 stateUpdate', {
+      incomingUpdatedAt: incomingStateUpdatedAt,
+      currentUpdatedAt: currentStateUpdatedAt,
+    });
+    return;
+  }
 
   const nextUpdatedAt = typeof state.interactionModeUpdatedAt === 'number' ? state.interactionModeUpdatedAt : undefined;
   const currentUpdatedAt = typeof getState().appState?.interactionModeUpdatedAt === 'number'
@@ -1878,6 +1890,18 @@ function handleUnifiedData(standard: StandardMessage) {
       handleWorkerStatusUpdate(asMessage(payload));
       break;
 
+    case 'workerConnectionTestResult':
+      handleConnectionTestResult(asMessage(payload));
+      break;
+
+    case 'orchestratorConnectionTestResult':
+      handleConnectionTestResult({ ...asMessage(payload), _target: 'orchestrator' });
+      break;
+
+    case 'auxiliaryConnectionTestResult':
+      handleConnectionTestResult({ ...asMessage(payload), _target: 'auxiliary' });
+      break;
+
     case 'interactionModeChanged':
       if (isStaleInteractionModeUpdate(payload, 'interactionModeChanged')) {
         break;
@@ -2594,6 +2618,7 @@ function updateTodo(
  * 避免等待下次 stateUpdate 全量同步才更新 UI
  */
 function syncSubTaskStatus(todoId: string, status: SubTaskItem['status']): void {
+  const terminalStatuses: Array<SubTaskItem['status']> = ['completed', 'failed', 'skipped', 'cancelled'];
   const store = getState();
   const tasksList = store.tasks;
   for (let ti = 0; ti < tasksList.length; ti++) {
@@ -2601,6 +2626,15 @@ function syncSubTaskStatus(todoId: string, status: SubTaskItem['status']): void 
     const subTasks = task.subTasks;
     for (let si = 0; si < subTasks.length; si++) {
       if (subTasks[si].id === todoId) {
+        const currentStatus = subTasks[si].status;
+        if (terminalStatuses.includes(currentStatus) && currentStatus !== status) {
+          console.warn('[MessageHandler] 子任务已终态_忽略回退更新', {
+            todoId,
+            currentStatus,
+            incomingStatus: status,
+          });
+          return;
+        }
         const updatedSubTasks = subTasks.map((st, idx) =>
           idx === si ? { ...st, status } : st
         );
@@ -2943,6 +2977,67 @@ function handleWorkerStatusUpdate(message: WebviewMessage) {
   // 直接存储完整的状态信息，不再简化
   // 这样 BottomTabs 和 SettingsPanel 可以使用同一个数据源
   store.modelStatus = { ...store.modelStatus, ...statuses };
+}
+
+/**
+ * 处理连接测试结果消息（全局）
+ * 将连接测试的状态同步到全局 store，确保即使 SettingsPanel 已卸载，
+ * BottomTabs 等其他组件也能获取最新状态。
+ */
+function handleConnectionTestResult(message: WebviewMessage) {
+  const store = getState();
+  const success = Boolean(message.success);
+  const error = message.error as string | undefined;
+
+  // Worker 连接测试
+  const worker = message.worker as string | undefined;
+  if (worker) {
+    store.modelStatus = {
+      ...store.modelStatus,
+      [worker]: {
+        status: success ? 'available' : 'error',
+        model: store.modelStatus[worker]?.model,
+        error: success ? undefined : error,
+      },
+    };
+    return;
+  }
+
+  // orchestratorConnectionTestResult / auxiliaryConnectionTestResult
+  // 通过 dataType 区分，由调用方传入 target
+  const target = message._target as 'orchestrator' | 'auxiliary' | undefined;
+  if (!target) return;
+
+  if (target === 'orchestrator') {
+    store.modelStatus = {
+      ...store.modelStatus,
+      orchestrator: {
+        status: success ? 'available' : 'error',
+        model: store.modelStatus.orchestrator?.model,
+        error: success ? undefined : error,
+      },
+    };
+  } else if (target === 'auxiliary') {
+    if (success) {
+      store.modelStatus = {
+        ...store.modelStatus,
+        auxiliary: {
+          status: 'available',
+          model: store.modelStatus.auxiliary?.model,
+        },
+      };
+    } else {
+      const orchestratorModel = (message.orchestratorModel as string) || store.modelStatus.orchestrator?.model;
+      store.modelStatus = {
+        ...store.modelStatus,
+        auxiliary: {
+          status: 'orchestrator',
+          model: orchestratorModel || store.modelStatus.auxiliary?.model,
+          error,
+        },
+      };
+    }
+  }
 }
 
 // ============ Worker Session 事件处理（提案 4.1） ============

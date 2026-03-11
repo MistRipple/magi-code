@@ -499,6 +499,7 @@ export interface AppState {
   toasts?: Toast[];
   interactionMode?: 'ask' | 'auto';
   interactionModeUpdatedAt?: number;
+  stateUpdatedAt?: number;
   [key: string]: unknown;
 }
 

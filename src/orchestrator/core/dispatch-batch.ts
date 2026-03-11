@@ -250,6 +250,10 @@ export class DispatchBatch extends EventEmitter {
     return this._auditOutcome;
   }
 
+  getLastActivityAt(): number {
+    return this._lastActivityAt;
+  }
+
   setAuditOutcome(outcome: DispatchAuditOutcome): void {
     this._auditOutcome = outcome;
   }

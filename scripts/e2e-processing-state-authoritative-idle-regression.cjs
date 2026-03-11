@@ -66,6 +66,7 @@ async function main() {
   const source = fs.readFileSync(sourcePath, 'utf8');
   assert(source.includes("transitionKind === 'forced'"), 'message-handler 未按 forced idle 消费 processingStateChanged(false)');
   assert(!source.includes("case 'task_failed': {\n      // 任务生命周期终极信号：彻底清除所有处理态"), 'task_failed 仍把请求级结束当成系统级空闲');
+  assert(source.includes("transitionKind === 'forced') {"), 'message-handler forced idle 分支缺失');
 
   const { initMessageHandler } = require(handlerPath);
   const {
@@ -108,6 +109,14 @@ async function main() {
   assert(messagesState.activeMessageIds.size === 0, 'forced false 应清空 activeMessageIds');
   assert(messagesState.pendingRequests.size === 0, 'forced false 应清空 pendingRequests');
 
+  setIsProcessing(true);
+  markMessageActive('msg-streaming-stale');
+  emitData({ isProcessing: false, transitionKind: 'derived' });
+  assert(messagesState.isProcessing === true, 'derived false 后残留处理态应保持，等待 authoritative idle');
+  emitData({ isProcessing: false, transitionKind: 'forced' });
+  assert(messagesState.isProcessing === false, '重复 forced false 仍应清空残留处理态');
+  assert(messagesState.activeMessageIds.size === 0, '重复 forced false 仍应清空 activeMessageIds');
+
   console.log('\n=== processing state authoritative idle regression ===');
   console.log(JSON.stringify({
     pass: true,
@@ -115,6 +124,7 @@ async function main() {
       'task_completed_does_not_clear_system_processing',
       'derived_false_is_ignored',
       'forced_false_clears_processing_state',
+      'repeated_forced_false_clears_residual_processing_state',
     ],
   }, null, 2));
 }

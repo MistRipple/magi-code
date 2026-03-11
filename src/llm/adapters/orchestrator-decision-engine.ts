@@ -45,6 +45,10 @@ export class OrchestratorDecisionEngine {
     budget: OrchestratorExecutionBudget,
     current: Pick<OrchestratorGateState, 'budgetBreachStreak' | 'externalWaitBreachStreak'>,
   ): Pick<OrchestratorGateState, 'budgetBreachStreak' | 'externalWaitBreachStreak'> {
+    const runningRequired = snapshot.runningRequired ?? 0;
+    if (runningRequired > 0) {
+      return { budgetBreachStreak: 0, externalWaitBreachStreak: 0 };
+    }
     const budgetBreachStreak = this.isBudgetThresholdBreached(snapshot, budget)
       ? current.budgetBreachStreak + 1
       : 0;
@@ -64,45 +68,48 @@ export class OrchestratorDecisionEngine {
     const { noProgressStreak, consecutiveUpstreamModelErrors, budgetBreachStreak, externalWaitBreachStreak } = gateState;
     const candidates: TerminationCandidate[] = [];
     const events: OrchestratorGateEvent[] = [];
+    const runningRequired = snapshot.runningRequired ?? 0;
 
     // 仅 required todo 轨道启用预算/超时/上游错误硬门禁。
     if (snapshot.requiredTotal === 0) {
       return { candidates, events };
     }
 
-    const hardBudgetBreach = this.isHardBudgetBreach(snapshot, budget);
-    if (hardBudgetBreach || budgetBreachStreak >= this.policy.budgetBreachStreakThreshold) {
-      const label = hardBudgetBreach ? 'budget_hard' : 'budget_debounced';
-      candidates.push(createCandidate('budget_exceeded', label));
-      events.push({
-        gate: 'budget',
-        hard: hardBudgetBreach,
-        label,
-        payload: {
-          requiredTotal: snapshot.requiredTotal,
-          attemptSeq: snapshot.attemptSeq,
-          budgetBreachStreak,
-          elapsedMs: snapshot.budgetState.elapsedMs,
-          tokenUsed: snapshot.budgetState.tokenUsed,
-        },
-      });
-    }
+    if (runningRequired === 0) {
+      const hardBudgetBreach = this.isHardBudgetBreach(snapshot, budget);
+      if (hardBudgetBreach || budgetBreachStreak >= this.policy.budgetBreachStreakThreshold) {
+        const label = hardBudgetBreach ? 'budget_hard' : 'budget_debounced';
+        candidates.push(createCandidate('budget_exceeded', label));
+        events.push({
+          gate: 'budget',
+          hard: hardBudgetBreach,
+          label,
+          payload: {
+            requiredTotal: snapshot.requiredTotal,
+            attemptSeq: snapshot.attemptSeq,
+            budgetBreachStreak,
+            elapsedMs: snapshot.budgetState.elapsedMs,
+            tokenUsed: snapshot.budgetState.tokenUsed,
+          },
+        });
+      }
 
-    const hardExternalWaitBreach = this.isHardExternalWaitBreach(snapshot);
-    if (hardExternalWaitBreach || externalWaitBreachStreak >= this.policy.externalWaitBreachStreakThreshold) {
-      const label = hardExternalWaitBreach ? 'external_wait_hard' : 'external_wait_debounced';
-      candidates.push(createCandidate('external_wait_timeout', label));
-      events.push({
-        gate: 'external_wait',
-        hard: hardExternalWaitBreach,
-        label,
-        payload: {
-          requiredTotal: snapshot.requiredTotal,
-          attemptSeq: snapshot.attemptSeq,
-          externalWaitBreachStreak,
-          maxExternalWaitAgeMs: snapshot.blockerState.maxExternalWaitAgeMs,
-        },
-      });
+      const hardExternalWaitBreach = this.isHardExternalWaitBreach(snapshot);
+      if (hardExternalWaitBreach || externalWaitBreachStreak >= this.policy.externalWaitBreachStreakThreshold) {
+        const label = hardExternalWaitBreach ? 'external_wait_hard' : 'external_wait_debounced';
+        candidates.push(createCandidate('external_wait_timeout', label));
+        events.push({
+          gate: 'external_wait',
+          hard: hardExternalWaitBreach,
+          label,
+          payload: {
+            requiredTotal: snapshot.requiredTotal,
+            attemptSeq: snapshot.attemptSeq,
+            externalWaitBreachStreak,
+            maxExternalWaitAgeMs: snapshot.blockerState.maxExternalWaitAgeMs,
+          },
+        });
+      }
     }
 
     if (consecutiveUpstreamModelErrors >= this.policy.upstreamModelErrorStreak) {
@@ -120,7 +127,6 @@ export class OrchestratorDecisionEngine {
       });
     }
 
-    const runningRequired = snapshot.runningRequired ?? 0;
     if (
       snapshot.requiredTotal > 0
       && noProgressStreak >= this.policy.stalledWindowSize
@@ -154,29 +160,26 @@ export class OrchestratorDecisionEngine {
     const { snapshot, budget, gateState, assistantText } = params;
     const { noProgressStreak, consecutiveUpstreamModelErrors, budgetBreachStreak, externalWaitBreachStreak } = gateState;
     const useTodoTrackGuards = snapshot.requiredTotal > 0;
+    const runningRequired = snapshot.runningRequired ?? 0;
 
     if (snapshot.requiredTotal > 0
       && snapshot.progressVector.terminalRequiredTodos >= snapshot.requiredTotal
       && snapshot.runningOrPendingRequired === 0) {
       return snapshot.failedRequired > 0 ? 'failed' : 'completed';
     }
-    if (
-      useTodoTrackGuards
-      && (
+    if (useTodoTrackGuards && runningRequired === 0) {
+      if (
         this.isHardBudgetBreach(snapshot, budget)
         || budgetBreachStreak >= this.policy.budgetBreachStreakThreshold
-      )
-    ) {
-      return 'budget_exceeded';
-    }
-    if (
-      useTodoTrackGuards
-      && (
+      ) {
+        return 'budget_exceeded';
+      }
+      if (
         this.isHardExternalWaitBreach(snapshot)
         || externalWaitBreachStreak >= this.policy.externalWaitBreachStreakThreshold
-      )
-    ) {
-      return 'external_wait_timeout';
+      ) {
+        return 'external_wait_timeout';
+      }
     }
     if (
       useTodoTrackGuards
@@ -184,7 +187,6 @@ export class OrchestratorDecisionEngine {
     ) {
       return 'upstream_model_error';
     }
-    const runningRequired = snapshot.runningRequired ?? 0;
     if (
       snapshot.requiredTotal > 0
       && noProgressStreak >= this.policy.stalledWindowSize
@@ -206,6 +208,9 @@ export class OrchestratorDecisionEngine {
     if (snapshot.requiredTotal === 0) {
       return false;
     }
+    if ((snapshot.runningRequired ?? 0) > 0) {
+      return false;
+    }
     return snapshot.budgetState.elapsedMs >= budget.maxDurationMs
       || snapshot.budgetState.tokenUsed >= budget.maxTokenUsage
       || this.isErrorRateBudgetExceeded(snapshot, budget);
@@ -213,6 +218,9 @@ export class OrchestratorDecisionEngine {
 
   public isExternalWaitThresholdBreached(snapshot: TerminationSnapshot): boolean {
     if (snapshot.requiredTotal === 0) {
+      return false;
+    }
+    if ((snapshot.runningRequired ?? 0) > 0) {
       return false;
     }
     return snapshot.blockerState.maxExternalWaitAgeMs >= this.policy.externalWaitSlaMs;
@@ -225,6 +233,9 @@ export class OrchestratorDecisionEngine {
     if (snapshot.requiredTotal === 0) {
       return false;
     }
+    if ((snapshot.runningRequired ?? 0) > 0) {
+      return false;
+    }
     return snapshot.budgetState.elapsedMs >= Math.ceil(
       budget.maxDurationMs * this.policy.budgetHardLimitFactor,
     )
@@ -235,6 +246,9 @@ export class OrchestratorDecisionEngine {
 
   public isHardExternalWaitBreach(snapshot: TerminationSnapshot): boolean {
     if (snapshot.requiredTotal === 0) {
+      return false;
+    }
+    if ((snapshot.runningRequired ?? 0) > 0) {
       return false;
     }
     return snapshot.blockerState.maxExternalWaitAgeMs >= Math.ceil(

@@ -13,7 +13,7 @@
   }
 
   let { toolCall, status = 'running', initialExpanded = true }: Props = $props();
-  let collapsed = $state(untrack(() => !initialExpanded));
+  let collapsed = $state(untrack(() => !initialExpanded && status !== 'error'));
 
   function parseJson(content?: string): Record<string, unknown> | null {
     const parsed = parseLeadingJson(content);

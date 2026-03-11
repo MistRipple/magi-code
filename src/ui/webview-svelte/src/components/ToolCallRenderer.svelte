@@ -20,7 +20,7 @@
   <TerminalSessionCard
     toolCall={block.toolCall}
     status={toolStatus}
-    initialExpanded={Boolean(toolStatus === 'running' || toolStatus === 'pending')}
+    initialExpanded={Boolean(toolStatus === 'running' || toolStatus === 'pending' || toolStatus === 'error')}
   />
 {:else}
   <ToolCall
@@ -32,6 +32,6 @@
     error={block.toolCall?.error}
     standardized={block.toolCall?.standardized}
     duration={block.toolCall?.endTime && block.toolCall?.startTime ? block.toolCall.endTime - block.toolCall.startTime : undefined}
-    initialExpanded={false}
+    initialExpanded={toolStatus === 'error'}
   />
 {/if}

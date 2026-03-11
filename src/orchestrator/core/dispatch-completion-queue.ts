@@ -4,7 +4,7 @@ import type { DispatchBatch, DispatchEntry, DispatchStatus } from './dispatch-ba
 import { isTerminalStatus } from './dispatch-batch';
 
 interface WaitForWorkersOptions {
-  waitTimeoutMs: number;
+  idleTimeoutMs: number;
   wakeupTimeoutMs: number;
   onTimeout?: (pendingTaskIds: string[], elapsedMs: number) => void;
 }
@@ -62,16 +62,18 @@ export class DispatchCompletionQueue {
 
     let timedOut = false;
     while (!this.isTargetSatisfied(batch, targetIds)) {
-      const elapsed = Date.now() - waitStartedAt;
-      if (elapsed > options.waitTimeoutMs) {
+      const now = Date.now();
+      const idleMs = Math.max(0, now - batch.getLastActivityAt());
+      if (idleMs > options.idleTimeoutMs) {
         timedOut = true;
         const pendingTaskIds = this.getPendingTargetTaskIds(batch, targetIds);
         logger.warn('waitForWorkers.超时', {
-          elapsed,
+          idleMs,
+          waitedMs: now - waitStartedAt,
           targetIds: targetIds ? Array.from(targetIds) : 'all',
           pendingTaskIds,
         }, LogCategory.ORCHESTRATOR);
-        options.onTimeout?.(pendingTaskIds, elapsed);
+        options.onTimeout?.(pendingTaskIds, idleMs);
         break;
       }
 

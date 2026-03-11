@@ -217,6 +217,13 @@ export class OrchestrationExecutor {
   private availableWorkers: { slot: WorkerSlot; description: string }[] = [];
   /** Category → Worker 映射（必须由 DispatchManager 从 ProfileLoader 注入） */
   private categoryWorkerMap: CategoryWorkerEntry[] = [];
+  /** 最近一次 get_todos 快照（用于 update_todo 前置校验） */
+  private lastTodoSnapshot: {
+    ids: Set<string>;
+    total: number;
+    updatedAt: number;
+    scope?: { missionId?: string; sessionId?: string };
+  } | null = null;
 
   private static readonly TOOL_NAMES = ['dispatch_task', 'send_worker_message', 'wait_for_workers', 'split_todo', 'get_todos', 'update_todo'] as const;
   private static readonly UPDATE_TODO_STATUS_ENUM: UpdateTodoStatus[] = ['pending', 'skipped'];
@@ -1066,6 +1073,15 @@ export class OrchestrationExecutor {
         waiverApproved: (t as any).waiverApproved ?? false,
         createdAt: t.createdAt,
       }));
+      this.lastTodoSnapshot = {
+        ids: new Set(summary.map(item => item.id).filter(id => typeof id === 'string' && id.trim().length > 0)),
+        total: summary.length,
+        updatedAt: Date.now(),
+        scope: {
+          missionId: typeof args.mission_id === 'string' ? args.mission_id : undefined,
+          sessionId: typeof args.session_id === 'string' ? args.session_id : undefined,
+        },
+      };
       return {
         toolCallId: toolCall.id,
         content: JSON.stringify(summary),
@@ -1131,6 +1147,24 @@ export class OrchestrationExecutor {
           content: 'Error: updates 必须是数组',
           isError: true,
         };
+      }
+
+      if (!this.lastTodoSnapshot || this.lastTodoSnapshot.total === 0) {
+        return {
+          toolCallId: toolCall.id,
+          content: 'Error: 当前没有可更新的 Todo，请先使用 get_todos 获取列表',
+          isError: true,
+        };
+      }
+
+      for (const update of args.updates) {
+        if (!update.todo_id || !this.lastTodoSnapshot.ids.has(update.todo_id)) {
+          return {
+            toolCallId: toolCall.id,
+            content: `Error: todo_id=${update.todo_id || ''} 不在最近的 Todo 列表中，请先使用 get_todos 刷新`,
+            isError: true,
+          };
+        }
       }
 
       const allowedStatus = new Set(OrchestrationExecutor.UPDATE_TODO_STATUS_ENUM);

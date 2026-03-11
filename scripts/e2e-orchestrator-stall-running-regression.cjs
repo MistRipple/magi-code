@@ -105,12 +105,47 @@ function main() {
   });
   assert(resIdle.candidates.some(c => c.reason === 'stalled'), '无 running 且无 external_wait 时应触发 stalled');
 
+  const snapshotExternalWait = makeSnapshot({
+    runningRequired: 0,
+    runningOrPendingRequired: 1,
+    externalWaitOpen: 1,
+    maxExternalWaitAgeMs: policy.externalWaitSlaMs - 1,
+  });
+  const resExternalWait = engine.collectBudgetCandidates({
+    snapshot: snapshotExternalWait,
+    budget,
+    gateState,
+    createCandidate: (reason, label) => ({ reason, eventId: label, triggeredAt: Date.now() }),
+  });
+  assert(!resExternalWait.candidates.some(c => c.reason === 'stalled'), '存在 external_wait 时不应触发 stalled');
+
+  const gateStateExternalWaitBreach = {
+    ...gateState,
+    externalWaitBreachStreak: policy.externalWaitBreachStreakThreshold,
+  };
+  const snapshotExternalWaitTimeout = makeSnapshot({
+    runningRequired: 0,
+    runningOrPendingRequired: 1,
+    externalWaitOpen: 1,
+    maxExternalWaitAgeMs: policy.externalWaitSlaMs,
+  });
+  const resExternalWaitTimeout = engine.collectBudgetCandidates({
+    snapshot: snapshotExternalWaitTimeout,
+    budget,
+    gateState: gateStateExternalWaitBreach,
+    createCandidate: (reason, label) => ({ reason, eventId: label, triggeredAt: Date.now() }),
+  });
+  assert(resExternalWaitTimeout.candidates.some(c => c.reason === 'external_wait_timeout'), 'external wait 超时应触发 external_wait_timeout');
+  assert(!resExternalWaitTimeout.candidates.some(c => c.reason === 'stalled'), 'external wait 超时时也不应混入 stalled');
+
   console.log('\n=== orchestrator stalled running regression ===');
   console.log(JSON.stringify({
     pass: true,
     checks: [
       'running_required_no_stall',
       'idle_required_stall',
+      'external_wait_blocks_stall',
+      'external_wait_timeout_not_mixed_with_stall',
     ],
   }, null, 2));
 }
