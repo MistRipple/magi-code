@@ -135,6 +135,7 @@ export interface DispatchManagerDeps {
     scopeHint?: string[];
     files?: string[];
     requiresModification: boolean;
+    missionTitle?: string;
   }) => Promise<void> | void;
 }
 
@@ -420,7 +421,7 @@ export class DispatchManager {
 
     orchestrationExecutor.setHandlers({
       dispatch: async (params) => {
-        const { task_name, goal, acceptance, constraints, context, files, scopeHint, dependsOn, category, requiresModification, contracts, idempotencyKey } = params;
+        const { task_name, goal, acceptance, constraints, context, files, scopeHint, dependsOn, category, requiresModification, contracts, idempotencyKey, missionTitle } = params;
         if (typeof requiresModification !== 'boolean') {
           return {
             task_id: '',
@@ -716,6 +717,7 @@ export class DispatchManager {
               scopeHint: taskContract.scopeHint.length > 0 ? taskContract.scopeHint : undefined,
               files: taskContract.files.length > 0 ? taskContract.files : undefined,
               requiresModification: taskContract.requirementAnalysis.requiresModification === true,
+              missionTitle: missionTitle || undefined,
             });
           } catch (ledgerError) {
             logger.warn('编排工具.dispatch_task.计划账本回写失败', {
@@ -1105,7 +1107,7 @@ export class DispatchManager {
       worker: effectiveWorker,
     });
 
-    if (emitWorkerInstruction) {
+    if (emitWorkerInstruction && !batch) {
       // 同一 worker 的多个任务通过 lane 级稳定卡片聚合，避免重复派发多张指令卡。
       this.emitWorkerLaneInstructionCard(entry, effectiveWorker, batch);
     }
@@ -1464,6 +1466,7 @@ export class DispatchManager {
     entry: DispatchEntry,
     worker: WorkerSlot,
     batch: DispatchBatch | null,
+    preferredTaskId?: string,
   ): void {
     if (!batch) {
       this.deps.messageHub.workerInstruction(worker, entry.taskContract.taskTitle, {
@@ -1474,33 +1477,53 @@ export class DispatchManager {
 
     const laneEntries = this.getWorkerLaneEntries(batch, worker);
     const laneTaskIds = laneEntries.map(item => item.taskId);
-    const currentLaneIndex = laneTaskIds.indexOf(entry.taskId);
-    const laneIndex = currentLaneIndex >= 0 ? currentLaneIndex + 1 : 1;
+    const focusTaskId = this.resolveWorkerLaneFocusTaskId(laneEntries, preferredTaskId || entry.taskId);
+    const focusEntry = laneEntries.find(item => item.taskId === focusTaskId) || entry;
+    const currentLaneIndex = laneTaskIds.indexOf(focusTaskId);
     const laneTotal = Math.max(1, laneEntries.length);
+    const laneIndex = currentLaneIndex >= 0 ? currentLaneIndex + 1 : laneTotal;
     const laneCardId = this.getWorkerLaneInstructionCardId(batch.id, worker);
     const laneId = `${batch.id}:${worker}`;
 
     this.deps.messageHub.workerInstruction(
       worker,
-      this.buildWorkerLaneInstructionContent(laneEntries, entry.taskId),
+      this.buildWorkerLaneInstructionContent(laneEntries, focusTaskId),
       {
-        assignmentId: entry.taskId,
+        assignmentId: focusEntry.taskId,
         missionId: batch.id,
         laneId,
         laneCardId,
         laneIndex,
         laneTotal,
         laneTaskIds,
-        laneCurrentTaskId: entry.taskId,
+        laneCurrentTaskId: focusTaskId,
         laneTasks: laneEntries.map(item => ({
           taskId: item.taskId,
           title: item.taskContract.taskTitle,
           status: item.status,
           dependsOn: item.taskContract.dependsOn,
-          isCurrent: item.taskId === entry.taskId,
+          isCurrent: item.taskId === focusTaskId,
         })),
       },
     );
+  }
+
+  private resolveWorkerLaneFocusTaskId(entries: DispatchEntry[], preferredTaskId?: string): string {
+    const runningEntry = entries.find(item => item.status === 'running');
+    if (runningEntry) {
+      return runningEntry.taskId;
+    }
+
+    if (preferredTaskId && entries.some(item => item.taskId === preferredTaskId)) {
+      return preferredTaskId;
+    }
+
+    const nextPendingEntry = entries.find(item => item.status === 'pending' || item.status === 'waiting_deps');
+    if (nextPendingEntry) {
+      return nextPendingEntry.taskId;
+    }
+
+    return entries[entries.length - 1]?.taskId || preferredTaskId || '';
   }
 
   private getWorkerLaneEntries(batch: DispatchBatch, worker: WorkerSlot): DispatchEntry[] {
@@ -1536,7 +1559,7 @@ export class DispatchManager {
   private buildWorkerLaneInstructionContent(entries: DispatchEntry[], currentTaskId: string): string {
     const current = entries.find(entry => entry.taskId === currentTaskId);
     const currentIndex = entries.findIndex(entry => entry.taskId === currentTaskId);
-    const laneIndex = currentIndex >= 0 ? currentIndex + 1 : 1;
+    const laneIndex = currentIndex >= 0 ? currentIndex + 1 : Math.max(entries.length, 1);
     const laneTotal = Math.max(entries.length, 1);
     const list = entries.length > 0 ? entries.map(item => ({
       taskId: item.taskId,
@@ -1561,17 +1584,14 @@ export class DispatchManager {
         const dependsText = item.dependsOn.length > 0
           ? t('dispatch.lane.dependsOn', { dependsOn: item.dependsOn.join(', ') })
           : '';
-        return `${index + 1}. [${this.getWorkerLaneTaskStatusLabel(item.status, item.taskId === currentTaskId)}] ${item.taskTitle}${dependsText}`;
+        return `${index + 1}. [${this.getWorkerLaneTaskStatusLabel(item.status)}] ${item.taskTitle}${dependsText}`;
       }),
     ];
 
     return lines.join('\n');
   }
 
-  private getWorkerLaneTaskStatusLabel(status: DispatchStatus, isCurrent: boolean): string {
-    if (isCurrent) {
-      return t('dispatch.lane.status.running');
-    }
+  private getWorkerLaneTaskStatusLabel(status: DispatchStatus): string {
     switch (status) {
       case 'completed':
         return t('dispatch.lane.status.completed');
@@ -1634,12 +1654,17 @@ export class DispatchManager {
    */
   private setupBatchEventHandlers(batch: DispatchBatch): void {
     // 依赖就绪 → 通过隔离策略筛选后启动 Worker
-    batch.on('task:ready', (_taskId: string, _entry: DispatchEntry) => {
+    batch.on('task:ready', (taskId: string, entry: DispatchEntry) => {
+      this.emitWorkerLaneInstructionCard(entry, entry.worker, batch, taskId);
       this.scheduleDispatchReadyTasks(batch, { reason: 'task-ready' });
     });
 
     // Worker 完成后重新检查是否有同类型排队任务可启动
     batch.on('task:statusChanged', (_taskId: string, status: DispatchStatus) => {
+      const entry = batch.getEntry(_taskId);
+      if (entry) {
+        this.emitWorkerLaneInstructionCard(entry, entry.worker, batch, _taskId);
+      }
       if (isTerminalStatus(status)) {
         this.clearProtocolState(_taskId);
         const mappedStatus = status === 'completed'

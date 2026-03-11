@@ -11,7 +11,7 @@
  * - UI 层通过视图适配器获取展示数据
  */
 
-import { Mission, Assignment, MissionStatus } from '../orchestrator/mission/types';
+import { Mission, Assignment, MissionStatus, MissionDeliveryStatus, MissionContinuationPolicy } from '../orchestrator/mission/types';
 import { UnifiedTodo, TodoStatus } from '../todo/types';
 import type { WorkerSlot } from '../types/agent-types';
 
@@ -59,6 +59,12 @@ export interface TaskView {
   // 状态
   status: TaskViewStatus;   // 映射自 MissionStatus
   priority: number;         // 默认 5
+  deliveryStatus: MissionDeliveryStatus;
+  deliverySummary?: string;
+  deliveryDetails?: string;
+  deliveryWarnings?: string[];
+  continuationPolicy: MissionContinuationPolicy;
+  continuationReason?: string;
 
   // 子任务
   subTasks: TodoItemView[];  // 从 UnifiedTodo 聚合
@@ -205,6 +211,12 @@ export function missionToTaskView(mission: Mission, todos: UnifiedTodo[]): TaskV
     goal: mission.goal,
     status: mapMissionStatusToTaskViewStatus(mission.status),
     priority: 5, // 默认优先级
+    deliveryStatus: mission.deliveryStatus,
+    deliverySummary: mission.deliverySummary,
+    deliveryDetails: mission.deliveryDetails,
+    deliveryWarnings: mission.deliveryWarnings,
+    continuationPolicy: mission.continuationPolicy,
+    continuationReason: mission.continuationReason,
     subTasks,
     createdAt: mission.createdAt,
     startedAt: mission.startedAt,

@@ -42,6 +42,7 @@ export interface MissionOrchestratorEventMap {
   missionDeleted: (data: { missionId: string }) => void;
   missionStatusChanged: (data: { mission: Mission; oldStatus: string; newStatus: string }) => void;
   missionPhaseChanged: (data: { mission: Mission; oldPhase: string; newPhase: string }) => void;
+  missionDeliveryChanged: (data: { mission: Mission; oldStatus: string; newStatus: string }) => void;
   // ---- Worker Session ----
   workerSessionCreated: (data: { sessionId: string; assignmentId: string; workerId: WorkerSlot }) => void;
   workerSessionResumed: (data: { sessionId: string; assignmentId: string; workerId: WorkerSlot; completedTodos: number }) => void;
@@ -132,6 +133,10 @@ export class MissionOrchestrator extends EventEmitter {
 
     this.storage.on('missionPhaseChanged', (data) => {
       this.emit('missionPhaseChanged', data);
+    });
+
+    this.storage.on('missionDeliveryChanged', (data) => {
+      this.emit('missionDeliveryChanged', data);
     });
   }
 

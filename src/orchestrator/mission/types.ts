@@ -30,6 +30,24 @@ export type MissionStatus =
   | 'cancelled';       // 取消
 
 /**
+ * Mission 交付状态（与执行状态解耦）
+ */
+export type MissionDeliveryStatus =
+  | 'pending'   // 待验收
+  | 'passed'    // 交付通过
+  | 'failed'    // 交付未通过
+  | 'blocked'   // 交付阻断（需人工介入）
+  | 'skipped';  // 未执行交付校验
+
+/**
+ * Mission 后续推进策略
+ */
+export type MissionContinuationPolicy =
+  | 'auto'  // 自动修复
+  | 'ask'   // 请求用户确认
+  | 'stop'; // 停止推进
+
+/**
  * Mission 阶段
  */
 export type MissionPhase =
@@ -152,6 +170,20 @@ export interface Mission {
   status: MissionStatus;
   /** 当前阶段（由 status 派生，不独立推进） */
   phase: MissionPhase;
+  /** 交付状态（与 status 解耦） */
+  deliveryStatus: MissionDeliveryStatus;
+  /** 交付摘要（用于 UI 透传） */
+  deliverySummary?: string;
+  /** 交付失败详情（用于 UI 透传） */
+  deliveryDetails?: string;
+  /** 交付告警（用于 UI 透传） */
+  deliveryWarnings?: string[];
+  /** 交付状态更新时间戳 */
+  deliveryUpdatedAt?: number;
+  /** 后续推进策略 */
+  continuationPolicy: MissionContinuationPolicy;
+  /** 后续推进原因 */
+  continuationReason?: string;
 
   // ===== 外部关联 =====
   /** 关联的外部 Task ID（用于与 UnifiedTaskManager 同步） */
@@ -471,6 +503,7 @@ export interface CreateMissionParams {
   riskLevel?: RiskLevel;
   riskFactors?: string[];
   executionPath?: ExecutionPath;
+  continuationPolicy?: MissionContinuationPolicy;
 }
 
 /**
@@ -516,6 +549,7 @@ export interface MissionEvents {
   missionDeleted: { missionId: string };
   missionStatusChanged: { mission: Mission; missionId: string; oldStatus: MissionStatus; newStatus: MissionStatus };
   missionPhaseChanged: { mission: Mission; missionId: string; oldPhase: MissionPhase; newPhase: MissionPhase };
+  missionDeliveryChanged: { mission: Mission; missionId: string; oldStatus: MissionDeliveryStatus; newStatus: MissionDeliveryStatus };
   collaborationPlanned: { mission: Mission };
   workersPlanned: { mission: Mission };
   missionCompleted: { mission: Mission };

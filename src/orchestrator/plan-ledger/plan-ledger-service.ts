@@ -250,6 +250,27 @@ export class PlanLedgerService extends EventEmitter {
     });
   }
 
+  /**
+   * 更新计划摘要（由编排者在首次 dispatch_task 时通过 mission_title 提供语义化标题）
+   */
+  async updateSummary(sessionId: string, planId: string, summary: string): Promise<PlanRecord | null> {
+    const trimmed = summary.trim();
+    if (!trimmed) {
+      return null;
+    }
+    return this.runWithSessionQueue(sessionId, async () => {
+      const record = this.loadPlan(sessionId, planId);
+      if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
+        return null;
+      }
+      record.summary = trimmed;
+      record.updatedAt = Date.now();
+      this.persistPlan(record);
+      this.emitUpdated(record, 'summary-updated');
+      return record;
+    });
+  }
+
   async startAttempt(sessionId: string, planId: string, input: PlanAttemptStartInput): Promise<PlanRecord | null> {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);

@@ -29,6 +29,8 @@ import {
   Mission,
   MissionStorageManager,
   FileBasedMissionStorage,
+  MissionDeliveryStatus,
+  MissionContinuationPolicy,
 } from '../mission';
 import { ExecutionStats } from '../execution-stats';
 import { MessageHub } from './message-hub';
@@ -38,7 +40,7 @@ import { isAbortError } from '../../errors';
 import { ConfigManager, type OrchestratorGovernanceThresholdsConfig } from '../../config';
 import { SupplementaryInstructionQueue } from './supplementary-instruction-queue';
 import { DispatchManager } from './dispatch-manager';
-import { runPostDispatchVerification } from './post-dispatch-verifier';
+import { runPostDispatchVerification, type DeliveryVerificationOutcome } from './post-dispatch-verifier';
 import { configureResilientAuxiliary } from './resilient-auxiliary-adapter';
 import {
   FileTerminationMetricsRepository,
@@ -66,6 +68,9 @@ import {
 export interface MissionDrivenEngineConfig {
   timeout: number;
   maxRetries: number;
+  delivery?: {
+    autoRepairMaxRounds?: number;
+  };
   review?: {
     selfCheck?: boolean;
     peerReview?: 'auto' | 'always' | 'never';
@@ -215,6 +220,10 @@ export class MissionDrivenEngine extends EventEmitter {
     sessionId: string;
     planId: string;
     resolve: (confirmed: boolean) => void;
+  } | null = null;
+  private pendingDeliveryRepairConfirmation: {
+    missionId: string;
+    resolve: (decision: 'repair' | 'stop') => void;
   } | null = null;
   /** dispatch 并发场景下的 Mission 创建单飞锁，确保每轮最多创建一个 Mission */
   private ensureMissionPromise: Promise<string> | null = null;
@@ -934,6 +943,16 @@ export class MissionDrivenEngine extends EventEmitter {
     return true;
   }
 
+  resolveDeliveryRepairConfirmation(decision: 'repair' | 'stop'): boolean {
+    if (!this.pendingDeliveryRepairConfirmation) {
+      return false;
+    }
+    const pending = this.pendingDeliveryRepairConfirmation;
+    this.pendingDeliveryRepairConfirmation = null;
+    pending.resolve(decision);
+    return true;
+  }
+
   /**
    * 核心层会话锚点同步：
    * 不依赖 UI/宿主适配层，确保 MessageHub trace 与真实 sessionId 对齐。
@@ -999,6 +1018,32 @@ export class MissionDrivenEngine extends EventEmitter {
     });
   }
 
+  private async awaitDeliveryRepairConfirmation(input: {
+    sessionId: string;
+    missionId: string;
+    summary: string;
+    details?: string;
+    round: number;
+    maxRounds: number;
+  }): Promise<'repair' | 'stop'> {
+    this.alignMessageHubTrace(input.sessionId);
+    this.messageHub.data('deliveryRepairRequest', {
+      sessionId: input.sessionId,
+      missionId: input.missionId,
+      summary: input.summary,
+      details: input.details,
+      round: input.round,
+      maxRounds: input.maxRounds,
+    });
+    this.setState('waiting_confirmation');
+    return new Promise<'repair' | 'stop'>((resolve) => {
+      this.pendingDeliveryRepairConfirmation = {
+        missionId: input.missionId,
+        resolve,
+      };
+    });
+  }
+
   private emitPlanLedgerUpdate(sessionId: string, reason: string): void {
     this.alignMessageHubTrace(sessionId);
     const snapshot = this.planLedger.getSnapshot(sessionId);
@@ -1022,10 +1067,17 @@ export class MissionDrivenEngine extends EventEmitter {
     scopeHint?: string[];
     files?: string[];
     requiresModification: boolean;
+    missionTitle?: string;
   }): Promise<void> {
     if (!this.currentPlanId) {
       return;
     }
+
+    // 如果编排者提供了 mission_title，回写为计划摘要（替换初始的用户消息截取）
+    if (payload.missionTitle) {
+      await this.planLedger.updateSummary(payload.sessionId, this.currentPlanId, payload.missionTitle);
+    }
+
     await this.planLedger.upsertDispatchItem(payload.sessionId, this.currentPlanId, {
       itemId: payload.taskId,
       title: payload.title,
@@ -1587,6 +1639,12 @@ export class MissionDrivenEngine extends EventEmitter {
       let orchestratorRuntimeShadow: RuntimeTerminationShadow | undefined;
       let orchestratorRuntimeDecisionTrace: RuntimeTerminationDecisionTraceEntry[] | undefined;
       let runtimeTokenUsage: TokenUsage | undefined;
+      let deliveryStatusForMission: MissionDeliveryStatus | null = null;
+      let deliverySummaryForMission: string | undefined;
+      let deliveryDetailsForMission: string | undefined;
+      let deliveryWarningsForMission: string[] | undefined;
+      let continuationPolicyForMission: MissionContinuationPolicy | undefined;
+      let continuationReasonForMission: string | undefined;
       let currentPlanMode: PlanMode = this.adapterFactory.isDeepTask() ? 'deep' : 'standard';
 
       try {
@@ -1779,135 +1837,318 @@ export class MissionDrivenEngine extends EventEmitter {
         // 编排者跨轮会话记忆保留在 adapter history 中，不再每轮清空。
         // SystemPrompt 侧通过 prepareContext 动态裁剪 recent_turns，避免双重注入和 token 膨胀。
 
-        // 5. 编排执行
-        const response = await this.adapterFactory.sendMessage(
-          'orchestrator',
-          trimmedPrompt,
-          imagePaths,
-          {
-            source: 'orchestrator',
-            adapterRole: 'orchestrator',
-            systemPrompt,
-            includeToolCalls: true,
+        const autoRepairMaxRounds = Math.max(0, this.config.delivery?.autoRepairMaxRounds ?? 1);
+        let autoRepairAttempt = 0;
+        const autoRepairHistory: string[] = [];
+        let promptForRound = trimmedPrompt;
+
+        // 5. 编排执行（支持交付失败后的自动修复闭环）
+        while (true) {
+          const executionRound = autoRepairAttempt + 1;
+          if (autoRepairAttempt > 0) {
+            this.dispatchManager.resetForNewExecutionCycle();
+            this.messageHub.progress(
+              t('engine.delivery.autoRepairProgressTitle'),
+              t('engine.delivery.autoRepairProgressMessage', { round: autoRepairAttempt, maxRounds: autoRepairMaxRounds }),
+            );
           }
-        );
-        orchestratorRuntimeReason = this.normalizeOrchestratorRuntimeReason(response.orchestratorRuntime?.reason);
-        orchestratorRuntimeRounds = response.orchestratorRuntime?.rounds || 0;
-        orchestratorRuntimeSnapshot = response.orchestratorRuntime?.snapshot as RuntimeTerminationSnapshot | undefined;
-        orchestratorRuntimeShadow = response.orchestratorRuntime?.shadow as RuntimeTerminationShadow | undefined;
-        orchestratorRuntimeDecisionTrace =
-          response.orchestratorRuntime?.decisionTrace as RuntimeTerminationDecisionTraceEntry[] | undefined;
-        runtimeTokenUsage = response.tokenUsage;
 
-        this.recordOrchestratorTokens(response.tokenUsage);
+          deliveryStatusForMission = null;
+          deliverySummaryForMission = undefined;
+          deliveryDetailsForMission = undefined;
+          deliveryWarningsForMission = undefined;
+          continuationPolicyForMission = undefined;
+          continuationReasonForMission = undefined;
 
-        // 等待 dispatch batch 归档（含 Worker 执行 + Phase C 汇总）
-        // dispatch_task 是非阻塞的，sendMessage 返回时 Worker 可能还在后台执行。
-        // 必须等待 activeBatch 归档后再推进下一阶段，保证链路完整闭合。
-        const currentBatch = this.dispatchManager.getActiveBatch();
-        if (currentBatch && currentBatch.status !== 'archived') {
-          await currentBatch.waitForArchive(this.dispatchManager.getIdleTimeoutMs());
-        }
+          this.activeUserPrompt = promptForRound;
+          orchestratorRuntimeReason = undefined;
+          orchestratorRuntimeSnapshot = undefined;
+          orchestratorRuntimeShadow = undefined;
+          orchestratorRuntimeDecisionTrace = undefined;
 
-        const executionWarnings: string[] = [];
-        const terminationCandidates: TerminationCandidate[] = [];
-        const auditOutcome = currentBatch?.getAuditOutcome();
-        if (auditOutcome?.level === 'intervention') {
-          executionWarnings.push(t('engine.phaseC.interventionBlocked'));
-          terminationCandidates.push({
-            reason: 'failed',
-            eventId: 'engine:audit-intervention',
-            triggeredAt: Date.now(),
-          });
-          logger.warn('编排器.PhaseC.审计阻断_已降级', {
-            batchId: currentBatch?.id,
-            level: auditOutcome.level,
-          }, LogCategory.ORCHESTRATOR);
-        }
+          const response = await this.adapterFactory.sendMessage(
+            'orchestrator',
+            promptForRound,
+            imagePaths,
+            {
+              source: 'orchestrator',
+              adapterRole: 'orchestrator',
+              systemPrompt,
+              includeToolCalls: true,
+            }
+          );
+          orchestratorRuntimeReason = this.normalizeOrchestratorRuntimeReason(response.orchestratorRuntime?.reason);
+          orchestratorRuntimeRounds = response.orchestratorRuntime?.rounds || 0;
+          orchestratorRuntimeSnapshot = response.orchestratorRuntime?.snapshot as RuntimeTerminationSnapshot | undefined;
+          orchestratorRuntimeShadow = response.orchestratorRuntime?.shadow as RuntimeTerminationShadow | undefined;
+          orchestratorRuntimeDecisionTrace =
+            response.orchestratorRuntime?.decisionTrace as RuntimeTerminationDecisionTraceEntry[] | undefined;
+          runtimeTokenUsage = response.tokenUsage;
 
-        if (response.error) {
-          const modelError = response.error.trim();
-          if (modelError) {
-            executionWarnings.push(`上游模型异常：${modelError}`);
-          } else {
-            executionWarnings.push('上游模型异常：未知错误');
+          this.recordOrchestratorTokens(response.tokenUsage);
+
+          // 等待 dispatch batch 归档（含 Worker 执行 + Phase C 汇总）
+          // dispatch_task 是非阻塞的，sendMessage 返回时 Worker 可能还在后台执行。
+          // 必须等待 activeBatch 归档后再推进下一阶段，保证链路完整闭合。
+          const currentBatch = this.dispatchManager.getActiveBatch();
+          if (currentBatch && currentBatch.status !== 'archived') {
+            await currentBatch.waitForArchive(this.dispatchManager.getIdleTimeoutMs());
           }
-          terminationCandidates.push({
-            reason: 'upstream_model_error',
-            eventId: 'engine:upstream-model-error',
-            triggeredAt: Date.now(),
-          });
-          logger.warn('编排器.统一执行.上游模型异常_已降级', {
-            error: response.error,
-          }, LogCategory.ORCHESTRATOR);
-        }
 
-        if (currentBatch) {
-          try {
-            await runPostDispatchVerification(currentBatch, this.verificationRunner, this.messageHub);
-          } catch (verificationError) {
-            const verificationMessage = verificationError instanceof Error
-              ? verificationError.message
-              : String(verificationError);
-            executionWarnings.push(`Phase C 校验异常：${verificationMessage}`);
-            terminationCandidates.push({
-              reason: 'failed',
-              eventId: 'engine:phasec-verification-failed',
-              triggeredAt: Date.now(),
-            });
-            logger.warn('编排器.PhaseC.校验异常_已降级', {
-              batchId: currentBatch.id,
-              error: verificationMessage,
+          const executionWarnings: string[] = [];
+          const deliveryNotes: string[] = [];
+          const terminationCandidates: TerminationCandidate[] = [];
+          const auditOutcome = currentBatch?.getAuditOutcome();
+          if (auditOutcome?.level === 'intervention') {
+            const blockedMessage = t('engine.phaseC.interventionBlocked');
+            deliveryNotes.push(blockedMessage);
+            deliveryStatusForMission = 'blocked';
+            deliverySummaryForMission = blockedMessage;
+            continuationPolicyForMission = 'ask';
+            continuationReasonForMission = blockedMessage;
+            logger.warn('编排器.PhaseC.审计阻断_已降级', {
+              batchId: currentBatch?.id,
+              level: auditOutcome.level,
             }, LogCategory.ORCHESTRATOR);
           }
-        }
 
-        // 反应式编排兜底：若 Batch 处于”等待最终汇总”且编排者未输出正文，
-        // 则由系统生成确定性总结并发送到主对话区，避免用户只看到子任务卡片没有结论。
-        let finalContent = response.content || '';
-        if (currentBatch && this.dispatchManager.isReactiveBatchAwaitingSummary(currentBatch.id)) {
-          if (finalContent.trim()) {
-            this.dispatchManager.markReactiveBatchSummarized(currentBatch.id);
-          } else {
-            finalContent = this.dispatchManager.buildReactiveBatchFallbackSummary(currentBatch);
-            this.messageHub.result(finalContent, {
-              metadata: {
-                phase: 'reactive_fallback_summary',
-                extra: {
-                  batchId: currentBatch.id,
-                },
-              },
+          if (response.error) {
+            const modelError = response.error.trim();
+            if (modelError) {
+              executionWarnings.push(`上游模型异常：${modelError}`);
+            } else {
+              executionWarnings.push('上游模型异常：未知错误');
+            }
+            terminationCandidates.push({
+              reason: 'upstream_model_error',
+              eventId: 'engine:upstream-model-error',
+              triggeredAt: Date.now(),
             });
-            this.dispatchManager.markReactiveBatchSummarized(currentBatch.id);
+            logger.warn('编排器.统一执行.上游模型异常_已降级', {
+              error: response.error,
+            }, LogCategory.ORCHESTRATOR);
           }
-        }
 
-        const resolvedRuntimeTermination = this.resolveOrchestratorRuntimeReason({
-          runtimeReason: orchestratorRuntimeReason,
-          runtimeSnapshot: orchestratorRuntimeSnapshot,
-          additionalCandidates: terminationCandidates,
-          fallback: terminationCandidates.length > 0 ? 'failed' : 'completed',
-        });
-        orchestratorRuntimeReason = resolvedRuntimeTermination.reason;
-        orchestratorRuntimeSnapshot = resolvedRuntimeTermination.runtimeSnapshot;
-        const finalPlanStatus = this.mapOrchestratorRuntimeReasonToPlanFinalStatus(orchestratorRuntimeReason);
+          if (currentBatch) {
+            let outcome: DeliveryVerificationOutcome;
+            try {
+              outcome = await runPostDispatchVerification(currentBatch, this.verificationRunner, this.messageHub);
+            } catch (verificationError) {
+              const verificationMessage = verificationError instanceof Error
+                ? verificationError.message
+                : String(verificationError);
+              logger.warn('编排器.PhaseC.校验异常_已降级', {
+                batchId: currentBatch.id,
+                error: verificationMessage,
+              }, LogCategory.ORCHESTRATOR);
+              outcome = {
+                status: 'failed',
+                summary: `验收异常：${verificationMessage}`,
+              };
+            }
 
-        if (executionWarnings.length > 0) {
-          const warningSection = [
-            '[System] 本轮触发门禁降级（会话不中断）：',
-            ...executionWarnings.map(item => `- ${item}`),
-          ].join('\n');
-          finalContent = finalContent.trim()
-            ? `${finalContent}\n\n${warningSection}`
-            : warningSection;
+            if (outcome.status === 'failed') {
+              deliveryNotes.push(outcome.summary);
+              if (deliveryStatusForMission === 'blocked') {
+                if (!deliverySummaryForMission) {
+                  deliverySummaryForMission = outcome.summary;
+                }
+                if (!deliveryDetailsForMission && outcome.details) {
+                  deliveryDetailsForMission = outcome.details;
+                }
+                if (!deliveryWarningsForMission && outcome.warnings && outcome.warnings.length > 0) {
+                  deliveryWarningsForMission = outcome.warnings;
+                }
+                if (!continuationPolicyForMission) {
+                  continuationPolicyForMission = this.interactionMode === 'ask' ? 'ask' : 'auto';
+                }
+                if (!continuationReasonForMission) {
+                  continuationReasonForMission = outcome.summary;
+                }
+              } else {
+                deliveryStatusForMission = 'failed';
+                deliverySummaryForMission = outcome.summary;
+                deliveryDetailsForMission = outcome.details;
+                deliveryWarningsForMission = outcome.warnings && outcome.warnings.length > 0 ? outcome.warnings : undefined;
+                continuationPolicyForMission = this.interactionMode === 'ask' ? 'ask' : 'auto';
+                continuationReasonForMission = outcome.summary;
+              }
+            } else if (outcome.status === 'passed') {
+              if (deliveryStatusForMission === 'blocked') {
+                if (!deliverySummaryForMission) {
+                  deliverySummaryForMission = outcome.summary;
+                }
+                if (!deliveryDetailsForMission && outcome.details) {
+                  deliveryDetailsForMission = outcome.details;
+                }
+                if (!deliveryWarningsForMission && outcome.warnings && outcome.warnings.length > 0) {
+                  deliveryWarningsForMission = outcome.warnings;
+                }
+                if (!continuationPolicyForMission) {
+                  continuationPolicyForMission = 'stop';
+                }
+                if (!continuationReasonForMission) {
+                  continuationReasonForMission = outcome.summary;
+                }
+              } else {
+                deliveryStatusForMission = 'passed';
+                deliverySummaryForMission = outcome.summary;
+                deliveryDetailsForMission = outcome.details;
+                deliveryWarningsForMission = outcome.warnings && outcome.warnings.length > 0 ? outcome.warnings : undefined;
+                continuationPolicyForMission = 'stop';
+                continuationReasonForMission = outcome.summary;
+              }
+            } else {
+              const skippedStatus: MissionDeliveryStatus = outcome.skippedReason === 'execution_failed'
+                ? 'blocked'
+                : 'skipped';
+              if (outcome.skippedReason === 'execution_failed') {
+                deliveryNotes.push(outcome.summary);
+              }
+              if (deliveryStatusForMission === 'blocked') {
+                if (!deliverySummaryForMission) {
+                  deliverySummaryForMission = outcome.summary;
+                }
+                if (!deliveryDetailsForMission && outcome.details) {
+                  deliveryDetailsForMission = outcome.details;
+                }
+                if (!deliveryWarningsForMission && outcome.warnings && outcome.warnings.length > 0) {
+                  deliveryWarningsForMission = outcome.warnings;
+                }
+                if (!continuationPolicyForMission) {
+                  continuationPolicyForMission = skippedStatus === 'blocked' ? 'ask' : 'stop';
+                }
+                if (!continuationReasonForMission) {
+                  continuationReasonForMission = outcome.summary;
+                }
+              } else {
+                deliveryStatusForMission = skippedStatus;
+                deliverySummaryForMission = outcome.summary;
+                deliveryDetailsForMission = outcome.details;
+                deliveryWarningsForMission = outcome.warnings && outcome.warnings.length > 0 ? outcome.warnings : undefined;
+                continuationPolicyForMission = skippedStatus === 'blocked' ? 'ask' : 'stop';
+                continuationReasonForMission = outcome.summary;
+              }
+            }
+          }
+
+          // 反应式编排兜底：若 Batch 处于”等待最终汇总”且编排者未输出正文，
+          // 则由系统生成确定性总结并发送到主对话区，避免用户只看到子任务卡片没有结论。
+          let finalContent = response.content || '';
+          if (currentBatch && this.dispatchManager.isReactiveBatchAwaitingSummary(currentBatch.id)) {
+            if (finalContent.trim()) {
+              this.dispatchManager.markReactiveBatchSummarized(currentBatch.id);
+            } else {
+              finalContent = this.dispatchManager.buildReactiveBatchFallbackSummary(currentBatch);
+              this.messageHub.result(finalContent, {
+                metadata: {
+                  phase: 'reactive_fallback_summary',
+                  extra: {
+                    batchId: currentBatch.id,
+                  },
+                },
+              });
+              this.dispatchManager.markReactiveBatchSummarized(currentBatch.id);
+            }
+          }
+
+          const resolvedRuntimeTermination = this.resolveOrchestratorRuntimeReason({
+            runtimeReason: orchestratorRuntimeReason,
+            runtimeSnapshot: orchestratorRuntimeSnapshot,
+            additionalCandidates: terminationCandidates,
+            fallback: terminationCandidates.length > 0 ? 'failed' : 'completed',
+          });
+          orchestratorRuntimeReason = resolvedRuntimeTermination.reason;
+          orchestratorRuntimeSnapshot = resolvedRuntimeTermination.runtimeSnapshot;
+          const finalPlanStatus = this.mapOrchestratorRuntimeReasonToPlanFinalStatus(orchestratorRuntimeReason);
+
+          if (executionWarnings.length > 0) {
+            const warningSection = [
+              '[System] 本轮触发门禁降级（会话不中断）：',
+              ...executionWarnings.map(item => `- ${item}`),
+            ].join('\n');
+            finalContent = finalContent.trim()
+              ? `${finalContent}\n\n${warningSection}`
+              : warningSection;
+          }
+
+          if (deliveryNotes.length > 0) {
+            const deliverySection = [
+              '[System] 交付验收结果：',
+              ...deliveryNotes.map(item => `- ${item}`),
+            ].join('\n');
+            finalContent = finalContent.trim()
+              ? `${finalContent}\n\n${deliverySection}`
+              : deliverySection;
+          }
+
+          if (deliverySummaryForMission) {
+            autoRepairHistory.push(`第${executionRound}轮：${deliverySummaryForMission}`);
+          }
+
+          if (
+            deliveryStatusForMission === 'failed'
+            && continuationPolicyForMission === 'ask'
+            && autoRepairAttempt < autoRepairMaxRounds
+          ) {
+            const sessionIdForConfirm = resolvedSessionId;
+            const missionIdForConfirm = this.lastMissionId || this.currentTurnId || `mission-${Date.now()}`;
+            const decision = await this.awaitDeliveryRepairConfirmation({
+              sessionId: sessionIdForConfirm,
+              missionId: missionIdForConfirm,
+              summary: deliverySummaryForMission || '验收未通过',
+              details: deliveryDetailsForMission,
+              round: autoRepairAttempt + 1,
+              maxRounds: autoRepairMaxRounds,
+            });
+            continuationPolicyForMission = decision === 'repair' ? 'auto' : 'stop';
+            continuationReasonForMission = decision === 'repair'
+              ? '用户确认继续自动修复'
+              : '用户确认停止自动修复';
+          }
+
+          const shouldAutoRepair = deliveryStatusForMission === 'failed'
+            && continuationPolicyForMission === 'auto'
+            && autoRepairAttempt < autoRepairMaxRounds;
+
+          if (shouldAutoRepair) {
+            autoRepairAttempt += 1;
+            const autoRepairPrompt = this.buildAutoRepairPrompt({
+              originalPrompt: trimmedPrompt,
+              goal: requirementAnalysis.goal,
+              constraints: requirementAnalysis.constraints ?? [],
+              acceptanceCriteria: requirementAnalysis.acceptanceCriteria ?? [],
+              deliverySummary: deliverySummaryForMission,
+              deliveryDetails: deliveryDetailsForMission,
+              round: autoRepairAttempt,
+              maxRounds: autoRepairMaxRounds,
+            });
+            this.messageHub.notify(
+              t('engine.delivery.autoRepairScheduled', { round: autoRepairAttempt, maxRounds: autoRepairMaxRounds }),
+              'warning',
+            );
+            promptForRound = autoRepairPrompt;
+            continue;
+          }
+
+          if (autoRepairAttempt > 0 && autoRepairHistory.length > 0) {
+            const historySection = [
+              '[System] 自动修复轮次记录：',
+              ...autoRepairHistory.map(item => `- ${item}`),
+            ].join('\n');
+            finalContent = finalContent.trim()
+              ? `${finalContent}\n\n${historySection}`
+              : historySection;
+          }
+
+          this.lastExecutionRuntimeReason = orchestratorRuntimeReason;
+          this.lastExecutionErrors = finalPlanStatus === 'failed'
+            ? this.buildExecutionFailureMessages(orchestratorRuntimeReason, executionWarnings)
+            : [];
+          this.setState('idle');
+          this.currentTaskId = null;
+          return finalContent;
         }
-        this.lastExecutionRuntimeReason = orchestratorRuntimeReason;
-        this.lastExecutionErrors = finalPlanStatus === 'failed'
-          ? this.buildExecutionFailureMessages(orchestratorRuntimeReason, executionWarnings)
-          : [];
-        this.setState('idle');
-        this.currentTaskId = null;
-        return finalContent;
 
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -2023,6 +2264,14 @@ export class MissionDrivenEngine extends EventEmitter {
           pendingConfirmation.resolve(false);
           this.pendingPlanConfirmation = null;
         }
+        const pendingDeliveryConfirmation = this.pendingDeliveryRepairConfirmation as {
+          missionId: string;
+          resolve: (decision: 'repair' | 'stop') => void;
+        } | null;
+        if (pendingDeliveryConfirmation) {
+          pendingDeliveryConfirmation.resolve('stop');
+          this.pendingDeliveryRepairConfirmation = null;
+        }
         this.isRunning = false;
         this.ensureMissionPromise = null;
         // 清除编排者快照上下文
@@ -2051,6 +2300,17 @@ export class MissionDrivenEngine extends EventEmitter {
                 await this.taskViewService.failTaskById(this.lastMissionId, this.lastExecutionErrors[0]);
               } else if (finalPlanStatus === 'cancelled') {
                 await this.taskViewService.cancelTaskById(this.lastMissionId);
+              }
+
+              if (deliveryStatusForMission) {
+                await this.missionStorage.updateDelivery(this.lastMissionId, {
+                  status: deliveryStatusForMission,
+                  summary: deliverySummaryForMission,
+                  details: deliveryDetailsForMission,
+                  warnings: deliveryWarningsForMission,
+                  continuationPolicy: continuationPolicyForMission,
+                  continuationReason: continuationReasonForMission,
+                });
               }
             }
           } catch (missionUpdateError) {
@@ -2115,6 +2375,7 @@ export class MissionDrivenEngine extends EventEmitter {
         riskLevel,
         riskFactors: requirementAnalysis.riskFactors,
         executionPath: this.mapRiskLevelToExecutionPath(riskLevel),
+        continuationPolicy: this.interactionMode === 'ask' ? 'ask' : 'auto',
       });
 
       // 若 Mission 创建期间执行轮次已切换，回收该 Mission，避免生成孤儿任务
@@ -2256,6 +2517,41 @@ export class MissionDrivenEngine extends EventEmitter {
       requiresModification: executionIntent.requiresModification,
       reason: executionIntent.reason,
     };
+  }
+
+  private buildAutoRepairPrompt(input: {
+    originalPrompt: string;
+    goal: string;
+    constraints: string[];
+    acceptanceCriteria: string[];
+    deliverySummary?: string;
+    deliveryDetails?: string;
+    round: number;
+    maxRounds: number;
+  }): string {
+    const goal = input.goal || input.originalPrompt;
+    const constraints = input.constraints.length > 0
+      ? input.constraints.map(item => `- ${item}`).join('\n')
+      : '- 无';
+    const acceptance = input.acceptanceCriteria.length > 0
+      ? input.acceptanceCriteria.map(item => `- ${item}`).join('\n')
+      : '- 无';
+    const summary = input.deliverySummary?.trim() || '未提供';
+    const details = input.deliveryDetails?.trim() || '';
+    const detailSection = details ? `验收失败详情：\n${details}` : '';
+
+    return [
+      '[System] 交付验收未通过，进入自动修复。',
+      `修复轮次：${input.round}/${input.maxRounds}`,
+      `原始目标：${goal}`,
+      `用户原始请求：${input.originalPrompt}`,
+      `约束：\n${constraints}`,
+      `验收标准：\n${acceptance}`,
+      `验收失败摘要：${summary}`,
+      detailSection,
+      '请根据失败信息修复问题，必要时调整实现并重新运行相关验收。',
+      '输出最终交付总结，并明确哪些验收已通过、哪些仍未通过。',
+    ].filter(line => line && line.trim().length > 0).join('\n\n');
   }
 
   private extractPreDraftAcceptanceCriteria(

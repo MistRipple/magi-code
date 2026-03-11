@@ -78,12 +78,14 @@ export type DispatchTaskHandler = (params: {
   scopeHint?: string[];
   /**
    * 严格目标文件（可选）
-   * 当任务确实要求“必须改这些文件”时使用；否则优先使用 scopeHint
+   * 当任务确实要求”必须改这些文件”时使用；否则优先使用 scopeHint
    */
   files?: string[];
   dependsOn?: string[];
   /** 跨任务协作契约（L3） */
   contracts?: DispatchTaskCollaborationContracts;
+  /** 本轮任务的整体标题（仅首次 dispatch 时由编排者提供，用于替换计划账本中的临时 summary） */
+  missionTitle?: string;
 }) => Promise<{
   task_id: string;
   status: 'dispatched' | 'failed';
@@ -474,6 +476,10 @@ export class OrchestrationExecutor {
       input_schema: {
         type: 'object',
         properties: {
+          mission_title: {
+            type: 'string',
+            description: '【首次 dispatch 必填】本轮任务的整体标题，简短概括核心目标（如"集成管理后台前端页面"、"修复用户登录流程 Bug"）。不要照抄用户原始消息，必须重新概括为规范的工程化标题。后续 dispatch 调用可省略。',
+          },
           tasks: {
             type: 'array',
             description: '待派发的任务列表（至少 1 个）。每个任务将独立路由到对应 Worker 并行执行。',
@@ -579,6 +585,10 @@ export class OrchestrationExecutor {
     }
     const tasks = normalizedTasks.tasks;
 
+    // 提取顶层 mission_title（由编排者在首次 dispatch 时提供）
+    const rawArgs = toolCall.arguments as Record<string, unknown> | undefined;
+    const missionTitle = typeof rawArgs?.mission_title === 'string' ? rawArgs.mission_title.trim() : '';
+
     // 阶段 1：全量验证（任一任务校验失败则整批拒绝，避免部分派发）
     const validatedParams: Parameters<DispatchTaskHandler>[0][] = [];
     for (let i = 0; i < tasks.length; i++) {
@@ -594,10 +604,16 @@ export class OrchestrationExecutor {
       validatedParams.push(validation.params);
     }
 
+    // 将 mission_title 注入第一个任务的参数中，由 handler 链路传递给引擎
+    if (missionTitle && validatedParams.length > 0) {
+      validatedParams[0].missionTitle = missionTitle;
+    }
+
     logger.info('dispatch_task 开始批量派发', {
       taskCount: validatedParams.length,
       categories: validatedParams.map(p => p.category),
       taskNames: validatedParams.map(p => p.task_name),
+      missionTitle: missionTitle || undefined,
     }, LogCategory.TOOLS);
 
     // 阶段 2：并行派发所有任务

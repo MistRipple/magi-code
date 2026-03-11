@@ -264,18 +264,19 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     return Boolean(result.isError);
   }
 
-  protected truncateToolResultContent(toolCall: ToolCall, rawResult: ToolResult, maxChars: number): void {
+  protected truncateToolResultContent(toolCall: ToolCall, rawResult: ToolResult, maxChars: number): boolean {
     if (typeof rawResult.content !== 'string' || rawResult.content.length <= maxChars) {
-      return;
+      return false;
     }
 
     // 终端工具结果要求保持 JSON 可解析，且已通过增量预览持续输出，不在此处做破坏性截断
     if (this.isTerminalProcessTool(toolCall.name)) {
-      return;
+      return false;
     }
 
     const truncated = rawResult.content.slice(0, maxChars);
     rawResult.content = `${truncated}\n...[truncated ${rawResult.content.length - maxChars} chars]`;
+    return true;
   }
 
   protected preAnnounceToolCalls(streamId: string, toolCalls: ToolCall[]): Set<string> {

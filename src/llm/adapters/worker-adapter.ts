@@ -178,8 +178,28 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   private decisionHookAppliedForThinking = false;
   /** 工具摘要是否已注入到 systemPrompt（lazy init，仅执行一次） */
   private toolsSummaryInjected = false;
-  /** 检索结果缓存：防止模型换措辞重复搜索相同内容 */
-  private searchResultCache = new Map<string, string>();
+  /** 写操作拦截缓存 TTL（避免环境修复后仍被旧记录阻断） */
+  private static readonly FAILED_WRITE_CACHE_TTL_MS = 10 * 60 * 1000;
+  private static readonly SUCCESS_WRITE_CACHE_TTL_MS = 10 * 60 * 1000;
+  private static readonly READ_ONLY_TOOL_NAMES = new Set<string>([
+    'file_view',
+    'grep_search',
+    'web_search',
+    'web_fetch',
+    'mermaid_diagram',
+    'codebase_retrieval',
+    'read-process',
+    'list-processes',
+    'get_todos',
+  ]);
+  private static readonly WRITE_DEDUP_TOOL_NAMES = new Set<string>([
+    'shell',
+    'file_create',
+    'file_edit',
+    'file_insert',
+    'file_bulk_edit',
+    'file_remove',
+  ]);
   /** 已读取过的文件路径（文件级去重：同一文件只需读取一次） */
   private viewedFiles = new Set<string>();
   /**
@@ -198,9 +218,9 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   /** 当前轮次的去重命中次数（空转分数加权用） */
   private roundDedupHits = 0;
   /** 失败写操作缓存：防止模型反复重试相同的失败写操作 */
-  private failedWriteCache = new Map<string, { count: number; error: string }>();
+  private failedWriteCache = new Map<string, { count: number; error: string; firstAt: number; lastAt: number }>();
   /** 成功写操作缓存：防止模型反复执行完全相同的已成功写操作 */
-  private successWriteCache = new Set<string>();
+  private successWriteCache = new Map<string, { filePath: string; updatedAt: number }>();
   /** 当前轮次被去重拦截的写操作计数（用于空转检测判断是否有实际写入） */
   private roundWriteInterceptCount = 0;
 
@@ -589,8 +609,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
             && toolCalls.length === toolResults.length
             && toolCalls.every(tc => tc.name === 'shell')
             && toolResults.every(result => this.isHardToolFailure(result)
-              && typeof result.content === 'string'
-              && result.content.includes('[系统拦截]'));
+              && result.standardized?.errorCode === 'write_failed_dedup');
 
           if (isShellInterceptRound) {
             repeatedShellInterceptRounds++;
@@ -865,7 +884,6 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     this.conversationHistory = [];
     this.rollingContextSummary = null;
     // 对话历史清空 → 模型失去已查看文件的上下文 → 去重状态同步重置
-    this.searchResultCache.clear();
     this.viewedFiles.clear();
     this.viewedRanges.clear();
     this.totalDedupHits = 0;
@@ -988,41 +1006,25 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       // 文件级去重：同一文件只需读取一次，阻断"对同一文件反复发起不同查询"的模式
       const fileDedup = this.checkFileAccessDuplicate(toolCall);
       if (fileDedup) {
-        logger.info(`${this.agent} 文件级去重命中`, { tool: toolCall.name, path: toolCall.arguments?.path }, LogCategory.TOOLS);
-        results.push(this.createSyntheticToolResult(
-          toolCall,
-          fileDedup,
-          'success',
-          toolSourceMap,
-        ));
-        this.emit('toolResult', toolCall.name, fileDedup);
-        continue;
+        logger.info(`${this.agent} 文件级去重提示`, { tool: toolCall.name, path: toolCall.arguments?.path }, LogCategory.TOOLS);
+        this.addSystemMessage(fileDedup);
       }
 
-      // 检索去重：只读工具的相似查询直接返回缓存结果，阻断无效循环
-      const dedupResult = this.checkSearchDuplicate(toolCall);
-      if (dedupResult) {
-        logger.info(`${this.agent} 检索去重命中`, { tool: toolCall.name }, LogCategory.TOOLS);
-        results.push(this.createSyntheticToolResult(
-          toolCall,
-          dedupResult,
-          'success',
-          toolSourceMap,
-        ));
-        this.emit('toolResult', toolCall.name, dedupResult);
-        continue;
-      }
 
       // 失败写操作去重：相同参数的写操作重复失败时短路拦截
       const failedWriteDedup = this.checkFailedWriteDuplicate(toolCall);
       if (failedWriteDedup) {
         logger.info(`${this.agent} 失败写操作去重命中`, { tool: toolCall.name, path: toolCall.arguments?.path }, LogCategory.TOOLS);
-        results.push(this.createSyntheticToolResult(
+        const synthetic = this.createSyntheticToolResult(
           toolCall,
           failedWriteDedup,
           'error',
           toolSourceMap,
-        ));
+        );
+        if (synthetic.standardized) {
+          synthetic.standardized.errorCode = 'write_failed_dedup';
+        }
+        results.push(synthetic);
         this.emit('toolResult', toolCall.name, failedWriteDedup);
         continue;
       }
@@ -1049,19 +1051,17 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           this.abortController?.signal,
           { workerId: this.workerSlot, role: 'worker' },
         );
-        this.truncateToolResultContent(toolCall, rawResult, maxToolResultChars);
+        const wasTruncated = this.truncateToolResultContent(toolCall, rawResult, maxToolResultChars);
         const result = this.ensureStandardizedToolResult(toolCall, rawResult, toolSourceMap);
         results.push(result);
 
-        // 缓存只读工具的成功结果
+        // 记录文件访问（用于文件级去重）
         if (!result.isError && this.isReadOnlyToolCall(toolCall)) {
-          this.cacheSearchResult(toolCall, result.content);
-          // 记录文件访问（用于文件级去重）
-          this.recordFileAccess(toolCall);
+          this.recordFileAccess(toolCall, { truncated: wasTruncated });
         }
 
         // 写操作结果追踪：成功则记录到成功缓存并清除失败缓存，失败则记录
-        if (!this.isReadOnlyToolCall(toolCall)) {
+        if (this.isWriteDedupToolCall(toolCall)) {
           if (result.isError) {
             this.recordFailedWrite(toolCall, typeof result.content === 'string' ? result.content : 'Unknown error');
           } else {
@@ -1294,39 +1294,17 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   }
 
   /**
-   * 判断工具调用是否为只读操作（搜索/检索/查看类）
-   *
-   * 用于智能空转检测：连续多轮只调用只读工具而无写入操作时，
-   * 根据探索度计算空转分数，渐进式注入提示推动 Worker 开始行动。
+   * 判断工具调用是否为只读操作（白名单）
    */
   private isReadOnlyToolCall(toolCall: ToolCall): boolean {
-    const name = toolCall.name;
+    return WorkerLLMAdapter.READ_ONLY_TOOL_NAMES.has(toolCall.name);
+  }
 
-    // 明确的只读内置工具
-    const READ_ONLY_BUILTINS = [
-      'codebase_retrieval',
-      'grep_search',
-      'web_search',
-      'web_fetch',
-      'mermaid_diagram',
-    ];
-    if (READ_ONLY_BUILTINS.includes(name)) {
-      return true;
-    }
-
-    // file_view 是只读工具
-    if (name === 'file_view') {
-      return true;
-    }
-
-    // MCP 工具：通过名称模式判断（搜索/检索/读取/查看类）
-    const READ_ONLY_PATTERNS = /retrieval|search|read|fetch|view|get[_-]|list[_-]|query|deepwiki|resolve/i;
-    if (READ_ONLY_PATTERNS.test(name)) {
-      return true;
-    }
-
-    // 其他工具视为写入操作
-    return false;
+  /**
+   * 判断工具调用是否允许写入去重（白名单）
+   */
+  private isWriteDedupToolCall(toolCall: ToolCall): boolean {
+    return WorkerLLMAdapter.WRITE_DEDUP_TOOL_NAMES.has(toolCall.name);
   }
 
   /**
@@ -1358,61 +1336,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   }
 
   /**
-   * 检索去重：检查工具调用是否与之前的查询高度相似
-   *
-   * 通过提取查询中的关键标识符（英文单词、文件路径、数字），
-   * 计算与缓存查询的 Jaccard 相似度。相似度 > 50% 视为重复。
-   *
-   * 返回去重提示（命中时）或 null（未命中时）。
-   */
-  private checkSearchDuplicate(toolCall: ToolCall): string | null {
-    if (!this.isReadOnlyToolCall(toolCall)) return null;
-
-    // file_view 是文件读取操作（无论是否带 view_range），
-    // 由 L1/L1+ 文件级去重处理，不参与 Jaccard 检索去重
-    if (toolCall.name === 'file_view') {
-      return null;
-    }
-
-    const newIdentifiers = this.extractQueryIdentifiers(toolCall);
-    if (newIdentifiers.length === 0) return null;
-
-    const newSet = new Set(newIdentifiers);
-
-    for (const [cachedKey, cachedResult] of this.searchResultCache) {
-      const cachedTokens = cachedKey.split('\x00');
-      const cachedSet = new Set(cachedTokens);
-
-      // Jaccard 相似度
-      const intersection = [...newSet].filter(t => cachedSet.has(t)).length;
-      const union = new Set([...newSet, ...cachedSet]).size;
-      const similarity = intersection / union;
-
-      if (similarity >= 0.4) {
-        this.totalDedupHits++;
-        this.roundDedupHits++;
-
-        if (this.totalDedupHits >= 3) {
-          // 第3次及以后：不再提供缓存内容，直接拒绝——迫使模型使用已有信息
-          return `[系统拒绝] 重复检索已被拦截（第 ${this.totalDedupHits} 次）。你之前已获取过此信息，系统不再重复提供。请立即使用已有信息完成任务，不要继续搜索或查看。`;
-        }
-
-        // 前2次：返回缓存结果 + 去重提示
-        return `[系统提示] 你之前已执行过相同或高度相似的检索，以下是之前的检索结果（无需再次搜索，请直接使用这些信息继续任务）：\n\n${cachedResult}`;
-      }
-    }
-
-    return null;
-  }
-
-  /**
-   * 文件级去重：检查工具调用是否正在访问已完整读取过的文件
+   * 文件级提示：检查工具调用是否正在访问已完整读取过的文件
    *
    * 解决的核心问题：模型把工具当"数据库查询"用，对同一文件反复发起不同的
    * search/view 请求，而不是一次读取完整文件后从上下文中提取信息。
-   * Jaccard 去重无法捕捉这种"不同查询、同一目标文件"的模式。
    *
-   * 仅在文件已被完整读取（无 view_range）后才拦截，避免阻止合理的分段读取。
+   * 仅在文件已被完整读取（无 view_range）后提示，避免阻止合理的分段读取。
    */
   private checkFileAccessDuplicate(toolCall: ToolCall): string | null {
     if (!this.isReadOnlyToolCall(toolCall)) return null;
@@ -1424,7 +1353,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       this.totalDedupHits++;
       this.roundDedupHits++;
       const basename = filePath.split('/').pop() || filePath;
-      return `[系统提示] 文件 ${basename} 已被完整读取过，全部内容已在你的对话上下文中。请直接从上下文中查找所需信息，不要重复访问同一文件。`;
+      return `[系统提示] 文件 ${basename} 已读取过。如无新变化可直接使用已有上下文，系统仍将继续执行本次读取。`;
     }
 
     // L1+: 分段读取追踪（仅 file_view + view_range）
@@ -1440,14 +1369,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           this.totalDedupHits++;
           this.roundDedupHits++;
           const basename = filePath.split('/').pop() || filePath;
-          return `[系统提示] 文件 ${basename} 的 ${rangeKey} 行已被读取过，请使用已有内容。`;
+          return `[系统提示] 文件 ${basename} 的 ${rangeKey} 行已读取过。如无新变化可直接使用已有内容，系统仍将继续执行本次读取。`;
         }
         // 碎片化预警：同一文件 ≥3 段分段读取 → 建议全量读取
         if (fileRanges.size >= 3) {
           this.totalDedupHits++;
           this.roundDedupHits++;
           const basename = filePath.split('/').pop() || filePath;
-          return `[系统提示] 你已对 ${basename} 进行了 ${fileRanges.size} 次分段读取。请直接使用 file_view（不带 view_range）完整读取该文件，而不是反复分段读取。`;
+          return `[系统提示] 你已对 ${basename} 进行了 ${fileRanges.size} 次分段读取。建议使用 file_view（不带 view_range）完整读取该文件，系统仍将继续执行本次读取。`;
         }
       }
     }
@@ -1465,14 +1394,20 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    * 返回拦截提示（命中时）或 null（未命中时）。
    */
   private checkFailedWriteDuplicate(toolCall: ToolCall): string | null {
-    if (this.isReadOnlyToolCall(toolCall)) return null;
+    if (!this.isWriteDedupToolCall(toolCall)) return null;
 
     const key = this.buildWriteOperationKey(toolCall);
     const cached = this.failedWriteCache.get(key);
     if (!cached) return null;
+    const now = Date.now();
+    if (now - cached.lastAt > WorkerLLMAdapter.FAILED_WRITE_CACHE_TTL_MS) {
+      this.failedWriteCache.delete(key);
+      return null;
+    }
 
     // 相同写操作已失败过 → 短路拦截
     cached.count++;
+    cached.lastAt = now;
     this.totalDedupHits++;
     this.roundDedupHits++;
     this.roundWriteInterceptCount++;
@@ -1488,10 +1423,16 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    * 使用内容感知 key（包含完整参数指纹）精确匹配，避免误拦截不同内容的操作。
    */
   private checkSuccessWriteDuplicate(toolCall: ToolCall): string | null {
-    if (this.isReadOnlyToolCall(toolCall)) return null;
+    if (!this.isWriteDedupToolCall(toolCall)) return null;
 
     const key = this.buildContentAwareWriteKey(toolCall);
-    if (!this.successWriteCache.has(key)) return null;
+    const cached = this.successWriteCache.get(key);
+    if (!cached) return null;
+    const now = Date.now();
+    if (now - cached.updatedAt > WorkerLLMAdapter.SUCCESS_WRITE_CACHE_TTL_MS) {
+      this.successWriteCache.delete(key);
+      return null;
+    }
 
     this.totalDedupHits++;
     this.roundDedupHits++;
@@ -1504,9 +1445,10 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    * 记录成功的写操作（工具执行成功后调用）
    */
   private recordSuccessWrite(toolCall: ToolCall): void {
-    if (this.isReadOnlyToolCall(toolCall)) return;
+    if (!this.isWriteDedupToolCall(toolCall)) return;
     const key = this.buildContentAwareWriteKey(toolCall);
-    this.successWriteCache.add(key);
+    const filePath = this.extractWriteTargetPath(toolCall) || '';
+    this.successWriteCache.set(key, { filePath, updatedAt: Date.now() });
   }
 
   /**
@@ -1524,16 +1466,18 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    * 记录失败的写操作（工具执行失败后调用）
    */
   private recordFailedWrite(toolCall: ToolCall, error: string): void {
-    if (this.isReadOnlyToolCall(toolCall)) return;
+    if (!this.isWriteDedupToolCall(toolCall)) return;
     if (this.shouldSkipFailedWriteCache(error)) return;
 
     const key = this.buildWriteOperationKey(toolCall);
     const existing = this.failedWriteCache.get(key);
+    const now = Date.now();
     if (existing) {
       existing.count++;
       existing.error = error;
+      existing.lastAt = now;
     } else {
-      this.failedWriteCache.set(key, { count: 1, error });
+      this.failedWriteCache.set(key, { count: 1, error, firstAt: now, lastAt: now });
     }
   }
 
@@ -1545,6 +1489,9 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    * 清除写操作失败缓存（写操作成功时调用，表明状态已变化）
    */
   private clearFailedWriteForPath(toolCall: ToolCall): void {
+    if (!this.isWriteDedupToolCall(toolCall)) {
+      return;
+    }
     // 代码文件发生成功写入后，清空终端命令失败缓存，
     // 避免“修复后重新执行同一构建命令”被历史失败误拦截。
     if (this.isFileMutationTool(toolCall.name)) {
@@ -1556,11 +1503,16 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     }
 
     // 任何写操作成功后，清除同文件的失败缓存（文件状态已变化，之前的失败可能不再适用）
-    const filePath = (toolCall.arguments?.path || toolCall.arguments?.file_path || '') as string;
+    const filePath = this.extractWriteTargetPath(toolCall) || '';
     if (!filePath) return;
     for (const key of this.failedWriteCache.keys()) {
       if (key.includes(filePath)) {
         this.failedWriteCache.delete(key);
+      }
+    }
+    for (const [key, entry] of this.successWriteCache.entries()) {
+      if (entry.filePath === filePath) {
+        this.successWriteCache.delete(key);
       }
     }
   }
@@ -1585,6 +1537,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     return this.buildContentAwareWriteKey(toolCall);
   }
 
+  private extractWriteTargetPath(toolCall: ToolCall): string | null {
+    const args = toolCall.arguments || {};
+    const path = args.path || args.file_path || args.filePath || args.file;
+    if (typeof path !== 'string') return null;
+    const trimmed = path.trim();
+    return trimmed ? trimmed : null;
+  }
+
   private isFileMutationTool(toolName: string): boolean {
     return toolName === 'file_edit'
       || toolName === 'file_create'
@@ -1596,9 +1556,11 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    * 记录文件访问（工具执行成功后调用）
    * 仅在完整读取（无 view_range）时标记为已读，分段读取不标记
    */
-  private recordFileAccess(toolCall: ToolCall): void {
+  private recordFileAccess(toolCall: ToolCall, options?: { truncated?: boolean }): void {
     const filePath = this.extractTargetFilePath(toolCall);
     if (!filePath) return;
+
+    const truncated = Boolean(options?.truncated);
 
     if (toolCall.name === 'file_view') {
       if (toolCall.arguments?.view_range) {
@@ -1609,8 +1571,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           this.viewedRanges.set(filePath, new Set());
         }
         this.viewedRanges.get(filePath)!.add(rangeKey);
-      } else {
-        // 完整读取 → 标记文件
+      } else if (!truncated) {
+        // 完整读取且未截断 → 标记文件
         this.viewedFiles.add(filePath);
       }
     }
@@ -1638,44 +1600,4 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     return null;
   }
 
-  /**
-   * 缓存只读工具的查询结果
-   */
-  private cacheSearchResult(toolCall: ToolCall, result: string): void {
-    // file_view 是文件读取，不缓存到检索结果中（避免污染 Jaccard 缓存）
-    if (toolCall.name === 'file_view') return;
-
-    const identifiers = this.extractQueryIdentifiers(toolCall);
-    if (identifiers.length === 0) return;
-
-    // 用 \x00 分隔标识符作为缓存 key
-    const key = identifiers.join('\x00');
-    this.searchResultCache.set(key, result);
-  }
-
-  /**
-   * 从工具调用参数中提取关键标识符（英文单词、文件路径片段、数字）
-   *
-   * 例如查询 "请详细列出与 isWeekend 测试相关的符号：tests/date-utils.test.ts"
-   * → ["isWeekend", "tests", "date-utils.test.ts"]
-   *
-   * 这些标识符用于相似度比较，忽略中文措辞差异，聚焦于实际搜索的代码实体。
-   */
-  private extractQueryIdentifiers(toolCall: ToolCall): string[] {
-    const args = toolCall.arguments || {};
-    // 收集所有可能包含搜索意图的字段
-    const texts: string[] = [];
-    for (const val of Object.values(args)) {
-      if (typeof val === 'string') texts.push(val);
-    }
-    if (texts.length === 0) return [];
-
-    const combined = texts.join(' ');
-    // 提取英文标识符（含点号/连字符，捕获文件路径如 date-utils.test.ts）
-    // 过滤单字符噪声（如 "d", "s"），避免降低 Jaccard 相似度
-    const matches = combined.match(/[a-zA-Z_][\w.-]*/g) || [];
-    const filtered = matches.filter(m => m.length >= 2);
-    // 去重 + 排序，确保相同标识符集合产生相同 key
-    return [...new Set(filtered)].sort();
-  }
 }

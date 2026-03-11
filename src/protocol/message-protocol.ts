@@ -110,6 +110,7 @@ export type DataMessageType =
   | 'auxiliaryConfigLoaded'
   | 'auxiliaryConnectionTestResult'
   | 'confirmationRequest'
+  | 'deliveryRepairRequest'
   | 'customToolAdded'
   | 'customToolRemoved'
   | 'deepTaskChanged'

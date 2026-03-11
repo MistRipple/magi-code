@@ -486,6 +486,7 @@ export type WebviewToExtensionMessage =
   // 新增：交互模式相关
   | { type: 'setInteractionMode'; mode: InteractionMode }
   | { type: 'confirmRecovery'; decision: 'retry' | 'rollback' | 'continue' }
+  | { type: 'confirmDeliveryRepair'; decision: 'repair' | 'stop' }
 
   | { type: 'requestExecutionStats' }
   | { type: 'resetExecutionStats' }

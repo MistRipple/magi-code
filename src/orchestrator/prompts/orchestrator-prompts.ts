@@ -233,6 +233,7 @@ Sequential Workers naturally inherit changes from predecessors. Conflicts from p
 
   // dispatch_task 使用指南
   sections.push(`## dispatch_task Usage Guide
+- **mission_title is required on every first dispatch_task call**: You MUST provide \`mission_title\` — a concise, semantic summary of the overall mission (e.g. “Integrate admin dashboard frontend pages”, “Fix user login flow bug”). This is the plan title shown to the user. Do NOT copy the user's raw message verbatim; always rephrase it into a proper engineering title. On subsequent dispatch_task calls within the same conversation turn, you may omit it.
 - **task_name is required**: Generate a concise, standard engineering task name (e.g. “[Frontend] Implement password visibility toggle”). Do not copy the user's raw conversation text.
 - **category is required**: Choose the best-matching category from the Routing Table based on the task's nature. The system uses this to route to the appropriate Worker.
 - **requires_modification is required**:
