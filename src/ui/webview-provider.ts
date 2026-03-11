@@ -1121,8 +1121,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [this.extensionUri],
     };
 
-    // HTML 中已注入 initialSessionId，webview 加载时即有正确的 sessionId
-    webviewView.webview.html = this.getHtmlContent(webviewView.webview);
+    let html = '';
+    try {
+      // HTML 中已注入 initialSessionId，webview 加载时即有正确的 sessionId
+      html = this.getHtmlContent(webviewView.webview);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error('界面.Webview.加载失败', { error: message }, LogCategory.UI);
+      webviewView.webview.html = this.getWebviewErrorHtml(message);
+      vscode.window.showErrorMessage(t('provider.errors.webviewRenderFailed', { error: message }));
+      return;
+    }
+    webviewView.webview.html = html;
 
     // 处理来自 Webview 的消息
     webviewView.webview.onDidReceiveMessage(
@@ -1477,6 +1487,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         // 用户确认恢复策略
         await this.handleRecoveryConfirmation(message.decision);
         break;
+
+      case 'confirmDeliveryRepair': {
+        const decision = message.decision === 'repair' ? 'repair' : 'stop';
+        const accepted = this.orchestratorEngine.resolveDeliveryRepairConfirmation(decision);
+        if (!accepted) {
+          logger.warn('界面.交付修复确认.无待处理请求', undefined, LogCategory.UI);
+        }
+        break;
+      }
 
       case 'requestExecutionStats':
 
@@ -3605,6 +3624,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         description: tv.goal,
         status: tv.status,
         priority: tv.priority,
+        deliveryStatus: tv.deliveryStatus,
+        deliverySummary: tv.deliverySummary,
+        deliveryDetails: tv.deliveryDetails,
+        deliveryWarnings: tv.deliveryWarnings,
+        continuationPolicy: tv.continuationPolicy,
+        continuationReason: tv.continuationReason,
         subTasks: tv.subTasks,
         createdAt: tv.createdAt,
         startedAt: tv.startedAt,
@@ -3776,6 +3801,40 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     logger.debug('界面.Svelte.已加载', { sessionId: initialSessionId, locale: initialLocale }, LogCategory.UI);
     return html;
+  }
+
+  private getWebviewErrorHtml(errorMessage: string): string {
+    const title = this.escapeHtml(t('provider.errors.webviewRenderTitle'));
+    const hint = this.escapeHtml(t('provider.errors.webviewRenderHint'));
+    const details = this.escapeHtml(errorMessage);
+    return `<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${title}</title>
+    <style>
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 24px; color: #1f2328; }
+      .title { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
+      .hint { font-size: 13px; color: #636c76; margin-bottom: 12px; }
+      .details { font-size: 12px; background: #f6f8fa; padding: 12px; border-radius: 8px; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <div class="title">${title}</div>
+    <div class="hint">${hint}</div>
+    <div class="details">${details}</div>
+  </body>
+</html>`;
+  }
+
+  private escapeHtml(input: string): string {
+    return input
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 
   /** 获取管理器实例 */

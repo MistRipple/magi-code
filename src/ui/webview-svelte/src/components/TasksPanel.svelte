@@ -4,6 +4,7 @@
   import type { Task, SubTaskItem, ActivePlanState, PlanLedgerRecord, Message } from '../types/message';
   import { vscode } from '../lib/vscode-bridge';
   import Icon from './Icon.svelte';
+  import ErrorDetailPopover from './ErrorDetailPopover.svelte';
   import { i18n } from '../stores/i18n.svelte';
 
   const appState = getState();
@@ -56,9 +57,10 @@
     const completed = tasks.filter(t => t.status === 'completed').length;
     const running = tasks.filter(t => t.status === 'running').length;
     const failed = tasks.filter(t => t.status === 'failed').length;
+    const deliveryFailed = tasks.filter(t => t.deliveryStatus === 'failed').length;
     const pending = total - completed - running - failed;
     const progress = total > 0 ? Math.round((completed / total) * 100) : 0;
-    return { total, completed, running, failed, pending, progress };
+    return { total, completed, running, failed, pending, progress, deliveryFailed };
   });
 
   // 将 task.subTasks 按 assignmentId 分组，并关联 missionPlan 的 Worker 元信息
@@ -154,6 +156,13 @@
     if (status === 'partially_completed') return 'is-partial';
     if (status === 'cancelled' || status === 'superseded') return 'is-cancelled';
     return 'is-pending';
+  }
+
+  function getDeliveryStatusLabel(status?: string): string {
+    if (!status) return '';
+    const key = `tasks.deliveryStatus.${status}`;
+    const label = i18n.t(key);
+    return label !== key ? label : status;
   }
 
   function formatTimestamp(timestamp?: number): string {
@@ -409,6 +418,10 @@
             <span class="overview-dot failed"></span>
             <span class="overview-failed">{i18n.t('tasks.overview.failed', { count: stats.failed })}</span>
           {/if}
+          {#if stats.deliveryFailed > 0}
+            <span class="overview-dot delivery-failed"></span>
+            <span class="overview-delivery-failed">{i18n.t('tasks.overview.deliveryFailed', { count: stats.deliveryFailed })}</span>
+          {/if}
         </div>
         <div class="overview-progress">
           <div class="overview-progress-fill" style="width: {stats.progress}%"></div>
@@ -450,8 +463,18 @@
               {#if task.todoTotal > 0}
                 <span class="task-count">{task.todoCompleted}/{task.todoTotal}</span>
               {/if}
+              {#if task.deliveryStatus === 'failed' || task.deliveryStatus === 'blocked'}
+                <span class="task-delivery status-{task.deliveryStatus}">
+                  {getDeliveryStatusLabel(task.deliveryStatus)}
+                  {#if task.deliveryDetails || task.deliverySummary}
+                    <ErrorDetailPopover text={task.deliveryDetails || task.deliverySummary} maxInlineChars={72} />
+                  {/if}
+                </span>
+              {/if}
               {#if task.status === 'failed' && task.failureReason}
-                <span class="task-error" title={task.failureReason}>{task.failureReason}</span>
+                <span class="task-error">
+                  <ErrorDetailPopover text={task.failureReason} maxInlineChars={72} />
+                </span>
               {/if}
             </div>
             <!-- 操作按钮（hover 显示） -->
@@ -806,9 +829,11 @@
 
   .overview-dot.running { background: var(--primary); }
   .overview-dot.failed { background: var(--error); }
+  .overview-dot.delivery-failed { background: var(--warning); }
 
   .overview-running { color: var(--primary); }
   .overview-failed { color: var(--error); }
+  .overview-delivery-failed { color: var(--warning); }
 
   .overview-progress {
     height: 3px;
@@ -963,13 +988,27 @@
     flex-shrink: 0;
   }
 
+  .task-delivery {
+    font-size: var(--text-2xs);
+    color: var(--warning);
+    background: var(--warning-muted);
+    border: 1px solid color-mix(in srgb, var(--warning) 30%, var(--border));
+    padding: 1px 6px;
+    border-radius: var(--radius-full);
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    max-width: 60%;
+    min-width: 0;
+  }
+
   .task-error {
     font-size: var(--text-2xs);
     color: var(--error);
     max-width: 60%;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
   }
 
   /* ========== 操作按钮 ========== */

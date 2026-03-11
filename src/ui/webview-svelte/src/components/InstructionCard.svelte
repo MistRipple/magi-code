@@ -140,16 +140,29 @@
     }
   }
 
+  function statusClass(status: LaneTask['status']): string {
+    if (status === 'running') {
+      return 'status-running';
+    }
+    if (status === 'pending' || status === 'waiting_deps') {
+      return 'status-pending';
+    }
+    if (status === 'completed') {
+      return 'status-done';
+    }
+    return 'status-neutral';
+  }
+
   const currentTask = $derived(
     laneView?.tasks.find(task =>
       task.isCurrent || (laneView.currentTaskId ? task.taskId === laneView.currentTaskId : false)
     )
   );
   const pendingTasks = $derived(
-    laneView ? laneView.tasks.filter(task => isPendingStatus(task.status)) : []
+    laneView ? laneView.tasks.filter(task => task !== currentTask && isPendingStatus(task.status)) : []
   );
   const completedTasks = $derived(
-    laneView ? laneView.tasks.filter(task => isCompletedStatus(task.status)) : []
+    laneView ? laneView.tasks.filter(task => task !== currentTask && isCompletedStatus(task.status)) : []
   );
   const otherTasks = $derived(
     laneView
@@ -193,7 +206,7 @@
       {#if currentTask}
         <div class="task-row current">
           <span class="task-title">{currentTask.title}</span>
-          <span class="task-status status-running">{statusLabel(currentTask.status)}</span>
+          <span class={`task-status ${statusClass(currentTask.status)}`}>{statusLabel(currentTask.status)}</span>
         </div>
       {/if}
 

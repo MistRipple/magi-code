@@ -344,8 +344,22 @@ export interface AutoScrollConfig {
   gemini: boolean;
 }
 
+export interface ScrollAnchor {
+  messageId: string | null;
+  offsetTop: number;
+}
+
+export interface ScrollAnchors {
+  thread: ScrollAnchor;
+  claude: ScrollAnchor;
+  codex: ScrollAnchor;
+  gemini: ScrollAnchor;
+}
+
 // 任务状态
 export type TaskStatus = 'pending' | 'paused' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type DeliveryStatus = 'pending' | 'passed' | 'failed' | 'blocked' | 'skipped';
+export type ContinuationPolicy = 'auto' | 'ask' | 'stop';
 
 // 子任务状态（对齐后端 SubTaskViewStatus）
 export type SubTaskStatus =
@@ -383,6 +397,12 @@ export interface Task {
   prompt?: string;
   description?: string;
   status: TaskStatus;
+  deliveryStatus?: DeliveryStatus;
+  deliverySummary?: string;
+  deliveryDetails?: string;
+  deliveryWarnings?: string[];
+  continuationPolicy?: ContinuationPolicy;
+  continuationReason?: string;
   subTasks: SubTaskItem[];
   progress: number;
   missionId: string;
@@ -512,6 +532,7 @@ export interface WebviewPersistedState {
   sessions: Session[];
   currentSessionId: string | null;
   scrollPositions: ScrollPositions;
+  scrollAnchors?: ScrollAnchors;
   autoScrollEnabled: AutoScrollConfig;
   notificationBuckets?: Record<string, PersistedNotification[]>;
 }

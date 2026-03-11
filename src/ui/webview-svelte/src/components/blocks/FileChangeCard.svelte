@@ -187,9 +187,9 @@
   .tool-header {
     display: flex;
     align-items: center;
-    gap: var(--space-2, 8px);
+    gap: var(--space-3);
     width: 100%;
-    padding: var(--space-2, 8px) var(--space-3, 12px);
+    padding: var(--space-2) var(--space-4);
     background: transparent;
     border: none;
     text-align: left;

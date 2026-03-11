@@ -362,6 +362,7 @@ function resolvePendingInteractionsOnAutoMode(options?: { showToast?: boolean })
     store.pendingToolAuthorization
     || store.pendingConfirmation
     || store.pendingRecovery
+    || store.pendingDeliveryRepair
     || store.pendingClarification
     || store.pendingWorkerQuestion
   );
@@ -385,6 +386,10 @@ function resolvePendingInteractionsOnAutoMode(options?: { showToast?: boolean })
     vscode.postMessage({ type: 'confirmRecovery', decision });
   }
 
+  if (store.pendingDeliveryRepair) {
+    vscode.postMessage({ type: 'confirmDeliveryRepair', decision: 'repair' });
+  }
+
   if (store.pendingClarification) {
     vscode.postMessage({
       type: 'answerClarification',
@@ -402,6 +407,7 @@ function resolvePendingInteractionsOnAutoMode(options?: { showToast?: boolean })
   store.pendingToolAuthorization = null;
   store.pendingConfirmation = null;
   store.pendingRecovery = null;
+  store.pendingDeliveryRepair = null;
   store.pendingClarification = null;
   store.pendingWorkerQuestion = null;
   clearRequestedInteractionMode();
@@ -546,6 +552,12 @@ function handleStateUpdate(message: WebviewMessage) {
         name: String(raw.name || raw.prompt || ''),
         description: typeof raw.description === 'string' ? raw.description : undefined,
         status: String(raw.status) as Task['status'],
+        deliveryStatus: typeof raw.deliveryStatus === 'string' ? raw.deliveryStatus as Task['deliveryStatus'] : undefined,
+        deliverySummary: typeof raw.deliverySummary === 'string' ? raw.deliverySummary : undefined,
+        deliveryDetails: typeof raw.deliveryDetails === 'string' ? raw.deliveryDetails : undefined,
+        deliveryWarnings: Array.isArray(raw.deliveryWarnings) ? raw.deliveryWarnings as string[] : undefined,
+        continuationPolicy: typeof raw.continuationPolicy === 'string' ? raw.continuationPolicy as Task['continuationPolicy'] : undefined,
+        continuationReason: typeof raw.continuationReason === 'string' ? raw.continuationReason : undefined,
         subTasks,
         progress: typeof raw.progress === 'number' ? raw.progress : 0,
         missionId: typeof raw.missionId === 'string' ? raw.missionId : id,
@@ -1830,6 +1842,10 @@ function handleUnifiedData(standard: StandardMessage) {
       handleRecoveryRequest(asMessage(payload));
       break;
 
+    case 'deliveryRepairRequest':
+      handleDeliveryRepairRequest(asMessage(payload));
+      break;
+
     case 'clarificationRequest':
       handleClarificationRequest(asMessage(payload));
       break;
@@ -2155,6 +2171,29 @@ function handleRecoveryRequest(message: WebviewMessage) {
     error: message.error,
     canRetry: Boolean(message.canRetry),
     canRollback: Boolean(message.canRollback),
+  };
+  settleProcessingForManualInteraction();
+  sealAllStreamingMessages();
+}
+
+function handleDeliveryRepairRequest(message: WebviewMessage) {
+  const store = getState();
+  if (store.appState?.interactionMode === 'auto') {
+    addToast('info', i18n.t('messageHandler.autoDeliveryRepair'), undefined, {
+      category: 'audit',
+      source: 'delivery-repair',
+      countUnread: false,
+    });
+    vscode.postMessage({ type: 'confirmDeliveryRepair', decision: 'repair' });
+    setIsProcessing(true);
+    return;
+  }
+  store.pendingDeliveryRepair = {
+    missionId: (message.missionId as string) || '',
+    summary: String(message.summary || ''),
+    details: typeof message.details === 'string' ? message.details : undefined,
+    round: typeof message.round === 'number' ? message.round : 1,
+    maxRounds: typeof message.maxRounds === 'number' ? message.maxRounds : 1,
   };
   settleProcessingForManualInteraction();
   sealAllStreamingMessages();

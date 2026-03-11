@@ -8,6 +8,7 @@
   import BlockRenderer from './BlockRenderer.svelte';
   import Icon from './Icon.svelte';
   import RetryRuntimeIndicator from './RetryRuntimeIndicator.svelte';
+  import ErrorDetailPopover from './ErrorDetailPopover.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { retryRuntimeState } from '../stores/messages.svelte';
 
@@ -74,6 +75,19 @@
     }
     return false;
   });
+
+  // 纯内容消息判断：只含 text/code blocks 的消息使用 inline 模式渲染，
+  // 不需要卡片包裹——它们是模型输出的自然语言内容和代码片段，
+  // 只有 tool_call / thinking / plan / file_change 等过程性内容才需要卡片。
+  const isContentOnly = $derived.by(() => {
+    if (safeBlocks.length === 0) return Boolean(message.content);
+    return safeBlocks.every(b => b.type === 'text' || b.type === 'code');
+  });
+
+  // 最终是否使用 inline 模式：主角色始终 inline；
+  // 非主角色仅在消息最终确定形态（非流式、非占位）且为纯内容时才 inline，
+  // 避免流式过程中 blocks 类型变化导致 DOM 分支切换闪烁。
+  const useInlineMode = $derived(isNativeSource || (!isStreaming && !isPlaceholder && isContentOnly));
 
   // 格式化时间戳
   function formatTime(timestamp: number): string {
@@ -163,7 +177,9 @@
     <span class="notice-icon" style="color: {noticeColors[noticeType] || noticeColors.info}">
       <Icon name={noticeIcons[noticeType] || 'info'} size={14} />
     </span>
-    <span class="notice-text">{message.content}</span>
+    <span class="notice-text">
+      <ErrorDetailPopover text={message.content} maxInlineChars={96} />
+    </span>
     <span class="notice-time">{formatTime(message.timestamp)}</span>
   </div>
 <!-- 用户消息：简洁显示 -->
@@ -200,11 +216,12 @@
       metadata={instructionMetadata}
     />
   </div>
-<!-- 助手消息：根据 displayContext 区分主角色（inline）和客角色（card） -->
-{:else if isNativeSource}
-  <!-- 主角色消息：inline 模式，无卡片边框和 header -->
+<!-- 助手消息：纯文本内容使用 inline 模式，结构化内容使用 card 模式 -->
+{:else if useInlineMode}
+  <!-- inline 模式：无卡片边框和 header，自然融入对话流 -->
   <div
     class="message-item assistant native"
+    class:inline-guest={!isNativeSource}
     class:streaming={isStreaming}
     class:placeholder={isPlaceholder}
     class:was-placeholder={wasPlaceholder}
@@ -226,6 +243,13 @@
           {/if}
         </div>
       {:else}
+        <!-- 非主角色的纯文本消息：在内容前显示来源标识 -->
+        {#if !isNativeSource}
+          <div class="inline-source-tag">
+            <WorkerBadge worker={badgeWorker} size="sm" />
+          </div>
+        {/if}
+
         {#if isInteraction && interactionMeta?.prompt}
           <div class="interaction-inline">
             <Icon name="sparkles" size={14} />
@@ -259,7 +283,7 @@
     </div>
   </div>
 {:else}
-  <!-- 客角色消息：card 模式，有卡片边框和 header -->
+  <!-- card 模式：含结构化内容（tool_call/thinking/code/plan 等）的消息，有卡片边框和 header -->
   <div
     class="message-item assistant"
     class:streaming={isStreaming}
@@ -387,9 +411,8 @@
     height: 14px;
   }
   .notice-text {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    min-width: 0;
+    flex: 1;
   }
   .notice-time {
     font-size: 10px;
@@ -466,13 +489,23 @@
     overflow: visible;
   }
 
-  /* ===== 主角色消息样式（inline 模式：无卡片包裹） ===== */
+  /* ===== inline 模式样式（无卡片包裹） ===== */
   .message-item.assistant.native {
     background: transparent;
     border: none;
     padding: 0 var(--space-4);
     border-radius: 0;
+  }
+
+  /* 主角色连续消息紧凑间距（orchestrator 在主对话区、worker 在 Worker 面板） */
+  .message-item.assistant.native:not(.inline-guest) {
     margin-top: calc(-1 * var(--space-2));
+  }
+
+  /* 非主角色的 inline 来源标识：轻量 badge，不打断阅读流 */
+  .inline-source-tag {
+    margin-bottom: var(--space-2);
+    opacity: 0.7;
   }
 
   /* 流式消息卡片：高度完全由内容与动画驱动，避免占位感 */

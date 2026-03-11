@@ -35,6 +35,7 @@
 
   const pendingConfirmation = $derived(appState.pendingConfirmation);
   const pendingRecovery = $derived(appState.pendingRecovery);
+  const pendingDeliveryRepair = $derived(appState.pendingDeliveryRepair);
   const pendingClarification = $derived(appState.pendingClarification);
   const pendingWorkerQuestion = $derived(appState.pendingWorkerQuestion);
   const pendingToolAuthorization = $derived(appState.pendingToolAuthorization);
@@ -62,6 +63,12 @@
     vscode.postMessage({ type: 'confirmRecovery', decision });
     appState.pendingRecovery = null;
     setIsProcessing(true);
+  }
+
+  function confirmDeliveryRepair(decision: 'repair' | 'stop') {
+    vscode.postMessage({ type: 'confirmDeliveryRepair', decision });
+    appState.pendingDeliveryRepair = null;
+    if (decision === 'repair') setIsProcessing(true);
   }
 
   function submitClarification(cancelled = false) {
@@ -167,6 +174,29 @@
           <button class="modal-btn secondary" onclick={() => confirmRecovery('continue')}>{i18n.t('app.recoveryContinue')}</button>
           <button class="modal-btn secondary" disabled={!pendingRecovery.canRollback} onclick={() => confirmRecovery('rollback')}>{i18n.t('app.recoveryRollback')}</button>
           <button class="modal-btn primary" disabled={!pendingRecovery.canRetry} onclick={() => confirmRecovery('retry')}>{i18n.t('app.recoveryRetry')}</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if pendingDeliveryRepair && interactionMode === 'ask'}
+    <div class="modal-overlay" role="presentation">
+      <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
+        <div class="modal-header">
+          <h3>{i18n.t('app.deliveryRepairTitle')}</h3>
+        </div>
+        <div class="modal-body">
+          <p>{i18n.t('app.deliveryRepairMessage', { round: pendingDeliveryRepair.round, maxRounds: pendingDeliveryRepair.maxRounds })}</p>
+          {#if pendingDeliveryRepair.summary}
+            <div class="modal-context">{pendingDeliveryRepair.summary}</div>
+          {/if}
+          {#if pendingDeliveryRepair.details}
+            <pre class="modal-pre">{pendingDeliveryRepair.details}</pre>
+          {/if}
+        </div>
+        <div class="modal-footer">
+          <button class="modal-btn secondary" onclick={() => confirmDeliveryRepair('stop')}>{i18n.t('app.deliveryRepairStop')}</button>
+          <button class="modal-btn primary" onclick={() => confirmDeliveryRepair('repair')}>{i18n.t('app.deliveryRepairConfirm')}</button>
         </div>
       </div>
     </div>

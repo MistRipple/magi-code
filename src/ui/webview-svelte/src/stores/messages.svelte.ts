@@ -13,6 +13,8 @@ import type {
   ProcessingActor,
   ContentBlock,
   ScrollPositions,
+  ScrollAnchors,
+  ScrollAnchor,
   AutoScrollConfig,
   AppState,
   WebviewPersistedState,
@@ -80,6 +82,12 @@ export const messagesState = $state({
     codex: 0,
     gemini: 0,
   } as ScrollPositions,
+  scrollAnchors: {
+    thread: { messageId: null, offsetTop: 0 },
+    claude: { messageId: null, offsetTop: 0 },
+    codex: { messageId: null, offsetTop: 0 },
+    gemini: { messageId: null, offsetTop: 0 },
+  } as ScrollAnchors,
   autoScrollEnabled: {
     thread: true,
     claude: true,
@@ -93,6 +101,53 @@ const MAX_THREAD_MESSAGES = 500;
 const MAX_AGENT_MESSAGES = 200;
 
 const MAX_PERSISTED_ARRAY_LENGTH = 10000;
+const WEBVIEW_STATE_SAVE_DEBOUNCE_MS = 120;
+
+type ScrollPanelKey = keyof ScrollPositions;
+
+const DEFAULT_SCROLL_ANCHOR: ScrollAnchor = { messageId: null, offsetTop: 0 };
+
+function createDefaultScrollAnchors(): ScrollAnchors {
+  return {
+    thread: { ...DEFAULT_SCROLL_ANCHOR },
+    claude: { ...DEFAULT_SCROLL_ANCHOR },
+    codex: { ...DEFAULT_SCROLL_ANCHOR },
+    gemini: { ...DEFAULT_SCROLL_ANCHOR },
+  };
+}
+
+let deferredWebviewStateSaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleSaveWebviewState(): void {
+  if (deferredWebviewStateSaveTimer) {
+    clearTimeout(deferredWebviewStateSaveTimer);
+  }
+  deferredWebviewStateSaveTimer = setTimeout(() => {
+    deferredWebviewStateSaveTimer = null;
+    saveWebviewState();
+  }, WEBVIEW_STATE_SAVE_DEBOUNCE_MS);
+}
+
+function normalizeScrollTop(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+  return Math.round(value);
+}
+
+function normalizeScrollAnchor(value: ScrollAnchor | null | undefined): ScrollAnchor {
+  if (!value || typeof value !== 'object') {
+    return { ...DEFAULT_SCROLL_ANCHOR };
+  }
+  const messageId = typeof value.messageId === 'string' && value.messageId.trim().length > 0
+    ? value.messageId.trim()
+    : null;
+  const offsetTop = Number.isFinite(value.offsetTop) ? Math.round(value.offsetTop) : 0;
+  return {
+    messageId,
+    offsetTop,
+  };
+}
 
 function isValidPersistedArray(value: unknown, max: number): value is unknown[] {
   if (!Array.isArray(value)) return false;
@@ -335,6 +390,7 @@ function normalizeMissionPlan(plan: MissionPlan | null): MissionPlan | null {
 // 交互请求状态
 let pendingConfirmation = $state<{ plan: unknown; formattedPlan?: string; forceManual?: boolean } | null>(null);
 let pendingRecovery = $state<{ taskId: string; error: unknown; canRetry: boolean; canRollback: boolean } | null>(null);
+let pendingDeliveryRepair = $state<{ missionId: string; summary: string; details?: string; round: number; maxRounds: number } | null>(null);
 let pendingClarification = $state<{ questions: string[]; context?: string; ambiguityScore?: number; originalPrompt?: string } | null>(null);
 let pendingWorkerQuestion = $state<{ workerId: string; question: string; context?: string; options?: unknown } | null>(null);
 let pendingToolAuthorization = $state<{ requestId: string; toolName: string; toolArgs: unknown } | null>(null);
@@ -406,6 +462,10 @@ export function getAppState() {
 
 export function getScrollPositions() {
   return messagesState.scrollPositions;
+}
+
+export function getScrollAnchors() {
+  return messagesState.scrollAnchors;
 }
 
 export function getAutoScrollEnabled() {
@@ -573,6 +633,8 @@ export function getState() {
     set pendingConfirmation(v) { pendingConfirmation = v; },
     get pendingRecovery() { return pendingRecovery; },
     set pendingRecovery(v) { pendingRecovery = v; },
+    get pendingDeliveryRepair() { return pendingDeliveryRepair; },
+    set pendingDeliveryRepair(v) { pendingDeliveryRepair = v; },
     get pendingClarification() { return pendingClarification; },
     set pendingClarification(v) { pendingClarification = v; },
     get pendingWorkerQuestion() { return pendingWorkerQuestion; },
@@ -609,6 +671,10 @@ function trimMessageLists() {
 
 // 保存状态到 VS Code
 function saveWebviewState() {
+  if (deferredWebviewStateSaveTimer) {
+    clearTimeout(deferredWebviewStateSaveTimer);
+    deferredWebviewStateSaveTimer = null;
+  }
   trimMessageLists();
   const state: WebviewPersistedState = {
     currentTopTab: messagesState.currentTopTab,
@@ -618,10 +684,54 @@ function saveWebviewState() {
     sessions: messagesState.sessions,
     currentSessionId: messagesState.currentSessionId,
     scrollPositions: messagesState.scrollPositions,
+    scrollAnchors: messagesState.scrollAnchors,
     autoScrollEnabled: messagesState.autoScrollEnabled,
     notificationBuckets,
   };
   vscode.setState(state);
+}
+
+export function updatePanelScrollState(
+  panel: ScrollPanelKey,
+  input: { scrollTop?: number; autoScrollEnabled?: boolean; anchor?: ScrollAnchor | null },
+  options: { persist?: boolean } = {}
+): void {
+  let changed = false;
+
+  if (typeof input.scrollTop === 'number') {
+    const nextScrollTop = normalizeScrollTop(input.scrollTop);
+    if (messagesState.scrollPositions[panel] !== nextScrollTop) {
+      messagesState.scrollPositions = {
+        ...messagesState.scrollPositions,
+        [panel]: nextScrollTop,
+      };
+      changed = true;
+    }
+  }
+
+  if (typeof input.autoScrollEnabled === 'boolean' && messagesState.autoScrollEnabled[panel] !== input.autoScrollEnabled) {
+    messagesState.autoScrollEnabled = {
+      ...messagesState.autoScrollEnabled,
+      [panel]: input.autoScrollEnabled,
+    };
+    changed = true;
+  }
+
+  if ('anchor' in input) {
+    const nextAnchor = normalizeScrollAnchor(input.anchor);
+    const currentAnchor = messagesState.scrollAnchors[panel];
+    if (currentAnchor.messageId !== nextAnchor.messageId || currentAnchor.offsetTop !== nextAnchor.offsetTop) {
+      messagesState.scrollAnchors = {
+        ...messagesState.scrollAnchors,
+        [panel]: nextAnchor,
+      };
+      changed = true;
+    }
+  }
+
+  if (changed && options.persist !== false) {
+    scheduleSaveWebviewState();
+  }
 }
 
 // Tab 操作
@@ -1278,6 +1388,12 @@ export function initializeState() {
       });
     messagesState.currentSessionId = persisted.currentSessionId || null;
     messagesState.scrollPositions = persisted.scrollPositions || { thread: 0, claude: 0, codex: 0, gemini: 0 };
+    messagesState.scrollAnchors = persisted.scrollAnchors ? {
+      thread: normalizeScrollAnchor(persisted.scrollAnchors.thread),
+      claude: normalizeScrollAnchor(persisted.scrollAnchors.claude),
+      codex: normalizeScrollAnchor(persisted.scrollAnchors.codex),
+      gemini: normalizeScrollAnchor(persisted.scrollAnchors.gemini),
+    } : createDefaultScrollAnchors();
     messagesState.autoScrollEnabled = persisted.autoScrollEnabled || { thread: true, claude: true, codex: true, gemini: true };
     notificationBuckets = normalizeNotificationBuckets(persisted.notificationBuckets);
     syncNotificationsFromBucket(messagesState.currentSessionId);

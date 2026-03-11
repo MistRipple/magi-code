@@ -131,6 +131,10 @@ export class EventBindingService {
       }
     });
 
+    mo.on('missionDeliveryChanged', () => {
+      this.ctx.sendStateUpdate();
+    });
+
     // Assignment 事件
     mo.on('assignmentStarted', (data) => {
       this.ctx.sendData('assignmentStarted', {

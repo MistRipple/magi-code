@@ -1,9 +1,9 @@
 <script lang="ts">
-  import type { Message } from '../types/message';
+  import type { Message, ScrollPositions } from '../types/message';
   import MessageItem from './MessageItem.svelte';
   import Icon from './Icon.svelte';
-  import { onMount, tick } from 'svelte';
-  import { clearMessageJump, messagesState } from '../stores/messages.svelte';
+  import { tick } from 'svelte';
+  import { clearMessageJump, messagesState, updatePanelScrollState } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { deriveWorkerPanelState, getMessageRequestId } from '../lib/worker-panel-state';
 
@@ -229,41 +229,115 @@
   const emptyIcon = $derived((emptyState?.icon || 'chat') as import('../lib/icons').IconName);
   const emptyTitle = $derived(emptyState?.title || i18n.t('messageList.empty.title'));
   const emptyHint = $derived(emptyState?.hint || i18n.t('messageList.empty.hint'));
+  const panelKey = $derived.by((): keyof ScrollPositions => (displayContext === 'worker' ? (workerName || 'claude') : 'thread'));
+  const persistedScrollTop = $derived(messagesState.scrollPositions[panelKey] || 0);
+  const persistedScrollAnchor = $derived(messagesState.scrollAnchors[panelKey]);
+  const shouldAutoScroll = $derived(messagesState.autoScrollEnabled[panelKey]);
 
   // 容器引用
   let containerRef: HTMLDivElement | null = $state(null);
+  const showScrollBtn = $derived(!shouldAutoScroll && safeMessages.length > 0);
+  let wasActive = $state(false);
 
-  // 是否应该自动滚动到底部
-  let shouldAutoScroll = $state(true);
-  // 是否显示滚动按钮
-  let showScrollBtn = $state(false);
+  function setContainerScrollPosition(nextTop: number) {
+    if (!containerRef) return;
+    containerRef.style.scrollBehavior = 'auto';
+    containerRef.scrollTop = Math.max(0, nextTop);
+    requestAnimationFrame(() => {
+      if (containerRef) {
+        containerRef.style.scrollBehavior = '';
+      }
+    });
+  }
+
+  function captureVisibleAnchor() {
+    if (!containerRef) {
+      return null;
+    }
+    if (containerRef.clientHeight <= 0 || containerRef.getClientRects().length === 0) {
+      return null;
+    }
+    const containerRect = containerRef.getBoundingClientRect();
+    const candidates = Array.from(containerRef.querySelectorAll<HTMLElement>('[data-message-id]'));
+    for (const candidate of candidates) {
+      const rect = candidate.getBoundingClientRect();
+      if (rect.bottom <= containerRect.top) {
+        continue;
+      }
+      return {
+        messageId: candidate.dataset.messageId || null,
+        offsetTop: Math.round(rect.top - containerRect.top),
+      };
+    }
+    const lastCandidate = candidates[candidates.length - 1];
+    if (!lastCandidate) {
+      return null;
+    }
+    const rect = lastCandidate.getBoundingClientRect();
+    return {
+      messageId: lastCandidate.dataset.messageId || null,
+      offsetTop: Math.round(rect.top - containerRect.top),
+    };
+  }
+
+  function syncPanelScrollState(scrollTop: number, autoScrollEnabled: boolean, persist = true, anchor = captureVisibleAnchor()) {
+    updatePanelScrollState(panelKey, { scrollTop, autoScrollEnabled, anchor }, { persist });
+  }
+
+  function scrollPanelToBottom(persist = true) {
+    if (!containerRef) return;
+    setContainerScrollPosition(containerRef.scrollHeight);
+    syncPanelScrollState(containerRef.scrollTop, true, persist);
+  }
+
+  function restorePanelScrollPosition(persist = false) {
+    if (!containerRef) return;
+    if (shouldAutoScroll) {
+      scrollPanelToBottom(persist);
+      return;
+    }
+    const anchor = persistedScrollAnchor;
+    if (anchor?.messageId) {
+      const selectorSafeId = anchor.messageId.replace(/"/g, '\\"');
+      const targetElement = containerRef.querySelector(`[data-message-id="${selectorSafeId}"]`) as HTMLElement | null;
+      if (targetElement) {
+        const containerRect = containerRef.getBoundingClientRect();
+        const elementRect = targetElement.getBoundingClientRect();
+        const currentOffsetTop = elementRect.top - containerRect.top;
+        setContainerScrollPosition(containerRef.scrollTop + currentOffsetTop - anchor.offsetTop);
+        syncPanelScrollState(containerRef.scrollTop, false, persist, anchor);
+        return;
+      }
+    }
+    setContainerScrollPosition(persistedScrollTop);
+    syncPanelScrollState(containerRef.scrollTop, false, persist);
+  }
 
   // 监听消息变化，自动滚动到底部
   // 🔧 同时监听流式消息内容变化，确保内容增长时也能自动滚动
   $effect(() => {
+    const active = isActive;
     const _len = safeMessages.length;
     const _sig = streamingContentSignature; // 订阅流式内容变化
     void _len;
     void _sig;
-    if (shouldAutoScroll && containerRef) {
-      tick().then(() => {
-        if (containerRef) {
-          // 直接定位，不要平滑滚动
-          containerRef.scrollTop = containerRef.scrollHeight;
-        }
-      });
-    }
+    if (!active || !shouldAutoScroll || !containerRef) return;
+    tick().then(() => {
+      if (!containerRef || !isActive || !shouldAutoScroll) return;
+      scrollPanelToBottom();
+    });
   });
 
-  // 面板从隐藏切到可见时，补一次定位到底部（首次切换 Worker 面板场景）
+  // 面板切回可见后，按 panel 维度恢复之前的位置；仅在可见性切换瞬间执行，避免覆盖用户手动滚动
   $effect(() => {
     const active = isActive;
-    if (!active || !containerRef || !shouldAutoScroll) return;
-    tick().then(() => {
-      if (containerRef && isActive && shouldAutoScroll) {
-        containerRef.scrollTop = containerRef.scrollHeight;
-      }
-    });
+    if (active && !wasActive && containerRef) {
+      tick().then(() => {
+        if (!containerRef || !isActive) return;
+        restorePanelScrollPosition(false);
+      });
+    }
+    wasActive = active;
   });
 
   // 外部触发的消息定位（例如：任务面板点击历史计划，穿透定位到对应对话轮次）
@@ -308,29 +382,16 @@
     const target = event.target as HTMLDivElement;
     const { scrollTop, scrollHeight, clientHeight } = target;
     const isNearBottom = scrollHeight - scrollTop - clientHeight < 100;
-    shouldAutoScroll = isNearBottom;
-    showScrollBtn = !isNearBottom && safeMessages.length > 0;
+    syncPanelScrollState(scrollTop, isNearBottom);
   }
 
   // 滚动到底部
   function scrollToBottom() {
-    shouldAutoScroll = true;
+    updatePanelScrollState(panelKey, { autoScrollEnabled: true }, { persist: false });
     if (containerRef) {
       containerRef.scrollTo({ top: containerRef.scrollHeight, behavior: 'smooth' });
     }
   }
-
-  onMount(() => {
-    // 初始化时直接定位到底部（不要动画）
-    if (containerRef) {
-      containerRef.style.scrollBehavior = 'auto'; // 强制关闭平滑滚动
-      containerRef.scrollTop = containerRef.scrollHeight;
-      // 恢复平滑滚动 (下一帧)
-      requestAnimationFrame(() => {
-        if (containerRef) containerRef.style.scrollBehavior = '';
-      });
-    }
-  });
 </script>
 
 <div class="message-list-wrapper">
