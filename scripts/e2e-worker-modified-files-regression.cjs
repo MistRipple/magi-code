@@ -71,21 +71,99 @@ function loadCompiledModule(relPath) {
 }
 
 function createWorker(AutonomousWorker, WorkerSessionManager) {
+  const todoStore = new Map();
+  const syncTodo = (todo) => {
+    const cloned = { ...todo };
+    if (todo.output) {
+      cloned.output = {
+        ...todo.output,
+        modifiedFiles: [...(todo.output.modifiedFiles || [])],
+      };
+    }
+    todoStore.set(cloned.id, cloned);
+    return cloned;
+  };
+
   const worker = new AutonomousWorker(
     'codex',
     { getProfile() { return {}; } },
     { buildSelfCheckGuidance() { return ''; } },
     {
       async prepareForExecution() { return true; },
-      async start() {},
-      async complete() {},
-      async fail() {},
+      async start(todoId) {
+        const todo = todoStore.get(todoId);
+        if (!todo) throw new Error(`missing todo: ${todoId}`);
+        syncTodo({ ...todo, status: 'running', startedAt: Date.now() });
+      },
+      async complete(todoId, output) {
+        const todo = todoStore.get(todoId);
+        if (!todo) throw new Error(`missing todo: ${todoId}`);
+        syncTodo({ ...todo, status: 'completed', completedAt: Date.now(), output });
+      },
+      async fail(todoId, error) {
+        const todo = todoStore.get(todoId);
+        if (!todo) throw new Error(`missing todo: ${todoId}`);
+        syncTodo({
+          ...todo,
+          status: 'failed',
+          completedAt: Date.now(),
+          output: {
+            success: false,
+            summary: '',
+            modifiedFiles: [...(todo.output?.modifiedFiles || [])],
+            error,
+            duration: 0,
+          },
+        });
+      },
+      async skip(todoId, reason) {
+        const todo = todoStore.get(todoId);
+        if (!todo) throw new Error(`missing todo: ${todoId}`);
+        syncTodo({ ...todo, status: 'skipped', completedAt: Date.now(), blockedReason: reason });
+      },
+      async get(todoId) {
+        return todoStore.get(todoId) || null;
+      },
+      async getByAssignment(assignmentId) {
+        return Array.from(todoStore.values()).filter((todo) => todo.assignmentId === assignmentId);
+      },
+      async reject(todoId, reason) {
+        const todo = todoStore.get(todoId);
+        if (!todo) throw new Error(`missing todo: ${todoId}`);
+        syncTodo({
+          ...todo,
+          approvalStatus: 'rejected',
+          approvalNote: reason,
+          status: 'skipped',
+          completedAt: Date.now(),
+          blockedReason: reason,
+        });
+      },
+      async resetToPending(todoId) {
+        const todo = todoStore.get(todoId);
+        if (!todo) throw new Error(`missing todo: ${todoId}`);
+        syncTodo({
+          ...todo,
+          status: 'pending',
+          output: undefined,
+          error: undefined,
+          blockedReason: undefined,
+          completedAt: undefined,
+          progress: 0,
+        });
+      },
+      async approve(todoId, note) {
+        const todo = todoStore.get(todoId);
+        if (!todo) throw new Error(`missing todo: ${todoId}`);
+        syncTodo({ ...todo, approvalStatus: 'approved', approvalNote: note });
+      },
     },
     {
       contextAssembler: {},
       fileSummaryCache: {},
       sharedContextPool: { getByMission() { return []; }, add() {} },
     },
+    undefined,
     new WorkerSessionManager({ autoCleanup: false }),
   );
   worker.discoverRelevantFiles = async () => [];
@@ -93,6 +171,12 @@ function createWorker(AutonomousWorker, WorkerSessionManager) {
   worker.writeInsights = async () => {};
   worker.hasWorkerSharedFacts = () => true;
   worker.collectUnknownRequiredContracts = () => [];
+  const originalExecuteTodo = worker.executeTodo.bind(worker);
+  worker.executeTodo = async (...args) => {
+    const [todo] = args;
+    syncTodo(todo);
+    return originalExecuteTodo(...args);
+  };
   return worker;
 }
 
@@ -180,7 +264,7 @@ async function testRealModifiedFilesBackfill(ToolManager, AutonomousWorker) {
   );
 
   assert(outcome.success === true, '真实写入场景下 executeTodo 应成功');
-  assert(todo.output?.modifiedFiles?.includes('tracked.txt'), `modifiedFiles 未回填真实文件: ${JSON.stringify(todo.output)}`);
+  assert(outcome.todo.output?.modifiedFiles?.includes('tracked.txt'), `modifiedFiles 未回填真实文件: ${JSON.stringify(outcome.todo.output)}`);
   assert(!fs.existsSync(trackedFile), '真实文件删除未生效');
   worker.dispose();
   toolManager.clearSnapshotContext('codex');

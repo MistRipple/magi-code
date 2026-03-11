@@ -213,6 +213,25 @@ async function testNack(DispatchManager) {
   ctx.manager.dispose();
 }
 
+function testNoHardExecutionTimeout(DispatchManager) {
+  const ctx = createManager(DispatchManager);
+  const batch = createFakeBatch('batch-no-hard-timeout');
+  batch.register('task-no-hard-timeout', 'codex');
+
+  ctx.manager.activeBatch = batch;
+  const state = ctx.manager.registerProtocolState('task-no-hard-timeout', batch.id, 'codex');
+  ctx.manager.markProtocolAck('task-no-hard-timeout', 'codex');
+  state.createdAt = Date.now() - 24 * 60 * 60 * 1000;
+  state.leaseExpireAt = Date.now() + 60 * 1000;
+
+  ctx.manager.checkProtocolLeases();
+
+  const failed = batch.getFailed();
+  assert(failed.length === 0, `不应因执行时长触发失败，实际: ${failed.length}`);
+  assert(ctx.manager.executionProtocolStates.has('task-no-hard-timeout'), '协议状态不应被硬超时清理');
+  ctx.manager.dispose();
+}
+
 function testHeartbeatRenewsLease(DispatchManager) {
   const ctx = createManager(DispatchManager);
   const batch = createFakeBatch('batch-heartbeat');
@@ -235,6 +254,7 @@ async function main() {
   await testAckTimeout(DispatchManager);
   await testLeaseExpired(DispatchManager);
   await testNack(DispatchManager);
+  testNoHardExecutionTimeout(DispatchManager);
   testHeartbeatRenewsLease(DispatchManager);
 
   console.log('\n=== dispatch protocol regression ===');
@@ -244,6 +264,7 @@ async function main() {
       'ack-timeout-fail-fast',
       'lease-expired-fail-fast',
       'nack-fail-fast',
+      'no-hard-execution-timeout',
       'heartbeat-renew-lease',
     ],
   }, null, 2));

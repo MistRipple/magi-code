@@ -33,6 +33,12 @@ function testSourceGuardrails() {
   const source = fs.readFileSync(path.join(ROOT, 'src', 'orchestrator', 'core', 'mission-driven-engine.ts'), 'utf8');
   assert(source.includes('const finalRuntimeReason = finalRuntimeTermination?.reason;'), 'engine finally 未收敛到 finalRuntimeReason');
   assert(source.includes('reason: finalRuntimeReason,'), 'Attempt/metrics 未统一消费 finalRuntimeReason');
+  assert(source.includes("if (finalPlanStatus === 'completed')"), 'Mission completed 未统一消费 finalPlanStatus');
+  assert(source.includes("} else if (finalPlanStatus === 'failed') {"), 'Mission failed 未统一消费 finalPlanStatus');
+  assert(source.includes("} else if (finalPlanStatus === 'cancelled') {"), 'Mission cancelled 未统一消费 finalPlanStatus');
+  assert(source.includes('private buildExecutionFailureMessages('), '缺少 formal runtime reason -> failureReason 收敛函数');
+  assert(source.includes('runtimeReason: this.lastExecutionRuntimeReason,'), 'getLastExecutionStatus 未暴露 runtimeReason');
+  assert(!source.includes('lastExecutionSuccess'), '仍残留旧 lastExecutionSuccess 第二裁决源');
   assert(!source.includes("orchestratorRuntimeReason = orchestratorRuntimeReason || 'interrupted'"), '仍残留旧中断兜底分支');
   assert(!source.includes("planFinalStatus = 'failed';"), '仍残留 planFinalStatus 过程态直写');
   assert(!source.includes('orchestrator-finalized:${planFinalStatus}'), '仍残留旧 attempt reason 拼接逻辑');
@@ -137,6 +143,44 @@ function testExternalAbortCompression(engine) {
   );
 }
 
+function testMissionTerminalContracts(engine) {
+  const cases = [
+    { reason: 'completed', plan: 'completed', attempt: 'succeeded', success: true, message: undefined },
+    { reason: 'cancelled', plan: 'cancelled', attempt: 'cancelled', success: false, message: undefined },
+    { reason: 'external_abort', plan: 'cancelled', attempt: 'cancelled', success: false, message: undefined },
+    { reason: 'interrupted', plan: 'cancelled', attempt: 'cancelled', success: false, message: undefined },
+    { reason: 'failed', plan: 'failed', attempt: 'failed', success: false, message: '执行失败' },
+    { reason: 'stalled', plan: 'failed', attempt: 'timeout', success: false, message: '执行停滞，未取得有效进展' },
+    { reason: 'budget_exceeded', plan: 'failed', attempt: 'timeout', success: false, message: '执行达到预算上限' },
+    { reason: 'external_wait_timeout', plan: 'failed', attempt: 'timeout', success: false, message: '执行等待外部条件超时' },
+    { reason: 'upstream_model_error', plan: 'failed', attempt: 'failed', success: false, message: '执行遭遇上游模型错误' },
+  ];
+
+  for (const item of cases) {
+    const finalPlanStatus = engine.mapOrchestratorRuntimeReasonToPlanFinalStatus(item.reason);
+    const attemptStatus = engine.mapOrchestratorRuntimeReasonToAttemptStatus(item.reason);
+    assert(finalPlanStatus === item.plan, `${item.reason} 应映射为 plan=${item.plan}，实际: ${finalPlanStatus}`);
+    assert(attemptStatus === item.attempt, `${item.reason} 应映射为 attempt=${item.attempt}，实际: ${attemptStatus}`);
+
+    const errors = item.plan === 'failed'
+      ? engine.buildExecutionFailureMessages(item.reason, [])
+      : [];
+    if (item.message) {
+      assert(errors.length > 0, `${item.reason} failed 时必须产生 failureReason`);
+      assert(errors[0] === item.message, `${item.reason} failureReason 异常: ${errors[0]}`);
+    }
+
+    engine.lastExecutionRuntimeReason = item.reason;
+    engine.lastExecutionErrors = errors;
+    const status = engine.getLastExecutionStatus();
+    assert(status.runtimeReason === item.reason, `getLastExecutionStatus runtimeReason 异常: ${status.runtimeReason}`);
+    assert(status.success === item.success, `getLastExecutionStatus success 异常: ${item.reason} -> ${status.success}`);
+    if (item.message) {
+      assert(status.errors[0] === item.message, `getLastExecutionStatus errors 异常: ${status.errors[0]}`);
+    }
+  }
+}
+
 function main() {
   testSourceGuardrails();
   const { MissionDrivenEngine } = loadCompiledModule(path.join('orchestrator', 'core', 'mission-driven-engine.js'));
@@ -144,6 +188,7 @@ function main() {
 
   testCompletedDemotedToFailed(engine);
   testExternalAbortCompression(engine);
+  testMissionTerminalContracts(engine);
 
   console.log('\n=== engine termination consistency regression ===');
   console.log(JSON.stringify({
@@ -152,8 +197,10 @@ function main() {
       'completed_demoted_to_failed',
       'failed_reason_plan_attempt_metrics_consistent',
       'external_abort_compresses_to_cancelled',
+      'mission_terminal_contracts_follow_runtime_reason',
     ],
   }, null, 2));
+  process.exit(0);
 }
 
 try {

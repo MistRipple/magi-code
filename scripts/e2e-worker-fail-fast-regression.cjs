@@ -290,12 +290,38 @@ async function testUniversalClientCircuitBreakerWindow() {
 
 async function testAutonomousWorkerModelResilience() {
   const { AutonomousWorker } = loadCompiledModule(path.join('orchestrator', 'worker', 'autonomous-worker.js'));
+  const todoStore = new Map();
 
   const worker = new AutonomousWorker(
     'codex',
     {},
     {},
-    {},
+    {
+      async getByAssignment(assignmentId) {
+        return Array.from(todoStore.values()).filter((todo) => todo.assignmentId === assignmentId);
+      },
+      async get(todoId) {
+        return todoStore.get(todoId) || null;
+      },
+      async approve(todoId, note) {
+        const todo = todoStore.get(todoId);
+        if (todo) {
+          todoStore.set(todoId, { ...todo, approvalStatus: 'approved', approvalNote: note });
+        }
+      },
+      async reject(todoId, reason) {
+        const todo = todoStore.get(todoId);
+        if (todo) {
+          todoStore.set(todoId, { ...todo, approvalStatus: 'rejected', approvalNote: reason, status: 'skipped', blockedReason: reason });
+        }
+      },
+      async resetToPending(todoId) {
+        const todo = todoStore.get(todoId);
+        if (todo) {
+          todoStore.set(todoId, { ...todo, status: 'pending', output: undefined, error: undefined, blockedReason: undefined });
+        }
+      },
+    },
     {
       contextAssembler: {},
       fileSummaryCache: {},
@@ -312,6 +338,18 @@ async function testAutonomousWorkerModelResilience() {
   let questionTouched = false;
 
   worker.executeTodo = async (todo) => {
+    const failedTodo = {
+      ...todo,
+      status: 'failed',
+      output: {
+        success: false,
+        summary: '',
+        modifiedFiles: [],
+        error: 'LLM 响应为空：流式传输完成但未收到有效内容',
+        duration: 1,
+      },
+    };
+    todoStore.set(todo.id, failedTodo);
     todo.status = 'failed';
     todo.output = {
       success: false,
@@ -382,6 +420,8 @@ async function testAutonomousWorkerModelResilience() {
     progress: 0,
     createdAt: Date.now(),
   };
+  assignment.todos[0].assignmentId = assignment.id;
+  todoStore.set(assignment.todos[0].id, { ...assignment.todos[0] });
 
   const reports = [];
   const result = await worker.executeAssignment(assignment, {
