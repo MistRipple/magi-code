@@ -434,8 +434,8 @@ export function repairJSON(text: string): string {
   repaired = removeJSComments(repaired);
 
   // 4. 移除尾随逗号（最常见的 LLM 错误）
-  //    匹配 `, ]` 或 `, }` 形式（逗号和闭合符之间可有空白）
-  repaired = repaired.replace(/,\s*([\]}])/g, '$1');
+  //    字符级安全：只在字符串外部移除 `, ]` / `, }` 形式的尾随逗号
+  repaired = removeTrailingCommas(repaired);
 
   return repaired;
 }
@@ -546,6 +546,64 @@ function removeJSComments(text: string): string {
 
     result.push(ch);
     i++;
+  }
+
+  return result.join('');
+}
+
+/**
+ * 字符级安全移除尾随逗号（只在字符串外部操作）
+ * 例如 `[1, 2, ]` → `[1, 2]`，`{"a": 1, }` → `{"a": 1}`
+ */
+function removeTrailingCommas(text: string): string {
+  const result: string[] = [];
+  let inString = false;
+  let escaped = false;
+  // 记录最近一次非空白字符的位置和是否为逗号
+  let lastNonWhitespaceIdx = -1;
+  let lastNonWhitespaceIsComma = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      result.push(ch);
+      lastNonWhitespaceIdx = result.length - 1;
+      lastNonWhitespaceIsComma = false;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      result.push(ch);
+      lastNonWhitespaceIdx = result.length - 1;
+      lastNonWhitespaceIsComma = false;
+      continue;
+    }
+
+    if (ch === ']' || ch === '}') {
+      // 如果前一个非空白字符是逗号 → 移除那个逗号
+      if (lastNonWhitespaceIsComma && lastNonWhitespaceIdx >= 0) {
+        result[lastNonWhitespaceIdx] = '';
+      }
+      result.push(ch);
+      lastNonWhitespaceIdx = result.length - 1;
+      lastNonWhitespaceIsComma = false;
+      continue;
+    }
+
+    result.push(ch);
+    if (ch !== ' ' && ch !== '\t' && ch !== '\n' && ch !== '\r') {
+      lastNonWhitespaceIdx = result.length - 1;
+      lastNonWhitespaceIsComma = ch === ',';
+    }
   }
 
   return result.join('');

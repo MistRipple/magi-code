@@ -341,6 +341,7 @@ export type EventType =
   | 'task:started'
   | 'task:completed'
   | 'task:failed'
+  | 'task:paused'
   | 'task:cancelled'
   | 'task:state_changed'
   | 'subtask:started'

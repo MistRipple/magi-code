@@ -40,6 +40,11 @@
   const pendingWorkerQuestion = $derived(appState.pendingWorkerQuestion);
   const pendingToolAuthorization = $derived(appState.pendingToolAuthorization);
   const interactionMode = $derived(appState.appState?.interactionMode || 'auto');
+  const deliveryRepairMaxRoundsLabel = $derived(
+    pendingDeliveryRepair && pendingDeliveryRepair.maxRounds > 0
+      ? pendingDeliveryRepair.maxRounds
+      : i18n.t('common.unlimited')
+  );
 
   function handleTabChange(tab: TopTabType) {
     setCurrentTopTab(tab);
@@ -186,7 +191,7 @@
           <h3>{i18n.t('app.deliveryRepairTitle')}</h3>
         </div>
         <div class="modal-body">
-          <p>{i18n.t('app.deliveryRepairMessage', { round: pendingDeliveryRepair.round, maxRounds: pendingDeliveryRepair.maxRounds })}</p>
+          <p>{i18n.t('app.deliveryRepairMessage', { round: pendingDeliveryRepair.round, maxRounds: deliveryRepairMaxRoundsLabel })}</p>
           {#if pendingDeliveryRepair.summary}
             <div class="modal-context">{pendingDeliveryRepair.summary}</div>
           {/if}

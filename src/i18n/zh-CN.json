@@ -1,4 +1,5 @@
 {
+  "common.unlimited": "不限",
   "app.planConfirmTitle": "执行计划确认",
   "app.planConfirmDefault": "需要确认执行计划，是否继续？",
   "app.planCancel": "取消",
@@ -972,6 +973,7 @@
   "engine.delivery.autoRepairProgressTitle": "自动修复",
   "engine.delivery.autoRepairProgressMessage": "验收未通过，进入自动修复第 {round}/{maxRounds} 轮",
   "engine.delivery.autoRepairScheduled": "已触发自动修复第 {round}/{maxRounds} 轮",
+  "engine.delivery.autoRepairStalled": "自动修复连续 {streak}/{threshold} 轮无新进展，已停止自动修复。",
   "engine.followUp.autoContinueTitle": "自动续跑",
   "engine.followUp.autoContinueMessage": "检测到下一步建议，进入自动续跑第 {round} 轮",
   "engine.followUp.autoContinueScheduled": "已触发自动续跑第 {round} 轮",

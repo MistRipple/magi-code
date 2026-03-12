@@ -1,4 +1,5 @@
 {
+  "common.unlimited": "Unlimited",
   "app.planConfirmTitle": "Execution Plan Confirmation",
   "app.planConfirmDefault": "Execution plan requires confirmation. Continue?",
   "app.planCancel": "Cancel",
@@ -972,6 +973,7 @@
   "engine.delivery.autoRepairProgressTitle": "Auto Repair",
   "engine.delivery.autoRepairProgressMessage": "Acceptance failed. Starting auto repair round {round}/{maxRounds}.",
   "engine.delivery.autoRepairScheduled": "Auto repair round {round}/{maxRounds} triggered.",
+  "engine.delivery.autoRepairStalled": "Auto repair stopped after {streak}/{threshold} rounds without progress.",
   "engine.followUp.autoContinueTitle": "Auto Follow-up",
   "engine.followUp.autoContinueMessage": "Next steps detected. Starting auto follow-up round {round}.",
   "engine.followUp.autoContinueScheduled": "Auto follow-up round {round} triggered.",

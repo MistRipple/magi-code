@@ -74,6 +74,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     updateStatusBar('failed');
     vscode.commands.executeCommand('setContext', 'magiTaskRunning', false);
   });
+  globalEventBus.on('task:paused', () => {
+    updateStatusBar('paused');
+    vscode.commands.executeCommand('setContext', 'magiTaskRunning', false);
+  });
   globalEventBus.on('task:cancelled', () => {
     updateStatusBar('cancelled');
     vscode.commands.executeCommand('setContext', 'magiTaskRunning', false);
@@ -91,7 +95,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 /**
  * 更新状态栏显示
  */
-function updateStatusBar(status: 'idle' | 'running' | 'completed' | 'failed' | 'cancelled'): void {
+function updateStatusBar(status: 'idle' | 'running' | 'completed' | 'failed' | 'paused' | 'cancelled'): void {
   if (!statusBarItem) return;
 
   switch (status) {
@@ -118,6 +122,13 @@ function updateStatusBar(status: 'idle' | 'running' | 'completed' | 'failed' | '
       statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
       // 5秒后恢复默认状态
       setTimeout(() => updateStatusBar('idle'), 5000);
+      break;
+    case 'paused':
+      statusBarItem.text = '$(debug-pause) Magi';
+      statusBarItem.tooltip = t('extension.tooltip.taskRunning');
+      statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+      // 3秒后恢复默认状态
+      setTimeout(() => updateStatusBar('idle'), 3000);
       break;
     case 'cancelled':
       statusBarItem.text = '$(debug-pause) Magi';

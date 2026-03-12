@@ -177,6 +177,22 @@ export class TaskViewService {
   }
 
   /**
+   * 暂停任务（治理门禁触发时使用）
+   */
+  async pauseTaskById(taskId: string, reason?: string): Promise<void> {
+    const mission = await this.missionStorage.load(taskId);
+    const sessionId = mission?.sessionId;
+    if (mission) {
+      await this.missionStorage.transitionStatus(taskId, 'paused');
+    }
+    globalEventBus.emitEvent('task:paused', {
+      taskId,
+      sessionId,
+      data: { taskId, sessionId, reason },
+    });
+  }
+
+  /**
    * 删除任务
    */
   async deleteTaskById(taskId: string): Promise<void> {

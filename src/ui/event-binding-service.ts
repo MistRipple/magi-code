@@ -426,6 +426,7 @@ export class EventBindingService {
     globalEventBus.on('task:failed', () => {
       this.ctx.sendStateUpdate();
     });
+    globalEventBus.on('task:paused', () => this.ctx.sendStateUpdate());
 
     globalEventBus.on('task:cancelled', () => {
       this.ctx.sendStateUpdate();

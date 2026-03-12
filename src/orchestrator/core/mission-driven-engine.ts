@@ -250,7 +250,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
   private lastExecutionErrors: string[] = [];
   private lastExecutionRuntimeReason: ResolvedOrchestratorTerminationReason = 'completed';
-  private lastExecutionFinalStatus: 'completed' | 'failed' | 'cancelled' = 'completed';
+  private lastExecutionFinalStatus: 'completed' | 'failed' | 'cancelled' | 'paused' = 'completed';
 
   // 执行统计
   private executionStats: ExecutionStats;
@@ -886,7 +886,7 @@ export class MissionDrivenEngine extends EventEmitter {
     planId?: string | null;
     turnId?: string | null;
     mode: PlanMode;
-    finalPlanStatus: 'completed' | 'failed' | 'cancelled' | null;
+    finalPlanStatus: 'completed' | 'failed' | 'cancelled' | 'paused' | null;
     runtimeReason?: string;
     runtimeRounds?: number;
     runtimeSnapshot?: RuntimeTerminationSnapshot;
@@ -1252,7 +1252,7 @@ export class MissionDrivenEngine extends EventEmitter {
   private resolveExecutionFinalStatus(
     runtimeReason?: ResolvedOrchestratorTerminationReason,
     runtimeSnapshot?: RuntimeTerminationSnapshot,
-  ): 'completed' | 'failed' | 'cancelled' {
+  ): 'completed' | 'failed' | 'cancelled' | 'paused' {
     const normalized = this.normalizeOrchestratorRuntimeReason(runtimeReason);
     if (normalized === 'cancelled' || normalized === 'external_abort' || normalized === 'interrupted') {
       return 'cancelled';
@@ -1278,7 +1278,18 @@ export class MissionDrivenEngine extends EventEmitter {
       return 'completed';
     }
 
+    if (normalized && this.isGovernancePauseReason(normalized)) {
+      return 'paused';
+    }
+
     return 'failed';
+  }
+
+  private isGovernancePauseReason(reason: ResolvedOrchestratorTerminationReason): boolean {
+    return reason === 'budget_exceeded'
+      || reason === 'external_wait_timeout'
+      || reason === 'stalled'
+      || reason === 'upstream_model_error';
   }
 
   private buildExecutionFailureMessages(
@@ -1859,7 +1870,15 @@ export class MissionDrivenEngine extends EventEmitter {
         // 编排者跨轮会话记忆保留在 adapter history 中，不再每轮清空。
         // SystemPrompt 侧通过 prepareContext 动态裁剪 recent_turns，避免双重注入和 token 膨胀。
 
-        const autoRepairMaxRounds = Math.max(0, this.config.delivery?.autoRepairMaxRounds ?? 1);
+        const autoRepairMaxRoundsRaw = this.config.delivery?.autoRepairMaxRounds;
+        const autoRepairMaxRoundsValue = Number(autoRepairMaxRoundsRaw);
+        const autoRepairMaxRounds = Number.isFinite(autoRepairMaxRoundsValue)
+          ? Math.max(0, autoRepairMaxRoundsValue)
+          : 0;
+        const autoRepairMaxRoundsLabel = autoRepairMaxRounds > 0
+          ? autoRepairMaxRounds
+          : t('common.unlimited');
+        const autoRepairStallThreshold = 3;
         let autoRepairAttempt = 0;
         let autoFollowUpAttempt = 0;
         let lastFollowUpSignature = '';
@@ -1867,6 +1886,8 @@ export class MissionDrivenEngine extends EventEmitter {
         let followUpStallStreak = 0;
         const autoRepairHistory: string[] = [];
         const autoFollowUpHistory: string[] = [];
+        let lastAutoRepairSignature = '';
+        let autoRepairStallStreak = 0;
         let promptForRound = trimmedPrompt;
 
         // 5. 编排执行（支持交付失败后的自动修复闭环）
@@ -1877,7 +1898,7 @@ export class MissionDrivenEngine extends EventEmitter {
             if (autoRepairAttempt > 0) {
               this.messageHub.progress(
                 t('engine.delivery.autoRepairProgressTitle'),
-                t('engine.delivery.autoRepairProgressMessage', { round: autoRepairAttempt, maxRounds: autoRepairMaxRounds }),
+                t('engine.delivery.autoRepairProgressMessage', { round: autoRepairAttempt, maxRounds: autoRepairMaxRoundsLabel }),
               );
             } else {
               this.messageHub.progress(
@@ -2130,10 +2151,33 @@ export class MissionDrivenEngine extends EventEmitter {
             autoRepairHistory.push(`第${executionRound}轮：${deliverySummaryForMission}`);
           }
 
+          const autoRepairProgressSignature = [
+            deliverySummaryForMission?.trim() ?? '',
+            deliveryDetailsForMission?.trim() ?? '',
+            this.buildFollowUpProgressSignature(orchestratorRuntimeSnapshot),
+          ].filter(Boolean).join('|');
+          let autoRepairStalled = false;
+          if (deliveryStatusForMission === 'failed') {
+            if (autoRepairProgressSignature && autoRepairProgressSignature === lastAutoRepairSignature) {
+              autoRepairStallStreak += 1;
+            } else if (autoRepairProgressSignature) {
+              lastAutoRepairSignature = autoRepairProgressSignature;
+              autoRepairStallStreak = 0;
+            } else {
+              lastAutoRepairSignature = '';
+              autoRepairStallStreak = 0;
+            }
+            autoRepairStalled = autoRepairStallStreak >= autoRepairStallThreshold;
+          } else {
+            lastAutoRepairSignature = '';
+            autoRepairStallStreak = 0;
+          }
+
+          const canAutoRepairByRounds = autoRepairMaxRounds === 0 || autoRepairAttempt < autoRepairMaxRounds;
           if (
             deliveryStatusForMission === 'failed'
             && continuationPolicyForMission === 'ask'
-            && autoRepairAttempt < autoRepairMaxRounds
+            && canAutoRepairByRounds
           ) {
             const sessionIdForConfirm = resolvedSessionId;
             const missionIdForConfirm = this.lastMissionId || this.currentTurnId || `mission-${Date.now()}`;
@@ -2153,7 +2197,8 @@ export class MissionDrivenEngine extends EventEmitter {
 
           const shouldAutoRepair = deliveryStatusForMission === 'failed'
             && continuationPolicyForMission === 'auto'
-            && autoRepairAttempt < autoRepairMaxRounds;
+            && canAutoRepairByRounds
+            && !autoRepairStalled;
 
           if (shouldAutoRepair) {
             autoRepairAttempt += 1;
@@ -2168,11 +2213,28 @@ export class MissionDrivenEngine extends EventEmitter {
               maxRounds: autoRepairMaxRounds,
             });
             this.messageHub.notify(
-              t('engine.delivery.autoRepairScheduled', { round: autoRepairAttempt, maxRounds: autoRepairMaxRounds }),
+              t('engine.delivery.autoRepairScheduled', { round: autoRepairAttempt, maxRounds: autoRepairMaxRoundsLabel }),
               'warning',
             );
             promptForRound = autoRepairPrompt;
             continue;
+          }
+
+          if (
+            deliveryStatusForMission === 'failed'
+            && continuationPolicyForMission === 'auto'
+            && autoRepairStalled
+          ) {
+            const stalledMessage = t('engine.delivery.autoRepairStalled', {
+              streak: autoRepairStallStreak,
+              threshold: autoRepairStallThreshold,
+            });
+            finalContent = finalContent.trim()
+              ? `${finalContent}\n\n${stalledMessage}`
+              : stalledMessage;
+            this.messageHub.result(stalledMessage, {
+              metadata: { phase: 'system_section', extra: { type: 'auto_repair_stalled' } },
+            });
           }
 
           const followUpSteps = this.resolveFollowUpSteps(response.orchestratorRuntime?.nextSteps);
@@ -2355,7 +2417,7 @@ export class MissionDrivenEngine extends EventEmitter {
             }, LogCategory.ORCHESTRATOR);
           }
         }
-        if (finalSessionId && finalPlanId && finalExecutionStatus) {
+        if (finalSessionId && finalPlanId && finalExecutionStatus && finalExecutionStatus !== 'paused') {
           try {
             await this.planLedger.finalize(finalSessionId, finalPlanId, finalExecutionStatus);
           } catch (planError) {
@@ -2425,6 +2487,8 @@ export class MissionDrivenEngine extends EventEmitter {
                 await this.taskViewService.failTaskById(this.lastMissionId, this.lastExecutionErrors[0]);
               } else if (finalExecutionStatus === 'cancelled') {
                 await this.taskViewService.cancelTaskById(this.lastMissionId);
+              } else if (finalExecutionStatus === 'paused') {
+                await this.taskViewService.pauseTaskById(this.lastMissionId, this.lastExecutionRuntimeReason);
               }
 
               if (deliveryStatusForMission) {
@@ -2552,10 +2616,10 @@ export class MissionDrivenEngine extends EventEmitter {
     success: boolean;
     errors: string[];
     runtimeReason: ResolvedOrchestratorTerminationReason;
-    finalStatus: 'completed' | 'failed' | 'cancelled';
+    finalStatus: 'completed' | 'failed' | 'cancelled' | 'paused';
   } {
     return {
-      success: this.lastExecutionFinalStatus === 'completed',
+      success: this.lastExecutionFinalStatus === 'completed' || this.lastExecutionFinalStatus === 'paused',
       errors: [...this.lastExecutionErrors],
       runtimeReason: this.lastExecutionRuntimeReason,
       finalStatus: this.lastExecutionFinalStatus,
@@ -2661,6 +2725,7 @@ export class MissionDrivenEngine extends EventEmitter {
     maxRounds: number;
   }): string {
     const goal = input.goal || input.originalPrompt;
+    const maxRoundsLabel = input.maxRounds > 0 ? input.maxRounds : t('common.unlimited');
     const constraints = input.constraints.length > 0
       ? input.constraints.map(item => `- ${item}`).join('\n')
       : '- 无';
@@ -2673,7 +2738,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
     return [
       '[System] 交付验收未通过，进入自动修复。',
-      `修复轮次：${input.round}/${input.maxRounds}`,
+      `修复轮次：${input.round}/${maxRoundsLabel}`,
       `原始目标：${goal}`,
       `用户原始请求：${input.originalPrompt}`,
       `约束：\n${constraints}`,
