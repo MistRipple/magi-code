@@ -136,6 +136,10 @@
     vscode.postMessage({ type: 'startTask', taskId });
   }
 
+  function resumeTask(taskId: string) {
+    vscode.postMessage({ type: 'resumeTask', taskId });
+  }
+
   function deleteTask(taskId: string) {
     vscode.postMessage({ type: 'deleteTask', taskId });
   }
@@ -479,8 +483,13 @@
             </div>
             <!-- 操作按钮（hover 显示） -->
             <div class="task-actions">
-              {#if task.status === 'pending' || task.status === 'paused'}
+              {#if task.status === 'pending'}
                 <button class="action-btn" title={i18n.t('tasks.task.startTitle')} onclick={(e) => { e.stopPropagation(); startTask(task.id); }}>
+                  <Icon name="play" size={12} />
+                </button>
+              {/if}
+              {#if task.status === 'paused'}
+                <button class="action-btn" title={i18n.t('tasks.task.resumeTitle')} onclick={(e) => { e.stopPropagation(); resumeTask(task.id); }}>
                   <Icon name="play" size={12} />
                 </button>
               {/if}

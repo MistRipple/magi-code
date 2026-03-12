@@ -251,6 +251,7 @@ export class MissionDrivenEngine extends EventEmitter {
   private lastExecutionErrors: string[] = [];
   private lastExecutionRuntimeReason: ResolvedOrchestratorTerminationReason = 'completed';
   private lastExecutionFinalStatus: 'completed' | 'failed' | 'cancelled' | 'paused' = 'completed';
+  private resumeMissionId: string | null = null;
 
   // 执行统计
   private executionStats: ExecutionStats;
@@ -1555,6 +1556,10 @@ export class MissionDrivenEngine extends EventEmitter {
     return this.supplementaryQueue.getPendingCount();
   }
 
+  prepareResumeMission(missionId: string): void {
+    this.resumeMissionId = missionId?.trim() || null;
+  }
+
   activateWorkerSessionResume(sourceMissionId: string, resumePrompt?: string): boolean {
     return this.dispatchManager.activateResumeContext(sourceMissionId, resumePrompt);
   }
@@ -1879,6 +1884,8 @@ export class MissionDrivenEngine extends EventEmitter {
           ? autoRepairMaxRounds
           : t('common.unlimited');
         const autoRepairStallThreshold = 3;
+        const governanceRecoveryDelays = [10000, 20000, 30000, 40000, 50000];
+        const governanceRecoveryMaxRounds = governanceRecoveryDelays.length;
         let autoRepairAttempt = 0;
         let autoFollowUpAttempt = 0;
         let lastFollowUpSignature = '';
@@ -1888,6 +1895,7 @@ export class MissionDrivenEngine extends EventEmitter {
         const autoFollowUpHistory: string[] = [];
         let lastAutoRepairSignature = '';
         let autoRepairStallStreak = 0;
+        let governanceRecoveryAttempt = 0;
         let promptForRound = trimmedPrompt;
 
         // 5. 编排执行（支持交付失败后的自动修复闭环）
@@ -2117,6 +2125,9 @@ export class MissionDrivenEngine extends EventEmitter {
           orchestratorRuntimeSnapshot = resolvedRuntimeTermination.runtimeSnapshot;
           const finalExecutionStatus = this.resolveExecutionFinalStatus(orchestratorRuntimeReason, orchestratorRuntimeSnapshot);
           const normalizedRuntimeReason = this.normalizeOrchestratorRuntimeReason(orchestratorRuntimeReason);
+          const isGovernancePaused = finalExecutionStatus === 'paused'
+            && normalizedRuntimeReason
+            && this.isGovernancePauseReason(normalizedRuntimeReason);
           if (finalExecutionStatus === 'completed' && normalizedRuntimeReason && normalizedRuntimeReason !== 'completed') {
             executionWarnings.push(`终止门禁判定为 ${normalizedRuntimeReason}，但必需 Todo 已完成，按执行完成处理。`);
           }
@@ -2178,6 +2189,7 @@ export class MissionDrivenEngine extends EventEmitter {
             deliveryStatusForMission === 'failed'
             && continuationPolicyForMission === 'ask'
             && canAutoRepairByRounds
+            && !isGovernancePaused
           ) {
             const sessionIdForConfirm = resolvedSessionId;
             const missionIdForConfirm = this.lastMissionId || this.currentTurnId || `mission-${Date.now()}`;
@@ -2198,7 +2210,8 @@ export class MissionDrivenEngine extends EventEmitter {
           const shouldAutoRepair = deliveryStatusForMission === 'failed'
             && continuationPolicyForMission === 'auto'
             && canAutoRepairByRounds
-            && !autoRepairStalled;
+            && !autoRepairStalled
+            && !isGovernancePaused;
 
           if (shouldAutoRepair) {
             autoRepairAttempt += 1;
@@ -2237,6 +2250,41 @@ export class MissionDrivenEngine extends EventEmitter {
             });
           }
 
+          if (
+            isGovernancePaused
+            && this.interactionMode === 'auto'
+            && currentPlanMode === 'deep'
+            && this.isGovernanceAutoRecoverReason(normalizedRuntimeReason)
+            && governanceRecoveryAttempt < governanceRecoveryMaxRounds
+          ) {
+            governanceRecoveryAttempt += 1;
+            const delayMs = governanceRecoveryDelays[governanceRecoveryAttempt - 1] ?? 0;
+            const reasonLabel = this.formatGovernanceReason(normalizedRuntimeReason);
+            const waitSeconds = Math.max(1, Math.round(delayMs / 1000));
+            this.messageHub.notify(
+              t('engine.governance.autoResumeScheduled', {
+                round: governanceRecoveryAttempt,
+                maxRounds: governanceRecoveryMaxRounds,
+                seconds: waitSeconds,
+                reason: reasonLabel,
+              }),
+              'warning',
+            );
+            if (delayMs > 0) {
+              await new Promise((resolve) => setTimeout(resolve, delayMs));
+            }
+            promptForRound = this.buildGovernanceRecoveryPrompt({
+              originalPrompt: trimmedPrompt,
+              goal: requirementAnalysis.goal,
+              constraints: requirementAnalysis.constraints ?? [],
+              acceptanceCriteria: requirementAnalysis.acceptanceCriteria ?? [],
+              reason: normalizedRuntimeReason,
+              round: governanceRecoveryAttempt,
+              maxRounds: governanceRecoveryMaxRounds,
+            });
+            continue;
+          }
+
           const followUpSteps = this.resolveFollowUpSteps(response.orchestratorRuntime?.nextSteps);
           const pendingRequiredTodos = this.extractPendingRequiredCount(orchestratorRuntimeSnapshot);
           const followUpSignature = [
@@ -2254,12 +2302,14 @@ export class MissionDrivenEngine extends EventEmitter {
             && currentPlanMode === 'deep'
             && this.interactionMode === 'auto'
             && followUpSignature !== lastFollowUpSignature
-            && followUpStallStreak < 2;
+            && followUpStallStreak < 2
+            && !isGovernancePaused;
 
           if (!shouldAutoFollowUp
             && currentPlanMode === 'deep'
             && this.interactionMode === 'ask'
-            && (followUpSteps.length > 0 || pendingRequiredTodos > 0)) {
+            && (followUpSteps.length > 0 || pendingRequiredTodos > 0)
+            && !isGovernancePaused) {
             const followUpNote = followUpSteps.length > 0
               ? '[System] 当前为 ask 模式，检测到下一步建议。请确认是否继续执行。'
               : '[System] 当前为 ask 模式，仍有未完成必需 Todo。请确认是否继续执行。';
@@ -2291,6 +2341,21 @@ export class MissionDrivenEngine extends EventEmitter {
               pendingRequired: pendingRequiredTodos,
             });
             continue;
+          }
+
+          if (isGovernancePaused) {
+            const pauseReport = this.buildGovernancePauseReport({
+              reason: normalizedRuntimeReason,
+              snapshot: orchestratorRuntimeSnapshot,
+              recoveryAttempted: governanceRecoveryAttempt,
+              recoveryMaxRounds: governanceRecoveryMaxRounds,
+            });
+            finalContent = finalContent.trim()
+              ? `${finalContent}\n\n${pauseReport}`
+              : pauseReport;
+            this.messageHub.result(pauseReport, {
+              metadata: { phase: 'system_section', extra: { type: 'governance_pause' } },
+            });
           }
 
           if (autoRepairAttempt > 0 && autoRepairHistory.length > 0) {
@@ -2460,6 +2525,7 @@ export class MissionDrivenEngine extends EventEmitter {
           this.pendingDeliveryRepairConfirmation = null;
         }
         this.isRunning = false;
+        this.resumeMissionId = null;
         this.ensureMissionPromise = null;
         // 清除编排者快照上下文
         this.adapterFactory.getToolManager().clearSnapshotContext('orchestrator');
@@ -2528,6 +2594,7 @@ export class MissionDrivenEngine extends EventEmitter {
     if (this.ensureMissionPromise) {
       return this.ensureMissionPromise;
     }
+    const resumeMissionId = this.resumeMissionId;
     const turnIdAtCall = this.currentTurnId;
     const pending = (async (): Promise<string> => {
       // 双重检查：并发请求在等待期内可能已有 mission 产生
@@ -2551,6 +2618,37 @@ export class MissionDrivenEngine extends EventEmitter {
       const riskLevel = requirementAnalysis.riskLevel;
       if (!riskLevel) {
         throw new Error('requirement analysis riskLevel missing before mission creation');
+      }
+
+      if (resumeMissionId) {
+        const mission = await this.missionStorage.load(resumeMissionId);
+        this.resumeMissionId = null;
+        if (!mission) {
+          throw new Error(t('engine.errors.taskNotFound', { taskId: resumeMissionId }));
+        }
+        if (mission.status !== 'paused') {
+          throw new Error(t('engine.errors.taskNotPaused', { taskId: resumeMissionId }));
+        }
+        await this.missionStorage.transitionStatus(mission.id, 'executing');
+        this.lastMissionId = mission.id;
+        this.missionOrchestrator.setCurrentMissionId(mission.id);
+
+        if (this.currentPlanId) {
+          await this.planLedger.bindMission(sessionId, this.currentPlanId, mission.id);
+        }
+
+        const orchestratorToolManager = this.adapterFactory.getToolManager();
+        const orchestratorAssignmentId = `orchestrator-${mission.id}`;
+        const normalizedSessionId = sessionId.trim();
+        orchestratorToolManager.setSnapshotContext({
+          sessionId: normalizedSessionId,
+          missionId: mission.id,
+          assignmentId: orchestratorAssignmentId,
+          todoId: orchestratorAssignmentId,
+          workerId: 'orchestrator',
+        });
+
+        return mission.id;
       }
 
       const mission = await this.missionStorage.createMission({
@@ -2748,6 +2846,130 @@ export class MissionDrivenEngine extends EventEmitter {
       '请根据失败信息修复问题，必要时调整实现并重新运行相关验收。',
       '输出最终交付总结，并明确哪些验收已通过、哪些仍未通过。',
     ].filter(line => line && line.trim().length > 0).join('\n\n');
+  }
+
+  private isGovernanceAutoRecoverReason(
+    reason?: ResolvedOrchestratorTerminationReason,
+  ): boolean {
+    return reason === 'upstream_model_error' || reason === 'external_wait_timeout';
+  }
+
+  private formatGovernanceReason(
+    reason?: ResolvedOrchestratorTerminationReason,
+  ): string {
+    switch (reason) {
+      case 'budget_exceeded':
+        return t('engine.governance.reason.budget_exceeded');
+      case 'external_wait_timeout':
+        return t('engine.governance.reason.external_wait_timeout');
+      case 'stalled':
+        return t('engine.governance.reason.stalled');
+      case 'upstream_model_error':
+        return t('engine.governance.reason.upstream_model_error');
+      default:
+        return t('engine.governance.reason.unknown');
+    }
+  }
+
+  private buildGovernanceRecoveryPrompt(input: {
+    originalPrompt: string;
+    goal: string;
+    constraints: string[];
+    acceptanceCriteria: string[];
+    reason?: ResolvedOrchestratorTerminationReason;
+    round: number;
+    maxRounds: number;
+  }): string {
+    const goal = input.goal || input.originalPrompt;
+    const reasonLabel = this.formatGovernanceReason(input.reason);
+    const constraints = input.constraints.length > 0
+      ? input.constraints.map(item => `- ${item}`).join('\n')
+      : '- 无';
+    const acceptance = input.acceptanceCriteria.length > 0
+      ? input.acceptanceCriteria.map(item => `- ${item}`).join('\n')
+      : '- 无';
+
+    return [
+      '[System] 上一轮触发治理暂停，已进入自动恢复。',
+      `暂停原因：${reasonLabel}`,
+      `恢复轮次：${input.round}/${input.maxRounds}`,
+      `原始目标：${goal}`,
+      `用户原始请求：${input.originalPrompt}`,
+      `约束：\n${constraints}`,
+      `验收标准：\n${acceptance}`,
+      '请继续推进未完成任务，必要时重试上游调用或等待外部依赖恢复。',
+    ].filter(line => line && line.trim().length > 0).join('\n\n');
+  }
+
+  private buildGovernancePauseReport(input: {
+    reason?: ResolvedOrchestratorTerminationReason;
+    snapshot?: RuntimeTerminationSnapshot;
+    recoveryAttempted: number;
+    recoveryMaxRounds: number;
+  }): string {
+    const reasonLabel = this.formatGovernanceReason(input.reason);
+    const snapshot = input.snapshot;
+    const lines: string[] = [`[System] ${t('engine.governance.pauseTitle')}`];
+    lines.push(`- ${t('engine.governance.pauseReason', { reason: reasonLabel })}`);
+
+    if (snapshot) {
+      const requiredTotal = this.resolveRequiredTotal(snapshot);
+      const terminalRequired = this.resolveTerminalRequired(snapshot);
+      const pendingRequired = this.extractPendingRequiredCount(snapshot);
+      const failedRequired = typeof snapshot.failedRequired === 'number' && Number.isFinite(snapshot.failedRequired)
+        ? snapshot.failedRequired
+        : 0;
+      if (typeof requiredTotal === 'number' && typeof terminalRequired === 'number') {
+        lines.push(`- ${t('engine.governance.pauseMetric.required', {
+          terminal: terminalRequired,
+          total: requiredTotal,
+          failed: failedRequired,
+        })}`);
+      }
+      if (pendingRequired > 0) {
+        lines.push(`- ${t('engine.governance.pauseMetric.pending', { pending: pendingRequired })}`);
+      }
+      if (snapshot.blockerState?.maxExternalWaitAgeMs) {
+        lines.push(`- ${t('engine.governance.pauseMetric.externalWait', {
+          seconds: Math.ceil(snapshot.blockerState.maxExternalWaitAgeMs / 1000),
+        })}`);
+      }
+      if (snapshot.budgetState) {
+        lines.push(`- ${t('engine.governance.pauseMetric.budget', {
+          elapsed: Math.ceil(snapshot.budgetState.elapsedMs / 1000),
+          tokens: snapshot.budgetState.tokenUsed,
+          errorRate: snapshot.budgetState.errorRate.toFixed(3),
+        })}`);
+      }
+    }
+
+    const advice = this.resolveGovernancePauseAdvice(input.reason);
+    if (advice) {
+      lines.push(`- ${t('engine.governance.pauseAdvice', { advice })}`);
+    }
+    if (input.recoveryAttempted >= input.recoveryMaxRounds && input.recoveryMaxRounds > 0) {
+      lines.push(`- ${t('engine.governance.autoResumeExhausted', {
+        attempt: input.recoveryAttempted,
+        maxRounds: input.recoveryMaxRounds,
+      })}`);
+    }
+
+    return lines.join('\n');
+  }
+
+  private resolveGovernancePauseAdvice(reason?: ResolvedOrchestratorTerminationReason): string {
+    switch (reason) {
+      case 'budget_exceeded':
+        return t('engine.governance.advice.budget_exceeded');
+      case 'external_wait_timeout':
+        return t('engine.governance.advice.external_wait_timeout');
+      case 'stalled':
+        return t('engine.governance.advice.stalled');
+      case 'upstream_model_error':
+        return t('engine.governance.advice.upstream_model_error');
+      default:
+        return t('engine.governance.advice.unknown');
+    }
   }
 
   private resolveFollowUpSteps(runtimeSteps?: string[]): string[] {

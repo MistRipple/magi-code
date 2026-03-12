@@ -1311,7 +1311,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'resumeTask':
 
         logger.info('界面.任务.恢复.消息', { taskId: message.taskId }, LogCategory.UI);
-        await this.resumeInterruptedTask({ taskId: message.taskId });
+        await this.handleResumeTask(message.taskId);
         break;
 
       case 'appendMessage':
@@ -2454,6 +2454,60 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     return lines.join('\n');
   }
 
+  private async handleResumeTask(taskId?: string): Promise<void> {
+    if (!taskId) {
+      this.sendToast(t('toast.missingTaskId'), 'error');
+      return;
+    }
+
+    if (this.orchestratorEngine.running) {
+      this.sendToast(t('toast.taskStillExecuting'), 'warning');
+      return;
+    }
+
+    const recoveryContext = this.getPendingRecoveryContext(taskId);
+    if (recoveryContext) {
+      await this.resumeInterruptedTask({ taskId });
+      return;
+    }
+
+    const sessionId = this.resolveActiveSessionId();
+    if (!sessionId) {
+      this.sendToast(t('toast.noActiveSession'), 'warning');
+      return;
+    }
+
+    const tasks = await this.orchestratorEngine.listTaskViews(sessionId);
+    const target = tasks.find(task => task.id === taskId);
+    if (!target) {
+      this.sendToast(t('toast.taskNotFound', { taskId }), 'warning');
+      return;
+    }
+    if (target.status !== 'paused') {
+      this.sendToast(t('toast.taskNotPaused'), 'warning');
+      return;
+    }
+
+    const basePrompt = target.prompt?.trim() || '';
+    if (!basePrompt) {
+      this.sendToast(t('toast.missingTaskPrompt'), 'warning');
+      return;
+    }
+
+    const resumePrompt = this.buildResumePrompt(basePrompt);
+    this.sendOrchestratorMessage({
+      content: t('provider.resumingTask'),
+      messageType: 'progress',
+      metadata: { phase: 'resuming' },
+    });
+    await this.executeTask(resumePrompt, undefined, [], undefined, undefined, {
+      resumeMissionId: target.id,
+      resumeInstruction: resumePrompt,
+      recoveryBasePrompt: basePrompt,
+      reuseMission: true,
+    });
+  }
+
   /** 恢复被打断的任务 */
   private async resumeInterruptedTask(options?: { taskId?: string; extraInstruction?: string }): Promise<void> {
     if (this.orchestratorEngine.running) {
@@ -2573,6 +2627,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       resumeMissionId?: string;
       resumeInstruction?: string;
       recoveryBasePrompt?: string;
+      reuseMission?: boolean;
     }
   ): Promise<void> {
     logger.info('界面.任务.执行.开始', { promptLength: prompt.length, imageCount: images?.length || 0 }, LogCategory.UI);
@@ -2616,6 +2671,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           options.resumeMissionId,
           options.resumeInstruction
         );
+        if (options.reuseMission) {
+          this.orchestratorEngine.prepareResumeMission(options.resumeMissionId);
+        }
         logger.info('界面.任务.恢复上下文.激活', {
           missionId: options.resumeMissionId,
           activated,
