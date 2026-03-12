@@ -323,41 +323,46 @@
     const items = event.clipboardData?.items;
     if (!items) return;
 
+    let hasImage = false;
+
     for (const item of items) {
-      if (item.type.startsWith('image/')) {
-        event.preventDefault();  // 阻止默认粘贴行为
+      if (!item.type.startsWith('image/')) continue;
+      hasImage = true;
 
-        if (selectedImages.length >= MAX_IMAGES) {
-          addToast('warning', i18n.t('input.maxImages', { max: MAX_IMAGES }));
-          return;
-        }
-
-        const file = item.getAsFile();
-        if (!file) continue;
-
-        if (file.size > MAX_IMAGE_SIZE) {
-          addToast('warning', i18n.t('input.imageTooLarge', { size: (file.size / 1024 / 1024).toFixed(1) }));
-          continue;
-        }
-
-        // 读取图片为 DataURL
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const dataUrl = e.target?.result as string;
-          if (dataUrl) {
-            selectedImages = [...selectedImages, {
-              id: generateId(),
-              dataUrl,
-              name: file.name || i18n.t('input.pastedImage', { index: selectedImages.length + 1 }),
-            }];
-            addToast('success', i18n.t('input.imageAdded'));
-          }
-        };
-        reader.onerror = () => {
-          addToast('error', i18n.t('input.imageReadFailed'));
-        };
-        reader.readAsDataURL(file);
+      if (selectedImages.length >= MAX_IMAGES) {
+        addToast('warning', i18n.t('input.maxImages', { max: MAX_IMAGES }));
+        break;
       }
+
+      const file = item.getAsFile();
+      if (!file) continue;
+
+      if (file.size > MAX_IMAGE_SIZE) {
+        addToast('warning', i18n.t('input.imageTooLarge', { size: (file.size / 1024 / 1024).toFixed(1) }));
+        continue;
+      }
+
+      // 读取图片为 DataURL
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const dataUrl = e.target?.result as string;
+        if (dataUrl) {
+          selectedImages = [...selectedImages, {
+            id: generateId(),
+            dataUrl,
+            name: file.name || i18n.t('input.pastedImage', { index: selectedImages.length + 1 }),
+          }];
+          addToast('success', i18n.t('input.imageAdded'));
+        }
+      };
+      reader.onerror = () => {
+        addToast('error', i18n.t('input.imageReadFailed'));
+      };
+      reader.readAsDataURL(file);
+    }
+
+    if (hasImage) {
+      event.preventDefault();
     }
   }
 

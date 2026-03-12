@@ -2401,7 +2401,7 @@
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="modal-overlay" onkeydown={(e) => e.key === 'Escape' && closeSkillLibraryDialog()} role="presentation">
     <!-- svelte-ignore a11y_no_static_element_interactions a11y_interactive_supports_focus -->
-    <div class="modal-dialog modal-dialog-lg" onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="modal-dialog modal-dialog-lg" role="dialog" aria-modal="true" tabindex="-1">
       <div class="modal-header">
         <h3>{i18n.t('settings.skillLibrary.title')}</h3>
         <button class="modal-close" onclick={closeSkillLibraryDialog}>×</button>

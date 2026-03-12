@@ -36,16 +36,32 @@ if (window.__MAGI_WEBVIEW_BOOTED__) {
   initMessageHandler();
 
   // 粘贴去重：VS Code Webview 中 paste 可能被浏览器引擎和宿主各触发一次，
-  // 在 capture 阶段拦截 100ms 内的重复 paste 事件，避免粘贴翻倍
+  // 在 capture 阶段拦截短时间内的重复 paste 事件，避免粘贴翻倍
   let lastPasteTime = 0;
+  let lastPasteTarget: EventTarget | null = null;
+  let lastPasteSignature = '';
   document.addEventListener('paste', (e) => {
     const now = Date.now();
-    if (now - lastPasteTime < 100) {
+    const clipboard = e.clipboardData;
+    const target = e.target;
+    const types = clipboard ? Array.from(clipboard.types || []) : [];
+    const text = clipboard ? (clipboard.getData('text/plain') || '') : '';
+    const signature = clipboard
+      ? `${types.join('|')}::${text.slice(0, 200)}`
+      : '';
+    const isDuplicate = signature
+      && now - lastPasteTime < 80
+      && target === lastPasteTarget
+      && signature === lastPasteSignature;
+
+    if (isDuplicate) {
       e.preventDefault();
       e.stopImmediatePropagation();
       return;
     }
     lastPasteTime = now;
+    lastPasteTarget = target;
+    lastPasteSignature = signature;
   }, true);
 
   // 剪贴板快捷键支持
@@ -55,7 +71,7 @@ if (window.__MAGI_WEBVIEW_BOOTED__) {
   // 依赖 VS Code 宿主通过 paste 事件注入 + 上方的 paste 去重机制。
   document.addEventListener('keydown', (e) => {
     const meta = e.metaKey || e.ctrlKey;
-    if (!meta) return;
+    if (!meta || e.altKey || e.shiftKey || e.defaultPrevented || e.isComposing) return;
     const key = e.key.toLowerCase();
     const code = e.code;
 

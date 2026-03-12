@@ -139,6 +139,7 @@
   }
 
   .bt-tab {
+    position: relative;
     display: inline-flex;
     align-items: center;
     gap: var(--space-1);
@@ -151,6 +152,17 @@
     cursor: pointer;
     transition: color var(--transition-fast);
     white-space: nowrap;
+  }
+
+  .bt-tab.active::after {
+    content: '';
+    position: absolute;
+    left: var(--space-2);
+    right: var(--space-2);
+    bottom: 0;
+    height: 2px;
+    background: currentColor;
+    border-radius: var(--radius-full);
   }
 
   .bt-tab:hover {
