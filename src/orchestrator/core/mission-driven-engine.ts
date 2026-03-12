@@ -2934,11 +2934,12 @@ export class MissionDrivenEngine extends EventEmitter {
           seconds: Math.ceil(snapshot.blockerState.maxExternalWaitAgeMs / 1000),
         })}`);
       }
-      if (snapshot.budgetState) {
+      const budgetState = snapshot.budgetState;
+      if (budgetState && typeof budgetState.elapsedMs === 'number' && typeof budgetState.tokenUsed === 'number' && typeof budgetState.errorRate === 'number') {
         lines.push(`- ${t('engine.governance.pauseMetric.budget', {
-          elapsed: Math.ceil(snapshot.budgetState.elapsedMs / 1000),
-          tokens: snapshot.budgetState.tokenUsed,
-          errorRate: snapshot.budgetState.errorRate.toFixed(3),
+          elapsed: Math.ceil(budgetState.elapsedMs / 1000),
+          tokens: budgetState.tokenUsed,
+          errorRate: budgetState.errorRate.toFixed(3),
         })}`);
       }
     }
