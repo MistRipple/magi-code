@@ -81,7 +81,7 @@ export class ConfigCommandHandler implements CommandHandler {
     const trimmed = (baseUrl || '').trim();
     if (!trimmed) return trimmed;
     const noTrailingSlash = trimmed.replace(/\/+$/, '');
-    if (/\/v1$/i.test(noTrailingSlash)) {
+    if (/\/v\d+$/i.test(noTrailingSlash)) {
       return noTrailingSlash;
     }
     return `${noTrailingSlash}/v1`;
@@ -94,7 +94,7 @@ export class ConfigCommandHandler implements CommandHandler {
     const trimmed = (baseUrl || '').trim();
     if (!trimmed) return trimmed;
     const noTrailingSlash = trimmed.replace(/\/+$/, '');
-    if (/\/v1$/i.test(noTrailingSlash)) {
+    if (/\/v\d+$/i.test(noTrailingSlash)) {
       return noTrailingSlash;
     }
     return `${noTrailingSlash}/v1`;

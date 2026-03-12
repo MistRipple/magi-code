@@ -18,7 +18,9 @@ import { fetchWithRetry, isRetryableNetworkError, toErrorMessage } from '../../t
 import { ProviderProtocolAdapter } from '../protocol/provider-adapter';
 import { ProtocolConformanceValidator } from '../protocol/conformance-validator';
 import { OpenAIResponsesProtocolAdapter } from '../protocol/adapters/openai-responses-adapter';
+import { OpenAIChatCompletionsProtocolAdapter } from '../protocol/adapters/openai-chat-completions-adapter';
 import { AnthropicMessagesProtocolAdapter } from '../protocol/adapters/anthropic-messages-adapter';
+import { resolveProtocolId } from '../protocol/capability-registry';
 
 class NonRetryableError extends Error {
   constructor(message: string, public originalError?: unknown) {
@@ -68,7 +70,7 @@ export class UniversalLLMClient extends BaseLLMClient {
     const trimmed = (baseUrl || '').trim();
     if (!trimmed) return trimmed;
     const noTrailingSlash = trimmed.replace(/\/+$/, '');
-    if (/\/v1$/i.test(noTrailingSlash)) {
+    if (/\/v\d+$/i.test(noTrailingSlash)) {
       return noTrailingSlash;
     }
     return `${noTrailingSlash}/v1`;
@@ -82,8 +84,8 @@ export class UniversalLLMClient extends BaseLLMClient {
     const trimmed = (baseUrl || '').trim();
     if (!trimmed) return trimmed;
     const noTrailingSlash = trimmed.replace(/\/+$/, '');
-    if (/\/v1$/i.test(noTrailingSlash)) {
-      return noTrailingSlash.replace(/\/v1$/i, '');
+    if (/\/v\d+$/i.test(noTrailingSlash)) {
+      return noTrailingSlash.replace(/\/v\d+$/i, '');
     }
     return noTrailingSlash;
   }
@@ -160,6 +162,11 @@ export class UniversalLLMClient extends BaseLLMClient {
 
     if (!this.openaiClient) {
       throw new Error('OpenAI client not initialized');
+    }
+
+    const protocolId = resolveProtocolId(this.config.provider, this.config.baseUrl);
+    if (protocolId === 'openai.chat-completions') {
+      return new OpenAIChatCompletionsProtocolAdapter(this.config, this.openaiClient);
     }
     return new OpenAIResponsesProtocolAdapter(this.config, this.openaiClient);
   }

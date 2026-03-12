@@ -307,6 +307,25 @@ export function parseToolArguments(
       rawText: text,
     };
   } catch (error: any) {
+    // 尝试 1：repairJSON 修复常见 LLM JSON 错误（尾随逗号、未转义控制字符等）
+    const repaired = repairJSON(text);
+    if (repaired !== text) {
+      try {
+        const repairedParsed = JSON.parse(repaired);
+        if (repairedParsed && typeof repairedParsed === 'object' && !Array.isArray(repairedParsed)) {
+          logger.info('Tool arguments 通过 repairJSON 修复后解析成功', {
+            provider,
+            model,
+            context,
+          }, LogCategory.LLM);
+          return { value: repairedParsed as Record<string, any>, rawText: text };
+        }
+      } catch {
+        // 修复后仍失败，继续下面的提取逻辑
+      }
+    }
+
+    // 尝试 2：extractFirstJSONObject 提取第一个完整 JSON 对象
     const extracted = extractFirstJSONObject(text);
     if (extracted && extracted !== text) {
       try {
@@ -391,4 +410,143 @@ export function extractFirstJSONObject(text: string): string | null {
   }
 
   return null;
+}
+
+/**
+ * 尝试修复 LLM 生成的不合法 JSON 字符串
+ *
+ * 常见 LLM JSON 错误：
+ * 1. 尾随逗号：`[{...}, ]` 或 `{"a": 1, }`
+ * 2. 字符串值中未转义的控制字符（换行、制表符等）
+ * 3. JavaScript 风格注释 `// ...` 和 `/* ... *​/`
+ */
+export function repairJSON(text: string): string {
+  let repaired = text;
+
+  // 1. 移除 BOM
+  repaired = repaired.replace(/^\uFEFF/, '');
+
+  // 2. 修复字符串值中未转义的控制字符
+  //    在 JSON 字符串内部（引号之间），将裸换行/制表替换为合法转义
+  repaired = repairControlCharsInStrings(repaired);
+
+  // 3. 移除 JavaScript 注释（在字符串外部）
+  repaired = removeJSComments(repaired);
+
+  // 4. 移除尾随逗号（最常见的 LLM 错误）
+  //    匹配 `, ]` 或 `, }` 形式（逗号和闭合符之间可有空白）
+  repaired = repaired.replace(/,\s*([\]}])/g, '$1');
+
+  return repaired;
+}
+
+/**
+ * 修复 JSON 字符串值内部的裸控制字符
+ */
+function repairControlCharsInStrings(text: string): string {
+  const result: string[] = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const code = text.charCodeAt(i);
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        result.push(ch);
+        continue;
+      }
+      if (ch === '\\') {
+        escaped = true;
+        result.push(ch);
+        continue;
+      }
+      if (ch === '"') {
+        inString = false;
+        result.push(ch);
+        continue;
+      }
+      // 裸控制字符 → 替换为合法转义序列
+      if (code < 0x20) {
+        switch (code) {
+          case 0x0A: result.push('\\n'); break;    // LF
+          case 0x0D: result.push('\\r'); break;    // CR
+          case 0x09: result.push('\\t'); break;    // TAB
+          case 0x08: result.push('\\b'); break;    // BS
+          case 0x0C: result.push('\\f'); break;    // FF
+          default:   result.push(`\\u${code.toString(16).padStart(4, '0')}`); break;
+        }
+        continue;
+      }
+      result.push(ch);
+      continue;
+    }
+
+    // 不在字符串中
+    if (ch === '"') {
+      inString = true;
+    }
+    result.push(ch);
+  }
+
+  return result.join('');
+}
+
+/**
+ * 移除字符串外部的 JavaScript 注释
+ */
+function removeJSComments(text: string): string {
+  const result: string[] = [];
+  let inString = false;
+  let escaped = false;
+  let i = 0;
+
+  while (i < text.length) {
+    const ch = text[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        result.push(ch);
+        i++;
+        continue;
+      }
+      if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      result.push(ch);
+      i++;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      result.push(ch);
+      i++;
+      continue;
+    }
+
+    // 行注释 //
+    if (ch === '/' && i + 1 < text.length && text[i + 1] === '/') {
+      const eol = text.indexOf('\n', i + 2);
+      i = eol === -1 ? text.length : eol;
+      continue;
+    }
+
+    // 块注释 /* */
+    if (ch === '/' && i + 1 < text.length && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2);
+      i = end === -1 ? text.length : end + 2;
+      continue;
+    }
+
+    result.push(ch);
+    i++;
+  }
+
+  return result.join('');
 }

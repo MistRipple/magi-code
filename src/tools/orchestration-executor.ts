@@ -13,6 +13,7 @@
 import { ExtendedToolDefinition } from './types';
 import { ToolCall, ToolResult } from '../llm/types';
 import { logger, LogCategory } from '../logging';
+import { repairJSON } from '../llm/protocol/adapters/protocol-utils';
 import type { WorkerSlot } from '../types';
 
 /**
@@ -660,24 +661,43 @@ export class OrchestrationExecutor {
       if (!trimmed) {
         return { ok: false, error: 'tasks 不能为空字符串，必须是任务数组' };
       }
-      try {
-        const parsed = JSON.parse(trimmed) as unknown;
-        if (Array.isArray(parsed)) {
-          if (parsed.length === 0) {
-            return { ok: false, error: 'tasks 必须是至少包含 1 个元素的数组' };
-          }
-          logger.warn('dispatch_task 参数归一化：tasks 从 JSON 字符串解析为数组', {
-            taskCount: parsed.length,
-          }, LogCategory.TOOLS);
-          return { ok: true, tasks: parsed as Record<string, any>[] };
-        }
-        return { ok: false, error: 'tasks 字符串解析后不是数组，请传递任务数组' };
-      } catch (error: any) {
-        return {
-          ok: false,
-          error: `tasks 不是有效 JSON 数组字符串: ${error?.message || String(error)}`,
-        };
+
+      // 尝试解析 JSON 字符串为数组（先直接解析，失败后修复再试）
+      const candidates = [trimmed];
+      const repaired = repairJSON(trimmed);
+      if (repaired !== trimmed) {
+        candidates.push(repaired);
       }
+
+      let lastParseError: string = '';
+      for (const candidate of candidates) {
+        try {
+          const parsed = JSON.parse(candidate) as unknown;
+          if (Array.isArray(parsed)) {
+            if (parsed.length === 0) {
+              return { ok: false, error: 'tasks 必须是至少包含 1 个元素的数组' };
+            }
+            if (candidate !== trimmed) {
+              logger.warn('dispatch_task: tasks JSON 修复后解析成功', {
+                taskCount: parsed.length,
+              }, LogCategory.TOOLS);
+            } else {
+              logger.warn('dispatch_task 参数归一化：tasks 从 JSON 字符串解析为数组', {
+                taskCount: parsed.length,
+              }, LogCategory.TOOLS);
+            }
+            return { ok: true, tasks: parsed as Record<string, any>[] };
+          }
+          return { ok: false, error: 'tasks 字符串解析后不是数组，请传递任务数组' };
+        } catch (error: any) {
+          lastParseError = error?.message || String(error);
+        }
+      }
+
+      return {
+        ok: false,
+        error: `tasks 不是有效 JSON 数组字符串: ${lastParseError}`,
+      };
     }
 
     return { ok: false, error: 'tasks 必须是至少包含 1 个元素的数组' };

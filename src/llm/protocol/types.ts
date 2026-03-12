@@ -9,7 +9,7 @@
 import { LLMProvider } from '../../types/agent-types';
 import { LLMMessageParams, LLMResponse, LLMStreamChunk } from '../types';
 
-export type ProtocolId = 'openai.responses' | 'anthropic.messages';
+export type ProtocolId = 'openai.responses' | 'openai.chat-completions' | 'anthropic.messages';
 
 export type CapabilitySupport = 'supported' | 'unsupported' | 'unknown';
 

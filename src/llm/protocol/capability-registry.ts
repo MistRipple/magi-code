@@ -15,6 +15,15 @@ const CAPABILITIES_BY_PROTOCOL: Record<ProtocolId, ProviderCapabilities> = {
     supportsThinkingStream: 'supported',
     supportsStatefulConversation: 'unknown',
   },
+  'openai.chat-completions': {
+    supportsTextIO: true,
+    supportsImageInput: true,
+    supportsFunctionTools: true,
+    supportsToolChoice: true,
+    supportsParallelToolCalls: 'supported',
+    supportsThinkingStream: 'supported',
+    supportsStatefulConversation: 'unsupported',
+  },
   'anthropic.messages': {
     supportsTextIO: true,
     supportsImageInput: true,
@@ -26,15 +35,32 @@ const CAPABILITIES_BY_PROTOCOL: Record<ProtocolId, ProviderCapabilities> = {
   },
 };
 
-export function resolveProtocolId(provider: LLMProvider): ProtocolId {
+/**
+ * 判断 baseUrl 是否为 OpenAI 官方端点
+ */
+function isOfficialOpenAI(baseUrl?: string): boolean {
+  if (!baseUrl) return true;
+  try {
+    const url = new URL(baseUrl);
+    return url.hostname === 'api.openai.com';
+  } catch {
+    return true;
+  }
+}
+
+export function resolveProtocolId(provider: LLMProvider, baseUrl?: string): ProtocolId {
   if (provider === 'openai') {
-    return 'openai.responses';
+    // 仅 OpenAI 官方端点使用 Responses API，第三方兼容 API 使用 Chat Completions
+    return isOfficialOpenAI(baseUrl) ? 'openai.responses' : 'openai.chat-completions';
   }
   return 'anthropic.messages';
 }
 
-export function resolveProviderProtocolProfile(provider: LLMProvider): ProviderProtocolProfile {
-  const protocol = resolveProtocolId(provider);
+export function resolveProviderProtocolProfile(
+  provider: LLMProvider,
+  protocolOverride?: ProtocolId,
+): ProviderProtocolProfile {
+  const protocol = protocolOverride ?? resolveProtocolId(provider);
   const capabilities = CAPABILITIES_BY_PROTOCOL[protocol];
   return {
     provider,
