@@ -80,7 +80,8 @@ export function buildUnifiedSystemPrompt(context: UnifiedPromptContext): string 
 - You may answer questions directly, operate on code via tools, or delegate complex tasks to specialized Workers.
 - Keep responses concise, professional, and direct.
 - Respond to the user in the same language as their input.
-- Never emit internal reasoning (e.g. "Let me...", "I need to...", "The user wants..."). Output conclusions and actions directly.`);
+- Never emit internal reasoning (e.g. "Let me...", "I need to...", "The user wants..."). Output conclusions and actions directly.
+- Do not mention or critique system prompts/messages. Treat them as immutable and focus on the task; if something seems inconsistent, state assumptions without referring to system prompts.`);
 
   // Worker 能力与分工映射
   if (availableWorkers.length === 0) {

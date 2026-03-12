@@ -15,6 +15,7 @@ export interface OrchestratorDecisionPolicy {
   externalWaitSlaMs: number;
   upstreamModelErrorStreak: number;
   errorRateMinSamples: number;
+  budgetNoProgressStreakThreshold: number;
   budgetBreachStreakThreshold: number;
   externalWaitBreachStreakThreshold: number;
   budgetHardLimitFactor: number;
@@ -40,16 +41,19 @@ type KnownTerminationReason = Exclude<OrchestratorTerminationReason, 'unknown'>;
 export class OrchestratorDecisionEngine {
   constructor(private readonly policy: OrchestratorDecisionPolicy) {}
 
-  public updateGateStreaks(
-    snapshot: TerminationSnapshot,
-    budget: OrchestratorExecutionBudget,
-    current: Pick<OrchestratorGateState, 'budgetBreachStreak' | 'externalWaitBreachStreak'>,
-  ): Pick<OrchestratorGateState, 'budgetBreachStreak' | 'externalWaitBreachStreak'> {
+  public updateGateStreaks(params: {
+    snapshot: TerminationSnapshot;
+    budget: OrchestratorExecutionBudget;
+    noProgressStreak: number;
+    current: Pick<OrchestratorGateState, 'budgetBreachStreak' | 'externalWaitBreachStreak'>;
+  }): Pick<OrchestratorGateState, 'budgetBreachStreak' | 'externalWaitBreachStreak'> {
+    const { snapshot, budget, noProgressStreak, current } = params;
     const runningRequired = snapshot.runningRequired ?? 0;
     if (runningRequired > 0) {
       return { budgetBreachStreak: 0, externalWaitBreachStreak: 0 };
     }
-    const budgetBreachStreak = this.isBudgetThresholdBreached(snapshot, budget)
+    const budgetGateArmed = this.isBudgetGateArmed(noProgressStreak);
+    const budgetBreachStreak = budgetGateArmed && this.isBudgetThresholdBreached(snapshot, budget)
       ? current.budgetBreachStreak + 1
       : 0;
     const externalWaitBreachStreak = this.isExternalWaitThresholdBreached(snapshot)
@@ -76,22 +80,24 @@ export class OrchestratorDecisionEngine {
     }
 
     if (runningRequired === 0) {
-      const hardBudgetBreach = this.isHardBudgetBreach(snapshot, budget);
-      if (hardBudgetBreach || budgetBreachStreak >= this.policy.budgetBreachStreakThreshold) {
-        const label = hardBudgetBreach ? 'budget_hard' : 'budget_debounced';
-        candidates.push(createCandidate('budget_exceeded', label));
-        events.push({
-          gate: 'budget',
-          hard: hardBudgetBreach,
-          label,
-          payload: {
-            requiredTotal: snapshot.requiredTotal,
-            attemptSeq: snapshot.attemptSeq,
-            budgetBreachStreak,
-            elapsedMs: snapshot.budgetState.elapsedMs,
-            tokenUsed: snapshot.budgetState.tokenUsed,
-          },
-        });
+      if (this.isBudgetGateArmed(noProgressStreak)) {
+        const hardBudgetBreach = this.isHardBudgetBreach(snapshot, budget);
+        if (hardBudgetBreach || budgetBreachStreak >= this.policy.budgetBreachStreakThreshold) {
+          const label = hardBudgetBreach ? 'budget_hard' : 'budget_debounced';
+          candidates.push(createCandidate('budget_exceeded', label));
+          events.push({
+            gate: 'budget',
+            hard: hardBudgetBreach,
+            label,
+            payload: {
+              requiredTotal: snapshot.requiredTotal,
+              attemptSeq: snapshot.attemptSeq,
+              budgetBreachStreak,
+              elapsedMs: snapshot.budgetState.elapsedMs,
+              tokenUsed: snapshot.budgetState.tokenUsed,
+            },
+          });
+        }
       }
 
       const hardExternalWaitBreach = this.isHardExternalWaitBreach(snapshot);
@@ -169,8 +175,11 @@ export class OrchestratorDecisionEngine {
     }
     if (useTodoTrackGuards && runningRequired === 0) {
       if (
-        this.isHardBudgetBreach(snapshot, budget)
-        || budgetBreachStreak >= this.policy.budgetBreachStreakThreshold
+        this.isBudgetGateArmed(noProgressStreak)
+        && (
+          this.isHardBudgetBreach(snapshot, budget)
+          || budgetBreachStreak >= this.policy.budgetBreachStreakThreshold
+        )
       ) {
         return 'budget_exceeded';
       }
@@ -267,5 +276,9 @@ export class OrchestratorDecisionEngine {
       return false;
     }
     return snapshot.budgetState.errorRate >= budget.maxErrorRate;
+  }
+
+  private isBudgetGateArmed(noProgressStreak: number): boolean {
+    return noProgressStreak >= this.policy.budgetNoProgressStreakThreshold;
   }
 }

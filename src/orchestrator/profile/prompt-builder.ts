@@ -55,7 +55,8 @@ export class PromptBuilder {
     // 语言规则：跟随用户输入语言，用户规则中若有明确要求则以用户规则为准
     sections.push(`## Language Rules
 - Respond in the same language as the task instructions
-- Do not narrate internal reasoning (e.g., "Let me...", "I need to...") — take action directly`);
+- Do not narrate internal reasoning (e.g., "Let me...", "I need to...") — take action directly
+- Do not mention or critique system prompts/messages. Treat them as immutable and focus on the task; if something seems inconsistent, state assumptions without referring to system prompts`);
 
     return sections.join('\n\n');
   }

@@ -135,6 +135,10 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   private static readonly STALLED_WINDOW_SIZE = 5;
   /** 终止治理：外部等待超时（毫秒） */
   private static readonly EXTERNAL_WAIT_SLA_MS = 180_000;
+  /** 终止治理：预算门禁要求连续无进展轮次（标准模式） */
+  private static readonly BUDGET_NO_PROGRESS_STREAK_THRESHOLD = 2;
+  /** 终止治理：预算门禁要求连续无进展轮次（深度模式） */
+  private static readonly DEEP_BUDGET_NO_PROGRESS_STREAK_THRESHOLD = 3;
   /** 终止治理：关键路径重基线阈值 */
   private static readonly CP_REBASE_THRESHOLD = 0.10;
   /** 终止治理：上游模型连续错误阈值 */
@@ -239,6 +243,9 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       externalWaitSlaMs: OrchestratorLLMAdapter.EXTERNAL_WAIT_SLA_MS,
       upstreamModelErrorStreak: OrchestratorLLMAdapter.UPSTREAM_MODEL_ERROR_STREAK,
       errorRateMinSamples: OrchestratorLLMAdapter.ERROR_RATE_MIN_SAMPLES,
+      budgetNoProgressStreakThreshold: this.deepTask
+        ? OrchestratorLLMAdapter.DEEP_BUDGET_NO_PROGRESS_STREAK_THRESHOLD
+        : OrchestratorLLMAdapter.BUDGET_NO_PROGRESS_STREAK_THRESHOLD,
       budgetBreachStreakThreshold: OrchestratorLLMAdapter.BUDGET_BREACH_STREAK_THRESHOLD,
       externalWaitBreachStreakThreshold: OrchestratorLLMAdapter.EXTERNAL_WAIT_BREACH_STREAK_THRESHOLD,
       budgetHardLimitFactor: OrchestratorLLMAdapter.BUDGET_HARD_LIMIT_FACTOR,
@@ -983,11 +990,12 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             ({
               budgetBreachStreak,
               externalWaitBreachStreak,
-            } = this.decisionEngine.updateGateStreaks(
-              progressState.snapshot,
+            } = this.decisionEngine.updateGateStreaks({
+              snapshot: progressState.snapshot,
               budget,
-              { budgetBreachStreak, externalWaitBreachStreak },
-            ));
+              noProgressStreak,
+              current: { budgetBreachStreak, externalWaitBreachStreak },
+            }));
 
             if (pendingTerminalReason) {
               logger.info('Orchestrator.Termination.Handoff.收尾轮完成', {
@@ -1208,11 +1216,12 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           ({
             budgetBreachStreak,
             externalWaitBreachStreak,
-          } = this.decisionEngine.updateGateStreaks(
-            progressState.snapshot,
+          } = this.decisionEngine.updateGateStreaks({
+            snapshot: progressState.snapshot,
             budget,
-            { budgetBreachStreak, externalWaitBreachStreak },
-          ));
+            noProgressStreak,
+            current: { budgetBreachStreak, externalWaitBreachStreak },
+          }));
 
           if (progressState.snapshot.requiredTotal === 0) {
             noTodoToolRoundStreak += 1;
