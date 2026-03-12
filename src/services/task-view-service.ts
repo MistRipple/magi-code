@@ -224,4 +224,46 @@ export class TaskViewService {
       await this.missionStorage.transitionStatus(taskId, 'executing');
     }
   }
+
+  /**
+   * 收敛执行中状态（用于启动恢复/中断后清理）
+   */
+  async recoverRunningState(input: {
+    sessionId?: string;
+    missionId?: string;
+  }): Promise<{ recovered: boolean; cancelledMissionIds: string[]; cancelledTodoIds: string[] }>
+  {
+    const { TodoManager } = await import('../todo');
+    const { sessionId, missionId } = input;
+    const cancelledMissionIds: string[] = [];
+    const cancelledTodoIds: string[] = [];
+
+    const missions = sessionId ? await this.missionStorage.listBySession(sessionId) : [];
+    for (const mission of missions) {
+      if (missionId && mission.id !== missionId) continue;
+      if (mission.status !== 'executing') continue;
+      await this.missionStorage.transitionStatus(mission.id, 'cancelled');
+      cancelledMissionIds.push(mission.id);
+    }
+
+    try {
+      const todoManager = new TodoManager(this.workspaceRoot);
+      await todoManager.initialize();
+      const cancelledTodos = await todoManager.cancelByQuery({
+        sessionId,
+        missionId,
+        status: ['running'],
+      }, '任务中断，状态收敛');
+      cancelledTodoIds.push(...cancelledTodos);
+    } catch (error) {
+      logger.warn('任务视图.收敛.TodoManager.失败', {
+        error: error instanceof Error ? error.message : String(error),
+        sessionId,
+        missionId,
+      }, LogCategory.ORCHESTRATOR);
+    }
+
+    const recovered = cancelledMissionIds.length > 0 || cancelledTodoIds.length > 0;
+    return { recovered, cancelledMissionIds, cancelledTodoIds };
+  }
 }

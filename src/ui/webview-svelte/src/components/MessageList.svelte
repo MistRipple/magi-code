@@ -1,11 +1,12 @@
 <script lang="ts">
-  import type { Message, ScrollPositions } from '../types/message';
+  import type { Message, MissionPlan, ScrollPositions, Task } from '../types/message';
   import MessageItem from './MessageItem.svelte';
   import Icon from './Icon.svelte';
   import { tick } from 'svelte';
-  import { clearMessageJump, messagesState, updatePanelScrollState } from '../stores/messages.svelte';
+  import { clearMessageJump, getState, messagesState, updatePanelScrollState } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { deriveWorkerPanelState, getMessageRequestId } from '../lib/worker-panel-state';
+  import { ensureArray } from '../lib/utils';
 
   // Props - Svelte 5 语法
   interface Props {
@@ -25,6 +26,7 @@
     isActive?: boolean;
   }
   let { workerName, messages, emptyState, readOnly = false, displayContext = 'thread', isActive = true }: Props = $props();
+  const appState = getState();
 
   // 🛡️ 防御性编程：过滤无效的消息
   const safeMessages = $derived(
@@ -94,12 +96,14 @@
   const hasBottomStreamingMessage = $derived(Boolean(lastMessage?.isStreaming));
   const pendingRequestIds = $derived.by(() => Array.from(messagesState.pendingRequests));
   const pendingRequestIdSet = $derived.by(() => new Set(pendingRequestIds));
+  const tasks = $derived(ensureArray(appState.tasks) as Task[]);
+  const missionPlans = $derived.by(() => Array.from(appState.missionPlan.values()) as MissionPlan[]);
   const workerPanelState = $derived.by(() => deriveWorkerPanelState({
     messages: safeMessages,
     workerName,
     pendingRequestIds,
-    isProcessing: messagesState.isProcessing,
-    processingActorAgent: messagesState.processingActor?.agent,
+    tasks,
+    missionPlans,
   }));
 
   const latestRoundAnchorMessage = $derived.by(() => {

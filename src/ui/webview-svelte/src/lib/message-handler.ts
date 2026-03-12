@@ -611,6 +611,10 @@ function handleStateUpdate(message: WebviewMessage) {
   // 延迟到达前端，携带过期的 isRunning=true，导致 clearProcessingState() 被覆盖。
   // 处理状态只由控制消息（task_started/task_completed）和消息生命周期驱动，不再接受 stateUpdate 的冗余信号。
 
+  if (state.recovered === true) {
+    sealAllStreamingMessages();
+  }
+
   if (typeof state.interactionMode === 'string') {
     applyInteractionModeFromPayload(
       state.interactionMode,
@@ -2525,6 +2529,21 @@ function handleTodoApprovalRequested(message: WebviewMessage) {
   if (!reason || !reason.trim()) {
     throw new Error('[MessageHandler] TodoApprovalRequested 缺少 reason');
   }
+  const store = getState();
+  if (store.appState?.interactionMode === 'auto') {
+    updateTodo(assignmentId, todoId, (todo) => ({
+      ...todo,
+      approvalStatus: 'approved',
+      approvalNote: reason,
+    }));
+    vscode.postMessage({
+      type: 'interactionResponse',
+      requestId: `approval-${todoId}`,
+      response: 'approved',
+    });
+    return;
+  }
+
   updateTodo(assignmentId, todoId, (todo) => ({
     ...todo,
     approvalStatus: 'pending',

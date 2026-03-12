@@ -1011,6 +1011,16 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    const interruptSessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id;
+    if (interruptSessionId) {
+      const recovery = await this.orchestratorEngine.getTaskViewService().recoverRunningState({
+        sessionId: interruptSessionId,
+      });
+      if (recovery.recovered) {
+        this.recoveredSinceLastUpdate = true;
+      }
+    }
+
     // 清理编排者流式输出缓存，避免跨任务串流
     this.streamMessageIds.clear();
     // 发送 task_failed 控制消息，确保前端 clearProcessingState() 被触发
@@ -1047,6 +1057,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   // 流式消息 ID 管理
   private streamMessageIds: Map<string, string> = new Map(); // key: `${source}-${worker}-${target}`, value: messageId
+  private recoveredSinceLastUpdate = false;
 
   /**
    * 发送编排器标准消息（非流式）
@@ -1144,6 +1155,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // Webview 初始化时强制中断可能残留的任务，避免重启后状态错乱。
     // 使用启动恢复栅栏，确保 getState/requestState 不会读到残留 running 状态。
     this.startupRecoveryPromise = this.interruptCurrentTask({ silent: true })
+      .then(async () => {
+        const sessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id;
+        if (!sessionId) return;
+        const recovery = await this.orchestratorEngine.getTaskViewService().recoverRunningState({ sessionId });
+        if (recovery.recovered) {
+          this.recoveredSinceLastUpdate = true;
+        }
+      })
       .catch((error) => {
         logger.warn('界面.启动.残留任务清理_失败', { error: String(error) }, LogCategory.UI);
       })
@@ -2927,24 +2946,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     let thrown = false;
     try {
       // 调用智能编排器
-      // 注意：executeWithTaskContext 内部已将 LLM 响应流式发送到前端
-      // 因此不需要再手动调用 sendOrchestratorMessage 发送结果，否则会导致重复消息
+      // 注意：executeWithTaskContext 内部已将 LLM 响应流式发送到前端，
+      // 引擎层同时负责通过 messageHub.result() 自主推送所有 [System] 带外段，
+      // 因此不需要在此层做任何回灌或白名单匹配。
       const taskContext = await this.orchestratorEngine.executeWithTaskContext(prompt, sessionId, imagePaths, turnId);
       taskId = taskContext.taskId.trim();
       const result = taskContext.result;
-
-      // 引擎 fail-open/门禁降级返回属于“非流式合成文本”，需要显式回灌到主对话区，
-      // 否则用户会看到“工具调用后结束但没有结论”。
-      if (this.shouldEmitOutOfBandResult(result)) {
-        this.sendOrchestratorMessage({
-          content: result,
-          messageType: 'result',
-          metadata: {
-            phase: 'out_of_band_result',
-            source: 'mission_engine_fail_open',
-          },
-        });
-      }
 
       logger.info('界面.任务.完成', { hasResult: !!result?.trim(), resultLength: result?.length || 0 }, LogCategory.UI);
 
@@ -2974,10 +2981,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const runtimeReason = thrown && executionStatus.success
       ? 'failed'
       : executionStatus.runtimeReason;
-    const errors = runtimeReason === executionStatus.runtimeReason
-      ? [...executionStatus.errors]
-      : (errorMsg ? [errorMsg] : []);
-    const success = !thrown && runtimeReason === 'completed';
+    const success = !thrown && executionStatus.success;
+    const errors = success
+      ? []
+      : (runtimeReason === executionStatus.runtimeReason
+        ? [...executionStatus.errors]
+        : (errorMsg ? [errorMsg] : []));
     const failureReason = success
       ? undefined
       : this.buildExecutionFailureReason({
@@ -3217,15 +3226,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
     this.messageHub.setTraceId(resolvedSessionId);
     logger.debug('界面.消息.Trace.同步', { traceId: resolvedSessionId }, LogCategory.UI);
-  }
-
-  private shouldEmitOutOfBandResult(result: string): boolean {
-    const text = (result || '').trim();
-    if (!text) {
-      return false;
-    }
-    return text.startsWith('[System] 本轮触发门禁降级（会话不中断）：')
-      || text.startsWith('[System] 本轮执行出现异常，已自动降级为不中断返回：');
   }
 
   /** 保存消息到当前会话 */
@@ -3678,6 +3678,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       : [];
 
     const stateUpdatedAt = Date.now();
+    const recovered = this.recoveredSinceLastUpdate;
+    this.recoveredSinceLastUpdate = false;
     return {
       currentSessionId: this.activeSessionId ?? currentSession?.id,
       sessions: sessionMetas,
@@ -3694,6 +3696,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       activePlan,
       planHistory,
       stateUpdatedAt,
+      recovered,
     };
   }
 

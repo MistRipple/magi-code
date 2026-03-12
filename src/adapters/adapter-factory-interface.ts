@@ -127,6 +127,7 @@ export interface AdapterResponse {
       note?: string;
       timestamp: number;
     }>;
+    nextSteps?: string[];
   };
 }
 

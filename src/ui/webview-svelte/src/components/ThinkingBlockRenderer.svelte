@@ -17,9 +17,8 @@
   const isComplete = $derived(isStreaming ? false : (block.thinking?.isComplete ?? true));
 </script>
 
-<!-- 🔧 修复：流式期间默认展开 thinking 面板，让用户能看到实时输出 -->
 <ThinkingBlock
   thinking={[{ content: thinkingContent }]}
   isStreaming={!isComplete}
-  initialExpanded={isStreaming}
+  initialExpanded={false}
 />

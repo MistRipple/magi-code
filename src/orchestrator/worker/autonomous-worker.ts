@@ -710,9 +710,6 @@ export class AutonomousWorker extends EventEmitter {
       await this.refreshAssignmentTodos(assignment);
       this.syncTodoCollections(assignment, completedTodos, failedTodos, skippedTodos);
 
-      // 检查是否有等待审批的 Todo
-      const hasPendingApprovals = assignment.todos.some(todo => this.isTodoAwaitingApproval(todo));
-
       // 如果被中止，将剩余的未终态 Todo 标记为 skipped
       if (aborted) {
         for (const todo of assignment.todos) {
@@ -723,6 +720,23 @@ export class AutonomousWorker extends EventEmitter {
         await this.refreshAssignmentTodos(assignment);
         this.syncTodoCollections(assignment, completedTodos, failedTodos, skippedTodos);
       }
+
+      const runningTerminationReason = aborted
+        ? (abortReason || 'Aborted by orchestrator')
+        : '任务已结束，未完成的 Todo 已终止';
+      const forcedRunningIds = await this.finalizeRunningTodos(
+        assignment,
+        runningTerminationReason,
+        completedTodos,
+        failedTodos,
+        skippedTodos,
+      );
+      if (forcedRunningIds.length > 0 && !errors.includes(runningTerminationReason)) {
+        errors.push(runningTerminationReason);
+      }
+
+      // 检查是否有等待审批的 Todo
+      const hasPendingApprovals = assignment.todos.some(todo => this.isTodoAwaitingApproval(todo));
 
       const success = completedTodos.length > 0 && failedTodos.length === 0 && !aborted;
       const resultErrors = aborted && abortSource === 'external'
@@ -1250,6 +1264,59 @@ If any criterion is not satisfied:
 
   private isTodoSkippable(todo: UnifiedTodo): boolean {
     return todo.status === 'pending' || todo.status === 'blocked' || todo.status === 'ready';
+  }
+
+  private async finalizeRunningTodos(
+    assignment: Assignment,
+    reason: string,
+    completedTodos: UnifiedTodo[],
+    failedTodos: UnifiedTodo[],
+    skippedTodos: UnifiedTodo[],
+  ): Promise<string[]> {
+    const runningTodoIds = assignment.todos
+      .filter(todo => todo.status === 'running')
+      .map(todo => todo.id);
+    if (runningTodoIds.length === 0) {
+      return [];
+    }
+
+    for (const todoId of runningTodoIds) {
+      try {
+        await this.todoManager.fail(todoId, reason);
+      } catch (error: any) {
+        logger.warn('Worker.Todo.强制终止失败', {
+          assignmentId: assignment.id,
+          todoId,
+          error: error?.message || String(error),
+        }, LogCategory.ORCHESTRATOR);
+      }
+    }
+
+    await this.refreshAssignmentTodos(assignment);
+    this.syncTodoCollections(assignment, completedTodos, failedTodos, skippedTodos);
+
+    for (const todoId of runningTodoIds) {
+      const updated = assignment.todos.find(todo => todo.id === todoId);
+      if (!updated || updated.status !== 'failed') {
+        continue;
+      }
+      try {
+        this.emit('todoFailed', {
+          assignmentId: assignment.id,
+          todoId: updated.id,
+          content: updated.content,
+          error: reason,
+        });
+      } catch (emitError) {
+        logger.warn('Worker.Todo.强制终止事件发送失败（忽略）', {
+          assignmentId: assignment.id,
+          todoId: updated.id,
+          error: emitError instanceof Error ? emitError.message : String(emitError),
+        }, LogCategory.ORCHESTRATOR);
+      }
+    }
+
+    return runningTodoIds;
   }
 
   private upsertTodo(list: UnifiedTodo[], todo: UnifiedTodo): void {

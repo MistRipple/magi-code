@@ -49,13 +49,14 @@ interface TodoPriorityItem extends PriorityItem {
 // ============================================================================
 
 const VALID_TRANSITIONS: Record<TodoStatus, TodoStatus[]> = {
-  pending: ['blocked', 'ready', 'skipped'],
-  blocked: ['ready', 'skipped'],
-  ready: ['running', 'skipped'],
-  running: ['completed', 'failed', 'blocked'],
+  pending: ['blocked', 'ready', 'skipped', 'cancelled'],
+  blocked: ['ready', 'skipped', 'cancelled'],
+  ready: ['running', 'skipped', 'cancelled'],
+  running: ['completed', 'failed', 'blocked', 'cancelled'],
   completed: [],
   failed: ['pending'], // 重试
   skipped: [],
+  cancelled: [],
 };
 
 // ============================================================================
@@ -355,6 +356,22 @@ export class TodoManager extends EventEmitter {
     return await this.repository.query(query);
   }
 
+  /**
+   * 按条件批量取消 Todo
+   */
+  async cancelByQuery(query: TodoQuery, reason?: string): Promise<string[]> {
+    const todos = await this.repository.query(query);
+    const cancelledIds: string[] = [];
+    for (const todo of todos) {
+      if (!VALID_TRANSITIONS[todo.status]?.includes('cancelled')) {
+        continue;
+      }
+      await this.cancel(todo.id, reason);
+      cancelledIds.push(todo.id);
+    }
+    return cancelledIds;
+  }
+
   // ============================================================================
   // 状态管理
   // ============================================================================
@@ -580,8 +597,8 @@ export class TodoManager extends EventEmitter {
       return;
     }
 
-    // completed / skipped 视为终态，不允许被失败回写覆盖
-    if (todo.status === 'completed' || todo.status === 'skipped') {
+    // completed / skipped / cancelled 视为终态，不允许被失败回写覆盖
+    if (todo.status === 'completed' || todo.status === 'skipped' || todo.status === 'cancelled') {
       logger.warn('Todo.状态机.fail.忽略终态回写', {
         todoId,
         currentStatus: todo.status,
@@ -635,6 +652,41 @@ export class TodoManager extends EventEmitter {
     await this.triggerDependentTodos(todoId);
 
     // 如果是二级 Todo 被跳过，检查是否可以自动 complete 一级 Todo
+    if (nextTodo.parentId) {
+      await this.tryCompleteParent(nextTodo.parentId);
+    }
+  }
+
+  /**
+   * 取消 Todo
+   */
+  async cancel(todoId: string, reason?: string): Promise<void> {
+    const todo = await this.get(todoId);
+    if (!todo) throw new Error(`Todo not found: ${todoId}`);
+
+    if (todo.status === 'cancelled') {
+      return;
+    }
+
+    if (!VALID_TRANSITIONS[todo.status].includes('cancelled')) {
+      throw new Error(`Cannot cancel todo in status: ${todo.status}`);
+    }
+
+    const nextTodo: UnifiedTodo = {
+      ...todo,
+      status: 'cancelled',
+      completedAt: Date.now(),
+      ...(reason !== undefined ? { blockedReason: reason } : {}),
+    };
+    await this.persistTodo(nextTodo);
+    this.timeoutChecker.remove(todoId);
+    this.queue.remove(todoId);
+    this.emit('todo:cancelled', nextTodo, reason);
+
+    // 触发依赖此 Todo 的其他 Todos 检查
+    await this.triggerDependentTodos(todoId);
+
+    // 如果是二级 Todo 被取消，检查是否可以自动 complete 一级 Todo
     if (nextTodo.parentId) {
       await this.tryCompleteParent(nextTodo.parentId);
     }

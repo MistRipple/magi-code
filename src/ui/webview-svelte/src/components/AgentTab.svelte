@@ -1,10 +1,11 @@
 <script lang="ts">
-  import type { Message } from '../types/message';
+  import type { Message, MissionPlan, Task } from '../types/message';
   import MessageList from './MessageList.svelte';
   import InstructionCard from './InstructionCard.svelte';
-  import { messagesState } from '../stores/messages.svelte';
+  import { getState, messagesState } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { deriveWorkerPanelState } from '../lib/worker-panel-state';
+  import { ensureArray } from '../lib/utils';
 
   // Props
   interface Props {
@@ -14,6 +15,7 @@
   }
 
   let { workerName, messages, isActive = false }: Props = $props();
+  const appState = getState();
 
   // Worker Tab 专用的空状态配置
   const emptyState = $derived({
@@ -23,19 +25,21 @@
   });
 
   const pendingRequestIds = $derived.by(() => Array.from(messagesState.pendingRequests));
+  const tasks = $derived(ensureArray(appState.tasks) as Task[]);
+  const missionPlans = $derived.by(() => Array.from(appState.missionPlan.values()) as MissionPlan[]);
   const workerPanelState = $derived.by(() => deriveWorkerPanelState({
     messages,
     workerName,
     pendingRequestIds,
-    isProcessing: messagesState.isProcessing,
-    processingActorAgent: messagesState.processingActor?.agent,
+    tasks,
+    missionPlans,
   }));
 
   const activeInstructionMessage = $derived.by(() => {
     if (!workerPanelState.workerHasCurrentRequestActivity) {
       return null;
     }
-    return workerPanelState.latestInstructionMessage;
+    return workerPanelState.latestRunningInstructionMessage || workerPanelState.latestInstructionMessage;
   });
 </script>
 

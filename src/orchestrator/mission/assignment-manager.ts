@@ -415,13 +415,14 @@ export class AssignmentManager {
     newStatus: AssignmentStatus
   ): Assignment {
     const validTransitions: Record<AssignmentStatus, AssignmentStatus[]> = {
-      pending: ['planning'],
-      planning: ['ready', 'pending'],
-      ready: ['executing', 'blocked'],
-      executing: ['completed', 'failed', 'blocked'],
-      blocked: ['executing', 'failed'],
+      pending: ['planning', 'cancelled'],
+      planning: ['ready', 'pending', 'cancelled'],
+      ready: ['executing', 'blocked', 'cancelled'],
+      executing: ['completed', 'failed', 'blocked', 'cancelled'],
+      blocked: ['executing', 'failed', 'cancelled'],
       completed: [],
       failed: ['pending'],
+      cancelled: [],
     };
 
     const currentTransitions = validTransitions[assignment.status];
@@ -441,7 +442,7 @@ export class AssignmentManager {
       ...assignment,
       status: newStatus,
       startedAt: newStatus === 'executing' ? Date.now() : assignment.startedAt,
-      completedAt: newStatus === 'completed' ? Date.now() : assignment.completedAt,
+      completedAt: (newStatus === 'completed' || newStatus === 'cancelled') ? Date.now() : assignment.completedAt,
     };
   }
 
@@ -469,7 +470,7 @@ export class AssignmentManager {
 
     // 重新计算进度
     const completedCount = newTodos.filter(
-      t => t.status === 'completed' || t.status === 'skipped'
+      t => t.status === 'completed' || t.status === 'skipped' || t.status === 'cancelled'
     ).length;
     const progress = newTodos.length > 0
       ? Math.round((completedCount / newTodos.length) * 100)

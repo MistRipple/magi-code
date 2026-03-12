@@ -520,6 +520,7 @@ export interface AppState {
   interactionMode?: 'ask' | 'auto';
   interactionModeUpdatedAt?: number;
   stateUpdatedAt?: number;
+  recovered?: boolean;
   [key: string]: unknown;
 }
 

@@ -155,6 +155,7 @@ export function mapTodoStatusToSubTaskViewStatus(status: TodoStatus): SubTaskVie
     completed: 'completed',
     failed: 'failed',
     skipped: 'skipped',
+    cancelled: 'cancelled',
   };
   return mapping[status] || 'pending';
 }
@@ -198,7 +199,7 @@ export function missionToTaskView(mission: Mission, todos: UnifiedTodo[]): TaskV
 
   // 计算进度
   const completedCount = subTasks.filter(
-    st => st.status === 'completed' || st.status === 'skipped'
+    st => st.status === 'completed' || st.status === 'skipped' || st.status === 'cancelled'
   ).length;
   const progress = subTasks.length > 0
     ? Math.round((completedCount / subTasks.length) * 100)

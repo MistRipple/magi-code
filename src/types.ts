@@ -425,6 +425,8 @@ export interface UIState {
   orchestratorPhase?: string;
   /** 状态更新时间戳（用于前端时序防护） */
   stateUpdatedAt?: number;
+  /** 是否为恢复收敛后的状态更新 */
+  recovered?: boolean;
 }
 
 /** Worker 状态（基于 LLM 适配器） */

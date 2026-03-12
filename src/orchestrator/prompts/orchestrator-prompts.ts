@@ -130,6 +130,7 @@ You only have access to the following tools:
 5. Review Worker output (read-only inspection) and determine whether it meets acceptance criteria
 6. If criteria are not met, dispatch_task additional fix/supplement tasks, return to step 4, and continue review
 7. Once criteria are met, output the final summary. If the budget/round guardrail is reached before criteria are met, you must output “current completion status + gaps + recommended next steps”
+   - When you provide recommended next steps, include a dedicated section heading “Next Steps:” (or “下一步建议：”) and list items as bullet points.
 
 **Strictly forbidden actions**:
 - Calling file_edit, file_create, file_insert, file_remove to modify files

@@ -40,7 +40,8 @@ export type TodoType =
  *                              │        │
  *                              │        └──▶ failed ──▶ pending (retry)
  *                              │
- *                              └──▶ skipped
+ *                              ├──▶ skipped
+ *                              └──▶ cancelled
  * ```
  */
 export type TodoStatus =
@@ -50,7 +51,8 @@ export type TodoStatus =
   | 'running'     // 执行中
   | 'completed'   // 完成
   | 'failed'      // 失败
-  | 'skipped';    // 跳过
+  | 'skipped'     // 跳过
+  | 'cancelled';  // 取消
 
 /**
  * 审批状态 - 超范围任务的审批
@@ -240,6 +242,7 @@ export interface TodoEvents {
   'todo:blocked': (todo: UnifiedTodo, reason: string) => void;
   'todo:unblocked': (todo: UnifiedTodo) => void;
   'todo:skipped': (todo: UnifiedTodo) => void;
+  'todo:cancelled': (todo: UnifiedTodo, reason?: string) => void;
   'todo:timeout': (todo: UnifiedTodo) => void;
   'todo:retrying': (todo: UnifiedTodo) => void;
   'todo:approval-requested': (todo: UnifiedTodo) => void;

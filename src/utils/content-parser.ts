@@ -144,6 +144,79 @@ export function extractEmbeddedJson(content: string): Array<{
   return results;
 }
 
+export function normalizeNextSteps(steps: string[]): string[] {
+  if (!Array.isArray(steps)) {
+    return [];
+  }
+  const normalized = steps
+    .map((step) => (typeof step === 'string' ? step.replace(/\s+/g, ' ').trim() : ''))
+    .filter((step) => step.length > 0);
+  return Array.from(new Set(normalized)).slice(0, 6);
+}
+
+export function extractNextStepsFromText(content: string): string[] {
+  if (typeof content !== 'string') {
+    return [];
+  }
+  const lines = content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) {
+    return [];
+  }
+
+  const headingPattern = /^(#{1,6}\s*)?(下一步|后续建议|后续步骤|建议下一步|下一步建议|next steps?|follow[- ]?ups?)[:：]?$/i;
+  const bulletPattern = /^[-*•]\s+(.+)$/;
+  const numberedPattern = /^\d+[.)]\s+(.+)$/;
+  let inSection = false;
+  const steps: string[] = [];
+
+  for (const line of lines) {
+    if (line.startsWith('[System]')) {
+      continue;
+    }
+    if (headingPattern.test(line)) {
+      inSection = true;
+      continue;
+    }
+    if (inSection) {
+      if (/^#{1,6}\s+/.test(line)) {
+        break;
+      }
+      if (/^(最终|总结|交付|验收|结论|overall|summary|final)/i.test(line)) {
+        break;
+      }
+      const bullet = bulletPattern.exec(line) || numberedPattern.exec(line);
+      if (bullet && bullet[1]) {
+        steps.push(bullet[1].trim());
+        continue;
+      }
+      steps.push(line);
+    }
+  }
+
+  if (steps.length === 0) {
+    for (const line of lines) {
+      if (line.startsWith('[System]')) {
+        continue;
+      }
+      if (!/下一步|next step|next steps|后续建议|后续步骤/i.test(line)) {
+        continue;
+      }
+      const separatorIndex = line.search(/[:：]/);
+      if (separatorIndex >= 0 && separatorIndex < line.length - 1) {
+        const tail = line.slice(separatorIndex + 1).trim();
+        if (tail) {
+          steps.push(tail);
+        }
+      }
+    }
+  }
+
+  return normalizeNextSteps(steps);
+}
+
 /**
  * 尝试从指定位置提取 JSON
  */

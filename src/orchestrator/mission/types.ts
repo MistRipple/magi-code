@@ -93,7 +93,8 @@ export type AssignmentStatus =
   | 'executing'  // 执行中
   | 'blocked'    // 被阻塞
   | 'completed'  // 完成
-  | 'failed';    // 失败
+  | 'failed'     // 失败
+  | 'cancelled'; // 取消
 
 /**
  * Assignment 规划状态
@@ -420,6 +421,7 @@ export interface Assignment {
   createdAt: number;
   startedAt?: number;
   completedAt?: number;
+  cancelledAt?: number;
 }
 
 /**

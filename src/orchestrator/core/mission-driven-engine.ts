@@ -61,6 +61,7 @@ import {
   isKeyInstruction,
   resolveOrchestratorContextPolicy,
 } from './mission-driven-engine-helpers';
+import { normalizeNextSteps } from '../../utils/content-parser';
 
 /**
  * 引擎配置
@@ -249,6 +250,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
   private lastExecutionErrors: string[] = [];
   private lastExecutionRuntimeReason: ResolvedOrchestratorTerminationReason = 'completed';
+  private lastExecutionFinalStatus: 'completed' | 'failed' | 'cancelled' = 'completed';
 
   // 执行统计
   private executionStats: ExecutionStats;
@@ -1245,19 +1247,36 @@ export class MissionDrivenEngine extends EventEmitter {
     };
   }
 
-  private mapOrchestratorRuntimeReasonToPlanFinalStatus(
-    runtimeReason?: string,
+  private resolveExecutionFinalStatus(
+    runtimeReason?: ResolvedOrchestratorTerminationReason,
+    runtimeSnapshot?: RuntimeTerminationSnapshot,
   ): 'completed' | 'failed' | 'cancelled' {
-    switch (this.normalizeOrchestratorRuntimeReason(runtimeReason)) {
-      case 'completed':
-        return 'completed';
-      case 'cancelled':
-      case 'external_abort':
-      case 'interrupted':
-        return 'cancelled';
-      default:
-        return 'failed';
+    const normalized = this.normalizeOrchestratorRuntimeReason(runtimeReason);
+    if (normalized === 'cancelled' || normalized === 'external_abort' || normalized === 'interrupted') {
+      return 'cancelled';
     }
+    if (normalized === 'completed') {
+      return 'completed';
+    }
+
+    const requiredTotal = this.resolveRequiredTotal(runtimeSnapshot);
+    const terminalRequired = this.resolveTerminalRequired(runtimeSnapshot);
+    const pendingRequired = this.extractPendingRequiredCount(runtimeSnapshot);
+    const failedRequired = typeof runtimeSnapshot?.failedRequired === 'number' && Number.isFinite(runtimeSnapshot.failedRequired)
+      ? runtimeSnapshot.failedRequired
+      : 0;
+    const hasRequired = typeof requiredTotal === 'number' && requiredTotal > 0;
+    const resolvedAllRequired = hasRequired
+      && typeof terminalRequired === 'number'
+      && terminalRequired >= requiredTotal
+      && pendingRequired === 0
+      && failedRequired === 0;
+
+    if (resolvedAllRequired) {
+      return 'completed';
+    }
+
+    return 'failed';
   }
 
   private buildExecutionFailureMessages(
@@ -1706,6 +1725,7 @@ export class MissionDrivenEngine extends EventEmitter {
             await this.planLedger.reject(resolvedSessionId, draftPlan.planId, 'user', rejectReason);
             orchestratorRuntimeReason = 'cancelled';
             this.lastExecutionRuntimeReason = orchestratorRuntimeReason;
+            this.lastExecutionFinalStatus = 'cancelled';
             this.lastExecutionErrors = [];
             this.setState('idle');
             this.currentTaskId = null;
@@ -1839,18 +1859,30 @@ export class MissionDrivenEngine extends EventEmitter {
 
         const autoRepairMaxRounds = Math.max(0, this.config.delivery?.autoRepairMaxRounds ?? 1);
         let autoRepairAttempt = 0;
+        let autoFollowUpAttempt = 0;
+        let lastFollowUpSignature = '';
+        let lastFollowUpProgressSignature = '';
+        let followUpStallStreak = 0;
         const autoRepairHistory: string[] = [];
+        const autoFollowUpHistory: string[] = [];
         let promptForRound = trimmedPrompt;
 
         // 5. 编排执行（支持交付失败后的自动修复闭环）
         while (true) {
           const executionRound = autoRepairAttempt + 1;
-          if (autoRepairAttempt > 0) {
+          if (autoRepairAttempt > 0 || autoFollowUpAttempt > 0) {
             this.dispatchManager.resetForNewExecutionCycle();
-            this.messageHub.progress(
-              t('engine.delivery.autoRepairProgressTitle'),
-              t('engine.delivery.autoRepairProgressMessage', { round: autoRepairAttempt, maxRounds: autoRepairMaxRounds }),
-            );
+            if (autoRepairAttempt > 0) {
+              this.messageHub.progress(
+                t('engine.delivery.autoRepairProgressTitle'),
+                t('engine.delivery.autoRepairProgressMessage', { round: autoRepairAttempt, maxRounds: autoRepairMaxRounds }),
+              );
+            } else {
+              this.messageHub.progress(
+                t('engine.followUp.autoContinueTitle'),
+                t('engine.followUp.autoContinueMessage', { round: autoFollowUpAttempt }),
+              );
+            }
           }
 
           deliveryStatusForMission = null;
@@ -2060,7 +2092,11 @@ export class MissionDrivenEngine extends EventEmitter {
           });
           orchestratorRuntimeReason = resolvedRuntimeTermination.reason;
           orchestratorRuntimeSnapshot = resolvedRuntimeTermination.runtimeSnapshot;
-          const finalPlanStatus = this.mapOrchestratorRuntimeReasonToPlanFinalStatus(orchestratorRuntimeReason);
+          const finalExecutionStatus = this.resolveExecutionFinalStatus(orchestratorRuntimeReason, orchestratorRuntimeSnapshot);
+          const normalizedRuntimeReason = this.normalizeOrchestratorRuntimeReason(orchestratorRuntimeReason);
+          if (finalExecutionStatus === 'completed' && normalizedRuntimeReason && normalizedRuntimeReason !== 'completed') {
+            executionWarnings.push(`终止门禁判定为 ${normalizedRuntimeReason}，但必需 Todo 已完成，按执行完成处理。`);
+          }
 
           if (executionWarnings.length > 0) {
             const warningSection = [
@@ -2070,6 +2106,9 @@ export class MissionDrivenEngine extends EventEmitter {
             finalContent = finalContent.trim()
               ? `${finalContent}\n\n${warningSection}`
               : warningSection;
+            this.messageHub.result(warningSection, {
+              metadata: { phase: 'system_section', extra: { type: 'execution_warning' } },
+            });
           }
 
           if (deliveryNotes.length > 0) {
@@ -2080,6 +2119,9 @@ export class MissionDrivenEngine extends EventEmitter {
             finalContent = finalContent.trim()
               ? `${finalContent}\n\n${deliverySection}`
               : deliverySection;
+            this.messageHub.result(deliverySection, {
+              metadata: { phase: 'system_section', extra: { type: 'delivery_verification' } },
+            });
           }
 
           if (deliverySummaryForMission) {
@@ -2131,6 +2173,62 @@ export class MissionDrivenEngine extends EventEmitter {
             continue;
           }
 
+          const followUpSteps = this.resolveFollowUpSteps(response.orchestratorRuntime?.nextSteps);
+          const pendingRequiredTodos = this.extractPendingRequiredCount(orchestratorRuntimeSnapshot);
+          const followUpSignature = [
+            `pending:${pendingRequiredTodos}`,
+            `steps:${followUpSteps.join('|')}`,
+          ].join('|');
+          const followUpProgressSignature = this.buildFollowUpProgressSignature(orchestratorRuntimeSnapshot);
+          if (followUpProgressSignature && followUpProgressSignature === lastFollowUpProgressSignature) {
+            followUpStallStreak += 1;
+          } else {
+            lastFollowUpProgressSignature = followUpProgressSignature;
+            followUpStallStreak = 0;
+          }
+          const shouldAutoFollowUp = (followUpSteps.length > 0 || pendingRequiredTodos > 0)
+            && currentPlanMode === 'deep'
+            && this.interactionMode === 'auto'
+            && followUpSignature !== lastFollowUpSignature
+            && followUpStallStreak < 2;
+
+          if (!shouldAutoFollowUp
+            && currentPlanMode === 'deep'
+            && this.interactionMode === 'ask'
+            && (followUpSteps.length > 0 || pendingRequiredTodos > 0)) {
+            const followUpNote = followUpSteps.length > 0
+              ? '[System] 当前为 ask 模式，检测到下一步建议。请确认是否继续执行。'
+              : '[System] 当前为 ask 模式，仍有未完成必需 Todo。请确认是否继续执行。';
+            finalContent = finalContent.trim()
+              ? `${finalContent}\n\n${followUpNote}`
+              : followUpNote;
+            this.messageHub.result(followUpNote, {
+              metadata: { phase: 'system_section', extra: { type: 'follow_up_pending' } },
+            });
+          }
+
+          if (shouldAutoFollowUp) {
+            autoFollowUpAttempt += 1;
+            lastFollowUpSignature = followUpSignature;
+            autoFollowUpHistory.push(`第${autoFollowUpAttempt}轮：${followUpSteps.join('；')}`);
+            this.messageHub.notify(
+              t('engine.followUp.autoContinueScheduled', { round: autoFollowUpAttempt }),
+              'warning',
+            );
+            promptForRound = this.buildAutoFollowUpPrompt({
+              originalPrompt: trimmedPrompt,
+              goal: requirementAnalysis.goal,
+              constraints: requirementAnalysis.constraints ?? [],
+              acceptanceCriteria: requirementAnalysis.acceptanceCriteria ?? [],
+              steps: followUpSteps,
+              round: autoFollowUpAttempt,
+              requiredTotal: this.resolveRequiredTotal(orchestratorRuntimeSnapshot),
+              terminalRequired: this.resolveTerminalRequired(orchestratorRuntimeSnapshot),
+              pendingRequired: pendingRequiredTodos,
+            });
+            continue;
+          }
+
           if (autoRepairAttempt > 0 && autoRepairHistory.length > 0) {
             const historySection = [
               '[System] 自动修复轮次记录：',
@@ -2139,10 +2237,27 @@ export class MissionDrivenEngine extends EventEmitter {
             finalContent = finalContent.trim()
               ? `${finalContent}\n\n${historySection}`
               : historySection;
+            this.messageHub.result(historySection, {
+              metadata: { phase: 'system_section', extra: { type: 'auto_repair_history' } },
+            });
+          }
+
+          if (autoFollowUpAttempt > 0 && autoFollowUpHistory.length > 0) {
+            const historySection = [
+              '[System] 自动续跑轮次记录：',
+              ...autoFollowUpHistory.map(item => `- ${item}`),
+            ].join('\n');
+            finalContent = finalContent.trim()
+              ? `${finalContent}\n\n${historySection}`
+              : historySection;
+            this.messageHub.result(historySection, {
+              metadata: { phase: 'system_section', extra: { type: 'auto_follow_up_history' } },
+            });
           }
 
           this.lastExecutionRuntimeReason = orchestratorRuntimeReason;
-          this.lastExecutionErrors = finalPlanStatus === 'failed'
+          this.lastExecutionFinalStatus = finalExecutionStatus;
+          this.lastExecutionErrors = finalExecutionStatus === 'failed'
             ? this.buildExecutionFailureMessages(orchestratorRuntimeReason, executionWarnings)
             : [];
           this.setState('idle');
@@ -2167,6 +2282,7 @@ export class MissionDrivenEngine extends EventEmitter {
           orchestratorRuntimeSnapshot = resolvedRuntimeTermination.runtimeSnapshot;
           logger.info('编排器.统一执行.中断', { error: errorMessage }, LogCategory.ORCHESTRATOR);
           this.lastExecutionRuntimeReason = orchestratorRuntimeReason;
+          this.lastExecutionFinalStatus = 'cancelled';
           this.lastExecutionErrors = [];
           this.setState('idle');
           this.currentTaskId = null;
@@ -2184,12 +2300,16 @@ export class MissionDrivenEngine extends EventEmitter {
         orchestratorRuntimeReason = resolvedRuntimeTermination.reason;
         orchestratorRuntimeSnapshot = resolvedRuntimeTermination.runtimeSnapshot;
         this.lastExecutionRuntimeReason = orchestratorRuntimeReason;
+        this.lastExecutionFinalStatus = 'failed';
         this.lastExecutionErrors = [errorMessage];
         logger.error('编排器.统一执行.失败', { error: errorMessage }, LogCategory.ORCHESTRATOR);
         this.setState('idle');
         this.currentTaskId = null;
         // fail-open：执行异常也返回可读结论，避免打断会话链路
         const degradedMessage = `[System] 本轮执行出现异常，已自动降级为不中断返回：${errorMessage}`;
+        this.messageHub.result(degradedMessage, {
+          metadata: { phase: 'system_section', extra: { type: 'execution_degraded' } },
+        });
         return degradedMessage;
       } finally {
         const finalSessionId = this.currentSessionId;
@@ -2202,12 +2322,15 @@ export class MissionDrivenEngine extends EventEmitter {
           : null;
         const finalRuntimeReason = finalRuntimeTermination?.reason;
         const finalRuntimeSnapshot = finalRuntimeTermination?.runtimeSnapshot || orchestratorRuntimeSnapshot;
-        const finalPlanStatus = finalRuntimeReason
-          ? this.mapOrchestratorRuntimeReasonToPlanFinalStatus(finalRuntimeReason)
+        const finalExecutionStatus = finalRuntimeReason
+          ? this.resolveExecutionFinalStatus(finalRuntimeReason, finalRuntimeSnapshot)
           : null;
         if (finalRuntimeReason) {
           this.lastExecutionRuntimeReason = finalRuntimeReason;
-          if (finalPlanStatus === 'failed') {
+          if (finalExecutionStatus) {
+            this.lastExecutionFinalStatus = finalExecutionStatus;
+          }
+          if (finalExecutionStatus === 'failed') {
             this.lastExecutionErrors = this.buildExecutionFailureMessages(finalRuntimeReason, this.lastExecutionErrors);
           }
         }
@@ -2230,9 +2353,9 @@ export class MissionDrivenEngine extends EventEmitter {
             }, LogCategory.ORCHESTRATOR);
           }
         }
-        if (finalSessionId && finalPlanId && finalPlanStatus) {
+        if (finalSessionId && finalPlanId && finalExecutionStatus) {
           try {
-            await this.planLedger.finalize(finalSessionId, finalPlanId, finalPlanStatus);
+            await this.planLedger.finalize(finalSessionId, finalPlanId, finalExecutionStatus);
           } catch (planError) {
             logger.warn('编排器.计划账本.终态更新失败', {
               sessionId: finalSessionId,
@@ -2246,7 +2369,7 @@ export class MissionDrivenEngine extends EventEmitter {
           planId: finalPlanId,
           turnId: this.currentTurnId,
           mode: currentPlanMode,
-          finalPlanStatus: finalPlanStatus,
+          finalPlanStatus: finalExecutionStatus,
           runtimeReason: finalRuntimeReason,
           runtimeRounds: orchestratorRuntimeRounds,
           runtimeSnapshot: finalRuntimeSnapshot,
@@ -2294,11 +2417,11 @@ export class MissionDrivenEngine extends EventEmitter {
               await this.missionStorage.delete(this.lastMissionId);
             } else {
               // 更新 Mission 终态
-              if (finalPlanStatus === 'completed') {
+              if (finalExecutionStatus === 'completed') {
                 await this.taskViewService.completeTaskById(this.lastMissionId);
-              } else if (finalPlanStatus === 'failed') {
+              } else if (finalExecutionStatus === 'failed') {
                 await this.taskViewService.failTaskById(this.lastMissionId, this.lastExecutionErrors[0]);
-              } else if (finalPlanStatus === 'cancelled') {
+              } else if (finalExecutionStatus === 'cancelled') {
                 await this.taskViewService.cancelTaskById(this.lastMissionId);
               }
 
@@ -2316,7 +2439,7 @@ export class MissionDrivenEngine extends EventEmitter {
           } catch (missionUpdateError) {
             logger.warn('编排器.Mission.终态更新失败', {
               missionId: this.lastMissionId,
-              finalPlanStatus,
+              finalPlanStatus: finalExecutionStatus,
               error: missionUpdateError instanceof Error ? missionUpdateError.message : String(missionUpdateError),
             }, LogCategory.ORCHESTRATOR);
           }
@@ -2423,11 +2546,17 @@ export class MissionDrivenEngine extends EventEmitter {
     }
   }
 
-  getLastExecutionStatus(): { success: boolean; errors: string[]; runtimeReason: ResolvedOrchestratorTerminationReason } {
+  getLastExecutionStatus(): {
+    success: boolean;
+    errors: string[];
+    runtimeReason: ResolvedOrchestratorTerminationReason;
+    finalStatus: 'completed' | 'failed' | 'cancelled';
+  } {
     return {
-      success: this.lastExecutionRuntimeReason === 'completed',
+      success: this.lastExecutionFinalStatus === 'completed',
       errors: [...this.lastExecutionErrors],
       runtimeReason: this.lastExecutionRuntimeReason,
+      finalStatus: this.lastExecutionFinalStatus,
     };
   }
 
@@ -2552,6 +2681,108 @@ export class MissionDrivenEngine extends EventEmitter {
       '请根据失败信息修复问题，必要时调整实现并重新运行相关验收。',
       '输出最终交付总结，并明确哪些验收已通过、哪些仍未通过。',
     ].filter(line => line && line.trim().length > 0).join('\n\n');
+  }
+
+  private resolveFollowUpSteps(runtimeSteps?: string[]): string[] {
+    if (!Array.isArray(runtimeSteps)) {
+      return [];
+    }
+    return normalizeNextSteps(runtimeSteps);
+  }
+
+  private buildAutoFollowUpPrompt(input: {
+    originalPrompt: string;
+    goal: string;
+    constraints: string[];
+    acceptanceCriteria: string[];
+    steps: string[];
+    round: number;
+    requiredTotal?: number;
+    terminalRequired?: number;
+    pendingRequired?: number;
+  }): string {
+    const goal = input.goal || input.originalPrompt;
+    const constraints = input.constraints.length > 0
+      ? input.constraints.map(item => `- ${item}`).join('\n')
+      : '- 无';
+    const acceptance = input.acceptanceCriteria.length > 0
+      ? input.acceptanceCriteria.map(item => `- ${item}`).join('\n')
+      : '- 无';
+    const steps = input.steps.length > 0
+      ? input.steps.map(item => `- ${item}`).join('\n')
+      : '- 无';
+    const totalRequired = typeof input.requiredTotal === 'number' ? input.requiredTotal : undefined;
+    const terminalRequired = typeof input.terminalRequired === 'number' ? input.terminalRequired : undefined;
+    const pendingRequired = typeof input.pendingRequired === 'number' ? input.pendingRequired : undefined;
+    const requiredSummary = (typeof totalRequired === 'number' && typeof terminalRequired === 'number')
+      ? [
+          `- 必需 Todo 总数: ${totalRequired}`,
+          `- 已终态必需 Todo: ${terminalRequired}`,
+          `- 剩余必需 Todo: ${Math.max(0, totalRequired - terminalRequired)}`,
+          typeof pendingRequired === 'number' ? `- 运行或待处理必需 Todo: ${pendingRequired}` : '',
+        ].filter(line => line.length > 0).join('\n')
+      : '';
+
+    return [
+      '[System] 你上一轮给出了下一步建议，已进入自动续跑。',
+      `续跑轮次：${input.round}`,
+      `原始目标：${goal}`,
+      `用户原始请求：${input.originalPrompt}`,
+      `约束：\n${constraints}`,
+      `验收标准：\n${acceptance}`,
+      requiredSummary ? `必需 Todo 进度：\n${requiredSummary}` : '',
+      `下一步建议：\n${steps}`,
+      '请直接执行上述步骤，必要时调用工具或 dispatch_task 继续推进，不要重复总结。',
+      '若确实无法执行，请明确说明原因并输出最终结论。',
+    ].filter(line => line && line.trim().length > 0).join('\n\n');
+  }
+
+  private resolveRequiredTotal(snapshot?: RuntimeTerminationSnapshot): number | undefined {
+    if (!snapshot) {
+      return undefined;
+    }
+    const raw = snapshot.requiredTotal;
+    return typeof raw === 'number' && Number.isFinite(raw) ? raw : undefined;
+  }
+
+  private resolveTerminalRequired(snapshot?: RuntimeTerminationSnapshot): number | undefined {
+    if (!snapshot) {
+      return undefined;
+    }
+    const raw = snapshot.progressVector?.terminalRequiredTodos;
+    return typeof raw === 'number' && Number.isFinite(raw) ? raw : undefined;
+  }
+
+  private extractPendingRequiredCount(snapshot?: RuntimeTerminationSnapshot): number {
+    if (!snapshot) {
+      return 0;
+    }
+    const raw = snapshot.runningOrPendingRequired;
+    if (typeof raw === 'number' && Number.isFinite(raw)) {
+      return Math.max(0, raw);
+    }
+    const total = this.resolveRequiredTotal(snapshot);
+    const terminal = this.resolveTerminalRequired(snapshot);
+    if (typeof total === 'number' && typeof terminal === 'number') {
+      return Math.max(0, total - terminal);
+    }
+    return 0;
+  }
+
+  private buildFollowUpProgressSignature(snapshot?: RuntimeTerminationSnapshot): string {
+    if (!snapshot) {
+      return '';
+    }
+    const total = this.resolveRequiredTotal(snapshot);
+    const terminal = this.resolveTerminalRequired(snapshot);
+    const pending = this.extractPendingRequiredCount(snapshot);
+    const failed = typeof snapshot.failedRequired === 'number' && Number.isFinite(snapshot.failedRequired)
+      ? snapshot.failedRequired
+      : 0;
+    if (typeof total !== 'number' && typeof terminal !== 'number' && pending === 0 && failed === 0) {
+      return '';
+    }
+    return `total:${total ?? 'na'}|terminal:${terminal ?? 'na'}|pending:${pending}|failed:${failed}`;
   }
 
   private extractPreDraftAcceptanceCriteria(

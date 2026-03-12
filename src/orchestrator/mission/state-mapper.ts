@@ -22,12 +22,12 @@ import type {
 /**
  * UI 子任务状态
  */
-type SubTaskViewStatus = 'pending' | 'planning' | 'running' | 'blocked' | 'completed' | 'failed';
+type SubTaskViewStatus = 'pending' | 'planning' | 'running' | 'blocked' | 'completed' | 'failed' | 'cancelled';
 
 /**
  * UI Todo 状态
  */
-type TodoViewStatus = 'pending' | 'blocked' | 'ready' | 'running' | 'completed' | 'failed' | 'skipped';
+type TodoViewStatus = 'pending' | 'blocked' | 'ready' | 'running' | 'completed' | 'failed' | 'skipped' | 'cancelled';
 
 /**
  * AssignmentView - UI 子任务视图
@@ -139,6 +139,7 @@ export class MissionStateMapper {
       'blocked': 'blocked',
       'completed': 'completed',
       'failed': 'failed',
+      'cancelled': 'cancelled',
     };
     return statusMap[status] || 'pending';
   }
@@ -155,6 +156,7 @@ export class MissionStateMapper {
       'completed': 'completed',
       'failed': 'failed',
       'skipped': 'skipped',
+      'cancelled': 'cancelled',
     };
     return statusMap[status] || 'pending';
   }

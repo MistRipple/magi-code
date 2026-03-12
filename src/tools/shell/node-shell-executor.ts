@@ -3,7 +3,7 @@
  * 基于 Node.js child_process 的 IShellExecutor 实现
  *
  * 纯命令执行模型（非交互式）：
- * - 每次 launch-process 直接 spawn(shell, ['-lc', command])
+ * - 每次 launch-process 直接 spawn(shell, shellArgs)
  * - 通过 stdout/stderr pipe 事件驱动捕获输出
  * - 不依赖 script 命令、pgrep、ANSI marker 或任何 PTY 能力
  * - 不依赖 VSCode 的任何 API
@@ -11,6 +11,8 @@
 
 import { spawn, ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
+import * as path from 'path';
 import {
   KillProcessResult,
   LaunchProcessOptions,
@@ -69,6 +71,81 @@ interface ServiceRuntimeState {
   startupMessage?: string;
   startupDeadlineAt?: number;
   lastHeartbeatAt: number;
+}
+
+interface ShellLaunchSpec {
+  executable: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+}
+
+function resolveWindowsShellExecutable(): string {
+  const explicitShell = (process.env.MAGI_SHELL || process.env.MAGI_WINDOWS_SHELL || '').trim();
+  if (explicitShell) return explicitShell;
+
+  const comspec = (process.env.ComSpec || '').trim();
+  if (comspec) {
+    if (!path.isAbsolute(comspec) || fs.existsSync(comspec)) {
+      return comspec;
+    }
+  }
+
+  return 'powershell.exe';
+}
+
+function resolveUnixShellExecutable(): string {
+  const candidates = [
+    process.env.MAGI_SHELL,
+    process.env.SHELL,
+    '/bin/bash',
+    '/bin/zsh',
+    '/bin/sh',
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const normalized = candidate.trim();
+    if (!normalized) continue;
+    if (path.isAbsolute(normalized) && !fs.existsSync(normalized)) {
+      continue;
+    }
+    return normalized;
+  }
+
+  return '/bin/sh';
+}
+
+function resolveShellLaunchSpec(command: string): ShellLaunchSpec {
+  const baseEnv: NodeJS.ProcessEnv = { ...process.env };
+  const platform = process.platform;
+
+  if (platform === 'win32') {
+    delete baseEnv.TERM;
+    const shellExecutable = resolveWindowsShellExecutable();
+    const shellName = path.basename(shellExecutable).toLowerCase();
+
+    if (shellName === 'cmd.exe' || shellName === 'cmd') {
+      return {
+        executable: shellExecutable,
+        args: ['/d', '/s', '/c', command],
+        env: baseEnv,
+      };
+    }
+
+    return {
+      executable: shellExecutable,
+      args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
+      env: baseEnv,
+    };
+  }
+
+  baseEnv.TERM = baseEnv.TERM || 'dumb';
+  const shellExecutable = resolveUnixShellExecutable();
+  return {
+    executable: shellExecutable,
+    args: ['-lc', command],
+    env: baseEnv,
+  };
 }
 
 // ============================================================================
@@ -326,7 +403,7 @@ export class NodeShellExecutor implements IShellExecutor {
     for (const [id, child] of this.childProcesses.entries()) {
       try {
         if (child.exitCode === null && !child.killed) {
-          child.kill('SIGTERM');
+          this.terminateChildProcess(child);
         }
       } catch {
         // 进程可能已退出
@@ -346,18 +423,19 @@ export class NodeShellExecutor implements IShellExecutor {
   /**
    * 启动子进程
    *
-   * 核心路径：spawn(shell, ['-lc', command])
+   * 核心路径：spawn(shell, shellArgs)
    * - stdout/stderr pipe 事件驱动捕获输出
    * - close 事件触发终态转换
    */
   private spawnChildProcess(proc: TerminalProcess): void {
-    const shellPath = process.env.SHELL || '/bin/bash';
     const cwd = proc.cwd || process.cwd();
+    const shellSpec = resolveShellLaunchSpec(proc.command);
 
-    const child = spawn(shellPath, ['-lc', proc.command], {
+    const child = spawn(shellSpec.executable, shellSpec.args, {
       cwd,
-      env: { ...process.env, TERM: 'dumb' },
+      env: shellSpec.env,
       stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: process.platform === 'win32',
     });
     this.childProcesses.set(proc.id, child);
 
@@ -549,15 +627,7 @@ export class NodeShellExecutor implements IShellExecutor {
 
       const child = this.childProcesses.get(proc.id);
       if (child && child.exitCode === null && !child.killed) {
-        try {
-          child.kill('SIGTERM');
-          await this.delay(200);
-          if (child.exitCode === null && !child.killed) {
-            child.kill('SIGKILL');
-          }
-        } catch {
-          // 进程可能已退出
-        }
+        await this.terminateChildProcess(child);
       }
       this.childProcesses.delete(proc.id);
 
@@ -777,5 +847,36 @@ export class NodeShellExecutor implements IShellExecutor {
 
   private delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private async terminateChildProcess(child: ChildProcess): Promise<void> {
+    if (process.platform === 'win32' && Number.isInteger(child.pid) && (child.pid as number) > 0) {
+      await new Promise<void>((resolve) => {
+        const killer = spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
+          stdio: 'ignore',
+          windowsHide: true,
+        });
+        killer.once('error', () => {
+          try {
+            child.kill();
+          } catch {
+            // 进程可能已退出
+          }
+          resolve();
+        });
+        killer.once('close', () => resolve());
+      });
+      return;
+    }
+
+    try {
+      child.kill('SIGTERM');
+      await this.delay(200);
+      if (child.exitCode === null && !child.killed) {
+        child.kill('SIGKILL');
+      }
+    } catch {
+      // 进程可能已退出
+    }
   }
 }

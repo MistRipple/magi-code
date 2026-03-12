@@ -1,7 +1,10 @@
 <script lang="ts">
-  import { getState } from '../stores/messages.svelte';
+  import type { AgentType, MissionPlan, Task } from '../types/message';
+  import { getState, messagesState } from '../stores/messages.svelte';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { deriveWorkerPanelState } from '../lib/worker-panel-state';
+  import { ensureArray } from '../lib/utils';
 
   interface Props {
     activeTab: 'thread' | 'claude' | 'codex' | 'gemini';
@@ -14,6 +17,8 @@
 
   // 模型连接状态（使用全局统一的 modelStatus）
   const modelStatus = $derived(appState.modelStatus);
+  const tasks = $derived(ensureArray(appState.tasks) as Task[]);
+  const missionPlans = $derived.by(() => Array.from(appState.missionPlan.values()) as MissionPlan[]);
 
   // 判断模型是否可用（available 或 connected 都表示可用）
   function isModelAvailable(worker: string): boolean {
@@ -21,11 +26,32 @@
     return status === 'available' || status === 'connected';
   }
 
-  // Worker 执行状态
-  const executionStatus = $derived(appState.workerExecutionStatus || {
-    claude: 'idle',
-    codex: 'idle',
-    gemini: 'idle'
+  const pendingRequestIds = $derived.by(() => Array.from(messagesState.pendingRequests));
+  const workerActivityState = $derived.by(() => {
+    const pendingIds = pendingRequestIds;
+    return {
+      claude: deriveWorkerPanelState({
+        messages: messagesState.agentOutputs.claude,
+        workerName: 'claude',
+        pendingRequestIds: pendingIds,
+        tasks,
+        missionPlans,
+      }),
+      codex: deriveWorkerPanelState({
+        messages: messagesState.agentOutputs.codex,
+        workerName: 'codex',
+        pendingRequestIds: pendingIds,
+        tasks,
+        missionPlans,
+      }),
+      gemini: deriveWorkerPanelState({
+        messages: messagesState.agentOutputs.gemini,
+        workerName: 'gemini',
+        pendingRequestIds: pendingIds,
+        tasks,
+        missionPlans,
+      }),
+    };
   });
 
   // Worker 颜色映射
@@ -34,6 +60,10 @@
     codex: 'var(--color-codex)',
     gemini: 'var(--color-gemini)',
   };
+
+  function isExecuting(worker: AgentType): boolean {
+    return workerActivityState[worker].workerHasCurrentRequestActivity;
+  }
 </script>
 
 <div class="bt-bar">
@@ -48,16 +78,13 @@
   <button
     class="bt-tab bt-worker"
     class:active={activeTab === 'claude'}
+    class:is-executing={isExecuting('claude')}
     style="--w-color: {workerColors.claude}"
     onclick={() => onTabChange('claude')}
   >
     <span class="bt-dot-wrap">
-      {#if executionStatus.claude === 'executing'}
-        <Icon name="loader" size={12} class="spinning" />
-      {:else if executionStatus.claude === 'completed'}
-        <Icon name="check-circle" size={12} class="bt-ok" />
-      {:else if executionStatus.claude === 'failed'}
-        <Icon name="x-circle" size={12} class="bt-err" />
+      {#if isExecuting('claude')}
+        <span class="bt-dot on executing"></span>
       {:else}
         <span class="bt-dot" class:on={isModelAvailable('claude')}></span>
       {/if}
@@ -67,16 +94,13 @@
   <button
     class="bt-tab bt-worker"
     class:active={activeTab === 'codex'}
+    class:is-executing={isExecuting('codex')}
     style="--w-color: {workerColors.codex}"
     onclick={() => onTabChange('codex')}
   >
     <span class="bt-dot-wrap">
-      {#if executionStatus.codex === 'executing'}
-        <Icon name="loader" size={12} class="spinning" />
-      {:else if executionStatus.codex === 'completed'}
-        <Icon name="check-circle" size={12} class="bt-ok" />
-      {:else if executionStatus.codex === 'failed'}
-        <Icon name="x-circle" size={12} class="bt-err" />
+      {#if isExecuting('codex')}
+        <span class="bt-dot on executing"></span>
       {:else}
         <span class="bt-dot" class:on={isModelAvailable('codex')}></span>
       {/if}
@@ -86,16 +110,13 @@
   <button
     class="bt-tab bt-worker"
     class:active={activeTab === 'gemini'}
+    class:is-executing={isExecuting('gemini')}
     style="--w-color: {workerColors.gemini}"
     onclick={() => onTabChange('gemini')}
   >
     <span class="bt-dot-wrap">
-      {#if executionStatus.gemini === 'executing'}
-        <Icon name="loader" size={12} class="spinning" />
-      {:else if executionStatus.gemini === 'completed'}
-        <Icon name="check-circle" size={12} class="bt-ok" />
-      {:else if executionStatus.gemini === 'failed'}
-        <Icon name="x-circle" size={12} class="bt-err" />
+      {#if isExecuting('gemini')}
+        <span class="bt-dot on executing"></span>
       {:else}
         <span class="bt-dot" class:on={isModelAvailable('gemini')}></span>
       {/if}
@@ -127,9 +148,8 @@
     color: var(--foreground-muted);
     background: transparent;
     border: none;
-    border-top: 2px solid transparent;
     cursor: pointer;
-    transition: color var(--transition-fast), border-color var(--transition-fast);
+    transition: color var(--transition-fast);
     white-space: nowrap;
   }
 
@@ -139,13 +159,15 @@
 
   .bt-tab.active {
     color: var(--foreground);
-    border-top-color: var(--primary);
   }
 
   /* Worker Tab 激活时使用品牌色 */
   .bt-worker.active {
     color: var(--w-color);
-    border-top-color: var(--w-color);
+  }
+
+  .bt-worker.is-executing {
+    color: color-mix(in srgb, var(--w-color) 82%, var(--foreground));
   }
 
   .bt-dot-wrap {
@@ -171,23 +193,42 @@
     opacity: 1;
   }
 
-  /* 执行状态动画 */
-  :global(.bt-dot-wrap .spinning) {
-    animation: bt-spin 1s linear infinite;
-    color: var(--w-color, var(--primary));
+  .bt-dot.executing {
+    position: relative;
+    width: 6px;
+    height: 6px;
+    background: var(--w-color);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--w-color) 30%, transparent);
   }
 
-  :global(.bt-ok) {
-    color: var(--success);
+  .bt-dot.executing::before,
+  .bt-dot.executing::after {
+    content: '';
+    position: absolute;
+    inset: -4px;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--w-color) 68%, transparent);
+    opacity: 0;
+    transform: scale(0.55);
+    animation: bt-breathe 1.8s ease-out infinite;
   }
 
-  :global(.bt-err) {
-    color: var(--error);
+  .bt-dot.executing::after {
+    animation-delay: 0.9s;
   }
 
-  @keyframes bt-spin {
-    from { transform: rotate(0deg); }
-    to { transform: rotate(360deg); }
+  @keyframes bt-breathe {
+    0% {
+      opacity: 0;
+      transform: scale(0.55);
+    }
+    30% {
+      opacity: 0.65;
+    }
+    100% {
+      opacity: 0;
+      transform: scale(1.9);
+    }
   }
 </style>
 

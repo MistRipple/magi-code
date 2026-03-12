@@ -79,12 +79,14 @@ export async function runPostDispatchVerification(
   messageHub.progress('Verification', `正在执行验收检查（${modifiedFiles.length} 个修改文件）...`);
   const verificationResult = await verificationRunner.runVerification(batch.id, modifiedFiles);
   if (verificationResult.success) {
+    const passedSummary = verificationResult.summary || '验收通过';
     if (verificationResult.warnings && verificationResult.warnings.length > 0) {
       messageHub.notify(`验收告警：${verificationResult.warnings.join('；')}`, 'warning');
     }
+    messageHub.progress('Verification', `✅ ${passedSummary}`);
     return {
       status: 'passed',
-      summary: verificationResult.summary || '验收通过',
+      summary: passedSummary,
       warnings: verificationResult.warnings,
     };
   }
@@ -92,6 +94,7 @@ export async function runPostDispatchVerification(
   const summary = verificationResult.summary || '验证失败';
   const details = verificationRunner.getErrorDetails(verificationResult).trim();
   const compactDetails = details.length > 3000 ? `${details.slice(0, 3000)}\n...(错误详情已截断)` : details;
+  messageHub.progress('Verification', `❌ 验收失败：${summary}`);
   return {
     status: 'failed',
     summary: `验收失败：${summary}`,

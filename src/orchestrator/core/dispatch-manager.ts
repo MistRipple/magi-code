@@ -1060,6 +1060,7 @@ export class DispatchManager {
     const executionRouting = this.resolveExecutionWorker(worker);
     if (!executionRouting.ok) {
       const errorMsg = executionRouting.error;
+      batch?.markFailed(taskId, { success: false, summary: errorMsg, errors: [errorMsg] });
       this.deps.messageHub.subTaskCard({
         id: taskId,
         title: taskTitle,
@@ -1068,7 +1069,6 @@ export class DispatchManager {
         summary: errorMsg,
         error: errorMsg,
       });
-      batch?.markFailed(taskId, { success: false, summary: errorMsg, errors: [errorMsg] });
       return;
     }
 
@@ -1166,6 +1166,7 @@ export class DispatchManager {
       if (!currentSessionId) {
         this.markProtocolNack(taskId, 'missing-session-context');
         const errorMsg = t('dispatch.errors.currentSessionMissingCannotCreateTodo');
+        batch?.markFailed(taskId, { success: false, summary: errorMsg, errors: [errorMsg] });
         this.deps.messageHub.subTaskCard({
           id: taskId,
           title: taskTitle,
@@ -1174,7 +1175,6 @@ export class DispatchManager {
           summary: errorMsg,
           error: errorMsg,
         });
-        batch?.markFailed(taskId, { success: false, summary: errorMsg, errors: [errorMsg] });
         return;
       }
 
@@ -1267,19 +1267,6 @@ export class DispatchManager {
         }, LogCategory.ORCHESTRATOR);
       }
 
-      // 更新 subTaskCard 最终状态
-      if (shouldUpdateCard) {
-        this.deps.messageHub.subTaskCard({
-          id: taskId,
-          title: taskTitle,
-          status: result.success ? 'completed' : 'failed',
-          worker: effectiveWorker,
-          summary,
-          modifiedFiles,
-          ...(!result.success && { error: result.errors?.[0] || summary }),
-        });
-      }
-
       // 更新 DispatchBatch 状态（含 tokenUsage 传递，供 archive 日志统计）
       const dispatchResult: DispatchResult = {
         success: result.success, summary, modifiedFiles,
@@ -1298,6 +1285,16 @@ export class DispatchManager {
         } else {
           batch?.markFailed(taskId, dispatchResult);
         }
+
+        this.deps.messageHub.subTaskCard({
+          id: taskId,
+          title: taskTitle,
+          status: result.success ? 'completed' : 'failed',
+          worker: effectiveWorker,
+          summary,
+          modifiedFiles,
+          ...(!result.success && { error: result.errors?.[0] || summary }),
+        });
       }
 
       // 记录 Worker Token 使用到 executionStats
@@ -1372,6 +1369,7 @@ export class DispatchManager {
         }, LogCategory.ORCHESTRATOR);
       }
       if (shouldUpdateCard) {
+        batch?.markFailed(taskId, { success: false, summary: userErrorMsg, errors: [userErrorMsg] });
         this.deps.messageHub.subTaskCard({
           id: taskId,
           title: taskTitle,
@@ -1385,8 +1383,6 @@ export class DispatchManager {
           effectiveWorker,
           userErrorMsg,
         );
-
-        batch?.markFailed(taskId, { success: false, summary: userErrorMsg, errors: [userErrorMsg] });
       }
 
       // C-15: Worker 崩溃后状态清理
@@ -2293,6 +2289,11 @@ export class DispatchManager {
 
     const semantic = this.resolveDispatchFailureSemantic(state.worker, reasonCode);
     const timeoutMessage = semantic.userMessage;
+    batch.markFailed(state.taskId, {
+      success: false,
+      summary: timeoutMessage,
+      errors: [`[${semantic.failureCode}] ${timeoutMessage}`],
+    });
     this.deps.messageHub.subTaskCard({
       id: state.taskId,
       title: entry.taskContract.taskTitle,
@@ -2315,11 +2316,6 @@ export class DispatchManager {
       },
     });
     this.deps.messageHub.notify(`${timeoutMessage}（${semantic.failureCode}）`, semantic.notifyLevel);
-    batch.markFailed(state.taskId, {
-      success: false,
-      summary: timeoutMessage,
-      errors: [`[${semantic.failureCode}] ${timeoutMessage}`],
-    });
     void this.deps.adapterFactory.interrupt(state.worker).catch((error: any) => {
       logger.warn('Dispatch.Protocol.Timeout.中断Worker失败', {
         taskId: state.taskId,

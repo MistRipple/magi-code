@@ -23,6 +23,7 @@ import { BaseLLMAdapter, AdapterState } from './base-adapter';
 import { logger, LogCategory } from '../../logging';
 import { t } from '../../i18n';
 import { isModelOriginIssue } from '../../errors/model-origin';
+import { extractNextStepsFromText } from '../../utils/content-parser';
 import { isRetryableNetworkError, toErrorMessage, buildStreamRecoveryPrompt, deduplicateResumption } from '../../tools/network-utils';
 import {
   type OrchestratorTerminationReason,
@@ -77,6 +78,7 @@ export interface OrchestratorRuntimeState {
     note?: string;
   };
   decisionTrace?: OrchestratorDecisionTraceEntry[];
+  nextSteps?: string[];
 }
 
 export interface OrchestratorDecisionTraceEntry {
@@ -1418,12 +1420,14 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         }));
       }
 
+      const finalNextSteps = extractNextStepsFromText(finalText);
       this.lastRuntimeState = {
         reason: terminationReason,
         rounds: loopRounds,
         snapshot: latestSnapshot,
         shadow: runtimeShadow,
         decisionTrace,
+        nextSteps: finalNextSteps,
       };
       return finalText || '任务已中断';
     } catch (error: any) {
@@ -1440,6 +1444,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                 note: 'shadow-abort',
               }
             : undefined,
+          nextSteps: [],
         };
         return '任务已中断';
       }

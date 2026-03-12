@@ -226,13 +226,6 @@ let interactionModeUpdatedAt = $state<number>(0);
 const INTERACTION_MODE_SYNC_TIMEOUT_MS = 10000;
 let interactionModeSyncTimer: ReturnType<typeof setTimeout> | null = null;
 
-// Worker 执行状态：idle | executing | completed | failed | stopped | skipped
-let workerExecutionStatus = $state<Record<string, 'idle' | 'executing' | 'completed' | 'failed' | 'stopped' | 'skipped'>>({
-  claude: 'idle',
-  codex: 'idle',
-  gemini: 'idle',
-});
-
 function sanitizeMessageBlocks(blocks: unknown): ContentBlock[] {
   const list = ensureArray(blocks);
   const invalid = list.filter(
@@ -553,10 +546,6 @@ export function setInteractionMode(mode: 'ask' | 'auto', updatedAt?: number) {
   }
 }
 
-export function getWorkerExecutionStatus() {
-  return workerExecutionStatus;
-}
-
 export function getPendingConfirmation() {
   return pendingConfirmation;
 }
@@ -626,9 +615,6 @@ export function getState() {
       const nextMode = v === 'ask' ? 'ask' : 'auto';
       setInteractionMode(nextMode);
     },
-    // Worker 状态
-    get workerExecutionStatus() { return workerExecutionStatus; },
-    set workerExecutionStatus(v) { workerExecutionStatus = v; },
     get pendingConfirmation() { return pendingConfirmation; },
     set pendingConfirmation(v) { pendingConfirmation = v; },
     get pendingRecovery() { return pendingRecovery; },
@@ -835,20 +821,6 @@ export function setMissionPlan(plan: MissionPlan | null) {
 }
 
 // Worker 执行状态操作
-export function setWorkerExecutionStatus(
-  worker: 'claude' | 'codex' | 'gemini',
-  status: 'idle' | 'executing' | 'completed' | 'failed' | 'stopped' | 'skipped'
-) {
-  workerExecutionStatus = { ...workerExecutionStatus, [worker]: status };
-
-  // 完成、失败、停止、跳过状态 2 秒后自动重置为 idle
-  if (status === 'completed' || status === 'failed' || status === 'stopped' || status === 'skipped') {
-    setTimeout(() => {
-      workerExecutionStatus = { ...workerExecutionStatus, [worker]: 'idle' };
-    }, 2000);
-  }
-}
-
 function updateProcessingState() {
   const nextIsProcessing = messagesState.backendProcessing
     || messagesState.activeMessageIds.size > 0
@@ -930,6 +902,70 @@ export function settleProcessingForManualInteraction() {
  * 2. 无内容的空占位消息被移除（避免残留"正在思考..."动画）
  * 3. 有内容的占位消息转为正常消息（去除占位标记）
  */
+
+// 终结 instruction 消息中残留的 running lane tasks
+function sealRunningLaneTasks() {
+  const agents: AgentType[] = ['claude', 'codex', 'gemini'];
+  for (const agent of agents) {
+    const list = messagesState.agentOutputs[agent];
+    let changed = false;
+    const sealed: Message[] = [];
+    for (const m of list) {
+      if (m.type !== 'instruction' || !Array.isArray(m.metadata?.laneTasks)) {
+        sealed.push(m);
+        continue;
+      }
+      const laneTasks = m.metadata!.laneTasks as Array<Record<string, unknown>>;
+      const hasRunning = laneTasks.some(t => t.status === 'running');
+      if (!hasRunning) {
+        sealed.push(m);
+        continue;
+      }
+      changed = true;
+      sealed.push({
+        ...m,
+        metadata: {
+          ...m.metadata,
+          laneTasks: laneTasks.map(t =>
+            t.status === 'running' ? { ...t, status: 'cancelled' } : t,
+          ),
+        },
+      });
+    }
+    if (changed) {
+      messagesState.agentOutputs = { ...messagesState.agentOutputs, [agent]: sealed };
+    }
+  }
+}
+
+// 终结 mission plan 中残留的 running assignment/todo
+function sealRunningMissionAssignments() {
+  let changed = false;
+  const next = new Map(missionPlan);
+  for (const [missionId, plan] of next) {
+    const hasRunning = (plan.assignments || []).some(a =>
+      a.status === 'running'
+      || (a.todos || []).some(t => t.status === 'running' || t.status === 'in_progress'),
+    );
+    if (!hasRunning) continue;
+    changed = true;
+    next.set(missionId, {
+      ...plan,
+      assignments: (plan.assignments || []).map(a => ({
+        ...a,
+        status: a.status === 'running' ? 'cancelled' : a.status,
+        todos: (a.todos || []).map(t => ({
+          ...t,
+          status: (t.status === 'running' || t.status === 'in_progress') ? 'cancelled' : t.status,
+        })),
+      })),
+    });
+  }
+  if (changed) {
+    missionPlan = next;
+  }
+}
+
 export function sealAllStreamingMessages() {
   let threadChanged = false;
   let agentChanged = false;
@@ -1015,6 +1051,11 @@ export function sealAllStreamingMessages() {
   if (threadChanged || agentChanged) {
     saveWebviewState();
   }
+
+  // 终结 instruction 消息中残留的 running lane tasks 和 mission plan 中 running 的 assignment，
+  // 避免插件重启/强制停止后 Worker 圆点持续显示"执行中"动画。
+  sealRunningLaneTasks();
+  sealRunningMissionAssignments();
 }
 
 /** 获取后端处理状态（用于时序判断） */
@@ -1401,11 +1442,6 @@ export function initializeState() {
     // 启动恢复：持久化状态只保留历史展示，不继承运行态。
     clearPendingInteractions();
     clearProcessingState();
-    workerExecutionStatus = {
-      claude: 'idle',
-      codex: 'idle',
-      gemini: 'idle',
-    };
     saveWebviewState();
   }
 }

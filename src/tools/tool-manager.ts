@@ -1598,7 +1598,7 @@ Only set may_modify_files=true when the command directly writes source files.`,
       };
     }
 
-    const inlineCdPattern = /^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^;&|]+?))\s*(?:&&|;)\s*(.+)$/s;
+    const inlineCdPattern = /^\s*cd\s+(?:\/d\s+)?(?:"([^"]+)"|'([^']+)'|([^;&|]+?))\s*(?:&&|;|&)\s*(.+)$/s;
     const inlineCdMatch = command.match(inlineCdPattern);
     if (inlineCdMatch) {
       const inlineCwd = (inlineCdMatch[1] || inlineCdMatch[2] || inlineCdMatch[3] || '').trim();
@@ -1738,8 +1738,12 @@ Only set may_modify_files=true when the command directly writes source files.`,
     }
 
     if (hasMultipleRoots) {
-      const slash = requestedCwd.indexOf('/');
-      const prefix = slash > 0 ? requestedCwd.substring(0, slash) : '';
+      const slashIndex = requestedCwd.indexOf('/');
+      const backslashIndex = requestedCwd.indexOf('\\');
+      const separatorIndex = slashIndex === -1
+        ? backslashIndex
+        : (backslashIndex === -1 ? slashIndex : Math.min(slashIndex, backslashIndex));
+      const prefix = separatorIndex > 0 ? requestedCwd.substring(0, separatorIndex) : '';
       const hasWorkspacePrefix = workspaceNames.includes(prefix);
 
       if (!hasWorkspacePrefix) {
@@ -1832,8 +1836,13 @@ Only set may_modify_files=true when the command directly writes source files.`,
       /\bsed\s+-i(?:\S*)?\b/i,
       /\bperl\b[^\n]*\s-i(?:\S*)?\b/i,
       /\b(?:g?awk)\b[^\n]*\s-i\s+inplace\b/i,
+      /\b(?:powershell|pwsh)\b[^\n]*\b-File\b\s+[^;&|\s]+\.ps1\b/i,
+      /\b(?:powershell|pwsh)\b[^\n]*\b-Command\b\s+[^\n]*\b(?:Set-Content|Add-Content|Out-File|Remove-Item|Copy-Item|Move-Item)\b/i,
       /\bpython(?:3)?\b[^\n]*\s+[^;&|]*\.py\b/i,
       /\bnode\b[^\n]*\s+[^;&|]*\.(?:[cm]?js|ts)\b/i,
+      /\b(?:cmd|cmd\.exe)\b[^\n]*\b\/c\b[^\n]*\b(?:copy|move|del|erase|ren|mkdir|rmdir|rd)\b/i,
+      /\b(?:copy|move|del|erase|ren|mkdir|rmdir|rd)\b\s+[^\n]+/i,
+      /\b(?:xcopy|robocopy)\b\s+[^\n]+/i,
       /\b(?:bash|sh|zsh)\b[^\n]*\s+[^;&|]*\.(?:sh|bash|zsh)\b/i,
       /\bpython(?:3)?\b[^\n]*\s-c\b/i,
       /\bpython(?:3)?\b[^\n]*<<-?\s*['"]?[A-Za-z_][A-Za-z0-9_]*['"]?/i,
@@ -1854,6 +1863,8 @@ Only set may_modify_files=true when the command directly writes source files.`,
     const patterns = [
       /\bpython(?:3)?\b(?![^\n]*\b-m\s+(?:pytest|unittest|pip|http\.server)\b)[^\n]*\s+(?!-)(?:[^;&|\s]*[/.][^;&|\s]*)(?:\s|$)/i,
       /\bnode\b[^\n]*\s+(?!-)(?:[^;&|\s]*[/.][^;&|\s]*)(?:\s|$)/i,
+      /\b(?:powershell|pwsh)\b[^\n]*\s+(?!-)(?:[^;&|\s]*[/.][^;&|\s]*\.(?:ps1|psm1))(?:\s|$)/i,
+      /\b(?:cmd|cmd\.exe)\b[^\n]*\s+(?!-)(?:[^;&|\s]*[/.][^;&|\s]*\.(?:bat|cmd))(?:\s|$)/i,
       /\b(?:bash|sh|zsh)\b[^\n]*\s+(?!-)(?:[^;&|\s]*[/.][^;&|\s]*)(?:\s|$)/i,
       /\bnpx\b[^\n]*\b(jscodeshift|codemod|ts-node|tsx)\b/i,
     ];
@@ -1871,6 +1882,9 @@ Only set may_modify_files=true when the command directly writes source files.`,
 
     const readOnlyPatterns = [
       /^(?:env\s+)?(?:ls|pwd|cat|head|tail|wc|grep|rg|find|tree|stat|file|which|whereis|du|df|sort|diff|md5sum|sha256sum|date|hostname|uname|printenv|id|whoami|test|true|false|type|command|readlink)(?:\s|$)/i,
+      /^(?:dir|cd|type|where|whoami|ver|set)\b/i,
+      /^powershell\b[^\n]*\b-Command\b\s+[^\n]*\b(Get-ChildItem|Get-Item|Get-Content|Get-Location|Get-Command|Get-Help|Get-Date|Get-Process|Get-Service|Test-Path)\b/i,
+      /^pwsh\b[^\n]*\b-Command\b\s+[^\n]*\b(Get-ChildItem|Get-Item|Get-Content|Get-Location|Get-Command|Get-Help|Get-Date|Get-Process|Get-Service|Test-Path)\b/i,
       /^cd(?:\s|$)/i,
       /^echo\b(?![\s\S]*?(?:>>|>)\s*(?!\/dev\/null\b)\S+)/i,
       /^git\s+(status|log|show|diff|branch|rev-parse|remote|tag|describe|stash\s+list|config\s+--get)(?:\s|$)/i,
