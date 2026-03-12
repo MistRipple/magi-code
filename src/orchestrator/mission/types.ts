@@ -140,6 +140,8 @@ export interface Mission {
   // ===== 目标定义 =====
   /** 用户原始输入 */
   userPrompt: string;
+  /** 编排者语义化任务名称（由 AI 理解用户意图后生成，非用户原话） */
+  title: string;
   /** 提炼后的目标（一句话描述） */
   goal: string;
   /** 目标分析（为什么需要这样做） */
@@ -498,6 +500,7 @@ export interface CreateMissionParams {
   userPrompt: string;
   sessionId: string;
   context?: string;
+  title?: string;
   goal?: string;
   analysis?: string;
   constraints?: string[];

@@ -231,6 +231,7 @@ export class InMemoryMissionStorage implements IMissionStorage {
   private normalizeMission(mission: Mission): Mission {
     return normalizeMissionPhase(normalizeMissionDelivery({
       ...mission,
+      title: mission.title || '',
       assignments: normalizeAssignments(mission.assignments),
     }));
   }
@@ -320,6 +321,7 @@ export class MissionStorageManager extends EventEmitter {
       id: `mission_${now}_${Math.random().toString(36).substring(2, 11)}`,
       sessionId: params.sessionId,
       userPrompt: params.userPrompt,
+      title: params.title?.trim() || '',
       goal: params.goal?.trim() || '',
       analysis: params.analysis?.trim() || '',
       context: params.context || '',
@@ -447,6 +449,27 @@ export class MissionStorageManager extends EventEmitter {
    * 更新 Mission
    */
   async update(mission: Mission): Promise<void> {
+    await this.updateMissionFields(mission);
+  }
+
+  /**
+   * 更新 Mission 语义化标题（由编排者在 dispatch_task 时生成）
+   * 仅在 title 为空或新值非空时写入，避免覆盖已有标题
+   */
+  async updateTitle(missionId: string, title: string): Promise<void> {
+    const normalizedTitle = title.trim();
+    if (!normalizedTitle) return;
+
+    const mission = await this.storage.load(missionId);
+    if (!mission) return;
+
+    // 已有语义化标题时不覆盖（首次 dispatch_task 写入即为最终标题）
+    if (mission.title && mission.title.trim().length > 0) return;
+
+    await this.updateMissionFields({ ...mission, title: normalizedTitle });
+  }
+
+  private async updateMissionFields(mission: Mission): Promise<void> {
     const oldMission = await this.storage.load(mission.id);
     if (oldMission && oldMission.status !== mission.status) {
       throw new Error(
@@ -634,6 +657,7 @@ export class FileBasedMissionStorage implements IMissionStorage {
   private normalizeMission(mission: Mission): Mission {
     return normalizeMissionPhase(normalizeMissionDelivery({
       ...mission,
+      title: mission.title || '',
       assignments: normalizeAssignments(mission.assignments),
     }));
   }

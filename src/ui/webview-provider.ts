@@ -1155,14 +1155,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // Webview 初始化时强制中断可能残留的任务，避免重启后状态错乱。
     // 使用启动恢复栅栏，确保 getState/requestState 不会读到残留 running 状态。
     this.startupRecoveryPromise = this.interruptCurrentTask({ silent: true })
-      .then(async () => {
-        const sessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id;
-        if (!sessionId) return;
-        const recovery = await this.orchestratorEngine.getTaskViewService().recoverRunningState({ sessionId });
-        if (recovery.recovered) {
-          this.recoveredSinceLastUpdate = true;
-        }
-      })
       .catch((error) => {
         logger.warn('界面.启动.残留任务清理_失败', { error: String(error) }, LogCategory.UI);
       })
@@ -3619,7 +3611,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 将 TaskView 转换为 UI Task 格式
       tasks = taskViews.map(tv => ({
         id: tv.id,
-        name: tv.goal || tv.prompt,
+        name: tv.title || tv.goal || tv.prompt,
         prompt: tv.prompt,
         description: tv.goal,
         status: tv.status,

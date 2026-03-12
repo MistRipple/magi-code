@@ -1078,6 +1078,8 @@ export class MissionDrivenEngine extends EventEmitter {
     // 如果编排者提供了 mission_title，回写为计划摘要（替换初始的用户消息截取）
     if (payload.missionTitle) {
       await this.planLedger.updateSummary(payload.sessionId, this.currentPlanId, payload.missionTitle);
+      // 同步回写 Mission.title（语义化任务名称的唯一真相源）
+      await this.missionStorage.updateTitle(payload.missionId, payload.missionTitle);
     }
 
     await this.planLedger.upsertDispatchItem(payload.sessionId, this.currentPlanId, {

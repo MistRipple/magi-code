@@ -53,6 +53,7 @@ export interface TaskView {
   // 基础信息
   id: string;               // = Mission.id
   sessionId: string;        // = Mission.sessionId
+  title: string;            // = Mission.title（编排者语义化任务名）
   prompt: string;           // = Mission.userPrompt
   goal: string;             // = Mission.goal
 
@@ -208,6 +209,7 @@ export function missionToTaskView(mission: Mission, todos: UnifiedTodo[]): TaskV
   return {
     id: mission.id,
     sessionId: mission.sessionId,
+    title: mission.title || '',
     prompt: mission.userPrompt,
     goal: mission.goal,
     status: mapMissionStatusToTaskViewStatus(mission.status),

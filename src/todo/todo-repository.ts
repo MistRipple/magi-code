@@ -371,6 +371,7 @@ export class FileTodoRepository implements TodoRepository {
       completed: 0,
       failed: 0,
       skipped: 0,
+      cancelled: 0,
     };
 
     const byType: Record<TodoType, number> = {
