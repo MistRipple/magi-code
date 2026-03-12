@@ -63,10 +63,19 @@
   };
 
   const isAllCompleted = $derived(data.wait_status === 'completed' && !data.timed_out);
+  const isWaiting = $derived(!isAllCompleted);
   const totalCount = $derived(data.results.length);
   const successCount = $derived(data.results.filter(r => r.status === 'completed').length);
   const failCount = $derived(data.results.filter(r => r.status === 'failed').length);
   const waitedSeconds = $derived((data.waited_ms / 1000).toFixed(1));
+
+  const workerSlots = ['claude', 'codex', 'gemini'] as const;
+  const workerLabels: Record<WorkerType, string> = {
+    claude: 'Claude',
+    codex: 'Codex',
+    gemini: 'Gemini',
+    default: 'Worker'
+  };
 
   // 审计等级配色
   const auditColorMap: Record<string, { colorVar: string; icon: IconName; labelKey: string }> = {
@@ -85,62 +94,86 @@
 
 <div class="wait-result-card">
   <!-- 顶部总状态横幅 -->
-  <div class="result-header" class:timeout={!isAllCompleted}>
+  <div class="result-header" class:waiting={isWaiting} class:timeout={data.timed_out}>
     <div class="header-left">
-      <Icon name={isAllCompleted ? 'check-circle' : 'alert-triangle'} size={16} />
-      <span class="header-title">{isAllCompleted ? i18n.t('waitResultCard.reportTitle') : i18n.t('waitResultCard.timeoutTitle')}</span>
+      <Icon name={isAllCompleted ? 'check-circle' : 'loader'} size={16} />
+      <span class="header-title">{isAllCompleted ? i18n.t('waitResultCard.reportTitle') : i18n.t('waitResultCard.waitingTitle')}</span>
     </div>
     <div class="header-right">
-      {#if totalCount > 1}
-        <span class="header-stat">{i18n.t('waitResultCard.completedStat', { success: successCount, total: totalCount })}</span>
-      {/if}
-      {#if failCount > 0}
-        <span class="header-stat fail">{i18n.t('waitResultCard.failedStat', { count: failCount })}</span>
+      {#if isAllCompleted}
+        {#if totalCount > 1}
+          <span class="header-stat">{i18n.t('waitResultCard.completedStat', { success: successCount, total: totalCount })}</span>
+        {/if}
+        {#if failCount > 0}
+          <span class="header-stat fail">{i18n.t('waitResultCard.failedStat', { count: failCount })}</span>
+        {/if}
+      {:else}
+        <span class="header-stat waiting">{i18n.t('waitResultCard.waitingStat', { count: workerSlots.length })}</span>
       {/if}
       <span class="header-time"><Icon name="clock" size={12} />{waitedSeconds}s</span>
     </div>
   </div>
 
-  <!-- Worker 结果列表 -->
-  <div class="result-list">
-    {#each data.results as result (result.task_id)}
-      {@const wt = resolveWorkerType(result.worker)}
-      {@const wm = workerMeta[wt]}
-      {@const sm = statusMap[result.status] || statusMap.completed}
-      <button
-        class="worker-result-item"
-        class:clickable={wt !== 'default'}
-        class:failed={result.status === 'failed'}
-        style="--worker-color: var({wm.colorVar}); --status-color: var({sm.colorVar})"
-        onclick={() => handleWorkerClick(result.worker)}
-      >
-        <div class="item-header">
-          <div class="item-worker">
-            <span class="worker-icon">{wm.icon}</span>
-            <span class="worker-name">{result.worker}</span>
+  {#if isWaiting}
+    <div class="waiting-panel">
+      <div class="waiting-list">
+        {#each workerSlots as worker}
+          {@const wt = resolveWorkerType(worker)}
+          {@const wm = workerMeta[wt]}
+          <div class="waiting-item" style="--worker-color: var({wm.colorVar})">
+            <span class="waiting-dot"></span>
+            <div class="waiting-main">
+              <span class="waiting-name">{workerLabels[wt]}</span>
+              <span class="waiting-status">{i18n.t('waitResultCard.waitingStatus')}</span>
+            </div>
+            <span class="waiting-icon">{wm.icon}</span>
           </div>
-          <span class="item-status" style="color: var({sm.colorVar})">
-            <Icon name={sm.icon} size={12} />
-            <span>{i18n.t(sm.labelKey)}</span>
-          </span>
-        </div>
-        {#if result.summary}
-          <div class="item-summary">{result.summary}</div>
-        {/if}
-        <div class="item-meta">
-          {#if result.modified_files && result.modified_files.length > 0}
-            <span class="meta-tag"><Icon name="file" size={11} />{i18n.t('waitResultCard.fileChangeCount', { count: result.modified_files.length })}</span>
+        {/each}
+      </div>
+      <div class="waiting-hint">{i18n.t('waitResultCard.waitingHint')}</div>
+    </div>
+  {:else}
+    <!-- Worker 结果列表 -->
+    <div class="result-list">
+      {#each data.results as result (result.task_id)}
+        {@const wt = resolveWorkerType(result.worker)}
+        {@const wm = workerMeta[wt]}
+        {@const sm = statusMap[result.status] || statusMap.completed}
+        <button
+          class="worker-result-item"
+          class:clickable={wt !== 'default'}
+          class:failed={result.status === 'failed'}
+          style="--worker-color: var({wm.colorVar}); --status-color: var({sm.colorVar})"
+          onclick={() => handleWorkerClick(result.worker)}
+        >
+          <div class="item-header">
+            <div class="item-worker">
+              <span class="worker-icon">{wm.icon}</span>
+              <span class="worker-name">{result.worker}</span>
+            </div>
+            <span class="item-status" style="color: var({sm.colorVar})">
+              <Icon name={sm.icon} size={12} />
+              <span>{i18n.t(sm.labelKey)}</span>
+            </span>
+          </div>
+          {#if result.summary}
+            <div class="item-summary">{result.summary}</div>
           {/if}
-          {#if result.errors && result.errors.length > 0}
-            <span class="meta-tag error"><Icon name="alert-circle" size={11} />{i18n.t('waitResultCard.errorCount', { count: result.errors.length })}</span>
-          {/if}
-          {#if wt !== 'default'}
-            <span class="jump-hint"><Icon name="chevron-right" size={12} /></span>
-          {/if}
-        </div>
-      </button>
-    {/each}
-  </div>
+          <div class="item-meta">
+            {#if result.modified_files && result.modified_files.length > 0}
+              <span class="meta-tag"><Icon name="file" size={11} />{i18n.t('waitResultCard.fileChangeCount', { count: result.modified_files.length })}</span>
+            {/if}
+            {#if result.errors && result.errors.length > 0}
+              <span class="meta-tag error"><Icon name="alert-circle" size={11} />{i18n.t('waitResultCard.errorCount', { count: result.errors.length })}</span>
+            {/if}
+            {#if wt !== 'default'}
+              <span class="jump-hint"><Icon name="chevron-right" size={12} /></span>
+            {/if}
+          </div>
+        </button>
+      {/each}
+    </div>
+  {/if}
 
   <!-- 超时时的 pending 列表 -->
   {#if data.pending_task_ids && data.pending_task_ids.length > 0}
@@ -193,6 +226,14 @@
     gap: var(--space-3);
   }
 
+  .result-header.waiting {
+    background: color-mix(in srgb, var(--primary) 8%, var(--surface-2));
+  }
+
+  .result-header.waiting .header-left {
+    color: var(--primary);
+  }
+
   .result-header.timeout {
     background: color-mix(in srgb, var(--warning) 10%, var(--surface-2));
   }
@@ -219,12 +260,85 @@
 
   .header-stat { font-weight: 500; color: var(--success); }
   .header-stat.fail { color: var(--error); }
+  .header-stat.waiting { color: var(--primary); }
 
   .header-time {
     display: flex;
     align-items: center;
     gap: 3px;
     color: var(--foreground-muted);
+  }
+
+  /* 等待态面板 */
+  .waiting-panel {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-sm);
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+  }
+
+  .waiting-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .waiting-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--worker-color) 6%, var(--surface-2));
+    border: 1px solid color-mix(in srgb, var(--worker-color) 18%, var(--border));
+  }
+
+  .waiting-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: var(--radius-full);
+    background: var(--worker-color);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--worker-color) 25%, transparent);
+    animation: wait-pulse 1.6s ease-in-out infinite;
+  }
+
+  .waiting-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1;
+  }
+
+  .waiting-name {
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--foreground);
+  }
+
+  .waiting-status {
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+  }
+
+  .waiting-icon {
+    font-size: var(--text-sm);
+    color: var(--foreground-muted);
+  }
+
+  .waiting-hint {
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    padding-left: var(--space-1);
+  }
+
+  @keyframes wait-pulse {
+    0% { opacity: 0.4; transform: scale(0.85); }
+    50% { opacity: 1; transform: scale(1); }
+    100% { opacity: 0.4; transform: scale(0.85); }
   }
 
   /* Worker 结果列表 */
