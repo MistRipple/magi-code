@@ -167,6 +167,7 @@ export function extractNextStepsFromText(content: string): string[] {
   }
 
   const headingPattern = /^(#{1,6}\s*)?(下一步|后续建议|后续步骤|建议下一步|下一步建议|next steps?|follow[- ]?ups?)[:：]?$/i;
+  const repairHeadingPattern = /^(#{1,6}\s*)?(立即)?派发?修复(任务|清单|建议|步骤|行动|计划)?[:：]?$/i;
   const bulletPattern = /^[-*•]\s+(.+)$/;
   const numberedPattern = /^\d+[.)]\s+(.+)$/;
   let inSection = false;
@@ -176,7 +177,7 @@ export function extractNextStepsFromText(content: string): string[] {
     if (line.startsWith('[System]')) {
       continue;
     }
-    if (headingPattern.test(line)) {
+    if (headingPattern.test(line) || repairHeadingPattern.test(line)) {
       inSection = true;
       continue;
     }
@@ -201,7 +202,7 @@ export function extractNextStepsFromText(content: string): string[] {
       if (line.startsWith('[System]')) {
         continue;
       }
-      if (!/下一步|next step|next steps|后续建议|后续步骤/i.test(line)) {
+      if (!/下一步|next step|next steps|后续建议|后续步骤|派发修复任务|修复清单|修复建议|修复步骤/i.test(line)) {
         continue;
       }
       const separatorIndex = line.search(/[:：]/);
@@ -210,6 +211,18 @@ export function extractNextStepsFromText(content: string): string[] {
         if (tail) {
           steps.push(tail);
         }
+      }
+    }
+  }
+
+  if (steps.length === 0) {
+    for (const line of lines) {
+      if (line.startsWith('[System]')) {
+        continue;
+      }
+      if (/派发修复任务|立即修复|修复清单|修复建议|修复步骤/i.test(line)) {
+        steps.push('根据上文缺口列表派发修复任务');
+        break;
       }
     }
   }
