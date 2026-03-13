@@ -1,11 +1,11 @@
 <script lang="ts">
-  import type { Message, MissionPlan, ScrollPositions, Task } from '../types/message';
+  import type { Message, ScrollPositions, Task } from '../types/message';
   import MessageItem from './MessageItem.svelte';
   import Icon from './Icon.svelte';
   import { tick } from 'svelte';
   import { clearMessageJump, getState, messagesState, updatePanelScrollState } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { deriveWorkerActivityState, deriveWorkerPanelState, getMessageRequestId } from '../lib/worker-panel-state';
+  import { deriveWorkerPanelState, getMessageRequestId } from '../lib/worker-panel-state';
   import { ensureArray } from '../lib/utils';
 
   // Props - Svelte 5 语法
@@ -97,21 +97,14 @@
   const pendingRequestIds = $derived.by(() => Array.from(messagesState.pendingRequests));
   const pendingRequestIdSet = $derived.by(() => new Set(pendingRequestIds));
   const tasks = $derived(ensureArray(appState.tasks) as Task[]);
-  const missionPlans = $derived.by(() => Array.from(appState.missionPlan.values()) as MissionPlan[]);
   const workerPanelState = $derived.by(() => deriveWorkerPanelState({
     messages: safeMessages,
     workerName,
     pendingRequestIds,
     tasks,
-    missionPlans,
   }));
-  const workerActivityState = $derived.by(() => deriveWorkerActivityState({
-    messages: safeMessages,
-    workerName,
-    pendingRequestIds,
-    tasks,
-    missionPlans,
-  }));
+  const workerRuntimeMap = $derived(appState.workerRuntime);
+  const workerRuntime = $derived.by(() => (workerName ? workerRuntimeMap[workerName] : null));
 
   const latestRoundAnchorMessage = $derived.by(() => {
     if (displayContext === 'worker') {
@@ -126,21 +119,10 @@
     return null;
   });
 
-  const latestWorkerOutputMessage = $derived.by(() => {
-    if (displayContext !== 'worker') return null;
-    if (!workerName) return null;
-    for (let i = safeMessages.length - 1; i >= 0; i -= 1) {
-      const message = safeMessages[i];
-      if (message.source !== workerName) continue;
-      return message;
-    }
-    return null;
-  });
-
   const latestRoundRequestId = $derived.by(() => getMessageRequestId(latestRoundAnchorMessage || undefined));
   const panelHasPendingRequest = $derived.by(() => {
     if (displayContext === 'worker') {
-      return workerActivityState.hasPendingRequest;
+      return Boolean(workerRuntime?.hasPendingRequest);
     }
     if (!latestRoundRequestId) return false;
     return pendingRequestIdSet.has(latestRoundRequestId);
@@ -151,7 +133,7 @@
   // 关键修复：禁止仅凭“最后一条是 instruction”就判定活跃，避免旧轮次导致多面板同步计时。
   const isExecuting = $derived.by(() => {
     if (displayContext !== 'worker') return false;
-    return workerActivityState.isExecuting;
+    return Boolean(workerRuntime?.isExecuting);
   });
   const streamingIndicatorMessageId = $derived.by(() => {
     if (!hasBottomStreamingMessage || !lastMessage) return null;
@@ -185,13 +167,7 @@
   //   无输出时兜底到最后一条任务指令，便于观测等待时长
   const timerStartTime = $derived.by(() => {
     if (displayContext === 'worker') {
-      if (latestWorkerOutputMessage) {
-        return latestWorkerOutputMessage.timestamp;
-      }
-      if (latestRoundAnchorMessage) {
-        return latestRoundAnchorMessage.timestamp;
-      }
-      return 0;
+      return workerRuntime?.timerStartAt || 0;
     }
 
     // 主对话区：优先按当前请求的最后一条用户消息计时，确保按轮次重置
@@ -211,7 +187,7 @@
   const shouldRunTimer = $derived.by(() => {
     if (timerStartTime <= 0) return false;
     if (displayContext === 'worker') {
-      return isExecuting || hasBottomStreamingMessage;
+      return isExecuting || Boolean(workerRuntime?.hasStreaming);
     }
     return messagesState.isProcessing || hasBottomStreamingMessage;
   });

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Message, PlaceholderState } from '../types/message';
+  import type { Message, PlaceholderState, Task } from '../types/message';
   import type { IconName } from '../lib/icons';
   import MarkdownContent from './MarkdownContent.svelte';
   import WorkerBadge from './WorkerBadge.svelte';
@@ -10,7 +10,8 @@
   import RetryRuntimeIndicator from './RetryRuntimeIndicator.svelte';
   import ErrorDetailPopover from './ErrorDetailPopover.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { retryRuntimeState } from '../stores/messages.svelte';
+  import { getState, retryRuntimeState } from '../stores/messages.svelte';
+  import { ensureArray } from '../lib/utils';
 
   // Props
   interface Props {
@@ -30,6 +31,9 @@
     showStreamingIndicator = true,
     streamingElapsedSeconds = 0,
   }: Props = $props();
+
+  const appState = getState();
+  const tasks = $derived(ensureArray(appState.tasks) as Task[]);
 
   // 派生状态
   const isUser = $derived(message.type === 'user_input');
@@ -111,6 +115,53 @@
 
   // 子任务卡片消息，作为独立消息存在
   const isSubTaskCardOnly = $derived(message.type === 'task_card');
+
+  type CardWorkerStatus = 'pending' | 'running' | 'completed' | 'failed' | 'stopped' | 'skipped';
+
+  const subTaskId = $derived.by(() => {
+    const metaId = typeof message.metadata?.subTaskId === 'string' ? message.metadata?.subTaskId : '';
+    if (metaId) return metaId;
+    const cardId = typeof (message.metadata?.subTaskCard as { id?: unknown } | undefined)?.id === 'string'
+      ? (message.metadata?.subTaskCard as { id: string }).id
+      : '';
+    return cardId || null;
+  });
+
+  const subTaskFromTasks = $derived.by(() => {
+    if (!subTaskId) return null;
+    for (const task of tasks) {
+      const found = (task.subTasks || []).find((st) => st.id === subTaskId);
+      if (found) return found;
+    }
+    return null;
+  });
+
+  function mapSubTaskStatusToCard(status?: string): CardWorkerStatus | undefined {
+    if (!status) return undefined;
+    switch (status) {
+      case 'running':
+        return 'running';
+      case 'in_progress':
+        return 'running';
+      case 'completed':
+        return 'completed';
+      case 'failed':
+        return 'failed';
+      case 'skipped':
+        return 'skipped';
+      case 'cancelled':
+        return 'stopped';
+      case 'blocked':
+      case 'paused':
+      case 'pending':
+        return 'pending';
+      default:
+        return undefined;
+    }
+  }
+
+  const subTaskStatusOverride = $derived.by(() => mapSubTaskStatusToCard(subTaskFromTasks?.status));
+  const subTaskStartedAtOverride = $derived.by(() => subTaskFromTasks?.startedAt);
 
   // 任务说明消息（编排者派发给 Worker）
   const isInstruction = $derived(message.type === 'instruction');
@@ -204,7 +255,13 @@
 <!-- subTaskCard 消息：直接显示卡片，不需要外层包裹 -->
 {:else if isSubTaskCardOnly}
   <div class="message-item subtask-card-only" data-message-id={message.id} data-source={message.source}>
-    <SubTaskSummaryCard card={message.metadata?.subTaskCard as any} {readOnly} messageTimestamp={message.timestamp} />
+    <SubTaskSummaryCard
+      card={message.metadata?.subTaskCard as any}
+      {readOnly}
+      messageTimestamp={message.timestamp}
+      statusOverride={subTaskStatusOverride}
+      startedAtOverride={subTaskStartedAtOverride}
+    />
   </div>
 <!-- WORKER_INSTRUCTION 消息：任务说明卡片 -->
 {:else if isInstruction}

@@ -2430,7 +2430,6 @@ function handleTodoStarted(message: WebviewMessage) {
     ...todo,
     status: 'in_progress',
   }));
-  syncSubTaskStatus(todoId, 'in_progress');
 }
 
 function handleTodoCompleted(message: WebviewMessage) {
@@ -2446,7 +2445,6 @@ function handleTodoCompleted(message: WebviewMessage) {
     ...todo,
     status: 'completed',
   }));
-  syncSubTaskStatus(todoId, 'completed');
 }
 
 function handleTodoFailed(message: WebviewMessage) {
@@ -2462,7 +2460,6 @@ function handleTodoFailed(message: WebviewMessage) {
     ...todo,
     status: 'failed',
   }));
-  syncSubTaskStatus(todoId, 'failed');
 }
 
 function handleDynamicTodoAdded(message: WebviewMessage) {
@@ -2496,24 +2493,6 @@ function handleDynamicTodoAdded(message: WebviewMessage) {
     ...assignment,
     todos: [...assignment.todos, newTodo],
   }));
-  // 同步到 store.tasks：遍历 missionPlan Map 查找包含该 assignmentId 的 plan
-  const planMap = getState().missionPlan;
-  for (const [, plan] of planMap) {
-    if (plan.assignments.some(a => a.id === assignmentId)) {
-      const newSubTask: SubTaskItem = {
-        id: todoId,
-        description: newTodo.content,
-        assignedWorker: todo?.workerId || '',
-        assignmentId,
-        status: (newTodo.status || 'pending') as SubTaskItem['status'],
-        progress: 0,
-        priority: newTodo.priority,
-        targetFiles: [],
-      };
-      syncSubTaskAdd(plan.missionId, newSubTask);
-      break;
-    }
-  }
 }
 
 function handleTodoApprovalRequested(message: WebviewMessage) {
@@ -2667,61 +2646,6 @@ function updateTodo(
     }
     const nextTodos = assignment.todos.map((todo, i) => (i === idx ? updater(todo) : todo));
     return { ...assignment, todos: nextTodos };
-  });
-}
-
-/**
- * 增量同步 store.tasks 中的 subTask 状态
- * 当增量事件到达时，直接更新 tasks 中对应 subTask 的 status，
- * 避免等待下次 stateUpdate 全量同步才更新 UI
- */
-function syncSubTaskStatus(todoId: string, status: SubTaskItem['status']): void {
-  const terminalStatuses: Array<SubTaskItem['status']> = ['completed', 'failed', 'skipped', 'cancelled'];
-  const store = getState();
-  const tasksList = store.tasks;
-  for (let ti = 0; ti < tasksList.length; ti++) {
-    const task = tasksList[ti];
-    const subTasks = task.subTasks;
-    for (let si = 0; si < subTasks.length; si++) {
-      if (subTasks[si].id === todoId) {
-        const currentStatus = subTasks[si].status;
-        if (terminalStatuses.includes(currentStatus) && currentStatus !== status) {
-          console.warn('[MessageHandler] 子任务已终态_忽略回退更新', {
-            todoId,
-            currentStatus,
-            incomingStatus: status,
-          });
-          return;
-        }
-        const updatedSubTasks = subTasks.map((st, idx) =>
-          idx === si ? { ...st, status } : st
-        );
-        const completedCount = updatedSubTasks.filter(
-          st => st.status === 'completed' || st.status === 'skipped'
-        ).length;
-        const progress = updatedSubTasks.length > 0
-          ? Math.round((completedCount / updatedSubTasks.length) * 100)
-          : task.progress;
-        store.tasks = tasksList.map((t, idx) =>
-          idx === ti ? { ...t, subTasks: updatedSubTasks, progress } : t
-        );
-        return;
-      }
-    }
-  }
-}
-
-/**
- * 增量向 store.tasks 添加动态 subTask
- */
-function syncSubTaskAdd(missionId: string, subTask: SubTaskItem): void {
-  const store = getState();
-  store.tasks = store.tasks.map(task => {
-    if (task.missionId !== missionId && task.id !== missionId) return task;
-    // 防重复
-    if (task.subTasks.some(st => st.id === subTask.id)) return task;
-    const updatedSubTasks = [...task.subTasks, subTask];
-    return { ...task, subTasks: updatedSubTasks };
   });
 }
 

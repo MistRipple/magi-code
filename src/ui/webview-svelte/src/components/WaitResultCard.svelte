@@ -1,6 +1,6 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
-  import { setCurrentBottomTab } from '../stores/messages.svelte';
+  import { getState, setCurrentBottomTab } from '../stores/messages.svelte';
   import type { IconName } from '../lib/icons';
   import { i18n } from '../stores/i18n.svelte';
 
@@ -36,6 +36,8 @@
   }
 
   let { data }: Props = $props();
+  const appState = getState();
+  const workerRuntimeMap = $derived(appState.workerRuntime);
 
   // Worker 颜色映射
   type WorkerType = 'claude' | 'codex' | 'gemini' | 'default';
@@ -76,6 +78,13 @@
     gemini: 'Gemini',
     default: 'Worker'
   };
+
+  const runtimeStatusMap = $derived.by(() => ({
+    claude: workerRuntimeMap.claude?.status || 'idle',
+    codex: workerRuntimeMap.codex?.status || 'idle',
+    gemini: workerRuntimeMap.gemini?.status || 'idle',
+    default: 'idle',
+  }));
 
   // 审计等级配色
   const auditColorMap: Record<string, { colorVar: string; icon: IconName; labelKey: string }> = {
@@ -119,8 +128,9 @@
       <div class="waiting-list">
         {#each workerSlots as worker}
           {@const wm = workerMeta[worker]}
-          <div class="waiting-item" style="--worker-color: var({wm.colorVar})">
-            <span class="waiting-dot"></span>
+          {@const runtimeStatus = runtimeStatusMap[worker]}
+          <div class="waiting-item" data-runtime={runtimeStatus} style="--worker-color: var({wm.colorVar})">
+            <span class="waiting-dot" data-runtime={runtimeStatus}></span>
             <div class="waiting-main">
               <span class="waiting-name">{workerLabels[worker]}</span>
               <span class="waiting-status">{i18n.t('waitResultCard.waitingStatus')}</span>
@@ -302,7 +312,25 @@
     border-radius: var(--radius-full);
     background: var(--worker-color);
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--worker-color) 25%, transparent);
+  }
+
+  .waiting-dot[data-runtime="running"] {
     animation: wait-pulse 1.6s ease-in-out infinite;
+  }
+
+  .waiting-dot[data-runtime="completed"] {
+    background: var(--success);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--success) 25%, transparent);
+  }
+
+  .waiting-dot[data-runtime="failed"] {
+    background: var(--error);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--error) 25%, transparent);
+  }
+
+  .waiting-dot[data-runtime="blocked"] {
+    background: var(--warning);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--warning) 25%, transparent);
   }
 
   .waiting-main {

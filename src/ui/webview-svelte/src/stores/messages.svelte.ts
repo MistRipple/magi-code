@@ -30,6 +30,7 @@ import { vscode } from '../lib/vscode-bridge';
 import { ensureArray } from '../lib/utils';
 import { i18n } from './i18n.svelte';
 import { terminalSessions } from './terminal-sessions.svelte';
+import { deriveWorkerRuntimeMap } from '../lib/worker-panel-state';
 
 // ============ 状态定义 ============
 // 🔧 修复：使用对象属性模式确保跨模块响应式正常工作
@@ -169,6 +170,13 @@ function hasInvalidMessageSource(messages: Message[]): boolean {
 // 新增状态：任务、变更、阶段、Toast、模型状态
 let tasks = $state<Task[]>([]);
 let edits = $state<Array<{ filePath: string; snapshotId?: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string; missionId?: string }>>([]);
+
+// 统一 Worker 运行态（唯一权威来源）
+const workerRuntime = $derived.by(() => deriveWorkerRuntimeMap({
+  messagesByWorker: messagesState.agentOutputs,
+  pendingRequestIds: messagesState.pendingRequests,
+  tasks,
+}));
 
 export type ToastCategory = 'incident' | 'audit' | 'feedback';
 export type NotificationCategory = 'incident' | 'audit';
@@ -635,6 +643,8 @@ export function getState() {
     // Worker Session 状态（提案 4.1）
     get workerSessions() { return workerSessions; },
     set workerSessions(v) { workerSessions = v; },
+    // Worker 运行态（统一入口）
+    get workerRuntime() { return workerRuntime; },
   };
 }
 

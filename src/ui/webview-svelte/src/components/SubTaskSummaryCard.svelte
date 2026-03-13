@@ -58,15 +58,17 @@
     card: SummaryCard;
     readOnly?: boolean;
     messageTimestamp?: number;
+    statusOverride?: WorkerStatus;
+    startedAtOverride?: number;
   }
 
-  let { card, readOnly = false, messageTimestamp }: Props = $props();
+  let { card, readOnly = false, messageTimestamp, statusOverride, startedAtOverride }: Props = $props();
 
   // 展开/收起状态
   let isExpanded = $state(false);
 
   // 获取当前状态的徽章配置（默认为 completed）
-  const currentStatus = $derived((card.status || 'completed') as WorkerStatus);
+  const currentStatus = $derived((statusOverride || card.status || 'completed') as WorkerStatus);
   const statusConfig = $derived(statusBadgeMap[currentStatus] || statusBadgeMap.completed);
 
   // 优化 executor 显示：支持更多来源字段，并统一使用中文
@@ -105,7 +107,9 @@
     const status = currentStatus;
     if (status === 'running') {
       if (runningStartAt === null) {
-        const startedAt = typeof card.startedAt === 'number' ? card.startedAt : undefined;
+        const startedAt = typeof startedAtOverride === 'number'
+          ? startedAtOverride
+          : (typeof card.startedAt === 'number' ? card.startedAt : undefined);
         const fallback = typeof messageTimestamp === 'number' ? messageTimestamp : Date.now();
         runningStartAt = startedAt ?? fallback;
       }

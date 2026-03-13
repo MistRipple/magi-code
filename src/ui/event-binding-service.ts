@@ -143,6 +143,7 @@ export class EventBindingService {
         workerId: data.workerId,
         sessionId: this.ctx.getActiveSessionId(),
       });
+      this.ctx.sendStateUpdate();
     });
 
     mo.on('assignmentPlanned', (data) => {
@@ -155,6 +156,7 @@ export class EventBindingService {
         warnings: data.warnings,
         sessionId: this.ctx.getActiveSessionId(),
       });
+      this.ctx.sendStateUpdate();
     });
 
     mo.on('assignmentCompleted', (data) => {
@@ -164,6 +166,7 @@ export class EventBindingService {
         success: data.success,
         sessionId: this.ctx.getActiveSessionId(),
       });
+      this.ctx.sendStateUpdate();
     });
 
     // Worker Session 事件
@@ -196,6 +199,7 @@ export class EventBindingService {
         todoId: data.todoId,
         sessionId: this.ctx.getActiveSessionId(),
       });
+      this.ctx.sendStateUpdate();
     });
 
     mo.on('todoCompleted', (data) => {
@@ -206,6 +210,7 @@ export class EventBindingService {
         output: data.output,
         sessionId: this.ctx.getActiveSessionId(),
       });
+      this.ctx.sendStateUpdate();
     });
 
     mo.on('todoFailed', (data) => {
@@ -216,6 +221,7 @@ export class EventBindingService {
         error: data.error,
         sessionId: this.ctx.getActiveSessionId(),
       });
+      this.ctx.sendStateUpdate();
     });
 
     // 动态 Todo
@@ -232,6 +238,7 @@ export class EventBindingService {
         todo: normalizedTodo,
         sessionId: this.ctx.getActiveSessionId(),
       });
+      this.ctx.sendStateUpdate();
     });
 
     // 审批请求

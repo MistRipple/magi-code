@@ -1,10 +1,8 @@
 <script lang="ts">
-  import type { AgentType, MissionPlan, Task } from '../types/message';
-  import { getState, messagesState } from '../stores/messages.svelte';
+  import type { AgentType } from '../types/message';
+  import { getState } from '../stores/messages.svelte';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { deriveWorkerActivityState } from '../lib/worker-panel-state';
-  import { ensureArray } from '../lib/utils';
 
   interface Props {
     activeTab: 'thread' | 'claude' | 'codex' | 'gemini';
@@ -17,42 +15,13 @@
 
   // 模型连接状态（使用全局统一的 modelStatus）
   const modelStatus = $derived(appState.modelStatus);
-  const tasks = $derived(ensureArray(appState.tasks) as Task[]);
-  const missionPlans = $derived.by(() => Array.from(appState.missionPlan.values()) as MissionPlan[]);
+  const workerRuntimeMap = $derived(appState.workerRuntime);
 
   // 判断模型是否可用（available 或 connected 都表示可用）
   function isModelAvailable(worker: string): boolean {
     const status = modelStatus[worker]?.status;
     return status === 'available' || status === 'connected';
   }
-
-  const pendingRequestIds = $derived.by(() => Array.from(messagesState.pendingRequests));
-  const workerActivityState = $derived.by(() => {
-    const pendingIds = pendingRequestIds;
-    return {
-      claude: deriveWorkerActivityState({
-        messages: messagesState.agentOutputs.claude,
-        workerName: 'claude',
-        pendingRequestIds: pendingIds,
-        tasks,
-        missionPlans,
-      }),
-      codex: deriveWorkerActivityState({
-        messages: messagesState.agentOutputs.codex,
-        workerName: 'codex',
-        pendingRequestIds: pendingIds,
-        tasks,
-        missionPlans,
-      }),
-      gemini: deriveWorkerActivityState({
-        messages: messagesState.agentOutputs.gemini,
-        workerName: 'gemini',
-        pendingRequestIds: pendingIds,
-        tasks,
-        missionPlans,
-      }),
-    };
-  });
 
   // Worker 颜色映射
   const workerColors: Record<string, string> = {
@@ -62,7 +31,7 @@
   };
 
   function isExecuting(worker: AgentType): boolean {
-    return workerActivityState[worker].isExecuting;
+    return workerRuntimeMap[worker]?.isExecuting ?? false;
   }
 </script>
 
@@ -243,4 +212,3 @@
     }
   }
 </style>
-
