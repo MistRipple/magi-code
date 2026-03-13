@@ -4,7 +4,7 @@
   import InstructionCard from './InstructionCard.svelte';
   import { getState, messagesState } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { deriveWorkerPanelState } from '../lib/worker-panel-state';
+  import { deriveWorkerActivityState } from '../lib/worker-panel-state';
   import { ensureArray } from '../lib/utils';
 
   // Props
@@ -27,7 +27,7 @@
   const pendingRequestIds = $derived.by(() => Array.from(messagesState.pendingRequests));
   const tasks = $derived(ensureArray(appState.tasks) as Task[]);
   const missionPlans = $derived.by(() => Array.from(appState.missionPlan.values()) as MissionPlan[]);
-  const workerPanelState = $derived.by(() => deriveWorkerPanelState({
+  const workerActivityState = $derived.by(() => deriveWorkerActivityState({
     messages,
     workerName,
     pendingRequestIds,
@@ -36,10 +36,10 @@
   }));
 
   const activeInstructionMessage = $derived.by(() => {
-    if (!workerPanelState.workerHasCurrentRequestActivity) {
+    if (!workerActivityState.isExecuting) {
       return null;
     }
-    return workerPanelState.latestRunningInstructionMessage || workerPanelState.latestInstructionMessage;
+    return workerActivityState.latestRunningInstructionMessage || workerActivityState.latestInstructionMessage;
   });
 </script>
 

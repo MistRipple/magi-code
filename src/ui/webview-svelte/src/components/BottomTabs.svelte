@@ -3,7 +3,7 @@
   import { getState, messagesState } from '../stores/messages.svelte';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { deriveWorkerPanelState } from '../lib/worker-panel-state';
+  import { deriveWorkerActivityState } from '../lib/worker-panel-state';
   import { ensureArray } from '../lib/utils';
 
   interface Props {
@@ -30,21 +30,21 @@
   const workerActivityState = $derived.by(() => {
     const pendingIds = pendingRequestIds;
     return {
-      claude: deriveWorkerPanelState({
+      claude: deriveWorkerActivityState({
         messages: messagesState.agentOutputs.claude,
         workerName: 'claude',
         pendingRequestIds: pendingIds,
         tasks,
         missionPlans,
       }),
-      codex: deriveWorkerPanelState({
+      codex: deriveWorkerActivityState({
         messages: messagesState.agentOutputs.codex,
         workerName: 'codex',
         pendingRequestIds: pendingIds,
         tasks,
         missionPlans,
       }),
-      gemini: deriveWorkerPanelState({
+      gemini: deriveWorkerActivityState({
         messages: messagesState.agentOutputs.gemini,
         workerName: 'gemini',
         pendingRequestIds: pendingIds,
@@ -62,7 +62,7 @@
   };
 
   function isExecuting(worker: AgentType): boolean {
-    return workerActivityState[worker].workerHasCurrentRequestActivity;
+    return workerActivityState[worker].isExecuting;
   }
 </script>
 

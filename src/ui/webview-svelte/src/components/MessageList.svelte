@@ -5,7 +5,7 @@
   import { tick } from 'svelte';
   import { clearMessageJump, getState, messagesState, updatePanelScrollState } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { deriveWorkerPanelState, getMessageRequestId } from '../lib/worker-panel-state';
+  import { deriveWorkerActivityState, deriveWorkerPanelState, getMessageRequestId } from '../lib/worker-panel-state';
   import { ensureArray } from '../lib/utils';
 
   // Props - Svelte 5 语法
@@ -105,6 +105,13 @@
     tasks,
     missionPlans,
   }));
+  const workerActivityState = $derived.by(() => deriveWorkerActivityState({
+    messages: safeMessages,
+    workerName,
+    pendingRequestIds,
+    tasks,
+    missionPlans,
+  }));
 
   const latestRoundAnchorMessage = $derived.by(() => {
     if (displayContext === 'worker') {
@@ -119,10 +126,21 @@
     return null;
   });
 
+  const latestWorkerOutputMessage = $derived.by(() => {
+    if (displayContext !== 'worker') return null;
+    if (!workerName) return null;
+    for (let i = safeMessages.length - 1; i >= 0; i -= 1) {
+      const message = safeMessages[i];
+      if (message.source !== workerName) continue;
+      return message;
+    }
+    return null;
+  });
+
   const latestRoundRequestId = $derived.by(() => getMessageRequestId(latestRoundAnchorMessage || undefined));
   const panelHasPendingRequest = $derived.by(() => {
     if (displayContext === 'worker') {
-      return workerPanelState.panelHasPendingRequest;
+      return workerActivityState.hasPendingRequest;
     }
     if (!latestRoundRequestId) return false;
     return pendingRequestIdSet.has(latestRoundRequestId);
@@ -131,9 +149,9 @@
   // Worker 面板是否在处理中：
   // 仅当当前面板对应的 Worker 正在被激活处理、或本面板仍有当前请求挂起时，才显示处理指示器并计时。
   // 关键修复：禁止仅凭“最后一条是 instruction”就判定活跃，避免旧轮次导致多面板同步计时。
-  const workerHasCurrentRequestActivity = $derived.by(() => {
+  const isExecuting = $derived.by(() => {
     if (displayContext !== 'worker') return false;
-    return workerPanelState.workerHasCurrentRequestActivity;
+    return workerActivityState.isExecuting;
   });
   const streamingIndicatorMessageId = $derived.by(() => {
     if (!hasBottomStreamingMessage || !lastMessage) return null;
@@ -157,17 +175,19 @@
 
   const showProcessingIndicator = $derived(
     displayContext === 'worker'
-      ? workerHasCurrentRequestActivity && debouncedNoBottomStreaming
+      ? isExecuting && debouncedNoBottomStreaming
       : messagesState.isProcessing && safeMessages.length > 0 && debouncedNoBottomStreaming
   );
 
   // 计时起点：
   // - thread: 从最后一条用户消息的时间戳开始
-  // - worker: 从当前面板的最后一条任务指令开始，实现按轮次独立计时
-  //   只在新任务分配（新 instruction）时重置，不受工具调用轮次影响
+  // - worker: 从最新一条 worker 输出开始，每次新输出重置
+  //   无输出时兜底到最后一条任务指令，便于观测等待时长
   const timerStartTime = $derived.by(() => {
     if (displayContext === 'worker') {
-      // Worker 面板：始终以最后一条任务指令为计时起点
+      if (latestWorkerOutputMessage) {
+        return latestWorkerOutputMessage.timestamp;
+      }
       if (latestRoundAnchorMessage) {
         return latestRoundAnchorMessage.timestamp;
       }
@@ -191,7 +211,7 @@
   const shouldRunTimer = $derived.by(() => {
     if (timerStartTime <= 0) return false;
     if (displayContext === 'worker') {
-      return workerHasCurrentRequestActivity || hasBottomStreamingMessage;
+      return isExecuting || hasBottomStreamingMessage;
     }
     return messagesState.isProcessing || hasBottomStreamingMessage;
   });

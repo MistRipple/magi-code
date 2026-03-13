@@ -23,7 +23,7 @@ import { BaseLLMAdapter, AdapterState } from './base-adapter';
 import { logger, LogCategory } from '../../logging';
 import { t } from '../../i18n';
 import { isModelOriginIssue } from '../../errors/model-origin';
-import { extractNextStepsFromText } from '../../utils/content-parser';
+import { normalizeNextSteps } from '../../utils/content-parser';
 import { isRetryableNetworkError, toErrorMessage, buildStreamRecoveryPrompt, deduplicateResumption } from '../../tools/network-utils';
 import {
   type OrchestratorTerminationReason,
@@ -96,6 +96,97 @@ export interface OrchestratorDecisionTraceEntry {
   };
   note?: string;
   timestamp: number;
+}
+
+type MissionOutcomeStatus = 'running' | 'completed' | 'failed';
+
+interface MissionOutcomeBlock {
+  status?: MissionOutcomeStatus;
+  next_steps?: string[];
+}
+
+const MISSION_OUTCOME_START = '[[MISSION_OUTCOME]]';
+const MISSION_OUTCOME_END = '[[/MISSION_OUTCOME]]';
+
+class MissionOutcomeExtractor {
+  private buffer = '';
+  private inBlock = false;
+  private latestOutcome: MissionOutcomeBlock | undefined;
+
+  consume(chunk: string): { text: string; outcome?: MissionOutcomeBlock } {
+    if (!chunk) {
+      return { text: '', outcome: this.latestOutcome };
+    }
+    this.buffer += chunk;
+    let output = '';
+
+    while (this.buffer.length > 0) {
+      if (!this.inBlock) {
+        const startIndex = this.buffer.indexOf(MISSION_OUTCOME_START);
+        if (startIndex === -1) {
+          const safeLen = Math.max(0, this.buffer.length - (MISSION_OUTCOME_START.length - 1));
+          output += this.buffer.slice(0, safeLen);
+          this.buffer = this.buffer.slice(safeLen);
+          break;
+        }
+        output += this.buffer.slice(0, startIndex);
+        this.buffer = this.buffer.slice(startIndex + MISSION_OUTCOME_START.length);
+        this.inBlock = true;
+        continue;
+      }
+
+      const endIndex = this.buffer.indexOf(MISSION_OUTCOME_END);
+      if (endIndex === -1) {
+        break;
+      }
+      const rawJson = this.buffer.slice(0, endIndex).trim();
+      this.buffer = this.buffer.slice(endIndex + MISSION_OUTCOME_END.length);
+      this.inBlock = false;
+      const parsed = this.parseOutcome(rawJson);
+      if (parsed) {
+        this.latestOutcome = parsed;
+      }
+    }
+
+    return { text: output, outcome: this.latestOutcome };
+  }
+
+  finalize(): { text: string; outcome?: MissionOutcomeBlock } {
+    const text = this.inBlock ? '' : this.buffer;
+    this.buffer = '';
+    this.inBlock = false;
+    return { text, outcome: this.latestOutcome };
+  }
+
+  private parseOutcome(raw: string): MissionOutcomeBlock | undefined {
+    if (!raw) {
+      return undefined;
+    }
+    try {
+      const data = JSON.parse(raw);
+      if (!data || typeof data !== 'object') {
+        return undefined;
+      }
+      const rawStatus = typeof data.status === 'string' ? data.status.toLowerCase() : '';
+      const status = rawStatus === 'running' || rawStatus === 'completed' || rawStatus === 'failed'
+        ? (rawStatus as MissionOutcomeStatus)
+        : undefined;
+      const rawSteps = Array.isArray(data.next_steps)
+        ? data.next_steps
+        : Array.isArray(data.nextSteps)
+          ? data.nextSteps
+          : undefined;
+      const next_steps = rawSteps
+        ? rawSteps.filter((item: unknown) => typeof item === 'string')
+        : undefined;
+      if (!status && (!next_steps || next_steps.length === 0)) {
+        return undefined;
+      }
+      return { status, next_steps };
+    } catch {
+      return undefined;
+    }
+  }
 }
 
 interface OrchestratorTodoSummary {
@@ -808,8 +899,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       let loopRounds = 0;
       let toolFailureRounds = 0;
       let noProgressStreak = 0;
-      let noTodoNoToolContinuationStreak = 0;
-      let noTodoNoToolAmbiguousStreak = 0;
+      let noTodoOutcomeMissingStreak = 0;
       let noTodoToolRoundStreak = 0;
       let repeatedNoTodoToolSignatureStreak = 0;
       let lastNoTodoToolSignature = '';
@@ -826,6 +916,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       let baseline: CriticalPathBaseline | null = null;
       let latestSnapshot: TerminationSnapshot | undefined;
       let lastSnapshot: TerminationSnapshot | null = null;
+      let latestOutcomeSteps: string[] = [];
       let terminationReason: Exclude<OrchestratorTerminationReason, 'unknown'> = 'completed';
       let runtimeShadow: OrchestratorRuntimeState['shadow'];
       const loopStartAt = Date.now();
@@ -871,6 +962,8 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           retryRuntimeHook: visibility === 'system' ? undefined : this.createRetryRuntimeHook(streamId),
         };
 
+        const outcomeExtractor = new MissionOutcomeExtractor();
+        let missionOutcome: MissionOutcomeBlock | undefined;
         let accumulatedText = '';
         let hasStreamedTextDelta = false;
         let toolCalls: ToolCall[] = [];
@@ -879,7 +972,14 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         try {
           const response = await this.client.streamMessage(params, (chunk) => {
             if (chunk.type === 'content_delta' && chunk.content) {
-              const delta = chunk.content;
+              const filtered = outcomeExtractor.consume(chunk.content);
+              if (filtered.outcome) {
+                missionOutcome = filtered.outcome;
+              }
+              const delta = filtered.text;
+              if (!delta) {
+                return;
+              }
               accumulatedText += delta;
               // 续跑去重：缓冲前 200 字符后一次性裁剪重叠
               if (preRecoveryTextLoop && accumulatedText.length <= 200) {
@@ -905,12 +1005,34 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             }
           });
           this.recordTokenUsage(response.usage);
+          const flushed = outcomeExtractor.finalize();
+          if (flushed.outcome) {
+            missionOutcome = flushed.outcome;
+          }
+          if (flushed.text) {
+            accumulatedText += flushed.text;
+            if (hasStreamedTextDelta) {
+              this.normalizer.processTextDelta(streamId, flushed.text);
+            }
+          }
 
           if (response.toolCalls && response.toolCalls.length > 0) {
             toolCalls = response.toolCalls;
           }
 
-          const assistantText = accumulatedText || response.content || '';
+          let assistantText = accumulatedText || response.content || '';
+          if (!accumulatedText && response.content) {
+            const fallbackExtractor = new MissionOutcomeExtractor();
+            const extracted = fallbackExtractor.consume(response.content);
+            const tail = fallbackExtractor.finalize();
+            assistantText = `${extracted.text}${tail.text}`;
+            if (extracted.outcome || tail.outcome) {
+              missionOutcome = extracted.outcome || tail.outcome;
+            }
+          }
+          const normalizedOutcomeSteps = normalizeNextSteps(missionOutcome?.next_steps || []);
+          const outcomeStatus = missionOutcome?.status;
+          latestOutcomeSteps = normalizedOutcomeSteps;
           const isSummaryHijack = isSummaryHijackText(assistantText);
           if (isSummaryHijack) {
             summaryHijackRounds++;
@@ -1042,42 +1164,46 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               noTodoToolRoundStreak = 0;
               repeatedNoTodoToolSignatureStreak = 0;
               lastNoTodoToolSignature = '';
-              const continueIntent = this.shouldContinueWithoutTodos(assistantText);
-              const finalizeIntent = this.shouldFinalizeWithoutTodos(assistantText);
-              // 无 Todo 轨道下，若本轮前已执行过工具（totalToolResultCount > 0），
-              // 不允许“模糊文本”直接 completed，必须显式 final 或继续。
               const hasToolEvidence = totalToolResultCount > 0;
+              const hasOutcomeSignal = normalizedOutcomeSteps.length > 0 || Boolean(outcomeStatus);
+              const runningWithoutSteps = outcomeStatus === 'running' && normalizedOutcomeSteps.length === 0;
 
-              if (continueIntent) {
-                noTodoNoToolContinuationStreak += 1;
-                noTodoNoToolAmbiguousStreak = 0;
-                if (noTodoNoToolContinuationStreak >= 2) {
-                  candidates.push(this.createTerminationCandidate('stalled', 'no_todo_no_tool_continuation_stalled'));
-                }
-              } else if (finalizeIntent || !hasToolEvidence) {
-                noTodoNoToolContinuationStreak = 0;
-                noTodoNoToolAmbiguousStreak = 0;
-                candidates.push(this.createTerminationCandidate('completed', 'no_required_todos'));
-              } else {
-                noTodoNoToolContinuationStreak = 0;
-                noTodoNoToolAmbiguousStreak += 1;
-                if (noTodoNoToolAmbiguousStreak >= 3) {
-                  candidates.push(this.createTerminationCandidate('stalled', 'no_todo_no_tool_ambiguous_stalled'));
+              if (hasToolEvidence || runningWithoutSteps) {
+                noTodoOutcomeMissingStreak = 0;
+                history.push({
+                  role: 'user',
+                  content: this.buildContinuePrompt(progressState.snapshot),
+                });
+                this.normalizer.endStream(streamId);
+                round++;
+                continue;
+              }
+
+              if (!hasOutcomeSignal) {
+                noTodoOutcomeMissingStreak += 1;
+                if (noTodoOutcomeMissingStreak >= 2) {
+                  candidates.push(this.createTerminationCandidate('stalled', 'no_outcome_block'));
                 } else {
                   history.push({
                     role: 'user',
-                    content: this.buildNoTodoAmbiguousPrompt(noTodoNoToolAmbiguousStreak),
+                    content: this.buildOutcomeBlockRequestPrompt(),
                   });
                   this.normalizer.endStream(streamId);
                   round++;
                   continue;
                 }
+              } else {
+                noTodoOutcomeMissingStreak = 0;
+                if (outcomeStatus === 'failed') {
+                  candidates.push(this.createTerminationCandidate('failed', 'no_required_todos_failed'));
+                } else {
+                  candidates.push(this.createTerminationCandidate('completed', 'no_required_todos'));
+                }
               }
             } else if (progressState.snapshot.requiredTotal > 0
               && progressState.snapshot.progressVector.terminalRequiredTodos >= progressState.snapshot.requiredTotal
               && progressState.snapshot.runningOrPendingRequired === 0) {
-              noTodoNoToolContinuationStreak = 0;
-              noTodoNoToolAmbiguousStreak = 0;
+              noTodoOutcomeMissingStreak = 0;
               if (progressState.snapshot.failedRequired > 0) {
                 candidates.push(this.createTerminationCandidate('failed', 'required_todos_failed'));
               } else {
@@ -1126,16 +1252,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               finalText = assistantText.trim() ? assistantText : (finalText || lastNonEmptyAssistantText);
               this.normalizer.endStream(streamId);
               break;
-            }
-
-            if (progressState.snapshot.requiredTotal === 0 && this.shouldContinueWithoutTodos(assistantText)) {
-              history.push({
-                role: 'user',
-                content: this.buildNoTodoContinuePrompt(),
-              });
-              this.normalizer.endStream(streamId);
-              round++;
-              continue;
             }
 
             history.push({
@@ -1210,8 +1326,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           } else {
             noProgressStreak += 1;
           }
-          noTodoNoToolContinuationStreak = 0;
-          noTodoNoToolAmbiguousStreak = 0;
+          noTodoOutcomeMissingStreak = 0;
           lastSnapshot = progressState.snapshot;
           ({
             budgetBreachStreak,
@@ -1429,14 +1544,13 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         }));
       }
 
-      const finalNextSteps = extractNextStepsFromText(finalText);
       this.lastRuntimeState = {
         reason: terminationReason,
         rounds: loopRounds,
         snapshot: latestSnapshot,
         shadow: runtimeShadow,
         decisionTrace,
-        nextSteps: finalNextSteps,
+        nextSteps: latestOutcomeSteps,
       };
       return finalText || '任务已中断';
     } catch (error: any) {
@@ -1628,19 +1742,13 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     ].join('\n');
   }
 
-  private shouldContinueWithoutTodos(assistantText: string): boolean {
-    const text = assistantText.trim();
-    if (!text) {
-      return false;
-    }
-    return /继续|下一轮|接下来|再发起|再进行|继续执行|继续测试|next round|next step|continue|proceed|let me continue|i(?:'| )ll continue/i.test(text);
-  }
-
-  private buildNoTodoContinuePrompt(): string {
+  private buildOutcomeBlockRequestPrompt(): string {
     return [
-      '[System] 你明确表示将继续下一轮，请直接继续执行工具调用与分析。',
-      '- 若已完成全部工作，请给出最终结论并停止继续调用工具。',
-      '- 若未完成，请继续调用必要工具，不要提前结束。',
+      '[System] 为保证续航与终止判定一致性，请在输出末尾追加控制块：',
+      MISSION_OUTCOME_START,
+      '{"status":"running|completed|failed","next_steps":["..."]}',
+      MISSION_OUTCOME_END,
+      '- 仅输出 JSON，不要额外解释。',
     ].join('\n');
   }
 
@@ -1660,27 +1768,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     }
     // 纯文本中断：使用尾部锚定提示词
     return buildStreamRecoveryPrompt(t, accumulatedText, recoveryAttempt, maxRecoveryAttempts);
-  }
-
-  private shouldFinalizeWithoutTodos(assistantText: string): boolean {
-    const text = assistantText.trim();
-    if (!text) {
-      return false;
-    }
-    // “Round/阶段进行中”语义优先判为未收尾，避免工具后首个无工具轮被提前 completed。
-    if (/round\s*\d+|第\s*\d+\s*轮|阶段\s*\d+/i.test(text)) {
-      return false;
-    }
-    return /最终|结论|总结|完成情况|交付状态|结案|结果如下|overall|final answer|in conclusion|summary|completed/i.test(text);
-  }
-
-  private buildNoTodoAmbiguousPrompt(streak: number): string {
-    return [
-      `[System] 你已在无 Todo 轨道下给出第 ${streak} 次模糊结论。请明确二选一：`,
-      '1) 若已完成，请输出“最终结论”并给出关键证据；',
-      '2) 若未完成，请继续调用必要工具，或先建立 required todo 轨道。',
-      '- 不要输出中间态模板文本。',
-    ].join('\n');
   }
 
   private buildToolRoundSignature(toolCalls: ToolCall[]): string {

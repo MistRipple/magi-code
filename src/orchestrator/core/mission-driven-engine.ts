@@ -2285,7 +2285,9 @@ export class MissionDrivenEngine extends EventEmitter {
             continue;
           }
 
-          const followUpSteps = this.resolveFollowUpSteps(response.orchestratorRuntime?.nextSteps);
+          const resolvedFollowUpSteps = this.resolveFollowUpSteps(response.orchestratorRuntime?.nextSteps);
+          const { actionable: followUpSteps, blocked: blockedFollowUpSteps } = this.classifyFollowUpSteps(resolvedFollowUpSteps);
+          const blockedFollowUpOnly = followUpSteps.length === 0 && blockedFollowUpSteps.length > 0;
           const pendingRequiredTodos = this.extractPendingRequiredCount(orchestratorRuntimeSnapshot);
           const followUpSignature = [
             `pending:${pendingRequiredTodos}`,
@@ -2298,18 +2300,30 @@ export class MissionDrivenEngine extends EventEmitter {
             lastFollowUpProgressSignature = followUpProgressSignature;
             followUpStallStreak = 0;
           }
+          if (blockedFollowUpOnly) {
+            const blockedNotice = this.buildFollowUpBlockedNotice(blockedFollowUpSteps);
+            finalContent = finalContent.trim()
+              ? `${finalContent}\n\n${blockedNotice}`
+              : blockedNotice;
+            this.messageHub.result(blockedNotice, {
+              metadata: { phase: 'system_section', extra: { type: 'follow_up_blocked' } },
+            });
+          }
+
           const shouldAutoFollowUp = (followUpSteps.length > 0 || pendingRequiredTodos > 0)
             && currentPlanMode === 'deep'
             && this.interactionMode === 'auto'
             && followUpSignature !== lastFollowUpSignature
             && followUpStallStreak < 2
-            && !isGovernancePaused;
+            && !isGovernancePaused
+            && !blockedFollowUpOnly;
 
           if (!shouldAutoFollowUp
             && currentPlanMode === 'deep'
             && this.interactionMode === 'ask'
             && (followUpSteps.length > 0 || pendingRequiredTodos > 0)
-            && !isGovernancePaused) {
+            && !isGovernancePaused
+            && !blockedFollowUpOnly) {
             const followUpNote = followUpSteps.length > 0
               ? '[System] 当前为 ask 模式，检测到下一步建议。请确认是否继续执行。'
               : '[System] 当前为 ask 模式，仍有未完成必需 Todo。请确认是否继续执行。';
@@ -2978,6 +2992,46 @@ export class MissionDrivenEngine extends EventEmitter {
       return [];
     }
     return normalizeNextSteps(runtimeSteps);
+  }
+
+  private classifyFollowUpSteps(steps: string[]): { actionable: string[]; blocked: string[] } {
+    const actionable: string[] = [];
+    const blocked: string[] = [];
+    for (const step of steps) {
+      if (this.isBlockedFollowUpStep(step)) {
+        blocked.push(step);
+      } else {
+        actionable.push(step);
+      }
+    }
+    return { actionable, blocked };
+  }
+
+  private isBlockedFollowUpStep(step: string): boolean {
+    const text = step.trim();
+    if (!text) {
+      return false;
+    }
+    const lower = text.toLowerCase();
+    const patterns: RegExp[] = [
+      /(系统|平台|策略).*(拦截|阻断|拒绝)/,
+      /(已被|被).*(拦截|阻止|拒绝)/,
+      /(无法|不能|未能|无法确认|无法获取|无法判断).*(输出|结果|日志|命令|编译|测试|诊断|tsc)/,
+      /(无输出|暂无输出)/,
+      /(需要|请).*(用户|你|人工).*(提供|授权|允许|确认)/,
+      /(需要|请).*(授权|权限|许可)/,
+      /重复.*(阻止|拦截|拒绝)/,
+      /command rejected|tool blocked|permission denied|unauthorized|forbidden|access denied|no output/i,
+    ];
+    if (patterns.some((pattern) => pattern.test(text) || pattern.test(lower))) {
+      return true;
+    }
+    return false;
+  }
+
+  private buildFollowUpBlockedNotice(blocked: string[]): string {
+    const items = blocked.map(item => `- ${item}`).join('\n');
+    return t('engine.followUp.blockedNotice', { items });
   }
 
   private buildAutoFollowUpPrompt(input: {

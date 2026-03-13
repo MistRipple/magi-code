@@ -204,7 +204,7 @@
 <!-- subTaskCard 消息：直接显示卡片，不需要外层包裹 -->
 {:else if isSubTaskCardOnly}
   <div class="message-item subtask-card-only" data-message-id={message.id} data-source={message.source}>
-    <SubTaskSummaryCard card={message.metadata?.subTaskCard as any} {readOnly} />
+    <SubTaskSummaryCard card={message.metadata?.subTaskCard as any} {readOnly} messageTimestamp={message.timestamp} />
   </div>
 <!-- WORKER_INSTRUCTION 消息：任务说明卡片 -->
 {:else if isInstruction}

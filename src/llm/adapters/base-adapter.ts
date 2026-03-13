@@ -261,6 +261,9 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     if (status === 'error' || status === 'timeout' || status === 'killed') {
       return true;
     }
+    if (status === 'blocked' || status === 'rejected') {
+      return true;
+    }
     return Boolean(result.isError);
   }
 

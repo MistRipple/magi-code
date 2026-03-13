@@ -1,6 +1,7 @@
 <script lang="ts">
   import { setCurrentBottomTab } from '../stores/messages.svelte';
   import Icon from './Icon.svelte';
+  import { formatDuration } from '../lib/utils';
   import type { IconName } from '../lib/icons';
   import { i18n } from '../stores/i18n.svelte';
 
@@ -14,7 +15,8 @@
     executor?: string;
     agent?: string;
     worker?: string;
-    duration?: string;
+    duration?: number | string;
+    startedAt?: number;
     changes?: string[];
     verification?: string[];
     error?: string;
@@ -55,9 +57,10 @@
   interface Props {
     card: SummaryCard;
     readOnly?: boolean;
+    messageTimestamp?: number;
   }
 
-  let { card, readOnly = false }: Props = $props();
+  let { card, readOnly = false, messageTimestamp }: Props = $props();
 
   // 展开/收起状态
   let isExpanded = $state(false);
@@ -93,6 +96,53 @@
 
   const workerType = $derived(getWorkerType(executor));
   const workerConfig = $derived(workerColorMap[workerType]);
+
+  let runningStartAt = $state<number | null>(null);
+  let runningElapsedMs = $state(0);
+  let runningTimer: ReturnType<typeof setInterval> | null = null;
+
+  $effect(() => {
+    const status = currentStatus;
+    if (status === 'running') {
+      if (runningStartAt === null) {
+        const startedAt = typeof card.startedAt === 'number' ? card.startedAt : undefined;
+        const fallback = typeof messageTimestamp === 'number' ? messageTimestamp : Date.now();
+        runningStartAt = startedAt ?? fallback;
+      }
+    } else {
+      runningStartAt = null;
+    }
+  });
+
+  $effect(() => {
+    if (currentStatus === 'running' && runningStartAt) {
+      runningElapsedMs = Math.max(0, Date.now() - runningStartAt);
+      runningTimer = setInterval(() => {
+        runningElapsedMs = Math.max(0, Date.now() - runningStartAt);
+      }, 1000);
+    } else {
+      runningElapsedMs = 0;
+    }
+    return () => {
+      if (runningTimer) {
+        clearInterval(runningTimer);
+        runningTimer = null;
+      }
+    };
+  });
+
+  const displayDuration = $derived.by(() => {
+    if (currentStatus === 'running' && runningStartAt) {
+      return formatDuration(runningElapsedMs);
+    }
+    if (typeof card.duration === 'number') {
+      return formatDuration(card.duration);
+    }
+    if (typeof card.duration === 'string' && card.duration.trim().length > 0) {
+      return card.duration;
+    }
+    return '';
+  });
 
   // 点击跳转到对应的 worker tab
   function handleCardClick(e: MouseEvent) {
@@ -153,8 +203,8 @@
       {/if}
     </div>
     <div class="card-meta">
-      {#if card.duration}
-        <span class="duration">{card.duration}</span>
+      {#if displayDuration}
+        <span class="duration">{displayDuration}</span>
       {/if}
       <!-- 状态徽章：图标 + 文字 -->
       <span

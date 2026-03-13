@@ -69,7 +69,7 @@
   const failCount = $derived(data.results.filter(r => r.status === 'failed').length);
   const waitedSeconds = $derived((data.waited_ms / 1000).toFixed(1));
 
-  const workerSlots = ['claude', 'codex', 'gemini'] as const;
+  const workerSlots = (Object.keys(workerMeta) as WorkerType[]).filter(k => k !== 'default');
   const workerLabels: Record<WorkerType, string> = {
     claude: 'Claude',
     codex: 'Codex',
@@ -118,12 +118,11 @@
     <div class="waiting-panel">
       <div class="waiting-list">
         {#each workerSlots as worker}
-          {@const wt = resolveWorkerType(worker)}
-          {@const wm = workerMeta[wt]}
+          {@const wm = workerMeta[worker]}
           <div class="waiting-item" style="--worker-color: var({wm.colorVar})">
             <span class="waiting-dot"></span>
             <div class="waiting-main">
-              <span class="waiting-name">{workerLabels[wt]}</span>
+              <span class="waiting-name">{workerLabels[worker]}</span>
               <span class="waiting-status">{i18n.t('waitResultCard.waitingStatus')}</span>
             </div>
             <span class="waiting-icon">{wm.icon}</span>

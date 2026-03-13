@@ -323,6 +323,19 @@ wait_for_workers()  → final results, summarize for the user
 - Simple tasks that a single dispatch_task can handle
 - Multiple fully independent dispatch_task calls that don't require result-based follow-up decisions`);
 
+  // 续航/终止控制块（唯一权威信号）
+  sections.push(`## Mission Outcome Control Block (Required)
+At the end of every response, append a control block in the exact format below (no code fences):
+
+[[MISSION_OUTCOME]]
+{"status":"running|completed|failed","next_steps":["..."]}
+[[/MISSION_OUTCOME]]
+
+Rules:
+- The JSON must be valid and contain \`status\` and \`next_steps\` (use an empty array if none).
+- Use \`status = completed\` only when you are truly done with the current round.
+- Do not wrap the block in Markdown fences or mention it in natural language output.`);
+
   // 项目上下文
   if (projectContext) {
     sections.push(`## Project Context\n${projectContext}`);

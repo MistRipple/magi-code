@@ -150,7 +150,6 @@
   const hasInput = $derived(!!input && !!formatContent(input));
   const hasOutput = $derived(!!output && !!formatContent(output));
   const hasError = $derived(!!error && !!error.trim());
-  const hasContent = $derived(hasInput || hasOutput || hasError);
 
   // 检查是否为 Mermaid 工具输出
   const isMermaidTool = $derived(name === 'mermaid_diagram');
@@ -172,26 +171,44 @@
   });
 
   // 检查是否为 wait_for_workers 工具输出
+  type WaitResultData = {
+    results: Array<{ task_id: string; worker: string; status: 'completed' | 'failed' | 'skipped' | 'cancelled'; summary: string; modified_files: string[]; errors?: string[] }>;
+    wait_status: 'completed' | 'timeout';
+    timed_out: boolean;
+    pending_task_ids: string[];
+    waited_ms: number;
+    audit?: any;
+  };
+
   const isWaitForWorkersTool = $derived(name === 'wait_for_workers');
-  const waitResultData = $derived.by(() => {
-    if (!isWaitForWorkersTool || !output) return null;
+  const isWaitForWorkersRunning = $derived(isWaitForWorkersTool && (status === 'running' || status === 'pending'));
+  const waitResultData = $derived.by((): WaitResultData | null => {
+    if (!isWaitForWorkersTool) return null;
+    if (!output) {
+      if (isWaitForWorkersRunning) {
+        return {
+          results: [],
+          wait_status: 'timeout',
+          timed_out: false,
+          pending_task_ids: [],
+          waited_ms: typeof duration === 'number' ? duration : 0,
+        };
+      }
+      return null;
+    }
     try {
       const data = typeof output === 'string' ? JSON.parse(output) : output;
       if (data && Array.isArray(data.results) && typeof data.wait_status === 'string') {
-        return data as {
-          results: Array<{ task_id: string; worker: string; status: 'completed' | 'failed' | 'skipped' | 'cancelled'; summary: string; modified_files: string[]; errors?: string[] }>;
-          wait_status: 'completed' | 'timeout';
-          timed_out: boolean;
-          pending_task_ids: string[];
-          waited_ms: number;
-          audit?: any;
-        };
+        return data as WaitResultData;
       }
     } catch {
       // 解析失败时回退到原始展示
     }
     return null;
   });
+
+  const hasWaitResult = $derived(!!waitResultData);
+  const hasContent = $derived(hasInput || hasOutput || hasError || hasWaitResult);
 
   // 获取工具显示名
   function getToolDisplayName(toolName: string): string {
@@ -506,7 +523,7 @@
             </div>
           {/if}
 
-          {#if hasOutput}
+          {#if hasOutput || hasWaitResult}
             <div class="tool-section">
               {#if isMermaidTool && mermaidData}
                 <MermaidRenderer

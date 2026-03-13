@@ -10,6 +10,14 @@ export interface WorkerPanelState {
   workerHasCurrentRequestActivity: boolean;
 }
 
+export interface WorkerActivityState {
+  latestInstructionMessage: Message | null;
+  latestRunningInstructionMessage: Message | null;
+  hasPendingRequest: boolean;
+  hasStreaming: boolean;
+  isExecuting: boolean;
+}
+
 interface DeriveWorkerPanelStateParams {
   messages: Message[];
   workerName?: AgentType;
@@ -51,7 +59,7 @@ function findLatestRunningInstructionMessage(messages: Message[], workerName?: A
   return null;
 }
 
-function hasWorkerAssignments(missionPlans: Iterable<MissionPlan>, workerName?: AgentType): boolean {
+function hasWorkerPlanAssignments(missionPlans: Iterable<MissionPlan>, workerName?: AgentType): boolean {
   if (!workerName) return false;
   for (const plan of missionPlans) {
     for (const assignment of plan.assignments || []) {
@@ -61,6 +69,15 @@ function hasWorkerAssignments(missionPlans: Iterable<MissionPlan>, workerName?: 
     }
   }
   return false;
+}
+
+function hasWorkerTaskAssignments(tasks: Task[], workerName?: AgentType): boolean {
+  if (!workerName) return false;
+  return tasks.some((task) =>
+    (task.subTasks || []).some((subTask) =>
+      normalizeWorkerName(subTask.assignedWorker) === workerName
+    )
+  );
 }
 
 function hasWorkerMissionActivity(missionPlans: Iterable<MissionPlan>, workerName?: AgentType): boolean {
@@ -126,10 +143,12 @@ export function deriveWorkerPanelState({
   const lastMessage = safeMessages.length > 0 ? safeMessages[safeMessages.length - 1] : null;
   const hasBottomStreamingMessage = Boolean(lastMessage?.isStreaming);
   const missionPlanList = Array.from(missionPlans || []);
-  const workerHasPlanAssignments = hasWorkerAssignments(missionPlanList, workerName);
-  const workerHasTaskExecution = workerHasPlanAssignments
-    ? hasWorkerMissionActivity(missionPlanList, workerName)
-    : hasWorkerTaskActivity(tasks, workerName);
+  // 以 TaskView 为单一真实来源，missionPlan 仅作为任务尚未落地时的兜底
+  const workerHasTaskAssignments = hasWorkerTaskAssignments(tasks, workerName);
+  const workerHasPlanAssignments = hasWorkerPlanAssignments(missionPlanList, workerName);
+  const workerHasTaskExecution = workerHasTaskAssignments
+    ? hasWorkerTaskActivity(tasks, workerName)
+    : (workerHasPlanAssignments ? hasWorkerMissionActivity(missionPlanList, workerName) : false);
   const workerHasCurrentRequestActivity = hasBottomStreamingMessage
     || Boolean(latestRunningInstructionMessage)
     || workerHasTaskExecution;
@@ -142,5 +161,16 @@ export function deriveWorkerPanelState({
     panelHasPendingRequest,
     hasBottomStreamingMessage,
     workerHasCurrentRequestActivity,
+  };
+}
+
+export function deriveWorkerActivityState(params: DeriveWorkerPanelStateParams): WorkerActivityState {
+  const panelState = deriveWorkerPanelState(params);
+  return {
+    latestInstructionMessage: panelState.latestInstructionMessage,
+    latestRunningInstructionMessage: panelState.latestRunningInstructionMessage,
+    hasPendingRequest: panelState.panelHasPendingRequest,
+    hasStreaming: panelState.hasBottomStreamingMessage,
+    isExecuting: panelState.workerHasCurrentRequestActivity,
   };
 }
