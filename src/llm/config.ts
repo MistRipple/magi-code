@@ -100,6 +100,7 @@ export class LLMConfigLoader {
         provider: 'anthropic',
         enabled: true,
         enableThinking: false,
+        openaiProtocol: 'responses',
       },
       workers: {
         claude: {
@@ -109,6 +110,7 @@ export class LLMConfigLoader {
           provider: 'anthropic',
           enabled: true,
           enableThinking: false,
+          openaiProtocol: 'responses',
         },
         codex: {
           baseUrl: 'https://api.openai.com/v1',
@@ -117,6 +119,7 @@ export class LLMConfigLoader {
           provider: 'openai',
           enabled: true,
           enableThinking: false,
+          openaiProtocol: 'responses',
         },
         gemini: {
           baseUrl: 'https://api.openai.com/v1',
@@ -125,6 +128,7 @@ export class LLMConfigLoader {
           provider: 'openai',
           enabled: true,
           enableThinking: false,
+          openaiProtocol: 'responses',
         },
       },
       auxiliary: {
@@ -133,6 +137,7 @@ export class LLMConfigLoader {
         apiKey: process.env.ANTHROPIC_API_KEY || '',
         model: 'claude-3-haiku-20240307',
         provider: 'anthropic',
+        openaiProtocol: 'responses',
       },
       userRules: {
         enabled: true,
@@ -154,6 +159,7 @@ export class LLMConfigLoader {
       apiKey: this.normalizeString(orchestratorConfig.apiKey, defaults.apiKey),
       model: this.normalizeString(orchestratorConfig.model, defaults.model),
       provider: this.normalizeString(orchestratorConfig.provider, defaults.provider) as LLMProvider,
+      openaiProtocol: this.normalizeOpenAIProtocol(orchestratorConfig.openaiProtocol, defaults.openaiProtocol),
       enabled: true,
       enableThinking: orchestratorConfig.enableThinking ?? defaults.enableThinking,
       reasoningEffort: this.normalizeReasoningEffort(orchestratorConfig.reasoningEffort, defaultReasoningEffort),
@@ -188,6 +194,7 @@ export class LLMConfigLoader {
       apiKey: this.normalizeString(workerConfig.apiKey, defaults.apiKey),
       model: this.normalizeString(workerConfig.model, defaults.model),
       provider: this.normalizeString(workerConfig.provider, defaults.provider) as LLMProvider,
+      openaiProtocol: this.normalizeOpenAIProtocol(workerConfig.openaiProtocol, defaults.openaiProtocol),
       enabled: workerConfig.enabled !== false,
       enableThinking: workerConfig.enableThinking ?? defaults.enableThinking,
       reasoningEffort: this.normalizeReasoningEffort(workerConfig.reasoningEffort, defaultReasoningEffort),
@@ -212,6 +219,20 @@ export class LLMConfigLoader {
     const normalized = value.trim().toLowerCase();
     if (this.VALID_REASONING_EFFORTS.has(normalized)) {
       return normalized as 'low' | 'medium' | 'high' | 'xhigh';
+    }
+    return fallback;
+  }
+
+  private static normalizeOpenAIProtocol(
+    value: unknown,
+    fallback: 'responses' | 'chat' = 'responses',
+  ): 'responses' | 'chat' {
+    if (typeof value !== 'string') {
+      return fallback;
+    }
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'responses' || normalized === 'chat') {
+      return normalized;
     }
     return fallback;
   }
@@ -335,6 +356,7 @@ export class LLMConfigLoader {
       apiKey: config.apiKey,
       model: config.model,
       provider: config.provider,
+      openaiProtocol: config.openaiProtocol,
       enabled: config.enabled !== false,
       enableThinking: config.enableThinking === true,
       ...(config.reasoningEffort ? { reasoningEffort: this.normalizeReasoningEffort(config.reasoningEffort, 'medium') } : {}),
@@ -355,6 +377,7 @@ export class LLMConfigLoader {
       apiKey: config.apiKey,
       model: config.model,
       provider: config.provider,
+      openaiProtocol: config.openaiProtocol,
       enabled: true,
       enableThinking: config.enableThinking === true,
       ...(config.reasoningEffort ? { reasoningEffort: this.normalizeReasoningEffort(config.reasoningEffort, 'medium') } : {}),
@@ -376,6 +399,7 @@ export class LLMConfigLoader {
       apiKey: config.apiKey,
       model: config.model,
       provider: config.provider,
+      openaiProtocol: config.openaiProtocol,
     };
 
     this.saveFullConfig(fullConfig);
@@ -397,6 +421,7 @@ export class LLMConfigLoader {
       apiKey: auxiliaryConfig.apiKey || defaults.apiKey,
       model: auxiliaryConfig.model || defaults.model,
       provider: auxiliaryConfig.provider || defaults.provider,
+      openaiProtocol: this.normalizeOpenAIProtocol(auxiliaryConfig.openaiProtocol, defaults.openaiProtocol),
     };
   }
 

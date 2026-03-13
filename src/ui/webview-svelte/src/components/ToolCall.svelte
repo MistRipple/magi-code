@@ -3,7 +3,6 @@
   import Icon from './Icon.svelte';
   import FileSpan from './FileSpan.svelte';
   import MermaidRenderer from './MermaidRenderer.svelte';
-  import WaitResultCard from './WaitResultCard.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
   import { vscode } from '../lib/vscode-bridge';
   import { extractLeadingJson } from '../lib/terminal-utils';
@@ -47,8 +46,8 @@
     onOpenFile
   }: Props = $props();
 
-  // 折叠状态 - Mermaid / wait_for_workers 卡片默认展开，其他由 initialExpanded 控制
-  let collapsed = $state(untrack(() => !initialExpanded && status !== 'error' && name !== 'mermaid_diagram' && name !== 'wait_for_workers'));
+  // 折叠状态 - Mermaid 卡片默认展开，其他由 initialExpanded 控制
+  let collapsed = $state(untrack(() => !initialExpanded && status !== 'error' && name !== 'mermaid_diagram'));
   let copySuccess = $state(false);
 
   // 格式化内容
@@ -147,8 +146,8 @@
   const isHeaderOpenableTool = $derived(name === 'file_view' || name === 'view');
 
   // 检查是否有内容
-  const hasInput = $derived(!!input && !!formatContent(input));
-  const hasOutput = $derived(!!output && !!formatContent(output));
+  const hasInput = $derived(!!input && !!formatContent(input) && name !== 'wait_for_workers');
+  const hasOutput = $derived(!!output && !!formatContent(output) && name !== 'wait_for_workers');
   const hasError = $derived(!!error && !!error.trim());
 
   // 检查是否为 Mermaid 工具输出
@@ -170,45 +169,15 @@
     return null;
   });
 
-  // 检查是否为 wait_for_workers 工具输出
-  type WaitResultData = {
-    results: Array<{ task_id: string; worker: string; status: 'completed' | 'failed' | 'skipped' | 'cancelled'; summary: string; modified_files: string[]; errors?: string[] }>;
-    wait_status: 'completed' | 'timeout';
-    timed_out: boolean;
-    pending_task_ids: string[];
-    waited_ms: number;
-    audit?: any;
-  };
-
   const isWaitForWorkersTool = $derived(name === 'wait_for_workers');
-  const isWaitForWorkersRunning = $derived(isWaitForWorkersTool && (status === 'running' || status === 'pending'));
-  const waitResultData = $derived.by((): WaitResultData | null => {
-    if (!isWaitForWorkersTool) return null;
-    if (!output) {
-      if (isWaitForWorkersRunning) {
-        return {
-          results: [],
-          wait_status: 'timeout',
-          timed_out: false,
-          pending_task_ids: [],
-          waited_ms: typeof duration === 'number' ? duration : 0,
-        };
-      }
-      return null;
-    }
-    try {
-      const data = typeof output === 'string' ? JSON.parse(output) : output;
-      if (data && Array.isArray(data.results) && typeof data.wait_status === 'string') {
-        return data as WaitResultData;
-      }
-    } catch {
-      // 解析失败时回退到原始展示
-    }
-    return null;
+  const hasContent = $derived(hasInput || hasOutput || hasError);
+  const shouldCompactWaitForWorkers = $derived(isWaitForWorkersTool && !hasContent);
+  const waitForWorkersStatusLabel = $derived.by(() => {
+    if (!isWaitForWorkersTool) return '';
+    if (status === 'running' || status === 'pending') return i18n.t('toolCall.waitForWorkersRunning');
+    if (status === 'success') return i18n.t('toolCall.waitForWorkersCompleted');
+    return '';
   });
-
-  const hasWaitResult = $derived(!!waitResultData);
-  const hasContent = $derived(hasInput || hasOutput || hasError || hasWaitResult);
 
   // 获取工具显示名
   function getToolDisplayName(toolName: string): string {
@@ -459,6 +428,8 @@
       <FileSpan filepath={toolFilepath} showIcon={false} clickable={true} onClick={handleOpenFile} />
     {:else if toolSummary}
       <span class="tool-summary" title={toolSummary}>{toolSummary}</span>
+    {:else if waitForWorkersStatusLabel}
+      <span class="tool-summary" title={waitForWorkersStatusLabel}>{waitForWorkersStatusLabel}</span>
     {/if}
   </span>
 
@@ -475,8 +446,8 @@
   <!-- 文件变更工具完成：由 FileChangeCard 全权展示 -->
 {:else}
   {@const isCompactMutation = isFileMutationTool && (status === 'running' || status === 'pending')}
-  {@const isExpandable = hasContent && !isCompactReadOnlyTool && !isCompactMutation}
-  {#if isExpandable || isCompactReadOnlyTool || isCompactMutation}
+  {@const isExpandable = hasContent && !isCompactReadOnlyTool && !isCompactMutation && !shouldCompactWaitForWorkers}
+  {#if isExpandable || isCompactReadOnlyTool || isCompactMutation || shouldCompactWaitForWorkers}
     <div
       class="tool-call"
       class:collapsed={isExpandable && collapsed}
@@ -496,7 +467,7 @@
         <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
         <div
           class="tool-header"
-          class:file-mutation-header={isCompactMutation || isCompactReadOnlyTool}
+          class:file-mutation-header={isCompactMutation || isCompactReadOnlyTool || shouldCompactWaitForWorkers}
           class:clickable={isHeaderOpenableTool && !!toolFilepath}
           onclick={isHeaderOpenableTool && toolFilepath ? handleOpenFile : undefined}
           onkeydown={(e) => {
@@ -514,7 +485,7 @@
 
       {#if isExpandable && !collapsed}
         <div class="tool-content">
-          {#if hasInput && !isMermaidTool && !isWaitForWorkersTool}
+          {#if hasInput && !isMermaidTool}
             <div class="tool-section">
               <div class="section-header">
                 <span class="section-label">{i18n.t('toolCall.section.input')}</span>
@@ -523,7 +494,7 @@
             </div>
           {/if}
 
-          {#if hasOutput || hasWaitResult}
+          {#if hasOutput}
             <div class="tool-section">
               {#if isMermaidTool && mermaidData}
                 <MermaidRenderer
@@ -531,8 +502,6 @@
                   title={mermaidData?.title}
                   diagramType={mermaidData?.diagramType}
                 />
-              {:else if isWaitForWorkersTool && waitResultData}
-                <WaitResultCard data={waitResultData} />
               {:else}
                 <div class="section-header">
                   <span class="section-label">{i18n.t('toolCall.section.output')}</span>

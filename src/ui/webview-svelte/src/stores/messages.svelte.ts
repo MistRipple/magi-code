@@ -25,6 +25,7 @@ import type {
   ModelStatusMap,
   Task,
   QueuedMessage,
+  WaitForWorkersResult,
 } from '../types/message';
 import { vscode } from '../lib/vscode-bridge';
 import { ensureArray } from '../lib/utils';
@@ -170,6 +171,10 @@ function hasInvalidMessageSource(messages: Message[]): boolean {
 // 新增状态：任务、变更、阶段、Toast、模型状态
 let tasks = $state<Task[]>([]);
 let edits = $state<Array<{ filePath: string; snapshotId?: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string; missionId?: string }>>([]);
+export type WorkerWaitResult = WaitForWorkersResult;
+export type WorkerWaitResultMap = Record<string, WorkerWaitResult | null>;
+
+let workerWaitResults = $state<WorkerWaitResultMap>({});
 
 // 统一 Worker 运行态（唯一权威来源）
 const workerRuntime = $derived.by(() => deriveWorkerRuntimeMap({
@@ -481,6 +486,10 @@ export function getEdits() {
   return edits;
 }
 
+export function getWorkerWaitResults() {
+  return workerWaitResults;
+}
+
 export function getToasts() {
   return toasts;
 }
@@ -586,6 +595,36 @@ export function getWorkerSessions() {
   return workerSessions;
 }
 
+export function updateWorkerWaitResults(next: Partial<Record<string, WaitForWorkersResult | null>>) {
+  const current = workerWaitResults;
+  const merged: Record<string, WaitForWorkersResult | null> = { ...current };
+  for (const [cardKey, payload] of Object.entries(next)) {
+    const key = cardKey;
+    if (!payload) {
+      merged[key] = null;
+      continue;
+    }
+    const incomingAt = typeof payload.updatedAt === 'number' ? payload.updatedAt : 0;
+    const currentPayload = current[key];
+    const currentAt = typeof currentPayload?.updatedAt === 'number' ? (currentPayload?.updatedAt as number) : 0;
+    const shouldPreserveCompletedAt = Boolean(
+      currentPayload
+        && currentPayload.wait_status === 'completed'
+        && !currentPayload.timed_out
+        && currentAt > 0
+        && payload.wait_status === 'completed'
+        && !payload.timed_out
+        && incomingAt >= currentAt
+    );
+    if (incomingAt >= currentAt) {
+      merged[key] = shouldPreserveCompletedAt
+        ? { ...payload, updatedAt: currentAt }
+        : payload;
+    }
+  }
+  workerWaitResults = merged;
+}
+
 // ============ getState() 仅用于现有调用方（Svelte 5 迁移中）============
 // ⚠️ 注意：此函数返回的对象无法被 Svelte 5 正确追踪
 // 建议使用上面的独立 getter 函数或直接使用 messagesState
@@ -612,6 +651,8 @@ export function getState() {
     set tasks(v) { tasks = v; },
     get edits() { return edits; },
     set edits(v) { edits = v; },
+    get workerWaitResults() { return workerWaitResults; },
+    set workerWaitResults(v) { workerWaitResults = v; },
     get toasts() { return toasts; },
     set toasts(v) { toasts = v; },
     get notifications() { return notifications; },
@@ -1371,6 +1412,7 @@ export function clearAllMessages() {
     codex: [],
     gemini: [],
   };
+  workerWaitResults = {};
   messagesState.queuedMessages = [];
   messagesState.messageJump = {
     messageId: null,
@@ -1385,6 +1427,7 @@ export function clearAllMessages() {
 // 设置完整的消息列表（用于会话切换时加载历史）
 export function setThreadMessages(messages: Message[]) {
   messagesState.threadMessages = normalizePersistedMessages(messages).map(m => JSON.parse(JSON.stringify(m)) as Message);
+  workerWaitResults = {};
   terminalSessions.clear();
   saveWebviewState();
 }

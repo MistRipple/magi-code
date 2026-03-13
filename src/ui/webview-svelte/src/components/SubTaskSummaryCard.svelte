@@ -3,6 +3,8 @@
   import Icon from './Icon.svelte';
   import { formatDuration } from '../lib/utils';
   import type { IconName } from '../lib/icons';
+  import type { WaitForWorkersResult } from '../types/message';
+  import type { WorkerRuntimeStatus } from '../lib/worker-panel-state';
   import { i18n } from '../stores/i18n.svelte';
 
   // Worker 状态类型（与 MessageHub subTaskCard 状态值对齐）
@@ -60,15 +62,36 @@
     messageTimestamp?: number;
     statusOverride?: WorkerStatus;
     startedAtOverride?: number;
+    runtimeStatus?: WorkerRuntimeStatus;
+    waitResult?: WaitForWorkersResult | null;
   }
 
-  let { card, readOnly = false, messageTimestamp, statusOverride, startedAtOverride }: Props = $props();
+  let { card, readOnly = false, messageTimestamp, statusOverride, startedAtOverride, runtimeStatus, waitResult }: Props = $props();
 
   // 展开/收起状态
   let isExpanded = $state(false);
 
-  // 获取当前状态的徽章配置（默认为 completed）
-  const currentStatus = $derived((statusOverride || card.status || 'completed') as WorkerStatus);
+  function mapRuntimeStatusToCard(status?: WorkerRuntimeStatus): WorkerStatus | undefined {
+    if (!status) return undefined;
+    switch (status) {
+      case 'pending':
+        return 'pending';
+      case 'running':
+        return 'running';
+      case 'blocked':
+        return 'pending';
+      case 'failed':
+        return 'failed';
+      case 'completed':
+        return 'completed';
+      default:
+        return undefined;
+    }
+  }
+
+  // 获取当前状态的徽章配置（任务状态优先，其次 runtime）
+  const runtimeStatusOverride = $derived(mapRuntimeStatusToCard(runtimeStatus));
+  const currentStatus = $derived((statusOverride || card.status || runtimeStatusOverride || 'pending') as WorkerStatus);
   const statusConfig = $derived(statusBadgeMap[currentStatus] || statusBadgeMap.completed);
 
   // 优化 executor 显示：支持更多来源字段，并统一使用中文
@@ -135,19 +158,6 @@
     };
   });
 
-  const displayDuration = $derived.by(() => {
-    if (currentStatus === 'running' && runningStartAt) {
-      return formatDuration(runningElapsedMs);
-    }
-    if (typeof card.duration === 'number') {
-      return formatDuration(card.duration);
-    }
-    if (typeof card.duration === 'string' && card.duration.trim().length > 0) {
-      return card.duration;
-    }
-    return '';
-  });
-
   // 点击跳转到对应的 worker tab
   function handleCardClick(e: MouseEvent) {
     // 如果点击的是展开按钮，不跳转
@@ -178,6 +188,39 @@
 
   // 是否有 Evidence 信息
   const hasEvidence = $derived(card.evidence !== undefined);
+
+  // wait_for_workers 结果展示
+  const waitData = $derived(waitResult || null);
+  const waitIsComplete = $derived(Boolean(waitData && waitData.wait_status === 'completed' && !waitData.timed_out));
+  const completedDuration = $derived.by(() => {
+    if (!waitData) return '';
+    const startedAt = typeof startedAtOverride === 'number'
+      ? startedAtOverride
+      : (typeof card.startedAt === 'number' ? card.startedAt : messageTimestamp);
+    const completedAt = typeof waitData.updatedAt === 'number' ? waitData.updatedAt : 0;
+    if (startedAt && completedAt && completedAt >= startedAt) {
+      return formatDuration(completedAt - startedAt);
+    }
+    return '';
+  });
+  const waitElapsedLabel = $derived(completedDuration);
+
+  const displayDuration = $derived.by(() => {
+    if (currentStatus === 'running' && runningStartAt) {
+      return formatDuration(runningElapsedMs);
+    }
+    if (typeof card.duration === 'number') {
+      return formatDuration(card.duration);
+    }
+    if (typeof card.duration === 'string' && card.duration.trim().length > 0) {
+      return card.duration;
+    }
+    if (completedDuration) {
+      return completedDuration;
+    }
+    return '';
+  });
+
 </script>
 
 <button
@@ -267,6 +310,49 @@
       </span>
     {/if}
   </div>
+
+  <!-- 等待/结果摘要 -->
+  {#if waitData}
+    <div class="wait-result" class:waiting={!waitIsComplete} class:timeout={waitData.timed_out}>
+      <div class="wait-result-header">
+        <span class="wait-title">
+          {i18n.t('waitResultCard.reportTitle')}
+        </span>
+        {#if waitElapsedLabel}
+          <span class="wait-time"><Icon name="clock" size={12} />{waitElapsedLabel}</span>
+        {/if}
+      </div>
+      {#if waitData.results && waitData.results.length > 0}
+        <div class="wait-result-list">
+          {#each waitData.results as result, i (result.task_id || i)}
+            <div class="wait-result-item">
+              {#if result.summary}
+                <span class="result-summary">{result.summary}</span>
+              {/if}
+              <div class="result-meta">
+                {#if result.modified_files && result.modified_files.length > 0}
+                  <span class="meta-tag"><Icon name="file" size={11} />{i18n.t('waitResultCard.fileChangeCount', { count: result.modified_files.length })}</span>
+                {/if}
+                {#if result.errors && result.errors.length > 0}
+                  <span class="meta-tag error"><Icon name="alert-circle" size={11} />{i18n.t('waitResultCard.errorCount', { count: result.errors.length })}</span>
+                {/if}
+              </div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+      {#if waitData.pending_task_ids && waitData.pending_task_ids.length > 0}
+        <div class="wait-pending">
+          <Icon name="hourglass" size={12} />
+          <span>{i18n.t('waitResultCard.pendingTasks', { count: waitData.pending_task_ids.length })}</span>
+        </div>
+      {/if}
+    </div>
+  {:else if runtimeStatus === 'running'}
+    <div class="wait-result waiting-only">
+      <span class="wait-hint">{i18n.t('waitResultCard.waitingHint')}</span>
+    </div>
+  {/if}
 
   <!-- 展开的详情面板 -->
   {#if isExpanded && hasDetails}
@@ -549,6 +635,95 @@
     display: flex;
     align-items: center;
     gap: var(--space-1);
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+  }
+
+  .wait-result {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-sm);
+    border: 1px dashed color-mix(in srgb, var(--worker-color) 35%, var(--border));
+    background: color-mix(in srgb, var(--worker-color) 6%, var(--surface-1));
+  }
+
+  .wait-result.waiting-only {
+    flex-direction: row;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .wait-result-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+  }
+
+  .wait-title {
+    font-weight: 600;
+    color: var(--foreground);
+  }
+
+  .wait-time {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--foreground-muted);
+  }
+
+  .wait-result-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .wait-result-item {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding: var(--space-2);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--surface-1) 85%, transparent);
+    border: 1px solid var(--border);
+  }
+
+  .result-summary {
+    font-size: var(--text-sm);
+    color: var(--foreground);
+  }
+
+  .result-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+  }
+
+  .result-meta .meta-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .result-meta .meta-tag.error {
+    color: var(--error);
+  }
+
+  .wait-pending {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+  }
+
+  .wait-hint {
     font-size: var(--text-xs);
     color: var(--foreground-muted);
   }

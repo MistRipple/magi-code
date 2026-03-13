@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
+  import { formatDuration } from '../lib/utils';
   import { getState, setCurrentBottomTab } from '../stores/messages.svelte';
   import type { IconName } from '../lib/icons';
   import { i18n } from '../stores/i18n.svelte';
@@ -69,7 +70,10 @@
   const totalCount = $derived(data.results.length);
   const successCount = $derived(data.results.filter(r => r.status === 'completed').length);
   const failCount = $derived(data.results.filter(r => r.status === 'failed').length);
-  const waitedSeconds = $derived((data.waited_ms / 1000).toFixed(1));
+  const waitedDuration = $derived.by(() => {
+    const waitedMs = typeof data.waited_ms === 'number' ? data.waited_ms : 0;
+    return waitedMs >= 1000 ? formatDuration(waitedMs) : '';
+  });
 
   const workerSlots = (Object.keys(workerMeta) as WorkerType[]).filter(k => k !== 'default');
   const workerLabels: Record<WorkerType, string> = {
@@ -119,7 +123,9 @@
       {:else}
         <span class="header-stat waiting">{i18n.t('waitResultCard.waitingStat', { count: workerSlots.length })}</span>
       {/if}
-      <span class="header-time"><Icon name="clock" size={12} />{waitedSeconds}s</span>
+      {#if waitedDuration}
+        <span class="header-time"><Icon name="clock" size={12} />{waitedDuration}</span>
+      {/if}
     </div>
   </div>
 

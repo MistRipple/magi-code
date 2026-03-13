@@ -164,7 +164,7 @@ export class UniversalLLMClient extends BaseLLMClient {
       throw new Error('OpenAI client not initialized');
     }
 
-    const protocolId = resolveProtocolId(this.config.provider, this.config.baseUrl);
+    const protocolId = resolveProtocolId(this.config.provider, this.config.openaiProtocol);
     if (protocolId === 'openai.chat-completions') {
       return new OpenAIChatCompletionsProtocolAdapter(this.config, this.openaiClient);
     }

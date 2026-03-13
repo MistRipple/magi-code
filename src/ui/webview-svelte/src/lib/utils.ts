@@ -39,11 +39,20 @@ export function formatTime(timestamp: number): string {
  * 格式化持续时间
  */
 export function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
-  const minutes = Math.floor(ms / 60000);
-  const seconds = Math.floor((ms % 60000) / 1000);
-  return `${minutes}m ${seconds}s`;
+  const totalSeconds = ms <= 0 ? 0 : Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  const pad2 = (value: number) => String(value).padStart(2, '0');
+
+  if (hours > 0) {
+    return `${hours}h${pad2(minutes)}m${pad2(seconds)}s`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m${pad2(seconds)}s`;
+  }
+  return `${seconds}s`;
 }
 
 /**

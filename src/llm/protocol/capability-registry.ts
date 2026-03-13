@@ -35,23 +35,12 @@ const CAPABILITIES_BY_PROTOCOL: Record<ProtocolId, ProviderCapabilities> = {
   },
 };
 
-/**
- * 判断 baseUrl 是否为 OpenAI 官方端点
- */
-function isOfficialOpenAI(baseUrl?: string): boolean {
-  if (!baseUrl) return true;
-  try {
-    const url = new URL(baseUrl);
-    return url.hostname === 'api.openai.com';
-  } catch {
-    return true;
-  }
-}
-
-export function resolveProtocolId(provider: LLMProvider, baseUrl?: string): ProtocolId {
+export function resolveProtocolId(
+  provider: LLMProvider,
+  openaiProtocol?: 'responses' | 'chat',
+): ProtocolId {
   if (provider === 'openai') {
-    // 仅 OpenAI 官方端点使用 Responses API，第三方兼容 API 使用 Chat Completions
-    return isOfficialOpenAI(baseUrl) ? 'openai.responses' : 'openai.chat-completions';
+    return openaiProtocol === 'chat' ? 'openai.chat-completions' : 'openai.responses';
   }
   return 'anthropic.messages';
 }

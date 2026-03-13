@@ -186,12 +186,12 @@
   let updatingAllSkills = $state(false);
 
   // 模型配置表单
-  let orchConfig = $state({ baseUrl: '', apiKey: '', model: '', provider: 'anthropic', thinking: false, reasoningEffort: 'medium' });
-  let compConfig = $state({ baseUrl: '', apiKey: '', model: '', provider: 'anthropic' });
-  let workerConfigs = $state<Record<string, { baseUrl: string; apiKey: string; model: string; provider: string; enabled: boolean; thinking: boolean; reasoningEffort: string }>>({
-    claude: { baseUrl: '', apiKey: '', model: '', provider: 'anthropic', enabled: true, thinking: false, reasoningEffort: 'medium' },
-    codex: { baseUrl: '', apiKey: '', model: '', provider: 'openai', enabled: true, thinking: false, reasoningEffort: 'medium' },
-    gemini: { baseUrl: '', apiKey: '', model: '', provider: 'openai', enabled: true, thinking: false, reasoningEffort: 'medium' }
+  let orchConfig = $state({ baseUrl: '', apiKey: '', model: '', provider: 'anthropic', openaiProtocol: 'responses', thinking: false, reasoningEffort: 'medium' });
+  let compConfig = $state({ baseUrl: '', apiKey: '', model: '', provider: 'anthropic', openaiProtocol: 'responses' });
+  let workerConfigs = $state<Record<string, { baseUrl: string; apiKey: string; model: string; provider: string; openaiProtocol: string; enabled: boolean; thinking: boolean; reasoningEffort: string }>>({
+    claude: { baseUrl: '', apiKey: '', model: '', provider: 'anthropic', openaiProtocol: 'responses', enabled: true, thinking: false, reasoningEffort: 'medium' },
+    codex: { baseUrl: '', apiKey: '', model: '', provider: 'openai', openaiProtocol: 'responses', enabled: true, thinking: false, reasoningEffort: 'medium' },
+    gemini: { baseUrl: '', apiKey: '', model: '', provider: 'openai', openaiProtocol: 'responses', enabled: true, thinking: false, reasoningEffort: 'medium' }
   });
 
   // API Key 明文可见状态
@@ -667,12 +667,12 @@
     if (target === 'worker') {
       const wc = workerConfigs[workerModelTab];
       vscode.postMessage({ type: 'saveWorkerConfig', worker: workerModelTab, config: {
-        baseUrl: wc.baseUrl, apiKey: wc.apiKey, model: wc.model, provider: wc.provider,
+        baseUrl: wc.baseUrl, apiKey: wc.apiKey, model: wc.model, provider: wc.provider, openaiProtocol: wc.openaiProtocol,
         enabled: wc.enabled, enableThinking: wc.thinking, reasoningEffort: wc.reasoningEffort
       }});
     } else if (target === 'orch') {
       vscode.postMessage({ type: 'saveOrchestratorConfig', config: {
-        baseUrl: orchConfig.baseUrl, apiKey: orchConfig.apiKey, model: orchConfig.model, provider: orchConfig.provider,
+        baseUrl: orchConfig.baseUrl, apiKey: orchConfig.apiKey, model: orchConfig.model, provider: orchConfig.provider, openaiProtocol: orchConfig.openaiProtocol,
         enableThinking: orchConfig.thinking, reasoningEffort: orchConfig.reasoningEffort
       }});
     } else if (target === 'comp') {
@@ -1175,6 +1175,7 @@
                 apiKey: config.apiKey || '',
                 model: config.model || '',
                 provider: config.provider || 'anthropic',
+                openaiProtocol: config.openaiProtocol || 'responses',
                 enabled: config.enabled !== false,
                 thinking: config.enableThinking === true,
                 reasoningEffort: config.reasoningEffort || 'medium'
@@ -1191,6 +1192,7 @@
             apiKey: payload.config.apiKey || '',
             model: payload.config.model || '',
             provider: payload.config.provider || 'anthropic',
+            openaiProtocol: payload.config.openaiProtocol || 'responses',
             thinking: payload.config.enableThinking === true,
             reasoningEffort: payload.config.reasoningEffort || 'medium'
           };
@@ -1203,7 +1205,8 @@
             baseUrl: payload.config.baseUrl || '',
             apiKey: payload.config.apiKey || '',
             model: payload.config.model || '',
-            provider: payload.config.provider || 'anthropic'
+            provider: payload.config.provider || 'anthropic',
+            openaiProtocol: payload.config.openaiProtocol || 'responses'
           };
         }
       }
@@ -1634,6 +1637,13 @@
                     </div>
                     {#if orchConfig.provider === 'openai'}
                     <div class="llm-config-field">
+                      <label class="llm-config-label">{i18n.t('settings.model.field.protocol')}</label>
+                      <select class="llm-config-select" bind:value={orchConfig.openaiProtocol}>
+                        <option value="responses">{i18n.t('settings.model.protocol.responses')}</option>
+                        <option value="chat">{i18n.t('settings.model.protocol.chat')}</option>
+                      </select>
+                    </div>
+                    <div class="llm-config-field">
                       <label class="llm-config-label">{i18n.t('settings.model.field.level')}</label>
                       <select class="llm-config-select" bind:value={orchConfig.reasoningEffort}>
                         <option value="low">{i18n.t('settings.model.reasoning.low')}</option>
@@ -1746,6 +1756,15 @@
                         <option value="anthropic">{i18n.t('settings.model.provider.anthropic')}</option>
                       </select>
                     </div>
+                    {#if compConfig.provider === 'openai'}
+                    <div class="llm-config-field">
+                      <label class="llm-config-label">{i18n.t('settings.model.field.protocol')}</label>
+                      <select class="llm-config-select" bind:value={compConfig.openaiProtocol}>
+                        <option value="responses">{i18n.t('settings.model.protocol.responses')}</option>
+                        <option value="chat">{i18n.t('settings.model.protocol.chat')}</option>
+                      </select>
+                    </div>
+                    {/if}
                   </div>
                   <div class="llm-config-actions">
                     <button
@@ -1867,6 +1886,13 @@
                   </select>
                 </div>
                 {#if workerConfigs[workerModelTab].provider === 'openai'}
+                <div class="llm-config-field">
+                  <label class="llm-config-label">{i18n.t('settings.model.field.protocol')}</label>
+                  <select class="llm-config-select" bind:value={workerConfigs[workerModelTab].openaiProtocol}>
+                    <option value="responses">{i18n.t('settings.model.protocol.responses')}</option>
+                    <option value="chat">{i18n.t('settings.model.protocol.chat')}</option>
+                  </select>
+                </div>
                 <div class="llm-config-field">
                   <label class="llm-config-label">{i18n.t('settings.model.field.level')}</label>
                   <select class="llm-config-select" bind:value={workerConfigs[workerModelTab].reasoningEffort}>
@@ -3041,9 +3067,9 @@
 
   .llm-config-form { display: flex; flex-direction: column; gap: var(--space-3); }
   .llm-config-field { display: flex; flex-direction: column; gap: var(--space-2); }
-  .llm-config-field-row { display: grid; grid-template-columns: 1fr 120px; gap: var(--space-3); }
-  .llm-config-field-row.has-thinking { grid-template-columns: 1fr 120px 80px; }
-  .llm-config-field-row.has-thinking.has-level { grid-template-columns: 1fr 120px 100px 80px; }
+  .llm-config-field-row { display: grid; grid-template-columns: 1fr 96px; gap: var(--space-3); }
+  .llm-config-field-row.has-thinking { grid-template-columns: 1fr 96px 72px; }
+  .llm-config-field-row.has-thinking.has-level { grid-template-columns: 1fr 96px 88px 88px 72px; }
   .llm-config-field-row.url-toggle-row { grid-template-columns: 1fr 80px; align-items: end; }
   .llm-config-label { font-size: var(--text-sm); color: var(--foreground-muted); }
 
@@ -3185,6 +3211,8 @@
     color: var(--foreground);
     font-size: var(--text-sm);
     cursor: pointer;
+    justify-content: flex-end;
+    width: 100%;
   }
   .inline-toggle { display: flex; flex-direction: column; gap: var(--space-2); }
   .toggle-switch { width: 32px; height: 18px; background: var(--secondary); border-radius: var(--radius-full); position: relative; transition: background var(--transition-fast); cursor: pointer; flex-shrink: 0; }

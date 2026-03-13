@@ -23,6 +23,8 @@ export interface SubTaskCardPayload {
   modifiedFiles?: string[];
   createdFiles?: string[];
   duration?: number;
+  missionId?: string;
+  turnId?: string;
 }
 
 /** Worker 指令卡片元数据（用于 lane 聚合与可追踪性） */
@@ -141,7 +143,13 @@ export class MessageFactory {
       running: `${w} 正在处理：${normalizedSubTask.title}`,
     };
     const content = statusContentMap[normalizedSubTask.status] || statusContentMap.running;
-    const stableMessageId = `subtask-card-${normalizedSubTask.id}`;
+    const rawMissionId = typeof normalizedSubTask.missionId === 'string' ? normalizedSubTask.missionId.trim() : '';
+    const rawTurnId = typeof normalizedSubTask.turnId === 'string' ? normalizedSubTask.turnId.trim() : '';
+    // scope 优先级：requestId > missionId > turnId，与前端 resolveScopeId 一致
+    const scopeId = this.requestId || rawMissionId || rawTurnId;
+    const stableMessageId = scopeId
+      ? `subtask-card-${normalizedSubTask.id}-${scopeId}`
+      : `subtask-card-${normalizedSubTask.id}`;
     const isFailed = normalizedSubTask.status === 'failed';
     const failureCode = typeof normalizedSubTask.failureCode === 'string' ? normalizedSubTask.failureCode.trim() : '';
     const modelOriginExtra = normalizedFailure?.isModelOrigin ? {
@@ -163,10 +171,13 @@ export class MessageFactory {
       agent: 'orchestrator',
       lifecycle: MessageLifecycle.COMPLETED,
       blocks: [{ type: 'text', content, isMarkdown: true }],
-      metadata: {
+      metadata: this.enrichMetadata({
         subTaskId: normalizedSubTask.id,
+        assignmentId: normalizedSubTask.id,
         assignedWorker: normalizedSubTask.worker,
         isStatusMessage: true,
+        ...(rawMissionId ? { missionId: rawMissionId } : {}),
+        ...(rawTurnId ? { turnId: rawTurnId } : {}),
         subTaskCard: normalizedSubTask,
         ...(isFailed && failureCode ? { reason: failureCode } : {}),
         ...(isFailed ? { recoverable: normalizedSubTask.recoverable ?? true } : {}),
@@ -176,7 +187,7 @@ export class MessageFactory {
             ...dispatchFailureExtra,
           },
         } : {}),
-      },
+      }),
       traceId: this.traceId,
       category: MessageCategory.CONTENT,
     }));

@@ -303,6 +303,15 @@ export class MessageHub {
 
   sendMessage(message: StandardMessage): boolean {
     const requestId = this.factory.getRequestContext();
+    if (requestId && !message.metadata?.requestId) {
+      return this.pipeline.process({
+        ...message,
+        metadata: {
+          ...(message.metadata || {}),
+          requestId,
+        },
+      }, requestId);
+    }
     return this.pipeline.process(message, requestId);
   }
 

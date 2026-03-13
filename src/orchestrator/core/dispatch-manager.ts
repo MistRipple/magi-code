@@ -18,7 +18,7 @@ import type { WorkerSlot } from '../../types';
 import type { TokenUsage } from '../../types/agent-types';
 import type { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import type { ProfileLoader } from '../profile/profile-loader';
-import type { MessageHub } from './message-hub';
+import type { MessageHub, SubTaskCardPayload } from './message-hub';
 import type { MissionOrchestrator } from './mission-orchestrator';
 import type { Assignment, AcceptanceCriterion, Constraint } from '../mission';
 import type { WorkerReport, OrchestratorResponse } from '../protocols/worker-report';
@@ -265,7 +265,7 @@ export class DispatchManager {
   private reportTodoProgress(assignmentId: string, summary: string): void {
     const entry = this.activeBatch?.getEntry(assignmentId);
     if (entry && entry.status === 'running') {
-      this.deps.messageHub.subTaskCard({
+      this.emitSubTaskCard({
         id: assignmentId,
         title: entry.taskContract.taskTitle,
         status: 'running',
@@ -273,6 +273,18 @@ export class DispatchManager {
         summary,
       });
     }
+  }
+
+  private emitSubTaskCard(payload: SubTaskCardPayload): void {
+    const rawMissionId = typeof payload.missionId === 'string' ? payload.missionId.trim() : '';
+    const rawTurnId = typeof payload.turnId === 'string' ? payload.turnId.trim() : '';
+    const missionId = rawMissionId || this.activeBatch?.id || this.deps.getCurrentTurnId() || undefined;
+    const turnId = rawTurnId || this.deps.getCurrentTurnId() || undefined;
+    this.deps.messageHub.subTaskCard({
+      ...payload,
+      ...(missionId ? { missionId } : {}),
+      ...(turnId ? { turnId } : {}),
+    });
   }
 
   /**
@@ -731,7 +743,7 @@ export class DispatchManager {
           this.dispatchIdempotencyStore.updateStatusByTaskId(taskId, 'cancelled');
         }
 
-        this.deps.messageHub.subTaskCard({
+        this.emitSubTaskCard({
           id: taskId,
           title: taskTitle,
           status: cardStatus,
@@ -1061,7 +1073,7 @@ export class DispatchManager {
     if (!executionRouting.ok) {
       const errorMsg = executionRouting.error;
       batch?.markFailed(taskId, { success: false, summary: errorMsg, errors: [errorMsg] });
-      this.deps.messageHub.subTaskCard({
+      this.emitSubTaskCard({
         id: taskId,
         title: taskTitle,
         status: 'failed',
@@ -1100,7 +1112,7 @@ export class DispatchManager {
 
     // 标记开始运行
     batch?.markRunning(taskId);
-    this.deps.messageHub.subTaskCard({
+    this.emitSubTaskCard({
       id: taskId,
       title: taskTitle,
       status: 'running',
@@ -1167,7 +1179,7 @@ export class DispatchManager {
         this.markProtocolNack(taskId, 'missing-session-context');
         const errorMsg = t('dispatch.errors.currentSessionMissingCannotCreateTodo');
         batch?.markFailed(taskId, { success: false, summary: errorMsg, errors: [errorMsg] });
-        this.deps.messageHub.subTaskCard({
+        this.emitSubTaskCard({
           id: taskId,
           title: taskTitle,
           status: 'failed',
@@ -1286,7 +1298,7 @@ export class DispatchManager {
           batch?.markFailed(taskId, dispatchResult);
         }
 
-        this.deps.messageHub.subTaskCard({
+        this.emitSubTaskCard({
           id: taskId,
           title: taskTitle,
           status: result.success ? 'completed' : 'failed',
@@ -1319,7 +1331,7 @@ export class DispatchManager {
           }, LogCategory.ORCHESTRATOR);
         }
         if (shouldUpdateCard) {
-          this.deps.messageHub.subTaskCard({
+          this.emitSubTaskCard({
             id: taskId,
             title: taskTitle,
             status: 'stopped',
@@ -1370,7 +1382,7 @@ export class DispatchManager {
       }
       if (shouldUpdateCard) {
         batch?.markFailed(taskId, { success: false, summary: userErrorMsg, errors: [userErrorMsg] });
-        this.deps.messageHub.subTaskCard({
+        this.emitSubTaskCard({
           id: taskId,
           title: taskTitle,
           status: 'failed',
@@ -1971,7 +1983,7 @@ export class DispatchManager {
         }, LogCategory.ORCHESTRATOR);
         return defaultResponse;
       }
-      this.deps.messageHub.subTaskCard({
+      this.emitSubTaskCard({
         id: report.assignmentId,
         title: report.progress.currentStep || '',
         status: 'running',
@@ -2294,7 +2306,7 @@ export class DispatchManager {
       summary: timeoutMessage,
       errors: [`[${semantic.failureCode}] ${timeoutMessage}`],
     });
-    this.deps.messageHub.subTaskCard({
+    this.emitSubTaskCard({
       id: state.taskId,
       title: entry.taskContract.taskTitle,
       status: 'failed',

@@ -102,6 +102,26 @@ export interface ToolCall {
   endTime?: number;
 }
 
+// wait_for_workers 返回结构
+export interface WaitForWorkersResultItem {
+  task_id: string;
+  worker: string;
+  status: 'completed' | 'failed' | 'skipped' | 'cancelled';
+  summary: string;
+  modified_files: string[];
+  errors?: string[];
+}
+
+export interface WaitForWorkersResult {
+  results: WaitForWorkersResultItem[];
+  wait_status: 'completed' | 'timeout';
+  timed_out: boolean;
+  pending_task_ids: string[];
+  waited_ms: number;
+  audit?: unknown;
+  updatedAt?: number;
+}
+
 export type TerminalOperation = 'shell';
 
 export interface TerminalSessionBlock {

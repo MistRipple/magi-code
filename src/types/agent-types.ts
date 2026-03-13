@@ -50,6 +50,8 @@ export interface LLMConfig {
   model: string;
   /** 提供商格式 */
   provider: LLMProvider;
+  /** OpenAI 协议模式（仅 openai provider 生效） */
+  openaiProtocol?: 'responses' | 'chat';
   /** 是否启用 */
   enabled: boolean;
   /**

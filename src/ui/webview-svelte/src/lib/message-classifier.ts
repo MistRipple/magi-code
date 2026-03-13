@@ -26,7 +26,9 @@ export function classifyMessage(standard: StandardMessage): {
   worker?: 'claude' | 'codex' | 'gemini';
 } {
   const meta = standard.metadata as Record<string, unknown> | undefined;
-  const resolvedWorker = normalizeWorkerSlot(standard.agent) ?? normalizeWorkerSlot(meta?.worker);
+  const resolvedWorker = normalizeWorkerSlot(standard.agent)
+    ?? normalizeWorkerSlot(meta?.worker)
+    ?? normalizeWorkerSlot(meta?.assignedWorker);
   const isStatusMessage = Boolean(meta?.isStatusMessage);
 
   // ============== 第一优先级：明确的消息类型 ==============

@@ -10,7 +10,7 @@ export interface WorkerPanelState {
   workerHasCurrentRequestActivity: boolean;
 }
 
-export type WorkerRuntimeStatus = 'idle' | 'running' | 'blocked' | 'failed' | 'completed';
+export type WorkerRuntimeStatus = 'idle' | 'pending' | 'running' | 'blocked' | 'failed' | 'completed';
 export type WorkerRuntimeSource = 'tasks' | 'none';
 
 export interface WorkerRuntimeState {
@@ -53,6 +53,10 @@ function isFailedTaskStatus(status: unknown): boolean {
   return status === 'failed';
 }
 
+function isPendingTaskStatus(status: unknown): boolean {
+  return status === 'pending' || status === 'paused';
+}
+
 function getLaneTasks(message: Message): Array<Record<string, unknown>> {
   const laneTasks = message.metadata?.laneTasks;
   return Array.isArray(laneTasks)
@@ -78,6 +82,7 @@ interface WorkerTaskSnapshot {
   hasRunning: boolean;
   hasBlocked: boolean;
   hasFailed: boolean;
+  hasPending: boolean;
   latestStartedAt: number | null;
 }
 
@@ -87,6 +92,7 @@ function snapshotWorkerTasks(tasks: Task[], workerName?: AgentType): WorkerTaskS
     hasRunning: false,
     hasBlocked: false,
     hasFailed: false,
+    hasPending: false,
     latestStartedAt: null,
   };
   if (!workerName) return snapshot;
@@ -102,6 +108,9 @@ function snapshotWorkerTasks(tasks: Task[], workerName?: AgentType): WorkerTaskS
       }
       if (isFailedTaskStatus(subTask.status)) {
         snapshot.hasFailed = true;
+      }
+      if (isPendingTaskStatus(subTask.status)) {
+        snapshot.hasPending = true;
       }
       if (typeof subTask.startedAt === 'number') {
         snapshot.latestStartedAt = snapshot.latestStartedAt === null
@@ -178,15 +187,17 @@ export function deriveWorkerRuntimeState(
   const worker = normalizeWorkerName(params.workerName || '');
   const tasksSnapshot = snapshotWorkerTasks(params.tasks || [], worker || undefined);
   const hasAssignments = tasksSnapshot.hasAssignments;
-  const hasRunningTask = tasksSnapshot.hasRunning;
+  const hasRunningTask = tasksSnapshot.hasRunning || Boolean(context.latestRunningInstructionMessage);
   const hasBlocked = tasksSnapshot.hasBlocked;
   const hasFailed = tasksSnapshot.hasFailed;
+  const hasPending = tasksSnapshot.hasPending;
   const hasStreaming = context.hasBottomStreamingMessage;
   const hasPendingRequest = context.panelHasPendingRequest;
+  const hasRunningSignal = hasRunningTask || hasStreaming || hasPendingRequest;
 
   let status: WorkerRuntimeStatus = 'idle';
   let source: WorkerRuntimeSource = 'none';
-  if (hasRunningTask) {
+  if (hasRunningSignal) {
     status = 'running';
     source = hasAssignments ? 'tasks' : 'none';
   } else if (hasBlocked) {
@@ -194,6 +205,9 @@ export function deriveWorkerRuntimeState(
     source = hasAssignments ? 'tasks' : 'none';
   } else if (hasFailed) {
     status = 'failed';
+    source = hasAssignments ? 'tasks' : 'none';
+  } else if (hasPending) {
+    status = 'pending';
     source = hasAssignments ? 'tasks' : 'none';
   } else if (hasAssignments) {
     status = 'completed';

@@ -17,6 +17,7 @@ import {
   setQueuedMessages,
   setAppState,
   setMissionPlan,
+  updateWorkerWaitResults,
   setInteractionMode,
   getRequestedInteractionMode,
   clearRequestedInteractionMode,
@@ -45,7 +46,7 @@ import {
   clearRetryRuntime,
   sealAllStreamingMessages,
 } from '../stores/messages.svelte';
-import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, SubTaskItem, Edit, ModelStatusMap, ActivePlanState, PlanLedgerRecord, PlanLedgerAttempt, QueuedMessage, RetryRuntimeState } from '../types/message';
+import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, SubTaskItem, Edit, ModelStatusMap, ActivePlanState, PlanLedgerRecord, PlanLedgerAttempt, QueuedMessage, RetryRuntimeState, AgentType, WaitForWorkersResult, WaitForWorkersResultItem } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
 import { MessageType, MessageCategory } from '../../../../protocol/message-protocol';
 import { routeStandardMessage, getMessageTarget, clearMessageTargets, clearMessageTarget, setMessageTarget } from './message-router';
@@ -88,6 +89,211 @@ function extractTextFromStandardBlocks(blocks?: StandardContentBlock[]): string 
     .map((block) => (block as any).content || '')
     .filter(Boolean)
     .join('\n');
+}
+
+const WAIT_RESULT_STATUS_SET = new Set<WaitForWorkersResultItem['status']>([
+  'completed',
+  'failed',
+  'skipped',
+  'cancelled',
+]);
+const WAIT_RESULT_WAIT_STATUS_SET = new Set<WaitForWorkersResult['wait_status']>([
+  'completed',
+  'timeout',
+]);
+
+function normalizeCardKey(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : '';
+}
+
+function buildAssignmentCardKey(assignmentKey: string, scopeId?: string): string {
+  const normalizedAssignment = assignmentKey.trim();
+  if (!normalizedAssignment) return '';
+  const normalizedScope = typeof scopeId === 'string' ? scopeId.trim() : '';
+  return normalizedScope ? `assign:${normalizedAssignment}@${normalizedScope}` : `assign:${normalizedAssignment}`;
+}
+
+function resolveScopeId(meta: Record<string, unknown> | undefined): string {
+  const requestId = typeof meta?.requestId === 'string' ? meta.requestId.trim() : '';
+  if (requestId) return requestId;
+  const missionId = typeof meta?.missionId === 'string' ? meta.missionId.trim() : '';
+  const turnId = typeof meta?.turnId === 'string' ? meta.turnId.trim() : '';
+  if (missionId && turnId) return `${missionId}:${turnId}`;
+  return missionId || turnId || '';
+}
+
+function resolveCardKeyFromMetadata(meta: Record<string, unknown> | undefined): string {
+  const scopeId = resolveScopeId(meta);
+  const rawAssignmentId = normalizeCardKey(meta?.assignmentId);
+  if (rawAssignmentId) return buildAssignmentCardKey(rawAssignmentId, scopeId);
+  const rawSubTaskId = normalizeCardKey(meta?.subTaskId);
+  if (rawSubTaskId) return buildAssignmentCardKey(rawSubTaskId, scopeId);
+  const rawCardId = normalizeCardKey(meta?.cardId);
+  if (rawCardId) return rawCardId;
+  return '';
+}
+
+function normalizeWaitResultItem(raw: Record<string, unknown>): WaitForWorkersResultItem | null {
+  const taskId = typeof raw.task_id === 'string' ? raw.task_id.trim() : '';
+  const worker = typeof raw.worker === 'string' ? raw.worker.trim() : '';
+  const statusRaw = typeof raw.status === 'string' ? raw.status.trim() : '';
+  if (!taskId || !worker || !WAIT_RESULT_STATUS_SET.has(statusRaw as WaitForWorkersResultItem['status'])) {
+    return null;
+  }
+  const summary = typeof raw.summary === 'string' ? raw.summary : '';
+  const modifiedFiles = Array.isArray(raw.modified_files)
+    ? raw.modified_files.filter((file): file is string => typeof file === 'string' && file.trim().length > 0)
+    : [];
+  const errors = Array.isArray(raw.errors)
+    ? raw.errors.filter((err): err is string => typeof err === 'string' && err.trim().length > 0)
+    : undefined;
+  return {
+    task_id: taskId,
+    worker,
+    status: statusRaw as WaitForWorkersResultItem['status'],
+    summary,
+    modified_files: modifiedFiles,
+    ...(errors && errors.length > 0 ? { errors } : {}),
+  };
+}
+
+function parseWaitForWorkersPayload(raw: unknown, timestamp: number): WaitForWorkersResult | null {
+  if (!raw) return null;
+  const payload = typeof raw === 'string' ? safeParseJson(raw) : (raw as Record<string, unknown>);
+  if (!payload || typeof payload !== 'object') return null;
+  const waitStatusRaw = typeof payload.wait_status === 'string' ? payload.wait_status.trim() : '';
+  if (!WAIT_RESULT_WAIT_STATUS_SET.has(waitStatusRaw as WaitForWorkersResult['wait_status'])) {
+    return null;
+  }
+  const results = ensureArray(payload.results)
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+    .map(normalizeWaitResultItem)
+    .filter((item): item is WaitForWorkersResultItem => !!item);
+  const pendingTaskIds = ensureArray(payload.pending_task_ids)
+    .filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+  const waitedMs = typeof payload.waited_ms === 'number' && Number.isFinite(payload.waited_ms)
+    ? payload.waited_ms
+    : 0;
+  return {
+    results,
+    wait_status: waitStatusRaw as WaitForWorkersResult['wait_status'],
+    timed_out: Boolean(payload.timed_out),
+    pending_task_ids: pendingTaskIds,
+    waited_ms: waitedMs,
+    audit: payload.audit,
+    updatedAt: timestamp,
+  };
+}
+
+function extractWaitForWorkersPayloadFromMessage(message: Message): WaitForWorkersResult | null {
+  const blocks = ensureArray(message.blocks);
+  if (blocks.length === 0) return null;
+  for (const block of blocks) {
+    if (block.type !== 'tool_call' || !block.toolCall) continue;
+    if (block.toolCall.name !== 'wait_for_workers') continue;
+    const rawPayload = block.toolCall.result ?? block.toolCall.standardized?.data;
+    const parsed = parseWaitForWorkersPayload(rawPayload, message.timestamp || Date.now());
+    if (parsed) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function buildWaitResultFromTaskCard(message: Message): { cardKey: string; result: WaitForWorkersResult } | null {
+  if (message.type !== 'task_card') return null;
+  const meta = message.metadata as Record<string, unknown> | undefined;
+  const subTaskCard = (meta?.subTaskCard || {}) as Record<string, unknown>;
+  const rawWorker = (subTaskCard.worker as string | undefined) || (meta?.assignedWorker as string | undefined);
+  const worker = normalizeWorkerSlot(rawWorker);
+  if (!worker) return null;
+  const cardKey = resolveCardKeyFromMetadata(meta);
+  if (!cardKey) return null;
+  const statusRaw = typeof subTaskCard.status === 'string' ? subTaskCard.status : '';
+  const statusMap: Record<string, WaitForWorkersResultItem['status']> = {
+    completed: 'completed',
+    failed: 'failed',
+    skipped: 'skipped',
+    stopped: 'cancelled',
+  };
+  const mappedStatus = statusMap[statusRaw];
+  if (!mappedStatus) return null;
+  const summary = typeof subTaskCard.summary === 'string'
+    ? subTaskCard.summary
+    : (typeof subTaskCard.error === 'string' ? subTaskCard.error : '');
+  const modifiedFiles = Array.isArray(subTaskCard.modifiedFiles)
+    ? subTaskCard.modifiedFiles.filter((file): file is string => typeof file === 'string' && file.trim().length > 0)
+    : [];
+  const errors = typeof subTaskCard.error === 'string' && subTaskCard.error.trim()
+    ? [subTaskCard.error.trim()]
+    : undefined;
+  const result: WaitForWorkersResult = {
+    results: [{
+      task_id: String(subTaskCard.id || message.id || ''),
+      worker,
+      status: mappedStatus,
+      summary,
+      modified_files: modifiedFiles,
+      ...(errors ? { errors } : {}),
+    }],
+    wait_status: 'completed',
+    timed_out: false,
+    pending_task_ids: [],
+    waited_ms: 0,
+    updatedAt: message.timestamp || Date.now(),
+  };
+  return { cardKey, result };
+}
+
+function syncWorkerWaitResultsFromMessage(message: Message): void {
+  // 入口 debug: 检查哪些消息进入了这个函数
+  const hasToolBlocks = ensureArray(message.blocks).some((b: any) => b?.type === 'tool_call');
+  const hasWaitTool = ensureArray(message.blocks).some((b: any) => b?.toolCall?.name === 'wait_for_workers');
+  if (hasToolBlocks || message.type === 'task_card') {
+    console.log('[DEBUG:syncEntry]', message.type, 'id=', message.id?.slice(-20),
+      'hasToolBlocks=', hasToolBlocks, 'hasWaitTool=', hasWaitTool,
+      'blockCount=', ensureArray(message.blocks).length,
+      hasWaitTool ? 'waitResult=' + JSON.stringify(ensureArray(message.blocks).find((b: any) => b?.toolCall?.name === 'wait_for_workers')?.toolCall?.result)?.slice(0, 200) : '');
+  }
+  const payload = extractWaitForWorkersPayloadFromMessage(message);
+  if (payload && payload.results.length > 0) {
+    const updates: Record<string, WaitForWorkersResult> = {};
+    const updatedAt = typeof payload.updatedAt === 'number' ? payload.updatedAt : (message.timestamp || Date.now());
+    const scopeId = resolveScopeId(message.metadata as Record<string, unknown> | undefined);
+    console.log('[DEBUG:waitResult] scopeId=', scopeId, 'meta=', JSON.stringify({
+      requestId: (message.metadata as any)?.requestId,
+      missionId: (message.metadata as any)?.missionId,
+      turnId: (message.metadata as any)?.turnId,
+    }));
+    const grouped = new Map<string, WaitForWorkersResultItem[]>();
+    for (const result of payload.results) {
+      const taskId = typeof result.task_id === 'string' ? result.task_id.trim() : '';
+      if (!taskId) continue;
+      const cardKey = buildAssignmentCardKey(taskId, scopeId);
+      console.log('[DEBUG:waitResult] taskId=', taskId, 'cardKey=', cardKey);
+      const list = grouped.get(cardKey) || [];
+      list.push(result);
+      grouped.set(cardKey, list);
+    }
+    for (const [cardKey, results] of grouped.entries()) {
+      updates[cardKey] = {
+        ...payload,
+        results,
+        updatedAt,
+      };
+    }
+    if (Object.keys(updates).length > 0) {
+      updateWorkerWaitResults(updates);
+    }
+    return;
+  }
+  const taskCardResult = buildWaitResultFromTaskCard(message);
+  if (taskCardResult) {
+    console.log('[DEBUG:taskCard] cardKey=', taskCardResult.cardKey, 'status=', taskCardResult.result.results[0]?.status);
+    updateWorkerWaitResults({ [taskCardResult.cardKey]: taskCardResult.result });
+  }
 }
 
 function handleRetryRuntimePayload(payload: Record<string, unknown>): void {
@@ -782,6 +988,7 @@ function findLastMessageByCardId(messages: Message[], cardId: string): Message |
   return undefined;
 }
 
+
 function recoverTargetByCardId(cardId: string): { target: ResolvedTarget; messageId: string } | null {
   if (!cardId.trim()) {
     return null;
@@ -864,7 +1071,8 @@ function tryUpsertInstructionByCardId(location: ResolvedTarget, uiMessage: Messa
   }
 
   if (location.location === 'worker') {
-    const existing = findLastMessageByCardId(getState().agentOutputs[location.worker], cardId);
+    const messages = getState().agentOutputs[location.worker];
+    const existing = findLastMessageByCardId(messages, cardId);
     if (!existing) {
       return false;
     }
@@ -978,6 +1186,7 @@ function applyUpdateToLocation(location: ReturnType<typeof getMessageTarget>, up
         };
       }
       updateThreadMessage(update.messageId, nextMessage);
+      syncWorkerWaitResultsFromMessage(nextMessage);
       applied = true;
     }
   } else if (location.location === 'worker') {
@@ -987,7 +1196,9 @@ function applyUpdateToLocation(location: ReturnType<typeof getMessageTarget>, up
         return true;
       }
       const streamUpdates = applyStreamUpdate(existing, update);
-      updateAgentMessage(location.worker, update.messageId, { ...existing, ...streamUpdates });
+      const nextMessage = { ...existing, ...streamUpdates };
+      updateAgentMessage(location.worker, update.messageId, nextMessage);
+      syncWorkerWaitResultsFromMessage(nextMessage);
       applied = true;
     }
   } else if (location.location === 'both') {
@@ -1010,6 +1221,7 @@ function applyUpdateToLocation(location: ReturnType<typeof getMessageTarget>, up
         };
       }
       updateThreadMessage(update.messageId, nextMessage);
+      syncWorkerWaitResultsFromMessage(nextMessage);
       applied = true;
     }
     const agentExisting = getState().agentOutputs[location.worker].find(m => m.id === update.messageId);
@@ -1018,7 +1230,9 @@ function applyUpdateToLocation(location: ReturnType<typeof getMessageTarget>, up
         return true;
       }
       const streamUpdates = applyStreamUpdate(agentExisting, update);
-      updateAgentMessage(location.worker, update.messageId, { ...agentExisting, ...streamUpdates });
+      const nextMessage = { ...agentExisting, ...streamUpdates };
+      updateAgentMessage(location.worker, update.messageId, nextMessage);
+      syncWorkerWaitResultsFromMessage(nextMessage);
       applied = true;
     }
   }
@@ -1120,6 +1334,7 @@ function handleContentMessage(standard: StandardMessage) {
     }
     addPendingRequest(requestId);
     upsertThreadMessage(uiMessage);
+    syncWorkerWaitResultsFromMessage(uiMessage);
     routeStandardMessage(standard);
     if (uiMessage.isStreaming) {
       markMessageActive(uiMessage.id);
@@ -1200,6 +1415,7 @@ function handleContentMessage(standard: StandardMessage) {
 
           // 3. 在 UI 中原地替换（保持滚动位置和顺序）
           replaceThreadMessage(placeholderId, newMessage);
+          syncWorkerWaitResultsFromMessage(newMessage);
 
           // 4. 真实消息 ID 与占位 ID 不一致时，必须重建路由
           // 否则 unifiedUpdate/unifiedComplete 会因找不到 messageId 对应目标而被暂存/忽略
@@ -1230,6 +1446,7 @@ function handleContentMessage(standard: StandardMessage) {
           },
         };
         updateThreadMessage(placeholderId, mergedMessage);
+        syncWorkerWaitResultsFromMessage(mergedMessage);
 
         // 标记为活跃消息
         if (uiMessage.isStreaming) {
@@ -1310,6 +1527,7 @@ function handleContentMessage(standard: StandardMessage) {
       }
     }
 
+    syncWorkerWaitResultsFromMessage(uiMessage);
     // 可能存在提前到达的流式更新，立即补齐
     flushPendingStreamUpdates(standard.id);
 }
@@ -1505,6 +1723,7 @@ function handleStandardComplete(message: WebviewMessage) {
     updateThreadMessage(actualMessageId, completedMessage);
     updateAgentMessage(location.worker, actualMessageId, completedMessage);
   }
+  syncWorkerWaitResultsFromMessage(completedMessage);
 
   // 补齐可能提前到达的流式更新
   flushPendingStreamUpdates(actualMessageId);
@@ -2543,15 +2762,26 @@ function mapStandardMessage(standard: StandardMessage): Message {
   const originSource = standard.source;
   const agentSlot = normalizeWorkerSlot(standard.agent);
   const metaSlot = normalizeWorkerSlot((standard.metadata as { worker?: unknown } | undefined)?.worker);
-  const resolvedWorker = agentSlot ?? metaSlot ?? null;
+  const metaAssigned = normalizeWorkerSlot((standard.metadata as { assignedWorker?: unknown } | undefined)?.assignedWorker);
+  const resolvedWorker = agentSlot ?? metaSlot ?? metaAssigned ?? null;
   const displaySource: Message['source'] =
     originSource === 'orchestrator'
       ? 'orchestrator'
       : (resolvedWorker ?? 'claude');
 
   const baseMetadata = { ...(standard.metadata || {}) } as Record<string, unknown>;
-  const cardId = typeof baseMetadata.cardId === 'string' && baseMetadata.cardId.trim()
-    ? baseMetadata.cardId.trim()
+  const rawCardId = typeof baseMetadata.cardId === 'string' ? baseMetadata.cardId.trim() : '';
+  const rawAssignmentId = typeof baseMetadata.assignmentId === 'string' ? baseMetadata.assignmentId.trim() : '';
+  const rawSubTaskId = typeof baseMetadata.subTaskId === 'string' ? baseMetadata.subTaskId.trim() : '';
+  const assignmentKey = rawAssignmentId || rawSubTaskId;
+  const scopeId = resolveScopeId(baseMetadata);
+  const shouldUseAssignmentCard = (standard.type === MessageType.INSTRUCTION || standard.type === MessageType.TASK_CARD)
+    && assignmentKey;
+  const cardId = shouldUseAssignmentCard
+    ? buildAssignmentCardKey(assignmentKey, scopeId)
+    : (rawCardId || standard.id);
+  const uiMessageId = (standard.type === MessageType.INSTRUCTION && assignmentKey)
+    ? cardId
     : standard.id;
 
   const dispatchToWorker = Boolean(baseMetadata.dispatchToWorker);
@@ -2565,7 +2795,7 @@ function mapStandardMessage(standard: StandardMessage): Message {
   const resolvedType = standard.type as import('../types/message').MessageType;
 
   return {
-    id: standard.id,
+    id: uiMessageId,
     role: resolvedRole,
     source: displaySource,
     content,
