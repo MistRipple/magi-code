@@ -1051,6 +1051,53 @@ export class DispatchManager {
           return { success: false, error: error.message };
         }
       },
+
+      claimNextTodo: async (params) => {
+        let todoManager = this.deps.getTodoManager();
+        if (!todoManager) {
+          await this.deps.missionOrchestrator.ensureTodoManagerInitialized();
+          todoManager = this.deps.getTodoManager();
+        }
+        if (!todoManager) {
+          return { claimed: false, remaining: 0, error: 'TodoManager not initialized' };
+        }
+
+        try {
+          const claimable = await todoManager.findClaimable(
+            params.missionId,
+            params.workerId as any
+          );
+
+          if (claimable.length === 0) {
+            return { claimed: false, remaining: 0 };
+          }
+
+          // 尝试认领第一个可用的 Todo
+          const target = claimable[0];
+          const claimed = await todoManager.tryClaim(target.id, params.workerId as any);
+
+          if (!claimed) {
+            // 竞态失败，报告剩余可认领数量
+            return { claimed: false, remaining: claimable.length - 1 };
+          }
+
+          return {
+            claimed: true,
+            todo: {
+              id: claimed.id,
+              content: claimed.content,
+              type: claimed.type,
+              priority: claimed.priority,
+              expectedOutput: claimed.expectedOutput,
+              targetFiles: claimed.targetFiles,
+              dependsOn: claimed.dependsOn,
+            },
+            remaining: claimable.length - 1,
+          };
+        } catch (error: any) {
+          return { claimed: false, remaining: 0, error: error.message };
+        }
+      },
     });
 
     logger.info('编排器.编排工具回调.已注入', undefined, LogCategory.ORCHESTRATOR);

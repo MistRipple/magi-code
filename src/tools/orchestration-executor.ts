@@ -208,6 +208,27 @@ export type UpdateTodoHandler = (params: {
   }>;
 }) => Promise<{ success: boolean; error?: string }>;
 
+/**
+ * claim_next_todo 回调：Worker 主动认领下一个可执行的 Todo
+ */
+export type ClaimNextTodoHandler = (params: {
+  missionId: string;
+  workerId: string;
+}) => Promise<{
+  claimed: boolean;
+  todo?: {
+    id: string;
+    content: string;
+    type: string;
+    priority: number;
+    expectedOutput?: string;
+    targetFiles?: string[];
+    dependsOn: string[];
+  };
+  remaining: number;
+  error?: string;
+}>;
+
 export class OrchestrationExecutor {
   private dispatchHandler: DispatchTaskHandler;
   private sendMessageHandler: SendWorkerMessageHandler;
@@ -215,6 +236,7 @@ export class OrchestrationExecutor {
   private splitTodoHandler: SplitTodoHandler;
   private getTodosHandler: GetTodosHandler;
   private updateTodoHandler: UpdateTodoHandler;
+  private claimNextTodoHandler: ClaimNextTodoHandler;
 
   /** 动态 Worker 列表（必须由 MissionDrivenEngine 从 ProfileLoader 注入） */
   private availableWorkers: { slot: WorkerSlot; description: string }[] = [];
@@ -228,7 +250,7 @@ export class OrchestrationExecutor {
     scope?: { missionId?: string; sessionId?: string };
   } | null = null;
 
-  private static readonly TOOL_NAMES = ['dispatch_task', 'send_worker_message', 'wait_for_workers', 'split_todo', 'get_todos', 'update_todo'] as const;
+  private static readonly TOOL_NAMES = ['dispatch_task', 'send_worker_message', 'wait_for_workers', 'split_todo', 'get_todos', 'update_todo', 'claim_next_todo'] as const;
   private static readonly UPDATE_TODO_STATUS_ENUM: UpdateTodoStatus[] = ['pending', 'skipped'];
 
   constructor() {
@@ -262,6 +284,12 @@ export class OrchestrationExecutor {
 
     this.updateTodoHandler = async () => ({
       success: false,
+      error: runtimeUnavailable,
+    });
+
+    this.claimNextTodoHandler = async () => ({
+      claimed: false,
+      remaining: 0,
       error: runtimeUnavailable,
     });
   }
@@ -322,6 +350,7 @@ export class OrchestrationExecutor {
     splitTodo?: SplitTodoHandler;
     getTodos?: GetTodosHandler;
     updateTodo?: UpdateTodoHandler;
+    claimNextTodo?: ClaimNextTodoHandler;
   }): void {
     if (handlers.dispatch) this.dispatchHandler = handlers.dispatch;
     if (handlers.sendMessage) this.sendMessageHandler = handlers.sendMessage;
@@ -329,6 +358,7 @@ export class OrchestrationExecutor {
     if (handlers.splitTodo) this.splitTodoHandler = handlers.splitTodo;
     if (handlers.getTodos) this.getTodosHandler = handlers.getTodos;
     if (handlers.updateTodo) this.updateTodoHandler = handlers.updateTodo;
+    if (handlers.claimNextTodo) this.claimNextTodoHandler = handlers.claimNextTodo;
   }
 
   /**
@@ -349,6 +379,7 @@ export class OrchestrationExecutor {
       this.getSplitTodoDefinition(),
       this.getGetTodosDefinition(),
       this.getUpdateTodoDefinition(),
+      this.getClaimNextTodoDefinition(),
     ];
   }
 
@@ -374,6 +405,8 @@ export class OrchestrationExecutor {
         return this.executeGetTodos(toolCall, callerContext);
       case 'update_todo':
         return this.executeUpdateTodo(toolCall);
+      case 'claim_next_todo':
+        return this.executeClaimNextTodo(toolCall, callerContext);
       default:
         return {
           toolCallId: toolCall.id,
@@ -1232,6 +1265,81 @@ export class OrchestrationExecutor {
       return {
         toolCallId: toolCall.id,
         content: `Error: ${err.message}`,
+        isError: true,
+      };
+    }
+  }
+
+  // ===========================================================================
+  // claim_next_todo（半自治 Worker 主动认领任务）
+  // ===========================================================================
+
+  private getClaimNextTodoDefinition(): ExtendedToolDefinition {
+    return {
+      name: 'claim_next_todo',
+      description:
+        '主动查询并认领当前 Mission 中下一个可执行的 Todo。' +
+        '当前 Todo 完成后，调用此工具继续认领下一个任务，无需等待 Orchestrator 重新分配。' +
+        '如果没有可认领的 Todo，将返回 claimed=false。',
+      input_schema: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+      metadata: {
+        source: 'builtin',
+        category: 'orchestration',
+        tags: ['orchestration', 'worker', 'autonomous', 'claim'],
+      },
+    };
+  }
+
+  private async executeClaimNextTodo(
+    toolCall: ToolCall,
+    callerContext?: SplitTodoCallerContext
+  ): Promise<ToolResult> {
+    if (!callerContext) {
+      return {
+        toolCallId: toolCall.id,
+        content: 'Error: claim_next_todo 需要执行上下文（仅 Worker 可调用）',
+        isError: true,
+      };
+    }
+
+    logger.info('claim_next_todo 开始', {
+      missionId: callerContext.missionId,
+      workerId: callerContext.workerId,
+    }, LogCategory.TOOLS);
+
+    try {
+      const result = await this.claimNextTodoHandler({
+        missionId: callerContext.missionId,
+        workerId: callerContext.workerId,
+      });
+
+      if (result.claimed && result.todo) {
+        logger.info('claim_next_todo 认领成功', {
+          todoId: result.todo.id,
+          content: result.todo.content.substring(0, 80),
+          remaining: result.remaining,
+        }, LogCategory.TOOLS);
+      } else {
+        logger.info('claim_next_todo 无可认领任务', {
+          remaining: result.remaining,
+          error: result.error,
+        }, LogCategory.TOOLS);
+      }
+
+      return {
+        toolCallId: toolCall.id,
+        content: JSON.stringify(result),
+        isError: false,
+      };
+    } catch (err: any) {
+      logger.error('claim_next_todo 执行失败', { error: err.message }, LogCategory.TOOLS);
+      return {
+        toolCallId: toolCall.id,
+        content: `claim_next_todo failed: ${err.message}`,
         isError: true,
       };
     }

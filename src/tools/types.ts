@@ -40,6 +40,7 @@ export const BUILTIN_TOOL_NAMES = [
   'update_todo',
   'apply_skill',
   'fetch_project_guidelines',
+  'claim_next_todo',
 ] as const;
 
 /** 内置工具名称的联合类型 */

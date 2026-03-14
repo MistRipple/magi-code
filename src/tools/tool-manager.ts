@@ -717,6 +717,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     ['update-todo', 'update_todo'],
     ['apply-skill', 'apply_skill'],
     ['fetch-project-guidelines', 'fetch_project_guidelines'],
+    ['claim-next-todo', 'claim_next_todo'],
   ]);
 
   /**
@@ -1156,7 +1157,8 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
       case 'get_todos':
       case 'update_todo':
-      case 'split_todo': {
+      case 'split_todo':
+      case 'claim_next_todo': {
         // 编排层 todo 工具需要调用方上下文（标识当前 worker/assignment/todo）
         const execCtx = this.executionContextStorage.getStore();
         const callerContext = execCtx?.workerId
@@ -1374,7 +1376,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     }
 
     const orchestrationToolNames = ['dispatch_task', 'send_worker_message', 'wait_for_workers'];
-    const workerOnlyToolNames = ['split_todo'];
+    const workerOnlyToolNames = ['split_todo', 'claim_next_todo'];
     const hideOrchestrationTools = role === 'worker' && excludeOrch;
     const hideWorkerOnlyTools = role === 'orchestrator';
     const builtinTools = tools.filter(t =>
@@ -1402,6 +1404,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       'update_todo': { category: 'Task Management', desc: 'Update todo status or content' },
       'apply_skill': { category: 'Code Intelligence', desc: 'Load and apply an installed instruction skill by name' },
       'fetch_project_guidelines': { category: 'Code Intelligence', desc: 'Fetch ADRs, FAQs, or learnings from the project knowledge base' },
+      'claim_next_todo': { category: 'Task Management', desc: 'Autonomously claim the next available todo from the current mission' },
     };
 
     // 编排者专用的附加说明

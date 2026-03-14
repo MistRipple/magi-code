@@ -692,6 +692,115 @@ export class TodoManager extends EventEmitter {
     }
   }
 
+  // ============================================================================
+  // 半自治调度：可认领任务查询与原子抢占
+  // ============================================================================
+
+  /**
+   * 查询当前 Mission 中 Worker 可认领的 Todo
+   *
+   * 设计原则（对标 Claude Code s11 半自治模式）：
+   * - 仅返回 status=ready 且 dependsOn 全部满足的 Todo
+   * - 按 Worker 能力匹配排序（workerId 匹配的优先）
+   * - 排除已被其他 Worker 认领正在运行的 Todo
+   *
+   * @param missionId 当前 Mission ID
+   * @param workerId 当前 Worker 标识
+   * @returns 按优先级排序的可认领 Todo 列表
+   */
+  async findClaimable(missionId: string, workerId?: WorkerSlot): Promise<UnifiedTodo[]> {
+    const todos = await this.repository.query({
+      missionId,
+      status: ['ready', 'pending'],
+    });
+
+    // 过滤：仅保留依赖已满足的 Todo
+    const claimable: UnifiedTodo[] = [];
+    for (const todo of todos) {
+      // 跳过已分配给特定 Worker 且不匹配的（保留未指定 Worker 的通用任务）
+      if (todo.status === 'pending') {
+        // pending 状态需要检查是否应该变为 ready
+        const depMet = await this.checkDependencies(todo);
+        const contractsMet = this.checkContracts(todo);
+        if (!depMet || !contractsMet) {
+          continue;
+        }
+      }
+
+      claimable.push(todo);
+    }
+
+    // 排序：workerId 匹配的优先，然后按 priority（低值高优先）
+    claimable.sort((a, b) => {
+      // Worker 匹配优先
+      if (workerId) {
+        const aMatch = a.workerId === workerId ? 0 : 1;
+        const bMatch = b.workerId === workerId ? 0 : 1;
+        if (aMatch !== bMatch) return aMatch - bMatch;
+      }
+      // 然后按优先级
+      return a.priority - b.priority;
+    });
+
+    return claimable;
+  }
+
+  /**
+   * 原子抢占一个 Todo
+   *
+   * 通过 CAS（Compare-And-Swap）语义实现幂等抢占：
+   * - 检查 Todo 当前 status 是否为 ready/pending
+   * - 原子地转换为 running 并记录认领者
+   *
+   * @param todoId 要认领的 Todo ID
+   * @param workerId 认领的 Worker 标识
+   * @returns 认领成功时返回 Todo，已被他人认领则返回 null
+   */
+  async tryClaim(todoId: string, workerId: WorkerSlot): Promise<UnifiedTodo | null> {
+    const todo = await this.get(todoId);
+    if (!todo) {
+      return null;
+    }
+
+    // CAS 检查：仅 ready 或 pending（依赖已满足）状态可认领
+    if (todo.status !== 'ready') {
+      if (todo.status === 'pending') {
+        // 二次检查依赖
+        const depMet = await this.checkDependencies(todo);
+        const contractsMet = this.checkContracts(todo);
+        if (!depMet || !contractsMet) {
+          return null; // 依赖未满足，不可认领
+        }
+        // 先转为 ready
+        await this.setReady(todo.id);
+      } else {
+        return null; // 非可认领状态
+      }
+    }
+
+    // 原子转换为 running
+    try {
+      await this.start(todoId);
+      const claimed = await this.get(todoId);
+      if (claimed) {
+        logger.info('Todo.半自治.认领成功', {
+          todoId,
+          workerId,
+          content: claimed.content.substring(0, 80),
+        }, LogCategory.TASK);
+      }
+      return claimed;
+    } catch (error) {
+      // 竞态失败（已被其他 Worker 认领）
+      logger.debug('Todo.半自治.认领失败（竞态）', {
+        todoId,
+        workerId,
+        error: String(error),
+      }, LogCategory.TASK);
+      return null;
+    }
+  }
+
   /**
    * 重试 Todo
    */
