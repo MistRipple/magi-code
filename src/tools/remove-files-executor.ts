@@ -18,6 +18,7 @@ import { WorkspaceRoots } from '../workspace/workspace-roots';
 export class RemoveFilesExecutor implements ToolExecutor {
   private workspaceRoots: WorkspaceRoots;
   private deletedFiles: Map<string, string> = new Map(); // 用于恢复
+  private effectiveWorkspaceRootsGetter?: () => WorkspaceRoots;
 
   /** 文件删除前回调（用于快照系统在删除前保存原始内容） */
   private onBeforeWrite?: (filePath: string) => void;
@@ -26,6 +27,14 @@ export class RemoveFilesExecutor implements ToolExecutor {
 
   constructor(workspaceRoots: WorkspaceRoots) {
     this.workspaceRoots = workspaceRoots;
+  }
+
+  private getEffectiveRoots(): WorkspaceRoots {
+    return this.effectiveWorkspaceRootsGetter?.() ?? this.workspaceRoots;
+  }
+
+  setEffectiveRootsGetter(getter: () => WorkspaceRoots): void {
+    this.effectiveWorkspaceRootsGetter = getter;
   }
 
   /**
@@ -193,7 +202,7 @@ IMPORTANT:
    */
   getRecoverableFiles(): string[] {
     return Array.from(this.deletedFiles.keys()).map(p =>
-      this.workspaceRoots.toDisplayPath(p)
+      this.getEffectiveRoots().toDisplayPath(p)
     );
   }
 
@@ -209,7 +218,7 @@ IMPORTANT:
    */
   private resolveWorkspacePath(inputPath: string): { absolutePath: string | null; error?: string } {
     try {
-      const resolved = this.workspaceRoots.resolvePath(inputPath, { mustExist: false });
+      const resolved = this.getEffectiveRoots().resolvePath(inputPath, { mustExist: false });
       return { absolutePath: resolved?.absolutePath || null };
     } catch (error: any) {
       return { absolutePath: null, error: error.message };

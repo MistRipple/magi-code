@@ -60,6 +60,8 @@ import { runIntentDrivenFileEdit } from '../llm/utils/intent-file-editor';
 export interface SnapshotContext {
   sessionId: string;
   missionId: string;
+  /** 显式请求标识（用于将快照与 UI 占位消息关联） */
+  requestId?: string;
   assignmentId: string;
   todoId: string;
   workerId: string;
@@ -72,6 +74,12 @@ export interface SnapshotContext {
 export interface ToolExecutionContext {
   workerId?: string;
   role?: 'orchestrator' | 'worker';
+  /**
+   * Worktree 隔离路径（可选）。
+   * 当 Worker 任务在 git worktree 中执行时，所有文件操作
+   * 应重定向到此路径，而非主 workspaceRoot。
+   */
+  worktreePath?: string;
 }
 
 /**
@@ -191,6 +199,13 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     // 当 snapshotManager 注入后，injectSnapshotCallbacks 会覆盖 afterWriteCallback 并包含此逻辑
     this.fileExecutor.setAfterWriteCallback((filePath) => this.recordDispatchFileWrite(filePath));
 
+    // 注入 worktree 感知的 WorkspaceRoots 获取器
+    // 当 Worker 在 worktree 中执行时，所有文件工具的路径解析自动重定向到 worktree 目录
+    const worktreeRootsGetter = () => this.getEffectiveWorkspaceRoots();
+    this.fileExecutor.setEffectiveRootsGetter(worktreeRootsGetter);
+    this.searchExecutor.setEffectiveRootsGetter(worktreeRootsGetter);
+    this.removeFilesExecutor.setEffectiveRootsGetter(worktreeRootsGetter);
+
     this.registerDefaultLlmEditHandler();
   }
 
@@ -214,6 +229,11 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     this.fileExecutor.updateWorkspaceRoots(this.workspaceRoots);
     this.searchExecutor = new SearchExecutor(this.workspaceRoots);
     this.removeFilesExecutor = new RemoveFilesExecutor(this.workspaceRoots);
+
+    // 重新注入 worktree 感知的 roots getter（重建的实例需要重新绑定）
+    const worktreeRootsGetter = () => this.getEffectiveWorkspaceRoots();
+    this.searchExecutor.setEffectiveRootsGetter(worktreeRootsGetter);
+    this.removeFilesExecutor.setEffectiveRootsGetter(worktreeRootsGetter);
 
     // 重新注入快照回调（SearchExecutor/RemoveFilesExecutor 被重建了）
     this.injectSnapshotCallbacks();
@@ -1676,7 +1696,7 @@ Only set may_modify_files=true when the command directly writes source files.`,
     preferWorkspacePath?: string
   ): { absolutePath: string | null; error?: string } {
     try {
-      const resolved = this.workspaceRoots.resolvePath(inputPath, {
+      const resolved = this.getEffectiveWorkspaceRoots().resolvePath(inputPath, {
         mustExist: true,
         preferWorkspacePath,
       });
@@ -1703,8 +1723,8 @@ Only set may_modify_files=true when the command directly writes source files.`,
       };
     }
 
-    const hasMultipleRoots = this.workspaceRoots.hasMultipleRoots();
-    const workspaceFolders = this.workspaceRoots.getFolders();
+    const hasMultipleRoots = this.getEffectiveWorkspaceRoots().hasMultipleRoots();
+    const workspaceFolders = this.getEffectiveWorkspaceRoots().getFolders();
     const workspaceNames = workspaceFolders.map(folder => folder.name);
     const requestedCwd = typeof rawCwd === 'string' ? rawCwd.trim() : '';
     const workspaceHint = hasMultipleRoots
@@ -1718,7 +1738,7 @@ Only set may_modify_files=true when the command directly writes source files.`,
           error: `Multi-workspace requires explicit cwd. ${workspaceHint}`,
         };
       }
-      return this.resolveLaunchProcessWorkspacePath('.', this.workspaceRoot);
+      return this.resolveLaunchProcessWorkspacePath('.', this.getEffectiveWorkspaceRoot());
     }
 
     if (path.isAbsolute(requestedCwd)) {
@@ -1754,7 +1774,7 @@ Only set may_modify_files=true when the command directly writes source files.`,
       }
     }
 
-    return this.resolveLaunchProcessWorkspacePath(requestedCwd, this.workspaceRoot);
+    return this.resolveLaunchProcessWorkspacePath(requestedCwd, this.getEffectiveWorkspaceRoot());
   }
 
   private resolveLaunchProcessTerminalName(context?: SnapshotContext): { terminalName: string | null; error?: string } {
@@ -1925,7 +1945,7 @@ Only set may_modify_files=true when the command directly writes source files.`,
       return null;
     }
     try {
-      const resolved = this.workspaceRoots.resolvePath(rawPath, { mustExist });
+      const resolved = this.getEffectiveWorkspaceRoots().resolvePath(rawPath, { mustExist });
       return resolved?.absolutePath || null;
     } catch {
       return null;
@@ -1953,7 +1973,7 @@ Only set may_modify_files=true when the command directly writes source files.`,
       return null;
     }
 
-    const displayPath = this.workspaceRoots.toDisplayPath(absPath);
+    const displayPath = this.getEffectiveWorkspaceRoots().toDisplayPath(absPath);
     return `Error [FILE_CONTEXT_STALE]: ${displayPath} may have changed after external mutations. Run file_view on this file once, then retry file_edit/file_insert with refreshed anchors.`;
   }
 
@@ -2357,6 +2377,31 @@ Only set may_modify_files=true when the command directly writes source files.`,
       mcpServers: this.mcpExecutors.size,
       cachedTools: this.toolCache.size,
     };
+  }
+
+  /**
+   * 获取当前执行上下文的有效 WorkspaceRoots（worktree 感知）。
+   * 当 AsyncLocalStorage 中有 worktreePath 时，返回指向 worktree 的镜像实例；
+   * 否则返回默认的 workspaceRoots。用于文件/搜索/删除工具的路径解析。
+   */
+  private getEffectiveWorkspaceRoots(): WorkspaceRoots {
+    const ctx = this.executionContextStorage.getStore();
+    if (ctx?.worktreePath) {
+      return WorkspaceRoots.createForWorktree(this.workspaceRoots, ctx.worktreePath);
+    }
+    return this.workspaceRoots;
+  }
+
+  /**
+   * 获取当前执行上下文的有效工作区路径（worktree 感知）。
+   * shell 工具的 cwd 解析应使用此方法。
+   */
+  getEffectiveWorkspaceRoot(): string {
+    const ctx = this.executionContextStorage.getStore();
+    if (ctx?.worktreePath) {
+      return ctx.worktreePath;
+    }
+    return this.workspaceRoot;
   }
 
   /**

@@ -1029,6 +1029,7 @@
   "pipeline.context.workerFinished": "{workerId} 已完成: {responsibility}",
   "pipeline.errors.lspPostCheckNewErrors": "LSP 后检发现 {count} 个新增编译错误：{errors}",
   "pipeline.errors.noTargetFileChanges": "未检测到对目标文件的修改",
+  "pipeline.errors.worktreeMergeConflict": "Worktree 合并冲突：{files}",
   "pipeline.forceChange.modifyAnyTarget": "必须修改以下文件之一并保存：{files}。",
   "pipeline.forceChange.modifyTarget": "必须对目标文件进行实际修改并保存。",
   "pipeline.forceChange.noActualModification": "你之前没有对目标文件产生实际修改。",

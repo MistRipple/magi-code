@@ -87,6 +87,7 @@ type OrchestratorQueueItem = {
   imagePaths: string[];
   sessionId: string;
   turnId: string;
+  requestId: string;
   resolve: (result: OrchestratorExecutionResult) => void;
 };
 type QueuedUserTurn = {
@@ -1918,10 +1919,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     prompt: string,
     imagePaths: string[],
     sessionId: string,
-    turnId: string
+    turnId: string,
+    requestId: string
   ): Promise<OrchestratorExecutionResult> {
     return new Promise((resolve) => {
-      this.pendingExecutionQueue.push({ prompt, imagePaths, sessionId, turnId, resolve });
+      this.pendingExecutionQueue.push({ prompt, imagePaths, sessionId, turnId, requestId, resolve });
       if (this.orchestratorQueueRunning) {
         return;
       }
@@ -1942,7 +1944,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         }
         logger.info('界面.编排器.排队执行_触发', { queueRemaining: this.pendingExecutionQueue.length }, LogCategory.UI);
         try {
-          const result = await this.executeWithOrchestrator(next.prompt, next.imagePaths, next.sessionId, next.turnId);
+          const result = await this.executeWithOrchestrator(next.prompt, next.imagePaths, next.sessionId, next.turnId, next.requestId);
           next.resolve(result);
         } catch (error) {
           const errorMsg = error instanceof Error ? error.message : String(error);
@@ -2665,7 +2667,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     try {
       this.cancelProcessingResetFallback();
-      this.messageHub.setRequestContext(requestKey);
       if (options?.resumeMissionId) {
         const activated = this.orchestratorEngine.activateWorkerSessionResume(
           options.resumeMissionId,
@@ -2785,7 +2786,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         effectivePrompt,
         imagePaths,
         executionSessionId,
-        executionTurnId
+        executionTurnId,
+        requestKey
       );
       executionResult = result;
       success = result.success;
@@ -2932,7 +2934,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         }
       }
       this.messageHub.finalizeRequestContext(requestKey);
-      this.messageHub.setRequestContext(undefined);
       this.clearRequestTimeout(requestKey);
       this.orchestratorEngine.clearWorkerSessionResume();
       this.scheduleProcessingResetFallback(`executeTask:${requestKey}`);
@@ -2984,7 +2985,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     prompt: string,
     imagePaths: string[],
     sessionId: string,
-    turnId: string
+    turnId: string,
+    requestId: string
   ): Promise<OrchestratorExecutionResult> {
     logger.info('界面.执行.模式.编排', undefined, LogCategory.UI);
 
@@ -2999,7 +3001,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 注意：executeWithTaskContext 内部已将 LLM 响应流式发送到前端，
       // 引擎层同时负责通过 messageHub.result() 自主推送所有 [System] 带外段，
       // 因此不需要在此层做任何回灌或白名单匹配。
-      const taskContext = await this.orchestratorEngine.executeWithTaskContext(prompt, sessionId, imagePaths, turnId);
+      const taskContext = await this.orchestratorEngine.executeWithTaskContext(prompt, sessionId, imagePaths, turnId, requestId);
       taskId = taskContext.taskId.trim();
       const result = taskContext.result;
 
@@ -3125,7 +3127,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.cancelPendingOrchestratorQueue(t('provider.sessionSwitchedQueueCancelled'));
     // 创建新会话时，重置所有适配器
     await this.adapterFactory.shutdown();
-    this.messageHub.setRequestContext(undefined);
     this.cancelProcessingResetFallback();
     this.messageHub.forceProcessingState(false);
     const newSession = this.sessionManager.createSession();
@@ -3144,7 +3145,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private async switchToSession(sessionId: string): Promise<void> {
     this.cancelPendingOrchestratorQueue(t('provider.sessionSwitchedQueueCancelled'));
     await this.adapterFactory.shutdown();
-    this.messageHub.setRequestContext(undefined);
     this.cancelProcessingResetFallback();
     this.messageHub.forceProcessingState(false);
     this.activeSessionId = sessionId;

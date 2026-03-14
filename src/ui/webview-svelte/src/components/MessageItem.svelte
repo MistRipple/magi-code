@@ -192,8 +192,7 @@
     const meta = message.metadata as Record<string, unknown> | undefined;
     const rawRequestId = typeof meta?.requestId === 'string' ? meta.requestId.trim() : '';
     const rawMissionId = typeof meta?.missionId === 'string' ? meta.missionId.trim() : '';
-    const rawTurnId = typeof meta?.turnId === 'string' ? meta.turnId.trim() : '';
-    const scopeId = rawRequestId || (rawMissionId && rawTurnId ? `${rawMissionId}:${rawTurnId}` : '') || rawMissionId || rawTurnId;
+    const scopeId = rawRequestId || rawMissionId;
     const rawAssignmentId = typeof meta?.assignmentId === 'string' ? meta.assignmentId.trim() : '';
     if (rawAssignmentId) {
       return scopeId ? `assign:${rawAssignmentId}@${scopeId}` : `assign:${rawAssignmentId}`;
@@ -257,9 +256,8 @@
   });
 
   const cardStatusOverride = $derived.by(() => {
-    // 3 层优先级：subTask(tasks数组) > metadata(消息自身，包含固化的 wait 结果) > runtime(Worker级)
-    // 移除了依赖全局 workerWaitResults 的脆弱状态
-    return subTaskStatusOverride || metadataCardStatus || runtimeStatusOverride;
+    // 3 层优先级：subTask(tasks数组) > waitResult(全局缓存) > metadata(消息自身) > runtime(Worker级)
+    return subTaskStatusOverride || waitResultStatusOverride || metadataCardStatus || runtimeStatusOverride;
   });
   const cardStartedAtOverride = $derived.by(() =>
     subTaskStartedAtOverride ?? (isInstruction ? message.timestamp : undefined)

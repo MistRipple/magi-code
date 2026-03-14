@@ -119,9 +119,7 @@ function resolveScopeId(meta: Record<string, unknown> | undefined): string {
   const requestId = typeof meta?.requestId === 'string' ? meta.requestId.trim() : '';
   if (requestId) return requestId;
   const missionId = typeof meta?.missionId === 'string' ? meta.missionId.trim() : '';
-  const turnId = typeof meta?.turnId === 'string' ? meta.turnId.trim() : '';
-  if (missionId && turnId) return `${missionId}:${turnId}`;
-  return missionId || turnId || '';
+  return missionId || '';
 }
 
 function resolveCardKeyFromMetadata(meta: Record<string, unknown> | undefined): string {

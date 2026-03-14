@@ -58,6 +58,12 @@ export class FileExecutor implements ToolExecutor {
   private onAfterWrite?: (filePath: string) => void;
   /** 并行写入冲突检测回调（file_create/file_insert 覆写已有文件时检查是否被其他并行任务修改过） */
   private onParallelWriteCheck?: (filePath: string) => { blocked: true; conflictTasks: string[] } | null;
+  /**
+   * 有效 WorkspaceRoots 获取器（可选覆盖）。
+   * 默认返回 this.workspaceRoots；在 worktree 隔离模式下，
+   * ToolManager 通过此回调注入指向 worktree 目录的临时 WorkspaceRoots。
+   */
+  private effectiveWorkspaceRootsGetter?: () => WorkspaceRoots;
 
   constructor(workspaceRoots: WorkspaceRoots, fileMutex: FileMutex) {
     this.workspaceRoots = workspaceRoots;
@@ -65,6 +71,22 @@ export class FileExecutor implements ToolExecutor {
     this.llmEditHandler = async () => {
       throw new Error('No available LLM configuration for file_edit. Please enable at least one model (auxiliary/worker/orchestrator) with valid apiKey/baseUrl/model.');
     };
+  }
+
+  /**
+   * 获取当前有效的 WorkspaceRoots（worktree 感知）。
+   * 优先使用 getter 返回值（指向 worktree 目录），否则回退到默认实例。
+   */
+  private getEffectiveRoots(): WorkspaceRoots {
+    return this.effectiveWorkspaceRootsGetter?.() ?? this.workspaceRoots;
+  }
+
+  /**
+   * 注入有效 WorkspaceRoots 获取器（由 ToolManager 调用）。
+   * 用于 worktree 隔离模式下动态重定向文件操作路径。
+   */
+  setEffectiveRootsGetter(getter: () => WorkspaceRoots): void {
+    this.effectiveWorkspaceRootsGetter = getter;
   }
 
   /**
@@ -361,7 +383,7 @@ IMPORTANT:
     }
 
     // file_view + 多工作区 + 通用路径（如 "."）：列出所有工作区目录结构
-    if (toolCall.name === 'file_view' && this.workspaceRoots.hasMultipleRoots()) {
+    if (toolCall.name === 'file_view' && this.getEffectiveRoots().hasMultipleRoots()) {
       const normalizedPath = filePath.trim();
       if (normalizedPath === '.' || normalizedPath === '') {
         return await this.executeViewMultiRoot(toolCall.id);
@@ -425,7 +447,7 @@ IMPORTANT:
    */
   private async executeViewMultiRoot(toolCallId: string): Promise<ToolResult> {
     try {
-      const folders = this.workspaceRoots.getFolders();
+      const folders = this.getEffectiveRoots().getFolders();
       const sections: string[] = [];
       for (const folder of folders) {
         const content = await this.listDirectory(folder.path, 2);
@@ -568,10 +590,10 @@ IMPORTANT:
       // 增强错误反馈：文件不存在时提供相似文件建议
       if (error.code === 'ENOENT') {
         if (pathType === 'directory') {
-          return { toolCallId, content: `Error: Directory not found: ${this.workspaceRoots.toDisplayPath(filePath)}`, isError: true };
+          return { toolCallId, content: `Error: Directory not found: ${this.getEffectiveRoots().toDisplayPath(filePath)}`, isError: true };
         }
         const suggestions = await this.findSimilarFiles(filePath);
-        let errorMsg = `Error: File not found: ${this.workspaceRoots.toDisplayPath(filePath)}`;
+        let errorMsg = `Error: File not found: ${this.getEffectiveRoots().toDisplayPath(filePath)}`;
         if (suggestions.length > 0) {
           errorMsg += `\n\nDid you mean one of these?\n${suggestions.map(s => `  - ${s}`).join('\n')}`;
         }
@@ -639,7 +661,7 @@ IMPORTANT:
 
       if (matches.length === 0) {
         const scopeInfo = viewRange ? ` within lines ${searchStart + 1}-${searchEnd + 1}` : '';
-        const displayPath = this.workspaceRoots.toDisplayPath(filePath);
+        const displayPath = this.getEffectiveRoots().toDisplayPath(filePath);
         return {
           toolCallId,
           content: `No matches found for regex pattern: ${searchQuery}${scopeInfo} in ${displayPath}`,
@@ -649,7 +671,7 @@ IMPORTANT:
 
       // 构建带上下文的输出（对齐 Augment 格式）
       const outputLines: string[] = [];
-      const displayPath = this.workspaceRoots.toDisplayPath(filePath);
+      const displayPath = this.getEffectiveRoots().toDisplayPath(filePath);
       outputLines.push(`Regex search results for pattern: ${searchQuery} in ${displayPath}`);
       if (viewRange) {
         outputLines.push(`Search limited to lines ${searchStart + 1}-${searchEnd + 1}`);
@@ -729,7 +751,7 @@ IMPORTANT:
           const name = entry.name.toLowerCase();
           // 简单的相似度检查：包含目标名称的一部分
           if (name.includes(targetName.slice(0, 3)) || targetName.includes(name.slice(0, 3))) {
-            suggestions.push(this.workspaceRoots.toDisplayPath(path.join(targetDir, entry.name)));
+            suggestions.push(this.getEffectiveRoots().toDisplayPath(path.join(targetDir, entry.name)));
             if (suggestions.length >= 5) break;
           }
         }
@@ -798,7 +820,7 @@ IMPORTANT:
       if (originalContent && this.onParallelWriteCheck) {
         const conflict = this.onParallelWriteCheck(filePath);
         if (conflict) {
-          const displayPath = this.workspaceRoots.toDisplayPath(filePath);
+          const displayPath = this.getEffectiveRoots().toDisplayPath(filePath);
           return {
             toolCallId,
             content: `Error: ${displayPath} has been modified by parallel task(s) [${conflict.conflictTasks.join(', ')}]. ` +
@@ -822,7 +844,7 @@ IMPORTANT:
       const changeType = originalContent ? 'modify' as const : 'create' as const;
       return {
         toolCallId,
-        content: `OK: file created at ${this.workspaceRoots.toDisplayPath(filePath)}`,
+        content: `OK: file created at ${this.getEffectiveRoots().toDisplayPath(filePath)}`,
         isError: false,
         fileChange: this.buildFileChangeMetadata(originalContent, settledContent, filePath, changeType),
       };
@@ -875,7 +897,7 @@ IMPORTANT:
       } catch (error: any) {
         return {
           toolCallId,
-          content: `Error: Cannot read file ${this.workspaceRoots.toDisplayPath(filePath)} for editing: ${error.message}`,
+          content: `Error: Cannot read file ${this.getEffectiveRoots().toDisplayPath(filePath)} for editing: ${error.message}`,
           isError: true
         };
       }
@@ -889,7 +911,7 @@ IMPORTANT:
       if (typeof generated !== 'string') {
         const rawReason = 'Error during LLM edit generation: model returned non-string content';
         const userReason = toModelOriginUserMessage(rawReason);
-        trackModelOriginEvent('surfaced', 'tool:file_edit', rawReason, { filePath: this.workspaceRoots.toDisplayPath(filePath) });
+        trackModelOriginEvent('surfaced', 'tool:file_edit', rawReason, { filePath: this.getEffectiveRoots().toDisplayPath(filePath) });
         return {
           toolCallId,
           content: userReason || '模型输出异常：未返回可写入文本。',
@@ -901,7 +923,7 @@ IMPORTANT:
       const rawReason = `Error during LLM edit generation: ${error?.message || String(error)}`;
       const userReason = toModelOriginUserMessage(rawReason);
       trackModelOriginEvent('surfaced', 'tool:file_edit', rawReason, {
-        filePath: this.workspaceRoots.toDisplayPath(filePath),
+        filePath: this.getEffectiveRoots().toDisplayPath(filePath),
       });
       return {
         toolCallId,
@@ -913,7 +935,7 @@ IMPORTANT:
     if (newContent === baseContent) {
       return {
         toolCallId,
-        content: `No changes were made to ${this.workspaceRoots.toDisplayPath(filePath)}. The new content is identical to the original.`,
+        content: `No changes were made to ${this.getEffectiveRoots().toDisplayPath(filePath)}. The new content is identical to the original.`,
         isError: false
       };
     }
@@ -930,7 +952,7 @@ IMPORTANT:
 
     return {
       toolCallId,
-      content: `Successfully edited ${this.workspaceRoots.toDisplayPath(filePath)} based on intent.\nSummary: ${editSummary}`,
+      content: `Successfully edited ${this.getEffectiveRoots().toDisplayPath(filePath)} based on intent.\nSummary: ${editSummary}`,
       isError: false,
       fileChange: this.buildFileChangeMetadata(baseContent, settledContent, filePath, 'modify'),
     };
@@ -1218,7 +1240,7 @@ IMPORTANT:
    */
   private resolveWorkspacePath(inputPath: string, mustExist: boolean): { absolutePath: string | null; error?: string } {
     try {
-      const resolved = this.workspaceRoots.resolvePath(inputPath, { mustExist });
+      const resolved = this.getEffectiveRoots().resolvePath(inputPath, { mustExist });
       return { absolutePath: resolved?.absolutePath || null };
     } catch (error: any) {
       return { absolutePath: null, error: `Error: ${error.message}` };
@@ -1236,7 +1258,7 @@ IMPORTANT:
     filePath: string,
     changeType: 'create' | 'modify' | 'delete'
   ): FileChangeMetadata {
-    const displayPath = this.workspaceRoots.toDisplayPath(filePath);
+    const displayPath = this.getEffectiveRoots().toDisplayPath(filePath);
     const { additions, deletions, diff } = this.generateUnifiedDiff(originalContent, newContent, displayPath);
 
     return {

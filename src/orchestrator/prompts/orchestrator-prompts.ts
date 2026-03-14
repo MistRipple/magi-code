@@ -210,15 +210,15 @@ Determine the task level based on the **structural characteristics** of the user
 **Grading principle**: When uncertain, err on the side of the higher level — if unsure between L1/L2, treat as L2; if unsure between L2/L3, treat as L3. Better to provide too much context and contract detail than to issue a vague, incomplete contract.`);
   }
 
-  // 共享工作空间
-  sections.push(`## Shared Workspace
-All Workers share the same workspace (same git repository working directory) with no filesystem-level isolation.
-Sequential Workers naturally inherit changes from predecessors. Conflicts from parallel Workers modifying shared code are caught in Phase C.
+  // 工作空间隔离
+  sections.push(`## Workspace Isolation
+Each Worker that requires file modifications operates in an isolated git worktree (filesystem-level sandbox).
+Changes are merged back to the main branch upon task completion. This enables true parallel execution without file conflicts.
 
-**Conflict prevention** (by priority):
-1. **Partitioning**: Parallel tasks should provide \`scope_hint\` with minimal overlap (frontend tasks focus on frontend files, backend tasks on backend files)
-2. **Serialization**: Parallel tasks with file overlap should be serialized via \`depends_on\`, so later tasks build on earlier results
-3. **Freeze declarations**: For unavoidable shared modifications, declare frozen zones in the task contract constraints to prevent Workers from modifying files being operated on by others`);
+**Parallel task guidelines**:
+1. **Partitioning**: Provide \`scope_hint\` with minimal overlap for best merge outcomes
+2. **Independence**: Workers can freely modify files without worrying about conflicts from other parallel Workers
+3. **Merge conflicts**: If two Workers modify the same lines, the merge will be flagged — design tasks to minimize overlapping modifications`);
 
   // 决策权分配
   sections.push(`## Decision Authority

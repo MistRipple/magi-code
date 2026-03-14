@@ -27,6 +27,7 @@ import { LspEnforcer } from '../lsp/lsp-enforcer';
 import { logger, LogCategory } from '../../logging';
 import type { AssembledContext } from '../../context/context-assembler';
 import { t } from '../../i18n';
+import type { WorktreeManager, WorktreeMergeResult } from '../../workspace/worktree-manager';
 
 // ============================================================================
 // 配置与结果类型
@@ -46,6 +47,7 @@ export interface PipelineConfig {
   cancellationToken?: CancellationToken;
   imagePaths?: string[];
   missionId?: string;
+  requestId?: string;
   sessionId?: string;
   resumeSessionId?: string;
   resumePrompt?: string;
@@ -60,6 +62,8 @@ export interface PipelineConfig {
   snapshotManager?: SnapshotManager | null;
   contextManager?: import('../../context/context-manager').ContextManager | null;
   todoManager?: import('../../todo').TodoManager | null;
+  /** Worktree 管理器（当任务需要写操作且 workspace 是 git 仓库时注入） */
+  worktreeManager?: WorktreeManager | null;
 
   // 反应式编排：补充指令回调（由 DispatchManager 从 SupplementaryInstructionQueue 注入）
   getSupplementaryInstructions?: () => string[];
@@ -69,6 +73,8 @@ export interface PipelineResult {
   executionResult: AutonomousExecutionResult;
   lspNewErrors: string[];
   targetChangeDetected: boolean;
+  /** Worktree merge 结果（仅在 worktree 隔离模式下有值） */
+  worktreeMerge?: WorktreeMergeResult;
 }
 
 // ============================================================================
@@ -86,8 +92,18 @@ export class WorkerPipeline {
       enableSnapshot, enableLSP, enableTargetEnforce, enableContextUpdate,
       snapshotManager, contextManager, todoManager,
       getSupplementaryInstructions,
+      worktreeManager,
     } = config;
     const missionId = config.missionId || 'dispatch';
+
+    // ========== 0. [可选] Worktree 隔离 ==========
+    // 当任务需要写操作且 worktreeManager 可用时，分配独立 worktree
+    const requiresWrite = assignment.scope?.requiresModification ?? false;
+    const worktreeAllocation = requiresWrite && worktreeManager
+      ? worktreeManager.acquire(assignment.id)
+      : null;
+    // Worker 的有效工作目录：worktree 路径 > 原始 workspaceRoot
+    const effectiveWorkspaceRoot = worktreeAllocation?.worktreePath ?? workspaceRoot;
 
     logger.info(
       'WorkerPipeline.开始',
@@ -95,6 +111,8 @@ export class WorkerPipeline {
         assignmentId: assignment.id,
         worker: assignment.workerId,
         governance: { enableSnapshot, enableLSP, enableTargetEnforce, enableContextUpdate },
+        worktreeIsolated: !!worktreeAllocation,
+        effectiveWorkspaceRoot: worktreeAllocation ? effectiveWorkspaceRoot : undefined,
       },
       LogCategory.ORCHESTRATOR
     );
@@ -111,6 +129,7 @@ export class WorkerPipeline {
       toolManager.setSnapshotContext({
         sessionId: normalizedSessionId,
         missionId,
+        requestId: config.requestId,
         assignmentId: assignment.id,
         todoId: assignment.id,
         workerId: assignment.workerId,
@@ -125,10 +144,10 @@ export class WorkerPipeline {
     // ========== 3/4/5. 上下文快照 + 目标文件收集 + LSP 预检（并行执行） ==========
     // 这三个步骤无互依赖，并行执行减少总耗时
     const targetFiles = this.collectTargetFiles(assignment);
-    const normalizedTargets = this.normalizeTargetFiles(targetFiles, workspaceRoot);
+    const normalizedTargets = this.normalizeTargetFiles(targetFiles, effectiveWorkspaceRoot);
     let preExecutionContents: Map<string, string> | null = null;
     if (enableTargetEnforce && normalizedTargets.length > 0) {
-      preExecutionContents = this.captureTargetContents(normalizedTargets, workspaceRoot);
+      preExecutionContents = this.captureTargetContents(normalizedTargets, effectiveWorkspaceRoot);
     }
 
     const assembledContextPromise = enableContextUpdate && contextManager
@@ -174,7 +193,7 @@ export class WorkerPipeline {
 
     try {
       result = await workerInstance.executeAssignment(assignment, {
-        workingDirectory: workspaceRoot,
+        workingDirectory: effectiveWorkspaceRoot,
         adapterFactory,
         projectContext,
         onReport,
@@ -190,7 +209,7 @@ export class WorkerPipeline {
       // ========== 7. [可选] 目标变更检测 + 强制重试 ==========
       if (enableTargetEnforce && preExecutionContents && normalizedTargets.length > 0
           && assignment.scope?.requiresModification) {
-        const hasChanges = this.hasContentChanges(normalizedTargets, preExecutionContents, workspaceRoot)
+        const hasChanges = this.hasContentChanges(normalizedTargets, preExecutionContents, effectiveWorkspaceRoot)
           || (snapshotManager ? this.hasAssignmentChanges(snapshotManager, assignment.id, normalizedTargets) : false);
 
         if (!hasChanges) {
@@ -208,7 +227,7 @@ export class WorkerPipeline {
           assignment.guidancePrompt = `${originalGuidance}\n\n${this.buildForceChangeGuidance(normalizedTargets)}`;
 
           result = await workerInstance.executeAssignment(assignment, {
-            workingDirectory: workspaceRoot,
+            workingDirectory: effectiveWorkspaceRoot,
             adapterFactory,
             projectContext,
             onReport,
@@ -221,7 +240,7 @@ export class WorkerPipeline {
 
           assignment.guidancePrompt = originalGuidance;
 
-          const retryHasChanges = this.hasContentChanges(normalizedTargets, preExecutionContents, workspaceRoot)
+          const retryHasChanges = this.hasContentChanges(normalizedTargets, preExecutionContents, effectiveWorkspaceRoot)
             || (snapshotManager ? this.hasAssignmentChanges(snapshotManager, assignment.id, normalizedTargets) : false);
 
           if (!retryHasChanges) {
@@ -277,7 +296,34 @@ export class WorkerPipeline {
       LogCategory.ORCHESTRATOR
     );
 
-    return { executionResult: result, lspNewErrors, targetChangeDetected };
+    // ========== 10. [可选] Worktree merge + release ==========
+    let worktreeMerge: WorktreeMergeResult | undefined;
+    if (worktreeAllocation && worktreeManager) {
+      try {
+        if (result.success) {
+          worktreeMerge = worktreeManager.merge(assignment.id);
+          if (worktreeMerge.hasConflicts) {
+            logger.warn('WorkerPipeline.Worktree.合并冲突', {
+              assignmentId: assignment.id,
+              conflictFiles: worktreeMerge.conflictFiles,
+            }, LogCategory.ORCHESTRATOR);
+            // 将冲突信息注入执行结果
+            if (!result.errors) { result.errors = []; }
+            result.errors.push(t('pipeline.errors.worktreeMergeConflict', {
+              files: worktreeMerge.conflictFiles.join(', '),
+            }));
+          }
+        } else {
+          logger.info('WorkerPipeline.Worktree.跳过合并_任务失败', {
+            assignmentId: assignment.id,
+          }, LogCategory.ORCHESTRATOR);
+        }
+      } finally {
+        worktreeManager.release(assignment.id);
+      }
+    }
+
+    return { executionResult: result, lspNewErrors, targetChangeDetected, worktreeMerge };
   }
 
   // ===========================================================================

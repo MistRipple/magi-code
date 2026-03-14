@@ -616,6 +616,52 @@ Worker 的 System Prompt 应高度聚焦于当前派发的具体指派（Assignm
 
 ---
 
+### 6.4 核心重构四：融合 Micro-Compact，优化 Orchestrator 上下文
+
+**1. [表象分析] (Symptom Analysis)**
+随着多轮对话和执行，Orchestrator 规划层容易出现 `budget_exceeded`（Token 超出预算）问题，LLM 响应变慢，且有时会因为历史信息过载而出现幻觉。
+
+**2. [机理溯源] (Context & Flow)**
+Orchestrator 需要记忆先前的规划和执行结果（通过 `recent_turns` 组装 L2 上下文），以便基于全局状态做出下一步决策。
+
+**3. [差距诊断] (Gap Diagnosis)**
+目前的 `ContextAssembler` 会将之前 Worker 返回的大量结构化报告（summary、errors、completedTodos 等）作为历史记录全量保留。经过几轮迭代后，这些长段的 `wait_for_workers` 结果迅速填满了 Orchestrator 的上下文窗口。
+
+**4. [根本原因分析] (Root Cause Analysis)**
+为什么需要保留全量结果？
+
+- 架构缺乏对已消费信息（已提取并落库到 PlanLedger 的状态）的折叠机制，系统简单地将所有历史交互视为同等重要。
+
+**5. [彻底修复与债清偿] (Fundamental Fix & Cleanup)**
+
+- **源头修复**：借鉴 Claude Code 的 s06 模式（micro_compact）。增强 `truncation-utils.ts`，精准识别超过 3 个 Turn 之前的 `tool_result`。如果识别出是 `wait_for_workers` 的长返回，则将其正则替换为 `[已折叠：历史派发结果，已提取至 PlanLedger]` 的占位符。
+- **禁止回退逻辑**：严禁采用粗暴截断末尾信息的“丢弃式”压缩，必须保留事件发生的“指针”记忆。
+- **清理债务**：移除现有的粗粒度 Token 强行截断逻辑，确保上下文即使被压缩也具备语义连贯性。
+
+---
+
+### 6.5 核心重构五：探索“半自治” Worker 调度模式（长期演进）
+
+**1. [表象分析] (Symptom Analysis)**
+系统高频地穿梭于 Orchestrator 和 Worker 之间，Orchestrator 处理状态变迁和重试逻辑造成大量中间状态调用，增加了端到端延迟和 API 成本。
+
+**2. [机理溯源] (Context & Flow)**
+`mission-driven-engine.ts` 是系统的中枢大脑，所有的任务分配、状态变迁（pending -> running -> verify -> completed）和异常恢复都必须由 Orchestrator 主导。
+
+**3. [差距诊断] (Gap Diagnosis)**
+系统极度依赖单一高级模型（如 Claude）做 Orchestrator，使其成了系统瓶颈（"保姆"式管理）。当执行确定性的任务图时，无需高级模型频繁介入分配。
+
+**4. [根本原因分析] (Root Cause Analysis)**
+根因在于 Worker 缺乏自组织能力。现在的 Worker 是一次性的、被动的函数调用，而不是持续在线、能主动拉取任务的自治体。
+
+**5. [彻底修复与债清偿] (Fundamental Fix & Cleanup)**
+
+- **源头修复**：对标 Claude Code s11。将 Orchestrator 降级为“项目经理”角色（仅负责分析需求并生成带有 `blockedBy` 依赖的 PlanLedger）。重构 `AutonomousWorker` 引入生命周期循环（`Loop`）。Worker 空闲时主动查询 `get_unclaimed_todos`，基于幂等锁（复用 `DispatchIdempotencyStore`）抢占自己擅长的任务，完成后写回 Ledger 并继续认领。
+- **禁止多重实现**：新架构下必须剥离 `mission-driven-engine.ts` 中针对单个子任务的微观状态管理逻辑，交由自治 Worker 闭环。
+- **清理债务**：逐步拆解 `mission-driven-engine.ts`（当前 3500+ 行），大幅精简 Orchestrator 的微观控制面代码，最终实现去中心化调度。
+
+---
+
 ## 七、结语
 
 Magi 的架构是高度工程化和防御性的（拥有复杂的 Orchestrator、Plan Ledger、Verification Pipeline），这在真实的 IDE 生产级场景下是必不可少的。然而，过度的集中防御也带来了全局状态耦合（如 requestContext 竞态）与并发瓶颈。

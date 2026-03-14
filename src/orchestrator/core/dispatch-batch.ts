@@ -142,6 +142,7 @@ export interface DispatchTaskContract {
 /** 单个 dispatch 条目 */
 export interface DispatchEntry {
   taskId: string;
+  requestId?: string; // Explicit request ID for this entry
   worker: WorkerSlot;
   taskContract: DispatchTaskContract;
   status: DispatchStatus;
@@ -215,6 +216,7 @@ export interface DispatchBatchEvents {
 
 export class DispatchBatch extends EventEmitter {
   readonly id: string;
+  readonly requestId: string;
   private entries: Map<string, DispatchEntry> = new Map();
   private _phase: BatchPhase = 'active';
   private readonly createdAt: number;
@@ -234,6 +236,7 @@ export class DispatchBatch extends EventEmitter {
   constructor(batchId?: string) {
     super();
     this.id = batchId || `batch-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    this.requestId = `req-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
     this.createdAt = Date.now();
     this._lastActivityAt = Date.now();
   }
@@ -348,6 +351,7 @@ export class DispatchBatch extends EventEmitter {
 
     const entry: DispatchEntry = {
       taskId: params.taskId,
+      requestId: this.requestId,
       worker: params.worker,
       taskContract,
       status: dependencyState.status,
@@ -497,100 +501,6 @@ export class DispatchBatch extends EventEmitter {
     return Array.from(this.entries.values()).every(
       e => isTerminalStatus(e.status)
     );
-  }
-
-  /**
-   * 检测文件冲突（多个并行任务操作相同文件）
-   * 返回冲突组：每组包含操作同一文件的 taskId 列表
-   */
-  detectFileConflicts(): Map<string, string[]> {
-    const fileToTasks = new Map<string, string[]>();
-
-    for (const entry of this.entries.values()) {
-      if (!entry.taskContract.requirementAnalysis.requiresModification) {
-        continue;
-      }
-      // 只检测可能并行的任务（无依赖关系的）
-      for (const file of entry.taskContract.files) {
-        const tasks = fileToTasks.get(file) || [];
-        tasks.push(entry.taskId);
-        fileToTasks.set(file, tasks);
-      }
-    }
-
-    // 过滤出冲突文件（有多个任务操作且这些任务间无依赖关系）
-    const conflicts = new Map<string, string[]>();
-    for (const [file, taskIds] of fileToTasks) {
-      if (taskIds.length <= 1) continue;
-
-      // 检查这些任务间是否有依赖关系
-      const independentTasks = taskIds.filter(taskId => {
-        const entry = this.entries.get(taskId)!;
-        return !taskIds.some(otherId =>
-          otherId !== taskId && entry.taskContract.dependsOn.includes(otherId)
-        );
-      });
-
-      if (independentTasks.length > 1) {
-        conflicts.set(file, independentTasks);
-      }
-    }
-
-    return conflicts;
-  }
-
-  /**
-   * 解决文件冲突 — 将冲突的并行任务自动转为串行
-   *
-   * 约束 6：多个并行 Worker 声明了重叠的 files 参数时，
-   * 自动为后注册的冲突任务添加 depends_on，使其串行执行。
-   *
-   * @returns 实际添加的依赖数量（0 表示无冲突或已有依赖）
-   */
-  resolveFileConflicts(): number {
-    const conflicts = this.detectFileConflicts();
-    if (conflicts.size === 0) return 0;
-
-    let addedDeps = 0;
-
-    // 收集所有存在冲突的 taskId 对（去重）
-    const processedPairs = new Set<string>();
-
-    for (const [file, conflictIds] of conflicts) {
-      // 按注册顺序排列（createdAt 时间戳）
-      const sorted = conflictIds
-        .map(id => this.entries.get(id)!)
-        .sort((a, b) => a.createdAt - b.createdAt);
-
-      // 将后注册的任务依赖于前一个任务（链式串行）
-      for (let i = 1; i < sorted.length; i++) {
-        const prev = sorted[i - 1];
-        const curr = sorted[i];
-        const pairKey = `${prev.taskId}->${curr.taskId}`;
-
-        if (processedPairs.has(pairKey)) continue;
-        processedPairs.add(pairKey);
-
-        // 如果已有依赖关系则跳过
-        if (curr.taskContract.dependsOn.includes(prev.taskId)) continue;
-
-        curr.taskContract.dependsOn.push(prev.taskId);
-        // 如果当前任务原本是 pending，改为 waiting_deps
-        if (curr.status === 'pending') {
-          curr.status = 'waiting_deps';
-        }
-        addedDeps++;
-
-        logger.info('DispatchBatch.文件冲突.自动串行化', {
-          batchId: this.id,
-          file: file,
-          predecessor: prev.taskId,
-          dependent: curr.taskId,
-        }, LogCategory.ORCHESTRATOR);
-      }
-    }
-
-    return addedDeps;
   }
 
   /**

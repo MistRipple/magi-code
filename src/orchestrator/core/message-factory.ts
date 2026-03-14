@@ -46,6 +46,7 @@ export interface WorkerInstructionMetadata {
   laneIndex?: number;
   laneTotal?: number;
   laneTaskIds?: string[];
+  requestId?: string;
 }
 
 /** MessagePipeline 接口（协议层） */
@@ -69,8 +70,7 @@ export class MessageFactory {
   setTraceId(traceId: string): void { this.traceId = traceId; }
   getTraceId(): string { return this.traceId; }
   newTrace(): string { this.traceId = this.generateTraceId(); return this.traceId; }
-  setRequestContext(requestId?: string): void { this.requestId = requestId; }
-  getRequestContext(): string | undefined { return this.requestId; }
+
 
   /** 发送进度消息 - 显示在主对话区 */
   progress(phase: string, content: string, options?: { percentage?: number; metadata?: MessageMetadata }): void {
@@ -91,7 +91,7 @@ export class MessageFactory {
       logger.warn('MessageFactory.result.空内容跳过', undefined, LogCategory.SYSTEM);
       return;
     }
-    const requestId = (options?.metadata as { requestId?: string } | undefined)?.requestId || this.requestId;
+    const requestId = (options?.metadata as { requestId?: string } | undefined)?.requestId;
     const reuseMessageId = requestId ? this.pipeline.getRequestMessageId?.(requestId) : undefined;
     const message = createStandardMessage({
       id: reuseMessageId,
@@ -151,7 +151,8 @@ export class MessageFactory {
     // scope 优先级：requestId > missionId。
     // 注意：task card 的生命周期必然跨越多个 turn（从派发 pending 到最终 completed 往往经过多轮交互），
     // 绝对不能将 turnId 作为卡片唯一 ID 的一部分，否则在 task 跨回合完成时会导致重复渲染多张卡片。
-    const scopeId = this.requestId || rawMissionId;
+    const explicitRequestId = typeof normalizedSubTask.requestId === 'string' ? normalizedSubTask.requestId.trim() : '';
+    const scopeId = explicitRequestId || rawMissionId;
     const stableMessageId = scopeId
       ? `subtask-card-${normalizedSubTask.id}-${scopeId}`
       : `subtask-card-${normalizedSubTask.id}`;
@@ -382,9 +383,6 @@ export class MessageFactory {
   }
 
   private enrichMetadata(metadata: MessageMetadata): MessageMetadata {
-    if (this.requestId && !metadata.requestId) {
-      return { ...metadata, requestId: this.requestId };
-    }
     return metadata;
   }
 

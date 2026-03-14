@@ -1641,7 +1641,8 @@ export class MissionDrivenEngine extends EventEmitter {
     taskId: string,
     sessionId?: string,
     imagePaths?: string[],
-    turnIdHint?: string
+    turnIdHint?: string,
+    requestId?: string
   ): Promise<string> {
     return this.enqueueExecution(async () => {
       const trimmedPrompt = userPrompt?.trim() || '';
@@ -1867,6 +1868,7 @@ export class MissionDrivenEngine extends EventEmitter {
         orchestratorToolManager.setSnapshotContext({
           sessionId: normalizedSessionId,
           missionId: this.lastMissionId || this.currentTurnId!,
+          requestId: orchestratorAttemptTargetId || this.currentTurnId!,
           assignmentId: orchestratorAssignmentId,
           todoId: orchestratorAssignmentId,
           workerId: 'orchestrator',
@@ -1938,6 +1940,7 @@ export class MissionDrivenEngine extends EventEmitter {
               adapterRole: 'orchestrator',
               systemPrompt,
               includeToolCalls: true,
+              requestId,
             }
           );
           orchestratorRuntimeReason = this.normalizeOrchestratorRuntimeReason(response.orchestratorRuntime?.reason);
@@ -2745,9 +2748,10 @@ export class MissionDrivenEngine extends EventEmitter {
     userPrompt: string,
     sessionId?: string,
     imagePaths?: string[],
-    turnIdHint?: string
+    turnIdHint?: string,
+    requestId?: string
   ): Promise<{ taskId: string; result: string }> {
-    const result = await this.execute(userPrompt, '', sessionId, imagePaths, turnIdHint);
+    const result = await this.execute(userPrompt, '', sessionId, imagePaths, turnIdHint, requestId);
     return { taskId: this.lastMissionId || '', result };
   }
 

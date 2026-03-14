@@ -1029,6 +1029,7 @@
   "pipeline.context.workerFinished": "{workerId} finished: {responsibility}",
   "pipeline.errors.lspPostCheckNewErrors": "LSP post-check found {count} new compile errors: {errors}",
   "pipeline.errors.noTargetFileChanges": "No modifications detected on target files",
+  "pipeline.errors.worktreeMergeConflict": "Worktree merge conflict: {files}",
   "pipeline.forceChange.modifyAnyTarget": "You must modify and save at least one of these files: {files}.",
   "pipeline.forceChange.modifyTarget": "You must make and save actual changes to target files.",
   "pipeline.forceChange.noActualModification": "You previously made no actual modifications to target files.",

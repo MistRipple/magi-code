@@ -78,6 +78,13 @@ export abstract class BaseLLMAdapter extends EventEmitter {
    */
   protected messageHub: MessageHub;
 
+  /**
+   * 当前请求的显式标识（实例级，非全局）。
+   * 由 AdapterFactory 在每次 sendMessage 前通过 setCurrentRequestId 注入，
+   * 用于将流式输出绑定到 UI 占位消息。取代已废弃的全局 requestContext。
+   */
+  protected currentRequestId: string | undefined;
+
   protected decisionHook?: (event: {
     type: 'thinking' | 'tool_call' | 'tool_result';
     toolName?: string;
@@ -702,12 +709,21 @@ export abstract class BaseLLMAdapter extends EventEmitter {
   }
 
   /**
+   * 设置当前请求标识（由 AdapterFactory 在每次 sendMessage 调用前注入）。
+   * 实例级变量，不存在多 Worker 并发竞态。
+   */
+  setCurrentRequestId(requestId: string | undefined): void {
+    this.currentRequestId = requestId;
+  }
+
+  /**
    * 使用当前请求上下文启动流式消息
-   * 优先复用占位消息 ID，确保 UI 端流式更新命中同一条消息
+   * 优先复用占位消息 ID，确保 UI 端流式更新命中同一条消息。
+   * 从实例级 currentRequestId 获取标识（取代已废弃的全局 requestContext）。
    */
   protected startStreamWithContext(visibility?: 'user' | 'system' | 'debug'): string {
     const traceId = this.syncTraceFromMessageHub();
-    const requestId = this.messageHub.getRequestContext();
+    const requestId = this.currentRequestId;
     const boundMessageId = requestId ? this.messageHub.getRequestMessageId(requestId) : undefined;
 
     return this.normalizer.startStream(traceId, undefined, boundMessageId, visibility);

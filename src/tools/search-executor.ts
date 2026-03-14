@@ -27,9 +27,18 @@ export class SearchExecutor implements ToolExecutor {
   private workspaceRoots: WorkspaceRoots;
   private defaultContextLines = 5;
   private maxResults = 100;
+  private effectiveWorkspaceRootsGetter?: () => WorkspaceRoots;
 
   constructor(workspaceRoots: WorkspaceRoots) {
     this.workspaceRoots = workspaceRoots;
+  }
+
+  private getEffectiveRoots(): WorkspaceRoots {
+    return this.effectiveWorkspaceRootsGetter?.() ?? this.workspaceRoots;
+  }
+
+  setEffectiveRootsGetter(getter: () => WorkspaceRoots): void {
+    this.effectiveWorkspaceRootsGetter = getter;
   }
 
   /**
@@ -201,7 +210,7 @@ export class SearchExecutor implements ToolExecutor {
             );
 
             matches.push({
-              file: this.workspaceRoots.toDisplayPath(file),
+              file: this.getEffectiveRoots().toDisplayPath(file),
               line: i + 1, // 1-based
               content: lines[i],
               contextBefore,
@@ -265,11 +274,11 @@ export class SearchExecutor implements ToolExecutor {
 
   private resolveSearchPaths(inputPath?: string): string[] {
     if (!inputPath || inputPath.trim() === '') {
-      return this.workspaceRoots.getRootPaths();
+      return this.getEffectiveRoots().getRootPaths();
     }
 
     try {
-      const resolved = this.workspaceRoots.resolvePath(inputPath, { mustExist: true });
+      const resolved = this.getEffectiveRoots().resolvePath(inputPath, { mustExist: true });
       if (!resolved) {
         return [];
       }

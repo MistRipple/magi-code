@@ -58,6 +58,7 @@ import {
 import { isModelOriginIssue, toModelOriginUserMessage } from '../../errors/model-origin';
 import { trackModelOriginEvent } from '../../errors/model-origin-observability';
 import { createHash } from 'crypto';
+import { WorktreeManager } from '../../workspace/worktree-manager';
 
 type DispatchAckState = 'pending' | 'acked' | 'nacked';
 
@@ -189,6 +190,8 @@ export class DispatchManager {
   /** 执行协议状态（ack/nack + lease + heartbeat） */
   private executionProtocolStates = new Map<string, DispatchExecutionProtocolState>();
   private leaseWatcherTimer?: NodeJS.Timeout;
+  /** Git worktree 沙盒管理器（文件系统级并行隔离） */
+  private readonly worktreeManager: WorktreeManager;
 
   constructor(private deps: DispatchManagerDeps) {
     this.routingService = new DispatchRoutingService(
@@ -201,6 +204,7 @@ export class DispatchManager {
       DispatchManager.MAX_MISSION_SESSION_RECORDS,
     );
     this.dispatchIdempotencyStore = new DispatchIdempotencyStore(this.deps.workspaceRoot);
+    this.worktreeManager = new WorktreeManager(this.deps.workspaceRoot);
     this.reportIdempotencyDeploymentDiagnostic();
     this.setupMissionEventListeners();
     this.startLeaseWatcher();
@@ -278,12 +282,15 @@ export class DispatchManager {
   private emitSubTaskCard(payload: SubTaskCardPayload): void {
     const rawMissionId = typeof payload.missionId === 'string' ? payload.missionId.trim() : '';
     const rawTurnId = typeof payload.turnId === 'string' ? payload.turnId.trim() : '';
+    const rawRequestId = typeof payload.requestId === 'string' ? payload.requestId.trim() : '';
     const missionId = rawMissionId || this.activeBatch?.id || this.deps.getCurrentTurnId() || undefined;
     const turnId = rawTurnId || this.deps.getCurrentTurnId() || undefined;
+    const requestId = rawRequestId || this.activeBatch?.requestId || undefined;
     this.deps.messageHub.subTaskCard({
       ...payload,
       ...(missionId ? { missionId } : {}),
       ...(turnId ? { turnId } : {}),
+      ...(requestId ? { requestId } : {}),
     });
   }
 
@@ -686,16 +693,8 @@ export class DispatchManager {
           this.activeBatch.topologicalSort();
           this.activeBatch.validateDepthLimit();
 
-          // C-13: 文件冲突解决 — 冲突的并行任务自动添加依赖转串行
-          const serialized = this.activeBatch.resolveFileConflicts();
-          if (serialized > 0) {
-            logger.info('DispatchBatch.文件冲突.已自动串行化', {
-              addedDeps: serialized, taskId,
-            }, LogCategory.ORCHESTRATOR);
-            // 串行化后重新验证拓扑和深度
-            this.activeBatch.topologicalSort();
-            this.activeBatch.validateDepthLimit();
-          }
+          // C-13: 文件冲突由 Worktree 隔离机制处理（每个写任务独立 worktree），
+          // 不再需要串行降级。
         } catch (regError: any) {
           this.dispatchIdempotencyStore.removeByTaskId(taskId);
           return {
@@ -748,6 +747,7 @@ export class DispatchManager {
           title: taskTitle,
           status: cardStatus,
           worker: decision.selectedWorker,
+          requestId: this.activeBatch.requestId,
           ...(entryStatus === 'skipped' && entry?.result?.summary
             ? { summary: entry.result.summary }
             : {}),
@@ -784,7 +784,25 @@ export class DispatchManager {
             messagePreview: message.substring(0, 80),
           }, LogCategory.ORCHESTRATOR);
         }
-        this.deps.messageHub.workerInstruction(worker, message);
+
+        // Find current worker's taskId to get missionId and optional laneCardId
+        let missionId: string | undefined;
+        if (this.activeBatch) {
+          const entry = Array.from(this.activeBatch.getEntries()).find(e => e.worker === worker && e.status === 'running');
+          if (entry) {
+             const assignment = this.activeAssignments.get(entry.taskId);
+             if (assignment) {
+               missionId = assignment.missionId;
+             }
+          }
+        }
+
+        const requestId = this.activeBatch?.requestId;
+
+        this.deps.messageHub.workerInstruction(worker, message, {
+           ...(missionId ? { missionId } : {}),
+           ...(requestId ? { requestId } : {}),
+        });
         return { delivered };
       },
 
@@ -1221,6 +1239,7 @@ export class DispatchManager {
           projectContext,
           // 与 Todo/Assignment 使用同一真实 missionId，避免终止快照作用域错位。
           missionId,
+          requestId: batch?.requestId,
           sessionId: currentSessionId,
           onReport: (report) => this.handleDispatchWorkerReport(report, batch),
           cancellationToken: batch?.cancellationToken,
@@ -1241,6 +1260,7 @@ export class DispatchManager {
           snapshotManager,
           contextManager,
           todoManager: this.deps.getTodoManager(),
+          worktreeManager: this.worktreeManager,
         });
       } finally {
         this.activeAssignments.delete(taskId);
@@ -1486,6 +1506,7 @@ export class DispatchManager {
     if (!batch) {
       this.deps.messageHub.workerInstruction(worker, entry.taskContract.taskTitle, {
         assignmentId: entry.taskId,
+        requestId: entry.requestId,
       });
       return;
     }
@@ -1506,6 +1527,7 @@ export class DispatchManager {
       {
         assignmentId: focusEntry.taskId,
         missionId: batch.id,
+        requestId: batch.requestId,
         laneId,
         laneCardId,
         laneIndex,
@@ -1996,6 +2018,7 @@ export class DispatchManager {
         status: 'running',
         worker: report.workerId,
         summary: `${report.progress.percentage}% - ${report.progress.currentStep}`,
+        requestId: batch?.requestId,
       });
       return defaultResponse;
     }
@@ -3109,5 +3132,7 @@ export class DispatchManager {
     this.stopLeaseWatcher();
     this.clearAllProtocolStates();
     this.clearDispatchScheduleTimers();
+    // 释放所有未完成的 worktree（崩溃/中断恢复）
+    this.worktreeManager.releaseAll();
   }
 }

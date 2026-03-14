@@ -456,6 +456,13 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       (adapter as any).setDecisionHook(decisionHook);
     }
 
+    // 显式注入请求标识（实例级，取代已废弃的全局 requestContext）
+    // Worker 和 visibility:'system' 调用不需要绑定占位消息，传入 undefined
+    const shouldBindRequest = agent === 'orchestrator' && options?.visibility !== 'system';
+    if (typeof (adapter as any).setCurrentRequestId === 'function') {
+      (adapter as any).setCurrentRequestId(shouldBindRequest ? options?.requestId : undefined);
+    }
+
     // 为 orchestrator 适配器应用临时配置
     if (agent === 'orchestrator' && adapter instanceof OrchestratorLLMAdapter) {
       if (options?.systemPrompt) {
@@ -489,16 +496,6 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       tokenUsage?: TokenUsage;
       orchestratorRuntime?: AdapterResponse['orchestratorRuntime'];
     }> => {
-      // requestContext 是全局状态，只有编排器的 LLM 输出才应绑定到 placeholder。
-      // Worker 或 visibility:'system' 调用必须临时清除 requestContext，
-      // 否则 Worker 的流式输出会复用编排器的 placeholder messageId，导致消息归属错误。
-      const shouldDetachRequest = options?.visibility === 'system' || agent !== 'orchestrator';
-      let savedRequestContext: string | undefined;
-      if (shouldDetachRequest && this.messageHub) {
-        savedRequestContext = this.messageHub.getRequestContext();
-        this.messageHub.setRequestContext(undefined);
-      }
-
       const beforeTotals = 'getTotalTokenUsage' in adapter && typeof (adapter as any).getTotalTokenUsage === 'function'
         ? (adapter as any).getTotalTokenUsage()
         : {
@@ -507,16 +504,15 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
           cacheReadTokens: 0,
           cacheWriteTokens: 0,
         };
-      try {
-        const content = await adapter.sendMessage(message, images);
-        const afterTotals = 'getTotalTokenUsage' in adapter && typeof (adapter as any).getTotalTokenUsage === 'function'
-          ? (adapter as any).getTotalTokenUsage()
-          : {
-            inputTokens: 0,
-            outputTokens: 0,
-            cacheReadTokens: 0,
-            cacheWriteTokens: 0,
-          };
+      const content = await adapter.sendMessage(message, images);
+      const afterTotals = 'getTotalTokenUsage' in adapter && typeof (adapter as any).getTotalTokenUsage === 'function'
+        ? (adapter as any).getTotalTokenUsage()
+        : {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+        };
 
       const tokenUsage = {
         inputTokens: Math.max(0, (afterTotals.inputTokens || 0) - (beforeTotals.inputTokens || 0)),
@@ -530,12 +526,6 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
         : undefined;
 
       return { content, tokenUsage, orchestratorRuntime };
-      } finally {
-        // 恢复 requestContext（无论成功或异常）
-        if (shouldDetachRequest && this.messageHub && savedRequestContext !== undefined) {
-          this.messageHub.setRequestContext(savedRequestContext);
-        }
-      }
     };
 
     const isWorker = agent !== 'orchestrator';
@@ -659,9 +649,12 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       }
       return { content: '', done: false, error: 'Worker request failed after retries.' };
     } finally {
-      // 清理决策点回调，避免跨请求泄漏
+      // 清理决策点回调和请求标识，避免跨请求泄漏
       if (typeof (adapter as any).setDecisionHook === 'function') {
         (adapter as any).setDecisionHook(undefined);
+      }
+      if (typeof (adapter as any).setCurrentRequestId === 'function') {
+        (adapter as any).setCurrentRequestId(undefined);
       }
     }
   }

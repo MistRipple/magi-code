@@ -168,13 +168,6 @@ export class MessageHub {
     return this.factory.newTrace();
   }
 
-  setRequestContext(requestId?: string): void {
-    this.factory.setRequestContext(requestId);
-  }
-
-  getRequestContext(): string | undefined {
-    return this.factory.getRequestContext();
-  }
 
   // ==========================================================================
   // 请求统计（委托给 MessagePipeline）
@@ -301,8 +294,8 @@ export class MessageHub {
   // 核心消息通道 API（委托给 MessagePipeline）
   // ==========================================================================
 
-  sendMessage(message: StandardMessage): boolean {
-    const requestId = this.factory.getRequestContext();
+  sendMessage(message: StandardMessage, options?: { explicitRequestId?: string }): boolean {
+    const requestId = options?.explicitRequestId;
     if (requestId && !message.metadata?.requestId) {
       return this.pipeline.process({
         ...message,
@@ -312,7 +305,7 @@ export class MessageHub {
         },
       }, requestId);
     }
-    return this.pipeline.process(message, requestId);
+    return this.pipeline.process(message, message.metadata?.requestId);
   }
 
   sendUpdate(update: StreamUpdate): boolean {

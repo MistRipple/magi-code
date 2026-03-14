@@ -49,6 +49,13 @@ export interface AdapterOutputScope {
    * 如果提供，将覆盖适配器的默认系统提示词（仅对当前请求生效）
    */
   systemPrompt?: string;
+
+  /**
+   * 显式请求标识（可选）
+   * 用于将 LLM 流式输出绑定到 UI 层已创建的占位消息。
+   * 取代已废弃的全局 requestContext，从架构源头消除并发竞态。
+   */
+  requestId?: string;
 }
 
 /**

@@ -46,6 +46,23 @@ export class WorkspaceRoots {
     this.nameMap = new Map(this.normalizedFolders.map(folder => [folder.name, folder]));
   }
 
+  /**
+   * 为 git worktree 创建镜像实例。
+   * 保留原始 workspace 的名称体系，但所有 folder 的物理路径
+   * 重映射到 worktree 目录下的对应子路径。
+   *
+   * 单 workspace：直接用 worktreePath 替换主 folder。
+   * 多 workspace：仅替换主 folder（worktree 只隔离主仓库）。
+   */
+  static createForWorktree(original: WorkspaceRoots, worktreePath: string): WorkspaceRoots {
+    const resolvedWorktree = path.resolve(worktreePath);
+    const folders = original.normalizedFolders.map((folder, index) => ({
+      name: folder.name,
+      path: index === 0 ? resolvedWorktree : folder.path,
+    }));
+    return new WorkspaceRoots(folders);
+  }
+
   getPrimaryFolder(): WorkspaceFolderInfo {
     return this.normalizedFolders[0];
   }
