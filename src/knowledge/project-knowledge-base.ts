@@ -854,6 +854,70 @@ export class ProjectKnowledgeBase {
     return context;
   }
 
+
+  /**
+   * 获取知识库索引（ADR/FAQ/Learning 标题列表）
+   * 用于系统提示词轻量注入，避免全量预载
+   */
+  getKnowledgeIndex(maxTokens: number = 600): string {
+    if (!this.codeIndex) {
+      return '';
+    }
+
+    const sections: string[] = [];
+    const maxItemsPerCategory = 20;
+
+    const acceptedADRs = this.adrs.filter(adr => adr.status === 'accepted');
+    if (acceptedADRs.length > 0) {
+      sections.push('**ADR 索引**:');
+      const visible = acceptedADRs.slice(0, maxItemsPerCategory);
+      visible.forEach(adr => {
+        sections.push(`- [${adr.id}] ${adr.title}`);
+      });
+      if (acceptedADRs.length > maxItemsPerCategory) {
+        sections.push(`- ... (${acceptedADRs.length - maxItemsPerCategory} more)`);
+      }
+      sections.push('');
+    }
+
+    if (this.faqs.length > 0) {
+      sections.push('**FAQ 索引**:');
+      const visible = this.faqs.slice(0, maxItemsPerCategory);
+      visible.forEach(faq => {
+        sections.push(`- [${faq.id}] ${faq.question}`);
+      });
+      if (this.faqs.length > maxItemsPerCategory) {
+        sections.push(`- ... (${this.faqs.length - maxItemsPerCategory} more)`);
+      }
+      sections.push('');
+    }
+
+    if (this.learnings.length > 0) {
+      sections.push('**Learning 索引**:');
+      const visible = this.learnings.slice(0, maxItemsPerCategory);
+      visible.forEach(learning => {
+        sections.push(`- [${learning.id}] ${learning.content.substring(0, 80)}`);
+      });
+      if (this.learnings.length > maxItemsPerCategory) {
+        sections.push(`- ... (${this.learnings.length - maxItemsPerCategory} more)`);
+      }
+      sections.push('');
+    }
+
+    const indexContent = sections.join('\n').trim();
+    if (!indexContent) {
+      return '';
+    }
+
+    const estimatedTokens = estimateTokenCount(indexContent);
+    if (estimatedTokens > maxTokens) {
+      const maxChars = estimateMaxCharsForTokens(maxTokens);
+      return indexContent.substring(0, maxChars) + '...';
+    }
+
+    return indexContent;
+  }
+
   /**
    * 设置 LLM 客户端（用于自动知识提取 + 搜索引擎查询扩展）
    */

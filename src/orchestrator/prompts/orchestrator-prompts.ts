@@ -30,8 +30,8 @@ export interface UnifiedPromptContext {
   sessionSummary?: string;
   /** 当前系统的 Todo 清单概要 */
   activeTodosSummary?: string;
-  /** 知识库 ADR */
-  relevantADRs?: string;
+  /** 知识库索引（ADR/FAQ/Learning 标题列表） */
+  knowledgeIndex?: string;
   /** 动态可用工具摘要（内置 + MCP + Skill，由 ToolManager 生成） */
   availableToolsSummary?: string;
   /** 分类定义（displayName + description，用于构建分工映射表） */
@@ -48,7 +48,7 @@ export interface UnifiedPromptContext {
  * LLM 在此提示词下通过工具循环自主决策：直接回答 / 工具操作 / 分配 Worker。
  */
 export function buildUnifiedSystemPrompt(context: UnifiedPromptContext): string {
-  const { availableWorkers, workerProfiles, projectContext, sessionSummary, relevantADRs, availableToolsSummary, categoryDefinitions, deepTask } = context;
+  const { availableWorkers, workerProfiles, projectContext, sessionSummary, knowledgeIndex, availableToolsSummary, categoryDefinitions, deepTask } = context;
 
   // Worker 能力描述表（从 ProfileLoader 动态获取）
   const workerTable = availableWorkers.map(w => {
@@ -342,8 +342,8 @@ Rules:
   }
 
   // ADR
-  if (relevantADRs) {
-    sections.push(`## Relevant Architecture Decisions\n${relevantADRs}`);
+  if (knowledgeIndex) {
+    sections.push(`## Project Knowledge Index\n${knowledgeIndex}\n\nUse fetch_project_guidelines to retrieve full details when needed.`);
   }
 
   // 会话上下文

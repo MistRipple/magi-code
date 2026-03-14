@@ -1626,6 +1626,8 @@ export class MissionDrivenEngine extends EventEmitter {
     this.projectKnowledgeBase = knowledgeBase;
     // 注入到 ContextManager（确保 Worker 上下文包含项目知识）
     this.contextManager.setProjectKnowledgeBase(knowledgeBase);
+    // 注入到 ToolManager，供 fetch_project_guidelines 工具按需拉取
+    this.adapterFactory.getToolManager().setProjectKnowledgeBase(() => this.projectKnowledgeBase);
     this.configureWisdomStorage();
     logger.info('任务引擎.知识库.已设置', undefined, LogCategory.ORCHESTRATOR);
   }
@@ -1782,10 +1784,8 @@ export class MissionDrivenEngine extends EventEmitter {
           ? this.projectKnowledgeBase.getProjectContext(600)
           : undefined;
 
-        const relevantADRs = this.projectKnowledgeBase
-          ? this.projectKnowledgeBase.getADRs({ status: 'accepted' })
-              .map(adr => `### ${adr.title}\n${adr.decision}`)
-              .join('\n\n') || undefined
+        const knowledgeIndex = this.projectKnowledgeBase
+          ? this.projectKnowledgeBase.getKnowledgeIndex(600)
           : undefined;
 
         // 3. 构建统一系统提示词（Worker 列表从 ProfileLoader 动态获取，工具列表从 ToolManager 动态加载）
@@ -1847,7 +1847,7 @@ export class MissionDrivenEngine extends EventEmitter {
           projectContext,
           sessionSummary: context || undefined,
           activeTodosSummary,
-          relevantADRs,
+          knowledgeIndex,
           availableToolsSummary,
           categoryDefinitions,
           deepTask: this.adapterFactory.isDeepTask(),

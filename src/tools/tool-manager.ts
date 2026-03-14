@@ -53,6 +53,7 @@ import { FileMutex } from '../utils/file-mutex';
 import { LLMConfigLoader } from '../llm/config';
 import { createLLMClient } from '../llm/clients/client-factory';
 import { runIntentDrivenFileEdit } from '../llm/utils/intent-file-editor';
+import { KnowledgeQueryExecutor } from './knowledge-query-executor';
 
 /**
  * 快照执行上下文（标识当前正在执行的 mission/assignment/worker）
@@ -137,6 +138,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   private codebaseRetrievalExecutor: CodebaseRetrievalExecutor;
   private lspExecutor: LspExecutor;
   private orchestrationExecutor: OrchestrationExecutor;
+  private knowledgeQueryExecutor: KnowledgeQueryExecutor;
 
   // 外部工具执行器
   private mcpExecutors: Map<string, ToolExecutor> = new Map();
@@ -185,6 +187,8 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     this.codebaseRetrievalExecutor = new CodebaseRetrievalExecutor();
     this.lspExecutor = new LspExecutor(this.workspaceRoot);
     this.orchestrationExecutor = new OrchestrationExecutor();
+    // 知识库查询工具（knowledgeBase getter 稍后通过 setProjectKnowledgeBase 注入）
+    this.knowledgeQueryExecutor = new KnowledgeQueryExecutor(() => undefined);
 
     this.permissions = options.permissions || {
       allowEdit: true,
@@ -254,6 +258,15 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     this.snapshotManager = snapshotManager;
     this.injectSnapshotCallbacks();
     logger.info('ToolManager: SnapshotManager 已注入', undefined, LogCategory.TOOLS);
+  }
+
+  /**
+   * 注入项目知识库引用（由 MissionDrivenEngine 在启动时调用）
+   * 使 fetch_project_guidelines 工具能按需查询 ADR、FAQ、经验记录等
+   */
+  setProjectKnowledgeBase(getter: () => import('../knowledge/project-knowledge-base').ProjectKnowledgeBase | undefined): void {
+    this.knowledgeQueryExecutor = new KnowledgeQueryExecutor(getter);
+    logger.info('ToolManager: ProjectKnowledgeBase 已注入', undefined, LogCategory.TOOLS);
   }
 
   /**
@@ -703,6 +716,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     ['get-todos', 'get_todos'],
     ['update-todo', 'update_todo'],
     ['apply-skill', 'apply_skill'],
+    ['fetch-project-guidelines', 'fetch_project_guidelines'],
   ]);
 
   /**
@@ -1154,6 +1168,9 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       case 'apply_skill':
         return await this.executeApplySkillTool(toolCall);
 
+      case 'fetch_project_guidelines':
+        return await this.knowledgeQueryExecutor.execute(toolCall);
+
       default:
         return {
           toolCallId: toolCall.id,
@@ -1384,6 +1401,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       'get_todos': { category: 'Task Management', desc: 'View the todo list for the current task' },
       'update_todo': { category: 'Task Management', desc: 'Update todo status or content' },
       'apply_skill': { category: 'Code Intelligence', desc: 'Load and apply an installed instruction skill by name' },
+      'fetch_project_guidelines': { category: 'Code Intelligence', desc: 'Fetch ADRs, FAQs, or learnings from the project knowledge base' },
     };
 
     // 编排者专用的附加说明
@@ -1560,6 +1578,9 @@ Only set may_modify_files=true when the command directly writes source files.`,
         tags: ['skill', 'instruction', 'enhancement'],
       },
     });
+
+    // 17. fetch_project_guidelines（按需拉取项目知识库）
+    tools.push(this.knowledgeQueryExecutor.getToolDefinition());
 
     return tools;
   }
