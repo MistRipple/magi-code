@@ -130,6 +130,9 @@ function resolveCardKeyFromMetadata(meta: Record<string, unknown> | undefined): 
   if (rawAssignmentId) return buildAssignmentCardKey(rawAssignmentId, scopeId);
   const rawSubTaskId = normalizeCardKey(meta?.subTaskId);
   if (rawSubTaskId) return buildAssignmentCardKey(rawSubTaskId, scopeId);
+  // 对齐 MessageItem.svelte，修复 task_card 重启丢失总结报告的问题
+  const rawSubTaskCardId = normalizeCardKey((meta?.subTaskCard as any)?.id);
+  if (rawSubTaskCardId) return buildAssignmentCardKey(rawSubTaskCardId, scopeId);
   const rawCardId = normalizeCardKey(meta?.cardId);
   if (rawCardId) return rawCardId;
   return '';
@@ -190,7 +193,7 @@ function parseWaitForWorkersPayload(raw: unknown, timestamp: number): WaitForWor
 function extractWaitForWorkersPayloadFromMessage(message: Message): WaitForWorkersResult | null {
   const blocks = ensureArray(message.blocks);
   if (blocks.length === 0) return null;
-  for (const block of blocks) {
+  for (const block of blocks as any[]) {
     if (block.type !== 'tool_call' || !block.toolCall) continue;
     if (block.toolCall.name !== 'wait_for_workers') continue;
     const rawPayload = block.toolCall.result ?? block.toolCall.standardized?.data;
@@ -248,31 +251,16 @@ function buildWaitResultFromTaskCard(message: Message): { cardKey: string; resul
 }
 
 function syncWorkerWaitResultsFromMessage(message: Message): void {
-  // 入口 debug: 检查哪些消息进入了这个函数
-  const hasToolBlocks = ensureArray(message.blocks).some((b: any) => b?.type === 'tool_call');
-  const hasWaitTool = ensureArray(message.blocks).some((b: any) => b?.toolCall?.name === 'wait_for_workers');
-  if (hasToolBlocks || message.type === 'task_card') {
-    console.log('[DEBUG:syncEntry]', message.type, 'id=', message.id?.slice(-20),
-      'hasToolBlocks=', hasToolBlocks, 'hasWaitTool=', hasWaitTool,
-      'blockCount=', ensureArray(message.blocks).length,
-      hasWaitTool ? 'waitResult=' + JSON.stringify(ensureArray(message.blocks).find((b: any) => b?.toolCall?.name === 'wait_for_workers')?.toolCall?.result)?.slice(0, 200) : '');
-  }
   const payload = extractWaitForWorkersPayloadFromMessage(message);
   if (payload && payload.results.length > 0) {
     const updates: Record<string, WaitForWorkersResult> = {};
     const updatedAt = typeof payload.updatedAt === 'number' ? payload.updatedAt : (message.timestamp || Date.now());
     const scopeId = resolveScopeId(message.metadata as Record<string, unknown> | undefined);
-    console.log('[DEBUG:waitResult] scopeId=', scopeId, 'meta=', JSON.stringify({
-      requestId: (message.metadata as any)?.requestId,
-      missionId: (message.metadata as any)?.missionId,
-      turnId: (message.metadata as any)?.turnId,
-    }));
     const grouped = new Map<string, WaitForWorkersResultItem[]>();
     for (const result of payload.results) {
       const taskId = typeof result.task_id === 'string' ? result.task_id.trim() : '';
       if (!taskId) continue;
       const cardKey = buildAssignmentCardKey(taskId, scopeId);
-      console.log('[DEBUG:waitResult] taskId=', taskId, 'cardKey=', cardKey);
       const list = grouped.get(cardKey) || [];
       list.push(result);
       grouped.set(cardKey, list);
@@ -287,11 +275,10 @@ function syncWorkerWaitResultsFromMessage(message: Message): void {
     if (Object.keys(updates).length > 0) {
       updateWorkerWaitResults(updates);
     }
-    return;
   }
+
   const taskCardResult = buildWaitResultFromTaskCard(message);
   if (taskCardResult) {
-    console.log('[DEBUG:taskCard] cardKey=', taskCardResult.cardKey, 'status=', taskCardResult.result.results[0]?.status);
     updateWorkerWaitResults({ [taskCardResult.cardKey]: taskCardResult.result });
   }
 }
@@ -917,6 +904,28 @@ function rebuildSessionMessageTargets(
         continue;
       }
       setMessageTarget(message.id, { location: 'worker', worker, reason: 'session-restored' });
+    }
+  }
+}
+
+/**
+ * 会话恢复时从已有消息重建 workerWaitResults。
+ * workerWaitResults 是运行时状态（不持久化），恢复后需要从 task_card 消息和
+ * 包含 wait_for_workers 结果的消息中重建，否则卡片完成态丢失。
+ */
+function rebuildWorkerWaitResultsFromMessages(
+  threadMessages: Message[],
+  workerMessages: { claude: Message[]; codex: Message[]; gemini: Message[] }
+): void {
+  const allMessages = [
+    ...threadMessages,
+    ...workerMessages.claude,
+    ...workerMessages.codex,
+    ...workerMessages.gemini,
+  ];
+  for (const message of allMessages) {
+    if (message.type === 'task_card' || ensureArray(message.blocks).some((b: any) => b?.toolCall?.name === 'wait_for_workers')) {
+      syncWorkerWaitResultsFromMessage(message);
     }
   }
 }
@@ -2347,6 +2356,9 @@ function handleSessionMessagesLoaded(message: WebviewMessage) {
     setThreadMessages(formattedThreadMessages);
     setAgentOutputs(formattedWorkerMessages);
     rebuildSessionMessageTargets(formattedThreadMessages, formattedWorkerMessages);
+    // 会话恢复时从已有 task_card 消息重建 workerWaitResults，
+    // 修复"恢复后卡片完成态丢失"问题（workerWaitResults 不持久化，需从消息重建）
+    rebuildWorkerWaitResultsFromMessages(formattedThreadMessages, formattedWorkerMessages);
   }
 }
 

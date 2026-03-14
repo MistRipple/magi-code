@@ -186,12 +186,12 @@
   let updatingAllSkills = $state(false);
 
   // 模型配置表单
-  let orchConfig = $state({ baseUrl: '', apiKey: '', model: '', provider: 'anthropic', openaiProtocol: 'responses', thinking: false, reasoningEffort: 'medium' });
-  let compConfig = $state({ baseUrl: '', apiKey: '', model: '', provider: 'anthropic', openaiProtocol: 'responses' });
-  let workerConfigs = $state<Record<string, { baseUrl: string; apiKey: string; model: string; provider: string; openaiProtocol: string; enabled: boolean; thinking: boolean; reasoningEffort: string }>>({
-    claude: { baseUrl: '', apiKey: '', model: '', provider: 'anthropic', openaiProtocol: 'responses', enabled: true, thinking: false, reasoningEffort: 'medium' },
-    codex: { baseUrl: '', apiKey: '', model: '', provider: 'openai', openaiProtocol: 'responses', enabled: true, thinking: false, reasoningEffort: 'medium' },
-    gemini: { baseUrl: '', apiKey: '', model: '', provider: 'openai', openaiProtocol: 'responses', enabled: true, thinking: false, reasoningEffort: 'medium' }
+  let orchConfig = $state({ baseUrl: '', endpointUrl: '', apiKey: '', model: '', provider: 'anthropic', openaiProtocol: 'responses', thinking: false, reasoningEffort: 'medium' });
+  let compConfig = $state({ baseUrl: '', endpointUrl: '', apiKey: '', model: '', provider: 'anthropic', openaiProtocol: 'responses' });
+  let workerConfigs = $state<Record<string, { baseUrl: string; endpointUrl: string; apiKey: string; model: string; provider: string; openaiProtocol: string; enabled: boolean; thinking: boolean; reasoningEffort: string }>>({
+    claude: { baseUrl: '', endpointUrl: '', apiKey: '', model: '', provider: 'anthropic', openaiProtocol: 'responses', enabled: true, thinking: false, reasoningEffort: 'medium' },
+    codex: { baseUrl: '', endpointUrl: '', apiKey: '', model: '', provider: 'openai', openaiProtocol: 'responses', enabled: true, thinking: false, reasoningEffort: 'medium' },
+    gemini: { baseUrl: '', endpointUrl: '', apiKey: '', model: '', provider: 'openai', openaiProtocol: 'responses', enabled: true, thinking: false, reasoningEffort: 'medium' }
   });
 
   // API Key 明文可见状态
@@ -667,12 +667,12 @@
     if (target === 'worker') {
       const wc = workerConfigs[workerModelTab];
       vscode.postMessage({ type: 'saveWorkerConfig', worker: workerModelTab, config: {
-        baseUrl: wc.baseUrl, apiKey: wc.apiKey, model: wc.model, provider: wc.provider, openaiProtocol: wc.openaiProtocol,
+        baseUrl: wc.baseUrl, endpointUrl: wc.endpointUrl, apiKey: wc.apiKey, model: wc.model, provider: wc.provider, openaiProtocol: wc.openaiProtocol,
         enabled: wc.enabled, enableThinking: wc.thinking, reasoningEffort: wc.reasoningEffort
       }});
     } else if (target === 'orch') {
       vscode.postMessage({ type: 'saveOrchestratorConfig', config: {
-        baseUrl: orchConfig.baseUrl, apiKey: orchConfig.apiKey, model: orchConfig.model, provider: orchConfig.provider, openaiProtocol: orchConfig.openaiProtocol,
+        baseUrl: orchConfig.baseUrl, endpointUrl: orchConfig.endpointUrl, apiKey: orchConfig.apiKey, model: orchConfig.model, provider: orchConfig.provider, openaiProtocol: orchConfig.openaiProtocol,
         enableThinking: orchConfig.thinking, reasoningEffort: orchConfig.reasoningEffort
       }});
     } else if (target === 'comp') {
@@ -1172,6 +1172,7 @@
             if (config && workerConfigs[worker]) {
               workerConfigs[worker] = {
                 baseUrl: config.baseUrl || '',
+                endpointUrl: config.endpointUrl || '',
                 apiKey: config.apiKey || '',
                 model: config.model || '',
                 provider: config.provider || 'anthropic',
@@ -1189,6 +1190,7 @@
         if (payload?.config) {
           orchConfig = {
             baseUrl: payload.config.baseUrl || '',
+            endpointUrl: payload.config.endpointUrl || '',
             apiKey: payload.config.apiKey || '',
             model: payload.config.model || '',
             provider: payload.config.provider || 'anthropic',
@@ -1203,6 +1205,7 @@
         if (payload?.config) {
           compConfig = {
             baseUrl: payload.config.baseUrl || '',
+            endpointUrl: payload.config.endpointUrl || '',
             apiKey: payload.config.apiKey || '',
             model: payload.config.model || '',
             provider: payload.config.provider || 'anthropic',
@@ -1594,6 +1597,12 @@
                     <label class="llm-config-label">{i18n.t('settings.model.field.baseUrl')}</label>
                     <input type="text" class="llm-config-input" bind:value={orchConfig.baseUrl} placeholder="https://api.anthropic.com">
                   </div>
+                  {#if orchConfig.provider === 'openai'}
+                  <div class="llm-config-field">
+                    <label class="llm-config-label">{i18n.t('settings.model.field.endpointUrl')}</label>
+                    <input type="text" class="llm-config-input" bind:value={orchConfig.endpointUrl} placeholder="https://api.openai.com/v1/chat/completions">
+                  </div>
+                  {/if}
                   <div class="llm-config-field">
                     <label class="llm-config-label">{i18n.t('settings.model.field.apiKey')}</label>
                     <div class="api-key-wrapper">
@@ -1715,6 +1724,12 @@
                     <label class="llm-config-label">{i18n.t('settings.model.field.baseUrl')}</label>
                     <input type="text" class="llm-config-input" bind:value={compConfig.baseUrl} placeholder="https://api.anthropic.com">
                   </div>
+                  {#if compConfig.provider === 'openai'}
+                  <div class="llm-config-field">
+                    <label class="llm-config-label">{i18n.t('settings.model.field.endpointUrl')}</label>
+                    <input type="text" class="llm-config-input" bind:value={compConfig.endpointUrl} placeholder="https://api.openai.com/v1/chat/completions">
+                  </div>
+                  {/if}
                   <div class="llm-config-field">
                     <label class="llm-config-label">{i18n.t('settings.model.field.apiKey')}</label>
                     <div class="api-key-wrapper">
@@ -1836,6 +1851,12 @@
                   <label class="llm-config-label">{i18n.t('settings.model.field.baseUrl')}</label>
                   <input type="text" class="llm-config-input" bind:value={workerConfigs[workerModelTab].baseUrl} placeholder="https://api.anthropic.com">
                 </div>
+                {#if workerConfigs[workerModelTab].provider === 'openai'}
+                <div class="llm-config-field">
+                  <label class="llm-config-label">{i18n.t('settings.model.field.endpointUrl')}</label>
+                  <input type="text" class="llm-config-input" bind:value={workerConfigs[workerModelTab].endpointUrl} placeholder="https://api.openai.com/v1/chat/completions">
+                </div>
+                {/if}
                 <div class="llm-config-field inline-toggle">
                   <label class="llm-config-label">{i18n.t('settings.model.status')}</label>
                   <button type="button" class="llm-config-toggle-btn" onclick={() => workerConfigs[workerModelTab].enabled = !workerConfigs[workerModelTab].enabled}>
@@ -3211,10 +3232,10 @@
     color: var(--foreground);
     font-size: var(--text-sm);
     cursor: pointer;
-    justify-content: flex-end;
+    justify-content: flex-start;
     width: 100%;
   }
-  .inline-toggle { display: flex; flex-direction: column; gap: var(--space-2); }
+  .inline-toggle { display: flex; flex-direction: column; gap: var(--space-2); align-items: flex-start; }
   .toggle-switch { width: 32px; height: 18px; background: var(--secondary); border-radius: var(--radius-full); position: relative; transition: background var(--transition-fast); cursor: pointer; flex-shrink: 0; }
   .toggle-switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; background: white; border-radius: var(--radius-full); transition: transform var(--transition-fast); }
   .toggle-switch.active { background: var(--primary); }

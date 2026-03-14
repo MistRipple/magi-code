@@ -40,7 +40,7 @@ export function resolveProtocolId(
   openaiProtocol?: 'responses' | 'chat',
 ): ProtocolId {
   if (provider === 'openai') {
-    return openaiProtocol === 'chat' ? 'openai.chat-completions' : 'openai.responses';
+    return 'openai.responses';
   }
   return 'anthropic.messages';
 }

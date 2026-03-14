@@ -181,6 +181,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   /** 写操作拦截缓存 TTL（避免环境修复后仍被旧记录阻断） */
   private static readonly FAILED_WRITE_CACHE_TTL_MS = 10 * 60 * 1000;
   private static readonly SUCCESS_WRITE_CACHE_TTL_MS = 10 * 60 * 1000;
+  /** 只读工具去重缓存 TTL（避免长期缓存导致必要重读被误拦截） */
+  private static readonly READ_ONLY_DEDUP_TTL_MS = 10 * 60 * 1000;
   private static readonly READ_ONLY_TOOL_NAMES = new Set<string>([
     'file_view',
     'grep_search',
@@ -200,8 +202,10 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     'file_bulk_edit',
     'file_remove',
   ]);
-  /** 已读取过的文件路径（文件级去重：同一文件只需读取一次） */
-  private viewedFiles = new Set<string>();
+  /** 只读工具调用去重缓存（参数指纹） */
+  private readOnlyCallCache = new Map<string, { count: number; firstAt: number; lastAt: number }>();
+  /** 最近一次可能改写文件的时间戳（写工具或 shell 成功） */
+  private lastMutationAt = 0;
   /**
    * 滚动上下文摘要：截断时从被丢弃消息中提取的关键信息
    *
@@ -211,8 +215,6 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   private rollingContextSummary: string | null = null;
   /** 滚动摘要最大字符数（约 500 tokens） */
   private static readonly MAX_ROLLING_SUMMARY_CHARS = 2000;
-  /** L1+: 按文件路径记录已读取的 view_range 集合（分段精确去重 + 碎片化预警） */
-  private viewedRanges = new Map<string, Set<string>>();
   /** 当前任务内的去重命中总次数（递增惩罚用） */
   private totalDedupHits = 0;
   /** 当前轮次的去重命中次数（空转分数加权用） */
@@ -884,8 +886,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     this.conversationHistory = [];
     this.rollingContextSummary = null;
     // 对话历史清空 → 模型失去已查看文件的上下文 → 去重状态同步重置
-    this.viewedFiles.clear();
-    this.viewedRanges.clear();
+    this.readOnlyCallCache.clear();
+    this.lastMutationAt = 0;
     this.totalDedupHits = 0;
     this.roundDedupHits = 0;
     this.failedWriteCache.clear();
@@ -1003,11 +1005,22 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         continue;
       }
 
-      // 文件级去重：同一文件只需读取一次，阻断"对同一文件反复发起不同查询"的模式
-      const fileDedup = this.checkFileAccessDuplicate(toolCall);
-      if (fileDedup) {
-        logger.info(`${this.agent} 文件级去重提示`, { tool: toolCall.name, path: toolCall.arguments?.path }, LogCategory.TOOLS);
-        this.addSystemMessage(fileDedup);
+      // 只读工具去重：同一工具 + 同一参数指纹 → 短路执行并提示模型
+      const readOnlyDedup = this.checkReadOnlyToolDuplicate(toolCall);
+      if (readOnlyDedup) {
+        logger.info(`${this.agent} 只读工具去重命中`, { tool: toolCall.name }, LogCategory.TOOLS);
+        const synthetic = this.createSyntheticToolResult(
+          toolCall,
+          readOnlyDedup,
+          'success',
+          toolSourceMap,
+        );
+        if (synthetic.standardized) {
+          synthetic.standardized.errorCode = 'read_only_dedup';
+        }
+        results.push(synthetic);
+        this.emit('toolResult', toolCall.name, readOnlyDedup);
+        continue;
       }
 
 
@@ -1051,13 +1064,13 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           this.abortController?.signal,
           { workerId: this.workerSlot, role: 'worker' },
         );
-        const wasTruncated = this.truncateToolResultContent(toolCall, rawResult, maxToolResultChars);
+        this.truncateToolResultContent(toolCall, rawResult, maxToolResultChars);
         const result = this.ensureStandardizedToolResult(toolCall, rawResult, toolSourceMap);
         results.push(result);
 
-        // 记录文件访问（用于文件级去重）
+        // 记录只读工具调用（用于参数指纹去重）
         if (!result.isError && this.isReadOnlyToolCall(toolCall)) {
-          this.recordFileAccess(toolCall, { truncated: wasTruncated });
+          this.recordReadOnlyCall(toolCall);
         }
 
         // 写操作结果追踪：成功则记录到成功缓存并清除失败缓存，失败则记录
@@ -1067,6 +1080,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           } else {
             this.clearFailedWriteForPath(toolCall);
             this.recordSuccessWrite(toolCall);
+            this.lastMutationAt = Date.now();
           }
         }
 
@@ -1336,52 +1350,72 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   }
 
   /**
-   * 文件级提示：检查工具调用是否正在访问已完整读取过的文件
+   * 只读工具去重：同一工具 + 同一参数指纹视为重复调用
    *
-   * 解决的核心问题：模型把工具当"数据库查询"用，对同一文件反复发起不同的
-   * search/view 请求，而不是一次读取完整文件后从上下文中提取信息。
-   *
-   * 仅在文件已被完整读取（无 view_range）后提示，避免阻止合理的分段读取。
+   * 规则：
+   * - 仅对 READ_ONLY_TOOL_NAMES 生效
+   * - 参数指纹相同才命中（参数不同不算重复）
+   * - 写入/外部命令后允许重新读取
    */
-  private checkFileAccessDuplicate(toolCall: ToolCall): string | null {
+  private checkReadOnlyToolDuplicate(toolCall: ToolCall): string | null {
     if (!this.isReadOnlyToolCall(toolCall)) return null;
-
-    const filePath = this.extractTargetFilePath(toolCall);
-    if (!filePath) return null;
-
-    if (this.viewedFiles.has(filePath)) {
-      this.totalDedupHits++;
-      this.roundDedupHits++;
-      const basename = filePath.split('/').pop() || filePath;
-      return `[系统提示] 文件 ${basename} 已读取过。如无新变化可直接使用已有上下文，系统仍将继续执行本次读取。`;
+    const key = this.buildReadOnlyToolFingerprint(toolCall);
+    if (!key) return null;
+    const cached = this.readOnlyCallCache.get(key);
+    if (!cached) return null;
+    const now = Date.now();
+    if (now - cached.lastAt > WorkerLLMAdapter.READ_ONLY_DEDUP_TTL_MS) {
+      this.readOnlyCallCache.delete(key);
+      return null;
     }
+    if (cached.lastAt < this.lastMutationAt) {
+      this.readOnlyCallCache.delete(key);
+      return null;
+    }
+    cached.count += 1;
+    cached.lastAt = now;
+    this.totalDedupHits++;
+    this.roundDedupHits++;
+    return `[系统提示] 已执行过完全相同的 ${toolCall.name} 调用（参数一致）。请直接使用已有结果推进，不要重复调用。`;
+  }
 
-    // L1+: 分段读取追踪（仅 file_view + view_range）
-    if (toolCall.name === 'file_view'
-      && toolCall.arguments?.view_range) {
-      const range = toolCall.arguments.view_range;
-      const rangeKey = Array.isArray(range) ? `${range[0]}-${range[1]}` : String(range);
-      const fileRanges = this.viewedRanges.get(filePath);
+  private recordReadOnlyCall(toolCall: ToolCall): void {
+    if (!this.isReadOnlyToolCall(toolCall)) return;
+    const key = this.buildReadOnlyToolFingerprint(toolCall);
+    if (!key) return;
+    const now = Date.now();
+    const cached = this.readOnlyCallCache.get(key);
+    if (cached) {
+      cached.lastAt = now;
+      return;
+    }
+    this.readOnlyCallCache.set(key, { count: 1, firstAt: now, lastAt: now });
+  }
 
-      if (fileRanges) {
-        // 精确去重：同一 range 已读取过
-        if (fileRanges.has(rangeKey)) {
-          this.totalDedupHits++;
-          this.roundDedupHits++;
-          const basename = filePath.split('/').pop() || filePath;
-          return `[系统提示] 文件 ${basename} 的 ${rangeKey} 行已读取过。如无新变化可直接使用已有内容，系统仍将继续执行本次读取。`;
-        }
-        // 碎片化预警：同一文件 ≥3 段分段读取 → 建议全量读取
-        if (fileRanges.size >= 3) {
-          this.totalDedupHits++;
-          this.roundDedupHits++;
-          const basename = filePath.split('/').pop() || filePath;
-          return `[系统提示] 你已对 ${basename} 进行了 ${fileRanges.size} 次分段读取。建议使用 file_view（不带 view_range）完整读取该文件，系统仍将继续执行本次读取。`;
-        }
+  private buildReadOnlyToolFingerprint(toolCall: ToolCall): string | null {
+    if (!this.isReadOnlyToolCall(toolCall)) return null;
+    const normalizedArgs = this.normalizeToolArguments(toolCall.arguments || {});
+    return `${toolCall.name}::${JSON.stringify(normalizedArgs)}`;
+  }
+
+  private normalizeToolArguments(value: unknown): unknown {
+    if (Array.isArray(value)) {
+      return value.map((item) => this.normalizeToolArguments(item));
+    }
+    if (!value || typeof value !== 'object') {
+      if (typeof value === 'string') {
+        return value.trim();
       }
+      return value;
     }
-
-    return null;
+    const obj = value as Record<string, unknown>;
+    const normalized: Record<string, unknown> = {};
+    for (const key of Object.keys(obj).sort()) {
+      const item = obj[key];
+      if (item === undefined) continue;
+      normalized[key] = this.normalizeToolArguments(item);
+    }
+    return normalized;
   }
 
   /**
@@ -1550,54 +1584,6 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       || toolName === 'file_create'
       || toolName === 'file_insert'
       || toolName === 'file_remove';
-  }
-
-  /**
-   * 记录文件访问（工具执行成功后调用）
-   * 仅在完整读取（无 view_range）时标记为已读，分段读取不标记
-   */
-  private recordFileAccess(toolCall: ToolCall, options?: { truncated?: boolean }): void {
-    const filePath = this.extractTargetFilePath(toolCall);
-    if (!filePath) return;
-
-    const truncated = Boolean(options?.truncated);
-
-    if (toolCall.name === 'file_view') {
-      if (toolCall.arguments?.view_range) {
-        // 分段读取 → 记录 range（用于 L1+ 精确去重和碎片化预警）
-        const range = toolCall.arguments.view_range;
-        const rangeKey = Array.isArray(range) ? `${range[0]}-${range[1]}` : String(range);
-        if (!this.viewedRanges.has(filePath)) {
-          this.viewedRanges.set(filePath, new Set());
-        }
-        this.viewedRanges.get(filePath)!.add(rangeKey);
-      } else if (!truncated) {
-        // 完整读取且未截断 → 标记文件
-        this.viewedFiles.add(filePath);
-      }
-    }
-    // grep_search、search_context 返回的是片段，不标记为完整读取
-  }
-
-  /**
-   * 从工具调用中提取目标文件路径（仅返回具体文件，不返回目录）
-   */
-  private extractTargetFilePath(toolCall: ToolCall): string | null {
-    const args = toolCall.arguments || {};
-
-    // file_view → path 字段
-    if (toolCall.name === 'file_view') {
-      return typeof args.path === 'string' ? args.path : null;
-    }
-
-    // grep_search → path 字段（仅当指向具体文件而非目录时）
-    if (toolCall.name === 'grep_search' && typeof args.path === 'string') {
-      const p = args.path;
-      // 有文件扩展名 → 具体文件；无扩展名或以 / 结尾 → 目录，不拦截
-      if (/\.\w+$/.test(p)) return p;
-    }
-
-    return null;
   }
 
 }

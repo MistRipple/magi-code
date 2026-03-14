@@ -203,17 +203,16 @@
     }
     return '';
   });
-  const waitElapsedLabel = $derived(completedDuration);
 
   const displayDuration = $derived.by(() => {
-    if (currentStatus === 'running' && runningStartAt) {
-      return formatDuration(runningElapsedMs);
-    }
     if (typeof card.duration === 'number') {
       return formatDuration(card.duration);
     }
     if (typeof card.duration === 'string' && card.duration.trim().length > 0) {
       return card.duration;
+    }
+    if (currentStatus === 'running' && runningStartAt) {
+      return formatDuration(runningElapsedMs);
     }
     if (completedDuration) {
       return completedDuration;
@@ -311,36 +310,31 @@
     {/if}
   </div>
 
-  <!-- 等待/结果摘要 -->
-  {#if waitData}
+  <!-- 统一的任务报告渲染区域（取代 WaitResultCard） -->
+  {#if waitData?.results && waitData.results.length > 0}
     <div class="wait-result" class:waiting={!waitIsComplete} class:timeout={waitData.timed_out}>
       <div class="wait-result-header">
         <span class="wait-title">
           {i18n.t('waitResultCard.reportTitle')}
         </span>
-        {#if waitElapsedLabel}
-          <span class="wait-time"><Icon name="clock" size={12} />{waitElapsedLabel}</span>
-        {/if}
       </div>
-      {#if waitData.results && waitData.results.length > 0}
-        <div class="wait-result-list">
-          {#each waitData.results as result, i (result.task_id || i)}
-            <div class="wait-result-item">
-              {#if result.summary}
-                <span class="result-summary">{result.summary}</span>
+      <div class="wait-result-list">
+        {#each waitData.results as result, i (result.task_id || i)}
+          <div class="wait-result-item">
+            {#if result.summary}
+              <span class="result-summary">{result.summary}</span>
+            {/if}
+            <div class="result-meta">
+              {#if result.modified_files && result.modified_files.length > 0}
+                <span class="meta-tag"><Icon name="file" size={11} />{i18n.t('waitResultCard.fileChangeCount', { count: result.modified_files.length })}</span>
               {/if}
-              <div class="result-meta">
-                {#if result.modified_files && result.modified_files.length > 0}
-                  <span class="meta-tag"><Icon name="file" size={11} />{i18n.t('waitResultCard.fileChangeCount', { count: result.modified_files.length })}</span>
-                {/if}
-                {#if result.errors && result.errors.length > 0}
-                  <span class="meta-tag error"><Icon name="alert-circle" size={11} />{i18n.t('waitResultCard.errorCount', { count: result.errors.length })}</span>
-                {/if}
-              </div>
+              {#if result.errors && result.errors.length > 0}
+                <span class="meta-tag error"><Icon name="alert-circle" size={11} />{i18n.t('waitResultCard.errorCount', { count: result.errors.length })}</span>
+              {/if}
             </div>
-          {/each}
-        </div>
-      {/if}
+          </div>
+        {/each}
+      </div>
       {#if waitData.pending_task_ids && waitData.pending_task_ids.length > 0}
         <div class="wait-pending">
           <Icon name="hourglass" size={12} />
@@ -666,14 +660,6 @@
   .wait-title {
     font-weight: 600;
     color: var(--foreground);
-  }
-
-  .wait-time {
-    margin-left: auto;
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    color: var(--foreground-muted);
   }
 
   .wait-result-list {

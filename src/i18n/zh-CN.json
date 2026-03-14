@@ -363,6 +363,7 @@
   "settings.model.auxiliaryDesc": "用于上下文压缩、知识提取与查询扩展",
   "settings.model.workerModel": "Worker 模型",
   "settings.model.field.baseUrl": "Base URL",
+  "settings.model.field.endpointUrl": "完整端点",
   "settings.model.field.apiKey": "API Key",
   "settings.model.field.model": "Model",
   "settings.model.field.provider": "Provider",

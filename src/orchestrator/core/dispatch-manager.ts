@@ -1298,6 +1298,12 @@ export class DispatchManager {
           batch?.markFailed(taskId, dispatchResult);
         }
 
+        // 从 DispatchEntry 中计算实际执行耗时
+        const updatedEntry = batch?.getEntry(taskId);
+        const durationMs = (updatedEntry?.startedAt && updatedEntry?.completedAt)
+          ? updatedEntry.completedAt - updatedEntry.startedAt
+          : undefined;
+
         this.emitSubTaskCard({
           id: taskId,
           title: taskTitle,
@@ -1305,6 +1311,7 @@ export class DispatchManager {
           worker: effectiveWorker,
           summary,
           modifiedFiles,
+          ...(durationMs !== undefined ? { duration: durationMs } : {}),
           ...(!result.success && { error: result.errors?.[0] || summary }),
         });
       }

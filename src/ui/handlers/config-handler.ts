@@ -77,7 +77,10 @@ export class ConfigCommandHandler implements CommandHandler {
   /**
    * 规范化 OpenAI 基础 URL，确保以 /v1 结尾且不重复拼接
    */
-  private normalizeOpenAIBaseUrl(baseUrl: string): string {
+  private normalizeOpenAIBaseUrl(baseUrl: string, endpointUrl?: string): string {
+    if (endpointUrl && endpointUrl.trim()) {
+      return endpointUrl.trim();
+    }
     const trimmed = (baseUrl || '').trim();
     if (!trimmed) return trimmed;
     const noTrailingSlash = trimmed.replace(/\/+$/, '');
@@ -436,7 +439,7 @@ export class ConfigCommandHandler implements CommandHandler {
       const provider = config.provider === 'anthropic' ? 'anthropic' : 'openai';
       let modelsUrl = provider === 'anthropic'
         ? this.normalizeAnthropicModelsBaseUrl(config.baseUrl)
-        : this.normalizeOpenAIBaseUrl(config.baseUrl);
+        : this.normalizeOpenAIBaseUrl(config.baseUrl, config.endpointUrl);
       modelsUrl += '/models';
 
       const headers: Record<string, string> = {

@@ -363,6 +363,7 @@
   "settings.model.auxiliaryDesc": "For context compression, knowledge extraction, and query expansion",
   "settings.model.workerModel": "Worker Model",
   "settings.model.field.baseUrl": "Base URL",
+  "settings.model.field.endpointUrl": "Endpoint URL",
   "settings.model.field.apiKey": "API Key",
   "settings.model.field.model": "Model",
   "settings.model.field.provider": "Provider",

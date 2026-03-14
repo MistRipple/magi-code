@@ -156,6 +156,7 @@ export class LLMConfigLoader {
 
     return {
       baseUrl: this.normalizeString(orchestratorConfig.baseUrl, defaults.baseUrl),
+      endpointUrl: orchestratorConfig.endpointUrl ? this.normalizeString(orchestratorConfig.endpointUrl, '') : undefined,
       apiKey: this.normalizeString(orchestratorConfig.apiKey, defaults.apiKey),
       model: this.normalizeString(orchestratorConfig.model, defaults.model),
       provider: this.normalizeString(orchestratorConfig.provider, defaults.provider) as LLMProvider,
@@ -191,6 +192,7 @@ export class LLMConfigLoader {
 
     return {
       baseUrl: this.normalizeString(workerConfig.baseUrl, defaults.baseUrl),
+      endpointUrl: workerConfig.endpointUrl ? this.normalizeString(workerConfig.endpointUrl, '') : undefined,
       apiKey: this.normalizeString(workerConfig.apiKey, defaults.apiKey),
       model: this.normalizeString(workerConfig.model, defaults.model),
       provider: this.normalizeString(workerConfig.provider, defaults.provider) as LLMProvider,
@@ -353,6 +355,7 @@ export class LLMConfigLoader {
 
     fullConfig.workers[worker] = {
       baseUrl: config.baseUrl,
+      endpointUrl: config.endpointUrl,
       apiKey: config.apiKey,
       model: config.model,
       provider: config.provider,
@@ -374,6 +377,7 @@ export class LLMConfigLoader {
 
     fullConfig.orchestrator = {
       baseUrl: config.baseUrl,
+      endpointUrl: config.endpointUrl,
       apiKey: config.apiKey,
       model: config.model,
       provider: config.provider,
@@ -396,6 +400,7 @@ export class LLMConfigLoader {
     fullConfig.auxiliary = {
       enabled: Boolean(config.apiKey) || config.enabled === true,
       baseUrl: config.baseUrl,
+      endpointUrl: config.endpointUrl,
       apiKey: config.apiKey,
       model: config.model,
       provider: config.provider,
@@ -418,6 +423,7 @@ export class LLMConfigLoader {
     return {
       enabled: Boolean(auxiliaryConfig.apiKey) || auxiliaryConfig.enabled === true,
       baseUrl: auxiliaryConfig.baseUrl || defaults.baseUrl,
+      endpointUrl: auxiliaryConfig.endpointUrl,
       apiKey: auxiliaryConfig.apiKey || defaults.apiKey,
       model: auxiliaryConfig.model || defaults.model,
       provider: auxiliaryConfig.provider || defaults.provider,

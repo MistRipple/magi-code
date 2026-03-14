@@ -44,6 +44,8 @@ export interface TokenUsage {
 export interface LLMConfig {
   /** API 端点（支持代理） */
   baseUrl: string;
+  /** 完整端点 URL（若提供，则直接使用，不进行 /v1 等拼接） */
+  endpointUrl?: string;
   /** API 密钥 */
   apiKey: string;
   /** 模型名称 */

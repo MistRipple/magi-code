@@ -25,6 +25,8 @@ export interface SubTaskCardPayload {
   duration?: number;
   missionId?: string;
   turnId?: string;
+  /** 显式 requestId（避免依赖全局 requestContext，防止 Worker 并行执行期间竞态丢失） */
+  requestId?: string;
 }
 
 /** Worker 指令卡片元数据（用于 lane 聚合与可追踪性） */
@@ -145,8 +147,11 @@ export class MessageFactory {
     const content = statusContentMap[normalizedSubTask.status] || statusContentMap.running;
     const rawMissionId = typeof normalizedSubTask.missionId === 'string' ? normalizedSubTask.missionId.trim() : '';
     const rawTurnId = typeof normalizedSubTask.turnId === 'string' ? normalizedSubTask.turnId.trim() : '';
-    // scope 优先级：requestId > missionId > turnId，与前端 resolveScopeId 一致
-    const scopeId = this.requestId || rawMissionId || rawTurnId;
+
+    // scope 优先级：requestId > missionId。
+    // 注意：task card 的生命周期必然跨越多个 turn（从派发 pending 到最终 completed 往往经过多轮交互），
+    // 绝对不能将 turnId 作为卡片唯一 ID 的一部分，否则在 task 跨回合完成时会导致重复渲染多张卡片。
+    const scopeId = this.requestId || rawMissionId;
     const stableMessageId = scopeId
       ? `subtask-card-${normalizedSubTask.id}-${scopeId}`
       : `subtask-card-${normalizedSubTask.id}`;

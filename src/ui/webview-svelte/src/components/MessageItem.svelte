@@ -245,15 +245,21 @@
     return mapWaitResultStatus(workerWaitResult.results[0]?.status);
   });
 
-  const cardStatusOverride = $derived.by(() => {
-    const result = waitResultStatusOverride || subTaskStatusOverride || runtimeStatusOverride;
-    if (isWorkerSingleCard && cardKey) {
-      console.log('[DEBUG:cardStatus]', message.type, 'cardKey=', cardKey,
-        'waitResult=', waitResultStatusOverride, 'subTask=', subTaskStatusOverride,
-        'runtime=', runtimeStatusOverride, '→', result,
-        'workerWaitResult=', workerWaitResult ? 'HIT' : 'MISS');
+  // 消息自身携带的 subTaskCard.status — 后端 emitSubTaskCard 写入，随消息持久化
+  // 作为比 runtimeStatusOverride 更优先的保护层，防止 Worker 级别的全局状态穿透已完成的旧卡片
+  const metadataCardStatus = $derived.by(() => {
+    const cardData = message.metadata?.subTaskCard as { status?: string, wait_status?: string } | undefined;
+    // 如果已经固化了 wait_status，则优先返回 wait_status 对应的卡片状态
+    if (cardData?.wait_status) {
+      return mapWaitResultStatus(cardData.wait_status);
     }
-    return result;
+    return mapSubTaskStatusToCard(cardData?.status);
+  });
+
+  const cardStatusOverride = $derived.by(() => {
+    // 3 层优先级：subTask(tasks数组) > metadata(消息自身，包含固化的 wait 结果) > runtime(Worker级)
+    // 移除了依赖全局 workerWaitResults 的脆弱状态
+    return subTaskStatusOverride || metadataCardStatus || runtimeStatusOverride;
   });
   const cardStartedAtOverride = $derived.by(() =>
     subTaskStartedAtOverride ?? (isInstruction ? message.timestamp : undefined)

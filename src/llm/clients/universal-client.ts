@@ -66,7 +66,10 @@ export class UniversalLLMClient extends BaseLLMClient {
     this.initializeClient();
   }
 
-  private normalizeOpenAIBaseUrl(baseUrl: string): string {
+  private normalizeOpenAIBaseUrl(baseUrl: string, endpointUrl?: string): string {
+    if (endpointUrl && endpointUrl.trim()) {
+      return endpointUrl.trim();
+    }
     const trimmed = (baseUrl || '').trim();
     if (!trimmed) return trimmed;
     const noTrailingSlash = trimmed.replace(/\/+$/, '');
@@ -112,7 +115,7 @@ export class UniversalLLMClient extends BaseLLMClient {
         model: this.config.model,
       }, LogCategory.LLM);
     } else if (this.config.provider === 'openai') {
-      const baseURL = this.normalizeOpenAIBaseUrl(this.config.baseUrl);
+      const baseURL = this.normalizeOpenAIBaseUrl(this.config.baseUrl, this.config.endpointUrl);
       this.openaiClient = new OpenAI({
         apiKey: this.config.apiKey,
         baseURL,
@@ -180,7 +183,7 @@ export class UniversalLLMClient extends BaseLLMClient {
       const isAnthropic = this.config.provider === 'anthropic';
       const baseV1 = isAnthropic
         ? this.normalizeAnthropicModelsBaseUrl(this.config.baseUrl)
-        : this.normalizeOpenAIBaseUrl(this.config.baseUrl);
+        : this.normalizeOpenAIBaseUrl(this.config.baseUrl, this.config.endpointUrl);
       const modelsUrl = `${baseV1}/models`;
 
       const headers: Record<string, string> = {
