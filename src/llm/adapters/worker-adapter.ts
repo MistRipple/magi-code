@@ -1182,6 +1182,9 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    * 保留最近的 N 轮对话，被丢弃的消息提取关键信息生成滚动摘要
    */
   private truncateHistoryIfNeeded(): void {
+    // Micro-Compact：先对旧轮次的 tool_result 进行语义压缩
+    this.compactOldToolResults();
+
     const { maxMessages, maxChars, preserveRecentRounds } = this.historyConfig;
 
     // 检查是否需要截断
@@ -1230,6 +1233,73 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         previousChars: currentChars,
         currentChars: this.getHistoryChars(),
         hasRollingSummary: !!this.rollingContextSummary,
+      }, LogCategory.LLM);
+    }
+  }
+
+  /**
+   * Micro-Compact：压缩旧轮次的 tool_result
+   *
+   * Worker 的对话历史中 file_view、grep_search 等工具返回的内容
+   * 在旧轮次中不再需要完整保留，折叠为简短摘要即可。
+   */
+  private compactOldToolResults(): void {
+    const { preserveRecentRounds } = this.historyConfig;
+    const history = this.conversationHistory;
+    if (history.length === 0) {
+      return;
+    }
+
+    const protectedCount = Math.min(preserveRecentRounds * 2, history.length);
+    const compactBoundary = history.length - protectedCount;
+    if (compactBoundary <= 0) {
+      return;
+    }
+
+    let compactedCount = 0;
+    let savedChars = 0;
+
+    for (let i = 0; i < compactBoundary; i++) {
+      const msg = history[i];
+      if (msg.role !== 'user' || !Array.isArray(msg.content)) {
+        continue;
+      }
+
+      const blocks = msg.content as any[];
+      let modified = false;
+
+      for (let j = 0; j < blocks.length; j++) {
+        const block = blocks[j];
+        if (block?.type !== 'tool_result' || typeof block.content !== 'string') {
+          continue;
+        }
+
+        const content = block.content as string;
+        // 仅压缩较大的 tool_result（> 800 字符）
+        if (content.length <= 800) {
+          continue;
+        }
+
+        // 保留首尾摘要
+        const head = content.substring(0, 400).trim();
+        const tail = content.substring(content.length - 200).trim();
+        const compacted = `${head}\n\n[... ${content.length - 600} chars compacted ...]\n\n${tail}`;
+
+        savedChars += content.length - compacted.length;
+        blocks[j] = { ...block, content: compacted };
+        modified = true;
+      }
+
+      if (modified) {
+        compactedCount++;
+      }
+    }
+
+    if (compactedCount > 0) {
+      logger.debug(`${this.agent} Micro-Compact 已压缩旧轮次 tool_result`, {
+        compactedMessages: compactedCount,
+        savedChars,
+        boundary: compactBoundary,
       }, LogCategory.LLM);
     }
   }

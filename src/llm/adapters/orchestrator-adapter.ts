@@ -704,6 +704,9 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
    * 保留最近的 N 轮对话
    */
   private truncateHistoryIfNeeded(): void {
+    // Micro-Compact：先对旧轮次的 tool_result 进行语义压缩
+    this.compactOldToolResults();
+
     const { maxMessages, maxChars, preserveRecentRounds } = this.historyConfig;
 
     // 检查是否需要截断
@@ -750,6 +753,142 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         hasRollingSummary: !!this.rollingContextSummary,
       }, LogCategory.LLM);
     }
+  }
+
+  /**
+   * Micro-Compact：压缩旧轮次的 tool_result
+   *
+   * 对超过 preserveRecentRounds 之前的消息，将大型 tool_result
+   * （尤其是 wait_for_workers 返回）折叠为简短占位符。
+   * 在截断丢弃之前执行，显著缩减 token 消耗并保留语义指针。
+   */
+  private compactOldToolResults(): void {
+    const { preserveRecentRounds } = this.historyConfig;
+    const history = this.conversationHistory;
+    if (history.length === 0) {
+      return;
+    }
+
+    // 计算需保护的消息边界：最近 N 轮（每轮约 2 条消息）不压缩
+    const protectedCount = Math.min(preserveRecentRounds * 2, history.length);
+    const compactBoundary = history.length - protectedCount;
+    if (compactBoundary <= 0) {
+      return;
+    }
+
+    let compactedCount = 0;
+    let savedChars = 0;
+
+    for (let i = 0; i < compactBoundary; i++) {
+      const msg = history[i];
+      if (msg.role !== 'user' || !Array.isArray(msg.content)) {
+        continue;
+      }
+
+      const blocks = msg.content as any[];
+      let modified = false;
+
+      for (let j = 0; j < blocks.length; j++) {
+        const block = blocks[j];
+        if (block?.type !== 'tool_result' || typeof block.content !== 'string') {
+          continue;
+        }
+
+        const content = block.content as string;
+        // 仅压缩较大的 tool_result（> 500 字符）
+        if (content.length <= 500) {
+          continue;
+        }
+
+        const compacted = this.compactToolResultContent(content);
+        if (compacted && compacted.length < content.length) {
+          savedChars += content.length - compacted.length;
+          blocks[j] = { ...block, content: compacted };
+          modified = true;
+        }
+      }
+
+      if (modified) {
+        compactedCount++;
+      }
+    }
+
+    if (compactedCount > 0) {
+      logger.debug('Orchestrator Micro-Compact 已压缩旧轮次 tool_result', {
+        compactedMessages: compactedCount,
+        savedChars,
+        boundary: compactBoundary,
+      }, LogCategory.LLM);
+    }
+  }
+
+  /**
+   * 压缩单个 tool_result 的内容
+   * 识别 wait_for_workers / dispatch_task 的 JSON 返回并提取关键信息
+   */
+  private compactToolResultContent(content: string): string | null {
+    // 尝试解析为 wait_for_workers 结果
+    try {
+      const parsed = JSON.parse(content);
+
+      // wait_for_workers 结果：包含 results 数组和 wait_status
+      if (parsed.results && Array.isArray(parsed.results) && 'wait_status' in parsed) {
+        return this.compactWaitForWorkersResult(parsed);
+      }
+
+      // dispatch_task 结果：包含 task_id 和 worker
+      if (parsed.task_id && parsed.worker) {
+        // dispatch_task 结果通常较短，但如果有大量上下文也压缩
+        if (content.length > 800) {
+          return `[已折叠: dispatch_task 结果] task_id=${parsed.task_id}, worker=${parsed.worker}, status=${parsed.status || 'dispatched'}`;
+        }
+        return null; // 不需要压缩
+      }
+    } catch {
+      // 非 JSON 内容
+    }
+
+    // 非结构化大文本：保留首尾摘要
+    if (content.length > 1500) {
+      const head = content.substring(0, 300).trim();
+      const tail = content.substring(content.length - 200).trim();
+      return `${head}\n\n[... ${content.length - 500} chars compacted ...]\n\n${tail}`;
+    }
+
+    return null; // 不需要压缩
+  }
+
+  /**
+   * 压缩 wait_for_workers 返回结果
+   * 保留：任务 ID、Worker、状态、修改文件列表
+   * 移除：完整 summary 文本、详细 audit 内容
+   */
+  private compactWaitForWorkersResult(result: any): string {
+    const lines: string[] = ['[已折叠: wait_for_workers 历史结果，关键信息已提取至 PlanLedger]'];
+
+    lines.push(`wait_status: ${result.wait_status}`);
+    if (result.timed_out) {
+      lines.push(`timed_out: true`);
+    }
+    if (result.pending_task_ids?.length > 0) {
+      lines.push(`pending: ${result.pending_task_ids.join(', ')}`);
+    }
+
+    if (Array.isArray(result.results)) {
+      for (const r of result.results) {
+        const files = r.modified_files?.length > 0
+          ? ` files=[${r.modified_files.slice(0, 5).join(', ')}${r.modified_files.length > 5 ? '...' : ''}]`
+          : '';
+        const errors = r.errors?.length > 0 ? ` errors=${r.errors.length}` : '';
+        lines.push(`- ${r.task_id} (${r.worker}): ${r.status}${files}${errors}`);
+      }
+    }
+
+    if (result.audit) {
+      lines.push(`audit: ${result.audit.level} (normal=${result.audit.summary?.normal || 0}, watch=${result.audit.summary?.watch || 0}, intervention=${result.audit.summary?.intervention || 0})`);
+    }
+
+    return lines.join('\n');
   }
 
   private updateRollingSummary(droppedMessages: LLMMessage[]): void {
