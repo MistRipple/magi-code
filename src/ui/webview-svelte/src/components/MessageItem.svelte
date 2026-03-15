@@ -11,6 +11,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import { getState, retryRuntimeState } from '../stores/messages.svelte';
   import { normalizeWorkerSlot } from '../lib/message-classifier';
+  import { buildWaitResultFromTaskCardMessage, resolveTaskCardKeyFromMetadata } from '../lib/task-card-runtime';
   import { ensureArray } from '../lib/utils';
 
   // Props
@@ -227,23 +228,15 @@
 
   const workerRuntime = $derived.by(() => (cardWorker ? workerRuntimeMap[cardWorker] : null));
   const cardKey = $derived.by(() => {
-    const meta = message.metadata as Record<string, unknown> | undefined;
-    const rawRequestId = typeof meta?.requestId === 'string' ? meta.requestId.trim() : '';
-    const rawMissionId = typeof meta?.missionId === 'string' ? meta.missionId.trim() : '';
-    const scopeId = rawRequestId || rawMissionId;
-    const rawAssignmentId = typeof meta?.assignmentId === 'string' ? meta.assignmentId.trim() : '';
-    if (rawAssignmentId) {
-      return scopeId ? `assign:${rawAssignmentId}@${scopeId}` : `assign:${rawAssignmentId}`;
-    }
-    const rawSubTaskId = typeof meta?.subTaskId === 'string' ? meta.subTaskId.trim() : '';
-    if (rawSubTaskId) {
-      return scopeId ? `assign:${rawSubTaskId}@${scopeId}` : `assign:${rawSubTaskId}`;
-    }
-    const rawCardId = typeof meta?.cardId === 'string' ? meta.cardId.trim() : '';
-    if (rawCardId) return rawCardId;
-    return '';
+    return resolveTaskCardKeyFromMetadata(message.metadata as Record<string, unknown> | undefined);
   });
-  const workerWaitResult = $derived.by(() => (cardKey ? (workerWaitResults?.[cardKey] || null) : null));
+  const persistedTaskCardWaitResult = $derived.by(() => buildWaitResultFromTaskCardMessage(message)?.result || null);
+  const workerWaitResult = $derived.by(() => {
+    if (cardKey && workerWaitResults?.[cardKey]) {
+      return workerWaitResults[cardKey];
+    }
+    return persistedTaskCardWaitResult;
+  });
 
   function mapRuntimeStatusToCard(status?: string | null): CardWorkerStatus | undefined {
     if (!status) return undefined;

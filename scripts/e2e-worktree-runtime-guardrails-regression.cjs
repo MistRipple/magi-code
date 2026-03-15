@@ -92,13 +92,15 @@ function cleanup(repoDir) {
   fs.rmSync(repoDir, { recursive: true, force: true });
 }
 
-async function testWriteTaskIsolationFailClosed(WorkerPipeline) {
+async function testWriteTaskNonGitWorkspaceSerialFallback(WorkerPipeline) {
   const pipeline = new WorkerPipeline();
   let workerExecuted = false;
+  let receivedWorkingDirectory = null;
+  let acquireCalled = false;
 
   const assignment = {
-    id: 'write-task-fail-closed',
-    missionId: 'mission-fail-closed',
+    id: 'write-task-non-git-fallback',
+    missionId: 'mission-non-git-fallback',
     workerId: 'codex',
     responsibility: 'write guarded file',
     scope: {
@@ -111,9 +113,28 @@ async function testWriteTaskIsolationFailClosed(WorkerPipeline) {
   const result = await pipeline.execute({
     assignment,
     workerInstance: {
-      async executeAssignment() {
+      async executeAssignment(_assignment, options) {
         workerExecuted = true;
-        throw new Error('write worker should not execute when isolation allocation fails');
+        receivedWorkingDirectory = options.workingDirectory;
+        return {
+          assignment,
+          success: true,
+          completedTodos: [],
+          failedTodos: [],
+          skippedTodos: [],
+          dynamicTodos: [],
+          recoveredTodos: [],
+          totalDuration: 0,
+          errors: [],
+          recoveryAttempts: 0,
+          summary: 'workspace serial fallback executed',
+          verification: {
+            attempted: false,
+            degraded: false,
+            warnings: [],
+            rounds: 0,
+          },
+        };
       },
     },
     adapterFactory: {
@@ -130,20 +151,19 @@ async function testWriteTaskIsolationFailClosed(WorkerPipeline) {
     enableTargetEnforce: false,
     enableContextUpdate: false,
     worktreeManager: {
-      acquire() { return null; },
+      acquire() {
+        acquireCalled = true;
+        return null;
+      },
       isGitRepository() { return false; },
     },
   });
 
-  assert(result.executionResult.success === false, '隔离失败时任务应 fail-closed');
-  assert(workerExecuted === false, '隔离失败时不应执行 worker');
-  const joinedErrors = Array.isArray(result.executionResult.errors)
-    ? result.executionResult.errors.join(' | ')
-    : '';
-  assert(
-    /worktree/i.test(joinedErrors) || joinedErrors.includes('隔离'),
-    `隔离失败错误信息缺失: ${joinedErrors}`,
-  );
+  assert(result.executionResult.success === true, '非 Git 工作区写任务应自动降级为串行执行');
+  assert(workerExecuted === true, '非 Git 工作区降级后仍应执行 worker');
+  assert(acquireCalled === false, '非 Git 工作区不应尝试申请 worktree');
+  assert(receivedWorkingDirectory === process.cwd(), `非 Git 工作区应直接使用主工作区执行，实际: ${receivedWorkingDirectory}`);
+  assert(result.worktreeMerge === undefined, '非 Git 工作区降级执行不应产生 worktree merge 结果');
 }
 
 async function main() {
@@ -153,14 +173,14 @@ async function main() {
   try {
     testMergeConflictGuidance(repoDir, WorktreeManager);
     testOrphanReconcile(repoDir, WorktreeManager);
-    await testWriteTaskIsolationFailClosed(WorkerPipeline);
+    await testWriteTaskNonGitWorkspaceSerialFallback(WorkerPipeline);
     console.log('\n=== worktree runtime guardrails regression ===');
     console.log(JSON.stringify({
       pass: true,
       checks: [
         'merge-conflict-guidance',
         'orphan-reconcile',
-        'write-task-isolation-fail-closed',
+        'write-task-non-git-workspace-serial-fallback',
       ],
     }, null, 2));
   } finally {

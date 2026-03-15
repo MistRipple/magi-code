@@ -238,11 +238,14 @@
   let containerRef: HTMLDivElement | null = $state(null);
   const showScrollBtn = $derived(!shouldAutoScroll && safeMessages.length > 0);
   let wasActive = $state(false);
+  let lastObservedScrollTop = $state(0);
 
   function setContainerScrollPosition(nextTop: number) {
     if (!containerRef) return;
+    const clampedTop = Math.max(0, nextTop);
+    lastObservedScrollTop = clampedTop;
     containerRef.style.scrollBehavior = 'auto';
-    containerRef.scrollTop = Math.max(0, nextTop);
+    containerRef.scrollTop = clampedTop;
     requestAnimationFrame(() => {
       if (containerRef) {
         containerRef.style.scrollBehavior = '';
@@ -381,8 +384,17 @@
   function handleScroll(event: Event) {
     const target = event.target as HTMLDivElement;
     const { scrollTop, scrollHeight, clientHeight } = target;
-    const isNearBottom = scrollHeight - scrollTop - clientHeight < 100;
-    syncPanelScrollState(scrollTop, isNearBottom);
+    const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+    const isNearBottom = distanceFromBottom < 100;
+    const userScrolledUp = scrollTop < lastObservedScrollTop - 4;
+    let nextAutoScroll = shouldAutoScroll;
+    if (isNearBottom) {
+      nextAutoScroll = true;
+    } else if (userScrolledUp) {
+      nextAutoScroll = false;
+    }
+    lastObservedScrollTop = scrollTop;
+    syncPanelScrollState(scrollTop, nextAutoScroll);
   }
 
   // 滚动到底部

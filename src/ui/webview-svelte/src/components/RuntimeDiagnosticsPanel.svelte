@@ -241,8 +241,9 @@
     border-radius: 8px;
     background: var(--vscode-editorWidget-background, #252526);
     color: var(--vscode-foreground, #ccc);
-    overflow: hidden;
+    overflow: visible;
     border-left: 3px solid var(--vscode-editorWidget-border, #3c3c3c);
+    position: relative;
   }
 
   /* 卡片左边框根据终态着色 */
@@ -307,11 +308,22 @@
   }
 
   .runtime-diagnostics__content {
+    position: absolute;
+    top: 100%;
+    left: -1px;
+    right: -1px;
+    z-index: 20;
+    border: 1px solid var(--vscode-editorWidget-border, #3c3c3c);
     border-top: 1px solid var(--vscode-editorWidget-border, #3c3c3c);
+    border-radius: 0 0 8px 8px;
+    background: var(--vscode-editorWidget-background, #252526);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
     padding: 8px 10px;
     display: flex;
     flex-direction: column;
     gap: 10px;
+    max-height: 320px;
+    overflow-y: auto;
   }
 
   .metrics-grid {

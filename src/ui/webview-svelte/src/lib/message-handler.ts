@@ -52,6 +52,7 @@ import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBloc
 import { MessageType, MessageCategory } from '../../../../protocol/message-protocol';
 import { routeStandardMessage, getMessageTarget, clearMessageTargets, clearMessageTarget, setMessageTarget } from './message-router';
 import { normalizeWorkerSlot } from './message-classifier';
+import { buildAssignmentTaskCardKey, buildWaitResultFromTaskCardMessage, resolveTaskCardKeyFromMetadata, resolveTaskCardScopeId } from './task-card-runtime';
 import { ensureArray } from './utils';
 import { i18n } from '../stores/i18n.svelte';
 import { terminalSessions, type TerminalStreamEventPayload } from '../stores/terminal-sessions.svelte';
@@ -102,40 +103,6 @@ const WAIT_RESULT_WAIT_STATUS_SET = new Set<WaitForWorkersResult['wait_status']>
   'completed',
   'timeout',
 ]);
-
-function normalizeCardKey(raw: unknown): string {
-  if (typeof raw !== 'string') return '';
-  const trimmed = raw.trim();
-  return trimmed.length > 0 ? trimmed : '';
-}
-
-function buildAssignmentCardKey(assignmentKey: string, scopeId?: string): string {
-  const normalizedAssignment = assignmentKey.trim();
-  if (!normalizedAssignment) return '';
-  const normalizedScope = typeof scopeId === 'string' ? scopeId.trim() : '';
-  return normalizedScope ? `assign:${normalizedAssignment}@${normalizedScope}` : `assign:${normalizedAssignment}`;
-}
-
-function resolveScopeId(meta: Record<string, unknown> | undefined): string {
-  const requestId = typeof meta?.requestId === 'string' ? meta.requestId.trim() : '';
-  if (requestId) return requestId;
-  const missionId = typeof meta?.missionId === 'string' ? meta.missionId.trim() : '';
-  return missionId || '';
-}
-
-function resolveCardKeyFromMetadata(meta: Record<string, unknown> | undefined): string {
-  const scopeId = resolveScopeId(meta);
-  const rawAssignmentId = normalizeCardKey(meta?.assignmentId);
-  if (rawAssignmentId) return buildAssignmentCardKey(rawAssignmentId, scopeId);
-  const rawSubTaskId = normalizeCardKey(meta?.subTaskId);
-  if (rawSubTaskId) return buildAssignmentCardKey(rawSubTaskId, scopeId);
-  // 对齐 MessageItem.svelte，修复 task_card 重启丢失总结报告的问题
-  const rawSubTaskCardId = normalizeCardKey((meta?.subTaskCard as any)?.id);
-  if (rawSubTaskCardId) return buildAssignmentCardKey(rawSubTaskCardId, scopeId);
-  const rawCardId = normalizeCardKey(meta?.cardId);
-  if (rawCardId) return rawCardId;
-  return '';
-}
 
 function normalizeWaitResultItem(raw: Record<string, unknown>): WaitForWorkersResultItem | null {
   const taskId = typeof raw.task_id === 'string' ? raw.task_id.trim() : '';
@@ -204,62 +171,17 @@ function extractWaitForWorkersPayloadFromMessage(message: Message): WaitForWorke
   return null;
 }
 
-function buildWaitResultFromTaskCard(message: Message): { cardKey: string; result: WaitForWorkersResult } | null {
-  if (message.type !== 'task_card') return null;
-  const meta = message.metadata as Record<string, unknown> | undefined;
-  const subTaskCard = (meta?.subTaskCard || {}) as Record<string, unknown>;
-  const rawWorker = (subTaskCard.worker as string | undefined) || (meta?.assignedWorker as string | undefined);
-  const worker = normalizeWorkerSlot(rawWorker);
-  if (!worker) return null;
-  const cardKey = resolveCardKeyFromMetadata(meta);
-  if (!cardKey) return null;
-  const statusRaw = typeof subTaskCard.status === 'string' ? subTaskCard.status : '';
-  const statusMap: Record<string, WaitForWorkersResultItem['status']> = {
-    completed: 'completed',
-    failed: 'failed',
-    skipped: 'skipped',
-    stopped: 'cancelled',
-  };
-  const mappedStatus = statusMap[statusRaw];
-  if (!mappedStatus) return null;
-  const summary = typeof subTaskCard.summary === 'string'
-    ? subTaskCard.summary
-    : (typeof subTaskCard.error === 'string' ? subTaskCard.error : '');
-  const modifiedFiles = Array.isArray(subTaskCard.modifiedFiles)
-    ? subTaskCard.modifiedFiles.filter((file): file is string => typeof file === 'string' && file.trim().length > 0)
-    : [];
-  const errors = typeof subTaskCard.error === 'string' && subTaskCard.error.trim()
-    ? [subTaskCard.error.trim()]
-    : undefined;
-  const result: WaitForWorkersResult = {
-    results: [{
-      task_id: String(subTaskCard.id || message.id || ''),
-      worker,
-      status: mappedStatus,
-      summary,
-      modified_files: modifiedFiles,
-      ...(errors ? { errors } : {}),
-    }],
-    wait_status: 'completed',
-    timed_out: false,
-    pending_task_ids: [],
-    waited_ms: 0,
-    updatedAt: message.timestamp || Date.now(),
-  };
-  return { cardKey, result };
-}
-
 function syncWorkerWaitResultsFromMessage(message: Message): void {
   const payload = extractWaitForWorkersPayloadFromMessage(message);
   if (payload && payload.results.length > 0) {
     const updates: Record<string, WaitForWorkersResult> = {};
     const updatedAt = typeof payload.updatedAt === 'number' ? payload.updatedAt : (message.timestamp || Date.now());
-    const scopeId = resolveScopeId(message.metadata as Record<string, unknown> | undefined);
+    const scopeId = resolveTaskCardScopeId(message.metadata as Record<string, unknown> | undefined);
     const grouped = new Map<string, WaitForWorkersResultItem[]>();
     for (const result of payload.results) {
       const taskId = typeof result.task_id === 'string' ? result.task_id.trim() : '';
       if (!taskId) continue;
-      const cardKey = buildAssignmentCardKey(taskId, scopeId);
+      const cardKey = buildAssignmentTaskCardKey(taskId, scopeId);
       const list = grouped.get(cardKey) || [];
       list.push(result);
       grouped.set(cardKey, list);
@@ -276,7 +198,7 @@ function syncWorkerWaitResultsFromMessage(message: Message): void {
     }
   }
 
-  const taskCardResult = buildWaitResultFromTaskCard(message);
+  const taskCardResult = buildWaitResultFromTaskCardMessage(message);
   if (taskCardResult) {
     updateWorkerWaitResults({ [taskCardResult.cardKey]: taskCardResult.result });
   }
@@ -997,16 +919,24 @@ function findLastMessageByCardId(messages: Message[], cardId: string): Message |
   return undefined;
 }
 
+function isStableCardMessage(message: Message | undefined): boolean {
+  if (!message) {
+    return false;
+  }
+  return message.type === 'task_card' || message.type === 'instruction';
+}
 
 function recoverTargetByCardId(cardId: string): { target: ResolvedTarget; messageId: string } | null {
   if (!cardId.trim()) {
     return null;
   }
   const state = getState();
-  const threadMessage = findLastMessageByCardId(state.threadMessages, cardId);
+  const threadMessageCandidate = findLastMessageByCardId(state.threadMessages, cardId);
+  const threadMessage = isStableCardMessage(threadMessageCandidate) ? threadMessageCandidate : undefined;
   const workerMatches: Array<{ worker: WorkerSlot; message: Message }> = [];
   for (const worker of WORKER_SLOTS) {
-    const message = findLastMessageByCardId(state.agentOutputs[worker], cardId);
+    const messageCandidate = findLastMessageByCardId(state.agentOutputs[worker], cardId);
+    const message = isStableCardMessage(messageCandidate) ? messageCandidate : undefined;
     if (message) {
       workerMatches.push({ worker, message });
     }
@@ -1411,14 +1341,26 @@ function handleContentMessage(standard: StandardMessage) {
           // 1. 更新绑定关系指向新 ID
           updateRequestBinding(requestId, { realMessageId: standard.id, placeholderMessageId: standard.id });
 
-          // 2. 构造新消息对象
+          // 2. 若流更新先于真实 STARTED 抵达，列表里可能已经存在 synthetic/恢复出来的实体。
+          // 必须合并该实体与占位消息，保留已累积的流式内容，并在最终列表中只保留一个消息节点。
+          const existingRealMessage = getState().threadMessages.find(m => m.id === standard.id);
+          const replacementBase = existingRealMessage && hasRenderableContent(existingRealMessage)
+            ? existingRealMessage
+            : existingPlaceholder;
+          const shouldUseIncomingContent = hasRenderableContent(uiMessage);
           const newMessage: import('../types/message').Message = {
+            ...replacementBase,
             ...uiMessage,
+            id: standard.id,
+            content: shouldUseIncomingContent ? uiMessage.content : replacementBase.content,
+            blocks: shouldUseIncomingContent ? uiMessage.blocks : replacementBase.blocks,
             metadata: {
+              ...(replacementBase.metadata || {}),
               ...(uiMessage.metadata || {}),
               requestId, // 保持请求关联
               isPlaceholder: false,
               wasPlaceholder: true,
+              placeholderState: undefined,
             },
           };
 
@@ -2835,16 +2777,12 @@ function mapStandardMessage(standard: StandardMessage): Message {
 
   const baseMetadata = { ...(standard.metadata || {}) } as Record<string, unknown>;
   const rawCardId = typeof baseMetadata.cardId === 'string' ? baseMetadata.cardId.trim() : '';
-  const rawAssignmentId = typeof baseMetadata.assignmentId === 'string' ? baseMetadata.assignmentId.trim() : '';
-  const rawSubTaskId = typeof baseMetadata.subTaskId === 'string' ? baseMetadata.subTaskId.trim() : '';
-  const assignmentKey = rawAssignmentId || rawSubTaskId;
-  const scopeId = resolveScopeId(baseMetadata);
-  const shouldUseAssignmentCard = (standard.type === MessageType.INSTRUCTION || standard.type === MessageType.TASK_CARD)
-    && assignmentKey;
+  const resolvedAssignmentCardId = resolveTaskCardKeyFromMetadata(baseMetadata);
+  const shouldUseAssignmentCard = standard.type === MessageType.INSTRUCTION || standard.type === MessageType.TASK_CARD;
   const cardId = shouldUseAssignmentCard
-    ? buildAssignmentCardKey(assignmentKey, scopeId)
+    ? (resolvedAssignmentCardId || rawCardId || standard.id)
     : (rawCardId || standard.id);
-  const uiMessageId = (standard.type === MessageType.INSTRUCTION && assignmentKey)
+  const uiMessageId = (standard.type === MessageType.INSTRUCTION && resolvedAssignmentCardId)
     ? cardId
     : standard.id;
 

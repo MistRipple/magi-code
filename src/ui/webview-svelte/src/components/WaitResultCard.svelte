@@ -90,6 +90,15 @@
     default: 'idle',
   }));
 
+  const runtimeStatusLabelKeyMap: Record<string, string> = {
+    idle: 'waitResultCard.runtime.idle',
+    pending: 'waitResultCard.runtime.pending',
+    running: 'waitResultCard.runtime.running',
+    blocked: 'waitResultCard.runtime.blocked',
+    failed: 'waitResultCard.runtime.failed',
+    completed: 'waitResultCard.runtime.completed',
+  };
+
   // 审计等级配色
   const auditColorMap: Record<string, { colorVar: string; icon: IconName; labelKey: string }> = {
     normal: { colorVar: '--success', icon: 'check-circle', labelKey: 'waitResultCard.audit.normal' },
@@ -139,7 +148,7 @@
             <span class="waiting-dot" data-runtime={runtimeStatus}></span>
             <div class="waiting-main">
               <span class="waiting-name">{workerLabels[worker]}</span>
-              <span class="waiting-status">{i18n.t('waitResultCard.waitingStatus')}</span>
+              <span class="waiting-status">{i18n.t(runtimeStatusLabelKeyMap[runtimeStatus] || 'waitResultCard.waitingStatus')}</span>
             </div>
             <span class="waiting-icon">{wm.icon}</span>
           </div>

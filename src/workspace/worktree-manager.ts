@@ -11,7 +11,7 @@
  *   4. release(taskId) → 清理 worktree 目录和临时分支
  *
  * 设计约束：
- * - 仅在 git 仓库内可用（非 git 项目回退到共享模式）
+ * - 仅在 git 仓库内可用；非 git 工作区由上层调度自动降级为主工作区串行写模式
  * - worktree 路径：{workspaceRoot}/.magi/worktrees/task-{id}
  * - 分支名称：magi/worker/{taskId}
  */

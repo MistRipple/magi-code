@@ -80,24 +80,23 @@ export class OrchestratorDecisionEngine {
     }
 
     if (runningRequired === 0) {
-      if (this.isBudgetGateArmed(noProgressStreak)) {
-        const hardBudgetBreach = this.isHardBudgetBreach(snapshot, budget);
-        if (hardBudgetBreach || budgetBreachStreak >= this.policy.budgetBreachStreakThreshold) {
-          const label = hardBudgetBreach ? 'budget_hard' : 'budget_debounced';
-          candidates.push(createCandidate('budget_exceeded', label));
-          events.push({
-            gate: 'budget',
-            hard: hardBudgetBreach,
-            label,
-            payload: {
-              requiredTotal: snapshot.requiredTotal,
-              attemptSeq: snapshot.attemptSeq,
-              budgetBreachStreak,
-              elapsedMs: snapshot.budgetState.elapsedMs,
-              tokenUsed: snapshot.budgetState.tokenUsed,
-            },
-          });
-        }
+      const hardBudgetBreach = this.isHardBudgetBreach(snapshot, budget);
+      const budgetGateArmed = hardBudgetBreach || this.isBudgetGateArmed(noProgressStreak);
+      if (budgetGateArmed && (hardBudgetBreach || budgetBreachStreak >= this.policy.budgetBreachStreakThreshold)) {
+        const label = hardBudgetBreach ? 'budget_hard' : 'budget_debounced';
+        candidates.push(createCandidate('budget_exceeded', label));
+        events.push({
+          gate: 'budget',
+          hard: hardBudgetBreach,
+          label,
+          payload: {
+            requiredTotal: snapshot.requiredTotal,
+            attemptSeq: snapshot.attemptSeq,
+            budgetBreachStreak,
+            elapsedMs: snapshot.budgetState.elapsedMs,
+            tokenUsed: snapshot.budgetState.tokenUsed,
+          },
+        });
       }
 
       const hardExternalWaitBreach = this.isHardExternalWaitBreach(snapshot);
@@ -175,10 +174,10 @@ export class OrchestratorDecisionEngine {
     }
     if (useTodoTrackGuards && runningRequired === 0) {
       if (
-        this.isBudgetGateArmed(noProgressStreak)
-        && (
-          this.isHardBudgetBreach(snapshot, budget)
-          || budgetBreachStreak >= this.policy.budgetBreachStreakThreshold
+        this.isHardBudgetBreach(snapshot, budget)
+        || (
+          this.isBudgetGateArmed(noProgressStreak)
+          && budgetBreachStreak >= this.policy.budgetBreachStreakThreshold
         )
       ) {
         return 'budget_exceeded';

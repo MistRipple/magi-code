@@ -1220,11 +1220,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'getState':
         this.sendStateUpdate();
         await this.sendCurrentSessionToWebview();
+        this.syncWorkerStatusToWebview(false, 'getState');
         break;
 
       case 'requestState':
         this.sendStateUpdate();
         await this.sendCurrentSessionToWebview();
+        this.syncWorkerStatusToWebview(false, 'requestState');
         break;
 
       case 'webviewReady':
@@ -1233,6 +1235,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         logger.info('界面.Webview.就绪', undefined, LogCategory.UI);
         this.sendStateUpdate();
         await this.sendCurrentSessionToWebview();
+        // 启动期的 workerStatusUpdate 可能早于 Webview ready 发出并被丢弃，
+        // ready 后必须补发一次缓存/最新状态，确保底部 Worker Tab 自恢复。
+        this.syncWorkerStatusToWebview(false, 'webviewReady');
         break;
 
       case 'login':
@@ -1571,6 +1576,20 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     if (this.runtimeInitializationError) {
       throw new Error(this.runtimeInitializationError);
     }
+  }
+
+  /**
+   * Worker 状态必须在 Webview ready / 刷新恢复后主动重放。
+   * 底部 Worker Tab 不应依赖 SettingsPanel 的 onMount 才获得正确状态。
+   */
+  private syncWorkerStatusToWebview(force: boolean, reason: string): void {
+    void this.workerStatusService.sendWorkerStatus(force).catch((error) => {
+      logger.warn('界面.Worker状态.同步_失败', {
+        reason,
+        force,
+        error: String(error),
+      }, LogCategory.UI);
+    });
   }
 
   /** 处理登录消息 */

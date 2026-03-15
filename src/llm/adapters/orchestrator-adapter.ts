@@ -113,6 +113,16 @@ class MissionOutcomeExtractor {
   private inBlock = false;
   private latestOutcome: MissionOutcomeBlock | undefined;
 
+  private getStartMarkerHoldbackLength(input: string): number {
+    const maxHoldback = Math.min(input.length, MISSION_OUTCOME_START.length - 1);
+    for (let len = maxHoldback; len > 0; len -= 1) {
+      if (MISSION_OUTCOME_START.startsWith(input.slice(-len))) {
+        return len;
+      }
+    }
+    return 0;
+  }
+
   consume(chunk: string): { text: string; outcome?: MissionOutcomeBlock } {
     if (!chunk) {
       return { text: '', outcome: this.latestOutcome };
@@ -124,7 +134,8 @@ class MissionOutcomeExtractor {
       if (!this.inBlock) {
         const startIndex = this.buffer.indexOf(MISSION_OUTCOME_START);
         if (startIndex === -1) {
-          const safeLen = Math.max(0, this.buffer.length - (MISSION_OUTCOME_START.length - 1));
+          const holdback = this.getStartMarkerHoldbackLength(this.buffer);
+          const safeLen = Math.max(0, this.buffer.length - holdback);
           output += this.buffer.slice(0, safeLen);
           this.buffer = this.buffer.slice(safeLen);
           break;
@@ -1305,10 +1316,14 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               repeatedNoTodoToolSignatureStreak = 0;
               lastNoTodoToolSignature = '';
               const hasToolEvidence = totalToolResultCount > 0;
+              const hasToolCapability = toolDefinitions.length > 0 || hasToolEvidence;
               const hasOutcomeSignal = normalizedOutcomeSteps.length > 0 || Boolean(outcomeStatus);
               const runningWithoutSteps = outcomeStatus === 'running' && normalizedOutcomeSteps.length === 0;
 
-              if (hasToolEvidence || runningWithoutSteps) {
+              if (!hasToolCapability && !hasOutcomeSignal) {
+                noTodoOutcomeMissingStreak = 0;
+                candidates.push(this.createTerminationCandidate('completed', 'plain_response_no_required_todos'));
+              } else if (hasToolEvidence || runningWithoutSteps) {
                 noTodoOutcomeMissingStreak = 0;
                 history.push({
                   role: 'user',
@@ -1317,9 +1332,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                 this.normalizer.endStream(streamId);
                 round++;
                 continue;
-              }
-
-              if (!hasOutcomeSignal) {
+              } else if (!hasOutcomeSignal) {
                 noTodoOutcomeMissingStreak += 1;
                 if (noTodoOutcomeMissingStreak >= 2) {
                   candidates.push(this.createTerminationCandidate('stalled', 'no_outcome_block'));

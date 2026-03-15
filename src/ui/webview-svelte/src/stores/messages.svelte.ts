@@ -120,6 +120,30 @@ function createDefaultScrollAnchors(): ScrollAnchors {
   };
 }
 
+function createDefaultScrollPositions(): ScrollPositions {
+  return {
+    thread: 0,
+    claude: 0,
+    codex: 0,
+    gemini: 0,
+  };
+}
+
+function createDefaultAutoScrollConfig(): AutoScrollConfig {
+  return {
+    thread: true,
+    claude: true,
+    codex: true,
+    gemini: true,
+  };
+}
+
+function resetPanelScrollRuntimeState(): void {
+  messagesState.scrollPositions = createDefaultScrollPositions();
+  messagesState.scrollAnchors = createDefaultScrollAnchors();
+  messagesState.autoScrollEnabled = createDefaultAutoScrollConfig();
+}
+
 let deferredWebviewStateSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 function scheduleSaveWebviewState(): void {
@@ -779,9 +803,6 @@ function saveWebviewState() {
     agentOutputs: messagesState.agentOutputs,
     sessions: messagesState.sessions,
     currentSessionId: messagesState.currentSessionId,
-    scrollPositions: messagesState.scrollPositions,
-    scrollAnchors: messagesState.scrollAnchors,
-    autoScrollEnabled: messagesState.autoScrollEnabled,
     notificationBuckets,
     orchestratorRuntimeDiagnostics: messagesState.orchestratorRuntimeDiagnostics,
   };
@@ -866,7 +887,11 @@ export function clearMessageJump(): void {
 
 // 会话操作
 export function setCurrentSessionId(id: string | null) {
+  const hasChanged = messagesState.currentSessionId !== id;
   messagesState.currentSessionId = id;
+  if (hasChanged) {
+    resetPanelScrollRuntimeState();
+  }
   syncNotificationsFromBucket(id);
   saveWebviewState();
 }
@@ -1364,7 +1389,15 @@ export function replaceThreadMessage(oldMessageId: string, message: Message) {
     addThreadMessage(safeMessage);
     return;
   }
-  if (messagesState.threadMessages.some((m, i) => m.id === safeMessage.id && i !== index)) {
+  const conflictIndex = messagesState.threadMessages.findIndex((m, i) => m.id === safeMessage.id && i !== index);
+  if (conflictIndex !== -1) {
+    // 占位消息被真实消息原地替换时，前端可能已因提前到达的流更新创建了同 id 的 synthetic 实体。
+    // replace 语义必须收敛为单一节点，而不是静默放弃替换，否则后续更新会继续打到旧位置。
+    const filtered = messagesState.threadMessages.filter((_, i) => i !== conflictIndex);
+    const replacementIndex = conflictIndex < index ? index - 1 : index;
+    filtered[replacementIndex] = safeMessage;
+    messagesState.threadMessages = filtered;
+    saveWebviewState();
     return;
   }
   const next = [...messagesState.threadMessages];
@@ -1487,6 +1520,7 @@ export function clearAllMessages() {
   clearPendingInteractions();
   clearProcessingState();
   terminalSessions.clear();
+  resetPanelScrollRuntimeState();
   saveWebviewState();
 }
 
@@ -1511,6 +1545,7 @@ export function setAgentOutputs(outputs: AgentOutputs) {
 // 导出状态初始化
 export function initializeState() {
   clearAllRetryRuntime();
+  resetPanelScrollRuntimeState();
   const persisted = vscode.getState<WebviewPersistedState>();
   if (persisted) {
     const validThread = isValidPersistedArray(persisted.threadMessages, MAX_PERSISTED_ARRAY_LENGTH);
@@ -1545,16 +1580,8 @@ export function initializeState() {
         if (sessionSeen.has(session.id)) return false;
         sessionSeen.add(session.id);
         return true;
-      });
+    });
     messagesState.currentSessionId = persisted.currentSessionId || null;
-    messagesState.scrollPositions = persisted.scrollPositions || { thread: 0, claude: 0, codex: 0, gemini: 0 };
-    messagesState.scrollAnchors = persisted.scrollAnchors ? {
-      thread: normalizeScrollAnchor(persisted.scrollAnchors.thread),
-      claude: normalizeScrollAnchor(persisted.scrollAnchors.claude),
-      codex: normalizeScrollAnchor(persisted.scrollAnchors.codex),
-      gemini: normalizeScrollAnchor(persisted.scrollAnchors.gemini),
-    } : createDefaultScrollAnchors();
-    messagesState.autoScrollEnabled = persisted.autoScrollEnabled || { thread: true, claude: true, codex: true, gemini: true };
     notificationBuckets = normalizeNotificationBuckets(persisted.notificationBuckets);
     messagesState.orchestratorRuntimeDiagnostics = normalizeOrchestratorRuntimeDiagnostics(persisted.orchestratorRuntimeDiagnostics);
     syncNotificationsFromBucket(messagesState.currentSessionId);

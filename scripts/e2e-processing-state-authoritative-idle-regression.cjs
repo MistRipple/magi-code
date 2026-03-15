@@ -13,7 +13,9 @@ function assert(condition, message) {
 function installBrowserEnv() {
   const listeners = new Map();
   global.$state = (value) => value;
-  global.$derived = (value) => value;
+  global.$derived = Object.assign((value) => value, {
+    by: (factory) => factory(),
+  });
   global.window = {
     __INITIAL_LOCALE__: 'zh-CN',
     __DEBUG_MODE__: false,

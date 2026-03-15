@@ -98,6 +98,8 @@ interface DispatchDependencyResolution {
   routingReasonPatches: string[];
 }
 
+type WorkspaceWriteIsolationMode = 'git_worktree' | 'workspace_serial';
+
 /**
  * DispatchManager 依赖接口
  */
@@ -203,6 +205,8 @@ export class DispatchManager {
   private leaseWatcherTimer?: NodeJS.Timeout;
   /** Git worktree 沙盒管理器（文件系统级并行隔离） */
   private readonly worktreeManager: WorktreeManager;
+  /** 非 Git 工作区写任务串行降级提示，单轮只提示一次 */
+  private nonGitWriteSerializationNoticeShown = false;
 
   constructor(private deps: DispatchManagerDeps) {
     this.routingService = new DispatchRoutingService(
@@ -356,6 +360,7 @@ export class DispatchManager {
     this.clearAllProtocolStates();
     this.clearDispatchScheduleTimers();
     this.clearResumeContext();
+    this.nonGitWriteSerializationNoticeShown = false;
     // 清空 dispatch 文件写入追踪表，避免跨执行周期的误判
     this.deps.adapterFactory.getToolManager().clearDispatchFileWriteTracker();
   }
@@ -367,22 +372,24 @@ export class DispatchManager {
     return this.routingService.resolveDispatchRouting(goal, explicitCategory);
   }
 
-  /**
-   * 写任务前置校验（fail-fast）：
-   * 在 dispatch 注册阶段阻断非 Git 工作区写任务，避免进入 Worker 并发后批量失败。
-   */
-  private checkWriteTaskPreconditions(): string | null {
-    if (this.worktreeManager.isGitRepository()) {
+  private resolveWorkspaceWriteIsolationMode(requiresModification: boolean): WorkspaceWriteIsolationMode | null {
+    if (!requiresModification) {
       return null;
     }
-    const errorMessage = t('dispatch.errors.writeTaskRequiresGitWorkspace', {
-      workspaceRoot: this.deps.workspaceRoot,
-    });
-    logger.warn('编排工具.worker_dispatch.写任务前置校验失败_非Git仓库', {
+    return this.worktreeManager.isGitRepository()
+      ? 'git_worktree'
+      : 'workspace_serial';
+  }
+
+  private notifyWorkspaceSerialWriteModeOnce(): void {
+    if (this.nonGitWriteSerializationNoticeShown) {
+      return;
+    }
+    this.nonGitWriteSerializationNoticeShown = true;
+    this.deps.messageHub.notify(t('dispatch.notify.nonGitWriteSerialized'), 'info');
+    logger.info('编排工具.worker_dispatch.非Git写任务.自动降级串行模式', {
       workspaceRoot: this.deps.workspaceRoot,
     }, LogCategory.ORCHESTRATOR);
-    this.deps.messageHub.notify(errorMessage, 'warning');
-    return errorMessage;
   }
 
   private resolveExecutionWorker(
@@ -476,16 +483,6 @@ export class DispatchManager {
             status: 'failed' as const,
             error: t('dispatch.errors.requiresModificationBoolean'),
           };
-        }
-        if (requiresModification) {
-          const writeTaskPreconditionError = this.checkWriteTaskPreconditions();
-          if (writeTaskPreconditionError) {
-            return {
-              task_id: '',
-              status: 'failed' as const,
-              error: writeTaskPreconditionError,
-            };
-          }
         }
         const taskName = typeof task_name === 'string' ? task_name.trim() : '';
         const goalText = typeof goal === 'string' ? goal.trim() : '';
@@ -603,12 +600,23 @@ export class DispatchManager {
           routingReason: decision.routingReason,
           degraded: decision.degraded,
         });
-        const effectiveDependsOn = scopeHintPlan.dependsOn;
-        const effectiveRoutingReason = [
+        const workspaceWriteIsolationMode = this.resolveWorkspaceWriteIsolationMode(requiresModification);
+        const baseRoutingReason = [
           scopeHintPlan.routingReason,
           ...dependencyResolution.routingReasonPatches,
         ].filter(Boolean).join('; ');
-        const effectiveDegraded = scopeHintPlan.degraded || dependencyResolution.degraded;
+        const baseDegraded = scopeHintPlan.degraded || dependencyResolution.degraded;
+        const writeIsolationPlan = this.resolveWriteIsolationPolicy({
+          batch: this.activeBatch,
+          dependsOn: scopeHintPlan.dependsOn,
+          routingReason: baseRoutingReason,
+          degraded: baseDegraded,
+          requiresModification,
+          isolationMode: workspaceWriteIsolationMode,
+        });
+        const effectiveDependsOn = writeIsolationPlan.dependsOn;
+        const effectiveRoutingReason = writeIsolationPlan.routingReason;
+        const effectiveDegraded = writeIsolationPlan.degraded;
         const taskContract = this.buildDispatchTaskContract({
           taskTitle,
           category: decision.category,
@@ -719,6 +727,21 @@ export class DispatchManager {
             existingDependsOn: normalizedDependsOn || [],
           }, LogCategory.ORCHESTRATOR);
         }
+        if (workspaceWriteIsolationMode === 'workspace_serial') {
+          this.notifyWorkspaceSerialWriteModeOnce();
+          if (writeIsolationPlan.addedDependencies.length > 0) {
+            this.deps.messageHub.notify(t('dispatch.notify.nonGitWriteSerializedTask', {
+              taskId,
+              count: writeIsolationPlan.addedDependencies.length,
+            }), 'info');
+          }
+          logger.info('编排工具.worker_dispatch.非Git写任务.串行依赖已注入', {
+            taskId,
+            worker: decision.selectedWorker,
+            addedDependencies: writeIsolationPlan.addedDependencies,
+            existingDependsOn: normalizedDependsOn || [],
+          }, LogCategory.ORCHESTRATOR);
+        }
 
         // 注册到 DispatchBatch
         try {
@@ -732,8 +755,7 @@ export class DispatchManager {
           this.activeBatch.topologicalSort();
           this.activeBatch.validateDepthLimit();
 
-          // C-13: 文件冲突由 Worktree 隔离机制处理（每个写任务独立 worktree），
-          // 不再需要串行降级。
+          // C-13: Git 工作区使用 worktree 物理隔离；非 Git 工作区自动降级为单写串行模式。
         } catch (regError: any) {
           this.dispatchIdempotencyStore.removeByTaskId(taskId);
           return {
@@ -2923,6 +2945,22 @@ export class DispatchManager {
     return merged;
   }
 
+  private buildAutoSerializationDependenciesForWorkspaceSerialWrites(
+    batch: DispatchBatch,
+    dependsOn?: string[],
+  ): string[] {
+    const dependencySet = new Set(dependsOn || []);
+    const merged = [...dependencySet];
+    for (const entry of batch.getEntries()) {
+      if (isTerminalStatus(entry.status)) continue;
+      if (entry.taskContract.requirementAnalysis.requiresModification !== true) continue;
+      if (dependencySet.has(entry.taskId)) continue;
+      dependencySet.add(entry.taskId);
+      merged.push(entry.taskId);
+    }
+    return merged;
+  }
+
   /**
    * 并行分区策略统一入口：
    * - scope_hint 存在：按调用方输入执行，不做额外降级。
@@ -2974,6 +3012,50 @@ export class DispatchManager {
     const downgradeReason = t('dispatch.notify.parallelScopeHintMissingSerializedReason', {
       count: addedDependencies.length,
     });
+
+    return {
+      dependsOn: serializedDependsOn.length > 0 ? serializedDependsOn : undefined,
+      routingReason: `${baseReason}; ${downgradeReason}`,
+      degraded: true,
+      addedDependencies,
+    };
+  }
+
+  private resolveWriteIsolationPolicy(input: {
+    batch: DispatchBatch;
+    dependsOn?: string[];
+    routingReason: string;
+    degraded: boolean;
+    requiresModification: boolean;
+    isolationMode: WorkspaceWriteIsolationMode | null;
+  }): {
+    dependsOn?: string[];
+    routingReason: string;
+    degraded: boolean;
+    addedDependencies: string[];
+  } {
+    const normalizedDependsOn = input.dependsOn && input.dependsOn.length > 0
+      ? [...new Set(input.dependsOn)]
+      : undefined;
+
+    if (!input.requiresModification || input.isolationMode !== 'workspace_serial') {
+      return {
+        dependsOn: normalizedDependsOn,
+        routingReason: input.routingReason,
+        degraded: input.degraded,
+        addedDependencies: [],
+      };
+    }
+
+    const serializedDependsOn = this.buildAutoSerializationDependenciesForWorkspaceSerialWrites(
+      input.batch,
+      normalizedDependsOn,
+    );
+    const addedDependencies = serializedDependsOn.filter(taskId =>
+      !(normalizedDependsOn || []).includes(taskId)
+    );
+    const baseReason = input.routingReason?.trim() || 'routing';
+    const downgradeReason = t('dispatch.notify.nonGitWriteSerializedReason');
 
     return {
       dependsOn: serializedDependsOn.length > 0 ? serializedDependsOn : undefined,
@@ -3358,6 +3440,7 @@ export class DispatchManager {
     this.completionQueue.reset();
     this.reactiveMode = false;
     this.reactiveBatchAwaitingSummary.clear();
+    this.nonGitWriteSerializationNoticeShown = false;
     this.resumeContextStore.dispose();
     this.routingService.clearAllRuntimeUnavailable();
     this.activeWorkerLanes.clear();

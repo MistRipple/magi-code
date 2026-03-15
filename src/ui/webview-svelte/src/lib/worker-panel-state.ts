@@ -86,6 +86,13 @@ interface WorkerTaskSnapshot {
   latestStartedAt: number | null;
 }
 
+interface InstructionTaskSnapshot {
+  hasAssignments: boolean;
+  hasRunning: boolean;
+  hasFailed: boolean;
+  hasPending: boolean;
+}
+
 function snapshotWorkerTasks(tasks: Task[], workerName?: AgentType): WorkerTaskSnapshot {
   const snapshot: WorkerTaskSnapshot = {
     hasAssignments: false,
@@ -119,6 +126,39 @@ function snapshotWorkerTasks(tasks: Task[], workerName?: AgentType): WorkerTaskS
       }
     }
   }
+  return snapshot;
+}
+
+function snapshotInstructionLaneTasks(message: Message | null): InstructionTaskSnapshot {
+  const snapshot: InstructionTaskSnapshot = {
+    hasAssignments: false,
+    hasRunning: false,
+    hasFailed: false,
+    hasPending: false,
+  };
+
+  if (!message || message.type !== 'instruction') return snapshot;
+  const laneTasks = getLaneTasks(message);
+  if (laneTasks.length === 0) return snapshot;
+
+  snapshot.hasAssignments = true;
+  for (const task of laneTasks) {
+    switch (task.status) {
+      case 'running':
+        snapshot.hasRunning = true;
+        break;
+      case 'failed':
+        snapshot.hasFailed = true;
+        break;
+      case 'pending':
+      case 'waiting_deps':
+        snapshot.hasPending = true;
+        break;
+      default:
+        break;
+    }
+  }
+
   return snapshot;
 }
 
@@ -186,18 +226,18 @@ export function deriveWorkerRuntimeState(
 ): WorkerRuntimeState {
   const worker = normalizeWorkerName(params.workerName || '');
   const tasksSnapshot = snapshotWorkerTasks(params.tasks || [], worker || undefined);
-  const hasAssignments = tasksSnapshot.hasAssignments;
-  const hasRunningTask = tasksSnapshot.hasRunning || Boolean(context.latestRunningInstructionMessage);
+  const instructionSnapshot = snapshotInstructionLaneTasks(context.latestInstructionMessage);
+  const hasAssignments = tasksSnapshot.hasAssignments || instructionSnapshot.hasAssignments;
+  const hasRunningTask = tasksSnapshot.hasRunning || instructionSnapshot.hasRunning || Boolean(context.latestRunningInstructionMessage);
   const hasBlocked = tasksSnapshot.hasBlocked;
-  const hasFailed = tasksSnapshot.hasFailed;
-  const hasPending = tasksSnapshot.hasPending;
+  const hasFailed = tasksSnapshot.hasFailed || instructionSnapshot.hasFailed;
+  const hasPending = tasksSnapshot.hasPending || instructionSnapshot.hasPending;
   const hasStreaming = context.hasBottomStreamingMessage;
   const hasPendingRequest = context.panelHasPendingRequest;
-  const hasRunningSignal = hasRunningTask || hasStreaming || hasPendingRequest;
 
   let status: WorkerRuntimeStatus = 'idle';
   let source: WorkerRuntimeSource = 'none';
-  if (hasRunningSignal) {
+  if (hasStreaming || hasRunningTask) {
     status = 'running';
     source = hasAssignments ? 'tasks' : 'none';
   } else if (hasBlocked) {

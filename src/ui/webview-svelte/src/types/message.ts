@@ -611,9 +611,9 @@ export interface WebviewPersistedState {
   agentOutputs: AgentOutputs;
   sessions: Session[];
   currentSessionId: string | null;
-  scrollPositions: ScrollPositions;
+  scrollPositions?: ScrollPositions;
   scrollAnchors?: ScrollAnchors;
-  autoScrollEnabled: AutoScrollConfig;
+  autoScrollEnabled?: AutoScrollConfig;
   notificationBuckets?: Record<string, PersistedNotification[]>;
   orchestratorRuntimeDiagnostics?: OrchestratorRuntimeDiagnostics | null;
 }

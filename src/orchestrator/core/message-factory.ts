@@ -91,10 +91,7 @@ export class MessageFactory {
       logger.warn('MessageFactory.result.空内容跳过', undefined, LogCategory.SYSTEM);
       return;
     }
-    const requestId = (options?.metadata as { requestId?: string } | undefined)?.requestId;
-    const reuseMessageId = requestId ? this.pipeline.getRequestMessageId?.(requestId) : undefined;
     const message = createStandardMessage({
-      id: reuseMessageId,
       traceId: this.traceId,
       category: MessageCategory.CONTENT,
       type: MessageType.RESULT,

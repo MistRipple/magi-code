@@ -211,6 +211,26 @@ async function main() {
     assert(String(result).length > 0, 'pending-required 结果不应为空');
   });
 
+  await runScenario('phase-completed-next-phase-pending', [
+    {
+      content: [
+        '已完成 Phase 1 并行审查。',
+        '下一步建议：',
+        '- Phase 2：派发修复实施',
+        '- Phase 3：修复完成后执行复审验证',
+      ].join('\n'),
+      nextSteps: ['Phase 2：派发修复实施', 'Phase 3：修复完成后执行复审验证'],
+      snapshot: buildSnapshot(3, 3, 0),
+    },
+    {
+      content: '已继续推进下一阶段并完成本轮实施。',
+      snapshot: buildSnapshot(3, 3, 0),
+    },
+  ], (adapterFactory, result) => {
+    assert(adapterFactory.attempts === 2, `phase-completed-next-phase-pending 应触发 2 轮，实际: ${adapterFactory.attempts}`);
+    assert(String(result).length > 0, 'phase-completed-next-phase-pending 结果不应为空');
+  });
+
   await runScenario('non-task-chat-no-followup', [
     {
       content: [

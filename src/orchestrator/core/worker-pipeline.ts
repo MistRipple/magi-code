@@ -29,6 +29,8 @@ import type { AssembledContext } from '../../context/context-assembler';
 import { t } from '../../i18n';
 import type { WorktreeAllocation, WorktreeManager, WorktreeMergeResult } from '../../workspace/worktree-manager';
 
+type WorkspaceWriteIsolationMode = 'git_worktree' | 'workspace_serial';
+
 // ============================================================================
 // 配置与结果类型
 // ============================================================================
@@ -96,10 +98,11 @@ export class WorkerPipeline {
     } = config;
     const missionId = config.missionId || 'dispatch';
 
-    // ========== 0. [可选] Worktree 隔离 ==========
-    // 当任务需要写操作时，必须分配独立 worktree（fail-closed，禁止回退共享目录）
+    // ========== 0. [可选] 写隔离 ==========
+    // Git 仓库：使用 worktree 物理隔离；非 Git 工作区：自动降级为主工作区串行写模式。
     const requiresWrite = assignment.scope?.requiresModification ?? false;
     let worktreeAllocation: WorktreeAllocation | null = null;
+    let writeIsolationMode: WorkspaceWriteIsolationMode | null = null;
     if (requiresWrite) {
       if (!worktreeManager) {
         const isolationError = t('pipeline.errors.worktreeIsolationManagerMissing');
@@ -114,36 +117,32 @@ export class WorkerPipeline {
           targetChangeDetected: false,
         };
       }
-      const isGitRepository = worktreeManager.isGitRepository();
-      if (!isGitRepository) {
-        const isolationError = t('pipeline.errors.worktreeIsolationGitRequired');
-        logger.error('WorkerPipeline.Worktree.隔离失败_非Git仓库', {
+      writeIsolationMode = worktreeManager.isGitRepository()
+        ? 'git_worktree'
+        : 'workspace_serial';
+      if (writeIsolationMode === 'git_worktree') {
+        worktreeAllocation = worktreeManager.acquire(assignment.id);
+        if (!worktreeAllocation) {
+          const isolationError = t('pipeline.errors.worktreeIsolationAcquireFailed');
+          logger.error('WorkerPipeline.Worktree.隔离失败_分配失败', {
+            assignmentId: assignment.id,
+            worker: assignment.workerId,
+            requiresWrite,
+            workspaceRoot,
+          }, LogCategory.ORCHESTRATOR);
+          return {
+            executionResult: this.buildWorktreeIsolationFailureResult(assignment, isolationError),
+            lspNewErrors: [],
+            targetChangeDetected: false,
+          };
+        }
+      } else {
+        logger.info('WorkerPipeline.Worktree.降级_非Git工作区串行写模式', {
           assignmentId: assignment.id,
           worker: assignment.workerId,
           requiresWrite,
           workspaceRoot,
         }, LogCategory.ORCHESTRATOR);
-        return {
-          executionResult: this.buildWorktreeIsolationFailureResult(assignment, isolationError),
-          lspNewErrors: [],
-          targetChangeDetected: false,
-        };
-      }
-      worktreeAllocation = worktreeManager.acquire(assignment.id);
-      if (!worktreeAllocation) {
-        const isolationError = t('pipeline.errors.worktreeIsolationAcquireFailed');
-        logger.error('WorkerPipeline.Worktree.隔离失败_分配失败', {
-          assignmentId: assignment.id,
-          worker: assignment.workerId,
-          requiresWrite,
-          isGitRepository,
-          workspaceRoot,
-        }, LogCategory.ORCHESTRATOR);
-        return {
-          executionResult: this.buildWorktreeIsolationFailureResult(assignment, isolationError),
-          lspNewErrors: [],
-          targetChangeDetected: false,
-        };
       }
     }
     // Worker 的有效工作目录：worktree 路径 > 原始 workspaceRoot
@@ -156,6 +155,7 @@ export class WorkerPipeline {
         worker: assignment.workerId,
         governance: { enableSnapshot, enableLSP, enableTargetEnforce, enableContextUpdate },
         worktreeIsolated: !!worktreeAllocation,
+        writeIsolationMode: writeIsolationMode ?? (requiresWrite ? 'workspace_serial' : 'none'),
         effectiveWorkspaceRoot: worktreeAllocation ? effectiveWorkspaceRoot : undefined,
       },
       LogCategory.ORCHESTRATOR

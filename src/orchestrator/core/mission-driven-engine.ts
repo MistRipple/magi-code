@@ -2816,7 +2816,13 @@ export class MissionDrivenEngine extends EventEmitter {
             }, LogCategory.ORCHESTRATOR);
           }
 
-          const allowStepDrivenFollowUp = normalizedRuntimeReason !== 'completed';
+          const allowStepDrivenFollowUp = this.shouldAllowStepDrivenFollowUp({
+            runtimeReason: normalizedRuntimeReason,
+            requiredTotalTodos,
+            pendingRequiredTodos,
+            hasStructuredRuntimeBacklog,
+            followUpSteps,
+          });
           const hasFollowUpPending = pendingRequiredTodos > 0
             || (allowStepDrivenFollowUp && hasStructuredRuntimeBacklog && followUpSteps.length > 0);
           const runtimeRecoveryDecision = decideRecoveryAction({
@@ -3978,6 +3984,35 @@ export class MissionDrivenEngine extends EventEmitter {
   private buildFollowUpBlockedNotice(blocked: string[]): string {
     const items = blocked.map(item => `- ${item}`).join('\n');
     return t('engine.followUp.blockedNotice', { items });
+  }
+
+  private shouldAllowStepDrivenFollowUp(input: {
+    runtimeReason?: ResolvedOrchestratorTerminationReason;
+    requiredTotalTodos: number;
+    pendingRequiredTodos: number;
+    hasStructuredRuntimeBacklog: boolean;
+    followUpSteps: string[];
+  }): boolean {
+    if (input.runtimeReason !== 'completed') {
+      return true;
+    }
+    // “completed” 只代表当前阶段已收口，不应直接等同 mission 完成。
+    // 只要当前 mission 已建立结构化 backlog，且本轮留下了明确可执行的后续步骤，
+    // deep 模式就应允许继续推进下一阶段，而不是把阶段切换错误地暴露成用户确认。
+    if (!input.hasStructuredRuntimeBacklog) {
+      return false;
+    }
+    if (input.followUpSteps.length === 0) {
+      return false;
+    }
+    if (input.pendingRequiredTodos > 0) {
+      return true;
+    }
+    logger.info('编排器.FollowUp.阶段完成但Mission未完成', {
+      requiredTotalTodos: input.requiredTotalTodos,
+      followUpSteps: input.followUpSteps.length,
+    }, LogCategory.ORCHESTRATOR);
+    return true;
   }
 
   private buildAutoFollowUpPrompt(input: {
