@@ -324,6 +324,8 @@ export interface OrchestratorRuntimeDiagnostics {
   requestId?: string;
   runtimeReason: string;
   finalStatus: 'completed' | 'failed' | 'cancelled' | 'paused';
+  failureReason?: string;
+  errors?: string[];
   runtimeSnapshot?: OrchestratorRuntimeSnapshot | null;
   runtimeDecisionTrace?: OrchestratorRuntimeDecisionTraceEntry[];
   updatedAt: number;

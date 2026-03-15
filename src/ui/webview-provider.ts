@@ -76,6 +76,7 @@ type OrchestratorExecutionResult = {
   runtimeSnapshot: OrchestratorRuntimeSnapshot;
   runtimeDecisionTrace: OrchestratorRuntimeDecisionTrace;
   errors: string[];
+  failureReason?: string;
   recoverable: boolean;
   error?: string;
 };
@@ -2371,6 +2372,96 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private isGenericExecutionFailure(message?: string): boolean {
+    if (typeof message !== 'string') {
+      return false;
+    }
+    const normalized = message.trim();
+    return normalized.length > 0 && normalized === t('provider.executionFailed');
+  }
+
+  private async enrichExecutionFailureContext(input: {
+    sessionId: string;
+    taskId: string;
+    errors: string[];
+    failureReason?: string;
+  }): Promise<{ errors: string[]; failureReason?: string }> {
+    const sessionId = input.sessionId.trim();
+    const taskId = input.taskId.trim();
+    const normalizedErrors = input.errors
+      .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      .map((item) => item.trim());
+    let failureReason = typeof input.failureReason === 'string' && input.failureReason.trim().length > 0
+      ? input.failureReason.trim()
+      : undefined;
+
+    if (!sessionId || !taskId) {
+      return {
+        errors: [...new Set(normalizedErrors)],
+        ...(failureReason ? { failureReason } : {}),
+      };
+    }
+
+    try {
+      const taskViews = await this.orchestratorEngine.listTaskViews(sessionId);
+      const task = taskViews.find((item) => item.id === taskId);
+      if (!task) {
+        return {
+          errors: [...new Set(normalizedErrors)],
+          ...(failureReason ? { failureReason } : {}),
+        };
+      }
+
+      const failedSubTasks = task.subTasks.filter((subTask) =>
+        subTask.status === 'failed' || subTask.status === 'cancelled'
+      );
+      const subTaskReasons = failedSubTasks.map((subTask) => {
+        const worker = subTask.assignedWorker ? `[${subTask.assignedWorker}] ` : '';
+        const title = (subTask.title || subTask.description || subTask.id).trim();
+        const detail = typeof subTask.error === 'string' && subTask.error.trim().length > 0
+          ? `：${subTask.error.trim()}`
+          : '';
+        return `${worker}${title}${detail}`;
+      });
+
+      if ((!failureReason || this.isGenericExecutionFailure(failureReason)) && task.failureReason?.trim()) {
+        failureReason = task.failureReason.trim();
+      }
+
+      if (subTaskReasons.length > 0) {
+        const joined = subTaskReasons.slice(0, 3).join('；');
+        failureReason = (!failureReason || this.isGenericExecutionFailure(failureReason))
+          ? `子任务失败或取消：${joined}`
+          : failureReason;
+      }
+
+      const mergedErrors = [
+        ...(failureReason && !this.isGenericExecutionFailure(failureReason) ? [failureReason] : []),
+        ...subTaskReasons,
+        ...normalizedErrors,
+      ].filter((item, index, arr) => arr.indexOf(item) === index);
+
+      const effectiveErrors = mergedErrors.length > 0
+        ? mergedErrors
+        : [...new Set(normalizedErrors)];
+
+      return {
+        errors: effectiveErrors,
+        ...(failureReason ? { failureReason } : {}),
+      };
+    } catch (error) {
+      logger.warn('界面.执行.失败上下文.收集失败', {
+        sessionId,
+        taskId,
+        error: error instanceof Error ? error.message : String(error),
+      }, LogCategory.UI);
+      return {
+        errors: [...new Set(normalizedErrors)],
+        ...(failureReason ? { failureReason } : {}),
+      };
+    }
+  }
+
   private buildRecoveryErrorMessage(context: PendingRecoveryContext): string {
     const normalizedError = context.errors
       .find((item): item is string => typeof item === 'string' && item.trim().length > 0)
@@ -2398,6 +2489,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       requestId: input.requestId || undefined,
       runtimeReason: input.result.runtimeReason,
       finalStatus: input.result.finalStatus,
+      failureReason: input.result.failureReason || undefined,
+      errors: input.result.errors,
       runtimeSnapshot: input.result.runtimeSnapshot || null,
       runtimeDecisionTrace: input.result.runtimeDecisionTrace || [],
       updatedAt: Date.now(),
@@ -3107,17 +3200,26 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         errors,
         error: errorMsg,
       });
+    const failureContext = success
+      ? { errors, failureReason }
+      : await this.enrichExecutionFailureContext({
+        sessionId,
+        taskId,
+        errors,
+        failureReason,
+      });
 
     this.sendStateUpdate();
     return {
       success,
-      error: failureReason,
+      error: failureContext.failureReason || failureReason,
       taskId,
       runtimeReason,
       finalStatus,
       runtimeSnapshot: executionStatus.runtimeSnapshot,
       runtimeDecisionTrace: executionStatus.runtimeDecisionTrace,
-      errors,
+      errors: failureContext.errors,
+      failureReason: failureContext.failureReason,
       recoverable: this.isRecoverableRuntimeReason(runtimeReason),
     };
   }

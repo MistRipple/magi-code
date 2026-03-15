@@ -444,6 +444,14 @@ function normalizeOrchestratorRuntimeDiagnostics(
   const requestId = typeof input.requestId === 'string' && input.requestId.trim().length > 0
     ? input.requestId.trim()
     : undefined;
+  const failureReason = typeof input.failureReason === 'string' && input.failureReason.trim().length > 0
+    ? input.failureReason.trim()
+    : undefined;
+  const errors = Array.isArray(input.errors)
+    ? input.errors
+      .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      .map((item) => item.trim())
+    : [];
   const runtimeSnapshot = input.runtimeSnapshot && typeof input.runtimeSnapshot === 'object'
     ? JSON.parse(JSON.stringify(input.runtimeSnapshot))
     : null;
@@ -458,6 +466,8 @@ function normalizeOrchestratorRuntimeDiagnostics(
     updatedAt,
     ...(sessionId ? { sessionId } : {}),
     ...(requestId ? { requestId } : {}),
+    ...(failureReason ? { failureReason } : {}),
+    ...(errors.length > 0 ? { errors } : {}),
     runtimeSnapshot,
     runtimeDecisionTrace,
   };

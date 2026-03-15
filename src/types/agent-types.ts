@@ -25,6 +25,13 @@ export type AgentType = 'orchestrator' | WorkerSlot;
 export type LLMProvider = 'openai' | 'anthropic';
 
 /**
+ * URL 路径模式
+ * - standard: 使用官方/标准代理路径规则，由系统做 /v1 级别的适配
+ * - full: 用户提供完整路径，系统不再追加或裁剪版本段
+ */
+export type UrlMode = 'standard' | 'full';
+
+/**
  * Token 使用统计
  */
 export interface TokenUsage {
@@ -44,8 +51,8 @@ export interface TokenUsage {
 export interface LLMConfig {
   /** API 端点（支持代理） */
   baseUrl: string;
-  /** 完整端点 URL（若提供，则直接使用，不进行 /v1 等拼接） */
-  endpointUrl?: string;
+  /** URL 路径模式 */
+  urlMode: UrlMode;
   /** API 密钥 */
   apiKey: string;
   /** 模型名称 */

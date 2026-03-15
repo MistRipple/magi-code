@@ -32,10 +32,7 @@ export async function createKnowledgeExtractionClient(
 
   // 创建基础客户端
   const baseClient = new UniversalLLMClient({
-    baseUrl: activeConfig.baseUrl,
-    apiKey: activeConfig.apiKey,
-    model: activeConfig.model,
-    provider: activeConfig.provider,
+    ...activeConfig,
     enabled: true,
   });
 

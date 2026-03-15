@@ -16,9 +16,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { atomicWriteFileSync } from '../utils/atomic-write';
-import { LLMConfig, LLMProvider, WorkerSlot } from '../types/agent-types';
+import { LLMConfig, LLMProvider, WorkerSlot, UrlMode } from '../types/agent-types';
 import { FullLLMConfig, WorkerLLMConfig } from './types';
 import { logger, LogCategory } from '../logging';
+import { normalizeUrlMode } from './url-mode';
 
 /**
  * LLM 配置加载器（从 ~/.magi/ 加载）
@@ -27,6 +28,52 @@ export class LLMConfigLoader {
   private static readonly CONFIG_DIR = path.join(os.homedir(), '.magi');
   private static readonly LLM_CONFIG_FILE = path.join(this.CONFIG_DIR, 'llm.json');
   private static readonly VALID_REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh']);
+
+  private static normalizePersistedConfig(config: any): { config: any; changed: boolean } {
+    const next = config && typeof config === 'object'
+      ? JSON.parse(JSON.stringify(config))
+      : this.getDefaultLLMConfig();
+    let changed = false;
+
+    const migrateNode = (node: any) => {
+      if (!node || typeof node !== 'object' || Array.isArray(node)) {
+        return;
+      }
+
+      const legacyEndpointUrl = typeof node.endpointUrl === 'string' ? node.endpointUrl.trim() : '';
+      if (legacyEndpointUrl) {
+        if (node.baseUrl !== legacyEndpointUrl) {
+          node.baseUrl = legacyEndpointUrl;
+          changed = true;
+        }
+        if (node.urlMode !== 'full') {
+          node.urlMode = 'full';
+          changed = true;
+        }
+      } else {
+        const normalizedMode = normalizeUrlMode(node.urlMode, 'standard');
+        if (node.urlMode !== normalizedMode) {
+          node.urlMode = normalizedMode;
+          changed = true;
+        }
+      }
+
+      if ('endpointUrl' in node) {
+        delete node.endpointUrl;
+        changed = true;
+      }
+    };
+
+    migrateNode(next.orchestrator);
+    migrateNode(next.auxiliary);
+    if (next.workers && typeof next.workers === 'object') {
+      for (const worker of Object.values(next.workers)) {
+        migrateNode(worker);
+      }
+    }
+
+    return { config: next, changed };
+  }
 
   /**
    * 加载完整配置
@@ -55,7 +102,12 @@ export class LLMConfigLoader {
 
     try {
       const content = fs.readFileSync(this.LLM_CONFIG_FILE, 'utf-8');
-      return JSON.parse(content);
+      const parsed = JSON.parse(content);
+      const normalized = this.normalizePersistedConfig(parsed);
+      if (normalized.changed) {
+        this.saveLLMConfigFile(normalized.config);
+      }
+      return normalized.config;
     } catch (error) {
       logger.warn(`Failed to load LLM config from ${this.LLM_CONFIG_FILE}, using defaults`, { error }, LogCategory.LLM);
       return this.getDefaultLLMConfig();
@@ -69,7 +121,8 @@ export class LLMConfigLoader {
     this.ensureConfigDir();
 
     try {
-      atomicWriteFileSync(this.LLM_CONFIG_FILE, JSON.stringify(config, null, 2));
+      const normalized = this.normalizePersistedConfig(config).config;
+      atomicWriteFileSync(this.LLM_CONFIG_FILE, JSON.stringify(normalized, null, 2));
       logger.info('LLM config saved', { path: this.LLM_CONFIG_FILE }, LogCategory.LLM);
     } catch (error) {
       logger.error('Failed to save LLM config', { error, path: this.LLM_CONFIG_FILE }, LogCategory.LLM);
@@ -95,6 +148,7 @@ export class LLMConfigLoader {
       },
       orchestrator: {
         baseUrl: 'https://api.anthropic.com',
+        urlMode: 'standard',
         apiKey: process.env.ANTHROPIC_API_KEY || '',
         model: 'claude-3-5-sonnet-20241022',
         provider: 'anthropic',
@@ -105,6 +159,7 @@ export class LLMConfigLoader {
       workers: {
         claude: {
           baseUrl: 'https://api.anthropic.com',
+          urlMode: 'standard',
           apiKey: process.env.ANTHROPIC_API_KEY || '',
           model: 'claude-3-5-sonnet-20241022',
           provider: 'anthropic',
@@ -113,7 +168,8 @@ export class LLMConfigLoader {
           openaiProtocol: 'responses',
         },
         codex: {
-          baseUrl: 'https://api.openai.com/v1',
+          baseUrl: 'https://api.openai.com',
+          urlMode: 'standard',
           apiKey: process.env.OPENAI_API_KEY || '',
           model: 'gpt-4-turbo-preview',
           provider: 'openai',
@@ -122,7 +178,8 @@ export class LLMConfigLoader {
           openaiProtocol: 'responses',
         },
         gemini: {
-          baseUrl: 'https://api.openai.com/v1',
+          baseUrl: 'https://api.openai.com',
+          urlMode: 'standard',
           apiKey: process.env.OPENAI_API_KEY || '',
           model: 'gpt-4-turbo-preview',
           provider: 'openai',
@@ -134,6 +191,7 @@ export class LLMConfigLoader {
       auxiliary: {
         enabled: false,
         baseUrl: 'https://api.anthropic.com',
+        urlMode: 'standard',
         apiKey: process.env.ANTHROPIC_API_KEY || '',
         model: 'claude-3-haiku-20240307',
         provider: 'anthropic',
@@ -153,10 +211,11 @@ export class LLMConfigLoader {
     const orchestratorConfig = config.orchestrator || {};
     const defaults = this.getDefaultLLMConfig().orchestrator;
     const defaultReasoningEffort = this.normalizeReasoningEffort(defaults.reasoningEffort, 'medium');
+    const { baseUrl, urlMode } = this.extractBaseUrlAndMode(orchestratorConfig, defaults.baseUrl);
 
     return {
-      baseUrl: this.normalizeString(orchestratorConfig.baseUrl, defaults.baseUrl),
-      endpointUrl: orchestratorConfig.endpointUrl ? this.normalizeString(orchestratorConfig.endpointUrl, '') : undefined,
+      baseUrl,
+      urlMode,
       apiKey: this.normalizeString(orchestratorConfig.apiKey, defaults.apiKey),
       model: this.normalizeString(orchestratorConfig.model, defaults.model),
       provider: this.normalizeString(orchestratorConfig.provider, defaults.provider) as LLMProvider,
@@ -189,10 +248,11 @@ export class LLMConfigLoader {
       return defaults;
     }
     const defaultReasoningEffort = this.normalizeReasoningEffort(defaults.reasoningEffort, 'medium');
+    const { baseUrl, urlMode } = this.extractBaseUrlAndMode(workerConfig, defaults.baseUrl);
 
     return {
-      baseUrl: this.normalizeString(workerConfig.baseUrl, defaults.baseUrl),
-      endpointUrl: workerConfig.endpointUrl ? this.normalizeString(workerConfig.endpointUrl, '') : undefined,
+      baseUrl,
+      urlMode,
       apiKey: this.normalizeString(workerConfig.apiKey, defaults.apiKey),
       model: this.normalizeString(workerConfig.model, defaults.model),
       provider: this.normalizeString(workerConfig.provider, defaults.provider) as LLMProvider,
@@ -209,6 +269,19 @@ export class LLMConfigLoader {
     }
     const trimmed = value.trim();
     return trimmed.length > 0 ? trimmed : defaultValue;
+  }
+
+  private static extractBaseUrlAndMode(config: any, defaultBaseUrl: string): { baseUrl: string; urlMode: UrlMode } {
+    const legacyEndpointUrl = typeof config?.endpointUrl === 'string'
+      ? config.endpointUrl.trim()
+      : '';
+    if (legacyEndpointUrl) {
+      return { baseUrl: legacyEndpointUrl, urlMode: 'full' };
+    }
+    return {
+      baseUrl: this.normalizeString(config?.baseUrl, defaultBaseUrl),
+      urlMode: normalizeUrlMode(config?.urlMode, 'standard'),
+    };
   }
 
   private static normalizeReasoningEffort(
@@ -355,7 +428,7 @@ export class LLMConfigLoader {
 
     fullConfig.workers[worker] = {
       baseUrl: config.baseUrl,
-      endpointUrl: config.endpointUrl,
+      urlMode: normalizeUrlMode(config.urlMode, 'standard'),
       apiKey: config.apiKey,
       model: config.model,
       provider: config.provider,
@@ -377,7 +450,7 @@ export class LLMConfigLoader {
 
     fullConfig.orchestrator = {
       baseUrl: config.baseUrl,
-      endpointUrl: config.endpointUrl,
+      urlMode: normalizeUrlMode(config.urlMode, 'standard'),
       apiKey: config.apiKey,
       model: config.model,
       provider: config.provider,
@@ -400,7 +473,7 @@ export class LLMConfigLoader {
     fullConfig.auxiliary = {
       enabled: Boolean(config.apiKey) || config.enabled === true,
       baseUrl: config.baseUrl,
-      endpointUrl: config.endpointUrl,
+      urlMode: normalizeUrlMode(config.urlMode, 'standard'),
       apiKey: config.apiKey,
       model: config.model,
       provider: config.provider,
@@ -419,11 +492,12 @@ export class LLMConfigLoader {
     // 向后兼容：优先读取 auxiliary，回退到旧版 compressor 键
     const auxiliaryConfig = config.auxiliary || config.compressor || {};
     const defaults = this.getDefaultLLMConfig().auxiliary;
+    const { baseUrl, urlMode } = this.extractBaseUrlAndMode(auxiliaryConfig, defaults.baseUrl);
 
     return {
       enabled: Boolean(auxiliaryConfig.apiKey) || auxiliaryConfig.enabled === true,
-      baseUrl: auxiliaryConfig.baseUrl || defaults.baseUrl,
-      endpointUrl: auxiliaryConfig.endpointUrl,
+      baseUrl,
+      urlMode,
       apiKey: auxiliaryConfig.apiKey || defaults.apiKey,
       model: auxiliaryConfig.model || defaults.model,
       provider: auxiliaryConfig.provider || defaults.provider,

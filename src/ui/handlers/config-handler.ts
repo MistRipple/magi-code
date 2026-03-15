@@ -10,6 +10,7 @@ import { fetchWithRetry, isRetryableNetworkError, toErrorMessage } from '../../t
 import type { WebviewToExtensionMessage, WorkerSlot } from '../../types';
 import type { CommandHandler, CommandHandlerContext } from './types';
 import { t } from '../../i18n';
+import { resolveModelsBaseUrl } from '../../llm/url-mode';
 
 type Msg<T extends string> = Extract<WebviewToExtensionMessage, { type: T }>;
 
@@ -72,35 +73,6 @@ export class ConfigCommandHandler implements CommandHandler {
         await this.handleFetchModelList(message as Msg<'fetchModelList'>, ctx);
         break;
     }
-  }
-
-  /**
-   * 规范化 OpenAI 基础 URL，确保以 /v1 结尾且不重复拼接
-   */
-  private normalizeOpenAIBaseUrl(baseUrl: string, endpointUrl?: string): string {
-    if (endpointUrl && endpointUrl.trim()) {
-      return endpointUrl.trim();
-    }
-    const trimmed = (baseUrl || '').trim();
-    if (!trimmed) return trimmed;
-    const noTrailingSlash = trimmed.replace(/\/+$/, '');
-    if (/\/v\d+$/i.test(noTrailingSlash)) {
-      return noTrailingSlash;
-    }
-    return `${noTrailingSlash}/v1`;
-  }
-
-  /**
-   * Anthropic Models API 路径规范化（以 /v1 结尾）
-   */
-  private normalizeAnthropicModelsBaseUrl(baseUrl: string): string {
-    const trimmed = (baseUrl || '').trim();
-    if (!trimmed) return trimmed;
-    const noTrailingSlash = trimmed.replace(/\/+$/, '');
-    if (/\/v\d+$/i.test(noTrailingSlash)) {
-      return noTrailingSlash;
-    }
-    return `${noTrailingSlash}/v1`;
   }
 
   // ============================================================================
@@ -286,12 +258,12 @@ export class ConfigCommandHandler implements CommandHandler {
       const client = createLLMClient(normalizedConfig);
 
       const response = await client.sendMessage({
-        messages: [{ role: 'user', content: 'Hello' }],
-        maxTokens: 10,
-        temperature: 0.7,
+        messages: [{ role: 'user', content: 'ping' }],
+        maxTokens: 1,
+        temperature: 0,
       });
 
-      if (response && response.content) {
+      if (response) {
         ctx.sendData('workerConnectionTestResult', { worker: message.worker, success: true });
         ctx.sendToast(t('config.toast.workerConnected', { worker: message.worker }), 'success');
       } else {
@@ -342,12 +314,12 @@ export class ConfigCommandHandler implements CommandHandler {
       const client = createLLMClient(normalizedConfig);
 
       const response = await client.sendMessage({
-        messages: [{ role: 'user', content: 'Hello' }],
-        maxTokens: 10,
-        temperature: 0.7,
+        messages: [{ role: 'user', content: 'ping' }],
+        maxTokens: 1,
+        temperature: 0,
       });
 
-      if (response && response.content) {
+      if (response) {
         ctx.sendData('orchestratorConnectionTestResult', { success: true });
         ctx.sendToast(t('config.toast.orchestratorConnected'), 'success');
       } else {
@@ -408,12 +380,12 @@ export class ConfigCommandHandler implements CommandHandler {
       const client = createLLMClient(normalizedConfig);
 
       const response = await client.sendMessage({
-        messages: [{ role: 'user', content: 'Hello' }],
-        maxTokens: 10,
-        temperature: 0.7,
+        messages: [{ role: 'user', content: 'ping' }],
+        maxTokens: 1,
+        temperature: 0,
       });
 
-      if (response && response.content) {
+      if (response) {
         ctx.sendData('auxiliaryConnectionTestResult', { success: true });
         ctx.sendToast(t('config.toast.auxiliaryConnected'), 'success');
       } else {
@@ -437,9 +409,13 @@ export class ConfigCommandHandler implements CommandHandler {
       }
 
       const provider = config.provider === 'anthropic' ? 'anthropic' : 'openai';
-      let modelsUrl = provider === 'anthropic'
-        ? this.normalizeAnthropicModelsBaseUrl(config.baseUrl)
-        : this.normalizeOpenAIBaseUrl(config.baseUrl, config.endpointUrl);
+      let modelsUrl = resolveModelsBaseUrl(provider, config.baseUrl, config.urlMode);
+      if (!modelsUrl) {
+        const error = t('config.toast.modelListUnsupportedInFullMode');
+        ctx.sendData('modelListFetched', { target, success: false, models: [], error });
+        ctx.sendToast(error, 'warning');
+        return;
+      }
       modelsUrl += '/models';
 
       const headers: Record<string, string> = {

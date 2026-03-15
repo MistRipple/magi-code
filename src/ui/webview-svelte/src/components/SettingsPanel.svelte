@@ -108,6 +108,95 @@
   // Model Tab 状态
   let modelConfigTab = $state<'orch' | 'comp'>('orch');
   let workerModelTab = $state<'claude' | 'codex' | 'gemini'>('claude');
+  type UrlMode = 'standard' | 'full';
+  type ProviderName = 'openai' | 'anthropic';
+
+  interface BaseModelFormConfig {
+    baseUrl: string;
+    urlMode: UrlMode;
+    apiKey: string;
+    model: string;
+    provider: ProviderName;
+    openaiProtocol: 'responses' | 'chat';
+  }
+
+  interface InteractiveModelFormConfig extends BaseModelFormConfig {
+    thinking: boolean;
+    reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh';
+  }
+
+  interface WorkerModelFormConfig extends InteractiveModelFormConfig {
+    enabled: boolean;
+  }
+
+  function createInteractiveConfig(
+    provider: ProviderName,
+    overrides: Partial<InteractiveModelFormConfig> = {},
+  ): InteractiveModelFormConfig {
+    return {
+      baseUrl: '',
+      urlMode: 'standard',
+      apiKey: '',
+      model: '',
+      provider,
+      openaiProtocol: 'responses',
+      thinking: false,
+      reasoningEffort: 'medium',
+      ...overrides,
+    };
+  }
+
+  function createAuxiliaryConfig(overrides: Partial<BaseModelFormConfig> = {}): BaseModelFormConfig {
+    return {
+      baseUrl: '',
+      urlMode: 'standard',
+      apiKey: '',
+      model: '',
+      provider: 'anthropic',
+      openaiProtocol: 'responses',
+      ...overrides,
+    };
+  }
+
+  function createWorkerConfig(
+    provider: ProviderName,
+    overrides: Partial<WorkerModelFormConfig> = {},
+  ): WorkerModelFormConfig {
+    return {
+      ...createInteractiveConfig(provider),
+      enabled: true,
+      ...overrides,
+    };
+  }
+
+  function normalizeUrlMode(value: unknown): UrlMode {
+    return value === 'full' ? 'full' : 'standard';
+  }
+
+  function getBaseUrlPlaceholder(provider: string): string {
+    return provider === 'openai' ? 'https://api.openai.com' : 'https://api.anthropic.com';
+  }
+
+  function normalizeBaseUrlForHint(baseUrl: string): string {
+    return typeof baseUrl === 'string'
+      ? baseUrl.trim().replace(/\/+$/, '').toLowerCase()
+      : '';
+  }
+
+  function shouldRecommendStandardUrlMode(provider: ProviderName, baseUrl: string): boolean {
+    const normalized = normalizeBaseUrlForHint(baseUrl);
+    if (!normalized) {
+      return false;
+    }
+
+    if (provider === 'anthropic') {
+      return normalized === 'https://api.anthropic.com'
+        || normalized === 'https://api.lkeap.cloud.tencent.com/coding/anthropic';
+    }
+
+    return normalized === 'https://api.openai.com'
+      || normalized === 'https://api.lkeap.cloud.tencent.com/coding/v3';
+  }
 
   // 测试连接状态: 'idle' | 'testing' | 'success' | 'error'
   let testStatus = $state<Record<string, 'idle' | 'testing' | 'success' | 'error'>>({
@@ -186,12 +275,12 @@
   let updatingAllSkills = $state(false);
 
   // 模型配置表单
-  let orchConfig = $state({ baseUrl: '', endpointUrl: '', apiKey: '', model: '', provider: 'anthropic', openaiProtocol: 'responses', thinking: false, reasoningEffort: 'medium' });
-  let compConfig = $state({ baseUrl: '', endpointUrl: '', apiKey: '', model: '', provider: 'anthropic', openaiProtocol: 'responses' });
-  let workerConfigs = $state<Record<string, { baseUrl: string; endpointUrl: string; apiKey: string; model: string; provider: string; openaiProtocol: string; enabled: boolean; thinking: boolean; reasoningEffort: string }>>({
-    claude: { baseUrl: '', endpointUrl: '', apiKey: '', model: '', provider: 'anthropic', openaiProtocol: 'responses', enabled: true, thinking: false, reasoningEffort: 'medium' },
-    codex: { baseUrl: '', endpointUrl: '', apiKey: '', model: '', provider: 'openai', openaiProtocol: 'responses', enabled: true, thinking: false, reasoningEffort: 'medium' },
-    gemini: { baseUrl: '', endpointUrl: '', apiKey: '', model: '', provider: 'openai', openaiProtocol: 'responses', enabled: true, thinking: false, reasoningEffort: 'medium' }
+  let orchConfig = $state<InteractiveModelFormConfig>(createInteractiveConfig('anthropic'));
+  let compConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
+  let workerConfigs = $state<Record<string, WorkerModelFormConfig>>({
+    claude: createWorkerConfig('anthropic'),
+    codex: createWorkerConfig('openai'),
+    gemini: createWorkerConfig('openai'),
   });
 
   // API Key 明文可见状态
@@ -667,12 +756,12 @@
     if (target === 'worker') {
       const wc = workerConfigs[workerModelTab];
       vscode.postMessage({ type: 'saveWorkerConfig', worker: workerModelTab, config: {
-        baseUrl: wc.baseUrl, endpointUrl: wc.endpointUrl, apiKey: wc.apiKey, model: wc.model, provider: wc.provider, openaiProtocol: wc.openaiProtocol,
+        baseUrl: wc.baseUrl, urlMode: wc.urlMode, apiKey: wc.apiKey, model: wc.model, provider: wc.provider, openaiProtocol: wc.openaiProtocol,
         enabled: wc.enabled, enableThinking: wc.thinking, reasoningEffort: wc.reasoningEffort
       }});
     } else if (target === 'orch') {
       vscode.postMessage({ type: 'saveOrchestratorConfig', config: {
-        baseUrl: orchConfig.baseUrl, endpointUrl: orchConfig.endpointUrl, apiKey: orchConfig.apiKey, model: orchConfig.model, provider: orchConfig.provider, openaiProtocol: orchConfig.openaiProtocol,
+        baseUrl: orchConfig.baseUrl, urlMode: orchConfig.urlMode, apiKey: orchConfig.apiKey, model: orchConfig.model, provider: orchConfig.provider, openaiProtocol: orchConfig.openaiProtocol,
         enableThinking: orchConfig.thinking, reasoningEffort: orchConfig.reasoningEffort
       }});
     } else if (target === 'comp') {
@@ -1170,9 +1259,9 @@
           const configs = payload.configs;
           for (const [worker, config] of Object.entries(configs) as [string, any][]) {
             if (config && workerConfigs[worker]) {
-              workerConfigs[worker] = {
+              workerConfigs[worker] = createWorkerConfig(config.provider || 'anthropic', {
                 baseUrl: config.baseUrl || '',
-                endpointUrl: config.endpointUrl || '',
+                urlMode: normalizeUrlMode(config.urlMode),
                 apiKey: config.apiKey || '',
                 model: config.model || '',
                 provider: config.provider || 'anthropic',
@@ -1180,7 +1269,7 @@
                 enabled: config.enabled !== false,
                 thinking: config.enableThinking === true,
                 reasoningEffort: config.reasoningEffort || 'medium'
-              };
+              });
             }
           }
         }
@@ -1188,29 +1277,29 @@
       // 编排者配置加载
       else if (dataType === 'orchestratorConfigLoaded') {
         if (payload?.config) {
-          orchConfig = {
+          orchConfig = createInteractiveConfig(payload.config.provider || 'anthropic', {
             baseUrl: payload.config.baseUrl || '',
-            endpointUrl: payload.config.endpointUrl || '',
+            urlMode: normalizeUrlMode(payload.config.urlMode),
             apiKey: payload.config.apiKey || '',
             model: payload.config.model || '',
             provider: payload.config.provider || 'anthropic',
             openaiProtocol: payload.config.openaiProtocol || 'responses',
             thinking: payload.config.enableThinking === true,
             reasoningEffort: payload.config.reasoningEffort || 'medium'
-          };
+          });
         }
       }
       // 辅助模型配置加载
       else if (dataType === 'auxiliaryConfigLoaded') {
         if (payload?.config) {
-          compConfig = {
+          compConfig = createAuxiliaryConfig({
             baseUrl: payload.config.baseUrl || '',
-            endpointUrl: payload.config.endpointUrl || '',
+            urlMode: normalizeUrlMode(payload.config.urlMode),
             apiKey: payload.config.apiKey || '',
             model: payload.config.model || '',
             provider: payload.config.provider || 'anthropic',
             openaiProtocol: payload.config.openaiProtocol || 'responses'
-          };
+          });
         }
       }
       // Worker 连接测试结果 - modelStatus 已由全局 message-handler 更新，此处仅维护按钮状态
@@ -1593,16 +1682,43 @@
                 </div>
                 <!-- svelte-ignore a11y_label_has_associated_control -->
                 <div class="llm-config-form">
-                  <div class="llm-config-field">
-                    <label class="llm-config-label">{i18n.t('settings.model.field.baseUrl')}</label>
-                    <input type="text" class="llm-config-input" bind:value={orchConfig.baseUrl} placeholder="https://api.anthropic.com">
+                  <div class="llm-config-field-row url-mode-row">
+                    <div class="llm-config-field">
+                      <label class="llm-config-label">{i18n.t('settings.model.field.baseUrl')}</label>
+                      <input
+                        type="text"
+                        class="llm-config-input"
+                        bind:value={orchConfig.baseUrl}
+                        placeholder={getBaseUrlPlaceholder(orchConfig.provider)}
+                      >
+                    </div>
+                    <div class="llm-config-field llm-config-field--compact">
+                      <label class="llm-config-label">{i18n.t('settings.model.field.urlMode')}</label>
+                      <div class="segmented-control">
+                        <button
+                          type="button"
+                          class="segmented-control__option"
+                          class:active={orchConfig.urlMode === 'standard'}
+                          onclick={() => orchConfig.urlMode = 'standard'}
+                        >
+                          {i18n.t('settings.model.urlMode.standard')}
+                        </button>
+                        <button
+                          type="button"
+                          class="segmented-control__option"
+                          class:active={orchConfig.urlMode === 'full'}
+                          onclick={() => orchConfig.urlMode = 'full'}
+                        >
+                          {i18n.t('settings.model.urlMode.full')}
+                        </button>
+                      </div>
+                      {#if shouldRecommendStandardUrlMode(orchConfig.provider, orchConfig.baseUrl)}
+                        <div class="llm-config-hint">
+                          {i18n.t('settings.model.urlMode.standardRecommended')}
+                        </div>
+                      {/if}
+                    </div>
                   </div>
-                  {#if orchConfig.provider === 'openai'}
-                  <div class="llm-config-field">
-                    <label class="llm-config-label">{i18n.t('settings.model.field.endpointUrl')}</label>
-                    <input type="text" class="llm-config-input" bind:value={orchConfig.endpointUrl} placeholder="https://api.openai.com/v1/chat/completions">
-                  </div>
-                  {/if}
                   <div class="llm-config-field">
                     <label class="llm-config-label">{i18n.t('settings.model.field.apiKey')}</label>
                     <div class="api-key-wrapper">
@@ -1720,16 +1836,43 @@
                 </div>
                 <!-- svelte-ignore a11y_label_has_associated_control -->
                 <div class="llm-config-form">
-                  <div class="llm-config-field">
-                    <label class="llm-config-label">{i18n.t('settings.model.field.baseUrl')}</label>
-                    <input type="text" class="llm-config-input" bind:value={compConfig.baseUrl} placeholder="https://api.anthropic.com">
+                  <div class="llm-config-field-row url-mode-row">
+                    <div class="llm-config-field">
+                      <label class="llm-config-label">{i18n.t('settings.model.field.baseUrl')}</label>
+                      <input
+                        type="text"
+                        class="llm-config-input"
+                        bind:value={compConfig.baseUrl}
+                        placeholder={getBaseUrlPlaceholder(compConfig.provider)}
+                      >
+                    </div>
+                    <div class="llm-config-field llm-config-field--compact">
+                      <label class="llm-config-label">{i18n.t('settings.model.field.urlMode')}</label>
+                      <div class="segmented-control">
+                        <button
+                          type="button"
+                          class="segmented-control__option"
+                          class:active={compConfig.urlMode === 'standard'}
+                          onclick={() => compConfig.urlMode = 'standard'}
+                        >
+                          {i18n.t('settings.model.urlMode.standard')}
+                        </button>
+                        <button
+                          type="button"
+                          class="segmented-control__option"
+                          class:active={compConfig.urlMode === 'full'}
+                          onclick={() => compConfig.urlMode = 'full'}
+                        >
+                          {i18n.t('settings.model.urlMode.full')}
+                        </button>
+                      </div>
+                      {#if shouldRecommendStandardUrlMode(compConfig.provider, compConfig.baseUrl)}
+                        <div class="llm-config-hint">
+                          {i18n.t('settings.model.urlMode.standardRecommended')}
+                        </div>
+                      {/if}
+                    </div>
                   </div>
-                  {#if compConfig.provider === 'openai'}
-                  <div class="llm-config-field">
-                    <label class="llm-config-label">{i18n.t('settings.model.field.endpointUrl')}</label>
-                    <input type="text" class="llm-config-input" bind:value={compConfig.endpointUrl} placeholder="https://api.openai.com/v1/chat/completions">
-                  </div>
-                  {/if}
                   <div class="llm-config-field">
                     <label class="llm-config-label">{i18n.t('settings.model.field.apiKey')}</label>
                     <div class="api-key-wrapper">
@@ -1846,17 +1989,42 @@
             </div>
             <!-- svelte-ignore a11y_label_has_associated_control -->
             <div class="llm-config-form">
-              <div class="llm-config-field-row url-toggle-row">
+              <div class="llm-config-field-row worker-url-mode-row">
                 <div class="llm-config-field">
                   <label class="llm-config-label">{i18n.t('settings.model.field.baseUrl')}</label>
-                  <input type="text" class="llm-config-input" bind:value={workerConfigs[workerModelTab].baseUrl} placeholder="https://api.anthropic.com">
+                  <input
+                    type="text"
+                    class="llm-config-input"
+                    bind:value={workerConfigs[workerModelTab].baseUrl}
+                    placeholder={getBaseUrlPlaceholder(workerConfigs[workerModelTab].provider)}
+                  >
                 </div>
-                {#if workerConfigs[workerModelTab].provider === 'openai'}
-                <div class="llm-config-field">
-                  <label class="llm-config-label">{i18n.t('settings.model.field.endpointUrl')}</label>
-                  <input type="text" class="llm-config-input" bind:value={workerConfigs[workerModelTab].endpointUrl} placeholder="https://api.openai.com/v1/chat/completions">
+                <div class="llm-config-field llm-config-field--compact">
+                  <label class="llm-config-label">{i18n.t('settings.model.field.urlMode')}</label>
+                  <div class="segmented-control">
+                    <button
+                      type="button"
+                      class="segmented-control__option"
+                      class:active={workerConfigs[workerModelTab].urlMode === 'standard'}
+                      onclick={() => workerConfigs[workerModelTab].urlMode = 'standard'}
+                    >
+                      {i18n.t('settings.model.urlMode.standard')}
+                    </button>
+                    <button
+                      type="button"
+                      class="segmented-control__option"
+                      class:active={workerConfigs[workerModelTab].urlMode === 'full'}
+                      onclick={() => workerConfigs[workerModelTab].urlMode = 'full'}
+                    >
+                      {i18n.t('settings.model.urlMode.full')}
+                    </button>
+                  </div>
+                  {#if shouldRecommendStandardUrlMode(workerConfigs[workerModelTab].provider, workerConfigs[workerModelTab].baseUrl)}
+                    <div class="llm-config-hint">
+                      {i18n.t('settings.model.urlMode.standardRecommended')}
+                    </div>
+                  {/if}
                 </div>
-                {/if}
                 <div class="llm-config-field inline-toggle">
                   <label class="llm-config-label">{i18n.t('settings.model.status')}</label>
                   <button type="button" class="llm-config-toggle-btn" onclick={() => workerConfigs[workerModelTab].enabled = !workerConfigs[workerModelTab].enabled}>
@@ -3091,8 +3259,16 @@
   .llm-config-field-row { display: grid; grid-template-columns: 1fr 96px; gap: var(--space-3); }
   .llm-config-field-row.has-thinking { grid-template-columns: 1fr 96px 72px; }
   .llm-config-field-row.has-thinking.has-level { grid-template-columns: 1fr 96px 88px 88px 72px; }
-  .llm-config-field-row.url-toggle-row { grid-template-columns: 1fr 80px; align-items: end; }
+  .llm-config-field-row.url-mode-row { grid-template-columns: minmax(0, 1fr) 180px; align-items: end; }
+  .llm-config-field-row.worker-url-mode-row { grid-template-columns: minmax(0, 1fr) 180px 88px; align-items: end; }
   .llm-config-label { font-size: var(--text-sm); color: var(--foreground-muted); }
+  .llm-config-field--compact { min-width: 0; }
+  .llm-config-hint {
+    margin-top: var(--space-2);
+    font-size: var(--text-xs);
+    line-height: 1.4;
+    color: var(--foreground-muted);
+  }
 
   .llm-config-input, .llm-config-select {
     height: var(--btn-height-md);
@@ -3109,6 +3285,44 @@
   }
 
   .llm-config-input:focus, .llm-config-select:focus { border-color: var(--primary); }
+
+  .segmented-control {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    min-width: 0;
+    height: var(--btn-height-md);
+    background: var(--surface-2);
+  }
+
+  .segmented-control__option {
+    border: none;
+    background: transparent;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+    min-width: 0;
+    padding: 0 var(--space-2);
+    white-space: nowrap;
+  }
+
+  .segmented-control__option + .segmented-control__option {
+    border-left: 1px solid var(--border);
+  }
+
+  .segmented-control__option:hover {
+    color: var(--foreground);
+    background: var(--surface-3);
+  }
+
+  .segmented-control__option.active {
+    background: var(--primary);
+    color: var(--primary-foreground, #fff);
+  }
 
   .api-key-wrapper { position: relative; }
   .api-key-wrapper .api-key-input { padding-right: 32px; }
@@ -3306,6 +3520,10 @@
   .profile-guidance-listing { margin: 0; padding-left: var(--space-4); color: var(--foreground); font-size: var(--text-sm); }
   @media (max-width: 720px) {
     .profile-guidance-columns { grid-template-columns: 1fr; }
+    .llm-config-field-row.url-mode-row,
+    .llm-config-field-row.worker-url-mode-row {
+      grid-template-columns: 1fr;
+    }
   }
   .profile-save-footer {
     display: flex;

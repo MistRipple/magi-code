@@ -21,6 +21,7 @@ import { OpenAIResponsesProtocolAdapter } from '../protocol/adapters/openai-resp
 import { OpenAIChatCompletionsProtocolAdapter } from '../protocol/adapters/openai-chat-completions-adapter';
 import { AnthropicMessagesProtocolAdapter } from '../protocol/adapters/anthropic-messages-adapter';
 import { resolveProtocolId } from '../protocol/capability-registry';
+import { resolveModelsBaseUrl, resolveSdkBaseUrl } from '../url-mode';
 
 class NonRetryableError extends Error {
   constructor(message: string, public originalError?: unknown) {
@@ -66,45 +67,9 @@ export class UniversalLLMClient extends BaseLLMClient {
     this.initializeClient();
   }
 
-  private normalizeOpenAIBaseUrl(baseUrl: string, endpointUrl?: string): string {
-    if (endpointUrl && endpointUrl.trim()) {
-      return endpointUrl.trim();
-    }
-    const trimmed = (baseUrl || '').trim();
-    if (!trimmed) return trimmed;
-    const noTrailingSlash = trimmed.replace(/\/+$/, '');
-    if (/\/v\d+$/i.test(noTrailingSlash)) {
-      return noTrailingSlash;
-    }
-    return `${noTrailingSlash}/v1`;
-  }
-
-  /**
-   * Anthropic SDK 会自行拼接 /v1/* 路径。
-   * 为避免用户配置已带 /v1 时出现 /v1/v1，SDK 入参需要去掉末尾 /v1。
-   */
-  private normalizeAnthropicSdkBaseUrl(baseUrl: string): string {
-    const trimmed = (baseUrl || '').trim();
-    if (!trimmed) return trimmed;
-    const noTrailingSlash = trimmed.replace(/\/+$/, '');
-    if (/\/v\d+$/i.test(noTrailingSlash)) {
-      return noTrailingSlash.replace(/\/v\d+$/i, '');
-    }
-    return noTrailingSlash;
-  }
-
-  /**
-   * 获取 Anthropic Models API 的基础地址（以 /v1 结尾）
-   */
-  private normalizeAnthropicModelsBaseUrl(baseUrl: string): string {
-    const sdkBase = this.normalizeAnthropicSdkBaseUrl(baseUrl);
-    if (!sdkBase) return sdkBase;
-    return `${sdkBase}/v1`;
-  }
-
   private initializeClient(): void {
     if (this.config.provider === 'anthropic') {
-      const baseURL = this.normalizeAnthropicSdkBaseUrl(this.config.baseUrl);
+      const baseURL = resolveSdkBaseUrl(this.config.provider, this.config.baseUrl, this.config.urlMode);
       this.anthropicClient = new Anthropic({
         apiKey: this.config.apiKey,
         baseURL,
@@ -112,10 +77,11 @@ export class UniversalLLMClient extends BaseLLMClient {
       logger.info('Anthropic client initialized', {
         originalBaseUrl: this.config.baseUrl,
         finalBaseUrl: baseURL,
+        urlMode: this.config.urlMode,
         model: this.config.model,
       }, LogCategory.LLM);
     } else if (this.config.provider === 'openai') {
-      const baseURL = this.normalizeOpenAIBaseUrl(this.config.baseUrl, this.config.endpointUrl);
+      const baseURL = resolveSdkBaseUrl(this.config.provider, this.config.baseUrl, this.config.urlMode);
       this.openaiClient = new OpenAI({
         apiKey: this.config.apiKey,
         baseURL,
@@ -124,6 +90,7 @@ export class UniversalLLMClient extends BaseLLMClient {
       logger.info('OpenAI client initialized', {
         originalBaseUrl: this.config.baseUrl,
         finalBaseUrl: baseURL,
+        urlMode: this.config.urlMode,
         model: this.config.model,
       }, LogCategory.LLM);
     } else {
@@ -181,9 +148,15 @@ export class UniversalLLMClient extends BaseLLMClient {
   }> {
     try {
       const isAnthropic = this.config.provider === 'anthropic';
-      const baseV1 = isAnthropic
-        ? this.normalizeAnthropicModelsBaseUrl(this.config.baseUrl)
-        : this.normalizeOpenAIBaseUrl(this.config.baseUrl, this.config.endpointUrl);
+      const baseV1 = resolveModelsBaseUrl(this.config.provider, this.config.baseUrl, this.config.urlMode);
+      if (!baseV1) {
+        logger.info('Fast connection test skipped model listing in full URL mode', {
+          provider: this.config.provider,
+          model: this.config.model,
+          baseUrl: this.config.baseUrl,
+        }, LogCategory.LLM);
+        return { success: true, modelExists: undefined };
+      }
       const modelsUrl = `${baseV1}/models`;
 
       const headers: Record<string, string> = {

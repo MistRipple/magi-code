@@ -9,7 +9,7 @@
  *
  * 运行：
  *   npm run -s compile
- *   node scripts/e2e-session-lazy-loading-regression.cjs
+ *   node scripts/manual/e2e-session-lazy-loading-regression.cjs
  */
 
 const fs = require('fs');

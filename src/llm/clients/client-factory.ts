@@ -27,7 +27,7 @@ const clientCache = new Map<string, LLMClient>();
  */
 export function getOrCreateLLMClient(config: LLMConfig): LLMClient {
   const keySuffix = config.apiKey ? config.apiKey.slice(-8) : '';
-  const cacheKey = `${config.provider}-${config.model}-${config.baseUrl}-${keySuffix}`;
+  const cacheKey = `${config.provider}-${config.model}-${config.urlMode}-${config.baseUrl}-${keySuffix}`;
 
   let client = clientCache.get(cacheKey);
   if (!client) {

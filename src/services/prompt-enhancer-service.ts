@@ -65,10 +65,7 @@ export class PromptEnhancerService {
       // 创建 LLM 客户端并调用
       const { UniversalLLMClient } = await import('../llm/clients/universal-client');
       const client = new UniversalLLMClient({
-        baseUrl: activeConfig.baseUrl,
-        apiKey: activeConfig.apiKey,
-        model: activeConfig.model,
-        provider: activeConfig.provider,
+        ...activeConfig,
         enabled: true,
       });
 

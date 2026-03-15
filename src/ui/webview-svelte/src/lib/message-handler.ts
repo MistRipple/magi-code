@@ -2412,6 +2412,16 @@ function handleOrchestratorRuntimeDiagnostics(message: WebviewMessage) {
     ...(typeof message.requestId === 'string' && message.requestId.trim().length > 0
       ? { requestId: message.requestId.trim() }
       : {}),
+    ...(typeof message.failureReason === 'string' && message.failureReason.trim().length > 0
+      ? { failureReason: message.failureReason.trim() }
+      : {}),
+    ...(Array.isArray(message.errors)
+      ? {
+          errors: message.errors
+            .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+            .map((item) => item.trim()),
+        }
+      : {}),
     runtimeSnapshot: message.runtimeSnapshot && typeof message.runtimeSnapshot === 'object'
       ? (message.runtimeSnapshot as OrchestratorRuntimeDiagnostics['runtimeSnapshot'])
       : null,

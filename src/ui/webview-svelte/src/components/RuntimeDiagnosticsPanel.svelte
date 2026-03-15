@@ -21,6 +21,22 @@
     return trace.slice(-8);
   });
 
+  const failureReason = $derived.by(() => {
+    const raw = diagnostics?.failureReason;
+    return typeof raw === 'string' && raw.trim().length > 0 ? raw.trim() : '';
+  });
+
+  const failureErrors = $derived.by(() => {
+    const errors = diagnostics?.errors;
+    if (!Array.isArray(errors)) {
+      return [] as string[];
+    }
+    return errors
+      .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      .map((item) => item.trim())
+      .filter((item, index, arr) => arr.indexOf(item) === index);
+  });
+
   // 状态图标
   const statusIcon = $derived.by((): IconName => {
     switch (diagnostics?.finalStatus) {
@@ -203,6 +219,22 @@
                 {/if}
               </div>
             </div>
+          {/if}
+        </div>
+      {/if}
+
+      {#if diagnostics.finalStatus === 'failed' && (failureReason || failureErrors.length > 0)}
+        <div class="runtime-diagnostics__block runtime-diagnostics__block--failure">
+          <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.failureTitle')}</div>
+          {#if failureReason}
+            <div class="runtime-diagnostics__failure-reason">{failureReason}</div>
+          {/if}
+          {#if failureErrors.length > 0}
+            <ul class="runtime-diagnostics__failure-list">
+              {#each failureErrors as item}
+                <li>{item}</li>
+              {/each}
+            </ul>
           {/if}
         </div>
       {/if}
@@ -402,10 +434,35 @@
     gap: 4px;
   }
 
+  .runtime-diagnostics__block--failure {
+    border: 1px solid color-mix(in srgb, var(--vscode-editorError-foreground, #f48771) 28%, transparent);
+    border-radius: 8px;
+    padding: 10px 12px;
+    background: color-mix(in srgb, var(--vscode-editorError-foreground, #f48771) 8%, transparent);
+  }
+
   .runtime-diagnostics__label {
     font-size: 11px;
     opacity: 0.8;
     margin-bottom: 2px;
+  }
+
+  .runtime-diagnostics__failure-reason {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--vscode-foreground, #ddd);
+    word-break: break-word;
+  }
+
+  .runtime-diagnostics__failure-list {
+    margin: 0;
+    padding-left: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    color: var(--vscode-descriptionForeground, #b0b0b0);
+    font-size: 12px;
+    line-height: 1.5;
   }
 
   .trace-list {
