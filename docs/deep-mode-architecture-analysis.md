@@ -1,962 +1,804 @@
-# Deep 模式产品级架构分析与重构方案
+# Deep 模式定档方案（现状、结论与后续方向）
+
+> 定档时间：2026-03-15
+>
+> 参考对照：
+> - https://learn.shareai.run/zh/timeline/
+> - 本仓库当前实现
+>
+> 文档定位：
+> - 本文是 deep 模式的唯一正式文档
+> - 已吸收此前相关分析文档与设计稿中的有效结论
+> - 参考网站仅作为交叉比对样本，不作为 Magi 的目标实现蓝图
+
+---
 
 ## 执行摘要
 
-**核心结论**：当前 deep 模式已具备项目级治理的产品语义，但运行时仍停留在"参数增强态"，尚未升级为"产品级项目执行状态机"。如果要达到产品级可发布标准，必须从架构层面完成一次完整升级。
+**定档结论**：
+
+当前 Magi 的 deep 模式，已经**不再适合**被定义为“standard runtime + 更大 budget + 更多 round”的单纯参数增强态。
+
+它现在更准确的定性是：
+
+> **一个建立在 `PlanLedger + TerminationSnapshot + Verification Pipeline + Worktree Isolation` 之上的 `deep_v1` 项目级治理运行时。**
+
+但它同时也**还没有**在 `s05 / s06 / s07 / s11 / s12` 这些关键维度上达到完全成熟。当前最合理的判断是：
+
+- **已明显超过“参数增强态”的早期判断**
+- **已落地 deep runtime 主干**
+- **仍有 4 个关键缺口没有收口**
+  - 纯按需技能注入还不彻底
+  - 真正的驻留式 `idle-poll-claim-work` 还没完成
+  - resume 仍以 session 恢复为主，不是 ledger-driven mission recovery
+  - ledger 的 CAS / reducer 非法转移审计 / 发布约束还没正式闭环
+
+因此，当前 deep 模式已经可以称为：
+
+> **“可用的 deep_v1 控制平面”，而不是“所有关键机制都已收口的最终完成态”。**
 
 ---
 
-## 一、表象分析
+## 一、文档定位与适用边界
 
-### 1.1 用户关注点
+本文统一承接了 3 类内容：
 
-用户要求分析 deep 模式下编排插件的"续航能力"，具体包括：
+1. 参考平台时间线带来的架构基线
+2. 仓库当前实现的真实落地状态
+3. 后续继续推进 deep runtime 时仍然有效的工程约束
 
-1. 如何实现持续 loop
-2. 如何实现持续 review
-3. 当前实现是否合理
-4. 是否有遗漏
-5. 是否有更好的方案
-6. 从架构层面和产品定位分析
+这里的“参考平台”含义必须明确：
 
-### 1.2 当前表象
+- 它是用来做交叉比对和机制拆解的样本
+- 不是要求 Magi 在产品形态上完整复刻的目标
+- 我们只应吸收那些能解决当前真实问题、且不破坏 Magi 既有优势的机制
 
-从产品表现看，deep 模式确实给人"更强续航"的感受：
+也就是说，后续关于 deep 模式的：
 
-- 比 standard 模式跑得更久
-- 更容易进入"做完再查、查完再补、补完再收口"的循环
-- 编排者更像在"持续盯进度"
-- Worker 更像在"持续执行 + 自检 + 修正"
+- 架构判断
+- 升级结论
+- 未完成项
+- 产品定性
 
-但真正的问题在于：**这种续航，到底是"架构级续航"，还是"参数放大后的续航感"？**
+都应以本文为准，不再并行维护平行版本文档或临时性方案稿。
 
----
+因此，参考平台演进摘要会保留在本文中，但只作为“候选机制来源”；对当前 Magi 的判断与取舍，仍只以本文为准。
 
-## 二、机理溯源
+早期分析阶段的核心判断有两个局限：
 
-### 2.1 Deep 模式的真实机制
+1. 它写作时，deep 模式确实更接近“参数增强态”。
+2. 但仓库后续已经沿着 `PlanLedger` 扩展路线完成了一轮实装，旧判断已经部分过时。
 
-基于代码链路分析，当前 deep 模式的"续航能力"由以下几层叠加实现：
+尤其是下面这些早期结论，已经不再准确：
 
-#### 第一层：模式切换层
+- “deep 仍缺少运行态一等对象”
+- “acceptance 仍主要依赖文本抽取”
+- “review 还不是持久化状态”
+- “缺少 runtime 级 wait / replan / review 状态推进”
+- “必须单独新建 `MissionLedgerService` 和顶层 `DeepRuntimePhase` 才能升级”
 
-```typescript
-// src/orchestrator/core/mission-driven-engine.ts
-const planMode: PlanMode = this.adapterFactory.isDeepTask() ? 'deep' : 'standard';
-const shouldAskConfirmation = this.interactionMode === 'ask' && planMode === 'deep';
-```
+现在更准确的路线已经直接体现在当前实现中：
 
-- `deepTask` 不是只改一个 UI 开关，而是进入了多个核心路径
-- `ask + deep` 才启用计划确认门禁
-- plan ledger 会记录 `mode = deep`
+- `src/orchestrator/plan-ledger/*`
+- `src/orchestrator/core/mission-driven-engine.ts`
+- `src/orchestrator/core/post-dispatch-verifier.ts`
+- `src/workspace/worktree-manager.ts`
 
-#### 第二层：Worker 侧的执行续航
-
-```typescript
-// src/orchestrator/worker/autonomous-worker.ts
-if (deepTaskEnabled) {
-  return { mode: 'project', maxReviewRounds: 8 };
-}
-return { mode: 'feature', maxReviewRounds: 2 };
-```
-
-Worker 真正的 loop 不是"无限 while 自己想多久就多久"，而是：
-
-1. 先执行 assignment 里的 todos
-2. 所有 todo 执行完后
-3. 对照 `delegationBriefing` 里的 `Acceptance Criteria / 验收标准`
-4. 发起一次静默验收检查
-5. 如果有 gap，就创建新的 `fix` todo
-6. 再继续执行
-7. 直到 review round 达到上限（standard: 2, deep: 8）
-
-**关键结论**：deep 模式不是无限循环，而是 **"todo 执行完成后，进入验收复审，再按缺口生成 fix todo 的有界闭环"**。
-
-#### 第三层：Worker 恢复能力
-
-```typescript
-// src/orchestrator/worker/worker-session.ts
-constructor(options?: { sessionTtlMs?: number; cleanupIntervalMs?: number; autoCleanup?: boolean }) {
-  this.SESSION_TTL_MS = options?.sessionTtlMs ?? 30 * 60 * 1000; // 默认 30 分钟
-  this.CLEANUP_INTERVAL_MS = options?.cleanupIntervalMs ?? 5 * 60 * 1000; // 默认 5 分钟
-}
-```
-
-- 默认 TTL 30 分钟
-- cleanup interval 5 分钟
-- `markAsResumed(...)` / `getByAssignment(...)` / `resumePrompt`
-
-**关键结论**：这是 **"短中期会话续跑"**，不是 **"长期自治任务体"**。
-
-#### 第四层：DispatchManager 做跨轮恢复桥接
-
-```typescript
-// src/orchestrator/core/dispatch-manager.ts
-const { resumeSessionId, resumePrompt } = this.getResumeContextForWorker(effectiveWorker);
-```
-
-- 激活 resume context
-- 给对应 worker 注入 `resumeSessionId` 和 `resumePrompt`
-- 归档后清理 resume context
-
-**关键结论**：恢复并不是"Worker 自己神奇记住了"，而是 **编排层显式桥接恢复上下文**。
-
-#### 第五层：编排层预算和终止门禁
-
-```typescript
-// src/llm/adapters/orchestrator-adapter.ts
-private static readonly STANDARD_BUDGET = {
-  maxDurationMs: 420_000,    // 7 分钟
-  maxTokenUsage: 120_000,
-  maxErrorRate: 0.7,
-};
-
-private static readonly DEEP_BUDGET = {
-  maxDurationMs: 900_000,    // 15 分钟
-  maxTokenUsage: 280_000,
-  maxErrorRate: 0.8,
-};
-```
-
-```typescript
-// src/llm/adapter-factory.ts
-if (deepTask) {
-  stallConfig.maxTotalRounds = Math.max(
-    stallConfig.maxTotalRounds + 20,
-    Math.ceil(stallConfig.maxTotalRounds * 3)
-  );
-}
-```
-
-**关键结论**：deep 模式的核心哲学不是"放开跑"，而是 **"在更大预算里继续受控运行"**。
-
-#### 第六层：编排者角色被收紧
-
-```typescript
-// src/llm/adapters/orchestrator-adapter.ts
-private static readonly DEEP_MODE_ALLOWED_TOOLS = new Set([
-  'dispatch_task',
-  'send_worker_message',
-  'wait_for_workers',
-  'file_view',
-  'grep_search',
-  'codebase_retrieval',
-  'web_search',
-  'web_fetch',
-  'shell',
-  'get_todos',
-  'update_todo',
-]);
-```
-
-**关键结论**：deep 不是"让 orchestrator 更像执行者"，而是 **"让 orchestrator 更像治理者，让 Worker 更像执行者"**。
-
-#### 第七层：编排后的整批验证
-
-```typescript
-// src/orchestrator/core/post-dispatch-verifier.ts
-await currentBatch.waitForArchive();
-await runPostDispatchVerification(currentBatch, this.verificationRunner, this.messageHub);
-```
-
-**关键结论**：系统实际有两层 review：
-1. Worker assignment 内部 review
-2. dispatch batch 结束后的编排级 verification
+也就是说，**早期分析对问题识别是有价值的，但升级路径应以当前实现和本文结论为准。**
 
 ---
 
-## 三、差距诊断
+## 二、参考平台的作用边界是什么
 
-### 3.1 现在实现的合理部分
+Learn Claude Code 时间线的关键演进，不是“功能越加越多”，而是 runtime 抽象层级不断提升：
 
-#### 合理点一：产品语义基本一致
+| 阶段 | 核心能力 | 对 deep 模式最相关的含义 |
+|---|---|---|
+| `s05` | `load_skill` / 两级注入 | 知识按需加载，而不是预先塞满 system prompt |
+| `s06` | `micro-compact + auto-compact + archival` | 长会话必须有系统级上下文压缩 |
+| `s07` | 文件持久化任务图 | 任务状态活在对话外面 |
+| `s11` | `idle-poll-claim-work` | Worker 可以自组织认领任务 |
+| `s12` | `git worktree` 目录隔离 | 并发写冲突从文件系统层面解决 |
 
-如果 deep 的产品定位是 **"项目级长任务治理模式"**，那么现在这套实现是基本成立的。
+补充说明：
 
-#### 合理点二：职责边界大方向是对的
+- `s01-s04` 解释的是最小 Agent loop、工具扩展、todo 和记忆外化、一次性子 Agent，这些是背景能力，不是当前 deep 差距判断的主轴
+- `s08-s10` 解释的是后台任务、团队协作、协议机制，对 Magi 有参考价值，但不是当前 deep runtime 成熟度判断的决定性指标
+- 对当前 deep 模式是否“成立”，真正关键的是 `s05 / s06 / s07 / s11 / s12`
 
-- **Orchestrator**：计划、调度、等待、决策、终止
-- **Worker**：执行、局部自检、修复、回报
+但这里有一个边界不能搞错：
 
-#### 合理点三：当前是"有界循环"，不是失控循环
+> **我们不是要把 Magi 变成另一个 Claude Code，而是要借它来识别哪些机制值得吸收、哪些机制不应照搬。**
 
-所有关键路径都有边界：
-- review round 有上限
-- stall round 有上限
-- budget 有上限
-- external wait 有 SLA
-- upstream model error 有连续阈值
+对 Magi 而言，应该保留的既有优势包括：
 
-### 3.2 当前实现的结构性不足
+- Orchestrator 主导的强治理能力
+- VS Code / Webview / IDE 深度集成
+- 多模型并行调度与异构执行
+- 结构化审计、验证与可追踪执行链
 
-#### 不足一：deep 更像"参数增强"，不是"状态机升级"
+因此，用这个参考平台来衡量 Magi，不应该只问“像不像 Claude Code”，而应该问：
 
-**核心判断**：deep 虽然跨了很多模块，但它的执行内核仍然更像：
+1. 我们是否已经有单一事实源？
+2. 我们是否已经把 review / acceptance / replan 变成运行时事实？
+3. 我们是否已经具备稳定的上下文治理？
+4. 我们是否已经有真正的自组织调度？
+5. 我们是否已经完成文件系统级隔离？
 
-> **standard runtime + 更大预算 + 更多复审轮次 + 更严角色约束**
+更进一步，取舍原则应该是：
 
-而不是一个真正独立的：
-
-> **deep runtime state machine**
-
-也就是说，目前缺少显式的一等状态，比如：
-- planning
-- dispatching
-- worker_review
-- project_verification
-- replan
-- external_wait
-- completed
-- failed
-
-现在这些状态分散在多个局部变量和不同模块中。
-
-#### 不足二：review 状态没有成为持久化的一等对象
-
-现在 review 的核心状态主要是：
-- `reviewRound`
-- `verificationAttempted`
-- `warnings`
-- 动态生成的 `fix` todos
-
-但缺少一个明确的、可持久化的 review ledger，例如：
-- 哪条验收标准已满足
-- 哪条未满足
-- 未满足归因给哪个 worker / 哪个 batch
-- 当前处于第几轮 project review
-- 本轮 review 是局部 fix 还是需要 replan
-
-现在这些信息很多是隐含在：
-- `delegationBriefing` 文本
-- silent verification response
-- fix todo 的 reasoning
-- 运行日志
-
-这对短链路够用，对 deep 项目级续航不够强。
-
-#### 不足三：Worker review 与 Orchestrator verification 没有统一合同
-
-当前两层 review 分别是：
-
-**Worker review**
-- 面向 assignment
-- 依据 `delegationBriefing` 中的验收标准文本
-- 发现 gap 就生成 `fix` todo
-
-**Orchestrator verification**
-- 面向 batch
-- 依据 `modifiedFiles`
-- 调 `verificationRunner`
-- 失败就抛错结束
-
-问题在于：
-
-> **这两层 review 不是同一个"完成合同"的两个阶段，而是两套并列机制。**
-
-这会带来几个问题：
-- Worker 通过，不代表项目级通过
-- Orchestrator 失败后，也不会自然进入统一的 replan / fix loop
-- batch verification 更像"最终闸门"，不是"项目级 review 闭环"
-
-这就是一个重要遗漏：
-
-> **项目级 review 闭环没有真正闭合。**
-
-#### 不足四：恢复能力是"会话续跑"，不是"任务持久化"
-
-当前 `WorkerSessionManager` 是内存 `Map` + TTL。
-所以它的能力更像：
-- 在当前进程生命周期里
-- 在一定时间窗口内
-- 允许恢复
-
-但这离 deep 模式真正想表达的"续航"还差一层：
-
-> **缺少 durable mission state persistence**
-
-因此当前系统可以说：
-- 支持恢复
-- 但不支持真正的长期项目持续推进
-
-这在产品表述上要很小心。
-否则容易让用户以为它已经是"长期自治代理"。
-
-#### 不足五：验收标准仍然是文本抽取，不是结构化合同
-
-Worker 的 acceptance review 现在从 `delegationBriefing` 里正则提取：
-- `## Acceptance Criteria`
-- `## 验收标准`
-
-这意味着 project-level review 的基础合同仍是文本块，而不是结构化对象。
-这会有几个后果：
-- 依赖 prompt 质量和格式稳定性
-- 不利于中断恢复
-- 不利于多轮累计 review
-- 不利于统一 project-level dashboard / explainability
-
-所以 deep 现在是"会复审"，但还不是"有结构化验收账本的复审系统"。
-
-#### 不足六：Ask 模式的确认点偏前置，缺少中途 replan 治理
-
-现在确认门禁是：
-- `interactionMode === 'ask' && planMode === 'deep'`
-
-这说明 deep + ask 的主要用户确认点是**计划开始前**。
-但如果后续 review 发现：
-- 范围扩大
-- 方案推翻
-- fix todo 累计已经变成 replan
-- cross-worker 集成策略需要变化
-
-当前看不到一个明确的"二次确认门禁"。
-这对产品来说是一个遗漏：
-
-> 初始计划可确认，不等于中途重大漂移也被治理住了。
-
-#### 不足七：deep 的上下文续航没有明显升级
-
-虽然预算加大了，但 `historyConfig` 仍是：
-- `maxMessages = 40`
-- `maxChars = 100000`
-- `preserveRecentRounds = 6`
-
-这说明 deep 模式的**执行预算**升级了，
-但**上下文记忆治理**没有同级升级，只能更多依赖滚动摘要。
-
-这不是 bug，但从"项目级续航"角度看，是一个架构短板。
+1. 如果某个参考机制能直接解决 Magi 当前已知问题，就吸收其机制，不复制其外在产品形态。
+2. 如果某个参考机制会削弱 Magi 的治理、可视化、审计或 IDE 集成优势，就不照搬。
+3. 如果 Magi 当前方案已经更适合自身产品目标，就以现有实现为主，不为了“像参考平台”而重构。
 
 ---
 
-## 八、产品级重构方案（唯一主线）
+## 三、当前代码的真实状态
 
-### 8.1 目标架构定义
+### 3.1 已落地能力
 
-> **把 deep 模式从"参数增强模式"升级为"显式阶段型项目执行状态机 + 统一完成合同 + 可恢复 ledger + 统一 review 闭环"的产品级项目执行运行时。**
+#### A. Deep runtime 已经有正式账本，不再只是局部变量
 
-不是推翻现有实现，而是把现有分散能力收编成一个统一模型。
+当前 deep 模式已经不是“靠几组 runtime 变量临时拼接”。
+
+`PlanLedger` 已经正式承载：
+
+- `schemaVersion`
+- `runtimeVersion`
+- `revision`
+- `runtime.acceptance`
+- `runtime.review`
+- `runtime.replan`
+- `runtime.wait`
+- `runtime.termination`
+
+代码依据：
+
+- `src/orchestrator/plan-ledger/types.ts`
+- `src/orchestrator/plan-ledger/plan-ledger-service.ts`
+
+这意味着：
+
+> **deep 的治理事实源已经收敛到 `PlanLedger`，而不是继续漂浮在 prompt / 日志 / 临时变量里。**
+
+这一步，本质上已经完成了“建立一等运行态对象”这一目标，只是实现方式不是另起 `MissionLedgerService`，而是**扩展 `PlanLedger`**。
+
+#### B. Deep phase 已经转成“分层状态模型”，不是必须新建顶层 11 状态
+
+当前代码已经采用“三层状态架构”：
+
+1. `Mission.status` 负责宏观生命周期
+2. `PlanRecord.runtime` 负责细粒度治理状态
+3. `MissionDrivenEngine` 瞬态变量负责当前轮次工作记忆
+
+代码依据：
+
+- `src/orchestrator/mission/types.ts`
+- `src/orchestrator/plan-ledger/types.ts`
+
+因此，下面这条早期路线判断：
+
+> 必须定义一个全新的 `DeepRuntimePhase` 顶层枚举作为唯一真相源
+
+现在已经不再是最佳答案。
+
+更合理的结论是：
+
+> **deep phase 应该是派生视图，不应该成为第二套顶层持久化状态真相源。**
+
+#### C. 结构化 acceptance 合同已经落地
+
+当前 acceptance 已经是正式结构，而不是只有文本 section：
+
+- `AcceptanceCriterion`
+- `VerificationSpec`
+- `verificationMethod`
+- `verifiable`
+- `status`
+
+代码依据：
+
+- `src/orchestrator/mission/types.ts`
+
+更关键的是，它已经不只是“定义了类型”，而是进入了实际运行链路：
+
+- plan 创建时写入结构化 acceptance
+- worker review prompt 会注入 `verificationSpec`
+- project verification 会读取结构化 acceptance
+
+代码依据：
+
+- `src/orchestrator/core/mission-driven-engine.ts`
+- `src/orchestrator/worker/autonomous-worker.ts`
+- `src/orchestrator/core/post-dispatch-verifier.ts`
+
+这说明：
+
+> **“acceptance 仍然主要依赖文本抽取”这一判断已经失效。**
+
+#### D. review / replan / wait 已经进入 runtime 回写链路
+
+当前 deep 模式已经能够在关键节点推进 runtime facet：
+
+- `review: running / accepted / rejected / idle`
+- `replan: none / required / applied`
+- `wait: none / external_waiting`
+
+代码依据：
+
+- `src/orchestrator/core/mission-driven-engine.ts`
+- `src/orchestrator/core/dispatch-manager.ts`
+- `src/orchestrator/plan-ledger/plan-ledger-service.ts`
+
+这意味着：
+
+> **review / wait / replan 已经成为持久化运行态，而不是只存在于一次执行回合中。**
+
+#### E. Project review 已经不是纯“终点闸门”
+
+`post-dispatch-verifier` 现在已经不只是“最后跑一下 verificationRunner”。
+
+它已经能：
+
+- 读取结构化 acceptance
+- 执行程序化 `verificationSpec`
+- 将未验证项 fail-closed
+- 将结果回流到 `PlanLedger.runtime`
+
+代码依据：
+
+- `src/orchestrator/core/post-dispatch-verifier.ts`
+
+这说明下面这条早期判断：
+
+> `post-dispatch-verifier` 只是后置闸门
+
+现在也不再成立。它已经是 deep review 闭环中的正式组成部分。
+
+#### F. s06 方向已经有真实落地
+
+当前 Magi 已经具备 micro-compact 级别的上下文治理：
+
+- Orchestrator 会压缩旧轮次大型 `tool_result`
+- `wait_for_workers` 历史结果会折叠成语义占位符
+- 压缩后的内容明确提示“关键信息已提取至 PlanLedger”
+
+代码依据：
+
+- `src/llm/adapters/orchestrator-adapter.ts`
+
+这不是完整等价于 Learn Claude Code 的三层压缩，但已经**不是“没有等价机制”**。
+
+#### G. s12 级别的 worktree 隔离已经落地
+
+这部分当前是最明确的强项之一。
+
+已经存在真实的：
+
+- `WorktreeManager`
+- `acquire -> execute in worktree -> merge -> release`
+- 工具链的 worktree-aware 路径重定向
+- merge conflict fail-fast
+
+代码依据：
+
+- `src/workspace/worktree-manager.ts`
+- `src/orchestrator/core/worker-pipeline.ts`
+- `src/tools/tool-manager.ts`
+
+所以如果按参考平台做交叉比对：
+
+> **s12 的核心思想，在 Magi 当前代码里已经是“已落地”状态。**
 
 ---
 
-### 8.2 核心架构升级路径
+### 3.2 半落地能力
 
-#### 升级一：建立 Deep Runtime State Machine
+#### A. s05 动态技能加载：已进入可用态，但还不够“纯按需”
 
-deep 模式必须有统一 phase，而不是散落在不同模块的局部状态。
-建议至少固定这些 phase：
+现在已经有：
 
-```typescript
-enum DeepRuntimePhase {
-  PLAN_CREATED = 'plan_created',
-  PLAN_CONFIRMED = 'plan_confirmed',
-  DISPATCHING = 'dispatching',
-  WORKER_EXECUTING = 'worker_executing',
-  WORKER_REVIEWING = 'worker_reviewing',
-  PROJECT_VERIFYING = 'project_verifying',
-  REPLANNING = 'replanning',
-  EXTERNAL_WAITING = 'external_waiting',
-  COMPLETED = 'completed',
-  FAILED = 'failed',
-  INTERRUPTED = 'interrupted',
-}
-```
+- `apply_skill`
+- `fetch_project_guidelines`
+- 项目知识索引注入
+- Worker/Orchestrator 可按需拉取知识
 
-这样带来的价值非常大：
+代码依据：
 
-- 所有继续/暂停/恢复都有统一依据
-- 所有 UI 展示都有统一状态源
-- 所有终止原因都能挂在 phase 上解释
-- 所有 review 都有清晰归属
+- `src/tools/tool-manager.ts`
+- `src/tools/knowledge-query-executor.ts`
+- `src/orchestrator/prompts/orchestrator-prompts.ts`
 
-如果没有这层，deep 永远只是"增强模式"。
+但问题在于：
 
----
+- 环境上下文仍可能直接展开部分 Skill 正文
+- 还没有完全收敛到“system prompt 只放索引，正文只走 tool_result”
 
-#### 升级二：建立 Mission Ledger，作为唯一事实源
+代码依据：
 
-必须引入任务级 ledger，而不是依赖：
+- `src/context/environment-context-provider.ts`
 
-- 内存 session
-- 日志
-- prompt 文本
-- 临时 summary
+所以这一项更准确的状态是：
 
-这个 ledger 至少要记录：
+> **动态技能加载已落地，但还没有完全达到“严格按需注入”的理想状态。**
 
-```typescript
-interface MissionLedger {
-  missionId: string;
-  currentPhase: DeepRuntimePhase;
-  planVersion: number;
-  reviewRound: number;
-  acceptanceCriteria: AcceptanceCriterion[];
-  activeBatchId?: string;
-  workerSessions: Map<WorkerSlot, string>;
-  terminationReason?: string;
-  budgetUsage: {
-    elapsedMs: number;
-    tokenUsed: number;
-    errorRate: number;
-  };
-  lastReplanReason?: string;
-  requiresUserConfirmation: boolean;
-  createdAt: number;
-  updatedAt: number;
-}
-```
+#### B. s11 自组织调度：已经进入“半自治”阶段
 
-这层一旦建立，deep 才真正具备产品能力。
+现在 Magi 并不是完全没有 claim 模式。
 
----
+已经存在：
 
-#### 升级三：把 Acceptance 升级为结构化合同
+- `claim_next_todo`
+- `TodoManager.findClaimable`
+- `TodoManager.tryClaim`
+- Worker persona 中明确允许当前 todo 完成后继续 claim 下一个 todo
 
-不能再让深度任务的闭环建立在 briefing 文本 section 抽取上。
+代码依据：
 
-应该把 acceptance 变成一等对象，至少包含：
+- `src/tools/orchestration-executor.ts`
+- `src/todo/todo-manager.ts`
+- `src/orchestrator/profile/builtin/worker-personas.ts`
 
-```typescript
-interface AcceptanceCriterion {
-  criterionId: string;
-  description: string;
-  scope: 'worker_local' | 'cross_worker' | 'project_global';
-  owner?: WorkerSlot;
-  status: 'pending' | 'satisfied' | 'unsatisfied' | 'blocked';
-  evidence?: string[];
-  lastReviewedAt?: number;
-  lastReviewedRound?: number;
-}
-```
+但它仍不是一种完整成熟的驻留自治模式：
 
-这样做之后：
+- Worker 常驻
+- 空闲自动轮询任务板
+- idle timeout 自治理
+- 无需 Orchestrator 继续显式驱动
 
-- Worker review
-- project verification
-- replan
-- resume
-- UI 展示
-- audit
+所以这项当前只能定义为：
 
-才能全部共享同一事实源。
+> **从“纯指令分发”进入了“半自治认领”，但还没有进入真正的驻留式自治 Worker 池。**
+
+#### C. review 闭环已成型，但 evidence / criterion 累计还偏轻
+
+当前 acceptance 已经结构化，review 也能回写运行态。
+
+但和理想形态相比，还缺少更重的“验收账本”维度，例如：
+
+- criterion 级 evidence 列表
+- criterion 级 owner / scope
+- 每轮 review 的 criterion 演化轨迹
+- 哪条 criterion 由哪个 batch / worker 满足
+
+所以这部分目前更像：
+
+> **合同已结构化，账本已存在，但“criterion 级审计粒度”还没完全做厚。**
 
 ---
 
-#### 升级四：统一 Review 闭环，不再让两层 review 并列漂浮
+### 3.3 尚未完成的关键缺口
 
-我建议把 review 明确拆成两层，但合同统一：
+#### A. Resume 仍然主要是 session 续跑，不是 mission-level recovery
 
-**Worker Review**
-负责：
-- assignment 局部完成度
-- 本 worker 范围内的 acceptance gap
-- gap 转换为 fix todo
+当前恢复主轴仍然是：
 
-**Project Review**
-负责：
-- 跨 worker 集成结果
-- 全局 acceptance contract
-- DoD 判定
-- 不通过时进入 `replanning`，而不是直接只抛错结束
+- `WorkerSessionManager`
+- `resumePrompt`
+- `resumeSessionId`
+- TTL + cleanup
 
-关键点不是"保留两层"，而是：
+代码依据：
 
-> **两层都围绕同一个 acceptance ledger 运转。**
+- `src/orchestrator/worker/worker-session.ts`
+- `src/orchestrator/core/dispatch-manager.ts`
 
-这样 review 才是产品级 review，不是两套机制。
+这适合：
 
----
+- 短中期失败恢复
+- 当前进程上下文里的续跑
 
-#### 升级五：把 Resume 从 Session 恢复升级成 Mission 恢复
-
-如果要产品级发布，恢复必须升级为：
+但它还不等于：
 
 - phase-aware
 - ledger-driven
-- deterministic
+- deterministic mission recovery
 
-也就是说恢复时系统要明确知道：
+因此，这个结论今天依然成立：
 
-- 我恢复到哪个 phase
-- 哪些 worker 已完成
-- 哪些 criterion 已满足
-- 哪些 fix todo 是上一轮 review 生成的
-- 当前为什么会恢复
-- 恢复后下一步是什么
+> **当前 deep 的恢复能力仍以 session 恢复为主，还不是产品级 mission persistence。**
 
-而不是只知道：
+#### B. CAS / reducer / terminal sticky 级发布约束还没正式收口
 
-- 有个 sessionId
-- 有段 resumePrompt
-- retryCount + 1
+虽然 `schemaVersion / runtimeVersion / revision` 已经落地，且 `PlanLedgerService` 对终态有保护：
 
-后者适合工程内部使用，不适合产品级 deep。
+- `runtimeVersion`
+- `revision`
+- `TERMINAL_PLAN_STATUSES`
+- session queue 串行写
 
----
+代码依据：
 
-#### 升级六：增加 Replan Gate
+- `src/orchestrator/plan-ledger/plan-ledger-service.ts`
 
-当前 ask + deep 只在开头做确认，这是不够的。
+但更严格的发布级治理能力还没完全体现为正式能力：
 
-产品级 deep 必须增加二次确认门禁，触发条件建议明确且标准化：
+- 没看到显式 `expectedRevision` CAS 提交接口
+- 没看到正式的 reducer 非法转移拒绝机制
+- 没看到“带审计的状态转移约束层”
 
-1. `reviewRound` 超过阈值（如 > 5）
-2. 新增 `fix todo` 数量超过阈值（如 > 10）
-3. project verification 失败后需要 replan
-4. scope 比初始计划显著扩大（如新增文件数 > 初始计划 50%）
-5. budget 消耗跨过关键阈值（如已用 > 70%）
-6. 涉及高风险文件/目录/操作
+所以这块必须继续保留为未完成项：
 
-这样用户看到的 deep 才是"可控深入"，而不是"沉默地越跑越大"。
+> **版本字段已落地，但并发控制与状态约束的“正式化治理层”还没有完全闭环。**
 
----
+#### C. Ask 模式下的 replan gate 仍不够完整
 
-#### 升级七：补齐产品级可观测性
+当前 deep 的 ask 模式，仍然主要集中在前置计划确认。
 
-deep 模式要发布，日志还不够，必须有稳定的运行态指标。
+现在虽然已有：
 
-至少要能观测：
+- `replan` runtime facet
+- 自动修复和自动续跑的状态回写
 
-- 当前 phase
-- 当前 review round
-- criterion satisfaction rate
-- no-progress streak
-- budget burn rate
-- external wait age
-- verification failure count
-- replan count
-- worker session resume success rate
+但还缺少正式、可解释、规则化的二次确认门禁，例如：
 
-否则一旦线上出现：
-
-- deep 卡住
-- deep 假完成
-- deep 持续补 fix 不收敛
-- deep 恢复后行为漂移
-
-你很难做运营和排障。
-
----
-
-### 8.3 哪些现有模块可以直接保留并升级
-
-这次不是推倒重来。
-当前代码里有不少东西是正确的，应该被收编，而不是废弃。
-
-#### 可以保留的核心资产
-
-**1. AutonomousWorker 的 fix todo 闭环能力**
-这是非常有价值的内核能力。
-应该保留，但纳入统一 review/contract 体系。
-
-**2. OrchestratorDecisionEngine**
-它已经在做终止治理。
-应继续保留，但从"局部门禁器"升级为"phase machine 的守门人"。
-
-**3. DispatchManager**
-它已经承担了恢复桥接和 batch 生命周期治理。
-这部分可以作为 deep runtime 的 dispatch coordinator 继续沿用。
-
-**4. post-dispatch-verifier**
-不要删除，但要把它从"后置闸门"升级为"project review phase"。
-
-**5. deep 下 orchestrator 收权机制**
-这是产品级边界感的体现，必须保留。
-
----
-
-### 8.4 产品级发布前的准入标准
-
-如果你要的是"优秀标准化"，那我建议 deep 模式在发布前至少满足下面这组门槛。
-
-#### 架构门槛
-- deep 有显式 phase machine
-- acceptance 是结构化合同，不依赖 prompt section 解析
-- mission ledger 成为唯一事实源
-- review / verification / replan 全部挂到统一 runtime
-
-#### 行为门槛
-- 每次继续、停止、恢复都有明确 reason
-- 不存在"系统自己也说不清为什么还在跑"的情况
-- project verification 失败后能进入标准 replan 分支
-
-#### 恢复门槛
-- deep 中断后可 deterministic 恢复
-- 恢复后 phase、review round、criterion 状态一致
-- 不依赖内存 map 作为唯一恢复来源
-
-#### 产品门槛
-- 用户可以看到当前阶段和继续原因
-- 高风险扩张时有二次确认
-- 完成态可解释，不是"模型说完成了所以完成"
-
-#### 运维门槛
-- 有 phase / review / budget / verification 的核心埋点
-- 可定位卡住、空转、反复修复不收敛等问题
-
-只要这几项没齐，我不会建议把 deep 定义为"产品级成熟能力"。
-
----
-
-## 九、实施路径与优先级
-
-### 9.1 P0：必须先做（核心架构）
-
-1. **Deep Phase Machine**
-   - 定义 `DeepRuntimePhase` 枚举
-   - 在 `MissionDrivenEngine` 中引入 phase 状态管理
-   - 所有关键决策点（dispatch / review / verification / termination）都基于 phase 驱动
-
-2. **Mission Ledger**
-   - 定义 `MissionLedger` 接口
-   - 实现 `MissionLedgerService`（可持久化到文件系统或内存）
-   - 在 deep 模式下强制使用 ledger 作为唯一事实源
-
-3. **结构化 Acceptance Contract**
-   - 定义 `AcceptanceCriterion` 接口
-   - 在 plan 阶段从 briefing 提取并结构化
-   - Worker review 和 project verification 都读写同一 contract
-
-4. **Worker Review / Project Review 统一闭环**
-   - Worker review 只更新 worker-local criterion
-   - Project verification 检查 project-global criterion
-   - 失败时进入 `replanning` phase，而不是直接抛错
-
----
-
-### 9.2 P1：紧随其后（产品化）
-
-1. **Mission-level Resume**
-   - 从 session 恢复升级为 ledger-driven 恢复
-   - 恢复时明确恢复到哪个 phase
-   - 恢复后 criterion 状态一致
-
-2. **Replan Gate**
-   - 定义二次确认触发条件
-   - 在 ask 模式下触发用户确认
-   - 记录 replan 原因到 ledger
-
-3. **运行态可观测性**
-   - 定义核心指标（phase / review round / criterion satisfaction rate）
-   - 通过 `MessageHub` 发送运行态事件
-   - UI 展示当前 phase 和 review 进度
-
----
-
-### 9.3 P2：发布优化（体验提升）
-
-1. **UI Phase 可解释化**
-   - 在 UI 中展示当前 phase
-   - 展示 review round 和 criterion 满足情况
-   - 展示预算消耗和预估剩余时间
-
-2. **产品级 Completion Reason 展示**
-   - 完成时展示哪些 criterion 已满足
-   - 失败时展示哪些 criterion 未满足及原因
-   - 中断时展示中断原因和恢复建议
-
-3. **Review 收敛度和预算消耗的运营指标**
-   - 统计 review 收敛轮次分布
-   - 统计预算消耗分布
-   - 识别异常模式（如持续不收敛、预算异常消耗）
-
----
-
-## 十、最终判断与建议
-
-### 10.1 当前 deep 模式的准确定性
-
-> **当前 deep 模式是"合理但未完成形态"的项目级长任务治理器。**
-> **它不是设计错误，但它也还没进化成真正完整的 deep execution architecture。**
-
-### 10.2 现在做得对的地方
-
-- 方向对
-- 角色边界对
-- 安全网对
-- 不是失控 agent
-- 已经具备 project mode 雏形
-
-### 10.3 现在真正的短板
-
-- 还不是显式 deep runtime
-- review 不是一等持久状态
-- project-level review 闭环没彻底打通
-- resume 还是会话级，不是任务级
-- ask 模式缺少中途 replan 门禁
-- acceptance contract 仍是文本，不是结构化事实源
-
-### 10.4 我的最终建议
-
-如果你的目标是：
-
-> **deep 模式具备产品级可发布能力，并且在架构层面达到优秀、可标准化、可持续演进的水平**
-
-那接下来不应该再沿着：
-
-- 加 round
-- 加 budget
-- 加几个 gate
-- 加几段 resume 逻辑
-
-这条路继续走。
-
-因为这条路会越来越像"把可用原型堆成复杂系统"。
-产品级优秀架构不能这样长。
-
-正确方向只有一个：
-
-> **建立 deep 专属的项目执行状态机、统一 acceptance 合同、任务级 ledger、统一 review/replan 闭环。**
-
----
-
-## 十一、下一步行动
-
-如果你认可这个判断，下一步我建议我直接帮你产出并落地：
-
-1. **核心数据结构定义**
-   - `DeepRuntimePhase`
-   - `MissionLedger`
-   - `AcceptanceCriterion`
-
-2. **MissionLedgerService 实现**
-   - 创建/读取/更新 ledger
-   - phase 转换逻辑
-   - criterion 状态管理
-
-3. **MissionDrivenEngine 升级**
-   - 引入 phase machine
-   - 在关键决策点基于 phase 驱动
-   - 删除与新模型冲突的旧路径
-
-4. **AutonomousWorker 升级**
-   - review 时读写结构化 criterion
-   - 删除文本 section 解析
-
-5. **post-dispatch-verifier 升级**
-   - 从"后置闸门"升级为"project review phase"
-   - 失败时进入 replanning，而不是直接抛错
-
-如果你点头，我下一步就直接按这个路径开始落第一轮核心架构代码。
-
-### 4.1 用 5 Whys 收口
-
-**Why 1：为什么 deep 看起来已经能 loop/review，但仍让人担心不够稳？**
-因为它的 loop/review 是分散在多个层里实现的，不是统一 runtime phase。
-
-**Why 2：为什么会分散？**
-因为当前 deep 并没有独立执行内核，而是沿用了 standard 的主框架，在局部增强：
-- budget
-- maxReviewRounds
-- maxTotalRounds
-- resume bridge
-- tool restriction
-
-**Why 3：为什么会采用这种增强式实现？**
-因为产品当前更像要一个**可控的项目级治理模式**，而不是一个彻底开放的自治代理。
-
-**Why 4：为什么这会导致"续航感有了，但结构仍偏弱"？**
-因为当 deep 进入多轮复审、跨 worker 集成、长链路恢复时，
-仅靠局部增强已经不足以表达完整状态。
-
-**Why 5：最终根因是什么？**
-我给一个最准确的定性：
-
-> **deep 模式的产品语义已经升级到了"项目级治理"，但执行内核还停留在"标准模式的参数化增强"，尚未升级为"项目级显式状态机"。**
-
-这就是根本原因。
-
-不是代码写得乱。
-也不是某个模块设计错。
-而是：
-
-> **产品层已经迈到下一层，runtime 抽象还没完全跟上。**
-
----
-
-## 五、产品级重构方案（唯一主线）
-
-### 5.1 核心目标
-
-> **把 deep 模式从"参数增强模式"升级为"显式阶段型项目执行状态机"，同时保留现有所有安全网。**
-
-不是推翻现有实现，而是把现有分散能力收编成一个统一模型。
-
-### 5.2 架构升级主线
-
-#### 第一件事：把 deep 的 loop 明确成阶段状态机
-
-建议 deep 运行态最少显式化为这些 phase：
-
-1. `plan_confirmed`
-2. `dispatching`
-3. `worker_execution`
-4. `worker_review`
-5. `project_verification`
-6. `replan`
-7. `external_wait`
-8. `completed`
-9. `failed`
-10. `interrupted`
-
-这样做的价值是：
-- 续航不再是"靠多个 if/while 拼出来"
-- 终止/恢复/展示都有统一状态依据
-- 用户和系统都知道"现在为什么还在继续"
-
-#### 第二件事：把验收标准改成结构化合同
-
-不要再让 deep 的核心闭环建立在：
-- `## Acceptance Criteria`
-- `## 验收标准`
-
-这种文本 section 解析之上。
-
-应该把 acceptance contract 结构化，例如至少具备：
-- `criterionId`
-- `description`
-- `ownerScope`（worker-local / cross-worker / project）
-- `status`（pending / satisfied / failed / blocked）
-- `evidence`
-- `lastReviewRound`
-
-这样后续：
-- Worker review
-- project verification
-- replan
-- resume
-
-才能共享同一事实源。
-
-#### 第三件事：把两层 review 合并成一个统一的"完成合同闭环"
-
-现在不是删除其中一层，而是要明确职责：
-
-**Worker review**
-只负责：
-- 本 assignment 的局部完成度
-- 本 worker 责任范围内的 fix 闭环
-
-**Project verification**
-负责：
-- 跨 worker 的集成完成度
-- 最终 Definition of Done
-- 不通过时触发 replan / new dispatch，而不是只 throw
+- review round 超阈值
+- 范围明显膨胀
+- 预算跨阈值
+- 需要重大 replan
 
 也就是说：
 
-> `post-dispatch-verifier` 不该只是终点闸门，而应该成为 deep 状态机中的一个正式 phase。
+> **replan 状态存在了，但“用户确认治理规则”还没有完全产品化。**
 
-#### 第四件事：把 resume 从 session 恢复升级为 mission 持久化
+#### D. s06 的 macro-compact / archival 还没有完全等价物
 
-至少 deep 模式下，应该把这些状态变成 durable ledger：
-- 当前 phase
-- 当前 review round
-- 哪些 criterion 未满足
-- 哪些 fix todo 是 review 生成的
-- 当前 worker session 映射
-- 当前预算消耗
-- 最近一次终止/中断原因
+现在的 micro-compact 已经有了。
 
-否则 deep 的"续航"仍然主要是进程内续跑，不够项目级。
+但和理想的长会话治理机制相比，仍缺：
 
-#### 第五件事：补一个"中途重大漂移确认门禁"
+- 完整的 auto-compact 归档路径
+- 明确的 archival transcript + compact summary 机制
+- 用户或模型可主动触发的 compact 工具级体验
 
-在 `ask + deep` 下，不应该只在起始计划确认一次。
-当发生这些情况时，应该触发二次确认：
-- scope 明显扩大
-- review 轮次跨过阈值
-- 生成 fix todo 数量持续增加
-- project verification 失败后需要 replan
-- 预算即将从 feature 级进入 project 级消耗
+所以这块属于：
 
-这才符合"深度任务"的产品可信度。
+> **局部落地，未完全等价。**
 
 ---
 
-### 5.3 哪些东西应该保留
+## 四、既有判断的保留与修正
 
-这些我认为是对的，应该保留：
+### 4.1 仍然成立的判断
 
-#### 1. 保留 orchestrator 收权
-deep 下不应该让 orchestrator 直接变成大执行者。
-它应该继续做治理者。
+这些判断今天依然成立：
 
-#### 2. 保留所有终止门禁
-不要为了"更续航"就放松：
-- stalled
-- budget
-- external wait
-- upstream model error
+- deep 的职责边界是对的：Orchestrator 治理，Worker 执行
+- 当前 deep 不是无限循环，而是有界闭环
+- 恢复能力仍偏 session 级，不是 mission 级
+- ask 模式的中途 replan gate 仍然不足
+- 真正的驻留自治 Worker 池还没建成
 
-这会直接把系统推向失控。
+### 4.2 需要修正的判断
 
-#### 3. 保留 Worker 内部 fix todo 机制
-这个机制是对的，说明 Worker 已经具备"做完再查、查完再补"的自修复能力。
-只是要把它纳入统一状态机，而不是散落在局部循环中。
+这些判断现在已经不准确：
 
----
+- “deep 还不是持久化运行态”
+- “review 还不是一等持久状态”
+- “acceptance 仍主要靠文本抽取”
+- “wait / review / replan 没进入统一 runtime”
+- “必须新建独立 `MissionLedgerService`”
+- “必须另建一套顶层 `DeepRuntimePhase` 才算升级”
 
-### 5.4 从产品定位看，当前 deep 到底是什么
+更准确的说法应该是：
 
-我给一个很明确的产品判断：
-
-**如果 deep 的定位是：**
-> **项目级长任务治理模式**
-
-那现在的实现是**基本合理的**，而且方向对。
-
-**如果 deep 的定位是：**
-> **能够长期自主循环直到真正完成的自治代理**
-
-那现在的实现**还不够**，差的不是几个常量，而是 runtime 抽象层级。
-
-所以从产品文案和预期管理上，我建议明确：
-
-> **deep 不是无限自治代理，而是"更强计划治理 + 更长执行预算 + 多轮复审 + 可恢复"的项目级执行模式。**
-
-这一定义和现有代码是一致的。
-如果你非要把它表述成"持续 autonomously loop until done"，那产品承诺会跑在架构前面。
+> **当前 deep runtime 已经存在，只是实现为 `Mission.status + PlanRecord.runtime + 瞬态变量` 的分层模型，而不是独立的新账本和新顶层状态机。**
 
 ---
 
-## 六、最终判断
+## 五、当前最合理的产品定性
 
-我最后给你一个不拐弯的判断：
+综合交叉比对结果与当前代码，我认为当前 deep 模式的最准确定性是：
 
-### 现在 deep 模式做得对的地方
-- 方向对
-- 角色边界对
-- 安全网对
-- 不是失控 agent
-- 已经具备 project mode 雏形
+> **Magi 当前 deep 模式 = 已落地的 `deep_v1` 项目级治理控制平面。**
 
-### 现在 deep 模式真正的短板
-- 还不是显式 deep runtime
-- review 不是一等持久状态
-- project-level review 闭环没彻底打通
-- resume 还是会话级，不是任务级
-- ask 模式缺少中途 replan 门禁
-- acceptance contract 仍是文本，不是结构化事实源
+它已经具备：
 
-### 我的总定性
-> **当前 deep 模式是"合理但未完成形态"的项目级长任务治理器。**
-> **它不是设计错误，但它也还没进化成真正完整的 deep execution architecture。**
+- 单一账本基础
+- 结构化 acceptance
+- review / replan / wait facet
+- project verification 闭环
+- worktree 物理隔离
+- 半自治 claim 模式
+- 按需技能 / 项目知识加载能力
+
+但它还**不具备**：
+
+- 完整驻留式自治 Worker 池
+- ledger-driven mission recovery
+- 完整发布级 CAS / reducer / 状态迁移审计
+- 完整三层 compact / archival 机制
+- 正式产品化的 replan 二次确认门禁
+
+因此：
+
+> **当前 deep 模式已经不是“原型级增强模式”，但也还不是所有关键治理机制都已产品化的完整方案。**
 
 ---
 
-## 七、下一步建议
+## 六、最需要继续推进的 4 个方向
 
-如果你的目标是：
+### P0. Mission-level Resume
 
-> **deep 模式具备产品级可发布能力，并且在架构层面达到优秀、可标准化、可持续演进的水平**
+目标：
 
-那我给你的结论会更严格一些：
+- 从 `session resume` 升级为 `ledger-driven mission recovery`
+- 恢复后明确 phase / review round / acceptance 状态
+- 不再主要依赖 `resumePrompt + retryCount`
 
-> **现状方向是对的，但还没有达到"产品级可发布"的优秀标准。**
-> **它现在更像"可工作的 deep 原型内核"，还不是"标准化的 deep 产品架构"。**
+### P1. 正式化 Ledger 并发与状态约束
 
-如果你愿意，下一步我可以继续做两件事中的一个：
+目标：
 
-1. **把我上面的结论落成一版 deep 模式架构重构方案图**
-2. **直接基于现有代码，给你列出最小改造路径，按优先级拆到具体模块和类**
+- 增加 CAS / expected revision 提交语义
+- 明确 reducer
+- 拒绝非法状态转移
+- 做审计记录
 
+### P2. Replan Gate 产品化
 
+目标：
+
+- 为 ask + deep 增加中途重大漂移确认
+- 把 replan 从 runtime 事实提升为用户可解释治理动作
+
+### P3. 从半自治走向驻留自治
+
+目标：
+
+- 从 `claim_next_todo` 升级到 `idle-poll-claim-work`
+- 让 Worker 真的具备有限自组织能力
+- 进一步减轻 Orchestrator 的微观控制负担
+
+---
+
+## 七、实施计划与验收标准
+
+本节用于把上述 P0-P3 方向转成可执行的升级基线。
+
+需要先明确两个原则：
+
+- 业务优先级仍按 `P0 -> P1 -> P2 -> P3` 理解。
+- 工程实施顺序建议按 `P1 -> P0 -> P2 -> P3` 推进，因为 `P1` 是其余三项的账本与状态约束底座。
+
+### 7.1 P1 底座先行：Ledger 并发与状态约束
+
+涉及模块：
+
+- `src/orchestrator/plan-ledger/types.ts`
+- `src/orchestrator/plan-ledger/plan-ledger-service.ts`
+- `src/orchestrator/core/mission-driven-engine.ts`
+- `src/orchestrator/core/dispatch-manager.ts`
+
+实施要求：
+
+- 为单 ledger 写入建立明确的 `expectedRevision` / CAS 语义。
+- 为关键 runtime facet 建立统一的状态转移约束层，拒绝非法转移。
+- 明确 terminal sticky 规则，进入终态后不得被普通事件回写。
+- 为状态转移失败、版本冲突、非法事件建立可审计记录。
+- 禁止出现“ledger 失败后退回内存事实源”的兼容路径。
+
+完成定义：
+
+- 并发写入冲突会被确定性拒绝，而不是静默覆盖。
+- 非法状态迁移会被拒绝，并留下审计记录。
+- `completed / failed / cancelled` 等终态具备稳定粘性。
+- deep runtime 的关键事实源只保留 `PlanLedger` 一条主路径。
+
+验收标准：
+
+- 至少补充一组并发写冲突回归用例。
+- 至少补充一组非法状态迁移回归用例。
+- 所有相关回归与 `release:preflight` 必须通过。
+
+### 7.2 P0 主链路补齐：Mission-level Resume
+
+涉及模块：
+
+- `src/orchestrator/worker/worker-session.ts`
+- `src/orchestrator/core/dispatch-manager.ts`
+- `src/orchestrator/core/mission-driven-engine.ts`
+- `src/orchestrator/plan-ledger/types.ts`
+- `src/orchestrator/plan-ledger/plan-ledger-service.ts`
+
+实施要求：
+
+- 恢复入口应以 ledger 中的 runtime 快照为主，而不是以 `resumePrompt` 拼接为主。
+- 恢复后必须能重建 `review / replan / wait / acceptance / termination` 等关键状态。
+- 中断恢复后不得重复创建同一类 fix todo、重复派发同一 assignment，或破坏既有终态。
+- 恢复逻辑必须兼容当前 deep 主链路，而不是引入第二套 mission 真相源。
+
+完成定义：
+
+- 进程中断后可基于 ledger 恢复 mission，而不是依赖人工补 prompt。
+- 恢复后 deep phase、review round、acceptance 状态保持一致。
+- ask / deep 两种交互路径在恢复后行为一致且可解释。
+- 恢复失败时进入受控失败或暂停状态，而不是静默跳过。
+
+验收标准：
+
+- 至少补充一组 mission 中断恢复回归用例。
+- 至少覆盖“恢复后继续执行”“恢复后进入 review”“恢复后终态保持”三类场景。
+- 所有相关回归与 `release:preflight` 必须通过。
+
+### 7.3 P2 用户治理补齐：Replan Gate 产品化
+
+涉及模块：
+
+- `src/orchestrator/core/mission-driven-engine.ts`
+- `src/orchestrator/plan-ledger/types.ts`
+- `src/orchestrator/plan-ledger/plan-ledger-service.ts`
+- `src/llm/adapters/orchestrator-adapter.ts`
+- 用户确认与展示链路
+
+实施要求：
+
+- 明确定义触发 replan gate 的规则，例如 review round 超阈值、范围膨胀、预算跨阈值、重大方案漂移。
+- 将 `replan.reason`、风险等级、是否需要确认、确认结果收敛为正式 runtime 数据。
+- `ask + deep` 下命中 gate 时必须阻塞继续执行，直到用户确认。
+- 用户确认结果必须进入持久化链路，并可在 UI 或消息层解释当前暂停原因。
+
+完成定义：
+
+- 重大 replan 不会在 ask 模式下静默继续。
+- 用户能看到“为什么被要求确认”和“确认后会发生什么”。
+- replan 决策从 prompt 语义提升为产品级治理动作。
+- 自动路径与确认路径不会形成双真相源。
+
+验收标准：
+
+- 至少补充一组 ask 模式下的 replan confirm / reject 回归用例。
+- 至少覆盖“范围膨胀”“预算超阈值”“review 超阈值”三类触发源中的两类。
+- 所有相关回归与 `release:preflight` 必须通过。
+
+### 7.4 P3 自治增强：从半自治到驻留自治
+
+涉及模块：
+
+- `src/orchestrator/worker/autonomous-worker.ts`
+- `src/todo/todo-manager.ts`
+- `src/tools/orchestration-executor.ts`
+- `src/orchestrator/profile/builtin/worker-personas.ts`
+- `src/orchestrator/core/mission-driven-engine.ts`
+
+实施要求：
+
+- 为 Worker 建立有边界的 `idle -> poll -> claim -> work -> idle` 生命周期。
+- claim 过程必须具备幂等与抢占保护，避免重复认领同一 todo。
+- Worker 的认领能力应受角色、能力或任务类型约束，不能无边界吞任务。
+- Orchestrator 应逐步从“逐个子任务微观驱动”退到“计划、治理、验收”主职责。
+- 迁移过程中不得让同一 todo 同时存在两条认领真相路径。
+
+完成定义：
+
+- Worker 在完成当前 todo 后可在边界内继续认领后续 todo。
+- claim 行为可解释、可审计、可回放。
+- 空闲状态有明确退出条件，不形成无限驻留或失控轮询。
+- 自治增强不会破坏现有 deep 的可追踪性和治理能力。
+
+验收标准：
+
+- 至少补充一组 claim 幂等回归用例。
+- 至少补充一组 idle 后自动认领与超时退出回归用例。
+- 所有相关回归与 `release:preflight` 必须通过。
+
+### 7.5 统一发布门禁
+
+无论 P0-P3 推进到哪一步，发布前都必须满足以下统一门禁：
+
+- 不引入第二套 mission / runtime 真相源。
+- 不引入“失败时退回旧路径”的回退逻辑。
+- 不引入“仅为通过当前问题而存在”的补丁式旁路。
+- 新增能力必须绑定最少一条专属回归用例。
+- 文档、实现、回归结果三者口径一致，变更后同步回写本文。
+
+### 7.6 主专项之外的完整升级/调整范围
+
+除 P0-P3 四个主专项外，当前仍应纳入 deep 升级范围的内容如下。
+
+| 项目 | 当前状态 | 分类 | 处理建议 | 关联模块 |
+|---|---|---|---|---|
+| 严格按需技能注入 | 半落地 | 建议调整 | 继续收敛到“system prompt 只放索引，正文只经工具注入”，清理环境上下文中的正文直注路径 | `src/tools/tool-manager.ts`、`src/tools/knowledge-query-executor.ts`、`src/context/environment-context-provider.ts`、`src/orchestrator/prompts/*` |
+| 三层上下文治理 | 半落地 | 建议调整 | 在已有 micro-compact 基础上补齐 auto-compact、archival transcript、manual compact 能力 | `src/llm/adapters/orchestrator-adapter.ts`、上下文组装与消息持久化链路 |
+| criterion 级验收账本 | 半落地 | 建议调整 | 为 acceptance criterion 增加 evidence、owner/scope、review history、batch/worker 归属信息 | `src/orchestrator/mission/types.ts`、`src/orchestrator/plan-ledger/*`、`src/orchestrator/core/post-dispatch-verifier.ts` |
+| 决策轨迹与高级诊断面 | 后端已落地，前台未完全消费 | 建议调整 | 将 `decisionTrace`、`blockerState`、termination metrics 暴露到诊断视图或高级运行态展示 | `src/adapters/adapter-factory-interface.ts`、`src/orchestrator/core/mission-driven-engine.ts`、`src/orchestrator/core/termination-metrics-repository.ts`、UI 链路 |
+| blocker / progress / acceptance 联动治理 | 部分存在 | 建议调整 | 把 blocker、review、replan、wait、acceptance failure 统一成可解释的治理事实，而不是分散原因串 | `src/llm/adapters/orchestrator-decision-engine.ts`、`src/llm/adapters/orchestrator-termination.ts`、`src/orchestrator/core/mission-driven-engine.ts` |
+| 统一恢复决策内核 | 部分存在 | 建议调整 | 将 retry / switch / degrade / finalize 等恢复决策逐步并入统一决策内核，减少分散 if-else | `src/llm/adapters/orchestrator-decision-engine.ts`、`src/llm/adapters/orchestrator-adapter.ts`、`src/orchestrator/core/mission-driven-engine.ts` |
+| worktree 运行保障 | 已落地，可继续增强 | 按需优化 | 强化 merge conflict 解释、孤儿 worktree 清理、失败后的修复微任务流 | `src/workspace/worktree-manager.ts`、`src/orchestrator/core/worker-pipeline.ts`、`src/tools/tool-manager.ts` |
+| 运行态解释与 UI | 部分存在 | 建议调整 | 展示当前 review / replan / wait facet、暂停原因、恢复来源、验收进度与决策轨迹摘要 | Webview、消息模型、i18n、运行态透传链路 |
+| schema / migration / version 治理 | 部分存在 | 建议调整 | 明确 N / N-1 兼容窗口、在线迁移策略、成功加载后回写策略与灰度边界 | `src/orchestrator/plan-ledger/plan-ledger-service.ts`、迁移脚本、发布脚本 |
+| 回归与 CI 闸门扩充 | 部分存在 | 必须持续补齐 | 为每个新专项补专属回归，并将稳定后纳入 `release:preflight` 或专项 workflow | `package.json`、`scripts/*`、`.github/workflows/*` |
+| 文档与变更治理 | 需要持续执行 | 必须持续补齐 | 实现变化后同步修订本文与版本说明，避免再次出现平行方案文档 | `docs/*`、版本说明文档 |
+
+### 7.7 明确不做或暂不做的调整
+
+为了保证升级稳定性，以下方向应明确视为“不做”或“暂不做”：
+
+- 不新建独立的 `MissionLedgerService` 或第二套 mission 真相源。
+- 不新建一套顶层 `DeepRuntimePhase` 作为新的持久化真相源。
+- 不在 ledger 或 runtime 失败时退回“内存事实源 + prompt 兜底”的兼容路径。
+- 不为了模仿参考平台而削弱 Orchestrator 的治理职责、IDE 集成或结构化审计链。
+- 不让 in-flight mission 在运行中热切换 `runtimeVersion` 或控制路径。
+- 不在 worktree 已经成为主路径后重新依赖串行降级来规避并发写冲突。
+- 不让 Worker 进入无边界自治，导致 claim 范围失控、角色约束失效或治理链断裂。
+
+### 7.8 建议回归与发布清单
+
+当 deep 升级涉及不同子系统时，建议至少按下面的维度执行回归。
+
+基础必跑：
+
+- `npm run -s compile`
+- `npm run -s release:preflight`
+
+账本与生命周期相关：
+
+- `npm run -s verify:e2e:plan-ledger-lifecycle`
+- `npm run -s verify:e2e:plan-ledger-attempt-lifecycle`
+- `npm run -s verify:e2e:plan-governance-gate`
+
+派发与自治链路相关：
+
+- `npm run -s verify:e2e:dispatch-protocol`
+- `npm run -s verify:e2e:dispatch-idempotency`
+- `npm run -s verify:e2e:auto-deep-followup`
+
+模式、治理与终止相关：
+
+- `npm run -s verify:e2e:mode-governance`
+- `npm run -s verify:e2e:orchestrator-termination`
+- `npm run -s verify:e2e:termination-ab-gate`
+- `npm run -s verify:e2e:termination-real-sample-gate`
+- `npm run -s verify:ci:termination-gate`
+
+知识与技能链路相关：
+
+- `npm run -s verify:e2e:apply-skill`
+- `npm run -s verify:e2e:knowledge-learning`
+
+补充要求：
+
+- 若本次变更命中了某一专项的“验收标准”条目，应额外执行该专项绑定的专属回归。
+- 若本次变更影响发布门禁、终止治理或运行态消息结构，必须同步检查对应 workflow 与脚本文档。
+
+---
+
+## 八、定档结论
+
+本文的最终定档结论如下：
+
+> **当前 Magi deep 模式已经完成了一轮真正的 runtime 升级，主干方向正确，且代码层面已有真实落地。**
+>
+> **它已经不是“参数增强态”的早期形态，而是可用的 `deep_v1` 项目级治理控制平面。**
+>
+> **但它在自治调度、恢复治理、上下文治理和发布约束这些关键维度上，仍有明确的工程距离，尚未达到全部关键机制收口后的最终成熟态。**
+
+---
+
+## 九、附：本次复核的代码依据与维护约束
+
+核心依据文件：
+
+- `src/orchestrator/mission/types.ts`
+- `src/orchestrator/plan-ledger/types.ts`
+- `src/orchestrator/plan-ledger/plan-ledger-service.ts`
+- `src/orchestrator/core/mission-driven-engine.ts`
+- `src/orchestrator/core/dispatch-manager.ts`
+- `src/orchestrator/core/post-dispatch-verifier.ts`
+- `src/orchestrator/worker/autonomous-worker.ts`
+- `src/todo/todo-manager.ts`
+- `src/tools/tool-manager.ts`
+- `src/tools/orchestration-executor.ts`
+- `src/workspace/worktree-manager.ts`
+- `src/llm/adapters/orchestrator-adapter.ts`
+
+本次复核同时参考了：
+
+- Learn Claude Code Timeline：`s05 / s06 / s07 / s11 / s12`
+- 当前仓库已通过的主回归链与 `release:preflight`
+
+后续维护约束：
+
+- 本文作为 deep 模式唯一正式文档持续更新
+- 如实现发生变化，应直接修订本文，不再新增平行方案稿
+- 若确需临时设计稿，应在落地后回收并合并回本文
