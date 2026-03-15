@@ -936,6 +936,7 @@
   "dispatch.lane.taskList": "Task list:",
   "dispatch.lane.unknownTask": "Unknown task",
   "dispatch.notify.executionRoutingAdjusted": "Task {taskId} reassigned before execution: {fromWorker} -> {toWorker} ({routingReason})",
+  "dispatch.notify.runtimeExecutionFailover": "Task {taskId} detected that {fromWorker} became temporarily unavailable during execution ({reason}); automatically downgraded to {toWorker} to continue",
   "dispatch.notify.dependsOnDroppedCrossSession": "Task {taskId} has {count} depends_on entries from another session; ignored ({dependencies})",
   "dispatch.notify.dependsOnDroppedCrossSessionReason": "cross-session dependencies ignored ({count})",
   "dispatch.notify.dependsOnDroppedUnfinished": "Task {taskId} has {count} historical depends_on entries not completed; ignored and continued ({dependencies})",

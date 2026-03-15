@@ -931,6 +931,7 @@
   "dispatch.lane.taskList": "任务列表：",
   "dispatch.lane.unknownTask": "未知任务",
   "dispatch.notify.executionRoutingAdjusted": "任务 {taskId} 执行前改派：{fromWorker} -> {toWorker}（{routingReason}）",
+  "dispatch.notify.runtimeExecutionFailover": "任务 {taskId} 执行中检测到 {fromWorker} 暂时不可用（{reason}），已自动降级到 {toWorker} 继续执行",
   "dispatch.notify.dependsOnDroppedCrossSession": "任务 {taskId} 的 {count} 个 depends_on 来自其他会话，已忽略（{dependencies}）",
   "dispatch.notify.dependsOnDroppedCrossSessionReason": "跨会话依赖已忽略（{count}）",
   "dispatch.notify.dependsOnDroppedUnfinished": "任务 {taskId} 的 {count} 个历史 depends_on 尚未完成，已忽略并继续执行（{dependencies}）",

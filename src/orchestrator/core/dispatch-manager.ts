@@ -1277,6 +1277,7 @@ export class DispatchManager {
   ): Promise<void> {
     const emitWorkerInstruction = options?.emitWorkerInstruction ?? true;
     const { taskId, worker, taskContract } = entry;
+    const preferredWorker = worker;
     const {
       taskTitle,
       category,
@@ -1291,7 +1292,7 @@ export class DispatchManager {
     const constraints = requirementAnalysis.constraints || [];
     const requiresModification = requirementAnalysis.requiresModification === true;
     const batch = this.activeBatch;
-    const executionRouting = this.resolveExecutionWorker(worker);
+    const executionRouting = this.resolveExecutionWorker(preferredWorker);
     if (!executionRouting.ok) {
       const errorMsg = executionRouting.error;
       batch?.markFailed(taskId, { success: false, summary: errorMsg, errors: [errorMsg] });
@@ -1299,23 +1300,23 @@ export class DispatchManager {
         id: taskId,
         title: taskTitle,
         status: 'failed',
-        worker,
+        worker: preferredWorker,
         summary: errorMsg,
         error: errorMsg,
       });
       return;
     }
 
-    const effectiveWorker = executionRouting.selectedWorker;
-    if (effectiveWorker !== worker) {
-      const entry = batch?.getEntry(taskId);
-      if (entry) {
-        entry.worker = effectiveWorker;
+    let effectiveWorker = executionRouting.selectedWorker;
+    if (effectiveWorker !== preferredWorker) {
+      const batchEntry = batch?.getEntry(taskId);
+      if (batchEntry) {
+        batchEntry.worker = effectiveWorker;
       }
       this.deps.messageHub.notify(
         t('dispatch.notify.executionRoutingAdjusted', {
           taskId,
-          fromWorker: worker,
+          fromWorker: preferredWorker,
           toWorker: effectiveWorker,
           routingReason: executionRouting.routingReason,
         }),
@@ -1323,14 +1324,11 @@ export class DispatchManager {
       );
       logger.warn('Dispatch.Worker.执行前改派', {
         taskId,
-        from: worker,
+        from: preferredWorker,
         to: effectiveWorker,
         reason: executionRouting.routingReason,
       }, LogCategory.ORCHESTRATOR);
     }
-
-    const { resumeSessionId, resumePrompt } = this.getResumeContextForWorker(effectiveWorker);
-    const protocolState = this.registerProtocolState(taskId, batch?.id, effectiveWorker);
 
     // 标记开始运行
     batch?.markRunning(taskId);
@@ -1346,10 +1344,9 @@ export class DispatchManager {
       this.emitWorkerLaneInstructionCard(entry, effectiveWorker, batch);
     }
 
+    let lastDispatchAttemptId: string | undefined;
+    const reservedFailoverWorkers = new Set<WorkerSlot>();
     try {
-      // 确保 Worker 存在
-      const workerInstance = await this.deps.missionOrchestrator.ensureWorkerForDispatch(effectiveWorker);
-
       // 构建轻量 Assignment
       const missionId = batch?.id || 'dispatch';
       const assignmentAcceptanceCriteria = this.buildAssignmentAcceptanceCriteria(acceptance);
@@ -1430,51 +1427,210 @@ export class DispatchManager {
       const enableWriteGovernance = hasFiles && requiresModification;
       const enableSnapshot = requiresModification && snapshotManager != null;
 
-      // 通过 WorkerPipeline 统一执行
-      this.activeAssignments.set(taskId, assignment);
       let pipelineResult;
-      try {
-        const currentSessionId = this.deps.getCurrentSessionId();
-        pipelineResult = await this.pipeline.execute({
-          assignment,
-          workerInstance,
-          adapterFactory: this.deps.adapterFactory,
-          workspaceRoot: this.deps.workspaceRoot,
-          projectContext,
-          // 与 Todo/Assignment 使用同一真实 missionId，避免终止快照作用域错位。
-          missionId,
-          requestId: batch?.requestId,
-          sessionId: currentSessionId,
-          onReport: (report) => this.handleDispatchWorkerReport(report, batch),
-          cancellationToken: batch?.cancellationToken,
-          heartbeatIntervalMs: DispatchManager.HEARTBEAT_INTERVAL_MS,
-          imagePaths: this.deps.getActiveImagePaths(),
-          // 反应式编排：补充指令回调（Worker 决策点消费队列中的用户追加指令）
-          getSupplementaryInstructions: () => {
-            const queue = this.deps.getSupplementaryQueue();
-            return queue ? queue.consume(effectiveWorker) : [];
-          },
-          resumeSessionId,
-          resumePrompt,
-          // 治理开关（仅写任务启用强制写入相关治理）
-          enableSnapshot,
-          enableLSP: enableWriteGovernance,
-          enableTargetEnforce: enableWriteGovernance,
-          enableContextUpdate: contextManager != null,
-          snapshotManager,
-          contextManager,
-          todoManager: this.deps.getTodoManager(),
-          worktreeManager: this.worktreeManager,
-        });
-      } finally {
-        this.activeAssignments.delete(taskId);
+      const attemptedWorkers = new Set<WorkerSlot>();
+      let currentRoutingReason = executionRouting.routingReason;
+
+      while (true) {
+        attemptedWorkers.add(effectiveWorker);
+        assignment.workerId = effectiveWorker;
+        assignment.assignmentReason = {
+          ...assignment.assignmentReason,
+          explanation: currentRoutingReason,
+        };
+        const batchEntry = batch?.getEntry(taskId);
+        if (batchEntry) {
+          batchEntry.worker = effectiveWorker;
+        }
+
+        const { resumeSessionId, resumePrompt } = this.getResumeContextForWorker(effectiveWorker);
+        const protocolState = this.registerProtocolState(taskId, batch?.id, effectiveWorker);
+        lastDispatchAttemptId = protocolState.dispatchAttemptId;
+
+        try {
+          const workerInstance = await this.deps.missionOrchestrator.ensureWorkerForDispatch(effectiveWorker);
+          this.activeAssignments.set(taskId, assignment);
+          try {
+            const currentSessionId = this.deps.getCurrentSessionId();
+            pipelineResult = await this.pipeline.execute({
+              assignment,
+              workerInstance,
+              adapterFactory: this.deps.adapterFactory,
+              workspaceRoot: this.deps.workspaceRoot,
+              projectContext,
+              // 与 Todo/Assignment 使用同一真实 missionId，避免终止快照作用域错位。
+              missionId,
+              requestId: batch?.requestId,
+              sessionId: currentSessionId,
+              onReport: (report) => this.handleDispatchWorkerReport(report, batch),
+              cancellationToken: batch?.cancellationToken,
+              heartbeatIntervalMs: DispatchManager.HEARTBEAT_INTERVAL_MS,
+              imagePaths: this.deps.getActiveImagePaths(),
+              // 反应式编排：补充指令回调（Worker 决策点消费队列中的用户追加指令）
+              getSupplementaryInstructions: () => {
+                const queue = this.deps.getSupplementaryQueue();
+                return queue ? queue.consume(effectiveWorker) : [];
+              },
+              resumeSessionId,
+              resumePrompt,
+              // 治理开关（仅写任务启用强制写入相关治理）
+              enableSnapshot,
+              enableLSP: enableWriteGovernance,
+              enableTargetEnforce: enableWriteGovernance,
+              enableContextUpdate: contextManager != null,
+              snapshotManager,
+              contextManager,
+              todoManager: this.deps.getTodoManager(),
+              worktreeManager: this.worktreeManager,
+            });
+          } finally {
+            this.activeAssignments.delete(taskId);
+          }
+
+          this.routingService.clearWorkerRuntimeUnavailable(effectiveWorker);
+          break;
+        } catch (error: any) {
+          if (error instanceof CancellationError || error?.isCancellation) {
+            this.markProtocolNack(taskId, error.message || 'cancelled');
+            const currentEntry = batch?.getEntry(taskId);
+            const shouldUpdateCard = !currentEntry || !isTerminalStatus(currentEntry.status);
+            if (!shouldUpdateCard && currentEntry) {
+              logger.warn('Dispatch.Worker.终态已存在_跳过取消卡片', {
+                taskId,
+                worker: effectiveWorker,
+                status: currentEntry.status,
+              }, LogCategory.ORCHESTRATOR);
+            }
+            if (shouldUpdateCard) {
+              this.emitSubTaskCard({
+                id: taskId,
+                title: taskTitle,
+                status: 'stopped',
+                worker: effectiveWorker,
+                summary: error.message,
+              });
+            }
+            logger.info('编排工具.worker_dispatch.Worker取消', {
+              worker: effectiveWorker, taskId, reason: error.message,
+            }, LogCategory.ORCHESTRATOR);
+            return;
+          }
+
+          const rawErrorMsg = error?.message || String(error);
+          const userErrorMsg = toModelOriginUserMessage(rawErrorMsg).trim() || rawErrorMsg;
+          this.markProtocolNack(taskId, userErrorMsg);
+          if (isModelOriginIssue(rawErrorMsg) || isModelOriginIssue(userErrorMsg)) {
+            trackModelOriginEvent('surfaced', 'dispatch:worker-failed', rawErrorMsg, {
+              worker: effectiveWorker,
+              taskId,
+            });
+          }
+
+          const runtimeUnavailable = this.routingService.shouldMarkRuntimeUnavailable(rawErrorMsg);
+          if (runtimeUnavailable) {
+            this.routingService.markWorkerRuntimeUnavailable(effectiveWorker, rawErrorMsg);
+            logger.warn('Dispatch.Worker.运行时不可用.已标记冷却', {
+              worker: effectiveWorker,
+              taskId,
+              reason: rawErrorMsg,
+              surfacedReason: userErrorMsg,
+            }, LogCategory.ORCHESTRATOR);
+          } else {
+            logger.warn('Dispatch.Worker.业务失败.不标记冷却', {
+              worker: effectiveWorker,
+              taskId,
+              reason: rawErrorMsg,
+              surfacedReason: userErrorMsg,
+            }, LogCategory.ORCHESTRATOR);
+          }
+
+          const canAutoFailover = runtimeUnavailable
+            && this.routingService.shouldAutoFailoverRuntime(rawErrorMsg);
+          if (canAutoFailover) {
+            const retryRouting = this.resolveExecutionWorker(preferredWorker, {
+              busyWorkers: new Set<WorkerSlot>(this.activeWorkerLanes),
+              excludedWorkers: attemptedWorkers,
+            });
+            if (retryRouting.ok && retryRouting.selectedWorker !== effectiveWorker) {
+              const previousWorker = effectiveWorker;
+              this.releaseReservedFailoverLane(previousWorker, reservedFailoverWorkers);
+              effectiveWorker = retryRouting.selectedWorker;
+              currentRoutingReason = retryRouting.routingReason;
+              this.reserveFailoverLane(effectiveWorker, preferredWorker, reservedFailoverWorkers);
+              this.clearWorkerSessionsSafe(previousWorker);
+              const retryEntry = batch?.getEntry(taskId);
+              if (retryEntry) {
+                retryEntry.worker = effectiveWorker;
+              }
+              this.deps.messageHub.notify(
+                t('dispatch.notify.runtimeExecutionFailover', {
+                  taskId,
+                  fromWorker: previousWorker,
+                  toWorker: effectiveWorker,
+                  reason: userErrorMsg,
+                }),
+                'warning',
+              );
+              this.emitSubTaskCard({
+                id: taskId,
+                title: taskTitle,
+                status: 'running',
+                worker: effectiveWorker,
+              });
+              logger.warn('Dispatch.Worker.运行中自动改派', {
+                taskId,
+                from: previousWorker,
+                to: effectiveWorker,
+                reason: userErrorMsg,
+                routingReason: retryRouting.routingReason,
+              }, LogCategory.ORCHESTRATOR);
+              continue;
+            }
+          }
+
+          const currentEntry = batch?.getEntry(taskId);
+          const shouldUpdateCard = !currentEntry || !isTerminalStatus(currentEntry.status);
+          if (!shouldUpdateCard && currentEntry) {
+            logger.warn('Dispatch.Worker.终态已存在_跳过失败卡片', {
+              taskId,
+              worker: effectiveWorker,
+              status: currentEntry.status,
+            }, LogCategory.ORCHESTRATOR);
+          }
+          if (shouldUpdateCard) {
+            batch?.markFailed(taskId, { success: false, summary: userErrorMsg, errors: [userErrorMsg] });
+            this.emitSubTaskCard({
+              id: taskId,
+              title: taskTitle,
+              status: 'failed',
+              worker: effectiveWorker,
+              summary: userErrorMsg,
+              error: userErrorMsg,
+            });
+
+            this.deps.messageHub.workerError(
+              effectiveWorker,
+              userErrorMsg,
+            );
+          }
+
+          this.clearWorkerSessionsSafe(effectiveWorker);
+
+          logger.error('编排工具.worker_dispatch.Worker失败', {
+            worker: effectiveWorker,
+            taskId,
+            error: rawErrorMsg,
+            surfacedError: userErrorMsg,
+            dispatchAttemptId: lastDispatchAttemptId,
+          }, LogCategory.ORCHESTRATOR);
+          return;
+        }
       }
 
       const result = pipelineResult.executionResult;
       if (result.sessionId) {
         this.recordMissionWorkerSession(missionId, effectiveWorker, result.sessionId);
       }
-      this.routingService.clearWorkerRuntimeUnavailable(effectiveWorker);
 
       // 直接使用 Worker 生成的结构化总结（唯一生产者：AutonomousWorker.buildStructuredSummary）
       const verificationWarnings = result.verification.degraded
@@ -1548,101 +1704,43 @@ export class DispatchManager {
       logger.info('编排工具.worker_dispatch.Worker完成', {
         worker: effectiveWorker, taskId, success: result.success, summary,
       }, LogCategory.ORCHESTRATOR);
-    } catch (error: any) {
-      // C-09: 取消异常不按失败处理，cancelAll 已标记 cancelled 状态
-      if (error instanceof CancellationError || error?.isCancellation) {
-        this.markProtocolNack(taskId, error.message || 'cancelled');
-        const entry = batch?.getEntry(taskId);
-        const shouldUpdateCard = !entry || !isTerminalStatus(entry.status);
-        if (!shouldUpdateCard && entry) {
-          logger.warn('Dispatch.Worker.终态已存在_跳过取消卡片', {
-            taskId,
-            worker: effectiveWorker,
-            status: entry.status,
-          }, LogCategory.ORCHESTRATOR);
-        }
-        if (shouldUpdateCard) {
-          this.emitSubTaskCard({
-            id: taskId,
-            title: taskTitle,
-            status: 'stopped',
-            worker: effectiveWorker,
-            summary: error.message,
-          });
-        }
-        logger.info('编排工具.worker_dispatch.Worker取消', {
-          worker: effectiveWorker, taskId, reason: error.message,
-        }, LogCategory.ORCHESTRATOR);
-        return;
-      }
-
-      const rawErrorMsg = error?.message || String(error);
-      const userErrorMsg = toModelOriginUserMessage(rawErrorMsg).trim() || rawErrorMsg;
-      this.markProtocolNack(taskId, userErrorMsg);
-      if (isModelOriginIssue(rawErrorMsg) || isModelOriginIssue(userErrorMsg)) {
-        trackModelOriginEvent('surfaced', 'dispatch:worker-failed', rawErrorMsg, {
-          worker: effectiveWorker,
-          taskId,
-        });
-      }
-      if (this.routingService.shouldMarkRuntimeUnavailable(rawErrorMsg)) {
-        this.routingService.markWorkerRuntimeUnavailable(effectiveWorker, rawErrorMsg);
-        logger.warn('Dispatch.Worker.运行时不可用.已标记冷却', {
-          worker: effectiveWorker,
-          taskId,
-          reason: rawErrorMsg,
-          surfacedReason: userErrorMsg,
-        }, LogCategory.ORCHESTRATOR);
-      } else {
-        logger.warn('Dispatch.Worker.业务失败.不标记冷却', {
-          worker: effectiveWorker,
-          taskId,
-          reason: rawErrorMsg,
-          surfacedReason: userErrorMsg,
-        }, LogCategory.ORCHESTRATOR);
-      }
-
-      const entry = batch?.getEntry(taskId);
-      const shouldUpdateCard = !entry || !isTerminalStatus(entry.status);
-      if (!shouldUpdateCard && entry) {
-        logger.warn('Dispatch.Worker.终态已存在_跳过失败卡片', {
-          taskId,
-          worker: effectiveWorker,
-          status: entry.status,
-        }, LogCategory.ORCHESTRATOR);
-      }
-      if (shouldUpdateCard) {
-        batch?.markFailed(taskId, { success: false, summary: userErrorMsg, errors: [userErrorMsg] });
-        this.emitSubTaskCard({
-          id: taskId,
-          title: taskTitle,
-          status: 'failed',
-          worker: effectiveWorker,
-          summary: userErrorMsg,
-          error: userErrorMsg,
-        });
-
-        this.deps.messageHub.workerError(
-          effectiveWorker,
-          userErrorMsg,
-        );
-      }
-
-      // C-15: Worker 崩溃后状态清理
-      try {
-        const workerInstance = this.deps.missionOrchestrator.getWorker(effectiveWorker);
-        workerInstance?.clearAllSessions();
-      } catch { /* 清理失败不阻塞 */ }
-
-      logger.error('编排工具.worker_dispatch.Worker失败', {
-        worker: effectiveWorker,
-        taskId,
-        error: rawErrorMsg,
-        surfacedError: userErrorMsg,
-        dispatchAttemptId: protocolState.dispatchAttemptId,
-      }, LogCategory.ORCHESTRATOR);
     } finally {
+      for (const reservedWorker of reservedFailoverWorkers) {
+        this.activeWorkerLanes.delete(reservedWorker);
+      }
       this.clearProtocolState(taskId);
+    }
+  }
+
+  private reserveFailoverLane(
+    worker: WorkerSlot,
+    preferredWorker: WorkerSlot,
+    reservedWorkers: Set<WorkerSlot>,
+  ): void {
+    if (worker === preferredWorker || this.activeWorkerLanes.has(worker)) {
+      return;
+    }
+    this.activeWorkerLanes.add(worker);
+    reservedWorkers.add(worker);
+  }
+
+  private releaseReservedFailoverLane(
+    worker: WorkerSlot,
+    reservedWorkers: Set<WorkerSlot>,
+  ): void {
+    if (!reservedWorkers.has(worker)) {
+      return;
+    }
+    reservedWorkers.delete(worker);
+    this.activeWorkerLanes.delete(worker);
+  }
+
+  private clearWorkerSessionsSafe(worker: WorkerSlot): void {
+    try {
+      const workerInstance = this.deps.missionOrchestrator.getWorker(worker);
+      workerInstance?.clearAllSessions();
+    } catch {
+      // 清理失败不阻塞主流程
     }
   }
 

@@ -71,6 +71,18 @@ export class DispatchRoutingService {
     return infraErrorPattern.test(normalized);
   }
 
+  shouldAutoFailoverRuntime(errorMessage: string): boolean {
+    const normalized = (errorMessage || '').toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+
+    const transientInfraErrorPattern =
+      /rate limit|limit exceeded|限流|timeout|timed out|超时|network|connection|fetch failed|socket|econnreset|econnrefused|enotfound|eai_again|tls|certificate|overloaded|service unavailable|502|503|504/;
+
+    return transientInfraErrorPattern.test(normalized);
+  }
+
   resolveDispatchRouting(
     goal: string,
     explicitCategory?: string,
@@ -303,4 +315,3 @@ export class DispatchRoutingService {
       .find(worker => availableWorkers.has(worker));
   }
 }
-
