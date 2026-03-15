@@ -14,6 +14,8 @@
 
   let { toolCall, status = 'running', initialExpanded = true }: Props = $props();
   let collapsed = $state(untrack(() => !initialExpanded && status !== 'error'));
+  // 用户是否手动操作过折叠状态
+  let userToggled = $state(false);
 
   function parseJson(content?: string): Record<string, unknown> | null {
     const parsed = parseLeadingJson(content);
@@ -37,6 +39,7 @@
 
   function toggle(): void {
     collapsed = !collapsed;
+    userToggled = true;
   }
 
   const parsedResult = $derived(parseJson(toolCall?.result));
@@ -97,6 +100,17 @@
   });
 
   const showStatusPulse = $derived(statusClass === 'running' || statusClass === 'pending');
+
+  // 运行时自动展开，完成后自动折叠（用户手动操作过则不干预）
+  $effect(() => {
+    const sc = statusClass;
+    if (userToggled) return;
+    if (sc === 'running' || sc === 'pending') {
+      collapsed = false;
+    } else if (sc === 'success' || sc === 'error') {
+      collapsed = true;
+    }
+  });
   const titleText = $derived(i18n.t('terminalSession.title', { id: terminalId ?? '-' }));
   const toolNameLabel = $derived(getTerminalToolDisplayName(toolCall?.name));
   const toolSummary = $derived(displayCommand?.trim() || '');
