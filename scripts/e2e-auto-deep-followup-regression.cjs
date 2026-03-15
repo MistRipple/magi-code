@@ -95,6 +95,14 @@ function verifySourceGuardrails() {
     source.includes('markPhaseRuntimeRunning'),
     '自动续跑未推进显式阶段运行态',
   );
+  assert(
+    source.includes('const nextRemaining = queue.slice(1);'),
+    '阶段运行态进入下一阶段时未消费已启动的 phase 队列',
+  );
+  assert(
+    source.includes('const phaseRuntime = this.getCurrentPlanPhaseRuntime(this.currentSessionId);'),
+    '续跑轮起点未挂接当前阶段运行态元数据',
+  );
 }
 
 function loadCompiledModule(relPath) {

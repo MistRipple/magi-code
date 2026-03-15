@@ -4202,18 +4202,26 @@ export class MissionDrivenEngine extends EventEmitter {
     }
     const currentPlan = this.planLedger.getPlan(input.sessionId, this.currentPlanId);
     const steps = input.followUpSteps.filter((item) => item.trim().length > 0);
-    const activeStep = steps[0] || currentPlan?.runtime.phase.nextTitle;
+    const currentPhase = currentPlan?.runtime.phase;
+    const queue = steps.length > 0
+      ? steps
+      : (currentPhase?.remainingPhases || []);
+    const activeStep = queue[0] || currentPhase?.nextTitle || currentPhase?.currentTitle;
     const descriptor = activeStep ? this.extractPhaseDescriptor(activeStep) : null;
+    const nextRemaining = queue.slice(1);
+    const nextDescriptor = nextRemaining.length > 0
+      ? this.extractPhaseDescriptor(nextRemaining[0])
+      : null;
     try {
       await this.planLedger.updateRuntimeState(input.sessionId, this.currentPlanId, {
         phase: {
           state: 'running',
-          currentIndex: descriptor?.index ?? currentPlan?.runtime.phase.nextIndex ?? currentPlan?.runtime.phase.currentIndex,
-          currentTitle: descriptor?.title ?? currentPlan?.runtime.phase.nextTitle ?? currentPlan?.runtime.phase.currentTitle,
-          nextIndex: currentPlan?.runtime.phase.nextIndex,
-          nextTitle: currentPlan?.runtime.phase.nextTitle,
-          remainingPhases: steps.length > 0 ? steps : (currentPlan?.runtime.phase.remainingPhases || []),
-          continuationIntent: (steps.length > 0 || (currentPlan?.runtime.phase.remainingPhases.length || 0) > 0)
+          currentIndex: descriptor?.index ?? currentPhase?.nextIndex ?? currentPhase?.currentIndex,
+          currentTitle: descriptor?.title ?? currentPhase?.nextTitle ?? currentPhase?.currentTitle,
+          nextIndex: nextDescriptor?.index,
+          nextTitle: nextDescriptor?.title,
+          remainingPhases: nextRemaining,
+          continuationIntent: nextRemaining.length > 0
             ? 'continue'
             : 'stop',
         },
@@ -4293,15 +4301,30 @@ export class MissionDrivenEngine extends EventEmitter {
     message: string;
   }): string {
     const requestId = `req_${input.kind}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const phaseRuntime = this.getCurrentPlanPhaseRuntime(this.currentSessionId);
     this.messageHub.beginSyntheticRound(requestId, input.message, {
       phase: 'synthetic_execution_round',
       extra: {
         type: input.kind,
         round: input.round,
         syntheticRequest: true,
+        currentPhaseIndex: phaseRuntime?.currentIndex,
+        currentPhaseTitle: phaseRuntime?.currentTitle,
+        nextPhaseIndex: phaseRuntime?.nextIndex,
+        nextPhaseTitle: phaseRuntime?.nextTitle,
+        continuationIntent: phaseRuntime?.continuationIntent,
       },
     });
     return requestId;
+  }
+
+  private getCurrentPlanPhaseRuntime(sessionId?: string): PlanRuntimePhaseState | undefined {
+    const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+    const normalizedPlanId = typeof this.currentPlanId === 'string' ? this.currentPlanId.trim() : '';
+    if (!normalizedSessionId || !normalizedPlanId) {
+      return undefined;
+    }
+    return this.planLedger.getPlan(normalizedSessionId, normalizedPlanId)?.runtime.phase;
   }
 
   private captureRequestMessageSummary(requestId?: string): RequestMessageSummary | undefined {
