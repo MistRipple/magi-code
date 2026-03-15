@@ -2,6 +2,7 @@
 out/
 dist/
 build/
+docs/
 
 # Dependencies
 node_modules/
