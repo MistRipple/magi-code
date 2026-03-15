@@ -287,14 +287,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
   /**
    * 静默发送消息：直接用底层 client 非流式调用，不触发 normalizer/emit/UI 推送。
-   * 适用于内部自检等不需要展示给用户的场景。
-   * 对话历史会正常更新，确保后续调用的上下文连贯。
+   * 适用于验收检查等内部自检场景。
+   * 注意：静默调用必须与用户可见对话历史隔离，严禁把内部 JSON 结果写回正式会话。
    */
   async sendSilentMessage(message: string): Promise<string> {
-    this.conversationHistory.push({ role: 'user', content: message });
+    const silentHistory = [...this.conversationHistory, { role: 'user' as const, content: message }];
 
     const response = await this.client.sendMessage({
-      messages: this.conversationHistory,
+      messages: silentHistory,
       systemPrompt: this.systemPrompt,
       maxTokens: 4096,
       temperature: 0.7,
@@ -302,7 +302,6 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     });
 
     const content = response.content || '';
-    this.conversationHistory.push({ role: 'assistant', content });
     this.recordTokenUsage(response.usage);
 
     return content;
@@ -416,6 +415,25 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
       // 创建 AbortController，供 interrupt() 中断 LLM 请求
       this.abortController = new AbortController();
+      const persistentVisibleStreamId = this.startStreamWithContext();
+      let persistentVisibleStreamFinished = false;
+      const endIntermediateRoundStream = (): void => {
+        // 同一 Worker 执行轮的内部工具循环应聚合在同一条可见消息里。
+      };
+      const endVisibleStreamWithError = (errorMessage: string): void => {
+        if (persistentVisibleStreamFinished) {
+          return;
+        }
+        this.normalizer.endStream(persistentVisibleStreamId, errorMessage);
+        persistentVisibleStreamFinished = true;
+      };
+      const finishPersistentVisibleStream = (): void => {
+        if (persistentVisibleStreamFinished) {
+          return;
+        }
+        this.normalizer.endStream(persistentVisibleStreamId);
+        persistentVisibleStreamFinished = true;
+      };
 
       let round = 0;
       while (true) {
@@ -443,11 +461,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         this.seenThinking = false;
         this.decisionHookAppliedForThinking = false;
 
-        // 只有首轮使用 startStreamWithContext 绑定 placeholder messageId，
-        // 后续轮次生成新 messageId，避免复用同一个 ID 导致 Pipeline 重新激活覆盖前一轮内容
-        const streamId = round === 0
-          ? this.startStreamWithContext()
-          : this.normalizer.startStream(this.currentTraceId!);
+        const streamId = persistentVisibleStreamId;
 
         const params: LLMMessageParams = {
           messages: this.conversationHistory,
@@ -497,6 +511,15 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
               this.seenThinking = true;
             } else if (chunk.type === 'tool_call_start' && chunk.toolCall) {
               sawToolCallSignal = true;
+              if (chunk.toolCall.id && chunk.toolCall.name) {
+                this.normalizer.addToolCall(streamId, {
+                  type: 'tool_call',
+                  toolName: chunk.toolCall.name,
+                  toolId: chunk.toolCall.id,
+                  status: 'running',
+                  input: JSON.stringify(chunk.toolCall.arguments || {}, null, 2),
+                });
+              }
               this.emit('toolCall', chunk.toolCall.name || '', chunk.toolCall.arguments || {});
               this.applyDecisionHook({
                 type: 'tool_call',
@@ -543,7 +566,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
               });
             }
 
-            this.normalizer.endStream(streamId);
+            endIntermediateRoundStream();
             round++;
             continue;
           }
@@ -565,7 +588,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
             finalText = assistantText.trim()
               ? assistantText
               : '工具执行已完成，但模型未输出文本结论。请查看上方工具结果。';
-            this.normalizer.endStream(streamId);
+            endIntermediateRoundStream();
             break;
           }
 
@@ -581,7 +604,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
           // 中断检查：工具执行完成后立即检测 abort，跳过后续处理直接退出循环
           if (this.abortController?.signal.aborted) {
-            this.normalizer.endStream(streamId);
+            endIntermediateRoundStream();
             break;
           }
 
@@ -636,7 +659,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
             if (totalFailures >= sc.totalFailLimit) {
               // 累计失败达到上限 → 终止
               finalText = assistantText || `工具调用累计失败 ${sc.totalFailLimit} 轮，判定为异常终止。`;
-              this.normalizer.endStream(streamId);
+              endIntermediateRoundStream();
               break;
             }
 
@@ -808,7 +831,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           });
 
           // 当轮 stream 结束，下一轮开启新 stream
-          this.normalizer.endStream(streamId);
+          endIntermediateRoundStream();
           round++;
         } catch (error: any) {
           const errorMessage = toErrorMessage(error);
@@ -847,12 +870,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
               interruptedAfterToolSignal,
               error: errorMessage.substring(0, 300),
             }, LogCategory.LLM);
-            this.normalizer.endStream(streamId);
+            endIntermediateRoundStream();
             round++;
             continue;
           }
 
-          this.normalizer.endStream(streamId, errorMessage || 'Request failed');
+          endVisibleStreamWithError(errorMessage || 'Request failed');
           // abort 中断不视为异常，优雅退出循环
           if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
             break;
@@ -860,6 +883,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           throw error;
         }
       }
+      finishPersistentVisibleStream();
 
       this.setState(AdapterState.CONNECTED);
 

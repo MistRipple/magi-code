@@ -1077,6 +1077,33 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
 
       // 创建 AbortController，供 interrupt() 中断 LLM 请求
       this.abortController = new AbortController();
+      const usesPersistentVisibleStream = visibility !== 'system';
+      const persistentVisibleStreamId = usesPersistentVisibleStream
+        ? this.startStreamWithContext()
+        : undefined;
+      let persistentVisibleStreamFinished = false;
+      const endIntermediateRoundStream = (streamId: string): void => {
+        if (!usesPersistentVisibleStream) {
+          this.normalizer.endStream(streamId);
+        }
+      };
+      const endVisibleStreamWithError = (streamId: string, errorMessage: string): void => {
+        if (usesPersistentVisibleStream) {
+          if (!persistentVisibleStreamFinished && persistentVisibleStreamId) {
+            this.normalizer.endStream(persistentVisibleStreamId, errorMessage);
+            persistentVisibleStreamFinished = true;
+          }
+          return;
+        }
+        this.normalizer.endStream(streamId, errorMessage);
+      };
+      const finishPersistentVisibleStream = (): void => {
+        if (!usesPersistentVisibleStream || persistentVisibleStreamFinished || !persistentVisibleStreamId) {
+          return;
+        }
+        this.normalizer.endStream(persistentVisibleStreamId);
+        persistentVisibleStreamFinished = true;
+      };
 
       let round = 0;
       while (true) {
@@ -1092,13 +1119,9 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           this.truncateHistoryIfNeeded();
         }
 
-        // 只有首轮使用 startStreamWithContext 绑定 placeholder messageId，
-        // 后续轮次生成新 messageId，避免复用同一个 ID 导致 Pipeline 重新激活覆盖前一轮内容
         const streamId = visibility === 'system'
           ? this.normalizer.startStream(this.currentTraceId!, undefined, undefined, 'system')
-          : round === 0
-            ? this.startStreamWithContext()
-            : this.normalizer.startStream(this.currentTraceId!);
+          : persistentVisibleStreamId!;
 
         const params: LLMMessageParams = {
           messages: history,
@@ -1153,6 +1176,15 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               this.emit('thinking', chunk.thinking);
             } else if (chunk.type === 'tool_call_start' && chunk.toolCall) {
               sawToolCallSignal = true;
+              if (chunk.toolCall.id && chunk.toolCall.name) {
+                this.normalizer.addToolCall(streamId, {
+                  type: 'tool_call',
+                  toolName: chunk.toolCall.name,
+                  toolId: chunk.toolCall.id,
+                  status: 'running',
+                  input: JSON.stringify(chunk.toolCall.arguments || {}, null, 2),
+                });
+              }
               this.emit('toolCall', chunk.toolCall.name || '', chunk.toolCall.arguments || {});
             }
           });
@@ -1216,7 +1248,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               });
             }
 
-            this.normalizer.endStream(streamId);
+            endIntermediateRoundStream(streamId);
             round++;
             continue;
           }
@@ -1290,7 +1322,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                   missingText: !assistantText.trim(),
                   missingOutcome: missingTerminalOutcome,
                 }, LogCategory.LLM);
-                this.normalizer.endStream(streamId);
+                endIntermediateRoundStream(streamId);
                 round++;
                 continue;
               }
@@ -1329,7 +1361,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                 ),
                 note: 'pending_terminal_reason_resolved',
               }));
-              this.normalizer.endStream(streamId);
+              endIntermediateRoundStream(streamId);
               break;
             }
 
@@ -1352,7 +1384,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                   role: 'user',
                   content: this.buildContinuePrompt(progressState.snapshot),
                 });
-                this.normalizer.endStream(streamId);
+                endIntermediateRoundStream(streamId);
                 round++;
                 continue;
               } else if (!hasOutcomeSignal) {
@@ -1364,7 +1396,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                     role: 'user',
                     content: this.buildOutcomeBlockRequestPrompt(),
                   });
-                  this.normalizer.endStream(streamId);
+                  endIntermediateRoundStream(streamId);
                   round++;
                   continue;
                 }
@@ -1426,7 +1458,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                 assistantText,
               });
               finalText = assistantText.trim() ? assistantText : (finalText || lastNonEmptyAssistantText);
-              this.normalizer.endStream(streamId);
+              endIntermediateRoundStream(streamId);
               break;
             }
 
@@ -1434,7 +1466,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               role: 'user',
               content: this.buildContinuePrompt(progressState.snapshot),
             });
-            this.normalizer.endStream(streamId);
+            endIntermediateRoundStream(streamId);
             round++;
             continue;
           }
@@ -1449,7 +1481,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
 
           // 中断检查：工具执行完成后立即检测 abort，跳过后续处理直接退出循环
           if (this.abortController?.signal.aborted) {
-            this.normalizer.endStream(streamId);
+            endIntermediateRoundStream(streamId);
             terminationReason = 'external_abort';
             break;
           }
@@ -1533,7 +1565,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                 role: 'user',
                 content: this.buildNoTodoToolLoopPrompt(noTodoToolRoundStreak, repeatedNoTodoToolSignatureStreak),
               });
-              this.normalizer.endStream(streamId);
+              endIntermediateRoundStream(streamId);
               round++;
               continue;
             }
@@ -1594,7 +1626,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                 role: 'user',
                 content: this.buildTerminalSynthesisPrompt(resolved.reason, progressState.snapshot),
               });
-              this.normalizer.endStream(streamId);
+              endIntermediateRoundStream(streamId);
               round++;
               continue;
             }
@@ -1610,7 +1642,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               assistantText,
             });
             finalText = assistantText.trim() ? assistantText : (finalText || lastNonEmptyAssistantText);
-            this.normalizer.endStream(streamId);
+            endIntermediateRoundStream(streamId);
             break;
           }
 
@@ -1624,7 +1656,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           }));
 
           // 当轮 stream 结束，工具副作用（subTaskCard 等）已自然排在后面
-          this.normalizer.endStream(streamId);
+          endIntermediateRoundStream(streamId);
           round++;
         } catch (error: any) {
           const errorMessage = toErrorMessage(error);
@@ -1659,12 +1691,12 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               interruptedAfterToolSignal,
               error: errorMessage.substring(0, 300),
             }, LogCategory.LLM);
-            this.normalizer.endStream(streamId);
+            endIntermediateRoundStream(streamId);
             round++;
             continue;
           }
 
-          this.normalizer.endStream(streamId, errorMessage || 'Request failed');
+          endVisibleStreamWithError(streamId, errorMessage || 'Request failed');
           // abort 中断不视为异常，优雅退出循环
           if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
             terminationReason = 'external_abort';
@@ -1673,6 +1705,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           throw error;
         }
       }
+      finishPersistentVisibleStream();
 
       // abort 中断时不要求必须有内容
       if (!finalText.trim() && !this.abortController?.signal.aborted) {

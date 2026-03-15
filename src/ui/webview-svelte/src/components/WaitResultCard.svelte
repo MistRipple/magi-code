@@ -180,9 +180,6 @@
               <span>{i18n.t(sm.labelKey)}</span>
             </span>
           </div>
-          {#if result.summary}
-            <div class="item-summary">{result.summary}</div>
-          {/if}
           <div class="item-meta">
             {#if result.modified_files && result.modified_files.length > 0}
               <span class="meta-tag"><Icon name="file" size={11} />{i18n.t('waitResultCard.fileChangeCount', { count: result.modified_files.length })}</span>

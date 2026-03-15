@@ -185,6 +185,11 @@ type AssignmentAbortSource = 'external';
  * AutonomousWorker - 自主 Worker
  */
 export class AutonomousWorker extends EventEmitter {
+  private static readonly LOW_SIGNAL_COMPLETION_SUMMARIES = new Set([
+    '工具执行已完成，但模型未输出文本结论。请查看上方工具结果。',
+    'Execution completed',
+  ]);
+
   private static readonly WRITE_REQUIRED_TODO_TYPES = new Set<UnifiedTodo['type']>([
     'implementation',
     'integration',
@@ -938,9 +943,7 @@ export class AutonomousWorker extends EventEmitter {
     // 1. 完成的工作
     if (result.completedTodos.length > 0) {
       const completedLines = result.completedTodos.map(t => {
-        const action = t.output?.summary
-          ? (t.output.summary.length > 120 ? t.output.summary.substring(0, 120) + '...' : t.output.summary)
-          : t.content;
+        const action = this.buildTodoDisplaySummary(t);
         return `- ${action}`;
       });
       sections.push(`Completed ${result.completedTodos.length} step(s):\n${completedLines.join('\n')}`);
@@ -949,7 +952,7 @@ export class AutonomousWorker extends EventEmitter {
     // 2. 失败的工作
     if (result.failedTodos.length > 0) {
       const failedLines = result.failedTodos.map(t => {
-        const reason = t.output?.summary || t.blockedReason || 'Unknown reason';
+        const reason = this.buildTodoDisplaySummary(t, t.blockedReason || 'Unknown reason');
         const shortReason = reason.length > 80 ? reason.substring(0, 80) + '...' : reason;
         return `- ${t.content}: ${shortReason}`;
       });
@@ -1006,7 +1009,7 @@ export class AutonomousWorker extends EventEmitter {
     // 2. 构建验收 prompt
     const completedWork = completedTodos
       .filter(t => !assignment.todos.some(c => c.parentId === t.id))
-      .map(t => `- ${t.content}: ${t.output?.summary || 'Completed'}`)
+      .map(t => `- ${t.content}: ${this.buildTodoDisplaySummary(t, 'Completed')}`)
       .join('\n');
 
     const criteriaList = acceptance
@@ -1359,6 +1362,42 @@ If any criterion is not satisfied:
       return '';
     }
     return content.trim().replace(/\s+/g, ' ').toLowerCase();
+  }
+
+  private buildTodoDisplaySummary(todo: UnifiedTodo, fallback?: string): string {
+    const rawSummary = typeof todo.output?.summary === 'string' ? todo.output.summary.trim() : '';
+    if (rawSummary && !this.isLowSignalTodoSummary(rawSummary) && !this.isPureAcceptanceJson(rawSummary)) {
+      return rawSummary.length > 120 ? `${rawSummary.substring(0, 120)}...` : rawSummary;
+    }
+
+    const modifiedFiles = Array.from(new Set((todo.output?.modifiedFiles || []).filter(Boolean)));
+    if (modifiedFiles.length > 0) {
+      const preview = modifiedFiles.slice(0, 3).join('、');
+      const suffix = modifiedFiles.length > 3 ? ` 等 ${modifiedFiles.length} 个文件` : '';
+      return `${todo.content}（修改：${preview}${suffix}）`;
+    }
+
+    return fallback || todo.content;
+  }
+
+  private isLowSignalTodoSummary(summary: string): boolean {
+    const normalized = summary.trim();
+    if (!normalized) {
+      return true;
+    }
+    if (AutonomousWorker.LOW_SIGNAL_COMPLETION_SUMMARIES.has(normalized)) {
+      return true;
+    }
+    const compact = normalized.replace(/\s+/g, ' ');
+    return compact.includes('工具执行已完成，但模型未输出文本结论');
+  }
+
+  private isPureAcceptanceJson(summary: string): boolean {
+    const trimmed = summary.trim();
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
+      return false;
+    }
+    return /"allSatisfied"\s*:/.test(trimmed) && /"gaps"\s*:/.test(trimmed);
   }
 
   private isTodoTerminal(todo: UnifiedTodo): boolean {

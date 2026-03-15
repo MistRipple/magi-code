@@ -1871,6 +1871,10 @@ export class MissionDrivenEngine extends EventEmitter {
       let continuationPolicyForMission: MissionContinuationPolicy | undefined;
       let continuationReasonForMission: string | undefined;
       let currentPlanMode: PlanMode = this.adapterFactory.isDeepTask() ? 'deep' : 'standard';
+      const rootRequestId = typeof requestId === 'string' && requestId.trim().length > 0
+        ? requestId.trim()
+        : `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      let currentRoundRequestId = rootRequestId;
 
       try {
         const resolvedSessionId = sessionId || this.sessionManager.getCurrentSession()?.id || taskId;
@@ -2196,20 +2200,9 @@ export class MissionDrivenEngine extends EventEmitter {
 
         // 5. 编排执行（支持交付失败后的自动修复闭环）
         while (true) {
-          const requestStatsBeforeRound = this.captureRequestMessageSummary(requestId);
-          if (autoRepairAttempt > 0 || autoFollowUpAttempt > 0) {
+          const requestStatsBeforeRound = this.captureRequestMessageSummary(currentRoundRequestId);
+          if (currentRoundRequestId !== rootRequestId) {
             this.dispatchManager.resetForNewExecutionCycle();
-            if (autoRepairAttempt > 0) {
-              this.messageHub.progress(
-                t('engine.delivery.autoRepairProgressTitle'),
-                t('engine.delivery.autoRepairProgressMessage', { round: autoRepairAttempt, maxRounds: autoRepairMaxRoundsLabel }),
-              );
-            } else {
-              this.messageHub.progress(
-                t('engine.followUp.autoContinueTitle'),
-                t('engine.followUp.autoContinueMessage', { round: autoFollowUpAttempt }),
-              );
-            }
           }
 
           deliveryStatusForMission = null;
@@ -2234,10 +2227,10 @@ export class MissionDrivenEngine extends EventEmitter {
               adapterRole: 'orchestrator',
               systemPrompt,
               includeToolCalls: true,
-              requestId,
+              requestId: currentRoundRequestId,
             }
           );
-          const requestStatsAfterRound = this.captureRequestMessageSummary(requestId);
+          const requestStatsAfterRound = this.captureRequestMessageSummary(currentRoundRequestId);
           orchestratorRuntimeReason = this.normalizeOrchestratorRuntimeReason(response.orchestratorRuntime?.reason);
           orchestratorRuntimeRounds = response.orchestratorRuntime?.rounds || 0;
           orchestratorRuntimeSnapshot = response.orchestratorRuntime?.snapshot as RuntimeTerminationSnapshot | undefined;
@@ -2710,6 +2703,14 @@ export class MissionDrivenEngine extends EventEmitter {
               t('engine.delivery.autoRepairScheduled', { round: autoRepairAttempt, maxRounds: autoRepairMaxRoundsLabel }),
               'warning',
             );
+            currentRoundRequestId = this.beginSyntheticExecutionRound({
+              kind: 'auto_repair',
+              round: autoRepairAttempt,
+              message: t('engine.delivery.autoRepairProgressMessage', {
+                round: autoRepairAttempt,
+                maxRounds: autoRepairMaxRoundsLabel,
+              }),
+            });
             promptForRound = autoRepairPrompt;
             continue;
           }
@@ -2761,6 +2762,16 @@ export class MissionDrivenEngine extends EventEmitter {
             if (delayMs > 0) {
               await new Promise((resolve) => setTimeout(resolve, delayMs));
             }
+            currentRoundRequestId = this.beginSyntheticExecutionRound({
+              kind: 'auto_governance_resume',
+              round: governanceRecoveryAttempt,
+              message: t('engine.governance.autoResumeScheduled', {
+                round: governanceRecoveryAttempt,
+                maxRounds: governanceRecoveryMaxRounds,
+                seconds: waitSeconds,
+                reason: reasonLabel,
+              }),
+            });
             promptForRound = this.buildGovernanceRecoveryPrompt({
               originalPrompt: trimmedPrompt,
               goal: requirementAnalysis.goal,
@@ -3040,6 +3051,11 @@ export class MissionDrivenEngine extends EventEmitter {
                   sessionId: resolvedSessionId,
                   followUpSteps: effectiveFollowUpSteps,
                 });
+                currentRoundRequestId = this.beginSyntheticExecutionRound({
+                  kind: 'auto_followup',
+                  round: autoFollowUpAttempt,
+                  message: t('engine.followUp.autoContinueMessage', { round: autoFollowUpAttempt }),
+                });
                 promptForRound = this.buildAutoFollowUpPrompt({
                   originalPrompt: trimmedPrompt,
                   goal: requirementAnalysis.goal,
@@ -3054,6 +3070,16 @@ export class MissionDrivenEngine extends EventEmitter {
               } else if (isGovernancePaused && isGovernanceAutoRecoverReason(normalizedRuntimeReason)) {
                 const resumeRound = governanceRecoveryAttempt + 1;
                 governanceRecoveryAttempt = resumeRound;
+                currentRoundRequestId = this.beginSyntheticExecutionRound({
+                  kind: 'auto_governance_resume',
+                  round: resumeRound,
+                  message: t('engine.governance.autoResumeScheduled', {
+                    round: resumeRound,
+                    maxRounds: governanceRecoveryMaxRounds,
+                    seconds: 0,
+                    reason: this.formatGovernanceReason(normalizedRuntimeReason),
+                  }),
+                });
                 promptForRound = this.buildGovernanceRecoveryPrompt({
                   originalPrompt: trimmedPrompt,
                   goal: requirementAnalysis.goal,
@@ -3121,6 +3147,11 @@ export class MissionDrivenEngine extends EventEmitter {
             await this.markPhaseRuntimeRunning({
               sessionId: resolvedSessionId,
               followUpSteps: effectiveFollowUpSteps,
+            });
+            currentRoundRequestId = this.beginSyntheticExecutionRound({
+              kind: 'auto_followup',
+              round: autoFollowUpAttempt,
+              message: t('engine.followUp.autoContinueMessage', { round: autoFollowUpAttempt }),
             });
             if (this.currentPlanId) {
               try {
@@ -4254,6 +4285,23 @@ export class MissionDrivenEngine extends EventEmitter {
       `执行要求：\n${executionDirectives}`,
       '若确实无法执行，请明确说明原因并输出最终结论。',
     ].filter(line => line && line.trim().length > 0).join('\n\n');
+  }
+
+  private beginSyntheticExecutionRound(input: {
+    kind: 'auto_followup' | 'auto_repair' | 'auto_governance_resume';
+    round: number;
+    message: string;
+  }): string {
+    const requestId = `req_${input.kind}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    this.messageHub.beginSyntheticRound(requestId, input.message, {
+      phase: 'synthetic_execution_round',
+      extra: {
+        type: input.kind,
+        round: input.round,
+        syntheticRequest: true,
+      },
+    });
+    return requestId;
   }
 
   private captureRequestMessageSummary(requestId?: string): RequestMessageSummary | undefined {

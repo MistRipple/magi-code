@@ -63,6 +63,26 @@ class MockNormalizer extends EventEmitter {
     });
   }
 
+  addToolCall(streamId, toolCall) {
+    this.emit('update', {
+      messageId: streamId,
+      blocks: [toolCall],
+    });
+  }
+
+  finishToolCall(streamId, toolId, output, error) {
+    this.emit('update', {
+      messageId: streamId,
+      blocks: [{
+        type: 'tool_call',
+        toolId,
+        status: error ? 'failed' : 'completed',
+        output,
+        error,
+      }],
+    });
+  }
+
   endStream(streamId, errorMessage) {
     if (errorMessage) {
       this.emit('error', { messageId: streamId, error: errorMessage });

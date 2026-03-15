@@ -321,9 +321,6 @@
       <div class="wait-result-list">
         {#each waitData.results as result, i (result.task_id || i)}
           <div class="wait-result-item">
-            {#if result.summary}
-              <span class="result-summary">{result.summary}</span>
-            {/if}
             <div class="result-meta">
               {#if result.modified_files && result.modified_files.length > 0}
                 <span class="meta-tag"><Icon name="file" size={11} />{i18n.t('waitResultCard.fileChangeCount', { count: result.modified_files.length })}</span>

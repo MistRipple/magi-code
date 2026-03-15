@@ -6,7 +6,7 @@
 import { logger, LogCategory } from '../../logging';
 import type { WorkerSlot, AgentType } from '../../types/agent-types';
 import type { StandardMessage, MessageMetadata, ContentBlock, MessageSource, NotifyLevel, DataMessageType } from '../../protocol/message-protocol';
-import { MessageType, MessageLifecycle, MessageCategory, ControlMessageType, createStandardMessage, createControlMessage, createNotifyMessage, createDataMessage } from '../../protocol/message-protocol';
+import { MessageType, MessageLifecycle, MessageCategory, ControlMessageType, createStandardMessage, createControlMessage, createNotifyMessage, createDataMessage, createStreamingMessage } from '../../protocol/message-protocol';
 import { classifyModelOriginIssue, toModelOriginUserMessage } from '../../errors/model-origin';
 import { trackModelOriginEvent } from '../../errors/model-origin-observability';
 
@@ -205,6 +205,71 @@ export class MessageFactory {
       : `我将安排 ${assignments.length} 个 Worker 协作完成：\n${workerList}`;
     if (options?.reason) content += `\n\n> ${options.reason}`;
     this.orchestratorMessage(content, { metadata: { phase: 'task_assignment', isStatusMessage: true } });
+  }
+
+  /**
+   * 创建一轮由插件主动发起的执行上下文。
+   * 用于自动续跑/自动修复等内部轮次，确保后续 thinking/tool_call 能挂到独立 placeholder 下。
+   */
+  beginSyntheticRound(requestId: string, content: string, metadata?: MessageMetadata): {
+    starterMessageId: string;
+    placeholderMessageId: string;
+  } {
+    const normalizedRequestId = requestId.trim();
+    const normalizedContent = content.trim();
+    if (!normalizedRequestId || !normalizedContent) {
+      throw new Error('beginSyntheticRound requires non-empty requestId/content');
+    }
+
+    const starterMessage = createStandardMessage({
+      traceId: this.traceId,
+      category: MessageCategory.CONTENT,
+      type: MessageType.PROGRESS,
+      source: 'orchestrator',
+      agent: 'orchestrator',
+      lifecycle: MessageLifecycle.COMPLETED,
+      blocks: [{ type: 'text', content: normalizedContent, isMarkdown: true }],
+      metadata: this.enrichMetadata({
+        ...metadata,
+        requestId: normalizedRequestId,
+        extra: {
+          syntheticRequest: true,
+          ...((metadata?.extra && typeof metadata.extra === 'object') ? metadata.extra : {}),
+        },
+      }),
+    });
+
+    const placeholderMessage = createStreamingMessage('orchestrator', 'orchestrator', this.traceId, {
+      metadata: this.enrichMetadata({
+        ...metadata,
+        isPlaceholder: true,
+        placeholderState: 'pending',
+        requestId: normalizedRequestId,
+        userMessageId: starterMessage.id,
+        extra: {
+          syntheticRequest: true,
+          ...((metadata?.extra && typeof metadata.extra === 'object') ? metadata.extra : {}),
+        },
+      }),
+    });
+
+    starterMessage.metadata = {
+      ...(starterMessage.metadata || {}),
+      placeholderMessageId: placeholderMessage.id,
+    };
+
+    this.pipeline.process(starterMessage);
+    this.pipeline.process(placeholderMessage);
+    this.taskAccepted(normalizedRequestId);
+    this.sendControl(ControlMessageType.TASK_STARTED, {
+      requestId: normalizedRequestId,
+      timestamp: Date.now(),
+    });
+
+    return {
+      starterMessageId: starterMessage.id,
+      placeholderMessageId: placeholderMessage.id,
+    };
   }
 
   /** 发送 Worker 输出 - 路由到对应 Worker Tab */

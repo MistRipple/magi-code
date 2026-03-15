@@ -2990,16 +2990,11 @@ function applyStreamUpdate(message: Message, update: StreamUpdate): Partial<Mess
   if (update.updateType === 'append' && update.appendText) {
     updates.content = (message.content || '') + update.appendText;
     const nextBlocks = [...(message.blocks || [])];
-    let lastTextIndex = -1;
-    for (let i = nextBlocks.length - 1; i >= 0; i--) {
-      if (nextBlocks[i].type === 'text') {
-        lastTextIndex = i;
-        break;
-      }
-    }
-    if (lastTextIndex >= 0) {
-      const current = nextBlocks[lastTextIndex];
-      nextBlocks[lastTextIndex] = {
+    const lastIndex = nextBlocks.length - 1;
+    const lastBlock = nextBlocks[nextBlocks.length - 1];
+    if (lastBlock?.type === 'text') {
+      const current = lastBlock;
+      nextBlocks[lastIndex] = {
         ...current,
         content: (current.content || '') + update.appendText,
       };
@@ -3088,10 +3083,10 @@ function mergeBlocks(existing: ContentBlock[], incoming: ContentBlock[]): Conten
       continue;
     }
     if (block.type === 'text') {
-      const idx = [...next].map((b) => b.type).lastIndexOf('text');
-      if (idx >= 0) {
-        const prev = next[idx];
-        next[idx] = { ...prev, content: (prev.content || '') + (block.content || '') };
+      const lastIndex = next.length - 1;
+      const prev = next[next.length - 1];
+      if (prev?.type === 'text') {
+        next[lastIndex] = { ...prev, content: (prev.content || '') + (block.content || '') };
       } else {
         next.push(block);
       }

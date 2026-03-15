@@ -213,6 +213,13 @@ export class MessageHub {
     this.factory.taskAssignment(assignments, options);
   }
 
+  beginSyntheticRound(requestId: string, content: string, metadata?: MessageMetadata): {
+    starterMessageId: string;
+    placeholderMessageId: string;
+  } {
+    return this.factory.beginSyntheticRound(requestId, content, metadata);
+  }
+
   // ==========================================================================
   // Worker 交互 API（委托给 MessageFactory）
   // ==========================================================================
