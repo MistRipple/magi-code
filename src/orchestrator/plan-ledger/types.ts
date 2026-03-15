@@ -105,6 +105,17 @@ export interface PlanRuntimeWaitState {
   updatedAt?: number;
 }
 
+export interface PlanRuntimePhaseState {
+  state: 'idle' | 'running' | 'awaiting_next_phase' | 'completed';
+  currentIndex?: number;
+  currentTitle?: string;
+  nextIndex?: number;
+  nextTitle?: string;
+  remainingPhases: string[];
+  continuationIntent: 'continue' | 'stop';
+  updatedAt?: number;
+}
+
 export interface PlanRuntimeTerminationState {
   snapshotId?: string;
   reason?: string;
@@ -124,6 +135,7 @@ export interface PlanRuntimeState {
   review: PlanRuntimeReviewState;
   replan: PlanRuntimeReplanState;
   wait: PlanRuntimeWaitState;
+  phase: PlanRuntimePhaseState;
   termination: PlanRuntimeTerminationState;
 }
 

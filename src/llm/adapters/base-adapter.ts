@@ -847,14 +847,22 @@ export abstract class BaseLLMAdapter extends EventEmitter {
    * - 错误事件仍通过 EventEmitter 传递（需要特殊处理）
    */
   private setupNormalizerEvents(): void {
+    const sendWithCurrentRequestContext = (message: import('../../protocol').StandardMessage): void => {
+      this.messageHub.sendMessage(message, {
+        explicitRequestId: this.currentRequestId,
+      });
+    };
+
     // 消息开始/流式：直接发送到 MessageHub
     this.normalizer.on(MESSAGE_EVENTS.MESSAGE, (message) => {
-      this.messageHub.sendMessage(message);
+      // 续跑轮 / 工具派生流不能丢失当前 requestId，
+      // 否则主线只会看到任务卡，思考过程与工具卡片可能漂成“裸消息”。
+      sendWithCurrentRequestContext(message);
     });
 
     // 消息完成：直接发送到 MessageHub
     this.normalizer.on(MESSAGE_EVENTS.COMPLETE, (_messageId, message) => {
-      this.messageHub.sendMessage(message);
+      sendWithCurrentRequestContext(message);
     });
 
     // 流式更新：直接发送到 MessageHub

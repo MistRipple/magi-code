@@ -24,6 +24,7 @@ import type {
   PlanRecord,
   PlanRuntimeReplanState,
   PlanRuntimeReviewState,
+  PlanRuntimePhaseState,
   PlanRuntimeState,
   PlanRuntimeTerminationState,
   PlanRuntimeVersion,
@@ -796,6 +797,7 @@ export class PlanLedgerService extends EventEmitter {
       review?: Partial<PlanRuntimeReviewState>;
       replan?: Partial<PlanRuntimeReplanState>;
       wait?: Partial<PlanRuntimeWaitState>;
+      phase?: Partial<PlanRuntimePhaseState>;
       termination?: Partial<PlanRuntimeTerminationState>;
       acceptance?: { summary?: PlanAcceptanceSummary; criteria?: AcceptanceCriterion[] };
     },
@@ -856,6 +858,25 @@ export class PlanLedgerService extends EventEmitter {
           nextWait.reasonCode = undefined;
         }
         record.runtime.wait = nextWait;
+      }
+
+      if (patch.phase) {
+        const nextPhase: PlanRuntimePhaseState = {
+          ...record.runtime.phase,
+          ...patch.phase,
+          remainingPhases: Array.isArray(patch.phase.remainingPhases)
+            ? patch.phase.remainingPhases
+                .map((item) => (typeof item === 'string' ? item.trim() : ''))
+                .filter((item) => item.length > 0)
+            : [...record.runtime.phase.remainingPhases],
+          updatedAt: now,
+        };
+        if (nextPhase.continuationIntent === 'stop') {
+          nextPhase.nextIndex = undefined;
+          nextPhase.nextTitle = undefined;
+          nextPhase.remainingPhases = [];
+        }
+        record.runtime.phase = nextPhase;
       }
 
       if (patch.termination) {
@@ -1906,6 +1927,20 @@ export class PlanLedgerService extends EventEmitter {
             : undefined,
           updatedAt: this.normalizeTimestamp(sourceRecord.runtime?.wait?.updatedAt),
         },
+        phase: {
+          state: this.normalizeRuntimePhaseState(sourceRecord.runtime?.phase?.state),
+          currentIndex: this.normalizePositiveInteger(sourceRecord.runtime?.phase?.currentIndex),
+          currentTitle: typeof sourceRecord.runtime?.phase?.currentTitle === 'string' && sourceRecord.runtime.phase.currentTitle.trim()
+            ? sourceRecord.runtime.phase.currentTitle.trim()
+            : undefined,
+          nextIndex: this.normalizePositiveInteger(sourceRecord.runtime?.phase?.nextIndex),
+          nextTitle: typeof sourceRecord.runtime?.phase?.nextTitle === 'string' && sourceRecord.runtime.phase.nextTitle.trim()
+            ? sourceRecord.runtime.phase.nextTitle.trim()
+            : undefined,
+          remainingPhases: this.normalizeStringArray(sourceRecord.runtime?.phase?.remainingPhases),
+          continuationIntent: this.normalizeRuntimePhaseContinuationIntent(sourceRecord.runtime?.phase?.continuationIntent),
+          updatedAt: this.normalizeTimestamp(sourceRecord.runtime?.phase?.updatedAt),
+        },
         termination: {
           snapshotId: this.normalizeIdentifier(sourceRecord.runtime?.termination?.snapshotId) || undefined,
           reason: typeof sourceRecord.runtime?.termination?.reason === 'string' && sourceRecord.runtime.termination.reason.trim()
@@ -2187,6 +2222,13 @@ export class PlanLedgerService extends EventEmitter {
       wait: {
         state: 'none',
       },
+      phase: {
+        state: runtimeVersion === 'deep_v1' ? 'running' : 'idle',
+        currentIndex: runtimeVersion === 'deep_v1' ? 1 : undefined,
+        currentTitle: runtimeVersion === 'deep_v1' ? 'Phase 1' : undefined,
+        remainingPhases: [],
+        continuationIntent: 'stop',
+      },
       termination: {},
     };
   }
@@ -2351,6 +2393,18 @@ export class PlanLedgerService extends EventEmitter {
     return input === 'external_waiting' ? 'external_waiting' : 'none';
   }
 
+  private normalizeRuntimePhaseState(input: unknown): PlanRuntimeState['phase']['state'] {
+    return input === 'running'
+      || input === 'awaiting_next_phase'
+      || input === 'completed'
+      ? input
+      : 'idle';
+  }
+
+  private normalizeRuntimePhaseContinuationIntent(input: unknown): PlanRuntimeState['phase']['continuationIntent'] {
+    return input === 'continue' ? 'continue' : 'stop';
+  }
+
   private addUnique(target: string[], value: string): void {
     const normalized = value.trim();
     if (!normalized) {
@@ -2441,6 +2495,10 @@ export class PlanLedgerService extends EventEmitter {
         review: { ...record.runtime.review },
         replan: { ...record.runtime.replan },
         wait: { ...record.runtime.wait },
+        phase: {
+          ...record.runtime.phase,
+          remainingPhases: [...record.runtime.phase.remainingPhases],
+        },
         termination: { ...record.runtime.termination },
       },
       items: record.items.map((item) => ({

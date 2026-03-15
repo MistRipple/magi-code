@@ -1073,6 +1073,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       const loopStartAt = Date.now();
       const loopStartTokenUsage = this.getTotalTokenUsage();
       const loopStartTokenUsed = (loopStartTokenUsage.inputTokens || 0) + (loopStartTokenUsage.outputTokens || 0);
+      let pendingTerminalSynthesisRetry = 0;
 
       // 创建 AbortController，供 interrupt() 中断 LLM 请求
       this.abortController = new AbortController();
@@ -1271,6 +1272,28 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             }));
 
             if (pendingTerminalReason) {
+              const missingTerminalOutcome = !outcomeStatus && normalizedOutcomeSteps.length === 0;
+              if (pendingTerminalSynthesisRetry < 1 && (!assistantText.trim() || missingTerminalOutcome)) {
+                pendingTerminalSynthesisRetry += 1;
+                history.push({
+                  role: 'user',
+                  content: this.buildTerminalSynthesisPrompt(
+                    pendingTerminalReason,
+                    progressState.snapshot,
+                    true,
+                  ),
+                });
+                logger.warn('Orchestrator.Termination.Handoff.收尾轮缺少结构化结论，触发补跑', {
+                  reason: pendingTerminalReason,
+                  round: loopRounds,
+                  retry: pendingTerminalSynthesisRetry,
+                  missingText: !assistantText.trim(),
+                  missingOutcome: missingTerminalOutcome,
+                }, LogCategory.LLM);
+                this.normalizer.endStream(streamId);
+                round++;
+                continue;
+              }
               logger.info('Orchestrator.Termination.Handoff.收尾轮完成', {
                 reason: pendingTerminalReason,
                 round: loopRounds,
@@ -1985,8 +2008,15 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   private buildTerminalSynthesisPrompt(
     reason: Exclude<OrchestratorTerminationReason, 'unknown'>,
     snapshot: TerminationSnapshot,
+    enforceOutcomeBlock = false,
   ): string {
     const remain = Math.max(0, snapshot.requiredTotal - snapshot.progressVector.terminalRequiredTodos);
+    const outcomeContract = [
+      '输出末尾必须追加控制块：',
+      MISSION_OUTCOME_START,
+      '{"status":"running|completed|failed","next_steps":["..."]}',
+      MISSION_OUTCOME_END,
+    ].join('\n');
     if (reason === 'completed') {
       return [
         '[System] 当前执行已满足终止条件。请基于已完成工具结果给出最终结论。',
@@ -1994,6 +2024,10 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         `- 已终态必需 Todo: ${snapshot.progressVector.terminalRequiredTodos}`,
         `- 剩余必需 Todo: ${remain}`,
         '- 要求：总结已完成事项、关键证据、验收结果与最终交付状态。',
+        '- 若当前 mission 仍有明确后续阶段（例如 Phase 3 复审/验证），status 必须填 running，并在 next_steps 中列出这些后续步骤。',
+        '- 只有当整个 mission 真正结束时，才能将 status 填为 completed。',
+        outcomeContract,
+        enforceOutcomeBlock ? '- 本轮禁止省略上述控制块；若无法判定，请至少给出 status 和 next_steps。' : '',
       ].join('\n');
     }
 
@@ -2003,6 +2037,8 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       `- 已终态必需 Todo: ${snapshot.progressVector.terminalRequiredTodos}`,
       `- 失败必需 Todo: ${snapshot.failedRequired}`,
       '- 要求：说明失败根因、已完成部分、未完成部分、下一步修复建议。',
+      outcomeContract,
+      enforceOutcomeBlock ? '- 本轮禁止省略上述控制块；失败后若仍需继续修复，请使用 status=failed 并写出 next_steps。' : '',
     ].join('\n');
   }
 

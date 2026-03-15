@@ -49,6 +49,54 @@ function assert(condition, message) {
   }
 }
 
+function verifySourceGuardrails() {
+  const source = fs.readFileSync(
+    path.join(ROOT, 'src', 'orchestrator', 'core', 'mission-driven-engine.ts'),
+    'utf8',
+  );
+  const orchestratorAdapterSource = fs.readFileSync(
+    path.join(ROOT, 'src', 'llm', 'adapters', 'orchestrator-adapter.ts'),
+    'utf8',
+  );
+
+  assert(
+    source.includes('didFollowUpRoundProduceExecutionActivity'),
+    '缺少自动续跑实际执行活动检测',
+  );
+  assert(
+    source.includes('这是执行轮，不是规划轮。'),
+    '自动续跑 prompt 未收紧为执行轮约束',
+  );
+  assert(
+    source.includes('禁止只输出“现在启动”“准备派发”“已确认结构”“派发修复：”这类口头承诺'),
+    '自动续跑 prompt 未拦截口头派发空转',
+  );
+  assert(
+    orchestratorAdapterSource.includes('若当前 mission 仍有明确后续阶段'),
+    '收尾总结轮未要求保留后续阶段的结构化 next_steps',
+  );
+  assert(
+    orchestratorAdapterSource.includes('收尾轮缺少结构化结论，触发补跑'),
+    '收尾总结轮缺少 outcome block 时未触发补跑',
+  );
+  const planLedgerTypes = fs.readFileSync(
+    path.join(ROOT, 'src', 'orchestrator', 'plan-ledger', 'types.ts'),
+    'utf8',
+  );
+  assert(
+    planLedgerTypes.includes('export interface PlanRuntimePhaseState'),
+    'PlanLedger 缺少显式阶段运行态定义',
+  );
+  assert(
+    source.includes('resolvePersistedPhaseFollowUpSteps'),
+    '自动续跑未接入持久化 phase 续跑恢复',
+  );
+  assert(
+    source.includes('markPhaseRuntimeRunning'),
+    '自动续跑未推进显式阶段运行态',
+  );
+}
+
 function loadCompiledModule(relPath) {
   const abs = path.join(OUT, relPath);
   if (!fs.existsSync(abs)) {
@@ -177,6 +225,7 @@ async function runScenario(label, responses, expectations) {
 }
 
 async function main() {
+  verifySourceGuardrails();
   await runScenario('next-steps', [
     {
       content: [

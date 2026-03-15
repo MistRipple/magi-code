@@ -834,6 +834,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
                 maxRecoveryAttempts: WorkerLLMAdapter.STREAM_INTERRUPTION_RECOVERY_MAX,
               }),
             });
+            this.emitVisibleAutoRecoveryNotice({
+              hasAccumulatedText,
+              interruptedAfterToolSignal,
+              recoveryAttempt: streamInterruptionRecoveryCount,
+              maxRecoveryAttempts: WorkerLLMAdapter.STREAM_INTERRUPTION_RECOVERY_MAX,
+            });
             logger.warn(`${this.agent} 流式中断自动续跑`, {
               round,
               recoveryAttempt: streamInterruptionRecoveryCount,
@@ -937,6 +943,34 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       return `[System] 上一轮在工具调用阶段因网络波动中断，已自动续跑（${recoveryAttempt}/${maxRecoveryAttempts}）。请继续当前任务；如仍需工具，请重新输出完整可执行的 tool_call（含完整参数）。`;
     }
     return `[System] 上一轮输出在传输过程中中断（网络波动），已自动续跑（${recoveryAttempt}/${maxRecoveryAttempts}）。请从已输出内容继续，不要重复前文。`;
+  }
+
+  private emitVisibleAutoRecoveryNotice(input: {
+    hasAccumulatedText: boolean;
+    interruptedAfterToolSignal: boolean;
+    recoveryAttempt: number;
+    maxRecoveryAttempts: number;
+  }): void {
+    const { hasAccumulatedText, interruptedAfterToolSignal, recoveryAttempt, maxRecoveryAttempts } = input;
+    const content = interruptedAfterToolSignal
+      ? `[System] 当前 Worker 在工具调用阶段因网络波动中断，已自动续跑（${recoveryAttempt}/${maxRecoveryAttempts}）。正在恢复执行并等待新的工具/结果输出。`
+      : hasAccumulatedText
+        ? `[System] 当前 Worker 因网络波动发生流式中断，已自动续跑（${recoveryAttempt}/${maxRecoveryAttempts}）。将基于已输出内容继续执行。`
+        : `[System] 当前 Worker 因网络波动发生流式中断，已自动续跑（${recoveryAttempt}/${maxRecoveryAttempts}）。正在重新建立输出流。`;
+
+    this.messageHub.workerOutput(this.workerSlot, content, {
+      metadata: {
+        requestId: this.currentRequestId,
+        role: 'system',
+        extra: {
+          type: 'worker_auto_recovery',
+          recoveryAttempt,
+          maxRecoveryAttempts,
+          interruptedAfterToolSignal,
+          hasAccumulatedText,
+        },
+      },
+    });
   }
 
   /**

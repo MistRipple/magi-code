@@ -94,6 +94,14 @@ function createMessageHub(traceId) {
       data(type, payload) {
         dataEvents.push({ type, payload });
       },
+      workerOutput(worker, content, options) {
+        sentMessages.push({
+          type: 'workerOutput',
+          worker,
+          content,
+          metadata: options?.metadata,
+        });
+      },
       getTraceId() {
         return traceId;
       },
@@ -371,6 +379,15 @@ async function testWorkerRoundRecovery() {
     history.some((msg) => msg.role === 'user' && typeof msg.content === 'string' && msg.content.includes('已自动续跑')),
     'Worker 历史缺少续跑提示',
   );
+  assert(
+    messageHub.sentMessages.some(
+      (msg) => msg.type === 'workerOutput'
+        && typeof msg.content === 'string'
+        && msg.content.includes('当前 Worker')
+        && msg.content.includes('已自动续跑'),
+    ),
+    'Worker 自动续跑缺少可见过程消息',
+  );
   assert(toolManager.executeCount === 0, 'Worker 本用例不应执行任何工具');
 }
 
@@ -457,6 +474,15 @@ async function testWorkerToolSignalRecovery() {
   assert(
     history.some((msg) => msg.role === 'user' && typeof msg.content === 'string' && msg.content.includes('工具调用阶段因网络波动中断')),
     'Worker 历史缺少工具阶段续跑提示',
+  );
+  assert(
+    messageHub.sentMessages.some(
+      (msg) => msg.type === 'workerOutput'
+        && typeof msg.content === 'string'
+        && msg.content.includes('工具调用阶段')
+        && msg.content.includes('已自动续跑'),
+    ),
+    'Worker 工具阶段自动续跑缺少可见过程消息',
   );
 }
 

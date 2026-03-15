@@ -35,6 +35,7 @@ import {
 } from '../mission';
 import { ExecutionStats } from '../execution-stats';
 import { MessageHub } from './message-hub';
+import type { RequestMessageSummary } from './message-pipeline';
 import { WisdomManager } from '../wisdom';
 import { buildUnifiedSystemPrompt } from '../prompts/orchestrator-prompts';
 import { isAbortError } from '../../errors';
@@ -54,7 +55,7 @@ import {
   type TerminationCandidate,
 } from '../../llm/adapters/orchestrator-termination';
 import { TaskViewService } from '../../services/task-view-service';
-import { PlanLedgerService, type PlanMode, type PlanRecord } from '../plan-ledger';
+import { PlanLedgerService, type PlanMode, type PlanRecord, type PlanRuntimePhaseState } from '../plan-ledger';
 import {
   createWisdomStorage,
   extractPrimaryIntent,
@@ -2184,6 +2185,7 @@ export class MissionDrivenEngine extends EventEmitter {
         const governanceRecoveryMaxRounds = governanceRecoveryDelays.length;
         let autoRepairAttempt = 0;
         let autoFollowUpAttempt = 0;
+        let autoFollowUpNoExecutionRetry = 0;
         let lastFollowUpSignature = '';
         let lastFollowUpProgressSignature = '';
         let followUpStallStreak = 0;
@@ -2194,6 +2196,7 @@ export class MissionDrivenEngine extends EventEmitter {
 
         // 5. 编排执行（支持交付失败后的自动修复闭环）
         while (true) {
+          const requestStatsBeforeRound = this.captureRequestMessageSummary(requestId);
           if (autoRepairAttempt > 0 || autoFollowUpAttempt > 0) {
             this.dispatchManager.resetForNewExecutionCycle();
             if (autoRepairAttempt > 0) {
@@ -2234,6 +2237,7 @@ export class MissionDrivenEngine extends EventEmitter {
               requestId,
             }
           );
+          const requestStatsAfterRound = this.captureRequestMessageSummary(requestId);
           orchestratorRuntimeReason = this.normalizeOrchestratorRuntimeReason(response.orchestratorRuntime?.reason);
           orchestratorRuntimeRounds = response.orchestratorRuntime?.rounds || 0;
           orchestratorRuntimeSnapshot = response.orchestratorRuntime?.snapshot as RuntimeTerminationSnapshot | undefined;
@@ -2777,13 +2781,20 @@ export class MissionDrivenEngine extends EventEmitter {
             blocked: blockedFollowUpSteps,
             nonActionable: nonActionableFollowUpSteps,
           } = this.classifyFollowUpSteps(resolvedFollowUpSteps);
-          const blockedFollowUpOnly = followUpSteps.length === 0 && blockedFollowUpSteps.length > 0;
+          const currentPlanForFollowUp = this.currentPlanId
+            ? this.planLedger.getPlan(resolvedSessionId, this.currentPlanId)
+            : null;
+          const persistedPhaseSteps = this.resolvePersistedPhaseFollowUpSteps(currentPlanForFollowUp?.runtime.phase);
+          const effectiveFollowUpSteps = followUpSteps.length > 0
+            ? followUpSteps
+            : persistedPhaseSteps;
+          const blockedFollowUpOnly = effectiveFollowUpSteps.length === 0 && blockedFollowUpSteps.length > 0;
           const pendingRequiredTodos = this.extractPendingRequiredCount(orchestratorRuntimeSnapshot);
           const requiredTotalTodos = this.resolveRequiredTotal(orchestratorRuntimeSnapshot) ?? 0;
           const hasStructuredRuntimeBacklog = requiredTotalTodos > 0;
           const followUpSignature = [
             `pending:${pendingRequiredTodos}`,
-            `steps:${followUpSteps.join('|')}`,
+            `steps:${effectiveFollowUpSteps.join('|')}`,
           ].join('|');
           const followUpProgressSignature = this.buildFollowUpProgressSignature(orchestratorRuntimeSnapshot);
           if (followUpProgressSignature && followUpProgressSignature === lastFollowUpProgressSignature) {
@@ -2808,9 +2819,9 @@ export class MissionDrivenEngine extends EventEmitter {
               examples: nonActionableFollowUpSteps.slice(0, 3),
             }, LogCategory.ORCHESTRATOR);
           }
-          if (followUpSteps.length > 0 && !hasStructuredRuntimeBacklog) {
+          if (effectiveFollowUpSteps.length > 0 && !hasStructuredRuntimeBacklog) {
             logger.info('编排器.FollowUp.忽略无任务上下文建议', {
-              count: followUpSteps.length,
+              count: effectiveFollowUpSteps.length,
               requiredTotalTodos,
               runtimeReason: normalizedRuntimeReason,
             }, LogCategory.ORCHESTRATOR);
@@ -2821,10 +2832,70 @@ export class MissionDrivenEngine extends EventEmitter {
             requiredTotalTodos,
             pendingRequiredTodos,
             hasStructuredRuntimeBacklog,
-            followUpSteps,
+            followUpSteps: effectiveFollowUpSteps,
+            phaseRuntime: currentPlanForFollowUp?.runtime.phase,
           });
           const hasFollowUpPending = pendingRequiredTodos > 0
-            || (allowStepDrivenFollowUp && hasStructuredRuntimeBacklog && followUpSteps.length > 0);
+            || (allowStepDrivenFollowUp && hasStructuredRuntimeBacklog && effectiveFollowUpSteps.length > 0);
+
+          if (this.currentPlanId) {
+            const phasePatch = this.buildPhaseRuntimePatch({
+              current: currentPlanForFollowUp?.runtime.phase,
+              runtimeReason: normalizedRuntimeReason,
+              hasStructuredRuntimeBacklog,
+              pendingRequiredTodos,
+              followUpSteps: effectiveFollowUpSteps,
+            });
+            if (phasePatch) {
+              try {
+                await this.planLedger.updateRuntimeState(resolvedSessionId, this.currentPlanId, {
+                  phase: phasePatch,
+                }, {
+                  auditReason: 'follow-up-phase-runtime-sync',
+                });
+              } catch (error) {
+                logger.warn('编排器.PlanRuntime.phase回写失败', {
+                  sessionId: resolvedSessionId,
+                  planId: this.currentPlanId,
+                  error: error instanceof Error ? error.message : String(error),
+                }, LogCategory.ORCHESTRATOR);
+              }
+            }
+          }
+
+          const followUpProducedExecutionActivity = this.didFollowUpRoundProduceExecutionActivity(
+            requestStatsBeforeRound,
+            requestStatsAfterRound,
+          );
+          const followUpNoExecutionDetected = autoFollowUpAttempt > 0
+            && hasFollowUpPending
+            && !blockedFollowUpOnly
+            && !followUpProducedExecutionActivity;
+
+          if (followUpProducedExecutionActivity) {
+            autoFollowUpNoExecutionRetry = 0;
+          } else if (followUpNoExecutionDetected && autoFollowUpNoExecutionRetry < 1) {
+            autoFollowUpNoExecutionRetry += 1;
+            logger.warn('编排器.FollowUp.检测到口头续跑未实际执行', {
+              round: autoFollowUpAttempt,
+              retry: autoFollowUpNoExecutionRetry,
+              pendingRequiredTodos,
+              followUpSteps: effectiveFollowUpSteps.length,
+            }, LogCategory.ORCHESTRATOR);
+            promptForRound = this.buildAutoFollowUpPrompt({
+              originalPrompt: trimmedPrompt,
+              goal: requirementAnalysis.goal,
+              constraints: requirementAnalysis.constraints ?? [],
+              acceptanceCriteria: requirementAnalysis.acceptanceCriteria ?? [],
+              steps: effectiveFollowUpSteps,
+              round: autoFollowUpAttempt,
+              requiredTotal: this.resolveRequiredTotal(orchestratorRuntimeSnapshot),
+              terminalRequired: this.resolveTerminalRequired(orchestratorRuntimeSnapshot),
+              pendingRequired: pendingRequiredTodos,
+              enforceExecution: true,
+            });
+            continue;
+          }
           const runtimeRecoveryDecision = decideRecoveryAction({
             currentPlanMode,
             interactionMode: this.interactionMode,
@@ -2852,7 +2923,7 @@ export class MissionDrivenEngine extends EventEmitter {
               source: replanSource,
               reviewRound: currentPlanForGate?.runtime.review.round,
               pendingRequiredTodos,
-              steps: followUpSteps,
+              steps: effectiveFollowUpSteps,
               budgetElapsedMs: orchestratorRuntimeSnapshot?.budgetState?.elapsedMs,
               budgetTokenUsed: orchestratorRuntimeSnapshot?.budgetState?.tokenUsed,
               scopeIssues: replanGateSignals.scopeIssues,
@@ -2873,14 +2944,14 @@ export class MissionDrivenEngine extends EventEmitter {
                   planId: this.currentPlanId,
                   source: replanSource,
                   pendingRequiredTodos,
-                  followUpSteps: followUpSteps.length,
+                  followUpSteps: effectiveFollowUpSteps.length,
                   error: error instanceof Error ? error.message : String(error),
                 }, LogCategory.ORCHESTRATOR);
               }
             }
             const followUpSummaryLines: string[] = [];
-            if (followUpSteps.length > 0) {
-              followUpSummaryLines.push(`检测到 ${followUpSteps.length} 项待继续执行工作`);
+            if (effectiveFollowUpSteps.length > 0) {
+              followUpSummaryLines.push(`检测到 ${effectiveFollowUpSteps.length} 项待继续执行工作`);
             }
             if (pendingRequiredTodos > 0) {
               followUpSummaryLines.push(`仍有 ${pendingRequiredTodos} 项关键任务未完成`);
@@ -2904,9 +2975,9 @@ export class MissionDrivenEngine extends EventEmitter {
               ? followUpSummaryLines.join('；')
               : '当前执行需要你确认是否继续';
             const followUpDetailsLines: string[] = [];
-            if (followUpSteps.length > 0) {
+            if (effectiveFollowUpSteps.length > 0) {
               followUpDetailsLines.push('待继续执行项：');
-              followUpDetailsLines.push(...followUpSteps.map((step) => `- ${step}`));
+              followUpDetailsLines.push(...effectiveFollowUpSteps.map((step) => `- ${step}`));
             }
             if (replanGateSignals.scopeIssues.length > 0) {
               followUpDetailsLines.push('范围风险明细：');
@@ -2965,12 +3036,16 @@ export class MissionDrivenEngine extends EventEmitter {
               if (hasFollowUpPending) {
                 autoFollowUpAttempt += 1;
                 lastFollowUpSignature = followUpSignature;
+                await this.markPhaseRuntimeRunning({
+                  sessionId: resolvedSessionId,
+                  followUpSteps: effectiveFollowUpSteps,
+                });
                 promptForRound = this.buildAutoFollowUpPrompt({
                   originalPrompt: trimmedPrompt,
                   goal: requirementAnalysis.goal,
                   constraints: requirementAnalysis.constraints ?? [],
                   acceptanceCriteria: requirementAnalysis.acceptanceCriteria ?? [],
-                  steps: followUpSteps,
+                  steps: effectiveFollowUpSteps,
                   round: autoFollowUpAttempt,
                   requiredTotal: this.resolveRequiredTotal(orchestratorRuntimeSnapshot),
                   terminalRequired: this.resolveTerminalRequired(orchestratorRuntimeSnapshot),
@@ -3043,6 +3118,10 @@ export class MissionDrivenEngine extends EventEmitter {
             }
             autoFollowUpAttempt += 1;
             lastFollowUpSignature = followUpSignature;
+            await this.markPhaseRuntimeRunning({
+              sessionId: resolvedSessionId,
+              followUpSteps: effectiveFollowUpSteps,
+            });
             if (this.currentPlanId) {
               try {
                 await this.planLedger.updateRuntimeState(resolvedSessionId, this.currentPlanId, {
@@ -3063,7 +3142,7 @@ export class MissionDrivenEngine extends EventEmitter {
               goal: requirementAnalysis.goal,
               constraints: requirementAnalysis.constraints ?? [],
               acceptanceCriteria: requirementAnalysis.acceptanceCriteria ?? [],
-              steps: followUpSteps,
+              steps: effectiveFollowUpSteps,
               round: autoFollowUpAttempt,
               requiredTotal: this.resolveRequiredTotal(orchestratorRuntimeSnapshot),
               terminalRequired: this.resolveTerminalRequired(orchestratorRuntimeSnapshot),
@@ -3992,6 +4071,7 @@ export class MissionDrivenEngine extends EventEmitter {
     pendingRequiredTodos: number;
     hasStructuredRuntimeBacklog: boolean;
     followUpSteps: string[];
+    phaseRuntime?: PlanRuntimePhaseState;
   }): boolean {
     if (input.runtimeReason !== 'completed') {
       return true;
@@ -4000,10 +4080,12 @@ export class MissionDrivenEngine extends EventEmitter {
     // 只要当前 mission 已建立结构化 backlog，且本轮留下了明确可执行的后续步骤，
     // deep 模式就应允许继续推进下一阶段，而不是把阶段切换错误地暴露成用户确认。
     if (!input.hasStructuredRuntimeBacklog) {
-      return false;
+      return input.phaseRuntime?.continuationIntent === 'continue'
+        && input.phaseRuntime.remainingPhases.length > 0;
     }
     if (input.followUpSteps.length === 0) {
-      return false;
+      return input.phaseRuntime?.continuationIntent === 'continue'
+        && input.phaseRuntime.remainingPhases.length > 0;
     }
     if (input.pendingRequiredTodos > 0) {
       return true;
@@ -4013,6 +4095,107 @@ export class MissionDrivenEngine extends EventEmitter {
       followUpSteps: input.followUpSteps.length,
     }, LogCategory.ORCHESTRATOR);
     return true;
+  }
+
+  private resolvePersistedPhaseFollowUpSteps(phase?: PlanRuntimePhaseState | null): string[] {
+    if (!phase || phase.continuationIntent !== 'continue' || phase.state !== 'awaiting_next_phase') {
+      return [];
+    }
+    return Array.isArray(phase.remainingPhases)
+      ? phase.remainingPhases.filter((item) => typeof item === 'string' && item.trim().length > 0)
+      : [];
+  }
+
+  private extractPhaseDescriptor(step: string): { index?: number; title: string } {
+    const trimmed = step.trim();
+    if (!trimmed) {
+      return { title: '' };
+    }
+    const explicitPhase = trimmed.match(/(?:^|[\s(（])phase\s*([0-9]+)(?:\b|[:：\-\s])/i)
+      || trimmed.match(/(?:^|[\s(（])阶段\s*([0-9]+)(?:\b|[:：\-\s])/i);
+    const phaseIndex = explicitPhase ? Number(explicitPhase[1]) : undefined;
+    if (phaseIndex && Number.isFinite(phaseIndex)) {
+      return { index: phaseIndex, title: `Phase ${phaseIndex}` };
+    }
+    const beforeColon = trimmed.split(/[:：]/)[0]?.trim();
+    return { title: beforeColon || trimmed };
+  }
+
+  private buildPhaseRuntimePatch(input: {
+    current?: PlanRuntimePhaseState | null;
+    runtimeReason?: ResolvedOrchestratorTerminationReason;
+    hasStructuredRuntimeBacklog: boolean;
+    pendingRequiredTodos: number;
+    followUpSteps: string[];
+  }): Partial<PlanRuntimePhaseState> | null {
+    const current = input.current;
+    const steps = input.followUpSteps.filter((item) => item.trim().length > 0);
+    if (steps.length > 0 && input.hasStructuredRuntimeBacklog) {
+      const descriptors = steps.map((step) => this.extractPhaseDescriptor(step));
+      const first = descriptors[0];
+      return {
+        state: input.pendingRequiredTodos > 0 ? 'running' : 'awaiting_next_phase',
+        currentIndex: current?.currentIndex,
+        currentTitle: current?.currentTitle,
+        nextIndex: first?.index,
+        nextTitle: first?.title,
+        remainingPhases: steps,
+        continuationIntent: 'continue',
+      };
+    }
+    if (input.pendingRequiredTodos > 0) {
+      return {
+        state: 'running',
+        continuationIntent: current?.continuationIntent === 'continue' ? 'continue' : 'stop',
+        remainingPhases: current?.continuationIntent === 'continue' ? current.remainingPhases : [],
+        nextIndex: current?.continuationIntent === 'continue' ? current.nextIndex : undefined,
+        nextTitle: current?.continuationIntent === 'continue' ? current.nextTitle : undefined,
+      };
+    }
+    if (input.runtimeReason === 'completed') {
+      return {
+        state: 'completed',
+        continuationIntent: 'stop',
+        remainingPhases: [],
+      };
+    }
+    return null;
+  }
+
+  private async markPhaseRuntimeRunning(input: {
+    sessionId: string;
+    followUpSteps: string[];
+  }): Promise<void> {
+    if (!this.currentPlanId) {
+      return;
+    }
+    const currentPlan = this.planLedger.getPlan(input.sessionId, this.currentPlanId);
+    const steps = input.followUpSteps.filter((item) => item.trim().length > 0);
+    const activeStep = steps[0] || currentPlan?.runtime.phase.nextTitle;
+    const descriptor = activeStep ? this.extractPhaseDescriptor(activeStep) : null;
+    try {
+      await this.planLedger.updateRuntimeState(input.sessionId, this.currentPlanId, {
+        phase: {
+          state: 'running',
+          currentIndex: descriptor?.index ?? currentPlan?.runtime.phase.nextIndex ?? currentPlan?.runtime.phase.currentIndex,
+          currentTitle: descriptor?.title ?? currentPlan?.runtime.phase.nextTitle ?? currentPlan?.runtime.phase.currentTitle,
+          nextIndex: currentPlan?.runtime.phase.nextIndex,
+          nextTitle: currentPlan?.runtime.phase.nextTitle,
+          remainingPhases: steps.length > 0 ? steps : (currentPlan?.runtime.phase.remainingPhases || []),
+          continuationIntent: (steps.length > 0 || (currentPlan?.runtime.phase.remainingPhases.length || 0) > 0)
+            ? 'continue'
+            : 'stop',
+        },
+      }, {
+        auditReason: 'follow-up-phase-runtime-running',
+      });
+    } catch (error) {
+      logger.warn('编排器.PlanRuntime.phase运行态推进失败', {
+        sessionId: input.sessionId,
+        planId: this.currentPlanId,
+        error: error instanceof Error ? error.message : String(error),
+      }, LogCategory.ORCHESTRATOR);
+    }
   }
 
   private buildAutoFollowUpPrompt(input: {
@@ -4025,6 +4208,7 @@ export class MissionDrivenEngine extends EventEmitter {
     requiredTotal?: number;
     terminalRequired?: number;
     pendingRequired?: number;
+    enforceExecution?: boolean;
   }): string {
     const goal = input.goal || input.originalPrompt;
     const constraints = input.constraints.length > 0
@@ -4047,6 +4231,16 @@ export class MissionDrivenEngine extends EventEmitter {
           typeof pendingRequired === 'number' ? `- 运行或待处理必需 Todo: ${pendingRequired}` : '',
         ].filter(line => line.length > 0).join('\n')
       : '';
+    const executionDirectives = input.enforceExecution
+      ? [
+          '这是执行轮，不是规划轮。',
+          '本轮必须直接推进执行：若步骤涉及派发、修复、验证或复审，必须立刻调用对应工具或 worker_dispatch / worker_wait 落地。',
+          '禁止只输出“现在启动”“准备派发”“已确认结构”“派发修复：”这类口头承诺；如果无法执行，必须明确写出阻断原因。',
+        ].join('\n')
+      : [
+          '这是执行轮，不是规划轮。',
+          '请直接执行上述步骤，必要时调用工具或 worker_dispatch / worker_wait 继续推进，不要重复总结或只复述阶段计划。',
+        ].join('\n');
 
     return [
       '[System] 你上一轮给出了下一步建议，已进入自动续跑。',
@@ -4057,9 +4251,28 @@ export class MissionDrivenEngine extends EventEmitter {
       `验收标准：\n${acceptance}`,
       requiredSummary ? `必需 Todo 进度：\n${requiredSummary}` : '',
       `下一步建议：\n${steps}`,
-      '请直接执行上述步骤，必要时调用工具或 worker_dispatch 继续推进，不要重复总结。',
+      `执行要求：\n${executionDirectives}`,
       '若确实无法执行，请明确说明原因并输出最终结论。',
     ].filter(line => line && line.trim().length > 0).join('\n\n');
+  }
+
+  private captureRequestMessageSummary(requestId?: string): RequestMessageSummary | undefined {
+    if (!requestId || !requestId.trim()) {
+      return undefined;
+    }
+    const summary = this.messageHub.getRequestMessageStats(requestId.trim());
+    return summary ? { ...summary } : undefined;
+  }
+
+  private didFollowUpRoundProduceExecutionActivity(
+    before?: RequestMessageSummary,
+    after?: RequestMessageSummary,
+  ): boolean {
+    const beforeDispatch = before?.assistantDispatchContent || 0;
+    const beforeWorker = before?.assistantWorkerContent || 0;
+    const afterDispatch = after?.assistantDispatchContent || 0;
+    const afterWorker = after?.assistantWorkerContent || 0;
+    return afterDispatch > beforeDispatch || afterWorker > beforeWorker;
   }
 
   private resolveRequiredTotal(snapshot?: RuntimeTerminationSnapshot): number | undefined {
